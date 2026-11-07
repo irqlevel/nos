@@ -21,9 +21,12 @@ public:
     bool init();
     void stop();
 
-    /* Called from hard IRQ handler to schedule deferred work.
-       The work runs on the CPU which raised it. */
-    void raise(ulong type);
+    /* Deferred work for this CPU's softirq task: every type `mask` has a bit
+       of (1UL << TYPE_*), with one wake and at most one kick of the task for
+       all of them -- where a raise each kicked it once each. From any
+       context, a hard IRQ handler's included. The work runs on the CPU which
+       raised it; a bit past the types is none. */
+    void raise_mask(ulong mask);
 
     /* Safety net, called from this CPU's timer tick. Nothing here should be
        needed: every path that makes work available also wakes the task. But
@@ -45,6 +48,7 @@ public:
     static const ulong TYPE_BLK_IO = 1;
     static const ulong TYPE_NET_TX = 2;
     static const ulong MAX_TYPES = 8;
+    static const ulong ALL_TYPES = (1UL << MAX_TYPES) - 1;
 
 private:
     SoftIrq();
@@ -64,6 +68,13 @@ private:
     {
         Atomic pending; /* bitmask of pending soft IRQ types */
         Task* task_ptr;
+        /* A type's: the cycle counter at the raise that made it pending, for
+           the wait its run's softirq_entry records -- written by that raise
+           alone, while softirq_entry is on, and zeroed by the run that takes
+           it whether it is on or not, so that none outlives its pending.
+           Atomics: a raise on this CPU writes one while its task may read
+           it. */
+        u64 raised_at[MAX_TYPES];
     };
 
     Handler handlers_[MAX_TYPES];
@@ -78,6 +89,15 @@ private:
 
     static void task_func(void* ctx);
     void run(CpuState& state);
+
+    /* One type of a raise: its stamp, while softirq_entry is on, and its bit
+       -- true when this made it pending, false when it already was. */
+    bool make_pending(CpuState& state, ulong type);
+
+    /* A type's handler, run once with its records (softirq_entry and
+       softirq_exit) where they are on: `raised` the stamp of the raise its
+       wait is counted from, 0 for none. */
+    void run_handler(CpuState& state, ulong type, u64 raised);
 
     /* Whether this CPU has a pending type that is not already running
        somewhere else -- the condition its task blocks on. */

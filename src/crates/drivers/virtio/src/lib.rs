@@ -18,7 +18,7 @@ pub mod transport;
 
 use kcore::klog;
 
-pub use queue::{Buf, Queue, MAX_DESCRIPTORS};
+pub use queue::{Buf, Queue, UsedWatch, MAX_DESCRIPTORS};
 pub use transport::{
     driver_ok, failed, negotiate, QueueLayout, Transport, FEATURE_VERSION_1, STATUS_ACKNOWLEDGE,
     STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FAILED, STATUS_FEATURES_OK,

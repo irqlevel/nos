@@ -94,6 +94,19 @@ enum class Id : u16
        zeroing task's at a time (mm/page_zeroer.cpp). */
     MmZero,
 
+    /* The hardware interrupts' (group "irq"): one taken where a CPU's
+       dispatch takes it, and its handler done -- before the reschedule it
+       may end in -- with how long it took, the task it took the time from,
+       and for the local timer how late it came. */
+    IrqEntry,
+    IrqExit,
+    /* The deferred work's (group "softirq"): a soft IRQ raised, and its
+       handler's run on its CPU's softirq task -- how long the work waited
+       for the task, and how long the handler ran. */
+    SoftirqRaise,
+    SoftirqEntry,
+    SoftirqExit,
+
     Count
 };
 
@@ -646,6 +659,200 @@ enum MmZeroEnd : u8
     MmZeroStop,
 };
 
+/* ---- the hardware interrupts' payloads (the sites are where each
+   architecture's dispatch takes an interrupt: docs/tracing.md) ---- */
+
+/* What an interrupt was, by where the CPU's dispatch took it: irq_entry's
+   and irq_exit's `kind`. Appended to, never reordered. */
+enum class IrqKind : u8
+{
+    /* This CPU's local timer: its tick, or a sleeper's deadline it was
+       armed for */
+    Timer = 0,
+    /* An interprocessor interrupt: a wakeup's reschedule, queued work, a TLB
+       shootdown -- or a soft IRQ's kick to its own CPU */
+    Ipi = 1,
+    /* A device's message-signalled interrupt: MSI-X on x86, an LPI on arm64 */
+    Msi = 2,
+    /* A device's line: a driver's INTx on x86, a GIC SPI on arm64 */
+    Line = 3,
+    /* x86: a line the handlers of several drivers share */
+    Shared = 4,
+    /* x86: the PIT's and the HPET's, the boot CPU's timekeeping */
+    Pit = 5,
+    Hpet = 6,
+    /* x86: the 8042 keyboard's and the serial port's */
+    Kbd = 7,
+    Serial = 8,
+    /* x86: a posted interrupt's notification that found its vCPU out of its
+       guest */
+    Posted = 9,
+    /* A vector, or an INTID, no handler has */
+    Stray = 10,
+    /* The interrupt controller's own "nothing to take" */
+    Spurious = 11,
+};
+
+struct IrqEntry
+{
+    /* The vector on x86, the INTID on arm64 */
+    u32 vector;
+    /* The task it landed on, whose time it takes: its CPU's idle task when
+       the CPU had nothing to run */
+    u32 pid;
+    u8 kind;
+    u8 pad[3];
+};
+
+struct IrqExit
+{
+    u32 vector;
+    u32 pid;
+    /* The cycle counter's low half at the entry (0: not timed), read back
+       as the nanoseconds from it to this record (Kind::Since): the handler's
+       time, which the site reads no counter for */
+    u32 ns;
+    /* The local timer's: how far past the deadline it was armed for the
+       interrupt was taken -- interrupts off, a CPU waking from a deep idle;
+       0 for any other kind, whose raise is a device's and unseen */
+    u32 late_ns;
+    u8 kind;
+    u8 pad[3];
+};
+
+/* One interrupt's two records: irq_entry as the dispatch takes it, and
+   irq_exit once its handler is done, the time between in the exit. A site
+   is, where a CPU's dispatch takes an interrupt -- once an interrupt:
+
+       tp::Irq irq;
+       if (unlikely(tp::Irq::on()))
+           irq.begin(vector, tp::IrqKind::Msi);
+
+   and the exit is written as `irq` goes out of scope, or before then by
+   end(): a handler that ends in a reschedule ends its record first --
+   preempt() may switch to another task and come back to this one only
+   later, and what the reschedule does is the scheduler's events'. Off, the
+   site is two bytes' loads and a branch, and its end a byte of its own
+   stack's load and a branch. Begun with irq_exit on, the exit is written
+   if the event is on still at the end; one turned on halfway writes nothing
+   for this interrupt, having no time for it. */
+class Irq
+{
+public:
+    Irq()
+        : stamp_(0)
+        , vector_(0)
+        , pid_(0)
+        , late_ns_(0)
+        , kind_(0)
+        , open_(false)
+    {
+    }
+
+    ~Irq()
+    {
+        end();
+    }
+
+    Irq(const Irq& other) = delete;
+    Irq(Irq&& other) = delete;
+    Irq& operator=(const Irq& other) = delete;
+    Irq& operator=(Irq&& other) = delete;
+
+    /* Whether either event is on: what a site asks before it computes its
+       interrupt's vector. Both flags' bytes read and or'ed, not one asked
+       after the other: two loads of one line and a branch, where `||` is a
+       branch each. */
+    static inline __attribute__((always_inline)) bool on()
+    {
+        return (__atomic_load_n(&enabled[(ulong)Id::IrqEntry], __ATOMIC_RELAXED)
+            | __atomic_load_n(&enabled[(ulong)Id::IrqExit], __ATOMIC_RELAXED)) != 0;
+    }
+
+    /* The interrupt taken: irq_entry recorded, if it is on, and if irq_exit
+       is, what that needs kept -- the cycle counter, read after the entry's
+       record so that the exit's time is the handler's, and the task the
+       interrupt landed on. Once a scope; out of line. */
+    void begin(u32 vector, IrqKind kind);
+
+    /* Whether its irq_exit is to be written: what a site asks before it
+       computes what only the exit records (late). */
+    bool timed() const
+    {
+        return open_;
+    }
+
+    /* The local timer's lateness, for the exit's record */
+    void late(ulong ns)
+    {
+        late_ns_ = (u32)stdlib::min(ns, (ulong)~0U);
+    }
+
+    /* The handler done: irq_exit recorded, once, if it was begun timed and
+       the event is on still. */
+    inline __attribute__((always_inline)) void end()
+    {
+        if (unlikely(open_))
+            finish();
+    }
+
+private:
+    void finish();
+
+    u64 stamp_;
+    u32 vector_;
+    u32 pid_;
+    u32 late_ns_;
+    u8 kind_;
+    bool open_;
+};
+
+/* ---- the soft IRQs' payloads (the sites are kernel/softirq.cpp's) ---- */
+
+/* What a raise did (softirq_raise's `how`) */
+enum SoftirqHow : u8
+{
+    /* Already pending: the run it is owed takes this too */
+    SoftirqPending,
+    /* Its CPU's softirq task is the task running, and finds it at its loop's
+       next look: nothing sent */
+    SoftirqRunning,
+    /* The task woken, and its CPU sent the interrupt that switches to it */
+    SoftirqKicked,
+    /* No softirq task to run it -- before they are made, or once they are
+       stopped: left pending */
+    SoftirqNone,
+};
+
+struct SoftirqRaise
+{
+    u8 type;
+    u8 how;
+    u8 pad[2];
+};
+
+struct SoftirqEntry
+{
+    /* From the raise that made it pending -- the first of those this run
+       takes -- to the run: the work's wait for its task. 0 when not timed:
+       raised while the event was off */
+    u32 wait_ns;
+    u8 type;
+    u8 pad[3];
+};
+
+struct SoftirqExit
+{
+    /* The handler's run, from its entry: the time the task was switched out
+       of mid-run as well, which the scheduler's events show */
+    u32 ns;
+    u8 type;
+    /* Raised again while it ran -- by an interrupt, or by the handler on its
+       budget: the loop runs it again */
+    u8 again;
+    u8 pad[2];
+};
+
 /* ---- the sites ----
    One function an event, building its payload off what the scheduler has in
    its hands, so that a site is a line: the check, and the call with the
@@ -663,6 +870,9 @@ void emit_sched_preempt_deferred(Task* task, ulong cpu, ulong count, bool idle);
 void emit_idle(Id id, ulong cpu, Task* idle_task);
 void emit_sched_slice(ulong cpu, Task* task, ulong slice_ns, ulong runnable);
 void emit_mm_zero(ulong cpu, ulong pages, ulong huge_pages, ulong ns, MmZeroEnd end);
+void emit_softirq_raise(ulong type, SoftirqHow how);
+void emit_softirq_entry(ulong type, ulong wait_ns);
+void emit_softirq_exit(ulong type, ulong ns, bool again);
 
 /* The wakeup trigger: `trace freeze wakeup>N` arms it, and a task that gets
    its CPU later than that after a wakeup freezes the rings where they are,

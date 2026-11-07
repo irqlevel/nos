@@ -134,6 +134,23 @@ def held_sched(records):
 # time is read a few hundred ns from the clock the field was computed from
 RAN_SLACK_NS = 50000
 
+# The interrupts' and the soft IRQs' values, as tracepoint.cpp names them
+IRQ_KINDS = {"timer", "ipi", "msi", "line", "shared", "pit", "hpet", "kbd", "serial", "posted", "stray", "spurious"}
+SOFTIRQ_TYPES = {"net_rx", "blk_io", "net_tx"}
+SOFTIRQ_HOW = {"pending", "running", "kicked", "none"}
+# A pid no task has: what a record says of an interrupt off any task's stack
+NO_TASK = 4294967295
+# How far a handler's or a run's own time may be from the distance between
+# its two records: each stamp is read a few instructions from the other's --
+# a record apart, under TCG a few microseconds
+SPAN_SLACK_NS = 50000
+# The most two times computed from one stamp, each by its own conversion,
+# may differ by: the counter's step under TCG and a nanosecond's rounding
+CLOCK_STEP_NS = 1000
+# The most a local timer's interrupt may come past its deadline on an
+# emulated machine that is not stuck: a second, where the tick is 10 ms
+LATE_MAX_NS = 1000000000
+
 
 def dumped_records(reply):
     """The records `trace dump` printed, as objects, oldest first."""
@@ -158,6 +175,152 @@ def held_in_order(records, first, count):
     seqs = [seq for _, seq, _ in records]
     values_right = all(value == (seq * GOLDEN) & (2**64 - 1) for _, seq, value in records)
     return seqs == list(range(first, first + count)) and values_right
+
+
+def held_pairs(records, entry, done, key, field):
+    """Per CPU, each `done` record after its `entry` -- the same `key` --
+    with no other entry of the two between: an interrupt or a soft IRQ's run
+    is never inside another's on its CPU. For each pair whose `field`, the
+    time the done record says, is timed: that time less the distance between
+    the two records' times; and the first pair that is not a pair."""
+    open_at = {}
+    offs, problem = [], None
+    for r in records:
+        cpu = r["cpu"]
+        if r["ev"] == entry:
+            if cpu in open_at and problem is None:
+                problem = f"cpu {cpu}: an {entry} at {r['t']} inside the one at {open_at[cpu]['t']}"
+            open_at[cpu] = r
+        elif r["ev"] == done:
+            began = open_at.pop(cpu, None)
+            if began is None:
+                continue  # the window began inside it
+            if key(began) != key(r):
+                if problem is None:
+                    problem = f"cpu {cpu}: {key(began)} entered, {key(r)} done"
+                continue
+            if r["f"][field] > 0:
+                offs.append(r["f"][field] - (r["t"] - began["t"]))
+    return offs, problem
+
+
+def most_within(offs, slack):
+    """Whether nine in ten of `offs` are within `slack` either way: a few
+    microseconds a record apart on the machine, and under TCG now and then
+    a host thread's preemption between two stamps."""
+    if not offs:
+        return False
+    ordered = sorted(abs(o) for o in offs)
+    return ordered[(9 * (len(ordered) - 1)) // 10] < slack
+
+
+def exercise_irq(shell):
+    """The interrupts' and the soft IRQs' events: every CPU's tick, the
+    probe's IPIs and the shell's own datagrams -- the NIC's interrupts, and
+    the receive soft IRQ's runs -- each recorded as its description says."""
+    reply = shell.run("trace list")
+    for name, group in (("irq_entry", "irq"), ("irq_exit", "irq"), ("softirq_raise", "softirq"),
+                        ("softirq_entry", "softirq"), ("softirq_exit", "softirq")):
+        nb.check(re.search(rf"^\s*off\s+{name}\s+{group}\s", reply, re.M) is not None,
+                 f"the {name} event listed, in group {group}")
+    ring_cpus = {int(m.group(1)) for m in STAT_ROW.finditer(shell.run("trace stat"))}
+
+    shell.run("trace off all")
+    nb.check("2 events on" in shell.run("trace on irq"), "trace on irq turns the two interrupt events on")
+    nb.check("3 events on" in shell.run("trace on softirq"), "trace on softirq the three of the soft IRQs")
+    shell.run("trace clear")
+    shell.run("sched probe spinners=2 ms=200")
+
+    # Interrupts: per CPU each exit after its entry, the same vector and
+    # kind, none inside another, and the time the exit says the distance
+    # between the two records -- the Kind::Since read back.
+    dumped = dumped_records(shell.run("trace dump 250 irq", timeout=60))
+    nb.check(len(dumped) > 0, f"the probe left interrupts' records ({len(dumped)})")
+    bad = [r for r in dumped if r["f"].get("kind") not in IRQ_KINDS or r["f"].get("pid") == NO_TASK]
+    nb.check(not bad, "every interrupt's kind one the kernel has, and the task it landed on a task"
+             + (f" ({bad[0]})" if bad else ""))
+    offs, problem = held_pairs(dumped, "irq_entry", "irq_exit",
+                               lambda r: (r["f"]["vector"], r["f"]["kind"]), "ns")
+    nb.check(problem is None, "each irq_exit after its irq_entry, none inside another" + (f" ({problem})" if problem else ""))
+    # The exit's ns is from a stamp read after the entry's record is
+    # written: never more than the two records' distance -- a clock's step
+    # of rounding apart -- and short of it by the entry record's tail.
+    nb.check(offs and max(offs) <= CLOCK_STEP_NS,
+             f"no exit's ns past the distance from its entry ({len(offs)} of them, the most "
+             f"{max(offs or [0])} ns past)")
+    nb.check(most_within(offs, SPAN_SLACK_NS),
+             f"nine in ten exits' ns the distance from the entry, within {SPAN_SLACK_NS} ns "
+             f"(the most {max([-o for o in offs] or [0])} ns short)")
+    kinds = {r["f"]["kind"] for r in dumped}
+    nb.check({"timer", "ipi"} <= kinds, f"the local timer's and the IPIs' among them ({sorted(kinds)})")
+    reply = shell.run("trace dump 250 irq_exit kind=line", timeout=60) + \
+        shell.run("trace dump 250 irq_exit kind=msi", timeout=60)
+    devices = dumped_records(reply)
+    nb.check(len(devices) > 0, f"and a device's -- the NIC's, the disks' -- a line's or an MSI's ({len(devices)})")
+
+    # Every CPU's tick, each how late it came: never past what a machine
+    # that is not stuck can be, and late at all at least once.
+    timers = dumped_records(shell.run("trace dump 200 irq_exit kind=timer", timeout=60))
+    nb.check(timers and all(r["f"]["kind"] == "timer" for r in timers), "trace dump irq_exit kind=timer: timers alone")
+    nb.check({r["cpu"] for r in timers} == ring_cpus,
+             f"every cpu's local timer ({sorted({r['cpu'] for r in timers})} of {sorted(ring_cpus)})")
+    lates = [r["f"]["late_ns"] for r in timers]
+    nb.check(all(0 <= late < LATE_MAX_NS for late in lates) and any(late > 0 for late in lates),
+             f"each tick's late_ns past its deadline, under a second (the most {max(lates or [0])} ns)")
+
+    # The soft IRQs: per CPU each run's exit after its entry, the same type,
+    # its ns the run's time; and the wait a receive run says, from the raise
+    # that made its type pending -- the last on its CPU before it that was
+    # not pending already -- which is recorded before the run begins. The
+    # receive soft IRQ's: raised from an interrupt, on the CPU whose task
+    # runs it, where a task's raise of another type could be moved between
+    # its CPU's look and its record.
+    for _ in range(5):
+        shell.run("trace stat")
+    dumped = dumped_records(shell.run("trace dump 250 softirq", timeout=60))
+    bad = [r for r in dumped if r["f"].get("type") not in SOFTIRQ_TYPES
+           or (r["ev"] == "softirq_raise" and r["f"].get("how") not in SOFTIRQ_HOW)]
+    nb.check(not bad, "every soft IRQ's type and raise one the kernel has" + (f" ({bad[0]})" if bad else ""))
+    offs, problem = held_pairs(dumped, "softirq_entry", "softirq_exit", lambda r: r["f"]["type"], "ns")
+    nb.check(problem is None, "each softirq_exit after its softirq_entry" + (f" ({problem})" if problem else ""))
+    nb.check(most_within(offs, SPAN_SLACK_NS),
+             f"nine in ten runs' ns the distance between their two records, within {SPAN_SLACK_NS} ns "
+             f"({len(offs)} of them, the most {max([abs(o) for o in offs] or [0])} ns off)")
+    nb.check(any(r["ev"] == "softirq_entry" and r["f"]["type"] == "net_rx" for r in dumped),
+             "the shell's datagrams ran the receive soft IRQ")
+    offs, missing = [], 0
+    for i, r in enumerate(dumped):
+        if r["ev"] != "softirq_entry" or r["f"]["type"] != "net_rx" or r["f"]["wait_ns"] == 0:
+            continue
+        raises = [q for q in dumped[:i] if q["ev"] == "softirq_raise" and q["cpu"] == r["cpu"]
+                  and q["f"]["type"] == r["f"]["type"] and q["f"]["how"] != "pending"]
+        if not raises:
+            missing += 1
+            continue
+        offs.append((r["t"] - r["f"]["wait_ns"]) - raises[-1]["t"])
+    nb.check(most_within(offs, SPAN_SLACK_NS),
+             f"nine in ten runs' wait_ns from the raise that made the type pending ({len(offs)} of them, the "
+             f"most {max([abs(o) for o in offs] or [0])} ns off; {missing} whose raise the window had not)")
+
+    # A field filter on the interrupts' enumeration, and the host's report
+    reply = shell.run("trace show 20 irq_exit kind=ipi", timeout=60)
+    shown = sched_records(reply)
+    nb.check(shown and all(n == "irq_exit" and "kind=ipi" in f for _, n, f in shown),
+             f"trace show irq_exit kind=ipi shows the IPIs' exits alone ({len(shown)})")
+    dump_dir = tempfile.mkdtemp(prefix="trace-irq-")
+    try:
+        path = os.path.join(dump_dir, "dump.txt")
+        with open(path, "w") as f:
+            f.write(shell.run("trace dump 250 irq softirq", timeout=60))
+        out = subprocess.run([sys.executable, os.path.join(HERE, "trace-decode.py"), "--irq", path],
+                             capture_output=True, text=True)
+        nb.check(out.returncode == 0 and "irq:" in out.stdout,
+                 "trace-decode.py --irq reads the interrupts back" + (f": {out.stdout.strip()[-300:]}"
+                                                                         if out.returncode or "irq:" not in out.stdout
+                                                                         else ""))
+    finally:
+        shutil.rmtree(dump_dir, ignore_errors=True)
+    nb.check("5 events off" in shell.run("trace off irq,softirq"), "trace off irq,softirq")
 
 
 def exercise(shell):
@@ -521,6 +684,8 @@ def exercise(shell):
     shell.run("trace on test")
     nb.check("5 test records" in shell.run("trace test 5") and len(test_records(shell.run("trace show 5 test"))) == 5,
              "after trace free the next rings record")
+
+    exercise_irq(shell)
 
     shell.run("trace off all")
     shell.run("trace free")

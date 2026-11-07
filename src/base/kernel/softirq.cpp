@@ -3,6 +3,8 @@
 #include "klog.h"
 #include "sched.h"
 #include "cpu.h"
+#include "time.h"
+#include "tracepoint.h"
 
 #include <hal/cpu.h>
 #include <hal/irqchip.h>
@@ -22,6 +24,8 @@ SoftIrq::SoftIrq()
     {
         cpu_states_[i].pending.set(0);
         cpu_states_[i].task_ptr = nullptr;
+        for (ulong type = 0; type < MAX_TYPES; type++)
+            cpu_states_[i].raised_at[type] = 0;
     }
 }
 
@@ -105,29 +109,68 @@ bool SoftIrq::is_pending(ulong type)
     return cpu_states_[cpu].pending.test_bit(type);
 }
 
-void SoftIrq::raise(ulong type)
+namespace
 {
-    if (type >= MAX_TYPES)
+
+/* softirq_raise's record of each type in `types`: what the raise did */
+void emit_raised(ulong types, tp::SoftirqHow how)
+{
+    for (ulong rest = types; rest != 0; rest &= rest - 1)
+        tp::emit_softirq_raise((ulong)__builtin_ctzl(rest), how);
+}
+
+}
+
+void SoftIrq::raise_mask(ulong mask)
+{
+    /* A bit past the types is none */
+    mask &= ALL_TYPES;
+    if (mask == 0)
         return;
 
     ulong cpu = CpuTable::get_instance().get_current_cpu_id();
     if (BUG_ON(cpu >= MAX_CPUS))
         return;
 
-    if (cpu_states_[cpu].pending.set_bit(type))
-        return; /* was already pending */
+    CpuState& state = cpu_states_[cpu];
 
-    if (!ready_.get())
+    /* Each type's bit, and which of them this raise made pending: those a
+       pass of the task is owed for. One already pending joins the pass it
+       is owed already. */
+    ulong fresh = 0;
+    for (ulong rest = mask; rest != 0; rest &= rest - 1)
+    {
+        ulong type = (ulong)__builtin_ctzl(rest);
+        if (make_pending(state, type))
+            fresh |= 1UL << type;
+    }
+    if (fresh == 0)
         return;
 
-    /* The pending bit is up; now make sure the task will be looked at. This
+    if (!ready_.get())
+    {
+        if (unlikely(tp::on(tp::Id::SoftirqRaise)))
+            emit_raised(fresh, tp::SoftirqNone);
+        return;
+    }
+
+    /* The pending bits are up; now make sure the task will be looked at. This
        is unconditional and comes before the check below: between the Block()
        in Run() and the context switch that follows it the task is already out
        of the scheduler's walk while still being the current task, so a raise
        landing in that window would take the early return below and leave the
        work to sit until the tick repaired it. */
-    Task* target = cpu_states_[cpu].task_ptr;
+    Task* target = state.task_ptr;
     bool was_blocked = (target != nullptr) && target->is_blocked();
+
+    /* The raise's records before the hand-off: from the unblock on, the task
+       may run a handler -- and write its softirq_entry -- before anything
+       here does. What it will do, decided as below: left to the running
+       task, or the task kicked. */
+    if (unlikely(tp::on(tp::Id::SoftirqRaise)))
+        emit_raised(fresh, (!was_blocked && Task::try_get_current_task() == target)
+            ? tp::SoftirqRunning : tp::SoftirqKicked);
+
     if (target != nullptr)
         target->unblock();
 
@@ -156,8 +199,48 @@ void SoftIrq::raise(ulong type)
     /* Otherwise the kick is what gets the task scheduled: without it an idle
        CPU would not run its softirq task until the next timer tick. Sent
        directly -- CpuTable::send_ipi takes spinlocks that are not safe in
-       hard IRQ context. */
+       hard IRQ context. One for every type this raise made pending: a NIC's
+       interrupt with work for both its queues raises both at once, where a
+       raise each sent two -- the second after the first had unblocked the
+       task, an IPI to this CPU it already had on its way. */
     hal::send_ipi(cpu, CpuTable::IPI_VECTOR);
+}
+
+bool SoftIrq::make_pending(CpuState& state, ulong type)
+{
+    /* When the work came, for the wait its run's softirq_entry records:
+       only while that is on, by a raise that finds the type not pending --
+       before its bit, so that the run that takes the bit finds the stamp --
+       and only into a stamp the last run zeroed. `stamp` the one this raise
+       wrote, 0 for none: the counter is never 0 once the machine is up. */
+    u64 stamp = 0;
+    if (unlikely(tp::on(tp::Id::SoftirqEntry)) && !state.pending.test_bit(type))
+    {
+        u64 none = 0;
+        u64 now = hal::read_cycle_counter_unordered();
+        if (__atomic_compare_exchange_n(&state.raised_at[type], &none, now, false,
+                __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            stamp = now;
+    }
+
+    if (!state.pending.set_bit(type))
+        return true;
+
+    /* Pending already, by a raise that came between this one's look and its
+       bit -- an interrupt's, landing on a task's raise: the stamp is that
+       one's to write, and this one's is taken back, so that only the raise
+       that made the type pending leaves one, and no stamp outlives the
+       pending it was for. One that found its own taken back is left as it
+       is; the run says it was not timed. */
+    if (unlikely(stamp != 0))
+    {
+        u64 mine = stamp;
+        __atomic_compare_exchange_n(&state.raised_at[type], &mine, 0, false,
+            __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+    }
+    if (unlikely(tp::on(tp::Id::SoftirqRaise)))
+        tp::emit_softirq_raise(type, tp::SoftirqPending);
+    return false;
 }
 
 void SoftIrq::register_handler(ulong type, void (*handler)(void* ctx), void* ctx)
@@ -172,6 +255,30 @@ void SoftIrq::register_handler(ulong type, void (*handler)(void* ctx), void* ctx
 void SoftIrq::task_func(void* ctx)
 {
     SoftIrq::get_instance().run(*static_cast<CpuState*>(ctx));
+}
+
+void SoftIrq::run_handler(CpuState& state, ulong type, u64 raised)
+{
+    u64 began = hal::read_cycle_counter_unordered();
+    if (tp::on(tp::Id::SoftirqEntry))
+    {
+        /* 0 for none: raised while the event was off. The raise was read on
+           this CPU, or on one whose counter keeps step with it -- never
+           after this read, but held to it should one say otherwise */
+        ulong wait_ns = (raised != 0 && began > raised) ? cycle_counter_delta_to_ns(began - raised) : 0;
+        tp::emit_softirq_entry(type, wait_ns);
+    }
+
+    handlers_[type].func(handlers_[type].ctx);
+
+    /* Raised again while it ran -- an interrupt's, or the handler's own on
+       its budget -- so that this loop runs it again */
+    if (tp::on(tp::Id::SoftirqExit))
+    {
+        u64 ended = hal::read_cycle_counter_unordered();
+        tp::emit_softirq_exit(type, (ended > began) ? cycle_counter_delta_to_ns(ended - began) : 0,
+            state.pending.test_bit(type));
+    }
 }
 
 void SoftIrq::tick_kick(ulong cpu)
@@ -222,11 +329,23 @@ void SoftIrq::run(CpuState& state)
                 continue;
             }
 
+            /* The stamp of the raise that made it pending, if softirq_entry
+               wants it -- and zeroed for the next raise whether it does or
+               not, so that no stamp outlives its pending: read while the bit
+               is still up, when no raise writes one (SoftIrq::raise_mask) */
+            u64 raised = 0;
+            if (unlikely(tp::on(tp::Id::SoftirqEntry)))
+                raised = __atomic_load_n(&state.raised_at[i], __ATOMIC_RELAXED);
+            __atomic_store_n(&state.raised_at[i], 0, __ATOMIC_RELAXED);
+
             state.pending.clear_bit(i);
 
             if (handlers_[i].func)
             {
-                handlers_[i].func(handlers_[i].ctx);
+                if (unlikely(tp::on(tp::Id::SoftirqEntry) || tp::on(tp::Id::SoftirqExit)))
+                    run_handler(state, i, raised);
+                else
+                    handlers_[i].func(handlers_[i].ctx);
                 handled = true;
             }
 
