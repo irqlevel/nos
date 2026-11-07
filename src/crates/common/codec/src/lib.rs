@@ -117,6 +117,16 @@ impl<'a> Reader<'a> {
         core::str::from_utf8(self.take(n)?).ok()
     }
 
+    /// The next `n` bytes, as they are: a length the bytes before said.
+    pub fn bytes(&mut self, n: usize) -> Option<&'a [u8]> {
+        self.take(n)
+    }
+
+    /// How many bytes are left.
+    pub fn remaining(&self) -> usize {
+        self.buf.len() - self.at
+    }
+
     /// Whether everything was read.
     pub fn done(&self) -> bool {
         self.at == self.buf.len()

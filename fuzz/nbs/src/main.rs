@@ -2,13 +2,14 @@
 //!
 //!     nbs-fuzz gate
 //!
-//! everything the gate holds: the meta target over seeds 1 to 300 and the cs
-//! target over 1 to 200, every allocation held to what the kernel's heap
+//! everything the gate holds: the meta target over seeds 1 to 300, the cs
+//! target over 1 to 200 and the wire target over 1 to 100, every allocation
+//! held to what the kernel's heap
 //! gives at once (fuzz/raft's `heap`). Exit 0 when everything held, 1 with
 //! what did not -- a finding with its seed, to run again with
 //! `<target> --seed N --trace`.
 //!
-//!     nbs-fuzz meta|cs [--seed N] [--seeds K] [--steps S] [--seconds T] [--trace]
+//!     nbs-fuzz meta|cs|wire [--seed N] [--seeds K] [--steps S] [--seconds T] [--trace]
 //!
 //! one target; with `--seconds`, seeds on from the first until the time is
 //! up -- a campaign.
@@ -17,6 +18,7 @@
 mod heap;
 mod cs;
 mod meta;
+mod wire;
 /* Shared with fuzz/raft, of which this crate takes what it needs */
 #[allow(dead_code)]
 #[path = "../../raft/src/rng.rs"]
@@ -33,6 +35,8 @@ const GATE_META_SEEDS: u64 = 300;
 const META_STEPS: u64 = 400;
 const GATE_CS_SEEDS: u64 = 200;
 const CS_STEPS: u64 = 300;
+const GATE_WIRE_SEEDS: u64 = 100;
+const WIRE_STEPS: u64 = 500;
 
 /// A run's outcome, a panic included as a finding, and a block asked for
 /// that the kernel's heap would not give.
@@ -99,11 +103,13 @@ fn main() -> ExitCode {
         Some("gate") | None => {
             target("meta", meta::run, 1, GATE_META_SEEDS, META_STEPS, None, false)
                 + target("cs", cs::run, 1, GATE_CS_SEEDS, CS_STEPS, None, false)
+                + target("wire", wire::run, 1, GATE_WIRE_SEEDS, WIRE_STEPS, None, false)
         }
         Some("meta") => one("meta", meta::run, META_STEPS),
         Some("cs") => one("cs", cs::run, CS_STEPS),
+        Some("wire") => one("wire", wire::run, WIRE_STEPS),
         Some(other) => {
-            eprintln!("nbs-fuzz: no target {} -- gate, meta, cs", other);
+            eprintln!("nbs-fuzz: no target {} -- gate, meta, cs, wire", other);
             return ExitCode::from(2);
         }
     };
