@@ -9,7 +9,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-extfmt = { path = "../../src/crates/extfmt" }
+extfmt = { path = "../../src/crates/common/storage/extfmt" }
 
 # Overflow checks on, as a RUSTUB=1 build has them: what a disk says is
 # untrusted, and an overflow on it is a bug of its own.

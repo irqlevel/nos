@@ -11,7 +11,7 @@ it ([raft.md](raft.md), [cluster.md](cluster.md), [nbs.md](nbs.md)).
   that host's root, and that host's hv starts it (`hv start`). Its CPUs go on
   the cores the host's `hv::place` gives it: whole cores of its own by
   default (`Cores::Own`), shared only when asked. Its memory comes from the
-  huge pool or the heap. `modules/hv/src/cores.rs` decides and takes those
+  huge pool or the heap. `modules/hypervisor/hv/src/cores.rs` decides and takes those
   holds under one lock.
 - **Nothing knows the cluster's VMs**: the panel asks every host's API in
   turn.

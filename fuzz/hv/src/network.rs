@@ -1,7 +1,7 @@
 //! What the guests' network reaches of the kernel: the net layer's devices,
-//! frames, ARP and NAT singleton (as `net/src/nat.rs` reaches them), the
+//! frames, ARP and NAT singleton (as `layers/net/src/nat.rs` reaches them), the
 //! module's view of them (`kcore::net`, `kcore::vnic`, as the switch in
-//! `modules/hv/src/net.rs` does), and the VM a port wakes.
+//! `modules/hypervisor/hv/src/net.rs` does), and the VM a port wakes.
 //!
 //! Wired as the kernel wires them. `hv0` is a virtual NIC: what the switch
 //! hands the stack (`Vnic::receive`) goes first to NAT's `intercept`, as a
@@ -354,7 +354,7 @@ pub mod vnic {
         }
         /// A frame into the stack as `hv0` received it, kept for the target:
         /// an IPv4 packet to NAT first, as the receive path hands it
-        /// (`net/src/device.rs`), and else -- and anything else -- the
+        /// (`layers/net/src/device.rs`), and else -- and anything else -- the
         /// stack's own, kept too. False when the stack would not take it.
         pub fn receive(&self, frame: &[u8]) -> bool {
             use netwire::{eth, ETH_HDR_LEN, ETH_TYPE_IP, IP_HDR_LEN, MAX_FRAME};

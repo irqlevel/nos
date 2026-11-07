@@ -1,0 +1,13 @@
+[package]
+name = "virtio-net"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "virtio_net"
+
+[dependencies]
+kcore = { path = "../../../base/kcore" }
+# The device table a NIC registers in, and the frames it moves.
+net = { path = "../../../layers/net" }
+virtio = { path = "../../virtio" }

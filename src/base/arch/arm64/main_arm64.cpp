@@ -32,7 +32,7 @@
 
 
 extern "C" void rust_init();
-/* The network layer is Rust (src/crates/net): the recycled frame pool, the
+/* The network layer is Rust (src/crates/layers/net): the recycled frame pool, the
    log over UDP armed as soon as the command line is known, TCP, and the
    services boot starts once there is a device and a shell. */
 extern "C" int rust_netframe_pool_setup(unsigned long count);
@@ -41,30 +41,30 @@ extern "C" int rust_tcp_init();
 extern "C" void rust_net_start_services(unsigned short udp_shell_port);
 extern "C" void rust_net_stop_shell();
 extern "C" void rust_net_stop_netconsole();
-/* The filesystem layer is Rust (src/crates/fs): what boot mounts where, and
+/* The filesystem layer is Rust (src/crates/layers/fs): what boot mounts where, and
    taking it all down again on the way out. */
 extern "C" void rust_mount_root_fs();
 extern "C" void kernel_vfs_unmount_all();
 extern "C" void rust_mgmt_stop();
-/* The message channel is Rust (src/crates/ipc): at the halt, after the
+/* The message channel is Rust (src/crates/layers/ipc): at the halt, after the
    modules, no mailbox is made and no message sent */
 extern "C" void rust_ipc_stop();
 
-/* The disk log is Rust (src/crates/block/src/disklog.rs). */
+/* The disk log is Rust (src/crates/layers/block/src/disklog.rs). */
 extern "C" int rust_disklog_setup();
 extern "C" void rust_disklog_stop();
 extern "C" void rust_test();
 extern "C" void rust_fini();
-/* The random pool is Rust (src/crates/random), the x86 twin's counterpart */
+/* The random pool is Rust (src/crates/base/random), the x86 twin's counterpart */
 extern "C" bool rust_random_setup();
 extern "C" void rust_random_reseed();
-/* The partition table reader (src/crates/block), the x86 twin's counterpart */
+/* The partition table reader (src/crates/layers/block), the x86 twin's counterpart */
 extern "C" void rust_partitions_probe();
 
 namespace kernel
 {
 /* Where a virtio-mmio window is, as the Rust drivers take it
-   (virtio::mmio::Slot in src/crates/virtio/src/mmio.rs) */
+   (virtio::mmio::Slot in src/crates/drivers/virtio/src/mmio.rs) */
 struct VirtioMmioSlot
 {
     ulong base;    /* kernel VA of the register window */
@@ -73,15 +73,15 @@ struct VirtioMmioSlot
     u32 reserved;
 };
 }
-/* The virtio-rng driver (src/crates/drivers/virtio_rng), which takes the
+/* The virtio-rng driver (src/crates/drivers/rng/virtio_rng), which takes the
    virtio-mmio windows the device tree described -- the arm64 bus. */
 extern "C" void rust_virtio_rng_init_mmio(const kernel::VirtioMmioSlot* slots, unsigned long count);
-/* The virtio-blk driver (src/crates/drivers/virtio_blk), likewise over the
+/* The virtio-blk driver (src/crates/drivers/block/virtio_blk), likewise over the
    windows the device tree described */
 extern "C" void rust_virtio_blk_init_mmio(const kernel::VirtioMmioSlot* slots, unsigned long count);
-/* The virtio-net driver (src/crates/drivers/virtio_net), likewise */
+/* The virtio-net driver (src/crates/drivers/net/virtio_net), likewise */
 extern "C" void rust_virtio_net_init_mmio(const kernel::VirtioMmioSlot* slots, unsigned long count);
-/* The virtio-scsi driver (src/crates/drivers/virtio_scsi), likewise */
+/* The virtio-scsi driver (src/crates/drivers/block/virtio_scsi), likewise */
 extern "C" void rust_virtio_scsi_init_mmio(const kernel::VirtioMmioSlot* slots, unsigned long count);
 namespace kernel { bool pci_ecam_setup(); }
 extern "C" void __cxa_finalize(void*);

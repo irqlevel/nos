@@ -68,7 +68,7 @@ bool VirtQueue::GetUsed(u32& id, u32& len)
 
 The first barrier keeps earlier loads ahead of the index load, but says nothing about the index load and the ring loads, which both come after it. The ring loads take their slot from `LastUsedIdx`, the driver's own counter, not from the index just read, so no address dependency makes the CPU wait. All that links them is the `if`, a control dependency. On arm64 that orders a load before later stores, but not before later loads: the CPU predicts the branch and issues the next load early. So a fresh index can pair with a stale ring entry. The same goes for whatever the caller reads next, such as a disk request's status byte or a received frame.
 
-x86 never reorders a load with another load, so this cannot happen there. Two Rust drivers had the same pattern. NVMe's `read_cqe` checked a completion entry's phase bit, which the controller flips on every pass around the queue, and then read the entry. r8168's `harvest` checked a receive descriptor's OWN bit, which says whether the NIC or the driver holds it, and then handed out a frame whose address came from a shadow array. Both now call `kcore::barrier::dma_rmb()` right after the check ([nvme](https://github.com/irqlevel/nos/blob/master/src/crates/drivers/nvme/src/queue.rs), [r8168](https://github.com/irqlevel/nos/blob/master/src/crates/drivers/r8168/src/desc.rs)).
+x86 never reorders a load with another load, so this cannot happen there. Two Rust drivers had the same pattern. NVMe's `read_cqe` checked a completion entry's phase bit, which the controller flips on every pass around the queue, and then read the entry. r8168's `harvest` checked a receive descriptor's OWN bit, which says whether the NIC or the driver holds it, and then handed out a frame whose address came from a shadow array. Both now call `kcore::barrier::dma_rmb()` right after the check ([nvme](https://github.com/irqlevel/nos/blob/master/src/crates/drivers/block/nvme/src/queue.rs), [r8168](https://github.com/irqlevel/nos/blob/master/src/crates/drivers/net/r8168/src/desc.rs)).
 
 ## The right instruction for the wrong audience
 
@@ -76,7 +76,7 @@ The second bug was a barrier that did emit an instruction, just the wrong one. T
 
 The `ish` names a shareability domain. Arm groups everything that observes memory into domains, and a barrier promises an order only to observers in the domain it names. The inner-shareable domain is typically the CPUs that run one operating system. The outer-shareable domain is wider and can include other bus masters, such as a PCIe device doing DMA. So `dmb ish` ordered the NVMe command before the doorbell as other CPUs see it, and promised nothing to the controller that actually reads it.
 
-The fix is a new module, `kcore::barrier`, the Rust half of `Hal::DmaWmb` and `Hal::DmaRmb` ([barrier.rs](https://github.com/irqlevel/nos/blob/master/src/crates/kcore/src/barrier.rs)):
+The fix is a new module, `kcore::barrier`, the Rust half of `Hal::DmaWmb` and `Hal::DmaRmb` ([barrier.rs](https://github.com/irqlevel/nos/blob/master/src/crates/base/kcore/src/barrier.rs)):
 
 ```rust
 pub fn dma_wmb() {

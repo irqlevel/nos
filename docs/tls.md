@@ -17,26 +17,26 @@ What the kernel supplies, and already had:
 
 | TLS needs | comes from |
 |---|---|
-| a byte transport | the TCP of `src/crates/net` (`tcp.rs`) |
-| randomness | the kernel's pool (`src/crates/random`, reached through `kcore::random`) — a ChaCha20 pool over RDSEED/RDRAND, RNDR, virtio-rng and timing jitter, see [Randomness](random.md) |
+| a byte transport | the TCP of `src/crates/layers/net` (`tcp.rs`) |
+| randomness | the kernel's pool (`src/crates/base/random`, reached through `kcore::random`) — a ChaCha20 pool over RDSEED/RDRAND, RNDR, virtio-rng and timing jitter, see [Randomness](random.md) |
 | a wall clock, for certificate validity | `get_wall_time_secs()` |
 | a heap | the Rust global allocator over `mm::alloc` |
 
 ## The pieces
 
 ```
-  wget                           src/crates/net/src/wget.rs
+  wget                           src/crates/layers/net/src/wget.rs
       |
-  http::get_with_location        src/crates/net/src/http.rs
+  http::get_with_location        src/crates/layers/net/src/http.rs
       |   Transport: send / recv
       |         |
     Plain      Tls
       |         |
-      |     TlsStream<T>         src/crates/tls
+      |     TlsStream<T>         src/crates/layers/tls
       |         |  rustls, rustls-rustcrypto, webpki-roots
       |     T: tls::Transport    implemented by http.rs for its connection
       |         |
-      +------  TCP               src/crates/net/src/tcp.rs
+      +------  TCP               src/crates/layers/net/src/tcp.rs
 ```
 
 `Transport` is the seam: request framing, header parsing, chunked decoding,
@@ -59,7 +59,7 @@ There is no `std` in the kernel, so `read_tls`/`write_tls` — which take
 `std::io` traits — are not available. The `tls` crate drives rustls'
 unbuffered API instead: `process_tls_records` returns one state at a time
 (`EncodeTlsData`, `TransmitTlsData`, `BlockedHandshake`, `ReadTraffic`,
-`WriteTraffic`, `Closed`) and the loop in `src/crates/tls/src/lib.rs` does the
+`WriteTraffic`, `Closed`) and the loop in `src/crates/layers/tls/src/lib.rs` does the
 reading, the writing and the buffering that `std::io` would have done.
 
 One rule matters more than the rest: **call `process_tls_records` once per
@@ -194,7 +194,7 @@ and on an application processor, which runs with `CR4.OSFXSR` clear, the
 first block hashed is an invalid opcode. It takes a feature instead, so
 `kernel/Cargo.toml` asks for `force-soft` -- which reaches the TLS client
 too, since a crate is built once for the whole graph -- and so does
-`ssh/Cargo.toml`, because a module is a build of its own that the kernel's
+`common/net/ssh/Cargo.toml`, because a module is a build of its own that the kernel's
 features do not reach.
 
 `getrandom` has no backend for a bare-metal target either; the `tls` crate

@@ -8,7 +8,7 @@ from the same changes.
 
 ## Where it starts
 
-`src/crates/net/src/tcp.rs`:
+`src/crates/layers/net/src/tcp.rs`:
 
 - **64 connections for the whole kernel** (`MAX_CONNECTIONS`), each with 8
   KiB of its own each way.

@@ -1,4 +1,4 @@
-//! The cluster's registry (src/crates/registry, plans/cluster.md) held to a
+//! The cluster's registry (src/crates/common/cluster/registry, plans/cluster.md) held to a
 //! model of its own:
 //!
 //! - **Alone**: one registry and the model take the same commands --

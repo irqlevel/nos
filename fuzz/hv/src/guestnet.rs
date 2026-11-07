@@ -1,6 +1,6 @@
 //! The guests' network: the switch between their NICs and `hv0`
-//! (`modules/hv/src/net.rs`), with its DHCP server, and NAT
-//! (`net/src/nat.rs`), which takes a guest's packets out into the world and
+//! (`modules/hypervisor/hv/src/net.rs`), with its DHCP server, and NAT
+//! (`layers/net/src/nat.rs`), which takes a guest's packets out into the world and
 //! the world's answers back. Frames here are the guests' own, and the
 //! world's: anything at all, and every field of them a lie now and then.
 

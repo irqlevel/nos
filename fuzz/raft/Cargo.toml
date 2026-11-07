@@ -9,9 +9,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-raft = { path = "../../src/crates/raft" }
+raft = { path = "../../src/crates/common/cluster/raft" }
 # The cluster's registry, the crate's first user (plans/cluster.md).
-registry = { path = "../../src/crates/registry" }
+registry = { path = "../../src/crates/common/cluster/registry" }
 # The CRC32C the log's records are checked by, for the known answers and
 # for records made by hand.
 crc = { path = "../../src/crates/common/crc" }

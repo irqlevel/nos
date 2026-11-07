@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Raft test: the raft crate (src/crates/raft), decided on the host.
+"""Raft test: the raft crate (src/crates/common/cluster/raft), decided on the host.
 
 The crate is the consensus the cluster's registry and NBS's metadata service
 run on (plans/raft.md): a member of a group as a state machine with no I/O,
@@ -48,7 +48,7 @@ into a host program that holds it to:
     timeouts; every client answered once calm, and the history of every
     operation checked for linearizability (RAFT_RSM_STATS=1 says what each
     run did);
-  - the registry target: the cluster's registry (src/crates/registry) held
+  - the registry target: the cluster's registry (src/crates/common/cluster/registry) held
     to a model of its own, alone and as a group through raft::rsm: every
     answer, every host, invitation and removed host, the voters and every
     host's peers; its snapshot read back, changed and refused, and a

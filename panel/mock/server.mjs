@@ -901,7 +901,7 @@ const all = descriptors();
 
 /* ---- what nos lets in at once ---- */
 
-/* api.ko's limits with no api.toml (modules/api/src/config.rs): connections
+/* api.ko's limits with no api.toml (modules/mgmt/api/src/config.rs): connections
  * in all, of one client's key, and in their handshake. One past them is
  * reset as nos resets it -- at the door, or right after its handshake when it
  * is its key's -- and counted as api.status counts it on nos, `busy`. */

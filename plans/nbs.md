@@ -35,7 +35,7 @@ for other users after NBS ([raft.md](raft.md)).
   and the refusals (an EFI or BIOS boot partition never, a device with
   something on it only with `force`). A cs's pool is that.
 - **A guest's disk in hv**: `blk::Backend` over `QueuedDisk`, whose `Media`
-  is an `ImageQueue` or a `DiskQueue` (`modules/hv/src/disk.rs`); 64 requests
+  is an `ImageQueue` or a `DiskQueue` (`modules/hypervisor/hv/src/disk.rs`); 64 requests
   in flight (`IN_FLIGHT`), 256 KiB the largest (`REQUEST_BYTES`); a flush is
   synchronous in the disk's task.
 - **Files for the mds**: `kcore::fs::append` (by path, not synced),

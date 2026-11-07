@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""api-test: the host API module (modules/api) and nosctl, end to end.
+"""api-test: the host API module (modules/mgmt/api) and nosctl, end to end.
 
 nos boots under QEMU with api.ko, modtest.ko and sshd.ko on its root, an
 api.toml that listens on eth0 (hv0 is the default, and the panel's), and two

@@ -437,7 +437,7 @@ if trace::on::<HvExit>() {
 An event's description stays the kernel's, one table for both languages: its
 number in `tp::Id`, its payload struct and fields' table, its line in
 `EVENTS` (below). What Rust has of one is in
-`src/crates/kcore/src/trace/events.rs`, one list read by one macro
+`src/crates/base/kcore/src/trace/events.rs`, one list read by one macro
 (`events!`): the event's number, its payload -- a `#[repr(C)]` struct of
 integers and arrays of them, with no padding, which is asserted, since the
 ring copies out every byte -- and the event it records, which ties the two
@@ -483,8 +483,8 @@ tracepoints take, from the flags' address to the ring.
 
 ## The hypervisor's events
 
-Group `hv`, recorded by the hv module (`src/crates/hv`): the payloads are
-kcore's (`events.rs`), the records built in `hv/src/tp.rs` and written at
+Group `hv`, recorded by the hv module (`src/crates/hypervisor/hv`): the payloads are
+kcore's (`events.rs`), the records built in `hypervisor/hv/src/tp.rs` and written at
 the sites named here. Each says its guest CPU by its number in its guest
 (`vcpu`) and its task's `pid` -- the BSP's is the task that runs the VM,
 each other's `hv/<vm>/cpu<n>` -- which tells one VM's from another's and
@@ -530,11 +530,11 @@ A time of 4.29 s or more is held at that, the most a u32 of nanoseconds has.
 ## A guest disk's events
 
 A request from a guest's virtio disk to the device and back, a record at
-each hand-off: group `blk` the virtio disk (`hv/src/devices/blk.rs`),
+each hand-off: group `blk` the virtio disk (`hypervisor/hv/src/devices/blk.rs`),
 group `disk` what serves it -- the hv module's disk task
-(`modules/hv/src/disk.rs`), the image (`fs/src/image.rs`) and the block
-layer's asynchronous queue (`block/src/queue.rs`) -- and group `fs` the
-ext4 journal (`fs/src/ext4/journal.rs`). A request is said by its `disk`
+(`modules/hypervisor/hv/src/disk.rs`), the image (`layers/fs/src/image.rs`) and the block
+layer's asynchronous queue (`layers/block/src/queue.rs`) -- and group `fs` the
+ext4 journal (`layers/fs/src/ext4/journal.rs`). A request is said by its `disk`
 (vda 0) and its `slot`, the buffer it has while it is out; a command to
 the device by its queue's `entry` and `buffer`.
 
@@ -560,7 +560,7 @@ and `disk_done` to `blk_complete` the vCPU's round coming for it. With
 ## TCP's events
 
 A connection's life on the wire and in its program, a record at each step,
-group `tcp` (`net/src/tcp.rs`). Every record says the connection by its
+group `tcp` (`layers/net/src/tcp.rs`). Every record says the connection by its
 `slot` -- the same in all of them -- and its two ports:
 
 | event | where, and what it records |
@@ -596,7 +596,7 @@ table (name, `offsetof`, `sizeof`, how to print it), and its line in the
 `EVENTS` table (name, group, help, size). A site checks `tp::on()` and calls
 `tp::emit()` with exactly the payload's size -- a size its description does
 not have is a `BUG_ON`. An event Rust records has one thing more, its line in
-`kcore/src/trace/events.rs`: its number, and its payload's fields with the
+`base/kcore/src/trace/events.rs`: its number, and its payload's fields with the
 same names, offsets and sizes -- an enumeration's with a `names!` type of
 the same names -- and its padding named, `_pad`, so that the struct has
 none; the boot's check holds it to the C++ table, which says the order a

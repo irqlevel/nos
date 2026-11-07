@@ -62,15 +62,15 @@ impl Caps {
     }
 }
 
-#[path = "../../../src/crates/hvarch/src/x86/svm/vmcb.rs"]
+#[path = "../../../src/crates/hypervisor/hvarch/src/x86/svm/vmcb.rs"]
 pub mod vmcb;
 
-#[path = "../../../src/crates/hvarch/src/x86/kick.rs"]
+#[path = "../../../src/crates/hypervisor/hvarch/src/x86/kick.rs"]
 pub mod kick;
 
 /// hvarch's own, as it is: the trait the world switch's loop answers an
 /// exit through (`vm::Cpu::enter` below calls it as the backends do).
-#[path = "../../../src/crates/hvarch/src/x86/fast.rs"]
+#[path = "../../../src/crates/hypervisor/hvarch/src/x86/fast.rs"]
 pub mod fast;
 
 /// WRMSRs answered in the world switch's own loop (`vm::Cpu::enter`'s
@@ -425,7 +425,7 @@ pub mod x86 {
             pub r15: u64,
         }
 
-        /// hvarch's own, as it is (`hvarch/src/x86/kick.rs`).
+        /// hvarch's own, as it is (`hypervisor/hvarch/src/x86/kick.rs`).
         pub use crate::cpu::kick::Kick;
 
         /// hvarch's: an entry's world switch as the cycle counter saw it,
