@@ -3,12 +3,20 @@
 version = 4
 
 [[package]]
+name = "crc"
+version = "0.1.0"
+
+[[package]]
 name = "extfmt"
 version = "0.1.0"
+dependencies = [
+ "crc",
+]
 
 [[package]]
 name = "hvboot-test"
 version = "0.1.0"
 dependencies = [
+ "crc",
  "extfmt",
 ]

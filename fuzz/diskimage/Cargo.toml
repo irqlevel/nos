@@ -3,7 +3,7 @@
 # to compare; its DEFLATE decoder held to zlib's answers; and images with
 # their metadata changed at random, the code held to never panicking,
 # never writing outside the disk and always ending (scripts/diskimage-test.py).
-# Nothing but the crate itself, a path of its own, so it builds offline.
+# Nothing but the tree's own crates, by path, so it builds offline.
 [package]
 name = "diskimage-test"
 version = "0.1.0"
@@ -11,6 +11,9 @@ edition = "2021"
 
 [dependencies]
 diskimage = { path = "../../src/crates/diskimage" }
+# The tree's CRC-32, whose answers over the decoder's output the script holds
+# to zlib's.
+crc = { path = "../../src/crates/common/crc" }
 
 # Overflow checks on, as a RUSTUB=1 build has them: what is converted is a
 # download, and an overflow on what it says is a bug of its own.

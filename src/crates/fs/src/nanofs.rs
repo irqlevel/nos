@@ -18,12 +18,19 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use block::Disk;
-use kcore::crc32::{crc32_update, crc32_with_hole};
+use crc::crc32::update as crc32_update;
 use kcore::dma::DmaBuffer;
 use kcore::klog;
 
 use crate::vfs::{FileSystem, Space};
 use crate::vnode::{Kind, NodeId, Tree, NAME_MAX};
+
+/// A block's CRC-32 with its own checksum field, at `hole`, counted as
+/// zeros. The fields are the format's offsets, well inside a block, so the
+/// `None` of one outside never comes; 0 stands for it, as it always has.
+fn crc32_with_hole(block: &[u8], hole: usize) -> u32 {
+    crc::crc32::with_hole(block, hole).unwrap_or(0)
+}
 
 pub const MAGIC: u32 = 0x4E41_4E4F; // "NANO"
 pub const VERSION: u32 = 1;

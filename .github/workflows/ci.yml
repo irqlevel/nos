@@ -100,6 +100,17 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           python3 scripts/extfmt-test.py
 
+      # One crate computes every CRC the formats are checked by -- GPT's,
+      # nanofs's, the disk log's, ext4's, raft's log's -- for the kernel,
+      # hvboot and the fuzzers: a CRC computed wrong is a disk that looks
+      # corrupt, or one that does not. Its known answers, every form held
+      # to the CRC computed from its definition, and CRC-32 to zlib's.
+      - name: CRC test (host)
+        if: matrix.arch == 'x86_64'
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 scripts/crc-test.py
+
       # A cloud's image is a download, and `hv convert` reads it in the
       # kernel: a cluster read wrong is a guest's disk with the wrong bytes
       # in it, and nothing to say so. Converted on the host and held to

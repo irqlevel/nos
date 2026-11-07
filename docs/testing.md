@@ -227,6 +227,7 @@ swallowing panic messages whole.
 | `trace-test.py [--arch aarch64\|x86_64]` | arm64 (x86-64 where grub-mkrescue is) | the tracepoints and the `trace` command: a boot's `tracepoints=`, records shown merged and in order, the rings made again, wrapped, cleared, frozen, freed -- [Tracepoints](tracing.md) |
 | `image-test.py [--image FILE]` | x86-64 (CI) | the system image and what pours and boots it: `make image`, `build/image/`, `nos-install` and its `--panel`, `root=UUID=` |
 | `web-test.py` | host (CI) | the host API's wire: `src/crates/web`, `src/crates/mgmtwire`, a provider's descriptor |
+| `crc-test.py [--seed N] [--cases N]` | host (CI) | the tree's CRCs (`src/crates/common/crc`) -- CRC-32, CRC-32C and CRC-16, which GPT, nanofs, the disk log, ext4 and raft's log are checked by -- from the crate's own sources: the known answers, every form held to the CRC computed from its definition a bit at a time, and CRC-32 to zlib's |
 | `raft-test.py [--seed N --seconds S] [--mutants]` | host (CI) | the raft crate (`src/crates/raft`): known answers, the known traps played out, groups fuzzed over a network that fails in every way and held to Raft's properties at every step, the wire fed noise, a member fed what no correct member sends, the log on disk through power cuts, torn writes and lost ones, a register through the replicated state machine checked for linearizability, every allocation held to a block of the kernel's heap -- [Raft](raft.md) |
 | `api-test.py [--arch aarch64\|x86_64]` | both (arm64 in CI) | the host API module, `nosctl`, the bus's caller side for modules; on x86-64 the `vm` provider through it and `api panel create` |
 | `panel/`: `npx playwright test` | host (CI) | the management panel against the mock API, both themes and both languages |
@@ -2211,7 +2212,8 @@ hvboot reads a guest's partition table, its ext2/3/4 /boot and its GRUB
 configuration, and boots the entry GRUB would: get any of that wrong and
 the guest boots something else -- an older kernel, the recovery entry --
 with nothing to say so. `fuzz/hvboot` compiles that code, its own sources
-(`src/crates/hvboot/src/{gpt,ext,grub,bzimage,crc32}.rs`), into a host
+(`src/crates/hvboot/src/{gpt,ext,grub,bzimage}.rs`, over extfmt and the
+tree's `crc`), into a host
 program, and the gate runs it over disks it makes: a GPT whose /boot is a
 partition of its own (an XBOOTLDR, as Ubuntu's image has, beside an ESP), an
 MBR whose /boot is on the root filesystem (as Debian's), and a disk that is
@@ -2710,6 +2712,42 @@ it; SHA-1's round constant; GeneralizedTime from 2051, a client's
 certificate for servers, a serial's top bit set; a leading zero in an
 address -- each failed it. Needs cargo and openssl; `--seed N --iters N` for
 a campaign.
+
+### `crc-test.py` -- the tree's CRCs, decided on the host
+
+One crate, `src/crates/common/crc`, computes every CRC the tree's formats
+are checked by: CRC-32 (GPT's header and partition array, nanofs's blocks,
+the disk log's header, the `crc32` command), CRC-32C (ext4's metadata_csum
+and journal, raft's log) and CRC-16 (ext4's gdt_csum) -- for the kernel,
+for hvboot in a guest and for the fuzzers on the host alike, where each of
+those had once a copy of its own. A CRC computed wrong is a disk that looks
+corrupt, or one that does not, and nothing else says which: `fuzz/crc`
+compiles the crate, as it is, into a host program and holds it to
+
+- the known answers: each CRC's check value (`123456789`), CRC-32's of the
+  quick brown fox, RFC 3720's four CRC-32C vectors, CRC-16 from 0 (ARC) and
+  from !0 (MODBUS, as gdt_csum starts it), and the references below held to
+  the same values, since a reference wrong in the crate's way would pass it;
+- 20,000 random messages -- most of them short, many around the eight-byte
+  steps the crate takes, some of 9000 bytes, each at a random alignment --
+  every function held to the CRC computed from its definition: the
+  polynomial as it is written, not reflected, divided into the message a
+  bit at a time with the bytes and the register reflected around it, which
+  shares nothing with the crate's reflected tables but the answer. `raw`
+  from a random register, `update` from a random CRC, `checksum`, each whole
+  and carried on across a random split; `with_hole` against the block with
+  its field zeroed, and refusing a field not inside the block;
+- CRC-32 against Python's zlib, over messages the script makes: every length
+  to 64 bytes, then lengths around and past the 64 KiB the `crc32` command
+  reads at a time, each whole and fed in random pieces.
+
+It takes about five seconds. Six bugs planted by hand in the crate -- two
+of the tables swapped, a polynomial's bit changed in CRC-32C and in CRC-16,
+`update` not inverting its result, the bytes past the last eight shifted by
+seven, `with_hole`'s bound one byte long -- each failed it. Every boot holds
+the kernel's own build of the crate to the check values as well
+(`crc32::selftest` in `rust_test`). `--seed N --cases N` for a campaign.
+Needs cargo.
 
 ### `raft-test.py` -- consensus, decided on the host
 
