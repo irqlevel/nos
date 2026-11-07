@@ -9,6 +9,7 @@
 #include <lib/stdlib.h>
 #include <mm/memory_map.h>
 #include <mm/page_table.h>
+#include <mm/page_zeroer.h>
 #include <mm/page_allocator.h>
 #include <mm/new.h>
 #include <mm/allocator.h>
@@ -374,6 +375,10 @@ static void bp_startup_arm(void* ctx)
        UDP: both on eth0, both the layer's to start. */
     rust_net_start_services(Parameters::get_instance().get_udp_shell_port());
 
+    /* The zeroing of free pages, last (as in kernel/main.cpp) */
+    if (!mm::PageZeroer::get_instance().start())
+        klog(0, "mm: the zeroing tasks did not start: every page is zeroed as it is handed out");
+
     /* The events tracepoints= named, on now that every CPU has its ring --
        after the self-tests, whose own use of the rings ends in freeing them. */
     tp::boot_on(Parameters::get_instance().get_tracepoints());
@@ -421,6 +426,9 @@ static void bp_startup_arm(void* ctx)
             /* The netconsole after all of them, with the halt's own lines
                (as in kernel/main.cpp), before the soft IRQs stop. */
             rust_net_stop_netconsole();
+
+            /* The zeroing tasks, with the soft IRQs (as in kernel/main.cpp) */
+            mm::PageZeroer::get_instance().stop();
 
             /* Then the soft IRQ tasks themselves, as on x86. Left running
                into the halt they were never released -- SoftIrq's own
@@ -602,6 +610,8 @@ extern "C" void main_arm64(void* dtb)
     pt.reserve_huge_pool(Parameters::get_instance().get_huge_pool_bytes(pt.get_total_pages_count() * consts::PAGE_SIZE));
     /* And mapped, for the copies into and out of guests' memory (PageTable::map_huge_pool_window) */
     pt.map_huge_pool_window();
+    /* zerofree=verify (as in kernel/main.cpp) */
+    pt.set_zero_check(Parameters::get_instance().is_zero_free_verify());
 
     /* W^X: kernel text is RX, everything else in the image is RW+NX.
        Runs after the free-pages list so the walk sees the final image

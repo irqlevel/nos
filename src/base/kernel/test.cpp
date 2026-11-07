@@ -671,6 +671,179 @@ stdlib::Error test_contiguous_pages()
     return make_success();
 }
 
+/* The zeroing of free pages (PageTable::zero_free_page and its huge pool's
+   twin), before the tasks that do it exist (PageZeroer): pages zeroed onto
+   the zeroed list and counted there, still counted free; a guest's
+   allocation (alloc_page_keeping) taking them before any other, each read
+   as zero by zerofree=verify's check; a page written to, freed, and
+   allocated again by the kernel's own path (alloc_page) back without a
+   byte of what was written; and the counts where they began. With a pool,
+   a block zeroed page by page into the known-zero ones, handed out as it
+   is and read, and back. */
+stdlib::Error test_zero_free()
+{
+    auto& pt = mm::PageTable::get_instance();
+    static const ulong PAGES = 16;
+    static const u8 PATTERN = 0x5A;
+    const bool check_was = pt.is_zero_check();
+    const ulong reserve = pt.get_kernel_reserve_pages();
+    const ulong free0 = pt.get_free_pages_count();
+    const ulong zeroed0 = pt.get_zeroed_pages_count();
+    mm::Page* pages[PAGES] = {};
+    stdlib::Error err = make_success();
+
+    klog(0, "test_zero_free: started, %lu free, %lu of them zeroed", free0, zeroed0);
+    if (free0 <= reserve + PAGES)
+    {
+        klog(0, "test_zero_free: too little free to test (%lu, the reserve %lu)", free0, reserve);
+        return make_error(stdlib::Error::NO_MEMORY);
+    }
+
+    for (ulong i = 0; i < PAGES; i++)
+    {
+        if (!pt.zero_free_page(reserve))
+        {
+            klog(0, "test_zero_free: zero_free_page %lu found nothing to zero", i);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
+        }
+    }
+    if (pt.get_zeroed_pages_count() != zeroed0 + PAGES || pt.get_free_pages_count() != free0)
+    {
+        klog(0, "test_zero_free: after zeroing %lu: %lu zeroed (want %lu), %lu free (want %lu)", PAGES,
+            pt.get_zeroed_pages_count(), zeroed0 + PAGES, pt.get_free_pages_count(), free0);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+    }
+
+    /* A guest's allocations take the zeroed ones first, and the check reads
+       each: a word not zero is a panic */
+    pt.set_zero_check(true);
+    for (ulong i = 0; i < PAGES; i++)
+    {
+        pages[i] = pt.alloc_page_keeping(reserve);
+        if (pages[i] == nullptr)
+        {
+            klog(0, "test_zero_free: alloc_page_keeping %lu failed", i);
+            err = make_error(stdlib::Error::NO_MEMORY);
+            break;
+        }
+    }
+    pt.set_zero_check(check_was);
+    if (err.ok() && pt.get_zeroed_pages_count() != zeroed0)
+    {
+        klog(0, "test_zero_free: the guest's allocations left %lu zeroed, not %lu: not taken from the zeroed list",
+            pt.get_zeroed_pages_count(), zeroed0);
+        err = make_error(stdlib::Error::UNSUCCESSFUL);
+    }
+
+    /* Written to, freed -- dirty again, on the other list -- and taken back
+       by the kernel's own allocation, which prefers those: zeroed again */
+    for (ulong i = 0; err.ok() && i < PAGES; i++)
+    {
+        ulong va = pt.tmp_map_page(pages[i]->get_phy_address());
+        if (va == 0)
+        {
+            klog(0, "test_zero_free: tmp_map_page failed");
+            err = make_error(stdlib::Error::UNSUCCESSFUL);
+            break;
+        }
+        stdlib::mem_set((void*)va, PATTERN, consts::PAGE_SIZE);
+        pt.tmp_unmap_page(va);
+    }
+    for (ulong i = 0; i < PAGES; i++)
+    {
+        if (pages[i] != nullptr)
+            pt.free_page(pages[i]);
+        pages[i] = nullptr;
+    }
+    if (!err.ok())
+        return err;
+    if (pt.get_free_pages_count() != free0 || pt.get_zeroed_pages_count() != zeroed0)
+    {
+        klog(0, "test_zero_free: after the frees %lu free (want %lu), %lu zeroed (want %lu)",
+            pt.get_free_pages_count(), free0, pt.get_zeroed_pages_count(), zeroed0);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+    }
+
+    for (ulong i = 0; err.ok() && i < PAGES; i++)
+    {
+        pages[i] = pt.alloc_page();
+        if (pages[i] == nullptr)
+        {
+            klog(0, "test_zero_free: alloc_page %lu failed", i);
+            err = make_error(stdlib::Error::NO_MEMORY);
+            break;
+        }
+        ulong va = pt.tmp_map_page(pages[i]->get_phy_address());
+        if (va == 0)
+        {
+            klog(0, "test_zero_free: tmp_map_page failed");
+            err = make_error(stdlib::Error::UNSUCCESSFUL);
+            break;
+        }
+        const u8* bytes = (const u8*)va;
+        for (ulong b = 0; b < consts::PAGE_SIZE; b++)
+        {
+            if (bytes[b] != 0)
+            {
+                klog(0, "test_zero_free: page 0x%lX handed out again with 0x%x at %lu",
+                    pages[i]->get_phy_address(), (unsigned int)bytes[b], b);
+                err = make_error(stdlib::Error::UNSUCCESSFUL);
+                break;
+            }
+        }
+        pt.tmp_unmap_page(va);
+    }
+    for (ulong i = 0; i < PAGES; i++)
+    {
+        if (pages[i] != nullptr)
+            pt.free_page(pages[i]);
+    }
+    if (!err.ok())
+        return err;
+    if (pt.get_free_pages_count() != free0)
+    {
+        klog(0, "test_zero_free: %lu free at the end, not %lu", pt.get_free_pages_count(), free0);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+    }
+
+    /* The huge pool, when there is one: a block's worth of the zeroing makes
+       one block known zero -- none is, before the tasks start -- which the
+       next allocation takes as it is, read under the check */
+    if (pt.get_huge_pool_blocks() != 0 && pt.get_huge_pool_free() != 0)
+    {
+        const ulong huge_zeroed0 = pt.get_huge_pool_zeroed();
+        for (ulong i = 0; i < mm::PageTable::HUGE_FRAME_PAGES; i++)
+        {
+            if (!pt.zero_free_huge_page())
+            {
+                klog(0, "test_zero_free: zero_free_huge_page %lu found nothing to zero", i);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
+            }
+        }
+        if (pt.get_huge_pool_zeroed() != huge_zeroed0 + 1)
+        {
+            klog(0, "test_zero_free: %lu blocks known zero after a block's worth, not %lu",
+                pt.get_huge_pool_zeroed(), huge_zeroed0 + 1);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
+        }
+        pt.set_zero_check(true);
+        ulong block = pt.alloc_huge_frame();
+        pt.set_zero_check(check_was);
+        if (block == 0 || pt.get_huge_pool_zeroed() != huge_zeroed0)
+        {
+            klog(0, "test_zero_free: the block known zero was not the one handed out (0x%lX, %lu known zero)",
+                block, pt.get_huge_pool_zeroed());
+            if (block != 0)
+                pt.free_huge_frame(block);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
+        }
+        pt.free_huge_frame(block);
+    }
+
+    klog(0, "test_zero_free: complete");
+    return make_success();
+}
+
 stdlib::Error test_page_allocator()
 {
     klog(0, "test_page_allocator: started");
@@ -3002,6 +3175,10 @@ stdlib::Error test()
         return err;
 
     err = test_page_allocator();
+    if (!err.ok())
+        return err;
+
+    err = test_zero_free();
     if (!err.ok())
         return err;
 
