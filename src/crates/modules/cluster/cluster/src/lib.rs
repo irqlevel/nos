@@ -34,7 +34,7 @@ use alloc::sync::Arc;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use ipcwire::control::{self, Identity};
+use ipcwire::control;
 use kcore::cmd::{Command as ShellCommand, Output};
 use kcore::error::Error;
 use kcore::ipc::{Limits, Mailbox};
@@ -42,6 +42,7 @@ use kcore::klog;
 use kcore::task::TaskHandle;
 use kcore::time::Duration;
 use raft::{Config, LogConfig, Role, Rsm};
+use raftmember::ipcnet::{call as ctl, identity};
 use raftmember::{KFiles, Locked};
 use registry::{Answer, Command, Role as AddrRole, State};
 
@@ -68,9 +69,6 @@ const USAGE: &str = "usage: cluster                          this member: its no
 
 /// How long an invitation is good for, by the leader's clock.
 const INVITE_SECS: u64 = 15 * 60;
-/// How long the shell waits for ipcnet's answer: a list of peers may wait
-/// out a dropped peer's dial.
-const CTL_MS: u64 = 15_000;
 /// How long a join is tried for -- the connection to the member coming up
 /// first -- and how long each try waits for its answer.
 const JOIN_TOTAL_MS: u64 = 60_000;
@@ -111,11 +109,13 @@ impl Drop for Starting<'_> {
     }
 }
 
-/* Dropped in this order: the provider, waiting out a call of it; the
-   member's task, stopped and waited out -- its log closed with it -- then
-   the command, waiting out a call of it */
+/* Dropped in this order: the provider and the command, each waiting out a
+   call of it -- an `init`, a join or a recover under way would start the
+   member's task after the stop below otherwise, and the module's code be
+   freed under it -- then the member's task, stopped and waited out, its log
+   closed with it */
 struct Cluster {
-    _cmd: ShellCommand,
+    cmd: Option<ShellCommand>,
     provider: Option<kcore::mgmt::Provider>,
     state: Arc<ModState>,
 }
@@ -125,6 +125,7 @@ impl kmod::Module for Cluster {}
 impl Drop for Cluster {
     fn drop(&mut self) {
         drop(self.provider.take());
+        drop(self.cmd.take());
         stop(&self.state);
     }
 }
@@ -181,7 +182,7 @@ fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn
             None
         }
     };
-    Ok(Box::new(Cluster { _cmd: cmd, provider, state }))
+    Ok(Box::new(Cluster { cmd: Some(cmd), provider, state }))
 }
 
 kmod::module!(name: "cluster", init_with_params: init);
@@ -228,25 +229,6 @@ fn run_member(state: &ModState, me: files::Member, log: member::Log, campaign: b
     };
     state.task.with(|t| *t = Some(task));
     Ok(())
-}
-
-/// A request of ipcnet's control mailbox: its answer's bytes, or why not.
-fn ctl(tag: u32, data: &[u8]) -> Result<alloc::vec::Vec<u8>, String> {
-    let mb = Mailbox::new(Limits { messages: 4, bytes: 4096 }).map_err(|e| alloc::format!("no mailbox: {}", e.name()))?;
-    let to = kcore::ipc::lookup(control::NAME)
-        .ok_or_else(|| String::from("ipcnet is not loaded -- `insmod ipcnet.ko`, and `ipcnet init` its hosts.toml"))?;
-    let answer = mb.call(to, tag, data, Duration::from_millis(CTL_MS))
-        .map_err(|_| String::from("ipcnet did not answer"))?;
-    if answer.tag == control::TAG_REFUSED {
-        return Err(alloc::format!("ipcnet: {}", String::from_utf8_lossy(&answer.data)));
-    }
-    Ok(answer.data)
-}
-
-/// Who this host is, as ipcnet has it.
-fn identity() -> Result<Identity, String> {
-    let data = ctl(control::TAG_ID, &[])?;
-    Identity::decode(&data).ok_or_else(|| String::from("ipcnet said who this host is in no form it has"))
 }
 
 fn view(state: &ModState) -> Option<View> {

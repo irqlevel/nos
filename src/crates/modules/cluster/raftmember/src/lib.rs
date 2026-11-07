@@ -29,8 +29,9 @@
 extern crate alloc;
 
 mod files;
+pub mod ipcnet;
 
-pub use files::KFiles;
+pub use files::{create_dirs, KFiles};
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;

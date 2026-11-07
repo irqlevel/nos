@@ -14,3 +14,5 @@ name = "raftmember"
 [dependencies]
 kcore = { path = "../../../base/kcore" }
 raft = { path = "../../../common/cluster/raft" }
+# ipcnet's control mailbox: who this host is.
+ipcwire = { path = "../../../common/ipc/ipcwire" }

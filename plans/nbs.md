@@ -529,7 +529,32 @@ each new gate.
   channel with an empty state, its log on the root; `nbs init`, `nbs host
   add`, `nbs status`; nbs-test's first phase: elections, a killed leader,
   partitions, restarts that keep the log, a wiped host refused as the old
-  member.
+  member. Done (docs/nbs.md). N0 to N4 were done before it. As built:
+  - **raftmember**: the member engine was taken out of cluster.ko into a
+    crate of its own, `src/crates/modules/cluster/raftmember`, which both
+    modules link. It holds the task, raft over ipc, commands handed to the
+    leader, the membership kept to the state's voters, and the log's files.
+    Each group's own part is its `App`. The registry's byte codec became
+    `common/codec` the same way.
+  - **nbsmeta** for now holds the cluster's identity and its members by
+    incarnation, the removed ones, and the voters (the first five). Its
+    fuzz target is `fuzz/raft`'s `nbsmeta`, beside the registry's; fuzz/nbs
+    comes with N6, which grows the state.
+  - **The join is an offer**: the member `nbs host add` is typed at offers
+    the cluster to `nbs.mds@<host>`. The host's mds, in no cluster, makes its
+    incarnation, its member file and an empty log, and answers. Then `Add`
+    commits, and the leader adds it as a learner and makes it a voter once
+    it holds the log. While a host is in no cluster, a listener holds
+    `nbs.mds` to take the offer.
+  - **A wiped host** answers raft's messages for its old member with "no
+    such member". The leader says so (`nbs`, and its log), an add of the
+    host is declined by the host itself, and `nbs host replace` removes the
+    old member for good and offers a new one. `nbs host remove` is there
+    too; `nbs hosts` names `nbs status`'s list.
+  - **The folder is `/nbs/mds`** (`member`, `raft/`). `/nbs/nbs.toml` waits
+    for the cs's devices (N7).
+  - **Tests**: `scripts/nbs-test.py`, three arm64 nos on hub.py with the
+    registry made among them first.
 - **N6, the metadata.** `nbsmeta` and its target: volumes, hosts, devices,
   placement, the snapshot of the state, the digest; the commands and the
   `nbs` provider.
