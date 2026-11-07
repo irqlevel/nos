@@ -324,6 +324,16 @@ const char* str_chr_once(const char* s, char sep);
 
 size_t log2(size_t size);
 
+/* As log2 -- the least n with 2^n >= size -- by the count of leading zeros
+   rather than a loop over the bits: for a path every Rust allocation and
+   free takes (AllocatorImpl::footprint) */
+static inline size_t log2_clz(size_t size)
+{
+    if (size < 2)
+        return 0;
+    return size_of_in_bits<size_t>() - static_cast<size_t>(__builtin_clzl(size - 1));
+}
+
 constexpr size_t const_log2(size_t v)
 {
     size_t r = 0;
