@@ -172,6 +172,40 @@ impl Super {
     }
 }
 
+/// What a device holds where a cs's superblock goes, its first two pages:
+/// whether a cs formats it, opens it, or leaves it alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Holds {
+    /// Zeros: never formatted, or a format cut short -- for a cs to format.
+    Nothing,
+    /// A cs's superblock: the newer of its good copies.
+    Nbs(Super),
+    /// Neither: a filesystem's, a partition table's, or a superblock of
+    /// NBS's both copies of which are damaged -- to be left alone.
+    Other,
+}
+
+/// What pages `a` and `b` -- a device's first two -- hold.
+///
+/// A format writes zeros over both pages first, then a superblock into the
+/// first bytes of A, then of B, and nothing past them: a page that has
+/// anything past a superblock's bytes was never written by a cs. That is
+/// what keeps a device with something else at its start -- a boot sector, a
+/// filesystem's superblock at 1 KiB, a partition table's header -- from
+/// being taken for blank where a superblock's own first bytes are zeros, or
+/// for a format cut in copy A where B is.
+pub fn holds(a: &[u8], b: &[u8]) -> Holds {
+    let ours = |p: &[u8]| p.get(SUPER_BYTES..).is_some_and(|rest| rest.iter().all(|&x| x == 0));
+    if !ours(a) || !ours(b) {
+        return Holds::Other;
+    }
+    match choose(Super::decode(a), Super::decode(b), |s: &Super| s.seq) {
+        Some(Decoded::Valid(s)) => Holds::Nbs(s),
+        Some(Decoded::Empty) => Holds::Nothing,
+        _ => Holds::Other,
+    }
+}
+
 /// A volume's fence: the newest attach generation the cs has been told.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Fence {

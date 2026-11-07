@@ -622,7 +622,58 @@ each new gate.
       replaced by a snapshot, and a member removed.
 - **N7, the cs.** `nbscs` and its target; `nbs-cs.ko`: its pool (ids,
   claims, `DiskQueue`, refusals), fences, open marks, reads and writes,
-  garbage.
+  garbage. Done (docs/nbs.md, "The chunk server"), with decision 3 taken as
+  written: the client to the cs's, each cs checking with its own host's mds.
+  As built:
+  - **Its pool is the metadata's**, not a file of the cs's: the devices
+    `nbs devices add` put there for this host's cs, asked of the host's mds
+    every 5 s. `nbs devices add` refuses a device with anything on it but
+    zeros or this cluster's superblock; `wipe` (the plan's `force`) zeroes
+    its first 8 KiB once the metadata has it. The cs formats a blank device,
+    leaves anything else alone and says why, and serves only once it has
+    taken every device in -- with one missing, a chunk on it would read as
+    zeros and be written twice.
+  - **The format** (`nbscs`'s `format.rs`) is the plan's, with every record
+    -- a slot's and a fence's -- its own: a sequence number and a CRC32C
+    seeded with the format's 64-bit id. A page is written in copy A, flushed,
+    then in copy B; the fences are a table of their own in slot 0, the same on
+    every device. A device is blank only where its first two pages are zeros
+    past a superblock's 128 bytes too, so that a filesystem whose first bytes
+    are zeros is never formatted.
+  - **A chunk has an incarnation** (nbsmeta's `Chunk.incarnation`, the
+    snapshot's format NBM3): a freed chunk's number is taken again, and a
+    slot of the chunk it was is never read or written for the one it is. The
+    plan had no such thing; without it, a cs that missed a free would serve a
+    new chunk the old one's data.
+  - **What the fuzzer found**, through power cuts (`fuzz/nbs`'s `cs`
+    target): a slot's zeros not flushed before the record that takes it,
+    which let a record kept with its zeros lost read another volume's data; a
+    record's first write torn in copy A taken for a lost record; a fence page
+    left with one copy stale at the open, which the next cut could leave with
+    neither. And in the module: a read not held to the chunk's volume. Each
+    has its mutant now.
+  - **One task**, not one a device: requests one at a time, each waited for
+    on its device. N11 measures what more would take.
+  - **No reports to the leader**: the cs asks its mds which of its chunks
+    and fences are gone, every 30 s, and gives them back (garbage). What a
+    cs holds is to be pulled by N9's repair rather than pushed.
+  - **The wire** (`nbswire`): a client's requests and a cs's answers on
+    `nbs.cs`, a cs's questions to `nbs.mds` and its answers; every request
+    and answer between hosts by ipcnet's bulk connection, so that a client's
+    keep their order and do not hold up raft.
+  - **`nbs io`** in nbs-mds writes, reads, flushes, closes, attaches and
+    detaches a volume from the shell, as N8's client will: fence each cs
+    before its first write, write every replica, read one.
+  - **Tests**:
+    - `fuzz/nbs`'s `cs` target (power cuts with torn sectors and rot, every
+      fence, open mark, close and sector held to what it may be) and `wire`
+      target, with seventeen mutants of the two crates;
+    - nbs-test's N7 phase: devices taken in and formatted, a device with
+      something on it refused and wiped, a volume written to three replicas
+      and read back, flushed, closed, a writer fenced out by a forced attach,
+      a host booted again with its data, fence and open marks, a volume
+      deleted with every cs giving its chunks and fence back, and a host's
+      nbs-cs unloaded and loaded again.
 - **N8, the client.** `nbsclient`; hv's `nbs:` disks; attach, fence,
   reconcile, flush; `nbsload.ko`; the `cluster` target; nbs-test's I/O
   phases, `hv-nbs-test.py`.
