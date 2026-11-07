@@ -154,17 +154,22 @@ still counted free (it is nobody's), and marked, so that a free of it -- a
 page freed twice -- panics (`free_page_no_lock`: a page handed out never has
 the mark). A page is taken only while more than `keep` are free; the tasks
 keep the kernel's reserve, where the one page off the lists can make no
-allocation fail. `alloc_contiguous_pages` finds a run across both lists and
-zeroes only the pages of it that are not marked.
+allocation fail. `alloc_contiguous_pages` finds a run across both lists and,
+once it has let go of the lock, zeroes only the pages of it that were not
+marked.
 
 The huge pool has a third bitmap, `huge_pool_zeroed_bits_`, of its free blocks
 known zero. `zero_free_huge_page` zeroes a page of a free block a call, under
 the pool's own lock (`huge_pool_lock_`, so that it keeps no 4 KiB allocation
 waiting), the block staying free throughout; once all 512 are done the block
 is known zero, and `alloc_huge_frame`, which takes such a block first, hands
-it out as it is. An allocation of the block the zeroing is part way through
-takes it like any block not known zero -- zeroing it whole -- and the zeroing
-goes on with another.
+it out as it is. With none known zero it takes the block the zeroing is part
+way through next, and zeroes only the pages the zeroing has not done -- those
+before `huge_zero_next_` were zeroed under the pool's lock, and the block has
+been free since -- while the zeroing goes on with another. Both look for
+blocks from the same place, so while a guest takes its memory they meet
+block after block: a zeroing task on an idle CPU does part of each of the
+guest's blocks, and the allocation the rest, rather than all of it again.
 
 The tasks (`PageZeroer`): one starts with the huge pool, the other with the 4
 KiB pages, each going on to the other's work when its own has none. They are
@@ -215,7 +220,10 @@ physically consecutive and still free — a self-pointing list entry is what
 marks a descriptor as allocated. The walk is deliberately unbounded (a cap
 would turn a slow allocation into a spurious OOM, and plain `new` panics on
 that) but says so in the log once it has examined more than a thousand
-entries, because it runs with the page-table lock held.
+entries, because it runs with the page-table lock held. The run is zeroed
+after the lock is let go, a page at a time, as `alloc_page` zeroes a page:
+under the lock, a run of 128 pages was half a megabyte of stores with
+interrupts off and every other CPU's allocation waiting for it.
 
 **`PageAllocatorImpl`** — eight `FixedPageAllocator` buckets, for 1, 2, 4 …
 128 pages. The VA arena starts where `page_array_` ends and spans 70% of the

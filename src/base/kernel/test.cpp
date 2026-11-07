@@ -806,11 +806,82 @@ stdlib::Error test_zero_free()
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    /* The huge pool, when there is one: a block's worth of the zeroing makes
-       one block known zero -- none is, before the tasks start -- which the
-       next allocation takes as it is, read under the check */
-    if (pt.get_huge_pool_blocks() != 0 && pt.get_huge_pool_free() != 0)
+    /* The huge pool, when there is one. First a block taken from under the
+       zeroing: a block written all over and given back, the zeroing a
+       hundred pages into it -- it starts on the block the last allocation
+       took, the lowest free one of its word, while no block is known zero
+       -- and the next allocation, with none known zero, takes that block,
+       its first hundred pages read under the check and the rest zeroed: all
+       of it zeros. Then a block's worth of the zeroing makes one block known
+       zero -- none is, before the tasks start -- which the next allocation
+       takes as it is, read under the check. */
+    if (pt.get_huge_pool_blocks() != 0 && pt.get_huge_pool_free() != 0 && pt.get_huge_pool_zeroed() == 0)
     {
+        static const ulong PART = 100;
+        const ulong dirty = pt.alloc_huge_frame();
+        if (dirty == 0)
+        {
+            klog(0, "test_zero_free: no block of the pool handed out with %lu free", pt.get_huge_pool_free());
+            return make_error(stdlib::Error::NO_MEMORY);
+        }
+        for (ulong i = 0; i < mm::PageTable::HUGE_FRAME_PAGES; i++)
+        {
+            ulong va = pt.tmp_map_page(dirty + i * consts::PAGE_SIZE);
+            if (va == 0)
+            {
+                klog(0, "test_zero_free: tmp_map_page failed");
+                pt.free_huge_frame(dirty);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
+            }
+            stdlib::mem_set((void*)va, PATTERN, consts::PAGE_SIZE);
+            pt.tmp_unmap_page(va);
+        }
+        pt.free_huge_frame(dirty);
+        for (ulong i = 0; i < PART; i++)
+        {
+            if (!pt.zero_free_huge_page())
+            {
+                klog(0, "test_zero_free: zero_free_huge_page %lu found nothing to zero", i);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
+            }
+        }
+        pt.set_zero_check(true);
+        const ulong taken = pt.alloc_huge_frame();
+        pt.set_zero_check(check_was);
+        if (taken != dirty)
+        {
+            klog(0, "test_zero_free: the allocation took 0x%lX, not 0x%lX, the block the zeroing was part way through",
+                taken, dirty);
+            if (taken != 0)
+                pt.free_huge_frame(taken);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
+        }
+        for (ulong i = 0; err.ok() && i < mm::PageTable::HUGE_FRAME_PAGES; i++)
+        {
+            ulong va = pt.tmp_map_page(taken + i * consts::PAGE_SIZE);
+            if (va == 0)
+            {
+                klog(0, "test_zero_free: tmp_map_page failed");
+                err = make_error(stdlib::Error::UNSUCCESSFUL);
+                break;
+            }
+            const ulong* words = (const ulong*)va;
+            for (ulong w = 0; w < consts::PAGE_SIZE / sizeof(ulong); w++)
+            {
+                if (words[w] != 0)
+                {
+                    klog(0, "test_zero_free: page %lu of a block taken from under the zeroing holds 0x%lX at word %lu",
+                        i, words[w], w);
+                    err = make_error(stdlib::Error::UNSUCCESSFUL);
+                    break;
+                }
+            }
+            pt.tmp_unmap_page(va);
+        }
+        pt.free_huge_frame(taken);
+        if (!err.ok())
+            return err;
+
         const ulong huge_zeroed0 = pt.get_huge_pool_zeroed();
         for (ulong i = 0; i < mm::PageTable::HUGE_FRAME_PAGES; i++)
         {
