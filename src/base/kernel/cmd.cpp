@@ -27,6 +27,7 @@
 #include <mm/page_table.h>
 #include <mm/memory_map.h>
 #include <mm/new.h>
+#include <mm/heap_usage.h>
 #include <lib/unique_ptr.h>
 #include <lib/grub_env.h>
 
@@ -1504,6 +1505,24 @@ static void cmd_memusage(const char* args, stdlib::Printer& con)
     con.printf("totalPages: %lu\n", pt.get_total_pages_count());
     con.printf("hugePages: %lu free of %lu, %lu of them zeroed\n", pt.get_huge_pool_free(), pt.get_huge_pool_blocks(),
         pt.get_huge_pool_zeroed());
+    /* The fewest there have been free since the free list was built */
+    con.printf("free_pages_lowest: %lu\n", pt.get_free_pages_lowest());
+
+    /* Rust's heap: Box, Vec, String and the rest, through its global
+       allocator (kernel_alloc). Asked is what Rust asked for; taken what
+       that took of RAM once the heap rounded it up -- a 16-byte Box takes a
+       32-byte block and the pool's 24-byte header, a 300 KiB Vec a run of
+       512 KiB. The peaks are the most each has been at once. */
+    mm::HeapUsage::Totals rust;
+    mm::rust_heap_usage().read(rust);
+    const long kib = static_cast<long>(consts::KB);
+    con.printf("rust_heap: %ld KiB taken, %ld KiB asked, %ld blocks\n",
+        rust.taken / kib, rust.bytes / kib, rust.blocks);
+    con.printf("rust_heap_peak: %ld KiB taken, %ld KiB asked, %ld blocks (to within %ld KiB and %ld blocks a cpu)\n",
+        rust.taken_peak / kib, rust.bytes_peak / kib, rust.blocks_peak,
+        mm::HeapUsage::FOLD_BYTES / kib, mm::HeapUsage::FOLD_BLOCKS);
+    con.printf("rust_heap_since_boot: %lu allocations, %lu frees, %lu refused\n",
+        rust.allocs, rust.frees, rust.refused);
 }
 
 static void cmd_memcheck(const char* args, stdlib::Printer& con)

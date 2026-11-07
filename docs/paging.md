@@ -271,6 +271,59 @@ costs what the first one did (`heapbench`, below, measures each):
 `AllocatorImpl::trim` gives all of it back; an allocation that finds no page
 or no VA trims the page allocator's lists and tries once more before refusing.
 
+### What Rust holds of it
+
+Rust's global allocator -- every `Box`, `Vec`, `String` and `Arc` of the
+image and of every module -- reaches the heap through `kernel_alloc` and
+`kernel_free`, which count it (`mm/heap_usage.{h,cpp}`): the bytes asked
+for; what they took once the heap rounded them up
+(`AllocatorImpl::footprint`: a 16-byte `Box` takes a 32-byte block and the
+pool's 24-byte header, a 300 KiB `Vec` a run of 512 KiB, every page of it
+backed); the blocks; and the most of each there has been at once -- with the
+allocations and frees since boot, and the allocations the heap had nothing
+for, a `try_reserve` that failed and was handled among them. `memusage`
+shows them, and `system`'s `memory` gives them to the host API
+([Management](mgmt.md)); on a 1 GiB arm64 QEMU just booted:
+
+```
+free_pages_lowest: 248837
+rust_heap: 16725 KiB taken, 8688 KiB asked, 4303 blocks
+rust_heap_peak: 17395 KiB taken, 9342 KiB asked, 5565 blocks (to within 64 KiB and 256 blocks a cpu)
+rust_heap_since_boot: 8956 allocations, 4653 frees, 0 refused
+```
+
+What is taken there is nearly twice what was asked for: the classes are
+powers of two, and a run of pages one too. Not in them: the C++ objects
+the bridge makes for Rust's handles (a `Mutex`, an `Event`, a `Task`), DMA
+buffers and frames, which are not the global allocator's.
+
+There is no lock in the counting. A change goes into this CPU's slot, a
+cache line of its own, with interrupts off for the few loads and stores it
+takes: nothing else writes the slot meanwhile -- not another CPU, not an
+interrupt on this one -- so not even a locked instruction. The totals the
+CPUs share are reached only when a slot has moved 64 KiB or 256 blocks either
+way since it was last folded into them -- an atomic add, and a
+compare-and-swap for a peak that rises -- and that is where the peaks are
+kept, since the most the sum has held is no sum of what each slot held. A
+peak is therefore the truth to within a slot's worth a CPU, either way; a
+read sums the totals and every slot. A slot is 128 bytes, not 64: Apple's
+cores have lines that long and x86's prefetcher takes lines in pairs.
+
+What it costs, `heapbench` on the tree before and after (arm64, HVF on an
+M-series Mac, the two booted in turn, the median of nine runs each): an
+allocation and its free 6 to 9 ns more on one CPU and on four -- 6 to 8% on
+the pools' sizes, 9 to 11% on runs of pages; a block of 64 KiB or more,
+which is past a slot's worth and so reaches the totals at every allocation
+and free, 24 ns more (27%). The first cut had 64-byte slots and took the
+class by `log2`'s loop over the bits rather than the count of leading zeros
+(`AllocatorImpl::footprint`, `stdlib::log2_clz`), and cost 9 to 15 ns on one
+CPU and 20 to 30 on four.
+
+`free_pages_lowest`, beside them, is the fewest pages there have been free
+since the free list was built: how near the machine has come to none, with
+guests' frames and the huge pool in it. It is lowered where the count is,
+under the page table's lock.
+
 `operator new` sits on top of `mm::alloc`, and its contract is unusual:
 **plain `new T(...)` panics on OOM and never returns nullptr**. The
 replaceable plain form is implicitly potentially-throwing, so the compiler
@@ -363,7 +416,8 @@ machine.
   actually uses (RAM reported vs. RAM reachable).
 - `memusage` — free and total page counts and how many of the free are
   zeroed, and the huge pool's free and total blocks and how many of the free
-  are known zero.
+  are known zero; the fewest pages free since boot; and what Rust's heap
+  takes now and took at most ([What Rust holds of it](#what-rust-holds-of-it)).
 - `meminfo` and the huge pool: with `hugepages=`, a line for the pool --
   2 MiB blocks reserved at boot right after the free list is built, kept for
   guests' memory and out of every other allocation ([The

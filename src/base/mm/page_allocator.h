@@ -79,6 +79,12 @@ public:
     virtual void* map_pages(size_t num_pages, ulong* phys_addrs) override;
     virtual void unmap_pages(void* ptr, size_t num_pages) override;
 
+    /* What alloc of num_pages takes: a block of its size class, a power of
+       two of pages, every one of them backed -- a run of five takes eight.
+       0 for none, or for a count past the largest class, which alloc
+       refuses. */
+    static size_t footprint(size_t num_pages);
+
     /* map_pages for runs past the largest block: up to
        PageTable::MAX_LARGE_MAP_PAGES pages, from a window of blocks that big */
     void* map_large_pages(size_t num_pages, ulong* phys_addrs);
