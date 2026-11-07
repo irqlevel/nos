@@ -38,6 +38,7 @@
 #include <mm/memory_map.h>
 #include <mm/allocator.h>
 #include <mm/page_table.h>
+#include <mm/page_zeroer.h>
 
 #include <drivers/8042.h>
 #include <drivers/screen.h>
@@ -773,6 +774,11 @@ void bp_startup(void* ctx)
            UDP: both on eth0, both the layer's to start. */
         rust_net_start_services(Parameters::get_instance().get_udp_shell_port());
 
+        /* The zeroing of free pages, last: it only ever takes a CPU nothing
+           else wants, and the boot's own work comes first */
+        if (!mm::PageZeroer::get_instance().start())
+            klog(0, "mm: the zeroing tasks did not start: every page is zeroed as it is handed out");
+
         /* The events tracepoints= named, on now that every CPU has its ring --
            after the self-tests, whose own use of the rings ends in freeing them. */
         tp::boot_on(Parameters::get_instance().get_tracepoints());
@@ -826,6 +832,10 @@ void bp_startup(void* ctx)
            drain sends what it still holds before it goes. Before the soft
            IRQs stop: a send may still have to resolve the collector. */
         rust_net_stop_netconsole();
+
+        /* The zeroing tasks, with the soft IRQs: nothing waits for them, and
+           they wait for nothing but a page's stores */
+        mm::PageZeroer::get_instance().stop();
 
         SoftIrq::get_instance().stop();
     } /* all locals destroyed before stack is abandoned */
@@ -1002,6 +1012,9 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
     pt.reserve_huge_pool(Parameters::get_instance().get_huge_pool_bytes(pt.get_total_pages_count() * consts::PAGE_SIZE));
     /* And mapped, for the copies into and out of guests' memory (PageTable::map_huge_pool_window) */
     pt.map_huge_pool_window();
+    /* zerofree=verify: every page and block handed out as zeroed read first.
+       Here, before there is another CPU to read the flag. */
+    pt.set_zero_check(Parameters::get_instance().is_zero_free_verify());
 
     /* W^X: the image mapping is the one executable thing the page table
        was built with (everything else is already NX), so split it here into

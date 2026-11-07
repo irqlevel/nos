@@ -129,6 +129,16 @@ public:
        the boot says so. The bytes for a machine of total_bytes of RAM. */
     ulong get_huge_pool_bytes(ulong total_bytes);
 
+    /* zerofree=on|off|verify -- the zeroing of free pages
+       (mm/page_zeroer.h): on, the default, tasks of the lowest priority
+       zero free pages while nothing else wants their CPU, and a guest's
+       memory is taken from those first; off, no task, and every page is
+       zeroed as it is handed out, as it always was; verify, as on, and
+       every page or block an allocation takes as zeroed is read first, a
+       word that is not zero a panic -- a free page written to, caught. */
+    bool is_zero_free_off();
+    bool is_zero_free_verify();
+
     /* rxpoll=on -- have the tick look at the receive path as well as the
        NIC's own interrupt. Off by default: it is a hypothesis about a driver
        stall, not a proven fix, and on the machine it was meant to help the
@@ -210,6 +220,12 @@ private:
         DhcpOff,       /* disabled entirely */
     };
 
+    enum ZeroFreeMode {
+        ZeroFreeOn = 0,
+        ZeroFreeOff,
+        ZeroFreeVerify,
+    };
+
     char cmdline_[CMDLINE_LEN];
     bool trace_vga_;
     bool panic_vga_;
@@ -236,6 +252,7 @@ private:
     /* hugepages=: a share of RAM in percent, or bytes -- one of the two. */
     ulong huge_pool_percent_;
     ulong huge_pool_bytes_;
+    ZeroFreeMode zero_free_md_;
     bool rx_poll_;
     int log_level_;
     bool dns_enabled_;
