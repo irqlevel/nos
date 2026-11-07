@@ -1,0 +1,15 @@
+[package]
+name = "mod-netblk"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mod_netblk"
+crate-type = ["staticlib"]
+
+[dependencies]
+kmod = { path = "../../../base/kmod" }
+kcore = { path = "../../../base/kcore" }
+# The frame formats: a request is taken apart and a reply's headers put
+# together here, in the frame itself, and the network layer cannot be linked.
+netwire = { path = "../../../common/net/netwire" }

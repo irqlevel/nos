@@ -23,7 +23,7 @@ You need:
 
 ## Start with the smallest real module: `hello`
 
-`src/crates/modules/hello/` contains two files. The first is `Cargo.toml`:
+`src/crates/modules/test/hello/` contains two files. The first is `Cargo.toml`:
 
 ```toml
 [package]
@@ -40,7 +40,7 @@ kmod = { path = "../../kmod" }
 kcore = { path = "../../kcore" }
 ```
 
-The second is [`src/lib.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/modules/hello/src/lib.rs), shown here without its doc comment:
+The second is [`src/lib.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/modules/test/hello/src/lib.rs), shown here without its doc comment:
 
 ```rust
 #![no_std]
@@ -93,13 +93,13 @@ What each part does:
 
 ## Make your own
 
-Copy `hello` and give the copy a name of its own. This guide uses `greet`:
+Copy `hello` and give the copy a name of its own. A module lives in an area of `src/crates/modules/` named for what it is for (`net/`, `storage/`, `tools/`, `test/` and the rest). This guide puts `greet` in `tools/`, at the same depth as `hello`, so the paths in its `Cargo.toml` stay right:
 
 ```sh
-cp -r src/crates/modules/hello src/crates/modules/greet
+cp -r src/crates/modules/test/hello src/crates/modules/tools/greet
 ```
 
-In `src/crates/modules/greet/Cargo.toml`, rename the package to `mod-<name>` and the library to `mod_<name>`. The Makefile expects exactly these names: it builds the package `mod-greet` and links `libmod_greet.a`.
+In `src/crates/modules/tools/greet/Cargo.toml`, rename the package to `mod-<name>` and the library to `mod_<name>`. The Makefile expects exactly these names: it builds the package `mod-greet` and links `libmod_greet.a`.
 
 ```diff
  [package]
@@ -114,21 +114,21 @@ In `src/crates/modules/greet/Cargo.toml`, rename the package to `mod-<name>` and
  crate-type = ["staticlib"]
 ```
 
-Add the crate to the workspace's `members` in `src/crates/Cargo.toml` (the line is shortened here). Leave `default-members` alone, because that list is what the kernel's own build compiles.
+Add the crate to the workspace's `members` in `src/crates/Cargo.toml`, on its area's line (shortened here). Leave `default-members` alone, because that list is what the kernel's own build compiles.
 
 ```diff
--members = [..., "modules/hv", "modules/heapbench"]
-+members = [..., "modules/hv", "modules/heapbench", "modules/greet"]
+-    "modules/cluster/cluster", ..., "modules/tools/edit",
++    "modules/cluster/cluster", ..., "modules/tools/edit", "modules/tools/greet",
 ```
 
 Add the name to `MODULES` in the `Makefile`:
 
 ```diff
--MODULES = hello modtest slowexit blkload netblk netload sshd hv heapbench
-+MODULES = hello modtest slowexit blkload netblk netload sshd hv heapbench greet
+-MODULES = hello modtest slowexit blkload netblk netload sshd hv heapbench edit api tlsbench ipcnet cluster
++MODULES = hello modtest slowexit blkload netblk netload sshd hv heapbench edit api tlsbench ipcnet cluster greet
 ```
 
-Finally, in `src/crates/modules/greet/src/lib.rs`, change the command's name and help text, and set the module's name in `kmod::module!(name: "greet", init: init)`.
+Finally, in `src/crates/modules/tools/greet/src/lib.rs`, change the command's name and help text, and set the module's name in `kmod::module!(name: "greet", init: init)`.
 
 ### Reach the kernel through `kcore`
 
@@ -154,11 +154,11 @@ let cmd = Command::register("hv", HELP, move |args, out| command(&for_cmd, args,
 
 Modules follow the project's conventions. These rules matter most:
 
-- **Write it without `unsafe`.** Look for a `kcore` type first. If none fits what you need, add the type to `kcore` once, with a comment explaining why it is sound. `scripts/unsafe-count.py modules/greet` counts the `unsafe` sites.
+- **Write it without `unsafe`.** Look for a `kcore` type first. If none fits what you need, add the type to `kcore` once, with a comment explaining why it is sound. `scripts/unsafe-count.py mod-greet` counts the `unsafe` sites.
 - **Never allocate or free memory while holding a spin lock.** The page allocator flushes the TLB of every other CPU (a TLB shootdown) and waits for all of them to answer. A CPU spinning on your lock has interrupts off, so it can never answer. The two wait for each other until, ten seconds later, the kernel panics and names the CPUs that never answered. Instead, collect what needs freeing under the lock, unlock, and only then free it.
 - **Be careful with objects that wait when dropped.** A UDP listener, a `TaskHandle` or an interrupt handle waits for its callbacks when it is dropped. Keep each one in its own `Lock<Option<..>>`: `take()` it under the lock, and drop it after you unlock. If you drop it while holding the lock its wait needs, you get a deadlock.
 - **Never run `rmmod` from the module's own command.** The unload would wait for that command, and the command would wait for the unload.
-- **A module can call only what `ffi` declares.** A new kernel service takes three steps: the C++ function in `src/base/kernel/rust_ffi.cpp`, its declaration in `src/crates/ffi`, and the safe wrapper in `src/crates/kcore` ([Adding a kernel service](/docs/rust#adding-a-kernel-service)). This changes the interface digest, so the kernel and every module have to be rebuilt together.
+- **A module can call only what `ffi` declares.** A new kernel service takes three steps: the C++ function in `src/base/kernel/rust_ffi.cpp`, its declaration in `src/crates/base/ffi`, and the safe wrapper in `src/crates/base/kcore` ([Adding a kernel service](/docs/rust#adding-a-kernel-service)). This changes the interface digest, so the kernel and every module have to be rebuilt together.
 
 ## Build it
 

@@ -1,4 +1,4 @@
-//! `hv forward`'s relay (modules/hv/src/relay.rs) between two sides a script
+//! `hv forward`'s relay (modules/hypervisor/hv/src/relay.rs) between two sides a script
 //! drives: what each side sends and when, whether each has room for what it
 //! is sent -- a window shut for a while, then open again -- when one ends or
 //! goes, when the clock jumps, and when the relay is told to stop. Held to:

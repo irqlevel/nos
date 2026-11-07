@@ -351,8 +351,8 @@ struct SchedSlice
 };
 
 /* ---- the hypervisor's payloads ----
-   Recorded by the hv module's Rust (src/crates/hv: vm.rs, run.rs, smp.rs),
-   which declares each in kcore/src/trace/events.rs: every boot holds those
+   Recorded by the hv module's Rust (src/crates/hypervisor/hv: vm.rs, run.rs, smp.rs),
+   which declares each in base/kcore/src/trace/events.rs: every boot holds those
    to the descriptions in tracepoint.cpp, a field's name, offset and size and
    an enumeration's names value by value, so the two are one layout. These
    are here for the descriptions' offsets; nothing in C++ fills one. A guest
@@ -421,10 +421,10 @@ struct HvRing
 
 /* ---- a guest disk's payloads ----
    Recorded by Rust as the hypervisor's are: the hv module's device and
-   disk task (src/crates/hv/src/devices/blk.rs, src/crates/modules/hv/src/
-   disk.rs), the image (src/crates/fs/src/image.rs), the block layer's
-   queue (src/crates/block/src/queue.rs) and ext4's journal
-   (src/crates/fs/src/ext4/journal.rs). A request is said by its disk --
+   disk task (src/crates/hypervisor/hv/src/devices/blk.rs, src/crates/modules/hypervisor/hv/src/
+   disk.rs), the image (src/crates/layers/fs/src/image.rs), the block layer's
+   queue (src/crates/layers/block/src/queue.rs) and ext4's journal
+   (src/crates/layers/fs/src/ext4/journal.rs). A request is said by its disk --
    its number among its guest's, vda 0 -- and its slot, the buffer it has
    while it is out; a command to the device by its queue's entry and its
    buffer. */

@@ -191,7 +191,7 @@ voter answers, and says what it is about to do.
 ## Steps
 
 **C1, the registry.** Done, in parts. C1a: the state machine as a crate
-of its own with no kernel in it, `src/crates/registry` -- the state, the
+of its own with no kernel in it, `src/crates/common/cluster/registry` -- the state, the
 commands (init, invite, join, remove, revoke) and their answers, every
 command carrying the proposer's clock and every invitation past its time let
 go of at the entry, the snapshot and the rules one read back is held to, the

@@ -1,10 +1,24 @@
 [workspace]
-members = ["ffi", "kernel", "hello", "kcore", "random", "tls", "ssh", "block", "virtio", "fs", "netwire", "net", "drivers/usb", "drivers/nvme", "drivers/virtio_rng", "drivers/virtio_blk", "drivers/virtio_net", "drivers/virtio_scsi", "drivers/r8168", "drivers/r8125", "drivers/igb", "hvarch", "hv", "kmod", "modules/hello", "modules/modtest", "modules/slowexit", "modules/blkload", "modules/netblk", "modules/netload", "modules/sshd", "modules/hv", "modules/heapbench", "modules/edit", "modules/api", "modules/tlsbench", "modules/ipcnet", "modules/cluster", "hvboot", "diskimage", "edit", "mgmtwire", "web", "mgmt", "events", "ipc", "ipcwire", "conf", "extfmt", "raft", "registry", "common/crc"]
+members = [
+    "kernel",
+    "base/events", "base/ffi", "base/hello", "base/kcore", "base/kmod", "base/random",
+    "layers/block", "layers/fs", "layers/ipc", "layers/mgmt", "layers/net", "layers/tls",
+    "drivers/block/nvme", "drivers/block/virtio_blk", "drivers/block/virtio_scsi", "drivers/net/igb", "drivers/net/r8125", "drivers/net/r8168", "drivers/net/virtio_net", "drivers/rng/virtio_rng", "drivers/usb", "drivers/virtio",
+    "hypervisor/hv", "hypervisor/hvarch", "hypervisor/hvboot",
+    "modules/cluster/cluster", "modules/cluster/ipcnet", "modules/hypervisor/hv", "modules/mgmt/api", "modules/net/netload", "modules/net/sshd", "modules/net/tlsbench", "modules/storage/blkload", "modules/storage/netblk", "modules/test/heapbench", "modules/test/hello", "modules/test/modtest", "modules/test/slowexit", "modules/tools/edit",
+    "common/cluster/raft", "common/cluster/registry", "common/crc", "common/ipc/ipcwire", "common/ipc/mgmtwire", "common/net/netwire", "common/net/ssh", "common/net/web", "common/storage/diskimage", "common/storage/extfmt", "common/text/conf", "common/text/edit",
+]
 # What a plain `cargo build` builds: the crates the kernel links. A loadable
 # module is built on its own, one package at a time and with the
 # position-independent code the kernel's crates do not use (the Makefile's
 # module rules), then linked into a shared object the kernel loads.
-default-members = ["ffi", "kernel", "hello", "kcore", "random", "mgmt", "events", "ipc", "tls", "block", "virtio", "fs", "netwire", "net", "drivers/usb", "drivers/nvme", "drivers/virtio_rng", "drivers/virtio_blk", "drivers/virtio_net", "drivers/virtio_scsi", "drivers/r8168", "drivers/r8125", "drivers/igb"]
+default-members = [
+    "kernel",
+    "base/events", "base/ffi", "base/hello", "base/kcore", "base/random",
+    "layers/block", "layers/fs", "layers/ipc", "layers/mgmt", "layers/net", "layers/tls",
+    "drivers/block/nvme", "drivers/block/virtio_blk", "drivers/block/virtio_scsi", "drivers/net/igb", "drivers/net/r8125", "drivers/net/r8168", "drivers/net/virtio_net", "drivers/rng/virtio_rng", "drivers/usb", "drivers/virtio",
+    "common/net/netwire",
+]
 resolver = "2"
 
 [profile.release]

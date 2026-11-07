@@ -11,7 +11,7 @@ One wait was still silent, though, and it was the one that every stop makes. Unt
 
 ## The join behind every stop
 
-A join is one task waiting for another to finish. In nos that is `Task::Wait`, and every stop path in the kernel goes through it. A Rust `TaskHandle` waits for its task when it is dropped ([task.rs](https://github.com/irqlevel/nos/blob/master/src/crates/kcore/src/task.rs)). `hv stop` waits for the guest's task in `finish()`. A guest's disk, `FileDisk`, waits for its own disk task when it goes away. `rmmod` and the host's shutdown end in joins too.
+A join is one task waiting for another to finish. In nos that is `Task::Wait`, and every stop path in the kernel goes through it. A Rust `TaskHandle` waits for its task when it is dropped ([task.rs](https://github.com/irqlevel/nos/blob/master/src/crates/base/kcore/src/task.rs)). `hv stop` waits for the guest's task in `finish()`. A guest's disk, `FileDisk`, waits for its own disk task when it goes away. `rmmod` and the host's shutdown end in joins too.
 
 Here is the whole of the old join:
 

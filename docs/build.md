@@ -14,7 +14,13 @@ make
 ```
 
 `make` runs `cppcheck` static analysis first (`make check`) and fails on any
-finding; `make nocheck` skips it. `make smoke` builds in Docker and runs the
+finding; `make nocheck` skips it. `make check` also holds the Rust
+workspace to its layout (`scripts/check-crates.py`): every crate in an
+area's directory under `src/crates/` -- `base/`, `layers/`, `drivers/`,
+`hypervisor/`, `modules/`, `common/`, `kernel/` the one crate at the top --
+and a member of the workspace; and every crate under `common/` with no
+kernel in it -- no path dependency outside `common/` -- and
+`#![forbid(unsafe_code)]` in its `lib.rs`. `make smoke` builds in Docker and runs the
 headless boot smoke test (`scripts/smoke-test.sh`).
 
 ## Four things the Makefile will not tell you
@@ -288,7 +294,7 @@ kernel](hypervisor.md#a-guests-own-kernel-pvh-and-hvboot)). It is a
 program of the guest's, not the kernel's, so it is built as a module is --
 its own target directory (`src/crates/target/hvboot`) and flags of its own:
 static, the small code model, compiler-builtins' `memcpy` and friends --
-and then linked by `ld.lld` with `src/crates/hvboot/hvboot.ld`, at 1 MiB,
+and then linked by `ld.lld` with `src/crates/hypervisor/hvboot/hvboot.ld`, at 1 MiB,
 into an ELF with the `Xen` note PVH names its entry by. Offline, as
 everything is: it has no dependencies but `core` and `alloc`.
 

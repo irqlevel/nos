@@ -281,7 +281,7 @@ class Test:
         check("a login after the probes", rc == 0 and uptime_like(out), out)
 
     def editor(self, sh, slow):
-        """edit (modules/edit) through a terminal of the test's own: the size
+        """edit (modules/tools/edit) through a terminal of the test's own: the size
         the session was told, a resize, a save, a write over a file changed
         meanwhile, and the changes kept when the connection goes."""
         sh.run("wget http://10.0.2.2:%d/edit.ko /edit.ko" % HTTP_PORT)

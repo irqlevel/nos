@@ -7,29 +7,29 @@ edition = "2021"
 crate-type = ["staticlib"]
 
 [dependencies]
-ffi = { path = "../ffi" }
-kcore = { path = "../kcore" }
-random = { path = "../random" }
+ffi = { path = "../base/ffi" }
+kcore = { path = "../base/kcore" }
+random = { path = "../base/random" }
 # The management bus: below every layer, so each can register its provider.
-mgmt = { path = "../mgmt" }
-events = { path = "../events" }
-ipc = { path = "../ipc" }
-mgmtwire = { path = "../mgmtwire" }
-block = { path = "../block" }
-fs = { path = "../fs" }
-net = { path = "../net" }
-hello = { path = "../hello" }
+mgmt = { path = "../layers/mgmt" }
+events = { path = "../base/events" }
+ipc = { path = "../layers/ipc" }
+mgmtwire = { path = "../common/ipc/mgmtwire" }
+block = { path = "../layers/block" }
+fs = { path = "../layers/fs" }
+net = { path = "../layers/net" }
+hello = { path = "../base/hello" }
 # For the crc32 shell command and its check at boot.
 crc = { path = "../common/crc" }
-nvme = { path = "../drivers/nvme" }
+nvme = { path = "../drivers/block/nvme" }
 usb = { path = "../drivers/usb" }
-virtio-rng = { path = "../drivers/virtio_rng" }
-virtio-blk = { path = "../drivers/virtio_blk" }
-virtio-net = { path = "../drivers/virtio_net" }
-virtio-scsi = { path = "../drivers/virtio_scsi" }
-r8168 = { path = "../drivers/r8168" }
-r8125 = { path = "../drivers/r8125" }
-igb = { path = "../drivers/igb" }
+virtio-rng = { path = "../drivers/rng/virtio_rng" }
+virtio-blk = { path = "../drivers/block/virtio_blk" }
+virtio-net = { path = "../drivers/net/virtio_net" }
+virtio-scsi = { path = "../drivers/block/virtio_scsi" }
+r8168 = { path = "../drivers/net/r8168" }
+r8125 = { path = "../drivers/net/r8125" }
+igb = { path = "../drivers/net/igb" }
 # For the sha256 shell command; the same crate the TLS client hashes with.
 # force-soft for the same reason .cargo/config.toml forces the other
 # RustCrypto crates onto their software backends: sha2 would otherwise pick

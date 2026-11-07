@@ -61,7 +61,7 @@ Sixteen minutes later came a correction ([fc314e7](https://github.com/irqlevel/n
 
 We had said the other drivers were checked. The grep behind that claim looked for a function name that does not exist in this tree. It returned nothing, and we read that nothing as clean.
 
-So the release moved out of the drivers and into the layer that owns the lock, where a driver cannot get it wrong. Today the net layer is written in Rust. A driver's `flush_tx` borrows a `TxQueue` for the length of the call, and a finished frame has one documented way out ([device.rs](https://github.com/irqlevel/nos/blob/master/src/crates/net/src/device.rs)):
+So the release moved out of the drivers and into the layer that owns the lock, where a driver cannot get it wrong. Today the net layer is written in Rust. A driver's `flush_tx` borrows a `TxQueue` for the length of the call, and a finished frame has one documented way out ([device.rs](https://github.com/irqlevel/nos/blob/master/src/crates/layers/net/src/device.rs)):
 
 ```rust
 /// A transmitted frame, for release once the lock is down. Never dropped
@@ -88,7 +88,7 @@ pub fn release_tx_done(&self) {
 }
 ```
 
-`self.tx` is an `IrqSpinLock<Tx>`, a lock that owns what it guards ([sync.rs](https://github.com/irqlevel/nos/blob/master/src/crates/kcore/src/sync.rs)). The queue cannot be reached at all except through the lock's guard, and it is the type that enforces this, not a comment. The guard that `lock()` returns here is a temporary, dropped at the end of the `let` statement. So by the time `drop(frame)` runs, the lock is already released. `submit_tx` adds one more subtlety: it releases frames only with interrupts on. A caller with interrupts off could not answer a shootdown itself, so it raises the TX soft IRQ and leaves the release to it.
+`self.tx` is an `IrqSpinLock<Tx>`, a lock that owns what it guards ([sync.rs](https://github.com/irqlevel/nos/blob/master/src/crates/base/kcore/src/sync.rs)). The queue cannot be reached at all except through the lock's guard, and it is the type that enforces this, not a comment. The guard that `lock()` returns here is a temporary, dropped at the end of the `let` statement. So by the time `drop(frame)` runs, the lock is already released. `submit_tx` adds one more subtlety: it releases frames only with interrupts on. A caller with interrupts off could not answer a shootdown itself, so it raises the TX soft IRQ and leaves the release to it.
 
 ## Ten seconds, then a report
 
@@ -132,7 +132,7 @@ Backtrace: DoPanic <- Watchdog::Check <- GenericTimer::LocalTick <- ArmIrqEntry
 
 Even better than releasing outside the lock is never releasing to the allocator at all. Also on September 4 ([c3e1d8d](https://github.com/irqlevel/nos/commit/c3e1d8d)), network frames moved into a pool built once at boot. The frames have a fixed size, and their physical addresses are resolved once. They are handed out from per-CPU caches, which are touched with interrupts off and need no atomics. Behind the caches sits one lockless ring, Vyukov's bounded MPMC (multi-producer, multi-consumer) queue. The caches refill from it and spill back to it in batches of 32.
 
-The commit put the priority plainly: a datapath that never calls the allocator cannot have that bug at all, and that is worth more than the speed. On a 4-CPU arm64 guest, 500 shell round trips took 506 frames from the pool with zero misses and touched the ring 31 times. The pool is in Rust now ([frame.rs](https://github.com/irqlevel/nos/blob/master/src/crates/net/src/frame.rs)). By default it holds 4096 frames. `netframes=` changes that, and `netpool` shows its state.
+The commit put the priority plainly: a datapath that never calls the allocator cannot have that bug at all, and that is worth more than the speed. On a 4-CPU arm64 guest, 500 shell round trips took 506 frames from the pool with zero misses and touched the ring 31 times. The pool is in Rust now ([frame.rs](https://github.com/irqlevel/nos/blob/master/src/crates/layers/net/src/frame.rs)). By default it holds 4096 frames. `netframes=` changes that, and `netpool` shows its state.
 
 The speed came anyway. On the AX41, the first flood after every boot used to lose frames at the NIC: 755,105 of 2.06 million, all in the first two seconds. The receive ring had been filled from `Mm::Alloc` before the pool was set up. Releasing each of those frames meant a TLB shootdown that waited on every other CPU, about 4 ms apiece on that machine ([e02dfe3](https://github.com/irqlevel/nos/commit/e02dfe3)). Now the pool comes up before any driver.
 

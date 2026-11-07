@@ -253,7 +253,7 @@ check_hardware() {
     fi
 
     # The network is a server's only console. The parts nos's drivers claim:
-    # drivers/r8168, drivers/r8125, drivers/igb, virtio-net
+    # drivers/net/r8168, drivers/net/r8125, drivers/net/igb, virtio-net
     for d in /sys/bus/pci/devices/*; do
         [ -r "$d/vendor" ] || continue
         id=$(cat "$d/vendor"):$(cat "$d/device")

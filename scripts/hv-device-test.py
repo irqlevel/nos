@@ -152,7 +152,7 @@ def pour_image(tmp, rootdir):
 def spin_elf(path):
     """A PVH image that runs until it is stopped: an ELF32 of one segment at
     1 MiB -- `pause; jmp` back to it -- and the Xen note naming it the
-    32-bit entry (hv/src/pvh.rs). d1's kernel: a guest that holds its disk
+    32-bit entry (hypervisor/hv/src/pvh.rs). d1's kernel: a guest that holds its disk
     for as long as the checks look at it, where hvboot on a disk with
     nothing on it would power itself off at once."""
     entry = 0x100000

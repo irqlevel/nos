@@ -1,7 +1,7 @@
 # The host API
 
 What nos is managed through, by programs: the panel, `nosctl`, other hosts'
-panels. It is a loadable module, `api.ko` (`src/crates/modules/api`), and
+panels. It is a loadable module, `api.ko` (`src/crates/modules/mgmt/api`), and
 what it serves is the [management bus](mgmt.md): every provider registered
 there -- the kernel's own, a module's -- with its methods, its descriptor and
 its jobs. It runs no shell command, and no client can make it run one.
@@ -68,7 +68,7 @@ the machine's own:
 
 ## api.toml
 
-The strict TOML of `src/crates/conf`; every key optional, a key it does not
+The strict TOML of `src/crates/common/text/conf`; every key optional, a key it does not
 have or one given twice refused with its line:
 
 ```toml

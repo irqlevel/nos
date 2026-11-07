@@ -1,5 +1,5 @@
 //! The `smbios` target: the tables a guest is told what it is by
-//! (`hv/src/smbios.rs`), made of what an operator says -- a VM's name, any
+//! (`hypervisor/hv/src/smbios.rs`), made of what an operator says -- a VM's name, any
 //! UUID -- and read back as Linux's `dmi_scan` reads them: the entry point
 //! found where the scan looks, its checksum, the structures walked to their
 //! end by their lengths and their strings, every string a structure names

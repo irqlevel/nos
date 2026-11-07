@@ -16,7 +16,7 @@
 #include <mm/new.h>
 #include <mm/page_table.h>
 
-/* The network layer is Rust (src/crates/net): a receive pass offered from the
+/* The network layer is Rust (src/crates/layers/net): a receive pass offered from the
    tick, which it takes only with rxpoll=on. */
 extern "C" void rust_net_poll_rx();
 

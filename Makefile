@@ -326,8 +326,12 @@ all: check nos-arm64.img modules $(OUT)/modules.bound
 nocheck: nos-arm64.img modules $(OUT)/modules.bound
 endif
 
+# cppcheck over the C++, and the Rust workspace's layout held to its rules
+# (scripts/check-crates.py: a crate in an area's directory and a member; one
+# under common/ with no kernel in it and its unsafe forbidden).
 check: $(CXX_SRC)
 	cppcheck --error-exitcode=22 --inline-suppr -q src/base || exit 1
+	python3 scripts/check-crates.py
 
 nos.iso: build/grub.cfg $(KERNEL)
 	rm -rf iso
@@ -430,20 +434,20 @@ MODULE_LDEMU_aarch64 = aarch64elf
 MODULE_LDFLAGS = -m $(MODULE_LDEMU_$(ARCH)) -shared -Bsymbolic --gc-sections \
     -z separate-loadable-segments -z max-page-size=4096 -z norelro \
     -z noexecstack -z now --build-id=none --hash-style=sysv \
-    --version-script=src/crates/kmod/module.ver -u nos_module_info
+    --version-script=src/crates/base/kmod/module.ver -u nos_module_info
 # The kernel interface a module is built against, and which the loader holds
 # it to: a digest of the ffi crate's sources, and of the tracepoints' payloads
-# kcore declares (kcore/src/trace/events.rs) -- bytes a module's sites hand
+# kcore declares (base/kcore/src/trace/events.rs) -- bytes a module's sites hand
 # the kernel's emit(), which holds them to the kernel's descriptions. The
 # boot holds the image's payloads to those; a module of other payloads is
 # one the loader refuses, not records printed wrong or an emit()'s BUG_ON.
-MODULE_FFI_SRC = $(sort $(wildcard src/crates/ffi/src/*.rs))
-MODULE_ABI_SRC = $(MODULE_FFI_SRC) src/crates/kcore/src/trace/events.rs
+MODULE_FFI_SRC = $(sort $(wildcard src/crates/base/ffi/src/*.rs))
+MODULE_ABI_SRC = $(MODULE_FFI_SRC) src/crates/base/kcore/src/trace/events.rs
 MODULE_ABI := $(shell cat $(MODULE_ABI_SRC) | sha256sum | cut -c1-64)
 
 modules: $(MODULE_KO)
 
-$(OUT)/modules/%.ko: $(RUST_SRC) src/crates/kmod/module.ver $(FLAVOR_STAMP)
+$(OUT)/modules/%.ko: $(RUST_SRC) src/crates/base/kmod/module.ver $(FLAVOR_STAMP)
 	@mkdir -p $(dir $@)
 	cd src/crates && NOS_MODULE_ABI=$(MODULE_ABI) cargo build --offline --release \
 	    --target $(RUST_TARGET) -p mod-$* --target-dir target/modules \
@@ -464,7 +468,7 @@ $(OUT)/modules/%.ko: $(RUST_SRC) src/crates/kmod/module.ver $(FLAVOR_STAMP)
 HVBOOT = $(OUT)/hvboot
 HVBOOT_RUSTFLAGS = ["-Ccode-model=small","-Crelocation-model=static"]
 HVBOOT_LDFLAGS = -m elf_x86_64 -static -nostdlib --gc-sections --build-id=none -z noexecstack \
-    -z max-page-size=4096 -T src/crates/hvboot/hvboot.ld
+    -z max-page-size=4096 -T src/crates/hypervisor/hvboot/hvboot.ld
 
 ifeq ($(ARCH),x86_64)
 hvboot: $(HVBOOT)
@@ -472,7 +476,7 @@ else
 hvboot:
 endif
 
-$(HVBOOT): $(RUST_SRC) src/crates/hvboot/hvboot.ld $(FLAVOR_STAMP)
+$(HVBOOT): $(RUST_SRC) src/crates/hypervisor/hvboot/hvboot.ld $(FLAVOR_STAMP)
 	@mkdir -p $(dir $@)
 	cd src/crates && cargo build --offline --release --target $(RUST_TARGET) -p hvboot --target-dir target/hvboot \
 	    --config 'target.$(RUST_TARGET).rustflags=$(HVBOOT_RUSTFLAGS)' \

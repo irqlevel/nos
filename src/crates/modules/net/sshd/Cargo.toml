@@ -1,0 +1,13 @@
+[package]
+name = "mod-sshd"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mod_sshd"
+crate-type = ["staticlib"]
+
+[dependencies]
+kmod = { path = "../../../base/kmod" }
+kcore = { path = "../../../base/kcore" }
+ssh = { path = "../../../common/net/ssh" }

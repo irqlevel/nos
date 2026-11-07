@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """extfmt test: the ext2/3/4 format crate held to what e2fsprogs makes.
 
-extfmt (src/crates/extfmt) is the format hvboot reads a guest's /boot
+extfmt (src/crates/common/storage/extfmt) is the format hvboot reads a guest's /boot
 through and the kernel's ext4 driver is to read and write through: views
 over the superblock, group descriptors, inodes, extent trees, block maps,
 directory and extended attribute blocks, and every checksum metadata_csum
