@@ -222,7 +222,7 @@ void Event::signal_holding(ulong hold_ns)
 
     /* Unblocked is not running: an idle CPU would not look at its queue again
        until the next tick. The IPI ends in schedule(), which finds the task
-       runnable -- the same kick SoftIrq::raise gives its tasks. A CPU's
+       runnable -- the same kick SoftIrq::raise_mask gives its tasks. A CPU's
        number, nothing of the task's, which may be gone by now. */
     if (kick)
         hal::send_ipi(cpu, CpuTable::IPI_VECTOR);

@@ -7,7 +7,8 @@
 //! what lets a received frame be handed up as it is rather than copied.
 //!
 //! Where the work happens follows the kernel's net contract: the interrupt
-//! raises the soft IRQs and does nothing else; the receive harvest runs in
+//! raises the soft IRQs of the queues it was for -- their used rings say
+//! which -- and does nothing else; the receive harvest runs in
 //! the receive soft IRQ, which is one CPU at a time, so the receive side
 //! needs no lock of its own; and the transmit side is only ever touched from
 //! `flush_tx`, which the net stack calls with its own lock held. That is
@@ -34,7 +35,7 @@ use kcore::softirq;
 use kcore::klog;
 use net::{Frame, FrameQueue, NetDriver, RxQueue, TxQueue};
 use virtio::mmio::{MmioTransport, Slot};
-use virtio::{Buf, Queue, Transport};
+use virtio::{Buf, Queue, Transport, UsedWatch};
 
 /// eth0 … eth3
 const MAX_DEVICES: usize = 4;
@@ -90,6 +91,11 @@ struct Net {
     rx_dropped: AtomicU64,
     /// Receive slots with no frame in them, waiting on memory
     rx_empty: AtomicU32,
+
+    /// Each queue's completions, as the interrupt asks whether it was for
+    /// it: the queues themselves are the soft IRQ's and the stack's
+    rx_used: UsedWatch,
+    tx_used: UsedWatch,
 
     /// Kept so the registration outlives nothing: the device is for good
     irq: Once<Irq>,
@@ -366,9 +372,32 @@ fn interrupt(net: &'static Net) {
 
     /* Nothing is harvested here: both sides are soft IRQ work, and the
      * transmit one needs the stack's lock, which an interrupt must not
-     * take. */
-    softirq::raise(softirq::TYPE_NET_RX);
-    softirq::raise(softirq::TYPE_NET_TX);
+     * take. Only the sides it was for, though: the interrupt is both
+     * queues' -- one MSI-X entry, or the line, whose ISR byte says only that
+     * some queue has completions -- and their used rings say which, as
+     * Linux asks each queue on a shared interrupt. Both raised every time
+     * was a transmit soft IRQ for every frame received -- the stack's lock
+     * taken to find nothing -- and two kicks of the softirq task, two IPIs
+     * to this CPU, where one was due.
+     *
+     * The receive side as well while any slot waits for a frame: a harvest
+     * is what posts one again, and a ring with none posted has nothing to
+     * complete -- every interrupt, the transmit side's included, is the
+     * next try, as it always was.
+     *
+     * And both in one raise when both are due -- a reply's transmit done as
+     * the next request comes in, one interrupt for the two: a raise each
+     * kicked the softirq task once each. */
+    let mut due = 0;
+    if net.rx_used.pending() || net.rx_empty.load(Ordering::Relaxed) != 0 {
+        due |= 1 << softirq::TYPE_NET_RX;
+    }
+    if net.tx_used.pending() {
+        due |= 1 << softirq::TYPE_NET_TX;
+    }
+    if due != 0 {
+        softirq::raise_mask(due);
+    }
 }
 
 /* ---- bring-up ---- */
@@ -404,20 +433,22 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
         return false;
     }
 
-    let rx_queue = match Queue::new(rx_size) {
+    let mut rx_queue = match Queue::new(rx_size) {
         Some(queue) => queue,
         None => {
             virtio::failed(transport.as_ref());
             return false;
         }
     };
-    let tx_queue = match Queue::new(tx_size) {
+    let mut tx_queue = match Queue::new(tx_size) {
         Some(queue) => queue,
         None => {
             virtio::failed(transport.as_ref());
             return false;
         }
     };
+    /* What the interrupt asks of each, from before it can come */
+    let (rx_used, tx_used) = (rx_queue.watch(), tx_queue.watch());
 
     let (rx_hdr, tx_hdr) = match (DmaBuffer::new(1), DmaBuffer::new(1)) {
         (Some(rx), Some(tx)) => (rx, tx),
@@ -451,6 +482,8 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
         tx_packets: AtomicU64::new(0),
         rx_dropped: AtomicU64::new(0),
         rx_empty: AtomicU32::new(slots as u32),
+        rx_used,
+        tx_used,
         irq: Once::new(),
     };
 
