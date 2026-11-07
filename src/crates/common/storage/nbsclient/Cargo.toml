@@ -1,0 +1,17 @@
+[package]
+name = "nbsclient"
+version = "0.1.0"
+edition = "2021"
+
+# NBS's client (plans/nbs.md, N8): a volume attached on this host, read and
+# written through the cs's that hold its chunks -- every replica written, one
+# read, a replica that does not answer taken out -- as a state machine fed
+# what comes and the time, and telling its driver what to send. No kernel in
+# it and no unsafe: hv's nbs: disks, nbs io and nbsload drive it over ipc,
+# and fuzz/nbs's cluster target drives it over a network of its own.
+[lib]
+
+[dependencies]
+nbscs = { path = "../nbscs" }
+nbsmeta = { path = "../nbsmeta" }
+nbswire = { path = "../nbswire" }

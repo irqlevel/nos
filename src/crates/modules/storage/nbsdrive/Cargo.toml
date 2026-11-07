@@ -1,0 +1,19 @@
+[package]
+name = "nbsdrive"
+version = "0.1.0"
+edition = "2021"
+
+# NBS's client (nbsclient) driven over ipc: a volume's session in a mailbox
+# of its own, its asks sent to this host's mds and its requests to the cs's,
+# what comes back fed to it, its time kept. No module of its own -- a library
+# the modules that read and write volumes link: nbs-mds.ko's `nbs io`,
+# nbsload.ko and hv.ko's `nbs:` disks (plans/nbs.md, N8).
+[lib]
+name = "nbsdrive"
+
+[dependencies]
+kcore = { path = "../../../base/kcore" }
+nbsclient = { path = "../../../common/storage/nbsclient" }
+nbswire = { path = "../../../common/storage/nbswire" }
+# Who this host is: ipcnet's control mailbox.
+ipcctl = { path = "../../cluster/ipcctl" }

@@ -1,0 +1,14 @@
+[package]
+name = "ipcctl"
+version = "0.1.0"
+edition = "2021"
+
+# ipcnet's control mailbox, as a module asks it: who this host is, its
+# peers, its key. No module of its own -- a library: raftmember's (cluster.ko,
+# nbs-mds.ko) and nbsdrive's (the modules that read and write NBS volumes).
+[lib]
+name = "ipcctl"
+
+[dependencies]
+kcore = { path = "../../../base/kcore" }
+ipcwire = { path = "../../../common/ipc/ipcwire" }

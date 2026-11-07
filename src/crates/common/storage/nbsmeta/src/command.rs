@@ -35,14 +35,27 @@ pub enum Command {
     VolumeResize { name: String, size_mib: u64 },
     /// Volume `name` attached on `host`: for writing -- a new generation, the
     /// fence of every older one -- or read-only. `force` takes it from whoever
-    /// has it.
-    Attach { name: String, host: String, writable: bool, force: bool },
+    /// has it. `token` is the client's own, made for its session: an attach
+    /// for writing asked again by the writer it made -- its answer late or
+    /// lost -- is answered with the generation it gave, not another.
+    Attach { name: String, host: String, writable: bool, force: bool, token: u64 },
     /// Volume `name` let go by `host`: the writer of `generation`, or -- with
     /// generation 0 -- a reader. Done where it is not so attached.
     Detach { name: String, host: String, generation: u64 },
     /// The leader's digest of the state at entry `at`, for every member to
     /// hold its own to.
     Digest { at: u64, digest: [u8; 32] },
+    /// Replica `cs` of set `set` taken out (N8): written and read by nobody
+    /// until repair brings it back (N9), the set's version up -- and with it
+    /// the epoch of every chunk in the set. Asked by a client that a replica
+    /// did not answer, and proposed by the leader once the cs does not answer
+    /// it either -- or, `refused`, that the cs itself refused as failed,
+    /// which the leader takes as it is. Done again where it is out already;
+    /// never the set's last active replica, which writes go on to. Asked by
+    /// volume `name`'s writer at `generation`, of a set of its chunks: a
+    /// writer fenced since takes nothing out -- else its write would be done
+    /// by taking out the replicas that refuse it.
+    ReplicaDown { set: u32, cs: u32, refused: bool, name: String, generation: u64 },
 }
 
 const INIT: u8 = 1;
@@ -56,6 +69,7 @@ const VOLUME_RESIZE: u8 = 8;
 const ATTACH: u8 = 9;
 const DETACH: u8 = 10;
 const DIGEST: u8 = 11;
+const REPLICA_DOWN: u8 = 12;
 
 const WRITABLE: u8 = 1;
 const FORCE: u8 = 2;
@@ -106,11 +120,12 @@ impl Command {
                 w.str(name);
                 w.u64(*size_mib);
             }
-            Command::Attach { name, host, writable, force } => {
+            Command::Attach { name, host, writable, force, token } => {
                 w.u8(ATTACH);
                 w.str(name);
                 w.str(host);
                 w.u8(if *writable { WRITABLE } else { 0 } | if *force { FORCE } else { 0 });
+                w.u64(*token);
             }
             Command::Detach { name, host, generation } => {
                 w.u8(DETACH);
@@ -122,6 +137,14 @@ impl Command {
                 w.u8(DIGEST);
                 w.u64(*at);
                 w.fixed(digest);
+            }
+            Command::ReplicaDown { set, cs, refused, name, generation } => {
+                w.u8(REPLICA_DOWN);
+                w.u32(*set);
+                w.u32(*cs);
+                w.u8(u8::from(*refused));
+                w.str(name);
+                w.u64(*generation);
             }
         }
         w.buf
@@ -172,7 +195,8 @@ impl Command {
                 if flags & !(WRITABLE | FORCE) != 0 {
                     return None;
                 }
-                Command::Attach { name, host, writable: flags & WRITABLE != 0, force: flags & FORCE != 0 }
+                Command::Attach { name, host, writable: flags & WRITABLE != 0, force: flags & FORCE != 0,
+                                  token: r.u64()? }
             }
             DETACH => {
                 let name = volume(&mut r)?;
@@ -182,6 +206,16 @@ impl Command {
             DIGEST => {
                 let at = r.u64()?;
                 Command::Digest { at, digest: r.fixed()? }
+            }
+            REPLICA_DOWN => {
+                let (set, cs) = (r.u32()?, r.u32()?);
+                let refused = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                };
+                let name = volume(&mut r)?;
+                Command::ReplicaDown { set, cs, refused, name, generation: r.u64()? }
             }
             _ => return None,
         };
@@ -253,6 +287,12 @@ pub enum Refusal {
     /// As many volumes, chunks, devices, chunk servers or readers as the
     /// metadata keeps.
     TooMany,
+    /// No such replica set, or the cs is no replica of it.
+    NoSuchSet,
+    /// The set's last active replica: writes go on to it alone.
+    LastReplica,
+    /// Not the volume's writer: attached elsewhere since, or never.
+    NotTheWriter,
 }
 
 impl Refusal {
@@ -289,6 +329,9 @@ impl Refusal {
             Refusal::Writing => "the volume is attached for writing",
             Refusal::ReadOnly => "an image or a snapshot is read-only",
             Refusal::TooMany => "as many volumes, chunks, devices, chunk servers or readers as the metadata keeps",
+            Refusal::NoSuchSet => "no such replica set, or the chunk server is no replica of it",
+            Refusal::LastReplica => "the set's last active replica: writes go on to it alone",
+            Refusal::NotTheWriter => "not the volume's writer: attached elsewhere since",
         }
     }
 
@@ -323,6 +366,9 @@ impl Refusal {
             Refusal::Writing => 27,
             Refusal::ReadOnly => 28,
             Refusal::TooMany => 29,
+            Refusal::NoSuchSet => 30,
+            Refusal::LastReplica => 31,
+            Refusal::NotTheWriter => 32,
         }
     }
 
@@ -357,6 +403,9 @@ impl Refusal {
             27 => Refusal::Writing,
             28 => Refusal::ReadOnly,
             29 => Refusal::TooMany,
+            30 => Refusal::NoSuchSet,
+            31 => Refusal::LastReplica,
+            32 => Refusal::NotTheWriter,
             _ => return None,
         })
     }
@@ -377,6 +426,8 @@ pub enum Answer {
     Attached { generation: u64 },
     /// A digest held to.
     Checked,
+    /// A replica taken out: its set's version now.
+    Set { version: u32 },
     Refused(Refusal),
 }
 
@@ -386,6 +437,7 @@ const DEVICE: u8 = 2;
 const VOLUME: u8 = 3;
 const ATTACHED: u8 = 4;
 const CHECKED: u8 = 5;
+const SET: u8 = 6;
 
 impl Answer {
     pub fn encode(&self) -> Vec<u8> {
@@ -412,6 +464,10 @@ impl Answer {
                 w.u64(*generation);
             }
             Answer::Checked => w.u8(CHECKED),
+            Answer::Set { version } => {
+                w.u8(SET);
+                w.u32(*version);
+            }
         }
         w.buf
     }
@@ -425,6 +481,7 @@ impl Answer {
             VOLUME => Answer::Volume { id: r.u32()? },
             ATTACHED => Answer::Attached { generation: r.u64()? },
             CHECKED => Answer::Checked,
+            SET => Answer::Set { version: r.u32()? },
             _ => return None,
         };
         r.done().then_some(a)

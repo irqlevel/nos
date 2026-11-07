@@ -38,6 +38,10 @@ pub enum Source<'a> {
     Id(&'a str),
     /// A device, by this boot's name: `dev:nvme14`.
     Name(&'a str),
+    /// A volume of NBS's, by its name: `nbs:disk1` (plans/nbs.md, N8) -- the
+    /// NBS cluster's, read and written through its client from any host of
+    /// it.
+    Volume(&'a str),
 }
 
 /// What `word` -- a disk's, without its `:ro` -- names.
@@ -46,14 +50,21 @@ pub fn source(word: &str) -> Source<'_> {
         Source::Id(word)
     } else if let Some(name) = word.strip_prefix("dev:") {
         Source::Name(name)
+    } else if let Some(name) = word.strip_prefix("nbs:") {
+        Source::Volume(name)
     } else {
         Source::File(word)
     }
 }
 
-/// Whether `word` names a device rather than a file.
+/// Whether `word` names a device of this host's.
 pub fn is_device(word: &str) -> bool {
-    !matches!(source(word), Source::File(_))
+    matches!(source(word), Source::Id(_) | Source::Name(_))
+}
+
+/// Whether `word` names a file of nos's: neither a device nor a volume.
+pub fn is_file(word: &str) -> bool {
+    matches!(source(word), Source::File(_))
 }
 
 /// The device `word` names.
@@ -67,6 +78,7 @@ pub fn find(word: &str) -> Result<Disk, String> {
         }),
         Source::Name(name) => Disk::open(name).ok_or_else(|| alloc::format!("no device is called {}", name)),
         Source::File(path) => Err(alloc::format!("{} is a file, not a device", path)),
+        Source::Volume(name) => Err(alloc::format!("nbs:{} is a volume of NBS's, not a device of this host's", name)),
     }
 }
 

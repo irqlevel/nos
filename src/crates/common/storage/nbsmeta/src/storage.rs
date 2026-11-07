@@ -172,11 +172,13 @@ pub enum Kind {
     Snapshot,
 }
 
-/// A volume's writer: the host, and the generation it attached at.
+/// A volume's writer: the host, the generation it attached at, and the
+/// token of the client's session that attached it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attach {
     pub host: String,
     pub generation: u64,
+    pub token: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,8 +216,8 @@ impl State {
             Command::VolumeResize { name, size_mib } => {
                 self.volume_resize(name, *size_mib).map(|id| Answer::Volume { id })
             }
-            Command::Attach { name, host, writable, force } => {
-                self.attach(name, host, *writable, *force).map(|generation| Answer::Attached { generation })
+            Command::Attach { name, host, writable, force, token } => {
+                self.attach(name, host, *writable, *force, *token).map(|generation| Answer::Attached { generation })
             }
             Command::Detach { name, host, generation } => {
                 self.detach(name, host, *generation).map(|generation| Answer::Attached { generation })
@@ -223,6 +225,9 @@ impl State {
             Command::Digest { at, digest } => {
                 self.checks.compare(*at, digest, index);
                 Ok(Answer::Checked)
+            }
+            Command::ReplicaDown { set, cs, name, generation, .. } => {
+                self.replica_down(*set, *cs, name, *generation).map(|version| Answer::Set { version })
             }
             /* The members' are lib.rs's */
             Command::Init { .. } | Command::Add { .. } | Command::Remove { .. } => Err(Refusal::Malformed),
@@ -386,7 +391,7 @@ impl State {
         Ok(v.id)
     }
 
-    fn attach(&mut self, name: &str, host: &str, writable: bool, force: bool) -> Result<u64, Refusal> {
+    fn attach(&mut self, name: &str, host: &str, writable: bool, force: bool, token: u64) -> Result<u64, Refusal> {
         self.ready()?;
         self.member_host(host)?;
         let Some(at) = self.volume_at(name) else { return Err(Refusal::NoSuchVolume) };
@@ -394,6 +399,10 @@ impl State {
         if writable {
             if v.kind != Kind::Volume {
                 return Err(Refusal::ReadOnly);
+            }
+            /* The writer's own attach asked again: answered as it was */
+            if let Some(w) = v.writer.as_ref().filter(|w| token != 0 && w.token == token && w.host == host) {
+                return Ok(w.generation);
             }
             if !force {
                 if v.writer.as_ref().is_some_and(|w| w.host != host) {
@@ -408,7 +417,7 @@ impl State {
                fenced by it too */
             v.readers.clear();
             v.generation += 1;
-            v.writer = Some(Attach { host: String::from(host), generation: v.generation });
+            v.writer = Some(Attach { host: String::from(host), generation: v.generation, token });
             return Ok(v.generation);
         }
         if v.writer.is_some() {
@@ -471,6 +480,35 @@ impl State {
             map.push(self.new_chunk(set));
         }
         Ok(())
+    }
+
+    /// Replica `cs` of set `set` taken out: its version now. The set keeps
+    /// it among its three, for repair to bring back or replace (N9), and
+    /// the room it holds; never the last active one.
+    fn replica_down(&mut self, set: u32, cs: u32, name: &str, generation: u64) -> Result<u32, Refusal> {
+        self.ready()?;
+        let v = self.volume(name).ok_or(Refusal::NoSuchVolume)?;
+        /* Asked by the volume's writer now: one fenced since would have its
+           write done by taking out the replicas that refuse it (found by
+           fuzz/nbs's cluster target) */
+        if v.writer.as_ref().is_none_or(|w| w.generation != generation) {
+            return Err(Refusal::NotTheWriter);
+        }
+        if !v.map.iter().any(|&c| self.chunks.get(c as usize).is_some_and(|ch| ch.set == set)) {
+            return Err(Refusal::NoSuchSet);
+        }
+        let s = self.sets.get_mut(set as usize).ok_or(Refusal::NoSuchSet)?;
+        let at = s.cs.iter().position(|&c| c == cs).ok_or(Refusal::NoSuchSet)?;
+        if s.replicas[at] == Replica::Down {
+            return Ok(s.version);
+        }
+        if !s.replicas.iter().enumerate().any(|(i, r)| i != at && *r == Replica::Active) {
+            return Err(Refusal::LastReplica);
+        }
+        let version = s.version.checked_add(1).ok_or(Refusal::TooMany)?;
+        s.replicas[at] = Replica::Down;
+        s.version = version;
+        Ok(version)
     }
 
     /// The set of cs's `cs`, made where there is none.

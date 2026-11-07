@@ -10,8 +10,8 @@
 //!   a message, so that two hosts never read one message two ways.
 
 use nbscs::{ChunkRef, Epoch};
-use nbswire::{Answer, Answered, Device, Identity, Op, Query, Question, Refusal, Reply, Request, Told, DATA_MAX,
-              LIST_MAX};
+use nbswire::{Answer, Answered, Ask, Asking, Device, Identity, Op, Place, Query, Question, Refusal, Reply,
+              ReplicaState, Request, Said, Saying, Told, DATA_MAX, LIST_MAX, MAP_MAX, REASON_MAX};
 
 use crate::rng::{mix, Rng};
 
@@ -49,10 +49,47 @@ fn refusal(r: &mut Rng) -> Refusal {
     }
 }
 
-/// Every kind of message, at random: its bytes.
-fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>) {
+/// A name, now and then at a limit's length, or past it -- which the writer
+/// keeps and the reader refuses.
+fn name(r: &mut Rng, max: usize) -> String {
+    let n = match r.below(10) {
+        0 => 0,
+        1 => max,
+        2 => max + 1,
+        _ => r.below(20) as usize,
+    };
+    (0..n).map(|i| (b'a' + (mix(r.below(1 << 20), i as u64) % 26) as u8) as char).collect()
+}
+
+/// A reason, of any characters -- some wider than a byte -- and of any
+/// length: what is told is cut at a character's edge.
+fn reason(r: &mut Rng) -> String {
+    let n = match r.below(6) {
+        0 => REASON_MAX + r.below(40) as usize,
+        _ => r.below(80) as usize,
+    };
+    (0..n).map(|_| match r.below(8) {
+        0 => '\u{e9}',
+        1 => '\u{2014}',
+        2 => '\u{1f600}',
+        _ => (b'a' + r.below(26) as u8) as char,
+    }).collect()
+}
+
+fn state(r: &mut Rng) -> ReplicaState {
+    match r.below(3) {
+        0 => ReplicaState::Active,
+        1 => ReplicaState::Rebuilding,
+        _ => ReplicaState::Down,
+    }
+}
+
+/// Every kind of message, at random: its kind, its bytes, and whether the
+/// reader is to take it -- not one with a name past its limit, nor a map
+/// asked for past MAP_MAX.
+fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
     let id = r.below(u64::MAX);
-    match r.below(4) {
+    match r.below(6) {
         0 => {
             let n = len(r, u64::from(DATA_MAX));
             let op = match r.below(6) {
@@ -63,10 +100,11 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>) {
                                 offset: r.below(1 << 32) as u32, len: r.below(u64::from(DATA_MAX) + 1) as u32 },
                 3 => Op::Flush,
                 4 => Op::Close { chunk: chunk(r), position: r.below(1 << 32) as u32, index: r.below(u64::MAX) },
+                5 if r.chance(50) => Op::Ping,
                 _ => Op::Held,
             };
             let m = Request { id, volume: r.below(1 << 32) as u32, generation: r.below(u64::MAX), op };
-            (0, m.encode())
+            (0, m.encode(), true)
         }
         1 => {
             let n = len(r, u64::from(DATA_MAX));
@@ -81,7 +119,7 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>) {
                 }
                 _ => Reply::Refused(refusal(r)),
             };
-            (1, Answer { id, reply }.encode())
+            (1, Answer { id, reply }.encode(), true)
         }
         2 => {
             let question = match r.below(4) {
@@ -98,9 +136,9 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>) {
                     Question::Volumes { volumes: (0..k).map(|i| i as u32).collect() }
                 }
             };
-            (2, Query { id, question }.encode())
+            (2, Query { id, question }.encode(), true)
         }
-        _ => {
+        3 => {
             let told = match r.below(5) {
                 0 => Told::Identity(None),
                 1 => {
@@ -124,7 +162,61 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>) {
                     Told::Gone((0..k).map(|i| i as u32).collect())
                 }
             };
-            (3, Answered { id, told }.encode())
+            (3, Answered { id, told }.encode(), true)
+        }
+        4 => {
+            let ask = match r.below(4) {
+                0 => Ask::Attach { name: name(r, nbsmeta::VOLUME_NAME_MAX), writable: r.chance(50),
+                                   force: r.chance(50), token: r.below(u64::MAX) },
+                1 => Ask::Detach { name: name(r, nbsmeta::VOLUME_NAME_MAX), generation: r.below(u64::MAX) },
+                2 => {
+                    /* At the limit and past it, often: either side of it is the reader's to hold */
+                    let count = match r.below(8) {
+                        0 => MAP_MAX,
+                        1 => MAP_MAX + 1 + r.below(1 << 20) as u32,
+                        _ => r.below(u64::from(MAP_MAX)) as u32,
+                    };
+                    Ask::Map { name: name(r, nbsmeta::VOLUME_NAME_MAX), from: r.below(1 << 32) as u32, count,
+                               index: r.below(u64::MAX) }
+                }
+                _ => Ask::Down { set: r.below(1 << 32) as u32, cs: r.below(1 << 32) as u32, refused: r.chance(50),
+                                 name: name(r, nbsmeta::VOLUME_NAME_MAX), generation: r.below(u64::MAX) },
+            };
+            let ok = match &ask {
+                Ask::Attach { name, .. } | Ask::Detach { name, .. } => name.len() <= nbsmeta::VOLUME_NAME_MAX,
+                Ask::Map { name, count, .. } => name.len() <= nbsmeta::VOLUME_NAME_MAX && *count <= MAP_MAX,
+                Ask::Down { name, .. } => name.len() <= nbsmeta::VOLUME_NAME_MAX,
+            };
+            (4, Asking { id, ask }.encode(), ok)
+        }
+        _ => {
+            let said = match r.below(9) {
+                0 => Said::Attached { generation: r.below(u64::MAX), index: r.below(u64::MAX) },
+                1 => Said::Detached { index: r.below(u64::MAX) },
+                2 => {
+                    let k = len(r, u64::from(MAP_MAX));
+                    let map = (0..k).map(|_| Place {
+                        chunk: chunk(r),
+                        cs: [r.below(1 << 32) as u32, r.below(1 << 32) as u32, r.below(1 << 32) as u32],
+                        replicas: [state(r), state(r), state(r)],
+                    }).collect();
+                    let h = r.below(nbsmeta::CS_MAX as u64 + 1) as usize;
+                    let hosts = (0..h).map(|i| (i as u32, name(r, nbsmeta::NAME_MAX))).collect();
+                    Said::Map { volume: r.below(1 << 32) as u32, size_mib: r.below(u64::MAX), places: k as u32,
+                                index: r.below(u64::MAX), from: r.below(1 << 32) as u32, map, hosts }
+                }
+                3 => Said::Down { version: r.below(1 << 32) as u32, index: r.below(u64::MAX) },
+                4 => Said::Behind { applied: r.below(u64::MAX) },
+                5 => Said::NotNow(reason(r)),
+                6 => Said::LastReplica,
+                7 => Said::NotTheWriter,
+                _ => Said::Refused(reason(r)),
+            };
+            let ok = match &said {
+                Said::Map { hosts, .. } => hosts.iter().all(|(_, h)| h.len() <= nbsmeta::NAME_MAX),
+                _ => true,
+            };
+            (5, Saying { id, said }.encode(), ok)
         }
     }
 }
@@ -136,7 +228,9 @@ fn read_back(kind: u8, b: &[u8]) -> Result<bool, String> {
         0 => Request::decode(b).map(|m| m.encode()),
         1 => Answer::decode(b).map(|m| m.encode()),
         2 => Query::decode(b).map(|m| m.encode()),
-        _ => Answered::decode(b).map(|m| m.encode()),
+        3 => Answered::decode(b).map(|m| m.encode()),
+        4 => Asking::decode(b).map(|m| m.encode()),
+        _ => Saying::decode(b).map(|m| m.encode()),
     };
     match again {
         Some(e) if e != b => Err(format!("kind {}: {} bytes read as a message that encodes as {} other bytes", kind,
@@ -150,9 +244,12 @@ pub fn run(seed: u64, steps: u64, _trace: bool) -> Result<(), String> {
     let mut r = Rng::new(mix(seed, 0x77697265));
     let data: Vec<u8> = (0..DATA_MAX as usize).map(|i| mix(seed, i as u64) as u8).collect();
     for step in 0..steps {
-        let (kind, bytes) = message(&mut r, &data);
-        if !read_back(kind, &bytes).map_err(|e| format!("step {}: {}", step, e))? {
-            return Err(format!("step {}: a message of kind {}, {} bytes, not read back", step, kind, bytes.len()));
+        let (kind, bytes, ok) = message(&mut r, &data);
+        let read = read_back(kind, &bytes).map_err(|e| format!("step {}: {}", step, e))?;
+        if read != ok {
+            return Err(format!("step {}: a message of kind {}, {} bytes, {} -- {}", step, kind, bytes.len(),
+                               if ok { "within its limits" } else { "past a limit" },
+                               if read { "read back" } else { "not read back" }));
         }
         /* Spoiled: a byte changed, cut short, grown -- and as another kind */
         let mut spoiled = bytes.clone();
@@ -171,13 +268,13 @@ pub fn run(seed: u64, steps: u64, _trace: bool) -> Result<(), String> {
             }
             _ => {}
         }
-        for k in 0..4 {
+        for k in 0..6 {
             read_back(k, &spoiled).map_err(|e| format!("step {}, spoiled: {}", step, e))?;
         }
         /* And noise */
         let n = r.below(64) as usize;
         let noise: Vec<u8> = (0..n).map(|_| r.below(256) as u8).collect();
-        for k in 0..4 {
+        for k in 0..6 {
             read_back(k, &noise).map_err(|e| format!("step {}, noise: {}", step, e))?;
         }
     }

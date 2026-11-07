@@ -235,8 +235,9 @@ swallowing panic messages whole.
 | `web-test.py` | host (CI) | the host API's wire: `src/crates/common/net/web`, `src/crates/common/ipc/mgmtwire`, a provider's descriptor |
 | `crc-test.py [--seed N] [--cases N]` | host (CI) | the tree's CRCs (`src/crates/common/crc`) -- CRC-32, CRC-32C and CRC-16, which GPT, the disk log, ext4 and raft's log are checked by -- from the crate's own sources: the known answers, every form held to the CRC computed from its definition a bit at a time, and CRC-32 to zlib's |
 | `raft-test.py [--seed N --seconds S] [--mutants]` | host (CI) | the raft crate (`src/crates/common/cluster/raft`): known answers, the known traps played out, groups fuzzed over a network that fails in every way and held to Raft's properties at every step, the wire fed noise, a member fed what no correct member sends, the log on disk through power cuts, torn writes and lost ones, a register through the replicated state machine checked for linearizability, every allocation held to a block of the kernel's heap -- [Raft](raft.md) |
-| `nbs-fuzz.py [--seed N --seconds S] [--target meta\|cs\|wire] [--mutants]` | host (CI) | NBS's metadata (`src/crates/common/storage/nbsmeta`): what is stored, placement, the snapshot and the digest; the chunk server's engine (`nbscs`) through power cuts; NBS's messages (`nbswire`) -- each held to a model of its own -- [`nbs-fuzz.py`](#nbs-fuzzpy----nbss-metadata-decided-on-the-host) |
-| `nbs-test.py [--arch aarch64\|x86_64] [--keep]` | both | NBS between kernels: `modules/storage/nbs-mds` (the member, its commands, the `nbs` provider, `nbs io`) and `modules/storage/nbs-cs` (the chunk server), raftmember as it runs them -- three nos on `scripts/hub.py`'s LAN, as `cluster-test.py` runs them, each with a pool disk |
+| `nbs-fuzz.py [--seed N --seconds S] [--target meta\|cs\|wire\|cluster] [--mutants]` | host (CI) | NBS's metadata (`src/crates/common/storage/nbsmeta`): what is stored, placement, the snapshot and the digest; the chunk server's engine (`nbscs`) through power cuts; NBS's messages (`nbswire`); and the client (`nbsclient`) end to end through six hosts' cs's and mds, crashes and takeovers -- each held to a model of its own -- [`nbs-fuzz.py`](#nbs-fuzzpy----nbss-metadata-decided-on-the-host) |
+| `nbs-test.py [--arch aarch64\|x86_64] [--keep]` | both | NBS between kernels: `modules/storage/nbs-mds` (the member, its commands, the `nbs` provider, `nbs io`'s sessions) and `modules/storage/nbs-cs` (the chunk server), raftmember as it runs them, nbsload -- three nos on `scripts/hub.py`'s LAN, as `cluster-test.py` runs them, each with a pool disk |
+| `hv-nbs-test.py --bzimage <bzImage> --initrd <cpio> [--keep]` | x86-64, **manual** | hv's guests on volumes of NBS's (`disk=nbs:<volume>`): a pour read by a guest elsewhere, a guest's writes read back and moved with the volume, a forced start fencing the old guest, a host killed under a write -- three nos under KVM where the host has it, the guests nested |
 | `api-test.py [--arch aarch64\|x86_64]` | both (arm64 in CI) | the host API module, `nosctl`, the bus's caller side for modules; on x86-64 the `vm` provider through it and `api panel create` |
 | `panel/`: `npx playwright test` | host (CI) | the management panel against the mock API, both themes and both languages |
 | `panel-appliance-test.py <bundle>` | host (CI), Docker | the panel's bundle (`scripts/panel-bundle.py`, `panel/appliance/`) run as its VM runs it |
@@ -3165,13 +3166,48 @@ epoch and every volume's generation, and keeps what each sector may hold.
   written, and another cs's is told apart.
 
 Its `wire` target -- 100 runs of 500 steps -- is nbswire's messages: every
-request, answer, question and what the mds tells, made at random, encoded,
-read back as itself and encoded the same, then cut short, spoiled and given
-bytes past its end, each read as none or as a message that encodes to the
-bytes read.
+request, answer, question and what the mds tells, a client's asks and what
+it is told, made at random, encoded, read back as itself and encoded the
+same, then cut short, spoiled and given bytes past its end, each read as
+none or as a message that encodes to the bytes read.
+
+Its `cluster` target -- 100 runs of 2,000 steps -- is NBS end to end: the
+client (`src/crates/common/storage/nbsclient`) writing, reading, flushing and
+closing a 24 MiB volume through six hosts' cs's -- nbscs's engine, done by
+nbswire's `serve` as nbs-cs.ko does it -- asking its host's mds, whose answers
+are nbswire's `mds` over nbsmeta's state, as nbs-mds.ko's are; the leader's
+look at a cs before it is taken out the fuzzer's, mostly that it answers.
+The network delivers a few messages a step, in order between two ends and
+the pairs in any order, time going by a little and now and then past a
+silence.
+
+- **What happens**: a host crashes now and then -- one at a time, its disk's
+  write cache kept, lost or torn -- and comes back a while on; a writer on
+  it is lost with it, what it sent to a cs still on its way. A writer is
+  taken over by force from another host, now or once it is at rest -- asked
+  to flush, then nothing -- and the old one is asked on to write and to
+  flush, as its host's driver would until it learns it is fenced. A writer
+  whose chunk's last replica restarted fails, as it should, and another
+  starts.
+- **Held to**:
+  - a write done held by every replica the metadata has in, read back from
+    each then and there -- but one that restarted with the chunk open at
+    the writer's generation, which refuses it;
+  - a read each block's last write done when it was asked, or one after
+    that -- out, failed, or done since;
+  - a host back holding, of every block, what a flush made durable or
+    something written since;
+  - once a newer writer serves, no active replica doing an older
+    generation's write or flush -- held where the cs serves it;
+  - the replicas alike once a writer serves, and at the end, after a writer
+    is stopped;
+  - a writer failing only as its chunk's last active replica refuses it.
+
+  A writer that follows another holds what that one had done and not
+  flushed as a crash would leave it: there or not.
 
 `--mutants` runs `fuzz/nbs/mutants.py`, which takes out one rule at a time.
-Each of its thirty-five must fail the gate. The metadata's eighteen:
+Each of its fifty-four must fail the gate. The metadata's twenty:
 - the home host first, the most room first, rule 6;
 - room given back, a volume refused whole, three full hosts refused as no
   room;
@@ -3181,7 +3217,10 @@ Each of its thirty-five must fail the gate. The metadata's eighteen:
   reserved, of the chunks' counts and of its counters, and a snapshot
   written in pieces as in one;
 - a chunk's incarnation moved on when its number is taken again, and held to
-  in a snapshot.
+  in a snapshot;
+- a replica taken out raising its set's version, a set's last active one
+  never taken out, a replica taken out only by the volume's writer of now,
+  and a writer's attach asked again answered with the generation it gave.
 
 The cs's fifteen: a slot's zeros flushed before the record that takes it,
 and the slot zeroed at all; an open mark durable before a generation's first
@@ -3192,12 +3231,26 @@ refused; a request older than the fence refused; a record whose CRC fails
 taken as no record; a record's first write torn in copy A taken as never
 written; a fence page with a torn copy written again at the open; a device
 with anything past a superblock's bytes never taken for blank; nothing of one
-volume's read through another's; a freed slot given back. And the wire's
-two: a request read whole, nothing past its end, and a flag read as 0 or 1
-alone.
+volume's read through another's; a freed slot given back -- and of
+`serve`, a chunk found open refused to its writer, a flush refused to a
+writer with one, and a flush refused to a writer fenced since. The wire's
+three: a request read whole, nothing past its end, a flag read as 0 or 1
+alone, and a map asked for past its most read as none. And the client's
+twelve: a write done only once every replica in has it; every cs fenced
+before the writer serves; a chunk left open made the same on its replicas; a
+read only of an active replica; a flush done only after the flushes before
+it, and of every cs that acknowledged a write since the last began; two
+writes that overlap never out at once; what was asked before the stop done
+before it; a writer its chunk's last replica refuses failed; a replica that
+refuses asked out as refusing though asked out as silent; and, the
+metadata's again through the client, the attach's token and who takes a
+replica out.
 
 `--seed N --seconds S` runs a campaign, of the target `--target` names
-(`meta` unless it names `cs` or `wire`). `NBS_META_STATS=1` and
+(`meta` unless it names `cs`, `wire` or `cluster`). `NBS_CLUSTER_STATS=1`
+says what a `cluster` run did -- writes, reads, flushes and closes done and
+failed, crashes, takeovers, replicas taken out -- and `--trace` every
+operation, request and answer. `NBS_META_STATS=1` and
 `NBS_CS_STATS=1` print each run's answers and steps by kind.
 
 ### `hv-linux-test.py` -- a real Linux bzImage, for a while and for good
