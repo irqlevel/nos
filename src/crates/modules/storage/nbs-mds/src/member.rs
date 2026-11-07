@@ -16,6 +16,10 @@
 //!   be said -- in the log once a minute, and by `nbs status` -- until the
 //!   member is replaced: Raft must never count the vote of a member that
 //!   forgot its log, and it does not, the host being no longer that member.
+//! - **The state's digest held to the leader's**: every member takes its
+//!   state's digest every `nbsmeta::CHECK_EVERY` entries; the leader proposes
+//!   its own (`Command::Digest`) as it takes it, and a member whose own
+//!   differs stops -- a determinism bug said, not a silent fork.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -27,8 +31,8 @@ use kcore::ipc::{Message, TAG_BULK};
 use kcore::klog;
 use kcore::time::boot_time_ns;
 use nbsmeta::{Answer, Command, State};
-use raft::Rsm;
-use raftmember::{App, Core, Locked};
+use raft::{Role, Rsm};
+use raftmember::{App, Core, Locked, Pending};
 
 use crate::files::{self, Known};
 
@@ -119,12 +123,16 @@ pub fn decode_id(bytes: &[u8]) -> Option<([u8; 16], u64)> {
 pub struct Mds {
     me: files::Member,
     lost: Lost,
+    /// The module's folder, for what a member that halts says to do.
+    dir: String,
+    /// The newest checkpoint whose digest this member proposed as leader.
+    proposed: u64,
 }
 
-/// The member over its log, its mailbox named.
-pub fn new(rsm: Rsm<raftmember::Log, State>, me: files::Member, lost: Lost) -> Result<Member, String> {
+/// The member over its log in `dir`, its mailbox named.
+pub fn new(rsm: Rsm<raftmember::Log, State>, me: files::Member, lost: Lost, dir: &str) -> Result<Member, String> {
     let id = me.id;
-    raftmember::Member::new(Mds { me, lost }, rsm, id)
+    raftmember::Member::new(Mds { me, lost, dir: String::from(dir), proposed: 0 }, rsm, id)
 }
 
 impl App for Mds {
@@ -185,10 +193,30 @@ impl App for Mds {
     }
 
     /// A host whose member is no longer the one that said it lost its state
-    /// -- replaced, or removed -- forgotten.
+    /// -- replaced, or removed -- forgotten; and as the leader, the newest
+    /// checkpoint's digest proposed, for every member to hold its own to.
     fn turn(&mut self, core: &mut Core<Mds>) {
         let state = core.state();
         self.lost.with(|l| l.retain(|host, &mut (id, _)| state.member(host).is_some_and(|m| m.id == id)));
+        if core.role() != Role::Leader {
+            return;
+        }
+        if let Some((at, digest)) = core.state().checks().latest() {
+            if at > self.proposed {
+                self.proposed = at;
+                core.ask(self, Command::Digest { at, digest }, Pending::App(()));
+            }
+        }
+    }
+
+    /// A state whose digest is not the leader's: this member serves nothing
+    /// more -- what it would answer from is not what the others hold.
+    fn halt(&self, core: &Core<Mds>) -> Option<String> {
+        let d = core.state().checks().diverged()?;
+        Some(alloc::format!("this host's state at entry {} is not the leader's (digest {}..., the leader's {}..., seen \
+                             at entry {}): a determinism bug, said rather than forked -- its member serves nothing; \
+                             `rmmod nbs-mds`, `rm {}` and `insmod` it, then `nbs host replace {}` on another member",
+                            d.at, codec::hex(&d.mine[..6]), codec::hex(&d.theirs[..6]), d.seen, self.dir, self.me.host))
     }
 }
 
