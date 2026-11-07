@@ -64,6 +64,9 @@ pub const S_CHECKSUM_TYPE: usize = 0x50;
 pub const S_NUM_FC_BLKS: usize = 0x54;
 pub const S_HEAD: usize = 0x58;
 pub const S_CHECKSUM: usize = 0xFC;
+/// `s_users`: the UUIDs of the filesystems the journal serves, 16 bytes
+/// each -- an internal journal's one user its own filesystem.
+pub const S_USERS: usize = 0x100;
 
 /* A commit block, as commit_header has it. */
 pub const H_CHKSUM_TYPE: usize = 12;
