@@ -1,16 +1,16 @@
 //! What the kernel mounts at boot: `root=` -- none, `auto`, a device, a
 //! label, a UUID -- over disks that carry an ext2 labelled `nos` or not,
-//! another ext2, a nanofs, something that only looks like an ext2, or
-//! nothing, some of them on the partitions of a disk; `ro`; `fstest=on`.
-//! Held to what `rootfs.rs` documents: the root the spec names, found the
-//! way it says -- the one ext2 whose label or UUID matches, and none where
-//! two do, a partition's UUID sometimes the other's as a copy's is -- and
-//! ext2 if it carries one, nanofs if not; with no root, a
-//! ramfs at `/`, the first ext2 read-only at `/boot`, the first nanofs at
-//! `/data`; procfs at `/proc` either way. And every filesystem it mounted
-//! for writing left clean by the unmount of everything that shutdown does.
+//! another ext2, something that only looks like an ext2, or nothing, some
+//! of them on the partitions of a disk; `ro`; `fstest=on`. Held to what
+//! `rootfs.rs` documents: the root the spec names, found the way it says --
+//! the one ext2 whose label or UUID matches, and none where two do, a
+//! partition's UUID sometimes the other's as a copy's is -- and mounted if
+//! it carries an ext2; with no root, a ramfs at `/` and the first ext2
+//! read-only at `/boot`; procfs at `/proc` either way. And every filesystem
+//! it mounted for writing left clean by the unmount of everything that
+//! shutdown does.
 
-use crate::image::{ext2 as ext2img, nanofs as nanoimg, part};
+use crate::image::{ext2 as ext2img, part};
 use crate::machine::{self, disk};
 use crate::model::{Data, Node};
 use crate::{reached, Input};
@@ -22,7 +22,6 @@ enum Carries {
     Ext2 { label: u8 },
     /// An ext2 whose revision the probe does not take: not an ext2 to it.
     OldExt2,
-    Nanofs,
     Nothing,
 }
 
@@ -66,7 +65,6 @@ fn image(c: Carries, uuid: [u8; 16], r: &mut Input) -> (disk::Media, u64) {
             }
             (m, 512 * 4096)
         }
-        Carries::Nanofs => (nanoimg::mkfs(&tree, uuid, 0).expect("a small tree").media, nanoimg::DEVICE_BYTES),
         Carries::Nothing => (disk::Media::from_bytes(&crate::input::noise(r.u32(), 4096)), 1 << 20),
     }
 }
@@ -85,10 +83,9 @@ pub fn rootfs(r: &mut Input) {
     let mut devs: Vec<Dev> = Vec::new();
     let mut slots: Vec<(usize, Vec<(Carries, [u8; 16], u64)>)> = Vec::new();
     let pick = |r: &mut Input| -> Carries {
-        match r.u8() % 5 {
+        match r.u8() % 4 {
             0 | 1 => Carries::Ext2 { label: r.below(3) as u8 },
-            2 => Carries::Nanofs,
-            3 => Carries::OldExt2,
+            2 => Carries::OldExt2,
             _ => Carries::Nothing,
         }
     };
@@ -182,28 +179,15 @@ pub fn rootfs(r: &mut Input) {
     let mut root_mounted = false;
     if mode != 0 {
         if let Some(i) = root {
-            match devs[i].carries {
-                Carries::Ext2 { .. } => {
-                    want.push((b"/".to_vec(), "ext2"));
-                    root_mounted = true;
-                }
-                Carries::Nanofs => {
-                    want.push((b"/".to_vec(), "nanofs"));
-                    root_mounted = true;
-                }
-                _ => {}
+            if let Carries::Ext2 { .. } = devs[i].carries {
+                want.push((b"/".to_vec(), "ext2"));
+                root_mounted = true;
             }
         }
         if !root_mounted {
             want.push((b"/".to_vec(), "ramfs"));
             if devs.iter().any(is_ext2) {
                 want.push((b"/boot".to_vec(), "ext2"));
-            }
-            /* The first device the probe does not call ext2 that nanofs
-             * mounts on -- a disk and its partition overlap, so a disk
-             * split in two is never one. */
-            if devs.iter().any(|d| d.carries == Carries::Nanofs) {
-                want.push((b"/data".to_vec(), "nanofs"));
             }
         }
         want.push((b"/proc".to_vec(), "procfs"));

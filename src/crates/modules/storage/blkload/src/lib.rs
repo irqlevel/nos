@@ -22,8 +22,9 @@
 //! another writer holds it -- or the disk it is a partition of, or a
 //! partition of it -- whatever else is said, and holding all of those off
 //! until it is done. Unless `force`, it is refused too on a disk with
-//! partitions and on anything that starts with an ext2 or nanofs
-//! filesystem, a partition table, a boot sector or a prepared disk log area.
+//! partitions and on anything that starts with a filesystem of the ext
+//! family or a nanofs, a partition table, a boot sector or a prepared disk
+//! log area.
 
 extern crate alloc;
 
@@ -67,8 +68,10 @@ const MBR_SIGNATURE_AT: usize = 510;
 const MBR_SIGNATURE: u16 = 0xAA55;
 /* A disk log area prepared for kernel/disklog.cpp begins with "NOSLOG1" */
 const DISKLOG_MAGIC: u64 = 0x0031_474F_4C53_4F4E;
-/* nanofs, `format nanofs`'s, begins its superblock -- the device's first
-   block -- with this (fs/nanofs.h) */
+/* nanofs, the filesystem nos had of its own before ext4 and no longer
+   mounts, began its superblock -- the device's first block -- with this. A
+   disk an older kernel formatted holds it still, and what is on it is
+   somebody's: a write test asks for force there too. */
 const NANOFS_MAGIC: u32 = 0x4E41_4E4F;
 /* Enough of a device's start to hold every one of them */
 const PEEK_BYTES: u64 = 4 * KIB;

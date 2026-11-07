@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 # The cyclic redundancy checks the tree's formats are checked by, each once:
-# CRC-32 (GPT, nanofs, the disk log, the `crc32` command), CRC-32C (ext4's
+# CRC-32 (GPT, the disk log, the `crc32` command), CRC-32C (ext4's
 # metadata and journal, raft's log) and CRC-16 (ext4's gdt_csum). No kernel
 # and no `unsafe` in it, so the kernel's crates, the guest's hvboot and the
 # host's tests all use the same.

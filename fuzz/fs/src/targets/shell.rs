@@ -1,14 +1,14 @@
 //! The shell's storage commands -- what the console, the UDP shell and an
-//! SSH session run: `mount`, `umount`, `format`, `ls`, `find`, `cat`, `write`,
+//! SSH session run: `mount`, `umount`, `ls`, `find`, `cat`, `write`,
 //! `append`, `mkdir`, `touch`, `cp -r`, `rm`, `mv`, `stat`, `truncate`,
 //! `sync`, `fstest`, `disks`, `partitions`, `diskread`, `diskwrite`, `disklog` --
-//! with arguments of every kind, over a ramfs root and an ext2 and a nanofs
-//! on disks. First the kernel's own self-test on each filesystem, which
-//! must pass; then whatever the input types. And at the end, every disk no
-//! command wrote to raw is a filesystem e2fsck -- or nanofs's checker --
-//! passes: what the commands did through the VFS left it whole.
+//! with arguments of every kind, over a ramfs root and two ext2s on disks,
+//! of two block sizes. First the kernel's own self-test on each filesystem,
+//! which must pass; then whatever the input types. And at the end, every
+//! disk no command wrote to raw is a filesystem e2fsck passes: what the
+//! commands did through the VFS left it whole.
 
-use crate::image::{ext2 as ext2img, nanofs as nanoimg};
+use crate::image::ext2 as ext2img;
 use crate::machine::{cmd, disk};
 use crate::model::{Data, Node};
 use crate::{reached, Input};
@@ -68,13 +68,12 @@ fn line(r: &mut Input) -> String {
         11 => "sync".to_string(),
         12 => "mounts".to_string(),
         13 => format!("umount {}", p),
-        14 => match r.u8() % 4 {
+        14 => match r.u8() % 3 {
             0 => format!("mount ramfs {}", p),
-            1 => format!("mount nanofs {} {}", r.pick(DISKS), p),
-            2 => format!("mount ext2 {} {}{}", r.pick(DISKS), p, r.pick(&["", " ro", " rw"])),
-            _ => format!("mount {}", r.pick(&["", "fat", "ext2", "nanofs vdb"])),
+            1 => format!("mount ext2 {} {}{}", r.pick(DISKS), p, r.pick(&["", " ro", " rw"])),
+            _ => format!("mount {}", r.pick(&["", "fat", "ext2", "xfs vdb"])),
         },
-        15 => format!("format {} {}", r.pick(&["nanofs", "ext2", ""]), r.pick(DISKS)),
+        15 => format!("umount {}", r.pick(&["/e", "/n", "/", "/proc"])),
         16 => format!("fstest {} {}", p, size(r)),
         17 => "disks".to_string(),
         18 => format!("partitions {}", r.pick(DISKS)),
@@ -97,15 +96,13 @@ fn tree(r: &mut Input) -> Node {
     Node::Dir(c)
 }
 
-pub fn shell(r: &mut Input) {
-    /* An ext2 on vda, a nanofs on vdb, and vdc carved in two by an MBR, the
-     * partition holding nothing yet. */
-    /* Roomy enough for the self-test's files, in every block size. */
-    let log = r.below(3) as u32;
+/// An ext2 of 4 MiB in blocks of 1 KiB << log -- roomy enough for the
+/// self-test's files at every block size -- labelled and numbered as given.
+fn geometry(log: u32, name: &[u8], uuid: [u8; 16]) -> ext2img::Geometry {
     let bs = 1024u64 << log;
     let mut label = [0u8; 16];
-    label[..3].copy_from_slice(b"nos");
-    let g = ext2img::Geometry {
+    label[..name.len()].copy_from_slice(name);
+    ext2img::Geometry {
         log_block_size: log,
         blocks: ((4u64 << 20) / bs) as u32,
         blocks_per_group: 8 * bs as u32,
@@ -117,13 +114,21 @@ pub fn shell(r: &mut Input) {
         ro_compat_extra: 0,
         reserved_blocks: 0,
         label,
-        uuid: [9; 16],
-    };
+        uuid,
+    }
+}
+
+pub fn shell(r: &mut Input) {
+    /* An ext2 on vda and another on vdb, each of its own block size, and
+     * vdc carved in two by an MBR, the partition holding nothing yet. */
+    let g = geometry(r.below(3) as u32, b"nos", [9; 16]);
     let Ok(e) = ext2img::mkfs(&g, &tree(r), &Default::default(), 1_749_000_000, r.u64()) else { return };
-    let ext2_bytes = g.blocks as u64 * bs;
+    let ext2_bytes = g.blocks as u64 * g.block_size() as u64;
     disk::insert(0, disk::Disk::new("vda", 512, ext2_bytes / 512, e.media));
-    let Ok(n) = nanoimg::mkfs(&tree(r), [5u8; 16], 0) else { return };
-    disk::insert(1, disk::Disk::new("vdb", 512, nanoimg::DEVICE_BYTES / 512, n.media));
+    let g2 = geometry(r.below(3) as u32, b"data", [5; 16]);
+    let Ok(e2) = ext2img::mkfs(&g2, &tree(r), &Default::default(), 1_749_000_000, r.u64()) else { return };
+    let ext2b_bytes = g2.blocks as u64 * g2.block_size() as u64;
+    disk::insert(1, disk::Disk::new("vdb", 512, ext2b_bytes / 512, e2.media));
     let entry = crate::image::part::MbrEntry { status: 0, kind: 0x83, start: 2048, size: 16384 };
     let none = crate::image::part::MbrEntry::default();
     let mbr = crate::image::part::mbr(&[entry, none, none, none], crate::image::part::MBR_SIGNATURE);
@@ -138,15 +143,15 @@ pub fn shell(r: &mut Input) {
 
     let out = cmd::run("mount ext2 vda /e");
     invariant!(out.contains("mounted ext2 on /e (rw)"), "mount ext2 vda /e said {:?}", out);
-    let out = cmd::run("mount nanofs vdb /n");
-    invariant!(out.contains("mounted nanofs on /n"), "mount nanofs vdb /n said {:?}", out);
+    let out = cmd::run("mount ext2 vdb /n");
+    invariant!(out.contains("mounted ext2 on /n (rw)"), "mount ext2 vdb /n said {:?}", out);
 
     /* The kernel's own test of each filesystem, on each as it came. */
     for (dir, big) in [("/", "300K"), ("/e", "40K"), ("/n", "64K")] {
         let out = cmd::run(&format!("fstest {} {}", dir, big));
         invariant!(out.contains("fstest: passed"), "fstest {} {} said {:?}", dir, big, out.lines().last());
     }
-    reached("fstest passed on ramfs, ext2 and nanofs");
+    reached("fstest passed on ramfs and two ext2s");
 
     /* Then whatever is typed. A disk a command writes to raw is no longer
      * a filesystem anybody vouches for. */
@@ -157,8 +162,8 @@ pub fn shell(r: &mut Input) {
         let l = line(r);
         let out = cmd::run(&l);
         crate::targets::fsops::say(format_args!("{} -> {:?}", l, out.lines().last()));
-        if out.contains("formatted") || out.contains("wrote ") {
-            let target = l.split_whitespace().nth(if l.starts_with("format") { 2 } else { 1 }).unwrap_or("");
+        if out.contains("wrote ") {
+            let target = l.split_whitespace().nth(1).unwrap_or("");
             for (slot, name) in ["vda", "vdb", "vdc"].iter().enumerate() {
                 if target.starts_with(name) {
                     raw[slot] = true;
@@ -170,19 +175,13 @@ pub fn shell(r: &mut Input) {
 
     let vfs = fs::vfs_instance().expect("the VFS");
     vfs.unmount_all();
-    for (slot, bytes) in [(0usize, ext2_bytes), (1, nanoimg::DEVICE_BYTES)] {
+    for (slot, name, bytes) in [(0usize, "vda", ext2_bytes), (1, "vdb", ext2b_bytes)] {
         if raw[slot] {
             continue;
         }
         let m = disk::with(slot, |d| d.current.clone());
-        if slot == 0 {
-            let c = ext2img::check(&m, bytes);
-            invariant!(c.corrupt.is_empty() && c.unclean.is_empty(), "the shell's commands left vda's ext2 {:?} {:?}",
-                       c.corrupt, c.unclean);
-        } else {
-            let c = nanoimg::check(&m);
-            invariant!(c.corrupt.is_empty() && c.unclean.is_empty(), "the shell's commands left vdb's nanofs {:?} \
-                       {:?}", c.corrupt, c.unclean);
-        }
+        let c = ext2img::check(&m, bytes);
+        invariant!(c.corrupt.is_empty() && c.unclean.is_empty(), "the shell's commands left {}'s ext2 {:?} {:?}", name,
+                   c.corrupt, c.unclean);
     }
 }

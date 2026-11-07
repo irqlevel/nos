@@ -3,7 +3,7 @@
 //! reach through any more.
 //!
 //! Every message here is the one the C++ printed, because the tests match on
-//! them -- `scripts/ext2-test.py` and `scripts/nanofs-test.py` drive the
+//! them -- `scripts/ext2-test.py` and `scripts/ext4-test.py` drive the
 //! filesystem entirely through these commands.
 
 use core::fmt::Write;
@@ -16,10 +16,7 @@ use crate::paths::{base_name, is_under, Path};
 use crate::vfs::{FileStat, Open, OPEN_APPEND, OPEN_CREATE, OPEN_READ, OPEN_TRUNCATE,
                  OPEN_WRITE};
 use crate::vnode::Kind;
-use crate::{ext2, ext4, nanofs, ramfs, vfs_instance};
-
-/// What `format`'s claim on its device says to whoever is refused it.
-const FORMAT_HOLDER: &core::ffi::CStr = c"format";
+use crate::{ext2, ext4, ramfs, vfs_instance};
 
 /// One file at a time through 64 KiB pieces: neither side has to fit in
 /// memory.
@@ -49,7 +46,6 @@ fn find_disk(name: &str, out: &mut Output) -> Option<Disk> {
 /* ---- mounting ---- */
 
 const MOUNT_USAGE_RAMFS: &str = "usage: mount ramfs <path>";
-const MOUNT_USAGE_NANOFS: &str = "usage: mount nanofs <disk> <path>";
 const MOUNT_USAGE_EXT2: &str = "usage: mount ext2 <disk> <path> [ro]";
 const MOUNT_USAGE_EXT4: &str = "usage: mount ext4 <disk> <path> [ro]";
 
@@ -59,7 +55,6 @@ pub fn mount(args: &str, out: &mut Output) {
         Some(name) => name,
         None => {
             let _ = writeln!(out, "{}", MOUNT_USAGE_RAMFS);
-            let _ = writeln!(out, "       mount nanofs <disk> <path>");
             let _ = writeln!(out, "       mount ext2 <disk> <path> [ro]");
             let _ = writeln!(out, "       mount ext4 <disk> <path> [ro]");
             return;
@@ -74,18 +69,6 @@ pub fn mount(args: &str, out: &mut Output) {
             };
             if ramfs::mount_at(path, false) {
                 let _ = writeln!(out, "mounted ramfs on {}", path);
-            } else {
-                let _ = writeln!(out, "mount failed");
-            }
-        }
-        "nanofs" => {
-            let (disk, path) = match (tokens.next(), tokens.next()) {
-                (Some(disk), Some(path)) => (disk, path),
-                _ => { let _ = writeln!(out, "{}", MOUNT_USAGE_NANOFS); return; }
-            };
-            let dev = match find_disk(disk, out) { Some(dev) => dev, None => return };
-            if nanofs::mount_at(path, dev.handle(), false) >= 0 {
-                let _ = writeln!(out, "mounted nanofs on {}", path);
             } else {
                 let _ = writeln!(out, "mount failed");
             }
@@ -135,43 +118,6 @@ pub fn umount(args: &str, out: &mut Output) {
 
 pub fn mounts(_args: &str, out: &mut Output) {
     files::dump_mounts(out);
-}
-
-pub fn format(args: &str, out: &mut Output) {
-    let mut tokens = args_of(args);
-    let fs_name = match tokens.next() {
-        Some(name) => name,
-        None => { let _ = writeln!(out, "usage: format nanofs <disk>"); return; }
-    };
-    if fs_name != "nanofs" {
-        let _ = writeln!(out, "unknown filesystem '{}'", fs_name);
-        return;
-    }
-
-    let name = match tokens.next() {
-        Some(name) => name,
-        None => { let _ = writeln!(out, "usage: format nanofs <disk>"); return; }
-    };
-    let dev = match find_disk(name, out) { Some(dev) => dev, None => return };
-
-    /* Not under a mounted filesystem, the disk log or a write test, nor over
-       a disk one of those holds a partition of */
-    let claim = match block::claim_as(dev.handle(), FORMAT_HOLDER) {
-        Ok(claim) => claim,
-        Err(held_by) => {
-            let _ = writeln!(out, "disk '{}' is in use by {}", name, held_by);
-            return;
-        }
-    };
-
-    let formatted = nanofs::format_device(dev.handle());
-    block::release(claim);
-
-    if formatted {
-        let _ = writeln!(out, "formatted {} as nanofs", name);
-    } else {
-        let _ = writeln!(out, "format failed");
-    }
 }
 
 /* ---- files and directories ---- */
@@ -541,8 +487,7 @@ pub fn fstest(args: &str, out: &mut Output) {
 
 pub fn register_all() {
     let commands: &[(&str, &str, fn(&str, &mut Output))] = &[
-        ("format", "format nanofs <disk> - format disk", format),
-        ("mount", "mount <ramfs|nanofs|ext2|ext4> ... - mount filesystem", mount),
+        ("mount", "mount <ramfs|ext2|ext4> ... - mount filesystem", mount),
         ("umount", "umount <path> - unmount filesystem", umount),
         ("mounts", "mounts - list mount points", mounts),
         ("ls", "ls [path] - list directory (default /)", ls),

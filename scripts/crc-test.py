@@ -2,7 +2,7 @@
 """CRC test: the tree's CRCs (src/crates/common/crc), decided on the host.
 
 One crate computes every CRC the tree's formats are checked by -- CRC-32
-(GPT, nanofs, the disk log, the `crc32` command), CRC-32C (ext4's
+(GPT, the disk log, the `crc32` command), CRC-32C (ext4's
 metadata_csum and journal, raft's log) and CRC-16 (ext4's gdt_csum) -- for
 the kernel, for hvboot in a guest and for the host's fuzzers alike. A CRC
 computed wrong looks like a disk that is corrupt, or one that is not:

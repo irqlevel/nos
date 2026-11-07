@@ -1,6 +1,6 @@
 # The storage layers fuzzed on the host: the kernel's own Rust crates --
 # `block` (the device table, the partition tables, the claims, the disk log)
-# and `fs` (the VFS, ext2, nanofs, ramfs, procfs, the file ABI, the shell's
+# and `fs` (the VFS, ext2, ext4, ramfs, procfs, the file ABI, the shell's
 # commands), over `kcore` and `ffi` as they are -- linked into a host
 # program that is the rest of the kernel: the C++ half the `ffi` crate
 # declares (fuzz/common) and disks whose media are the fuzzer's. What is on
@@ -20,7 +20,7 @@ fs = { path = "../../src/crates/layers/fs" }
 # The events tasks wait on, which an image's queue may be made on
 # (plans/ipc.md I2).
 events = { path = "../../src/crates/base/events" }
-# The CRC-32 the partition tables, nanofs and the disk log are checked by,
+# The CRC-32 the partition tables and the disk log are checked by,
 # for the images the fuzzer makes and judges. (Its ext4 judge's CRC32C is
 # its own, by design: it shares nothing with the code it judges.)
 crc = { path = "../../src/crates/common/crc" }

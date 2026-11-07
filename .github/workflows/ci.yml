@@ -101,7 +101,7 @@ jobs:
           python3 scripts/extfmt-test.py
 
       # One crate computes every CRC the formats are checked by -- GPT's,
-      # nanofs's, the disk log's, ext4's, raft's log's -- for the kernel,
+      # the disk log's, ext4's, raft's log's -- for the kernel,
       # hvboot and the fuzzers: a CRC computed wrong is a disk that looks
       # corrupt, or one that does not. Its known answers, every form held
       # to the CRC computed from its definition, and CRC-32 to zlib's.
@@ -244,12 +244,6 @@ jobs:
       - name: ext4 test (mke2fs, debugfs, TCG)
         if: matrix.arch == 'aarch64'
         run: python3 scripts/ext4-test.py --tcg
-
-      # nanofs is the one filesystem no smoke boot mounts, so without this
-      # nothing here would notice it breaking.
-      - name: nanofs test (TCG)
-        if: matrix.arch == 'aarch64'
-        run: python3 scripts/nanofs-test.py --tcg
 
       # On the machines with no serial port the kernel log over UDP is the
       # only console there is, and a panic is when it matters most.
