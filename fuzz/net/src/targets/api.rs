@@ -2008,7 +2008,7 @@ pub fn api(r: &mut Input) {
     let out = console(&mut w, "api stop");
     invariant!(out.contains("api: stopped"), "`api stop` at the end: {:?}", out);
     let m = module().take();
-    let app = App::spawn("rmmod", 1, move || drop(m));
+    let app = App::spawn("rmmod", 1, move || kmod::unload(m));
     invariant!(w.wait_app(&app, 120 * SEC), "rmmod api never returned");
     for e in 0..w.peers.tcp.eps.len() {
         if w.peers.tcp.eps[e].open() {

@@ -127,6 +127,16 @@ struct Slot {
     removing: bool,
 }
 
+impl Slot {
+    /// Whether it is a module's whose image is `lo..hi`: its handler there.
+    fn of_module(&self, lo: usize, hi: usize) -> bool {
+        match self.handler {
+            Handler::Module { f, .. } => (lo..hi).contains(&(f as usize)),
+            Handler::Image(_) => false,
+        }
+    }
+}
+
 /// A call running: what an answer from a module is looked up by.
 struct Active {
     id: u64,
@@ -284,6 +294,16 @@ pub(crate) fn add<'a>(name: &str, methods: impl Iterator<Item = (&'a str, Kind)>
     if r.stopped {
         return Err(Status::Gone);
     }
+    /* Not a provider of a module the loader is taking down: asked under the
+     * lock close_range marks its providers under, the module made Unloading
+     * before that, so a registration either comes first and is closed with
+     * the rest, or comes after and is refused here -- never one that a call
+     * can begin in while the module's state and code go */
+    if let Handler::Module { f, .. } = handler {
+        if ffi::system::kernel_module_unloading_at(f as usize) != 0 {
+            return Err(Status::Gone);
+        }
+    }
     if r.slots.iter().flatten().any(|s| s.name == name) {
         return Err(Status::Conflict);
     }
@@ -319,15 +339,13 @@ pub(crate) fn unregister(handle: u64) {
         /* The slot, taken once nothing runs in it -- and dropped out of the
          * lock; or how many run, and what, for the report */
         let mut waiting = 0;
-        let mut what: [(usize, usize); 4] = [(usize::MAX, 0); 4];
+        let mut what = NOT_RUNNING;
         let gone = {
             let mut r = bus.lock();
             match r.slots[index].as_ref() {
                 Some(s) if s.handle == handle && s.running > 0 => {
                     waiting = s.running;
-                    for (w, c) in what.iter_mut().zip(r.calls.iter().flatten().filter(|c| c.slot == index)) {
-                        *w = (c.method, c.task);
-                    }
+                    what = r.running_in(index);
                     None
                 }
                 Some(s) if s.handle == handle => r.slots[index].take(),
@@ -348,9 +366,98 @@ pub(crate) fn unregister(handle: u64) {
     }
 }
 
+/// The first few calls running in a slot, as a wait's report names them:
+/// each one's method and task; `usize::MAX` methods past the last.
+type Running = [(usize, usize); 4];
+const NOT_RUNNING: Running = [(usize::MAX, 0); 4];
+
+impl Registry {
+    fn running_in(&self, index: usize) -> Running {
+        let mut what = NOT_RUNNING;
+        for (w, c) in what.iter_mut().zip(self.calls.iter().flatten().filter(|c| c.slot == index)) {
+            *w = (c.method, c.task);
+        }
+        what
+    }
+}
+
+/// Every provider of a module's -- its handler in `lo..hi`, the module's
+/// image -- closed, as the loader takes the module down
+/// (ModuleTable::take_down, through `rust_mgmt_close_range`): no call or job
+/// of it starts from here on, and its jobs are told to stop, as the first
+/// half of each one's unregister would. Never waits.
+pub(crate) fn close_range(lo: usize, hi: usize) {
+    let Some(bus) = BUS.get() else { return };
+    let mut handles = [0u64; MAX_PROVIDERS];
+    let mut n = 0;
+    {
+        let mut r = bus.lock();
+        for s in r.slots.iter_mut().flatten().filter(|s| s.of_module(lo, hi)) {
+            s.removing = true;
+            handles[n] = s.handle;
+            n += 1;
+        }
+    }
+    for &handle in &handles[..n] {
+        job::cancel_provider(handle);
+    }
+}
+
+/// The second half: returns once no call or job of a provider of the
+/// module's runs, saying every REPORT_NS while it waits which do -- one
+/// still running is in the module's code, which is about to go. With
+/// `take`, those of them still registered then are taken off, each said as
+/// its module's leaving it behind: closed by `close_range` before, or
+/// refused registration since, so none of them runs or can begin.
+pub(crate) fn drain_range(lo: usize, hi: usize, take: bool) {
+    let Some(bus) = BUS.get() else { return };
+    let start = boot_time_ns();
+    let mut said = start;
+    loop {
+        let mut busy = None;
+        {
+            let r = bus.lock();
+            for (index, s) in r.slots.iter().enumerate() {
+                if let Some(s) = s.as_ref().filter(|s| s.of_module(lo, hi) && s.running > 0) {
+                    busy = Some((index, s.running, r.running_in(index)));
+                    break;
+                }
+            }
+        }
+        let Some((index, waiting, what)) = busy else { break };
+        let now = boot_time_ns();
+        if now.saturating_sub(said) >= REPORT_NS {
+            said = now;
+            klog!(0, "mgmt: a module's unload waits for the calls and jobs of its providers");
+            describe_wait(bus, index, waiting, &what, now.saturating_sub(start));
+        }
+        kcore::task::sleep_ms(POLL_MS);
+    }
+    if !take {
+        return;
+    }
+    loop {
+        /* Taken under the lock, dropped -- and said -- out of it */
+        let gone = {
+            let mut r = bus.lock();
+            match r.slots.iter().position(|s| s.as_ref().is_some_and(|s| s.of_module(lo, hi))) {
+                Some(index) => r.slots[index].take(),
+                None => None,
+            }
+        };
+        let Some(slot) = gone else { break };
+        if slot.running != 0 || !slot.removing {
+            panic!("mgmt: provider {} taken off with its module, {} calls running, removing {}", slot.name,
+                   slot.running, slot.removing);
+        }
+        klog!(0, "mgmt: provider {} left registered by its module as it went: taken off", slot.name);
+        drop(slot);
+    }
+}
+
 /// Whom an unregister waits for, said: the provider, how long, and the
 /// methods and tasks of the first of its calls.
-fn describe_wait(bus: &Mutex<Registry>, index: usize, waiting: u32, what: &[(usize, usize); 4], ns: u64) {
+fn describe_wait(bus: &Mutex<Registry>, index: usize, waiting: u32, what: &Running, ns: u64) {
     /* Names copied under the lock, said after it */
     let mut name = [0u8; 24];
     let mut methods = [[0u8; 32]; 4];

@@ -2961,9 +2961,11 @@ has got; its cancel -- or the module's going -- stops a download, a
 conversion and a copy where they are, what they made taken away, and stops
 waiting for a guest's power button. A VM whose vm.toml says `protected =
 true` is stopped and deleted only when the call says `force`: the panel's
-own VM has it. The provider is unregistered first when the module goes,
-which waits out its calls and jobs, and only then do the forwards, the VMs
-and the command go. Its descriptor is `vm.descriptor.json`
+own VM has it. When the module goes, the loader closes the provider with
+the command -- its jobs told to stop -- and the module's stop unregisters
+it, waiting out its calls and jobs, before the forwards and the VMs go; the
+loader then waits out the command's calls, and only then is the module
+dropped ([Unloading](modules.md#unloading)). Its descriptor is `vm.descriptor.json`
 ([Descriptors](mgmt.md#descriptors)).
 
 ### Where the folders are
@@ -3250,10 +3252,12 @@ in the background after five seconds, `lsmod` saying `unloading` and the
 kernel log how each guest ended; the halt waits, and says why in the log
 before it does (`hv: unloading -- 2 vm(s) asked to turn themselves off,
 given 120 s`). `stop_secs=0` is the old way, every guest stopped where it
-is. Meanwhile no guest starts, `hv list` shows each `stopping`, `hv stop` of
-one is refused as already being stopped and an `hv stop` already giving one
-its time goes on with it, the unload's time and its own both running: the
-first to end takes the guest off the list. On a machine whose only console
+is. Meanwhile no guest starts, and the `hv` command and the `vm` provider
+are gone with the module, closed as its unload began
+([Unloading](modules.md#unloading)) -- `lsmod` shows it unloading and the
+log how each guest ends; an `hv stop` already giving one its time then goes
+on with it, the unload's time and its own both running: the first to end
+takes the guest off the list. On a machine whose only console
 is the network the netconsole stays up through all of it -- stopped after
 the modules and the filesystems, sending what it still holds as it goes
 (`rust_net_stop_netconsole`) -- so that the wait is seen.

@@ -101,19 +101,32 @@ struct Sshd {
     state: Arc<State>,
 }
 
-impl kmod::Module for Sshd {}
+impl kmod::Module for Sshd {
+    /* Before the loader waits out a call of the command: the server's
+       sessions told to stop, as a call whose output an SSH client is not
+       taking gives up only once its session sees the stop */
+    fn stop(&mut self) {
+        tell_server_to_stop(&self.state);
+    }
+}
 
 impl Drop for Sshd {
     fn drop(&mut self) {
-        /* Before the fields go -- the command first, whose drop waits out a
-           call of it still running: a call whose output an SSH client is not
-           taking gives up only once its session sees the stop */
-        self.state.server.with(|server| {
-            if let Some(s) = server.as_ref() {
-                s.shared.stop.store(true, Ordering::Release);
-            }
-        });
+        /* Again, before the fields go: an `sshd start` running as the unload
+           began may have made a server after the stop, which the state's
+           drop waits for */
+        tell_server_to_stop(&self.state);
     }
+}
+
+/// The server's sessions and listener, if there is a server, told to stop:
+/// not waited for.
+fn tell_server_to_stop(state: &State) {
+    state.server.with(|server| {
+        if let Some(s) = server.as_ref() {
+            s.shared.stop.store(true, Ordering::Release);
+        }
+    });
 }
 
 fn init() -> kcore::error::Result<Box<dyn kmod::Module>> {
