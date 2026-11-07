@@ -12,6 +12,8 @@ edition = "2021"
 raft = { path = "../../src/crates/common/cluster/raft" }
 # The cluster's registry, the crate's first user (plans/cluster.md).
 registry = { path = "../../src/crates/common/cluster/registry" }
+# NBS's metadata, its second (plans/nbs.md).
+nbsmeta = { path = "../../src/crates/common/storage/nbsmeta" }
 # The CRC32C the log's records are checked by, for the known answers and
 # for records made by hand.
 crc = { path = "../../src/crates/common/crc" }

@@ -38,7 +38,6 @@
 
 extern crate alloc;
 
-mod codec;
 mod command;
 
 pub use command::{Answer, Command, Refusal};

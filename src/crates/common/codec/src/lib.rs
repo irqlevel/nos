@@ -1,12 +1,24 @@
-//! What the registry's commands, answers and snapshots are made of:
-//! little-endian integers, and strings with their lengths in front -- every
-//! read checked, none past the end, and a length never taken on trust.
+//! Bytes in order: little-endian integers, and strings with their lengths
+//! in front -- every read checked, none past the end, and a length never
+//! taken on trust. What a replicated state's commands, answers and snapshots
+//! are made of: the cluster's registry's and NBS's metadata's.
+
+#![no_std]
+#![forbid(unsafe_code)]
+
+extern crate alloc;
 
 use alloc::vec::Vec;
 
 /// Bytes written in order.
-pub(crate) struct Writer {
+pub struct Writer {
     pub buf: Vec<u8>,
+}
+
+impl Default for Writer {
+    fn default() -> Writer {
+        Writer::new()
+    }
 }
 
 impl Writer {
@@ -31,8 +43,8 @@ impl Writer {
         self.buf.extend_from_slice(b);
     }
 
-    /// A string, its length in front: one the registry wrote, so at most
-    /// what a `u8` counts -- every string it keeps is shorter than that.
+    /// A string, its length in front: at most what a `u8` counts -- the
+    /// writer keeps none longer.
     pub fn str(&mut self, s: &str) {
         debug_assert!(s.len() <= usize::from(u8::MAX));
         self.buf.push(s.len().min(usize::from(u8::MAX)) as u8);
@@ -41,7 +53,7 @@ impl Writer {
 }
 
 /// Bytes read in order: None for any read past the end.
-pub(crate) struct Reader<'a> {
+pub struct Reader<'a> {
     buf: &'a [u8],
     at: usize,
 }

@@ -9,7 +9,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::codec::{Reader, Writer};
+use codec::{Reader, Writer};
 use crate::{Fingerprint, Role};
 
 /// The longest string a command carries: what its length byte counts. A
