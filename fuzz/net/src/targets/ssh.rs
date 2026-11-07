@@ -205,15 +205,25 @@ fn plan(r: &mut Input) -> Plan {
             Run::Exec(c, out)
         }
     };
-    /* A window of a byte or a hundred is for what prints little: a hundred
-     * thousand round trips is a long time to spend on one client. */
-    let big = matches!(&run, Run::Exec(c, _) if c.starts_with("spew ") && c.len() > 9);
+    /* A window of a byte or a hundred, and a packet of a byte, are for what
+     * prints little: a hundred thousand round trips is a long time to spend
+     * on one client. Whatever runs the spew -- an exec, a shell's line, a
+     * terminal's: a shell's `spew 300000` through a window of a byte was
+     * 300000 round trips, ten seconds of one input on a fast machine and
+     * past the runner's hang limit on CI's arm64 one (seed 1, iteration 164). */
+    let spews = |c: &str| c.starts_with("spew ") && c.len() > 9;
+    let big = match &run {
+        Run::Exec(c, _) => spews(c),
+        Run::Shell(lines) => lines.iter().any(|(c, _)| spews(c)),
+        Run::Pty(lines) => lines.iter().any(|c| spews(c)),
+    };
     /* Past the window is past it only where nothing takes what came in:
      * a shell takes it as typing, and gives the window back. */
     let brk = if brk == Break::Overrun && !matches!(run, Run::Exec(..)) { Break::None } else { brk };
     let window = if big { r.pick(&[0x20_0000u32, 64 * 1024, 4096]) }
                  else { r.pick(&[0x20_0000u32, 64 * 1024, 32 * 1024, 4096, 100, 1]) };
-    let max_packet = r.pick(&[32 * 1024u32, 16 * 1024, 1024, 100, 1]);
+    let max_packet = if big { r.pick(&[32 * 1024u32, 16 * 1024, 1024, 100]) }
+                     else { r.pick(&[32 * 1024u32, 16 * 1024, 1024, 100, 1]) };
     let adjust_after = match r.u8() % 3 {
         0 => 1,
         1 => window / 2 + 1,
