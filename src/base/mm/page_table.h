@@ -21,6 +21,19 @@ struct Page final
         phy_addr = addr;
     }
 
+    /* A page's address is page-aligned, so its low bit is free to say what
+       the descriptor has no room for: that the page, free, is zeroed or
+       being zeroed -- on the zeroed list, or on its way there from the other
+       (PageTable::zero_free_page). Set and cleared under the page table's
+       Lock, and only while the page is free: a page handed out never has
+       it, so one freed with it is a page freed twice (free_page_no_lock).
+       Read and written as relaxed atomics -- plain loads and stores on
+       either arch -- because the address is read without the lock
+       (check_free_list's snapshot, is_frame_address on an address handed
+       in) while the bit may be flipped beside it; the address's own bits
+       never change, so whichever word is read, the address is the same. */
+    static const ulong ZEROED_BIT = 1;
+
     void get()
     {
         ref_count.inc();
@@ -34,7 +47,18 @@ struct Page final
 
     ulong get_phy_address()
     {
-        return phy_addr;
+        return __atomic_load_n(&phy_addr, __ATOMIC_RELAXED) & ~ZEROED_BIT;
+    }
+
+    bool is_zeroed()
+    {
+        return (__atomic_load_n(&phy_addr, __ATOMIC_RELAXED) & ZEROED_BIT) != 0;
+    }
+
+    void set_zeroed(bool zeroed)
+    {
+        const ulong addr = __atomic_load_n(&phy_addr, __ATOMIC_RELAXED) & ~ZEROED_BIT;
+        __atomic_store_n(&phy_addr, zeroed ? (addr | ZEROED_BIT) : addr, __ATOMIC_RELAXED);
     }
 
     stdlib::ListEntry list_entry;
@@ -208,12 +232,62 @@ public:
        fault it could find. */
     void check_free_list(stdlib::Printer& printer);
 
+    /* A page, zeroed. Free pages are on one of two lists: the zeroed one,
+       pages the zeroing tasks have cleared (zero_free_page), and the other,
+       pages as their last owner left them. alloc_page takes from the other
+       first and zeroes what it takes -- the page its last owner just let go
+       of is still in the cache -- and from the zeroed list when the other is
+       empty, where there is nothing to zero. */
     Page* alloc_page();
     /* A page, zeroed, as alloc_page gives one -- or none while the free list
        holds `keep` pages or fewer: what an allocation that must leave the
        rest of the kernel its memory takes (kernel_frame_alloc, a guest's
-       RAM). The count is looked at under the lock the page is taken under. */
+       RAM). The count is looked at under the lock the page is taken under.
+       It takes from the zeroed list first: a guest's memory is gigabytes,
+       and every page of it already cleared is one its start does not wait
+       for. */
     Page* alloc_page_keeping(ulong keep);
+
+    /* The zeroing tasks' work (PageZeroer), a page at a time so that each
+       call is short.
+
+       zero_free_page: a free page off the other list -- its cold end, the
+       allocations taking from the other -- zeroed and put on the zeroed one.
+       The page is zeroed off Lock, through this CPU's frame slot, and is on
+       neither list meanwhile: still counted free, as it is nobody's, and
+       marked, so that a free of it -- a page freed twice -- panics.
+       Interrupts are off from the take to the put, a microsecond, so that
+       nothing keeps it off its list for longer; and a page is taken only
+       while more than `keep` pages are free. The zeroing tasks keep the
+       kernel's reserve (get_kernel_reserve_pages), where the page off the
+       list can make no allocation fail: a guest's stops at the reserve, and
+       the kernel's would have to take every page there is in that
+       microsecond -- and the one after the last would fail anyway. False
+       when there was nothing to zero.
+
+       zero_free_huge_page: a page of a free block of the huge pool zeroed,
+       under the pool's lock, the block staying free throughout: an
+       allocation of it meanwhile takes it as it does any block not known
+       zero, zeroing it whole itself, and the zeroing starts on another; with
+       all 512 pages done the block is known zero, and alloc_huge_frame hands
+       it out as it is. The pool's lock is its own so that the zeroing keeps
+       no 4 KiB allocation waiting. False when every free block is known
+       zero, or there is no pool.
+
+       get_zeroed_pages_count, get_huge_pool_zeroed: how many free pages, and
+       free blocks, are known zero.
+
+       set_zero_check (zerofree=verify): every page, and block, an allocation
+       takes as known zero read first, and a word that is not zero a panic
+       naming the page -- something wrote to a free page, a use after free,
+       caught at the allocation rather than handed to a guest. Set once, at
+       boot, before there is another CPU. */
+    bool zero_free_page(ulong keep);
+    bool zero_free_huge_page();
+    ulong get_zeroed_pages_count();
+    ulong get_huge_pool_zeroed();
+    void set_zero_check(bool on);
+    bool is_zero_check();
     static const ulong MAX_CONTIGUOUS_PAGES = 128;
 
     /* The most pages mm::map_large_pages maps at one run of VA: 16 MiB, for
@@ -288,7 +362,8 @@ public:
        alloc_huge_frame: a block of the pool, zeroed as alloc_page zeroes a
        page -- what a guest finds in its memory is what it was given, never
        what the last guest left there: its physical address, or 0 when none
-       is free.
+       is free. A block known zero (zero_free_huge_page) first, as it is;
+       else any free one, zeroed here.
 
        free_huge_frame: a block back into the pool. An address that is no
        block of the pool, or one already back, is a panic, as free_frame's
@@ -363,11 +438,22 @@ private:
 
     Page* alloc_page_no_lock();
     void free_page_no_lock(Page* page);
-    /* The halves of an allocation: a page off the free list, with Lock
-       held; and its zeroing, which needs no lock -- the page is the
-       caller's alone once it is off the list. */
-    Page* take_free_page_no_lock();
+    /* The halves of an allocation: a page off a free list, with Lock held --
+       the zeroed one first when zeroed_first, the other first otherwise --
+       its mark cleared and `zeroed` saying which list it came off; and its
+       zeroing, which needs no lock -- the page is the caller's alone once it
+       is off the list -- unless it came off the zeroed one. */
+    Page* take_free_page_no_lock(bool zeroed_first, bool& zeroed);
     void zero_page(Page* page);
+    /* What an allocation does with the page it took: zeroes it, unless it is
+       known zero -- and then reads it, under zero_check_ */
+    void zero_unless_zeroed(Page* page, bool zeroed);
+    /* The page at va, mapped, read: a word that is not zero is a panic */
+    void check_zeroed(ulong va, ulong phy_addr);
+    /* A page taken off a free list by anything that does not hand it out
+       whole -- a run, a block for the pool: off its list, its mark and the
+       counts with it. Under Lock. */
+    void unlist_free_page_no_lock(Page* page);
 
     /* Where a range map takes its frames from: exactly one member is set.
        A tagged source keeps one range walk serving all three public forms
@@ -424,23 +510,45 @@ private:
     ulong page_array_phys_;
     ulong page_array_count_;
     ulong highest_phy_addr_;
+    /* The free pages: free_pages_list_ those as their last owner left them,
+       zeroed_pages_list_ those known to read as zeros, each of them marked
+       (Page::ZEROED_BIT). free_pages_count_ counts both lists and a page
+       zero_free_page has off them on its way from one to the other;
+       zeroed_pages_count_ the zeroed list alone. */
     stdlib::ListEntry free_pages_list_;
+    stdlib::ListEntry zeroed_pages_list_;
     ulong free_pages_count_;
+    ulong zeroed_pages_count_;
     ulong total_pages_count_;
 
-    /* The huge pool's two bitmaps, a bit a 2MiB block of physical memory:
-       in the pool, written only by reserve_huge_pool before there is another
-       CPU, and free in it, under Lock. Sized for the most RAM the bootstrap
-       map can reach on either arch, one PDPT of 1GiB blocks: 512 GiB, 32
-       KiB a bitmap. */
+    /* The huge pool's bitmaps, a bit a 2MiB block of physical memory: in
+       the pool, written only by reserve_huge_pool before there is another
+       CPU; free in it; and known zero, of what is free. Sized for the most
+       RAM the bootstrap map can reach on either arch, one PDPT of 1GiB
+       blocks: 512 GiB, 32 KiB a bitmap. */
     static const ulong HUGE_POOL_MAX_BYTES = 512 * consts::GB;
     static const ulong HUGE_POOL_MAX_BLOCKS = HUGE_POOL_MAX_BYTES / HUGE_FRAME_SIZE;
     static const ulong HUGE_POOL_WORD_BITS = 8 * sizeof(ulong);
     static const ulong HUGE_POOL_WORDS = HUGE_POOL_MAX_BLOCKS / HUGE_POOL_WORD_BITS;
+    /* What of the pool is free and what of that is known zero, and their
+       counts, the zeroing's place and the hint: under huge_pool_lock_, which
+       nests inside Lock (reserve_huge_pool takes both) and is never taken
+       the other way round. */
+    kernel::SpinLock huge_pool_lock_;
     ulong huge_pool_in_[HUGE_POOL_WORDS];
     ulong huge_pool_free_bits_[HUGE_POOL_WORDS];
+    /* Free and known zero, a subset of the free bits */
+    ulong huge_pool_zeroed_bits_[HUGE_POOL_WORDS];
     ulong huge_pool_count_;
     ulong huge_pool_free_count_;
+    ulong huge_pool_zeroed_count_;
+    /* The block zero_free_huge_page is zeroing and the page of it it does
+       next: NO_HUGE_BLOCK when none -- and set to that by alloc_huge_frame
+       when it takes this one, whose pages the zeroing has done are the
+       new owner's from then on. */
+    static const ulong NO_HUGE_BLOCK = ~0UL;
+    ulong huge_zero_block_;
+    ulong huge_zero_next_;
     /* The word alloc_huge_frame looks in first: where the last block came
        from, so that a guest taking thousands of blocks does not scan past
        the ones it took already for each. */
@@ -452,6 +560,14 @@ private:
     static bool huge_pool_test(const ulong* bits, ulong block);
     static void huge_pool_set(ulong* bits, ulong block, bool value);
     bool huge_block_free(ulong block);
+    /* A block whose bit is set in bits and not in minus (nullptr: none), the
+       search from the hint's word on. Under huge_pool_lock_. */
+    bool huge_pool_find(const ulong* bits, const ulong* minus, ulong& block);
+    /* A page of the pool zeroed, and read, through this CPU's frame slot,
+       as kernel_frame_read copies: interrupts off for that page's stores
+       and no longer, and no tmp_map_lock_ for each of the 512 */
+    void zero_huge_page(ulong phy_addr);
+    void check_huge_page_zeroed(ulong phy_addr);
 
     /* Where the window is: a top-level entry of its own, 64 TiB into the
        kernel's half -- far past the image, page_array_ and the allocators'
@@ -463,6 +579,8 @@ private:
     /* Set once by map_huge_pool_window, before there is another CPU, and
        never again: read without the lock. */
     bool huge_pool_window_on_;
+    /* zerofree=verify (set_zero_check) */
+    bool zero_check_;
 
     /* The L2 table that maps virt_addr, temp-mapped -- the levels above it
        made where they are missing -- or nullptr: no page for a table, a

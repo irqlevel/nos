@@ -55,6 +55,7 @@ struct Expected
     ulong panic_reset_secs = 0;
     int console = 0; /* both, serial, vga */
     int dhcp = 0;    /* on, auto, off */
+    int zero_free = 0; /* on, off, verify -- the last of the three said */
     ulong max_cpus = 0, net_frames = 0, tail_kb = 0;
     u16 udp_shell = 0, nc_port = 0;
     u32 nc_ip = 0;
@@ -213,6 +214,15 @@ void take(Expected& e, const std::string& token)
         else if (value == "off")
             e.dhcp = 2;
     }
+    else if (key == "zerofree")
+    {
+        if (value == "on")
+            e.zero_free = 0;
+        else if (value == "off")
+            e.zero_free = 1;
+        else if (value == "verify")
+            e.zero_free = 2;
+    }
     else if (key == "udpshell")
     {
         if (number(value, n) && n > 0 && n <= 65535)
@@ -365,7 +375,8 @@ Expected read(const std::string& line)
 
 const char* const WORDS[] = {"trace", "panic", "its", "usb", "rc", "hwrng", "hwp", "ucode", "idle", "wxprobe", "smp",
                              "maxcpus", "console", "dhcp", "udpshell", "netconsole", "rxpoll", "ubsan", "netframes",
-                             "nctail", "loglevel", "root", "fstest", "disklog", "dns", "hugepages", "tracepoints"};
+                             "nctail", "loglevel", "root", "fstest", "disklog", "dns", "hugepages", "tracepoints",
+                             "zerofree"};
 
 const char* const HUGE_VALUES[] = {"50%", "100%", "101%", "0%", "1%", "32G", "512G", "513G", "0G", "512M", "524288M",
                                   "524289m", "1g", "2m", "G", "%", "M", "50", "50%%", "0050%", "%50", "18446744073709551615G",
@@ -378,6 +389,7 @@ const char* const STRAYS[] = {"quiet", "splash", "r", "=", "a=", "=b", "foo=bar"
                               "ro=1"};
 
 const char* const VALUES[] = {"on", "off", "vga", "serial", "both", "auto", "text", "heap", "warn", "mwait",
+                              "verify", "verif", "verifys", "VERIFY",
                               "mwai", "mwaits", "MWAIT", "halt", "hal", "halts", "HALT", "", "0", "1",
                               "64", "65", "65535", "65536", "1024", "1025", "3600", "3601", "5", "6",
                               "18446744073709551615", "18446744073709551616", "-1", "1x", "abc"};
@@ -503,6 +515,8 @@ void run(fuzz::Input& in)
     INVARIANT(p.is_console_both() == (e.console == 0) && p.is_console_serial() == (e.console == 1) &&
         p.is_console_vga() == (e.console == 2), "console read wrong");
     INVARIANT(p.is_dhcp_auto() == (e.dhcp == 1) && p.is_dhcp_off() == (e.dhcp == 2), "dhcp read wrong");
+    INVARIANT(p.is_zero_free_off() == (e.zero_free == 1) && p.is_zero_free_verify() == (e.zero_free == 2),
+        "zerofree read wrong");
     INVARIANT(p.get_udp_shell_port() == e.udp_shell, "udpshell %u, not %u", p.get_udp_shell_port(), e.udp_shell);
     INVARIANT(p.is_netconsole_enabled() == (e.nc_port != 0) && p.get_netconsole_port() == e.nc_port &&
         p.get_netconsole_ip() == e.nc_ip, "netconsole 0x%x:%u, not 0x%x:%u", p.get_netconsole_ip(), p.get_netconsole_port(),

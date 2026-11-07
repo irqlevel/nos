@@ -199,7 +199,12 @@ and the next switch to its task -- after it was displaced and put back --
 would be taken for it. So the walk starts there, and what is older is
 counted and left out (`the oldest 120 left out: cpu 2 holds nothing before
 ...`). A task woken again before any switch to it says the window lost one,
-and is said too.
+and is said too. A field filter is another way for a window to lose a
+switch, and one the walk cannot see: a filter that drops the switch that
+answered a wakeup and keeps a later one to the task -- after it was displaced
+and put back -- has the wakeup paired with that later switch, its wait longer
+than it was. Through a filter, the waits are the window's, not necessarily
+the schedule's.
 
 ```
 > trace on sched
@@ -586,6 +591,21 @@ promised room it did not have. With a field filter, over the UDP shell's
 > trace show tcp_loss slot=3                 # one connection's recoveries
 > trace show tcp_wait what=cwnd              # sends the congestion window held
 ```
+
+## The memory's events
+
+Group `mm`: the zeroing of free pages ahead of their allocation
+([Paging](paging.md#zeroed-ahead-free-pages-and-the-two-lists)), a record a
+zeroing task's batch (`mm/page_zeroer.cpp`):
+
+| event | what it records |
+|---|---|
+| `mm_zero` | a batch: the `cpu` it ran on, the 4 KiB `pages` it moved onto the zeroed list and the `huge_pages` of the pool's free blocks it zeroed, how long it took (`ns`), and what ended it -- `full` (256 pages), `none` left to zero, the CPU `busy` with another task, or the task told to `stop` |
+
+So how fast free memory is zeroed, on which CPUs, and how often a task gave
+its CPU up to another is in the records: `trace on mm`, then `trace show
+mm_zero` -- or `trace show mm_zero end=busy` for the batches another task cut
+short. A batch that zeroed nothing is no record.
 
 ## An event of its own
 

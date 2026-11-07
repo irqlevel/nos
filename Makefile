@@ -192,6 +192,7 @@ CXX_SRC_x86_64 =   \
     src/base/mm/va_allocator.cpp \
     src/base/mm/pool.cpp    \
     src/base/mm/page_table.cpp \
+    src/base/mm/page_zeroer.cpp \
     src/base/mm/block_allocator.cpp \
 
 CXX_SRC_aarch64 = \
@@ -267,6 +268,7 @@ CXX_SRC_aarch64 = \
     src/base/mm/va_allocator.cpp \
     src/base/mm/pool.cpp \
     src/base/mm/page_table.cpp \
+    src/base/mm/page_zeroer.cpp \
     src/base/mm/block_allocator.cpp \
 
 CXX_SRC = $(CXX_SRC_$(ARCH))
