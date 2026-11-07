@@ -266,13 +266,15 @@ public:
        when there was nothing to zero.
 
        zero_free_huge_page: a page of a free block of the huge pool zeroed,
-       under the pool's lock, the block staying free throughout: an
-       allocation of it meanwhile takes it as it does any block not known
-       zero, zeroing it whole itself, and the zeroing starts on another; with
-       all 512 pages done the block is known zero, and alloc_huge_frame hands
-       it out as it is. The pool's lock is its own so that the zeroing keeps
-       no 4 KiB allocation waiting. False when every free block is known
-       zero, or there is no pool.
+       under the pool's lock, the block staying free throughout. With all 512
+       pages done the block is known zero, and alloc_huge_frame hands it out
+       as it is; with no block known zero, an allocation meanwhile takes this
+       one first and zeroes only the pages not done yet, and the zeroing
+       starts on another -- so that while a guest takes its memory, the
+       zeroing on an idle CPU does part of each block's work rather than
+       work the allocation does again. The pool's lock is its own so that
+       the zeroing keeps no 4 KiB allocation waiting. False when every free
+       block is known zero, or there is no pool.
 
        get_zeroed_pages_count, get_huge_pool_zeroed: how many free pages, and
        free blocks, are known zero.
@@ -294,6 +296,10 @@ public:
        what outgrows the largest block map_pages serves -- a loadable
        module's image, the .ko file it is read from */
     static const ulong MAX_LARGE_MAP_PAGES = 4096;
+    /* A run of count pages, physically contiguous, zeroed -- found and
+       taken off the free lists under Lock, then zeroed off it a page at a
+       time, as alloc_page zeroes one, the pages known zero left as they
+       are -- or nullptr for none. count is 1 to MAX_CONTIGUOUS_PAGES. */
     Page* alloc_contiguous_pages(ulong count);
     void free_page(Page* page);
 
@@ -363,7 +369,9 @@ public:
        page -- what a guest finds in its memory is what it was given, never
        what the last guest left there: its physical address, or 0 when none
        is free. A block known zero (zero_free_huge_page) first, as it is;
-       else any free one, zeroed here.
+       else the block the zeroing is part way through, of which only the
+       pages it has not done are zeroed here; else any free one, zeroed
+       here.
 
        free_huge_frame: a block back into the pool. An address that is no
        block of the pool, or one already back, is a panic, as free_frame's
@@ -454,6 +462,11 @@ private:
        whole -- a run, a block for the pool: off its list, its mark and the
        counts with it. Under Lock. */
     void unlist_free_page_no_lock(Page* page);
+    /* alloc_contiguous_pages' half under Lock: a run of count free pages
+       found and taken off the lists, zeroed[j] saying whether page j of it
+       was known zero; nullptr when there is none. examined counts the list
+       entries looked at. */
+    Page* take_run_no_lock(ulong count, bool* zeroed, ulong& examined);
 
     /* Where a range map takes its frames from: exactly one member is set.
        A tagged source keeps one range walk serving all three public forms
@@ -544,8 +557,9 @@ private:
     ulong huge_pool_zeroed_count_;
     /* The block zero_free_huge_page is zeroing and the page of it it does
        next: NO_HUGE_BLOCK when none -- and set to that by alloc_huge_frame
-       when it takes this one, whose pages the zeroing has done are the
-       new owner's from then on. */
+       when it takes this one, which zeroes only the pages from
+       huge_zero_next_ on: those before it are zeros, and the new owner's
+       from then on. */
     static const ulong NO_HUGE_BLOCK = ~0UL;
     ulong huge_zero_block_;
     ulong huge_zero_next_;
