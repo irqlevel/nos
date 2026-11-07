@@ -1,6 +1,10 @@
 //! extfmt on the host: the format crate's views and checksums held to the
 //! filesystems e2fsprogs makes, and walked over them damaged.
 //!
+//!     extfmt-test mkfs <ext2|ext4> <bytes> <image> [--bs N] [--label L] [--garbage]
+//!
+//! makes the filesystem extfmt's mkfs lays out (src/mkfs.rs says how).
+//!
 //!     extfmt-test crc
 //!
 //! holds CRC32C and CRC16 to known answers (RFC 3720's, CRC-16/ARC's) and
@@ -48,6 +52,7 @@
 
 mod journal;
 mod longlog;
+mod mkfs;
 
 #[global_allocator]
 static HEAP: longlog::Tracking = longlog::Tracking;
@@ -569,6 +574,7 @@ fn main() {
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let code = match args.get(1).map(String::as_str) {
         Some("crc") => crc(),
+        Some("mkfs") => mkfs::run(&args),
         Some("long-log") => longlog::run(),
         Some("verify") if args.len() >= 3 => verify(&args[2], args.iter().any(|a| a == "--regions")),
         Some("replay") if args.len() >= 4 => replay(&args[2], &args[3]),
@@ -591,7 +597,7 @@ fn main() {
             fuzz(&args[2], seed, iterations)
         }
         _ => {
-            eprintln!("usage: extfmt-test crc | long-log | verify <image> [--regions] | fuzz <image> [--seed N] \
+            eprintln!("usage: extfmt-test crc | mkfs <ext2|ext4> <bytes> <image> | long-log | verify <image> [--regions] | fuzz <image> [--seed N] \
                        [--iterations N] | replay <image> <out> | fuzz-journal <image> [--seed N] [--iterations N]");
             2
         }

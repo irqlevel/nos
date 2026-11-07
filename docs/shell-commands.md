@@ -55,9 +55,10 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `dhcp [dev]` | Obtain IP address via DHCP |
 | `random [len]` | Get random bytes as hex string, 1..1024, default 16 — from the kernel's ChaCha20 pool, not from a device |
 | `entropy [reseed]` | Show the random pool (seeded, whether hardware entropy reached it, reseeds, bytes generated) and the registered entropy sources; `reseed` draws from every source again first. See [Randomness](random.md) |
+| `format <ext2\|ext4> <disk> [label=<name>] [bs=1024\|2048\|4096] [force]` | Make a filesystem on a disk or a partition: ext4 as its driver writes it (a journal, extents, metadata_csum) or ext2; blocks of 1 KiB below 512 MiB and 4 KiB from there unless `bs=` says, a label of up to 16 printable characters. Refuses a device in use (mounted, the disk log's, a disk under a mounted partition), a whole disk the kernel knows partitions of, and without `force` a device that holds anything -- a filesystem, a partition table or a volume, named with its label, or any byte at its start that is not zero; writes nothing when it refuses. `format` alone lists the filesystems and their options. See [Filesystems](filesystems.md#making-one-from-the-shell) |
 | `mount ramfs <path>` | Mount a ramfs at path |
 | `mount ext2 <disk> <path> [ro]` | Mount ext2 from disk at path, read-write unless `ro` (or unless the image carries features the driver does not write; see [Filesystems](filesystems.md)) |
-| `mount ext4 <disk> <path> [ro]` | Mount ext4 (or ext3) from disk at path: read-only, all the driver does yet; a journal nobody replayed is read through, not replayed (see [Filesystems](filesystems.md#ext4)) |
+| `mount ext4 <disk> <path> [ro]` | Mount ext4 (or ext3) from disk at path, read-write unless `ro` (or unless the image carries features the driver does not write): a mount for writing replays a journal nobody replayed and releases the orphan list, a read-only one reads the journal through and writes nothing (see [Filesystems](filesystems.md#ext4)) |
 | `umount <path>` | Unmount filesystem |
 | `mounts` | List mount points |
 | `ls [path]` | List directory contents (default `/`) |

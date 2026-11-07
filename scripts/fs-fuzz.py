@@ -21,7 +21,8 @@ or failed request leaves), ext2bad (images damaged, and made to lie with
 their checksums right), ext4mkfs, ext4, ext4bad, ext4rw, ext4sys and
 ext4judge (ext4's, docs/testing.md says what each), vfs (many mounts, the C ABI and
 the file ABI a module uses, tasks at work at once), shell (the storage
-commands) and rootfs (what `root=` mounts at boot). The images are the
+commands), rootfs (what `root=` mounts at boot) and format (the shell's
+`format`: what it refuses, what it makes, what a power cut leaves of it). The images are the
 fuzzer's own, made and judged from the formats -- the judge agrees with
 e2fsck -fn, which FS_FUZZ_DUMP=<dir> is for checking -- and not from the
 drivers. Overflow checks are on, as a RUSTUB=1 kernel has them. Each input
@@ -47,8 +48,8 @@ The judges are held to e2fsprogs in turn:
 
 has the targets write out what they make and judge -- ext4mkfs every image
 its mkfs makes, beside a manifest of its tree; ext2 its fresh images and its
-power cuts, each tagged with the judge's verdict -- and holds each to
-e2fsck: an ext4 image clean by `e2fsck -fn` (its planted journal replayed
+power cuts, each tagged with the judge's verdict; format what the kernel's
+`format` made and what its driver left on it -- and holds each to e2fsck: an ext4 image clean by `e2fsck -fn` (its planted journal replayed
 by `e2fsck -E journal_only` first) and every directory and file of its
 manifest in what `debugfs rdump` reads out, byte for byte; an ext2 image
 the judge called clean clean by e2fsck, and one it called unclean not. It
@@ -363,7 +364,7 @@ def e2fsck_judged(args):
     os.makedirs(dump)
     env = dict(os.environ, FS_FUZZ_DUMP=dump)
     binary = os.path.join(OUT, 'release', 'fs-fuzz')
-    for target, n in (('ext4mkfs', it), ('ext2', max(it // 3, 1)), ('ext4rw', it)):
+    for target, n in (('ext4mkfs', it), ('ext2', max(it // 3, 1)), ('ext4rw', it), ('format', max(it // 3, 1))):
         r = subprocess.run([binary, '--target', target, '--iterations', str(n), '--seed', seed], env=env, cwd=tmp)
         if r.returncode != 0:
             print('fs-fuzz --e2fsck: the %s target found something first' % target)
@@ -390,6 +391,13 @@ def e2fsck_judged(args):
             problems = [] if r.returncode in (0, 1) else ['e2fsck -E journal_only, exit %d: %s'
                                                           % (r.returncode, r.stdout[-600:])]
             problems += e2fsck_problems(work, True)
+            os.unlink(work)
+        elif tag in ('format', 'format-used'):
+            # What the kernel's `format` made, and what its driver left on
+            # it after fstest and an unmount: nothing for e2fsck to find.
+            work = os.path.join(tmp, 'work.img')
+            shutil.copyfile(img, work)
+            problems = e2fsck_problems(work, False)
             os.unlink(work)
         elif tag in ('mkfs', 'crash-clean', 'crash-unclean'):
             r = subprocess.run(['e2fsck', '-fn', img], capture_output=True, text=True)
