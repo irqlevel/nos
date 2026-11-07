@@ -14,3 +14,5 @@ edition = "2021"
 [dependencies]
 raft = { path = "../raft" }
 ipcwire = { path = "../../ipc/ipcwire" }
+# Its commands', answers' and snapshots' bytes.
+codec = { path = "../../codec" }

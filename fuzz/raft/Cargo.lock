@@ -3,12 +3,25 @@
 version = 4
 
 [[package]]
+name = "codec"
+version = "0.1.0"
+
+[[package]]
 name = "crc"
 version = "0.1.0"
 
 [[package]]
 name = "ipcwire"
 version = "0.1.0"
+
+[[package]]
+name = "nbsmeta"
+version = "0.1.0"
+dependencies = [
+ "codec",
+ "ipcwire",
+ "raft",
+]
 
 [[package]]
 name = "raft"
@@ -22,6 +35,7 @@ name = "raft-fuzz"
 version = "0.1.0"
 dependencies = [
  "crc",
+ "nbsmeta",
  "raft",
  "registry",
 ]
@@ -30,6 +44,7 @@ dependencies = [
 name = "registry"
 version = "0.1.0"
 dependencies = [
+ "codec",
  "ipcwire",
  "raft",
 ]
