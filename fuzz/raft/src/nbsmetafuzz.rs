@@ -45,8 +45,19 @@ fn m_name(s: &str) -> bool {
 }
 
 impl Model {
-    fn apply(&mut self, index: u64, cmd: Option<&Command>) -> Answer {
-        let Some(cmd) = cmd else { return Answer::Refused(Refusal::Malformed) };
+    /// What the metadata answers `cmd`: None for a command of what is stored
+    /// (N6), which spoiled bytes can read as and this model does not keep --
+    /// fuzz/nbs's meta target does -- and which must leave the members as
+    /// they were.
+    fn apply(&mut self, index: u64, cmd: Option<&Command>) -> Option<Answer> {
+        let Some(cmd) = cmd else { return Some(Answer::Refused(Refusal::Malformed)) };
+        if !matches!(cmd, Command::Init { .. } | Command::Add { .. } | Command::Remove { .. }) {
+            return None;
+        }
+        Some(self.apply_member(index, cmd))
+    }
+
+    fn apply_member(&mut self, index: u64, cmd: &Command) -> Answer {
         let refuse = Answer::Refused;
         match cmd {
             Command::Init { cluster, name, host, member } => {
@@ -108,6 +119,7 @@ impl Model {
                 self.removed.push((h, id, index));
                 Answer::Done { member: id }
             }
+            _ => Answer::Refused(Refusal::Malformed),
         }
     }
 }
@@ -223,6 +235,7 @@ fn answer_name(a: &Answer) -> String {
     match a {
         Answer::Done { .. } => String::from("Done"),
         Answer::Refused(why) => format!("{:?}", why),
+        other => format!("{:?}", other),
     }
 }
 
@@ -245,7 +258,7 @@ pub fn run(seed: u64, steps: u64) -> Result<(), String> {
         let got = Answer::decode(&s.apply(step, &bytes))
             .ok_or_else(|| format!("step {}: an answer that does not read back", step))?;
         let want = m.apply(step, decoded.as_ref());
-        if got != want {
+        if want.is_some_and(|w| w != got) {
             return Err(format!("step {}: {:?} answered {:?}, the model {:?}", step, decoded, got, want));
         }
         *answers.entry(answer_name(&got)).or_default() += 1;
@@ -308,6 +321,7 @@ fn m_name_fits(cmd: &Command) -> bool {
     match cmd {
         Command::Init { name, host, .. } => name.len() <= 63 && host.len() <= 63,
         Command::Add { host, .. } | Command::Remove { host } => host.len() <= 63,
+        _ => true,
     }
 }
 

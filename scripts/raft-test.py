@@ -84,6 +84,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 FUZZ = os.path.join(ROOT, "fuzz", "raft")
 OUT = os.path.join(ROOT, "out", "raft-test")
+VENDOR = os.path.join(ROOT, "src", "crates", "vendor")
 BIN = os.path.join(OUT, "release", "raft-fuzz")
 
 
@@ -95,9 +96,12 @@ def main():
     args = p.parse_args()
 
     # The manifest is outside src/crates, whose .cargo/config.toml would make
-    # any build under it a kernel build; the crate has no dependency, so it
-    # builds offline.
-    r = subprocess.run(["cargo", "build", "--release", "--offline", "--quiet", "--target-dir", OUT], cwd=FUZZ)
+    # any build under it a kernel build. Its one dependency from outside the
+    # tree -- sha2, nbsmeta's digest -- is the kernel's vendored copy, as
+    # net-fuzz takes it, so it builds offline.
+    r = subprocess.run(["cargo", "build", "--release", "--offline", "--quiet", "--target-dir", OUT,
+                        "--config", 'source.crates-io.replace-with="vendored-sources"',
+                        "--config", 'source.vendored-sources.directory="%s"' % VENDOR], cwd=FUZZ)
     if r.returncode != 0:
         sys.exit("raft-test: fuzz/raft did not build")
 

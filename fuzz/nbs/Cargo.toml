@@ -1,0 +1,30 @@
+# NBS on the host (plans/nbs.md, "Tested"): its crates as they are, each
+# held to a model of its own (scripts/nbs-fuzz.py). For now the metadata's
+# state machine -- the `meta` target (N6); the cs's device format, whole
+# clusters over a simulated channel and the wire come with N7 and N8. Built
+# outside src/crates, whose .cargo/config.toml would make it a kernel build;
+# its one crate from outside the tree, sha2, is the kernel's vendored copy.
+[package]
+name = "nbs-fuzz"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nbsmeta = { path = "../../src/crates/common/storage/nbsmeta" }
+raft = { path = "../../src/crates/common/cluster/raft" }
+
+# No CPU features, as net-fuzz has it and for its reason: the RustCrypto
+# crates on their software backends, the ones the kernel runs -- and the
+# real crate would ask macOS through libc, which the vendored tree does not
+# carry.
+[patch.crates-io]
+cpufeatures = { path = "../net/standins/cpufeatures" }
+
+# Overflow checks on, as a RUSTUB=1 build has them: an overflow in the state
+# machine is a bug of its own, and in the kernel a panic.
+[profile.release]
+overflow-checks = true
+debug-assertions = true
+panic = "unwind"
+
+[workspace]
