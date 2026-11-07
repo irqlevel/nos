@@ -17,8 +17,9 @@
 //!
 //! The state is `registry::State`, raft's state machine; its log is in
 //! `<conf>/raft`, and `<conf>/member` says which member of which cluster
-//! this host is (files.rs). The member is a task of its own (member.rs),
-//! which the shell hands its commands to.
+//! this host is (files.rs). The member is raftmember's, a task of its own
+//! with the registry's hooks (member.rs), which the shell hands its
+//! commands to.
 
 extern crate alloc;
 
@@ -28,7 +29,6 @@ mod provider;
 mod token;
 
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::fmt::Write;
@@ -39,14 +39,14 @@ use kcore::cmd::{Command as ShellCommand, Output};
 use kcore::error::Error;
 use kcore::ipc::{Limits, Mailbox};
 use kcore::klog;
-use kcore::sync::Mutex;
 use kcore::task::TaskHandle;
 use kcore::time::Duration;
 use raft::{Config, LogConfig, Role, Rsm};
+use raftmember::{KFiles, Locked};
 use registry::{Answer, Command, Role as AddrRole, State};
 
-use files::{Dir, KFiles};
-use member::{Member, Request, Shared, Slot, View};
+use files::Dir;
+use member::{Shared, View};
 use token::Token;
 
 const HELP: &str = "cluster [init | invite | join | hosts | remove | ...] - this host in its cluster's registry";
@@ -75,28 +75,14 @@ const CTL_MS: u64 = 15_000;
 /// first -- and how long each try waits for its answer.
 const JOIN_TOTAL_MS: u64 = 60_000;
 const JOIN_TRY_MS: u64 = 3000;
-/// How often the shell asks again a command the member could not take yet
-/// -- a leader being chosen, a session being made -- and how long it waits
-/// for its answer.
+/// How often a join is asked again while the member could not take it yet
+/// -- a leader being chosen, a session being made.
 const ASK_RETRY_MS: u64 = 250;
-/// How long a command is asked for, all its tries together.
-const ASK_TOTAL_MS: u64 = 30_000;
 /// How long `recover` waits for any other voter to answer its probe.
 const PROBE_MS: u64 = 3000;
 const ANSWER_POLL_MS: u64 = 20;
-
-/// A value under a lock of the kernel's, taken for a call.
-pub struct Locked<T>(Mutex<T>);
-
-impl<T> Locked<T> {
-    pub fn new(value: T) -> Option<Locked<T>> {
-        Some(Locked(Mutex::new(value)?))
-    }
-
-    pub fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        f(&mut self.0.lock())
-    }
-}
+/// What a command asked of a host that is no member is told.
+const NO_MEMBER: &str = "this host is no member -- `cluster init`, or a join";
 
 /// The module's: its folder, and the member while there is one.
 struct ModState {
@@ -166,11 +152,7 @@ fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn
     }
     let state = Arc::new(ModState {
         dir: Dir::new(root.unwrap_or(files::DEFAULT_DIR)),
-        shared: Arc::new(Shared {
-            stop: AtomicBool::new(false),
-            requests: Locked::new(VecDeque::new()).ok_or(Error::NoMemory)?,
-            view: Locked::new(None).ok_or(Error::NoMemory)?,
-        }),
+        shared: Arc::new(Shared::new().ok_or(Error::NoMemory)?),
         task: Locked::new(None).ok_or(Error::NoMemory)?,
         starting: AtomicBool::new(false),
     });
@@ -210,7 +192,7 @@ fn start(state: &ModState, me: files::Member, fresh: bool) -> Result<(), String>
     if state.task.with(|t| t.is_some()) {
         return Err(String::from("the member is running already"));
     }
-    let files = KFiles::new(&state.dir)?;
+    let files = KFiles::new(&state.dir.root, "raft")?;
     let log = if fresh {
         raft::DiskLog::bootstrap(files, LogConfig::default(), &[me.node], &[])
     } else {
@@ -234,12 +216,13 @@ fn run_member(state: &ModState, me: files::Member, log: member::Log, campaign: b
         /* Its group's one voter: leading at once rather than at a timeout */
         let _ = rsm.campaign();
     }
-    let member = Member::new(rsm, me)?;
+    let member = member::new(rsm, me)?;
     state.shared.stop.store(false, Ordering::Release);
     /* Shown before the task's first turn, so that a command right after
        this one finds the member */
     state.shared.view.with(|v| *v = Some(member.view(None)));
-    let Some(task) = kcore::task::spawn_with("cluster/raft", (state.shared.clone(), member), member::run) else {
+    let Some(task) = kcore::task::spawn_with("cluster/raft", (state.shared.clone(), member),
+                                             raftmember::run::<member::Registry>) else {
         state.shared.view.with(|v| *v = None);
         return Err(String::from("could not start the member's task"));
     };
@@ -267,40 +250,13 @@ fn identity() -> Result<Identity, String> {
 }
 
 fn view(state: &ModState) -> Option<View> {
-    state.shared.view.with(|v| v.clone())
+    state.shared.view()
 }
 
 /// `cmd`, as the member's registry answers it -- asked again while the
 /// member cannot take it yet.
 fn ask(state: &ModState, cmd: &Command) -> Result<Answer, String> {
-    let mut last = String::from("no answer");
-    let end = kcore::time::boot_time_ns() + ASK_TOTAL_MS * 1_000_000;
-    while kcore::time::boot_time_ns() < end {
-        if view(state).is_none_or(|v| v.stopped.is_some()) {
-            return Err(String::from("this host is no member -- `cluster init`, or a join"));
-        }
-        let slot: Slot = Arc::new(Locked::new(None).ok_or_else(|| String::from("out of memory"))?);
-        state.shared.requests.with(|q| q.push_back(Request { cmd: cmd.clone(), done: slot.clone() }));
-        let until = (kcore::time::boot_time_ns() + (member::ANSWER_MS + 2000) * 1_000_000).min(end);
-        let outcome = loop {
-            if let Some(o) = slot.with(|s| s.take()) {
-                break o;
-            }
-            if kcore::time::boot_time_ns() >= until {
-                break Err(String::from("no answer -- ask again"));
-            }
-            kcore::task::sleep_ms(ANSWER_POLL_MS);
-        };
-        match outcome {
-            Ok(a) => return Ok(a),
-            Err(why) if why.ends_with("ask again") || why.ends_with("ask again in a moment") => {
-                last = why;
-                kcore::task::sleep_ms(ASK_RETRY_MS);
-            }
-            Err(why) => return Err(why),
-        }
-    }
-    Err(last)
+    raftmember::ask(&state.shared, cmd, NO_MEMBER)
 }
 
 fn said(a: Answer, done: impl FnOnce(u64) -> String) -> Result<String, String> {
@@ -323,7 +279,7 @@ fn now() -> u64 {
 }
 
 fn member_view(state: &ModState) -> Result<View, String> {
-    view(state).ok_or_else(|| String::from("this host is no member -- `cluster init`, or a join"))
+    view(state).ok_or_else(|| String::from(NO_MEMBER))
 }
 
 /* ---- what the shell and the bus both ask: the commands, each a value ---- */
@@ -493,7 +449,7 @@ fn recover(state: &ModState, confirm: Option<&str>, out: &mut Output) -> Result<
     stop(state);
     let stopped = |why: String| alloc::format!("{} -- the member is stopped: `rmmod cluster` and `insmod` start it \
                                                again", why);
-    let files = KFiles::new(&state.dir).map_err(stopped)?;
+    let files = KFiles::new(&state.dir.root, "raft").map_err(stopped)?;
     let log = raft::DiskLog::open(files, LogConfig::default())
         .map_err(|e| stopped(alloc::format!("the log in {}: {:?}", state.dir.path("raft"), e)))?;
     let (log, forced) = match raft::recover::force_alone(log, member.node) {
@@ -743,7 +699,7 @@ fn status(state: &ModState, out: &mut Output) -> Result<(), String> {
 }
 
 fn hosts(state: &ModState, out: &mut Output) -> Result<(), String> {
-    let v = view(state).ok_or_else(|| String::from("this host is no member -- `cluster init`, or a join"))?;
+    let v = view(state).ok_or_else(|| String::from(NO_MEMBER))?;
     for h in v.state.hosts() {
         let vote = if v.membership.voters.contains(&h.node) {
             "voter"

@@ -1,0 +1,16 @@
+[package]
+name = "raftmember"
+version = "0.1.0"
+edition = "2021"
+
+# A member of a raft group over ipc, for a module to run its replicated
+# state in: raft's rsm over a log in a folder of the root, its messages to
+# the same name on every host of the group, commands handed to the leader.
+# No module of its own -- a library the modules that keep a group link:
+# cluster.ko, the registry's, and nbs-mds.ko, NBS's metadata (plans/nbs.md).
+[lib]
+name = "raftmember"
+
+[dependencies]
+kcore = { path = "../../../base/kcore" }
+raft = { path = "../../../common/cluster/raft" }
