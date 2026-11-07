@@ -12,7 +12,7 @@ Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Clo
 - **Interrupts** — IDT/IOAPIC/LAPIC and MSI-X on x86-64, GICv3 with ITS-delivered LPIs on arm64, IRQ balancing across CPUs
 - **Drivers** — virtio blk/net/scsi/rng (virtio-pci and virtio-mmio), **NVMe in Rust**, Realtek RTL8168/RTL8125 and Intel I210 NICs in Rust, xHCI USB keyboard, 8042, serial, VGA text and pixel framebuffer consoles
 - **Networking** — ARP, IPv4, ICMP, DHCP, DNS, UDP, TCP, an HTTP client, a [UDP remote shell](docs/udp-shell.md) and a [netconsole](docs/netconsole.md) that ships the kernel log over UDP
-- **Storage** — async interrupt-driven block layer, MBR partitions, VFS with ramfs and the on-disk nanofs
+- **Storage** — async interrupt-driven block layer, MBR and GPT partitions, VFS with ext4 and ext2 on disk, ramfs and procfs
 - **Observability** — dmesg ring buffer, symbolized stack traces, a sampling profiler on the PMU, `top`, stack high-water marks, a lock watchdog
 
 The complete list is in [docs/features.md](docs/features.md).

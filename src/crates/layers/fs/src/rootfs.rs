@@ -4,13 +4,13 @@
 //! or `auto`, which takes the ext4 or ext2 whose volume label is `nos` --
 //! an ext4 is what nos-install, scripts/mkrootfs.sh and scripts/build-disk.sh
 //! make, an ext2 what an install before ext4 made -- by the driver for it
-//! (`extfs`). A device that carries neither is tried as nanofs. A label or
-//! a UUID two devices carry finds neither: one of them may be a guest's.
+//! (`extfs`). A label or a UUID two devices carry finds neither: one of
+//! them may be a guest's.
 //!
 //! With no root on disk there is a fallback layout instead, the one the ISO
-//! had before there was a root to boot from: a ramfs on `/`, the first of
-//! the ext family found read-only on `/boot`, and the first nanofs found
-//! read-write on `/data`. A procfs goes on `/proc` either way.
+//! had before there was a root to boot from: a ramfs on `/` and the first
+//! of the ext family found read-only on `/boot`. A procfs goes on `/proc`
+//! either way.
 
 use block::Disk;
 use kcore::procinfo::{self, Root};
@@ -18,7 +18,6 @@ use kcore::klog;
 
 use crate::ext2;
 use crate::extfs;
-use crate::nanofs;
 use crate::procfs;
 use crate::ramfs;
 
@@ -74,8 +73,8 @@ fn find_root(mode: &Root, value: &[u8], uuid: &[u8; 16]) -> Option<Disk> {
     found
 }
 
-/// ext4 or ext2 if the device carries one, else nanofs; false when neither
-/// mounts.
+/// The ext4 or ext2 the device carries; false when it carries neither, or
+/// what it carries does not mount.
 fn mount_root_on(dev: &Disk, read_only: bool) -> bool {
     let mut id = ext2::Identity { uuid: [0; 16], label: [0; 17] };
 
@@ -92,21 +91,13 @@ fn mount_root_on(dev: &Disk, read_only: bool) -> bool {
         return false;
     }
 
-    let mounted = nanofs::mount_at("/", dev.handle(), read_only);
-    if mounted >= 0 {
-        klog!(0, "MountRootFs: mounted nanofs on / from {} ({})",
-            dev.name(),
-            if read_only { "ro" } else { "rw" });
-        return true;
-    }
-
     klog!(0, "MountRootFs: {} carries no filesystem this kernel mounts",
         dev.name());
     false
 }
 
-/// No root on disk: a ramfs on /, the first of the ext family found
-/// read-only on /boot, the first nanofs found read-write on /data.
+/// No root on disk: a ramfs on /, and the first of the ext family found
+/// read-only on /boot.
 fn mount_fallback_layout() {
     let vfs = match crate::vfs_instance() {
         Some(vfs) => vfs,
@@ -133,24 +124,6 @@ fn mount_fallback_layout() {
         let (mounted, driver) = extfs::mount_at("/boot", &dev, true);
         if mounted >= 0 {
             klog!(0, "MountRootFs: mounted {} on /boot from {} (ro)", driver,
-                dev.name());
-            break;
-        }
-    }
-
-    vfs.create(b"/data", true);
-
-    for index in 0..block::count() {
-        let dev = match block::at(index) {
-            Some(dev) => dev,
-            None => continue,
-        };
-        let mut id = ext2::Identity { uuid: [0; 16], label: [0; 17] };
-        if ext2::probe(&dev, &mut id) {
-            continue;
-        }
-        if nanofs::mount_at("/data", dev.handle(), false) >= 0 {
-            klog!(0, "MountRootFs: mounted nanofs on /data from {} (rw)",
                 dev.name());
             break;
         }

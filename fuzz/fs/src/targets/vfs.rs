@@ -1,5 +1,5 @@
 //! The VFS itself, over several filesystems at once: a ramfs at the root,
-//! held to the model; procfs, ext2, nanofs and more ramfs mounted beside it
+//! held to the model; procfs, ext2 and more ramfs mounted beside it
 //! and taken down again at paths of every kind -- nested, doubled, without
 //! a slash, too long; files open across it all; the C ABI the C++ half and
 //! the modules reach it by (`kernel_vfs_*`, and the file ABI `kernel_file_*`
@@ -18,7 +18,7 @@ use std::sync::atomic::Ordering;
 
 use fs::vfs::{Handle, MAX_MOUNTS, MAX_PATH, OPEN_READ, OPEN_WRITE};
 
-use crate::image::{ext2 as ext2img, nanofs as nanoimg};
+use crate::image::ext2 as ext2img;
 use crate::machine::{self, disk, sched};
 use crate::model::{show, Data, Node};
 use crate::targets::fsops::{self, Fs, Limits, Model, Opened};
@@ -29,7 +29,6 @@ enum Kind {
     Ram,
     Proc,
     Ext2,
-    Nano,
 }
 
 #[derive(Clone, Debug)]
@@ -48,7 +47,8 @@ struct World {
     root: Fs,
     mounts: Vec<Mount>,
     ext2_dev: usize,
-    nano_dev: usize,
+    /// A disk that carries nothing a driver takes.
+    bare_dev: usize,
     /// Handles into the other mounts, and which mount each is on.
     others: Vec<(Handle, Vec<u8>)>,
     tasks: Vec<usize>,
@@ -72,22 +72,18 @@ impl World {
     /// A mount, taken exactly when the VFS's rules say.
     fn mount(&mut self, r: &mut Input) {
         let path = self.mount_path(r);
-        let kind = r.pick(&[Kind::Ram, Kind::Proc, Kind::Ext2, Kind::Nano]);
-        /* A device that carries the other kind now and then: not
-         * recognised, and nothing mounted. */
+        let kind = r.pick(&[Kind::Ram, Kind::Proc, Kind::Ext2]);
+        /* Now and then the device that carries nothing: not recognised, and
+         * nothing mounted. */
         let crossed = r.chance(32);
-        let dev = match (kind, crossed) {
-            (Kind::Ext2, false) | (Kind::Nano, true) => self.ext2_dev,
-            _ => self.nano_dev,
-        };
+        let dev = if crossed { self.bare_dev } else { self.ext2_dev };
         let text = String::from_utf8_lossy(&path).into_owned();
         let got = match kind {
             Kind::Ram => fs::ramfs::mount_at(&text, false),
             Kind::Proc => fs::procfs::mount_at(&text),
             Kind::Ext2 => fs::ext2::mount_at(&text, dev, false) >= 0,
-            Kind::Nano => fs::nanofs::mount_at(&text, dev, false) >= 0,
         };
-        let on_disk = matches!(kind, Kind::Ext2 | Kind::Nano);
+        let on_disk = kind == Kind::Ext2;
         let device_busy = on_disk && self.mounts.iter().any(|m| m.dev == dev);
         let want = path.first() == Some(&b'/') && path.len() < MAX_PATH
             && !self.mounts.iter().any(|m| m.path == path) && self.mounts.len() < MAX_MOUNTS
@@ -248,7 +244,6 @@ impl World {
             Kind::Ram => "ramfs",
             Kind::Proc => "procfs",
             Kind::Ext2 => "ext2",
-            Kind::Nano => "nanofs",
         })).collect();
         want.push((b"/".to_vec(), "ramfs"));
         paths.sort();
@@ -262,8 +257,8 @@ impl World {
 
     /// Which mount each open file is on, by the identity a guest's disk
     /// claims its image by (`kernel_file_mount`): one for files on one
-    /// mount, another for files on two, whatever their inodes -- an ext2's
-    /// and a nanofs's numbers are alike. (`Fs::compare` holds the root's
+    /// mount, another for files on two, whatever their inodes, which two
+    /// mounts may number alike. (`Fs::compare` holds the root's
     /// files to one another; every mount with a file open stays mounted.)
     fn identities(&self) {
         let ids: Vec<(&[u8], Option<(u64, u64)>)> = self.root.model.open.iter().map(|(h, _)| (&b"/"[..], *h))
@@ -715,7 +710,7 @@ pub fn vfs(r: &mut Input) {
     p.interrupts = vec![(b"timer".to_vec(), 12345), (b"nvme0-q1".to_vec(), 7), (b"a-name-longer-than-its-column".to_vec(), i64::MAX)];
     machine::set_params(p);
 
-    /* The disks the other filesystems are on. */
+    /* The disk the ext2 is on, and one that carries nothing. */
     let g = crate::targets::ext2::geometry(r);
     let Ok(made) = ext2img::mkfs(&g, &small_tree(r), &Default::default(), 1_749_000_000, r.u64()) else { return };
     let bs = g.block_size() as u64;
@@ -724,11 +719,11 @@ pub fn vfs(r: &mut Input) {
     let mut vda = disk::Disk::new("vda", 512, g.blocks as u64 * bs / 512, made.media);
     vda.latency = r.bool();
     disk::insert(0, vda);
-    let Ok(nano) = nanoimg::mkfs(&small_tree(r), [3u8; 16], 0) else { return };
-    let mut vdb = disk::Disk::new("vdb", 4096, nanoimg::DEVICE_BYTES / 4096, nano.media);
+    let mut vdb = disk::Disk::new("vdb", 4096, (1 << 20) / 4096,
+                                  disk::Media::from_bytes(&crate::input::noise(r.u32(), 4096)));
     vdb.latency = r.bool();
     disk::insert(1, vdb);
-    let (Some(e), Some(n)) = (disk::register(0), disk::register(1)) else { return };
+    let (Some(e), Some(b)) = (disk::register(0), disk::register(1)) else { return };
 
     invariant!(fs::ramfs::mount_at("/", false), "a ramfs would not mount at the root");
     let vfs = fs::vfs_instance().expect("the VFS");
@@ -736,7 +731,7 @@ pub fn vfs(r: &mut Input) {
         root: Fs::new(vfs, Model::new(Node::dir(), false, Limits::memory()), true),
         mounts: Vec::new(),
         ext2_dev: e.handle(),
-        nano_dev: n.handle(),
+        bare_dev: b.handle(),
         others: Vec::new(),
         tasks: Vec::new(),
     };
@@ -782,9 +777,5 @@ pub fn vfs(r: &mut Input) {
     let e2 = disk::with(0, |d| d.current.clone());
     let c = ext2img::check(&e2, g.blocks as u64 * bs);
     invariant!(c.corrupt.is_empty() && c.unclean.is_empty(), "the ext2 beside the root is left {:?} {:?}", c.corrupt,
-               c.unclean);
-    let nm = disk::with(1, |d| d.current.clone());
-    let c = nanoimg::check(&nm);
-    invariant!(c.corrupt.is_empty() && c.unclean.is_empty(), "the nanofs beside the root is left {:?} {:?}", c.corrupt,
                c.unclean);
 }

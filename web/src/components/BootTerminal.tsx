@@ -9,7 +9,6 @@ const log: { at: string; where: string; text: string; ok?: boolean }[] = [
     { at: "0:1.409463:", where: "Init(),softirq.cpp,61:", text: "SoftIrq: initialized" },
     { at: "0:1.409711:", where: "block(),lib.rs,106:", text: "part: 0 partitions on 1 disks" },
     { at: "0:1.409935:", where: "fs::rootfs(),rootfs.rs,110:", text: "MountRootFs: mounted ramfs on / (rw)" },
-    { at: "0:1.410281:", where: "fs::nanofs(),nanofs.rs,326:", text: "nanofs: bad magic 0x0" },
     { at: "0:1.410464:", where: "fs::rootfs(),rootfs.rs,163:", text: "MountRootFs: mounted procfs on /proc (ro)" },
     { at: "0:1.410664:", where: "net::tcp(),tcp.rs,418:", text: "tcp: initialized, up to 64 connections" },
     { at: "0:1.411045:", where: "net::udp_shell(),udp_shell.rs,148:", text: "udpshell: started on port 9000" },

@@ -16,8 +16,6 @@ block = { path = "../block" }
 # The ext2/3/4 on-disk format and its checksums, which ext4 reads through: a
 # crate of the tree's with no kernel in it.
 extfmt = { path = "../../common/storage/extfmt" }
-# nanofs's CRC-32, and the `crc32` command's: the tree's one.
-crc = { path = "../../common/crc" }
 # The management bus, which the layer's provider registers on.
 mgmt = { path = "../mgmt" }
 # The events tasks wait on: an image's queue may be made on one.

@@ -3,8 +3,8 @@
 //! kernel calls them by.
 //!
 //! [`vfs`] is the mount table, path resolution and the open files; under it
-//! [`ext4`] and [`ext2`] (the root filesystem), [`nanofs`], [`ramfs`] and
-//! [`procfs`], each a [`vfs::FileSystem`] seeing one call at a time under its
+//! [`ext4`] and [`ext2`] (the root filesystem), [`ramfs`] and [`procfs`],
+//! each a [`vfs::FileSystem`] seeing one call at a time under its
 //! mount's lock -- and calls on two mounts side by side -- and each keeping
 //! what it holds in a [`vnode::Tree`]. [`image`] is a file held as a guest's
 //! disk, read and written off that lock. [`rootfs`] is what the kernel
@@ -23,7 +23,6 @@ pub mod extfs;
 pub mod files;
 pub mod find;
 pub mod image;
-pub mod nanofs;
 pub mod paths;
 pub mod procfs;
 pub mod provider;

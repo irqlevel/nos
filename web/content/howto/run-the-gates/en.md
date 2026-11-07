@@ -91,7 +91,6 @@ What a smoke boot cannot notice has a test of its own in `scripts/`. Each one ex
 | the block layer, the partition tables | `parttest.py [--arch aarch64\|x86_64]` | both, in CI |
 | the block layer's asynchronous path, or the C ABI that modules use to reach it | `netblk-test.py [--arch x86_64\|aarch64]` | both |
 | ext2 | `ext2-test.py` (`e2fsck` judges the image) | arm64, in CI |
-| nanofs | `nanofs-test.py` | arm64, in CI |
 | the disk log | `disklog-test.py` | arm64 |
 | the trace path, a net device, netconsole | `netconsole-test.py` | arm64, in CI |
 | TCP, the HTTP client | `tcp-test.py` | arm64, in CI |
@@ -105,7 +104,7 @@ What a smoke boot cannot notice has a test of its own in `scripts/`. Each one ex
 | a Linux guest: the loader, the policy, the devices, more than one CPU, ACPI, the network | `hv-linux-test.py --bzimage <bzImage> --initrd <cpio>`, with `--disk`, `--net`, `--cpus N`, `--acpi`, `--attach` as needed | x86-64, by hand |
 | what a distribution's kernel runs into | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <raw>]` | x86-64, by hand |
 | anything the network hands the kernel: the stack, DHCP, DNS, HTTP and TLS, the UDP shell, netconsole, `ssh`, `sshd` | `net-fuzz.py` | host, in CI |
-| anything a disk hands the kernel: partition tables, ext2, nanofs, the VFS, `root=` | `fs-fuzz.py` | host, in CI |
+| anything a disk hands the kernel: partition tables, ext2, ext4, the VFS, `root=` | `fs-fuzz.py` | host, in CI |
 | what firmware, a bootloader or a disk hands the C++, and the page tables and heap under everything | `cpp-fuzz.py` | host, in CI |
 | the system image, `nos-install`, `root=UUID=` | `image-test.py` | x86-64, in CI |
 | a wait primitive, the scheduler's choice of the idle task | `idle-wait-test.py` (needs 12 or more CPUs and KVM) | x86-64 |
@@ -121,7 +120,7 @@ Four programs compile the kernel's own sources for the host and feed them random
 |---|---|---|
 | `hv-fuzz.py` | everything a guest reaches in the hypervisor: devices, local APIC and IO-APIC, MMIO, the Linux loader and ACPI tables, the CPUID and MSR policy, the run loop on every CPU of a guest, the guests' switch, DHCP and NAT, and where guests are placed | `cargo` |
 | `net-fuzz.py` | everything the network hands the kernel: frames of every kind, TCP, HTTP and HTTPS, DNS, DHCP, ICMP and ARP, the UDP shell, netconsole, SSH | `cargo` |
-| `fs-fuzz.py` | everything a disk hands the kernel: MBR and GPT, the disk log, sound and damaged ext2 and nanofs images, the VFS, the storage commands, `root=` | `cargo` |
+| `fs-fuzz.py` | everything a disk hands the kernel: MBR and GPT, the disk log, sound and damaged ext2 and ext4 images, the VFS, the storage commands, `root=` | `cargo` |
 | `cpp-fuzz.py` | the C++ under ASan and UBSan: the device tree, Multiboot2 tags, ACPI tables, the memory map, the command line, the GRUB environment block, the module loader, `printf`, the page tables and the heap | `clang` with sanitizers, `make` |
 
 With no arguments, a fuzzer works as a **gate**: it runs fixed inputs from a fixed seed, the same on every run. That takes from well under a minute (`hv-fuzz.py`) to a couple of minutes (`net-fuzz.py`, `fs-fuzz.py`). In a **campaign**, each target gets a number of seconds and a seed of its own:
@@ -129,7 +128,7 @@ With no arguments, a fuzzer works as a **gate**: it runs fixed inputs from a fix
 ```sh
 python3 scripts/hv-fuzz.py
 python3 scripts/net-fuzz.py --seed 7 --seconds 300
-python3 scripts/fs-fuzz.py --target ext2 --target nanofs
+python3 scripts/fs-fuzz.py --target ext2 --target ext4
 python3 scripts/net-fuzz.py --replay tcp out/net-fuzz/findings/X.hex --trace
 ```
 
@@ -144,7 +143,7 @@ python3 scripts/net-fuzz.py --replay tcp out/net-fuzz/findings/X.hex --trace
 
 - **Both jobs** run `make check` (cppcheck, which fails on any finding), `make nocheck ARCH=<arch>`, the smoke boot and `parttest.py --arch <arch> --tcg`, and last a `UBSAN=1 RUSTUB=1` build with its own smoke boot.
 - **The x86-64 job** adds `make image` with `image-test.py`, `insn-test.py`, `hv-fuzz.py` and `fs-fuzz.py`.
-- **The aarch64 job** adds `net-fuzz.py`, `cpp-fuzz.py`, and `ext2-test.py`, `nanofs-test.py`, `netconsole-test.py`, `tcp-test.py` and `netload-test.py`, each with `--tcg`.
+- **The aarch64 job** adds `net-fuzz.py`, `cpp-fuzz.py`, and `ext2-test.py`, `netconsole-test.py`, `tcp-test.py` and `netload-test.py`, each with `--tcg`.
 
 You run every other gate in the table yourself, whenever your change reaches what it covers. That includes the hypervisor's Linux and distribution gates (a `bzImage` is megabytes in size, and the distribution images have to be downloaded), `hv-test.py`, `idle-wait-test.py` and the hardware NIC gates.
 
