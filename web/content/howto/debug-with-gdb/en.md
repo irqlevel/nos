@@ -119,7 +119,7 @@ A line is printed if its level is no higher than the current trace level. The tr
 - `loglevel=N` on the kernel command line. It's the only way to get more detail from the boot itself.
 - `loglevel N` in the shell, on a running kernel. Run `loglevel` alone to see the current level. The command works over the UDP shell and SSH too, which matters on a machine with no other console.
 
-The noisier subsystems trace at their own levels, which are constants at the top of [`src/base/kernel/trace.h`](https://github.com/irqlevel/nos/blob/master/src/base/kernel/trace.h):
+The noisier subsystems trace at their own levels, which are constants at the top of [`src/base/kernel/klog.h`](https://github.com/irqlevel/nos/blob/master/src/base/kernel/klog.h):
 
 | Level | Constants | What you see at that level |
 |---|---|---|
@@ -127,7 +127,7 @@ The noisier subsystems trace at their own levels, which are constants at the top
 | 3 | `KBD_LL`, `USB_LL`, `TEST_LL`, `ICMP_LL`, `TASK_LL`, `MODULE_LL` | keyboard and USB, the multitasking self-test, three lines per ping, every task's creation and teardown, what each module import was bound to |
 | 4 | `PAGE_ALLOCATOR_LL`, `ALLOCATOR_LL`, `POOL_LL`, `MM_IO_LL` | the allocators (every allocation) and MMIO; very noisy |
 
-To see one subsystem without the rest, lower its constant and rebuild. Rust code traces with `trace!(level, ...)` on the same scale.
+To see one subsystem without the rest, lower its constant and rebuild. Rust code logs with `klog!(level, ...)` on the same scale.
 
 ## Bisect a failing boot
 
