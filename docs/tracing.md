@@ -659,34 +659,42 @@ Here an arm64 boot under HVF, four CPUs, a `sched probe` and the UDP shell's
 own datagrams, every CPU's part dumped in turn from frozen rings:
 
 ```
-irq: 359 interrupts on 4 cpus, 0.17% of their time in handlers
+irq: 368 interrupts on 4 cpus, 0.33% of their time in handlers
   kind        vector   count   handler                                     in all
-  timer         0x1b     251   p50 1.5us p99 11.4us max 27.4us            730.0us
-  line          0x4e      22   p50 5.8us p99 15.1us max 27.5us            189.2us
-  ipi            0x1      86   p50 1.1us p99 12.7us max 13.0us            144.0us
-  cpu 0: 61 interrupts, 336.9us in handlers, 0.22% of 156.23ms
+  timer         0x1b     255   p50 2.0us p99 41.8us max 56.7us             1.65ms
+  line          0x4e      22   p50 6.7us p99 29.1us max 60.4us            301.8us
+  ipi            0x1      91   p50 1.5us p99 24.7us max 29.4us            261.1us
+  cpu 0: 63 interrupts, 703.3us in handlers, 0.41% of 170.40ms
   ...
-  the local timer, past the deadline it was armed for: p50 3.5us p99 2.01ms max 2.23ms (251)
-softirq: 44 handler runs, 0.01% of the cpus' time
+  the local timer, past the deadline it was armed for: p50 5.2us p99 2.28ms max 2.34ms (255)
+softirq: 33 handler runs, 0.02% of the cpus' time
   type      runs   waited for its task                   ran                                       in all  again
-  net_rx      22   p50 6.2us p99 16.1us max 26.3us       p50 958ns p99 13.7us max 17.6us           80.0us      0
-  net_tx      22   p50 9.4us p99 26.3us max 28.6us       p50 41ns p99 83ns max 166ns                1.2us      0
-  raises of net_rx: 22 -- 22 kicked
+  net_rx      11   p50 7.5us p99 10.0us max 14.2us       p50 13.7us p99 24.7us max 25.1us         161.4us      0
+  net_tx      22   p50 15.8us p99 32.3us max 41.3us      p50 83ns p99 333ns max 375ns               2.7us      0
+  raises of net_rx: 11 -- 11 kicked
 ```
 
 -- the virtio-net card's line, whose handler's reads and writes of its
-registers each exit to the hypervisor, 5.8 us; a tick 3.5 us late at the
-median and 2 ms at the 99th percentile, those of CPUs halted in WFI, which
-HVF wakes late; a received frame's work 6.2 us from the interrupt's raise to
+registers each exit to the hypervisor, 6.7 us; a tick 5.2 us late at the
+median and 2.3 ms at the 99th percentile, those of CPUs halted in WFI, which
+HVF wakes late; a received frame's work 7.5 us from the interrupt's raise to
 its handler: the rest of the card's handler, the kick's IPI to its own CPU
-and the switch to `softirq/0`, which `trace show` has in that order:
+and the switch to `softirq/0`. Each of the card's interrupts raises what it
+has work for ([Interrupts](interrupts.md#deferred-work-softirq)): a reply's
+transmit completion alone, then the next request with the reply's last
+completion riding on it -- both due, raised in one call, their two records
+in the same microsecond and one kick after them -- which `trace show` has
+in that order:
 
 ```
-    3.192663  0 softirq_raise: type=net_rx how=kicked
-    3.192664  0 softirq_raise: type=net_tx how=kicked
-    3.192669  0 softirq_entry: type=net_rx wait_ns=6.125us
-    3.192673  0 softirq_exit: type=net_rx ns=4.166us again=0
-    3.192673  0 softirq_entry: type=net_tx wait_ns=9.375us
+    3.196148  0 softirq_raise: type=net_tx how=kicked
+    3.196155  0 softirq_entry: type=net_tx wait_ns=6.375us
+    3.196155  0 softirq_exit: type=net_tx ns=0.208us again=0
+    3.196234  0 softirq_raise: type=net_rx how=kicked
+    3.196234  0 softirq_raise: type=net_tx how=kicked
+    3.196239  0 softirq_entry: type=net_rx wait_ns=4.833us
+    3.196246  0 softirq_exit: type=net_rx ns=7.625us again=0
+    3.196247  0 softirq_entry: type=net_tx wait_ns=12.583us
 ```
 
 With the scheduler's records beside them it says what the interrupts and
@@ -696,8 +704,8 @@ runs -- which the interrupts inside them are counted in too:
 
 ```
   the longest waits for a CPU, and what of them was its interrupts and its softirq task:
-       17.9us pid 10 udpsh (cpu 2 -> 2): interrupts 1.5us (1), softirq 0ns (0)
-       14.0us pid 10 udpsh (cpu 2 -> 2): interrupts 1.2us (1), softirq 0ns (0)
+       32.5us pid 10 udpsh (cpu 2 -> 2): interrupts 4.5us (1), softirq 0ns (0)
+       28.6us pid 10 udpsh (cpu 2 -> 2): interrupts 4.2us (1), softirq 0ns (0)
 ```
 
 -- the shell's task woken onto an idle CPU, its wait the wakeup's IPI

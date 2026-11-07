@@ -219,6 +219,16 @@ tasks. Three types today: `NetRx`, `NetTx`, `BlkIo`. TCP's timer was a
 fourth, raised every 200 ms; it is a task of its own now, asleep until the
 earliest retransmission any connection has.
 
+A raise wakes the CPU's softirq task and, unless it is the task running
+there, kicks the CPU with an IPI to switch to it. A handler with work for
+more than one type raises them in one call (`kcore::softirq::raise_mask`,
+`SoftIrq::raise_mask`): one wake and one kick, where a raise each sent the
+CPU an IPI each. And it raises only the types it has work for: virtio-net's
+interrupt is both its queues' -- one MSI-X entry, or a line whose ISR byte
+says only that some queue completed -- so it asks each queue's used ring
+(`virtio::UsedWatch`), as Linux's `vring_interrupt` does, instead of raising
+both directions every time.
+
 A type runs on at most one CPU at a time — handlers are not reentrant — so a
 CPU that loses the race keeps its pending bit set and retries, and the CPU
 that finishes kicks the losers rather than leaving them until the next tick.

@@ -252,7 +252,7 @@ The tick or an IPI can land on a task with preemption off -- inside a
 spinlock, most often -- where the reschedule cannot be made. It used to be
 dropped: the task went on, and whatever the reschedule was for waited for the
 next tick or IPI. For the tick's own turn-taking that costs nothing; for the
-IPI a wakeup sends, the wakeup is lost. `SoftIrq::raise` in an interrupt
+IPI a wakeup sends, the wakeup is lost. `SoftIrq::raise_mask` in an interrupt
 handler unblocks its CPU's softirq task and sends the CPU an IPI to switch to
 it. Landing on the idle task inside the lock `reap_exited()` takes -- a few
 instructions, with interrupts on -- that IPI's reschedule was dropped, and the
@@ -339,7 +339,7 @@ too and exactly one succeeds -- and pushes it onto its queue's wake stack:
 a Treiber stack that is pushed onto from any context and only ever taken
 whole, by its CPU's next `schedule()` (`TaskQueue::push_wake`,
 `drain_wakes`), so it has no pop and no ABA. That `schedule()` is the waker's
-to bring about, as it always was: `Event::signal` and `SoftIrq::raise` send
+to bring about, as it always was: `Event::signal` and `SoftIrq::raise_mask` send
 the CPU an IPI. A task asleep is never moved to another queue, so the queue
 an `unblock()` reads is the one the task sleeps on.
 
