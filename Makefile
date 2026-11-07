@@ -326,12 +326,15 @@ all: check nos-arm64.img modules $(OUT)/modules.bound
 nocheck: nos-arm64.img modules $(OUT)/modules.bound
 endif
 
-# cppcheck over the C++, and the Rust workspace's layout held to its rules
+# cppcheck over the C++; the Rust workspace's layout held to its rules
 # (scripts/check-crates.py: a crate in an area's directory and a member; one
-# under common/ with no kernel in it and its unsafe forbidden).
+# under common/ with no kernel in it and its unsafe forbidden); and every
+# link the site and the documents make into the tree held to naming
+# something there (scripts/check-links.py).
 check: $(CXX_SRC)
 	cppcheck --error-exitcode=22 --inline-suppr -q src/base || exit 1
 	python3 scripts/check-crates.py
+	python3 scripts/check-links.py
 
 nos.iso: build/grub.cfg $(KERNEL)
 	rm -rf iso

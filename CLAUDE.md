@@ -38,7 +38,7 @@ Native (Linux with the toolchain installed), or inside the container:
 ```sh
 make            # = `make check` (cppcheck static analysis) + build nos.iso
 make nocheck    # skip cppcheck, just build
-make check      # cppcheck, and scripts/check-crates.py's rules for where a crate goes (fails on any finding, exit code 22)
+make check      # cppcheck; check-crates.py's rules for where a crate goes; check-links.py: every link of the site and the docs into the tree names something there (fails on any finding, exit code 22)
 make rust       # build only the Rust staticlib (src/crates → libkernel.a)
 make smoke      # boot smoke test: build in Docker + headless QEMU, assert serial markers
 make clean
