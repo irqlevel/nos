@@ -7,7 +7,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::crc32::{crc32, Crc32};
+use crc::crc32::checksum as crc32;
 
 pub const SECTOR: usize = 512;
 
@@ -144,9 +144,7 @@ fn gpt(sectors: u64, read: &mut dyn FnMut(u64, &mut [u8]) -> Result<(), String>)
     }
     let mut array = vec![0u8; array_sectors as usize * SECTOR];
     read(array_lba, &mut array)?;
-    let mut crc = Crc32::new();
-    crc.update(&array[..bytes]);
-    if crc.finish() != array_crc {
+    if crc32(&array[..bytes]) != array_crc {
         return Err(String::from("the GPT array's CRC does not match"));
     }
 

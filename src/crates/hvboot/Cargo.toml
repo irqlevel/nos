@@ -16,3 +16,5 @@ path = "src/lib.rs"
 # crate of the tree's with no kernel in it.
 [dependencies]
 extfmt = { path = "../extfmt" }
+# GPT's CRC-32: the tree's one, with no kernel in it.
+crc = { path = "../common/crc" }

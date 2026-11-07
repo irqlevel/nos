@@ -28,7 +28,6 @@
 #include <mm/memory_map.h>
 #include <mm/new.h>
 #include <lib/unique_ptr.h>
-#include <lib/checksum.h>
 #include <lib/grub_env.h>
 
 /* The network layer is Rust (src/crates/net); its commands register
@@ -1574,63 +1573,6 @@ static void cmd_pci(const char* args, stdlib::Printer& con)
 }
 
 
-/* crc32 <path>: the CRC-32 of a file, to check a copy against the host
-   (python3 -c "import zlib,sys; print(hex(zlib.crc32(open(sys.argv[1],'rb').read())))" file) */
-static void cmd_crc32(const char* args, stdlib::Printer& con)
-{
-    static const ulong CHUNK_SIZE = 64 * 1024;
-
-    const char* end;
-    const char* path_start = stdlib::next_token(args, end);
-    if (path_start == nullptr)
-    {
-        con.printf("usage: crc32 <path>\n");
-        return;
-    }
-    char path[MAX_PATH];
-    stdlib::token_copy(path_start, end, path, sizeof(path));
-
-    RustFile* file = file_open(path, FILE_READ);
-    if (file == nullptr)
-    {
-        con.printf("open failed\n");
-        return;
-    }
-
-    u8* buf = (u8*)mm::alloc(CHUNK_SIZE, 0);
-    if (buf == nullptr)
-    {
-        con.printf("alloc failed\n");
-        kernel_vfs_close(file);
-        return;
-    }
-
-    u32 crc = 0;
-    ulong total = 0;
-    bool ok = true;
-    for (;;)
-    {
-        ulong got = 0;
-        if (kernel_vfs_read(file, buf, CHUNK_SIZE, &got) != 0)
-        {
-            ok = false;
-            break;
-        }
-        if (got == 0)
-            break;
-        crc = stdlib::crc32_update(crc, buf, got);
-        total += got;
-    }
-
-    mm::free(buf);
-    kernel_vfs_close(file);
-
-    if (ok)
-        con.printf("%s: crc32 0x%lX, %lu bytes\n", path, (ulong)crc, total);
-    else
-        con.printf("read failed\n");
-}
-
 /* A GRUB environment block bigger than this is not one grub-editenv made */
 static const ulong GRUBENV_MAX_SIZE = 64 * 1024;
 
@@ -2377,7 +2319,6 @@ static const CmdEntry COMMANDS[] = {
     { "memcheck",  cmd_memcheck,  "memcheck - verify no reserved page reached the free list" },
     { "irqstat",   cmd_irqstat,   "irqstat - show interrupt statistics" },
     { "pci",       cmd_pci,       "pci - show pci devices" },
-    { "crc32",     cmd_crc32,     "crc32 <path> - CRC-32 of a file" },
     { "grubenv",   cmd_grubenv,   "grubenv <path> [name=value ...] - show or set GRUB environment variables" },
     { "insmod",    cmd_insmod,    "insmod <path> [params] - load a kernel module (.ko), handing its init the parameters" },
     { "rmmod",     cmd_rmmod,     "rmmod <name> - unload a kernel module" },

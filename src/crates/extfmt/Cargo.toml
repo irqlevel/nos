@@ -10,8 +10,10 @@ edition = "2021"
 # over bytes, with no kernel in it: hvboot reads a guest's
 # /boot through it, the kernel's ext4 driver is to read and write through
 # it, and fuzz/extfmt holds it to the filesystems e2fsprogs makes and to
-# what e2fsck says of them damaged. No dependency, so it builds offline;
-# nothing in it is unsafe (`forbid`).
+# what e2fsck says of them damaged. No dependency but the tree's own `crc`
+# (its CRC32C and CRC16), so it builds offline; nothing in it is unsafe
+# (`forbid`).
 [lib]
 
 [dependencies]
+crc = { path = "../common/crc" }

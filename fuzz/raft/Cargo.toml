@@ -1,8 +1,8 @@
 # The raft crate on the host: members of a group in one process over a
 # simulated network and simulated disks, held at every step to Raft's
 # properties, the known traps as scripted scenarios, and the wire's decoder
-# fed noise (scripts/raft-test.py). Its one dependency is the crate itself,
-# a path of the tree's, so it builds offline.
+# fed noise (scripts/raft-test.py). Its dependencies are the tree's own
+# crates, by path, so it builds offline.
 [package]
 name = "raft-fuzz"
 version = "0.1.0"
@@ -12,6 +12,9 @@ edition = "2021"
 raft = { path = "../../src/crates/raft" }
 # The cluster's registry, the crate's first user (plans/cluster.md).
 registry = { path = "../../src/crates/registry" }
+# The CRC32C the log's records are checked by, for the known answers and
+# for records made by hand.
+crc = { path = "../../src/crates/common/crc" }
 
 # Overflow checks on, as a RUSTUB=1 build has them: an overflow in the
 # protocol is a bug of its own, and in the kernel a panic.

@@ -397,9 +397,9 @@ fn gpt_header(sector: &[u8], sector_size: usize) -> Option<GptHeader> {
     /* The checksum is taken over the header with its own field zeroed, so it
      * is computed in three pieces rather than by editing the sector. */
     let stored = le32(sector, 16);
-    let mut crc = kcore::crc32::crc32_update(0, &sector[..16]);
-    crc = kcore::crc32::crc32_update(crc, &[0u8; 4]);
-    crc = kcore::crc32::crc32_update(crc, &sector[20..header_size]);
+    let mut crc = crc::crc32::update(0, &sector[..16]);
+    crc = crc::crc32::update(crc, &[0u8; 4]);
+    crc = crc::crc32::update(crc, &sector[20..header_size]);
 
     Some(GptHeader {
         entry_lba: le64(sector, 72),

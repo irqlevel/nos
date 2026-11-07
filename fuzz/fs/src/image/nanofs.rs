@@ -13,10 +13,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use kcore::crc32::{crc32_update, crc32_with_hole};
+use crc::crc32::update as crc32_update;
 
 use crate::machine::disk::Media;
 use crate::model::{Data, Node};
+
+/// A block's CRC-32 with its own checksum field, at `hole`, counted as
+/// zeros. Every caller hands a whole block and one of the format's offsets.
+fn crc32_with_hole(block: &[u8], hole: usize) -> u32 {
+    crc::crc32::with_hole(block, hole).expect("a checksum field inside its block")
+}
 
 pub const MAGIC: u32 = 0x4E41_4E4F;
 pub const VERSION: u32 = 1;
