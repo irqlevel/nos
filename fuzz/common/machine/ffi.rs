@@ -535,8 +535,12 @@ pub unsafe extern "C" fn kernel_cpu_model(buf: *mut u8, len: usize) -> usize {
 /// `out` is writable.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_mem_info(out: *mut ffi::system::MemInfo) {
+    /* Free pages that never went lower; and no Rust heap of the kernel's
+     * counted -- here the host's allocator is the fuzzer's -- every peak
+     * then no less than what it peaks */
     let info = ffi::system::MemInfo { page_bytes: 4096, total_pages: 1 << 18, free_pages: 1 << 17,
-                                      huge_block_bytes: 2 << 20, huge_blocks: 0, huge_free: 0 };
+                                      huge_block_bytes: 2 << 20, huge_blocks: 0, huge_free: 0,
+                                      free_lowest_pages: 1 << 17, ..Default::default() };
     // SAFETY: the caller's struct.
     unsafe { *out = info };
 }
