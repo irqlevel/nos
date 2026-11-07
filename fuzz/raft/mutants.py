@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Mutants of the raft crate -- and of the cluster's registry, its first user
--- the gate must catch: each one rule taken out of
+"""Mutants of the raft crate -- and of the cluster's registry, its first user,
+and NBS's metadata, its second -- the gate must catch: each one rule taken out of
 src/crates/common/cluster/raft/src/node.rs (or the file a mutant names), the fuzzer built
 over it, and `raft-fuzz gate`
 run -- which must fail; and so must the scenario written for that rule, on
@@ -20,8 +20,9 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 SRC = os.path.join(ROOT, 'src', 'crates', 'common', 'cluster', 'raft', 'src')
-# The registry's mutants name their file from SRC.
+# The registry's and nbsmeta's mutants name their file from SRC.
 REGISTRY = os.path.join('..', '..', 'registry', 'src', 'lib.rs')
+NBSMETA = os.path.join('..', '..', '..', 'storage', 'nbsmeta', 'src', 'lib.rs')
 OUT = os.path.join(ROOT, 'out', 'raft-mutants')
 BINARY = os.path.join(OUT, 'release', 'raft-fuzz')
 
@@ -178,6 +179,30 @@ MUTANTS = [
      'if *ip != 0 && taken {',
      'if false && *ip != 0 && taken {',
      'registry_addresses', REGISTRY),
+    ('nbsmeta_removed_back', 'an incarnation removed taken again',
+     'if self.id_removed(*member) {\n                    return Err(Refusal::MemberRemoved);',
+     'if false && self.id_removed(*member) {\n                    return Err(Refusal::MemberRemoved);',
+     'nbsmeta_replace', NBSMETA),
+    ('nbsmeta_new_incarnation_taken', "a host's new incarnation taken for its old one",
+     'return if m.id == *member { Ok(m.id) } else { Err(Refusal::HostIsMember) };',
+     'return Ok(m.id);',
+     'nbsmeta_replace', NBSMETA),
+    ('nbsmeta_remove_again_refused', 'a remove asked again, once done, refused',
+     'return self.removed.iter().rev().find(|r| r.host == *host).map(|r| r.id)\n                        .ok_or(Refusal::NoSuchHost);',
+     'return Err(Refusal::NoSuchHost);',
+     'nbsmeta_replace', NBSMETA),
+    ('nbsmeta_last_member', "the cluster's last member removed",
+     'if self.members.len() == 1 {\n                    return Err(Refusal::LastMember);',
+     'if false && self.members.len() == 1 {\n                    return Err(Refusal::LastMember);',
+     'nbsmeta_bounds', NBSMETA),
+    ('nbsmeta_all_vote', 'every member a voter, none a learner',
+     'self.members.iter().take(VOTERS_MAX).map(|m| m.id).collect()',
+     'self.members.iter().map(|m| m.id).collect()',
+     'nbsmeta_voters', NBSMETA),
+    ('nbsmeta_snapshot_removed_unchecked', 'a snapshot with a removed member taken',
+     'if self.id_removed(m.id) {\n                return Err(RestoreError("a member removed"));',
+     'if false && self.id_removed(m.id) {\n                return Err(RestoreError("a member removed"));',
+     'nbsmeta_snapshot_rules', NBSMETA),
 ]
 
 
