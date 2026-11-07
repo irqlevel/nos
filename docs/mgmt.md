@@ -189,9 +189,16 @@ Unregistering follows the protocol of the shell's table of module commands
 3. The unregister returns only once its `running` is 0, saying every 10 s
    which of its methods it still waits for, and on which tasks.
 
-A module's unload unregisters before its code goes, so no call is ever made
-into a module that is gone. Unregistering from inside one of the provider's
-own calls would wait for itself: that is a bug, and a panic says so.
+A module's unload does the same for every provider of the module's before
+the module is even dropped ([Unloading](modules.md#unloading)): the loader
+closes those whose handler is in the module's image (`rust_mgmt_close_range`:
+steps 1 and 2), runs the module's stop, and waits out their calls and jobs
+(`rust_mgmt_drain_range`: step 3) -- so the module's drop never runs beside
+a call of its own, and no call is ever made into a module that is gone. A
+registration whose handler is in a module that is going is refused (`Gone`),
+and a provider the module's drop left behind is taken off after it, said in
+the log as the module's. Unregistering from inside one of the provider's own
+calls would wait for itself: that is a bug, and a panic says so.
 
 Handles and call ids carry a generation in their high bits and their slot
 in the low eight; they are looked up, never followed. Locks: the job

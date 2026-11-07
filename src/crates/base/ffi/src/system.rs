@@ -131,6 +131,12 @@ unsafe extern "C" {
     /// no loaded module's -- the image's, say. What ipc knows a caller of
     /// its C ABI by (ipc::owner_at). Task context.
     pub fn kernel_module_name_at(addr: usize, buf: *mut u8, size: usize) -> usize;
+    /// 1 when `addr` is in the image of a module that is going -- unloaded,
+    /// or its init failed -- else 0: what the bus refuses a provider whose
+    /// handler is such a module's by, once the loader has closed the
+    /// module's (ModuleTable::unloading_at). Compares `addr` with the
+    /// images, under the table's lock: sound for any address, any context.
+    pub safe fn kernel_module_unloading_at(addr: usize) -> i32;
     /// insmod (`unload` 0) of the module at the path `arg`, its init handed
     /// `params`, or rmmod (1) of the module named `arg`, as the shell runs
     /// them -- what they said handed to `sink(ctx, ...)` -- answering

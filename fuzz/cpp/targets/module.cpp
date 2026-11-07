@@ -265,6 +265,28 @@ extern "C" void rust_ipc_module_gone(const char*, ulong)
     fuzz::host_hal_unreachable("rust_ipc_module_gone");
 }
 
+/* Nor the rest of a module's take-down: its commands and providers closed
+   and drained */
+extern "C" void rust_mgmt_close_range(ulong, ulong)
+{
+    fuzz::host_hal_unreachable("rust_mgmt_close_range");
+}
+
+extern "C" void rust_mgmt_drain_range(ulong, ulong, int)
+{
+    fuzz::host_hal_unreachable("rust_mgmt_drain_range");
+}
+
+void kernel::Cmd::close_range(ulong, ulong)
+{
+    fuzz::host_hal_unreachable("Cmd::close_range");
+}
+
+void kernel::Cmd::drain_range(ulong, ulong, const char*, bool)
+{
+    fuzz::host_hal_unreachable("Cmd::drain_range");
+}
+
 namespace
 {
 
@@ -404,13 +426,14 @@ Ko build(fuzz::Input& in)
         ko.funcs.push_back({funcs[i], name});
     }
 
-    /* The header, in the data, and what points at it. */
-    const ulong info_size = 120;
+    /* The header, in the data, and what points at it: the loader's own
+       layout of it, and its version */
+    const ulong info_size = sizeof(ModuleInfo);
     ulong info_off = in.below((data.filesz - info_size) / 8) * 8;
     ko.info_vaddr = data.vaddr + info_off;
     std::vector<uint8_t> info(info_size, 0);
-    put_le(info, 0, 0x4D534F4E, 4);
-    put_le(info, 4, 2, 4);
+    put_le(info, 0, INFO_MAGIC, 4);
+    put_le(info, 4, INFO_VERSION, 4);
     memcpy(info.data() + 8, "fuzz", 4);
     memcpy(info.data() + 72, ko.name.data(), ko.name.size());
     memcpy(data.bytes.data() + info_off, info.data(), info_size);
@@ -419,9 +442,10 @@ Ko build(fuzz::Input& in)
     ko.syms.push_back({"nos_module_info", 0x11, 5, ko.info_vaddr, info_size});
     for (size_t i = 0; i < funcs.size(); i++)
         ko.syms.push_back({"fn" + std::to_string(i), 0x12, 6, funcs[i], 16});
-    ulong init = funcs[0], exit = funcs[1];
-    ko.relas.push_back({ko.info_vaddr + 104, rel_type('R'), 0, static_cast<long>(init)});
-    ko.relas.push_back({ko.info_vaddr + 112, rel_type('R'), 0, static_cast<long>(exit)});
+    ulong init = funcs[0], stop = funcs[funcs.size() - 1], exit = funcs[1];
+    ko.relas.push_back({ko.info_vaddr + offsetof(ModuleInfo, init), rel_type('R'), 0, static_cast<long>(init)});
+    ko.relas.push_back({ko.info_vaddr + offsetof(ModuleInfo, stop), rel_type('R'), 0, static_cast<long>(stop)});
+    ko.relas.push_back({ko.info_vaddr + offsetof(ModuleInfo, exit), rel_type('R'), 0, static_cast<long>(exit)});
 
     /* A slot in the data for a pointer, clear of the header, whose fields
        check_info reads */
@@ -505,7 +529,7 @@ void twist(fuzz::Input& in, Ko& ko)
         break;
     case 5:
         /* The header past the image's end, or unaligned */
-        ko.syms[1].value = in.boolean() ? ko.image_size - 120 + 8 : ko.syms[1].value + 4;
+        ko.syms[1].value = in.boolean() ? ko.image_size - sizeof(ModuleInfo) + 8 : ko.syms[1].value + 4;
         break;
     case 6:
         /* Function table lines out of order, past the image, not hex */

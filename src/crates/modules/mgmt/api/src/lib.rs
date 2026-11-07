@@ -65,26 +65,31 @@ const CERT_NICS: [&str; 2] = ["eth0", "hv0"];
 /// A client's certificate, as `cert=` reads it.
 const CERT_FILE_MAX: usize = 16 * 1024;
 
-/* Dropped in this order: the command, waiting out a call of it; the
-   provider, waiting out a call of it; then the state, and with its last
-   reference the server, whose listeners and connections are waited for */
+/* Dropped in this order: the command and the provider, no call of either
+   running by then -- the loader waited them out; then the state, and with
+   its last reference the server, whose listeners and connections are
+   waited for */
 struct Api {
     _cmd: Command,
     _provider: Provider,
     state: Arc<State>,
 }
 
-impl kmod::Module for Api {}
+impl kmod::Module for Api {
+    /* Before the loader waits out the calls of the command and the
+     * provider: the server's tasks told to stop, as a call run from the
+     * console channel whose output its client is not taking gives up only
+     * once its connection sees the stop */
+    fn stop(&mut self) {
+        self.state.tell_server_to_stop();
+    }
+}
 
 impl Drop for Api {
     fn drop(&mut self) {
-        /* The server's tasks told to stop before the command goes: a call
-         * of it may be running, and the drop of the command waits it out */
-        self.state.server.with(|s| {
-            if let Some(s) = s.as_ref() {
-                s.shared.stop.store(true, Ordering::Release);
-            }
-        });
+        /* Again: an `api start` running as the unload began may have made a
+         * server after the stop, which its drop, with the state's, waits for */
+        self.state.tell_server_to_stop();
     }
 }
 
@@ -95,6 +100,18 @@ struct State {
     /// Held through every change of the clients file
     files: Locked<()>,
     starting: AtomicBool,
+}
+
+impl State {
+    /// The server's tasks, if there is a server, told to stop: not waited
+    /// for.
+    fn tell_server_to_stop(&self) {
+        self.server.with(|s| {
+            if let Some(s) = s.as_ref() {
+                s.shared.stop.store(true, Ordering::Release);
+            }
+        });
+    }
 }
 
 fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn kmod::Module>> {

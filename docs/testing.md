@@ -64,7 +64,14 @@ run its job on:
   `cancelled`, and the provider goes with its module.
 
 An unregister that does not tell its jobs to stop, or does not wait for its
-calls, fails the boot (`mgmt selftest: ...`). And on every CPU `test_sleep_prompt` has a task of its own sleep a
+calls, fails the boot (`mgmt selftest: ...`). After it `test_module_unload`
+holds an unload to its order ([Unloading](modules.md#unloading)): a call of
+`modtest hold` is running on a task of its own as modtest is unloaded, and
+returns only once the module's stop has run. The stop must find the
+module's command and provider closed already, the call says so as it
+returns, and modtest's drop panics if a call of its command is still running
+-- so a loader that drops a module beside a call of its own, that never
+calls the stop, or calls it before the close, fails the boot. And on every CPU `test_sleep_prompt` has a task of its own sleep a
 millisecond twenty-one times while the CPU halts between interrupts: the
 median sleep must be under 5 ms -- 1.0-2.4 under HVF and TCG, 10.0 when the
 CPU's timer is not armed for a sleeper's deadline and the tick wakes it
@@ -252,7 +259,7 @@ how it works and what it found.
 | the disk log | `disklog-test.py` (arm64): nothing else gives `disklog=on` |
 | the log path (`klog`), a net device, netconsole | `netconsole-test.py` (arm64): on the Hetzner boxes it is the only console there is -- what a boot logs, a panic's report, and the halt's lines down to its own last |
 | TCP, the HTTP client; TCP's loss recovery -- SACK and D-SACK, RACK-TLP, PRR, the undos, the table of what is in flight (`Sent` in `layers/net/src/tcp.rs`); the window it offers and takes in by (`offer_window`, `acceptable`) and silly window avoidance | `net-fuzz.py --target tcp` (host, in CI): a peer that takes SACK or not, says four blocks, fewer or none, and reneges now and then -- the machine held to SACKing only what reached it, D-SACKing only what reached it twice, and never sending again what an acknowledgement it had taken in told it was held; every connection's table, and the furthest edge its window offered -- within the receive buffer, no byte inside a window offered ever finding no room -- audited after every step. Then `tcp-test.py` (arm64); for the numbers, `scripts/tcp-loss-bench.py` (arm64, HVF): two nos over hub.py, MB/s and each end's counters under loss, delay and reordering, against the tree before -- `--path` for the frames each way by size, `--trace`/`--show` for TCP's tracepoints, `--top` for the CPUs |
-| TCP's listening side, the module loader, the `ffi` declarations, `ssh`, `modules/net/sshd` | `sshd-test.py` (arm64). 59 checks pass; `connections past the four logging in are refused` flakes under load: stragglers of the probe burst land after its quiet window |
+| TCP's listening side, the module loader, the `ffi` declarations, `ssh`, `modules/net/sshd` | `sshd-test.py` (arm64); the loader's unload order, the smoke boots (`test_module_unload`) and `cpp-fuzz.py --target module`. 59 checks pass; `connections past the four logging in are refused` flakes under load: stragglers of the probe burst land after its quiet window |
 | the editor: `src/crates/common/text/edit`, `modules/tools/edit`; the terminal a session lends the command it runs -- the pty-req's and window-changes' size in `ssh`, `Output::terminal`, `kernel_printer_terminal` | `edit-test.py` (host, in CI): the crate run as the module runs it, on a terminal of the test's own that does what xterm does -- key sessions held to what they leave in the file, at the cursor and on the screen; files read and saved back byte for byte; random sessions after every key of which the editor keeps its promises and the terminal has had nothing it would wrap, scroll or not know, the screen drawn a row at a time what a full redraw draws, and undoing everything the file as it was read. Then `sshd-test.py` (arm64), whose editor phase types at `edit` through `ssh -t` on a pty of its own: drawn at the pty's size, saved, a file changed meanwhile asked about, a resize drawn again whole, `<file>.save` when the connection goes; and `net-fuzz.py`, whose `term` command is told the size its client gave and changed |
 | the receive path, the frame pool, `modules/net/netload`, a module's UDP listener in `kcore::net`, the tick's receive poll (`rxpoll`) | `netload-test.py` (arm64; about seven minutes, by design), and `--arch x86_64`, its short form, after touching the module ABI |
 | `drivers/net/igb`, the driver seam in `layers/net/src/device.rs` | `tcp-test.py --nic igb` and `netload-test.py --nic igb`: QEMU's 82576, the only way a hardware NIC driver runs anywhere but on a Hetzner box (QEMU 8.0 or later; CI's does not have it, so by hand) |

@@ -70,12 +70,60 @@ struct ModTest {
     _ipc: Arc<Mutex<Option<Mailbox>>>,
 }
 
-impl kmod::Module for ModTest {}
+/* What test_module_unload holds the loader's take-down order to
+   (ModuleTable::take_down): a `modtest hold` running as the unload begins
+   returns only once the module's stop has run, and the stop has to find
+   the module's command and provider closed already; the drop comes after
+   the call has returned, or it panics. */
+
+/// Calls of `modtest hold` running.
+static HOLDING: AtomicU32 = AtomicU32::new(0);
+/// Set by the module's stop: what lets a `modtest hold` return.
+static STOPPED: AtomicBool = AtomicBool::new(false);
+/// What the stop found: 0 nothing yet, 1 its command and provider both
+/// closed, 2 one of them still answering.
+static CLOSED: AtomicU8 = AtomicU8::new(0);
+/// How long a `modtest hold` waits for the stop, at most.
+const HOLD_LIMIT_MS: u64 = 10_000;
+
+impl kmod::Module for ModTest {
+    fn stop(&mut self) {
+        let mut said = Vec::new();
+        kcore::cmd::dispatch("modtest", &mut |b| said.extend_from_slice(b));
+        let command_closed = has(&said, b"not found");
+        let (s, _) = answered(|sink| kcore::mgmt::call("modtest", "echo", b"{}", 64, sink));
+        let provider_closed = s == Status::NoProvider;
+        CLOSED.store(if command_closed && provider_closed { 1 } else { 2 }, Ordering::Release);
+        STOPPED.store(true, Ordering::Release);
+    }
+}
 
 impl Drop for ModTest {
     fn drop(&mut self) {
+        let running = HOLDING.load(Ordering::Acquire);
+        if running != 0 {
+            panic!("modtest: dropped with {} calls of its command running -- the unload's order broke", running);
+        }
         kcore::klog!(0, "modtest: unloaded");
     }
+}
+
+/// `modtest hold`: running until the module's stop, and saying what the
+/// stop found.
+fn hold(out: &mut Output) {
+    HOLDING.fetch_add(1, Ordering::AcqRel);
+    let mut ms = 0;
+    while !STOPPED.load(Ordering::Acquire) && ms < HOLD_LIMIT_MS {
+        kcore::task::sleep_ms(1);
+        ms += 1;
+    }
+    let line = match (STOPPED.load(Ordering::Acquire), CLOSED.load(Ordering::Acquire)) {
+        (true, 1) => "modtest hold: released by the stop, its command and provider closed before it",
+        (true, _) => "modtest hold: released by the stop, its command or provider still answering then",
+        (false, _) => "modtest hold: never released -- no stop came",
+    };
+    let _ = writeln!(out, "{}", line);
+    HOLDING.fetch_sub(1, Ordering::AcqRel);
 }
 
 fn check(ok: bool, what: &str) -> Result<()> {
@@ -147,6 +195,14 @@ fn init(params: &kmod::Params, out: &mut Output) -> Result<Box<dyn kmod::Module>
                     let _ = writeln!(out, "modtest ipc: {} went wrong", what);
                 }
             }
+            return;
+        }
+        if args.trim() == "hold" {
+            hold(out);
+            return;
+        }
+        if args.trim() == "holding" {
+            let _ = writeln!(out, "modtest holding: {}", HOLDING.load(Ordering::Acquire));
             return;
         }
         if args.trim() == "bus" {
