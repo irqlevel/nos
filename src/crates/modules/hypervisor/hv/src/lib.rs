@@ -194,21 +194,29 @@ struct Hv {
     /// use goes.
     #[cfg(target_arch = "x86_64")]
     provider: Option<kcore::mgmt::Provider>,
-    /// In an `Option` so that unregistering -- which waits out a call of the
-    /// command still running on another CPU -- happens before the machine is
-    /// let go of, and not in whatever order the fields happen to be in.
+    /// In an `Option` so that it is unregistered before the machine is let
+    /// go of, and not in whatever order the fields happen to be in. No call
+    /// of it is running by then: the loader waits those out before the drop.
     cmd: Option<Command>,
     state: Arc<State>,
 }
 
-impl kmod::Module for Hv {}
+impl kmod::Module for Hv {
+    /* The loader's step before it waits out the calls of the command and the
+     * provider: what an `hv boot`, `hv wait` or `hv exec` still running waits
+     * on -- a guest -- stopped, so that those calls return. */
+    fn stop(&mut self) {
+        self.guests_down();
+    }
+}
 
-impl Drop for Hv {
-    fn drop(&mut self) {
-        /* The guests first: an `hv boot` running, and every `hv start`ed one
-         * -- so that an `hv wait` or `hv exec` waiting on one returns, and it
-         * is those calls the unregister below waits for. A download, a
-         * conversion or a clone stops where it is, as told by the flag. */
+impl Hv {
+    /// The guests stopped: an `hv boot` running, and every `hv start`ed one
+    /// -- so that an `hv wait` or `hv exec` waiting on one returns. A
+    /// download, a conversion or a clone stops where it is, as told by the
+    /// flag. The loader's stop, before it waits out the calls of the module's
+    /// command and provider, and the drop's again after them.
+    fn guests_down(&mut self) {
         self.state.unloading.store(true, core::sync::atomic::Ordering::Release);
         #[cfg(target_arch = "x86_64")]
         {
@@ -219,11 +227,19 @@ impl Drop for Hv {
             self.state.forwards.close();
             self.state.vms.close(self.state.stop_secs);
         }
+    }
+}
 
-        /* Then the command: `kernel_cmd_unregister` returns only once any
-         * call of it still running has, so from here nothing can ask the
-         * machine anything -- nor start a guest on it, since `close` turned
-         * every later `hv start` away. */
+impl Drop for Hv {
+    fn drop(&mut self) {
+        /* Down already, by the stop; again for a guest a call of the
+         * command started before the loader had waited it out -- `close`
+         * turned every `hv start` after it away, so there is none, and this
+         * finds nothing to stop. */
+        self.guests_down();
+
+        /* Then the command: the loader waited out every call of it before
+         * this drop, so from here nothing can ask the machine anything. */
         drop(self.cmd.take());
 
         /* A forward added while the guests stopped, before the command went:

@@ -104,6 +104,13 @@ public:
        listed while its init runs, so what its init makes is its own. */
     ulong name_at(ulong addr, char* buf, ulong size);
 
+    /* Whether addr is in the image of a module that is going -- unloaded,
+       or its init failed: what a shell command and a bus provider are
+       refused registration by once take_down has begun to close the
+       module's, so that none is left behind it able to take a call. Never
+       waits. */
+    bool unloading_at(ulong addr);
+
     /* The loaded modules, "name base+size" each, into buf for the panic
        report. Never waits either; false if there are none, or no telling. */
     bool describe_all(char* buf, ulong size);
@@ -151,6 +158,10 @@ private:
     JobOutcome start_job(bool unload, const char* arg, const char* params, stdlib::Printer& out);
     LoadedModule* find_locked(const char* name);
     void remove(LoadedModule* module);
+
+    /* A module made Unloading taken down, its exit run if it has an
+       instance (live), and freed: the order is module.cpp's */
+    void take_down(LoadedModule* module, bool live);
 
     /* Guards List and each module's phase. Held only for a lookup or a
        change of phase: never across a module's init or exit, an allocation,
