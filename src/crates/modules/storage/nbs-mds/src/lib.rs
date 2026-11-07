@@ -1,18 +1,34 @@
 #![no_std]
 
-//! nbs-mds: NBS's metadata service on this host (plans/nbs.md, N5) -- the
-//! state every member holds alike, through raft over ipc, of which NBS's
-//! hosts are its members. For now that state is the NBS cluster's identity
-//! and its members; volumes, devices and placement come with N6.
+//! nbs-mds: NBS's metadata service on this host (plans/nbs.md, N5 and N6) --
+//! the state every member holds alike, through raft over ipc, of which NBS's
+//! hosts are its members: the NBS cluster's identity and its members, each
+//! host's chunk server and its devices, the volumes and where each chunk of
+//! them is (nbsmeta).
 //!
 //!     insmod /lib/modules/ipcnet.ko, then cluster.ko: the hosts that trust each other
-//!     insmod /lib/modules/nbs-mds.ko [dir=/nbs/mds]
+//!     insmod /lib/modules/nbs-mds.ko [dir=/nbs/mds] [compact=<bytes>]
 //!     nbs init <name>            on the first host: an NBS cluster of it alone
 //!     nbs host add <host>        on a member: <host> -- a host of the registry -- a member
 //!     nbs host remove <host>     on a member: <host>'s member out, for good
 //!     nbs host replace <host>    on a member: a host that lost its state, back as a new member
 //!     nbs hosts                  every member: its incarnation, its vote, the leader
 //!     nbs                        this host's member: role, term, leader, what it applied
+//!     nbs devices add <id|name>  a device of this host's for its chunk server
+//!     nbs devices drain <id>     given no new chunks
+//!     nbs cs                     every host's chunk server: its devices and room
+//!     nbs volume create <name> <size> [host=<h>], delete <name>, resize <name> <size>
+//!     nbs volumes, nbs volume <name>
+//!
+//! The same is on the management bus as the `nbs` provider (provider.rs). A
+//! device is recorded, not yet written: the cs (N7) claims and formats what
+//! its host has in the metadata.
+//!
+//! `compact=` is how many bytes of entries the log holds past its snapshot
+//! before it is compacted into a new one -- or the state's size, should that
+//! be more: raft's 1 MiB unless given. A test gives it a few, so that a
+//! member started again reads its state back from a snapshot, and a member
+//! added is sent one.
 //!
 //! Who the members are is two things (plans/nbs.md, "Who is in the cluster"):
 //! the hosts that may talk at all are the cluster registry's, ipcnet pinning
@@ -34,6 +50,8 @@ extern crate alloc;
 
 mod files;
 mod member;
+mod provider;
+mod store;
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -45,6 +63,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use kcore::cmd::{Command as ShellCommand, Output};
 use kcore::error::Error;
+use kcore::mgmt::Provider;
 use kcore::ipc::{Limits, Mailbox, Message, Scope, TAG_BULK};
 use kcore::klog;
 use kcore::task::TaskHandle;
@@ -56,7 +75,7 @@ use raftmember::{KFiles, Locked};
 use files::Known;
 use member::{Lost, Offer, Shared, View};
 
-const HELP: &str = "nbs [init | host | hosts] - this host in NBS's metadata service";
+const HELP: &str = "nbs [init | host | hosts | devices | cs | volume | volumes] - NBS's metadata service";
 const _: () = assert!(HELP.len() <= kcore::cmd::HELP_MAX, "`help` would cut it short");
 
 const USAGE: &str = "usage: nbs                          this host's member: incarnation, role, leader, what it applied\n\
@@ -65,8 +84,17 @@ const USAGE: &str = "usage: nbs                          this host's member: inc
                      \x20      nbs host add <host>        <host>, a host of the cluster registry, a member: a learner\n\
                      \x20                                 until it holds the log, then a voter while fewer than five vote\n\
                      \x20      nbs host remove <host>     <host>'s member out, for good\n\
-                     \x20      nbs host replace <host>    <host>, which lost its state, back as a new member";
-const NO_MEMBER: &str = "this host is in no NBS cluster -- `nbs init <name>`, or `nbs host add <this host>` on a member";
+                     \x20      nbs host replace <host>    <host>, which lost its state, back as a new member\n\
+                     \x20      nbs devices add <id|name>  a device of this host's for its chunk server\n\
+                     \x20      nbs devices drain <id>     given no new chunks\n\
+                     \x20      nbs cs                     every host's chunk server: its devices and room\n\
+                     \x20      nbs volumes                every volume\n\
+                     \x20      nbs volume <name>          one, and which hosts hold its replicas\n\
+                     \x20      nbs volume create <name> <size> [host=<host>]   size in MiB, or with M, G, T\n\
+                     \x20      nbs volume delete <name>\n\
+                     \x20      nbs volume resize <name> <size>";
+pub(crate) const NO_MEMBER: &str = "this host is in no NBS cluster -- `nbs init <name>`, or `nbs host add <this host>` \
+                                    on a member";
 
 /// How long an offer is tried for -- the connection to the host coming up
 /// first -- and how long each try waits for its answer.
@@ -84,6 +112,8 @@ const NS_PER_MS: u64 = 1_000_000;
 /// while there is not.
 struct ModState {
     dir: String,
+    /// The log's bytes past its snapshot before it is compacted: `compact=`.
+    compact: u64,
     shared: Arc<Shared>,
     lost: Lost,
     task: Locked<Option<TaskHandle>>,
@@ -111,12 +141,14 @@ impl Drop for Starting<'_> {
     }
 }
 
-/* Dropped in this order: the command, waiting out a call of it -- an `init`
-   under way would start a task after the stops below otherwise, and the
-   module's code be freed under it -- then the listener stopped and waited
-   out, then the member's task, its log closed with it */
+/* Dropped in this order: the command and the provider -- the loader has
+   waited out every call of them before this drop, the member's task they
+   hand their changes to among what such a call may have been waiting on --
+   then the listener stopped and waited out, then the member's task, its log
+   closed with it */
 struct Nbs {
     cmd: Option<ShellCommand>,
+    provider: Option<Provider>,
     state: Arc<ModState>,
 }
 
@@ -124,6 +156,7 @@ impl kmod::Module for Nbs {}
 
 impl Drop for Nbs {
     fn drop(&mut self) {
+        drop(self.provider.take());
         drop(self.cmd.take());
         stop_idle(&self.state);
         stop(&self.state);
@@ -148,17 +181,23 @@ fn stop_idle(state: &ModState) {
 
 fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn kmod::Module>> {
     let mut dir = None;
+    let mut compact = None;
     for (key, value) in params.words() {
         match (key, value) {
             ("dir", Some(path)) if dir.is_none() && path.starts_with('/') && path.len() < 200 => dir = Some(path),
+            ("compact", Some(bytes)) if compact.is_none() && bytes.parse::<u64>().is_ok() => {
+                compact = bytes.parse::<u64>().ok();
+            }
             _ => {
-                let _ = writeln!(out, "nbs: \"{}\" is not a parameter of nbs-mds's -- dir=<folder> is, given once", key);
+                let _ = writeln!(out, "nbs: \"{}\" is not a parameter of nbs-mds's -- dir=<folder> and \
+                                       compact=<bytes> are, each given once", key);
                 return Err(Error::InvalidValue);
             }
         }
     }
     let state = Arc::new(ModState {
         dir: String::from(dir.unwrap_or(files::DEFAULT_DIR).trim_end_matches('/')),
+        compact: compact.unwrap_or(raft::rsm::SNAPSHOT_FLOOR),
         shared: Arc::new(Shared::new().ok_or(Error::NoMemory)?),
         lost: Arc::new(Locked::new(BTreeMap::new()).ok_or(Error::NoMemory)?),
         task: Locked::new(None).ok_or(Error::NoMemory)?,
@@ -190,7 +229,8 @@ fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn
             let _ = writeln!(out, "nbs: {}", problem);
         }
     })?;
-    Ok(Box::new(Nbs { cmd: Some(cmd), state }))
+    let provider = provider::register(state.clone()).map_err(|_| Error::Busy)?;
+    Ok(Box::new(Nbs { cmd: Some(cmd), provider: Some(provider), state }))
 }
 
 kmod::module!(name: "nbs-mds", init_with_params: init);
@@ -212,11 +252,12 @@ fn start(state: &ModState, me: files::Member, fresh: bool) -> Result<(), String>
     cfg.seed = kcore::random::random_u64().unwrap_or(me.id);
     let nonce = kcore::random::random_u64().ok_or_else(|| String::from("no randomness for the member's start"))?;
     let mut rsm = Rsm::new(cfg, log, State::new(), nonce).map_err(|e| alloc::format!("the member: {:?}", e))?;
+    rsm.set_snapshot_floor(state.compact);
     if fresh {
         /* Its group's one voter: leading at once rather than at a timeout */
         let _ = rsm.campaign();
     }
-    let member = member::new(rsm, me, state.lost.clone())?;
+    let member = member::new(rsm, me, state.lost.clone(), &state.dir)?;
     state.shared.stop.store(false, Ordering::Release);
     /* Shown before the task's first turn, so that a command right after
        this one finds the member */
@@ -338,11 +379,11 @@ fn take_offer(state: &ModState, mb: &Mailbox, m: &Message) -> Option<files::Memb
 
 /* ---- the shell ---- */
 
-fn view(state: &ModState) -> Option<View> {
+pub(crate) fn view(state: &ModState) -> Option<View> {
     state.shared.view()
 }
 
-fn member_view(state: &ModState) -> Result<View, String> {
+pub(crate) fn member_view(state: &ModState) -> Result<View, String> {
     view(state).filter(|v| v.stopped.is_none()).ok_or_else(|| String::from(NO_MEMBER))
 }
 
@@ -352,13 +393,14 @@ fn ask(state: &ModState, cmd: &Command) -> Result<u64, String> {
     match raftmember::ask(&state.shared, cmd, NO_MEMBER)? {
         Answer::Done { member } => Ok(member),
         Answer::Refused(why) => Err(String::from(why.says())),
+        other => Err(alloc::format!("answered {:?}", other)),
     }
 }
 
 /// This member's view once its log has the cluster: a member just added
 /// holds none until raft has brought it the log, which it is given a few
 /// seconds for.
-fn caught_up(state: &ModState) -> Result<View, String> {
+pub(crate) fn caught_up(state: &ModState) -> Result<View, String> {
     let end = boot_time_ns() + VIEW_WAIT_MS * NS_PER_MS;
     loop {
         let v = member_view(state)?;
@@ -486,6 +528,56 @@ fn run(state: &Arc<ModState>, args: &str, out: &mut Output) -> Result<(), String
             let _ = writeln!(out, "nbs: {}'s member {} removed, and {} is member {} now", host, old, host, new);
             Ok(())
         }
+        ["devices", "add", word] => {
+            let (ident, slots, id) = store::device_add(state, word).map_err(|f| f.says())?;
+            let _ = writeln!(out, "nbs: device {} of this host's chunk server, {} -- device {} in the metadata; \
+                                   nothing is written to it before the cs (N7) takes it", ident,
+                             store::Mib(u64::from(slots) * u64::from(nbsmeta::CHUNK_MIB)), id);
+            Ok(())
+        }
+        ["devices", "drain", ident] => {
+            let id = store::device_drain(state, ident).map_err(|f| f.says())?;
+            let _ = writeln!(out, "nbs: device {} ({}) takes no new chunks", ident, id);
+            Ok(())
+        }
+        ["devices"] | ["cs"] => {
+            store::show_cs(&member_view(state)?, out);
+            Ok(())
+        }
+        ["volumes"] => {
+            store::show_volumes(&member_view(state)?, out);
+            Ok(())
+        }
+        ["volume", "create", name, size, rest @ ..] => {
+            let size_mib = store::parse_size(size).ok_or_else(|| alloc::format!("\"{}\" is not a size: MiB, or with \
+                                                                                 M, G or T after it", size))?;
+            let host = match rest {
+                [] => None,
+                [h] => Some(h.strip_prefix("host=").ok_or_else(|| String::from(USAGE))?),
+                _ => return Err(String::from(USAGE)),
+            };
+            let id = store::volume_create(state, name, size_mib, host).map_err(|f| f.says())?;
+            let _ = writeln!(out, "nbs: volume {} ({}), {}", name, id, store::Mib(size_mib));
+            Ok(())
+        }
+        ["volume", "delete", name] => {
+            match store::volume_delete(state, name).map_err(|f| f.says())? {
+                0 => {
+                    let _ = writeln!(out, "nbs: no volume {}: gone already", name);
+                }
+                id => {
+                    let _ = writeln!(out, "nbs: volume {} ({}) deleted", name, id);
+                }
+            }
+            Ok(())
+        }
+        ["volume", "resize", name, size] => {
+            let size_mib = store::parse_size(size).ok_or_else(|| alloc::format!("\"{}\" is not a size", size))?;
+            let id = store::volume_resize(state, name, size_mib).map_err(|f| f.says())?;
+            let _ = writeln!(out, "nbs: volume {} ({}) is {} now", name, id, store::Mib(size_mib));
+            Ok(())
+        }
+        ["volume", name] => store::show_volume(&member_view(state)?, name, out),
         _ => Err(String::from(USAGE)),
     }
 }
@@ -564,6 +656,16 @@ fn status(state: &ModState, out: &mut Output) -> Result<(), String> {
                            learners, {} messages refused", name, id, v.node, role_name(v.role), v.term, leader,
                      v.applied, v.state.members().len(), v.membership.voters.len(), v.membership.learners.len(),
                      v.refused);
+    match v.state.checks().latest() {
+        Some((at, d)) => {
+            let _ = writeln!(out, "nbs: the state's digest at entry {}: {}... -- {} of the leader's held to it, {} \
+                                   too old to", at, codec::hex(&d[..8]), v.state.checks().held,
+                             v.state.checks().unheld);
+        }
+        None => {
+            let _ = writeln!(out, "nbs: no digest of the state yet -- one every {} entries", nbsmeta::CHECK_EVERY);
+        }
+    }
     let lost: Vec<(String, u64)> = state.lost.with(|l| l.iter().map(|(h, &(i, _))| (h.clone(), i)).collect());
     for (host, id) in lost {
         let _ = writeln!(out, "nbs: {} says its mds has no member {}: its state is gone -- `nbs host replace {}`",

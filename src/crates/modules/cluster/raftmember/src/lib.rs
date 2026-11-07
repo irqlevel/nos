@@ -61,7 +61,8 @@ pub const TAG_RAFT: u32 = 0x100;
 /// A command handed to the leader: a request's number, then the command.
 pub const TAG_PROPOSE: u32 = 0x101;
 /// The leader's answer to one: the request's number, a byte -- 1 applied, 0
-/// not -- then the answer's bytes, or what went wrong in words.
+/// not -- the entry it was applied at (0 for none), then the answer's bytes,
+/// or what went wrong in words.
 pub const TAG_ANSWER: u32 = 0x102;
 /// The first tag a group's own messages may have: below it the engine's.
 pub const TAG_APP: u32 = 0x103;
@@ -81,10 +82,15 @@ pub const ANSWER_MS: u64 = 10_000;
 const ASK_TOTAL_MS: u64 = 30_000;
 const ASK_RETRY_MS: u64 = 250;
 const ANSWER_POLL_MS: u64 = 20;
+/// How long a change the leader answered is waited for in this member's
+/// view: applied here too, what the shell reads next holds it.
+const VIEW_WAIT_MS: u64 = 5000;
 /// How often a message of another group is said in the log at most.
 const OTHER_GROUP_SAY_MS: u64 = 10_000;
 /// A group's id, before every message of the engine's where the app has one.
 pub const GROUP_BYTES: usize = 16;
+/// An answer's head: the request's number, applied or not, the entry.
+const ANSWER_HEAD: usize = 8 + 1 + 8;
 
 /// A value under a lock of the kernel's, taken for a call.
 pub struct Locked<T>(Mutex<T>);
@@ -154,12 +160,21 @@ pub trait App: Sized {
 
     /// What the group does at every turn, after raft's work.
     fn turn(&mut self, _core: &mut Core<Self>) {}
+
+    /// Why the member must stop, where it must: a state that can no longer
+    /// be trusted -- NBS's digest not the leader's. Asked after every turn;
+    /// once it answers, the member stops, as for a log that failed, and the
+    /// view and the log say why in the app's words.
+    fn halt(&self, _core: &Core<Self>) -> Option<String> {
+        None
+    }
 }
 
 /// What a request is answered: the command's answer, or what went wrong.
 pub type Outcome<A> = Result<<A as App>::Answer, String>;
-/// Where a request's outcome goes, for whoever waits for it.
-pub type Slot<A> = Arc<Locked<Option<Outcome<A>>>>;
+/// Where the shell's request is answered: the outcome, and the entry the
+/// command was applied at -- 0 where it was not.
+pub type Slot<A> = Arc<Locked<Option<(Outcome<A>, u64)>>>;
 
 /// A command the shell asks for.
 pub struct Request<A: App> {
@@ -214,6 +229,12 @@ impl<A: App> Shared<A> {
 
     pub fn view(&self) -> Option<View<A>> {
         self.view.with(|v| v.clone())
+    }
+
+    /// The entry the member's view has applied, read without a copy of the
+    /// state -- None while there is no member, or it stopped.
+    pub fn applied(&self) -> Option<u64> {
+        self.view.with(|v| v.as_ref().filter(|v| v.stopped.is_none()).map(|v| v.applied))
     }
 }
 
@@ -405,26 +426,30 @@ impl<A: App> Core<A> {
         None
     }
 
-    fn answer_remote(&self, app: &A, to: Addr, request: u64, outcome: Outcome<A>) {
+    fn answer_remote(&self, app: &A, to: Addr, request: u64, outcome: Outcome<A>, index: u64) {
         let mut data = Vec::new();
         data.extend_from_slice(&request.to_le_bytes());
         match outcome {
             Ok(a) => {
                 data.push(1);
+                data.extend_from_slice(&index.to_le_bytes());
                 data.extend_from_slice(&A::encode_answer(&a));
             }
             Err(why) => {
                 data.push(0);
+                data.extend_from_slice(&0u64.to_le_bytes());
                 data.extend_from_slice(why.as_bytes());
             }
         }
         let _ = self.mb.send(to, TAG_ANSWER, 0, &self.framed(app, &data));
     }
 
-    fn finish(&mut self, app: &mut A, w: Pending<A>, outcome: Outcome<A>) {
+    /// `w` told `outcome`: the command applied at entry `index`, 0 where it
+    /// was not.
+    fn finish(&mut self, app: &mut A, w: Pending<A>, outcome: Outcome<A>, index: u64) {
         match w {
-            Pending::Local(slot) => slot.with(|s| *s = Some(outcome)),
-            Pending::Remote { to, request } => self.answer_remote(app, to, request, outcome),
+            Pending::Local(slot) => slot.with(|s| *s = Some((outcome, index))),
+            Pending::Remote { to, request } => self.answer_remote(app, to, request, outcome, index),
             Pending::App(w) => app.finish(self, w, outcome),
         }
     }
@@ -433,7 +458,7 @@ impl<A: App> Core<A> {
     fn hand_to_leader(&mut self, app: &mut A, cmd: A::Command, w: Pending<A>) {
         let leader = self.rsm.leader();
         let Some(host) = app.host_of(self, leader) else {
-            self.finish(app, w, Err(String::from("no leader known yet -- ask again in a moment")));
+            self.finish(app, w, Err(String::from("no leader known yet -- ask again in a moment")), 0);
             return;
         };
         let request = self.take_request();
@@ -443,7 +468,7 @@ impl<A: App> Core<A> {
         let to = alloc::format!("{}@{}", A::NAME, host);
         let framed = self.framed(app, &data);
         if let Err(e) = self.mb.send_to(&to, TAG_PROPOSE, 0, &framed) {
-            self.finish(app, w, Err(alloc::format!("the leader, {}, out of reach: {}", host, e.name())));
+            self.finish(app, w, Err(alloc::format!("the leader, {}, out of reach: {}", host, e.name())), 0);
             return;
         }
         self.forwarded.insert(request, (w, boot_time_ns() + ANSWER_MS * NS_PER_MS, leader));
@@ -452,15 +477,15 @@ impl<A: App> Core<A> {
     /// `cmd` submitted under the member's session, as the leader.
     fn submit(&mut self, app: &mut A, cmd: A::Command, w: Pending<A>) {
         if self.rsm.role() != Role::Leader {
-            self.finish(app, w, Err(String::from("not the leader any more -- ask again")));
+            self.finish(app, w, Err(String::from("not the leader any more -- ask again")), 0);
             return;
         }
         if let Err(why) = app.before_submit(self, &cmd) {
-            self.finish(app, w, Err(why));
+            self.finish(app, w, Err(why), 0);
             return;
         }
         let Some(client) = self.session else {
-            self.finish(app, w, Err(String::from("the leader is not ready yet -- ask again in a moment")));
+            self.finish(app, w, Err(String::from("the leader is not ready yet -- ask again in a moment")), 0);
             return;
         };
         self.seq += 1;
@@ -468,7 +493,7 @@ impl<A: App> Core<A> {
             Ok(_) => {
                 self.pending.insert(self.seq, w);
             }
-            Err(e) => self.finish(app, w, Err(alloc::format!("not taken: {:?}", e))),
+            Err(e) => self.finish(app, w, Err(alloc::format!("not taken: {:?}", e)), 0),
         }
     }
 
@@ -517,7 +542,7 @@ impl<A: App> Core<A> {
         }
         let request = u64::from_le_bytes(data[..8].try_into().unwrap_or([0; 8]));
         let Some(cmd) = A::decode_command(&data[8..]) else {
-            self.answer_remote(app, m.from, request, Err(String::from("not a command")));
+            self.answer_remote(app, m.from, request, Err(String::from("not a command")), 0);
             return;
         };
         self.submit(app, cmd, Pending::Remote { to: m.from, request });
@@ -527,7 +552,7 @@ impl<A: App> Core<A> {
     fn on_answer(&mut self, app: &mut A, m: &Message) {
         let Some(data) = self.unframed(app, m) else { return };
         let sender = self.sender_node(app, m);
-        if data.len() < 9 || sender.is_none() {
+        if data.len() < ANSWER_HEAD || sender.is_none() {
             self.refused += 1;
             return;
         }
@@ -541,13 +566,14 @@ impl<A: App> Core<A> {
             }
             None => return,
         }
+        let index = u64::from_le_bytes(data[9..ANSWER_HEAD].try_into().unwrap_or([0; 8]));
         let outcome = if data[8] == 1 {
-            A::decode_answer(&data[9..]).ok_or_else(|| String::from("an answer that is none"))
+            A::decode_answer(&data[ANSWER_HEAD..]).ok_or_else(|| String::from("an answer that is none"))
         } else {
-            Err(String::from_utf8_lossy(&data[9..]).into_owned())
+            Err(String::from_utf8_lossy(&data[ANSWER_HEAD..]).into_owned())
         };
         let Some((w, _, _)) = self.forwarded.remove(&request) else { return };
-        self.finish(app, w, outcome);
+        self.finish(app, w, outcome, index);
     }
 
     /* ---- what the member does ---- */
@@ -560,17 +586,17 @@ impl<A: App> Core<A> {
                     self.session = Some(client);
                 }
             }
-            Event::Applied { client, seq, answer, .. } if Some(client) == self.session => {
+            Event::Applied { client, seq, index, answer } if Some(client) == self.session => {
                 if let Some(w) = self.pending.remove(&seq) {
                     let outcome = A::decode_answer(&answer).ok_or_else(|| String::from("an answer that is none"));
-                    self.finish(app, w, outcome);
+                    self.finish(app, w, outcome, index);
                 }
             }
             Event::Expired { client, seq } | Event::Stale { client, seq } | Event::Lost { client, seq }
                 if Some(client) == self.session =>
             {
                 if let Some(w) = self.pending.remove(&seq) {
-                    self.finish(app, w, Err(String::from("the member's session went -- ask again")));
+                    self.finish(app, w, Err(String::from("the member's session went -- ask again")), 0);
                 }
                 /* A leader is never left without one */
                 if self.rsm.role() == Role::Leader {
@@ -605,7 +631,7 @@ impl<A: App> Core<A> {
             /* What waited here is asked again by whoever waits */
             let waiting = core::mem::take(&mut self.pending);
             for (_, w) in waiting {
-                self.finish(app, w, Err(String::from("the leader changed -- ask again")));
+                self.finish(app, w, Err(String::from("the leader changed -- ask again")), 0);
             }
             self.session = None;
             self.registering = None;
@@ -624,7 +650,7 @@ impl<A: App> Core<A> {
         let gone: Vec<u64> = self.forwarded.iter().filter(|(_, &(_, _, to))| to != leader).map(|(&r, _)| r).collect();
         for r in gone {
             if let Some((w, _, _)) = self.forwarded.remove(&r) {
-                self.finish(app, w, Err(String::from("the leader changed -- ask again")));
+                self.finish(app, w, Err(String::from("the leader changed -- ask again")), 0);
             }
         }
     }
@@ -715,7 +741,7 @@ impl<A: App> Core<A> {
         let late: Vec<u64> = self.forwarded.iter().filter(|(_, (_, until, _))| *until <= now).map(|(&r, _)| r).collect();
         for r in late {
             if let Some((w, _, _)) = self.forwarded.remove(&r) {
-                self.finish(app, w, Err(String::from("no answer from the leader -- ask again")));
+                self.finish(app, w, Err(String::from("no answer from the leader -- ask again")), 0);
             }
         }
     }
@@ -753,14 +779,31 @@ pub fn run<A: App>((shared, m): (Arc<Shared<A>>, Member<A>)) {
             return;
         }
         app.turn(&mut core);
+        if let Some(why) = app.halt(&core) {
+            klog!(0, "{}: the member stopped: {}", A::LOG, why);
+            shared.view.with(|v| *v = Some(core.view(Some(why))));
+            return;
+        }
         core.keep_membership(&mut app);
         shared.view.with(|v| *v = Some(core.view(None)));
     }
 }
 
+/// Until this member's view has applied entry `index`, or VIEW_WAIT_MS has
+/// gone: a change the leader answered, applied there already.
+fn seen<A: App>(shared: &Shared<A>, index: u64) {
+    let end = boot_time_ns() + VIEW_WAIT_MS * NS_PER_MS;
+    while shared.applied().is_some_and(|a| a < index) && boot_time_ns() < end {
+        kcore::task::sleep_ms(ANSWER_POLL_MS);
+    }
+}
+
 /// `cmd`, as the member's state answers it -- asked of the member's task by
 /// the shell, again while the member cannot take it yet. `no_member` is
-/// what is said where there is no member to ask.
+/// what is said where there is no member to ask. Answered once this
+/// member's view holds the change too, so that what the shell reads next on
+/// this host has it, whichever member led -- or after VIEW_WAIT_MS of a view
+/// that lags further, the change made all the same.
 pub fn ask<A: App>(shared: &Shared<A>, cmd: &A::Command, no_member: &str) -> Result<A::Answer, String> {
     let mut last = String::from("no answer");
     let end = boot_time_ns() + ASK_TOTAL_MS * NS_PER_MS;
@@ -771,17 +814,20 @@ pub fn ask<A: App>(shared: &Shared<A>, cmd: &A::Command, no_member: &str) -> Res
         let slot: Slot<A> = Arc::new(Locked::new(None).ok_or_else(|| String::from("out of memory"))?);
         shared.requests.with(|q| q.push_back(Request { cmd: cmd.clone(), done: slot.clone() }));
         let until = (boot_time_ns() + (ANSWER_MS + 2000) * NS_PER_MS).min(end);
-        let outcome = loop {
+        let (outcome, index) = loop {
             if let Some(o) = slot.with(|s| s.take()) {
                 break o;
             }
             if boot_time_ns() >= until {
-                break Err(String::from("no answer -- ask again"));
+                break (Err(String::from("no answer -- ask again")), 0);
             }
             kcore::task::sleep_ms(ANSWER_POLL_MS);
         };
         match outcome {
-            Ok(a) => return Ok(a),
+            Ok(a) => {
+                seen(shared, index);
+                return Ok(a);
+            }
             Err(why) if why.ends_with("ask again") || why.ends_with("ask again in a moment") => {
                 last = why;
                 kcore::task::sleep_ms(ASK_RETRY_MS);

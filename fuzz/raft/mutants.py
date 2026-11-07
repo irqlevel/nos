@@ -25,6 +25,8 @@ REGISTRY = os.path.join('..', '..', 'registry', 'src', 'lib.rs')
 NBSMETA = os.path.join('..', '..', '..', 'storage', 'nbsmeta', 'src', 'lib.rs')
 OUT = os.path.join(ROOT, 'out', 'raft-mutants')
 BINARY = os.path.join(OUT, 'release', 'raft-fuzz')
+# The kernel's vendored crates, for nbsmeta's sha2 (scripts/raft-test.py).
+VENDOR = os.path.join(ROOT, 'src', 'crates', 'vendor')
 
 # name, what it takes out, the text it changes, what it becomes, and the
 # scenario written for that rule.
@@ -214,7 +216,9 @@ def digest(path):
 def build():
     return subprocess.run(['cargo', 'build', '--release', '--quiet', '--offline',
                            '--manifest-path', os.path.join(ROOT, 'fuzz', 'raft', 'Cargo.toml'),
-                           '--target-dir', OUT], cwd=ROOT,
+                           '--target-dir', OUT,
+                           '--config', 'source.crates-io.replace-with="vendored-sources"',
+                           '--config', 'source.vendored-sources.directory="%s"' % VENDOR], cwd=ROOT,
                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE).returncode
 
 
