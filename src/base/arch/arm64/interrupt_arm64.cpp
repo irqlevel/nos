@@ -7,6 +7,7 @@
 #include <kernel/cpu.h>
 #include <kernel/panic.h>
 #include <kernel/klog.h>
+#include <kernel/tracepoint.h>
 #include <hal/context.h>
 #include <hal/irqchip.h>
 
@@ -114,20 +115,34 @@ extern "C" void arm_irq_entry(Context* ctx)
             /* An empty first read is a real spurious interrupt; an empty
                re-read is just the dispatch loop draining */
             if (!handled)
+            {
+                /* Its records (tp::Irq), as any interrupt's: one taken for
+                   nothing */
+                tp::Irq irq;
+                if (unlikely(tp::Irq::on()))
+                    irq.begin(int_id, tp::IrqKind::Spurious);
                 InterruptStats::inc(IrqSpurious);
+            }
             return;
         }
         handled = true;
 
         if (int_id == CpuTable::IPI_VECTOR)
         {
-            /* EOIs itself (hal::irq_eoi in Cpu::ipi) before Schedule */
+            /* EOIs itself (hal::irq_eoi in Cpu::ipi) before Schedule; its
+               records are ip_interrupt's, ended before that too */
             ip_interrupt(ctx);
             continue;
         }
 
+        /* Each interrupt the loop takes, its records (tp::Irq): ended as the
+           scope is, at the `continue`, past the EOI */
         if (int_id >= Its::LPI_INT_ID_BASE)
         {
+            tp::Irq irq;
+            if (unlikely(tp::Irq::on()))
+                irq.begin(int_id, tp::IrqKind::Msi);
+
             Its::get_instance().handle_lpi(int_id);
             Gic::write_eoir(int_id);
             continue;
@@ -136,15 +151,20 @@ extern "C" void arm_irq_entry(Context* ctx)
         if (int_id == GenericTimer::get_instance().int_id())
         {
             /* Per-CPU scheduler tick: local_tick EOIs before it may
-               schedule() away, so it is not part of the generic path. */
+               schedule() away, so it is not part of the generic path --
+               and its records are its own, ended before that too. */
             GenericTimer::get_instance().local_tick(ctx);
             continue;
         }
+
+        tp::Irq irq;
 
         /* Registration is bounded to u8 INTIDs, but the GIC can report up
            to 1019 — never index int_ids with an unregistered-range id */
         if (int_id >= MAX_INT_IDS)
         {
+            if (unlikely(tp::Irq::on()))
+                irq.begin(int_id, tp::IrqKind::Stray);
             InterruptStats::inc(IrqDummy);
             Gic::write_eoir(int_id);
             continue;
@@ -154,6 +174,8 @@ extern "C" void arm_irq_entry(Context* ctx)
         /* Acquire, the other half of register_common's release: every handler
            counted is one whose pointer is there to call */
         const u8 count = __atomic_load_n(&ve.handler_count, __ATOMIC_ACQUIRE);
+        if (unlikely(tp::Irq::on()))
+            irq.begin(int_id, (count == 0) ? tp::IrqKind::Stray : tp::IrqKind::Line);
         if (count == 0)
         {
             InterruptStats::inc(IrqDummy);

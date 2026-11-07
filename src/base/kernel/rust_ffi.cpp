@@ -1308,6 +1308,13 @@ void dispatch_rust_interrupt(kernel::Context* ctx, int slot)
 {
     (void)ctx;
 
+    /* Its records (tp::Irq). A slot's stub is installed at its own vector
+       alone, RUST_IRQ_VECTOR_BASE on (kernel_interrupt_register_level): a
+       line shared with another slot's goes through the shared dispatch. */
+    kernel::tp::Irq irq;
+    if (unlikely(kernel::tp::Irq::on()))
+        irq.begin((u32)RUST_IRQ_VECTOR_BASE + (u32)slot, kernel::tp::IrqKind::Line);
+
     /* The legacy line, counted for the same reason as the MSI-X path below:
        the driver falls back to INTx when MSI-X is unavailable, and which of
        the two a card ended up on was not visible from the running machine. */
@@ -1523,6 +1530,10 @@ struct RustMsixSlot
     void (*handler)(void*) = nullptr;
     void* ctx = nullptr;
     bool used = false;
+    /* The CPU's vector the slot's interrupt comes at, as the table that
+       enabled it said (on_interrupt_register, before it unmasked the entry):
+       what its records name. An atomic, read by the interrupt on any CPU. */
+    u8 vector = 0;
     kernel::Atomic in_flight; /* ISRs currently executing Handler */
 };
 
@@ -1564,7 +1575,7 @@ static kernel::InterruptHandlerFn rust_msix_stub_table[RUST_MSIX_SLOT_COUNT] = {
     rust_msix_stub31,
 };
 
-extern "C" void dispatch_rust_msix(kernel::Context* ctx, int slot);
+static inline __attribute__((always_inline)) void run_rust_msix(int slot);
 
 class RustMsixSlotHandler : public kernel::InterruptHandler
 {
@@ -1574,7 +1585,7 @@ public:
     void on_interrupt_register(u8 irq, u8 vector) override
     {
         (void)irq;
-        (void)vector;
+        __atomic_store_n(&rust_msix_slots[slot_index_].vector, vector, __ATOMIC_RELAXED);
     }
 
     kernel::InterruptHandlerFn get_handler_fn() override
@@ -1582,12 +1593,13 @@ public:
         return rust_msix_stub_table[slot_index_];
     }
 
-    /* Object-based dispatch path (arm64 GIC/ITS LPIs). On x86 MSI-X goes
-       through the IDT stub -> dispatch_rust_msix instead, so this override is
-       unused there. */
+    /* Object-based dispatch path (arm64 GIC/ITS LPIs), whose records are
+       arm_irq_entry's. On x86 MSI-X goes through the IDT stub ->
+       dispatch_rust_msix instead, so this override is unused there. */
     void on_interrupt(kernel::Context* ctx) override
     {
-        dispatch_rust_msix(ctx, (int)slot_index_);
+        (void)ctx;
+        run_rust_msix((int)slot_index_);
     }
 };
 
@@ -1604,12 +1616,12 @@ static RustMsixSlotHandler& get_msix_slot_handler(ulong i)
     return *reinterpret_cast<RustMsixSlotHandler*>(&rust_msix_slot_handlers_buf[i]);
 }
 
-extern "C" {
-
-void dispatch_rust_msix(kernel::Context* ctx, int slot)
+/* A slot's interrupt, from whichever dispatch took it: x86's IDT stub
+   (dispatch_rust_msix, which records it) or arm64's LPIs (whose records
+   arm_irq_entry writes). In line in both, as it was in the one function
+   both called: no call more on a device's interrupt. */
+static inline __attribute__((always_inline)) void run_rust_msix(int slot)
 {
-    (void)ctx;
-
     /* Counted here because nothing counted it anywhere: IrqMsix existed only
        to name a row in `irqstat`, so that row read zero for the life of every
        boot -- including on a machine whose NIC had just delivered thirteen
@@ -1636,6 +1648,24 @@ void dispatch_rust_msix(kernel::Context* ctx, int slot)
         rust_msix_slots[slot].in_flight.dec();
     }
     hal::irq_eoi();
+}
+
+extern "C" {
+
+/* x86's MSI-X: a slot's IDT stub's, with its records (tp::Irq) */
+void dispatch_rust_msix(kernel::Context* ctx, int slot)
+{
+    (void)ctx;
+    kernel::tp::Irq irq;
+    if (unlikely(kernel::tp::Irq::on()))
+    {
+        u32 vector = 0;
+        if (slot >= 0 && (ulong)slot < RUST_MSIX_SLOT_COUNT)
+            vector = __atomic_load_n(&rust_msix_slots[slot].vector, __ATOMIC_RELAXED);
+        irq.begin(vector, kernel::tp::IrqKind::Msi);
+    }
+
+    run_rust_msix(slot);
 }
 
 unsigned long kernel_msix_register_handler(
