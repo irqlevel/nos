@@ -1209,18 +1209,20 @@ void alloc_huge(fuzz::Input& in)
     auto it = pool_blocks.find(phys);
     INVARIANT(it != pool_blocks.end() && !it->second, "alloc_huge_frame handed out 0x%lx, no free block of the pool",
         phys);
-    /* A block known zero first */
+    /* A block known zero first; with none, the block the zeroing is part way
+       through, which the zeroing then leaves for another */
     INVARIANT(pool_zeroed.empty() || pool_zeroed.count(phys), "alloc_huge_frame handed out 0x%lx with %zu blocks known "
         "zero, and it none of them", phys, pool_zeroed.size());
+    INVARIANT(!pool_zeroed.empty() || zeroing == PageTable::NO_HUGE_BLOCK || zeroing == phys / HUGE_BYTES,
+        "alloc_huge_frame handed out 0x%lx with no block known zero, not block %lu the zeroing is part way through",
+        phys, zeroing);
     fuzz::reached(pool_zeroed.count(phys) ? "a huge frame known zero" : "a huge frame to zero");
     pool_zeroed.erase(phys);
-    /* The block the zeroing was part way through is the new owner's, and the
-       zeroing goes on with another */
     if (zeroing == phys / HUGE_BYTES)
     {
         INVARIANT(tested_pt().huge_zero_block_ == PageTable::NO_HUGE_BLOCK, "block 0x%lx handed out part way through "
             "its zeroing, and the zeroing still on it", phys);
-        fuzz::reached("a huge frame taken from under the zeroing");
+        fuzz::reached("a huge frame taken from under the zeroing, its rest zeroed");
     }
     it->second = true;
     for (ulong i = 0; i < HUGE_PAGES; i++)
