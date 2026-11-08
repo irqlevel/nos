@@ -26,7 +26,9 @@
 #include <mm/memory_map.h>
 #include <mm/new.h>
 #include <mm/allocator.h>
+#include <mm/alloc_sites.h>
 #include <mm/heap_usage.h>
+#include "memsites.h"
 
 namespace kernel
 {
@@ -186,6 +188,121 @@ stdlib::Error test_heap_usage()
     if (!ok)
         return make_error(stdlib::Error::UNSUCCESSFUL);
     klog(0, "test_heap_usage: complete");
+    return make_success();
+}
+
+/* The Rust half of test_alloc_sites (kernel crate, memsites.rs): blocks
+   allocated by its memsites_probe and kept, and freed */
+extern "C" bool rust_memsites_probe(unsigned long count, unsigned long size);
+extern "C" void rust_memsites_release();
+
+/* What the sites whose own frame is the probe's function hold, as the
+   report would merge them, read off the heap now */
+static mm::AllocSites::Totals probe_totals(mm::AllocSites::Totals* totals)
+{
+    mm::AllocSites::Totals sum = {0, 0, 0};
+    memsites::collect(totals);
+    for (size_t i = 0; i < mm::AllocSites::SITES; i++)
+    {
+        if (totals[i].blocks == 0)
+            continue;
+        ulong frames[mm::AllocSites::FRAMES];
+        const size_t n = mm::AllocSites::get_instance().frames_of(i, frames);
+        char name[SymbolTable::DESCRIBE_MAX];
+        if (n == 0 || !SymbolTable::get_instance().describe_return(frames[memsites::own_position(frames, n)],
+            name, sizeof(name)))
+            continue;
+        if (stdlib::str_str(name, "memsites_probe") == nullptr)
+            continue;
+        sum.blocks += totals[i].blocks;
+        sum.asked += totals[i].asked;
+        sum.taken += totals[i].taken;
+    }
+    return sum;
+}
+
+/* memsites, the allocation-site tracker (mm/alloc_sites.h): blocks Rust
+   allocates from a function of a known name, through Vec's growth, Rust's
+   allocator shims and the kernel's GlobalAlloc, must be that function's
+   site's when read off the heap -- the pools' blocks by their tags, the
+   page runs by the big blocks' table -- every one of them and what each was
+   asked for; none once freed; and none given a site while it is off. */
+stdlib::Error test_alloc_sites()
+{
+    static const ulong TAG = 'TSit';
+    /* A Vec's own three words: the vector of the probe's blocks holds one a
+       block */
+    static const ulong VEC_BYTES = 3 * sizeof(ulong);
+    struct Case
+    {
+        ulong count;
+        ulong size;
+        const char* what;
+    };
+    static const Case CASES[] = {
+        {5, 200, "pool blocks"},
+        {3, 3 * consts::PAGE_SIZE, "page runs"},
+    };
+
+    auto& sites = mm::AllocSites::get_instance();
+    const bool was_on = sites.enabled();
+    auto* totals = static_cast<mm::AllocSites::Totals*>(
+        mm::alloc(mm::AllocSites::SITES * sizeof(mm::AllocSites::Totals), TAG));
+    if (totals == nullptr || !sites.enable())
+    {
+        if (totals != nullptr)
+            mm::free(totals);
+        klog(0, "test_alloc_sites: no memory for the tables");
+        return make_error(stdlib::Error::NO_MEMORY);
+    }
+
+    bool ok = true;
+    for (const Case& c : CASES)
+    {
+        if (!rust_memsites_probe(c.count, c.size))
+        {
+            klog(0, "test_alloc_sites: %s: the probe got no memory", c.what);
+            ok = false;
+            break;
+        }
+        /* Its blocks, and the vector holding them */
+        const ulong want_blocks = c.count + 1;
+        const ulong want_asked = c.count * c.size + c.count * VEC_BYTES;
+        mm::AllocSites::Totals got = probe_totals(totals);
+        if (got.blocks != want_blocks || got.asked != want_asked || got.taken < got.asked)
+        {
+            klog(0, "test_alloc_sites: %s: the probe's site holds %lu blocks of %lu bytes (taking %lu), not %lu of %lu",
+                c.what, got.blocks, got.asked, got.taken, want_blocks, want_asked);
+            ok = false;
+        }
+        rust_memsites_release();
+        got = probe_totals(totals);
+        if (got.blocks != 0)
+        {
+            klog(0, "test_alloc_sites: %s: %lu blocks still the probe's once freed", c.what, got.blocks);
+            ok = false;
+        }
+    }
+
+    /* Off: what is allocated then is nobody's site */
+    sites.disable();
+    if (ok && rust_memsites_probe(CASES[0].count, CASES[0].size))
+    {
+        const mm::AllocSites::Totals got = probe_totals(totals);
+        rust_memsites_release();
+        if (got.blocks != 0)
+        {
+            klog(0, "test_alloc_sites: off, and %lu blocks given the probe's site", got.blocks);
+            ok = false;
+        }
+    }
+    if (was_on)
+        sites.enable();
+    mm::free(totals);
+
+    if (!ok)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+    klog(0, "test_alloc_sites: complete");
     return make_success();
 }
 
@@ -3421,6 +3538,10 @@ stdlib::Error test()
         return err;
 
     err = test_heap_usage();
+    if (!err.ok())
+        return err;
+
+    err = test_alloc_sites();
     if (!err.ok())
         return err;
 

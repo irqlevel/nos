@@ -38,7 +38,8 @@ HEAP := fuzz/cpp/common/heap.cpp
 # keeps of them, whose constructors are kernel/eevdf.cpp's
 CPU := fuzz/cpp/common/cpu.cpp src/base/kernel/eevdf.cpp
 
-TARGETS := fdt memmap grubenv module pagetable heap cmdline multiboot acpi format ucode eevdf lineedit trace tracewin
+TARGETS := fdt memmap grubenv module pagetable heap allocsites cmdline multiboot acpi format ucode eevdf lineedit trace \
+           tracewin
 
 SRC_fdt := $(COMMON) fuzz/cpp/targets/fdt.cpp \
            src/base/arch/arm64/fdt.cpp src/base/arch/arm64/board.cpp
@@ -65,6 +66,9 @@ SRC_lineedit := $(COMMON) fuzz/cpp/targets/lineedit.cpp src/base/kernel/line_edi
 SRC_trace := $(COMMON) $(HEAP) fuzz/cpp/targets/trace.cpp src/base/kernel/trace_ring.cpp
 SRC_tracewin := $(COMMON) $(HEAP) fuzz/cpp/targets/tracewin.cpp src/base/kernel/trace_ring.cpp \
                 src/base/kernel/trace_window.cpp
+# memsites' tables, over the stand-in heap; the walk they read the pools by
+# is the heap target's to hold
+SRC_allocsites := $(COMMON) $(HEAP) fuzz/cpp/targets/allocsites.cpp src/base/mm/alloc_sites.cpp
 # The kernel heap itself: no heap.cpp under it
 SRC_heap := $(COMMON) $(CPU) fuzz/cpp/targets/heap.cpp \
             src/base/mm/allocator.cpp src/base/mm/pool.cpp src/base/mm/page_allocator.cpp \
