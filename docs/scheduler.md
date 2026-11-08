@@ -166,7 +166,10 @@ switch_context(next->rsp_, &curr->rsp_, &TaskQueue::switch_complete, next)
 `switch_context` pushes the callee-saved state (x86: `PushAll` — all GPRs and
 the flags; arm64: x19–x30 and DAIF), stores the old stack pointer through
 `currSp`, loads the new one, and **calls the completion callback on the new
-stack** before popping the incoming task's registers.
+stack** before popping the incoming task's registers. On arm64 it starts
+with a `dsb ish`: the task it switches away from may next run on another
+CPU, and a `TLBI` it issued here is complete only once this CPU passes a
+`DSB` ([TLB shootdown](paging.md#tlb-shootdown-and-the-deadlock-it-can-cause)).
 
 That callback is the whole trick. The queue lock, the outgoing task's lock
 and the incoming task's lock were all taken by the *previous* task, on the

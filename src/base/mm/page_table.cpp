@@ -1625,8 +1625,18 @@ ulong PageTable::huge_pool_window(ulong phy_addr)
 /* Sentinel for tmp_map_page_array_ when page was mapped without a Page struct (e.g. reserved ACPI region). */
 static Page* const TMP_MAP_DIRECT_SENTINEL = (Page*)1;
 
+/* A slot is flushed of what it held on the CPU that maps it and on the CPU
+   that unmaps it, and on no other: the caller is held to one CPU from the
+   map to the unmap (preempt_disable_task, a spinlock, interrupts off), or a
+   move half way leaves the translation cached where the next user of the
+   slot reads and writes through it. What maps once for good -- the VGA
+   buffer, the local APIC, the IO-APIC -- does it before the scheduler
+   preempts, which is before any other CPU runs. Either is checked at both
+   ends: a caller that could be moved is a panic at its first call. */
 ulong PageTable::tmp_map_page(ulong phy_addr)
 {
+    BUG_ON(preempt_can_move());
+
     stdlib::AutoLock lock(tmp_map_lock_);
 
     BUG_ON(phy_addr & (consts::PAGE_SIZE - 1));
@@ -1723,6 +1733,8 @@ void PageTable::unmap_frame_slot(ulong virt_addr)
 
 ulong PageTable::tmp_unmap_page(ulong virt_addr)
 {
+    BUG_ON(preempt_can_move()); /* as tmp_map_page */
+
     stdlib::AutoLock lock(tmp_map_lock_);
 
     BUG_ON(virt_addr & (consts::PAGE_SIZE - 1));

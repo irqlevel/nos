@@ -47,6 +47,15 @@ Task* preempt_current_task();
    SpinLock, RawRwSpinLock) keeps it for as long as it is held. */
 bool preempt_can_block();
 
+/* Could the caller be moved to another CPU before its next line? Not with
+   interrupts off or preemption disabled, not off a task stack, and not
+   before the scheduler preempts at all. What acts on the CPU it is on -- a
+   TLB flushed here and the other CPUs asked to flush theirs, a tmp_map slot
+   flushed here and used here -- holds that it cannot be:
+   BUG_ON(preempt_can_move()), which fails at the first call made unheld,
+   not only the one a move happened to cut. */
+bool preempt_can_move();
+
 /*
  * Save rflags, conditionally disable preemption, disable interrupts.
  * Bit 63 of the returned flags records whether preempt_disable() was
