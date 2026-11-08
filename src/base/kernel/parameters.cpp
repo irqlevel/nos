@@ -54,6 +54,7 @@ Parameters::Parameters()
     , huge_pool_percent_(0)
     , huge_pool_bytes_(0)
     , zero_free_md_(ZeroFreeOn)
+    , heap_check_(false)
     , rx_poll_(false)
     , log_level_(DEFAULT_LOG_LEVEL)
     , dns_enabled_(false)
@@ -215,6 +216,11 @@ bool Parameters::is_zero_free_off()
 bool Parameters::is_zero_free_verify()
 {
     return zero_free_md_ == ZeroFreeVerify;
+}
+
+bool Parameters::is_heap_check()
+{
+    return heap_check_;
 }
 
 ulong Parameters::get_huge_pool_bytes(ulong total_bytes)
@@ -549,6 +555,15 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
             zero_free_md_ = ZeroFreeOff;
         else if (stdlib::str_cmp(value, "verify") == 0)
             zero_free_md_ = ZeroFreeVerify;
+        else
+            klog(0, "Unknown value %s, key %s", value, key);
+    }
+    else if (stdlib::str_cmp(key, "heapcheck") == 0)
+    {
+        if (stdlib::str_cmp(value, "on") == 0)
+            heap_check_ = true;
+        else if (stdlib::str_cmp(value, "off") == 0)
+            heap_check_ = false;
         else
             klog(0, "Unknown value %s, key %s", value, key);
     }

@@ -136,6 +136,17 @@ ipc ping <to> [count=N] [bytes=B] [window=W] [bulk] [timeout=MS]
                         messages to a name, here or name@host, each answer held to what was sent
 ```
 
+Every 8 bytes of a ping hold its reference and their own place in it, so
+the first answer that is not its message's bytes is said in full -- how
+many words differ, in how many runs, and what the first holds read as a
+ping's: another message's bytes, its own from elsewhere, or neither. A
+round trip is timed from before the send, so a send that waits, or gives
+its CPU to the task it woke, is counted in it. kernel.echo holds every
+ping to the same pattern as it comes, before it goes back -- `ipc echo`
+counts them, and the first few it finds wrong are said in the log -- so a
+wrong answer says which way it was made wrong: on its way to the echo, or
+on its way back.
+
 ## What keeps it sound
 
 - **Pull, never push.** Nothing in the channel calls anybody's code: a

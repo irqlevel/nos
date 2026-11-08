@@ -68,7 +68,8 @@ SRC_tracewin := $(COMMON) $(HEAP) fuzz/cpp/targets/tracewin.cpp src/base/kernel/
 # The kernel heap itself: no heap.cpp under it
 SRC_heap := $(COMMON) $(CPU) fuzz/cpp/targets/heap.cpp \
             src/base/mm/allocator.cpp src/base/mm/pool.cpp src/base/mm/page_allocator.cpp \
-            src/base/mm/va_allocator.cpp src/base/lib/bitmap.cpp src/base/lib/error.cpp
+            src/base/mm/va_allocator.cpp src/base/lib/bitmap.cpp src/base/lib/error.cpp \
+            src/base/kernel/parameters.cpp
 
 all: $(TARGETS:%=$(OUT)/bin/%)
 
