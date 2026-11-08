@@ -935,6 +935,7 @@ Page* PageTable::take_free_page_no_lock(bool zeroed_first, bool& zeroed)
 
     Page* page = CONTAINING_RECORD(list->remove_head(), Page, list_entry);
     page->list_entry.init(); /* Self-pointing = not on any list */
+    check_unreferenced(page);
     zeroed = (list == &zeroed_pages_list_);
     /* The mark and the list are changed together, under Lock: a page on the
        zeroed list without it, or on the other with it, is the two come
@@ -950,6 +951,20 @@ Page* PageTable::take_free_page_no_lock(bool zeroed_first, bool& zeroed)
         zeroed_pages_count_--;
     }
     return page;
+}
+
+/* A page taken off a free list has its descriptor's own reference and no
+   other: every mapping holds one more (map_range_locked) and gives it back
+   as it goes (unmap_range_locked, under Lock with the free), so one with
+   more is a page freed while something still maps it -- about to be handed
+   to a second owner while the first writes it, each over the other's data
+   with nothing to say so. Under Lock. */
+void PageTable::check_unreferenced(Page* page)
+{
+    const long refs = page->ref_count.get();
+    if (refs != 1)
+        PANIC("mm: free page 0x%lX has %ld references, not 1: freed while still mapped", page->get_phy_address(),
+            refs);
 }
 
 void PageTable::unlist_free_page_no_lock(Page* page)
@@ -1107,6 +1122,7 @@ Page* PageTable::take_run_no_lock(ulong count, bool* zeroed, ulong& examined)
                 Page* p = &page_array_[base_index + j];
                 zeroed[j] = p->is_zeroed();
                 unlist_free_page_no_lock(p);
+                check_unreferenced(p);
             }
             return first;
         }
@@ -1161,6 +1177,14 @@ void PageTable::free_page_no_lock(Page* page)
        being zeroed -- and freed a second time. */
     if (page->is_zeroed())
         PANIC("free_page: page 0x%lX is free already: freed twice", page->get_phy_address());
+    /* Nor is one handed out on a list: its entry points at itself. One on a
+       list is free already, not zeroed yet, and freed a second time -- put
+       on the list again, its old neighbours would still point at it, and a
+       take of one of them would hand the page out once more while its
+       first owner still has it: two owners of one frame, each writing over
+       the other's page, and nothing to say so. */
+    if (page->list_entry.flink != &page->list_entry)
+        PANIC("free_page: page 0x%lX is on a free list already: freed twice", page->get_phy_address());
     /* Back as its owner left it: onto the other list, whose hot end the
        allocations take from */
     free_pages_count_++;

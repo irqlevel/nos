@@ -5,6 +5,7 @@
 #include <kernel/panic.h>
 #include <kernel/klog.h>
 #include <kernel/cpu.h>
+#include <kernel/parameters.h>
 #include <lib/list_entry.h>
 
 namespace kernel
@@ -145,6 +146,21 @@ bool FixedPageAllocator::contains(void* addr)
     return va_alloc_.contains((ulong)addr);
 }
 
+bool FixedPageAllocator::free_keeping_va(void* addr)
+{
+    if (!va_alloc_.contains((ulong)addr))
+        return false;
+
+    PageTable::get_instance().unmap_pages((ulong)addr, page_count_, true);
+    kernel::CpuTable::get_instance().invalidate_tlb_range((ulong)addr, page_count_);
+    return true;
+}
+
+void FixedPageAllocator::free_va(void* addr)
+{
+    va_alloc_.free((ulong)addr);
+}
+
 PageAllocatorImpl::PageAllocatorImpl()
 {
 }
@@ -196,6 +212,19 @@ bool PageAllocatorImpl::setup()
         for (size_t i = 0; i < CPU_KEPT_LOGS; i++)
             cpu.sizes[i].limit = stdlib::min<ulong>(CPU_KEPT_PAGES >> i, kept_blocks_[i].limit);
     }
+
+    /* Nothing held back yet: the addresses the quarantine holds are of the
+       allocators set up above */
+    for (auto& q : quarantine_)
+    {
+        stdlib::AutoLock lock(q.lock);
+        q.next = 0;
+        q.count = 0;
+    }
+    heap_check_ = Parameters::get_instance().is_heap_check();
+    if (heap_check_)
+        klog(0, "mm: heapcheck=on: a freed block of the heap is unmapped, nothing kept, its address held back for "
+            "%lu frees of its size", QUARANTINE);
 
     return true;
 }
@@ -249,8 +278,38 @@ void PageAllocatorImpl::free(void* addr)
     if (!class_of(addr, log))
         PANIC("Can't free addr 0x%p", addr);
 
+    if (heap_check_)
+    {
+        release_quarantined(log, addr);
+        return;
+    }
     if (!keep(log, addr))
         release(addr);
+}
+
+/* heapcheck=on's free: the block's pages given back and every CPU's
+   translation of it gone now, its address only once QUARANTINE more of its
+   size have gone the same way -- until then nothing maps it, and a read or
+   a write through it faults where it is made. Called as Free is, with no
+   spin lock held: the unmap shoots down every other CPU's TLB. */
+void PageAllocatorImpl::release_quarantined(size_t log, void* addr)
+{
+    if (!fixed_pg_alloc_[log].free_keeping_va(addr))
+        PANIC("Can't free addr 0x%p", addr);
+
+    ulong oldest = 0;
+    {
+        Quarantine& q = quarantine_[log];
+        stdlib::AutoLock lock(q.lock);
+        if (q.count == QUARANTINE)
+            oldest = q.held[q.next];
+        else
+            q.count++;
+        q.held[q.next] = reinterpret_cast<ulong>(addr);
+        q.next = (q.next + 1) % QUARANTINE;
+    }
+    if (oldest != 0)
+        fixed_pg_alloc_[log].free_va(reinterpret_cast<void*>(oldest));
 }
 
 bool PageAllocatorImpl::class_of(void* addr, size_t& log)
@@ -399,6 +458,15 @@ void* PageAllocatorImpl::take_kept(size_t log)
         list.count--;
     }
 
+    /* Every block a cache or kept_blocks_ holds was marked on its way in
+       (keep, keep_shared), and nobody writes a kept block. One taken without
+       the mark was taken before -- kept twice, and handed out twice -- or
+       written by a holder that had freed it: either way a second owner of
+       memory somebody still uses, stopped here rather than found later as
+       its data gone wrong. */
+    if (block->mark != KEPT_MARK)
+        PANIC("take_kept: kept block 0x%p of %lu pages is not marked (0x%lX): kept twice, or written after its free",
+            static_cast<void*>(block), 1UL << log, block->mark);
     /* The caller's now: unmarked, so that its free does not go looking */
     block->mark = 0;
     return block;
