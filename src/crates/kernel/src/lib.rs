@@ -5,6 +5,7 @@ extern crate alloc;
 
 mod crc32;
 mod frames;
+mod memsites;
 mod one_event;
 mod ring;
 mod sha256;

@@ -24,6 +24,7 @@
 #include "cmd.h"
 #include <mm/new.h>
 #include <mm/allocator.h>
+#include <mm/alloc_sites.h>
 #include <mm/heap_usage.h>
 #include <mm/page_allocator.h>
 #include <mm/page_table.h>
@@ -267,19 +268,35 @@ void* kernel_alloc(unsigned long size, unsigned long align)
     if (align == 0 || (align & (align - 1)) != 0)
         PANIC("kernel_alloc: bad align %lu", align);
 
+    /* While memsites is on, the block's owner is where it is allocated from:
+       the frames above this one (mm/alloc_sites.h) */
+    auto& sites = kernel::mm::AllocSites::get_instance();
+    ulong tag = RUST_ALLOC_TAG;
+    if (unlikely(sites.enabled()))
+    {
+        const ulong site = sites.site_tag(reinterpret_cast<ulong>(__builtin_frame_address(0)));
+        if (site != 0)
+            tag = site;
+    }
+
     /* alloc_uninit: GlobalAlloc::alloc promises nothing about the contents,
        and alloc_zeroed zeroes them on the Rust side. */
     auto& usage = kernel::mm::rust_heap_usage();
     unsigned long request = 0;
     void* raw = nullptr;
     if (rust_heap_request(size, align, request))
-        raw = kernel::mm::alloc_uninit(request, RUST_ALLOC_TAG);
+        raw = kernel::mm::alloc_uninit(request, tag);
     if (raw == nullptr)
     {
         usage.refuse();
         return nullptr;
     }
-    usage.add(size, kernel::mm::AllocatorImpl::footprint(request));
+    const size_t taken = kernel::mm::AllocatorImpl::footprint(request);
+    usage.add(size, taken);
+    /* A block of the page allocator's carries no tag: its site is noted
+       aside until its free */
+    if (tag != RUST_ALLOC_TAG && kernel::mm::AllocatorImpl::from_pages(raw))
+        sites.big_note(raw, tag, request, taken);
 
     if (align <= 8)
         return raw;
@@ -308,6 +325,9 @@ void kernel_free(void* ptr, unsigned long size, unsigned long align)
 
     if (align > 8)
         ptr = ((void**)ptr)[-1];
+    /* Out of memsites' table before the block can be anybody else's */
+    if (kernel::mm::AllocatorImpl::from_pages(ptr))
+        kernel::mm::AllocSites::get_instance().big_forget(ptr);
     kernel::mm::free(ptr);
 }
 

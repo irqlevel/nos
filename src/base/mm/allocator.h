@@ -21,6 +21,15 @@ public:
 	virtual void free(void* ptr) = 0;
 };
 
+/* What a walk of the heap (AllocatorImpl::walk) hands its visitor: each
+   block of the pools an owner has -- its tag, the size it was asked for,
+   and what it takes of RAM (AllocatorImpl::footprint) */
+class HeapVisitor
+{
+public:
+	virtual void block(ulong tag, size_t asked, size_t taken) = 0;
+};
+
 /* final, with a destructor that is not virtual: the per-CPU caches below are
    aligned to cache lines, which makes the class over-aligned, and a virtual
    destructor of an over-aligned class calls the aligned operator delete the
@@ -52,11 +61,27 @@ public:
 	   (HeapUsage), worked out as alloc_block works it out. */
 	static size_t footprint(size_t size);
 
+	/* Whether a block the heap handed out is the page allocator's -- half
+	   a page and more, which starts a page -- rather than a pool's, which
+	   never does (the pool's and the allocator's headers come first): what
+	   free tells the two apart by */
+	static bool from_pages(const void* ptr)
+	{
+		return (reinterpret_cast<ulong>(ptr) & (consts::PAGE_SIZE - 1)) == 0;
+	}
+
 	/* Give back to the page allocator what the heap keeps for its next
 	   allocations -- the pools' empty pages, then the freed blocks the page
 	   allocator holds mapped; whether there was any. Called without a spin
 	   lock held. */
 	bool trim();
+
+	/* Every block of the pools an owner has, to visitor, a pool at a time
+	   under its lock (Pool::walk): what memsites reads the heap's owners by
+	   (mm/alloc_sites.h). A block of the page allocator's -- half a page and
+	   more -- carries no tag and is not walked. The visitor runs under a
+	   pool's lock: it must not allocate or free. */
+	void walk(HeapVisitor& visitor);
 private:
 	AllocatorImpl(PageAllocator* pg_alloc);
 	~AllocatorImpl();

@@ -17,6 +17,12 @@ void* alloc_uninit(size_t size, ulong tag);
 
 void free(void* ptr);
 
+class HeapVisitor;
+
+/* Every block of the heap's pools an owner has, to visitor (allocator.h,
+   AllocatorImpl::walk): what memsites reads the heap's owners by */
+void walk_heap(HeapVisitor& visitor);
+
 void* alloc_map_pages(size_t num_pages, ulong* phys_addr);
 
 void unmap_free_pages(void* ptr);
