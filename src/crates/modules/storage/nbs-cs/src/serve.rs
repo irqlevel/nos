@@ -17,6 +17,12 @@
 //!   (`Question::Verify`) first.
 //! - **What the metadata no longer has** freed every half minute: chunks
 //!   freed or their number another chunk's now, fences of volumes gone.
+//! - **The joins** this cs is the joiner of (N9), asked of the mds with its
+//!   devices: each copied by nbswire's `copy`, its pulls sent to the set's
+//!   active members and their answers handed back, its end asked of the
+//!   mds. A join found as the cs starts is given up: what clients wrote to
+//!   it was marked in memory alone, and a copy without those marks could
+//!   write over them.
 //!
 //! While it waits for the mds, what else comes is kept, in order, and served
 //! after. A client's requests and their answers go between hosts by the
@@ -32,6 +38,7 @@ use kcore::ipc::{Limits, Mailbox, Message, Scope, TAG_BULK};
 use kcore::klog;
 use kcore::time::{boot_time_ns, Duration};
 use nbscs::{Identity as DevIdentity, OpenError, SlotState, Store};
+use nbswire::copy::{self, Copy};
 use nbswire::serve::{serve, Vouched};
 use nbswire::{Answer, Answered, Op, Query, Question, Refusal, Reply, Request, Told, CS_NAME, LIST_MAX, TAG_ANSWER,
               TAG_QUERY, TAG_REQUEST, TAG_TOLD};
@@ -51,8 +58,12 @@ const BACKLOG_MAX: usize = 1024;
 /// How often what the shell shows is made again, at most: it walks the chunks.
 const SHOW_EVERY_MS: u64 = 1_000;
 const NS_PER_MS: u64 = 1_000_000;
-/// An answer's tag, as it goes.
+/// An answer's tag, as it goes; and a request's, a copy's pull.
 const ANSWER: u32 = TAG_ANSWER | TAG_BULK;
+const REQUEST: u32 = TAG_REQUEST | TAG_BULK;
+/// How long a copy done, or given up, waits before its end is asked of the
+/// mds again where it could not be.
+const END_AGAIN_MS: u64 = 1_000;
 
 /// The cs's mailbox, and its asks of this host's mds: a part of its own, so
 /// that a request's check asks the mds while the store is lent to `serve`.
@@ -125,6 +136,13 @@ struct Server {
     shown_at: u64,
     served: u64,
     refused: u64,
+    /// The joins this cs is the joiner of, each being copied (N9); the
+    /// copies' request ids; whether the joins found as it started were
+    /// given up; when a copy's end may be asked again.
+    copies: Vec<Copy>,
+    copy_id: u64,
+    joins_seen: bool,
+    end_at: u64,
 }
 
 pub fn run(shared: Arc<Shared>) {
@@ -145,7 +163,7 @@ pub fn run(shared: Arc<Shared>) {
     let mut s = Server {
         link, store: Store::new(), vouched: Vouched::new(), cluster: [0; 16], cs: None, taken: BTreeSet::new(),
         trouble: Vec::new(), serving: false, changed: false, idents: Vec::new(), identity_at: 0, garbage_at: 0,
-        shown_at: 0, served: 0, refused: 0,
+        shown_at: 0, served: 0, refused: 0, copies: Vec::new(), copy_id: 1, joins_seen: false, end_at: 0,
     };
     s.main();
     /* Everything written so far durable before the queues go */
@@ -159,6 +177,9 @@ impl Server {
             if now >= self.identity_at {
                 self.identity_at = now + IDENTITY_EVERY_MS * NS_PER_MS;
                 self.refresh();
+                if self.serving {
+                    self.joins();
+                }
             }
             if now >= self.garbage_at && !self.taken.is_empty() {
                 self.garbage_at = now + GARBAGE_EVERY_MS * NS_PER_MS;
@@ -169,10 +190,15 @@ impl Server {
                 None => self.link.mb.recv(Duration::from_millis(TURN_MS)),
             };
             if let Some(m) = m {
-                if m.tag & !TAG_BULK == TAG_REQUEST {
-                    self.request(&m);
+                match m.tag & !TAG_BULK {
+                    TAG_REQUEST => self.request(&m),
+                    TAG_ANSWER => self.copy_answer(&m),
+                    /* A late answer of the mds's, or the channel's own: dropped */
+                    _ => {}
                 }
-                /* A late answer of the mds's, or the channel's own: dropped */
+            }
+            if self.serving {
+                self.copy_turn();
             }
             if self.changed || boot_time_ns() >= self.shown_at {
                 self.changed = false;
@@ -301,6 +327,124 @@ impl Server {
                 if let Err(e) = self.store.drop_fence(v) {
                     klog!(0, "nbs-cs: volume {}'s fence not taken off: {:?}", v, e);
                 }
+            }
+        }
+    }
+
+    /* ---- joins (N9) ---- */
+
+    /// The joins this cs is the joiner of, as the mds has them: a copy
+    /// begun for a new one -- its writes marked from now on -- refreshed for
+    /// one it has, and dropped for one gone, its marks with it.
+    fn joins(&mut self) {
+        let (Some(me), Some(Told::Joins(views))) = (self.cs, self.link.ask(Question::Joins)) else { return };
+        if !self.joins_seen {
+            self.joins_seen = true;
+            for v in &views {
+                klog!(0, "nbs-cs: the join of set {} given up: the cs started again", v.set);
+                self.end(v.set, v.since, false);
+            }
+            return;
+        }
+        let mut kept = Vec::new();
+        for c in core::mem::take(&mut self.copies) {
+            if views.iter().any(|v| v.set == c.set() && v.since == c.since()) {
+                kept.push(c);
+            } else {
+                klog!(1, "nbs-cs: the join of set {} is over", c.set());
+                self.store.leave(c.set());
+            }
+        }
+        self.copies = kept;
+        /* Marks a client's write began for a join that is over */
+        for (set, since) in self.store.joined() {
+            if !views.iter().any(|v| v.set == set && v.since == since) {
+                self.store.leave(set);
+            }
+        }
+        let now = boot_time_ns();
+        for v in views {
+            match self.copies.iter_mut().find(|c| c.set() == v.set && c.since() == v.since) {
+                Some(c) => c.refresh(v),
+                None => {
+                    klog!(1, "nbs-cs: joining set {} in place {} from its {} active members", v.set, v.place,
+                          v.sources.len());
+                    self.store.join(v.set, v.since);
+                    let found = self.store.found_in(v.set);
+                    self.copies.push(Copy::new(v, me, found, now));
+                }
+            }
+        }
+    }
+
+    /// The copies' turn: what each asks sent, and each done or given up
+    /// asked of the mds.
+    fn copy_turn(&mut self) {
+        let now = boot_time_ns();
+        let mut out = Vec::new();
+        for c in self.copies.iter_mut() {
+            c.step(&mut self.store, now, &mut self.copy_id, &mut out);
+        }
+        self.copy_out(out);
+        if now < self.end_at {
+            return;
+        }
+        let ended: Vec<(u32, u32, bool)> = self.copies.iter().filter_map(|c| match c.state() {
+            copy::State::Done => Some((c.set(), c.since(), true)),
+            copy::State::Failed(_) => Some((c.set(), c.since(), false)),
+            _ => None,
+        }).collect();
+        for (set, since, done) in ended {
+            self.end(set, since, done);
+        }
+    }
+
+    /// Join `set` begun at `since` ended -- `done`, the cs taking its place,
+    /// or given up -- as the mds proposes it: its copy and its marks dropped
+    /// once that is applied, or once it is not the join it was; asked again
+    /// in a moment where the mds could not.
+    fn end(&mut self, set: u32, since: u32, done: bool) {
+        let question = if done { Question::JoinDone { set, since } } else { Question::GiveUp { set, since } };
+        match self.link.ask(question) {
+            Some(Told::Verified) => {
+                if done {
+                    klog!(0, "nbs-cs: set {} joined: this cs is its member now", set);
+                }
+            }
+            Some(Told::Refused(Refusal::NotTheJoiner)) => klog!(1, "nbs-cs: the join of set {} was over", set),
+            _ => {
+                self.end_at = boot_time_ns() + END_AGAIN_MS * NS_PER_MS;
+                return;
+            }
+        }
+        self.copies.retain(|c| !(c.set() == set && c.since() == since));
+        self.store.leave(set);
+        self.changed = true;
+    }
+
+    /// An answer to a copy's request.
+    fn copy_answer(&mut self, m: &Message) {
+        let Some(a) = Answer::decode(&m.data) else { return };
+        let now = boot_time_ns();
+        let mut out = Vec::new();
+        if let Some(c) = self.copies.iter_mut().find(|c| c.sent(a.id)) {
+            c.answer(&mut self.store, a.id, &a.reply, now, &mut out);
+            c.step(&mut self.store, now, &mut self.copy_id, &mut out);
+        }
+        self.copy_out(out);
+    }
+
+    fn copy_out(&mut self, out: Vec<copy::Out>) {
+        for o in out {
+            match o {
+                /* A source on another host always: a set's three are on
+                   three, and its joiner is none of them. Not sent -- no way
+                   there now -- it is asked again once its answer is late */
+                copy::Out::Send { host, bytes } => {
+                    let to = alloc::format!("{}@{}", CS_NAME, host);
+                    let _ = self.link.mb.send_to(&to, REQUEST, 0, &bytes);
+                }
+                copy::Out::Say(line) => klog!(0, "{}", line),
             }
         }
     }

@@ -778,7 +778,8 @@ impl Session {
                 }
                 self.ask_out(cs, what, true, now, bufs, out);
             }
-            Refusal::NoRoom | Refusal::Bad | Refusal::TooManyFences => {
+            /* A joiner's (N9), never a client's: as a request the cs found bad */
+            Refusal::NoRoom | Refusal::Bad | Refusal::TooManyFences | Refusal::NotHeld | Refusal::NotTheJoiner => {
                 self.subs.remove(&id);
                 out.push(Out::Say(alloc::format!("nbs: cs {} refused a request of volume {}: {}", cs, self.name,
                                                  why.says())));

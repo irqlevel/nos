@@ -35,12 +35,18 @@ message read back as itself, and spoiled bytes read as none or as a message
 that encodes to them. NBS end to end, the `cluster` target (nbsclient, N8):
 the client's session through six hosts' cs's and mds, hosts that crash and
 writers taken over, held to every write done on every replica in, every
-read, what a crash may leave, the fences, and the replicas alike.
+read, what a crash may leave, the fences, and the replicas alike. A join's
+copy, the `join` target (nbswire's `copy`, N9): one set copied from a source
+onto its joiner over a network that drops, repeats and reorders, writers of
+the map now and of maps before, rejoins, rot, a member back, and the
+joiner's power failing mid-copy -- at the end, every chunk of the set on the
+joiner is the source's.
 
     python3 scripts/nbs-fuzz.py                              # the gate: every target
     python3 scripts/nbs-fuzz.py --seconds 600                # a meta campaign from seed 1
     python3 scripts/nbs-fuzz.py --target cs --seconds 600    # a cs campaign
     python3 scripts/nbs-fuzz.py --target cluster --seconds 600   # the client's
+    python3 scripts/nbs-fuzz.py --target join --seconds 600      # the copy's
     python3 scripts/nbs-fuzz.py --mutants                    # and fuzz/nbs/mutants.py
 
 fuzz/nbs/mutants.py takes one rule at a time out of the crate and must see the
@@ -63,7 +69,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--seed", type=int, default=1, help="the campaign's first seed (1)")
     p.add_argument("--seconds", type=int, help="a campaign this long, instead of the gate")
-    p.add_argument("--target", choices=["meta", "cs", "wire", "cluster"], default="meta",
+    p.add_argument("--target", choices=["meta", "cs", "wire", "cluster", "join"], default="meta",
                    help="the campaign's target (meta)")
     p.add_argument("--mutants", action="store_true", help="the mutants too, after the gate")
     args = p.parse_args()

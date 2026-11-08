@@ -24,6 +24,7 @@
 
 extern crate alloc;
 
+pub mod copy;
 pub mod mds;
 pub mod serve;
 
@@ -73,6 +74,20 @@ pub enum Op<'a> {
     /// Whether the cs is there and serving: the leader's look at a cs a client
     /// says did not answer it (N8).
     Ping,
+    /// A joiner's asks of a source, an active member of the set it joins
+    /// (N9): each names the joiner, and the set's version it knows, which
+    /// the source's mds vouches for -- at entry `index` at least.
+    /// The set's chunks the source holds from chunk number `from` on.
+    Holdings { set: u32, from: u32, joiner: u32, version: u32, index: u64 },
+    /// `len` bytes of the chunk at `offset`: the chunk's epoch moved on at
+    /// the source before it reads.
+    Pull { chunk: ChunkRef, joiner: u32, index: u64, offset: u32, len: u32 },
+    /// The CRC-32C of each `nbscs::GRANULE` of the chunk from `offset` for
+    /// `len` bytes, its epoch moved on as a pull's.
+    Sums { chunk: ChunkRef, joiner: u32, index: u64, offset: u32, len: u32 },
+    /// The chunk's epoch moved on for a member back that holds it as it
+    /// was, and the version it was last written at told.
+    Touch { chunk: ChunkRef, joiner: u32, index: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,6 +126,11 @@ pub enum Refusal {
     NoMds,
     /// The cs is not serving yet: its devices not taken in.
     NotReady,
+    /// A pull or a sum of a chunk the cs does not hold (N9).
+    NotHeld,
+    /// The mds: the cs named is not the set's joiner, or not at that
+    /// version (N9).
+    NotTheJoiner,
 }
 
 /// What a cs answers.
@@ -126,6 +146,13 @@ pub enum Reply<'a> {
     /// The volume's chunks held open: number, incarnation, generation.
     Held(Vec<(u32, u32, u64)>),
     Refused(Refusal),
+    /// A set's chunks the source holds (N9): number, incarnation, volume,
+    /// the version each was last written at.
+    Chunks(Vec<(u32, u32, u32, u32)>),
+    /// A sum of each granule asked.
+    Sums(Vec<u32>),
+    /// A touch's: the version the chunk was last written at.
+    Written(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,6 +175,37 @@ pub enum Question {
     Live { chunks: Vec<(u32, u32)> },
     /// Which of these volumes are gone.
     Volumes { volumes: Vec<u32> },
+    /// A joiner's ask of this cs, a source (N9): cs `joiner` the joiner of
+    /// set `set` at its version `version`, this cs an active member of it --
+    /// at entry `index` at least.
+    VerifyJoin { set: u32, joiner: u32, version: u32, index: u64 },
+    /// The joins this host's cs is the joiner of.
+    Joins,
+    /// The join of set `set`, begun at `since`, done: its end proposed --
+    /// the cs takes its place -- and told once it is applied.
+    JoinDone { set: u32, since: u32 },
+    /// The join given up: the cs started again, and its marks are gone.
+    GiveUp { set: u32, since: u32 },
+}
+
+/// A join this host's cs is the joiner of (N9), as its mds tells it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JoinView {
+    pub set: u32,
+    /// The member whose place it takes.
+    pub place: u8,
+    /// The version the join raised the set to, and the set's now.
+    pub since: u32,
+    pub version: u32,
+    /// The place its own: a member back, which copies what it may have
+    /// missed -- what was written at `until`, the last version it was active
+    /// at, or after.
+    pub own: bool,
+    pub until: u32,
+    /// The set's active members, the copy's sources, and their hosts.
+    pub sources: Vec<(u32, String)>,
+    /// The entry the mds has applied: a source's mds is asked to be as far.
+    pub index: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,6 +239,11 @@ pub enum Told {
     Refused(Refusal),
     /// The chunks of a `Live` that are gone.
     Gone(Vec<u32>),
+    /// A `Verify` of a write by the set's joiner (N9) -- the join begun at
+    /// `since`: verified, and the cs is to mark what clients write to the
+    /// set from now on.
+    VerifiedJoining { since: u32 },
+    Joins(Vec<JoinView>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -236,6 +299,8 @@ fn refusal(w: &mut Writer, why: &Refusal) {
         }
         Refusal::NoMds => w.u8(15),
         Refusal::NotReady => w.u8(16),
+        Refusal::NotHeld => w.u8(17),
+        Refusal::NotTheJoiner => w.u8(18),
     }
 }
 
@@ -257,6 +322,8 @@ fn read_refusal(r: &mut Reader<'_>) -> Option<Refusal> {
         14 => Refusal::Behind { applied: r.u64()? },
         15 => Refusal::NoMds,
         16 => Refusal::NotReady,
+        17 => Refusal::NotHeld,
+        18 => Refusal::NotTheJoiner,
         _ => return None,
     })
 }
@@ -279,6 +346,9 @@ impl Refusal {
             E::Failed => Refusal::Failed,
             E::Io => Refusal::Io,
             E::TooManyFences => Refusal::TooManyFences,
+            E::NotHeld => Refusal::NotHeld,
+            /* Asked again by the client, as for a cs not ready */
+            E::NoMemory => Refusal::NotReady,
         }
     }
 
@@ -301,6 +371,8 @@ impl Refusal {
             Refusal::Behind { .. } => "the host's metadata is behind the request: ask again",
             Refusal::NoMds => "no metadata service on the host",
             Refusal::NotReady => "the cs is not serving yet",
+            Refusal::NotHeld => "the cs holds no such chunk",
+            Refusal::NotTheJoiner => "the cs named is not the set's joiner at that version",
         }
     }
 }
@@ -339,6 +411,36 @@ impl Request<'_> {
             }
             Op::Held => w.u8(6),
             Op::Ping => w.u8(7),
+            Op::Holdings { set, from, joiner, version, index } => {
+                w.u8(8);
+                w.u32(*set);
+                w.u32(*from);
+                w.u32(*joiner);
+                w.u32(*version);
+                w.u64(*index);
+            }
+            Op::Pull { chunk, joiner, index, offset, len } => {
+                w.u8(9);
+                chunk_ref(&mut w, chunk);
+                w.u32(*joiner);
+                w.u64(*index);
+                w.u32(*offset);
+                w.u32(*len);
+            }
+            Op::Sums { chunk, joiner, index, offset, len } => {
+                w.u8(10);
+                chunk_ref(&mut w, chunk);
+                w.u32(*joiner);
+                w.u64(*index);
+                w.u32(*offset);
+                w.u32(*len);
+            }
+            Op::Touch { chunk, joiner, index } => {
+                w.u8(11);
+                chunk_ref(&mut w, chunk);
+                w.u32(*joiner);
+                w.u64(*index);
+            }
         }
         w.buf
     }
@@ -373,6 +475,22 @@ impl<'a> Request<'a> {
             5 => Op::Close { chunk: read_chunk_ref(&mut r)?, position: r.u32()?, index: r.u64()? },
             6 => Op::Held,
             7 => Op::Ping,
+            8 => Op::Holdings { set: r.u32()?, from: r.u32()?, joiner: r.u32()?, version: r.u32()?, index: r.u64()? },
+            code @ (9 | 10) => {
+                let pull = code == 9;
+                let chunk = read_chunk_ref(&mut r)?;
+                let (joiner, index, offset, len) = (r.u32()?, r.u64()?, r.u32()?, r.u32()?);
+                /* A pull is data, as a read is; a sum reads at most a chunk */
+                if (pull && len > DATA_MAX) || u64::from(len) > nbscs::SLOT {
+                    return None;
+                }
+                if pull {
+                    Op::Pull { chunk, joiner, index, offset, len }
+                } else {
+                    Op::Sums { chunk, joiner, index, offset, len }
+                }
+            }
+            11 => Op::Touch { chunk: read_chunk_ref(&mut r)?, joiner: r.u32()?, index: r.u64()? },
             _ => return None,
         };
         r.done().then_some(Request { id, volume, generation, op })
@@ -411,6 +529,27 @@ impl Answer<'_> {
                 w.u8(6);
                 refusal(&mut w, why);
             }
+            Reply::Chunks(list) => {
+                w.u8(7);
+                w.u32(list.len() as u32);
+                for &(c, i, v, at) in list {
+                    w.u32(c);
+                    w.u32(i);
+                    w.u32(v);
+                    w.u32(at);
+                }
+            }
+            Reply::Sums(sums) => {
+                w.u8(8);
+                w.u32(sums.len() as u32);
+                for &s in sums {
+                    w.u32(s);
+                }
+            }
+            Reply::Written(v) => {
+                w.u8(9);
+                w.u32(*v);
+            }
         }
         w.buf
     }
@@ -448,6 +587,30 @@ impl<'a> Answer<'a> {
                 Reply::Held(list)
             }
             6 => Reply::Refused(read_refusal(&mut r)?),
+            7 => {
+                let n = r.u32()? as usize;
+                /* Each entry is 16 bytes: a count past what is there is none */
+                if n > LIST_MAX || n * 16 > r.remaining() {
+                    return None;
+                }
+                let mut list = Vec::new();
+                for _ in 0..n {
+                    list.push((r.u32()?, r.u32()?, r.u32()?, r.u32()?));
+                }
+                Reply::Chunks(list)
+            }
+            8 => {
+                let n = r.u32()? as usize;
+                if n > SUMS_MAX || n * 4 > r.remaining() {
+                    return None;
+                }
+                let mut sums = Vec::new();
+                for _ in 0..n {
+                    sums.push(r.u32()?);
+                }
+                Reply::Sums(sums)
+            }
+            9 => Reply::Written(r.u32()?),
             _ => return None,
         };
         r.done().then_some(Answer { id, reply })
@@ -483,6 +646,24 @@ impl Query {
                 for &v in volumes {
                     w.u32(v);
                 }
+            }
+            Question::VerifyJoin { set, joiner, version, index } => {
+                w.u8(5);
+                w.u32(*set);
+                w.u32(*joiner);
+                w.u32(*version);
+                w.u64(*index);
+            }
+            Question::Joins => w.u8(6),
+            Question::JoinDone { set, since } => {
+                w.u8(7);
+                w.u32(*set);
+                w.u32(*since);
+            }
+            Question::GiveUp { set, since } => {
+                w.u8(8);
+                w.u32(*set);
+                w.u32(*since);
             }
         }
         w.buf
@@ -526,6 +707,10 @@ impl Query {
                 }
                 Question::Volumes { volumes }
             }
+            5 => Question::VerifyJoin { set: r.u32()?, joiner: r.u32()?, version: r.u32()?, index: r.u64()? },
+            6 => Question::Joins,
+            7 => Question::JoinDone { set: r.u32()?, since: r.u32()? },
+            8 => Question::GiveUp { set: r.u32()?, since: r.u32()? },
             _ => return None,
         };
         r.done().then_some(Query { id, question })
@@ -560,6 +745,28 @@ impl Answered {
                 w.u32(list.len() as u32);
                 for &c in list {
                     w.u32(c);
+                }
+            }
+            Told::VerifiedJoining { since } => {
+                w.u8(6);
+                w.u32(*since);
+            }
+            Told::Joins(joins) => {
+                w.u8(7);
+                w.u32(joins.len() as u32);
+                for j in joins {
+                    w.u32(j.set);
+                    w.u8(j.place);
+                    w.u32(j.since);
+                    w.u32(j.version);
+                    w.u8(u8::from(j.own));
+                    w.u32(j.until);
+                    w.u8(j.sources.len() as u8);
+                    for (cs, host) in &j.sources {
+                        w.u32(*cs);
+                        w.str(host);
+                    }
+                    w.u64(j.index);
                 }
             }
         }
@@ -604,6 +811,35 @@ impl Answered {
                 }
                 Told::Gone(list)
             }
+            6 => Told::VerifiedJoining { since: r.u32()? },
+            7 => {
+                let n = r.u32()? as usize;
+                /* Each join is 24 bytes at the least */
+                if n > LIST_MAX || n * 24 > r.remaining() {
+                    return None;
+                }
+                let mut joins = Vec::new();
+                for _ in 0..n {
+                    let (set, place, since, version) = (r.u32()?, r.u8()?, r.u32()?, r.u32()?);
+                    let own = match r.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return None,
+                    };
+                    let until = r.u32()?;
+                    let k = usize::from(r.u8()?);
+                    if usize::from(place) >= nbsmeta::REPLICAS || k > nbsmeta::REPLICAS {
+                        return None;
+                    }
+                    let mut sources = Vec::new();
+                    for _ in 0..k {
+                        let cs = r.u32()?;
+                        sources.push((cs, String::from(r.str(nbsmeta::NAME_MAX)?)));
+                    }
+                    joins.push(JoinView { set, place, since, version, own, until, sources, index: r.u64()? });
+                }
+                Told::Joins(joins)
+            }
             _ => return None,
         };
         r.done().then_some(Answered { id, told })
@@ -618,6 +854,8 @@ pub const TAG_ASK: u32 = 0x112;
 pub const TAG_SAID: u32 = 0x113;
 /// The most places of a volume's map an ask is told at once.
 pub const MAP_MAX: u32 = 4096;
+/// The most sums an answer gives: a chunk's granules (N9).
+pub const SUMS_MAX: usize = (nbscs::SLOT / nbscs::GRANULE as u64) as usize;
 /// The longest reason a refusal is told, in bytes: past it, cut short at a
 /// character's edge.
 pub const REASON_MAX: usize = 255;
