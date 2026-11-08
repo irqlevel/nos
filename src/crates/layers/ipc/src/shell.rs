@@ -13,8 +13,8 @@
 //!                             round trips and MB/s said -- kernel.echo@host
 //!                             a peer's echo through ipcnet
 
-use crate::{boxes, counters, echo_start, echo_status, echo_stop, list, peers, router, Addr, Limits, Mailbox, Payload,
-            To, TAG_BOUNCED, TAG_BULK, TAG_DOWN};
+use crate::{boxes, counters, echo_start, echo_status, echo_stop, list, peers, ping, router, Addr, Limits, Mailbox,
+            Payload, To, TAG_BOUNCED, TAG_BULK, TAG_DOWN};
 use alloc::vec::Vec;
 use core::fmt::Write;
 use kcore::time::{boot_time_ns, Duration};
@@ -122,9 +122,10 @@ fn echo(what: &str, out: &mut Output) {
         }
         "" => {
             let s = echo_status();
-            let _ = writeln!(out, "ipc echo: {}, echoed {}, downs {}, pestering {}, pester messages {}",
-                             if s.running { "running" } else { "stopped" }, s.echoed, s.downs, s.pestering,
-                             s.pester_sent);
+            let _ = writeln!(out, "ipc echo: {}, echoed {}, pings checked {} (not as made {}), downs {}, pestering {}, \
+                                   pester messages {}",
+                             if s.running { "running" } else { "stopped" }, s.echoed, s.pings, s.pings_wrong, s.downs,
+                             s.pestering, s.pester_sent);
         }
         _ => {
             let _ = writeln!(out, "usage: ipc echo [start|stop]");
@@ -132,39 +133,12 @@ fn echo(what: &str, out: &mut Output) {
     }
 }
 
-/// What `ipc ping` sends: "PIN", bulk's bit clear -- `bulk` sets it.
-const PING_TAG: u32 = 0x0050_494E;
 /// Pings at most, and in flight at most: the round trips are kept to be
 /// sorted, a u64 each, well under a block of the heap.
 const PING_MAX: usize = 20_000;
 const WINDOW_MAX: usize = 64;
 const PING_LIMITS: Limits = Limits { messages: 256, bytes: 16 << 20 };
 const NS_PER_US: u64 = 1_000;
-/// A ping's bytes are made, and an answer's compared, a piece at a time:
-/// a megabyte is more than one block of the heap holds.
-const PING_PIECE: usize = 64 * 1024;
-
-/// The byte a ping has at `i`.
-fn ping_byte(i: usize) -> u8 {
-    (i as u8).wrapping_mul(29) ^ 0x5A
-}
-
-/// Whether `p` holds `len` bytes of the ping's pattern, read a piece at a
-/// time into `scratch`.
-fn ping_matches(p: &Payload, len: usize, scratch: &mut [u8]) -> bool {
-    if p.len() != len {
-        return false;
-    }
-    let mut at = 0;
-    while at < len {
-        let n = p.read(at, &mut scratch[..PING_PIECE.min(len - at)]);
-        if n == 0 || scratch[..n].iter().enumerate().any(|(k, &b)| b != ping_byte(at + k)) {
-            return false;
-        }
-        at += n;
-    }
-    true
-}
 
 /// `ipc ping <to> [count=N] [bytes=B] [window=W] [bulk] [timeout=MS]`: N
 /// messages of B bytes to `to`, W of them in flight at once, each answer
@@ -202,18 +176,18 @@ fn ping(args: &str, out: &mut Output) {
         let _ = writeln!(out, "ipc ping: no mailbox");
         return;
     };
-    /* The bytes in pieces, and room to read an answer's back a piece at a
-     * time */
+    /* The bytes in pieces -- written again for each message, whose own they
+     * are -- and room to read an answer's back a piece at a time */
     let mut pieces: Vec<Vec<u8>> = Vec::new();
     let mut scratch: Vec<u8> = Vec::new();
     let mut made = 0;
-    let mut room = scratch.try_reserve_exact(PING_PIECE.min(bytes.max(1))).is_ok();
+    let mut room = scratch.try_reserve_exact(ping::PIECE.min(bytes.max(1))).is_ok();
     while room && made < bytes {
-        let n = PING_PIECE.min(bytes - made);
+        let n = ping::PIECE.min(bytes - made);
         let mut p = Vec::new();
         room = p.try_reserve_exact(n).is_ok() && pieces.try_reserve(1).is_ok();
         if room {
-            p.extend((made..made + n).map(ping_byte));
+            p.resize(n, 0);
             pieces.push(p);
             made += n;
         }
@@ -222,13 +196,12 @@ fn ping(args: &str, out: &mut Output) {
         let _ = writeln!(out, "ipc ping: no memory for {} bytes", bytes);
         return;
     }
-    scratch.resize(PING_PIECE.min(bytes.max(1)), 0);
-    let parts: Vec<&[u8]> = pieces.iter().map(|p| &p[..]).collect();
+    scratch.resize(ping::PIECE.min(bytes.max(1)), 0);
     let mut rtts: Vec<u64> = Vec::new();
     if rtts.try_reserve_exact(count).is_err() {
         return;
     }
-    let tag = if bulk { PING_TAG | TAG_BULK } else { PING_TAG };
+    let tag = if bulk { ping::TAG | TAG_BULK } else { ping::TAG };
     let (mut sent, mut wrong, mut bounced, mut timeouts, mut errors, mut down) = (0usize, 0usize, 0usize, 0usize, 0usize, false);
     let mut target: Option<Addr> = None;
     let mut monitor: Option<u64> = None;
@@ -243,19 +216,25 @@ fn ping(args: &str, out: &mut Output) {
         /* Into flight while there is room -- the first alone, by name,
          * until its answer says where to */
         while sent < count && flight.len() < if target.is_some() { window } else { 1 } {
+            let reference = mb.next_reference();
+            ping::fill(&mut pieces, reference);
+            let parts: Vec<&[u8]> = pieces.iter().map(|p| &p[..]).collect();
             let Ok(payload) = Payload::gather(&parts) else {
                 errors += 1;
                 sent += 1;
                 continue;
             };
-            let reference = mb.next_reference();
             let to = match target {
                 Some(a) => To::Addr(a),
                 None => To::Name(name),
             };
             sent += 1;
+            /* Timed from before the send: a send that waits, or whose task
+             * gives the CPU to the one it woke, is part of the round trip --
+             * timed after it, the message may be long gone, even answered */
+            let at = boot_time_ns();
             match mb.send(to, tag, reference, payload) {
-                Ok(()) => flight.push((reference, boot_time_ns())),
+                Ok(()) => flight.push((reference, at)),
                 Err(_) => errors += 1,
             }
         }
@@ -287,7 +266,20 @@ fn ping(args: &str, out: &mut Output) {
         if m.is_system() {
             continue;
         }
-        if m.tag() != tag || !ping_matches(m.payload(), bytes, &mut scratch) {
+        /* The first wrong answer of a run said in full: what a count alone
+         * cannot tell -- whose bytes came back, and where */
+        if m.tag() != tag {
+            if wrong == 0 {
+                let _ = writeln!(out, "ipc ping: answer {} wrong: tag {:#x} (sent {:#x})", m.reference(), m.tag(),
+                                 tag);
+            }
+            wrong += 1;
+            continue;
+        }
+        if let Some(w) = ping::check(m.payload(), bytes, m.reference(), &mut scratch) {
+            if wrong == 0 {
+                let _ = writeln!(out, "ipc ping: answer {} wrong: {}", m.reference(), w.said(bytes));
+            }
             wrong += 1;
             continue;
         }

@@ -8,11 +8,17 @@
 //! Sent `TAG_ECHO_PESTER`, it also monitors the sender and sends it a
 //! message every millisecond until the sender's Down comes: a module
 //! unloaded under traffic, which is what the boot's test does with it.
+//!
+//! A ping (`ipc ping`'s tag) it holds to the ping's own pattern as it comes,
+//! before it goes back: so that an answer the pinger finds wrong says which
+//! way it was made wrong -- on its way here, if the echo found it wrong too;
+//! on its way back, if the echo found it right.
 
-use crate::{Addr, Limits, Mailbox, Payload, Scope, To, TAG_DOWN};
+use crate::{ping, Addr, Limits, Mailbox, Message, Payload, Scope, To, TAG_BULK, TAG_DOWN};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+use kcore::klog;
 use kcore::once::OnceBox;
 use kcore::sync::Mutex;
 use kcore::task::TaskHandle;
@@ -29,6 +35,8 @@ const PESTER_MS: u64 = 1;
 const IDLE_MS: u64 = 100;
 /// Senders pestered at once.
 const MAX_PESTERED: usize = 8;
+/// Wrong pings said in the log, at most: each is counted.
+const SAY_WRONG: u64 = 8;
 
 struct State {
     task: Option<TaskHandle>,
@@ -45,6 +53,8 @@ static ECHOED: AtomicU64 = AtomicU64::new(0);
 static DOWNS: AtomicU64 = AtomicU64::new(0);
 static PESTER_SENT: AtomicU64 = AtomicU64::new(0);
 static PESTERING: AtomicU64 = AtomicU64::new(0);
+static PINGS: AtomicU64 = AtomicU64::new(0);
+static PINGS_WRONG: AtomicU64 = AtomicU64::new(0);
 
 /// What the echo has done since boot, and whether it runs.
 pub struct EchoStatus {
@@ -53,6 +63,9 @@ pub struct EchoStatus {
     pub downs: u64,
     pub pester_sent: u64,
     pub pestering: u64,
+    /// Pings held to their pattern as they came, and how many were not it.
+    pub pings: u64,
+    pub pings_wrong: u64,
 }
 
 pub fn echo_status() -> EchoStatus {
@@ -62,6 +75,20 @@ pub fn echo_status() -> EchoStatus {
         downs: DOWNS.load(Ordering::Relaxed),
         pester_sent: PESTER_SENT.load(Ordering::Relaxed),
         pestering: PESTERING.load(Ordering::Relaxed),
+        pings: PINGS.load(Ordering::Relaxed),
+        pings_wrong: PINGS_WRONG.load(Ordering::Relaxed),
+    }
+}
+
+/// A ping held to its pattern as it came: counted, and the first few that
+/// are not it said in the log, in full.
+fn check_ping(msg: &Message, scratch: &mut [u8]) {
+    PINGS.fetch_add(1, Ordering::Relaxed);
+    let len = msg.payload().len();
+    if let Some(w) = ping::check(msg.payload(), len, msg.reference(), scratch) {
+        if PINGS_WRONG.fetch_add(1, Ordering::Relaxed) < SAY_WRONG {
+            klog!(0, "ipc echo: ping {} from {} not as it was made: {}", msg.reference(), msg.from(), w.said(len));
+        }
     }
 }
 
@@ -96,6 +123,13 @@ pub fn echo_stop() -> bool {
 
 fn serve(mb: Mailbox) {
     let mut pestered: Vec<(Addr, u64)> = Vec::new();
+    /* Room to read a ping back a piece at a time: with none, pings go back
+     * unchecked */
+    let mut scratch: Vec<u8> = Vec::new();
+    let checking = scratch.try_reserve_exact(ping::PIECE).is_ok();
+    if checking {
+        scratch.resize(ping::PIECE, 0);
+    }
     while !kcore::task::stopping() {
         let wait = if pestered.is_empty() { IDLE_MS } else { PESTER_MS };
         if let Some(msg) = mb.recv(Duration::from_millis(wait)) {
@@ -106,6 +140,9 @@ fn serve(mb: Mailbox) {
                 }
             } else if !msg.is_system() {
                 let (from, tag, reference) = (msg.from(), msg.tag(), msg.reference());
+                if checking && tag & !TAG_BULK == ping::TAG {
+                    check_ping(&msg, &mut scratch);
+                }
                 if tag == TAG_ECHO_PESTER && pestered.len() < MAX_PESTERED && pestered.try_reserve(1).is_ok() {
                     if let Ok(id) = mb.monitor(from) {
                         pestered.push((from, id));
