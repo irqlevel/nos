@@ -134,12 +134,15 @@ struct SetInfo {
     version: u32,
     cs: [u32; REPLICAS],
     replicas: [ReplicaState; REPLICAS],
+    /// The cs being copied onto (N9): written, not read.
+    joiner: Option<u32>,
 }
 
 impl SetInfo {
-    /// Its replicas that are written: active ones, and those being copied onto.
+    /// Its replicas that are written: the active members, and the joiner --
+    /// a write it missed would be missing from what its copy takes over.
     fn written(&self) -> impl Iterator<Item = u32> + '_ {
-        (0..REPLICAS).filter(|&i| self.replicas[i] != ReplicaState::Down).map(|i| self.cs[i])
+        (0..REPLICAS).filter(|&i| self.replicas[i] != ReplicaState::Down).map(|i| self.cs[i]).chain(self.joiner)
     }
 
     fn active(&self, cs: u32) -> bool {
@@ -147,7 +150,7 @@ impl SetInfo {
     }
 
     fn written_to(&self, cs: u32) -> bool {
-        (0..REPLICAS).any(|i| self.cs[i] == cs && self.replicas[i] != ReplicaState::Down)
+        self.joiner == Some(cs) || (0..REPLICAS).any(|i| self.cs[i] == cs && self.replicas[i] != ReplicaState::Down)
     }
 }
 
@@ -512,7 +515,7 @@ impl Session {
                 for p in &map {
                     r.places.push((p.chunk.chunk, p.chunk.incarnation, p.chunk.epoch.set));
                     r.sets.insert(p.chunk.epoch.set, SetInfo { version: p.chunk.epoch.version, cs: p.cs,
-                                                               replicas: p.replicas });
+                                                               replicas: p.replicas, joiner: p.joiner });
                 }
                 for (cs, host) in hosts {
                     r.hosts.insert(cs, host);
@@ -860,9 +863,15 @@ impl Session {
     #[allow(clippy::too_many_arguments)]
     fn taken_out(&mut self, set: u32, cs: u32, version: u32, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
         if let Some(s) = self.map.sets.get_mut(&set) {
-            for i in 0..REPLICAS {
-                if s.cs[i] == cs {
-                    s.replicas[i] = ReplicaState::Down;
+            /* Its join dropped where it was the joiner -- a member back
+               whose copy is given up stays down */
+            if s.joiner == Some(cs) {
+                s.joiner = None;
+            } else {
+                for i in 0..REPLICAS {
+                    if s.cs[i] == cs {
+                        s.replicas[i] = ReplicaState::Down;
+                    }
                 }
             }
             s.version = s.version.max(version);

@@ -78,10 +78,22 @@ fn reason(r: &mut Rng) -> String {
 
 fn state(r: &mut Rng) -> ReplicaState {
     match r.below(3) {
-        0 => ReplicaState::Active,
-        1 => ReplicaState::Rebuilding,
+        0 | 1 => ReplicaState::Active,
         _ => ReplicaState::Down,
     }
+}
+
+/// A place: its chunk, three cs's and their states, and a joiner as the
+/// reader takes one -- none, a cs no member is, or a member down back.
+fn place(r: &mut Rng) -> Place {
+    let cs = [r.below(1 << 32) as u32, r.below(1 << 32) as u32, r.below(1 << 32) as u32];
+    let replicas = [state(r), state(r), state(r)];
+    let joiner = match r.below(3) {
+        0 => None,
+        1 => (0..3).find(|&k| replicas[k] == ReplicaState::Down).map(|k| cs[k]),
+        _ => Some(r.below(u64::from(u32::MAX)) as u32).filter(|j| !cs.contains(j)),
+    };
+    Place { chunk: chunk(r), cs, replicas, joiner }
 }
 
 /// Every kind of message, at random: its kind, its bytes, and whether the
@@ -195,11 +207,7 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                 1 => Said::Detached { index: r.below(u64::MAX) },
                 2 => {
                     let k = len(r, u64::from(MAP_MAX));
-                    let map = (0..k).map(|_| Place {
-                        chunk: chunk(r),
-                        cs: [r.below(1 << 32) as u32, r.below(1 << 32) as u32, r.below(1 << 32) as u32],
-                        replicas: [state(r), state(r), state(r)],
-                    }).collect();
+                    let map = (0..k).map(|_| place(r)).collect();
                     let h = r.below(nbsmeta::CS_MAX as u64 + 1) as usize;
                     let hosts = (0..h).map(|i| (i as u32, name(r, nbsmeta::NAME_MAX))).collect();
                     Said::Map { volume: r.below(1 << 32) as u32, size_mib: r.below(u64::MAX), places: k as u32,
