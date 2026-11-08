@@ -28,6 +28,8 @@
 #include <mm/memory_map.h>
 #include <mm/new.h>
 #include <mm/heap_usage.h>
+#include <mm/alloc_sites.h>
+#include "memsites.h"
 #include <lib/unique_ptr.h>
 #include <lib/grub_env.h>
 
@@ -1531,6 +1533,55 @@ static void cmd_memcheck(const char* args, stdlib::Printer& con)
     mm::PageTable::get_instance().check_free_list(con);
 }
 
+/* memsites: what Rust's heap holds, by where it was allocated
+   (kernel/memsites.h) -- on, off, the report of the top sites, the dump
+   scripts/memsites.py names to files and lines, the pools by owner */
+static void cmd_memsites(const char* args, stdlib::Printer& con)
+{
+    static const ulong DEFAULT_TOP = 20;
+    static const ulong MAX_TOP = 1000;
+
+    const char* end;
+    const char* tok = stdlib::next_token(args, end);
+    char word[16];
+    word[0] = '\0';
+    if (tok)
+        stdlib::token_copy(tok, end, word, sizeof(word));
+
+    auto& sites = mm::AllocSites::get_instance();
+    ulong top = DEFAULT_TOP;
+    if (stdlib::str_cmp(word, "on") == 0)
+    {
+        if (sites.enable())
+            con.printf("memsites: on -- the blocks Rust allocates from now are given their sites\n");
+        else
+            con.printf("memsites: no memory for its tables, still off\n");
+        return;
+    }
+    if (stdlib::str_cmp(word, "off") == 0)
+    {
+        sites.disable();
+        con.printf("memsites: off -- the blocks given sites keep them until they are freed\n");
+        return;
+    }
+    if (stdlib::str_cmp(word, "dump") == 0)
+    {
+        memsites::dump(con);
+        return;
+    }
+    if (stdlib::str_cmp(word, "tags") == 0)
+    {
+        memsites::tags(con);
+        return;
+    }
+    if (word[0] != '\0' && (!stdlib::parse_ulong(word, top) || top == 0 || top > MAX_TOP))
+    {
+        con.printf("usage: memsites [on|off|dump|tags|N, 1-%lu]\n", MAX_TOP);
+        return;
+    }
+    memsites::report(con, top);
+}
+
 static void cmd_meminfo(const char* args, stdlib::Printer& con)
 {
     (void)args;
@@ -2342,6 +2393,7 @@ static const CmdEntry COMMANDS[] = {
     { "memusage",  cmd_memusage,  "memusage - show memory usage stats" },
     { "meminfo",   cmd_meminfo,   "meminfo - show the firmware memory map and what of it is used" },
     { "memcheck",  cmd_memcheck,  "memcheck - verify no reserved page reached the free list" },
+    { "memsites",  cmd_memsites,  "memsites [on|off|dump|tags|N] - Rust's heap by where it was allocated" },
     { "irqstat",   cmd_irqstat,   "irqstat - show interrupt statistics" },
     { "pci",       cmd_pci,       "pci - show pci devices" },
     { "grubenv",   cmd_grubenv,   "grubenv <path> [name=value ...] - show or set GRUB environment variables" },

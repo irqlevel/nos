@@ -119,15 +119,49 @@ void* AllocatorImpl::alloc_block(size_t size, ulong tag, bool zero_pages)
 	}
 
 	header->magic = MAGIC;
-	header->size = size;
+	/* A word walk reads with no lock: an owner taking a block through its
+	   CPU's cache takes none either */
+	__atomic_store_n(&header->size, static_cast<u32>(size), __ATOMIC_RELAXED);
 	return header + 1;
+}
+
+void AllocatorImpl::walk(HeapVisitor& visitor)
+{
+	/* A pool's blocks, their headers read for what each was asked for: a
+	   class of the function's own, which reaches Header as the function
+	   does */
+	class PoolWalk final : public Pool::BlockVisitor
+	{
+	public:
+		PoolWalk(HeapVisitor& to, size_t taken)
+			: to_(to)
+			, taken_(taken)
+		{
+		}
+
+		void block(ulong tag, const void* data) override
+		{
+			const Header* header = static_cast<const Header*>(data);
+			to_.block(tag, __atomic_load_n(&header->size, __ATOMIC_RELAXED), taken_);
+		}
+
+	private:
+		HeapVisitor& to_;
+		size_t taken_;
+	};
+
+	for (size_t i = 0; i < POOL_COUNT; i++)
+	{
+		PoolWalk walk(visitor, Pool::footprint(pool_[i].block_size()));
+		pool_[i].walk(walk);
+	}
 }
 
 void AllocatorImpl::free(void* ptr)
 {
 	BUG_ON(ptr == nullptr);
 
-	if ((reinterpret_cast<ulong>(ptr) & (consts::PAGE_SIZE - 1)) == 0)
+	if (from_pages(ptr))
 	{
 		pg_alloc_->free(ptr);
 		return;

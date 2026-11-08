@@ -18,6 +18,7 @@
 #include <kernel/panic.h>
 #include <kernel/dmesg.h>
 #include <kernel/parameters.h>
+#include <kernel/memsites.h>
 #include <kernel/tracepoint.h>
 #include <kernel/ubsan.h>
 #include <kernel/time.h>
@@ -660,6 +661,8 @@ extern "C" void main_arm64(void* dtb)
         PANIC("Can't setup page allocator");
 
     mm::AllocatorImpl::get_instance(&mm::PageAllocatorImpl::get_instance());
+    /* memsites=on (as in kernel/main.cpp) */
+    memsites::setup();
 
     if (Parameters::get_instance().is_wx_probe_heap())
         wx_probe_heap();

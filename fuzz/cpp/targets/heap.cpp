@@ -291,7 +291,13 @@ struct Block
         Large,  /* map_large_pages */
     } how;
     std::vector<ulong> pages;
+    /* The owner's tag a heap block was allocated with */
+    ulong tag = 0;
 };
+
+/* The tags the sequence allocates with: two of the C++ code's kind, and one
+   of memsites' sites' (mm/alloc_sites.h) */
+const ulong TAGS[] = {0x54657374UL, 0x43707521UL, 0x5349544500000007UL};
 
 std::map<ulong, Block> live;
 ulong baseline;
@@ -496,7 +502,8 @@ void alloc(fuzz::Input& in)
     ulong kept_before = kept_count();
     ulong cached_before = cached_count();
     ulong cpu_kept_before = cpu_kept_count();
-    void* p = uninit ? tested_heap().alloc_uninit(size, 0x54657374) : tested_heap().alloc(size, 0x54657374);
+    const ulong tag = TAGS[in.below(sizeof(TAGS) / sizeof(TAGS[0]))];
+    void* p = uninit ? tested_heap().alloc_uninit(size, tag) : tested_heap().alloc(size, tag);
     if (cpu_kept_count() < cpu_kept_before)
         fuzz::reached("a kept block from a CPU's own");
     if (kept_count() < kept_before)
@@ -527,8 +534,57 @@ void alloc(fuzz::Input& in)
         for (ulong i = 0; i < size; i++)
             INVARIANT(bytes[i] == 0, "alloc(%lu) gave 0x%lx with a byte not zero at +%lu", size, va, i);
     }
-    place(va, {size, static_cast<uint8_t>(1 + in.below(255)), Block::Heap, {}}, "Alloc");
+    Block b{size, static_cast<uint8_t>(1 + in.below(255)), Block::Heap, {}};
+    b.tag = tag;
+    place(va, b, "Alloc");
     fuzz::reached(pages ? "a page allocation" : "a pool allocation");
+}
+
+/* What a walk of the heap counts: blocks and bytes asked by tag, and any
+   block whose footprint is not what footprint() says of what it was asked */
+class WalkCount final : public kernel::mm::HeapVisitor
+{
+public:
+    std::map<ulong, std::pair<ulong, ulong>> got;
+    ulong wrong_taken = 0;
+
+    void block(ulong tag, size_t asked, size_t taken) override
+    {
+        auto& g = got[tag];
+        g.first++;
+        g.second += asked;
+        if (taken != AllocatorImpl::footprint(asked))
+            wrong_taken++;
+    }
+};
+
+/* The heap walked (AllocatorImpl::walk, what memsites reads the owners by):
+   every pool block out, by its tag, with what it was asked for -- none of
+   the page allocator's, none free or in a CPU's cache -- the model's */
+void walk_check()
+{
+    WalkCount w;
+    tested_heap().walk(w);
+    std::map<ulong, std::pair<ulong, ulong>> want;
+    for (const auto& l : live)
+    {
+        if (l.second.how != Block::Heap || l.second.size + 8 >= PAGE_BYTES / 2)
+            continue;
+        auto& g = want[l.second.tag];
+        g.first++;
+        g.second += l.second.size;
+    }
+    INVARIANT(w.wrong_taken == 0, "the walk said %lu blocks take other than footprint() says", w.wrong_taken);
+    for (const auto& g : want)
+    {
+        auto it = w.got.find(g.first);
+        INVARIANT(it != w.got.end() && it->second == g.second, "the walk found %lu blocks of %lu bytes of tag 0x%lx; "
+            "%lu of %lu are out", it == w.got.end() ? 0 : it->second.first,
+            it == w.got.end() ? 0 : it->second.second, g.first, g.second.first, g.second.second);
+    }
+    INVARIANT(w.got.size() == want.size(), "the walk found blocks of %zu tags, %zu are out", w.got.size(),
+        want.size());
+    fuzz::reached(want.empty() ? "a walk of no pool blocks" : "a walk of pool blocks");
 }
 
 void free_one(fuzz::Input& in)
@@ -670,8 +726,11 @@ void run(fuzz::Input& in)
            caches' CPUs there is none, and the pools are reached directly */
         if (in.chance(32))
             fuzz::current_cpu = in.chance(16) ? kernel::mm::CACHE_CPUS + in.below(4) : in.below(4);
-        switch (in.u8() % 13)
+        switch (in.u8() % 14)
         {
+        case 13:
+            walk_check();
+            break;
         case 12:
             /* What the heap keeps for its next allocations given back,
                with blocks still out */

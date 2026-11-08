@@ -51,6 +51,26 @@ public:
         return block_size + sizeof(Block);
     }
 
+    size_t block_size() const
+    {
+        return block_size_;
+    }
+
+    /* What a walk of the pool (walk) hands its visitor: each block an owner
+       has -- its tag, and the bytes after the pool's header, the owner's */
+    class BlockVisitor
+    {
+    public:
+        virtual void block(ulong tag, const void* data) = 0;
+    };
+
+    /* Every block an owner has, to visitor, under Lock: a page with such a
+       block is on one of the two lists, and stays there, mapped, while Lock
+       is held. A block a CPU's cache takes or gives back meanwhile -- with
+       no Lock -- may be seen with either its old owner's tag or its new
+       one's. The visitor runs under Lock: it must not allocate or free. */
+    void walk(BlockVisitor& visitor);
+
 private:
 
     using ListEntry = stdlib::ListEntry;
