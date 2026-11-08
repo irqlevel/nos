@@ -81,4 +81,11 @@ void preempt_irq_restore(ulong flags)
     hal::irq_restore(flags);
 }
 
+/* One task, on the one CPU there is: nothing moves it (tmp_map_page's
+   check). */
+bool preempt_can_move()
+{
+    return false;
+}
+
 }
