@@ -14,6 +14,12 @@
                           void (*callback)(void*), void* ctx) */
     .globl switch_context
 switch_context:
+    /* The task switched away may be woken on another CPU, and a TLBI or a
+       cache maintenance instruction it issued here is complete only once
+       this CPU has passed a DSB: the one the task runs after it, if it was
+       interrupted in between, completes only the CPU's it runs on then.
+       Complete this CPU's before the task can leave it. */
+    dsb     ish
     mrs     x9, daif
     stp     x29, x30, [sp, #-16]!
     stp     x27, x28, [sp, #-16]!

@@ -466,6 +466,10 @@ private:
        whole -- a run, a block for the pool: off its list, its mark and the
        counts with it. Under Lock. */
     void unlist_free_page_no_lock(Page* page);
+    /* A page just taken off a free list: a panic unless its only reference
+       is the descriptor's own -- one with more is still mapped somewhere,
+       freed under a holder. Under Lock. */
+    static void check_unreferenced(Page* page);
     /* alloc_contiguous_pages' half under Lock: a run of count free pages
        found and taken off the lists, zeroed[j] saying whether page j of it
        was known zero; nullptr when there is none. examined counts the list
