@@ -370,8 +370,7 @@ impl Server {
                     klog!(1, "nbs-cs: joining set {} in place {} from its {} active members", v.set, v.place,
                           v.sources.len());
                     self.store.join(v.set, v.since);
-                    let found = self.store.found_in(v.set);
-                    self.copies.push(Copy::new(v, me, found, now));
+                    self.copies.push(Copy::new(v, me, now));
                 }
             }
         }

@@ -122,9 +122,8 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                                     index: r.below(u64::MAX) },
                 7 => Op::Pull { chunk: chunk(r), joiner: r.below(1 << 32) as u32, index: r.below(u64::MAX),
                                 offset: r.below(1 << 32) as u32, len: r.below(u64::from(DATA_MAX) + 1) as u32 },
-                8 => Op::Sums { chunk: chunk(r), joiner: r.below(1 << 32) as u32, index: r.below(u64::MAX),
+                _ => Op::Sums { chunk: chunk(r), joiner: r.below(1 << 32) as u32, index: r.below(u64::MAX),
                                 offset: r.below(1 << 32) as u32, len: r.below(nbscs::SLOT + 1) as u32 },
-                _ => Op::Touch { chunk: chunk(r), joiner: r.below(1 << 32) as u32, index: r.below(u64::MAX) },
             };
             let m = Request { id, volume: r.below(1 << 32) as u32, generation: r.below(u64::MAX), op };
             (0, m.encode(), true)
@@ -149,7 +148,6 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                     let k = len(r, nbswire::SUMS_MAX as u64);
                     Reply::Sums((0..k).map(|_| r.below(1 << 32) as u32).collect())
                 }
-                7 => Reply::Written(r.below(1 << 32) as u32),
                 _ => Reply::Refused(refusal(r)),
             };
             (1, Answer { id, reply }.encode(), true)

@@ -85,9 +85,6 @@ pub enum Op<'a> {
     /// The CRC-32C of each `nbscs::GRANULE` of the chunk from `offset` for
     /// `len` bytes, its epoch moved on as a pull's.
     Sums { chunk: ChunkRef, joiner: u32, index: u64, offset: u32, len: u32 },
-    /// The chunk's epoch moved on for a member back that holds it as it
-    /// was, and the version it was last written at told.
-    Touch { chunk: ChunkRef, joiner: u32, index: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,8 +148,6 @@ pub enum Reply<'a> {
     Chunks(Vec<(u32, u32, u32, u32)>),
     /// A sum of each granule asked.
     Sums(Vec<u32>),
-    /// A touch's: the version the chunk was last written at.
-    Written(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -435,12 +430,6 @@ impl Request<'_> {
                 w.u32(*offset);
                 w.u32(*len);
             }
-            Op::Touch { chunk, joiner, index } => {
-                w.u8(11);
-                chunk_ref(&mut w, chunk);
-                w.u32(*joiner);
-                w.u64(*index);
-            }
         }
         w.buf
     }
@@ -490,7 +479,6 @@ impl<'a> Request<'a> {
                     Op::Sums { chunk, joiner, index, offset, len }
                 }
             }
-            11 => Op::Touch { chunk: read_chunk_ref(&mut r)?, joiner: r.u32()?, index: r.u64()? },
             _ => return None,
         };
         r.done().then_some(Request { id, volume, generation, op })
@@ -545,10 +533,6 @@ impl Answer<'_> {
                 for &s in sums {
                     w.u32(s);
                 }
-            }
-            Reply::Written(v) => {
-                w.u8(9);
-                w.u32(*v);
             }
         }
         w.buf
@@ -610,7 +594,6 @@ impl<'a> Answer<'a> {
                 }
                 Reply::Sums(sums)
             }
-            9 => Reply::Written(r.u32()?),
             _ => return None,
         };
         r.done().then_some(Answer { id, reply })

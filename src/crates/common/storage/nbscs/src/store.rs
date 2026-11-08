@@ -162,11 +162,6 @@ pub struct Store<D: Device> {
     /// again since: what this cs held of them in its device's write cache
     /// may be gone (`found_open`).
     found: BTreeMap<u32, (u32, u64)>,
-    /// The chunks found open when their device was taken in, each at its
-    /// incarnation, until a copy has pulled one whole and closed it (N9):
-    /// what it held may be short of writes, however it is written since --
-    /// a copy given up part way among them.
-    suspect: BTreeMap<u32, u32>,
     /// The sets this cs joins (N9), each with its join's `since`: their
     /// clients' writes marked, and a copy into them written only where no
     /// write is.
@@ -217,7 +212,6 @@ impl<D: Device> Store<D> {
             fence_of: BTreeMap::new(),
             fence_free: (0..FENCES_MAX as u32).rev().collect(),
             found: BTreeMap::new(),
-            suspect: BTreeMap::new(),
             joining: BTreeMap::new(),
             marks: BTreeMap::new(),
         }
@@ -402,7 +396,6 @@ impl<D: Device> Store<D> {
             .map(|(c, r)| (c, r.incarnation, r.generation)).collect();
         for (c, incarnation, generation) in open {
             self.found.insert(c, (incarnation, generation));
-            self.suspect.insert(c, incarnation);
         }
         /* Its fences joined with the cs's: the newer generation of each
            volume, in the cs's place for it. The devices taken in before all
@@ -628,6 +621,16 @@ impl<D: Device> Store<D> {
     pub fn write(&mut self, volume: u32, generation: u64, c: ChunkRef, offset: u32, data: &[u8], verified: bool)
         -> Result<(), Error> {
         self.check_fence(volume, generation)?;
+        /* A joiner takes no write of an epoch before its join: one from a
+           view that old -- a writer taken over since among them, which the
+           members fenced against it refuse -- would be marked, and the copy
+           keep it over the set's (found by fuzz/nbs's cluster target, N9d).
+           Its writer reads its map again, and writes at the join's epoch */
+        if let Some(since) = self.joining.get(&c.epoch.set).copied() {
+            if c.epoch.version < since {
+                return Err(Error::Epoch { known: Epoch { set: c.epoch.set, version: since } });
+            }
+        }
         let found = self.find(&c)?;
         let (dv, slot) = match found {
             Some((dv, slot, r)) => {
@@ -789,7 +792,6 @@ impl<D: Device> Store<D> {
         }
         self.release(dv, slot)?;
         self.at.remove(&chunk);
-        self.suspect.remove(&chunk);
         Ok(true)
     }
 
@@ -866,24 +868,20 @@ impl<D: Device> Store<D> {
             return Err(Error::Epoch { known: r.known });
         }
         if r.known != c.epoch {
+            /* A chunk found open never comes here (`not_found_open`): the
+               record written would take its mark off (found by fuzz/nbs's
+               cluster target, N9d: a joiner's pull did, and the writer went
+               on with a replica short of a write it had done) */
             self.put(dv, slot, Record { known: c.epoch, seq: r.seq + 1, ..r })?;
         }
         Ok((dv, slot))
-    }
-
-    /// Chunk `c`'s epoch moved on for a member back that holds it as it was
-    /// (`advance`), and the version it was last written at -- with the move,
-    /// so that no write the member missed comes between: one at the version
-    /// it went down at or after, and the member pulls it after all.
-    pub fn touch(&mut self, c: ChunkRef) -> Result<u32, Error> {
-        let (dv, slot) = self.advance(&c)?;
-        Ok(self.record(dv, slot).written.version)
     }
 
     /// Chunk `c`'s data at `offset`, into `buf`, for its set's joiner: its
     /// epoch moved on first (`advance`). The caller has had the joiner
     /// vouched for by its host's mds.
     pub fn pull(&mut self, c: ChunkRef, offset: u32, buf: &mut [u8]) -> Result<(), Error> {
+        self.not_found_open(&c)?;
         let (dv, slot) = self.advance(&c)?;
         self.span(Some(dv), offset, buf.len())?;
         self.read_at(dv, slot, offset, buf)
@@ -893,8 +891,23 @@ impl<D: Device> Store<D> {
     /// bytes -- the last shorter where `len` ends inside one -- for its set's
     /// joiner, its epoch moved on first as a pull's is.
     pub fn sums(&mut self, c: ChunkRef, offset: u32, len: u32) -> Result<Vec<u32>, Error> {
+        self.not_found_open(&c)?;
         let (dv, slot) = self.advance(&c)?;
         self.sums_at(dv, slot, offset, len)
+    }
+
+    /// Chunk `c` no source of a copy where it was found open: it may lack
+    /// what its writer wrote since its last flush, which a joiner would take
+    /// as the set's (found by fuzz/nbs's cluster target, N9d: a joiner
+    /// copied from such a replica, and once it was active held a write done
+    /// as it was before). Refused as failed: the copy takes another source,
+    /// or waits for the writer to take this one out, or for a writer's
+    /// reconcile to make the chunk the same, which ends the mark.
+    fn not_found_open(&self, c: &ChunkRef) -> Result<(), Error> {
+        if self.found_open(c.chunk, c.incarnation).is_some() {
+            return Err(Error::Failed);
+        }
+        Ok(())
     }
 
     /// The same of this cs's own copy of chunk `c`: what a joiner holds its
@@ -952,8 +965,9 @@ impl<D: Device> Store<D> {
                     return Err(Error::Epoch { known: r.known });
                 }
                 if r.state != SlotState::Open || r.known != c.epoch {
-                    /* A client's open mark kept at its generation; a closed
-                       chunk opened at none, for `close_copy` to close */
+                    /* A client's open mark kept at its generation, for
+                       `close_copy` to leave or close; a closed chunk opened
+                       at none, for `close_copy` to close */
                     let generation = if r.state == SlotState::Open { r.generation } else { 0 };
                     self.put(dv, slot, Record { state: SlotState::Open, known: c.epoch, written: c.epoch, generation,
                                                 seq: r.seq + 1, ..r })?;
@@ -995,15 +1009,16 @@ impl<D: Device> Store<D> {
     }
 
     /// Chunk `c`'s copy done: its data flushed, then its record closed where
-    /// no client has written it since the copy opened it -- one a client
-    /// has, at its generation, is that client's to close.
+    /// no client has written it since the join began -- one a client has,
+    /// at its generation, is that client's to close.
     pub fn close_copy(&mut self, c: ChunkRef) -> Result<(), Error> {
         let Some((dv, slot, r)) = self.find(&c)? else { return Ok(()) };
-        /* Pulled whole and held to its source's: no longer suspect */
-        self.suspect.remove(&c.chunk);
-        if r.state != SlotState::Open || r.generation != 0 {
-            return Ok(());
-        }
+        /* What the copy took in durable, whatever the record: one a client
+           wrote meanwhile stays open at the writer's generation, as any
+           chunk it writes, but the join's end makes this cs a member, and a
+           power cut after must not take the copy's sectors with it (found
+           by fuzz/nbs's cluster target, N9d: the record left open, the
+           flush was left out with it) */
         let dev = &mut self.devs[dv];
         if dev.dirty {
             if dev.d.flush().is_err() {
@@ -1011,6 +1026,18 @@ impl<D: Device> Store<D> {
                 return Err(Error::Io);
             }
             dev.dirty = false;
+        }
+        /* Open at a writer's generation, the chunk that client's to close
+           where a client has written it since the join began. A mark from
+           before the join -- this cs a member then, taken out with the chunk
+           open, its writer closing it on the members it had left -- is
+           nobody's but the copy's, whether the copy wrote the chunk or found
+           it the source's already (found by fuzz/nbs's cluster target, N9d:
+           kept, the joiner's crash made the chunk found open, and as its
+           set's last member it was no source for the joiner after it) */
+        let written = self.marks.get(&c.chunk).is_some_and(|m| m.incarnation == c.incarnation);
+        if r.state != SlotState::Open || (r.generation != 0 && written) {
+            return Ok(());
         }
         self.put(dv, slot, Record { state: SlotState::Written, seq: r.seq + 1, ..r })
     }
@@ -1057,18 +1084,6 @@ impl<D: Device> Store<D> {
                 r.volume == volume && r.incarnation == incarnation
             })
         })
-    }
-
-    /// The chunks of set `set` found open when their device was taken in,
-    /// and not since pulled whole and closed by a copy: what a member back
-    /// copies whatever it holds of them (N9).
-    pub fn found_in(&self, set: u32) -> Vec<u32> {
-        self.suspect.iter().filter(|(&chunk, &incarnation)| {
-            self.at.get(&chunk).is_some_and(|&(dv, slot)| {
-                let r = self.record(dv, slot);
-                r.incarnation == incarnation && r.known.set == set
-            })
-        }).map(|(&chunk, _)| chunk).collect()
     }
 
     /// The chunk's record, where the cs holds it at this incarnation.
