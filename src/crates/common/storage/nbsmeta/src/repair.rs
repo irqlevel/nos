@@ -8,9 +8,10 @@
 //! of a view gone stale is refused where it is applied, as it names the
 //! version it was planned at.
 //!
-//! - A cs silent `DOWN_AFTER_MS` is down (`CsDown`); silent `out_after` --
-//!   held off while its host is in maintenance -- or its host no member, out
-//!   (`CsOut`); answering again, up (`CsUp`).
+//! - A cs silent `down_ms` (`DOWN_AFTER_MS` unless the cluster says
+//!   otherwise) is down (`CsDown`); silent `out_ms` -- the cluster's
+//!   `out_after`, held off while its host is in maintenance -- or its host no
+//!   member, out (`CsOut`); answering again, up (`CsUp`).
 //! - A set with a member down whose cs is up again has it join in its own
 //!   place: it copies only what it missed. One whose member's cs is out, or
 //!   drained, has another join in that place: the most room first, ties by
@@ -31,6 +32,20 @@ pub const DOWN_AFTER_MS: u64 = 5_000;
 /// A cs silent this long is out, and its places are taken by others: the
 /// cluster's `out_after` unless it says otherwise.
 pub const OUT_AFTER_MS: u64 = 10 * 60 * 1000;
+/// When a silent cs is taken for down, and for out: the cluster's. The
+/// default is `DOWN_AFTER_MS` and `OUT_AFTER_MS`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct After {
+    pub down_ms: u64,
+    pub out_ms: u64,
+}
+
+impl Default for After {
+    fn default() -> After {
+        After { down_ms: DOWN_AFTER_MS, out_ms: OUT_AFTER_MS }
+    }
+}
+
 /// Joins one cs is the joiner of at once, at most.
 pub const JOINS_PER_CS: usize = 2;
 /// Joins the leader proposes at a turn, at most.
@@ -58,9 +73,9 @@ enum Need {
 }
 
 /// What the leader proposes at a turn of its: cs's down, up and out as it
-/// sees them -- or where none is to change, joins. `out_after_ms` is the
-/// cluster's `out_after`.
-pub fn plan(s: &State, seen: &[Seen], out_after_ms: u64) -> Vec<Command> {
+/// sees them, silent past the cluster's `after` -- or where none is to
+/// change, joins.
+pub fn plan(s: &State, seen: &[Seen], after: After) -> Vec<Command> {
     let mut out = Vec::new();
     let view = |c: &Cs| seen.iter().find(|v| v.cs == c.id);
     for c in s.cs() {
@@ -71,9 +86,9 @@ pub fn plan(s: &State, seen: &[Seen], out_after_ms: u64) -> Vec<Command> {
             continue;
         }
         let Some(v) = view(c) else { continue };
-        let out_now = !v.answering && v.silent_ms >= out_after_ms && !v.maintenance;
+        let out_now = !v.answering && v.silent_ms >= after.out_ms && !v.maintenance;
         match c.state {
-            CsState::Up if !v.answering && v.silent_ms >= DOWN_AFTER_MS => {
+            CsState::Up if !v.answering && v.silent_ms >= after.down_ms => {
                 out.push(if out_now { Command::CsOut { cs: c.id } } else { Command::CsDown { cs: c.id } });
             }
             CsState::Down | CsState::Out if v.answering => out.push(Command::CsUp { cs: c.id }),

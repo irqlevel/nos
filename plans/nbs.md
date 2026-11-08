@@ -942,6 +942,100 @@ each new gate.
       own place, every chunk at three again with none being copied, and a
       read on c of what was written while it was gone, which its join's
       copy took. nbs-test 148 of 148 on arm64 (HVF) and x86-64 (TCG).
+  - **N9d, done** (2026-11-08): the controller and the copy in the `cluster`
+    target, and what they found:
+    - **The target**: the leader's controller runs there as in nbs-mds --
+      `repair::plan` takes its thresholds now (`repair::After`, nbs-mds's
+      `DOWN_AFTER_MS` and `out_after=`; the target's two seconds down,
+      four out, its outages 0.4 to 4.4 s: at a second and three nearly every
+      restart had left its sets first, and N8's rules for a member back with
+      a chunk found open were reached no more) -- every half second, on what
+      it sees of each host; each host's cs looks at its joins as nbs-cs
+      does and runs nbswire's copy over the target's network, a source's cs
+      serving it by `serve`; a copy done or given up proposed as `Joined` or
+      `Unjoin`; a host drained now and then, one a run. At the end every set
+      is held to
+      three active members, none on a drained cs, no joiner -- within ten
+      minutes of the network's time -- and every proposal of the
+      controller's to be applied, none refused.
+    - **What it found in the client**: a set's version taken from a
+      take-out's answer two past the view -- a join begun between, which the
+      view lacked -- so the joiner was never written: an answer one past is
+      that take-out alone, one further marks the set behind, its writes held
+      until the map is read again; a write out by a view the map read since
+      changed, waiting for a down last replica alone, done once that one was
+      taken out -- by no replica: a map read sends a changed set's writes out
+      again by the new view; a member joined while the start fenced, never
+      fenced, the start waiting for good; a read with no active replica in a
+      view behind its set, which failed a reconcile and its session -- it
+      waits for the map; a session detached failed by a late answer; an
+      ask-out refused as no replica of its set -- a cs lost for good, its
+      places joined by others -- asked again a second on for good, the map
+      never read again, the stop waiting on the cs: a refusal has the map
+      read again, which drops every ask about a set that no longer writes
+      its cs; and a close a cs back refused as not in the chunk's set
+      (`NotHere`), sent again on each map read for good -- done so now.
+    - **In the cs**: a copy's close that left out its flush where a client's
+      write left the chunk open at its generation -- copied sectors lost to
+      a power cut once the join was done; a pull's moving the epoch on,
+      which took a found-open chunk's mark off, so its writer went on with a
+      replica short of a write; a found-open chunk serving as a source --
+      refused now, the copy waiting or taking another; a joiner taking a
+      write of an epoch before its join, from a writer taken over since,
+      which the copy then kept marked -- refused now; a copy keeping an open
+      mark from before its join -- the joiner a member then, taken out with
+      the chunk open, its writer closing it on those it had left -- which
+      the joiner's crash made found open, its set's last member then no
+      source for the joiner after it: the copy closes at its end a mark no
+      client has written since the join began, whether it wrote the chunk
+      or found it the source's already.
+    - **In the copy**: a member back touched the chunks it thought it had not
+      missed, and kept a write a writer taken over had made on it while it
+      was out -- unfenced, the members fenced against that writer refusing
+      it. It holds every chunk to its source's by sums now, copying only
+      what differs; `Op::Touch` is gone from the wire, `serve` and the store.
+    - **The judges**: the flush owed a host lost for good is judged as
+      sent -- one sent while the view had the host in got there after, a
+      false finding; a writer asks a cs out of a set only where its view
+      writes it there, else it would ask for as long as it lives; and an
+      operation fails only at its deadline or with its session -- a read in
+      a view with no active replica among them failed at once, unjudged,
+      the rule caught by 4 runs in 3000 until then, by 5 in the first 63
+      after.
+    - **Mutants**: 104 in all, each caught. Taken out as redundant, each
+      surviving 1000 seeds as it must: `serve`'s fence of a cs come into the
+      view while reconciling (its writer taken over writes from a view before
+      the join, which the joiner refuses), `ask_out`'s re-send of a write
+      waiting for a cs the view dropped (the map read sends it again), and
+      the mds vouching a joiner for writes alone (a view naming it active is
+      from before its join, whose epoch is refused), a found-open mark put
+      back after a pull's epoch move (no pull reaches such a chunk now), and
+      a chunk found open kept suspect until a copy pulled it whole, though
+      written since, and then a member back pulling whole what it found
+      open at all (it holds every chunk it keeps to its source's by sums,
+      which find what a power cut lost; the join target's focus on a member
+      back with every chunk found open, its last writes cut, holds without
+      it). `client_cs_wide_out` and `client_resend_changed`, which no
+      random run reached, are caught by the end shaped for them: the
+      controller has the host lost down before the writer touches its sets.
+      `client_refused_rereads` and
+      `client_close_not_here`, which random runs reached no more once the
+      copy's rule was in `close_copy`, by two more: the host lost's places
+      all others' before the writer touches its sets, and a drained host
+      back with its chunks found open, sent closes by a writer stalled while
+      its cs was taken down; `found_open_no_source`, by a third: a set's
+      first source back at once with its chunks found open, the last writes
+      on it unflushed, while another member is drained and the writer
+      stalls -- drawn of their own, so that a run they do not shape goes as
+      it did.
+    - **The cost**: the target's 1000 seeds take some 90 s now, against 11:
+      copies move whole chunks. The gate keeps its 1000 seeds: several of
+      the new rules are caught only a few times in a thousand -- a joiner
+      fenced while the start fences, a read waiting for the map, a found-open
+      chunk no source, the copy's flush.
+    - **Tests**: the `cluster` target 3000 seeds; the gate; 104 mutants,
+      each caught; nbs-test 148 of 148 on arm64 (HVF) and x86-64 (TCG);
+      raft-test; make check, both arches and their modules built.
 - **N10.** Snapshots, images and clones.
 - **N11, numbers.** On the hardware, and what they ask for: pages that move
   instead of copies (a message's pages lent to a `DiskQueue`), chain

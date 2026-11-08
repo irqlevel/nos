@@ -136,6 +136,10 @@ struct SetInfo {
     replicas: [ReplicaState; REPLICAS],
     /// The cs being copied onto (N9): written, not read.
     joiner: Option<u32>,
+    /// Behind the set: a Down answer came past the version after this view,
+    /// so changes between are missing from it (N9d). No write is sent by
+    /// it, nor done, until the map is read again.
+    stale: bool,
 }
 
 impl SetInfo {
@@ -385,6 +389,33 @@ impl Session {
         self.ops.values().filter(|o| o.tag & INTERNAL == 0).count()
     }
 
+    /// Whether some set of the volume, as the session's view has it, writes
+    /// cs `cs`: an active member of it, or its joiner.
+    pub fn writes(&self, cs: u32) -> bool {
+        self.map.written_cs().contains(&cs)
+    }
+
+    /// Whether set `set`, as the session's view has it, writes cs `cs`.
+    pub fn writes_in(&self, set: u32, cs: u32) -> bool {
+        self.map.sets.get(&set).is_some_and(|s| s.written_to(cs))
+    }
+
+    /// The session's view of the volume's sets, for a person: each set's
+    /// version, its members and their states, its joiner, and whether the
+    /// view is behind it.
+    pub fn view(&self) -> String {
+        let mut said = String::new();
+        for (id, s) in &self.map.sets {
+            let members: Vec<String> = (0..REPLICAS).map(|i| alloc::format!("{}{}", s.cs[i],
+                if s.replicas[i] == ReplicaState::Active { "" } else { " down" })).collect();
+            let _ = core::fmt::Write::write_fmt(&mut said, format_args!(
+                "[set {} v{}: {}{}{}] ", id, s.version, members.join(", "),
+                s.joiner.map_or(String::new(), |j| alloc::format!("; joiner {}", j)),
+                if s.stale { "; behind" } else { "" }));
+        }
+        said
+    }
+
     /// What the session waits on, for a person: its operations, requests,
     /// closes and asks out.
     pub fn report(&self) -> String {
@@ -435,6 +466,10 @@ impl Session {
 
     /// What this host's mds said.
     pub fn on_mds(&mut self, bytes: &[u8], now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
+        /* Detached or failed: an answer to an ask of before means nothing */
+        if matches!(self.phase, Phase::Detached | Phase::Failed(_)) {
+            return;
+        }
         let Some(s) = Saying::decode(bytes) else { return };
         if self.mds.as_ref().is_some_and(|m| m.id == s.id) {
             self.on_mds_ask(s.said, now, bufs, out);
@@ -465,9 +500,16 @@ impl Session {
                 self.fail(LOST_LAST, out);
             }
             Said::LastReplica | Said::Refused(_) => {
-                /* Silent, and its set's last active replica -- or no longer
-                   this set's: it stays in, the request goes on being sent,
-                   and it is asked about again a second on */
+                /* Silent, and its set's last active replica: it stays in, the
+                   request goes on being sent, and it is asked about again a
+                   second on. Refused otherwise -- no replica of the set as the
+                   mds has it, its place joined by another since (N9), or the
+                   set no longer the volume's -- the view is behind: the map
+                   read again, which drops the ask, and what waits for the cs
+                   is done as it comes due, by a view that no longer writes
+                   it there (found by fuzz/nbs's cluster target, N9d: a cs
+                   lost for good, its places joined by others, and the
+                   writer's stop waited for it for good) */
                 if !said {
                     let why = match &s.said {
                         Said::Refused(why) => why.as_str(),
@@ -478,6 +520,9 @@ impl Session {
                 if let Some(d) = self.downs.get_mut(&key) {
                     d.again = Some(now + RESEND_NS);
                     d.said = true;
+                }
+                if matches!(s.said, Said::Refused(_)) {
+                    self.refresh(now, out);
                 }
             }
             _ => {}
@@ -515,7 +560,8 @@ impl Session {
                 for p in &map {
                     r.places.push((p.chunk.chunk, p.chunk.incarnation, p.chunk.epoch.set));
                     r.sets.insert(p.chunk.epoch.set, SetInfo { version: p.chunk.epoch.version, cs: p.cs,
-                                                               replicas: p.replicas, joiner: p.joiner });
+                                                               replicas: p.replicas, joiner: p.joiner,
+                                                               stale: false });
                 }
                 for (cs, host) in hosts {
                     r.hosts.insert(cs, host);
@@ -526,8 +572,9 @@ impl Session {
                     return;
                 }
                 let read = self.reading.take().unwrap_or_default();
+                let before: BTreeMap<u32, u32> = self.map.sets.iter().map(|(&id, s)| (id, s.version)).collect();
                 self.map = read;
-                self.mapped(now, bufs, out);
+                self.mapped(&before, now, bufs, out);
             }
             (MdsWant::Detach, Said::Detached { .. }) => {
                 self.mds = None;
@@ -552,9 +599,10 @@ impl Session {
         }
     }
 
-    /// The map read: on with the session's start, or the parked pieces sent
-    /// again.
-    fn mapped(&mut self, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
+    /// The map read -- `before`, each set's version in the view before it:
+    /// on with the session's start, or the parked pieces sent again, and the
+    /// writes out by a view of their set that changed.
+    fn mapped(&mut self, before: &BTreeMap<u32, u32>, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
         match self.phase {
             Phase::Mapping => {
                 self.phase = Phase::Fencing;
@@ -569,12 +617,53 @@ impl Session {
                 self.fences_done(now, bufs, out);
             }
             _ => {
+                /* A cs the view writes now that the start has not fenced -- a
+                   member joined meanwhile -- fenced: the start waits for it */
+                if self.phase == Phase::Fencing && self.writable {
+                    self.fence_unfenced(now, bufs, out);
+                    self.fences_done(now, bufs, out);
+                }
+                /* A write out by a view of its set the map read finds changed:
+                   sent again by the view now, waiting for the replicas it has
+                   in -- a member or a joiner come since among them, one gone
+                   not -- so that taking one out never leaves it done with
+                   fewer than the set's view has */
+                let changed: Vec<u64> = self.pieces.iter()
+                    .filter(|(pid, p)| !self.parked.contains(pid)
+                            && self.ops.get(&p.op).is_some_and(|o| o.kind != Kind::Read)
+                            && self.map.set_of(p.place).is_some_and(|(set, s)| before.get(&set) != Some(&s.version)))
+                    .map(|(&id, _)| id).collect();
+                for pid in changed {
+                    self.subs.retain(|_, s| s.what != What::Piece(pid));
+                    self.send_piece(pid, now, bufs, out);
+                }
                 let parked = core::mem::take(&mut self.parked);
                 for pid in parked {
                     self.send_piece(pid, now, bufs, out);
                 }
+                /* An ask to take a cs out of a set the view no longer writes it
+                   in dropped: asked again, it would be refused for as long as
+                   the session lives. What waits for that cs is settled as it
+                   comes due: a request to a cs no set writes done as silent
+                   (`ask_out`), a close it is not in the chunk's set for done
+                   as refused so */
+                let map = &self.map;
+                self.downs.retain(|&(set, cs), _| map.sets.get(&set).is_some_and(|s| s.written_to(cs)));
             }
         }
+    }
+
+    /// A fence sent to every cs the view writes that has none, and none on
+    /// its way: one come into the view since the start's fences went.
+    /// Whether one is still not fenced.
+    fn fence_unfenced(&mut self, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) -> bool {
+        let need: Vec<u32> = self.map.written_cs().into_iter().filter(|cs| !self.fenced.contains(cs)).collect();
+        for &cs in &need {
+            if !self.subs.values().any(|s| s.cs == cs && s.what == What::Fence) {
+                self.send(cs, What::Fence, now, bufs, out);
+            }
+        }
+        !need.is_empty()
     }
 
     /// Asked again where a page of it was refused: the map, from the start.
@@ -646,8 +735,17 @@ impl Session {
                 }
                 let pick = pick.or_else(|| set.cs.iter().copied().find(|&c| set.active(c) && !p.tried.contains(&c)))
                     .or_else(|| set.cs.iter().copied().find(|&c| set.active(c)));
+                /* No active replica in the view: it is behind the set, whose
+                   last active member is never taken out -- a joiner become a
+                   member since, its last one taken out of it meanwhile. The
+                   read waits for the map read again, rather than fail (found
+                   by the cluster target with joins, N9d: a reconcile's read
+                   failed so, and the session with it); its deadline holds */
                 let Some(cs) = pick else {
-                    self.piece_done(pid, false, now, bufs, out);
+                    if !self.parked.contains(&pid) {
+                        self.parked.push(pid);
+                    }
+                    self.refresh(now, out);
                     return;
                 };
                 if let Some(p) = self.pieces.get_mut(&pid) {
@@ -657,6 +755,14 @@ impl Session {
                 self.send(cs, What::Piece(pid), now, bufs, out);
             }
             _ => {
+                /* A view behind its set may lack a joiner: the write waits for
+                   the map */
+                if set.stale {
+                    if !self.parked.contains(&pid) {
+                        self.parked.push(pid);
+                    }
+                    return;
+                }
                 let to: Vec<u32> = set.written().collect();
                 if let Some(p) = self.pieces.get_mut(&pid) {
                     p.waiting = to.iter().copied().collect();
@@ -761,6 +867,14 @@ impl Session {
                             self.parked.push(pid);
                         }
                     }
+                    /* The cs in the chunk's set neither as an active member
+                       nor as its joiner, as the mds has it at the view's index
+                       or after -- taken out, its place another's since:
+                       nothing of the chunk there is to close (found by
+                       fuzz/nbs's cluster target, N9d: the close sent again on
+                       each map read and refused each time, and the writer's
+                       stop waited for good) */
+                    What::Close(place) if matches!(why, Refusal::NotHere) => self.closed(place, cs, now, bufs, out),
                     other => self.resend_later(cs, other, now, bufs, out),
                 }
                 self.refresh(now, out);
@@ -804,7 +918,8 @@ impl Session {
     fn replica_has(&mut self, pid: u64, cs: u32, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
         let Some(p) = self.pieces.get_mut(&pid) else { return };
         p.waiting.remove(&cs);
-        if p.waiting.is_empty() {
+        /* Parked, it is sent again by the map read: done then, by its view */
+        if p.waiting.is_empty() && !self.parked.contains(&pid) {
             self.piece_done(pid, true, now, bufs, out);
         }
     }
@@ -868,6 +983,12 @@ impl Session {
     /// that set waits for it.
     #[allow(clippy::too_many_arguments)]
     fn taken_out(&mut self, set: u32, cs: u32, version: u32, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
+        let Some(at) = self.map.sets.get(&set).map(|s| s.version) else { return };
+        /* As old as the view or older: the view has what was done then */
+        if version <= at {
+            self.cs_wide_done(cs, now, bufs, out);
+            return;
+        }
         if let Some(s) = self.map.sets.get_mut(&set) {
             /* Its join dropped where it was the joiner -- a member back
                whose copy is given up stays down */
@@ -880,7 +1001,28 @@ impl Session {
                     }
                 }
             }
-            s.version = s.version.max(version);
+            /* Each change raises a set's version by one: one past the view is
+               this taking out alone. Further, the view lacks changes between
+               -- a join begun -- and a write by it, at the version answered,
+               taken where the copy has the chunk already, would miss the
+               joiner: the set is read again, its writes held until then */
+            if version == at + 1 {
+                s.version = version;
+            } else {
+                s.stale = true;
+            }
+        }
+        if self.map.sets.get(&set).is_some_and(|s| s.stale) {
+            let writes: Vec<u64> = self.pieces.iter()
+                .filter(|(_, p)| self.map.set_of(p.place).is_some_and(|(s, _)| s == set)
+                        && self.ops.get(&p.op).is_some_and(|o| o.kind != Kind::Read))
+                .map(|(&id, _)| id).collect();
+            for pid in writes {
+                if !self.parked.contains(&pid) {
+                    self.parked.push(pid);
+                }
+            }
+            self.refresh(now, out);
         }
         out.push(Out::Say(alloc::format!("nbs: cs {} of set {} taken out of volume {}'s chunks there (version {})",
                                          cs, set, self.name, version)));

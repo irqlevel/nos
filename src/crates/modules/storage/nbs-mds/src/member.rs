@@ -166,15 +166,16 @@ pub struct Mds {
     /// since when it watches it, when it last answered and served -- when it
     /// looks next; when it last planned, the entry it had applied then, and
     /// when it plans next at the latest; whether a proposal of its was
-    /// refused since; the cluster's `out_after`; and how many of its
-    /// proposals are still to be applied: no plan is made while one is.
+    /// refused since; when a silent cs is down and out (`out_after=`); and
+    /// how many of its proposals are still to be applied: no plan is made
+    /// while one is.
     watch: BTreeMap<u32, (u64, u64)>,
     watch_at: u64,
     planned: u64,
     planned_index: u64,
     plan_at: u64,
     refused: bool,
-    out_after_ms: u64,
+    after: repair::After,
     repairing: u32,
 }
 
@@ -210,7 +211,8 @@ pub fn new(rsm: Rsm<raftmember::Log, State>, me: files::Member, lost: Lost, dir:
     let id = me.id;
     raftmember::Member::new(Mds { me, lost, dir: String::from(dir), proposed: 0, probes: Vec::new(),
                                   verdicts: BTreeMap::new(), next_probe: 1, watch: BTreeMap::new(), watch_at: 0,
-                                  planned: 0, planned_index: 0, plan_at: 0, refused: false, out_after_ms,
+                                  planned: 0, planned_index: 0, plan_at: 0, refused: false,
+                                  after: repair::After { down_ms: repair::DOWN_AFTER_MS, out_ms: out_after_ms },
                                   repairing: 0 }, rsm, id)
 }
 
@@ -429,7 +431,7 @@ impl Mds {
         let changed = applied != self.planned_index || seen.iter().any(|v| {
             core.state().cs().get(v.cs as usize).is_some_and(|c| {
                 (c.state == nbsmeta::CsState::Up) != v.answering
-                    && (v.answering || v.silent_ms >= repair::DOWN_AFTER_MS)
+                    && (v.answering || v.silent_ms >= self.after.down_ms)
             })
         });
         let early = changed && !self.refused && now >= self.planned + WATCH_NS;
@@ -440,7 +442,7 @@ impl Mds {
         self.planned_index = applied;
         self.refused = false;
         self.plan_at = now + PLAN_NS;
-        let plan = repair::plan(core.state(), &seen, self.out_after_ms);
+        let plan = repair::plan(core.state(), &seen, self.after);
         for cmd in plan {
             klog!(1, "nbs: the controller proposes {:?}", cmd);
             self.repairing += 1;

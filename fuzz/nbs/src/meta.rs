@@ -1131,7 +1131,7 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
                 let silent_ms = if answering { 0 } else { r.pick(&[1_000u64, 6_000, 700_000]).unwrap_or(6_000) };
                 Seen { cs, answering, silent_ms, maintenance: r.chance(10) }
             }).collect();
-            let mut plan = repair::plan(s, &seen, repair::OUT_AFTER_MS);
+            let mut plan = repair::plan(s, &seen, repair::After::default());
             if plan.is_empty() {
                 Command::CsUp { cs: r.below(m.cs.len() as u64 + 1) as u32 }
             } else {
@@ -1157,7 +1157,7 @@ fn settle(s: &State, gone: &[bool]) -> Option<String> {
     let turns = 4 * (t.sets().len() + 4);
     let mut index = 2_000_000u64;
     for _ in 0..turns {
-        let cmds = repair::plan(&t, &seen, repair::OUT_AFTER_MS);
+        let cmds = repair::plan(&t, &seen, repair::After::default());
         for c in &cmds {
             index += 1;
             if let Some(Answer::Refused(why)) = Answer::decode(&t.apply(index, &c.encode())) {

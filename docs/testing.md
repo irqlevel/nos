@@ -285,7 +285,7 @@ how it works and what it found.
 | the CRCs: `src/crates/common/crc` (CRC-32, CRC-32C and CRC-16, each as a message has it and as the bare register, slicing by eight) and what is checked by them -- GPT, the disk log, ext4's metadata_csum, gdt_csum and journal, raft's log -- and the `crc32` command (`kernel/src/crc32.rs`) | `crc-test.py` (host, in CI): each CRC's known answers, random messages of every length and alignment held to the CRC computed from its definition a bit at a time -- every form, from any register, whole and across a split, a checksum with a hole -- and CRC-32 to zlib's over messages past 64 KiB, whole and in pieces; every boot's `rust_test` holds the kernel's own build to the check values (`crc32::selftest`). Then the gates of the formats checked by what changed: `parttest.py` and `fs-fuzz.py` (GPT, the disk log), `extfmt-test.py` and `hvboot-test.py` (ext4's checksums and journal, hvboot's GPT), `raft-test.py` (the log), and `ext4-test.py`, whose files the `crc32` command sums against the host's |
 | NBS's metadata service: `src/crates/modules/storage/nbs-mds` -- the member over raftmember with NBS's hooks (the cluster's id before every message and held to, the offer a host is made a member by and the listener that takes it while the host is in no cluster, raft's messages for a member a host does not have answered so, a host's lost state said by the leader, the state's digest proposed as leader and a member whose own differs stopped -- raftmember's `App::halt`), its commands (`nbs init`, `nbs host add`, `remove` and `replace`, `nbs`, `nbs hosts`; `nbs devices add` and `drain`, `nbs cs`, `nbs volume create`, `delete` and `resize`, `nbs volumes`, `nbs volume`, in `store.rs`; `nbs io`, below), the `nbs` provider (`provider.rs`, `nbs.descriptor.json`), `compact=`, and its folder; `src/crates/modules/cluster/raftmember`, the member it and cluster.ko run | `nbs-test.py` (arm64, and `--arch x86_64`): three nos on hub.py, the registry made among them first, each with a pool disk of three partitions -- an NBS cluster made and two hosts added, one through a member that does not lead; an add asked again answered with the same incarnation, a second init refused; a commit through the majority; what is stored: no volume before three hosts have a device, the pools' partitions found by their GUIDs, devices added by id and by name, the pool's disk refused for having no id, a device added again the same, c's copy of a's partition refused as a disk moved between servers, every host saying the same of the chunk servers; volumes made, made again the same, refused for another size, grown, refused smaller, past the room and for a name that is none, made for another host; a change read at once on the host it was typed at, and on the others once they have applied it; the room filled to its last slot and given back by a delete; a device drained and what it holds counted against its host's room; the provider answering through `mgmt call` as the command does; every host's digest at the same entry, the same, the leader's held to it; every log compacted into a snapshot (`compact=4096`); the leader killed, the other two electing one of themselves and committing, the killed host back from its snapshot and log with the others' state; the leader cut off by the hub, the other two electing and committing while it commits nothing, and following once healed; a host's folder removed, the leader saying its state is gone, an add of it refused, and `replace` taking it back as a new member, sent the snapshot; a member removed, its old incarnation refused added again, its chunk server kept taking no new chunks; nothing panicked. After touching raftmember, `cluster-test.py` too; the descriptor, `web-test.py` and the panel's tests |
 | NBS's metadata: `src/crates/common/storage/nbsmeta` -- the NBS cluster's id and name, its members (a host and the incarnation its mds made) in the order they joined, the members removed and never taken again, the voters' policy (the first five); what is stored (`storage.rs`: each host's cs and its devices in slots, the volumes, their chunks, the replica sets the chunks share, the free list); placement (`place.rs`); the tables in copy-on-write pieces (`pieces.rs`); the snapshot written and read as a stream, the rules one read back is held to, and the digest every 64 entries (`snapshot.rs`); the commands and their answers; and `codec::Stream`, what the snapshot is read through | `nbs-fuzz.py` (host, in CI), whose `meta` target holds it to a model of its own (below), then `nbs-fuzz.py --mutants`, forty-four of them the metadata's (five the repair controller's), each caught; `raft-test.py` (host, in CI), whose `nbsmeta` target holds the members' part to a model of its own -- alone, under commands from pools that meet and from wide ones that fill the cluster, every answer and everything it shows; its snapshot read back, changed and refused, and a replica from a snapshot part way -- and its `nbsmeta_*` scenarios; `fuzz/raft/mutants.py`'s six `nbsmeta_*` mutants, each failing the gate and its own scenario |
-| NBS's chunk server, its format and engine: `src/crates/common/storage/nbscs` -- the device's layout (`format.rs`: the superblock twice, the fences and the table of slots in two copies, every record's sequence number and CRC seeded with the format's id, the good copy chosen, a device's first pages told apart -- blank, NBS's, something else's -- by `holds`), the engine (`store.rs`: format and open, a torn copy written again, fences durable on every device before they are answered, open marks before a generation's first write, a chunk held by number and incarnation, a slot zeroed and flushed before its record, a close after its data, the volume a request names held to the chunk's, a free); and NBS's messages, `src/crates/common/storage/nbswire` -- a client's requests and a cs's answers, a cs's questions and its mds's | `nbs-fuzz.py` (host, in CI), whose `cs` target runs the engine over disks with a write cache through power cuts and holds it to what each fence, open mark, close and sector may be (below), and whose `wire` target reads every message back and noise as none; then `nbs-fuzz.py --mutants`, twenty-four of the cs's and twelve of the wire's, its `serve`'s and the copy's, each caught; then `nbs-test.py` (arm64, and `--arch x86_64`) for the cs over a real device |
+| NBS's chunk server, its format and engine: `src/crates/common/storage/nbscs` -- the device's layout (`format.rs`: the superblock twice, the fences and the table of slots in two copies, every record's sequence number and CRC seeded with the format's id, the good copy chosen, a device's first pages told apart -- blank, NBS's, something else's -- by `holds`), the engine (`store.rs`: format and open, a torn copy written again, fences durable on every device before they are answered, open marks before a generation's first write, a chunk held by number and incarnation, a slot zeroed and flushed before its record, a close after its data, the volume a request names held to the chunk's, a free); and NBS's messages, `src/crates/common/storage/nbswire` -- a client's requests and a cs's answers, a cs's questions and its mds's | `nbs-fuzz.py` (host, in CI), whose `cs` target runs the engine over disks with a write cache through power cuts and holds it to what each fence, open mark, close and sector may be (below), and whose `wire` target reads every message back and noise as none; then `nbs-fuzz.py --mutants`, twenty-seven of the cs's and twelve of the wire's, its `serve`'s, the mds's and the copy's, each caught; then `nbs-test.py` (arm64, and `--arch x86_64`) for the cs over a real device |
 | NBS's chunk server on a host: `src/crates/modules/storage/nbs-cs` (the devices the host's mds gives it taken in -- held with a `DiskQueue` and claimed, opened, formatted where blank, refused and said otherwise, and tried again -- served only with every one taken in; `nbs.cs` served, a request the engine has not checked asked of the host's mds first, what it vouched for kept; chunks and fences the metadata no longer has given back; `nbscs`, `nbscs chunks`, `nbscs fences`; `disk.rs`, the engine's device over a queue); what nbs-mds tells a cs (`member.rs`'s `on_cs_query`, and the listener's `NoMds`); `nbs io` (`nbs-mds/src/io.rs`); `nbs devices add`'s look at a device's first pages and `wipe` (`store.rs`); kcore's `DiskQueue::read_wait` and `write_wait` | `nbs-test.py` (arm64, and `--arch x86_64`), its N7 phase: every host's cs taking its devices in and formatting them; a device with a filesystem's magic on it refused, and taken with `wipe`; a device its cs holds added again, the same; a volume written to its three replicas and read back across a chunk's end, from the writer's host and read-only from the others; flushed, its two chunks open on every cs at the writer's generation, then closed; a writer on another host refused, then forced, and its fences refusing the old writer's write and read; a host booted again, its cs back with its fence, its open mark and closed chunk, and their data; the volume deleted, refused first while attached, and every cs giving its chunks and its fence back; a host's nbs-cs unloaded, a request to it bounced and said at once while the others answer, and loaded again, serving. Then `nbs-fuzz.py` |
 | the cluster's registry: `src/crates/common/cluster/registry` -- its state (the cluster, its hosts by node with their keys, addresses, labels and maintenance, the hosts removed, the keys retired, the invitations open), its commands and their answers (maintenance, an address by role, a key added and dropped among them), applying them under the proposer's clock, its snapshot and the rules a snapshot read back is held to, the voters' policy, a host's peers | `raft-test.py` (host, in CI), whose `registry` target holds it to a model of its own -- alone, under commands from pools that meet and from wide ones that fill the cluster, every answer and everything it shows; its snapshot read back, changed and refused, and a replica from a snapshot part way; and as a group through `raft::rsm` over a lossy network, every member the same and the model's in the log's order -- and its `registry_*` scenarios; `fuzz/raft/mutants.py`'s nine `registry_*` mutants, each failing the gate and its own scenario; a kernel's build compiles the crate for its target, through cluster.ko |
 | the cluster's module: `src/crates/modules/cluster/cluster` -- its member over raft's `rsm` and a `DiskLog` (`member.rs`: raft's messages taken only from the host whose node they claim, commands handed to the leader, raft's membership kept to the registry's, the leader's own removal handing the lead on first, the peers told to ipcnet), its folder (`files.rs`: `member` written last and once, the joined hosts in it, a log with no `member` cleared), `init`, `invite`, `join`, `remove`, `revoke`, `maintenance`, `address`, `rekey` (resumable, from the registry's keys and ipcnet's), `recover` (the probe, the typed name, the lost hosts removed) (`lib.rs`), the token (`token.rs`), the `cluster` provider and its descriptor (`provider.rs`, `cluster.descriptor.json`) -- ipcnet's control mailbox (`ipcnet.ctl`: `ipcwire::control`, `modules/cluster/ipcnet/src/control.rs`), a host invited held to the member's mailbox alone (`only=` in hosts.toml, `PeerConf::same_link`, `Peer::may_reach`, `monitor_for`), a peer's keys changed in place and the host's own key staged and switched (`files.rs`'s identity.pem and next.pem, `Peer::live`, `Server::use_identity`), and the channel's word on which host sent a message (`kernel_ipc_peer_name`, `kcore::ipc::peer_name`) | `cluster-test.py` (arm64, and `--arch x86_64`): three nos on hub.py's LAN, no key pinned by hand -- a cluster made, two hosts invited by their keys and joined (one through a member that does not lead), a wrong secret, another host's token, a token used again and a second `init` refused, an invited host's pings to a member's echo refused, every host up to every other and pinging over what the registry made, the provider through the bus, maintenance and an address seen by every host, a rekey under 6000 pings with every one answered and no connection lost, every host rebooted at once, `recover` on the last of three and a host installed anew joined after, the leader of two removed with the lead handed on first and its key refused when invited again; then `net-fuzz.py`'s `ipcnet` target (the control mailbox's requests, hosts.toml held to each; the world's host made a host invited and a host again -- nothing past its one name, no monitor, never made anew -- and pinned by a second key, kept; a key staged) and `raft-test.py` (the registry, `force_alone`); for the provider `web-test.py` (its descriptor) and the panel's tests (`cd panel && npx playwright test`: the cluster's page, an invitation made and taken back); after touching the ABI, `sshd-test.py` (arm64: the ffi digest) and `ipc-fuzz.py` |
@@ -3246,9 +3246,14 @@ closing a 24 MiB volume through six hosts' cs's -- nbscs's engine, done by
 nbswire's `serve` as nbs-cs.ko does it -- asking its host's mds, whose answers
 are nbswire's `mds` over nbsmeta's state, as nbs-mds.ko's are; the leader's
 look at a cs before it is taken out the fuzzer's, mostly that it answers.
-The network delivers a few messages a step, in order between two ends and
-the pairs in any order, time going by a little and now and then past a
-silence.
+The leader's controller runs there as nbs-mds runs it (N9d): a cs down two
+seconds after its host is, out after four (`repair::After`, the thresholds a
+parameter of the plan) -- some two restarts in five come back members still
+-- up once back; its places joined by its own cs back,
+or by another, and each joiner's cs running nbswire's copy from a source, as
+nbs-cs does, over the same network. The network delivers a few messages a
+step, in order between two ends and the pairs in any order, time going by a
+little and now and then past a silence.
 
 - **What happens**: a host crashes now and then -- one at a time, its disk's
   write cache kept, lost or torn -- and comes back a while on; a writer on
@@ -3257,12 +3262,28 @@ silence.
   to flush, then nothing -- and the old one is asked on to write and to
   flush, as its host's driver would until it learns it is fenced. A writer
   whose chunk's last replica restarted fails, as it should, and another
-  starts. At the end of some runs a host is lost for good, where every
-  chunk has a replica in on another: the one down kept down, or nbs-test's
-  repair phase shaped -- every chunk written, so that each replica in owes
-  a flush; a host that holds some lost; every chunk written past it, so
-  that it is out of every set and still owed one; then a flush and a
-  close.
+  starts. A host is drained now and then, one a run, its places taken by
+  others while it serves. At the end of some runs a host is lost for good,
+  where every chunk has a replica in on another: the one down kept down, or
+  nbs-test's repair phase shaped -- every chunk written, so that each
+  replica in owes a flush; a host that holds some lost; every chunk written
+  past it, so that it is out of every set and still owed one; then a flush
+  and a close. In half of those the controller has the host down first,
+  before the writer touches its sets: a flush goes to it by the view of
+  before, and the writes past it read the map again, dropping it -- and in
+  half of those again the target waits until the host's places are all
+  others', so that the writer's asks to take it out are refused as no
+  replica of their sets. In some other runs a host that holds some is
+  crashed with every chunk open on it and drained, the writer stalled
+  until the controller has its cs down in every set; back with the chunks
+  found open, it is sent the writer's closes by a view from before, and
+  refuses them as not in the chunks' sets; in others a set's first active
+  member -- the source a copy asks first -- crashes with every chunk
+  written since the last flush and comes back at once, its chunks found
+  open and what its cache lost gone, while the writer stalls and another
+  member of the set is drained: the joiner is to take another source.
+  These ends are drawn of their own, so that a run they do not shape goes
+  as it did.
 - **Held to**:
   - a write done held by every replica the metadata has in, read back from
     each then and there -- but one that restarted with the chunk open at
@@ -3275,25 +3296,62 @@ silence.
     generation's write or flush -- held where the cs serves it;
   - the replicas alike once a writer serves, and at the end, after a writer
     is stopped;
-  - a writer failing only as its chunk's last active replica refuses it;
+  - a writer failing only as its chunk's last active replica refuses it,
+    and an operation of its -- a read, a write, a flush, a close -- only at
+    its deadline or with its session: a refusal sends it to another
+    replica, or has the map read again;
   - with a host lost for good, the writer's writes past it, its flush and
     its close done -- none failed at its deadline -- no flush sent to its
-    cs once no set has it in, and the stop detached. A stop held up by a
-    chunk whose replicas in are all on the host lost is none of this: that
-    chunk has nowhere else to be.
+    cs once neither the state nor the writer's view has it in a set (judged
+    as sent: one sent while the view had it in may get there after), and
+    the stop detached. A stop held up by a chunk whose replicas in are all
+    on the host lost is none of this: that chunk has nowhere else to be;
+  - a cs asked out of a set only where the writer's view writes it there:
+    one asked about once the view has it out would be asked about for as
+    long as the session lives;
+  - every set back at three active members by the end, none on a drained
+    cs and none with a joiner, within ten minutes of the network's time --
+    but where a set's active members are all on the host lost; and every
+    proposal of the controller's applied, none refused.
 
   A writer that follows another holds what that one had done and not
   flushed as a crash would leave it: there or not.
 
   It did not find the close that nbs-test's repair phase left waiting for
-  good on a cs no set had in any more, though it still owed a flush. There
-  the controller had taken it out. Here only the writer takes a replica
-  out, the hosts always came back, and a run's writes reach three of the
-  volume's six chunks, so a host lost was never out of every set. Hence the
-  end above.
+  good on a cs no set had in any more, though it still owed a flush (N9c):
+  only the writer took a replica out then, the hosts always came back, and
+  a run's writes reach three of the volume's six chunks, so a host lost was
+  never out of every set. Hence the end above. With the controller and the
+  copies in it (N9d) it found, each fixed with its mutant:
+  - in the client, a set's version taken from a take-out's answer past the
+    view -- a join begun between, the joiner never written; a write out by
+    a view the map read since changed, done once its one replica, down, was
+    taken out, by no replica at all; a member joined while the start fenced,
+    never fenced, the start waiting for it for good; a read with no active
+    replica in a view behind its set, failing a reconcile and its session;
+    a session detached failed by a late answer; and, with the controller's
+    thresholds at two seconds and four, where more restarts come back
+    members, an ask-out refused as no replica of its set -- a cs lost for
+    good, its places joined by others -- asked again a second on for good,
+    the map never read again, and the stop waiting on the cs: a refusal has
+    the map read again; and a close a cs back refused as not in the chunk's
+    set, sent again on each map read for good: it is done so now;
+  - in the cs, a copy's close that left out its flush where a client's write
+    left the chunk open; a pull's moving the epoch on that took the mark of
+    a chunk found open off; a chunk found open serving as a copy's source;
+    a joiner taking a write of an epoch before its join, from a writer
+    taken over since; and a copy keeping an open mark from before its join
+    -- the joiner a member then, taken out with the chunk open -- which the
+    joiner's crash made found open, its set's last member then no source
+    for the joiner after it: the copy closes such a mark at its end;
+  - in the copy, a member back's touch keeping a write a writer taken over
+    had made on it while it was out and not fenced: it holds every chunk to
+    its source's by sums now, and `Op::Touch` is gone.
 
 `--mutants` runs `fuzz/nbs/mutants.py`, which takes out one rule at a time.
-Each of its ninety-one must fail the gate. The metadata's forty-four:
+Each of its hundred and four must fail the gate -- run as `nbs-fuzz gate
+--first`, stopped at the first target that fails: the gate's verdict, sooner.
+The metadata's forty-four:
 - placement: the home host first, the most room first, rule 6, three full
   hosts refused as no room rather than too few hosts, new chunks only on
   cs's that are up and only into a clean set, an empty set made again
@@ -3320,7 +3378,7 @@ Each of its ninety-one must fail the gate. The metadata's forty-four:
   room, joins waiting for a turn without a cs's change, and a cs silent past
   `out_after` out.
 
-The cs's twenty-four: a slot's zeros flushed before the record that takes it,
+The cs's twenty-seven: a slot's zeros flushed before the record that takes it,
 and the slot zeroed at all; an open mark durable before a generation's first
 write; copy B written only once copy A is flushed; a fence durable before it
 is answered; a close only after the chunk's data; a slot of a number's chunk
@@ -3329,40 +3387,54 @@ refused; a request older than the fence refused; a record whose CRC fails
 taken as no record; a record's first write torn in copy A taken as never
 written; a fence page with a torn copy written again at the open; a device
 with anything past a superblock's bytes never taken for blank; nothing of one
-volume's read through another's; a freed slot given back -- and nine of the
-copy's: a chunk found open suspect until a copy has pulled it whole, though
-written since; a write of an epoch before the chunk's refused, though a check
-of it was vouched for; a client's write to a set joined marked before it is
-written, and a copy writing no sector so marked; a pull moving the chunk's
-epoch on, durably, before it reads; a join's marks not those of the join
-before it; a copy into a set not joined refused; a chunk the copy closes
-closed only after its data is durable; and a record of the copy's, at no
-writer's generation, read back as itself.
+volume's read through another's; a freed slot given back -- and twelve of
+the copy's: a chunk found open no copy's source, and an open mark no client
+has written since the join began closed by the copy at its end; a write of
+an epoch before the
+chunk's refused, though a check of it was vouched for, and a joiner taking no
+write of an epoch before its join; a client's write to a set joined marked
+before it is written, and a copy writing no sector so marked; a pull moving
+the chunk's epoch on, durably, before it reads; a join's marks not those of
+the join before it; a copy into a set not joined refused; a chunk the copy
+closes closed only after its data is durable, and what it took in made
+durable where a client's write left the chunk open at its generation; and a
+record of the copy's, at no writer's generation, read back as itself.
 
-The wire's twelve: a request read whole, nothing past its end, a flag read as
-0 or 1 alone, and a map asked for past its most read as none; of `serve`, a
-chunk found open refused to its writer, a flush refused to a writer with one
-and to a writer fenced since, a write vouched for as the joiner's marking the
-set from then on, and a found-open chunk written by its set's joiner not
-refused as failed; of the copy, a touch that finds a chunk written since the
-member went down pulling it, a member back pulling every chunk it found open,
+The wire's twelve: a request read whole, nothing past its end, a flag read
+as 0 or 1 alone, and a map asked for past its most read as none; of `serve`,
+a chunk found open refused to its writer, a flush refused to a writer with
+one and to a writer fenced since, a write vouched for as the joiner's marking
+the set from then on, and a found-open chunk written by its set's joiner not
+refused as failed; of the mds, the map naming a set's joiner; of the copy, a
+member back holding every chunk to its source's by sums, those it holds too,
 a chunk pulled held to its source's by sums, and a granule that differs held
 to the source's a sector at a time.
 
-And the client's eleven: a write done only once every replica in has it;
-every cs fenced before the writer serves; a chunk left open made the same on
-its replicas; a read only of an active replica; a flush done only after the
-flushes before it, of every cs that acknowledged a write since the last
-began, and only of those some set of the volume still writes; two writes that
-overlap never out at once; what was asked before the stop done before it; a
-writer its chunk's last replica refuses failed; and a replica that refuses
-asked out as refusing though asked out as silent.
+And the client's twenty-one: a write done only once every replica in has it,
+a set's joiner among them; every cs fenced before the writer serves, and one
+come into the view while the start fences fenced too; a chunk left open made
+the same on its replicas; a read only of an active replica, and one with
+none in the view waiting for the map; a flush done only after the flushes
+before it, of every cs that acknowledged a write since the last began, and
+only of those some set of the volume still writes; a flush, a close or a
+fence to a cs no set writes done, not waited on; two writes that overlap
+never out at once; what was asked before the stop done before it; a writer
+its chunk's last replica refuses failed; a replica that refuses asked out as
+refusing though asked out as silent; a set's version from a take-out's
+answer taken only one past the view, else the set read again; a write out by
+a view a map read finds changed sent again by the new one; a session
+detached deaf to the answers of before; an ask-out refused as no replica
+of its set having the map read again, which drops every ask about a set
+that no longer writes its cs; and a close a cs refuses as not in the
+chunk's set done.
 
 `--seed N --seconds S` runs a campaign, of the target `--target` names
 (`meta` unless it names `cs`, `wire` or `cluster`). `NBS_CLUSTER_STATS=1`
 says what a `cluster` run did -- writes, reads, flushes and closes done and
-failed, crashes, takeovers, replicas taken out -- and `--trace` every
-operation, request and answer. `NBS_META_STATS=1` and
+failed, crashes, takeovers, replicas taken out, the controller's proposals,
+joins, drains -- and `--trace` every operation, request and answer, a copy's
+among them. `NBS_DEBUG_REPORT=<client>:<from>:<to>` prints a client's report
+and its view of the sets (`Session::view`) at each step of a span. `NBS_META_STATS=1` and
 `NBS_CS_STATS=1` print each run's answers and steps by kind.
 
 ### `hv-linux-test.py` -- a real Linux bzImage, for a while and for good
