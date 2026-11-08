@@ -887,6 +887,61 @@ each new gate.
       joiner is the source's, and every one the copy closed still is after
       a power cut. Fifteen mutants of its rules; the wire target's new
       messages.
+  - **N9c, done** (2026-11-08): the controller in nbs-mds, run by the
+    leader:
+    - **What it watches**: every cs, once a second, by the look it takes
+      before a replica is taken out (`Op::Ping`): a cs answering and
+      serving is seen up; one silent 2.5 s past its last answer, silent.
+      Its silence counts from when this leader began to watch it, so that a
+      new leader takes none for down at once; a member that is no leader
+      keeps nothing of it.
+    - **What it proposes**: every 10 s -- and a second after its last plan
+      at the soonest where the state moved on (a cs changed, a join done or
+      dropped, so that a cs back in many sets is not ten seconds a pair of
+      joins) or a cs went silent past `DOWN_AFTER_MS` or came back -- what
+      `nbsmeta::repair::plan` makes of the state and of what it saw: cs's
+      down, up and out, then joins. One plan at a time: none is made while
+      one is still to be applied, and after a refusal the ten seconds'
+      alone, each refusal said, so that one is not proposed again every
+      second. `out_after=<seconds>` (10 to 86400, ten minutes unless given)
+      is how long a cs is silent before it is out and its places taken by
+      others. The registry's maintenance flag is not read yet.
+    - **`nbs status`** says how far from three the chunks are: at three
+      replicas, at two, at one, being copied and by how many joins, and the
+      cs's down and out.
+    - **Found by nbs-test's repair phase, in the client**: c had
+      acknowledged a write; killed, it was taken out of every set -- there
+      by the controller's `CsDown`, which the client read in its map at the
+      next write -- and the close's flush then went to it and waited for
+      good, no set being left to ask it out of. A flush now goes only to the
+      cs's some set of the volume still writes, and a flush, a close or a
+      fence asked of a cs no set writes is done, not waited on. The
+      `cluster` target could not have seen it: its hosts always came back,
+      and its writes reach three of the volume's six chunks, so a host lost
+      was never out of every set by the writer's own taking out, the one
+      way it has. At the end of some runs a host is now lost for good --
+      the one down kept down where every chunk can do without it, or
+      nbs-test's case shaped: every chunk written, a host that holds some
+      lost, every chunk written past it, then a flush and a close, which
+      must be done, and no flush sent to that cs. The flush's half has its
+      mutant (`client_flush_written`), 91 in all. The other half -- what was
+      asked of a cs before a map read dropped it, done once the cs is found
+      silent -- is the one cover where the request went first: a cs the
+      controller has down, or a drained cs's place taken by its joiner,
+      while a flush or a close to it is out. N9d's `cluster` target, with
+      the controller in it, is to reach that, and its mutant then join the
+      three above.
+    - **nbs-test's phases before the repair one** reboot c and unload its
+      cs: under TCG a boot is past `DOWN_AFTER_MS`, so the controller has c
+      down and its replicas out until its joins are done -- x86-64 read c's
+      data from a, not c. A read on c from its own replica now waits for
+      every set to be whole again.
+    - **Tests**: nbs-test's repair phase, on both arches: a volume written,
+      c killed -- the leader's controller has its cs down -- the volume
+      written past it and closed, c booted again: its cs up, joined in its
+      own place, every chunk at three again with none being copied, and a
+      read on c of what was written while it was gone, which its join's
+      copy took. nbs-test 148 of 148 on arm64 (HVF) and x86-64 (TCG).
 - **N10.** Snapshots, images and clones.
 - **N11, numbers.** On the hardware, and what they ask for: pages that move
   instead of copies (a message's pages lent to a `DiskQueue`), chain

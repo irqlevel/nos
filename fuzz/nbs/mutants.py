@@ -340,6 +340,10 @@ MUTANTS = [
      'nbsclient/src/lib.rs',
      '.is_some_and(|d| d.refused || !refused)',
      '.is_some()'),
+    ('client_flush_written', "a flush only of the cs's some set of the volume still writes",
+     'nbsclient/src/lib.rs',
+     '.into_iter().filter(|cs| written.contains(cs)).collect();',
+     '.into_iter().filter(|cs| written.contains(cs) || true).collect();'),
     # N9b: the copy -- the join target's
     ('copy_leaves_marks', "a copy writes no sector a client has since the join began",
      'nbscs/src/store.rs',

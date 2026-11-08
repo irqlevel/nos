@@ -3257,7 +3257,12 @@ silence.
   to flush, then nothing -- and the old one is asked on to write and to
   flush, as its host's driver would until it learns it is fenced. A writer
   whose chunk's last replica restarted fails, as it should, and another
-  starts.
+  starts. At the end of some runs a host is lost for good, where every
+  chunk has a replica in on another: the one down kept down, or nbs-test's
+  repair phase shaped -- every chunk written, so that each replica in owes
+  a flush; a host that holds some lost; every chunk written past it, so
+  that it is out of every set and still owed one; then a flush and a
+  close.
 - **Held to**:
   - a write done held by every replica the metadata has in, read back from
     each then and there -- but one that restarted with the chunk open at
@@ -3270,28 +3275,52 @@ silence.
     generation's write or flush -- held where the cs serves it;
   - the replicas alike once a writer serves, and at the end, after a writer
     is stopped;
-  - a writer failing only as its chunk's last active replica refuses it.
+  - a writer failing only as its chunk's last active replica refuses it;
+  - with a host lost for good, the writer's writes past it, its flush and
+    its close done -- none failed at its deadline -- no flush sent to its
+    cs once no set has it in, and the stop detached. A stop held up by a
+    chunk whose replicas in are all on the host lost is none of this: that
+    chunk has nowhere else to be.
 
   A writer that follows another holds what that one had done and not
   flushed as a crash would leave it: there or not.
 
-`--mutants` runs `fuzz/nbs/mutants.py`, which takes out one rule at a time.
-Each of its fifty-four must fail the gate. The metadata's twenty:
-- the home host first, the most room first, rule 6;
-- room given back, a volume refused whole, three full hosts refused as no
-  room;
-- a forced attach's new generation, a device of another host's, a name
-  taken, an attached volume kept;
-- a divergence said, the snapshot's checks of the free list, of the room
-  reserved, of the chunks' counts and of its counters, and a snapshot
-  written in pieces as in one;
-- a chunk's incarnation moved on when its number is taken again, and held to
-  in a snapshot;
-- a replica taken out raising its set's version, a set's last active one
-  never taken out, a replica taken out only by the volume's writer of now,
-  and a writer's attach asked again answered with the generation it gave.
+  It did not find the close that nbs-test's repair phase left waiting for
+  good on a cs no set had in any more, though it still owed a flush. There
+  the controller had taken it out. Here only the writer takes a replica
+  out, the hosts always came back, and a run's writes reach three of the
+  volume's six chunks, so a host lost was never out of every set. Hence the
+  end above.
 
-The cs's fifteen: a slot's zeros flushed before the record that takes it,
+`--mutants` runs `fuzz/nbs/mutants.py`, which takes out one rule at a time.
+Each of its ninety-one must fail the gate. The metadata's forty-four:
+- placement: the home host first, the most room first, rule 6, three full
+  hosts refused as no room rather than too few hosts, new chunks only on
+  cs's that are up and only into a clean set, an empty set made again
+  before a new one, and only where it is no clean set the placement fills;
+- room given back, a volume refused whole, a forced attach's new
+  generation, a device of another host's, a name taken, an attached volume
+  kept, and a writer's attach asked again answered with the generation it
+  gave;
+- a chunk's incarnation moved on when its number is taken again;
+- a replica taken out raising its set's version, and only by the volume's
+  writer of now; a set's last active replica never taken out, nor taken
+  with a cs down; a cs down dropped as the joiner of its sets, and a member
+  down keeping the last version it was active at;
+- a join: refused where its set moved on since its plan, one a set at a
+  time, in another's place only with room for the set and only where that
+  member's cs is gone or drained, holding the room it takes; the member it
+  replaces giving its room back, the three in order again, and a joiner
+  silent to the writer dropped;
+- a divergence said; a snapshot's free list, room reserved, chunks' counts,
+  incarnations, counters, joiner and members down each held to what they
+  can be; a snapshot written in pieces as in one;
+- the controller's five: a member back joining its own place, another
+  taking the place of a member gone or drained, a join only where there is
+  room, joins waiting for a turn without a cs's change, and a cs silent past
+  `out_after` out.
+
+The cs's twenty-four: a slot's zeros flushed before the record that takes it,
 and the slot zeroed at all; an open mark durable before a generation's first
 write; copy B written only once copy A is flushed; a fence durable before it
 is answered; a close only after the chunk's data; a slot of a number's chunk
@@ -3300,20 +3329,34 @@ refused; a request older than the fence refused; a record whose CRC fails
 taken as no record; a record's first write torn in copy A taken as never
 written; a fence page with a torn copy written again at the open; a device
 with anything past a superblock's bytes never taken for blank; nothing of one
-volume's read through another's; a freed slot given back -- and of
-`serve`, a chunk found open refused to its writer, a flush refused to a
-writer with one, and a flush refused to a writer fenced since. The wire's
-three: a request read whole, nothing past its end, a flag read as 0 or 1
-alone, and a map asked for past its most read as none. And the client's
-twelve: a write done only once every replica in has it; every cs fenced
-before the writer serves; a chunk left open made the same on its replicas; a
-read only of an active replica; a flush done only after the flushes before
-it, and of every cs that acknowledged a write since the last began; two
-writes that overlap never out at once; what was asked before the stop done
-before it; a writer its chunk's last replica refuses failed; a replica that
-refuses asked out as refusing though asked out as silent; and, the
-metadata's again through the client, the attach's token and who takes a
-replica out.
+volume's read through another's; a freed slot given back -- and nine of the
+copy's: a chunk found open suspect until a copy has pulled it whole, though
+written since; a write of an epoch before the chunk's refused, though a check
+of it was vouched for; a client's write to a set joined marked before it is
+written, and a copy writing no sector so marked; a pull moving the chunk's
+epoch on, durably, before it reads; a join's marks not those of the join
+before it; a copy into a set not joined refused; a chunk the copy closes
+closed only after its data is durable; and a record of the copy's, at no
+writer's generation, read back as itself.
+
+The wire's twelve: a request read whole, nothing past its end, a flag read as
+0 or 1 alone, and a map asked for past its most read as none; of `serve`, a
+chunk found open refused to its writer, a flush refused to a writer with one
+and to a writer fenced since, a write vouched for as the joiner's marking the
+set from then on, and a found-open chunk written by its set's joiner not
+refused as failed; of the copy, a touch that finds a chunk written since the
+member went down pulling it, a member back pulling every chunk it found open,
+a chunk pulled held to its source's by sums, and a granule that differs held
+to the source's a sector at a time.
+
+And the client's eleven: a write done only once every replica in has it;
+every cs fenced before the writer serves; a chunk left open made the same on
+its replicas; a read only of an active replica; a flush done only after the
+flushes before it, of every cs that acknowledged a write since the last
+began, and only of those some set of the volume still writes; two writes that
+overlap never out at once; what was asked before the stop done before it; a
+writer its chunk's last replica refuses failed; and a replica that refuses
+asked out as refusing though asked out as silent.
 
 `--seed N --seconds S` runs a campaign, of the target `--target` names
 (`meta` unless it names `cs`, `wire` or `cluster`). `NBS_CLUSTER_STATS=1`

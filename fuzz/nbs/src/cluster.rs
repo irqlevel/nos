@@ -25,7 +25,15 @@
 //! - **the replicas the same**: once a writer serves, and at the end, every
 //!   replica the metadata has in reads every block written alike;
 //! - **a writer fails** only as its chunk's last active replica, restarted,
-//!   refuses it (`nbsclient::LOST_LAST`), or once taken over.
+//!   refuses it (`nbsclient::LOST_LAST`), or once taken over;
+//! - **a writer goes on and stops** with a host lost for good, as long as
+//!   every chunk has a replica in on another: none of what it asks -- a
+//!   write, a flush, a close -- fails at its deadline, and none waits on a
+//!   cs no set of the volume writes any more (nbs-test's repair phase, where
+//!   a close waited for good on a cs no set had in, shaped at the end of
+//!   some runs: every chunk written, a host that holds some lost, every
+//!   chunk written past it, then a flush and a close) -- and no flush goes
+//!   to that cs at all once no set has it in.
 //!
 //! A writer that follows another holds what that one had done and not
 //! flushed as a crash would leave it: there or not -- a replica that lost it
@@ -240,6 +248,9 @@ struct World {
     /// A writer to be taken over at rest: the step, and the writer -- asked
     /// to flush, then nothing, so that its chunks are closed by then.
     rest: Option<(u64, usize)>,
+    /// A writer, and the host lost that its writes took out of every set
+    /// while it was still owed a flush: no flush of that writer's goes there.
+    owed: Option<(usize, usize)>,
     stats: BTreeMap<&'static str, u64>,
 }
 
@@ -498,6 +509,9 @@ impl World {
     /// A request at host `h`'s cs: done by nbswire's `serve`, the cs asking
     /// the mds as its own host's -- or, its host down, lost or bounced.
     fn at_cs(&mut self, c: usize, h: usize, m: Msg) -> Result<(), String> {
+        if self.owed == Some((c, h)) && Request::decode(&m.bytes).is_some_and(|r| matches!(r.op, nbswire::Op::Flush)) {
+            self.count("flushes to a cs out of every set");
+        }
         let World { hosts, state, index, served, .. } = self;
         let host = &mut hosts[h];
         let Some(store) = host.store.as_mut() else {
@@ -683,21 +697,27 @@ impl World {
     /// An operation of the writer's -- a write or a flush alone, `writes`.
     fn op(&mut self, c: usize, writes: bool) -> Result<(), String> {
         let blocks = VOLUME_MIB << 20 >> 12;
-        let tag = self.clients[c].next_tag;
-        self.clients[c].next_tag += 1;
         /* A few blocks, near each other, now and then across a chunk's end */
         let first = match self.r.below(4) {
             0 => SLOT / BLOCK - 1 - self.r.below(2),
             _ => self.r.below(blocks.min(3 * SLOT / BLOCK)),
         };
         let n = (1 + self.r.below(4)).min(blocks - first);
-        let (offset, len) = (first * BLOCK, (n * BLOCK) as u32);
         let kind = match if writes && self.r.chance(80) { 0 } else if writes { 9 } else { self.r.below(10) } {
             0..=4 => K::Write(1 + self.r.below(255) as u8),
             5..=8 => K::Read,
             _ if self.r.chance(30) => K::Close,
             _ => K::Flush,
         };
+        self.submit_op(c, kind, first, n)
+    }
+
+    /// An operation of `kind` on the `n` blocks from block `first` -- none,
+    /// a flush's or a close's -- handed to client `c`, and to the model.
+    fn submit_op(&mut self, c: usize, kind: K, first: u64, n: u64) -> Result<(), String> {
+        let tag = self.clients[c].next_tag;
+        self.clients[c].next_tag += 1;
+        let (offset, len) = (first * BLOCK, (n * BLOCK) as u32);
         let seq = self.seq;
         let mut before = Vec::new();
         let user = match kind {
@@ -817,6 +837,115 @@ impl World {
         self.outs(c, out)
     }
 
+    /// Whether every chunk of the volume has a replica in on a host other
+    /// than `h`: a writer can do without `h`.
+    fn whole_without(&self, h: usize) -> bool {
+        let Some(v) = self.state.volume(VOLUME) else { return false };
+        v.map.iter().all(|&c| {
+            self.state.chunks().get(c as usize).and_then(|ch| self.state.sets().get(ch.set as usize))
+                .is_some_and(|s| (0..nbsmeta::REPLICAS).any(|i| {
+                    s.replicas[i] != Replica::Down && self.host_of_cs(s.cs[i]).is_some_and(|x| x != h)
+                }))
+        })
+    }
+
+    /// Whether host `h` holds a replica in of some chunk of the volume.
+    fn holds_some(&self, h: usize) -> bool {
+        let Some(v) = self.state.volume(VOLUME) else { return false };
+        v.map.iter().any(|&c| {
+            self.state.chunks().get(c as usize).and_then(|ch| self.state.sets().get(ch.set as usize))
+                .is_some_and(|s| (0..nbsmeta::REPLICAS).any(|i| {
+                    s.replicas[i] != Replica::Down && self.host_of_cs(s.cs[i]) == Some(h)
+                }))
+        })
+    }
+
+    /// Whether client `c` serves: the writer, started, not stopping.
+    fn serving(&self, c: usize) -> bool {
+        !self.clients[c].zombie && self.clients[c].served && *self.clients[c].s.phase() == Phase::Serving
+    }
+
+    fn stat(&self, what: &str) -> u64 {
+        self.stats.get(what).copied().unwrap_or(0)
+    }
+
+    /// The network let run as at the end -- a message at a time, time going
+    /// by -- until `done` holds of client `c`, or long past any deadline.
+    fn drive(&mut self, c: usize, done: fn(&World, usize) -> bool) -> Result<(), String> {
+        for _ in 0..30_000 {
+            if done(self, c) {
+                break;
+            }
+            self.now += 5 * MS;
+            if self.links.values().all(|q| q.is_empty()) {
+                self.now += 200 * MS;
+            }
+            self.deliver()?;
+            self.tick()?;
+        }
+        Ok(())
+    }
+
+    /// nbs-test's repair phase, where a close waited for good on a cs no set
+    /// had in any more, though it owed a flush: every chunk written, so that
+    /// each replica in owes a flush; a host that holds some, and that every
+    /// chunk can do without, lost for good; every chunk written past it, so
+    /// that it is out of every set while still owed a flush; then a flush
+    /// and a close, which must be done, as the writes past it must. The host
+    /// lost, if the writer served to the loss.
+    fn lose_written(&mut self) -> Result<Option<usize>, String> {
+        let Some(c) = self.current() else { return Ok(None) };
+        let idle: fn(&World, usize) -> bool = |w, c| w.clients[c].ops.is_empty() || !w.serving(c);
+        self.drive(c, |w, c| {
+            w.serving(c) || w.clients[c].zombie || matches!(w.clients[c].s.phase(), Phase::Failed(_) | Phase::Detached)
+        })?;
+        self.drive(c, idle)?;
+        if !self.serving(c) {
+            return Ok(None);
+        }
+        let places = (VOLUME_MIB << 20) / SLOT;
+        for p in 0..places {
+            let v = 1 + self.r.below(255) as u8;
+            self.submit_op(c, K::Write(v), p * (SLOT / BLOCK), 1)?;
+        }
+        self.drive(c, idle)?;
+        let up: Vec<usize> = (0..HOSTS.len())
+            .filter(|&h| h != self.clients[c].host && self.holds_some(h) && self.whole_without(h)).collect();
+        let Some(h) = self.r.pick(&up) else { return Ok(None) };
+        if !self.serving(c) {
+            return Ok(None);
+        }
+        self.crash(h)?;
+        self.count("hosts lost for good, written past");
+        let failed = |w: &World| w.stat("writes failed") + w.stat("flushes failed") + w.stat("closes failed");
+        let before = failed(self);
+        for p in 0..places {
+            let v = 1 + self.r.below(255) as u8;
+            self.submit_op(c, K::Write(v), p * (SLOT / BLOCK) + 1, 1)?;
+        }
+        self.drive(c, idle)?;
+        /* Out of every set now, by the writes past it, and still owed a flush */
+        if self.serving(c) && failed(self) == before && !self.holds_some(h) {
+            self.owed = Some((c, h));
+        }
+        let sent = self.stat("flushes to a cs out of every set");
+        self.submit_op(c, K::Flush, 0, 0)?;
+        self.drive(c, idle)?;
+        self.submit_op(c, K::Close, 0, 0)?;
+        self.drive(c, idle)?;
+        self.owed = None;
+        if self.stat("flushes to a cs out of every set") > sent {
+            return Err(format!("host {} lost for good and out of every set: client {} sent it a flush all the same -- {}",
+                               self.hosts[h].name, c, self.clients[c].s.report()));
+        }
+        if self.serving(c) && self.whole_without(h) && failed(self) > before {
+            return Err(format!("host {} lost for good, every chunk with a replica in on another: client {}'s writes \
+                                past it, its flush or its close failed -- {}", self.hosts[h].name, c,
+                               self.clients[c].s.report()));
+        }
+        Ok(Some(h))
+    }
+
     /// The writer now: the newest not lost or taken over.
     fn current(&self) -> Option<usize> {
         (0..self.clients.len()).rev().find(|&c| !self.clients[c].zombie)
@@ -826,7 +955,7 @@ impl World {
 fn setup(r: &mut Rng) -> Result<World, String> {
     let mut w = World { r: Rng::new(r.below(u64::MAX)), now: 0, step: 0, trace: false, state: State::new(), index: 0,
                         hosts: Vec::new(), links: BTreeMap::new(), clients: Vec::new(), blocks: Blocks::default(),
-                        seq: 1, down: None, served: 0, rest: None, stats: BTreeMap::new() };
+                        seq: 1, down: None, served: 0, rest: None, owed: None, stats: BTreeMap::new() };
     w.apply(Command::Init { cluster: CLUSTER, name: String::from("nbs"), host: String::from(HOSTS[0]), member: 1 });
     for (k, h) in HOSTS.iter().enumerate().skip(1) {
         w.apply(Command::Add { host: h.to_string(), member: 1 + k as u64 });
@@ -965,17 +1094,31 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         }
         w.tick().map_err(|e| format!("step {}: {}", step, e))?;
     }
-    /* The end: the host down back, the writer stopped -- one started where
-       there is none, or where the last failed as it may -- and every
-       replica alike */
+    /* The end: the host down back -- or, where every chunk has a replica in
+       on another, now and then lost for good -- the writer stopped, one
+       started on a host up where there is none, or where the last failed as
+       it may, and every replica on a host up alike */
+    let mut lost = None;
     if let Some(h) = w.down {
-        w.restart(h).map_err(|e| format!("the end: {}", e))?;
+        if w.r.chance(50) && w.whole_without(h) {
+            w.count("hosts lost for good");
+            if w.trace {
+                eprintln!("  [end] host {} lost for good", w.hosts[h].name);
+            }
+            lost = Some(h);
+        } else {
+            w.restart(h).map_err(|e| format!("the end: {}", e))?;
+        }
+    }
+    if lost.is_none() && w.r.chance(30) {
+        lost = w.lose_written().map_err(|e| format!("the end: {}", e))?;
     }
     for _ in 0..END_WRITERS {
         let c = match w.current() {
             Some(c) => c,
             None => {
-                let h = w.r.below(HOSTS.len() as u64) as usize;
+                let up: Vec<usize> = (0..HOSTS.len()).filter(|&h| Some(h) != w.down).collect();
+                let h = w.r.pick(&up).ok_or_else(|| String::from("the end: no host up"))?;
                 w.writer(h).map_err(|e| format!("the end: {}", e))?;
                 w.clients.len() - 1
             }
@@ -1017,6 +1160,12 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
             }
             /* As it may -- check_failed said so: another */
             Phase::Failed(_) => continue,
+            /* Held up by a chunk whose replicas in are all on the host lost
+               -- the writers' take-outs left it there: nowhere else to be */
+            _ if lost.is_some_and(|h| !w.whole_without(h)) => {
+                w.count("stops held by a chunk on the host lost alone");
+                return Ok(());
+            }
             _ => return Err(format!("the last writer not detached at the end: {}", w.clients[c].s.report())),
         }
     }
