@@ -7,7 +7,7 @@
 //! them is (nbsmeta).
 //!
 //!     insmod /lib/modules/ipcnet.ko, then cluster.ko: the hosts that trust each other
-//!     insmod /lib/modules/nbs-mds.ko [dir=/nbs/mds] [compact=<bytes>]
+//!     insmod /lib/modules/nbs-mds.ko [dir=/nbs/mds] [compact=<bytes>] [out_after=<seconds>]
 //!     nbs init <name>            on the first host: an NBS cluster of it alone
 //!     nbs host add <host>        on a member: <host> -- a host of the registry -- a member
 //!     nbs host remove <host>     on a member: <host>'s member out, for good
@@ -124,6 +124,10 @@ struct ModState {
     dir: String,
     /// The log's bytes past its snapshot before it is compacted: `compact=`.
     compact: u64,
+    /// How long a cs is silent before the leader's controller has it out
+    /// and its places taken by others: `out_after=`, ten minutes unless
+    /// given (N9c).
+    out_after_ms: u64,
     shared: Arc<Shared>,
     lost: Lost,
     task: Locked<Option<TaskHandle>>,
@@ -194,15 +198,19 @@ fn stop_idle(state: &ModState) {
 fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn kmod::Module>> {
     let mut dir = None;
     let mut compact = None;
+    let mut out_after = None;
     for (key, value) in params.words() {
         match (key, value) {
             ("dir", Some(path)) if dir.is_none() && path.starts_with('/') && path.len() < 200 => dir = Some(path),
             ("compact", Some(bytes)) if compact.is_none() && bytes.parse::<u64>().is_ok() => {
                 compact = bytes.parse::<u64>().ok();
             }
+            ("out_after", Some(secs)) if out_after.is_none() && secs.parse::<u64>().is_ok_and(|s| (10..=86_400).contains(&s)) => {
+                out_after = secs.parse::<u64>().ok();
+            }
             _ => {
-                let _ = writeln!(out, "nbs: \"{}\" is not a parameter of nbs-mds's -- dir=<folder> and \
-                                       compact=<bytes> are, each given once", key);
+                let _ = writeln!(out, "nbs: \"{}\" is not a parameter of nbs-mds's -- dir=<folder>, \
+                                       compact=<bytes> and out_after=<seconds, 10 to 86400> are, each given once", key);
                 return Err(Error::InvalidValue);
             }
         }
@@ -210,6 +218,7 @@ fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn
     let state = Arc::new(ModState {
         dir: String::from(dir.unwrap_or(files::DEFAULT_DIR).trim_end_matches('/')),
         compact: compact.unwrap_or(raft::rsm::SNAPSHOT_FLOOR),
+        out_after_ms: out_after.map_or(nbsmeta::repair::OUT_AFTER_MS, |s| s * 1000),
         shared: Arc::new(Shared::new().ok_or(Error::NoMemory)?),
         lost: Arc::new(Locked::new(BTreeMap::new()).ok_or(Error::NoMemory)?),
         task: Locked::new(None).ok_or(Error::NoMemory)?,
@@ -270,7 +279,7 @@ fn start(state: &ModState, me: files::Member, fresh: bool) -> Result<(), String>
         /* Its group's one voter: leading at once rather than at a timeout */
         let _ = rsm.campaign();
     }
-    let member = member::new(rsm, me, state.lost.clone(), &state.dir)?;
+    let member = member::new(rsm, me, state.lost.clone(), &state.dir, state.out_after_ms)?;
     state.shared.stop.store(false, Ordering::Release);
     /* Shown before the task's first turn, so that a command right after
        this one finds the member */
@@ -687,6 +696,12 @@ fn status(state: &ModState, out: &mut Output) -> Result<(), String> {
                            learners, {} messages refused", name, id, v.node, role_name(v.role), v.term, leader,
                      v.applied, v.state.members().len(), v.membership.voters.len(), v.membership.learners.len(),
                      v.refused);
+    /* How far from three the chunks are (N9) */
+    let h = nbsmeta::repair::health(&v.state);
+    let joins = v.state.sets().iter().filter(|s| s.joiner.is_some()).count();
+    let _ = writeln!(out, "nbs: chunks at three replicas {}, at two {}, at one {} -- {} being copied, by {} joins; \
+                           cs's down {}, out {}", h.by_active[3], h.by_active[2], h.by_active[1], h.joining, joins,
+                     h.down, h.out);
     match v.state.checks().latest() {
         Some((at, d)) => {
             let _ = writeln!(out, "nbs: the state's digest at entry {}: {}... -- {} of the leader's held to it, {} \

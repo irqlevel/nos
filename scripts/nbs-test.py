@@ -36,6 +36,10 @@ what it stores, then a volume's bytes through the chunk servers.
   deleted, and every cs gives its chunks and its fence back; a host's
   nbs-cs unloaded -- a request to it bounced and said at once -- and loaded
   again, serving;
+- repair (N9): a volume written, c killed -- the leader's controller has its
+  cs down -- the volume written past it, c booted again: its cs up, joined in
+  its own place, every chunk at three replicas again, and c's own replica
+  holding the write made while it was gone, which its join's copy took;
 - the leader killed: the other two elect one of themselves and commit; the
   killed host booted again, back from its snapshot and log -- three voters
   again, every host agreeing on the leader and on what is stored;
@@ -277,6 +281,21 @@ def compacted(sh):
     return re.search(r"\bsnap\.[0-9a-f]{16}(?!\.tmp)\b", sh.run("ls /nbs/mds/raft")) is not None
 
 
+def health(sh):
+    """`nbs status`'s counts of how far from three the chunks are (N9): at
+    three replicas, at two, at one, being copied, the joins, the cs's down
+    and out."""
+    m = re.search(r"chunks at three replicas (\d+), at two (\d+), at one (\d+) -- (\d+) being copied, by "
+                  r"(\d+) joins; cs's down (\d+), out (\d+)", sh.run("nbs status"))
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+def whole(sh):
+    """Every chunk at three replicas, none being copied, no cs down or out."""
+    h = health(sh)
+    return h is not None and h[0] > 0 and h[1:] == (0, 0, 0, 0, 0, 0)
+
+
 def json_of(out):
     m = re.search(r"(\{.*\})", out, re.S)
     try:
@@ -434,9 +453,10 @@ def main():
                   all(d in found[i][0] for d in ids[h]), found[i])
         need("every host's pool found", all(ids[h][0] in found[i][0] and ids[h][1] in found[i][0]
                                             for i, h in enumerate(HOSTS)))
-        whole = found[0][0][ids["a"][0]][:-1]
-        out = a.run("nbs devices add %s" % whole)
-        check("a's pool disk itself refused: no id finds it again", whole in found[0][1] and "has no id" in out, out)
+        pool_disk = found[0][0][ids["a"][0]][:-1]
+        out = a.run("nbs devices add %s" % pool_disk)
+        check("a's pool disk itself refused: no id finds it again", pool_disk in found[0][1] and "has no id" in out,
+              out)
         room = part_slots(PART_SECTORS) * CHUNK_MIB
         dev = {}
         for i, h, word in ((0, "a", ids["a"][0]), (1, "b", found[1][0][ids["b"][0]]), (2, "c", ids["c"][0])):
@@ -643,6 +663,11 @@ def main():
         check("disk1 not deleted while b has it attached", "attached" in out and "deleted" not in out, out)
         out = b.run("nbs io detach disk1")
         check("b detaches it", ("disk1 detached (generation %d)" % gen2) in out, out)
+        # A boot of c's past DOWN_AFTER_MS -- under TCG -- has the leader's
+        # controller (N9c) take its cs down and its replicas out until its
+        # joins are done, and a read takes an active replica alone
+        check("c's sets whole again, as the leader's controller keeps them: every chunk at three replicas",
+              ipct.wait_for(lambda: whole(a), 300, 3), [x.run("nbs status") for x in sh])
         out = c.run("nbs io read disk1 0 8192")
         check("c's data kept: read on c, read-only now nobody writes, from its own replica",
               "from c: 0x77x4096 0x5ax4096" in out, out)
@@ -676,6 +701,38 @@ def main():
         c.run("insmod /nbs-cs.ko")
         check("c's cs loaded again: its devices opened as they were, serving",
               ipct.wait_for(lambda: serving(2, 2), CS_S, 1), c.run("nbscs"))
+
+        # -- repair (N9): c lost and written past, then back -- the leader's
+        # controller has its cs down, then up, joins it in its own place, and
+        # its copy takes what it missed --
+        out = a.run("nbs volume create rep 8")
+        need("a volume to repair made", re.search(r"volume rep \(\d+\), 8 MiB", out) is not None, out)
+        out = a.run("nbs io write rep 0 65536 0x31")
+        need("written on a, to its three replicas", "65536 bytes of 0x31 written" in out and
+             "to every replica in" in out, out)
+        # c's cs, unloaded a while just now, may be joining again yet
+        check("every chunk at three replicas", ipct.wait_for(lambda: whole(a), 240, 3), a.run("nbs status"))
+        kill(2)
+        others = [sh[0], sh[1]]
+        check("c gone: the leader's controller has its cs down",
+              ipct.wait_for(lambda: any((health(x) or (0,) * 7)[5] == 1 for x in others), 90, 2),
+              [x.run("nbs status") for x in others])
+        out = a.run("nbs io write rep 65536 65536 0x32")
+        check("written past c, to a's and b's replicas", "65536 bytes of 0x32 written" in out, out)
+        out = a.run("nbs io close rep")
+        check("and closed there", "closed on its replicas" in out, out)
+        need("c boots again", pt.wait_log(boot(2), "boot: complete", 300) and addressed(2))
+        sh[2] = c = ipct.Shell(hub.shell(2))
+        need("c back: three voters, one leader", ipct.wait_for(lambda: agreed(sh, 3), 90, 1))
+        check("c's cs up, joined in its own place, its copy done: every chunk at three replicas, none being "
+              "copied, no cs down", ipct.wait_for(lambda: whole(a), 240, 3), [x.run("nbs status") for x in sh])
+        out = a.run("nbs io detach rep")
+        check("a lets rep go", "rep detached" in out, out)
+        out = c.run("nbs io read rep 0 131072")
+        check("read on c, from its own replica: what was written while it was gone, which its join's copy took",
+              "131072 bytes at 0 of rep, from c: 0x31x65536 0x32x65536" in out, out)
+        out = a.run("nbs volume delete rep")
+        check("rep deleted", "deleted" in out, out)
 
         # -- the leader killed, and booted again --
         name = leader_of(a)

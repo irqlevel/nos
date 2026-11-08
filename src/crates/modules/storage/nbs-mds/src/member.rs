@@ -29,6 +29,14 @@
 //!   proposes the change, and refuses it while the cs answers -- a client
 //!   whose own way to a healthy cs is broken waits, rather than take a
 //!   replica out of sets other volumes share.
+//! - **The controller** (N9c): the leader looks at every cs once a second,
+//!   and every ten seconds -- sooner, a second after the last plan at the
+//!   soonest, where the state moved on or a cs went silent or came back --
+//!   proposes what `nbsmeta::repair::plan` makes of the state and of what
+//!   it saw: cs's down, up and out, and joins. A cs's silence is counted
+//!   from when this leader began to watch it, so a new leader takes none for
+//!   down at once. The registry's maintenance flag is not read yet: a host
+//!   in maintenance goes out at `out_after` as any other.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -39,6 +47,7 @@ use codec::{Reader, Writer};
 use kcore::ipc::{Addr, Message, TAG_BOUNCED, TAG_BULK};
 use kcore::klog;
 use kcore::time::boot_time_ns;
+use nbsmeta::repair::{self, Seen};
 use nbsmeta::{Answer, Command, Refusal, Replica, State};
 use nbswire::{Answered, Ask, Asking, Op, Query, Question, Request, Said, Saying, Told};
 use raft::{Role, Rsm};
@@ -65,6 +74,11 @@ const LOST_SAY_NS: u64 = 60_000_000_000;
 /// found stands before a replica's taking out looks again.
 const PROBE_NS: u64 = 250_000_000;
 const VERDICT_NS: u64 = 2_000_000_000;
+/// How often the leader looks at every cs; how long after its last answer
+/// a cs is taken as silent; how often the controller plans at the least.
+const WATCH_NS: u64 = 1_000_000_000;
+const ANSWERED_NS: u64 = 2_500_000_000;
+const PLAN_NS: u64 = 10_000_000_000;
 /// The leader's look at a cs, as it goes.
 const PROBE: u32 = nbswire::TAG_REQUEST | TAG_BULK;
 
@@ -148,6 +162,20 @@ pub struct Mds {
     probes: Vec<Probe>,
     verdicts: BTreeMap<u32, (bool, u64)>,
     next_probe: u64,
+    /// The controller's (N9c), as the leader: what it has seen of each cs --
+    /// since when it watches it, when it last answered and served -- when it
+    /// looks next; when it last planned, the entry it had applied then, and
+    /// when it plans next at the latest; whether a proposal of its was
+    /// refused since; the cluster's `out_after`; and how many of its
+    /// proposals are still to be applied: no plan is made while one is.
+    watch: BTreeMap<u32, (u64, u64)>,
+    watch_at: u64,
+    planned: u64,
+    planned_index: u64,
+    plan_at: u64,
+    refused: bool,
+    out_after_ms: u64,
+    repairing: u32,
 }
 
 /// A look at a cs, waiting for its answer.
@@ -163,6 +191,8 @@ pub enum Waiter {
     Digest,
     /// A client of this host's, told the outcome as its ask's kind is.
     Client { to: Addr, id: u64, kind: Kind },
+    /// The controller's proposal.
+    Repair,
     /// This host's cs, told its join's end or its giving up as applied (N9).
     Cs { to: Addr, id: u64 },
 }
@@ -175,10 +205,13 @@ pub enum Kind {
 }
 
 /// The member over its log in `dir`, its mailbox named.
-pub fn new(rsm: Rsm<raftmember::Log, State>, me: files::Member, lost: Lost, dir: &str) -> Result<Member, String> {
+pub fn new(rsm: Rsm<raftmember::Log, State>, me: files::Member, lost: Lost, dir: &str, out_after_ms: u64)
+    -> Result<Member, String> {
     let id = me.id;
     raftmember::Member::new(Mds { me, lost, dir: String::from(dir), proposed: 0, probes: Vec::new(),
-                                  verdicts: BTreeMap::new(), next_probe: 1 }, rsm, id)
+                                  verdicts: BTreeMap::new(), next_probe: 1, watch: BTreeMap::new(), watch_at: 0,
+                                  planned: 0, planned_index: 0, plan_at: 0, refused: false, out_after_ms,
+                                  repairing: 0 }, rsm, id)
 }
 
 impl App for Mds {
@@ -293,6 +326,18 @@ impl App for Mds {
                 return;
             }
             Waiter::Digest => return,
+            Waiter::Repair => {
+                self.repairing = self.repairing.saturating_sub(1);
+                match outcome {
+                    Ok(Answer::Refused(why)) => {
+                        klog!(1, "nbs: a repair's proposal refused: {}", why.says());
+                        self.refused = true;
+                    }
+                    Err(why) => klog!(1, "nbs: a repair's proposal not applied: {}", why),
+                    Ok(_) => {}
+                }
+                return;
+            }
         };
         let said = match (outcome, kind) {
             (Ok(Answer::Attached { generation }), Kind::Attach) => Said::Attached { generation, index },
@@ -315,6 +360,10 @@ impl App for Mds {
         let state = core.state();
         self.lost.with(|l| l.retain(|host, &mut (id, _)| state.member(host).is_some_and(|m| m.id == id)));
         if core.role() != Role::Leader {
+            /* What this member saw as a leader is of no use to the next */
+            self.watch.clear();
+            self.repairing = 0;
+            self.refused = false;
             return;
         }
         /* A look not answered in time: the cs is silent */
@@ -334,6 +383,7 @@ impl App for Mds {
                 core.ask(self, Command::Digest { at, digest }, Pending::App(Waiter::Digest));
             }
         }
+        self.control(core, now);
     }
 
     /// A state whose digest is not the leader's: this member serves nothing
@@ -348,6 +398,56 @@ impl App for Mds {
 }
 
 impl Mds {
+    /// The controller's turn, as the leader: every cs looked at once a
+    /// second, and a plan made every ten -- sooner where the state moved on
+    /// or a cs went silent or came back -- and proposed, once what it
+    /// proposed last is applied.
+    fn control(&mut self, core: &mut Core<Mds>, now: u64) {
+        let ids: Vec<u32> = core.state().cs().iter().map(|c| c.id).collect();
+        self.watch.retain(|cs, _| ids.contains(cs));
+        for &cs in &ids {
+            self.watch.entry(cs).or_insert((now, 0));
+        }
+        if now >= self.watch_at {
+            self.watch_at = now + WATCH_NS;
+            for &cs in &ids {
+                self.probe(core, cs);
+            }
+        }
+        let seen: Vec<Seen> = self.watch.iter().map(|(&cs, &(since, ok_at))| {
+            let answering = ok_at != 0 && now < ok_at + ANSWERED_NS;
+            let silent_ns = if answering { 0 } else { now.saturating_sub(ok_at.max(since)) };
+            Seen { cs, answering, silent_ms: silent_ns / 1_000_000, maintenance: false }
+        }).collect();
+        /* Planned now, a second after the last plan at the soonest: where the
+           state moved on since -- a cs changed, a join done or dropped, so
+           that the next joins are not kept ten seconds -- or a cs's
+           answering is not what the state has it as. Not after a proposal
+           of the controller's was refused: that would be made again each
+           second; the ten seconds' plan stands, and says each refusal */
+        let applied = core.rsm().applied();
+        let changed = applied != self.planned_index || seen.iter().any(|v| {
+            core.state().cs().get(v.cs as usize).is_some_and(|c| {
+                (c.state == nbsmeta::CsState::Up) != v.answering
+                    && (v.answering || v.silent_ms >= repair::DOWN_AFTER_MS)
+            })
+        });
+        let early = changed && !self.refused && now >= self.planned + WATCH_NS;
+        if self.repairing != 0 || (now < self.plan_at && !early) {
+            return;
+        }
+        self.planned = now;
+        self.planned_index = applied;
+        self.refused = false;
+        self.plan_at = now + PLAN_NS;
+        let plan = repair::plan(core.state(), &seen, self.out_after_ms);
+        for cmd in plan {
+            klog!(1, "nbs: the controller proposes {:?}", cmd);
+            self.repairing += 1;
+            core.ask(self, cmd, Pending::App(Waiter::Repair));
+        }
+    }
+
     /// A look at cs `cs` started, unless one is under way: its `Ping`, from
     /// the member's mailbox, the answer looked for in `on_probe_answer`.
     fn probe(&mut self, core: &Core<Mds>, cs: u32) {
@@ -378,7 +478,13 @@ impl Mds {
         let Some(at) = self.probes.iter().position(|p| p.id == a.id) else { return };
         let p = self.probes.swap_remove(at);
         let serving = matches!(a.reply, nbswire::Reply::Done);
-        self.verdicts.insert(p.cs, (serving, boot_time_ns()));
+        let now = boot_time_ns();
+        self.verdicts.insert(p.cs, (serving, now));
+        if serving {
+            if let Some(w) = self.watch.get_mut(&p.cs) {
+                w.1 = now;
+            }
+        }
     }
 
     /// A look the channel gave back: the cs is not there.
