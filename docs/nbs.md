@@ -139,7 +139,9 @@ what is read next on the same host holds it.
     is to move with N9.
 
   A cs's room is the slots of its active devices. Reserved of it is a slot
-  for every chunk on it, active or draining.
+  for every chunk on it, active or draining, and for every chunk of a set it
+  is joining in another's place (N9). A cs is up, down or out as the leader
+  has committed it ([Repair](#repair)): only an up one takes new chunks.
 - **The volumes**:
   - a number never taken again;
   - a name -- lowercase letters, digits, `.`, `_` and `-`, up to 63;
@@ -150,7 +152,13 @@ what is read next on the same host holds it.
   - its map: a chunk for every 4 MiB.
 - **The replica sets**: three cs's on three hosts, shared by every chunk
   placed on the same three, so that a host lost changes the few sets it is
-  in and not every chunk it holds.
+  in and not every chunk it holds. Each member is active or down -- a down
+  one with the last version it was active at -- and a set has at most one
+  joiner, a cs being copied onto ([Repair](#repair)). New chunks go only
+  into a clean set, every member active and no joiner; an empty set is made
+  again for three new cs's before a new one is made -- never the clean set
+  of three cs's the same placement fills, so that the sets a placement takes
+  are counted before it takes any.
 - **The chunks**: the set each is in, how many maps name it, and whether it
   was written. A chunk freed goes onto a free list and is taken again
   first.
@@ -172,8 +180,8 @@ it, from the committed state alone, so every member places them alike
 (plans/nbs.md, "Where replicas go"; `nbsmeta`'s `place.rs`):
 
 1. three replicas on three hosts;
-2. only on the cs's of members, on their active devices, where there is
-   room;
+2. only on the cs's of members that are up, on their active devices, where
+   there is room;
 3. one on the volume's own host, where it has room;
 4. the other two on the hosts with the most room left, ties broken by a
    hash of the volume, the chunk and the cs;
@@ -189,6 +197,45 @@ A volume that cannot be placed is refused, and why:
 - three or more do, but are too full: `not room for its chunks on three
   hosts`;
 - rule 6: `it would leave too little room to rebuild the biggest host`.
+
+## Repair
+
+How three are kept (plans/nbs.md, "How three are kept"). What N9a has of it
+is the metadata and the controller; the copies are N9b's, the leader's turns
+N9c's.
+
+- **A cs's state.** `CsDown` -- silent 5 s to the leader -- has it down in
+  every set it is an active member of, the last active member of one apart,
+  and drops every join it is the joiner of: writes go on to the others. Its
+  version at the time is kept with each place, as the last it was active
+  at. `CsOut` -- silent past `out_after`, 10 minutes held off by the
+  registry's maintenance flag, or its host removed -- is down for good: its
+  places are to be taken by others. `CsUp` is a cs that answers again; its
+  places in its sets stay down until it joins them again.
+- **A join** (`Join`) puts a cs into a set as its joiner, to take one place
+  once its copy is done: its own place, the member down and back, which
+  copies only what it missed; or another's -- a member down and out, or one
+  whose cs is drained, which stays active meanwhile -- with room for every
+  chunk of the set. It names the set's version it was planned at, and is
+  refused once the set has moved on. `Joined` makes the joiner the member in
+  that place, active, the room of the one it replaces given back; `Unjoin`
+  gives the join up. Each raises the set's version: a chunk's epoch moves on
+  with it, so the writes of the epoch before are refused at the cs's that
+  know the new one (rule 3 of plans/nbs.md's "Replication: the rules").
+- **The joiner is written, not read**: a client writes it with every member
+  active, and reads only from active members; the host's mds vouches it for
+  writes alone. Silent to the writer, it is asked out as a member is
+  (`ReplicaDown`), after the same look by the leader, and its join dropped.
+- **The controller** (`nbsmeta::repair::plan`) is a pure function of the
+  committed state and what the leader sees of each cs -- answering, for how
+  long not, in maintenance -- the same in the member as in the fuzzer. Its
+  turn proposes the cs's to go down, up or out; where none is to, joins:
+  the sets with one active member first; a member down whose cs is up again
+  joins its own place; one gone, or drained, has another join in its place
+  -- the most room first, ties by a hash of the set and the cs; two joins a
+  joiner and sixteen a turn at most. A set is rebuilt whole.
+- **Seen**: `nbsmeta::repair::health` counts the chunks by how many of
+  their set's members are active, and those being copied onto a joiner.
 
 ## The digest
 
@@ -549,11 +596,20 @@ image's zeros out.
 - **`scripts/nbs-fuzz.py`** (host, in CI; [testing.md](testing.md)): `fuzz/nbs`'s
   `meta` target, the state against a model of its own:
   - every command's answer and everything the state shows held to the
-    model's, the placement to the model's own;
+    model's, the placement to the model's own; among the commands, cs's
+    going down, up and out, and joins begun, ended and given up, from the
+    controller's turns and at random;
   - an fsck of its own after every step;
   - the snapshot read back in pieces, spoiled and refused, and continued
-    from;
-  - two members' digests compared, and a divergence said.
+    from: bytes spoiled at random, and a set's joiner made one no set can
+    have;
+  - two members' digests compared, and a divergence said;
+  - the controller's progress (N9a): from the state of a step, some hosts
+    gone for good and the rest answering, its turns applied until it has
+    nothing to propose -- every proposal answered as the model answers it,
+    none refused -- and then no member down whose cs answers, no place
+    left that a cs had the room to fill, no join under way, every cs that
+    answers up and every one gone out.
 
   Its `cs` target is the chunk server's engine over disks with a write
   cache, through histories of fences, writes, reads, flushes, closes and
@@ -579,9 +635,9 @@ image's zeros out.
   writer serves and at the end, and no active replica doing an older
   generation's write or flush once a newer writer serves.
 
-  `--mutants` takes fifty-four rules out one at a time -- twenty of the
-  metadata's, nineteen of the cs's and its `serve`'s, three of the wire's,
-  twelve of the client's -- each caught.
+  `--mutants` takes seventy-five rules out one at a time -- forty-four of
+  the metadata's, five of them the controller's; fifteen of the cs's; six of
+  the wire's and its `serve`'s; ten of the client's -- each caught.
 - **`fuzz/raft`'s `nbsmeta` target**: the members' part of the state, its
   commands from pools of names and incarnations that meet and from wide ones
   that fill the cluster. There are four scenarios and six mutants.

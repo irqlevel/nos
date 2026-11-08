@@ -56,6 +56,27 @@ pub enum Command {
     /// writer fenced since takes nothing out -- else its write would be done
     /// by taking out the replicas that refuse it.
     ReplicaDown { set: u32, cs: u32, refused: bool, name: String, generation: u64 },
+    /// cs `cs` silent past the controller's 5 s, as the leader sees it
+    /// (N9): down in every set it is a member of -- never the last active
+    /// member of one -- dropped as the joiner of any, and given no new
+    /// chunks. Done again where it is down or out already.
+    CsDown { cs: u32 },
+    /// cs `cs` answering the leader again: up, taking new chunks. Back in a
+    /// set it is down in only by joining it again.
+    CsUp { cs: u32 },
+    /// cs `cs` silent past `out_after`, or its host no member: down in its
+    /// sets as `CsDown` has it, its places there to be taken by others.
+    CsOut { cs: u32 },
+    /// cs `cs` joins set `set` -- planned at the set's `version` -- to take
+    /// the place of member `place` once its copy is done: the member itself,
+    /// down and back, or another cs in the place of a member down and out,
+    /// or drained.
+    Join { set: u32, place: u8, cs: u32, version: u32 },
+    /// The join of set `set` by cs `cs` that raised it to `since` done: the
+    /// joiner a member in its place, active.
+    Joined { set: u32, cs: u32, since: u32 },
+    /// The join of set `set` by cs `cs` that raised it to `since` given up.
+    Unjoin { set: u32, cs: u32, since: u32 },
 }
 
 const INIT: u8 = 1;
@@ -70,6 +91,12 @@ const ATTACH: u8 = 9;
 const DETACH: u8 = 10;
 const DIGEST: u8 = 11;
 const REPLICA_DOWN: u8 = 12;
+const CS_DOWN: u8 = 13;
+const CS_UP: u8 = 14;
+const CS_OUT: u8 = 15;
+const JOIN: u8 = 16;
+const JOINED: u8 = 17;
+const UNJOIN: u8 = 18;
 
 const WRITABLE: u8 = 1;
 const FORCE: u8 = 2;
@@ -146,6 +173,37 @@ impl Command {
                 w.str(name);
                 w.u64(*generation);
             }
+            Command::CsDown { cs } => {
+                w.u8(CS_DOWN);
+                w.u32(*cs);
+            }
+            Command::CsUp { cs } => {
+                w.u8(CS_UP);
+                w.u32(*cs);
+            }
+            Command::CsOut { cs } => {
+                w.u8(CS_OUT);
+                w.u32(*cs);
+            }
+            Command::Join { set, place, cs, version } => {
+                w.u8(JOIN);
+                w.u32(*set);
+                w.u8(*place);
+                w.u32(*cs);
+                w.u32(*version);
+            }
+            Command::Joined { set, cs, since } => {
+                w.u8(JOINED);
+                w.u32(*set);
+                w.u32(*cs);
+                w.u32(*since);
+            }
+            Command::Unjoin { set, cs, since } => {
+                w.u8(UNJOIN);
+                w.u32(*set);
+                w.u32(*cs);
+                w.u32(*since);
+            }
         }
         w.buf
     }
@@ -216,6 +274,22 @@ impl Command {
                 };
                 let name = volume(&mut r)?;
                 Command::ReplicaDown { set, cs, refused, name, generation: r.u64()? }
+            }
+            CS_DOWN => Command::CsDown { cs: r.u32()? },
+            CS_UP => Command::CsUp { cs: r.u32()? },
+            CS_OUT => Command::CsOut { cs: r.u32()? },
+            JOIN => {
+                let (set, place) = (r.u32()?, r.u8()?);
+                let cs = r.u32()?;
+                Command::Join { set, place, cs, version: r.u32()? }
+            }
+            JOINED => {
+                let (set, cs) = (r.u32()?, r.u32()?);
+                Command::Joined { set, cs, since: r.u32()? }
+            }
+            UNJOIN => {
+                let (set, cs) = (r.u32()?, r.u32()?);
+                Command::Unjoin { set, cs, since: r.u32()? }
             }
             _ => return None,
         };
@@ -293,6 +367,22 @@ pub enum Refusal {
     LastReplica,
     /// Not the volume's writer: attached elsewhere since, or never.
     NotTheWriter,
+    /// No chunk server of that number.
+    NoSuchCs,
+    /// The set has moved on since the plan was made, or that is not its
+    /// join.
+    Stale,
+    /// A join of the set is under way already.
+    Joining,
+    /// The member is active: it needs no join of its own.
+    NotDown,
+    /// The cs is a member of the set already.
+    AlreadyMember,
+    /// The cs is not up: it joins nothing.
+    NotUp,
+    /// The member in that place is active and stays: not down, nor its cs
+    /// out or drained.
+    InPlace,
 }
 
 impl Refusal {
@@ -332,6 +422,13 @@ impl Refusal {
             Refusal::NoSuchSet => "no such replica set, or the chunk server is no replica of it",
             Refusal::LastReplica => "the set's last active replica: writes go on to it alone",
             Refusal::NotTheWriter => "not the volume's writer: attached elsewhere since",
+            Refusal::NoSuchCs => "no chunk server of that number",
+            Refusal::Stale => "the set has moved on since, or that is not its join",
+            Refusal::Joining => "a join of the set is under way already",
+            Refusal::NotDown => "the member is active: it needs no join",
+            Refusal::AlreadyMember => "the chunk server is a member of the set already",
+            Refusal::NotUp => "the chunk server is not up",
+            Refusal::InPlace => "the member in that place is active and stays",
         }
     }
 
@@ -369,6 +466,13 @@ impl Refusal {
             Refusal::NoSuchSet => 30,
             Refusal::LastReplica => 31,
             Refusal::NotTheWriter => 32,
+            Refusal::NoSuchCs => 33,
+            Refusal::Stale => 34,
+            Refusal::Joining => 35,
+            Refusal::NotDown => 36,
+            Refusal::AlreadyMember => 37,
+            Refusal::NotUp => 38,
+            Refusal::InPlace => 39,
         }
     }
 
@@ -406,6 +510,13 @@ impl Refusal {
             30 => Refusal::NoSuchSet,
             31 => Refusal::LastReplica,
             32 => Refusal::NotTheWriter,
+            33 => Refusal::NoSuchCs,
+            34 => Refusal::Stale,
+            35 => Refusal::Joining,
+            36 => Refusal::NotDown,
+            37 => Refusal::AlreadyMember,
+            38 => Refusal::NotUp,
+            39 => Refusal::InPlace,
             _ => return None,
         })
     }
@@ -426,8 +537,11 @@ pub enum Answer {
     Attached { generation: u64 },
     /// A digest held to.
     Checked,
-    /// A replica taken out: its set's version now.
+    /// A replica taken out, a join begun, done or given up: its set's
+    /// version now.
     Set { version: u32 },
+    /// A cs down, up or out: how many sets that changed.
+    Changed { sets: u32 },
     Refused(Refusal),
 }
 
@@ -438,6 +552,7 @@ const VOLUME: u8 = 3;
 const ATTACHED: u8 = 4;
 const CHECKED: u8 = 5;
 const SET: u8 = 6;
+const CHANGED: u8 = 7;
 
 impl Answer {
     pub fn encode(&self) -> Vec<u8> {
@@ -468,6 +583,10 @@ impl Answer {
                 w.u8(SET);
                 w.u32(*version);
             }
+            Answer::Changed { sets } => {
+                w.u8(CHANGED);
+                w.u32(*sets);
+            }
         }
         w.buf
     }
@@ -482,6 +601,7 @@ impl Answer {
             ATTACHED => Answer::Attached { generation: r.u64()? },
             CHECKED => Answer::Checked,
             SET => Answer::Set { version: r.u32()? },
+            CHANGED => Answer::Changed { sets: r.u32()? },
             _ => return None,
         };
         r.done().then_some(a)

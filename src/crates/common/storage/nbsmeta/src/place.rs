@@ -6,8 +6,8 @@
 //!
 //! 1. Three replicas on three hosts: a host is the failure domain, and one
 //!    cs a host makes three cs's three hosts.
-//! 2. Only cs's that take new chunks: their hosts members, their devices
-//!    active, with room. Fewer than three that take any is the cluster's
+//! 2. Only cs's that take new chunks: their hosts members, up (N9), their
+//!    devices active, with room. Fewer than three that take any is the cluster's
 //!    shape (`TooFewHosts`); three or more, full, its room (`NoRoom`).
 //! 3. One replica on the volume's own host where it has room, so that its
 //!    reads are local.
@@ -31,7 +31,7 @@
 
 use alloc::vec::Vec;
 
-use crate::storage::REPLICAS;
+use crate::storage::{CsState, REPLICAS};
 use crate::State;
 
 #[derive(Clone)]
@@ -52,13 +52,13 @@ pub(crate) struct Placer {
 }
 
 impl Placer {
-    /// The cs's of member hosts with devices that take new chunks; `host`'s
-    /// first where it is one of them.
+    /// The cs's of member hosts, up, with devices that take new chunks;
+    /// `host`'s first where it is one of them.
     pub(crate) fn new(state: &State, host: &str) -> Placer {
         let mut candidates = Vec::new();
         for c in state.cs.iter() {
             let slots = c.slots();
-            if slots == 0 || state.member(&c.host).is_none() {
+            if slots == 0 || state.member(&c.host).is_none() || c.state != CsState::Up {
                 continue;
             }
             candidates.push(Candidate { cs: c.id, slots, reserved: c.reserved, free: slots.saturating_sub(c.reserved) });
@@ -125,7 +125,7 @@ impl Placer {
 
 /// A tie broken: a hash of the volume, the chunk's place in it and the cs
 /// (splitmix64's finalizer), the same on every member.
-fn tie(volume: u32, index: u64, cs: u32) -> u64 {
+pub(crate) fn tie(volume: u32, index: u64, cs: u32) -> u64 {
     let mut z = (u64::from(volume) << 32 ^ index).wrapping_add(u64::from(cs).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);

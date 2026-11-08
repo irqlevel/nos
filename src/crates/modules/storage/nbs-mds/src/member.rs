@@ -255,10 +255,12 @@ impl App for Mds {
             return Ok(());
         }
         let Some(st) = s.sets().get(*set as usize) else { return Ok(()) };
-        let Some(at) = st.cs.iter().position(|c| c == cs) else { return Ok(()) };
-        if st.replicas[at] == Replica::Down
-            || !st.replicas.iter().enumerate().any(|(i, r)| i != at && *r == Replica::Active)
-        {
+        /* An active member, not the last -- or the joiner (N9), whose join a
+           client with a broken way to it would otherwise drop at every try */
+        let joining = st.joiner.is_some_and(|j| j.cs == *cs);
+        let active = st.cs.iter().position(|c| c == cs)
+            .is_some_and(|at| st.replicas[at] == Replica::Active && st.active() > 1);
+        if !joining && !active {
             return Ok(());
         }
         let now = boot_time_ns();

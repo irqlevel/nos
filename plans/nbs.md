@@ -731,7 +731,86 @@ each new gate.
     elsewhere, a volume moved between hosts, a forced start fencing the old
     guest, a host killed under a write.
 - **N9, repair.** A host or a device lost, epochs, a rebuild under writes, a
-  host back; a scrub comparing replicas by checksum.
+  host back; a scrub comparing replicas by checksum. The design, as decided
+  before it is built:
+  - **A set and its joiner.** A set keeps its three members, each Active or
+    Down -- the version a member went down at kept with it -- and at most
+    one *joiner*: a cs being copied onto, written and not read, which takes
+    a member's place once its copy is done. One mechanism for every case:
+    a cs back before `out_after` joins in its own place and copies only what
+    it missed; a cs out -- `out_after` past, its host removed -- is replaced
+    by a new one in the place it leaves; a cs drained is replaced while it
+    stays active, four copies for a while and never two. Joining and the
+    join's end each raise the set's version.
+  - **Rule 3, by the epochs the cs's keep per chunk.** The joiner pulls each
+    chunk from an active member with the join's epoch: the source moves the
+    chunk's known epoch on before it reads it (checked with its own mds),
+    so a write of the epoch before is refused there from then on, and its
+    writer, its map read again, writes the joiner too. A write the joiner
+    has from a client marks its granules, and the copy leaves those alone:
+    the client's are newer.
+  - **What a cs back copies**: the chunks its source wrote at or after the
+    version the member went down at -- the writes it may have missed -- and
+    every chunk it no longer holds (a device lost with them); its other
+    chunks are the same on every replica already.
+  - **Verified before the end**: every granule copied is held to the
+    source's by checksum before the joiner says it is done; one that
+    differs and was not written meanwhile is copied again and said.
+  - **The controller** is a pure function of the committed state and of
+    what the leader sees of each cs -- answering or not, for how long, in
+    maintenance or not -- in nbsmeta, the same that the fuzzer runs: a cs
+    silent 5 s is down (`CsDown`: every set it is a member of, and every
+    join it is the joiner of), one silent `out_after` (10 min, held off by
+    the registry's maintenance flag) is out (`CsOut`); a set with a member
+    down or out, or drained, is given a joiner (`Join`), those with one
+    active member left first; `place` picks a new one -- up, not in the set,
+    its host not a member's, the room for every chunk of the set, the most
+    room first. A set is rebuilt whole: the batches of 64 the plan began
+    with would mean splitting a set, which comes when the numbers ask for
+    it. The leader proposes, every 10 s and at every change it hears of;
+    the joiner's cs says when it is done (`Joined`), and a join whose joiner
+    goes down is dropped with it.
+  - **Steps**: N9a, nbsmeta's commands, the joiner, the controller and
+    `place` for a joiner, the snapshot NBM5, the `meta` target's model and
+    its progress rule (every set back at three active members within so
+    many turns once hosts and room allow); N9b, the copy -- nbswire's pulls
+    and checksums, nbscs's granule marks, nbs-cs's joiner; N9c, the
+    controller in nbs-mds -- monitors of every `nbs.cs`, the timers, `nbs
+    status`'s counts; N9d, the client writing the joiner, and the `cluster`
+    target losing, bringing back and draining hosts under writes; N9e, the
+    scrub; N9f, nbs-test with a short `out_after` -- a host of four lost for
+    good and every chunk back at three, a host back that copies only what
+    was written meanwhile -- docs and gates.
+  - **N9a, done** (2026-11-08): a cs up, down or out (`CsDown`, `CsUp`,
+    `CsOut`), a set's members down with the version each was active until,
+    its joiner (`Join` at the version it was planned at, `Joined`,
+    `Unjoin`), new chunks only into a set every member of which is active
+    and with no joiner, and only on cs's that are up, an empty set made
+    again before a new one; the snapshot NBM5; `nbsmeta::repair` -- the
+    controller and the counts `nbs status` will show; the `meta` target's
+    model of all of it, and its progress rule. What came up on the way:
+    - **A cs's change and a join in one turn**: a join planned on the state
+      before its cs came back up was refused as in place. The controller
+      proposes the cs's changes alone, and joins at the next turn.
+    - **A placement's count of the sets it takes** (found reading it): the
+      trial counted every empty set as one to make again, the real pass
+      only those whose version can move on, and the trial did not see that
+      making again the empty clean set of three cs's picked later leaves
+      those three needing one more -- with the table full, an
+      `unreachable!` in nbs-mds. The count and the pass now share one rule
+      (`spare`): an empty set is made again only where it is no clean set
+      the placement fills. The table is never full in the fuzzer; the model
+      holds the order the rule gives, and its own mutant fails the gate.
+    - **Mutants**: twenty-two of N9a's and five re-pointed, 75 in all. Two
+      survived the first run: `cs_down_keeps_last` took out a check that
+      `touches` had made redundant -- the rule is in one place now -- and
+      `joiner_checked` was out of reach of spoiling bytes at random, so a
+      set's joiner is now found by its values and spoiled on purpose.
+      `replica_down_drops_joiner` was caught by luck only, until a writer's
+      `ReplicaDown` was drawn of a volume there is, of a set it has chunks
+      in, and now and then of the set's joiner. Three mutants wait for N9d's
+      `cluster` target with joins: the mds vouching a joiner for writes
+      only, the client writing the joiner, the map naming its host.
 - **N10.** Snapshots, images and clones.
 - **N11, numbers.** On the hardware, and what they ask for: pages that move
   instead of copies (a message's pages lent to a `DiskQueue`), chain

@@ -18,8 +18,10 @@ use crate::pieces::Pieces;
 use crate::storage::*;
 use crate::{Cluster, Member, Removed, State, MEMBERS_MAX, NAME_MAX, REMOVED_MAX};
 
-/* NBM3: chunks carry their incarnation; NBM4: a writer its client's token */
-const MAGIC: [u8; 4] = *b"NBM4";
+/* NBM3: chunks carry their incarnation; NBM4: a writer its client's token;
+   NBM5: a cs its state, a set its joiner and its members' last active
+   versions (N9) */
+const MAGIC: [u8; 4] = *b"NBM5";
 /// Chunks or map entries a record of the stream carries at most.
 const BATCH: usize = 256;
 /// How much a digest asks of the stream at a time.
@@ -110,6 +112,7 @@ impl FrozenState {
                 Some(c) => {
                     w.str(&c.host);
                     w.u64(c.reserved);
+                    w.u8(cs_state_code(c.state));
                     w.u8(c.devices.len() as u8);
                     for d in &c.devices {
                         w.u32(d.id);
@@ -131,6 +134,18 @@ impl FrozenState {
                     }
                     for r in set.replicas {
                         w.u8(replica_code(r));
+                    }
+                    for a in set.active_until {
+                        w.u32(a);
+                    }
+                    match set.joiner {
+                        Some(j) => {
+                            w.u8(1);
+                            w.u32(j.cs);
+                            w.u8(j.place);
+                            w.u32(j.since);
+                        }
+                        None => w.u8(0),
                     }
                     w.u32(set.version);
                     w.u32(set.chunks);
@@ -236,7 +251,6 @@ fn device_state(c: u8) -> Option<DeviceState> {
 fn replica_code(r: Replica) -> u8 {
     match r {
         Replica::Active => 0,
-        Replica::Rebuilding => 1,
         Replica::Down => 2,
     }
 }
@@ -244,8 +258,24 @@ fn replica_code(r: Replica) -> u8 {
 fn replica(c: u8) -> Option<Replica> {
     Some(match c {
         0 => Replica::Active,
-        1 => Replica::Rebuilding,
         2 => Replica::Down,
+        _ => return None,
+    })
+}
+
+fn cs_state_code(s: CsState) -> u8 {
+    match s {
+        CsState::Up => 0,
+        CsState::Down => 1,
+        CsState::Out => 2,
+    }
+}
+
+fn cs_state(c: u8) -> Option<CsState> {
+    Some(match c {
+        0 => CsState::Up,
+        1 => CsState::Down,
+        2 => CsState::Out,
         _ => return None,
     })
 }
@@ -324,6 +354,7 @@ pub(crate) fn read<S: Source>(r: &mut Stream<S>) -> Result<State, RestoreError> 
     for id in 0..n as u32 {
         let host = r.str(ipcwire::HOST_MAX).ok_or(BAD)?;
         let reserved = r.u64().ok_or(BAD)?;
+        let state = cs_state(r.u8().ok_or(BAD)?).ok_or(BAD)?;
         let k = usize::from(r.u8().ok_or(BAD)?);
         if k > DEVICES_MAX {
             return Err(RestoreError("more devices than a cs has"));
@@ -336,13 +367,13 @@ pub(crate) fn read<S: Source>(r: &mut Stream<S>) -> Result<State, RestoreError> 
             let state = device_state(r.u8().ok_or(BAD)?).ok_or(BAD)?;
             devices.push(Device { id, ident, slots, state });
         }
-        s.cs.push(Cs { id, host, devices, reserved });
+        s.cs.push(Cs { id, host, devices, reserved, state });
     }
     let n = r.u32().ok_or(BAD)? as usize;
     if n > SETS_MAX {
         return Err(RestoreError("more sets than are kept"));
     }
-    for id in 0..n as u32 {
+    for _ in 0..n {
         let mut cs = [0u32; REPLICAS];
         for c in cs.iter_mut() {
             *c = r.u32().ok_or(BAD)?;
@@ -351,12 +382,22 @@ pub(crate) fn read<S: Source>(r: &mut Stream<S>) -> Result<State, RestoreError> 
         for x in replicas.iter_mut() {
             *x = replica(r.u8().ok_or(BAD)?).ok_or(BAD)?;
         }
+        let mut active_until = [0u32; REPLICAS];
+        for a in active_until.iter_mut() {
+            *a = r.u32().ok_or(BAD)?;
+        }
+        let joiner = match r.u8().ok_or(BAD)? {
+            0 => None,
+            1 => {
+                let cs = r.u32().ok_or(BAD)?;
+                let place = r.u8().ok_or(BAD)?;
+                Some(Joiner { cs, place, since: r.u32().ok_or(BAD)? })
+            }
+            _ => return Err(BAD),
+        };
         let version = r.u32().ok_or(BAD)?;
         let chunks = r.u32().ok_or(BAD)?;
-        s.sets.push(Set { cs, replicas, version, chunks });
-        if s.set_of.insert(cs, id).is_some() {
-            return Err(RestoreError("two sets of the same three chunk servers"));
-        }
+        s.sets.push(Set { cs, replicas, active_until, joiner, version, chunks });
     }
     let n = r.u32().ok_or(BAD)? as usize;
     if n > CHUNKS_MAX {
@@ -455,6 +496,27 @@ impl State {
             if !set.replicas.contains(&Replica::Active) {
                 return Err(RestoreError("a set with no active replica"));
             }
+            /* A member down was active until a version before this one; an
+               active one has none */
+            for k in 0..REPLICAS {
+                let ok = match set.replicas[k] {
+                    Replica::Active => set.active_until[k] == 0,
+                    Replica::Down => set.active_until[k] != 0 && set.active_until[k] < set.version,
+                };
+                if !ok {
+                    return Err(RestoreError("a set's member down at no version before its own, or active with one"));
+                }
+            }
+            /* A joiner in one of its places: the member's own, down, or
+               another cs's no member is; joined at a version of the set's */
+            if let Some(j) = set.joiner {
+                let k = usize::from(j.place);
+                let ok = k < REPLICAS && (j.cs as usize) < self.cs.len() && j.since != 0 && j.since <= set.version
+                    && if set.cs[k] == j.cs { set.replicas[k] == Replica::Down } else { !set.cs.contains(&j.cs) };
+                if !ok {
+                    return Err(RestoreError("a set's joiner of no place, or a member already, or of a version to come"));
+                }
+            }
         }
         /* Every chunk in use: in a set, counted by as many maps as name it;
            every free one on the free list, which ends */
@@ -513,11 +575,23 @@ impl State {
         if walked != free {
             return Err(RestoreError("a free chunk off the free list"));
         }
-        for (i, c) in self.cs.iter().enumerate() {
-            let replicas: u64 = self.sets.iter().filter(|s| s.cs.contains(&(i as u32))).map(|s| u64::from(s.chunks)).sum();
-            if replicas != c.reserved {
-                return Err(RestoreError("a chunk server's reserved not its replicas'"));
+        /* Reserved: every chunk of a set it is a member of, and of one it
+           joins in another's place */
+        let mut held = alloc::vec![0u64; self.cs.len()];
+        for set in self.sets.iter() {
+            for &c in &set.cs {
+                if let Some(h) = held.get_mut(c as usize) {
+                    *h += u64::from(set.chunks);
+                }
             }
+            if let Some(j) = set.joiner.filter(|j| set.joins_elsewhere(j.cs)) {
+                if let Some(h) = held.get_mut(j.cs as usize) {
+                    *h += u64::from(set.chunks);
+                }
+            }
+        }
+        if self.cs.iter().zip(held.iter()).any(|(c, &h)| c.reserved != h) {
+            return Err(RestoreError("a chunk server's reserved not its replicas'"));
         }
         let mut ids: Vec<u32> = Vec::new();
         let mut names: Vec<&str> = Vec::new();

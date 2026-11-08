@@ -42,15 +42,13 @@ pub fn told(s: &State, host: &str, applied: u64, q: &Question) -> Told {
             let (Some(set), Some(me)) = (s.sets().get(ch.set as usize), mine) else {
                 return Told::Refused(Refusal::NotHere);
             };
-            /* A replica taken out serves nothing; one being copied onto is
-               written, not read */
-            let Some(at) = set.cs.iter().position(|&c| c == me.id) else {
+            /* A member taken out serves nothing; the joiner -- being copied
+               onto, its own place's member back or another cs -- is written,
+               not read */
+            let joining = set.joiner.is_some_and(|j| j.cs == me.id);
+            let active = set.cs.iter().position(|&c| c == me.id).is_some_and(|at| set.replicas[at] == Replica::Active);
+            if !(active || (joining && *writing)) {
                 return Told::Refused(Refusal::NotHere);
-            };
-            match set.replicas[at] {
-                Replica::Down => return Told::Refused(Refusal::NotHere),
-                Replica::Rebuilding if !*writing => return Told::Refused(Refusal::NotHere),
-                _ => {}
             }
             let known = Epoch { set: ch.set, version: set.version };
             if known != chunk.epoch {
@@ -74,7 +72,6 @@ pub fn told(s: &State, host: &str, applied: u64, q: &Question) -> Told {
 fn replica_state(r: Replica) -> ReplicaState {
     match r {
         Replica::Active => ReplicaState::Active,
-        Replica::Rebuilding => ReplicaState::Rebuilding,
         Replica::Down => ReplicaState::Down,
     }
 }
@@ -104,8 +101,9 @@ pub fn map(s: &State, applied: u64, name: &str, from: u32, count: u32, index: u6
             chunk: ChunkRef { chunk: c, incarnation: ch.incarnation, epoch: Epoch { set: ch.set, version: set.version } },
             cs: set.cs,
             replicas: [replica_state(set.replicas[0]), replica_state(set.replicas[1]), replica_state(set.replicas[2])],
+            joiner: set.joiner.map(|j| j.cs),
         });
-        for &cs in &set.cs {
+        for cs in set.cs.iter().copied().chain(set.joiner.map(|j| j.cs)) {
             if !named.contains(&cs) {
                 named.push(cs);
             }
