@@ -302,7 +302,12 @@ private:
     CpuTable& operator=(CpuTable&& other) = delete;
 
     ulong get_bsp_index_lock_held();
+    /* The running CPUs but this one and the parked: the caller held to its
+       CPU (BUG_ON), or "this one" stops meaning the CPU it was. */
     ulong get_remote_cpu_mask();
+    /* A shootdown's first half: this CPU's TLB flushed -- of `count` pages
+       from virt_addr, or of everything -- and the CPUs left for the second. */
+    ulong flush_local_tlb(ulong virt_addr, ulong count, bool all);
     void send_tlb_ipi(ulong cpu_mask, IPITask tasks[MAX_CPUS]);
 
     SpinLock lock_;

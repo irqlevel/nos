@@ -1,6 +1,7 @@
 #include "cpu.h"
 #include "interrupt.h"
 #include "panic.h"
+#include "preempt.h"
 #include "klog.h"
 #include "watchdog.h"
 #include "softirq.h"
@@ -451,9 +452,16 @@ static void tlb_flush_range_func(void* ctx, Context* ipi_ctx)
     mm::PageTable::invalidate_local_tlb_range(rc->virt_addr, rc->count);
 }
 
-/* Build a running-CPU mask excluding the local CPU and exited CPUs. */
+/* Build a running-CPU mask excluding the local CPU and exited CPUs. Which
+   CPU is the local one means something only while the caller cannot be
+   moved off it: a shootdown that asked after a move left out the CPU it
+   moved to, whose TLB nobody flushed (flush_local_tlb). So the caller is
+   held to its CPU, or this is a panic at its first call, whatever the
+   timing. */
 ulong CpuTable::get_remote_cpu_mask()
 {
+    BUG_ON(preempt_can_move());
+
     ulong local_id = get_current_cpu_id();
     ulong cpu_mask = get_running_cpus() & ~(1UL << local_id);
 
@@ -533,7 +541,12 @@ void CpuTable::synchronize(const char* what)
 {
     static const ulong ACK_TIMEOUT_NS = 10 * consts::NANO_SECS_IN_SEC;
 
+    /* Held to this CPU for the mask, as get_remote_cpu_mask asks -- though
+       a move would do no harm here: the CPU left out is running this task
+       when it is left out, so it is in the middle of nothing else. */
+    Task* pinned = preempt_disable_task();
     ulong cpu_mask = get_remote_cpu_mask();
+    preempt_enable_task(pinned);
     if (cpu_mask == 0)
         return;
 
@@ -576,14 +589,32 @@ void CpuTable::synchronize(const char* what)
         PANIC("%s: cpus 0x%lX never took the interrupt (asked 0x%lX)", what, silent, cpu_mask);
 }
 
+/* Preemption is off from the flush to the mask, so the CPU the mask leaves
+   out is the CPU just flushed. A task moved to another CPU in between had
+   the mask leave out the CPU it moved to, whose TLB nobody flushed, and ask
+   the one already flushed -- and a range flushed half on one CPU and half on
+   the next left both with half of it. On x86 that kept a translation of a
+   freed heap block on a CPU that went on reading and writing the block's
+   old frame through it, once the VA was handed out again with a frame of
+   its own: a page of somebody else's (an ipc ping in some thousands of
+   1 MiB came back with a page of another one's, between two hosts under
+   KVM). arm64's TLBI broadcasts, so there is no mask; held to the CPU, its
+   DSB completes the TLBI of the CPU that issued it. */
+ulong CpuTable::flush_local_tlb(ulong virt_addr, ulong count, bool all)
+{
+    Task* pinned = preempt_disable_task();
+    if (all)
+        mm::PageTable::invalidate_local_tlb();
+    else
+        mm::PageTable::invalidate_local_tlb_range(virt_addr, count);
+    const ulong cpu_mask = hal::tlb_shootdown_needs_ipi() ? get_remote_cpu_mask() : 0;
+    preempt_enable_task(pinned);
+    return cpu_mask;
+}
+
 void CpuTable::invalidate_tlb_all()
 {
-    mm::PageTable::invalidate_local_tlb();
-
-    if (!hal::tlb_shootdown_needs_ipi())
-        return; /* the local TLBI already broadcast to all CPUs */
-
-    ulong cpu_mask = get_remote_cpu_mask();
+    ulong cpu_mask = flush_local_tlb(0, 0, true);
     if (cpu_mask == 0)
         return;
 
@@ -600,12 +631,7 @@ void CpuTable::invalidate_tlb_all()
 
 void CpuTable::invalidate_tlb_address(ulong virt_addr)
 {
-    mm::PageTable::invalidate_local_tlb_address(virt_addr);
-
-    if (!hal::tlb_shootdown_needs_ipi())
-        return;
-
-    ulong cpu_mask = get_remote_cpu_mask();
+    ulong cpu_mask = flush_local_tlb(virt_addr, 1, false);
     if (cpu_mask == 0)
         return;
 
@@ -629,12 +655,7 @@ void CpuTable::invalidate_tlb_address(ulong virt_addr)
 
 void CpuTable::invalidate_tlb_range(ulong virt_addr, ulong count)
 {
-    mm::PageTable::invalidate_local_tlb_range(virt_addr, count);
-
-    if (!hal::tlb_shootdown_needs_ipi())
-        return;
-
-    ulong cpu_mask = get_remote_cpu_mask();
+    ulong cpu_mask = flush_local_tlb(virt_addr, count, false);
     if (cpu_mask == 0)
         return;
 
