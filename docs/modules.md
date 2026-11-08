@@ -674,7 +674,7 @@ heapbench: 200 ms a run, on 1 CPU and on 4
   pass 256            481.7        583.1            6.8
 ```
 
-    heapbench [cpus=N] [ms=200]
+    heapbench [cpus=N] [ms=200] [pass [roam]]
 
 - `pair S`: an allocation of S bytes and its free. The sizes are the ones the
   heap treats differently: its pools' classes (16 to 1024), the largest
@@ -684,10 +684,28 @@ heapbench: 200 ms a run, on 1 CPU and on 4
   and give-back cost.
 - `grow 64k`: a vector grown to 64 KiB in 512-byte pieces and dropped, every
   reallocation an allocation, a copy and a free.
-- `pass S` checks as much as it measures: each worker fills a batch with a
-  byte of its own, hands it to the next worker and checks and frees the batch
-  handed to it -- every block freed on another CPU than the one that took
-  it. A block that comes back changed ends the run with `CORRUPT`.
+- `pass S` checks as much as it measures: each worker makes a batch of
+  blocks, every word of each its block's id -- the worker's slot and a
+  number -- mixed with the word's index, hands it to the next worker and
+  checks and frees the batch handed to it: every block freed on another CPU
+  than the one that took it. A block that comes back changed ends the run
+  with `CORRUPT`, the size, the maker, the word that was wrong and what it
+  held -- which block's, by the id it carries. `pass` alone runs only
+  these, a stress rather than a measure (`heapbench pass ms=10000`).
+- `roam` (it implies `pass`) takes the workers off their CPUs: two a CPU,
+  bound to none, each pausing after a round -- a yield, or a sleep of up
+  to 300 µs. A task moves only when it is displaced while it can run and
+  its queue is busier than another by two ([Load
+  balancing](scheduler.md#load-balancing)), so workers that never sleep
+  leave every queue even and nobody moves; sleeping, they leave their CPUs
+  short, and each wakeup displaces whoever runs there, at any point of a
+  round -- a free among them. A free moved between its CPU's TLB flush and
+  its list of the CPUs still to flush once left the CPU it moved to with
+  the freed block's translation, and the next block at that address was
+  read and written through it ([TLB
+  shootdown](paging.md#tlb-shootdown-and-the-deadlock-it-can-cause)): on
+  x86 under KVM, four CPUs, the tree before the fix panicked in `roam`'s
+  first round, a kept block found written after its free.
 - Nothing panics on a refusal: an allocation the heap refuses ends the run
   and says so.
 
