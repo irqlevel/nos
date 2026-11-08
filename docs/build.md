@@ -62,6 +62,24 @@ tables they lack, in `kernel/pass1_tables.cpp`, a file that indexes neither.
 Anything that touches the link or symbol resolution has to keep all three
 working, and the check green.
 
+The names in the table are demangled, Rust's v0 ones too, and so are those
+of a module's `.nos_syms`. `nm -C` alone left some four hundred of Rust's
+functions mangled on x86 -- those LLVM gave a suffix of its own,
+`.llvm.<n>`, which GNU nm's demangler does not take -- and arm64's
+`llvm-nm` writes the suffix after the name as ` (.llvm.<n>)`: the tables cut
+the suffix either way and demangle what is left with `llvm-cxxfilt`, so that
+`alloc`'s `finish_grow` is a name in a backtrace, a profile and memsites
+on either architecture. The rule does not depend on the `Makefile`: after
+changing it, delete `out/$(ARCH)/symtab_data.cpp` for a table made anew.
+
+The kernel's Rust is built with its line tables
+(`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`), and its C++ with `-g3`:
+`bin/kernel64.elf` and `kernel-arm64.elf` name an address to a file and a
+line for GDB, `llvm-symbolizer` and `scripts/memsites.py`. None of it is
+loaded -- GRUB loads the segments, `nos-arm64.img` is the segments alone --
+and the kernel `nos.iso`, `nos-test.iso` and the system image carry is
+copied without it (`llvm-objcopy --strip-debug`).
+
 All three links take in every function the `ffi` crate declares that the
 Rust staticlib defines, by `-u` (`out/$(ARCH)/ffi_keep.rsp`, made from the
 staticlib's `nm`). A function only modules call -- the device queue's
