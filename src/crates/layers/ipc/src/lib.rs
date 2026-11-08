@@ -44,6 +44,7 @@ extern crate alloc;
 
 mod abi;
 mod echo;
+mod ping;
 mod remote;
 mod selftest;
 mod shell;
