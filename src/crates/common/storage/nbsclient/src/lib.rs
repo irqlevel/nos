@@ -829,6 +829,11 @@ impl Session {
             },
             _ => self.map.sets.iter().filter(|(_, s)| s.written_to(cs)).map(|(&id, _)| id).collect(),
         };
+        /* A cs-wide request to a cs no set writes now: done, not waited on */
+        if sets.is_empty() && !matches!(what, What::Piece(_)) {
+            self.cs_wide_done(cs, now, bufs, out);
+            return;
+        }
         /* A read moves to another replica meanwhile */
         if let What::Piece(pid) = what {
             let read = self.pieces.get(&pid).and_then(|p| self.ops.get(&p.op)).is_some_and(|o| o.kind == Kind::Read);
@@ -892,30 +897,38 @@ impl Session {
                 self.replica_has(pid, cs, now, bufs, out);
             }
         }
-        /* A cs-wide request: not needed once no set of the volume writes it */
-        if !self.map.written_cs().contains(&cs) {
-            let cs_wide: Vec<(u64, What)> = self.subs.iter()
-                .filter(|(_, s)| s.cs == cs && !matches!(s.what, What::Piece(_)))
-                .map(|(&id, s)| (id, s.what)).collect();
-            for (id, what) in cs_wide {
-                self.subs.remove(&id);
-                match what {
-                    What::Fence => {
-                        self.fences_done(now, bufs, out);
-                    }
-                    What::Held => {
-                        self.held.insert(cs, Some(Vec::new()));
-                        self.helds_done(now, bufs, out);
-                    }
-                    What::Flush(op) => {
-                        if let Some(o) = self.ops.get_mut(&op) {
-                            o.waiting.remove(&cs);
-                        }
-                        self.flush_progress(op, now, bufs, out);
-                    }
-                    What::Close(place) => self.closed(place, cs, now, bufs, out),
-                    What::Piece(_) => {}
+        self.cs_wide_done(cs, now, bufs, out);
+    }
+
+    /// The cs-wide requests to `cs` done, where no set of the volume writes it
+    /// any more -- taken out before they went, or after: none is needed of a
+    /// cs out of every set, and one no answer comes to would wait for good,
+    /// no set being left to ask it out of.
+    fn cs_wide_done(&mut self, cs: u32, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
+        if self.map.written_cs().contains(&cs) {
+            return;
+        }
+        let cs_wide: Vec<(u64, What)> = self.subs.iter()
+            .filter(|(_, s)| s.cs == cs && !matches!(s.what, What::Piece(_)))
+            .map(|(&id, s)| (id, s.what)).collect();
+        for (id, what) in cs_wide {
+            self.subs.remove(&id);
+            match what {
+                What::Fence => {
+                    self.fences_done(now, bufs, out);
                 }
+                What::Held => {
+                    self.held.insert(cs, Some(Vec::new()));
+                    self.helds_done(now, bufs, out);
+                }
+                What::Flush(op) => {
+                    if let Some(o) = self.ops.get_mut(&op) {
+                        o.waiting.remove(&cs);
+                    }
+                    self.flush_progress(op, now, bufs, out);
+                }
+                What::Close(place) => self.closed(place, cs, now, bufs, out),
+                What::Piece(_) => {}
             }
         }
     }
@@ -1128,7 +1141,10 @@ impl Session {
         o.out = true;
         let (kind, offset, len) = (o.kind, o.offset, o.len);
         if kind.flushes() {
-            let to = core::mem::take(&mut self.dirty);
+            /* A cs taken out of every set it was written in holds nothing the
+               volume counts on: not flushed */
+            let written = self.map.written_cs();
+            let to: BTreeSet<u32> = core::mem::take(&mut self.dirty).into_iter().filter(|cs| written.contains(cs)).collect();
             if let Some(o) = self.ops.get_mut(&id) {
                 o.waiting = to.clone();
             }

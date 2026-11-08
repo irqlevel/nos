@@ -41,7 +41,9 @@ $ insmod /lib/modules/nbs-cs.ko            # after it: the cs asks this host's m
 
 `compact=<bytes>` is how much log the member keeps past its snapshot before
 it takes a new one. It is the state's size if that is more, and raft's
-1 MiB unless given ("The snapshot", below).
+1 MiB unless given ("The snapshot", below). `out_after=<seconds>` is how
+long a cs is silent before the leader's controller has it out and its
+places taken by others: ten minutes unless given ([Repair](#repair)).
 
 On the first host:
 
@@ -235,7 +237,17 @@ N9c's.
   -- the most room first, ties by a hash of the set and the cs; two joins a
   joiner and sixteen a turn at most. A set is rebuilt whole.
 - **Seen**: `nbsmeta::repair::health` counts the chunks by how many of
-  their set's members are active, and those being copied onto a joiner.
+  their set's members are active, and those being copied onto a joiner;
+  `nbs status` says them, with the joins under way and the cs's down and
+  out.
+- **In nbs-mds** (N9c) the leader looks at every cs once a second
+  (`Op::Ping`) and plans every ten seconds -- sooner, a second after its
+  last plan at the soonest, where the state moved on (a cs changed, a join
+  done or dropped) or a cs went silent or came back -- proposing what the
+  plan gives once what it proposed last is applied. After a proposal of its
+  is refused it keeps to the ten seconds, saying each refusal. A cs's silence counts from when this leader began to watch it: a
+  new leader takes none for down at once. The registry's maintenance flag
+  is not read yet.
 
 ### The copy
 
@@ -547,10 +559,15 @@ What it holds to (plans/nbs.md, "Replication: the rules"):
   active replica, this host's where it has one, and to another when it does
   not answer.
 - **A flush** waits for every write before it, then asks every cs that has
-  acknowledged a write since the last flush began to make its writes
-  durable. It is done once they have and once every flush before it is,
-  since each takes the cs's dirty when it begins; one that fails fails those
-  out after it. A close is a flush, then every chunk written closed at once.
+  acknowledged a write since the last flush began, and that some set of the
+  volume still writes, to make its writes durable. It is done once they have
+  and once every flush before it is, since each takes the cs's dirty when it
+  begins; one that fails fails those out after it. A close is a flush, then
+  every chunk written closed at once. A cs taken out of every set holds
+  nothing the volume counts on: a flush, a close or a fence asked of it is
+  done, not waited on -- nbs-test's repair phase found a close waiting for
+  good on a cs the controller had taken out (`CsDown`) while it still owed
+  a flush.
 - **A replica that restarted** with a chunk open at the writer's generation
   may have lost what was written since the last flush, which the others
   have: it refuses that writer's requests of the chunk -- and its flushes --
@@ -672,7 +689,10 @@ image's zeros out.
   every read to what a write done or out since may have left, every replica
   that comes back to what a flush made durable, the replicas the same once a
   writer serves and at the end, and no active replica doing an older
-  generation's write or flush once a newer writer serves.
+  generation's write or flush once a newer writer serves. At the end of
+  some runs a host is lost for good, where every chunk can do without it:
+  the writer's writes past it, its flush and its close must be done, and no
+  flush may go to its cs once no set has it in.
 
   Its `join` target is one join's copy (N9b) between two engines, the
   source served by nbswire's `serve` as a cs serves it, and the hosts' mds
@@ -688,10 +708,10 @@ image's zeros out.
   set on the joiner is the source's, byte for byte, and every one the copy
   closed is still so after a power cut.
 
-  `--mutants` takes ninety rules out one at a time -- forty-four of the
+  `--mutants` takes ninety-one rules out one at a time -- forty-four of the
   metadata's, five of them the controller's; twenty-four of the cs's, nine
   of them the copy's; twelve of the wire's, its `serve`'s and the copy's;
-  ten of the client's -- each caught.
+  eleven of the client's -- each caught.
 - **`fuzz/raft`'s `nbsmeta` target**: the members' part of the state, its
   commands from pools of names and incarnations that meet and from wide ones
   that fill the cluster. There are four scenarios and six mutants.
@@ -741,6 +761,11 @@ image's zeros out.
     host writes, a forced writer's fences failing the old session, a host's
     closed chunks and data kept over its reboot; nbsload's `verify` holding
     every block to its last write, and a read load on another host;
+  - repair (N9): a volume written, c killed -- the leader's controller has
+    its cs down -- the volume written past it and closed, c booted again:
+    its cs up, joined in its own place, every chunk at three replicas again
+    with none being copied, and a read on c of what was written while it was
+    gone, which its join's copy took;
   - nothing panicked.
 - **`scripts/hv-nbs-test.py`** (x86-64, manual: a guest kernel and an
   initrd): Linux guests of hv's on volumes -- an image poured with `hv
