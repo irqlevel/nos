@@ -31,9 +31,23 @@
 #undef private
 
 #include <kernel/cpu.h>
+#include <kernel/parameters.h>
 
 #include "fuzz.h"
 #include "kernel.h"
+
+namespace kernel
+{
+namespace ubsan
+{
+
+/* What parameters.cpp reaches for on ubsan=: nothing of this target's */
+void set_warn_only(bool)
+{
+}
+
+}
+}
 
 #include <sanitizer/asan_interface.h>
 #include <sys/mman.h>
@@ -637,6 +651,10 @@ void boot(fuzz::Input& in)
     /* The fixed allocators' ranges and the first of the large runs' window:
        poisoned until mapped */
     ASAN_POISON_MEMORY_REGION(region, 64UL << 20);
+    /* heapcheck=on now and then: every block unmapped as it is freed, and
+       its address held back -- a stale access in the heap's own code a page
+       the model has poisoned again, for ASan */
+    Parameters::get_instance().parse(in.chance(4) ? "heapcheck=on" : "heapcheck=off");
     INVARIANT(PageAllocatorImpl::get_instance().setup(), "the page allocator would not set up over %lu pages", pages);
     tested_heap();
     baseline = pages - page_model.free_count;

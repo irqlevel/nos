@@ -139,6 +139,15 @@ public:
     bool is_zero_free_off();
     bool is_zero_free_verify();
 
+    /* heapcheck=on -- every block the page allocator hands the heap (an
+       allocation of half a page and more) unmapped as it is freed, nothing
+       kept for reuse, and its address held back from the next ones of its
+       size for a while (PageAllocatorImpl::QUARANTINE): a read or a write
+       through a freed block's address -- which would otherwise land in
+       whoever has the memory next -- is a page fault, its backtrace the
+       culprit's. Off by default: every such free is a shootdown. */
+    bool is_heap_check();
+
     /* rxpoll=on -- have the tick look at the receive path as well as the
        NIC's own interrupt. Off by default: it is a hypothesis about a driver
        stall, not a proven fix, and on the machine it was meant to help the
@@ -253,6 +262,7 @@ private:
     ulong huge_pool_percent_;
     ulong huge_pool_bytes_;
     ZeroFreeMode zero_free_md_;
+    bool heap_check_;
     bool rx_poll_;
     int log_level_;
     bool dns_enabled_;
