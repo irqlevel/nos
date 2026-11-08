@@ -147,6 +147,13 @@ impl Session {
         }
     }
 
+    fn failure(&self) -> Option<tls::pinned::Failure> {
+        match self {
+            Session::Server(s) => s.failure(),
+            Session::Client(s) => s.failure(),
+        }
+    }
+
     /// Its goodbye, and the connection closed -- or reset, when the goodbye
     /// did not go.
     fn close(self) {
@@ -167,6 +174,13 @@ impl Session {
         };
         sock.tcp.abort();
     }
+}
+
+/// What a peer is lost by when its session fails: the session's own word
+/// for why -- a connection reset and a record whose bytes changed on the
+/// way are not the same loss.
+fn failed(sess: &Session) -> &'static str {
+    sess.failure().map_or("the session failed", tls::pinned::Failure::said)
 }
 
 /// Where a connection's task starts.
@@ -609,13 +623,13 @@ fn serve_link(shared: &Arc<Shared>, sess: &mut Session, peer: &Arc<Peer>, class:
         let mut moved = false;
         while sess.pending() < MAX_PENDING && sender.next(peer, class, &mut frame) {
             if !sess.write(&frame, WRITE_ROOM) {
-                return "the session failed";
+                return failed(&sess);
             }
             moved = true;
         }
         if sess.pending() > 0 {
             match sess.flush(1) {
-                Flush::Failed => return "the session failed",
+                Flush::Failed => return failed(&sess),
                 Flush::Done | Flush::More => {}
             }
         }
@@ -660,7 +674,7 @@ fn serve_link(shared: &Arc<Shared>, sess: &mut Session, peer: &Arc<Peer>, class:
                 }
                 Read::Idle => break,
                 Read::End => return "it closed its connection",
-                Read::Failed => return "the session failed",
+                Read::Failed => return failed(&sess),
             }
             if !sess.buffered() {
                 break;

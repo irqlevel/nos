@@ -40,8 +40,8 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{NoServerSessionStorage, ServerConnectionData, UnbufferedServerConnection};
 use rustls::time_provider::TimeProvider;
 use rustls::unbuffered::{ConnectionState, EncodeError, EncryptError, UnbufferedStatus};
-use rustls::{CertificateError, ClientConfig, CommonState, DigitallySignedStruct, DistinguishedName, Error, ServerConfig,
-             SignatureScheme};
+use rustls::{AlertDescription, CertificateError, ClientConfig, CommonState, DigitallySignedStruct, DistinguishedName,
+             Error, ServerConfig, SignatureScheme};
 use sha2::{Digest, Sha256};
 
 /// An end's key, as the other knows it: the SHA-256 of the
@@ -445,6 +445,68 @@ pub enum Flush {
     Failed,
 }
 
+/// Why a session failed -- what its `Read::Failed`, a write's false and
+/// `Flush::Failed` came of: the first cause, kept (`Session::failure`). A
+/// connection reset and a record whose bytes changed on the way both end a
+/// session, and only this says which it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    /// The connection under it failed: reset, or given up on.
+    Socket,
+    /// The stream ended inside a record.
+    Cut,
+    /// A record larger than the buffer: not TLS this end can follow.
+    Oversize,
+    /// A record that did not decrypt: its tag was not what its bytes make
+    /// -- they changed on the way, or were never the other end's.
+    BadRecord,
+    /// The other end's alert that a record of this end's did not decrypt.
+    PeerBadRecord,
+    /// Another alert from the other end.
+    Alert,
+    /// The other end broke the protocol.
+    Protocol,
+    /// A record this end could not make.
+    Encrypt,
+    /// The session would take no more to write: it closed, or rustls wants
+    /// to read first.
+    Unwritable,
+    /// No memory for what a record held.
+    NoMemory,
+    /// Its state machine turned without coming to anything.
+    Stuck,
+}
+
+impl Failure {
+    fn of(e: &Error) -> Failure {
+        match e {
+            Error::DecryptError => Failure::BadRecord,
+            Error::AlertReceived(AlertDescription::BadRecordMac) => Failure::PeerBadRecord,
+            Error::AlertReceived(_) => Failure::Alert,
+            Error::EncryptError => Failure::Encrypt,
+            Error::PeerSentOversizedRecord => Failure::Oversize,
+            _ => Failure::Protocol,
+        }
+    }
+
+    /// The whole of it said: what a log line says a session ended by.
+    pub fn said(self) -> &'static str {
+        match self {
+            Failure::Socket => "the session failed: its connection did",
+            Failure::Cut => "the session failed: its stream was cut inside a record",
+            Failure::Oversize => "the session failed: a record too large to follow",
+            Failure::BadRecord => "the session failed: a record that does not decrypt -- its bytes changed on the way",
+            Failure::PeerBadRecord => "the session failed: the other end found a record of this end's that does not decrypt",
+            Failure::Alert => "the session failed: an alert from the other end",
+            Failure::Protocol => "the session failed: the other end broke the protocol",
+            Failure::Encrypt => "the session failed: a record this end could not make",
+            Failure::Unwritable => "the session failed: it would take no more to write",
+            Failure::NoMemory => "the session failed: no memory for a record",
+            Failure::Stuck => "the session failed: its state machine came to nothing",
+        }
+    }
+}
+
 /// What one turn of the state machine did.
 enum Turn {
     Progress,
@@ -535,6 +597,8 @@ pub struct Session<S: Socket, E: End> {
     peer: Fingerprint,
     closed: bool,
     failed: bool,
+    /// Why, once it has: the first cause
+    failure: Option<Failure>,
 }
 
 /// A server's session with a client it let in.
@@ -646,6 +710,7 @@ impl<S: Socket, E: End> Session<S, E> {
             peer: [0; 32],
             closed: false,
             failed: false,
+            failure: None,
         };
         match session.handshake(within_ms) {
             Ok(()) => Ok(session),
@@ -756,6 +821,7 @@ impl<S: Socket, E: End> Session<S, E> {
     /// record larger than the buffer is not TLS this server can follow.
     fn fill(&mut self, wait_ms: u64) -> Recv {
         if self.used == self.incoming.len() {
+            self.fail(Failure::Oversize);
             return Recv::Failed;
         }
         match self.sock.recv(&mut self.incoming[self.used..], wait_ms.max(1)) {
@@ -898,15 +964,31 @@ impl<S: Socket, E: End> Session<S, E> {
                         /* The end of the stream between two records is the
                          * other end gone; inside one, the stream was cut */
                         Recv::End if self.used == 0 => self.closed = true,
-                        Recv::End | Recv::Failed => self.failed = true,
+                        Recv::End => self.fail(Failure::Cut),
+                        Recv::Failed => self.fail(Failure::Socket),
                     }
                 }
                 Turn::PeerClosed | Turn::Closed => self.closed = true,
-                Turn::Failed(_) | Turn::NoMemory => self.failed = true,
+                Turn::Failed(e) => self.fail(Failure::of(&e)),
+                Turn::NoMemory => self.fail(Failure::NoMemory),
             }
         }
-        self.failed = true;
+        self.fail(Failure::Stuck);
         Read::Failed
+    }
+
+    /// The session failed, for `why` -- unless it had already, for
+    /// something else first.
+    fn fail(&mut self, why: Failure) {
+        self.failed = true;
+        if self.failure.is_none() {
+            self.failure = Some(why);
+        }
+    }
+
+    /// Why the session failed, if it has.
+    pub fn failure(&self) -> Option<Failure> {
+        self.failure
     }
 
     /// `data`, encrypted, put after what waits to be sent -- unless that
@@ -927,6 +1009,7 @@ impl<S: Socket, E: End> Session<S, E> {
             return true;
         }
         let mut out = Some(data);
+        let mut why = Failure::Stuck;
         for _ in 0..MAX_TURNS {
             match self.turn(&mut out) {
                 Turn::Ready if out.is_none() => return true,
@@ -934,10 +1017,21 @@ impl<S: Socket, E: End> Session<S, E> {
                 /* What it said before is in `plain`, still to be read; from
                  * here on it says nothing more */
                 Turn::PeerClosed => self.closed = true,
-                Turn::NeedRead | Turn::Closed | Turn::Failed(_) | Turn::NoMemory => break,
+                Turn::NeedRead | Turn::Closed => {
+                    why = Failure::Unwritable;
+                    break;
+                }
+                Turn::Failed(e) => {
+                    why = Failure::of(&e);
+                    break;
+                }
+                Turn::NoMemory => {
+                    why = Failure::NoMemory;
+                    break;
+                }
             }
         }
-        self.failed = true;
+        self.fail(why);
         false
     }
 
@@ -957,7 +1051,7 @@ impl<S: Socket, E: End> Session<S, E> {
                 Flush::More
             }
             None => {
-                self.failed = true;
+                self.fail(Failure::Socket);
                 Flush::Failed
             }
         }

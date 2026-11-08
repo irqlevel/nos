@@ -126,6 +126,15 @@ apart.
   into the session's own queue, bounded by what the caller allows, and
   `flush` sends from it for as long as it is given -- so a client that stops
   reading holds up its own connection's task and nobody else.
+- **A failure says why.** `read`'s `Failed`, a `write` that is refused and
+  `flush`'s `Failed` all end the session, and `failure` says what ended it,
+  the first cause kept (`tls::pinned::Failure`): the connection under it
+  (reset, or given up on), the stream cut inside a record, a record that
+  does not decrypt -- its bytes changed on the way -- or the other end's
+  alert that one of this end's did not, another alert, the protocol
+  broken, no memory. A reset and a corrupted record end a session alike,
+  and only this tells them apart; ipcnet logs it as the reason a peer was
+  lost.
 - **The way out.** `close` sends a close_notify and hands the socket back to
   be closed, after the client's own goodbye, so the server is never the
   side left in TIME-WAIT; `into_socket` hands it back for a reset. A
