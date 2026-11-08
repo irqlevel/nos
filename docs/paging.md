@@ -60,6 +60,17 @@ invalidates the local TLB, takes a reference on the page and returns the
 VA; `tmp_unmap_page` reverses it. `tmp_map_range` takes a run of adjacent slots
 for a structure that crosses a page boundary (ACPI tables, mostly).
 
+Both flush only the TLB of the CPU they run on, so a slot is used on the CPU
+that mapped it, and unmapped there: the caller is held to one CPU from the
+map to the unmap -- a spinlock (the page-table walks hold `lock_`),
+`preempt_disable_task` (`zero_page`), interrupts off (`virt_to_phys`). A task
+moved half way would leave the slot's translation cached on the CPU it left,
+for the next user of the slot there to read and write through. What maps a
+slot for good -- the VGA buffer, the local APIC, the IO-APIC -- does it
+before the scheduler preempts, before any other CPU runs. Both ends check:
+`BUG_ON(preempt_can_move())`, a panic at the first call made by a caller
+that could be moved, whether or not a move happened to cut it.
+
 The last 64 are a slot for each CPU, and serve one thing: a copy into or
 out of a frame -- a page handed out by address and mapped nowhere, what a
 guest's memory is made of (`kcore::frame`) -- which is every read and write
@@ -395,6 +406,25 @@ Every mapping change invalidates only the issuing CPU's TLB.
 others as an IPI task and wait for every one to acknowledge — except on
 arm64, where `TLBI` broadcasts in hardware and `hal::tlb_shootdown_needs_ipi()`
 answers false.
+
+The local flush and the mask of the CPUs still to ask are made on one CPU,
+preemption off from the first to the second (`CpuTable::flush_local_tlb`):
+the mask leaves out the CPU it is computed on, and that has to be the CPU
+just flushed. It was not always: a task moved between the two left out the
+CPU it moved to, whose TLB nobody flushed, and asked the one already
+flushed. On x86 under load that CPU kept a translation of a freed heap
+block, and once the block's VA was handed out again with a frame of its own
+it read and wrote the old frame through it -- a page of somebody else's.
+It showed as one 1 MiB `ipc ping` in some thousands coming back with a
+4 KiB piece of another ping's data, between two hosts under KVM, and as
+`take_kept`'s mark check firing within seconds once a yield was put
+between the flush and the mask. `get_remote_cpu_mask` now refuses a caller
+that could be moved (`BUG_ON(preempt_can_move())`), a panic at its first
+call rather than at the move that one call in thousands meets. arm64 needs
+no mask, but the same move can leave a `TLBI` incomplete -- it is complete
+once the CPU that issued it passes a `DSB`, and a task interrupted between
+the two runs its `DSB` on the CPU it is moved to -- so `switch_context`
+starts with a `dsb ish`, as Linux's `__switch_to` does.
 
 This is the origin of the single most important rule in the codebase:
 **never allocate or free with a spinlock held.** `mm::free`/`mm::alloc` can

@@ -46,6 +46,11 @@ public:
     bool free(void* addr);
     bool unmap(void* addr, size_t count);
     bool contains(void* addr);
+    /* free in two halves, for heapcheck=on: the block unmapped and its
+       pages given back, every CPU's translation of it gone -- and later, on
+       its own, the address made free again */
+    bool free_keeping_va(void* addr);
+    void free_va(void* addr);
 
 private:
     FixedPageAllocator(const FixedPageAllocator& other) = delete;
@@ -197,6 +202,29 @@ private:
 
     KeptList kept_blocks_[PAGE_LOG_LIMIT];
     CpuKept cpu_kept_blocks_[CACHE_CPUS]; /* cpu_cache.h's */
+
+public:
+    /* heapcheck=on: the frees of a size whose addresses are held back from
+       the allocations after them -- a freed address handed out again only
+       once this many more of its size have been freed */
+    static constexpr ulong QUARANTINE = 1024;
+
+private:
+    struct Quarantine
+    {
+        SpinLock lock;
+        ulong held[QUARANTINE] = {};
+        ulong next = 0;
+        ulong count = 0;
+    };
+
+    /* heapcheck=on (Parameters::is_heap_check), read at setup: Free unmaps
+       a block and gives its pages back at once, keeping nothing, and its
+       address joins its size's quarantine -- a stale read or write through
+       it a page fault, not somebody else's data */
+    bool heap_check_ = false;
+    Quarantine quarantine_[PAGE_LOG_LIMIT];
+    void release_quarantined(size_t log, void* addr);
 };
 
 }

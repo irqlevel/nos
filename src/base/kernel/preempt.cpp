@@ -133,6 +133,13 @@ bool preempt_can_block()
     return task != nullptr && task->preempt_disable_counter_.get() == 0;
 }
 
+bool preempt_can_move()
+{
+    /* What could block could be switched away, and woken on another CPU;
+       before preemption is on, nothing is switched away at all. */
+    return preempt_is_on() && preempt_can_block();
+}
+
 static constexpr ulong PREEMPT_WAS_ON_BIT = (1UL << 63);
 
 ulong preempt_irq_save()
