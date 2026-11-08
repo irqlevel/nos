@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use nbscs::{ChunkRef, Epoch};
 use nbsmeta::{DeviceState, Replica, State};
 
-use crate::{Device, Identity, Place, Question, Refusal, ReplicaState, Said, Told, MAP_MAX};
+use crate::{Device, Identity, JoinView, Place, Question, Refusal, ReplicaState, Said, Told, LIST_MAX, MAP_MAX};
 
 /// Question `q` of host `host`'s cs, answered from state `s`, applied as far
 /// as entry `applied`.
@@ -59,8 +59,46 @@ pub fn told(s: &State, host: &str, applied: u64, q: &Question) -> Told {
             if (*writing || *generation != 0) && v.writer.as_ref().is_none_or(|w| w.generation != *generation) {
                 return Told::Refused(Refusal::NotAttached);
             }
+            /* The joiner told so: it marks what clients write from now on,
+               which its copy is not to write over */
+            match set.joiner.filter(|_| !active) {
+                Some(j) => Told::VerifiedJoining { since: j.since },
+                None => Told::Verified,
+            }
+        }
+        /* A source's check of a joiner's ask: the joiner the set's at the
+           version it names, this host's cs an active member of the set */
+        Question::VerifyJoin { set, joiner, version, index } => {
+            if applied < *index {
+                return Told::Refused(Refusal::Behind { applied });
+            }
+            let Some(st) = s.sets().get(*set as usize) else { return Told::Refused(Refusal::NotTheJoiner) };
+            if st.joiner.is_none_or(|j| j.cs != *joiner) {
+                return Told::Refused(Refusal::NotTheJoiner);
+            }
+            if st.version != *version {
+                return Told::Refused(Refusal::Epoch { known: Epoch { set: *set, version: st.version } });
+            }
+            let Some(me) = mine else { return Told::Refused(Refusal::NotHere) };
+            if !st.cs.iter().zip(st.replicas.iter()).any(|(&c, &r)| c == me.id && r == Replica::Active) {
+                return Told::Refused(Refusal::NotHere);
+            }
             Told::Verified
         }
+        Question::Joins => {
+            let Some(me) = mine else { return Told::Joins(Vec::new()) };
+            Told::Joins(s.sets().iter().enumerate().filter_map(|(id, st)| {
+                let j = st.joiner.filter(|j| j.cs == me.id)?;
+                let k = usize::from(j.place);
+                let sources = (0..nbsmeta::REPLICAS).filter(|&m| st.replicas[m] == Replica::Active)
+                    .filter_map(|m| s.cs().get(st.cs[m] as usize).map(|c| (c.id, c.host.clone()))).collect();
+                Some(JoinView { set: id as u32, place: j.place, since: j.since, version: st.version,
+                                own: st.cs.get(k) == Some(&me.id), until: st.active_until.get(k).copied().unwrap_or(0),
+                                sources, index: applied })
+            }).take(LIST_MAX).collect())
+        }
+        /* Proposals: nbs-mds's, through raft, not answered from the state */
+        Question::JoinDone { .. } | Question::GiveUp { .. } => Told::Refused(Refusal::NoMds),
         Question::Live { chunks } => Told::Gone(chunks.iter()
             .filter(|(c, inc)| s.chunks().get(*c as usize).is_none_or(|ch| ch.is_free() || ch.incarnation != *inc))
             .map(|&(c, _)| c).collect()),

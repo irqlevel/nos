@@ -3,14 +3,15 @@
 //!     nbs-fuzz gate
 //!
 //! everything the gate holds: the meta target over seeds 1 to 300, the cs
-//! target over 1 to 200, the wire target over 1 to 100 and the cluster
-//! target over 1 to 100, every allocation
+//! target over 1 to 200, the wire target over 1 to 100, the cluster
+//! target over 1 to 1000 and the join target over 1 to 800 -- the races of
+//! some of their mutants come once in a few hundred runs -- every allocation
 //! held to what the kernel's heap
 //! gives at once (fuzz/raft's `heap`). Exit 0 when everything held, 1 with
 //! what did not -- a finding with its seed, to run again with
 //! `<target> --seed N --trace`.
 //!
-//!     nbs-fuzz meta|cs|wire|cluster [--seed N] [--seeds K] [--steps S] [--seconds T] [--trace]
+//!     nbs-fuzz meta|cs|wire|cluster|join [--seed N] [--seeds K] [--steps S] [--seconds T] [--trace]
 //!
 //! one target; with `--seconds`, seeds on from the first until the time is
 //! up -- a campaign.
@@ -19,6 +20,7 @@
 mod heap;
 mod cluster;
 mod cs;
+mod join;
 mod meta;
 mod wire;
 /* Shared with fuzz/raft, of which this crate takes what it needs */
@@ -39,8 +41,10 @@ const GATE_CS_SEEDS: u64 = 200;
 const CS_STEPS: u64 = 300;
 const GATE_WIRE_SEEDS: u64 = 100;
 const WIRE_STEPS: u64 = 500;
-const GATE_CLUSTER_SEEDS: u64 = 100;
+const GATE_CLUSTER_SEEDS: u64 = 1000;
 const CLUSTER_STEPS: u64 = 2000;
+const GATE_JOIN_SEEDS: u64 = 800;
+const JOIN_STEPS: u64 = 3000;
 
 /// A run's outcome, a panic included as a finding, and a block asked for
 /// that the kernel's heap would not give.
@@ -109,13 +113,15 @@ fn main() -> ExitCode {
                 + target("cs", cs::run, 1, GATE_CS_SEEDS, CS_STEPS, None, false)
                 + target("wire", wire::run, 1, GATE_WIRE_SEEDS, WIRE_STEPS, None, false)
                 + target("cluster", cluster::run, 1, GATE_CLUSTER_SEEDS, CLUSTER_STEPS, None, false)
+                + target("join", join::run, 1, GATE_JOIN_SEEDS, JOIN_STEPS, None, false)
         }
         Some("meta") => one("meta", meta::run, META_STEPS),
         Some("cs") => one("cs", cs::run, CS_STEPS),
         Some("wire") => one("wire", wire::run, WIRE_STEPS),
         Some("cluster") => one("cluster", cluster::run, CLUSTER_STEPS),
+        Some("join") => one("join", join::run, JOIN_STEPS),
         Some(other) => {
-            eprintln!("nbs-fuzz: no target {} -- gate, meta, cs, wire, cluster", other);
+            eprintln!("nbs-fuzz: no target {} -- gate, meta, cs, wire, cluster, join", other);
             return ExitCode::from(2);
         }
     };

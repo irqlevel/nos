@@ -17,6 +17,11 @@
 //!   first.
 //! - **A record whose two copies are both bad is lost**, its slot never
 //!   used again, and said.
+//! - **A pull moves the chunk's epoch on, durable, before it reads** (N9):
+//!   a write of the epoch before is refused here from then on.
+//! - **A copy writes no sector a client has** since the join of its set
+//!   began: those are marked first, and a copy into a set not joined is
+//!   refused.
 
 use alloc::collections::BTreeMap;
 use alloc::vec;
@@ -26,7 +31,7 @@ use nbsmeta::Pieces;
 
 use crate::device::Device;
 use crate::format::*;
-use crate::{PAGE, SECTOR, SLOT};
+use crate::{GRANULE, PAGE, SECTOR, SLOT};
 
 /// Why a request was not done.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +63,10 @@ pub enum Error {
     /// The device failed under this request: every request of its from now
     /// on is refused.
     Io,
+    /// A chunk the cs does not hold: a pull's, or a sum's (N9).
+    NotHeld,
+    /// No memory for what the request needs: asked again.
+    NoMemory,
     /// As many fences as a cs keeps.
     TooManyFences,
 }
@@ -94,6 +103,11 @@ pub struct Holding {
     pub volume: u32,
     pub generation: u64,
     pub device: u32,
+    /// Its slot on the device.
+    pub slot: u32,
+    /// The epoch the cs knows it at, and the one it was last written at.
+    pub known: Epoch,
+    pub written: Epoch,
 }
 
 /// A device of the cs's, as `devices` gives it.
@@ -148,12 +162,45 @@ pub struct Store<D: Device> {
     /// again since: what this cs held of them in its device's write cache
     /// may be gone (`found_open`).
     found: BTreeMap<u32, (u32, u64)>,
+    /// The chunks found open when their device was taken in, each at its
+    /// incarnation, until a copy has pulled one whole and closed it (N9):
+    /// what it held may be short of writes, however it is written since --
+    /// a copy given up part way among them.
+    suspect: BTreeMap<u32, u32>,
+    /// The sets this cs joins (N9), each with its join's `since`: their
+    /// clients' writes marked, and a copy into them written only where no
+    /// write is.
+    joining: BTreeMap<u32, u32>,
+    marks: BTreeMap<u32, Marks>,
 }
+
+/// The sectors of a chunk that clients have written since the join of its
+/// set began (N9): a bit a sector, in memory alone -- a joiner started
+/// again gives its joins up, so nothing of a copy outlives its run.
+struct Marks {
+    set: u32,
+    incarnation: u32,
+    bits: Vec<u64>,
+}
+
+/// A chunk's marks: a bit for each sector of the smallest kind.
+const MARK_WORDS: usize = (SLOT / SECTOR) as usize / 64;
 
 impl<D: Device> Default for Store<D> {
     fn default() -> Self {
         Store::new()
     }
+}
+
+/// Whether epoch `e` is one before `known`, a chunk's as the cs knows it:
+/// refused, vouched for or not. The mds vouches for the epoch that is the
+/// set's now, but the cs keeps what it vouched for, and a write in flight
+/// comes after the epoch has moved on -- a pull's for a joiner, a replica
+/// taken out (found by fuzz/nbs's join target: such a write taken moved the
+/// chunk's epoch back, and a writer of the map before the join wrote past
+/// the joiner).
+fn older(e: Epoch, known: Epoch) -> bool {
+    e.set != known.set || e.version < known.version
 }
 
 /// A slot's place in its table's pages.
@@ -170,6 +217,9 @@ impl<D: Device> Store<D> {
             fence_of: BTreeMap::new(),
             fence_free: (0..FENCES_MAX as u32).rev().collect(),
             found: BTreeMap::new(),
+            suspect: BTreeMap::new(),
+            joining: BTreeMap::new(),
+            marks: BTreeMap::new(),
         }
     }
 
@@ -352,6 +402,7 @@ impl<D: Device> Store<D> {
             .map(|(c, r)| (c, r.incarnation, r.generation)).collect();
         for (c, incarnation, generation) in open {
             self.found.insert(c, (incarnation, generation));
+            self.suspect.insert(c, incarnation);
         }
         /* Its fences joined with the cs's: the newer generation of each
            volume, in the cs's place for it. The devices taken in before all
@@ -584,7 +635,7 @@ impl<D: Device> Store<D> {
                 if r.volume != volume {
                     return Err(Error::NotTheVolumes);
                 }
-                if r.known != c.epoch && !verified {
+                if r.known != c.epoch && (!verified || older(c.epoch, r.known)) {
                     return Err(Error::Epoch { known: r.known });
                 }
                 /* The first write of this generation or epoch: the open mark
@@ -602,33 +653,12 @@ impl<D: Device> Store<D> {
                 if !verified {
                     return Err(Error::Unverified);
                 }
-                /* The slot of the chunk its number was -- the mds says this
-                   is the number's chunk now -- given back first */
-                if let Some((odv, oslot)) = self.at.get(&c.chunk).copied() {
-                    self.release(odv, oslot)?;
-                    self.at.remove(&c.chunk);
-                }
-                let dv = self.pick().ok_or(Error::NoRoom)?;
-                self.span(Some(dv), offset, data.len())?;
-                let slot = self.devs[dv].free.pop().ok_or(Error::NoRoom)?;
-                /* Zeros, flushed before the record that takes the slot is
-                   written: a device keeps or loses what it holds unflushed
-                   in any order, and a record kept with its zeros lost would
-                   read what the slot held through this chunk -- another
-                   volume's data. (Found by fuzz/nbs's cs target.) */
-                let base = self.devs[dv].layout.data + u64::from(slot) * SLOT;
-                if self.devs[dv].d.zero(base, SLOT).and_then(|_| self.devs[dv].d.flush()).is_err() {
-                    self.devs[dv].failed = true;
-                    return Err(Error::Io);
-                }
-                let old = self.record(dv, slot);
-                let open = Record { state: SlotState::Open, chunk: c.chunk, incarnation: c.incarnation, known: c.epoch,
-                                    written: c.epoch, volume, generation, seq: old.seq + 1 };
-                self.put(dv, slot, open)?;
-                self.at.insert(c.chunk, (dv, slot));
-                (dv, slot)
+                self.take_slot(volume, generation, &c, offset, data.len())?
             }
         };
+        /* Marked before it is written, where its set is joined: a copy must
+           not write over it, and a mark that cannot be kept refuses it */
+        self.mark(&c, offset, data.len())?;
         let dev = &mut self.devs[dv];
         let at = dev.layout.data + u64::from(slot) * SLOT + u64::from(offset);
         if dev.d.write(at, data).is_err() {
@@ -637,6 +667,38 @@ impl<D: Device> Store<D> {
         }
         dev.dirty = true;
         Ok(())
+    }
+
+    /// A slot taken for chunk `c`, which the cs does not hold, open for
+    /// `volume`'s `generation` at `c`'s epoch -- a client's first write's,
+    /// or a copy's (N9).
+    fn take_slot(&mut self, volume: u32, generation: u64, c: &ChunkRef, offset: u32, len: usize)
+        -> Result<(usize, u32), Error> {
+        /* The slot of the chunk its number was -- the mds says this is the
+           number's chunk now -- given back first */
+        if let Some((odv, oslot)) = self.at.get(&c.chunk).copied() {
+            self.release(odv, oslot)?;
+            self.at.remove(&c.chunk);
+        }
+        let dv = self.pick().ok_or(Error::NoRoom)?;
+        self.span(Some(dv), offset, len)?;
+        let slot = self.devs[dv].free.pop().ok_or(Error::NoRoom)?;
+        /* Zeros, flushed before the record that takes the slot is written: a
+           device keeps or loses what it holds unflushed in any order, and a
+           record kept with its zeros lost would read what the slot held
+           through this chunk -- another volume's data. (Found by fuzz/nbs's
+           cs target.) */
+        let base = self.devs[dv].layout.data + u64::from(slot) * SLOT;
+        if self.devs[dv].d.zero(base, SLOT).and_then(|_| self.devs[dv].d.flush()).is_err() {
+            self.devs[dv].failed = true;
+            return Err(Error::Io);
+        }
+        let old = self.record(dv, slot);
+        let open = Record { state: SlotState::Open, chunk: c.chunk, incarnation: c.incarnation, known: c.epoch,
+                            written: c.epoch, volume, generation, seq: old.seq + 1 };
+        self.put(dv, slot, open)?;
+        self.at.insert(c.chunk, (dv, slot));
+        Ok((dv, slot))
     }
 
     /// Chunk `c`'s data at `offset`, into `buf`: zeros where nothing was
@@ -657,9 +719,14 @@ impl<D: Device> Store<D> {
         if r.volume != volume {
             return Err(Error::NotTheVolumes);
         }
-        if r.known != c.epoch && !verified {
+        if r.known != c.epoch && (!verified || older(c.epoch, r.known)) {
             return Err(Error::Epoch { known: r.known });
         }
+        self.read_at(dv, slot, offset, buf)
+    }
+
+    /// Slot `slot` of device `dv` read at `offset` into `buf`.
+    fn read_at(&mut self, dv: usize, slot: u32, offset: u32, buf: &mut [u8]) -> Result<(), Error> {
         let dev = &mut self.devs[dv];
         let at = dev.layout.data + u64::from(slot) * SLOT + u64::from(offset);
         if dev.d.read(at, buf).is_err() {
@@ -722,7 +789,241 @@ impl<D: Device> Store<D> {
         }
         self.release(dv, slot)?;
         self.at.remove(&chunk);
+        self.suspect.remove(&chunk);
         Ok(true)
+    }
+
+    /* ---- joins (N9) ---- */
+
+    /// Clients' writes to set `set`'s chunks marked from now on, as this cs
+    /// joins it -- the join begun at `since`: a copy into the set writes only
+    /// where no client has. The marks of a join before it dropped: written
+    /// while this cs was the joiner of none, the source may have newer
+    /// data than they kept.
+    pub fn join(&mut self, set: u32, since: u32) {
+        if self.joining.get(&set) != Some(&since) {
+            self.leave(set);
+            self.joining.insert(set, since);
+        }
+    }
+
+    /// The join of set `set` over -- done, or given up: its marks dropped.
+    pub fn leave(&mut self, set: u32) {
+        self.joining.remove(&set);
+        self.marks.retain(|_, m| m.set != set);
+    }
+
+    /// The join of set `set` this cs marks for: its `since`.
+    pub fn joins(&self, set: u32) -> Option<u32> {
+        self.joining.get(&set).copied()
+    }
+
+    /// The sets this cs marks for, each with its join's `since`.
+    pub fn joined(&self) -> Vec<(u32, u32)> {
+        self.joining.iter().map(|(&s, &since)| (s, since)).collect()
+    }
+
+    /// Whether a client has written a sector of chunk `c` from `offset` for
+    /// `len` bytes since the join of its set began: what a copy leaves as
+    /// it is, and its check leaves out.
+    pub fn marked(&self, c: &ChunkRef, offset: u32, len: u32) -> bool {
+        let Some(m) = self.marks.get(&c.chunk).filter(|m| m.incarnation == c.incarnation) else { return false };
+        let first = offset as usize / SECTOR as usize;
+        (first..first + len as usize / SECTOR as usize)
+            .any(|s| m.bits.get(s / 64).is_some_and(|w| w & (1 << (s % 64)) != 0))
+    }
+
+    /// A client's write of `len` bytes at `offset` in chunk `c` marked,
+    /// where its set is joined.
+    fn mark(&mut self, c: &ChunkRef, offset: u32, len: usize) -> Result<(), Error> {
+        if !self.joining.contains_key(&c.epoch.set) {
+            return Ok(());
+        }
+        if !self.marks.get(&c.chunk).is_some_and(|m| m.incarnation == c.incarnation) {
+            let mut bits = Vec::new();
+            bits.try_reserve_exact(MARK_WORDS).map_err(|_| Error::NoMemory)?;
+            bits.resize(MARK_WORDS, 0);
+            self.marks.insert(c.chunk, Marks { set: c.epoch.set, incarnation: c.incarnation, bits });
+        }
+        let Some(m) = self.marks.get_mut(&c.chunk) else { return Err(Error::NoMemory) };
+        let first = offset as usize / SECTOR as usize;
+        for s in first..first + len / SECTOR as usize {
+            if let Some(w) = m.bits.get_mut(s / 64) {
+                *w |= 1 << (s % 64);
+            }
+        }
+        Ok(())
+    }
+
+    /// Chunk `c`'s known epoch moved on to `c`'s -- durable -- before a pull
+    /// or a sum reads it: a write of the epoch before is refused here from
+    /// then on, and its writer, its map read again, writes the joiner too.
+    /// An epoch older than the one the cs knows is refused, as a request's
+    /// is.
+    fn advance(&mut self, c: &ChunkRef) -> Result<(usize, u32), Error> {
+        let Some((dv, slot, r)) = self.find(c)? else { return Err(Error::NotHeld) };
+        if r.known.set != c.epoch.set || r.known.version > c.epoch.version {
+            return Err(Error::Epoch { known: r.known });
+        }
+        if r.known != c.epoch {
+            self.put(dv, slot, Record { known: c.epoch, seq: r.seq + 1, ..r })?;
+        }
+        Ok((dv, slot))
+    }
+
+    /// Chunk `c`'s epoch moved on for a member back that holds it as it was
+    /// (`advance`), and the version it was last written at -- with the move,
+    /// so that no write the member missed comes between: one at the version
+    /// it went down at or after, and the member pulls it after all.
+    pub fn touch(&mut self, c: ChunkRef) -> Result<u32, Error> {
+        let (dv, slot) = self.advance(&c)?;
+        Ok(self.record(dv, slot).written.version)
+    }
+
+    /// Chunk `c`'s data at `offset`, into `buf`, for its set's joiner: its
+    /// epoch moved on first (`advance`). The caller has had the joiner
+    /// vouched for by its host's mds.
+    pub fn pull(&mut self, c: ChunkRef, offset: u32, buf: &mut [u8]) -> Result<(), Error> {
+        let (dv, slot) = self.advance(&c)?;
+        self.span(Some(dv), offset, buf.len())?;
+        self.read_at(dv, slot, offset, buf)
+    }
+
+    /// The CRC-32C of each `GRANULE` of chunk `c` from `offset` for `len`
+    /// bytes -- the last shorter where `len` ends inside one -- for its set's
+    /// joiner, its epoch moved on first as a pull's is.
+    pub fn sums(&mut self, c: ChunkRef, offset: u32, len: u32) -> Result<Vec<u32>, Error> {
+        let (dv, slot) = self.advance(&c)?;
+        self.sums_at(dv, slot, offset, len)
+    }
+
+    /// The same of this cs's own copy of chunk `c`: what a joiner holds its
+    /// copy to its source's by.
+    pub fn own_sums(&mut self, c: ChunkRef, offset: u32, len: u32) -> Result<Vec<u32>, Error> {
+        let Some((dv, slot, _)) = self.find(&c)? else { return Err(Error::NotHeld) };
+        self.sums_at(dv, slot, offset, len)
+    }
+
+    /// This cs's own copy of chunk `c` at `offset`, into `buf`: what a
+    /// joiner holds a granule that differs to its source's by, a sector at a
+    /// time.
+    pub fn own_read(&mut self, c: ChunkRef, offset: u32, buf: &mut [u8]) -> Result<(), Error> {
+        let Some((dv, slot, _)) = self.find(&c)? else { return Err(Error::NotHeld) };
+        self.span(Some(dv), offset, buf.len())?;
+        self.read_at(dv, slot, offset, buf)
+    }
+
+    fn sums_at(&mut self, dv: usize, slot: u32, offset: u32, len: u32) -> Result<Vec<u32>, Error> {
+        self.span(Some(dv), offset, len as usize)?;
+        let mut sums = Vec::new();
+        sums.try_reserve_exact(len.div_ceil(GRANULE) as usize).map_err(|_| Error::NoMemory)?;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(GRANULE.min(len) as usize).map_err(|_| Error::NoMemory)?;
+        let end = offset + len;
+        let mut at = offset;
+        while at < end {
+            let n = GRANULE.min(end - at);
+            buf.resize(n as usize, 0);
+            self.read_at(dv, slot, at, &mut buf)?;
+            sums.push(crc::crc32c::checksum(&buf));
+            at += n;
+        }
+        Ok(sums)
+    }
+
+    /// `data` copied into chunk `c` at `offset` for the join of its set,
+    /// held as `volume`'s: written where no client's write has marked a
+    /// sector -- the client's is newer, and the source has it or will. A
+    /// chunk the cs does not hold taken in as a first write takes it, open
+    /// at no writer's generation; one it holds opened at the copy's epoch.
+    /// Refused where the set is not joined: with no marks kept, a copy could
+    /// write over a client's write.
+    pub fn copy_in(&mut self, volume: u32, c: ChunkRef, offset: u32, data: &[u8]) -> Result<(), Error> {
+        if !self.joining.contains_key(&c.epoch.set) || volume == 0 {
+            return Err(Error::Bad);
+        }
+        let (dv, slot) = match self.find(&c)? {
+            Some((dv, slot, r)) => {
+                self.span(Some(dv), offset, data.len())?;
+                if r.volume != volume {
+                    return Err(Error::NotTheVolumes);
+                }
+                if r.known.set != c.epoch.set || r.known.version > c.epoch.version {
+                    return Err(Error::Epoch { known: r.known });
+                }
+                if r.state != SlotState::Open || r.known != c.epoch {
+                    /* A client's open mark kept at its generation; a closed
+                       chunk opened at none, for `close_copy` to close */
+                    let generation = if r.state == SlotState::Open { r.generation } else { 0 };
+                    self.put(dv, slot, Record { state: SlotState::Open, known: c.epoch, written: c.epoch, generation,
+                                                seq: r.seq + 1, ..r })?;
+                }
+                (dv, slot)
+            }
+            None => self.take_slot(volume, 0, &c, offset, data.len())?,
+        };
+        /* The runs of sectors no client has written */
+        let sector = SECTOR as usize;
+        let first = offset as usize / sector;
+        let n = data.len() / sector;
+        let marks = self.marks.get(&c.chunk).filter(|m| m.incarnation == c.incarnation);
+        let marked = |s: usize| marks.is_some_and(|m| m.bits.get(s / 64).is_some_and(|w| w & (1 << (s % 64)) != 0));
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut k = 0;
+        while k < n {
+            if marked(first + k) {
+                k += 1;
+                continue;
+            }
+            let start = k;
+            while k < n && !marked(first + k) {
+                k += 1;
+            }
+            runs.try_reserve(1).map_err(|_| Error::NoMemory)?;
+            runs.push((start, k));
+        }
+        let dev = &mut self.devs[dv];
+        for (from, to) in runs {
+            let at = dev.layout.data + u64::from(slot) * SLOT + u64::from(offset) + (from * sector) as u64;
+            if dev.d.write(at, &data[from * sector..to * sector]).is_err() {
+                dev.failed = true;
+                return Err(Error::Io);
+            }
+            dev.dirty = true;
+        }
+        Ok(())
+    }
+
+    /// Chunk `c`'s copy done: its data flushed, then its record closed where
+    /// no client has written it since the copy opened it -- one a client
+    /// has, at its generation, is that client's to close.
+    pub fn close_copy(&mut self, c: ChunkRef) -> Result<(), Error> {
+        let Some((dv, slot, r)) = self.find(&c)? else { return Ok(()) };
+        /* Pulled whole and held to its source's: no longer suspect */
+        self.suspect.remove(&c.chunk);
+        if r.state != SlotState::Open || r.generation != 0 {
+            return Ok(());
+        }
+        let dev = &mut self.devs[dv];
+        if dev.dirty {
+            if dev.d.flush().is_err() {
+                dev.failed = true;
+                return Err(Error::Io);
+            }
+            dev.dirty = false;
+        }
+        self.put(dv, slot, Record { state: SlotState::Written, seq: r.seq + 1, ..r })
+    }
+
+    /// The chunks of set `set` the cs holds, from chunk number `from` on,
+    /// `max` at most: each's number, incarnation, volume and the version it
+    /// was last written at -- what its joiner copies.
+    pub fn holdings_in(&self, set: u32, from: u32, max: usize) -> Vec<(u32, u32, u32, u32)> {
+        self.at.range(from..).filter_map(|(&chunk, &(dv, slot))| {
+            let r = self.record(dv, slot);
+            (r.known.set == set && r.state != SlotState::Lost && !self.devs[dv].failed)
+                .then_some((chunk, r.incarnation, r.volume, r.written.version))
+        }).take(max).collect()
     }
 
     /// Every chunk the cs holds.
@@ -730,7 +1031,8 @@ impl<D: Device> Store<D> {
         self.at.iter().map(|(&chunk, &(dv, slot))| {
             let r = self.record(dv, slot);
             Holding { chunk, incarnation: r.incarnation, state: r.state, volume: r.volume,
-                      generation: r.generation, device: self.devs[dv].sup.identity.device }
+                      generation: r.generation, device: self.devs[dv].sup.identity.device, slot, known: r.known,
+                      written: r.written }
         }).collect()
     }
 
@@ -757,12 +1059,25 @@ impl<D: Device> Store<D> {
         })
     }
 
+    /// The chunks of set `set` found open when their device was taken in,
+    /// and not since pulled whole and closed by a copy: what a member back
+    /// copies whatever it holds of them (N9).
+    pub fn found_in(&self, set: u32) -> Vec<u32> {
+        self.suspect.iter().filter(|(&chunk, &incarnation)| {
+            self.at.get(&chunk).is_some_and(|&(dv, slot)| {
+                let r = self.record(dv, slot);
+                r.incarnation == incarnation && r.known.set == set
+            })
+        }).map(|(&chunk, _)| chunk).collect()
+    }
+
     /// The chunk's record, where the cs holds it at this incarnation.
     pub fn holding(&self, chunk: u32) -> Option<Holding> {
         let (dv, slot) = self.at.get(&chunk).copied()?;
         let r = self.record(dv, slot);
         Some(Holding { chunk, incarnation: r.incarnation, state: r.state, volume: r.volume,
-                       generation: r.generation, device: self.devs[dv].sup.identity.device })
+                       generation: r.generation, device: self.devs[dv].sup.identity.device, slot, known: r.known,
+                       written: r.written })
     }
 }
 

@@ -811,6 +811,82 @@ each new gate.
       in, and now and then of the set's joiner. Three mutants wait for N9d's
       `cluster` target with joins: the mds vouching a joiner for writes
       only, the client writing the joiner, the map naming its host.
+  - **N9b, done** (2026-11-08): the copy, as nbs-cs.ko runs it --
+    nbswire's `copy`, sans-I/O, beside its `serve`, so that the fuzzer's
+    cs's run the same one:
+    - **Its asks of a source**, an active member: `Op::Holdings` (the set's
+      chunks it holds, a page of 4096 at a time), `Op::Pull`, `Op::Sums`,
+      `Op::Touch`. Each names the joiner and the set's version, which the
+      source's mds vouches for (`Question::VerifyJoin`) -- asked once, then
+      kept. A pull, a sum and a touch move the chunk's known epoch on at the
+      source, durable before it reads (`Store::advance`). From then on, a
+      write of the epoch before is refused there. Its writer must have
+      every active member's acknowledgement, so it reads its map again and
+      writes the joiner too.
+    - **The marks**: a write vouched for as the joiner's
+      (`Told::VerifiedJoining { since }`) has the store mark the set's
+      writes from then on, a bit a 512-byte sector, in memory alone. A copy
+      writes only where no sector is marked (`Store::copy_in`), and one into
+      a set not joined is refused. The marks belong to one join: a join of
+      another `since` drops them, as the source may have newer data than
+      they kept. A joiner never resumes a join: one found as nbs-cs starts
+      is given up (`Question::GiveUp`).
+    - **A member back** pulls a chunk the source last wrote at or after the
+      version it went down at, one it does not hold, and one it found open
+      (taken as the copy begins, before a write clears it). It touches the
+      rest: the touch moves the epoch on and tells, with the move, the
+      version the chunk was last written at, so a write the member missed
+      since the listing has it pulled after all (found designing the
+      `join` target: decided at the listing, it would have been lost).
+    - **The check**: a chunk pulled is summed against the source's. A
+      granule that differs is pulled again and held to the source's a
+      sector at a time, the marked sectors left out. A sector that differs
+      is copied in and read back, and one that does not read back as
+      copied is a round; past three, the join is given up and said. (Found
+      by the `join` target: left out whole for a client's write in it, a
+      granule's rot went unchecked.) The chunk is then closed at no
+      writer's generation (`Store::close_copy`), its data flushed first.
+    - **A found-open chunk**, refused to its own writer as failed since N8,
+      is written by its set's joiner. The cs asks its mds first where the
+      store does not know of the join yet. (Found by the `join` target: the
+      writer asked the member back out at its first write, and its join was
+      dropped each time it was made.)
+    - **The end**: every chunk done, the joiner asks its mds for the join's
+      end (`Question::JoinDone`), which nbs-mds proposes as `Joined`; a copy
+      that fails asks for `Unjoin` likewise.
+    - **What the `join` target found** besides, each with its mutant now:
+      a write in flight of an epoch the cs's cache had vouched for was taken
+      after a pull had moved the chunk on, and moved its epoch back (true of
+      N8's taking out too) -- an epoch older than the one a chunk is known
+      at is refused, vouched for or not; and a copy given up part way had
+      written the record of a chunk found open, which was found open no
+      more, and the next join's copy touched it -- such a chunk is suspect
+      until a copy has pulled it whole and closed it; and a record of the
+      copy's, at generation 0 -- no writer's -- read back as bad, so that
+      every chunk a copy had taken in was lost at the cs's next start. The
+      target's checks after a cut had compared the chunks still held: none
+      were, and they passed. They now hold the joiner to no record lost.
+    - **Focused runs**: five of the copy's mutants survived a hundred random
+      runs, caught once in thousands -- each a race of several steps. A
+      tenth of the runs each now sets one of them up: the power failing
+      inside a close, an old writer at the epoch a closed chunk was left at,
+      one between a member back's listing and its touch, a write on the
+      joiner held from the source past the copy, a found-open chunk part
+      copied when the join is given up.
+    - **The gate's seeds**: an epoch older than a chunk's refused made two of
+      N8's races rarer in the `cluster` target -- a flush refused to a writer
+      with a chunk found open, a flush done only after those before it --
+      caught once in some 150 runs; and the sector-by-sector check's in the
+      `join` target once in some 120. The gate now runs the `cluster` target
+      over 1000 seeds and the `join` target over 800, about half a minute.
+    - **Tests**: fuzz/nbs's `join` target, a join between two engines over
+      a network that drops, repeats and reorders, with writers of the map
+      now -- up to three in flight -- and of maps before, the set moving on,
+      rejoins, rot, members back with chunks found open, and the joiner's
+      power failing mid-copy; at its end every chunk of the set on the
+      joiner is the source's, and every one the copy closed still is after
+      a power cut. Fifteen mutants of its rules; the wire target's new
+      messages.
 - **N10.** Snapshots, images and clones.
 - **N11, numbers.** On the hardware, and what they ask for: pages that move
   instead of copies (a message's pages lent to a `DiskQueue`), chain
