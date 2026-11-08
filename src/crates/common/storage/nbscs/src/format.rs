@@ -329,9 +329,13 @@ impl Record {
             generation: le64(b, 32),
             seq: le64(b, 40),
         };
-        /* A chunk's record names one; a free one, none */
+        /* A chunk's record names one, and its volume; a free one, none. Its
+           generation is 0 where a join's copy took the chunk in and no
+           writer has written it since (N9): found as bad, every chunk of a
+           copy's was lost at the cs's next start (found by fuzz/nbs's join
+           target) */
         let holds = state != SlotState::Free;
-        if holds == (r.incarnation == 0) || (holds && (r.volume == 0 || r.generation == 0)) {
+        if holds == (r.incarnation == 0) || (holds && r.volume == 0) {
             return Decoded::Bad;
         }
         Decoded::Valid(r)

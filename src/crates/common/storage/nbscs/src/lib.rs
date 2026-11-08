@@ -35,3 +35,6 @@ pub const SLOT: u64 = (nbsmeta::CHUNK_MIB as u64) << 20;
 pub const PAGE: u64 = 4096;
 /// The smallest sector a device has.
 pub const SECTOR: u64 = 512;
+/// What a sum covers (N9): a joiner holds its copy to its source's by one
+/// CRC-32C of each.
+pub const GRANULE: u32 = 64 << 10;

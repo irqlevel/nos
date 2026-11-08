@@ -237,6 +237,45 @@ N9c's.
 - **Seen**: `nbsmeta::repair::health` counts the chunks by how many of
   their set's members are active, and those being copied onto a joiner.
 
+### The copy
+
+A joiner's cs copies the set (N9b): nbswire's `copy`, driven by nbs-cs's
+task, whose mds tells it its joins (`Question::Joins`) with its devices.
+
+- **From a source**, an active member: the set's chunks it holds a page at
+  a time (`Op::Holdings`), each pulled (`Op::Pull`), summed (`Op::Sums`) or
+  touched (`Op::Touch`). Each names the joiner and the set's version, which
+  the source's mds vouches for (`Question::VerifyJoin`). A pull, a sum and a
+  touch move the chunk's epoch on at the source, durable before it reads: a
+  write of the epoch before is refused there from then on, and its writer,
+  its map read again, writes the joiner too. An epoch older than the one a
+  chunk is known at is refused even where the cs's cache once vouched for
+  it.
+- **The marks**: what clients write to the set from the join on is marked,
+  a bit a sector, in memory alone, from the first write the mds vouches for
+  as the joiner's (`Told::VerifiedJoining`). The copy writes only where no
+  sector is marked: the client's data is newer, and the source has it or
+  will.
+- **A member back** pulls what it may have missed -- a chunk last written at
+  the version it went down at or after, one it does not hold, one it found
+  open as its devices were taken in and has not had pulled whole since --
+  and touches the rest. A touch tells the version the chunk was last
+  written at with the move, and a chunk written since the listing is pulled
+  after all.
+- **The check**: a chunk pulled is summed against the source's. A granule
+  that differs is pulled again and held to the source's a sector at a time,
+  the marked sectors left out; a sector that does not read back as copied is
+  a round, and past three the join is given up and said. The chunk is then
+  closed, its data flushed first.
+- **Its end** is asked of the mds (`Question::JoinDone`, proposed as
+  `Joined`); a copy that fails gives the join up (`Question::GiveUp`, as
+  `Unjoin`). A join found as nbs-cs starts is given up: its marks are gone,
+  and a copy without them could write over a client's write. The
+  controller joins it again under a new version.
+- **A chunk found open** is written by its set's joiner, as a joiner is
+  written and not read, and its copy pulls the chunk; refused to its writer
+  as `Failed` only where its cs is an active member.
+
 ## The digest
 
 A member that applies an entry differently from the others is a fork that
@@ -635,9 +674,24 @@ image's zeros out.
   writer serves and at the end, and no active replica doing an older
   generation's write or flush once a newer writer serves.
 
-  `--mutants` takes seventy-five rules out one at a time -- forty-four of
-  the metadata's, five of them the controller's; fifteen of the cs's; six of
-  the wire's and its `serve`'s; ten of the client's -- each caught.
+  Its `join` target is one join's copy (N9b) between two engines, the
+  source served by nbswire's `serve` as a cs serves it, and the hosts' mds
+  played from the set's state the target keeps. The network delays,
+  reorders, drops and repeats; up to three writes of the map now are in
+  flight at once, each delivery anywhere among the copy's; writers of maps
+  before the join write the source alone; the set moves on, and the join is
+  given up and made again; a sector being checked rots; and the joiner's
+  power fails mid-copy, now and then a few writes before a chunk is closed.
+  In a third of the runs a member back joins its own place, with chunks
+  found open after a cut; in a tenth each, one race random runs seldom put
+  together is set up on purpose (testing.md). At its end every chunk of the
+  set on the joiner is the source's, byte for byte, and every one the copy
+  closed is still so after a power cut.
+
+  `--mutants` takes ninety rules out one at a time -- forty-four of the
+  metadata's, five of them the controller's; twenty-four of the cs's, nine
+  of them the copy's; twelve of the wire's, its `serve`'s and the copy's;
+  ten of the client's -- each caught.
 - **`fuzz/raft`'s `nbsmeta` target**: the members' part of the state, its
   commands from pools of names and incarnations that meet and from wide ones
   that fill the cluster. There are four scenarios and six mutants.

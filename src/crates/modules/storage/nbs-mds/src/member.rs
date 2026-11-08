@@ -40,7 +40,7 @@ use kcore::ipc::{Addr, Message, TAG_BOUNCED, TAG_BULK};
 use kcore::klog;
 use kcore::time::boot_time_ns;
 use nbsmeta::{Answer, Command, Refusal, Replica, State};
-use nbswire::{Answered, Ask, Asking, Op, Query, Request, Said, Saying};
+use nbswire::{Answered, Ask, Asking, Op, Query, Question, Request, Said, Saying, Told};
 use raft::{Role, Rsm};
 use raftmember::{App, Core, Locked, Outcome, Pending};
 
@@ -163,6 +163,8 @@ pub enum Waiter {
     Digest,
     /// A client of this host's, told the outcome as its ask's kind is.
     Client { to: Addr, id: u64, kind: Kind },
+    /// This host's cs, told its join's end or its giving up as applied (N9).
+    Cs { to: Addr, id: u64 },
 }
 
 #[derive(Clone, Copy)]
@@ -277,7 +279,21 @@ impl App for Mds {
     }
 
     fn finish(&mut self, core: &mut Core<Mds>, w: Waiter, outcome: Outcome<Mds>, index: u64) {
-        let Waiter::Client { to, id, kind } = w else { return };
+        let (to, id, kind) = match w {
+            Waiter::Client { to, id, kind } => (to, id, kind),
+            Waiter::Cs { to, id } => {
+                let told = match outcome {
+                    Ok(Answer::Set { .. }) => Told::Verified,
+                    /* Not the join it was: ended or given up meanwhile */
+                    Ok(_) => Told::Refused(nbswire::Refusal::NotTheJoiner),
+                    /* No leader, or not ready: asked again */
+                    Err(_) => Told::Refused(nbswire::Refusal::NoMds),
+                };
+                let _ = core.mailbox().send(to, nbswire::TAG_TOLD, 0, &Answered { id, told }.encode());
+                return;
+            }
+            Waiter::Digest => return,
+        };
         let said = match (outcome, kind) {
             (Ok(Answer::Attached { generation }), Kind::Attach) => Said::Attached { generation, index },
             (Ok(Answer::Attached { .. }), Kind::Detach) => Said::Detached { index },
@@ -409,6 +425,21 @@ impl Mds {
             return;
         }
         let Some(q) = Query::decode(&m.data) else { return };
+        /* A join's end, or its giving up: proposed for this host's cs, and
+           told once applied (N9) */
+        if let Question::JoinDone { set, since } | Question::GiveUp { set, since } = q.question {
+            let Some(cs) = core.state().cs_of(&self.me.host).map(|c| c.id) else {
+                let told = Told::Refused(nbswire::Refusal::NotHere);
+                let _ = core.mailbox().send(m.from, nbswire::TAG_TOLD, 0, &Answered { id: q.id, told }.encode());
+                return;
+            };
+            let cmd = match q.question {
+                Question::JoinDone { .. } => Command::Joined { set, cs, since },
+                _ => Command::Unjoin { set, cs, since },
+            };
+            core.ask(self, cmd, Pending::App(Waiter::Cs { to: m.from, id: q.id }));
+            return;
+        }
         let told = nbswire::mds::told(core.state(), &self.me.host, core.rsm().applied(), &q.question);
         let _ = core.mailbox().send(m.from, nbswire::TAG_TOLD, 0, &Answered { id: q.id, told }.encode());
     }

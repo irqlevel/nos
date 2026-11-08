@@ -207,6 +207,25 @@ impl Disk {
         true
     }
 
+    /// The power to fail at the `n`th write or flush from now (the `join`
+    /// target's); and whether it has.
+    pub(crate) fn arm(&mut self, n: u64) {
+        self.fuse = Some(n.max(1));
+    }
+
+    pub(crate) fn dead(&self) -> bool {
+        self.dead
+    }
+
+    /// One bit of sector `n` flipped as it is now, its cache flushed first:
+    /// a device that rots what it was given (the `join` target's).
+    pub(crate) fn flip(&mut self, n: u64, bit: u64) {
+        self.flush();
+        let s = self.sector as usize;
+        let v = self.durable.entry(n).or_insert_with(|| vec![0; s]);
+        v[(bit / 8) as usize % s] ^= 1 << (bit % 8);
+    }
+
     fn flush(&mut self) {
         let pending = std::mem::take(&mut self.pending);
         for op in &pending {
