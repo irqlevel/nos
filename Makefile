@@ -65,6 +65,13 @@ RUST_TARGET_aarch64 = aarch64-unknown-none-softfloat
 LDSCRIPT_aarch64 = build/linker-arm64.ld
 KERNEL_aarch64 = kernel-arm64.elf
 OBJCOPY = llvm-objcopy
+# Rust's v0 names nm leaves mangled: those of the functions LLVM gave a suffix
+# of its own (`.llvm.<n>`: made visible across a crate's codegen units), which
+# GNU nm's demangler does not take -- llvm-nm's takes them, and writes the
+# suffix after the name as " (.llvm.<n>)". The symbol tables cut the suffix
+# either way and demangle what is left with this, so that a backtrace, a
+# profile and memsites name them as the rest, on either architecture alike.
+CXXFILT = llvm-cxxfilt
 
 TARGET = $(TARGET_$(ARCH))
 LD = $(LD_$(ARCH))
@@ -176,6 +183,7 @@ CXX_SRC_x86_64 =   \
     src/base/kernel/stack_trace.cpp \
     src/base/kernel/stack_probe.cpp \
     src/base/kernel/symtab.cpp \
+    src/base/kernel/memsites.cpp \
     src/base/kernel/pass1_tables.cpp \
     src/base/kernel/rust_ffi.cpp \
     src/base/kernel/module.cpp \
@@ -189,6 +197,7 @@ CXX_SRC_x86_64 =   \
     src/base/mm/new.cpp  \
     src/base/mm/allocator.cpp   \
     src/base/mm/heap_usage.cpp   \
+    src/base/mm/alloc_sites.cpp \
     src/base/mm/page_allocator.cpp  \
     src/base/mm/va_allocator.cpp \
     src/base/mm/pool.cpp    \
@@ -229,6 +238,7 @@ CXX_SRC_aarch64 = \
     src/base/kernel/stack_trace.cpp \
     src/base/kernel/stack_probe.cpp \
     src/base/kernel/symtab.cpp \
+    src/base/kernel/memsites.cpp \
     src/base/kernel/pass1_tables.cpp \
     src/base/kernel/atomic.cpp \
     src/base/kernel/spin_lock.cpp \
@@ -266,6 +276,7 @@ CXX_SRC_aarch64 = \
     src/base/mm/new.cpp \
     src/base/mm/allocator.cpp \
     src/base/mm/heap_usage.cpp \
+    src/base/mm/alloc_sites.cpp \
     src/base/mm/page_allocator.cpp \
     src/base/mm/va_allocator.cpp \
     src/base/mm/pool.cpp \
@@ -340,12 +351,16 @@ check: $(CXX_SRC)
 	python3 scripts/check-crates.py
 	python3 scripts/check-links.py
 
+# The kernel the ISO and the system image carry has no debug info: GRUB loads
+# its segments alone, and the machine names its frames by its own symbol
+# table. bin/kernel64.elf keeps the lines of its C++ and its Rust, for GDB and
+# scripts/memsites.py.
 nos.iso: build/grub.cfg $(KERNEL)
 	rm -rf iso
 	rm -rf bin
 	mkdir -p iso/boot/grub
 	mkdir -p bin
-	cp $(KERNEL) iso/boot/kernel64.elf
+	$(OBJCOPY) --strip-debug $(KERNEL) iso/boot/kernel64.elf
 	cp $(KERNEL) bin/kernel64.elf
 	cp build/grub.cfg iso/boot/grub/grub.cfg
 	$(MKRESCUE) -o nos.iso iso
@@ -359,7 +374,7 @@ nos.iso: build/grub.cfg $(KERNEL)
 nos-test.iso: build/grub.cfg $(KERNEL)
 	rm -rf iso-test
 	mkdir -p iso-test/boot/grub
-	cp $(KERNEL) iso-test/boot/kernel64.elf
+	$(OBJCOPY) --strip-debug $(KERNEL) iso-test/boot/kernel64.elf
 	sed 's|^\(\s*multiboot2 /boot/kernel64.elf\)|\1 $(TEST_ISO_ARGS)|' build/grub.cfg > iso-test/boot/grub/grub.cfg
 	grep -q 'multiboot2 /boot/kernel64.elf .*$(TEST_ISO_ARGS)' iso-test/boot/grub/grub.cfg
 	$(MKRESCUE) -o nos-test.iso iso-test
@@ -412,8 +427,12 @@ $(FLAVOR_STAMP): $(FLAVOR_STAMP).check
 rust:
 	cd src/crates && cargo build --offline --release --target $(RUST_TARGET) $(RUST_UB_CFG)
 
+# With the lines of its code -- debug info of no more than that, in sections
+# the image does not load -- so that a frame of the kernel's Rust is a file
+# and a line to the host's tools: scripts/memsites.py, GDB, llvm-symbolizer.
 $(RUST_LIB): $(RUST_SRC) $(FLAVOR_STAMP)
-	cd src/crates && cargo build --offline --release --target $(RUST_TARGET) $(RUST_UB_CFG)
+	cd src/crates && CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
+	    cargo build --offline --release --target $(RUST_TARGET) $(RUST_UB_CFG)
 
 # Loadable kernel modules (docs/modules.md): the crates under src/crates/modules,
 # each built on its own into a position-independent staticlib -- the module,
@@ -435,9 +454,9 @@ MODULE_LDEMU_aarch64 = aarch64elf
 # separate-loadable-segments on 4 KiB pages gives every segment pages of its
 # own, which the loader needs to give each its own permissions. The linked
 # object then gets a .nos_syms section: its functions, "<offset> <name>" a
-# line, in address order and demangled by llvm-nm -C -- Rust's v0 names
-# would need a demangler in the kernel otherwise -- which the loader keeps so
-# a backtrace through a module can name its frames.
+# line, in address order and demangled by llvm-nm -C and $(CXXFILT) -- Rust's
+# v0 names would need a demangler in the kernel otherwise -- which the loader
+# keeps so a backtrace through a module can name its frames.
 MODULE_LDFLAGS = -m $(MODULE_LDEMU_$(ARCH)) -shared -Bsymbolic --gc-sections \
     -z separate-loadable-segments -z max-page-size=4096 -z norelro \
     -z noexecstack -z now --build-id=none --hash-style=sysv \
@@ -461,7 +480,8 @@ $(OUT)/modules/%.ko: $(RUST_SRC) src/crates/base/kmod/module.ver $(FLAVOR_STAMP)
 	    --config 'target.$(RUST_TARGET).rustflags=$(MODULE_RUSTFLAGS_$(ARCH))' \
 	    --config 'unstable.build-std-features=["compiler-builtins-mem"]' $(RUST_UB_CFG)
 	ld.lld $(MODULE_LDFLAGS) -o $@.elf src/crates/target/modules/$(RUST_TARGET)/release/libmod_$(subst -,_,$*).a
-	llvm-nm -n -C --defined-only $@.elf | awk '$$2 ~ /^[tTwW]$$/ { a = $$1; sub(/^[0-9a-fA-F]+ [tTwW] /, ""); print a " " $$0 }' > $@.syms
+	llvm-nm -n -C --defined-only $@.elf | awk '$$2 ~ /^[tTwW]$$/ { a = $$1; sub(/^[0-9a-fA-F]+ [tTwW] /, ""); sub(/ \(\.llvm\.[0-9]+\)$$/, ""); if ($$0 ~ /^_R/) sub(/\.llvm\.[0-9]+$$/, ""); print a " " $$0 }' | \
+	    $(CXXFILT) > $@.syms
 	$(OBJCOPY) --add-section .nos_syms=$@.syms $@.elf $@
 	@rm -f $@.elf $@.syms
 
@@ -586,7 +606,8 @@ endif
 $(IMAGE): $(KERNEL) $(MODULE_KO) $(HVBOOT) build/image/nos.cfg build/image/rc scripts/nos-install
 	rm -rf $(IMAGE_STAGE) $@.tmp
 	mkdir -p $(IMAGE_STAGE)/boot/grub $(IMAGE_STAGE)/lib/modules $(IMAGE_STAGE)/etc
-	install -m 0644 $(KERNEL) $(IMAGE_STAGE)/boot/kernel64.elf
+	$(OBJCOPY) --strip-debug $(KERNEL) $(IMAGE_STAGE)/boot/kernel64.elf
+	chmod 0644 $(IMAGE_STAGE)/boot/kernel64.elf
 	install -m 0644 $(MODULE_KO) $(IMAGE_STAGE)/lib/modules/
 	install -m 0644 $(HVBOOT) $(IMAGE_STAGE)/lib/hvboot
 	install -m 0644 build/image/nos.cfg $(IMAGE_STAGE)/boot/grub/nos.cfg
@@ -630,10 +651,12 @@ $(OUT)/pass2.elf: $(LDSCRIPT) $(OBJS) $(OUT)/modtest_blob.o $(OUT)/module_export
 	$(LD) $(LDFLAGS) -T $< -o $@ @$(OUT)/ffi_keep.rsp $(OBJS) $(OUT)/modtest_blob.o $(OUT)/module_exports.o $(RUST_LIB)
 
 # The symbol table stack traces name frames by (kernel/symtab.cpp): every
-# function of an ELF's text, in address order. $(call symtab,elf,cpp)
+# function of an ELF's text, in address order, its Rust names that nm left
+# mangled demangled by $(CXXFILT). $(call symtab,elf,cpp)
 define symtab
 @printf '#include "kernel/symtab.h"\nnamespace kernel {\nconst SymEntry SymbolTable::SYMBOLS[] = {\n' > $(2)
-@$(NM) -Cn $(1) | awk '/^[0-9a-fA-F]+ [TtWw] / { addr=$$1; name=""; for(i=3;i<=NF;i++){name=name (i>3?" ":"") $$i}; sub(/\(.*/, "", name); gsub(/"/, "\\\"", name); printf "    { 0x%s, \"%s\" },\n", addr, name }' >> $(2)
+@$(NM) -Cn $(1) | awk '/^[0-9a-fA-F]+ [TtWw] / { name=""; for(i=3;i<=NF;i++){name=name (i>3?" ":"") $$i}; if (name ~ /^_R/) sub(/\.llvm\.[0-9]+$$/, "", name); print $$1, name }' | \
+    $(CXXFILT) | awk '{ addr=$$1; name=""; for(i=2;i<=NF;i++){name=name (i>2?" ":"") $$i}; sub(/\(.*/, "", name); sub(/ +$$/, "", name); gsub(/"/, "\\\"", name); printf "    { 0x%s, \"%s\" },\n", addr, name }' >> $(2)
 @printf '};\nconst size_t SymbolTable::SYMBOL_COUNT = sizeof(SYMBOLS)/sizeof(SYMBOLS[0]);\n}\n' >> $(2)
 endef
 

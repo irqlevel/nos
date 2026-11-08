@@ -25,6 +25,11 @@ void free(void* ptr)
 	AllocatorImpl::get_instance(&PageAllocatorImpl::get_instance()).free(ptr);
 }
 
+void walk_heap(HeapVisitor& visitor)
+{
+	AllocatorImpl::get_instance(&PageAllocatorImpl::get_instance()).walk(visitor);
+}
+
 void* alloc_map_pages(size_t num_pages, ulong* phys_addr)
 {
 	return PageAllocatorImpl::get_instance().alloc_map_pages(num_pages, phys_addr);

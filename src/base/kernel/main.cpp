@@ -19,6 +19,7 @@
 #include "dmesg.h"
 #include "watchdog.h"
 #include "parameters.h"
+#include "memsites.h"
 #include "tracepoint.h"
 #include "console.h"
 #include "input.h"
@@ -1114,6 +1115,8 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
     }
 
     mm::AllocatorImpl::get_instance(&mm::PageAllocatorImpl::get_instance());
+    /* memsites=on: with the heap, before the first of Rust's allocations */
+    memsites::setup();
 
     if (Parameters::get_instance().is_wx_probe_heap())
         wx_probe_heap();
