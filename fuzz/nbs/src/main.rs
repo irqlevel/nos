@@ -109,11 +109,24 @@ fn main() -> ExitCode {
     };
     let failed = match args.first().map(String::as_str) {
         Some("gate") | None => {
-            target("meta", meta::run, 1, GATE_META_SEEDS, META_STEPS, None, false)
-                + target("cs", cs::run, 1, GATE_CS_SEEDS, CS_STEPS, None, false)
-                + target("wire", wire::run, 1, GATE_WIRE_SEEDS, WIRE_STEPS, None, false)
-                + target("cluster", cluster::run, 1, GATE_CLUSTER_SEEDS, CLUSTER_STEPS, None, false)
-                + target("join", join::run, 1, GATE_JOIN_SEEDS, JOIN_STEPS, None, false)
+            /* `--first`: stopped at the first target that fails -- the
+               gate's verdict, sooner (mutants.py's) */
+            let first = args.iter().any(|a| a == "--first");
+            let targets: [(&str, fn(u64, u64, bool) -> Result<(), String>, u64, u64); 5] = [
+                ("meta", meta::run, GATE_META_SEEDS, META_STEPS),
+                ("cs", cs::run, GATE_CS_SEEDS, CS_STEPS),
+                ("wire", wire::run, GATE_WIRE_SEEDS, WIRE_STEPS),
+                ("cluster", cluster::run, GATE_CLUSTER_SEEDS, CLUSTER_STEPS),
+                ("join", join::run, GATE_JOIN_SEEDS, JOIN_STEPS),
+            ];
+            let mut failed = 0;
+            for (name, run, seeds, steps) in targets {
+                failed += target(name, run, 1, seeds, steps, None, false);
+                if first && failed > 0 {
+                    break;
+                }
+            }
+            failed
         }
         Some("meta") => one("meta", meta::run, META_STEPS),
         Some("cs") => one("cs", cs::run, CS_STEPS),

@@ -60,7 +60,6 @@ pub enum Done {
     Held(Vec<(u32, u32, u64)>),
     Chunks(Vec<(u32, u32, u32, u32)>),
     Sums(Vec<u32>),
-    Written(u32),
 }
 
 impl Done {
@@ -74,7 +73,6 @@ impl Done {
             Done::Held(h) => Reply::Held(h.clone()),
             Done::Chunks(c) => Reply::Chunks(c.clone()),
             Done::Sums(s) => Reply::Sums(s.clone()),
-            Done::Written(v) => Reply::Written(*v),
         }
     }
 }
@@ -164,10 +162,6 @@ pub fn serve<D: Device>(store: &mut Store<D>, vouched: &mut Vouched, req: &Reque
         Op::Sums { chunk, joiner, index, offset, len } => {
             joined(vouched, ask, chunk.epoch.set, joiner, chunk.epoch.version, index)?;
             store.sums(chunk, offset, len).map(Done::Sums).map_err(Refusal::of)
-        }
-        Op::Touch { chunk, joiner, index } => {
-            joined(vouched, ask, chunk.epoch.set, joiner, chunk.epoch.version, index)?;
-            store.touch(chunk).map(Done::Written).map_err(Refusal::of)
         }
     }
 }

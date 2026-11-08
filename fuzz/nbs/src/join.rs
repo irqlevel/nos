@@ -33,7 +33,7 @@
 //! A tenth of the runs each set out to reach one race a random run seldom
 //! puts together (`Focus`): the power failing inside a close; a writer of a
 //! map before the join at the epoch a chunk just closed was left at; one
-//! between a member back's listing and its touch, at the epoch a touch of a
+//! between a member back's listing and its sums, at the epoch the sums of a
 //! join before left the chunk at; a write on the joiner whose delivery to
 //! the source is held past the copy, made before the copy began; and a
 //! chunk found open part copied as the join is given up.
@@ -99,14 +99,16 @@ enum Focus {
     /// A writer of a map before the join at the epoch the source knows a
     /// chunk at, as the copy closes it: the pull is to have moved it on.
     Moved,
-    /// A member back given up once it has touched, and writers of maps before
-    /// at the epochs the touches left, once the next copy has listed.
-    Touch,
+    /// A member back given up once it has held a chunk to its source's by
+    /// sums, and writers of maps before at the epochs the sums left, once
+    /// the next copy has listed.
+    Held,
     /// A write on the joiner before the next copy begins, held from the
     /// source past it: marked as the joiner's first write, or written over.
     Marks,
     /// A member back with every chunk found open, given up at its first
-    /// pull: the next copy is to pull them all.
+    /// pull: the next copy is to hold them all to the source's, what the
+    /// cut lost among what differs.
     Suspect,
 }
 
@@ -359,7 +361,6 @@ impl World {
                     let what = match &req.op {
                         Op::Pull { chunk, offset, len, .. } => format!("pull of chunk {} sectors {}..{} at {}",
                             chunk.chunk, offset / 512, (offset + len) / 512, chunk.epoch.version),
-                        Op::Touch { chunk, .. } => format!("touch of chunk {} at {}", chunk.chunk, chunk.epoch.version),
                         Op::Sums { chunk, .. } => format!("sums of chunk {} at {}", chunk.chunk, chunk.epoch.version),
                         other => format!("{:?}", other),
                     };
@@ -417,8 +418,7 @@ impl World {
     fn begin(&mut self) {
         self.closed_now.clear();
         self.joiner.join(SET, self.since);
-        let found = self.joiner.found_in(SET);
-        self.copy = Some(Copy::new(self.view(), JOINER, found, self.now));
+        self.copy = Some(Copy::new(self.view(), JOINER, self.now));
     }
 
     /// A sector of the chunk being copied rotted on the joiner, where no
@@ -588,12 +588,12 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     let focus = match r.below(10) {
         0 => Focus::Close,
         1 => Focus::Moved,
-        2 => Focus::Touch,
+        2 => Focus::Held,
         3 => Focus::Marks,
         4 => Focus::Suspect,
         _ => Focus::None,
     };
-    let own = matches!(focus, Focus::Touch | Focus::Suspect)
+    let own = matches!(focus, Focus::Held | Focus::Suspect)
         || (!matches!(focus, Focus::Marks | Focus::Close) && r.chance(33));
     let mut chunks: Vec<u32> = Vec::new();
     while chunks.len() < 1 + r.below(3) as usize {
@@ -612,7 +612,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     let rejoins = focus == Focus::None && r.chance(50);
     for version in 1..SINCE {
         let writes = match focus {
-            Focus::Touch | Focus::Suspect if version >= UNTIL => 0,
+            Focus::Held | Focus::Suspect if version >= UNTIL => 0,
             /* Every chunk written at the member's last version, six times:
                found open, and what the cut loses of it to be seen */
             Focus::Suspect if version == UNTIL - 1 => 6 * chunks.len() as u64,
@@ -639,7 +639,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         if own && version == UNTIL - 2 {
             joiner.flush().map_err(|e| format!("joiner not flushed: {:?}", e))?;
         }
-        if own && version == UNTIL - 1 && focus != Focus::Touch && (focus == Focus::Suspect || r.chance(50)) {
+        if own && version == UNTIL - 1 && focus != Focus::Held && (focus == Focus::Suspect || r.chance(50)) {
             cut = true;
         }
     }
@@ -678,13 +678,14 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     let mut close_fuse = fuse_at.is_none() && focus == Focus::None && w.r.chance(30);
     /* The random writes, but where they would move on the epoch the focus's
        race is at */
-    let writes_on = !matches!(focus, Focus::Moved | Focus::Touch | Focus::Suspect | Focus::Close);
+    let writes_on = !matches!(focus, Focus::Moved | Focus::Held | Focus::Suspect | Focus::Close);
     /* A member back with chunks found open: its join given up as its first
-       pull lands, half the time -- the next copy is to pull them all the same */
+       pull lands, half the time -- the next copy is to hold them all to the
+       source's the same, what the cut lost among what differs */
     let mut early = own && cut && (focus == Focus::Suspect || w.r.chance(50));
-    /* A member back given up once it has touched, or any joiner once it has
-       pulled: the focus's race is after it */
-    let mut give_up = matches!(focus, Focus::Touch | Focus::Marks);
+    /* A member back given up once it has held a chunk by sums, or any
+       joiner once it has pulled: the focus's race is after it */
+    let mut give_up = matches!(focus, Focus::Held | Focus::Marks);
     let faults = steps.min(FAULT_STEPS);
     let mut step = 0u64;
     loop {
@@ -724,7 +725,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
             }
         }
         let ready = match focus {
-            Focus::Touch => w.copy.as_ref().is_some_and(|c| c.stats.touched > 0),
+            Focus::Held => w.copy.as_ref().is_some_and(|c| c.stats.kept > 0),
             _ => w.copy.as_ref().is_some_and(|c| c.stats.bytes > 0),
         };
         if give_up && ready {
@@ -751,9 +752,9 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
                 w.deliver_write_at(at)?;
             }
         }
-        /* Writers of maps before, at the epochs the touches of the join
-           before left, once the next copy has listed */
-        if focus == Focus::Touch && !w.injected && !give_up && w.copy.as_ref().is_some_and(|c| c.listed()) {
+        /* Writers of maps before, at the epochs the sums of the join before
+           left, once the next copy has listed */
+        if focus == Focus::Held && !w.injected && !give_up && w.copy.as_ref().is_some_and(|c| c.listed()) {
             w.injected = true;
             for chunk in w.chunks.clone() {
                 let known = w.source.holding(chunk).map(|h| h.known.version);

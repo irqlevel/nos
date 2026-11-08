@@ -7,14 +7,18 @@
 //!   (`Op::Holdings`), the source an active member of the set.
 //! - **Each chunk pulled whole** (`Op::Pull`) into the store
 //!   (`Store::copy_in`), where no client has written since the join began.
-//!   A member back pulls only what it may have missed: a chunk the source
-//!   last wrote at or after the version the member went down at, one the
-//!   member does not hold, or one it found open when its devices were taken
-//!   in. It touches the others (`Op::Touch`), which moves their epoch on at
-//!   the source all the same, so that no writer of the map before the join
-//!   writes them past it -- and tells the version the chunk was last
-//!   written at with the move: a write the member missed may have come
-//!   since the chunks were listed, and the chunk is pulled after all.
+//!   A member back pulls whole only what it may have missed: a chunk the
+//!   source last wrote at or after the version the member went down at, or
+//!   one the member does not hold. The others -- one it found open when its
+//!   devices were taken in among them, its last writes lost -- it holds to
+//!   the source's by sums all the same, copying only what differs: a sum
+//!   finds what a power cut lost as it finds a write it missed. Taken out,
+//!   it kept each chunk at the epoch
+//!   it last knew, and a writer since taken over, its view as old, could
+//!   write it there -- the members fenced against that writer refuse it,
+//!   the member out was not fenced (found by fuzz/nbs's cluster target,
+//!   N9d). The sums move the chunk's epoch on at the source, so that no
+//!   writer of the map before the join writes it past them.
 //! - **A chunk pulled is held to the source's** by sums (`Op::Sums`). A
 //!   granule whose sums differ is pulled again and held to the source's a
 //!   sector at a time, the sectors a client has written since the join
@@ -31,7 +35,7 @@
 //! that fails, or is silent, is left for another of the set's active
 //! members.
 
-use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -84,9 +88,10 @@ pub enum State {
 /// What it has done.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
-    /// Chunks pulled and held to their source's, and chunks touched.
+    /// Chunks copied and held to their source's; of them, chunks a member
+    /// back held that its sums found the source's.
     pub chunks: u64,
-    pub touched: u64,
+    pub kept: u64,
     pub bytes: u64,
     /// Granules pulled again for differing from the source's.
     pub again: u64,
@@ -99,7 +104,6 @@ enum Ask {
     /// A granule held to the source's a sector at a time.
     Verify { offset: u32, len: u32, version: u32, rounds: u32 },
     Sums,
-    Touch,
 }
 
 #[derive(Clone, Copy)]
@@ -118,12 +122,13 @@ struct Work {
     next: u32,
     again: Vec<(u32, u32)>,
     verify: Vec<(u32, u32, u32)>,
-    /// A chunk a member back holds as it was: touched, not pulled.
-    touch: bool,
+    /// A chunk a member back holds: not pulled, held to the source's by
+    /// its sums.
+    held: bool,
     /// Its sums compared: the granules that differed held to the source's
     /// a sector at a time, and then it is closed.
     summed: bool,
-    /// Its sums -- or its touch -- asked.
+    /// Its sums asked.
     checking: bool,
 }
 
@@ -131,9 +136,6 @@ struct Work {
 pub struct Copy {
     view: JoinView,
     me: u32,
-    /// The chunks of the set a member back found open: pulled whatever it
-    /// holds of them.
-    found: BTreeSet<u32>,
     source: usize,
     silent: u32,
     from: u32,
@@ -160,10 +162,9 @@ fn differing<D: Device>(store: &mut Store<D>, c: ChunkRef, offset: u32, mine: &m
 
 impl Copy {
     /// The copy of join `view` by cs `me`, begun at `now`. The driver has
-    /// the store mark the set's writes first (`Store::join`), and hands in
-    /// what the store found open of the set (`Store::found_in`).
-    pub fn new(view: JoinView, me: u32, found: Vec<u32>, now: u64) -> Copy {
-        Copy { view, me, found: found.into_iter().collect(), source: 0, silent: 0, from: 0, listed: false,
+    /// the store mark the set's writes first (`Store::join`).
+    pub fn new(view: JoinView, me: u32, now: u64) -> Copy {
+        Copy { view, me, source: 0, silent: 0, from: 0, listed: false,
                page: VecDeque::new(), work: None, sent: BTreeMap::new(), hold_until: 0, progress_at: now,
                state: State::Copying, stats: Stats::default() }
     }
@@ -198,7 +199,7 @@ impl Copy {
     /// The chunk whose sums are asked, if one is: pulled whole, its check to
     /// come.
     pub fn summing(&self) -> Option<u32> {
-        self.work.as_ref().filter(|w| w.checking && !w.touch && !w.summed).map(|w| w.chunk)
+        self.work.as_ref().filter(|w| w.checking && !w.held && !w.summed).map(|w| w.chunk)
     }
 
     /// Its view refreshed -- the same join, the set's version now and its
@@ -274,8 +275,9 @@ impl Copy {
             let op = Op::Pull { chunk: self.chunk_ref(), joiner: self.me, index: self.view.index, offset, len };
             self.send(op, ask, now, next_id, out);
         }
-        /* Every range pulled: its sums asked, or its touch -- or, its sums
-           compared and what differed held to the source's, it is done */
+        /* Every range pulled -- none, for a chunk held -- its sums asked;
+           or, its sums compared and what differed held to the source's, it
+           is done */
         let idle = self.sent.is_empty();
         let Some(w) = self.work.as_mut() else { return };
         if idle && w.again.is_empty() && w.verify.is_empty() && w.next >= CHUNK && w.summed {
@@ -284,12 +286,8 @@ impl Copy {
         }
         if idle && w.again.is_empty() && w.verify.is_empty() && w.next >= CHUNK && !w.checking {
             w.checking = true;
-            let (touch, chunk, joiner, index) = (w.touch, self.chunk_ref(), self.me, self.view.index);
-            if touch {
-                self.send(Op::Touch { chunk, joiner, index }, Ask::Touch, now, next_id, out);
-            } else {
-                self.send(Op::Sums { chunk, joiner, index, offset: 0, len: CHUNK }, Ask::Sums, now, next_id, out);
-            }
+            let (chunk, joiner, index) = (self.chunk_ref(), self.me, self.view.index);
+            self.send(Op::Sums { chunk, joiner, index, offset: 0, len: CHUNK }, Ask::Sums, now, next_id, out);
         }
     }
 
@@ -345,22 +343,6 @@ impl Copy {
                 self.progress_at = now;
                 self.check(store, theirs, out);
             }
-            (Ask::Touch, Reply::Written(v)) => {
-                self.progress_at = now;
-                match self.work.as_mut() {
-                    /* Written at the version the member went down at or
-                       after, since it was listed: pulled after all */
-                    Some(w) if *v >= self.view.until => {
-                        w.touch = false;
-                        w.next = 0;
-                        w.checking = false;
-                    }
-                    _ => {
-                        self.stats.touched += 1;
-                        self.work = None;
-                    }
-                }
-            }
             /* An answer that is not the request's: the source left */
             _ => {
                 self.requeue_one(sent.ask);
@@ -378,9 +360,9 @@ impl Copy {
         let Some((chunk, incarnation, volume, written)) = self.page.pop_front() else { return false };
         let held = store.holding(chunk)
             .is_some_and(|h| h.incarnation == incarnation && h.volume == volume && h.state != SlotState::Lost);
-        let touch = self.view.own && written < self.view.until && held && !self.found.contains(&chunk);
-        self.work = Some(Work { chunk, incarnation, volume, next: if touch { CHUNK } else { 0 }, again: Vec::new(),
-                                verify: Vec::new(), touch, summed: false, checking: false });
+        let held = self.view.own && written < self.view.until && held;
+        self.work = Some(Work { chunk, incarnation, volume, next: if held { CHUNK } else { 0 }, again: Vec::new(),
+                                verify: Vec::new(), held, summed: false, checking: false });
         true
     }
 
@@ -407,6 +389,9 @@ impl Copy {
         let Some(w) = self.work.as_mut() else { return };
         w.summed = true;
         if differ.is_empty() {
+            if w.held {
+                self.stats.kept += 1;
+            }
             self.close(store, out);
             return;
         }
@@ -510,7 +495,7 @@ impl Copy {
         match ask {
             Ask::Pull { offset, len, .. } => self.again(offset, len),
             Ask::Verify { offset, len, rounds, .. } => self.verify_again(offset, len, rounds),
-            Ask::Sums | Ask::Touch => {
+            Ask::Sums => {
                 if let Some(w) = self.work.as_mut() {
                     w.checking = false;
                 }

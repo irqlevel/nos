@@ -255,30 +255,58 @@ A joiner's cs copies the set (N9b): nbswire's `copy`, driven by nbs-cs's
 task, whose mds tells it its joins (`Question::Joins`) with its devices.
 
 - **From a source**, an active member: the set's chunks it holds a page at
-  a time (`Op::Holdings`), each pulled (`Op::Pull`), summed (`Op::Sums`) or
-  touched (`Op::Touch`). Each names the joiner and the set's version, which
-  the source's mds vouches for (`Question::VerifyJoin`). A pull, a sum and a
-  touch move the chunk's epoch on at the source, durable before it reads: a
-  write of the epoch before is refused there from then on, and its writer,
-  its map read again, writes the joiner too. An epoch older than the one a
-  chunk is known at is refused even where the cs's cache once vouched for
-  it.
+  a time (`Op::Holdings`), each pulled (`Op::Pull`) and summed
+  (`Op::Sums`). Each names the joiner and the set's version, which the
+  source's mds vouches for (`Question::VerifyJoin`). A pull and a sum move
+  the chunk's epoch on at the source, durable before they read: a write of
+  the epoch before is refused there from then on, and its writer, its map
+  read again, writes the joiner too. An epoch older than the one a chunk is
+  known at is refused even where the cs's cache once vouched for it.
+- **A chunk found open is no source**: restarted with it open at a writer's
+  generation, the cs may have lost what that writer wrote since its last
+  flush, which a joiner would take as the set's. Its pulls and sums are
+  refused as failed -- the copy takes another source, or waits for the
+  writer to take this one out, or for a writer's reconcile to make the
+  chunk the same, which ends the mark -- where the cs is its set's last
+  active member, its writer's next request there fails as the last replica
+  refused (`LOST_LAST`), and the next writer's start reconciles it. Refused,
+  they keep the mark too: a pull's moving the epoch on writes the chunk's
+  record, which would take it off. (Both found by fuzz/nbs's cluster
+  target, N9d: a joiner copied from such a replica, and a pull from one had
+  taken the mark off.)
 - **The marks**: what clients write to the set from the join on is marked,
   a bit a sector, in memory alone, from the first write the mds vouches for
   as the joiner's (`Told::VerifiedJoining`). The copy writes only where no
   sector is marked: the client's data is newer, and the source has it or
-  will.
-- **A member back** pulls what it may have missed -- a chunk last written at
-  the version it went down at or after, one it does not hold, one it found
-  open as its devices were taken in and has not had pulled whole since --
-  and touches the rest. A touch tells the version the chunk was last
-  written at with the move, and a chunk written since the listing is pulled
-  after all.
+  will. A joiner takes no write of an epoch before its join: one from a view
+  that old -- a writer taken over since among them, which the members fenced
+  against it refuse -- would be marked, and kept over the set's (found by
+  the cluster target, N9d). Its writer reads its map again.
+- **A member back** pulls whole what it may have missed -- a chunk last
+  written at the version it went down at or after, or one it does not hold
+  -- and holds the rest to the source's by sums, copying only what differs:
+  one it found open when its devices were taken in among them, a sum
+  finding what a power cut lost as it finds a write missed. It trusts no
+  chunk it holds: taken out, it kept each at the epoch it last knew, and a
+  writer since taken over, its view as old, could write it there unfenced,
+  which the members fenced against that writer refused (found by the
+  cluster target, N9d; a touch, which moved the epoch on and kept the data,
+  did before).
 - **The check**: a chunk pulled is summed against the source's. A granule
   that differs is pulled again and held to the source's a sector at a time,
   the marked sectors left out; a sector that does not read back as copied is
   a round, and past three the join is given up and said. The chunk is then
-  closed, its data flushed first.
+  closed, its data flushed first -- flushed too where a client's write left
+  it open at the writer's generation, which leaves it open: the join's end
+  makes this cs a member, and a power cut after must not take the copy's
+  sectors (found by the cluster target, N9d). A chunk the joiner holds open
+  from before its join -- a member then, taken out with the chunk open, its
+  writer closing it on the members it had left -- is nobody's but the
+  copy's: the copy closes it at its end, whether it wrote the chunk or found
+  it the source's already, and leaves a mark open only where a client has
+  written the chunk since the join began (found by the cluster target, N9d:
+  kept, it made the chunk found open once the joiner crashed, and as its
+  set's last member it was no source for the joiner after it).
 - **Its end** is asked of the mds (`Question::JoinDone`, proposed as
   `Joined`); a copy that fails gives the join up (`Question::GiveUp`, as
   `Unjoin`). A join found as nbs-cs starts is given up: its marks are gone,
@@ -558,6 +586,22 @@ What it holds to (plans/nbs.md, "Replication: the rules"):
 - **Two writes that overlap are never out at once.** A read goes to one
   active replica, this host's where it has one, and to another when it does
   not answer.
+- **Its view of a set is whole, or held as behind.** Each change raises a
+  set's version by one, so a take-out's answer one past the view is that
+  take-out alone; one further is changes the view lacks -- a join begun --
+  and the set is read again, its writes held until then. A map read that
+  finds a set changed sends its writes out again by the new view, so that a
+  write is done only by every replica the view has in, a joiner among them.
+  A read that finds no active replica in the view waits for the map: the
+  set's last active member is never taken out. A cs that comes into the view
+  while the session's start fences is fenced too, and the start waits for
+  it. A session detached takes no answer to an ask of before. An ask to
+  take a cs out refused as no replica of its set -- its place another's
+  since, a joiner's of the controller's -- has the map read again, which
+  drops the ask; what waits for the cs is done as it comes due, by the view
+  read -- a request to a cs no set writes as a silent one's, a close the cs
+  refuses as not in the chunk's set (`NotHere`) at once. (Each found by the
+  cluster target with the controller in it, N9d.)
 - **A flush** waits for every write before it, then asks every cs that has
   acknowledged a write since the last flush began, and that some set of the
   volume still writes, to make its writes durable. It is done once they have
@@ -708,10 +752,10 @@ image's zeros out.
   set on the joiner is the source's, byte for byte, and every one the copy
   closed is still so after a power cut.
 
-  `--mutants` takes ninety-one rules out one at a time -- forty-four of the
-  metadata's, five of them the controller's; twenty-four of the cs's, nine
-  of them the copy's; twelve of the wire's, its `serve`'s and the copy's;
-  eleven of the client's -- each caught.
+  `--mutants` takes a hundred and four rules out one at a time -- forty-four
+  of the metadata's, five of them the controller's; twenty-seven of the
+  cs's, twelve of them the copy's; twelve of the wire's, its `serve`'s,
+  the mds's and the copy's; twenty-one of the client's -- each caught.
 - **`fuzz/raft`'s `nbsmeta` target**: the members' part of the state, its
   commands from pools of names and incarnations that meet and from wide ones
   that fill the cluster. There are four scenarios and six mutants.
