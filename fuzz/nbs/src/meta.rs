@@ -22,8 +22,9 @@
 //! - a checkpoint's digest the state's own at that entry, every true digest
 //!   of the leader's held, and a false one said as a divergence.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use nbsmeta::repair::{self, Seen};
 use nbsmeta::{Answer, Command, Refusal, State, CHECK_EVERY};
 use raft::rsm::{Frozen, StateMachine};
 
@@ -55,25 +56,66 @@ struct MDevice {
     active: bool,
 }
 
+/// A cs's being there as the leader committed it (N9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MState {
+    Up,
+    Down,
+    Out,
+}
+
 #[derive(Clone)]
 struct MCs {
     host: String,
     devices: Vec<MDevice>,
     reserved: u64,
+    state: MState,
 }
 
 impl MCs {
     fn slots(&self) -> u64 {
         self.devices.iter().filter(|d| d.active).map(|d| u64::from(d.slots)).sum()
     }
+
+    /// Devices, none taking new chunks: its places to be taken by others.
+    fn drained(&self) -> bool {
+        !self.devices.is_empty() && self.slots() == 0
+    }
 }
 
-/// A replica set: its three cs's, which of them are taken out, its version.
+/// A replica set: its three cs's, which of them are taken out and the last
+/// version each was active at, its joiner (cs, place, the version it joined
+/// at), its version and how many chunks are in it.
 #[derive(Clone)]
 struct MSet {
     cs: [u32; REPLICAS],
     down: [bool; REPLICAS],
+    until: [u32; REPLICAS],
+    joiner: Option<(u32, usize, u32)>,
     version: u32,
+    chunks: u64,
+}
+
+impl MSet {
+    fn clean(&self) -> bool {
+        self.joiner.is_none() && !self.down.contains(&true)
+    }
+
+    fn active(&self) -> usize {
+        self.down.iter().filter(|&&d| !d).count()
+    }
+
+    /// The cs's that hold room for each of its chunks: its three, and a
+    /// joiner of a place not its own.
+    fn holders(&self) -> Vec<u32> {
+        let mut h = self.cs.to_vec();
+        if let Some((j, place, _)) = self.joiner {
+            if self.cs[place] != j {
+                h.push(j);
+            }
+        }
+        h
+    }
 }
 
 #[derive(Clone)]
@@ -85,8 +127,8 @@ struct MVol {
     /// The writer: its host, generation and token.
     writer: Option<(String, u64, u64)>,
     readers: Vec<String>,
-    /// Each chunk's three cs's, by number, in increasing order.
-    chunks: Vec<[u32; REPLICAS]>,
+    /// Each chunk's set, by its number.
+    chunks: Vec<usize>,
 }
 
 #[derive(Default, Clone)]
@@ -98,10 +140,13 @@ struct Model {
     vols: BTreeMap<String, MVol>,
     next_device: u32,
     next_volume: u32,
-    /// Every set, in the order its three cs's were first placed on.
+    /// Every set: made where three cs's have no clean one, the lowest empty
+    /// one made again first (N9).
     sets: Vec<MSet>,
-    set_of: BTreeMap<[u32; REPLICAS], usize>,
 }
+
+/// The sets the metadata keeps at most.
+const SETS_MAX: usize = 1 << 16;
 
 fn m_name(s: &str) -> bool {
     (1..=63).contains(&s.len()) && s.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
@@ -149,7 +194,7 @@ impl Model {
         let mut c: Vec<(u32, u64, u64, u64)> = Vec::new();
         for (i, x) in self.cs.iter().enumerate() {
             let slots = x.slots();
-            if slots > 0 && self.is_member(&x.host) {
+            if slots > 0 && self.is_member(&x.host) && x.state == MState::Up {
                 c.push((i as u32, slots, x.reserved, slots.saturating_sub(x.reserved)));
             }
         }
@@ -199,24 +244,142 @@ impl Model {
         Placed { result: Ok(out), fits }
     }
 
-    fn take(&mut self, chunks: &[[u32; REPLICAS]]) {
-        for set in chunks {
-            for &c in set {
+    /// The clean set -- no member down, no joiner -- of three cs's: the
+    /// lowest-numbered.
+    fn clean_set(&self, cs: &[u32; REPLICAS]) -> Option<usize> {
+        (0..self.sets.len()).find(|&i| self.sets[i].cs == *cs && self.sets[i].clean())
+    }
+
+    /// Whether set `i` may be made again for a placement onto the three
+    /// cs's of `used`: no chunk, no joiner, a version that can move on, and
+    /// not the clean set of three the placement fills.
+    fn spare(&self, i: usize, used: &BTreeSet<[u32; REPLICAS]>) -> bool {
+        let s = &self.sets[i];
+        s.chunks == 0 && s.joiner.is_none() && s.version < u32::MAX && !(s.clean() && used.contains(&s.cs))
+    }
+
+    /// The empty set made again first: the lowest-numbered spare one.
+    fn empty_set(&self, used: &BTreeSet<[u32; REPLICAS]>) -> Option<usize> {
+        (0..self.sets.len()).find(|&i| self.spare(i, used))
+    }
+
+    /// Whether the sets have room for the three cs's of `chunks` that have
+    /// no clean set: a set each, made again or new.
+    fn sets_for(&self, chunks: &[[u32; REPLICAS]]) -> Result<(), Refusal> {
+        let used: BTreeSet<[u32; REPLICAS]> = chunks.iter().copied().collect();
+        let fresh = used.iter().filter(|t| self.clean_set(t).is_none()).count();
+        let empty = (0..self.sets.len()).filter(|&i| self.spare(i, &used)).count();
+        if fresh > SETS_MAX.saturating_sub(self.sets.len()) + empty {
+            return Err(Refusal::TooMany);
+        }
+        Ok(())
+    }
+
+    /// The chunks placed on `chunks`' three cs's, each into its set: the
+    /// clean one, else an empty one made again on them -- its version on --
+    /// else a new one.
+    fn take(&mut self, chunks: &[[u32; REPLICAS]]) -> Vec<usize> {
+        let used: BTreeSet<[u32; REPLICAS]> = chunks.iter().copied().collect();
+        let mut out = Vec::new();
+        for t in chunks {
+            let id = match self.clean_set(t) {
+                Some(i) => i,
+                None => match self.empty_set(&used) {
+                    Some(i) => {
+                        let version = self.sets[i].version + 1;
+                        self.sets[i] = MSet { cs: *t, down: [false; REPLICAS], until: [0; REPLICAS], joiner: None,
+                                              version, chunks: 0 };
+                        i
+                    }
+                    None => {
+                        self.sets.push(MSet { cs: *t, down: [false; REPLICAS], until: [0; REPLICAS], joiner: None,
+                                              version: 1, chunks: 0 });
+                        self.sets.len() - 1
+                    }
+                },
+            };
+            self.sets[id].chunks += 1;
+            for c in self.sets[id].holders() {
                 self.cs[c as usize].reserved += 1;
             }
-            if !self.set_of.contains_key(set) {
-                self.set_of.insert(*set, self.sets.len());
-                self.sets.push(MSet { cs: *set, down: [false; REPLICAS], version: 1 });
+            out.push(id);
+        }
+        out
+    }
+
+    fn give_back(&mut self, chunks: &[usize]) {
+        for &id in chunks {
+            self.sets[id].chunks -= 1;
+            for c in self.sets[id].holders() {
+                self.cs[c as usize].reserved -= 1;
             }
         }
     }
 
-    fn give_back(&mut self, chunks: &[[u32; REPLICAS]]) {
-        for set in chunks {
-            for &c in set {
-                self.cs[c as usize].reserved -= 1;
-            }
+    /// A cs down or out, from up: down in its sets but where it is the last
+    /// active member, no joiner of any; from down to out nothing more.
+    fn gone(&mut self, cs: u32, to: MState) -> Result<Answer, Refusal> {
+        if !self.init {
+            return Err(Refusal::NotInitialized);
         }
+        let was = self.cs.get(cs as usize).ok_or(Refusal::NoSuchCs)?.state;
+        if was == to || was == MState::Out {
+            return Ok(Answer::Changed { sets: 0 });
+        }
+        if was == MState::Down {
+            self.cs[cs as usize].state = to;
+            return Ok(Answer::Changed { sets: 0 });
+        }
+        let touched = |s: &MSet| {
+            s.joiner.is_some_and(|(j, _, _)| j == cs)
+                || (s.active() > 1 && (0..REPLICAS).any(|k| s.cs[k] == cs && !s.down[k]))
+        };
+        if self.sets.iter().any(|s| touched(s) && s.version == u32::MAX) {
+            return Err(Refusal::TooMany);
+        }
+        let (mut changed, mut released) = (0u32, 0u64);
+        for s in self.sets.iter_mut() {
+            if !touched(s) {
+                continue;
+            }
+            if let Some((j, place, _)) = s.joiner.filter(|(j, _, _)| *j == cs) {
+                if s.cs[place] != j {
+                    released += s.chunks;
+                }
+                s.joiner = None;
+            }
+            if let Some(k) = (0..REPLICAS).find(|&k| s.cs[k] == cs && !s.down[k]) {
+                if s.active() > 1 {
+                    s.down[k] = true;
+                    s.until[k] = s.version;
+                }
+            }
+            s.version += 1;
+            changed += 1;
+        }
+        let c = &mut self.cs[cs as usize];
+        c.state = to;
+        c.reserved -= released;
+        Ok(Answer::Changed { sets: changed })
+    }
+
+    /// The join of set `set` by `cs` of `since` given up.
+    fn unjoin(&mut self, set: usize, cs: u32, since: u32) -> Result<Answer, Refusal> {
+        let s = self.sets.get_mut(set).ok_or(Refusal::NoSuchSet)?;
+        let Some((_, place, _)) = s.joiner.filter(|&(j, _, si)| j == cs && si == since) else {
+            return Err(Refusal::Stale);
+        };
+        if s.version == u32::MAX {
+            return Err(Refusal::TooMany);
+        }
+        let elsewhere = s.cs[place] != cs;
+        s.joiner = None;
+        s.version += 1;
+        let (version, chunks) = (s.version, s.chunks);
+        if elsewhere {
+            self.cs[cs as usize].reserved -= chunks;
+        }
+        Ok(Answer::Set { version })
     }
 
     /// The model's answer to `cmd`, and whether a refusal for room was one the
@@ -317,7 +480,7 @@ impl Model {
                         if self.cs.len() >= CS_MAX {
                             return Err(TooMany);
                         }
-                        self.cs.push(MCs { host: host.clone(), devices: Vec::new(), reserved: 0 });
+                        self.cs.push(MCs { host: host.clone(), devices: Vec::new(), reserved: 0, state: MState::Up });
                         self.cs.len() - 1
                     }
                 };
@@ -361,8 +524,9 @@ impl Model {
                 let id = self.next_volume;
                 let p = self.place(id, host, 0, n);
                 *unfair = p.result == Err(NoRoom) && p.fits;
-                let chunks = p.result?;
-                self.take(&chunks);
+                let placed = p.result?;
+                self.sets_for(&placed)?;
+                let chunks = self.take(&placed);
                 self.next_volume += 1;
                 self.vols.insert(name.clone(), MVol { id, size_mib: *size_mib, host: host.clone(), generation: 0,
                                                       writer: None, readers: Vec::new(), chunks });
@@ -399,8 +563,9 @@ impl Model {
                     }
                     let p = self.place(v.id, &v.host, had, want - had);
                     *unfair = p.result == Err(NoRoom) && p.fits;
-                    let more = p.result?;
-                    self.take(&more);
+                    let placed = p.result?;
+                    self.sets_for(&placed)?;
+                    let more = self.take(&placed);
                     self.vols.get_mut(name).expect("there").chunks.extend(more);
                 }
                 self.vols.get_mut(name).expect("there").size_mib = *size_mib;
@@ -466,8 +631,13 @@ impl Model {
                 if v.writer.as_ref().is_none_or(|(_, g, _)| g != generation) {
                     return Err(NotTheWriter);
                 }
-                if !v.chunks.iter().any(|t| self.set_of.get(t) == Some(&(*set as usize))) {
+                if !v.chunks.contains(&(*set as usize)) {
                     return Err(NoSuchSet);
+                }
+                let s = self.sets.get(*set as usize).ok_or(NoSuchSet)?;
+                /* The joiner silent to the writer: its join dropped */
+                if let Some((_, _, since)) = s.joiner.filter(|(j, _, _)| j == cs) {
+                    return self.unjoin(*set as usize, *cs, since);
                 }
                 let s = self.sets.get_mut(*set as usize).ok_or(NoSuchSet)?;
                 let at = s.cs.iter().position(|c| c == cs).ok_or(NoSuchSet)?;
@@ -477,9 +647,118 @@ impl Model {
                 if (0..REPLICAS).all(|i| i == at || s.down[i]) {
                     return Err(LastReplica);
                 }
+                if s.version == u32::MAX {
+                    return Err(TooMany);
+                }
                 s.down[at] = true;
+                s.until[at] = s.version;
                 s.version += 1;
                 Ok(Answer::Set { version: s.version })
+            }
+            Command::CsDown { cs } => self.gone(*cs, MState::Down),
+            Command::CsOut { cs } => self.gone(*cs, MState::Out),
+            Command::CsUp { cs } => {
+                if !self.init {
+                    return Err(NotInitialized);
+                }
+                let c = self.cs.get(*cs as usize).ok_or(NoSuchCs)?;
+                if c.state == MState::Up {
+                    return Ok(Answer::Changed { sets: 0 });
+                }
+                if !self.is_member(&c.host) {
+                    return Err(NotAMember);
+                }
+                self.cs[*cs as usize].state = MState::Up;
+                Ok(Answer::Changed { sets: 0 })
+            }
+            Command::Join { set, place, cs, version } => {
+                if !self.init {
+                    return Err(NotInitialized);
+                }
+                let s = self.sets.get(*set as usize).ok_or(NoSuchSet)?;
+                if s.version != *version {
+                    return Err(Stale);
+                }
+                if s.joiner.is_some() {
+                    return Err(Joining);
+                }
+                let k = usize::from(*place);
+                if k >= REPLICAS {
+                    return Err(NoSuchSet);
+                }
+                let c = self.cs.get(*cs as usize).ok_or(NoSuchCs)?;
+                if c.state != MState::Up {
+                    return Err(NotUp);
+                }
+                if !self.is_member(&c.host) {
+                    return Err(NotAMember);
+                }
+                let back = s.cs[k] == *cs;
+                if back {
+                    if !s.down[k] {
+                        return Err(NotDown);
+                    }
+                } else {
+                    if s.cs.contains(cs) {
+                        return Err(AlreadyMember);
+                    }
+                    let m = &self.cs[s.cs[k] as usize];
+                    let gone = m.state == MState::Out || !self.is_member(&m.host);
+                    if !(s.down[k] && gone) && !m.drained() {
+                        return Err(InPlace);
+                    }
+                    if c.slots().saturating_sub(c.reserved) < s.chunks {
+                        return Err(NoRoom);
+                    }
+                }
+                if *version == u32::MAX {
+                    return Err(TooMany);
+                }
+                let chunks = s.chunks;
+                let s = &mut self.sets[*set as usize];
+                s.version += 1;
+                s.joiner = Some((*cs, k, s.version));
+                let since = s.version;
+                if !back {
+                    self.cs[*cs as usize].reserved += chunks;
+                }
+                Ok(Answer::Set { version: since })
+            }
+            Command::Joined { set, cs, since } => {
+                if !self.init {
+                    return Err(NotInitialized);
+                }
+                let s = self.sets.get(*set as usize).ok_or(NoSuchSet)?;
+                let Some((_, k, _)) = s.joiner.filter(|&(j, _, si)| j == *cs && si == *since) else {
+                    return Err(Stale);
+                };
+                if s.version == u32::MAX {
+                    return Err(TooMany);
+                }
+                let (old, chunks) = (s.cs[k], s.chunks);
+                let mut members: Vec<(u32, bool, u32)> =
+                    (0..REPLICAS).map(|i| if i == k { (*cs, false, 0) } else { (s.cs[i], s.down[i], s.until[i]) })
+                        .collect();
+                members.sort_by_key(|m| m.0);
+                let s = &mut self.sets[*set as usize];
+                for (i, m) in members.iter().enumerate() {
+                    s.cs[i] = m.0;
+                    s.down[i] = m.1;
+                    s.until[i] = m.2;
+                }
+                s.joiner = None;
+                s.version += 1;
+                let version = s.version;
+                if old != *cs {
+                    self.cs[old as usize].reserved -= chunks;
+                }
+                Ok(Answer::Set { version })
+            }
+            Command::Unjoin { set, cs, since } => {
+                if !self.init {
+                    return Err(NotInitialized);
+                }
+                self.unjoin(*set as usize, *cs, *since)
             }
         }
     }
@@ -495,9 +774,17 @@ fn differs(s: &State, m: &Model) -> Option<String> {
         return Some(format!("{} chunk servers, the model {}", s.cs().len(), m.cs.len()));
     }
     for (i, (c, mc)) in s.cs().iter().zip(m.cs.iter()).enumerate() {
-        if c.id as usize != i || c.host != mc.host || c.reserved != mc.reserved || c.devices.len() != mc.devices.len() {
-            return Some(format!("cs {}: {} reserved {} of {} devices, the model {} reserved {} of {}", i, c.host,
-                                c.reserved, c.devices.len(), mc.host, mc.reserved, mc.devices.len()));
+        let state = match c.state {
+            nbsmeta::CsState::Up => MState::Up,
+            nbsmeta::CsState::Down => MState::Down,
+            nbsmeta::CsState::Out => MState::Out,
+        };
+        if c.id as usize != i || c.host != mc.host || c.reserved != mc.reserved || c.devices.len() != mc.devices.len()
+            || state != mc.state
+        {
+            return Some(format!("cs {}: {} {:?} reserved {} of {} devices, the model {} {:?} reserved {} of {}", i,
+                                c.host, state, c.reserved, c.devices.len(), mc.host, mc.state, mc.reserved,
+                                mc.devices.len()));
         }
         for (d, md) in c.devices.iter().zip(mc.devices.iter()) {
             let active = d.state == nbsmeta::DeviceState::Active;
@@ -512,9 +799,13 @@ fn differs(s: &State, m: &Model) -> Option<String> {
     }
     for (i, (set, ms)) in s.sets().iter().zip(m.sets.iter()).enumerate() {
         let down: Vec<bool> = set.replicas.iter().map(|r| *r == nbsmeta::Replica::Down).collect();
-        if set.cs != ms.cs || down != ms.down || set.version != ms.version {
-            return Some(format!("set {}: cs's {:?}, out {:?}, version {}; the model {:?}, {:?}, {}", i, set.cs, down,
-                                set.version, ms.cs, ms.down, ms.version));
+        let joiner = set.joiner.map(|j| (j.cs, usize::from(j.place), j.since));
+        if set.cs != ms.cs || down != ms.down || set.active_until != ms.until || joiner != ms.joiner
+            || set.version != ms.version || u64::from(set.chunks) != ms.chunks
+        {
+            return Some(format!("set {}: cs's {:?}, out {:?} until {:?}, joiner {:?}, version {}, {} chunks; the model \
+                                 {:?}, {:?} until {:?}, {:?}, {}, {}", i, set.cs, down, set.active_until, joiner,
+                                set.version, set.chunks, ms.cs, ms.down, ms.until, ms.joiner, ms.version, ms.chunks));
         }
     }
     if s.volumes().len() != m.vols.len() {
@@ -534,13 +825,13 @@ fn differs(s: &State, m: &Model) -> Option<String> {
                                 v.generation, writer, v.readers, v.map.len(), mv.id, mv.size_mib, mv.host,
                                 mv.generation, mv.writer, mv.readers, mv.chunks.len()));
         }
-        for (k, (&c, want)) in v.map.iter().zip(mv.chunks.iter()).enumerate() {
+        for (k, (&c, &want)) in v.map.iter().zip(mv.chunks.iter()).enumerate() {
             let Some(ch) = s.chunks().get(c as usize) else { return Some(format!("{}'s chunk {} is none", name, k)) };
             let Some(set) = s.sets().get(ch.set as usize) else {
                 return Some(format!("{}'s chunk {} in no set", name, k));
             };
-            if ch.is_free() || set.cs != *want {
-                return Some(format!("{}'s chunk {} on cs's {:?}, the model's {:?}", name, k, set.cs, want));
+            if ch.is_free() || ch.set as usize != want {
+                return Some(format!("{}'s chunk {} in set {}, the model's {}", name, k, ch.set, want));
             }
             let hosts: Vec<&str> = set.cs.iter().map(|&c| s.cs()[c as usize].host.as_str()).collect();
             if hosts[0] == hosts[1] || hosts[1] == hosts[2] || hosts[0] == hosts[2] {
@@ -626,9 +917,42 @@ fn fsck(s: &State) -> Option<String> {
         }
     }
     for (i, c) in s.cs().iter().enumerate() {
-        let replicas: u64 = s.sets().iter().filter(|x| x.cs.contains(&(i as u32))).map(|x| u64::from(x.chunks)).sum();
+        let me = i as u32;
+        /* A member's chunks, and those of a set it joins in a place not its
+           own -- a member back holds its room already */
+        let replicas: u64 = s.sets().iter()
+            .filter(|x| x.cs.contains(&me)
+                || x.joiner.is_some_and(|j| j.cs == me && x.cs.get(usize::from(j.place)) != Some(&me)))
+            .map(|x| u64::from(x.chunks)).sum();
         if replicas != c.reserved {
             return Some(format!("cs {} reserved {}, its sets have {} chunks", i, c.reserved, replicas));
+        }
+    }
+    for (i, set) in s.sets().iter().enumerate() {
+        if !set.replicas.contains(&nbsmeta::Replica::Active) {
+            return Some(format!("set {} with no active member", i));
+        }
+        /* A member down was active until an earlier version; an active one
+           has none */
+        for k in 0..REPLICAS {
+            let until = set.active_until[k];
+            let ok = if set.replicas[k] == nbsmeta::Replica::Down { until != 0 && until < set.version } else { until == 0 };
+            if !ok {
+                return Some(format!("set {}'s member {} {:?} active until {} at version {}", i, k, set.replicas[k],
+                                    until, set.version));
+            }
+        }
+        if let Some(j) = set.joiner {
+            let k = usize::from(j.place);
+            if k >= REPLICAS || (set.cs[k] == j.cs) != (set.cs.contains(&j.cs))
+                || (set.cs[k] == j.cs && set.replicas[k] != nbsmeta::Replica::Down)
+            {
+                return Some(format!("set {}'s joiner {:?}: an active member's own place, or another member's", i, j));
+            }
+            if j.cs as usize >= s.cs().len() || j.since == 0 || j.since > set.version {
+                return Some(format!("set {}'s joiner {:?}: of no cs, or joined at no version of the set's {}", i, j,
+                                    set.version));
+            }
         }
     }
     let mut seen = vec![false; chunks.len()];
@@ -664,7 +988,7 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
         *fresh += 1;
         return Command::Init { cluster: [7; 16], name: String::from("nbs"), host: host(r), member: *fresh };
     }
-    match r.below(100) {
+    match r.below(124) {
         0..=7 => {
             *fresh += 1;
             Command::Add { host: host(r), member: if r.chance(5) { 0 } else { *fresh } }
@@ -710,24 +1034,35 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
             };
             Command::Detach { name, host: h, generation }
         }
-        /* A replica taken out: of a set there is, one of its own -- or a set
-           past the table, a cs that is none of its */
+        /* A replica taken out: mostly of a set the volume has chunks in, and
+           of one of its members or now and then its joiner -- a writer finds
+           a joiner silent as it finds a member; else of any set there is or
+           one past the table, and a cs that is none of its */
         87..=89 => {
+            let name = match m.vols.keys().nth(r.below(m.vols.len() as u64) as usize) {
+                Some(n) if r.chance(75) => n.clone(),
+                _ => volume(r),
+            };
+            let vol = m.vols.get(&name);
             let sets = m.sets.len() as u64;
-            let set = if sets == 0 || r.chance(10) { r.below(sets + 2) as u32 } else { r.below(sets) as u32 };
+            let set = match vol.and_then(|v| r.pick(&v.chunks)) {
+                Some(s) if r.chance(70) => s as u32,
+                _ if sets == 0 || r.chance(10) => r.below(sets + 2) as u32,
+                _ => r.below(sets) as u32,
+            };
             let cs = match m.sets.get(set as usize) {
+                Some(ms) if ms.joiner.is_some() && r.chance(30) => ms.joiner.map_or(0, |(j, _, _)| j),
                 Some(ms) if r.chance(85) => ms.cs[r.below(REPLICAS as u64) as usize],
                 _ => r.below(m.cs.len() as u64 + 1) as u32,
             };
             /* As the volume's writer mostly, or one fenced since */
-            let name = volume(r);
-            let generation = match m.vols.get(&name).and_then(|v| v.writer.clone()) {
+            let generation = match vol.and_then(|v| v.writer.clone()) {
                 Some((_, g, _)) if r.chance(80) => g,
                 _ => r.below(4),
             };
             Command::ReplicaDown { set, cs, refused: r.chance(30), name, generation }
         }
-        _ => {
+        90..=99 => {
             /* The leader's digest: the true one of the newest checkpoint, or
                of none the state has */
             match s.checks().latest() {
@@ -735,7 +1070,202 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
                 _ => Command::Digest { at: r.below(10_000), digest: [r.below(256) as u8; 32] },
             }
         }
+        /* A cs down, up or out (N9): one there is, or none */
+        100..=103 => {
+            let cs = r.below(m.cs.len() as u64 + 1) as u32;
+            match r.below(3) {
+                0 => Command::CsDown { cs },
+                1 => Command::CsUp { cs },
+                _ => Command::CsOut { cs },
+            }
+        }
+        /* A join: mostly of a set with a place to fill, at its version, by
+           its own member back or another cs -- else anything */
+        104..=111 => {
+            let sets = m.sets.len() as u64;
+            let wanting: Vec<usize> = (0..m.sets.len()).filter(|&i| {
+                let ms = &m.sets[i];
+                ms.joiner.is_none() && (ms.down.contains(&true) || ms.cs.iter().any(|&c| m.cs[c as usize].drained()))
+            }).collect();
+            let set = match r.pick(&wanting) {
+                Some(i) if r.chance(85) => i,
+                _ => r.below(sets + 2) as usize,
+            };
+            let ms = m.sets.get(set);
+            let place = match ms {
+                Some(ms) if r.chance(80) => (0..REPLICAS)
+                    .find(|&k| ms.down[k] || m.cs[ms.cs[k] as usize].drained()).unwrap_or(0) as u8,
+                _ => r.below(4) as u8,
+            };
+            let cs = match ms {
+                Some(ms) if r.chance(40) && usize::from(place) < REPLICAS => ms.cs[usize::from(place)],
+                _ => r.below(m.cs.len() as u64 + 1) as u32,
+            };
+            let version = match ms {
+                Some(ms) if r.chance(85) => ms.version,
+                Some(ms) => ms.version.saturating_sub(1),
+                None => 1,
+            };
+            Command::Join { set: set as u32, place, cs, version }
+        }
+        /* A join's end or give-up: of one under way, or not */
+        112..=115 => {
+            let joining: Vec<usize> = (0..m.sets.len()).filter(|&i| m.sets[i].joiner.is_some()).collect();
+            let (set, cs, since) = match r.pick(&joining) {
+                Some(i) if r.chance(85) => {
+                    let (j, _, since) = m.sets[i].joiner.expect("joining");
+                    (i as u32, j, if r.chance(90) { since } else { since + 1 })
+                }
+                _ => (r.below(m.sets.len() as u64 + 1) as u32, r.below(m.cs.len() as u64 + 1) as u32, r.below(5) as u32),
+            };
+            if r.chance(70) {
+                Command::Joined { set, cs, since }
+            } else {
+                Command::Unjoin { set, cs, since }
+            }
+        }
+        /* What the controller proposes, as a leader seeing the cs's so */
+        _ => {
+            let seen: Vec<Seen> = (0..s.cs().len() as u32).map(|cs| {
+                let answering = r.chance(70);
+                let silent_ms = if answering { 0 } else { r.pick(&[1_000u64, 6_000, 700_000]).unwrap_or(6_000) };
+                Seen { cs, answering, silent_ms, maintenance: r.chance(10) }
+            }).collect();
+            let mut plan = repair::plan(s, &seen, repair::OUT_AFTER_MS);
+            if plan.is_empty() {
+                Command::CsUp { cs: r.below(m.cs.len() as u64 + 1) as u32 }
+            } else {
+                let at = r.below(plan.len() as u64) as usize;
+                plan.swap_remove(at)
+            }
+        }
     }
+}
+
+/// The controller's progress (N9): from state `s`, every member's cs
+/// answering but those `gone` for good, the controller's plans applied turn
+/// after turn and every join under way ended at the next -- its copy done --
+/// until it proposes nothing: within so many turns, and then every set with
+/// a place to fill has none it could fill -- no member back that was not
+/// joined, no cs with room that could have taken another's place.
+fn settle(s: &State, gone: &[bool]) -> Option<String> {
+    let mut t = s.clone();
+    let seen: Vec<Seen> = (0..t.cs().len() as u32).map(|cs| {
+        let g = gone.get(cs as usize).copied().unwrap_or(false);
+        Seen { cs, answering: !g, silent_ms: if g { repair::OUT_AFTER_MS } else { 0 }, maintenance: false }
+    }).collect();
+    let turns = 4 * (t.sets().len() + 4);
+    let mut index = 2_000_000u64;
+    for _ in 0..turns {
+        let cmds = repair::plan(&t, &seen, repair::OUT_AFTER_MS);
+        for c in &cmds {
+            index += 1;
+            if let Some(Answer::Refused(why)) = Answer::decode(&t.apply(index, &c.encode())) {
+                return Some(format!("the controller proposed {:?}, refused: {:?}", c, why));
+            }
+        }
+        /* Every join under way ends: its copy done */
+        let ends: Vec<Command> = t.sets().iter().enumerate()
+            .filter_map(|(id, set)| set.joiner.map(|j| Command::Joined { set: id as u32, cs: j.cs, since: j.since }))
+            .collect();
+        for c in &ends {
+            index += 1;
+            if let Some(Answer::Refused(why)) = Answer::decode(&t.apply(index, &c.encode())) {
+                return Some(format!("a join's end {:?} refused: {:?}", c, why));
+            }
+        }
+        if cmds.is_empty() && ends.is_empty() {
+            return settled(&t, gone).or_else(|| fsck(&t)).or_else(|| {
+                State::decode(&t.encode()).err().map(|e| format!("the settled state's snapshot refused: {:?}", e))
+            });
+        }
+    }
+    Some(format!("the controller still proposing after {} turns", turns))
+}
+
+/// What the controller left undone, said: a member down whose cs answers,
+/// up, a member host's and not drained, never joined back; a place of a
+/// member gone or drained that a cs with room -- up, answering, a member
+/// host's, not drained, no member of the set -- could have taken; a join
+/// still under way; a member host's cs answering but not up.
+fn settled(t: &State, gone: &[bool]) -> Option<String> {
+    let g = |c: u32| gone.get(c as usize).copied().unwrap_or(false);
+    let usable = |c: &nbsmeta::Cs| c.state == nbsmeta::CsState::Up && t.member(&c.host).is_some() && !g(c.id) && !c.draining();
+    for c in t.cs() {
+        if t.member(&c.host).is_some() && !g(c.id) && c.state != nbsmeta::CsState::Up {
+            return Some(format!("cs {} answering but {:?} at the end", c.id, c.state));
+        }
+        /* Silent past out_after, or of a host no member: out */
+        if (g(c.id) || t.member(&c.host).is_none()) && c.state != nbsmeta::CsState::Out {
+            return Some(format!("cs {} gone for good but {:?} at the end", c.id, c.state));
+        }
+    }
+    for (id, set) in t.sets().iter().enumerate() {
+        if set.chunks == 0 {
+            continue;
+        }
+        if set.joiner.is_some() {
+            return Some(format!("set {} still joining at the end", id));
+        }
+        for k in 0..REPLICAS {
+            let Some(c) = t.cs().get(set.cs[k] as usize) else { return Some(format!("set {} of no cs", id)) };
+            let down = set.replicas[k] == nbsmeta::Replica::Down;
+            if down && usable(c) {
+                return Some(format!("set {}'s member {} down, its cs back, never joined again", id, c.id));
+            }
+            let gone_for_good = c.state == nbsmeta::CsState::Out || t.member(&c.host).is_none();
+            if (down && gone_for_good) || c.draining() {
+                let taker = t.cs().iter().find(|o| usable(o) && !set.cs.contains(&o.id) && o.free() >= u64::from(set.chunks));
+                if let Some(o) = taker {
+                    return Some(format!("set {}'s place {} ({}) left to fill, which cs {} had the room for", id, k,
+                                        if down { "gone" } else { "drained" }, o.id));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A set's joiner in the snapshot `bytes` of `s` made one no set can have:
+/// of a place past the three, or another member's; the cs of a member
+/// active; joined at 0, or at a version to come. The joiner is found by its
+/// own values, as NBM5 writes them -- 1, its cs, its place and the version
+/// it joined at, then the set's version and count of chunks -- and the rest
+/// of the snapshot is left whole, so that the check of joiners is the one
+/// to refuse it: bytes spoiled at random reach it once in a long while. A
+/// format that writes a joiner otherwise finds none here, and the
+/// `joiner_checked` mutant then says so. False where no set has a joiner.
+fn spoil_joiner(r: &mut Rng, s: &State, bytes: &mut [u8]) -> bool {
+    let joining: Vec<usize> = s.sets().iter().enumerate().filter(|(_, x)| x.joiner.is_some()).map(|(i, _)| i).collect();
+    let Some(set) = r.pick(&joining).and_then(|i| s.sets().get(i)) else { return false };
+    let Some(j) = set.joiner else { return false };
+    let mut needle = vec![1u8];
+    needle.extend_from_slice(&j.cs.to_le_bytes());
+    needle.push(j.place);
+    needle.extend_from_slice(&j.since.to_le_bytes());
+    needle.extend_from_slice(&set.version.to_le_bytes());
+    needle.extend_from_slice(&set.chunks.to_le_bytes());
+    let Some(at) = bytes.windows(needle.len()).position(|w| w == needle.as_slice()) else { return false };
+    let (cs_at, place_at, since_at) = (at + 1, at + 5, at + 6);
+    let k = usize::from(j.place);
+    match r.below(4) {
+        0 => bytes[place_at] = 3 + r.below(253) as u8,
+        /* A member back at another member's place */
+        1 if set.cs[k] == j.cs => bytes[place_at] = ((k + 1 + r.below(2) as usize) % REPLICAS) as u8,
+        2 => {
+            let since = if r.chance(50) { 0 } else { set.version.saturating_add(1 + r.below(8) as u32) };
+            bytes[since_at..since_at + 4].copy_from_slice(&since.to_le_bytes());
+        }
+        _ => {
+            let active: Vec<u32> = (0..REPLICAS)
+                .filter(|&m| set.replicas[m] == nbsmeta::Replica::Active && set.cs[m] != j.cs)
+                .map(|m| set.cs[m])
+                .collect();
+            let Some(c) = r.pick(&active) else { return false };
+            bytes[cs_at..cs_at + 4].copy_from_slice(&c.to_le_bytes());
+        }
+    }
+    true
 }
 
 /// `cmd`'s bytes, now and then spoiled.
@@ -818,9 +1348,12 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         if unfair {
             return Err(format!("step {}: {:?} refused for room its chunks fit by counting", step, decoded));
         }
+        let what = decoded.as_ref().map_or(String::from("bytes"), |c| {
+            format!("{:?}", c).split([' ', '(', '{']).next().unwrap_or("").to_string()
+        });
         let kind = match got {
-            Answer::Refused(why) => format!("{:?}", why),
-            other => format!("{:?}", other).split([' ', '(', '{']).next().unwrap_or("").to_string(),
+            Answer::Refused(why) => format!("{} {:?}", what, why),
+            other => format!("{} {}", what, format!("{:?}", other).split([' ', '(', '{']).next().unwrap_or("")),
         };
         *answers.entry(kind).or_default() += 1;
         let differ = {
@@ -851,6 +1384,14 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         if r.chance(5) && s != replica {
             return Err(format!("step {}: the replica's state is not the state", step));
         }
+        /* The controller's progress from here, some hosts gone for good */
+        if r.chance(2) {
+            let _model = Exempt::new();
+            let gone: Vec<bool> = (0..s.cs().len()).map(|_| r.chance(20)).collect();
+            if let Some(d) = settle(&s, &gone) {
+                return Err(format!("step {}: {}", step, d));
+            }
+        }
         /* Its snapshot read back as itself, in pieces as in one */
         if r.chance(6) {
             let _big = Exempt::new();
@@ -866,9 +1407,11 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
             if restored.is_none() && r.chance(30) {
                 restored = Some(back);
             }
-            /* Spoiled: refused, or a state that reads back the same */
+            /* Spoiled: refused, or a state that reads back the same -- a
+               joiner now and then, aimed at, the rest at random */
             let mut spoiled = whole.clone();
-            for _ in 0..r.range(1, 4) {
+            let aimed = r.chance(25) && spoil_joiner(&mut r, &s, &mut spoiled);
+            for _ in 0..if aimed { 0 } else { r.range(1, 4) } {
                 if spoiled.is_empty() {
                     break;
                 }
@@ -895,7 +1438,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
                     spoiled[at] = r.below(256) as u8;
                 }
             }
-            if r.chance(20) {
+            if !aimed && r.chance(20) {
                 spoiled.truncate(r.below(spoiled.len() as u64 + 1) as usize);
             }
             if let Ok(mut t) = State::decode(&spoiled) {

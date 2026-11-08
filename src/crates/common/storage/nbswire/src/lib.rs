@@ -630,24 +630,27 @@ fn reason(s: &str) -> &str {
     &s[..n]
 }
 
-/// A replica of a chunk's set, as a client is told it.
+/// A member of a chunk's set, as a client is told it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplicaState {
     /// Written and read.
     Active,
-    /// Being copied onto: written, not read (N9).
-    Rebuilding,
     /// Taken out: neither.
     Down,
 }
 
-/// A place of a volume's map: the chunk there, as a request names it, and
-/// its set's three cs's, each with its state.
+/// What a place's joiner is on the wire when it has none.
+pub const NO_JOINER: u32 = u32::MAX;
+
+/// A place of a volume's map: the chunk there, as a request names it, its
+/// set's three cs's, each with its state, and the set's joiner -- a cs
+/// being copied onto, written and not read (N9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Place {
     pub chunk: ChunkRef,
     pub cs: [u32; nbsmeta::REPLICAS],
     pub replicas: [ReplicaState; nbsmeta::REPLICAS],
+    pub joiner: Option<u32>,
 }
 
 /// What a client -- hv's disk, `nbs io`, nbsload -- asks its host's mds.
@@ -711,7 +714,6 @@ pub struct Saying {
 fn replica_state(s: ReplicaState) -> u8 {
     match s {
         ReplicaState::Active => 0,
-        ReplicaState::Rebuilding => 1,
         ReplicaState::Down => 2,
     }
 }
@@ -719,14 +721,13 @@ fn replica_state(s: ReplicaState) -> u8 {
 fn read_replica_state(c: u8) -> Option<ReplicaState> {
     Some(match c {
         0 => ReplicaState::Active,
-        1 => ReplicaState::Rebuilding,
         2 => ReplicaState::Down,
         _ => return None,
     })
 }
 
-/// A place's bytes: its chunk, its three cs's and their states.
-const PLACE_BYTES: usize = 16 + 4 * nbsmeta::REPLICAS + nbsmeta::REPLICAS;
+/// A place's bytes: its chunk, its three cs's and their states, its joiner.
+const PLACE_BYTES: usize = 16 + 4 * nbsmeta::REPLICAS + nbsmeta::REPLICAS + 4;
 
 impl Asking {
     pub fn encode(&self) -> Vec<u8> {
@@ -833,6 +834,7 @@ impl Saying {
                     for &s in &p.replicas {
                         w.u8(replica_state(s));
                     }
+                    w.u32(p.joiner.unwrap_or(NO_JOINER));
                 }
                 w.u8(hosts.len() as u8);
                 for (cs, host) in hosts {
@@ -890,7 +892,14 @@ impl Saying {
                     for s in replicas.iter_mut() {
                         *s = read_replica_state(r.u8()?)?;
                     }
-                    map.push(Place { chunk, cs, replicas });
+                    let joiner = match r.u32()? {
+                        NO_JOINER => None,
+                        j if cs.contains(&j) && replicas[cs.iter().position(|&c| c == j)?] != ReplicaState::Down => {
+                            return None;
+                        }
+                        j => Some(j),
+                    };
+                    map.push(Place { chunk, cs, replicas, joiner });
                 }
                 let k = usize::from(r.u8()?);
                 if k > nbsmeta::CS_MAX {
