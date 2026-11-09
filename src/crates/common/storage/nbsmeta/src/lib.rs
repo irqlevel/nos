@@ -61,7 +61,7 @@ pub use pieces::{Pieces, PIECE};
 pub use snapshot::{Checks, Diverged, FrozenState};
 pub use storage::*;
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -129,6 +129,9 @@ pub struct State {
     next_check: u64,
     /// The free list's first chunk, `NO_CHUNK` for none.
     free_head: u32,
+    /// The copy-ups pending (N10), by volume and place in its map: the new
+    /// chunk, and the old one the map names still.
+    copying: BTreeMap<(u32, u32), (u32, u32)>,
     /* Of the tables above, made again from them: never in a snapshot */
     /// The clean sets -- every member active, no joiner -- by their three
     /// cs's and number: where new chunks on those three go, the lowest first.
@@ -153,6 +156,7 @@ impl Default for State {
             next_volume: 1,
             next_check: CHECK_EVERY,
             free_head: NO_CHUNK,
+            copying: BTreeMap::new(),
             set_of: BTreeSet::new(),
             free_count: 0,
             checks: Checks::default(),
@@ -167,7 +171,7 @@ impl PartialEq for State {
         self.cluster == o.cluster && self.members == o.members && self.removed == o.removed && self.cs == o.cs
             && self.sets == o.sets && self.chunks == o.chunks && self.volumes == o.volumes
             && self.next_device == o.next_device && self.next_volume == o.next_volume
-            && self.next_check == o.next_check && self.free_head == o.free_head
+            && self.next_check == o.next_check && self.free_head == o.free_head && self.copying == o.copying
     }
 }
 
@@ -189,6 +193,12 @@ impl State {
 
     pub fn chunks(&self) -> &Pieces<Chunk> {
         &self.chunks
+    }
+
+    /// The copy-ups pending (N10): by volume and place, the new chunk and
+    /// the old one.
+    pub fn copying(&self) -> &BTreeMap<(u32, u32), (u32, u32)> {
+        &self.copying
     }
 
     pub fn volumes(&self) -> &Pieces<Volume> {

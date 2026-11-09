@@ -20,6 +20,11 @@
 //!   its own record, so no other table keeps it.
 //! - **A volume**: its name and size, its kind, its own host, its attach,
 //!   and its map, a chunk's number for each 4 MiB of it.
+//! - **Snapshots, images and clones** (N10) share their chunks with the
+//!   volume they were made of, each chunk counted by every map that names
+//!   it, room reserved for none -- thin. A write to a shared chunk is a
+//!   copy-up: a new chunk in the same set, pending until the set's members
+//!   have copied it, then named by the writer's map in the old one's place.
 
 use alloc::collections::BTreeSet;
 use alloc::string::String;
@@ -40,6 +45,8 @@ pub const CS_MAX: usize = 64;
 pub const DEVICES_MAX: usize = 16;
 /// Volumes, at most.
 pub const VOLUMES_MAX: usize = 4096;
+/* A chunk's count of the maps that name it -- each once at most -- is a u16 */
+const _: () = assert!(VOLUMES_MAX < u16::MAX as usize);
 /// Chunks, at most: 16 TiB of volumes, some 48 MiB of state.
 pub const CHUNKS_MAX: usize = 1 << 22;
 /// A volume's size at most, in MiB: 16 TiB.
@@ -56,6 +63,9 @@ pub const VOLUME_NAME_MAX: usize = 63;
 pub const SETS_MAX: usize = 1 << 16;
 /// What a free chunk's record has for the end of the free list.
 pub const NO_CHUNK: u32 = u32::MAX;
+/// Copy-ups pending at once, at most (N10): a writer has a few under way,
+/// and leaves those it had where it stops.
+pub const COPYING_MAX: usize = 4096;
 
 /// A chunk on the free list.
 pub const CHUNK_FREE: u8 = 0x80;
@@ -298,6 +308,16 @@ impl State {
             Command::ReplicaBad { set, cs, version } => {
                 self.replica_bad(*set, *cs, *version).map(|version| Answer::Set { version })
             }
+            Command::Snapshot { volume, name, generation } => {
+                self.snapshot(volume, name, *generation).map(|id| Answer::Volume { id })
+            }
+            Command::Freeze { name } => self.freeze(name).map(|id| Answer::Volume { id }),
+            Command::Clone { from, name, host } => self.clone_of(from, name, host).map(|id| Answer::Volume { id }),
+            Command::CopyUp { name, place, generation } => {
+                self.copy_up(name, *place, *generation).map(|(chunk, incarnation)| Answer::Chunk { chunk, incarnation })
+            }
+            Command::CopyDone { name, place, generation, chunk } => self.copy_done(name, *place, *generation, *chunk)
+                .map(|(chunk, incarnation)| Answer::Chunk { chunk, incarnation }),
             /* The members' are lib.rs's */
             Command::Init { .. } | Command::Add { .. } | Command::Remove { .. } => Err(Refusal::Malformed),
         };
@@ -457,7 +477,181 @@ impl State {
         for &chunk in v.map.iter() {
             self.release_chunk(chunk);
         }
+        self.give_up_copies(v.id);
         Ok(v.id)
+    }
+
+    /// A snapshot `name` of volume `volume`, at its writer's `generation` --
+    /// 0 for a volume with none (N10): its map copied, every chunk's count
+    /// up. Taken again of the same volume, answered as it is.
+    fn snapshot(&mut self, volume: &str, name: &str, generation: u64) -> Result<u32, Refusal> {
+        self.ready()?;
+        if !valid_volume(name) {
+            return Err(Refusal::BadVolume);
+        }
+        let v = self.volume(volume).ok_or(Refusal::NoSuchVolume)?;
+        if v.kind != Kind::Volume {
+            return Err(Refusal::ReadOnly);
+        }
+        if let Some(e) = self.volume(name) {
+            return if e.kind == Kind::Snapshot && e.origin == v.id { Ok(e.id) } else { Err(Refusal::NameTaken) };
+        }
+        /* The writer that paused for it: one that did not could have a write
+           on its way into a chunk the snapshot shares from now on */
+        if v.writer.as_ref().map_or(0, |w| w.generation) != generation {
+            return Err(Refusal::NotTheWriter);
+        }
+        let (origin, size_mib, host, map) = (v.id, v.size_mib, v.host.clone(), v.map.clone());
+        self.share(origin, name, size_mib, &host, map, Kind::Snapshot)
+    }
+
+    /// Volume `name` made an image (N10): read-only for good. Its copy-ups
+    /// pending given up -- no writer finishes one of an image's.
+    fn freeze(&mut self, name: &str) -> Result<u32, Refusal> {
+        self.ready()?;
+        let at = self.volume_at(name).ok_or(Refusal::NoSuchVolume)?;
+        let v = self.volumes.get(at).ok_or(Refusal::NoSuchVolume)?;
+        match v.kind {
+            Kind::Image => return Ok(v.id),
+            Kind::Snapshot => return Err(Refusal::ReadOnly),
+            Kind::Volume => {}
+        }
+        if v.writer.is_some() || !v.readers.is_empty() {
+            return Err(Refusal::Attached);
+        }
+        let id = v.id;
+        self.give_up_copies(id);
+        if let Some(v) = self.volumes.get_mut(at) {
+            v.kind = Kind::Image;
+        }
+        Ok(id)
+    }
+
+    /// Volume `name`, `host`'s own, a clone of image or snapshot `from`
+    /// (N10). Made again of the same origin, answered as it is.
+    fn clone_of(&mut self, from: &str, name: &str, host: &str) -> Result<u32, Refusal> {
+        self.ready()?;
+        if !valid_volume(name) {
+            return Err(Refusal::BadVolume);
+        }
+        self.member_host(host)?;
+        let v = self.volume(from).ok_or(Refusal::NoSuchVolume)?;
+        if v.kind == Kind::Volume {
+            return Err(Refusal::NotFrozen);
+        }
+        if let Some(e) = self.volume(name) {
+            return if e.kind == Kind::Volume && e.origin == v.id { Ok(e.id) } else { Err(Refusal::NameTaken) };
+        }
+        let (origin, size_mib, map) = (v.id, v.size_mib, v.map.clone());
+        self.share(origin, name, size_mib, host, map, Kind::Volume)
+    }
+
+    /// A volume `name` of kind `kind` made of `origin`'s, its map `map` --
+    /// every chunk of it counted once more -- and no room reserved: thin.
+    fn share(&mut self, origin: u32, name: &str, size_mib: u64, host: &str, map: Pieces<u32>, kind: Kind)
+        -> Result<u32, Refusal> {
+        if self.volumes.len() >= VOLUMES_MAX {
+            return Err(Refusal::TooMany);
+        }
+        /* A map names a chunk once at most, and a copy-up's new chunk is
+           named by none: no count passes the volumes there can be */
+        for &c in map.iter() {
+            if let Some(ch) = self.chunks.get_mut(c as usize) {
+                ch.count += 1;
+            }
+        }
+        let id = self.next_volume;
+        self.next_volume += 1;
+        self.volumes.push(Volume {
+            id,
+            name: String::from(name),
+            size_mib,
+            kind,
+            origin,
+            host: String::from(host),
+            generation: 0,
+            writer: None,
+            readers: Vec::new(),
+            map,
+        });
+        Ok(id)
+    }
+
+    /// A copy-up's first step (N10): chunk `place` of volume `name`'s map,
+    /// shared, given a new chunk in its set, pending -- its room taken on the
+    /// set's cs's, which copy it there locally (rule 7). Asked again, the
+    /// pending one; of a chunk shared no longer, the chunk itself.
+    fn copy_up(&mut self, name: &str, place: u32, generation: u64) -> Result<(u32, u32), Refusal> {
+        let (id, from) = self.writers_place(name, place, generation)?;
+        if let Some(&(to, _)) = self.copying.get(&(id, place)) {
+            return Ok((to, self.incarnation_of(to)));
+        }
+        let ch = *self.chunks.get(from as usize).ok_or(Refusal::NoSuchVolume)?;
+        if ch.count <= 1 {
+            return Ok((from, ch.incarnation));
+        }
+        if self.copying.len() >= COPYING_MAX || self.live_chunks() >= CHUNKS_MAX as u64 {
+            return Err(Refusal::TooMany);
+        }
+        /* Thin: the room is taken now, where there is any -- a slot on each
+           of the set's cs's, the room kept to rebuild a host included */
+        let s = self.sets.get(ch.set as usize).ok_or(Refusal::NoSuchSet)?;
+        let (cs, joiner) = State::holders(s);
+        if cs.iter().chain(joiner.iter()).any(|&c| self.cs.get(c as usize).map_or(true, |c| c.free() == 0)) {
+            return Err(Refusal::NoRoom);
+        }
+        let to = self.new_chunk(ch.set);
+        self.copying.insert((id, place), (to, from));
+        Ok((to, self.incarnation_of(to)))
+    }
+
+    /// A copy-up's second step: the map names pending chunk `chunk` at
+    /// `place`, the old one counted down. Done where it names it already.
+    fn copy_done(&mut self, name: &str, place: u32, generation: u64, chunk: u32) -> Result<(u32, u32), Refusal> {
+        let (id, from) = self.writers_place(name, place, generation)?;
+        if from == chunk {
+            return Ok((chunk, self.incarnation_of(chunk)));
+        }
+        match self.copying.get(&(id, place)) {
+            Some(&(to, was)) if to == chunk && was == from => {}
+            _ => return Err(Refusal::Stale),
+        }
+        self.copying.remove(&(id, place));
+        let at = self.volume_at(name).ok_or(Refusal::NoSuchVolume)?;
+        if let Some(c) = self.volumes.get_mut(at).and_then(|v| v.map.get_mut(place as usize)) {
+            *c = chunk;
+        }
+        self.release_chunk(from);
+        Ok((chunk, self.incarnation_of(chunk)))
+    }
+
+    /// Volume `name`'s number and the chunk its map names at `place`, as its
+    /// writer at `generation` asks of it: a volume's, attached for writing
+    /// at that generation.
+    fn writers_place(&self, name: &str, place: u32, generation: u64) -> Result<(u32, u32), Refusal> {
+        self.ready()?;
+        let v = self.volume(name).ok_or(Refusal::NoSuchVolume)?;
+        if v.kind != Kind::Volume {
+            return Err(Refusal::ReadOnly);
+        }
+        if generation == 0 || v.writer.as_ref().map(|w| w.generation) != Some(generation) {
+            return Err(Refusal::NotTheWriter);
+        }
+        let from = *v.map.get(place as usize).ok_or(Refusal::BadVolume)?;
+        Ok((v.id, from))
+    }
+
+    fn incarnation_of(&self, chunk: u32) -> u32 {
+        self.chunks.get(chunk as usize).map_or(0, |c| c.incarnation)
+    }
+
+    /// Volume `id`'s copy-ups pending given up: their new chunks freed.
+    fn give_up_copies(&mut self, id: u32) {
+        let gone: Vec<u32> = self.copying.range((id, 0)..=(id, u32::MAX)).map(|(_, &(to, _))| to).collect();
+        self.copying.retain(|&(v, _), _| v != id);
+        for to in gone {
+            self.release_chunk(to);
+        }
     }
 
     fn attach(&mut self, name: &str, host: &str, writable: bool, force: bool, token: u64) -> Result<u64, Refusal> {
