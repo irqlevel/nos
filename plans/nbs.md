@@ -731,8 +731,12 @@ each new gate.
     elsewhere, a volume moved between hosts, a forced start fencing the old
     guest, a host killed under a write.
 - **N9, repair.** A host or a device lost, epochs, a rebuild under writes, a
-  host back; a scrub comparing replicas by checksum. The design, as decided
-  before it is built:
+  host back; a scrub comparing replicas by checksum. **Done** in six steps,
+  N9a-N9f (2026-11-08..09): the metadata of repair, the copy, the leader's
+  controller, all of it under the cluster target's crashes and writes, the
+  scrub -- which says what differs, a person taking a member down -- and
+  nbs-test end to end on four hosts. The design, as decided before it is
+  built:
   - **A set and its joiner.** A set keeps its three members, each Active or
     Down -- the version a member went down at kept with it -- and at most
     one *joiner*: a cs being copied onto, written and not read, which takes
@@ -1123,6 +1127,49 @@ each new gate.
     - **Not yet**: an nbs-test phase with rot -- a sector spoiled on one
       host's device while it is off, found, and copied again by `nbs replica
       bad` -- goes with N9f.
+  - **N9f, nbs-test end to end** (2026-11-09):
+    - **A short `out_after`**: every host's nbs-mds is loaded with
+      `out_after=10`, the least it takes. With three hosts nothing can take
+      a lost host's places -- a set's three are on three hosts -- so a host
+      gone past it comes back into its own places as before; its cs is out
+      meanwhile, and the repair phase now waits for it down and then out.
+    - **A host back copies only what it missed**: the repair phase writes
+      both chunks of its volume before c goes, and one of them while c is
+      gone. Between, the sets move on (b's cs taken away and back): a chunk
+      written at the version a member was last active at may be one it
+      missed -- a write on its way as it went -- and is pulled whole, as the
+      copy's rule has it (found by the first run, which lost c at the
+      version both chunks were written at: both pulled); one written before
+      is one it held through, held to its source's by sums. nbs-cs's "set S
+      joined" line now says what the join's copy did
+      (`copy::Stats`: chunks copied, those found as the source's, bytes
+      pulled, granules pulled again); over c's joins, read through `dmesg`
+      -- klog's lines do not reach the serial console once the shell runs
+      -- the bytes pulled are the chunk written meanwhile, whole, and the
+      other chunk is found as its source's.
+    - **A host of four lost for good**: a fourth host, d, boots late, is
+      invited into the registry and added to the NBS cluster, and its cs
+      takes its device in. A volume made before it, on a, b and c, is
+      written; one of the three, not the leader, is killed for good: its cs
+      down at 5 s, out at 10, and d joins every set it was in, in its place
+      -- every chunk back at three, none being copied, the volume read off
+      d's own replica. The lost host is removed: three members again.
+    - **Rot, found and copied again** (N9e's deferred phase): a chunk written
+      and closed, its bytes found in each of its three hosts' pool images
+      (by an mmap search: 64 KiB of a byte no other volume writes), and a
+      sector of them spoiled on one host -- running -- through QEMU's QMP
+      (`human-monitor-command`: `qemu-io more0 "write -P ..."`), under its
+      cs with no cache between. Spoiled while the host was off, it would be
+      mended by its member back's copy before any scrub looked: a member
+      back holds every chunk to a source's by sums. The leader's scrub says
+      it in `nbs status`, with the command; the test runs it (`nbs replica
+      bad`); the member joins its own place again and its copy pulls what
+      differs; the chunk reads back off that host's replica as written,
+      the image's sector as it was, and the finding is shown as history.
+    - The later phases run on the hosts alive; the last scrub check holds
+      the leader to no finding of now -- the rot's is history.
+    - **Done**: nbs-test 189 of 189 on arm64 (HVF) and x86-64 (TCG), and on
+      arm64's `UBSAN=1 RUSTUB=1` build.
 - **N10.** Snapshots, images and clones.
 - **N11, numbers.** On the hardware, and what they ask for: pages that move
   instead of copies (a message's pages lent to a `DiskQueue`), chain

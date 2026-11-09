@@ -342,7 +342,7 @@ impl Server {
             self.joins_seen = true;
             for v in &views {
                 klog!(0, "nbs-cs: the join of set {} given up: the cs started again", v.set);
-                self.end(v.set, v.since, false);
+                self.end(v.set, v.since, false, None);
             }
             return;
         }
@@ -388,26 +388,31 @@ impl Server {
         if now < self.end_at {
             return;
         }
-        let ended: Vec<(u32, u32, bool)> = self.copies.iter().filter_map(|c| match c.state() {
-            copy::State::Done => Some((c.set(), c.since(), true)),
-            copy::State::Failed(_) => Some((c.set(), c.since(), false)),
+        let ended: Vec<(u32, u32, bool, copy::Stats)> = self.copies.iter().filter_map(|c| match c.state() {
+            copy::State::Done => Some((c.set(), c.since(), true, c.stats)),
+            copy::State::Failed(_) => Some((c.set(), c.since(), false, c.stats)),
             _ => None,
         }).collect();
-        for (set, since, done) in ended {
-            self.end(set, since, done);
+        for (set, since, done, stats) in ended {
+            self.end(set, since, done, Some(stats));
         }
     }
 
     /// Join `set` begun at `since` ended -- `done`, the cs taking its place,
     /// or given up -- as the mds proposes it: its copy and its marks dropped
     /// once that is applied, or once it is not the join it was; asked again
-    /// in a moment where the mds could not.
-    fn end(&mut self, set: u32, since: u32, done: bool) {
+    /// in a moment where the mds could not. A join done says what its copy
+    /// did: a member back pulls whole only what it may have missed (N9f).
+    fn end(&mut self, set: u32, since: u32, done: bool, stats: Option<copy::Stats>) {
         let question = if done { Question::JoinDone { set, since } } else { Question::GiveUp { set, since } };
         match self.link.ask(question) {
             Some(Told::Verified) => {
-                if done {
-                    klog!(0, "nbs-cs: set {} joined: this cs is its member now", set);
+                match (done, stats) {
+                    (true, Some(s)) => klog!(0, "nbs-cs: set {} joined: this cs is its member now -- {} chunks copied, \
+                                                {} of them found as the source's, {} bytes pulled, {} granules \
+                                                pulled again", set, s.chunks, s.kept, s.bytes, s.again),
+                    (true, None) => klog!(0, "nbs-cs: set {} joined: this cs is its member now", set),
+                    (false, _) => {}
                 }
             }
             Some(Told::Refused(Refusal::NotTheJoiner)) => klog!(1, "nbs-cs: the join of set {} was over", set),

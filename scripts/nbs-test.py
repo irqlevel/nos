@@ -108,6 +108,16 @@ COMPACT = 4096
 # The leader's scrub's pace here (N9e): a chunk a second, so that it looks at
 # every chunk of the test's volumes while the test runs.
 SCRUB_S = 1
+# How long the leader takes a silent cs for out, its places for others' to
+# take (N9f): the least nbs-mds takes, so that a host lost for good is
+# replaced while the test runs. With three hosts nothing can take a place
+# -- a set's three are on three hosts -- and a host back comes back into its
+# own.
+OUT_S = 10
+# A fourth host, booted late (N9f): one of four lost for good, its places
+# are d's.
+LATE = "d"
+ALL = HOSTS + [LATE]
 CHUNK_MIB = 4
 
 
@@ -153,7 +163,8 @@ def rootfs(tmp, arch, name, cluster):
         f.write('# nbs-test.py\nname = "%s"\ncluster = "%s"\npeers = []\n' % (name, cluster))
     with open(os.path.join(rootdir, "etc", "rc"), "w") as f:
         f.write("# nbs-test.py\ninsmod /ipcnet.ko\nipcnet start\ninsmod /cluster.ko\n"
-                "insmod /nbs-mds.ko compact=%d scrub=%d\ninsmod /nbs-cs.ko\n" % (COMPACT, SCRUB_S))
+                "insmod /nbs-mds.ko compact=%d scrub=%d out_after=%d\ninsmod /nbs-cs.ko\n"
+                % (COMPACT, SCRUB_S, OUT_S))
     image = os.path.join(tmp, "root-%s.img" % name)
     subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, "64", rootdir, "1024"], cwd=ROOT, check=True,
                    stdout=subprocess.DEVNULL)
@@ -366,23 +377,29 @@ def main():
     tmp = tempfile.mkdtemp(prefix="nos-nbs-")
     print("nbs-test: %s, %s, scratch in %s" % (args.arch, accel, tmp), flush=True)
     ip = hubmod.Hub.ip
-    images = [rootfs(tmp, args.arch, h, os.urandom(16).hex()) for h in HOSTS]
-    guids = {h: [uuid.uuid4() for _ in POOL_PARTS] for h in HOSTS}
+    images = [rootfs(tmp, args.arch, h, os.urandom(16).hex()) for h in ALL]
+    guids = {h: [uuid.uuid4() for _ in POOL_PARTS] for h in ALL}
     # c's third partition a copy of a's first, as if a's disk were moved to c
     guids["c"][2] = guids["a"][0]
-    ids = {h: ["part:%s" % g for g in guids[h]] for h in HOSTS}
-    pools = [pool(tmp, h, guids[h]) for h in HOSTS]
+    ids = {h: ["part:%s" % g for g in guids[h]] for h in ALL}
+    pools = [pool(tmp, h, guids[h]) for h in ALL]
     # a's second partition with a filesystem's magic on it: refused as a
     # device until wiped
     scribble(pools[0], 1)
     n = len(HOSTS)
-    hub = hubmod.Hub(n, HUB_BASE, shell_port=SHELL_PORT).start()
-    procs, logs = [None] * n, []
+    hub = hubmod.Hub(len(ALL), HUB_BASE, shell_port=SHELL_PORT).start()
+    procs, logs = [None] * len(ALL), []
+
+    def qmp(i):
+        return os.path.join(tmp, "qmp-%s.sock" % ALL[i])
 
     def boot(i):
-        log = os.path.join(tmp, "serial-%s-%d.log" % (HOSTS[i], len(logs)))
+        log = os.path.join(tmp, "serial-%s-%d.log" % (ALL[i], len(logs)))
         logs.append(log)
-        procs[i] = subprocess.Popen(ipct.qemu(args.arch, accel, images[i], log, hub, i, args.iso, disks=[pools[i]]),
+        if os.path.exists(qmp(i)):
+            os.remove(qmp(i))
+        procs[i] = subprocess.Popen(ipct.qemu(args.arch, accel, images[i], log, hub, i, args.iso, disks=[pools[i]],
+                                              monitor=qmp(i)),
                                     cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return log
 
@@ -713,12 +730,26 @@ def main():
         out = a.run("nbs io write rep 0 65536 0x31")
         need("written on a, to its three replicas", "65536 bytes of 0x31 written" in out and
              "to every replica in" in out, out)
+        out = a.run("nbs io write rep %d 65536 0x33" % (CHUNK_MIB << 20))
+        need("and its second chunk", "65536 bytes of 0x33 written" in out, out)
+        # the sets moved on past those writes -- b's cs taken away and back --
+        # so that c, lost next, was last active at a version after them: a
+        # chunk written at the version a member was last active at may be one
+        # it missed, a write on its way as it went, and is pulled whole; one
+        # written before is one it held through, held to its source's by sums
+        b.run("rmmod nbs-cs")
+        need("b's cs gone: the leader's controller has it down",
+             ipct.wait_for(lambda: sum((health(a) or (0,) * 7)[5:]) == 1, 90, 2), a.run("nbs status"))
+        b.run("insmod /nbs-cs.ko")
         # c's cs, unloaded a while just now, may be joining again yet
         check("every chunk at three replicas", ipct.wait_for(lambda: whole(a), 240, 3), a.run("nbs status"))
         kill(2)
         others = [sh[0], sh[1]]
         check("c gone: the leader's controller has its cs down",
-              ipct.wait_for(lambda: any((health(x) or (0,) * 7)[5] == 1 for x in others), 90, 2),
+              ipct.wait_for(lambda: any(sum((health(x) or (0,) * 7)[5:]) == 1 for x in others), 90, 2),
+              [x.run("nbs status") for x in others])
+        check("and out, %d s on (out_after=): its places for others' to take -- none can, a set's three on three "
+              "hosts" % OUT_S, ipct.wait_for(lambda: any((health(x) or (0,) * 7)[6] == 1 for x in others), 60, 2),
               [x.run("nbs status") for x in others])
         out = a.run("nbs io write rep 65536 65536 0x32")
         check("written past c, to a's and b's replicas", "65536 bytes of 0x32 written" in out, out)
@@ -734,6 +765,16 @@ def main():
         out = c.run("nbs io read rep 0 131072")
         check("read on c, from its own replica: what was written while it was gone, which its join's copy took",
               "131072 bytes at 0 of rep, from c: 0x31x65536 0x32x65536" in out, out)
+        out = c.run("nbs io read rep %d 65536" % (CHUNK_MIB << 20))
+        check("and its second chunk, not written meanwhile, as it was",
+              ("65536 bytes at %d of rep, from c: 0x33x65536" % (CHUNK_MIB << 20)) in out, out)
+        # what c's copies did, each join's end in its log
+        joined = re.findall(r"set \d+ joined: this cs is its member now -- (\d+) chunks copied, (\d+) of them found "
+                            r"as the source's, (\d+) bytes pulled", c.run("dmesg 5000 joined:"))
+        copied, kept, pulled = (sum(int(j[k]) for j in joined) for k in range(3))
+        check("c's copies took only what it missed: the chunk written meanwhile pulled whole, the other found as "
+              "its source's (%d chunks, %d found, %d bytes pulled, by %d joins)" % (copied, kept, pulled, len(joined)),
+              copied == 2 and kept == 1 and pulled == CHUNK_MIB << 20, joined)
         out = a.run("nbs volume delete rep")
         check("rep deleted", "deleted" in out, out)
 
@@ -783,7 +824,7 @@ def main():
         old = old[0]
         sh[fi].run("rmmod nbs-mds")
         sh[fi].run("rm /nbs/mds")
-        out = sh[fi].run("insmod /nbs-mds.ko compact=%d scrub=%d" % (COMPACT, SCRUB_S))
+        out = sh[fi].run("insmod /nbs-mds.ko compact=%d scrub=%d out_after=%d" % (COMPACT, SCRUB_S, OUT_S))
         out = sh[fi].run("nbs")
         need("%s's mds, its folder gone, is in no NBS cluster" % lost, "in no NBS cluster" in out, out)
         check("the leader says %s's mds has no member %d" % (lost, old),
@@ -803,21 +844,131 @@ def main():
               ipct.wait_for(lambda: stored_alike(sh), 30, 1))
         check("as a snapshot: %s's new log has one" % lost, compacted(sh[fi]))
 
-        # -- a member removed, and refused when added again as it was --
+        # -- a fourth host, and one of four lost for good (N9f): the leader's
+        # controller has the lost host's cs down, then out, and d joins
+        # every set it was in, in its place --
+        di = len(HOSTS)
+        need("d boots", pt.wait_log(boot(di), "boot: complete", 300) and addressed(di))
+        sh.append(ipct.Shell(hub.shell(di)))
+        d = sh[di]
+        out = a.run("cluster invite %s %s %s" % (LATE, ip(di), key_of(d)))
+        token = token_of(out)
+        need("a invites d", token is not None, out)
+        out = d.run("cluster join %s" % token)
+        need("d joins the registry", "joined as node" in out, out)
+        need("every host up to d, and d to every host",
+             ipct.wait_for(lambda: all(ipct.peer_up(x, LATE) for x in sh[:di])
+                           and all(ipct.peer_up(d, h) for h in HOSTS), 60, 1))
         name = leader_of(a)
-        gi = next(i for i in range(n) if HOSTS[i] != name)
+        need("a leader agreed on", name in HOSTS, name)
+        li = ALL.index(name)
+        out = sh[li].run("nbs host add %s" % LATE)
+        need("d added", re.search(r"d is member \d+", out) is not None, out)
+        need("four members, four voters, one leader, as every host says", ipct.wait_for(lambda: agreed(sh, 4), 60, 1))
+        out = d.run("nbs devices add %s" % ids[LATE][0])
+        need("d's device in the metadata", "in the metadata" in out, out)
+        need("d's cs takes its device in and serves", ipct.wait_for(lambda: serving(di, 1), CS_S, 1), d.run("nbscs"))
+        out = sh[li].run("nbs io write api1 0 65536 0x61")
+        need("api1 written, on a, b and c -- made before d", "65536 bytes of 0x61 written" in out, out)
+        out = sh[li].run("nbs io write api1 %d 65536 0x62" % (CHUNK_MIB << 20))
+        need("and its second chunk", "65536 bytes of 0x62 written" in out, out)
+        out = sh[li].run("nbs io close api1")
+        need("and closed", "closed on its replicas" in out, out)
+        out = sh[li].run("nbs io detach api1")
+        need("and let go", "api1 detached" in out, out)
+        check("every chunk at three replicas", ipct.wait_for(lambda: whole(sh[li]), 240, 3), sh[li].run("nbs status"))
+        xi = next(i for i in range(n) if i != li)
+        gone_for_good = HOSTS[xi]
+        kill(xi)
+        live = [i for i in range(len(ALL)) if i != xi]
+
+        def at_three(x):
+            h = health(x)
+            return h is not None and h[0] > 0 and h[1:5] == (0, 0, 0, 0) and h[5] == 0
+
+        check("%s lost for good: its cs out, %d s on" % (gone_for_good, OUT_S),
+              ipct.wait_for(lambda: (health(sh[li]) or (0,) * 7)[6] == 1, 90, 2), sh[li].run("nbs status"))
+        check("d joined every set %s was in, in its place, its copies done: every chunk at three replicas, none "
+              "being copied" % gone_for_good, ipct.wait_for(lambda: at_three(sh[li]), 300, 3),
+              [sh[i].run("nbs status") for i in live])
+        out = d.run("nbs io read api1 0 65536")
+        check("api1 read on d, from its own replica", "65536 bytes at 0 of api1, from d: 0x61x65536" in out, out)
+        out = d.run("nbs io read api1 %d 65536" % (CHUNK_MIB << 20))
+        check("and its second chunk", ("65536 bytes at %d of api1, from d: 0x62x65536" % (CHUNK_MIB << 20)) in out,
+              out)
+        out = sh[li].run("nbs host remove %s" % gone_for_good)
+        check("%s removed, for good" % gone_for_good, "removed, for good" in out, out)
+        need("three members again, d among them, as every host alive says",
+             ipct.wait_for(lambda: agreed([sh[i] for i in live], 3), 60, 1))
+
+        # -- rot (N9e): a sector of a closed chunk spoiled under a running
+        # host's cs, through QEMU's monitor -- spoiled while the host was off,
+        # its member back's copy would mend it before the scrub looked; the
+        # leader's scrub says it, and a person has the member copied again --
+        name = leader_of(d)
+        need("a leader agreed on", name in ALL, name)
+        ld = sh[ALL.index(name)]
+        rot = b"\x4e" * 65536
+        out = ld.run("nbs io write more 0 65536 0x4e")
+        need("more written, its chunk", "65536 bytes of 0x4e written" in out, out)
+        out = ld.run("nbs io close more")
+        need("and closed", "closed on its replicas" in out, out)
+        out = ld.run("nbs io detach more")
+        need("and let go", "more detached" in out, out)
+
+        def found_at(i):
+            """Where in host i's pool the chunk's bytes are, if once."""
+            import mmap
+            with open(pools[i], "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                at = data.find(rot)
+                return at if at >= 0 and data.find(rot, at + 1) < 0 else None
+
+        held = {i: found_at(i) for i in live}
+        holders = [i for i in live if held[i] is not None]
+        need("more's chunk on three hosts' pools, once on each", len(holders) == 3,
+             {ALL[i]: held[i] for i in live})
+        yi = next(i for i in holders if ALL[i] != name)
+        spoiled = held[yi] + 8192
+        ipct.hmp(qmp(yi), 'qemu-io more0 "write -P 0xb1 %d 4096"' % spoiled)
+        with open(pools[yi], "rb") as f:
+            f.seek(spoiled)
+            need("a sector of it spoiled on %s, under its cs" % ALL[yi], f.read(4096) == b"\xb1" * 4096)
+        finding = re.compile(r"nbs: scrub: chunk (\d+) of set (\d+) \(version (\d+)\): (\w+)'s copy is unlike the two "
+                             r"others' -- `nbs replica bad (\d+) (\w+)` has it copied again")
+        out = eventually(ld, "nbs status", lambda o: finding.search(o) is not None)
+        m = finding.search(out)
+        need("the leader's scrub says %s's copy unlike the two others', with the command" % ALL[yi],
+             m is not None and m.group(4) == ALL[yi] and m.group(6) == ALL[yi], out)
+        out = ld.run("nbs replica bad %s %s" % (m.group(5), ALL[yi]))
+        check("%s's cs taken down in set %s, to join its place again" % (ALL[yi], m.group(5)),
+              "taken down in set %s" % m.group(5) in out and "joins its own place again" in out, out)
+        check("its copy done: every chunk at three replicas, none being copied",
+              ipct.wait_for(lambda: at_three(ld), 240, 3), [sh[i].run("nbs status") for i in live])
+        out = sh[yi].run("nbs io read more 0 65536")
+        check("more read on %s, from its own replica, as written" % ALL[yi],
+              ("65536 bytes at 0 of more, from %s: 0x4ex65536" % ALL[yi]) in out, out)
+        with open(pools[yi], "rb") as f:
+            f.seek(held[yi])
+            check("and the sector spoiled on its pool as it was", f.read(65536) == rot)
+        out = eventually(ld, "nbs status", lambda o: "copy was unlike the two others' -- the set is at version" in o)
+        check("the finding shown as history: the set moved on", finding.search(out) is None
+              and "copy was unlike the two others' -- the set is at version" in out, out)
+
+        # -- a member removed, and refused when added again as it was --
+        name = leader_of(d)
+        gi = next(i for i in live if i < n and HOSTS[i] != name)
         gone = HOSTS[gi]
-        out = sh[HOSTS.index(name)].run("nbs host remove %s" % gone)
+        out = sh[ALL.index(name)].run("nbs host remove %s" % gone)
         need("%s removed" % gone, "removed, for good" in out, out)
-        others = [sh[i] for i in range(n) if i != gi]
+        others = [sh[i] for i in live if i != gi]
         need("two members, two voters, as the others say", ipct.wait_for(lambda: agreed(others, 2), 30, 1))
-        out = sh[HOSTS.index(name)].run("nbs host add %s" % gone)
+        out = sh[ALL.index(name)].run("nbs host add %s" % gone)
         check("%s, still its old member, refused: an incarnation removed is never taken again" % gone,
               "never taken again" in out, out)
-        out = sh[HOSTS.index(name)].run("nbs cs")
+        out = sh[ALL.index(name)].run("nbs cs")
         check("%s's chunk server kept, taking no new chunks" % gone,
               re.search(r"^\s+%s\s.*\(no member: takes no new chunks\)$" % gone, out, re.M) is not None, out)
-        out = sh[HOSTS.index(name)].run("nbs volume create late 4")
+        out = sh[ALL.index(name)].run("nbs volume create late 4")
         check("and so a volume refused: fewer than three hosts take new chunks",
               "fewer than three hosts take new chunks" in out, out)
 
@@ -825,7 +976,7 @@ def main():
         # the volumes left -- disk2, more, api1 -- were never written: more
         # written now, so that a chunk is held, on the two members of its
         # set left
-        ld = sh[HOSTS.index(name)]
+        ld = sh[ALL.index(name)]
         out = ld.run("nbs io write more 0 65536 0x6b")
         need("more written, its chunk", "65536 bytes of 0x6b written" in out, out)
         out = ld.run("nbs io close more")
@@ -838,12 +989,13 @@ def main():
                          lambda o: (lambda m: m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0)(
                              scrubbed.search(o)))
         m = scrubbed.search(out)
-        check("the leader's scrub found the chunk written alike on its members, the others held by none, none unlike",
-              m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0 and int(m.group(3)) == 0, out)
+        check("the leader's scrub found the chunk written alike on its members, the others held by none, and no "
+              "finding of now -- the rot's, shown as history, its one",
+              m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0 and finding.search(out) is None, out)
     except Stop as e:
         print("nbs-test: stopped at \"%s\": the rest stands on it" % e, flush=True)
     finally:
-        for i in range(n):
+        for i in range(len(ALL)):
             kill(i)
         hub.close()
         text = "".join(open(l, errors="replace").read() for l in logs if os.path.exists(l))
