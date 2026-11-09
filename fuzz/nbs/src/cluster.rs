@@ -60,6 +60,7 @@ use nbscs::{ChunkRef, Epoch, Identity, Store, SLOT};
 use nbsmeta::repair::{self, Seen};
 use nbsmeta::{Answer, Command, Replica, State};
 use nbswire::copy::{self, Copy};
+use nbswire::scrub::{self, Scrub};
 use nbswire::serve::{serve, Vouched};
 use nbswire::{Answer as CsAnswer, Ask, Asking, Question, Reply, Request, Said, Saying, Told};
 
@@ -74,8 +75,9 @@ const CLUSTER: [u8; 16] = [5; 16];
 const VOLUME: &str = "v";
 /// The volume: six chunks.
 const VOLUME_MIB: u64 = 24;
-/// A host's disk: room for the volume's chunks and some.
+/// A host's disk: room for the volume's chunks and some, in sectors of 4 KiB.
 const DISK_SLOTS: u64 = 12;
+const DISK_SECTOR: u64 = 4096;
 const MS: u64 = 1_000_000;
 /// How long a run lasts at most, in the network's time: well under an
 /// operation's deadline.
@@ -99,6 +101,10 @@ const JOINS_EVERY: u64 = 300 * MS;
 /// How long the end waits for every set to be back at three, in the
 /// network's time: past any copy's.
 const SETTLE_NS: u64 = 600_000 * MS;
+/// The leader's scrub's pace here (N9e): a chunk's look every four seconds
+/// of the network's time -- each reads it whole on every member it is
+/// closed on.
+const SCRUB_EVERY: u64 = 4_000 * MS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum End {
@@ -133,6 +139,21 @@ struct Host {
     joins_at: u64,
     copy_id: u64,
 }
+
+/// A chunk the target rotted (N9e): on one member, or on two -- a sector
+/// each -- when the scrub found it, and whether its members have been taken
+/// down for it, as a person would, half a minute after.
+struct Rot {
+    hosts: Vec<usize>,
+    chunk: u32,
+    set: u32,
+    found: Option<u64>,
+    taken: bool,
+}
+
+/// How long after the scrub's finding the members rotted are taken down:
+/// past the scrub's next round over the chunk, which is to say nothing again.
+const TAKE_DOWN_AFTER: u64 = 30_000 * MS;
 
 /// The driver's buffers, by tag.
 #[derive(Default)]
@@ -295,6 +316,14 @@ struct World {
     /// is -- one a run at most, a drain having no end.
     plan_at: u64,
     drained: Option<usize>,
+    /// The leader's scrub (N9e), its asks and answers on their way -- each
+    /// with its host and whether it is to the cs -- delivered by a
+    /// randomness of their own, and its request numbers.
+    scrub: Scrub,
+    scrub_q: Vec<(usize, bool, Vec<u8>)>,
+    scrub_r: Rng,
+    scrub_id: u64,
+    rotted: Vec<Rot>,
     stats: BTreeMap<&'static str, u64>,
 }
 
@@ -801,6 +830,221 @@ impl World {
         Ok(())
     }
 
+    /// The leader's scrub's turn (N9e): what it asks queued, and a few of
+    /// its asks and answers on their way delivered, by its own randomness.
+    fn scrub_turn(&mut self) -> Result<(), String> {
+        let now = self.now;
+        /* What the scrub found taken down, as a person would, a while on */
+        for k in 0..self.rotted.len() {
+            let due = self.rotted[k].found.is_some_and(|at| now >= at + TAKE_DOWN_AFTER) && !self.rotted[k].taken;
+            if !due {
+                continue;
+            }
+            self.rotted[k].taken = true;
+            let set = self.rotted[k].set;
+            for h in self.rotted[k].hosts.clone() {
+                let cs = self.hosts[h].cs;
+                let version = self.state.sets().get(set as usize).map_or(0, |x| x.version);
+                let cmd = Command::ReplicaBad { set, cs, version };
+                let answer = self.apply(cmd.clone());
+                if self.trace {
+                    eprintln!("  [{}] {:?}, as a person would: {:?}", self.step, cmd, answer);
+                }
+                if let Answer::Refused(why) = answer {
+                    return Err(format!("{:?}, of what the scrub found, refused: {:?}", cmd, why));
+                }
+            }
+            self.count("rotted copies the scrub found");
+        }
+        let mut out = Vec::new();
+        self.scrub.tick(&self.state, now, &mut self.scrub_id, &mut out);
+        self.scrub_out(out)?;
+        /* One at a time, now and then: a member's answer may wait through a
+           pause of the network's while the writer writes and closes the
+           chunk, which a look's answers taken at one instant would never
+           show */
+        for _ in 0..u64::from(self.scrub_r.chance(15)) {
+            if self.scrub_q.is_empty() {
+                break;
+            }
+            let k = self.scrub_r.below(self.scrub_q.len() as u64) as usize;
+            let (h, to_cs, bytes) = self.scrub_q.swap_remove(k);
+            if to_cs {
+                let World { hosts, state, index, scrub_q, .. } = self;
+                let host = &mut hosts[h];
+                let Some(store) = host.store.as_mut() else { continue };
+                let Some(req) = Request::decode(&bytes) else { continue };
+                let (name, applied) = (host.name, *index);
+                let mut ask = |q| Some(nbswire::mds::told(state, name, applied, &q));
+                let answer = match serve(store, &mut host.vouched, &req, &mut ask) {
+                    Ok(done) => CsAnswer { id: req.id, reply: done.reply() }.encode(),
+                    Err(why) => CsAnswer { id: req.id, reply: Reply::Refused(why) }.encode(),
+                };
+                scrub_q.push((h, false, answer));
+            } else {
+                let Some(a) = CsAnswer::decode(&bytes) else { continue };
+                let mut out = Vec::new();
+                self.scrub.answer(a.id, &a.reply, &self.state, now, &mut out);
+                self.scrub_out(out)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// What the scrub asks done: its requests queued for their hosts, a
+    /// member it found bad taken down -- only one whose copy the target
+    /// rotted -- and its lines said.
+    fn scrub_out(&mut self, out: Vec<scrub::Out>) -> Result<(), String> {
+        for o in out {
+            match o {
+                scrub::Out::Send { host, bytes } => {
+                    let Some(h) = self.hosts.iter().position(|x| x.name == host) else {
+                        return Err(format!("the scrub asked host {}, none", host));
+                    };
+                    if self.hosts[h].store.is_some() {
+                        self.scrub_q.push((h, true, bytes));
+                    }
+                }
+                scrub::Out::Found { chunk, set, version, odd } => {
+                    /* Of the set as it is: a look the set moved on under is
+                       no finding of now */
+                    let now_at = self.state.sets().get(set as usize).map(|s| s.version);
+                    if now_at != Some(version) {
+                        return Err(format!("the scrub found chunk {} of set {} at version {}, the set at {:?}", chunk, set,
+                                           version, now_at));
+                    }
+                    /* Only what the target rotted, said once: a member rotted
+                       alone the one unlike the two others, two rotted no two
+                       alike */
+                    let at = self.rotted.iter().position(|x| x.chunk == chunk && x.set == set && !x.taken);
+                    let right = at.is_some_and(|k| {
+                        let r = &self.rotted[k];
+                        r.found.is_none() && match r.hosts.as_slice() {
+                            [h] => odd.and_then(|cs| self.host_of_cs(cs)) == Some(*h),
+                            _ => odd.is_none(),
+                        }
+                    });
+                    let (Some(k), true) = (at, right) else {
+                        let copies = self.copies_of_set(set);
+                        return Err(format!("the scrub found chunk {} of set {} at version {} unlike on its members (odd \
+                                            {:?}), which the target did not rot so, or found it again -- the members' \
+                                            copies, granules unlike the first's: {}; rotted {:?}", chunk, set, version,
+                                           odd, copies,
+                                           self.rotted.iter().map(|x| (x.hosts.iter().map(|&h| self.hosts[h].name)
+                                                                       .collect::<Vec<_>>(), x.chunk, x.set, x.found))
+                                               .collect::<Vec<_>>()));
+                    };
+                    self.rotted[k].found = Some(self.now);
+                }
+                scrub::Out::Say(line) => {
+                    if self.trace {
+                        eprintln!("  [{}] {}", self.step, line);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Set `set`'s members' copies of each chunk of the volume in it, for a
+    /// finding: by member, its record and the granules unlike the first
+    /// member's.
+    fn copies_of_set(&mut self, set: u32) -> String {
+        let Some(v) = self.state.volume(VOLUME) else { return String::new() };
+        let Some(st) = self.state.sets().get(set as usize).cloned() else { return String::new() };
+        let chunks: Vec<u32> = v.map.iter().copied()
+            .filter(|&c| self.state.chunks().get(c as usize).is_some_and(|ch| ch.set == set)).collect();
+        let mut said = Vec::new();
+        for c in chunks {
+            let Some(ch) = self.state.chunks().get(c as usize) else { continue };
+            let chunk = ChunkRef { chunk: c, incarnation: ch.incarnation, epoch: Epoch { set, version: st.version } };
+            let mut first: Option<Vec<u32>> = None;
+            for i in 0..nbsmeta::REPLICAS {
+                let cs = st.cs[i];
+                let Some(h) = self.host_of_cs(cs) else { continue };
+                let got = self.hosts[h].store.as_mut().map(|x| x.scrub(chunk));
+                let line = match got {
+                    Some(Ok((open, written, sums))) => {
+                        let differ: Vec<usize> = match &first {
+                            Some(f) => (0..sums.len()).filter(|&k| f.get(k) != sums.get(k)).collect(),
+                            None => Vec::new(),
+                        };
+                        if first.is_none() {
+                            first = Some(sums);
+                        }
+                        format!("cs {} ({:?}) open {} written v{} differs at {:?}", cs, st.replicas[i], open, written,
+                                differ)
+                    }
+                    Some(Err(e)) => format!("cs {}: {:?}", cs, e),
+                    None => format!("cs {}: down", cs),
+                };
+                said.push(format!("chunk {} {}", c, line));
+            }
+        }
+        said.join("; ")
+    }
+
+    /// A sector of a chunk closed on its every member rotted on one of them
+    /// (N9e), a host up and not drained: what the scrub is to find. Whether
+    /// there was one to rot.
+    fn rot_one(&mut self, r: &mut Rng) -> bool {
+        let Some(v) = self.state.volume(VOLUME) else { return false };
+        let Some(layout) = nbscs::layout(DISK_SLOTS * SLOT) else { return false };
+        let mut can = Vec::new();
+        for &c in v.map.iter() {
+            let Some(ch) = self.state.chunks().get(c as usize) else { continue };
+            let Some(set) = self.state.sets().get(ch.set as usize) else { continue };
+            if set.joiner.is_some() || set.replicas.iter().any(|&x| x != Replica::Active) {
+                continue;
+            }
+            let hosts: Vec<usize> = set.cs.iter().filter_map(|&cs| self.host_of_cs(cs)).collect();
+            let closed = hosts.len() == nbsmeta::REPLICAS && hosts.iter().all(|&h| {
+                self.hosts[h].store.as_ref().and_then(|st| st.holding(c))
+                    .is_some_and(|x| x.incarnation == ch.incarnation && x.state == nbscs::SlotState::Written)
+            });
+            if !closed {
+                continue;
+            }
+            for &h in &hosts {
+                if Some(h) != self.drained {
+                    can.push((h, c, ch.set));
+                }
+            }
+        }
+        let Some((h, c, set)) = r.pick(&can) else { return false };
+        /* Now and then a second member of the set rotted too, elsewhere in
+           the chunk: no two alike then */
+        let mut hosts = vec![h];
+        if r.chance(25) {
+            let others: Vec<usize> = can.iter().filter(|&&(x, cc, _)| cc == c && x != h).map(|&(x, _, _)| x).collect();
+            if let Some(g) = r.pick(&others) {
+                hosts.push(g);
+            }
+        }
+        for (n, &h) in hosts.iter().enumerate() {
+            let Some(slot) = self.hosts[h].store.as_ref().and_then(|st| st.holding(c)).map(|x| x.slot) else {
+                return false;
+            };
+            /* The second in the chunk's other half: never the same sector */
+            let half = SLOT / DISK_SECTOR / 2;
+            let k = n as u64 * half + r.below(half);
+            let at = layout.data + u64::from(slot) * SLOT + k * DISK_SECTOR;
+            let bit = r.below(DISK_SECTOR * 8);
+            self.hosts[h].disk.borrow_mut().flip(at / DISK_SECTOR, bit);
+            if self.trace {
+                eprintln!("  [end] chunk {} rotted on host {} (cs {}) at {} of its slot {}", c, self.hosts[h].name,
+                          self.hosts[h].cs, k * DISK_SECTOR, slot);
+            }
+        }
+        if self.trace {
+            let copies = self.copies_of_set(set);
+            eprintln!("  [end] the set's copies now: {}", copies);
+        }
+        self.count(if hosts.len() == 1 { "chunks rotted on a member" } else { "chunks rotted on two members" });
+        self.rotted.push(Rot { hosts, chunk: c, set, found: None, taken: false });
+        true
+    }
+
     /// Whether every set of the volume's chunks has three active members,
     /// none of them on a cs drained, and no joiner.
     fn sets_whole(&self) -> bool {
@@ -855,8 +1099,13 @@ impl World {
             return Ok(());
         }
         let until = self.now + SETTLE_NS;
-        while !self.sets_whole() {
+        while !self.sets_whole() || self.rotted.iter().any(|x| !x.taken) {
             if self.now >= until {
+                if let Some(x) = self.rotted.iter().find(|x| !x.taken) {
+                    return Err(format!("chunk {} rotted on {:?}: not found by the scrub {} s after the end -- {:?}",
+                                       x.chunk, x.hosts.iter().map(|&h| self.hosts[h].name).collect::<Vec<_>>(),
+                                       SETTLE_NS / 1_000_000_000, self.scrub.stats));
+                }
                 return Err(format!("the sets not at three {} s after the end: {}", SETTLE_NS / 1_000_000_000,
                                    self.sets_said()));
             }
@@ -994,6 +1243,7 @@ impl World {
 
     fn tick(&mut self) -> Result<(), String> {
         self.control()?;
+        self.scrub_turn()?;
         for h in 0..self.hosts.len() {
             self.joins(h)?;
             self.copy_turn(h)?;
@@ -1138,6 +1388,7 @@ impl World {
             from != End::Cs(h) && to != End::Cs(h) && from != End::Copy(h) && to != End::Copy(h)
         });
         self.down = Some(h);
+        self.scrub_q.retain(|&(x, _, _)| x != h);
         self.hosts[h].down_since = Some(self.now);
         self.hosts[h].copies.clear();
         let writers: Vec<usize> = (0..self.clients.len()).filter(|&c| self.clients[c].host == h && !self.clients[c].dead)
@@ -1537,7 +1788,8 @@ fn setup(r: &mut Rng) -> Result<World, String> {
     let mut w = World { r: Rng::new(r.below(u64::MAX)), now: 0, step: 0, trace: false, state: State::new(), index: 0,
                         hosts: Vec::new(), links: BTreeMap::new(), clients: Vec::new(), blocks: Blocks::default(),
                         seq: 1, down: None, served: 0, rest: None, owed: None, plan_at: 0, drained: None,
-                        stats: BTreeMap::new() };
+                        scrub: Scrub::new(SCRUB_EVERY), scrub_q: Vec::new(), scrub_r: Rng::new(0), scrub_id: 1,
+                        rotted: Vec::new(), stats: BTreeMap::new() };
     w.apply(Command::Init { cluster: CLUSTER, name: String::from("nbs"), host: String::from(HOSTS[0]), member: 1 });
     for (k, h) in HOSTS.iter().enumerate().skip(1) {
         w.apply(Command::Add { host: h.to_string(), member: 1 + k as u64 });
@@ -1558,7 +1810,7 @@ fn setup(r: &mut Rng) -> Result<World, String> {
     for h in HOSTS {
         let cs = w.state.cs_of(h).ok_or_else(|| format!("no cs of {}", h))?;
         let identity = Identity { cluster: CLUSTER, cs: cs.id, device: cs.devices[0].id };
-        let disk = Rc::new(RefCell::new(Disk::new(4096, bytes)));
+        let disk = Rc::new(RefCell::new(Disk::new(DISK_SECTOR, bytes)));
         let mut store = Store::new();
         if let Err((_, e)) = store.format_device(Handle(disk.clone()), identity, 1 + r.below(u64::MAX - 1)) {
             return Err(format!("disk of {} not formatted: {:?}", h, e));
@@ -1573,6 +1825,9 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     let mut r = Rng::new(mix(seed, 0x636c_7573));
     let mut w = setup(&mut r)?;
     w.trace = trace;
+    /* The scrub's randomness of its own, so that the run goes as it would
+       without it */
+    w.scrub_r = Rng::new(mix(seed, 0x7363_7275));
     let first = w.r.below(HOSTS.len() as u64) as usize;
     w.writer(first)?;
     let mut back_at = 0u64;
@@ -1755,6 +2010,14 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         match phase {
             Phase::Detached => {
                 w.settle(lost).map_err(|e| format!("the end: {}", e))?;
+                /* Every set whole, no copy to come: a sector of a closed chunk
+                   rotted on one member, now and then (N9e) -- the scrub to
+                   find it, the member taken down as a person would, its join
+                   back to copy it again. Rotted before, a copy from it could
+                   make two members alike in rot, which no look can tell */
+                if lost.is_none() && ends.chance(40) && w.rot_one(&mut ends) {
+                    w.settle(lost).map_err(|e| format!("the end: {}", e))?;
+                }
                 let generation = w.clients[c].s.generation();
                 w.same(generation, "the end, detached")?;
                 if std::env::var_os("NBS_CLUSTER_STATS").is_some() {

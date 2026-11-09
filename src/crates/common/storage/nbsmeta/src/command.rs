@@ -77,6 +77,14 @@ pub enum Command {
     Joined { set: u32, cs: u32, since: u32 },
     /// The join of set `set` by cs `cs` that raised it to `since` given up.
     Unjoin { set: u32, cs: u32, since: u32 },
+    /// A person's: member `cs` of set `set` taken down at the set's
+    /// `version` as its copy is found bad -- the leader's scrub said it unlike
+    /// the set's two others (N9e). Down, as a member taken out is, for the
+    /// controller to have it join its own place again: its copy holds every
+    /// chunk to a source's by sums. Never the set's last active member, a
+    /// member down already, nor a set with a joiner; refused as stale once
+    /// the set has moved on.
+    ReplicaBad { set: u32, cs: u32, version: u32 },
 }
 
 const INIT: u8 = 1;
@@ -97,6 +105,7 @@ const CS_OUT: u8 = 15;
 const JOIN: u8 = 16;
 const JOINED: u8 = 17;
 const UNJOIN: u8 = 18;
+const REPLICA_BAD: u8 = 19;
 
 const WRITABLE: u8 = 1;
 const FORCE: u8 = 2;
@@ -204,6 +213,12 @@ impl Command {
                 w.u32(*cs);
                 w.u32(*since);
             }
+            Command::ReplicaBad { set, cs, version } => {
+                w.u8(REPLICA_BAD);
+                w.u32(*set);
+                w.u32(*cs);
+                w.u32(*version);
+            }
         }
         w.buf
     }
@@ -290,6 +305,10 @@ impl Command {
             UNJOIN => {
                 let (set, cs) = (r.u32()?, r.u32()?);
                 Command::Unjoin { set, cs, since: r.u32()? }
+            }
+            REPLICA_BAD => {
+                let (set, cs) = (r.u32()?, r.u32()?);
+                Command::ReplicaBad { set, cs, version: r.u32()? }
             }
             _ => return None,
         };
@@ -383,6 +402,9 @@ pub enum Refusal {
     /// The member in that place is active and stays: not down, nor its cs
     /// out or drained.
     InPlace,
+    /// The member is down already: the controller has it join its place
+    /// again.
+    AlreadyDown,
 }
 
 impl Refusal {
@@ -429,6 +451,7 @@ impl Refusal {
             Refusal::AlreadyMember => "the chunk server is a member of the set already",
             Refusal::NotUp => "the chunk server is not up",
             Refusal::InPlace => "the member in that place is active and stays",
+            Refusal::AlreadyDown => "the member is down already: it joins its place again",
         }
     }
 
@@ -473,6 +496,7 @@ impl Refusal {
             Refusal::AlreadyMember => 37,
             Refusal::NotUp => 38,
             Refusal::InPlace => 39,
+            Refusal::AlreadyDown => 40,
         }
     }
 
@@ -517,6 +541,7 @@ impl Refusal {
             37 => Refusal::AlreadyMember,
             38 => Refusal::NotUp,
             39 => Refusal::InPlace,
+            40 => Refusal::AlreadyDown,
             _ => return None,
         })
     }

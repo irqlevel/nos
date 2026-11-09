@@ -93,29 +93,6 @@ impl Disk {
         }
     }
 
-    fn sector_now(&self, n: u64) -> Vec<u8> {
-        let s = self.sector;
-        let mut v = self.durable.get(&n).cloned().unwrap_or_else(|| vec![0; s as usize]);
-        for op in &self.pending {
-            match op {
-                Op::Write { at, data } => {
-                    let first = at / s;
-                    let count = data.len() as u64 / s;
-                    if n >= first && n < first + count {
-                        let k = (n - first) as usize * s as usize;
-                        v.copy_from_slice(&data[k..k + s as usize]);
-                    }
-                }
-                Op::Zero { at, len } => {
-                    if n >= at / s && n < (at + len) / s {
-                        v.fill(0);
-                    }
-                }
-            }
-        }
-        v
-    }
-
     /// The power cut: each write the cache held kept whole, lost, or torn
     /// -- some of its sectors kept -- and now and then, in the cs's own
     /// pages, one sector torn inside: no device should, some do, and a
@@ -254,8 +231,29 @@ impl Device for Handle {
         let s = d.sector;
         assert!(offset % s == 0 && buf.len() as u64 % s == 0 && offset + buf.len() as u64 <= d.bytes,
                 "a read the device cannot do: {} bytes at {}", buf.len(), offset);
-        for (k, out) in buf.chunks_mut(s as usize).enumerate() {
-            out.copy_from_slice(&d.sector_now(offset / s + k as u64));
+        /* What is durable, then what the cache holds over it in its order:
+           each sector as a later write left it, the cache gone through once
+           a read and not once a sector (a scrub reads whole chunks) */
+        let (first, end) = (offset / s, (offset + buf.len() as u64) / s);
+        buf.fill(0);
+        for (&n, v) in d.durable.range(first..end) {
+            let k = ((n - first) * s) as usize;
+            buf[k..k + s as usize].copy_from_slice(v);
+        }
+        for op in &d.pending {
+            let (from, to) = match op {
+                Op::Write { at, data } => (at / s, at / s + data.len() as u64 / s),
+                Op::Zero { at, len } => (at / s, (at + len) / s),
+            };
+            let (a, b) = (from.max(first), to.min(end));
+            if a >= b {
+                continue;
+            }
+            let into = &mut buf[((a - first) * s) as usize..((b - first) * s) as usize];
+            match op {
+                Op::Write { data, .. } => into.copy_from_slice(&data[((a - from) * s) as usize..((b - from) * s) as usize]),
+                Op::Zero { .. } => into.fill(0),
+            }
         }
         Ok(())
     }

@@ -170,6 +170,21 @@ pub fn device_add(state: &ModState, word: &str, wipe: bool) -> Result<(String, u
     Ok((ident, slots, id, wiped))
 }
 
+/// Host `host`'s cs taken down in set `set` as a person finds its copy bad
+/// -- the scrub's finding (N9e) -- at the set's version now: the set's version
+/// after.
+pub fn replica_bad(state: &ModState, set: u32, host: &str) -> Result<u32, Failure> {
+    let v = caught_up(state)?;
+    let cs = v.state.cs_of(host).map(|c| c.id)
+        .ok_or_else(|| Failure::Other(alloc::format!("{} has no chunk server", host)))?;
+    let version = v.state.sets().get(set as usize).map(|s| s.version)
+        .ok_or_else(|| Failure::Other(alloc::format!("there is no set {}", set)))?;
+    match ask(state, &Command::ReplicaBad { set, cs, version })? {
+        Answer::Set { version } => Ok(version),
+        other => Err(Failure::Other(alloc::format!("answered {:?}", other))),
+    }
+}
+
 /// Device `ident` of this host's given no new chunks.
 pub fn device_drain(state: &ModState, ident: &str) -> Result<u32, Failure> {
     let v = caught_up(state)?;

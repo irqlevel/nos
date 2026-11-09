@@ -49,6 +49,7 @@ use kcore::klog;
 use kcore::time::boot_time_ns;
 use nbsmeta::repair::{self, Seen};
 use nbsmeta::{Answer, Command, Refusal, Replica, State};
+use nbswire::scrub::{self, Scrub};
 use nbswire::{Answered, Ask, Asking, Op, Query, Question, Request, Said, Saying, Told};
 use raft::{Role, Rsm};
 use raftmember::{App, Core, Locked, Outcome, Pending};
@@ -89,6 +90,18 @@ pub type View = raftmember::View<Mds>;
 /// metadata has for them: the host, that incarnation, and when it was last
 /// said in the log. Kept by the member, read by the shell.
 pub type Lost = Arc<Locked<BTreeMap<String, (u64, u64)>>>;
+
+/// What the leader's scrub has done and found (N9e), kept by the member for
+/// the shell: its counts, and the newest of its findings -- chunk, set, the
+/// set's version, and the member unlike the two others where two agree.
+#[derive(Default)]
+pub struct Scrubs {
+    pub stats: scrub::Stats,
+    pub found: alloc::collections::VecDeque<(u32, u32, u32, Option<u32>)>,
+}
+pub type Scrubbed = Arc<Locked<Scrubs>>;
+/// How many of the scrub's findings the shell is shown.
+const FOUND_KEPT: usize = 16;
 
 /// An offer of the cluster, as it goes between hosts.
 pub struct Offer {
@@ -177,6 +190,11 @@ pub struct Mds {
     refused: bool,
     after: repair::After,
     repairing: u32,
+    /// The leader's scrub (N9e) while this member leads, its pace
+    /// (`scrub=`, none where 0), and what it found, for the shell.
+    scrub: Option<Scrub>,
+    scrub_every_ns: u64,
+    scrubbed: Scrubbed,
 }
 
 /// A look at a cs, waiting for its answer.
@@ -206,14 +224,16 @@ pub enum Kind {
 }
 
 /// The member over its log in `dir`, its mailbox named.
-pub fn new(rsm: Rsm<raftmember::Log, State>, me: files::Member, lost: Lost, dir: &str, out_after_ms: u64)
-    -> Result<Member, String> {
+#[allow(clippy::too_many_arguments)]
+pub fn new(rsm: Rsm<raftmember::Log, State>, me: files::Member, lost: Lost, dir: &str, out_after_ms: u64,
+           scrub_ms: u64, scrubbed: Scrubbed) -> Result<Member, String> {
     let id = me.id;
     raftmember::Member::new(Mds { me, lost, dir: String::from(dir), proposed: 0, probes: Vec::new(),
                                   verdicts: BTreeMap::new(), next_probe: 1, watch: BTreeMap::new(), watch_at: 0,
                                   planned: 0, planned_index: 0, plan_at: 0, refused: false,
                                   after: repair::After { down_ms: repair::DOWN_AFTER_MS, out_ms: out_after_ms },
-                                  repairing: 0 }, rsm, id)
+                                  repairing: 0, scrub: None, scrub_every_ns: scrub_ms * 1_000_000, scrubbed },
+                            rsm, id)
 }
 
 impl App for Mds {
@@ -271,7 +291,7 @@ impl App for Mds {
             TAG_NO_MEMBER => self.on_no_member(core, m),
             nbswire::TAG_QUERY => self.on_cs_query(core, m),
             nbswire::TAG_ASK => self.on_client(core, m),
-            nbswire::TAG_ANSWER => self.on_probe_answer(m),
+            nbswire::TAG_ANSWER => self.on_answer(core, m),
             TAG_BOUNCED => self.on_bounce(m),
             _ => {}
         }
@@ -366,6 +386,7 @@ impl App for Mds {
             self.watch.clear();
             self.repairing = 0;
             self.refused = false;
+            self.scrub = None;
             return;
         }
         /* A look not answered in time: the cs is silent */
@@ -386,6 +407,15 @@ impl App for Mds {
             }
         }
         self.control(core, now);
+        /* The scrub's turn, as the leader, where it has a pace (N9e) */
+        if self.scrub_every_ns > 0 {
+            let every = self.scrub_every_ns;
+            let Mds { scrub, next_probe, .. } = self;
+            let s = scrub.get_or_insert_with(|| Scrub::new(every));
+            let mut out = Vec::new();
+            s.tick(core.state(), now, next_probe, &mut out);
+            self.scrub_out(core, out);
+        }
     }
 
     /// A state whose digest is not the leader's: this member serves nothing
@@ -450,6 +480,39 @@ impl Mds {
         }
     }
 
+    /// What the scrub asks done: its requests sent from the member's
+    /// mailbox, as a look at a cs is; what it found said, and kept for the
+    /// shell with its counts.
+    fn scrub_out(&mut self, core: &Core<Mds>, out: Vec<scrub::Out>) {
+        for o in out {
+            match o {
+                scrub::Out::Send { host, bytes } => {
+                    let to = if host == self.me.host {
+                        String::from(nbswire::CS_NAME)
+                    } else {
+                        alloc::format!("{}@{}", nbswire::CS_NAME, host)
+                    };
+                    /* Not sent -- the cs not there: the look waits out its
+                       answer, and the chunk is left to a later round */
+                    let _ = core.mailbox().send_to(&to, PROBE, 0, &bytes);
+                }
+                scrub::Out::Found { chunk, set, version, odd } => {
+                    self.scrubbed.with(|x| {
+                        if x.found.len() >= FOUND_KEPT {
+                            x.found.pop_front();
+                        }
+                        x.found.push_back((chunk, set, version, odd));
+                    });
+                }
+                scrub::Out::Say(line) => klog!(0, "{}", line),
+            }
+        }
+        if let Some(s) = self.scrub.as_ref() {
+            let stats = s.stats;
+            self.scrubbed.with(|x| x.stats = stats);
+        }
+    }
+
     /// A look at cs `cs` started, unless one is under way: its `Ping`, from
     /// the member's mailbox, the answer looked for in `on_probe_answer`.
     fn probe(&mut self, core: &Core<Mds>, cs: u32) {
@@ -474,9 +537,20 @@ impl Mds {
         self.probes.push(Probe { cs, id, until: now + PROBE_NS });
     }
 
-    /// A cs's answer to the leader's look: there, and serving, or not.
-    fn on_probe_answer(&mut self, m: &Message) {
+    /// A cs's answer: to the scrub's ask (N9e), or to the leader's look.
+    fn on_answer(&mut self, core: &Core<Mds>, m: &Message) {
         let Some(a) = nbswire::Answer::decode(&m.data) else { return };
+        if let Some(s) = self.scrub.as_mut().filter(|s| s.asked(a.id)) {
+            let mut out = Vec::new();
+            s.answer(a.id, &a.reply, core.state(), boot_time_ns(), &mut out);
+            self.scrub_out(core, out);
+            return;
+        }
+        self.on_probe_answer(&a);
+    }
+
+    /// A cs's answer to the leader's look: there, and serving, or not.
+    fn on_probe_answer(&mut self, a: &nbswire::Answer<'_>) {
         let Some(at) = self.probes.iter().position(|p| p.id == a.id) else { return };
         let p = self.probes.swap_remove(at);
         let serving = matches!(a.reply, nbswire::Reply::Done);

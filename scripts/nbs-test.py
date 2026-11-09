@@ -105,6 +105,9 @@ POOL_PARTS = tuple((2048 + i * PART_SECTORS, 2048 + (i + 1) * PART_SECTORS - 1) 
 # few, so that the log is compacted during the test -- a member started
 # again reads its state back from a snapshot, and one added is sent it
 COMPACT = 4096
+# The leader's scrub's pace here (N9e): a chunk a second, so that it looks at
+# every chunk of the test's volumes while the test runs.
+SCRUB_S = 1
 CHUNK_MIB = 4
 
 
@@ -149,8 +152,8 @@ def rootfs(tmp, arch, name, cluster):
     with open(os.path.join(rootdir, "etc", "ipc", "hosts.toml"), "w") as f:
         f.write('# nbs-test.py\nname = "%s"\ncluster = "%s"\npeers = []\n' % (name, cluster))
     with open(os.path.join(rootdir, "etc", "rc"), "w") as f:
-        f.write("# nbs-test.py\ninsmod /ipcnet.ko\nipcnet start\ninsmod /cluster.ko\ninsmod /nbs-mds.ko compact=%d\n"
-                "insmod /nbs-cs.ko\n" % COMPACT)
+        f.write("# nbs-test.py\ninsmod /ipcnet.ko\nipcnet start\ninsmod /cluster.ko\n"
+                "insmod /nbs-mds.ko compact=%d scrub=%d\ninsmod /nbs-cs.ko\n" % (COMPACT, SCRUB_S))
     image = os.path.join(tmp, "root-%s.img" % name)
     subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, "64", rootdir, "1024"], cwd=ROOT, check=True,
                    stdout=subprocess.DEVNULL)
@@ -780,7 +783,7 @@ def main():
         old = old[0]
         sh[fi].run("rmmod nbs-mds")
         sh[fi].run("rm /nbs/mds")
-        out = sh[fi].run("insmod /nbs-mds.ko compact=%d" % COMPACT)
+        out = sh[fi].run("insmod /nbs-mds.ko compact=%d scrub=%d" % (COMPACT, SCRUB_S))
         out = sh[fi].run("nbs")
         need("%s's mds, its folder gone, is in no NBS cluster" % lost, "in no NBS cluster" in out, out)
         check("the leader says %s's mds has no member %d" % (lost, old),
@@ -817,6 +820,26 @@ def main():
         out = sh[HOSTS.index(name)].run("nbs volume create late 4")
         check("and so a volume refused: fewer than three hosts take new chunks",
               "fewer than three hosts take new chunks" in out, out)
+
+        # -- the scrub (N9e): the leader has looked, and found nothing unlike --
+        # the volumes left -- disk2, more, api1 -- were never written: more
+        # written now, so that a chunk is held, on the two members of its
+        # set left
+        ld = sh[HOSTS.index(name)]
+        out = ld.run("nbs io write more 0 65536 0x6b")
+        need("more written, its chunk", "65536 bytes of 0x6b written" in out, out)
+        out = ld.run("nbs io close more")
+        need("and closed", "closed on its replicas" in out, out)
+        out = ld.run("nbs io detach more")
+        need("and let go", "more detached" in out, out)
+        scrubbed = re.compile(r"the scrub, a chunk every \d+ s as this host's member leads: (\d+) alike, (\d+) held by "
+                              r"none, \d+ let be, (\d+) unlike")
+        out = eventually(ld, "nbs status",
+                         lambda o: (lambda m: m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0)(
+                             scrubbed.search(o)))
+        m = scrubbed.search(out)
+        check("the leader's scrub found the chunk written alike on its members, the others held by none, none unlike",
+              m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0 and int(m.group(3)) == 0, out)
     except Stop as e:
         print("nbs-test: stopped at \"%s\": the rest stands on it" % e, flush=True)
     finally:

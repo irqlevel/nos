@@ -60,6 +60,7 @@ pub enum Done {
     Held(Vec<(u32, u32, u64)>),
     Chunks(Vec<(u32, u32, u32, u32)>),
     Sums(Vec<u32>),
+    Scrub { open: bool, written: u32, sums: Vec<u32> },
 }
 
 impl Done {
@@ -73,6 +74,7 @@ impl Done {
             Done::Held(h) => Reply::Held(h.clone()),
             Done::Chunks(c) => Reply::Chunks(c.clone()),
             Done::Sums(s) => Reply::Sums(s.clone()),
+            Done::Scrub { open, written, sums } => Reply::Scrub { open: *open, written: *written, sums: sums.clone() },
         }
     }
 }
@@ -163,6 +165,10 @@ pub fn serve<D: Device>(store: &mut Store<D>, vouched: &mut Vouched, req: &Reque
             joined(vouched, ask, chunk.epoch.set, joiner, chunk.epoch.version, index)?;
             store.sums(chunk, offset, len).map(Done::Sums).map_err(Refusal::of)
         }
+        /* The leader's scrub (N9e): sums and a record, nothing moved on and
+           no data -- answered as a ping is, unvouched */
+        Op::Scrub { chunk } => store.scrub(chunk)
+            .map(|(open, written, sums)| Done::Scrub { open, written, sums }).map_err(Refusal::of),
     }
 }
 

@@ -73,6 +73,8 @@ What is stored, on any member:
 ```
 nbs devices add <id|name> [wipe]   a device of this host's for its chunk server, by its id or its name
 nbs devices drain <id>     the device takes no new chunks
+nbs replica bad <set> <host>   <host>'s cs taken down in <set>, to join its place again and copy it anew --
+                               the member the scrub found unlike the two others
 nbs cs                     every host's chunk server: its devices, its room, what of it is reserved
 nbs volume create <name> <size> [host=<host>]   size in MiB, or with M, G or T after it; its own host this one
 nbs volume resize <name> <size>                 grown, never made smaller
@@ -315,6 +317,51 @@ task, whose mds tells it its joins (`Question::Joins`) with its devices.
 - **A chunk found open** is written by its set's joiner, as a joiner is
   written and not read, and its copy pulls the chunk; refused to its writer
   as `Failed` only where its cs is an active member.
+
+### The scrub
+
+The leader looks at every chunk in turn, a chunk every `scrub=` seconds (ten
+unless nbs-mds is given another, 0 for none), and holds its set's active
+members alike (`nbswire::scrub`, the one nbs-mds runs and the cluster target
+does):
+
+- **The look**: each active member asked for the chunk's record and the
+  CRC-32C of each of its 64 KiB granules (`Op::Scrub`) -- read as a joiner's
+  sums are, but moving no epoch on, so that a writer is refused nothing. A
+  chunk open on any member is in flight and is left for a later round, as is
+  a set that moved on between the asking and the answers.
+- **A member that holds none of it** says so, and is compared as what such
+  a chunk reads as: zeros (`nbscs::zero_sums`, a slot being zeros before a
+  chunk takes it). A member that lost a chunk its set's others hold
+  differs from them as a rotted one does. A chunk no member holds was never
+  written: nothing is read, and the next chunk is looked at a hundredth of
+  the pace on -- the pace is the reads', so that a volume mostly unwritten
+  takes a round little longer than what is written of it, its empty chunks
+  asked about no faster than that.
+- **Two looks**: two members' answers are not taken at one instant, and a
+  write and a close between them would show a difference that is none. A
+  difference is a finding only when a look two seconds on finds every
+  member's answer as the first did.
+- **What it finds it says**, in the log and in `nbs status` -- the chunk,
+  its set and version, and the member unlike the two others where two
+  agree, with the command that takes it down; a finding of a set that has
+  moved on since is shown as history -- once for the set's version, and
+  takes nothing down. A cs keeps no
+  checksum of its own data, and two members alike are no proof which one
+  holds it: a joiner that copied a source that had rotted makes two alike in
+  rot, and a scrub that took the odd one down would take the one good copy
+  down, its join back copying the rot over it (found by the cluster target,
+  N9e). A person decides: `nbs replica bad <set> <host>` takes that member
+  down (`ReplicaBad`, at the set's version now; refused for a member down
+  already, a set with a joiner and the set's last active member), and the
+  controller has it join its own place again, a member back whose copy
+  holds every chunk to a source's by sums and pulls what differs.
+
+`nbs status` on the leader counts what its scrub has done since it began
+to lead -- chunks found alike, held by none, let be (open, moved on, an
+answer late or refused, written between two looks) and unlike, those with
+a member unlike the two others among them -- and lists its sixteen newest
+findings.
 
 ## The digest
 
@@ -752,10 +799,29 @@ image's zeros out.
   set on the joiner is the source's, byte for byte, and every one the copy
   closed is still so after a power cut.
 
-  `--mutants` takes a hundred and four rules out one at a time -- forty-four
-  of the metadata's, five of them the controller's; twenty-seven of the
-  cs's, twelve of them the copy's; twelve of the wire's, its `serve`'s,
-  the mds's and the copy's; twenty-one of the client's -- each caught.
+  Its `scrub` target is the leader's scrub alone (N9e), over a set of
+  three members whose copies are the target's: writes and closes reach each
+  member on a delay of its own, the scrub's asks on another way, a member
+  holds a chunk once its first write reaches it, granules rot on one member
+  or two, or a member loses a chunk; members are taken down and joined back
+  under the looks, and the races random runs seldom make -- a write raced
+  through a look, a close held back on one member -- set up of a
+  randomness of their own. Every finding is held to the set's version now
+  and to what each member held when it answered, every rot is found, and a
+  chunk held by none takes no turn of the pace.
+
+  The leader's scrub runs in the `cluster` target too, its asks and answers in a queue
+  and a randomness of their own so that the run goes as it would without
+  them, held to finding nothing the target did not rot; at the end of some
+  runs a sector of a closed chunk rots on one member, or on two, the
+  finding is held to it, and the members taken down as a person would are
+  copied again: every replica alike.
+
+  `--mutants` takes a hundred and thirteen rules out one at a time --
+  forty-five of the metadata's, five of them the controller's; twenty-seven
+  of the cs's, twelve of them the copy's; twenty of the wire's, its `serve`'s,
+  the mds's, the copy's and the scrub's; twenty-one of the client's -- each
+  caught.
 - **`fuzz/raft`'s `nbsmeta` target**: the members' part of the state, its
   commands from pools of names and incarnations that meet and from wide ones
   that fill the cluster. There are four scenarios and six mutants.
@@ -849,8 +915,10 @@ image's zeros out.
   taken in stops the cs serving. Taking a device out, and rebuilding what was
   on it, is N9's.
 - A chunk's data has no checksum of the cs's: a sector is taken to be
-  written whole, as NVMe's atomic write unit promises. A scrub comparing the
-  replicas is N9's.
+  written whole, as NVMe's atomic write unit promises. The scrub compares the
+  replicas and says what differs; which copy is good a person decides. A
+  copy takes its source's data as it is: rot on a source the scrub has not
+  found yet goes into the joiner.
 - A device drained stays draining, and neither a device nor a cs is ever
   removed. A placement never moves: moving chunks is N9's.
 - Bounds, each refused past:

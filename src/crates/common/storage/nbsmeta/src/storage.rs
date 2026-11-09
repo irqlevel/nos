@@ -295,6 +295,9 @@ impl State {
             }
             Command::Joined { set, cs, since } => self.joined(*set, *cs, *since).map(|version| Answer::Set { version }),
             Command::Unjoin { set, cs, since } => self.unjoin(*set, *cs, *since).map(|version| Answer::Set { version }),
+            Command::ReplicaBad { set, cs, version } => {
+                self.replica_bad(*set, *cs, *version).map(|version| Answer::Set { version })
+            }
             /* The members' are lib.rs's */
             Command::Init { .. } | Command::Add { .. } | Command::Remove { .. } => Err(Refusal::Malformed),
         };
@@ -574,6 +577,52 @@ impl State {
         s.chunks == 0 && s.joiner.is_none() && s.version < u32::MAX && !(State::is_clean(s) && used.contains(&s.cs))
     }
 
+    /// Member `cs` of set `set` taken down as a person finds its copy bad
+    /// -- the scrub's finding (N9e) -- at `version`: down as a replica taken
+    /// out is, the set's version now. A set with a joiner is the copy's, a
+    /// member down already joins its place again, and the last active
+    /// member is never taken down.
+    fn replica_bad(&mut self, set: u32, cs: u32, version: u32) -> Result<u32, Refusal> {
+        let s = self.set_at(set, version)?;
+        let at = s.cs.iter().position(|&c| c == cs).ok_or(Refusal::NoSuchSet)?;
+        if s.replicas[at] == Replica::Down {
+            return Err(Refusal::AlreadyDown);
+        }
+        self.member_down(set, at)
+    }
+
+    /// Set `set` as a change planned at its `version` finds it: refused as
+    /// stale once the set has moved on, and while a join of it is under way.
+    fn set_at(&self, set: u32, version: u32) -> Result<&Set, Refusal> {
+        self.ready()?;
+        let s = self.sets.get(set as usize).ok_or(Refusal::NoSuchSet)?;
+        if s.version != version {
+            return Err(Refusal::Stale);
+        }
+        if s.joiner.is_some() {
+            return Err(Refusal::Joining);
+        }
+        Ok(s)
+    }
+
+    /// Member `at` of set `set` down -- never the set's last active member:
+    /// the version it was active until kept, and the set's raised by one,
+    /// what it is now answered.
+    fn member_down(&mut self, set: u32, at: usize) -> Result<u32, Refusal> {
+        let s = self.sets.get(set as usize).ok_or(Refusal::NoSuchSet)?;
+        if s.active() <= 1 {
+            return Err(Refusal::LastReplica);
+        }
+        let version = s.version.checked_add(1).ok_or(Refusal::TooMany)?;
+        self.unindex(set);
+        if let Some(s) = self.sets.get_mut(set as usize) {
+            s.replicas[at] = Replica::Down;
+            s.active_until[at] = s.version;
+            s.version = version;
+        }
+        Ok(version)
+    }
+
     /// Replica `cs` of set `set` taken out: its version now. The set keeps
     /// it among its three, for repair to bring back or replace (N9), and
     /// the room it holds; never the last active one.
@@ -599,17 +648,7 @@ impl State {
         if s.replicas[at] == Replica::Down {
             return Ok(s.version);
         }
-        if s.active() <= 1 {
-            return Err(Refusal::LastReplica);
-        }
-        let version = s.version.checked_add(1).ok_or(Refusal::TooMany)?;
-        self.unindex(set);
-        if let Some(s) = self.sets.get_mut(set as usize) {
-            s.replicas[at] = Replica::Down;
-            s.active_until[at] = s.version;
-            s.version = version;
-        }
-        Ok(version)
+        self.member_down(set, at)
     }
 
     /// cs `cs` down, or out (`to`): down in every set it is an active member
@@ -695,14 +734,7 @@ impl State {
     /// back -- its room its own already -- or another cs, with room for every
     /// chunk of the set, in the place of a member down, out or drained.
     fn join(&mut self, set: u32, place: u8, cs: u32, version: u32) -> Result<u32, Refusal> {
-        self.ready()?;
-        let s = self.sets.get(set as usize).ok_or(Refusal::NoSuchSet)?;
-        if s.version != version {
-            return Err(Refusal::Stale);
-        }
-        if s.joiner.is_some() {
-            return Err(Refusal::Joining);
-        }
+        let s = self.set_at(set, version)?;
         let k = usize::from(place);
         if k >= REPLICAS {
             return Err(Refusal::NoSuchSet);
