@@ -153,7 +153,11 @@ what is read next on the same host holds it.
   - its own host: where a replica of every chunk goes, and where its VM is
     to run;
   - its attach: a writer and its generation, or readers;
-  - its map: a chunk for every 4 MiB.
+  - its map: a chunk for every 4 MiB;
+  - its kind (N10): a volume, an image -- frozen read-only, to be cloned --
+    or a snapshot, a volume's map at a moment; and what it was made of: the
+    volume a snapshot was taken of, the image or snapshot a clone was made
+    of.
 - **The replica sets**: three cs's on three hosts, shared by every chunk
   placed on the same three, so that a host lost changes the few sets it is
   in and not every chunk it holds. Each member is active or down -- a down
@@ -166,6 +170,38 @@ what is read next on the same host holds it.
 - **The chunks**: the set each is in, how many maps name it, and whether it
   was written. A chunk freed goes onto a free list and is taken again
   first.
+- **The copy-ups pending** (N10): by a volume and a place in its map, the
+  new chunk a write to a shared chunk is to go to, and the old one the map
+  still names.
+
+### Snapshots, images and clones (N10)
+
+A snapshot or a clone shares the chunks of what it was made of: its map a
+copy of the other's, every chunk counted once more, and no room reserved --
+thin (decision 5). The metadata's commands, as the shell and the client are
+to drive them (N10b-N10d):
+
+- `Snapshot { volume, name, generation }` -- of a volume only, at the
+  generation of the writer that paused for it, or 0 for one with none: a
+  writer not paused could have a write on its way into a chunk the snapshot
+  shares from then on.
+- `Freeze { name }` -- a volume made an image, refused while attached; its
+  copy-ups pending given up.
+- `Clone { from, name, host }` -- of an image or a snapshot only (else
+  `NotFrozen`).
+- `CopyUp { name, place, generation }` -- the writer's, before it writes a
+  chunk others share: a new chunk in the same set, so that each of its cs's
+  copies it locally; its room taken on each, refused as `NoRoom` where one
+  has none left -- the room kept to rebuild a host may go to it. Pending, the
+  old chunk named by the map still, so that nothing can free it while the
+  cs's copy it. Asked again, it is answered the pending chunk; of a chunk
+  shared no longer, the chunk itself.
+- `CopyDone { name, place, generation, chunk }` -- the map names the new
+  chunk, the old one counted down, freed at none.
+
+A volume deleted, or an image, counts its chunks down: those a snapshot or a
+clone still names live on. A chunk's count is a u16; a map names a chunk
+once at most, and there are fewer volumes than it holds.
 
 On the host, in `/nbs/mds`:
 
@@ -817,8 +853,8 @@ image's zeros out.
   finding is held to it, and the members taken down as a person would are
   copied again: every replica alike.
 
-  `--mutants` takes a hundred and thirteen rules out one at a time --
-  forty-five of the metadata's, five of them the controller's; twenty-seven
+  `--mutants` takes a hundred and thirty-five rules out one at a time --
+  sixty-seven of the metadata's, five of them the controller's; twenty-seven
   of the cs's, twelve of them the copy's; twenty of the wire's, its `serve`'s,
   the mds's, the copy's and the scrub's; twenty-one of the client's -- each
   caught.

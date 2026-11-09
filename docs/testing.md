@@ -3087,7 +3087,7 @@ another state. And a chunk server can be wrong in a way no test that never
 cuts the power sees: a fence or an open mark not yet durable when it is
 answered, zeros a record outlived, a torn copy taken for the record.
 `fuzz/nbs` compiles `nbsmeta`, `nbscs` and `nbswire` as they are into a host
-program, every target under a few seconds. Its `meta` target -- 300 runs of
+program, every target under a few seconds. Its `meta` target -- 1000 runs of
 400 steps -- holds the metadata to a model of its own, which shares no code
 with it:
 
@@ -3103,19 +3103,34 @@ with it:
   - replicas taken out by a volume's writer; cs's going down, up and out;
     joins begun -- a member back in its own place, another in a place gone
     or drained -- ended and given up, at versions of now and of before (N9a);
+  - snapshots, freezes and clones (N10a), mostly of what they can be made
+    of; copy-ups begun by a volume's writer, mostly of a place it shares,
+    and done, mostly of a copy-up pending -- and detaches, freezes and
+    deletes now and then of a volume with copy-ups pending;
   - the leader's digests, true and false.
 - **Every answer** must be the model's, and so must everything the state
   shows: the members, the cs's with their state, devices and reserved room,
   the volumes with their writers and readers, the three cs's each chunk is
   on, of three hosts, and each set's members down, the version each was
   active until, and its joiner.
+- **A chunk's identity** (N10a): the model knows each chunk by an identity
+  of its own, shared by the maps a snapshot or a clone copied and counted by
+  them and by a copy-up pending on it. It cannot know the number the
+  metadata's free list gives a chunk: it learns it as the chunk first shows
+  -- in a map, a copy-up pending, a copy-up's answer -- and holds it from
+  then on, one number one chunk, of the incarnation it had, counted as the
+  model counts it.
 - **The placement** is the model's own, made by the plan's rules alone. A
   refusal for room is a finding when the chunks would have fitted by
   counting: `n` chunks fit on three hosts each exactly when the hosts' free
   room, each counted up to `n`, adds up to `3n`.
 - **An fsck of its own** after every step:
-  - every chunk in use counted as often as the maps name it, and a free one
-    neither counted nor named;
+  - every chunk in use counted as often as the maps name it -- and a
+    copy-up pending on it, its new chunk in the old one's set, the old one
+    where the volume's map has it -- and a free one neither counted nor
+    named;
+  - an image and a snapshot written by none, a snapshot made of a volume,
+    none made of itself;
   - every set's count of chunks the chunks in it;
   - every cs's reserved room what its sets hold, a set it joins in
     another's place among them;
@@ -3402,9 +3417,9 @@ little and now and then past a silence.
     its source's by sums now, and `Op::Touch` is gone.
 
 `--mutants` runs `fuzz/nbs/mutants.py`, which takes out one rule at a time.
-Each of its hundred and thirteen must fail the gate -- run as `nbs-fuzz gate
+Each of its hundred and thirty-five must fail the gate -- run as `nbs-fuzz gate
 --first`, stopped at the first target that fails: the gate's verdict, sooner.
-The metadata's forty-five:
+The metadata's sixty-seven:
 - placement: the home host first, the most room first, rule 6, three full
   hosts refused as no room rather than too few hosts, new chunks only on
   cs's that are up and only into a clean set, an empty set made again
@@ -3432,7 +3447,23 @@ The metadata's forty-five:
 - the controller's five: a member back joining its own place, another
   taking the place of a member gone or drained, a join only where there is
   room, joins waiting for a turn without a cs's change, and a cs silent past
-  `out_after` out.
+  `out_after` out;
+- N10a's twenty-two: a snapshot of a volume only, at the writer's
+  generation that paused for it or of none, answered as it is when made
+  again; a freeze only while attached by none, giving up the copy-ups
+  pending; a clone only of an image or a snapshot, answered as it is when
+  made again; a snapshot or a clone counting every chunk it shares; a
+  copy-up only by the volume's writer of now and of a volume's, answered its
+  pending chunk when asked again and the chunk itself when shared no
+  longer, its room taken only where every cs of the set has a slot left, its
+  new chunk in the old one's set; a copy-up done only of its pending chunk,
+  counting the old one down; a delete giving up the copy-ups pending; an
+  image or a snapshot never resized nor attached for writing, and a volume
+  made again answered as it is only where it is one; a snapshot's copy-ups
+  pending and read-only volumes each held to what they can be -- the meta
+  target aims a spoil at each, of a randomness of its own, and its fsck
+  holds what a spoiled snapshot taken says. A free chunk's link is aimed at
+  the same way, which random bytes reach once in a long while.
 
 The cs's twenty-seven: a slot's zeros flushed before the record that takes it,
 and the slot zeroed at all; an open mark durable before a generation's first

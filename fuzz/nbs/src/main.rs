@@ -2,7 +2,7 @@
 //!
 //!     nbs-fuzz gate
 //!
-//! everything the gate holds: the meta target over seeds 1 to 300, the cs
+//! everything the gate holds: the meta target over seeds 1 to 1000, the cs
 //! target over 1 to 200, the wire target over 1 to 100, the scrub target over
 //! 1 to 300, the cluster target over 1 to 1000 and the join target over 1 to
 //! 800 -- the races of
@@ -37,7 +37,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-const GATE_META_SEEDS: u64 = 300;
+const GATE_META_SEEDS: u64 = 1000;
 const META_STEPS: u64 = 400;
 const GATE_CS_SEEDS: u64 = 200;
 const CS_STEPS: u64 = 300;
