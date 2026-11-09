@@ -106,7 +106,7 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
     match r.below(6) {
         0 => {
             let n = len(r, u64::from(DATA_MAX));
-            let op = match r.below(10) {
+            let op = match r.below(11) {
                 0 => Op::Fence,
                 1 => Op::Write { chunk: chunk(r), position: r.below(1 << 32) as u32, index: r.below(u64::MAX),
                                  offset: r.below(1 << 32) as u32, data: &data[..n] },
@@ -122,6 +122,8 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                                     index: r.below(u64::MAX) },
                 7 => Op::Pull { chunk: chunk(r), joiner: r.below(1 << 32) as u32, index: r.below(u64::MAX),
                                 offset: r.below(1 << 32) as u32, len: r.below(u64::from(DATA_MAX) + 1) as u32 },
+                /* The leader's scrub (N9e) */
+                8 => Op::Scrub { chunk: chunk(r) },
                 _ => Op::Sums { chunk: chunk(r), joiner: r.below(1 << 32) as u32, index: r.below(u64::MAX),
                                 offset: r.below(1 << 32) as u32, len: r.below(nbscs::SLOT + 1) as u32 },
             };
@@ -130,7 +132,7 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
         }
         1 => {
             let n = len(r, u64::from(DATA_MAX));
-            let reply = match r.below(9) {
+            let reply = match r.below(10) {
                 0 => Reply::Fenced { generation: r.below(u64::MAX) },
                 1 => Reply::Done,
                 2 => Reply::Data(&data[..n]),
@@ -147,6 +149,11 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                 6 => {
                     let k = len(r, nbswire::SUMS_MAX as u64);
                     Reply::Sums((0..k).map(|_| r.below(1 << 32) as u32).collect())
+                }
+                7 => {
+                    let k = len(r, nbswire::SUMS_MAX as u64);
+                    Reply::Scrub { open: r.chance(50), written: r.below(1 << 32) as u32,
+                                   sums: (0..k).map(|_| r.below(1 << 32) as u32).collect() }
                 }
                 _ => Reply::Refused(refusal(r)),
             };
