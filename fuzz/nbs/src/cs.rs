@@ -779,14 +779,16 @@ impl Run {
                     let held = self.store.holding(c).is_some_and(|h| h.incarnation == cref.incarnation);
                     let at = k * self.sector as u32;
                     match self.store.read(other, 0, cref, at, &mut buf, false) {
-                        Err(Error::Unverified) if held => match self.store.read(other, 0, cref, at, &mut buf, true) {
+                        /* Asked of the mds first, held or not -- another
+                           volume's, or none's here, which may be one freed
+                           since (N10) -- then what it holds, or zeros */
+                        Err(Error::Unverified) => match self.store.read(other, 0, cref, at, &mut buf, true) {
                             Ok(()) if buf.iter().all(|&x| x == want) => {}
                             got => {
                                 return Err(format!("step {}: chunk {} of volume {} read by volume {}, vouched for: \
                                                     {:?}, {} expected", step, c, v, other, got.map(|_| buf[0]), want));
                             }
                         },
-                        Ok(()) if !held && buf.iter().all(|&x| x == 0) => {}
                         got => {
                             return Err(format!("step {}: chunk {} of volume {} read by volume {} (held {}): {:?}",
                                                step, c, v, other, held, got));
@@ -796,7 +798,32 @@ impl Run {
                     return Ok(());
                 }
                 let g = self.fenced[v as usize];
-                match self.store.read(v, g, cref, k * self.sector as u32, &mut buf, true) {
+                /* Now and then unvouched first, as nbs-cs reads what it has not
+                   checked: asked of the mds where the cs does not hold the
+                   chunk -- zeros only once it vouches (N10) -- or knows it at
+                   another epoch, and nowhere else */
+                let verified = !aim.chance(25);
+                let held = self.store.holding(c).filter(|h| h.incarnation == cref.incarnation);
+                let at = k * self.sector as u32;
+                let mut got = self.store.read(v, g, cref, at, &mut buf, verified);
+                if !verified {
+                    match got {
+                        Err(Error::Unverified) if held.is_some() => {
+                            return Err(format!("step {}: chunk {} held at {:?}, and its read unverified", step, c,
+                                               held));
+                        }
+                        Ok(()) if held.is_none() => {
+                            return Err(format!("step {}: chunk {}, which the cs does not hold, read unvouched", step,
+                                               c));
+                        }
+                        Err(Error::Unverified) | Err(Error::Epoch { .. }) => {
+                            self.count("reads unverified at first");
+                            got = self.store.read(v, g, cref, at, &mut buf, true);
+                        }
+                        _ => {}
+                    }
+                }
+                match got {
                     Err(Error::Io) if self.dead() => {}
                     Ok(()) if buf.iter().all(|&x| x == want) => {}
                     Ok(()) => {
@@ -870,11 +897,44 @@ impl Run {
                 let tell = self.r.chance(60);
                 self.count(if tell { "frees told" } else { "frees missed" });
                 let m = &self.chunks[c as usize];
+                /* Now and then a read vouched for first -- at an epoch the cs
+                   did not know, served as nbs-cs serves it -- and the same read
+                   once the chunk is freed: asked of the mds again, which says it
+                   is no map's now, not taken as vouched for (N10c) */
+                let held = self.store.holding(c).filter(|h| h.incarnation == m.incarnation);
+                let probe = match held {
+                    Some(h) if tell && aim.chance(30) && h.known.set == m.epoch.set => {
+                        let mut cref = self.cref(c);
+                        cref.epoch.version = h.known.version + 1;
+                        Some(Request { id: step, volume: m.volume, generation: 0,
+                                       op: WireOp::Read { chunk: cref, position: 0, index: step, offset: 0,
+                                                          len: self.sector as u32 } })
+                    }
+                    _ => None,
+                };
+                if let Some(req) = &probe {
+                    let got = serve(&mut self.store, &mut self.vouched, req, &mut |_| Some(Told::Verified));
+                    if !matches!(got, Ok(Done::Data(_))) {
+                        return Err(format!("step {}: chunk {} read at a newer epoch, vouched for: {:?}", step, c, got));
+                    }
+                }
+                let m = &self.chunks[c as usize];
                 if tell {
                     match self.store.free(c, m.incarnation) {
                         Err(Error::Io) if self.dead() => {}
                         r => {
                             r.map_err(|e| format!("step {}: free of {}: {:?}", step, c, e))?;
+                        }
+                    }
+                }
+                if let Some(req) = &probe {
+                    if !self.dead() && self.store.holding(c).is_none() {
+                        self.count("reads of a chunk freed asked again");
+                        let got = serve(&mut self.store, &mut self.vouched, req,
+                                        &mut |_| Some(Told::Refused(Refusal::NotTheMap)));
+                        if got != Err(Refusal::NotTheMap) {
+                            return Err(format!("step {}: chunk {}, freed, read as vouched for before: {:?}", step, c,
+                                               got.map(|d| format!("{:?}", d).chars().take(40).collect::<String>())));
                         }
                     }
                 }

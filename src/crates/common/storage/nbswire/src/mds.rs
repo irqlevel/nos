@@ -172,6 +172,9 @@ pub fn map(s: &State, applied: u64, name: &str, from: u32, count: u32, index: u6
             cs: set.cs,
             replicas: [replica_state(set.replicas[0]), replica_state(set.replicas[1]), replica_state(set.replicas[2])],
             joiner: set.joiner.map(|j| j.cs),
+            /* Another map's too (N10) -- and so where a copy-up is pending,
+               which the metadata gives up of a chunk named by one map */
+            shared: ch.count > 1,
         });
         for cs in set.cs.iter().copied().chain(set.joiner.map(|j| j.cs)) {
             if !named.contains(&cs) {

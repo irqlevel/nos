@@ -26,6 +26,10 @@
 //!   vouches** that the volume's map names it (N10): a snapshot's or a
 //!   clone's map shares the chunks of what it was made of. Written, it is
 //!   the writer's volume's from then on, as a reconcile looks for it.
+//! - **A chunk the cs does not hold is read as zeros only once the host's
+//!   mds vouches** that the volume's map names it (N10): one freed since --
+//!   a copy-up done, the old chunk named by no map -- is not a chunk never
+//!   written, and a read of it on its way from before is refused.
 //! - **A copy-up's chunk is durable before it is answered** (N10), its data
 //!   before its record, and never written over once held: what a client
 //!   wrote to it since is kept.
@@ -715,14 +719,18 @@ impl<D: Device> Store<D> {
     }
 
     /// Chunk `c`'s data at `offset`, into `buf`: zeros where nothing was
-    /// written. `generation` 0 for a read-only attach, which no fence holds
-    /// to.
+    /// written -- a chunk the cs does not hold, once the mds vouches that the
+    /// volume's map names it (N10): one freed since is not one never written.
+    /// `generation` 0 for a read-only attach, which no fence holds to.
     pub fn read(&mut self, volume: u32, generation: u64, c: ChunkRef, offset: u32, buf: &mut [u8], verified: bool)
         -> Result<(), Error> {
         if generation != 0 {
             self.check_fence(volume, generation)?;
         }
         let Some((dv, slot, r)) = self.find(&c)? else {
+            if !verified {
+                return Err(Error::Unverified);
+            }
             self.span(None, offset, buf.len())?;
             buf.fill(0);
             return Ok(());
