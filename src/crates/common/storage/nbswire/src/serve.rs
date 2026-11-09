@@ -50,6 +50,49 @@ impl Vouched {
     }
 }
 
+/// What a pass over a cs's garbage did (`collect`).
+#[derive(Default, Debug)]
+pub struct Collected {
+    /// The chunks freed, each at its incarnation.
+    pub freed: Vec<(u32, u32)>,
+    /// The volumes whose fences were taken off.
+    pub unfenced: Vec<u32>,
+    /// A chunk, or a volume's fence, the store failed to let go of, and why.
+    pub failed: Vec<(u32, Error)>,
+}
+
+/// The chunks `store` holds that the metadata freed -- or whose number is
+/// another chunk's now -- freed, and the fences of volumes gone taken off:
+/// as the host's mds says, asked `ask` in lists of LIST_MAX, and nothing
+/// where it says nothing. nbs-cs's every 30 s, and the cluster target's
+/// cs's.
+pub fn collect<D: Device>(store: &mut Store<D>, ask: &mut dyn FnMut(Question) -> Option<Told>) -> Collected {
+    let mut done = Collected::default();
+    let held: Vec<(u32, u32)> = store.holdings().iter().map(|h| (h.chunk, h.incarnation)).collect();
+    for batch in held.chunks(LIST_MAX) {
+        let Some(Told::Gone(gone)) = ask(Question::Live { chunks: batch.to_vec() }) else { return done };
+        for c in gone {
+            let Some(&(_, incarnation)) = batch.iter().find(|(n, _)| *n == c) else { continue };
+            match store.free(c, incarnation) {
+                Ok(true) => done.freed.push((c, incarnation)),
+                Ok(false) => {}
+                Err(e) => done.failed.push((c, e)),
+            }
+        }
+    }
+    let volumes: Vec<u32> = store.fenced_volumes().iter().map(|&(v, _)| v).collect();
+    for batch in volumes.chunks(LIST_MAX) {
+        let Some(Told::Gone(gone)) = ask(Question::Volumes { volumes: batch.to_vec() }) else { return done };
+        for v in gone {
+            match store.drop_fence(v) {
+                Ok(()) => done.unfenced.push(v),
+                Err(e) => done.failed.push((v, e)),
+            }
+        }
+    }
+    done
+}
+
 /// What a request was done to, owned past its message: a reply's shape.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Done {
@@ -216,14 +259,18 @@ fn joined(vouched: &mut Vouched, ask: &mut dyn FnMut(Question) -> Option<Told>, 
 }
 
 /// `op` done on the store -- and where the engine has not checked the
-/// request, asked of the mds first and done again once it vouches.
+/// request, asked of the mds first and done again once it vouches. What it
+/// vouched for before is taken only for a chunk the cs holds (N10): one
+/// freed since -- a copy-up done, the old chunk named by no map -- reads as
+/// zeros, which it vouched for of no chunk.
 #[allow(clippy::too_many_arguments)]
 fn checked<D: Device, T>(store: &mut Store<D>, vouched: &mut Vouched, ask: &mut dyn FnMut(Question) -> Option<Told>,
                          volume: u32, generation: u64, chunk: ChunkRef, position: u32, index: u64, writing: bool,
                          op: &mut dyn FnMut(&mut Store<D>, bool) -> Result<T, Error>) -> Result<T, Refusal> {
     let key = Check { volume, generation, chunk: chunk.chunk, incarnation: chunk.incarnation, set: chunk.epoch.set,
                       version: chunk.epoch.version };
-    let known = vouched.checks.contains(&key);
+    let known = vouched.checks.contains(&key)
+        && store.holding(chunk.chunk).is_some_and(|h| h.incarnation == chunk.incarnation);
     match op(store, known) {
         Ok(t) => return Ok(t),
         Err(Error::Unverified) | Err(Error::Epoch { .. }) if !known => {}

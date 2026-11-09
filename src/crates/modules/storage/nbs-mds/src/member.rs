@@ -221,6 +221,8 @@ pub enum Kind {
     Attach,
     Detach,
     Down,
+    /// A copy-up asked, or its end (N10).
+    Copy,
 }
 
 /// The member over its log in `dir`, its mailbox named.
@@ -366,7 +368,12 @@ impl App for Mds {
             (Ok(Answer::Attached { .. }), Kind::Detach) => Said::Detached { index },
             (Ok(Answer::Set { version }), Kind::Down) => Said::Down { version, index },
             (Ok(Answer::Refused(Refusal::LastReplica)), Kind::Down) => Said::LastReplica,
-            (Ok(Answer::Refused(Refusal::NotTheWriter)), Kind::Down) => Said::NotTheWriter,
+            (Ok(Answer::Refused(Refusal::NotTheWriter)), Kind::Down | Kind::Copy) => Said::NotTheWriter,
+            /* A copy-up's chunk (N10); a set being joined asked again */
+            (Ok(Answer::Chunk { chunk, incarnation }), Kind::Copy) => Said::Chunk { chunk, incarnation, index },
+            (Ok(Answer::Refused(why @ (Refusal::Joining | Refusal::Draining))), Kind::Copy) => {
+                Said::NotNow(String::from(why.says()))
+            }
             (Ok(Answer::Refused(why)), _) => Said::Refused(String::from(why.says())),
             (Ok(other), _) => Said::Refused(alloc::format!("answered {:?}", other)),
             /* The engine's: no leader, the leader not ready, its look */
@@ -589,6 +596,10 @@ impl Mds {
             Ask::Detach { name, generation } => (Command::Detach { name, host, generation }, Kind::Detach),
             Ask::Down { set, cs, refused, name, generation } => {
                 (Command::ReplicaDown { set, cs, refused, name, generation }, Kind::Down)
+            }
+            Ask::CopyUp { name, place, generation } => (Command::CopyUp { name, place, generation }, Kind::Copy),
+            Ask::CopyDone { name, place, generation, chunk } => {
+                (Command::CopyDone { name, place, generation, chunk }, Kind::Copy)
             }
             Ask::Map { name, from, count, index } => {
                 let said = nbswire::mds::map(core.state(), core.rsm().applied(), &name, from, count, index);

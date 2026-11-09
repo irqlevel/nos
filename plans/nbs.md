@@ -1294,6 +1294,63 @@ each new gate.
     chunk it wrote before it detaches, and a writer that dies stays attached
     until the next one's reconcile -- which a snapshot of it, or a freeze,
     leans on.
+  - **N10c, as it is to be built** (2026-11-09), in two:
+    - **N10c1, the writer's copy-up.** The map says of each place whether
+      its chunk is shared -- named by another map, or a copy-up pending
+      there (`Place.shared`). A write to such a place holds its pieces while
+      the session asks `CopyUp` (`Ask::CopyUp`, `Said::Chunk`), has each
+      active member of the set copy (`Op::CopyUp`) -- one that refuses as
+      failed, or is silent 0.5 s, asked out as for a write -- then asks
+      `CopyDone`; its map names the new chunk then, and the pieces go to
+      it. A copy-up of a chunk shared no longer is answered the chunk
+      itself, written as it is. `Joining` is asked again; past the
+      operation's deadline the write fails, said. A copy-up pending is
+      finished by the next writer, sent to it by the map's flag. The
+      cluster target takes snapshots of the volume between writers -- the
+      writer stopped cleanly (flush, closes, detach), a snapshot, a writer
+      again -- deletes some, and holds each snapshot to reading what the
+      volume held at it, on every active replica and every time; copy-ups
+      race joins, crashes and takeovers.
+    - **N10c1, done** (2026-11-09). nbswire: `Place.shared` -- the chunk's
+      count past one, which a copy-up pending's is, as the metadata gives up
+      one of a chunk named by one map now -- `Ask::CopyUp`, `Ask::CopyDone`
+      and `Said::Chunk`, which nbs-mds proposes as it does an attach; a
+      copy-up into a set with a member drained refused as `Draining` and
+      asked again, as `Joining` is. The client's copy-up as designed above,
+      a take-out past the view having it asked again from its start. A read
+      of a chunk the cs does not hold is vouched for by the mds -- one freed
+      since is not one never written -- and what the mds vouched for is
+      taken only for a chunk held. The garbage pass is nbswire's `collect`,
+      which nbs-cs and the cluster target run. The cluster target takes
+      snapshots between writers and holds each to what the volume held at
+      it. It found a bug of N9's copy, never met before -- a chunk freed
+      under a join dropped with its asks in flight, which were taken for
+      the next chunk's -- and in N10's own: the copy-up done without the one
+      member a stale view asked, the vouched cache letting a stale epoch in
+      for a chunk not held, a copy-up refused for room where a member is
+      drained. Mutants: 171, the thirteen new ones each caught.
+    - **N10c2, the snapshot's pause**, an attached volume's -- decided
+      2026-11-09: asked on the writer's host only, whose mds pauses its own
+      session (one asked elsewhere is refused, naming the host). The session
+      paused sends nothing new, waits for what it has out, flushes and closes
+      every chunk it has open, and answers with its generation; the mds
+      proposes the snapshot at it, and once it is applied tells the session to
+      go on, which reads its map again -- every chunk shared. A session that
+      goes on by its own timeout attaches again, so that a snapshot at its old
+      generation is refused.
+    - **Clones in the cluster target** (with N10d): a second volume cloned
+      from a snapshot and written by its own writer -- through chunks the
+      snapshot shares no longer, found open at another volume's generation
+      -- where `serve`'s found-open refusal comparing the volume is judged.
+    - **A limit, and what would lift it.** A write to a shared chunk of a
+      set being joined waits for the join, and fails past the operation's
+      deadline: a join of a big set takes minutes. Lifting it: copy-ups into
+      a set being joined, the joiner written as a member is -- its first
+      write of the new chunk takes a slot, marked, which its copy fills --
+      and the join's end refused while the set had chunks born since its
+      copy's last pass (a count of births in the joiner's record, which
+      `JoinDone` carries as the copy saw it). Kept as a limit for now, said
+      in docs/nbs.md (the user, 2026-11-09).
 - **N11, numbers.** On the hardware, and what they ask for: pages that move
   instead of copies (a message's pages lent to a `DiskQueue`), chain
   replication (the writer's NIC sending one copy instead of two), TCP's T4
