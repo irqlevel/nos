@@ -1170,7 +1170,84 @@ each new gate.
       the leader to no finding of now -- the rot's is history.
     - **Done**: nbs-test 189 of 189 on arm64 (HVF) and x86-64 (TCG), and on
       arm64's `UBSAN=1 RUSTUB=1` build.
-- **N10.** Snapshots, images and clones.
+- **N10, snapshots, images and clones.** Decided 2026-11-09: thin room, an
+  attached volume's snapshot by pausing its writer, a shared chunk copied
+  locally on its cs's, deletes allowed while others share the chunks. The
+  design, as decided before it is built:
+  - **The metadata** has the fields already: a volume's `kind` and
+    `origin`, a chunk's `count` of the maps that name it. New commands:
+    - `Snapshot { volume, name, generation }`: the volume's map copied into
+      a volume of kind snapshot, every chunk's count up; at the writer's
+      generation -- the writer that paused for it -- or 0 for a detached
+      volume. Of a volume only: an image or a snapshot is read-only, cloned
+      rather than snapshotted.
+    - `Freeze { volume }`: a volume made an image, read-only for good;
+      refused while attached.
+    - `Clone { from, name, host }`: a volume whose map is an image's or a
+      snapshot's, every chunk's count up; its origin kept.
+    - `CopyUp { volume, place, generation }` and `CopyDone { volume, place,
+      generation, chunk }`, the writer's, below.
+    - A delete counts its chunks down, a chunk at none freed, as now --
+      allowed while snapshots or clones share them, which keep them.
+  - **Room, thin**: a snapshot or a clone reserves nothing. A copy-up takes
+    a slot on each of its set's cs's, refused where one has none left; it
+    may take the room kept to rebuild a host -- a guest's write failing
+    while there is room would be worse -- and `nbs status` says when the
+    room left could not rebuild the biggest host.
+  - **A copy-up, in two steps, eager**: a write to a shared chunk -- one
+    whose count is more than one, as the map the client reads says -- is
+    held while the writer asks `CopyUp`: a new chunk in the same set (rule
+    7), its room taken, pending -- the volume's map still names the old
+    one, which so stays alive. The writer has each active member copy the
+    old chunk's slot into the new one's locally (`Op::CopyUp`, idempotent,
+    durable before it answers), then asks `CopyDone`: the map names the new
+    chunk, the old one's count goes down -- freed at none -- and the write
+    goes on. Copied lazily instead, on a cs's first request for the new
+    chunk, the old one could be freed -- its last snapshot deleted -- before
+    a slow cs had copied it. A crash between the two steps leaves the
+    copy-up pending: the next writer's asks find it and finish it; a
+    member down meanwhile has the new chunk by its join's copy, as any
+    chunk it does not hold; a volume deleted frees its pending ones.
+  - **An attached volume's snapshot**: the leader asks the writer's session
+    to pause -- nothing new sent, its writes out answered, a flush -- and
+    to answer with its generation; commits the snapshot at it; tells the
+    session to go on, which reads its map again: every chunk shared.
+    Refused where the writer does not answer in time. Without the pause a
+    write already on its way would land in a chunk the snapshot now
+    shares.
+  - **hv**: `hv convert <file> nbs:<image>` and `hv create <vm> <url> nbs`
+    pour into a volume frozen after; `hv create <vm> image=nbs:<image>
+    size=...` clones it, a VM up at once.
+  - **Tests**: the meta target's model of the commands, counts, pending
+    copy-ups and room; the cluster target -- snapshots and clones under
+    writes, copy-ups racing joins, crashes and deletes, a snapshot held to
+    read for good what the volume held at it; the cs target -- a local
+    copy through power cuts; nbs-test and hv-nbs-test phases.
+  - **Steps**: N10a the metadata and its model; N10b the cs's copy and its
+    target; N10c the client's copy-up and the snapshot's pause, in the
+    cluster target; N10d hv and the commands; N10e nbs-test, docs, gates.
+  - **N10a, done** (2026-11-09): nbsmeta's `Snapshot`, `Freeze`, `Clone`,
+    `CopyUp` and `CopyDone`, `Answer::Chunk`, `Refusal::NotFrozen`; the
+    copy-ups pending in the state and in its snapshot, NBM6, held to a
+    volume's place whose map names the old chunk and to the old chunk's set,
+    and read-only volumes to no writer and to a volume made before them. A
+    count's overflow is no refusal: a map names a chunk once at most, and
+    `VOLUMES_MAX` is below a u16's range -- an assertion of the constants'.
+    The meta target's model knows a chunk by an identity of its own, shared
+    and counted, and learns the metadata's number for it as it first shows,
+    a copy-up's new chunk numbered by the metadata's answer, holding it from
+    then on: one number one chunk. Its draws take snapshots, freezes, clones
+    and copy-ups, biased to places shared and to copy-ups pending a detach,
+    a freeze or a delete meets; aimed spoils of a copy-up pending and of a
+    read-only volume, of randomnesses of their own; fsck's rules of both.
+    Mutants: 135, each caught. The metadata's twenty-two new ones: the first
+    runs left five, caught once the draws and the spoils reached them. The
+    first full run left two old ones, their seeds moved by the new draws:
+    `free_list_checked`, now aimed at as well -- a free chunk's link made one
+    in use, itself or the list's end -- and `spare_not_used`, a placement's
+    rare case, caught at seed 548: the meta target's gate runs 1000 seeds
+    now, not 300 (two seconds). The meta target 30000 seeds; raft-test; the
+    gate; make check, both arches and their modules built.
 - **N11, numbers.** On the hardware, and what they ask for: pages that move
   instead of copies (a message's pages lent to a `DiskQueue`), chain
   replication (the writer's NIC sending one copy instead of two), TCP's T4
@@ -1200,8 +1277,11 @@ each new gate.
    mds.
 4. Decided: one writer a volume, the attach fenced; a VM moved by a forced
    attach.
-5. Decided: 4 MiB chunks; room reserved at create, a clone's too; data on
-   write.
+5. Decided: 4 MiB chunks; a volume's room reserved at create; data on
+   write. Snapshots and clones thin (decided 2026-11-09): they reserve
+   nothing, and a write that needs a copy-up where a set's cs's have no
+   room left fails, said -- the price of not holding a volume's size again
+   for every snapshot.
 6. Decided (2026-11-07): the client writes to all three at once and is
    answered when all three have it; a replica silent for 0.5 s -- not the
    2 s first written -- is taken out of the set first, and only once the

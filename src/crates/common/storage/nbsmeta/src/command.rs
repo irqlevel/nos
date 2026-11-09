@@ -85,6 +85,35 @@ pub enum Command {
     /// member down already, nor a set with a joiner; refused as stale once
     /// the set has moved on.
     ReplicaBad { set: u32, cs: u32, version: u32 },
+    /// A snapshot of volume `volume`, named `name` (N10): its map as it is,
+    /// every chunk's count up -- what the volume held, for good. At the
+    /// generation of the writer that paused for it, or 0 for a volume with
+    /// none: a writer not paused could have a write on its way into a chunk
+    /// the snapshot now shares. Of a volume only -- an image or a snapshot
+    /// is read-only, and cloned rather than snapshotted. Made again of the
+    /// same volume, it is answered as it is.
+    Snapshot { volume: String, name: String, generation: u64 },
+    /// Volume `name` made an image (N10): read-only for good, to be cloned;
+    /// refused while attached, its copy-ups pending given up. Done where it
+    /// is an image already.
+    Freeze { name: String },
+    /// Volume `name`, `host`'s own, a clone of image or snapshot `from`
+    /// (N10): its map `from`'s, every chunk's count up, room reserved for
+    /// none of them -- a write to one copies it up. Made again of the same
+    /// origin, it is answered as it is.
+    Clone { from: String, name: String, host: String },
+    /// A copy-up's first step (N10): chunk `place` of volume `name`'s map --
+    /// shared, and to be written by its writer at `generation` -- given a
+    /// new chunk in the same set, its room taken on the set's cs's, refused
+    /// where one has none left; pending, the map naming the old one still.
+    /// Asked again, answered the pending one; asked of a chunk shared no
+    /// longer, the chunk itself.
+    CopyUp { name: String, place: u32, generation: u64 },
+    /// A copy-up's second step: pending chunk `chunk` of place `place`
+    /// copied onto its set's active members -- volume `name`'s map names it,
+    /// and the old one's count goes down, at none freed. Done where the map
+    /// names it already.
+    CopyDone { name: String, place: u32, generation: u64, chunk: u32 },
 }
 
 const INIT: u8 = 1;
@@ -106,6 +135,11 @@ const JOIN: u8 = 16;
 const JOINED: u8 = 17;
 const UNJOIN: u8 = 18;
 const REPLICA_BAD: u8 = 19;
+const SNAPSHOT: u8 = 20;
+const FREEZE: u8 = 21;
+const CLONE: u8 = 22;
+const COPY_UP: u8 = 23;
+const COPY_DONE: u8 = 24;
 
 const WRITABLE: u8 = 1;
 const FORCE: u8 = 2;
@@ -219,6 +253,35 @@ impl Command {
                 w.u32(*cs);
                 w.u32(*version);
             }
+            Command::Snapshot { volume, name, generation } => {
+                w.u8(SNAPSHOT);
+                w.str(volume);
+                w.str(name);
+                w.u64(*generation);
+            }
+            Command::Freeze { name } => {
+                w.u8(FREEZE);
+                w.str(name);
+            }
+            Command::Clone { from, name, host } => {
+                w.u8(CLONE);
+                w.str(from);
+                w.str(name);
+                w.str(host);
+            }
+            Command::CopyUp { name, place, generation } => {
+                w.u8(COPY_UP);
+                w.str(name);
+                w.u32(*place);
+                w.u64(*generation);
+            }
+            Command::CopyDone { name, place, generation, chunk } => {
+                w.u8(COPY_DONE);
+                w.str(name);
+                w.u32(*place);
+                w.u64(*generation);
+                w.u32(*chunk);
+            }
         }
         w.buf
     }
@@ -309,6 +372,28 @@ impl Command {
             REPLICA_BAD => {
                 let (set, cs) = (r.u32()?, r.u32()?);
                 Command::ReplicaBad { set, cs, version: r.u32()? }
+            }
+            SNAPSHOT => {
+                let volume = volume(&mut r)?;
+                let name = String::from(r.str(crate::VOLUME_NAME_MAX)?);
+                Command::Snapshot { volume, name, generation: r.u64()? }
+            }
+            FREEZE => Command::Freeze { name: volume(&mut r)? },
+            CLONE => {
+                let from = volume(&mut r)?;
+                let name = String::from(r.str(crate::VOLUME_NAME_MAX)?);
+                Command::Clone { from, name, host: host(&mut r)? }
+            }
+            COPY_UP => {
+                let name = volume(&mut r)?;
+                let place = r.u32()?;
+                Command::CopyUp { name, place, generation: r.u64()? }
+            }
+            COPY_DONE => {
+                let name = volume(&mut r)?;
+                let place = r.u32()?;
+                let generation = r.u64()?;
+                Command::CopyDone { name, place, generation, chunk: r.u32()? }
             }
             _ => return None,
         };
@@ -405,6 +490,8 @@ pub enum Refusal {
     /// The member is down already: the controller has it join its place
     /// again.
     AlreadyDown,
+    /// A clone is of an image or a snapshot, not of a volume (N10).
+    NotFrozen,
 }
 
 impl Refusal {
@@ -452,6 +539,7 @@ impl Refusal {
             Refusal::NotUp => "the chunk server is not up",
             Refusal::InPlace => "the member in that place is active and stays",
             Refusal::AlreadyDown => "the member is down already: it joins its place again",
+            Refusal::NotFrozen => "a clone is of an image or a snapshot -- freeze or snapshot the volume first",
         }
     }
 
@@ -497,6 +585,7 @@ impl Refusal {
             Refusal::NotUp => 38,
             Refusal::InPlace => 39,
             Refusal::AlreadyDown => 40,
+            Refusal::NotFrozen => 41,
         }
     }
 
@@ -542,6 +631,7 @@ impl Refusal {
             38 => Refusal::NotUp,
             39 => Refusal::InPlace,
             40 => Refusal::AlreadyDown,
+            41 => Refusal::NotFrozen,
             _ => return None,
         })
     }
@@ -567,6 +657,9 @@ pub enum Answer {
     Set { version: u32 },
     /// A cs down, up or out: how many sets that changed.
     Changed { sets: u32 },
+    /// A copy-up's chunk (N10): the pending one, or -- done, or the chunk
+    /// shared no longer -- the one the map names; and its incarnation.
+    Chunk { chunk: u32, incarnation: u32 },
     Refused(Refusal),
 }
 
@@ -578,6 +671,7 @@ const ATTACHED: u8 = 4;
 const CHECKED: u8 = 5;
 const SET: u8 = 6;
 const CHANGED: u8 = 7;
+const CHUNK: u8 = 8;
 
 impl Answer {
     pub fn encode(&self) -> Vec<u8> {
@@ -612,6 +706,11 @@ impl Answer {
                 w.u8(CHANGED);
                 w.u32(*sets);
             }
+            Answer::Chunk { chunk, incarnation } => {
+                w.u8(CHUNK);
+                w.u32(*chunk);
+                w.u32(*incarnation);
+            }
         }
         w.buf
     }
@@ -627,6 +726,10 @@ impl Answer {
             CHECKED => Answer::Checked,
             SET => Answer::Set { version: r.u32()? },
             CHANGED => Answer::Changed { sets: r.u32()? },
+            CHUNK => {
+                let chunk = r.u32()?;
+                Answer::Chunk { chunk, incarnation: r.u32()? }
+            }
             _ => return None,
         };
         r.done().then_some(a)

@@ -20,8 +20,8 @@ use crate::{Cluster, Member, Removed, State, MEMBERS_MAX, NAME_MAX, REMOVED_MAX}
 
 /* NBM3: chunks carry their incarnation; NBM4: a writer its client's token;
    NBM5: a cs its state, a set its joiner and its members' last active
-   versions (N9) */
-const MAGIC: [u8; 4] = *b"NBM5";
+   versions (N9); NBM6: the copy-ups pending (N10) */
+const MAGIC: [u8; 4] = *b"NBM6";
 /// Chunks or map entries a record of the stream carries at most.
 const BATCH: usize = 256;
 /// How much a digest asks of the stream at a time.
@@ -41,6 +41,7 @@ enum At {
     Chunks(usize),
     Volume(usize),
     Map(usize, usize),
+    Copying(usize),
     Done,
 }
 
@@ -195,7 +196,10 @@ impl FrozenState {
                     w.u32(v.map.len() as u32);
                     At::Map(i, 0)
                 }
-                None => return false,
+                None => {
+                    w.u32(s.copying.len() as u32);
+                    At::Copying(0)
+                }
             },
             At::Map(i, j) => match s.volumes.get(i) {
                 Some(v) if j < v.map.len() => {
@@ -207,6 +211,19 @@ impl FrozenState {
                 }
                 _ => At::Volume(i + 1),
             },
+            At::Copying(k) => {
+                if k >= s.copying.len() {
+                    return false;
+                }
+                let end = (k + BATCH).min(s.copying.len());
+                for (&(v, place), &(to, from)) in s.copying.iter().skip(k).take(end - k) {
+                    w.u32(v);
+                    w.u32(place);
+                    w.u32(to);
+                    w.u32(from);
+                }
+                At::Copying(end)
+            }
             At::Done => return false,
         };
         self.pending = w.buf;
@@ -449,6 +466,17 @@ pub(crate) fn read<S: Source>(r: &mut Stream<S>) -> Result<State, RestoreError> 
         }
         s.volumes.push(Volume { id, name, size_mib, kind, origin, host, generation, writer, readers, map });
     }
+    let n = r.u32().ok_or(BAD)? as usize;
+    if n > COPYING_MAX {
+        return Err(RestoreError("more copy-ups pending than are kept"));
+    }
+    for _ in 0..n {
+        let (v, place) = (r.u32().ok_or(BAD)?, r.u32().ok_or(BAD)?);
+        let (to, from) = (r.u32().ok_or(BAD)?, r.u32().ok_or(BAD)?);
+        if s.copying.insert((v, place), (to, from)).is_some() {
+            return Err(RestoreError("a copy-up pending twice"));
+        }
+    }
     Ok(s)
 }
 
@@ -532,6 +560,23 @@ impl State {
                 *n = n.checked_add(1).ok_or(RestoreError("a chunk named too often"))?;
             }
         }
+        /* A copy-up pending (N10): of a volume's place, whose map names the
+           chunk it copies still, the new one in the same set, named by no
+           map -- counted by the copy-up alone */
+        for (&(vol, place), &(to, from)) in self.copying.iter() {
+            let named_at = self.volumes.iter().find(|v| v.id == vol)
+                .filter(|v| v.kind == Kind::Volume).and_then(|v| v.map.get(place as usize).copied());
+            let same_set = match (self.chunks.get(to as usize), self.chunks.get(from as usize)) {
+                (Some(t), Some(f)) => !t.is_free() && !f.is_free() && t.set == f.set,
+                _ => false,
+            };
+            if named_at != Some(from) || to == from || !same_set || named.get(to as usize).copied() != Some(0) {
+                return Err(RestoreError("a copy-up pending of no volume's place, or of a chunk in another set"));
+            }
+            if let Some(n) = named.get_mut(to as usize) {
+                *n = 1;
+            }
+        }
         let mut in_set: Vec<u32> = alloc::vec![0; self.sets.len()];
         let mut free = 0u64;
         for (i, ch) in self.chunks.iter().enumerate() {
@@ -605,6 +650,15 @@ impl State {
                 || (v.writer.is_some() && !v.readers.is_empty())
             {
                 return Err(RestoreError("a volume's writer of a generation it never gave, or with readers"));
+            }
+            /* An image and a snapshot are read-only (N10); what a volume was
+               made of is a volume made before it, never itself -- a snapshot
+               always of one */
+            if (v.kind != Kind::Volume && v.writer.is_some())
+                || v.origin >= self.next_volume || v.origin == v.id
+                || (v.kind == Kind::Snapshot && v.origin == 0)
+            {
+                return Err(RestoreError("a read-only volume written, or made of one never made"));
             }
             for (k, r) in v.readers.iter().enumerate() {
                 if v.readers[..k].contains(r) {

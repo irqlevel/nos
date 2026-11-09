@@ -20,12 +20,18 @@
 //! - a replica applying the same entries the same state, with the same
 //!   digests, and one restored from a snapshot part way the same at the end;
 //! - a checkpoint's digest the state's own at that entry, every true digest
-//!   of the leader's held, and a false one said as a divergence.
+//!   of the leader's held, and a false one said as a divergence;
+//! - snapshots, images and clones (N10): each chunk known by an identity of
+//!   the model's, shared by the maps a snapshot or a clone copied, counted by
+//!   them and by a copy-up pending on it -- the metadata's number for it
+//!   learned as it first shows, and held from then on, one number one chunk;
+//!   a copy-up's new chunk in the old one's set, its room taken where every
+//!   cs of the set has a slot left, named by the map once done.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use nbsmeta::repair::{self, Seen};
-use nbsmeta::{Answer, Command, Refusal, State, CHECK_EVERY};
+use nbsmeta::{Answer, Command, Kind, Refusal, State, CHECK_EVERY};
 use raft::rsm::{Frozen, StateMachine};
 
 use crate::heap::Exempt;
@@ -33,8 +39,16 @@ use crate::rng::{mix, Rng};
 
 /// The hosts a run's members are drawn from.
 const HOSTS: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
-/// The volumes' names.
+/// The volumes' names, and those snapshots and clones are drawn from (N10):
+/// a command of one names any of them.
 const VOLUMES: [&str; 10] = ["v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "web.root", "db-1"];
+const SNAPS: [&str; 4] = ["s0", "s1", "s2", "s3"];
+const CLONES: [&str; 4] = ["k0", "k1", "k2", "k3"];
+/// Copy-ups pending at once, at most.
+const COPYING_MAX: usize = 4096;
+/// The answer the model gives for a copy-up's new chunk, whose number the
+/// metadata's free list chooses: taken from the metadata's own answer.
+const FRESH: u32 = u32::MAX;
 /// What the model has of the crate's limits: the plan's.
 const MEMBERS_MAX: usize = 16;
 const REMOVED_MAX: usize = 1024;
@@ -129,6 +143,21 @@ struct MVol {
     readers: Vec<String>,
     /// Each chunk's set, by its number.
     chunks: Vec<usize>,
+    /// What it is (N10), and the volume it was made of: 0 for none.
+    kind: Kind,
+    origin: u32,
+    /// Each chunk's identity in the model: the same where maps share it.
+    keys: Vec<u64>,
+}
+
+/// A chunk in use, by the model's identity (N10).
+#[derive(Clone)]
+struct MChunk {
+    set: usize,
+    /// The maps that name it, and a copy-up pending on it as its new chunk.
+    count: u32,
+    /// The metadata's number and incarnation for it, once seen.
+    real: Option<(u32, u32)>,
 }
 
 #[derive(Default, Clone)]
@@ -143,6 +172,13 @@ struct Model {
     /// Every set: made where three cs's have no clean one, the lowest empty
     /// one made again first (N9).
     sets: Vec<MSet>,
+    /// The chunks in use, by identity (N10), and the next identity.
+    mchunks: BTreeMap<u64, MChunk>,
+    next_key: u64,
+    /// The copy-ups pending: by volume and place, the new chunk and the old.
+    pending: BTreeMap<(u32, u32), (u64, u64)>,
+    /// A copy-up's new chunk just made: its number the metadata's answer.
+    fresh: Option<u64>,
 }
 
 /// The sets the metadata keeps at most.
@@ -185,7 +221,141 @@ impl Model {
     }
 
     fn live(&self) -> u64 {
-        self.vols.values().map(|v| v.chunks.len() as u64).sum()
+        self.mchunks.len() as u64
+    }
+
+    /// A chunk in set `set`, placed already -- the set's count and its
+    /// holders' room taken: its identity.
+    fn key_for(&mut self, set: usize) -> u64 {
+        let k = self.next_key;
+        self.next_key += 1;
+        self.mchunks.insert(k, MChunk { set, count: 1, real: None });
+        k
+    }
+
+    /// One of chunk `key`'s counts given back: at none, the chunk freed, its
+    /// set's room given back.
+    fn release(&mut self, key: u64) {
+        let c = self.mchunks.get_mut(&key).expect("a chunk in use");
+        c.count -= 1;
+        if c.count == 0 {
+            let set = c.set;
+            self.mchunks.remove(&key);
+            self.give_back(&[set]);
+        }
+    }
+
+    /// Volume `id`'s copy-ups pending given up: their new chunks freed.
+    fn give_up(&mut self, id: u32) {
+        let gone: Vec<u64> = self.pending.range((id, 0)..=(id, u32::MAX)).map(|(_, &(to, _))| to).collect();
+        self.pending.retain(|&(v, _), _| v != id);
+        for to in gone {
+            self.release(to);
+        }
+    }
+
+    /// Chunk `key`'s answer: its number and incarnation, as seen.
+    fn answer_of(&self, key: u64) -> Answer {
+        match self.mchunks.get(&key).and_then(|c| c.real) {
+            Some((chunk, incarnation)) => Answer::Chunk { chunk, incarnation },
+            None => Answer::Chunk { chunk: FRESH, incarnation: 0 },
+        }
+    }
+
+    /// The chunk the metadata numbers `chunk`, if one of the model's is.
+    fn key_of(&self, chunk: u32) -> Option<u64> {
+        self.mchunks.iter().find(|(_, c)| c.real.is_some_and(|(n, _)| n == chunk)).map(|(&k, _)| k)
+    }
+
+    /// Volume `name`'s number and the chunk its map has at `place`, as its
+    /// writer at `generation` asks: the crate's order of refusals.
+    fn writers_place(&self, name: &str, place: u32, generation: u64) -> Result<(u32, u64), Refusal> {
+        if !self.init {
+            return Err(Refusal::NotInitialized);
+        }
+        let v = self.vols.get(name).ok_or(Refusal::NoSuchVolume)?;
+        if v.kind != Kind::Volume {
+            return Err(Refusal::ReadOnly);
+        }
+        if generation == 0 || v.writer.as_ref().map(|(_, g, _)| *g) != Some(generation) {
+            return Err(Refusal::NotTheWriter);
+        }
+        let from = *v.keys.get(place as usize).ok_or(Refusal::BadVolume)?;
+        Ok((v.id, from))
+    }
+
+    /// A volume `name` of kind `kind` made of `of`: its chunks shared, each
+    /// counted once more, no room taken.
+    fn share(&mut self, of: &MVol, name: &str, host: &str, kind: Kind) -> Result<Answer, Refusal> {
+        if self.vols.len() >= VOLUMES_MAX {
+            return Err(Refusal::TooMany);
+        }
+        for k in &of.keys {
+            self.mchunks.get_mut(k).expect("a map's").count += 1;
+        }
+        let id = self.next_volume;
+        self.next_volume += 1;
+        self.vols.insert(String::from(name), MVol { id, size_mib: of.size_mib, host: String::from(host), generation: 0,
+                                                   writer: None, readers: Vec::new(), chunks: of.chunks.clone(),
+                                                   kind, origin: of.id, keys: of.keys.clone() });
+        Ok(Answer::Volume { id })
+    }
+
+    /// The copy-up just made numbered as the metadata answered it: the answer
+    /// the model gives then, or None where that number is another chunk's.
+    fn bind_fresh(&mut self, chunk: u32, incarnation: u32) -> Option<Answer> {
+        let k = self.fresh.take()?;
+        if self.key_of(chunk).is_some() {
+            return None;
+        }
+        self.mchunks.get_mut(&k)?.real = Some((chunk, incarnation));
+        Some(Answer::Chunk { chunk, incarnation })
+    }
+
+    /// The metadata's numbers for the model's chunks learned, map by map and
+    /// copy-up by copy-up -- and every one already learned held: one number
+    /// one chunk, counted as the model counts it.
+    fn learn(&mut self, s: &State) -> Option<String> {
+        let mut seen: BTreeMap<u32, u64> = BTreeMap::new();
+        let mut pairs: Vec<(u64, u32)> = Vec::new();
+        for (name, mv) in &self.vols {
+            let v = s.volume(name)?;
+            for (place, (&c, &k)) in v.map.iter().zip(mv.keys.iter()).enumerate() {
+                pairs.push((k, c));
+                if let Some(&other) = seen.get(&c).filter(|&&o| o != k) {
+                    return Some(format!("{}'s chunk {} at {} is the model's {} and {} both", name, c, place, k, other));
+                }
+                seen.insert(c, k);
+            }
+        }
+        let real: Vec<((u32, u32), (u32, u32))> = s.copying().iter().map(|(&a, &b)| (a, b)).collect();
+        if real.len() != self.pending.len() {
+            return Some(format!("{} copy-ups pending, the model {}", real.len(), self.pending.len()));
+        }
+        for ((at, (to, from)), (mat, &(mto, mfrom))) in real.iter().zip(self.pending.iter()) {
+            if at != mat {
+                return Some(format!("a copy-up pending at {:?}, the model's at {:?}", at, mat));
+            }
+            pairs.push((mto, *to));
+            pairs.push((mfrom, *from));
+        }
+        for (k, c) in pairs {
+            let ch = s.chunks().get(c as usize)?;
+            let mc = self.mchunks.get_mut(&k)?;
+            match mc.real {
+                None => mc.real = Some((c, ch.incarnation)),
+                Some(r) if r != (c, ch.incarnation) => {
+                    return Some(format!("the model's chunk {} is the metadata's {:?}, now {} of incarnation {}", k, r,
+                                        c, ch.incarnation));
+                }
+                Some(_) => {}
+            }
+            if u32::from(ch.count) != mc.count || ch.set as usize != mc.set {
+                return Some(format!("chunk {} counted {} in set {}, the model {} in {}", c, ch.count, ch.set, mc.count,
+                                    mc.set));
+            }
+        }
+        None
     }
 
     /// `n` chunks of volume `volume` from its `from`th, by the plan's rules.
@@ -512,7 +682,11 @@ impl Model {
                     return Err(NotAMember);
                 }
                 if let Some(v) = self.vols.get(name) {
-                    return if v.size_mib == *size_mib { Ok(Answer::Volume { id: v.id }) } else { Err(NameTaken) };
+                    return if v.kind == Kind::Volume && v.size_mib == *size_mib {
+                        Ok(Answer::Volume { id: v.id })
+                    } else {
+                        Err(NameTaken)
+                    };
                 }
                 if self.vols.len() >= VOLUMES_MAX {
                     return Err(TooMany);
@@ -527,9 +701,11 @@ impl Model {
                 let placed = p.result?;
                 self.sets_for(&placed)?;
                 let chunks = self.take(&placed);
+                let keys = chunks.iter().map(|&set| self.key_for(set)).collect();
                 self.next_volume += 1;
                 self.vols.insert(name.clone(), MVol { id, size_mib: *size_mib, host: host.clone(), generation: 0,
-                                                      writer: None, readers: Vec::new(), chunks });
+                                                      writer: None, readers: Vec::new(), chunks, kind: Kind::Volume,
+                                                      origin: 0, keys });
                 Ok(Answer::Volume { id })
             }
             Command::VolumeDelete { name } => {
@@ -541,7 +717,10 @@ impl Model {
                     return Err(Attached);
                 }
                 let v = self.vols.remove(name).expect("there");
-                self.give_back(&v.chunks);
+                for &k in &v.keys {
+                    self.release(k);
+                }
+                self.give_up(v.id);
                 Ok(Answer::Volume { id: v.id })
             }
             Command::VolumeResize { name, size_mib } => {
@@ -552,6 +731,9 @@ impl Model {
                     return Err(BadVolume);
                 }
                 let v = self.vols.get(name).ok_or(NoSuchVolume)?.clone();
+                if v.kind != Kind::Volume {
+                    return Err(ReadOnly);
+                }
                 if *size_mib < v.size_mib {
                     return Err(Shrink);
                 }
@@ -566,7 +748,10 @@ impl Model {
                     let placed = p.result?;
                     self.sets_for(&placed)?;
                     let more = self.take(&placed);
-                    self.vols.get_mut(name).expect("there").chunks.extend(more);
+                    let keys: Vec<u64> = more.iter().map(|&set| self.key_for(set)).collect();
+                    let mv = self.vols.get_mut(name).expect("there");
+                    mv.chunks.extend(more);
+                    mv.keys.extend(keys);
                 }
                 self.vols.get_mut(name).expect("there").size_mib = *size_mib;
                 Ok(Answer::Volume { id: v.id })
@@ -580,6 +765,9 @@ impl Model {
                 }
                 let v = self.vols.get_mut(name).ok_or(NoSuchVolume)?;
                 if *writable {
+                    if v.kind != Kind::Volume {
+                        return Err(ReadOnly);
+                    }
                     if let Some((_, g, _)) = v.writer.as_ref().filter(|(h, _, t)| *token != 0 && t == token && h == host) {
                         return Ok(Answer::Attached { generation: *g });
                     }
@@ -787,6 +975,113 @@ impl Model {
                 s.version += 1;
                 Ok(Answer::Set { version: s.version })
             }
+            Command::Snapshot { volume, name, generation } => {
+                if !self.init {
+                    return Err(NotInitialized);
+                }
+                if !m_volume_name(name) {
+                    return Err(BadVolume);
+                }
+                let v = self.vols.get(volume).ok_or(NoSuchVolume)?.clone();
+                if v.kind != Kind::Volume {
+                    return Err(ReadOnly);
+                }
+                if let Some(e) = self.vols.get(name) {
+                    return if e.kind == Kind::Snapshot && e.origin == v.id {
+                        Ok(Answer::Volume { id: e.id })
+                    } else {
+                        Err(NameTaken)
+                    };
+                }
+                if v.writer.as_ref().map_or(0, |(_, g, _)| *g) != *generation {
+                    return Err(NotTheWriter);
+                }
+                self.share(&v, name, &v.host, Kind::Snapshot)
+            }
+            Command::Freeze { name } => {
+                if !self.init {
+                    return Err(NotInitialized);
+                }
+                let v = self.vols.get(name).ok_or(NoSuchVolume)?;
+                match v.kind {
+                    Kind::Image => return Ok(Answer::Volume { id: v.id }),
+                    Kind::Snapshot => return Err(ReadOnly),
+                    Kind::Volume => {}
+                }
+                if v.writer.is_some() || !v.readers.is_empty() {
+                    return Err(Attached);
+                }
+                let id = v.id;
+                self.give_up(id);
+                self.vols.get_mut(name).expect("there").kind = Kind::Image;
+                Ok(Answer::Volume { id })
+            }
+            Command::Clone { from, name, host } => {
+                if !self.init {
+                    return Err(NotInitialized);
+                }
+                if !m_volume_name(name) {
+                    return Err(BadVolume);
+                }
+                if !self.is_member(host) {
+                    return Err(NotAMember);
+                }
+                let v = self.vols.get(from).ok_or(NoSuchVolume)?.clone();
+                if v.kind == Kind::Volume {
+                    return Err(NotFrozen);
+                }
+                if let Some(e) = self.vols.get(name) {
+                    return if e.kind == Kind::Volume && e.origin == v.id {
+                        Ok(Answer::Volume { id: e.id })
+                    } else {
+                        Err(NameTaken)
+                    };
+                }
+                self.share(&v, name, host, Kind::Volume)
+            }
+            Command::CopyUp { name, place, generation } => {
+                let (id, from) = self.writers_place(name, *place, *generation)?;
+                if let Some(&(to, _)) = self.pending.get(&(id, *place)) {
+                    return Ok(self.answer_of(to));
+                }
+                let ch = self.mchunks.get(&from).expect("a map's").clone();
+                if ch.count <= 1 {
+                    return Ok(self.answer_of(from));
+                }
+                if self.pending.len() >= COPYING_MAX || self.live() >= CHUNKS_MAX {
+                    return Err(TooMany);
+                }
+                /* Thin: a slot of every cs of the set, the room kept to rebuild
+                   a host's included */
+                let holders = self.sets[ch.set].holders();
+                if holders.iter().any(|&c| self.cs[c as usize].slots().saturating_sub(self.cs[c as usize].reserved) == 0) {
+                    return Err(NoRoom);
+                }
+                self.sets[ch.set].chunks += 1;
+                for c in holders {
+                    self.cs[c as usize].reserved += 1;
+                }
+                let to = self.key_for(ch.set);
+                self.pending.insert((id, *place), (to, from));
+                self.fresh = Some(to);
+                Ok(Answer::Chunk { chunk: FRESH, incarnation: 0 })
+            }
+            Command::CopyDone { name, place, generation, chunk } => {
+                let (id, from) = self.writers_place(name, *place, *generation)?;
+                if self.mchunks.get(&from).and_then(|c| c.real).map(|r| r.0) == Some(*chunk) {
+                    return Ok(self.answer_of(from));
+                }
+                let to = match self.pending.get(&(id, *place)) {
+                    Some(&(to, was)) if was == from
+                        && self.mchunks.get(&to).and_then(|c| c.real).map(|r| r.0) == Some(*chunk) => to,
+                    _ => return Err(Stale),
+                };
+                self.pending.remove(&(id, *place));
+                let v = self.vols.values_mut().find(|v| v.id == id).expect("there");
+                v.keys[*place as usize] = to;
+                self.release(from);
+                Ok(self.answer_of(to))
+            }
         }
     }
 }
@@ -846,6 +1141,7 @@ fn differs(s: &State, m: &Model) -> Option<String> {
         let writer = v.writer.as_ref().map(|w| (w.host.clone(), w.generation, w.token));
         if v.id != mv.id || v.size_mib != mv.size_mib || v.host != mv.host || v.generation != mv.generation
             || writer != mv.writer || v.readers != mv.readers || v.map.len() != mv.chunks.len()
+            || v.kind != mv.kind || v.origin != mv.origin
         {
             return Some(format!("volume {}: {} {} MiB on {} gen {} writer {:?} readers {:?} {} chunks; the model {} {} \
                                  MiB on {} gen {} writer {:?} readers {:?} {} chunks", name, v.id, v.size_mib, v.host,
@@ -918,6 +1214,27 @@ fn fsck(s: &State) -> Option<String> {
                 Some(n) => *n += 1,
                 None => return Some(format!("volume {}'s map names chunk {}, past the table", v.name, c)),
             }
+        }
+    }
+    /* An image and a snapshot written by none, a snapshot made of a volume,
+       none made of itself (N10) */
+    for v in s.volumes().iter() {
+        if (v.kind != Kind::Volume && v.writer.is_some()) || v.origin == v.id || (v.kind == Kind::Snapshot && v.origin == 0) {
+            return Some(format!("volume {} a {:?} of {} with writer {:?}", v.name, v.kind, v.origin, v.writer));
+        }
+    }
+    /* A copy-up pending (N10): its new chunk counted by it alone, in the old
+       one's set, the old one where the volume's map has it */
+    for (&(vol, place), &(to, from)) in s.copying() {
+        let at = s.volumes().iter().find(|v| v.id == vol).and_then(|v| v.map.get(place as usize).copied());
+        let sets = (chunks.get(to as usize).map(|c| c.set), chunks.get(from as usize).map(|c| c.set));
+        if at != Some(from) || sets.0.is_none() || sets.0 != sets.1 {
+            return Some(format!("copy-up of volume {}'s place {}: {} from {}, its map has {:?}, sets {:?}", vol, place,
+                                to, from, at, sets));
+        }
+        match named.get_mut(to as usize) {
+            Some(n) => *n += 1,
+            None => return Some(format!("copy-up of volume {}'s place {} into chunk {}, past the table", vol, place, to)),
         }
     }
     let mut in_set = vec![0u64; s.sets().len()];
@@ -1000,6 +1317,13 @@ fn fsck(s: &State) -> Option<String> {
     None
 }
 
+/// A volume with copy-ups pending, by name (N10).
+fn pending_volume(r: &mut Rng, s: &State, m: &Model) -> Option<String> {
+    let ids: Vec<u32> = s.copying().keys().map(|&(v, _)| v).collect();
+    let id = r.pick(&ids)?;
+    m.vols.iter().find(|(_, v)| v.id == id).map(|(n, _)| n.clone())
+}
+
 /// A command for the history: of every kind, valid and not.
 fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
     let host = |r: &mut Rng| HOSTS[r.below(HOSTS.len() as u64) as usize].to_string();
@@ -1010,12 +1334,15 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
             m.members[r.below(m.members.len() as u64) as usize].0.clone()
         }
     };
-    let volume = |r: &mut Rng| VOLUMES[r.below(VOLUMES.len() as u64) as usize].to_string();
+    let volume = |r: &mut Rng| {
+        let k = r.below((VOLUMES.len() + SNAPS.len() + CLONES.len()) as u64) as usize;
+        VOLUMES.iter().chain(SNAPS.iter()).chain(CLONES.iter()).nth(k).copied().unwrap_or("v0").to_string()
+    };
     if !m.init {
         *fresh += 1;
         return Command::Init { cluster: [7; 16], name: String::from("nbs"), host: host(r), member: *fresh };
     }
-    match r.below(128) {
+    match r.below(150) {
         0..=7 => {
             *fresh += 1;
             Command::Add { host: host(r), member: if r.chance(5) { 0 } else { *fresh } }
@@ -1037,10 +1364,22 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
         }
         28..=49 => {
             let size_mib = r.pick(&[0u64, 1, 3, 4, 5, 8, 16, 33, 64, 100, 256, 1024, VOLUME_MIB_MAX + 1]).unwrap_or(4);
-            Command::VolumeCreate { name: if r.chance(3) { String::from("Bad_Name") } else { volume(r) }, size_mib,
-                                    host: member(r) }
+            let name = if r.chance(3) {
+                String::from("Bad_Name")
+            } else if r.chance(90) {
+                VOLUMES[r.below(VOLUMES.len() as u64) as usize].to_string()
+            } else {
+                volume(r)
+            };
+            Command::VolumeCreate { name, size_mib, host: member(r) }
         }
-        50..=59 => Command::VolumeDelete { name: volume(r) },
+        50..=59 => {
+            let name = match pending_volume(r, s, m) {
+                Some(n) if r.chance(30) => n,
+                _ => volume(r),
+            };
+            Command::VolumeDelete { name }
+        }
         60..=67 => {
             let name = volume(r);
             let base = m.vols.get(&name).map_or(4, |v| v.size_mib);
@@ -1054,7 +1393,10 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
         68..=79 => Command::Attach { name: volume(r), host: member(r), writable: r.chance(60), force: r.chance(15),
                                      token: r.below(4) },
         80..=86 => {
-            let name = volume(r);
+            let name = match pending_volume(r, s, m) {
+                Some(n) if r.chance(30) => n,
+                _ => volume(r),
+            };
             let (h, generation) = match m.vols.get(&name).and_then(|v| v.writer.clone()) {
                 Some((h, g, _)) if r.chance(70) => (h, g),
                 _ => (member(r), r.pick(&[0u64, 1, 2, 7]).unwrap_or(0)),
@@ -1149,6 +1491,79 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
                 Command::Joined { set, cs, since }
             } else {
                 Command::Unjoin { set, cs, since }
+            }
+        }
+        /* A snapshot (N10): mostly of a volume, at its writer's generation or
+           none, named as snapshots are -- else anything */
+        120..=123 => {
+            let of: Vec<&String> = m.vols.iter().filter(|(_, v)| v.kind == Kind::Volume).map(|(n, _)| n).collect();
+            let volume_name = match r.pick(&of) {
+                Some(n) if r.chance(85) => n.clone(),
+                _ => volume(r),
+            };
+            let generation = match m.vols.get(&volume_name).and_then(|v| v.writer.as_ref()) {
+                Some((_, g, _)) if r.chance(85) => *g,
+                Some(_) => 0,
+                None if r.chance(90) => 0,
+                None => r.below(4),
+            };
+            let name = if r.chance(3) { String::from("Bad_Name") } else { SNAPS[r.below(SNAPS.len() as u64) as usize].to_string() };
+            Command::Snapshot { volume: volume_name, name, generation }
+        }
+        124..=125 => {
+            let name = match pending_volume(r, s, m) {
+                Some(n) if r.chance(50) => n,
+                _ => volume(r),
+            };
+            Command::Freeze { name }
+        }
+        /* A clone: mostly of an image or a snapshot, named as clones are */
+        126..=129 => {
+            let of: Vec<&String> = m.vols.iter().filter(|(_, v)| v.kind != Kind::Volume).map(|(n, _)| n).collect();
+            let from = match r.pick(&of) {
+                Some(n) if r.chance(85) => n.clone(),
+                _ => volume(r),
+            };
+            let name = if r.chance(3) { String::from("Bad_Name") } else { CLONES[r.below(CLONES.len() as u64) as usize].to_string() };
+            Command::Clone { from, name, host: member(r) }
+        }
+        /* A copy-up's first step: mostly of a volume with a writer, at its
+           generation, of a place of its map -- mostly one it shares */
+        130..=135 => {
+            let writing: Vec<(&String, &MVol)> = m.vols.iter().filter(|(_, v)| v.writer.is_some()).collect();
+            let (name, keys, generation) = match r.pick(&writing) {
+                Some((n, v)) if r.chance(85) => (n.clone(), v.keys.clone(), v.writer.as_ref().map_or(0, |w| w.1)),
+                _ => (volume(r), Vec::new(), r.below(4)),
+            };
+            let len = keys.len() as u64;
+            let shared: Vec<u64> = (0..len).filter(|&p| m.mchunks.get(&keys[p as usize]).is_some_and(|c| c.count > 1))
+                .collect();
+            let place = match r.pick(&shared) {
+                Some(p) if r.chance(70) => p,
+                _ if r.chance(95) => r.below(len.max(1)),
+                _ => len + r.below(3),
+            } as u32;
+            let generation = if r.chance(90) { generation } else { generation + 1 + r.below(2) };
+            Command::CopyUp { name, place, generation }
+        }
+        /* Its second: mostly of a copy-up pending, named by its chunk -- else
+           of any place, any chunk */
+        136..=141 => {
+            let pending: Vec<((u32, u32), (u32, u32))> = s.copying().iter().map(|(&a, &b)| (a, b)).collect();
+            match r.pick(&pending) {
+                Some(((vol, place), (to, from))) if r.chance(80) => {
+                    let (name, generation) = m.vols.iter().find(|(_, v)| v.id == vol)
+                        .map_or((volume(r), 0), |(n, v)| (n.clone(), v.writer.as_ref().map_or(0, |w| w.1)));
+                    let chunk = match r.below(10) {
+                        0 => from,
+                        1 => r.below(s.chunks().len() as u64 + 1) as u32,
+                        _ => to,
+                    };
+                    let generation = if r.chance(90) { generation } else { generation + 1 };
+                    Command::CopyDone { name, place, generation, chunk }
+                }
+                _ => Command::CopyDone { name: volume(r), place: r.below(4) as u32, generation: r.below(4),
+                                         chunk: r.below(s.chunks().len() as u64 + 2) as u32 },
             }
         }
         /* A member the scrub found unlike the others (N9e): mostly of a set
@@ -1337,6 +1752,97 @@ fn spoil_counters(r: &mut Rng, s: &State, m: &Model, bytes: &mut [u8]) -> bool {
     true
 }
 
+/// A copy-up pending spoiled in the snapshot (N10): its new chunk made the
+/// old one, its place another, or its old chunk one of another set. Found by
+/// its values as NBM6 writes it -- the volume's number, the place, the new
+/// chunk, the old, each four bytes -- the rest left whole, so that the check
+/// of copy-ups pending is the one to refuse it. A format that writes them
+/// otherwise finds none here, and the `copying_checked` mutant then says so.
+fn spoil_copying(r: &mut Rng, s: &State, bytes: &mut [u8]) -> bool {
+    let pending: Vec<((u32, u32), (u32, u32))> = s.copying().iter().map(|(&a, &b)| (a, b)).collect();
+    let Some(((vol, place), (to, from))) = r.pick(&pending) else { return false };
+    let mut needle = Vec::new();
+    for x in [vol, place, to, from] {
+        needle.extend_from_slice(&x.to_le_bytes());
+    }
+    let Some(at) = bytes.windows(16).position(|w| w == needle.as_slice()) else { return false };
+    let other = (0..s.chunks().len() as u32)
+        .find(|&c| s.chunks().get(c as usize).is_some_and(|x| !x.is_free() && Some(x.set) != s.chunks().get(from as usize).map(|f| f.set)));
+    match r.below(3) {
+        0 => bytes[at + 8..at + 12].copy_from_slice(&from.to_le_bytes()),
+        1 => bytes[at + 4..at + 8].copy_from_slice(&place.wrapping_add(1).to_le_bytes()),
+        _ => match other {
+            Some(o) => bytes[at + 12..at + 16].copy_from_slice(&o.to_le_bytes()),
+            None => return false,
+        },
+    }
+    true
+}
+
+/// A volume's kind or origin spoiled in the snapshot (N10): one with a
+/// writer made an image, a snapshot made of nothing, or one made of itself.
+/// Found by its values as the snapshot writes it -- its number, its name,
+/// its size, its kind -- the rest left whole, so that the check of
+/// read-only volumes is the one to refuse it. A format that writes them
+/// otherwise finds none here, and the `read_only_checked` mutant then says
+/// so.
+fn spoil_read_only(r: &mut Rng, s: &State, bytes: &mut [u8]) -> bool {
+    let vols: Vec<usize> = (0..s.volumes().len()).collect();
+    let Some(v) = r.pick(&vols).and_then(|i| s.volumes().get(i)) else { return false };
+    let code = match v.kind {
+        Kind::Volume => 0u8,
+        Kind::Image => 1,
+        Kind::Snapshot => 2,
+    };
+    let mut needle = v.id.to_le_bytes().to_vec();
+    needle.push(v.name.len() as u8);
+    needle.extend_from_slice(v.name.as_bytes());
+    needle.extend_from_slice(&v.size_mib.to_le_bytes());
+    needle.push(code);
+    let Some(at) = bytes.windows(needle.len()).position(|w| w == needle.as_slice()) else { return false };
+    let (kind_at, origin_at) = (at + needle.len() - 1, at + needle.len());
+    if v.writer.is_some() {
+        bytes[kind_at] = 1 + r.below(2) as u8;
+    } else if v.kind == Kind::Snapshot && r.chance(50) {
+        bytes[origin_at..origin_at + 4].copy_from_slice(&0u32.to_le_bytes());
+    } else {
+        bytes[origin_at..origin_at + 4].copy_from_slice(&v.id.to_le_bytes());
+    }
+    true
+}
+
+/// A free chunk's link spoiled in the snapshot: the next free chunk made one
+/// in use, itself, or the list's end. Found by its values as the snapshot
+/// writes a chunk -- its link, a count of none, the free flag, its
+/// incarnation -- the rest left whole, so that the check of the free list is
+/// the one to refuse it. A format that writes them otherwise finds none
+/// here, and the `free_list_checked` mutant then says so.
+fn spoil_free_list(r: &mut Rng, s: &State, bytes: &mut [u8]) -> bool {
+    let free_at = |c: u32| s.chunks().get(c as usize).is_some_and(|x| x.is_free());
+    let free: Vec<u32> = (0..s.chunks().len() as u32).filter(|&c| free_at(c)).collect();
+    let used: Vec<u32> = (0..s.chunks().len() as u32).filter(|&c| !free_at(c)).collect();
+    let Some(c) = r.pick(&free) else { return false };
+    let Some(&ch) = s.chunks().get(c as usize) else { return false };
+    let mut needle = ch.set.to_le_bytes().to_vec();
+    needle.extend_from_slice(&0u16.to_le_bytes());
+    needle.push(nbsmeta::CHUNK_FREE);
+    needle.extend_from_slice(&ch.incarnation.to_le_bytes());
+    let Some(at) = bytes.windows(needle.len()).position(|w| w == needle.as_slice()) else { return false };
+    let next = match r.below(3) {
+        0 => match r.pick(&used) {
+            Some(u) => u,
+            None => return false,
+        },
+        1 => c,
+        _ => nbsmeta::NO_CHUNK,
+    };
+    if next == ch.set {
+        return false;
+    }
+    bytes[at..at + 4].copy_from_slice(&next.to_le_bytes());
+    true
+}
+
 /// `cmd`'s bytes, now and then spoiled.
 fn entry(r: &mut Rng, cmd: &Command) -> Vec<u8> {
     let mut b = cmd.encode();
@@ -1406,7 +1912,17 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
            to the kernel's heap, the model's is not */
         let (want, unfair) = {
             let _model = Exempt::new();
-            m.apply(decoded.as_ref())
+            let (want, unfair) = m.apply(decoded.as_ref());
+            /* A copy-up's new chunk numbered as the metadata answers: the
+               number held from then on */
+            let want = match (want, got) {
+                (Answer::Chunk { chunk: FRESH, .. }, Answer::Chunk { chunk, incarnation }) => {
+                    m.bind_fresh(chunk, incarnation).unwrap_or(want)
+                }
+                _ => want,
+            };
+            m.fresh = None;
+            (want, unfair)
         };
         if trace {
             eprintln!("step {}: {:?} -> {:?}", step, decoded, got);
@@ -1427,7 +1943,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         *answers.entry(kind).or_default() += 1;
         let differ = {
             let _model = Exempt::new();
-            differs(&s, &m).or_else(|| fsck(&s)).or_else(|| incarnations(&s, &mut lives))
+            differs(&s, &m).or_else(|| m.learn(&s)).or_else(|| fsck(&s)).or_else(|| incarnations(&s, &mut lives))
         };
         if let Some(d) = differ {
             return Err(format!("step {} after {:?}: {}", step, decoded, d));
@@ -1530,6 +2046,24 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
                             return Err(format!("step {}: a snapshot whose counters were spoiled taken: {:?} answered \
                                                 {:?} of it, {:?} of the state", step, p, y, x));
                         }
+                    }
+                }
+            }
+            /* A copy-up pending and a read-only volume aimed at (N10), as the
+               counters are: refused, or -- taken -- held to fsck */
+            let mut aim = Rng::new(mix(mix(seed, 0x636f_7079), step));
+            let mut aimed_at = whole.clone();
+            let spoiled_one = match aim.below(4) {
+                0 => spoil_copying(&mut aim, &s, &mut aimed_at),
+                1 => spoil_read_only(&mut aim, &s, &mut aimed_at),
+                2 => spoil_free_list(&mut aim, &s, &mut aimed_at),
+                _ => false,
+            };
+            if spoiled_one {
+                if let Ok(t) = State::decode(&aimed_at) {
+                    if let Some(d) = fsck(&t) {
+                        return Err(format!("step {}: a snapshot spoiled where it holds a copy-up, a read-only volume or \
+                                            the free list taken that breaks a rule: {}", step, d));
                     }
                 }
             }
