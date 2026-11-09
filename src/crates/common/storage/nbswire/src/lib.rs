@@ -89,6 +89,11 @@ pub enum Op<'a> {
     /// The leader's scrub (N9e): the chunk's record and the sums of all of
     /// it, no epoch moved on.
     Scrub { chunk: ChunkRef },
+    /// A copy-up's copy, the volume's writer's (N10): chunk `from`, at map
+    /// place `position`, copied into the new chunk `to` of its set -- the
+    /// copy-up pending in the metadata at entry `index` at least. Durable
+    /// before it is answered; done again, nothing.
+    CopyUp { from: ChunkRef, to: ChunkRef, position: u32, index: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,7 +113,6 @@ pub enum Refusal {
     StaleChunk { incarnation: u32 },
     /// The epoch the cs and its mds know the chunk at.
     Epoch { known: Epoch },
-    NotTheVolumes,
     NoRoom,
     Bad,
     Failed,
@@ -117,7 +121,8 @@ pub enum Refusal {
     /// The mds: no such chunk at that place of that volume's map, at that
     /// incarnation.
     NotTheMap,
-    /// The mds: this host's cs is not in the chunk's set.
+    /// The mds: this host's cs is not in the chunk's set -- not an active
+    /// member of it, where the request reads, or copies.
     NotHere,
     /// The mds: the generation is not the volume's attach's.
     NotAttached,
@@ -183,6 +188,11 @@ pub enum Question {
     VerifyJoin { set: u32, joiner: u32, version: u32, index: u64 },
     /// The joins this host's cs is the joiner of.
     Joins,
+    /// A copy-up's copy (N10): the copy-up pending at map place `position`
+    /// of the volume, from chunk `from` to chunk `to`, asked by the volume's
+    /// writer at `generation`, this cs an active member of their set at its
+    /// version now -- at entry `index` at least.
+    VerifyCopy { volume: u32, generation: u64, position: u32, from: ChunkRef, to: ChunkRef, index: u64 },
     /// The join of set `set`, begun at `since`, done: its end proposed --
     /// the cs takes its place -- and told once it is applied.
     JoinDone { set: u32, since: u32 },
@@ -286,7 +296,6 @@ fn refusal(w: &mut Writer, why: &Refusal) {
             w.u32(known.set);
             w.u32(known.version);
         }
-        Refusal::NotTheVolumes => w.u8(5),
         Refusal::NoRoom => w.u8(6),
         Refusal::Bad => w.u8(7),
         Refusal::Failed => w.u8(8),
@@ -312,7 +321,6 @@ fn read_refusal(r: &mut Reader<'_>) -> Option<Refusal> {
         2 => Refusal::NotFenced { generation: r.u64()? },
         3 => Refusal::StaleChunk { incarnation: r.u32()? },
         4 => Refusal::Epoch { known: Epoch { set: r.u32()?, version: r.u32()? } },
-        5 => Refusal::NotTheVolumes,
         6 => Refusal::NoRoom,
         7 => Refusal::Bad,
         8 => Refusal::Failed,
@@ -342,7 +350,6 @@ impl Refusal {
             /* Asked of the mds by the cs before it answers: a client never
                sees it */
             E::Unverified => Refusal::NotReady,
-            E::NotTheVolumes => Refusal::NotTheVolumes,
             E::NoRoom => Refusal::NoRoom,
             E::Bad => Refusal::Bad,
             E::Failed => Refusal::Failed,
@@ -361,7 +368,6 @@ impl Refusal {
             Refusal::NotFenced { .. } => "not fenced at this generation yet",
             Refusal::StaleChunk { .. } => "the chunk's number is a newer chunk's",
             Refusal::Epoch { .. } => "the chunk is at another epoch",
-            Refusal::NotTheVolumes => "the chunk is another volume's",
             Refusal::NoRoom => "no room on the cs's devices",
             Refusal::Bad => "past the chunk, not whole sectors, or empty",
             Refusal::Failed => "the device the chunk is on failed",
@@ -441,6 +447,13 @@ impl Request<'_> {
                 w.u8(11);
                 chunk_ref(&mut w, chunk);
             }
+            Op::CopyUp { from, to, position, index } => {
+                w.u8(12);
+                chunk_ref(&mut w, from);
+                chunk_ref(&mut w, to);
+                w.u32(*position);
+                w.u64(*index);
+            }
         }
         w.buf
     }
@@ -491,6 +504,8 @@ impl<'a> Request<'a> {
                 }
             }
             11 => Op::Scrub { chunk: read_chunk_ref(&mut r)? },
+            12 => Op::CopyUp { from: read_chunk_ref(&mut r)?, to: read_chunk_ref(&mut r)?, position: r.u32()?,
+                               index: r.u64()? },
             _ => return None,
         };
         r.done().then_some(Request { id, volume, generation, op })
@@ -686,6 +701,15 @@ impl Query {
                 w.u32(*set);
                 w.u32(*since);
             }
+            Question::VerifyCopy { volume, generation, position, from, to, index } => {
+                w.u8(9);
+                w.u32(*volume);
+                w.u64(*generation);
+                w.u32(*position);
+                chunk_ref(&mut w, from);
+                chunk_ref(&mut w, to);
+                w.u64(*index);
+            }
         }
         w.buf
     }
@@ -732,6 +756,11 @@ impl Query {
             6 => Question::Joins,
             7 => Question::JoinDone { set: r.u32()?, since: r.u32()? },
             8 => Question::GiveUp { set: r.u32()?, since: r.u32()? },
+            9 => {
+                let (volume, generation, position) = (r.u32()?, r.u64()?, r.u32()?);
+                let (from, to) = (read_chunk_ref(&mut r)?, read_chunk_ref(&mut r)?);
+                Question::VerifyCopy { volume, generation, position, from, to, index: r.u64()? }
+            }
             _ => return None,
         };
         r.done().then_some(Query { id, question })

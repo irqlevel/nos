@@ -22,6 +22,13 @@
 //! - **A copy writes no sector a client has** since the join of its set
 //!   began: those are marked first, and a copy into a set not joined is
 //!   refused.
+//! - **Another volume's chunk is read or written only once the host's mds
+//!   vouches** that the volume's map names it (N10): a snapshot's or a
+//!   clone's map shares the chunks of what it was made of. Written, it is
+//!   the writer's volume's from then on, as a reconcile looks for it.
+//! - **A copy-up's chunk is durable before it is answered** (N10), its data
+//!   before its record, and never written over once held: what a client
+//!   wrote to it since is kept.
 
 use alloc::collections::BTreeMap;
 use alloc::vec;
@@ -31,7 +38,7 @@ use nbsmeta::Pieces;
 
 use crate::device::Device;
 use crate::format::*;
-use crate::{GRANULE, PAGE, SECTOR, SLOT};
+use crate::{COPY_PIECE, GRANULE, PAGE, SECTOR, SLOT};
 
 /// Why a request was not done.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,11 +55,9 @@ pub enum Error {
     /// The cs knows the chunk at another epoch: one to be checked with its
     /// host's mds.
     Epoch { known: Epoch },
-    /// A chunk this cs does not hold: its first write is checked with its
-    /// host's mds first.
+    /// A chunk this cs does not hold, or another volume's (N10): checked
+    /// with its host's mds first.
     Unverified,
-    /// Another volume's chunk.
-    NotTheVolumes,
     /// Every device that takes new chunks is full.
     NoRoom,
     /// Past the chunk, not whole sectors of the device, empty, or a volume
@@ -635,18 +640,23 @@ impl<D: Device> Store<D> {
         let (dv, slot) = match found {
             Some((dv, slot, r)) => {
                 self.span(Some(dv), offset, data.len())?;
-                if r.volume != volume {
-                    return Err(Error::NotTheVolumes);
+                /* Another volume's (N10): a clone's chunk that its image, deleted,
+                   named before -- written once the mds vouches that this
+                   volume's map names it */
+                if r.volume != volume && !verified {
+                    return Err(Error::Unverified);
                 }
                 if r.known != c.epoch && (!verified || older(c.epoch, r.known)) {
                     return Err(Error::Epoch { known: r.known });
                 }
-                /* The first write of this generation or epoch: the open mark
-                   durable before it */
+                /* The first write of this generation or epoch, or of this
+                   volume's: the open mark durable before it -- the writer's
+                   volume's, which its reconcile asks of the cs, and its flush
+                   is held to (`found_open_in`) */
                 if r.state != SlotState::Open || r.generation != generation || r.written != c.epoch
-                    || r.known != c.epoch
+                    || r.known != c.epoch || r.volume != volume
                 {
-                    let open = Record { state: SlotState::Open, known: c.epoch, written: c.epoch, generation,
+                    let open = Record { state: SlotState::Open, known: c.epoch, written: c.epoch, volume, generation,
                                         seq: r.seq + 1, ..r };
                     self.put(dv, slot, open)?;
                 }
@@ -718,9 +728,11 @@ impl<D: Device> Store<D> {
             return Ok(());
         };
         self.span(Some(dv), offset, buf.len())?;
-        /* Nothing of one volume's is read through another's */
-        if r.volume != volume {
-            return Err(Error::NotTheVolumes);
+        /* Another volume's -- a snapshot's or a clone's map shares it (N10)
+           -- read once the mds vouches that this volume's map names it:
+           nothing of one volume's is read through another's otherwise */
+        if r.volume != volume && !verified {
+            return Err(Error::Unverified);
         }
         if r.known != c.epoch && (!verified || older(c.epoch, r.known)) {
             return Err(Error::Epoch { known: r.known });
@@ -964,7 +976,9 @@ impl<D: Device> Store<D> {
     /// held as `volume`'s: written where no client's write has marked a
     /// sector -- the client's is newer, and the source has it or will. A
     /// chunk the cs does not hold taken in as a first write takes it, open
-    /// at no writer's generation; one it holds opened at the copy's epoch.
+    /// at no writer's generation; one it holds opened at the copy's epoch,
+    /// held as whichever volume's it was -- the source's data is the set's,
+    /// and another volume's chunk is the next write's to vouch for (N10).
     /// Refused where the set is not joined: with no marks kept, a copy could
     /// write over a client's write.
     pub fn copy_in(&mut self, volume: u32, c: ChunkRef, offset: u32, data: &[u8]) -> Result<(), Error> {
@@ -974,9 +988,6 @@ impl<D: Device> Store<D> {
         let (dv, slot) = match self.find(&c)? {
             Some((dv, slot, r)) => {
                 self.span(Some(dv), offset, data.len())?;
-                if r.volume != volume {
-                    return Err(Error::NotTheVolumes);
-                }
                 if r.known.set != c.epoch.set || r.known.version > c.epoch.version {
                     return Err(Error::Epoch { known: r.known });
                 }
@@ -1021,6 +1032,77 @@ impl<D: Device> Store<D> {
             }
             dev.dirty = true;
         }
+        Ok(())
+    }
+
+    /// Chunk `from` copied into chunk `to` of its set, for `volume`'s writer
+    /// at `generation`, before it writes a chunk others share (N10): `to`
+    /// held as the volume's, closed, written at its epoch -- so that a member
+    /// back copies it -- and durable before the answer, its data before its
+    /// record. `to` held already, the copy was done: what it holds is kept,
+    /// a client's writes since among it. `from` held by none here -- never
+    /// written -- the copy is zeros, as `to` reads held by none.
+    /// `verified`: the copy-up checked with the host's mds, needed for a
+    /// `to` the cs does not hold. Refused where `from` was found open: it
+    /// may lack what its writer wrote since its last flush, which the copy
+    /// would keep for good.
+    pub fn copy_up(&mut self, volume: u32, generation: u64, from: ChunkRef, to: ChunkRef, verified: bool)
+        -> Result<(), Error> {
+        self.check_fence(volume, generation)?;
+        if from.epoch != to.epoch || from.chunk == to.chunk {
+            return Err(Error::Bad);
+        }
+        if self.find(&to)?.is_some() {
+            return Ok(());
+        }
+        if !verified {
+            return Err(Error::Unverified);
+        }
+        self.not_found_open(&from)?;
+        let Some((fdv, fslot, r)) = self.find(&from)? else { return Ok(()) };
+        if older(from.epoch, r.known) {
+            return Err(Error::Epoch { known: r.known });
+        }
+        /* The slot of the chunk `to`'s number was given back first, as a
+           first write's is */
+        if let Some((odv, oslot)) = self.at.get(&to.chunk).copied() {
+            self.release(odv, oslot)?;
+            self.at.remove(&to.chunk);
+        }
+        let dv = self.pick().ok_or(Error::NoRoom)?;
+        /* Taken off the free list only once its record is written: a copy
+           that fails before leaves the slot free, what it wrote there no
+           chunk's */
+        let top = self.devs[dv].free.len().checked_sub(1).ok_or(Error::NoRoom)?;
+        let slot = *self.devs[dv].free.get(top).ok_or(Error::NoRoom)?;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(COPY_PIECE as usize).map_err(|_| Error::NoMemory)?;
+        let mut at = 0;
+        while at < SLOT {
+            let n = (SLOT - at).min(COPY_PIECE);
+            buf.resize(n as usize, 0);
+            self.read_at(fdv, fslot, at as u32, &mut buf)?;
+            let dev = &mut self.devs[dv];
+            if dev.d.write(dev.layout.data + u64::from(slot) * SLOT + at, &buf).is_err() {
+                dev.failed = true;
+                return Err(Error::Io);
+            }
+            at += n;
+        }
+        /* The data durable before the record that names it: a device keeps
+           or loses what it holds unflushed in any order */
+        let dev = &mut self.devs[dv];
+        if dev.d.flush().is_err() {
+            dev.failed = true;
+            return Err(Error::Io);
+        }
+        dev.dirty = false;
+        let old = self.record(dv, slot);
+        self.put(dv, slot, Record { state: SlotState::Written, chunk: to.chunk, incarnation: to.incarnation,
+                                    known: to.epoch, written: to.epoch, volume, generation: 0, seq: old.seq + 1 })?;
+        /* The slot looked at above: nothing has taken from the list since */
+        self.devs[dv].free.pop();
+        self.at.insert(to.chunk, (dv, slot));
         Ok(())
     }
 

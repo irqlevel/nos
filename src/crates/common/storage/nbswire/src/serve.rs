@@ -169,6 +169,27 @@ pub fn serve<D: Device>(store: &mut Store<D>, vouched: &mut Vouched, req: &Reque
            no data -- answered as a ping is, unvouched */
         Op::Scrub { chunk } => store.scrub(chunk)
             .map(|(open, written, sums)| Done::Scrub { open, written, sums }).map_err(Refusal::of),
+        Op::CopyUp { from, to, position, index } => {
+            copied(store, ask, v, g, from, to, position, index)?;
+            Ok(Done::Done)
+        }
+    }
+}
+
+/// A copy-up's copy done on the store (N10) -- where the cs does not hold
+/// its new chunk yet, asked of the mds first, every time: once per copy-up,
+/// and done again only where the copy was lost.
+#[allow(clippy::too_many_arguments)]
+fn copied<D: Device>(store: &mut Store<D>, ask: &mut dyn FnMut(Question) -> Option<Told>, volume: u32,
+                     generation: u64, from: ChunkRef, to: ChunkRef, position: u32, index: u64) -> Result<(), Refusal> {
+    match store.copy_up(volume, generation, from, to, false) {
+        Err(Error::Unverified) => {}
+        done => return done.map_err(Refusal::of),
+    }
+    match ask(Question::VerifyCopy { volume, generation, position, from, to, index }) {
+        Some(Told::Verified) => store.copy_up(volume, generation, from, to, true).map_err(Refusal::of),
+        Some(Told::Refused(why)) => Err(why),
+        _ => Err(Refusal::NoMds),
     }
 }
 

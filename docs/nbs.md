@@ -194,8 +194,14 @@ to drive them (N10b-N10d):
   copies it locally; its room taken on each, refused as `NoRoom` where one
   has none left -- the room kept to rebuild a host may go to it. Pending, the
   old chunk named by the map still, so that nothing can free it while the
-  cs's copy it. Asked again, it is answered the pending chunk; of a chunk
-  shared no longer, the chunk itself.
+  cs's copy it (`Op::CopyUp`, below). Asked again, it is answered the
+  pending chunk; of a chunk shared no longer, the chunk itself. Refused as
+  `Joining` in a set being joined (N10b): a joiner lists what its source
+  holds once, and a new chunk behind its listing would never reach it -- so
+  a join gives up its set's copy-ups pending as it begins, their writers ask
+  again once it is over, and what the cs's copied for them is freed as any
+  chunk gone. A join still needs room for every chunk of the set, those
+  among it: the controller plans none with less.
 - `CopyDone { name, place, generation, chunk }` -- the map names the new
   chunk, the old one counted down, freed at none.
 
@@ -594,7 +600,40 @@ then       the slots, 4 MiB each: the chunks' data
   record that gives it the slot: what was freed is never read through another
   chunk.
 - **A close is durable only after the chunk's data is**: it flushes first.
-- **Nothing of one volume's is read or written through another's.**
+- **Another volume's chunk is read or written only once the host's mds
+  vouches** that this volume's map names it (N10b): a snapshot's or a
+  clone's map shares the chunks of what it was made of, and a clone whose
+  image is deleted writes the image's chunks it alone names. Written, the
+  chunk is the writer's volume's from then on -- what its reconcile asks the
+  cs for, and what its flush is held to.
+- **A copy-up's chunk is durable before it is answered**, its data before
+  its record, and never written over once held (below).
+
+### A copy-up's copy (N10b)
+
+Before a writer writes a chunk others share, it asks the metadata
+`CopyUp`, then has each active member of the chunk's set copy it into the
+new chunk, locally (`Op::CopyUp { from, to, position, index }`), then asks
+`CopyDone` (N10c). On a cs (`Store::copy_up`):
+- a new chunk the cs does not hold is asked of its mds first
+  (`Question::VerifyCopy`), every time -- once a copy-up;
+- the copy is of the whole chunk, 256 KiB at a time, into a slot the cs
+  takes off its free list only once the chunk's record is written: a copy
+  that fails part way leaves the slot free;
+- its data is flushed before its record is written -- closed, the copy-up's
+  volume's, written at the set's version now, so that a member back copies
+  it as any chunk written while it was out;
+- asked again, with the new chunk held, it does nothing: what the writer
+  wrote to it since is kept;
+- the old chunk held by none here -- never written -- the new one is not
+  taken either: both read as zeros;
+- refused where the old chunk was found open at the cs's start: it may lack
+  what its writer wrote since its last flush, which the copy would keep for
+  good. The writer takes the member out, and it copies the new chunk when
+  it comes back.
+
+A copy-up holds the cs's task for its copy -- 4 MiB read and written, and
+three flushes.
 
 ### Checked with the host's mds
 
@@ -612,7 +651,11 @@ which the client asks again. It vouches that:
 - a write is the volume's writer's, at its attach's generation; a read of
   generation 0 is a read-only one's.
 
-What the mds vouched for is kept, up to 65536 of them.
+What the mds vouched for is kept, up to 65536 of them. A copy-up's copy it
+vouches for (N10b) where the copy-up is pending at that place of that
+volume, from that chunk to that one at their incarnations, both at the
+set's version now, this host's cs an active member of the set, and the
+volume's writer of now asking.
 
 ### What is freed
 
@@ -853,11 +896,11 @@ image's zeros out.
   finding is held to it, and the members taken down as a person would are
   copied again: every replica alike.
 
-  `--mutants` takes a hundred and thirty-five rules out one at a time --
-  sixty-seven of the metadata's, five of them the controller's; twenty-seven
-  of the cs's, twelve of them the copy's; twenty of the wire's, its `serve`'s,
-  the mds's, the copy's and the scrub's; twenty-one of the client's -- each
-  caught.
+  `--mutants` takes a hundred and fifty-eight rules out one at a time --
+  sixty-nine of the metadata's, five of them the controller's; forty of the
+  cs's, twelve of them the copy's and eleven a copy-up's; twenty-eight of the
+  wire's, its `serve`'s, the mds's, the copy's and the scrub's; twenty-one of
+  the client's -- each caught.
 - **`fuzz/raft`'s `nbsmeta` target**: the members' part of the state, its
   commands from pools of names and incarnations that meet and from wide ones
   that fill the cluster. There are four scenarios and six mutants.

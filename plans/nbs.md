@@ -1208,6 +1208,13 @@ each new gate.
     copy-up pending: the next writer's asks find it and finish it; a
     member down meanwhile has the new chunk by its join's copy, as any
     chunk it does not hold; a volume deleted frees its pending ones.
+    Copy-ups and joins never meet in a set (found designing N10b): a joiner
+    lists what its source holds once, so a new chunk behind its listing
+    would never reach it. A copy-up into a set being joined is refused
+    (`Joining`), and a join gives up its set's copy-ups pending as it
+    begins; their writers ask again once it is over -- a write to a shared
+    chunk of a set being joined waits for the join -- and what the cs's
+    copied for them is garbage, freed as any chunk gone.
   - **An attached volume's snapshot**: the leader asks the writer's session
     to pause -- nothing new sent, its writes out answered, a flush -- and
     to answer with its generation; commits the snapshot at it; tells the
@@ -1248,6 +1255,45 @@ each new gate.
     rare case, caught at seed 548: the meta target's gate runs 1000 seeds
     now, not 300 (two seconds). The meta target 30000 seeds; raft-test; the
     gate; make check, both arches and their modules built.
+  - **N10b, done** (2026-11-09): the cs's copy-up. nbsmeta: copy-ups and
+    joins never meet in a set; a join still needs room for every chunk of
+    the set, the pending ones' among it -- the controller plans none with
+    less, so a join's room less them would be a rule nothing reaches.
+    nbswire: `Op::CopyUp { from, to, position,
+    index }` and `Question::VerifyCopy`, which the mds answers from its
+    state -- the copy-up pending at that place, from that chunk to that one
+    at their incarnations, both at the set's version now, the host's cs an
+    active member, the volume's writer of now asking; `serve` asks it where
+    the cs does not hold the new chunk. nbscs's `Store::copy_up`: the whole
+    chunk, 256 KiB at a time, into a slot taken off the free list only once
+    the record is written; the data flushed before the record -- closed, the
+    volume's, written at the set's version now, so that a member back copies
+    it; asked again with the new chunk held, nothing; of a chunk never
+    written here, nothing taken; refused of a chunk found open, and of an
+    epoch older than the one the cs knows. Another volume's chunk is read
+    and written once the mds vouches that this volume's map names it -- a
+    snapshot's, a clone's, or a clone's alone once its image is deleted --
+    and written, it is the writer's volume's from then on, as its reconcile
+    looks for it; `NotTheVolumes` is gone, and a joiner's copy holds a chunk
+    as whichever volume's it was. The cs target serves copy-ups through
+    `serve`, the fuzzer the mds, power cut at any of their writes; another
+    volume's reads and writes; the meta target holds what the mds vouches of
+    a copy-up to its model. Mutants: 158, the twenty-three new ones each
+    caught -- the copy-up's power cut aimed past its data, where its
+    record's first flush is, and its stale epoch at the one the cs knows,
+    which random draws reached in 5 and 10 of the gate's 200 seeds.
+  - **For N10c, found on the way**: the snapshot's pause closes every chunk
+    the writer has open, as well as flushing, so that a snapshot shares
+    closed chunks only -- the scrub compares no open chunk, and one left open
+    for good would be found open at every start of its cs. `serve`'s
+    refusal of a chunk found open to its writer compares the writer's volume
+    as well as its generation: a clone writes a chunk recorded as another
+    volume's once its image is deleted, and generations are counted by
+    volume. A writer refused `Joining` waits for the join and asks again.
+    A volume with no writer has no chunk open -- the client closes every
+    chunk it wrote before it detaches, and a writer that dies stays attached
+    until the next one's reconcile -- which a snapshot of it, or a freeze,
+    leans on.
 - **N11, numbers.** On the hardware, and what they ask for: pages that move
   instead of copies (a message's pages lent to a `DiskQueue`), chain
   replication (the writer's NIC sending one copy instead of two), TCP's T4

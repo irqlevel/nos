@@ -473,7 +473,7 @@ impl Server {
             self.answer(m, Answer { id: req.id, reply: Reply::Refused(Refusal::NotReady) });
             return;
         }
-        if matches!(req.op, Op::Fence | Op::Close { .. }) {
+        if matches!(req.op, Op::Fence | Op::Close { .. } | Op::CopyUp { .. }) {
             self.changed = true;
         }
         let link = &mut self.link;
