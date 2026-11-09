@@ -38,3 +38,16 @@ pub const SECTOR: u64 = 512;
 /// What a sum covers (N9): a joiner holds its copy to its source's by one
 /// CRC-32C of each.
 pub const GRANULE: u32 = 64 << 10;
+
+/// The sums of a chunk of zeros, one a `GRANULE`, as `Store::sums` and
+/// `Store::scrub` give them: what a chunk a cs does not hold reads as -- a
+/// slot is zeros before a chunk takes it -- for the leader's scrub to hold
+/// it to the copies of members that do (N9e).
+pub fn zero_sums() -> alloc::vec::Vec<u32> {
+    let zeros = [0u8; SECTOR as usize];
+    let mut sum = 0;
+    for _ in 0..u64::from(GRANULE) / SECTOR {
+        sum = crc::crc32c::update(sum, &zeros);
+    }
+    alloc::vec![sum; (SLOT / u64::from(GRANULE)) as usize]
+}

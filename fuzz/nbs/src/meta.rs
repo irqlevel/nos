@@ -760,6 +760,33 @@ impl Model {
                 }
                 self.unjoin(*set as usize, *cs, *since)
             }
+            Command::ReplicaBad { set, cs, version } => {
+                if !self.init {
+                    return Err(NotInitialized);
+                }
+                let s = self.sets.get(*set as usize).ok_or(NoSuchSet)?;
+                if s.version != *version {
+                    return Err(Stale);
+                }
+                if s.joiner.is_some() {
+                    return Err(Joining);
+                }
+                let at = s.cs.iter().position(|c| c == cs).ok_or(NoSuchSet)?;
+                if s.down[at] {
+                    return Err(AlreadyDown);
+                }
+                if (0..REPLICAS).all(|i| i == at || s.down[i]) {
+                    return Err(LastReplica);
+                }
+                if s.version == u32::MAX {
+                    return Err(TooMany);
+                }
+                let s = &mut self.sets[*set as usize];
+                s.down[at] = true;
+                s.until[at] = s.version;
+                s.version += 1;
+                Ok(Answer::Set { version: s.version })
+            }
         }
     }
 }
@@ -988,7 +1015,7 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
         *fresh += 1;
         return Command::Init { cluster: [7; 16], name: String::from("nbs"), host: host(r), member: *fresh };
     }
-    match r.below(124) {
+    match r.below(128) {
         0..=7 => {
             *fresh += 1;
             Command::Add { host: host(r), member: if r.chance(5) { 0 } else { *fresh } }
@@ -1123,6 +1150,29 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
             } else {
                 Command::Unjoin { set, cs, since }
             }
+        }
+        /* A member the scrub found unlike the others (N9e): mostly of a set
+           with three active members and no joiner, at its version -- else
+           anything */
+        116..=119 => {
+            let sets = m.sets.len() as u64;
+            let whole: Vec<usize> = (0..m.sets.len())
+                .filter(|&i| m.sets[i].joiner.is_none() && !m.sets[i].down.contains(&true)).collect();
+            let set = match r.pick(&whole) {
+                Some(i) if r.chance(85) => i,
+                _ => r.below(sets + 2) as usize,
+            };
+            let ms = m.sets.get(set);
+            let cs = match ms {
+                Some(ms) if r.chance(85) => ms.cs[r.below(REPLICAS as u64) as usize],
+                _ => r.below(m.cs.len() as u64 + 1) as u32,
+            };
+            let version = match ms {
+                Some(ms) if r.chance(85) => ms.version,
+                Some(ms) => ms.version.saturating_sub(1),
+                None => 1,
+            };
+            Command::ReplicaBad { set: set as u32, cs, version }
         }
         /* What the controller proposes, as a leader seeing the cs's so */
         _ => {
@@ -1265,6 +1315,25 @@ fn spoil_joiner(r: &mut Rng, s: &State, bytes: &mut [u8]) -> bool {
             bytes[cs_at..cs_at + 4].copy_from_slice(&c.to_le_bytes());
         }
     }
+    true
+}
+
+/// The state's counters spoiled in its snapshot: the next device's number,
+/// or the next volume's, made 0 -- which applying never leaves them at, so
+/// that a device or a volume added after would be numbered 0. Found by their
+/// values, as the snapshot's header writes them -- the next device's number,
+/// the next volume's, the next check's index, the head of the free chunks
+/// -- the model's and the state's own; the rest left whole, so that the
+/// check of the counters is the one to refuse it. A format that writes them
+/// otherwise finds none here, and the `counters_checked` mutant then says
+/// so. False where they are not found.
+fn spoil_counters(r: &mut Rng, s: &State, m: &Model, bytes: &mut [u8]) -> bool {
+    let mut head = m.next_device.to_le_bytes().to_vec();
+    head.extend_from_slice(&m.next_volume.to_le_bytes());
+    let free = s.free_head().to_le_bytes();
+    let Some(at) = bytes.windows(20).position(|w| w[..8] == head[..] && w[16..] == free) else { return false };
+    let k = if r.chance(50) { at } else { at + 4 };
+    bytes[k..k + 4].fill(0);
     true
 }
 
@@ -1440,6 +1509,29 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
             }
             if !aimed && r.chance(20) {
                 spoiled.truncate(r.below(spoiled.len() as u64 + 1) as usize);
+            }
+            /* Its counters aimed at, of a randomness of their own so that the
+               run goes as it would without: refused -- or, taken, a device
+               and a volume added to it numbered as the state numbers them.
+               Spoiled at random they are reached once in a long while, and
+               a counter of 0 breaks no rule fsck can see until something
+               is numbered by it */
+            let mut aim = Rng::new(mix(mix(seed, 0x636f_756e), step));
+            let mut counters = whole.clone();
+            if aim.chance(25) && spoil_counters(&mut aim, &s, &m, &mut counters) {
+                if let (Ok(t), Some(host)) = (State::decode(&counters), s.cs().first().map(|c| c.host.clone())) {
+                    let probes = [Command::DeviceAdd { host: host.clone(), ident: String::from("disk:probe"), slots: 64 },
+                                  Command::VolumeCreate { name: String::from("probe"), size_mib: 1, host }];
+                    let (mut a, mut b) = (s.clone(), t);
+                    for (k, p) in probes.iter().enumerate() {
+                        let index = 2_000_000 + step * 4 + k as u64;
+                        let (x, y) = (a.apply_command(index, p), b.apply_command(index, p));
+                        if x != y {
+                            return Err(format!("step {}: a snapshot whose counters were spoiled taken: {:?} answered \
+                                                {:?} of it, {:?} of the state", step, p, y, x));
+                        }
+                    }
+                }
             }
             if let Ok(mut t) = State::decode(&spoiled) {
                 if let Some(d) = fsck(&t) {

@@ -917,6 +917,22 @@ impl<D: Device> Store<D> {
         self.sums_at(dv, slot, offset, len)
     }
 
+    /// What the leader's scrub holds chunk `c`'s replicas alike by (N9e):
+    /// whether its record is open, the version of the epoch it was last
+    /// written at, and the CRC-32C of each `GRANULE` of the whole chunk --
+    /// read as a joiner's sums are, but with no epoch moved on: a writer of
+    /// now is refused nothing for it. The chunk is the one its number and
+    /// incarnation name, as `find` holds every request to.
+    pub fn scrub(&mut self, c: ChunkRef) -> Result<(bool, u32, Vec<u32>), Error> {
+        let Some((dv, slot, r)) = self.find(&c)? else { return Err(Error::NotHeld) };
+        /* Open, it is in flight and compared with nothing: not read */
+        if r.state == SlotState::Open {
+            return Ok((true, r.written.version, Vec::new()));
+        }
+        let sums = self.sums_at(dv, slot, 0, SLOT as u32)?;
+        Ok((false, r.written.version, sums))
+    }
+
     /// This cs's own copy of chunk `c` at `offset`, into `buf`: what a
     /// joiner holds a granule that differs to its source's by, a sector at a
     /// time.

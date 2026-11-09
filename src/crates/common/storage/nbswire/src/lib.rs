@@ -26,6 +26,7 @@ extern crate alloc;
 
 pub mod copy;
 pub mod mds;
+pub mod scrub;
 pub mod serve;
 
 use alloc::string::String;
@@ -85,6 +86,9 @@ pub enum Op<'a> {
     /// The CRC-32C of each `nbscs::GRANULE` of the chunk from `offset` for
     /// `len` bytes, its epoch moved on as a pull's.
     Sums { chunk: ChunkRef, joiner: u32, index: u64, offset: u32, len: u32 },
+    /// The leader's scrub (N9e): the chunk's record and the sums of all of
+    /// it, no epoch moved on.
+    Scrub { chunk: ChunkRef },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,6 +152,9 @@ pub enum Reply<'a> {
     Chunks(Vec<(u32, u32, u32, u32)>),
     /// A sum of each granule asked.
     Sums(Vec<u32>),
+    /// What the scrub asked of a chunk: whether its record is open, the
+    /// version it was last written at, and a sum of each granule.
+    Scrub { open: bool, written: u32, sums: Vec<u32> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -430,6 +437,10 @@ impl Request<'_> {
                 w.u32(*offset);
                 w.u32(*len);
             }
+            Op::Scrub { chunk } => {
+                w.u8(11);
+                chunk_ref(&mut w, chunk);
+            }
         }
         w.buf
     }
@@ -479,6 +490,7 @@ impl<'a> Request<'a> {
                     Op::Sums { chunk, joiner, index, offset, len }
                 }
             }
+            11 => Op::Scrub { chunk: read_chunk_ref(&mut r)? },
             _ => return None,
         };
         r.done().then_some(Request { id, volume, generation, op })
@@ -529,6 +541,15 @@ impl Answer<'_> {
             }
             Reply::Sums(sums) => {
                 w.u8(8);
+                w.u32(sums.len() as u32);
+                for &s in sums {
+                    w.u32(s);
+                }
+            }
+            Reply::Scrub { open, written, sums } => {
+                w.u8(9);
+                w.u8(u8::from(*open));
+                w.u32(*written);
                 w.u32(sums.len() as u32);
                 for &s in sums {
                     w.u32(s);
@@ -593,6 +614,23 @@ impl<'a> Answer<'a> {
                     sums.push(r.u32()?);
                 }
                 Reply::Sums(sums)
+            }
+            9 => {
+                let open = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                };
+                let written = r.u32()?;
+                let n = r.u32()? as usize;
+                if n > SUMS_MAX || n * 4 > r.remaining() {
+                    return None;
+                }
+                let mut sums = Vec::new();
+                for _ in 0..n {
+                    sums.push(r.u32()?);
+                }
+                Reply::Scrub { open, written, sums }
             }
             _ => return None,
         };

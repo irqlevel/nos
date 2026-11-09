@@ -1036,6 +1036,93 @@ each new gate.
     - **Tests**: the `cluster` target 3000 seeds; the gate; 104 mutants,
       each caught; nbs-test 148 of 148 on arm64 (HVF) and x86-64 (TCG);
       raft-test; make check, both arches and their modules built.
+  - **N9e, done** (2026-11-08): the scrub.
+    - **What it holds**: a chunk closed on every active member of its set
+      is the same on each -- held by the CRC-32C of each 64 KiB granule, the
+      sums the copy holds a chunk to its source's by. The leader looks at a
+      chunk at a time (`nbswire::scrub`, sans-I/O, the one nbs-mds runs and
+      the cluster target does; `scrub=<seconds>` its pace in nbs-mds, ten
+      unless given, 0 for none), asking each active member by `Op::Scrub`,
+      which moves no epoch on and reads nothing of an open chunk. An open
+      chunk, a set moved on, an answer late or refused: let be, for a later
+      round. A member that holds none of the chunk is compared as what that
+      reads as, zeros (`nbscs::zero_sums`): one that lost a chunk the others
+      hold differs as a rotted one does. A chunk held by none was never
+      written, and the next is looked at a hundredth of the pace on (not at
+      once: the member's turn follows each answer, and empty chunks would be
+      asked about as fast as answers came) -- found by nbs-test, whose
+      volumes at the end were never written: every look was let be, and a
+      volume mostly unwritten would have taken a round of ten seconds a
+      chunk.
+    - **Two looks**: a difference is a finding only when a second look, two
+      seconds on, finds every member's answer as the first did -- a write
+      and a close between two members' answers would show one that is none.
+    - **It says, and takes nothing down** -- changed from the design as
+      first proposed, which had the odd one of three taken down at once. The
+      cluster target found why not: a joiner copied a source that had rotted
+      before the scrub found it, two members were alike in rot, and the scrub
+      took the one good copy down, its join back about to copy the rot over
+      it. With no checksum of its own data a cs keeps, two alike are no
+      proof which holds it. So the scrub says what it found -- the log, `nbs
+      status`: the chunk, its set and version, the member unlike the two
+      others where two agree -- once for the set's version, and a person
+      takes the member down: `nbs replica bad <set> <host>`
+      (`Command::ReplicaBad` at the set's version now: refused as stale past
+      it and with a joiner in the set, as a join is -- `set_at`, one copy of
+      those checks now -- for a member down already, `AlreadyDown`, and
+      never the last active member, as a replica taken out -- `member_down`,
+      one copy of that). `nbs status` names the command with each finding,
+      and shows a finding of a set that has moved on since as history. The
+      controller has it
+      join its own place again; its copy holds every chunk to a source's by
+      sums. Taking down by itself waits for checksums a cs keeps of its own
+      data.
+    - **Tests**: the `cluster` target runs the scrub as the leader's, its
+      asks and answers in a queue and a randomness of their own so that a
+      run goes as it would without them, held to finding nothing the target
+      did not rot; once every set is whole at the end, a sector of a closed
+      chunk rots on one member -- or on two -- the finding is held to what
+      was rotted (one member: the one unlike the two others; two: no two
+      alike), said once, and the members taken down half a minute on as a
+      person would are copied again: every replica alike. 198 single and 51
+      double rots in the gate's 1000 seeds, each found as it was and mended.
+      The target's 1000 seeds take some 130 s now, against 95: each look
+      reads a chunk whole on three members (the fuzzer's disk reads were
+      made one pass over the cache a read, rather than a sector). A target
+      of its own, `scrub`, holds the scrub alone over members the target
+      models: a writer's writes and closes on one way to each member -- a
+      close once every member has the writes before it -- the scrub's asks on
+      another, granules rotted on one member or two, every finding held to
+      what each member held when it answered; it is where the second look's
+      rule is caught, a race the cluster target's chunks, closed seconds
+      after their last write, never put together. Its members hold a chunk
+      once its first write reaches them, its writer writes half the chunks
+      seldom, and a member loses a chunk now and then; a look at a chunk
+      held by none is to be followed by the next well inside half a look's
+      turn. The `meta` target models
+      `ReplicaBad`; the `wire` target draws `Op::Scrub` and its answer.
+      nbs-test runs nbs-mds with `scrub=1` and holds the leader's scrub to
+      having found a chunk written at the end alike, the volumes' others
+      held by none, none unlike. Mutants: 113, the scrub's eight and
+      `ReplicaBad`'s one among them -- its other rules are the join's and the
+      take-out's, which now share their code with it. The first full run
+      left two: `counters_checked`, an N8 rule of the snapshot's that the
+      meta target's random spoils had reached by luck, the seeds that did so
+      moved by `ReplicaBad`'s draw -- the counters are now aimed at, of a
+      randomness of their own, and a device and a volume added to what was
+      taken; and `scrub_set_as_asked`, whose set the cluster target's runs no
+      longer moved under a look -- the scrub target now takes members down
+      and back under its looks, and both targets hold every finding to the
+      set's version now. The scrub target also sets up the two races its
+      second look and its closed-chunks rule are for (one member's answer
+      taken before a write and a close the others' come after; a close
+      held back on one member), its writer leaving a chunk alone while its
+      close is on its way and its end closing a chunk only once the writes
+      are delivered, as a client does; and its person acts a few seconds
+      after a finding, so that one said twice would show.
+    - **Not yet**: an nbs-test phase with rot -- a sector spoiled on one
+      host's device while it is off, found, and copied again by `nbs replica
+      bad` -- goes with N9f.
 - **N10.** Snapshots, images and clones.
 - **N11, numbers.** On the hardware, and what they ask for: pages that move
   instead of copies (a message's pages lent to a `DiskQueue`), chain
