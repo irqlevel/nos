@@ -826,7 +826,9 @@ image's zeros out.
   commands from pools of names and incarnations that meet and from wide ones
   that fill the cluster. There are four scenarios and six mutants.
 - **`scripts/nbs-test.py`** (three nos on `scripts/hub.py`'s LAN, after the
-  cluster registry is made among them). It covers:
+  cluster registry is made among them, and a fourth booted late; every
+  nbs-mds with `out_after=10`, the least it takes, and `scrub=1`). It
+  covers:
   - an NBS cluster made and two hosts added, one through a member that does
     not lead;
   - an add asked again answered with the same incarnation, and a second init
@@ -871,11 +873,31 @@ image's zeros out.
     host writes, a forced writer's fences failing the old session, a host's
     closed chunks and data kept over its reboot; nbsload's `verify` holding
     every block to its last write, and a read load on another host;
-  - repair (N9): a volume written, c killed -- the leader's controller has
-    its cs down -- the volume written past it and closed, c booted again:
-    its cs up, joined in its own place, every chunk at three replicas again
-    with none being copied, and a read on c of what was written while it was
-    gone, which its join's copy took;
+  - repair (N9): a volume's two chunks written, the sets moved on past
+    them (b's cs taken away and back), c killed -- the leader's
+    controller has its cs down, then out ten seconds on, its places for
+    others' to take, of which there are none with three hosts -- one chunk
+    written past it and closed, c booted again: its cs up, joined in its own
+    place, every chunk at three replicas again with none being copied; a
+    read on c of what was written while it was gone, which its join's copy
+    took, and of the chunk not written meanwhile; and what its copies did,
+    each join's end in its log (`dmesg`): the chunk written meanwhile pulled
+    whole, the other found as its source's, nothing more;
+  - a fourth host, d, booted late, invited into the registry and added to
+    the NBS cluster, its cs taking its device in; a volume's two chunks
+    written on a, b and c; one of the three killed for good -- its cs down,
+    then out -- and d joining every set it was in, in its place: every chunk
+    at three replicas, none being copied, the volume read off d's own
+    replica; the lost host removed, three members again;
+  - rot (N9e): a chunk written and closed, its bytes found in a pool image
+    on each of its three hosts and a sector of them spoiled on one -- running
+    -- through QEMU's monitor (`qemu-io` over QMP), under its cs; the
+    leader's scrub saying that host's copy unlike the two others', with the
+    command; the command run, the member joined back in its own place and
+    its copy done; the chunk read off that host's replica as written, the
+    spoiled sector back as it was in the image, and the finding shown as
+    history; at the end, a chunk written and found alike, the volumes'
+    others held by none, and no finding of now;
   - nothing panicked.
 - **`scripts/hv-nbs-test.py`** (x86-64, manual: a guest kernel and an
   initrd): Linux guests of hv's on volumes -- an image poured with `hv
