@@ -246,8 +246,17 @@ impl Model {
     fn release(&mut self, key: u64) {
         let c = self.mchunks.get_mut(&key).expect("a chunk in use");
         c.count -= 1;
-        if c.count == 0 {
-            let set = c.set;
+        let (count, set) = (c.count, c.set);
+        /* Named by one map now: its copy-ups pending given up (N10c) */
+        if count == 1 {
+            let gone: Vec<((u32, u32), u64)> = self.pending.iter().filter(|(_, &(_, from))| from == key)
+                .map(|(&at, &(to, _))| (at, to)).collect();
+            for (at, to) in gone {
+                self.pending.remove(&at);
+                self.release(to);
+            }
+        }
+        if count == 0 {
             self.mchunks.remove(&key);
             self.give_back(&[set]);
         }
@@ -1067,6 +1076,9 @@ impl Model {
                 if self.sets[ch.set].joiner.is_some() {
                     return Err(Joining);
                 }
+                if self.sets[ch.set].cs.iter().any(|&c| self.cs[c as usize].drained()) {
+                    return Err(Draining);
+                }
                 if self.pending.len() >= COPYING_MAX || self.live() >= CHUNKS_MAX {
                     return Err(TooMany);
                 }
@@ -1251,6 +1263,11 @@ fn fsck(s: &State) -> Option<String> {
             return Some(format!("copy-up of volume {}'s place {}: {} from {}, its map has {:?}, sets {:?}", vol, place,
                                 to, from, at, sets));
         }
+        /* Of a chunk shared: one named by one map has its copy-ups given up */
+        if chunks.get(from as usize).is_none_or(|c| c.count < 2) {
+            return Some(format!("copy-up of volume {}'s place {} from chunk {}, which no other map names", vol, place,
+                                from));
+        }
         match named.get_mut(to as usize) {
             Some(n) => *n += 1,
             None => return Some(format!("copy-up of volume {}'s place {} into chunk {}, past the table", vol, place, to)),
@@ -1420,6 +1437,16 @@ fn pending_volume(r: &mut Rng, s: &State, m: &Model) -> Option<String> {
     m.vols.iter().find(|(_, v)| v.id == id).map(|(n, _)| n.clone())
 }
 
+/// A volume that shares the old chunk of a copy-up pending, by name: its
+/// delete may leave that chunk named by one map (N10c).
+fn sharing_volume(r: &mut Rng, s: &State, m: &Model) -> Option<String> {
+    let pending: Vec<(u32, u32)> = s.copying().iter().map(|(&(v, _), &(_, from))| (v, from)).collect();
+    let (vol, from) = r.pick(&pending)?;
+    let names: Vec<&String> = m.vols.iter().filter(|(_, v)| v.id != vol)
+        .filter(|(n, _)| s.volume(n).is_some_and(|x| x.map.iter().any(|&c| c == from))).map(|(n, _)| n).collect();
+    r.pick(&names).cloned()
+}
+
 /// A command for the history: of every kind, valid and not.
 fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
     let host = |r: &mut Rng| HOSTS[r.below(HOSTS.len() as u64) as usize].to_string();
@@ -1470,8 +1497,9 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
             Command::VolumeCreate { name, size_mib, host: member(r) }
         }
         50..=59 => {
-            let name = match pending_volume(r, s, m) {
-                Some(n) if r.chance(30) => n,
+            let name = match (pending_volume(r, s, m), sharing_volume(r, s, m)) {
+                (Some(n), _) if r.chance(30) => n,
+                (_, Some(n)) if r.chance(40) => n,
                 _ => volume(r),
             };
             Command::VolumeDelete { name }

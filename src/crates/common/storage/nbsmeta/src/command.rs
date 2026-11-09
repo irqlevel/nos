@@ -492,6 +492,9 @@ pub enum Refusal {
     AlreadyDown,
     /// A clone is of an image or a snapshot, not of a volume (N10).
     NotFrozen,
+    /// A copy-up into a set with a member drained, whose place is to be
+    /// joined by another cs first (N10).
+    Draining,
 }
 
 impl Refusal {
@@ -540,6 +543,7 @@ impl Refusal {
             Refusal::InPlace => "the member in that place is active and stays",
             Refusal::AlreadyDown => "the member is down already: it joins its place again",
             Refusal::NotFrozen => "a clone is of an image or a snapshot -- freeze or snapshot the volume first",
+            Refusal::Draining => "a member of the set is drained: its place is to be joined by another cs first",
         }
     }
 
@@ -586,6 +590,7 @@ impl Refusal {
             Refusal::InPlace => 39,
             Refusal::AlreadyDown => 40,
             Refusal::NotFrozen => 41,
+            Refusal::Draining => 42,
         }
     }
 
@@ -632,6 +637,7 @@ impl Refusal {
             39 => Refusal::InPlace,
             40 => Refusal::AlreadyDown,
             41 => Refusal::NotFrozen,
+            42 => Refusal::Draining,
             _ => return None,
         })
     }

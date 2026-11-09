@@ -471,10 +471,16 @@ impl Copy {
             /* The set moved on, or the join is over: the view refreshed */
             Refusal::Epoch { .. } | Refusal::NotTheJoiner => self.state = State::Stale,
             Refusal::Behind { .. } | Refusal::NotReady | Refusal::NoMds => self.hold_until = now + AGAIN_NS,
-            /* The chunk freed, or its number another's now: nothing to copy */
+            /* The chunk freed, or its number another's now: nothing to copy --
+               and its asks still in flight dropped, so that their answers are
+               of none: taken for the next chunk's, a late refusal dropped that
+               one too, and a late pull's data would be written into it (found
+               by fuzz/nbs's cluster target, N10c: the source's garbage pass
+               freed a chunk a copy-up had left, under the join) */
             Refusal::NotHeld | Refusal::StaleChunk { .. } if ask != Ask::List => {
                 self.progress_at = now;
                 self.work = None;
+                self.sent.retain(|_, s| s.ask == Ask::List);
             }
             _ => {
                 out.push(Out::Say(alloc::format!("nbs-cs: set {}'s source refused the copy: {}", self.view.set,

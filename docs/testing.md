@@ -3106,7 +3106,8 @@ with it:
   - snapshots, freezes and clones (N10a), mostly of what they can be made
     of; copy-ups begun by a volume's writer, mostly of a place it shares,
     and done, mostly of a copy-up pending -- and detaches, freezes and
-    deletes now and then of a volume with copy-ups pending;
+    deletes now and then of a volume with copy-ups pending, and deletes of a
+    volume that shares a copy-up pending's old chunk (N10c);
   - the leader's digests, true and false.
 - **Every answer** must be the model's, and so must everything the state
   shows: the members, the cs's with their state, devices and reserved room,
@@ -3229,8 +3230,11 @@ epoch and every volume's generation, and keeps what each sector may hold.
 
 - **The steps**: fences, new and old; writes at the fence, older and newer
   than it, checked or not, and now and then by another volume's writer
-  (N10b) where the chunk is not open for its own; reads by the writer, and
-  now and then by another volume, unvouched first; flushes; closes; a chunk
+  (N10b) where the chunk is not open for its own; reads by the writer,
+  unvouched first now and then -- asked of the mds where the cs does not
+  hold the chunk, and nowhere else (N10c) -- and by another volume,
+  unvouched first; a read vouched for at an epoch the cs did not know, and
+  the same once the chunk is freed, which asks the mds again (N10c); flushes; closes; a chunk
   freed and its number taken by a new incarnation of another volume, the cs
   told or not; a set's version moved on; a request of a number's chunk
   before; and copy-ups (N10b), served by nbswire's `serve` as nbs-cs serves
@@ -3348,15 +3352,26 @@ little and now and then past a silence.
   member -- the source a copy asks first -- crashes with every chunk
   written since the last flush and comes back at once, its chunks found
   open and what its cache lost gone, while the writer stalls and another
-  member of the set is drained: the joiner is to take another source.
-  These ends are drawn of their own, so that a run they do not shape goes
-  as it did. The leader's scrub runs throughout (N9e), as nbs-mds runs it, a
+  member of the set is drained: the joiner is to take another source; in
+  others (N10c) a host that holds some crashes with every chunk written
+  since the last flush and comes back at once, its chunks found open, the
+  writer flushes -- which that replica is to refuse, and be taken out by --
+  and the host crashes and comes back again, held then to what was
+  flushed. These ends are drawn of their own, so that a run they do not
+  shape goes as it did. The leader's scrub runs throughout (N9e), as nbs-mds runs it, a
   chunk every four seconds of the network's time; its asks and answers in a
   queue and a randomness of their own, so that the run they look at goes as
   it would without them. Once every set is whole at the end, a sector of a
   closed chunk rots on one member now and then, or on two; the scrub is to
   find it, and the members are taken down half a minute on, as a person
-  would -- past the scrub's next round over the chunk.
+  would -- past the scrub's next round over the chunk. Snapshots of the
+  volume are taken now and then between two writers (N10c) -- the writer
+  stopped, a flush and its closes done, the snapshot taken, a writer started
+  again -- two kept at most, the oldest dropped for a new one and one dropped
+  now and then, of a randomness of their own; the writers after them copy up
+  each chunk a snapshot shares before they write there. Each cs's garbage
+  pass runs every three seconds of the network's time, as nbs-cs's does,
+  freeing what copy-ups and drops leave.
 - **Held to**:
   - a write done held by every replica the metadata has in, read back from
     each then and there -- but one that restarted with the chunk open at
@@ -3389,7 +3404,14 @@ little and now and then past a silence.
   - every set back at three active members by the end, none on a drained
     cs and none with a joiner, within ten minutes of the network's time --
     but where a set's active members are all on the host lost; and every
-    proposal of the controller's applied, none refused.
+    proposal of the controller's applied, none refused;
+  - every snapshot reading what the volume held when it was taken (N10c):
+    each block written by then -- the last write done, or one failed or lost
+    after it -- and each written first since, zeros, read on every active
+    replica up of its chunk alike, one of those values, and the same at
+    every look: once it is taken, now and then, and at the end; and once a
+    newer writer serves, no active replica doing an older generation's
+    copy-up either.
 
   A writer that follows another holds what that one had done and not
   flushed as a crash would leave it: there or not.
@@ -3430,10 +3452,36 @@ little and now and then past a silence.
     had made on it while it was out and not fenced: it holds every chunk to
     its source's by sums now, and `Op::Touch` is gone.
 
+  With snapshots and copy-ups in it (N10c) it found, each fixed with its
+  mutant:
+  - in the copy (N9's, never met before: no chunk was freed under a join),
+    a chunk the source freed under the copy -- its garbage pass, a copy-up's
+    old chunk named by no map -- dropped with its pulls still in flight, whose
+    answers were taken for the next chunk's: a late refusal dropped that one
+    too after its first piece, the join ending without it, and a late pull's
+    data would have been written into it. Dropping a chunk drops its asks;
+  - in the client's copy-up as first written, done without the one member a
+    view behind its set had asked -- down, taken out, at a version past the
+    view -- so that no member copied and the new chunk was zeros under the
+    writes after: a take-out past the view has it asked again from its start;
+  - in the cs, what the mds vouched for taken for a chunk the cs does not
+    hold: a read of a chunk never written, vouched for at a set's version,
+    kept; the set joined; the writer's first write of it, by its view of
+    before, taken as vouched for, the joiner never written. A vouch is taken
+    only for a chunk held, whose record refuses an older epoch;
+  - in the metadata as first written for N10b, a copy-up refused for room
+    where a member of the set is drained -- its devices count no room --
+    failing the writes held: it is refused as `Draining` now, and asked
+    again;
+  - in the target itself, the end's wait for the scrub skipping ahead while
+    the scrub's asks and answers waited their turn: every look of a quiet
+    end timed out, and a rot went unfound once snapshots made the rounds
+    longer.
+
 `--mutants` runs `fuzz/nbs/mutants.py`, which takes out one rule at a time.
-Each of its hundred and fifty-eight must fail the gate -- run as `nbs-fuzz gate
+Each of its hundred and seventy-one must fail the gate -- run as `nbs-fuzz gate
 --first`, stopped at the first target that fails: the gate's verdict, sooner.
-The metadata's sixty-nine:
+The metadata's seventy-one:
 - placement: the home host first, the most room first, rule 6, three full
   hosts refused as no room rather than too few hosts, new chunks only on
   cs's that are up and only into a clean set, an empty set made again
@@ -3479,9 +3527,11 @@ The metadata's sixty-nine:
   holds what a spoiled snapshot taken says. A free chunk's link is aimed at
   the same way, which random bytes reach once in a long while;
 - N10b's two: no copy-up into a set being joined, and a join giving up
-  its set's copy-ups pending.
+  its set's copy-ups pending;
+- N10c's two: no copy-up into a set with a member drained, and a copy-up
+  pending of a chunk named by one map now given up.
 
-The cs's forty: a slot's zeros flushed before the record that takes it,
+The cs's forty-one: a slot's zeros flushed before the record that takes it,
 and the slot zeroed at all; an open mark durable before a generation's first
 write; copy B written only once copy A is flushed; a fence durable before it
 is answered; a close only after the chunk's data; a slot of a number's chunk
@@ -3492,7 +3542,8 @@ written; a fence page with a torn copy written again at the open; a device
 with anything past a superblock's bytes never taken for blank; nothing of one
 volume's read or written through another's unless the mds vouches that its
 map names it, and a write of another volume's chunk making it the writer's
-volume's; a freed slot given back -- eleven of a copy-up's (N10b): by the
+volume's; a chunk the cs does not hold read as zeros only once the mds
+vouches (N10c); a freed slot given back -- eleven of a copy-up's (N10b): by the
 volume's writer of now, of two chunks of one epoch, asked again changing
 nothing, its chunk taken only once vouched for, none of a chunk found open
 nor of an epoch older than the one the cs knows, the whole chunk copied, its
@@ -3510,17 +3561,20 @@ closes closed only after its data is durable, and what it took in made
 durable where a client's write left the chunk open at its generation; and a
 record of the copy's, at no writer's generation, read back as itself.
 
-The wire's twenty-eight: a request read whole, nothing past its end, a flag read
+The wire's thirty-one: a request read whole, nothing past its end, a flag read
 as 0 or 1 alone, and a map asked for past its most read as none; of `serve`,
 a chunk found open refused to its writer, a flush refused to a writer with
 one and to a writer fenced since, a write vouched for as the joiner's marking
 the set from then on, and a found-open chunk written by its set's joiner not
 refused as failed, a copy-up's chunk the cs does not hold asked of the mds
-first, and one the mds refuses not done; of the mds, the map naming a set's
-joiner, and a copy-up's copy vouched for only by an mds as far as its
+first, one the mds refuses not done, and what the mds vouched for taken only
+for a chunk the cs holds (N10c); of the mds, the map naming a set's joiner
+and saying a place's chunk shared where another map names it (N10c), and a
+copy-up's copy vouched for only by an mds as far as its
 writer's entry, only where it is pending from that chunk to that one, of
 their incarnations, on an active member of the set, of both chunks at the
 set's version now, and for the volume's writer of now; of the copy, a
+chunk the source freed under it dropping its asks in flight (N10c), a
 member back holding every chunk to its source's by sums, those it holds too,
 a chunk pulled held to its source's by sums, and a granule that differs held
 to the source's a sector at a time; of the scrub, a difference a finding only
@@ -3531,7 +3585,7 @@ version, a member that holds no copy compared as zeros -- not let be -- a
 chunk empty only where no member holds it, and a chunk held by none taking
 no turn of the pace.
 
-And the client's twenty-one: a write done only once every replica in has it,
+And the client's twenty-eight: a write done only once every replica in has it,
 a set's joiner among them; every cs fenced before the writer serves, and one
 come into the view while the start fences fenced too; a chunk left open made
 the same on its replicas; a read only of an active replica, and one with
@@ -3546,8 +3600,13 @@ answer taken only one past the view, else the set read again; a write out by
 a view a map read finds changed sent again by the new one; a session
 detached deaf to the answers of before; an ask-out refused as no replica
 of its set having the map read again, which drops every ask about a set
-that no longer writes its cs; and a close a cs refuses as not in the
-chunk's set done.
+that no longer writes its cs; a close a cs refuses as not in the chunk's
+set done; and N10c's seven, the copy-up: a write to a place whose chunk is
+shared held while the chunk is copied up, every active member of the set
+asked to copy, the copy-up told done only once each has copied or is out,
+asked again from its start where a take-out's answer is past the view,
+where a member refuses it as of another epoch or map, and where its end is
+refused, and a chunk shared no longer written as it is.
 
 `--seed N --seconds S` runs a campaign, of the target `--target` names
 (`meta` unless it names `cs`, `wire` or `cluster`). `NBS_CLUSTER_STATS=1`

@@ -596,6 +596,14 @@ impl State {
         if self.sets.get(ch.set as usize).is_some_and(|s| s.joiner.is_some()) {
             return Err(Refusal::Joining);
         }
+        /* Nor into one with a member drained: its devices take no new chunk,
+           and its place is to be joined by another cs -- asked again once that
+           is over */
+        if self.sets.get(ch.set as usize)
+            .is_some_and(|s| s.cs.iter().any(|&c| self.cs.get(c as usize).is_some_and(|c| c.draining())))
+        {
+            return Err(Refusal::Draining);
+        }
         if self.copying.len() >= COPYING_MAX || self.live_chunks() >= CHUNKS_MAX as u64 {
             return Err(Refusal::TooMany);
         }
@@ -1141,14 +1149,29 @@ impl State {
     /// One of chunk `id`'s counts given back: at none, the chunk freed --
     /// its slots given back on its set's cs's, the chunk onto the free list.
     fn release_chunk(&mut self, id: u32) {
+        let count = match self.chunks.get_mut(id as usize) {
+            Some(ch) if !ch.is_free() && ch.count > 0 => {
+                ch.count -= 1;
+                ch.count
+            }
+            _ => return,
+        };
+        if count > 0 {
+            /* Named by one map now: a copy-up pending of it has nothing to
+               copy for, and is given up -- one left would hand its new chunk,
+               copied as the old one was then, to a copy-up of the old one asked
+               after the place was written directly (N10) */
+            if count == 1 {
+                let gone: Vec<((u32, u32), u32)> = self.copying.iter().filter(|(_, &(_, from))| from == id)
+                    .map(|(&at, &(to, _))| (at, to)).collect();
+                for (at, to) in gone {
+                    self.copying.remove(&at);
+                    self.release_chunk(to);
+                }
+            }
+            return;
+        }
         let Some(ch) = self.chunks.get_mut(id as usize) else { return };
-        if ch.is_free() || ch.count == 0 {
-            return;
-        }
-        ch.count -= 1;
-        if ch.count > 0 {
-            return;
-        }
         let set = ch.set;
         *ch = Chunk { set: self.free_head, count: 0, flags: CHUNK_FREE, incarnation: ch.incarnation };
         self.free_head = id;

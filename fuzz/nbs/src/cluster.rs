@@ -45,7 +45,16 @@
 //! - **a writer stops** whose closes go, by a view from before, to a cs
 //!   that is in their chunks' sets no more -- drained, its cs down in every
 //!   set while the writer stalled, back with the chunks found open -- and
-//!   asks a cs out of a set only where its view writes it there.
+//!   asks a cs out of a set only where its view writes it there;
+//! - **a snapshot reads for good what the volume held at it** (N10c):
+//!   taken between two writers -- the one stopped, a flush and its closes
+//!   done, the next one started -- some dropped later, two kept at most; the
+//!   writers after it copy up each chunk it shares before they write there,
+//!   through joins, crashes and takeovers; and each block of it, on every
+//!   active replica up, reads the same, one of what the volume could hold
+//!   then, at every look -- after it is taken, now and then, and at the end.
+//!   Each cs's garbage pass runs as nbs-cs's, freeing what copy-ups and
+//!   deletes leave.
 //!
 //! A writer that follows another holds what that one had done and not
 //! flushed as a crash would leave it: there or not -- a replica that lost it
@@ -61,7 +70,7 @@ use nbsmeta::repair::{self, Seen};
 use nbsmeta::{Answer, Command, Replica, State};
 use nbswire::copy::{self, Copy};
 use nbswire::scrub::{self, Scrub};
-use nbswire::serve::{serve, Vouched};
+use nbswire::serve::{collect, serve, Vouched};
 use nbswire::{Answer as CsAnswer, Ask, Asking, Question, Reply, Request, Said, Saying, Told};
 
 use crate::cs::{Disk, Handle};
@@ -75,8 +84,9 @@ const CLUSTER: [u8; 16] = [5; 16];
 const VOLUME: &str = "v";
 /// The volume: six chunks.
 const VOLUME_MIB: u64 = 24;
-/// A host's disk: room for the volume's chunks and some, in sectors of 4 KiB.
-const DISK_SLOTS: u64 = 12;
+/// A host's disk: room for the volume's chunks, the copy-ups after two
+/// snapshots, and some, in sectors of 4 KiB.
+const DISK_SLOTS: u64 = 20;
 const DISK_SECTOR: u64 = 4096;
 const MS: u64 = 1_000_000;
 /// How long a run lasts at most, in the network's time: well under an
@@ -105,6 +115,20 @@ const SETTLE_NS: u64 = 600_000 * MS;
 /// of the network's time -- each reads it whole on every member it is
 /// closed on.
 const SCRUB_EVERY: u64 = 4_000 * MS;
+/// How often each cs's garbage pass runs, in the network's time.
+const GARBAGE_EVERY: u64 = 3_000 * MS;
+/// The snapshots kept at once, at most: the oldest dropped for a new one.
+const SNAPS_KEPT: usize = 2;
+
+/// A snapshot of the volume, taken between two writers (N10c): for each
+/// block written by then, and each written first since, what it may hold --
+/// the last write done before it, or one failed or lost after that, or zeros
+/// -- and the value a look found first, which every look after must find.
+struct Snap {
+    name: String,
+    may: BTreeMap<u64, BTreeSet<u8>>,
+    seen: BTreeMap<u64, u8>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum End {
@@ -324,6 +348,12 @@ struct World {
     scrub_r: Rng,
     scrub_id: u64,
     rotted: Vec<Rot>,
+    /// The snapshots kept, and their randomness of their own (N10c); the
+    /// next one's number; when the garbage passes run next.
+    snaps: Vec<Snap>,
+    snap_r: Rng,
+    snap_next: u32,
+    garbage_at: u64,
     stats: BTreeMap<&'static str, u64>,
 }
 
@@ -417,7 +447,12 @@ impl World {
     /// replicas' hosts that are in -- each with whether it may be trusted:
     /// up, and not holding the chunk as it found it open at `generation`.
     fn replicas(&self, b: u64, generation: u64) -> Option<(u32, ChunkRef, u32, Vec<usize>)> {
-        let v = self.state.volume(VOLUME)?;
+        self.replicas_in(VOLUME, b, generation)
+    }
+
+    /// The same of block `b` of volume `name`'s map -- a snapshot's (N10c).
+    fn replicas_in(&self, name: &str, b: u64, generation: u64) -> Option<(u32, ChunkRef, u32, Vec<usize>)> {
+        let v = self.state.volume(name)?;
         let at = b * BLOCK;
         let place = (at / SLOT) as usize;
         let inside = (at % SLOT) as u32;
@@ -1109,8 +1144,13 @@ impl World {
                 return Err(format!("the sets not at three {} s after the end: {}", SETTLE_NS / 1_000_000_000,
                                    self.sets_said()));
             }
+            /* Time skips ahead only where nothing is on its way -- the scrub's
+               asks and answers neither: those wait their turn tick by tick,
+               and a look of a dozen ticks across skips timed out unanswered,
+               every look of the quiet end let be (found once N10c's
+               snapshots made the rounds longer than the end's wait) */
             self.now += 5 * MS;
-            if self.links.values().all(|q| q.is_empty()) {
+            if self.links.values().all(|q| q.is_empty()) && self.scrub_q.is_empty() {
                 self.now += 100 * MS;
             }
             self.deliver()?;
@@ -1168,14 +1208,20 @@ impl World {
                         state.chunks().get(c as usize).is_some_and(|ch| ch.set == set)
                     }));
                     let wrong = match &req.op {
-                        nbswire::Op::Write { chunk, .. } => active(chunk.epoch.set),
+                        nbswire::Op::Write { chunk, .. } | nbswire::Op::CopyUp { to: chunk, .. } => {
+                            active(chunk.epoch.set)
+                        }
                         nbswire::Op::Flush => (0..state.sets().len() as u32).any(|s| active(s) && of_volume(s)),
                         _ => false,
                     };
                     if wrong {
                         return Err(format!("cs {} (host {}), an active replica, did a {} of generation {} once \
                                             generation {} serves", host.cs, name,
-                                           if matches!(req.op, nbswire::Op::Flush) { "flush" } else { "write" },
+                                           match req.op {
+                                               nbswire::Op::Flush => "flush",
+                                               nbswire::Op::CopyUp { .. } => "copy-up",
+                                               _ => "write",
+                                           },
                                            req.generation, served));
                     }
                 }
@@ -1233,6 +1279,42 @@ impl World {
                     }
                 }
             }
+            /* A copy-up's asks (N10), answered as nbs-mds's member does */
+            ask @ (Ask::CopyUp { .. } | Ask::CopyDone { .. }) => {
+                let done = matches!(ask, Ask::CopyDone { .. });
+                let cmd = match ask {
+                    Ask::CopyUp { name, place, generation } => Command::CopyUp { name, place, generation },
+                    Ask::CopyDone { name, place, generation, chunk } => {
+                        Command::CopyDone { name, place, generation, chunk }
+                    }
+                    _ => return Ok(()),
+                };
+                let answer = self.apply(cmd);
+                if self.trace {
+                    eprintln!("  [{}] mds: client {} asks a copy-up{}: {:?}", self.step, c,
+                              if done { "'s end" } else { "" }, answer);
+                }
+                match answer {
+                    Answer::Chunk { chunk, incarnation } => {
+                        self.count(if done { "copy-ups done" } else { "copy-ups asked" });
+                        Said::Chunk { chunk, incarnation, index: self.index }
+                    }
+                    Answer::Refused(why @ (nbsmeta::Refusal::Joining | nbsmeta::Refusal::Draining)) => {
+                        self.count(if why == nbsmeta::Refusal::Joining {
+                            "copy-ups asked while the set is joined"
+                        } else {
+                            "copy-ups asked while a member is drained"
+                        });
+                        Said::NotNow(why.says().to_string())
+                    }
+                    Answer::Refused(nbsmeta::Refusal::NotTheWriter) => Said::NotTheWriter,
+                    Answer::Refused(why) => {
+                        self.count(if done { "copy-ups' ends refused" } else { "copy-ups refused" });
+                        Said::Refused(why.says().to_string())
+                    }
+                    other => Said::Refused(format!("{:?}", other)),
+                }
+            }
         };
         let h = self.clients[c].host;
         self.push(End::Mds(h), End::Client(c), Saying { id: a.id, said }.encode(), m.id);
@@ -1244,6 +1326,7 @@ impl World {
     fn tick(&mut self) -> Result<(), String> {
         self.control()?;
         self.scrub_turn()?;
+        self.garbage()?;
         for h in 0..self.hosts.len() {
             self.joins(h)?;
             self.copy_turn(h)?;
@@ -1271,6 +1354,138 @@ impl World {
                 eprintln!("  [{}] client {}: {:?}", self.step, c, self.clients[c].s.phase());
                 self.clients[c].shown = self.clients[c].s.phase().clone();
             }
+        }
+        Ok(())
+    }
+
+    /// Each cs up's garbage pass, as nbs-cs's (N10c): the chunks the
+    /// metadata freed given back -- a copy-up's old chunk named by no map, a
+    /// snapshot's dropped.
+    fn garbage(&mut self) -> Result<(), String> {
+        if self.now < self.garbage_at {
+            return Ok(());
+        }
+        self.garbage_at = self.now + GARBAGE_EVERY;
+        for h in 0..self.hosts.len() {
+            let World { hosts, state, index, .. } = self;
+            let host = &mut hosts[h];
+            let Some(store) = host.store.as_mut() else { continue };
+            let (applied, name) = (*index, host.name);
+            let done = collect(store, &mut |q| Some(nbswire::mds::told(state, name, applied, &q)));
+            if let Some((n, e)) = done.failed.first() {
+                return Err(format!("host {}'s cs did not let go of {}: {:?}", name, n, e));
+            }
+            if self.trace && !done.freed.is_empty() {
+                eprintln!("  [{}] host {} frees {:?}", self.step, name, done.freed);
+            }
+            *self.stats.entry("chunks freed by a garbage pass").or_default() += done.freed.len() as u64;
+        }
+        Ok(())
+    }
+
+    /* ---- snapshots (N10c) ---- */
+
+    /// A snapshot of the volume between two writers: the writer stopped --
+    /// what it was asked done, a flush, its chunks closed, the volume let go
+    /// of -- the snapshot taken, the oldest dropped first where two are
+    /// kept, held to at once; a writer started again by force on a host up.
+    fn snapshot(&mut self) -> Result<(), String> {
+        let Some(c) = self.current().filter(|&c| self.serving(c)) else { return Ok(()) };
+        let mut out = Vec::new();
+        let now = self.now;
+        {
+            let cl = &mut self.clients[c];
+            cl.s.stop(u64::MAX - 1, now, &mut cl.bufs, &mut out);
+        }
+        self.outs(c, out)?;
+        self.drive(c, &|w, c| matches!(w.clients[c].s.phase(), Phase::Detached | Phase::Failed(_)))?;
+        self.clients[c].zombie = true;
+        match self.clients[c].s.phase() {
+            Phase::Detached => {}
+            /* As it may -- check_failed said so: no snapshot, another writer */
+            Phase::Failed(_) => return Ok(()),
+            _ => return Err(format!("client {} not stopped for a snapshot: {}", c, self.clients[c].s.report())),
+        }
+        if self.snaps.len() >= SNAPS_KEPT {
+            self.drop_snapshot(0)?;
+        }
+        let name = format!("s{}", self.snap_next);
+        self.snap_next += 1;
+        match self.apply(Command::Snapshot { volume: String::from(VOLUME), name: name.clone(), generation: 0 }) {
+            Answer::Volume { .. } => {}
+            other => return Err(format!("a snapshot of the volume, let go of, answered {:?}", other)),
+        }
+        let blocks: Vec<u64> = self.blocks.history.keys().copied().collect();
+        let mut may = BTreeMap::new();
+        for b in blocks {
+            let mut m = self.blocks.failed_since_done(b);
+            m.insert(self.blocks.acked(b).1);
+            may.insert(b, m);
+        }
+        if self.trace {
+            eprintln!("  [{}] snapshot {} of the volume taken, client {} stopped for it", self.step, name, c);
+        }
+        self.snaps.push(Snap { name, may, seen: BTreeMap::new() });
+        self.count("snapshots taken");
+        self.snapshots_hold("a snapshot taken")?;
+        let up: Vec<usize> = (0..HOSTS.len()).filter(|&h| Some(h) != self.down).collect();
+        match self.snap_r.pick(&up) {
+            Some(h) => self.writer(h),
+            None => Ok(()),
+        }
+    }
+
+    /// Snapshot `k` dropped: its chunks counted down, those no map names
+    /// freed -- by the garbage passes on the cs's.
+    fn drop_snapshot(&mut self, k: usize) -> Result<(), String> {
+        let s = self.snaps.remove(k);
+        match self.apply(Command::VolumeDelete { name: s.name.clone() }) {
+            Answer::Volume { .. } => {}
+            other => return Err(format!("snapshot {} not dropped: {:?}", s.name, other)),
+        }
+        if self.trace {
+            eprintln!("  [{}] snapshot {} dropped", self.step, s.name);
+        }
+        self.count("snapshots dropped");
+        Ok(())
+    }
+
+    /// Every snapshot reads what the volume held at it: each block it is
+    /// held to, on every active replica up of its chunk, one of what it may
+    /// hold, the same on all, and the same as at the first look.
+    fn snapshots_hold(&mut self, when: &str) -> Result<(), String> {
+        for k in 0..self.snaps.len() {
+            let name = self.snaps[k].name.clone();
+            let blocks: Vec<u64> = self.snaps[k].may.keys().copied().collect();
+            for b in blocks {
+                let Some((volume, chunk, inside, hosts)) = self.replicas_in(&name, b, 0) else {
+                    return Err(format!("{}: snapshot {}'s block {} is in no chunk", when, name, b));
+                };
+                for h in hosts {
+                    let v = self.block_on(h, volume, chunk, inside)
+                        .map_err(|e| format!("{}: snapshot {}'s block {} on host {}: {}", when, name, b,
+                                             self.hosts[h].name, e))?;
+                    let snap = &mut self.snaps[k];
+                    if !snap.may.get(&b).is_some_and(|m| m.contains(&v)) {
+                        return Err(format!("{}: snapshot {}'s block {} is {} on host {} (chunk {}), and the volume \
+                                            held {:?} there when it was taken", when, name, b, v,
+                                           self.hosts[h].name, chunk.chunk, snap.may.get(&b)));
+                    }
+                    match snap.seen.get(&b) {
+                        Some(&was) if was != v => {
+                            return Err(format!("{}: snapshot {}'s block {} is {} on host {} (chunk {}), {} before",
+                                               when, name, b, v, self.hosts[h].name, chunk.chunk, was));
+                        }
+                        Some(_) => {}
+                        None => {
+                            snap.seen.insert(b, v);
+                        }
+                    }
+                }
+            }
+        }
+        if !self.snaps.is_empty() {
+            self.count("snapshots looked at");
         }
         Ok(())
     }
@@ -1351,6 +1566,12 @@ impl World {
                 self.seq += 1;
                 self.clients[c].bufs.0.insert(tag, vec![v; len as usize]);
                 for b in first..first + n {
+                    /* Written first since a snapshot: zeros in it (N10c) */
+                    if !self.blocks.history.contains_key(&b) {
+                        for snap in self.snaps.iter_mut() {
+                            snap.may.entry(b).or_insert_with(|| BTreeSet::from([0]));
+                        }
+                    }
                     self.blocks.history.entry(b).or_default().push((seq, v, WState::Out));
                 }
                 UserOp::Write { tag, offset, len }
@@ -1778,6 +1999,59 @@ impl World {
         Ok(shaped)
     }
 
+    /// A writer's flush to a replica that restarted with chunks it had open
+    /// (N8's rule, which the runs reached once in a long while once N10c's
+    /// snapshots changed them): what the replica's disk cache lost may be
+    /// what the writer wrote since its last flush, so it refuses the flush as
+    /// failed and is taken out -- a flush done there would say durable what
+    /// is gone. A flush, then every chunk written; a host that holds some, not
+    /// the writer's, and that every chunk can do without, crashed and back at
+    /// once, its chunks found open; the writer's flush; and the host crashed
+    /// and back again, held then -- as a replica in -- to what was flushed.
+    /// Whether it was shaped.
+    fn found_open_flush(&mut self) -> Result<bool, String> {
+        let Some(c) = self.current() else { return Ok(false) };
+        let idle = |w: &World, c: usize| w.clients[c].ops.is_empty() || !w.serving(c);
+        self.drive(c, &|w, c| {
+            w.serving(c) || w.clients[c].zombie || matches!(w.clients[c].s.phase(), Phase::Failed(_) | Phase::Detached)
+        })?;
+        self.drive(c, &idle)?;
+        if !self.serving(c) || self.down.is_some() {
+            return Ok(false);
+        }
+        /* Flushed first: what the crash may lose is the writes below alone */
+        self.submit_op(c, K::Flush, 0, 0)?;
+        self.drive(c, &idle)?;
+        let places = (VOLUME_MIB << 20) / SLOT;
+        for p in 0..places {
+            for k in 0..3 {
+                let v = 1 + self.r.below(255) as u8;
+                self.submit_op(c, K::Write(v), p * (SLOT / BLOCK) + 5 + k, 1)?;
+            }
+        }
+        self.drive(c, &idle)?;
+        if !self.serving(c) || self.down.is_some() {
+            return Ok(false);
+        }
+        let me = self.clients[c].host;
+        let hosts: Vec<usize> = (0..HOSTS.len()).filter(|&h| h != me && self.holds_some(h) && self.whole_without(h))
+            .collect();
+        let Some(x) = self.r.pick(&hosts) else { return Ok(false) };
+        self.crash(x)?;
+        self.now += 300 * MS;
+        self.restart(x)?;
+        self.submit_op(c, K::Flush, 0, 0)?;
+        self.drive(c, &idle)?;
+        if !self.serving(c) {
+            return Ok(false);
+        }
+        self.crash(x)?;
+        self.now += 300 * MS;
+        self.restart(x)?;
+        self.count("flushes shaped to a replica back with chunks found open");
+        Ok(true)
+    }
+
     /// The writer now: the newest not lost or taken over.
     fn current(&self) -> Option<usize> {
         (0..self.clients.len()).rev().find(|&c| !self.clients[c].zombie)
@@ -1789,7 +2063,8 @@ fn setup(r: &mut Rng) -> Result<World, String> {
                         hosts: Vec::new(), links: BTreeMap::new(), clients: Vec::new(), blocks: Blocks::default(),
                         seq: 1, down: None, served: 0, rest: None, owed: None, plan_at: 0, drained: None,
                         scrub: Scrub::new(SCRUB_EVERY), scrub_q: Vec::new(), scrub_r: Rng::new(0), scrub_id: 1,
-                        rotted: Vec::new(), stats: BTreeMap::new() };
+                        rotted: Vec::new(), snaps: Vec::new(), snap_r: Rng::new(0), snap_next: 1, garbage_at: 0,
+                        stats: BTreeMap::new() };
     w.apply(Command::Init { cluster: CLUSTER, name: String::from("nbs"), host: String::from(HOSTS[0]), member: 1 });
     for (k, h) in HOSTS.iter().enumerate().skip(1) {
         w.apply(Command::Add { host: h.to_string(), member: 1 + k as u64 });
@@ -1828,6 +2103,8 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     /* The scrub's randomness of its own, so that the run goes as it would
        without it */
     w.scrub_r = Rng::new(mix(seed, 0x7363_7275));
+    /* The snapshots' too (N10c) */
+    w.snap_r = Rng::new(mix(seed, 0x736e_6170));
     let first = w.r.below(HOSTS.len() as u64) as usize;
     w.writer(first)?;
     let mut back_at = 0u64;
@@ -1930,6 +2207,19 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
                 }
             }
         }
+        /* A snapshot between two writers now and then, one dropped, and every
+           snapshot looked at (N10c): of a randomness of their own */
+        if w.snap_r.below(1000) < 3 {
+            if w.down.is_none() && w.rest.is_none() {
+                w.snapshot().map_err(|e| format!("step {}: {}", step, e))?;
+            }
+        } else if !w.snaps.is_empty() && w.snap_r.below(1000) < 2 {
+            let k = w.snap_r.below(w.snaps.len() as u64) as usize;
+            w.drop_snapshot(k).map_err(|e| format!("step {}: {}", step, e))?;
+        }
+        if !w.snaps.is_empty() && w.snap_r.chance(1) {
+            w.snapshots_hold("a look").map_err(|e| format!("step {}: {}", step, e))?;
+        }
         /* A writer lost with its host: another starts */
         if w.current().is_none() {
             let up: Vec<usize> = (0..HOSTS.len()).filter(|&h| Some(h) != w.down).collect();
@@ -1965,11 +2255,17 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         lost = w.lose_written(replaced).map_err(|e| format!("the end: {}", e))?;
     }
     if !shaped && lost.is_none() && ends.chance(40) {
+        shaped = true;
         if ends.chance(50) {
             w.close_drained().map_err(|e| format!("the end: {}", e))?;
         } else {
             w.source_found_open().map_err(|e| format!("the end: {}", e))?;
         }
+    }
+    /* A flush to a replica back with chunks found open (N10c), drawn of its
+       own so that the ends above go as they did */
+    if !shaped && lost.is_none() && Rng::new(mix(seed, 0x666f_666c)).chance(30) {
+        w.found_open_flush().map_err(|e| format!("the end: {}", e))?;
     }
     for _ in 0..END_WRITERS {
         let c = match w.current() {
@@ -2010,6 +2306,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         match phase {
             Phase::Detached => {
                 w.settle(lost).map_err(|e| format!("the end: {}", e))?;
+                w.snapshots_hold("the end")?;
                 /* Every set whole, no copy to come: a sector of a closed chunk
                    rotted on one member, now and then (N9e) -- the scrub to
                    find it, the member taken down as a person would, its join

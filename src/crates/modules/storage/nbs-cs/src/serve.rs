@@ -39,8 +39,8 @@ use kcore::klog;
 use kcore::time::{boot_time_ns, Duration};
 use nbscs::{Identity as DevIdentity, OpenError, SlotState, Store};
 use nbswire::copy::{self, Copy};
-use nbswire::serve::{serve, Vouched};
-use nbswire::{Answer, Answered, Op, Query, Question, Refusal, Reply, Request, Told, CS_NAME, LIST_MAX, TAG_ANSWER,
+use nbswire::serve::{collect, serve, Vouched};
+use nbswire::{Answer, Answered, Op, Query, Question, Refusal, Reply, Request, Told, CS_NAME, TAG_ANSWER,
               TAG_QUERY, TAG_REQUEST, TAG_TOLD};
 
 use crate::disk::QueueDevice;
@@ -301,34 +301,17 @@ impl Server {
     }
 
     /// Chunks the metadata freed, or whose number is another chunk's now,
-    /// freed here; fences of volumes gone taken off.
+    /// freed here; fences of volumes gone taken off (nbswire's `collect`).
     fn collect(&mut self) {
-        let held: Vec<(u32, u32)> = self.store.holdings().iter().map(|h| (h.chunk, h.incarnation)).collect();
-        for batch in held.chunks(LIST_MAX) {
-            let Some(Told::Gone(gone)) = self.link.ask(Question::Live { chunks: batch.to_vec() }) else { return };
-            for c in gone {
-                if let Some(&(_, inc)) = batch.iter().find(|(n, _)| *n == c) {
-                    match self.store.free(c, inc) {
-                        Ok(true) => {
-                            klog!(2, "nbs-cs: chunk {} ({}) freed", c, inc);
-                            self.changed = true;
-                        }
-                        Ok(false) => {}
-                        Err(e) => klog!(0, "nbs-cs: chunk {} not freed: {:?}", c, e),
-                    }
-                }
-            }
+        let link = &mut self.link;
+        let done = collect(&mut self.store, &mut |q| link.ask(q));
+        for &(c, inc) in &done.freed {
+            klog!(2, "nbs-cs: chunk {} ({}) freed", c, inc);
         }
-        let volumes: Vec<u32> = self.store.fenced_volumes().iter().map(|&(v, _)| v).collect();
-        for batch in volumes.chunks(LIST_MAX) {
-            let Some(Told::Gone(gone)) = self.link.ask(Question::Volumes { volumes: batch.to_vec() }) else { return };
-            for v in gone {
-                self.changed = true;
-                if let Err(e) = self.store.drop_fence(v) {
-                    klog!(0, "nbs-cs: volume {}'s fence not taken off: {:?}", v, e);
-                }
-            }
+        for &(n, e) in &done.failed {
+            klog!(0, "nbs-cs: chunk {} or volume {}'s fence not let go of: {:?}", n, n, e);
         }
+        self.changed |= !done.freed.is_empty() || !done.unfenced.is_empty();
     }
 
     /* ---- joins (N9) ---- */

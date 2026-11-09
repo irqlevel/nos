@@ -39,6 +39,15 @@
 //!   closes every chunk written before it at once.
 //! - An operation not done in a minute fails, said -- a stalled disk is
 //!   reported, not left hanging.
+//! - A write to a place whose chunk is shared -- a snapshot's or a clone's
+//!   too, as a copy-up pending's is -- is held while the chunk is copied up
+//!   (N10): a new chunk asked of the mds (`CopyUp`), each active member of
+//!   the set asked to copy the old one into it, and the mds told
+//!   (`CopyDone`), after which the map names the new one and the write goes
+//!   to it. A member that refuses as failed, or is silent, is asked out as
+//!   for a write; a view behind the set, or a copy-up given up meanwhile --
+//!   a join of the set begun -- has the copy-up asked again from its start
+//!   once the map is read again: each step of it does nothing done before.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -142,6 +151,31 @@ struct SetInfo {
     stale: bool,
 }
 
+/// A place's copy-up (N10): the writes to it held while the mds gives a new
+/// chunk, each active member of the set copies the old one into it, and the
+/// mds is told it done.
+#[derive(Default)]
+struct CopyUp {
+    /// The ask of the mds out: `CopyUp`, or -- `done` -- `CopyDone`.
+    ask: Option<CopyAsk>,
+    /// The new chunk and its incarnation, once told.
+    to: Option<(u32, u32)>,
+    /// The members asked to copy, not answered.
+    waiting: BTreeSet<u32>,
+    /// To be asked again from its start once the map is read again.
+    after_map: bool,
+    /// The write pieces held for it.
+    held: Vec<u64>,
+}
+
+struct CopyAsk {
+    id: u64,
+    bytes: Vec<u8>,
+    sent: u64,
+    again: Option<u64>,
+    done: bool,
+}
+
 impl SetInfo {
     /// Its replicas that are written: the active members, and the joiner --
     /// a write it missed would be missing from what its copy takes over.
@@ -167,6 +201,8 @@ struct Map {
     places: Vec<(u32, u32, u32)>,
     sets: BTreeMap<u32, SetInfo>,
     hosts: BTreeMap<u32, String>,
+    /// The places whose chunk is shared (N10).
+    shared: BTreeSet<u32>,
 }
 
 impl Map {
@@ -241,6 +277,8 @@ enum What {
     Flush(u64),
     Held,
     Close(u32),
+    /// A member's copy of a place's chunk into its copy-up's (N10).
+    CopyUp(u32),
 }
 
 /// A request out to a cs.
@@ -340,6 +378,8 @@ pub struct Session {
     /// Read pieces each cs has answered, for a person: where a read went.
     reads: BTreeMap<u32, u64>,
     stop_flush: Option<u64>,
+    /// The copy-ups under way, by place (N10).
+    copies: BTreeMap<u32, CopyUp>,
 }
 
 impl Session {
@@ -354,6 +394,7 @@ impl Session {
             queue: VecDeque::new(), parked: Vec::new(), fenced: BTreeSet::new(), held: BTreeMap::new(),
             dirty: BTreeSet::new(), open: BTreeMap::new(), closing: BTreeMap::new(), mend: VecDeque::new(),
             mending: None, scratch: Vec::new(), stop: None, stop_flush: None, reads: BTreeMap::new(),
+            copies: BTreeMap::new(),
         }
     }
 
@@ -433,6 +474,11 @@ impl Session {
         s += &alloc::format!("; open {:?}; closing {:?}; asked out {:?}; stop {:?}/{:?}; mds {:?}", self.open,
                              self.closing, self.downs.keys().collect::<Vec<_>>(), self.stop, self.stop_flush,
                              self.mds.as_ref().map(|m| m.want));
+        for (place, c) in &self.copies {
+            s += &alloc::format!("; copy-up of place {}: to {:?}, members {:?}, held {:?}, asking {:?}{}", place,
+                                 c.to, c.waiting, c.held, c.ask.as_ref().map(|a| if a.done { "done" } else { "up" }),
+                                 if c.after_map { ", after the map" } else { "" });
+        }
         s
     }
 
@@ -473,6 +519,11 @@ impl Session {
         let Some(s) = Saying::decode(bytes) else { return };
         if self.mds.as_ref().is_some_and(|m| m.id == s.id) {
             self.on_mds_ask(s.said, now, bufs, out);
+            return;
+        }
+        let copy = self.copies.iter().find(|(_, c)| c.ask.as_ref().is_some_and(|a| a.id == s.id)).map(|(&p, _)| p);
+        if let Some(place) = copy {
+            self.on_copy_said(place, s.said, now, bufs, out);
             return;
         }
         let Some(&key) = self.downs.iter().find(|(_, d)| d.id == s.id).map(|(k, _)| k) else { return };
@@ -558,6 +609,9 @@ impl Session {
                 r.volume = volume;
                 r.size = size_mib << 20;
                 for p in &map {
+                    if p.shared {
+                        r.shared.insert(r.places.len() as u32);
+                    }
                     r.places.push((p.chunk.chunk, p.chunk.incarnation, p.chunk.epoch.set));
                     r.sets.insert(p.chunk.epoch.set, SetInfo { version: p.chunk.epoch.version, cs: p.cs,
                                                                replicas: p.replicas, joiner: p.joiner,
@@ -649,6 +703,20 @@ impl Session {
                    as refused so */
                 let map = &self.map;
                 self.downs.retain(|&(set, cs), _| map.sets.get(&set).is_some_and(|s| s.written_to(cs)));
+                /* Copy-ups that waited for the map: asked again from their
+                   start -- or, their chunk shared no longer as the map says
+                   now, over */
+                let again: Vec<u32> = self.copies.iter().filter(|(_, c)| c.after_map).map(|(&p, _)| p).collect();
+                for place in again {
+                    if let Some(c) = self.copies.get_mut(&place) {
+                        c.after_map = false;
+                    }
+                    if self.map.shared.contains(&place) {
+                        self.ask_copy(place, false, now, out);
+                    } else if let Some(&(chunk, incarnation, _)) = self.map.places.get(place as usize) {
+                        self.copied(place, chunk, incarnation, now, bufs, out);
+                    }
+                }
             }
         }
     }
@@ -688,6 +756,11 @@ impl Session {
             What::Held => Op::Held,
             What::Flush(_) => Op::Flush,
             What::Close(place) => Op::Close { chunk: self.map.chunk(place)?, position: place, index },
+            What::CopyUp(place) => {
+                let from = self.map.chunk(place)?;
+                let (chunk, incarnation) = self.copies.get(&place)?.to?;
+                Op::CopyUp { from, to: ChunkRef { chunk, incarnation, epoch: from.epoch }, position: place, index }
+            }
             What::Piece(pid) => {
                 let p = self.pieces.get(&pid)?;
                 let o = self.ops.get(&p.op)?;
@@ -755,6 +828,16 @@ impl Session {
                 self.send(cs, What::Piece(pid), now, bufs, out);
             }
             _ => {
+                /* A chunk shared, or a copy-up pending there (N10): the write
+                   held while it is copied up */
+                let place = p.place;
+                if self.map.shared.contains(&place) {
+                    self.hold_for_copy(pid, place, now, out);
+                    return;
+                }
+                for c in self.copies.values_mut() {
+                    c.held.retain(|&x| x != pid);
+                }
                 /* A view behind its set may lack a joiner: the write waits for
                    the map */
                 if set.stale {
@@ -828,6 +911,12 @@ impl Session {
                 self.flush_progress(op, now, bufs, out);
             }
             (What::Close(place), Reply::Closed(_)) => self.closed(place, cs, now, bufs, out),
+            (What::CopyUp(place), Reply::Done) => {
+                if let Some(c) = self.copies.get_mut(&place) {
+                    c.waiting.remove(&cs);
+                }
+                self.copy_progress(place, now, out);
+            }
             _ => {}
         }
     }
@@ -874,6 +963,10 @@ impl Session {
                        each map read and refused each time, and the writer's
                        stop waited for good) */
                     What::Close(place) if matches!(why, Refusal::NotHere) => self.closed(place, cs, now, bufs, out),
+                    /* A copy-up's member by a view behind the set, or the
+                       copy-up given up meanwhile: asked again from its start
+                       once the map is read again */
+                    What::CopyUp(place) => self.restart_copy(place),
                     other => self.resend_later(cs, other, now, bufs, out),
                 }
                 self.refresh(now, out);
@@ -881,6 +974,14 @@ impl Session {
             Refusal::Behind { .. } | Refusal::NotReady | Refusal::NoMds => {
                 if let Some(s) = self.subs.get_mut(&id) {
                     s.again = Some(now + AGAIN_NS);
+                }
+            }
+            /* A member with no slot free yet for a copy-up's chunk, which the
+               metadata counted room for: its slots of chunks gone are given
+               back as it looks for them (N10) */
+            Refusal::NoRoom if matches!(what, What::CopyUp(_)) => {
+                if let Some(s) = self.subs.get_mut(&id) {
+                    s.again = Some(now + RESEND_NS);
                 }
             }
             Refusal::Failed | Refusal::Io => {
@@ -941,8 +1042,21 @@ impl Session {
                 Some((set, info)) if info.written_to(cs) => alloc::vec![set],
                 _ => Vec::new(),
             },
+            What::CopyUp(place) => match self.map.set_of(place) {
+                Some((set, info)) if info.written_to(cs) => alloc::vec![set],
+                _ => Vec::new(),
+            },
             _ => self.map.sets.iter().filter(|(_, s)| s.written_to(cs)).map(|(&id, _)| id).collect(),
         };
+        /* A copy-up's member the view has out of the set: not waited on */
+        if let (true, What::CopyUp(place)) = (sets.is_empty(), what) {
+            self.drop_subs(cs, what);
+            if let Some(c) = self.copies.get_mut(&place) {
+                c.waiting.remove(&cs);
+            }
+            self.copy_progress(place, now, out);
+            return;
+        }
         /* A cs-wide request to a cs no set writes now: done, not waited on */
         if sets.is_empty() && !matches!(what, What::Piece(_)) {
             self.cs_wide_done(cs, now, bufs, out);
@@ -1038,6 +1152,28 @@ impl Session {
                 self.replica_has(pid, cs, now, bufs, out);
             }
         }
+        /* Copy-ups of that set waiting for it: done without it, which copies
+           the new chunk when it comes back, as any chunk written while it was
+           out (N10) -- but by a view behind the set, asked again from their
+           start once the map is read again: the members it asked may not be
+           the set's, and one it lacks has copied nothing (found by fuzz/nbs's
+           cluster target, N10c: the one member asked, down, taken out, and the
+           copy-up done by none, the new chunk zeros under the writes after) */
+        let stale = self.map.sets.get(&set).is_some_and(|s| s.stale);
+        let copies: Vec<u32> = self.copies.iter()
+            .filter(|(&place, c)| c.waiting.contains(&cs) && self.map.set_of(place).is_some_and(|(s, _)| s == set))
+            .map(|(&place, _)| place).collect();
+        for place in copies {
+            if stale {
+                self.restart_copy(place);
+                continue;
+            }
+            self.drop_subs(cs, What::CopyUp(place));
+            if let Some(c) = self.copies.get_mut(&place) {
+                c.waiting.remove(&cs);
+            }
+            self.copy_progress(place, now, out);
+        }
         self.cs_wide_done(cs, now, bufs, out);
     }
 
@@ -1069,8 +1205,150 @@ impl Session {
                     self.flush_progress(op, now, bufs, out);
                 }
                 What::Close(place) => self.closed(place, cs, now, bufs, out),
+                What::CopyUp(place) => {
+                    if let Some(c) = self.copies.get_mut(&place) {
+                        c.waiting.remove(&cs);
+                    }
+                    self.copy_progress(place, now, out);
+                }
                 What::Piece(_) => {}
             }
+        }
+    }
+
+    /* ---- copy-ups (N10) ---- */
+
+    /// Write piece `pid` held for its place's copy-up -- begun, where none is
+    /// under way.
+    fn hold_for_copy(&mut self, pid: u64, place: u32, now: u64, out: &mut Vec<Out>) {
+        let c = self.copies.entry(place).or_default();
+        if !c.held.contains(&pid) {
+            c.held.push(pid);
+        }
+        if c.ask.is_none() && c.to.is_none() && !c.after_map {
+            self.ask_copy(place, false, now, out);
+        }
+    }
+
+    /// Place `place`'s copy-up asked of the mds: a new chunk for it, or --
+    /// `done` -- the copy done.
+    fn ask_copy(&mut self, place: u32, done: bool, now: u64, out: &mut Vec<Out>) {
+        let (name, generation) = (self.name.clone(), self.generation);
+        let ask = match self.copies.get(&place).and_then(|c| c.to) {
+            Some((chunk, _)) if done => Ask::CopyDone { name, place, generation, chunk },
+            _ => Ask::CopyUp { name, place, generation },
+        };
+        let id = self.take_id();
+        let bytes = Asking { id, ask }.encode();
+        out.push(Out::Send { to: To::Mds, id, bytes: bytes.clone() });
+        if let Some(c) = self.copies.get_mut(&place) {
+            c.ask = Some(CopyAsk { id, bytes, sent: now, again: None, done });
+        }
+    }
+
+    /// What the mds said of place `place`'s copy-up.
+    fn on_copy_said(&mut self, place: u32, said: Said, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
+        let done = self.copies.get(&place).and_then(|c| c.ask.as_ref()).is_some_and(|a| a.done);
+        match said {
+            Said::Chunk { chunk, incarnation, index } => {
+                self.index = self.index.max(index);
+                let at = self.map.places.get(place as usize).map(|&(c, i, _)| (c, i));
+                if done || at == Some((chunk, incarnation)) {
+                    /* Done -- or the chunk shared no longer: written as it is */
+                    self.copied(place, chunk, incarnation, now, bufs, out);
+                    return;
+                }
+                if let Some(c) = self.copies.get_mut(&place) {
+                    c.ask = None;
+                    c.to = Some((chunk, incarnation));
+                }
+                self.copy_members(place, now, bufs, out);
+            }
+            /* No leader, the mds behind, or the set being joined: asked again */
+            Said::NotNow(_) | Said::Behind { .. } => {
+                if let Some(a) = self.copies.get_mut(&place).and_then(|c| c.ask.as_mut()) {
+                    a.again = Some(now + AGAIN_NS);
+                }
+            }
+            Said::NotTheWriter => self.fail("the volume was attached elsewhere: this attach is fenced", out),
+            /* Its copy-up given up meanwhile -- a join of the set begun: asked
+               again from its start */
+            Said::Refused(_) if done => {
+                if let Some(c) = self.copies.get_mut(&place) {
+                    c.ask = None;
+                    c.to = None;
+                }
+                self.ask_copy(place, false, now, out);
+            }
+            /* No room for a new chunk, or none of the volume's: the writes held
+               fail, said */
+            Said::Refused(why) => {
+                out.push(Out::Say(alloc::format!("nbs: volume {}: place {}'s chunk not copied up: {}", self.name,
+                                                 place, why)));
+                let held = self.copies.remove(&place).map(|c| c.held).unwrap_or_default();
+                for pid in held {
+                    self.piece_done(pid, false, now, bufs, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Each active member of place `place`'s set, as the view has it, asked to
+    /// copy the place's chunk into its copy-up's: a view behind the set, or
+    /// with none, has it asked again once the map is read again.
+    fn copy_members(&mut self, place: u32, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
+        let members: Vec<u32> = match self.map.set_of(place) {
+            Some((_, set)) if !set.stale => set.cs.iter().copied().filter(|&c| set.active(c)).collect(),
+            _ => Vec::new(),
+        };
+        if members.is_empty() {
+            self.restart_copy(place);
+            self.refresh(now, out);
+            return;
+        }
+        if let Some(c) = self.copies.get_mut(&place) {
+            c.waiting = members.iter().copied().collect();
+        }
+        for cs in members {
+            self.send(cs, What::CopyUp(place), now, bufs, out);
+        }
+    }
+
+    /// Place `place`'s copy-up told done to the mds once every member asked
+    /// has copied, or is out.
+    fn copy_progress(&mut self, place: u32, now: u64, out: &mut Vec<Out>) {
+        let Some(c) = self.copies.get(&place) else { return };
+        if c.to.is_some() && c.ask.is_none() && c.waiting.is_empty() && !c.after_map {
+            self.ask_copy(place, true, now, out);
+        }
+    }
+
+    /// Place `place`'s copy-up to be asked again from its start once the map
+    /// is read again: its members' copies of now dropped.
+    fn restart_copy(&mut self, place: u32) {
+        self.subs.retain(|_, s| s.what != What::CopyUp(place));
+        if let Some(c) = self.copies.get_mut(&place) {
+            c.ask = None;
+            c.to = None;
+            c.waiting.clear();
+            c.after_map = true;
+        }
+    }
+
+    /// Place `place`'s copy-up over, chunk `chunk` the place's now: the map
+    /// names it, shared no longer, and the writes held go to it.
+    fn copied(&mut self, place: u32, chunk: u32, incarnation: u32, now: u64, bufs: &mut dyn Buffers,
+              out: &mut Vec<Out>) {
+        if let Some(p) = self.map.places.get_mut(place as usize) {
+            p.0 = chunk;
+            p.1 = incarnation;
+        }
+        self.map.shared.remove(&place);
+        self.subs.retain(|_, s| s.what != What::CopyUp(place));
+        let held = self.copies.remove(&place).map(|c| c.held).unwrap_or_default();
+        for pid in held {
+            self.send_piece(pid, now, bufs, out);
         }
     }
 
@@ -1579,6 +1857,7 @@ impl Session {
         self.pieces.clear();
         self.subs.clear();
         self.downs.clear();
+        self.copies.clear();
         self.mds = None;
         if let Some(tag) = self.stop.take() {
             out.push(Out::Done { tag, ok: false });
@@ -1611,6 +1890,14 @@ impl Session {
                 d.sent = now;
                 d.again = None;
                 out.push(Out::Send { to: To::Mds, id: d.id, bytes: d.bytes.clone() });
+            }
+        }
+        for a in self.copies.values_mut().filter_map(|c| c.ask.as_mut()) {
+            let due = a.again.map_or(now >= a.sent + RESEND_NS, |t| now >= t);
+            if due {
+                a.sent = now;
+                a.again = None;
+                out.push(Out::Send { to: To::Mds, id: a.id, bytes: a.bytes.clone() });
             }
         }
         let mut silent = Vec::new();

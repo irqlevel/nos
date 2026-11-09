@@ -932,13 +932,16 @@ pub const NO_JOINER: u32 = u32::MAX;
 
 /// A place of a volume's map: the chunk there, as a request names it, its
 /// set's three cs's, each with its state, and the set's joiner -- a cs
-/// being copied onto, written and not read (N9).
+/// being copied onto, written and not read (N9). `shared`: the chunk is
+/// another map's too -- a snapshot's or a clone's, and so of every copy-up
+/// pending (N10): its writer copies it up before it writes there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Place {
     pub chunk: ChunkRef,
     pub cs: [u32; nbsmeta::REPLICAS],
     pub replicas: [ReplicaState; nbsmeta::REPLICAS],
     pub joiner: Option<u32>,
+    pub shared: bool,
 }
 
 /// What a client -- hv's disk, `nbs io`, nbsload -- asks its host's mds.
@@ -958,6 +961,13 @@ pub enum Ask {
     /// or, `refused`, it refused as failed. Asked as volume `name`'s writer
     /// at `generation`.
     Down { set: u32, cs: u32, refused: bool, name: String, generation: u64 },
+    /// A new chunk for place `place` of volume `name`, whose chunk is shared
+    /// (N10): asked by its writer at `generation` before it writes there,
+    /// told the chunk each active member of the set is to copy the old one
+    /// into -- or the old one, shared no longer.
+    CopyUp { name: String, place: u32, generation: u64 },
+    /// The copy-up at place `place` done: the map names chunk `chunk` there.
+    CopyDone { name: String, place: u32, generation: u64, chunk: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -991,6 +1001,9 @@ pub enum Said {
     LastReplica,
     /// The one asking is not the volume's writer: attached elsewhere since.
     NotTheWriter,
+    /// A copy-up's chunk (N10): the chunk, its incarnation, and the entry the
+    /// answer was applied at.
+    Chunk { chunk: u32, incarnation: u32, index: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1014,8 +1027,9 @@ fn read_replica_state(c: u8) -> Option<ReplicaState> {
     })
 }
 
-/// A place's bytes: its chunk, its three cs's and their states, its joiner.
-const PLACE_BYTES: usize = 16 + 4 * nbsmeta::REPLICAS + nbsmeta::REPLICAS + 4;
+/// A place's bytes: its chunk, its three cs's and their states, its joiner,
+/// whether it is shared.
+const PLACE_BYTES: usize = 16 + 4 * nbsmeta::REPLICAS + nbsmeta::REPLICAS + 4 + 1;
 
 impl Asking {
     pub fn encode(&self) -> Vec<u8> {
@@ -1047,6 +1061,19 @@ impl Asking {
                 w.u8(u8::from(*refused));
                 w.str(name);
                 w.u64(*generation);
+            }
+            Ask::CopyUp { name, place, generation } => {
+                w.u8(5);
+                w.str(name);
+                w.u32(*place);
+                w.u64(*generation);
+            }
+            Ask::CopyDone { name, place, generation, chunk } => {
+                w.u8(6);
+                w.str(name);
+                w.u32(*place);
+                w.u64(*generation);
+                w.u32(*chunk);
             }
         }
         w.buf
@@ -1086,6 +1113,15 @@ impl Asking {
                 let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);
                 Ask::Down { set, cs, refused, name, generation: r.u64()? }
             }
+            5 => {
+                let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);
+                Ask::CopyUp { name, place: r.u32()?, generation: r.u64()? }
+            }
+            6 => {
+                let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);
+                let (place, generation) = (r.u32()?, r.u64()?);
+                Ask::CopyDone { name, place, generation, chunk: r.u32()? }
+            }
             _ => return None,
         };
         r.done().then_some(Asking { id, ask })
@@ -1123,6 +1159,7 @@ impl Saying {
                         w.u8(replica_state(s));
                     }
                     w.u32(p.joiner.unwrap_or(NO_JOINER));
+                    w.u8(u8::from(p.shared));
                 }
                 w.u8(hosts.len() as u8);
                 for (cs, host) in hosts {
@@ -1149,6 +1186,12 @@ impl Saying {
             }
             Said::LastReplica => w.u8(8),
             Said::NotTheWriter => w.u8(9),
+            Said::Chunk { chunk, incarnation, index } => {
+                w.u8(10);
+                w.u32(*chunk);
+                w.u32(*incarnation);
+                w.u64(*index);
+            }
         }
         w.buf
     }
@@ -1187,7 +1230,12 @@ impl Saying {
                         }
                         j => Some(j),
                     };
-                    map.push(Place { chunk, cs, replicas, joiner });
+                    let shared = match r.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return None,
+                    };
+                    map.push(Place { chunk, cs, replicas, joiner, shared });
                 }
                 let k = usize::from(r.u8()?);
                 if k > nbsmeta::CS_MAX {
@@ -1209,6 +1257,7 @@ impl Saying {
             7 => Said::Refused(String::from(r.str(REASON_MAX)?)),
             8 => Said::LastReplica,
             9 => Said::NotTheWriter,
+            10 => Said::Chunk { chunk: r.u32()?, incarnation: r.u32()?, index: r.u64()? },
             _ => return None,
         };
         r.done().then_some(Saying { id, said })
