@@ -29,24 +29,23 @@ fn len(r: &mut Rng, max: u64) -> usize {
 }
 
 fn refusal(r: &mut Rng) -> Refusal {
-    match r.below(18) {
+    match r.below(17) {
         0 => Refusal::Fenced { generation: r.below(u64::MAX) },
         1 => Refusal::NotFenced { generation: r.below(u64::MAX) },
         2 => Refusal::StaleChunk { incarnation: r.below(1 << 32) as u32 },
         3 => Refusal::Epoch { known: Epoch { set: r.below(1 << 32) as u32, version: r.below(1 << 32) as u32 } },
-        4 => Refusal::NotTheVolumes,
-        5 => Refusal::NoRoom,
-        6 => Refusal::Bad,
-        7 => Refusal::Failed,
-        8 => Refusal::Io,
-        9 => Refusal::TooManyFences,
-        10 => Refusal::NotTheMap,
-        11 => Refusal::NotHere,
-        12 => Refusal::NotAttached,
-        13 => Refusal::Behind { applied: r.below(u64::MAX) },
-        14 => Refusal::NoMds,
-        16 => Refusal::NotHeld,
-        17 => Refusal::NotTheJoiner,
+        4 => Refusal::NoRoom,
+        5 => Refusal::Bad,
+        6 => Refusal::Failed,
+        7 => Refusal::Io,
+        8 => Refusal::TooManyFences,
+        9 => Refusal::NotTheMap,
+        10 => Refusal::NotHere,
+        11 => Refusal::NotAttached,
+        12 => Refusal::Behind { applied: r.below(u64::MAX) },
+        13 => Refusal::NoMds,
+        14 => Refusal::NotHeld,
+        15 => Refusal::NotTheJoiner,
         _ => Refusal::NotReady,
     }
 }
@@ -106,7 +105,7 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
     match r.below(6) {
         0 => {
             let n = len(r, u64::from(DATA_MAX));
-            let op = match r.below(11) {
+            let op = match r.below(12) {
                 0 => Op::Fence,
                 1 => Op::Write { chunk: chunk(r), position: r.below(1 << 32) as u32, index: r.below(u64::MAX),
                                  offset: r.below(1 << 32) as u32, data: &data[..n] },
@@ -124,6 +123,9 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                                 offset: r.below(1 << 32) as u32, len: r.below(u64::from(DATA_MAX) + 1) as u32 },
                 /* The leader's scrub (N9e) */
                 8 => Op::Scrub { chunk: chunk(r) },
+                /* A copy-up's copy (N10) */
+                9 => Op::CopyUp { from: chunk(r), to: chunk(r), position: r.below(1 << 32) as u32,
+                                  index: r.below(u64::MAX) },
                 _ => Op::Sums { chunk: chunk(r), joiner: r.below(1 << 32) as u32, index: r.below(u64::MAX),
                                 offset: r.below(1 << 32) as u32, len: r.below(nbscs::SLOT + 1) as u32 },
             };
@@ -160,7 +162,7 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
             (1, Answer { id, reply }.encode(), true)
         }
         2 => {
-            let question = match r.below(8) {
+            let question = match r.below(9) {
                 0 => Question::Identity,
                 1 => Question::Verify { volume: r.below(1 << 32) as u32, generation: r.below(u64::MAX), chunk: chunk(r),
                                         position: r.below(1 << 32) as u32, index: r.below(u64::MAX),
@@ -178,7 +180,11 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                                             version: r.below(1 << 32) as u32, index: r.below(u64::MAX) },
                 5 => Question::Joins,
                 6 => Question::JoinDone { set: r.below(1 << 32) as u32, since: r.below(1 << 32) as u32 },
-                _ => Question::GiveUp { set: r.below(1 << 32) as u32, since: r.below(1 << 32) as u32 },
+                7 => Question::GiveUp { set: r.below(1 << 32) as u32, since: r.below(1 << 32) as u32 },
+                /* A copy-up's copy (N10) */
+                _ => Question::VerifyCopy { volume: r.below(1 << 32) as u32, generation: r.below(u64::MAX),
+                                            position: r.below(1 << 32) as u32, from: chunk(r), to: chunk(r),
+                                            index: r.below(u64::MAX) },
             };
             (2, Query { id, question }.encode(), true)
         }

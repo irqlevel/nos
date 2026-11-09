@@ -39,6 +39,10 @@ pub const SECTOR: u64 = 512;
 /// CRC-32C of each.
 pub const GRANULE: u32 = 64 << 10;
 
+/// A copy-up's piece (N10): a chunk read and written this much at a time,
+/// a buffer the kernel's heap gives at once.
+pub const COPY_PIECE: u64 = 256 << 10;
+
 /// The sums of a chunk of zeros, one a `GRANULE`, as `Store::sums` and
 /// `Store::scrub` give them: what a chunk a cs does not hold reads as -- a
 /// slot is zeros before a chunk takes it -- for the leader's scrub to hold

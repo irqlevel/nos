@@ -3228,11 +3228,19 @@ cs's clients and its host's mds: it decides every chunk's incarnation and
 epoch and every volume's generation, and keeps what each sector may hold.
 
 - **The steps**: fences, new and old; writes at the fence, older and newer
-  than it, checked or not; reads by the writer, and now and then by another
-  volume; flushes; closes; a chunk freed and its number taken by a new
-  incarnation of another volume, the cs told or not; a set's version moved
-  on; a request of a number's chunk before.
-- **The power** fails within a step's next few writes, or between steps.
+  than it, checked or not, and now and then by another volume's writer
+  (N10b) where the chunk is not open for its own; reads by the writer, and
+  now and then by another volume, unvouched first; flushes; closes; a chunk
+  freed and its number taken by a new incarnation of another volume, the cs
+  told or not; a set's version moved on; a request of a number's chunk
+  before; and copy-ups (N10b), served by nbswire's `serve` as nbs-cs serves
+  them, the fuzzer the mds it asks -- mostly of a chunk the cs holds by a
+  volume fenced, now and then by an older attach or a newer one, of two
+  chunks of two epochs or one, of an epoch older than the one the cs knows,
+  refused by the mds, or the last one asked again -- drawn of a randomness of
+  their own, so that every other draw goes as it did.
+- **The power** fails within a step's next few writes, or between steps,
+  and in a copy-up at any of its writes and flushes.
   Each write the cache held is kept, lost or torn -- some of its sectors
   kept -- and now and then one of the cs's own sectors is torn inside, or a
   bit of a copy A rotted when no record of it was in flight.
@@ -3240,15 +3248,21 @@ epoch and every volume's generation, and keeps what each sector may hold.
   order, and held to:
   - every fence answered there, at least as new;
   - every chunk written since its last close open, at a generation at least
-    the newest answered;
-  - a chunk closed reading exactly what it held at the close;
+    the newest answered, as the volume's whose writer wrote it;
+  - a chunk closed reading exactly what it held at the close, and a
+    copy-up's what it was copied from -- one cut in it reading that or
+    nothing;
   - every sector reading its value at the last flush answered, or one
     written since;
   - a chunk never written, freed, or taken by a new incarnation reading
     zeros where the new one was not written;
   - no record lost, and every slot free, held or lost, none twice.
 - **Between cuts**: every read exactly the last write, and every refusal the
-  one the request deserves.
+  one the request deserves; another volume's chunk read or written only once
+  vouched for, and written, that volume's from then on; a copy-up asking the
+  mds where the cs does not hold its new chunk and nowhere else, done a copy
+  of its chunk -- closed, the volume's, at its epoch -- and asked again,
+  nothing.
 - **Before each run**: a blank disk opens as blank, one with a byte past a
   superblock's in its first two pages -- a boot sector's signature, a GPT
   header, ext's magic, anywhere -- opens as something else's and is not
@@ -3417,9 +3431,9 @@ little and now and then past a silence.
     its source's by sums now, and `Op::Touch` is gone.
 
 `--mutants` runs `fuzz/nbs/mutants.py`, which takes out one rule at a time.
-Each of its hundred and thirty-five must fail the gate -- run as `nbs-fuzz gate
+Each of its hundred and fifty-eight must fail the gate -- run as `nbs-fuzz gate
 --first`, stopped at the first target that fails: the gate's verdict, sooner.
-The metadata's sixty-seven:
+The metadata's sixty-nine:
 - placement: the home host first, the most room first, rule 6, three full
   hosts refused as no room rather than too few hosts, new chunks only on
   cs's that are up and only into a clean set, an empty set made again
@@ -3463,9 +3477,11 @@ The metadata's sixty-seven:
   pending and read-only volumes each held to what they can be -- the meta
   target aims a spoil at each, of a randomness of its own, and its fsck
   holds what a spoiled snapshot taken says. A free chunk's link is aimed at
-  the same way, which random bytes reach once in a long while.
+  the same way, which random bytes reach once in a long while;
+- N10b's two: no copy-up into a set being joined, and a join giving up
+  its set's copy-ups pending.
 
-The cs's twenty-seven: a slot's zeros flushed before the record that takes it,
+The cs's forty: a slot's zeros flushed before the record that takes it,
 and the slot zeroed at all; an open mark durable before a generation's first
 write; copy B written only once copy A is flushed; a fence durable before it
 is answered; a close only after the chunk's data; a slot of a number's chunk
@@ -3474,8 +3490,15 @@ refused; a request older than the fence refused; a record whose CRC fails
 taken as no record; a record's first write torn in copy A taken as never
 written; a fence page with a torn copy written again at the open; a device
 with anything past a superblock's bytes never taken for blank; nothing of one
-volume's read through another's; a freed slot given back -- and twelve of
-the copy's: a chunk found open no copy's source, and an open mark no client
+volume's read or written through another's unless the mds vouches that its
+map names it, and a write of another volume's chunk making it the writer's
+volume's; a freed slot given back -- eleven of a copy-up's (N10b): by the
+volume's writer of now, of two chunks of one epoch, asked again changing
+nothing, its chunk taken only once vouched for, none of a chunk found open
+nor of an epoch older than the one the cs knows, the whole chunk copied, its
+data durable before its record, its chunk closed and written at its own
+epoch, and its slot off the free list once the record is written -- and
+twelve of the copy's: a chunk found open no copy's source, and an open mark no client
 has written since the join began closed by the copy at its end; a write of
 an epoch before the
 chunk's refused, though a check of it was vouched for, and a joiner taking no
@@ -3487,12 +3510,17 @@ closes closed only after its data is durable, and what it took in made
 durable where a client's write left the chunk open at its generation; and a
 record of the copy's, at no writer's generation, read back as itself.
 
-The wire's twenty: a request read whole, nothing past its end, a flag read
+The wire's twenty-eight: a request read whole, nothing past its end, a flag read
 as 0 or 1 alone, and a map asked for past its most read as none; of `serve`,
 a chunk found open refused to its writer, a flush refused to a writer with
 one and to a writer fenced since, a write vouched for as the joiner's marking
 the set from then on, and a found-open chunk written by its set's joiner not
-refused as failed; of the mds, the map naming a set's joiner; of the copy, a
+refused as failed, a copy-up's chunk the cs does not hold asked of the mds
+first, and one the mds refuses not done; of the mds, the map naming a set's
+joiner, and a copy-up's copy vouched for only by an mds as far as its
+writer's entry, only where it is pending from that chunk to that one, of
+their incarnations, on an active member of the set, of both chunks at the
+set's version now, and for the volume's writer of now; of the copy, a
 member back holding every chunk to its source's by sums, those it holds too,
 a chunk pulled held to its source's by sums, and a granule that differs held
 to the source's a sector at a time; of the scrub, a difference a finding only

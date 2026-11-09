@@ -590,6 +590,12 @@ impl State {
         if ch.count <= 1 {
             return Ok((from, ch.incarnation));
         }
+        /* None into a set being joined: a joiner lists what its source holds
+           once, and a new chunk behind its listing would never reach it -- the
+           writer asks again once the join is over */
+        if self.sets.get(ch.set as usize).is_some_and(|s| s.joiner.is_some()) {
+            return Err(Refusal::Joining);
+        }
         if self.copying.len() >= COPYING_MAX || self.live_chunks() >= CHUNKS_MAX as u64 {
             return Err(Refusal::TooMany);
         }
@@ -928,6 +934,13 @@ impl State {
     /// back -- its room its own already -- or another cs, with room for every
     /// chunk of the set, in the place of a member down, out or drained.
     fn join(&mut self, set: u32, place: u8, cs: u32, version: u32) -> Result<u32, Refusal> {
+        /* The set's copy-ups pending, given up as the join begins (N10): a
+           joiner lists what its source holds once, and a copy-up's new chunk
+           behind its listing would never reach it. Their writers ask again
+           once the join is over; what their cs's copied is garbage */
+        let pending: Vec<((u32, u32), u32)> = self.copying.iter()
+            .filter(|(_, &(to, _))| self.chunks.get(to as usize).is_some_and(|c| c.set == set))
+            .map(|(&at, &(to, _))| (at, to)).collect();
         let s = self.set_at(set, version)?;
         let k = usize::from(place);
         if k >= REPLICAS {
@@ -958,7 +971,11 @@ impl State {
             }
         }
         let since = version.checked_add(1).ok_or(Refusal::TooMany)?;
-        let chunks = s.chunks;
+        for (at, to) in pending {
+            self.copying.remove(&at);
+            self.release_chunk(to);
+        }
+        let chunks = self.sets.get(set as usize).map_or(0, |s| s.chunks);
         self.unindex(set);
         if let Some(s) = self.sets.get_mut(set as usize) {
             s.joiner = Some(Joiner { cs, place, since });
