@@ -858,8 +858,7 @@ impl Session {
                 self.send(cs, What::Fence, now, bufs, out);
                 self.send(cs, what, now, bufs, out);
             }
-            Refusal::Epoch { .. } | Refusal::StaleChunk { .. } | Refusal::NotTheMap | Refusal::NotTheVolumes
-            | Refusal::NotHere => {
+            Refusal::Epoch { .. } | Refusal::StaleChunk { .. } | Refusal::NotTheMap | Refusal::NotHere => {
                 self.subs.remove(&id);
                 match what {
                     What::Piece(pid) => {

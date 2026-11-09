@@ -26,12 +26,20 @@
 //!   them and by a copy-up pending on it -- the metadata's number for it
 //!   learned as it first shows, and held from then on, one number one chunk;
 //!   a copy-up's new chunk in the old one's set, its room taken where every
-//!   cs of the set has a slot left, named by the map once done.
+//!   cs of the set has a slot left, named by the map once done; none in a
+//!   set being joined, and a join giving up its set's copy-ups pending;
+//! - what a host's mds tells its cs of a copy-up's copy (nbswire's `told`,
+//!   N10b): vouched for only where the model has that copy-up pending, its
+//!   writer asking, the host's cs an active member of the set at its version
+//!   now -- asked of a copy-up pending, one of its pieces now and then made
+//!   another.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use nbscs::{ChunkRef, Epoch};
 use nbsmeta::repair::{self, Seen};
 use nbsmeta::{Answer, Command, Kind, Refusal, State, CHECK_EVERY};
+use nbswire::{Question, Told};
 use raft::rsm::{Frozen, StateMachine};
 
 use crate::heap::Exempt;
@@ -863,6 +871,10 @@ impl Model {
                 if !self.init {
                     return Err(NotInitialized);
                 }
+                /* Its set's copy-ups pending given up as it begins (N10) */
+                let pending: Vec<((u32, u32), u64)> = self.pending.iter()
+                    .filter(|(_, (to, _))| self.mchunks.get(to).is_some_and(|c| c.set == *set as usize))
+                    .map(|(&at, &(to, _))| (at, to)).collect();
                 let s = self.sets.get(*set as usize).ok_or(NoSuchSet)?;
                 if s.version != *version {
                     return Err(Stale);
@@ -902,7 +914,11 @@ impl Model {
                 if *version == u32::MAX {
                     return Err(TooMany);
                 }
-                let chunks = s.chunks;
+                for (at, to) in pending {
+                    self.pending.remove(&at);
+                    self.release(to);
+                }
+                let chunks = self.sets[*set as usize].chunks;
                 let s = &mut self.sets[*set as usize];
                 s.version += 1;
                 s.joiner = Some((*cs, k, s.version));
@@ -1047,6 +1063,9 @@ impl Model {
                 let ch = self.mchunks.get(&from).expect("a map's").clone();
                 if ch.count <= 1 {
                     return Ok(self.answer_of(from));
+                }
+                if self.sets[ch.set].joiner.is_some() {
+                    return Err(Joining);
                 }
                 if self.pending.len() >= COPYING_MAX || self.live() >= CHUNKS_MAX {
                     return Err(TooMany);
@@ -1315,6 +1334,83 @@ fn fsck(s: &State) -> Option<String> {
         return Some(format!("the free list has {} chunks, {} are free", walked, free));
     }
     None
+}
+
+/// What a host's mds tells its cs of a copy-up's copy (N10b), held to the
+/// model: vouched for only where a copy-up is pending at that place of that
+/// volume, from that chunk to that one at their incarnations, asked by the
+/// volume's writer of now, the host's cs an active member of their set at
+/// its version now, the mds as far as the entry asked -- in that order of
+/// refusals. Asked of a copy-up pending, one of its pieces now and then
+/// made another.
+fn verify_copy(a: &mut Rng, s: &State, m: &Model, applied: u64) -> Option<Result<Told, String>> {
+    use nbswire::Refusal as Why;
+    let pending: Vec<((u32, u32), (u64, u64))> = m.pending.iter().map(|(&k, &v)| (k, v)).collect();
+    let ((vol, place), (to_key, from_key)) = a.pick(&pending)?;
+    let (to_n, to_inc) = m.mchunks.get(&to_key)?.real?;
+    let (from_n, from_inc) = m.mchunks.get(&from_key)?.real?;
+    let st = m.sets.get(m.mchunks.get(&from_key)?.set)?;
+    let epoch = Epoch { set: m.mchunks.get(&from_key)?.set as u32, version: st.version };
+    let writer_of = |id: u32| m.vols.values().find(|v| v.id == id).and_then(|v| v.writer.as_ref()).map(|w| w.1);
+    /* Mostly an active member's host: past its refusal, the others */
+    let active: Vec<u32> = (0..REPLICAS).filter(|&k| !st.down[k]).map(|k| st.cs[k]).collect();
+    let cs = match a.pick(&active) {
+        Some(c) if a.chance(80) => c,
+        _ => st.cs[a.below(REPLICAS as u64) as usize],
+    };
+    let mut host = m.cs.get(cs as usize)?.host.clone();
+    let (mut volume, mut position, mut generation, mut index) = (vol, place, writer_of(vol).unwrap_or(0), applied);
+    let mut from = ChunkRef { chunk: from_n, incarnation: from_inc, epoch };
+    let mut to = ChunkRef { chunk: to_n, incarnation: to_inc, epoch };
+    match a.below(24) {
+        0 => index = applied + 1 + a.below(3),
+        1 => volume = volume.wrapping_add(1),
+        2 => position = position.wrapping_add(1),
+        3 => to.chunk = from_n,
+        4 => from.chunk = to_n,
+        5 => to.incarnation = to_inc.wrapping_add(1),
+        6 => from.incarnation = from_inc.wrapping_sub(1),
+        7 => from.epoch.version = epoch.version.wrapping_sub(1),
+        8 => to.epoch.version = epoch.version.wrapping_add(1),
+        9 => generation = generation.wrapping_add(1),
+        10 => generation = 0,
+        11 | 12 => host = String::from(a.pick(&HOSTS)?),
+        _ => {}
+    }
+    /* The model's answer, in the order of refusals the plan gives */
+    let want = (|| {
+        if applied < index {
+            return Told::Refused(Why::Behind { applied });
+        }
+        if !m.vols.values().any(|v| v.id == volume) {
+            return Told::Refused(Why::NotTheMap);
+        }
+        let Some(&(t, f)) = m.pending.get(&(volume, position)) else { return Told::Refused(Why::NotTheMap) };
+        let (Some((tn, ti)), Some((fnum, fi)), Some(fc)) = (m.mchunks.get(&t).and_then(|c| c.real),
+                                                             m.mchunks.get(&f).and_then(|c| c.real), m.mchunks.get(&f))
+        else {
+            return Told::Refused(Why::NotTheMap);
+        };
+        if (tn, fnum) != (to.chunk, from.chunk) || (ti, fi) != (to.incarnation, from.incarnation) {
+            return Told::Refused(Why::NotTheMap);
+        }
+        let set = &m.sets[fc.set];
+        let me = m.cs.iter().position(|c| c.host == host);
+        if !me.is_some_and(|me| (0..REPLICAS).any(|k| set.cs[k] as usize == me && !set.down[k])) {
+            return Told::Refused(Why::NotHere);
+        }
+        let known = Epoch { set: fc.set as u32, version: set.version };
+        if from.epoch != known || to.epoch != known {
+            return Told::Refused(Why::Epoch { known });
+        }
+        if generation == 0 || writer_of(volume) != Some(generation) {
+            return Told::Refused(Why::NotAttached);
+        }
+        Told::Verified
+    })();
+    let q = Question::VerifyCopy { volume, generation, position, from, to, index };
+    let got = nbswire::mds::told(s, &host, applied, &q);
+    Some(if got == want { Ok(got) } else { Err(format!("{:?} of host {}'s cs told {:?}, the model {:?}", q, host, got, want)) })
 }
 
 /// A volume with copy-ups pending, by name (N10).
@@ -1947,6 +2043,20 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         };
         if let Some(d) = differ {
             return Err(format!("step {} after {:?}: {}", step, decoded, d));
+        }
+        /* What a host's mds tells its cs of a copy-up's copy (N10b), of a
+           randomness of its own */
+        let mut aim = Rng::new(mix(mix(seed, 0x7665_7269), step));
+        if aim.chance(40) {
+            match verify_copy(&mut aim, &s, &m, index) {
+                Some(Err(d)) => return Err(format!("step {} after {:?}: {}", step, decoded, d)),
+                Some(Ok(told)) => {
+                    let what = format!("{:?}", told);
+                    *answers.entry(format!("VerifyCopy {}", what.split([' ', '(', '{']).nth(1).unwrap_or(&what)))
+                        .or_default() += 1;
+                }
+                None => {}
+            }
         }
         /* The same entries on a replica: the same state, the same digests */
         replica.apply(index, &bytes);

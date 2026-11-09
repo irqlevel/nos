@@ -97,6 +97,38 @@ pub fn told(s: &State, host: &str, applied: u64, q: &Question) -> Told {
                                 sources, index: applied })
             }).take(LIST_MAX).collect())
         }
+        /* A copy-up's copy on this host's cs (N10): pending at that place of
+           that volume, from that chunk to that one, asked by the volume's
+           writer of now, this host's cs an active member of their set at its
+           version now */
+        Question::VerifyCopy { volume, generation, position, from, to, index } => {
+            if applied < *index {
+                return Told::Refused(Refusal::Behind { applied });
+            }
+            let Some(v) = s.volumes().iter().find(|v| v.id == *volume) else {
+                return Told::Refused(Refusal::NotTheMap);
+            };
+            if s.copying().get(&(*volume, *position)) != Some(&(to.chunk, from.chunk)) {
+                return Told::Refused(Refusal::NotTheMap);
+            }
+            let live = |c: &ChunkRef| s.chunks().get(c.chunk as usize)
+                .filter(|ch| !ch.is_free() && ch.incarnation == c.incarnation).copied();
+            let (Some(ch), Some(_)) = (live(from), live(to)) else { return Told::Refused(Refusal::NotTheMap) };
+            let (Some(set), Some(me)) = (s.sets().get(ch.set as usize), mine) else {
+                return Told::Refused(Refusal::NotHere);
+            };
+            if !set.cs.iter().zip(set.replicas.iter()).any(|(&c, &r)| c == me.id && r == Replica::Active) {
+                return Told::Refused(Refusal::NotHere);
+            }
+            let known = Epoch { set: ch.set, version: set.version };
+            if from.epoch != known || to.epoch != known {
+                return Told::Refused(Refusal::Epoch { known });
+            }
+            if *generation == 0 || v.writer.as_ref().is_none_or(|w| w.generation != *generation) {
+                return Told::Refused(Refusal::NotAttached);
+            }
+            Told::Verified
+        }
         /* Proposals: nbs-mds's, through raft, not answered from the state */
         Question::JoinDone { .. } | Question::GiveUp { .. } => Told::Refused(Refusal::NoMds),
         Question::Live { chunks } => Told::Gone(chunks.iter()

@@ -272,8 +272,9 @@ pub struct Record {
     pub known: Epoch,
     /// The epoch it was last written at.
     pub written: Epoch,
-    /// The volume whose write took the slot, and the newest generation
-    /// written to it.
+    /// The volume whose map names the chunk, as its last write said -- or
+    /// the copy-up or the copy that took the slot (N10) -- and the newest
+    /// generation written to it.
     pub volume: u32,
     pub generation: u64,
     pub seq: u64,

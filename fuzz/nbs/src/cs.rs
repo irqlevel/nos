@@ -1,15 +1,18 @@
 //! The `cs` target: NBS's chunk server engine (src/crates/common/storage/
 //! nbscs) over disks with a write cache, through random histories of
-//! fences, writes, reads, flushes, closes and frees -- and power cuts, each
-//! write not yet flushed kept, lost or torn at a sector's edge, on its own.
-//! The fuzzer is the cs's clients and its host's mds: it decides every
-//! chunk's incarnation and epoch, and every volume's generation.
+//! fences, writes, reads, flushes, closes, frees and copy-ups (N10) -- and
+//! power cuts, each write not yet flushed kept, lost or torn at a sector's
+//! edge, on its own. The fuzzer is the cs's clients and its host's mds: it
+//! decides every chunk's incarnation and epoch, and every volume's
+//! generation. A copy-up goes through nbswire's `serve`, as nbs-cs serves
+//! it, the fuzzer the mds it asks.
 //!
 //! Held to, after every cut and the cs opened again:
 //! - every fence answered there, at least as new;
 //! - every chunk written since its last close open, at a generation at
-//!   least the newest answered;
-//! - a chunk closed reading exactly what it held when it was closed;
+//!   least the newest answered, as the volume's whose writer wrote it;
+//! - a chunk closed reading exactly what it held when it was closed, and a
+//!   copy-up's what it was copied from -- one cut in reading that or none;
 //! - every sector reading its value at the last flush answered, or one
 //!   written since;
 //! - a chunk never written, freed, or taken again by a new incarnation,
@@ -17,7 +20,11 @@
 //! - no record lost: one copy of a page is ever in flight.
 //!
 //! And between cuts: every read exactly the last write, every refusal the
-//! one the request deserves. Before each run: a disk with anything at all
+//! one the request deserves; another volume's chunk read or written only
+//! once the mds vouches for it, and written, that volume's from then on; a
+//! copy-up done a copy of its chunk, closed, at its epoch, asked of the mds
+//! where the cs does not hold its chunk and nowhere else, and asked again,
+//! nothing. Before each run: a disk with anything at all
 //! past a superblock's bytes in its first two pages -- a boot sector, a
 //! filesystem, a partition table -- is never taken for blank, nor written;
 //! a cs's of another identity is told apart.
@@ -26,7 +33,9 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use nbscs::{ChunkRef, Device, Epoch, Error, Identity, IoError, OpenError, SlotState, Store, PAGE, SLOT};
+use nbscs::{ChunkRef, Device, Epoch, Error, Identity, IoError, OpenError, SlotState, Store, COPY_PIECE, PAGE, SLOT};
+use nbswire::serve::{serve, Done, Vouched};
+use nbswire::{Op as WireOp, Question, Refusal, Request, Told};
 
 use crate::rng::{mix, Rng};
 
@@ -325,6 +334,14 @@ struct MChunk {
     at_close: Option<BTreeMap<u32, u8>>,
     /// Whether the cs was told the number's chunk before was freed.
     told_free: bool,
+    /// The volume of a write by another volume cut by the power before it
+    /// was answered (N10): the record may be that volume's, or as it was.
+    maybe_volume: Option<u32>,
+}
+
+/// Whether epoch `e` is one before `known`, as the cs holds it: refused.
+fn older(e: Epoch, known: Epoch) -> bool {
+    e.set != known.set || e.version < known.version
 }
 
 const VOLUMES: u32 = 4;
@@ -348,6 +365,10 @@ struct Run {
     /// The chunk last written: half the writes and closes go to it, so that
     /// a close finds its chunk's data still in the cache.
     last: Option<u32>,
+    seed: u64,
+    /// The last copy-up done (N10): its volume and two chunks, to ask again.
+    copied: Option<(u32, ChunkRef, ChunkRef)>,
+    vouched: Vouched,
 }
 
 fn sectors_per_chunk(sector: u64) -> u32 {
@@ -443,10 +464,11 @@ impl Run {
             let m = &self.chunks[c as usize];
             if let Some(g) = m.open {
                 match held {
-                    Some(h) if h.incarnation == m.incarnation && h.state == SlotState::Open && h.generation >= g => {}
+                    Some(h) if h.incarnation == m.incarnation && h.state == SlotState::Open && h.generation >= g
+                        && h.volume == m.volume => {}
                     other => {
-                        return Err(format!("chunk {} written at generation {} since its close, after the cut: {:?}",
-                                           c, g, other));
+                        return Err(format!("chunk {} written at generation {} of volume {} since its close, after the \
+                                            cut: {:?}", c, g, m.volume, other));
                     }
                 }
             }
@@ -456,6 +478,22 @@ impl Run {
                         return Err(format!("chunk {} closed, after the cut {:?}", c, h.state));
                     }
                 }
+            }
+        }
+        /* A write by another volume cut in it (N10): the record that
+           volume's, or as it was -- the run goes on from which */
+        for c in 0..CHUNKS {
+            let held = self.store.holding(c);
+            let m = &mut self.chunks[c as usize];
+            let Some(v) = m.maybe_volume.take() else { continue };
+            match held.filter(|h| h.incarnation == m.incarnation) {
+                Some(h) if h.volume == v => m.volume = v,
+                Some(h) if h.volume != m.volume => {
+                    return Err(format!("chunk {} of volume {}, written by volume {} and cut: volume {}'s after the \
+                                        cut", c, m.volume, v, h.volume));
+                }
+                /* As it was: not open */
+                _ => m.maybe_open = None,
             }
         }
         /* A chunk whose record says closed: exactly what it held at that close */
@@ -567,6 +605,13 @@ impl Run {
     }
 
     fn op(&mut self, step: u64) -> Result<(), String> {
+        /* A copy-up now and then, and a write now and then by another
+           volume (N10): of a randomness of their own, so that every other
+           draw goes as it did */
+        let mut aim = Rng::new(mix(mix(self.seed, 0x636f_7079_7570), step));
+        if aim.chance(8) {
+            return self.copy_up(&mut aim, step);
+        }
         let c = match self.last {
             Some(l) if self.r.chance(50) => l,
             _ => self.r.below(u64::from(CHUNKS)) as u32,
@@ -604,7 +649,15 @@ impl Run {
             /* A write: of the chunk's volume, at its fence */
             10..=49 => {
                 let m = &self.chunks[c as usize];
-                let v = m.volume;
+                /* Now and then by another volume's writer (N10): a clone's,
+                   whose map alone names the chunk now -- not where it is open
+                   for its own */
+                let v = if m.open.is_none() && m.maybe_open.is_none() && aim.chance(10) {
+                    1 + m.volume % VOLUMES
+                } else {
+                    m.volume
+                };
+                let other = v != m.volume;
                 let fence = self.fenced[v as usize];
                 /* Now and then an attach older than the fence, or newer than
                    the cs was told of */
@@ -625,12 +678,18 @@ impl Run {
                 }
                 let cref = self.cref(c);
                 let verified = self.r.chance(60);
+                let before = self.store.holding(c).filter(|h| h.incarnation == cref.incarnation);
                 let mut got = self.store.write(v, g, cref, start * self.sector as u32, &data, verified);
                 let held = self.store.holding(c);
+                if !verified && got.is_ok() && before.is_some_and(|h| h.volume != v) {
+                    return Err(format!("step {}: chunk {} of volume {:?} written by volume {}, unvouched", step, c,
+                                       before.map(|h| h.volume), v));
+                }
                 if !verified && matches!(got, Err(Error::Unverified) | Err(Error::Epoch { .. })) {
                     /* As the module does: asked of the mds, which vouches */
                     match got {
-                        Err(Error::Unverified) if held.is_some_and(|h| h.incarnation >= cref.incarnation) => {
+                        Err(Error::Unverified)
+                            if held.is_some_and(|h| h.incarnation >= cref.incarnation && h.volume == v) => {
                             return Err(format!("step {}: chunk {} held at {:?}, and its write unverified", step, c,
                                                held));
                         }
@@ -647,6 +706,9 @@ impl Run {
                     }
                     m.closed = false;
                     m.maybe_open = Some(g);
+                    if other {
+                        m.maybe_volume = Some(v);
+                    }
                     return Ok(());
                 }
                 let want_err = if g == 0 {
@@ -671,12 +733,16 @@ impl Run {
                 if !verified {
                     self.count("writes unverified at first");
                 }
+                if other && got.is_ok() {
+                    self.count("writes by another volume");
+                }
                 match (got, want_err) {
                     (Ok(()), None) => {
                         let m = &mut self.chunks[c as usize];
                         for (i, &b) in vals.iter().enumerate() {
                             m.sectors.entry(start + i as u32).or_default().since.push(b);
                         }
+                        m.volume = v;
                         m.open = Some(m.open.map_or(g, |o| o.max(g)));
                         m.closed = false;
                         m.at_close = None;
@@ -703,14 +769,23 @@ impl Run {
                 let want = m.sectors.get(&k).map_or(0, |s| s.now());
                 let mut buf = vec![0u8; self.sector as usize];
                 let cref = self.cref(c);
-                /* Now and then by another volume's read-only attach: refused
-                   where the cs holds the chunk -- nothing of one volume's
-                   is read through another's -- zeros where it does not */
+                /* Now and then by another volume's read-only attach: where the
+                   cs holds the chunk, asked of the mds first -- nothing of one
+                   volume's is read through another's unless it vouches that
+                   the other's map names it, a snapshot's or a clone's (N10)
+                   -- and then what the chunk holds; zeros where it does not */
                 if self.r.chance(10) {
                     let other = 1 + v % VOLUMES;
                     let held = self.store.holding(c).is_some_and(|h| h.incarnation == cref.incarnation);
-                    match self.store.read(other, 0, cref, k * self.sector as u32, &mut buf, true) {
-                        Err(Error::NotTheVolumes) if held => {}
+                    let at = k * self.sector as u32;
+                    match self.store.read(other, 0, cref, at, &mut buf, false) {
+                        Err(Error::Unverified) if held => match self.store.read(other, 0, cref, at, &mut buf, true) {
+                            Ok(()) if buf.iter().all(|&x| x == want) => {}
+                            got => {
+                                return Err(format!("step {}: chunk {} of volume {} read by volume {}, vouched for: \
+                                                    {:?}, {} expected", step, c, v, other, got.map(|_| buf[0]), want));
+                            }
+                        },
                         Ok(()) if !held && buf.iter().all(|&x| x == 0) => {}
                         got => {
                             return Err(format!("step {}: chunk {} of volume {} read by volume {} (held {}): {:?}",
@@ -810,6 +885,7 @@ impl Run {
                 m.sectors.clear();
                 m.open = None;
                 m.maybe_open = None;
+                m.maybe_volume = None;
                 m.closed = false;
                 m.at_close = None;
                 m.told_free = tell;
@@ -845,6 +921,229 @@ impl Run {
             eprintln!("step {}: ok", step);
         }
         Ok(())
+    }
+}
+
+impl Run {
+    /// Every sector the run wrote of chunk `c` read back as the model has it.
+    fn sectors_hold(&mut self, c: u32, step: u64, what: &str) -> Result<(), String> {
+        let cref = self.cref(c);
+        let volume = self.chunks[c as usize].volume;
+        let want: Vec<(u32, u8)> = self.chunks[c as usize].sectors.iter().map(|(&k, s)| (k, s.now())).collect();
+        for (k, w) in want {
+            let got = self.read_sector(volume, cref, k)?;
+            if got != w {
+                return Err(format!("step {}: {}: chunk {} sector {} reads {}, {} expected", step, what, c, k, got, w));
+            }
+        }
+        Ok(())
+    }
+
+    /// A copy-up (N10): chunk `from` copied into a new chunk `to` of its set
+    /// -- `to`'s number taken again, at `from`'s epoch -- by a volume's writer
+    /// at its fence, served as nbs-cs serves it: the mds asked where the cs
+    /// does not hold `to`, which vouches for it, or now and then not. Now and
+    /// then an older attach or a newer one, the two chunks of two epochs or
+    /// one, an epoch older than the one the cs knows `from` at, or the last
+    /// copy-up asked again; and a cut in it, at any of its writes.
+    fn copy_up(&mut self, a: &mut Rng, step: u64) -> Result<(), String> {
+        let chunks = &self.chunks;
+        let again = self.copied.filter(|&(_, from, to)| {
+            let (f, t) = (&chunks[from.chunk as usize], &chunks[to.chunk as usize]);
+            f.incarnation == from.incarnation && t.incarnation == to.incarnation && t.epoch == to.epoch
+        }).filter(|_| a.chance(30));
+        let (v, mut from, mut to) = match again {
+            Some(x) => x,
+            None => {
+                /* Mostly of a chunk the cs holds, by a volume fenced */
+                let held: Vec<u32> = (0..CHUNKS).filter(|&c| self.store.holding(c)
+                    .is_some_and(|h| h.incarnation == self.chunks[c as usize].incarnation)).collect();
+                let fenced: Vec<u32> = (1..=VOLUMES).filter(|&v| self.fenced[v as usize] != 0).collect();
+                let f = match a.pick(&held) {
+                    Some(c) if a.chance(75) => c,
+                    _ => a.below(u64::from(CHUNKS)) as u32,
+                };
+                let t = (f + 1 + a.below(u64::from(CHUNKS) - 1) as u32) % CHUNKS;
+                let v = match a.pick(&fenced) {
+                    Some(v) if a.chance(80) => v,
+                    _ => 1 + a.below(u64::from(VOLUMES)) as u32,
+                };
+                let epoch = self.chunks[f as usize].epoch;
+                let m = &mut self.chunks[t as usize];
+                m.incarnation += 1;
+                m.volume = v;
+                m.epoch = epoch;
+                m.sectors.clear();
+                m.open = None;
+                m.maybe_open = None;
+                m.maybe_volume = None;
+                m.closed = false;
+                m.at_close = None;
+                m.told_free = false;
+                (v, self.cref(f), self.cref(t))
+            }
+        };
+        if again.is_none() {
+            let known = self.store.holding(from.chunk).filter(|h| h.incarnation == from.incarnation).map(|h| h.known);
+            match a.below(24) {
+                0 => to.epoch.version += 1,
+                1 => to.chunk = from.chunk,
+                /* An epoch the cs knows `from` past: one before its version,
+                   or of another set */
+                2..=4 => {
+                    if let Some(k) = known {
+                        from.epoch = if k.version > 1 {
+                            Epoch { set: k.set, version: k.version - 1 }
+                        } else {
+                            Epoch { set: k.set + 1, version: k.version }
+                        };
+                        to.epoch = from.epoch;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let fence = self.fenced[v as usize];
+        let g = match a.below(100) {
+            0..=5 => fence.saturating_sub(1),
+            6..=8 => fence + 1,
+            _ => fence,
+        };
+        /* The mds vouches for it, or now and then not */
+        let vouch = a.chance(85);
+        /* Now and then a cut in it: at any of its writes and flushes, or
+           aimed past its data, where its record's first flush is -- four
+           later where the slot `to`'s number held before is given back on
+           the same device first */
+        if a.chance(40) {
+            let n = if a.chance(50) { SLOT / COPY_PIECE + 1 + a.below(6) } else { 1 + a.below(40) };
+            for d in &self.disks {
+                d.borrow_mut().fuse = Some(n);
+            }
+        }
+        let to_held = self.store.holding(to.chunk).filter(|h| h.incarnation == to.incarnation);
+        let from_held = self.store.holding(from.chunk).filter(|h| h.incarnation == from.incarnation);
+        let found_open = self.store.found_open(from.chunk, from.incarnation).is_some();
+        let fenced = if g == 0 {
+            Some(Error::Bad)
+        } else if g < fence {
+            Some(Error::Fenced { generation: fence })
+        } else if g > fence || fence == 0 {
+            Some(Error::NotFenced { generation: fence })
+        } else {
+            None
+        };
+        let two = from.epoch == to.epoch && from.chunk != to.chunk;
+        /* The mds asked where the request is the volume's writer's of now, of
+           two chunks of one epoch, `to` not held: nowhere else */
+        let asks = fenced.is_none() && two && to_held.is_none();
+        let want: Result<(), Refusal> = if let Some(e) = fenced {
+            Err(Refusal::of(e))
+        } else if !two {
+            Err(Refusal::Bad)
+        } else if to_held.is_some() {
+            Ok(())
+        } else if !vouch {
+            Err(Refusal::NotTheMap)
+        } else if found_open {
+            Err(Refusal::Failed)
+        } else if let Some(h) = from_held.filter(|h| older(from.epoch, h.known)) {
+            Err(Refusal::Epoch { known: h.known })
+        } else {
+            Ok(())
+        };
+        if self.trace {
+            eprintln!("step {}: copy-up of {:?} into {:?} by volume {} at {} (fence {}), again {}, vouch {}, want {:?}",
+                      step, from, to, v, g, fence, again.is_some(), vouch, want);
+        }
+        let (position, index) = (a.below(1 << 20) as u32, step);
+        let req = Request { id: step, volume: v, generation: g, op: WireOp::CopyUp { from, to, position, index } };
+        let mut asked: Option<Question> = None;
+        let got = serve(&mut self.store, &mut self.vouched, &req, &mut |q| {
+            asked = Some(q);
+            Some(if vouch { Told::Verified } else { Told::Refused(Refusal::NotTheMap) })
+        });
+        let question = Question::VerifyCopy { volume: v, generation: g, position, from, to, index };
+        match &asked {
+            None if asks => return Err(format!("step {}: a copy-up of chunk {} into {}, not held, not asked of the mds",
+                                               step, from.chunk, to.chunk)),
+            Some(q) if !asks || *q != question => {
+                return Err(format!("step {}: a copy-up of chunk {} into {} asked the mds {:?}", step, from.chunk,
+                                   to.chunk, q));
+            }
+            _ => {}
+        }
+        if got == Err(Refusal::Io) && self.dead() {
+            /* Cut in it: `to` holds `from`'s copy, closed, or nothing */
+            self.count("copy-ups cut");
+            let vals: BTreeMap<u32, u8> = self.chunks[from.chunk as usize].sectors.iter()
+                .map(|(&k, s)| (k, s.now())).collect();
+            let m = &mut self.chunks[to.chunk as usize];
+            m.sectors = vals.iter().map(|(&k, &b)| (k, MSector { durable: 0, since: vec![b] })).collect();
+            m.at_close = Some(vals);
+            m.closed = false;
+            return Ok(());
+        }
+        match (got, want) {
+            (Ok(Done::Done), Ok(())) => {}
+            (Err(Refusal::NoRoom), Ok(())) if to_held.is_none() && from_held.is_some() => {
+                self.count("copy-ups with no room");
+                return Ok(());
+            }
+            (Err(got), Err(want)) if got == want => {
+                self.count(match got {
+                    Refusal::Bad => "copy-ups refused bad",
+                    Refusal::Fenced { .. } | Refusal::NotFenced { .. } => "copy-ups refused fenced",
+                    Refusal::NotTheMap => "copy-ups refused by the mds",
+                    Refusal::Failed => "copy-ups refused found open",
+                    Refusal::Epoch { .. } => "copy-ups refused an older epoch",
+                    _ => "copy-ups refused otherwise",
+                });
+                return Ok(());
+            }
+            (got, want) => {
+                return Err(format!("step {}: copy-up of chunk {} into {} by volume {} at {} (fenced {}): {:?}, {:?} \
+                                    expected", step, from.chunk, to.chunk, v, g, fence, got, want));
+            }
+        }
+        if let Some(h) = to_held {
+            /* Asked again: nothing changed -- what a client wrote to it since
+               kept */
+            self.count("copy-ups asked again");
+            let now = self.store.holding(to.chunk);
+            if now != Some(h) {
+                return Err(format!("step {}: a copy-up of chunk {} into {} asked again: {:?}, {:?} before", step,
+                                   from.chunk, to.chunk, now, h));
+            }
+            return self.sectors_hold(to.chunk, step, "a copy-up asked again");
+        }
+        self.copied = Some((v, from, to));
+        if from_held.is_none() {
+            /* `from` never written here: nothing to copy, no slot taken */
+            self.count("copy-ups of a chunk never written");
+            if self.store.holding(to.chunk).is_some_and(|h| h.incarnation == to.incarnation) {
+                return Err(format!("step {}: chunk {} copied up from {}, which the cs does not hold: it holds it",
+                                   step, to.chunk, from.chunk));
+            }
+            return Ok(());
+        }
+        self.count("copy-ups");
+        let vals: BTreeMap<u32, u8> = self.chunks[from.chunk as usize].sectors.iter()
+            .map(|(&k, s)| (k, s.now())).collect();
+        let m = &mut self.chunks[to.chunk as usize];
+        m.sectors = vals.iter().map(|(&k, &b)| (k, MSector { durable: b, since: Vec::new() })).collect();
+        m.at_close = Some(vals);
+        m.closed = true;
+        match self.store.holding(to.chunk) {
+            Some(h) if h.incarnation == to.incarnation && h.state == SlotState::Written && h.volume == v
+                && h.known == to.epoch && h.written == to.epoch => {}
+            other => {
+                return Err(format!("step {}: chunk {} copied up from {} by volume {} at {:?}: {:?}", step, to.chunk,
+                                   from.chunk, v, to.epoch, other));
+            }
+        }
+        self.last = Some(to.chunk);
+        self.sectors_hold(to.chunk, step, "a copy-up")
     }
 }
 
@@ -924,10 +1223,11 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         closed: false,
         at_close: None,
         told_free: false,
+        maybe_volume: None,
     }).collect();
     let mut run = Run { r, disks: handles, identities, store, generation: [0; VOLUMES as usize + 1],
                         fenced: [0; VOLUMES as usize + 1], chunks, sector, trace, stats: BTreeMap::new(),
-                        last: None };
+                        last: None, seed, copied: None, vouched: Vouched::new() };
     for step in 1..=steps {
         run.step(step)?;
     }
