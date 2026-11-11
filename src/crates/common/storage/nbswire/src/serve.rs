@@ -136,13 +136,16 @@ impl Done {
 /// chunk it found open -- the mds asked first where the store has not been
 /// told yet, as a member back's first write comes (found by fuzz/nbs's join
 /// target: refused, the writer asked it out, and its join was dropped every
-/// time it was made).
+/// time it was made). That same writer is the volume's as well as the
+/// generation's (`found_open_by`): generations are counted by volume, and a
+/// clone's writer at the generation another volume's left the chunk open at
+/// is not refused for it (N10d).
 pub fn serve<D: Device>(store: &mut Store<D>, vouched: &mut Vouched, req: &Request<'_>,
                         ask: &mut dyn FnMut(Question) -> Option<Told>) -> Result<Done, Refusal> {
     let (v, g) = (req.volume, req.generation);
     if let Op::Write { chunk, position, index, .. } | Op::Read { chunk, position, index, .. }
          | Op::Close { chunk, position, index } = req.op {
-        if g != 0 && store.found_open(chunk.chunk, chunk.incarnation) == Some(g)
+        if g != 0 && store.found_open_by(v, chunk.chunk, chunk.incarnation) == Some(g)
             && store.joins(chunk.epoch.set).is_none()
         {
             let writing = !matches!(req.op, Op::Read { .. });
