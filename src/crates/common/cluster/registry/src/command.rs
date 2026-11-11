@@ -17,8 +17,11 @@ use crate::{Fingerprint, Role};
 /// one longer than a name is answered `BadName` as any other that is none.
 const STR_MAX: usize = u8::MAX as usize;
 
-/// What the bytes of an entry begin with: this format's.
-const VERSION: u8 = 1;
+/// What the bytes of an entry begin with: this format's -- 2 since an
+/// address has its port (#99).
+const VERSION: u8 = 2;
+/// The format before: its addresses read with ports 0.
+const VERSION_NO_PORTS: u8 = 1;
 
 const TAG_INIT: u8 = 1;
 const TAG_INVITE: u8 = 2;
@@ -35,13 +38,14 @@ const TAG_DROP_KEY: u8 = 9;
 pub enum Command {
     /// The cluster made, with its first host -- the one entry an empty
     /// registry takes.
-    Init { now: u64, cluster: [u8; 16], name: String, host: String, key: Fingerprint, ip: u32 },
-    /// A host invited: `host` may join from `ip`, with the key `key` --
+    Init { now: u64, cluster: [u8; 16], name: String, host: String, key: Fingerprint, ip: u32, port: u16 },
+    /// A host invited: `host` may join from `ip` -- called at `port`, 0 for
+    /// ipcnet's own -- with the key `key` --
     /// pinned by every member's ipcnet from now on, as its own pins the
     /// inviting member's from the token -- until `expires`, proving the
     /// secret whose hash is `secret_hash`. `id` is the proposer's, a random
     /// number the token carries.
-    Invite { now: u64, id: u64, host: String, ip: u32, key: Fingerprint, secret_hash: [u8; 32], expires: u64 },
+    Invite { now: u64, id: u64, host: String, ip: u32, port: u16, key: Fingerprint, secret_hash: [u8; 32], expires: u64 },
     /// The host invitation `invitation` named, joined: it proved the secret
     /// over a connection pinned by the invitation's key.
     Join { now: u64, invitation: u64 },
@@ -52,10 +56,10 @@ pub enum Command {
     /// A host being worked on, or back: what every service of the cluster
     /// reads alike -- held off counting it out, nothing new placed on it.
     Maintenance { now: u64, host: String, on: bool },
-    /// A host's address for `role` made `ip` -- a host that moved, or one
-    /// with an address for another role -- or, for a role but `Ipc`, taken
-    /// away with `ip` 0.
-    Address { now: u64, host: String, role: Role, ip: u32 },
+    /// A host's address for `role` made `ip` and `port` -- a host that
+    /// moved, or one with an address for another role -- or, for a role
+    /// but `Ipc`, taken away with `ip` 0.
+    Address { now: u64, host: String, role: Role, ip: u32, port: u16 },
     /// A key added to a host's: the one it moves to, pinned beside the one
     /// it has until that one is dropped. Two at most.
     AddKey { now: u64, host: String, key: Fingerprint },
@@ -84,7 +88,7 @@ impl Command {
         let mut w = Writer::new();
         w.u8(VERSION);
         match self {
-            Command::Init { now, cluster, name, host, key, ip } => {
+            Command::Init { now, cluster, name, host, key, ip, port } => {
                 w.u8(TAG_INIT);
                 w.u64(*now);
                 w.fixed(cluster);
@@ -92,13 +96,15 @@ impl Command {
                 w.str(host);
                 w.fixed(key);
                 w.u32(*ip);
+                w.u16(*port);
             }
-            Command::Invite { now, id, host, ip, key, secret_hash, expires } => {
+            Command::Invite { now, id, host, ip, port, key, secret_hash, expires } => {
                 w.u8(TAG_INVITE);
                 w.u64(*now);
                 w.u64(*id);
                 w.str(host);
                 w.u32(*ip);
+                w.u16(*port);
                 w.fixed(key);
                 w.fixed(secret_hash);
                 w.u64(*expires);
@@ -124,12 +130,13 @@ impl Command {
                 w.str(host);
                 w.u8(u8::from(*on));
             }
-            Command::Address { now, host, role, ip } => {
+            Command::Address { now, host, role, ip, port } => {
                 w.u8(TAG_ADDRESS);
                 w.u64(*now);
                 w.str(host);
                 w.u8(role.code());
                 w.u32(*ip);
+                w.u16(*port);
             }
             Command::AddKey { now, host, key } => {
                 w.u8(TAG_ADD_KEY);
@@ -150,9 +157,11 @@ impl Command {
     /// The command `bytes` are, or None: bytes no proposer wrote.
     pub fn decode(bytes: &[u8]) -> Option<Command> {
         let mut r = Reader::new(bytes);
-        if r.u8()? != VERSION {
-            return None;
-        }
+        let ports = match r.u8()? {
+            VERSION => true,
+            VERSION_NO_PORTS => false,
+            _ => return None,
+        };
         let tag = r.u8()?;
         let now = r.u64()?;
         let cmd = match tag {
@@ -163,12 +172,14 @@ impl Command {
                 host: String::from(r.str(STR_MAX)?),
                 key: r.fixed()?,
                 ip: r.u32()?,
+                port: if ports { r.u16()? } else { 0 },
             },
             TAG_INVITE => Command::Invite {
                 now,
                 id: r.u64()?,
                 host: String::from(r.str(STR_MAX)?),
                 ip: r.u32()?,
+                port: if ports { r.u16()? } else { 0 },
                 key: r.fixed()?,
                 secret_hash: r.fixed()?,
                 expires: r.u64()?,
@@ -190,6 +201,7 @@ impl Command {
                 host: String::from(r.str(STR_MAX)?),
                 role: Role::from_code(r.u8()?)?,
                 ip: r.u32()?,
+                port: if ports { r.u16()? } else { 0 },
             },
             TAG_ADD_KEY => Command::AddKey { now, host: String::from(r.str(STR_MAX)?), key: r.fixed()? },
             TAG_DROP_KEY => Command::DropKey { now, host: String::from(r.str(STR_MAX)?), key: r.fixed()? },

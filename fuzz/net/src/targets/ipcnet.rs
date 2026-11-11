@@ -843,7 +843,7 @@ pub fn ipcnet(r: &mut Input) {
                 /* ipcnet's control mailbox, asked as the cluster's registry
                  * asks it (control.rs) */
                 let kind = r.u8() % 9;
-                let a = control::Peer { name: String::from("a"), ip: A_IP, keys: vec![a_key], only: None };
+                let a = control::Peer { name: String::from("a"), ip: A_IP, port: 0, keys: vec![a_key], only: None };
                 /* A list that lets `a` reach more: the flag down before it is
                  * taken */
                 if kind == 1 || kind == 2 || kind == 8 {
@@ -856,15 +856,17 @@ pub fn ipcnet(r: &mut Input) {
                     1 => (control::TAG_PEERS, control::Peers { cluster: CLUSTER, peers: vec![a.clone()] }.encode()),
                     /* One more: a host the world never is */
                     2 => {
+                        /* At this host's port, or at one of its own (#99) */
                         let c = control::Peer { name: String::from("c"), ip: 0x0A00_0296 + u32::from(r.u8() % 8),
+                                                port: [0, 39241, 39242][usize::from(r.u8() % 3)],
                                                 keys: vec![[r.u8() | 1; 32]], only: None };
                         (control::TAG_PEERS, control::Peers { cluster: CLUSTER, peers: vec![a.clone(), c] }.encode())
                     }
                     /* Refused: another cluster's, this host among its own, noise */
                     3 => (control::TAG_PEERS, control::Peers { cluster: OTHER_CLUSTER, peers: vec![a.clone()] }.encode()),
                     4 => {
-                        let me = control::Peer { name: String::from("b"), ip: 0x0A00_0299, keys: vec![[9; 32]],
-                                                 only: None };
+                        let me = control::Peer { name: String::from("b"), ip: 0x0A00_0299, port: 0,
+                                                 keys: vec![[9; 32]], only: None };
                         (control::TAG_PEERS, control::Peers { cluster: CLUSTER, peers: vec![a.clone(), me] }.encode())
                     }
                     /* `a` a host invited: `nbs.sink` by that name, and nothing else */

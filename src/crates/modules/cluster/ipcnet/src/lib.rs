@@ -7,7 +7,9 @@
 //!     insmod /lib/modules/ipcnet.ko [conf=/etc/ipc]
 //!     ipcnet init ex44                       this host's name, a new cluster
 //!     ipcnet id                              the key every peer pins
-//!     ipcnet add ax41 65.109.93.213 9c1e...  a peer, pinned by its key
+//!     ipcnet add ax41 65.109.93.213 9c1e...  a peer, pinned by its key --
+//!                                           65.109.93.213:39242 one listening
+//!                                           on a port of its own (#99)
 //!     ipcnet start
 //!     ipcnet                                 the peers, and what went between them
 //!
@@ -43,7 +45,7 @@ use kcore::cmd::{Command, Output};
 use kcore::error::Error;
 use kcore::task::TaskHandle;
 
-use files::{Dir, Ip, PeerConf};
+use files::{Dir, PeerConf};
 use peer::Locked;
 use server::Server;
 
@@ -54,7 +56,7 @@ const USAGE: &str = "usage: ipcnet                          this host, its peers
                      \x20      ipcnet init <name> [cluster=<32 hex digits>]\n\
                      \x20                                     hosts.toml made: this host, in a new cluster or the one given\n\
                      \x20      ipcnet id                       this host's key, which every peer pins\n\
-                     \x20      ipcnet add <name> <address> <key> [<key>]\n\
+                     \x20      ipcnet add <name> <address>[:<port>] <key> [<key>]\n\
                      \x20      ipcnet remove <name>\n\
                      \x20      ipcnet start                    serve, as hosts.toml says\n\
                      \x20      ipcnet stop                     every peer lost, every connection closed";
@@ -233,12 +235,13 @@ fn add(state: &State, name: &str, ip: &str, keys: &[&str], out: &mut Output) -> 
     if !files::valid_host(name) {
         return Err(alloc::format!("\"{}\" is not a host's name: lowercase letters, digits and -", name));
     }
-    let ip = files::parse_ip(ip).ok_or_else(|| alloc::format!("\"{}\" is not an IPv4 address", ip))?;
+    let (ip, port) = files::parse_addr(ip)
+        .ok_or_else(|| alloc::format!("\"{}\" is not an IPv4 address, with a port or not", ip))?;
     let mut fingerprints = Vec::new();
     for k in keys {
         fingerprints.push(files::parse_key(k).ok_or_else(|| alloc::format!("\"{}\" is not a key: 64 hex digits", k))?);
     }
-    let peer = PeerConf { name: String::from(name), ip, keys: fingerprints, only: None };
+    let peer = PeerConf { name: String::from(name), ip, port, keys: fingerprints, only: None };
     edit_peers(state, |cfg, peers| {
         if cfg.name == name {
             return Err(alloc::format!("{} is this host", name));
@@ -250,15 +253,15 @@ fn add(state: &State, name: &str, ip: &str, keys: &[&str], out: &mut Output) -> 
             /* Given again: its address or its keys changed */
             Some(i) => peers[i] = peer.clone(),
             None => {
-                if peers.iter().any(|p| p.ip == ip) {
-                    return Err(alloc::format!("{} is another peer's address", Ip(ip)));
+                if peers.iter().any(|p| p.same_place(&peer)) {
+                    return Err(alloc::format!("{} is another peer's address", files::Addr(ip, port)));
                 }
                 peers.push(peer.clone());
             }
         }
         Ok(())
     })?;
-    let _ = writeln!(out, "ipcnet: {} ({}) pinned", name, Ip(ip));
+    let _ = writeln!(out, "ipcnet: {} ({}) pinned", name, files::Addr(ip, port));
     Ok(())
 }
 
@@ -318,7 +321,8 @@ fn status(state: &State, out: &mut Output) -> Result<(), String> {
             }
         });
         let _ = writeln!(out, "  {:<12} {:<15} {} -- {}; sent {} got {}, bytes {} / {}, bounced {} / {}, refused {}, \
-                               dropped {}, ups {}, losses {}", name, alloc::format!("{}", Ip(p.conf.ip)),
+                               dropped {}, ups {}, losses {}", name,
+                         alloc::format!("{}", files::Addr(p.conf.ip, p.conf.port)),
                          if p.dials { "dials" } else { "takes" }, state, get(&c.sent), get(&c.received),
                          get(&c.bytes_out), get(&c.bytes_in), get(&c.bounced_out), get(&c.bounced_in),
                          get(&c.refused), get(&c.dropped), get(&c.ups), get(&c.losses));

@@ -103,6 +103,35 @@ pub fn parse_ipv4(text: &[u8]) -> Option<u32> {
     Some((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3])
 }
 
+/// An IPv4 address and a port, printed `a.b.c.d`, with `:port` where the
+/// port is said -- not 0.
+pub struct Ipv4Port(pub u32, pub u16);
+
+impl core::fmt::Display for Ipv4Port {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", Ipv4(self.0))?;
+        if self.1 != 0 {
+            write!(f, ":{}", self.1)?;
+        }
+        Ok(())
+    }
+}
+
+/// `a.b.c.d` or `a.b.c.d:port`, as `parse_ipv4` holds a quad: the address,
+/// and the port -- 0 where none is said, 1 to 65535 where one is.
+pub fn parse_ipv4_port(text: &str) -> Option<(u32, u16)> {
+    match text.split_once(':') {
+        None => Some((parse_ipv4(text.as_bytes())?, 0)),
+        Some((ip, port)) => {
+            if port.is_empty() || port.len() > 5 || !port.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let port: u16 = port.parse().ok()?;
+            (port != 0).then_some((parse_ipv4(ip.as_bytes())?, port))
+        }
+    }
+}
+
 /* ---- what an address may be ---- */
 
 /// Whether a packet may go to `addr` at all (RFC 1122 3.2.1.3): not "this

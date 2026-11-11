@@ -45,7 +45,8 @@ pub const KEYS_MAX: usize = 2;
 /// An interface's name, as `net` names them.
 pub const NIC_MAX: usize = 15;
 
-const VERSION: u8 = 1;
+/// 2 since a peer's port is said (#99).
+const VERSION: u8 = 2;
 
 /// This host, as ipcnet has it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,6 +71,11 @@ pub struct Identity {
 pub struct Peer {
     pub name: String,
     pub ip: u32,
+    /// The port its ipcnet listens on, which this host dials -- 0 for
+    /// ipcnet's own, `crate::PORT`, as before a peer's port was said: two
+    /// hosts behind one address, a NAT's, are told apart by their ports
+    /// (#99).
+    pub port: u16,
     pub keys: Vec<[u8; 32]>,
     /// The one name the peer may reach here, by that name alone -- a host
     /// invited, which reaches the cluster's member and nothing else until
@@ -198,6 +204,7 @@ impl Peers {
         for p in &self.peers {
             w.str(&p.name);
             w.0.extend_from_slice(&p.ip.to_le_bytes());
+            w.0.extend_from_slice(&p.port.to_le_bytes());
             w.0.push(p.keys.len().min(usize::from(u8::MAX)) as u8);
             for k in &p.keys {
                 w.0.extend_from_slice(k);
@@ -207,9 +214,9 @@ impl Peers {
         w.0
     }
 
-    /// The peers `bytes` say: each a host's name, an address that is not 0,
-    /// one key or two and at most a mailbox's name it alone may reach, no
-    /// name twice, at most `PEERS_MAX` -- or None.
+    /// The peers `bytes` say: each a host's name, an address that is not 0
+    /// and its port, one key or two and at most a mailbox's name it alone
+    /// may reach, no name twice, at most `PEERS_MAX` -- or None.
     pub fn decode(bytes: &[u8]) -> Option<Peers> {
         let mut r = R { buf: bytes, at: 0 };
         if r.u8()? != VERSION {
@@ -224,6 +231,7 @@ impl Peers {
         for _ in 0..n {
             let name = r.str(crate::HOST_MAX)?;
             let ip = r.u32()?;
+            let port = r.u16()?;
             let k = usize::from(r.u8()?);
             if !crate::valid_host(name) || ip == 0 || k == 0 || k > KEYS_MAX || peers.iter().any(|p| p.name == name) {
                 return None;
@@ -237,7 +245,7 @@ impl Peers {
                 n if crate::valid_name(n) => Some(String::from(n)),
                 _ => return None,
             };
-            peers.push(Peer { name: String::from(name), ip, keys, only });
+            peers.push(Peer { name: String::from(name), ip, port, keys, only });
         }
         r.done().then_some(Peers { cluster, peers })
     }

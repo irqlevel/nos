@@ -35,8 +35,8 @@ struct MHost {
     name: String,
     node: u64,
     keys: Vec<Fingerprint>,
-    /// The ipc address first, the rest by role.
-    addrs: Vec<(Role, u32)>,
+    /// The ipc address first, the rest by role: each with its port.
+    addrs: Vec<(Role, u32, u16)>,
     maintenance: bool,
     joined: u64,
 }
@@ -44,6 +44,10 @@ struct MHost {
 impl MHost {
     fn ip(&self) -> u32 {
         self.addrs[0].1
+    }
+
+    fn port(&self) -> u16 {
+        self.addrs[0].2
     }
 }
 
@@ -59,6 +63,7 @@ struct MInvite {
     id: u64,
     host: String,
     ip: u32,
+    port: u16,
     key: Fingerprint,
     hash: [u8; 32],
     expires: u64,
@@ -103,7 +108,7 @@ impl Model {
         self.invites.retain(|i| i.expires > now);
         let refuse = Answer::Refused;
         match cmd {
-            Command::Init { now, cluster, name, host, key, ip } => {
+            Command::Init { now, cluster, name, host, key, ip, port } => {
                 if self.cluster.is_some() {
                     return refuse(Refusal::Initialized);
                 }
@@ -114,13 +119,13 @@ impl Model {
                     return refuse(Refusal::BadAddress);
                 }
                 self.cluster = Some((*cluster, name.clone(), *now));
-                self.hosts.push(MHost { name: host.clone(), node: 1, keys: vec![*key], addrs: vec![(Role::Ipc, *ip)],
-                                        maintenance: false, joined: *now });
+                self.hosts.push(MHost { name: host.clone(), node: 1, keys: vec![*key],
+                                        addrs: vec![(Role::Ipc, *ip, *port)], maintenance: false, joined: *now });
                 self.next = 2;
                 Answer::Done { node: 1 }
             }
             _ if self.cluster.is_none() => refuse(Refusal::NotInitialized),
-            Command::Invite { now, id, host, ip, key, secret_hash, expires } => {
+            Command::Invite { now, id, host, ip, port, key, secret_hash, expires } => {
                 let key_used = self.hosts.iter().any(|h| h.keys.contains(key)) || self.invites.iter().any(|i| i.key == *key);
                 if !m_name(host) {
                     refuse(Refusal::BadName)
@@ -130,8 +135,8 @@ impl Model {
                     refuse(Refusal::HostExists)
                 } else if self.invites.iter().any(|i| i.id == *id) {
                     refuse(Refusal::InvitationExists)
-                } else if self.hosts.iter().any(|h| h.addrs.iter().any(|a| a.1 == *ip))
-                    || self.invites.iter().any(|i| i.ip == *ip)
+                } else if self.hosts.iter().any(|h| h.addrs.iter().any(|a| a.1 == *ip && a.2 == *port))
+                    || self.invites.iter().any(|i| i.ip == *ip && i.port == *port)
                 {
                     refuse(Refusal::AddressInUse)
                 } else if key_used {
@@ -143,8 +148,8 @@ impl Model {
                 } else if self.hosts.len() + self.invites.len() >= M_HOSTS_MAX {
                     refuse(Refusal::Full)
                 } else {
-                    self.invites.push(MInvite { id: *id, host: host.clone(), ip: *ip, key: *key, hash: *secret_hash,
-                                                expires: *expires });
+                    self.invites.push(MInvite { id: *id, host: host.clone(), ip: *ip, port: *port, key: *key,
+                                                hash: *secret_hash, expires: *expires });
                     Answer::Done { node: 0 }
                 }
             }
@@ -162,7 +167,7 @@ impl Model {
                 let inv = self.invites.remove(at);
                 let node = self.next;
                 self.next += 1;
-                self.hosts.push(MHost { name: inv.host, node, keys: vec![key], addrs: vec![(Role::Ipc, inv.ip)],
+                self.hosts.push(MHost { name: inv.host, node, keys: vec![key], addrs: vec![(Role::Ipc, inv.ip, inv.port)],
                                         maintenance: false, joined: *now });
                 Answer::Done { node }
             }
@@ -194,22 +199,23 @@ impl Model {
                 }
                 None => refuse(Refusal::NoSuchHost),
             },
-            Command::Address { host, role, ip, .. } => {
+            Command::Address { host, role, ip, port, .. } => {
                 let Some(at) = self.hosts.iter().position(|h| &h.name == host) else {
                     return refuse(Refusal::NoSuchHost);
                 };
                 if *ip == 0 && *role == Role::Ipc {
                     return refuse(Refusal::BadAddress);
                 }
-                let taken = self.hosts.iter().enumerate().any(|(i, h)| i != at && h.addrs.iter().any(|a| a.1 == *ip))
-                    || self.invites.iter().any(|i| i.ip == *ip);
+                let taken = self.hosts.iter().enumerate()
+                    .any(|(i, h)| i != at && h.addrs.iter().any(|a| a.1 == *ip && a.2 == *port))
+                    || self.invites.iter().any(|i| i.ip == *ip && i.port == *port);
                 if *ip != 0 && taken {
                     return refuse(Refusal::AddressInUse);
                 }
                 let h = &mut self.hosts[at];
                 h.addrs.retain(|a| a.0 != *role);
                 if *ip != 0 {
-                    h.addrs.push((*role, *ip));
+                    h.addrs.push((*role, *ip, *port));
                 }
                 h.addrs.sort();
                 Answer::Done { node: h.node }
@@ -268,13 +274,15 @@ fn differs(s: &State, m: &Model) -> Option<String> {
     }
     let hosts: Vec<MHost> = s.hosts().iter()
         .map(|h| MHost { name: h.name.clone(), node: h.node, keys: h.keys.clone(),
-                         addrs: h.addrs.iter().map(|a| (a.role, a.ip)).collect(), maintenance: h.maintenance,
+                         addrs: h.addrs.iter().map(|a| (a.role, a.ip, a.port)).collect(), maintenance: h.maintenance,
                          joined: h.joined })
         .collect();
     if hosts != m.hosts {
         return Some(format!("the hosts {:?}, the model's {:?}", hosts, m.hosts));
     }
-    if s.hosts().iter().any(|h| !h.labels.is_empty() || h.ipc() != h.addrs[0].ip || h.addrs[0].role != Role::Ipc) {
+    if s.hosts().iter().any(|h| !h.labels.is_empty() || h.ipc() != h.addrs[0].ip || h.ipc_port() != h.addrs[0].port
+        || h.addrs[0].role != Role::Ipc)
+    {
         return Some(String::from("a host with a label nothing gave it, or its ipc address not first"));
     }
     let retired: Vec<MRetired> = s.retired().iter().map(|r| MRetired { key: r.key, node: r.node, at: r.retired })
@@ -283,7 +291,7 @@ fn differs(s: &State, m: &Model) -> Option<String> {
         return Some(format!("the keys retired {:?}, the model's {:?}", retired, m.retired));
     }
     let invites: Vec<MInvite> = s.invitations().iter()
-        .map(|i| MInvite { id: i.id, host: i.host.clone(), ip: i.ip, key: i.key, hash: i.secret_hash,
+        .map(|i| MInvite { id: i.id, host: i.host.clone(), ip: i.ip, port: i.port, key: i.key, hash: i.secret_hash,
                            expires: i.expires })
         .collect();
     if invites != m.invites {
@@ -304,10 +312,12 @@ fn differs(s: &State, m: &Model) -> Option<String> {
     for h in &m.hosts {
         let peers = s.peers_of(&h.name);
         /* Every other host, and every host invited, by the key it will come with */
-        let mut want: Vec<(String, u32, Vec<Fingerprint>)> = m.hosts.iter().filter(|o| o.name != h.name)
-            .map(|o| (o.name.clone(), o.ip(), o.keys.clone())).collect();
-        want.extend(m.invites.iter().filter(|i| i.host != h.name).map(|i| (i.host.clone(), i.ip, vec![i.key])));
-        let got: Vec<(String, u32, Vec<Fingerprint>)> = peers.into_iter().map(|p| (p.name, p.ip, p.keys)).collect();
+        let mut want: Vec<(String, u32, u16, Vec<Fingerprint>)> = m.hosts.iter().filter(|o| o.name != h.name)
+            .map(|o| (o.name.clone(), o.ip(), o.port(), o.keys.clone())).collect();
+        want.extend(m.invites.iter().filter(|i| i.host != h.name)
+            .map(|i| (i.host.clone(), i.ip, i.port, vec![i.key])));
+        let got: Vec<(String, u32, u16, Vec<Fingerprint>)> = peers.into_iter().map(|p| (p.name, p.ip, p.port, p.keys))
+            .collect();
         if got != want {
             return Some(format!("{}'s peers {:?}, the model's {:?}", h.name, got, want));
         }
@@ -320,6 +330,8 @@ fn differs(s: &State, m: &Model) -> Option<String> {
 const NAMES: [&str; 6] = ["ex44", "ax41", "box3", "node-4", "n5", "a"];
 const BAD_NAMES: [&str; 5] = ["", "Ex44", "a b", "ex44.lan", "--"];
 const IPS: [u32; 6] = [0x0a00_0001, 0x0a00_0002, 0x0a00_0003, 0x0a00_0004, 0xc0a8_0001, 0x4135_5dd5];
+/// A port none said most often, else one of three (#99).
+const PORTS: [u16; 5] = [0, 0, 39240, 39241, 39242];
 const IDS: [u64; 5] = [1, 2, 3, 0x7fff_ffff_ffff_ffff, u64::MAX];
 
 fn key(k: u64) -> Fingerprint {
@@ -375,6 +387,13 @@ impl Pools {
         if r.chance(4) { 0 } else { self.ips[r.below(self.ips.len() as u64) as usize] }
     }
 
+    /// A port: mostly none said, else one of a few -- so that two hosts
+    /// share an address by their ports, and an address and port come
+    /// twice (#99).
+    fn port(&self, r: &mut Rng) -> u16 {
+        PORTS[r.below(PORTS.len() as u64) as usize]
+    }
+
     fn id(&self, r: &mut Rng) -> u64 {
         self.ids[r.below(self.ids.len() as u64) as usize]
     }
@@ -400,7 +419,7 @@ fn command(r: &mut Rng, p: &Pools, m: &Model, now: &mut u64) -> Command {
     let now = clock(r, now);
     if m.cluster.is_none() && r.chance(70) {
         return Command::Init { now, cluster: mix(r.next(), 3).to_le_bytes().repeat(2).try_into().unwrap_or([0; 16]),
-                               name: p.name(r), host: p.name(r), key: p.key(r), ip: p.ip(r) };
+                               name: p.name(r), host: p.name(r), key: p.key(r), ip: p.ip(r), port: p.port(r) };
     }
     let invitation = |r: &mut Rng| match m.invites.get(r.below(m.invites.len() as u64 + 1) as usize) {
         Some(i) if r.chance(80) => i.id,
@@ -418,7 +437,7 @@ fn command(r: &mut Rng, p: &Pools, m: &Model, now: &mut u64) -> Command {
             0 => Command::Maintenance { now, host: h, on: r.chance(50) },
             1 => {
                 let role = [Role::Ipc, Role::Underlay, Role::Public][r.below(3) as usize];
-                Command::Address { now, host: h, role, ip: p.ip(r) }
+                Command::Address { now, host: h, role, ip: p.ip(r), port: p.port(r) }
             }
             2 => Command::AddKey { now, host: h, key: p.key(r) },
             _ => {
@@ -436,12 +455,14 @@ fn command(r: &mut Rng, p: &Pools, m: &Model, now: &mut u64) -> Command {
     let removes = if p.wide { 4 } else { 16 };
     let pick = r.below(100);
     if pick < 4 {
-        Command::Init { now, cluster: [7; 16], name: p.name(r), host: p.name(r), key: p.key(r), ip: p.ip(r) }
+        Command::Init { now, cluster: [7; 16], name: p.name(r), host: p.name(r), key: p.key(r), ip: p.ip(r),
+                        port: p.port(r) }
     } else if pick < 39 {
         let mut hash = [0u8; 32];
         hash[..8].copy_from_slice(&r.next().to_le_bytes());
         let expires = if r.chance(10) { now.saturating_sub(r.below(60)) } else { now + r.range(1, 1800) };
-        Command::Invite { now, id: p.id(r), host: p.name(r), ip: p.ip(r), key: p.key(r), secret_hash: hash, expires }
+        Command::Invite { now, id: p.id(r), host: p.name(r), ip: p.ip(r), port: p.port(r), key: p.key(r),
+                          secret_hash: hash, expires }
     } else if pick < 73 {
         Command::Join { now, invitation: invitation(r) }
     } else if pick < 73 + removes {
@@ -821,7 +842,7 @@ pub fn run(seed: u64, steps: u64) -> Result<(), String> {
 
 fn init(s: &mut State) -> Result<(), String> {
     let a = s.apply_command(&Command::Init { now: 100, cluster: [1; 16], name: "test".into(), host: "ex44".into(),
-                                             key: key(1), ip: IPS[0] });
+                                             key: key(1), ip: IPS[0], port: 0 });
     if a != (Answer::Done { node: 1 }) {
         return Err(format!("init answered {:?}", a));
     }
@@ -829,7 +850,7 @@ fn init(s: &mut State) -> Result<(), String> {
 }
 
 fn invite(s: &mut State, now: u64, id: u64, host: &str, ip: u32, k: Fingerprint, expires: u64) -> Answer {
-    s.apply_command(&Command::Invite { now, id, host: host.into(), ip, key: k, secret_hash: [9; 32], expires })
+    s.apply_command(&Command::Invite { now, id, host: host.into(), ip, port: 0, key: k, secret_hash: [9; 32], expires })
 }
 
 /// A token is good once: the second join on its invitation is refused; and
@@ -1039,7 +1060,7 @@ fn addresses() -> Result<(), String> {
     let mut s = State::new();
     two_hosts(&mut s)?;
     let set = |s: &mut State, now: u64, host: &str, role: Role, ip: u32| {
-        s.apply_command(&Command::Address { now, host: host.into(), role, ip })
+        s.apply_command(&Command::Address { now, host: host.into(), role, ip, port: 0 })
     };
     if set(&mut s, 130, "ex44", Role::Public, IPS[3]) != (Answer::Done { node: 1 })
         || set(&mut s, 131, "ex44", Role::Underlay, IPS[2]) != (Answer::Done { node: 1 })
@@ -1096,9 +1117,86 @@ fn maintenance() -> Result<(), String> {
     Ok(())
 }
 
+/// Two hosts behind one address, a NAT's, told apart by their ports
+/// (#99): both invited and joined, each other's peer at its own port; one
+/// address and port refused to a third, invited or moved to; a command of
+/// format 1 read with its address's port 0, and a snapshot REG2 -- written
+/// here, by a writer of the test's own -- read with every port 0.
+fn ports() -> Result<(), String> {
+    let mut s = State::new();
+    init(&mut s)?;
+    let nat = IPS[5];
+    let at = |s: &mut State, now: u64, id: u64, host: &str, port: u16, k: u64| {
+        s.apply_command(&Command::Invite { now, id, host: host.into(), ip: nat, port, key: key(k),
+                                           secret_hash: [9; 32], expires: 1000 })
+    };
+    let join = |s: &mut State, now: u64, id: u64| s.apply_command(&Command::Join { now, invitation: id });
+    if at(&mut s, 110, 5, "vm1", 39241, 3) != (Answer::Done { node: 0 })
+        || at(&mut s, 111, 6, "vm2", 39242, 4) != (Answer::Done { node: 0 })
+        || join(&mut s, 112, 5) != (Answer::Done { node: 2 }) || join(&mut s, 113, 6) != (Answer::Done { node: 3 })
+    {
+        return Err(String::from("two hosts behind one address, of ports of their own, not let in"));
+    }
+    let peers: Vec<(String, u32, u16)> = s.peers_of("vm1").into_iter().map(|p| (p.name, p.ip, p.port)).collect();
+    if peers != [(String::from("ex44"), IPS[0], 0), (String::from("vm2"), nat, 39242)] {
+        return Err(format!("vm1's peers {:?}", peers));
+    }
+    let twice = at(&mut s, 114, 7, "vm3", 39242, 5);
+    let moved = s.apply_command(&Command::Address { now: 115, host: "ex44".into(), role: Role::Ipc, ip: nat,
+                                                    port: 39241 });
+    if twice != Answer::Refused(Refusal::AddressInUse) || moved != Answer::Refused(Refusal::AddressInUse) {
+        return Err(format!("an address and port twice answered {:?} and {:?}", twice, moved));
+    }
+    if at(&mut s, 116, 8, "vm3", 39243, 5) != (Answer::Done { node: 0 }) {
+        return Err(String::from("a third port at the same address refused"));
+    }
+    /* Format 1: no port after the address */
+    let mut old = vec![1u8, 7];
+    old.extend_from_slice(&120u64.to_le_bytes());
+    old.push(4);
+    old.extend_from_slice(b"ex44");
+    old.push(1);
+    old.extend_from_slice(&IPS[2].to_le_bytes());
+    let want = Command::Address { now: 120, host: "ex44".into(), role: Role::Ipc, ip: IPS[2], port: 0 };
+    if Command::decode(&old) != Some(want) {
+        return Err(format!("a command of format 1 read as {:?}", Command::decode(&old)));
+    }
+    /* REG2: an Init's state, its host's one address with no port */
+    let mut reg2 = Vec::from(&b"REG2"[..]);
+    reg2.push(1);
+    reg2.extend_from_slice(&[1; 16]);
+    reg2.push(4);
+    reg2.extend_from_slice(b"test");
+    reg2.extend_from_slice(&100u64.to_le_bytes());
+    reg2.extend_from_slice(&2u64.to_le_bytes());
+    reg2.extend_from_slice(&1u32.to_le_bytes());
+    reg2.push(4);
+    reg2.extend_from_slice(b"ex44");
+    reg2.extend_from_slice(&1u64.to_le_bytes());
+    reg2.push(1);
+    reg2.extend_from_slice(&key(1));
+    reg2.push(1);
+    reg2.push(1);
+    reg2.extend_from_slice(&IPS[0].to_le_bytes());
+    reg2.push(0);
+    reg2.push(0);
+    reg2.extend_from_slice(&100u64.to_le_bytes());
+    for _ in 0..3 {
+        reg2.extend_from_slice(&0u32.to_le_bytes());
+    }
+    let mut first = State::new();
+    init(&mut first)?;
+    match State::decode(&reg2) {
+        Ok(back) if back == first => Ok(()),
+        Ok(back) => Err(format!("a snapshot REG2 read as {:?}", back.hosts())),
+        Err(e) => Err(format!("a snapshot REG2 refused: {:?}", e)),
+    }
+}
+
 pub const SCENARIOS: &[(&str, fn() -> Result<(), String>)] = &[
     ("registry_keys", keys),
     ("registry_addresses", addresses),
+    ("registry_ports", ports),
     ("registry_maintenance", maintenance),
     ("registry_voters", voters),
     ("registry_join_once", join_once),

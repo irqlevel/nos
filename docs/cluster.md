@@ -42,7 +42,7 @@ cluster hosts                   every host: node, voter or learner, addresses, k
 cluster remove <host>           a host out, for good: its key refused from then on
 cluster revoke <host>           its open invitation taken back, its token good for nothing
 cluster maintenance <host> on|off   a host being worked on, or back
-cluster address <host> <role> <ip|none>   a host's address for ipc, underlay or public
+cluster address <host> <role> <ip[:port]|none>   a host's address for ipc, underlay or public
 cluster rekey                   this host moved to a new key, no connection lost
 cluster recover [<cluster>]     on the last host standing: what it does, then -- the cluster's name given -- does it
 ```
@@ -92,8 +92,10 @@ insmod /lib/modules/cluster.ko
 
 1. **Its key first**: `ipcnet id` on the new host prints its key's
    fingerprint, the key made at ipcnet's first start.
-2. **`cluster invite <host> <ip> <key>`** on any member commits an
-   invitation: the host's name, the address it will come from, its key, the
+2. **`cluster invite <host> <ip>[:<port>] <key>`** on any member commits an
+   invitation: the host's name, the address it will come from -- and the
+   port its ipcnet listens on, where it is not ipcnet's own 39240: one of
+   two hosts behind a NAT's address (#99) -- its key, the
    hash of a secret, and when it ends -- fifteen minutes on by the leader's
    clock. The command prints the token, once: the cluster's id, this
    member's name, address, port and key, the invitation's number and the
