@@ -110,7 +110,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `usb` | Show xHCI controllers, connected root ports and keyboard report counters |
 | `panic [type]` | Trigger kernel panic: direct, or `pf` (page fault), `div0` (divide by zero), `ud` (invalid opcode), `df` (a real double fault, x86-64: a stack pointer no access can use, the report from the IST stack), `offstack` (a panic on a stack that is no task's, with preemption on) -- the last two what `panic-test.sh` drives |
 | `version` | Show kernel version |
-| `poweroff` / `shutdown` | Power off (ACPI S5) |
+| `poweroff` / `shutdown` | Power off (ACPI S5: the sleep type the firmware's DSDT names in `\_S5`, written to the PM1 control registers the FADT names; with no `\_S5` read the kernel says so and halts instead of guessing one) |
 | `reboot` | Reset system (keyboard controller) |
 
 ## Line editing

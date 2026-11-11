@@ -18,6 +18,11 @@ Acpi::Acpi()
     , irq_to_gsi_size_(0)
     , io_apic_gsi_base_(~0U)
     , pm1a_cnt_port_(0)
+    , pm1b_cnt_port_(0)
+    , dsdt_phys_(0)
+    , s5_valid_(false)
+    , s5_typ_a_(0)
+    , s5_typ_b_(0)
     , reset_reg_valid_(false)
     , reset_reg_port_(0)
     , reset_val_(0)
@@ -553,6 +558,21 @@ void Acpi::parse_fadt()
         klog(ACPI_LL, "Acpi: FADT PM1a_CNT port 0x%lX", pm1a_cnt_port_);
     }
 
+    static const ulong PM1B_CNT_BLK_END = OFFSET_OF(FadtFields, pm1b_cnt_blk) + sizeof(fadt->pm1b_cnt_blk);
+    if (body_len >= PM1B_CNT_BLK_END)
+        pm1b_cnt_port_ = fadt->pm1b_cnt_blk;
+
+    /* The DSDT: X_DSDT where the table is long enough to have the field and
+       it is not zero (ACPI 2.0 and later, and the one ACPICA takes of the
+       two), else the 32-bit DSDT. It is read by parse_dsdt, once this table
+       is let go of. */
+    static const ulong DSDT_END = OFFSET_OF(FadtFields, dsdt) + sizeof(fadt->dsdt);
+    static const ulong X_DSDT_END = OFFSET_OF(FadtFields, x_dsdt) + sizeof(fadt->x_dsdt);
+    if (body_len >= DSDT_END)
+        dsdt_phys_ = fadt->dsdt;
+    if (body_len >= X_DSDT_END && fadt->x_dsdt != 0)
+        dsdt_phys_ = (ulong)fadt->x_dsdt;
+
     /* Flags + reset_reg + reset_value require at least 93 bytes of body (ACPI 2.0+) */
     static const ulong RESET_VALUE_END = OFFSET_OF(FadtFields, reset_value) + sizeof(fadt->reset_value);
     if (body_len >= RESET_VALUE_END)
@@ -584,6 +604,157 @@ void Acpi::parse_fadt()
 u8 Acpi::get_century_register()
 {
     return century_register_;
+}
+
+bool Acpi::parse_s5_type(const u8* aml, size_t limit, size_t& at, u8& value)
+{
+    if (at >= limit)
+        return false;
+
+    u8 type;
+    const u8 op = aml[at++];
+    if (op == AML_ZERO_OP)
+    {
+        type = 0;
+    }
+    else if (op == AML_ONE_OP)
+    {
+        type = 1;
+    }
+    else if (op == AML_BYTE_PREFIX)
+    {
+        if (at >= limit)
+            return false;
+        type = aml[at++];
+    }
+    else
+    {
+        return false;
+    }
+
+    if (type > SLP_TYP_MAX)
+        return false;
+
+    value = type;
+    return true;
+}
+
+bool Acpi::parse_s5(const u8* aml, size_t len, u8& typ_a, u8& typ_b)
+{
+    static const u8 NAME[] = { '_', 'S', '5', '_' };
+
+    size_t at = 0;
+    if (at >= len || aml[at] != AML_NAME_OP)
+        return false;
+    at++;
+
+    if (at < len && aml[at] == AML_ROOT_CHAR)
+        at++;
+
+    if (len - at < sizeof(NAME))
+        return false;
+    for (size_t i = 0; i < sizeof(NAME); i++)
+    {
+        if (aml[at + i] != NAME[i])
+            return false;
+    }
+    at += sizeof(NAME);
+
+    if (at >= len || aml[at] != AML_PACKAGE_OP)
+        return false;
+    at++;
+
+    /* The package's length is counted from its own first byte */
+    if (at >= len)
+        return false;
+    const size_t pkg_start = at;
+    const u8 lead = aml[at];
+    const size_t follow = lead >> AML_PKG_FOLLOW_SHIFT;
+    if (len - at < 1 + follow)
+        return false;
+    size_t pkg_len = lead & ((follow == 0) ? AML_PKG_SHORT_MASK : AML_PKG_LOW_MASK);
+    for (size_t i = 0; i < follow; i++)
+        pkg_len |= (size_t)aml[at + 1 + i] << (AML_PKG_LOW_BITS + 8 * i);
+    at += 1 + follow;
+
+    /* What is read of the package is inside it, and inside what is there */
+    const size_t limit = stdlib::min(len, pkg_start + pkg_len);
+    if (at >= limit)
+        return false;
+    const u8 elements = aml[at++];
+    if (elements < 2)
+        return false;
+
+    u8 a = 0;
+    u8 b = 0;
+    if (!parse_s5_type(aml, limit, at, a) || !parse_s5_type(aml, limit, at, b))
+        return false;
+
+    typ_a = a;
+    typ_b = b;
+    return true;
+}
+
+void Acpi::parse_dsdt()
+{
+    if (dsdt_phys_ == 0)
+    {
+        klog(0, "Acpi: the FADT names no DSDT, so no \\_S5: no ACPI power-off");
+        return;
+    }
+
+    const ulong phys = dsdt_phys_;
+    ACPISDTHeader* header = map_header(phys);
+    if (header == nullptr)
+        return;
+
+    const u32 length = header->length;
+    const bool is_dsdt = stdlib::strn_cmp(header->signature, "DSDT", sizeof(header->signature)) == 0;
+    unmap_table_range(header, sizeof(ACPISDTHeader));
+    if (!is_dsdt || length < sizeof(ACPISDTHeader) || length > MAX_DSDT_LENGTH ||
+        length > mm::MemoryMap::MAX_PHYS_ADDR - phys)
+    {
+        klog(0, "Acpi: 0x%lX is %s (length %lu), so no \\_S5: no ACPI power-off", phys,
+            is_dsdt ? "a DSDT not to be read" : "no DSDT", (ulong)length);
+        return;
+    }
+
+    /* A page of it at a time, with as much of the next as a \_S5 begun in
+       this one's last byte runs to: two slots of the window at most, each
+       mapping given back before the next is taken */
+    auto& pt = mm::PageTable::get_instance();
+    const ulong end = phys + length;
+    for (ulong at = phys + sizeof(ACPISDTHeader); at < end; )
+    {
+        const ulong page_end = stdlib::min((at & ~(consts::PAGE_SIZE - 1)) + consts::PAGE_SIZE, end);
+        const ulong map_end = stdlib::min(page_end + (S5_MAX_BYTES - 1), end);
+        const ulong mapped = pt.tmp_map_range(at, map_end - at);
+        if (mapped == 0)
+        {
+            klog(0, "Acpi: can't map the DSDT at 0x%lX, so no \\_S5: no ACPI power-off", at);
+            return;
+        }
+
+        const u8* aml = reinterpret_cast<const u8*>(mapped);
+        bool found = false;
+        for (ulong i = 0; i < page_end - at && !found; i++)
+        {
+            if (aml[i] == AML_NAME_OP)
+                found = parse_s5(aml + i, map_end - at - i, s5_typ_a_, s5_typ_b_);
+        }
+        unmap_table_range(reinterpret_cast<void*>(mapped), map_end - at);
+
+        if (found)
+        {
+            s5_valid_ = true;
+            klog(ACPI_LL, "Acpi: DSDT 0x%lX length %lu, \\_S5 is SLP_TYP %lu and %lu", phys,
+                (ulong)length, (ulong)s5_typ_a_, (ulong)s5_typ_b_);
+            return;
+        }
+        at = page_end;
+    }
+
+    klog(0, "Acpi: DSDT 0x%lX length %lu holds no \\_S5 to read: no ACPI power-off", phys, (ulong)length);
 }
 
 void Acpi::parse_hpet()
@@ -694,8 +865,11 @@ stdlib::Error Acpi::parse()
             io_apic_address_ = nullptr;
             io_apic_gsi_base_ = ~0U;
         }
+        return err;
     }
 
+    /* The DSDT now, the tables' slots of the window free again */
+    parse_dsdt();
     return err;
 }
 
@@ -809,6 +983,21 @@ u32 Acpi::get_gsi_by_irq(u8 irq)
 ulong Acpi::get_pm1a_cnt_port()
 {
     return pm1a_cnt_port_;
+}
+
+ulong Acpi::get_pm1b_cnt_port()
+{
+    return pm1b_cnt_port_;
+}
+
+bool Acpi::get_s5(u8& typ_a, u8& typ_b)
+{
+    if (!s5_valid_)
+        return false;
+
+    typ_a = s5_typ_a_;
+    typ_b = s5_typ_b_;
+    return true;
 }
 
 bool Acpi::has_reset_reg()
