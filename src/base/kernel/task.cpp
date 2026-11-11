@@ -1116,7 +1116,7 @@ void TaskTable::ps(stdlib::Printer& printer)
             if (task->is_blocked())
                 flags |= 1UL << Task::FLAG_BLOCKED_BIT;
             stdlib::Time runtime(task->get_runtime_ns());
-            printer.printf("%lu %lu 0x%lX %lu.%lu %lu %s\n",
+            printer.printf("%lu %lu 0x%lX %lu.%06lu %lu %s\n",
                 task->pid_, task->state_.get(), flags, runtime.get_secs(),
                 runtime.get_usecs(), task->context_switches_.get(), task->get_name());
         }
