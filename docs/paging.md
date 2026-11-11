@@ -112,7 +112,10 @@ before:
 3. `get_free_pages()` walks the usable regions and threads a singly linked
    list through the pages themselves. It skips reserved runs boundary to
    boundary rather than testing each page (a real server has twenty-odd
-   reserved regions and sixteen million pages), skips the kernel image, and
+   reserved regions and sixteen million pages), skips RAM an earlier usable
+   region listed already -- firmware may name a range twice, or two that
+   overlap, and a page listed twice makes a loop of the list -- skips the
+   kernel image, and
    sorts pages whose identity address is shadowed by the kernel's own VA
    window onto a *second* list — `excluded_pages_` — because `setup` still
    reaches its allocations through the bootstrap map.

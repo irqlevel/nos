@@ -152,6 +152,18 @@ bool PageTable::get_free_pages(ulong exclude_limit)
         ulong address = mem_start;
         while (address < mem_end)
         {
+            /* RAM an earlier region of the map listed already: firmware may
+               name the same range twice, or two that overlap, and a page put
+               on this list a second time makes a loop of it -- its link
+               written over with a head that leads back to it. Skipped, and
+               not counted again. */
+            ulong listed_end = mmap.get_listed_end(i, address);
+            if (listed_end != 0)
+            {
+                address = (listed_end < mem_end) ? listed_end : mem_end;
+                continue;
+            }
+
             /* Reserved carve-outs (the arm64 DTB, page_array_'s backing, the
                firmware's own) overlap usable-RAM regions; free-listing them
                would clobber their contents. Skipped a run at a time rather
@@ -169,6 +181,7 @@ bool PageTable::get_free_pages(ulong exclude_limit)
             }
 
             ulong run_end = mmap.get_next_reserved_start(address, mem_end);
+            run_end = mmap.get_next_listed_start(i, address, run_end);
             for (; address < run_end; address += consts::PAGE_SIZE)
             {
                 total_pages_count_++;
