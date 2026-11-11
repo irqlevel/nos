@@ -93,6 +93,13 @@ struct Pages
     long map_fail_after = -1;
     /* va -> page index, for every page mapped */
     std::map<ulong, ulong> mapped;
+    /* The other CPUs' TLBs: va -> page index, for every address unmapped
+       and not yet shot down (CpuTable::invalidate_tlb_range). Until it is,
+       another CPU reaches the page through it -- so the page is not to be
+       anybody else's, and the address not to be mapped again. */
+    std::map<ulong, ulong> stale;
+    /* How many such addresses each page has */
+    std::vector<ulong> stale_count;
 } page_model;
 
 bool take(long& fail_after)
@@ -117,6 +124,8 @@ void map_one(ulong va, ulong index)
     INVARIANT(va >= reinterpret_cast<ulong>(region) && va + PAGE_BYTES <= reinterpret_cast<ulong>(region) + REGION_BYTES,
         "a map at 0x%lx, outside the VA the heap was given", va);
     INVARIANT(!page_model.free[index], "free page %lu mapped at 0x%lx", index, va);
+    INVARIANT(page_model.stale.find(va) == page_model.stale.end(), "0x%lx mapped again before the shootdown of "
+        "what it was unmapped from", va);
     INVARIANT(page_model.mapped.insert({va, index}).second, "0x%lx mapped twice", va);
     page_model.map_count[index]++;
     ASAN_UNPOISON_MEMORY_REGION(reinterpret_cast<void*>(va), PAGE_BYTES);
@@ -130,6 +139,8 @@ ulong unmap_one(ulong va)
     ulong index = it->second;
     page_model.mapped.erase(it);
     page_model.map_count[index]--;
+    page_model.stale[va] = index;
+    page_model.stale_count[index]++;
     ASAN_POISON_MEMORY_REGION(reinterpret_cast<void*>(va), PAGE_BYTES);
     return index;
 }
@@ -197,6 +208,8 @@ void PageTable::free_page(Page* page)
     ulong i = index_of(page);
     INVARIANT(!page_model.free[i], "page %lu freed twice", i);
     INVARIANT(page_model.map_count[i] == 0, "page %lu freed while mapped", i);
+    INVARIANT(page_model.stale_count[i] == 0, "page %lu freed before the shootdown of an address it was unmapped "
+        "from: another CPU's TLB still reaches it", i);
     page_model.free[i] = true;
     page_model.free_count++;
     page_model.stack.push_back(i);
@@ -217,46 +230,62 @@ bool PageTable::map_page(ulong virt_addr, Page* page)
     return map_pages(virt_addr, &page, 1);
 }
 
+/* A map that fails has mapped the first half and taken it back, as the
+   kernel's does (map_range_locked): those addresses are in the other CPUs'
+   TLBs until the caller's shootdown, and the pages not to be freed before
+   it. */
 bool PageTable::map_pages(ulong virt_addr, Page* const* pages, size_t count)
 {
     INVARIANT(fuzz::held_spin_locks() == 0, "pages mapped with a spin lock held");
-    if (!take(page_model.map_fail_after))
-        return false;
-    for (size_t i = 0; i < count; i++)
+    const bool fails = !take(page_model.map_fail_after);
+    const size_t mapped = fails ? count / 2 : count;
+    for (size_t i = 0; i < mapped; i++)
         map_one(virt_addr + i * PAGE_BYTES, index_of(pages[i]));
-    return true;
+    for (size_t i = 0; fails && i < mapped; i++)
+        unmap_one(virt_addr + i * PAGE_BYTES);
+    return !fails;
 }
 
 bool PageTable::map_contiguous_pages(ulong virt_addr, Page* pages, size_t count)
 {
-    if (!take(page_model.map_fail_after))
-        return false;
-    for (size_t i = 0; i < count; i++)
+    const bool fails = !take(page_model.map_fail_after);
+    const size_t mapped = fails ? count / 2 : count;
+    for (size_t i = 0; i < mapped; i++)
         map_one(virt_addr + i * PAGE_BYTES, index_of(&pages[i]));
-    return true;
+    for (size_t i = 0; fails && i < mapped; i++)
+        unmap_one(virt_addr + i * PAGE_BYTES);
+    return !fails;
 }
 
 bool PageTable::map_phys_pages(ulong virt_addr, const ulong* phy_addrs, size_t count)
 {
-    if (!take(page_model.map_fail_after))
-        return false;
-    for (size_t i = 0; i < count; i++)
+    const bool fails = !take(page_model.map_fail_after);
+    const size_t mapped = fails ? count / 2 : count;
+    for (size_t i = 0; i < mapped; i++)
     {
         INVARIANT(phy_addrs[i] % PAGE_BYTES == 0 && phy_addrs[i] / PAGE_BYTES < page_model.all.size(),
             "a map of physical 0x%lx, which is no page", phy_addrs[i]);
         map_one(virt_addr + i * PAGE_BYTES, phy_addrs[i] / PAGE_BYTES);
     }
-    return true;
+    for (size_t i = 0; fails && i < mapped; i++)
+        unmap_one(virt_addr + i * PAGE_BYTES);
+    return !fails;
 }
 
-void PageTable::unmap_pages(ulong virt_addr, size_t count, bool free_pages)
+void PageTable::unmap_pages(ulong virt_addr, size_t count, Page** frames)
 {
     for (size_t i = 0; i < count; i++)
     {
         ulong index = unmap_one(virt_addr + i * PAGE_BYTES);
-        if (free_pages)
-            free_page(&page_model.all[index]);
+        if (frames != nullptr)
+            frames[i] = &page_model.all[index];
     }
+}
+
+void PageTable::free_pages(Page* const* pages, size_t count)
+{
+    for (size_t i = 0; i < count; i++)
+        free_page(pages[i]);
 }
 
 Page* PageTable::unmap_page(ulong virt_addr)
@@ -268,8 +297,15 @@ Page* PageTable::unmap_page(ulong virt_addr)
 
 void CpuTable::invalidate_tlb_range(ulong virt_addr, ulong count)
 {
-    (void)virt_addr;
-    (void)count;
+    INVARIANT(fuzz::held_spin_locks() == 0, "a TLB shootdown with a spin lock held");
+    for (ulong i = 0; i < count; i++)
+    {
+        auto it = page_model.stale.find(virt_addr + i * PAGE_BYTES);
+        if (it == page_model.stale.end())
+            continue;
+        page_model.stale_count[it->second]--;
+        page_model.stale.erase(it);
+    }
 }
 
 }
@@ -701,6 +737,7 @@ void boot(fuzz::Input& in)
         page_model.all[i].init(i * PAGE_BYTES);
     page_model.free.assign(pages, true);
     page_model.map_count.assign(pages, 0);
+    page_model.stale_count.assign(pages, 0);
     page_model.free_count = pages;
     for (ulong i = pages; i-- > 0;)
         page_model.stack.push_back(i);

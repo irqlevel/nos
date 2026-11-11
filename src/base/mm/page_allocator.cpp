@@ -60,12 +60,13 @@ void* FixedPageAllocator::alloc()
 
     if (!pt.map_pages(va, pages, page_count_))
     {
-        for (size_t i = 0; i < page_count_; i++)
-            pt.free_page(pages[i]);
         /* Remote CPUs may have cached translations from the prefix map_pages
            rolled back (it only invalidates locally); flush everywhere before
-           the VA block and the pages become reusable. */
+           the VA block and the pages become reusable -- the pages too, which
+           used to go back first. */
         kernel::CpuTable::get_instance().invalidate_tlb_range(va, page_count_);
+        for (size_t i = 0; i < page_count_; i++)
+            pt.free_page(pages[i]);
         va_alloc_.free(va);
         return nullptr;
     }
@@ -122,7 +123,7 @@ bool FixedPageAllocator::unmap(void* addr, size_t count)
 
     BUG_ON(count == 0 || count > page_count_);
 
-    PageTable::get_instance().unmap_pages((ulong)addr, count, false);
+    PageTable::get_instance().unmap_pages((ulong)addr, count);
 
     kernel::CpuTable::get_instance().invalidate_tlb_range((ulong)addr, count);
     va_alloc_.free((ulong)addr);
@@ -134,11 +135,23 @@ bool FixedPageAllocator::free(void* addr)
     if (!va_alloc_.contains((ulong)addr))
         return false;
 
-    PageTable::get_instance().unmap_pages((ulong)addr, page_count_, true);
-
-    kernel::CpuTable::get_instance().invalidate_tlb_range((ulong)addr, page_count_);
+    unmap_and_free((ulong)addr);
     va_alloc_.free((ulong)addr);
     return true;
+}
+
+/* A block's pages unmapped and given back, in that order with every CPU's
+   TLB flushed between the two: a page is nobody else's while any CPU can
+   still reach it through this block's address (PageTable::unmap_pages). */
+void FixedPageAllocator::unmap_and_free(ulong va)
+{
+    auto& pt = PageTable::get_instance();
+    BUG_ON(page_count_ > MAX_PAGE_COUNT);
+    Page* frames[MAX_PAGE_COUNT];
+
+    pt.unmap_pages(va, page_count_, frames);
+    kernel::CpuTable::get_instance().invalidate_tlb_range(va, page_count_);
+    pt.free_pages(frames, page_count_);
 }
 
 bool FixedPageAllocator::contains(void* addr)
@@ -151,8 +164,7 @@ bool FixedPageAllocator::free_keeping_va(void* addr)
     if (!va_alloc_.contains((ulong)addr))
         return false;
 
-    PageTable::get_instance().unmap_pages((ulong)addr, page_count_, true);
-    kernel::CpuTable::get_instance().invalidate_tlb_range((ulong)addr, page_count_);
+    unmap_and_free((ulong)addr);
     return true;
 }
 

@@ -944,7 +944,17 @@ void unmap(fuzz::Input& in)
         if (u.second != 1 || pages[index(u.first)].ref != 2 || pages[index(u.first)].frame)
             free = false;
     }
-    tested_pt().unmap_pages(va, count, free);
+    /* The pages come back in the order unmapped, for the caller to free
+       once its shootdown is done; here there is one CPU */
+    std::vector<Page*> frames(count, nullptr);
+    tested_pt().unmap_pages(va, count, free ? frames.data() : nullptr);
+    if (free)
+    {
+        for (ulong i = 0; i < count; i++)
+            INVARIANT(frames[i] == page_of(maps[va + i * PAGE_BYTES]), "unmap_pages(0x%lx) hands back another "
+                "page for 0x%lx", va, va + i * PAGE_BYTES);
+        tested_pt().free_pages(frames.data(), count);
+    }
     for (ulong i = 0; i < count; i++)
     {
         ulong phys = maps[va + i * PAGE_BYTES];

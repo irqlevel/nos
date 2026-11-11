@@ -2028,7 +2028,7 @@ bool PageTable::map_range_locked(ulong virt_addr, size_t count, const MapSource&
     /* All-or-nothing: undo the prefix that did get mapped, leaving the
        pages themselves to the caller. */
     if (mapped != 0)
-        unmap_range_locked(virt_addr, mapped, false);
+        unmap_range_locked(virt_addr, mapped, nullptr);
 
     return false;
 }
@@ -2036,7 +2036,7 @@ bool PageTable::map_range_locked(ulong virt_addr, size_t count, const MapSource&
 /* Range twin of map_range_locked. A missing entry is a caller bug (BUG_ON),
    but the walk carries on so the rest of the range is still torn down.
    Lock must be held. */
-void PageTable::unmap_range_locked(ulong virt_addr, size_t count, bool free_pages)
+void PageTable::unmap_range_locked(ulong virt_addr, size_t count, Page** frames)
 {
     BUG_ON(virt_addr & (consts::PAGE_SIZE - 1));
 
@@ -2065,6 +2065,9 @@ void PageTable::unmap_range_locked(ulong virt_addr, size_t count, bool free_page
         if (!l1_entry->present())
         {
             BUG_ON(1);
+            /* No page of this address's for the caller to free */
+            if (frames != nullptr)
+                frames[i] = nullptr;
         }
         else
         {
@@ -2075,9 +2078,10 @@ void PageTable::unmap_range_locked(ulong virt_addr, size_t count, bool free_page
 
             Page* page = get_page(phy_addr);
             page->put(); /* balance get_page's lookup reference */
-            if (free_pages)
-                free_page_no_lock(page);
             page->put(); /* the mapping reference map_range_locked took */
+            /* The caller's to free, after the shootdown (unmap_pages) */
+            if (frames != nullptr)
+                frames[i] = page;
         }
 
         if (l1_index == (stdlib::array_size(l1_page->entry) - 1))
@@ -2127,11 +2131,23 @@ bool PageTable::map_phys_pages(ulong virt_addr, const ulong* phy_addrs, size_t c
     return map_range_locked(virt_addr, count, src);
 }
 
-void PageTable::unmap_pages(ulong virt_addr, size_t count, bool free_pages)
+void PageTable::unmap_pages(ulong virt_addr, size_t count, Page** frames)
 {
     stdlib::AutoLock lock(lock_);
 
-    unmap_range_locked(virt_addr, count, free_pages);
+    unmap_range_locked(virt_addr, count, frames);
+}
+
+void PageTable::free_pages(Page* const* pages, size_t count)
+{
+    stdlib::AutoLock lock(lock_);
+
+    for (size_t i = 0; i < count; i++)
+    {
+        /* None where unmap_pages found nothing mapped */
+        if (pages[i] != nullptr)
+            free_page_no_lock(pages[i]);
+    }
 }
 
 ulong PageTable::map_mmio_region(ulong phys_addr, ulong size_bytes, MmioCachePolicy policy)

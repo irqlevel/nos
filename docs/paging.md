@@ -440,6 +440,19 @@ once the CPU that issued it passes a `DSB`, and a task interrupted between
 the two runs its `DSB` on the CPU it is moved to -- so `switch_context`
 starts with a `dsb ish`, as Linux's `__switch_to` does.
 
+A frame goes back to the free list only after that shootdown. The page
+allocator unmaps a block's pages, has every other CPU's TLB flushed, and
+frees the frames then (`FixedPageAllocator::unmap_and_free`:
+`PageTable::unmap_pages` hands the frames back, `invalidate_tlb_range`,
+`PageTable::free_pages`). They used to be freed inside the unmap, under the
+table's lock, with the unmapping CPU's TLB alone flushed: until the
+shootdown that followed, a CPU that still had the address in its TLB could
+read or write a frame that was somebody else's already -- a use after free
+of the block landing in whoever had the frame next. `cpp-fuzz.py --target
+heap` keeps the addresses unmapped and not yet shot down, and fails at a
+frame freed -- or an address mapped again -- while one of them still
+reaches it.
+
 This is the origin of the single most important rule in the codebase:
 **never allocate or free with a spinlock held.** `mm::free`/`mm::alloc` can
 reach the page allocator, which shoots down every other CPU and waits for

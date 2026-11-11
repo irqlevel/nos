@@ -174,9 +174,19 @@ public:
     bool map_contiguous_pages(ulong virt_addr, Page* pages, size_t count);
     bool map_phys_pages(ulong virt_addr, const ulong* phy_addrs, size_t count);
 
-    /* Drop the mapping reference on count pages; with free_pages set they
-       also go back to the free list (the alloc_page/map_pages pairing). */
-    void unmap_pages(ulong virt_addr, size_t count, bool free_pages);
+    /* Drop the mapping reference on count pages. With frames given, each
+       page unmapped is put in it, in order, for the caller to hand to
+       free_pages -- once no CPU's TLB can still reach it at this address
+       (CpuTable::invalidate_tlb_range). The pages used to go back to the
+       free list here, under the lock, with only this CPU's TLB flushed: a
+       page could be another allocation's while a CPU that still had the
+       address in its TLB read or wrote it through the old one, so that a
+       use after free landed in whoever had the page next. */
+    void unmap_pages(ulong virt_addr, size_t count, Page** frames = nullptr);
+
+    /* count pages back on the free list, under one hold of the lock; a
+       null one -- an address unmap_pages found nothing at -- is passed over */
+    void free_pages(Page* const* pages, size_t count);
 
     /* Cache policy for map_mmio_region.
 
@@ -512,7 +522,7 @@ private:
 
     bool change_range_protection(ulong virt_addr, ulong size_bytes, bool writable,
         bool executable, bool exact);
-    void unmap_range_locked(ulong virt_addr, size_t count, bool free_pages);
+    void unmap_range_locked(ulong virt_addr, size_t count, Page** frames);
 
     ulong tmp_map_start_;
     kernel::SpinLock tmp_map_lock_;
