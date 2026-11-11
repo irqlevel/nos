@@ -348,17 +348,19 @@ void CpuTable::exit_all_except_self()
     }
 }
 
-void CpuTable::send_ipi_all_exclude(ulong exclude_index)
+void CpuTable::send_panic_ipi(ulong exclude_index)
 {
-    ulong cpu_mask = get_running_cpus();
+    ulong cpu_mask = get_running_cpus_no_lock();
     for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        if ((cpu_mask & (1UL << i)) && (i != exclude_index))
-        {
-            auto& cpu = get_cpu(i);
+        if (!(cpu_mask & (1UL << i)) || i == exclude_index)
+            continue;
 
-            cpu.send_ipi_self();
-        }
+        /* Parked: stopped already, on a stack of its own */
+        if (cpu_array_[i].is_parked())
+            continue;
+
+        hal::send_ipi(i, IPI_VECTOR);
     }
 }
 
