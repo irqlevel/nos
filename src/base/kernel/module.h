@@ -56,10 +56,15 @@ public:
 
     stdlib::Error unload(const char* name, stdlib::Printer& out);
 
-    /* Unload every module that can be, newest first. For the shutdown path,
-       while the services a module's exit may use -- files, block I/O, the
-       soft IRQs it completes through -- still run. A module another task is
-       still loading or unloading is left to it. */
+    /* The halt's: unload every module that can be, newest first, and load
+       none from here on. While the services a module's exit may use --
+       files, block I/O, the soft IRQs it completes through -- still run,
+       and while the shells do: a shell may be inside a module's command
+       that returns only when its module is told to stop, and it is the
+       take-down that tells it (close, stop, the calls waited out, exit --
+       which is why no shell has to be gone first). A load another task is
+       in the middle of is waited for, LOADING_WAIT_MS at most, and unloaded
+       with the rest; a module another task is unloading is left to it. */
     void unload_all();
 
     /* How an insmod or rmmod ended, as start_load and start_unload saw it */
@@ -147,6 +152,9 @@ public:
        finish on its own */
     static const ulong SHELL_WAIT_MS = 5000;
 
+    /* How long the halt waits for a load in another task's hands */
+    static const ulong LOADING_WAIT_MS = 10000;
+
 private:
     ModuleTable();
     ~ModuleTable();
@@ -168,6 +176,8 @@ private:
        or printing. Not watched: a panic may be the first to want it. */
     RawSpinLock lock_;
     stdlib::ListEntry list_;
+    /* Set by unload_all, under the lock: nothing is put on the list after */
+    bool halting_;
 };
 
 }
