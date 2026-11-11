@@ -1487,11 +1487,22 @@ struct RustTimerSlot
 {
     void (*handler)(void*);
     void* ctx;
+    /* Taken: from kernel_timer_start until kernel_timer_stop is done with
+       it -- its stop_timer returned, not merely its handler gone */
     bool active;
+    /* Being stopped: no second stop of it, and not yet anyone else's */
+    bool stopping;
+    /* Which timer the slot holds, counted at each start: the upper half of
+       its handle, so that a handle kept past its stop -- or stopped twice --
+       is not the handle of whoever has the slot now */
+    u32 generation;
 };
 
 static RustTimerSlot rust_timer_slots[RUST_TIMER_SLOT_COUNT];
 static kernel::RawRwSpinLock rust_timer_lock;
+
+static const ulong RUST_TIMER_SLOT_BITS = 32;
+static const ulong RUST_TIMER_SLOT_MASK = (1UL << RUST_TIMER_SLOT_BITS) - 1;
 
 class RustTimerAdapter : public kernel::TimerCallback
 {
@@ -1540,6 +1551,9 @@ unsigned long kernel_timer_start(
             rust_timer_slots[i].handler = handler;
             rust_timer_slots[i].ctx = ctx;
             rust_timer_slots[i].active = true;
+            rust_timer_slots[i].stopping = false;
+            rust_timer_slots[i].generation = rust_timer_slots[i].generation + 1;
+            const ulong generation = rust_timer_slots[i].generation;
 
             auto& ta = get_timer_adapter(i);
             ta.slot_index_ = i;
@@ -1555,7 +1569,7 @@ unsigned long kernel_timer_start(
                 return 0;
             }
             rust_timer_lock.write_unlock_irq_restore(flags);
-            return i + 1;
+            return (generation << RUST_TIMER_SLOT_BITS) | (i + 1);
         }
     }
     rust_timer_lock.write_unlock_irq_restore(flags);
@@ -1564,22 +1578,42 @@ unsigned long kernel_timer_start(
 
 void kernel_timer_stop(unsigned long handle)
 {
-    if (handle == 0 || handle > RUST_TIMER_SLOT_COUNT)
+    const ulong slot = handle & RUST_TIMER_SLOT_MASK;
+    if (slot == 0 || slot > RUST_TIMER_SLOT_COUNT)
         return;
-    ulong i = handle - 1;
+    ulong i = slot - 1;
 
-    /* Clear the slot under the lock, then release it BEFORE stop_timer. stop_timer
+    /* Clear the handler under the lock, then release it BEFORE stop_timer. stop_timer
        spin-waits for an in-flight on_tick on another CPU to finish, and on_tick
        needs rust_timer_lock in read mode; holding the write lock across that wait
        would deadlock (AB/BA). Clearing Handler first makes a racing on_tick a
-       no-op once it acquires the read lock. */
+       no-op once it acquires the read lock.
+
+       The slot stays taken across it. Freed here, as it used to be, a
+       kernel_timer_start on another CPU took it in the gap and registered
+       the slot's one adapter a second time -- and the stop_timer below,
+       which takes every entry of that adapter off, took the new timer with
+       the old: a handle to a timer that never fired, and nothing said. And
+       a handle that is not this slot's timer's -- stopped already, or the
+       slot's last tenant's -- stops nothing. */
     ulong flags = rust_timer_lock.write_lock_irq_save();
+    if (!rust_timer_slots[i].active || rust_timer_slots[i].stopping ||
+        (ulong)rust_timer_slots[i].generation != (handle >> RUST_TIMER_SLOT_BITS))
+    {
+        rust_timer_lock.write_unlock_irq_restore(flags);
+        return;
+    }
     rust_timer_slots[i].handler = nullptr;
     rust_timer_slots[i].ctx = nullptr;
-    rust_timer_slots[i].active = false;
+    rust_timer_slots[i].stopping = true;
     rust_timer_lock.write_unlock_irq_restore(flags);
 
     kernel::TimerTable::get_instance().stop_timer(get_timer_adapter(i));
+
+    flags = rust_timer_lock.write_lock_irq_save();
+    rust_timer_slots[i].stopping = false;
+    rust_timer_slots[i].active = false;
+    rust_timer_lock.write_unlock_irq_restore(flags);
 }
 
 } /* extern "C" */
