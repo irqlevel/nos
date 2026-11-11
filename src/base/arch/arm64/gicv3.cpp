@@ -193,6 +193,22 @@ void Gic::enable_irq(u32 int_id, ulong mpidr, bool edge)
         1U << (int_id % 32));
 }
 
+void Gic::disable_irq(u32 int_id)
+{
+    BUG_ON(int_id >= 1020);
+
+    if (int_id < 32)
+    {
+        gic_write32(redist_base_for_cpu() + SGI_OFFSET + GICR_ICENABLER0, 1U << int_id);
+        return;
+    }
+
+    /* Done once the distributor says the write is no longer pending */
+    gic_write32(gicd_base_ + GICD_ICENABLER + (int_id / 32) * 4, 1U << (int_id % 32));
+    while (gic_read32(gicd_base_ + GICD_CTLR) & CTLR_RWP)
+        ;
+}
+
 void Gic::send_sgi(ulong target_cpu, u32 int_id)
 {
     BUG_ON(int_id >= 16);

@@ -31,6 +31,18 @@ static inline __attribute__((always_inline)) bool irq_chip_ready()
     return true; /* cpu-id reads (MPIDR) never need the GIC */
 }
 
+/* A level line with no device on it, which a self-test may register a
+   handler on and take it off again: an SPI past everything QEMU's virt
+   board wires (its platform bus ends at INTID 207). An SPI is
+   level-sensitive high, so one with nothing on it is quiet on any board. */
+static inline bool spare_level_line(u8& line)
+{
+    static const u8 SPARE_INT_ID = 250;
+
+    line = SPARE_INT_ID;
+    return true;
+}
+
 /* No-arg EOI is x86-only (LAPIC); on arm64 the IRQ dispatch loop owns
    the IAR/EOIR pairing (see arch/arm64/interrupt_arm64.cpp). */
 static inline __attribute__((always_inline)) void irq_eoi()

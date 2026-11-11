@@ -12,7 +12,13 @@ the ITS. Drivers see the same two functions on both.
 ```cpp
 Interrupt::register_handler(handler, irq, vector);       // edge, pinned to the BSP
 Interrupt::register_level(handler, irq, vector);  // level, shared, balanced
+Interrupt::unregister_level(handler);             // a level handler off its line
 ```
+
+Both registrations say whether the handler was taken: `false`, which is also
+logged, when the line or the vector is somebody's already or the line is
+none the interrupt controller has -- nothing is programmed then, and the
+handler's `on_interrupt_register` is not called.
 
 `register_handler` is for the edge-triggered system lines — the PIT or HPET tick,
 the 8042 keyboard, the serial port. They stay on the CPU that registered
@@ -25,6 +31,18 @@ on one GSI chain onto one vector, up to eight — and their destination CPU is
 chosen by `IrqBalance`. Chaining a level handler onto a GSI already owned by
 an edge handler is refused, because it would reprogram the pin and feed the
 edge handler phantom interrupts.
+
+`unregister_level` takes a level handler off its line again. While others
+are left on the line they go on being called, and the vector stays the
+shared stub's however few they are. With the line's last handler gone the
+line is masked at the controller -- the IO-APIC's pin on x86, the INTID
+disabled at the GIC's distributor on arm64 -- forgotten by `IrqBalance`, and
+its vector is free to be registered at again. It used to be the driver's
+slot alone that was given back: the line's entry kept the handler and the pin
+stayed unmasked, so a device that asserted the line once more interrupted
+for ever with nobody to quiet it, and the next registration chained onto the
+stale entry or was refused. Every boot under QEMU registers and lets go of a
+spare line a dozen times (`test_irq_line_unregister`).
 
 A handler is an object with a `get_handler_fn()` (the assembly stub to put in
 the IDT) and an `on_interrupt(ctx)` (used by the shared and arm64 dispatch
@@ -46,7 +64,7 @@ are (`hal/irqchip.h`: `irq_eoi`, `send_ipi`, `get_current_cpu_hw_id`,
 | `0x00`–`0x15` | CPU exceptions, registered by `ExceptionTable`. All of them panic with a register dump and a backtrace, except NMI |
 | `0x20`, `0x21`, `0x24` | Tick (PIT or HPET), 8042 keyboard, serial |
 | — | the virtio devices are Rust drivers and take one of the shared Rust slots below, on a line or as MSI-X |
-| `0x38`–`0x3F` | Legacy INTx lines requested by Rust drivers (8 slots) |
+| `0x38`–`0x3F` | Legacy INTx lines requested by Rust drivers (8 slots). A line takes the first of these vectors nothing is registered at, from its slot's own on: a slot's own may still be a shared line's, whose first handler was that slot's and has left |
 | `0x40`–`0xEF` | MSI-X vectors, handed out in order by `MsixTable::alloc_vector` |
 | `0xFC` | Posted-interrupt notification (`hal::POSTED_VECTOR`): a vCPU in its guest takes it without an exit (VT-x's posted interrupts, [the hypervisor](hypervisor.md#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)); one out of its guest only ends it |
 | `0xFD` | Local APIC timer — this CPU's tick, and the deadline of a task asleep on it: one-shot ([the local timer](scheduler.md#the-local-timer)) |
@@ -91,7 +109,11 @@ driven is one: the MADT's whose pins start at GSI 0, the legacy IRQs' (or,
 on a machine with none such, the first listed) -- a machine may have several,
 as AMD's does, the FCH's at GSI 0 and the GNB's past it, and the driver
 takes a GSI for the index of its pin. An override naming a GSI past 255, or
-an IRQ overridden once already, is left out and said.
+an IRQ overridden once already, is left out and said. A GSI past the pins the
+IO-APIC says it has is refused: a pin's entry is two registers whose index is
+a byte, so there are 120 pins at most, and the write for pin 120 used to land
+on the IO-APIC's id and the one for 128 on pin 0's entry, the timer's -- a
+PCI device with no line says 0xFF for it.
 `register_level` first asks ACPI for the GSI the ISA IRQ maps to and for the
 MADT polarity flags (bits [1:0]: 00 = bus default, 01 = active high,
 11 = active low; PCI's bus default is active low), then asks `IrqBalance`
