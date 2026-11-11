@@ -265,6 +265,12 @@ extern "C" void rust_ipc_module_gone(const char*, ulong)
     fuzz::host_hal_unreachable("rust_ipc_module_gone");
 }
 
+/* Nor the bridge's, of the timers and handlers a module left */
+void kernel::sweep_module_slots(ulong, ulong, const char*)
+{
+    fuzz::host_hal_unreachable("sweep_module_slots");
+}
+
 /* Nor the rest of a module's take-down: its commands and providers closed
    and drained */
 extern "C" void rust_mgmt_close_range(ulong, ulong)

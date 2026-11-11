@@ -337,11 +337,7 @@ void Pci::write_dword(u16 bus, u16 slot, u16 func, u16 offset, u32 value)
 void Pci::write_word(u16 bus, u16 slot, u16 func, u16 offset, u16 value)
 {
     ulong flags = config_lock().lock_irq_save();
-    u32 dword = config_read_dword_raw(bus, slot, func, offset);
-    u16 shift = (offset & 2) * 8;
-    dword &= ~(0xFFFF << shift);
-    dword |= ((u32)value << shift);
-    config_write_dword_raw(bus, slot, func, offset, dword);
+    hal::pci_config_write16(bus, slot, func, offset, value);
     config_lock().unlock_irq_restore(flags);
 }
 
@@ -354,11 +350,7 @@ u8 Pci::read_byte(u16 bus, u16 slot, u16 func, u16 offset)
 void Pci::write_byte(u16 bus, u16 slot, u16 func, u16 offset, u8 value)
 {
     ulong flags = config_lock().lock_irq_save();
-    u32 dword = config_read_dword_raw(bus, slot, func, offset);
-    u16 shift = (offset & 3) * 8;
-    dword &= ~(0xFF << shift);
-    dword |= ((u32)value << shift);
-    config_write_dword_raw(bus, slot, func, offset, dword);
+    hal::pci_config_write8(bus, slot, func, offset, value);
     config_lock().unlock_irq_restore(flags);
 }
 
@@ -450,16 +442,40 @@ u8 Pci::get_revision_id(u16 bus, u16 device, u16 function)
 
 void Pci::scan()
 {
+    /* The header type's bit that says a device has functions past its
+       first (PCI 3.0, 6.2.1) */
+    static const u16 HEADER_TYPE = 0x0E;
+    static const u8 HEADER_MULTI_FUNCTION = 0x80;
+
+    ulong found = 0;
+
     device_count_ = 0;
 	for(u32 bus = 0; bus < 256; bus++)
     {
         for(u32 slot = 0; slot < 32; slot++)
         {
+            bool multi_function = false;
+
             for(u32 function = 0; function < 8; function++)
             {
                 u16 vendor = get_vendor_id(bus, slot, function);
                 if(vendor == 0xffff)
+                {
+                    /* No function 0, no device: the others are its */
+                    if (function == 0)
+                        break;
                     continue;
+                }
+
+                /* Functions past the first only where function 0 says there
+                   are any. A device of one function need not decode the
+                   function number at all, and answers for all eight: it was
+                   listed eight times over, and a driver would have taken it
+                   as many. */
+                if (function == 0)
+                    multi_function = (read_byte(bus, slot, 0, HEADER_TYPE) & HEADER_MULTI_FUNCTION) != 0;
+                else if (!multi_function)
+                    break;
 
                 u16 device = get_device_id(bus, slot, function);
                 u16 cls = get_class_id(bus, slot, function);
@@ -470,6 +486,7 @@ void Pci::scan()
                 klog(0, "vnd %s(0x%lX) dev %s(0x%lX) %s(0x%lX) %s(0x%lX) p 0x%lX r 0x%lX",
                     vendor_to_str(vendor), (ulong)vendor, device_to_str(vendor, device), (ulong)device, class_to_str(cls), (ulong)cls, sub_class_to_str(cls, scls), (ulong)scls, (ulong)prog_if, (ulong)rev_id);
 
+                found++;
                 if (device_count_ < MAX_DEVICES)
                 {
                     auto& d = devices_[device_count_];
@@ -490,6 +507,11 @@ void Pci::scan()
             }
         }
     }
+
+    /* Said: a device past the table is one no driver is shown */
+    if (found > device_count_)
+        klog(0, "pci: %lu devices, %lu of them kept: the rest have no driver looking for them", found,
+            device_count_);
 
     /* Firmware programs BARs on x86; bare -kernel arm64 must assign them. */
     hal::pci_assign_resources(devices_, device_count_, sizeof(DeviceInfo));

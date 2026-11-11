@@ -107,6 +107,10 @@ void busy_wait(ulong nano_secs)
 
 ulong get_wall_time_secs()
 {
+    /* 0 for no clock, as on x86 (kernel/time.cpp) */
+    if (boot_epoch_secs == 0)
+        return 0;
+
     return boot_epoch_secs + get_boot_time().nano_secs / consts::NANO_SECS_IN_SEC;
 }
 

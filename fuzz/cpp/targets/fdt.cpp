@@ -755,6 +755,10 @@ void fallbacks(Expected& e)
         e.gicd_size = 0x10000;
         e.gicr_base = 0x080A0000;
         e.gicr_size = 0xF60000;
+        /* The ITS of the board assumed, with its GIC: a tree that gives a
+           GIC and no ITS has none */
+        if (e.its_base == 0)
+            e.its_base = 0x08080000;
     }
     if (e.pl011_base == 0)
         e.pl011_base = 0x09000000;
@@ -766,8 +770,6 @@ void fallbacks(Expected& e)
         e.pl031_int_id = 34;
     if (e.timer_int_id == 0)
         e.timer_int_id = 27;
-    if (e.its_base == 0)
-        e.its_base = 0x08080000;
     if (e.ecam_base == 0)
     {
         e.ecam_base = 0x4010000000ULL;

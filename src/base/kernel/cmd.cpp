@@ -28,6 +28,8 @@
 #include <mm/memory_map.h>
 #include <mm/new.h>
 #include <mm/heap_usage.h>
+#include <mm/alloc_sites.h>
+#include "memsites.h"
 #include <lib/unique_ptr.h>
 #include <lib/grub_env.h>
 
@@ -203,7 +205,9 @@ static void cmd_uptime(const char* args, stdlib::Printer& con)
 {
     (void)args;
     auto time = get_boot_time();
-    con.printf("%lu.%lu\n", time.get_secs(), time.get_usecs());
+    /* Six digits of microseconds: without the zeros 5 s and 42 us read as
+       5.42 */
+    con.printf("%lu.%06lu\n", time.get_secs(), time.get_usecs());
 }
 
 static void cmd_date(const char* args, stdlib::Printer& con)
@@ -261,7 +265,8 @@ static void cmd_date(const char* args, stdlib::Printer& con)
     }
     ulong d = days + 1;
 
-    con.printf("%lu-%lu-%lu %lu:%lu:%lu UTC\n", y, mo, d, h, m, s);
+    /* Two digits each: 9:05:03 was printed 9:5:3 */
+    con.printf("%lu-%02lu-%02lu %02lu:%02lu:%02lu UTC\n", y, mo, d, h, m, s);
 }
 
 /* Percentages are per CPU, the way top has always reported them: a thread
@@ -899,10 +904,7 @@ static void cmd_sched_probe(const char* args, stdlib::Printer& con)
     p->stop.set(1);
     p->ev.signal();
     for (ulong i = 0; i < started; i++)
-    {
         tasks[i]->wait();
-        tasks[i]->put();
-    }
 
     if (!ok)
     {
@@ -929,6 +931,14 @@ static void cmd_sched_probe(const char* args, stdlib::Printer& con)
             con.printf(" %s %lu", tasks[i]->get_name(), (ran[i] * 1000) / elapsed);
         con.printf("\n");
     }
+
+    /* Let go of only now: the names above are the tasks' own, and this
+       reference is the last once a task has exited and its CPU's idle loop
+       has reaped it -- which, the tasks being that CPU's only work, is at
+       once. They used to be put before the report, which then read each
+       name out of a task freed. */
+    for (ulong i = 0; i < started; i++)
+        tasks[i]->put();
 
     p->~SchedProbe();
     mm::free(p);
@@ -1444,7 +1454,7 @@ static void cmd_profile(const char* args, stdlib::Printer& con)
     auto& profiler = Profiler::get_instance();
     if (!profiler.start())
     {
-        con.printf("profile: could not start\n");
+        con.printf("profile: could not start -- another run is on, or there is no memory for its samples\n");
         return;
     }
 
@@ -1457,6 +1467,8 @@ static void cmd_profile(const char* args, stdlib::Printer& con)
     con.printf("\n");
 
     profiler.report(con, pid, chains);
+    /* The samples are this run's until here */
+    profiler.finish();
 }
 
 static void cmd_stacks(const char* args, stdlib::Printer& con)
@@ -1529,6 +1541,55 @@ static void cmd_memcheck(const char* args, stdlib::Printer& con)
 {
     (void)args;
     mm::PageTable::get_instance().check_free_list(con);
+}
+
+/* memsites: what Rust's heap holds, by where it was allocated
+   (kernel/memsites.h) -- on, off, the report of the top sites, the dump
+   scripts/memsites.py names to files and lines, the pools by owner */
+static void cmd_memsites(const char* args, stdlib::Printer& con)
+{
+    static const ulong DEFAULT_TOP = 20;
+    static const ulong MAX_TOP = 1000;
+
+    const char* end;
+    const char* tok = stdlib::next_token(args, end);
+    char word[16];
+    word[0] = '\0';
+    if (tok)
+        stdlib::token_copy(tok, end, word, sizeof(word));
+
+    auto& sites = mm::AllocSites::get_instance();
+    ulong top = DEFAULT_TOP;
+    if (stdlib::str_cmp(word, "on") == 0)
+    {
+        if (sites.enable())
+            con.printf("memsites: on -- the blocks Rust allocates from now are given their sites\n");
+        else
+            con.printf("memsites: no memory for its tables, still off\n");
+        return;
+    }
+    if (stdlib::str_cmp(word, "off") == 0)
+    {
+        sites.disable();
+        con.printf("memsites: off -- the blocks given sites keep them until they are freed\n");
+        return;
+    }
+    if (stdlib::str_cmp(word, "dump") == 0)
+    {
+        memsites::dump(con);
+        return;
+    }
+    if (stdlib::str_cmp(word, "tags") == 0)
+    {
+        memsites::tags(con);
+        return;
+    }
+    if (word[0] != '\0' && (!stdlib::parse_ulong(word, top) || top == 0 || top > MAX_TOP))
+    {
+        con.printf("usage: memsites [on|off|dump|tags|N, 1-%lu]\n", MAX_TOP);
+        return;
+    }
+    memsites::report(con, top);
 }
 
 static void cmd_meminfo(const char* args, stdlib::Printer& con)
@@ -1702,7 +1763,10 @@ static void cmd_grubenv(const char* args, stdlib::Printer& con)
         char assignment[GRUBENV_ASSIGNMENT_SIZE];
         stdlib::token_copy(tok_start, end, assignment, sizeof(assignment));
 
-        const char* sep = stdlib::str_chr_once(assignment, '=');
+        /* The first '=': what follows is the value, whatever is in it. An
+           assignment with a second one was refused, and a value can have
+           one -- a kernel's arguments do. */
+        const char* sep = stdlib::str_chr(assignment, '=');
         if (sep == nullptr || sep == assignment)
         {
             con.printf("%s: expected name=value\n", assignment);
@@ -1830,6 +1894,22 @@ static void panic_off_stack(void* ctx)
     PANIC("user requested panic, off a task's stack");
 }
 
+/* For `panic overflow`: frames one under another until there is no stack
+   left for the next. The flag is nobody's to set: it is what keeps the
+   compiler from seeing a function that never returns, and the sum after the
+   call from making a loop of it. */
+static volatile ulong panic_overflow_stop;
+
+static __attribute__((noinline)) ulong panic_overflow(ulong depth)
+{
+    volatile u8 frame[256];
+
+    frame[0] = (u8)depth;
+    if (panic_overflow_stop != 0)
+        return depth;
+    return panic_overflow(depth + 1) + frame[0];
+}
+
 static void cmd_panic(const char* args, stdlib::Printer& con)
 {
     const char* end;
@@ -1857,6 +1937,8 @@ static void cmd_panic(const char* args, stdlib::Printer& con)
         // cppcheck-suppress zerodiv
         volatile int x = 1 / zero;
         (void)x;
+        /* Still here: the division trapped nothing */
+        con.printf("no fault here: a division by zero is none on this architecture\n");
     }
     else if (stdlib::str_cmp(type, "ud") == 0)
     {
@@ -1875,15 +1957,21 @@ static void cmd_panic(const char* args, stdlib::Printer& con)
         interrupt_disable();
         hal::run_on_stack((ulong)&off_stack[sizeof(off_stack)], panic_off_stack, nullptr);
     }
+    else if (stdlib::str_cmp(type, "overflow") == 0)
+    {
+        con.printf("running out of stack...\n");
+        con.printf("%lu frames deep, and still a stack\n", panic_overflow(0));
+    }
     else
     {
-        con.printf("usage: panic [pf|div0|ud|df|offstack]\n");
+        con.printf("usage: panic [pf|div0|ud|df|offstack|overflow]\n");
         con.printf("  (no arg) - direct panic\n");
         con.printf("  pf       - page fault (null deref)\n");
         con.printf("  div0     - divide by zero\n");
         con.printf("  ud       - invalid opcode\n");
         con.printf("  df       - double fault, on its own stack (x86-64)\n");
         con.printf("  offstack - panic on a stack that is no task's\n");
+        con.printf("  overflow - run this task's stack out, into the page under it\n");
     }
 }
 
@@ -2144,7 +2232,12 @@ static void rc_show(stdlib::Printer& con)
         ulong n = (len < SCRIPT_LINE_MAX) ? len : SCRIPT_LINE_MAX;
         stdlib::mem_cpy(shown, line, n);
         shown[n] = '\0';
-        con.printf("%lu  %s\n", number, shown);
+        /* The line as it is: with its number in one format it was a few
+           bytes more than the formatter holds when as long as a line may
+           be, and lost its end */
+        con.printf("%lu  ", number);
+        con.print_string(shown);
+        con.print_string("\n");
     }
     if (number == 0)
         con.printf("rc: %s is empty\n", RC_PATH);
@@ -2247,6 +2340,18 @@ static bool rc_rewrite(ulong skip, const char* add, stdlib::Printer& con)
         text[pos++] = '\n';
     }
 
+    /* Held to the limit as it is written, not as it was read: a last line
+       that had no newline has one now, a byte the look above did not count.
+       At the limit that byte was written -- within the buffer, which has
+       one to spare -- and left a script one byte longer than `rc` will
+       read whole, which no `rc add` or `rc del` would touch again. */
+    if (pos > SCRIPT_SIZE_MAX)
+    {
+        mm::free(text);
+        con.printf("rc: %s would pass %lu bytes\n", RC_PATH, SCRIPT_SIZE_MAX);
+        return false;
+    }
+
     bool ok = kernel_file_write(RC_PATH, stdlib::str_len(RC_PATH), text, pos) == 0;
     mm::free(text);
     if (!ok)
@@ -2282,7 +2387,11 @@ static void cmd_rc(const char* args, stdlib::Printer& con)
         else if (len > SCRIPT_LINE_MAX)
             con.printf("rc: at most %lu characters a line\n", SCRIPT_LINE_MAX);
         else if (rc_rewrite(0, rest, con))
-            con.printf("rc: added to %s: %s\n", RC_PATH, rest);
+        {
+            con.printf("rc: added to %s: ", RC_PATH);
+            con.print_string(rest);
+            con.print_string("\n");
+        }
     }
     else if (stdlib::str_cmp(verb, "del") == 0)
     {
@@ -2342,6 +2451,7 @@ static const CmdEntry COMMANDS[] = {
     { "memusage",  cmd_memusage,  "memusage - show memory usage stats" },
     { "meminfo",   cmd_meminfo,   "meminfo - show the firmware memory map and what of it is used" },
     { "memcheck",  cmd_memcheck,  "memcheck - verify no reserved page reached the free list" },
+    { "memsites",  cmd_memsites,  "memsites [on|off|dump|tags|N] - Rust's heap by where it was allocated" },
     { "irqstat",   cmd_irqstat,   "irqstat - show interrupt statistics" },
     { "pci",       cmd_pci,       "pci - show pci devices" },
     { "grubenv",   cmd_grubenv,   "grubenv <path> [name=value ...] - show or set GRUB environment variables" },
@@ -2351,7 +2461,7 @@ static const CmdEntry COMMANDS[] = {
     { "rc",        cmd_rc,        "rc [add <command line>|del <n>|clear|run] - show or edit /etc/rc, run at boot" },
     { "version",   cmd_version,   "version - show kernel version" },
     { "bt",        cmd_bt,        "bt <pid> - show task backtrace" },
-    { "panic",     cmd_panic,     "panic [pf|div0|ud|df|offstack] - trigger kernel panic" },
+    { "panic",     cmd_panic,     "panic [pf|div0|ud|df|offstack|overflow] - trigger kernel panic" },
     { "poweroff",  cmd_poweroff,  "poweroff - power off (ACPI S5)" },
     { "shutdown",  cmd_poweroff,  nullptr },
     { "reboot",    cmd_reboot,    "reboot - reset system" },
@@ -2364,8 +2474,14 @@ static void cmd_help(const char* args, stdlib::Printer& con)
     (void)args;
     for (ulong i = 0; COMMANDS[i].name != nullptr; i++)
     {
+        /* As it is, not through a format: a help line is as long as it
+           needs to be, and the formatter's buffer cut the long ones short,
+           their newline with the rest */
         if (COMMANDS[i].help != nullptr)
-            con.printf("%s\n", COMMANDS[i].help);
+        {
+            con.print_string(COMMANDS[i].help);
+            con.print_string("\n");
+        }
     }
 
     Cmd::get_instance().dynamic_help(con);
@@ -2486,6 +2602,13 @@ ulong Cmd::register_dynamic(const char* name, ulong name_len, const char* help, 
         if (stdlib::str_cmp(COMMANDS[i].name, key) == 0)
             return 0;
     }
+
+    /* A help longer than is kept is said, here before the lock: `help`
+       would show it cut in the middle of a word and nothing else would say
+       why (kcore::cmd::HELP_MAX is the same number, for a module to hold
+       its own to at compile time) */
+    if (help != nullptr && help_len > DYNAMIC_HELP_MAX)
+        klog(0, "cmd: %s's help is %lu characters, %lu are kept", key, help_len, DYNAMIC_HELP_MAX);
 
     stdlib::AutoLock lock(dynamic_lock_);
 
@@ -2701,7 +2824,10 @@ void Cmd::dynamic_help(stdlib::Printer& out)
 
         /* Printed without the lock: a console line can take a while */
         if (help[0] != '\0')
-            out.printf("%s\n", help);
+        {
+            out.print_string(help);
+            out.print_string("\n");
+        }
     }
 }
 

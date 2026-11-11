@@ -17,8 +17,18 @@ public:
 
     void enable();
 
-    void set_irq(u8 irq, u64 apic_id, u8 vector);
-    void set_irq_level(u8 irq, u64 apic_id, u8 vector, bool active_high);
+    /* Whether irq -- a GSI, taken for the index of a pin -- is a pin this
+       IO-APIC has: fewer than it reported at enable(), and none before */
+    bool has_pin(u8 irq) const;
+
+    /* A pin programmed and unmasked. False, with nothing written, for an
+       irq that is no pin (has_pin). */
+    bool set_irq(u8 irq, u64 apic_id, u8 vector);
+    bool set_irq_level(u8 irq, u64 apic_id, u8 vector, bool active_high);
+
+    /* A pin masked, what it was programmed with otherwise as it is: an
+       interrupt of its already in service ends as any other */
+    void mask_irq(u8 irq);
 
     /* Rewrite only the destination of an already programmed entry, and
        return the apic id written: check_dest's, should the one asked for be
@@ -66,6 +76,18 @@ private:
     static const ulong APIC_VER = 0x1;
     static const ulong APIC_ARB = 0x2;
     static const ulong RED_TBL = 0x10;
+
+    /* A pin's redirection entry is two registers from RED_TBL on, and a
+       register's index is a byte: the pins that can be reached at all.
+       Intel's PCHs have exactly this many. */
+    static const size_t MAX_PINS = (0x100 - RED_TBL) / 2;
+
+    /* The pins enable() found, no more than MAX_PINS: an irq past them
+       is refused. Its entry's registers used to be written all the same,
+       their index wrapping in its byte -- irq 120's onto the IO-APIC's id,
+       128's onto pin 0's entry, the timer's. A PCI device with no line
+       says 0xFF for it. */
+    size_t pins_;
 
     static const ulong DELIV_MODE_SHIFT = 8;
     static const ulong DEST_MODE_SHIFT = 11;

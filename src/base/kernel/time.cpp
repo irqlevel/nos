@@ -196,6 +196,12 @@ void busy_wait(ulong nano_secs)
 
 ulong get_wall_time_secs()
 {
+    /* 0 for no clock: with no RTC read there is no epoch to add the uptime
+       to, and the uptime by itself was returned -- a date in January 1970,
+       which `date` printed and TLS judged certificates by */
+    if (rtc_epoch_secs == 0)
+        return 0;
+
     return rtc_epoch_secs + get_boot_time().get_secs();
 }
 

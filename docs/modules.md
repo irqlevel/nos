@@ -280,6 +280,10 @@ one order (`ModuleTable::take_down`), whatever module it is:
    running or able to start;
 5. **what the drop left registered is taken off**, each said in the log as
    the module's leaving it behind, and the mailboxes it left open are closed;
+   so are a timer it left running and an interrupt handler -- a line's or an
+   MSI-X entry's -- it left registered: the bridge's slots whose code is in
+   its image (`sweep_module_slots`), which would otherwise call into pages
+   about to be freed;
 
 and only then are its pages unmapped and freed. `rmmod` must not be run from
 the module's own command, which would wait for itself.
@@ -309,9 +313,15 @@ $ dmesg 5 module:
 ```
 
 `poweroff` and `reboot` unload every module that can be unloaded, newest
-first, once the shells have stopped and before the filesystems are unmounted
-and the soft IRQs stop -- so a module's exit still has the kernel services it
-may need, and nothing of the module is left running while they go.
+first, before the filesystems are unmounted and the soft IRQs stop -- so a
+module's exit still has the kernel services it may need, and nothing of the
+module is left running while they go. The shells are stopped after the
+modules, not before: a shell may be inside a module's command that returns
+only when its module is told to stop -- an `hv boot` on the console as
+`poweroff` comes over SSH -- and the order above is what gets it out. From the
+moment the halt begins no module is loaded (`insmod` says the machine is going
+down); a load another task is in the middle of is waited for, ten seconds at
+most, and unloaded with the rest.
 
 ## What a module may call
 

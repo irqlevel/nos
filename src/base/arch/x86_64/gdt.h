@@ -49,6 +49,16 @@ public:
        descriptor is rewritten first, which clears the busy bit ltr sets. */
     void setup_tss_self(ulong cpu_index);
 
+    /* The boot CPU's TSS before its index can be had: the first slot's.
+       #DF's gate names IST1 from the first IDT load on
+       (ExceptionTable::register_exception_handlers), and until TR is loaded
+       there is no TSS to take IST1 from: a double fault anywhere in main2 --
+       its self-tests among it -- found no stack at all, a triple fault, the
+       machine reset with nothing said. setup_tss_self takes over once the
+       index is known, before any other CPU is started; the slot is then
+       whichever CPU's index it is, written again by that CPU. */
+    void setup_boot_tss();
+
     /* Must equal MAX_CPUS (static_assert in gdt.cpp); gdt.h cannot include
        cpu.h without an include cycle. */
     static const ulong TSS_MAX_CPUS = 64;
@@ -63,6 +73,7 @@ private:
     } __attribute((packed));
 
     static const ulong TSS_ENTRY_BASE = 2; /* null, code, then TSS pairs */
+    static const ulong BOOT_TSS_SLOT = 0;
     /* What a double fault's report runs on, all of it: one, the netconsole
        sending it, went 5688 bytes deep here (stack_probe, on a build for the
        purpose) -- past the page this was, into the next CPU's. */

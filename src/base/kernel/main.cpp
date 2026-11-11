@@ -19,6 +19,7 @@
 #include "dmesg.h"
 #include "watchdog.h"
 #include "parameters.h"
+#include "memsites.h"
 #include "tracepoint.h"
 #include "console.h"
 #include "input.h"
@@ -253,11 +254,12 @@ __attribute__((noinline)) void ap_main2()
        boot64.asm, which maps exactly two windows: the low 4GiB identity and
        the same 4GiB at KERNEL_SPACE_BASE. Nothing here may touch a virtual
        address outside them -- and the console is one. map_mmio_region places a
-       device at phys_addr + KERNEL_SPACE_BASE, so a framebuffer above 4GiB (the
-       Raptor Lake iGPU aperture sits at 0x40_0000_0000) lands at a VA the
-       boot table has no L3 entry for. An AP has no IDT yet either, so that
-       page fault is a triple fault: the machine resets during start_all with
-       nothing on the screen and nothing in any log.
+       device in a window of its own (PageTable::MMIO_WINDOW), which the boot
+       table does not map at all -- as it had no L3 entry for a framebuffer
+       above 4GiB when a device was at phys_addr + KERNEL_SPACE_BASE (the
+       Raptor Lake iGPU aperture sits at 0x40_0000_0000). An AP has no IDT
+       yet either, so that page fault is a triple fault: the machine resets
+       during start_all with nothing on the screen and nothing in any log.
 
        Hence the order: NXE first (the W^X page table sets NX bits, which
        fault as reserved without it), then the real page table, then the GDT
@@ -292,6 +294,11 @@ __attribute__((noinline)) void ap_main2()
     Lapic::enable();
     atomic_read_and_inc(&ap_started_flag); /* 5: LAPIC enabled */
 
+    /* This CPU's TSS as soon as its index is its own to read -- the local
+       APIC's, good from the enable above -- so that #DF has its IST stack:
+       the IDT loaded above names one (Gdt::setup_boot_tss has the why). */
+    Gdt::get_instance().setup_tss_self(CpuTable::get_instance().get_current_cpu_id());
+
     /* KVM updates a pvclock entry only for the vcpu that armed it; without
        this the AP would read the BSP's entry with its own TSC. No-op when
        kvmclock is unavailable. */
@@ -321,16 +328,15 @@ __attribute__((noinline)) void ap_main2()
         klog(0, "Cpu %lu: C1E auto-promotion %s by firmware, now %s", cpu.get_index(), c1e_was ? "on" : "off",
             c1e_now ? "on" : "off");
 
-    /* GDT is loaded (above); give this CPU its TSS so #DF has an IST stack */
-    Gdt::get_instance().setup_tss_self(cpu.get_index());
-
     klog(0, "Cpu %lu rsp 0x%lX (static stack)", cpu.get_index(), get_rsp());
 
+    /* A panic, as the boot CPU's is, and not a return: ap_main left the
+       stack it was entered on for this one (ALLOC_CPU_STACK), and its
+       epilogue would pop this stack's fill for a return address -- an idle
+       task that could not be had, for want of memory, said as a fault at
+       0x5A5A5A5A5A5A5A5A. */
     if (!cpu.run(ap_startup, nullptr))
-    {
-        klog(0, "Can't run cpu %lu task", cpu.get_index());
-        return;
-    }
+        PANIC("Can't run cpu %lu task", cpu.get_index());
 }
 
 extern "C" void ap_main()
@@ -526,19 +532,26 @@ void bp_startup(void* ctx)
         {
             /* HPET in legacy replacement mode: timer 0 replaces PIT on IRQ 0.
                Use the same GSI that PIT would use (MADT may remap IRQ 0 → GSI 2). */
-            Interrupt::register_handler(hpet, acpi.get_gsi_by_irq(0x0), 0x20);
+            if (!Interrupt::register_handler(hpet, acpi.get_gsi_by_irq(0x0), 0x20))
+                PANIC("no tick: the HPET's interrupt (gsi %lu) was refused", (ulong)acpi.get_gsi_by_irq(0x0));
             klog(0, "Using HPET as tick source (legacy replacement, IRQ 0)");
         }
         else
         {
             // PIT is ISA IRQ 0; ACPI MADT may remap it to GSI 2
-            Interrupt::register_handler(pit, acpi.get_gsi_by_irq(0x0), 0x20);
+            if (!Interrupt::register_handler(pit, acpi.get_gsi_by_irq(0x0), 0x20))
+                PANIC("no tick: the PIT's interrupt (gsi %lu) was refused", (ulong)acpi.get_gsi_by_irq(0x0));
             pit.setup();
             klog(0, "Using PIT as tick source");
         }
 
-        Interrupt::register_handler(kbd, acpi.get_gsi_by_irq(0x1), 0x21);
-        Interrupt::register_handler(serial, acpi.get_gsi_by_irq(0x4), 0x24);
+        /* A machine boots without either: the refusal has been said */
+        (void)Interrupt::register_handler(kbd, acpi.get_gsi_by_irq(0x1), 0x21);
+        /* Only a UART that is there has a line to answer for: on a machine
+           with none the handler was registered all the same, to read a port
+           nothing decodes if the line ever moved */
+        if (serial.is_present())
+            (void)Interrupt::register_handler(serial, acpi.get_gsi_by_irq(0x4), 0x24);
 
         rust_virtio_blk_init();
         rust_virtio_scsi_init();
@@ -801,18 +814,31 @@ void bp_startup(void* ctx)
                     klog(0, "Reboot requested");
                 else
                     klog(0, "Shutdown requested");
-                rust_net_stop_shell();
-                rust_usb_stop();
-                cmd.stop();
-                cmd.stop_dhcp();
                 break;
             }
         }
 
-        /* With the shells gone nothing calls into a module any more: its
-           exit runs now, while the files, block I/O and soft IRQs it may
-           still need are all there */
+        /* The modules first, before the shells are waited for: a shell may
+           be inside a module's command that returns only when its module is
+           told to stop -- an `hv boot` on the console as `poweroff` comes
+           over SSH -- and the halt used to wait for that shell before any
+           module had been told anything: for ever, a join's report every ten
+           seconds. A take-down needs no shell gone (ModuleTable::take_down:
+           the module's commands closed, its stop, their calls waited out,
+           its exit), and no module is loaded from here on. The files, block
+           I/O and soft IRQs an exit may still need are all there.
+
+           The log back on the console first: the shell that keeps it off
+           while it has the console is stopped after the modules now, and
+           what their exits say -- a guest waited for -- is the halt's to
+           show, as it was when the shell went first. */
+        Klog::get_instance().set_console_suppressed(false);
         ModuleTable::get_instance().unload_all();
+
+        rust_net_stop_shell();
+        rust_usb_stop();
+        cmd.stop();
+        cmd.stop_dhcp();
 
         /* The management bus after the modules -- whose providers their exits
            took off it -- and before the files go: its jobs are told to stop and
@@ -935,6 +961,8 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
     klog(0, "Set new cr3 0x%lX", get_cr3());
 
     Gdt::get_instance().save();
+    /* A stack for a double fault before the IDT that names it is loaded */
+    Gdt::get_instance().setup_boot_tss();
     ExceptionTable::get_instance().register_exception_handlers();
     Idt::get_instance().save();
 
@@ -1056,9 +1084,13 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
                 (c1e_was && c1e_now) ? " (c1e=firmware)" : "");
         ulong t0 = (ulong)kernel_start, t1 = (ulong)kernel_text;
         ulong r1 = (ulong)kernel_rodata, e = (ulong)kernel_end;
-        pt.protect_range(t0, t1 - t0, false, true);   /* RX */
-        pt.protect_range(t1, r1 - t1, false, false);  /* RO+NX */
-        pt.protect_range(r1, e - r1, true, false);    /* RW+NX */
+        /* All three, or no boot: left as it was mapped the image is
+           writable and executable throughout, and nothing after this would
+           say so -- the results used to be dropped */
+        if (!pt.protect_range(t0, t1 - t0, false, true) ||   /* RX */
+            !pt.protect_range(t1, r1 - t1, false, false) ||  /* RO+NX */
+            !pt.protect_range(r1, e - r1, true, false))      /* RW+NX */
+            PANIC("W^X: the kernel image could not be protected");
         klog(0, "W^X: text [0x%lX,0x%lX) rodata [0x%lX,0x%lX) data [0x%lX,0x%lX)",
             t0, t1, t1, r1, r1, e);
         if (Parameters::get_instance().is_wx_probe_text())
@@ -1114,6 +1146,8 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
     }
 
     mm::AllocatorImpl::get_instance(&mm::PageAllocatorImpl::get_instance());
+    /* memsites=on: with the heap, before the first of Rust's allocations */
+    memsites::setup();
 
     if (Parameters::get_instance().is_wx_probe_heap())
         wx_probe_heap();

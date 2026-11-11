@@ -8,6 +8,7 @@
 #include <mm/new.h>
 #include <drivers/hpet.h>
 #include <arch/x86_64/lapic.h>
+#include <hal/irqchip.h>
 
 namespace kernel
 {
@@ -196,7 +197,10 @@ bool Tsc::enable_kvm_clock_self()
     if (pv_clock_ == nullptr)
         return false;
 
-    ulong idx = Lapic::get_apic_id();
+    /* This CPU's id as the irq chip's HAL has it -- its GS slot once the
+       local APIC is on, the APIC's own register before -- and not the
+       register every time: see kvm_clock_time */
+    ulong idx = hal::get_current_cpu_hw_id();
     if (idx >= PV_CLOCK_ENTRY_COUNT)
     {
         klog(0, "TSC: apic id %lu exceeds pvclock entries", idx);
@@ -227,7 +231,14 @@ stdlib::Time Tsc::kvm_clock_time()
        TSC. */
     ulong irq = preempt_irq_save();
 
-    PvClockVcpuTimeInfo* pv = &pv_clock_[Lapic::get_apic_id() % PV_CLOCK_ENTRY_COUNT];
+    /* Which entry: this CPU's id from its GS slot, not from the local
+       APIC's ID register. The register is an MMIO read, and this function
+       is what stamps every log line (get_boot_time): at loglevel 4 the MMIO
+       accessors used to trace, the trace asked the time, and the time read
+       the register -- a recursion with no end but the stack's, on every KVM
+       guest whose log level was raised to look at something. A clock read
+       touches no device. */
+    PvClockVcpuTimeInfo* pv = &pv_clock_[hal::get_current_cpu_hw_id() % PV_CLOCK_ENTRY_COUNT];
 
     do {
         version = pv->version;

@@ -24,6 +24,7 @@
 #include "cmd.h"
 #include <mm/new.h>
 #include <mm/allocator.h>
+#include <mm/alloc_sites.h>
 #include <mm/heap_usage.h>
 #include <mm/page_allocator.h>
 #include <mm/page_table.h>
@@ -267,19 +268,35 @@ void* kernel_alloc(unsigned long size, unsigned long align)
     if (align == 0 || (align & (align - 1)) != 0)
         PANIC("kernel_alloc: bad align %lu", align);
 
+    /* While memsites is on, the block's owner is where it is allocated from:
+       the frames above this one (mm/alloc_sites.h) */
+    auto& sites = kernel::mm::AllocSites::get_instance();
+    ulong tag = RUST_ALLOC_TAG;
+    if (unlikely(sites.enabled()))
+    {
+        const ulong site = sites.site_tag(reinterpret_cast<ulong>(__builtin_frame_address(0)));
+        if (site != 0)
+            tag = site;
+    }
+
     /* alloc_uninit: GlobalAlloc::alloc promises nothing about the contents,
        and alloc_zeroed zeroes them on the Rust side. */
     auto& usage = kernel::mm::rust_heap_usage();
     unsigned long request = 0;
     void* raw = nullptr;
     if (rust_heap_request(size, align, request))
-        raw = kernel::mm::alloc_uninit(request, RUST_ALLOC_TAG);
+        raw = kernel::mm::alloc_uninit(request, tag);
     if (raw == nullptr)
     {
         usage.refuse();
         return nullptr;
     }
-    usage.add(size, kernel::mm::AllocatorImpl::footprint(request));
+    const size_t taken = kernel::mm::AllocatorImpl::footprint(request);
+    usage.add(size, taken);
+    /* A block of the page allocator's carries no tag: its site is noted
+       aside until its free */
+    if (tag != RUST_ALLOC_TAG && kernel::mm::AllocatorImpl::from_pages(raw))
+        sites.big_note(raw, tag, request, taken);
 
     if (align <= 8)
         return raw;
@@ -308,6 +325,9 @@ void kernel_free(void* ptr, unsigned long size, unsigned long align)
 
     if (align > 8)
         ptr = ((void**)ptr)[-1];
+    /* Out of memsites' table before the block can be anybody else's */
+    if (kernel::mm::AllocatorImpl::from_pages(ptr))
+        kernel::mm::AllocSites::get_instance().big_forget(ptr);
     kernel::mm::free(ptr);
 }
 
@@ -819,9 +839,9 @@ void* kernel_map_phys(unsigned long phys_base, unsigned long num_pages)
 
 void kernel_unmap_phys(void* virt_addr, unsigned long num_pages)
 {
-    /* map_mmio_region maps at phys_addr + KERNEL_SPACE_BASE via direct PTEs;
-     * these mappings are permanent and cannot be unmapped in the current
-     * page-table implementation. */
+    /* map_mmio_region's mappings are permanent -- the window they are in is
+     * never given back, and the same range mapped again is the mapping it
+     * has -- so there is nothing to undo. */
     (void)virt_addr;
     (void)num_pages;
 }
@@ -1308,7 +1328,7 @@ public:
     void on_interrupt_register(u8 irq, u8 vector) override
     {
         (void)irq;
-        rust_irq_slots[slot_index_].vector = vector;
+        __atomic_store_n(&rust_irq_slots[slot_index_].vector, vector, __ATOMIC_RELAXED);
     }
 
     kernel::InterruptHandlerFn get_handler_fn() override
@@ -1333,7 +1353,10 @@ public:
     }
 };
 
-static char rust_legacy_handlers_buf[RUST_IRQ_SLOT_COUNT][sizeof(RustLegacyHandler)];
+/* Aligned for what is made in it: an array of char is aligned for a char,
+   and an object with a vtable's pointer made there by placement new was
+   aligned only because the linker happened to put it so */
+alignas(RustLegacyHandler) static char rust_legacy_handlers_buf[RUST_IRQ_SLOT_COUNT][sizeof(RustLegacyHandler)];
 static bool rust_legacy_handlers_init[RUST_IRQ_SLOT_COUNT];
 
 static RustLegacyHandler& get_legacy_handler(ulong i)
@@ -1352,12 +1375,19 @@ void dispatch_rust_interrupt(kernel::Context* ctx, int slot)
 {
     (void)ctx;
 
-    /* Its records (tp::Irq). A slot's stub is installed at its own vector
-       alone, RUST_IRQ_VECTOR_BASE on (kernel_interrupt_register_level): a
-       line shared with another slot's goes through the shared dispatch. */
+    /* Its records (tp::Irq), by the vector the slot's line was registered
+       at -- one of the slots' own, RUST_IRQ_VECTOR_BASE on, and not always
+       this slot's (kernel_interrupt_register_level): a line shared with
+       another slot's goes through the shared dispatch. 0 for a slot being
+       taken down as this is read. */
     kernel::tp::Irq irq;
     if (unlikely(kernel::tp::Irq::on()))
-        irq.begin((u32)RUST_IRQ_VECTOR_BASE + (u32)slot, kernel::tp::IrqKind::Line);
+    {
+        u32 vector = 0;
+        if (slot >= 0 && (ulong)slot < RUST_IRQ_SLOT_COUNT)
+            vector = __atomic_load_n(&rust_irq_slots[slot].vector, __ATOMIC_RELAXED);
+        irq.begin(vector, kernel::tp::IrqKind::Line);
+    }
 
     /* The legacy line, counted for the same reason as the MSI-X path below:
        the driver falls back to INTx when MSI-X is unavailable, and which of
@@ -1402,25 +1432,40 @@ unsigned long kernel_interrupt_register_level(
             rust_irq_slots[i].handler = handler;
             rust_irq_slots[i].ctx = ctx;
             rust_irq_slots[i].used = true;
-            rust_irq_slots[i].vector = 0;
+            __atomic_store_n(&rust_irq_slots[i].vector, static_cast<u8>(0), __ATOMIC_RELAXED);
 
             auto& lh = get_legacy_handler(i);
             lh.slot_index_ = i;
 
+            /* The vector asked for, should the line be the first of its
+               GSI: the slot's own, or the next of the slots' vectors with
+               nothing registered at it. A slot's own may be taken though
+               the slot is free -- by a line this slot was the first on and
+               left, with others still on it (Interrupt::unregister_level)
+               -- and there are as many vectors as slots, each one in use
+               held by a slot in use: with a slot free, one of them is. */
             u8 vector = (u8)(RUST_IRQ_VECTOR_BASE + i);
-            kernel::Interrupt::register_level(lh, irq_line, vector);
+            for (ulong k = 0; k < RUST_IRQ_SLOT_COUNT; k++)
+            {
+                u8 candidate = (u8)(RUST_IRQ_VECTOR_BASE + (i + k) % RUST_IRQ_SLOT_COUNT);
+                if (kernel::Interrupt::is_vector_free(candidate))
+                {
+                    vector = candidate;
+                    break;
+                }
+            }
 
-            /* register_level is void and refuses silently (GSI owned by an
-               edge handler, vector already claimed, shared list full). Its
-               on_interrupt_register callback sets the slot's Vector; still 0
-               means no IOAPIC pin was programmed -- roll the slot back
-               instead of handing the driver a dead handle it would trust
-               (NIC enabled, no interrupts ever delivered). */
-            if (rust_irq_slots[i].vector == 0)
+            /* A refusal (the GSI owned by an edge handler or no pin of the
+               IO-APIC's, the shared list full) has programmed nothing: the
+               slot is rolled back instead of handing the driver a dead
+               handle it would trust (NIC enabled, no interrupts ever
+               delivered). */
+            if (!kernel::Interrupt::register_level(lh, irq_line, vector))
             {
                 rust_irq_slots[i].handler = nullptr;
                 rust_irq_slots[i].ctx = nullptr;
                 rust_irq_slots[i].used = false;
+                __atomic_store_n(&rust_irq_slots[i].vector, static_cast<u8>(0), __ATOMIC_RELAXED);
                 rust_irq_lock.write_unlock_irq_restore(flags);
                 klog(0, "kernel_interrupt_register_level: irq %lu refused",
                       (ulong)irq_line);
@@ -1444,10 +1489,19 @@ void kernel_interrupt_unregister(unsigned long handle)
         return;
     ulong i = handle - 1;
     ulong flags = rust_irq_lock.write_lock_irq_save();
+
+    /* Off its line first. The slot was all that used to be given back: the
+       line's entry kept the handler and the IO-APIC's pin stayed unmasked,
+       so a device that asserted the line again interrupted for ever with
+       nobody to quiet it, and the slot's next registration found its own
+       vector taken -- refused, or chained onto the line a second time. */
+    if (rust_irq_slots[i].used)
+        kernel::Interrupt::unregister_level(get_legacy_handler(i));
+
     rust_irq_slots[i].handler = nullptr;
     rust_irq_slots[i].ctx = nullptr;
     rust_irq_slots[i].used = false;
-    rust_irq_slots[i].vector = 0;
+    __atomic_store_n(&rust_irq_slots[i].vector, static_cast<u8>(0), __ATOMIC_RELAXED);
     rust_irq_lock.write_unlock_irq_restore(flags);
 
     /* Wait out an ISR mid-call on another CPU: the caller may free ctx the
@@ -1467,11 +1521,22 @@ struct RustTimerSlot
 {
     void (*handler)(void*);
     void* ctx;
+    /* Taken: from kernel_timer_start until kernel_timer_stop is done with
+       it -- its stop_timer returned, not merely its handler gone */
     bool active;
+    /* Being stopped: no second stop of it, and not yet anyone else's */
+    bool stopping;
+    /* Which timer the slot holds, counted at each start: the upper half of
+       its handle, so that a handle kept past its stop -- or stopped twice --
+       is not the handle of whoever has the slot now */
+    u32 generation;
 };
 
 static RustTimerSlot rust_timer_slots[RUST_TIMER_SLOT_COUNT];
 static kernel::RawRwSpinLock rust_timer_lock;
+
+static const ulong RUST_TIMER_SLOT_BITS = 32;
+static const ulong RUST_TIMER_SLOT_MASK = (1UL << RUST_TIMER_SLOT_BITS) - 1;
 
 class RustTimerAdapter : public kernel::TimerCallback
 {
@@ -1490,7 +1555,7 @@ public:
     }
 };
 
-static char rust_timer_adapters_buf[RUST_TIMER_SLOT_COUNT][sizeof(RustTimerAdapter)];
+alignas(RustTimerAdapter) static char rust_timer_adapters_buf[RUST_TIMER_SLOT_COUNT][sizeof(RustTimerAdapter)];
 static bool rust_timer_adapters_init[RUST_TIMER_SLOT_COUNT];
 
 static RustTimerAdapter& get_timer_adapter(ulong i)
@@ -1520,6 +1585,9 @@ unsigned long kernel_timer_start(
             rust_timer_slots[i].handler = handler;
             rust_timer_slots[i].ctx = ctx;
             rust_timer_slots[i].active = true;
+            rust_timer_slots[i].stopping = false;
+            rust_timer_slots[i].generation = rust_timer_slots[i].generation + 1;
+            const ulong generation = rust_timer_slots[i].generation;
 
             auto& ta = get_timer_adapter(i);
             ta.slot_index_ = i;
@@ -1535,7 +1603,7 @@ unsigned long kernel_timer_start(
                 return 0;
             }
             rust_timer_lock.write_unlock_irq_restore(flags);
-            return i + 1;
+            return (generation << RUST_TIMER_SLOT_BITS) | (i + 1);
         }
     }
     rust_timer_lock.write_unlock_irq_restore(flags);
@@ -1544,22 +1612,42 @@ unsigned long kernel_timer_start(
 
 void kernel_timer_stop(unsigned long handle)
 {
-    if (handle == 0 || handle > RUST_TIMER_SLOT_COUNT)
+    const ulong slot = handle & RUST_TIMER_SLOT_MASK;
+    if (slot == 0 || slot > RUST_TIMER_SLOT_COUNT)
         return;
-    ulong i = handle - 1;
+    ulong i = slot - 1;
 
-    /* Clear the slot under the lock, then release it BEFORE stop_timer. stop_timer
+    /* Clear the handler under the lock, then release it BEFORE stop_timer. stop_timer
        spin-waits for an in-flight on_tick on another CPU to finish, and on_tick
        needs rust_timer_lock in read mode; holding the write lock across that wait
        would deadlock (AB/BA). Clearing Handler first makes a racing on_tick a
-       no-op once it acquires the read lock. */
+       no-op once it acquires the read lock.
+
+       The slot stays taken across it. Freed here, as it used to be, a
+       kernel_timer_start on another CPU took it in the gap and registered
+       the slot's one adapter a second time -- and the stop_timer below,
+       which takes every entry of that adapter off, took the new timer with
+       the old: a handle to a timer that never fired, and nothing said. And
+       a handle that is not this slot's timer's -- stopped already, or the
+       slot's last tenant's -- stops nothing. */
     ulong flags = rust_timer_lock.write_lock_irq_save();
+    if (!rust_timer_slots[i].active || rust_timer_slots[i].stopping ||
+        (ulong)rust_timer_slots[i].generation != (handle >> RUST_TIMER_SLOT_BITS))
+    {
+        rust_timer_lock.write_unlock_irq_restore(flags);
+        return;
+    }
     rust_timer_slots[i].handler = nullptr;
     rust_timer_slots[i].ctx = nullptr;
-    rust_timer_slots[i].active = false;
+    rust_timer_slots[i].stopping = true;
     rust_timer_lock.write_unlock_irq_restore(flags);
 
     kernel::TimerTable::get_instance().stop_timer(get_timer_adapter(i));
+
+    flags = rust_timer_lock.write_lock_irq_save();
+    rust_timer_slots[i].stopping = false;
+    rust_timer_slots[i].active = false;
+    rust_timer_lock.write_unlock_irq_restore(flags);
 }
 
 } /* extern "C" */
@@ -1647,7 +1735,8 @@ public:
     }
 };
 
-static char rust_msix_slot_handlers_buf[RUST_MSIX_SLOT_COUNT][sizeof(RustMsixSlotHandler)];
+alignas(RustMsixSlotHandler) static char rust_msix_slot_handlers_buf[RUST_MSIX_SLOT_COUNT]
+    [sizeof(RustMsixSlotHandler)];
 static bool rust_msix_slot_handlers_init[RUST_MSIX_SLOT_COUNT];
 
 static RustMsixSlotHandler& get_msix_slot_handler(ulong i)
@@ -2586,3 +2675,62 @@ unsigned int kernel_tp_pid()
 }
 
 } /* extern "C" */
+
+namespace kernel
+{
+
+/* What a module left in the slots above as it went (ModuleTable::take_down):
+   a timer, a line's handler, an MSI-X entry's, whose code is in [lo, hi) --
+   the module's image, about to be freed. Its commands, its providers and its
+   mailboxes were taken off at its unload, and these were not: a timer it
+   had leaked went on firing, into whatever had the image's memory next.
+   Each is the module's bug, said, and stopped as its own stop would have.
+   Called as an unload is, from a task, with no lock held. */
+void sweep_module_slots(ulong lo, ulong hi, const char* name)
+{
+    for (ulong i = 0; i < RUST_TIMER_SLOT_COUNT; i++)
+    {
+        ulong handle = 0;
+        ulong flags = rust_timer_lock.write_lock_irq_save();
+        const ulong code = reinterpret_cast<ulong>(rust_timer_slots[i].handler);
+        if (rust_timer_slots[i].active && !rust_timer_slots[i].stopping && code >= lo && code < hi)
+            handle = ((ulong)rust_timer_slots[i].generation << RUST_TIMER_SLOT_BITS) | (i + 1);
+        rust_timer_lock.write_unlock_irq_restore(flags);
+
+        if (handle != 0)
+        {
+            klog(0, "module: %s left a timer running (slot %lu): stopped", name, i);
+            kernel_timer_stop(handle);
+        }
+    }
+
+    for (ulong i = 0; i < RUST_IRQ_SLOT_COUNT; i++)
+    {
+        ulong flags = rust_irq_lock.write_lock_irq_save();
+        const ulong code = reinterpret_cast<ulong>(rust_irq_slots[i].handler);
+        const bool left = rust_irq_slots[i].used && code >= lo && code < hi;
+        rust_irq_lock.write_unlock_irq_restore(flags);
+
+        if (left)
+        {
+            klog(0, "module: %s left a line's interrupt handler registered (slot %lu): taken off", name, i);
+            kernel_interrupt_unregister(i + 1);
+        }
+    }
+
+    for (ulong i = 0; i < RUST_MSIX_SLOT_COUNT; i++)
+    {
+        ulong flags = rust_msix_lock.write_lock_irq_save();
+        const ulong code = reinterpret_cast<ulong>(rust_msix_slots[i].handler);
+        const bool left = rust_msix_slots[i].used && code >= lo && code < hi;
+        rust_msix_lock.write_unlock_irq_restore(flags);
+
+        if (left)
+        {
+            klog(0, "module: %s left an MSI-X handler registered (slot %lu): taken off", name, i);
+            kernel_msix_unregister_handler(i + 1);
+        }
+    }
+}
+
+}

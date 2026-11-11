@@ -42,6 +42,12 @@ public:
 	   actually taken, and the caller must decide what to do if it was not. */
 	ulong try_lock_irq_save(bool& acquired);
 
+    /* Taken out of the watchdog's supervision, for good: off its list, and
+       no longer stamped -- nor unregistered a second time by the
+       destructor. Before the lock is shared: the console's, at its
+       setup. */
+    void unwatch();
+
 private:
     RawSpinLock(const RawSpinLock& other) = delete;
     RawSpinLock(RawSpinLock&& other) = delete;

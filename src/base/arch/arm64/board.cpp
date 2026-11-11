@@ -302,6 +302,12 @@ void Board::apply_fallbacks()
         gicd_size_ = 0x10000;
         gicr_base_ = 0x080A0000;
         gicr_size_ = 0xF60000;
+        /* And the ITS that board has beside it. Only here: a tree that
+           describes its interrupt controller and no ITS has none, and one
+           used to be taken to be at this address all the same -- its
+           registers read out of whatever is there. */
+        if (its_base_ == 0)
+            its_base_ = 0x08080000;
     }
     /* Each on its own: a device the tree placed but whose interrupt it did
        not give -- or gave as one the kernel cannot take -- would otherwise
@@ -316,8 +322,6 @@ void Board::apply_fallbacks()
         pl031_int_id_ = 34;
     if (timer_int_id_ == 0)
         timer_int_id_ = 27;
-    if (its_base_ == 0)
-        its_base_ = 0x08080000;
     if (ecam_base_ == 0)
     {
         ecam_base_ = 0x4010000000;

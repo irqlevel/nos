@@ -60,12 +60,13 @@ void* FixedPageAllocator::alloc()
 
     if (!pt.map_pages(va, pages, page_count_))
     {
-        for (size_t i = 0; i < page_count_; i++)
-            pt.free_page(pages[i]);
         /* Remote CPUs may have cached translations from the prefix map_pages
            rolled back (it only invalidates locally); flush everywhere before
-           the VA block and the pages become reusable. */
+           the VA block and the pages become reusable -- the pages too, which
+           used to go back first. */
         kernel::CpuTable::get_instance().invalidate_tlb_range(va, page_count_);
+        for (size_t i = 0; i < page_count_; i++)
+            pt.free_page(pages[i]);
         va_alloc_.free(va);
         return nullptr;
     }
@@ -122,7 +123,7 @@ bool FixedPageAllocator::unmap(void* addr, size_t count)
 
     BUG_ON(count == 0 || count > page_count_);
 
-    PageTable::get_instance().unmap_pages((ulong)addr, count, false);
+    PageTable::get_instance().unmap_pages((ulong)addr, count);
 
     kernel::CpuTable::get_instance().invalidate_tlb_range((ulong)addr, count);
     va_alloc_.free((ulong)addr);
@@ -134,11 +135,23 @@ bool FixedPageAllocator::free(void* addr)
     if (!va_alloc_.contains((ulong)addr))
         return false;
 
-    PageTable::get_instance().unmap_pages((ulong)addr, page_count_, true);
-
-    kernel::CpuTable::get_instance().invalidate_tlb_range((ulong)addr, page_count_);
+    unmap_and_free((ulong)addr);
     va_alloc_.free((ulong)addr);
     return true;
+}
+
+/* A block's pages unmapped and given back, in that order with every CPU's
+   TLB flushed between the two: a page is nobody else's while any CPU can
+   still reach it through this block's address (PageTable::unmap_pages). */
+void FixedPageAllocator::unmap_and_free(ulong va)
+{
+    auto& pt = PageTable::get_instance();
+    BUG_ON(page_count_ > MAX_PAGE_COUNT);
+    Page* frames[MAX_PAGE_COUNT];
+
+    pt.unmap_pages(va, page_count_, frames);
+    kernel::CpuTable::get_instance().invalidate_tlb_range(va, page_count_);
+    pt.free_pages(frames, page_count_);
 }
 
 bool FixedPageAllocator::contains(void* addr)
@@ -151,8 +164,7 @@ bool FixedPageAllocator::free_keeping_va(void* addr)
     if (!va_alloc_.contains((ulong)addr))
         return false;
 
-    PageTable::get_instance().unmap_pages((ulong)addr, page_count_, true);
-    kernel::CpuTable::get_instance().invalidate_tlb_range((ulong)addr, page_count_);
+    unmap_and_free((ulong)addr);
     return true;
 }
 
@@ -191,8 +203,22 @@ bool PageAllocatorImpl::setup()
     /* The large runs get a window of their own, past the blocks' */
     const ulong large_block = PageTable::MAX_LARGE_MAP_PAGES * consts::PAGE_SIZE;
     const ulong large_start = stdlib::round_up(end_address, large_block);
-    if (!large_pg_alloc_.setup(large_start, large_start + LARGE_BLOCK_COUNT * large_block,
-            PageTable::MAX_LARGE_MAP_PAGES))
+    const ulong large_end = large_start + LARGE_BLOCK_COUNT * large_block;
+
+    /* All of it inside the image's top-level entry: the windows mapped by
+       address rather than handed out here -- MMIO's, the huge pool's -- are
+       entries of their own above it, and ranges that reached one would be
+       the heap and a device given the same addresses again. Seven tenths of
+       512 GiB of RAM fit; more is a machine this layout was not made for,
+       said rather than booted. */
+    if (large_end > PageTable::IMAGE_ENTRY_END)
+    {
+        klog(0, "setup 0x%p: the ranges end at 0x%lX, past the image's top-level entry at 0x%lX", this, large_end,
+            PageTable::IMAGE_ENTRY_END);
+        return false;
+    }
+
+    if (!large_pg_alloc_.setup(large_start, large_end, PageTable::MAX_LARGE_MAP_PAGES))
     {
         return false;
     }
@@ -215,16 +241,20 @@ bool PageAllocatorImpl::setup()
 
     /* Nothing held back yet: the addresses the quarantine holds are of the
        allocators set up above */
-    for (auto& q : quarantine_)
+    static_assert(sizeof(quarantine_) / sizeof(quarantine_[0]) == sizeof(fixed_pg_alloc_) / sizeof(fixed_pg_alloc_[0]),
+        "a quarantine a size");
+    for (size_t i = 0; i < stdlib::array_size(quarantine_); i++)
     {
+        Quarantine& q = quarantine_[i];
         stdlib::AutoLock lock(q.lock);
         q.next = 0;
         q.count = 0;
+        q.limit = stdlib::min<ulong>(QUARANTINE, fixed_pg_alloc_[i].block_count() / 2);
     }
     heap_check_ = Parameters::get_instance().is_heap_check();
     if (heap_check_)
         klog(0, "mm: heapcheck=on: a freed block of the heap is unmapped, nothing kept, its address held back for "
-            "%lu frees of its size", QUARANTINE);
+            "%lu frees of its size, or for as many as half the size's addresses", QUARANTINE);
 
     return true;
 }
@@ -297,16 +327,24 @@ void PageAllocatorImpl::release_quarantined(size_t log, void* addr)
     if (!fixed_pg_alloc_[log].free_keeping_va(addr))
         PANIC("Can't free addr 0x%p", addr);
 
-    ulong oldest = 0;
+    /* The address that leaves the quarantine as this one joins it: the
+       oldest held, or this one itself where the size holds none back */
+    ulong oldest = reinterpret_cast<ulong>(addr);
     {
         Quarantine& q = quarantine_[log];
         stdlib::AutoLock lock(q.lock);
-        if (q.count == QUARANTINE)
-            oldest = q.held[q.next];
-        else
-            q.count++;
-        q.held[q.next] = reinterpret_cast<ulong>(addr);
-        q.next = (q.next + 1) % QUARANTINE;
+        if (q.limit != 0)
+        {
+            if (q.count == q.limit)
+                oldest = q.held[q.next];
+            else
+            {
+                oldest = 0;
+                q.count++;
+            }
+            q.held[q.next] = reinterpret_cast<ulong>(addr);
+            q.next = (q.next + 1) % q.limit;
+        }
     }
     if (oldest != 0)
         fixed_pg_alloc_[log].free_va(reinterpret_cast<void*>(oldest));

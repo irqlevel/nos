@@ -327,6 +327,9 @@ Cpu& CpuTable::get_current_cpu()
     return get_cpu(get_current_cpu_id());
 }
 
+/* How long the halt waits for a CPU to park */
+static const ulong PARK_TIMEOUT_NS = 10 * consts::NANO_SECS_IN_SEC;
+
 void CpuTable::exit_all_except_self()
 {
     auto& self = get_current_cpu();
@@ -339,8 +342,19 @@ void CpuTable::exit_all_except_self()
             auto& cpu = get_cpu(i);
             cpu.set_exiting();
 
+            /* Waited for, and no longer than this: a CPU wedged with its
+               interrupts off never parks, and the halt waited for it with
+               nothing said -- a machine told to turn itself off that stays
+               on, silent. Said, and the halt goes on without it. */
+            const stdlib::Time deadline = get_boot_time() + stdlib::Time(PARK_TIMEOUT_NS);
             while (!cpu.is_parked())
             {
+                if (get_boot_time() >= deadline)
+                {
+                    klog(0, "cpu %lu has not parked in %lu s: the halt goes on without it", i,
+                        PARK_TIMEOUT_NS / consts::NANO_SECS_IN_SEC);
+                    break;
+                }
                 cpu.send_ipi_self();
                 cpu_relax();
             }
@@ -348,17 +362,19 @@ void CpuTable::exit_all_except_self()
     }
 }
 
-void CpuTable::send_ipi_all_exclude(ulong exclude_index)
+void CpuTable::send_panic_ipi(ulong exclude_index)
 {
-    ulong cpu_mask = get_running_cpus();
+    ulong cpu_mask = get_running_cpus_no_lock();
     for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        if ((cpu_mask & (1UL << i)) && (i != exclude_index))
-        {
-            auto& cpu = get_cpu(i);
+        if (!(cpu_mask & (1UL << i)) || i == exclude_index)
+            continue;
 
-            cpu.send_ipi_self();
-        }
+        /* Parked: stopped already, on a stack of its own */
+        if (cpu_array_[i].is_parked())
+            continue;
+
+        hal::send_ipi(i, IPI_VECTOR);
     }
 }
 
@@ -920,8 +936,27 @@ void Cpu::queue_ipi_task_async(IPITask& task)
 
 void Cpu::queue_ipi_task(IPITask& task)
 {
+    /* How long before a task not yet run is said to be so, and again */
+    static const ulong REPORT_NS = 10 * consts::NANO_SECS_IN_SEC;
+
     queue_ipi_task_async(task);
-    task.completion.wait();
+
+    /* Waited for however long it takes -- the task is the caller's, on its
+       stack and on this CPU's list, and cannot be left there -- but not in
+       silence: a CPU that never runs it has its interrupts off for good,
+       and the waiter used to say nothing of what it was waiting for. */
+    stdlib::Time report_at = get_boot_time() + stdlib::Time(REPORT_NS);
+    while (task.completion.get_counter() != 0)
+    {
+        if (get_boot_time() >= report_at)
+        {
+            klog(0, "cpu %lu has not run an IPI task (0x%p) in %lu s: still waited for", index_, task.function,
+                REPORT_NS / consts::NANO_SECS_IN_SEC);
+            report_at = get_boot_time() + stdlib::Time(REPORT_NS);
+        }
+        /* As send_tlb_ipi waits: the answer comes from the other CPU */
+        yield_to_runnable();
+    }
 }
 
 ulong Cpu::process_ipi_tasks(Context* ctx)
@@ -1095,13 +1130,21 @@ void CpuTable::reset()
     for (ulong i = 0; i < stdlib::array_size(cpu_array_); i++)
         cpu_array_[i].get_task_queue().reap_exited();
 
-    stdlib::AutoLock lock(lock_);
-
-    for (ulong i = 0; i < stdlib::array_size(cpu_array_); i++)
     {
-        auto& cpu = cpu_array_[i];
-        cpu.reset();
+        stdlib::AutoLock lock(lock_);
+
+        for (ulong i = 0; i < stdlib::array_size(cpu_array_); i++)
+        {
+            auto& cpu = cpu_array_[i];
+            cpu.reset();
+        }
     }
+
+    /* And what each queue's clear() left for it, for the same reason off
+       the table's lock and each Cpu's: the references the queues' home
+       lists held (TaskQueue::clear) */
+    for (ulong i = 0; i < stdlib::array_size(cpu_array_); i++)
+        cpu_array_[i].get_task_queue().reap_exited();
 }
 
 bool Cpu::run(Task::Func func, void *ctx)

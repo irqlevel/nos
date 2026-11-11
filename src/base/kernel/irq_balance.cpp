@@ -151,6 +151,23 @@ void IrqBalance::remove_msix(MsixTable* table)
     entry_count_ = dst;
 }
 
+void IrqBalance::remove_io_apic_irq(u8 gsi)
+{
+    stdlib::AutoLock lock(lock_);
+
+    ulong dst = 0;
+    for (ulong src = 0; src < entry_count_; src++)
+    {
+        if (entries_[src].kind == KIND_IO_APIC && entries_[src].gsi == gsi)
+            continue;
+
+        if (dst != src)
+            entries_[dst] = entries_[src];
+        dst++;
+    }
+    entry_count_ = dst;
+}
+
 void IrqBalance::balance()
 {
     /* What was done, said once the lock is down: the entries as they were

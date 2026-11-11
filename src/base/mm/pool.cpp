@@ -248,6 +248,27 @@ void Pool::put_free(void* const* blocks, size_t count)
         pg_alloc_->free(release[i]);
 }
 
+void Pool::walk(BlockVisitor& visitor)
+{
+    stdlib::AutoLock lock(lock_);
+
+    ListEntry* lists[] = { &page_list_, &free_page_list_ };
+    for (ListEntry* list : lists)
+    {
+        for (auto link = list->flink; link != list; link = link->flink)
+        {
+            auto page = CONTAINING_RECORD(link, Page, link);
+            for (ulong i = 0; i < page->max_block_count; i++)
+            {
+                Block* block = block_at(page, i);
+                ulong tag = static_cast<ulong>(block->tag.get());
+                if (tag != FREED_TAG)
+                    visitor.block(tag, block + 1);
+            }
+        }
+    }
+}
+
 void Pool::claim(void* ptr, ulong tag)
 {
     Block* block = static_cast<Block*>(ptr) - 1;
