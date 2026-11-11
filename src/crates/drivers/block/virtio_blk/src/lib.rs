@@ -12,6 +12,12 @@
 //! probe reads sectors before the scheduler is running -- so until the block
 //! layer says interrupts have started, a request is polled to completion
 //! instead of waited for.
+//!
+//! A device with an interrupt also takes the block layer's asynchronous
+//! path (`submit`): a request in a slot of its own, nobody waiting on it,
+//! the caller's `done` called from the completion -- what a device's queue
+//! (`DiskQueue`) keeps many requests in flight by, a flush among them, so
+//! that its owner never waits on the device (plans/nbs.md, N12).
 
 #![no_std]
 
@@ -22,6 +28,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use block::{BlockDriver, Piece};
+use kcore::block::{BlockIo, SubmitError, IO_FLUSH, IO_READ, IO_WRITE};
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::{self, DmaBuffer};
 use kcore::interrupt::LegacyInterrupt;
@@ -55,6 +62,13 @@ const TYPE_FLUSH: u32 = 4;
 
 /// The device has a write cache, and a flush is worth sending.
 const FEATURE_FLUSH: u64 = 1 << 9;
+/// The device says how long one segment may be (`size_max`, at byte 8 of
+/// its configuration).
+const FEATURE_SIZE_MAX: u64 = 1 << 1;
+const CONFIG_SIZE_MAX: usize = 8;
+/// The most one asynchronous request moves: a device queue's buffer of the
+/// usual size whole, or less where the device says so.
+const ASYNC_MAX: usize = 256 * 1024;
 
 const HEADER_SIZE: usize = 16;
 /// The status byte the device writes: 0 is success.
@@ -72,6 +86,8 @@ struct Blk {
     transport: Box<dyn Transport>,
     capacity: u64,
     has_flush: bool,
+    /// The most one asynchronous request moves, in bytes: whole sectors.
+    async_max: usize,
     /// Whether completions arrive as MSI-X, where the ISR byte means nothing.
     /// Known once the interrupt is in place, which is after the device is.
     msix: AtomicBool,
@@ -99,10 +115,21 @@ struct Blk {
     irq: Once<Irq>,
 }
 
+/// Whom an asynchronous request's completion is for: the caller's `done`,
+/// and its context, a number to this driver.
+#[derive(Clone, Copy)]
+struct AsyncTarget {
+    done: extern "C" fn(ctx: *mut u8, status: i32),
+    ctx: usize,
+}
+
 struct Inner {
     queue: Queue,
     /// Which slot a descriptor head belongs to, NO_SLOT for none
     slot_of_head: [u8; virtio::MAX_DESCRIPTORS as usize],
+    /// An asynchronous request's caller, by its slot: None for a slot whose
+    /// caller waits on it.
+    targets: [Option<AsyncTarget>; MAX_SLOTS],
     /// One page holding every slot's request header and status byte. A
     /// slot's are its holder's, but the page is one allocation, so it is
     /// written and read where the queue is: under the lock.
@@ -196,7 +223,7 @@ impl Blk {
     /// The status byte is the device's answer, read once the wait is over.
     fn request(&self, kind: u32, sector: u64, data: Option<(u64, u32, bool)>) -> bool {
         let slot = self.wait_for_slot();
-        if !self.queue(slot, kind, sector, data) {
+        if !self.queue(slot, kind, sector, data, None) {
             return false;
         }
         self.transport.notify(REQUEST_QUEUE);
@@ -204,10 +231,12 @@ impl Blk {
     }
 
     /// Put the request on the ring in `slot`: its header written, its status
-    /// unset, the chain added and its head mapped to the slot. The doorbell is
+    /// unset, the chain added and its head mapped to the slot -- and, for an
+    /// asynchronous request, whom its completion is for. The doorbell is
     /// the caller's to ring. False -- the slot given back -- when the ring
     /// would not take it.
-    fn queue(&self, slot: usize, kind: u32, sector: u64, data: Option<(u64, u32, bool)>) -> bool {
+    fn queue(&self, slot: usize, kind: u32, sector: u64, data: Option<(u64, u32, bool)>,
+             target: Option<AsyncTarget>) -> bool {
         let header = Self::header_offset(slot);
         let status = Self::status_offset(slot);
 
@@ -251,6 +280,7 @@ impl Blk {
             match head {
                 Some(head) if (head as usize) < inner.slot_of_head.len() => {
                     inner.slot_of_head[head as usize] = slot as u8;
+                    inner.targets[slot] = target;
                     true
                 }
                 _ => false,
@@ -308,7 +338,7 @@ impl Blk {
                         break;
                     };
                     let data = Some((buf_phys + piece.at as u64, len, kind == TYPE_IN));
-                    if !self.queue(taken, kind, sector, data) {
+                    if !self.queue(taken, kind, sector, data, None) {
                         ok = false;
                         break;
                     }
@@ -359,11 +389,12 @@ impl Blk {
     }
 
     /// Take every completion the device has published and wake whoever is
-    /// waiting for it. Runs in interrupt context, and on the polled path in
-    /// the submitter's.
+    /// waiting for it -- or, for an asynchronous request, give its slot
+    /// back and tell its caller. Runs in interrupt context, and on the
+    /// polled path in the submitter's.
     fn collect(&self) {
         loop {
-            let slot = {
+            let (slot, target, status) = {
                 let mut inner = self.inner.lock();
 
                 match inner.queue.take_used() {
@@ -376,7 +407,16 @@ impl Blk {
                         }
                         let slot = inner.slot_of_head[head];
                         inner.slot_of_head[head] = NO_SLOT;
-                        slot
+                        /* An asynchronous request's caller, and the status
+                         * the device wrote -- read here, under the lock the
+                         * page is read under, once the ring said it is done */
+                        let target = inner.targets.get_mut(slot as usize).and_then(|t| t.take());
+                        let status = match target {
+                            Some(_) => inner.dma.bytes(Self::status_offset(slot as usize), 1)
+                                .map_or(STATUS_UNSET, |byte| byte[0]),
+                            None => STATUS_UNSET,
+                        };
+                        (slot, target, status)
                     }
                 }
             };
@@ -386,11 +426,61 @@ impl Blk {
                 continue;
             }
 
-            /* The flag before the wake: the polled path watches the flag,
-             * and the blocked one reads the status once wait() returns. */
-            self.complete[slot as usize].store(true, Ordering::Release);
-            self.done[slot as usize].done();
+            match target {
+                Some(t) => {
+                    /* Nobody waits on the slot: the count `queue` added
+                     * given back, the slot freed, and then the caller told,
+                     * once, with the device's status -- 0 for done, the
+                     * rest an error -- out of the lock */
+                    self.done[slot as usize].done();
+                    self.give_slot(slot as usize);
+                    (t.done)(t.ctx as *mut u8, i32::from(status));
+                }
+                None => {
+                    /* The flag before the wake: the polled path watches the
+                     * flag, and the blocked one reads the status once wait()
+                     * returns. */
+                    self.complete[slot as usize].store(true, Ordering::Release);
+                    self.done[slot as usize].done();
+                }
+            }
         }
+    }
+
+    /// One asynchronous request into a slot of its own, its doorbell left to
+    /// the caller: never blocks, never waits for a slot -- none free is
+    /// Busy, for the caller to try again after a completion. A device with
+    /// no write cache has no flush to start: Unsupported, which its queue
+    /// does as a flush of nothing.
+    fn queue_async(&self, io: &BlockIo) -> Result<(), SubmitError> {
+        if !self.is_async() {
+            return Err(SubmitError::Unsupported);
+        }
+        let (kind, sector, data) = match io.op {
+            IO_READ | IO_WRITE => {
+                let bytes = (io.count as usize).checked_mul(SECTOR_SIZE).ok_or(SubmitError::Invalid)?;
+                if io.count == 0 || bytes > self.async_max || io.sector >= self.capacity
+                    || u64::from(io.count) > self.capacity - io.sector || io.phys == 0 || io.phys & 3 != 0
+                {
+                    return Err(SubmitError::Invalid);
+                }
+                let read = io.op == IO_READ;
+                /* The device writes into a read's data, and reads a write's:
+                 * one run, physically contiguous -- the caller's promise */
+                (if read { TYPE_IN } else { TYPE_OUT }, io.sector, Some((io.phys, bytes as u32, read)))
+            }
+            IO_FLUSH if self.has_flush => (TYPE_FLUSH, 0, None),
+            IO_FLUSH => return Err(SubmitError::Unsupported),
+            _ => return Err(SubmitError::Invalid),
+        };
+        let slot = self.take_slot_now().ok_or(SubmitError::Busy)?;
+        let target = AsyncTarget { done: io.done, ctx: io.ctx as usize };
+        if !self.queue(slot, kind, sector, data, Some(target)) {
+            /* The slot given back by `queue`; the ring is never what runs
+             * out (MAX_SLOTS), so this is said there and refused here */
+            return Err(SubmitError::Invalid);
+        }
+        Ok(())
     }
 }
 
@@ -419,8 +509,8 @@ impl Blk {
 }
 
 impl BlockDriver for Blk {
-    /* The asynchronous path is NVMe's; this driver is a queue and a caller
-     * that waits on it. */
+    /* Callers that wait on their request, and -- with an interrupt to end
+     * a request by -- the asynchronous path, whose caller does not. */
 
     fn capacity(&self) -> u64 {
         self.capacity
@@ -449,6 +539,30 @@ impl BlockDriver for Blk {
     fn flush(&'static self) -> bool {
         /* No write cache: there is nothing to push. */
         !self.has_flush || self.request(TYPE_FLUSH, 0, None)
+    }
+
+    /* Only with an interrupt: a completion nothing would collect -- the
+     * polled path is a waiting caller's -- would never reach its caller. */
+    fn is_async(&self) -> bool {
+        self.irq.get().is_some()
+    }
+
+    fn submit_max(&self) -> usize {
+        if self.is_async() { self.async_max } else { 0 }
+    }
+
+    /* A kick rings the doorbell whatever became of this request: those
+     * queued before it without one are owed it. */
+    fn submit(&'static self, io: &BlockIo, kick: bool) -> Result<(), SubmitError> {
+        let result = self.queue_async(io);
+        if kick {
+            self.transport.notify(REQUEST_QUEUE);
+        }
+        result
+    }
+
+    fn kick(&'static self) {
+        self.transport.notify(REQUEST_QUEUE);
     }
 }
 
@@ -479,7 +593,7 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
         return false;
     }
 
-    let features = match virtio::negotiate(transport.as_ref(), FEATURE_FLUSH) {
+    let features = match virtio::negotiate(transport.as_ref(), FEATURE_FLUSH | FEATURE_SIZE_MAX) {
         Some(features) => features,
         None => {
             klog!(0, "virtio-blk: the device would not agree on features");
@@ -487,6 +601,14 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
         }
     };
     let has_flush = features & FEATURE_FLUSH != 0;
+    /* One segment's most, where the device says one: what an asynchronous
+     * request moves at most -- whole sectors, never below one */
+    let async_max = if features & FEATURE_SIZE_MAX != 0 {
+        let said = transport.config_read32(CONFIG_SIZE_MAX) as usize;
+        (said.min(ASYNC_MAX) / SECTOR_SIZE).max(1) * SECTOR_SIZE
+    } else {
+        ASYNC_MAX
+    };
 
     let size = transport.select_queue(REQUEST_QUEUE);
     if size == 0 {
@@ -535,6 +657,7 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
     let inner = match SpinLock::new(Inner {
         queue,
         slot_of_head: [NO_SLOT; virtio::MAX_DESCRIPTORS as usize],
+        targets: [None; MAX_SLOTS],
         dma,
     }) {
         Some(inner) => inner,
@@ -556,6 +679,7 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
         transport,
         capacity,
         has_flush,
+        async_max,
         msix: AtomicBool::new(false),
         free: AtomicU64::new(if MAX_SLOTS >= 64 { u64::MAX } else { (1 << MAX_SLOTS) - 1 }),
         next_ticket: AtomicU64::new(0),
