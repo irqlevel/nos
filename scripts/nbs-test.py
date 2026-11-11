@@ -32,10 +32,16 @@ what it stores, then a volume's bytes through the chunk servers.
   end, from the writer's host and read-only from the others -- flushed, its
   chunks open on every cs, then closed; a writer on another host refused,
   then forced: its fences refuse the old writer's writes and reads; a host
-  booted again with its data, its fence and its open marks; the volume
-  deleted, and every cs gives its chunks and its fence back; a host's
-  nbs-cs unloaded -- a request to it bounced and said at once -- and loaded
-  again, serving;
+  booted again with its data, its fence and its open marks; a snapshot of a
+  volume its writer writes (N10c2) -- asked on another host, refused,
+  naming the writer's; asked on the writer's host, a member that need not
+  lead, its session (`nbs io`'s, driven by the snapshot's command while it
+  pauses) paused for it and the snapshot taken; the writer writing on, its
+  chunk copied up first; the volume as written since, the snapshot as the
+  volume was; both deleted; the volumes deleted, and every cs gives its
+  chunks -- the one a snapshot shared and the one copied up among them --
+  and its fence back; a host's nbs-cs unloaded -- a request to it bounced
+  and said at once -- and loaded again, serving;
 - repair (N9): a volume written, c killed -- the leader's controller has its
   cs down -- the volume written past it, c booted again: its cs up, joined in
   its own place, every chunk at three replicas again, and c's own replica
@@ -701,6 +707,36 @@ def main():
         out = b.run("nbsload disk1 randread secs=2 qd=8 span=8")
         check("and reads on b, read-only", re.search(r"\d+ reads: \d+ IOPS", out) is not None and "nbsload:" not in out,
               out)
+
+        # -- a snapshot of a volume its writer writes (N10c2): asked on the
+        # writer's host -- b's, a member that need not lead -- its session
+        # paused for it; asked elsewhere, refused naming the host; the writer
+        # goes on, copying its chunk up first. The snapshot and the volume
+        # deleted then: the chunk they shared and the one copied up are given
+        # back with disk1's, below --
+        out = a.run("nbs volume create snapsrc 4")
+        need("a volume to take a snapshot of", "nbs: volume snapsrc" in out, out)
+        out = b.run("nbs io write snapsrc 0 8192 0x41")
+        need("written on b: a session there attached for writing", "8192 bytes of 0x41 written" in out, out)
+        out = a.run("nbs volume snapshot snapsrc snap1")
+        check("its snapshot asked on another host refused, naming the writer's", "attached on host b" in out, out)
+        out = b.run("nbs volume snapshot snapsrc snap1")
+        check("asked on the writer's host: its session paused for it, and the snapshot taken",
+              re.search(r"nbs: snapshot snap1 \(\d+\) of volume snapsrc", out) is not None, out)
+        out = b.run("nbs io write snapsrc 4096 4096 0x42")
+        check("the writer writes on: its chunk, the snapshot's too, copied up first", "4096 bytes of 0x42 written" in out,
+              out)
+        out = b.run("nbs io read snapsrc 0 8192")
+        check("the volume as written since", "0x41x4096 0x42x4096" in out, out)
+        out = b.run("nbs io detach snapsrc")
+        need("and let go", "snapsrc detached" in out, out)
+        out = c.run("nbs io read snap1 0 8192")
+        check("the snapshot as the volume was when it was taken, read on another host", "0x41x8192" in out, out)
+        out = a.run("nbs volume delete snap1")
+        check("the snapshot deleted", "snap1" in out and "deleted" in out, out)
+        out = a.run("nbs volume delete snapsrc")
+        check("and the volume", "snapsrc" in out and "deleted" in out, out)
+
         out = a.run("nbs volume delete disk1")
         check("disk1 deleted", "deleted" in out, out)
         check("every cs gives its chunks and its fence back",

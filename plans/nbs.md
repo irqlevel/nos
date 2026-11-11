@@ -1329,6 +1329,49 @@ each new gate.
       member a stale view asked, the vouched cache letting a stale epoch in
       for a chunk not held, a copy-up refused for room where a member is
       drained. Mutants: 171, the thirteen new ones each caught.
+    - **N10c2, done** (2026-11-09). The wire: `Said::Pause`, `Ask::Paused`,
+      `Said::GoOn`, `Ask::Reattach`. The client pauses as decided below; with
+      no word it attaches anew by `Command::Reattach` -- the writer's own
+      attach only, refused where it was taken over -- not by letting go and
+      attaching again, which left a window where a writer after it, on
+      another host or on this one, was taken back. raftmember's
+      `App::take` offers the shell's requests to the app first; nbs-mds
+      takes a snapshot asked with `PAUSE_FIRST` and pauses the session it
+      knows by its attach and its asks since, proposes at its generation
+      once answered, says go on only where it never proposed or once the
+      proposal was applied, and gives a pause up in 5 s. `nbs volume
+      snapshot`. The cluster target pauses its writer as nbs-mds does, the
+      word now and then lost, the snapshot now and then applied late, and
+      judges every chunk closed at the answer and a writer whose pause was
+      given up going on with no attach anew; nbs-test takes a snapshot of a
+      volume `nbs io` writes, its session driven by the snapshot's command
+      while it pauses (`raftmember::ask_turning`) -- left alone between its
+      commands it would not pause. Read over before its gates, which found:
+      a stop asked while paused was begun at once -- it could let go of the
+      volume mid-pause, a take-out on its way then refused as not the
+      writer's, and with no word its flush, queued behind the pause's
+      writes, was begun a second time after the attach anew, the stop told
+      done before the volume was let go of. It is held until the pause is
+      over now, as one asked while starting is, and a stop asked again is
+      refused where it was let overwrite the first. The cluster target saw
+      none of it: it did not judge a stop's end, and its stops' tags had the
+      bit of the session's own operations set, so a flush done out of turn
+      was told to nobody. It holds every stop to being done once, as its
+      session ends, stops a writer paused at some ends, and its tags are the
+      driver's; `stop` refuses a tag of the session's own, as `submit` does.
+      The pause's first stage, waiting for nothing at all to be out, was
+      taken out: its mutant survived, as a write out keeps its place open
+      and the closes wait for it already. nbs-mds keeps a volume's session
+      only by the asks of its writer as applied, not of one taken over on
+      the host. A campaign of the cluster target found its own judge wrong:
+      a writer taken over while it paused answers all the same, and what is
+      open then is the writer's after it -- judged so now, its snapshot to
+      be refused. And the full run of the mutants left N9d's
+      `joiner_epoch_since` uncaught: the one cluster seed that caught it had
+      moved on with the target's course. It is aimed in the join target
+      now -- a writer taken over, of a map from when a member back was
+      still active, writing it as it joins -- which a tenth of its runs
+      reach. Mutants: 182, the eleven new ones each caught.
     - **N10c2, the snapshot's pause**, an attached volume's -- decided
       2026-11-09: asked on the writer's host only, whose mds pauses its own
       session (one asked elsewhere is refused, naming the host). The session

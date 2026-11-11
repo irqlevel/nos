@@ -13,7 +13,8 @@
 //!
 //! The first write attaches the volume for writing on this host unless
 //! `attach` did; the session is kept for the commands after, until `detach`
-//! or another `attach`. A read on a host with no session of the volume's
+//! or another `attach` -- and driven only while one of them runs, or while
+//! `nbs volume snapshot` asked here pauses it for a snapshot (N10c2). A read on a host with no session of the volume's
 //! attaches read-only for itself and lets go after -- which the metadata
 //! refuses while another host writes. `force` takes the volume from a
 //! writer elsewhere, whose writes the fences then refuse. Offsets and sizes
@@ -46,6 +47,9 @@ const HELD_MS: u64 = 10_000;
 const NS_PER_MS: u64 = 1_000_000;
 /// The runs of a read shown at most.
 const RUNS_SHOWN: usize = 16;
+/// How long a session a snapshot paused is driven after the snapshot's
+/// answer, for it to go on -- the word to go on sent before the answer.
+const ON_MS: u64 = 5_000;
 
 /// The volumes this host's `nbs io` has a session of, by name: each taken
 /// out while a command drives it, so that no lock is held while it waits.
@@ -217,6 +221,32 @@ fn read(state: &ModState, name: &str, offset: u64, len: u64, out: &mut Output) -
     let result = show(&mut d, out);
     let stopped = d.stop();
     result.and(stopped)
+}
+
+/// A snapshot of volume `volume` as `name`, asked on this host (N10c2):
+/// with `nbs io` writing the volume here, its session driven while the
+/// snapshot is asked -- as a guest's disk is by a task of its own: left
+/// alone between commands, it would not pause, and the snapshot would be
+/// given up -- and then until it goes on, its map read anew.
+pub fn snapshot(state: &ModState, volume: &str, name: &str, out: &mut Output) -> Result<(), String> {
+    let said = |id: u32, out: &mut Output| {
+        let _ = writeln!(out, "nbs: snapshot {} ({}) of volume {}", name, id, volume);
+    };
+    if !state.io.with(|io| io.contains_key(volume)) {
+        let id = crate::store::volume_snapshot(state, volume, name, &mut |ms| kcore::task::sleep_ms(ms))
+            .map_err(|f| f.says())?;
+        said(id, out);
+        return Ok(());
+    }
+    kept(state, volume, out, |d, out| {
+        let asked = crate::store::volume_snapshot(state, volume, name, &mut |ms| d.turn(ms * NS_PER_MS));
+        let end = boot_time_ns() + ON_MS * NS_PER_MS;
+        while d.session().paused() && boot_time_ns() < end {
+            d.turn(nbsdrive::TURN_NS);
+        }
+        said(asked.map_err(|f| f.says())?, out);
+        Ok(())
+    })
 }
 
 fn detach(state: &ModState, name: &str, out: &mut Output) -> Result<(), String> {

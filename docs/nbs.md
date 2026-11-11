@@ -79,6 +79,7 @@ nbs cs                     every host's chunk server: its devices, its room, wha
 nbs volume create <name> <size> [host=<host>]   size in MiB, or with M, G or T after it; its own host this one
 nbs volume resize <name> <size>                 grown, never made smaller
 nbs volume delete <name>
+nbs volume snapshot <volume> <name>              attached: on its writer's host, which pauses it
 nbs volumes                every volume
 nbs volume <name>          one, and the hosts its replicas are on
 ```
@@ -184,7 +185,28 @@ to drive them (N10b-N10d):
 - `Snapshot { volume, name, generation }` -- of a volume only, at the
   generation of the writer that paused for it, or 0 for one with none: a
   writer not paused could have a write on its way into a chunk the snapshot
-  shares from then on.
+  shares from then on. `nbs volume snapshot <volume> <name>` asks it (N10c2):
+  of a volume with no writer, as it is; of one attached, only on its
+  writer's host -- elsewhere refused, naming that host -- whose mds pauses
+  the writer's session first (`Said::Pause`): the session sends nothing new,
+  closes every chunk it wrote -- each once the writes out to it are done --
+  and answers (`Ask::Paused`); the snapshot is proposed at its generation,
+  and once it is applied the session is told to go on (`Said::GoOn`) and
+  reads its map anew -- every chunk shared -- before it writes. A pause not
+  answered in 5 s is given up, the session told to go on, and the snapshot
+  refused. A session that answered and hears no word in 10 s attaches anew
+  (`Reattach`): a snapshot of its pause applied late is refused then. The
+  mds tells a session to go on only where it never proposed, or once the
+  proposal was applied -- one that may still commit leaves the session to
+  its own wait. A stop asked of a session while it is paused is begun once
+  the pause is over: nothing is let go of while its snapshot may still be
+  applied. A session `nbs io` keeps on the host is driven by the snapshot's
+  command while it is asked there, as a guest's disk is by a task of its
+  own: left alone between its commands, it would not pause.
+- `Reattach { name, host, generation, token }` -- the writer's own attach
+  anew (N10c2), at a new generation: refused where the volume's writer is no
+  longer `host`'s at `generation` -- taken over since, on that host or
+  another -- and asked again by its token, answered as it was.
 - `Freeze { name }` -- a volume made an image, refused while attached; its
   copy-ups pending given up.
 - `Clone { from, name, host }` -- of an image or a snapshot only (else
@@ -712,7 +734,9 @@ A session's life:
    that stopped uncleanly -- read from one replica, this host's if it has
    one, and written to every one, 256 KiB at a time, then closed.
 5. **Serve**, until **stop**: what was asked before it done, a flush, every
-   chunk written closed, detached.
+   chunk written closed, detached. A stop asked while the session is still
+   starting, or paused for a snapshot, is begun once it serves; one asked
+   again is refused, the first standing.
 
 What it holds to (plans/nbs.md, "Replication: the rules"):
 - **A write is done once every replica in has it.** One that has not
@@ -802,10 +826,11 @@ nbs io detach <volume>                          flushed, closed, let go of
 
 The first write attaches the volume for writing on this host unless
 `attach` did; the session is kept for the commands after, until `detach` or
-another `attach`, and moves only while a command drives it. A read on a host
-with no session of the volume's attaches read-only for itself and lets go
-after -- refused while another host writes. Offsets and sizes are whole
-4 KiB. For example:
+another `attach`, and moves only while a command drives it -- one of its
+own, or `nbs volume snapshot` asked on this host, which pauses it. A read
+on a host with no session of the volume's attaches read-only for itself and
+lets go after -- refused while another host writes. Offsets and sizes are
+whole 4 KiB. For example:
 
 ```
 a$ nbs io write disk1 0 65536 0x5a
@@ -936,13 +961,22 @@ image's zeros out.
   snapshot shares before they write there, through joins, drains, crashes and
   takeovers; each cs's garbage pass frees what copy-ups and drops leave; and
   every snapshot reads, on every active replica up and at every look, what
-  the volume held at it.
+  the volume held at it. Snapshots of the volume attached are taken too,
+  as nbs-mds takes them (N10c2): the writer paused, every chunk closed when
+  it answers, the snapshot applied at its generation; the word to go on now
+  and then lost and the snapshot now and then applied late -- refused, its
+  session having attached anew -- and a pause not answered given up, its
+  writer going on with no attach anew; at some ends the writer stopped while
+  paused, a write held behind the pause. Every stop is held to being done
+  once, as its session ends -- the stops' tags the driver's, as nbsdrive's
+  are: with the bit of the session's own operations set, as they were, a
+  stop's flush done out of turn was told to nobody, and no judge saw it.
 
-  `--mutants` takes a hundred and seventy-one rules out one at a time --
-  seventy-one of the metadata's, five of them the controller's; forty-one of
-  the cs's, twelve of them the copy's and eleven a copy-up's; thirty-one of
-  the wire's, its `serve`'s, the mds's, the copy's and the scrub's;
-  twenty-eight of the client's -- each caught.
+  `--mutants` takes a hundred and eighty-two rules out one at a time --
+  seventy-three of the metadata's, five of them the controller's; forty-one
+  of the cs's, twelve of them the copy's and eleven a copy-up's; thirty-one
+  of the wire's, its `serve`'s, the mds's, the copy's and the scrub's;
+  thirty-seven of the client's -- each caught.
 - **`fuzz/raft`'s `nbsmeta` target**: the members' part of the state, its
   commands from pools of names and incarnations that meet and from wide ones
   that fill the cluster. There are four scenarios and six mutants.
@@ -1057,6 +1091,9 @@ image's zeros out.
   fails while it serves fails the requests of its chunks; one that is never
   taken in stops the cs serving. Taking a device out, and rebuilding what was
   on it, is N9's.
+- A snapshot of an attached volume is asked on its writer's host: the one
+  mds that knows the writer's session. Its writer pauses for it, every chunk
+  it wrote closed -- a moment's stall in the guest.
 - A write to a chunk a snapshot or a clone shares, in a set being joined
   or with a member drained, waits for the join (N10c), and fails past the
   operation's deadline: a join of a big set takes minutes. plans/nbs.md has

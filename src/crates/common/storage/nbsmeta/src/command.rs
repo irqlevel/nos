@@ -42,6 +42,13 @@ pub enum Command {
     /// Volume `name` let go by `host`: the writer of `generation`, or -- with
     /// generation 0 -- a reader. Done where it is not so attached.
     Detach { name: String, host: String, generation: u64 },
+    /// Volume `name`'s writer on `host` at `generation` attached anew, at a
+    /// new generation, `token` its session's now (N10c2): a session paused
+    /// for a snapshot that heard no word, so that a snapshot of its pause
+    /// applied late is refused. Refused (`NotTheWriter`) where the volume's
+    /// writer is no longer so -- taken over since, here or elsewhere. Asked
+    /// again by that token, answered with the generation it gave.
+    Reattach { name: String, host: String, generation: u64, token: u64 },
     /// The leader's digest of the state at entry `at`, for every member to
     /// hold its own to.
     Digest { at: u64, digest: [u8; 32] },
@@ -140,6 +147,7 @@ const FREEZE: u8 = 21;
 const CLONE: u8 = 22;
 const COPY_UP: u8 = 23;
 const COPY_DONE: u8 = 24;
+const REATTACH: u8 = 25;
 
 const WRITABLE: u8 = 1;
 const FORCE: u8 = 2;
@@ -275,6 +283,13 @@ impl Command {
                 w.u32(*place);
                 w.u64(*generation);
             }
+            Command::Reattach { name, host, generation, token } => {
+                w.u8(REATTACH);
+                w.str(name);
+                w.str(host);
+                w.u64(*generation);
+                w.u64(*token);
+            }
             Command::CopyDone { name, place, generation, chunk } => {
                 w.u8(COPY_DONE);
                 w.str(name);
@@ -394,6 +409,10 @@ impl Command {
                 let place = r.u32()?;
                 let generation = r.u64()?;
                 Command::CopyDone { name, place, generation, chunk: r.u32()? }
+            }
+            REATTACH => {
+                let (name, host) = (volume(&mut r)?, host(&mut r)?);
+                Command::Reattach { name, host, generation: r.u64()?, token: r.u64()? }
             }
             _ => return None,
         };
