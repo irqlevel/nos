@@ -3529,7 +3529,7 @@ little and now and then past a silence.
     longer.
 
 `--mutants` runs `fuzz/nbs/mutants.py`, which takes out one rule at a time.
-Each of its hundred and eighty-four must fail the gate -- run as `nbs-fuzz gate
+Each of its hundred and eighty-six must fail the gate -- run as `nbs-fuzz gate
 --first`, stopped at the first target that fails: the gate's verdict, sooner.
 The metadata's seventy-three:
 - placement: the home host first, the most room first, rule 6, three full
