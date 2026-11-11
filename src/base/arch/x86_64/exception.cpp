@@ -9,6 +9,7 @@
 #include <kernel/klog.h>
 #include <kernel/cpu.h>
 #include <kernel/debug.h>
+#include <hal/irqchip.h>
 
 namespace kernel
 {
@@ -133,6 +134,18 @@ void ExceptionTable::exc_divide_by_zero(Context* ctx)
         ctx->get_ret_rip(), ctx->get_orig_rsp());
 }
 
+/* Which CPU a fault is on, for its message -- or ~0 while nothing can say.
+   Until a CPU's GS slot is published its id is read from the local APIC,
+   and until the ACPI tables are read the APIC's address is not known:
+   asked then, the read was of address 0x20, a page fault inside the
+   handler, and what was reported was that fault and not the one being
+   handled -- with the instruction and the error code of an early #GP, the
+   kind a new machine's MSRs give, lost. */
+static ulong fault_cpu()
+{
+    return hal::irq_chip_ready() ? CpuTable::get_instance().get_current_cpu_id() : ~0UL;
+}
+
 void ExceptionTable::exc_debugger(Context* ctx)
 {
     exc_debugger_counter_.inc();
@@ -202,7 +215,7 @@ void ExceptionTable::exc_invalid_opcode(Context* ctx)
     exc_invalid_opcode_counter_.inc();
 
     PANIC_CTX(ctx, false, "EXC: InvalidOpcode cpu %lu rip 0x%lX rsp 0x%lX",
-        CpuTable::get_instance().get_current_cpu_id(),
+        fault_cpu(),
         ctx->get_ret_rip(), ctx->get_orig_rsp());
 }
 
@@ -266,7 +279,7 @@ void ExceptionTable::exc_general_protection_fault(Context* ctx)
     Panicker::get_instance().recover_fault();
 
     PANIC_CTX(ctx, true, "EXC: GP cpu %lu rip 0x%lX rsp 0x%lX err 0x%lX",
-        CpuTable::get_instance().get_current_cpu_id(),
+        fault_cpu(),
         ctx->get_ret_rip(true), ctx->get_orig_rsp(true), ctx->get_error_code());
 }
 
