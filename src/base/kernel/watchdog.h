@@ -3,6 +3,7 @@
 #include <lib/stdlib.h>
 #include <lib/list_entry.h>
 #include <lib/printer.h>
+#include <include/const.h>
 
 #include "raw_spin_lock.h"
 #include "atomic.h"
@@ -56,12 +57,19 @@ private:
     stdlib::ListEntry spin_lock_list_[SPIN_LOCK_HASH_SIZE];
     ListLock spin_lock_list_lock_[SPIN_LOCK_HASH_SIZE];
 
-    /* The slice of the bucket table each CPU walks, for Dump. */
+    /* The slice of the bucket table each CPU walks, for Dump: its rank
+       among the running CPUs, where its slice starts at a tick whose number
+       divides by the stride, and the stride. */
     struct Slice
     {
         ulong first;
         ulong stride;
     };
+
+    /* How often the slices move on by one CPU: a tick's period (check) */
+    static constexpr ulong ROTATE_NS = 10 * consts::NANO_SECS_IN_MS;
+    /* How many locks held too long a walk says of one bucket */
+    static constexpr ulong LATE_MAX = 4;
 
     Slice cpu_slice_[SLICE_CPUS];
 
