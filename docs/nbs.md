@@ -985,6 +985,13 @@ image's zeros out.
   once, as its session ends -- the stops' tags the driver's, as nbsdrive's
   are: with the bit of the session's own operations set, as they were, a
   stop's flush done out of turn was told to nobody, and no judge saw it.
+  And a clone of the newest snapshot is made now and then (N10d2), with a
+  writer of its own apart from the volume's: a volume born with every
+  chunk shared, its writes copied up, its reads of chunks recorded as
+  another volume's vouched for by the mds, its writes in place once the
+  snapshot is dropped -- through the crashes, joins and drains the volume's
+  writers meet; dropped now and then, at once where its writer is lost, and
+  at the end once every block it holds is held to what its writer did.
 
   `--mutants` takes a hundred and eighty-four rules out one at a time --
   seventy-three of the metadata's, five of them the controller's;

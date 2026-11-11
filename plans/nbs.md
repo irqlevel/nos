@@ -1417,6 +1417,37 @@ each new gate.
       copied up, its snapshot as it was; the clone made an image, written
       refused, cloned, deleted under that clone, whose write then takes the
       chunk in place. Mutants: 184.
+    - **N10d2, done** (2026-11-11). The cluster target's clone: made of the
+      newest snapshot -- once each block of it that may hold anything but
+      zeros was read, which seeds the clone's model as writes done and
+      flushed before any -- and written and read by a writer of its own, on
+      the network as `End::Clone`, apart from the volume's writers and their
+      judges (`at_cs` and `at_mds` take who asked; the fenced judge is the
+      volume's writers'). Dropped now and then with every host up, at once
+      where its writer is lost or fails as its last replica refuses it --
+      let go of by force then -- and at the end, after the host down is
+      back, each block held to its model on every active replica; a host is
+      lost for good at the end only where the clone does without it too.
+      Found on the way, the target's own: a stop asked of a clone's writer
+      while a chunk's last replica in was on a host down held it up for good
+      -- the drive does not bring the host back -- as it would the volume's
+      writer, whose stop the target asks only with every host up. And a
+      campaign found the target's judge of a flush wrong for both writers:
+      a flush out with one before it that failed at its deadline fails with
+      it, before its own -- the client's rule. In 300 runs: 545 clones in
+      271 of them, 10517 writes and 8494 reads of theirs, 130 held at the
+      end, 115 let go of by force. Mutants: 184.
+    - **Open, found in N10d2: a flush after one that failed.** The client
+      fails, with a flush that failed, those out with it -- and no target
+      catches that rule taken out: not one of the cluster target's first
+      thousand seeds. And one not out yet when the first failed -- waiting
+      on a write before it -- is launched later and may be done: it flushes
+      the cs's acknowledged since it began, and so may say durable what the
+      failed one did not make so on a cs still in its set (its last active
+      replica, say, which the writer cannot take out). To be looked at: a
+      flush done only once every flush before it was done, not failed --
+      or the cs's of the one that failed carried into the next -- and a
+      judge of its own: a flush done while one before it failed.
     - **A limit, and what would lift it.** A write to a shared chunk of a
       set being joined waits for the join, and fails past the operation's
       deadline: a join of a big set takes minutes. Lifting it: copy-ups into

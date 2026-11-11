@@ -67,7 +67,19 @@
 //! - **a stop is done once**, and as its session ends: detached, or failed
 //!   (a driver tears its session down at it); asked again, done at once and
 //!   not ok, the first standing; asked with a tag of the session's own,
-//!   refused at once, the session as it was.
+//!   refused at once, the session as it was;
+//! - **a clone holds what its snapshot held and its writer wrote** (N10d2):
+//!   one of the newest snapshot, made once the snapshot's blocks were read,
+//!   written and read by a writer of its own -- `End::Clone` on the
+//!   network, apart from the volume's writers -- its reads one of what its
+//!   model allows, its writes on every replica in, and at the end every
+//!   block on every active replica as its writer left it; dropped now and
+//!   then, and at once where its writer is lost, let go of by force then.
+//!
+//! An operation fails only at its deadline or with its session, but for a
+//! flush or a close out with one before it that failed at its deadline: the
+//! client fails those with it, as what it was to flush was written before
+//! them too.
 //!
 //! A writer that follows another holds what that one had done and not
 //! flushed as a crash would leave it: there or not -- a replica that lost it
@@ -132,6 +144,8 @@ const SCRUB_EVERY: u64 = 4_000 * MS;
 const GARBAGE_EVERY: u64 = 3_000 * MS;
 /// The snapshots kept at once, at most: the oldest dropped for a new one.
 const SNAPS_KEPT: usize = 2;
+/// The clone's name (N10d2): one at a time, of a snapshot of the volume.
+const CLONE: &str = "w";
 /// How long the writer's host's mds waits for its pause to be answered
 /// before it gives the snapshot up (N10c2).
 const PAUSE_WAIT_NS: u64 = 5_000 * MS;
@@ -181,6 +195,27 @@ enum End {
     /// A host's cs as the joiner of its sets: its copies' requests to their
     /// sources, and the answers.
     Copy(usize),
+    /// A clone's writer (N10d2).
+    Clone(usize),
+}
+
+/// A clone of a snapshot of the volume, and its writer (N10d2): a session
+/// on a host, as a client's is, apart from the volume's writers -- one a
+/// clone, the clone dropped with it.
+struct CloneW {
+    host: usize,
+    s: Session,
+    bufs: Bufs,
+    ops: BTreeMap<u64, MOp>,
+    next_tag: u64,
+    /// Lost with its host, or failed as its chunk's last replica refused
+    /// it: driven no more, the clone let go of by force and dropped.
+    dead: bool,
+    /// Its stop done: once, as its session ends.
+    stop_done: bool,
+    /// When a flush of its last failed at its deadline: those out with it
+    /// fail then too.
+    flush_failed_at: Option<u64>,
 }
 
 struct Msg {
@@ -286,6 +321,9 @@ struct Client {
     failed: u64,
     /// Its stop done: once, as its session ends.
     stop_done: bool,
+    /// When a flush of its last failed at its deadline: those out with it
+    /// fail then too.
+    flush_failed_at: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -412,6 +450,12 @@ struct World {
     /// The word a pause's answer gets, as an end shaped it: 0 the snapshot
     /// applied late, 1 the word lost, 2 the word said.
     pause_word: Option<u64>,
+    /// The clones' writers, one live at a time (N10d2); what the clone may
+    /// hold -- its snapshot's blocks as they read, its writer's writes since
+    /// -- and its randomness of its own.
+    clones: Vec<CloneW>,
+    cmodel: Blocks,
+    clone_r: Rng,
     stats: BTreeMap<&'static str, u64>,
 }
 
@@ -545,6 +589,18 @@ impl World {
         Ok(v)
     }
 
+    /// Whether a flush or a close of `op` failing now, before its own
+    /// deadline, is one the client fails with a flush before it that failed
+    /// at its deadline -- out with it: the client's rule. `failed_at` is when
+    /// a flush of the session's last failed at its deadline; `ops` what it
+    /// has out still.
+    fn failed_with_one_before(&self, op: &MOp, failed_at: Option<u64>, ops: &BTreeMap<u64, MOp>) -> bool {
+        matches!(op.kind, K::Flush | K::Close)
+            && (failed_at == Some(self.now)
+                || ops.values().any(|o| matches!(o.kind, K::Flush | K::Close) && o.at <= op.at
+                    && self.now >= o.at + DEADLINE_NS))
+    }
+
     fn done(&mut self, c: usize, tag: u64, ok: bool) -> Result<(), String> {
         /* A stop: done once, and as its session ends -- the volume let go
            of, or the session failed: a driver tears its session down at it */
@@ -578,7 +634,12 @@ impl World {
         if !ok && op.kind != K::Read {
             self.clients[c].failed += 1;
         }
-        if !ok && !lost && self.now < op.at + DEADLINE_NS {
+        if !ok && matches!(op.kind, K::Flush | K::Close) && self.now >= op.at + DEADLINE_NS {
+            self.clients[c].flush_failed_at = Some(self.now);
+        }
+        if !ok && !lost && self.now < op.at + DEADLINE_NS
+            && !self.failed_with_one_before(&op, self.clients[c].flush_failed_at, &self.clients[c].ops)
+        {
             return Err(format!("client {}'s {:?} of blocks {}+{} failed {} ms after it was asked, before its deadline",
                                c, op.kind, first, n, (self.now - op.at) / MS));
         }
@@ -702,7 +763,21 @@ impl World {
         let Some(&(from, to)) = self.r.pick(&keys).as_ref() else { return Ok(()) };
         let Some(m) = self.links.get_mut(&(from, to)).and_then(|q| q.pop_front()) else { return Ok(()) };
         match (from, to) {
-            (End::Client(c), End::Cs(h)) => self.at_cs(c, h, m),
+            (End::Client(_) | End::Clone(_), End::Cs(h)) => self.at_cs(from, h, m),
+            (End::Client(_) | End::Clone(_), End::Mds(_)) => self.at_mds(from, m),
+            /* A clone's writer (N10d2), as a client */
+            (End::Cs(_), End::Clone(k)) | (End::Mds(_), End::Clone(k)) if self.clones[k].dead => Ok(()),
+            (End::Cs(_) | End::Mds(_), End::Clone(k)) => {
+                let now = self.now;
+                let mut out = Vec::new();
+                let cl = &mut self.clones[k];
+                if matches!(from, End::Cs(_)) {
+                    cl.s.on_cs(&m.bytes, now, &mut cl.bufs, &mut out);
+                } else {
+                    cl.s.on_mds(&m.bytes, now, &mut cl.bufs, &mut out);
+                }
+                self.clone_outs(k, out)
+            }
             (End::Cs(_), End::Client(c)) | (End::Mds(_), End::Client(c)) if self.clients[c].dead => Ok(()),
             (End::Cs(h), End::Client(c)) => {
                 if self.trace {
@@ -715,7 +790,6 @@ impl World {
                 cl.s.on_cs(&m.bytes, now, &mut cl.bufs, &mut out);
                 self.outs(c, out)
             }
-            (End::Client(c), End::Mds(_)) => self.at_mds(c, m),
             (End::Mds(_), End::Client(c)) => {
                 let now = self.now;
                 let mut out = Vec::new();
@@ -1235,9 +1309,28 @@ impl World {
         Ok(())
     }
 
+    /// The session of `e` -- a client, or a clone's writer -- with its
+    /// buffers, and its host.
+    fn session_of(&mut self, e: End) -> Option<(&mut Session, &mut Bufs, usize)> {
+        match e {
+            End::Client(c) => self.clients.get_mut(c).map(|cl| (&mut cl.s, &mut cl.bufs, cl.host)),
+            End::Clone(k) => self.clones.get_mut(k).map(|cl| (&mut cl.s, &mut cl.bufs, cl.host)),
+            _ => None,
+        }
+    }
+
+    /// The outputs of `e`'s session, taken as a client's or a clone's.
+    fn outs_of(&mut self, e: End, out: Vec<Out>) -> Result<(), String> {
+        match e {
+            End::Client(c) => self.outs(c, out),
+            End::Clone(k) => self.clone_outs(k, out),
+            _ => Ok(()),
+        }
+    }
+
     /// A request at host `h`'s cs: done by nbswire's `serve`, the cs asking
     /// the mds as its own host's -- or, its host down, lost or bounced.
-    fn at_cs(&mut self, c: usize, h: usize, m: Msg) -> Result<(), String> {
+    fn at_cs(&mut self, from: End, h: usize, m: Msg) -> Result<(), String> {
         let World { hosts, state, index, served, .. } = self;
         let host = &mut hosts[h];
         let Some(store) = host.store.as_mut() else {
@@ -1245,9 +1338,10 @@ impl World {
                 self.count("bounces");
                 let now = self.now;
                 let mut out = Vec::new();
-                let cl = &mut self.clients[c];
-                cl.s.on_bounce(m.id, true, now, &mut cl.bufs, &mut out);
-                return self.outs(c, out);
+                if let Some((s, bufs, _)) = self.session_of(from) {
+                    s.on_bounce(m.id, true, now, bufs, &mut out);
+                }
+                return self.outs_of(from, out);
             }
             return Ok(());
         };
@@ -1270,12 +1364,13 @@ impl World {
                         Ok(d) => format!("{:?}", d).chars().take(60).collect(),
                         Err(e) => format!("refused {:?}", e),
                     };
-                    eprintln!("  [{}] cs {} (host {}) for client {} at generation {}: #{} {} -> {}", self.step,
-                              host.cs, name, c, req.generation, req.id, what, said);
+                    eprintln!("  [{}] cs {} (host {}) for {:?} at generation {}: #{} {} -> {}", self.step,
+                              host.cs, name, from, req.generation, req.id, what, said);
                 }
                 /* Fenced: once a newer writer serves, no active replica does
-                   an older generation's write or flush */
-                if result.is_ok() && req.generation != 0 && req.generation < *served {
+                   an older generation's write or flush -- of the volume's
+                   writers: a clone's generations are its own */
+                if matches!(from, End::Client(_)) && result.is_ok() && req.generation != 0 && req.generation < *served {
                     let active = |set: u32| state.sets().get(set as usize).is_some_and(|s| {
                         (0..nbsmeta::REPLICAS).any(|i| s.cs[i] == host.cs && s.replicas[i] != Replica::Down)
                     });
@@ -1306,15 +1401,16 @@ impl World {
                 }
             }
         };
-        self.push(End::Cs(h), End::Client(c), answer, m.id);
+        self.push(End::Cs(h), from, answer, m.id);
         Ok(())
     }
 
     /// A client's ask at its host's mds, answered as nbs-mds's member does --
     /// the leader's look at a cs being whether its host is up.
-    fn at_mds(&mut self, c: usize, m: Msg) -> Result<(), String> {
+    fn at_mds(&mut self, from: End, m: Msg) -> Result<(), String> {
         let Some(a) = Asking::decode(&m.bytes) else { return Ok(()) };
-        let host = HOSTS[self.clients[c].host].to_string();
+        let Some(at) = self.session_of(from).map(|(_, _, h)| h) else { return Ok(()) };
+        let host = HOSTS[at].to_string();
         let said = match a.ask {
             Ask::Attach { name, writable, force, token } => match self.apply(Command::Attach { name, host, writable,
                                                                                               force, token }) {
@@ -1336,7 +1432,7 @@ impl World {
                 } else {
                     let answer = self.apply(Command::ReplicaDown { set, cs, refused, name, generation });
                     if self.trace {
-                        eprintln!("  [{}] mds: client {} asks cs {} of set {} out (refused {}): {:?}", self.step, c, cs,
+                        eprintln!("  [{}] mds: {:?} asks cs {} of set {} out (refused {}): {:?}", self.step, from, cs,
                                   set, refused, answer);
                     }
                     match answer {
@@ -1369,7 +1465,12 @@ impl World {
                 }
             }
             /* A pause answered (N10c2) */
-            Ask::Paused { generation, pause, .. } => return self.paused(c, a.id, generation, pause),
+            /* A pause answered: of the volume's writers alone, whom the
+               writer's host's mds pauses */
+            Ask::Paused { generation, pause, .. } => match from {
+                End::Client(c) => return self.paused(c, a.id, generation, pause),
+                _ => return Err(format!("{:?} answered a pause it was never asked", from)),
+            },
             /* A copy-up's asks (N10), answered as nbs-mds's member does */
             ask @ (Ask::CopyUp { .. } | Ask::CopyDone { .. }) => {
                 let done = matches!(ask, Ask::CopyDone { .. });
@@ -1382,7 +1483,7 @@ impl World {
                 };
                 let answer = self.apply(cmd);
                 if self.trace {
-                    eprintln!("  [{}] mds: client {} asks a copy-up{}: {:?}", self.step, c,
+                    eprintln!("  [{}] mds: {:?} asks a copy-up{}: {:?}", self.step, from,
                               if done { "'s end" } else { "" }, answer);
                 }
                 match answer {
@@ -1407,8 +1508,7 @@ impl World {
                 }
             }
         };
-        let h = self.clients[c].host;
-        self.push(End::Mds(h), End::Client(c), Saying { id: a.id, said }.encode(), m.id);
+        self.push(End::Mds(at), from, Saying { id: a.id, said }.encode(), m.id);
         Ok(())
     }
 
@@ -1446,6 +1546,17 @@ impl World {
                 eprintln!("  [{}] client {}: {:?}", self.step, c, self.clients[c].s.phase());
                 self.clients[c].shown = self.clients[c].s.phase().clone();
             }
+        }
+        /* The clones' writers (N10d2) */
+        for k in 0..self.clones.len() {
+            if self.clones[k].dead {
+                continue;
+            }
+            let now = self.now;
+            let mut out = Vec::new();
+            let cl = &mut self.clones[k];
+            cl.s.tick(now, &mut cl.bufs, &mut out);
+            self.clone_outs(k, out)?;
         }
         Ok(())
     }
@@ -1707,6 +1818,392 @@ impl World {
         Ok(())
     }
 
+    /* ---- the clone (N10d2) ---- */
+
+    /// The clone's turn, on draws of its own: one made of the newest snapshot
+    /// now and then, its writer's operations, the clone dropped now and then
+    /// -- or at once, its writer lost with its host or failed.
+    fn clone_turn(&mut self) -> Result<(), String> {
+        let Some(k) = self.clones.len().checked_sub(1).filter(|_| self.state.volume(CLONE).is_some()) else {
+            if self.clone_r.below(1000) < 4 {
+                self.make_clone()?;
+            }
+            return Ok(());
+        };
+        if self.clones[k].dead {
+            return self.drop_clone();
+        }
+        if *self.clones[k].s.phase() == Phase::Serving && self.clones[k].s.busy() < 6 && self.clone_r.chance(12) {
+            self.clone_op(k)?;
+        }
+        /* Stopped with every host up, as the volume's writer is for a
+           snapshot between two: a chunk whose last replica in is on a host
+           down holds a stop up until it is back */
+        if self.clone_r.below(1000) < 2 && self.down.is_none() {
+            self.drop_clone()?;
+        }
+        Ok(())
+    }
+
+    /// A clone made of the newest snapshot -- once each block of it that may
+    /// hold anything but zeros has been read, so that what the clone holds
+    /// where its writer has not written is known -- its own host one up, and
+    /// its writer started there.
+    fn make_clone(&mut self) -> Result<(), String> {
+        let Some(snap) = self.snaps.last() else { return Ok(()) };
+        let mut base = BTreeMap::new();
+        for (&b, may) in &snap.may {
+            match snap.seen.get(&b) {
+                Some(&v) => {
+                    base.insert(b, v);
+                }
+                None if may.iter().all(|&v| v == 0) => {}
+                None => return Ok(()),
+            }
+        }
+        let up: Vec<usize> = (0..HOSTS.len()).filter(|&h| Some(h) != self.down).collect();
+        let Some(h) = self.clone_r.pick(&up) else { return Ok(()) };
+        let from = snap.name.clone();
+        match self.apply(Command::Clone { from: from.clone(), name: String::from(CLONE), host: HOSTS[h].to_string() }) {
+            Answer::Volume { .. } => {}
+            other => return Err(format!("the clone of snapshot {} not made: {:?}", from, other)),
+        }
+        /* What it holds where its writer has not written: its snapshot's,
+           there for good -- as a write done and flushed before any */
+        self.cmodel = Blocks::default();
+        for (b, v) in base.into_iter().filter(|&(_, v)| v != 0) {
+            self.cmodel.history.insert(b, vec![(0, v, WState::Done)]);
+            self.cmodel.flushed.insert(b, (BTreeSet::from([v]), 1));
+        }
+        let token = 1 + self.clone_r.below(u64::MAX - 1);
+        let mut s = Session::new(CLONE, HOSTS[h], true, false, token);
+        let mut out = Vec::new();
+        s.start(self.now, &mut out);
+        let k = self.clones.len();
+        self.clones.push(CloneW { host: h, s, bufs: Bufs::default(), ops: BTreeMap::new(), next_tag: 1, dead: false,
+                                  stop_done: false, flush_failed_at: None });
+        self.count("clones made");
+        if self.trace {
+            eprintln!("  [{}] clone {} made of snapshot {}, its writer {} on host {}", self.step, CLONE, from, k,
+                      HOSTS[h]);
+        }
+        self.clone_outs(k, out)
+    }
+
+    /// An operation of the clone's writer: a write, a read, or a flush.
+    fn clone_op(&mut self, k: usize) -> Result<(), String> {
+        let blocks = VOLUME_MIB << 20 >> 12;
+        let first = self.clone_r.below(blocks.min(3 * SLOT / BLOCK));
+        let n = (1 + self.clone_r.below(4)).min(blocks - first);
+        let kind = match self.clone_r.below(10) {
+            0..=4 => K::Write(1 + self.clone_r.below(255) as u8),
+            5..=8 => K::Read,
+            _ => K::Flush,
+        };
+        let tag = self.clones[k].next_tag;
+        self.clones[k].next_tag += 1;
+        let (offset, len) = (first * BLOCK, (n * BLOCK) as u32);
+        let seq = self.seq;
+        let mut before = Vec::new();
+        let user = match kind {
+            K::Write(v) => {
+                self.seq += 1;
+                self.clones[k].bufs.0.insert(tag, vec![v; len as usize]);
+                for b in first..first + n {
+                    self.cmodel.history.entry(b).or_default().push((seq, v, WState::Out));
+                }
+                UserOp::Write { tag, offset, len }
+            }
+            K::Read => {
+                self.clones[k].bufs.0.insert(tag, vec![0u8; len as usize]);
+                before = (first..first + n).map(|b| self.cmodel.acked(b)).collect();
+                UserOp::Read { tag, offset, len }
+            }
+            K::Flush | K::Close => UserOp::Flush { tag },
+        };
+        if self.trace {
+            eprintln!("  [{}] the clone's writer {}: {:?} seq {} blocks {}+{} submitted", self.step, k, kind, seq,
+                      first, n);
+        }
+        self.clones[k].ops.insert(tag, MOp { kind, offset, len, seq, before, at: self.now });
+        let now = self.now;
+        let mut out = Vec::new();
+        let cl = &mut self.clones[k];
+        cl.s.submit(user, now, &mut cl.bufs, &mut out);
+        self.clone_outs(k, out)
+    }
+
+    /// The clone's writer's outputs: its messages queued, its operations
+    /// checked.
+    fn clone_outs(&mut self, k: usize, out: Vec<Out>) -> Result<(), String> {
+        for o in out {
+            match o {
+                Out::Send { to: To::Mds, id, bytes } => {
+                    if let Some(Ask::Down { set, cs, .. }) = Asking::decode(&bytes).map(|a| a.ask) {
+                        if !self.clones[k].s.writes_in(set, cs) {
+                            return Err(format!("the clone's writer {} asked cs {} out of set {}, which its view does \
+                                                not write it in -- {}", k, cs, set, self.clones[k].s.view()));
+                        }
+                    }
+                    let h = self.clones[k].host;
+                    self.push(End::Clone(k), End::Mds(h), bytes, id);
+                }
+                Out::Send { to: To::Cs(cs), id, bytes } => {
+                    let Some(h) = self.host_of_cs(cs) else { return Err(format!("a request to cs {}, none", cs)) };
+                    self.push(End::Clone(k), End::Cs(h), bytes, id);
+                }
+                Out::Done { tag, ok } => self.clone_done(k, tag, ok)?,
+                Out::Say(line) => {
+                    if self.trace {
+                        eprintln!("  [{}] the clone's writer {}: {}", self.step, k, line);
+                    }
+                }
+            }
+        }
+        self.clone_failed(k)
+    }
+
+    /// The clone's writer failed: only as its chunk's last active replica
+    /// refuses it -- driven no more then, the clone dropped -- or once
+    /// dropped.
+    fn clone_failed(&mut self, k: usize) -> Result<(), String> {
+        let Phase::Failed(why) = self.clones[k].s.phase() else { return Ok(()) };
+        if self.clones[k].dead {
+            return Ok(());
+        }
+        if why != LOST_LAST {
+            return Err(format!("the clone's writer {} failed: {}", k, why));
+        }
+        self.count("clone writers failed: the last replica lost");
+        self.clones[k].dead = true;
+        Ok(())
+    }
+
+    /// An operation of the clone's writer's done: held to the clone's model
+    /// as the volume's writers' are to the volume's.
+    fn clone_done(&mut self, k: usize, tag: u64, ok: bool) -> Result<(), String> {
+        if tag == STOP {
+            let phase = self.clones[k].s.phase();
+            if self.clones[k].stop_done || !matches!(phase, Phase::Detached | Phase::Failed(_))
+                || ok != (*phase == Phase::Detached)
+            {
+                return Err(format!("the clone's writer {}'s stop done {}, {:?}: {}", k, ok, phase,
+                                   self.clones[k].s.report()));
+            }
+            self.clones[k].stop_done = true;
+            return Ok(());
+        }
+        let Some(op) = self.clones[k].ops.remove(&tag) else { return Ok(()) };
+        let data = self.clones[k].bufs.0.remove(&tag).unwrap_or_default();
+        let (first, n) = (op.offset / BLOCK, u64::from(op.len) / BLOCK);
+        let lost = self.clones[k].dead || matches!(self.clones[k].s.phase(), Phase::Failed(_));
+        if !ok && matches!(op.kind, K::Flush | K::Close) && self.now >= op.at + DEADLINE_NS {
+            self.clones[k].flush_failed_at = Some(self.now);
+        }
+        if !ok && !lost && self.now < op.at + DEADLINE_NS
+            && !self.failed_with_one_before(&op, self.clones[k].flush_failed_at, &self.clones[k].ops)
+        {
+            return Err(format!("the clone's writer {}: {:?} of blocks {}+{} failed {} ms after it was asked, before \
+                                its deadline", k, op.kind, first, n, (self.now - op.at) / MS));
+        }
+        match op.kind {
+            K::Write(v) => {
+                for b in first..first + n {
+                    if let Some(w) = self.cmodel.history.get_mut(&b).and_then(|h| h.iter_mut().find(|w| w.0 == op.seq)) {
+                        w.2 = if ok { WState::Done } else { WState::Failed };
+                    }
+                }
+                self.count(if ok { "clone writes done" } else { "clone writes failed" });
+                if !ok {
+                    return Ok(());
+                }
+                /* Every replica of the clone's in holds it -- but where a
+                   later write was done since */
+                let generation = self.clones[k].s.generation();
+                for b in first..first + n {
+                    if self.cmodel.history.get(&b).is_some_and(|h| h.iter().any(|w| w.0 > op.seq)) {
+                        continue;
+                    }
+                    let Some((volume, chunk, inside, hosts)) = self.replicas_in(CLONE, b, generation) else { continue };
+                    for h in hosts {
+                        let got = self.block_on(h, volume, chunk, inside);
+                        if got != Ok(v) {
+                            return Err(format!("the clone's write of {} to block {} done, and host {} holds {:?}", v,
+                                               b, self.hosts[h].name, got));
+                        }
+                    }
+                }
+            }
+            K::Read => {
+                self.count(if ok { "clone reads done" } else { "clone reads failed" });
+                if !ok {
+                    return Ok(());
+                }
+                for i in 0..n {
+                    let b = first + i;
+                    let got = &data[(i * BLOCK) as usize..((i + 1) * BLOCK) as usize];
+                    let v = got[0];
+                    if got.iter().any(|&x| x != v) {
+                        return Err(format!("the clone's read of block {}: not one value", b));
+                    }
+                    let may = self.cmodel.readable(b, op.before[i as usize]);
+                    if !may.contains(&v) {
+                        return Err(format!("the clone's read of block {} gave {}, which may be {:?}", b, v, may));
+                    }
+                }
+            }
+            K::Flush | K::Close => {
+                self.count(if ok { "clone flushes done" } else { "clone flushes failed" });
+                if !ok {
+                    return Ok(());
+                }
+                /* What was done before it durable -- or what came after that
+                   and may be there: failed, or out still */
+                let blocks: Vec<u64> = self.cmodel.history.keys().copied().collect();
+                for b in blocks {
+                    let h = &self.cmodel.history[&b];
+                    let last = h.iter().rposition(|w| w.0 < op.seq && w.2 == WState::Done);
+                    let mut may = BTreeSet::from([last.map_or(0, |i| h[i].1)]);
+                    for w in h[last.map_or(0, |i| i + 1)..].iter().filter(|w| w.0 < op.seq && w.2 != WState::Done) {
+                        may.insert(w.1);
+                    }
+                    self.cmodel.flushed.insert(b, (may, op.seq));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The clone's writer gone with its host: its writes out failed -- there
+    /// or not -- and it driven no more, the clone to be dropped.
+    fn lose_clone(&mut self, k: usize) {
+        self.count("clone writers lost");
+        let ops: Vec<MOp> = std::mem::take(&mut self.clones[k].ops).into_values().collect();
+        for op in ops {
+            if let K::Write(_) = op.kind {
+                let first = op.offset / BLOCK;
+                for b in first..first + u64::from(op.len) / BLOCK {
+                    if let Some(w) = self.cmodel.history.get_mut(&b).and_then(|h| h.iter_mut().find(|w| w.0 == op.seq)) {
+                        w.2 = WState::Failed;
+                    }
+                }
+            }
+        }
+        self.clones[k].dead = true;
+    }
+
+    /// The clone's writer stopped -- what it was asked done, a flush, its
+    /// chunks closed, the clone let go of -- its stop done once, as it ends.
+    fn stop_clone(&mut self, k: usize) -> Result<(), String> {
+        let now = self.now;
+        let mut out = Vec::new();
+        {
+            let cl = &mut self.clones[k];
+            cl.s.stop(STOP, now, &mut cl.bufs, &mut out);
+        }
+        self.clone_outs(k, out)?;
+        for _ in 0..30_000 {
+            if self.clones[k].dead || matches!(self.clones[k].s.phase(), Phase::Detached | Phase::Failed(_)) {
+                break;
+            }
+            self.now += 5 * MS;
+            if self.links.values().all(|q| q.is_empty()) {
+                self.now += 200 * MS;
+            }
+            self.deliver()?;
+            self.tick()?;
+        }
+        match self.clones[k].s.phase() {
+            Phase::Detached | Phase::Failed(_) if !self.clones[k].stop_done => {
+                Err(format!("the clone's writer {} over, and its stop never done", k))
+            }
+            Phase::Detached | Phase::Failed(_) => Ok(()),
+            _ if self.clones[k].dead => Ok(()),
+            _ => Err(format!("the clone's writer {} not stopped: {}", k, self.clones[k].s.report())),
+        }
+    }
+
+    /// The clone dropped: its writer stopped, or -- lost or failed -- the
+    /// clone let go of by force on a host up, as a person would; then
+    /// deleted, its chunks freed by the cs's garbage passes where no map
+    /// names them.
+    fn drop_clone(&mut self) -> Result<(), String> {
+        let Some(k) = self.clones.len().checked_sub(1) else { return Ok(()) };
+        if self.state.volume(CLONE).is_none() {
+            return Ok(());
+        }
+        if !self.clones[k].dead && !matches!(self.clones[k].s.phase(), Phase::Detached | Phase::Failed(_)) {
+            self.stop_clone(k)?;
+        }
+        if self.state.volume(CLONE).is_some_and(|v| v.writer.is_some()) {
+            let up: Vec<usize> = (0..HOSTS.len()).filter(|&h| Some(h) != self.down).collect();
+            let h = self.clone_r.pick(&up).unwrap_or(0);
+            let host = HOSTS[h].to_string();
+            let token = 1 + self.clone_r.below(u64::MAX - 1);
+            let attached = self.apply(Command::Attach { name: String::from(CLONE), host: host.clone(), writable: true,
+                                                        force: true, token });
+            let Answer::Attached { generation } = attached else {
+                return Err(format!("the clone, its writer lost, not taken by force: {:?}", attached));
+            };
+            match self.apply(Command::Detach { name: String::from(CLONE), host, generation }) {
+                Answer::Refused(why) => return Err(format!("the clone, taken by force, not let go of: {:?}", why)),
+                _ => self.count("clones let go of by force"),
+            }
+        }
+        match self.apply(Command::VolumeDelete { name: String::from(CLONE) }) {
+            Answer::Volume { .. } => {}
+            other => return Err(format!("the clone not dropped: {:?}", other)),
+        }
+        self.clones[k].dead = true;
+        self.cmodel = Blocks::default();
+        self.count("clones dropped");
+        if self.trace {
+            eprintln!("  [{}] clone {} dropped", self.step, CLONE);
+        }
+        Ok(())
+    }
+
+    /// The clone at the end, where there is one: its writer stopped, and
+    /// each block it holds by its model -- its snapshot's, or written since
+    /// -- read on every active replica of its chunk as the last write done
+    /// there, or one that failed since, the same on all but where one did;
+    /// then dropped.
+    fn clone_end(&mut self) -> Result<(), String> {
+        let Some(k) = self.clones.len().checked_sub(1).filter(|_| self.state.volume(CLONE).is_some()) else {
+            return Ok(());
+        };
+        if !self.clones[k].dead {
+            self.stop_clone(k)?;
+        }
+        if !self.clones[k].dead && *self.clones[k].s.phase() == Phase::Detached {
+            let blocks: Vec<u64> = self.cmodel.history.keys().copied().collect();
+            for b in blocks {
+                let Some((volume, chunk, inside, hosts)) = self.replicas_in(CLONE, b, 0) else { continue };
+                let failed = self.cmodel.failed_since_done(b);
+                let mut may = failed.clone();
+                may.insert(self.cmodel.acked(b).1);
+                let mut seen: Option<(usize, u8)> = None;
+                for h in hosts {
+                    let v = self.block_on(h, volume, chunk, inside)
+                        .map_err(|e| format!("the end: the clone's block {} on host {}: {}", b, self.hosts[h].name, e))?;
+                    if !may.contains(&v) {
+                        return Err(format!("the end: the clone's block {} is {} on host {}, which may be {:?}", b, v,
+                                           self.hosts[h].name, may));
+                    }
+                    match seen {
+                        Some((g, w)) if w != v && failed.is_empty() => {
+                            return Err(format!("the end: the clone's block {} is {} on host {} and {} on host {}", b,
+                                               w, self.hosts[g].name, v, self.hosts[h].name));
+                        }
+                        _ => seen = Some((h, v)),
+                    }
+                }
+            }
+            self.count("clones held to at the end");
+        }
+        self.drop_clone()
+    }
+
     /// Every snapshot reads what the volume held at it: each block it is
     /// held to, on every active replica up of its chunk, one of what it may
     /// hold, the same on all, and the same as at the first look.
@@ -1874,6 +2371,11 @@ impl World {
         for c in writers {
             self.lose_client(c);
         }
+        let clones: Vec<usize> = (0..self.clones.len()).filter(|&k| self.clones[k].host == h && !self.clones[k].dead)
+            .collect();
+        for k in clones {
+            self.lose_clone(k);
+        }
         Ok(())
     }
 
@@ -1950,14 +2452,21 @@ impl World {
         s.start(self.now, &mut out);
         self.clients.push(Client { host: h, s, bufs: Bufs::default(), ops: BTreeMap::new(), next_tag: 1, zombie: false,
                                    dead: false, served: false, unflushed: Vec::new(), quiet: false,
-                                   shown: Phase::Attaching, failed: 0, stop_done: false });
+                                   shown: Phase::Attaching, failed: 0, stop_done: false,
+                                   flush_failed_at: None });
         self.outs(c, out)
     }
 
     /// Whether every chunk of the volume has a replica in on a host other
     /// than `h`: a writer can do without `h`.
     fn whole_without(&self, h: usize) -> bool {
-        let Some(v) = self.state.volume(VOLUME) else { return false };
+        self.volume_whole_without(VOLUME, h)
+    }
+
+    /// `whole_without`, of volume `name`'s chunks: the clone's too, where it
+    /// is to be stopped with `h` gone (N10d2).
+    fn volume_whole_without(&self, name: &str, h: usize) -> bool {
+        let Some(v) = self.state.volume(name) else { return false };
         v.map.iter().all(|&c| {
             self.state.chunks().get(c as usize).and_then(|ch| self.state.sets().get(ch.set as usize))
                 .is_some_and(|s| (0..nbsmeta::REPLICAS).any(|i| {
@@ -2322,6 +2831,7 @@ fn setup(r: &mut Rng) -> Result<World, String> {
                         scrub: Scrub::new(SCRUB_EVERY), scrub_q: Vec::new(), scrub_r: Rng::new(0), scrub_id: 1,
                         rotted: Vec::new(), snaps: Vec::new(), snap_r: Rng::new(0), snap_next: 1, garbage_at: 0,
                         pausing: None, late: None, pause_next: 1, given_up: None, pause_word: None,
+                        clones: Vec::new(), cmodel: Blocks::default(), clone_r: Rng::new(0),
                         stats: BTreeMap::new() };
     w.apply(Command::Init { cluster: CLUSTER, name: String::from("nbs"), host: String::from(HOSTS[0]), member: 1 });
     for (k, h) in HOSTS.iter().enumerate().skip(1) {
@@ -2363,6 +2873,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     w.scrub_r = Rng::new(mix(seed, 0x7363_7275));
     /* The snapshots' too (N10c) */
     w.snap_r = Rng::new(mix(seed, 0x736e_6170));
+    w.clone_r = Rng::new(mix(seed, 0x636c_6f6e));
     let first = w.r.below(HOSTS.len() as u64) as usize;
     w.writer(first)?;
     let mut back_at = 0u64;
@@ -2480,6 +2991,9 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         if !w.snaps.is_empty() && w.snap_r.chance(1) {
             w.snapshots_hold("a look").map_err(|e| format!("step {}: {}", step, e))?;
         }
+        /* A clone of the newest snapshot, its writer's operations, the clone
+           dropped (N10d2): of a randomness of their own */
+        w.clone_turn().map_err(|e| format!("step {}: {}", step, e))?;
         /* A writer lost with its host: another starts */
         if w.current().is_none() {
             let up: Vec<usize> = (0..HOSTS.len()).filter(|&h| Some(h) != w.down).collect();
@@ -2492,10 +3006,14 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     /* The end: the host down back -- or, where every chunk has a replica in
        on another, now and then lost for good -- the writer stopped, one
        started on a host up where there is none, or where the last failed as
-       it may, and every replica on a host up alike */
+       it may, and every replica on a host up alike. The clone first, where
+       there is one -- whole without the host lost too: its writer stopped,
+       held to its model, dropped (N10d2) */
     let mut lost = None;
     if let Some(h) = w.down {
-        if w.r.chance(50) && w.whole_without(h) {
+        if w.r.chance(50) && w.whole_without(h)
+            && (w.state.volume(CLONE).is_none() || w.volume_whole_without(CLONE, h))
+        {
             w.count("hosts lost for good");
             if w.trace {
                 eprintln!("  [end] host {} lost for good", w.hosts[h].name);
@@ -2505,6 +3023,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
             w.restart(h).map_err(|e| format!("the end: {}", e))?;
         }
     }
+    w.clone_end().map_err(|e| format!("the end: {}", e))?;
     /* The ends shaped since N9d's second round drawn of their own, so that
        a run they do not shape goes as it did */
     let mut ends = Rng::new(mix(seed, 0x636c_6f73));
