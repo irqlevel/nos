@@ -174,9 +174,24 @@ public:
     bool map_contiguous_pages(ulong virt_addr, Page* pages, size_t count);
     bool map_phys_pages(ulong virt_addr, const ulong* phy_addrs, size_t count);
 
-    /* Drop the mapping reference on count pages; with free_pages set they
-       also go back to the free list (the alloc_page/map_pages pairing). */
-    void unmap_pages(ulong virt_addr, size_t count, bool free_pages);
+    /* Drop the mapping reference on count pages. With frames given, each
+       page unmapped is put in it, in order, for the caller to hand to
+       free_pages -- once no CPU's TLB can still reach it at this address
+       (CpuTable::invalidate_tlb_range). The pages used to go back to the
+       free list here, under the lock, with only this CPU's TLB flushed: a
+       page could be another allocation's while a CPU that still had the
+       address in its TLB read or wrote it through the old one, so that a
+       use after free landed in whoever had the page next. */
+    void unmap_pages(ulong virt_addr, size_t count, Page** frames = nullptr);
+
+    /* count pages back on the free list, under one hold of the lock; a
+       null one -- an address unmap_pages found nothing at -- is passed over */
+    void free_pages(Page* const* pages, size_t count);
+
+    /* How many bytes of a map_mmio_region mapping there are from virt_addr
+       to its end; 0 when the address is in none this table made. What a
+       user of somebody else's mapping holds an offset into it to. */
+    ulong mmio_mapped_span(ulong virt_addr);
 
     /* Cache policy for map_mmio_region.
 
@@ -203,11 +218,23 @@ public:
        MMIO, and on real hardware a speculative fetch from device memory can
        trigger read side effects.
 
-       Boot-ordering constraint: the mapping is placed at
-       phys_addr + KERNEL_SPACE_BASE outside the VaAllocator, is permanent
-       (never unmapped), and only the local TLB is invalidated. Callers
-       must therefore run on the BSP before the APs are started
-       (currently: HPET and driver init in Main2/bp_startup). */
+       Where: in a window of its own (MMIO_WINDOW), at an address handed out
+       here, with a page left unmapped after it, so that a step past a
+       device's end faults rather than reaching the next device's registers.
+       It used to be at phys_addr + KERNEL_SPACE_BASE -- which is where the
+       image, page_array_ and the allocators' ranges are too, all of them at
+       KERNEL_SPACE_BASE plus an offset the machine's RAM sizes. On a machine
+       of more than three or four GiB the PCI hole's addresses were inside a
+       size class's range, a device's registers and a heap block one
+       allocation from the same VA: the heap's map refused at the device's
+       leaf, and went on being handed that block and refusing; or the
+       device's map found the heap's leaf there, left it, and handed back
+       heap memory for registers. No boot smaller than that showed either.
+
+       The same range asked for again -- a table's BAR its driver has mapped,
+       a driver trying again -- is the mapping it has. Permanent, as it was:
+       never unmapped. The addresses were never mapped before, so no TLB
+       holds anything of them and no other CPU is asked to flush. */
     ulong map_mmio_region(ulong phys_addr, ulong size_bytes,
         MmioCachePolicy policy = MmioUncached);
 
@@ -415,6 +442,13 @@ public:
     bool map_huge_pool_window();
     ulong huge_pool_window(ulong phy_addr);
 
+    /* Where the image's top-level entry ends. Everything a machine's RAM
+       sizes -- page_array_, the allocators' ranges -- stays below it
+       (PageAllocatorImpl::setup holds its ranges to it), and the windows --
+       MMIO's, the huge pool's -- are entries of their own above: nothing of
+       the one kind can be given an address of the other's. */
+    static const ulong IMAGE_ENTRY_END = 0xFFFF808000000000UL;
+
 private:
     PageTable(const PageTable& other) = delete;
     PageTable(PageTable&& other) = delete;
@@ -493,7 +527,7 @@ private:
 
     bool change_range_protection(ulong virt_addr, ulong size_bytes, bool writable,
         bool executable, bool exact);
-    void unmap_range_locked(ulong virt_addr, size_t count, bool free_pages);
+    void unmap_range_locked(ulong virt_addr, size_t count, Page** frames);
 
     ulong tmp_map_start_;
     kernel::SpinLock tmp_map_lock_;
@@ -604,6 +638,34 @@ private:
     /* Set once by map_huge_pool_window, before there is another CPU, and
        never again: read without the lock. */
     bool huge_pool_window_on_;
+
+    /* MMIO's window: a top-level entry of its own too, 48 TiB into the
+       kernel's half, between the allocators' ranges and the huge pool's
+       window -- so that where a device is mapped depends on nothing a
+       machine's RAM or its firmware's choice of addresses sizes. */
+    static const ulong MMIO_WINDOW = 0xFFFFB00000000000UL;
+    static_assert(MMIO_WINDOW % TOP_ENTRY_SPAN == 0, "the window starts a top-level entry");
+    static_assert(MMIO_WINDOW + TOP_ENTRY_SPAN <= HUGE_POOL_WINDOW, "the two windows apart");
+    static_assert(IMAGE_ENTRY_END % TOP_ENTRY_SPAN == 0, "the image's entry ends where the next starts");
+    static_assert(IMAGE_ENTRY_END <= MMIO_WINDOW, "the windows above the image's entry");
+    /* The window's next address (map_mmio_region): only ever forward, under
+       Lock. What a mapping cut short for want of a table leaves mapped
+       stays, where nothing reaches it. */
+    ulong mmio_next_;
+    /* What is mapped there, for the same range asked for again: under Lock.
+       A machine has a few dozen -- a BAR or two a device, the HPET, the
+       framebuffer -- and one past the last slot is mapped all the same,
+       only not found again. */
+    struct MmioMapping
+    {
+        ulong phys;
+        ulong pages;
+        ulong va;
+        bool write_combining;
+    };
+    static const ulong MMIO_MAPPINGS_MAX = 128;
+    MmioMapping mmio_mappings_[MMIO_MAPPINGS_MAX];
+    ulong mmio_mapping_count_;
     /* zerofree=verify (set_zero_check) */
     bool zero_check_;
 

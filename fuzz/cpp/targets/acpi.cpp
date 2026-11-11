@@ -9,14 +9,19 @@
 // and tables below and above 4 GiB, across page ends, over each other: a
 // MADT of every entry kind, a FADT, an HPET table and a WDAT of every
 // length, the SSDTs and the rest a firmware lists, and seconds of the kinds
-// read among them; now and then damaged anywhere. The window is emulated to
+// read among them; the DSDT the FADT names by either of its fields or by
+// neither -- pages of AML nobody runs, with a \_S5 in it as a firmware
+// writes one and as none does, across a page's end, cut by the table's, in
+// a table as long as one may be or longer; now and then damaged anywhere.
+// The window is emulated to
 // the slot: a mapping is a copy of the pages it maps between poisoned ones,
 // each page is let go of by itself, and the window refuses a mapping where
 // the input says. The machine is held to a reader of it written from
 // acpi.h -- the RSDP the search finds, the root, the first table of each
 // kind that can be mapped, the CPUs, the IO-APIC the driver can drive, the
-// overrides, the FADT's, HPET's and WDAT's fields, and whether it boots at
-// all -- and any machine, the window cut short or not, to this: nothing read
+// overrides, the FADT's, HPET's and WDAT's fields, the sleep types of the
+// DSDT's \_S5, and whether it boots at all -- and any machine, the window
+// cut short or not, to this: nothing read
 // past a mapping, nothing mapped past the physical address space or longer
 // than a table can be, no more of the window held at once than acpi.h
 // bounds, and nothing held once the parse is done but the local APIC's and
@@ -48,13 +53,16 @@ typedef unsigned long long ull;
 const u64 PAGE_BYTES = consts::PAGE_SIZE;
 const u64 MAX_PHYS = mm::MemoryMap::MAX_PHYS_ADDR;
 const u64 MAX_TABLE_LENGTH = Acpi::MAX_TABLE_LENGTH;
+const u64 MAX_DSDT_LENGTH = Acpi::MAX_DSDT_LENGTH;
 const size_t WINDOW_SLOTS = PageTable::TMP_MAP_SHARED_COUNT;
 
 /* What of the window the parse may hold at once (acpi.h): the root and a
    table of each kind, each at most MAX_TABLE_LENGTH long and so across at
    most that many pages and one more; then a header looked at, across two,
    or the local APIC's page and two IO-APICs', the one kept and the one
-   taking its place. */
+   taking its place. The DSDT is read once those are let go of, and holds
+   less: the APICs' two pages, and its header or a page of it with the start
+   of the next, across two. */
 const size_t MAX_TABLE_PAGES = Acpi::MAX_TABLE_LENGTH / consts::PAGE_SIZE + 1;
 const size_t MAX_HELD = (Acpi::MAX_TABLES + 1) * MAX_TABLE_PAGES + 3;
 
@@ -422,7 +430,7 @@ std::vector<uint8_t> madt_body(fuzz::Input& in)
     return body;
 }
 
-std::vector<uint8_t> fadt_body(fuzz::Input& in)
+std::vector<uint8_t> fadt_body(fuzz::Input& in, u64 dsdt_at)
 {
     /* ACPI 1.0's, 2.0's, 5.0's and 6's, less the header; and each side of
        where a field the kernel reads ends */
@@ -444,7 +452,84 @@ std::vector<uint8_t> fadt_body(fuzz::Input& in)
     }
     if (len >= 73 && in.boolean())
         body[72] = 0x32;
+
+    /* PM1b: none, as on most machines, or one */
+    if (len >= 36 && !in.chance(32))
+        put(body, 32, 0, 4);
+
+    /* The DSDT: by the 32-bit field and, where the table has it, by X_DSDT
+       -- which is the one taken when it is not zero -- and at times by
+       neither, or with one of them naming something else */
+    if (len >= 8)
+        put(body, 4, in.chance(24) ? (in.boolean() ? 0 : in.u32()) : static_cast<u32>(dsdt_at), 4);
+    if (len >= 112)
+        put(body, 104, in.chance(64) ? 0 : in.chance(16) ? in.u64() >> in.below(64) : dsdt_at, 8);
     return body;
+}
+
+/* A \_S5 as a firmware writes it -- NameOp, the name, a package of four
+   constants, the first two the sleep types -- and as none does: at the root
+   by its character, a PkgLength of more bytes than it takes or not the
+   package's, a count that is not the elements', fewer elements than two, a
+   sleep type past three bits or written as a word */
+std::vector<uint8_t> s5_name(fuzz::Input& in)
+{
+    /* Now and then the longest one this kernel reads: the root's character,
+       a PkgLength of four bytes, each sleep type behind its prefix -- what
+       its look past a page's end is measured by */
+    const bool longest = in.chance(32);
+
+    std::vector<uint8_t> elements;
+    const size_t count = in.chance(24) ? in.below(6) : 4;
+    for (size_t i = 0; i < count; i++)
+    {
+        const uint8_t v = static_cast<uint8_t>((i >= 2) ? 0 : in.chance(16) ? in.u8() : in.below(8));
+        if (longest && i < 2)
+        {
+            elements.push_back(0x0A);
+            elements.push_back(v);
+        }
+        else if (in.chance(8))
+        {
+            const uint8_t word[] = {0x0B, v, 0};
+            elements.insert(elements.end(), word, word + sizeof(word));
+        }
+        else if (v <= 1 && !in.chance(32))
+        {
+            elements.push_back(v);
+        }
+        else
+        {
+            elements.push_back(0x0A);
+            elements.push_back(v);
+        }
+    }
+
+    std::vector<uint8_t> n = {0x08};
+    if (longest || in.chance(64))
+        n.push_back(0x5C);
+    const uint8_t name[] = {'_', 'S', '5', '_', 0x12};
+    n.insert(n.end(), name, name + sizeof(name));
+
+    const size_t follow = longest ? 3 : in.chance(32) ? in.range(1, 3) : 0;
+    size_t len = 1 + follow + 1 + elements.size();
+    if (in.chance(16))
+        len = in.below(len + 4);
+    if (follow == 0)
+    {
+        n.push_back(static_cast<uint8_t>(len & 0x3F));
+    }
+    else
+    {
+        n.push_back(static_cast<uint8_t>((follow << 6) | (len & 0x0F)));
+        for (size_t i = 0; i < follow; i++)
+            n.push_back(static_cast<uint8_t>(len >> (4 + 8 * i)));
+    }
+    /* The count of elements: now and then not theirs -- fewer than the two
+       read, as often as anything */
+    n.push_back(static_cast<uint8_t>(in.chance(16) ? (in.boolean() ? in.below(3) : in.u8()) : count));
+    n.insert(n.end(), elements.begin(), elements.end());
+    return n;
 }
 
 std::vector<uint8_t> hpet_body(fuzz::Input& in)
@@ -531,6 +616,11 @@ struct Expected
     std::vector<ulong> cpus;
     std::vector<Override> overrides;
     ulong pm1a = 0;
+    ulong pm1b = 0;
+    u64 dsdt = 0;
+    bool s5 = false;
+    u8 s5_a = 0;
+    u8 s5_b = 0;
     bool reset = false;
     ulong reset_port = 0;
     u8 reset_value = 0;
@@ -695,6 +785,141 @@ void read_fadt(u64 fadt, u64 len, Expected& e)
     }
     if (body_len >= 73)
         e.century = peek(body + 72);
+    if (body_len >= 36)
+        e.pm1b = read(body + 32, 4);
+    if (body_len >= 8)
+        e.dsdt = read(body + 4, 4);
+    if (body_len >= 112 && read(body + 104, 8) != 0)
+    {
+        e.dsdt = read(body + 104, 8);
+        fuzz::reached("a DSDT by X_DSDT");
+    }
+}
+
+/* AML copied out of the table, read a byte at a time: past what there is of
+   it every byte is 0, and that it ran out is kept */
+struct Aml
+{
+    std::vector<uint8_t> bytes;
+    size_t at = 0;
+    bool ran_out = false;
+
+    uint8_t take()
+    {
+        if (at >= bytes.size())
+        {
+            ran_out = true;
+            return 0;
+        }
+        return bytes[at++];
+    }
+};
+
+/* Whether the AML at p, of a table that ends at end, is a \_S5 this
+   kernel reads (acpi.h): its sleep types, and how many bytes were read */
+bool s5_at(u64 p, u64 end, u8& a, u8& b, u64& len)
+{
+    Aml w;
+    for (u64 q = p; q < end && w.bytes.size() < 16; q++)
+        w.bytes.push_back(peek(q));
+
+    if (w.take() != 0x08)
+        return false;
+    if (w.at < w.bytes.size() && w.bytes[w.at] == 0x5C)
+        w.at++;
+    for (const char* c = "_S5_"; *c != 0; c++)
+    {
+        if (w.take() != static_cast<uint8_t>(*c))
+            return false;
+    }
+    if (w.take() != 0x12)
+        return false;
+
+    /* The package, from its length's first byte to where that length says
+       it ends: no more of it is the package's to read */
+    const size_t start = w.at;
+    const uint8_t lead = w.take();
+    size_t length = (lead >> 6) ? (lead & 0x0F) : (lead & 0x3F);
+    for (int k = 0; k < (lead >> 6); k++)
+        length |= static_cast<size_t>(w.take()) << (4 + 8 * k);
+    if (w.ran_out)
+        return false;
+    if (start + length < w.bytes.size())
+        w.bytes.resize(start + length);
+
+    if (w.take() < 2)
+        return false;
+    u8 type[2] = {0, 0};
+    for (u8& t : type)
+    {
+        const uint8_t op = w.take();
+        if (op == 0x0A)
+            t = w.take();
+        else if (op <= 1)
+            t = op;
+        else
+            return false;
+        if (t > 7)
+            return false;
+    }
+    if (w.ran_out)
+        return false;
+
+    a = type[0];
+    b = type[1];
+    len = w.at;
+    return true;
+}
+
+void read_dsdt(Expected& e)
+{
+    const u64 dsdt = e.dsdt;
+    if (dsdt == 0)
+    {
+        fuzz::reached("a FADT naming no DSDT");
+        return;
+    }
+    if (dsdt > MAX_PHYS - HDR || !is(dsdt, "DSDT"))
+    {
+        fuzz::reached("a DSDT that is none");
+        return;
+    }
+    const u64 len = read(dsdt + 4, 4);
+    if (len < HDR || len > MAX_DSDT_LENGTH || len > MAX_PHYS - dsdt)
+    {
+        fuzz::reached("a DSDT of a length not to be read");
+        return;
+    }
+    if (len > MAX_DSDT_LENGTH - PAGE_BYTES)
+        fuzz::reached("a DSDT as long as one may be");
+
+    /* The first, a page at a time: one never written holds no name's start */
+    const u64 end = dsdt + len;
+    for (u64 page = (dsdt + HDR) & ~(PAGE_BYTES - 1); page < end; page += PAGE_BYTES)
+    {
+        auto it = phys.find(page);
+        if (it == phys.end())
+            continue;
+        const u64 from = std::max<u64>(page, dsdt + HDR), to = std::min<u64>(page + PAGE_BYTES, end);
+        for (u64 p = from; p < to; p++)
+        {
+            u64 read_len = 0;
+            if (it->second[p - page] != 0x08 || !s5_at(p, end, e.s5_a, e.s5_b, read_len))
+                continue;
+            e.s5 = true;
+            fuzz::reached("a \\_S5");
+            if ((p & ~(PAGE_BYTES - 1)) != ((p + read_len - 1) & ~(PAGE_BYTES - 1)))
+                fuzz::reached("a \\_S5 across a page's end");
+            if (read_len == Acpi::S5_MAX_BYTES && ((p + 1) & (PAGE_BYTES - 1)) == 0)
+                fuzz::reached("the longest \\_S5 there is, begun in a page's last byte");
+            if (p + read_len == end)
+                fuzz::reached("a \\_S5 at the DSDT's very end");
+            if (e.s5_a > 1 || e.s5_b > 1)
+                fuzz::reached("a \\_S5 of sleep types past 1");
+            return;
+        }
+    }
+    fuzz::reached("a DSDT with no \\_S5 to read");
 }
 
 void read_hpet(u64 hpet, u64 len, Expected& e)
@@ -760,6 +985,7 @@ Expected read_machine()
         read_hpet(table[2], len[2], e);
     if (len[3] != 0)
         read_wdat(table[3], len[3], e);
+    read_dsdt(e);
     e.ok = true;
     return e;
 }
@@ -779,11 +1005,59 @@ void run(fuzz::Input& in)
         std::string name;
         std::vector<uint8_t> bytes;
     };
+
+    /* The DSDT first, for the FADT to name: a few pages of AML, at times
+       many; its length now and then not what was written of it -- as long
+       as one may be, most of it then pages nobody wrote, or longer, or
+       short of a header -- with a \_S5 in it, mostly one, anywhere: at
+       times across a page's end, or cut by the table's */
+    u64 dsdt_at = 0;
+    if (!in.chance(16))
+    {
+        const size_t built = in.chance(32) ? in.below(40 * PAGE_BYTES) : in.below(3 * PAGE_BYTES);
+        std::vector<uint8_t> dsdt = sdt(in.chance(4) ? "SSDT" : "DSDT", fuzz::noise(in.u32(), built));
+        u64 claimed = dsdt.size();
+        if (in.chance(8))
+        {
+            claimed = in.boolean() ? MAX_DSDT_LENGTH - in.below(PAGE_BYTES) : in.boolean() ?
+                MAX_DSDT_LENGTH + 1 + in.below(64) : in.below(HDR);
+            put(dsdt, 4, claimed, 4);
+        }
+        const u64 reserved = std::min<u64>(std::max<u64>(claimed, dsdt.size()), MAX_DSDT_LENGTH);
+        dsdt_at = place.place(reserved);
+        poke(dsdt_at, dsdt);
+        fuzz::say("DSDT at 0x%llx, %zu bytes written, length %llu", (ull)dsdt_at, dsdt.size(), (ull)claimed);
+
+        const u64 body_at = dsdt_at + HDR, body_end = dsdt_at + reserved;
+        for (size_t n = in.chance(32) ? in.below(4) : 1; n > 0 && body_end > body_at; n--)
+        {
+            const std::vector<uint8_t> name = s5_name(in);
+            u64 at = body_at + in.below(body_end - body_at);
+            if (in.chance(64))
+            {
+                /* Across a page's end: one of the table's */
+                const u64 first = (body_at + PAGE_BYTES) & ~(PAGE_BYTES - 1);
+                const u64 ends = (body_end > first) ? (body_end - first) / PAGE_BYTES + 1 : 1;
+                /* Its first byte the page's last, as often as anywhere else */
+                at = first + PAGE_BYTES * in.below(ends) - (in.chance(64) ? 1 : in.range(1, name.size() - 1));
+            }
+            else if (in.chance(24))
+            {
+                /* At the table's end, to its last byte or cut by it */
+                at = body_end - std::min<u64>(body_end - body_at, name.size() - in.below(4));
+            }
+            if (at < body_at)
+                at = body_at;
+            poke(at, name);
+            fuzz::say("a name at 0x%llx, %zu bytes", (ull)at, name.size());
+        }
+    }
+
     std::vector<Table> tables;
     if (!in.chance(8))
         tables.push_back({"APIC", sdt("APIC", madt_body(in))});
     if (!in.chance(64))
-        tables.push_back({"FACP", sdt("FACP", fadt_body(in))});
+        tables.push_back({"FACP", sdt("FACP", fadt_body(in, dsdt_at))});
     if (in.boolean())
         tables.push_back({"HPET", sdt("HPET", hpet_body(in))});
     if (in.chance(96))
@@ -1002,6 +1276,12 @@ void run(fuzz::Input& in)
             "irq %u goes to gsi %u flags 0x%x, not %u 0x%x", irq, acpi.get_gsi_by_irq(i), acpi.get_irq_flags(i), gsi, flags);
     }
     INVARIANT(acpi.get_pm1a_cnt_port() == e.pm1a, "PM1a at 0x%lx, not 0x%lx", acpi.get_pm1a_cnt_port(), e.pm1a);
+    INVARIANT(acpi.get_pm1b_cnt_port() == e.pm1b, "PM1b at 0x%lx, not 0x%lx", acpi.get_pm1b_cnt_port(), e.pm1b);
+    u8 typ_a = 0xFF, typ_b = 0xFF;
+    const bool s5 = acpi.get_s5(typ_a, typ_b);
+    INVARIANT(s5 == e.s5, "a \\_S5 %s", e.s5 ? "missed" : "from nowhere");
+    INVARIANT(!s5 || (typ_a == e.s5_a && typ_b == e.s5_b), "the \\_S5 read as %u and %u, where the DSDT's is "
+        "%u and %u", typ_a, typ_b, e.s5_a, e.s5_b);
     INVARIANT(acpi.has_reset_reg() == e.reset && acpi.get_reset_reg_port() == e.reset_port &&
         acpi.get_reset_value() == e.reset_value, "the reset register is not the FADT's");
     INVARIANT(acpi.get_century_register() == e.century, "the century register is %u, not %u",

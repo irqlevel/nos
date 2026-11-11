@@ -66,12 +66,25 @@ private:
 
     size_t get_index(u8 x, u8 y);
 
-    void overflow();
+    /* Where the next character goes: kept in row_/column_ between calls and
+       worked on as a copy within one, as FbTerm's is and for its reason --
+       the panic's path takes no lock, and holds its copy to the screen
+       before it writes through it. */
+    struct Cursor
+    {
+        u8 row;
+        u8 column;
+    };
 
-    void put_char(char c);
-    void cursor();
+    void overflow(Cursor& at);
+
+    void put_char(Cursor& at, char c);
+    void cursor(const Cursor& at);
 
     void puts_lock_held(const char *s);
+    /* The text written from `at` on, and where that left the cursor kept:
+       `at` on the screen */
+    void puts_from(Cursor at, const char *s);
     void cls_lock_held();
 
     const ulong buf_phy_addr_ = 0xB8000;

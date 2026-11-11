@@ -44,6 +44,12 @@ bool Profiler::allocate()
         if (!(running & (1UL << i)))
             continue;
 
+        /* One an earlier try got is kept: a try that ran out of memory
+           part of the way left what it had allocated, and the next
+           allocated every CPU's again over it */
+        if (cpu_[i].records != nullptr)
+            continue;
+
         cpu_[i].records = (Record*)mm::alloc(SAMPLES_PER_CPU * sizeof(Record), TAG);
         if (cpu_[i].records == nullptr)
         {
@@ -62,11 +68,14 @@ bool Profiler::allocate()
 
 bool Profiler::start()
 {
-    if (active_)
+    if (owned_.cmpxchg(1, 0) != 0)
         return false;
 
     if (!allocate())
+    {
+        owned_.set(0);
         return false;
+    }
 
     for (ulong i = 0; i < MAX_CPUS; i++)
     {
@@ -81,6 +90,12 @@ bool Profiler::start()
 
     active_ = true;
     return true;
+}
+
+void Profiler::finish()
+{
+    active_ = false;
+    owned_.set(0);
 }
 
 void Profiler::stop()

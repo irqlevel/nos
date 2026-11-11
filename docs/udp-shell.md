@@ -30,7 +30,7 @@ python3 scripts/udpsh.py <vm-ip> [port] [timeout]
   marked `[output truncated]`. The client collects chunks by index, so one
   reordered datagram no longer discards the whole answer, and it names any
   that never arrived.
-- `dmesg` still takes a line count, because the log holds 2048 messages and
+- `dmesg` still takes a line count, because the log holds 1024 messages and
   even 32 KB is a fraction of it: a dump from the head returns the first
   minutes of boot and nothing since, so on a machine that has been up a while
   `dmesg 40` is the useful form. Same reasoning as `nctail=N` for the

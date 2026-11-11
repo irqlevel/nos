@@ -194,10 +194,6 @@ void TaskQueue::switch_complete(Task* curr)
            itself, and it is not running. */
         bool runnable = prev->run_state_.get() == Task::RUN_QUEUED && !prev->is_idle();
         auto task_queue = runnable ? prev->select_next_task_queue() : nullptr;
-        /* Moved because this CPU is out of its affinity (set_task_affinity),
-           not for a lighter queue: the CPU it goes to may be halted, with
-           nothing to look at its queue until its next tick -- it is told */
-        bool evicted = task_queue != nullptr && out_of_affinity(prev);
 
         /* schedule()'s count should be the only one left: the locks
            TaskQueue::schedule took in prev were released above, in this
@@ -233,8 +229,16 @@ void TaskQueue::switch_complete(Task* curr)
                 tp::emit_sched_migrate(prev, from, task_queue->index());
             task_queue->insert(prev);
             prev->put();
-            if (evicted)
-                CpuTable::get_instance().get_cpu(task_queue->index()).send_ipi_self();
+            /* And the CPU it went to is told, whatever moved it. It used to
+               be told only of a task evicted by its affinity; one moved for
+               a lighter queue went, as often as not, to a CPU with nothing
+               to run -- which is what made it the lighter -- halted, and
+               looking at its queue again only at its next interrupt: the
+               task waited a tick there to save a slice here. A CPU that is
+               running something decides again for the same reason: alone on
+               its queue until now, it has no slice's end armed
+               (arm_slice). */
+            CpuTable::get_instance().get_cpu(task_queue->index()).send_ipi_self();
         }
         else
         {
@@ -1018,10 +1022,23 @@ void TaskQueue::clear()
     while (!task_list.is_empty())
     {
         Task* task = CONTAINING_RECORD(task_list.remove_head(), Task, list_entry_);
-        stdlib::AutoLock lock2(task->lock_);
-        BUG_ON(task->task_queue_ != this);
-        task->task_queue_ = nullptr;
-        task->put();
+        {
+            stdlib::AutoLock lock2(task->lock_);
+            BUG_ON(task->task_queue_ != this);
+            task->task_queue_ = nullptr;
+        }
+
+        /* The home list's reference is not dropped here but left for
+           reap_exited, which the caller runs once it holds no lock
+           (CpuTable::reset). Dropped here it was dropped under the task's
+           own lock -- whose release then wrote into a task this had just
+           freed, when the reference was its last -- and under the Cpu's
+           and the table's, the caller's, where a stack's free reads the
+           running CPUs under the table's lock a second time. The last it
+           is for a task its CPU was parked in the middle of the exit of:
+           off the task table already, and not yet off its queue. */
+        stdlib::AutoLock lock(exited_lock_);
+        exited_list_.insert_tail(&task->list_entry_);
     }
 
     klog(0, "TaskQueue 0x%p counters: sched %lu switch context %lu",
@@ -1031,6 +1048,8 @@ void TaskQueue::clear()
 TaskQueue::~TaskQueue()
 {
     clear();
+    /* What clear() left: nothing is held here */
+    reap_exited();
 }
 
 long TaskQueue::get_task_count()

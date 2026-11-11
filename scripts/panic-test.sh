@@ -19,6 +19,16 @@
 # lock, a panic inside the panic: on the network nothing, and no reset; and
 # a double fault's stopped again at the walk of the stack it came from,
 # until a fault in that walk came back to the report.
+#
+# And a fourth, the same way: a task's stack run out (`panic overflow`),
+# into the page under it, which is not mapped. On x86 that is a double fault
+# again, the fault having no stack to be delivered on; on arm64 the
+# exception's entry sees the abort is next to the stack pointer and takes it
+# on the CPU's overflow stack. Either way the report has to say the stack
+# ran out, name the frames that ran it out -- this stack can be read -- and
+# reach the collector, and panic=1 has to reset the machine. Before the page
+# was unmapped there was no panic to test: the stack ran on over its own
+# header and into the block below.
 # Usage: scripts/panic-test.sh [--skip-build] [--arch x86_64|aarch64]
 # Env:   PANIC_TIMEOUT  seconds to wait for each boot to panic (default 120)
 #        PANIC_HVF      set to 1 to run the arm64 boots under hvf (Apple Silicon)
@@ -171,13 +181,15 @@ done
 # collector, the command typed once the collector has heard from the machine
 # (its address resolved, which the report's flush needs), and what came out.
 ACCEL="${ACCEL_OPTS:-}"
-python3 - "$ARCH" "$TMPDIR_PT/panic-offstack.log" "out/x86_64/panic-offstack.iso" \
-    "$SHELL_PORT" "$NC_PORT" "$PANIC_TIMEOUT" "$RESET_WITHIN" "$OFFSTACK_ARGS" "$ACCEL" <<'PY' || exit 1
+# $1: which panic -- offstack, the third boot's, or overflow, the fourth's
+shell_panic() {
+python3 - "$ARCH" "$TMPDIR_PT/panic-$1.log" "out/x86_64/panic-offstack.iso" \
+    "$SHELL_PORT" "$NC_PORT" "$PANIC_TIMEOUT" "$RESET_WITHIN" "$OFFSTACK_ARGS" "$ACCEL" "$1" <<'PY'
 import os, re, socket, struct, subprocess, sys, threading, time
 
 arch, log, iso = sys.argv[1], sys.argv[2], sys.argv[3]
 shell_port, nc_port, timeout, reset_within = (int(a) for a in sys.argv[4:8])
-args, accel = sys.argv[8], sys.argv[9].split()
+args, accel, kind = sys.argv[8], sys.argv[9].split(), sys.argv[10]
 SHELL_MAGIC = 0x4E4F5348
 SHELL_HDR = struct.Struct("!IIHHHH")   # scripts/udpsh.py
 NC_HDR = 8                             # "NOSC" and the datagram's number
@@ -212,6 +224,8 @@ else:
             "-global", "virtio-mmio.force-legacy=false", "-device", "virtio-net-device,netdev=n0",
             "-serial", "file:" + log, "-display", "none"]
     command, said = "panic offstack", "off a task's stack"
+if kind == "overflow":
+    command, said = "panic overflow", "the stack ran out"
 argv += ["-netdev", "user,id=n0,hostfwd=udp::%d-:%d" % (shell_port, shell_port)]
 p = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -228,7 +242,7 @@ def until(cond, secs):
 
 
 def fail(why):
-    print("PANIC-TEST FAIL: offstack: " + why)
+    print("PANIC-TEST FAIL: %s: %s" % (kind, why))
     print("--- last 20 lines of serial log ---")
     print("".join(serial().splitlines(True)[-20:]), end="")
     sys.exit(1)
@@ -261,7 +275,10 @@ try:
         fail("it reset without saying so")
     if said not in sent or "Backtrace" not in sent:
         fail("its report never reached the netconsole's collector")
-    if arch == "x86_64":
+    if kind == "overflow":
+        if "panic_overflow" not in text or "panic_overflow" not in sent:
+            fail("the frames that ran the stack out are not in the report")
+    elif arch == "x86_64":
         if "the stack it came from cannot be read" not in text:
             fail("the walk of the stack it came from did not say it could not be read")
         if not re.search(r"Cpu \d+ backtrace:", text) or not re.search(r"Cpu \d+ backtrace:", sent):
@@ -273,6 +290,10 @@ finally:
         p.kill()
         p.wait()
 PY
+}
+
+shell_panic offstack || exit 1
+shell_panic overflow || exit 1
 
 echo "panic-test: OK ($ARCH)"
 exit 0
