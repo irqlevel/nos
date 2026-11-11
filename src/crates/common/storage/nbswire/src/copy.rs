@@ -154,7 +154,7 @@ pub struct Copy {
 /// into `mine`.
 fn differing<D: Device>(store: &mut Store<D>, c: ChunkRef, offset: u32, mine: &mut [u8], theirs: &[u8])
     -> Result<u64, nbscs::Error> {
-    store.own_read(c, offset, mine)?;
+    nbscs::now(store.own_read(c, offset, mine))?;
     Ok(mine.chunks(SECTOR).zip(theirs.chunks(SECTOR)).enumerate()
         .filter(|(k, (a, b))| a != b && !store.marked(&c, offset + (k * SECTOR) as u32, SECTOR as u32))
         .count() as u64)
@@ -317,7 +317,7 @@ impl Copy {
                 let Some(w) = self.work.as_ref() else { return };
                 let c = ChunkRef { chunk: w.chunk, incarnation: w.incarnation,
                                    epoch: Epoch { set: self.view.set, version } };
-                match store.copy_in(w.volume, c, offset, d) {
+                match nbscs::now(store.copy_in(w.volume, c, offset, d)) {
                     Ok(()) => {
                         self.progress_at = now;
                         self.stats.bytes += u64::from(len);
@@ -376,7 +376,7 @@ impl Copy {
     /// not pulled again.
     fn check<D: Device>(&mut self, store: &mut Store<D>, theirs: &[u32], out: &mut Vec<Out>) {
         let c = self.chunk_ref();
-        let mine = match store.own_sums(c, 0, CHUNK) {
+        let mine = match nbscs::now(store.own_sums(c, 0, CHUNK)) {
             Ok(m) => m,
             Err(e) => return self.fail(alloc::format!("chunk {}'s copy not read back: {:?}", c.chunk, e), out),
         };
@@ -402,7 +402,7 @@ impl Copy {
     /// The chunk copied and held to its source's: closed, and the next one.
     fn close<D: Device>(&mut self, store: &mut Store<D>, out: &mut Vec<Out>) {
         let c = self.chunk_ref();
-        if let Err(e) = store.close_copy(c) {
+        if let Err(e) = nbscs::now(store.close_copy(c)) {
             return self.fail(alloc::format!("chunk {}'s copy not closed: {:?}", c.chunk, e), out);
         }
         self.stats.chunks += 1;
@@ -433,7 +433,7 @@ impl Copy {
             return;
         }
         self.stats.again += before;
-        match store.copy_in(volume, c, offset, theirs) {
+        match nbscs::now(store.copy_in(volume, c, offset, theirs)) {
             Ok(()) => {}
             /* A client wrote the chunk here at a newer version: held again
                once the view has it */

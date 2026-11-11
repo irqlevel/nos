@@ -1,8 +1,10 @@
 //! A device of the cs's, as nbscs's engine is handed it: the device held
 //! with a queue of its own -- claimed as `nbs-cs`, so that nothing else
-//! writes it while the cs has it -- each request waited for in turn.
+//! writes it while the cs has it -- each request waited for in turn, its
+//! future ready at its first poll (until N12c starts and reaps them).
 
 use alloc::string::String;
+use core::future::{ready, Future};
 
 use kcore::block::{Disk, DiskQueue, Found};
 use kcore::events::SharedEvent;
@@ -44,19 +46,25 @@ impl Device for QueueDevice {
         self.q.disk().sector_size()
     }
 
-    fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), IoError> {
-        self.q.read_wait(0, offset, buf, Self::timeout()).map_err(|_| IoError)
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> impl Future<Output = Result<(), IoError>> + 'a {
+        ready(self.q.read_wait(0, offset, buf, Self::timeout()).map_err(|_| IoError))
     }
 
-    fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), IoError> {
-        self.q.write_wait(0, offset, data, Self::timeout()).map_err(|_| IoError)
+    fn write<'a>(&'a self, offset: u64, data: &'a [u8]) -> impl Future<Output = Result<(), IoError>> + 'a {
+        ready(self.q.write_wait(0, offset, data, Self::timeout()).map_err(|_| IoError))
     }
 
-    fn flush(&mut self) -> Result<(), IoError> {
-        self.q.flush().map_err(|_| IoError)
+    fn flush(&self) -> impl Future<Output = Result<(), IoError>> + '_ {
+        ready(self.q.flush().map_err(|_| IoError))
     }
 
-    fn zero(&mut self, offset: u64, len: u64) -> Result<(), IoError> {
+    fn zero(&self, offset: u64, len: u64) -> impl Future<Output = Result<(), IoError>> + '_ {
+        ready(self.zero_now(offset, len))
+    }
+}
+
+impl QueueDevice {
+    fn zero_now(&self, offset: u64, len: u64) -> Result<(), IoError> {
         /* The buffer zeroed once, then written over and over: nothing else
            lends it meanwhile */
         {

@@ -31,6 +31,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::future::{ready, Future};
 use std::rc::Rc;
 
 use nbscs::{ChunkRef, Device, Epoch, Error, Identity, IoError, OpenError, SlotState, Store, COPY_PIECE, PAGE, SLOT};
@@ -246,7 +247,26 @@ impl Device for Handle {
         self.0.borrow().sector
     }
 
-    fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), IoError> {
+    /* Each request done at once, its future ready at its first poll */
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> impl Future<Output = Result<(), IoError>> + 'a {
+        ready(self.read_now(offset, buf))
+    }
+
+    fn write<'a>(&'a self, offset: u64, data: &'a [u8]) -> impl Future<Output = Result<(), IoError>> + 'a {
+        ready(self.write_now(offset, data))
+    }
+
+    fn flush(&self) -> impl Future<Output = Result<(), IoError>> + '_ {
+        ready(self.flush_now())
+    }
+
+    fn zero(&self, offset: u64, len: u64) -> impl Future<Output = Result<(), IoError>> + '_ {
+        ready(self.zero_now(offset, len))
+    }
+}
+
+impl Handle {
+    fn read_now(&self, offset: u64, buf: &mut [u8]) -> Result<(), IoError> {
         let d = self.0.borrow();
         if d.dead {
             return Err(IoError);
@@ -281,7 +301,7 @@ impl Device for Handle {
         Ok(())
     }
 
-    fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), IoError> {
+    fn write_now(&self, offset: u64, data: &[u8]) -> Result<(), IoError> {
         let mut d = self.0.borrow_mut();
         let s = d.sector;
         assert!(offset % s == 0 && data.len() as u64 % s == 0 && offset + data.len() as u64 <= d.bytes,
@@ -293,7 +313,7 @@ impl Device for Handle {
         if d.burn() { Err(IoError) } else { Ok(()) }
     }
 
-    fn flush(&mut self) -> Result<(), IoError> {
+    fn flush_now(&self) -> Result<(), IoError> {
         let mut d = self.0.borrow_mut();
         if d.dead || d.burn() {
             return Err(IoError);
@@ -302,7 +322,7 @@ impl Device for Handle {
         Ok(())
     }
 
-    fn zero(&mut self, offset: u64, len: u64) -> Result<(), IoError> {
+    fn zero_now(&self, offset: u64, len: u64) -> Result<(), IoError> {
         let mut d = self.0.borrow_mut();
         assert!(offset % d.sector == 0 && len % d.sector == 0 && offset + len <= d.bytes, "a zero past the device");
         if d.dead {
@@ -420,13 +440,13 @@ impl Run {
     }
 
     fn reopen(&mut self) -> Result<(), String> {
-        let mut store = Store::new();
+        let store = Store::new();
         let mut order: Vec<usize> = (0..self.disks.len()).collect();
         if self.r.chance(50) {
             order.reverse();
         }
         for i in order {
-            match store.open_device(Handle(self.disks[i].clone()), self.identities[i]) {
+            match nbscs::now(store.open_device(Handle(self.disks[i].clone()), self.identities[i])) {
                 Ok((_, rep)) => {
                     if self.trace {
                         eprintln!("  reopen disk {}: {:?}", i, rep);
@@ -570,7 +590,7 @@ impl Run {
         let others: Vec<u32> = (1..=VOLUMES).filter(|&w| Some(w) != owner && self.fenced[w as usize] <= g).collect();
         let Some(w) = probe.pick(&others) else { return Ok(()) };
         if self.fenced[w as usize] < g {
-            self.store.fence(w, g).map_err(|e| format!("volume {} not fenced at {}: {:?}", w, g, e))?;
+            nbscs::now(self.store.fence(w, g)).map_err(|e| format!("volume {} not fenced at {}: {:?}", w, g, e))?;
             self.fenced[w as usize] = g;
             self.generation[w as usize] = self.generation[w as usize].max(g);
         }
@@ -591,7 +611,7 @@ impl Run {
     fn read_sector(&mut self, volume: u32, cref: ChunkRef, k: u32) -> Result<u8, String> {
         let mut buf = vec![0u8; self.sector as usize];
         let offset = k * self.sector as u32;
-        match self.store.read(volume, 0, cref, offset, &mut buf, true) {
+        match nbscs::now(self.store.read(volume, 0, cref, offset, &mut buf, true)) {
             Ok(()) => {}
             Err(e) => return Err(format!("chunk {} sector {} not read: {:?}", cref.chunk, k, e)),
         }
@@ -615,7 +635,7 @@ impl Run {
                 d.fuse = Some(fuse);
                 d.tear_next = true;
             }
-            match self.store.fence(v, g) {
+            match nbscs::now(self.store.fence(v, g)) {
                 Err(Error::Io) if self.dead() => {}
                 Ok(f) => self.fenced[v as usize] = f,
                 Err(e) => return Err(format!("fence of volume {} at {} in the tears: {:?}", v, g, e)),
@@ -676,7 +696,7 @@ impl Run {
                     self.generation[v as usize] += 1;
                 }
                 let g = self.generation[v as usize].saturating_sub(u64::from(self.r.chance(15)));
-                let got = self.store.fence(v, g.max(1));
+                let got = nbscs::now(self.store.fence(v, g.max(1)));
                 if got == Err(Error::Io) && self.dead() {
                     return Ok(());
                 }
@@ -725,7 +745,7 @@ impl Run {
                 let cref = self.cref(c);
                 let verified = self.r.chance(60);
                 let before = self.store.holding(c).filter(|h| h.incarnation == cref.incarnation);
-                let mut got = self.store.write(v, g, cref, start * self.sector as u32, &data, verified);
+                let mut got = nbscs::now(self.store.write(v, g, cref, start * self.sector as u32, &data, verified));
                 let held = self.store.holding(c);
                 if !verified && got.is_ok() && before.is_some_and(|h| h.volume != v) {
                     return Err(format!("step {}: chunk {} of volume {:?} written by volume {}, unvouched", step, c,
@@ -741,7 +761,7 @@ impl Run {
                         }
                         _ => {}
                     }
-                    got = self.store.write(v, g, cref, start * self.sector as u32, &data, true);
+                    got = nbscs::now(self.store.write(v, g, cref, start * self.sector as u32, &data, true));
                 }
                 if got == Err(Error::Io) && self.dead() {
                     /* Cut in the write: its sectors may hold its data, and
@@ -824,11 +844,11 @@ impl Run {
                     let other = 1 + v % VOLUMES;
                     let held = self.store.holding(c).is_some_and(|h| h.incarnation == cref.incarnation);
                     let at = k * self.sector as u32;
-                    match self.store.read(other, 0, cref, at, &mut buf, false) {
+                    match nbscs::now(self.store.read(other, 0, cref, at, &mut buf, false)) {
                         /* Asked of the mds first, held or not -- another
                            volume's, or none's here, which may be one freed
                            since (N10) -- then what it holds, or zeros */
-                        Err(Error::Unverified) => match self.store.read(other, 0, cref, at, &mut buf, true) {
+                        Err(Error::Unverified) => match nbscs::now(self.store.read(other, 0, cref, at, &mut buf, true)) {
                             Ok(()) if buf.iter().all(|&x| x == want) => {}
                             got => {
                                 return Err(format!("step {}: chunk {} of volume {} read by volume {}, vouched for: \
@@ -851,7 +871,7 @@ impl Run {
                 let verified = !aim.chance(25);
                 let held = self.store.holding(c).filter(|h| h.incarnation == cref.incarnation);
                 let at = k * self.sector as u32;
-                let mut got = self.store.read(v, g, cref, at, &mut buf, verified);
+                let mut got = nbscs::now(self.store.read(v, g, cref, at, &mut buf, verified));
                 if !verified {
                     match got {
                         Err(Error::Unverified) if held.is_some() => {
@@ -864,7 +884,7 @@ impl Run {
                         }
                         Err(Error::Unverified) | Err(Error::Epoch { .. }) => {
                             self.count("reads unverified at first");
-                            got = self.store.read(v, g, cref, at, &mut buf, true);
+                            got = nbscs::now(self.store.read(v, g, cref, at, &mut buf, true));
                         }
                         _ => {}
                     }
@@ -881,7 +901,7 @@ impl Run {
             }
             /* A flush: everything written durable */
             70..=79 => {
-                match self.store.flush() {
+                match nbscs::now(self.store.flush()) {
                     Err(Error::Io) if self.dead() => return Ok(()),
                     r => r.map_err(|e| format!("step {}: flush: {:?}", step, e))?,
                 }
@@ -905,7 +925,7 @@ impl Run {
                 let was_open = m.open == Some(g) && held;
                 let may = m.maybe_open == Some(g) && held;
                 let now: BTreeMap<u32, u8> = m.sectors.iter().map(|(&k, s)| (k, s.now())).collect();
-                let got = match self.store.close(v, g, cref) {
+                let got = match nbscs::now(self.store.close(v, g, cref)) {
                     Err(Error::Io) if self.dead() => {
                         /* Cut in the close: open still, or closed */
                         let m = &mut self.chunks[c as usize];
@@ -966,7 +986,7 @@ impl Run {
                 }
                 let m = &self.chunks[c as usize];
                 if tell {
-                    match self.store.free(c, m.incarnation) {
+                    match nbscs::now(self.store.free(c, m.incarnation)) {
                         Err(Error::Io) if self.dead() => {}
                         r => {
                             r.map_err(|e| format!("step {}: free of {}: {:?}", step, c, e))?;
@@ -1009,7 +1029,7 @@ impl Run {
                     let mut stale = self.cref(c);
                     stale.incarnation -= 1;
                     let mut buf = vec![0u8; self.sector as usize];
-                    let got = self.store.read(m.volume, 0, stale, 0, &mut buf, true);
+                    let got = nbscs::now(self.store.read(m.volume, 0, stale, 0, &mut buf, true));
                     *self.stats.entry("stale reads").or_default() += 1;
                     if got == Err(Error::Io) && self.dead() {
                         return Ok(());
@@ -1259,7 +1279,7 @@ impl Run {
 fn strangers(r: &mut Rng, sector: u64) -> Result<(), String> {
     let id = Identity { cluster: [7; 16], cs: 3, device: 99 };
     let d = Rc::new(RefCell::new(Disk::new(sector, 12 * SLOT)));
-    match Store::new().open_device(Handle(d.clone()), id) {
+    match nbscs::now(Store::new().open_device(Handle(d.clone()), id)) {
         Err((_, OpenError::Blank)) => {}
         other => return Err(format!("a blank disk opened as {:?}", other.map(|(_, rep)| rep).map_err(|(_, e)| e))),
     }
@@ -1278,7 +1298,7 @@ fn strangers(r: &mut Rng, sector: u64) -> Result<(), String> {
         disk.durable.insert(at / sector, v);
     }
     let before = d.borrow().durable.clone();
-    match Store::new().open_device(Handle(d.clone()), id) {
+    match nbscs::now(Store::new().open_device(Handle(d.clone()), id)) {
         Err((_, OpenError::Corrupt(_))) => {}
         other => {
             return Err(format!("a disk with a byte at {} of its first pages opened as {:?}", at,
@@ -1291,10 +1311,10 @@ fn strangers(r: &mut Rng, sector: u64) -> Result<(), String> {
     /* Another cs's: formatted as its, opened as this one's */
     let other = Rc::new(RefCell::new(Disk::new(sector, 12 * SLOT)));
     let theirs = Identity { cluster: [7; 16], cs: 4, device: 99 };
-    if let Err((_, e)) = Store::new().format_device(Handle(other.clone()), theirs, 5) {
+    if let Err((_, e)) = nbscs::now(Store::new().format_device(Handle(other.clone()), theirs, 5)) {
         return Err(format!("a disk not formatted: {:?}", e));
     }
-    match Store::new().open_device(Handle(other.clone()), id) {
+    match nbscs::now(Store::new().open_device(Handle(other.clone()), id)) {
         Err((_, OpenError::Foreign(i))) if i == theirs => Ok(()),
         got => Err(format!("another cs's disk opened as {:?}", got.map(|(_, rep)| rep).map_err(|(_, e)| e))),
     }
@@ -1313,9 +1333,9 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         handles.push(Rc::new(RefCell::new(Disk::new(sector, slots * SLOT))));
         identities.push(Identity { cluster: [7; 16], cs: 3, device: 10 + i as u32 });
     }
-    let mut store = Store::new();
+    let store = Store::new();
     for (i, d) in handles.iter().enumerate() {
-        if let Err((_, e)) = store.format_device(Handle(d.clone()), identities[i], 1 + r.below(u64::MAX - 1)) {
+        if let Err((_, e)) = nbscs::now(store.format_device(Handle(d.clone()), identities[i], 1 + r.below(u64::MAX - 1))) {
             return Err(format!("disk {} not formatted: {:?}", i, e));
         }
     }
