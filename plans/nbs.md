@@ -1563,11 +1563,38 @@ each new gate.
     cs answers looks ahead of its queue (docs/nbs.md, "The chunk server");
     nbs-test's N11 phase throttles c's pool through QEMU's monitor and
     holds c in its set through a stop's closes -- the tree before fails it.
+  - **With both** (8953bd84), and no replica taken out by any writer's stop:
+    256 KiB writes 28 MiB/s at depth 1 (6.7 ms), 50 at 2, 56 from 4 on --
+    1 GbE with two copies leaving the writer, as "What to expect" said.
+    Reads from the writer's own replica, a volume written whole: 256 KiB
+    929 MiB/s at depth 1 (0.25 ms), 1143 at 8; 4 KiB 14.5k IOPS at 1
+    (58 us), 17.5k at 32 -- the cs one request at a time, where the device
+    alone does 68k. 4 KiB writes into open chunks 1.4 ms at depth 1 (a round
+    trip to the AX41 and its write), 11.3k IOPS at 32. A cold chunk's first
+    write: p99 20 ms, p99.9 35 ms -- the open mark's two table writes and two
+    flushes on every replica, a VM's flush 10 ms, not the 1-4 ms expected of
+    the NVMe itself. A rejoin that finds its chunks the same pulls nothing
+    (619 compared in 18 s); one that missed writes pulls them whole -- 8 GiB
+    in 160 s at the line.
+  - **Still taken out, and why it is the next question**: a single request
+    past the leader's 250 ms look -- one flush of a VM's pool after a new
+    region (sparse files on the AX41's ext4: the host's journal commits) --
+    took a replica out (a cold chunk's write waited 676 ms); and under a
+    join's copy and cold writes at depth 8 at once, all three replicas were
+    silent 0.5 s at the same moment, two taken out, the writer's own kept as
+    the last. The cs serves one request at a time, a pull or a sum moves the
+    chunk's epoch -- a record written durable -- before it reads, and a
+    request the engine has not checked waits up to 5 s for this host's mds:
+    each a turn a look cannot get past. A real disk's 300 ms hiccup is a
+    take-out and a copy; whether a look should be answered by more than the
+    serving task, the look's time or decision 6's 0.5 s itself, is the
+    user's to weigh with the numbers above.
   - **What the numbers ask next**: closes a cs makes durable together, one
     write of each table page and two flushes for all that came at once,
     where today each costs three flushes (a VM's stop of 140 chunks is ~4 s
     of them); a cs with more than one request at its device at a time (the
-    `DiskQueue` is one slot); and the CPU -- at ~53 MB/s each way a
+    `DiskQueue` is one slot), which the 4 KiB reads (17.5k of the device's
+    68k) and the look both want; and the CPU -- at ~53 MB/s each way a
     connection's task is most of a CPU, all of TLS in software, as the
     kernel keeps SSE off. Chain replication and a UDP path wait on these:
     the link and TCP were not the limit.
