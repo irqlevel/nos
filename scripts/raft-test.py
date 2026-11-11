@@ -54,6 +54,12 @@ into a host program that holds it to:
     host's peers; its snapshot read back, changed and refused, and a
     replica from a snapshot part way (RAFT_REGISTRY_STATS=1 says what each
     run did);
+  - the asks target: raft::asks as raftmember runs it -- every member's
+    own commands, a session each, through raft::rsm in groups of three or
+    five over a network that fails, members cut off long enough to come
+    back by a snapshot, the leader refusing now and then; no command
+    applied twice, each ask told truly what became of it, and every one
+    asked once calm answered (RAFT_ASKS_STATS=1 says what each run did);
   - the wire target: messages written and read back, and noise and broken
     messages read without a panic, anything taken written back to its bytes;
   - the hostile target: one member fed messages no correct member sends --

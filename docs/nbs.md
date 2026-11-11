@@ -533,9 +533,10 @@ raftmember's, as the registry's member runs ([cluster.md](cluster.md), "How a
 member runs"):
 - one task, `nbs/mds`, over the log, ticking every 100 ms;
 - a message taken only from the host its node is on;
-- commands handed to the leader, and asked again for up to 30 s while a
-  leader is being chosen; answered once this host's member has applied them
-  too, so that what is read next on the host holds the change;
+- a shell's command asked once whoever leads, under a session of its own
+  and sent again to whichever member leads for up to 30 s (`raft::asks`);
+  answered once this host's member has applied it too, so that what is read
+  next on the host holds the change;
 - raft's membership kept to the state's voters and learners, a change at a
   time, a removed leader handing the lead on first.
 

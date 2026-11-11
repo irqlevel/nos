@@ -7,18 +7,19 @@
 //! the hostile target over seeds 1 to 2000, the storage target over seeds
 //! 1 to 20, the log target over seeds 1 to 300, the rsm target over seeds 1
 //! to 100, the registry target over seeds 1 to 200, the nbsmeta target over seeds 1
-//! to 200 -- every allocation of every one
+//! to 200, the asks target over seeds 1 to 300 -- every allocation of every one
 //! held to what the kernel's heap gives at once (`heap`). Exit 0 when
 //! everything held, 1 with what did not -- a finding with its seed, to run
 //! again with `node --seed N --trace` or `hostile --seed N`.
 //!
 //!     raft-fuzz unit | scenarios [name]
 //!     raft-fuzz node [--seed N] [--seeds K] [--steps S] [--seconds T] [--trace]
-//!     raft-fuzz wire|hostile|storage|log|rsm|registry|nbsmeta [--seed N] [--seeds K] [--iterations K] [--seconds T]
+//!     raft-fuzz wire|hostile|storage|log|rsm|registry|nbsmeta|asks [--seed N] [--seeds K] [--iterations K] [--seconds T]
 //!
 //! one part at a time; with `--seconds`, seeds on from the first until the
 //! time is up -- a campaign.
 
+mod asksfuzz;
 mod heap;
 mod hostile;
 mod logfuzz;
@@ -61,6 +62,8 @@ const GATE_REGISTRY_SEEDS: u64 = 200;
 const REGISTRY_STEPS: u64 = 400;
 const GATE_NBSMETA_SEEDS: u64 = 200;
 const NBSMETA_STEPS: u64 = 400;
+const GATE_ASKS_SEEDS: u64 = 300;
+const ASKS_STEPS: u64 = 3000;
 const HOSTILE_ITERATIONS: u64 = 3000;
 
 /// A run's outcome, a panic included as a finding, and a block asked for
@@ -135,7 +138,7 @@ fn unit() -> u32 {
 fn scenarios(only: Option<&str>) -> u32 {
     let mut failed = 0;
     for (name, f) in scenarios::ALL.iter().chain(review::ALL).chain(logfuzz::SCENARIOS).chain(rsmfuzz::SCENARIOS)
-        .chain(registryfuzz::SCENARIOS).chain(nbsmetafuzz::SCENARIOS) {
+        .chain(registryfuzz::SCENARIOS).chain(nbsmetafuzz::SCENARIOS).chain(asksfuzz::SCENARIOS) {
         if only.is_some_and(|o| o != *name) {
             continue;
         }
@@ -236,6 +239,7 @@ fn main() -> ExitCode {
                 + seeds("rsm", rsmfuzz::run, 1, GATE_RSM_SEEDS, RSM_STEPS, None)
                 + seeds("registry", registryfuzz::run, 1, GATE_REGISTRY_SEEDS, REGISTRY_STEPS, None)
                 + seeds("nbsmeta", nbsmetafuzz::run, 1, GATE_NBSMETA_SEEDS, NBSMETA_STEPS, None)
+                + seeds("asks", asksfuzz::run, 1, GATE_ASKS_SEEDS, ASKS_STEPS, None)
         }
         "unit" => unit(),
         "scenarios" => scenarios(args.get(2).map(String::as_str).filter(|a| !a.starts_with("--"))),
@@ -251,9 +255,10 @@ fn main() -> ExitCode {
         "rsm" => target(&args, "rsm", rsmfuzz::run, GATE_RSM_SEEDS, RSM_STEPS, seconds),
         "registry" => target(&args, "registry", registryfuzz::run, GATE_REGISTRY_SEEDS, REGISTRY_STEPS, seconds),
         "nbsmeta" => target(&args, "nbsmeta", nbsmetafuzz::run, GATE_NBSMETA_SEEDS, NBSMETA_STEPS, seconds),
+        "asks" => target(&args, "asks", asksfuzz::run, GATE_ASKS_SEEDS, ASKS_STEPS, seconds),
         _ => {
             eprintln!("usage: raft-fuzz gate | unit | scenarios [name] | node [--seed N] [--seeds K] [--steps S] \
-                       [--seconds T] [--trace] | wire|hostile|storage|log|rsm|registry|nbsmeta [--seed N] [--seeds K] [--iterations K] [--seconds T]");
+                       [--seconds T] [--trace] | wire|hostile|storage|log|rsm|registry|nbsmeta|asks [--seed N] [--seeds K] [--iterations K] [--seconds T]");
             return ExitCode::from(2);
         }
     };
