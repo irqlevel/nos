@@ -648,9 +648,13 @@ extern "C" void main_arm64(void* dtb)
         ulong text_end = (ulong)kernel_text;
         ulong rodata_end = (ulong)kernel_rodata;
         ulong img_end = (ulong)kernel_end;
-        pt.protect_range(text_start, text_end - text_start, false, true);     /* RX */
-        pt.protect_range(text_end, rodata_end - text_end, false, false);      /* RO+NX */
-        pt.protect_range(rodata_end, img_end - rodata_end, true, false);      /* RW+NX */
+        /* All three, or no boot: left as it was mapped the image is
+           writable and executable throughout, and nothing after this would
+           say so -- the results used to be dropped */
+        if (!pt.protect_range(text_start, text_end - text_start, false, true) ||     /* RX */
+            !pt.protect_range(text_end, rodata_end - text_end, false, false) ||      /* RO+NX */
+            !pt.protect_range(rodata_end, img_end - rodata_end, true, false))        /* RW+NX */
+            PANIC("W^X: the kernel image could not be protected");
         asm volatile("dsb ish; isb");
         klog(0, "W^X: text [0x%lX,0x%lX) rodata [0x%lX,0x%lX) data [0x%lX,0x%lX)",
             text_start, text_end, text_end, rodata_end, rodata_end, img_end);

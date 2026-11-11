@@ -590,13 +590,19 @@ bool PageTable::change_range_protection(ulong virt_addr, ulong size_bytes,
        exactly like map_page/unmap_page. */
     for (ulong va = virt_addr; va < end; va += consts::PAGE_SIZE)
     {
+        /* A window with no slot left is a failure the caller is told of:
+           each of the four used to be dereferenced as it came back */
         PtePage* l4 = (PtePage*)tmp_map_page(root_);
+        if (l4 == nullptr)
+            return false;
         Pte* l4e = &l4->entry[Pte::l4_index(va)];
         if (!l4e->present()) { tmp_unmap_page((ulong)l4); return false; }
         ulong l3phys = l4e->address();
         tmp_unmap_page((ulong)l4);
 
         PtePage* l3 = (PtePage*)tmp_map_page(l3phys);
+        if (l3 == nullptr)
+            return false;
         Pte* l3e = &l3->entry[Pte::l3_index(va)];
         if (!l3e->present() || l3e->huge())
         {
@@ -607,6 +613,8 @@ bool PageTable::change_range_protection(ulong virt_addr, ulong size_bytes,
         tmp_unmap_page((ulong)l3);
 
         PtePage* l2 = (PtePage*)tmp_map_page(l2phys);
+        if (l2 == nullptr)
+            return false;
         Pte* l2e = &l2->entry[Pte::l2_index(va)];
         if (!l2e->present() || l2e->huge())
         {
@@ -617,6 +625,8 @@ bool PageTable::change_range_protection(ulong virt_addr, ulong size_bytes,
         tmp_unmap_page((ulong)l2);
 
         PtePage* l1 = (PtePage*)tmp_map_page(l1phys);
+        if (l1 == nullptr)
+            return false;
         Pte* l1e = &l1->entry[Pte::l1_index(va)];
         if (!l1e->present()) { tmp_unmap_page((ulong)l1); return false; }
 
