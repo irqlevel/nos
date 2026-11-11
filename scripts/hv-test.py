@@ -145,7 +145,9 @@ def create_script(port):
     answer (create_checks): a qcow2 image downloaded, made a disk and grown
     to size=, given the seed and a vm.toml; the same name again refused; a
     raw image taken as it is; a URL with nothing at it, a file that is no
-    image and a size= under the image's refused, each leaving nothing."""
+    image and a size= under the image's refused, each leaving nothing; and
+    an image of NBS's made, and a VM of one, on a host with no NBS: refused,
+    leaving nothing (N10d3)."""
     url = "http://10.0.2.2:%d/" % port
     return [
         "hv create c1 %simg.qcow2 size=16M mem=512 password=nos" % url,
@@ -160,6 +162,9 @@ def create_script(port):
         "hv create c5 %simg.qcow2 size=1M" % url,
         "ls /vms",
         "hv vms",
+        "hv image i1 %simg.qcow2" % url,
+        "hv create c7 image=nbs:i1",
+        "ls /vms",
     ] + CLONE
 
 
@@ -547,7 +552,13 @@ def create_checks(out, grown, raw):
     pt.check("and those three left nothing behind",
              "c1" in out[10] and "c2" in out[10] and not any(n in out[10] for n in ("c3", "c4", "c5")), out[10])
     pt.check("hv vms lists the two made", "c1  not running" in out[11] and "c2  not running" in out[11], out[11])
-    clone_checks(out[12:], grown)
+    pt.check("hv image with no NBS here: refused before a download, saying to load nbs-mds.ko",
+             "insmod /nbs-mds.ko" in out[12] and "download" not in out[12], out[12])
+    pt.check("hv create ... image=nbs: with no NBS here: refused, saying the same",
+             "insmod /nbs-mds.ko" in out[13], out[13])
+    pt.check("and neither left anything behind: no folder, no download",
+             "c7" not in out[14] and ".image-" not in out[14], out[14])
+    clone_checks(out[15:], grown)
 
 
 def clone_checks(out, grown):

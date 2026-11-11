@@ -890,6 +890,32 @@ hv create <name> <url> onto=nbs:<volume>        a cloud's image downloaded and p
 A volume never written before reads as zeros, so a pour onto one leaves the
 image's zeros out.
 
+Or a cloud's image is made an image of NBS's once, and every VM of it is
+given a clone (N10d3):
+
+```
+hv image <name> <file|http(s)://image>          an image of NBS's: downloaded where it is a URL, a volume of its disk's size made, poured onto, frozen
+hv create <vm> image=nbs:<image> [size=N] [onto=nbs:<volume>] [words]
+                                                a VM whose first disk is a clone of the image: a volume of the VM's name, or onto='s, grown to size=
+```
+
+hv asks NBS through the management bus, as the host API does: nbs-mds's
+`nbs` provider (`volume`, `volume_create`, `volume_resize`,
+`volume_freeze`, `volume_clone`, `volume_delete`), so hv.ko links nothing of
+nbs-mds's, and without it says to `insmod /nbs-mds.ko`. `hv image` holds
+the name on its host while it makes the image -- a second of it there is
+refused -- refuses one NBS has, downloads a URL into the vms' folder
+(`.image-<name>`, removed after however it ends), makes the volume on this
+host of the disk's size, pours, and freezes it; one that fails deletes the
+volume while it is a volume still and this host's -- an image another host
+made of the name meanwhile is never taken away. `hv create ...
+image=nbs:` refuses an image that is a plain volume, a clone's name NBS has
+already and a `size=` under the image's; the clone is made before the
+folder's seed and vm.toml, and deleted with the rest when a later step
+fails. The clone is thin -- each chunk shared with the image until the VM
+writes it, copied up then -- so a VM of a 3 GiB image costs, at first,
+only its metadata.
+
 ## Tested
 
 - **`scripts/nbs-fuzz.py`** (host, in CI; [testing.md](testing.md)): `fuzz/nbs`'s
