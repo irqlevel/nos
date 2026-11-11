@@ -26,6 +26,27 @@ static inline __attribute__((always_inline)) bool irq_chip_ready()
     return kernel::Acpi::get_instance().get_lapic_address() != nullptr;
 }
 
+/* A level line with no device on it, which a self-test may register a
+   handler on and take it off again: false where none can be promised
+   quiet. Under QEMU and under nos's own hypervisor -- told by the firmware's
+   OEM id -- the last pin of an IO-APIC of 24: their IO-APICs raise a pin
+   when a device of theirs does and at no other time. On any other machine
+   none: a real IO-APIC's pin that nothing here drives may be held down by a
+   device nothing here drives, and one left unconnected and programmed
+   active-low, as a PCI line is, is asserted for as long as it is
+   unmasked. */
+static inline bool spare_level_line(u8& line)
+{
+    static const u8 SPARE_PIN = 23;
+
+    const char* oem = kernel::Acpi::get_instance().get_oem_id();
+    if (stdlib::str_cmp(oem, "BOCHS ") != 0 && stdlib::str_cmp(oem, "NOS   ") != 0)
+        return false;
+
+    line = SPARE_PIN;
+    return true;
+}
+
 static inline __attribute__((always_inline)) void irq_eoi()
 {
     kernel::Lapic::eoi();

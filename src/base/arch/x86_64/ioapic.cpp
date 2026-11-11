@@ -10,7 +10,8 @@ namespace kernel
 {
 
 IoApic::IoApic()
-    : base_address_(nullptr)
+    : pins_(0)
+    , base_address_(nullptr)
 {
     base_address_ = Acpi::get_instance().get_io_apic_address();
 
@@ -51,14 +52,44 @@ void IoApic::enable()
 
     u32 ver = read_register(APIC_VER);
     size_t pins = ((ver >> 16) & 0xFF) + 1;
+    if (pins > MAX_PINS)
+    {
+        klog(0, "IO Apic says %lu pins, more than its registers reach: %lu taken", pins, MAX_PINS);
+        pins = MAX_PINS;
+    }
 
     // Disable all entries
     for (size_t i = 0; i < pins; i++)
     {
-        set_entry(i, 1 << MASKED_SHIFT);
+        set_entry((u8)i, 1 << MASKED_SHIFT);
     }
+    pins_ = pins;
 
     klog(IO_APIC_LL, "IO Apic ver 0x%X pins %lu", ver, pins);
+}
+
+bool IoApic::has_pin(u8 irq) const
+{
+    return irq < pins_;
+}
+
+void IoApic::mask_irq(u8 irq)
+{
+    if (!has_pin(irq))
+        return;
+
+    /* The low register read and written back under one hold of the lock,
+       the select register still naming it */
+    stdlib::AutoLock lock(op_lock_);
+
+    mm::MmIo::write32(stdlib::mem_add(base_address_, REG_SEL), (u32)(RED_TBL + 2 * irq));
+
+    hal::dma_wmb();
+
+    u32 low = mm::MmIo::read32(stdlib::mem_add(base_address_, REG_WIN));
+    mm::MmIo::write32(stdlib::mem_add(base_address_, REG_WIN), low | (1U << MASKED_SHIFT));
+
+    hal::dma_wmb();
 }
 
 void IoApic::set_entry(u8 index, u64 data)
@@ -83,9 +114,12 @@ u64 IoApic::check_dest(u8 irq, u64 apic_id)
     return 0;
 }
 
-void IoApic::set_irq(u8 irq, u64 apic_id, u8 vector)
+bool IoApic::set_irq(u8 irq, u64 apic_id, u8 vector)
 {
     u64 data = 0;
+
+    if (!has_pin(irq))
+        return false;
 
     apic_id = check_dest(irq, apic_id);
 
@@ -102,10 +136,15 @@ void IoApic::set_irq(u8 irq, u64 apic_id, u8 vector)
         (ulong)irq, (ulong)apic_id, (ulong)vector, (ulong)data);
 
     set_entry(irq, data);
+    return true;
 }
 
 u64 IoApic::set_irq_destination(u8 irq, u64 apic_id)
 {
+    /* Only a line register_level programmed is retargeted */
+    if (BUG_ON(!has_pin(irq)))
+        return apic_id;
+
     apic_id = check_dest(irq, apic_id);
 
     /* The destination id occupies bits 56-63 of the redirection entry,
@@ -118,9 +157,12 @@ u64 IoApic::set_irq_destination(u8 irq, u64 apic_id)
     return apic_id;
 }
 
-void IoApic::set_irq_level(u8 irq, u64 apic_id, u8 vector, bool active_high)
+bool IoApic::set_irq_level(u8 irq, u64 apic_id, u8 vector, bool active_high)
 {
     u64 data = 0;
+
+    if (!has_pin(irq))
+        return false;
 
     apic_id = check_dest(irq, apic_id);
 
@@ -137,6 +179,7 @@ void IoApic::set_irq_level(u8 irq, u64 apic_id, u8 vector, bool active_high)
         (ulong)irq, (ulong)apic_id, (ulong)vector, (ulong)data, (ulong)active_high);
 
     set_entry(irq, data);
+    return true;
 }
 
 }
