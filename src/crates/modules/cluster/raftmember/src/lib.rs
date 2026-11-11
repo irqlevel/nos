@@ -161,6 +161,14 @@ pub trait App: Sized {
     /// reads the state after it waits for this member to have applied.
     fn finish(&mut self, _core: &mut Core<Self>, _w: Self::Waiter, _outcome: Outcome<Self>, _index: u64) {}
 
+    /// A command the shell asks for, offered before the engine asks it: the
+    /// app's to take -- answering its slot in its own time, as NBS's
+    /// snapshot of an attached volume does once its writer has paused -- or,
+    /// handed back, asked as any. Every one handed back, by default.
+    fn take(&mut self, _core: &mut Core<Self>, r: Request<Self>) -> Option<Request<Self>> {
+        Some(r)
+    }
+
     /// What the group does at every turn, after raft's work.
     fn turn(&mut self, _core: &mut Core<Self>) {}
 
@@ -774,7 +782,9 @@ pub fn run<A: App>((shared, m): (Arc<Shared<A>>, Member<A>)) {
         }
         let requests: Vec<Request<A>> = shared.requests.with(|q| q.drain(..).collect());
         for r in requests {
-            core.ask(&mut app, r.cmd, Pending::Local(r.done));
+            if let Some(r) = app.take(&mut core, r) {
+                core.ask(&mut app, r.cmd, Pending::Local(r.done));
+            }
         }
         if let Err(why) = core.process(&mut app) {
             klog!(0, "{}: the member stopped: {} -- `rmmod` and `insmod` start it again", A::LOG, why);
@@ -808,6 +818,15 @@ fn seen<A: App>(shared: &Shared<A>, index: u64) {
 /// this host has it, whichever member led -- or after VIEW_WAIT_MS of a view
 /// that lags further, the change made all the same.
 pub fn ask<A: App>(shared: &Shared<A>, cmd: &A::Command, no_member: &str) -> Result<A::Answer, String> {
+    ask_turning(shared, cmd, no_member, &mut |ms| kcore::task::sleep_ms(ms))
+}
+
+/// `ask`, the time between two looks at the answer `turn`'s, in ms, where
+/// `ask` sleeps: for a command that drives something of its own as it
+/// waits -- nbs-mds's snapshot, the session of `nbs io`'s it pauses.
+pub fn ask_turning<A: App>(shared: &Shared<A>, cmd: &A::Command, no_member: &str, turn: &mut dyn FnMut(u64))
+    -> Result<A::Answer, String>
+{
     let mut last = String::from("no answer");
     let end = boot_time_ns() + ASK_TOTAL_MS * NS_PER_MS;
     while boot_time_ns() < end {
@@ -824,7 +843,7 @@ pub fn ask<A: App>(shared: &Shared<A>, cmd: &A::Command, no_member: &str) -> Res
             if boot_time_ns() >= until {
                 break (Err(String::from("no answer -- ask again")), 0);
             }
-            kcore::task::sleep_ms(ANSWER_POLL_MS);
+            turn(ANSWER_POLL_MS);
         };
         match outcome {
             Ok(a) => {
@@ -833,7 +852,7 @@ pub fn ask<A: App>(shared: &Shared<A>, cmd: &A::Command, no_member: &str) -> Res
             }
             Err(why) if why.ends_with("ask again") || why.ends_with("ask again in a moment") => {
                 last = why;
-                kcore::task::sleep_ms(ASK_RETRY_MS);
+                turn(ASK_RETRY_MS);
             }
             Err(why) => return Err(why),
         }

@@ -52,7 +52,7 @@ use nbsmeta::{Answer, Command, Refusal, Replica, State};
 use nbswire::scrub::{self, Scrub};
 use nbswire::{Answered, Ask, Asking, Op, Query, Question, Request, Said, Saying, Told};
 use raft::{Role, Rsm};
-use raftmember::{App, Core, Locked, Outcome, Pending};
+use raftmember::{App, Core, Locked, Outcome, Pending, Request as Asked};
 
 use crate::files::{self, Known};
 
@@ -195,6 +195,36 @@ pub struct Mds {
     scrub: Option<Scrub>,
     scrub_every_ns: u64,
     scrubbed: Scrubbed,
+    /// Each volume's writer on this host, as its attach was applied and its
+    /// asks since name it: its generation and its session's mailbox -- what
+    /// a snapshot pauses (N10c2). A pause under way, one at a time, and the
+    /// next one's number.
+    sessions: BTreeMap<String, (u64, Addr)>,
+    pausing: Option<Pausing>,
+    next_pause: u64,
+}
+
+/// A snapshot asked of an attached volume (N10c2): its writer, on this host,
+/// paused first, and the snapshot taken at its generation. A generation no
+/// attach has: the metadata refuses it, should it ever be proposed.
+pub const PAUSE_FIRST: u64 = u64::MAX;
+
+/// How long a pause is waited for before the snapshot is given up.
+const PAUSE_WAIT_NS: u64 = 5_000_000_000;
+
+/// A pause for a snapshot of an attached volume (N10c2): of which volume and
+/// as what name, the session paused and its generation, the pause's number,
+/// when it was asked, whether the snapshot is proposed -- answered then by
+/// its outcome alone -- and the shell's request waiting.
+struct Pausing {
+    volume: String,
+    name: String,
+    generation: u64,
+    session: Addr,
+    pause: u64,
+    asked: u64,
+    proposed: bool,
+    request: Asked<Mds>,
 }
 
 /// A look at a cs, waiting for its answer.
@@ -208,15 +238,18 @@ struct Probe {
 pub enum Waiter {
     /// The leader's digest.
     Digest,
-    /// A client of this host's, told the outcome as its ask's kind is.
-    Client { to: Addr, id: u64, kind: Kind },
+    /// A client of this host's, told the outcome as its ask's kind is -- and
+    /// for an attach for writing or a detach, the volume's name (N10c2).
+    Client { to: Addr, id: u64, kind: Kind, volume: Option<String> },
     /// The controller's proposal.
     Repair,
     /// This host's cs, told its join's end or its giving up as applied (N9).
     Cs { to: Addr, id: u64 },
+    /// A snapshot of a writer paused (N10c2).
+    Snapshot,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Attach,
     Detach,
@@ -234,7 +267,8 @@ pub fn new(rsm: Rsm<raftmember::Log, State>, me: files::Member, lost: Lost, dir:
                                   verdicts: BTreeMap::new(), next_probe: 1, watch: BTreeMap::new(), watch_at: 0,
                                   planned: 0, planned_index: 0, plan_at: 0, refused: false,
                                   after: repair::After { down_ms: repair::DOWN_AFTER_MS, out_ms: out_after_ms },
-                                  repairing: 0, scrub: None, scrub_every_ns: scrub_ms * 1_000_000, scrubbed },
+                                  repairing: 0, scrub: None, scrub_every_ns: scrub_ms * 1_000_000, scrubbed,
+                                  sessions: BTreeMap::new(), pausing: None, next_pause: 1 },
                             rsm, id)
 }
 
@@ -337,7 +371,35 @@ impl App for Mds {
 
     fn finish(&mut self, core: &mut Core<Mds>, w: Waiter, outcome: Outcome<Mds>, index: u64) {
         let (to, id, kind) = match w {
-            Waiter::Client { to, id, kind } => (to, id, kind),
+            Waiter::Client { to, id, kind, volume } => {
+                /* The writer's session on this host as its attach, or its
+                   detach, is applied (N10c2) */
+                if let (Some(name), Ok(Answer::Attached { generation })) = (volume, &outcome) {
+                    match kind {
+                        Kind::Attach => {
+                            self.sessions.insert(name, (*generation, to));
+                        }
+                        Kind::Detach if *generation != 0 => {
+                            self.sessions.remove(&name);
+                        }
+                        _ => {}
+                    }
+                }
+                (to, id, kind)
+            }
+            /* Applied -- taken or refused -- the session goes on, its map read
+               anew at this entry; not applied, a word now could let it write
+               before the snapshot is applied late: none, and it attaches again
+               past its wait */
+            Waiter::Snapshot => {
+                let Some(p) = self.pausing.take() else { return };
+                if index > 0 {
+                    let said = Said::GoOn { pause: p.pause, index };
+                    let _ = core.mailbox().send(p.session, nbswire::TAG_SAID, 0, &Saying { id: 0, said }.encode());
+                }
+                p.request.done.with(|s| *s = Some((outcome, index)));
+                return;
+            }
             Waiter::Cs { to, id } => {
                 let told = match outcome {
                     Ok(Answer::Set { .. }) => Told::Verified,
@@ -382,10 +444,58 @@ impl App for Mds {
         let _ = core.mailbox().send(to, nbswire::TAG_SAID, 0, &Saying { id, said }.encode());
     }
 
-    /// A host whose member is no longer the one that said it lost its state
-    /// -- replaced, or removed -- forgotten; and as the leader, the newest
-    /// checkpoint's digest proposed, for every member to hold its own to.
+    /// A snapshot asked with its writer to pause first (N10c2): with no
+    /// writer, asked as it is, at no generation; with one on another host,
+    /// refused, naming it; with one here, its session paused -- the one that
+    /// last asked at its generation -- and the snapshot proposed once it
+    /// answers, at that generation. Anything else asked as it is.
+    fn take(&mut self, core: &mut Core<Mds>, r: Asked<Mds>) -> Option<Asked<Mds>> {
+        let Command::Snapshot { volume, name, generation: PAUSE_FIRST } = &r.cmd else { return Some(r) };
+        let (volume, name) = (volume.clone(), name.clone());
+        let writer = core.state().volume(&volume).and_then(|v| v.writer.as_ref()).map(|w| (w.host.clone(), w.generation));
+        let refuse = |r: Asked<Mds>, why: String| -> Option<Asked<Mds>> {
+            r.done.with(|s| *s = Some((Err(why), 0)));
+            None
+        };
+        let Some((host, generation)) = writer else {
+            return Some(Asked { cmd: Command::Snapshot { volume, name, generation: 0 }, done: r.done });
+        };
+        if host != self.me.host {
+            return refuse(r, alloc::format!("volume {} is attached on host {}: its snapshot is asked there, where its \
+                                             writer is paused for it", volume, host));
+        }
+        if self.pausing.is_some() {
+            return refuse(r, String::from("a snapshot is being taken already: one at a time"));
+        }
+        let Some(&(_, session)) = self.sessions.get(&volume).filter(|&&(g, _)| g == generation) else {
+            return refuse(r, alloc::format!("volume {}'s writer here has not been heard from since this mds started -- \
+                                             ask again once it writes", volume));
+        };
+        let pause = self.next_pause;
+        self.next_pause += 1;
+        let _ = core.mailbox().send(session, nbswire::TAG_SAID, 0,
+                                    &Saying { id: 0, said: Said::Pause { pause } }.encode());
+        self.pausing = Some(Pausing { volume, name, generation, session, pause, asked: boot_time_ns(), proposed: false,
+                                      request: r });
+        None
+    }
+
+    /// A pause not answered in time given up (N10c2); a host whose member is
+    /// no longer the one that said it lost its state -- replaced, or removed
+    /// -- forgotten; and as the leader, the newest checkpoint's digest
+    /// proposed, for every member to hold its own to.
     fn turn(&mut self, core: &mut Core<Mds>) {
+        /* A pause not answered in time given up -- no snapshot proposed, so
+           the session may go on at once (N10c2) */
+        if self.pausing.as_ref().is_some_and(|p| !p.proposed && boot_time_ns() >= p.asked + PAUSE_WAIT_NS) {
+            if let Some(p) = self.pausing.take() {
+                let said = Said::GoOn { pause: p.pause, index: core.rsm().applied() };
+                let _ = core.mailbox().send(p.session, nbswire::TAG_SAID, 0, &Saying { id: 0, said }.encode());
+                let why = alloc::format!("volume {}'s writer did not pause in {} s: no snapshot taken", p.volume,
+                                         PAUSE_WAIT_NS / 1_000_000_000);
+                p.request.done.with(|s| *s = Some((Err(why), 0)));
+            }
+        }
         let state = core.state();
         self.lost.with(|l| l.retain(|host, &mut (id, _)| state.member(host).is_some_and(|m| m.id == id)));
         if core.role() != Role::Leader {
@@ -589,11 +699,50 @@ impl Mds {
         }
         let Some(a) = Asking::decode(&m.data) else { return };
         let host = self.me.host.clone();
+        /* The writer's session of a volume on this host, by the asks that
+           name its generation: the one a snapshot pauses (N10c2). Only the
+           volume's writer here as applied -- a session taken over on this
+           host asks at a generation before it, and is not the one to pause */
+        match &a.ask {
+            Ask::Down { name, generation, .. } | Ask::CopyUp { name, generation, .. }
+            | Ask::CopyDone { name, generation, .. } | Ask::Paused { name, generation, .. } => {
+                let writer = core.state().volume(name).and_then(|v| v.writer.as_ref())
+                    .is_some_and(|w| w.generation == *generation && w.host == host);
+                if writer {
+                    self.sessions.insert(name.clone(), (*generation, m.from));
+                }
+            }
+            _ => {}
+        }
+        let volume = match &a.ask {
+            Ask::Attach { name, writable: true, .. } | Ask::Detach { name, .. } | Ask::Reattach { name, .. } => {
+                Some(name.clone())
+            }
+            _ => None,
+        };
         let (cmd, kind) = match a.ask {
+            /* A pause answered: the snapshot proposed at the writer's
+               generation. One this member does not know -- given up, done, or
+               of before its start -- is answered by none: the session goes on
+               only by a word, or by attaching again */
+            Ask::Paused { name, generation, pause } => {
+                let Some(p) = self.pausing.as_mut()
+                    .filter(|p| p.pause == pause && p.volume == name && p.generation == generation && !p.proposed)
+                else {
+                    return;
+                };
+                p.proposed = true;
+                let cmd = Command::Snapshot { volume: p.volume.clone(), name: p.name.clone(), generation };
+                core.ask(self, cmd, Pending::App(Waiter::Snapshot));
+                return;
+            }
             Ask::Attach { name, writable, force, token } => {
                 (Command::Attach { name, host, writable, force, token }, Kind::Attach)
             }
             Ask::Detach { name, generation } => (Command::Detach { name, host, generation }, Kind::Detach),
+            Ask::Reattach { name, generation, token } => {
+                (Command::Reattach { name, host, generation, token }, Kind::Attach)
+            }
             Ask::Down { set, cs, refused, name, generation } => {
                 (Command::ReplicaDown { set, cs, refused, name, generation }, Kind::Down)
             }
@@ -607,7 +756,7 @@ impl Mds {
                 return;
             }
         };
-        core.ask(self, cmd, Pending::App(Waiter::Client { to: m.from, id: a.id, kind }));
+        core.ask(self, cmd, Pending::App(Waiter::Client { to: m.from, id: a.id, kind, volume }));
     }
 
     /// A question of this host's cs, answered from the member's applied

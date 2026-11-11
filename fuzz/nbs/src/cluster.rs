@@ -54,7 +54,20 @@
 //!   active replica up, reads the same, one of what the volume could hold
 //!   then, at every look -- after it is taken, now and then, and at the end.
 //!   Each cs's garbage pass runs as nbs-cs's, freeing what copy-ups and
-//!   deletes leave.
+//!   deletes leave. A snapshot is taken now and then of the volume while it
+//!   is attached too (N10c2): its writer paused as the writer's host's mds
+//!   pauses it -- every chunk closed when it answers, the snapshot applied at
+//!   its generation, the word to go on now and then lost, the snapshot now
+//!   and then applied late, past the session's wait, when its attach again
+//!   is to have it refused; a pause not answered in five seconds given up; a
+//!   writer taken over while it paused answering all the same, what is open
+//!   then the writer's after it, and its snapshot refused;
+//!   at some ends the writer stopped while paused, a write held behind the
+//!   pause, the stop begun once it is over;
+//! - **a stop is done once**, and as its session ends: detached, or failed
+//!   (a driver tears its session down at it); asked again, done at once and
+//!   not ok, the first standing; asked with a tag of the session's own,
+//!   refused at once, the session as it was.
 //!
 //! A writer that follows another holds what that one had done and not
 //! flushed as a crash would leave it: there or not -- a replica that lost it
@@ -64,7 +77,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 
-use nbsclient::{Buffers, Out, Phase, Session, To, UserOp, BLOCK, DEADLINE_NS, LOST_LAST};
+use nbsclient::{Buffers, Out, Phase, Session, To, UserOp, BLOCK, DEADLINE_NS, LOST_LAST, PAUSE_NS};
 use nbscs::{ChunkRef, Epoch, Identity, Store, SLOT};
 use nbsmeta::repair::{self, Seen};
 use nbsmeta::{Answer, Command, Replica, State};
@@ -119,6 +132,36 @@ const SCRUB_EVERY: u64 = 4_000 * MS;
 const GARBAGE_EVERY: u64 = 3_000 * MS;
 /// The snapshots kept at once, at most: the oldest dropped for a new one.
 const SNAPS_KEPT: usize = 2;
+/// How long the writer's host's mds waits for its pause to be answered
+/// before it gives the snapshot up (N10c2).
+const PAUSE_WAIT_NS: u64 = 5_000 * MS;
+/// The tags of a writer's stop: at the end, for a snapshot between two
+/// writers, and the end's asked again -- above any operation's, and the
+/// driver's as nbsdrive's are: the top bit, which marks the session's own
+/// operations, clear. With it set, a stop's flush done out of turn would be
+/// told to nobody, and no judge here would see it.
+const STOP: u64 = (1 << 62) | 1;
+const SNAP_STOP: u64 = (1 << 62) | 2;
+const STOP_AGAIN: u64 = (1 << 62) | 3;
+/// A tag of the session's own: a stop asked with it is refused.
+const STOP_OWN: u64 = (1 << 63) | 1;
+
+/// A pause for a snapshot of the volume while attached (N10c2): the client
+/// asked, the pause's number, and when.
+struct Pausing {
+    c: usize,
+    pause: u64,
+    asked_at: u64,
+}
+
+/// A snapshot of a pause applied late, past the session's wait (N10c2):
+/// when, at the generation the session paused at -- refused once it has
+/// attached again -- and what it would hold.
+struct Late {
+    at: u64,
+    generation: u64,
+    may: BTreeMap<u64, BTreeSet<u8>>,
+}
 
 /// A snapshot of the volume, taken between two writers (N10c): for each
 /// block written by then, and each written first since, what it may hold --
@@ -238,6 +281,11 @@ struct Client {
     quiet: bool,
     /// Its phase as the trace said it last.
     shown: Phase,
+    /// Its writes, flushes and closes failed: an end's judge holds the
+    /// writer's own, not a session's taken over that fails meanwhile.
+    failed: u64,
+    /// Its stop done: once, as its session ends.
+    stop_done: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -354,6 +402,16 @@ struct World {
     snap_r: Rng,
     snap_next: u32,
     garbage_at: u64,
+    /// A pause for a snapshot under way, a late snapshot to come, and the
+    /// next pause's number (N10c2); the writer of a pause given up, and its
+    /// generation then -- which it is to go on at, attaching again for none.
+    pausing: Option<Pausing>,
+    late: Option<Late>,
+    pause_next: u64,
+    given_up: Option<(usize, u64)>,
+    /// The word a pause's answer gets, as an end shaped it: 0 the snapshot
+    /// applied late, 1 the word lost, 2 the word said.
+    pause_word: Option<u64>,
     stats: BTreeMap<&'static str, u64>,
 }
 
@@ -488,6 +546,20 @@ impl World {
     }
 
     fn done(&mut self, c: usize, tag: u64, ok: bool) -> Result<(), String> {
+        /* A stop: done once, and as its session ends -- the volume let go
+           of, or the session failed: a driver tears its session down at it */
+        if tag == STOP || tag == SNAP_STOP {
+            let phase = self.clients[c].s.phase();
+            if self.clients[c].stop_done || !matches!(phase, Phase::Detached | Phase::Failed(_))
+                || ok != (*phase == Phase::Detached)
+            {
+                return Err(format!("client {}'s stop done {}{}, {:?}: {}", c, ok,
+                                   if self.clients[c].stop_done { " a second time" } else { "" }, phase,
+                                   self.clients[c].s.report()));
+            }
+            self.clients[c].stop_done = true;
+            return Ok(());
+        }
         let Some(op) = self.clients[c].ops.remove(&tag) else { return Ok(()) };
         if self.trace {
             let first = self.clients[c].bufs.0.get(&tag).and_then(|b| b.first().copied());
@@ -503,6 +575,9 @@ impl World {
            with no active replica among them failed at once: found by this
            target, N9d) */
         let lost = self.clients[c].zombie || matches!(self.clients[c].s.phase(), Phase::Failed(_));
+        if !ok && op.kind != K::Read {
+            self.clients[c].failed += 1;
+        }
         if !ok && !lost && self.now < op.at + DEADLINE_NS {
             return Err(format!("client {}'s {:?} of blocks {}+{} failed {} ms after it was asked, before its deadline",
                                c, op.kind, first, n, (self.now - op.at) / MS));
@@ -1279,6 +1354,22 @@ impl World {
                     }
                 }
             }
+            /* A writer's own attach anew, a pause with no word (N10c2) */
+            Ask::Reattach { name, generation, token } => {
+                match self.apply(Command::Reattach { name, host, generation, token }) {
+                    Answer::Attached { generation } => {
+                        self.count("writers attached anew");
+                        Said::Attached { generation, index: self.index }
+                    }
+                    Answer::Refused(why) => {
+                        self.count("writers attached anew refused");
+                        Said::Refused(why.says().to_string())
+                    }
+                    other => Said::Refused(format!("{:?}", other)),
+                }
+            }
+            /* A pause answered (N10c2) */
+            Ask::Paused { generation, pause, .. } => return self.paused(c, a.id, generation, pause),
             /* A copy-up's asks (N10), answered as nbs-mds's member does */
             ask @ (Ask::CopyUp { .. } | Ask::CopyDone { .. }) => {
                 let done = matches!(ask, Ask::CopyDone { .. });
@@ -1327,6 +1418,7 @@ impl World {
         self.control()?;
         self.scrub_turn()?;
         self.garbage()?;
+        self.pause_turn()?;
         for h in 0..self.hosts.len() {
             self.joins(h)?;
             self.copy_turn(h)?;
@@ -1395,44 +1487,209 @@ impl World {
         let now = self.now;
         {
             let cl = &mut self.clients[c];
-            cl.s.stop(u64::MAX - 1, now, &mut cl.bufs, &mut out);
+            cl.s.stop(SNAP_STOP, now, &mut cl.bufs, &mut out);
         }
         self.outs(c, out)?;
         self.drive(c, &|w, c| matches!(w.clients[c].s.phase(), Phase::Detached | Phase::Failed(_)))?;
         self.clients[c].zombie = true;
         match self.clients[c].s.phase() {
-            Phase::Detached => {}
+            Phase::Detached => self.stop_said(c)?,
             /* As it may -- check_failed said so: no snapshot, another writer */
-            Phase::Failed(_) => return Ok(()),
+            Phase::Failed(_) => return self.stop_said(c),
             _ => return Err(format!("client {} not stopped for a snapshot: {}", c, self.clients[c].s.report())),
         }
-        if self.snaps.len() >= SNAPS_KEPT {
-            self.drop_snapshot(0)?;
+        if self.trace {
+            eprintln!("  [{}] client {} stopped for a snapshot", self.step, c);
         }
-        let name = format!("s{}", self.snap_next);
-        self.snap_next += 1;
-        match self.apply(Command::Snapshot { volume: String::from(VOLUME), name: name.clone(), generation: 0 }) {
+        let may = self.snapshot_may();
+        match self.take_snapshot(0, may, "a snapshot taken")? {
             Answer::Volume { .. } => {}
             other => return Err(format!("a snapshot of the volume, let go of, answered {:?}", other)),
         }
-        let blocks: Vec<u64> = self.blocks.history.keys().copied().collect();
-        let mut may = BTreeMap::new();
-        for b in blocks {
-            let mut m = self.blocks.failed_since_done(b);
-            m.insert(self.blocks.acked(b).1);
-            may.insert(b, m);
-        }
-        if self.trace {
-            eprintln!("  [{}] snapshot {} of the volume taken, client {} stopped for it", self.step, name, c);
-        }
-        self.snaps.push(Snap { name, may, seen: BTreeMap::new() });
-        self.count("snapshots taken");
-        self.snapshots_hold("a snapshot taken")?;
         let up: Vec<usize> = (0..HOSTS.len()).filter(|&h| Some(h) != self.down).collect();
         match self.snap_r.pick(&up) {
             Some(h) => self.writer(h),
             None => Ok(()),
         }
+    }
+
+    /// What each block written may hold in a snapshot taken now: the last
+    /// write done, or one failed or lost since.
+    fn snapshot_may(&self) -> BTreeMap<u64, BTreeSet<u8>> {
+        self.blocks.history.keys().map(|&b| {
+            let mut m = self.blocks.failed_since_done(b);
+            m.insert(self.blocks.acked(b).1);
+            (b, m)
+        }).collect()
+    }
+
+    /// The snapshot `name` applied at `generation`, as `may` holds: kept --
+    /// the oldest dropped first where two are -- and held to at once.
+    fn take_snapshot(&mut self, generation: u64, may: BTreeMap<u64, BTreeSet<u8>>, when: &str)
+        -> Result<Answer, String> {
+        if self.snaps.len() >= SNAPS_KEPT {
+            self.drop_snapshot(0)?;
+        }
+        let name = format!("s{}", self.snap_next);
+        self.snap_next += 1;
+        let answer = self.apply(Command::Snapshot { volume: String::from(VOLUME), name: name.clone(), generation });
+        if self.trace {
+            eprintln!("  [{}] snapshot {} of the volume at generation {} ({}): {:?}", self.step, name, generation, when,
+                      answer);
+        }
+        if let Answer::Volume { .. } = answer {
+            self.snaps.push(Snap { name, may, seen: BTreeMap::new() });
+            self.count("snapshots taken");
+            self.snapshots_hold(when)?;
+        }
+        Ok(answer)
+    }
+
+    /// Client `c`'s stop done, its session over: what a driver waits for.
+    fn stop_said(&self, c: usize) -> Result<(), String> {
+        if self.clients[c].stop_done {
+            return Ok(());
+        }
+        Err(format!("client {} over, {:?}, and its stop never done", c, self.clients[c].s.phase()))
+    }
+
+    /// The writer paused for a snapshot, as the writer's host's mds asks it
+    /// (N10c2): one pause at a time.
+    fn pause_writer(&mut self) -> Result<(), String> {
+        if self.pausing.is_some() || self.late.is_some() {
+            return Ok(());
+        }
+        /* Not of a session still paused from before -- its word lost, it is
+           to attach again of that one */
+        let Some(c) = self.current().filter(|&c| self.serving(c) && !self.clients[c].s.paused()) else { return Ok(()) };
+        let pause = self.pause_next;
+        self.pause_next += 1;
+        let h = self.clients[c].host;
+        self.push(End::Mds(h), End::Client(c), Saying { id: 0, said: Said::Pause { pause } }.encode(), 0);
+        self.pausing = Some(Pausing { c, pause, asked_at: self.now });
+        if self.trace {
+            eprintln!("  [{}] mds: client {} asked to pause for a snapshot ({})", self.step, c, pause);
+        }
+        self.count("pauses asked");
+        Ok(())
+    }
+
+    /// Client `c`'s answer, ask `id`, to pause `pause` at `generation`: every
+    /// chunk of the volume closed on every active replica up, then the
+    /// snapshot at that generation -- answered with the word to go on, the
+    /// word now and then lost, or the snapshot now and then applied late.
+    /// One of a pause given up, or done, is answered by none: the session
+    /// goes on by a word, or by attaching again.
+    fn paused(&mut self, c: usize, id: u64, generation: u64, pause: u64) -> Result<(), String> {
+        if self.trace {
+            eprintln!("  [{}] mds: client {} paused for snapshot {} at generation {}{}", self.step, c, pause, generation,
+                      if self.pausing.as_ref().is_some_and(|p| p.c == c && p.pause == pause) { "" } else { ", unknown" });
+        }
+        if !self.pausing.as_ref().is_some_and(|p| p.c == c && p.pause == pause) {
+            return Ok(());
+        }
+        self.pausing = None;
+        /* The volume's writer still: every chunk closed. Taken over while it
+           paused -- at rest, or cut off -- what is open is the writer's after
+           it, and its snapshot is to be refused: no writer has its generation */
+        let writer = self.state.volume(VOLUME).and_then(|v| v.writer.as_ref()).is_some_and(|w| w.generation == generation);
+        if writer {
+            self.closed_at_pause(c)?;
+        } else {
+            self.count("pauses answered by a writer taken over");
+        }
+        let may = self.snapshot_may();
+        let h = self.clients[c].host;
+        match self.pause_word.take().unwrap_or_else(|| self.snap_r.below(10)) {
+            0 => {
+                self.count("snapshots of a pause to be applied late");
+                self.late = Some(Late { at: self.now + PAUSE_NS + 2_000 * MS, generation, may });
+            }
+            k => {
+                let answer = self.take_snapshot(generation, may, "a writer paused")?;
+                if !writer && matches!(answer, Answer::Volume { .. }) {
+                    return Err(format!("client {}, taken over, paused at generation {}, and its snapshot was taken", c,
+                                       generation));
+                }
+                if k == 1 {
+                    self.count("words to go on lost");
+                } else {
+                    let index = self.index;
+                    self.push(End::Mds(h), End::Client(c), Saying { id, said: Said::GoOn { pause, index } }.encode(), id);
+                }
+                if !matches!(answer, Answer::Volume { .. }) {
+                    self.count("snapshots of a pause refused");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every chunk of the volume closed on every active replica up: what
+    /// writer `c`, paused for a snapshot, has left (N10c2).
+    fn closed_at_pause(&self, c: usize) -> Result<(), String> {
+        let Some(v) = self.state.volume(VOLUME) else { return Ok(()) };
+        for (place, &chunk) in v.map.iter().enumerate() {
+            let Some(ch) = self.state.chunks().get(chunk as usize) else { continue };
+            let Some(set) = self.state.sets().get(ch.set as usize) else { continue };
+            for i in 0..nbsmeta::REPLICAS {
+                if set.replicas[i] == Replica::Down {
+                    continue;
+                }
+                let Some(h) = self.host_of_cs(set.cs[i]) else { continue };
+                let Some(store) = self.hosts[h].store.as_ref() else { continue };
+                if let Some(x) = store.holding(chunk).filter(|x| x.incarnation == ch.incarnation) {
+                    if x.state == nbscs::SlotState::Open {
+                        return Err(format!("client {} paused for a snapshot, and place {}'s chunk {} is open on host \
+                                            {} at generation {}", c, place, chunk, self.hosts[h].name, x.generation));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A pause not answered in time given up -- no snapshot proposed, so the
+    /// session may go on at once -- and a late snapshot applied when due:
+    /// refused, the session having attached again, or held to what the
+    /// volume held at its pause (N10c2).
+    fn pause_turn(&mut self) -> Result<(), String> {
+        if let Some(p) = self.pausing.as_ref().filter(|p| self.now >= p.asked_at + PAUSE_WAIT_NS) {
+            let (c, pause) = (p.c, p.pause);
+            self.pausing = None;
+            self.count("pauses given up");
+            self.given_up = Some((c, self.clients[c].s.generation()));
+            if self.trace {
+                eprintln!("  [{}] mds: client {}'s pause {} given up: {}", self.step, c, pause, self.clients[c].s.report());
+            }
+            let (h, index) = (self.clients[c].host, self.index);
+            self.push(End::Mds(h), End::Client(c), Saying { id: 0, said: Said::GoOn { pause, index } }.encode(), 0);
+        }
+        /* The writer of a pause given up goes on at its generation: none was
+           taken, so it attaches again for none */
+        if let Some((c, generation)) = self.given_up {
+            let s = &self.clients[c].s;
+            if self.clients[c].zombie || matches!(s.phase(), Phase::Failed(_) | Phase::Detached) {
+                self.given_up = None;
+            } else if s.generation() != generation {
+                return Err(format!("client {}, its pause given up, attached again: generation {}, {} before", c,
+                                   s.generation(), generation));
+            } else if *s.phase() == Phase::Serving && !s.paused() {
+                self.given_up = None;
+            }
+        }
+        if let Some(l) = self.late.take() {
+            if self.now < l.at {
+                self.late = Some(l);
+                return Ok(());
+            }
+            match self.take_snapshot(l.generation, l.may, "a pause's, applied late")? {
+                Answer::Refused(nbsmeta::Refusal::NotTheWriter) => self.count("snapshots of a pause applied late refused"),
+                Answer::Volume { .. } => self.count("snapshots of a pause applied late taken"),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Snapshot `k` dropped: its chunks counted down, those no map names
@@ -1693,7 +1950,7 @@ impl World {
         s.start(self.now, &mut out);
         self.clients.push(Client { host: h, s, bufs: Bufs::default(), ops: BTreeMap::new(), next_tag: 1, zombie: false,
                                    dead: false, served: false, unflushed: Vec::new(), quiet: false,
-                                   shown: Phase::Attaching });
+                                   shown: Phase::Attaching, failed: 0, stop_done: false });
         self.outs(c, out)
     }
 
@@ -1788,7 +2045,7 @@ impl World {
         }
         self.crash(h)?;
         self.count("hosts lost for good, written past");
-        let failed = |w: &World| w.stat("writes failed") + w.stat("flushes failed") + w.stat("closes failed");
+        let failed = |w: &World| w.clients[c].failed;
         let before = failed(self);
         /* Now and then the controller first: the host's cs down in every set
            before the writer touches them, its view not having read it -- a
@@ -2064,6 +2321,7 @@ fn setup(r: &mut Rng) -> Result<World, String> {
                         seq: 1, down: None, served: 0, rest: None, owed: None, plan_at: 0, drained: None,
                         scrub: Scrub::new(SCRUB_EVERY), scrub_q: Vec::new(), scrub_r: Rng::new(0), scrub_id: 1,
                         rotted: Vec::new(), snaps: Vec::new(), snap_r: Rng::new(0), snap_next: 1, garbage_at: 0,
+                        pausing: None, late: None, pause_next: 1, given_up: None, pause_word: None,
                         stats: BTreeMap::new() };
     w.apply(Command::Init { cluster: CLUSTER, name: String::from("nbs"), host: String::from(HOSTS[0]), member: 1 });
     for (k, h) in HOSTS.iter().enumerate().skip(1) {
@@ -2209,8 +2467,10 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         }
         /* A snapshot between two writers now and then, one dropped, and every
            snapshot looked at (N10c): of a randomness of their own */
-        if w.snap_r.below(1000) < 3 {
-            if w.down.is_none() && w.rest.is_none() {
+        if w.snap_r.below(1000) < 4 {
+            if w.snap_r.chance(50) {
+                w.pause_writer().map_err(|e| format!("step {}: {}", step, e))?;
+            } else if w.down.is_none() && w.rest.is_none() && w.pausing.is_none() && w.late.is_none() {
                 w.snapshot().map_err(|e| format!("step {}: {}", step, e))?;
             }
         } else if !w.snaps.is_empty() && w.snap_r.below(1000) < 2 {
@@ -2267,6 +2527,14 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     if !shaped && lost.is_none() && Rng::new(mix(seed, 0x666f_666c)).chance(30) {
         w.found_open_flush().map_err(|e| format!("the end: {}", e))?;
     }
+    /* The stop asked of a writer paused for a snapshot, a write held behind
+       the pause -- the word to go on said, lost, or the snapshot applied
+       late -- and the stop asked again (N10c2): drawn of their own, so that
+       the ends they do not shape go as they did */
+    let mut stops = Rng::new(mix(seed, 0x7374_6f70));
+    let mut pause_first = stops.chance(35);
+    let again = stops.chance(25);
+    let own = stops.chance(25);
     for _ in 0..END_WRITERS {
         let c = match w.current() {
             Some(c) => c,
@@ -2277,6 +2545,19 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
                 w.clients.len() - 1
             }
         };
+        if std::mem::take(&mut pause_first) && w.serving(c) && !w.clients[c].s.paused() && w.pausing.is_none()
+            && w.late.is_none()
+        {
+            w.pause_word = Some(stops.below(3));
+            w.pause_writer().map_err(|e| format!("the end: {}", e))?;
+            w.drive(c, &|w, c| w.clients[c].s.paused() || !w.serving(c) || w.pausing.is_none())
+                .map_err(|e| format!("the end: {}", e))?;
+            if w.clients[c].s.paused() {
+                w.count("stops asked of a writer paused for a snapshot");
+                let first = stops.below((VOLUME_MIB << 20 >> 12).min(3 * SLOT / BLOCK));
+                w.submit_op(c, K::Write(1 + stops.below(255) as u8), first, 1).map_err(|e| format!("the end: {}", e))?;
+            }
+        }
         /* Writes out when the stop is asked, the last ones over each other
            -- what was asked before it done before it */
         if w.clients[c].served && *w.clients[c].s.phase() == Phase::Serving {
@@ -2288,7 +2569,28 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         let now = w.now;
         {
             let cl = &mut w.clients[c];
-            cl.s.stop(u64::MAX, now, &mut cl.bufs, &mut out);
+            /* A stop with a tag of the session's own: refused at once, the
+               session as it was */
+            if own {
+                let was = cl.s.phase().clone();
+                let mut refused = Vec::new();
+                cl.s.stop(STOP_OWN, now, &mut cl.bufs, &mut refused);
+                if refused != [Out::Done { tag: STOP_OWN, ok: false }] || *cl.s.phase() != was {
+                    return Err(format!("the end: client {}'s stop with a tag of the session's own: {:?}, {:?} then, \
+                                        {:?} before", c, refused, cl.s.phase(), was));
+                }
+            }
+            cl.s.stop(STOP, now, &mut cl.bufs, &mut out);
+            /* Asked again: done at once, the first standing -- not ok, but
+               where the session is over already */
+            if again {
+                let mut twice = Vec::new();
+                cl.s.stop(STOP_AGAIN, now, &mut cl.bufs, &mut twice);
+                let ok = *cl.s.phase() == Phase::Detached;
+                if twice != [Out::Done { tag: STOP_AGAIN, ok }] {
+                    return Err(format!("the end: client {}'s stop asked again: {:?}", c, twice));
+                }
+            }
         }
         w.outs(c, out).map_err(|e| format!("the end: {}", e))?;
         for _ in 0..20_000 {
@@ -2303,6 +2605,9 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
             w.tick().map_err(|e| format!("the end: {}", e))?;
         }
         let phase = w.clients[c].s.phase().clone();
+        if matches!(phase, Phase::Detached | Phase::Failed(_)) {
+            w.stop_said(c).map_err(|e| format!("the end: {}", e))?;
+        }
         match phase {
             Phase::Detached => {
                 w.settle(lost).map_err(|e| format!("the end: {}", e))?;

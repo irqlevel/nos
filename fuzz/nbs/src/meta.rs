@@ -812,6 +812,24 @@ impl Model {
                 }
                 Ok(Answer::Attached { generation: 0 })
             }
+            Command::Reattach { name, host, generation, token } => {
+                if !self.init {
+                    return Err(NotInitialized);
+                }
+                if !self.is_member(host) {
+                    return Err(NotAMember);
+                }
+                let v = self.vols.get_mut(name).ok_or(NoSuchVolume)?;
+                if let Some((_, g, _)) = v.writer.as_ref().filter(|(h, _, t)| *token != 0 && t == token && h == host) {
+                    return Ok(Answer::Attached { generation: *g });
+                }
+                if *generation == 0 || !v.writer.as_ref().is_some_and(|(h, g, _)| h == host && g == generation) {
+                    return Err(NotTheWriter);
+                }
+                v.generation += 1;
+                v.writer = Some((host.clone(), v.generation, *token));
+                Ok(Answer::Attached { generation: v.generation })
+            }
             Command::Detach { name, host, generation } => {
                 if !self.init {
                     return Err(NotInitialized);
@@ -1465,7 +1483,7 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
         *fresh += 1;
         return Command::Init { cluster: [7; 16], name: String::from("nbs"), host: host(r), member: *fresh };
     }
-    match r.below(150) {
+    match r.below(155) {
         0..=7 => {
             *fresh += 1;
             Command::Add { host: host(r), member: if r.chance(5) { 0 } else { *fresh } }
@@ -1615,6 +1633,26 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
                 Command::Joined { set, cs, since }
             } else {
                 Command::Unjoin { set, cs, since }
+            }
+        }
+        /* A writer's own attach anew (N10c2): mostly of a writer as it is,
+           a new token -- or its own, asked again -- else of a generation or
+           a host it is not */
+        150..=154 => {
+            let writers: Vec<(String, String, u64, u64)> = m.vols.iter()
+                .filter_map(|(n, v)| v.writer.as_ref().map(|(h, g, t)| (n.clone(), h.clone(), *g, *t))).collect();
+            let pick = (!writers.is_empty()).then(|| writers[r.below(writers.len() as u64) as usize].clone());
+            match pick {
+                Some((name, host, generation, token)) if r.chance(85) => {
+                    let token = if r.chance(20) { token } else { *fresh + 1 + r.below(1 << 20) };
+                    let (host, generation) = match r.below(10) {
+                        0 => (member(r), generation),
+                        1 => (host, generation.saturating_sub(1)),
+                        _ => (host, generation),
+                    };
+                    Command::Reattach { name, host, generation, token }
+                }
+                _ => Command::Reattach { name: volume(r), host: member(r), generation: r.below(4), token: r.below(4) },
             }
         }
         /* A snapshot (N10): mostly of a volume, at its writer's generation or
