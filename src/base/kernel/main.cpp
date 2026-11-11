@@ -814,18 +814,31 @@ void bp_startup(void* ctx)
                     klog(0, "Reboot requested");
                 else
                     klog(0, "Shutdown requested");
-                rust_net_stop_shell();
-                rust_usb_stop();
-                cmd.stop();
-                cmd.stop_dhcp();
                 break;
             }
         }
 
-        /* With the shells gone nothing calls into a module any more: its
-           exit runs now, while the files, block I/O and soft IRQs it may
-           still need are all there */
+        /* The modules first, before the shells are waited for: a shell may
+           be inside a module's command that returns only when its module is
+           told to stop -- an `hv boot` on the console as `poweroff` comes
+           over SSH -- and the halt used to wait for that shell before any
+           module had been told anything: for ever, a join's report every ten
+           seconds. A take-down needs no shell gone (ModuleTable::take_down:
+           the module's commands closed, its stop, their calls waited out,
+           its exit), and no module is loaded from here on. The files, block
+           I/O and soft IRQs an exit may still need are all there.
+
+           The log back on the console first: the shell that keeps it off
+           while it has the console is stopped after the modules now, and
+           what their exits say -- a guest waited for -- is the halt's to
+           show, as it was when the shell went first. */
+        Klog::get_instance().set_console_suppressed(false);
         ModuleTable::get_instance().unload_all();
+
+        rust_net_stop_shell();
+        rust_usb_stop();
+        cmd.stop();
+        cmd.stop_dhcp();
 
         /* The management bus after the modules -- whose providers their exits
            took off it -- and before the files go: its jobs are told to stop and

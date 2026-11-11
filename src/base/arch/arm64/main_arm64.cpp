@@ -422,14 +422,18 @@ static void bp_startup_arm(void* ctx)
             else
                 klog(0, "Shutdown requested");
 
+            /* The modules first, before the shells are waited for: a shell
+               may be inside a module's command that returns only when its
+               module is told to stop, and a take-down needs no shell gone
+               (as in kernel/main.cpp). The files and block I/O an exit may
+               still need are there. The log back on the console first: the
+               shell that keeps it off is stopped after the modules. */
+            Klog::get_instance().set_console_suppressed(false);
+            ModuleTable::get_instance().unload_all();
+
             rust_net_stop_shell();
             cmd.stop();
             cmd.stop_dhcp();
-
-            /* With the shells gone nothing calls into a module any more:
-               its exit runs now, while the files and block I/O it may still
-               need are there (as in kernel/main.cpp) */
-            ModuleTable::get_instance().unload_all();
 
             /* The management bus after the modules -- whose providers their exits
                took off it -- and before the files go: its jobs are told to stop and

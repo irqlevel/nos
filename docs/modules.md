@@ -313,9 +313,15 @@ $ dmesg 5 module:
 ```
 
 `poweroff` and `reboot` unload every module that can be unloaded, newest
-first, once the shells have stopped and before the filesystems are unmounted
-and the soft IRQs stop -- so a module's exit still has the kernel services it
-may need, and nothing of the module is left running while they go.
+first, before the filesystems are unmounted and the soft IRQs stop -- so a
+module's exit still has the kernel services it may need, and nothing of the
+module is left running while they go. The shells are stopped after the
+modules, not before: a shell may be inside a module's command that returns
+only when its module is told to stop -- an `hv boot` on the console as
+`poweroff` comes over SSH -- and the order above is what gets it out. From the
+moment the halt begins no module is loaded (`insmod` says the machine is going
+down); a load another task is in the middle of is waited for, ten seconds at
+most, and unloaded with the rest.
 
 ## What a module may call
 
