@@ -24,6 +24,13 @@ public:
 
     IdtDescriptor get_descriptor(u16 index);
 
+    /* An entry may be written while its vector can be taken on another CPU
+       -- an MSI-X entry given another handler, a line's taken off -- and the
+       CPU that takes it reads the entry's two halves with no lock. It never
+       reads one of each: the upper half is the handler's upper 32 bits, the
+       same for every handler in the kernel's text, and the lower half goes
+       in with one aligned 8-byte store. A handler whose upper half is
+       another's would break that, and is refused here (BUG_ON). */
     void set_descriptor(u16 index, const IdtDescriptor& desc);
 
     /* The entry as it was before anything was registered at it: the stub of

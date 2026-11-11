@@ -94,6 +94,10 @@ void Idt::set_descriptor(u16 index, const IdtDescriptor& desc)
     if (index >= stdlib::array_size(entry_))
 	    return;
 
+    /* See idt.h: what makes a write of a live entry safe */
+    if (BUG_ON(entry_[index].get_high_part() != desc.get_high_part()))
+        return;
+
     entry_[index] = desc;
 }
 
@@ -102,7 +106,7 @@ void Idt::reset_descriptor(u16 index)
     if (index >= stdlib::array_size(entry_))
 	    return;
 
-    entry_[index] = IdtDescriptor::encode(dummy_interrupt_stub_table[index]);
+    set_descriptor(index, IdtDescriptor::encode(dummy_interrupt_stub_table[index]));
 }
 
 void Idt::dummy_interrupt(Context* ctx, u8 vector)

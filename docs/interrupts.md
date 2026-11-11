@@ -65,7 +65,7 @@ are (`hal/irqchip.h`: `irq_eoi`, `send_ipi`, `get_current_cpu_hw_id`,
 | `0x20`, `0x21`, `0x24` | Tick (PIT or HPET), 8042 keyboard, serial |
 | — | the virtio devices are Rust drivers and take one of the shared Rust slots below, on a line or as MSI-X |
 | `0x38`–`0x3F` | Legacy INTx lines requested by Rust drivers (8 slots). A line takes the first of these vectors nothing is registered at, from its slot's own on: a slot's own may still be a shared line's, whose first handler was that slot's and has left |
-| `0x40`–`0xEF` | MSI-X vectors, handed out in order by `MsixTable::alloc_vector` |
+| `0x40`–`0xEF` | MSI-X vectors, the lowest free one handed out by `MsixTable::alloc_vector` and given back when its table goes |
 | `0xFC` | Posted-interrupt notification (`hal::POSTED_VECTOR`): a vCPU in its guest takes it without an exit (VT-x's posted interrupts, [the hypervisor](hypervisor.md#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)); one out of its guest only ends it |
 | `0xFD` | Local APIC timer — this CPU's tick, and the deadline of a task asleep on it: one-shot ([the local timer](scheduler.md#the-local-timer)) |
 | `0xFE` | IPI (`hal::IPI_VECTOR`) |

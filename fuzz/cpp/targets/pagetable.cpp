@@ -1129,6 +1129,20 @@ void map_mmio(fuzz::Input& in)
         }
         /* The page after it is left unmapped */
         INVARIANT(!leaf_of(got + pages * PAGE_BYTES).present(), "MMIO at 0x%lx with no unmapped page after it", pa);
+        /* A mapping the table notes -- it notes MMIO_MAPPINGS_MAX of them --
+           says how far it runs from any address in it, and nothing of the
+           page left unmapped after it: what a user of somebody else's
+           mapping holds an offset into it to (MsixTable::setup) */
+        if (mmio_known.size() < PageTable::MMIO_MAPPINGS_MAX)
+        {
+            const ulong inside = in.below(pages * PAGE_BYTES);
+            INVARIANT(tested_pt().mmio_mapped_span(got + inside) == pages * PAGE_BYTES - inside,
+                "mmio_mapped_span(0x%lx) = 0x%lx for a mapping of %lu pages at 0x%lx", got + inside,
+                tested_pt().mmio_mapped_span(got + inside), pages, got);
+            INVARIANT(tested_pt().mmio_mapped_span(got + pages * PAGE_BYTES) == 0,
+                "mmio_mapped_span says the page after a mapping is mapped");
+            fuzz::reached("a noted MMIO mapping's span");
+        }
         mmio_known[MmioKey{pa, pages, wc}] = got;
     }
     for (ulong i = 0; i < pages; i++)
