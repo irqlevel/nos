@@ -58,6 +58,8 @@ private:
     FixedPageAllocator& operator=(const FixedPageAllocator& other) = delete;
     FixedPageAllocator& operator=(FixedPageAllocator&& other) = delete;
 
+    void unmap_and_free(ulong va);
+
     VaAllocator va_alloc_;
     ulong page_count_;
 };
