@@ -327,6 +327,9 @@ Cpu& CpuTable::get_current_cpu()
     return get_cpu(get_current_cpu_id());
 }
 
+/* How long the halt waits for a CPU to park */
+static const ulong PARK_TIMEOUT_NS = 10 * consts::NANO_SECS_IN_SEC;
+
 void CpuTable::exit_all_except_self()
 {
     auto& self = get_current_cpu();
@@ -339,8 +342,19 @@ void CpuTable::exit_all_except_self()
             auto& cpu = get_cpu(i);
             cpu.set_exiting();
 
+            /* Waited for, and no longer than this: a CPU wedged with its
+               interrupts off never parks, and the halt waited for it with
+               nothing said -- a machine told to turn itself off that stays
+               on, silent. Said, and the halt goes on without it. */
+            const stdlib::Time deadline = get_boot_time() + stdlib::Time(PARK_TIMEOUT_NS);
             while (!cpu.is_parked())
             {
+                if (get_boot_time() >= deadline)
+                {
+                    klog(0, "cpu %lu has not parked in %lu s: the halt goes on without it", i,
+                        PARK_TIMEOUT_NS / consts::NANO_SECS_IN_SEC);
+                    break;
+                }
                 cpu.send_ipi_self();
                 cpu_relax();
             }
@@ -922,8 +936,27 @@ void Cpu::queue_ipi_task_async(IPITask& task)
 
 void Cpu::queue_ipi_task(IPITask& task)
 {
+    /* How long before a task not yet run is said to be so, and again */
+    static const ulong REPORT_NS = 10 * consts::NANO_SECS_IN_SEC;
+
     queue_ipi_task_async(task);
-    task.completion.wait();
+
+    /* Waited for however long it takes -- the task is the caller's, on its
+       stack and on this CPU's list, and cannot be left there -- but not in
+       silence: a CPU that never runs it has its interrupts off for good,
+       and the waiter used to say nothing of what it was waiting for. */
+    stdlib::Time report_at = get_boot_time() + stdlib::Time(REPORT_NS);
+    while (task.completion.get_counter() != 0)
+    {
+        if (get_boot_time() >= report_at)
+        {
+            klog(0, "cpu %lu has not run an IPI task (0x%p) in %lu s: still waited for", index_, task.function,
+                REPORT_NS / consts::NANO_SECS_IN_SEC);
+            report_at = get_boot_time() + stdlib::Time(REPORT_NS);
+        }
+        /* As send_tlb_ipi waits: the answer comes from the other CPU */
+        yield_to_runnable();
+    }
 }
 
 ulong Cpu::process_ipi_tasks(Context* ctx)
