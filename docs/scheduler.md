@@ -192,10 +192,15 @@ displaced:
   both of which run with interrupts enabled.
 
 A brand-new task has no saved frame, so `hal::build_task_frame` fabricates one
-that looks exactly like a frame `switch_context` would have pushed, with the
-entry point where the return address goes (x86) or in `x30` via a thunk
-(arm64). The first switch into a task is therefore indistinguishable from
-any other.
+that looks exactly like a frame `switch_context` would have pushed, its
+return address a thunk's -- `task_entry_thunk` on x86, which calls the entry
+function out of `rbx`, and `x30` via a thunk on arm64. The first switch into
+a task is therefore indistinguishable from any other, the stack's alignment
+included: on x86 the frame is laid out so that `switch_context`'s callback
+on the new stack (`switch_complete`) and then the entry function are each
+entered as the ABI has it, 8 below a 16-byte boundary. It used to be made
+for the `ret` alone, straight into the entry function, which left every
+task's first `switch_complete` 8 off.
 
 ## Preemption
 

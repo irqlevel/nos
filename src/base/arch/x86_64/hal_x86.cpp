@@ -29,6 +29,17 @@ void enable_wx_support()
     /* EFER (MSR 0xC0000080) bit 11 = NXE: honor the NX bit in PTEs. */
     static const u32 EFER_MSR = 0xC0000080;
     static const u64 EFER_NXE = 1ULL << 11;
+    /* CPUID 0x80000001 EDX bit 20: the CPU has NX. Every x86-64 one does,
+       unless firmware turned it off ("Execute Disable" in its setup) -- and
+       then the write of EFER.NXE below is a #GP, here before there is an
+       IDT to take it: a reset with nothing said. Said instead. */
+    static const u32 LEAF_EXT_MAX = 0x80000000;
+    static const u32 LEAF_EXT_FEATURES = 0x80000001;
+    static const u32 EXT_FEATURES_EDX_NX = 1U << 20;
+    if (cpuid(LEAF_EXT_MAX).eax < LEAF_EXT_FEATURES || !(cpuid(LEAF_EXT_FEATURES).edx & EXT_FEATURES_EDX_NX))
+        PANIC("this CPU has no NX (CPUID 0x80000001 EDX bit 20), and the kernel's mappings need it: "
+            "turn execute-disable on in the firmware's setup");
+
     u64 efer = read_msr(EFER_MSR);
     if (!(efer & EFER_NXE))
         write_msr(EFER_MSR, efer | EFER_NXE);
@@ -458,20 +469,40 @@ ModuleReloc classify_module_reloc(u32 type)
    that a function is entered 8 below one. */
 static const ulong ABI_STACK_ALIGN = 16;
 
+/* A new task's first instructions (asm.asm): the entry function in rbx,
+   its argument in rdi */
+extern "C" void task_entry_thunk();
+
 ulong build_task_frame(ulong stack_top, ulong entry, ulong arg)
 {
-    /* The entry function is reached by switch_context's `ret`, as though it
-       had been called from a boundary -- so the address `ret` pops sits on
-       one. Worked out from the top rounded down, not from where Task::Stack
+    /* What switch_context finds on a task it has never run, as it would on
+       one it had switched out. It calls its callback on the new stack before
+       it pops the registers: the registers' frame is on a boundary, as it is
+       after switch_context's own pushes in a task that called it. Then its
+       `ret` -- to task_entry_thunk, reached as a caller is come back to, on
+       a boundary, which calls the entry function: entered 8 below one.
+
+       The frame used to be made for the `ret` alone, straight into the
+       entry function: right for that, and the callback before it -- every
+       task's first switch_complete -- was called 8 off the boundary. With
+       no SSE in this kernel nothing faulted on it; the ABI is the
+       compiler's to rely on all the same.
+
+       Worked out from the top rounded down, not from where Task::Stack
        happens to put stack_top. */
-    ulong* rsp = (ulong *)((stack_top & ~(ABI_STACK_ALIGN - 1)) - ABI_STACK_ALIGN);
-    rsp[0] = entry; /* return address switch_context's ret pops */
-    /* and the entry function's own, which it has none of: 0 ends a
-       backtrace there (StackTrace::capture_from), where the stack's poison
-       read as one more frame of every task's */
-    rsp[1] = 0;
-    kernel::Context* regs = (kernel::Context*)((ulong)rsp - sizeof(*regs));
+    static_assert(sizeof(kernel::Context) % ABI_STACK_ALIGN == sizeof(ulong),
+        "switch_context's pushes leave a called function's stack on a boundary");
+
+    ulong* top = (ulong *)(stack_top & ~(ABI_STACK_ALIGN - 1));
+    /* Nothing above the thunk: 0 ends a backtrace there
+       (StackTrace::capture_from), where the stack's poison read as one more
+       frame of every task's */
+    top[-1] = 0;
+    top[-2] = 0;
+    top[-3] = (ulong)&task_entry_thunk; /* what switch_context's ret pops */
+    kernel::Context* regs = (kernel::Context*)((ulong)&top[-3] - sizeof(*regs));
     stdlib::mem_set(regs, 0, sizeof(*regs));
+    regs->rbx = entry;       /* the thunk calls it (asm.asm) */
     regs->rdi = arg;         /* 1st argument for the entry function */
     regs->rflags = (1 << 9); /* IF */
     return (ulong)regs;
@@ -543,12 +574,17 @@ void print_cpu_info(stdlib::Printer& con)
 
     /* Family and model carry their extended halves above 0xF / 0x6
        respectively (SDM 3-217). */
-    ulong family = (r1.eax >> 8) & 0xF;
+    /* The model's extension goes by the base family, before its own
+       extension is added: asked of the sum, every AMD part since family
+       10h -- base 0xF, and 0x17 or 0x19 once extended -- had its model
+       printed without the upper half. */
+    const ulong base_family = (r1.eax >> 8) & 0xF;
+    ulong family = base_family;
     ulong model = (r1.eax >> 4) & 0xF;
     ulong stepping = r1.eax & 0xF;
-    if (family == 0xF)
+    if (base_family == 0xF)
         family = family + ((r1.eax >> 20) & 0xFF);
-    if (family == 0x6 || family == 0xF)
+    if (base_family == 0x6 || base_family == 0xF)
         model = model + (((r1.eax >> 16) & 0xF) << 4);
 
     con.printf("vendor %s\n", vendor);
