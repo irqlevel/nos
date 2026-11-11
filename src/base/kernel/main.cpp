@@ -1067,9 +1067,13 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
                 (c1e_was && c1e_now) ? " (c1e=firmware)" : "");
         ulong t0 = (ulong)kernel_start, t1 = (ulong)kernel_text;
         ulong r1 = (ulong)kernel_rodata, e = (ulong)kernel_end;
-        pt.protect_range(t0, t1 - t0, false, true);   /* RX */
-        pt.protect_range(t1, r1 - t1, false, false);  /* RO+NX */
-        pt.protect_range(r1, e - r1, true, false);    /* RW+NX */
+        /* All three, or no boot: left as it was mapped the image is
+           writable and executable throughout, and nothing after this would
+           say so -- the results used to be dropped */
+        if (!pt.protect_range(t0, t1 - t0, false, true) ||   /* RX */
+            !pt.protect_range(t1, r1 - t1, false, false) ||  /* RO+NX */
+            !pt.protect_range(r1, e - r1, true, false))      /* RW+NX */
+            PANIC("W^X: the kernel image could not be protected");
         klog(0, "W^X: text [0x%lX,0x%lX) rodata [0x%lX,0x%lX) data [0x%lX,0x%lX)",
             t0, t1, t1, r1, r1, e);
         if (Parameters::get_instance().is_wx_probe_text())
