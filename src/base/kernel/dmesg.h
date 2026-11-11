@@ -90,7 +90,12 @@ public:
     /* The list cannot hold more messages than the buffer has slots, so a walk
        that visits more than this is not walking a log any more -- it is
        following a tail another CPU keeps extending, and it is not obliged to
-       ever end. Every walk is capped here. */
+       ever end. Every walk is capped here.
+
+       The log itself holds half of MAX_MSGS, 1024 messages: the block
+       allocator keeps a block of its own beside every message's
+       (BlockAllocatorImpl::setup steps by two), so the cap is a bound and
+       not the count. */
     static const ulong BUF_SIZE = 128 * consts::PAGE_SIZE;
     static const ulong MAX_MSGS = BUF_SIZE / sizeof(DmesgMsg);
 
