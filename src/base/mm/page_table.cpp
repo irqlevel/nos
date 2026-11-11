@@ -78,6 +78,8 @@ PageTable::PageTable()
     , huge_zero_next_(0)
     , huge_pool_hint_(0)
     , huge_pool_window_on_(false)
+    , mmio_next_(MMIO_WINDOW)
+    , mmio_mapping_count_(0)
     , zero_check_(false)
 {
     klog(0, "PageTable 0x%p", this);
@@ -2111,6 +2113,11 @@ void PageTable::unmap_pages(ulong virt_addr, size_t count, bool free_pages)
 
 ulong PageTable::map_mmio_region(ulong phys_addr, ulong size_bytes, MmioCachePolicy policy)
 {
+    static_assert(MMIO_WINDOW == MemoryMap::KERNEL_SPACE_BASE + 48 * 1024 * consts::GB,
+        "the window 48 TiB into the kernel's half, as page_table.h says");
+    static_assert(IMAGE_ENTRY_END == MemoryMap::KERNEL_SPACE_BASE + TOP_ENTRY_SPAN,
+        "the image's top-level entry is the kernel half's first");
+
     const bool write_combining =
         (policy == MmioWriteCombining) && hal::is_write_combining_available();
 
@@ -2126,89 +2133,96 @@ ulong PageTable::map_mmio_region(ulong phys_addr, ulong size_bytes, MmioCachePol
     if (phys_addr & (consts::PAGE_SIZE - 1))
         return 0;
 
+    /* A BAR's or the firmware's word for where the device is: a range that
+       wraps, or reaches past what a table entry can name, is none */
+    if (size_bytes > MemoryMap::MAX_PHYS_ADDR || phys_addr > MemoryMap::MAX_PHYS_ADDR - size_bytes)
+        return 0;
+
     ulong pages = (size_bytes + consts::PAGE_SIZE - 1) / consts::PAGE_SIZE;
     if (pages == 0)
         pages = 1;
 
-    for (ulong i = 0; i < pages; i++)
+    ulong va = 0;
     {
-        ulong pa = phys_addr + i * consts::PAGE_SIZE;
-        ulong va = pa + MemoryMap::KERNEL_SPACE_BASE;
-
         stdlib::AutoLock lock(lock_);
-
-        ulong l4_index = Pte::l4_index(va);
-        ulong l3_index = Pte::l3_index(va);
-        ulong l2_index = Pte::l2_index(va);
-        ulong l1_index = Pte::l1_index(va);
 
         if (root_ == 0)
             return 0;
 
-        PtePage* l4_page = (PtePage*)tmp_map_page(root_);
-        if (l4_page == nullptr)
-            return 0;
-
-        Pte *l4_entry = &l4_page->entry[l4_index];
-        if (!l4_entry->present()) {
-            Page* p = alloc_page_no_lock();
-            if (!p) { tmp_unmap_page((ulong)l4_page); return 0; }
-            l4_entry->set_address(p->get_phy_address());
-            l4_entry->set_writable();
-            l4_entry->set_present();
+        /* Mapped already, all of it and as asked: that mapping */
+        for (ulong i = 0; i < mmio_mapping_count_; i++)
+        {
+            const MmioMapping& m = mmio_mappings_[i];
+            if (m.write_combining != write_combining || phys_addr < m.phys || pages > m.pages)
+                continue;
+            const ulong skipped = (phys_addr - m.phys) / consts::PAGE_SIZE;
+            if (skipped <= m.pages - pages)
+                return m.va + (phys_addr - m.phys);
         }
 
-        PtePage* l3_page = (PtePage*)tmp_map_page(l4_entry->address());
-        tmp_unmap_page((ulong)l4_page);
-        if (l3_page == nullptr)
+        /* Its pages and one more, left unmapped. The addresses are taken
+           whether or not all of it is then mapped: nobody is handed them
+           again, so no later mapping finds a leaf of this one in its way. */
+        const ulong left = MMIO_WINDOW + TOP_ENTRY_SPAN - mmio_next_;
+        if (pages >= left / consts::PAGE_SIZE)
             return 0;
+        va = mmio_next_;
+        mmio_next_ += (pages + 1) * consts::PAGE_SIZE;
+    }
 
-        Pte *l3_entry = &l3_page->entry[l3_index];
-        if (!l3_entry->present()) {
-            Page* p = alloc_page_no_lock();
-            if (!p) { tmp_unmap_page((ulong)l3_page); return 0; }
-            l3_entry->set_address(p->get_phy_address());
-            l3_entry->set_writable();
-            l3_entry->set_present();
-        }
+    /* An L1 table's worth under the lock at a time: a framebuffer is tens of
+       thousands of pages, and the lock keeps interrupts off */
+    for (ulong done = 0; done < pages;)
+    {
+        stdlib::AutoLock lock(lock_);
 
-        PtePage* l2_page = (PtePage*)tmp_map_page(l3_entry->address());
-        tmp_unmap_page((ulong)l3_page);
-        if (l2_page == nullptr)
-            return 0;
-
-        Pte *l2_entry = &l2_page->entry[l2_index];
-        if (!l2_entry->present()) {
-            Page* p = alloc_page_no_lock();
-            if (!p) { tmp_unmap_page((ulong)l2_page); return 0; }
-            l2_entry->set_address(p->get_phy_address());
-            l2_entry->set_writable();
-            l2_entry->set_present();
-        }
-
-        PtePage* l1_page = (PtePage*)tmp_map_page(l2_entry->address());
-        tmp_unmap_page((ulong)l2_page);
+        const ulong page_va = va + done * consts::PAGE_SIZE;
+        PtePage* l1_page = walk_to_l1_locked(page_va, true);
         if (l1_page == nullptr)
             return 0;
 
-        Pte *l1_entry = &l1_page->entry[l1_index];
-        if (!l1_entry->present())
+        for (ulong l1_index = Pte::l1_index(page_va);
+            done < pages && l1_index < stdlib::array_size(l1_page->entry); done++, l1_index++)
         {
-            l1_entry->set_address(pa);
+            Pte* l1_entry = &l1_page->entry[l1_index];
+            /* The window's addresses are handed out once each */
+            BUG_ON(l1_entry->present());
+
+            /* Built aside and stored whole, so the walker never sees half
+               of it */
+            Pte e;
+            e.set_address(phys_addr + done * consts::PAGE_SIZE);
             if (write_combining)
-                l1_entry->set_write_combining();
+                e.set_write_combining();
             else
-                l1_entry->set_cache_disabled();   /* device memory: uncached */
+                e.set_cache_disabled();   /* device memory: uncached */
             /* Nothing is ever executed out of MMIO */
-            l1_entry->set_no_execute();
-            l1_entry->set_writable();
-            l1_entry->set_present();
+            e.set_no_execute();
+            e.set_writable();
+            e.set_present();
+            l1_entry->value = e.value;
         }
         tmp_unmap_page((ulong)l1_page);
-        hal::tlb_flush_page(va);
     }
 
-    return phys_addr + MemoryMap::KERNEL_SPACE_BASE;
+    /* Not present before, so no TLB holds anything of them: only the stores
+       to make the walker's */
+    hal::pte_made_valid();
+
+    {
+        stdlib::AutoLock lock(lock_);
+
+        if (mmio_mapping_count_ < MMIO_MAPPINGS_MAX)
+        {
+            MmioMapping& m = mmio_mappings_[mmio_mapping_count_++];
+            m.phys = phys_addr;
+            m.pages = pages;
+            m.va = va;
+            m.write_combining = write_combining;
+        }
+    }
+
+    return va;
 }
 
 /* Legacy single-page form: returns the page so the caller can pair its own

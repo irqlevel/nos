@@ -191,8 +191,22 @@ bool PageAllocatorImpl::setup()
     /* The large runs get a window of their own, past the blocks' */
     const ulong large_block = PageTable::MAX_LARGE_MAP_PAGES * consts::PAGE_SIZE;
     const ulong large_start = stdlib::round_up(end_address, large_block);
-    if (!large_pg_alloc_.setup(large_start, large_start + LARGE_BLOCK_COUNT * large_block,
-            PageTable::MAX_LARGE_MAP_PAGES))
+    const ulong large_end = large_start + LARGE_BLOCK_COUNT * large_block;
+
+    /* All of it inside the image's top-level entry: the windows mapped by
+       address rather than handed out here -- MMIO's, the huge pool's -- are
+       entries of their own above it, and ranges that reached one would be
+       the heap and a device given the same addresses again. Seven tenths of
+       512 GiB of RAM fit; more is a machine this layout was not made for,
+       said rather than booted. */
+    if (large_end > PageTable::IMAGE_ENTRY_END)
+    {
+        klog(0, "setup 0x%p: the ranges end at 0x%lX, past the image's top-level entry at 0x%lX", this, large_end,
+            PageTable::IMAGE_ENTRY_END);
+        return false;
+    }
+
+    if (!large_pg_alloc_.setup(large_start, large_end, PageTable::MAX_LARGE_MAP_PAGES))
     {
         return false;
     }
