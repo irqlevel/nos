@@ -1633,6 +1633,18 @@ each new gate.
       closes and frees that came together made durable by one write of each
       copy and two flushes, where each costs that now -- a stop's 140 closes
       some 30 ms on a VM instead of ~4 s.
+  - **The engine's form** (decided 2026-11-12): its operations are `async
+    fn`s over an asynchronous `Device` -- read, write and flush each a
+    future -- driven by one task's executor: nbs-cs's, and the fuzzer's on
+    the host. A completion or a message makes ready the futures that wait
+    on it, and the executor polls those (`Waker::noop` and readiness flags:
+    no waker kept anywhere). The compiler makes each operation's state
+    machine, so its steps cannot be written out of order; what operations
+    share -- the slot tables, the fences, a chunk's turn, the table pages
+    waiting for their commit -- sits in cells borrowed only between two
+    awaits, never across one, which the fuzzer's interleavings would catch
+    as a panic. An operation is boxed when it starts: an allocation a
+    request, as its message is already.
   - **The device queue**: a flush started and reaped as a write is
     (`IO_FLUSH` on the asynchronous path, which NVMe has); and virtio-blk
     given the asynchronous path -- the VMs' pools are virtio disks, which
