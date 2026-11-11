@@ -42,10 +42,11 @@ public:
     Event();
     ~Event();
 
-    /* Task context, one waiter at a time (a second panics) -- and never a
-       CPU's idle task, which is the scheduler's last resort and must stay
-       runnable: a task exiting on a CPU whose idle task is blocked has
-       nothing to switch to. */
+    /* Task context, one waiter at a time (a second panics). A CPU's idle
+       task, which is the scheduler's last resort and must stay runnable -- a
+       task exiting on a CPU whose idle task is blocked has nothing to switch
+       to -- does not block here: it yields the CPU and looks again, as
+       sleep() polls there. */
     void wait();
 
     /* wait() for at most timeout_ns: true when signalled, false when the
