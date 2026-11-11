@@ -44,7 +44,10 @@ private:
     static const u8 REG_DAY      = 0x07;
     static const u8 REG_MONTH    = 0x08;
     static const u8 REG_YEAR     = 0x09;
-    static const u8 REG_CENTURY  = 0x32;
+    /* The last index the CMOS has: the index port's bit 7 gates the NMI */
+    static const u8 CMOS_INDEX_MAX = 0x7F;
+    /* How many times the clock is read for two readings alike */
+    static const ulong SNAPSHOT_TRIES = 8;
     static const u8 REG_STATUS_A  = 0x0A;
     static const u8 REG_STATUS_B  = 0x0B;
 
