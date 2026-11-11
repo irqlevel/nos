@@ -94,6 +94,7 @@ impl Joined {
             b.extend_from_slice(h.name.as_bytes());
             b.extend_from_slice(&h.node.to_le_bytes());
             b.extend_from_slice(&h.ip.to_le_bytes());
+            b.extend_from_slice(&h.port.to_le_bytes());
             b.push(h.keys.len().min(registry::KEYS_MAX) as u8);
             for k in h.keys.iter().take(registry::KEYS_MAX) {
                 b.extend_from_slice(k);
@@ -122,6 +123,7 @@ impl Joined {
             let name = core::str::from_utf8(take(len)?).ok()?;
             let node = u64::from_le_bytes(take(8)?.try_into().ok()?);
             let ip = u32::from_le_bytes(take(4)?.try_into().ok()?);
+            let port = u16::from_le_bytes(take(2)?.try_into().ok()?);
             let k = usize::from(take(1)?[0]);
             if !registry::valid_name(name) || node == 0 || ip == 0 || k == 0 || k > registry::KEYS_MAX
                 || hosts.iter().any(|h: &files::Known| h.name == name || h.node == node)
@@ -132,7 +134,7 @@ impl Joined {
             for _ in 0..k {
                 keys.push(take(32)?.try_into().ok()?);
             }
-            hosts.push(files::Known { name: String::from(name), node, ip, keys });
+            hosts.push(files::Known { name: String::from(name), node, ip, port, keys });
         }
         (at == b.len() && node != 0).then_some(Joined { node, cluster, hosts })
     }
@@ -262,7 +264,8 @@ impl App for Registry {
                 node,
                 cluster: c.id,
                 hosts: core.state().hosts().iter()
-                    .map(|h| files::Known { name: h.name.clone(), node: h.node, ip: h.ipc(), keys: h.keys.clone() })
+                    .map(|h| files::Known { name: h.name.clone(), node: h.node, ip: h.ipc(), port: h.ipc_port(),
+                                            keys: h.keys.clone() })
                     .collect(),
             }),
             _ => None,
@@ -360,7 +363,7 @@ impl Registry {
                 let mut peers: Vec<control::Peer> = state.peers_of(&self.me.name).into_iter()
                     .map(|p| {
                         let only = state.host(&p.name).is_none().then(|| String::from(NAME));
-                        control::Peer { name: p.name, ip: p.ip, keys: p.keys, only }
+                        control::Peer { name: p.name, ip: p.ip, port: p.port, keys: p.keys, only }
                     })
                     .collect();
                 /* A host removed since ipcnet was told: kept a while, held to
@@ -386,7 +389,8 @@ impl Registry {
             }
             None if !self.me.hosts.is_empty() => (self.me.cluster, self.me.hosts.iter()
                 .filter(|h| h.name != self.me.name)
-                .map(|h| control::Peer { name: h.name.clone(), ip: h.ip, keys: h.keys.clone(), only: None })
+                .map(|h| control::Peer { name: h.name.clone(), ip: h.ip, port: h.port, keys: h.keys.clone(),
+                                         only: None })
                 .collect()),
             None => return,
         };

@@ -8,7 +8,9 @@ every host's ipcnet pinning every other's key from the registry alone.
 - b invited from a with the key `ipcnet id` says on b, and joined with the
   token: a voter, and a and b up to each other;
 - c invited from b, a member that does not lead (the command handed to the
-  leader), a join with a secret not the token's refused; c, invited, b's
+  leader), at the port it listens on, one of its own -- every host reaches
+  it there, its address said with its port (#99) -- a join with a secret
+  not the token's refused; c, invited, b's
   peer and reaching b's member alone -- its pings to b's echo refused -- then
   joined with the token: a, b and c all up to one another, three voters, and
   c's pings to a's echo answered over the connection the registry made;
@@ -68,6 +70,8 @@ hubmod = load("hub", "hub.py")
 ipct = load("ipct", "ipc-test.py")
 
 HOSTS = ["a", "b", "c"]
+# c's ipcnet listens here, not at ipcnet's own 39240 (#99)
+C_PORT = 39250
 SHELL_PORT = ipct.SHELL_PORT
 HUB_BASE = 47800
 FAILED = []
@@ -91,10 +95,10 @@ def need(name, ok, detail=""):
         raise Stop(name)
 
 
-def rootfs(tmp, arch, name, cluster, tag=""):
+def rootfs(tmp, arch, name, cluster, tag="", port=None):
     """A root for host `name`: both modules, and hosts.toml naming this host
-    alone, in a cluster of its own until it joins one -- `tag` telling one
-    install of a host from another."""
+    alone, in a cluster of its own until it joins one -- listening on `port`
+    where one is given -- `tag` telling one install of a host from another."""
     rootdir = os.path.join(tmp, "root-" + name + tag)
     os.makedirs(os.path.join(rootdir, "etc", "ipc"))
     for m in ("ipcnet", "cluster"):
@@ -104,6 +108,8 @@ def rootfs(tmp, arch, name, cluster, tag=""):
         shutil.copy(ko, os.path.join(rootdir, m + ".ko"))
     with open(os.path.join(rootdir, "etc", "ipc", "hosts.toml"), "w") as f:
         f.write('# cluster-test.py\nname = "%s"\ncluster = "%s"\npeers = []\n' % (name, cluster))
+        if port is not None:
+            f.write("port = %d\n" % port)
     with open(os.path.join(rootdir, "etc", "rc"), "w") as f:
         f.write("# cluster-test.py\ninsmod /ipcnet.ko\nipcnet start\nipc echo start\ninsmod /cluster.ko\n")
     image = os.path.join(tmp, "root-%s%s.img" % (name, tag))
@@ -160,7 +166,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix="nos-cluster-")
     print("cluster-test: %s, %s, scratch in %s" % (args.arch, accel, tmp), flush=True)
     ip = hubmod.Hub.ip
-    images = [rootfs(tmp, args.arch, h, os.urandom(16).hex()) for h in HOSTS]
+    images = [rootfs(tmp, args.arch, h, os.urandom(16).hex(), port=C_PORT if h == "c" else None) for h in HOSTS]
     n = len(HOSTS)
     hub = hubmod.Hub(n, HUB_BASE, shell_port=SHELL_PORT).start()
     procs, logs = [None] * n, []
@@ -225,7 +231,7 @@ def main():
 
         # -- c invited from b, which hands it to the leader; a wrong secret refused --
         kc = key_of(c)
-        out = b.run("cluster invite c %s %s" % (ip(2), kc))
+        out = b.run("cluster invite c %s:%d %s" % (ip(2), C_PORT, kc))
         tc = token_of(out)
         need("b invites c, a member that does not lead", tc is not None, out)
         # The token's bytes in hex after "nos1-": the cluster (16), the
@@ -257,6 +263,9 @@ def main():
               r is not None and r["answered"] == 50 and r["wrong"] == 0, r)
         out = a.run("cluster")
         check("a's member says three hosts, three voters", "3 hosts, 3 voters" in out, out)
+        out = a.run("cluster hosts")
+        check("c's address said with its port, which every host calls it at",
+              re.search(r"^\s+c\s+node 3\s+\w+\s+%s:%d\s" % (re.escape(ip(2)), C_PORT), out, re.M) is not None, out)
 
         # -- the provider: the bus answering as the command does --
         out = a.run("mgmt call cluster hosts")
@@ -266,6 +275,11 @@ def main():
         except (ValueError, KeyError):
             names = []
         check("the cluster provider's hosts, through the bus, the three", names == ["a", "b", "c"], out)
+        try:
+            ports = {h["name"]: h["port"] for h in json.loads(m.group(1))["hosts"]} if m else {}
+        except (ValueError, KeyError):
+            ports = {}
+        check("and c's port, none for the others", ports == {"a": None, "b": None, "c": C_PORT}, out)
 
         # -- maintenance and an address, as every host says them --
         out = a.run("cluster maintenance b on")

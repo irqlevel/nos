@@ -123,6 +123,23 @@ fn role_name(role: Role) -> &'static str {
     }
 }
 
+/// A port given (#99): None where none is, refused where it is not one.
+fn port_param(p: &mut Params<'_>, call: &mut Call) -> Result<u16, Status> {
+    match p.opt_uint("port", 1, u64::from(u16::MAX)).map_err(|e| invalid(call, e))? {
+        None => Ok(0),
+        Some(n) => Ok(n as u16),
+    }
+}
+
+/// A port, null where none is said: ipcnet's own.
+fn port_or_null(w: &mut Writer, port: u16) {
+    if port == 0 {
+        w.null();
+    } else {
+        w.uint(u64::from(port));
+    }
+}
+
 fn ip_or_null(w: &mut Writer, ip: Option<u32>) {
     match ip {
         Some(ip) => w.str(&alloc::format!("{}", crate::Ip(ip))),
@@ -198,6 +215,8 @@ fn hosts(state: &ModState, p: Params<'_>, call: &mut Call) -> Status {
             w.field_bool("leader", h.node == v.leader);
             w.key("ip");
             ip_or_null(w, Some(h.ipc()));
+            w.key("port");
+            port_or_null(w, h.ipc_port());
             w.key("underlay");
             ip_or_null(w, of_role(AddrRole::Underlay));
             w.key("public");
@@ -219,6 +238,8 @@ fn hosts(state: &ModState, p: Params<'_>, call: &mut Call) -> Status {
             w.field_str("host", &i.host);
             w.key("ip");
             ip_or_null(w, Some(i.ip));
+            w.key("port");
+            port_or_null(w, i.port);
             w.field_uint("expires_s", i.expires);
             w.end_object();
         }
@@ -238,6 +259,10 @@ fn invite(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status {
         Ok(None) => return refuse(call, Status::Invalid, "the address the host joins from", Some("ip")),
         Err(s) => return s,
     };
+    let port = match port_param(&mut p, call) {
+        Ok(port) => port,
+        Err(s) => return s,
+    };
     let key = match p.str("key", KEY_MAX).map(files::unhex::<32>) {
         Ok(Some(k)) => k,
         Ok(None) => return refuse(call, Status::Invalid, "64 hex digits, as `ipcnet id` says them", Some("key")),
@@ -246,7 +271,7 @@ fn invite(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status {
     if let Err(e) = p.finish() {
         return invalid(call, e);
     }
-    match op_invite(state, host, ip, key) {
+    match op_invite(state, host, ip, port, key) {
         Ok(token) => answer(call, |w| {
             w.begin_object();
             w.field_str("host", host);
@@ -332,16 +357,22 @@ fn address(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status {
         Ok(ip) => ip,
         Err(s) => return s,
     };
+    let port = match port_param(&mut p, call) {
+        Ok(port) => port,
+        Err(s) => return s,
+    };
     if let Err(e) = p.finish() {
         return invalid(call, e);
     }
-    match op_address(state, host, role, ip.unwrap_or(0)) {
+    match op_address(state, host, role, ip.unwrap_or(0), port) {
         Ok(_) => answer(call, |w| {
             w.begin_object();
             w.field_str("host", host);
             w.field_str("role", role.name());
             w.key("ip");
             ip_or_null(w, ip);
+            w.key("port");
+            port_or_null(w, port);
             w.end_object();
         }),
         Err(why) => failed(call, &why),

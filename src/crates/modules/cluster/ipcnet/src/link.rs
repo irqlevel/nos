@@ -230,10 +230,12 @@ type Up = Option<(Session, Arc<Peer>, usize, u64)>;
 /// Hello said and heard, and the peer's session joined.
 fn dial(shared: &Arc<Shared>, peer: Arc<Peer>, class: usize, session: u64) -> Up {
     let ip = peer.conf.ip;
+    /* Its own port where it says one (#99), else ipcnet's */
+    let port = if peer.conf.port != 0 { peer.conf.port } else { super::files::DEFAULT_PORT };
     let stream = if class == BULK {
-        TcpStream::connect_bulk(&shared.nic, ip, shared.cfg.port)
+        TcpStream::connect_bulk(&shared.nic, ip, port)
     } else {
-        TcpStream::connect(&shared.nic, ip, shared.cfg.port)
+        TcpStream::connect(&shared.nic, ip, port)
     };
     let Some(stream) = stream else {
         peer.lose(&shared.router, session, "no answer");
