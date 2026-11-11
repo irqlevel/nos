@@ -236,9 +236,26 @@ struct PageState
 };
 
 std::vector<PageState> pages;
-/* va -> phys of the sequence's mappings, and of MMIO */
+/* va -> phys of the sequence's mappings, and of MMIO's pages */
 std::map<ulong, ulong> maps;
 std::map<ulong, ulong> mmio;
+/* What MMIO has been mapped: (phys, pages, write-combining) -> where. The
+   same range asked for again is to be that mapping. */
+struct MmioKey
+{
+    ulong phys;
+    ulong pages;
+    bool write_combining;
+    bool operator<(const MmioKey& o) const
+    {
+        if (phys != o.phys)
+            return phys < o.phys;
+        if (pages != o.pages)
+            return pages < o.pages;
+        return write_combining < o.write_combining;
+    }
+};
+std::map<MmioKey, ulong> mmio_known;
 /* The sequence's temp mappings: va -> (phys, what it wrote there) */
 struct Tmp
 {
@@ -1047,22 +1064,69 @@ void frame(fuzz::Input& in)
 
 void map_mmio(fuzz::Input& in)
 {
-    ulong pa = (machine.pages + in.below(64)) * PAGE_BYTES;
-    ulong va = pa + MemoryMap::KERNEL_SPACE_BASE;
-    if (mmio.count(va) || maps.count(va))
-        return;
+    /* A device past the machine's memory, of one to three pages, mapped
+       whole or from its second page on */
+    const ulong pa = (machine.pages + in.below(64)) * PAGE_BYTES;
+    const ulong pages = 1 + in.below(3);
     hal::write_combining = in.boolean();
-    ulong got = tested_pt().map_mmio_region(pa, 1 + in.below(PAGE_BYTES), in.boolean() ? PageTable::MmioWriteCombining
-                                                                          : PageTable::MmioUncached);
+    const bool ask_wc = in.boolean();
+    const bool wc = ask_wc && hal::write_combining;
+    const ulong size = (pages - 1) * PAGE_BYTES + 1 + in.below(PAGE_BYTES);
+    ulong got = tested_pt().map_mmio_region(pa, size, ask_wc ? PageTable::MmioWriteCombining
+                                                             : PageTable::MmioUncached);
     if (got == 0)
     {
         fuzz::reached("an MMIO map that failed on the way");
         return;
     }
-    INVARIANT(got == va, "MMIO at 0x%lx mapped at 0x%lx", pa, got);
-    mmio[va] = pa;
-    Pte leaf = leaf_of(va);
-    INVARIANT(leaf.present() && !executable(leaf), "an MMIO mapping that can be executed");
+    INVARIANT(got >= PageTable::MMIO_WINDOW && got < PageTable::MMIO_WINDOW + PageTable::TOP_ENTRY_SPAN &&
+        got % PAGE_BYTES == 0, "MMIO at 0x%lx mapped at 0x%lx, outside its window", pa, got);
+
+    /* The same range again is the mapping it has; so is a range inside one
+       mapped before, as the same pages of it */
+    ulong expected = 0;
+    for (const auto& k : mmio_known)
+    {
+        if (k.first.write_combining == wc && pa >= k.first.phys &&
+            pa + pages * PAGE_BYTES <= k.first.phys + k.first.pages * PAGE_BYTES)
+        {
+            expected = k.second + (pa - k.first.phys);
+            break;
+        }
+    }
+    if (expected != 0 && mmio_known.size() <= PageTable::MMIO_MAPPINGS_MAX)
+    {
+        /* Any mapping that holds the range will do: the kernel takes the
+           first it noted */
+        bool held = false;
+        for (const auto& k : mmio_known)
+        {
+            if (k.first.write_combining == wc && pa >= k.first.phys &&
+                pa + pages * PAGE_BYTES <= k.first.phys + k.first.pages * PAGE_BYTES &&
+                got == k.second + (pa - k.first.phys))
+                held = true;
+        }
+        INVARIANT(held, "MMIO at 0x%lx, mapped before, mapped again at 0x%lx", pa, got);
+        fuzz::reached("an MMIO map of a range mapped already");
+    }
+    else
+    {
+        for (ulong i = 0; i < pages; i++)
+        {
+            const ulong va = got + i * PAGE_BYTES;
+            INVARIANT(!mmio.count(va) && !maps.count(va), "MMIO at 0x%lx given 0x%lx, which is taken", pa, va);
+            mmio[va] = pa + i * PAGE_BYTES;
+        }
+        /* The page after it is left unmapped */
+        INVARIANT(!leaf_of(got + pages * PAGE_BYTES).present(), "MMIO at 0x%lx with no unmapped page after it", pa);
+        mmio_known[MmioKey{pa, pages, wc}] = got;
+    }
+    for (ulong i = 0; i < pages; i++)
+    {
+        Pte leaf = leaf_of(got + i * PAGE_BYTES);
+        INVARIANT(leaf.present() && writable(leaf) && !executable(leaf),
+            "an MMIO mapping that is not there, cannot be written or can be executed");
+    }
     fuzz::reached("an MMIO map");
 }
 
@@ -1398,6 +1462,7 @@ void reset()
     tmp_slots = 0;
     maps.clear();
     mmio.clear();
+    mmio_known.clear();
     prot.clear();
     pool_blocks.clear();
     pool_zeroed.clear();
