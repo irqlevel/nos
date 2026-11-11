@@ -1877,13 +1877,28 @@ void bench(stdlib::Printer& con, ulong cpu)
 const ulong WORDS_MAX = 16;
 const ulong WORD_LEN = 32;
 
-ulong split(const char* args, char words[WORDS_MAX][WORD_LEN])
+/* What of a line split() did not take */
+struct Left
+{
+    ulong dropped;  /* words past WORDS_MAX */
+    ulong cut;      /* words longer than WORD_LEN - 1 */
+};
+
+/* The words of a line, WORDS_MAX of them at most, each cut to WORD_LEN - 1;
+   what did not fit is counted into left, for whole() to refuse the line
+   by. They used to be dropped and cut without a word: `trace on` of
+   seventeen events turned on sixteen. */
+ulong split(const char* args, char words[WORDS_MAX][WORD_LEN], Left& left)
 {
     ulong n = 0;
+    ulong dropped = 0;
+    ulong cut = 0;
     const char* end;
-    for (const char* tok = stdlib::next_token(args, end); tok && n < WORDS_MAX; tok = stdlib::next_token(end, end))
+    for (const char* tok = stdlib::next_token(args, end); tok; tok = stdlib::next_token(end, end))
     {
         char token[WORDS_MAX * WORD_LEN];
+        if ((ulong)(end - tok) >= sizeof(token))
+            cut++;
         stdlib::token_copy(tok, end, token, sizeof(token));
         /* Commas split words too, as spaces do: `trace on
            sched_switch,sched_wakeup`. An empty word between two is none. */
@@ -1897,17 +1912,39 @@ ulong split(const char* args, char words[WORDS_MAX][WORD_LEN])
             if (len != 0 && n < WORDS_MAX)
             {
                 if (len >= WORD_LEN)
+                {
                     len = WORD_LEN - 1;
+                    cut++;
+                }
                 stdlib::mem_cpy(words[n], from, len);
                 words[n][len] = '\0';
                 n++;
+            }
+            else if (len != 0)
+            {
+                dropped++;
             }
             if (*comma == '\0')
                 break;
             from = comma + 1;
         }
     }
+    left.dropped = dropped;
+    left.cut = cut;
     return n;
+}
+
+/* Whether split() took all of a line; said, and nothing to be done with the
+   line, when it did not: a list acted on as far as it fitted is a command
+   that did part of what was typed. */
+bool whole(const Left& left, stdlib::Printer& con)
+{
+    if (left.dropped == 0 && left.cut == 0)
+        return true;
+
+    con.printf("trace: %lu words a line at most, of %lu characters each: this one has %lu more, and %lu longer -- "
+        "nothing done\n", WORDS_MAX, WORD_LEN - 1, left.dropped, left.cut);
+    return false;
 }
 
 }
@@ -2003,7 +2040,10 @@ const Event& event(Id id)
 long set(const char* what, bool turn_on, stdlib::Printer& con)
 {
     char words[WORDS_MAX][WORD_LEN] = {};
-    ulong n = split(what, words);
+    Left left = {};
+    ulong n = split(what, words, left);
+    if (!whole(left, con))
+        return -1;
     if (n == 0)
     {
         con.printf("trace: name events, groups or `all`\n");
@@ -2126,6 +2166,7 @@ bool field_filter(const char* name, const char* value, Select& select, stdlib::P
     u64 number = 0;
     const bool numeric = parse_filter_number(value, number);
     bool any = false;
+    bool a_time = false;
     for (ulong id = 0; id < COUNT; id++)
     {
         f.offset[id] = 0;
@@ -2141,6 +2182,14 @@ bool field_filter(const char* name, const char* value, Select& select, stdlib::P
                 continue;
             u64 v = 0;
             bool fits = false;
+            /* Not a field to match a value against: what it holds is half
+               of a stamp, shown as the time from it to the record's. A
+               number given for it was compared with the stamp's bits. */
+            if (field.kind == Kind::Since)
+            {
+                a_time = true;
+                break;
+            }
             if (numeric)
             {
                 v = number;
@@ -2170,7 +2219,10 @@ bool field_filter(const char* name, const char* value, Select& select, stdlib::P
     }
     if (!any)
     {
-        con.printf("trace: no event of the window has a field %s that can be %s\n", name, value);
+        if (a_time)
+            con.printf("trace: %s is a time, shown from a stamp the record holds: not a field to filter by\n", name);
+        else
+            con.printf("trace: no event of the window has a field %s that can be %s\n", name, value);
         return false;
     }
     select.filter_count++;
@@ -2261,8 +2313,15 @@ bool parse_wakeup_trigger(const char* word, u64& ns)
 void command(const char* args, stdlib::Printer& con)
 {
     char words[WORDS_MAX][WORD_LEN] = {};
-    ulong n = split(args, words);
+    Left left = {};
+    ulong n = split(args, words, left);
     const char* verb = (n == 0) ? "list" : words[0];
+
+    /* on and off take the rest of the line by themselves (set), which says
+       what of it does not fit; every other verb's words are these */
+    const bool sets = stdlib::str_cmp(verb, "on") == 0 || stdlib::str_cmp(verb, "off") == 0;
+    if (!sets && !whole(left, con))
+        return;
 
     /* The rest of the line after the verb, for set(). */
     const char* rest = args;

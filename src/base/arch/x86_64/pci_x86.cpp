@@ -32,6 +32,20 @@ void pci_config_write32(u16 bus, u16 slot, u16 func, u16 offset, u32 value)
     outl(0xCFC, value);
 }
 
+/* The data port is four bytes wide, each its own: a word or a byte of it
+   written is that part of the register alone */
+void pci_config_write16(u16 bus, u16 slot, u16 func, u16 offset, u16 value)
+{
+    outl(0xCF8, config_address(bus, slot, func, offset));
+    outw((u16)(0xCFC + (offset & 2)), value);
+}
+
+void pci_config_write8(u16 bus, u16 slot, u16 func, u16 offset, u8 value)
+{
+    outl(0xCF8, config_address(bus, slot, func, offset));
+    outb((u16)(0xCFC + (offset & 3)), value);
+}
+
 void pci_assign_resources(void* devices, ulong count, ulong stride)
 {
     (void)devices;

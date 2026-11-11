@@ -33,6 +33,14 @@ bool Rtc::read_time(RtcTime& t)
     while ((read_register(REG_STATUS_A) & STATUS_A_UIP) && timeout > 0)
         timeout--;
 
+    /* The century is where the FADT says it is, on a machine that has one:
+       0 for none, and an index past the CMOS's seven bits is none either --
+       bit 7 of the index port is the NMI's gate. It used to be read at 0x32
+       whatever the FADT's index was. */
+    u8 century_reg = Acpi::get_instance().get_century_register();
+    if (century_reg > CMOS_INDEX_MAX)
+        century_reg = 0;
+
     /* Read first snapshot */
     u8 sec1 = read_register(REG_SECONDS);
     u8 min1 = read_register(REG_MINUTES);
@@ -40,11 +48,19 @@ bool Rtc::read_time(RtcTime& t)
     u8 day1 = read_register(REG_DAY);
     u8 mon1 = read_register(REG_MONTH);
     u8 yr1  = read_register(REG_YEAR);
-    u8 cen1 = read_register(REG_CENTURY);
+    u8 cen1 = (century_reg != 0) ? read_register(century_reg) : 0;
 
-    /* Read second snapshot and compare to avoid mid-update inconsistency */
+    /* Read second snapshot and compare to avoid mid-update inconsistency.
+       A clock that never reads the same twice is not one to wait out: the
+       last reading is taken, and said. */
     u8 sec2, min2, hr2, day2, mon2, yr2, cen2;
+    ulong tries = 0;
     do {
+        if (++tries > SNAPSHOT_TRIES)
+        {
+            klog(0, "RTC: no two readings alike in %lu, the last taken", SNAPSHOT_TRIES);
+            break;
+        }
         sec2 = sec1; min2 = min1; hr2 = hr1;
         day2 = day1; mon2 = mon1; yr2 = yr1; cen2 = cen1;
 
@@ -59,7 +75,7 @@ bool Rtc::read_time(RtcTime& t)
         day1 = read_register(REG_DAY);
         mon1 = read_register(REG_MONTH);
         yr1  = read_register(REG_YEAR);
-        cen1 = read_register(REG_CENTURY);
+        cen1 = (century_reg != 0) ? read_register(century_reg) : 0;
     } while (sec1 != sec2 || min1 != min2 || hr1 != hr2 ||
              day1 != day2 || mon1 != mon2 || yr1 != yr2 || cen1 != cen2);
 
@@ -93,15 +109,13 @@ bool Rtc::read_time(RtcTime& t)
     t.month  = mon1;
 
     /* Only trust the century CMOS register if the FADT advertises one;
-       on a board without a century register, REG_CENTURY (0x32) holds
-       unrelated data and would yield a wildly wrong year. */
-    u8 century_reg = Acpi::get_instance().get_century_register();
+       on a board without a century register nothing was read for it. */
     if (century_reg != 0 && cen1 != 0)
         t.year = (u16)cen1 * 100 + yr1;
     else
         t.year = DEFAULT_CENTURY + yr1;
 
-    klog(0, "RTC: %lu-%lu-%lu %lu:%lu:%lu",
+    klog(0, "RTC: %lu-%02lu-%02lu %02lu:%02lu:%02lu",
         (ulong)t.year, (ulong)t.month, (ulong)t.day,
         (ulong)t.hour, (ulong)t.minute, (ulong)t.second);
 

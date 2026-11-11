@@ -15,7 +15,9 @@
 #include "event.h"
 #include "tracepoint.h"
 #include "trace_ring.h"
+#include "interrupt.h"
 #include <hal/cpu.h>
+#include <hal/irqchip.h>
 
 #include <lib/error.h>
 #include <lib/grub_env.h>
@@ -26,7 +28,9 @@
 #include <mm/memory_map.h>
 #include <mm/new.h>
 #include <mm/allocator.h>
+#include <mm/alloc_sites.h>
 #include <mm/heap_usage.h>
+#include "memsites.h"
 
 namespace kernel
 {
@@ -189,6 +193,121 @@ stdlib::Error test_heap_usage()
     return make_success();
 }
 
+/* The Rust half of test_alloc_sites (kernel crate, memsites.rs): blocks
+   allocated by its memsites_probe and kept, and freed */
+extern "C" bool rust_memsites_probe(unsigned long count, unsigned long size);
+extern "C" void rust_memsites_release();
+
+/* What the sites whose own frame is the probe's function hold, as the
+   report would merge them, read off the heap now */
+static mm::AllocSites::Totals probe_totals(mm::AllocSites::Totals* totals)
+{
+    mm::AllocSites::Totals sum = {0, 0, 0};
+    memsites::collect(totals);
+    for (size_t i = 0; i < mm::AllocSites::SITES; i++)
+    {
+        if (totals[i].blocks == 0)
+            continue;
+        ulong frames[mm::AllocSites::FRAMES];
+        const size_t n = mm::AllocSites::get_instance().frames_of(i, frames);
+        char name[SymbolTable::DESCRIBE_MAX];
+        if (n == 0 || !SymbolTable::get_instance().describe_return(frames[memsites::own_position(frames, n)],
+            name, sizeof(name)))
+            continue;
+        if (stdlib::str_str(name, "memsites_probe") == nullptr)
+            continue;
+        sum.blocks += totals[i].blocks;
+        sum.asked += totals[i].asked;
+        sum.taken += totals[i].taken;
+    }
+    return sum;
+}
+
+/* memsites, the allocation-site tracker (mm/alloc_sites.h): blocks Rust
+   allocates from a function of a known name, through Vec's growth, Rust's
+   allocator shims and the kernel's GlobalAlloc, must be that function's
+   site's when read off the heap -- the pools' blocks by their tags, the
+   page runs by the big blocks' table -- every one of them and what each was
+   asked for; none once freed; and none given a site while it is off. */
+stdlib::Error test_alloc_sites()
+{
+    static const ulong TAG = 'TSit';
+    /* A Vec's own three words: the vector of the probe's blocks holds one a
+       block */
+    static const ulong VEC_BYTES = 3 * sizeof(ulong);
+    struct Case
+    {
+        ulong count;
+        ulong size;
+        const char* what;
+    };
+    static const Case CASES[] = {
+        {5, 200, "pool blocks"},
+        {3, 3 * consts::PAGE_SIZE, "page runs"},
+    };
+
+    auto& sites = mm::AllocSites::get_instance();
+    const bool was_on = sites.enabled();
+    auto* totals = static_cast<mm::AllocSites::Totals*>(
+        mm::alloc(mm::AllocSites::SITES * sizeof(mm::AllocSites::Totals), TAG));
+    if (totals == nullptr || !sites.enable())
+    {
+        if (totals != nullptr)
+            mm::free(totals);
+        klog(0, "test_alloc_sites: no memory for the tables");
+        return make_error(stdlib::Error::NO_MEMORY);
+    }
+
+    bool ok = true;
+    for (const Case& c : CASES)
+    {
+        if (!rust_memsites_probe(c.count, c.size))
+        {
+            klog(0, "test_alloc_sites: %s: the probe got no memory", c.what);
+            ok = false;
+            break;
+        }
+        /* Its blocks, and the vector holding them */
+        const ulong want_blocks = c.count + 1;
+        const ulong want_asked = c.count * c.size + c.count * VEC_BYTES;
+        mm::AllocSites::Totals got = probe_totals(totals);
+        if (got.blocks != want_blocks || got.asked != want_asked || got.taken < got.asked)
+        {
+            klog(0, "test_alloc_sites: %s: the probe's site holds %lu blocks of %lu bytes (taking %lu), not %lu of %lu",
+                c.what, got.blocks, got.asked, got.taken, want_blocks, want_asked);
+            ok = false;
+        }
+        rust_memsites_release();
+        got = probe_totals(totals);
+        if (got.blocks != 0)
+        {
+            klog(0, "test_alloc_sites: %s: %lu blocks still the probe's once freed", c.what, got.blocks);
+            ok = false;
+        }
+    }
+
+    /* Off: what is allocated then is nobody's site */
+    sites.disable();
+    if (ok && rust_memsites_probe(CASES[0].count, CASES[0].size))
+    {
+        const mm::AllocSites::Totals got = probe_totals(totals);
+        rust_memsites_release();
+        if (got.blocks != 0)
+        {
+            klog(0, "test_alloc_sites: off, and %lu blocks given the probe's site", got.blocks);
+            ok = false;
+        }
+    }
+    if (was_on)
+        sites.enable();
+    mm::free(totals);
+
+    if (!ok)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+    klog(0, "test_alloc_sites: complete");
+    return make_success();
+}
+
 stdlib::Error test_ring_buffer()
 {
     klog(0, "test_ring_buffer: started");
@@ -296,7 +415,7 @@ stdlib::Error test_stack_trace()
     if (stack_ptr->magic1 == Task::STACK_MAGIC1 &&
         stack_ptr->magic2 == Task::STACK_MAGIC2)
     {
-        count = StackTrace::capture(base, base + Task::STACK_SIZE,
+        count = StackTrace::capture((ulong)&stack_ptr->stack_bottom[0], (ulong)&stack_ptr->stack_top[0],
                                     frames, stdlib::array_size(frames));
         if (count == 0)
             return make_error(stdlib::Error::UNSUCCESSFUL);
@@ -3221,6 +3340,9 @@ bool test_module_unload()
 {
     static const ulong OUTPUT_SIZE = 1024;
     static const ulong HOLD_WAIT_POLLS = 5000;
+    /* How long the unloaded module's timer is given to tick again, were it
+       left running: several of its periods, and of the tick's */
+    static const ulong LEFT_TIMER_NS = 50 * consts::NANO_SECS_IN_MS;
 
     auto& modules = ModuleTable::get_instance();
     char output[OUTPUT_SIZE];
@@ -3247,13 +3369,24 @@ bool test_module_unload()
             sleep(consts::NANO_SECS_IN_MS);
     }
 
+    /* A timer the module starts and leaves, its handler the module's own
+       code: the unload has to stop it (sweep_module_slots). Left running,
+       its next tick is a call into the pages the unload frees -- a fault
+       inside the wait below, which is the check. */
+    out.reset();
+    Cmd::dispatch("modtest timer", out);
+    const bool ticking = (stdlib::str_str(out.get(), "modtest timer: left running") != nullptr);
+    if (!ticking)
+        klog(0, "test_module_unload: the timer: %s", out.get());
+
     /* Unloaded whatever came of that: the call returns only once the stop
        has run, and the unload, only once the call has returned */
     out.reset();
     stdlib::Error unloaded = modules.unload("modtest", out);
-    bool ok = unloaded.ok() && !modules.is_loaded("modtest");
-    if (!ok)
+    bool ok = unloaded.ok() && !modules.is_loaded("modtest") && ticking;
+    if (!unloaded.ok() || modules.is_loaded("modtest"))
         klog(0, "test_module_unload: unload failed: %s", out.get());
+    sleep(LEFT_TIMER_NS);
     if (!holding)
     {
         klog(0, "test_module_unload: the call never ran: started %u", started ? 1U : 0U);
@@ -3421,6 +3554,10 @@ stdlib::Error test()
         return err;
 
     err = test_heap_usage();
+    if (!err.ok())
+        return err;
+
+    err = test_alloc_sites();
     if (!err.ok())
         return err;
 
@@ -5467,6 +5604,90 @@ static bool test_heap_usage_cpus()
     return ok;
 }
 
+/* A driver's line interrupt, registered and taken off again, over and over.
+   Until it was fixed, taking a handler off gave back its slot and nothing
+   else: the line's entry kept the handler and its pin stayed unmasked, so
+   each registration after that chained onto the line once more -- refused
+   on x86 once the entry held eight, a BUG_ON on arm64 -- and the slot's own
+   vector was never free again. Here: two handlers share the line, the first
+   leaves and a third takes its place on the same vector, all leave, and the
+   vector is nobody's -- in all more registrations than an entry holds
+   handlers, and no more than that: each is a line in the log. */
+extern "C" unsigned long kernel_interrupt_register_level(unsigned char irq_line, void (*handler)(void*),
+    void* ctx, unsigned char* out_vector);
+extern "C" void kernel_interrupt_unregister(unsigned long handle);
+
+static void test_irq_line_handler(void* ctx)
+{
+    static_cast<Atomic*>(ctx)->inc();
+}
+
+static bool test_irq_line_unregister()
+{
+    static const ulong ROUNDS = 4;
+
+    u8 line = 0;
+    if (!hal::spare_level_line(line))
+    {
+        klog(0, "test_irq_line_unregister: no line here to try it on: not run");
+        return true;
+    }
+
+    /* Static: a handler may still be called as its line is unregistered,
+       and is handed this */
+    static Atomic calls;
+
+    for (ulong pass = 0; pass < ROUNDS; pass++)
+    {
+        unsigned char vector[3] = {0, 0, 0};
+        unsigned long first = kernel_interrupt_register_level(line, test_irq_line_handler, &calls, &vector[0]);
+        unsigned long second = first ? kernel_interrupt_register_level(line, test_irq_line_handler, &calls,
+            &vector[1]) : 0;
+        if (first == 0 || second == 0)
+        {
+            if (first != 0)
+                kernel_interrupt_unregister(first);
+
+            /* The first time round it is the drivers that have the slots --
+               a machine of eight virtio-mmio devices has them all -- and
+               there is nothing to try this with. Later it is what this
+               looks for: slots and a line that were free a pass ago. */
+            if (pass == 0)
+            {
+                klog(0, "test_irq_line_unregister: no two of the drivers' slots are free: not run");
+                return true;
+            }
+
+            klog(0, "test_irq_line_unregister: pass %lu, line %lu refused (handles %lu %lu)", pass, (ulong)line,
+                first, second);
+            return false;
+        }
+
+        /* The line's first handler leaves; the one left has it, and its
+           vector, and a third joins it there */
+        kernel_interrupt_unregister(first);
+        unsigned long third = kernel_interrupt_register_level(line, test_irq_line_handler, &calls, &vector[2]);
+        bool ok = third != 0 && vector[1] == vector[0] && vector[2] == vector[0];
+
+        kernel_interrupt_unregister(second);
+        if (third != 0)
+            kernel_interrupt_unregister(third);
+
+        /* The line's last handler gone, its vector is nobody's */
+        if (!ok || !Interrupt::is_vector_free(vector[0]))
+        {
+            klog(0, "test_irq_line_unregister: pass %lu, line %lu: handle %lu, vectors 0x%lX 0x%lX 0x%lX, the "
+                "first %s", pass, (ulong)line, third, (ulong)vector[0], (ulong)vector[1], (ulong)vector[2],
+                Interrupt::is_vector_free(vector[0]) ? "free" : "still taken");
+            return false;
+        }
+    }
+
+    klog(0, "test_irq_line_unregister: line %lu registered and let go of %lu times, %lu interrupts", (ulong)line,
+        3 * ROUNDS, (ulong)calls.get());
+    return true;
+}
+
 bool test_multi_tasking()
 {
     if (!test_spin_lock_preempt())
@@ -5497,6 +5718,16 @@ bool test_multi_tasking()
 
     /* Once too, from the boot CPU, a task on every CPU */
     if (cpus.get_current_cpu_id() == cpus.get_bsp_index() && !test_heap_usage_cpus())
+        return false;
+
+    /* And once: the line is one, and so are the drivers' slots */
+    if (cpus.get_current_cpu_id() == cpus.get_bsp_index() && !test_irq_line_unregister())
+        return false;
+
+    /* The block table again, now that the drivers have put their disks in
+       it: at its first run (test()) there was none, and all it checked was
+       that a name nothing carries finds nothing */
+    if (cpus.get_current_cpu_id() == cpus.get_bsp_index() && !test_block_device_table().ok())
         return false;
 
     Task *task[2] = {0};

@@ -164,12 +164,12 @@ void FbTerm::draw_glyph(u32 row, u32 col, char c)
     }
 }
 
-void FbTerm::draw_cursor(bool on)
+void FbTerm::draw_cursor(const Cursor& at, bool on)
 {
     /* Underline cursor: the bottom two pixel rows of the current cell */
     const u32 cursor_height = 2;
 
-    if (row_ >= rows_ || column_ >= cols_)
+    if (at.row >= rows_ || at.column >= cols_)
         return;
 
     if (!on)
@@ -177,12 +177,12 @@ void FbTerm::draw_cursor(bool on)
         /* Repaint the cell instead of clearing those rows: the underline
            sits exactly where the font draws '_' and the descenders, so
            painting background over it would eat part of the glyph. */
-        draw_glyph(row_, column_, cells_[row_][column_]);
+        draw_glyph(at.row, at.column, cells_[at.row][at.column]);
         return;
     }
 
-    fill_rect(column_ * FONT8X16_WIDTH,
-        row_ * FONT8X16_HEIGHT + FONT8X16_HEIGHT - cursor_height,
+    fill_rect(at.column * FONT8X16_WIDTH,
+        at.row * FONT8X16_HEIGHT + FONT8X16_HEIGHT - cursor_height,
         FONT8X16_WIDTH, cursor_height, fg_color_);
 }
 
@@ -211,46 +211,49 @@ void FbTerm::scroll()
     repaint();
 }
 
-void FbTerm::new_line()
+/* `at` inside the grid on the way in, and on the way out: a row past the
+   last scrolls the grid up and stays the last */
+void FbTerm::new_line(Cursor& at)
 {
-    column_ = 0;
-    row_++;
-    if (row_ == rows_)
+    at.column = 0;
+    at.row++;
+    if (at.row >= rows_)
     {
         scroll();
-        row_ = rows_ - 1;
+        at.row = rows_ - 1;
     }
 }
 
-void FbTerm::put_char(char c)
+/* `at` inside the grid on the way in, and on the way out */
+void FbTerm::put_char(Cursor& at, char c)
 {
     if (c == '\n')
     {
-        new_line();
+        new_line(at);
         return;
     }
 
     if (c == '\r')
     {
-        column_ = 0;
+        at.column = 0;
         return;
     }
 
-    cells_[row_][column_] = c;
-    if (shown_[row_][column_] != c)
+    cells_[at.row][at.column] = c;
+    if (shown_[at.row][at.column] != c)
     {
-        draw_glyph(row_, column_, c);
-        shown_[row_][column_] = c;
+        draw_glyph(at.row, at.column, c);
+        shown_[at.row][at.column] = c;
     }
 
-    column_++;
-    if (column_ == cols_)
-        new_line();
+    at.column++;
+    if (at.column >= cols_)
+        new_line(at);
 }
 
-void FbTerm::puts_lock_held(const char *str)
+void FbTerm::puts_from(Cursor at, const char *str)
 {
-    draw_cursor(false);
+    draw_cursor(at, false);
 
     for (;;)
     {
@@ -258,14 +261,25 @@ void FbTerm::puts_lock_held(const char *str)
         if (c == '\0')
             break;
 
-        put_char(c);
+        put_char(at, c);
     }
 
-    draw_cursor(true);
+    draw_cursor(at, true);
+
+    row_ = at.row;
+    column_ = at.column;
 
     /* Write-combining stores may sit in the CPU's fill buffers; without
        this the last line of output can stay invisible indefinitely. */
     hal::wc_flush();
+}
+
+void FbTerm::puts_lock_held(const char *str)
+{
+    /* Under the lock the members are inside the grid: every writer leaves
+       them there before it lets go of it */
+    Cursor at = { row_, column_ };
+    puts_from(at, str);
 }
 
 void FbTerm::cls_lock_held()
@@ -326,6 +340,30 @@ bool FbTerm::setup(const FbInfo& info)
     }
 
     info_ = info;
+
+    /* A colour's field has to lie inside the pixel: its position is the
+       bootloader's word, and a pixel is shifted by it (pack_color) -- by
+       255, should it say so. A field that does not fit is left out, and
+       that colour is not drawn. */
+    struct Field
+    {
+        const char* name;
+        u8* size;
+        u8 pos;
+    } fields[] = {
+        { "red", &info_.red_size, info_.red_pos },
+        { "green", &info_.green_size, info_.green_pos },
+        { "blue", &info_.blue_size, info_.blue_pos },
+    };
+    for (auto& f : fields)
+    {
+        if (*f.size != 0 && (*f.size > 8 || f.pos > info_.bpp - *f.size))
+        {
+            klog(0, "Fb: %s is %lu bits at %lu of a pixel of %lu, left out", f.name, (ulong)*f.size, (ulong)f.pos,
+                (ulong)info_.bpp);
+            *f.size = 0;
+        }
+    }
     fb_ = (u8 *)va;
     pitch_ = info.pitch;
     width_ = info.width;
@@ -344,7 +382,7 @@ bool FbTerm::setup(const FbInfo& info)
     bg_color_ = pack_color(0x00, 0x00, 0x00);
 
     cls_lock_held();
-    draw_cursor(true);
+    draw_cursor(Cursor{ row_, column_ }, true);
     hal::wc_flush();
 
     ready_flag_ = true;
@@ -364,7 +402,7 @@ void FbTerm::cls()
         return;
 
     cls_lock_held();
-    draw_cursor(true);
+    draw_cursor(Cursor{ row_, column_ }, true);
     hal::wc_flush();
 }
 
@@ -405,13 +443,30 @@ void FbTerm::print_string(const char *s)
 void FbTerm::panic_print_string(const char *s)
 {
     /*
-     * Bypass the lock -- draw straight into the framebuffer.
-     * Safe only in panic context with interrupts disabled.
+     * Bypass the lock -- draw straight into the framebuffer: whoever holds
+     * it may be a CPU the panic has stopped, for good.
+     *
+     * Which means the cursor may be found mid-update. A panic prints before
+     * it stops the other CPUs, and one of them inside a line feed has row_
+     * one past the grid until its scroll is done -- ten milliseconds of a
+     * repaint on a large screen. Printed from the members as they were,
+     * that row was a cell past cells_ and shown_ and a glyph past the end of
+     * the framebuffer's mapping: a fault inside the panic, which only spins,
+     * with the report never reaching the netconsole. So the cursor is read
+     * once and held to the grid, and every cell written is one the copy
+     * names. What two CPUs draw between them may come out garbled; none of
+     * it is outside the grid.
      */
-    if (fb_ == nullptr)
+    if (fb_ == nullptr || rows_ == 0 || cols_ == 0)
         return;
 
-    puts_lock_held(s);
+    Cursor at = { row_, column_ };
+    if (at.row >= rows_)
+        at.row = rows_ - 1;
+    if (at.column >= cols_)
+        at.column = 0;
+
+    puts_from(at, s);
 }
 
 void FbTerm::backspace()
@@ -421,7 +476,7 @@ void FbTerm::backspace()
     if (fb_ == nullptr)
         return;
 
-    draw_cursor(false);
+    draw_cursor(Cursor{ row_, column_ }, false);
 
     if (column_ > 0)
     {
@@ -440,7 +495,7 @@ void FbTerm::backspace()
         shown_[row_][column_] = '\0';
     }
 
-    draw_cursor(true);
+    draw_cursor(Cursor{ row_, column_ }, true);
     hal::wc_flush();
 }
 

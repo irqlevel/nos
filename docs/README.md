@@ -17,6 +17,7 @@ How it works, by subsystem:
 - [Interrupts](interrupts.md) — the IDT and IOAPIC, MSI-X, GICv3 and the ITS, IPIs, NMI, IRQ balancing, deferred work
 - [Profiler](profiler.md) — sampling on a performance counter or the tick, and how to read a `profile` report
 - [Tracepoints](tracing.md) — events recorded as they happen into each CPU's ring, turned on and off with `trace`, and read back merged by time
+- [memsites](memsites.md) — who holds Rust's heap: the live blocks by the site that allocated them, to the file and the line
 - [HTTPS](tls.md) — how `wget https://` works: the transport seam, rustls in `no_std`, certificates, and what it costs
 - [Randomness](random.md) — the ChaCha20 pool, the entropy sources each machine turns out to have, and what timing jitter is worth
 - [Rust in the kernel](rust.md) — how the crates are layered, how a kernel service reaches Rust, the type each shape that used to need `unsafe` has now, a map of `kcore`, and how a driver is written

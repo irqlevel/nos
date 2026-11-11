@@ -86,7 +86,11 @@ use work::Shell;
 use kcore::consts::MAX_CPUS;
 use kcore::sync::Mutex;
 
-const HELP: &str = "hv [info|on|off|run|bench|boot|start|create|image|clone|delete|vms|list|console|attach|send|exec|wait|restart|stop|forward|cores|convert|help] - the CPU's virtualization extension, and guests under it";
+/* What `help` shows of it: the commands most used, and where the rest are.
+   Every one of them here was 194 characters, of which `help` keeps 95 --
+   the line came out cut in the middle of a word. */
+const HELP: &str = "hv [info|on|off|start|stop|list|vms|create|...] - guests under VT-x or AMD-V; hv help for all";
+const _: () = assert!(HELP.len() <= kcore::cmd::HELP_MAX, "`help` would cut it short");
 
 /// What `hv help` prints: every subcommand, a line each.
 const USAGE: &str = "\
