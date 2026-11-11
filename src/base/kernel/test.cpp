@@ -5724,6 +5724,12 @@ bool test_multi_tasking()
     if (cpus.get_current_cpu_id() == cpus.get_bsp_index() && !test_irq_line_unregister())
         return false;
 
+    /* The block table again, now that the drivers have put their disks in
+       it: at its first run (test()) there was none, and all it checked was
+       that a name nothing carries finds nothing */
+    if (cpus.get_current_cpu_id() == cpus.get_bsp_index() && !test_block_device_table().ok())
+        return false;
+
     Task *task[2] = {0};
     for (size_t i = 0; i < stdlib::array_size(task); i++)
     {
