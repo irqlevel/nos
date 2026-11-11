@@ -62,6 +62,9 @@ extern "C" bool rust_random_setup();
 extern "C" void rust_random_reseed();
 /* The partition table reader (src/crates/layers/block), the x86 twin's counterpart */
 extern "C" void rust_partitions_probe();
+/* The block layer told that a request may wait for its interrupt
+   (src/crates/layers/block/src/table.rs) */
+extern "C" void kernel_blockdev_set_interrupts_started();
 
 namespace kernel
 {
@@ -261,11 +264,27 @@ static void bp_startup_arm(void* ctx)
         rust_random_reseed();
     }
 
+    /* Interrupts are on and the drivers' handlers in place: from here a
+       disk's request waits for its completion instead of polling for it, as
+       on x86 (kernel/main.cpp). This path never said so, and virtio-blk and
+       virtio-scsi spun a CPU through every request for as long as the
+       machine was up. */
+    kernel_blockdev_set_interrupts_started();
+
+    /* smp=off is the boot CPU alone here too: this path used to start the
+       others whatever the parameter said */
     auto& cpus = CpuTable::get_instance();
-    if (!cpus.start_all())
+    if (!Parameters::get_instance().is_smp_off())
     {
-        PANIC("Can't start all cpus");
-        return;
+        if (!cpus.start_all())
+        {
+            PANIC("Can't start all cpus");
+            return;
+        }
+    }
+    else
+    {
+        klog(0, "smp=off: the other cpus are left parked");
     }
 
     preempt_on();
