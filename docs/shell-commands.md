@@ -12,7 +12,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `dmesg [lines] [filter]` | Dump kernel log: newest `lines` messages (all of it if omitted), optional substring filter |
 | `loglevel [N]` | Show or set the log level (0-5) on a running kernel |
 | `uptime` | Show uptime |
-| `date` | Show wall clock date and time (RTC + boot time) |
+| `date` | Show wall clock date and time (RTC + boot time); "wall clock not available" on a machine whose RTC could not be read, rather than a date in 1970 |
 | `igbdump` | The igb chip's own state: MAC command/status registers, ring head and tail, receive statistics; the interrupt layout (INTx, one MSI-X vector, or a queue vector and another) with each vector's count, the throttle and the receive rate it follows, and how often under load the poll looked at an empty ring again rather than arm the interrupt, with the time that cost; and the PHY's view of the link — what it advertised, what the partner offered, both 1000BASE-T registers. What made the I210's 10 Mb/s latch diagnosable |
 | `nicdump` | The r8125's own state: command register (is the receiver still enabled?), interrupt status and mask, and whose the head receive descriptor is. For a machine that has stopped receiving and can still be typed at |
 | `stacks` | Stack high-water marks: every stack is filled with a pattern when it is created, and what is still intact is what it never reached. Catches a spike that lasted microseconds during boot, and costs nothing while the machine runs |
