@@ -408,7 +408,9 @@ u32 Its::map_event(u32 device_id, u32 event_id, InterruptHandler& handler,
     }
 
     u32 slot = lpi - LPI_INT_ID_BASE;
-    lpi_handlers_[slot].handler = &handler;
+    lpi_handlers_[slot].device_id = device_id;
+    lpi_handlers_[slot].event_id = event_id;
+    __atomic_store_n(&lpi_handlers_[slot].handler, &handler, __ATOMIC_RELEASE);
 
     /* Enable this LPI in the config table + invalidate the cached copy */
     *reinterpret_cast<volatile u8*>(lpi_config_va_ + slot) = LPI_PRIORITY | 1;
@@ -421,7 +423,7 @@ u32 Its::map_event(u32 device_id, u32 event_id, InterruptHandler& handler,
     {
         /* Don't hand the driver a dead interrupt: report failure (the
            LPI id and config-table slot stay burned, which is fine) */
-        lpi_handlers_[slot].handler = nullptr;
+        __atomic_store_n(&lpi_handlers_[slot].handler, static_cast<InterruptHandler*>(nullptr), __ATOMIC_RELEASE);
         return 0;
     }
 
@@ -437,12 +439,32 @@ u32 Its::map_event(u32 device_id, u32 event_id, InterruptHandler& handler,
     return event_id; /* MSI data = event_id */
 }
 
+bool Its::rebind_event(u32 device_id, u32 event_id, InterruptHandler& handler)
+{
+    for (u32 slot = 0; slot < MAX_LPIS; slot++)
+    {
+        LpiHandler& h = lpi_handlers_[slot];
+        if (__atomic_load_n(&h.handler, __ATOMIC_ACQUIRE) == nullptr ||
+            h.device_id != device_id || h.event_id != event_id)
+            continue;
+
+        __atomic_store_n(&h.handler, &handler, __ATOMIC_RELEASE);
+        return true;
+    }
+
+    return false;
+}
+
 void Its::handle_lpi(u32 int_id)
 {
     u32 slot = int_id - LPI_INT_ID_BASE;
-    if (slot >= MAX_LPIS || !lpi_handlers_[slot].handler)
+    if (slot >= MAX_LPIS)
         return;
-    lpi_handlers_[slot].handler->on_interrupt(nullptr);
+
+    /* Read once: rebind_event may be changing it */
+    InterruptHandler* handler = __atomic_load_n(&lpi_handlers_[slot].handler, __ATOMIC_ACQUIRE);
+    if (handler != nullptr)
+        handler->on_interrupt(nullptr);
 }
 
 }

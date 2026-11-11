@@ -188,6 +188,11 @@ public:
        null one -- an address unmap_pages found nothing at -- is passed over */
     void free_pages(Page* const* pages, size_t count);
 
+    /* How many bytes of a map_mmio_region mapping there are from virt_addr
+       to its end; 0 when the address is in none this table made. What a
+       user of somebody else's mapping holds an offset into it to. */
+    ulong mmio_mapped_span(ulong virt_addr);
+
     /* Cache policy for map_mmio_region.
 
        MmioUncached is the only correct choice for device registers: every

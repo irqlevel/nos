@@ -25,7 +25,8 @@ static const u16 MSIX_CONTROL_FUNC_MASK = (u16)(1 << 14);
 
 static const u32 MSIX_ADDR_BASE = 0xFEE00000U;
 
-Atomic MsixTable::next_vector_offset_;
+ulong MsixTable::vector_map_[(MsixTable::VECTOR_COUNT + MsixTable::VECTOR_WORD_BITS - 1) /
+    MsixTable::VECTOR_WORD_BITS];
 
 MsixTable::MsixTable()
     : table_(nullptr)
@@ -55,6 +56,25 @@ MsixTable::~MsixTable()
 
     if (entry_vector_)
     {
+        /* Each entry's vector back: its IDT entry nobody's again, the
+           vector free for another table's. MSI-X is off above -- an entry
+           with a vector was enabled, and that turned it on -- so the device
+           sends nothing more, and the table's own memory is not touched
+           here: it may be in a BAR its driver has let go of. An interrupt
+           already on its way is named and dismissed by the vector's dummy
+           handler, or comes to whoever has the vector next as one more
+           than its device raised, which every handler takes. */
+        for (u16 i = 0; i < count_; i++)
+        {
+            const u8 vector = entry_vector_[i];
+            if (vector == 0)
+                continue;
+
+            Idt::get_instance().reset_descriptor(vector);
+            free_vector(vector);
+            entry_vector_[i] = 0;
+        }
+
         mm::free(entry_vector_);
         entry_vector_ = nullptr;
     }
@@ -174,10 +194,30 @@ bool MsixTable::setup(Pci::DeviceInfo* dev, const ulong* mapped_bars)
     bool mapped = false;
     if (mapped_bars && bir < 6 && mapped_bars[bir] != 0)
     {
-        table_ = (volatile u8*)(mapped_bars[bir] + off_in_bar);
-        mapped = true;
-        klog(0, "MsixTable: reusing BAR%lu VA 0x%lX off 0x%lX",
-            (ulong)bir, mapped_bars[bir], off_in_bar);
+        /* The driver's mapping of the BAR, where the table is inside what
+           it mapped: the offset is the device's word, and added to the
+           mapping's address unchecked it put the table wherever the device
+           said, past the mapping's end included. */
+        const ulong span = mm::PageTable::get_instance().mmio_mapped_span(mapped_bars[bir]);
+        if (off_in_bar <= span && table_bytes <= span - off_in_bar)
+        {
+            table_ = (volatile u8*)(mapped_bars[bir] + off_in_bar);
+            mapped = true;
+            klog(0, "MsixTable: reusing BAR%lu VA 0x%lX off 0x%lX",
+                (ulong)bir, mapped_bars[bir], off_in_bar);
+        }
+        else if (span == 0)
+        {
+            /* No mapping the page table noted the length of: taken for
+               none that holds the table */
+            klog(0, "MsixTable: BAR%lu's mapping at 0x%lX is of no length the page table knows: the table is "
+                "mapped by itself", (ulong)bir, mapped_bars[bir]);
+        }
+        else
+        {
+            klog(0, "MsixTable: BAR%lu is mapped at 0x%lX for 0x%lX bytes, the table is 0x%lX at 0x%lX of it: "
+                "mapped by itself", (ulong)bir, mapped_bars[bir], span, table_bytes, off_in_bar);
+        }
     }
 
     if (!mapped && !map_bar_for_table(dev, bir, off_in_bar, table_bytes))
@@ -198,15 +238,23 @@ bool MsixTable::setup(Pci::DeviceInfo* dev, const ulong* mapped_bars)
 
 u8 MsixTable::alloc_vector()
 {
-    for (;;)
+    for (ulong i = 0; i < VECTOR_COUNT; i++)
     {
-        long curr = next_vector_offset_.get();
-        ulong vector = MSIX_VECTOR_BASE + (ulong)curr;
-        if (vector > MSIX_VECTOR_LIMIT)
-            return 0;
-        if (next_vector_offset_.cmpxchg(curr + 1, curr) == curr)
-            return (u8)vector;
+        const ulong bit = 1UL << (i % VECTOR_WORD_BITS);
+        if (!(__atomic_fetch_or(&vector_map_[i / VECTOR_WORD_BITS], bit, __ATOMIC_ACQ_REL) & bit))
+            return (u8)(MSIX_VECTOR_BASE + i);
     }
+
+    return 0;
+}
+
+void MsixTable::free_vector(u8 vector)
+{
+    if (BUG_ON(vector < MSIX_VECTOR_BASE || vector > MSIX_VECTOR_LIMIT))
+        return;
+
+    const ulong i = (ulong)vector - MSIX_VECTOR_BASE;
+    __atomic_fetch_and(&vector_map_[i / VECTOR_WORD_BITS], ~(1UL << (i % VECTOR_WORD_BITS)), __ATOMIC_ACQ_REL);
 }
 
 void MsixTable::disable_legacy_intx(Pci::DeviceInfo* dev)
@@ -223,7 +271,15 @@ u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
         return 0;
 
     if (entry_vector_[index] != 0)
-        return entry_vector_[index];
+    {
+        /* Enabled already: the vector it has, and this handler at it. The
+           one it had was left there -- the stub of a slot that may have been
+           given back since, and be nobody's or somebody else's. */
+        const u8 had = entry_vector_[index];
+        Idt::get_instance().set_descriptor(had, IdtDescriptor::encode(handler.get_handler_fn()));
+        handler.on_interrupt_register(0, had);
+        return had;
+    }
 
     u8 vector = alloc_vector();
     if (vector == 0)
