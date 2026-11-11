@@ -40,12 +40,27 @@ void Event::wait()
        over the slot, and each signal() would then wake one of the two. */
     BUG_ON(waiter_.cmpxchg((long)self, 0) != 0);
 
+    /* A CPU's idle task waits without leaving the scheduler's walk: it is
+       the last resort, switched to when nothing else on its CPU can run,
+       and found asleep there it was a BUG_ON in the scheduler, far from the
+       wait that put it to sleep -- the boot's own task is one, and what it
+       calls is not always its to know (a module's command waiting on a
+       mailbox). It lets whoever can run have the CPU and looks again, as
+       sleep() does there. */
+    const bool may_block = !self->is_idle();
+
     for (;;)
     {
         /* A signal already there is taken without blocking at all -- which
            is the common case for a waiter that is busy when it is signalled. */
         if (signaled_.cmpxchg(0, 1) == 1)
             break;
+
+        if (unlikely(!may_block))
+        {
+            schedule();
+            continue;
+        }
 
         /* Interrupts off from the moment the flag goes up until it is down
            again. The tick and every IPI end in a schedule() of their own, and
@@ -86,6 +101,8 @@ bool Event::wait_for(unsigned long long timeout_ns)
     ulong start = get_boot_time().get_value();
     ulong until = (timeout_ns > ~0UL - start) ? ~0UL : start + (ulong)timeout_ns;
     bool signaled = false;
+    /* As in wait(): an idle task polls */
+    const bool may_block = !self->is_idle();
 
     for (;;)
     {
@@ -96,6 +113,12 @@ bool Event::wait_for(unsigned long long timeout_ns)
         }
         if (get_boot_time().get_value() >= until)
             break;
+
+        if (unlikely(!may_block))
+        {
+            schedule();
+            continue;
+        }
 
         /* wait()'s window, interrupts off from the flag going up until it is
            down again, with the deadline beside it for the scheduler: a
