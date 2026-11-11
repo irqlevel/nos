@@ -42,6 +42,13 @@ void rust_mgmt_drain_range(ulong lo, ulong hi, int take);
 
 namespace kernel
 {
+/* The bridge's slots -- timers, line and MSI-X handlers -- whose code is in
+   [lo, hi) stopped and taken off (rust_ffi.cpp) */
+void sweep_module_slots(ulong lo, ulong hi, const char* name);
+}
+
+namespace kernel
+{
 
 /* Pages of its own at one run of VA -- up to PageTable::MAX_LARGE_MAP_PAGES of
    them, physically scattered, mapped writable: a module's image, or the .ko
@@ -1131,7 +1138,9 @@ void ModuleTable::remove(LoadedModule* module)
       above all -- stays stopped. A call that started one after the exit
       had stopped them was the race this order closes;
    5. what the exit left registered taken off, said as the module's bug;
-      the mailboxes it left open closed (rust_ipc_module_gone);
+      the mailboxes it left open closed (rust_ipc_module_gone); a timer it
+      left running stopped and an interrupt handler it left registered
+      taken off (sweep_module_slots);
    and then it is off the list and its code freed. An init that failed has
    no instance: steps 2 and 4 are not its. */
 void ModuleTable::take_down(LoadedModule* module, bool live)
@@ -1156,6 +1165,9 @@ void ModuleTable::take_down(LoadedModule* module, bool live)
     Cmd::drain_range(lo, hi, module->name, true);
     rust_mgmt_drain_range(lo, hi, 1);
     rust_ipc_module_gone(module->name, len);
+    /* And what calls into its image by a slot of the bridge's: a timer, an
+       interrupt handler. Left as they were, they outlived the code. */
+    sweep_module_slots(lo, hi, module->name);
 
     remove(module);
     release_module(module);

@@ -3340,6 +3340,9 @@ bool test_module_unload()
 {
     static const ulong OUTPUT_SIZE = 1024;
     static const ulong HOLD_WAIT_POLLS = 5000;
+    /* How long the unloaded module's timer is given to tick again, were it
+       left running: several of its periods, and of the tick's */
+    static const ulong LEFT_TIMER_NS = 50 * consts::NANO_SECS_IN_MS;
 
     auto& modules = ModuleTable::get_instance();
     char output[OUTPUT_SIZE];
@@ -3366,13 +3369,24 @@ bool test_module_unload()
             sleep(consts::NANO_SECS_IN_MS);
     }
 
+    /* A timer the module starts and leaves, its handler the module's own
+       code: the unload has to stop it (sweep_module_slots). Left running,
+       its next tick is a call into the pages the unload frees -- a fault
+       inside the wait below, which is the check. */
+    out.reset();
+    Cmd::dispatch("modtest timer", out);
+    const bool ticking = (stdlib::str_str(out.get(), "modtest timer: left running") != nullptr);
+    if (!ticking)
+        klog(0, "test_module_unload: the timer: %s", out.get());
+
     /* Unloaded whatever came of that: the call returns only once the stop
        has run, and the unload, only once the call has returned */
     out.reset();
     stdlib::Error unloaded = modules.unload("modtest", out);
-    bool ok = unloaded.ok() && !modules.is_loaded("modtest");
-    if (!ok)
+    bool ok = unloaded.ok() && !modules.is_loaded("modtest") && ticking;
+    if (!unloaded.ok() || modules.is_loaded("modtest"))
         klog(0, "test_module_unload: unload failed: %s", out.get());
+    sleep(LEFT_TIMER_NS);
     if (!holding)
     {
         klog(0, "test_module_unload: the call never ran: started %u", started ? 1U : 0U);
