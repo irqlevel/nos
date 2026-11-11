@@ -1454,7 +1454,7 @@ static void cmd_profile(const char* args, stdlib::Printer& con)
     auto& profiler = Profiler::get_instance();
     if (!profiler.start())
     {
-        con.printf("profile: could not start\n");
+        con.printf("profile: could not start -- another run is on, or there is no memory for its samples\n");
         return;
     }
 
@@ -1467,6 +1467,8 @@ static void cmd_profile(const char* args, stdlib::Printer& con)
     con.printf("\n");
 
     profiler.report(con, pid, chains);
+    /* The samples are this run's until here */
+    profiler.finish();
 }
 
 static void cmd_stacks(const char* args, stdlib::Printer& con)
