@@ -26,11 +26,23 @@ SoftIrq::SoftIrq()
         cpu_states_[i].task_ptr = nullptr;
         for (ulong type = 0; type < MAX_TYPES; type++)
             cpu_states_[i].raised_at[type] = 0;
+        stopped_[i] = nullptr;
     }
 }
 
 SoftIrq::~SoftIrq()
 {
+    /* The references stop() kept, let go of here: the kernel's statics go
+       with every other CPU parked and this one's interrupts off, so nothing
+       is left that could be holding one of these pointers */
+    for (ulong i = 0; i < MAX_CPUS; i++)
+    {
+        if (stopped_[i] != nullptr)
+        {
+            stopped_[i]->put();
+            stopped_[i] = nullptr;
+        }
+    }
 }
 
 bool SoftIrq::init()
@@ -73,27 +85,48 @@ void SoftIrq::stop()
 {
     ready_.set(0);
 
+    /* Every task told before any is waited for: a task still running ends a
+       handler by waking the others' (run), and is not to find one of them
+       on its way out from under it. */
     for (ulong i = 0; i < MAX_CPUS; i++)
     {
         Task* task = cpu_states_[i].task_ptr;
-        if (task)
-        {
-            task->set_stopping();
+        if (task == nullptr)
+            continue;
 
-            /* Publish-then-wake, as everywhere else here: a blocked task is
-               out of the scheduler's walk and would never reach the top of
-               its loop to notice the flag, and the wait() below would then
-               spin for good. */
-            task->unblock();
+        task->set_stopping();
 
+        /* Publish-then-wake, as everywhere else here: a blocked task is out
+           of the scheduler's walk and would never reach the top of its loop
+           to notice the flag, and the wait() below would then spin for
+           good. The task looks at the flag again after it blocks (run). */
+        task->unblock();
+    }
+
+    for (ulong i = 0; i < MAX_CPUS; i++)
+    {
+        Task* task = cpu_states_[i].task_ptr;
+        if (task != nullptr)
             task->wait();
+    }
 
-            /* Unpublished before the reference goes: raise() and tick_kick()
-               both dereference this pointer without a lock, and put() may be
-               the last one. */
-            cpu_states_[i].task_ptr = nullptr;
-            task->put();
-        }
+    /* Unpublished, and kept. raise_mask and tick_kick read these pointers
+       with no lock -- from an interrupt, or from a task that may be switched
+       away between its read and its use -- so there is no moment here at
+       which this could be known to be the last look at a task: let go of
+       here, as it used to be, the last reference could go under a CPU that
+       had just read the pointer. The task has exited; its Task goes when
+       the kernel's statics do (~SoftIrq). An unblock() of it until then
+       finds it neither blocking nor asleep, and does nothing. */
+    for (ulong i = 0; i < MAX_CPUS; i++)
+    {
+        Task* task = cpu_states_[i].task_ptr;
+        if (task == nullptr)
+            continue;
+
+        cpu_states_[i].task_ptr = nullptr;
+        BUG_ON(stopped_[i] != nullptr);
+        stopped_[i] = task;
     }
 }
 
@@ -363,8 +396,9 @@ void SoftIrq::run(CpuState& state)
                    uses: that CPU's task may be sitting out of the scheduler's
                    walk, and an IPI alone would not put it back in -- the work
                    would then wait for the tick to repair it. */
-                if (cpu_states_[c].task_ptr != nullptr)
-                    cpu_states_[c].task_ptr->unblock();
+                Task* other = cpu_states_[c].task_ptr;
+                if (other != nullptr)
+                    other->unblock();
 
                 hal::send_ipi(c, CpuTable::IPI_VECTOR);
             }
@@ -418,7 +452,12 @@ void SoftIrq::run(CpuState& state)
             ulong flags = hal::irq_save();
             task->block();
 
-            if (!has_runnable_work(state))
+            /* And not asked to stop: stop() raises the flag and then
+               unblocks, the same publish-then-wake, and a task that had
+               passed the loop's test just before the two would otherwise
+               sleep here on a flag already up -- its unblock having found
+               it not yet blocked -- with stop() waiting for it for good. */
+            if (!has_runnable_work(state) && !task->is_stopping())
                 schedule();
 
             /* Running again, so the flag has no business still being up. The

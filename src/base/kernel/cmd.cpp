@@ -901,10 +901,7 @@ static void cmd_sched_probe(const char* args, stdlib::Printer& con)
     p->stop.set(1);
     p->ev.signal();
     for (ulong i = 0; i < started; i++)
-    {
         tasks[i]->wait();
-        tasks[i]->put();
-    }
 
     if (!ok)
     {
@@ -931,6 +928,14 @@ static void cmd_sched_probe(const char* args, stdlib::Printer& con)
             con.printf(" %s %lu", tasks[i]->get_name(), (ran[i] * 1000) / elapsed);
         con.printf("\n");
     }
+
+    /* Let go of only now: the names above are the tasks' own, and this
+       reference is the last once a task has exited and its CPU's idle loop
+       has reaped it -- which, the tasks being that CPU's only work, is at
+       once. They used to be put before the report, which then read each
+       name out of a task freed. */
+    for (ulong i = 0; i < started; i++)
+        tasks[i]->put();
 
     p->~SchedProbe();
     mm::free(p);

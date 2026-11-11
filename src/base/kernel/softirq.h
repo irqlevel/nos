@@ -80,6 +80,10 @@ private:
     Handler handlers_[MAX_TYPES];
     CpuState cpu_states_[MAX_CPUS];
 
+    /* The tasks stop() has stopped, each still referenced: let go of by the
+       destructor, with every other CPU parked (stop) */
+    Task* stopped_[MAX_CPUS];
+
     /* Handlers are not reentrant: a type runs on at most one CPU
        at a time. A CPU which loses the race keeps its pending bit
        set and retries. */
