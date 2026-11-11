@@ -45,6 +45,10 @@ const NS_PER_MS: u64 = 1_000_000;
 /// same list, should nothing have changed: a refusal said in the log at
 /// most this often.
 const PEERS_RETRY_MS: u64 = 10_000;
+/// How long a host just removed stays a peer, held to this member's
+/// mailbox: what the member owes it -- the answer to the removal it asked,
+/// the commit of it -- reaches it before the link goes (#92).
+const LEAVING_MS: u64 = 5_000;
 /* Every peer a host has -- the other hosts and the open invitations, which
    the registry holds to HOSTS_MAX together -- fits a list ipcnet takes */
 const _: () = assert!(registry::HOSTS_MAX - 1 <= control::PEERS_MAX);
@@ -146,6 +150,13 @@ pub struct Registry {
     /// invitation used by the first, and its refusal could reach the host
     /// before the first's answer.
     joining: Vec<u64>,
+    /// Hosts just removed, kept peers until then (`LEAVING_MS`), held to
+    /// this member's mailbox -- where a removed host is refused whatever it
+    /// says, as no host of the registry's: the answer this member owes one
+    /// gets out before its link goes. A leader's own removal is asked
+    /// again of the leader it handed the lead to, whose apply of it took
+    /// the host off at once, its answer lost with the link (#92).
+    leaving: Vec<(control::Peer, u64)>,
 }
 
 /// The member over its log, its mailbox named. A host that joined knows
@@ -153,7 +164,8 @@ pub struct Registry {
 /// has the cluster.
 pub fn new(rsm: Rsm<Log, State>, me: files::Member) -> Result<Member, String> {
     let node = me.node;
-    raftmember::Member::new(Registry { me, peers_told: None, peers_retry: 0, joining: Vec::new() }, rsm, node)
+    raftmember::Member::new(Registry { me, peers_told: None, peers_retry: 0, joining: Vec::new(), leaving: Vec::new() },
+                            rsm, node)
 }
 
 impl App for Registry {
@@ -344,12 +356,34 @@ impl Registry {
         let (cluster, peers): (_, Vec<control::Peer>) = match state.cluster() {
             /* A peer the registry has no host of is a host invited: it
                reaches this member alone, by its name, until it has joined */
-            Some(c) => (c.id, state.peers_of(&self.me.name).into_iter()
-                .map(|p| {
-                    let only = state.host(&p.name).is_none().then(|| String::from(NAME));
-                    control::Peer { name: p.name, ip: p.ip, keys: p.keys, only }
-                })
-                .collect()),
+            Some(c) => {
+                let mut peers: Vec<control::Peer> = state.peers_of(&self.me.name).into_iter()
+                    .map(|p| {
+                        let only = state.host(&p.name).is_none().then(|| String::from(NAME));
+                        control::Peer { name: p.name, ip: p.ip, keys: p.keys, only }
+                    })
+                    .collect();
+                /* A host removed since ipcnet was told: kept a while, held to
+                   this member's mailbox, so that its own removal's answer
+                   reaches it */
+                let now = boot_time_ns();
+                for p in self.peers_told.iter().flatten() {
+                    let removed = state.removed().iter().any(|r| r.name == p.name);
+                    if removed && !peers.iter().any(|q| q.name == p.name)
+                        && !self.leaving.iter().any(|(l, _)| l.name == p.name)
+                    {
+                        let held = control::Peer { only: Some(String::from(NAME)), ..p.clone() };
+                        self.leaving.push((held, now + LEAVING_MS * NS_PER_MS));
+                    }
+                }
+                self.leaving.retain(|(p, until)| *until > now && state.host(&p.name).is_none());
+                for (p, _) in &self.leaving {
+                    if !peers.iter().any(|q| q.name == p.name) {
+                        peers.push(p.clone());
+                    }
+                }
+                (c.id, peers)
+            }
             None if !self.me.hosts.is_empty() => (self.me.cluster, self.me.hosts.iter()
                 .filter(|h| h.name != self.me.name)
                 .map(|h| control::Peer { name: h.name.clone(), ip: h.ip, keys: h.keys.clone(), only: None })
