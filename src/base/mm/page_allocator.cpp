@@ -241,16 +241,20 @@ bool PageAllocatorImpl::setup()
 
     /* Nothing held back yet: the addresses the quarantine holds are of the
        allocators set up above */
-    for (auto& q : quarantine_)
+    static_assert(sizeof(quarantine_) / sizeof(quarantine_[0]) == sizeof(fixed_pg_alloc_) / sizeof(fixed_pg_alloc_[0]),
+        "a quarantine a size");
+    for (size_t i = 0; i < stdlib::array_size(quarantine_); i++)
     {
+        Quarantine& q = quarantine_[i];
         stdlib::AutoLock lock(q.lock);
         q.next = 0;
         q.count = 0;
+        q.limit = stdlib::min<ulong>(QUARANTINE, fixed_pg_alloc_[i].block_count() / 2);
     }
     heap_check_ = Parameters::get_instance().is_heap_check();
     if (heap_check_)
         klog(0, "mm: heapcheck=on: a freed block of the heap is unmapped, nothing kept, its address held back for "
-            "%lu frees of its size", QUARANTINE);
+            "%lu frees of its size, or for as many as half the size's addresses", QUARANTINE);
 
     return true;
 }
@@ -323,16 +327,24 @@ void PageAllocatorImpl::release_quarantined(size_t log, void* addr)
     if (!fixed_pg_alloc_[log].free_keeping_va(addr))
         PANIC("Can't free addr 0x%p", addr);
 
-    ulong oldest = 0;
+    /* The address that leaves the quarantine as this one joins it: the
+       oldest held, or this one itself where the size holds none back */
+    ulong oldest = reinterpret_cast<ulong>(addr);
     {
         Quarantine& q = quarantine_[log];
         stdlib::AutoLock lock(q.lock);
-        if (q.count == QUARANTINE)
-            oldest = q.held[q.next];
-        else
-            q.count++;
-        q.held[q.next] = reinterpret_cast<ulong>(addr);
-        q.next = (q.next + 1) % QUARANTINE;
+        if (q.limit != 0)
+        {
+            if (q.count == q.limit)
+                oldest = q.held[q.next];
+            else
+            {
+                oldest = 0;
+                q.count++;
+            }
+            q.held[q.next] = reinterpret_cast<ulong>(addr);
+            q.next = (q.next + 1) % q.limit;
+        }
     }
     if (oldest != 0)
         fixed_pg_alloc_[log].free_va(reinterpret_cast<void*>(oldest));

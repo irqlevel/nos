@@ -21,6 +21,9 @@ public:
     void free(ulong va);
     bool contains(ulong va);
 
+    /* How many blocks it has in all, taken and free */
+    ulong block_count() const { return block_count_; }
+
 private:
     VaAllocator(const VaAllocator& other) = delete;
     VaAllocator(VaAllocator&& other) = delete;
