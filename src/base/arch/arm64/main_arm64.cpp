@@ -18,6 +18,7 @@
 #include <kernel/panic.h>
 #include <kernel/dmesg.h>
 #include <kernel/parameters.h>
+#include <kernel/memsites.h>
 #include <kernel/tracepoint.h>
 #include <kernel/ubsan.h>
 #include <kernel/time.h>
@@ -61,6 +62,9 @@ extern "C" bool rust_random_setup();
 extern "C" void rust_random_reseed();
 /* The partition table reader (src/crates/layers/block), the x86 twin's counterpart */
 extern "C" void rust_partitions_probe();
+/* The block layer told that a request may wait for its interrupt
+   (src/crates/layers/block/src/table.rs) */
+extern "C" void kernel_blockdev_set_interrupts_started();
 
 namespace kernel
 {
@@ -260,11 +264,27 @@ static void bp_startup_arm(void* ctx)
         rust_random_reseed();
     }
 
+    /* Interrupts are on and the drivers' handlers in place: from here a
+       disk's request waits for its completion instead of polling for it, as
+       on x86 (kernel/main.cpp). This path never said so, and virtio-blk and
+       virtio-scsi spun a CPU through every request for as long as the
+       machine was up. */
+    kernel_blockdev_set_interrupts_started();
+
+    /* smp=off is the boot CPU alone here too: this path used to start the
+       others whatever the parameter said */
     auto& cpus = CpuTable::get_instance();
-    if (!cpus.start_all())
+    if (!Parameters::get_instance().is_smp_off())
     {
-        PANIC("Can't start all cpus");
-        return;
+        if (!cpus.start_all())
+        {
+            PANIC("Can't start all cpus");
+            return;
+        }
+    }
+    else
+    {
+        klog(0, "smp=off: the other cpus are left parked");
     }
 
     preempt_on();
@@ -402,14 +422,18 @@ static void bp_startup_arm(void* ctx)
             else
                 klog(0, "Shutdown requested");
 
+            /* The modules first, before the shells are waited for: a shell
+               may be inside a module's command that returns only when its
+               module is told to stop, and a take-down needs no shell gone
+               (as in kernel/main.cpp). The files and block I/O an exit may
+               still need are there. The log back on the console first: the
+               shell that keeps it off is stopped after the modules. */
+            Klog::get_instance().set_console_suppressed(false);
+            ModuleTable::get_instance().unload_all();
+
             rust_net_stop_shell();
             cmd.stop();
             cmd.stop_dhcp();
-
-            /* With the shells gone nothing calls into a module any more:
-               its exit runs now, while the files and block I/O it may still
-               need are there (as in kernel/main.cpp) */
-            ModuleTable::get_instance().unload_all();
 
             /* The management bus after the modules -- whose providers their exits
                took off it -- and before the files go: its jobs are told to stop and
@@ -628,9 +652,13 @@ extern "C" void main_arm64(void* dtb)
         ulong text_end = (ulong)kernel_text;
         ulong rodata_end = (ulong)kernel_rodata;
         ulong img_end = (ulong)kernel_end;
-        pt.protect_range(text_start, text_end - text_start, false, true);     /* RX */
-        pt.protect_range(text_end, rodata_end - text_end, false, false);      /* RO+NX */
-        pt.protect_range(rodata_end, img_end - rodata_end, true, false);      /* RW+NX */
+        /* All three, or no boot: left as it was mapped the image is
+           writable and executable throughout, and nothing after this would
+           say so -- the results used to be dropped */
+        if (!pt.protect_range(text_start, text_end - text_start, false, true) ||     /* RX */
+            !pt.protect_range(text_end, rodata_end - text_end, false, false) ||      /* RO+NX */
+            !pt.protect_range(rodata_end, img_end - rodata_end, true, false))        /* RW+NX */
+            PANIC("W^X: the kernel image could not be protected");
         asm volatile("dsb ish; isb");
         klog(0, "W^X: text [0x%lX,0x%lX) rodata [0x%lX,0x%lX) data [0x%lX,0x%lX)",
             text_start, text_end, text_end, rodata_end, rodata_end, img_end);
@@ -660,6 +688,8 @@ extern "C" void main_arm64(void* dtb)
         PANIC("Can't setup page allocator");
 
     mm::AllocatorImpl::get_instance(&mm::PageAllocatorImpl::get_instance());
+    /* memsites=on (as in kernel/main.cpp) */
+    memsites::setup();
 
     if (Parameters::get_instance().is_wx_probe_heap())
         wx_probe_heap();

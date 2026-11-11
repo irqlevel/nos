@@ -12,7 +12,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `dmesg [lines] [filter]` | Dump kernel log: newest `lines` messages (all of it if omitted), optional substring filter |
 | `loglevel [N]` | Show or set the log level (0-5) on a running kernel |
 | `uptime` | Show uptime |
-| `date` | Show wall clock date and time (RTC + boot time) |
+| `date` | Show wall clock date and time (RTC + boot time); "wall clock not available" on a machine whose RTC could not be read, rather than a date in 1970 |
 | `igbdump` | The igb chip's own state: MAC command/status registers, ring head and tail, receive statistics; the interrupt layout (INTx, one MSI-X vector, or a queue vector and another) with each vector's count, the throttle and the receive rate it follows, and how often under load the poll looked at an empty ring again rather than arm the interrupt, with the time that cost; and the PHY's view of the link — what it advertised, what the partner offered, both 1000BASE-T registers. What made the I210's 10 Mb/s latch diagnosable |
 | `nicdump` | The r8125's own state: command register (is the receiver still enabled?), interrupt status and mask, and whose the head receive descriptor is. For a machine that has stopped receiving and can still be typed at |
 | `stacks` | Stack high-water marks: every stack is filled with a pattern when it is created, and what is still intact is what it never reached. Catches a spike that lasted microseconds during boot, and costs nothing while the machine runs |
@@ -32,6 +32,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `memusage` | Show memory usage: free and total pages, how many of the free are zeroed already, and the huge pool's free and total 2 MiB blocks (`hugepages=`) and how many of the free are zeroed (`zerofree=`); the fewest pages free since boot (`free_pages_lowest`); and Rust's heap -- what its `Box`es, `Vec`s and the rest take now and took at most, what they asked for, the blocks, and the allocations, frees and refusals since boot ([Paging](paging.md#what-rust-holds-of-it)) |
 | `meminfo` | Show the firmware memory map, and how much of it the kernel actually uses |
 | `memcheck` | Verify no reserved, kernel-image or absent page reached the free list |
+| `memsites [on\|off\|dump\|tags\|N]` | Who holds Rust's heap: `on` gives every block Rust allocates from then on its site -- the stack that asked, past the allocator's own frames -- and `memsites` reads the heap by them: the N sites (20 by default) holding the most, merged by the frame that is the code's own, with what each takes and asked for, its blocks and the two frames that called it, and what of the heap has no site; `tags`, the heap's pool blocks by their owners' tags, C++'s and Rust's; `dump`, every site's frames as addresses, which `scripts/memsites.py` names to files and lines; `off` stops giving sites, and those given stay. `memsites=on` at boot starts it with the first allocation. See [memsites](memsites.md) |
 | `pci` | Show PCI devices |
 | `disks` | List block devices, each with the id a VM's vm.toml finds it by from boot to boot where it has one: `part:` and a partition's GPT unique GUID, or its MBR's signature and number; `disk:nvme-` and a whole NVMe disk's model and serial |
 | `diskread <disk> <sector>` | Read and hex-dump a sector |
@@ -108,9 +109,9 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `lsmod` | List the modules: name, size, load address, how many kernel functions each binds to, and which are permanent, still loading or still unloading. Never waits on a load or unload in progress |
 | `rc [add <line>\|del <n>\|clear\|run]` | Show or edit `/etc/rc`: shell commands, a line each (blank lines and `#` comments skipped), that the shell's task runs once at boot after DHCP -- how a module such as [sshd](sshd.md) gets loaded and started on a machine nobody can reach until it is. `rc` numbers the lines, `add` appends one, `del` takes one out, `clear` removes the file, `run` runs it now. What it prints at boot goes to the kernel log and the screen; `rc=off` skips it |
 | `usb` | Show xHCI controllers, connected root ports and keyboard report counters |
-| `panic [type]` | Trigger kernel panic: direct, or `pf` (page fault), `div0` (divide by zero), `ud` (invalid opcode), `df` (a real double fault, x86-64: a stack pointer no access can use, the report from the IST stack), `offstack` (a panic on a stack that is no task's, with preemption on) -- the last two what `panic-test.sh` drives |
+| `panic [type]` | Trigger kernel panic: direct, or `pf` (page fault), `div0` (divide by zero), `ud` (invalid opcode), `df` (a real double fault, x86-64: a stack pointer no access can use, the report from the IST stack), `offstack` (a panic on a stack that is no task's, with preemption on), `overflow` (this task's stack run out, into the unmapped page under it) -- the last three what `panic-test.sh` drives |
 | `version` | Show kernel version |
-| `poweroff` / `shutdown` | Power off (ACPI S5) |
+| `poweroff` / `shutdown` | Power off (ACPI S5: the sleep type the firmware's DSDT names in `\_S5`, written to the PM1 control registers the FADT names; with no `\_S5` read the kernel says so and halts instead of guessing one) |
 | `reboot` | Reset system (keyboard controller) |
 
 ## Line editing

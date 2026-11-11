@@ -7,7 +7,9 @@
 // in arithmetic that cannot wrap, over the regions as memory_map.h says it
 // keeps them; and the free-page scan PageTable::get_free_pages runs is run
 // over the map, which must never list a page a reserved region covers, and
-// must always move forward.
+// must always move forward -- and over the whole map as the builder takes
+// it, usable region after usable region, where a page that two of them have
+// is listed once.
 #include "host.h"
 
 #include <include/const.h>
@@ -18,6 +20,7 @@
 #undef private
 
 #include <new>
+#include <set>
 
 #include "fuzz.h"
 #include "kernel.h"
@@ -166,6 +169,69 @@ void run(fuzz::Input& in)
             INVARIANT(!reserved(map, address), "the free-page scan lists page 0x%lx, which is reserved", address);
         fuzz::reached("a free run listed");
     }
+
+    /* The free list's builder over the whole map, as page_table.cpp runs
+       it: the usable regions in the map's order, each by its pages; what an
+       earlier one has skipped (get_listed_end, get_next_listed_start), what
+       is reserved skipped. However the firmware's regions lie over each
+       other a page is listed once -- twice, and the list is a loop -- and
+       every page a usable region has whole and nothing reserves is listed.
+       Held to a window: a region may be most of the address space. */
+    const ulong window = 96 * PAGE;
+    std::set<ulong> listed;
+    bool lapped = false;
+    for (size_t i = 0; i < map.size(); i++)
+    {
+        if (!map[i].usable)
+            continue;
+        const u128 first = (map[i].addr + PAGE - 1) / PAGE * PAGE, last = map[i].end / PAGE * PAGE;
+        if (first >= last || first >= window)
+            continue;
+        const ulong mem_end = static_cast<ulong>(last < window ? last : window);
+        ulong at = static_cast<ulong>(first);
+        for (ulong steps = 0; at < mem_end; steps++)
+        {
+            INVARIANT(steps <= 4 * window / PAGE + 4, "the list's builder does not end: region %zu at 0x%lx", i, at);
+            /* Whether an earlier usable region has this page, asked naively */
+            bool earlier = false;
+            for (size_t j = 0; j < i; j++)
+                earlier |= map[j].usable && (map[j].addr + PAGE - 1) / PAGE * PAGE <= at && at < map[j].end / PAGE * PAGE;
+            ulong listed_end = mmap.get_listed_end(i, at);
+            INVARIANT((listed_end != 0) == earlier, "get_listed_end(%zu, 0x%lx) = 0x%lx, where an earlier region %s "
+                "the page", i, at, listed_end, earlier ? "has" : "has not");
+            if (listed_end != 0)
+            {
+                INVARIANT(listed_end > at, "get_listed_end(%zu, 0x%lx) = 0x%lx: the builder goes nowhere", i, at,
+                    listed_end);
+                lapped = true;
+                at = listed_end < mem_end ? listed_end : mem_end;
+                continue;
+            }
+            ulong reserved_end = mmap.get_reserved_end(at);
+            if (reserved_end != 0)
+            {
+                at = reserved_end < mem_end ? reserved_end : mem_end;
+                continue;
+            }
+            ulong run_end = mmap.get_next_reserved_start(at, mem_end);
+            run_end = mmap.get_next_listed_start(i, at, run_end);
+            INVARIANT(run_end > at && run_end <= mem_end, "get_next_listed_start(%zu, 0x%lx) = 0x%lx: not a run's "
+                "end below 0x%lx", i, at, run_end, mem_end);
+            for (; at < run_end; at += PAGE)
+                INVARIANT(listed.insert(at).second, "page 0x%lx is listed twice: region %zu and one before it", at, i);
+        }
+    }
+    for (ulong a = 0; a < window; a += PAGE)
+    {
+        bool want = false;
+        for (const Region& r : map)
+            want |= r.usable && (r.addr + PAGE - 1) / PAGE * PAGE <= a && a < r.end / PAGE * PAGE;
+        want = want && !reserved(map, a);
+        INVARIANT((listed.count(a) != 0) == want, "page 0x%lx is %s, where the map says it %s", a,
+            listed.count(a) ? "listed" : "not listed", want ? "is free RAM" : "is not");
+    }
+    if (lapped)
+        fuzz::reached("usable regions over each other, each page listed once");
 
     /* The per-address questions. */
     while (in.more())

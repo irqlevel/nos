@@ -80,6 +80,7 @@ global read_tsc
 global cpuid_call
 
 global switch_context
+global task_entry_thunk
 
 global atomic_inc
 global atomic_dec
@@ -439,6 +440,18 @@ cpuid_call:
 	popfq
 	add rsp, 8; simulate pop rsp(see push rsp in PushAll)
 %endmacro
+
+; Where switch_context's ret lands in a task it has never run
+; (hal::build_task_frame): rbx is the task's entry function, rdi its
+; argument, the stack on a 16-byte boundary as after a call's return -- so
+; the call here enters the function 8 below one, as the ABI has it. The
+; function does not return; one that did stops here.
+task_entry_thunk:
+	call rbx
+.returned:
+	cli
+	hlt
+	jmp .returned
 
 switch_context:
 	;rdi = nextTask->Rsp

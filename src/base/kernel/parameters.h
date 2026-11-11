@@ -148,6 +148,13 @@ public:
        culprit's. Off by default: every such free is a shootdown. */
     bool is_heap_check();
 
+    /* memsites=on -- the allocation-site tracker (kernel/memsites.h) on
+       from the first of Rust's allocations: every block Rust's allocator
+       takes given the stack that asked for it, for `memsites` to read the
+       heap by. Off by default: on, an allocation pays a walk of its frames
+       and a look in the table of stacks. `memsites on` starts it later. */
+    bool is_mem_sites();
+
     /* rxpoll=on -- have the tick look at the receive path as well as the
        NIC's own interrupt. Off by default: it is a hypothesis about a driver
        stall, not a proven fix, and on the machine it was meant to help the
@@ -263,6 +270,7 @@ private:
     ulong huge_pool_bytes_;
     ZeroFreeMode zero_free_md_;
     bool heap_check_;
+    bool mem_sites_;
     bool rx_poll_;
     int log_level_;
     bool dns_enabled_;

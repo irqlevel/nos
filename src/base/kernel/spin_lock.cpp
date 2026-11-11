@@ -18,7 +18,7 @@ SpinLock::~SpinLock()
 
 void SpinLock::unwatch()
 {
-    Watchdog::get_instance().unregister_spin_lock(raw_lock_);
+    raw_lock_.unwatch();
 }
 
 void SpinLock::lock()

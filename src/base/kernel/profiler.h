@@ -59,8 +59,14 @@ public:
        acknowledged as this profiler's. */
     void sample(Context* ctx);
 
+    /* A run is one caller's from start() to finish(): start() is false while
+       another has it. Two `profile` commands at once -- the console's and an
+       SSH session's -- used to both start, the one's stop ending the other's
+       run and each reporting a mix of both. stop() ends the sampling;
+       finish() gives the run up, once its samples have been read. */
     bool start();
     void stop();
+    void finish();
 
     /* Report every task, rather than one. */
     static const ulong NO_PID_FILTER = (ulong)-1;
@@ -109,6 +115,9 @@ private:
     bool allocate();
 
     volatile bool active_;
+
+    /* A run has an owner: taken by start(), given back by finish() */
+    Atomic owned_;
 
     /* Set at Start from CPUID; read by every tick. */
     volatile bool use_pmu_;

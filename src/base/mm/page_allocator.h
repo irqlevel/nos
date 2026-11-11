@@ -52,11 +52,16 @@ public:
     bool free_keeping_va(void* addr);
     void free_va(void* addr);
 
+    /* How many blocks of this size there are addresses for */
+    ulong block_count() const { return va_alloc_.block_count(); }
+
 private:
     FixedPageAllocator(const FixedPageAllocator& other) = delete;
     FixedPageAllocator(FixedPageAllocator&& other) = delete;
     FixedPageAllocator& operator=(const FixedPageAllocator& other) = delete;
     FixedPageAllocator& operator=(FixedPageAllocator&& other) = delete;
+
+    void unmap_and_free(ulong va);
 
     VaAllocator va_alloc_;
     ulong page_count_;
@@ -206,7 +211,11 @@ private:
 public:
     /* heapcheck=on: the frees of a size whose addresses are held back from
        the allocations after them -- a freed address handed out again only
-       once this many more of its size have been freed */
+       once this many more of its size have been freed. Or fewer: no more
+       than half of a size's addresses are held back at once. A size of
+       large blocks has a few hundred addresses, and with this many of them
+       held it had none left to give: the heap out of memory with the
+       memory free. */
     static constexpr ulong QUARANTINE = 1024;
 
 private:
@@ -216,6 +225,9 @@ private:
         ulong held[QUARANTINE] = {};
         ulong next = 0;
         ulong count = 0;
+        /* How many of held are used: QUARANTINE, or half the size's
+           addresses where that is fewer -- 0 for a size of one */
+        ulong limit = 0;
     };
 
     /* heapcheck=on (Parameters::is_heap_check), read at setup: Free unmaps

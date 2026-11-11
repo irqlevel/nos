@@ -42,6 +42,13 @@ void rust_mgmt_drain_range(ulong lo, ulong hi, int take);
 
 namespace kernel
 {
+/* The bridge's slots -- timers, line and MSI-X handlers -- whose code is in
+   [lo, hi) stopped and taken off (rust_ffi.cpp) */
+void sweep_module_slots(ulong lo, ulong hi, const char* name);
+}
+
+namespace kernel
+{
 
 /* Pages of its own at one run of VA -- up to PageTable::MAX_LARGE_MAP_PAGES of
    them, physically scattered, mapped writable: a module's image, or the .ko
@@ -1087,6 +1094,7 @@ void run_job(void* ctx)
 
 ModuleTable::ModuleTable()
     : lock_(false)
+    , halting_(false)
 {
     list_.init();
 }
@@ -1131,7 +1139,9 @@ void ModuleTable::remove(LoadedModule* module)
       above all -- stays stopped. A call that started one after the exit
       had stopped them was the race this order closes;
    5. what the exit left registered taken off, said as the module's bug;
-      the mailboxes it left open closed (rust_ipc_module_gone);
+      the mailboxes it left open closed (rust_ipc_module_gone); a timer it
+      left running stopped and an interrupt handler it left registered
+      taken off (sweep_module_slots);
    and then it is off the list and its code freed. An init that failed has
    no instance: steps 2 and 4 are not its. */
 void ModuleTable::take_down(LoadedModule* module, bool live)
@@ -1156,6 +1166,9 @@ void ModuleTable::take_down(LoadedModule* module, bool live)
     Cmd::drain_range(lo, hi, module->name, true);
     rust_mgmt_drain_range(lo, hi, 1);
     rust_ipc_module_gone(module->name, len);
+    /* And what calls into its image by a slot of the bridge's: a timer, an
+       interrupt handler. Left as they were, they outlived the code. */
+    sweep_module_slots(lo, hi, module->name);
 
     remove(module);
     release_module(module);
@@ -1179,16 +1192,28 @@ stdlib::Error ModuleTable::load(const void* image, ulong size, const char* param
     /* On the list while its init runs -- a backtrace from inside it can name
        it -- unless the name is taken, whatever that module is doing */
     bool taken;
+    bool halting;
     ModulePhase phase = ModulePhase::Live;
     {
         const ulong flags = lock_.lock_irq_save();
+        halting = halting_;
         LoadedModule* other = find_locked(module->name);
         taken = (other != nullptr);
         if (taken)
             phase = other->phase;
-        else
+        else if (!halting)
             list_.insert_tail(&module->list_entry);
         lock_.unlock_irq_restore(flags);
+    }
+
+    /* The halt has unloaded the modules, or is doing so, with the shells
+       still there to ask for another: one loaded now would run on while the
+       files and the soft IRQs went from under it */
+    if (halting && !taken)
+    {
+        out.printf("module: %s is not loaded: the machine is going down\n", module->name);
+        release_module(module);
+        return make_error(stdlib::Error::INVALID_STATE);
     }
 
     if (taken)
@@ -1325,12 +1350,18 @@ stdlib::Error ModuleTable::unload(const char* name, stdlib::Printer& out)
 
 void ModuleTable::unload_all()
 {
+    ulong waited = 0;
     for (;;)
     {
-        /* Newest first: the reverse of the order they came in */
+        /* Newest first: the reverse of the order they came in. And no load
+           from here on (halting_, under the lock the list is looked through
+           by): the shells still run, and what one loaded behind this would
+           be left running. */
         LoadedModule* module = nullptr;
+        bool loading = false;
         {
             const ulong flags = lock_.lock_irq_save();
+            halting_ = true;
             for (stdlib::ListEntry* entry = list_.blink; entry != &list_; entry = entry->blink)
             {
                 LoadedModule* candidate = CONTAINING_RECORD(entry, LoadedModule, list_entry);
@@ -1340,17 +1371,34 @@ void ModuleTable::unload_all()
                     module = candidate;
                     break;
                 }
+                if (candidate->phase == ModulePhase::Loading)
+                    loading = true;
             }
             lock_.unlock_irq_restore(flags);
         }
 
-        if (module == nullptr)
+        if (module != nullptr)
+        {
+            char name[NAME_LEN_MAX + 1];
+            stdlib::mem_cpy(name, module->name, sizeof(name));
+            take_down(module, true);
+            klog(0, "module: %s unloaded", name);
+            continue;
+        }
+
+        if (!loading)
             break;
 
-        char name[NAME_LEN_MAX + 1];
-        stdlib::mem_cpy(name, module->name, sizeof(name));
-        take_down(module, true);
-        klog(0, "module: %s unloaded", name);
+        /* One on the list before the halt began, its init still running in
+           its own task: live or gone in a moment, and unloaded then like
+           the rest. Not for ever -- an init may be stuck. */
+        if (waited >= LOADING_WAIT_MS)
+        {
+            klog(0, "module: a load is still going after %lu s: left to its task", LOADING_WAIT_MS / 1000);
+            break;
+        }
+        sleep(JOB_POLL_MS * consts::NANO_SECS_IN_MS);
+        waited += JOB_POLL_MS;
     }
 
     ulong left = 0;
