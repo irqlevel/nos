@@ -1588,7 +1588,15 @@ each new gate.
     each a turn a look cannot get past. A real disk's 300 ms hiccup is a
     take-out and a copy; whether a look should be answered by more than the
     serving task, the look's time or decision 6's 0.5 s itself, is the
-    user's to weigh with the numbers above.
+    user's to weigh with the numbers above. (Weighed: N12, below.)
+  - **A host lost**: under 4 KiB writes at depth 8, ax41b quit by QEMU --
+    the longest write 779 ms (0.5 s, the leader's look, a commit), then on
+    to two replicas; booted again, it pulled the 16 chunks written meanwhile
+    and held the other 2032 to the source's by sums, whole 86 s after its
+    boot began. **Lost for good** with a fourth host: its cs down at 16 s,
+    out at 10 min 13 s (`out_after`), its places given to the fourth, which
+    copied the set whole -- 8 GiB in 184 s, some 47 MB/s -- every chunk at
+    three replicas 13 min 21 s after the kill.
   - **What the numbers ask next**: closes a cs makes durable together, one
     write of each table page and two flushes for all that came at once,
     where today each costs three flushes (a VM's stop of 140 chunks is ~4 s
@@ -1598,6 +1606,58 @@ each new gate.
     connection's task is most of a CPU, all of TLS in software, as the
     kernel keeps SSE off. Chain replication and a UDP path wait on these:
     the link and TCP were not the limit.
+- **N12, an event-driven cs** (decided 2026-11-11, from N11's numbers; chain
+  replication after it, as a step of its own with its design first). The
+  cs serves one request at a time and waits on its device for each: a look
+  waits behind whatever the cs is doing, so a slow disk -- a VM's flush of
+  0.7 s -- reads as a dead host, a take-out and a copy; and the device sees
+  one request at a time -- 4 KiB reads at 17.5k IOPS of the device's 68k, a
+  stop's closes three flushes each, one after another. The shape is the
+  one "The cs" first had: one task, asleep on one event for its mailbox and
+  its device queues, which never waits on a device.
+  - **Nothing waits on a device**: every read, write and flush is started
+    and reaped. A look is answered at the next turn whatever the device is
+    doing. A step not done within the queue's 30 s fails the device, as a
+    request does now, and the cs refuses as failed -- out with no look.
+  - **The engine plans** (`nbscs::Store`): an operation is the device steps
+    it needs and what each must wait for; its effect on the store's state
+    is applied when the step it hangs on is done, and its answer goes then.
+    What orders the steps of different requests:
+    - a slot's record durable before data is written into it (the open
+      mark), and data before the record that closes it -- a flush covers
+      what was done before it started;
+    - a fence durable on every device before it is answered;
+    - two operations on one chunk in the order they came;
+    - a table page written whole, both copies, each followed by a flush,
+      with every record changed on it since its last write: the opens,
+      closes and frees that came together made durable by one write of each
+      copy and two flushes, where each costs that now -- a stop's 140 closes
+      some 30 ms on a VM instead of ~4 s.
+  - **The device queue**: a flush started and reaped as a write is
+    (`IO_FLUSH` on the asynchronous path, which NVMe has); and virtio-blk
+    given the asynchronous path, which it does not have -- the VMs' pools
+    are virtio disks the queue serves synchronously today.
+  - **Steps**:
+    - **N12a**, the block layer: the queue's flush, virtio-blk's
+      asynchronous path. Gates: the smoke boots, fs-fuzz (its disk model's
+      asynchronous path), netblk-test, hv-test.
+    - **N12b**, the engine planned, the table pages committed together:
+      nbs-fuzz's `cs` target over a disk whose completions come in any order
+      and whose power is cut with requests in flight -- a write out may or
+      may not be on the medium, a flush covers only what was done before it
+      began -- its judge promising what it promises now; a mutant for each
+      ordering rule.
+    - **N12c**, nbs-cs's loop on one event, requests in flight up to the
+      queue's buffers; nbswire's serve, copy and scrub over the planned
+      engine. Gates: nbs-fuzz's every target and its mutants, nbs-test
+      (its N11 phase throttled from the first write: a look answered even
+      during a long request), hv-nbs-test.
+    - **N12d**, the hardware: a slow flush taking no replica out; 4 KiB at
+      depth; a stop's closes.
+  - **Limits**: one task a cs, so one CPU's worth of checks and copies -- a
+    1 GbE host's; a look says the cs's task turns, not that its device
+    answers: a device stuck short of 30 s keeps its replicas in, its writes
+    waiting -- the price of a disk's hiccup not being a copy.
 
 ## What to expect
 
