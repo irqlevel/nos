@@ -3395,7 +3395,18 @@ little and now and then past a silence.
   answered in five seconds given up. At some ends the writer is stopped
   while paused -- a write held behind the pause, the word to go on said,
   lost, or the snapshot applied late -- at some the stop is asked again, and
-  at some asked first with a tag of the session's own.
+  at some asked first with a tag of the session's own. A clone of the
+  newest snapshot is made now and then (N10d2), once each block of the
+  snapshot that may hold anything but zeros has been read, and written and
+  read by a writer of its own on a host up -- a session of its own on the
+  network, apart from the volume's writers, of a randomness of its own: a
+  volume born with every chunk shared, copied up as it is written, its reads
+  of chunks recorded as another volume's vouched for by the mds, its writes
+  in place once the snapshot is dropped. It is dropped now and then -- its
+  writer stopped with every host up -- and at once where its writer is lost
+  with its host or fails as its chunk's last replica refuses it, let go of
+  by force then as a person would; at the end, its writer stopped and every
+  block held, then dropped.
 - **Held to**:
   - a write done held by every replica the metadata has in, read back from
     each then and there -- but one that restarted with the chunk open at
@@ -3444,7 +3455,13 @@ little and now and then past a silence.
   - every stop done once, and as its session ends -- detached, or failed: a
     driver tears its session down at it; one asked again done at once, not
     ok, the first standing; one asked with a tag of the session's own
-    refused at once, the session as it was.
+    refused at once, the session as it was;
+  - the clone's (N10d2): its reads one of what its model allows -- its
+    snapshot's block as it was read, or a write of its writer's since -- a
+    write done held by every replica of the clone's in, a stop done once,
+    and at the end every block it holds on every active replica the last
+    write done there or one failed since, the same on all but where one
+    failed; its writer failed only as its chunk's last replica refuses it.
 
   A writer that follows another holds what that one had done and not
   flushed as a crash would leave it: there or not.
