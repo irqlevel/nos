@@ -30,6 +30,10 @@ public:
        route is ignored, the enable lands in this CPU's redistributor. */
     void enable_irq(u32 int_id, ulong mpidr, bool edge);
 
+    /* enable_irq undone: the interrupt no longer forwarded -- an SPI by the
+       distributor, to any CPU; a PPI by this CPU's redistributor alone */
+    void disable_irq(u32 int_id);
+
     /* target_cpu is the kernel's linear CPU index; the MPIDR affinity is
        looked up in the Board CPU list (DTB order == linear index). */
     void send_sgi(ulong target_cpu, u32 int_id);

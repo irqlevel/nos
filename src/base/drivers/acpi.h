@@ -17,6 +17,10 @@ public:
 
     stdlib::Error parse();
 
+    /* The RSDP's OEM id, six characters: whose firmware this is -- "BOCHS "
+       is QEMU's */
+    const char* get_oem_id();
+
     void* get_lapic_address();
 
     void* get_io_apic_address();

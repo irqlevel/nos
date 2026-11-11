@@ -917,6 +917,11 @@ stdlib::Error Acpi::parse_tables()
 }
 
 
+const char* Acpi::get_oem_id()
+{
+    return oem_id_;
+}
+
 void* Acpi::get_lapic_address()
 {
     return lapic_address_;

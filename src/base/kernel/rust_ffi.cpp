@@ -1328,7 +1328,7 @@ public:
     void on_interrupt_register(u8 irq, u8 vector) override
     {
         (void)irq;
-        rust_irq_slots[slot_index_].vector = vector;
+        __atomic_store_n(&rust_irq_slots[slot_index_].vector, vector, __ATOMIC_RELAXED);
     }
 
     kernel::InterruptHandlerFn get_handler_fn() override
@@ -1372,12 +1372,19 @@ void dispatch_rust_interrupt(kernel::Context* ctx, int slot)
 {
     (void)ctx;
 
-    /* Its records (tp::Irq). A slot's stub is installed at its own vector
-       alone, RUST_IRQ_VECTOR_BASE on (kernel_interrupt_register_level): a
-       line shared with another slot's goes through the shared dispatch. */
+    /* Its records (tp::Irq), by the vector the slot's line was registered
+       at -- one of the slots' own, RUST_IRQ_VECTOR_BASE on, and not always
+       this slot's (kernel_interrupt_register_level): a line shared with
+       another slot's goes through the shared dispatch. 0 for a slot being
+       taken down as this is read. */
     kernel::tp::Irq irq;
     if (unlikely(kernel::tp::Irq::on()))
-        irq.begin((u32)RUST_IRQ_VECTOR_BASE + (u32)slot, kernel::tp::IrqKind::Line);
+    {
+        u32 vector = 0;
+        if (slot >= 0 && (ulong)slot < RUST_IRQ_SLOT_COUNT)
+            vector = __atomic_load_n(&rust_irq_slots[slot].vector, __ATOMIC_RELAXED);
+        irq.begin(vector, kernel::tp::IrqKind::Line);
+    }
 
     /* The legacy line, counted for the same reason as the MSI-X path below:
        the driver falls back to INTx when MSI-X is unavailable, and which of
@@ -1422,25 +1429,40 @@ unsigned long kernel_interrupt_register_level(
             rust_irq_slots[i].handler = handler;
             rust_irq_slots[i].ctx = ctx;
             rust_irq_slots[i].used = true;
-            rust_irq_slots[i].vector = 0;
+            __atomic_store_n(&rust_irq_slots[i].vector, static_cast<u8>(0), __ATOMIC_RELAXED);
 
             auto& lh = get_legacy_handler(i);
             lh.slot_index_ = i;
 
+            /* The vector asked for, should the line be the first of its
+               GSI: the slot's own, or the next of the slots' vectors with
+               nothing registered at it. A slot's own may be taken though
+               the slot is free -- by a line this slot was the first on and
+               left, with others still on it (Interrupt::unregister_level)
+               -- and there are as many vectors as slots, each one in use
+               held by a slot in use: with a slot free, one of them is. */
             u8 vector = (u8)(RUST_IRQ_VECTOR_BASE + i);
-            kernel::Interrupt::register_level(lh, irq_line, vector);
+            for (ulong k = 0; k < RUST_IRQ_SLOT_COUNT; k++)
+            {
+                u8 candidate = (u8)(RUST_IRQ_VECTOR_BASE + (i + k) % RUST_IRQ_SLOT_COUNT);
+                if (kernel::Interrupt::is_vector_free(candidate))
+                {
+                    vector = candidate;
+                    break;
+                }
+            }
 
-            /* register_level is void and refuses silently (GSI owned by an
-               edge handler, vector already claimed, shared list full). Its
-               on_interrupt_register callback sets the slot's Vector; still 0
-               means no IOAPIC pin was programmed -- roll the slot back
-               instead of handing the driver a dead handle it would trust
-               (NIC enabled, no interrupts ever delivered). */
-            if (rust_irq_slots[i].vector == 0)
+            /* A refusal (the GSI owned by an edge handler or no pin of the
+               IO-APIC's, the shared list full) has programmed nothing: the
+               slot is rolled back instead of handing the driver a dead
+               handle it would trust (NIC enabled, no interrupts ever
+               delivered). */
+            if (!kernel::Interrupt::register_level(lh, irq_line, vector))
             {
                 rust_irq_slots[i].handler = nullptr;
                 rust_irq_slots[i].ctx = nullptr;
                 rust_irq_slots[i].used = false;
+                __atomic_store_n(&rust_irq_slots[i].vector, static_cast<u8>(0), __ATOMIC_RELAXED);
                 rust_irq_lock.write_unlock_irq_restore(flags);
                 klog(0, "kernel_interrupt_register_level: irq %lu refused",
                       (ulong)irq_line);
@@ -1464,10 +1486,19 @@ void kernel_interrupt_unregister(unsigned long handle)
         return;
     ulong i = handle - 1;
     ulong flags = rust_irq_lock.write_lock_irq_save();
+
+    /* Off its line first. The slot was all that used to be given back: the
+       line's entry kept the handler and the IO-APIC's pin stayed unmasked,
+       so a device that asserted the line again interrupted for ever with
+       nobody to quiet it, and the slot's next registration found its own
+       vector taken -- refused, or chained onto the line a second time. */
+    if (rust_irq_slots[i].used)
+        kernel::Interrupt::unregister_level(get_legacy_handler(i));
+
     rust_irq_slots[i].handler = nullptr;
     rust_irq_slots[i].ctx = nullptr;
     rust_irq_slots[i].used = false;
-    rust_irq_slots[i].vector = 0;
+    __atomic_store_n(&rust_irq_slots[i].vector, static_cast<u8>(0), __ATOMIC_RELAXED);
     rust_irq_lock.write_unlock_irq_restore(flags);
 
     /* Wait out an ISR mid-call on another CPU: the caller may free ctx the

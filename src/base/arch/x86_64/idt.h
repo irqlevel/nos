@@ -26,6 +26,10 @@ public:
 
     void set_descriptor(u16 index, const IdtDescriptor& desc);
 
+    /* The entry as it was before anything was registered at it: the stub of
+       a vector nobody has (dummy_interrupt) */
+    void reset_descriptor(u16 index);
+
     u32 get_base();
 
     u16 get_limit();

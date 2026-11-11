@@ -532,19 +532,22 @@ void bp_startup(void* ctx)
         {
             /* HPET in legacy replacement mode: timer 0 replaces PIT on IRQ 0.
                Use the same GSI that PIT would use (MADT may remap IRQ 0 → GSI 2). */
-            Interrupt::register_handler(hpet, acpi.get_gsi_by_irq(0x0), 0x20);
+            if (!Interrupt::register_handler(hpet, acpi.get_gsi_by_irq(0x0), 0x20))
+                PANIC("no tick: the HPET's interrupt (gsi %lu) was refused", (ulong)acpi.get_gsi_by_irq(0x0));
             klog(0, "Using HPET as tick source (legacy replacement, IRQ 0)");
         }
         else
         {
             // PIT is ISA IRQ 0; ACPI MADT may remap it to GSI 2
-            Interrupt::register_handler(pit, acpi.get_gsi_by_irq(0x0), 0x20);
+            if (!Interrupt::register_handler(pit, acpi.get_gsi_by_irq(0x0), 0x20))
+                PANIC("no tick: the PIT's interrupt (gsi %lu) was refused", (ulong)acpi.get_gsi_by_irq(0x0));
             pit.setup();
             klog(0, "Using PIT as tick source");
         }
 
-        Interrupt::register_handler(kbd, acpi.get_gsi_by_irq(0x1), 0x21);
-        Interrupt::register_handler(serial, acpi.get_gsi_by_irq(0x4), 0x24);
+        /* A machine boots without either: the refusal has been said */
+        (void)Interrupt::register_handler(kbd, acpi.get_gsi_by_irq(0x1), 0x21);
+        (void)Interrupt::register_handler(serial, acpi.get_gsi_by_irq(0x4), 0x24);
 
         rust_virtio_blk_init();
         rust_virtio_scsi_init();
