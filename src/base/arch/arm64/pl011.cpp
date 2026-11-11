@@ -104,6 +104,17 @@ void Pl011::on_interrupt(Context* ctx)
 {
     (void)ctx;
 
+    /* Acknowledged before the FIFO is read, not after: a character that
+       came in between the last look at the FIFO and an acknowledgement
+       after it had its interrupt cleared with it, and stayed in the FIFO
+       with nothing to say so -- for good under QEMU, whose PL011 raises RX
+       as the FIFO goes from empty to one character and has no receive
+       timeout, so that the characters after it raised nothing either and
+       the console took no more input. One that comes in from here on
+       raises it anew: at worst an interrupt that finds the FIFO read
+       already. */
+    mmio_write32(base_ + ICR, INT_RX | INT_RT);
+
     while (!(mmio_read32(base_ + FR) & FR_RXFE))
     {
         char c = (char)(mmio_read32(base_ + DR) & 0xFF);
@@ -112,8 +123,6 @@ void Pl011::on_interrupt(Context* ctx)
         for (ulong i = 0; i < observer_count_; i++)
             observers_[i]->on_char(c, (u8)c);
     }
-
-    mmio_write32(base_ + ICR, INT_RX | INT_RT);
 }
 
 }

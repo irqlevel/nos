@@ -5,6 +5,7 @@
 #include <kernel/interrupt.h>
 #include <kernel/cpu.h>
 #include <kernel/sched.h>
+#include <kernel/softirq.h>
 #include <kernel/timer.h>
 #include <kernel/watchdog.h>
 #include <kernel/profiler.h>
@@ -162,6 +163,13 @@ void GenericTimer::local_tick(Context* ctx)
            in its poll, DeviceTable::poll_rx, not here. */
         rust_net_poll_rx();
     }
+
+    /* Repairs a wakeup that went missing, and nothing else -- see
+       SoftIrq::tick_kick -- as x86's tick does (Cpu::timer_tick): this one
+       left it out, so a soft IRQ raised here whose wake was lost waited for
+       the next raise, however long that took. Before the reschedule below,
+       so that the kick has an effect on this very tick. */
+    SoftIrq::get_instance().tick_kick(cpu.get_index());
 
     /* EOI before Preempt(): it may context-switch away and only return
        when this task is rescheduled, so the PPI must be deactivated first
