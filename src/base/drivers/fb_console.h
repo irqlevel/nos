@@ -73,12 +73,27 @@ private:
     void blit_span(u32 x, u32 y, const u64 *span);
     void fill_rect(u32 x, u32 y, u32 w, u32 h, u32 color);
 
+    /* Where the next character goes. Kept in row_/column_ between calls and
+       worked on as a copy within one: the locked path's is the members' as
+       they are, and the panic's -- which takes no lock, while another CPU
+       may hold it in the middle of a line feed, row_ one past the grid
+       until its scroll is done -- is read once and held to the grid, so that
+       no cell it names is outside the arrays or the screen. */
+    struct Cursor
+    {
+        u32 row;
+        u32 column;
+    };
+
     void draw_glyph(u32 row, u32 col, char c);
-    void draw_cursor(bool on);
+    void draw_cursor(const Cursor& at, bool on);
 
     void puts_lock_held(const char *s);
-    void put_char(char c);
-    void new_line();
+    /* The text drawn from `at` on, the cursor after it, and where that left
+       it kept: `at` inside the grid */
+    void puts_from(Cursor at, const char *s);
+    void put_char(Cursor& at, char c);
+    void new_line(Cursor& at);
     void scroll();
     void cls_lock_held();
     void repaint();

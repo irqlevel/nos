@@ -80,6 +80,11 @@ private:
     Atomic probe_cpu_;
 
     Atomic collecting_;
+    /* The CPU whose report it is while it asks the others for their stacks,
+       -1 otherwise: an NMI it takes itself in that time -- the profiler's
+       counter overflowing, which is one too -- is no request for its stack
+       (collect_remote_stack) */
+    Atomic collector_cpu_;
     ulong remote_frame_[REMOTE_CPU_COUNT][REMOTE_FRAME_COUNT];
     u8 remote_count_[REMOTE_CPU_COUNT];
     Atomic remote_done_[REMOTE_CPU_COUNT];

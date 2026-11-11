@@ -48,7 +48,7 @@ VgaTerm::VgaTerm()
     outb(vga_base_ + 1, 0x0F);
 
     cls_lock_held();
-    cursor();
+    cursor(Cursor{ row_, column_ });
 
     ready_flag_ = true;
 }
@@ -73,7 +73,10 @@ u8 VgaTerm::make_color(Color fg, Color bg)
 
 u16 VgaTerm::make_entry(char c, u8 color)
 {
-    return (u16)c | (u16)color << 8;
+    /* Through u8: char is signed here, and a byte of 0x80 or more -- a
+       file's UTF-8 -- widened as it is would carry its sign into the
+       attribute byte */
+    return (u16)(u8)c | (u16)color << 8;
 }
 
 void VgaTerm::set_color(Color fg, Color bg)
@@ -90,23 +93,29 @@ size_t VgaTerm::get_index(u8 x, u8 y)
 
 void VgaTerm::put_char_at(char c, u8 color, u8 x, u8 y)
 {
-    BUG_ON(x >= width_);
-    BUG_ON(y >= height_);
+    /* A cell off the screen is not written -- and not a BUG_ON: this is what
+       a panic prints through, and a panic in it is one that only spins.
+       The panic's path found the cursor there, another CPU being in the
+       middle of a line feed, and stopped at its first character. */
+    if (x >= width_ || y >= height_)
+        return;
 
     buf_[get_index(x, y)] = make_entry(c, color);
 }
 
-void VgaTerm::overflow()
+/* A cursor a column or a row past the screen brought back onto it: the row
+   past the last scrolls the screen up */
+void VgaTerm::overflow(Cursor& at)
 {
-    if (column_ == width_)
+    if (at.column >= width_)
     {
-        column_ = 0;
-        row_++;
+        at.column = 0;
+        at.row++;
     }
 
-    if (row_ == height_)
+    if (at.row >= height_)
     {
-        for (size_t row = 0; row < height_ - 1; row++)
+        for (size_t row = 0; row < (size_t)(height_ - 1); row++)
         {
             for (size_t column = 0; column < width_; column++)
             {
@@ -117,31 +126,32 @@ void VgaTerm::overflow()
         for (size_t column = 0; column < width_; column++)
             put_char_at('\0', make_color(ColorBlack, ColorBlack), column, height_ - 1);
 
-        row_ = height_ - 1;
+        at.row = height_ - 1;
     }
 }
 
-void VgaTerm::put_char(char c)
+/* `at` on the screen on the way in, and on the way out */
+void VgaTerm::put_char(Cursor& at, char c)
 {
     if (c == '\n')
     {
-        while (column_ < width_)
-            put_char_at('\0', color_code_, column_++, row_);
+        while (at.column < width_)
+            put_char_at('\0', color_code_, at.column++, at.row);
 
-        column_ = 0;
-        row_++;
-        overflow();
+        at.column = 0;
+        at.row++;
+        overflow(at);
     }
     else
     {
-        put_char_at(c, color_code_, column_++, row_);
-        overflow();
+        put_char_at(c, color_code_, at.column++, at.row);
+        overflow(at);
     }
 
-    cursor();
+    cursor(at);
 }
 
-void VgaTerm::puts_lock_held(const char *str)
+void VgaTerm::puts_from(Cursor at, const char *str)
 {
     for (;;)
     {
@@ -149,8 +159,18 @@ void VgaTerm::puts_lock_held(const char *str)
         if (c == '\0')
             break;
 
-        put_char(c);
+        put_char(at, c);
     }
+
+    row_ = at.row;
+    column_ = at.column;
+}
+
+void VgaTerm::puts_lock_held(const char *str)
+{
+    /* Under the lock the members are on the screen: every writer leaves
+       them there before it lets go of it */
+    puts_from(Cursor{ row_, column_ }, str);
 }
 
 void VgaTerm::puts(const char *str)
@@ -180,7 +200,7 @@ void VgaTerm::cls()
     cls_lock_held();
     row_ = 0;
     column_ = 0;
-    cursor();
+    cursor(Cursor{ row_, column_ });
 }
 
 void VgaTerm::v_printf(const char *fmt, va_list args)
@@ -220,18 +240,29 @@ void VgaTerm::print_string(const char *s)
 void VgaTerm::panic_print_string(const char *s)
 {
     /*
-     * Bypass lock — write directly to VGA buffer.
-     * Safe only in panic context with interrupts disabled.
+     * Bypass the lock -- write directly to the VGA buffer: whoever holds it
+     * may be a CPU the panic has stopped, for good.
+     *
+     * So the cursor may be found mid-update -- a panic prints before it
+     * stops the other CPUs, and one of them inside a line feed has row_ one
+     * past the screen until it has scrolled -- and is read once and held to
+     * the screen here (FbTerm::panic_print_string has the long of it).
      */
-    if (buf_ == nullptr)
+    if (buf_ == nullptr || width_ == 0 || height_ == 0)
         return;
 
-    puts_lock_held(s);
+    Cursor at = { row_, column_ };
+    if (at.row >= height_)
+        at.row = height_ - 1;
+    if (at.column >= width_)
+        at.column = 0;
+
+    puts_from(at, s);
 }
 
-void VgaTerm::cursor()
+void VgaTerm::cursor(const Cursor& at)
 {
-    u16 offset = ((row_ % height_) * width_ + (column_ % width_)) % (width_ * height_);
+    u16 offset = ((at.row % height_) * width_ + (at.column % width_)) % (width_ * height_);
     outb(vga_base_, vga_index_ + 1);
     outb(vga_base_ + 1, offset & 0xFF);
     outb(vga_base_, vga_index_);
@@ -259,7 +290,7 @@ void VgaTerm::backspace()
         }
     }
 
-    cursor();
+    cursor(Cursor{ row_, column_ });
 }
 
 }

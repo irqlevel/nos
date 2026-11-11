@@ -30,6 +30,7 @@ namespace kernel
 
 Panicker::Panicker()
     : probe_cpu_(-1)
+    , collector_cpu_(-1)
 {
 }
 
@@ -70,16 +71,24 @@ void Panicker::reset_if_asked()
 
 void Panicker::print_output(const char* str)
 {
-    hal::console_panic_write(str);
+    /* The rings first, the consoles after: a console's write is the one
+       step here that touches hardware and state another CPU may be in the
+       middle of -- a UART to wait for, a screen's cursor -- and whatever
+       becomes of it, the line is already where the flushes below take it
+       from. It used to come first, and a report that stopped in it never
+       reached the netconsole: on a machine whose only console is the
+       network, nothing at all.
 
-    /* Also into the netconsole ring; PanicFlush() below pushes it out while
-       the machine still can. */
+       Into the netconsole ring; PanicFlush() pushes it out while the
+       machine still can. */
     rust_netconsole_log(str, stdlib::str_len(str));
 
     /* And into the disk log's, for its PanicFlush(): on a machine with no
        serial port and no network yet the disk is the only place the report
        can go. Log() takes no lock, which is what makes it safe here. */
     rust_disklog_log(str);
+
+    hal::console_panic_write(str);
 }
 
 void Panicker::dump_context()
@@ -147,6 +156,15 @@ bool Panicker::collect_remote_stack()
     if (index >= REMOTE_CPU_COUNT)
         return false;
 
+    /* The CPU asking is not one of the asked. An NMI it takes while it waits
+       for the others -- the profiler's counter overflowing, at a thousand a
+       second on a busy CPU while `profile` runs -- was answered as theirs
+       are: its own stack recorded, and the CPU stopped for good, in the
+       middle of its own report -- no other CPU's stack printed, no flush,
+       no reset. Its NMI is whatever it was before the panic. */
+    if ((long)index == collector_cpu_.get())
+        return false;
+
     if (remote_done_[index].cmpxchg(1, 0) != 0)
         return true; /* already recorded; still not our NMI to panic about */
 
@@ -185,13 +203,21 @@ void Panicker::collect_remote_stacks()
     if (!hal::irq_chip_ready() || !hal::nmi_ipi_supported())
         return;
 
+    /* No lock from here to the end of the report: not the table's, not a
+       Cpu's. The panic may be a BUG_ON under one of them, or the watchdog's
+       about one that is stuck; and the NMIs below stop each CPU where it
+       stands, for good -- inside Cpu::send_ipi_self or get_running_cpus as
+       likely as anywhere, on a machine that wakes tasks across CPUs. The
+       mirror of the running CPUs is read instead, and a CPU's parked flag is
+       an atomic. */
     auto& table = CpuTable::get_instance();
     ulong self = table.get_current_cpu().get_index();
-    ulong mask = table.get_running_cpus();
+    ulong mask = table.get_running_cpus_no_lock();
 
     for (ulong i = 0; i < REMOTE_CPU_COUNT; i++)
         remote_done_[i].set(0);
 
+    collector_cpu_.set((long)self);
     collecting_.set(1);
 
     ulong asked = 0;
@@ -291,7 +317,7 @@ void Panicker::do_panic(const char *fmt, ...)
         if (hal::irq_chip_ready())
         {
             Cpu& cpu = CpuTable::get_instance().get_current_cpu();
-            CpuTable::get_instance().send_ipi_all_exclude(cpu.get_index());
+            CpuTable::get_instance().send_panic_ipi(cpu.get_index());
         }
 
         /* Last thing done, and best-effort by construction: the console
@@ -366,7 +392,7 @@ void Panicker::do_panic_ctx(Context* ctx, bool has_error_code, const char *fmt, 
         if (hal::irq_chip_ready())
         {
             Cpu& cpu = CpuTable::get_instance().get_current_cpu();
-            CpuTable::get_instance().send_ipi_all_exclude(cpu.get_index());
+            CpuTable::get_instance().send_panic_ipi(cpu.get_index());
         }
 
         /* Last thing done, and best-effort by construction: the console
