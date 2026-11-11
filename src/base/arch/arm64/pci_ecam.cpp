@@ -26,9 +26,10 @@ ulong mmio64_next, mmio64_end;   /* bump allocator: 64-bit window */
 ulong config_va(u16 bus, u16 slot, u16 func, u16 offset)
 {
     /* ECAM: addr = base + (bus << 20 | dev << 15 | func << 12) + offset.
-       ECAM config space is Device memory: only aligned 32-bit accesses are
-       allowed, so the raw accessor reads the dword containing `offset`
-       (offset & 0xFFC) and the byte/word helpers extract the sub-field. */
+       ECAM config space is Device memory, where an access is to be aligned
+       to its size: a read is of the dword containing `offset` (offset &
+       0xFFC), the field taken out of it, and a write of a word or a byte is
+       made at the field itself (pci_config_write16/8). */
     return ecam_va + (((ulong)bus << 20) | ((ulong)slot << 15) |
                      ((ulong)func << 12) | (offset & 0xFFC));
 }
@@ -50,6 +51,20 @@ void pci_config_write32(u16 bus, u16 slot, u16 func, u16 offset, u32 value)
     if (ecam_va == 0 || bus >= ecam_buses_mapped)
         return;
     *reinterpret_cast<volatile u32*>(config_va(bus, slot, func, offset)) = value;
+}
+
+void pci_config_write16(u16 bus, u16 slot, u16 func, u16 offset, u16 value)
+{
+    if (ecam_va == 0 || bus >= ecam_buses_mapped)
+        return;
+    *reinterpret_cast<volatile u16*>(config_va(bus, slot, func, offset) + (offset & 2)) = value;
+}
+
+void pci_config_write8(u16 bus, u16 slot, u16 func, u16 offset, u8 value)
+{
+    if (ecam_va == 0 || bus >= ecam_buses_mapped)
+        return;
+    *reinterpret_cast<volatile u8*>(config_va(bus, slot, func, offset) + (offset & 3)) = value;
 }
 
 /* Probe and assign one BAR; returns the number of BAR slots consumed
