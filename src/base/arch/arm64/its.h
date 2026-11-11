@@ -35,6 +35,10 @@ public:
        collection; registers `handler` for that LPI. Returns the MSI data
        value (the event_id) and fills msi_addr with GITS_TRANSLATER; returns
        0 on failure. Caller writes {msi_addr, event_id} into the MSI-X entry. */
+    /* An event map_event mapped given another handler; false when it was
+       never mapped */
+    bool rebind_event(u32 device_id, u32 event_id, InterruptHandler& handler);
+
     u32 map_event(u32 device_id, u32 event_id, InterruptHandler& handler,
         u64& msi_addr);
 
@@ -91,7 +95,12 @@ private:
 
     struct LpiHandler
     {
+        /* Read by handle_lpi on any CPU as map_event and rebind_event set
+           it: every access is an atomic one */
         InterruptHandler* handler;
+        /* The event the LPI was mapped for */
+        u32 device_id;
+        u32 event_id;
     };
     LpiHandler lpi_handlers_[MAX_LPIS];
 

@@ -23,6 +23,9 @@ public:
     static IdtDescriptor encode(u64 offset, u16 selector, u8 type, u8 ist = 0);
     static IdtDescriptor encode(void (*handler_fn)(), u8 ist = 0);
 
+    /* The upper half: the handler's address above its low 32 bits */
+    u64 get_high_part() const { return high_part_; }
+
 private:
     u64 low_part_;
     u64 high_part_;

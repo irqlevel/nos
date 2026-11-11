@@ -2150,6 +2150,21 @@ void PageTable::free_pages(Page* const* pages, size_t count)
     }
 }
 
+ulong PageTable::mmio_mapped_span(ulong virt_addr)
+{
+    stdlib::AutoLock lock(lock_);
+
+    for (ulong i = 0; i < mmio_mapping_count_; i++)
+    {
+        const MmioMapping& m = mmio_mappings_[i];
+        const ulong bytes = m.pages * consts::PAGE_SIZE;
+        if (virt_addr >= m.va && virt_addr - m.va < bytes)
+            return bytes - (virt_addr - m.va);
+    }
+
+    return 0;
+}
+
 ulong PageTable::map_mmio_region(ulong phys_addr, ulong size_bytes, MmioCachePolicy policy)
 {
     static_assert(MMIO_WINDOW == MemoryMap::KERNEL_SPACE_BASE + 48 * 1024 * consts::GB,

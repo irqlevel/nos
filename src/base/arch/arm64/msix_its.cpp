@@ -23,8 +23,11 @@ static const u8 PCI_CAP_ID_MSIX = 0x11;
 static const u16 PCI_COMMAND_INTX_DISABLE = (u16)(1 << 10);
 static const u16 MSIX_CONTROL_ENABLE = (u16)(1 << 15);
 static const u16 MSIX_CONTROL_FUNC_MASK = (u16)(1 << 14);
+/* What an enabled entry's slot of entry_vector_ holds */
+static const u8 ENABLED_TOKEN = 1;
 
-Atomic MsixTable::next_vector_offset_;
+ulong MsixTable::vector_map_[(MsixTable::VECTOR_COUNT + MsixTable::VECTOR_WORD_BITS - 1) /
+    MsixTable::VECTOR_WORD_BITS];
 
 MsixTable::MsixTable()
     : table_(nullptr)
@@ -110,8 +113,15 @@ bool MsixTable::setup(Pci::DeviceInfo* dev, const ulong* mapped_bars)
     bool mapped = false;
     if (mapped_bars && bir < 6 && mapped_bars[bir] != 0)
     {
-        table_ = (volatile u8*)(mapped_bars[bir] + off_in_bar);
-        mapped = true;
+        /* The driver's mapping of the BAR, where the table is inside what
+           it mapped (drivers/msix.cpp). A span of 0 is the arch's premapped
+           device window, which is mapped whole. */
+        const ulong span = mm::PageTable::get_instance().mmio_mapped_span(mapped_bars[bir]);
+        if (span == 0 || (off_in_bar <= span && table_bytes <= span - off_in_bar))
+        {
+            table_ = (volatile u8*)(mapped_bars[bir] + off_in_bar);
+            mapped = true;
+        }
     }
     if (!mapped && !map_bar_for_table(dev, bir, off_in_bar, table_bytes))
     {
@@ -166,10 +176,17 @@ u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
 {
     if (!table_ || !dev_ || index >= count_ || cap_offset_ == 0)
         return 0;
-    if (entry_vector_[index] != 0)
-        return entry_vector_[index];
-
     u32 device_id = ((u32)dev_->bus << 8) | ((u32)dev_->slot << 3) | dev_->func;
+
+    if (entry_vector_[index] != 0)
+    {
+        /* Enabled already: this handler at the LPI it has. The one it had
+           was left there -- a slot's that may have been given back since. */
+        if (!Its::get_instance().rebind_event(device_id, index, handler))
+            return 0;
+        handler.on_interrupt_register((u8)0, (u8)0);
+        return entry_vector_[index];
+    }
 
     u64 msi_addr = 0;
     u32 msi_data = Its::get_instance().map_event(device_id, index, handler, msi_addr);
@@ -199,8 +216,10 @@ u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
     }
 
     /* Non-zero token so re-enable is idempotent; the actual routing token
-       is the ITS LPI, not a CPU vector. */
-    entry_vector_[index] = (u8)(index + 1);
+       is the ITS LPI, not a CPU vector. One token for every entry: it used
+       to be the index and one in a byte, which is 0 -- "not enabled", and to
+       the caller a failure -- for entry 255 and every 256th after it. */
+    entry_vector_[index] = ENABLED_TOKEN;
     return entry_vector_[index];
 }
 
