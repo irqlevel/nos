@@ -7,6 +7,14 @@ device. Then:
 
 - an image poured onto a volume on a (`hv convert <raw> nbs:<volume>`) and
   read by a guest on b: what its /dev/vda holds is what was poured;
+- a disk hvboot boots -- ext4, a grub.cfg naming the guest's kernel and
+  initrd -- made an image of NBS's by `hv image` (N10d3), and two VMs made
+  of it by `hv create <vm> image=nbs:<image>`, one on a and one on b, each
+  booted by its name, by hvboot, off a clone of its own: a's grown to
+  size=, zeros past the image, and written over a chunk the image shares --
+  b's, started after, still the image's; the refusals: the image's name
+  again, a VM of a plain volume, a size= under the image's, a clone's name
+  taken -- each leaving nothing;
 - a guest on a with `disk=nbs:gdisk`: its disk the volume's size, its serial
   `nbs-<number>`; written with dd, synced, read back past the page cache the
   same; stopped -- the volume let go of, detached;
@@ -67,6 +75,14 @@ VOLUME_MIB = 64
 WRITE_MIB = 8
 # The write a host is killed under: 16 MiB, after the first
 LONG_MIB = 16
+# N10d3: the disk hvboot boots, made an image; a's clone of it grown to
+# CLONE_MIB, and written at COPY_AT MiB -- inside the image, so over a
+# chunk the image shares -- with the image's first MiB
+BOOT_MIB = 32
+CLONE_MIB = 64
+COPY_AT = 29
+MIB = 1 << 20
+HVBOOT = os.path.join(ROOT, "out", "x86_64", "hvboot")
 FAILED = []
 
 
@@ -85,10 +101,27 @@ def need(name, ok, detail=""):
         raise Stop(name)
 
 
-def rootfs(tmp, name, cluster, bzimage, initrd, raw):
+def boot_disk(tmp, bzimage, initrd):
+    """A disk hvboot boots (N10d3): ext4 on the whole of it, /boot/grub/grub.cfg
+    naming /boot/bzImage and /boot/initrd -- found by hvboot on the
+    filesystem the configuration is on."""
+    content = os.path.join(tmp, "bootdisk")
+    os.makedirs(os.path.join(content, "boot", "grub"))
+    shutil.copy(bzimage, os.path.join(content, "boot", "bzImage"))
+    shutil.copy(initrd, os.path.join(content, "boot", "initrd"))
+    with open(os.path.join(content, "boot", "grub", "grub.cfg"), "w") as f:
+        f.write("set default=0\nset timeout=0\nmenuentry 'hv-nbs-test' {\n\tlinux /boot/bzImage %s\n"
+                "\tinitrd /boot/initrd\n}\n" % CMDLINE)
+    disk = os.path.join(tmp, "boot.raw")
+    subprocess.run([os.path.join(HERE, "mkrootfs.sh"), disk, str(BOOT_MIB), content], cwd=ROOT, check=True,
+                   stdout=subprocess.DEVNULL, env=dict(os.environ, LABEL="hvnbsboot"))
+    return disk
+
+
+def rootfs(tmp, name, cluster, bzimage, initrd, raw, boot):
     """Host `name`'s root: the modules, the guest's kernel and initrd, the
-    image to pour, and hosts.toml naming it alone, in a cluster of its own
-    until it joins one."""
+    image to pour, hvboot and the disk it boots, and hosts.toml naming it
+    alone, in a cluster of its own until it joins one."""
     rootdir = os.path.join(tmp, "root-" + name)
     os.makedirs(os.path.join(rootdir, "etc", "ipc"))
     for m in MODULES:
@@ -99,13 +132,16 @@ def rootfs(tmp, name, cluster, bzimage, initrd, raw):
     shutil.copy(bzimage, os.path.join(rootdir, "bzImage"))
     shutil.copy(initrd, os.path.join(rootdir, "initrd"))
     shutil.copy(raw, os.path.join(rootdir, "img.raw"))
+    shutil.copy(boot, os.path.join(rootdir, "boot.raw"))
+    os.makedirs(os.path.join(rootdir, "lib"))
+    shutil.copy(HVBOOT, os.path.join(rootdir, "lib", "hvboot"))
     with open(os.path.join(rootdir, "etc", "ipc", "hosts.toml"), "w") as f:
         f.write('# hv-nbs-test.py\nname = "%s"\ncluster = "%s"\npeers = []\n' % (name, cluster))
     with open(os.path.join(rootdir, "etc", "rc"), "w") as f:
         f.write("# hv-nbs-test.py\ninsmod /ipcnet.ko\nipcnet start\ninsmod /cluster.ko\ninsmod /nbs-mds.ko\n"
                 "insmod /nbs-cs.ko\ninsmod /hv.ko\nhv on\n")
     image = os.path.join(tmp, "root-%s.img" % name)
-    subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, "160", rootdir, "1024"], cwd=ROOT, check=True,
+    subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, "256", rootdir, "1024"], cwd=ROOT, check=True,
                    stdout=subprocess.DEVNULL)
     return image
 
@@ -117,7 +153,7 @@ def x(vm, line, secs=60):
 
 def started(out):
     """The number of the VM `hv start` started, or None."""
-    m = re.search(r"hv: vm (\d+) started", out)
+    m = re.search(r"hv: vm (\d+)(?: \([^)]*\))? started", out)
     return int(m.group(1)) if m else None
 
 
@@ -135,18 +171,29 @@ def main():
     ap.add_argument("--iso", default=os.path.join(ROOT, "nos-test.iso"),
                     help="an ISO whose command line has udpshell=%d" % SHELL_PORT)
     ap.add_argument("--vm-secs", type=int, default=300, help="how long a guest is given to reach its shell")
+    ap.add_argument("--mem", action="store_true",
+                    help="say a's and b's memusage at each step, and a's every 10 s while c is killed")
     args = ap.parse_args()
     accel = ipct.accel_of(ARCH)
     if not os.path.exists(args.iso):
         sys.exit("no %s -- make nos-test.iso TEST_ISO_ARGS=udpshell=%d" % (args.iso, SHELL_PORT))
+    if not os.path.exists(HVBOOT):
+        sys.exit("no %s -- build the tree first" % HVBOOT)
     tmp = tempfile.mkdtemp(prefix="nos-hvnbs-")
     print("hv-nbs-test: %s, scratch in %s" % (accel, tmp), flush=True)
     raw = os.path.join(tmp, "img.raw")
     with open(raw, "wb") as f:
         f.write(os.urandom(WRITE_MIB << 20))
     poured_sum = hashlib.md5(open(raw, "rb").read()).hexdigest()
+    boot = boot_disk(tmp, args.bzimage, args.initrd)
+    boot_bytes = open(boot, "rb").read()
+    boot_sum = hashlib.md5(boot_bytes).hexdigest()
+    # a's clone once its guest copied the image's first MiB over COPY_AT
+    copied_sum = hashlib.md5(boot_bytes[:COPY_AT * MIB] + boot_bytes[:MIB]
+                             + boot_bytes[(COPY_AT + 1) * MIB:]).hexdigest()
+    zeros_sum = hashlib.md5(bytes((CLONE_MIB - BOOT_MIB) * MIB)).hexdigest()
     ip = hubmod.Hub.ip
-    images = [rootfs(tmp, h, os.urandom(16).hex(), args.bzimage, args.initrd, raw) for h in HOSTS]
+    images = [rootfs(tmp, h, os.urandom(16).hex(), args.bzimage, args.initrd, raw, boot) for h in HOSTS]
     guids = {h: [uuid.uuid4() for _ in nbst.POOL_PARTS] for h in HOSTS}
     ids = {h: ["part:%s" % g for g in guids[h]] for h in HOSTS}
     pools = [nbst.pool(tmp, h, guids[h]) for h in HOSTS]
@@ -195,6 +242,16 @@ def main():
         start = lambda vol, more="": "hv start /bzImage mem=%d initrd=/initrd disk=nbs:%s%s cmdline=%s" % (
             GUEST_MIB, vol, more, CMDLINE)
 
+        def mem(when):
+            """With --mem: a's and b's free pages and Rust heap, said."""
+            if not args.mem:
+                return
+            for s_, h in ((a, "a"), (b, "b")):
+                got = s_.run("memusage")
+                said = " ".join(ln.strip() for ln in got.splitlines()
+                                if ln.strip().startswith(("free_pages", "rust_heap:", "rust_heap_peak")))
+                print("hv-nbs-test: memory of %s %s: %s" % (h, when, said), flush=True)
+
         def shell_up(s, vm):
             out = s.run(x(vm, "id", args.vm_secs))
             return "uid=0" in out and s.run(x(vm, "mount -t devtmpfs devtmpfs /dev")) is not None
@@ -204,6 +261,7 @@ def main():
                               "| md5sum" % (skip_mib, count_mib), 300))
             return md5_of(out), out
 
+        mem("with the cluster made")
         # -- an image poured onto a volume, read by a guest elsewhere --
         out = a.run("hv convert /img.raw nbs:poured")
         check("a raw image poured onto nbs:poured, flushed and let go of", "flushed and let go of" in out, out)
@@ -214,6 +272,64 @@ def main():
         got, out = volume_sum(b, vb, 0, WRITE_MIB)
         check("its /dev/vda holds what was poured", got == poured_sum, out)
         b.run("hv stop %d" % vb)
+
+        # -- N10d3: an image of NBS's made by hv, and VMs of it, each a clone of its own --
+        out = a.run("hv image img /boot.raw")
+        print("hv-nbs-test: hv image img /boot.raw answered:\n" + out.rstrip(), flush=True)
+        check("hv image: a disk hvboot boots made image nbs:img", "nbs:img is an image now" in out, out)
+        out = a.run("nbs volume img")
+        check("nbs:img an image, of the disk's size", "an image" in out and ("%d MiB" % BOOT_MIB) in out, out)
+        out = a.run("hv image img /boot.raw")
+        check("hv image of the name again refused", "nbs:img is there already" in out, out)
+        out = a.run("hv create v3 image=nbs:gdisk")
+        check("a VM of a plain volume refused", "nbs:gdisk is a volume" in out, out)
+        out = a.run("hv create v4 image=nbs:img size=1M")
+        check("a size= under the image's refused", "is less than the image's disk" in out, out)
+        out = a.run("hv create v1 image=nbs:img size=%dM mem=%d" % (CLONE_MIB, GUEST_MIB))
+        print("hv-nbs-test: hv create v1 answered:\n" + out.rstrip(), flush=True)
+        check("hv create v1 image=nbs:img: made, a clone its disk",
+              "nbs:v1 cloned from nbs:img" in out and "/vms/v1/vm.toml written" in out, out)
+        out = a.run("nbs volume v1")
+        check("nbs:v1 a clone of img, grown to size=", "a clone of img" in out and ("%d MiB" % CLONE_MIB) in out, out)
+        out = a.run("hv create v5 image=nbs:img onto=nbs:v1")
+        check("a clone's name NBS has refused", "nbs:v1 is there already" in out, out)
+        out = a.run("hv vms") + a.run("nbs volumes")
+        check("the refused left nothing: no folder, no volume",
+              not any(n in out for n in ("v3", "v4", "v5")) and "v1" in out, out)
+        out = b.run("hv create v2 image=nbs:img mem=%d" % GUEST_MIB)
+        check("hv create v2 image=nbs:img on b: made", "/vms/v2/vm.toml written" in out, out)
+
+        out = a.run("hv start v1")
+        v1 = started(out)
+        need("v1 started by its name", v1 is not None, out)
+        need("its shell up: hvboot booted the kernel the image's grub.cfg names, off the clone", shell_up(a, v1))
+        out = a.run(x(v1, "cat /sys/block/vda/size"))
+        check("its disk grown to size=", ("%d" % (CLONE_MIB << 11)) in out, out)
+        got, out = volume_sum(a, v1, 0, BOOT_MIB)
+        check("its disk holds the image", got == boot_sum, out)
+        got, out = volume_sum(a, v1, BOOT_MIB, CLONE_MIB - BOOT_MIB)
+        check("and zeros past it", got == zeros_sum, out)
+        out = a.run(x(v1, "dd if=/dev/vda of=/dev/vda bs=1M count=1 seek=%d conv=fsync 2>/dev/null; echo nos-rc=$?"
+                          % COPY_AT, 300))
+        check("its first MiB copied over a chunk the image shares, synced", "nos-rc=0" in out, out)
+        got, out = volume_sum(a, v1, 0, BOOT_MIB)
+        check("read back past the page cache: the write, and the rest of the chunk the image's", got == copied_sum,
+              out)
+
+        out = b.run("hv start v2")
+        v2 = started(out)
+        need("v2 started by its name on b", v2 is not None, out)
+        need("its shell up, off a clone of its own", shell_up(b, v2))
+        out = b.run(x(v2, "cat /sys/block/vda/size"))
+        check("its disk the image's size", ("%d" % (BOOT_MIB << 11)) in out, out)
+        got, out = volume_sum(b, v2, 0, BOOT_MIB)
+        check("v1's write is v1's alone: v2's clone holds the image", got == boot_sum, out)
+        b.run("hv stop %d" % v2)
+        a.run("hv stop %d" % v1)
+        check("both stopped, their clones let go of",
+              ipct.wait_for(lambda: all("detached" in s_.run("nbs volume %s" % v) for s_, v in ((a, "v1"), (b, "v2"))),
+                            120, 1), a.run("nbs volumes"))
+        mem("with v1 and v2 stopped")
 
         # -- a guest on a, off gdisk --
         out = a.run(start("gdisk"))
@@ -234,6 +350,7 @@ def main():
         a.run("hv stop %d" % va)
         check("stopped, the volume let go of",
               ipct.wait_for(lambda: "detached" in a.run("nbs volume gdisk"), 60, 1), a.run("nbs volume gdisk"))
+        mem("with a's guest off gdisk stopped")
 
         # -- on b: what a wrote is there --
         out = b.run(start("gdisk"))
@@ -262,9 +379,18 @@ def main():
         need("16 MiB more of noise made", long_sum is not None, out)
         a.run("hv send %d dd if=/w2 of=/dev/vda bs=1M seek=%d conv=fsync 2>/dev/null; echo nos-long-rc=$?\\n"
               % (va, WRITE_MIB))
+        mem("before c is killed, a's guest writing")
         time.sleep(3)
         pt.kill(procs[2])
         procs[2] = None
+        if args.mem:
+            for _ in range(30):
+                if "nos-long-rc=" in a.run("hv wait %d secs=10 nos-long-rc=" % (va,)):
+                    break
+                got = a.run("memusage")
+                said = " ".join(ln.strip() for ln in got.splitlines()
+                                if ln.strip().startswith(("free_pages:", "rust_heap:")))
+                print("hv-nbs-test: memory of a, c killed: %s" % said, flush=True)
         out = a.run("hv wait %d secs=300 nos-long-rc=" % (va,))
         out = a.run("hv console %d" % va)
         check("c killed under the write, the write done all the same", "nos-long-rc=0" in out, out[-600:])

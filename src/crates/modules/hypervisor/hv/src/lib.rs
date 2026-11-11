@@ -57,6 +57,8 @@ mod guest;
 mod forward;
 mod image;
 #[cfg(target_arch = "x86_64")]
+mod nbs;
+#[cfg(target_arch = "x86_64")]
 mod net;
 #[cfg(target_arch = "x86_64")]
 mod provider;
@@ -84,7 +86,7 @@ use work::Shell;
 use kcore::consts::MAX_CPUS;
 use kcore::sync::Mutex;
 
-const HELP: &str = "hv [info|on|off|run|bench|boot|start|create|clone|delete|vms|list|console|attach|send|exec|wait|restart|stop|forward|cores|convert|help] - the CPU's virtualization extension, and guests under it";
+const HELP: &str = "hv [info|on|off|run|bench|boot|start|create|image|clone|delete|vms|list|console|attach|send|exec|wait|restart|stop|forward|cores|convert|help] - the CPU's virtualization extension, and guests under it";
 
 /// What `hv help` prints: every subcommand, a line each.
 const USAGE: &str = "\
@@ -120,6 +122,14 @@ hv create <name> <http(s)://image> [size=N[K|M|G|T]] [password=...] [hvboot=path
                                    its folder and made its disk, grown to size=; cloud-init
                                    given the keys nos's sshd lets in, and the password; and
                                    a vm.toml booting it by hvboot, on the switch, 1 GiB
+hv create <name> image=nbs:<image> [size=N[K|M|G|T]] [onto=nbs:<volume>] [password=...] [words]
+                                   a vm of an image of NBS's: a clone of it its disk -- a
+                                   volume of the vm's name, or onto='s -- grown to size=,
+                                   the rest as for a cloud's image
+hv image <name> <file|http(s)://image>
+                                   an image of NBS's made of a cloud's image, qcow2 or raw,
+                                   downloaded first where it is a URL: poured onto a volume
+                                   of its disk's size, then frozen -- read-only for good
 hv clone <from> <to> [port=N]      a vm's folder copied into a new one: its disks with their
                                    holes left out, a new UUID, a port of its own if it had
                                    one, no forwards, and cloud-init's seed made anew
@@ -464,6 +474,9 @@ fn command(state: &State, args: &str, out: &mut Output) {
         #[cfg(target_arch = "x86_64")]
         "create" => store::create(&state.vms_root, &state.vms, rest, &mut Shell { out, unloading: &state.unloading }),
         #[cfg(target_arch = "x86_64")]
+        "image" => image::image_command(&state.vms_root, &state.vms, rest,
+                                        &mut Shell { out, unloading: &state.unloading }),
+        #[cfg(target_arch = "x86_64")]
         "clone" => clone::command(&state.vms_root, &state.vms, rest, &mut Shell { out, unloading: &state.unloading }),
         #[cfg(target_arch = "x86_64")]
         "delete" => store::delete_command(&state.vms_root, &state.vms, rest, out),
@@ -490,8 +503,8 @@ fn command(state: &State, args: &str, out: &mut Output) {
         #[cfg(target_arch = "x86_64")]
         "forward" => forward_command(state, rest, out),
         #[cfg(not(target_arch = "x86_64"))]
-        "boot" | "start" | "create" | "clone" | "delete" | "vms" | "list" | "console" | "attach" | "send" | "exec"
-        | "wait" | "restart" | "stop" | "forward" | "bench" | "cores" => {
+        "boot" | "start" | "create" | "image" | "clone" | "delete" | "vms" | "list" | "console" | "attach" | "send"
+        | "exec" | "wait" | "restart" | "stop" | "forward" | "bench" | "cores" => {
             let _ = writeln!(out, "hv: no Linux guest on this architecture yet");
         }
         other => {

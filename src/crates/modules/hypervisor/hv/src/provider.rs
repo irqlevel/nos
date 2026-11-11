@@ -1295,7 +1295,8 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
         forwards,
         ..Options::default()
     };
-    let recipe = cloud::Recipe { url, size, onto, force, password, hvboot: cloud::HVBOOT, user_data, protected };
+    let recipe = cloud::Recipe { source: cloud::Source::Url(url), size, onto, force, password, hvboot: cloud::HVBOOT,
+                                 user_data, protected };
     let mut job = Job::new(call, &state.unloading);
     let created = cloud::create(&state.vms_root, &state.vms, name, &recipe, o, &mut job);
     /* Started once it is made, when asked: by the same job, its reservation

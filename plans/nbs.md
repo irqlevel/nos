@@ -1437,6 +1437,46 @@ each new gate.
       it, before its own -- the client's rule. In 300 runs: 545 clones in
       271 of them, 10517 writes and 8494 reads of theirs, 130 held at the
       end, 115 let go of by force. Mutants: 184.
+    - **N10d3, decided** (the user, 2026-11-11): a command of its own for
+      an image, `hv image <name> <file|url>` -- the image poured onto a
+      volume made for it, the download first where it is a URL, and the
+      volume frozen; and `hv create <vm> image=nbs:<image> [size=N]` -- the
+      image cloned into the VM's volume, grown to `size=` where it is given,
+      the VM made with it as its disk, as `hv create` makes one of a URL.
+      hv asks NBS through the bus (`nbs`'s `volume_create`, `volume_freeze`,
+      `volume_clone`, `volume_resize`). Then the flush question below.
+    - **N10d3, done** (2026-11-11). `hv image <name> <file|url>`
+      (`image.rs`'s `make_image`): the name held on the host
+      (`Vms::reserve` of `nbs:<name>`, which no VM's name can be) and
+      refused where NBS has it; a URL downloaded into the vms' folder,
+      removed after; the volume made of the disk's size, poured -- a fresh
+      volume, its zeros left out -- and frozen; one that fails deleted
+      while it is a volume still and this host's: a create of a name that
+      is there is answered as made where the size is the same, so an image
+      another host made of it meanwhile must not be taken for this one's.
+      `hv create <vm> image=nbs:<image> [size=N] [onto=nbs:<volume>]`
+      (`cloud.rs`'s `Source::Image`, `clone_image`): a plain volume, a
+      clone's name NBS has and a `size=` under the image's refused before
+      anything is made; the clone made, grown, and deleted by `Made::undo`
+      when a later step fails. hv's bus client is `nbs.rs`, its refusals
+      said with the volume's name. Found by hv-nbs-test: a VM of an image
+      did not boot -- hvboot read 512 bytes at sector 0 of a disk of 4 KiB
+      blocks, which hv's device refuses as it says it would (`F_BLK_SIZE`);
+      hvboot now reads such a disk in whole blocks, the ends through a
+      block's buffer. Gates: hv-nbs-test on the AX41 under KVM (the new
+      phase: an image of a disk hvboot boots, two VMs of it on two hosts
+      booted by their names off clones of their own, a write over a chunk
+      the image shares seen by one alone, the refusals), hv-test there
+      (no NBS: both commands refused before a download, nothing left),
+      hvboot-test, make check, both arches. Left: `hv delete` leaves the
+      clone, and the host API's `create` takes a URL alone. And found by
+      the same run, past the new phase, not of this step: host a panics
+      `alloc error: 262201 bytes` in the client's send when host c is
+      killed under its guest's write -- with 690 MiB free (`--mem`): a
+      piece's request, 256 KiB and a header, takes a 512 KiB block of the
+      heap, whose window for that class holds about 170 on a 1 GiB host,
+      and the client holds one a replica for its resends and clones one
+      for every send. The next step's.
     - **Open, found in N10d2: a flush after one that failed.** The client
       fails, with a flush that failed, those out with it -- and no target
       catches that rule taken out: not one of the cluster target's first
