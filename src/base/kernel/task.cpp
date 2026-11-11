@@ -591,6 +591,15 @@ bool Task::prepare_start(Func func, void* ctx)
 
 bool Task::start(Func func, void* ctx)
 {
+    /* Where it will go, before anything is taken for it: with no CPU of its
+       affinity running there is nowhere, and found out after prepare_start
+       -- as it used to be -- the stack, the pid and the task table's two
+       references stayed taken for good, the caller's put() of a start that
+       failed never being the last. */
+    auto task_queue = select_next_task_queue();
+    if (task_queue == nullptr)
+        return false;
+
     if (!prepare_start(func, ctx))
         return false;
 
@@ -600,17 +609,24 @@ bool Task::start(Func func, void* ctx)
     start_time_ = get_boot_time();
     state_.set(STATE_WAITING);
 
-    auto task_queue = select_next_task_queue();
-    if (task_queue == nullptr)
-        return false;
-
     /* The first queue it lives on, recorded before the insert: from there it
        can run -- an interrupt the insert's unlock lets in may switch to it on
        this very CPU -- and a record after could come after its first
        switch, or its exit. */
     if (unlikely(tp::on(tp::Id::SchedNew)))
         tp::emit_sched_new(this, task_queue->index());
+    const ulong cpu = task_queue->index();
     task_queue->insert(this);
+
+    /* Another CPU's queue: that CPU is told. Halted with nothing to run, it
+       looks at its queue again only at its next interrupt, and a task
+       started there waited out a tick before its first instruction; a task
+       woken there has always been announced by its waker (Event::signal).
+       This CPU's own is looked at when this task next lets go of it, or at
+       its next interrupt. `this` is not touched again: from the insert on
+       the task may run, exit and be let go of. */
+    if (cpu != CpuTable::get_instance().get_current_cpu_id())
+        CpuTable::get_instance().get_cpu(cpu).send_ipi_self();
     return true;
 }
 

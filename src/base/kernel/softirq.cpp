@@ -77,6 +77,23 @@ bool SoftIrq::init()
 
     ready_.set(1);
 
+    /* What was raised while the tasks were being made is in the pending
+       bits and woke nobody (raise_mask, before ready_) -- and a task that
+       had already looked and blocked sleeps on it: every later raise of
+       that type finds its bit up and wakes nobody either, until some other
+       type is raised there. On arm64 a NIC is live long before this. Each
+       CPU with something pending is looked at once, now that a raise
+       wakes. */
+    for (ulong i = 0; i < MAX_CPUS; i++)
+    {
+        Task* task = cpu_states_[i].task_ptr;
+        if (task == nullptr || cpu_states_[i].pending.get() == 0)
+            continue;
+
+        task->unblock();
+        hal::send_ipi(i, CpuTable::IPI_VECTOR);
+    }
+
     klog(0, "SoftIrq: initialized");
     return true;
 }
