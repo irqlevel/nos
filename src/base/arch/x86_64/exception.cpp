@@ -231,8 +231,20 @@ void ExceptionTable::exc_double_fault(Context* ctx)
 {
     exc_double_fault_counter_.inc();
 
-    PANIC_CTX(ctx, true, "EXC: DoubleFault rip 0x%lX rsp 0x%lX err 0x%lX",
-        ctx->get_ret_rip(true), ctx->get_orig_rsp(true), ctx->get_error_code());
+    /* A stack that ran out is a double fault here: the fault at the page
+       under it could not be delivered, there being no stack to push its
+       frame on. Said when the address the CPU last faulted at is where a
+       stack's guard page would be -- the lowest page of a block of a
+       stack's size -- and the stack pointer is above it, no further than
+       a stack is long. Arithmetic alone: neither address is one to
+       read. */
+    const ulong cr2 = get_cr2();
+    const ulong rsp = ctx->get_orig_rsp(true);
+    const bool ran_out = Task::in_stack_guard(cr2) && rsp >= cr2 && rsp - cr2 < Task::STACK_SIZE;
+
+    PANIC_CTX(ctx, true, "EXC: DoubleFault rip 0x%lX rsp 0x%lX err 0x%lX cr2 0x%lX%s",
+        ctx->get_ret_rip(true), rsp, ctx->get_error_code(), cr2,
+        ran_out ? " -- the page under a stack: the stack ran out" : "");
 }
 
 void ExceptionTable::exc_coprocessor_segment_overrun(Context* ctx)
