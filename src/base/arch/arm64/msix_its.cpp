@@ -125,9 +125,23 @@ bool MsixTable::setup(Pci::DeviceInfo* dev, const ulong* mapped_bars)
     for (u16 i = 0; i < count_; i++)
         mask(i);
 
-    /* Map the device with the ITS up front (RID = device_id on QEMU virt) */
+    /* Map the device with the ITS up front (RID = device_id on QEMU virt).
+       No ITS (its=off), no room in it for another device, a command it did
+       not take: then this device has no MSI-X, said here and now, and its
+       driver takes its line. The result used to go unread: the table came
+       back ready, and each vector asked of it later sent the ITS a MAPTI for
+       a device it had never been given -- a command error, on an ITS that
+       then stalls its queue for every device after this one. */
     u32 device_id = ((u32)dev->bus << 8) | ((u32)dev->slot << 3) | dev->func;
-    Its::get_instance().map_device(device_id, count_);
+    if (!Its::get_instance().map_device(device_id, count_))
+    {
+        klog(0, "MsixTable(its): the ITS did not take dev 0x%lX, no MSI-X for it", (ulong)device_id);
+        mm::free(entry_vector_);
+        entry_vector_ = nullptr;
+        table_ = nullptr;
+        count_ = 0;
+        return false;
+    }
 
     klog(0, "MsixTable(its): %lu entries cap 0x%lX dev 0x%lX",
         (ulong)count_, (ulong)cap, (ulong)device_id);

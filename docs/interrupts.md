@@ -112,7 +112,10 @@ from the message-control word (`(ctrl & 0x7FF) + 1` entries), and reads the
 BIR and offset from the next dword. The table itself lives in one of the
 device's BARs, so it size-probes that BAR (both halves, if it is 64-bit —
 probing only the low half computes a bogus size for BARs above 4 GB), maps
-it with `map_mmio_region`, and masks every entry.
+it with `map_mmio_region`, and masks every entry. On arm64 it then gives the
+device to the ITS, and fails -- the device has no MSI-X, and its driver takes
+its line -- when the ITS does not take it: `its=off`, no room for another
+device, a command that timed out.
 
 `enable_vector(index, handler)` then, in this order:
 
