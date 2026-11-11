@@ -1886,6 +1886,22 @@ static void panic_off_stack(void* ctx)
     PANIC("user requested panic, off a task's stack");
 }
 
+/* For `panic overflow`: frames one under another until there is no stack
+   left for the next. The flag is nobody's to set: it is what keeps the
+   compiler from seeing a function that never returns, and the sum after the
+   call from making a loop of it. */
+static volatile ulong panic_overflow_stop;
+
+static __attribute__((noinline)) ulong panic_overflow(ulong depth)
+{
+    volatile u8 frame[256];
+
+    frame[0] = (u8)depth;
+    if (panic_overflow_stop != 0)
+        return depth;
+    return panic_overflow(depth + 1) + frame[0];
+}
+
 static void cmd_panic(const char* args, stdlib::Printer& con)
 {
     const char* end;
@@ -1931,15 +1947,21 @@ static void cmd_panic(const char* args, stdlib::Printer& con)
         interrupt_disable();
         hal::run_on_stack((ulong)&off_stack[sizeof(off_stack)], panic_off_stack, nullptr);
     }
+    else if (stdlib::str_cmp(type, "overflow") == 0)
+    {
+        con.printf("running out of stack...\n");
+        con.printf("%lu frames deep, and still a stack\n", panic_overflow(0));
+    }
     else
     {
-        con.printf("usage: panic [pf|div0|ud|df|offstack]\n");
+        con.printf("usage: panic [pf|div0|ud|df|offstack|overflow]\n");
         con.printf("  (no arg) - direct panic\n");
         con.printf("  pf       - page fault (null deref)\n");
         con.printf("  div0     - divide by zero\n");
         con.printf("  ud       - invalid opcode\n");
         con.printf("  df       - double fault, on its own stack (x86-64)\n");
         con.printf("  offstack - panic on a stack that is no task's\n");
+        con.printf("  overflow - run this task's stack out, into the page under it\n");
     }
 }
 
@@ -2408,7 +2430,7 @@ static const CmdEntry COMMANDS[] = {
     { "rc",        cmd_rc,        "rc [add <command line>|del <n>|clear|run] - show or edit /etc/rc, run at boot" },
     { "version",   cmd_version,   "version - show kernel version" },
     { "bt",        cmd_bt,        "bt <pid> - show task backtrace" },
-    { "panic",     cmd_panic,     "panic [pf|div0|ud|df|offstack] - trigger kernel panic" },
+    { "panic",     cmd_panic,     "panic [pf|div0|ud|df|offstack|overflow] - trigger kernel panic" },
     { "poweroff",  cmd_poweroff,  "poweroff - power off (ACPI S5)" },
     { "shutdown",  cmd_poweroff,  nullptr },
     { "reboot",    cmd_reboot,    "reboot - reset system" },

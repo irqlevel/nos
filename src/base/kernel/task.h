@@ -14,6 +14,11 @@
 namespace kernel
 {
 
+namespace mm
+{
+struct Page;
+}
+
 /* Task name buffer, shared by Task and by TaskTable::CpuSample. */
 static const size_t TASK_NAME_LEN = 32;
 
@@ -26,6 +31,18 @@ public:
        goes several times deeper than anything else a task does, and a task
        stack that overflows takes the machine down with it. */
     static const ulong STACK_SIZE = 16 * consts::PAGE_SIZE;
+    /* The lowest page of the block, which is no part of the stack: not
+       mapped for as long as the task has the stack (guard_stack), so that a
+       stack that runs out runs into a fault, there and then -- x86's double
+       fault on its own stack, arm64's entry onto the CPU's overflow stack --
+       and not into the block below it. It used to run on, over its own
+       header and into whatever the heap had put under it, to be found out
+       later, or never. A frame larger than the page can still step over
+       it. */
+    static const ulong STACK_GUARD_SIZE = consts::PAGE_SIZE;
+    /* What a task has of the block: all of it but the guard page and the
+       three words at its top */
+    static const ulong STACK_USABLE = STACK_SIZE - STACK_GUARD_SIZE - 3 * sizeof(ulong);
     static const ulong STACK_MAGIC1 = 0xBCDEBCDE;
     static const ulong STACK_MAGIC2 = 0xCBDECBDE;
 
@@ -53,10 +70,15 @@ public:
             task = nullptr;
         }
 
+        /* The task and the magics are at the block's top, above the
+           stack, where the guard page below cannot be in their way: the
+           block is found from any stack pointer in it, by its alignment,
+           and they from the block. */
+        u8 guard[STACK_GUARD_SIZE];
+        u8 stack_bottom[STACK_USABLE];
+        u8 stack_top[0];
         Task* task;
         ulong magic1;
-        u8 stack_bottom[STACK_SIZE - 3 * sizeof(ulong)];
-        u8 stack_top[0];
         ulong magic2;
 
     private:
@@ -67,6 +89,15 @@ public:
     } __attribute__((packed));
 
     static_assert(sizeof(Stack) == STACK_SIZE, "Invalid size");
+
+    /* Whether addr is in the lowest page of a block of a stack's size and
+       alignment -- the guard page, if the block is a task's stack. Arithmetic
+       alone: nothing is read, so a fault's report may ask it of any
+       address. */
+    static bool in_stack_guard(ulong addr)
+    {
+        return (addr & (STACK_SIZE - 1)) < STACK_GUARD_SIZE;
+    }
 
     using Func = void (*)(void *ctx);
 
@@ -377,6 +408,16 @@ private:
     static const ulong LOCATE_ATTEMPTS = 4;
 
     Stack* stack_ptr_;
+    /* The frame behind the stack's guard page while that page is not
+       mapped: put back before the block is freed (free_stack) */
+    mm::Page* stack_guard_;
+
+    /* The guard page taken out of the address space, on every CPU; false
+       when it could not be */
+    bool guard_stack();
+    /* The stack given back to the heap, whole again */
+    void free_stack();
+
     Func function_;
     void* ctx_;
     Atomic ref_counter_;

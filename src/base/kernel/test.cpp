@@ -415,7 +415,7 @@ stdlib::Error test_stack_trace()
     if (stack_ptr->magic1 == Task::STACK_MAGIC1 &&
         stack_ptr->magic2 == Task::STACK_MAGIC2)
     {
-        count = StackTrace::capture(base, base + Task::STACK_SIZE,
+        count = StackTrace::capture((ulong)&stack_ptr->stack_bottom[0], (ulong)&stack_ptr->stack_top[0],
                                     frames, stdlib::array_size(frames));
         if (count == 0)
             return make_error(stdlib::Error::UNSUCCESSFUL);
