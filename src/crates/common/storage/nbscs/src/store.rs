@@ -1180,6 +1180,17 @@ impl<D: Device> Store<D> {
         self.found.get(&chunk).filter(|(i, _)| *i == incarnation).map(|&(_, g)| g)
     }
 
+    /// `found_open`, where the chunk's record is `volume`'s: the generation
+    /// of that volume's writer that left it open. Generations are counted
+    /// by volume -- a clone's writer may be at the very one another
+    /// volume's left a chunk open at, and is not that writer (N10d). The
+    /// record is as it was found while the chunk is: a write takes it out.
+    pub fn found_open_by(&self, volume: u32, chunk: u32, incarnation: u32) -> Option<u64> {
+        let g = self.found_open(chunk, incarnation)?;
+        let &(dv, slot) = self.at.get(&chunk)?;
+        (self.record(dv, slot).volume == volume).then_some(g)
+    }
+
     /// Whether some chunk of `volume`'s is found open at `generation` (as
     /// `found_open`): that writer's flush cannot make durable what may be
     /// gone here.

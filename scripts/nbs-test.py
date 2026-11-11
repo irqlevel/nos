@@ -38,7 +38,11 @@ what it stores, then a volume's bytes through the chunk servers.
   lead, its session (`nbs io`'s, driven by the snapshot's command while it
   pauses) paused for it and the snapshot taken; the writer writing on, its
   chunk copied up first; the volume as written since, the snapshot as the
-  volume was; both deleted; the volumes deleted, and every cs gives its
+  volume was; clones and images (N10d) -- a volume cloned refused, the
+  snapshot cloned and read on a third host as it is, written there, its
+  chunk copied up and the snapshot as it was; the clone made an image,
+  written refused, cloned, deleted under its clone, whose write then takes
+  the chunk in place; all of them deleted; the volumes deleted, and every cs gives its
   chunks -- the one a snapshot shared and the one copied up among them --
   and its fence back; a host's nbs-cs unloaded -- a request to it bounced
   and said at once -- and loaded again, serving;
@@ -732,10 +736,51 @@ def main():
         need("and let go", "snapsrc detached" in out, out)
         out = c.run("nbs io read snap1 0 8192")
         check("the snapshot as the volume was when it was taken, read on another host", "0x41x8192" in out, out)
-        out = a.run("nbs volume delete snap1")
-        check("the snapshot deleted", "snap1" in out and "deleted" in out, out)
-        out = a.run("nbs volume delete snapsrc")
-        check("and the volume", "snapsrc" in out and "deleted" in out, out)
+
+        # -- clones and images (N10d): a volume cloned once it is an image or
+        # a snapshot; a clone written copies its chunk up, its origin as it
+        # was; an image read-only for good; an image deleted under a clone,
+        # whose write then takes the chunk in place, another volume's on its
+        # cs until then --
+        out = a.run("nbs volume clone snapsrc fromvol")
+        check("a volume cloned refused: a clone is of an image or a snapshot", "freeze or snapshot" in out, out)
+        out = a.run("nbs volume clone snap1 sclone host=c")
+        need("the snapshot cloned, for c", "a clone of snap1" in out, out)
+        out = a.run("nbs volumes")
+        check("each said as what it is: a snapshot of its volume, a clone of its snapshot",
+              re.search(r"^\s+snap1\s.*a snapshot of snapsrc", out, re.M) is not None
+              and re.search(r"^\s+sclone\s.*a clone of snap1", out, re.M) is not None, out)
+        out = c.run("nbs io read sclone 0 8192")
+        check("the clone read on c as its snapshot: its chunks the volume's on every cs, vouched for by the mds",
+              "0x41x8192" in out, out)
+        out = c.run("nbs io write sclone 0 4096 0x43")
+        check("the clone written on c: its chunk, shared, copied up first", "4096 bytes of 0x43 written" in out, out)
+        out = c.run("nbs io read sclone 0 8192")
+        check("the clone as written", "0x43x4096 0x41x4096" in out, out)
+        out = b.run("nbs io read snap1 0 8192")
+        check("and its snapshot as it was", "0x41x8192" in out, out)
+        out = c.run("nbs io detach sclone")
+        need("the clone let go", "sclone detached" in out, out)
+        out = a.run("nbs volume freeze sclone")
+        need("the clone made an image", "is an image now" in out, out)
+        out = b.run("nbs io write sclone 0 4096 0x44")
+        check("an image written refused: read-only for good", "read-only" in out, out)
+        out = a.run("nbs volume clone sclone iclone")
+        need("the image cloned, for a", "a clone of sclone" in out, out)
+        out = a.run("nbs volume delete sclone")
+        check("the image deleted under its clone", "sclone" in out and "deleted" in out, out)
+        out = a.run("nbs io read iclone 0 8192")
+        check("the clone reads as the image did", "0x43x4096 0x41x4096" in out, out)
+        out = a.run("nbs io write iclone 0 4096 0x45")
+        check("the clone written where the image's chunk is its alone now: in place",
+              "4096 bytes of 0x45 written" in out, out)
+        out = a.run("nbs io read iclone 0 8192")
+        check("and read as written", "0x45x4096 0x41x4096" in out, out)
+        out = a.run("nbs io detach iclone")
+        need("the clone let go", "iclone detached" in out, out)
+        for name in ("iclone", "snap1", "snapsrc"):
+            out = a.run("nbs volume delete %s" % name)
+            check("%s deleted" % name, name in out and "deleted" in out, out)
 
         out = a.run("nbs volume delete disk1")
         check("disk1 deleted", "deleted" in out, out)

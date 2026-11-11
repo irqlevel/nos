@@ -111,6 +111,8 @@ const USAGE: &str = "usage: nbs                          this host's member: inc
                      \x20      nbs volume delete <name>\n\
                      \x20      nbs volume resize <name> <size>\n\
                      \x20      nbs volume snapshot <volume> <name>   on the host it is attached on, its writer paused\n\
+                     \x20      nbs volume freeze <name>   an image: read-only for good, cloned from\n\
+                     \x20      nbs volume clone <image|snapshot> <name> [host=<host>]   a volume of its, thin\n\
                      \x20      nbs io write <volume> <offset> <bytes> <byte>   through the cs's; read <volume> \
                      <offset> <bytes>,\n\
                      \x20                                 attach <volume> [force], flush, close, held and detach \
@@ -650,7 +652,26 @@ fn run(state: &Arc<ModState>, args: &str, out: &mut Output) -> Result<(), String
             let _ = writeln!(out, "nbs: volume {} ({}) is {} now", name, id, store::Mib(size_mib));
             Ok(())
         }
-        ["volume", "snapshot", volume, name] => io::snapshot(state, volume, name, out),
+        ["volume", "snapshot", volume, name] => {
+            let id = io::snapshot(state, volume, name).map_err(|f| f.says())?;
+            let _ = writeln!(out, "nbs: snapshot {} ({}) of volume {}", name, id, volume);
+            Ok(())
+        }
+        ["volume", "freeze", name] => {
+            let id = store::volume_freeze(state, name).map_err(|f| f.says())?;
+            let _ = writeln!(out, "nbs: volume {} ({}) is an image now: read-only for good, cloned from", name, id);
+            Ok(())
+        }
+        ["volume", "clone", from, name, rest @ ..] => {
+            let host = match rest {
+                [] => None,
+                [h] => Some(h.strip_prefix("host=").ok_or_else(|| String::from(USAGE))?),
+                _ => return Err(String::from(USAGE)),
+            };
+            let id = store::volume_clone(state, from, name, host).map_err(|f| f.says())?;
+            let _ = writeln!(out, "nbs: volume {} ({}), a clone of {}", name, id, from);
+            Ok(())
+        }
         ["volume", name] => store::show_volume(&member_view(state)?, name, out),
         ["io", rest @ ..] => io::run(state, rest, out),
         _ => Err(String::from(USAGE)),

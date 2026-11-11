@@ -525,7 +525,7 @@ impl World {
             }
             let Some(h) = self.host_of_cs(set.cs[i]) else { continue };
             let Some(store) = self.hosts[h].store.as_ref() else { continue };
-            if generation != 0 && store.found_open(c, ch.incarnation) == Some(generation) {
+            if generation != 0 && store.found_open_by(v.id, c, ch.incarnation) == Some(generation) {
                 continue;
             }
             hosts.push(h);
