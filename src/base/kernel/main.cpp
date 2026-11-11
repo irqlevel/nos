@@ -294,6 +294,11 @@ __attribute__((noinline)) void ap_main2()
     Lapic::enable();
     atomic_read_and_inc(&ap_started_flag); /* 5: LAPIC enabled */
 
+    /* This CPU's TSS as soon as its index is its own to read -- the local
+       APIC's, good from the enable above -- so that #DF has its IST stack:
+       the IDT loaded above names one (Gdt::setup_boot_tss has the why). */
+    Gdt::get_instance().setup_tss_self(CpuTable::get_instance().get_current_cpu_id());
+
     /* KVM updates a pvclock entry only for the vcpu that armed it; without
        this the AP would read the BSP's entry with its own TSC. No-op when
        kvmclock is unavailable. */
@@ -323,16 +328,15 @@ __attribute__((noinline)) void ap_main2()
         klog(0, "Cpu %lu: C1E auto-promotion %s by firmware, now %s", cpu.get_index(), c1e_was ? "on" : "off",
             c1e_now ? "on" : "off");
 
-    /* GDT is loaded (above); give this CPU its TSS so #DF has an IST stack */
-    Gdt::get_instance().setup_tss_self(cpu.get_index());
-
     klog(0, "Cpu %lu rsp 0x%lX (static stack)", cpu.get_index(), get_rsp());
 
+    /* A panic, as the boot CPU's is, and not a return: ap_main left the
+       stack it was entered on for this one (ALLOC_CPU_STACK), and its
+       epilogue would pop this stack's fill for a return address -- an idle
+       task that could not be had, for want of memory, said as a fault at
+       0x5A5A5A5A5A5A5A5A. */
     if (!cpu.run(ap_startup, nullptr))
-    {
-        klog(0, "Can't run cpu %lu task", cpu.get_index());
-        return;
-    }
+        PANIC("Can't run cpu %lu task", cpu.get_index());
 }
 
 extern "C" void ap_main()
@@ -937,6 +941,8 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
     klog(0, "Set new cr3 0x%lX", get_cr3());
 
     Gdt::get_instance().save();
+    /* A stack for a double fault before the IDT that names it is loaded */
+    Gdt::get_instance().setup_boot_tss();
     ExceptionTable::get_instance().register_exception_handlers();
     Idt::get_instance().save();
 

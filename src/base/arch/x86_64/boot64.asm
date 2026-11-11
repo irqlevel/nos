@@ -385,6 +385,13 @@ start64:
     mov rdi, [mbinfo]
     mov rax, main_x86_64
     call rax
+    ; Neither entry returns. One that did would run into whatever follows
+    ; its call -- here the AP's entry, below the end of the trampoline --
+    ; so each stops here instead.
+.returned:
+    cli
+    hlt
+    jmp .returned
 
 long_mode_ap_start:
     ; load 0 into all data segment registers
@@ -397,3 +404,7 @@ long_mode_ap_start:
 ap_start64:
     mov rax, ap_main
     call rax
+.returned:
+    cli
+    hlt
+    jmp .returned
