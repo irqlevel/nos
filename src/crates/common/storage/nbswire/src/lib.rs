@@ -385,9 +385,34 @@ impl Refusal {
     }
 }
 
+/// The most a request is but for a write's data: its id, volume and
+/// generation, its kind and the fields of the largest -- a copy-up's two
+/// chunks, or a write's chunk, place and range.
+const REQUEST_HEAD_MAX: usize = 128;
+
 impl Request<'_> {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
+        self.encode_into(&mut w);
+        w.buf
+    }
+
+    /// `encode`, refused rather than had where there is no memory for it:
+    /// the whole of it asked for first -- a write's is a piece of up to
+    /// `DATA_MAX` and its head, more than a kernel's heap may have at once.
+    pub fn try_encode(&self) -> Option<Vec<u8>> {
+        let data = match &self.op {
+            Op::Write { data, .. } => data.len(),
+            _ => 0,
+        };
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(REQUEST_HEAD_MAX + data).ok()?;
+        let mut w = Writer { buf };
+        self.encode_into(&mut w);
+        Some(w.buf)
+    }
+
+    fn encode_into(&self, w: &mut Writer) {
         w.u64(self.id);
         w.u32(self.volume);
         w.u64(self.generation);
@@ -395,7 +420,7 @@ impl Request<'_> {
             Op::Fence => w.u8(1),
             Op::Write { chunk, position, index, offset, data } => {
                 w.u8(2);
-                chunk_ref(&mut w, chunk);
+                chunk_ref(w, chunk);
                 w.u32(*position);
                 w.u64(*index);
                 w.u32(*offset);
@@ -404,7 +429,7 @@ impl Request<'_> {
             }
             Op::Read { chunk, position, index, offset, len } => {
                 w.u8(3);
-                chunk_ref(&mut w, chunk);
+                chunk_ref(w, chunk);
                 w.u32(*position);
                 w.u64(*index);
                 w.u32(*offset);
@@ -413,7 +438,7 @@ impl Request<'_> {
             Op::Flush => w.u8(4),
             Op::Close { chunk, position, index } => {
                 w.u8(5);
-                chunk_ref(&mut w, chunk);
+                chunk_ref(w, chunk);
                 w.u32(*position);
                 w.u64(*index);
             }
@@ -429,7 +454,7 @@ impl Request<'_> {
             }
             Op::Pull { chunk, joiner, index, offset, len } => {
                 w.u8(9);
-                chunk_ref(&mut w, chunk);
+                chunk_ref(w, chunk);
                 w.u32(*joiner);
                 w.u64(*index);
                 w.u32(*offset);
@@ -437,7 +462,7 @@ impl Request<'_> {
             }
             Op::Sums { chunk, joiner, index, offset, len } => {
                 w.u8(10);
-                chunk_ref(&mut w, chunk);
+                chunk_ref(w, chunk);
                 w.u32(*joiner);
                 w.u64(*index);
                 w.u32(*offset);
@@ -445,17 +470,16 @@ impl Request<'_> {
             }
             Op::Scrub { chunk } => {
                 w.u8(11);
-                chunk_ref(&mut w, chunk);
+                chunk_ref(w, chunk);
             }
             Op::CopyUp { from, to, position, index } => {
                 w.u8(12);
-                chunk_ref(&mut w, from);
-                chunk_ref(&mut w, to);
+                chunk_ref(w, from);
+                chunk_ref(w, to);
                 w.u32(*position);
                 w.u64(*index);
             }
         }
-        w.buf
     }
 }
 
@@ -512,9 +536,37 @@ impl<'a> Request<'a> {
     }
 }
 
+/// The most an answer is but for what it carries -- a read's data, a list:
+/// its id, its kind, a count, a refusal's fields.
+const ANSWER_HEAD_MAX: usize = 64;
+
 impl Answer<'_> {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
+        self.encode_into(&mut w);
+        w.buf
+    }
+
+    /// `encode`, refused rather than had where there is no memory for it:
+    /// the whole of it asked for first -- a read's carries a piece of up to
+    /// `DATA_MAX`, more than a kernel's heap may have at once.
+    pub fn try_encode(&self) -> Option<Vec<u8>> {
+        let body = match &self.reply {
+            Reply::Data(d) => d.len(),
+            Reply::Held(list) => list.len() * 16,
+            Reply::Chunks(list) => list.len() * 16,
+            Reply::Sums(sums) => sums.len() * 4,
+            Reply::Scrub { sums, .. } => sums.len() * 4,
+            _ => 0,
+        };
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(ANSWER_HEAD_MAX + body).ok()?;
+        let mut w = Writer { buf };
+        self.encode_into(&mut w);
+        Some(w.buf)
+    }
+
+    fn encode_into(&self, w: &mut Writer) {
         w.u64(self.id);
         match &self.reply {
             Reply::Fenced { generation } => {
@@ -542,7 +594,7 @@ impl Answer<'_> {
             }
             Reply::Refused(why) => {
                 w.u8(6);
-                refusal(&mut w, why);
+                refusal(w, why);
             }
             Reply::Chunks(list) => {
                 w.u8(7);
@@ -571,7 +623,6 @@ impl Answer<'_> {
                 }
             }
         }
-        w.buf
     }
 }
 
