@@ -78,6 +78,50 @@
         "name": {"type": "string", "required": true, "title": {"en": "Name", "ru": "Имя"}},
         "size_mib": {"type": "int", "required": true, "title": {"en": "New size, MiB", "ru": "Новый размер, МиБ"}}
       }
+    },
+    "volume_snapshot": {
+      "kind": "action",
+      "title": {"en": "Snapshot", "ru": "Снимок"},
+      "help": {
+        "en": "The volume as it is now, read-only and thin. Of an attached volume, asked on the host it is attached on: its writer pauses for it, every chunk it wrote closed -- a moment's stall in its VM.",
+        "ru": "Том, какой он сейчас: только для чтения, без копирования данных. Снимок подключённого тома делается на хосте, где он подключён: его писатель на миг останавливается и закрывает все чанки, в которые писал."
+      },
+      "params": {
+        "volume": {"type": "string", "required": true, "title": {"en": "Volume", "ru": "Том"}},
+        "name": {"type": "string", "required": true, "title": {"en": "Snapshot's name", "ru": "Имя снимка"}}
+      }
+    },
+    "volume_freeze": {
+      "kind": "action",
+      "title": {"en": "Make an image", "ru": "Сделать образом"},
+      "confirm": {
+        "en": "The volume becomes an image: read-only for good, cloned from. Type its name to go on.",
+        "ru": "Том станет образом: навсегда только для чтения, с него делают клоны. Введите его имя, чтобы продолжить."
+      },
+      "confirm_typed": "name",
+      "params": {
+        "name": {"type": "string", "required": true, "title": {"en": "Name", "ru": "Имя"}}
+      }
+    },
+    "volume_clone": {
+      "kind": "action",
+      "title": {"en": "Clone", "ru": "Клонировать"},
+      "help": {
+        "en": "A new volume of an image or a snapshot, thin: each chunk shared until it is written, and copied on its replicas then.",
+        "ru": "Новый том из образа или снимка, без копирования: каждый чанк общий, пока в него не пишут, а тогда копируется на своих репликах."
+      },
+      "params": {
+        "from": {"type": "string", "required": true, "title": {"en": "Image or snapshot", "ru": "Образ или снимок"}},
+        "name": {"type": "string", "required": true, "title": {"en": "Name", "ru": "Имя"}},
+        "host": {
+          "type": "string",
+          "title": {"en": "Its own host", "ru": "Его хост"},
+          "help": {
+            "en": "Where one replica of each chunk it writes goes, and its VM runs: this host when none is given.",
+            "ru": "Куда ложится одна реплика каждого чанка, в который он пишет, и где работает его ВМ: этот хост, если не указан."
+          }
+        }
+      }
     }
   },
   "resources": {
@@ -89,15 +133,28 @@
       "fields": {
         "name": {"type": "string", "title": {"en": "Name", "ru": "Имя"}},
         "volume": {"type": "int", "title": {"en": "Number", "ru": "Номер"}},
+        "kind": {
+          "type": "enum",
+          "title": {"en": "Kind", "ru": "Вид"},
+          "values": {
+            "volume": {"en": "volume", "ru": "том"},
+            "image": {"en": "image", "ru": "образ"},
+            "snapshot": {"en": "snapshot", "ru": "снимок"}
+          }
+        },
+        "origin": {"type": "string", "title": {"en": "Made of", "ru": "Сделан из"}},
         "size": {"type": "bytes", "title": {"en": "Size", "ru": "Размер"}},
         "chunks": {"type": "int", "title": {"en": "Chunks", "ru": "Чанки"}},
         "host": {"type": "string", "title": {"en": "Its host", "ru": "Его хост"}},
         "writer": {"type": "string", "title": {"en": "Attached on", "ru": "Подключён на"}},
         "generation": {"type": "int", "title": {"en": "Generation", "ru": "Поколение"}}
       },
-      "columns": ["name", "size", "chunks", "host", "writer"],
+      "columns": ["name", "kind", "origin", "size", "chunks", "host", "writer"],
       "actions": [
         {"method": "volume_resize", "params": {"name": "$name"}},
+        {"method": "volume_snapshot", "params": {"volume": "$name"}},
+        {"method": "volume_clone", "params": {"from": "$name"}},
+        {"method": "volume_freeze", "params": {"name": "$name"}},
         {"method": "volume_delete", "params": {"name": "$name"}}
       ]
     },

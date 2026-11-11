@@ -80,7 +80,9 @@ nbs volume create <name> <size> [host=<host>]   size in MiB, or with M, G or T a
 nbs volume resize <name> <size>                 grown, never made smaller
 nbs volume delete <name>
 nbs volume snapshot <volume> <name>              attached: on its writer's host, which pauses it
-nbs volumes                every volume
+nbs volume freeze <name>   an image: read-only for good, cloned from
+nbs volume clone <image|snapshot> <name> [host=<host>]   a volume of its, thin
+nbs volumes                every volume, and what each is: a volume, a clone of, an image, a snapshot of
 nbs volume <name>          one, and the hosts its replicas are on
 ```
 
@@ -113,8 +115,13 @@ number, nothing read or written.
 
 The same is on the management bus as the `nbs` provider (`provider.rs`,
 `nbs.descriptor.json`), which the panel shows:
-- to read: `status`, `hosts`, `cs`, `volumes`, `volume`;
-- to change: `volume_create`, `volume_delete`, `volume_resize`.
+- to read: `status`, `hosts`, `cs`, `volumes`, `volume` -- each volume with
+  its `kind` (`volume`, `image` or `snapshot`) and its `origin`, the image or
+  snapshot a clone was made of and the volume a snapshot was taken of, by
+  name while that is there;
+- to change: `volume_create`, `volume_delete`, `volume_resize`, and
+  `volume_snapshot`, `volume_freeze`, `volume_clone` (N10d) -- a snapshot of
+  an attached volume asked on its writer's host, as the command is.
 
 Reads are this member's view, at the entry it has applied. Every change is a
 command through the leader, answered once this member has applied it too:
@@ -208,9 +215,16 @@ to drive them (N10b-N10d):
   longer `host`'s at `generation` -- taken over since, on that host or
   another -- and asked again by its token, answered as it was.
 - `Freeze { name }` -- a volume made an image, refused while attached; its
-  copy-ups pending given up.
+  copy-ups pending given up. `nbs volume freeze <name>` asks it (N10d).
 - `Clone { from, name, host }` -- of an image or a snapshot only (else
-  `NotFrozen`).
+  `NotFrozen`). `nbs volume clone <from> <name> [host=<host>]` asks it
+  (N10d), this host its own where none is given. A clone's writer reads and
+  writes chunks recorded as another volume's on their cs's, each asked of
+  the mds first; a write it makes in place -- its image deleted, the chunk
+  its alone -- makes the chunk its own. And a chunk a cs found open is
+  refused, as found open, to its writer alone: the volume's as well as the
+  generation's, as generations are counted by volume, and a clone's writer
+  may be at the very one another volume's left a chunk open at.
 - `CopyUp { name, place, generation }` -- the writer's, before it writes a
   chunk others share: a new chunk in the same set, so that each of its cs's
   copies it locally; its room taken on each, refused as `NoRoom` where one
@@ -972,11 +986,11 @@ image's zeros out.
   are: with the bit of the session's own operations set, as they were, a
   stop's flush done out of turn was told to nobody, and no judge saw it.
 
-  `--mutants` takes a hundred and eighty-two rules out one at a time --
-  seventy-three of the metadata's, five of them the controller's; forty-one
-  of the cs's, twelve of them the copy's and eleven a copy-up's; thirty-one
-  of the wire's, its `serve`'s, the mds's, the copy's and the scrub's;
-  thirty-seven of the client's -- each caught.
+  `--mutants` takes a hundred and eighty-four rules out one at a time --
+  seventy-three of the metadata's, five of them the controller's;
+  forty-two of the cs's, twelve of them the copy's and eleven a copy-up's;
+  thirty-two of the wire's, its `serve`'s, the mds's, the copy's and the
+  scrub's; thirty-seven of the client's -- each caught.
 - **`fuzz/raft`'s `nbsmeta` target**: the members' part of the state, its
   commands from pools of names and incarnations that meet and from wide ones
   that fill the cluster. There are four scenarios and six mutants.

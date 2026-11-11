@@ -1385,6 +1385,38 @@ each new gate.
       from a snapshot and written by its own writer -- through chunks the
       snapshot shares no longer, found open at another volume's generation
       -- where `serve`'s found-open refusal comparing the volume is judged.
+      Found building N10d1: the cluster's own flows never reach that
+      refusal. A snapshot is taken with every chunk closed (the pause), and
+      a chunk two volumes' writers can reach is shared until one copies it
+      up, so no active replica holds a chunk one volume's writer left open
+      where another's reaches it. The refusal by volume is the store's and
+      `serve`'s contract all the same, and the cs target judges it
+      directly. What a clone's writer in the cluster target is for: a
+      volume born with every chunk shared, reads of chunks recorded as
+      another volume's vouched for by the mds through crashes and joins, a
+      write in place once the snapshot is dropped, and the garbage passes
+      with clones about.
+  - **N10d, in three** (2026-11-11): N10d1 the commands and the provider,
+    and `serve`'s found-open refusal by volume; N10d2 clones in the cluster
+    target; N10d3 hv over the bus, its commands' form to be put to the user
+    first.
+    - **N10d1, done** (2026-11-11). `nbs volume freeze <name>` and `nbs
+      volume clone <from> <name> [host=<host>]`; `nbs volumes` and `nbs
+      volume` say what each is -- an image, a snapshot of its volume, a clone
+      of its image or snapshot. The `nbs` provider: `volume_snapshot`
+      (through `io::snapshot`, as the command), `volume_freeze`,
+      `volume_clone`, and each volume's `kind` and `origin`; the panel's
+      mock and a test of them. nbscs's `found_open_by(volume, ...)`, and
+      `serve` refusing a chunk found open to its writer alone -- the
+      volume's as well as the generation's. Judged directly in the cs
+      target, as the cluster target has no second writer yet: a chunk found
+      open, read through `serve` by another volume's writer at its
+      generation, served (every seed of its 200 catches either mutant).
+      nbs-test: a volume cloned refused; a snapshot cloned, read on a third
+      host through chunks recorded as another volume's, written there --
+      copied up, its snapshot as it was; the clone made an image, written
+      refused, cloned, deleted under that clone, whose write then takes the
+      chunk in place. Mutants: 184.
     - **A limit, and what would lift it.** A write to a shared chunk of a
       set being joined waits for the join, and fails past the operation's
       deadline: a join of a big set takes minutes. Lifting it: copy-ups into

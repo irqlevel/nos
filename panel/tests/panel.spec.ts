@@ -144,6 +144,46 @@ test('block storage: volumes listed, one made, grown, refused smaller, deleted w
   await expect(volumes).toContainText('web-root');
 });
 
+test('block storage: a snapshot of a volume, a clone of it, the clone made an image with its name typed', async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/p/nbs`);
+  const volumes = page.getByTestId('resource-volumes');
+  await volumes.getByRole('row', { name: /^\s*web-root\s/ }).getByRole('button', { name: 'Snapshot' }).click();
+  const snap = page.getByTestId('form-nbs-volume_snapshot');
+  await snap.locator('input[name=name]').fill('pw-snap');
+  await snap.getByRole('button', { name: 'Snapshot' }).click();
+  await expect(page.getByTestId('answer')).toContainText('"volume"');
+
+  /* A volume is cloned once it is an image or a snapshot: refused of a volume */
+  await page.goto(`/en/h/${host}/p/nbs`);
+  await volumes.getByRole('row', { name: /^\s*web-root\s/ }).getByRole('button', { name: 'Clone' }).click();
+  const refused = page.getByTestId('form-nbs-volume_clone');
+  await refused.locator('input[name=name]').fill('pw-clone');
+  await refused.getByRole('button', { name: 'Clone' }).click();
+  await expect(refused.getByRole('alert')).toContainText('freeze or snapshot the volume first');
+
+  await page.goto(`/en/h/${host}/p/nbs`);
+  await expect(volumes.getByRole('row', { name: /^\s*pw-snap\s/ })).toContainText('snapshot');
+  await expect(volumes.getByRole('row', { name: /^\s*pw-snap\s/ })).toContainText('web-root');
+  await volumes.getByRole('row', { name: /^\s*pw-snap\s/ }).getByRole('button', { name: 'Clone' }).click();
+  const clone = page.getByTestId('form-nbs-volume_clone');
+  await clone.locator('input[name=name]').fill('pw-clone');
+  await clone.getByRole('button', { name: 'Clone' }).click();
+  await expect(page.getByTestId('answer')).toContainText('"volume"');
+
+  /* The clone made an image only once its name is typed again */
+  await page.goto(`/en/h/${host}/p/nbs`);
+  await expect(volumes.getByRole('row', { name: /^\s*pw-clone\s/ })).toContainText('pw-snap');
+  await volumes.getByRole('row', { name: /^\s*pw-clone\s/ }).getByRole('button', { name: 'Make an image' }).click();
+  const freeze = page.getByTestId('form-nbs-volume_freeze');
+  await freeze.getByRole('button', { name: 'Make an image' }).click();
+  await expect(freeze).toContainText('read-only for good');
+  await freeze.getByLabel('Type it here').fill('pw-clone');
+  await freeze.getByRole('button', { name: 'Confirm' }).click();
+  await page.goto(`/ru/h/${host}/p/nbs`);
+  await expect(volumes.getByRole('row', { name: /^\s*pw-clone\s/ })).toContainText('образ');
+});
+
 test('a read run from its form shows its answer', async ({ page }) => {
   const host = await login(page);
   await page.goto(`/en/h/${host}/p/system`);

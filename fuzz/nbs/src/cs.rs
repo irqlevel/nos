@@ -537,6 +537,38 @@ impl Run {
                 m.closed = false;
             }
         }
+        self.found_open_by_another()
+    }
+
+    /// A chunk found open, read through `serve` by another volume's writer
+    /// at the very generation it was found open at -- a clone's, whose
+    /// generations are counted apart: served, not refused as if it were the
+    /// writer that left the chunk open (N10d). On draws of its own, the
+    /// other volume fenced at that generation where it is not yet.
+    fn found_open_by_another(&mut self) -> Result<(), String> {
+        let n = self.stats.get("cuts").copied().unwrap_or(0);
+        let mut probe = Rng::new(mix(mix(self.seed, 0x666f_6276), n));
+        let found: Vec<(u32, u64)> = (0..CHUNKS)
+            .filter_map(|c| self.store.found_open(c, self.chunks[c as usize].incarnation).map(|g| (c, g)))
+            .collect();
+        let Some((c, g)) = probe.pick(&found) else { return Ok(()) };
+        let owner = self.store.holding(c).map(|h| h.volume);
+        let others: Vec<u32> = (1..=VOLUMES).filter(|&w| Some(w) != owner && self.fenced[w as usize] <= g).collect();
+        let Some(w) = probe.pick(&others) else { return Ok(()) };
+        if self.fenced[w as usize] < g {
+            self.store.fence(w, g).map_err(|e| format!("volume {} not fenced at {}: {:?}", w, g, e))?;
+            self.fenced[w as usize] = g;
+            self.generation[w as usize] = self.generation[w as usize].max(g);
+        }
+        let req = Request { id: 0, volume: w, generation: g,
+                            op: WireOp::Read { chunk: self.cref(c), position: 0, index: 0, offset: 0,
+                                               len: self.sector as u32 } };
+        let got = serve(&mut self.store, &mut self.vouched, &req, &mut |_| Some(Told::Verified));
+        self.count("chunks found open read by another volume's writer at their generation");
+        if got == Err(Refusal::Failed) {
+            return Err(format!("chunk {}, found open at generation {} of volume {:?}, refused as found open to volume \
+                                {}'s writer at that generation", c, g, owner, w));
+        }
         Ok(())
     }
 

@@ -22,7 +22,7 @@ use kcore::cmd::Output;
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
 use nbscs::Holds;
-use nbsmeta::{Answer, Command, DeviceState, Refusal, State, Volume, CHUNK_MIB};
+use nbsmeta::{Answer, Command, DeviceState, Kind, Refusal, State, Volume, CHUNK_MIB};
 
 use crate::member::View;
 use crate::{caught_up, ModState};
@@ -242,6 +242,25 @@ pub fn volume_snapshot(state: &ModState, volume: &str, name: &str, turn: &mut dy
     volume_id(ask_turning(state, &cmd, turn)?)
 }
 
+/// Volume `name` made an image (N10d): read-only for good, cloned from --
+/// refused while attached. Its number.
+pub fn volume_freeze(state: &ModState, name: &str) -> Result<u32, Failure> {
+    caught_up(state)?;
+    volume_id(ask(state, &Command::Freeze { name: String::from(name) })?)
+}
+
+/// Volume `name`, a clone of image or snapshot `from`, its own host `host`
+/// -- this one where none is given (N10d): thin, every chunk shared with
+/// `from` until it is written. Its number.
+pub fn volume_clone(state: &ModState, from: &str, name: &str, host: Option<&str>) -> Result<u32, Failure> {
+    let v = caught_up(state)?;
+    let host = match host {
+        Some(h) => String::from(h),
+        None => this_host(&v)?,
+    };
+    volume_id(ask(state, &Command::Clone { from: String::from(from), name: String::from(name), host })?)
+}
+
 /// A size as it is typed: MiB, or with M, G or T after it.
 pub fn parse_size(text: &str) -> Option<u64> {
     let (digits, shift) = match text.as_bytes().last()? {
@@ -316,6 +335,20 @@ pub fn show_cs(v: &View, out: &mut Output) {
     }
 }
 
+/// What a volume is, where it is not a plain one (N10d): an image, a
+/// snapshot of a volume, or a clone of an image or a snapshot -- its origin
+/// by name while it is there.
+pub fn kind_text(s: &State, v: &Volume) -> Option<String> {
+    let origin = || s.volumes().iter().find(|o| o.id == v.origin)
+        .map_or_else(|| alloc::format!("volume {}, gone", v.origin), |o| o.name.clone());
+    match v.kind {
+        Kind::Volume if v.origin == 0 => None,
+        Kind::Volume => Some(alloc::format!("a clone of {}", origin())),
+        Kind::Image => Some(String::from("an image")),
+        Kind::Snapshot => Some(alloc::format!("a snapshot of {}", origin())),
+    }
+}
+
 fn attach_text(v: &Volume) -> String {
     match &v.writer {
         Some(w) => alloc::format!("attached on {} (generation {})", w.host, w.generation),
@@ -332,15 +365,17 @@ pub fn show_volumes(v: &View, out: &mut Output) {
     let mut vols: Vec<&Volume> = v.state.volumes().iter().collect();
     vols.sort_by(|a, b| a.name.cmp(&b.name));
     for vol in vols {
-        let _ = writeln!(out, "  {:<24} volume {:<5} {:>10}  {} chunks, of {}, {}", vol.name, vol.id,
-                         alloc::format!("{}", Mib(vol.size_mib)), vol.map.len(), vol.host, attach_text(vol));
+        let kind = kind_text(&v.state, vol).map_or_else(String::new, |k| alloc::format!(", {}", k));
+        let _ = writeln!(out, "  {:<24} volume {:<5} {:>10}  {} chunks, of {}, {}{}", vol.name, vol.id,
+                         alloc::format!("{}", Mib(vol.size_mib)), vol.map.len(), vol.host, attach_text(vol), kind);
     }
 }
 
 pub fn show_volume(v: &View, name: &str, out: &mut Output) -> Result<(), String> {
     let vol = v.state.volume(name).ok_or_else(|| alloc::format!("no volume {}", name))?;
-    let _ = writeln!(out, "nbs: volume {} ({}), {}, {} chunks of {} MiB, its own host {}, {}", vol.name, vol.id,
-                     Mib(vol.size_mib), vol.map.len(), CHUNK_MIB, vol.host, attach_text(vol));
+    let kind = kind_text(&v.state, vol).map_or_else(String::new, |k| alloc::format!(", {}", k));
+    let _ = writeln!(out, "nbs: volume {} ({}), {}, {} chunks of {} MiB, its own host {}, {}{}", vol.name, vol.id,
+                     Mib(vol.size_mib), vol.map.len(), CHUNK_MIB, vol.host, attach_text(vol), kind);
     let hosts = replica_hosts(&v.state, vol);
     let line: Vec<String> = hosts.iter().map(|(h, n)| alloc::format!("{} {}", h, n)).collect();
     let _ = writeln!(out, "  replicas, chunks a host: {}", line.join(", "));
