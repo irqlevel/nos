@@ -170,7 +170,7 @@ pub fn run(shared: Arc<Shared>) {
     };
     s.main();
     /* Everything written so far durable before the queues go */
-    let _ = s.store.flush();
+    let _ = nbscs::now(s.store.flush());
 }
 
 impl Server {
@@ -282,7 +282,7 @@ impl Server {
         if have != slots {
             return Err(alloc::format!("{} slots on it, {} in the metadata -- the device changed size", have, slots));
         }
-        match self.store.open_device(dev, ident) {
+        match nbscs::now(self.store.open_device(dev, ident)) {
             Ok((_, rep)) => {
                 if rep.lost != 0 {
                     klog!(0, "nbs-cs: {}: {} slots' records lost, those slots never used again", name, rep.lost);
@@ -292,7 +292,7 @@ impl Server {
             Err((dev, OpenError::Blank)) => {
                 let format = kcore::random::random_u64().filter(|&f| f != 0)
                     .ok_or_else(|| String::from("no randomness for its format's id"))?;
-                self.store.format_device(dev, ident, format).map(|_| "formatted")
+                nbscs::now(self.store.format_device(dev, ident, format)).map(|_| "formatted")
                     .map_err(|(_, e)| alloc::format!("not formatted: {:?}", e))
             }
             Err((_, OpenError::Foreign(other))) => Err(alloc::format!(

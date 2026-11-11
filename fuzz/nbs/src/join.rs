@@ -488,8 +488,8 @@ impl World {
         let disk = self.joiner_disk.clone();
         drop(std::mem::replace(&mut self.joiner, Store::new()));
         disk.borrow_mut().cut(&mut self.r);
-        let mut s = Store::new();
-        s.open_device(Handle(disk), id).map_err(|(_, e)| format!("the joiner not opened after a cut: {:?}", e))?;
+        let s = Store::new();
+        nbscs::now(s.open_device(Handle(disk), id)).map_err(|(_, e)| format!("the joiner not opened after a cut: {:?}", e))?;
         self.joiner = s;
         if let Some(d) = self.joiner.devices().iter().find(|d| d.lost != 0) {
             return Err(format!("{} records lost on the joiner's device after a cut", d.lost));
@@ -501,8 +501,8 @@ impl World {
                 continue;
             }
             let c = cref(chunk, self.version);
-            self.source.read(VOLUME, GEN, c, 0, &mut a, true).map_err(|e| format!("source's chunk {}: {:?}", chunk, e))?;
-            self.joiner.own_read(c, 0, &mut b).map_err(|e| format!("joiner's chunk {}: {:?}", chunk, e))?;
+            nbscs::now(self.source.read(VOLUME, GEN, c, 0, &mut a, true)).map_err(|e| format!("source's chunk {}: {:?}", chunk, e))?;
+            nbscs::now(self.joiner.own_read(c, 0, &mut b)).map_err(|e| format!("joiner's chunk {}: {:?}", chunk, e))?;
             if a != b {
                 return Err(format!("chunk {}, closed by the copy, is not the source's after a power cut", chunk));
             }
@@ -529,8 +529,8 @@ impl World {
                 continue;
             }
             let c = cref(chunk, self.version);
-            self.source.read(VOLUME, GEN, c, 0, &mut a, true).map_err(|e| format!("source's chunk {}: {:?}", chunk, e))?;
-            self.joiner.own_read(c, 0, &mut b).map_err(|e| format!("joiner's chunk {}: {:?}", chunk, e))?;
+            nbscs::now(self.source.read(VOLUME, GEN, c, 0, &mut a, true)).map_err(|e| format!("source's chunk {}: {:?}", chunk, e))?;
+            nbscs::now(self.joiner.own_read(c, 0, &mut b)).map_err(|e| format!("joiner's chunk {}: {:?}", chunk, e))?;
             /* But the sectors of a write still on its way to one of them */
             let flying = |k: usize| self.writes.iter().map(|w| (w.chunk, w.offset, w.data.len()))
                 .chain(self.missed.iter().copied())
@@ -550,8 +550,8 @@ impl World {
         let disk = self.joiner_disk.clone();
         drop(std::mem::replace(&mut self.joiner, Store::new()));
         disk.borrow_mut().cut(&mut self.r);
-        let mut s = Store::new();
-        s.open_device(Handle(disk), id).map_err(|(_, e)| format!("the joiner not opened after a cut: {:?}", e))?;
+        let s = Store::new();
+        nbscs::now(s.open_device(Handle(disk), id)).map_err(|(_, e)| format!("the joiner not opened after a cut: {:?}", e))?;
         self.joiner = s;
         /* The chunk the copy was at among them: a close the cut cut short
            that left its record closed is to have left its data too */
@@ -590,8 +590,8 @@ impl World {
         let mut b = vec![0u8; SLOT as usize];
         for &(chunk, ..) in &theirs {
             let c = cref(chunk, self.version);
-            self.source.read(VOLUME, GEN, c, 0, &mut a, true).map_err(|e| format!("source's chunk {}: {:?}", chunk, e))?;
-            self.joiner.read(VOLUME, GEN, c, 0, &mut b, true).map_err(|e| format!("joiner's chunk {}: {:?}", chunk, e))?;
+            nbscs::now(self.source.read(VOLUME, GEN, c, 0, &mut a, true)).map_err(|e| format!("source's chunk {}: {:?}", chunk, e))?;
+            nbscs::now(self.joiner.read(VOLUME, GEN, c, 0, &mut b, true)).map_err(|e| format!("joiner's chunk {}: {:?}", chunk, e))?;
             if let Some(k) = (0..(SLOT / 512) as usize).find(|&k| a[k * 512..(k + 1) * 512] != b[k * 512..(k + 1) * 512]) {
                 return Err(format!("chunk {}'s sector {} (of 512 bytes) differs on the joiner from the source's",
                                    chunk, k));
@@ -604,20 +604,20 @@ impl World {
 fn store(r: &mut Rng, cs: u32, device: u32) -> Result<(Store<Handle>, Rc<RefCell<Disk>>, Identity), String> {
     let disk = Rc::new(RefCell::new(Disk::new(SECTOR, DISK_SLOTS * SLOT)));
     let identity = Identity { cluster: CLUSTER, cs, device };
-    let mut s = Store::new();
-    s.format_device(Handle(disk.clone()), identity, 1 + r.below(u64::MAX - 1))
+    let s = Store::new();
+    nbscs::now(s.format_device(Handle(disk.clone()), identity, 1 + r.below(u64::MAX - 1)))
         .map_err(|(_, e)| format!("cs {}'s disk not formatted: {:?}", cs, e))?;
-    s.fence(VOLUME, GEN).map_err(|e| format!("cs {} not fenced: {:?}", cs, e))?;
+    nbscs::now(s.fence(VOLUME, GEN)).map_err(|e| format!("cs {} not fenced: {:?}", cs, e))?;
     Ok((s, disk, identity))
 }
 
 pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     let mut r = Rng::new(mix(seed, 0x6a6f_696e));
-    let (mut source, _sdisk, _) = store(&mut r, SOURCE, 1)?;
+    let (source, _sdisk, _) = store(&mut r, SOURCE, 1)?;
     let (mut joiner, jdisk, jid) = store(&mut r, JOINER, 2)?;
     /* A copy into a set not joined: refused, as its writes are not marked */
-    if joiner.copy_in(VOLUME, ChunkRef { chunk: 1, incarnation: 1, epoch: Epoch { set: SET + 1, version: 1 } }, 0,
-                      &[0u8; SECTOR as usize]) != Err(nbscs::Error::Bad) {
+    if nbscs::now(joiner.copy_in(VOLUME, ChunkRef { chunk: 1, incarnation: 1, epoch: Epoch { set: SET + 1, version: 1 } }, 0,
+                      &[0u8; SECTOR as usize])) != Err(nbscs::Error::Bad) {
         return Err(String::from("a copy into a set not joined taken"));
     }
     let focus = match r.below(10) {
@@ -662,17 +662,17 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
             seq += 1;
             let d = data(seq ^ 0x5eed_0000, (n * SECTOR) as usize);
             let c = cref(chunk, version);
-            source.write(VOLUME, GEN, c, (first * SECTOR) as u32, &d, true)
+            nbscs::now(source.write(VOLUME, GEN, c, (first * SECTOR) as u32, &d, true))
                 .map_err(|e| format!("the source's history not written: {:?}", e))?;
             if own && version < UNTIL {
-                joiner.write(VOLUME, GEN, c, (first * SECTOR) as u32, &d, true)
+                nbscs::now(joiner.write(VOLUME, GEN, c, (first * SECTOR) as u32, &d, true))
                     .map_err(|e| format!("the joiner's history not written: {:?}", e))?;
             }
         }
         /* The member's writes of its last version flushed, or lost to a
            cut: those chunks found open as it comes back */
         if own && version == UNTIL - 2 {
-            joiner.flush().map_err(|e| format!("joiner not flushed: {:?}", e))?;
+            nbscs::now(joiner.flush()).map_err(|e| format!("joiner not flushed: {:?}", e))?;
         }
         if own && version == UNTIL - 1 && focus != Focus::Held && (focus == Focus::Suspect || r.chance(50)) {
             cut = true;
@@ -686,20 +686,20 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
                 let at = k * u64::from(nbswire::DATA_MAX) + r.below(u64::from(nbswire::DATA_MAX) / SECTOR) * SECTOR;
                 seq += 1;
                 let d = data(seq ^ 0x5eed_0000, SECTOR as usize);
-                source.write(VOLUME, GEN, cref(chunk, SINCE - 1), at as u32, &d, true)
+                nbscs::now(source.write(VOLUME, GEN, cref(chunk, SINCE - 1), at as u32, &d, true))
                     .map_err(|e| format!("the source's history not written: {:?}", e))?;
             }
         }
     }
-    source.flush().map_err(|e| format!("source not flushed: {:?}", e))?;
+    nbscs::now(source.flush()).map_err(|e| format!("source not flushed: {:?}", e))?;
     if cut {
         drop(joiner);
         jdisk.borrow_mut().cut(&mut r);
-        let mut s = Store::new();
-        s.open_device(Handle(jdisk.clone()), jid).map_err(|(_, e)| format!("the joiner not opened again: {:?}", e))?;
+        let s = Store::new();
+        nbscs::now(s.open_device(Handle(jdisk.clone()), jid)).map_err(|(_, e)| format!("the joiner not opened again: {:?}", e))?;
         joiner = s;
     } else {
-        joiner.flush().map_err(|e| format!("joiner not flushed: {:?}", e))?;
+        nbscs::now(joiner.flush()).map_err(|e| format!("joiner not flushed: {:?}", e))?;
     }
     let mut w = World { r, now: 0, trace, source, joiner, joiner_disk: jdisk, sv: Vouched::new(), jv: Vouched::new(),
                         version: SINCE, since: SINCE, joining: true, own, chunks, copy: None, copy_at: None,

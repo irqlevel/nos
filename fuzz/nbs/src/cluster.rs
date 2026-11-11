@@ -604,7 +604,7 @@ impl World {
     fn block_on(&mut self, h: usize, volume: u32, chunk: ChunkRef, inside: u32) -> Result<u8, String> {
         let Some(store) = self.hosts[h].store.as_mut() else { return Err(String::from("its host is down")) };
         let mut buf = vec![0u8; BLOCK as usize];
-        store.read(volume, 0, chunk, inside, &mut buf, true).map_err(|e| format!("{:?}", e))?;
+        nbscs::now(store.read(volume, 0, chunk, inside, &mut buf, true)).map_err(|e| format!("{:?}", e))?;
         let v = buf[0];
         if buf.iter().any(|&x| x != v) {
             return Err(format!("not one value: {:?}...", &buf[..8]));
@@ -1169,7 +1169,7 @@ impl World {
             for i in 0..nbsmeta::REPLICAS {
                 let cs = st.cs[i];
                 let Some(h) = self.host_of_cs(cs) else { continue };
-                let got = self.hosts[h].store.as_mut().map(|x| x.scrub(chunk));
+                let got = self.hosts[h].store.as_mut().map(|x| nbscs::now(x.scrub(chunk)));
                 let line = match got {
                     Some(Ok((open, written, sums))) => {
                         let differ: Vec<usize> = match &first {
@@ -2430,9 +2430,9 @@ impl World {
         if self.trace {
             eprintln!("  [{}] host {} comes back", self.step, self.hosts[h].name);
         }
-        let mut store = Store::new();
+        let store = Store::new();
         let handle = Handle(self.hosts[h].disk.clone());
-        if let Err((_, e)) = store.open_device(handle, self.hosts[h].identity) {
+        if let Err((_, e)) = nbscs::now(store.open_device(handle, self.hosts[h].identity)) {
             return Err(format!("host {}'s disk not opened again: {:?}", self.hosts[h].name, e));
         }
         if self.trace {
@@ -3040,8 +3040,8 @@ fn setup(r: &mut Rng) -> Result<World, String> {
         let cs = w.state.cs_of(h).ok_or_else(|| format!("no cs of {}", h))?;
         let identity = Identity { cluster: CLUSTER, cs: cs.id, device: cs.devices[0].id };
         let disk = Rc::new(RefCell::new(Disk::new(DISK_SECTOR, bytes)));
-        let mut store = Store::new();
-        if let Err((_, e)) = store.format_device(Handle(disk.clone()), identity, 1 + r.below(u64::MAX - 1)) {
+        let store = Store::new();
+        if let Err((_, e)) = nbscs::now(store.format_device(Handle(disk.clone()), identity, 1 + r.below(u64::MAX - 1))) {
             return Err(format!("disk of {} not formatted: {:?}", h, e));
         }
         w.hosts.push(Host { name: h, cs: cs.id, disk, identity, store: Some(store), vouched: Vouched::new(),

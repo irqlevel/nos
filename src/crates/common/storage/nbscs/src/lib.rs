@@ -20,10 +20,12 @@
 extern crate alloc;
 
 mod device;
+mod exec;
 mod format;
 mod store;
 
 pub use device::{Device, IoError};
+pub use exec::now;
 pub use format::{device_slots, holds, layout, Decoded, Epoch, Holds, Identity, Layout, Record, SlotState, Super,
                  FENCES_MAX};
 pub use store::{ChunkRef, DeviceInfo, Error, Holding, OpenError, Repairs, Store};
