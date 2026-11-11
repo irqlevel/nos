@@ -547,7 +547,11 @@ void bp_startup(void* ctx)
 
         /* A machine boots without either: the refusal has been said */
         (void)Interrupt::register_handler(kbd, acpi.get_gsi_by_irq(0x1), 0x21);
-        (void)Interrupt::register_handler(serial, acpi.get_gsi_by_irq(0x4), 0x24);
+        /* Only a UART that is there has a line to answer for: on a machine
+           with none the handler was registered all the same, to read a port
+           nothing decodes if the line ever moved */
+        if (serial.is_present())
+            (void)Interrupt::register_handler(serial, acpi.get_gsi_by_irq(0x4), 0x24);
 
         rust_virtio_blk_init();
         rust_virtio_scsi_init();
