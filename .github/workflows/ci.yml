@@ -251,6 +251,15 @@ jobs:
         if: matrix.arch == 'aarch64'
         run: python3 scripts/netconsole-test.py --tcg
 
+      # The halt with something still running: a shell inside a module's
+      # command as the machine is told to go, and another shell asking for a
+      # module while they unload. With nothing running in a module, either
+      # order of the halt ends the same, and no other boot would notice the
+      # shells being waited for before the modules are told to stop.
+      - name: Halt test (TCG)
+        if: matrix.arch == 'aarch64'
+        run: python3 scripts/halt-test.py --tcg
+
       # The connecting side of TCP, which the sshd test does not reach.
       - name: TCP test (TCG)
         if: matrix.arch == 'aarch64'
