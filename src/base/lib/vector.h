@@ -39,7 +39,10 @@ public:
         if (capacity <= capacity_)
             return true;
 
-        T* new_arr = new T[capacity];
+        /* The form that can say no: plain new[] panics for want of memory
+           and never returns null, so the check after it was dead and a
+           reserve that could not be had took the machine down */
+        T* new_arr = new (kernel::mm::NO_THROW) T[capacity];
         if (!new_arr)
             return false;
 

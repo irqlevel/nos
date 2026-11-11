@@ -134,12 +134,16 @@ public:
     {
         if (this != &other)
         {
-            reset(nullptr);
-            object_ref_ = other.object_ref_;
-            if (object_ref_ != nullptr)
+            /* The other's reference taken before this one's is let go of:
+               `other` may be part of the object this pointer keeps alive
+               (p = p->next), and was read after the reset had freed it */
+            ObjectReference<T, Deleter>* ref = other.object_ref_;
+            if (ref != nullptr)
             {
-                object_ref_->inc_counter();
+                ref->inc_counter();
             }
+            reset(nullptr);
+            object_ref_ = ref;
         }
 
         klog(SHARED_PTR_LL, "ptr 0x%p op= obj 0x%p", this, get());
@@ -151,9 +155,11 @@ public:
     {
         if (this != &other)
         {
-            reset(nullptr);
-            object_ref_ = other.object_ref_;
+            /* Taken out of the other first, for the same reason */
+            ObjectReference<T, Deleter>* ref = other.object_ref_;
             other.object_ref_ = nullptr;
+            reset(nullptr);
+            object_ref_ = ref;
         }
 
         klog(SHARED_PTR_LL, "ptr 0x%p op= obj 0x%p", this, get());
