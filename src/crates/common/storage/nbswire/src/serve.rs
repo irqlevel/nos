@@ -8,7 +8,7 @@
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
-use nbscs::{ChunkRef, Device, Error, SlotState, Store};
+use nbscs::{now, ChunkRef, Device, Error, SlotState, Store};
 
 use crate::{Op, Question, Refusal, Reply, Request, Told, LIST_MAX};
 
@@ -73,7 +73,7 @@ pub fn collect<D: Device>(store: &mut Store<D>, ask: &mut dyn FnMut(Question) ->
         let Some(Told::Gone(gone)) = ask(Question::Live { chunks: batch.to_vec() }) else { return done };
         for c in gone {
             let Some(&(_, incarnation)) = batch.iter().find(|(n, _)| *n == c) else { continue };
-            match store.free(c, incarnation) {
+            match now(store.free(c, incarnation)) {
                 Ok(true) => done.freed.push((c, incarnation)),
                 Ok(false) => {}
                 Err(e) => done.failed.push((c, e)),
@@ -84,7 +84,7 @@ pub fn collect<D: Device>(store: &mut Store<D>, ask: &mut dyn FnMut(Question) ->
     for batch in volumes.chunks(LIST_MAX) {
         let Some(Told::Gone(gone)) = ask(Question::Volumes { volumes: batch.to_vec() }) else { return done };
         for v in gone {
-            match store.drop_fence(v) {
+            match now(store.drop_fence(v)) {
                 Ok(()) => done.unfenced.push(v),
                 Err(e) => done.failed.push((v, e)),
             }
@@ -165,10 +165,10 @@ pub fn serve<D: Device>(store: &mut Store<D>, vouched: &mut Vouched, req: &Reque
         }
     }
     match req.op {
-        Op::Fence => store.fence(v, g).map(|now| Done::Fenced { generation: now }).map_err(Refusal::of),
+        Op::Fence => now(store.fence(v, g)).map(|g| Done::Fenced { generation: g }).map_err(Refusal::of),
         Op::Write { chunk, position, index, offset, data } => {
             checked(store, vouched, ask, v, g, chunk, position, index, true,
-                    &mut |s, verified| s.write(v, g, chunk, offset, data, verified))?;
+                    &mut |s, verified| now(s.write(v, g, chunk, offset, data, verified)))?;
             Ok(Done::Done)
         }
         Op::Read { chunk, position, index, offset, len } => {
@@ -178,12 +178,12 @@ pub fn serve<D: Device>(store: &mut Store<D>, vouched: &mut Vouched, req: &Reque
             }
             buf.resize(len as usize, 0);
             checked(store, vouched, ask, v, g, chunk, position, index, false,
-                    &mut |s, verified| s.read(v, g, chunk, offset, &mut buf, verified))?;
+                    &mut |s, verified| now(s.read(v, g, chunk, offset, &mut buf, verified)))?;
             Ok(Done::Data(buf))
         }
-        Op::Flush => store.flush_for(v, g).map(|()| Done::Done).map_err(Refusal::of),
+        Op::Flush => now(store.flush_for(v, g)).map(|()| Done::Done).map_err(Refusal::of),
         Op::Close { chunk, position, index } => {
-            checked(store, vouched, ask, v, g, chunk, position, index, true, &mut |s, _| s.close(v, g, chunk))
+            checked(store, vouched, ask, v, g, chunk, position, index, true, &mut |s, _| now(s.close(v, g, chunk)))
                 .map(Done::Closed)
         }
         Op::Held => Ok(Done::Held(store.holdings().iter()
@@ -204,16 +204,16 @@ pub fn serve<D: Device>(store: &mut Store<D>, vouched: &mut Vouched, req: &Reque
                 return Err(Refusal::NotReady);
             }
             buf.resize(len as usize, 0);
-            store.pull(chunk, offset, &mut buf).map_err(Refusal::of)?;
+            now(store.pull(chunk, offset, &mut buf)).map_err(Refusal::of)?;
             Ok(Done::Data(buf))
         }
         Op::Sums { chunk, joiner, index, offset, len } => {
             joined(vouched, ask, chunk.epoch.set, joiner, chunk.epoch.version, index)?;
-            store.sums(chunk, offset, len).map(Done::Sums).map_err(Refusal::of)
+            now(store.sums(chunk, offset, len)).map(Done::Sums).map_err(Refusal::of)
         }
         /* The leader's scrub (N9e): sums and a record, nothing moved on and
            no data -- answered as a ping is, unvouched */
-        Op::Scrub { chunk } => store.scrub(chunk)
+        Op::Scrub { chunk } => now(store.scrub(chunk))
             .map(|(open, written, sums)| Done::Scrub { open, written, sums }).map_err(Refusal::of),
         Op::CopyUp { from, to, position, index } => {
             copied(store, ask, v, g, from, to, position, index)?;
@@ -228,12 +228,12 @@ pub fn serve<D: Device>(store: &mut Store<D>, vouched: &mut Vouched, req: &Reque
 #[allow(clippy::too_many_arguments)]
 fn copied<D: Device>(store: &mut Store<D>, ask: &mut dyn FnMut(Question) -> Option<Told>, volume: u32,
                      generation: u64, from: ChunkRef, to: ChunkRef, position: u32, index: u64) -> Result<(), Refusal> {
-    match store.copy_up(volume, generation, from, to, false) {
+    match now(store.copy_up(volume, generation, from, to, false)) {
         Err(Error::Unverified) => {}
         done => return done.map_err(Refusal::of),
     }
     match ask(Question::VerifyCopy { volume, generation, position, from, to, index }) {
-        Some(Told::Verified) => store.copy_up(volume, generation, from, to, true).map_err(Refusal::of),
+        Some(Told::Verified) => now(store.copy_up(volume, generation, from, to, true)).map_err(Refusal::of),
         Some(Told::Refused(why)) => Err(why),
         _ => Err(Refusal::NoMds),
     }
