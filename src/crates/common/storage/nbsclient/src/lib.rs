@@ -319,15 +319,39 @@ enum What {
     CopyUp(u32),
 }
 
-/// A request out to a cs.
+/// A request to a cs out: no bytes of it kept -- a piece's would be 256 KiB
+/// a replica -- but what makes it again as it first went: its stamp, and
+/// the piece's data, the driver's until the operation is done.
 struct Sub {
     cs: u32,
     what: What,
-    bytes: Vec<u8>,
+    stamp: Stamp,
     sent: u64,
+    /// When it first went: the cs is silent from then on.
     first: u64,
-    /// When it is to go again: a refusal for now, or a bounce.
+    /// Whether it has gone at all: one with no memory for it yet has not,
+    /// and its cs is not silent for that.
+    went: bool,
+    /// When it is to go again: a refusal for now, a bounce, or no memory.
     again: Option<u64>,
+}
+
+/// What a request to a cs is made at, kept with it so that it goes again
+/// as it first went though the map is read again meanwhile: the session's
+/// generation, the map's index, and the chunks it names.
+#[derive(Clone, Copy)]
+struct Stamp {
+    generation: u64,
+    index: u64,
+    chunk: Option<ChunkRef>,
+    to: Option<ChunkRef>,
+}
+
+/// Why a request was not made: what it is of is gone -- its piece, or the
+/// data of it -- or there is no memory for it now.
+enum Unmade {
+    Gone,
+    NoMemory,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -420,6 +444,12 @@ pub struct Session {
     copies: BTreeMap<u32, CopyUp>,
     /// A pause for a snapshot, while one is (N10c2).
     pausing: Option<Pause>,
+    /// Whether a request found no memory, since one last went: said once.
+    starved: bool,
+    /// The fuzzer's (#97): a write's request made until then finds no
+    /// memory.
+    #[cfg(feature = "starve")]
+    starve_until: u64,
 }
 
 impl Session {
@@ -434,8 +464,31 @@ impl Session {
             queue: VecDeque::new(), parked: Vec::new(), fenced: BTreeSet::new(), held: BTreeMap::new(),
             dirty: BTreeSet::new(), open: BTreeMap::new(), closing: BTreeMap::new(), mend: VecDeque::new(),
             mending: None, scratch: Vec::new(), stop: None, stop_flush: None, reads: BTreeMap::new(),
-            copies: BTreeMap::new(), pausing: None,
+            copies: BTreeMap::new(), pausing: None, starved: false,
+            #[cfg(feature = "starve")]
+            starve_until: 0,
         }
+    }
+
+    /// The fuzzer's (#97): every write's request made until `until` finds no
+    /// memory, as a kernel's heap may refuse one.
+    #[cfg(feature = "starve")]
+    pub fn starve_until(&mut self, until: u64) {
+        self.starve_until = until;
+    }
+
+    /// Whether a request of `what` finds no memory now: the fuzzer's write
+    /// starved (`starve_until`), and nothing else.
+    #[cfg(feature = "starve")]
+    fn starved_at(&self, what: What, now: u64) -> bool {
+        now < self.starve_until
+            && matches!(what, What::Piece(pid) if self.pieces.get(&pid).and_then(|p| self.ops.get(&p.op))
+                .is_some_and(|o| o.kind == Kind::Write))
+    }
+
+    #[cfg(not(feature = "starve"))]
+    fn starved_at(&self, _what: What, _now: u64) -> bool {
+        false
     }
 
     pub fn phase(&self) -> &Phase {
@@ -804,48 +857,96 @@ impl Session {
 
     /* ---- requests to cs's ---- */
 
-    /// The bytes of a request of `what`, its id left 0: a write's data from
-    /// its operation's buffer -- the driver's, or the session's own for a
-    /// reconcile's copy.
-    fn request(&self, what: What, bufs: &dyn Buffers) -> Option<Vec<u8>> {
-        let (volume, generation, index) = (self.map.volume, if self.writable { self.generation } else { 0 },
-                                           self.index);
+    /// What a request of `what` is made at now: None where what it names
+    /// is not in the map, or gone.
+    fn stamp(&self, what: What) -> Option<Stamp> {
+        let (chunk, to) = match what {
+            What::Fence | What::Held | What::Flush(_) => (None, None),
+            What::Close(place) => (Some(self.map.chunk(place)?), None),
+            What::CopyUp(place) => {
+                let from = self.map.chunk(place)?;
+                let (chunk, incarnation) = self.copies.get(&place)?.to?;
+                (Some(from), Some(ChunkRef { chunk, incarnation, epoch: from.epoch }))
+            }
+            What::Piece(pid) => (Some(self.map.chunk(self.pieces.get(&pid)?.place)?), None),
+        };
+        Some(Stamp { generation: if self.writable { self.generation } else { 0 }, index: self.index, chunk, to })
+    }
+
+    /// The bytes of a request of `what` made at `stamp`, its id left 0: a
+    /// write's data from its operation's buffer -- the driver's, or the
+    /// session's own for a reconcile's copy.
+    fn request(&self, what: What, stamp: &Stamp, bufs: &dyn Buffers) -> Result<Vec<u8>, Unmade> {
+        let (volume, generation, index) = (self.map.volume, stamp.generation, stamp.index);
+        let named = |c: Option<ChunkRef>| c.ok_or(Unmade::Gone);
         let op = match what {
             What::Fence => Op::Fence,
             What::Held => Op::Held,
             What::Flush(_) => Op::Flush,
-            What::Close(place) => Op::Close { chunk: self.map.chunk(place)?, position: place, index },
-            What::CopyUp(place) => {
-                let from = self.map.chunk(place)?;
-                let (chunk, incarnation) = self.copies.get(&place)?.to?;
-                Op::CopyUp { from, to: ChunkRef { chunk, incarnation, epoch: from.epoch }, position: place, index }
-            }
+            What::Close(place) => Op::Close { chunk: named(stamp.chunk)?, position: place, index },
+            What::CopyUp(place) => Op::CopyUp { from: named(stamp.chunk)?, to: named(stamp.to)?, position: place, index },
             What::Piece(pid) => {
-                let p = self.pieces.get(&pid)?;
-                let o = self.ops.get(&p.op)?;
-                let chunk = self.map.chunk(p.place)?;
+                let p = self.pieces.get(&pid).ok_or(Unmade::Gone)?;
+                let o = self.ops.get(&p.op).ok_or(Unmade::Gone)?;
+                let chunk = named(stamp.chunk)?;
                 match o.kind {
                     Kind::Read => Op::Read { chunk, position: p.place, index, offset: p.inside, len: p.len },
                     _ => {
                         let all = if o.tag & INTERNAL != 0 { &self.scratch[..] } else { bufs.data(o.tag) };
-                        let data = all.get(p.at as usize..(p.at + p.len) as usize)?;
+                        let data = all.get(p.at as usize..(p.at + p.len) as usize).ok_or(Unmade::Gone)?;
                         let op = Op::Write { chunk, position: p.place, index, offset: p.inside, data };
-                        return Some(Request { id: 0, volume, generation, op }.encode());
+                        return Request { id: 0, volume, generation, op }.try_encode().ok_or(Unmade::NoMemory);
                     }
                 }
             }
         };
-        Some(Request { id: 0, volume, generation, op }.encode())
+        Ok(Request { id: 0, volume, generation, op }.encode())
     }
 
-    /// A request to cs `cs` made and sent.
+    /// A request to cs `cs` made and sent -- or, with no memory for it now,
+    /// sent in a moment.
     fn send(&mut self, cs: u32, what: What, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
-        let Some(mut bytes) = self.request(what, bufs) else { return };
+        let Some(stamp) = self.stamp(what) else { return };
         let id = self.take_id();
-        /* The id is the request's first eight bytes */
-        bytes[..8].copy_from_slice(&id.to_le_bytes());
-        out.push(Out::Send { to: To::Cs(cs), id, bytes: bytes.clone() });
-        self.subs.insert(id, Sub { cs, what, bytes, sent: now, first: now, again: None });
+        self.subs.insert(id, Sub { cs, what, stamp, sent: now, first: now, went: false, again: None });
+        self.transmit(id, now, bufs, out);
+    }
+
+    /// Request `id` made again as it first was, and sent: its bytes the
+    /// send's alone, kept by nobody once the driver has handed them on.
+    fn transmit(&mut self, id: u64, now: u64, bufs: &dyn Buffers, out: &mut Vec<Out>) {
+        let Some(s) = self.subs.get(&id) else { return };
+        let (cs, what, stamp) = (s.cs, s.what, s.stamp);
+        let made = if self.starved_at(what, now) { Err(Unmade::NoMemory) } else { self.request(what, &stamp, bufs) };
+        match made {
+            Ok(mut bytes) => {
+                /* The id is the request's first eight bytes */
+                bytes[..8].copy_from_slice(&id.to_le_bytes());
+                out.push(Out::Send { to: To::Cs(cs), id, bytes });
+                if let Some(s) = self.subs.get_mut(&id) {
+                    s.sent = now;
+                    s.again = None;
+                    if !s.went {
+                        s.went = true;
+                        s.first = now;
+                    }
+                }
+                self.starved = false;
+            }
+            Err(Unmade::Gone) => {
+                self.subs.remove(&id);
+            }
+            Err(Unmade::NoMemory) => {
+                if let Some(s) = self.subs.get_mut(&id) {
+                    s.again = Some(now + AGAIN_NS);
+                }
+                if !self.starved {
+                    self.starved = true;
+                    out.push(Out::Say(alloc::format!("nbs: volume {}: no memory for a request to cs {} -- sent \
+                                                      again in a moment", self.name, cs)));
+                }
+            }
+        }
     }
 
     fn send_piece(&mut self, pid: u64, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
@@ -2059,16 +2160,17 @@ impl Session {
             return;
         }
         let mut silent = Vec::new();
-        for (&id, s) in self.subs.iter_mut() {
-            let due = s.again.map_or(now >= s.sent + RESEND_NS, |a| now >= a);
-            if due {
-                s.sent = now;
-                s.again = None;
-                out.push(Out::Send { to: To::Cs(s.cs), id, bytes: s.bytes.clone() });
+        let mut due = Vec::new();
+        for (&id, s) in self.subs.iter() {
+            if s.again.map_or(now >= s.sent + RESEND_NS, |a| now >= a) {
+                due.push(id);
             }
-            if now >= s.first + SILENT_NS {
+            if s.went && now >= s.first + SILENT_NS {
                 silent.push((s.cs, s.what));
             }
+        }
+        for id in due {
+            self.transmit(id, now, &*bufs, out);
         }
         for (cs, what) in silent {
             self.silent(cs, what, now, bufs, out);

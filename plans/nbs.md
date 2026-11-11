@@ -1477,6 +1477,22 @@ each new gate.
       heap, whose window for that class holds about 170 on a 1 GiB host,
       and the client holds one a replica for its resends and clones one
       for every send. The next step's.
+    - **What a request out costs, done** (2026-11-11, after N10d3). A
+      request out keeps no bytes: its stamp -- the session's generation, the
+      map's index, the chunks it names -- and the piece's data, the
+      driver's until the operation is done, make it again as it first went;
+      the bytes are the send's alone (no clone), handed to the mailbox,
+      which keeps them in pages. A write's request is made fallibly
+      (`Request::try_encode`): no room now is a send again in a moment
+      (`AGAIN_NS`), said once, its cs not counted silent for it -- `went`.
+      The cs's answer the same (`Answer::try_encode`): no room is
+      `NotReady`, asked again. Judged by the cluster target's end that
+      starves the writer (nbsclient's `starve` feature, the fuzzer's
+      alone): every host up, writes starved of memory 1.5 s -- each done,
+      none failed, no cs asked out anew meanwhile (an ask asked again goes
+      by its id), each read back; first written and flushed unstarved, as a
+      chunk whose last replica lost what it was given fails a session at
+      its first write. Two mutants (186).
     - **Open, found in N10d2: a flush after one that failed.** The client
       fails, with a flush that failed, those out with it -- and no target
       catches that rule taken out: not one of the cluster target's first

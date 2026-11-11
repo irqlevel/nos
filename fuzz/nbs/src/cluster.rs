@@ -109,6 +109,11 @@ const CLUSTER: [u8; 16] = [5; 16];
 const VOLUME: &str = "v";
 /// The volume: six chunks.
 const VOLUME_MIB: u64 = 24;
+/// How long the writer's write requests find no memory in the end that
+/// starves it (#97): longer than a cs is given to answer.
+const STARVED_NS: u64 = 3 * nbsclient::SILENT_NS;
+/// The writes made while it is starved.
+const STARVED_WRITES: u64 = 6;
 /// A host's disk: room for the volume's chunks, the copy-ups after two
 /// snapshots, and some, in sectors of 4 KiB.
 const DISK_SLOTS: u64 = 20;
@@ -324,6 +329,13 @@ struct Client {
     /// When a flush of its last failed at its deadline: those out with it
     /// fail then too.
     flush_failed_at: Option<u64>,
+    /// Its asks of a cs out of a set, each by its id: one asked again goes
+    /// by the same.
+    downs_asked: BTreeSet<u64>,
+    /// While its writes are starved of memory, until then (#97): and the
+    /// new asks out it made meanwhile.
+    starved_until: u64,
+    asked_starved: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -490,6 +502,17 @@ impl World {
                         if !self.clients[c].s.writes_in(set, cs) {
                             return Err(format!("client {} asked cs {} out of set {}, which its view does not \
                                                 write it in -- {}", c, cs, set, self.clients[c].s.view()));
+                        }
+                        /* A new ask, not one asked again: an ask the leader
+                           said not now to goes again by its id */
+                        if self.clients[c].downs_asked.insert(id) {
+                            if self.now < self.clients[c].starved_until {
+                                self.clients[c].asked_starved += 1;
+                            }
+                            if self.trace {
+                                eprintln!("  [{}] client {} asks cs {} of set {} out, at {} ms: {}", self.step, c, cs,
+                                          set, self.now / MS, self.clients[c].s.report());
+                            }
                         }
                     }
                     let h = self.clients[c].host;
@@ -2453,7 +2476,8 @@ impl World {
         self.clients.push(Client { host: h, s, bufs: Bufs::default(), ops: BTreeMap::new(), next_tag: 1, zombie: false,
                                    dead: false, served: false, unflushed: Vec::new(), quiet: false,
                                    shown: Phase::Attaching, failed: 0, stop_done: false,
-                                   flush_failed_at: None });
+                                   flush_failed_at: None, downs_asked: BTreeSet::new(), starved_until: 0,
+                                   asked_starved: 0 });
         self.outs(c, out)
     }
 
@@ -2818,6 +2842,60 @@ impl World {
         Ok(true)
     }
 
+    /// Writes made while the writer's heap has no room for a request (#97):
+    /// every host up, each write's requests refused memory for longer than
+    /// a cs is given to answer -- sent again in a moment, not taken for the
+    /// cs's silence: no cs asked out anew meanwhile -- then let be: every
+    /// write done, none failed, each read back as written. The blocks are
+    /// written and flushed unstarved first: a chunk whose last replica lost
+    /// what it was given fails the session at its first write, which is no
+    /// starving's. Drawn of `r`, its own.
+    fn starved_writes(&mut self, r: &mut Rng) -> Result<bool, String> {
+        let Some(c) = self.current() else { return Ok(false) };
+        let idle = |w: &World, c: usize| w.clients[c].ops.is_empty() || !w.serving(c);
+        self.drive(c, &|w, c| {
+            w.serving(c) || w.clients[c].zombie || matches!(w.clients[c].s.phase(), Phase::Failed(_) | Phase::Detached)
+        })?;
+        self.drive(c, &idle)?;
+        if !self.serving(c) || self.down.is_some() {
+            return Ok(false);
+        }
+        let blocks = VOLUME_MIB << 20 >> 12;
+        let picks: Vec<(u64, u64)> = (0..STARVED_WRITES).map(|_| (r.below(blocks - 4), 1 + r.below(4))).collect();
+        for &(first, n) in &picks {
+            self.submit_op(c, K::Write(1 + r.below(255) as u8), first, n)?;
+        }
+        self.submit_op(c, K::Flush, 0, 0)?;
+        self.drive(c, &idle)?;
+        if !self.serving(c) || self.down.is_some() {
+            return Ok(false);
+        }
+        let failed = self.clients[c].failed;
+        let until = self.now + STARVED_NS;
+        self.clients[c].s.starve_until(until);
+        self.clients[c].starved_until = until;
+        self.clients[c].asked_starved = 0;
+        for &(first, n) in &picks {
+            self.submit_op(c, K::Write(1 + r.below(255) as u8), first, n)?;
+        }
+        self.drive(c, &idle)?;
+        self.clients[c].starved_until = 0;
+        let starved = self.clients[c].s.report();
+        if !self.serving(c) || self.clients[c].failed != failed {
+            return Err(format!("client {}'s writes starved of memory failed, every host up: {}", c, starved));
+        }
+        if self.clients[c].asked_starved != 0 {
+            return Err(format!("client {} asked {} cs's out while its writes were starved of memory, every host up: \
+                                {}", c, self.clients[c].asked_starved, starved));
+        }
+        for &(first, n) in &picks {
+            self.submit_op(c, K::Read, first, n)?;
+        }
+        self.drive(c, &idle)?;
+        self.count("writes starved of memory, sent again");
+        Ok(true)
+    }
+
     /// The writer now: the newest not lost or taken over.
     fn current(&self) -> Option<usize> {
         (0..self.clients.len()).rev().find(|&c| !self.clients[c].zombie)
@@ -3045,6 +3123,12 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
        own so that the ends above go as they did */
     if !shaped && lost.is_none() && Rng::new(mix(seed, 0x666f_666c)).chance(30) {
         w.found_open_flush().map_err(|e| format!("the end: {}", e))?;
+    }
+    /* Writes whose requests find no memory for a while (#97), drawn of
+       their own, so that the ends they do not shape go as they did */
+    let mut starve = Rng::new(mix(seed, 0x7374_6172));
+    if !shaped && lost.is_none() && starve.chance(30) {
+        w.starved_writes(&mut starve).map_err(|e| format!("the end: {}", e))?;
     }
     /* The stop asked of a writer paused for a snapshot, a write held behind
        the pause -- the word to go on said, lost, or the snapshot applied

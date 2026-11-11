@@ -11,6 +11,12 @@ edition = "2021"
 # and fuzz/nbs's cluster target drives it over a network of its own.
 [lib]
 
+# The fuzzer's alone (fuzz/nbs, #97): a session's write requests made to
+# find no memory until a time (`Session::starve_until`), as a kernel's heap
+# may refuse one -- never in a kernel's build.
+[features]
+starve = []
+
 [dependencies]
 nbscs = { path = "../nbscs" }
 nbsmeta = { path = "../nbsmeta" }

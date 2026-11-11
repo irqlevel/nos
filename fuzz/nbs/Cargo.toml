@@ -15,7 +15,8 @@ edition = "2021"
 nbsmeta = { path = "../../src/crates/common/storage/nbsmeta" }
 nbscs = { path = "../../src/crates/common/storage/nbscs" }
 nbswire = { path = "../../src/crates/common/storage/nbswire" }
-nbsclient = { path = "../../src/crates/common/storage/nbsclient" }
+# With its `starve` seam: the cluster target starves a writer of memory (#97)
+nbsclient = { path = "../../src/crates/common/storage/nbsclient", features = ["starve"] }
 raft = { path = "../../src/crates/common/cluster/raft" }
 
 # No CPU features, as net-fuzz has it and for its reason: the RustCrypto

@@ -439,12 +439,19 @@ impl Server {
     /* ---- requests ---- */
 
     fn answer(&mut self, m: &Message, a: Answer<'_>) {
-        if matches!(a.reply, Reply::Refused(_)) {
+        /* A read's answer is a piece's data: refused for now where the heap
+           has no room for it -- its client asks again in a moment (#97) --
+           never the host's panic */
+        let (bytes, refused) = match a.try_encode() {
+            Some(b) => (b, matches!(a.reply, Reply::Refused(_))),
+            None => (Answer { id: a.id, reply: Reply::Refused(Refusal::NotReady) }.encode(), true),
+        };
+        if refused {
             self.refused += 1;
         } else {
             self.served += 1;
         }
-        let _ = self.link.mb.reply(m, ANSWER, &a.encode());
+        let _ = self.link.mb.reply(m, ANSWER, &bytes);
     }
 
     fn request(&mut self, m: &Message) {

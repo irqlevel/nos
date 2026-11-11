@@ -822,6 +822,22 @@ What it holds to (plans/nbs.md, "Replication: the rules"):
   itself, and written as it is. Refused for now -- the set being joined, or
   a member of it drained -- it is asked again, the write waiting; refused
   for room, its writes fail, said.
+- **What a request out costs.** A write's piece is up to 256 KiB, and its
+  request -- the data and a head of 57 bytes -- a block of 512 KiB of a
+  kernel's heap, whose page-sized blocks come from a window of addresses
+  of their own for each size: on a host of 1 GiB that window holds about
+  170 such blocks, however much is free. So a request out keeps no bytes
+  of it: what made it -- the session's generation, the map's index and the
+  chunks it names, its stamp -- is kept, and the piece's data is the
+  driver's until the operation is done; a resend makes it again as it first
+  went, and the bytes are the send's alone, handed to the mailbox, which
+  keeps them in pages. A request the heap has no room for now is sent again
+  in a moment, said once, its cs not counted silent for it -- never the
+  host's panic (found by hv-nbs-test, the guest of a host whose replica was
+  killed under its write: the session kept a copy a replica of every piece
+  out and cloned one for every send, 192 blocks for a guest's 64 requests
+  of 256 KiB). A cs whose answer -- a read's is a piece's data -- finds no
+  room refuses for now (`NotReady`), asked again in a moment.
 
 ### `nbs io`
 
@@ -1018,12 +1034,16 @@ only its metadata.
   snapshot is dropped -- through the crashes, joins and drains the volume's
   writers meet; dropped now and then, at once where its writer is lost, and
   at the end once every block it holds is held to what its writer did.
+  And now and then its end starves the writer of memory (#97, nbsclient's
+  `starve` feature, the fuzzer's alone): every host up, its writes' requests
+  find no room for longer than a cs is given to answer, then do -- each done,
+  none failed, no cs asked out anew while it was starved, each read back.
 
-  `--mutants` takes a hundred and eighty-four rules out one at a time --
+  `--mutants` takes a hundred and eighty-six rules out one at a time --
   seventy-three of the metadata's, five of them the controller's;
   forty-two of the cs's, twelve of them the copy's and eleven a copy-up's;
   thirty-two of the wire's, its `serve`'s, the mds's, the copy's and the
-  scrub's; thirty-seven of the client's -- each caught.
+  scrub's; thirty-nine of the client's -- each caught.
 - **`fuzz/raft`'s `nbsmeta` target**: the members' part of the state, its
   commands from pools of names and incarnations that meet and from wide ones
   that fill the cluster. There are four scenarios and six mutants.
