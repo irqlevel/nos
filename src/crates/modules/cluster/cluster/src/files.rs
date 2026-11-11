@@ -59,6 +59,8 @@ pub struct Known {
     pub name: String,
     pub node: u64,
     pub ip: u32,
+    /// Its port, 0 for ipcnet's own (#99).
+    pub port: u16,
     pub keys: Vec<[u8; 32]>,
 }
 
@@ -86,10 +88,10 @@ pub fn read_member(dir: &Dir) -> Result<Option<Member>, String> {
     let mut hosts: Vec<Known> = Vec::new();
     for line in lines.filter(|l| !l.trim().is_empty()) {
         let words: Vec<&str> = line.split_whitespace().collect();
-        let bad = || alloc::format!("{}: \"{}\" is not `<host> <node> <ip> <key> [<key>]`", path, line);
+        let bad = || alloc::format!("{}: \"{}\" is not `<host> <node> <ip>[:<port>] <key> [<key>]`", path, line);
         let [host, n, ip, keys @ ..] = words.as_slice() else { return Err(bad()) };
         let n: u64 = n.parse().map_err(|_| bad())?;
-        let ip = crate::parse_ip(ip).ok_or_else(bad)?;
+        let (ip, port) = crate::parse_addr(ip).ok_or_else(bad)?;
         let keys: Option<Vec<[u8; 32]>> = keys.iter().map(|k| unhex::<32>(k)).collect();
         let keys = keys.ok_or_else(bad)?;
         if n == 0 || !registry::valid_name(host) || keys.is_empty() || keys.len() > registry::KEYS_MAX
@@ -97,7 +99,7 @@ pub fn read_member(dir: &Dir) -> Result<Option<Member>, String> {
         {
             return Err(bad());
         }
-        hosts.push(Known { name: String::from(*host), node: n, ip, keys });
+        hosts.push(Known { name: String::from(*host), node: n, ip, port, keys });
     }
     Ok(Some(Member { node, cluster, name: String::from(*name), hosts }))
 }
@@ -108,7 +110,7 @@ pub fn create_member(dir: &Dir, m: &Member) -> Result<(), String> {
     let _ = kcore::fs::create_dir(&dir.root);
     let mut text = alloc::format!("{} {} {}\n", m.node, hex(&m.cluster), m.name);
     for h in &m.hosts {
-        let _ = write!(text, "{} {} {}", h.name, h.node, crate::Ip(h.ip));
+        let _ = write!(text, "{} {} {}", h.name, h.node, crate::IpPort(h.ip, h.port));
         for k in &h.keys {
             let _ = write!(text, " {}", hex(k));
         }

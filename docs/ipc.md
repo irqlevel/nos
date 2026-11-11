@@ -323,9 +323,14 @@ hosts and back.
   rekey`), the server and every peer's clients made anew with it and the
   connections up kept. It answers while the module is loaded, serving or
   not (docs/cluster.md).
-- **Two TCP connections a peer**, control and bulk, on one port (39240), on
-  the interface hosts.toml names (eth0 unless told; never hv0, so that no
-  guest reaches it). The listener answers the peers' addresses alone: to
+- **Two TCP connections a peer**, control and bulk, on the host's one port
+  -- 39240 unless hosts.toml's `port` says another -- on the interface
+  hosts.toml names (eth0 unless told; never hv0, so that no guest reaches
+  it). A peer is called at the port its address says, `<ip>:<port>` in
+  hosts.toml and in the registry, and at 39240 where it says none: two
+  hosts behind one address, a NAT's, are told apart by their ports, and
+  each is known by its key and its Hello, the address the connection
+  comes from checked to be the peer's (#99). The listener answers the peers' addresses alone: to
   anyone else the port is not there, no SYN-ACK and no reset, and no slot
   taken (TCP's allowlist, plans/tcp.md T3). At most two handshakes at once,
   one a source, each given 3 s. Each connection has a link's 20 ms floor
