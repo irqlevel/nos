@@ -29,6 +29,8 @@ ulong early_device_limit;
 bool BuiltinPageTable::setup()
 {
     auto& board = Board::get_instance();
+    /* The lowest region's start and the highest one's end: the tree lists
+       them in no promised order, and the first was taken for the lowest */
     ulong ram_base = board.mem_regions_[0].addr;
     ulong ram_end = ram_base;
     for (ulong i = 0; i < board.mem_region_count_; i++)
@@ -36,6 +38,8 @@ bool BuiltinPageTable::setup()
         ulong end = board.mem_regions_[i].addr + board.mem_regions_[i].size;
         if (end > ram_end)
             ram_end = end;
+        if (board.mem_regions_[i].addr < ram_base)
+            ram_base = board.mem_regions_[i].addr;
     }
 
     auto& l0_entry = p4_page_.entry[256];
