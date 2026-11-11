@@ -155,17 +155,20 @@ void Serial::panic_print_string(const char *str)
     if (!present_)
         return;
 
+    /* Each character waited for as wait() waits, and no longer: a
+       transmitter that never empties -- a UART that answered the probe and
+       then went quiet -- kept this loop for good, and the screen, the
+       netconsole and the disk log after it never had the report. Such a
+       character is written anyway, into whatever the UART makes of it. */
     while (*str)
     {
         char c = *str++;
         if (c == '\n')
         {
-            while (!is_transmit_empty())
-                cpu_relax();
+            wait();
             outb(PORT, '\r');
         }
-        while (!is_transmit_empty())
-            cpu_relax();
+        wait();
         outb(PORT, c);
     }
 }
