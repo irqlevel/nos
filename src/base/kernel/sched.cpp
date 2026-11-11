@@ -194,10 +194,6 @@ void TaskQueue::switch_complete(Task* curr)
            itself, and it is not running. */
         bool runnable = prev->run_state_.get() == Task::RUN_QUEUED && !prev->is_idle();
         auto task_queue = runnable ? prev->select_next_task_queue() : nullptr;
-        /* Moved because this CPU is out of its affinity (set_task_affinity),
-           not for a lighter queue: the CPU it goes to may be halted, with
-           nothing to look at its queue until its next tick -- it is told */
-        bool evicted = task_queue != nullptr && out_of_affinity(prev);
 
         /* schedule()'s count should be the only one left: the locks
            TaskQueue::schedule took in prev were released above, in this
@@ -233,8 +229,16 @@ void TaskQueue::switch_complete(Task* curr)
                 tp::emit_sched_migrate(prev, from, task_queue->index());
             task_queue->insert(prev);
             prev->put();
-            if (evicted)
-                CpuTable::get_instance().get_cpu(task_queue->index()).send_ipi_self();
+            /* And the CPU it went to is told, whatever moved it. It used to
+               be told only of a task evicted by its affinity; one moved for
+               a lighter queue went, as often as not, to a CPU with nothing
+               to run -- which is what made it the lighter -- halted, and
+               looking at its queue again only at its next interrupt: the
+               task waited a tick there to save a slice here. A CPU that is
+               running something decides again for the same reason: alone on
+               its queue until now, it has no slice's end armed
+               (arm_slice). */
+            CpuTable::get_instance().get_cpu(task_queue->index()).send_ipi_self();
         }
         else
         {
