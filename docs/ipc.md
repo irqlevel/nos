@@ -370,6 +370,16 @@ hosts and back.
   the median on `scripts/hub.py`'s LAN under HVF, where it was 7 ms while
   the task polled; what is left of polling is a send waiting for room in
   TCP's buffer, a millisecond at a time.
+- **No wait while there is more to send**: a turn puts at most 64 KiB of
+  TLS into the session (`MAX_PENDING`) and flushes it to TCP; where TCP took
+  all of it and more frames wait, the task wakes its own socket before the
+  read, which then comes back at once when nothing has arrived, and the
+  next turn goes on. Before, the read waited out its millisecond for data
+  that was not coming: a turn of 64 KiB took some 2.4 ms, ~27 MB/s a
+  connection whatever the link -- the same between two VMs on one bridge
+  as between the EX44 and the AX41 (plans/nbs.md, N11). A 256 KiB message
+  there and back went from 25 ms to 9 ms; a connection's task, all of TLS
+  on it in software, is then most of a CPU at ~53 MB/s each way.
 
 `ipcnet` says each peer's state -- up and as which number, or down and why
 -- and what went between them; `ipc ping kernel.echo@<host>` sends to a

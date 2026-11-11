@@ -578,6 +578,21 @@ What `nbscs` shows is what the cs's task last made of itself: at the end of
 a turn that fenced, closed, freed or took a device in, and once a second
 otherwise -- the shell never waits on the cs's devices.
 
+The cs serves one request at a time, each to its device and back, in the
+order they came -- but the leader's look (`Op::Ping`), taken out of the
+mailbox with everything else that has come at the start of every turn, is
+answered there, ahead of what waits: a look says whether the cs is there,
+not how long its queue is. A writer's stop closes every chunk it wrote on
+every replica at once, each close a write of the chunk's record twice with
+a flush after each; where a flush takes 10 ms -- a VM on a RAID1 of NVMe --
+a stop that had written 140 chunks is seconds of closes at one cs. A look
+that waited behind them missed its 250 ms, and the leader took a cs that
+was serving all along out of its sets, to be copied anew: on the hardware
+every stop of a busy writer did (plans/nbs.md, N11). A cs stuck in one
+request -- its device not answering -- answers no look, as before. What
+the cs takes out of its mailbox this way is held to the mailbox's own
+bytes, so that a look never makes room for as much again.
+
 ### Its devices
 
 Every 5 s the cs asks this host's mds which cs it is and which devices it

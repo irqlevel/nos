@@ -32,7 +32,10 @@ what it stores, then a volume's bytes through the chunk servers.
   end, from the writer's host and read-only from the others -- flushed, its
   chunks open on every cs, then closed; a writer on another host refused,
   then forced: its fences refuse the old writer's writes and reads; a host
-  booted again with its data, its fence and its open marks; a snapshot of a
+  booted again with its data, its fence and its open marks; a cs slow, not
+  silent (N11) -- c's pool throttled by QEMU, a writer stopped that opened
+  32 chunks, seconds of closes queued at c -- left in its set, the leader's
+  look answered ahead of its queue; a snapshot of a
   volume its writer writes (N10c2) -- asked on another host, refused,
   naming the writer's; asked on the writer's host, a member that need not
   lead, its session (`nbs io`'s, driven by the snapshot's command while it
@@ -129,6 +132,11 @@ OUT_S = 10
 LATE = "d"
 ALL = HOSTS + [LATE]
 CHUNK_MIB = 4
+# A slow cs (N11): c's pool held to this many operations a second while a
+# writer that opened this many chunks stops -- some seconds of closes queued
+# at c, each closed one at a time.
+BURST_IOPS = 40
+BURST_CHUNKS = 32
 
 
 def part_slots(sectors):
@@ -711,6 +719,42 @@ def main():
         out = b.run("nbsload disk1 randread secs=2 qd=8 span=8")
         check("and reads on b, read-only", re.search(r"\d+ reads: \d+ IOPS", out) is not None and "nbsload:" not in out,
               out)
+
+        # -- a cs slow, not silent (N11): c's pool throttled by QEMU to
+        # BURST_IOPS operations a second -- a close's two table writes among
+        # them -- and a writer's stop, which closes every chunk it opened on
+        # every replica at once: a burst c serves one at a time, seconds of
+        # queue. The client asks c out of the set after 0.5 s; the leader's
+        # look (`Op::Ping`, 250 ms) is answered ahead of c's queue, so c
+        # stays. Before, the look waited behind the closes, and every stop of
+        # a writer that had written many chunks took the slower hosts out of
+        # its sets, to be copied anew (found on the hardware, N11) --
+        out = a.run("nbs volume create burst %d" % (BURST_CHUNKS * CHUNK_MIB))
+        need("a volume of %d chunks" % BURST_CHUNKS, "nbs: volume burst" in out, out)
+        taken = len(re.findall(r"taken out of volume burst", a.run("dmesg 65536 nbs")))
+        outs = [a.run("nbs io write burst %d 4096 0x5b" % (k * (CHUNK_MIB << 20))) for k in range(BURST_CHUNKS)]
+        check("a writes a block into each of burst's chunks, each open on every replica",
+              all("written at" in o for o in outs), [o for o in outs if "written at" not in o][:3])
+        # c slowed once the chunks are open: its closes alone queued, each a
+        # short request -- a fence or an open mark on a slowed device is one
+        # long one, which a look rightly waits behind
+        ipct.hmp(qmp(2), "block_set_io_throttle more0 0 0 0 %d 0 0" % BURST_IOPS)
+        try:
+            t0 = time.time()
+            out = a.run("nbs io detach burst")
+            took = time.time() - t0
+        finally:
+            ipct.hmp(qmp(2), "block_set_io_throttle more0 0 0 0 0 0 0")
+        check("a detaches burst, every chunk closed on c one at a time, c in its set throughout: %.1f s" % took,
+              "burst detached" in out and took > 0.5, out)
+        log = a.run("dmesg 65536 nbs")
+        check("c not taken out of burst's set for the length of its queue: the leader's look answered ahead of it",
+              len(re.findall(r"taken out of volume burst", log)) == taken,
+              [l for l in log.split("\n") if "burst" in l][-6:])
+        check("burst's chunks at three replicas still", ipct.wait_for(lambda: whole(a), 30, 1),
+              [x.run("nbs status") for x in sh])
+        out = a.run("nbs volume delete burst")
+        check("burst deleted", "deleted" in out, out)
 
         # -- a snapshot of a volume its writer writes (N10c2): asked on the
         # writer's host -- b's, a member that need not lead -- its session

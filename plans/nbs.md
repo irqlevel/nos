@@ -1534,6 +1534,43 @@ each new gate.
   replication (the writer's NIC sending one copy instead of two), TCP's T4
   (SACK, RACK-TLP) if retransmissions cost,
   a UDP bulk path on a private link only if TCP measures as the limit.
+  - **Where it ran** (2026-11-11): the EX44's bare metal, nos at the branch's
+    head, NBS on its 15 GiB p6; two nos VMs under KVM on the AX41 -- 4 vCPUs
+    and 4 GiB each, a raw file O_DIRECT on the AX41's RAID1 of NVMe for the
+    pool, tap and vhost on a bridge -- behind the AX41's one address, each at
+    a port of its own (#99: a host's address is `ip[:port]`); the hairpin
+    between the two SNATed to that address, so that ipcnet's check of where
+    a peer comes from holds. A volume of 8 GiB, its replicas on the three.
+  - **The devices alone** (blkload): the EX44's p6, 332 MiB/s written, 4 KiB
+    writes at queue depth 1 in 10 us, a flush 1.2 ms; a VM's pool, 4 KiB
+    writes in 58 us, a flush 10 ms.
+  - **First numbers**: 256 KiB writes at 24-30 MiB/s whatever the depth from
+    2, 8 MiB/s at depth 1 (24 ms each). TCP was never the limit -- the
+    connections near empty, windows open, no timeout -- nor a CPU. The same
+    ~30 MB/s between the two VMs on one bridge: ipcnet's link loop. A turn
+    put 64 KiB into the session, TCP sent it in a few hundred microseconds,
+    and the read then waited out its millisecond for data that was not
+    coming -- 64 KiB a turn of 2.4 ms. Fixed: the loop wakes its own socket
+    when more waits and TCP took all of it (docs/ipc.md). 256 KiB there and
+    back, 25 -> 9 ms; writes 22 MiB/s at depth 1, 52 at 2.
+  - **Every busy writer's stop took the slower replicas out.** A stop closes
+    every chunk written, on every replica, at once; a close is the chunk's
+    record written twice with a flush after each; the cs serves one request
+    at a time. On a VM's 10 ms flush, 140 closes were seconds of queue at
+    each AX41 cs; the client asked them out after 0.5 s, and the leader's
+    look (`Op::Ping`, 250 ms), behind the same queue, found them silent:
+    both out of the set, then copied anew (2.6 GB at 48 MB/s). Fixed: the
+    cs answers looks ahead of its queue (docs/nbs.md, "The chunk server");
+    nbs-test's N11 phase throttles c's pool through QEMU's monitor and
+    holds c in its set through a stop's closes -- the tree before fails it.
+  - **What the numbers ask next**: closes a cs makes durable together, one
+    write of each table page and two flushes for all that came at once,
+    where today each costs three flushes (a VM's stop of 140 chunks is ~4 s
+    of them); a cs with more than one request at its device at a time (the
+    `DiskQueue` is one slot); and the CPU -- at ~53 MB/s each way a
+    connection's task is most of a CPU, all of TLS in software, as the
+    kernel keeps SSE off. Chain replication and a UDP path wait on these:
+    the link and TCP were not the limit.
 
 ## What to expect
 
