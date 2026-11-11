@@ -1635,12 +1635,18 @@ each new gate.
       some 30 ms on a VM instead of ~4 s.
   - **The device queue**: a flush started and reaped as a write is
     (`IO_FLUSH` on the asynchronous path, which NVMe has); and virtio-blk
-    given the asynchronous path, which it does not have -- the VMs' pools
-    are virtio disks the queue serves synchronously today.
+    given the asynchronous path -- the VMs' pools are virtio disks, which
+    the queue served synchronously before it.
   - **Steps**:
-    - **N12a**, the block layer: the queue's flush, virtio-blk's
-      asynchronous path. Gates: the smoke boots, fs-fuzz (its disk model's
-      asynchronous path), netblk-test, hv-test.
+    - **N12a**, the block layer -- done: virtio-blk's asynchronous path,
+      once its interrupt is in place (a request in a slot of its own, its
+      caller told from the completion; a flush where the device has a write
+      cache; one request at most `size_max`, 256 KiB unless the device says
+      less). The image's fast path now takes a virtio-blk root as it takes
+      an NVMe one -- hv-test's disk trace holds it to that. The queue's
+      flush (`DiskQueue::start_flush`) waits for N12c, its first caller.
+      Gates: the smoke boots both arches, netblk-test and parttest (arm64,
+      every disk virtio-blk), nbs-test both arches, fs-fuzz, hv-test.
     - **N12b**, the engine planned, the table pages committed together:
       nbs-fuzz's `cs` target over a disk whose completions come in any order
       and whose power is cut with requests in flight -- a write out may or
@@ -1648,7 +1654,7 @@ each new gate.
       began -- its judge promising what it promises now; a mutant for each
       ordering rule.
     - **N12c**, nbs-cs's loop on one event, requests in flight up to the
-      queue's buffers; nbswire's serve, copy and scrub over the planned
+      queue's buffers, the queue's flush started and reaped as a write is; nbswire's serve, copy and scrub over the planned
       engine. Gates: nbs-fuzz's every target and its mutants, nbs-test
       (its N11 phase throttled from the first write: a look answered even
       during a long request), hv-nbs-test.
