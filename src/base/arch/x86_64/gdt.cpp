@@ -48,6 +48,11 @@ void Gdt::setup_tss_self(ulong cpu_index)
     load_tr((u16)((TSS_ENTRY_BASE + 2 * cpu_index) * sizeof(GdtDescriptor)));
 }
 
+void Gdt::setup_boot_tss()
+{
+    setup_tss_self(BOOT_TSS_SLOT);
+}
+
 void Gdt::save()
 {
     TableDesc desc = {

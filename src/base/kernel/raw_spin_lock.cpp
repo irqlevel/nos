@@ -22,6 +22,16 @@ RawSpinLock::~RawSpinLock()
         Watchdog::get_instance().unregister_spin_lock(*this);
 }
 
+void RawSpinLock::unwatch()
+{
+    if (!watched_)
+        return;
+
+    Watchdog::get_instance().unregister_spin_lock(*this);
+    watched_ = false;
+    watchdog_lock_time_.set(0);
+}
+
 /* Raw cycle counter, not get_boot_time(): this runs on every lock in the
    kernel. 0 is the "not held" marker the watchdog reads, so a counter that
    happens to read exactly 0 is nudged rather than losing the timestamp. */

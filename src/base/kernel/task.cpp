@@ -13,6 +13,7 @@
 #include "symtab.h"
 #include "tracepoint.h"
 #include <mm/new.h>
+#include <mm/page_table.h>
 
 namespace kernel
 {
@@ -36,6 +37,7 @@ Task::Task()
     , cpu_affinity_(~(0UL))
     , pid_(INVALID_OBJECT_ID)
     , stack_ptr_(nullptr)
+    , stack_guard_(nullptr)
     , function_(nullptr)
     , ctx_(nullptr)
 {
@@ -75,9 +77,43 @@ void Task::release()
     {
         klog(TASK_LL, "task 0x%p %s free stack 0x%lX",
             this, name_, (ulong)stack_ptr_);
-        delete stack_ptr_;
-        stack_ptr_ = nullptr;
+        free_stack();
     }
+}
+
+bool Task::guard_stack()
+{
+    BUG_ON(stack_guard_ != nullptr);
+
+    const ulong guard = (ulong)&stack_ptr_->guard[0];
+    mm::Page* page = mm::PageTable::get_instance().unmap_page(guard);
+    if (page == nullptr)
+        return false;
+    stack_guard_ = page;
+
+    /* On every CPU, not this one alone: the block was somebody's before,
+       and a CPU that still had the page in its TLB would run a stack
+       through the guard as if it were not there */
+    CpuTable::get_instance().invalidate_tlb_range(guard, 1);
+    return true;
+}
+
+void Task::free_stack()
+{
+    /* Mapped again before the block goes back: the heap writes into a freed
+       block's first words, and hands it out whole. unmap_page left the
+       frame's count as the mapping had made it, so the count map_page adds
+       is given back. */
+    if (stack_guard_ != nullptr)
+    {
+        if (!mm::PageTable::get_instance().map_page((ulong)&stack_ptr_->guard[0], stack_guard_))
+            PANIC("task %s: the page under its stack could not be mapped back", name_);
+        stack_guard_->put();
+        stack_guard_ = nullptr;
+    }
+
+    delete stack_ptr_;
+    stack_ptr_ = nullptr;
 }
 
 void Task::get()
@@ -424,7 +460,8 @@ bool Task::locate_switched(Where& where)
        so a look that loses the race names wrong frames and is thrown away,
        and never faults. */
     long switches = context_switches_.get();
-    ulong base = (ulong)stack_ptr_;
+    /* From above the guard page, which is not there to read */
+    ulong base = (ulong)&stack_ptr_->stack_bottom[0];
     ulong limit = (ulong)&stack_ptr_->stack_top[0];
     ulong sp = __atomic_load_n(&rsp_, __ATOMIC_RELAXED);
 
@@ -576,10 +613,16 @@ bool Task::prepare_start(Func func, void* ctx)
     klog(TASK_LL, "task 0x%p %s stack 0x%lX top 0x%lX",
         this, name_, (ulong)stack_ptr_, (ulong)&stack_ptr_->stack_top[0]);
 
+    if (!guard_stack())
+    {
+        klog(0, "task %s: the page under its stack could not be unmapped", name_);
+        free_stack();
+        return false;
+    }
+
     if (!TaskTable::get_instance().insert(this))
     {
-        delete stack_ptr_;
-        stack_ptr_ = nullptr;
+        free_stack();
         return false;
     }
 
@@ -591,6 +634,15 @@ bool Task::prepare_start(Func func, void* ctx)
 
 bool Task::start(Func func, void* ctx)
 {
+    /* Where it will go, before anything is taken for it: with no CPU of its
+       affinity running there is nowhere, and found out after prepare_start
+       -- as it used to be -- the stack, the pid and the task table's two
+       references stayed taken for good, the caller's put() of a start that
+       failed never being the last. */
+    auto task_queue = select_next_task_queue();
+    if (task_queue == nullptr)
+        return false;
+
     if (!prepare_start(func, ctx))
         return false;
 
@@ -600,17 +652,24 @@ bool Task::start(Func func, void* ctx)
     start_time_ = get_boot_time();
     state_.set(STATE_WAITING);
 
-    auto task_queue = select_next_task_queue();
-    if (task_queue == nullptr)
-        return false;
-
     /* The first queue it lives on, recorded before the insert: from there it
        can run -- an interrupt the insert's unlock lets in may switch to it on
        this very CPU -- and a record after could come after its first
        switch, or its exit. */
     if (unlikely(tp::on(tp::Id::SchedNew)))
         tp::emit_sched_new(this, task_queue->index());
+    const ulong cpu = task_queue->index();
     task_queue->insert(this);
+
+    /* Another CPU's queue: that CPU is told. Halted with nothing to run, it
+       looks at its queue again only at its next interrupt, and a task
+       started there waited out a tick before its first instruction; a task
+       woken there has always been announced by its waker (Event::signal).
+       This CPU's own is looked at when this task next lets go of it, or at
+       its next interrupt. `this` is not touched again: from the insert on
+       the task may run, exit and be let go of. */
+    if (cpu != CpuTable::get_instance().get_current_cpu_id())
+        CpuTable::get_instance().get_cpu(cpu).send_ipi_self();
     return true;
 }
 
@@ -649,7 +708,7 @@ Task* Task::get_current_task()
     if (BUG_ON(stack_ptr->magic2 != STACK_MAGIC2))
         return nullptr;
 
-    if (BUG_ON(rsp < ((ulong)&stack_ptr->stack_bottom[0] + consts::PAGE_SIZE)))
+    if (BUG_ON(rsp < (ulong)&stack_ptr->stack_bottom[0]))
         return nullptr;
 
     if (BUG_ON(rsp > (ulong)&stack_ptr->stack_top[0]))
@@ -673,7 +732,7 @@ Task* Task::try_get_current_task()
     if (stack_ptr->magic1 != STACK_MAGIC1 || stack_ptr->magic2 != STACK_MAGIC2)
         return nullptr;
 
-    if (rsp < ((ulong)&stack_ptr->stack_bottom[0] + consts::PAGE_SIZE))
+    if (rsp < (ulong)&stack_ptr->stack_bottom[0])
         return nullptr;
 
     if (rsp > (ulong)&stack_ptr->stack_top[0])
@@ -696,8 +755,8 @@ void Task::diagnose_get_current_task()
     klog(0, "DiagTask: rsp 0x%lX base 0x%lX", rsp, (ulong)stack_ptr);
     klog(0, "DiagTask: Magic1 0x%lX expect 0x%lX", stack_ptr->magic1, STACK_MAGIC1);
     klog(0, "DiagTask: Magic2 0x%lX expect 0x%lX", stack_ptr->magic2, STACK_MAGIC2);
-    klog(0, "DiagTask: stack_bottom+page 0x%lX stack_top 0x%lX",
-        (ulong)&stack_ptr->stack_bottom[0] + consts::PAGE_SIZE,
+    klog(0, "DiagTask: stack_bottom 0x%lX stack_top 0x%lX",
+        (ulong)&stack_ptr->stack_bottom[0],
         (ulong)&stack_ptr->stack_top[0]);
 
     if (stack_ptr->magic1 == STACK_MAGIC1 && stack_ptr->magic2 == STACK_MAGIC2)
@@ -1022,7 +1081,7 @@ void TaskTable::stacks(stdlib::Printer& printer, ulong& worst_free)
                 continue;
 
             printer.printf("task %lu %lu %lu %s\n", task->pid_,
-                (ulong)Task::STACK_SIZE - free, (ulong)Task::STACK_SIZE, task->get_name());
+                (ulong)Task::STACK_USABLE - free, (ulong)Task::STACK_USABLE, task->get_name());
 
             if (free < worst_free)
                 worst_free = free;
@@ -1057,7 +1116,7 @@ void TaskTable::ps(stdlib::Printer& printer)
             if (task->is_blocked())
                 flags |= 1UL << Task::FLAG_BLOCKED_BIT;
             stdlib::Time runtime(task->get_runtime_ns());
-            printer.printf("%lu %lu 0x%lX %lu.%lu %lu %s\n",
+            printer.printf("%lu %lu 0x%lX %lu.%06lu %lu %s\n",
                 task->pid_, task->state_.get(), flags, runtime.get_secs(),
                 runtime.get_usecs(), task->context_switches_.get(), task->get_name());
         }

@@ -44,6 +44,10 @@ bool Serial::is_present()
     return present_;
 }
 
+/* A line status register with every bit set: no UART's status, what a port
+   nothing decodes reads as (interrupt) */
+static const u8 LSR_NOTHING_THERE = 0xFF;
+
 void Serial::send()
 {
     ulong flags;
@@ -155,17 +159,20 @@ void Serial::panic_print_string(const char *str)
     if (!present_)
         return;
 
+    /* Each character waited for as wait() waits, and no longer: a
+       transmitter that never empties -- a UART that answered the probe and
+       then went quiet -- kept this loop for good, and the screen, the
+       netconsole and the disk log after it never had the report. Such a
+       character is written anyway, into whatever the UART makes of it. */
     while (*str)
     {
         char c = *str++;
         if (c == '\n')
         {
-            while (!is_transmit_empty())
-                cpu_relax();
+            wait();
             outb(PORT, '\r');
         }
-        while (!is_transmit_empty())
-            cpu_relax();
+        wait();
         outb(PORT, c);
     }
 }
@@ -253,9 +260,33 @@ void Serial::interrupt(Context* ctx)
     if (unlikely(tp::Irq::on()))
         irq.begin((u32)int_vector_, tp::IrqKind::Serial);
 
-    /* Check for received data (LSR bit 0 = Data Ready) */
-    while (inb(PORT + 5) & 0x01)
+    /* No UART, no handler's work: the port reads all ones, data ready
+       among them, for ever */
+    if (!present_)
     {
+        hal::irq_eoi(int_vector_);
+        return;
+    }
+
+    /* Check for received data (LSR bit 0 = Data Ready) */
+    for (;;)
+    {
+        u8 lsr = inb(PORT + 5);
+
+        /* Every bit of the status up at once is no UART's status: break,
+           both errors, an overrun and an empty transmitter with data ready.
+           It is what a port nothing decodes reads as -- a UART that
+           answered the probe and is gone -- and a loop on its data-ready
+           bit would never end, here with interrupts off. Its interrupts
+           are turned off, should anything be there to hear it. */
+        if (lsr == LSR_NOTHING_THERE)
+        {
+            outb(PORT + 1, 0x00);
+            break;
+        }
+        if (!(lsr & 0x01))
+            break;
+
         u8 data = inb(PORT);
         char c = (char)data;
         u8 code = 0;

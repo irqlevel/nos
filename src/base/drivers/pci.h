@@ -134,7 +134,7 @@ private:
 
     u8 get_revision_id(u16 bus, u16 device, u16 function);
 
-    static const ulong MAX_DEVICES = 64;
+    static const ulong MAX_DEVICES = 256;
     DeviceInfo devices_[MAX_DEVICES];
     ulong device_count_;
 };

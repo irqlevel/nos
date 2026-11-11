@@ -10,6 +10,9 @@
  * with the vector index as the second argument.
  */
 
+/* A CPU's overflow stack is 1 << this bytes (exception_arm64.cpp) */
+#define ARM64_OVERFLOW_STACK_SHIFT 14
+
 .macro SAVE_CONTEXT
     sub     sp, sp, #(36 * 8)
     stp     x0, x1, [sp, #(0 * 8)]
@@ -63,11 +66,83 @@
 
     .text
 
+/*
+ * An exception here is taken on the stack it interrupted: there is none
+ * of its own. A data abort at an address within a page of the stack
+ * pointer is that stack having run out -- into the page under a task's
+ * stack, which is not mapped -- or not being there at all, and the context
+ * saved on it would be the same fault again, and again, each one further
+ * down. That one is taken on the CPU's overflow stack instead, where it can
+ * be reported (arm_stack_fault_entry). x0 and x1 are kept in TPIDR_EL0 and
+ * TPIDRRO_EL0 meanwhile, which nothing else in this kernel uses.
+ */
 vec_sync:
+    msr     tpidr_el0, x0
+    msr     tpidrro_el0, x1
+    mrs     x0, esr_el1
+    lsr     x0, x0, #26
+    cmp     x0, #0x25                   /* a data abort from this EL */
+    b.ne    1f
+    mrs     x0, far_el1
+    mov     x1, sp
+    sub     x0, x0, x1
+    add     x0, x0, #0x1000
+    cmp     x0, #0x2000                 /* far in [sp - 4096, sp + 4096) */
+    b.lo    vec_stack_fault
+1:
+    mrs     x1, tpidrro_el0
+    mrs     x0, tpidr_el0
     SAVE_CONTEXT
     mov     x0, sp
     bl      arm_sync_entry
     RESTORE_CONTEXT_ERET
+
+vec_stack_fault:
+    /* This CPU's overflow stack: its index is in TPIDR_EL1 (boot.S) */
+    mrs     x0, tpidr_el1
+    add     x0, x0, #1
+    lsl     x0, x0, #ARM64_OVERFLOW_STACK_SHIFT
+    adrp    x1, arm64_overflow_stacks
+    add     x1, x1, :lo12:arm64_overflow_stacks
+    add     x0, x1, x0
+    mov     x1, sp                      /* the stack pointer that ran out */
+    mov     sp, x0
+
+    /* The context, as SAVE_CONTEXT makes it, but for the stack pointer:
+       the one the exception was taken with, not this stack's */
+    sub     sp, sp, #(36 * 8)
+    str     x1, [sp, #(31 * 8)]
+    mrs     x1, tpidrro_el0
+    mrs     x0, tpidr_el0
+    stp     x0, x1, [sp, #(0 * 8)]
+    stp     x2, x3, [sp, #(2 * 8)]
+    stp     x4, x5, [sp, #(4 * 8)]
+    stp     x6, x7, [sp, #(6 * 8)]
+    stp     x8, x9, [sp, #(8 * 8)]
+    stp     x10, x11, [sp, #(10 * 8)]
+    stp     x12, x13, [sp, #(12 * 8)]
+    stp     x14, x15, [sp, #(14 * 8)]
+    stp     x16, x17, [sp, #(16 * 8)]
+    stp     x18, x19, [sp, #(18 * 8)]
+    stp     x20, x21, [sp, #(20 * 8)]
+    stp     x22, x23, [sp, #(22 * 8)]
+    stp     x24, x25, [sp, #(24 * 8)]
+    stp     x26, x27, [sp, #(26 * 8)]
+    stp     x28, x29, [sp, #(28 * 8)]
+    str     x30, [sp, #(30 * 8)]
+    mrs     x1, elr_el1
+    mrs     x2, spsr_el1
+    stp     x1, x2, [sp, #(32 * 8)]
+    mrs     x1, esr_el1
+    mrs     x2, far_el1
+    stp     x1, x2, [sp, #(34 * 8)]
+
+    mov     x0, sp
+    bl      arm_stack_fault_entry
+    /* It does not return: what was interrupted has no stack to go back to */
+2:
+    wfi
+    b       2b
 
 vec_irq:
     SAVE_CONTEXT

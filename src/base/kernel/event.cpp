@@ -5,6 +5,7 @@
 #include "cpu.h"
 #include "panic.h"
 
+#include <hal/barrier.h>
 #include <hal/cpu.h>
 #include <hal/irqchip.h>
 
@@ -39,12 +40,27 @@ void Event::wait()
        over the slot, and each signal() would then wake one of the two. */
     BUG_ON(waiter_.cmpxchg((long)self, 0) != 0);
 
+    /* A CPU's idle task waits without leaving the scheduler's walk: it is
+       the last resort, switched to when nothing else on its CPU can run,
+       and found asleep there it was a BUG_ON in the scheduler, far from the
+       wait that put it to sleep -- the boot's own task is one, and what it
+       calls is not always its to know (a module's command waiting on a
+       mailbox). It lets whoever can run have the CPU and looks again, as
+       sleep() does there. */
+    const bool may_block = !self->is_idle();
+
     for (;;)
     {
         /* A signal already there is taken without blocking at all -- which
            is the common case for a waiter that is busy when it is signalled. */
         if (signaled_.cmpxchg(0, 1) == 1)
             break;
+
+        if (unlikely(!may_block))
+        {
+            schedule();
+            continue;
+        }
 
         /* Interrupts off from the moment the flag goes up until it is down
            again. The tick and every IPI end in a schedule() of their own, and
@@ -85,6 +101,8 @@ bool Event::wait_for(unsigned long long timeout_ns)
     ulong start = get_boot_time().get_value();
     ulong until = (timeout_ns > ~0UL - start) ? ~0UL : start + (ulong)timeout_ns;
     bool signaled = false;
+    /* As in wait(): an idle task polls */
+    const bool may_block = !self->is_idle();
 
     for (;;)
     {
@@ -95,6 +113,12 @@ bool Event::wait_for(unsigned long long timeout_ns)
         }
         if (get_boot_time().get_value() >= until)
             break;
+
+        if (unlikely(!may_block))
+        {
+            schedule();
+            continue;
+        }
 
         /* wait()'s window, interrupts off from the flag going up until it is
            down again, with the deadline beside it for the scheduler: a
@@ -174,10 +198,34 @@ void Event::signal()
 void Event::signal_holding(ulong hold_ns)
 {
     /* Published first. A plain read before the locked operation, so a burst
-       of signals to a busy waiter costs one locked instruction, not one
-       each. */
+       of signals to a busy waiter does not take the event's line from it
+       for each.
+
+       But with the flag found up nothing here was a locked instruction, and
+       the flag is not all a signal publishes: what the caller made for the
+       waiter just before -- a completion pushed onto a lock-free ring, its
+       last steps plain stores -- may still be in this CPU's store buffer.
+       The waiter that takes the flag now and looks for its work then does
+       not see it, finds nothing, and goes back to sleep on a flag this call
+       left as it was: work queued, the waiter asleep, and no signal owed.
+       On x86 a store followed by a load is the one pair the CPU reorders;
+       on arm64 the same holds for a publisher's plain store.
+
+       So a full barrier on that path, and the flag looked at again after
+       it. Still up: whoever takes it does so after the work can be seen.
+       Taken meanwhile -- perhaps before the work could be seen -- it is put
+       up again. Found down the first time, the compare-and-swap is the
+       barrier, whether it sets the flag or loses to another signal's. */
     if (signaled_.get() == 0)
+    {
         signaled_.cmpxchg(1, 0);
+    }
+    else
+    {
+        hal::smp_mb();
+        if (signaled_.get() == 0)
+            signaled_.cmpxchg(1, 0);
+    }
 
     /* Then the waiter, every time -- not only by whoever set the flag: a
        waiter found blocked with a signal pending is one to wake, whoever's

@@ -71,6 +71,20 @@ public:
     ulong get_reserved_end(ulong phy_addr);
     ulong get_next_reserved_start(ulong phy_addr, ulong limit);
 
+    /* The same pair for RAM listed already. The free list's builder takes
+       the usable regions in the map's order, and firmware is free to name a
+       range twice or two that overlap: a page listed twice makes a loop of
+       the list. Of the usable regions before region `index`, by their pages
+       -- a region's start rounded up and its end down, as the builder takes
+       it:
+
+       get_listed_end: if the page at phy_addr is one of theirs, the end of
+       the pages of the one that reaches furthest; 0 if it is none's.
+       get_next_listed_start: the first page above phy_addr that is one of
+       theirs, or limit if none is below limit. */
+    ulong get_listed_end(size_t index, ulong phy_addr);
+    ulong get_next_listed_start(size_t index, ulong phy_addr, ulong limit);
+
     /* Name of a firmware region type, for the shell. */
     static const char* get_region_type_name(ulong type);
 

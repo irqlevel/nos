@@ -178,12 +178,21 @@ impl Hba {
         }
     }
 
+    /// Whether an answer is something to wait for: the boot is past where
+    /// an interrupt can come and a waiter be woken, and this adapter has an
+    /// interrupt to come. One that was given none is polled for good, as
+    /// `arm_interrupt` says of it: waited for there, its first command once
+    /// the boot was past that point waited for ever.
+    fn waits_on_interrupt(&self) -> bool {
+        block::interrupts_started() && self.irq.get().is_some()
+    }
+
     fn wait_for_slot(&self) -> usize {
         loop {
             if let Some(slot) = self.take_slot() {
                 return slot;
             }
-            if block::interrupts_started() {
+            if self.waits_on_interrupt() {
                 kcore::task::yield_to_runnable();
             } else {
                 self.collect();
@@ -274,7 +283,7 @@ impl Hba {
     }
 
     fn wait_done(&self, slot: usize) {
-        if block::interrupts_started() {
+        if self.waits_on_interrupt() {
             self.done[slot].wait();
             return;
         }

@@ -84,10 +84,19 @@ void Watchdog::check()
        twenty CPUs each walking all 512 buckets a hundred times a second was
        doing the same work twenty times over -- and contending on the same
        bucket locks to do it. Every bucket is still visited every tick, by
-       exactly one CPU: the coverage and the detection latency do not change,
-       only the redundancy. */
+       one CPU, while they all tick.
+
+       Which CPU moves on by one every tick. A slice that was a CPU's for
+       good was nobody's the moment that CPU stopped ticking -- wedged with
+       its interrupts off, which is what a lock held for ever by it, or
+       waited for by it, is -- and the stuck lock, when its bucket was in
+       that slice, was never looked at again: no line, no panic at ten
+       seconds, one time in as many as there are CPUs and every time on a
+       machine of two with both in the deadlock's embrace but one. Rotated,
+       a slice whose CPU has stopped is the next CPU's a tick later. */
     ulong first = 0;
     ulong stride = 1;
+    ulong rank = 0;
 
     auto& table = CpuTable::get_instance();
     ulong mask = table.get_running_cpus_no_lock();
@@ -100,16 +109,20 @@ void Watchdog::check()
            (0,1,8,9,...,62 for twenty threads). Ranks are dense, so every
            bucket falls to exactly one CPU. */
         stride = pop_count(mask);
-        first = pop_count(mask & ((1UL << index) - 1));
+        rank = pop_count(mask & ((1UL << index) - 1));
+        /* The same tick's number on every CPU -- the clock's, not a count of
+           this CPU's own ticks -- so that at any one tick the CPUs' slices
+           are still all different */
+        first = (rank + get_boot_time().get_value() / ROTATE_NS) % stride;
     }
 
     /* Recorded so `watchdog` can show how the table is divided. Written only
        when the split changes, which after bring-up is never: a store every
        tick would put every CPU back on a shared line. */
     if (index < SLICE_CPUS &&
-        (cpu_slice_[index].first != first || cpu_slice_[index].stride != stride))
+        (cpu_slice_[index].first != rank || cpu_slice_[index].stride != stride))
     {
-        cpu_slice_[index].first = first;
+        cpu_slice_[index].first = rank;
         cpu_slice_[index].stride = stride;
     }
 
@@ -129,6 +142,17 @@ void Watchdog::check()
         if (list.is_empty())
             continue;
 
+        /* The locks found held too long, said once the bucket's lock is
+           down: a line is a console's write -- ten milliseconds of a
+           framebuffer's repaint, with interrupts off and every lock made or
+           unmade in this bucket waiting -- and the lock it is about may be
+           one the log itself takes, which would keep this CPU here, and the
+           panic below from ever being reached. One past the room is said at
+           the next walk: it is not marked reported. */
+        const RawSpinLock* late[LATE_MAX];
+        ulong late_ns[LATE_MAX];
+        ulong late_count = 0;
+
         ulong flags = list_lock.lock_irq_save();
         for (stdlib::ListEntry* entry = list.flink;
             entry != &list;
@@ -141,9 +165,12 @@ void Watchdog::check()
                 /* 0 until the counter's rate is known -- no report then,
                    rather than a report built on a guessed frequency. */
                 ulong delta_ns = cycle_counter_delta_to_ns(now - lock_time);
-                if (delta_ns > timeout_ns && lock->watchdog_reported_.cmpxchg(1, 0) == 0)
+                if (delta_ns > timeout_ns && late_count < LATE_MAX &&
+                    lock->watchdog_reported_.cmpxchg(1, 0) == 0)
                 {
-                    klog(0, "Spinlock 0x%p is held too long %lu", lock, delta_ns);
+                    late[late_count] = lock;
+                    late_ns[late_count] = delta_ns;
+                    late_count++;
                 }
 
                 if (delta_ns > stuck_ns && stuck == nullptr)
@@ -156,9 +183,13 @@ void Watchdog::check()
         list_lock.unlock_irq_restore(flags);
 
         /* Outside the list lock: Panic prints, and printing must not run with
-           this held. */
+           this held. The panic first: it says more, and does not need the
+           log's locks to say it. */
         if (stuck != nullptr)
             PANIC("Spinlock 0x%lX stuck, held %lu ns", (ulong)stuck, stuck_held_ns);
+
+        for (ulong k = 0; k < late_count; k++)
+            klog(0, "Spinlock 0x%p is held too long %lu", late[k], late_ns[k]);
     }
 }
 
@@ -179,10 +210,17 @@ void Watchdog::unregister_spin_lock(RawSpinLock& lock)
     size_t i = stdlib::hash_ptr(&lock) % stdlib::array_size(spin_lock_list_);
     auto& list_lock = spin_lock_list_lock_[i];
 
+    /* remove_init, not remove: the entry is left pointing at itself, which
+       is what is_empty reads. A lock taken out of the watchdog's supervision
+       (SpinLock::unwatch) is unregistered again by its destructor, and left
+       linked to the neighbours it had it was unlinked a second time through
+       them -- every lock registered between the two since cut out of the
+       list, the count down twice, and a write through a neighbour that may
+       have been destroyed in between. */
     ulong flags = list_lock.lock_irq_save();
     if (!lock.watchdog_list_entry_.is_empty())
     {
-        lock.watchdog_list_entry_.remove();
+        lock.watchdog_list_entry_.remove_init();
         spin_lock_counter_.dec();
     }
     list_lock.unlock_irq_restore(flags);
@@ -202,7 +240,7 @@ void Watchdog::dump(stdlib::Printer& printer)
         if (cpu_slice_[i].stride == 0)
             continue;
 
-        printer.printf("cpu %lu: %lu buckets, from %lu every %lu\n", i,
+        printer.printf("cpu %lu: %lu buckets, from %lu every %lu, moved on by one a tick\n", i,
             (ulong)((stdlib::array_size(spin_lock_list_) - cpu_slice_[i].first +
                 cpu_slice_[i].stride - 1) / cpu_slice_[i].stride),
             cpu_slice_[i].first, cpu_slice_[i].stride);

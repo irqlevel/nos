@@ -17,6 +17,10 @@ public:
 
     stdlib::Error parse();
 
+    /* The RSDP's OEM id, six characters: whose firmware this is -- "BOCHS "
+       is QEMU's */
+    const char* get_oem_id();
+
     void* get_lapic_address();
 
     void* get_io_apic_address();
@@ -26,6 +30,19 @@ public:
 
     /* FADT: PM1a control port for ACPI S5 shutdown (0 if not found) */
     ulong get_pm1a_cnt_port();
+
+    /* FADT: PM1b control port, 0 where the machine has no second block --
+       as most have none */
+    ulong get_pm1b_cnt_port();
+
+    /* The DSDT's \_S5: the sleep types that, written to the PM1 control
+       registers with SLP_EN, turn the machine off. They are the chipset's
+       own -- 7 on Intel's PCHs, 5 on AMD's FCH, 0 under QEMU -- so one that
+       is guessed asks for another state: the 5 this kernel used to write
+       everywhere is S3 on an Intel machine, a suspend to RAM with nothing
+       set up to come back from it. False when the firmware's DSDT gave no
+       \_S5 this kernel can read, which Parse has said. */
+    bool get_s5(u8& typ_a, u8& typ_b);
 
     /* FADT: ACPI reset register (I/O port) and value (0/false if not available) */
     bool has_reset_reg();
@@ -200,6 +217,53 @@ private:
     /* Let go of the tmp_map pages a mapping of len bytes at va holds */
     static void unmap_table_range(void* va, ulong len);
 
+    /* The DSDT is not one of the tables above: a real one is hundreds of
+       KiB -- the window has no room to hold it whole, nor is it to be held
+       to MAX_TABLE_LENGTH -- and all this kernel wants of it is one name.
+       It is read after the tables are let go of, a page of it mapped at a
+       time, and one longer than this is not read at all. */
+    static const u32 MAX_DSDT_LENGTH = 4 * 1024 * 1024;
+
+    /* AML (ACPI 20.2), as much of it as a \_S5 is written in: the name
+       defined by NameOp, at the root with or without the root's character,
+       as a package whose first two elements are the sleep types, each a
+       constant of a byte. Nothing here runs AML: a firmware that computes
+       its \_S5, or keeps it in an SSDT, has none this kernel reads. */
+    static const u8 AML_ZERO_OP = 0x00;
+    static const u8 AML_ONE_OP = 0x01;
+    static const u8 AML_NAME_OP = 0x08;
+    static const u8 AML_BYTE_PREFIX = 0x0A;
+    static const u8 AML_PACKAGE_OP = 0x12;
+    static const u8 AML_ROOT_CHAR = 0x5C;
+
+    /* A PkgLength's lead byte: its top two bits count the bytes after it.
+       With none the length is its low six bits; else its low four, and the
+       bytes after it above those. */
+    static const u8 AML_PKG_FOLLOW_SHIFT = 6;
+    static const u8 AML_PKG_SHORT_MASK = 0x3F;
+    static const u8 AML_PKG_LOW_MASK = 0x0F;
+    static const u8 AML_PKG_LOW_BITS = 4;
+
+    /* SLP_TYP is three bits of a PM1 control register */
+    static const u8 SLP_TYP_MAX = 7;
+
+    /* The most of the AML a \_S5 is read from: NameOp, the root's
+       character, the name, PackageOp, a PkgLength of four bytes, the count
+       of elements, and two elements of a prefix and a byte each */
+    static const size_t S5_MAX_BYTES = 1 + 1 + 4 + 1 + 4 + 1 + 2 + 2;
+
+    /* Whether the len bytes at aml begin with a \_S5 as above, and its
+       two sleep types if so. Nothing past len is read, and nothing of the
+       package past where its own length ends it. */
+    static bool parse_s5(const u8* aml, size_t len, u8& typ_a, u8& typ_b);
+
+    /* An element of that package at aml[at], which it moves past: a
+       constant no greater than SLP_TYP_MAX, read from before limit */
+    static bool parse_s5_type(const u8* aml, size_t limit, size_t& at, u8& value);
+
+    /* The DSDT the FADT named, read for its \_S5 */
+    void parse_dsdt();
+
     static const bool CHECK_RSDT_CHECKSUM = false;
     static const u64 RSDP_SIGNATURE = 0x2052545020445352ULL; //'RSD PTR '
 
@@ -294,7 +358,15 @@ private:
         u32 flags;              /* +76 */
         GenericAddressStructure reset_reg;   /* +80 */
         u8  reset_value;         /* +92 */
+        u16 arm_boot_arch;       /* +93 */
+        u8  fadt_minor_version;  /* +95 */
+        u64 x_firmware_ctrl;     /* +96 */
+        u64 x_dsdt;              /* +104 */
     } __attribute__((packed));
+
+    static_assert(OFFSET_OF(FadtFields, pm1b_cnt_blk) == 32, "Invalid FADT layout");
+    static_assert(OFFSET_OF(FadtFields, reset_value) == 92, "Invalid FADT layout");
+    static_assert(OFFSET_OF(FadtFields, x_dsdt) == 104, "Invalid FADT layout");
 
     /* HPET ACPI table body (beyond SDT header) */
     struct HpetTableBody
@@ -350,6 +422,14 @@ private:
 
     /* FADT-derived values */
     ulong pm1a_cnt_port_;
+    ulong pm1b_cnt_port_;
+    /* Where the FADT says the DSDT is, 0 when it names none */
+    ulong dsdt_phys_;
+
+    /* DSDT-derived values: its \_S5, when s5_valid_ */
+    bool s5_valid_;
+    u8 s5_typ_a_;
+    u8 s5_typ_b_;
     bool reset_reg_valid_;
     ulong reset_reg_port_;
     u8 reset_val_;

@@ -201,6 +201,45 @@ ulong MemoryMap::get_next_reserved_start(ulong phy_addr, ulong limit)
     return next;
 }
 
+ulong MemoryMap::get_listed_end(size_t index, ulong phy_addr)
+{
+    ulong end = 0;
+
+    for (size_t i = 0; i < index && i < size_; i++)
+    {
+        auto& region = region_[i];
+        if (region.type != USABLE_RAM_TYPE)
+            continue;
+
+        /* No overflow: a region ends at MAX_PHYS_ADDR at most (add_region) */
+        ulong first = stdlib::round_up(region.addr, consts::PAGE_SIZE);
+        ulong last = stdlib::round_down(region.addr + region.len, consts::PAGE_SIZE);
+        if (first <= phy_addr && phy_addr < last && last > end)
+            end = last;
+    }
+
+    return end;
+}
+
+ulong MemoryMap::get_next_listed_start(size_t index, ulong phy_addr, ulong limit)
+{
+    ulong next = limit;
+
+    for (size_t i = 0; i < index && i < size_; i++)
+    {
+        auto& region = region_[i];
+        if (region.type != USABLE_RAM_TYPE)
+            continue;
+
+        ulong first = stdlib::round_up(region.addr, consts::PAGE_SIZE);
+        ulong last = stdlib::round_down(region.addr + region.len, consts::PAGE_SIZE);
+        if (first < last && first > phy_addr && first < next)
+            next = first;
+    }
+
+    return next;
+}
+
 ulong MemoryMap::get_usable_ram_bytes()
 {
     ulong total = 0;

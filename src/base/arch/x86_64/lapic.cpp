@@ -5,7 +5,8 @@
 
 #include <kernel/klog.h>
 #include "asm.h"
-#include <mm/mmio.h>
+#include <drivers/mmio.h>
+#include <hal/barrier.h>
 
 namespace kernel
 {
@@ -17,15 +18,22 @@ void* Lapic::get_reg_base(ulong index)
     return stdlib::mem_add(Acpi::get_instance().get_lapic_address(), index * 0x10);
 }
 
+/* The registers read and written as they are, not through mm::MmIo, whose
+   accessors trace each access at loglevel 4. The local APIC is under what a
+   trace line itself stands on -- its time, where the clock asks which CPU
+   this is before the GS slot is published (hal::get_current_cpu_hw_id); the
+   timer the scheduler arms as a lock's release reschedules; the EOI of the
+   interrupt the line is printed in -- and a trace from here was a trace
+   that traced itself until the stack ran out. */
 u32 Lapic::read_reg(ulong index)
 {
     hal::dma_rmb();
-    return mm::MmIo::read32(get_reg_base(index));
+    return mmio_read32(get_reg_base(index));
 }
 
 void Lapic::write_reg(ulong index, u32 value)
 {
-    mm::MmIo::write32(get_reg_base(index), value);
+    mmio_write32(get_reg_base(index), value);
     hal::dma_wmb();
 }
 

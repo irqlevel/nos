@@ -77,7 +77,7 @@ namespace kernel
                Magic2, and a walk allowed to read it reports the guard value
                as a return address -- 0xCBDECBDE appearing as this task's
                outermost caller, which is not a caller at all. */
-            return StackTrace::capture_from(rbp, base,
+            return StackTrace::capture_from(rbp, (ulong)&stack_ptr->stack_bottom[0],
                 (ulong)&stack_ptr->stack_top[0], frames, max_frames);
         }
 

@@ -78,6 +78,8 @@ PageTable::PageTable()
     , huge_zero_next_(0)
     , huge_pool_hint_(0)
     , huge_pool_window_on_(false)
+    , mmio_next_(MMIO_WINDOW)
+    , mmio_mapping_count_(0)
     , zero_check_(false)
 {
     klog(0, "PageTable 0x%p", this);
@@ -150,6 +152,18 @@ bool PageTable::get_free_pages(ulong exclude_limit)
         ulong address = mem_start;
         while (address < mem_end)
         {
+            /* RAM an earlier region of the map listed already: firmware may
+               name the same range twice, or two that overlap, and a page put
+               on this list a second time makes a loop of it -- its link
+               written over with a head that leads back to it. Skipped, and
+               not counted again. */
+            ulong listed_end = mmap.get_listed_end(i, address);
+            if (listed_end != 0)
+            {
+                address = (listed_end < mem_end) ? listed_end : mem_end;
+                continue;
+            }
+
             /* Reserved carve-outs (the arm64 DTB, page_array_'s backing, the
                firmware's own) overlap usable-RAM regions; free-listing them
                would clobber their contents. Skipped a run at a time rather
@@ -167,6 +181,7 @@ bool PageTable::get_free_pages(ulong exclude_limit)
             }
 
             ulong run_end = mmap.get_next_reserved_start(address, mem_end);
+            run_end = mmap.get_next_listed_start(i, address, run_end);
             for (; address < run_end; address += consts::PAGE_SIZE)
             {
                 total_pages_count_++;
@@ -588,13 +603,19 @@ bool PageTable::change_range_protection(ulong virt_addr, ulong size_bytes,
        exactly like map_page/unmap_page. */
     for (ulong va = virt_addr; va < end; va += consts::PAGE_SIZE)
     {
+        /* A window with no slot left is a failure the caller is told of:
+           each of the four used to be dereferenced as it came back */
         PtePage* l4 = (PtePage*)tmp_map_page(root_);
+        if (l4 == nullptr)
+            return false;
         Pte* l4e = &l4->entry[Pte::l4_index(va)];
         if (!l4e->present()) { tmp_unmap_page((ulong)l4); return false; }
         ulong l3phys = l4e->address();
         tmp_unmap_page((ulong)l4);
 
         PtePage* l3 = (PtePage*)tmp_map_page(l3phys);
+        if (l3 == nullptr)
+            return false;
         Pte* l3e = &l3->entry[Pte::l3_index(va)];
         if (!l3e->present() || l3e->huge())
         {
@@ -605,6 +626,8 @@ bool PageTable::change_range_protection(ulong virt_addr, ulong size_bytes,
         tmp_unmap_page((ulong)l3);
 
         PtePage* l2 = (PtePage*)tmp_map_page(l2phys);
+        if (l2 == nullptr)
+            return false;
         Pte* l2e = &l2->entry[Pte::l2_index(va)];
         if (!l2e->present() || l2e->huge())
         {
@@ -615,6 +638,8 @@ bool PageTable::change_range_protection(ulong virt_addr, ulong size_bytes,
         tmp_unmap_page((ulong)l2);
 
         PtePage* l1 = (PtePage*)tmp_map_page(l1phys);
+        if (l1 == nullptr)
+            return false;
         Pte* l1e = &l1->entry[Pte::l1_index(va)];
         if (!l1e->present()) { tmp_unmap_page((ulong)l1); return false; }
 
@@ -2003,7 +2028,7 @@ bool PageTable::map_range_locked(ulong virt_addr, size_t count, const MapSource&
     /* All-or-nothing: undo the prefix that did get mapped, leaving the
        pages themselves to the caller. */
     if (mapped != 0)
-        unmap_range_locked(virt_addr, mapped, false);
+        unmap_range_locked(virt_addr, mapped, nullptr);
 
     return false;
 }
@@ -2011,7 +2036,7 @@ bool PageTable::map_range_locked(ulong virt_addr, size_t count, const MapSource&
 /* Range twin of map_range_locked. A missing entry is a caller bug (BUG_ON),
    but the walk carries on so the rest of the range is still torn down.
    Lock must be held. */
-void PageTable::unmap_range_locked(ulong virt_addr, size_t count, bool free_pages)
+void PageTable::unmap_range_locked(ulong virt_addr, size_t count, Page** frames)
 {
     BUG_ON(virt_addr & (consts::PAGE_SIZE - 1));
 
@@ -2040,6 +2065,9 @@ void PageTable::unmap_range_locked(ulong virt_addr, size_t count, bool free_page
         if (!l1_entry->present())
         {
             BUG_ON(1);
+            /* No page of this address's for the caller to free */
+            if (frames != nullptr)
+                frames[i] = nullptr;
         }
         else
         {
@@ -2050,9 +2078,10 @@ void PageTable::unmap_range_locked(ulong virt_addr, size_t count, bool free_page
 
             Page* page = get_page(phy_addr);
             page->put(); /* balance get_page's lookup reference */
-            if (free_pages)
-                free_page_no_lock(page);
             page->put(); /* the mapping reference map_range_locked took */
+            /* The caller's to free, after the shootdown (unmap_pages) */
+            if (frames != nullptr)
+                frames[i] = page;
         }
 
         if (l1_index == (stdlib::array_size(l1_page->entry) - 1))
@@ -2102,15 +2131,47 @@ bool PageTable::map_phys_pages(ulong virt_addr, const ulong* phy_addrs, size_t c
     return map_range_locked(virt_addr, count, src);
 }
 
-void PageTable::unmap_pages(ulong virt_addr, size_t count, bool free_pages)
+void PageTable::unmap_pages(ulong virt_addr, size_t count, Page** frames)
 {
     stdlib::AutoLock lock(lock_);
 
-    unmap_range_locked(virt_addr, count, free_pages);
+    unmap_range_locked(virt_addr, count, frames);
+}
+
+void PageTable::free_pages(Page* const* pages, size_t count)
+{
+    stdlib::AutoLock lock(lock_);
+
+    for (size_t i = 0; i < count; i++)
+    {
+        /* None where unmap_pages found nothing mapped */
+        if (pages[i] != nullptr)
+            free_page_no_lock(pages[i]);
+    }
+}
+
+ulong PageTable::mmio_mapped_span(ulong virt_addr)
+{
+    stdlib::AutoLock lock(lock_);
+
+    for (ulong i = 0; i < mmio_mapping_count_; i++)
+    {
+        const MmioMapping& m = mmio_mappings_[i];
+        const ulong bytes = m.pages * consts::PAGE_SIZE;
+        if (virt_addr >= m.va && virt_addr - m.va < bytes)
+            return bytes - (virt_addr - m.va);
+    }
+
+    return 0;
 }
 
 ulong PageTable::map_mmio_region(ulong phys_addr, ulong size_bytes, MmioCachePolicy policy)
 {
+    static_assert(MMIO_WINDOW == MemoryMap::KERNEL_SPACE_BASE + 48 * 1024 * consts::GB,
+        "the window 48 TiB into the kernel's half, as page_table.h says");
+    static_assert(IMAGE_ENTRY_END == MemoryMap::KERNEL_SPACE_BASE + TOP_ENTRY_SPAN,
+        "the image's top-level entry is the kernel half's first");
+
     const bool write_combining =
         (policy == MmioWriteCombining) && hal::is_write_combining_available();
 
@@ -2126,89 +2187,96 @@ ulong PageTable::map_mmio_region(ulong phys_addr, ulong size_bytes, MmioCachePol
     if (phys_addr & (consts::PAGE_SIZE - 1))
         return 0;
 
+    /* A BAR's or the firmware's word for where the device is: a range that
+       wraps, or reaches past what a table entry can name, is none */
+    if (size_bytes > MemoryMap::MAX_PHYS_ADDR || phys_addr > MemoryMap::MAX_PHYS_ADDR - size_bytes)
+        return 0;
+
     ulong pages = (size_bytes + consts::PAGE_SIZE - 1) / consts::PAGE_SIZE;
     if (pages == 0)
         pages = 1;
 
-    for (ulong i = 0; i < pages; i++)
+    ulong va = 0;
     {
-        ulong pa = phys_addr + i * consts::PAGE_SIZE;
-        ulong va = pa + MemoryMap::KERNEL_SPACE_BASE;
-
         stdlib::AutoLock lock(lock_);
-
-        ulong l4_index = Pte::l4_index(va);
-        ulong l3_index = Pte::l3_index(va);
-        ulong l2_index = Pte::l2_index(va);
-        ulong l1_index = Pte::l1_index(va);
 
         if (root_ == 0)
             return 0;
 
-        PtePage* l4_page = (PtePage*)tmp_map_page(root_);
-        if (l4_page == nullptr)
-            return 0;
-
-        Pte *l4_entry = &l4_page->entry[l4_index];
-        if (!l4_entry->present()) {
-            Page* p = alloc_page_no_lock();
-            if (!p) { tmp_unmap_page((ulong)l4_page); return 0; }
-            l4_entry->set_address(p->get_phy_address());
-            l4_entry->set_writable();
-            l4_entry->set_present();
+        /* Mapped already, all of it and as asked: that mapping */
+        for (ulong i = 0; i < mmio_mapping_count_; i++)
+        {
+            const MmioMapping& m = mmio_mappings_[i];
+            if (m.write_combining != write_combining || phys_addr < m.phys || pages > m.pages)
+                continue;
+            const ulong skipped = (phys_addr - m.phys) / consts::PAGE_SIZE;
+            if (skipped <= m.pages - pages)
+                return m.va + (phys_addr - m.phys);
         }
 
-        PtePage* l3_page = (PtePage*)tmp_map_page(l4_entry->address());
-        tmp_unmap_page((ulong)l4_page);
-        if (l3_page == nullptr)
+        /* Its pages and one more, left unmapped. The addresses are taken
+           whether or not all of it is then mapped: nobody is handed them
+           again, so no later mapping finds a leaf of this one in its way. */
+        const ulong left = MMIO_WINDOW + TOP_ENTRY_SPAN - mmio_next_;
+        if (pages >= left / consts::PAGE_SIZE)
             return 0;
+        va = mmio_next_;
+        mmio_next_ += (pages + 1) * consts::PAGE_SIZE;
+    }
 
-        Pte *l3_entry = &l3_page->entry[l3_index];
-        if (!l3_entry->present()) {
-            Page* p = alloc_page_no_lock();
-            if (!p) { tmp_unmap_page((ulong)l3_page); return 0; }
-            l3_entry->set_address(p->get_phy_address());
-            l3_entry->set_writable();
-            l3_entry->set_present();
-        }
+    /* An L1 table's worth under the lock at a time: a framebuffer is tens of
+       thousands of pages, and the lock keeps interrupts off */
+    for (ulong done = 0; done < pages;)
+    {
+        stdlib::AutoLock lock(lock_);
 
-        PtePage* l2_page = (PtePage*)tmp_map_page(l3_entry->address());
-        tmp_unmap_page((ulong)l3_page);
-        if (l2_page == nullptr)
-            return 0;
-
-        Pte *l2_entry = &l2_page->entry[l2_index];
-        if (!l2_entry->present()) {
-            Page* p = alloc_page_no_lock();
-            if (!p) { tmp_unmap_page((ulong)l2_page); return 0; }
-            l2_entry->set_address(p->get_phy_address());
-            l2_entry->set_writable();
-            l2_entry->set_present();
-        }
-
-        PtePage* l1_page = (PtePage*)tmp_map_page(l2_entry->address());
-        tmp_unmap_page((ulong)l2_page);
+        const ulong page_va = va + done * consts::PAGE_SIZE;
+        PtePage* l1_page = walk_to_l1_locked(page_va, true);
         if (l1_page == nullptr)
             return 0;
 
-        Pte *l1_entry = &l1_page->entry[l1_index];
-        if (!l1_entry->present())
+        for (ulong l1_index = Pte::l1_index(page_va);
+            done < pages && l1_index < stdlib::array_size(l1_page->entry); done++, l1_index++)
         {
-            l1_entry->set_address(pa);
+            Pte* l1_entry = &l1_page->entry[l1_index];
+            /* The window's addresses are handed out once each */
+            BUG_ON(l1_entry->present());
+
+            /* Built aside and stored whole, so the walker never sees half
+               of it */
+            Pte e;
+            e.set_address(phys_addr + done * consts::PAGE_SIZE);
             if (write_combining)
-                l1_entry->set_write_combining();
+                e.set_write_combining();
             else
-                l1_entry->set_cache_disabled();   /* device memory: uncached */
+                e.set_cache_disabled();   /* device memory: uncached */
             /* Nothing is ever executed out of MMIO */
-            l1_entry->set_no_execute();
-            l1_entry->set_writable();
-            l1_entry->set_present();
+            e.set_no_execute();
+            e.set_writable();
+            e.set_present();
+            l1_entry->value = e.value;
         }
         tmp_unmap_page((ulong)l1_page);
-        hal::tlb_flush_page(va);
     }
 
-    return phys_addr + MemoryMap::KERNEL_SPACE_BASE;
+    /* Not present before, so no TLB holds anything of them: only the stores
+       to make the walker's */
+    hal::pte_made_valid();
+
+    {
+        stdlib::AutoLock lock(lock_);
+
+        if (mmio_mapping_count_ < MMIO_MAPPINGS_MAX)
+        {
+            MmioMapping& m = mmio_mappings_[mmio_mapping_count_++];
+            m.phys = phys_addr;
+            m.pages = pages;
+            m.va = va;
+            m.write_combining = write_combining;
+        }
+    }
+
+    return va;
 }
 
 /* Legacy single-page form: returns the page so the caller can pair its own

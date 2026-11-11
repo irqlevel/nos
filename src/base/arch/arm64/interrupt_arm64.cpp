@@ -48,18 +48,18 @@ ulong read_mpidr()
     return mpidr;
 }
 
-void register_common(InterruptHandler& handler, u8 int_id, bool edge, bool level)
+bool register_common(InterruptHandler& handler, u8 int_id, bool edge, bool level)
 {
     auto& gic = Gic::get_instance();
     BUG_ON(!gic.is_ready());
 
     auto& ve = int_ids[int_id];
     if (BUG_ON(ve.handler_count >= MAX_SHARED_PER_INT_ID))
-        return;
+        return false;
     if (BUG_ON(ve.handler_count != 0 && !ve.level))
-        return;
+        return false;
     ve.level = level;
-    ve.handlers[ve.handler_count] = &handler;
+    __atomic_store_n(&ve.handlers[ve.handler_count], &handler, __ATOMIC_RELAXED);
     /* The handler written before the count that lets an interrupt on another
        CPU reach it -- a level line shared is enabled already. Release: the
        compiler and the CPU both keep the order, which plain stores at -O2
@@ -71,6 +71,7 @@ void register_common(InterruptHandler& handler, u8 int_id, bool edge, bool level
 
     klog(0, "Interrupt: intid %lu registered %s", (ulong)int_id,
         level ? "level" : "edge");
+    return true;
 }
 
 }
@@ -79,16 +80,57 @@ void register_common(InterruptHandler& handler, u8 int_id, bool edge, bool level
    "vector" argument is advisory and ignored (callers like the Rust FFI
    pass an x86 vector-space value). on_interrupt_register reports the
    INTID back as the effective vector. */
-void Interrupt::register_handler(InterruptHandler& handler, u8 irq, u8 vector)
+bool Interrupt::register_handler(InterruptHandler& handler, u8 irq, u8 vector)
 {
     (void)vector;
-    register_common(handler, irq, true, false);
+    return register_common(handler, irq, true, false);
 }
 
-void Interrupt::register_level(InterruptHandler& handler, u8 irq, u8 vector)
+bool Interrupt::register_level(InterruptHandler& handler, u8 irq, u8 vector)
 {
     (void)vector;
-    register_common(handler, irq, false, true);
+    return register_common(handler, irq, false, true);
+}
+
+bool Interrupt::is_vector_free(u8 vector)
+{
+    (void)vector;
+    return true;
+}
+
+void Interrupt::unregister_level(InterruptHandler& handler)
+{
+    for (ulong id = 0; id < MAX_INT_IDS; id++)
+    {
+        auto& ve = int_ids[id];
+        const u8 count = ve.handler_count;
+        if (count == 0 || !ve.level)
+            continue;
+
+        for (u8 i = 0; i < count; i++)
+        {
+            if (ve.handlers[i] != &handler)
+                continue;
+
+            /* The line's last: disabled at the GIC before the count says
+               nobody is there, so that a device still asserting it does
+               not interrupt for ever with nobody to quiet it */
+            if (count == 1)
+                Gic::get_instance().disable_irq((u32)id);
+
+            /* The last handler into this one's place, then one fewer: a
+               dispatch that read the count before finds every handler it
+               reaches still there to call */
+            __atomic_store_n(&ve.handlers[i], ve.handlers[count - 1], __ATOMIC_RELAXED);
+            __atomic_store_n(&ve.handler_count, static_cast<u8>(count - 1), __ATOMIC_RELEASE);
+
+            klog(0, "Interrupt: intid %lu, a handler taken off, %lu left%s", id, (ulong)count - 1,
+                (count == 1) ? ": disabled" : "");
+            return;
+        }
+    }
+
+    klog(0, "Interrupt: handler 0x%p is on no line", &handler);
 }
 
 void Interrupt::shared_dispatch(Context* ctx)
@@ -182,8 +224,8 @@ extern "C" void arm_irq_entry(Context* ctx)
         }
         else
         {
-            for (u8 i = 0; i < count; i++)
-                ve.handlers[i]->on_interrupt(ctx);
+            for (u8 i = 0; i < count && i < MAX_SHARED_PER_INT_ID; i++)
+                __atomic_load_n(&ve.handlers[i], __ATOMIC_RELAXED)->on_interrupt(ctx);
         }
 
         Gic::write_eoir(int_id);

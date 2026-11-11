@@ -274,7 +274,15 @@ public:
 
     void exit_all_except_self();
 
-    void send_ipi_all_exclude(ulong exclude_index);
+    /* The panic's: every other CPU running sent the IPI its Cpu::ipi answers
+       by stopping (on_panic) -- with no lock taken. The panic's NMI stops a
+       CPU where it stands and for good, and one stopped inside
+       Cpu::send_ipi_self or get_running_cpus holds a Cpu's lock or this
+       table's: taken here, as they used to be, they were a panic that spun
+       on them before its netconsole and disk-log flushes and its reset --
+       a report that never left the machine. So the mirror of the running
+       CPUs, and the irq chip's own IPI. */
+    void send_panic_ipi(ulong exclude_index);
 
     void send_ipi_all();
 
