@@ -839,9 +839,9 @@ void* kernel_map_phys(unsigned long phys_base, unsigned long num_pages)
 
 void kernel_unmap_phys(void* virt_addr, unsigned long num_pages)
 {
-    /* map_mmio_region maps at phys_addr + KERNEL_SPACE_BASE via direct PTEs;
-     * these mappings are permanent and cannot be unmapped in the current
-     * page-table implementation. */
+    /* map_mmio_region's mappings are permanent -- the window they are in is
+     * never given back, and the same range mapped again is the mapping it
+     * has -- so there is nothing to undo. */
     (void)virt_addr;
     (void)num_pages;
 }

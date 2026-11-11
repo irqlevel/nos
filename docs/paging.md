@@ -12,11 +12,13 @@ deadlocking. The code lives in `src/base/mm/`, with the PTE encoding in
 | Range | Contents |
 |---|---|
 | `0x0000000000000000` – `0x00007FFFFFFFFFFF` | User half. Mapped only by the x86 bootstrap table, and only until the real table takes over; on arm64 TTBR0 walks are disabled outright after boot |
-| `0xFFFF800000000000` + phys | `KERNEL_SPACE_BASE`. The bootstrap linear map, and the permanent home of every MMIO mapping |
+| `0xFFFF800000000000` + phys | `KERNEL_SPACE_BASE`. The bootstrap linear map -- and, on arm64, the boot device GiB that stays mapped (`hal::mmio_premapped_va`) |
 | `0xFFFF800001000000` | Kernel image (x86-64; arm64 links at `…40200000`, matching the QEMU virt load address). Split into text RX / rodata RO+NX / data RW+NX late in boot |
 | just above the image | The `tmp_map` window: 512 slots, one L1 table, the only way the kernel touches an arbitrary physical page -- 448 shared under a lock, and one for each CPU for copying a frame |
 | next huge-page boundary | `page_array_`, one 32-byte descriptor per 4 KiB frame, mapped in 2 MiB pages |
-| after `page_array_` | The `VaAllocator` arena the page allocator hands out |
+| after `page_array_` | The `VaAllocator` arena the page allocator hands out: seven tenths of free RAM long, and a GiB of large runs after it |
+| `0xFFFFB00000000000` | `MMIO_WINDOW`: every device mapping `map_mmio_region` makes, a top-level entry of its own |
+| `0xFFFFC00000000000` + phys | `HUGE_POOL_WINDOW`: the huge pool's blocks, a top-level entry of its own too |
 
 ## Two page tables
 
@@ -350,8 +352,9 @@ it.
 
 ## MMIO, cacheability and W^X
 
-`map_mmio_region(phys, size, policy)` builds 4 KiB leaf entries at
-`phys + KERNEL_SPACE_BASE`, allocating table pages as it goes. Two policies:
+`map_mmio_region(phys, size, policy)` builds 4 KiB leaf entries in a window
+of its own, `MMIO_WINDOW`, at an address it hands out, allocating table pages
+as it goes and leaving a page unmapped after each mapping. Two policies:
 `MmioUncached` for device registers (every load and store reaches the
 device, in program order) and `MmioWriteCombining` for memory-like device
 RAM with no read side effects — a framebuffer — where stores may be
@@ -364,13 +367,21 @@ Every MMIO mapping is non-executable: nothing is ever fetched from a device,
 and on real hardware a speculative fetch from device memory can trigger read
 side effects.
 
-These mappings live outside the `VaAllocator`, are permanent, and invalidate
-only the local TLB — so **`map_mmio_region` callers must run on the BSP before
-the APs start**. On arm64 a request that falls inside the boot device GiB is
-answered from the premapped window instead (`hal::mmio_premapped_va`).
+These mappings are permanent, and the same range asked for again is the
+mapping it has. The window is a top-level entry nothing else is in, so where
+a device is mapped depends on nothing the machine's RAM sizes: a device used
+to be mapped at `phys + KERNEL_SPACE_BASE`, which is where the `VaAllocator`
+arena is too, and on a machine of more than three or four GiB the PCI hole's
+addresses were inside a size class's range -- a heap block and a device's
+registers one allocation from the same VA, and no boot of a GiB or two to
+show it. The window's addresses were never mapped before, so no TLB holds
+anything of them and no other CPU is asked to flush. On arm64 a request that
+falls inside the boot device GiB is answered from the premapped window
+instead (`hal::mmio_premapped_va`).
 
 Never map DMA or device memory at `phys + KERNEL_SPACE_BASE` by hand: go
-through `mm::map_pages` / `mm::alloc_map_pages` so the VA is tracked.
+through `mm::map_pages` / `mm::alloc_map_pages` for memory, and
+`map_mmio_region` for a device, so the VA is tracked.
 
 **W^X** has two halves. Every mapping the kernel makes at runtime is
 non-executable from birth: `map_range_locked` sets NX on each leaf it writes,

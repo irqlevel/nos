@@ -254,11 +254,12 @@ __attribute__((noinline)) void ap_main2()
        boot64.asm, which maps exactly two windows: the low 4GiB identity and
        the same 4GiB at KERNEL_SPACE_BASE. Nothing here may touch a virtual
        address outside them -- and the console is one. map_mmio_region places a
-       device at phys_addr + KERNEL_SPACE_BASE, so a framebuffer above 4GiB (the
-       Raptor Lake iGPU aperture sits at 0x40_0000_0000) lands at a VA the
-       boot table has no L3 entry for. An AP has no IDT yet either, so that
-       page fault is a triple fault: the machine resets during start_all with
-       nothing on the screen and nothing in any log.
+       device in a window of its own (PageTable::MMIO_WINDOW), which the boot
+       table does not map at all -- as it had no L3 entry for a framebuffer
+       above 4GiB when a device was at phys_addr + KERNEL_SPACE_BASE (the
+       Raptor Lake iGPU aperture sits at 0x40_0000_0000). An AP has no IDT
+       yet either, so that page fault is a triple fault: the machine resets
+       during start_all with nothing on the screen and nothing in any log.
 
        Hence the order: NXE first (the W^X page table sets NX bits, which
        fault as reserved without it), then the real page table, then the GDT
