@@ -281,7 +281,10 @@ device, and have `quiesce` take it out and drop it after the lock.
 arrive from any task on any CPU, several at once: what one needs exclusively
 sits behind a lock in the device. A buffer is whole sectors and never empty,
 and the device may DMA straight into it.
-`fn is_async(&self) -> bool { true }` adds `submit`/`kick`.
+`fn is_async(&self) -> bool { true }` adds `submit`/`kick` -- true only
+where a completion reaches its caller with nobody waiting: virtio-blk says
+so once its interrupt is in place, its polled path being a waiting
+caller's.
 `write_pieces`/`read_pieces` take a batch -- pieces of one `DmaBuffer`, each
 a page of it or the start of one (`block::Piece`), the table having checked
 every one -- and by default do them one after another through `write` and

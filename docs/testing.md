@@ -3864,11 +3864,10 @@ unmounted; and the image, taken back out of it with `debugfs`, must pass
 guest kernel with PCI, legacy virtio-pci, virtio-blk and ext4 built in.
 `--nvme-root` puts nos's root on an NVMe disk instead of virtio-blk: each
 driver takes ext2's batches of blocks its own way, and NVMe's is the one the
-AX41 runs -- and NVMe's is the one with an asynchronous path, so there the
-guest's requests go to the disk through the image's queue as they come,
-each back when it is done (`fs::image`'s `start` and `reap`; the image says
-how many it served so); on virtio-blk the queue serves every one by the
-batch.
+AX41 runs. Both have the asynchronous path (virtio-blk since N12a, once its
+interrupt is in place), so on either the guest's requests go to the disk
+through the image's queue as they come, each back when it is done
+(`fs::image`'s `start` and `reap`; the image says how many it served so).
 
 `--cpus N` gives every guest of the run N CPUs, the boot's and the VMs'.
 The boot must say `smp: Brought up 1 node, N CPUs`, and its report that the

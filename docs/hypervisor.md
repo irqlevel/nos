@@ -1968,8 +1968,9 @@ a device disk and a file disk share the disk task's loop
 `unsafe` of its own for either. A request longer than the device takes at
 once is split into the commands it can take and given back when the last
 is done; a device busy with nos's own I/O is waited for as an image waits
-for it; and a device without the asynchronous path -- virtio-blk and
-virtio-scsi in nos -- is served a page at a time on the spot. What the
+for it; and a device without the asynchronous path -- virtio-scsi in
+nos, and virtio-blk polled before its interrupt is in place -- is served a
+page at a time on the spot. What the
 guest's device offers follows the backend: discard where the device can
 give blocks back -- an NVMe whose controller has Dataset Management (ONCS
 bit 2), which nos now sends -- and not on a read-only disk; no write of

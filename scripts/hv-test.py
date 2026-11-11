@@ -987,8 +987,9 @@ def decode_disk(dump):
     pt.check("each stretch of it in order: to its task, served at once, back",
              all(q["submit"] <= q["start"] <= q["done"] <= q["complete"] and q["how"] == "at_once" and q["ok"] == 1
                  and q["op"] == "read" for q in whole), str(whole))
-    pt.check("and the image's synchronous path and ext4's commits read", len(d["syncs"]) == 2
-             and len(d["commits"]) >= 1, "%d syncs, %d commits" % (len(d["syncs"]), len(d["commits"])))
+    pt.check("and the image's synchronous path -- the MBR's read, at least -- and ext4's commits read",
+             1 <= len(d["syncs"]) <= 2 and len(d["commits"]) >= 1,
+             "%d syncs, %d commits" % (len(d["syncs"]), len(d["commits"])))
     slices = [e for e in chrome_of(dump) if e.get("ph") == "X" and e.get("cat") == "disk"]
     pt.check("and in Chrome's trace format: a slice each request on its disk's track, its stretches with it",
              len(slices) == 2 and all(e["args"].get("how") == "at_once" and e["dur"] > 0 for e in slices),
@@ -999,9 +1000,13 @@ def disk_checks(on, boot, shown):
     """A guest disk's requests, traced: hvboot's reads of /disk.raw -- a
     disk of an MBR's signature and nothing else, which it reads its sectors
     of and gives up on -- each taken off the ring, picked up by the disk's
-    task, served by the image through its filesystem (unaligned to its
-    blocks, so then and there), done and given back, in that order, slot by
-    slot; and a file written, ext4's transactions committed."""
+    task, served by the image then and there, done and given back, in that
+    order, slot by slot: the MBR's 512 bytes through its filesystem (no
+    block of the image's is that short: `image_sync`), and a read the
+    image's blocks line up for, of a hole, by its fast path with zeros and
+    no command at all -- the root's disk is virtio-blk, which has the
+    asynchronous path that fast path needs (N12a); and a file written,
+    ext4's transactions committed."""
     pt.check("trace on blk disk fs turns the disk path's events on", re.search(r"\b9 events on", on) is not None,
              on)
     pt.check("hvboot, given /disk.raw, reads it and finds nothing to boot",
@@ -1014,6 +1019,7 @@ def disk_checks(on, boot, shown):
     # Each request, slot by slot, through every stage in order: no stage of
     # it before the one before, every stage of it there, done well.
     order = ["blk_submit", "disk_start", "image_sync", "disk_done", "blk_complete"]
+    fast = ["blk_submit", "disk_start", "disk_done", "blk_complete"]
     seen = []
     whole = True
     for e, f in recs:
@@ -1024,9 +1030,10 @@ def disk_checks(on, boot, shown):
         elif seen:
             seen[-1].append(e)
     for stages in seen:
-        whole = whole and stages == order
-    pt.check("each one picked up by the disk's task, served by the image then and there, done and given back, "
-             "in order", whole and len(seen) == len(submits), shown)
+        whole = whole and stages in (order, fast)
+    pt.check("each one picked up by the disk's task, served by the image then and there -- through its filesystem or "
+             "by its fast path -- done and given back, in order",
+             whole and len(seen) == len(submits) and seen != [] and seen[0] == order, shown)
     vcpu = {f.get("pid") for f in submits}
     task = {f.get("pid") for e, f in recs if e in ("disk_start", "disk_done", "image_sync")}
     pt.check("the disk's records its own task's, not the vCPU's", len(task) == 1 and not (task & vcpu), shown)
@@ -1034,8 +1041,10 @@ def disk_checks(on, boot, shown):
     pt.check("disk_done: every one served at once, and well",
              done != [] and all(f.get("how") == "at_once" and f.get("ok") == 1 for f in done), shown)
     syncs = [f for e, f in recs if e == "image_sync"]
-    pt.check("image_sync: each read's offset and length the request's, its time said",
-             [(f.get("offset"), f.get("len")) for f in syncs] == [(f.get("offset"), f.get("len")) for f in submits]
+    by_path = [(f.get("offset"), f.get("len")) for f, stages in zip(submits, seen) if stages == order]
+    pt.check("image_sync: the MBR's read through the filesystem, and each such read's offset and length the "
+             "request's, its time said",
+             [(f.get("offset"), f.get("len")) for f in syncs] == by_path and by_path[:1] == [(0, 512)]
              and all(f.get("write") == 0 and f.get("ok") == 1 and f.get("ns", 0) > 0 for f in syncs), shown)
     completes = [f for e, f in recs if e == "blk_complete"]
     pt.check("blk_complete: each given back well, from the slot it went out in",
