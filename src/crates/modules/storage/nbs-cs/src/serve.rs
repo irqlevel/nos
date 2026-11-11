@@ -55,6 +55,9 @@ const MDS_WAIT_MS: u64 = 5_000;
 const TURN_MS: u64 = 500;
 /// What came while the mds was asked, kept at most: past it, refused.
 const BACKLOG_MAX: usize = 1024;
+/// The cs's mailbox: the requests it holds at most, and their bytes.
+const MAILBOX_MESSAGES: u32 = 512;
+const MAILBOX_BYTES: usize = 16 << 20;
 /// How often what the shell shows is made again, at most: it walks the chunks.
 const SHOW_EVERY_MS: u64 = 1_000;
 const NS_PER_MS: u64 = 1_000_000;
@@ -146,7 +149,7 @@ struct Server {
 }
 
 pub fn run(shared: Arc<Shared>) {
-    let mb = match Mailbox::new_on(Limits { messages: 512, bytes: 16 << 20 }, &shared.event) {
+    let mb = match Mailbox::new_on(Limits { messages: MAILBOX_MESSAGES, bytes: MAILBOX_BYTES }, &shared.event) {
         Ok(mb) => mb,
         Err(e) => {
             klog!(0, "nbs-cs: no mailbox: {}", e.name());
@@ -185,6 +188,7 @@ impl Server {
                 self.garbage_at = now + GARBAGE_EVERY_MS * NS_PER_MS;
                 self.collect();
             }
+            self.take_looks();
             let m = match self.link.backlog.pop_front() {
                 Some(m) => Some(m),
                 None => self.link.mb.recv(Duration::from_millis(TURN_MS)),
@@ -452,6 +456,32 @@ impl Server {
             self.served += 1;
         }
         let _ = self.link.mb.reply(m, ANSWER, &bytes);
+    }
+
+    /// What has come since the last turn taken into the backlog, in its
+    /// order, the leader's looks (`Op::Ping`) answered on the way: a look
+    /// waits behind no request. The cs serves one request at a time, and a
+    /// burst of them -- the closes of a writer's stop, three flushes each,
+    /// a few hundred of them where a VM's flush takes 10 ms -- is seconds
+    /// of queue: a look behind it went unanswered for its 250 ms, and the
+    /// leader took a cs that was serving all along for silent, out of its
+    /// sets, to be copied anew (N11). Between two requests, so that a cs
+    /// stuck in one -- its device not answering -- answers none.
+    /// The backlog is held to the mailbox's own bytes, so that what is
+    /// taken out of the mailbox for a look is not room for as much again.
+    fn take_looks(&mut self) {
+        let mut bytes: usize = self.link.backlog.iter().map(|m| m.data.len()).sum();
+        while self.link.backlog.len() < BACKLOG_MAX && bytes < MAILBOX_BYTES {
+            let Some(m) = self.link.mb.recv(Duration::from_millis(0)) else { return };
+            let look = m.tag & !TAG_BULK == TAG_REQUEST
+                && Request::decode(&m.data).is_some_and(|r| matches!(r.op, Op::Ping));
+            if look {
+                self.request(&m);
+            } else {
+                bytes += m.data.len();
+                self.link.backlog.push_back(m);
+            }
+        }
     }
 
     fn request(&mut self, m: &Message) {
