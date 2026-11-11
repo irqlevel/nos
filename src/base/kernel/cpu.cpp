@@ -1097,13 +1097,21 @@ void CpuTable::reset()
     for (ulong i = 0; i < stdlib::array_size(cpu_array_); i++)
         cpu_array_[i].get_task_queue().reap_exited();
 
-    stdlib::AutoLock lock(lock_);
-
-    for (ulong i = 0; i < stdlib::array_size(cpu_array_); i++)
     {
-        auto& cpu = cpu_array_[i];
-        cpu.reset();
+        stdlib::AutoLock lock(lock_);
+
+        for (ulong i = 0; i < stdlib::array_size(cpu_array_); i++)
+        {
+            auto& cpu = cpu_array_[i];
+            cpu.reset();
+        }
     }
+
+    /* And what each queue's clear() left for it, for the same reason off
+       the table's lock and each Cpu's: the references the queues' home
+       lists held (TaskQueue::clear) */
+    for (ulong i = 0; i < stdlib::array_size(cpu_array_); i++)
+        cpu_array_[i].get_task_queue().reap_exited();
 }
 
 bool Cpu::run(Task::Func func, void *ctx)
