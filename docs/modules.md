@@ -280,6 +280,10 @@ one order (`ModuleTable::take_down`), whatever module it is:
    running or able to start;
 5. **what the drop left registered is taken off**, each said in the log as
    the module's leaving it behind, and the mailboxes it left open are closed;
+   so are a timer it left running and an interrupt handler -- a line's or an
+   MSI-X entry's -- it left registered: the bridge's slots whose code is in
+   its image (`sweep_module_slots`), which would otherwise call into pages
+   about to be freed;
 
 and only then are its pages unmapped and freed. `rmmod` must not be run from
 the module's own command, which would wait for itself.

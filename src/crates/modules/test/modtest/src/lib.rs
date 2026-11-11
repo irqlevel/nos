@@ -86,6 +86,42 @@ static CLOSED: AtomicU8 = AtomicU8::new(0);
 /// How long a `modtest hold` waits for the stop, at most.
 const HOLD_LIMIT_MS: u64 = 10_000;
 
+/* What test_module_unload holds the loader's last step to
+   (sweep_module_slots): `modtest timer` starts a periodic timer and forgets
+   its handle, as a module's bug would. Its handler is this module's code.
+   The loader has to stop it as the module goes -- left running, its next
+   tick is a call into the pages the unload has just freed. */
+
+/// Ticks of the timer `modtest timer` leaves running.
+static TICKS: AtomicU32 = AtomicU32::new(0);
+/// Its period, and how long its first tick is waited for.
+const TIMER_PERIOD_MS: u64 = 1;
+const TIMER_FIRST_TICK_MS: u64 = 2000;
+
+fn tick(ticks: &'static AtomicU32) {
+    ticks.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `modtest timer`: the timer started, seen ticking, and left.
+fn timer(out: &mut Output) {
+    let Some(left) = kcore::timer::Timer::start_for(kcore::time::Duration::from_millis(TIMER_PERIOD_MS), &TICKS, tick)
+    else {
+        let _ = writeln!(out, "modtest timer: no timer to be had");
+        return;
+    };
+    left.leak();
+    let mut ms = 0;
+    while TICKS.load(Ordering::Relaxed) == 0 && ms < TIMER_FIRST_TICK_MS {
+        kcore::task::sleep_ms(1);
+        ms += 1;
+    }
+    if TICKS.load(Ordering::Relaxed) == 0 {
+        let _ = writeln!(out, "modtest timer: started and never ticked");
+    } else {
+        let _ = writeln!(out, "modtest timer: left running");
+    }
+}
+
 impl kmod::Module for ModTest {
     fn stop(&mut self) {
         let mut said = Vec::new();
@@ -203,6 +239,10 @@ fn init(params: &kmod::Params, out: &mut Output) -> Result<Box<dyn kmod::Module>
         }
         if args.trim() == "holding" {
             let _ = writeln!(out, "modtest holding: {}", HOLDING.load(Ordering::Acquire));
+            return;
+        }
+        if args.trim() == "timer" {
+            timer(out);
             return;
         }
         if args.trim() == "bus" {

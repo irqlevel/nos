@@ -1353,7 +1353,10 @@ public:
     }
 };
 
-static char rust_legacy_handlers_buf[RUST_IRQ_SLOT_COUNT][sizeof(RustLegacyHandler)];
+/* Aligned for what is made in it: an array of char is aligned for a char,
+   and an object with a vtable's pointer made there by placement new was
+   aligned only because the linker happened to put it so */
+alignas(RustLegacyHandler) static char rust_legacy_handlers_buf[RUST_IRQ_SLOT_COUNT][sizeof(RustLegacyHandler)];
 static bool rust_legacy_handlers_init[RUST_IRQ_SLOT_COUNT];
 
 static RustLegacyHandler& get_legacy_handler(ulong i)
@@ -1552,7 +1555,7 @@ public:
     }
 };
 
-static char rust_timer_adapters_buf[RUST_TIMER_SLOT_COUNT][sizeof(RustTimerAdapter)];
+alignas(RustTimerAdapter) static char rust_timer_adapters_buf[RUST_TIMER_SLOT_COUNT][sizeof(RustTimerAdapter)];
 static bool rust_timer_adapters_init[RUST_TIMER_SLOT_COUNT];
 
 static RustTimerAdapter& get_timer_adapter(ulong i)
@@ -1732,7 +1735,8 @@ public:
     }
 };
 
-static char rust_msix_slot_handlers_buf[RUST_MSIX_SLOT_COUNT][sizeof(RustMsixSlotHandler)];
+alignas(RustMsixSlotHandler) static char rust_msix_slot_handlers_buf[RUST_MSIX_SLOT_COUNT]
+    [sizeof(RustMsixSlotHandler)];
 static bool rust_msix_slot_handlers_init[RUST_MSIX_SLOT_COUNT];
 
 static RustMsixSlotHandler& get_msix_slot_handler(ulong i)
@@ -2671,3 +2675,62 @@ unsigned int kernel_tp_pid()
 }
 
 } /* extern "C" */
+
+namespace kernel
+{
+
+/* What a module left in the slots above as it went (ModuleTable::take_down):
+   a timer, a line's handler, an MSI-X entry's, whose code is in [lo, hi) --
+   the module's image, about to be freed. Its commands, its providers and its
+   mailboxes were taken off at its unload, and these were not: a timer it
+   had leaked went on firing, into whatever had the image's memory next.
+   Each is the module's bug, said, and stopped as its own stop would have.
+   Called as an unload is, from a task, with no lock held. */
+void sweep_module_slots(ulong lo, ulong hi, const char* name)
+{
+    for (ulong i = 0; i < RUST_TIMER_SLOT_COUNT; i++)
+    {
+        ulong handle = 0;
+        ulong flags = rust_timer_lock.write_lock_irq_save();
+        const ulong code = reinterpret_cast<ulong>(rust_timer_slots[i].handler);
+        if (rust_timer_slots[i].active && !rust_timer_slots[i].stopping && code >= lo && code < hi)
+            handle = ((ulong)rust_timer_slots[i].generation << RUST_TIMER_SLOT_BITS) | (i + 1);
+        rust_timer_lock.write_unlock_irq_restore(flags);
+
+        if (handle != 0)
+        {
+            klog(0, "module: %s left a timer running (slot %lu): stopped", name, i);
+            kernel_timer_stop(handle);
+        }
+    }
+
+    for (ulong i = 0; i < RUST_IRQ_SLOT_COUNT; i++)
+    {
+        ulong flags = rust_irq_lock.write_lock_irq_save();
+        const ulong code = reinterpret_cast<ulong>(rust_irq_slots[i].handler);
+        const bool left = rust_irq_slots[i].used && code >= lo && code < hi;
+        rust_irq_lock.write_unlock_irq_restore(flags);
+
+        if (left)
+        {
+            klog(0, "module: %s left a line's interrupt handler registered (slot %lu): taken off", name, i);
+            kernel_interrupt_unregister(i + 1);
+        }
+    }
+
+    for (ulong i = 0; i < RUST_MSIX_SLOT_COUNT; i++)
+    {
+        ulong flags = rust_msix_lock.write_lock_irq_save();
+        const ulong code = reinterpret_cast<ulong>(rust_msix_slots[i].handler);
+        const bool left = rust_msix_slots[i].used && code >= lo && code < hi;
+        rust_msix_lock.write_unlock_irq_restore(flags);
+
+        if (left)
+        {
+            klog(0, "module: %s left an MSI-X handler registered (slot %lu): taken off", name, i);
+            kernel_msix_unregister_handler(i + 1);
+        }
+    }
+}
+
+}
