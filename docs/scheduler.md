@@ -185,17 +185,22 @@ displaced:
   a task whose count was up; now that would be a bug, and is a `BUG_ON`.
   Asleep, it stays: its wakeups and its deadline are this queue's.
 - Exited: put it on the CPU's `exited_list_` instead of releasing it. The
-  final `put()` frees a 32 KiB stack, which triggers a blocking cross-CPU
+  final `put()` frees a 64 KiB stack, which triggers a blocking cross-CPU
   TLB shootdown, and this code runs with interrupts off — two CPUs freeing
   exited stacks here concurrently would deadlock on each other's shootdown
   IPI. `reap_exited()` does it later from the idle task and the softirq task,
   both of which run with interrupts enabled.
 
 A brand-new task has no saved frame, so `hal::build_task_frame` fabricates one
-that looks exactly like a frame `switch_context` would have pushed, with the
-entry point where the return address goes (x86) or in `x30` via a thunk
-(arm64). The first switch into a task is therefore indistinguishable from
-any other.
+that looks exactly like a frame `switch_context` would have pushed, its
+return address a thunk's -- `task_entry_thunk` on x86, which calls the entry
+function out of `rbx`, and `x30` via a thunk on arm64. The first switch into
+a task is therefore indistinguishable from any other, the stack's alignment
+included: on x86 the frame is laid out so that `switch_context`'s callback
+on the new stack (`switch_complete`) and then the entry function are each
+entered as the ABI has it, 8 below a 16-byte boundary. It used to be made
+for the `ret` alone, straight into the entry function, which left every
+task's first `switch_complete` 8 off.
 
 ## Preemption
 
@@ -597,13 +602,27 @@ arches.
 
 ## Tasks and stacks
 
-A task's stack is 32 KiB and carries its own identity: a `Task*` and a magic
-word at the base, a second magic word at the top. `Task::get_current_task()`
-rounds the stack pointer down to a 32 KiB boundary and reads the pointer
-from there — no per-CPU variable, no register convention. It works because
-the page allocator's 8-page bucket hands out blocks aligned to their own
-size. The bottom page is a tripwire: a stack pointer inside it is a
-`BUG_ON`, not a silent corruption. There is deliberately no `klog()` in
+A task's stack is a 64 KiB block that carries its own identity: a `Task*`
+and two magic words at its top, above the stack. `Task::get_current_task()`
+rounds the stack pointer down to a 64 KiB boundary and reads the pointer
+from the block found -- no per-CPU variable, no register convention. It
+works because the page allocator's 16-page bucket hands out blocks aligned
+to their own size.
+
+The block's lowest page is no part of the stack, and is not mapped while the
+task has it (`Task::guard_stack`: the page unmapped, on every CPU; mapped
+again before the block goes back to the heap). A stack that runs out runs
+into a fault, there and then. On x86 the fault has no stack to be delivered
+on and becomes a double fault, on its IST stack, whose report says the stack
+ran out; on arm64, where an exception is taken on the stack it interrupted,
+the entry sees a data abort within a page of the stack pointer and takes it
+on the CPU's overflow stack (`vec_stack_fault`). Either report walks the
+frames that ran the stack out. Until then the page was mapped, and a
+tripwire only: a stack pointer found in it by the next
+`get_current_task()` was a `BUG_ON`, and a stack that ran on without one ran
+over its own header and into whatever the heap had put below. Not caught: a
+frame larger than the page, which steps over it. The price is a TLB
+shootdown at each task's start. There is deliberately no `klog()` in
 `get_current_task` — logging takes a lock, which calls `preempt_disable`, which
 calls `get_current_task`. Every lock asks that way (`preempt_current_task`) until a
 panic has begun; from then on a stack that is no task's -- x86's double

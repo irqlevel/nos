@@ -42,6 +42,11 @@ public:
     /* Forget the MSI-X vectors of a table being destroyed. */
     void remove_msix(MsixTable* table);
 
+    /* Forget an IOAPIC line whose last handler is unregistered: the line
+       is masked, and balance() is not to give its pin a destination --
+       nor a second entry to stand for it when it is registered again. */
+    void remove_io_apic_irq(u8 gsi);
+
     /* Called once after SMP bringup: spread recorded IRQs across CPUs. */
     void balance();
 

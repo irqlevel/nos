@@ -236,9 +236,26 @@ struct PageState
 };
 
 std::vector<PageState> pages;
-/* va -> phys of the sequence's mappings, and of MMIO */
+/* va -> phys of the sequence's mappings, and of MMIO's pages */
 std::map<ulong, ulong> maps;
 std::map<ulong, ulong> mmio;
+/* What MMIO has been mapped: (phys, pages, write-combining) -> where. The
+   same range asked for again is to be that mapping. */
+struct MmioKey
+{
+    ulong phys;
+    ulong pages;
+    bool write_combining;
+    bool operator<(const MmioKey& o) const
+    {
+        if (phys != o.phys)
+            return phys < o.phys;
+        if (pages != o.pages)
+            return pages < o.pages;
+        return write_combining < o.write_combining;
+    }
+};
+std::map<MmioKey, ulong> mmio_known;
 /* The sequence's temp mappings: va -> (phys, what it wrote there) */
 struct Tmp
 {
@@ -927,7 +944,17 @@ void unmap(fuzz::Input& in)
         if (u.second != 1 || pages[index(u.first)].ref != 2 || pages[index(u.first)].frame)
             free = false;
     }
-    tested_pt().unmap_pages(va, count, free);
+    /* The pages come back in the order unmapped, for the caller to free
+       once its shootdown is done; here there is one CPU */
+    std::vector<Page*> frames(count, nullptr);
+    tested_pt().unmap_pages(va, count, free ? frames.data() : nullptr);
+    if (free)
+    {
+        for (ulong i = 0; i < count; i++)
+            INVARIANT(frames[i] == page_of(maps[va + i * PAGE_BYTES]), "unmap_pages(0x%lx) hands back another "
+                "page for 0x%lx", va, va + i * PAGE_BYTES);
+        tested_pt().free_pages(frames.data(), count);
+    }
     for (ulong i = 0; i < count; i++)
     {
         ulong phys = maps[va + i * PAGE_BYTES];
@@ -1047,22 +1074,83 @@ void frame(fuzz::Input& in)
 
 void map_mmio(fuzz::Input& in)
 {
-    ulong pa = (machine.pages + in.below(64)) * PAGE_BYTES;
-    ulong va = pa + MemoryMap::KERNEL_SPACE_BASE;
-    if (mmio.count(va) || maps.count(va))
-        return;
+    /* A device past the machine's memory, of one to three pages, mapped
+       whole or from its second page on */
+    const ulong pa = (machine.pages + in.below(64)) * PAGE_BYTES;
+    const ulong pages = 1 + in.below(3);
     hal::write_combining = in.boolean();
-    ulong got = tested_pt().map_mmio_region(pa, 1 + in.below(PAGE_BYTES), in.boolean() ? PageTable::MmioWriteCombining
-                                                                          : PageTable::MmioUncached);
+    const bool ask_wc = in.boolean();
+    const bool wc = ask_wc && hal::write_combining;
+    const ulong size = (pages - 1) * PAGE_BYTES + 1 + in.below(PAGE_BYTES);
+    ulong got = tested_pt().map_mmio_region(pa, size, ask_wc ? PageTable::MmioWriteCombining
+                                                             : PageTable::MmioUncached);
     if (got == 0)
     {
         fuzz::reached("an MMIO map that failed on the way");
         return;
     }
-    INVARIANT(got == va, "MMIO at 0x%lx mapped at 0x%lx", pa, got);
-    mmio[va] = pa;
-    Pte leaf = leaf_of(va);
-    INVARIANT(leaf.present() && !executable(leaf), "an MMIO mapping that can be executed");
+    INVARIANT(got >= PageTable::MMIO_WINDOW && got < PageTable::MMIO_WINDOW + PageTable::TOP_ENTRY_SPAN &&
+        got % PAGE_BYTES == 0, "MMIO at 0x%lx mapped at 0x%lx, outside its window", pa, got);
+
+    /* The same range again is the mapping it has; so is a range inside one
+       mapped before, as the same pages of it */
+    ulong expected = 0;
+    for (const auto& k : mmio_known)
+    {
+        if (k.first.write_combining == wc && pa >= k.first.phys &&
+            pa + pages * PAGE_BYTES <= k.first.phys + k.first.pages * PAGE_BYTES)
+        {
+            expected = k.second + (pa - k.first.phys);
+            break;
+        }
+    }
+    if (expected != 0 && mmio_known.size() <= PageTable::MMIO_MAPPINGS_MAX)
+    {
+        /* Any mapping that holds the range will do: the kernel takes the
+           first it noted */
+        bool held = false;
+        for (const auto& k : mmio_known)
+        {
+            if (k.first.write_combining == wc && pa >= k.first.phys &&
+                pa + pages * PAGE_BYTES <= k.first.phys + k.first.pages * PAGE_BYTES &&
+                got == k.second + (pa - k.first.phys))
+                held = true;
+        }
+        INVARIANT(held, "MMIO at 0x%lx, mapped before, mapped again at 0x%lx", pa, got);
+        fuzz::reached("an MMIO map of a range mapped already");
+    }
+    else
+    {
+        for (ulong i = 0; i < pages; i++)
+        {
+            const ulong va = got + i * PAGE_BYTES;
+            INVARIANT(!mmio.count(va) && !maps.count(va), "MMIO at 0x%lx given 0x%lx, which is taken", pa, va);
+            mmio[va] = pa + i * PAGE_BYTES;
+        }
+        /* The page after it is left unmapped */
+        INVARIANT(!leaf_of(got + pages * PAGE_BYTES).present(), "MMIO at 0x%lx with no unmapped page after it", pa);
+        /* A mapping the table notes -- it notes MMIO_MAPPINGS_MAX of them --
+           says how far it runs from any address in it, and nothing of the
+           page left unmapped after it: what a user of somebody else's
+           mapping holds an offset into it to (MsixTable::setup) */
+        if (mmio_known.size() < PageTable::MMIO_MAPPINGS_MAX)
+        {
+            const ulong inside = in.below(pages * PAGE_BYTES);
+            INVARIANT(tested_pt().mmio_mapped_span(got + inside) == pages * PAGE_BYTES - inside,
+                "mmio_mapped_span(0x%lx) = 0x%lx for a mapping of %lu pages at 0x%lx", got + inside,
+                tested_pt().mmio_mapped_span(got + inside), pages, got);
+            INVARIANT(tested_pt().mmio_mapped_span(got + pages * PAGE_BYTES) == 0,
+                "mmio_mapped_span says the page after a mapping is mapped");
+            fuzz::reached("a noted MMIO mapping's span");
+        }
+        mmio_known[MmioKey{pa, pages, wc}] = got;
+    }
+    for (ulong i = 0; i < pages; i++)
+    {
+        Pte leaf = leaf_of(got + i * PAGE_BYTES);
+        INVARIANT(leaf.present() && writable(leaf) && !executable(leaf),
+            "an MMIO mapping that is not there, cannot be written or can be executed");
+    }
     fuzz::reached("an MMIO map");
 }
 
@@ -1398,6 +1486,7 @@ void reset()
     tmp_slots = 0;
     maps.clear();
     mmio.clear();
+    mmio_known.clear();
     prot.clear();
     pool_blocks.clear();
     pool_zeroed.clear();

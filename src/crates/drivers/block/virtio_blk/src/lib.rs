@@ -150,6 +150,16 @@ impl Blk {
         self.served.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Whether a completion is something to wait for: the boot is past
+    /// where an interrupt can come and a waiter be woken, and this device
+    /// has an interrupt to come. One that was given none -- no MSI-X entry
+    /// and no line left -- is polled for good, as `arm_interrupt` says of
+    /// it: waited for there, its first request once the boot was past that
+    /// point waited for ever.
+    fn waits_on_interrupt(&self) -> bool {
+        block::interrupts_started() && self.irq.get().is_some()
+    }
+
     /// Wait for a slot in the order callers asked for one, giving the CPU up
     /// while the device works through what it has. Before the scheduler runs
     /// there is nothing to yield to, so completions are collected here
@@ -164,7 +174,7 @@ impl Blk {
                 }
             }
 
-            if block::interrupts_started() {
+            if self.waits_on_interrupt() {
                 kcore::task::yield_to_runnable();
             } else {
                 self.collect();
@@ -331,9 +341,10 @@ impl Blk {
     }
 
     /// Wait for one slot's completion: blocked if there is a scheduler to
-    /// block under, polled if the boot has not got there yet.
+    /// block under and an interrupt to end the wait, polled if the boot has
+    /// not got there yet or the device has none.
     fn wait_done(&self, slot: usize) {
-        if block::interrupts_started() {
+        if self.waits_on_interrupt() {
             self.done[slot].wait();
             return;
         }
