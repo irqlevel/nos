@@ -1477,6 +1477,22 @@ each new gate.
       heap, whose window for that class holds about 170 on a 1 GiB host,
       and the client holds one a replica for its resends and clones one
       for every send. The next step's.
+    - **A flush after one that failed, done** (#95, 2026-11-11). The
+      cs's a failed flush waited for are dirty again, for the next flush to
+      ask -- the second of the two ways the question named, the first
+      failing every flush after one that failed until a person looks. The
+      cluster target's end that makes it happen (`flush_after_failed`): a
+      chunk's last active replica, the set's two others taken out by
+      `ReplicaDown` as the writer would ask, the controller held off; its
+      host crashes with a write of the chunk in its cache, every write the
+      cache held lost (the disk model's `lose_next`, one of a cut's
+      outcomes); a flush waits for it to its deadline and fails; a write to
+      a chunk the host holds nothing of, and a flush after it -- asked while
+      the first is out, or after it failed; then the host back, and the
+      restart's judge. Each way's rule now has a mutant: a failed flush's
+      cs's not asked again (3 of the first 150 seeds catch it, 28 the
+      first), and the rule before it, that a failed flush fails those out
+      after it, back (10 of 150, 13 the first). Mutants: 188.
     - **What a request out costs, done** (2026-11-11, after N10d3). A
       request out keeps no bytes: its stamp -- the session's generation, the
       map's index, the chunks it names -- and the piece's data, the
@@ -1493,7 +1509,7 @@ each new gate.
       by its id), each read back; first written and flushed unstarved, as a
       chunk whose last replica lost what it was given fails a session at
       its first write. Two mutants (186).
-    - **Open, found in N10d2: a flush after one that failed.** The client
+    - **Closed (#95, 2026-11-11), see below.** The question as it stood:
       fails, with a flush that failed, those out with it -- and no target
       catches that rule taken out: not one of the cluster target's first
       thousand seeds. And one not out yet when the first failed -- waiting

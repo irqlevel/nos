@@ -787,7 +787,11 @@ What it holds to (plans/nbs.md, "Replication: the rules"):
   acknowledged a write since the last flush began, and that some set of the
   volume still writes, to make its writes durable. It is done once they have
   and once every flush before it is, since each takes the cs's dirty when it
-  begins; one that fails fails those out after it. A close is a flush, then
+  begins; one that fails fails those out after it, and the cs's it waited
+  for are dirty again, for the next flush to ask: a flush done says durable
+  what was written before it, the failed one's too -- on its set's last
+  active replica, which no ask takes out, it would say so of a write the
+  replica lost (#95). A close is a flush, then
   every chunk written closed at once. A cs taken out of every set holds
   nothing the volume counts on: a flush, a close or a fence asked of it is
   done, not waited on -- nbs-test's repair phase found a close waiting for
@@ -1038,12 +1042,20 @@ only its metadata.
   `starve` feature, the fuzzer's alone): every host up, its writes' requests
   find no room for longer than a cs is given to answer, then do -- each done,
   none failed, no cs asked out anew while it was starved, each read back.
+  And now and then a flush after one that failed (#95): a chunk's last
+  active replica -- the set's two others taken out, as the writer would
+  ask, the controller held off -- holds a write not yet flushed when its
+  host crashes, every write its cache held lost; a flush waits for it to its
+  deadline and fails, and a write elsewhere and a flush after it, asked
+  while that one is out or after it failed, may not be done before the
+  replica is flushed -- the restart's judge holds what the replica has to
+  what the last flush done made durable.
 
-  `--mutants` takes a hundred and eighty-six rules out one at a time --
+  `--mutants` takes a hundred and eighty-eight rules out one at a time --
   seventy-three of the metadata's, five of them the controller's;
   forty-two of the cs's, twelve of them the copy's and eleven a copy-up's;
   thirty-two of the wire's, its `serve`'s, the mds's, the copy's and the
-  scrub's; thirty-nine of the client's -- each caught.
+  scrub's; forty-one of the client's -- each caught.
 - **`fuzz/raft`'s `nbsmeta` target**: the members' part of the state, its
   commands from pools of names and incarnations that meet and from wide ones
   that fill the cluster. There are four scenarios and six mutants.
