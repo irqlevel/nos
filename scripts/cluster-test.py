@@ -366,6 +366,12 @@ def main():
         lead, other = (a, c) if name == "a" else (c, a)
         rest = "c" if name == "a" else "a"
         out = lead.run("cluster remove %s" % name)
+        if "removed" not in out:
+            # What each host says of it, before the stop: whether the removal
+            # was made after all, its answer lost on the way to the host removed
+            for x, who in ((lead, name), (other, rest)):
+                for cmd in ("cluster", "cluster hosts", "ipcnet", "dmesg 2000 cluster:"):
+                    print("    [%s] %s:\n%s" % (who, cmd, x.run(cmd)), flush=True)
         need("%s, the leader of two, removed" % name, "removed" in out, out)
         log = lead.run("dmesg 2000 cluster:")
         check("%s handed the lead to %s before its own removal, as its log says" % (name, rest),

@@ -231,9 +231,15 @@ asks, and the typed name is the admin's word that they are gone.
   gives this host -- every other host and every open invitation -- whenever
   they change; ipcnet writes hosts.toml (a new file, synced, renamed over
   the old) and gives the running server the list: one writer of the file.
-  A host added is pinned at once, a host removed has its connections closed
-  at once. A list ipcnet refuses is said in the log and told again ten
-  seconds later.
+  A host added is pinned at once; a host removed stays a peer five seconds
+  more, held to the member's mailbox -- where it is refused whatever it
+  says, the registry having no host of it -- and then has its connections
+  closed: the answer the new leader owes it, to the removal it asked of it
+  when it led, gets out first. Closed at once, the answer went with the
+  link, and the removed host said no leader was known (cluster-test's
+  leader-of-two step, now and then -- the second of two runs, once). A list
+  ipcnet refuses is said
+  in the log and told again ten seconds later.
 - **`init`** starts the member over a new log with this host its one voter,
   commits `Init`, and only then writes `member`; should any of it fail, the
   member is stopped and its log and `member` removed, for an `init` again --
