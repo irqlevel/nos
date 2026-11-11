@@ -795,10 +795,22 @@ def run(*args):
     return p.returncode, first
 
 
+def fresh_build_of_good():
+    """Every file a mutant changes made newer than anything built of it: cargo
+    rebuilds a crate by its files' times alone, so a crate last built while a
+    mutant was in it -- the run before's last one, say -- whose good file came
+    back with an older time, by a copy that keeps times, would go on being
+    built in with that mutant in it, failing the gate for every mutant after
+    it (found as a mutant that seemed caught only in one copy of the tree)."""
+    for path in sorted({os.path.join(SRC, m[2]) for m in MUTANTS}):
+        os.utime(path, None)
+
+
 def main():
     wanted = set(sys.argv[1:])
     tried = 0
     missed = []
+    fresh_build_of_good()
     for name, what, file, old, new in MUTANTS:
         if wanted and name not in wanted:
             continue
