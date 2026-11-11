@@ -59,23 +59,39 @@ void __cxa_guard_abort(__guard *)
 }
 
 atexit_func_entry_t __atexit_funcs[ATEXIT_MAX_FUNCS];
-uarch_t __atexit_func_count = 0;
- 
+/* How many slots are taken: counted atomically (__cxa_atexit) */
+volatile long __atexit_func_count = 0;
+
 void *__dso_handle = 0; //Attention! Optimally, you should remove the '= 0' part and define this in your asm script.
- 
+
 int __cxa_atexit(void (*f)(void *), void *objptr, void *dso)
 {
-	if (__atexit_func_count >= ATEXIT_MAX_FUNCS) {return -1;};
-	__atexit_funcs[__atexit_func_count].destructor_func = f;
-	__atexit_funcs[__atexit_func_count].obj_ptr = objptr;
-	__atexit_funcs[__atexit_func_count].dso_handle = dso;
-	__atexit_func_count++;
+	/* The slot taken atomically. A guard keeps two CPUs from constructing
+	   the same static, not two different ones at once, and nearly every
+	   static here is made by the boot CPU -- but not all: the shell's task
+	   makes its Console on whichever CPU it starts on, while the boot CPU
+	   goes on to make the next of its own (seen at boot on both arches, 38
+	   of 39 registrations the boot CPU's and that one another's). Two that
+	   read the same count shared a slot: one destructor lost, or -- the
+	   fields written in turn -- one object's destructor kept with the
+	   other's pointer, and run on it at the halt.
+
+	   The function last, so that a slot not filled yet reads as none to
+	   __cxa_finalize. A table that is full is said: the destructor would
+	   otherwise never run, and nothing would say so. */
+	long slot = atomic_read_and_inc(&__atexit_func_count);
+	if (slot < 0 || slot >= ATEXIT_MAX_FUNCS)
+		PANIC("__cxa_atexit: more than %d static destructors", ATEXIT_MAX_FUNCS);
+	__atexit_funcs[slot].obj_ptr = objptr;
+	__atexit_funcs[slot].dso_handle = dso;
+	__atexit_funcs[slot].destructor_func = f;
 	return 0; /*I would prefer if functions returned 1 on success, but the ABI says...*/
 };
- 
+
 void __cxa_finalize(void *f)
 {
-	uarch_t i = __atexit_func_count;
+	long taken = __atexit_func_count;
+	uarch_t i = (taken > ATEXIT_MAX_FUNCS) ? ATEXIT_MAX_FUNCS : (uarch_t)taken;
 	if (!f)
 	{
 		/*
