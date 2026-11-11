@@ -340,6 +340,30 @@ bool FbTerm::setup(const FbInfo& info)
     }
 
     info_ = info;
+
+    /* A colour's field has to lie inside the pixel: its position is the
+       bootloader's word, and a pixel is shifted by it (pack_color) -- by
+       255, should it say so. A field that does not fit is left out, and
+       that colour is not drawn. */
+    struct Field
+    {
+        const char* name;
+        u8* size;
+        u8 pos;
+    } fields[] = {
+        { "red", &info_.red_size, info_.red_pos },
+        { "green", &info_.green_size, info_.green_pos },
+        { "blue", &info_.blue_size, info_.blue_pos },
+    };
+    for (auto& f : fields)
+    {
+        if (*f.size != 0 && (*f.size > 8 || f.pos > info_.bpp - *f.size))
+        {
+            klog(0, "Fb: %s is %lu bits at %lu of a pixel of %lu, left out", f.name, (ulong)*f.size, (ulong)f.pos,
+                (ulong)info_.bpp);
+            *f.size = 0;
+        }
+    }
     fb_ = (u8 *)va;
     pitch_ = info.pitch;
     width_ = info.width;
