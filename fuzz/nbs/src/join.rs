@@ -12,6 +12,10 @@
 //!   member went down -- write the source alone: taken where the source
 //!   still knows the chunk at that epoch, refused once the copy has moved
 //!   it on, and then written again as a writer of the map now;
+//! - a writer taken over since, of a map from when a member back was still
+//!   active, writes it now and then: the source, fenced against it, refuses
+//!   the write, and so must the joiner, as of an epoch before its join --
+//!   the writer after it has not fenced it yet;
 //! - the set moves on now and then (another member down), and the copy's
 //!   view is refreshed a while after;
 //! - the join is given up now and then and made again under a new version,
@@ -157,6 +161,10 @@ struct World {
     missed: Vec<(u32, u32, usize)>,
     /// The focus's race set up.
     injected: bool,
+    /// The writes of a writer taken over (`zombie_write`), drawn of their
+    /// own so that the runs go as they did, and their numbers.
+    zr: Rng,
+    zseq: u64,
     stats: [u64; 8],
 }
 
@@ -268,6 +276,33 @@ impl World {
         self.stats[1] += 1;
         let at = self.writes.len() - 1;
         self.deliver_write_at(at)
+    }
+
+    /// A writer taken over since, of a map from when a member back was still
+    /// active -- version `UNTIL` or before -- writes it: the source, fenced
+    /// against it, refuses the write, and the joiner, which the writer after
+    /// it has not fenced yet, is to refuse it too, as of an epoch before its
+    /// join. Taken, it would be marked as a client's, kept over the set's by
+    /// the copy, and written again by nobody (found by the cluster target in
+    /// N9d, which came on it at one seed in a thousand: aimed here).
+    fn zombie_write(&mut self) -> Result<(), String> {
+        let chunk = self.chunks[self.zr.below(self.chunks.len() as u64) as usize];
+        let first = self.zr.below(SLOT / SECTOR - 16);
+        let n = 1 + self.zr.below(16);
+        let version = self.zr.range(1, u64::from(UNTIL)) as u32;
+        self.zseq += 1;
+        let d = data((0x7a6f_6d62 << 32) | self.zseq, (n * SECTOR) as usize);
+        let done = self.serve_write(true, chunk, (first * SECTOR) as u32, &d, version);
+        if self.trace {
+            eprintln!("a writer taken over writes chunk {} at {} to the joiner, joining since {}: {:?}", chunk, version,
+                      self.since, done);
+        }
+        if done.is_ok() {
+            return Err(format!("the joiner, joining since {}, took a write of chunk {} at epoch {} of a writer taken \
+                                over: its copy would keep it over the set's", self.since, chunk, version));
+        }
+        self.stats[7] += 1;
+        Ok(())
     }
 
     /// Every write on its way delivered, but those held from the source:
@@ -670,7 +705,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
                         version: SINCE, since: SINCE, joining: true, own, chunks, copy: None, copy_at: None,
                         refresh_at: None, next_id: 1, net: Vec::new(), writes: Vec::new(), seq: 1 << 32, rotted: Vec::new(),
                         focus, release: false, last_working: None, closed: 0, closed_now: Vec::new(), missed: Vec::new(), injected: false,
-                        stats: [0; 8] };
+                        zr: Rng::new(mix(seed, 0x7a6f_6d62)), zseq: 0, stats: [0; 8] };
     w.begin();
     let fuse_at = if focus == Focus::None && w.r.chance(33) { Some(w.r.range(20, 300)) } else { None };
     /* Or, where it is not, armed a few writes ahead as a chunk's sums are
@@ -793,6 +828,11 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
             w.copy_at = Some(step + w.r.range(1, 150));
             w.stats[5] += 1;
         }
+        /* A writer taken over, of a map from when the member back was still
+           active, now and then: on draws of its own */
+        if own && !quiet && w.joiner.joins(SET).is_some() && !w.joiner_disk.borrow().dead() && w.zr.chance(2) {
+            w.zombie_write()?;
+        }
         match w.r.below(100) {
             0..=44 => w.deliver()?,
             45..=64 => w.step_copy(),
@@ -864,8 +904,9 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
             if std::env::var_os("NBS_JOIN_STATS").is_some() {
                 let s = w.copy.as_ref().map(|c| c.stats);
                 eprintln!("join seed {}: {:?}, own {}, cut {}, {} steps, writes {} old {} refused {}, rots {}, moves {}, \
-                           rejoins {}, crashes {}, {:?}", seed, focus, own, cut, step, w.stats[0], w.stats[1],
-                          w.stats[2], w.stats[3], w.stats[4], w.stats[5], w.stats[6], s);
+                           rejoins {}, crashes {}, a writer taken over's refused {}, {:?}", seed, focus, own, cut, step,
+                          w.stats[0], w.stats[1], w.stats[2], w.stats[3], w.stats[4], w.stats[5], w.stats[6],
+                          w.stats[7], s);
             }
             return Ok(());
         }

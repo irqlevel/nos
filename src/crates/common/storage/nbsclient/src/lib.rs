@@ -48,6 +48,20 @@
 //!   for a write; a view behind the set, or a copy-up given up meanwhile --
 //!   a join of the set begun -- has the copy-up asked again from its start
 //!   once the map is read again: each step of it does nothing done before.
+//! - A snapshot of the volume taken while it is attached pauses its writer
+//!   (N10c2): asked by this host's mds, the session sends nothing new,
+//!   closes every chunk it wrote -- each once the writes out to it are done,
+//!   each close durable after its data -- and answers: a read, a flush or a
+//!   close still out changes nothing the snapshot holds. Told to go on, it
+//!   reads its map anew, at the entry the snapshot was applied at or after,
+//!   before it writes: every chunk shared then. With no word in `PAUSE_NS`
+//!   of having answered, it attaches anew (`Reattach`) -- a snapshot of its
+//!   pause applied late would share chunks it went on writing, and the
+//!   metadata refuses one at a generation no writer has. Its own attach
+//!   only: one taken over meanwhile is refused, and fails, rather than take
+//!   the volume back from the writer after it. A stop asked while paused is
+//!   begun once the pause is over, as one asked while starting is: nothing
+//!   let go of while the pause's snapshot may still be applied.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -75,9 +89,13 @@ pub const DEADLINE_NS: u64 = 60_000_000_000;
 pub const ATTACH_NS: u64 = 10_000_000_000;
 /// How long a chunk written and flushed stays open with nothing written to it.
 pub const CLOSE_IDLE_NS: u64 = 3_000_000_000;
+/// How long a session paused for a snapshot waits for word, once it has
+/// answered, before it attaches again (N10c2).
+pub const PAUSE_NS: u64 = 10_000_000_000;
 /// What an operation's offset and length are whole multiples of.
 pub const BLOCK: u64 = 4096;
 /// Tags of the session's own operations -- a reconcile's reads and writes.
+/// A driver's tag leaves the bit clear: `submit` and `stop` refuse one set.
 const INTERNAL: u64 = 1 << 63;
 /// Why a session fails when a chunk's last active replica refuses it: the
 /// replica restarted with the chunk open at this attach's generation, so
@@ -174,6 +192,26 @@ struct CopyAsk {
     sent: u64,
     again: Option<u64>,
     done: bool,
+}
+
+/// A pause for a snapshot of the volume (N10c2), as this host's mds asked
+/// it: its number, where it is, and its answer, once sent -- and when.
+struct Pause {
+    pause: u64,
+    stage: PauseStage,
+    ask: Option<CopyAsk>,
+    since: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PauseStage {
+    /// Every chunk written closing, nothing new sent.
+    Closing,
+    /// Answered: told to go on, or attached again past `PAUSE_NS`.
+    Answered,
+    /// Told to go on: the map read anew first, asked at the snapshot's entry
+    /// or after -- a read under way at its ask's.
+    Map,
 }
 
 impl SetInfo {
@@ -380,6 +418,8 @@ pub struct Session {
     stop_flush: Option<u64>,
     /// The copy-ups under way, by place (N10).
     copies: BTreeMap<u32, CopyUp>,
+    /// A pause for a snapshot, while one is (N10c2).
+    pausing: Option<Pause>,
 }
 
 impl Session {
@@ -394,7 +434,7 @@ impl Session {
             queue: VecDeque::new(), parked: Vec::new(), fenced: BTreeSet::new(), held: BTreeMap::new(),
             dirty: BTreeSet::new(), open: BTreeMap::new(), closing: BTreeMap::new(), mend: VecDeque::new(),
             mending: None, scratch: Vec::new(), stop: None, stop_flush: None, reads: BTreeMap::new(),
-            copies: BTreeMap::new(),
+            copies: BTreeMap::new(), pausing: None,
         }
     }
 
@@ -428,6 +468,11 @@ impl Session {
     /// Operations not done yet.
     pub fn busy(&self) -> usize {
         self.ops.values().filter(|o| o.tag & INTERNAL == 0).count()
+    }
+
+    /// Whether it is paused for a snapshot (N10c2).
+    pub fn paused(&self) -> bool {
+        self.pausing.is_some()
     }
 
     /// Whether some set of the volume, as the session's view has it, writes
@@ -474,6 +519,9 @@ impl Session {
         s += &alloc::format!("; open {:?}; closing {:?}; asked out {:?}; stop {:?}/{:?}; mds {:?}", self.open,
                              self.closing, self.downs.keys().collect::<Vec<_>>(), self.stop, self.stop_flush,
                              self.mds.as_ref().map(|m| m.want));
+        if let Some(p) = &self.pausing {
+            s += &alloc::format!("; paused for snapshot {} ({:?}) since {}", p.pause, p.stage, p.since);
+        }
         for (place, c) in &self.copies {
             s += &alloc::format!("; copy-up of place {}: to {:?}, members {:?}, held {:?}, asking {:?}{}", place,
                                  c.to, c.waiting, c.held, c.ask.as_ref().map(|a| if a.done { "done" } else { "up" }),
@@ -517,6 +565,12 @@ impl Session {
             return;
         }
         let Some(s) = Saying::decode(bytes) else { return };
+        /* A pause for a snapshot (N10c2): asked unasked, and its end */
+        match s.said {
+            Said::Pause { pause } => return self.on_pause(pause, now, bufs, out),
+            Said::GoOn { pause, index } => return self.on_go_on(pause, index, now, bufs, out),
+            _ => {}
+        }
         if self.mds.as_ref().is_some_and(|m| m.id == s.id) {
             self.on_mds_ask(s.said, now, bufs, out);
             return;
@@ -716,6 +770,11 @@ impl Session {
                     } else if let Some(&(chunk, incarnation, _)) = self.map.places.get(place as usize) {
                         self.copied(place, chunk, incarnation, now, bufs, out);
                     }
+                }
+                /* Paused for a snapshot and told to go on: on, the map read
+                   anew at the snapshot's entry or after */
+                if self.pausing.as_ref().is_some_and(|p| p.stage == PauseStage::Map) {
+                    self.unpause(now, bufs, out);
                 }
             }
         }
@@ -1533,8 +1592,10 @@ impl Session {
                 continue;
             };
             /* Serving, or stopping: what was asked before the stop is done
-               before it */
-            let serving = matches!(self.phase, Phase::Serving | Phase::Stopping) || o.tag & INTERNAL != 0;
+               before it -- and nothing of the driver's while paused for a
+               snapshot (N10c2) */
+            let serving = (matches!(self.phase, Phase::Serving | Phase::Stopping) && self.pausing.is_none())
+                || o.tag & INTERNAL != 0;
             let ready = match o.kind {
                 Kind::Read => serving,
                 Kind::Write => {
@@ -1552,6 +1613,7 @@ impl Session {
             self.launch(id, now, bufs, out);
         }
         self.maybe_stop(now, bufs, out);
+        self.pause_step(now, bufs, out);
     }
 
     /// Operation `id` out: a read's or a write's pieces sent, a flush's.
@@ -1746,6 +1808,7 @@ impl Session {
         }
         self.closes_progress(now, bufs, out);
         self.maybe_stop(now, bufs, out);
+        self.pause_step(now, bufs, out);
     }
 
     /// Every close of the driver's that waits on its places, looked at.
@@ -1776,31 +1839,121 @@ impl Session {
         }
     }
 
+    /* ---- a pause for a snapshot (N10c2) ---- */
+
+    /// This host's mds asks the session to pause for a snapshot of its
+    /// volume: a writer serving takes it -- one starting, stopping, or
+    /// paused already, not: the mds is answered by none, and gives up.
+    fn on_pause(&mut self, pause: u64, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
+        if !self.writable || self.phase != Phase::Serving || self.pausing.is_some() {
+            return;
+        }
+        self.pausing = Some(Pause { pause, stage: PauseStage::Closing, ask: None, since: now });
+        self.pause_step(now, bufs, out);
+    }
+
+    /// The pause on: every chunk written closed -- one a piece is out to once
+    /// it is done, as a place busy stays open; each close durable after its
+    /// data -- and once they are, answered.
+    fn pause_step(&mut self, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
+        if self.pausing.as_ref().map(|p| p.stage) != Some(PauseStage::Closing) {
+            return;
+        }
+        self.close_idle(now, bufs, out, true);
+        if !self.closing.is_empty() || !self.open.is_empty() {
+            return;
+        }
+        let Some(pause) = self.pausing.as_ref().map(|p| p.pause) else { return };
+        let id = self.take_id();
+        let bytes = Asking { id, ask: Ask::Paused { name: self.name.clone(), generation: self.generation, pause } }
+            .encode();
+        out.push(Out::Send { to: To::Mds, id, bytes: bytes.clone() });
+        if let Some(p) = self.pausing.as_mut() {
+            p.stage = PauseStage::Answered;
+            p.ask = Some(CopyAsk { id, bytes, sent: now, again: None, done: false });
+            p.since = now;
+        }
+    }
+
+    /// Told to go on from pause `pause`: answered, the map read anew at the
+    /// snapshot's entry `index` or after, before anything is written; not
+    /// answered yet -- the mds gave up, and took no snapshot -- on at once.
+    fn on_go_on(&mut self, pause: u64, index: u64, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
+        let Some(stage) = self.pausing.as_ref().filter(|p| p.pause == pause).map(|p| p.stage) else { return };
+        match stage {
+            PauseStage::Answered => {
+                self.index = self.index.max(index);
+                if let Some(p) = self.pausing.as_mut() {
+                    p.stage = PauseStage::Map;
+                    p.ask = None;
+                }
+                /* A read under way may be of before the snapshot: asked anew,
+                   its answer that of an ask no longer out */
+                self.reading = Some(Map::default());
+                self.ask_map(0, now, out);
+            }
+            PauseStage::Map => {}
+            PauseStage::Closing => self.unpause(now, bufs, out),
+        }
+    }
+
+    /// The pause over: on -- and a stop asked meanwhile begun.
+    fn unpause(&mut self, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
+        self.pausing = None;
+        self.serve(now, bufs, out);
+    }
+
+    /// Paused and answered, with no word in `PAUSE_NS`: its own attach anew,
+    /// at a new generation -- a snapshot of the pause applied late is refused
+    /// then, where going on would have it share chunks written since. Its
+    /// own only: a session taken over meanwhile is refused, and fails.
+    fn attach_again(&mut self, now: u64, out: &mut Vec<Out>) {
+        out.push(Out::Say(alloc::format!("nbs: volume {}: paused for a snapshot, and no word of it in {} s -- attached \
+                                          again", self.name, PAUSE_NS / 1_000_000_000)));
+        self.pausing = None;
+        self.reading = None;
+        self.subs.clear();
+        self.downs.clear();
+        self.copies.clear();
+        self.fenced.clear();
+        self.held.clear();
+        self.phase = Phase::Attaching;
+        self.attach_from = now;
+        self.token = self.token.wrapping_add(1).max(1);
+        let ask = Ask::Reattach { name: self.name.clone(), generation: self.generation, token: self.token };
+        self.ask_mds(MdsWant::Attach, ask, now, out);
+    }
+
     /* ---- the stop ---- */
 
     /// The session stopped once the operations out are done: a flush, every
     /// chunk written closed, the volume let go of -- operation `tag` done
-    /// then.
+    /// then. `tag` is the driver's, as an operation's is: one of the
+    /// session's own is refused -- its flush would be done as an operation
+    /// of the session's, told to nobody.
     pub fn stop(&mut self, tag: u64, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
-        match self.phase {
-            Phase::Failed(_) | Phase::Detached => {
-                out.push(Out::Done { tag, ok: matches!(self.phase, Phase::Detached) });
-                return;
-            }
-            /* Asked again: the first stands */
-            Phase::Stopping => {
-                out.push(Out::Done { tag, ok: false });
-                return;
-            }
-            /* Still starting: begun once it serves, as the start leaves the
-               volume as the stop wants it -- fenced, reconciled */
-            Phase::Attaching | Phase::Mapping | Phase::Fencing | Phase::Reconciling => {
-                self.stop = Some(tag);
-                return;
-            }
-            Phase::Serving => {}
+        if tag & INTERNAL != 0 {
+            out.push(Out::Done { tag, ok: false });
+            return;
+        }
+        if matches!(self.phase, Phase::Failed(_) | Phase::Detached) {
+            out.push(Out::Done { tag, ok: matches!(self.phase, Phase::Detached) });
+            return;
+        }
+        /* Asked again: the first stands */
+        if self.stop.is_some() {
+            out.push(Out::Done { tag, ok: false });
+            return;
         }
         self.stop = Some(tag);
+        /* Still starting, or paused for a snapshot (N10c2): begun once it
+           serves -- the start leaves the volume as the stop wants it, fenced
+           and reconciled; the pause's end, with nothing let go of while its
+           snapshot may still be applied, and what was asked before the stop
+           done before it, whether it goes on or attaches anew */
+        if self.phase != Phase::Serving || self.pausing.is_some() {
+            return;
+        }
         if !self.writable {
             self.phase = Phase::Stopping;
             self.detach(now, out);
@@ -1858,6 +2011,7 @@ impl Session {
         self.subs.clear();
         self.downs.clear();
         self.copies.clear();
+        self.pausing = None;
         self.mds = None;
         if let Some(tag) = self.stop.take() {
             out.push(Out::Done { tag, ok: false });
@@ -1892,13 +2046,17 @@ impl Session {
                 out.push(Out::Send { to: To::Mds, id: d.id, bytes: d.bytes.clone() });
             }
         }
-        for a in self.copies.values_mut().filter_map(|c| c.ask.as_mut()) {
+        for a in self.copies.values_mut().filter_map(|c| c.ask.as_mut()).chain(self.pausing.iter_mut().filter_map(|p| p.ask.as_mut())) {
             let due = a.again.map_or(now >= a.sent + RESEND_NS, |t| now >= t);
             if due {
                 a.sent = now;
                 a.again = None;
                 out.push(Out::Send { to: To::Mds, id: a.id, bytes: a.bytes.clone() });
             }
+        }
+        if self.pausing.as_ref().is_some_and(|p| p.stage == PauseStage::Answered && now >= p.since + PAUSE_NS) {
+            self.attach_again(now, out);
+            return;
         }
         let mut silent = Vec::new();
         for (&id, s) in self.subs.iter_mut() {

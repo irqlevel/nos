@@ -110,6 +110,7 @@ const USAGE: &str = "usage: nbs                          this host's member: inc
                      \x20      nbs volume create <name> <size> [host=<host>]   size in MiB, or with M, G, T\n\
                      \x20      nbs volume delete <name>\n\
                      \x20      nbs volume resize <name> <size>\n\
+                     \x20      nbs volume snapshot <volume> <name>   on the host it is attached on, its writer paused\n\
                      \x20      nbs io write <volume> <offset> <bytes> <byte>   through the cs's; read <volume> \
                      <offset> <bytes>,\n\
                      \x20                                 attach <volume> [force], flush, close, held and detach \
@@ -649,6 +650,7 @@ fn run(state: &Arc<ModState>, args: &str, out: &mut Output) -> Result<(), String
             let _ = writeln!(out, "nbs: volume {} ({}) is {} now", name, id, store::Mib(size_mib));
             Ok(())
         }
+        ["volume", "snapshot", volume, name] => io::snapshot(state, volume, name, out),
         ["volume", name] => store::show_volume(&member_view(state)?, name, out),
         ["io", rest @ ..] => io::run(state, rest, out),
         _ => Err(String::from(USAGE)),

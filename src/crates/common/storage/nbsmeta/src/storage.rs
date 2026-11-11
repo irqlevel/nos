@@ -290,6 +290,9 @@ impl State {
             Command::Detach { name, host, generation } => {
                 self.detach(name, host, *generation).map(|generation| Answer::Attached { generation })
             }
+            Command::Reattach { name, host, generation, token } => {
+                self.reattach(name, host, *generation, *token).map(|generation| Answer::Attached { generation })
+            }
             Command::Digest { at, digest } => {
                 self.checks.compare(*at, digest, index);
                 Ok(Answer::Checked)
@@ -707,6 +710,25 @@ impl State {
             v.readers.push(String::from(host));
         }
         Ok(0)
+    }
+
+    /// The writer's own attach anew (N10c2): a new generation, only where the
+    /// volume's writer is still `host`'s at `generation`; asked again by its
+    /// token, answered as it was.
+    fn reattach(&mut self, name: &str, host: &str, generation: u64, token: u64) -> Result<u64, Refusal> {
+        self.ready()?;
+        self.member_host(host)?;
+        let Some(at) = self.volume_at(name) else { return Err(Refusal::NoSuchVolume) };
+        let v = self.volumes.get_mut(at).ok_or(Refusal::NoSuchVolume)?;
+        if let Some(w) = v.writer.as_ref().filter(|w| token != 0 && w.token == token && w.host == host) {
+            return Ok(w.generation);
+        }
+        if generation == 0 || !v.writer.as_ref().is_some_and(|w| w.host == host && w.generation == generation) {
+            return Err(Refusal::NotTheWriter);
+        }
+        v.generation += 1;
+        v.writer = Some(Attach { host: String::from(host), generation: v.generation, token });
+        Ok(v.generation)
     }
 
     fn detach(&mut self, name: &str, host: &str, generation: u64) -> Result<u64, Refusal> {

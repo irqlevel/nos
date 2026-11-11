@@ -968,6 +968,13 @@ pub enum Ask {
     CopyUp { name: String, place: u32, generation: u64 },
     /// The copy-up at place `place` done: the map names chunk `chunk` there.
     CopyDone { name: String, place: u32, generation: u64, chunk: u32 },
+    /// Paused for snapshot `pause` (N10c2): every chunk the writer at
+    /// `generation` wrote closed, nothing new sent.
+    Paused { name: String, generation: u64, pause: u64 },
+    /// The writer's own attach at `generation` anew (N10c2): a pause with no
+    /// word -- refused where it is no longer the writer. `token` its
+    /// session's now, by which it is asked again.
+    Reattach { name: String, generation: u64, token: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1004,6 +1011,12 @@ pub enum Said {
     /// A copy-up's chunk (N10): the chunk, its incarnation, and the entry the
     /// answer was applied at.
     Chunk { chunk: u32, incarnation: u32, index: u64 },
+    /// The writer's session asked to pause for a snapshot of its volume
+    /// (N10c2), by this host's mds: unasked, as `pause`.
+    Pause { pause: u64 },
+    /// The pause over: the map read again at entry `index` at least -- every
+    /// chunk shared there where the snapshot was taken.
+    GoOn { pause: u64, index: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1075,6 +1088,18 @@ impl Asking {
                 w.u64(*generation);
                 w.u32(*chunk);
             }
+            Ask::Paused { name, generation, pause } => {
+                w.u8(7);
+                w.str(name);
+                w.u64(*generation);
+                w.u64(*pause);
+            }
+            Ask::Reattach { name, generation, token } => {
+                w.u8(8);
+                w.str(name);
+                w.u64(*generation);
+                w.u64(*token);
+            }
         }
         w.buf
     }
@@ -1121,6 +1146,14 @@ impl Asking {
                 let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);
                 let (place, generation) = (r.u32()?, r.u64()?);
                 Ask::CopyDone { name, place, generation, chunk: r.u32()? }
+            }
+            7 => {
+                let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);
+                Ask::Paused { name, generation: r.u64()?, pause: r.u64()? }
+            }
+            8 => {
+                let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);
+                Ask::Reattach { name, generation: r.u64()?, token: r.u64()? }
             }
             _ => return None,
         };
@@ -1192,6 +1225,15 @@ impl Saying {
                 w.u32(*incarnation);
                 w.u64(*index);
             }
+            Said::Pause { pause } => {
+                w.u8(11);
+                w.u64(*pause);
+            }
+            Said::GoOn { pause, index } => {
+                w.u8(12);
+                w.u64(*pause);
+                w.u64(*index);
+            }
         }
         w.buf
     }
@@ -1258,6 +1300,8 @@ impl Saying {
             8 => Said::LastReplica,
             9 => Said::NotTheWriter,
             10 => Said::Chunk { chunk: r.u32()?, incarnation: r.u32()?, index: r.u64()? },
+            11 => Said::Pause { pause: r.u64()? },
+            12 => Said::GoOn { pause: r.u64()?, index: r.u64()? },
             _ => return None,
         };
         r.done().then_some(Saying { id, said })

@@ -239,7 +239,7 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
             (3, Answered { id, told }.encode(), ok)
         }
         4 => {
-            let ask = match r.below(6) {
+            let ask = match r.below(8) {
                 0 => Ask::Attach { name: name(r, nbsmeta::VOLUME_NAME_MAX), writable: r.chance(50),
                                    force: r.chance(50), token: r.below(u64::MAX) },
                 1 => Ask::Detach { name: name(r, nbsmeta::VOLUME_NAME_MAX), generation: r.below(u64::MAX) },
@@ -255,23 +255,28 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                 }
                 3 => Ask::Down { set: r.below(1 << 32) as u32, cs: r.below(1 << 32) as u32, refused: r.chance(50),
                                  name: name(r, nbsmeta::VOLUME_NAME_MAX), generation: r.below(u64::MAX) },
-                /* A copy-up's asks (N10) */
+                /* A copy-up's asks (N10), a pause's answer (N10c2) */
                 4 => Ask::CopyUp { name: name(r, nbsmeta::VOLUME_NAME_MAX), place: r.below(1 << 32) as u32,
                                    generation: r.below(u64::MAX) },
+                5 => Ask::Paused { name: name(r, nbsmeta::VOLUME_NAME_MAX), generation: r.below(u64::MAX),
+                                   pause: r.below(u64::MAX) },
+                6 => Ask::Reattach { name: name(r, nbsmeta::VOLUME_NAME_MAX), generation: r.below(u64::MAX),
+                                     token: r.below(u64::MAX) },
                 _ => Ask::CopyDone { name: name(r, nbsmeta::VOLUME_NAME_MAX), place: r.below(1 << 32) as u32,
                                      generation: r.below(u64::MAX), chunk: r.below(1 << 32) as u32 },
             };
             let ok = match &ask {
                 Ask::Attach { name, .. } | Ask::Detach { name, .. } => name.len() <= nbsmeta::VOLUME_NAME_MAX,
                 Ask::Map { name, count, .. } => name.len() <= nbsmeta::VOLUME_NAME_MAX && *count <= MAP_MAX,
-                Ask::Down { name, .. } | Ask::CopyUp { name, .. } | Ask::CopyDone { name, .. } => {
+                Ask::Down { name, .. } | Ask::CopyUp { name, .. } | Ask::CopyDone { name, .. }
+                | Ask::Paused { name, .. } | Ask::Reattach { name, .. } => {
                     name.len() <= nbsmeta::VOLUME_NAME_MAX
                 }
             };
             (4, Asking { id, ask }.encode(), ok)
         }
         _ => {
-            let said = match r.below(10) {
+            let said = match r.below(12) {
                 0 => Said::Attached { generation: r.below(u64::MAX), index: r.below(u64::MAX) },
                 1 => Said::Detached { index: r.below(u64::MAX) },
                 2 => {
@@ -290,6 +295,9 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                 /* A copy-up's chunk (N10) */
                 8 => Said::Chunk { chunk: r.below(1 << 32) as u32, incarnation: r.below(1 << 32) as u32,
                                    index: r.below(u64::MAX) },
+                /* A pause for a snapshot, and its end (N10c2) */
+                9 => Said::Pause { pause: r.below(u64::MAX) },
+                10 => Said::GoOn { pause: r.below(u64::MAX), index: r.below(u64::MAX) },
                 _ => Said::Refused(reason(r)),
             };
             let ok = match &said {

@@ -51,7 +51,13 @@ impl From<String> for Failure {
 
 /// `cmd`, as the metadata answers it: a refusal as a failure of its own.
 pub fn ask(state: &ModState, cmd: &Command) -> Result<Answer, Failure> {
-    match raftmember::ask(&state.shared, cmd, crate::NO_MEMBER) {
+    ask_turning(state, cmd, &mut |ms| kcore::task::sleep_ms(ms))
+}
+
+/// `ask`, `turn` given the time between two looks at the answer: a
+/// command's that drives something of its own as it waits.
+fn ask_turning(state: &ModState, cmd: &Command, turn: &mut dyn FnMut(u64)) -> Result<Answer, Failure> {
+    match raftmember::ask_turning(&state.shared, cmd, crate::NO_MEMBER, turn) {
         Ok(Answer::Refused(why)) => Err(Failure::Refused(why)),
         Ok(a) => Ok(a),
         Err(why) => Err(Failure::Other(why)),
@@ -222,6 +228,18 @@ pub fn volume_delete(state: &ModState, name: &str) -> Result<u32, Failure> {
 pub fn volume_resize(state: &ModState, name: &str, size_mib: u64) -> Result<u32, Failure> {
     caught_up(state)?;
     volume_id(ask(state, &Command::VolumeResize { name: String::from(name), size_mib })?)
+}
+
+/// A snapshot of volume `volume` as `name` (N10c2): attached, on this host,
+/// its writer paused for it -- the member's to do -- else refused; detached,
+/// taken as it is. `turn` given the time the answer is waited for.
+pub fn volume_snapshot(state: &ModState, volume: &str, name: &str, turn: &mut dyn FnMut(u64))
+    -> Result<u32, Failure>
+{
+    caught_up(state)?;
+    let cmd = Command::Snapshot { volume: String::from(volume), name: String::from(name),
+                                  generation: crate::member::PAUSE_FIRST };
+    volume_id(ask_turning(state, &cmd, turn)?)
 }
 
 /// A size as it is typed: MiB, or with M, G or T after it.
