@@ -69,6 +69,10 @@ pub(crate) struct Disk {
     own_cut: bool,
     /// Where copy A of the fences and of the table are, and how long each.
     copy_a: [(u64, u64); 2],
+    /// The next cut loses every write the cache holds (#95): the power gone
+    /// before any of them reached the media -- one of a cut's outcomes,
+    /// had by choice.
+    lose_all: bool,
 }
 
 impl Disk {
@@ -79,7 +83,7 @@ impl Disk {
         /* The fences' copy A: slot 0's pages 2 to 34 */
         let copy_a = [(2 * PAGE, 32 * PAGE), table];
         Disk { sector, bytes, own_end, durable: BTreeMap::new(), pending: Vec::new(), fuse: None, dead: false,
-               tear_next: false, own_cut: false, copy_a }
+               tear_next: false, own_cut: false, copy_a, lose_all: false }
     }
 
     fn apply(durable: &mut BTreeMap<u64, Vec<u8>>, sector: u64, op: &Op, keep: &dyn Fn(u64) -> bool) {
@@ -129,6 +133,10 @@ impl Disk {
         self.dead = false;
         let pending = std::mem::take(&mut self.pending);
         self.own_cut = pending.iter().any(|op| matches!(op, Op::Write { at, .. } if *at < self.own_end));
+        if std::mem::take(&mut self.lose_all) {
+            self.tear_next = false;
+            return;
+        }
         let s = self.sector as usize;
         for op in &pending {
             /* One of the cs's own sectors the write changes, torn inside,
@@ -191,6 +199,12 @@ impl Disk {
             v[(bit / 8) as usize] ^= 1 << (bit % 8);
         }
         true
+    }
+
+    /// The next cut to lose every write the cache holds (the `cluster`
+    /// target's, #95).
+    pub(crate) fn lose_next(&mut self) {
+        self.lose_all = true;
     }
 
     /// The power to fail at the `n`th write or flush from now (the `join`

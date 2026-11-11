@@ -2896,6 +2896,114 @@ impl World {
         Ok(true)
     }
 
+    /// A flush after one that failed (#95): the last active replica of a
+    /// chunk's set, on host `x` -- its two others taken out, as the writer
+    /// would ask -- holds a write not yet flushed when `x` crashes, every
+    /// write its cache held lost; a flush waits for it to its deadline and
+    /// fails. A write to a chunk `x` holds nothing of, and a flush after it
+    /// -- asked while the first is out, or after it failed -- is not done
+    /// before `x` is flushed: the write on `x` is lost, and a flush done says
+    /// durable what was written before it. `x` back, the restart's judge
+    /// holds each block it has to what the last flush done made durable.
+    /// The controller held off meanwhile, so that `x` stays the last
+    /// active. Drawn of `r`, its own.
+    fn flush_after_failed(&mut self, r: &mut Rng) -> Result<bool, String> {
+        let Some(c) = self.current() else { return Ok(false) };
+        let idle = |w: &World, c: usize| w.clients[c].ops.is_empty() || !w.serving(c);
+        self.drive(c, &|w, c| {
+            w.serving(c) || w.clients[c].zombie || matches!(w.clients[c].s.phase(), Phase::Failed(_) | Phase::Detached)
+        })?;
+        self.drive(c, &idle)?;
+        if !self.serving(c) || self.down.is_some() {
+            return Ok(false);
+        }
+        /* A place whose set's three are active with no joiner, one of them on
+           a host other than the writer's -- and a place whose set has
+           nothing on that host */
+        let me = self.clients[c].host;
+        let Some(map) = self.state.volume(VOLUME).map(|v| v.map.clone()) else { return Ok(false) };
+        let set_of = |w: &World, chunk: u32| w.state.chunks().get(chunk as usize).map(|ch| ch.set);
+        let mut pick = None;
+        'places: for (p, &chunk) in map.iter().enumerate() {
+            let Some(set) = set_of(self, chunk) else { continue };
+            let Some(s) = self.state.sets().get(set as usize) else { continue };
+            if s.joiner.is_some() || s.replicas.iter().any(|&x| x != Replica::Active) {
+                continue;
+            }
+            for i in 0..nbsmeta::REPLICAS {
+                let Some(x) = self.host_of_cs(s.cs[i]) else { continue };
+                if x == me {
+                    continue;
+                }
+                let xcs = self.hosts[x].cs;
+                let far = map.iter().enumerate().find(|&(_, &qc)| set_of(self, qc).and_then(|qs| self.state.sets()
+                    .get(qs as usize)).is_some_and(|t| !t.cs.contains(&xcs) && t.joiner.is_none_or(|j| j.cs != xcs)));
+                if let Some((q, _)) = far {
+                    pick = Some((p as u64, set, i, x, q as u64));
+                    break 'places;
+                }
+            }
+        }
+        let Some((p, set, i, x, q)) = pick else { return Ok(false) };
+        let held = self.plan_at;
+        self.plan_at = u64::MAX;
+        let shaped = self.flush_after_failed_at(c, r, p, set, i, x, q);
+        self.plan_at = held;
+        shaped
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn flush_after_failed_at(&mut self, c: usize, r: &mut Rng, p: u64, set: u32, i: usize, x: usize, q: u64)
+                             -> Result<bool, String> {
+        let idle = |w: &World, c: usize| w.clients[c].ops.is_empty() || !w.serving(c);
+        let per = SLOT / BLOCK;
+        let (bp, bq) = (p * per + r.below(per), q * per + r.below(per));
+        /* Written and flushed: durable on the set's three */
+        self.submit_op(c, K::Write(1 + r.below(255) as u8), bp, 1)?;
+        self.submit_op(c, K::Flush, 0, 0)?;
+        self.drive(c, &idle)?;
+        if !self.serving(c) || self.down.is_some() {
+            return Ok(false);
+        }
+        /* The set's two others taken out, as its writer asks: x its last
+           active */
+        let generation = self.clients[c].s.generation();
+        let Some(others) = self.state.sets().get(set as usize)
+            .map(|s| (0..nbsmeta::REPLICAS).filter(|&k| k != i).map(|k| s.cs[k]).collect::<Vec<u32>>()) else {
+            return Ok(false);
+        };
+        for cs in others {
+            if !matches!(self.apply(Command::ReplicaDown { set, cs, refused: false, name: String::from(VOLUME),
+                                                           generation }), Answer::Set { .. }) {
+                return Ok(false);
+            }
+        }
+        /* Written there again: to x alone, once the view is read again */
+        self.submit_op(c, K::Write(1 + r.below(255) as u8), bp, 1)?;
+        self.drive(c, &idle)?;
+        if !self.serving(c) || self.down.is_some() {
+            return Ok(false);
+        }
+        /* x crashes, every write its cache held lost -- that one with them */
+        self.hosts[x].disk.borrow_mut().lose_next();
+        self.crash(x)?;
+        /* A flush, x's to make: it waits for x, which no ask takes out, to
+           its deadline -- and a write elsewhere and a flush after it, asked
+           while that one is out or after it failed */
+        let early = r.chance(50);
+        self.submit_op(c, K::Flush, 0, 0)?;
+        if !early {
+            self.drive(c, &idle)?;
+        }
+        self.submit_op(c, K::Write(1 + r.below(255) as u8), bq, 1)?;
+        self.submit_op(c, K::Flush, 0, 0)?;
+        self.drive(c, &idle)?;
+        /* x back: what it has held to what the last flush done made durable */
+        self.restart(x)?;
+        self.count(if early { "flushes asked while one before was failing" } else { "flushes asked after one failed" });
+        Ok(true)
+    }
+
     /// The writer now: the newest not lost or taken over.
     fn current(&self) -> Option<usize> {
         (0..self.clients.len()).rev().find(|&c| !self.clients[c].zombie)
@@ -3123,6 +3231,12 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
        own so that the ends above go as they did */
     if !shaped && lost.is_none() && Rng::new(mix(seed, 0x666f_666c)).chance(30) {
         w.found_open_flush().map_err(|e| format!("the end: {}", e))?;
+    }
+    /* A flush after one that failed (#95), drawn of its own, so that the
+       ends it does not shape go as they did */
+    let mut flushes = Rng::new(mix(seed, 0x666c_6166));
+    if !shaped && lost.is_none() && flushes.chance(30) {
+        w.flush_after_failed(&mut flushes).map_err(|e| format!("the end: {}", e))?;
     }
     /* Writes whose requests find no memory for a while (#97), drawn of
        their own, so that the ends they do not shape go as they did */
