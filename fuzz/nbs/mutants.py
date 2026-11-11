@@ -690,6 +690,15 @@ MUTANTS = [
      'nbsclient/src/lib.rs',
      '        if self.stop.is_some() {\n            out.push(Out::Done { tag, ok: false });\n            return;\n        }\n        self.stop = Some(tag);',
      '        self.stop = Some(tag);'),
+    # #95: a flush after one that failed
+    ('client_flush_failed_after', "a flush failed fails those out after it, which flush what it was to too",
+     'nbsclient/src/lib.rs',
+     '        let later: Vec<u64> = self.ops.iter().filter(|(&id, x)| id >= op && x.kind.flushes() && x.out)',
+     '        let later: Vec<u64> = self.ops.iter().filter(|(&id, x)| id == op && x.kind.flushes() && x.out)'),
+    ('client_flush_failed_redirty', "the cs's a failed flush waited for asked by the next flush",
+     'nbsclient/src/lib.rs',
+     '                self.dirty.extend(core::mem::take(&mut o.waiting));',
+     '                o.waiting.clear();'),
     # #97: a request with no memory for it now
     ('client_starved_again', "a request that found no memory sent again in a moment",
      'nbsclient/src/lib.rs',

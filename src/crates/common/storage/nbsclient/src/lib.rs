@@ -1844,7 +1844,8 @@ impl Session {
     }
 
     /// Flush `op` failed: and the flushes out after it with it, as what it
-    /// was to flush was written before them too.
+    /// was to flush was written before them too; the cs's it waited for
+    /// dirty again, for the next flush to ask.
     fn flush_failed(&mut self, op: u64, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
         let later: Vec<u64> = self.ops.iter().filter(|(&id, x)| id >= op && x.kind.flushes() && x.out)
             .map(|(&id, _)| id).collect();
@@ -1855,7 +1856,12 @@ impl Session {
         }
         let closing = match self.ops.get_mut(&op) {
             Some(o) => {
-                o.waiting.clear();
+                /* What it waited for dirty again, for the next flush to ask:
+                   a flush done says durable what was written before it --
+                   this one's too, on a cs still in its set (its last active
+                   replica, which no ask takes out) -- so one launched after
+                   this failed must not be done without them (#95) */
+                self.dirty.extend(core::mem::take(&mut o.waiting));
                 o.closing.take().is_some()
             }
             None => false,
