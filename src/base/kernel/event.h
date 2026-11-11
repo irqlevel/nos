@@ -74,7 +74,12 @@ public:
        -- so the event must outlive every signal() that may still be running:
        whoever frees it has to know that no signaller is left, not merely
        that the waiter woke. The waiting task need not: its wait() returns
-       only once no signal() may touch it (let_go). */
+       only once no signal() may touch it (let_go).
+
+       What the caller wrote for the waiter before the call is there for the
+       waiter that takes the signal, whatever it was written with -- plain
+       stores included, a lock-free ring's push: signal() makes a full
+       barrier between them and its look at the flag (signal_holding). */
     void signal();
 
     /* signal(), holding the waiter it found for hold_ns inside its window --

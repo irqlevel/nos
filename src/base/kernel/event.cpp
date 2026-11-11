@@ -5,6 +5,7 @@
 #include "cpu.h"
 #include "panic.h"
 
+#include <hal/barrier.h>
 #include <hal/cpu.h>
 #include <hal/irqchip.h>
 
@@ -174,10 +175,34 @@ void Event::signal()
 void Event::signal_holding(ulong hold_ns)
 {
     /* Published first. A plain read before the locked operation, so a burst
-       of signals to a busy waiter costs one locked instruction, not one
-       each. */
+       of signals to a busy waiter does not take the event's line from it
+       for each.
+
+       But with the flag found up nothing here was a locked instruction, and
+       the flag is not all a signal publishes: what the caller made for the
+       waiter just before -- a completion pushed onto a lock-free ring, its
+       last steps plain stores -- may still be in this CPU's store buffer.
+       The waiter that takes the flag now and looks for its work then does
+       not see it, finds nothing, and goes back to sleep on a flag this call
+       left as it was: work queued, the waiter asleep, and no signal owed.
+       On x86 a store followed by a load is the one pair the CPU reorders;
+       on arm64 the same holds for a publisher's plain store.
+
+       So a full barrier on that path, and the flag looked at again after
+       it. Still up: whoever takes it does so after the work can be seen.
+       Taken meanwhile -- perhaps before the work could be seen -- it is put
+       up again. Found down the first time, the compare-and-swap is the
+       barrier, whether it sets the flag or loses to another signal's. */
     if (signaled_.get() == 0)
+    {
         signaled_.cmpxchg(1, 0);
+    }
+    else
+    {
+        hal::smp_mb();
+        if (signaled_.get() == 0)
+            signaled_.cmpxchg(1, 0);
+    }
 
     /* Then the waiter, every time -- not only by whoever set the flag: a
        waiter found blocked with a signal pending is one to wake, whoever's
