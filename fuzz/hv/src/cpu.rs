@@ -486,43 +486,10 @@ pub mod x86 {
     }
 }
 
-/// hv's own `svm`: the exits as the backends decode them, as they are there.
+/// hv's own `svm`: the exits as the backends decode them -- hv's `exit.rs`
+/// itself -- and the start states, as they are there.
 pub mod svm {
-    #[derive(Clone, Copy, Debug)]
-    pub struct Io {
-        pub port: u16,
-        pub size: u8,
-        pub input: bool,
-        pub string: bool,
-        pub rep: bool,
-        pub next_rip: u64,
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    pub enum Exit {
-        Host,
-        Kicked,
-        Io(Io),
-        Hlt,
-        Cpuid,
-        Msr { write: bool },
-        Hypercall,
-        IrqWindow,
-        NmiWindow,
-        NestedFault { gpa: u64, error: u64 },
-        Exception { vector: u8, error: Option<u32> },
-        MachineCheck,
-        Shutdown,
-        Invalid,
-        Cr8 { write: bool, gpr: u8 },
-        Cr0Write { value: u64 },
-        Cr4 { write: bool, gpr: Option<u8> },
-        Dr { write: bool, dr: u8, gpr: Option<u8> },
-        Eoi { vector: u8 },
-        Pause,
-        Undefined,
-        Other(u64),
-    }
+    pub use crate::exit::{Exit, Instr, Io};
 
     #[derive(Clone, Copy, Debug, Default)]
     pub struct LongMode {

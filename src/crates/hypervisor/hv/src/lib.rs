@@ -47,6 +47,8 @@ mod npt;
 #[cfg(target_arch = "x86_64")]
 mod ept;
 #[cfg(target_arch = "x86_64")]
+pub mod exit;
+#[cfg(target_arch = "x86_64")]
 pub mod svm;
 #[cfg(target_arch = "x86_64")]
 pub mod vmx;

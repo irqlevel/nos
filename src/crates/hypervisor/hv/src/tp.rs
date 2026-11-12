@@ -78,7 +78,11 @@ pub fn exit_fields(exit: &Exit, regs: &ExitRegs, host_vector: Option<u8>) -> (Ex
         Exit::Eoi { vector } => (ExitReason::Eoi, u64::from(vector), 0),
         Exit::Pause => (ExitReason::Pause, 0, 0),
         Exit::Undefined => (ExitReason::Undefined, 0, 0),
-        Exit::Other(code) => (ExitReason::Other, code, 0),
+        /* As before they had names: AMD-V's code, under either backend */
+        Exit::Instr(instr) => (ExitReason::Other, instr.svm_code(), 0),
+        Exit::TaskSwitch => (ExitReason::Other, hvarch::x86::svm::vmcb::exit::TASK_SWITCH, 0),
+        Exit::FerrFreeze => (ExitReason::Other, hvarch::x86::svm::vmcb::exit::FERR_FREEZE, 0),
+        Exit::Other { code, vmx } => (ExitReason::Other, code, u32::from(vmx)),
     }
 }
 
