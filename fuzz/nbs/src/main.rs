@@ -48,6 +48,14 @@ const GATE_SCRUB_SEEDS: u64 = 300;
 const SCRUB_STEPS: u64 = 3000;
 const GATE_CLUSTER_SEEDS: u64 = 1000;
 const CLUSTER_STEPS: u64 = 2000;
+/// Cluster seeds past the gate's range run with it: each the place a rule's
+/// race comes together that the range lost when the target's course moved
+/// -- the client's copy-up ended only once every member active in its view
+/// has copied (`client_copy_every_active`: a clone's or a volume's copy-up
+/// asked at a view a member had left, NotHere, those that had come since
+/// never asked), lost to N13's chains, found again at these. A stopgap: a
+/// race moved on by the next change is lost again, which the mutants say.
+const GATE_CLUSTER_ALSO: [u64; 5] = [1232, 2759, 5241, 6647, 7786];
 const GATE_JOIN_SEEDS: u64 = 800;
 const JOIN_STEPS: u64 = 3000;
 const GATE_INFLIGHT_SEEDS: u64 = 600;
@@ -133,6 +141,14 @@ fn main() -> ExitCode {
                 failed += target(name, run, 1, seeds, steps, None, false);
                 if first && failed > 0 {
                     break;
+                }
+                if name == "cluster" {
+                    for seed in GATE_CLUSTER_ALSO {
+                        failed += target(name, run, seed, 1, steps, None, false);
+                    }
+                    if first && failed > 0 {
+                        break;
+                    }
                 }
             }
             failed

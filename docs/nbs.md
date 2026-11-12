@@ -367,6 +367,16 @@ task, whose mds tells it its joins (`Question::Joins`) with its devices.
   that old -- a writer taken over since among them, which the members fenced
   against it refuse -- would be marked, and kept over the set's (found by
   the cluster target, N9d). Its writer reads its map again.
+- **The joiner fenced first** (N13): its mds gives each join with the
+  newest generation of every volume a writer has had with a chunk in the
+  set (`JoinView::fences`), and the joiner's cs fences itself so, durable,
+  before its join's marks begin and again as the view is refreshed
+  (`copy::fence_for`) -- a fence it cannot have keeps the join from
+  beginning. Down when the volume's writer of now fenced the set's
+  members, it holds the fence of the one before; and that one, taken over,
+  its map read anew -- a view as new as the join -- would write it there
+  alone, unasked, at the epoch the copy moved its chunks on to, the
+  members refusing it (found by the cluster target, N13).
 - **A member back** pulls whole what it may have missed -- a chunk last
   written at the version it went down at or after, or one it does not hold
   -- and holds the rest to the source's by sums, copying only what differs:
@@ -376,7 +386,13 @@ task, whose mds tells it its joins (`Question::Joins`) with its devices.
   writer since taken over, its view as old, could write it there unfenced,
   which the members fenced against that writer refused (found by the
   cluster target, N9d; a touch, which moved the epoch on and kept the data,
-  did before).
+  did before). And as the copy closes a chunk, the joiner knows it at the
+  copy's epoch from then on, as the source does once pulled or summed --
+  those the sums found the same among them: kept at the epoch it last knew,
+  such a chunk took a write of that writer's once the join was done, the
+  member active and its new writer's fence never come to it (found by the
+  cluster target, N13: a chain passed the write on; sent directly, as
+  before N13, it would have been taken the same way).
 - **The check**: a chunk pulled is summed against the source's. A granule
   that differs is pulled again and held to the source's a sector at a time,
   the marked sectors left out; a sector that does not read back as copied is
@@ -571,7 +587,7 @@ For example:
 
 ```
 a$ nbscs
-nbscs: cs 0 -- serving: 2 chunks held, 2 open, 1 volumes fenced, 9 requests served, 0 refused
+nbscs: cs 0 -- serving: 2 chunks held, 2 open, 1 volumes fenced, 9 requests served, 0 refused, 0 writes passed on along chains, 0 not
   device 3    part:4f7661ab-0525-4f56-9d6b-9283d322e47c 292 MiB, 284 MiB free, 0 slots lost, active
 ```
 
@@ -686,6 +702,18 @@ then       the slots, 4 MiB each: the chunks' data
   that the volume's map names it (N10c): one freed since -- a copy-up done,
   the old chunk named by no map -- is not a chunk never written, and a read
   of it still on its way from before is refused.
+- **A write of a chain is applied once** (N13): the cs keeps, for each
+  volume's writer, its mark and the ids above it it has applied; a write
+  that comes again -- along its chain and directly -- is answered as done,
+  not written again, and past 65,536 kept, refused for now until the mark
+  moves on. Once, that is, for as long as nothing else can have written its
+  sectors: an id applied before a join of its set began at this cs was not
+  marked by that join, and its copy may have put the source's data over it
+  -- the write that comes again then, sent again because it is not done,
+  is written again and marked (`Store::joins_begun`, counted as the write
+  is marked: found by fuzz/nbs's cluster target, N13, where a member taken
+  out and back answered as done a write its copy had undone). A write that
+  comes late from before the join is refused by the epoch, as any is.
 - **A chunk's requests end in the order they came** (N12c), each from its
   arrival to its answer, its questions to the mds among it -- the engine's
   own turns order them inside the store only. A write sent twice by its
@@ -807,6 +835,42 @@ What it holds to (plans/nbs.md, "Replication: the rules"):
   failed -- else a write of its would be done by taking out the replicas
   that refuse it. The set's last active replica is never taken out: writes
   wait for it.
+- **A write's piece leaves the writer once** (N13): along its chain -- its
+  replicas as the view has them, this host's first where it has one, the
+  others in the set's order. Each replica passes it on to the next as it
+  takes it, before its own write is done, and answers the writer's session
+  itself, at its mailbox by name (`<module>.nbsw.<token>@<host>` --
+  `hv.nbsw.…`, `nbsload.nbsw.…` -- registered for the cluster by nbsdrive
+  under the namespace of the module it drives the session for, the only one
+  a module may name a mailbox under: an ipc address means nothing to a
+  third host; a name not had is said, and that session writes directly;
+  the writer's own host's cs, which `name@host` with its own name does not
+  reach -- the channel routes to peers alone -- answers by the name alone).
+  Each
+  hop is a request of its own, its id and its sub, so that the session's
+  bookkeeping is the one above. A replica is waited for from the answer of
+  the one before it in the chain -- which passed the piece on as it took it
+  -- and sent the piece directly where it has not answered 0.25 s after;
+  one whose replica before it is taken out of the piece unanswered is sent
+  it at once; the 0.5 s counts from the direct send: a forwarder that died,
+  or a link down between two replicas, never has a live replica asked out.
+  Counted from the piece's leaving, as first written, a chain slow all
+  along -- its devices, its links -- had every hop after the first sent
+  twice, the writer's line carrying more than before N13 just when it was
+  busiest (found by the cluster target, whose network carried the copies
+  until answers went late and live cs's were asked out). Every request of
+  the chain goes with the session's mark for its replica -- every request
+  of its there below it
+  answered -- and a replica applies a write of a chain once: the copy that
+  comes again, along the chain after the direct one or the other way, is
+  answered as done, not written again -- it could come after the session's
+  next write of the same blocks and put the older data back (found by
+  fuzz/nbs's cluster target at once) -- and so does every other send of a
+  write of a session that chains, to one replica again after a refusal or
+  to each where its chain could not be had: sent without its mark, a late
+  copy by another way than a newer write of its blocks put older data over
+  that one (found by the cluster target). A session with no name -- `nbs
+  io`'s -- sends each piece to each replica directly, as before N13.
 - **Two writes that overlap are never out at once.** A read goes to one
   active replica, this host's where it has one, and to another when it does
   not answer.
@@ -1119,11 +1183,14 @@ only its metadata.
   replica is flushed -- the restart's judge holds what the replica has to
   what the last flush done made durable.
 
-  `--mutants` takes a hundred and eighty-eight rules out one at a time --
+  `--mutants` takes two hundred and ten rules out one at a time --
   seventy-three of the metadata's, five of them the controller's;
-  forty-two of the cs's, twelve of them the copy's and eleven a copy-up's;
-  thirty-two of the wire's, its `serve`'s, the mds's, the copy's and the
-  scrub's; forty-one of the client's -- each caught.
+  forty-nine of the cs's engine; forty-one of the wire's, its `serve`'s,
+  the mds's, the copy's and the scrub's; forty-seven of the client's --
+  each caught: one, the client's copy-up ended only once every member
+  active in its view has copied, only at the cluster seeds the gate runs
+  past its range (`GATE_CLUSTER_ALSO`), its race having moved past the
+  range's with N13's chains.
 - **`fuzz/raft`'s `nbsmeta` target**: the members' part of the state, its
   commands from pools of names and incarnations that meet and from wide ones
   that fill the cluster. There are four scenarios and six mutants.

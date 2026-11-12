@@ -1745,6 +1745,111 @@ each new gate.
     1 GbE host's; a look says the cs's task turns, not that its device
     answers: a device stuck short of 30 s keeps its replicas in, its writes
     waiting -- the price of a disk's hiccup not being a copy.
+- **N13, chain replication** (decided 2026-11-12, from N12d's numbers). The
+  writer's host sends every write twice -- a copy to each replica not its
+  own -- so 1 GbE carries some 56 MB/s of writes; the links are not the
+  limit (each link's task 23-36% of a CPU at 28 MB/s, ChaCha20 in
+  software), the line is. A write's piece leaves the writer once:
+  - **The chain**: the piece's replicas as the client's view has them --
+    the set's active members and its joiner -- its own host's first where
+    it has one, the others in the set's order. The client sends the piece
+    to the first, with the rest of the chain; each replica passes it on to
+    the next as it takes it, before its own write is done, and writes its
+    own copy.
+  - **Each replica answers the client itself**, to the writer session's
+    mailbox by name (`<module>.nbsw.<id>@<host>`, registered for the
+    cluster under the driving module's namespace, the only one a module
+    may name a mailbox under -- as first written, `nbs.w.`, only nbs-mds's
+    `nbs io` could have it, and hv's and nbsload's sessions went direct
+    in silence, which nbs-test's look at the cs's counters found): an
+    ipc address is the host that holds it's, and means nothing to a third.
+    Each hop has its own request id, so that the client knows which replica
+    answered; its bookkeeping is unchanged -- a piece held until every
+    replica it wrote to answered, decision 6's 0.5 s and the leader's look,
+    fences, epochs and the mds's checks each replica's own as now.
+  - **A hop that does not pass a piece on** is gone around: a replica that
+    has not answered 0.25 s after the replica before it answered is sent it
+    directly -- one whose replica before it is taken out of the piece
+    unanswered, at once -- and the 0.5 s counts from then: a forwarder that
+    died, or a link down between two replicas, never has a live replica
+    asked out. (As built: the plan counted the 0.25 s from the piece's
+    leaving, which under a chain slow all along sent every hop after the
+    first twice.) A replica
+    sent the piece twice writes it once (as built: the plan had it write
+    both copies, in the order the chunk's turn (N12c) keeps, and the
+    cluster target had a late copy along the chain put older data over the
+    client's next write of the blocks at once). Each request of a chain
+    carries the session's mark for its replica -- every request of its
+    there below it answered -- and keeps one id for the piece's life,
+    however often and whichever way it is sent; the cs keeps the ids above
+    the mark it applied, and answers one that comes again as done -- or as
+    fenced, a newer writer's fence come since -- unless a join of its set
+    began at the cs since, whose copy may have written over it: then it is
+    written again, and marked.
+  - **What is chained**: writes' pieces, the bytes. Fences, flushes,
+    closes, copy-ups and reads go to each replica directly, as now. A
+    driver that gives its session no name -- `nbs io` -- writes as now.
+  - **Limits**: the last replica's answer one hop later (some 0.3-1 ms
+    here); a replica in the middle carries the piece in and out, its NIC's
+    and its link's CPU; a chain is as fast as its slowest hop, and one
+    link's task, ChaCha20 in software, its CPU at some 80-100 MB/s.
+  - **Steps**: N13a, the wire (a write's chain and the answer's name), the
+    cs's passing on and answering by name, the client's chain and the
+    0.25 s way round, nbsdrive's session named; fuzz/nbs's cluster target
+    with chains -- a forwarder crashed, a hop silent, a piece twice -- and a
+    mutant for each rule; nbs-test both arches. N13b, the hardware: N12d's
+    numbers again, writes at depth.
+  - **What the fuzzer found in N13a** (each fixed, each a mutant, each a
+    judge of its own where the cluster target came on it at one seed in a
+    thousand): a late copy along a chain wrote older data over the
+    client's next write of the blocks -- a write of a chain applied once,
+    by id and mark; sent again after a map read under new ids, a copy
+    reopened a chunk closed since -- one id per piece and replica for the
+    piece's life; a write come again answered as done after a newer
+    writer's fence -- refused as fenced (the cs target's `relayed`); a
+    member back, its join done, took a write of a writer taken over while
+    it was out, the chunks its sums found the same kept at the epoch it
+    last knew -- `close_copy` moves the epoch on (the join target writes
+    every chunk at every older version once the join is over; a direct
+    send before N13 would have been taken the same way); a member taken
+    out and back answered as done a write its copy had undone -- written
+    again across a join of its set begun since, counted as the write is
+    marked (the inflight target begins and ends joins among its requests);
+    and the 0.25 s counted from the piece's leaving sent every hop of a
+    chain slow all along twice -- counted from the answer before it; a
+    piece sent again to one replica, after a `NotFenced`, went without its
+    mark, and late by another way than a newer write of its blocks put
+    older data over that one -- every send of such a write marked (and
+    judged so as sent); and a joiner whose new writer's fence never came
+    to it, down at the takeover, took the old writer's writes once it read
+    the map anew -- joiners fenced at their set's volumes' generations as
+    their joins begin (`JoinView::fences`, `copy::fence_for`).
+  - **What nbs-test found on the hardware** (x86-64, the AX41), where the
+    fuzzer's network had delivered by any name: the session's name,
+    `nbs.w.<hex>`, was refused to every module but nbs-mds -- a module
+    names mailboxes under its own namespace alone -- and to most sessions
+    anyway, a name's part beginning with a digit, so hv's and nbsload's
+    writes went direct in silence (`<module>.nbsw.s<hex>` now, a name not
+    had said); and the chain's head, the writer's own host's cs, answered
+    `name@host` with its own host's name, which the channel routes to
+    peers alone -- every answer lost, every write of a chain at its
+    deadline (the cs answers its own host by the name alone now).
+  - **Open, found in N13a: a write failed at its deadline leaves its
+    replicas apart.** An operation not done in a minute fails; a write's
+    pieces are dropped with whatever replicas have taken them, and the
+    session later closes the chunk as it closes any -- its replicas apart
+    for good, a read answered by whichever it goes to. Not N13's: the
+    same before it, rare -- a set churning for a minute, the writer's view
+    a step behind every refusal; the cluster target's end came on it once
+    in eight thousand runs while chains crowded its network (seed 2905 of
+    that tree). The way out is the reconcile's, which makes a crashed
+    writer's open chunks the same: (a) the session attaches anew at a
+    write's failure -- every operation out failed with it, its open chunks
+    mended by the new generation's reconcile, as `attach_again` does after
+    a pause given up -- the volume going on; or (b) the session fails, as
+    at `LOST_LAST`, and the next attach mends; or (c) the chunk is never
+    closed by that session, left to the next writer, its replicas apart
+    meanwhile. (a) is the recommendation; a decision for the user.
 
 ## What to expect
 

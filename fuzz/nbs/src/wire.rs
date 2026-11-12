@@ -3,15 +3,18 @@
 //!
 //! - **Every message read back as written**: random requests, answers,
 //!   questions and their answers, of every kind and at their limits, encoded
-//!   and decoded the same.
+//!   and decoded the same -- a write passed along its chain (N13) among
+//!   them, and what a cs passes on of it (`relay_on`) read as the next
+//!   replica's: its id and mark, the hops after it, the same mailbox.
 //! - **Bytes read as they are, or as none**: random bytes, and messages
 //!   spoiled -- a byte changed, cut short, grown -- read without a panic; any
 //!   that read as a message encode back to exactly those bytes. One encoding
 //!   a message, so that two hosts never read one message two ways.
 
 use nbscs::{ChunkRef, Epoch};
-use nbswire::{Answer, Answered, Ask, Asking, Device, Identity, JoinView, Op, Place, Query, Question, Refusal, Reply,
-              ReplicaState, Request, Said, Saying, Told, DATA_MAX, LIST_MAX, MAP_MAX, REASON_MAX};
+use nbswire::{Answer, Answered, Ask, Asking, Device, Hop, Identity, JoinView, Op, Place, Query, Question, Refusal,
+              Relay, Reply, ReplicaState, Request, Said, Saying, Told, DATA_MAX, LIST_MAX, MAP_MAX, REASON_MAX,
+              RELAY_HOPS_MAX, RELAY_NAME_MAX};
 
 use crate::rng::{mix, Rng};
 
@@ -52,6 +55,13 @@ fn refusal(r: &mut Rng) -> Refusal {
 
 /// A name, now and then at a limit's length, or past it -- which the writer
 /// keeps and the reader refuses.
+/// A relay's name, within its limits: a mailbox's with its host's, or a
+/// host's.
+fn relay_name(r: &mut Rng) -> String {
+    let n = 1 + r.below(RELAY_NAME_MAX as u64) as usize;
+    (0..n).map(|i| (b'a' + (mix(r.below(1 << 20), i as u64) % 26) as u8) as char).collect()
+}
+
 fn name(r: &mut Rng, max: usize) -> String {
     let n = match r.below(10) {
         0 => 0,
@@ -102,7 +112,34 @@ fn place(r: &mut Rng) -> Place {
 /// asked for past MAP_MAX.
 fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
     let id = r.below(u64::MAX);
-    match r.below(6) {
+    match r.below(7) {
+        /* A write passed along its chain, and what its cs passes on (N13) */
+        6 => {
+            let n = len(r, u64::from(DATA_MAX));
+            let op = Op::Write { chunk: chunk(r), position: r.below(1 << 32) as u32, index: r.below(u64::MAX),
+                                 offset: r.below(1 << 32) as u32, data: &data[..n] };
+            let m = Request { id, volume: r.below(1 << 32) as u32, generation: r.below(u64::MAX), op };
+            let answer = relay_name(r);
+            let hosts: Vec<String> = (0..r.below(RELAY_HOPS_MAX as u64 + 1)).map(|_| relay_name(r)).collect();
+            let next: Vec<Hop<'_>> = hosts.iter().map(|host| Hop { id: r.below(u64::MAX), mark: r.below(u64::MAX), host })
+                .collect();
+            let relay = Relay { answer: &answer, mark: r.below(u64::MAX), next };
+            let bytes = m.try_encode_relayed(&relay).expect("a relay within its limits encoded");
+            match nbswire::relay_on(&m, &relay) {
+                None => assert!(relay.next.is_empty(), "a relay with hops after it not passed on"),
+                Some((host, on)) => {
+                    let (got, got_relay) = Request::decode_relayed(&on).expect("what a cs passes on read back");
+                    let got_relay = got_relay.expect("what a cs passes on has its relay");
+                    let want = Relay { answer: relay.answer, mark: relay.next[0].mark, next: relay.next[1..].to_vec() };
+                    assert_eq!(host, relay.next[0].host, "passed on to another host than the next");
+                    assert_eq!(got.id, relay.next[0].id, "passed on with another id than the next replica's");
+                    assert_eq!((got.volume, got.generation, &got.op), (m.volume, m.generation, &m.op),
+                               "passed on as another write");
+                    assert_eq!(got_relay, want, "passed on with another relay than the rest of the chain's");
+                }
+            }
+            (6, bytes, true)
+        }
         0 => {
             let n = len(r, u64::from(DATA_MAX));
             let op = match r.below(12) {
@@ -227,6 +264,7 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                             until: r.below(1 << 32) as u32,
                             sources: (0..n).map(|i| (i as u32, name(r, nbsmeta::NAME_MAX))).collect(),
                             index: r.below(u64::MAX),
+                            fences: (0..len(r, 20)).map(|_| (r.below(1 << 32) as u32, r.below(u64::MAX))).collect(),
                         }
                     }).collect())
                 }
@@ -318,7 +356,11 @@ fn read_back(kind: u8, b: &[u8]) -> Result<bool, String> {
         2 => Query::decode(b).map(|m| m.encode()),
         3 => Answered::decode(b).map(|m| m.encode()),
         4 => Asking::decode(b).map(|m| m.encode()),
-        _ => Saying::decode(b).map(|m| m.encode()),
+        5 => Saying::decode(b).map(|m| m.encode()),
+        _ => Request::decode_relayed(b).and_then(|(m, relay)| match relay {
+            Some(x) => m.try_encode_relayed(&x),
+            None => Some(m.encode()),
+        }),
     };
     match again {
         Some(e) if e != b => Err(format!("kind {}: {} bytes read as a message that encodes as {} other bytes", kind,
@@ -356,13 +398,13 @@ pub fn run(seed: u64, steps: u64, _trace: bool) -> Result<(), String> {
             }
             _ => {}
         }
-        for k in 0..6 {
+        for k in 0..7 {
             read_back(k, &spoiled).map_err(|e| format!("step {}, spoiled: {}", step, e))?;
         }
         /* And noise */
         let n = r.below(64) as usize;
         let noise: Vec<u8> = (0..n).map(|_| r.below(256) as u8).collect();
-        for k in 0..6 {
+        for k in 0..7 {
             read_back(k, &noise).map_err(|e| format!("step {}, noise: {}", step, e))?;
         }
     }

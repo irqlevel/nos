@@ -73,7 +73,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use nbscs::{ChunkRef, Epoch, SLOT};
-use nbswire::{Answer, Ask, Asking, Op, Refusal, Reply, ReplicaState, Request, Said, Saying, DATA_MAX, MAP_MAX};
+use nbswire::{Answer, Ask, Asking, Hop, Op, Refusal, Relay, Reply, ReplicaState, Request, Said, Saying, DATA_MAX,
+              MAP_MAX};
 
 /// How long a replica may be silent before it is asked out (decision 6).
 pub const SILENT_NS: u64 = 500_000_000;
@@ -81,6 +82,16 @@ pub const SILENT_NS: u64 = 500_000_000;
 pub const RESEND_NS: u64 = 1_000_000_000;
 /// How long before an ask refused for now is asked again.
 pub const AGAIN_NS: u64 = 200_000_000;
+/// How long a replica a write was passed along to is waited for, once the
+/// replica before it in the chain has answered, before it is sent the piece
+/// directly (N13): a link down between two replicas, or no memory there to
+/// pass it on, is gone around before SILENT_NS -- which counts from the
+/// direct send -- could ask a live replica out. From the answer before it,
+/// not from the piece's leaving: a chain slow all along, its replicas'
+/// devices or its links, is waited for as it goes, not sent each piece
+/// twice -- what the chain is there to spare. One whose replica before it
+/// is taken out of the piece unanswered is sent it at once.
+pub const CHAIN_WAIT_NS: u64 = 250_000_000;
 /// How long an operation may take before it fails.
 pub const DEADLINE_NS: u64 = 60_000_000_000;
 /// How long the attach is asked for before the session fails: a session
@@ -335,6 +346,17 @@ struct Sub {
     went: bool,
     /// When it is to go again: a refusal for now, a bounce, or no memory.
     again: Option<u64>,
+    /// Passed along by the replica before it in its write's chain (N13),
+    /// not sent by this session yet: sent directly CHAIN_WAIT_NS after that
+    /// replica answered where not answered itself by then, and not silent
+    /// before that.
+    chained: bool,
+    /// While chained, the request of the replica before it in the chain,
+    /// not answered yet: 0 once it has, the wait counted from then.
+    after: u64,
+    /// Of a chain: sent again, it goes with its mark, so that the replica
+    /// applies it once whichever way it comes first.
+    relayed: bool,
 }
 
 /// What a request to a cs is made at, kept with it so that it goes again
@@ -397,6 +419,17 @@ struct Mend {
 pub struct Session {
     name: String,
     me: String,
+    /// This session's mailbox, by name and host, for a write's replicas to
+    /// answer it at (N13): none, writes sent to each replica directly.
+    answer: Option<String>,
+    /// A write piece's request id at each replica it goes to (N13): one for
+    /// the piece's life, however often and whichever way it is sent -- the
+    /// first send, the chain's, the direct one when the chain is slow, those
+    /// again when the map is read again -- so that the replica, which keeps
+    /// the ids it applied, applies the piece once: a copy along a chain may
+    /// come after the session's close of the chunk, or its next write of the
+    /// blocks. Let go once the piece is over, or the replica out of it.
+    piece_ids: BTreeMap<(u64, u32), u64>,
     writable: bool,
     force: bool,
     /// The session's own, made by its driver: what its attach asked again is
@@ -458,7 +491,8 @@ impl Session {
     /// bits, never 0: started by `start`.
     pub fn new(name: &str, me: &str, writable: bool, force: bool, token: u64) -> Session {
         Session {
-            name: String::from(name), me: String::from(me), writable, force, token, attach_from: 0,
+            name: String::from(name), me: String::from(me), answer: None, piece_ids: BTreeMap::new(), writable, force,
+            token, attach_from: 0,
             phase: Phase::Attaching, generation: 0,
             index: 0, map: Map::default(), reading: None, next_id: 1, mds: None, downs: BTreeMap::new(),
             subs: BTreeMap::new(), pieces: BTreeMap::new(), next_piece: 1, ops: BTreeMap::new(), next_op: 1,
@@ -469,6 +503,19 @@ impl Session {
             #[cfg(feature = "starve")]
             starve_until: 0,
         }
+    }
+
+    /// Its writes passed along their replicas from now on (N13), each
+    /// replica answering the driver's mailbox registered as `mailbox` for
+    /// the cluster -- on this host, `me`. Without it a write goes to each
+    /// replica directly.
+    pub fn answer_at(&mut self, mailbox: &str) {
+        self.answer = Some(alloc::format!("{}@{}", mailbox, self.me));
+    }
+
+    /// Whether its writes go along chains (N13): a name to be answered at.
+    pub fn chains(&self) -> bool {
+        self.answer.is_some()
     }
 
     /// The fuzzer's (#97): every write's request made until `until` finds no
@@ -877,7 +924,8 @@ impl Session {
     /// The bytes of a request of `what` made at `stamp`, its id left 0: a
     /// write's data from its operation's buffer -- the driver's, or the
     /// session's own for a reconcile's copy.
-    fn request(&self, what: What, stamp: &Stamp, bufs: &dyn Buffers) -> Result<Vec<u8>, Unmade> {
+    fn request(&self, what: What, stamp: &Stamp, bufs: &dyn Buffers, relay: Option<&Relay<'_>>)
+        -> Result<Vec<u8>, Unmade> {
         let (volume, generation, index) = (self.map.volume, stamp.generation, stamp.index);
         let named = |c: Option<ChunkRef>| c.ok_or(Unmade::Gone);
         let op = match what {
@@ -896,7 +944,12 @@ impl Session {
                         let all = if o.tag & INTERNAL != 0 { &self.scratch[..] } else { bufs.data(o.tag) };
                         let data = all.get(p.at as usize..(p.at + p.len) as usize).ok_or(Unmade::Gone)?;
                         let op = Op::Write { chunk, position: p.place, index, offset: p.inside, data };
-                        return Request { id: 0, volume, generation, op }.try_encode().ok_or(Unmade::NoMemory);
+                        let req = Request { id: 0, volume, generation, op };
+                        let made = match relay {
+                            Some(r) => req.try_encode_relayed(r),
+                            None => req.try_encode(),
+                        };
+                        return made.ok_or(Unmade::NoMemory);
                     }
                 }
             }
@@ -908,8 +961,20 @@ impl Session {
     /// sent in a moment.
     fn send(&mut self, cs: u32, what: What, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
         let Some(stamp) = self.stamp(what) else { return };
-        let id = self.take_id();
-        self.subs.insert(id, Sub { cs, what, stamp, sent: now, first: now, went: false, again: None });
+        /* A write of a session whose writes go along chains goes with its
+           mark however it is sent -- to one replica again after a refusal,
+           to each where its chain could not be had: sent without it, it
+           would be written as often as it came, and a copy of it late by
+           another way than a newer write of its blocks put older data over
+           that one (found by the cluster target, N13: a piece sent again
+           after a `NotFenced`, late behind a chain's newer one) */
+        let chained = matches!(what, What::Piece(pid) if self.chained_write(pid));
+        let id = match what {
+            What::Piece(pid) if chained => self.piece_id(pid, cs),
+            _ => self.take_id(),
+        };
+        self.subs.insert(id, Sub { cs, what, stamp, sent: now, first: now, went: false, again: None, chained: false,
+                                   after: 0, relayed: chained });
         self.transmit(id, now, bufs, out);
     }
 
@@ -917,8 +982,17 @@ impl Session {
     /// send's alone, kept by nobody once the driver has handed them on.
     fn transmit(&mut self, id: u64, now: u64, bufs: &dyn Buffers, out: &mut Vec<Out>) {
         let Some(s) = self.subs.get(&id) else { return };
-        let (cs, what, stamp) = (s.cs, s.what, s.stamp);
-        let made = if self.starved_at(what, now) { Err(Unmade::NoMemory) } else { self.request(what, &stamp, bufs) };
+        let (cs, what, stamp, relayed) = (s.cs, s.what, s.stamp, s.relayed);
+        let made = if self.starved_at(what, now) {
+            Err(Unmade::NoMemory)
+        } else if let (true, Some(answer)) = (relayed, self.answer.as_deref()) {
+            /* A write of a chain sent directly: with its mark, for the
+               replica to apply it once */
+            let relay = Relay { answer, mark: self.mark_for(cs), next: Vec::new() };
+            self.request(what, &stamp, bufs, Some(&relay))
+        } else {
+            self.request(what, &stamp, bufs, None)
+        };
         match made {
             Ok(mut bytes) => {
                 /* The id is the request's first eight bytes */
@@ -927,6 +1001,7 @@ impl Session {
                 if let Some(s) = self.subs.get_mut(&id) {
                     s.sent = now;
                     s.again = None;
+                    s.chained = false;
                     if !s.went {
                         s.went = true;
                         s.first = now;
@@ -948,6 +1023,104 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// Write piece `pid` sent once, along its replicas `to` (N13): its own
+    /// host's first where they have one, then the others in the set's
+    /// order; each replica passes it on to the next as it takes it and
+    /// answers this session's mailbox by name. Each hop a request of its own
+    /// -- its id, its sub -- the first sent now, the others chained. Whether
+    /// it went so: not where the session has no name to be answered at, a
+    /// replica's host is not known, or there is no memory for it now -- the
+    /// piece then sent to each replica directly, as before.
+    fn send_chain(&mut self, pid: u64, to: &[u32], now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) -> bool {
+        let what = What::Piece(pid);
+        let Some(answer) = self.answer.clone() else { return false };
+        let Some(stamp) = self.stamp(what) else { return false };
+        if self.starved_at(what, now) {
+            return false;
+        }
+        let mut chain: Vec<u32> = to.iter().copied().filter(|cs| self.map.hosts.get(cs) == Some(&self.me)).collect();
+        chain.extend(to.iter().copied().filter(|cs| self.map.hosts.get(cs) != Some(&self.me)));
+        let Some(hosts) = chain[1..].iter().map(|cs| self.map.hosts.get(cs).cloned()).collect::<Option<Vec<String>>>()
+        else {
+            return false;
+        };
+        let ids: Vec<u64> = chain.iter().map(|&cs| self.piece_id(pid, cs)).collect();
+        for (k, &cs) in chain.iter().enumerate() {
+            let head = k == 0;
+            let after = if head { 0 } else { ids[k - 1] };
+            self.subs.insert(ids[k], Sub { cs, what, stamp, sent: now, first: now, went: head, again: None,
+                                           chained: !head, after, relayed: true });
+        }
+        /* Each hop's mark taken with its own request out: none of its ids
+           at or above it is answered */
+        let marks: Vec<u64> = chain.iter().map(|&cs| self.mark_for(cs)).collect();
+        let next: Vec<Hop<'_>> = (1..chain.len()).map(|k| Hop { id: ids[k], mark: marks[k], host: &hosts[k - 1] })
+            .collect();
+        let relay = Relay { answer: &answer, mark: marks[0], next };
+        let made = self.request(what, &stamp, bufs, Some(&relay));
+        drop(relay);
+        let Ok(mut bytes) = made else {
+            for id in &ids {
+                self.subs.remove(id);
+            }
+            return false;
+        };
+        /* The id is the request's first eight bytes */
+        bytes[..8].copy_from_slice(&ids[0].to_le_bytes());
+        out.push(Out::Send { to: To::Cs(chain[0]), id: ids[0], bytes });
+        self.starved = false;
+        true
+    }
+
+    /// Request `id` answered, whatever it says: the replica after it in its
+    /// write's chain, passed the piece as it was taken, waited for from now
+    /// (N13).
+    fn answered_before(&mut self, id: u64, now: u64) {
+        for s in self.subs.values_mut().filter(|s| s.chained && s.after == id) {
+            s.after = 0;
+            s.sent = now;
+        }
+    }
+
+    /// Requests `gone` let go of unanswered -- their replicas out of the
+    /// piece: those after them in their chains sent directly now, as nobody
+    /// may have passed them on (N13).
+    fn chain_broken(&mut self, gone: &[u64], now: u64, bufs: &dyn Buffers, out: &mut Vec<Out>) {
+        let next: Vec<u64> = self.subs.iter().filter(|(_, s)| s.chained && s.after != 0 && gone.contains(&s.after))
+            .map(|(&id, _)| id).collect();
+        for id in next {
+            self.transmit(id, now, bufs, out);
+        }
+    }
+
+    /// The mark of the session's requests to cs `cs` (N13): every one of
+    /// them below it answered, and no write piece's id there below it to be
+    /// sent again -- the lowest of those out and of the pieces' it is in,
+    /// or the next.
+    fn mark_for(&self, cs: u32) -> u64 {
+        let out = self.subs.iter().filter(|(_, s)| s.cs == cs).map(|(&id, _)| id);
+        let pieces = self.piece_ids.iter().filter(|(&(_, c), _)| c == cs).map(|(_, &id)| id);
+        out.chain(pieces).min().unwrap_or(self.next_id)
+    }
+
+    /// Whether piece `pid` is a write of a session whose writes go along
+    /// chains: its ids the piece's (`piece_ids`).
+    fn chained_write(&self, pid: u64) -> bool {
+        self.answer.is_some()
+            && self.pieces.get(&pid).and_then(|p| self.ops.get(&p.op)).is_some_and(|o| o.kind != Kind::Read)
+    }
+
+    /// Write piece `pid`'s request id at cs `cs`: the one it has, or a new
+    /// one, kept for the piece's life.
+    fn piece_id(&mut self, pid: u64, cs: u32) -> u64 {
+        if let Some(&id) = self.piece_ids.get(&(pid, cs)) {
+            return id;
+        }
+        let id = self.take_id();
+        self.piece_ids.insert((pid, cs), id);
+        id
     }
 
     fn send_piece(&mut self, pid: u64, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
@@ -1011,6 +1184,9 @@ impl Session {
                 if let Some(p) = self.pieces.get_mut(&pid) {
                     p.waiting = to.iter().copied().collect();
                 }
+                if to.len() > 1 && self.send_chain(pid, &to, now, bufs, out) {
+                    return;
+                }
                 for cs in to {
                     self.send(cs, What::Piece(pid), now, bufs, out);
                 }
@@ -1023,6 +1199,7 @@ impl Session {
         let Some(a) = Answer::decode(bytes) else { return };
         let Some(sub) = self.subs.get(&a.id) else { return };
         let (cs, what) = (sub.cs, sub.what);
+        self.answered_before(a.id, now);
         if let Reply::Refused(why) = a.reply {
             self.refused(a.id, cs, what, why, now, bufs, out);
             return;
@@ -1306,7 +1483,11 @@ impl Session {
             .filter(|(_, p)| p.waiting.contains(&cs) && self.map.set_of(p.place).is_some_and(|(s, _)| s == set))
             .map(|(&id, _)| id).collect();
         for pid in waiting {
+            let gone: Vec<u64> = self.subs.iter().filter(|(_, s)| s.cs == cs && s.what == What::Piece(pid))
+                .map(|(&id, _)| id).collect();
             self.subs.retain(|_, s| !(s.cs == cs && s.what == What::Piece(pid)));
+            self.chain_broken(&gone, now, &*bufs, out);
+            self.piece_ids.remove(&(pid, cs));
             let read = self.pieces.get(&pid).and_then(|p| self.ops.get(&p.op)).is_some_and(|o| o.kind == Kind::Read);
             if read {
                 self.send_piece(pid, now, bufs, out);
@@ -1793,6 +1974,7 @@ impl Session {
     fn piece_done(&mut self, pid: u64, ok: bool, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
         let Some(p) = self.pieces.remove(&pid) else { return };
         self.subs.retain(|_, s| s.what != What::Piece(pid));
+        self.piece_ids.retain(|&(x, _), _| x != pid);
         self.parked.retain(|&x| x != pid);
         let Some(o) = self.ops.get_mut(&p.op) else { return };
         o.ok &= ok;
@@ -2187,7 +2369,12 @@ impl Session {
         let mut silent = Vec::new();
         let mut due = Vec::new();
         for (&id, s) in self.subs.iter() {
-            if s.again.map_or(now >= s.sent + RESEND_NS, |a| now >= a) {
+            let resend = if s.chained {
+                s.after == 0 && now >= s.sent + CHAIN_WAIT_NS
+            } else {
+                s.again.map_or(now >= s.sent + RESEND_NS, |a| now >= a)
+            };
+            if resend {
                 due.push(id);
             }
             if s.went && now >= s.first + SILENT_NS {
@@ -2217,6 +2404,7 @@ impl Session {
             for pid in pieces {
                 self.pieces.remove(&pid);
                 self.subs.retain(|_, s| s.what != What::Piece(pid));
+                self.piece_ids.retain(|&(x, _), _| x != pid);
             }
             self.subs.retain(|_, s| s.what != What::Flush(id));
             self.op_done(id, false, out);

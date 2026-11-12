@@ -92,9 +92,19 @@ pub fn told(s: &State, host: &str, applied: u64, q: &Question) -> Told {
                 let k = usize::from(j.place);
                 let sources = (0..nbsmeta::REPLICAS).filter(|&m| st.replicas[m] == Replica::Active)
                     .filter_map(|m| s.cs().get(st.cs[m] as usize).map(|c| (c.id, c.host.clone()))).collect();
+                /* Every volume a writer has had with a chunk in the set, at
+                   its newest generation: the joiner fences itself so first */
+                let fences: Vec<(u32, u64)> = s.volumes().iter().filter(|v| v.generation != 0 && v.map.iter()
+                    .any(|&c| s.chunks().get(c as usize).is_some_and(|ch| !ch.is_free() && ch.set as usize == id)))
+                    .map(|v| (v.id, v.generation)).collect();
+                /* Past what a view carries -- never in a cluster of this size
+                   -- the join waits, not begun unfenced */
+                if fences.len() > LIST_MAX {
+                    return None;
+                }
                 Some(JoinView { set: id as u32, place: j.place, since: j.since, version: st.version,
                                 own: st.cs.get(k) == Some(&me.id), until: st.active_until.get(k).copied().unwrap_or(0),
-                                sources, index: applied })
+                                sources, index: applied, fences })
             }).take(LIST_MAX).collect())
         }
         /* A copy-up's copy on this host's cs (N10): pending at that place of

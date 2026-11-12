@@ -17,7 +17,11 @@
 //! - no write of a generation answered once a newer fence of its volume has
 //!   been, and one asked after it refused as fenced;
 //! - every request answered once nothing more is asked -- nothing waits for
-//!   ever -- and then no turn held and no round running.
+//!   ever -- and then no turn held and no round running;
+//! - a write's count of the joins of its set begun as it was marked
+//!   (`Store::write_marked`, N13) the one at its mark: where no join has
+//!   begun since and one is on, it marked the write. Joins of the chunks'
+//!   sets are begun and ended at random, among the requests in flight.
 //!
 //! And after every cut, the cs opened again: no record lost (never both
 //! copies of a page in flight), every fence answered there, every chunk
@@ -279,6 +283,7 @@ enum What {
 #[derive(Debug)]
 enum Said {
     Unit(Result<(), Error>),
+    Wrote(Result<u64, Error>),
     Read(Result<u8, Error>),
     Closed(Result<bool, Error>),
     Fenced(Result<u64, Error>),
@@ -380,7 +385,7 @@ impl Run {
                 let s = self.disks[0].0.borrow().sector as usize;
                 let data = vec![value; s];
                 Box::pin(async move {
-                    Said::Unit(st.write(volume, generation, cref(chunk), k * s as u32, &data, true).await)
+                    Said::Wrote(st.write_marked(volume, generation, cref(chunk), k * s as u32, &data, true).await)
                 })
             }
             What::Read { volume, generation, chunk, k } => {
@@ -418,6 +423,17 @@ impl Run {
         *peak = (*peak).max(n);
     }
 
+    /// A join of a chunk's set begun, or the one on ended (N13): what a
+    /// write's count of the joins begun as it was marked is held to.
+    fn join_turn(&mut self) {
+        let set = cref(self.r.below(u64::from(CHUNKS)) as u32).epoch.set;
+        self.store.leave(set);
+        if self.r.chance(70) {
+            self.store.join(set, 1);
+            self.count("joins begun");
+        }
+    }
+
     /// Every request in flight polled, in the order asked: those that end
     /// held to the model.
     fn poll(&mut self) -> Result<(), String> {
@@ -441,13 +457,23 @@ impl Run {
             eprintln!("[{}] {:?} asked at {}: {:?}", at, what, asked, said);
         }
         match (what, said) {
-            (What::Write { volume, generation, chunk, k, value }, Said::Unit(got)) => {
+            (What::Write { volume, generation, chunk, k, value }, Said::Wrote(got)) => {
                 let fenced = self.fenced[volume as usize];
                 match got {
-                    Ok(()) => {
+                    Ok(joins) => {
                         if generation < fenced {
                             return Err(format!("a write of volume {} at {} answered done after its fence at {} was \
                                                 answered", volume, generation, fenced));
+                        }
+                        /* Counted as it was marked: a join on now and none
+                           begun since -- the one on then -- marked it */
+                        let (cr, sector) = (cref(chunk), self.disks[0].0.borrow().sector as u32);
+                        if joins == self.store.joins_begun(cr.epoch.set) && self.store.joins(cr.epoch.set).is_some()
+                            && !self.store.marked(&cr, k * sector, sector)
+                        {
+                            return Err(format!("a write of chunk {}'s sector {} counted {} joins of its set begun as \
+                                                it was marked, as many as now, and the join on now has not marked it",
+                                               chunk, k, joins));
                         }
                         self.count("writes");
                         let c = &mut self.chunks[chunk as usize];
@@ -739,6 +765,9 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         }
         run.poll()?;
         run.disks_turn();
+        if run.r.chance(3) {
+            run.join_turn();
+        }
         run.poll()?;
         if run.r.chance(2) {
             run.cut().map_err(|e| format!("step {}: {}", step, e))?;
