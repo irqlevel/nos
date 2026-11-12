@@ -1701,8 +1701,46 @@ each new gate.
       client's 0.5 s: c stays only where the look is answered whatever its
       device is doing; the closes' records written together, the stop
       fast), hv-nbs-test.
-    - **N12d**, the hardware: a slow flush taking no replica out; 4 KiB at
-      depth; a stop's closes.
+    - **N12d**, the hardware -- done (2026-11-12), N11's three hosts at
+      6125b9df: the EX44's bare metal, ax41a and ax41c under KVM on the
+      AX41 (ax41b, lost for good in N11, removed from both clusters first,
+      so that one host at a time could be taken down), NBS's `bench` of 8
+      GiB, nbsload on the EX44 against N11's numbers:
+      - **Reads from the writer's own replica**, 4 KiB: 47-50k IOPS at
+        depth 8 and on, where N11 had 17.5k at 32 -- the device sees as
+        many requests as the queue has buffers; 256 KiB at depth 8, 1.5-1.6
+        GiB/s (N11: 1.1). At depth 1, 10-13k IOPS, 73-84 us a read, where
+        N11 had 14.5k and 58 us: each request a future, two wake-ups of the
+        cs's task, more than the old loop's work. A spin of 50 us on the
+        event before sleeping, where a request is out on a device, gave back
+        some 8 us of it, three rounds each way, nothing at depth: not taken,
+        the CPU it burns for so little; where the rest goes is for a trace
+        of the cs's turn to say.
+      - **Writes**: the line, as before -- 256 KiB 25-26 MiB/s at depth 1, 53
+        at 2, 56 from 8; 4 KiB into open chunks 1.5-1.7 ms at depth 1, 12.8-
+        13.0k IOPS at 32 (N11 11.3k).
+      - **A stop's closes**: 1024 chunks opened by 30 s of cold 4 KiB writes
+        closed in under a second (N11: 140 in some 4 s) -- their records
+        written together, a round's two writes and two flushes for all.
+      - **Cold chunks**, a fresh volume of 4 GiB written at depth 8: p50 0.9
+        ms, p99 1.3-5.6 ms (N11 20), p99.9 41-78 ms (N11 35), the max 81-103
+        ms -- an open that just misses a round waits for it and its own, two
+        flushes each on a VM's 10 ms: the price of the rounds, under the
+        client's 0.5 s and the look's 250 ms. Rounds that overlap where
+        their pages differ would take the tail in.
+      - **No replica taken out** in any of it: cold writes at depth 8 for 60
+        s while ax41c, quit by QMP and started again, had its places joined
+        (N11's case, where all three went silent and two were taken out):
+        0; ax41c's pool held to 20 IOPS by QEMU for 30 s, writes waiting 2-4
+        s on it: 0 -- the client asked it out, the leader looked, the cs
+        answered, the writes waited. A slow device costs its writes'
+        latency, not a copy -- decision 6 as N12 meant it.
+      - **Found on the way**: a member back that had gone down at the version
+        its last writes were made at pulls everything whole -- ax41c, quit
+        after the cold writes, pulled 12 GiB at the line in 4 min where a
+        member back with nothing missed holds its chunks to the source's by
+        sums in a minute (N9f's rule is by version, and those writes were at
+        the version it went down at).
   - **Limits**: one task a cs, so one CPU's worth of checks and copies -- a
     1 GbE host's; a look says the cs's task turns, not that its device
     answers: a device stuck short of 30 s keeps its replicas in, its writes
@@ -1715,8 +1753,10 @@ each new gate.
   device.
 - **Reads** from the local replica: the device's speed, less the copies --
   guest to the client's buffer, to a message, to the cs's buffer.
-- **The first write to a cold chunk** waits for the open mark's sync, 1 to 4
-  ms on these drives.
+- **The first write to a cold chunk** waits for the open mark's commit round
+  -- two table writes and two flushes on each replica, shared by the opens
+  that come together: a p99 of 1 to 6 ms on these drives, tens of ms at
+  the tail where an open just misses a round (N12d).
 - **A host lost**: the writes to its chunks stall 0.5 s, the leader's look
   at the cs and a commit, then go on to two replicas.
 
