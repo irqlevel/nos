@@ -14,29 +14,37 @@
 //!
 //! A device drives its pin: [`IoApic::set_line`] says whether it asserts it
 //! now, and [`IoApic::edge`] that it pulsed it. An edge-triggered pin's
-//! interrupt is sent as the pin rises; a level-triggered one's while the pin
-//! is asserted and the last one has been ended -- its remote IRR set when it
-//! is sent, and cleared by the EOI that ends it, which the local APIC that
-//! took it as a level broadcasts ([`IoApic::eoi`]; or the guest writes the
-//! EOI register), and a pin asserted still is sent again. Only a fixed or a
-//! lowest-priority interrupt is ever level-triggered: an NMI or an INIT is
-//! no interrupt a local APIC has in service, and nothing would end it --
-//! the 82093AA treats one "as an edge triggered interrupt, even if it is
-//! programmed as a level triggered interrupt" -- so an entry of either is
-//! edge-triggered whatever its trigger bit says ([`level_triggered`]). Taken
-//! as a level, a pin held up -- the SCI, by a guest that pointed its entry
-//! at NMI -- would send one at every look, and the CPU it is for turn back
-//! its own entry for each: a guest's CPU 0 never entered again (hv-fuzz
-//! found it). Each of these
-//! says which pins have an interrupt to send now, and [`IoApic::send`] makes
-//! each one's message: what the APIC bus carries, as a device's MSI does,
-//! for the caller to deliver to the CPUs it names.
+//! interrupt is sent as the pin rises; a level-triggered one's as the pin
+//! rises, and again while it is asserted once the last one has been ended
+//! -- its remote IRR set when a local APIC has taken it
+//! ([`IoApic::taken`]), as the 82093AA sets it "when local APIC(s) accept
+//! the level interrupt", and cleared by the EOI that ends it, which that
+//! APIC broadcasts ([`IoApic::eoi`]; or the guest writes the EOI
+//! register). One no APIC took -- its destination no CPU's, or the APIC it
+//! went to software-disabled, which refuses it ([`IoApic::refused`]) -- is
+//! not in service anywhere, and nothing will end it: its remote IRR stays
+//! clear, and it is sent again when a CPU's APIC changes in a way that can
+//! change that ([`IoApic::untaken`]), as the chip holds such a message
+//! pending and tries it again. Set as it was made, the pin was dead for good
+//! -- no EOI was ever coming. Only a fixed or a lowest-priority interrupt
+//! is ever level-triggered: an NMI is no interrupt a local APIC has in
+//! service, and nothing would end it -- the 82093AA treats one "as an edge
+//! triggered interrupt, even if it is programmed as a level triggered
+//! interrupt" -- so such an entry is edge-triggered whatever its trigger bit
+//! says ([`level_triggered`]). Taken as a level, a pin held up -- the SCI, by
+//! a guest that pointed its entry at NMI -- would send one at every look,
+//! and the CPU it is for turn back its own entry for each: a guest's CPU 0
+//! never entered again (hv-fuzz found it). Each of these says which pins
+//! have an interrupt to send now, and [`IoApic::send`] makes each one's
+//! message: what the APIC bus carries, as a device's MSI does, for the
+//! caller to deliver to the CPUs it names.
 //!
 //! The polarity bit is kept and not applied: a device here says when it
 //! asserts its line, which is what the entry's polarity says of the wire.
-//! And nothing is sent in a delivery mode no local APIC here takes by
-//! message -- ExtINT, which is the 8259's own path to the first CPU, SMI, the
-//! reserved ones -- which is counted instead.
+//! And nothing is sent in a delivery mode no local APIC here takes from a
+//! device -- ExtINT, which is the 8259's own path to the first CPU, SMI, an
+//! INIT, which no PC's firmware wires a device to, the reserved ones --
+//! which is counted instead.
 //!
 //! Plain data, as every device here is.
 
@@ -108,7 +116,6 @@ const RTE_RESET: u64 = RTE_MASKED;
 const DELIVERY_FIXED: u64 = 0;
 const DELIVERY_LOWEST: u64 = 1;
 const DELIVERY_NMI: u64 = 4;
-const DELIVERY_INIT: u64 = 5;
 
 /// Pins, a bit each: those with an interrupt to send now, which the caller
 /// sends one at a time ([`IoApic::send`]).
@@ -138,6 +145,9 @@ pub struct Stats {
     pub level: u64,
     /// Level-triggered interrupts ended, by EOI.
     pub eois: u64,
+    /// Level-triggered interrupts no local APIC took -- sent to nobody, or
+    /// refused -- and held to be sent again (`IoApic::untaken`).
+    pub untaken: u64,
     /// Interrupts of a delivery mode no message here has, not sent.
     pub dropped: u64,
 }
@@ -150,8 +160,8 @@ pub struct IoApic {
     rte: [u64; PINS],
     /// Each pin as its device drives it: asserted or not, a bit a pin.
     lines: u32,
-    /// Level-triggered interrupts sent and not yet ended, a bit a pin: the
-    /// entries' remote IRR.
+    /// Level-triggered interrupts a local APIC took and has not yet ended, a
+    /// bit a pin: the entries' remote IRR.
     remote_irr: u32,
     pub stats: Stats,
 }
@@ -261,8 +271,11 @@ impl IoApic {
     }
 
     /// Pin `pin` driven by its device, `asserted` or not: its bit when that
-    /// sends an interrupt -- an edge-triggered pin rising, unmasked; a
-    /// level-triggered one asserted, unmasked, its last interrupt ended.
+    /// sends an interrupt -- the pin rising, unmasked, and a level-triggered
+    /// one's last interrupt ended. A level held up was sent as it rose, and
+    /// is sent again by what ends it (`eoi`), changes its entry, or changes
+    /// who would take it (`untaken`) -- not at every look, which for one no
+    /// local APIC takes was a message a round to a CPU that refuses it.
     pub fn set_line(&mut self, pin: usize, asserted: bool) -> Pins {
         let Some(&e) = self.rte.get(pin) else { return 0 };
         let bit = 1 << pin;
@@ -272,10 +285,13 @@ impl IoApic {
         } else {
             self.lines &= !bit;
         }
+        if !asserted || was {
+            return 0;
+        }
         if level_triggered(e) {
             return self.level_pending(pin);
         }
-        if asserted && !was && e & RTE_MASKED == 0 { bit } else { 0 }
+        if e & RTE_MASKED == 0 { bit } else { 0 }
     }
 
     /// Pin `pin` pulsed -- down and up again, whatever it was before: an edge,
@@ -303,31 +319,66 @@ impl IoApic {
         again
     }
 
-    /// The message pin `pin`'s interrupt is, sent now, for the caller to
-    /// deliver: a level-triggered one waits to be ended from here on. None
-    /// for a pin that is none, or a delivery mode no message here has.
-    pub fn send(&mut self, pin: usize) -> Option<Message> {
-        let &e = self.rte.get(pin)?;
+    /// Pin `pin`'s interrupt, sent now: its message handed to `deliver`,
+    /// which delivers it to the CPUs it names and says whether a local APIC
+    /// took it. A level-triggered one a local APIC took waits to be ended
+    /// from here on; one none took is held, to be sent again (`untaken`).
+    /// Whether it was taken: false too for a pin that is none, and a
+    /// delivery mode no message here has, which is not sent at all.
+    pub fn send(&mut self, pin: usize, deliver: &mut dyn FnMut(&Message) -> bool) -> bool {
+        let Some(&e) = self.rte.get(pin) else { return false };
         let delivery = match (e >> RTE_DELIVERY_SHIFT) & RTE_DELIVERY_MASK {
             DELIVERY_FIXED => Delivery::Fixed,
             DELIVERY_LOWEST => Delivery::LowestPriority,
             DELIVERY_NMI => Delivery::Nmi,
-            DELIVERY_INIT => Delivery::Init,
             _ => {
                 self.stats.dropped += 1;
-                return None;
+                return false;
             }
         };
-        /* Only a fixed interrupt is ended by an EOI: an NMI or an INIT is
-         * never in service anywhere. */
+        /* Only a fixed interrupt is ended by an EOI: an NMI is never in
+         * service anywhere. */
         let level = level_triggered(e);
+        self.stats.sent += 1;
         if level {
-            self.remote_irr |= 1 << pin;
             self.stats.level += 1;
         }
-        self.stats.sent += 1;
         let ipi = lapic::message((e >> RTE_DEST_SHIFT) as u8, e & RTE_LOGICAL != 0, delivery, e as u8);
-        Some(Message { ipi, level })
+        let taken = deliver(&Message { ipi, level });
+        if level {
+            if taken {
+                self.remote_irr |= 1 << pin;
+            } else {
+                self.stats.untaken += 1;
+            }
+        }
+        taken
+    }
+
+    /// A level-triggered interrupt of `vector` that the local APIC it was
+    /// posted to -- through another CPU's mailbox, where who sent it could
+    /// not ask -- did not take: software-disabled, or the vector one no
+    /// fixed interrupt may have. Nothing is in service, and no EOI will come:
+    /// each entry of that vector waiting for one waits no longer, and is
+    /// held to be sent again (`untaken`) -- not now, which would only have
+    /// the same APIC refuse it again.
+    pub fn refused(&mut self, vector: u8) {
+        for pin in 0..PINS {
+            let bit = 1 << pin;
+            if self.remote_irr & bit != 0 && self.rte[pin] & RTE_VECTOR == u64::from(vector) {
+                self.remote_irr &= !bit;
+                self.stats.untaken += 1;
+            }
+        }
+    }
+
+    /// The level-triggered pins with an interrupt no local APIC has --
+    /// asserted, unmasked, none of theirs waiting to be ended -- to be sent
+    /// again: what a CPU asks once its APIC has changed so that it may take
+    /// one it did not -- turned on, or addressed otherwise. The chip tries
+    /// such a message again on its own.
+    pub fn untaken(&self) -> Pins {
+        (0..PINS).fold(0, |pins, pin| pins | self.level_pending(pin))
     }
 
     /// The message pin `pin` would send, while its entry is unmasked and

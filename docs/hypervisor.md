@@ -4266,9 +4266,14 @@ CPU leaves its guest at the deadline it was armed for, as a host interrupt.
 
 Each local APIC has its timer: one-shot and periodic, counting down at a bus
 clock of 1 GHz -- KVM's, and one that makes a count nanoseconds -- with the
-divide configuration a guest writes. A periodic timer that fell behind is
+divide configuration a guest writes; written while a count runs, the count
+goes on from where it is at the new rate, its interrupt with it, as KVM
+restarts its timer for. A periodic timer that fell behind is
 owed its periods, handed over one at a time as the guest takes each, a
-second's worth at most, as the PIT's channel 0 is. And TSC-deadline mode,
+second's worth at most, as the PIT's channel 0 is -- but one whose entry is
+masked, or whose vector the APIC refuses, owes none: every period gone by is
+skipped, as an APIC loses a masked one, and unmasked it does not hand over
+the periods it missed back to back. And TSC-deadline mode,
 which leaf 1 offers with the APIC wherever the host knows its TSC's rate: a
 write of IA32_TSC_DEADLINE (MSR 0x6E0) arms the timer to run out when the
 TSC reaches it -- the guest's TSC is the host's, so the deadline is turned
@@ -4515,17 +4520,24 @@ The tables say so: the MP table marks the IO-APIC usable and routes each
 PCI function's INTA, level and active low, and the MADT lists it with the
 timer's and the SCI's overrides ([ACPI](#acpi)); `noapic` is not added.
 
-An edge-triggered pin sends as it rises; a level-triggered one while its
-line is up and its last interrupt has been ended -- its remote IRR set as
-it sends, and cleared by the EOI of the local APIC that took it, which the
-APIC broadcasts for a vector it took as a level (its trigger-mode
-register), or by a write of the IO-APIC's EOI register; a line still up
-then sends again. Only a fixed or a lowest-priority interrupt is ever a
-level: an NMI or an INIT is in service nowhere and nothing ends it, so an
-entry of either is edge-triggered whatever its trigger bit says, as the
-82093AA treats one -- taken as a level, a guest that pointed the SCI's
-entry at NMI had one sent at every look while the SCI was up, and its CPU 0
-turned back its own entry for each, never to run again (hv-fuzz found it).
+An edge-triggered pin sends as it rises; a level-triggered one as it rises
+and again while its line is up once its last interrupt has been ended --
+its remote IRR set when a local APIC has taken it, as the 82093AA sets it,
+and cleared by the EOI of that APIC, which the APIC broadcasts for a vector
+it took as a level (its trigger-mode register), or by a write of the
+IO-APIC's EOI register; a line still up then sends again. A level no APIC
+took -- its destination no CPU's, or the APIC software-disabled, which
+refuses it, there or as the CPU it was mailed to takes its mail -- is in
+service nowhere and no EOI will come: its remote IRR stays clear, and it is
+sent again when a CPU's APIC is turned on or addressed otherwise, as the
+chip holds such a message and tries it again. Set as the message was made,
+the pin was dead for good. Only a fixed or a lowest-priority interrupt is
+ever a level: an NMI is in service nowhere and nothing ends it, so such an
+entry is edge-triggered whatever its trigger bit says, as the 82093AA
+treats one -- taken as a level, a guest that pointed the SCI's entry at NMI
+had one sent at every look while the SCI was up, and its CPU 0 turned back
+its own entry for each, never to run again (hv-fuzz found it). An entry of
+INIT, which no PC's firmware wires a device to, is counted and not sent.
 A message goes as a device's MSI does: into the local
 APIC of the CPU whose loop sent it, or through another's mailbox, the
 level bit with it. The serial port had to become a 16550 for this: its
@@ -4538,12 +4550,17 @@ vector is still requested in the first CPU's APIC.
 
 **Its local APICs come out of reset in xAPIC mode.** Linux keeps a
 firmware-enabled x2APIC with an IO-APIC only with interrupt remapping, or
-under a hypervisor it knows to support x2APIC without -- KVM, Xen, Hyper-V
--- and this one names none (CPUID's hypervisor range is blank). Finding
+under a hypervisor it knows to support x2APIC without -- KVM, Xen, Hyper-V.
+This one's CPUID names KVM's paravirtual interface ([KVM's paravirtual
+interface](#kvms-paravirtual-interface-as-far-as-it-is-backed)), and a Linux built with
+`KVM_GUEST` takes that for the answer (`x2apic_available` is
+`kvm_para_available` there); one built without it does not, and finding
 its firmware left x2APIC on, a Linux 6.1 or 6.18 turns it off, reading its
 APIC's ID through a page it has not mapped, and faults. So a machine with
-an IO-APIC is the PC most firmware makes, in xAPIC mode, and the kernel
-takes it as it is:
+an IO-APIC is the PC most firmware makes, in xAPIC mode, which every kernel
+takes as it is (whether a `KVM_GUEST` kernel with an IO-APIC runs right
+with its x2APIC kept, and no MMIO exit for its APIC, has not been measured
+yet: that is what starting such a guest in x2APIC mode would want first):
 
 ```
 $ hv boot /bzImage cpus=2 ioapic initrd=/initrd cmdline=console=ttyS0
@@ -4554,7 +4571,7 @@ $ hv boot /bzImage cpus=2 ioapic initrd=/initrd cmdline=console=ttyS0
 [    0.260088] ..TIMER: vector=0x30 apic1=0 pin1=2 apic2=0 pin2=0
 ...
   mmio       65657 accesses performed for the guest, its instructions decoded: the xAPIC page's and the IO-APIC's
-  ioapic     431 interrupts sent, 0 of them level-triggered, 0 ended by EOI, 0 of no delivery mode sent here
+  ioapic     431 interrupts sent, 0 of them level-triggered, 0 ended by EOI, 0 levels no local APIC took, 0 of no delivery mode sent here
 ```
 
 Every access of its APICs is then a decoded MMIO access ([What an exit
