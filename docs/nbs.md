@@ -823,7 +823,15 @@ A session's life:
    closes, flushes -- are refused.
 4. **Reconcile**: each chunk any replica holds open -- left so by a writer
    that stopped uncleanly -- read from one replica, this host's if it has
-   one, and written to every one, 256 KiB at a time, then closed.
+   one, and written to every one, 256 KiB at a time, then closed. After an
+   attach anew, also every place a write out had reached a replica with,
+   open anywhere or not: a join's copy of a write out closes what it
+   copies, and its source taken out and back left the chunk open nowhere
+   (N13c). A chunk others share is written in place -- what the reconcile
+   writes, one of its replicas holds already, the same for every map that
+   names it -- not held for a copy-up, which waits for any join of its set
+   (N13c: a join stuck under its one source's failed device failed the
+   session at the mend's deadline).
 5. **Serve**, until **stop**: what was asked before it done, a flush, every
    chunk written closed, detached. A stop asked while the session is still
    starting, or paused for a snapshot, is begun once it serves; one asked
@@ -877,6 +885,18 @@ What it holds to (plans/nbs.md, "Replication: the rules"):
   copy by another way than a newer write of its blocks put older data over
   that one (found by the cluster target). A session with no name -- `nbs
   io`'s -- sends each piece to each replica directly, as before N13.
+- **A write alone goes to each replica directly** (N13c): one whose
+  session has no other write out -- none of another's pieces sent and not
+  done -- is sent to each replica at once, its marks with it as above, and
+  answered by each by name. Its time is the slowest replica's, not the
+  chain's hops one after another, each taking the whole piece before it
+  passes it on: at depth 1 the chain cost a 256 KiB write half its speed
+  (N13b). With another write out, a chain again -- one copy leaving the
+  writer's host, which is what depth is for. On the AX41's three VMs, 16
+  MiB to 64 MiB written at depth 1, its chunks open, three rounds each:
+  4 KiB 1350-1377 IOPS along chains, 1954-2002 alone (0.73 ms to 0.51);
+  256 KiB 24.6-25.0 MiB/s, 46.7-47.9; at depth 2 and 8, and 4 KiB at 32,
+  the same both ways, the writes going along chains then.
 - **Two writes that overlap are never out at once.** A read goes to one
   active replica, this host's where it has one, and to another when it does
   not answer.
@@ -889,7 +909,10 @@ What it holds to (plans/nbs.md, "Replication: the rules"):
   A read that finds no active replica in the view waits for the map: the
   set's last active member is never taken out. A cs that comes into the view
   while the session's start fences is fenced too, and the start waits for
-  it. A session detached takes no answer to an ask of before. An ask to
+  it. A session detached or failed takes no answer of before -- the mds's
+  to an ask, nor a cs's to a request: a copy-up's member refusing its copy
+  as `NotAttached` once the stop had let the volume go failed a session
+  detached (found by the cluster target, N13c). An ask to
   take a cs out refused as no replica of its set -- its place another's
   since, a joiner's of the controller's -- has the map read again, which
   drops the ask; what waits for the cs is done as it comes due, by the view
@@ -1218,12 +1241,15 @@ only its metadata.
   and not on another must have its session close nothing of its
   generation after; one that reached none -- the session paused for a
   snapshot as it came, say, and its fence of the replica cut off waiting --
-  is not held to it.
+  is not held to it. And a write starved of memory past its deadline,
+  every request of it unmade, reaches no replica: the session goes on at
+  its generation, not attaching anew, and writes the block once its memory
+  is back (the `starved_past_deadline` end, a quarter of the seeds).
 
-  `--mutants` takes two hundred and sixteen rules out one at a time --
+  `--mutants` takes two hundred and nineteen rules out one at a time --
   seventy-four of the metadata's, five of them the controller's;
   forty-nine of the cs's engine; forty-one of the wire's, its `serve`'s,
-  the mds's, the copy's and the scrub's; fifty-two of the client's --
+  the mds's, the copy's and the scrub's; fifty-five of the client's --
   each caught: one, the client's copy-up ended only once every member
   active in its view has copied, only at the cluster seeds the gate runs
   past its range (`GATE_CLUSTER_ALSO`), its race having moved past the

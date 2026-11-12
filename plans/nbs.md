@@ -1911,8 +1911,68 @@ each new gate.
     out at a time (`small_windows`): its `close_all_written` end, every
     place closed when a close asked alone is done, and in a moment; and
     every session's places closing at once held to the window.
-  - **Left from N13**: depth 1's cost -- a session with one write out could
-    send it to each replica directly.
+  - **Depth 1's cost, done (N13c, 2026-11-12)**: a write alone -- its
+    session's only write out, none of another's pieces sent and not done
+    -- goes to each replica directly, with its marks, as a chain's hop sent
+    directly does (`Session::alone`); with another out, along its chain.
+    The fuzzer's cluster target holds a client to it: a chain begun by its
+    only write not done fails (mutants `alone_fans_out`,
+    `alone_of_others_left`). nbs-test: nbsload at depth 1 has no cs pass a
+    write on. The EX44 another session's that day, the numbers are the
+    AX41's alone: its three VMs on its bridge (ax41a, ax41c, and ax41d made
+    for it in VM slot b; n11's old volumes deleted, `ab` made, its chunks
+    at three), nbsload on ax41a, the client's module the only thing changed
+    -- n13c's against the tree's -- three rounds of each, alternated. Its
+    chunks open (16 MiB to 64 MiB written): 4 KiB at depth 1 1361, 1377
+    and 1350 IOPS along chains, 2002, 1954 and 1966 alone (0.73 ms a write
+    to 0.51); 256 KiB 25.0, 24.6 and 24.9 MiB/s, 47.9, 47.4 and 46.7. Over
+    the whole 4 GiB, 256 KiB at depth 1 23-25 against 33-44, 4 KiB at
+    depth 1 116-148 IOPS both ways -- each write a cold chunk's, its open
+    mark's commit round all its time; at depth 2 (45-52 MiB/s), 8 (72-76)
+    and 4 KiB at 32 (8.6-9.5k IOPS) the same both ways, chains in both. On
+    the EX44's line, its middle replica a VM over the WAN, the chain cost
+    more (N12d 25 against N13b's 11-15): to be measured there when it is
+    free again.
+  - **What the lone writes' timing brought up** (campaigns of cluster seeds
+    1001-9000; each a hole before them, its seed's course moved): (1) a
+    copy-up's member refusing its copy as `NotAttached` once the stop had
+    let the volume go failed a session detached -- `on_cs` and `on_bounce`
+    now take no answer once detached or failed, as `on_mds` and `tick`
+    did -- no mutant of it: no seed of 1001-9000 reaches it with the guard
+    taken out (a copy-up's member late past the stop), and the guard is
+    theirs. (2) A reconcile's mend of a shared place waited
+    for a copy-up, which waits for any join of the set; a join stuck --
+    its one source's device failed -- failed the session at the mend's
+    deadline (7225; 1960 the same through an attach anew): the reconcile
+    writes a shared chunk in place, what it writes a replica of it held
+    already (`mend_in_place`). (3) A lone write out to a and b, b cut off;
+    e joined the set and copied the chunk from a, the write in it, closing
+    what it copied; a stale ask took a out, and a's join back closed its
+    copy too; the write failed at its deadline, the session attached anew,
+    and its reconcile found the chunk open nowhere -- b without the write,
+    e with it, for good (5316). An attach anew's reconcile now mends the
+    places of every write it had out that reached a replica, open anywhere
+    or not (`mend_too`, mutant `anew_mends_writes_out`). And the end
+    `starved_past_deadline` holds the attach anew's other side: a write
+    starved of memory past its deadline reaches no replica and has none
+    (`anew_only_left`'s one seed lost to the lone writes' course).
+  - **Open, for the user (found in N13c): a join's copy closes what it
+    copies.** (3)'s hole without the attach anew: a writer that crashes
+    with a write out its source has and another member has not, the source
+    copied by a joiner -- the copy closed -- and then taken out and back:
+    the next writer's reconcile goes by open marks and finds none, the
+    members apart for good. Options: (a) the copy keeps the source's open
+    mark -- the source's sums answered with the generation that has the
+    chunk open there (tried: right for (3), but a writer's close with a
+    view from before the join reaches the source alone, the store's close
+    takes any epoch, and the joiner's mark stays open past the writer's
+    pause, which the cluster target fails a fifth of its seeds on; it
+    needs closes refused at an epoch past the writer's view, as writes are,
+    and a close's places sent again to the set's new members once the map
+    is read again); (b) a source holding the chunk open is no source for it
+    -- the join waits for its close (a chunk written all the time holds
+    the join for good); (c) leave it, the window being a crash inside a
+    join's copy of the very chunk.
 
 ## What to expect
 
