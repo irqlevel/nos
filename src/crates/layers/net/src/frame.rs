@@ -92,6 +92,19 @@ impl RawFrame {
             unsafe { alloc::alloc::dealloc(raw, layout) };
             return None;
         }
+        /* A device is pointed at `data_phys` and the frame's length, so the
+         * buffer is one run of physical memory or it is no frame: a heap
+         * block of a page and more is pages taken one by one, and a device
+         * given one past its first page read -- or wrote -- RAM that was
+         * another owner's. `alloc_tx` holds a frame to FRAME_CAPACITY, which
+         * with its header is a block of one page at most -- a pool's block,
+         * which no page boundary cuts, or a page of its own -- so this
+         * holds; were the heap to change, a frame would stop here rather
+         * than reach a device. */
+        let last = kcore::dma::virt_to_phys(data.as_ptr().wrapping_add(capacity.max(1) - 1)) as usize;
+        assert!(last == data_phys + (capacity.max(1) - 1),
+            "net: a frame of {} bytes whose buffer is not one run of physical memory ({:#x}, then {:#x})",
+            capacity, data_phys, last);
 
         /* Fresh memory of the header's size and alignment. */
         unsafe {
@@ -185,12 +198,19 @@ impl Frame {
         unsafe { self.0.as_ref() }
     }
 
-    /// A frame to transmit, with room for `len` bytes.
+    /// A frame to transmit, with room for `len` bytes: None for more than
+    /// FRAME_CAPACITY, which no device here is given -- nothing sends a
+    /// jumbo frame -- and which a frame could not be and stay one run of
+    /// physical memory (`RawFrame::build`); counted as `oversized`.
     ///
     /// From the pool whenever it fits one -- a per-CPU cache, no allocator at
     /// all. What the pool cannot serve falls through to the allocator, which
     /// is what this used to be for every frame.
     pub fn alloc_tx(len: usize) -> Option<Frame> {
+        if len > FRAME_CAPACITY {
+            POOL.oversized.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         POOL.alloc(len)
             .or_else(|| RawFrame::build(len, false).map(IdleFrame::activate))
     }
@@ -499,15 +519,12 @@ impl FramePool {
         true
     }
 
-    /// A frame with room for `len` bytes, or None when the request is too
-    /// large for a pooled one or the pool is empty -- the caller then falls
-    /// back to the allocator.
+    /// A frame with room for `len` bytes -- no more than FRAME_CAPACITY,
+    /// which `Frame::alloc_tx` refuses past -- or None when the pool is
+    /// empty, or not made yet: the caller then falls back to the allocator.
     fn alloc(&self, len: usize) -> Option<Frame> {
         let ring = self.ring.get()?;
-        if len > FRAME_CAPACITY {
-            self.oversized.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
+        debug_assert!(len <= FRAME_CAPACITY);
 
         /* This CPU's cache, with interrupts off rather than a lock: nothing
          * else touches it, so there is nothing to contend for and no atomic

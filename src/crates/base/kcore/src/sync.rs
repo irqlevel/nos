@@ -7,10 +7,22 @@ use ffi::sync;
  * unlock is `unsafe` at a call site -- the one place that needs it is the
  * guard's own `Deref`, below, once per lock type.
  *
- * Guards are values: two may be held at once and dropped in either order
- * (`drop(a)` before `b` goes out of scope), and a function that takes a lock
- * on its caller's behalf returns the guard. A lock that guards nothing --
- * one that only serialises a stretch of code -- is a lock over `()`. */
+ * Guards are values: two may be held at once, and a function that takes a
+ * lock on its caller's behalf returns the guard. The order they are dropped
+ * in is free for a `Mutex`, a `PreemptSpinLock` and a `TryLock` -- a count,
+ * or nothing, is all they give back -- and not for the two that save the
+ * interrupt flag, a `SpinLock` and an `IrqSpinLock`: each puts back the flag
+ * as it found it, so the one taken first, released first, turns interrupts
+ * (and preemption) on under the other, and the other's release then leaves
+ * them off. Those are released innermost first; the release of one that
+ * finds interrupts on panics, naming it, rather than leave a deadlock for
+ * the next interrupt that takes the lock (`kernel_irq_restore`).
+ *
+ * None of the guards but a `TryLock`'s is `Send`: a `Mutex`'s belongs to
+ * the task that took it, and the spin locks' give back what they took of
+ * this CPU -- its interrupt flag -- and of this task -- its preemption
+ * count. A lock that guards nothing -- one that only serialises a stretch
+ * of code -- is a lock over `()`. */
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
@@ -255,7 +267,7 @@ impl<T> IrqSpinLock<T> {
         while self.held.swap(true, Ordering::Acquire) {
             core::hint::spin_loop();
         }
-        IrqSpinGuard { lock: self, flags }
+        IrqSpinGuard { lock: self, flags, _not_send: PhantomData }
     }
 
     /// One attempt, no spin: None when someone else has it. For the panic
@@ -267,7 +279,7 @@ impl<T> IrqSpinLock<T> {
             unsafe { ffi::cpu::kernel_irq_restore(flags) };
             None
         } else {
-            Some(IrqSpinGuard { lock: self, flags })
+            Some(IrqSpinGuard { lock: self, flags, _not_send: PhantomData })
         }
     }
 
@@ -287,6 +299,9 @@ impl<T> IrqSpinLock<T> {
 pub struct IrqSpinGuard<'a, T> {
     lock: &'a IrqSpinLock<T>,
     flags: usize,
+    /// The flags are this CPU's and the preemption count this task's: the
+    /// guard is dropped where it was taken.
+    _not_send: PhantomData<*const ()>,
 }
 
 impl<T> Deref for IrqSpinGuard<'_, T> {
@@ -338,12 +353,15 @@ impl<T> PreemptSpinLock<T> {
         while self.held.swap(true, Ordering::Acquire) {
             core::hint::spin_loop();
         }
-        PreemptSpinGuard { lock: self }
+        PreemptSpinGuard { lock: self, _not_send: PhantomData }
     }
 }
 
 pub struct PreemptSpinGuard<'a, T> {
     lock: &'a PreemptSpinLock<T>,
+    /// The preemption count is the task's that took it: the guard is
+    /// dropped by that task.
+    _not_send: PhantomData<*const ()>,
 }
 
 impl<T> Deref for PreemptSpinGuard<'_, T> {

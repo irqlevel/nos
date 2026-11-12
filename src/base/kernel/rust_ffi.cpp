@@ -426,8 +426,23 @@ unsigned long long kernel_spinlock_lock(unsigned long handle)
     return (unsigned long long)flags;
 }
 
+/* A Rust guard that saved the interrupt flag, given back: interrupts are
+   off from its lock to its release, so finding them on means a guard taken
+   before this one was released before it -- the two out of order, the
+   outer's flags turning interrupts and preemption on under this lock -- or
+   something turned them on inside. Said here, at the inner release, where
+   it is certain, rather than left a deadlock for the next interrupt that
+   takes the lock and a task run on with interrupts off (kcore::sync). One
+   flags read; only Rust calls the two exports that make it. */
+static void check_interrupts_saved(const char* what)
+{
+    if (unlikely(hal::is_interrupt_enabled()))
+        PANIC("%s: released with interrupts on -- after a guard taken before it, or with them turned on inside", what);
+}
+
 void kernel_spinlock_unlock(unsigned long handle, unsigned long long flags)
 {
+    check_interrupts_saved("a SpinLock");
     reinterpret_cast<kernel::SpinLock*>(handle)->unlock((unsigned long)flags);
 }
 
@@ -1089,10 +1104,10 @@ int kernel_softirq_pending(unsigned long type)
     return kernel::SoftIrq::get_instance().is_pending(type) ? 1 : 0;
 }
 
-void kernel_softirq_register(unsigned long type,
+int kernel_softirq_register(unsigned long type,
     void (*handler)(void*), void* ctx)
 {
-    kernel::SoftIrq::get_instance().register_handler(type, handler, ctx);
+    return kernel::SoftIrq::get_instance().register_handler(type, handler, ctx) ? 1 : 0;
 }
 
 /* ---- PCI ---- */
@@ -2451,6 +2466,7 @@ unsigned long kernel_irq_save()
 
 void kernel_irq_restore(unsigned long flags)
 {
+    check_interrupts_saved("interrupts saved (an IrqSpinLock, irq_save)");
     kernel::preempt_irq_restore(flags);
 }
 

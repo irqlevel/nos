@@ -283,6 +283,12 @@ extern "C" void rust_mgmt_drain_range(ulong, ulong, int)
     fuzz::host_hal_unreachable("rust_mgmt_drain_range");
 }
 
+/* And the net layer's sweep of a listener or a sink it left */
+extern "C" void rust_net_close_range(ulong, ulong, const char*, ulong)
+{
+    fuzz::host_hal_unreachable("rust_net_close_range");
+}
+
 void kernel::Cmd::close_range(ulong, ulong)
 {
     fuzz::host_hal_unreachable("Cmd::close_range");

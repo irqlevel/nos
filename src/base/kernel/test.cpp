@@ -3336,6 +3336,39 @@ static void hold_call_task(void* ctx)
     Cmd::dispatch("modtest hold", out);
 }
 
+/* What test_module_unload holds the net layer's sweep to
+   (rust_net_close_range): modtest loaded again, its `modtest listen` taking
+   the port the unloaded copy left a listener on -- refused, that listener
+   outlived its module, its callbacks in freed pages -- and unloaded again,
+   the one it leaves now swept the same way */
+static bool check_listener_swept(stdlib::BufferPrinter& out)
+{
+    auto& modules = ModuleTable::get_instance();
+
+    out.reset();
+    stdlib::Error err = modules.load(nos_modtest_ko, nos_modtest_ko_size, "", out);
+    if (!err.ok())
+    {
+        klog(0, "test_module_unload: the load after the listener's: %s", out.get());
+        return false;
+    }
+
+    out.reset();
+    Cmd::dispatch("modtest listen", out);
+    const bool port_free = (stdlib::str_str(out.get(), "modtest listen: left listening") != nullptr);
+    if (!port_free)
+        klog(0, "test_module_unload: the listener the unload had to take off: %s", out.get());
+
+    out.reset();
+    stdlib::Error unloaded = modules.unload("modtest", out);
+    if (!unloaded.ok() || modules.is_loaded("modtest"))
+    {
+        klog(0, "test_module_unload: the unload after the listener's: %s", out.get());
+        return false;
+    }
+    return port_free;
+}
+
 bool test_module_unload()
 {
     static const ulong OUTPUT_SIZE = 1024;
@@ -3379,11 +3412,23 @@ bool test_module_unload()
     if (!ticking)
         klog(0, "test_module_unload: the timer: %s", out.get());
 
+    /* A UDP listener the module leaves, its callbacks the module's code:
+       the unload has to take it off (rust_net_close_range), which the next
+       load finds out by taking the port again (check_listener_swept). A
+       boot with no NIC has nothing to listen on: said, and not held
+       against it */
+    out.reset();
+    Cmd::dispatch("modtest listen", out);
+    const bool listening = (stdlib::str_str(out.get(), "modtest listen: left listening") != nullptr);
+    const bool no_nic = (stdlib::str_str(out.get(), "modtest listen: no ") != nullptr);
+    if (!listening)
+        klog(0, "test_module_unload: the listener: %s", out.get());
+
     /* Unloaded whatever came of that: the call returns only once the stop
        has run, and the unload, only once the call has returned */
     out.reset();
     stdlib::Error unloaded = modules.unload("modtest", out);
-    bool ok = unloaded.ok() && !modules.is_loaded("modtest") && ticking;
+    bool ok = unloaded.ok() && !modules.is_loaded("modtest") && ticking && (listening || no_nic);
     if (!unloaded.ok() || modules.is_loaded("modtest"))
         klog(0, "test_module_unload: unload failed: %s", out.get());
     sleep(LEFT_TIMER_NS);
@@ -3411,6 +3456,9 @@ bool test_module_unload()
         hold->~HoldCall();
         mm::free(hold);
     }
+
+    if (ok && listening && !check_listener_swept(out))
+        ok = false;
 
     if (ok)
         klog(0, "test_module_unload: complete");
