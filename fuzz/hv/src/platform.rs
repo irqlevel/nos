@@ -1425,16 +1425,22 @@ impl Script {
                 }
                 26 => Exit::Pause,
                 27 if v.has_vapic() => {
-                    /* A `mov` to CR8 under the TPR shadow: VTPR, no exit. */
+                    /* A `mov` to CR8 under the TPR shadow: VTPR, no exit --
+                     * but below the TPR threshold the run loop asked for, an
+                     * interrupt held by the TPR alone waiting. */
                     v.virtual_cr8(r.u8());
-                    continue;
+                    if v.tpr_window_hit() {
+                        Exit::IrqWindow
+                    } else {
+                        continue;
+                    }
                 }
                 27 => {
                     let write = r.bool();
                     let gpr = r.below(16) as u8;
                     v.regs_mut().rcx = r.value64();
                     v.regs_mut().r9 = r.value64();
-                    Exit::Cr8 { write, gpr }
+                    Exit::Cr8 { write, gpr: Some(gpr) }
                 }
                 /* An instruction the guest was told nothing of -- a VMX or
                  * SVM one, GETSEC -- answered #UD. */

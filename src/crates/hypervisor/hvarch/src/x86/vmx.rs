@@ -998,6 +998,9 @@ pub struct Guest {
     /// Ask the CPU to exit the moment the guest could take an interrupt: the
     /// interrupt-window control, toggled entry to entry.
     irq_window: bool,
+    /// What `set_tpr_threshold` asked for, and what the VMCS holds.
+    tpr_threshold: u8,
+    tpr_threshold_set: u8,
     /// The same for an NMI: the NMI-window control, which needs virtual NMIs
     /// (`virtual_nmis`).
     nmi_window: bool,
@@ -1119,6 +1122,8 @@ impl Guest {
             inject: 0,
             inject_errcode: 0,
             irq_window: false,
+            tpr_threshold: 0,
+            tpr_threshold_set: 0,
             nmi_window: false,
             exit_reason: 0,
             exit_qual: 0,
@@ -1533,6 +1538,16 @@ impl Guest {
     }
 
     /// Whether to exit as soon as the guest can take an interrupt.
+    /// The TPR threshold, the class whose lowering of VTPR below it stops
+    /// the guest (`TPR_BELOW_THRESHOLD`): written at the next entry where
+    /// the CPU has the TPR shadow and is not delivering the APIC's
+    /// interrupts itself, and 0 otherwise -- an entry refuses a threshold
+    /// above VTPR's class then, which the run loop never asks for, the
+    /// class held being at most the TPR's.
+    pub fn set_tpr_threshold(&mut self, class: u8) {
+        self.tpr_threshold = class & 0xF;
+    }
+
     pub fn set_irq_window(&mut self, on: bool) {
         self.irq_window = on;
     }
@@ -1800,7 +1815,9 @@ impl Guest {
                 vmwrite(GUEST_RFLAGS, s.rflags);
                 vmwrite(GUEST_DR7, s.dr7);
                 vmwrite(GUEST_ACTIVITY_STATE, 0);
-                vmwrite(vmcs::GUEST_PENDING_DBG, 0);
+                /* A single step owed past what the policy stepped over
+                 * (`set_pending_single_step`), or nothing pending */
+                vmwrite(vmcs::GUEST_PENDING_DBG, if self.pending_bs { debug::BS } else { 0 });
             }
             unsafe {
                 vmwrite(GUEST_RIP, s.rip);
@@ -2283,7 +2300,7 @@ impl Guest {
              * the other order could read one CPU and run on another -- and
              * lends the entry what the CPU keeps of its guests
              * (`super::Entries`). */
-            let ran = super::ENTRIES.with(|entries, cpu| {
+            let ran = super::ENTRIES.with_then(|entries, cpu| {
                 let cpu = cpu as u32;
                 /* The task may have moved between the load phase and here.
                  * If the VMCS is current on a CPU that is not this one, go
@@ -2291,18 +2308,27 @@ impl Guest {
                  * a second copy. */
                 let loaded = self.loaded_cpu.load(Ordering::Acquire);
                 if loaded >= 0 && loaded as u32 != cpu {
-                    return None;
+                    return (None, None);
                 }
-                Some(unsafe { self.enter(entries, cpu, nested, host_areas, kick, fast.as_deref_mut()) })
+                let ran = unsafe { self.enter(entries, cpu, nested, host_areas, kick, fast.as_deref_mut()) };
+                (Some(ran), self.acked.take())
+            }, |acked| {
+                /* The host's interrupt the exit acknowledged, handed to its
+                 * handler here and now: on this CPU, whose local APIC holds it
+                 * in service, with interrupts and preemption still off -- and
+                 * the CPU's entries let go of, an IPI's handler among them
+                 * free to reach them. Handed over once interrupts were back
+                 * on, an interrupt of a higher class came first and its
+                 * handler's `preempt` could switch the task away -- every
+                 * interrupt of this one's class and below held off the CPU
+                 * meanwhile -- or move it, and the handler then ran, and
+                 * ended the vector, on another CPU: this one kept it in
+                 * service for good. Its handler's own `preempt` comes once
+                 * preemption is back on. */
+                if let Some(vector) = acked {
+                    unsafe { deliver_host_interrupt(vector) };
+                }
             });
-            /* The host's interrupt an exit acknowledged, handed to its handler
-             * now that the CPU's entries are let go of: its handler may
-             * switch tasks. */
-            if let Some(vector) = self.acked.take() {
-                /* Acknowledged at this CPU's last exit and delivered no
-                 * other way; `with` has returned, no borrow held. */
-                unsafe { deliver_host_interrupt(vector) };
-            }
             match ran {
                 Some(Some(ran)) => return ran,
                 Some(None) => continue,
@@ -2493,6 +2519,15 @@ impl Guest {
                         self.synced.eoi_exit = self.eoi_exit;
                     }
                 }
+                /* The TPR threshold: an interrupt the TPR alone holds stops
+                 * the guest when VTPR drops below its class -- not while the
+                 * CPU delivers the APIC's interrupts itself, when nothing is
+                 * held by the run loop. Written when it changes. */
+                let threshold = if self.apicv_on { 0 } else { self.tpr_threshold };
+                if threshold != self.tpr_threshold_set {
+                    vmcs::vmwrite(vmcs::TPR_THRESHOLD, u64::from(threshold));
+                    self.tpr_threshold_set = threshold;
+                }
             }
             /* The event to inject, when there is one: the CPU clears the
              * field's valid bit as it takes the event, so with none to
@@ -2557,6 +2592,7 @@ impl Guest {
             /* Its IA32_SPEC_CTRL over the host's, put back after the exit --
              * by the stub itself for legacy IBRS (`super::spec`). */
             let ran_with = entries.spec.load_guest(self.msrs.spec_ctrl());
+            let ran_with = if self.msrs.measuring() { entries.spec.read_spec_ctrl() } else { ran_with };
             self.msrs.ran(ran_with);
             speculation.flush_l1d();
             let failed = unsafe { vmx_launch_stub(&mut gpr, flags, spec_ctrl.unwrap_or(0)) };
@@ -2817,9 +2853,10 @@ core::arch::global_asm!(
 ///
 /// # Safety
 /// `vector` is one the CPU acknowledged for the host at this CPU's last
-/// exit, delivered no other way and only this once; and no per-CPU borrow is
-/// held -- the handler may switch tasks (`Preempt`), as an interrupt taken
-/// with interrupts on may.
+/// exit, delivered no other way and only this once, on that CPU, with
+/// interrupts and preemption off since the exit: the handler's own end --
+/// its EOI, and a switch of tasks its `preempt` asks for -- comes on this
+/// CPU, the switch once preemption is back on.
 unsafe fn deliver_host_interrupt(vector: u8) {
     /* An external interrupt has a vector above the exceptions'; an `int` of
      * one of those would be the exception's handler with no error code. */

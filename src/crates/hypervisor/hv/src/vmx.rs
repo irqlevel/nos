@@ -348,7 +348,10 @@ impl Vcpu {
              * stop of its whole VM for a user process's `vmxoff`. */
             r::VMCLEAR | r::VMLAUNCH | r::VMPTRLD | r::VMPTRST | r::VMREAD | r::VMRESUME | r::VMWRITE
             | r::VMXOFF | r::VMXON | r::INVEPT | r::INVVPID | r::VMFUNC | r::GETSEC => Exit::Undefined,
-            r::INTERRUPT_WINDOW => Exit::IrqWindow,
+            /* A window: the guest can take an interrupt now -- its
+             * interrupts on, or its task priority below the threshold the
+             * one held for is of. */
+            r::INTERRUPT_WINDOW | r::TPR_BELOW_THRESHOLD => Exit::IrqWindow,
             r::CR_ACCESS => {
                 /* CR8, which is the host's; a `mov` to CR0 or an `lmsw`
                  * changing a bit the host keeps of CR0 (`Guest::set_cr0`);
@@ -361,7 +364,9 @@ impl Vcpu {
                 let kind = q & cr::TYPE_MASK;
                 let gpr = ((q & cr::GPR_MASK) >> cr::GPR_SHIFT) as u8;
                 match (q & cr::CR_MASK, kind) {
-                    (8, cr::MOV_TO_CR) | (8, cr::MOV_FROM_CR) => Exit::Cr8 { write: kind == cr::MOV_TO_CR, gpr },
+                    (8, cr::MOV_TO_CR) | (8, cr::MOV_FROM_CR) => {
+                        Exit::Cr8 { write: kind == cr::MOV_TO_CR, gpr: Some(gpr) }
+                    }
                     (0, cr::MOV_TO_CR) => Exit::Cr0Write { value: self.gpr(gpr) },
                     (4, cr::MOV_TO_CR) => Exit::Cr4 { write: true, gpr: Some(gpr) },
                     (0, cr::LMSW) => {
@@ -694,9 +699,10 @@ impl Vcpu {
         self.guest.save().efer & EFER_LMA != 0 && self.guest.exit_cs_ar() & AR_L != 0
     }
 
-    /// Step past the ICEBP whose #DB stopped the guest at it.
+    /// Step past the ICEBP whose #DB stopped the guest at it: its own #DB
+    /// the run loop gives, and no single step's beside it.
     pub fn skip_icebp(&mut self) {
-        self.skip();
+        self.step_over();
     }
 
     /// CR8 written for the guest -- its APIC's task priority, written
@@ -765,16 +771,38 @@ impl Vcpu {
     /// Step past the instruction the guest stopped at: VMX reports its length
     /// for every exit that has one, so there is no per-instruction constant.
     fn skip(&mut self) {
+        self.step_over();
+        self.stepped();
+    }
+
+    fn step_over(&mut self) {
         let len = self.guest.exit_instr_len() as u64;
         let s = self.guest.save_mut();
         s.rip = s.rip.wrapping_add(len);
         self.leave_shadow();
     }
 
+    /// After every instruction the host stepped past for the guest: with
+    /// RFLAGS.TF set, the single step's #DB the instruction would have
+    /// raised -- the CPU raises none for an instruction that exited -- as a
+    /// debug exception pending at the next entry, which the CPU delivers
+    /// before the guest's next instruction, and DR6.BS in the guest's DR6,
+    /// which VT-x does not switch and a `mov` from it is answered from.
+    fn stepped(&mut self) {
+        let s = self.guest.save_mut();
+        if s.rflags & RFLAGS_TF == 0 {
+            return;
+        }
+        let payload = vmcs::debug::BS;
+        s.dr6 = (((s.dr6 & !DR6_TRAP_BITS) | DR6_ACTIVE_LOW | payload) ^ (payload & DR6_ACTIVE_LOW)) & !DR6_BIT12;
+        self.guest.set_pending_single_step();
+    }
+
     pub fn skip_io(&mut self, io: &Io) {
         let s = self.guest.save_mut();
         s.rip = io.next_rip;
         self.leave_shadow();
+        self.stepped();
     }
 
     /// Step past an instruction the host performed for the guest, `len`
@@ -784,6 +812,7 @@ impl Vcpu {
         let s = self.guest.save_mut();
         s.rip = s.rip.wrapping_add(len);
         self.leave_shadow();
+        self.stepped();
     }
 
     /// Out of any interrupt shadow the stepped instruction was in -- a STI's
@@ -906,6 +935,17 @@ impl Vcpu {
 
     pub fn clear_irq_window(&mut self) {
         self.guest.set_irq_window(false);
+        self.guest.set_tpr_threshold(0);
+    }
+
+    /// Stop the guest when its task priority drops below `class`: an
+    /// interrupt of that class is requested and the TPR alone holds it.
+    /// Under the TPR shadow a `mov` to CR8 does not exit, and the TPR
+    /// threshold is what does; without it every `mov` of CR8 exits anyway.
+    /// While the CPU delivers the APIC's interrupts itself the run loop
+    /// holds nothing back, and asks for none.
+    pub fn request_tpr_window(&mut self, class: u8) {
+        self.guest.set_tpr_threshold(class);
     }
 
     /// The guest's state and the last exit, for a report.

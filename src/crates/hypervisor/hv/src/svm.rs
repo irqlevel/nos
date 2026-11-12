@@ -44,6 +44,11 @@ const CR4_DEFINED: u64 = 0x00F7_1FFF;
 pub const PAT_RESET: u64 = 0x0007_0406_0007_0406;
 const RFLAGS_RESERVED_ONE: u64 = 1 << 1;
 const DR6_RESET: u64 = 0xFFFF_0FF0;
+/// DR6.BS: the #DB was a single step's.
+const DR6_BS: u64 = 1 << 14;
+/// RFLAGS.TF: a single step after every instruction.
+const RFLAGS_TF: u64 = 1 << 8;
+const VECTOR_DB: u64 = 1;
 const DR7_RESET: u64 = 0x400;
 /// How many debug registers an exit code can name a `mov` of, each way.
 const DEBUG_REGS: u64 = 16;
@@ -533,6 +538,7 @@ impl Vcpu {
             vmcb::exit::INTR | vmcb::exit::NMI | vmcb::exit::SMI | vmcb::exit::INIT => Exit::Host,
             vmcb::exit::CR4_READ => Exit::Cr4 { write: false, gpr: None },
             vmcb::exit::CR4_WRITE => Exit::Cr4 { write: true, gpr: None },
+            vmcb::exit::CR8_WRITE => Exit::Cr8 { write: true, gpr: None },
             code if (vmcb::exit::DR_READ..vmcb::exit::DR_READ + DEBUG_REGS).contains(&code) => {
                 Exit::Dr { write: false, dr: (code - vmcb::exit::DR_READ) as u8, gpr: None }
             }
@@ -640,10 +646,32 @@ impl Vcpu {
     /// instruction also steps out of the interrupt shadow it may have been
     /// in: the one instruction after STI has now run.
     pub fn skip(&mut self, len: u64) {
+        self.step_over(len);
+        self.stepped();
+    }
+
+    /// `skip` with no single step after it: for ICEBP, whose own #DB the
+    /// run loop gives.
+    fn step_over(&mut self, len: u64) {
         let nrip = self.nrip;
         let v = self.guest.vmcb_mut();
         v.save.rip = if nrip { v.control.next_rip } else { v.save.rip.wrapping_add(len) };
         v.control.int_state &= !vmcb::int_state::SHADOW;
+    }
+
+    /// After every instruction the host stepped past for the guest: with
+    /// RFLAGS.TF set, the single step's #DB the instruction would have
+    /// raised, DR6.BS set -- the CPU raises none for an instruction it never
+    /// ran, and a debugger's `stepi` over a CPUID landed one instruction
+    /// late, a uprobe's step after it ran the next. Not over an event
+    /// already going in, which an instruction's intercept never cuts short.
+    fn stepped(&mut self) {
+        use vmcb::event;
+        let v = self.guest.vmcb_mut();
+        if v.save.rflags & RFLAGS_TF != 0 && v.control.event_inj & event::VALID == 0 {
+            v.save.dr6 |= DR6_BS;
+            v.control.event_inj = event::VALID | event::TYPE_EXCEPTION | VECTOR_DB;
+        }
     }
 
     /// Step past an instruction the host performed for the guest, `len`
@@ -654,6 +682,7 @@ impl Vcpu {
         let v = self.guest.vmcb_mut();
         v.save.rip = v.save.rip.wrapping_add(len);
         v.control.int_state &= !vmcb::int_state::SHADOW;
+        self.stepped();
     }
 
     /// Step past an I/O instruction: its end is always known.
@@ -661,6 +690,7 @@ impl Vcpu {
         let v = self.guest.vmcb_mut();
         v.save.rip = io.next_rip;
         v.control.int_state &= !vmcb::int_state::SHADOW;
+        self.stepped();
     }
 
     pub fn skip_hlt(&mut self) {
@@ -695,7 +725,7 @@ impl Vcpu {
     /// Step past an ICEBP (`int1`), intercepted: the #DB it raises, which
     /// the run loop gives the guest next, is a trap's, delivered after it.
     pub fn skip_icebp(&mut self) {
-        self.skip(LEN_ICEBP);
+        self.step_over(LEN_ICEBP);
     }
 
     /// Step past an XSETBV performed for the guest (`crate::cr::xsetbv`).
@@ -785,12 +815,26 @@ impl Vcpu {
         c.int_ctl |= int_ctl::V_IRQ | int_ctl::V_IGN_TPR;
     }
 
+    /// Stop the guest at its next write of its task priority: an interrupt
+    /// is requested that the TPR alone holds (`class` its class), and under
+    /// V_INTR_MASKING a `mov` to CR8 is the guest's own, no exit -- the
+    /// lowering was seen at the guest's next exit of another kind, a host
+    /// tick on. KVM's way (`svm_update_cr8_intercept`): the CR8 write
+    /// intercept, taken off with the window (`clear_irq_window`). Not a
+    /// V_IRQ at that priority: whether it is taken at a V_TPR equal to it
+    /// differs between QEMU's TCG, which takes it, and AMD's text -- a storm
+    /// of VINTR exits on one, nothing on the other.
+    pub fn request_tpr_window(&mut self, _class: u8) {
+        self.guest.vmcb_mut().control.intercept_cr |= vmcb::intercept::cr::WRITE_CR8;
+    }
+
     /// Take the interrupt-window request back once it is no longer needed.
     pub fn clear_irq_window(&mut self) {
         use vmcb::{int_ctl, intercept};
         let c = &mut self.guest.vmcb_mut().control;
         c.intercept_misc1 &= !intercept::misc1::VINTR;
         c.int_ctl &= !int_ctl::V_IRQ;
+        c.intercept_cr &= !intercept::cr::WRITE_CR8;
     }
 
     /// Inject an invalid-opcode fault on the next entry: what a CPU raises for

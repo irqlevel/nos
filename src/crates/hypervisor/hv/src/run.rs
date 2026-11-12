@@ -1758,7 +1758,17 @@ impl LinuxGuest {
                             break;
                         }
                         Sleep::Wait => {
-                            bell.wait(ASLEEP_WAIT_NS.min(deadline.saturating_sub(now)).max(1));
+                            /* The first CPU's task does the devices' work
+                             * whatever its CPU does: asleep, it wakes for
+                             * their next edge too, as a halted one does --
+                             * a crash kernel's dump through a NIC held a
+                             * second a frame once, the boot CPU parked with
+                             * interrupts off in its NMI handler. */
+                            let until = pit_edge.unwrap_or(u64::MAX)
+                                .min(devices_due.unwrap_or(u64::MAX))
+                                .min(now.saturating_add(ASLEEP_WAIT_NS))
+                                .min(deadline);
+                            bell.wait(until.saturating_sub(now).max(1));
                             gc.step = Step::Spun;
                             continue;
                         }
@@ -2091,7 +2101,7 @@ impl LinuxGuest {
                     gc.cpu.backend_mut().skip_wbinvd();
                     None
                 }
-                Exit::Cr8 { write, gpr } => {
+                Exit::Cr8 { write, gpr: Some(gpr) } => {
                     gc.counts.cr8 += 1;
                     let v = gc.cpu.backend_mut();
                     v.cr8_access(write, gpr);
@@ -2099,6 +2109,20 @@ impl LinuxGuest {
                      * one of the TPR too. */
                     gc.lapic.sync_cr8(v.cr8());
                     None
+                }
+                /* AMD-V's write, stopped at while an interrupt the task
+                 * priority alone held waited: decoded and performed, and
+                 * the round looks again at what it lets in. */
+                Exit::Cr8 { write: true, gpr: None } => {
+                    gc.counts.cr8 += 1;
+                    let mut bytes = mmio::Bytes::default();
+                    match cr::cr8_write(gc.cpu.backend_mut(), &self.memory, &mut bytes) {
+                        Ok(()) => {
+                            gc.lapic.sync_cr8(gc.cpu.backend().cr8());
+                            None
+                        }
+                        Err(error) => Some(Stop::CrInsn { rip, error, bytes }),
+                    }
                 }
                 Exit::Cr0Write { value } => {
                     gc.counts.cr0 += 1;
@@ -2301,8 +2325,15 @@ impl LinuxGuest {
             gc.pv_eoi_armed = false;
             self.publish(gc);
             gc.cpu.backend_mut().init_reset();
-            /* What the CPU had to deliver goes with the reset. */
+            /* What the CPU had to deliver goes with the reset -- an NMI
+             * latched before it too, which INIT discards as KVM's reset
+             * does: kept, the reset's clearing of the NMI mask let it in at
+             * the CPU's first instruction after its start-up IPI, through a
+             * real-mode vector table that is whatever low memory holds. */
             gc.exception = None;
+            gc.nmi_pending = false;
+            gc.last_from_pic = false;
+            gc.fast = false;
             self.set_activity(gc, Activity::WaitForSipi);
         }
         if let Some(vector) = mail.sipi {
@@ -2396,7 +2427,15 @@ impl LinuxGuest {
         gc.lapic.sync_cr8(cr8);
         let apic = if apicv { None } else { gc.lapic.pending() };
         if !extint && apic.is_none() {
-            gc.cpu.backend_mut().clear_irq_window();
+            let v = gc.cpu.backend_mut();
+            v.clear_irq_window();
+            /* One held by the task priority alone goes in when the guest
+             * lowers it -- which a `mov` to CR8 under AMD-V's V_TPR or
+             * VT-x's TPR shadow does without an exit: stopped there, rather
+             * than at its next exit of another kind, a host tick on. */
+            if let Some(class) = (!apicv).then(|| gc.lapic.held_by_tpr()).flatten() {
+                v.request_tpr_window(class);
+            }
             return;
         }
         let v = gc.cpu.backend_mut();

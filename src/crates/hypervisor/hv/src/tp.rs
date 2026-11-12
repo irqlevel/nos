@@ -71,7 +71,7 @@ pub fn exit_fields(exit: &Exit, regs: &ExitRegs, host_vector: Option<u8>) -> (Ex
         Exit::MachineCheck => (ExitReason::MachineCheck, 0, 0),
         Exit::Shutdown => (ExitReason::Shutdown, 0, 0),
         Exit::Invalid => (ExitReason::Invalid, 0, 0),
-        Exit::Cr8 { write, gpr } => (ExitReason::Cr8, u64::from(gpr), if write { WRITE } else { 0 }),
+        Exit::Cr8 { write, gpr } => (ExitReason::Cr8, gpr.map_or(NO_GPR, u64::from), if write { WRITE } else { 0 }),
         Exit::Cr0Write { value } => (ExitReason::Cr0, value, WRITE),
         Exit::Cr4 { write, gpr } => (ExitReason::Cr4, gpr.map_or(NO_GPR, u64::from), if write { WRITE } else { 0 }),
         Exit::Dr { write, dr, .. } => (ExitReason::Dr, u64::from(dr), if write { WRITE } else { 0 }),
