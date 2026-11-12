@@ -567,6 +567,9 @@ pub struct Vfs {
     table: Mutex<Table>,
     /// Each mount under its own lock, at its entry's index in the table
     mounts: Box<[Mutex<MountSlot>; MAX_MOUNTS]>,
+    /// Held by a file's two-step replace for both its steps
+    /// (`files::replace_file`): two of them at once shared `<path>.new`.
+    replacing: Mutex<()>,
 }
 
 /// What a mount's claim on its device says to whoever is refused it.
@@ -607,7 +610,14 @@ impl Vfs {
             admin: Mutex::new(Admin { next_id: 1 })?,
             table: Mutex::new(Table { entries: [const { None }; MAX_MOUNTS] })?,
             mounts: mounts.into_boxed_slice().try_into().ok()?,
+            replacing: Mutex::new(())?,
         }))
+    }
+
+    /// What a two-step replace of a file holds for both its steps
+    /// (`files::replace_file`): one at a time. Task context; it sleeps.
+    pub fn replacing(&self) -> kcore::sync::MutexGuard<'_, ()> {
+        self.replacing.lock()
     }
 
     /* ---- mounts ---- */

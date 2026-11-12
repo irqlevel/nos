@@ -34,7 +34,7 @@ pub const MAX_SENT: usize = 256;
 /// Monitors of mailboxes on peers, at most, the host's.
 pub const MAX_REMOTE_MONITORS: usize = 1024;
 /// A host's name at most: a DNS label's.
-pub const HOST_NAME_MAX: usize = 63;
+pub const HOST_NAME_MAX: usize = ffi::ipc::IPC_HOST_NAME_MAX;
 /// The prefix a host's coming and going is told under, to a watch of it.
 pub const HOST_PREFIX: &str = "host.";
 

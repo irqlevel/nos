@@ -46,8 +46,8 @@ impl ListenError {
     /// What `kernel_net_udp_listen` answered, when it was not 0.
     fn of(code: i32) -> Self {
         match code {
-            1 => ListenError::PortTaken,
-            2 => ListenError::TableFull,
+            net::NET_LISTEN_PORT_TAKEN => ListenError::PortTaken,
+            net::NET_LISTEN_TABLE_FULL => ListenError::TableFull,
             _ => ListenError::Invalid,
         }
     }
@@ -273,10 +273,10 @@ impl Nic {
     pub fn nat(&self) -> core::result::Result<Nat, NatError> {
         let on = net::kernel_net_nat_enable(self.handle);
         match on.code {
-            0 => Ok(Nat { inner: self.handle, outer: Nic { handle: on.outer } }),
-            1 => Err(NatError::NoUplink),
-            3 => Err(NatError::Busy),
-            4 => Err(NatError::NoMemory),
+            net::NAT_ON => Ok(Nat { inner: self.handle, outer: Nic { handle: on.outer } }),
+            net::NAT_NO_UPLINK => Err(NatError::NoUplink),
+            net::NAT_BUSY => Err(NatError::Busy),
+            net::NAT_NO_MEMORY => Err(NatError::NoMemory),
             _ => Err(NatError::Device),
         }
     }

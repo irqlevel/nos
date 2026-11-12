@@ -230,12 +230,14 @@ fn floor(r: &mut Input) -> Option<u64> {
     }
 }
 
+/// A connection's word, as the module ABI hands it out (`Tcp::word_of`):
+/// its slot and the generation the slot holds now.
 fn conn_word(c: &'static Conn) -> usize {
-    c as *const Conn as usize
+    TCP.word_of(c)
 }
 
 fn conn_of(word: usize) -> &'static Conn {
-    TCP.by_handle(word).expect("a connection the pool gave out")
+    TCP.by_word(word).expect("a connection the pool gave out, still the one its word was made for")
 }
 
 /// Whether the allowlist `allow` admits `ip`, as the model reads one -- None

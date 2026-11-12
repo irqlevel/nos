@@ -25,6 +25,27 @@ pub fn random_u64() -> Option<u64> {
     }
 }
 
+/// A word from the pool -- or, while nothing has seeded it, one from the
+/// cycle counter and the clock, scrambled: varying, not secret -- said once
+/// where it was taken (`said`, the call site's own flag). For a value that
+/// has to differ from one use to the next more than it has to be secret: a
+/// DHCP transaction's id, a DNS query's, TCP's initial sequence number. An
+/// `unwrap_or(constant)` there made every one of them the same on a machine
+/// whose pool was not seeded, with nothing said where it was used.
+pub fn random_u64_or_clock(what: &str, said: &core::sync::atomic::AtomicBool) -> u64 {
+    if let Some(r) = random_u64() {
+        return r;
+    }
+    if !said.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        crate::klog!(0, "random: the pool is unseeded -- {} from the clock, which is no secret", what);
+    }
+    /* SplitMix64's finaliser over the two clocks */
+    let mut z = crate::time::cycle_counter() ^ crate::time::boot_time_ns().rotate_left(32);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 /// Which random instruction the CPU has
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HwKind {

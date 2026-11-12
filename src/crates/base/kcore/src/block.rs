@@ -9,16 +9,10 @@ pub use crate::lent::{Lent, Started};
 
 pub use ffi::block::BlockIo;
 
-/// What a BlockIo asks for
-pub const IO_READ: u8 = 0;
-pub const IO_WRITE: u8 = 1;
-pub const IO_FLUSH: u8 = 2;
-
-/// What a driver's submit answers
-pub const SUBMIT_OK: i32 = 0;
-pub const SUBMIT_BUSY: i32 = 1;
-pub const SUBMIT_INVALID: i32 = 2;
-pub const SUBMIT_UNSUPPORTED: i32 = 3;
+/// What a BlockIo asks for, and what a driver's submit answers: ffi's
+pub use ffi::block::{BLOCK_IO_FLUSH as IO_FLUSH, BLOCK_IO_READ as IO_READ, BLOCK_IO_WRITE as IO_WRITE,
+                     BLOCK_SUBMIT_BUSY as SUBMIT_BUSY, BLOCK_SUBMIT_INVALID as SUBMIT_INVALID,
+                     BLOCK_SUBMIT_OK as SUBMIT_OK, BLOCK_SUBMIT_UNSUPPORTED as SUBMIT_UNSUPPORTED};
 
 /// The most bytes of a claim's holder's name the kernel keeps: a name is cut
 /// there.
@@ -536,10 +530,10 @@ impl DiskQueue {
         /* `take` made buffer `k` this call's: no `Lent` of it is out, and
          * the queue is this one's alone */
         match unsafe { block::kernel_blockq_start(self.q, k, i32::from(write), offset, len) } {
-            1 => Ok(Started::InFlight),
+            block::QUEUE_IN_FLIGHT => Ok(Started::InFlight),
             rc => {
                 self.buffers.untake(k);
-                if rc == 0 { Ok(Started::Done) } else { Err(Error::IoError) }
+                if rc == block::QUEUE_DONE { Ok(Started::Done) } else { Err(Error::IoError) }
             }
         }
     }

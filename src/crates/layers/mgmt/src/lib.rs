@@ -48,7 +48,7 @@ use kcore::klog;
 /// Providers at once.
 pub const MAX_PROVIDERS: usize = 32;
 /// Methods a provider has, at most.
-pub const MAX_METHODS: usize = 48;
+pub const MAX_METHODS: usize = ffi::mgmt::MGMT_METHODS_MAX;
 /// A descriptor's bytes, at most.
 pub const MAX_DESCRIPTOR: usize = 16 * 1024;
 /// Calls and jobs running at once, in all.
