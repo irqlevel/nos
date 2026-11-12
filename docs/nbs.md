@@ -579,25 +579,28 @@ What `nbscs` shows is what the cs's task last made of itself: at the end of
 a turn that fenced, closed, freed or took a device in, and once a second
 otherwise -- the shell never waits on the cs's devices.
 
-The cs serves one request at a time, each to its device and back, in the
-order they came -- but the leader's look (`Op::Ping`), taken out of the
-mailbox with everything else that has come at the start of every turn, is
-answered there, ahead of what waits: a look says whether the cs is there,
-not how long its queue is. A writer's stop closes every chunk it wrote on
-every replica at once, each close a write of the chunk's record twice with
-a flush after each; where a flush takes 10 ms -- a VM on a RAID1 of NVMe --
-a stop that had written 140 chunks is seconds of closes at one cs. A look
-that waited behind them missed its 250 ms, and the leader took a cs that
-was serving all along out of its sets, to be copied anew: on the hardware
-every stop of a busy writer did (plans/nbs.md, N11). A cs stuck in one
-request -- its device not answering -- answers no look, as before. What
-the cs takes out of its mailbox this way is held to the mailbox's own
-bytes, so that a look never makes room for as much again.
+The cs is one task asleep on one event, which its mailbox and its
+devices' queues signal (N12c). Awake, it takes what has come: the leader's
+look (`Op::Ping`) answered there and then, whatever its devices are doing;
+an answer of its host's mds handed to the request that asked; a request kept,
+in order, for a future of its own -- up to 64 in flight, the rest waiting
+their turn to begin, refused for now past the mailbox's own bytes. Then it
+polls every future again while anything moved: a device's request reaped,
+a turn let go, a commit round or a flush ended. Nothing it does waits on a
+device or on the mds: a request waits where it is, pending, and the device
+sees as many requests at once as its queue has buffers (8 of 256 KiB). A
+step not done in 30 s fails its device. A look says whether the cs is there,
+not how long its queue is: before N12 a cs served one request at a time,
+and a look behind a writer's stop -- 140 closes, three flushes each, where a
+flush took 10 ms -- missed its 250 ms, and the leader took a cs that was
+serving all along out of its sets (plans/nbs.md, N11).
 
 ### Its devices
 
-Every 5 s the cs asks this host's mds which cs it is and which devices it
-has. The mds answers from its applied state; no other host's is asked. The
+Every 5 s -- every second while it does not serve -- the cs asks this
+host's mds which cs it is and which devices it has: a device just added is
+taken in before the leader's controller, two seconds on, takes a cs that
+does not serve for down and has its places joined again for nothing. The mds answers from its applied state; no other host's is asked. The
 cs takes each device in:
 - held with a queue of its own (`DiskQueue`) and claimed as `nbs-cs`, so
   that nothing else writes it while the cs has it;
@@ -683,6 +686,16 @@ then       the slots, 4 MiB each: the chunks' data
   that the volume's map names it (N10c): one freed since -- a copy-up done,
   the old chunk named by no map -- is not a chunk never written, and a read
   of it still on its way from before is refused.
+- **A chunk's requests end in the order they came** (N12c), each from its
+  arrival to its answer, its questions to the mds among it -- the engine's
+  own turns order them inside the store only. A write sent twice by its
+  client, the first copy answered while the second waited for the mds, would
+  otherwise end after the client's close of the chunk, or its next write
+  there, and undo it: the chunk open again, older data over newer. The
+  garbage pass frees a chunk in the same order, so that no free comes
+  between a request's look at the chunk and what it does: a read the mds
+  vouched for, its answer on its way as the metadata dropped the chunk,
+  would read zeros where the chunk held data.
 
 ### A copy-up's copy (N10b)
 
@@ -852,7 +865,13 @@ What it holds to (plans/nbs.md, "Replication: the rules"):
   by none, the new chunk zeros under the writes after (found by the cluster
   target) -- and a copy-up's end refused, the copy-up given up meanwhile,
   have it asked again from its start once the map is read again; each step
-  of it does nothing done already. A chunk shared no longer is answered as
+  of it does nothing done already. Its end is asked only once every member
+  the view has active then has copied: a member made active since the
+  members were asked -- a join done, the map read again for another reason
+  -- has copied nothing, and the copy-up is asked again from its start
+  (found by the cluster target once its cs's answered later, N12c: the one
+  member asked crashed, the two joined since never asked, the one asked
+  taken out one version on). A chunk shared no longer is answered as
   itself, and written as it is. Refused for now -- the set being joined, or
   a member of it drained -- it is asked again, the write waiting; refused
   for room, its writes fail, said.
@@ -994,6 +1013,9 @@ only its metadata.
   open mark answered, every chunk closed reading what it held, every sector
   one of the values it may have, no record lost; before each run, a disk with
   something else on it never taken for blank, and another cs's told apart.
+  Its `cs` target also frees a chunk through the garbage pass while a read
+  of it waits for the mds's word, the word coming after: the read ends with
+  what the chunk held, never zeros (N12c).
   Its `inflight` target (N12b) is the same engine with many requests'
   operations in flight at once on one task -- tens to a couple of hundred --
   over disks whose requests are in flight too, done in any order, a flush
@@ -1012,9 +1034,12 @@ only its metadata.
 
   Its `cluster` target is the whole of it end to end (N8): the client's
   session writing, reading, flushing and closing a volume through six
-  hosts' cs's -- nbswire's `serve` over nbscs, as nbs-cs.ko runs it -- asking
-  its host's mds, whose answers are nbswire's `mds` over nbsmeta's state,
-  over a network that delivers in any order of pairs, with hosts that crash
+  hosts' cs's -- nbswire's `serve` over nbscs, as nbs-cs.ko runs it, many
+  requests in flight at once at each, a request's question to its host's
+  mds a message of the network, answered as the state is when it gets there
+  and handed back when the answer does (N12c) -- whose answers are
+  nbswire's `mds` over nbsmeta's state, over a network that delivers in any
+  order of pairs, with hosts that crash
   -- their disks' caches kept, lost or torn -- and come back, writers lost
   with them, and writers taken over by force: now, or at rest, the old one
   asked on to write and flush. Every write done held on every replica in,
@@ -1206,9 +1231,10 @@ only its metadata.
   this host's, or the first in -- whether the replicas differ or not.
 - A guest's disk offers no discards and no writes of zeros, and copies a
   read's data out of the session's buffer into the guest's.
-- A cs serves one request at a time, each waited for on its device, and
-  copies the data into a message and out of one. Measuring, and pages that
-  move instead, are N11's.
+- A cs is one task (N12c): one CPU's worth of checks and copies -- a 1 GbE
+  host's -- and it copies the data into a message and out of one. A look
+  says the task turns, not that its devices answer: a device stuck short of
+  30 s keeps its replicas in, their writes waiting.
 - A cs serves only with every device the metadata gives it. A device that
   fails while it serves fails the requests of its chunks; one that is never
   taken in stops the cs serving. Taking a device out, and rebuilding what was

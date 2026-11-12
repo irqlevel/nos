@@ -1,7 +1,10 @@
 //! A joiner's copy of a set (plans/nbs.md, "How three are kept"; N9): the
 //! one copy nbs-cs.ko runs and fuzz/nbs's cluster target's cs's do. It has
 //! no I/O of its own: what it sends is handed back, what is answered handed
-//! in, and the store it copies into is lent to each call.
+//! in, and the store it copies into is lent to each call -- `step` and
+//! `answer` are `async`, the store's operations awaited among the requests
+//! the cs serves meanwhile (N12c); the copy itself is its driver's, one
+//! call at a time.
 //!
 //! - **The set's chunks** a source holds, a page at a time
 //!   (`Op::Holdings`), the source an active member of the set.
@@ -152,9 +155,9 @@ pub struct Copy {
 /// The sectors of this cs's copy of chunk `c` at `offset` that differ from
 /// `theirs`, those a client has written since the join began left out: read
 /// into `mine`.
-fn differing<D: Device>(store: &mut Store<D>, c: ChunkRef, offset: u32, mine: &mut [u8], theirs: &[u8])
+async fn differing<D: Device>(store: &Store<D>, c: ChunkRef, offset: u32, mine: &mut [u8], theirs: &[u8])
     -> Result<u64, nbscs::Error> {
-    nbscs::now(store.own_read(c, offset, mine))?;
+    store.own_read(c, offset, mine).await?;
     Ok(mine.chunks(SECTOR).zip(theirs.chunks(SECTOR)).enumerate()
         .filter(|(k, (a, b))| a != b && !store.marked(&c, offset + (k * SECTOR) as u32, SECTOR as u32))
         .count() as u64)
@@ -217,7 +220,7 @@ impl Copy {
     }
 
     /// What it asks now: each turn, and after an answer.
-    pub fn step<D: Device>(&mut self, store: &mut Store<D>, now: u64, next_id: &mut u64, out: &mut Vec<Out>) {
+    pub async fn step<D: Device>(&mut self, store: &Store<D>, now: u64, next_id: &mut u64, out: &mut Vec<Out>) {
         if !matches!(self.state, State::Copying | State::Stale) {
             return;
         }
@@ -281,7 +284,7 @@ impl Copy {
         let idle = self.sent.is_empty();
         let Some(w) = self.work.as_mut() else { return };
         if idle && w.again.is_empty() && w.verify.is_empty() && w.next >= CHUNK && w.summed {
-            self.close(store, out);
+            self.close(store, out).await;
             return;
         }
         if idle && w.again.is_empty() && w.verify.is_empty() && w.next >= CHUNK && !w.checking {
@@ -292,8 +295,8 @@ impl Copy {
     }
 
     /// Request `id`'s answer, `reply`.
-    pub fn answer<D: Device>(&mut self, store: &mut Store<D>, id: u64, reply: &Reply<'_>, now: u64,
-                             out: &mut Vec<Out>) {
+    pub async fn answer<D: Device>(&mut self, store: &Store<D>, id: u64, reply: &Reply<'_>, now: u64,
+                                   out: &mut Vec<Out>) {
         /* A request sent again since, or of a source left: dropped */
         let Some(sent) = self.sent.remove(&id) else { return };
         if !matches!(self.state, State::Copying | State::Stale) {
@@ -317,7 +320,7 @@ impl Copy {
                 let Some(w) = self.work.as_ref() else { return };
                 let c = ChunkRef { chunk: w.chunk, incarnation: w.incarnation,
                                    epoch: Epoch { set: self.view.set, version } };
-                match nbscs::now(store.copy_in(w.volume, c, offset, d)) {
+                match store.copy_in(w.volume, c, offset, d).await {
                     Ok(()) => {
                         self.progress_at = now;
                         self.stats.bytes += u64::from(len);
@@ -337,11 +340,11 @@ impl Copy {
             }
             (Ask::Verify { offset, len, version, rounds }, Reply::Data(d)) if d.len() == len as usize => {
                 self.progress_at = now;
-                self.verify(store, offset, d, version, rounds, out);
+                self.verify(store, offset, d, version, rounds, out).await;
             }
             (Ask::Sums, Reply::Sums(theirs)) => {
                 self.progress_at = now;
-                self.check(store, theirs, out);
+                self.check(store, theirs, out).await;
             }
             /* An answer that is not the request's: the source left */
             _ => {
@@ -374,9 +377,9 @@ impl Copy {
     /// The chunk pulled held to the source's sums `theirs`: closed where
     /// every granule no client has written is the same, those that are
     /// not pulled again.
-    fn check<D: Device>(&mut self, store: &mut Store<D>, theirs: &[u32], out: &mut Vec<Out>) {
+    async fn check<D: Device>(&mut self, store: &Store<D>, theirs: &[u32], out: &mut Vec<Out>) {
         let c = self.chunk_ref();
-        let mine = match nbscs::now(store.own_sums(c, 0, CHUNK)) {
+        let mine = match store.own_sums(c, 0, CHUNK).await {
             Ok(m) => m,
             Err(e) => return self.fail(alloc::format!("chunk {}'s copy not read back: {:?}", c.chunk, e), out),
         };
@@ -392,7 +395,7 @@ impl Copy {
             if w.held {
                 self.stats.kept += 1;
             }
-            self.close(store, out);
+            self.close(store, out).await;
             return;
         }
         /* Held to the source's a sector at a time, and then closed */
@@ -400,9 +403,9 @@ impl Copy {
     }
 
     /// The chunk copied and held to its source's: closed, and the next one.
-    fn close<D: Device>(&mut self, store: &mut Store<D>, out: &mut Vec<Out>) {
+    async fn close<D: Device>(&mut self, store: &Store<D>, out: &mut Vec<Out>) {
         let c = self.chunk_ref();
-        if let Err(e) = nbscs::now(store.close_copy(c)) {
+        if let Err(e) = store.close_copy(c).await {
             return self.fail(alloc::format!("chunk {}'s copy not closed: {:?}", c.chunk, e), out);
         }
         self.stats.chunks += 1;
@@ -414,8 +417,8 @@ impl Copy {
     /// left out: one that differs copied in and read back. One that does not
     /// read back as copied is a round, asked again; past `ROUNDS_MAX`, the
     /// join is given up.
-    fn verify<D: Device>(&mut self, store: &mut Store<D>, offset: u32, theirs: &[u8], version: u32, rounds: u32,
-                         out: &mut Vec<Out>) {
+    async fn verify<D: Device>(&mut self, store: &Store<D>, offset: u32, theirs: &[u8], version: u32, rounds: u32,
+                               out: &mut Vec<Out>) {
         let Some(w) = self.work.as_ref() else { return };
         let volume = w.volume;
         let c = ChunkRef { chunk: w.chunk, incarnation: w.incarnation, epoch: Epoch { set: self.view.set, version } };
@@ -425,7 +428,7 @@ impl Copy {
             return;
         }
         mine.resize(theirs.len(), 0);
-        let before = match differing(store, c, offset, &mut mine, theirs) {
+        let before = match differing(store, c, offset, &mut mine, theirs).await {
             Ok(n) => n,
             Err(e) => return self.fail(alloc::format!("chunk {}'s copy not read back: {:?}", c.chunk, e), out),
         };
@@ -433,7 +436,7 @@ impl Copy {
             return;
         }
         self.stats.again += before;
-        match nbscs::now(store.copy_in(volume, c, offset, theirs)) {
+        match store.copy_in(volume, c, offset, theirs).await {
             Ok(()) => {}
             /* A client wrote the chunk here at a newer version: held again
                once the view has it */
@@ -448,7 +451,7 @@ impl Copy {
             }
             Err(e) => return self.fail(alloc::format!("chunk {} not copied in again: {:?}", c.chunk, e), out),
         }
-        match differing(store, c, offset, &mut mine, theirs) {
+        match differing(store, c, offset, &mut mine, theirs).await {
             Ok(0) => {}
             Ok(n) if rounds + 1 >= ROUNDS_MAX => {
                 self.fail(alloc::format!("chunk {}: {} sectors at {} do not read back as copied, {} times", c.chunk,

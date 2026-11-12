@@ -3,14 +3,48 @@
 //! store's engine has not checked it -- a chunk it does not hold yet, an
 //! epoch other than the one it knows. The one copy that nbs-cs.ko serves
 //! with and fuzz/nbs's cluster target's cs's do; how the mds is asked is
-//! the caller's.
+//! the caller's (`Asker`).
+//!
+//! Every request is an `async fn` over the store's (N12c): many in flight
+//! together on the cs's one task, a question to the mds awaited by the
+//! request that asked it alone. What they share (`Requests`) -- the checks
+//! vouched for, each chunk's order -- is borrowed between two awaits, never
+//! across one.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
+use core::cell::{Cell, RefCell};
+use core::future::{poll_fn, ready, Future};
+use core::task::Poll;
 
-use nbscs::{now, ChunkRef, Device, Error, SlotState, Store};
+use nbscs::{ChunkRef, Device, Error, SlotState, Store};
 
 use crate::{Op, Question, Refusal, Reply, Request, Told, LIST_MAX};
+
+/// How a cs asks its host's mds: a question, and what it is told -- None
+/// where there is no mds, or it said nothing in time. nbs-cs.ko's sends it
+/// and is answered by the mds's message to its id; the fuzzer's answers
+/// from its model.
+pub trait Asker {
+    fn ask(&self, question: Question) -> impl Future<Output = Option<Told>> + '_;
+}
+
+/// An mds that answers at once: `f`'s word, for a driver whose model of the
+/// mds is a function of the question.
+pub struct AskNow<F>(pub RefCell<F>);
+
+impl<F: FnMut(Question) -> Option<Told>> AskNow<F> {
+    pub fn new(f: F) -> AskNow<F> {
+        AskNow(RefCell::new(f))
+    }
+}
+
+impl<F: FnMut(Question) -> Option<Told>> Asker for AskNow<F> {
+    fn ask(&self, question: Question) -> impl Future<Output = Option<Told>> + '_ {
+        let told = (self.0.borrow_mut())(question);
+        ready(told)
+    }
+}
 
 /// Checks the mds vouched for, kept at most: past it, forgotten all at once
 /// and asked again.
@@ -36,17 +70,105 @@ struct Join {
     version: u32,
 }
 
-/// The checks the host's mds vouched for: a request of one is done without
-/// asking again.
+/// What a cs's requests in flight share (N12c): the checks the host's mds
+/// vouched for -- a request of one is done without asking again -- and
+/// each chunk's order: a chunk's requests one at a time, each from its
+/// first poll to its answer, its questions to the mds among it, in the
+/// order they came. Without the order a request asked again by its client
+/// -- a write sent twice, the first answered -- could end after the
+/// client's next request of the chunk, a close or a newer write, had been
+/// answered, and undo it: the chunk open again, or older data over newer
+/// (found by fuzz/nbs's cluster target once its cs's asked their mds over
+/// its network). The engine's own turns order a chunk's requests only
+/// inside the store, not across a question to the mds.
 #[derive(Default)]
-pub struct Vouched {
+pub struct Requests {
+    inner: RefCell<Sets>,
+    order: RefCell<BTreeMap<u32, VecDeque<u64>>>,
+    next: Cell<u64>,
+    released: Cell<u64>,
+}
+
+/// A chunk's order held, or waited for: let go when dropped.
+struct InOrder<'a> {
+    requests: &'a Requests,
+    chunk: u32,
+    ticket: u64,
+}
+
+impl Drop for InOrder<'_> {
+    fn drop(&mut self) {
+        let r = self.requests;
+        r.released.set(r.released.get().wrapping_add(1));
+        let mut order = r.order.borrow_mut();
+        if let Some(q) = order.get_mut(&self.chunk) {
+            q.retain(|&t| t != self.ticket);
+            if q.is_empty() {
+                order.remove(&self.chunk);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct Sets {
     checks: BTreeSet<Check>,
     joins: BTreeSet<Join>,
 }
 
-impl Vouched {
-    pub fn new() -> Vouched {
-        Vouched::default()
+impl Requests {
+    pub fn new() -> Requests {
+        Requests::default()
+    }
+
+    /// Chunk `chunk`'s turn, once every request of it that came before has
+    /// ended: taken at the request's first poll, so in the order they came.
+    async fn in_order(&self, chunk: u32) -> InOrder<'_> {
+        let ticket = self.next.get();
+        self.next.set(ticket.wrapping_add(1));
+        self.order.borrow_mut().entry(chunk).or_default().push_back(ticket);
+        let held = InOrder { requests: self, chunk, ticket };
+        poll_fn(|_| {
+            let first = self.order.borrow().get(&chunk).and_then(|q| q.front().copied());
+            if first == Some(ticket) { Poll::Ready(()) } else { Poll::Pending }
+        }).await;
+        held
+    }
+
+    /// Chunks' turns let go, counted: an executor that polls its requests
+    /// again until this, the store's and the devices' moves stay put has
+    /// polled every one that could go on.
+    pub fn moves(&self) -> u64 {
+        self.released.get()
+    }
+
+    /// Chunks' turns held or waited for: none once every request is over.
+    pub fn in_use(&self) -> usize {
+        self.order.borrow().values().map(|q| q.len()).sum()
+    }
+
+    fn has_check(&self, key: &Check) -> bool {
+        self.inner.borrow().checks.contains(key)
+    }
+
+    fn add_check(&self, key: Check) {
+        let mut v = self.inner.borrow_mut();
+        if v.checks.len() >= VOUCHED_MAX {
+            v.checks.clear();
+        }
+        v.checks.insert(key);
+    }
+
+    fn has_join(&self, key: &Join) -> bool {
+        self.inner.borrow().joins.contains(key)
+    }
+
+    fn add_join(&self, key: Join) {
+        let mut v = self.inner.borrow_mut();
+        if v.joins.len() >= VOUCHED_MAX {
+            v.joins.clear();
+        }
+        v.joins.insert(key);
     }
 }
 
@@ -63,17 +185,23 @@ pub struct Collected {
 
 /// The chunks `store` holds that the metadata freed -- or whose number is
 /// another chunk's now -- freed, and the fences of volumes gone taken off:
-/// as the host's mds says, asked `ask` in lists of LIST_MAX, and nothing
-/// where it says nothing. nbs-cs's every 30 s, and the cluster target's
-/// cs's.
-pub fn collect<D: Device>(store: &mut Store<D>, ask: &mut dyn FnMut(Question) -> Option<Told>) -> Collected {
+/// as the host's mds says, asked in lists of LIST_MAX, and nothing where it
+/// says nothing. nbs-cs's every 30 s, and the cluster target's cs's.
+///
+/// A chunk is freed in its order among the requests (`Requests`): never
+/// between a request's look at it and what the request does -- a read the
+/// mds vouched for, its answer on its way as the metadata dropped the
+/// chunk, would read zeros where the chunk held data, as a chunk freed
+/// reads as one never written.
+pub async fn collect<D: Device, A: Asker>(store: &Store<D>, requests: &Requests, ask: &A) -> Collected {
     let mut done = Collected::default();
     let held: Vec<(u32, u32)> = store.holdings().iter().map(|h| (h.chunk, h.incarnation)).collect();
     for batch in held.chunks(LIST_MAX) {
-        let Some(Told::Gone(gone)) = ask(Question::Live { chunks: batch.to_vec() }) else { return done };
+        let Some(Told::Gone(gone)) = ask.ask(Question::Live { chunks: batch.to_vec() }).await else { return done };
         for c in gone {
             let Some(&(_, incarnation)) = batch.iter().find(|(n, _)| *n == c) else { continue };
-            match now(store.free(c, incarnation)) {
+            let _order = requests.in_order(c).await;
+            match store.free(c, incarnation).await {
                 Ok(true) => done.freed.push((c, incarnation)),
                 Ok(false) => {}
                 Err(e) => done.failed.push((c, e)),
@@ -82,9 +210,9 @@ pub fn collect<D: Device>(store: &mut Store<D>, ask: &mut dyn FnMut(Question) ->
     }
     let volumes: Vec<u32> = store.fenced_volumes().iter().map(|&(v, _)| v).collect();
     for batch in volumes.chunks(LIST_MAX) {
-        let Some(Told::Gone(gone)) = ask(Question::Volumes { volumes: batch.to_vec() }) else { return done };
+        let Some(Told::Gone(gone)) = ask.ask(Question::Volumes { volumes: batch.to_vec() }).await else { return done };
         for v in gone {
-            match now(store.drop_fence(v)) {
+            match store.drop_fence(v).await {
                 Ok(()) => done.unfenced.push(v),
                 Err(e) => done.failed.push((v, e)),
             }
@@ -122,9 +250,8 @@ impl Done {
     }
 }
 
-/// `req` done on `store`, or why not. `ask` asks the host's mds a question
-/// and waits for what it is told: None where there is no mds, or it said
-/// nothing in time.
+/// `req` done on `store`, or why not. `ask` asks the host's mds a question;
+/// what it is told is awaited by this request alone.
 ///
 /// A chunk the cs found open when it started -- its writer's data not
 /// flushed may be gone here while the other replicas have it -- is refused
@@ -140,17 +267,28 @@ impl Done {
 /// generation's (`found_open_by`): generations are counted by volume, and a
 /// clone's writer at the generation another volume's left the chunk open at
 /// is not refused for it (N10d).
-pub fn serve<D: Device>(store: &mut Store<D>, vouched: &mut Vouched, req: &Request<'_>,
-                        ask: &mut dyn FnMut(Question) -> Option<Told>) -> Result<Done, Refusal> {
+pub async fn serve<D: Device, A: Asker>(store: &Store<D>, vouched: &Requests, req: &Request<'_>, ask: &A)
+    -> Result<Done, Refusal> {
     let (v, g) = (req.volume, req.generation);
+    let _order = match req.op {
+        Op::Write { chunk, .. } | Op::Read { chunk, .. } | Op::Close { chunk, .. } => {
+            Some(vouched.in_order(chunk.chunk).await)
+        }
+        Op::CopyUp { to, .. } => Some(vouched.in_order(to.chunk).await),
+        _ => None,
+    };
     if let Op::Write { chunk, position, index, .. } | Op::Read { chunk, position, index, .. }
          | Op::Close { chunk, position, index } = req.op {
         if g != 0 && store.found_open_by(v, chunk.chunk, chunk.incarnation) == Some(g)
             && store.joins(chunk.epoch.set).is_none()
         {
             let writing = !matches!(req.op, Op::Read { .. });
-            match writing.then(|| ask(Question::Verify { volume: v, generation: g, chunk, position, index, writing }))
-                .flatten() {
+            let told = if writing {
+                ask.ask(Question::Verify { volume: v, generation: g, chunk, position, index, writing }).await
+            } else {
+                None
+            };
+            match told {
                 Some(Told::VerifiedJoining { since }) => store.join(chunk.epoch.set, since),
                 /* The mds's own reason -- an epoch moved on, a writer fenced:
                    told as it is, for the client to act on */
@@ -165,10 +303,17 @@ pub fn serve<D: Device>(store: &mut Store<D>, vouched: &mut Vouched, req: &Reque
         }
     }
     match req.op {
-        Op::Fence => now(store.fence(v, g)).map(|g| Done::Fenced { generation: g }).map_err(Refusal::of),
+        Op::Fence => store.fence(v, g).await.map(|g| Done::Fenced { generation: g }).map_err(Refusal::of),
         Op::Write { chunk, position, index, offset, data } => {
-            checked(store, vouched, ask, v, g, chunk, position, index, true,
-                    &mut |s, verified| now(s.write(v, g, chunk, offset, data, verified)))?;
+            let check = Check::of(v, g, chunk);
+            let known = vouched.knows(store, &check, &chunk);
+            match store.write(v, g, chunk, offset, data, known).await {
+                Err(e) if unchecked(&e, known) => {
+                    verify(store, vouched, ask, check, position, index, true).await?;
+                    store.write(v, g, chunk, offset, data, true).await.map_err(Refusal::of)?;
+                }
+                done => done.map_err(Refusal::of)?,
+            }
             Ok(Done::Done)
         }
         Op::Read { chunk, position, index, offset, len } => {
@@ -177,14 +322,28 @@ pub fn serve<D: Device>(store: &mut Store<D>, vouched: &mut Vouched, req: &Reque
                 return Err(Refusal::NotReady);
             }
             buf.resize(len as usize, 0);
-            checked(store, vouched, ask, v, g, chunk, position, index, false,
-                    &mut |s, verified| now(s.read(v, g, chunk, offset, &mut buf, verified)))?;
+            let check = Check::of(v, g, chunk);
+            let known = vouched.knows(store, &check, &chunk);
+            match store.read(v, g, chunk, offset, &mut buf, known).await {
+                Err(e) if unchecked(&e, known) => {
+                    verify(store, vouched, ask, check, position, index, false).await?;
+                    store.read(v, g, chunk, offset, &mut buf, true).await.map_err(Refusal::of)?;
+                }
+                done => done.map_err(Refusal::of)?,
+            }
             Ok(Done::Data(buf))
         }
-        Op::Flush => now(store.flush_for(v, g)).map(|()| Done::Done).map_err(Refusal::of),
+        Op::Flush => store.flush_for(v, g).await.map(|()| Done::Done).map_err(Refusal::of),
         Op::Close { chunk, position, index } => {
-            checked(store, vouched, ask, v, g, chunk, position, index, true, &mut |s, _| now(s.close(v, g, chunk)))
-                .map(Done::Closed)
+            let check = Check::of(v, g, chunk);
+            let known = vouched.knows(store, &check, &chunk);
+            match store.close(v, g, chunk).await {
+                Err(e) if unchecked(&e, known) => {
+                    verify(store, vouched, ask, check, position, index, true).await?;
+                    store.close(v, g, chunk).await.map(Done::Closed).map_err(Refusal::of)
+                }
+                done => done.map(Done::Closed).map_err(Refusal::of),
+            }
         }
         Op::Held => Ok(Done::Held(store.holdings().iter()
             .filter(|h| h.volume == v && h.state == SlotState::Open)
@@ -194,29 +353,29 @@ pub fn serve<D: Device>(store: &mut Store<D>, vouched: &mut Vouched, req: &Reque
         Op::Ping => Ok(Done::Done),
         /* A joiner's asks of this cs as a source (N9) */
         Op::Holdings { set, from, joiner, version, index } => {
-            joined(vouched, ask, set, joiner, version, index)?;
+            joined(vouched, ask, set, joiner, version, index).await?;
             Ok(Done::Chunks(store.holdings_in(set, from, LIST_MAX)))
         }
         Op::Pull { chunk, joiner, index, offset, len } => {
-            joined(vouched, ask, chunk.epoch.set, joiner, chunk.epoch.version, index)?;
+            joined(vouched, ask, chunk.epoch.set, joiner, chunk.epoch.version, index).await?;
             let mut buf = Vec::new();
             if buf.try_reserve_exact(len as usize).is_err() {
                 return Err(Refusal::NotReady);
             }
             buf.resize(len as usize, 0);
-            now(store.pull(chunk, offset, &mut buf)).map_err(Refusal::of)?;
+            store.pull(chunk, offset, &mut buf).await.map_err(Refusal::of)?;
             Ok(Done::Data(buf))
         }
         Op::Sums { chunk, joiner, index, offset, len } => {
-            joined(vouched, ask, chunk.epoch.set, joiner, chunk.epoch.version, index)?;
-            now(store.sums(chunk, offset, len)).map(Done::Sums).map_err(Refusal::of)
+            joined(vouched, ask, chunk.epoch.set, joiner, chunk.epoch.version, index).await?;
+            store.sums(chunk, offset, len).await.map(Done::Sums).map_err(Refusal::of)
         }
         /* The leader's scrub (N9e): sums and a record, nothing moved on and
            no data -- answered as a ping is, unvouched */
-        Op::Scrub { chunk } => now(store.scrub(chunk))
+        Op::Scrub { chunk } => store.scrub(chunk).await
             .map(|(open, written, sums)| Done::Scrub { open, written, sums }).map_err(Refusal::of),
         Op::CopyUp { from, to, position, index } => {
-            copied(store, ask, v, g, from, to, position, index)?;
+            copied(store, ask, v, g, from, to, position, index).await?;
             Ok(Done::Done)
         }
     }
@@ -226,14 +385,14 @@ pub fn serve<D: Device>(store: &mut Store<D>, vouched: &mut Vouched, req: &Reque
 /// its new chunk yet, asked of the mds first, every time: once per copy-up,
 /// and done again only where the copy was lost.
 #[allow(clippy::too_many_arguments)]
-fn copied<D: Device>(store: &mut Store<D>, ask: &mut dyn FnMut(Question) -> Option<Told>, volume: u32,
-                     generation: u64, from: ChunkRef, to: ChunkRef, position: u32, index: u64) -> Result<(), Refusal> {
-    match now(store.copy_up(volume, generation, from, to, false)) {
+async fn copied<D: Device, A: Asker>(store: &Store<D>, ask: &A, volume: u32, generation: u64, from: ChunkRef,
+                                     to: ChunkRef, position: u32, index: u64) -> Result<(), Refusal> {
+    match store.copy_up(volume, generation, from, to, false).await {
         Err(Error::Unverified) => {}
         done => return done.map_err(Refusal::of),
     }
-    match ask(Question::VerifyCopy { volume, generation, position, from, to, index }) {
-        Some(Told::Verified) => now(store.copy_up(volume, generation, from, to, true)).map_err(Refusal::of),
+    match ask.ask(Question::VerifyCopy { volume, generation, position, from, to, index }).await {
+        Some(Told::Verified) => store.copy_up(volume, generation, from, to, true).await.map_err(Refusal::of),
         Some(Told::Refused(why)) => Err(why),
         _ => Err(Refusal::NoMds),
     }
@@ -242,18 +401,15 @@ fn copied<D: Device>(store: &mut Store<D>, ask: &mut dyn FnMut(Question) -> Opti
 /// Cs `joiner` as set `set`'s joiner at its version `version`, vouched for
 /// by the host's mds -- asked once, then kept: a version gone stale is
 /// refused by the store, which knows the chunk's.
-fn joined(vouched: &mut Vouched, ask: &mut dyn FnMut(Question) -> Option<Told>, set: u32, joiner: u32, version: u32,
-          index: u64) -> Result<(), Refusal> {
+async fn joined<A: Asker>(vouched: &Requests, ask: &A, set: u32, joiner: u32, version: u32, index: u64)
+    -> Result<(), Refusal> {
     let key = Join { set, joiner, version };
-    if vouched.joins.contains(&key) {
+    if vouched.has_join(&key) {
         return Ok(());
     }
-    match ask(Question::VerifyJoin { set, joiner, version, index }) {
+    match ask.ask(Question::VerifyJoin { set, joiner, version, index }).await {
         Some(Told::Verified) => {
-            if vouched.joins.len() >= VOUCHED_MAX {
-                vouched.joins.clear();
-            }
-            vouched.joins.insert(key);
+            vouched.add_join(key);
             Ok(())
         }
         Some(Told::Refused(why)) => Err(why),
@@ -261,36 +417,45 @@ fn joined(vouched: &mut Vouched, ask: &mut dyn FnMut(Question) -> Option<Told>, 
     }
 }
 
-/// `op` done on the store -- and where the engine has not checked the
-/// request, asked of the mds first and done again once it vouches. What it
-/// vouched for before is taken only for a chunk the cs holds (N10): one
-/// freed since -- a copy-up done, the old chunk named by no map -- reads as
-/// zeros, which it vouched for of no chunk.
-#[allow(clippy::too_many_arguments)]
-fn checked<D: Device, T>(store: &mut Store<D>, vouched: &mut Vouched, ask: &mut dyn FnMut(Question) -> Option<Told>,
-                         volume: u32, generation: u64, chunk: ChunkRef, position: u32, index: u64, writing: bool,
-                         op: &mut dyn FnMut(&mut Store<D>, bool) -> Result<T, Error>) -> Result<T, Refusal> {
-    let key = Check { volume, generation, chunk: chunk.chunk, incarnation: chunk.incarnation, set: chunk.epoch.set,
-                      version: chunk.epoch.version };
-    let known = vouched.checks.contains(&key)
-        && store.holding(chunk.chunk).is_some_and(|h| h.incarnation == chunk.incarnation);
-    match op(store, known) {
-        Ok(t) => return Ok(t),
-        Err(Error::Unverified) | Err(Error::Epoch { .. }) if !known => {}
-        Err(e) => return Err(Refusal::of(e)),
+impl Check {
+    fn of(volume: u32, generation: u64, chunk: ChunkRef) -> Check {
+        Check { volume, generation, chunk: chunk.chunk, incarnation: chunk.incarnation, set: chunk.epoch.set,
+                version: chunk.epoch.version }
     }
-    match ask(Question::Verify { volume, generation, chunk, position, index, writing }) {
+}
+
+impl Requests {
+    /// Whether the mds vouched for `check` before -- taken only for a chunk
+    /// the cs holds (N10): one freed since -- a copy-up done, the old chunk
+    /// named by no map -- reads as zeros, which it vouched for of no chunk.
+    fn knows<D: Device>(&self, store: &Store<D>, check: &Check, chunk: &ChunkRef) -> bool {
+        self.has_check(check) && store.holding(chunk.chunk).is_some_and(|h| h.incarnation == chunk.incarnation)
+    }
+}
+
+/// Whether the engine's refusal of a request it was not told was vouched
+/// for sends the request to the mds: a chunk it does not hold, an epoch it
+/// does not know.
+fn unchecked(e: &Error, known: bool) -> bool {
+    !known && matches!(e, Error::Unverified | Error::Epoch { .. })
+}
+
+/// `check` asked of the mds, for the request to be done again once it
+/// vouches -- where it says the cs is the set's joiner, what clients write
+/// to the set marked from now on, before the request is done again.
+async fn verify<D: Device, A: Asker>(store: &Store<D>, vouched: &Requests, ask: &A, check: Check, position: u32,
+                                     index: u64, writing: bool) -> Result<(), Refusal> {
+    let chunk = ChunkRef { chunk: check.chunk, incarnation: check.incarnation,
+                           epoch: nbscs::Epoch { set: check.set, version: check.version } };
+    let question = Question::Verify { volume: check.volume, generation: check.generation, chunk, position, index,
+                                      writing };
+    match ask.ask(question).await {
         Some(told @ (Told::Verified | Told::VerifiedJoining { .. })) => {
-            /* The set's joiner: what clients write to it marked from now
-               on, before this write is done */
             if let Told::VerifiedJoining { since } = told {
-                store.join(chunk.epoch.set, since);
+                store.join(check.set, since);
             }
-            if vouched.checks.len() >= VOUCHED_MAX {
-                vouched.checks.clear();
-            }
-            vouched.checks.insert(key);
-            op(store, true).map_err(Refusal::of)
+            vouched.add_check(check);
+            Ok(())
         }
         Some(Told::Refused(why)) => Err(why),
         _ => Err(Refusal::NoMds),

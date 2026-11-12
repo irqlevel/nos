@@ -5,12 +5,14 @@
 //! as there are buffers. A request longer than a buffer goes a buffer's
 //! worth at a time; a flush is started and reaped as a write is.
 //!
-//! Until the cs's loop drives requests together, a request is waited out
-//! where it is polled (`Mode::Wait`): started, the queue waited on and
-//! reaped until its buffer comes back -- what the engine's every caller
-//! drives one at a time through `nbscs::now` still needs. Driven, a request
-//! not done is pending, and the loop's reap ends it (`Mode::Driven`).
+//! Nothing here waits: a request polled reaps its queue and is pending
+//! until its buffer comes back, the cs's task asleep on the one event its
+//! queues and its mailbox signal (`serve.rs`). Every buffer freed or
+//! reaped is counted in the cs's moves, which its loop polls until they
+//! stay put: a request that waited for a buffer is polled again once one
+//! is free.
 
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -21,7 +23,7 @@ use core::task::{Context, Poll};
 
 use kcore::block::{Disk, DiskQueue, Found, Started};
 use kcore::events::SharedEvent;
-use kcore::time::{boot_time_ns, Duration};
+use kcore::time::boot_time_ns;
 use nbscs::{Device, IoError};
 
 /// The queue's buffers, and each one's bytes: a request's most at once, and
@@ -31,8 +33,6 @@ const BUFFER: usize = 256 * 1024;
 /// A request not done in this long is the device failed: its buffer the
 /// device's until its reap all the same.
 const IO_TIMEOUT_NS: u64 = 30_000 * 1_000_000;
-/// How long a request waited out sleeps between looks at its queue.
-const WAIT_MS: u64 = 10;
 
 /// What a buffer is doing.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -47,24 +47,17 @@ enum Buf {
     Left,
 }
 
-/// How a request that is not done yet is had.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    /// Waited out where it is polled.
-    Wait,
-    /// Pending: the cs's loop reaps it.
-    Driven,
-}
-
 pub struct QueueDevice {
     q: DiskQueue,
     bufs: RefCell<Vec<Buf>>,
-    mode: Cell<Mode>,
+    /// The cs's moves: a buffer freed or reaped counted there.
+    moves: Rc<Cell<u64>>,
 }
 
 impl QueueDevice {
-    /// Device `ident` of this host's, held with a queue on `event`.
-    pub fn open(ident: &str, event: &SharedEvent) -> Result<QueueDevice, String> {
+    /// Device `ident` of this host's, held with a queue on `event`, its
+    /// buffers' moves counted in `moves`.
+    pub fn open(ident: &str, event: &SharedEvent, moves: Rc<Cell<u64>>) -> Result<QueueDevice, String> {
         let disk = Disk::find_ident(ident).map_err(|f| match f {
             Found::Many(n) => alloc::format!("{} devices say they are {}: none is taken", n, ident),
             _ => alloc::format!("no device of this host's is {}", ident),
@@ -72,30 +65,26 @@ impl QueueDevice {
         let q = disk.into_queue_on(event, true, "nbs-cs", BUFFERS, BUFFER)
             .map_err(|e| alloc::format!("{} not taken: {}", ident, e))?;
         let bufs = vec![Buf::Free; q.buffers()];
-        Ok(QueueDevice { q, bufs: RefCell::new(bufs), mode: Cell::new(Mode::Wait) })
+        Ok(QueueDevice { q, bufs: RefCell::new(bufs), moves })
     }
 
-    /// How a request not done is had from now on.
-    pub fn set_mode(&self, mode: Mode) {
-        self.mode.set(mode);
+    fn moved(&self) {
+        self.moves.set(self.moves.get().wrapping_add(1));
     }
 
     /// Every request the device has done, its buffer's request told -- or
-    /// the buffer freed, where its request is nobody's: how many.
-    pub fn reap(&self) -> usize {
+    /// the buffer freed, where its request is nobody's.
+    fn reap(&self) {
         let mut bufs = self.bufs.borrow_mut();
-        self.q.reap(|k, ok| {
+        let n = self.q.reap(|k, ok| {
             if let Some(b) = bufs.get_mut(k) {
                 *b = if *b == Buf::Left { Buf::Free } else { Buf::Done(ok) };
             }
-        })
-    }
-
-    /// Requests out, and buffers free.
-    pub fn out(&self) -> (usize, usize) {
-        let bufs = self.bufs.borrow();
-        (bufs.iter().filter(|b| matches!(b, Buf::Out { .. } | Buf::Left)).count(),
-         bufs.iter().filter(|b| **b == Buf::Free).count())
+        });
+        drop(bufs);
+        if n != 0 {
+            self.moved();
+        }
     }
 
     /// A free buffer, taken for a request: None while every one is out.
@@ -110,17 +99,13 @@ impl QueueDevice {
         if let Some(cur) = self.bufs.borrow_mut().get_mut(k) {
             *cur = b;
         }
+        if b == Buf::Free {
+            self.moved();
+        }
     }
 
     fn state(&self, k: usize) -> Buf {
         self.bufs.borrow().get(k).copied().unwrap_or(Buf::Free)
-    }
-
-    /// A request on its way, waited for here: the queue slept on and reaped
-    /// for a while.
-    fn wait_a_while(&self) {
-        self.q.wait(Duration::from_millis(WAIT_MS));
-        self.reap();
     }
 }
 
@@ -155,8 +140,8 @@ struct Request<'a> {
 }
 
 impl Request<'_> {
-    /// The next piece started: Ready where it cannot be, Pending where every
-    /// buffer is out.
+    /// The next piece started: Ready where it cannot be, Pending started or
+    /// with every buffer out.
     fn start(&mut self) -> Poll<Result<(), IoError>> {
         let Some(k) = self.dev.take() else { return Poll::Pending };
         let n = (self.kind.len() - self.done).min(self.dev.q.buffer_len());
@@ -201,6 +186,7 @@ impl Future for Request<'_> {
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
+        this.dev.reap();
         loop {
             let Some((k, n)) = this.out else {
                 let left = this.kind.len() - this.done;
@@ -209,15 +195,10 @@ impl Future for Request<'_> {
                 }
                 match this.start() {
                     Poll::Ready(r) => return Poll::Ready(r),
-                    /* Started, or no buffer free: looked at again below */
+                    /* Started: looked at below -- done on the spot, it is */
                     Poll::Pending if this.out.is_some() => continue,
-                    Poll::Pending => {
-                        if this.dev.mode.get() == Mode::Driven {
-                            return Poll::Pending;
-                        }
-                        this.dev.wait_a_while();
-                        continue;
-                    }
+                    /* Every buffer out: polled again once one is freed */
+                    Poll::Pending => return Poll::Pending,
                 }
             };
             match this.dev.state(k) {
@@ -246,12 +227,7 @@ impl Future for Request<'_> {
                     this.out = None;
                     return Poll::Ready(Err(IoError));
                 }
-                _ => {
-                    if this.dev.mode.get() == Mode::Driven {
-                        return Poll::Pending;
-                    }
-                    this.dev.wait_a_while();
-                }
+                _ => return Poll::Pending,
             }
         }
     }

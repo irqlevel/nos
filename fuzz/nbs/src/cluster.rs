@@ -85,9 +85,12 @@
 //! flushed as a crash would leave it: there or not -- a replica that lost it
 //! may be what its reconcile copied.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
 
 use nbsclient::{Buffers, Out, Phase, Session, To, UserOp, BLOCK, DEADLINE_NS, LOST_LAST, PAUSE_NS};
 use nbscs::{ChunkRef, Epoch, Identity, Store, SLOT};
@@ -95,8 +98,8 @@ use nbsmeta::repair::{self, Seen};
 use nbsmeta::{Answer, Command, Replica, State};
 use nbswire::copy::{self, Copy};
 use nbswire::scrub::{self, Scrub};
-use nbswire::serve::{collect, serve, Vouched};
-use nbswire::{Answer as CsAnswer, Ask, Asking, Question, Reply, Request, Said, Saying, Told};
+use nbswire::serve::{collect, serve, AskNow, Asker, Collected, Done, Requests};
+use nbswire::{Answer as CsAnswer, Answered, Ask, Asking, Query, Question, Refusal, Reply, Request, Said, Saying, Told};
 
 use crate::cs::{Disk, Handle};
 use crate::rng::{mix, Rng};
@@ -119,6 +122,8 @@ const STARVED_WRITES: u64 = 6;
 const DISK_SLOTS: u64 = 20;
 const DISK_SECTOR: u64 = 4096;
 const MS: u64 = 1_000_000;
+/// How long a cs waits for its mds's answer, as nbs-cs does.
+const MDS_WAIT: u64 = 5_000 * MS;
 /// How long a run lasts at most, in the network's time: well under an
 /// operation's deadline.
 const RUN_NS: u64 = 40_000 * MS;
@@ -233,8 +238,16 @@ struct Host {
     cs: u32,
     disk: Rc<RefCell<Disk>>,
     identity: Identity,
-    store: Option<Store<Handle>>,
-    vouched: Vouched,
+    store: Option<Rc<Store<Handle>>>,
+    vouched: Rc<Requests>,
+    /// Its cs's requests in flight (N12c), as nbs-cs's are -- each pending
+    /// while a question of its to the mds is out -- and those questions.
+    flights: Vec<Flight>,
+    asks: Rc<Asks>,
+    /// Its garbage pass under way, if one is: a future of its cs's own, as
+    /// nbs-cs's is, its questions over the network and its frees in each
+    /// chunk's order among the requests.
+    garbage: Option<Pin<Box<dyn Future<Output = Collected>>>>,
     /// When it went down, if it is: what the leader counts its silence from.
     down_since: Option<u64>,
     /// Its cs's copies -- one a join it is the joiner of -- as nbs-cs's;
@@ -245,6 +258,77 @@ struct Host {
     joins_seen: bool,
     joins_at: u64,
     copy_id: u64,
+}
+
+/// A request at a host's cs, in flight there (N12c): the end it answers,
+/// its message's id and bytes -- for the judge at its end -- and its
+/// future, nbswire's `serve` of it.
+struct Flight {
+    from: End,
+    msg: u64,
+    bytes: Vec<u8>,
+    fut: Pin<Box<dyn Future<Output = Result<Done, Refusal>>>>,
+}
+
+/// A host's cs's questions to its mds (N12c), as nbs-cs's go: each a
+/// message of the network's -- queued here by the request that asks it,
+/// put on its way by the host, answered by the mds when it gets there, as
+/// the state is then -- and its answer, when it comes, the asking request's
+/// alone. One unanswered in MDS_WAIT is answered None; one answered later,
+/// dropped.
+#[derive(Default)]
+struct Asks {
+    now: Cell<u64>,
+    next: Cell<u64>,
+    outbox: RefCell<Vec<(u64, Question)>>,
+    /// Each out: when it was asked, and what it was told once it was.
+    out: RefCell<BTreeMap<u64, (u64, Option<Told>)>>,
+}
+
+/// A question out: its id let go of however its ask ends.
+struct Asked<'a>(&'a Asks, u64);
+
+impl Drop for Asked<'_> {
+    fn drop(&mut self) {
+        self.0.out.borrow_mut().remove(&self.1);
+    }
+}
+
+impl Asker for Asks {
+    fn ask(&self, question: Question) -> impl Future<Output = Option<Told>> + '_ {
+        async move {
+            let id = self.next.get() + 1;
+            self.next.set(id);
+            let at = self.now.get();
+            self.outbox.borrow_mut().push((id, question));
+            self.out.borrow_mut().insert(id, (at, None));
+            let _asked = Asked(self, id);
+            std::future::poll_fn(|_| {
+                let mut out = self.out.borrow_mut();
+                match out.get_mut(&id) {
+                    Some((_, told)) if told.is_some() => Poll::Ready(told.take()),
+                    Some((at, _)) if self.now.get() >= *at + MDS_WAIT => Poll::Ready(None),
+                    _ => Poll::Pending,
+                }
+            }).await
+        }
+    }
+}
+
+impl Asks {
+    /// What the mds told question `id`, handed to it: dropped where it is
+    /// out no more.
+    fn told(&self, id: u64, told: Told) {
+        if let Some((_, slot)) = self.out.borrow_mut().get_mut(&id) {
+            *slot = Some(told);
+        }
+    }
+
+    /// Everything out forgotten: its host crashed.
+    fn clear(&self) {
+        self.outbox.borrow_mut().clear();
+        self.out.borrow_mut().clear();
+    }
 }
 
 /// A chunk the target rotted (N9e): on one member, or on two -- a sector
@@ -428,6 +512,13 @@ struct World {
     down: Option<usize>,
     /// The newest generation a writer has come to serve at.
     served: u64,
+    /// The host lost for good at the end, once it is: the leader's look at
+    /// a cs up is answered from then on, as nbs-cs's task answers it
+    /// whatever it is doing (N12c) -- one taken out by a look that missed
+    /// would leave a set's last active replica on the host lost, which the
+    /// end's premise, every chunk with a replica in on another host, rules
+    /// out.
+    lost_for_good: Option<usize>,
     /// A writer to be taken over at rest: the step, and the writer -- asked
     /// to flush, then nothing, so that its chunks are closed by then.
     rest: Option<(u64, usize)>,
@@ -787,6 +878,9 @@ impl World {
         let Some(m) = self.links.get_mut(&(from, to)).and_then(|q| q.pop_front()) else { return Ok(()) };
         match (from, to) {
             (End::Client(_) | End::Clone(_), End::Cs(h)) => self.at_cs(from, h, m),
+            /* A cs's question to its host's mds, and the answer (N12c) */
+            (End::Cs(h), End::Mds(_)) => self.mds_for_cs(h, m),
+            (End::Mds(_), End::Cs(h)) => self.told_cs(h, m),
             (End::Client(_) | End::Clone(_), End::Mds(_)) => self.at_mds(from, m),
             /* A clone's writer (N10d2), as a client */
             (End::Cs(_), End::Clone(k)) | (End::Mds(_), End::Clone(k)) if self.clones[k].dead => Ok(()),
@@ -832,34 +926,7 @@ impl World {
     /// `serve` as for a client, the cs asking its own host's mds -- or, its
     /// host down, lost: the copy asks again, or another source.
     fn copy_request(&mut self, j: usize, s: usize, m: Msg) -> Result<(), String> {
-        let World { hosts, state, index, .. } = self;
-        let host = &mut hosts[s];
-        let Some(store) = host.store.as_mut() else { return Ok(()) };
-        let name = host.name;
-        let applied = *index;
-        let answer = match Request::decode(&m.bytes) {
-            None => CsAnswer { id: 0, reply: Reply::Refused(nbswire::Refusal::Bad) }.encode(),
-            Some(req) => {
-                let mut ask = |q| Some(nbswire::mds::told(state, name, applied, &q));
-                let result = serve(store, &mut host.vouched, &req, &mut ask);
-                if self.trace {
-                    let what: String = format!("{:?}", req.op).chars().take(90).collect();
-                    let said: String = match &result {
-                        Ok(nbswire::serve::Done::Data(d)) => format!("data {} bytes", d.len()),
-                        Ok(d) => format!("{:?}", d).chars().take(90).collect(),
-                        Err(e) => format!("refused {:?}", e),
-                    };
-                    eprintln!("  [{}] cs {} (host {}) for host {}'s copy: #{} {} -> {}", self.step, host.cs, name,
-                              HOSTS[j], req.id, what, said);
-                }
-                match result {
-                    Ok(done) => CsAnswer { id: req.id, reply: done.reply() }.encode(),
-                    Err(why) => CsAnswer { id: req.id, reply: Reply::Refused(why) }.encode(),
-                }
-            }
-        };
-        self.push(End::Cs(s), End::Copy(j), answer, m.id);
-        Ok(())
+        self.at_cs(End::Copy(j), s, m)
     }
 
     /// An answer to host `j`'s copy: handed to the copy that asked, which
@@ -872,8 +939,8 @@ impl World {
             let Host { store, copies, copy_id, .. } = &mut self.hosts[j];
             let Some(store) = store.as_mut() else { return Ok(()) };
             if let Some(c) = copies.iter_mut().find(|c| c.sent(a.id)) {
-                c.answer(store, a.id, &a.reply, now, &mut out);
-                c.step(store, now, copy_id, &mut out);
+                nbscs::now(c.answer(store, a.id, &a.reply, now, &mut out));
+                nbscs::now(c.step(store, now, copy_id, &mut out));
             }
         }
         self.copy_out(j, out)
@@ -963,7 +1030,7 @@ impl World {
             let Host { store, copies, copy_id, .. } = &mut self.hosts[h];
             let Some(store) = store.as_mut() else { return Ok(()) };
             for c in copies.iter_mut() {
-                c.step(store, now, copy_id, &mut out);
+                nbscs::now(c.step(store, now, copy_id, &mut out));
             }
         }
         self.copy_out(h, out)?;
@@ -1082,8 +1149,8 @@ impl World {
                 let Some(store) = host.store.as_mut() else { continue };
                 let Some(req) = Request::decode(&bytes) else { continue };
                 let (name, applied) = (host.name, *index);
-                let mut ask = |q| Some(nbswire::mds::told(state, name, applied, &q));
-                let answer = match serve(store, &mut host.vouched, &req, &mut ask) {
+                let ask = AskNow::new(|q| Some(nbswire::mds::told(state, name, applied, &q)));
+                let answer = match nbscs::now(serve(store, &host.vouched, &req, &ask)) {
                     Ok(done) => CsAnswer { id: req.id, reply: done.reply() }.encode(),
                     Err(why) => CsAnswer { id: req.id, reply: Reply::Refused(why) }.encode(),
                 };
@@ -1352,11 +1419,12 @@ impl World {
     }
 
     /// A request at host `h`'s cs: done by nbswire's `serve`, the cs asking
-    /// the mds as its own host's -- or, its host down, lost or bounced.
+    /// the mds as its own host's, over the network (N12c) -- many in flight
+    /// at once, each answered as it ends; or, its host down, lost or
+    /// bounced.
     fn at_cs(&mut self, from: End, h: usize, m: Msg) -> Result<(), String> {
-        let World { hosts, state, index, served, .. } = self;
-        let host = &mut hosts[h];
-        let Some(store) = host.store.as_mut() else {
+        let host = &mut self.hosts[h];
+        let Some(store) = host.store.clone() else {
             if self.r.chance(50) {
                 self.count("bounces");
                 let now = self.now;
@@ -1368,13 +1436,121 @@ impl World {
             }
             return Ok(());
         };
-        let applied = *index;
+        let (vouched, asks) = (host.vouched.clone(), host.asks.clone());
+        if self.trace {
+            let what: String = Request::decode(&m.bytes).map_or(String::from("none"), |r| {
+                format!("#{} {:?}", r.id, r.op).chars().take(100).collect()
+            });
+            eprintln!("  [{}] cs {} (host {}) gets from {:?}: {}", self.step, host.cs, host.name, from, what);
+        }
+        let bytes = m.bytes.clone();
+        let fut = Box::pin(async move {
+            let Some(req) = Request::decode(&bytes) else { return Err(Refusal::Bad) };
+            serve(&store, &vouched, &req, &*asks).await
+        });
+        host.flights.push(Flight { from, msg: m.id, bytes: m.bytes, fut });
+        self.poll_cs(h)
+    }
+
+    /// Host `h`'s cs's requests in flight polled: those that end answered,
+    /// the questions asked on their way.
+    fn poll_cs(&mut self, h: usize) -> Result<(), String> {
+        let now = self.now;
+        let host = &mut self.hosts[h];
+        host.asks.now.set(now);
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut ended = Vec::new();
+        /* Again while one ends: its chunk's next may go on */
+        loop {
+            let before = ended.len();
+            let mut k = 0;
+            while k < host.flights.len() {
+                match host.flights[k].fut.as_mut().poll(&mut cx) {
+                    Poll::Ready(result) => {
+                        let f = host.flights.remove(k);
+                        ended.push((f.from, f.msg, f.bytes, result));
+                    }
+                    Poll::Pending => k += 1,
+                }
+            }
+            if ended.len() == before {
+                break;
+            }
+        }
+        let collected = match host.garbage.as_mut().map(|g| g.as_mut().poll(&mut cx)) {
+            Some(Poll::Ready(done)) => {
+                host.garbage = None;
+                Some(done)
+            }
+            _ => None,
+        };
+        /* The pass's frees may let a request of their chunk go on */
+        if collected.is_some() {
+            let mut k = 0;
+            while k < host.flights.len() {
+                match host.flights[k].fut.as_mut().poll(&mut cx) {
+                    Poll::Ready(result) => {
+                        let f = host.flights.remove(k);
+                        ended.push((f.from, f.msg, f.bytes, result));
+                    }
+                    Poll::Pending => k += 1,
+                }
+            }
+        }
+        let asked = std::mem::take(&mut *host.asks.outbox.borrow_mut());
+        for (id, question) in asked {
+            self.push(End::Cs(h), End::Mds(h), Query { id, question }.encode(), id);
+        }
+        if let Some(done) = collected {
+            let name = self.hosts[h].name;
+            if let Some((n, e)) = done.failed.first() {
+                return Err(format!("host {}'s cs did not let go of {}: {:?}", name, n, e));
+            }
+            if self.trace && !done.freed.is_empty() {
+                eprintln!("  [{}] host {} frees {:?}", self.step, name, done.freed);
+            }
+            *self.stats.entry("chunks freed by a garbage pass").or_default() += done.freed.len() as u64;
+        }
+        if ended.len() > 1 {
+            self.count("requests ended together at a cs");
+        }
+        for (from, msg, bytes, result) in ended {
+            self.served_at_cs(from, h, msg, &bytes, result)?;
+        }
+        Ok(())
+    }
+
+    /// A cs's question at its host's mds: answered as the state is now, the
+    /// answer on its way back.
+    fn mds_for_cs(&mut self, h: usize, m: Msg) -> Result<(), String> {
+        let Some(q) = Query::decode(&m.bytes) else { return Err(String::from("a cs's question that is none")) };
+        let told = nbswire::mds::told(&self.state, self.hosts[h].name, self.index, &q.question);
+        self.count("cs questions answered");
+        self.push(End::Mds(h), End::Cs(h), Answered { id: q.id, told }.encode(), q.id);
+        Ok(())
+    }
+
+    /// The mds's answer at the cs that asked: handed to its question, and
+    /// the requests in flight polled.
+    fn told_cs(&mut self, h: usize, m: Msg) -> Result<(), String> {
+        if self.hosts[h].store.is_none() {
+            return Ok(());
+        }
+        let Some(a) = Answered::decode(&m.bytes) else { return Err(String::from("an mds's answer that is none")) };
+        self.hosts[h].asks.told(a.id, a.told);
+        self.poll_cs(h)
+    }
+
+    /// A request ended at host `h`'s cs, `result`: held to the fence, and
+    /// answered to `from`.
+    fn served_at_cs(&mut self, from: End, h: usize, msg: u64, bytes: &[u8], result: Result<Done, Refusal>)
+        -> Result<(), String> {
+        let World { hosts, state, served, .. } = self;
+        let host = &hosts[h];
         let name = host.name;
-        let answer = match Request::decode(&m.bytes) {
+        let answer = match Request::decode(bytes) {
             None => CsAnswer { id: 0, reply: Reply::Refused(nbswire::Refusal::Bad) }.encode(),
             Some(req) => {
-                let mut ask = |q| Some(nbswire::mds::told(state, name, applied, &q));
-                let result = serve(store, &mut host.vouched, &req, &mut ask);
                 if self.trace {
                     let what = match &req.op {
                         nbswire::Op::Write { chunk, offset, data, .. } => {
@@ -1383,7 +1559,7 @@ impl World {
                         other => format!("{:?}", other).chars().take(60).collect(),
                     };
                     let said = match &result {
-                        Ok(nbswire::serve::Done::Data(_)) => String::from("data"),
+                        Ok(nbswire::serve::Done::Data(d)) => format!("data {} bytes", d.len()),
                         Ok(d) => format!("{:?}", d).chars().take(60).collect(),
                         Err(e) => format!("refused {:?}", e),
                     };
@@ -1424,7 +1600,7 @@ impl World {
                 }
             }
         };
-        self.push(End::Cs(h), from, answer, m.id);
+        self.push(End::Cs(h), from, answer, msg);
         Ok(())
     }
 
@@ -1449,7 +1625,7 @@ impl World {
                                                                         index),
             Ask::Down { set, cs, refused, name, generation } => {
                 let up = self.host_of_cs(cs).is_some_and(|h| self.hosts[h].store.is_some());
-                if up && !refused && !self.r.chance(10) {
+                if up && !refused && (self.lost_for_good.is_some() || !self.r.chance(10)) {
                     self.count("downs refused: the cs answers the leader");
                     Said::NotNow(String::from("the cs answers the leader"))
                 } else {
@@ -1538,6 +1714,13 @@ impl World {
     /* ---- what happens ---- */
 
     fn tick(&mut self) -> Result<(), String> {
+        /* Each cs's requests in flight: a question unanswered in MDS_WAIT
+           answered None */
+        for h in 0..self.hosts.len() {
+            if self.hosts[h].store.is_some() && (!self.hosts[h].flights.is_empty() || self.hosts[h].garbage.is_some()) {
+                self.poll_cs(h)?;
+            }
+        }
         self.control()?;
         self.scrub_turn()?;
         self.garbage()?;
@@ -1593,18 +1776,13 @@ impl World {
         }
         self.garbage_at = self.now + GARBAGE_EVERY;
         for h in 0..self.hosts.len() {
-            let World { hosts, state, index, .. } = self;
-            let host = &mut hosts[h];
-            let Some(store) = host.store.as_mut() else { continue };
-            let (applied, name) = (*index, host.name);
-            let done = collect(store, &mut |q| Some(nbswire::mds::told(state, name, applied, &q)));
-            if let Some((n, e)) = done.failed.first() {
-                return Err(format!("host {}'s cs did not let go of {}: {:?}", name, n, e));
-            }
-            if self.trace && !done.freed.is_empty() {
-                eprintln!("  [{}] host {} frees {:?}", self.step, name, done.freed);
-            }
-            *self.stats.entry("chunks freed by a garbage pass").or_default() += done.freed.len() as u64;
+            let host = &mut self.hosts[h];
+            /* One pass at a time: one still waiting for its mds, or for a
+               chunk's request, goes on */
+            let Some(store) = host.store.clone().filter(|_| host.garbage.is_none()) else { continue };
+            let (requests, asks) = (host.vouched.clone(), host.asks.clone());
+            host.garbage = Some(Box::pin(async move { collect(&store, &requests, &*asks).await }));
+            self.poll_cs(h)?;
         }
         Ok(())
     }
@@ -1973,6 +2151,12 @@ impl World {
                 }
                 Out::Send { to: To::Cs(cs), id, bytes } => {
                     let Some(h) = self.host_of_cs(cs) else { return Err(format!("a request to cs {}, none", cs)) };
+                    if self.trace {
+                        if let Some(r) = Request::decode(&bytes).filter(|r| matches!(r.op, nbswire::Op::CopyUp { .. })) {
+                            eprintln!("  [{}] the clone's writer {} sends #{} to cs {}: {:?} -- view {}", self.step, k,
+                                      r.id, cs, r.op, self.clones[k].s.view());
+                        }
+                    }
                     self.push(End::Clone(k), End::Cs(h), bytes, id);
                 }
                 Out::Done { tag, ok } => self.clone_done(k, tag, ok)?,
@@ -2379,6 +2563,11 @@ impl World {
         if self.trace {
             eprintln!("  [{}] host {} crashes", self.step, self.hosts[h].name);
         }
+        /* Its requests in flight and its garbage pass gone first: each
+           holds the store */
+        self.hosts[h].flights.clear();
+        self.hosts[h].garbage = None;
+        self.hosts[h].asks.clear();
         self.hosts[h].store = None;
         let r = &mut self.r;
         self.hosts[h].disk.borrow_mut().cut(r);
@@ -2440,8 +2629,8 @@ impl World {
                 .map(|x| (x.chunk, x.generation)).collect();
             eprintln!("  [{}] host {} finds open (chunk, generation): {:?}", self.step, self.hosts[h].name, open);
         }
-        self.hosts[h].store = Some(store);
-        self.hosts[h].vouched = Vouched::new();
+        self.hosts[h].store = Some(Rc::new(store));
+        self.hosts[h].vouched = Rc::new(Requests::new());
         self.hosts[h].down_since = None;
         self.hosts[h].joins_seen = false;
         self.hosts[h].joins_at = 0;
@@ -2577,6 +2766,7 @@ impl World {
             return Ok(None);
         }
         self.crash(h)?;
+        self.lost_for_good = Some(h);
         self.count("hosts lost for good, written past");
         let failed = |w: &World| w.clients[c].failed;
         let before = failed(self);
@@ -3015,7 +3205,7 @@ fn setup(r: &mut Rng) -> Result<World, String> {
                         hosts: Vec::new(), links: BTreeMap::new(), clients: Vec::new(), blocks: Blocks::default(),
                         seq: 1, down: None, served: 0, rest: None, owed: None, plan_at: 0, drained: None,
                         scrub: Scrub::new(SCRUB_EVERY), scrub_q: Vec::new(), scrub_r: Rng::new(0), scrub_id: 1,
-                        rotted: Vec::new(), snaps: Vec::new(), snap_r: Rng::new(0), snap_next: 1, garbage_at: 0,
+                        rotted: Vec::new(), snaps: Vec::new(), snap_r: Rng::new(0), snap_next: 1, garbage_at: 0, lost_for_good: None,
                         pausing: None, late: None, pause_next: 1, given_up: None, pause_word: None,
                         clones: Vec::new(), cmodel: Blocks::default(), clone_r: Rng::new(0),
                         stats: BTreeMap::new() };
@@ -3044,7 +3234,9 @@ fn setup(r: &mut Rng) -> Result<World, String> {
         if let Err((_, e)) = nbscs::now(store.format_device(Handle(disk.clone()), identity, 1 + r.below(u64::MAX - 1))) {
             return Err(format!("disk of {} not formatted: {:?}", h, e));
         }
-        w.hosts.push(Host { name: h, cs: cs.id, disk, identity, store: Some(store), vouched: Vouched::new(),
+        w.hosts.push(Host { name: h, cs: cs.id, disk, identity, store: Some(Rc::new(store)),
+                            vouched: Rc::new(Requests::new()), flights: Vec::new(), asks: Rc::new(Asks::default()),
+                            garbage: None,
                             down_since: None, copies: Vec::new(), joins_seen: false, joins_at: 0, copy_id: 1 });
     }
     Ok(w)
@@ -3205,6 +3397,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
                 eprintln!("  [end] host {} lost for good", w.hosts[h].name);
             }
             lost = Some(h);
+            w.lost_for_good = lost;
         } else {
             w.restart(h).map_err(|e| format!("the end: {}", e))?;
         }

@@ -50,7 +50,7 @@ use std::rc::Rc;
 
 use nbscs::{ChunkRef, Epoch, Identity, Store, SLOT};
 use nbswire::copy::{self, Copy};
-use nbswire::serve::{serve, Vouched};
+use nbswire::serve::{serve, AskNow, Requests};
 use nbswire::{Answer, JoinView, Op, Question, Refusal, Reply, Request, Told};
 
 use crate::cs::{Disk, Handle};
@@ -123,8 +123,8 @@ struct World {
     source: Store<Handle>,
     joiner: Store<Handle>,
     joiner_disk: Rc<RefCell<Disk>>,
-    sv: Vouched,
-    jv: Vouched,
+    sv: Requests,
+    jv: Requests,
     /// The set as the mds has it: its version, its join's `since`, whether
     /// the join is on.
     version: u32,
@@ -225,9 +225,9 @@ impl World {
                             op: Op::Write { chunk: cref(chunk, version), position: 0, index: 1, offset, data } };
         let (v, s, j) = (self.version, self.since, self.joining);
         let done = if to_joiner {
-            serve(&mut self.joiner, &mut self.jv, &req, &mut |q| World::joiner_mds(v, s, j, q))
+            nbscs::now(serve(&self.joiner, &self.jv, &req, &AskNow::new(|q| World::joiner_mds(v, s, j, q))))
         } else {
-            serve(&mut self.source, &mut self.sv, &req, &mut |q| World::source_mds(v, j, q))
+            nbscs::now(serve(&self.source, &self.sv, &req, &AskNow::new(|q| World::source_mds(v, j, q))))
         };
         done.map(|_| ())
     }
@@ -387,7 +387,7 @@ impl World {
             Msg::Request(bytes) => {
                 let Some(req) = Request::decode(&bytes) else { return Err(String::from("a request that is none")) };
                 let (v, j) = (self.version, self.joining);
-                let done = serve(&mut self.source, &mut self.sv, &req, &mut |q| World::source_mds(v, j, q));
+                let done = nbscs::now(serve(&self.source, &self.sv, &req, &AskNow::new(|q| World::source_mds(v, j, q))));
                 let reply = match &done {
                     Ok(d) => d.reply(),
                     Err(why) => Reply::Refused(*why),
@@ -420,7 +420,7 @@ impl World {
                 }
                 let mut out = Vec::new();
                 if let Some(c) = self.copy.as_mut() {
-                    c.answer(&mut self.joiner, a.id, &a.reply, self.now, &mut out);
+                    nbscs::now(c.answer(&self.joiner, a.id, &a.reply, self.now, &mut out));
                 }
                 self.sent(out);
             }
@@ -444,7 +444,7 @@ impl World {
     fn step_copy(&mut self) {
         let mut out = Vec::new();
         if let Some(c) = self.copy.as_mut() {
-            c.step(&mut self.joiner, self.now, &mut self.next_id, &mut out);
+            nbscs::now(c.step(&self.joiner, self.now, &mut self.next_id, &mut out));
         }
         self.sent(out);
     }
@@ -559,7 +559,7 @@ impl World {
             self.closed_now.push(chunk);
         }
         self.closed_kept()?;
-        self.jv = Vouched::new();
+        self.jv = Requests::new();
         self.copy = None;
         self.closed_now.clear();
         self.missed.clear();
@@ -701,7 +701,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     } else {
         nbscs::now(joiner.flush()).map_err(|e| format!("joiner not flushed: {:?}", e))?;
     }
-    let mut w = World { r, now: 0, trace, source, joiner, joiner_disk: jdisk, sv: Vouched::new(), jv: Vouched::new(),
+    let mut w = World { r, now: 0, trace, source, joiner, joiner_disk: jdisk, sv: Requests::new(), jv: Requests::new(),
                         version: SINCE, since: SINCE, joining: true, own, chunks, copy: None, copy_at: None,
                         refresh_at: None, next_id: 1, net: Vec::new(), writes: Vec::new(), seq: 1 << 32, rotted: Vec::new(),
                         focus, release: false, last_working: None, closed: 0, closed_now: Vec::new(), missed: Vec::new(), injected: false,
