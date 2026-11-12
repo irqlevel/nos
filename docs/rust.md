@@ -100,8 +100,7 @@ module export table is generated from the `ffi` declarations:
 **`base/ffi/`** holds `extern "C"` declarations and `#[repr(C)]` structs and no
 logic. Every pointer is raw (`*mut u8`, `*const u8`): no reference crosses
 the boundary. A kernel object is an opaque handle, 0 for null or failure:
-a `usize` mostly, a `u64` for a mailbox, a provider, a job or an event, and
-a TCP connection's a `*mut c_void` that is still only looked up. The blocks are `unsafe extern "C" { .. }` -- **at the start of a
+a `usize` mostly, a `u64` for a mailbox, a provider, a job or an event. The blocks are `unsafe extern "C" { .. }` -- **at the start of a
 line**, which is what the Makefile's module export table looks for -- and a
 function that is sound for *any* argument at *any* time is declared
 `pub safe fn`, so that calling it needs no `unsafe` block and the blocks
@@ -132,10 +131,11 @@ the pointer cast to `unsigned long`, 0 for failure. The callbacks' pools --
 line interrupts, timers, MSI-X -- are static storage, each adapter made in
 place by placement new, under a `RawRwSpinLock`: read-locked in the
 handlers, write-locked with interrupts saved to register or unregister;
-their handles are slot numbers, a timer's with a generation, as a command's
-are. The Rust side's handles are its own: a slot and a generation for
-files, images, queues, events and claims, a mailbox's, provider's or job's
-`u64`, a TCP connection a pointer -- each looked up, never dereferenced.
+their handles are slot numbers with a generation, as a command's are. The
+Rust side's handles are its own: a slot and a generation for files, images,
+queues, events, claims and TCP connections, a mailbox's, provider's or job's
+`u64` -- each looked up, never dereferenced, and one kept past its object's
+end names nothing, not the slot's next tenant.
 
 ## Where `unsafe` goes
 

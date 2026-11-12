@@ -348,6 +348,33 @@ def cpp_struct(text, name):
     return fields
 
 
+# (Rust file, its constant, C++ file, its constant): a number both halves
+# hold, each in its own language, which neither compiler sees the other's.
+SHARED_CONSTANTS = [
+    ("src/crates/base/ffi/src/frame.rs", "FRAMES_MAP_MAX", "src/base/kernel/rust_ffi.cpp", "FRAMES_MAP_MAX"),
+    ("src/crates/base/ffi/src/klog.rs", "LINE_BYTES", "src/base/kernel/klog.h", "LINE_SIZE"),
+]
+
+
+def constant(text, name, rust):
+    pattern = (r"\bconst\s+%s\s*:\s*[\w:]+\s*=\s*([0-9][0-9_xXa-fA-F]*)\s*;" if rust else
+               r"\bconst\s+[\w\s:]+?\b%s\s*=\s*([0-9][0-9xXa-fA-F]*)[uUlL]*\s*;") % name
+    m = re.search(pattern, text)
+    return int(m.group(1).replace("_", ""), 0) if m else None
+
+
+def shared_constants():
+    bad = []
+    for rust_file, rust_name, cpp_file, cpp_name in SHARED_CONSTANTS:
+        r = constant(strip(open(os.path.join(ROOT, rust_file), encoding="utf-8").read(), True), rust_name, True)
+        c = constant(strip(open(os.path.join(ROOT, cpp_file), encoding="utf-8").read(), False), cpp_name, False)
+        if r is None or c is None:
+            bad.append("%s in %s or %s in %s not found, or not read" % (rust_name, rust_file, cpp_name, cpp_file))
+        elif r != c:
+            bad.append("%s (%s) is %d and %s (%s) is %d" % (rust_name, rust_file, r, cpp_name, cpp_file, c))
+    return bad
+
+
 def shared_structs():
     bad = []
     for rust_file, rust_name, cpp_file, cpp_name in SHARED_STRUCTS:
@@ -522,7 +549,7 @@ def main():
         failed = True
         print("check-ffi: %s (%s:%d) is a static in an extern block: a module can import no data, and it "
               "is never exported" % (name, os.path.relpath(path, ROOT), line))
-    for problem in shared_structs():
+    for problem in shared_structs() + shared_constants():
         failed = True
         print("check-ffi: " + problem)
 
@@ -545,7 +572,8 @@ def main():
     if failed:
         return 22
     print("check-ffi: %d functions, every spelling of each the same; %d exports as the Makefile scans them; "
-          "%d structs laid out alike" % (compared, len(scanned), len(SHARED_STRUCTS)))
+          "%d structs laid out alike; %d numbers the same in both languages"
+          % (compared, len(scanned), len(SHARED_STRUCTS), len(SHARED_CONSTANTS)))
     return 0
 
 

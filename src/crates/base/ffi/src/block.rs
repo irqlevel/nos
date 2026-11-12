@@ -166,3 +166,28 @@ unsafe extern "C" {
     /// no slice of its buffers, which are freed here.
     pub fn kernel_blockq_close(q: usize);
 }
+
+/* The numbers that cross with these functions, one copy of each: the
+ * layer that answers and kcore that reads them both use these, and this
+ * file is in the module interface's digest. They were written twice --
+ * a copy in the layer, literals in kcore -- outside it: a release that
+ * renumbered one built, hashed the same, and its modules misread the
+ * answers. */
+
+/// What a `BlockIo` asks for.
+pub const BLOCK_IO_READ: u8 = 0;
+pub const BLOCK_IO_WRITE: u8 = 1;
+pub const BLOCK_IO_FLUSH: u8 = 2;
+
+/// What a driver's submit answers.
+pub const BLOCK_SUBMIT_OK: i32 = 0;
+pub const BLOCK_SUBMIT_BUSY: i32 = 1;
+pub const BLOCK_SUBMIT_INVALID: i32 = 2;
+pub const BLOCK_SUBMIT_UNSUPPORTED: i32 = 3;
+
+/// What a queue's start answers -- a device's (`kernel_blockq_start`) and an
+/// image's (`kernel_image_start`): with the device until it is reaped, done
+/// now, or done and failed.
+pub const QUEUE_IN_FLIGHT: i32 = 1;
+pub const QUEUE_DONE: i32 = 0;
+pub const QUEUE_FAILED: i32 = -1;

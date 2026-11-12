@@ -131,6 +131,9 @@ private:
     static const ulong DYNAMIC_SLOT_BITS = 8;
     static_assert(DYNAMIC_MAX < (1UL << DYNAMIC_SLOT_BITS), "slot must fit a handle");
     static const ulong DYNAMIC_POLL_NS = consts::NANO_SECS_IN_MS;
+    /* How long an unregister's wait for its calls goes before it is said,
+       and again */
+    static const ulong DYNAMIC_REPORT_NS = 10 * consts::NANO_SECS_IN_SEC;
 
     struct DynamicCmd
     {

@@ -55,11 +55,13 @@ pub enum ListenError {
     Invalid,
 }
 
+/// How long a wait for a callback to return goes before it is said, and
+/// again: a join's ten seconds (`Task::wait`).
+const WAIT_REPORT_NS: u64 = 10 * kcore::consts::NS_PER_SEC;
+
 /// What `kernel_net_udp_listen` answers a module (kcore::net::ListenError).
-const LISTEN_OK: i32 = 0;
-const LISTEN_PORT_TAKEN: i32 = 1;
-const LISTEN_TABLE_FULL: i32 = 2;
-const LISTEN_INVALID: i32 = 3;
+use ffi::net::{NET_LISTEN_INVALID as LISTEN_INVALID, NET_LISTEN_OK as LISTEN_OK,
+               NET_LISTEN_PORT_TAKEN as LISTEN_PORT_TAKEN, NET_LISTEN_TABLE_FULL as LISTEN_TABLE_FULL};
 
 /// How many frames cross from a driver, or to one, in a single call.
 const HANDLE_CHUNK: usize = 64;
@@ -253,15 +255,15 @@ pub struct Lent<'a>(&'a Frame);
 
 impl Lent<'_> {
     /// The frame's bytes, Ethernet header first.
+    ///
+    /// Lent, and kept by nobody in the image past the call: a frame has one
+    /// owner here, so `data_mut` is one writer's. (A `retain` that made a
+    /// second owner of the same buffer, from `&self`, let safe code hold two
+    /// `&mut` slices of it; nothing called it. A module keeps a frame it was
+    /// lent through kcore's `Lent::retain`, across the C ABI, where no
+    /// reference of the image's is live.)
     pub fn bytes(&self) -> &[u8] {
         self.0.bytes()
-    }
-
-    /// The frame, to keep past the call -- to answer in, where it lies. The
-    /// receive path's own reference is then not the last, and it never looks
-    /// at the bytes again.
-    pub fn retain(self) -> Frame {
-        self.0.retain()
     }
 }
 
@@ -1039,9 +1041,20 @@ impl Device {
          * the lock. The count covers every listener on the device, not just
          * this port -- the table is compacted on removal, so a per-slot count
          * would not stay with its slot -- and a callback is microseconds, so
-         * waiting for a neighbour's costs nothing worth a second structure. */
+         * waiting for a neighbour's costs nothing worth a second structure.
+         * A callback that never returns made this a wait with no word: said
+         * every ten seconds it lasts, as a join is. */
+        let from = kcore::time::boot_time_ns();
+        let mut said_at = from;
         while self.listener_in_flight.load(Ordering::Acquire) != 0 {
             kcore::task::sleep_ms(1);
+            let now = kcore::time::boot_time_ns();
+            if now.saturating_sub(said_at) >= WAIT_REPORT_NS {
+                said_at = now;
+                klog!(0, "net: {}: port {}'s unlisten has waited {} s for a listener's callback to return",
+                      core::str::from_utf8(self.name()).unwrap_or("?"), port,
+                      now.saturating_sub(from) / kcore::consts::NS_PER_SEC);
+            }
         }
     }
 
@@ -1287,7 +1300,10 @@ impl DeviceTable {
 
     /// The next slot, named. Registration is boot's, one driver at a time.
     fn claim(&'static self, name: &str, mac: Mac) -> Option<&'static Device> {
-        if name.is_empty() || name.len() >= NAME_MAX || name.as_bytes().contains(&0) {
+        /* A name a device has already is no name for another: a module's
+         * virtual NIC opened as `eth0` was registered beside the real one,
+         * and a lookup by the name found whichever came first */
+        if !Self::name_will_do(name) || self.named(name) {
             return None;
         }
 
@@ -1307,6 +1323,24 @@ impl DeviceTable {
             return None;
         }
         Some(dev)
+    }
+
+    fn name_will_do(name: &str) -> bool {
+        !name.is_empty() && name.len() < NAME_MAX && !name.as_bytes().contains(&0)
+    }
+
+    /// Whether a device is called `name`.
+    fn named(&'static self, name: &str) -> bool {
+        self.devices[..self.count()].iter().any(|dev| dev.name() == name.as_bytes())
+    }
+
+    /// Whether `register` would take a device called `name` now: a name
+    /// that will do, no device called so already, and room in the table. A
+    /// look, not a hold -- what a caller that has to make its driver
+    /// `'static`, for good, before it may register asks first
+    /// (`vnic::make`).
+    pub fn would_take(&'static self, name: &str) -> bool {
+        Self::name_will_do(name) && self.count() < MAX_DEVICES && !self.named(name)
     }
 
     /// The receive softirq: harvest every device, then dispatch what it

@@ -479,7 +479,11 @@ MODULE_LDFLAGS = -m $(MODULE_LDEMU_$(ARCH)) -shared -Bsymbolic --gc-sections \
 # the shell takes no notice of cat's failure -- and on a host with no
 # sha256sum it was empty, which every module built so matched.
 MODULE_FFI_SRC = $(sort $(shell find src/crates/base/ffi/src -name '*.rs'))
-MODULE_ABI_SRC = $(MODULE_FFI_SRC) src/crates/base/kcore/src/trace/events.rs
+# And the management bus's wire (common/ipc/mgmtwire), whose status codes a
+# provider of a module's answers in and the bus reads: compiled into both,
+# and once outside the digest.
+MODULE_ABI_SRC = $(MODULE_FFI_SRC) src/crates/base/kcore/src/trace/events.rs \
+    $(sort $(shell find src/crates/common/ipc/mgmtwire/src -name '*.rs'))
 MODULE_ABI := $(shell cat $(MODULE_ABI_SRC) | sha256sum | cut -c1-64)
 ifneq ($(filter-out clean,$(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)),)
 ifneq ($(filter-out $(wildcard $(MODULE_ABI_SRC)),$(MODULE_ABI_SRC)),)
