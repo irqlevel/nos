@@ -14,7 +14,7 @@ use hvarch::x86::svm::{GuestRegs, Kick, NotRun};
 use hvarch::{Caps, Result};
 
 use crate::memory::GuestMemory;
-use crate::svm::{Exit, Io, LongMode, ProtectedMode};
+use crate::svm::{Exit, Instr, Io, LongMode, ProtectedMode};
 use crate::vm::Refusal;
 
 /* Control-register and EFER bits a guest's starting state is made of. The
@@ -32,11 +32,8 @@ const CR0_LOW: u64 = 0xFFFF_FFFF;
 /// The CR0 bits LMSW loads: PE, MP, EM and TS.
 const LMSW_BITS: u64 = 0xF;
 
-/// Exit codes this decoder hands the run loop for instructions it does not
-/// answer itself, in the AMD-V namespace the loop already speaks -- so one
-/// set of `Exit::Other` arms serves both backends.
-use hvarch::x86::svm::vmcb::exit as svm_exit;
-/// Nested-fault error bits, likewise the AMD-V encoding the loop reads.
+/// Nested-fault error bits: the AMD-V encoding the run loop reads, into
+/// which an EPT violation's qualification is put.
 use hvarch::x86::svm::vmcb::npf;
 
 const RFLAGS_RESERVED_ONE: u64 = 1 << 1;
@@ -317,7 +314,7 @@ impl Vcpu {
                  * software exception -- the run loop steps past it and gives
                  * the #DB as the trap it is, as for AMD-V's intercept. */
                 if vector == VECTOR_DB && info & vmcs::intr::TYPE_MASK == vmcs::intr::TYPE_PRIV_SOFT_EXCEPTION {
-                    return Exit::Other(svm_exit::ICEBP);
+                    return Exit::Instr(Instr::Icebp);
                 }
                 let error = (info & vmcs::intr::DELIVER_ERRCODE != 0).then(|| g.exit_intr_errcode());
                 Exit::Exception { vector, error }
@@ -374,7 +371,7 @@ impl Vcpu {
                         let src = (q >> cr::LMSW_SOURCE_SHIFT) & LMSW_BITS;
                         Exit::Cr0Write { value: (old & !LMSW_BITS) | src | (old & CR0_PE) }
                     }
-                    _ => Exit::Other(r::CR_ACCESS as u64),
+                    _ => Exit::Other { code: u64::from(r::CR_ACCESS), vmx: true },
                 }
             }
             r::DR_ACCESS => {
@@ -417,14 +414,17 @@ impl Vcpu {
             }
             r::TRIPLE_FAULT => Exit::Shutdown,
             /* The instructions the run loop answers in one place for both
-             * backends: hand it the AMD-V code it already matches. */
-            r::WBINVD => Exit::Other(svm_exit::WBINVD),
-            r::XSETBV => Exit::Other(svm_exit::XSETBV),
-            r::MONITOR => Exit::Other(svm_exit::MONITOR),
-            r::MWAIT => Exit::Other(svm_exit::MWAIT),
-            r::RDTSCP => Exit::Other(svm_exit::RDTSCP),
-            r::RDPMC => Exit::Other(svm_exit::RDPMC),
-            other => Exit::Other(other as u64),
+             * backends, by name. INVD exits whatever the controls say; it was
+             * once an exit no arm answered, its guest stopped. */
+            r::WBINVD => Exit::Instr(Instr::Wbinvd),
+            r::INVD => Exit::Instr(Instr::Invd),
+            r::XSETBV => Exit::Instr(Instr::Xsetbv),
+            r::MONITOR => Exit::Instr(Instr::Monitor),
+            r::MWAIT => Exit::Instr(Instr::Mwait),
+            r::RDTSCP => Exit::Instr(Instr::Rdtscp),
+            r::RDPMC => Exit::Instr(Instr::Rdpmc),
+            r::TASK_SWITCH => Exit::TaskSwitch,
+            other => Exit::Other { code: u64::from(other), vmx: true },
         }
     }
 
