@@ -9,7 +9,11 @@
 //! double-width compare-and-swap to write. Enqueue fails when full and
 //! dequeue when empty; neither ever blocks, which is what makes it safe from
 //! the places that must not -- a hard IRQ handler, code under a spinlock, the
-//! panic path.
+//! panic path. "Full" and "empty" are not exact while another operation is
+//! half-way through: a consumer that has claimed a cell and not yet marked
+//! it free makes a producer a lap behind it find the ring full, and a
+//! stalled producer makes consumers find it empty with later cells filled.
+//! So a push that "cannot fail" by counting can, for a moment.
 //!
 //! One difference from `LocklessRing`, and the reason this can be a `static`
 //! with no initialiser to run: Vyukov's cells start with `seq[i] = i`, which
@@ -47,7 +51,7 @@ pub struct StaticRing<const N: usize> {
 
 impl<const N: usize> StaticRing<N> {
     pub const fn new() -> Self {
-        assert!(N.is_power_of_two(), "a ring's capacity must be a power of two");
+        assert!(N.is_power_of_two() && N >= 2, "a ring's capacity must be a power of two, two at least");
         Self {
             cells: [const { Cell::new() }; N],
             enqueue_pos: AtomicUsize::new(0),
@@ -148,6 +152,11 @@ pub struct Mailbox<T, const N: usize> {
     fresh: AtomicUsize,
     /// Slots the reader is done with
     free: StaticRing<N>,
+    /// Slots the reader could not give back: a free ring that a sender
+    /// stalled half-way through a pop of it -- an interrupt, an NMI, its
+    /// vCPU descheduled -- answered full for longer than the reader tried.
+    /// Each is one slot fewer for good, counted rather than silent.
+    lost: AtomicUsize,
     /// Slots holding a message, in the order they were sent
     ready: StaticRing<N>,
 }
@@ -164,9 +173,16 @@ impl<T: ConstInit, const N: usize> Mailbox<T, N> {
             fresh: AtomicUsize::new(0),
             free: StaticRing::new(),
             ready: StaticRing::new(),
+            lost: AtomicUsize::new(0),
         }
     }
 }
+
+/// How many times a slot's give-back is tried before it is counted lost:
+/// enough to see a pop on another CPU finish its two instructions, and no
+/// wait for good -- the reader may be the panic path, on the CPU that was
+/// stopped half-way.
+const GIVE_BACK_TRIES: usize = 64;
 
 impl<T, const N: usize> Mailbox<T, N> {
     fn take_slot(&self) -> Option<usize> {
@@ -201,13 +217,32 @@ impl<T, const N: usize> Mailbox<T, N> {
         /* The number came off `fresh` or `free`, to this call alone. */
         fill(unsafe { &mut *self.slots[slot].get() });
 
-        /* Cannot fail: the ready ring holds every slot there is. */
+        /* The ready ring holds every slot there is: refused only for the
+         * moment a consumer is half-way through, and then given back. */
         if self.ready.push(slot) {
             true
         } else {
-            self.free.push(slot);
+            self.give_back(slot);
             false
         }
+    }
+
+    /// Slot `slot` onto the free ring -- tried again for the moment a pop
+    /// of it is half-way through elsewhere -- or counted lost.
+    fn give_back(&self, slot: usize) {
+        for _ in 0..GIVE_BACK_TRIES {
+            if self.free.push(slot) {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+        self.lost.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Slots never given back since boot (`lost`): what a report of the
+    /// mailbox says, so that one fewer is never silent.
+    pub fn lost(&self) -> usize {
+        self.lost.load(Ordering::Relaxed)
     }
 
     /// The oldest message, looked at by `read` where it lies; its slot is
@@ -218,8 +253,9 @@ impl<T, const N: usize> Mailbox<T, N> {
         /* The number came off `ready`, to this call alone. */
         let result = read(unsafe { &*self.slots[slot].get() });
 
-        /* Cannot fail either: the free ring holds every slot there is. */
-        self.free.push(slot);
+        /* The free ring holds every slot there is: refused only for the
+         * moment a sender is half-way through a pop of it. */
+        self.give_back(slot);
         Some(result)
     }
 

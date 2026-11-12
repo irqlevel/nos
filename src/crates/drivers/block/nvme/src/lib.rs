@@ -224,7 +224,9 @@ fn init_device(dev: pci::PciDevice) {
     dev.enable_bus_mastering();
 
     /* --- Map BAR0 --- */
-    let bar_phys = dev.get_bar64(0);
+    /* BAR0, read as its type says: NVMe makes it a 64-bit one, and a
+     * controller that does not is not taken for one */
+    let bar_phys = dev.bar_address(0);
     if bar_phys == 0 {
         klog!(0, "NVMe: BAR0 is 0, skipping");
         return;

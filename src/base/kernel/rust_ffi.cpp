@@ -46,8 +46,6 @@ static const ulong RUST_ALLOC_TAG = 'rust';
 /* kernel_printer_write hands a Printer at most this much at a time */
 static const unsigned long PRINTER_CHUNK_SIZE = 128;
 
-/* Longer than any net device's name: VirtioNet's are at most 7 */
-
 /* kernel_cmd_dispatch: the longest command line it runs -- as long as a line
    of /etc/rc (cmd.cpp's SCRIPT_LINE_MAX): a guest's `hv start` over SSH with a
    distribution's kernel command line runs past two hundred characters before
@@ -643,8 +641,9 @@ void kernel_cpu_run_on(unsigned int cpu,
         return;
 
     /* A CPU that never started or already exited will not drain its IPI task
-       list; queueing would block Completion.wait() forever (send_ipi_self
-       silently refuses to send in those states). */
+       list: queueing would block the completion's wait forever, and the IPI
+       itself is a BUG_ON for a CPU that is not running (send_ipi_self; only
+       a parked one is refused without a word). So it is looked at here. */
     auto& target = kernel::CpuTable::get_instance().get_cpu(cpu);
     ulong state = target.get_state();
     if (!(state & kernel::Cpu::STATE_RUNNING) ||

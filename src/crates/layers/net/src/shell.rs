@@ -80,7 +80,7 @@ pub fn netpool(_args: &str, out: &mut Output) {
     let _ = writeln!(out, "in flight {}", st.in_flight);
     let _ = writeln!(out, "alloc hits {}, misses {}, oversized (refused) {}",
         st.hits, st.misses, st.oversized);
-    let _ = writeln!(out, "ring refills {}, flushes {}", st.refills, st.flushes);
+    let _ = writeln!(out, "ring refills {}, flushes {}, frames lost {}", st.refills, st.flushes, st.lost);
 }
 
 pub fn arp(_args: &str, out: &mut Output) {

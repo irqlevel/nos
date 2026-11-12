@@ -492,7 +492,9 @@ impl Disk {
         match unsafe { Buffers::new(at, bytes) } {
             Ok(buffers) => Ok(DiskQueue { buffers, disk: self, q }),
             Err(_) => {
-                block::kernel_blockq_close(q);
+                /* Opened just now, by this call alone, and no slice of its
+                 * buffers made */
+                unsafe { block::kernel_blockq_close(q) };
                 Err(QueueError::Refused)
             }
         }
@@ -531,7 +533,9 @@ impl DiskQueue {
     /// doorbell waits for `kick`.
     pub fn start(&self, k: usize, write: bool, offset: u64, len: usize) -> Result<Started> {
         self.buffers.take(k)?;
-        match block::kernel_blockq_start(self.q, k, i32::from(write), offset, len) {
+        /* `take` made buffer `k` this call's: no `Lent` of it is out, and
+         * the queue is this one's alone */
+        match unsafe { block::kernel_blockq_start(self.q, k, i32::from(write), offset, len) } {
             1 => Ok(Started::InFlight),
             rc => {
                 self.buffers.untake(k);
@@ -674,6 +678,6 @@ impl Drop for DiskQueue {
         /* Waits for what the device still has, frees the buffers and gives
          * the claim back: nothing reaches the buffers after -- a `Lent`
          * borrows the queue, and so is gone before this runs. */
-        block::kernel_blockq_close(self.q);
+        unsafe { block::kernel_blockq_close(self.q) };
     }
 }

@@ -137,9 +137,10 @@ module: sshd: init failed
 insmod: /sshd.ko failed, error 502
 ```
 
-They are at most 255 bytes (`ModuleTable::PARAMS_MAX`). Since its init takes
-them, the module's header is at layout version 2, and a module built before
-is refused with `header version 1, this kernel reads 2`: rebuild it.
+They are at most 255 bytes (`ModuleTable::PARAMS_MAX`). The module's header
+is at layout version 3 -- 2 when its init came to take them, 3 with its
+stop -- and a module built before is refused with `header version 2, this
+kernel reads 3`: rebuild it.
 
 ## Building
 
@@ -903,8 +904,10 @@ shell's wait by hand or from a script.
 - A module's image, function names included, is at most 16 MiB
   (`PageTable::MAX_LARGE_MAP_PAGES` pages), and so is the `.ko` file. The window
   they are mapped from holds 63 such runs at a time.
-- A module that registers a block device, a net device or a softirq handler
-  cannot be unloaded (above).
+- A module that registers a softirq handler (`kernel_softirq_register`, the
+  one name `PERMANENT_IMPORTS` holds) cannot be unloaded (above). A block or
+  a net device it cannot register at all; a virtual NIC it opens stays when
+  it goes, for its next load to find, and does not make it permanent.
 - An unload waits for a running call of the module's commands and providers
   for as long as it runs -- in a task of its own, so it holds up nothing
   else, and saying so in the log every so often; but a call that never

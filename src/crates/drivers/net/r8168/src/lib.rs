@@ -301,7 +301,7 @@ fn find_mmio_bar(dev: &pci::PciDevice) -> u64 {
             let bits21 = (raw >> 1) & 0x3;
             if bits21 == 2 {
                 /* 64-bit BAR */
-                return dev.get_bar64(bar);
+                return dev.bar_address(bar);
             } else {
                 /* 32-bit BAR */
                 return (raw & !0xF) as u64;

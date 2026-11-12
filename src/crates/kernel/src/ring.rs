@@ -172,7 +172,7 @@ fn consume(shared: Arc<Shared>) {
 
 /// What a ring answers on one CPU, full and empty, lap after lap.
 fn check_one_cpu() {
-    for refused in [0, 3, kcore::ring::MAX_CAPACITY * 2] {
+    for refused in [0, 1, 3, kcore::ring::MAX_CAPACITY * 2] {
         assert!(LocklessRing::new(refused).is_none(), "ring selftest: a ring of {} cells made", refused);
     }
 

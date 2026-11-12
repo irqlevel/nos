@@ -229,7 +229,9 @@ impl Image {
 
 impl Drop for Image {
     fn drop(&mut self) {
-        fs::kernel_image_close(self.handle);
+        /* This image's alone; its queue, which borrows it, is gone, and with
+         * it every `Lent` of the queue's buffers */
+        unsafe { fs::kernel_image_close(self.handle) };
     }
 }
 
@@ -311,7 +313,9 @@ impl ImageQueue {
     /// buffer lent or started already. Its doorbell waits for `kick`.
     pub fn start(&self, k: usize, write: bool, offset: u64, len: usize) -> Result<Started> {
         self.buffers.take(k)?;
-        match fs::kernel_image_start(self.image.handle, k, i32::from(write), offset, len) {
+        /* `take` made buffer `k` this call's: no `Lent` of it is out, and
+         * the queue is this one's alone */
+        match unsafe { fs::kernel_image_start(self.image.handle, k, i32::from(write), offset, len) } {
             1 => Ok(Started::InFlight),
             rc => {
                 self.buffers.untake(k);
@@ -391,8 +395,9 @@ pub fn write(path: &str, data: &[u8]) -> Result<()> {
 }
 
 /// A new file with this content; Busy, and nothing written, when there is
-/// one at the path already -- also when `read` could not see it. For a file
-/// that must never be written over by mistake.
+/// one at the path already -- also when `read` could not see it; IoError,
+/// and no file left, for anything else that refused it. For a file that
+/// must never be written over by mistake.
 pub fn create(path: &str, data: &[u8]) -> Result<()> {
     let rc = unsafe { fs::kernel_file_create(path.as_ptr(), path.len(), data.as_ptr(), data.len()) };
     match rc {

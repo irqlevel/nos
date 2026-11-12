@@ -277,7 +277,7 @@ fn map_bar(
     }
 
     let is64 = low & 0x6 == 0x4 && index + 1 < MAX_BARS;
-    let phys = if is64 { dev.get_bar64(bar) & !0xF } else { (low & !0xF) as u64 };
+    let phys = if is64 { dev.bar_address(bar) } else { (low & !0xF) as u64 };
     if phys == 0 {
         return None;
     }
