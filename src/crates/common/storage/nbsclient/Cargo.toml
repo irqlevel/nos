@@ -11,6 +11,16 @@ edition = "2021"
 # and fuzz/nbs's cluster target drives it over a network of its own.
 [lib]
 
+# The fuzzer's alone (fuzz/nbs, #97): a session's write requests made to
+# find no memory until a time (`Session::starve_until`), as a kernel's heap
+# may refuse one -- never in a kernel's build.
+[features]
+starve = []
+# The fuzzer's alone too: closes let out two places at a time
+# (`CLOSING_MAX`), so that a target whose volume has a few chunks steps a
+# stop, a pause and a close of the driver's through window after window.
+small_windows = []
+
 [dependencies]
 nbscs = { path = "../nbscs" }
 nbsmeta = { path = "../nbsmeta" }

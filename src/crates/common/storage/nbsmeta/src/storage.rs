@@ -8,16 +8,25 @@
 //!   Its room is its devices' slots that take new data; what its replicas
 //!   take is counted as reserved, never as used (rule 5 of "Where replicas
 //!   go"): one slot for every chunk whose set it is in.
-//! - **A set** is three cs's on three hosts, each replica's state, and a
-//!   version. Chunks placed on the same three cs's name the same set, so a
-//!   host lost changes the few sets it is in rather than every chunk. A set
-//!   and its version are a chunk's epoch.
+//! - **A set** is three cs's on three hosts, each member Active or Down, at
+//!   most one joiner -- a cs being copied onto, which takes a member's place
+//!   once its copy is done (N9) -- and a version. Chunks placed on the same
+//!   three cs's name the same set, so a host lost changes the few sets it is
+//!   in rather than every chunk. A set and its version are a chunk's epoch.
+//!   A join can leave two sets on the same three cs's; placement takes the
+//!   lowest-numbered of them.
 //! - **A chunk** -- 4 MiB of a volume -- is 8 bytes: its set, how many maps
 //!   name it, its flags. A free one is on the free list, chained through
 //!   its own record, so no other table keeps it.
 //! - **A volume**: its name and size, its kind, its own host, its attach,
 //!   and its map, a chunk's number for each 4 MiB of it.
+//! - **Snapshots, images and clones** (N10) share their chunks with the
+//!   volume they were made of, each chunk counted by every map that names
+//!   it, room reserved for none -- thin. A write to a shared chunk is a
+//!   copy-up: a new chunk in the same set, pending until the set's members
+//!   have copied it, then named by the writer's map in the old one's place.
 
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -36,6 +45,8 @@ pub const CS_MAX: usize = 64;
 pub const DEVICES_MAX: usize = 16;
 /// Volumes, at most.
 pub const VOLUMES_MAX: usize = 4096;
+/* A chunk's count of the maps that name it -- each once at most -- is a u16 */
+const _: () = assert!(VOLUMES_MAX < u16::MAX as usize);
 /// Chunks, at most: 16 TiB of volumes, some 48 MiB of state.
 pub const CHUNKS_MAX: usize = 1 << 22;
 /// A volume's size at most, in MiB: 16 TiB.
@@ -52,6 +63,9 @@ pub const VOLUME_NAME_MAX: usize = 63;
 pub const SETS_MAX: usize = 1 << 16;
 /// What a free chunk's record has for the end of the free list.
 pub const NO_CHUNK: u32 = u32::MAX;
+/// Copy-ups pending at once, at most (N10): a writer has a few under way,
+/// and leaves those it had where it stops.
+pub const COPYING_MAX: usize = 4096;
 
 /// A chunk on the free list.
 pub const CHUNK_FREE: u8 = 0x80;
@@ -96,6 +110,22 @@ pub struct Device {
     pub state: DeviceState,
 }
 
+/// What the leader has committed of a cs's being there (N9): what the
+/// controller (`repair.rs`) moves it by, from what the leader sees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CsState {
+    /// Answering: a member of its sets, taking new chunks where it has room.
+    Up,
+    /// Silent past the controller's 5 s: down in every set it is a member of
+    /// -- the last active member of one apart -- and the joiner of none; it
+    /// takes no new chunks, and is back in a set only by joining it again
+    /// once it answers.
+    Down,
+    /// Silent past `out_after`, or its host no member: down in its sets as
+    /// a down one is, its places in them to be taken by others.
+    Out,
+}
+
 /// A host's chunk server.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cs {
@@ -103,8 +133,10 @@ pub struct Cs {
     pub id: u32,
     pub host: String,
     pub devices: Vec<Device>,
-    /// The slots its replicas take: one for every chunk whose set it is in.
+    /// The slots its replicas take: one for every chunk whose set it is a
+    /// member of, and for every chunk of a set it joins in another's place.
     pub reserved: u64,
+    pub state: CsState,
 }
 
 impl Cs {
@@ -117,15 +149,34 @@ impl Cs {
     pub fn free(&self) -> u64 {
         self.slots().saturating_sub(self.reserved)
     }
+
+    /// Being drained: devices, none of which takes new chunks -- every set
+    /// it is a member of to be given a joiner in its place.
+    pub fn draining(&self) -> bool {
+        !self.devices.is_empty() && self.slots() == 0
+    }
 }
 
+/// A member of a set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Replica {
+    /// Written and read.
     Active,
-    /// Being copied onto: written to, not read from (N9).
-    Rebuilding,
-    /// Not answering: written to by nobody until it is back (N9).
+    /// Taken out: written and read by nobody until it joins again, or
+    /// another joins in its place (N9).
     Down,
+}
+
+/// A cs being copied onto (N9): written, not read, until its copy is done
+/// and it takes a member's place -- the member's own, when the member
+/// itself is back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Joiner {
+    pub cs: u32,
+    /// The member whose place it takes: its index in the set's three.
+    pub place: u8,
+    /// The version the join raised the set to: what its end names it by.
+    pub since: u32,
 }
 
 /// Three cs's on three hosts, by number, in increasing order.
@@ -133,11 +184,28 @@ pub enum Replica {
 pub struct Set {
     pub cs: [u32; REPLICAS],
     pub replicas: [Replica; REPLICAS],
+    /// For each member down, the last version it was active at: the writes
+    /// it may have missed were made at that version or after. 0 for an
+    /// active one.
+    pub active_until: [u32; REPLICAS],
+    pub joiner: Option<Joiner>,
     /// Raised by every change of its members: a chunk's epoch is its set and
     /// that.
     pub version: u32,
     /// The chunks in it.
     pub chunks: u32,
+}
+
+impl Set {
+    /// How many of its members are active.
+    pub fn active(&self) -> usize {
+        self.replicas.iter().filter(|&&r| r == Replica::Active).count()
+    }
+
+    /// Whether `cs` is the joiner of a place another's is.
+    pub fn joins_elsewhere(&self, cs: u32) -> bool {
+        self.joiner.is_some_and(|j| j.cs == cs && self.cs.get(usize::from(j.place)) != Some(&cs))
+    }
 }
 
 /// A chunk: in use, or on the free list.
@@ -222,12 +290,38 @@ impl State {
             Command::Detach { name, host, generation } => {
                 self.detach(name, host, *generation).map(|generation| Answer::Attached { generation })
             }
+            Command::Reattach { name, host, generation, token } => {
+                self.reattach(name, host, *generation, *token).map(|generation| Answer::Attached { generation })
+            }
             Command::Digest { at, digest } => {
                 self.checks.compare(*at, digest, index);
                 Ok(Answer::Checked)
             }
             Command::ReplicaDown { set, cs, name, generation, .. } => {
                 self.replica_down(*set, *cs, name, *generation).map(|version| Answer::Set { version })
+            }
+            Command::CsDown { cs } => self.cs_gone(*cs, CsState::Down).map(|sets| Answer::Changed { sets }),
+            Command::CsOut { cs } => self.cs_gone(*cs, CsState::Out).map(|sets| Answer::Changed { sets }),
+            Command::CsUp { cs } => self.cs_up(*cs).map(|sets| Answer::Changed { sets }),
+            Command::Join { set, place, cs, version } => {
+                self.join(*set, *place, *cs, *version).map(|version| Answer::Set { version })
+            }
+            Command::Joined { set, cs, since } => self.joined(*set, *cs, *since).map(|version| Answer::Set { version }),
+            Command::Unjoin { set, cs, since } => self.unjoin(*set, *cs, *since).map(|version| Answer::Set { version }),
+            Command::ReplicaBad { set, cs, version } => {
+                self.replica_bad(*set, *cs, *version).map(|version| Answer::Set { version })
+            }
+            Command::Snapshot { volume, name, generation } => {
+                self.snapshot(volume, name, *generation).map(|id| Answer::Volume { id })
+            }
+            Command::Freeze { name } => self.freeze(name).map(|id| Answer::Volume { id }),
+            Command::Clone { from, name, host } => self.clone_of(from, name, host).map(|id| Answer::Volume { id }),
+            Command::CopyUp { name, place, generation } => {
+                self.copy_up(name, *place, *generation).map(|(chunk, incarnation)| Answer::Chunk { chunk, incarnation })
+            }
+            Command::CopyDone { name, place, generation, chunk, incarnation } => {
+                self.copy_done(name, *place, *generation, (*chunk, *incarnation))
+                    .map(|(chunk, incarnation)| Answer::Chunk { chunk, incarnation })
             }
             /* The members' are lib.rs's */
             Command::Init { .. } | Command::Add { .. } | Command::Remove { .. } => Err(Refusal::Malformed),
@@ -288,7 +382,7 @@ impl State {
                     return Err(Refusal::TooMany);
                 }
                 let id = self.cs.len() as u32;
-                self.cs.push(Cs { id, host: String::from(host), devices: Vec::new(), reserved: 0 });
+                self.cs.push(Cs { id, host: String::from(host), devices: Vec::new(), reserved: 0, state: CsState::Up });
                 self.cs.len() - 1
             }
         };
@@ -388,7 +482,200 @@ impl State {
         for &chunk in v.map.iter() {
             self.release_chunk(chunk);
         }
+        self.give_up_copies(v.id);
         Ok(v.id)
+    }
+
+    /// A snapshot `name` of volume `volume`, at its writer's `generation` --
+    /// 0 for a volume with none (N10): its map copied, every chunk's count
+    /// up. Taken again of the same volume, answered as it is.
+    fn snapshot(&mut self, volume: &str, name: &str, generation: u64) -> Result<u32, Refusal> {
+        self.ready()?;
+        if !valid_volume(name) {
+            return Err(Refusal::BadVolume);
+        }
+        let v = self.volume(volume).ok_or(Refusal::NoSuchVolume)?;
+        if v.kind != Kind::Volume {
+            return Err(Refusal::ReadOnly);
+        }
+        if let Some(e) = self.volume(name) {
+            return if e.kind == Kind::Snapshot && e.origin == v.id { Ok(e.id) } else { Err(Refusal::NameTaken) };
+        }
+        /* The writer that paused for it: one that did not could have a write
+           on its way into a chunk the snapshot shares from now on */
+        if v.writer.as_ref().map_or(0, |w| w.generation) != generation {
+            return Err(Refusal::NotTheWriter);
+        }
+        let (origin, size_mib, host, map) = (v.id, v.size_mib, v.host.clone(), v.map.clone());
+        self.share(origin, name, size_mib, &host, map, Kind::Snapshot)
+    }
+
+    /// Volume `name` made an image (N10): read-only for good. Its copy-ups
+    /// pending given up -- no writer finishes one of an image's.
+    fn freeze(&mut self, name: &str) -> Result<u32, Refusal> {
+        self.ready()?;
+        let at = self.volume_at(name).ok_or(Refusal::NoSuchVolume)?;
+        let v = self.volumes.get(at).ok_or(Refusal::NoSuchVolume)?;
+        match v.kind {
+            Kind::Image => return Ok(v.id),
+            Kind::Snapshot => return Err(Refusal::ReadOnly),
+            Kind::Volume => {}
+        }
+        if v.writer.is_some() || !v.readers.is_empty() {
+            return Err(Refusal::Attached);
+        }
+        let id = v.id;
+        self.give_up_copies(id);
+        if let Some(v) = self.volumes.get_mut(at) {
+            v.kind = Kind::Image;
+        }
+        Ok(id)
+    }
+
+    /// Volume `name`, `host`'s own, a clone of image or snapshot `from`
+    /// (N10). Made again of the same origin, answered as it is.
+    fn clone_of(&mut self, from: &str, name: &str, host: &str) -> Result<u32, Refusal> {
+        self.ready()?;
+        if !valid_volume(name) {
+            return Err(Refusal::BadVolume);
+        }
+        self.member_host(host)?;
+        let v = self.volume(from).ok_or(Refusal::NoSuchVolume)?;
+        if v.kind == Kind::Volume {
+            return Err(Refusal::NotFrozen);
+        }
+        if let Some(e) = self.volume(name) {
+            return if e.kind == Kind::Volume && e.origin == v.id { Ok(e.id) } else { Err(Refusal::NameTaken) };
+        }
+        let (origin, size_mib, map) = (v.id, v.size_mib, v.map.clone());
+        self.share(origin, name, size_mib, host, map, Kind::Volume)
+    }
+
+    /// A volume `name` of kind `kind` made of `origin`'s, its map `map` --
+    /// every chunk of it counted once more -- and no room reserved: thin.
+    fn share(&mut self, origin: u32, name: &str, size_mib: u64, host: &str, map: Pieces<u32>, kind: Kind)
+        -> Result<u32, Refusal> {
+        if self.volumes.len() >= VOLUMES_MAX {
+            return Err(Refusal::TooMany);
+        }
+        /* A map names a chunk once at most, and a copy-up's new chunk is
+           named by none: no count passes the volumes there can be */
+        for &c in map.iter() {
+            if let Some(ch) = self.chunks.get_mut(c as usize) {
+                ch.count += 1;
+            }
+        }
+        let id = self.next_volume;
+        self.next_volume += 1;
+        self.volumes.push(Volume {
+            id,
+            name: String::from(name),
+            size_mib,
+            kind,
+            origin,
+            host: String::from(host),
+            generation: 0,
+            writer: None,
+            readers: Vec::new(),
+            map,
+        });
+        Ok(id)
+    }
+
+    /// A copy-up's first step (N10): chunk `place` of volume `name`'s map,
+    /// shared, given a new chunk in its set, pending -- its room taken on the
+    /// set's cs's, which copy it there locally (rule 7). Asked again, the
+    /// pending one; of a chunk shared no longer, the chunk itself.
+    fn copy_up(&mut self, name: &str, place: u32, generation: u64) -> Result<(u32, u32), Refusal> {
+        let (id, from) = self.writers_place(name, place, generation)?;
+        if let Some(&(to, _)) = self.copying.get(&(id, place)) {
+            return Ok((to, self.incarnation_of(to)));
+        }
+        let ch = *self.chunks.get(from as usize).ok_or(Refusal::NoSuchVolume)?;
+        if ch.count <= 1 {
+            return Ok((from, ch.incarnation));
+        }
+        /* None into a set being joined: a joiner lists what its source holds
+           once, and a new chunk behind its listing would never reach it -- the
+           writer asks again once the join is over */
+        if self.sets.get(ch.set as usize).is_some_and(|s| s.joiner.is_some()) {
+            return Err(Refusal::Joining);
+        }
+        /* Nor into one with a member drained: its devices take no new chunk,
+           and its place is to be joined by another cs -- asked again once that
+           is over */
+        if self.sets.get(ch.set as usize)
+            .is_some_and(|s| s.cs.iter().any(|&c| self.cs.get(c as usize).is_some_and(|c| c.draining())))
+        {
+            return Err(Refusal::Draining);
+        }
+        if self.copying.len() >= COPYING_MAX || self.live_chunks() >= CHUNKS_MAX as u64 {
+            return Err(Refusal::TooMany);
+        }
+        /* Thin: the room is taken now, where there is any -- a slot on each
+           of the set's cs's, the room kept to rebuild a host included */
+        let s = self.sets.get(ch.set as usize).ok_or(Refusal::NoSuchSet)?;
+        let (cs, joiner) = State::holders(s);
+        if cs.iter().chain(joiner.iter()).any(|&c| self.cs.get(c as usize).map_or(true, |c| c.free() == 0)) {
+            return Err(Refusal::NoRoom);
+        }
+        let to = self.new_chunk(ch.set);
+        self.copying.insert((id, place), (to, from));
+        Ok((to, self.incarnation_of(to)))
+    }
+
+    /// A copy-up's second step: the map names pending chunk `chunk` -- its
+    /// number and incarnation -- at `place`, the old one counted down. Done
+    /// where it names it already. A number alone would not do: a copy-up
+    /// given up and asked anew can be given the number it had, freed
+    /// (`Command::CopyDone`).
+    fn copy_done(&mut self, name: &str, place: u32, generation: u64, chunk: (u32, u32))
+                 -> Result<(u32, u32), Refusal> {
+        let (id, from) = self.writers_place(name, place, generation)?;
+        if (from, self.incarnation_of(from)) == chunk {
+            return Ok(chunk);
+        }
+        match self.copying.get(&(id, place)) {
+            Some(&(to, was)) if (to, self.incarnation_of(to)) == chunk && was == from => {}
+            _ => return Err(Refusal::Stale),
+        }
+        let chunk = chunk.0;
+        self.copying.remove(&(id, place));
+        let at = self.volume_at(name).ok_or(Refusal::NoSuchVolume)?;
+        if let Some(c) = self.volumes.get_mut(at).and_then(|v| v.map.get_mut(place as usize)) {
+            *c = chunk;
+        }
+        self.release_chunk(from);
+        Ok((chunk, self.incarnation_of(chunk)))
+    }
+
+    /// Volume `name`'s number and the chunk its map names at `place`, as its
+    /// writer at `generation` asks of it: a volume's, attached for writing
+    /// at that generation.
+    fn writers_place(&self, name: &str, place: u32, generation: u64) -> Result<(u32, u32), Refusal> {
+        self.ready()?;
+        let v = self.volume(name).ok_or(Refusal::NoSuchVolume)?;
+        if v.kind != Kind::Volume {
+            return Err(Refusal::ReadOnly);
+        }
+        if generation == 0 || v.writer.as_ref().map(|w| w.generation) != Some(generation) {
+            return Err(Refusal::NotTheWriter);
+        }
+        let from = *v.map.get(place as usize).ok_or(Refusal::BadVolume)?;
+        Ok((v.id, from))
+    }
+
+    fn incarnation_of(&self, chunk: u32) -> u32 {
+        self.chunks.get(chunk as usize).map_or(0, |c| c.incarnation)
+    }
+
+    /// Volume `id`'s copy-ups pending given up: their new chunks freed.
+    fn give_up_copies(&mut self, id: u32) {
+        let gone: Vec<u32> = self.copying.range((id, 0)..=(id, u32::MAX)).map(|(_, &(to, _))| to).collect();
+        self.copying.retain(|&(v, _), _| v != id);
+        for to in gone {
+            self.release_chunk(to);
+        }
     }
 
     fn attach(&mut self, name: &str, host: &str, writable: bool, force: bool, token: u64) -> Result<u64, Refusal> {
@@ -432,6 +719,25 @@ impl State {
         Ok(0)
     }
 
+    /// The writer's own attach anew (N10c2): a new generation, only where the
+    /// volume's writer is still `host`'s at `generation`; asked again by its
+    /// token, answered as it was.
+    fn reattach(&mut self, name: &str, host: &str, generation: u64, token: u64) -> Result<u64, Refusal> {
+        self.ready()?;
+        self.member_host(host)?;
+        let Some(at) = self.volume_at(name) else { return Err(Refusal::NoSuchVolume) };
+        let v = self.volumes.get_mut(at).ok_or(Refusal::NoSuchVolume)?;
+        if let Some(w) = v.writer.as_ref().filter(|w| token != 0 && w.token == token && w.host == host) {
+            return Ok(w.generation);
+        }
+        if generation == 0 || !v.writer.as_ref().is_some_and(|w| w.host == host && w.generation == generation) {
+            return Err(Refusal::NotTheWriter);
+        }
+        v.generation += 1;
+        v.writer = Some(Attach { host: String::from(host), generation: v.generation, token });
+        Ok(v.generation)
+    }
+
     fn detach(&mut self, name: &str, host: &str, generation: u64) -> Result<u64, Refusal> {
         self.ready()?;
         let Some(at) = self.volume_at(name) else { return Ok(0) };
@@ -466,20 +772,92 @@ impl State {
             return Err(Refusal::TooFewHosts);
         }
         let mut trial = placer.clone();
+        /* Every three cs's the picks take */
+        let mut used: BTreeSet<[u32; REPLICAS]> = BTreeSet::new();
         for k in 0..n {
-            trial.pick(volume, from + k).ok_or(Refusal::NoRoom)?;
+            used.insert(trial.pick(volume, from + k).ok_or(Refusal::NoRoom)?);
         }
         if !trial.leaves_rebuild_room() {
             return Err(Refusal::NoRoomToRebuild);
         }
+        /* Those of no clean set take a set each, and only those: a set made
+           again for them is none of the others' clean sets (`spare`), and
+           is clean for its own from then on */
+        let fresh = used.iter().filter(|&&cs| self.clean_set(cs).is_none()).count();
+        if fresh > self.sets_to_spare(&used) {
+            return Err(Refusal::TooMany);
+        }
         let mut real = placer;
         for k in 0..n {
-            /* The same picks as the trial's, which found room for every one */
+            /* The same picks as the trial's, which found room for every one,
+               and a set for each new three */
             let Some(cs) = real.pick(volume, from + k) else { unreachable!("a placement the trial made") };
-            let set = self.set_for(cs);
+            let Some(set) = self.set_for(cs, &used) else { unreachable!("a set the trial counted") };
             map.push(self.new_chunk(set));
         }
         Ok(())
+    }
+
+    /// Sets a placement onto the three cs's of `used` can have for those of
+    /// them with no clean set: the table's room left, and the empty sets it
+    /// may make again.
+    fn sets_to_spare(&self, used: &BTreeSet<[u32; REPLICAS]>) -> usize {
+        SETS_MAX.saturating_sub(self.sets.len()) + self.sets.iter().filter(|s| State::spare(s, used)).count()
+    }
+
+    /// Whether set `s` may be made again on other cs's by a placement onto
+    /// those of `used`: empty, no joiner, a version that can move on, and
+    /// not the clean set of three cs's the placement fills -- which, made
+    /// again for others, would leave those three to take a set of their own
+    /// that no count had for them.
+    fn spare(s: &Set, used: &BTreeSet<[u32; REPLICAS]>) -> bool {
+        s.chunks == 0 && s.joiner.is_none() && s.version < u32::MAX && !(State::is_clean(s) && used.contains(&s.cs))
+    }
+
+    /// Member `cs` of set `set` taken down as a person finds its copy bad
+    /// -- the scrub's finding (N9e) -- at `version`: down as a replica taken
+    /// out is, the set's version now. A set with a joiner is the copy's, a
+    /// member down already joins its place again, and the last active
+    /// member is never taken down.
+    fn replica_bad(&mut self, set: u32, cs: u32, version: u32) -> Result<u32, Refusal> {
+        let s = self.set_at(set, version)?;
+        let at = s.cs.iter().position(|&c| c == cs).ok_or(Refusal::NoSuchSet)?;
+        if s.replicas[at] == Replica::Down {
+            return Err(Refusal::AlreadyDown);
+        }
+        self.member_down(set, at)
+    }
+
+    /// Set `set` as a change planned at its `version` finds it: refused as
+    /// stale once the set has moved on, and while a join of it is under way.
+    fn set_at(&self, set: u32, version: u32) -> Result<&Set, Refusal> {
+        self.ready()?;
+        let s = self.sets.get(set as usize).ok_or(Refusal::NoSuchSet)?;
+        if s.version != version {
+            return Err(Refusal::Stale);
+        }
+        if s.joiner.is_some() {
+            return Err(Refusal::Joining);
+        }
+        Ok(s)
+    }
+
+    /// Member `at` of set `set` down -- never the set's last active member:
+    /// the version it was active until kept, and the set's raised by one,
+    /// what it is now answered.
+    fn member_down(&mut self, set: u32, at: usize) -> Result<u32, Refusal> {
+        let s = self.sets.get(set as usize).ok_or(Refusal::NoSuchSet)?;
+        if s.active() <= 1 {
+            return Err(Refusal::LastReplica);
+        }
+        let version = s.version.checked_add(1).ok_or(Refusal::TooMany)?;
+        self.unindex(set);
+        if let Some(s) = self.sets.get_mut(set as usize) {
+            s.replicas[at] = Replica::Down;
+            s.active_until[at] = s.version;
+            s.version = version;
+        }
+        Ok(version)
     }
 
     /// Replica `cs` of set `set` taken out: its version now. The set keeps
@@ -497,42 +875,286 @@ impl State {
         if !v.map.iter().any(|&c| self.chunks.get(c as usize).is_some_and(|ch| ch.set == set)) {
             return Err(Refusal::NoSuchSet);
         }
-        let s = self.sets.get_mut(set as usize).ok_or(Refusal::NoSuchSet)?;
+        let s = self.sets.get(set as usize).ok_or(Refusal::NoSuchSet)?;
+        /* The joiner silent to the writer: its join dropped, as its going
+           down would drop it -- the writer's writes go on to the members */
+        if let Some(j) = s.joiner.filter(|j| j.cs == cs) {
+            return self.unjoin(set, cs, j.since);
+        }
         let at = s.cs.iter().position(|&c| c == cs).ok_or(Refusal::NoSuchSet)?;
         if s.replicas[at] == Replica::Down {
             return Ok(s.version);
         }
-        if !s.replicas.iter().enumerate().any(|(i, r)| i != at && *r == Replica::Active) {
-            return Err(Refusal::LastReplica);
+        self.member_down(set, at)
+    }
+
+    /// cs `cs` down, or out (`to`): down in every set it is an active member
+    /// of but the last -- the version it was active at kept -- and dropped
+    /// as the joiner of any, its room for that given back; given no new
+    /// chunks. From up only: down to out changes no set, and out again or
+    /// down again nothing. How many sets changed.
+    fn cs_gone(&mut self, cs: u32, to: CsState) -> Result<u32, Refusal> {
+        self.ready()?;
+        let was = self.cs.get(cs as usize).ok_or(Refusal::NoSuchCs)?.state;
+        if was == to || was == CsState::Out {
+            return Ok(0);
         }
+        if was == CsState::Down {
+            if let Some(c) = self.cs.get_mut(cs as usize) {
+                c.state = to;
+            }
+            return Ok(0);
+        }
+        /* The sets it changes: those it is joining, and those it is an
+           active member of but not the last -- a set is never left with no
+           member active, and its writes go on at the one it has. Every
+           version to be raised checked first: a refusal half way would
+           leave half of the sets changed */
+        let touches = |s: &Set| {
+            s.joiner.is_some_and(|j| j.cs == cs)
+                || (s.active() > 1 && (0..REPLICAS).any(|k| s.cs[k] == cs && s.replicas[k] == Replica::Active))
+        };
+        if self.sets.iter().any(|s| touches(s) && s.version == u32::MAX) {
+            return Err(Refusal::TooMany);
+        }
+        let mut changed = 0u32;
+        let mut released = 0u64;
+        for id in 0..self.sets.len() as u32 {
+            let Some(s) = self.sets.get(id as usize) else { break };
+            if !touches(s) {
+                continue;
+            }
+            self.unindex(id);
+            let Some(s) = self.sets.get_mut(id as usize) else { break };
+            if let Some(j) = s.joiner.filter(|j| j.cs == cs) {
+                if s.cs[usize::from(j.place)] != cs {
+                    released += u64::from(s.chunks);
+                }
+                s.joiner = None;
+            }
+            /* `touches` has left out a set it is the last member active of */
+            for k in 0..REPLICAS {
+                if s.cs[k] == cs && s.replicas[k] == Replica::Active {
+                    s.replicas[k] = Replica::Down;
+                    s.active_until[k] = s.version;
+                }
+            }
+            s.version += 1;
+            changed += 1;
+            self.index(id);
+        }
+        if let Some(c) = self.cs.get_mut(cs as usize) {
+            c.state = to;
+            c.reserved -= released;
+        }
+        Ok(changed)
+    }
+
+    /// cs `cs` answering again: up, given new chunks. Its sets are as they
+    /// were: in one it is down in, it is back by joining it. Done again
+    /// where it is up.
+    fn cs_up(&mut self, cs: u32) -> Result<u32, Refusal> {
+        self.ready()?;
+        let c = self.cs.get(cs as usize).ok_or(Refusal::NoSuchCs)?;
+        if c.state == CsState::Up {
+            return Ok(0);
+        }
+        self.member_host(&c.host.clone())?;
+        if let Some(c) = self.cs.get_mut(cs as usize) {
+            c.state = CsState::Up;
+        }
+        Ok(0)
+    }
+
+    /// cs `cs` joining set `set`, planned at its `version`, to take member
+    /// `place`'s place once its copy is done: the member itself, down and
+    /// back -- its room its own already -- or another cs, with room for every
+    /// chunk of the set, in the place of a member down, out or drained.
+    fn join(&mut self, set: u32, place: u8, cs: u32, version: u32) -> Result<u32, Refusal> {
+        /* The set's copy-ups pending, given up as the join begins (N10): a
+           joiner lists what its source holds once, and a copy-up's new chunk
+           behind its listing would never reach it. Their writers ask again
+           once the join is over; what their cs's copied is garbage */
+        let pending: Vec<((u32, u32), u32)> = self.copying.iter()
+            .filter(|(_, &(to, _))| self.chunks.get(to as usize).is_some_and(|c| c.set == set))
+            .map(|(&at, &(to, _))| (at, to)).collect();
+        let s = self.set_at(set, version)?;
+        let k = usize::from(place);
+        if k >= REPLICAS {
+            return Err(Refusal::NoSuchSet);
+        }
+        let c = self.cs.get(cs as usize).ok_or(Refusal::NoSuchCs)?;
+        if c.state != CsState::Up {
+            return Err(Refusal::NotUp);
+        }
+        self.member_host(&c.host)?;
+        let member = s.cs[k];
+        let back = member == cs;
+        if back {
+            if s.replicas[k] != Replica::Down {
+                return Err(Refusal::NotDown);
+            }
+        } else {
+            if s.cs.contains(&cs) {
+                return Err(Refusal::AlreadyMember);
+            }
+            let m = self.cs.get(member as usize).ok_or(Refusal::NoSuchCs)?;
+            let gone = m.state == CsState::Out || self.member(&m.host).is_none();
+            if !(s.replicas[k] == Replica::Down && gone) && !m.draining() {
+                return Err(Refusal::InPlace);
+            }
+            if c.free() < u64::from(s.chunks) {
+                return Err(Refusal::NoRoom);
+            }
+        }
+        let since = version.checked_add(1).ok_or(Refusal::TooMany)?;
+        for (at, to) in pending {
+            self.copying.remove(&at);
+            self.release_chunk(to);
+        }
+        let chunks = self.sets.get(set as usize).map_or(0, |s| s.chunks);
+        self.unindex(set);
+        if let Some(s) = self.sets.get_mut(set as usize) {
+            s.joiner = Some(Joiner { cs, place, since });
+            s.version = since;
+        }
+        if !back {
+            if let Some(c) = self.cs.get_mut(cs as usize) {
+                c.reserved += u64::from(chunks);
+            }
+        }
+        Ok(since)
+    }
+
+    /// Set `set`'s join by `cs` of `since` done: the joiner the member in
+    /// its place, active, the room of the member it replaces given back,
+    /// the three in order again.
+    fn joined(&mut self, set: u32, cs: u32, since: u32) -> Result<u32, Refusal> {
+        self.ready()?;
+        let s = self.sets.get(set as usize).ok_or(Refusal::NoSuchSet)?;
+        let Some(j) = s.joiner.filter(|j| j.cs == cs && j.since == since) else { return Err(Refusal::Stale) };
         let version = s.version.checked_add(1).ok_or(Refusal::TooMany)?;
-        s.replicas[at] = Replica::Down;
-        s.version = version;
+        let k = usize::from(j.place);
+        let (old, chunks) = (s.cs[k], s.chunks);
+        let mut members: [(u32, Replica, u32); REPLICAS] = [(0, Replica::Active, 0); REPLICAS];
+        for (i, m) in members.iter_mut().enumerate() {
+            *m = if i == k { (cs, Replica::Active, 0) } else { (s.cs[i], s.replicas[i], s.active_until[i]) };
+        }
+        members.sort_unstable_by_key(|m| m.0);
+        self.unindex(set);
+        if let Some(s) = self.sets.get_mut(set as usize) {
+            for (i, m) in members.iter().enumerate() {
+                s.cs[i] = m.0;
+                s.replicas[i] = m.1;
+                s.active_until[i] = m.2;
+            }
+            s.joiner = None;
+            s.version = version;
+        }
+        if old != cs {
+            if let Some(c) = self.cs.get_mut(old as usize) {
+                c.reserved -= u64::from(chunks);
+            }
+        }
+        self.index(set);
         Ok(version)
     }
 
-    /// The set of cs's `cs`, made where there is none.
-    fn set_for(&mut self, cs: [u32; REPLICAS]) -> u32 {
-        if let Some(&id) = self.set_of.get(&cs) {
-            return id;
+    /// Set `set`'s join by `cs` of `since` given up: the room it took given
+    /// back.
+    fn unjoin(&mut self, set: u32, cs: u32, since: u32) -> Result<u32, Refusal> {
+        self.ready()?;
+        let s = self.sets.get(set as usize).ok_or(Refusal::NoSuchSet)?;
+        let Some(j) = s.joiner.filter(|j| j.cs == cs && j.since == since) else { return Err(Refusal::Stale) };
+        let version = s.version.checked_add(1).ok_or(Refusal::TooMany)?;
+        let elsewhere = s.cs[usize::from(j.place)] != cs;
+        let chunks = s.chunks;
+        if let Some(s) = self.sets.get_mut(set as usize) {
+            s.joiner = None;
+            s.version = version;
+        }
+        if elsewhere {
+            if let Some(c) = self.cs.get_mut(cs as usize) {
+                c.reserved -= u64::from(chunks);
+            }
+        }
+        self.index(set);
+        Ok(version)
+    }
+
+    /// The clean set of cs's `cs` -- every member active, no joiner -- where
+    /// new chunks on them go: the lowest-numbered.
+    pub(crate) fn clean_set(&self, cs: [u32; REPLICAS]) -> Option<u32> {
+        self.set_of.range((cs, 0)..=(cs, u32::MAX)).next().map(|&(_, id)| id)
+    }
+
+    /// Whether set `id` is clean: what placement puts new chunks into.
+    fn is_clean(s: &Set) -> bool {
+        s.joiner.is_none() && s.replicas.iter().all(|&r| r == Replica::Active)
+    }
+
+    /// Set `id` out of the index of clean sets: before it changes.
+    fn unindex(&mut self, id: u32) {
+        if let Some(s) = self.sets.get(id as usize) {
+            self.set_of.remove(&(s.cs, id));
+        }
+    }
+
+    /// Set `id` in the index of clean sets, where it is one: once it has
+    /// changed.
+    pub(crate) fn index(&mut self, id: u32) {
+        if let Some(s) = self.sets.get(id as usize).filter(|s| State::is_clean(s)) {
+            self.set_of.insert((s.cs, id));
+        }
+    }
+
+    /// The set new chunks on cs's `cs` go into, in a placement onto those of
+    /// `used`: their clean set; else the lowest-numbered spare one (`spare`),
+    /// made again on them -- its version moved on, so that no epoch of what
+    /// it was is one of what it is -- or a new one; None where the table is
+    /// full.
+    fn set_for(&mut self, cs: [u32; REPLICAS], used: &BTreeSet<[u32; REPLICAS]>) -> Option<u32> {
+        if let Some(id) = self.clean_set(cs) {
+            return Some(id);
+        }
+        let empty = self.sets.iter().position(|s| State::spare(s, used));
+        if let Some(at) = empty {
+            let id = at as u32;
+            self.unindex(id);
+            if let Some(s) = self.sets.get_mut(at) {
+                *s = Set { cs, replicas: [Replica::Active; REPLICAS], active_until: [0; REPLICAS], joiner: None,
+                           version: s.version + 1, chunks: 0 };
+            }
+            self.index(id);
+            return Some(id);
+        }
+        if self.sets.len() >= SETS_MAX {
+            return None;
         }
         let id = self.sets.len() as u32;
-        self.sets.push(Set { cs, replicas: [Replica::Active; REPLICAS], version: 1, chunks: 0 });
-        self.set_of.insert(cs, id);
-        id
+        self.sets.push(Set { cs, replicas: [Replica::Active; REPLICAS], active_until: [0; REPLICAS], joiner: None,
+                             version: 1, chunks: 0 });
+        self.index(id);
+        Some(id)
+    }
+
+    /// The cs's that hold room for every chunk of set `s`: its three, and a
+    /// joiner in another's place.
+    fn holders(s: &Set) -> ([u32; REPLICAS], Option<u32>) {
+        (s.cs, s.joiner.filter(|j| s.cs.get(usize::from(j.place)) != Some(&j.cs)).map(|j| j.cs))
     }
 
     /// A chunk in set `set`, counted once: off the free list where it has
     /// one.
     fn new_chunk(&mut self, set: u32) -> u32 {
-        let cs = match self.sets.get_mut(set as usize) {
+        let (cs, joiner) = match self.sets.get_mut(set as usize) {
             Some(s) => {
                 s.chunks += 1;
-                s.cs
+                State::holders(s)
             }
             None => unreachable!("a set made for it"),
         };
-        for c in cs {
+        for c in cs.into_iter().chain(joiner) {
             if let Some(c) = self.cs.get_mut(c as usize) {
                 c.reserved += 1;
             }
@@ -556,26 +1178,41 @@ impl State {
     /// One of chunk `id`'s counts given back: at none, the chunk freed --
     /// its slots given back on its set's cs's, the chunk onto the free list.
     fn release_chunk(&mut self, id: u32) {
+        let count = match self.chunks.get_mut(id as usize) {
+            Some(ch) if !ch.is_free() && ch.count > 0 => {
+                ch.count -= 1;
+                ch.count
+            }
+            _ => return,
+        };
+        if count > 0 {
+            /* Named by one map now: a copy-up pending of it has nothing to
+               copy for, and is given up -- one left would hand its new chunk,
+               copied as the old one was then, to a copy-up of the old one asked
+               after the place was written directly (N10) */
+            if count == 1 {
+                let gone: Vec<((u32, u32), u32)> = self.copying.iter().filter(|(_, &(_, from))| from == id)
+                    .map(|(&at, &(to, _))| (at, to)).collect();
+                for (at, to) in gone {
+                    self.copying.remove(&at);
+                    self.release_chunk(to);
+                }
+            }
+            return;
+        }
         let Some(ch) = self.chunks.get_mut(id as usize) else { return };
-        if ch.is_free() || ch.count == 0 {
-            return;
-        }
-        ch.count -= 1;
-        if ch.count > 0 {
-            return;
-        }
         let set = ch.set;
         *ch = Chunk { set: self.free_head, count: 0, flags: CHUNK_FREE, incarnation: ch.incarnation };
         self.free_head = id;
         self.free_count += 1;
-        let cs = match self.sets.get_mut(set as usize) {
+        let (cs, joiner) = match self.sets.get_mut(set as usize) {
             Some(s) => {
                 s.chunks -= 1;
-                s.cs
+                State::holders(s)
             }
             None => return,
         };
-        for c in cs {
+        for c in cs.into_iter().chain(joiner) {
             if let Some(c) = self.cs.get_mut(c as usize) {
                 c.reserved -= 1;
             }

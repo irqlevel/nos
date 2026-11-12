@@ -52,6 +52,7 @@ extern crate alloc;
 mod command;
 mod pieces;
 mod place;
+pub mod repair;
 mod snapshot;
 mod storage;
 
@@ -60,7 +61,7 @@ pub use pieces::{Pieces, PIECE};
 pub use snapshot::{Checks, Diverged, FrozenState};
 pub use storage::*;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -128,9 +129,13 @@ pub struct State {
     next_check: u64,
     /// The free list's first chunk, `NO_CHUNK` for none.
     free_head: u32,
+    /// The copy-ups pending (N10), by volume and place in its map: the new
+    /// chunk, and the old one the map names still.
+    copying: BTreeMap<(u32, u32), (u32, u32)>,
     /* Of the tables above, made again from them: never in a snapshot */
-    /// The set of three cs's, by them.
-    set_of: BTreeMap<[u32; REPLICAS], u32>,
+    /// The clean sets -- every member active, no joiner -- by their three
+    /// cs's and number: where new chunks on those three go, the lowest first.
+    set_of: BTreeSet<([u32; REPLICAS], u32)>,
     /// The free list's length.
     free_count: u32,
     /* This member's own: never in a snapshot, never compared */
@@ -151,7 +156,8 @@ impl Default for State {
             next_volume: 1,
             next_check: CHECK_EVERY,
             free_head: NO_CHUNK,
-            set_of: BTreeMap::new(),
+            copying: BTreeMap::new(),
+            set_of: BTreeSet::new(),
             free_count: 0,
             checks: Checks::default(),
         }
@@ -165,7 +171,7 @@ impl PartialEq for State {
         self.cluster == o.cluster && self.members == o.members && self.removed == o.removed && self.cs == o.cs
             && self.sets == o.sets && self.chunks == o.chunks && self.volumes == o.volumes
             && self.next_device == o.next_device && self.next_volume == o.next_volume
-            && self.next_check == o.next_check && self.free_head == o.free_head
+            && self.next_check == o.next_check && self.free_head == o.free_head && self.copying == o.copying
     }
 }
 
@@ -187,6 +193,12 @@ impl State {
 
     pub fn chunks(&self) -> &Pieces<Chunk> {
         &self.chunks
+    }
+
+    /// The copy-ups pending (N10): by volume and place, the new chunk and
+    /// the old one.
+    pub fn copying(&self) -> &BTreeMap<(u32, u32), (u32, u32)> {
+        &self.copying
     }
 
     pub fn volumes(&self) -> &Pieces<Volume> {
@@ -355,8 +367,8 @@ impl State {
     fn read<S: codec::Source>(r: &mut Stream<S>) -> Result<State, RestoreError> {
         let mut s = snapshot::read(r)?;
         s.free_count = s.chunks.iter().filter(|c| c.is_free()).count() as u32;
-        for (i, set) in s.sets.iter().enumerate() {
-            s.set_of.insert(set.cs, i as u32);
+        for id in 0..s.sets.len() as u32 {
+            s.index(id);
         }
         s.check()?;
         Ok(s)
@@ -423,7 +435,7 @@ impl StateMachine for State {
     fn size(&self) -> u64 {
         let maps: u64 = self.volumes.iter().map(|v| v.map.len() as u64 * 4 + 160).sum();
         let cs: u64 = self.cs.iter().map(|c| 80 + c.devices.len() as u64 * 80).sum();
-        128 + (self.members.len() + self.removed.len()) as u64 * 96 + cs + self.sets.len() as u64 * 23
+        128 + (self.members.len() + self.removed.len()) as u64 * 96 + cs + self.sets.len() as u64 * 45
             + self.chunks.len() as u64 * 11 + maps
     }
 

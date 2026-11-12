@@ -6,7 +6,10 @@
 //!   members), `cs` (each host's chunk server, its devices and room),
 //!   `volumes`, `volume` (one, and which hosts hold its replicas: where its
 //!   VM's reads stay local);
-//! - actions: `volume_create`, `volume_delete`, `volume_resize`.
+//! - actions: `volume_create`, `volume_delete`, `volume_resize`; and
+//!   `volume_snapshot` (an attached volume's asked on its writer's host),
+//!   `volume_freeze` (an image), `volume_clone` (of an image or a snapshot)
+//!   -- N10d.
 //!
 //! Its changes can be asked again with the same result, as an automation that
 //! retries needs: a volume made again by its name and size is answered as it
@@ -15,9 +18,9 @@
 
 use alloc::sync::Arc;
 
-use kcore::mgmt::{Call, Kind, Method, Provider, Status, Writer};
+use kcore::mgmt::{Call, Kind as MethodKind, Method, Provider, Status, Writer};
 use mgmtwire::{Invalid, Params, Value};
-use nbsmeta::{Refusal, Volume, VOLUME_MIB_MAX, VOLUME_NAME_MAX};
+use nbsmeta::{Kind, Refusal, Volume, VOLUME_MIB_MAX, VOLUME_NAME_MAX};
 use raft::Role;
 
 use crate::store::{self, Failure};
@@ -25,15 +28,18 @@ use crate::{member_view, view, ModState};
 
 const DESCRIPTOR: &str = include_str!("nbs.descriptor.json");
 
-const METHODS: [Method; 8] = [
-    Method { name: "status", kind: Kind::Read },
-    Method { name: "hosts", kind: Kind::Read },
-    Method { name: "cs", kind: Kind::Read },
-    Method { name: "volumes", kind: Kind::Read },
-    Method { name: "volume", kind: Kind::Read },
-    Method { name: "volume_create", kind: Kind::Action },
-    Method { name: "volume_delete", kind: Kind::Action },
-    Method { name: "volume_resize", kind: Kind::Action },
+const METHODS: [Method; 11] = [
+    Method { name: "status", kind: MethodKind::Read },
+    Method { name: "hosts", kind: MethodKind::Read },
+    Method { name: "cs", kind: MethodKind::Read },
+    Method { name: "volumes", kind: MethodKind::Read },
+    Method { name: "volume", kind: MethodKind::Read },
+    Method { name: "volume_create", kind: MethodKind::Action },
+    Method { name: "volume_delete", kind: MethodKind::Action },
+    Method { name: "volume_resize", kind: MethodKind::Action },
+    Method { name: "volume_snapshot", kind: MethodKind::Action },
+    Method { name: "volume_freeze", kind: MethodKind::Action },
+    Method { name: "volume_clone", kind: MethodKind::Action },
 ];
 
 const HOST_MAX: usize = 63;
@@ -60,8 +66,12 @@ fn failed(call: &mut Call, f: Failure) -> Status {
         Failure::Refused(Refusal::NoSuchVolume | Refusal::NoSuchDevice | Refusal::NotAMember) => Status::NotFound,
         Failure::Refused(Refusal::BadVolume | Refusal::Shrink | Refusal::BadDevice) => Status::Invalid,
         Failure::Refused(Refusal::NameTaken | Refusal::Attached | Refusal::AttachedElsewhere
-                         | Refusal::ReadersAttached | Refusal::Writing | Refusal::ReadOnly) => Status::Conflict,
+                         | Refusal::ReadersAttached | Refusal::Writing | Refusal::ReadOnly | Refusal::NotFrozen
+                         | Refusal::NotTheWriter) => Status::Conflict,
         Failure::Other(why) if why.starts_with("this host is in no NBS cluster") => Status::Conflict,
+        /* A snapshot of a volume attached elsewhere: asked on its writer's
+           host, where it can be paused (member.rs's `take`) */
+        Failure::Other(why) if why.contains(" is attached on host ") => Status::Conflict,
         _ => Status::Failed,
     };
     refuse(call, status, &f.says(), None)
@@ -93,6 +103,9 @@ fn provide(state: &ModState, method: &str, params: &[u8], call: &mut Call) -> St
         "volume_create" => volume_create(state, p, call),
         "volume_delete" => volume_delete(state, p, call),
         "volume_resize" => volume_resize(state, p, call),
+        "volume_snapshot" => volume_snapshot(state, p, call),
+        "volume_freeze" => volume_freeze(state, p, call),
+        "volume_clone" => volume_clone(state, p, call),
         _ => Status::NoMethod,
     }
 }
@@ -233,6 +246,18 @@ fn volume_json(w: &mut Writer, s: &nbsmeta::State, v: &Volume, hosts: bool) {
     w.begin_object();
     w.field_str("name", &v.name);
     w.field_uint("volume", u64::from(v.id));
+    /* What it is (N10d): a volume, an image, a snapshot -- and what it was
+       made of, by name while that is there */
+    w.field_str("kind", match v.kind {
+        Kind::Volume => "volume",
+        Kind::Image => "image",
+        Kind::Snapshot => "snapshot",
+    });
+    w.key("origin");
+    match s.volumes().iter().find(|o| v.origin != 0 && o.id == v.origin) {
+        Some(o) => w.str(&o.name),
+        None => w.null(),
+    }
     w.field_uint("size", v.size_mib << 20);
     w.field_uint("chunks", v.map.len() as u64);
     w.field_str("host", &v.host);
@@ -372,4 +397,78 @@ fn volume_resize(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status
         }),
         Err(f) => failed(call, f),
     }
+}
+
+/// A volume's name given under `field`, held to what a name may be.
+fn volume_param<'a>(p: &mut Params<'a>, call: &mut Call, field: &'static str) -> Result<&'a str, Status> {
+    let name = p.str(field, VOLUME_NAME_MAX).map_err(|e| invalid(call, e))?;
+    if !nbsmeta::valid_volume(name) {
+        return Err(refuse(call, Status::Invalid, "lowercase letters, digits, . _ and -, up to 63", Some(field)));
+    }
+    Ok(name)
+}
+
+/// The volume made, answered by its number.
+fn made(call: &mut Call, got: Result<u32, Failure>) -> Status {
+    match got {
+        Ok(id) => answer(call, |w| {
+            w.begin_object();
+            w.field_uint("volume", u64::from(id));
+            w.end_object();
+        }),
+        Err(f) => failed(call, f),
+    }
+}
+
+/// A snapshot `name` of volume `volume` (N10d): attached, asked on its
+/// writer's host -- this call's -- which pauses it; detached, taken as it
+/// is. Asked again of the same volume, answered as it is.
+fn volume_snapshot(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status {
+    let volume = match volume_param(&mut p, call, "volume") {
+        Ok(n) => n,
+        Err(s) => return s,
+    };
+    let name = match name_param(&mut p, call) {
+        Ok(n) => n,
+        Err(s) => return s,
+    };
+    if let Err(e) = p.finish() {
+        return invalid(call, e);
+    }
+    made(call, crate::io::snapshot(state, volume, name))
+}
+
+/// Volume `name` made an image (N10d): read-only for good -- refused while
+/// attached. Asked again, answered as it is.
+fn volume_freeze(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status {
+    let name = match name_param(&mut p, call) {
+        Ok(n) => n,
+        Err(s) => return s,
+    };
+    if let Err(e) = p.finish() {
+        return invalid(call, e);
+    }
+    made(call, store::volume_freeze(state, name))
+}
+
+/// A volume `name` cloned from image or snapshot `from` (N10d), its own
+/// host `host` -- this one where none is given. Made again of the same
+/// origin, answered as it is.
+fn volume_clone(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status {
+    let from = match volume_param(&mut p, call, "from") {
+        Ok(n) => n,
+        Err(s) => return s,
+    };
+    let name = match name_param(&mut p, call) {
+        Ok(n) => n,
+        Err(s) => return s,
+    };
+    let host = match p.opt_str("host", HOST_MAX) {
+        Ok(h) => h,
+        Err(e) => return invalid(call, e),
+    };
+    if let Err(e) = p.finish() {
+        return invalid(call, e);
+    }
+    made(call, store::volume_clone(state, from, name, host))
 }

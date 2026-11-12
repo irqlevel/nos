@@ -7,7 +7,7 @@
 //! them is (nbsmeta).
 //!
 //!     insmod /lib/modules/ipcnet.ko, then cluster.ko: the hosts that trust each other
-//!     insmod /lib/modules/nbs-mds.ko [dir=/nbs/mds] [compact=<bytes>]
+//!     insmod /lib/modules/nbs-mds.ko [dir=/nbs/mds] [compact=<bytes>] [out_after=<seconds>] [scrub=<seconds>]
 //!     nbs init <name>            on the first host: an NBS cluster of it alone
 //!     nbs host add <host>        on a member: <host> -- a host of the registry -- a member
 //!     nbs host remove <host>     on a member: <host>'s member out, for good
@@ -16,6 +16,7 @@
 //!     nbs                        this host's member: role, term, leader, what it applied
 //!     nbs devices add <id|name> [wipe]   a device of this host's for its chunk server
 //!     nbs devices drain <id>     given no new chunks
+//!     nbs replica bad <set> <host>   <host>'s cs taken down in <set>, for its join back to copy it again
 //!     nbs cs                     every host's chunk server: its devices and room
 //!     nbs volume create <name> <size> [host=<h>], delete <name>, resize <name> <size>
 //!     nbs volumes, nbs volume <name>
@@ -32,6 +33,13 @@
 //! be more: raft's 1 MiB unless given. A test gives it a few, so that a
 //! member started again reads its state back from a snapshot, and a member
 //! added is sent one.
+//!
+//! `scrub=` is the leader's scrub's pace (N9e): a chunk every so many
+//! seconds, ten unless given, 0 for none -- each look reads the chunk whole on
+//! its set's every member it is closed on. What it finds it says, in the log
+//! and in `nbs status`, and takes nothing down: no checksum of its own data
+//! does a cs keep, and two members alike are no proof which one holds the
+//! data. `nbs replica bad` is a person's.
 //!
 //! Who the members are is two things (plans/nbs.md, "Who is in the cluster"):
 //! the hosts that may talk at all are the cluster registry's, ipcnet pinning
@@ -93,12 +101,18 @@ const USAGE: &str = "usage: nbs                          this host's member: inc
                      with wipe,\n\
                      \x20                                 even one with something else on it\n\
                      \x20      nbs devices drain <id>     given no new chunks\n\
+                     \x20      nbs replica bad <set> <host>   <host>'s cs taken down in <set>, to copy its chunks \
+                     again\n\
+                     \x20                                 -- the member the scrub found unlike the two others\n\
                      \x20      nbs cs                     every host's chunk server: its devices and room\n\
                      \x20      nbs volumes                every volume\n\
                      \x20      nbs volume <name>          one, and which hosts hold its replicas\n\
                      \x20      nbs volume create <name> <size> [host=<host>]   size in MiB, or with M, G, T\n\
                      \x20      nbs volume delete <name>\n\
                      \x20      nbs volume resize <name> <size>\n\
+                     \x20      nbs volume snapshot <volume> <name>   on the host it is attached on, its writer paused\n\
+                     \x20      nbs volume freeze <name>   an image: read-only for good, cloned from\n\
+                     \x20      nbs volume clone <image|snapshot> <name> [host=<host>]   a volume of its, thin\n\
                      \x20      nbs io write <volume> <offset> <bytes> <byte>   through the cs's; read <volume> \
                      <offset> <bytes>,\n\
                      \x20                                 attach <volume> [force], flush, close, held and detach \
@@ -117,6 +131,9 @@ const NO_MEMBER_EVERY_NS: u64 = 5_000_000_000;
 /// How long a change applied is waited for in the member's view.
 const VIEW_WAIT_MS: u64 = 5000;
 const NS_PER_MS: u64 = 1_000_000;
+/// The leader's scrub's pace unless `scrub=` is given: a chunk every ten
+/// seconds, which reads it whole on each of its set's members (N9e).
+const SCRUB_MS: u64 = 10_000;
 
 /// The module's: its folder, the member while there is one, the listener
 /// while there is not.
@@ -124,6 +141,14 @@ struct ModState {
     dir: String,
     /// The log's bytes past its snapshot before it is compacted: `compact=`.
     compact: u64,
+    /// How long a cs is silent before the leader's controller has it out
+    /// and its places taken by others: `out_after=`, ten minutes unless
+    /// given (N9c).
+    out_after_ms: u64,
+    /// The leader's scrub's pace, a chunk every so long: `scrub=`, ten
+    /// seconds unless given, 0 for none (N9e); and what it found.
+    scrub_ms: u64,
+    scrubbed: member::Scrubbed,
     shared: Arc<Shared>,
     lost: Lost,
     task: Locked<Option<TaskHandle>>,
@@ -194,15 +219,24 @@ fn stop_idle(state: &ModState) {
 fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn kmod::Module>> {
     let mut dir = None;
     let mut compact = None;
+    let mut out_after = None;
+    let mut scrub = None;
     for (key, value) in params.words() {
         match (key, value) {
             ("dir", Some(path)) if dir.is_none() && path.starts_with('/') && path.len() < 200 => dir = Some(path),
             ("compact", Some(bytes)) if compact.is_none() && bytes.parse::<u64>().is_ok() => {
                 compact = bytes.parse::<u64>().ok();
             }
+            ("out_after", Some(secs)) if out_after.is_none() && secs.parse::<u64>().is_ok_and(|s| (10..=86_400).contains(&s)) => {
+                out_after = secs.parse::<u64>().ok();
+            }
+            ("scrub", Some(secs)) if scrub.is_none() && secs.parse::<u64>().is_ok_and(|s| s <= 86_400) => {
+                scrub = secs.parse::<u64>().ok();
+            }
             _ => {
-                let _ = writeln!(out, "nbs: \"{}\" is not a parameter of nbs-mds's -- dir=<folder> and \
-                                       compact=<bytes> are, each given once", key);
+                let _ = writeln!(out, "nbs: \"{}\" is not a parameter of nbs-mds's -- dir=<folder>, \
+                                       compact=<bytes>, out_after=<seconds, 10 to 86400> and scrub=<seconds a chunk, \
+                                       0 for none, to 86400> are, each given once", key);
                 return Err(Error::InvalidValue);
             }
         }
@@ -210,6 +244,9 @@ fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn
     let state = Arc::new(ModState {
         dir: String::from(dir.unwrap_or(files::DEFAULT_DIR).trim_end_matches('/')),
         compact: compact.unwrap_or(raft::rsm::SNAPSHOT_FLOOR),
+        out_after_ms: out_after.map_or(nbsmeta::repair::OUT_AFTER_MS, |s| s * 1000),
+        scrub_ms: scrub.map_or(SCRUB_MS, |s| s * 1000),
+        scrubbed: Arc::new(Locked::new(member::Scrubs::default()).ok_or(Error::NoMemory)?),
         shared: Arc::new(Shared::new().ok_or(Error::NoMemory)?),
         lost: Arc::new(Locked::new(BTreeMap::new()).ok_or(Error::NoMemory)?),
         task: Locked::new(None).ok_or(Error::NoMemory)?,
@@ -270,7 +307,8 @@ fn start(state: &ModState, me: files::Member, fresh: bool) -> Result<(), String>
         /* Its group's one voter: leading at once rather than at a timeout */
         let _ = rsm.campaign();
     }
-    let member = member::new(rsm, me, state.lost.clone(), &state.dir)?;
+    let member = member::new(rsm, me, state.lost.clone(), &state.dir, state.out_after_ms, state.scrub_ms,
+                             state.scrubbed.clone())?;
     state.shared.stop.store(false, Ordering::Release);
     /* Shown before the task's first turn, so that a command right after
        this one finds the member */
@@ -565,6 +603,13 @@ fn run(state: &Arc<ModState>, args: &str, out: &mut Output) -> Result<(), String
                              id, if wiped { ", its first pages wiped" } else { "" });
             Ok(())
         }
+        ["replica", "bad", set, host] => {
+            let set = set.parse::<u32>().map_err(|_| alloc::format!("\"{}\" is no set's number", set))?;
+            let version = store::replica_bad(state, set, host).map_err(|f| f.says())?;
+            let _ = writeln!(out, "nbs: {}'s cs taken down in set {} (now at version {}): it joins its own place \
+                                   again, its copy held to another member's by sums", host, set, version);
+            Ok(())
+        }
         ["devices", "drain", ident] => {
             let id = store::device_drain(state, ident).map_err(|f| f.says())?;
             let _ = writeln!(out, "nbs: device {} ({}) takes no new chunks", ident, id);
@@ -605,6 +650,26 @@ fn run(state: &Arc<ModState>, args: &str, out: &mut Output) -> Result<(), String
             let size_mib = store::parse_size(size).ok_or_else(|| alloc::format!("\"{}\" is not a size", size))?;
             let id = store::volume_resize(state, name, size_mib).map_err(|f| f.says())?;
             let _ = writeln!(out, "nbs: volume {} ({}) is {} now", name, id, store::Mib(size_mib));
+            Ok(())
+        }
+        ["volume", "snapshot", volume, name] => {
+            let id = io::snapshot(state, volume, name).map_err(|f| f.says())?;
+            let _ = writeln!(out, "nbs: snapshot {} ({}) of volume {}", name, id, volume);
+            Ok(())
+        }
+        ["volume", "freeze", name] => {
+            let id = store::volume_freeze(state, name).map_err(|f| f.says())?;
+            let _ = writeln!(out, "nbs: volume {} ({}) is an image now: read-only for good, cloned from", name, id);
+            Ok(())
+        }
+        ["volume", "clone", from, name, rest @ ..] => {
+            let host = match rest {
+                [] => None,
+                [h] => Some(h.strip_prefix("host=").ok_or_else(|| String::from(USAGE))?),
+                _ => return Err(String::from(USAGE)),
+            };
+            let id = store::volume_clone(state, from, name, host).map_err(|f| f.says())?;
+            let _ = writeln!(out, "nbs: volume {} ({}), a clone of {}", name, id, from);
             Ok(())
         }
         ["volume", name] => store::show_volume(&member_view(state)?, name, out),
@@ -687,6 +752,46 @@ fn status(state: &ModState, out: &mut Output) -> Result<(), String> {
                            learners, {} messages refused", name, id, v.node, role_name(v.role), v.term, leader,
                      v.applied, v.state.members().len(), v.membership.voters.len(), v.membership.learners.len(),
                      v.refused);
+    /* How far from three the chunks are (N9) */
+    let h = nbsmeta::repair::health(&v.state);
+    let joins = v.state.sets().iter().filter(|s| s.joiner.is_some()).count();
+    let _ = writeln!(out, "nbs: chunks at three replicas {}, at two {}, at one {} -- {} being copied, by {} joins; \
+                           cs's down {}, out {}", h.by_active[3], h.by_active[2], h.by_active[1], h.joining, joins,
+                     h.down, h.out);
+    /* The scrub's, as this host's member led it (N9e) */
+    let (stats, found) = state.scrubbed.with(|x| (x.stats, x.found.clone()));
+    if state.scrub_ms == 0 {
+        let _ = writeln!(out, "nbs: no scrub here (scrub=0)");
+    } else {
+        let _ = writeln!(out, "nbs: the scrub, a chunk every {} s as this host's member leads: {} alike, {} held by none, \
+                               {} let be, {} unlike -- {} with a member unlike the two others", state.scrub_ms / 1000,
+                         stats.alike, stats.empty, stats.skipped, stats.odd + stats.differ, stats.odd);
+    }
+    for (chunk, set, version, odd) in found {
+        let who = odd.and_then(|cs| v.state.cs().get(cs as usize)).map(|c| c.host.as_str());
+        /* A finding of a set that has moved on since -- the member taken
+           down, joined back -- is history, and says so */
+        let now = v.state.sets().get(set as usize).map(|s| s.version).filter(|&now| now != version);
+        match (who, now) {
+            (Some(host), None) => {
+                let _ = writeln!(out, "nbs: scrub: chunk {} of set {} (version {}): {}'s copy is unlike the two others' \
+                                       -- `nbs replica bad {} {}` has it copied again", chunk, set, version, host, set,
+                                 host);
+            }
+            (Some(host), Some(now)) => {
+                let _ = writeln!(out, "nbs: scrub: chunk {} of set {} (version {}): {}'s copy was unlike the two \
+                                       others' -- the set is at version {} now", chunk, set, version, host, now);
+            }
+            (None, None) => {
+                let _ = writeln!(out, "nbs: scrub: chunk {} of set {} (version {}): its members' copies differ, no two \
+                                       alike", chunk, set, version);
+            }
+            (None, Some(now)) => {
+                let _ = writeln!(out, "nbs: scrub: chunk {} of set {} (version {}): its members' copies differed, no \
+                                       two alike -- the set is at version {} now", chunk, set, version, now);
+            }
+        }
+    }
     match v.state.checks().latest() {
         Some((at, d)) => {
             let _ = writeln!(out, "nbs: the state's digest at entry {}: {}... -- {} of the leader's held to it, {} \

@@ -68,6 +68,8 @@ pub(crate) const CREATE_USAGE: &str = "hv create <name> <kernel> [mem=MiB] [cpus
                             [cmdline=...]\n\
                             hv create <name> <http(s)://image> [size=N[K|M|G|T] | onto=<device|nbs:volume>] [password=...] \
                             [hvboot=path] [force] [the words hv start takes, but a kernel and initrd=]\n\
+                            hv create <name> image=nbs:<image> [size=N[K|M|G|T]] [onto=nbs:<volume>] [password=...] \
+                            [hvboot=path] [the words hv start takes, but a kernel and initrd=]\n\
                             a device is a partition or a whole disk of nos's: dev:<name>, part:<id> or disk:<id> \
                             (hv devices); force gives one over what is on it";
 
@@ -379,9 +381,10 @@ pub fn create(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
         return;
     };
     let rest = rest.as_str();
-    /* A cloud's image, by its URL: downloaded, made a disk, given a seed. */
+    /* A cloud's image, by its URL: downloaded, made a disk, given a seed --
+     * or an image of NBS's (N10d3), cloned into the VM's own volume. */
     let first = rest.split_ascii_whitespace().next().unwrap_or("");
-    if crate::cloud::is_url(first) {
+    if crate::cloud::is_url(first) || crate::cloud::is_image(first) {
         crate::cloud::command(root, vms, name, first, rest[first.len()..].trim_start(), force, work);
         return;
     }

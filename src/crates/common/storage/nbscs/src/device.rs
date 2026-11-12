@@ -6,6 +6,11 @@
 //! A write may sit in the device's cache until a flush: only a flush makes
 //! what was written before it durable. A write is torn, if at all, at its
 //! sectors' edges: a sector is the device's unit of writing.
+//!
+//! Each request is a future (N12): one that answers at once is ready at its
+//! first poll; one whose device answers later is pending until it has.
+
+use core::future::Future;
 
 /// A request the device could not do: the engine takes the device to have
 /// failed.
@@ -18,23 +23,25 @@ pub trait Device {
     /// The sector, in bytes: 512 or 4096.
     fn sector(&self) -> u64;
     /// `buf.len()` bytes from `offset`: whole sectors.
-    fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), IoError>;
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> impl Future<Output = Result<(), IoError>> + 'a;
     /// `data` at `offset`: whole sectors.
-    fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), IoError>;
+    fn write<'a>(&'a self, offset: u64, data: &'a [u8]) -> impl Future<Output = Result<(), IoError>> + 'a;
     /// What was written before it, durable.
-    fn flush(&mut self) -> Result<(), IoError>;
+    fn flush(&self) -> impl Future<Output = Result<(), IoError>> + '_;
     /// Zeros over `len` bytes from `offset`, as a write is -- the device's
     /// own command where it has one.
-    fn zero(&mut self, offset: u64, len: u64) -> Result<(), IoError> {
-        /* Off the heap: a kernel task's stack is no place for it */
-        const BLOCK: usize = 64 * 1024;
-        let zeros = alloc::vec![0u8; BLOCK];
-        let mut at = 0u64;
-        while at < len {
-            let n = (len - at).min(BLOCK as u64) as usize;
-            self.write(offset + at, &zeros[..n])?;
-            at += n as u64;
+    fn zero(&self, offset: u64, len: u64) -> impl Future<Output = Result<(), IoError>> + '_ {
+        async move {
+            /* Off the heap: a kernel task's stack is no place for it */
+            const BLOCK: usize = 64 * 1024;
+            let zeros = alloc::vec![0u8; BLOCK];
+            let mut at = 0u64;
+            while at < len {
+                let n = (len - at).min(BLOCK as u64) as usize;
+                self.write(offset + at, &zeros[..n]).await?;
+                at += n as u64;
+            }
+            Ok(())
         }
-        Ok(())
     }
 }

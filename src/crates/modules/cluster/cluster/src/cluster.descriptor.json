@@ -30,6 +30,14 @@
       "params": {
         "host": {"type": "string", "required": true, "title": {"en": "Host", "ru": "Хост"}},
         "ip": {"type": "ipv4", "required": true, "title": {"en": "Its address", "ru": "Его адрес"}},
+        "port": {
+          "type": "port",
+          "title": {"en": "Its port", "ru": "Его порт"},
+          "help": {
+            "en": "Where its ipcnet listens, if not where this host's does: one of two hosts behind a NAT's address.",
+            "ru": "Где слушает его ipcnet, если не там же, где у этого хоста: один из двух хостов за адресом NAT."
+          }
+        },
         "key": {
           "type": "string",
           "required": true,
@@ -95,7 +103,8 @@
             "public": {"en": "the world reaches it", "ru": "доступен снаружи"}
           }
         },
-        "ip": {"type": "ipv4", "title": {"en": "Address", "ru": "Адрес"}}
+        "ip": {"type": "ipv4", "title": {"en": "Address", "ru": "Адрес"}},
+        "port": {"type": "port", "title": {"en": "Port", "ru": "Порт"}}
       }
     },
     "rekey": {
@@ -127,6 +136,7 @@
         },
         "leader": {"type": "bool", "title": {"en": "Leads", "ru": "Лидер"}},
         "ip": {"type": "ipv4", "title": {"en": "Address", "ru": "Адрес"}},
+        "port": {"type": "port", "title": {"en": "Port", "ru": "Порт"}},
         "underlay": {"type": "ipv4", "title": {"en": "Underlay", "ru": "Подложка"}},
         "public": {"type": "ipv4", "title": {"en": "Public address", "ru": "Внешний адрес"}},
         "maintenance": {"type": "bool", "title": {"en": "Maintenance", "ru": "Обслуживание"}},
@@ -146,6 +156,7 @@
       "fields": {
         "host": {"type": "string", "title": {"en": "Host", "ru": "Хост"}},
         "ip": {"type": "ipv4", "title": {"en": "From", "ru": "Откуда"}},
+        "port": {"type": "port", "title": {"en": "Port", "ru": "Порт"}},
         "expires_s": {"type": "time_s", "title": {"en": "Until", "ru": "До"}}
       },
       "columns": ["host", "ip", "expires_s"],

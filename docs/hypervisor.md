@@ -2032,8 +2032,9 @@ a device disk and a file disk share the disk task's loop
 `unsafe` of its own for either. A request longer than the device takes at
 once is split into the commands it can take and given back when the last
 is done; a device busy with nos's own I/O is waited for as an image waits
-for it; and a device without the asynchronous path -- virtio-blk and
-virtio-scsi in nos -- is served a page at a time on the spot. What the
+for it; and a device without the asynchronous path -- virtio-scsi in
+nos, and virtio-blk polled before its interrupt is in place -- is served a
+page at a time on the spot. What the
 guest's device offers follows the backend: discard where the device can
 give blocks back -- an NVMe whose controller has Dataset Management (ONCS
 bit 2), which nos now sends -- and not on a read-only disk; no write of
@@ -2991,6 +2992,61 @@ root grown into the 4 GiB disk, and cloud-init done from `DataSourceNoCloud
 [seed=/dev/vdb]` 50 s after the VM started -- its user logged in with the
 seed's password, nos's key in its authorized_keys.
 
+### A VM of an image of NBS's
+
+Where the hosts are an NBS cluster ([NBS](nbs.md)), a cloud's image is
+made an image of NBS's once -- read-only for good, on three hosts' chunk
+servers -- and a VM of it on any of them is given a clone, thin: each of
+its chunks the image's until the VM writes it (N10d3,
+`modules/hypervisor/hv/src/{image,cloud,nbs}.rs`):
+
+```
+$ hv image img /boot.raw
+hv: /boot.raw: raw, a disk of 32 MiB -- onto nbs:img, 32 MiB, fresh: its zeros left out
+hv: nbs:img: 32 MiB written in 0.3 s, flushed and let go of
+hv: nbs:img is an image now, 32 MiB, read-only for good -- hv create <vm> image=nbs:img makes a vm of a clone of it
+$ hv create v1 image=nbs:img size=64M mem=256
+hv: nbs:v1 cloned from nbs:img, 64 MiB -- thin: its chunks copied as they are written
+hv: /vms/v1/vm.toml written -- hv start v1 boots it: hvboot, a 64 MiB disk, cloud-init given 0 keys
+hv: no key in /etc/ssh/authorized_keys and no password= -- nobody can log in to it
+$ hv start v1
+```
+
+- **`hv image <name> <file|url>`** takes a qcow2 image or a raw disk, a
+  URL's downloaded first into the vms' folder (`.image-<name>`, removed
+  after, however it ends): a volume of the disk's size made on this host,
+  the image poured onto it as `hv convert ... nbs:` pours one -- its zeros
+  left out, a new volume reading as zeros -- and the volume frozen. The
+  name is held on the host while it is made, and refused where NBS has a
+  volume of it; one that fails leaves nothing -- the volume deleted while
+  it is a volume still and this host's, so an image another host made of
+  the name meanwhile is never taken away.
+- **`hv create <vm> image=nbs:<image> [size=N] [onto=nbs:<volume>]
+  [words]`** makes the VM as `hv create <vm> <url>` does -- a seed for
+  cloud-init, a vm.toml booting it by hvboot -- its first disk
+  `nbs:<volume>`, a clone of the image: of the VM's name, or `onto=`'s,
+  which NBS must not have yet; grown to `size=`, never under the image's.
+  A plain volume is refused -- a VM is made of an image or a snapshot --
+  and a clone made is deleted with the rest of what was made when a later
+  step fails.
+- hv asks NBS through the management bus, as the host API does: nbs-mds's
+  `nbs` provider (`volume`, `volume_create`, `volume_resize`,
+  `volume_freeze`, `volume_clone`, `volume_delete`), so hv.ko links nothing
+  of nbs-mds's; without it both commands say to `insmod /nbs-mds.ko`, before
+  anything is downloaded.
+- A volume is a disk of 4 KiB blocks, which hv's device says to its driver
+  (`F_BLK_SIZE`) and holds every request to; hvboot reads such a disk in
+  whole blocks, the parts at either end of a read through a block's buffer
+  of its own -- its partition tables and superblocks are reads of 512 and
+  1024 bytes.
+
+What it does not do yet: `hv delete` leaves the VM's clone, as it leaves
+any `nbs:` disk -- `nbs volume delete` takes it away -- and the host API's
+`create` takes a URL alone. `scripts/hv-nbs-test.py` makes an image of a
+disk hvboot boots and two VMs of it on two hosts, each booted by its name
+off a clone of its own, one written over a chunk the image shares and the
+other still the image's ([Testing](testing.md)).
+
 ### Cloned, deleted, changed
 
 `hv clone <from> <to> [port=N]` (`modules/hypervisor/hv/src/clone.rs`) copies a VM's
@@ -3708,7 +3764,11 @@ the guest. It reads:
   in 30 s is said, not waited on, and its disk reset and given up: the
   device still held the chain, whose buffers the loader had given to
   something else since, and the next request's slot and index were the
-  same, so a late answer was taken for that one's (`virtio.rs`);
+  same, so a late answer was taken for that one's; a disk of blocks larger
+  than a sector (`F_BLK_SIZE`: a volume of NBS's, 4 KiB) read and written
+  in whole blocks, the part of one at either end of a read or a write
+  through a block's buffer -- a write's read first, changed and written
+  whole (grubenv's) (`virtio.rs`);
 - each disk's partitions, from its GPT -- header and array each checked by
   their CRC -- or an MBR, an XBOOTLDR partition (a /boot of its own, as
   Ubuntu's) first, and a disk with no table looked at whole; a partition

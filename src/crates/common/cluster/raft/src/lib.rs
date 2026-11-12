@@ -40,7 +40,9 @@
 //! read back after a crash as the member left it, a torn tail cut. [`rsm`]
 //! is what every user of it needs on top: a replicated state machine over
 //! a node, a store and the user's state, with clients' sessions, reads and
-//! snapshots taken as the log grows.
+//! snapshots taken as the log grows; and [`asks`] is a member's own
+//! commands asked through such sessions, a session each, so that one asked
+//! again as its leader steps down is applied once, whoever leads.
 //!
 //! `no_std` with `alloc`, no `unsafe`, no dependency but the tree's `crc`
 //! (the log's CRC32C), and no allocation
@@ -60,6 +62,7 @@ mod progress;
 mod raft_log;
 mod rand;
 
+pub mod asks;
 pub mod log;
 pub mod node;
 pub mod recover;

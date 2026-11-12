@@ -55,14 +55,14 @@ const _: () = assert!(HELP.len() <= kcore::cmd::HELP_MAX, "`help` would cut it s
 
 const USAGE: &str = "usage: cluster                          this member: its node, role, leader, what it applied\n\
                      \x20      cluster init <name>             a cluster of this host alone, named <name>\n\
-                     \x20      cluster invite <host> <ip> <key>   a token for `cluster join` on <host>, from <ip>,\n\
+                     \x20      cluster invite <host> <ip>[:<port>] <key>   a token for `cluster join` on <host>, from <ip>,\n\
                      \x20                                     with <key> -- what `ipcnet id` says there -- once\n\
                      \x20      cluster join <token>            on the host invited: into the cluster, as the token says\n\
                      \x20      cluster hosts                   every host: node, vote, addresses, key\n\
                      \x20      cluster remove <host>           a host out, for good\n\
                      \x20      cluster revoke <host>           its invitation taken back, unused\n\
                      \x20      cluster maintenance <host> on|off   a host being worked on, or back\n\
-                     \x20      cluster address <host> <ipc|underlay|public> <ip|none>   a host's address for a role\n\
+                     \x20      cluster address <host> <ipc|underlay|public> <ip[:port]|none>   a host's address for a role\n\
                      \x20      cluster rekey                   this host moved to a new key, no connection lost\n\
                      \x20      cluster recover [<cluster>]     on the last host standing: what it does, then -- the\n\
                      \x20                                     cluster's name given -- this host the one voter";
@@ -274,8 +274,8 @@ fn op_maintenance(state: &ModState, host: &str, on: bool) -> Result<u64, String>
     done(ask(state, &Command::Maintenance { now: now(), host: String::from(host), on })?)
 }
 
-fn op_address(state: &ModState, host: &str, role: AddrRole, ip: u32) -> Result<u64, String> {
-    done(ask(state, &Command::Address { now: now(), host: String::from(host), role, ip })?)
+fn op_address(state: &ModState, host: &str, role: AddrRole, ip: u32, port: u16) -> Result<u64, String> {
+    done(ask(state, &Command::Address { now: now(), host: String::from(host), role, ip, port })?)
 }
 
 /// The open invitation of `host`, taken back.
@@ -286,9 +286,10 @@ fn op_revoke(state: &ModState, host: &str) -> Result<(), String> {
     done(ask(state, &Command::Revoke { now: now(), invitation: inv.id })?).map(|_| ())
 }
 
-/// `host` invited from `ip` with `key`: the token, which `cluster join`
-/// takes there -- shown once, and kept nowhere.
-fn op_invite(state: &ModState, host: &str, ip: u32, key: [u8; 32]) -> Result<String, String> {
+/// `host` invited from `ip` -- called at `port`, 0 for ipcnet's own --
+/// with `key`: the token, which `cluster join` takes there -- shown once,
+/// and kept nowhere.
+fn op_invite(state: &ModState, host: &str, ip: u32, port: u16, key: [u8; 32]) -> Result<String, String> {
     let v = member_view(state)?;
     let id = identity()?;
     let me = v.state.host(&id.name).ok_or_else(|| String::from("this host is not in the registry yet"))?;
@@ -299,9 +300,12 @@ fn op_invite(state: &ModState, host: &str, ip: u32, key: [u8; 32]) -> Result<Str
         return Err(String::from("no randomness for an invitation"));
     };
     let now = now();
-    done(ask(state, &Command::Invite { now, id: invitation, host: String::from(host), ip, key,
+    done(ask(state, &Command::Invite { now, id: invitation, host: String::from(host), ip, port, key,
                                         secret_hash: token::secret_hash(&secret), expires: now + INVITE_SECS })?)?;
-    let t = Token { cluster, member: id.name.clone(), ip: me.ipc(), port: id.port, key: id.key,
+    /* Where the joiner calls this host: its address as the registry has it,
+       at its port there -- ipcnet's own where none is said */
+    let at = if me.ipc_port() != 0 { me.ipc_port() } else { IPC_PORT };
+    let t = Token { cluster, member: id.name.clone(), ip: me.ipc(), port: at, key: id.key,
                     host: String::from(host), invitation, secret };
     Ok(t.encode())
 }
@@ -488,15 +492,16 @@ fn run(state: &ModState, args: &str, out: &mut Output) -> Result<(), String> {
         ["address", host, role, ip] => {
             let role = AddrRole::from_name(role)
                 .ok_or_else(|| alloc::format!("\"{}\" is not a role: ipc, underlay or public", role))?;
-            let ip = match *ip {
-                "none" => 0,
-                text => parse_ip(text).ok_or_else(|| alloc::format!("\"{}\" is not an IPv4 address", text))?,
+            let (ip, port) = match *ip {
+                "none" => (0, 0),
+                text => parse_addr(text)
+                    .ok_or_else(|| alloc::format!("\"{}\" is not an IPv4 address, with a port or not", text))?,
             };
-            op_address(state, host, role, ip)?;
+            op_address(state, host, role, ip, port)?;
             if ip == 0 {
                 let _ = writeln!(out, "cluster: {}'s {} address taken away", host, role.name());
             } else {
-                let _ = writeln!(out, "cluster: {}'s {} address is {}", host, role.name(), Ip(ip));
+                let _ = writeln!(out, "cluster: {}'s {} address is {}", host, role.name(), IpPort(ip, port));
             }
             Ok(())
         }
@@ -531,8 +536,11 @@ fn init_cluster(state: &ModState, name: &str, out: &mut Output) -> Result<(), St
     let me = files::Member { node: 1, cluster: id.cluster, name: id.name.clone(), hosts: alloc::vec::Vec::new() };
     start(state, me.clone(), true)?;
     /* The member file last: the mark that this host is a member */
+    /* Its port said where it is not ipcnet's own (#99) */
+    let port = if id.port == IPC_PORT { 0 } else { id.port };
     let made = ask(state, &Command::Init { now: kcore::time::wall_clock_secs(), cluster: id.cluster,
-                                           name: String::from(name), host: id.name.clone(), key: id.key, ip: id.ip })
+                                           name: String::from(name), host: id.name.clone(), key: id.key, ip: id.ip,
+                                           port })
         .and_then(|a| said(a, |node| alloc::format!("cluster: {} made, {} its first host (node {}) -- `cluster \
                                                      invite` the next", name, id.name, node)))
         .and_then(|line| files::create_member(&state.dir, &me).map(|()| line));
@@ -553,12 +561,13 @@ fn init_cluster(state: &ModState, name: &str, out: &mut Output) -> Result<(), St
 }
 
 fn invite(state: &ModState, host: &str, ip: &str, key: &str, out: &mut Output) -> Result<(), String> {
-    let ip = parse_ip(ip).ok_or_else(|| alloc::format!("\"{}\" is not an IPv4 address", ip))?;
+    let (ip, port) = parse_addr(ip)
+        .ok_or_else(|| alloc::format!("\"{}\" is not an IPv4 address, with a port or not", ip))?;
     let key = files::unhex::<32>(key)
         .ok_or_else(|| alloc::format!("\"{}\" is not a key: 64 hex digits, as `ipcnet id` says them", key))?;
-    let token = op_invite(state, host, ip, key)?;
-    let _ = writeln!(out, "cluster: {} invited from {} for {} minutes -- on it: cluster join {}", host, Ip(ip),
-                     INVITE_SECS / 60, token);
+    let token = op_invite(state, host, ip, port, key)?;
+    let _ = writeln!(out, "cluster: {} invited from {} for {} minutes -- on it: cluster join {}", host,
+                     IpPort(ip, port), INVITE_SECS / 60, token);
     Ok(())
 }
 
@@ -579,7 +588,8 @@ fn join_cluster(state: &ModState, text: &str, out: &mut Output) -> Result<(), St
     /* What an init or a join that did not finish left */
     files::clear_log(&state.dir)?;
     ctl(control::TAG_JOIN, &t.cluster)?;
-    let member = control::Peer { name: t.member.clone(), ip: t.ip, keys: alloc::vec![t.key], only: None };
+    let member = control::Peer { name: t.member.clone(), ip: t.ip, port: t.port, keys: alloc::vec![t.key],
+                                 only: None };
     ctl(control::TAG_PEERS, &control::Peers { cluster: t.cluster, peers: alloc::vec![member] }.encode())?;
     if !identity()?.serving {
         return Err(String::from("ipcnet is not serving -- `ipcnet start`, then join again"));
@@ -702,13 +712,13 @@ fn hosts(state: &ModState, out: &mut Output) -> Result<(), String> {
             let _ = write!(more, " moving to key {}...", files::hex(&next[..8]));
         }
         for a in h.addrs.iter().skip(1) {
-            let _ = write!(more, " {} {}", a.role.name(), Ip(a.ip));
+            let _ = write!(more, " {} {}", a.role.name(), IpPort(a.ip, a.port));
         }
         let _ = writeln!(out, "  {:<16} node {:<4} {:<8} {:<15} key {}...{}", h.name, h.node, vote,
-                         alloc::format!("{}", Ip(h.ipc())), key, more);
+                         alloc::format!("{}", IpPort(h.ipc(), h.ipc_port())), key, more);
     }
     for i in v.state.invitations() {
-        let _ = writeln!(out, "  {:<16} invited  from {}", i.host, Ip(i.ip));
+        let _ = writeln!(out, "  {:<16} invited  from {}", i.host, IpPort(i.ip, i.port));
     }
     if !v.state.removed().is_empty() {
         let _ = writeln!(out, "  {} hosts removed", v.state.removed().len());
@@ -716,33 +726,19 @@ fn hosts(state: &ModState, out: &mut Output) -> Result<(), String> {
     Ok(())
 }
 
-/// An IPv4 address in dotted form, host order.
+/// An IPv4 address in dotted form, host order -- never 0.
 fn parse_ip(text: &str) -> Option<u32> {
-    let mut parts = text.split('.');
-    let mut ip = 0u32;
-    for _ in 0..4 {
-        let p = parts.next()?;
-        if p.is_empty() || p.len() > 3 || !p.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        let v: u32 = p.parse().ok()?;
-        if v > 255 {
-            return None;
-        }
-        ip = (ip << 8) | v;
-    }
-    if parts.next().is_some() || ip == 0 {
-        return None;
-    }
-    Some(ip)
+    netwire::parse_ipv4(text.as_bytes()).filter(|&ip| ip != 0)
 }
 
-/// An address as `a.b.c.d`.
-struct Ip(u32);
-
-impl core::fmt::Display for Ip {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let b = self.0.to_be_bytes();
-        write!(f, "{}.{}.{}.{}", b[0], b[1], b[2], b[3])
-    }
+/// `a.b.c.d` or `a.b.c.d:port` -- the address never 0 -- and the port, 0
+/// where none is said: ipcnet's own (#99).
+fn parse_addr(text: &str) -> Option<(u32, u16)> {
+    netwire::parse_ipv4_port(text).filter(|&(ip, _)| ip != 0)
 }
+
+use netwire::{Ipv4 as Ip, Ipv4Port as IpPort};
+
+/// ipcnet's port: what an address with no port is called at -- what
+/// `init` leaves unsaid for a host listening there.
+const IPC_PORT: u16 = ipcwire::PORT;

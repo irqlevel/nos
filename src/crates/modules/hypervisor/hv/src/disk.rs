@@ -423,7 +423,9 @@ impl Volume {
             tags: Mutex::new([None; blk::IN_FLIGHT]).ok_or_else(|| String::from("out of memory"))?,
             event,
         };
-        let drive = nbsdrive::Drive::open_on(name, &me, !read_only, force, &volume.event)?;
+        /* Its session named under hv's namespace, for its writes' chains
+           to answer at (N13) */
+        let drive = nbsdrive::Drive::open_on(name, &me, !read_only, force, &volume.event, Some("hv"))?;
         *volume.drive.lock() = Some(drive);
         Ok(volume)
     }

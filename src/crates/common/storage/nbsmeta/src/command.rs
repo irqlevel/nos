@@ -42,6 +42,13 @@ pub enum Command {
     /// Volume `name` let go by `host`: the writer of `generation`, or -- with
     /// generation 0 -- a reader. Done where it is not so attached.
     Detach { name: String, host: String, generation: u64 },
+    /// Volume `name`'s writer on `host` at `generation` attached anew, at a
+    /// new generation, `token` its session's now (N10c2): a session paused
+    /// for a snapshot that heard no word, so that a snapshot of its pause
+    /// applied late is refused. Refused (`NotTheWriter`) where the volume's
+    /// writer is no longer so -- taken over since, here or elsewhere. Asked
+    /// again by that token, answered with the generation it gave.
+    Reattach { name: String, host: String, generation: u64, token: u64 },
     /// The leader's digest of the state at entry `at`, for every member to
     /// hold its own to.
     Digest { at: u64, digest: [u8; 32] },
@@ -56,6 +63,70 @@ pub enum Command {
     /// writer fenced since takes nothing out -- else its write would be done
     /// by taking out the replicas that refuse it.
     ReplicaDown { set: u32, cs: u32, refused: bool, name: String, generation: u64 },
+    /// cs `cs` silent past the controller's 5 s, as the leader sees it
+    /// (N9): down in every set it is a member of -- never the last active
+    /// member of one -- dropped as the joiner of any, and given no new
+    /// chunks. Done again where it is down or out already.
+    CsDown { cs: u32 },
+    /// cs `cs` answering the leader again: up, taking new chunks. Back in a
+    /// set it is down in only by joining it again.
+    CsUp { cs: u32 },
+    /// cs `cs` silent past `out_after`, or its host no member: down in its
+    /// sets as `CsDown` has it, its places there to be taken by others.
+    CsOut { cs: u32 },
+    /// cs `cs` joins set `set` -- planned at the set's `version` -- to take
+    /// the place of member `place` once its copy is done: the member itself,
+    /// down and back, or another cs in the place of a member down and out,
+    /// or drained.
+    Join { set: u32, place: u8, cs: u32, version: u32 },
+    /// The join of set `set` by cs `cs` that raised it to `since` done: the
+    /// joiner a member in its place, active.
+    Joined { set: u32, cs: u32, since: u32 },
+    /// The join of set `set` by cs `cs` that raised it to `since` given up.
+    Unjoin { set: u32, cs: u32, since: u32 },
+    /// A person's: member `cs` of set `set` taken down at the set's
+    /// `version` as its copy is found bad -- the leader's scrub said it unlike
+    /// the set's two others (N9e). Down, as a member taken out is, for the
+    /// controller to have it join its own place again: its copy holds every
+    /// chunk to a source's by sums. Never the set's last active member, a
+    /// member down already, nor a set with a joiner; refused as stale once
+    /// the set has moved on.
+    ReplicaBad { set: u32, cs: u32, version: u32 },
+    /// A snapshot of volume `volume`, named `name` (N10): its map as it is,
+    /// every chunk's count up -- what the volume held, for good. At the
+    /// generation of the writer that paused for it, or 0 for a volume with
+    /// none: a writer not paused could have a write on its way into a chunk
+    /// the snapshot now shares. Of a volume only -- an image or a snapshot
+    /// is read-only, and cloned rather than snapshotted. Made again of the
+    /// same volume, it is answered as it is.
+    Snapshot { volume: String, name: String, generation: u64 },
+    /// Volume `name` made an image (N10): read-only for good, to be cloned;
+    /// refused while attached, its copy-ups pending given up. Done where it
+    /// is an image already.
+    Freeze { name: String },
+    /// Volume `name`, `host`'s own, a clone of image or snapshot `from`
+    /// (N10): its map `from`'s, every chunk's count up, room reserved for
+    /// none of them -- a write to one copies it up. Made again of the same
+    /// origin, it is answered as it is.
+    Clone { from: String, name: String, host: String },
+    /// A copy-up's first step (N10): chunk `place` of volume `name`'s map --
+    /// shared, and to be written by its writer at `generation` -- given a
+    /// new chunk in the same set, its room taken on the set's cs's, refused
+    /// where one has none left; pending, the map naming the old one still.
+    /// Asked again, answered the pending one; asked of a chunk shared no
+    /// longer, the chunk itself.
+    CopyUp { name: String, place: u32, generation: u64 },
+    /// A copy-up's second step: pending chunk `chunk` of place `place`, at
+    /// `incarnation`, copied onto its set's active members -- volume `name`'s
+    /// map names it, and the old one's count goes down, at none freed. Done
+    /// where the map names it already. Refused (`Stale`) where the pending
+    /// chunk is that number at another incarnation: a copy-up given up -- a
+    /// join of its set begun -- and asked anew, by an ask of the writer's
+    /// asked again and late, is given a new chunk, which can be the number
+    /// freed; an end of the old one's then would have the map name a chunk
+    /// nobody copied into, zeros where the volume had data (found by
+    /// fuzz/nbs's cluster target, N13c).
+    CopyDone { name: String, place: u32, generation: u64, chunk: u32, incarnation: u32 },
 }
 
 const INIT: u8 = 1;
@@ -70,6 +141,19 @@ const ATTACH: u8 = 9;
 const DETACH: u8 = 10;
 const DIGEST: u8 = 11;
 const REPLICA_DOWN: u8 = 12;
+const CS_DOWN: u8 = 13;
+const CS_UP: u8 = 14;
+const CS_OUT: u8 = 15;
+const JOIN: u8 = 16;
+const JOINED: u8 = 17;
+const UNJOIN: u8 = 18;
+const REPLICA_BAD: u8 = 19;
+const SNAPSHOT: u8 = 20;
+const FREEZE: u8 = 21;
+const CLONE: u8 = 22;
+const COPY_UP: u8 = 23;
+const COPY_DONE: u8 = 24;
+const REATTACH: u8 = 25;
 
 const WRITABLE: u8 = 1;
 const FORCE: u8 = 2;
@@ -146,6 +230,80 @@ impl Command {
                 w.str(name);
                 w.u64(*generation);
             }
+            Command::CsDown { cs } => {
+                w.u8(CS_DOWN);
+                w.u32(*cs);
+            }
+            Command::CsUp { cs } => {
+                w.u8(CS_UP);
+                w.u32(*cs);
+            }
+            Command::CsOut { cs } => {
+                w.u8(CS_OUT);
+                w.u32(*cs);
+            }
+            Command::Join { set, place, cs, version } => {
+                w.u8(JOIN);
+                w.u32(*set);
+                w.u8(*place);
+                w.u32(*cs);
+                w.u32(*version);
+            }
+            Command::Joined { set, cs, since } => {
+                w.u8(JOINED);
+                w.u32(*set);
+                w.u32(*cs);
+                w.u32(*since);
+            }
+            Command::Unjoin { set, cs, since } => {
+                w.u8(UNJOIN);
+                w.u32(*set);
+                w.u32(*cs);
+                w.u32(*since);
+            }
+            Command::ReplicaBad { set, cs, version } => {
+                w.u8(REPLICA_BAD);
+                w.u32(*set);
+                w.u32(*cs);
+                w.u32(*version);
+            }
+            Command::Snapshot { volume, name, generation } => {
+                w.u8(SNAPSHOT);
+                w.str(volume);
+                w.str(name);
+                w.u64(*generation);
+            }
+            Command::Freeze { name } => {
+                w.u8(FREEZE);
+                w.str(name);
+            }
+            Command::Clone { from, name, host } => {
+                w.u8(CLONE);
+                w.str(from);
+                w.str(name);
+                w.str(host);
+            }
+            Command::CopyUp { name, place, generation } => {
+                w.u8(COPY_UP);
+                w.str(name);
+                w.u32(*place);
+                w.u64(*generation);
+            }
+            Command::Reattach { name, host, generation, token } => {
+                w.u8(REATTACH);
+                w.str(name);
+                w.str(host);
+                w.u64(*generation);
+                w.u64(*token);
+            }
+            Command::CopyDone { name, place, generation, chunk, incarnation } => {
+                w.u8(COPY_DONE);
+                w.str(name);
+                w.u32(*place);
+                w.u64(*generation);
+                w.u32(*chunk);
+                w.u32(*incarnation);
+            }
         }
         w.buf
     }
@@ -216,6 +374,52 @@ impl Command {
                 };
                 let name = volume(&mut r)?;
                 Command::ReplicaDown { set, cs, refused, name, generation: r.u64()? }
+            }
+            CS_DOWN => Command::CsDown { cs: r.u32()? },
+            CS_UP => Command::CsUp { cs: r.u32()? },
+            CS_OUT => Command::CsOut { cs: r.u32()? },
+            JOIN => {
+                let (set, place) = (r.u32()?, r.u8()?);
+                let cs = r.u32()?;
+                Command::Join { set, place, cs, version: r.u32()? }
+            }
+            JOINED => {
+                let (set, cs) = (r.u32()?, r.u32()?);
+                Command::Joined { set, cs, since: r.u32()? }
+            }
+            UNJOIN => {
+                let (set, cs) = (r.u32()?, r.u32()?);
+                Command::Unjoin { set, cs, since: r.u32()? }
+            }
+            REPLICA_BAD => {
+                let (set, cs) = (r.u32()?, r.u32()?);
+                Command::ReplicaBad { set, cs, version: r.u32()? }
+            }
+            SNAPSHOT => {
+                let volume = volume(&mut r)?;
+                let name = String::from(r.str(crate::VOLUME_NAME_MAX)?);
+                Command::Snapshot { volume, name, generation: r.u64()? }
+            }
+            FREEZE => Command::Freeze { name: volume(&mut r)? },
+            CLONE => {
+                let from = volume(&mut r)?;
+                let name = String::from(r.str(crate::VOLUME_NAME_MAX)?);
+                Command::Clone { from, name, host: host(&mut r)? }
+            }
+            COPY_UP => {
+                let name = volume(&mut r)?;
+                let place = r.u32()?;
+                Command::CopyUp { name, place, generation: r.u64()? }
+            }
+            COPY_DONE => {
+                let name = volume(&mut r)?;
+                let place = r.u32()?;
+                let (generation, chunk) = (r.u64()?, r.u32()?);
+                Command::CopyDone { name, place, generation, chunk, incarnation: r.u32()? }
+            }
+            REATTACH => {
+                let (name, host) = (volume(&mut r)?, host(&mut r)?);
+                Command::Reattach { name, host, generation: r.u64()?, token: r.u64()? }
             }
             _ => return None,
         };
@@ -293,6 +497,30 @@ pub enum Refusal {
     LastReplica,
     /// Not the volume's writer: attached elsewhere since, or never.
     NotTheWriter,
+    /// No chunk server of that number.
+    NoSuchCs,
+    /// The set has moved on since the plan was made, or that is not its
+    /// join.
+    Stale,
+    /// A join of the set is under way already.
+    Joining,
+    /// The member is active: it needs no join of its own.
+    NotDown,
+    /// The cs is a member of the set already.
+    AlreadyMember,
+    /// The cs is not up: it joins nothing.
+    NotUp,
+    /// The member in that place is active and stays: not down, nor its cs
+    /// out or drained.
+    InPlace,
+    /// The member is down already: the controller has it join its place
+    /// again.
+    AlreadyDown,
+    /// A clone is of an image or a snapshot, not of a volume (N10).
+    NotFrozen,
+    /// A copy-up into a set with a member drained, whose place is to be
+    /// joined by another cs first (N10).
+    Draining,
 }
 
 impl Refusal {
@@ -332,6 +560,16 @@ impl Refusal {
             Refusal::NoSuchSet => "no such replica set, or the chunk server is no replica of it",
             Refusal::LastReplica => "the set's last active replica: writes go on to it alone",
             Refusal::NotTheWriter => "not the volume's writer: attached elsewhere since",
+            Refusal::NoSuchCs => "no chunk server of that number",
+            Refusal::Stale => "the set has moved on since, or that is not its join",
+            Refusal::Joining => "a join of the set is under way already",
+            Refusal::NotDown => "the member is active: it needs no join",
+            Refusal::AlreadyMember => "the chunk server is a member of the set already",
+            Refusal::NotUp => "the chunk server is not up",
+            Refusal::InPlace => "the member in that place is active and stays",
+            Refusal::AlreadyDown => "the member is down already: it joins its place again",
+            Refusal::NotFrozen => "a clone is of an image or a snapshot -- freeze or snapshot the volume first",
+            Refusal::Draining => "a member of the set is drained: its place is to be joined by another cs first",
         }
     }
 
@@ -369,6 +607,16 @@ impl Refusal {
             Refusal::NoSuchSet => 30,
             Refusal::LastReplica => 31,
             Refusal::NotTheWriter => 32,
+            Refusal::NoSuchCs => 33,
+            Refusal::Stale => 34,
+            Refusal::Joining => 35,
+            Refusal::NotDown => 36,
+            Refusal::AlreadyMember => 37,
+            Refusal::NotUp => 38,
+            Refusal::InPlace => 39,
+            Refusal::AlreadyDown => 40,
+            Refusal::NotFrozen => 41,
+            Refusal::Draining => 42,
         }
     }
 
@@ -406,6 +654,16 @@ impl Refusal {
             30 => Refusal::NoSuchSet,
             31 => Refusal::LastReplica,
             32 => Refusal::NotTheWriter,
+            33 => Refusal::NoSuchCs,
+            34 => Refusal::Stale,
+            35 => Refusal::Joining,
+            36 => Refusal::NotDown,
+            37 => Refusal::AlreadyMember,
+            38 => Refusal::NotUp,
+            39 => Refusal::InPlace,
+            40 => Refusal::AlreadyDown,
+            41 => Refusal::NotFrozen,
+            42 => Refusal::Draining,
             _ => return None,
         })
     }
@@ -426,8 +684,14 @@ pub enum Answer {
     Attached { generation: u64 },
     /// A digest held to.
     Checked,
-    /// A replica taken out: its set's version now.
+    /// A replica taken out, a join begun, done or given up: its set's
+    /// version now.
     Set { version: u32 },
+    /// A cs down, up or out: how many sets that changed.
+    Changed { sets: u32 },
+    /// A copy-up's chunk (N10): the pending one, or -- done, or the chunk
+    /// shared no longer -- the one the map names; and its incarnation.
+    Chunk { chunk: u32, incarnation: u32 },
     Refused(Refusal),
 }
 
@@ -438,6 +702,8 @@ const VOLUME: u8 = 3;
 const ATTACHED: u8 = 4;
 const CHECKED: u8 = 5;
 const SET: u8 = 6;
+const CHANGED: u8 = 7;
+const CHUNK: u8 = 8;
 
 impl Answer {
     pub fn encode(&self) -> Vec<u8> {
@@ -468,6 +734,15 @@ impl Answer {
                 w.u8(SET);
                 w.u32(*version);
             }
+            Answer::Changed { sets } => {
+                w.u8(CHANGED);
+                w.u32(*sets);
+            }
+            Answer::Chunk { chunk, incarnation } => {
+                w.u8(CHUNK);
+                w.u32(*chunk);
+                w.u32(*incarnation);
+            }
         }
         w.buf
     }
@@ -482,6 +757,11 @@ impl Answer {
             ATTACHED => Answer::Attached { generation: r.u64()? },
             CHECKED => Answer::Checked,
             SET => Answer::Set { version: r.u32()? },
+            CHANGED => Answer::Changed { sets: r.u32()? },
+            CHUNK => {
+                let chunk = r.u32()?;
+                Answer::Chunk { chunk, incarnation: r.u32()? }
+            }
             _ => return None,
         };
         r.done().then_some(a)

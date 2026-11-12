@@ -22,7 +22,7 @@ use kcore::cmd::Output;
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
 use nbscs::Holds;
-use nbsmeta::{Answer, Command, DeviceState, Refusal, State, Volume, CHUNK_MIB};
+use nbsmeta::{Answer, Command, DeviceState, Kind, Refusal, State, Volume, CHUNK_MIB};
 
 use crate::member::View;
 use crate::{caught_up, ModState};
@@ -51,7 +51,13 @@ impl From<String> for Failure {
 
 /// `cmd`, as the metadata answers it: a refusal as a failure of its own.
 pub fn ask(state: &ModState, cmd: &Command) -> Result<Answer, Failure> {
-    match raftmember::ask(&state.shared, cmd, crate::NO_MEMBER) {
+    ask_turning(state, cmd, &mut |ms| kcore::task::sleep_ms(ms))
+}
+
+/// `ask`, `turn` given the time between two looks at the answer: a
+/// command's that drives something of its own as it waits.
+fn ask_turning(state: &ModState, cmd: &Command, turn: &mut dyn FnMut(u64)) -> Result<Answer, Failure> {
+    match raftmember::ask_turning(&state.shared, cmd, crate::NO_MEMBER, turn) {
         Ok(Answer::Refused(why)) => Err(Failure::Refused(why)),
         Ok(a) => Ok(a),
         Err(why) => Err(Failure::Other(why)),
@@ -172,6 +178,21 @@ pub fn device_add(state: &ModState, word: &str, wipe: bool) -> Result<(String, u
     Ok((ident, slots, id, wiped))
 }
 
+/// Host `host`'s cs taken down in set `set` as a person finds its copy bad
+/// -- the scrub's finding (N9e) -- at the set's version now: the set's version
+/// after.
+pub fn replica_bad(state: &ModState, set: u32, host: &str) -> Result<u32, Failure> {
+    let v = caught_up(state)?;
+    let cs = v.state.cs_of(host).map(|c| c.id)
+        .ok_or_else(|| Failure::Other(alloc::format!("{} has no chunk server", host)))?;
+    let version = v.state.sets().get(set as usize).map(|s| s.version)
+        .ok_or_else(|| Failure::Other(alloc::format!("there is no set {}", set)))?;
+    match ask(state, &Command::ReplicaBad { set, cs, version })? {
+        Answer::Set { version } => Ok(version),
+        other => Err(Failure::Other(alloc::format!("answered {:?}", other))),
+    }
+}
+
 /// Device `ident` of this host's given no new chunks.
 pub fn device_drain(state: &ModState, ident: &str) -> Result<u32, Failure> {
     let v = caught_up(state)?;
@@ -209,6 +230,37 @@ pub fn volume_delete(state: &ModState, name: &str) -> Result<u32, Failure> {
 pub fn volume_resize(state: &ModState, name: &str, size_mib: u64) -> Result<u32, Failure> {
     caught_up(state)?;
     volume_id(ask(state, &Command::VolumeResize { name: String::from(name), size_mib })?)
+}
+
+/// A snapshot of volume `volume` as `name` (N10c2): attached, on this host,
+/// its writer paused for it -- the member's to do -- else refused; detached,
+/// taken as it is. `turn` given the time the answer is waited for.
+pub fn volume_snapshot(state: &ModState, volume: &str, name: &str, turn: &mut dyn FnMut(u64))
+    -> Result<u32, Failure>
+{
+    caught_up(state)?;
+    let cmd = Command::Snapshot { volume: String::from(volume), name: String::from(name),
+                                  generation: crate::member::PAUSE_FIRST };
+    volume_id(ask_turning(state, &cmd, turn)?)
+}
+
+/// Volume `name` made an image (N10d): read-only for good, cloned from --
+/// refused while attached. Its number.
+pub fn volume_freeze(state: &ModState, name: &str) -> Result<u32, Failure> {
+    caught_up(state)?;
+    volume_id(ask(state, &Command::Freeze { name: String::from(name) })?)
+}
+
+/// Volume `name`, a clone of image or snapshot `from`, its own host `host`
+/// -- this one where none is given (N10d): thin, every chunk shared with
+/// `from` until it is written. Its number.
+pub fn volume_clone(state: &ModState, from: &str, name: &str, host: Option<&str>) -> Result<u32, Failure> {
+    let v = caught_up(state)?;
+    let host = match host {
+        Some(h) => String::from(h),
+        None => this_host(&v)?,
+    };
+    volume_id(ask(state, &Command::Clone { from: String::from(from), name: String::from(name), host })?)
 }
 
 /// A size as it is typed: MiB, or with M, G or T after it.
@@ -285,6 +337,20 @@ pub fn show_cs(v: &View, out: &mut Output) {
     }
 }
 
+/// What a volume is, where it is not a plain one (N10d): an image, a
+/// snapshot of a volume, or a clone of an image or a snapshot -- its origin
+/// by name while it is there.
+pub fn kind_text(s: &State, v: &Volume) -> Option<String> {
+    let origin = || s.volumes().iter().find(|o| o.id == v.origin)
+        .map_or_else(|| alloc::format!("volume {}, gone", v.origin), |o| o.name.clone());
+    match v.kind {
+        Kind::Volume if v.origin == 0 => None,
+        Kind::Volume => Some(alloc::format!("a clone of {}", origin())),
+        Kind::Image => Some(String::from("an image")),
+        Kind::Snapshot => Some(alloc::format!("a snapshot of {}", origin())),
+    }
+}
+
 fn attach_text(v: &Volume) -> String {
     match &v.writer {
         Some(w) => alloc::format!("attached on {} (generation {})", w.host, w.generation),
@@ -301,15 +367,17 @@ pub fn show_volumes(v: &View, out: &mut Output) {
     let mut vols: Vec<&Volume> = v.state.volumes().iter().collect();
     vols.sort_by(|a, b| a.name.cmp(&b.name));
     for vol in vols {
-        let _ = writeln!(out, "  {:<24} volume {:<5} {:>10}  {} chunks, of {}, {}", vol.name, vol.id,
-                         alloc::format!("{}", Mib(vol.size_mib)), vol.map.len(), vol.host, attach_text(vol));
+        let kind = kind_text(&v.state, vol).map_or_else(String::new, |k| alloc::format!(", {}", k));
+        let _ = writeln!(out, "  {:<24} volume {:<5} {:>10}  {} chunks, of {}, {}{}", vol.name, vol.id,
+                         alloc::format!("{}", Mib(vol.size_mib)), vol.map.len(), vol.host, attach_text(vol), kind);
     }
 }
 
 pub fn show_volume(v: &View, name: &str, out: &mut Output) -> Result<(), String> {
     let vol = v.state.volume(name).ok_or_else(|| alloc::format!("no volume {}", name))?;
-    let _ = writeln!(out, "nbs: volume {} ({}), {}, {} chunks of {} MiB, its own host {}, {}", vol.name, vol.id,
-                     Mib(vol.size_mib), vol.map.len(), CHUNK_MIB, vol.host, attach_text(vol));
+    let kind = kind_text(&v.state, vol).map_or_else(String::new, |k| alloc::format!(", {}", k));
+    let _ = writeln!(out, "nbs: volume {} ({}), {}, {} chunks of {} MiB, its own host {}, {}{}", vol.name, vol.id,
+                     Mib(vol.size_mib), vol.map.len(), CHUNK_MIB, vol.host, attach_text(vol), kind);
     let hosts = replica_hosts(&v.state, vol);
     let line: Vec<String> = hosts.iter().map(|(h, n)| alloc::format!("{} {}", h, n)).collect();
     let _ = writeln!(out, "  replicas, chunks a host: {}", line.join(", "));

@@ -549,6 +549,111 @@ fn pour_failed(why: String, target: &str, stopped: bool, wrote: bool) -> String 
 }
 
 #[cfg(target_arch = "x86_64")]
+/// The size of the disk `from` is an image of -- a qcow2 image, or a raw
+/// disk (`pour_source`): what a volume is made for it to be poured onto
+/// (`hv image`).
+fn disk_size(from: &str, to: &str) -> Result<u64, String> {
+    let file = File::open(from, false).map_err(|e| alloc::format!("{}: {}", from, e))?;
+    let len = file.size().map_err(|e| alloc::format!("{}: {}", from, e))?;
+    let mut image = Image { file, len };
+    let img = pour_source(&mut image, from, to)?;
+    Ok(img.as_ref().map_or(len, |i| i.size()))
+}
+
+/* ---- an image of NBS's ---- */
+
+#[cfg(target_arch = "x86_64")]
+const IMAGE_USAGE: &str = "hv image <name> <file|http(s)://image> -- an image of NBS's made of a cloud's image, qcow2 \
+                           or raw, downloaded first where it is a URL: a volume of its disk's size, the image poured \
+                           onto it, frozen -- hv create <vm> image=nbs:<name> makes a vm of a clone of it";
+/// What a download for `hv image` is called in the vms' folder, before the
+/// image's name: no VM's name begins with a dot, and `hv vms` lists folders.
+#[cfg(target_arch = "x86_64")]
+const DOWNLOAD_PREFIX: &str = ".image-";
+
+/// `hv image <name> <file|url>` (N10d3).
+#[cfg(target_arch = "x86_64")]
+pub fn image_command(root: &str, vms: &crate::vms::Vms, args: &str, work: &mut dyn Work) {
+    let mut words = args.split_ascii_whitespace();
+    let (Some(name), Some(from), None) = (words.next(), words.next(), words.next()) else {
+        let _ = writeln!(work, "{}", IMAGE_USAGE);
+        return;
+    };
+    /* Its name as hv's other words give a volume, nbs:<name>, or alone */
+    let name = name.strip_prefix("nbs:").unwrap_or(name);
+    if let Err(e) = make_image(root, vms, name, from, work) {
+        let _ = writeln!(work, "hv: {}", e);
+    }
+}
+
+/// A file made for one command alone, removed when it goes, however that
+/// ends: `hv image`'s download.
+#[cfg(target_arch = "x86_64")]
+struct Scratch(String);
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = kcore::fs::remove(&self.0);
+    }
+}
+
+/// Image `name` of NBS's made of `from`, a file of this host's or a URL:
+/// the name held on this host while it is made, and refused where NBS has
+/// a volume of it; a URL downloaded into the vms' folder `root`; a volume
+/// made of the disk's size, this host its own; the image poured onto it
+/// -- its zeros left out, a volume new reading as zeros -- and frozen.
+/// Nothing is left of one that fails: the download removed, the volume
+/// deleted -- while it is a volume still, and this host's: never an image
+/// another host made of the name meanwhile.
+#[cfg(target_arch = "x86_64")]
+fn make_image(root: &str, vms: &crate::vms::Vms, name: &str, from: &str, work: &mut dyn Work) -> Result<(), String> {
+    let target = alloc::format!("nbs:{}", name);
+    /* No second make of the name on this host meanwhile -- the download is
+     * this one's alone -- and no unload under it. No VM's name has a `:`. */
+    let _held = vms.reserve(&target, "made an image")?;
+    if crate::nbs::volume(name)?.is_some() {
+        return Err(alloc::format!("{} is there already", target));
+    }
+    let me = nbsdrive::this_host()?;
+    let scratch = if crate::cloud::is_url(from) {
+        if kcore::fs::list(root).is_err() {
+            crate::store::make_dirs(root).map_err(|_| alloc::format!("{} could not be made", root))?;
+        }
+        let path = crate::store::join(root, &alloc::format!("{}{}", DOWNLOAD_PREFIX, name))
+            .ok_or_else(|| String::from("out of memory"))?;
+        /* One there is a make's that ended with nos: the name is held */
+        let _ = kcore::fs::remove(&path);
+        let scratch = Scratch(path);
+        crate::cloud::download_to(from, &scratch.0, work)?;
+        Some(scratch)
+    } else {
+        None
+    };
+    let file = scratch.as_ref().map_or(from, |s| s.0.as_str());
+    let size = disk_size(file, &target)?;
+    crate::nbs::create(name, size)?;
+    let made = pour_volume(file, name, false, work).and_then(|_| crate::nbs::freeze(name).map(|_| ()));
+    drop(scratch);
+    if let Err(e) = made {
+        let left = match crate::nbs::volume(name) {
+            Ok(Some(v)) if v.kind == "volume" && v.host == me => match crate::nbs::delete(name) {
+                Ok(()) => alloc::format!("{} deleted", target),
+                Err(why) => alloc::format!("not deleted -- {}", why),
+            },
+            Ok(Some(v)) => alloc::format!("{} left as it is: {} {}, host {}'s", target,
+                                          if v.kind == "image" { "an" } else { "a" }, v.kind, v.host),
+            Ok(None) => alloc::format!("{} gone already", target),
+            Err(why) => alloc::format!("not looked at again -- {}", why),
+        };
+        return Err(alloc::format!("{} -- {}", e, left));
+    }
+    let _ = writeln!(work, "hv: {} is an image now, {} MiB, read-only for good -- hv create <vm> image={} makes a vm \
+                            of a clone of it", target, size.div_ceil(MIB), target);
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
 /// `from` -- a qcow2 image, or a raw disk (`pour_source`) -- poured onto
 /// volume `volume` of NBS's through its session, attached for writing here
 /// -- taken from a writer elsewhere with `force` -- and let go of after: Ok
@@ -568,7 +673,8 @@ pub fn pour_volume(from: &str, volume: &str, force: bool, work: &mut dyn Work) -
     let mut first = Vec::new();
     first.try_reserve_exact(VOLUME_POUR_BYTES).map_err(|_| String::from("out of memory"))?;
     let me = nbsdrive::this_host()?;
-    let mut d = nbsdrive::Drive::open(volume, &me, true, force).map_err(|e| alloc::format!("{}: {}", name, e))?;
+    let mut d = nbsdrive::Drive::open(volume, &me, true, force, Some("hv"))
+        .map_err(|e| alloc::format!("{}: {}", name, e))?;
     let (room, fresh) = (d.session().size(), d.session().generation() == 1);
     /* The disk whole blocks of the volume's: a last part of one, zeros after */
     let disk = size.div_ceil(nbsdrive::BLOCK) * nbsdrive::BLOCK;

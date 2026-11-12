@@ -16,6 +16,8 @@ tls = { path = "../../../layers/tls", features = ["pinned"] }
 web = { path = "../../../common/net/web" }
 # What two hosts say inside their session.
 ipcwire = { path = "../../../common/ipc/ipcwire" }
+# An address read and printed, with its port (#99): the one copy of a quad
+netwire = { path = "../../../common/net/netwire" }
 # hosts.toml.
 conf = { path = "../../../common/text/conf" }
 zeroize = { version = "1", default-features = false }

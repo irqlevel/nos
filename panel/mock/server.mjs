@@ -336,10 +336,31 @@ const nbsRoom = (more) => {
   }
 };
 const nbsJson = (v, replicas) => ({
-  name: v.name, volume: v.volume, size: v.size_mib * MIB, chunks: nbsChunks(v.size_mib), host: v.host, writer: v.writer,
+  name: v.name, volume: v.volume, kind: v.kind || 'volume',
+  origin: (nbs.volumes.find((o) => v.origin && o.volume === v.origin) || { name: null }).name,
+  size: v.size_mib * MIB, chunks: nbsChunks(v.size_mib), host: v.host, writer: v.writer,
   generation: v.generation, readers: v.readers,
   ...(replicas ? { replicas: nbs.hosts.map((h) => ({ host: h.host, chunks: nbsChunks(v.size_mib) })) } : {}),
 });
+/** A volume made of `from` -- a snapshot or a clone, thin: nothing reserved
+ * (N10d). Made again of the same origin, answered as it is. */
+const nbsShare = (from, name, kind, host) => {
+  if (!NBS_NAME.test(name)) {
+    throw new Refused('invalid', 'lowercase letters, digits, . _ and -, up to 63', 'name');
+  }
+  const had = nbs.volumes.find((v) => v.name === name);
+  if (had) {
+    if ((had.kind || 'volume') !== kind || had.origin !== from.volume) {
+      throw new Refused('conflict', 'a volume of that name is there already, of another size or kind');
+    }
+    return { volume: had.volume };
+  }
+  const v = { name, volume: nbs.next, kind, origin: from.volume, size_mib: from.size_mib, host, writer: null,
+              generation: 0, readers: [] };
+  nbs.next += 1;
+  nbs.volumes.push(v);
+  return { volume: v.volume };
+};
 
 const reads = {
   'system.info': () => ({
@@ -480,6 +501,45 @@ const actions = {
     }
     const [v] = nbs.volumes.splice(at, 1);
     return { volume: v.volume };
+  },
+  'nbs.volume_snapshot': (p) => {
+    const v = nbs.volumes.find((x) => x.name === need(p, 'volume'));
+    if (!v) {
+      throw new Refused('not_found', 'no volume of that name', 'volume');
+    }
+    if ((v.kind || 'volume') !== 'volume') {
+      throw new Refused('conflict', 'an image or a snapshot is read-only');
+    }
+    if (v.writer && v.writer !== nbs.hosts[0].host) {
+      throw new Refused('conflict', `volume ${v.name} is attached on host ${v.writer}: its snapshot is asked there, `
+                        + 'where its writer is paused for it');
+    }
+    return nbsShare(v, need(p, 'name'), 'snapshot', v.host);
+  },
+  'nbs.volume_freeze': (p) => {
+    const v = nbsVolume(p);
+    if ((v.kind || 'volume') === 'snapshot') {
+      throw new Refused('conflict', 'an image or a snapshot is read-only');
+    }
+    if (v.writer || v.readers.length) {
+      throw new Refused('conflict', 'the volume is attached');
+    }
+    v.kind = 'image';
+    return { volume: v.volume };
+  },
+  'nbs.volume_clone': (p) => {
+    const from = nbs.volumes.find((x) => x.name === need(p, 'from'));
+    if (!from) {
+      throw new Refused('not_found', 'no volume of that name', 'from');
+    }
+    if ((from.kind || 'volume') === 'volume') {
+      throw new Refused('conflict', 'a clone is of an image or a snapshot -- freeze or snapshot the volume first');
+    }
+    const host = p.host || nbs.hosts[0].host;
+    if (!nbs.hosts.some((h) => h.host === host)) {
+      throw new Refused('not_found', 'the host is no member of the NBS cluster', 'host');
+    }
+    return nbsShare(from, need(p, 'name'), 'volume', host);
   },
   'cluster.invite': (p) => {
     const host = need(p, 'host');

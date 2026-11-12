@@ -2,15 +2,17 @@
 //!
 //!     nbs-fuzz gate
 //!
-//! everything the gate holds: the meta target over seeds 1 to 300, the cs
-//! target over 1 to 200, the wire target over 1 to 100 and the cluster
-//! target over 1 to 100, every allocation
+//! everything the gate holds: the meta target over seeds 1 to 1000, the cs
+//! target over 1 to 200, the inflight target over 1 to 600, the wire target
+//! over 1 to 100, the scrub target over 1 to 300, the cluster target over 1
+//! to 1000 and the join target over 1 to 800 -- the races of
+//! some of their mutants come once in a few hundred runs -- every allocation
 //! held to what the kernel's heap
 //! gives at once (fuzz/raft's `heap`). Exit 0 when everything held, 1 with
 //! what did not -- a finding with its seed, to run again with
 //! `<target> --seed N --trace`.
 //!
-//!     nbs-fuzz meta|cs|wire|cluster [--seed N] [--seeds K] [--steps S] [--seconds T] [--trace]
+//!     nbs-fuzz meta|cs|inflight|wire|scrub|cluster|join [--seed N] [--seeds K] [--steps S] [--seconds T] [--trace]
 //!
 //! one target; with `--seconds`, seeds on from the first until the time is
 //! up -- a campaign.
@@ -19,7 +21,10 @@
 mod heap;
 mod cluster;
 mod cs;
+mod inflight;
+mod join;
 mod meta;
+mod scrub;
 mod wire;
 /* Shared with fuzz/raft, of which this crate takes what it needs */
 #[allow(dead_code)]
@@ -33,14 +38,41 @@ use std::panic::{self, AssertUnwindSafe};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-const GATE_META_SEEDS: u64 = 300;
+const GATE_META_SEEDS: u64 = 1000;
 const META_STEPS: u64 = 400;
 const GATE_CS_SEEDS: u64 = 200;
 const CS_STEPS: u64 = 300;
 const GATE_WIRE_SEEDS: u64 = 100;
 const WIRE_STEPS: u64 = 500;
-const GATE_CLUSTER_SEEDS: u64 = 100;
+const GATE_SCRUB_SEEDS: u64 = 300;
+const SCRUB_STEPS: u64 = 3000;
+const GATE_CLUSTER_SEEDS: u64 = 1000;
 const CLUSTER_STEPS: u64 = 2000;
+/// Cluster seeds past the gate's range run with it: each the place a rule's
+/// race comes together that the range lost when the target's course moved
+/// -- the client's copy-up ended only once every member active in its view
+/// has copied (`client_copy_every_active`: a clone's or a volume's copy-up
+/// asked at a view a member had left, NotHere, those that had come since
+/// never asked), lost to N13's chains, found again at these; and N13c's
+/// campaign's: a copy-up's end named by its chunk's number alone, matched
+/// to a copy-up asked anew late given that number again (1219, 3663); a
+/// session attached anew for a write that reached no replica, its reconcile
+/// held by the stuck join that held the write (1960), and the end that cuts
+/// a replica off as its write was never sent (2149); and its lone writes'
+/// campaign's: a join's copy of a write out that closed what it copied,
+/// its source then taken out and back, an attach anew's reconcile finding
+/// it open nowhere (5316); a reconcile's mend of a shared place held for a
+/// copy-up a stuck join held back (7225); and a write out by a view of its
+/// set that a map read finds changed sent again by the new view
+/// (`client_resend_changed`), its race moved past the range by the lone
+/// writes' course (2758, 4206: a write done that a replica lacks). A
+/// stopgap: a race moved on by the next change is lost again, which the
+/// mutants say.
+const GATE_CLUSTER_ALSO: [u64; 13] = [1232, 2759, 5241, 6647, 7786, 1219, 1960, 2149, 3663, 5316, 7225, 2758, 4206];
+const GATE_JOIN_SEEDS: u64 = 800;
+const JOIN_STEPS: u64 = 3000;
+const GATE_INFLIGHT_SEEDS: u64 = 600;
+const INFLIGHT_STEPS: u64 = 400;
 
 /// A run's outcome, a panic included as a finding, and a block asked for
 /// that the kernel's heap would not give.
@@ -105,17 +137,44 @@ fn main() -> ExitCode {
     };
     let failed = match args.first().map(String::as_str) {
         Some("gate") | None => {
-            target("meta", meta::run, 1, GATE_META_SEEDS, META_STEPS, None, false)
-                + target("cs", cs::run, 1, GATE_CS_SEEDS, CS_STEPS, None, false)
-                + target("wire", wire::run, 1, GATE_WIRE_SEEDS, WIRE_STEPS, None, false)
-                + target("cluster", cluster::run, 1, GATE_CLUSTER_SEEDS, CLUSTER_STEPS, None, false)
+            /* `--first`: stopped at the first target that fails -- the
+               gate's verdict, sooner (mutants.py's) */
+            let first = args.iter().any(|a| a == "--first");
+            let targets: [(&str, fn(u64, u64, bool) -> Result<(), String>, u64, u64); 7] = [
+                ("meta", meta::run, GATE_META_SEEDS, META_STEPS),
+                ("cs", cs::run, GATE_CS_SEEDS, CS_STEPS),
+                ("inflight", inflight::run, GATE_INFLIGHT_SEEDS, INFLIGHT_STEPS),
+                ("wire", wire::run, GATE_WIRE_SEEDS, WIRE_STEPS),
+                ("scrub", scrub::run, GATE_SCRUB_SEEDS, SCRUB_STEPS),
+                ("cluster", cluster::run, GATE_CLUSTER_SEEDS, CLUSTER_STEPS),
+                ("join", join::run, GATE_JOIN_SEEDS, JOIN_STEPS),
+            ];
+            let mut failed = 0;
+            for (name, run, seeds, steps) in targets {
+                failed += target(name, run, 1, seeds, steps, None, false);
+                if first && failed > 0 {
+                    break;
+                }
+                if name == "cluster" {
+                    for seed in GATE_CLUSTER_ALSO {
+                        failed += target(name, run, seed, 1, steps, None, false);
+                    }
+                    if first && failed > 0 {
+                        break;
+                    }
+                }
+            }
+            failed
         }
         Some("meta") => one("meta", meta::run, META_STEPS),
         Some("cs") => one("cs", cs::run, CS_STEPS),
+        Some("inflight") => one("inflight", inflight::run, INFLIGHT_STEPS),
         Some("wire") => one("wire", wire::run, WIRE_STEPS),
+        Some("scrub") => one("scrub", scrub::run, SCRUB_STEPS),
         Some("cluster") => one("cluster", cluster::run, CLUSTER_STEPS),
+        Some("join") => one("join", join::run, JOIN_STEPS),
         Some(other) => {
-            eprintln!("nbs-fuzz: no target {} -- gate, meta, cs, wire, cluster", other);
+            eprintln!("nbs-fuzz: no target {} -- gate, meta, cs, inflight, wire, scrub, cluster, join", other);
             return ExitCode::from(2);
         }
     };

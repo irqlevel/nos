@@ -74,7 +74,9 @@ pub const VOTERS_MAX: usize = 5;
 pub const SNAPSHOT_MAX: u64 = 256 * 1024;
 
 /// What a snapshot of the state begins with.
-const MAGIC: &[u8; 4] = b"REG2";
+const MAGIC: &[u8; 4] = b"REG3";
+/// A snapshot's before addresses had ports (#99): read, each port 0.
+const MAGIC_NO_PORTS: &[u8; 4] = b"REG2";
 
 /// The cluster: made once, by its first host.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,11 +127,22 @@ impl Role {
     }
 }
 
-/// An address of a host's: IPv4, host order.
+/// An address of a host's: IPv4, host order, and its port -- 0 for the
+/// role's own: for ipc, ipcnet's (`ipcwire::PORT`), as before a port was
+/// said. Two hosts behind one address, a NAT's, have ports of their own
+/// (#99).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Addr {
     pub role: Role,
     pub ip: u32,
+    pub port: u16,
+}
+
+impl Addr {
+    /// Whether `ip` and `port` are this address: what no two hosts share.
+    pub fn is(&self, ip: u32, port: u16) -> bool {
+        self.ip == ip && self.port == port
+    }
 }
 
 /// A host of the cluster.
@@ -154,6 +167,11 @@ impl Host {
     /// The address the other hosts' ipcnet calls.
     pub fn ipc(&self) -> u32 {
         self.addrs.first().map_or(0, |a| a.ip)
+    }
+
+    /// The port it is called at there: 0 for ipcnet's own.
+    pub fn ipc_port(&self) -> u16 {
+        self.addrs.first().map_or(0, |a| a.port)
     }
 }
 
@@ -182,6 +200,8 @@ pub struct Invitation {
     pub id: u64,
     pub host: String,
     pub ip: u32,
+    /// Its port, 0 for ipcnet's own (#99).
+    pub port: u16,
     /// The key the host will come with: its ipcnet's.
     pub key: Fingerprint,
     pub secret_hash: [u8; 32],
@@ -193,6 +213,7 @@ pub struct Invitation {
 pub struct Peer {
     pub name: String,
     pub ip: u32,
+    pub port: u16,
     pub keys: Vec<Fingerprint>,
 }
 
@@ -288,13 +309,20 @@ impl State {
     /// knows it.
     pub fn peers_of(&self, me: &str) -> Vec<Peer> {
         let hosts = self.hosts.iter().filter(|h| h.name != me)
-            .map(|h| Peer { name: h.name.clone(), ip: h.ipc(), keys: h.keys.clone() });
+            .map(|h| Peer { name: h.name.clone(), ip: h.ipc(), port: h.ipc_port(), keys: h.keys.clone() });
         let invited = self.invitations.iter().filter(|i| i.host != me)
-            .map(|i| Peer { name: i.host.clone(), ip: i.ip, keys: alloc::vec![i.key] });
+            .map(|i| Peer { name: i.host.clone(), ip: i.ip, port: i.port, keys: alloc::vec![i.key] });
         hosts.chain(invited).collect()
     }
 
     /// Whether `key` is a host's or an open invitation's.
+    /// Whether `ip` and `port` are an address of a host's -- but the host
+    /// at `but` -- or an invitation's.
+    fn address_in_use(&self, ip: u32, port: u16, but: Option<usize>) -> bool {
+        self.hosts.iter().enumerate().any(|(i, h)| Some(i) != but && h.addrs.iter().any(|a| a.is(ip, port)))
+            || self.invitations.iter().any(|i| i.ip == ip && i.port == port)
+    }
+
     fn key_in_use(&self, key: &Fingerprint) -> bool {
         self.host_of_key(key).is_some() || self.invitations.iter().any(|i| i.key == *key)
     }
@@ -312,7 +340,7 @@ impl State {
     }
 
     fn change(&mut self, command: &Command) -> Result<u64, Refusal> {
-        if let Command::Init { now, cluster, name, host, key, ip } = command {
+        if let Command::Init { now, cluster, name, host, key, ip, port } = command {
             if self.cluster.is_some() {
                 return Err(Refusal::Initialized);
             }
@@ -327,7 +355,7 @@ impl State {
                 name: host.clone(),
                 node: 1,
                 keys: alloc::vec![*key],
-                addrs: alloc::vec![Addr { role: Role::Ipc, ip: *ip }],
+                addrs: alloc::vec![Addr { role: Role::Ipc, ip: *ip, port: *port }],
                 labels: Vec::new(),
                 maintenance: false,
                 joined: *now,
@@ -340,7 +368,7 @@ impl State {
         }
         match command {
             Command::Init { .. } => Err(Refusal::Initialized),
-            Command::Invite { now, id, host, ip, key, secret_hash, expires } => {
+            Command::Invite { now, id, host, ip, port, key, secret_hash, expires } => {
                 if !valid_name(host) {
                     return Err(Refusal::BadName);
                 }
@@ -353,9 +381,7 @@ impl State {
                 if self.invitation(*id).is_some() {
                     return Err(Refusal::InvitationExists);
                 }
-                if self.hosts.iter().any(|h| h.addrs.iter().any(|a| a.ip == *ip))
-                    || self.invitations.iter().any(|i| i.ip == *ip)
-                {
+                if self.address_in_use(*ip, *port, None) {
                     return Err(Refusal::AddressInUse);
                 }
                 if self.key_in_use(key) {
@@ -374,6 +400,7 @@ impl State {
                     id: *id,
                     host: host.clone(),
                     ip: *ip,
+                    port: *port,
                     key: *key,
                     secret_hash: *secret_hash,
                     expires: *expires,
@@ -399,7 +426,7 @@ impl State {
                     name: inv.host,
                     node,
                     keys: alloc::vec![inv.key],
-                    addrs: alloc::vec![Addr { role: Role::Ipc, ip: inv.ip }],
+                    addrs: alloc::vec![Addr { role: Role::Ipc, ip: inv.ip, port: inv.port }],
                     labels: Vec::new(),
                     maintenance: false,
                     joined: *now,
@@ -432,20 +459,18 @@ impl State {
                 h.maintenance = *on;
                 Ok(h.node)
             }
-            Command::Address { host, role, ip, .. } => {
+            Command::Address { host, role, ip, port, .. } => {
                 let at = self.hosts.iter().position(|h| h.name == *host).ok_or(Refusal::NoSuchHost)?;
                 if *ip == 0 && *role == Role::Ipc {
                     return Err(Refusal::BadAddress);
                 }
-                let taken = self.hosts.iter().enumerate().any(|(i, h)| i != at && h.addrs.iter().any(|a| a.ip == *ip))
-                    || self.invitations.iter().any(|i| i.ip == *ip);
-                if *ip != 0 && taken {
+                if *ip != 0 && self.address_in_use(*ip, *port, Some(at)) {
                     return Err(Refusal::AddressInUse);
                 }
                 let h = &mut self.hosts[at];
                 h.addrs.retain(|a| a.role != *role);
                 if *ip != 0 {
-                    h.addrs.push(Addr { role: *role, ip: *ip });
+                    h.addrs.push(Addr { role: *role, ip: *ip, port: *port });
                 }
                 /* The ipc address first, the rest by role */
                 h.addrs.sort_by_key(|a| a.role);
@@ -520,6 +545,7 @@ impl State {
             for a in &h.addrs {
                 w.u8(a.role.code());
                 w.u32(a.ip);
+                w.u16(a.port);
             }
             w.u8(h.labels.len() as u8);
             for l in &h.labels {
@@ -543,6 +569,7 @@ impl State {
             w.u64(i.id);
             w.str(&i.host);
             w.u32(i.ip);
+            w.u16(i.port);
             w.fixed(&i.key);
             w.fixed(&i.secret_hash);
             w.u64(i.expires);
@@ -561,9 +588,12 @@ impl State {
     pub fn decode(bytes: &[u8]) -> Result<State, RestoreError> {
         let bad = RestoreError("not a registry's state");
         let mut r = Reader::new(bytes);
-        if &r.fixed::<4>().ok_or(bad)? != MAGIC {
-            return Err(RestoreError("not a registry's snapshot"));
-        }
+        /* REG2's addresses have no ports: each the role's own, 0 */
+        let ports = match &r.fixed::<4>().ok_or(bad)? {
+            m if m == MAGIC => true,
+            m if m == MAGIC_NO_PORTS => false,
+            _ => return Err(RestoreError("not a registry's snapshot")),
+        };
         let mut s = State::new();
         s.cluster = match r.u8().ok_or(bad)? {
             0 => None,
@@ -583,7 +613,7 @@ impl State {
             return Err(RestoreError("more hosts than a cluster takes"));
         }
         for _ in 0..hosts {
-            s.hosts.push(read_host(&mut r)?);
+            s.hosts.push(read_host(&mut r, ports)?);
         }
         let removed = r.u32().ok_or(bad)? as usize;
         if removed > REMOVED_MAX {
@@ -607,13 +637,14 @@ impl State {
             let id = r.u64().ok_or(bad)?;
             let host = r.str(ipcwire::HOST_MAX).ok_or(bad)?;
             let ip = r.u32().ok_or(bad)?;
+            let port = if ports { r.u16().ok_or(bad)? } else { 0 };
             let key = r.fixed().ok_or(bad)?;
             let secret_hash = r.fixed().ok_or(bad)?;
             let expires = r.u64().ok_or(bad)?;
             if !valid_name(host) || ip == 0 {
                 return Err(RestoreError("an invitation of no host or no address"));
             }
-            s.invitations.push(Invitation { id, host: String::from(host), ip, key, secret_hash, expires });
+            s.invitations.push(Invitation { id, host: String::from(host), ip, port, key, secret_hash, expires });
         }
         let retired = r.u32().ok_or(bad)? as usize;
         if retired > RETIRED_MAX {
@@ -670,8 +701,8 @@ impl State {
                 return Err(RestoreError("a host's name twice"));
             }
             for a in &h.addrs {
-                let taken = self.hosts[..i].iter().any(|o| o.addrs.iter().any(|b| b.ip == a.ip))
-                    || self.invitations.iter().any(|v| v.ip == a.ip);
+                let taken = self.hosts[..i].iter().any(|o| o.addrs.iter().any(|b| b.is(a.ip, a.port)))
+                    || self.invitations.iter().any(|v| v.ip == a.ip && v.port == a.port);
                 if taken {
                     return Err(RestoreError("an address twice"));
                 }
@@ -679,7 +710,7 @@ impl State {
         }
         for (i, v) in self.invitations.iter().enumerate() {
             let twice = self.invitations[..i].iter()
-                .any(|o| o.id == v.id || o.host == v.host || o.ip == v.ip || o.key == v.key);
+                .any(|o| o.id == v.id || o.host == v.host || (o.ip == v.ip && o.port == v.port) || o.key == v.key);
             if twice || self.host_of_key(&v.key).is_some() || self.key_removed(&v.key) {
                 return Err(RestoreError("an invitation twice, or of a key in use or removed"));
             }
@@ -721,7 +752,8 @@ fn read_keys(r: &mut Reader<'_>) -> Result<Vec<Fingerprint>, RestoreError> {
     Ok(keys)
 }
 
-fn read_host(r: &mut Reader<'_>) -> Result<Host, RestoreError> {
+/// A host as a snapshot has it: its addresses' ports read where `ports`.
+fn read_host(r: &mut Reader<'_>, ports: bool) -> Result<Host, RestoreError> {
     let bad = RestoreError("not a registry's state");
     let name = r.str(ipcwire::HOST_MAX).ok_or(bad)?;
     if !valid_name(name) {
@@ -737,11 +769,12 @@ fn read_host(r: &mut Reader<'_>) -> Result<Host, RestoreError> {
     for k in 0..n {
         let role = Role::from_code(r.u8().ok_or(bad)?).ok_or(RestoreError("an address of no role"))?;
         let ip = r.u32().ok_or(bad)?;
+        let port = if ports { r.u16().ok_or(bad)? } else { 0 };
         /* The ipc address first, each role once, none 0 */
         if (k == 0) != (role == Role::Ipc) || addrs.iter().any(|a| a.role == role) || ip == 0 {
             return Err(RestoreError("a host's addresses out of rule"));
         }
-        addrs.push(Addr { role, ip });
+        addrs.push(Addr { role, ip, port });
     }
     let n = usize::from(r.u8().ok_or(bad)?);
     if n > LABELS_MAX {

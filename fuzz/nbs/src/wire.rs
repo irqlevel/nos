@@ -3,15 +3,18 @@
 //!
 //! - **Every message read back as written**: random requests, answers,
 //!   questions and their answers, of every kind and at their limits, encoded
-//!   and decoded the same.
+//!   and decoded the same -- a write passed along its chain (N13) among
+//!   them, and what a cs passes on of it (`relay_on`) read as the next
+//!   replica's: its id and mark, the hops after it, the same mailbox.
 //! - **Bytes read as they are, or as none**: random bytes, and messages
 //!   spoiled -- a byte changed, cut short, grown -- read without a panic; any
 //!   that read as a message encode back to exactly those bytes. One encoding
 //!   a message, so that two hosts never read one message two ways.
 
 use nbscs::{ChunkRef, Epoch};
-use nbswire::{Answer, Answered, Ask, Asking, Device, Identity, Op, Place, Query, Question, Refusal, Reply,
-              ReplicaState, Request, Said, Saying, Told, DATA_MAX, LIST_MAX, MAP_MAX, REASON_MAX};
+use nbswire::{Answer, Answered, Ask, Asking, Device, Hop, Identity, JoinView, Op, Place, Query, Question, Refusal,
+              Relay, Reply, ReplicaState, Request, Said, Saying, Told, DATA_MAX, LIST_MAX, MAP_MAX, REASON_MAX,
+              RELAY_HOPS_MAX, RELAY_NAME_MAX};
 
 use crate::rng::{mix, Rng};
 
@@ -29,28 +32,36 @@ fn len(r: &mut Rng, max: u64) -> usize {
 }
 
 fn refusal(r: &mut Rng) -> Refusal {
-    match r.below(16) {
+    match r.below(17) {
         0 => Refusal::Fenced { generation: r.below(u64::MAX) },
         1 => Refusal::NotFenced { generation: r.below(u64::MAX) },
         2 => Refusal::StaleChunk { incarnation: r.below(1 << 32) as u32 },
         3 => Refusal::Epoch { known: Epoch { set: r.below(1 << 32) as u32, version: r.below(1 << 32) as u32 } },
-        4 => Refusal::NotTheVolumes,
-        5 => Refusal::NoRoom,
-        6 => Refusal::Bad,
-        7 => Refusal::Failed,
-        8 => Refusal::Io,
-        9 => Refusal::TooManyFences,
-        10 => Refusal::NotTheMap,
-        11 => Refusal::NotHere,
-        12 => Refusal::NotAttached,
-        13 => Refusal::Behind { applied: r.below(u64::MAX) },
-        14 => Refusal::NoMds,
+        4 => Refusal::NoRoom,
+        5 => Refusal::Bad,
+        6 => Refusal::Failed,
+        7 => Refusal::Io,
+        8 => Refusal::TooManyFences,
+        9 => Refusal::NotTheMap,
+        10 => Refusal::NotHere,
+        11 => Refusal::NotAttached,
+        12 => Refusal::Behind { applied: r.below(u64::MAX) },
+        13 => Refusal::NoMds,
+        14 => Refusal::NotHeld,
+        15 => Refusal::NotTheJoiner,
         _ => Refusal::NotReady,
     }
 }
 
 /// A name, now and then at a limit's length, or past it -- which the writer
 /// keeps and the reader refuses.
+/// A relay's name, within its limits: a mailbox's with its host's, or a
+/// host's.
+fn relay_name(r: &mut Rng) -> String {
+    let n = 1 + r.below(RELAY_NAME_MAX as u64) as usize;
+    (0..n).map(|i| (b'a' + (mix(r.below(1 << 20), i as u64) % 26) as u8) as char).collect()
+}
+
 fn name(r: &mut Rng, max: usize) -> String {
     let n = match r.below(10) {
         0 => 0,
@@ -78,10 +89,22 @@ fn reason(r: &mut Rng) -> String {
 
 fn state(r: &mut Rng) -> ReplicaState {
     match r.below(3) {
-        0 => ReplicaState::Active,
-        1 => ReplicaState::Rebuilding,
+        0 | 1 => ReplicaState::Active,
         _ => ReplicaState::Down,
     }
+}
+
+/// A place: its chunk, three cs's and their states, and a joiner as the
+/// reader takes one -- none, a cs no member is, or a member down back.
+fn place(r: &mut Rng) -> Place {
+    let cs = [r.below(1 << 32) as u32, r.below(1 << 32) as u32, r.below(1 << 32) as u32];
+    let replicas = [state(r), state(r), state(r)];
+    let joiner = match r.below(3) {
+        0 => None,
+        1 => (0..3).find(|&k| replicas[k] == ReplicaState::Down).map(|k| cs[k]),
+        _ => Some(r.below(u64::from(u32::MAX)) as u32).filter(|j| !cs.contains(j)),
+    };
+    Place { chunk: chunk(r), cs, replicas, joiner, shared: r.chance(30) }
 }
 
 /// Every kind of message, at random: its kind, its bytes, and whether the
@@ -89,10 +112,37 @@ fn state(r: &mut Rng) -> ReplicaState {
 /// asked for past MAP_MAX.
 fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
     let id = r.below(u64::MAX);
-    match r.below(6) {
+    match r.below(7) {
+        /* A write passed along its chain, and what its cs passes on (N13) */
+        6 => {
+            let n = len(r, u64::from(DATA_MAX));
+            let op = Op::Write { chunk: chunk(r), position: r.below(1 << 32) as u32, index: r.below(u64::MAX),
+                                 offset: r.below(1 << 32) as u32, data: &data[..n] };
+            let m = Request { id, volume: r.below(1 << 32) as u32, generation: r.below(u64::MAX), op };
+            let answer = relay_name(r);
+            let hosts: Vec<String> = (0..r.below(RELAY_HOPS_MAX as u64 + 1)).map(|_| relay_name(r)).collect();
+            let next: Vec<Hop<'_>> = hosts.iter().map(|host| Hop { id: r.below(u64::MAX), mark: r.below(u64::MAX), host })
+                .collect();
+            let relay = Relay { answer: &answer, mark: r.below(u64::MAX), next };
+            let bytes = m.try_encode_relayed(&relay).expect("a relay within its limits encoded");
+            match nbswire::relay_on(&m, &relay) {
+                None => assert!(relay.next.is_empty(), "a relay with hops after it not passed on"),
+                Some((host, on)) => {
+                    let (got, got_relay) = Request::decode_relayed(&on).expect("what a cs passes on read back");
+                    let got_relay = got_relay.expect("what a cs passes on has its relay");
+                    let want = Relay { answer: relay.answer, mark: relay.next[0].mark, next: relay.next[1..].to_vec() };
+                    assert_eq!(host, relay.next[0].host, "passed on to another host than the next");
+                    assert_eq!(got.id, relay.next[0].id, "passed on with another id than the next replica's");
+                    assert_eq!((got.volume, got.generation, &got.op), (m.volume, m.generation, &m.op),
+                               "passed on as another write");
+                    assert_eq!(got_relay, want, "passed on with another relay than the rest of the chain's");
+                }
+            }
+            (6, bytes, true)
+        }
         0 => {
             let n = len(r, u64::from(DATA_MAX));
-            let op = match r.below(6) {
+            let op = match r.below(12) {
                 0 => Op::Fence,
                 1 => Op::Write { chunk: chunk(r), position: r.below(1 << 32) as u32, index: r.below(u64::MAX),
                                  offset: r.below(1 << 32) as u32, data: &data[..n] },
@@ -101,14 +151,27 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                 3 => Op::Flush,
                 4 => Op::Close { chunk: chunk(r), position: r.below(1 << 32) as u32, index: r.below(u64::MAX) },
                 5 if r.chance(50) => Op::Ping,
-                _ => Op::Held,
+                5 => Op::Held,
+                /* A joiner's asks of a source (N9) */
+                6 => Op::Holdings { set: r.below(1 << 32) as u32, from: r.below(1 << 32) as u32,
+                                    joiner: r.below(1 << 32) as u32, version: r.below(1 << 32) as u32,
+                                    index: r.below(u64::MAX) },
+                7 => Op::Pull { chunk: chunk(r), joiner: r.below(1 << 32) as u32, index: r.below(u64::MAX),
+                                offset: r.below(1 << 32) as u32, len: r.below(u64::from(DATA_MAX) + 1) as u32 },
+                /* The leader's scrub (N9e) */
+                8 => Op::Scrub { chunk: chunk(r) },
+                /* A copy-up's copy (N10) */
+                9 => Op::CopyUp { from: chunk(r), to: chunk(r), position: r.below(1 << 32) as u32,
+                                  index: r.below(u64::MAX) },
+                _ => Op::Sums { chunk: chunk(r), joiner: r.below(1 << 32) as u32, index: r.below(u64::MAX),
+                                offset: r.below(1 << 32) as u32, len: r.below(nbscs::SLOT + 1) as u32 },
             };
             let m = Request { id, volume: r.below(1 << 32) as u32, generation: r.below(u64::MAX), op };
             (0, m.encode(), true)
         }
         1 => {
             let n = len(r, u64::from(DATA_MAX));
-            let reply = match r.below(6) {
+            let reply = match r.below(10) {
                 0 => Reply::Fenced { generation: r.below(u64::MAX) },
                 1 => Reply::Done,
                 2 => Reply::Data(&data[..n]),
@@ -117,12 +180,26 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                     let k = len(r, LIST_MAX as u64);
                     Reply::Held((0..k).map(|i| (i as u32, r.below(1 << 32) as u32, r.below(u64::MAX))).collect())
                 }
+                5 => {
+                    let k = len(r, LIST_MAX as u64);
+                    Reply::Chunks((0..k).map(|i| (i as u32, r.below(1 << 32) as u32, r.below(1 << 32) as u32,
+                                                  r.below(1 << 32) as u32)).collect())
+                }
+                6 => {
+                    let k = len(r, nbswire::SUMS_MAX as u64);
+                    Reply::Sums((0..k).map(|_| r.below(1 << 32) as u32).collect())
+                }
+                7 => {
+                    let k = len(r, nbswire::SUMS_MAX as u64);
+                    Reply::Scrub { open: r.chance(50), written: r.below(1 << 32) as u32,
+                                   sums: (0..k).map(|_| r.below(1 << 32) as u32).collect() }
+                }
                 _ => Reply::Refused(refusal(r)),
             };
             (1, Answer { id, reply }.encode(), true)
         }
         2 => {
-            let question = match r.below(4) {
+            let question = match r.below(9) {
                 0 => Question::Identity,
                 1 => Question::Verify { volume: r.below(1 << 32) as u32, generation: r.below(u64::MAX), chunk: chunk(r),
                                         position: r.below(1 << 32) as u32, index: r.below(u64::MAX),
@@ -131,15 +208,25 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                     let k = len(r, LIST_MAX as u64);
                     Question::Live { chunks: (0..k).map(|i| (i as u32, r.below(1 << 32) as u32)).collect() }
                 }
-                _ => {
+                3 => {
                     let k = len(r, LIST_MAX as u64);
                     Question::Volumes { volumes: (0..k).map(|i| i as u32).collect() }
                 }
+                /* A source's of a joiner, and a joiner's of its joins (N9) */
+                4 => Question::VerifyJoin { set: r.below(1 << 32) as u32, joiner: r.below(1 << 32) as u32,
+                                            version: r.below(1 << 32) as u32, index: r.below(u64::MAX) },
+                5 => Question::Joins,
+                6 => Question::JoinDone { set: r.below(1 << 32) as u32, since: r.below(1 << 32) as u32 },
+                7 => Question::GiveUp { set: r.below(1 << 32) as u32, since: r.below(1 << 32) as u32 },
+                /* A copy-up's copy (N10) */
+                _ => Question::VerifyCopy { volume: r.below(1 << 32) as u32, generation: r.below(u64::MAX),
+                                            position: r.below(1 << 32) as u32, from: chunk(r), to: chunk(r),
+                                            index: r.below(u64::MAX) },
             };
             (2, Query { id, question }.encode(), true)
         }
         3 => {
-            let told = match r.below(5) {
+            let told = match r.below(7) {
                 0 => Told::Identity(None),
                 1 => {
                     let n = r.below(nbsmeta::DEVICES_MAX as u64 + 1) as usize;
@@ -157,15 +244,40 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                 }
                 2 => Told::Verified,
                 3 => Told::Refused(refusal(r)),
-                _ => {
+                4 => {
                     let k = len(r, LIST_MAX as u64);
                     Told::Gone((0..k).map(|i| i as u32).collect())
                 }
+                5 => Told::VerifiedJoining { since: r.below(1 << 32) as u32 },
+                _ => {
+                    /* A place past the three, and a name past its limit, now
+                       and then: the reader's to refuse */
+                    let k = len(r, 40);
+                    Told::Joins((0..k).map(|_| {
+                        let n = r.below(nbsmeta::REPLICAS as u64 + 1) as usize;
+                        JoinView {
+                            set: r.below(1 << 32) as u32,
+                            place: if r.chance(3) { 3 + r.below(253) as u8 } else { r.below(3) as u8 },
+                            since: r.below(1 << 32) as u32,
+                            version: r.below(1 << 32) as u32,
+                            own: r.chance(50),
+                            until: r.below(1 << 32) as u32,
+                            sources: (0..n).map(|i| (i as u32, name(r, nbsmeta::NAME_MAX))).collect(),
+                            index: r.below(u64::MAX),
+                            fences: (0..len(r, 20)).map(|_| (r.below(1 << 32) as u32, r.below(u64::MAX))).collect(),
+                        }
+                    }).collect())
+                }
             };
-            (3, Answered { id, told }.encode(), true)
+            let ok = match &told {
+                Told::Joins(joins) => joins.iter().all(|j| usize::from(j.place) < nbsmeta::REPLICAS
+                    && j.sources.iter().all(|(_, h)| h.len() <= nbsmeta::NAME_MAX)),
+                _ => true,
+            };
+            (3, Answered { id, told }.encode(), ok)
         }
         4 => {
-            let ask = match r.below(4) {
+            let ask = match r.below(8) {
                 0 => Ask::Attach { name: name(r, nbsmeta::VOLUME_NAME_MAX), writable: r.chance(50),
                                    force: r.chance(50), token: r.below(u64::MAX) },
                 1 => Ask::Detach { name: name(r, nbsmeta::VOLUME_NAME_MAX), generation: r.below(u64::MAX) },
@@ -179,27 +291,36 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                     Ask::Map { name: name(r, nbsmeta::VOLUME_NAME_MAX), from: r.below(1 << 32) as u32, count,
                                index: r.below(u64::MAX) }
                 }
-                _ => Ask::Down { set: r.below(1 << 32) as u32, cs: r.below(1 << 32) as u32, refused: r.chance(50),
+                3 => Ask::Down { set: r.below(1 << 32) as u32, cs: r.below(1 << 32) as u32, refused: r.chance(50),
                                  name: name(r, nbsmeta::VOLUME_NAME_MAX), generation: r.below(u64::MAX) },
+                /* A copy-up's asks (N10), a pause's answer (N10c2) */
+                4 => Ask::CopyUp { name: name(r, nbsmeta::VOLUME_NAME_MAX), place: r.below(1 << 32) as u32,
+                                   generation: r.below(u64::MAX) },
+                5 => Ask::Paused { name: name(r, nbsmeta::VOLUME_NAME_MAX), generation: r.below(u64::MAX),
+                                   pause: r.below(u64::MAX) },
+                6 => Ask::Reattach { name: name(r, nbsmeta::VOLUME_NAME_MAX), generation: r.below(u64::MAX),
+                                     token: r.below(u64::MAX) },
+                _ => Ask::CopyDone { name: name(r, nbsmeta::VOLUME_NAME_MAX), place: r.below(1 << 32) as u32,
+                                     generation: r.below(u64::MAX), chunk: r.below(1 << 32) as u32,
+                                     incarnation: r.below(1 << 32) as u32 },
             };
             let ok = match &ask {
                 Ask::Attach { name, .. } | Ask::Detach { name, .. } => name.len() <= nbsmeta::VOLUME_NAME_MAX,
                 Ask::Map { name, count, .. } => name.len() <= nbsmeta::VOLUME_NAME_MAX && *count <= MAP_MAX,
-                Ask::Down { name, .. } => name.len() <= nbsmeta::VOLUME_NAME_MAX,
+                Ask::Down { name, .. } | Ask::CopyUp { name, .. } | Ask::CopyDone { name, .. }
+                | Ask::Paused { name, .. } | Ask::Reattach { name, .. } => {
+                    name.len() <= nbsmeta::VOLUME_NAME_MAX
+                }
             };
             (4, Asking { id, ask }.encode(), ok)
         }
         _ => {
-            let said = match r.below(9) {
+            let said = match r.below(12) {
                 0 => Said::Attached { generation: r.below(u64::MAX), index: r.below(u64::MAX) },
                 1 => Said::Detached { index: r.below(u64::MAX) },
                 2 => {
                     let k = len(r, u64::from(MAP_MAX));
-                    let map = (0..k).map(|_| Place {
-                        chunk: chunk(r),
-                        cs: [r.below(1 << 32) as u32, r.below(1 << 32) as u32, r.below(1 << 32) as u32],
-                        replicas: [state(r), state(r), state(r)],
-                    }).collect();
+                    let map = (0..k).map(|_| place(r)).collect();
                     let h = r.below(nbsmeta::CS_MAX as u64 + 1) as usize;
                     let hosts = (0..h).map(|i| (i as u32, name(r, nbsmeta::NAME_MAX))).collect();
                     Said::Map { volume: r.below(1 << 32) as u32, size_mib: r.below(u64::MAX), places: k as u32,
@@ -210,6 +331,12 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                 5 => Said::NotNow(reason(r)),
                 6 => Said::LastReplica,
                 7 => Said::NotTheWriter,
+                /* A copy-up's chunk (N10) */
+                8 => Said::Chunk { chunk: r.below(1 << 32) as u32, incarnation: r.below(1 << 32) as u32,
+                                   index: r.below(u64::MAX) },
+                /* A pause for a snapshot, and its end (N10c2) */
+                9 => Said::Pause { pause: r.below(u64::MAX) },
+                10 => Said::GoOn { pause: r.below(u64::MAX), index: r.below(u64::MAX) },
                 _ => Said::Refused(reason(r)),
             };
             let ok = match &said {
@@ -230,7 +357,11 @@ fn read_back(kind: u8, b: &[u8]) -> Result<bool, String> {
         2 => Query::decode(b).map(|m| m.encode()),
         3 => Answered::decode(b).map(|m| m.encode()),
         4 => Asking::decode(b).map(|m| m.encode()),
-        _ => Saying::decode(b).map(|m| m.encode()),
+        5 => Saying::decode(b).map(|m| m.encode()),
+        _ => Request::decode_relayed(b).and_then(|(m, relay)| match relay {
+            Some(x) => m.try_encode_relayed(&x),
+            None => Some(m.encode()),
+        }),
     };
     match again {
         Some(e) if e != b => Err(format!("kind {}: {} bytes read as a message that encodes as {} other bytes", kind,
@@ -268,13 +399,13 @@ pub fn run(seed: u64, steps: u64, _trace: bool) -> Result<(), String> {
             }
             _ => {}
         }
-        for k in 0..6 {
+        for k in 0..7 {
             read_back(k, &spoiled).map_err(|e| format!("step {}, spoiled: {}", step, e))?;
         }
         /* And noise */
         let n = r.below(64) as usize;
         let noise: Vec<u8> = (0..n).map(|_| r.below(256) as u8).collect();
-        for k in 0..6 {
+        for k in 0..7 {
             read_back(k, &noise).map_err(|e| format!("step {}, noise: {}", step, e))?;
         }
     }
