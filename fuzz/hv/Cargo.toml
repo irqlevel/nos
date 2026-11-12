@@ -4,7 +4,7 @@
 # the run loop that dispatches a guest's exits (hypervisor/hv/src/run.rs), and the
 # guests' DHCP server -- compiled from their own sources over stand-ins for
 # the kernel and the CPU (scripts/hv-fuzz.py builds and runs it). Nothing
-# but netwire and conf, paths of their own, so it builds offline.
+# but netwire, conf and bzimage, paths of their own, so it builds offline.
 [package]
 name = "hv-fuzz"
 version = "0.1.0"
@@ -17,6 +17,9 @@ netwire = { path = "../../src/crates/common/net/netwire" }
 # vm.toml's text, as the module reads it (the config target). No
 # dependencies of its own either.
 conf = { path = "../../src/crates/common/text/conf" }
+# A bzImage's header and the zero page the Linux loader makes a guest's by
+# (the linux and platform targets). No dependencies of its own either.
+bzimage = { path = "../../src/crates/common/boot/bzimage" }
 
 # What a RUSTUB=1 kernel has on: an overflow is a panic, not a wrap -- and a
 # guest that can cause one can bring down the host that runs it.

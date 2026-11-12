@@ -1,0 +1,14 @@
+[package]
+name = "bzimage"
+version = "0.1.0"
+edition = "2021"
+
+# A Linux bzImage as a loader reads it by the 64-bit boot protocol: its
+# setup header, held to what that protocol needs, and the zero page a
+# loader hands the kernel. hv loads a guest's kernel by it, hvboot -- the
+# loader a guest boots its own kernel with -- does too, and their fuzzers
+# link the same copy. No kernel in it, no allocation, no dependency, and
+# nothing unsafe (`forbid`).
+[lib]
+
+[dependencies]

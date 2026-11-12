@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "bzimage"
+version = "0.1.0"
+
+[[package]]
 name = "crc"
 version = "0.1.0"
 
@@ -17,6 +21,7 @@ dependencies = [
 name = "hvboot-test"
 version = "0.1.0"
 dependencies = [
+ "bzimage",
  "crc",
  "extfmt",
 ]

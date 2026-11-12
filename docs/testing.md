@@ -2585,7 +2585,8 @@ the guest boots something else -- an older kernel, the recovery entry --
 with nothing to say so. What it boots is its `plan`'s to work out
 (`src/crates/hypervisor/hvboot/src/plan.rs`, with no platform in it), and
 `fuzz/hvboot` compiles that, with the readers it reads through
-(`{gpt,ext,grub,bzimage}.rs`, over extfmt and the tree's `crc`), the RAM's
+(`{gpt,ext,grub}.rs`, over extfmt and the tree's `crc`, and the bzImage crate
+it loads a kernel by, `src/crates/common/boot/bzimage`), the RAM's
 bookkeeping and the loader's command line (`ram.rs`, `options.rs`), from
 their own sources into a host program: the boot's own rules, not a copy of
 them. It runs them under hvboot's own heap -- every allocation hvboot's code

@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::Infallible;
 
-use crate::bzimage::{self, ENTRY64_OFFSET, ZERO_PAGE_BYTES};
+use bzimage::{Loaded, ENTRY64_OFFSET, ZERO_PAGE_BYTES};
 use crate::io::rdtsc;
 use crate::options::Options;
 use crate::plan::{self, letter};
@@ -64,8 +64,16 @@ pub fn run(start_info: u64) -> Result<Infallible, String> {
     cmdline.push(0);
     let cmdline: &'static [u8] = cmdline.leak();
     let page: &'static mut [u8; ZERO_PAGE_BYTES] = alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; ZERO_PAGE_BYTES]));
-    bzimage::zero_page(&plan.first, &plan.header, cmdline.as_ptr() as u64, plan.line.len(),
-                       (initrd_at, plan.initrd_len), &si.memmap, si.rsdp, page)?;
+    /* The zero page by the copy hv makes a guest's with (`bzimage`), the
+     * three addresses it holds 32 bits wide. */
+    let (Ok(cmdline_at), Ok(initrd_at32), Ok(initrd_len)) =
+        (u32::try_from(cmdline.as_ptr() as u64), u32::try_from(initrd_at), u32::try_from(plan.initrd_len))
+    else {
+        return Err(String::from("a command line or an initrd above 4 GiB"));
+    };
+    let loaded = Loaded { cmdline: cmdline_at, cmdline_len: plan.line.len(), initrd: (initrd_at32, initrd_len),
+                          rsdp: si.rsdp };
+    bzimage::zero_page(&plan.first, &plan.header, &loaded, &si.memmap, page).map_err(|e| alloc::format!("{}", e))?;
 
     let t1 = rdtsc();
     let h = &plan.header;

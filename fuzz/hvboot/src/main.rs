@@ -52,8 +52,6 @@ macro_rules! say {
 
 #[path = "../../../src/crates/hypervisor/hvboot/src/arena.rs"]
 mod arena;
-#[path = "../../../src/crates/hypervisor/hvboot/src/bzimage.rs"]
-mod bzimage;
 #[path = "../../../src/crates/hypervisor/hvboot/src/disk.rs"]
 mod disk;
 #[path = "../../../src/crates/hypervisor/hvboot/src/ext.rs"]
@@ -314,11 +312,11 @@ fn open(path: &str, writable: bool) -> Image {
 /* The guest the harness boots into, as hv makes one: RAM below 640 KiB and
  * from 1 MiB to 128 MiB, the loader's image at 1 MiB -- what `Ram` places
  * a kernel and its initrds in. */
-const MEMMAP: [ram::MemEntry; 2] = [ram::MemEntry { addr: 0, size: 0x9_FC00, kind: ram::E820_RAM },
-                                    ram::MemEntry { addr: 1 << 20, size: (127 << 20), kind: ram::E820_RAM }];
+const MEMMAP: [ram::E820Entry; 2] = [ram::E820Entry { addr: 0, size: 0x9_FC00, kind: ram::E820_RAM },
+                                     ram::E820Entry { addr: 1 << 20, size: (127 << 20), kind: ram::E820_RAM }];
 const IMAGE: (u64, u64) = (1 << 20, 6 << 20);
 const RSDP: u64 = 0xE_0000;
-const CMDLINE_AT: u64 = 0x2_0000;
+const CMDLINE_AT: u32 = 0x2_0000;
 /// What RAM held before the loader read into it: every byte it gives the
 /// kernel, the padding between initrds too, it has to have written.
 const STALE: u8 = 0xA5;
@@ -350,8 +348,12 @@ fn boot_in(disks: &mut [Image], cmdline: &str) -> Result<Booted, String> {
     plan::load(disks, &plan, &mut kernel, &mut initrd)?;
     let mut page = [0u8; bzimage::ZERO_PAGE_BYTES];
     let initrd_at = place.initrd.as_ref().map_or(0, ram::Loan::addr);
-    bzimage::zero_page(&plan.first, &plan.header, CMDLINE_AT, plan.line.len(), (initrd_at, plan.initrd_len),
-                       &MEMMAP, RSDP, &mut page)?;
+    let (Ok(initrd_at), Ok(initrd_len)) = (u32::try_from(initrd_at), u32::try_from(plan.initrd_len)) else {
+        return Err(String::from("an initrd above 4 GiB"));
+    };
+    let loaded = bzimage::Loaded { cmdline: CMDLINE_AT, cmdline_len: plan.line.len(), initrd: (initrd_at, initrd_len),
+                                   rsdp: RSDP };
+    bzimage::zero_page(&plan.first, &plan.header, &loaded, &MEMMAP, &mut page).map_err(|e| e.to_string())?;
     let (kernel_name, line) = heap::outside(|| (plan.kernel_name.clone(), plan.line.clone()));
     Ok(Booted { kernel_name, kernel, initrd, line })
 }

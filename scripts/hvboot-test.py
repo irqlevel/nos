@@ -6,7 +6,8 @@ the guest's own partition table, its ext2/3/4 /boot and its GRUB
 configuration, and boots the entry GRUB would. What it boots is its `plan`'s
 to work out -- src/crates/hypervisor/hvboot/src/plan.rs, with no platform in
 it -- and fuzz/hvboot compiles that, and the readers it reads through
-({gpt,ext,grub,bzimage}.rs over extfmt and the tree's CRCs), as they are,
+({gpt,ext,grub}.rs over extfmt and the tree's CRCs, and the bzImage crate,
+src/crates/common/boot/bzimage), as they are,
 into a host program: the boot's own rules, not a second copy of them, run
 under hvboot's own heap -- arena.rs's arithmetic, no bigger than its heap --
 over disks made here:

@@ -12,15 +12,9 @@ use alloc::vec::Vec;
 /// past it.
 pub const MAPPED: u64 = 1 << 32;
 
-pub const E820_RAM: u32 = 1;
-
-/// An entry of the memory map, as e820 has them.
-#[derive(Clone, Copy, Debug)]
-pub struct MemEntry {
-    pub addr: u64,
-    pub size: u64,
-    pub kind: u32,
-}
+/// An entry of the memory map, as e820 has them -- and PVH's start info,
+/// and the zero page the kernel is handed (`bzimage`).
+pub use bzimage::{E820Entry, E820_RAM};
 
 /// A range taken by [`Ram::take`]: RAM the memory map has, below 4 GiB,
 /// clear of the loader's image and of every range taken before it. It is
@@ -50,7 +44,7 @@ pub struct Ram {
 }
 
 impl Ram {
-    pub fn new(map: &[MemEntry], image: (u64, u64)) -> Ram {
+    pub fn new(map: &[E820Entry], image: (u64, u64)) -> Ram {
         let ram = map.iter().filter(|e| e.kind == E820_RAM).filter_map(|e| Some((e.addr, e.addr.checked_add(e.size)?)))
             .collect();
         Ram { ram, image, taken: Vec::new() }

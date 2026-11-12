@@ -1922,9 +1922,39 @@ fn linux(r: &mut Input) {
         let mut n = [0u8; 1];
         memory.read(0x7000 + 0x1e8, &mut n).expect("the e820 count");
         e820_held(&memory, 0x7000 + 0x2d0, 20, usize::from(n[0]), mem_bytes);
+        zero_page_held(&memory, &first, &l, usize::from(n[0]), firmware.map(|f| f.rsdp));
     }
     let mut vcpu = crate::vm::Backend::default();
     set_entry(&mut vcpu, &l);
+}
+
+/// The zero page at 0x7000 held to the boot protocol -- read by its offsets
+/// here, not through `bzimage`, which wrote it for hv and writes hvboot's:
+/// the header as the image has it, from 0x1f1 to the end its byte at 0x201
+/// says, but for what a loader owns and the memory map's `entries` laid
+/// over it; the loader's type undefined; loaded high; the command line at
+/// the loader's 0x20000; no heap, and the extended loader's bytes clear;
+/// the initrd where the plan put it; and the RSDP the firmware's, or none.
+fn zero_page_held(memory: &GuestMemory, first: &[u8], l: &crate::linux::Layout, entries: usize, rsdp: Option<u64>) {
+    let mut page = [0u8; 4096];
+    memory.read(0x7000, &mut page).expect("the zero page");
+    let word = |at: usize| u32::from_le_bytes(page[at..at + 4].try_into().unwrap());
+    let owned = [0x210..0x212, 0x218..0x220, 0x224..0x22C, 0x2D0..0x2D0 + entries * 20];
+    let end = (0x202 + usize::from(first[0x201])).min(first.len());
+    for at in (0x1F1..end).filter(|at| !owned.iter().any(|r| r.contains(at))) {
+        invariant!(page[at] == first[at], "the zero page's byte {:#x} is {:#x}, the image's {:#x}", at, page[at],
+                   first[at]);
+    }
+    invariant!(page[0x210] == 0xFF, "type_of_loader {:#x}, not an undefined loader's", page[0x210]);
+    invariant!(page[0x211] == first[0x211] | 1, "loadflags {:#x}, of the image's {:#x}: not loaded high",
+               page[0x211], first[0x211]);
+    invariant!(word(0x228) == 0x2_0000, "cmd_line_ptr {:#x}, where the line is at 0x20000", word(0x228));
+    invariant!(word(0x224) == 0, "heap_end_ptr and the extended loader's bytes {:#x}", word(0x224));
+    invariant!(u64::from(word(0x218)) == l.initrd_addr && u64::from(word(0x21C)) == l.initrd_len,
+               "the initrd at {:#x}, {:#x} bytes: planned at {:#x}, {:#x}", word(0x218), word(0x21C), l.initrd_addr,
+               l.initrd_len);
+    let at = u64::from_le_bytes(page[0x70..0x78].try_into().unwrap());
+    invariant!(at == rsdp.unwrap_or(0), "acpi_rsdp_addr {:#x}, where the firmware's is {:?}", at, rsdp);
 }
 
 /// A memory map of `n` entries at `map`, `stride` bytes apart, held to the
