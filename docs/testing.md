@@ -3436,10 +3436,21 @@ passed none on fails, and a write of a session that chains sent without
 its mark fails as it is sent; each joiner's view of its join held to the
 metadata -- every volume a writer has had with a chunk in the set among
 its fences, at its newest generation -- and the joiner's cs fenced so
-before its copy begins; the leader's
-look at a cs before it is taken out the fuzzer's, mostly that it answers --
-always, once a host is lost for good at the end, as nbs-cs answers a look
-whatever it is doing.
+before its copy begins; a write failed at its deadline that left its
+replicas apart -- on some active replica of a block, not on another --
+followed by its session's attach anew -- no close of the old generation's
+after it -- and
+a session serving again at a newer generation finding every block no
+write is out to alike, which the `cut_write` end brings about: one active
+replica of a chunk cut off from every host but its own, its host up, while
+the writer writes the chunk past its deadline; never more of a session's
+places closing at once than its window -- two, as the fuzzer builds
+nbsclient (`small_windows`) -- and a close asked alone of a few places done
+in a moment, every place closed on every active replica (the
+`close_all_written` end); the leader's look at a cs before it is taken out
+the fuzzer's, mostly that it answers -- always once a host is lost for good
+at the end, as nbs-cs answers a look whatever it is doing, and while a cs
+is cut off.
 The leader's controller runs there as nbs-mds runs it (N9d): a cs down two
 seconds after its host is, out after four (`repair::After`, the thresholds a
 parameter of the plan) -- some two restarts in five come back members still
@@ -3640,7 +3651,7 @@ little and now and then past a silence.
     longer.
 
 `--mutants` runs `fuzz/nbs/mutants.py`, which takes out one rule at a time.
-Each of its two hundred and ten must fail the gate -- run as `nbs-fuzz gate
+Each of its two hundred and sixteen must fail the gate -- run as `nbs-fuzz gate
 --first`, stopped at the first target that fails: the gate's verdict, sooner.
 The gate's cluster range is followed by a few seeds past it
 (`GATE_CLUSTER_ALSO`), each where a rule's race comes together that the

@@ -16,7 +16,7 @@ nbsmeta = { path = "../../src/crates/common/storage/nbsmeta" }
 nbscs = { path = "../../src/crates/common/storage/nbscs" }
 nbswire = { path = "../../src/crates/common/storage/nbswire" }
 # With its `starve` seam: the cluster target starves a writer of memory (#97)
-nbsclient = { path = "../../src/crates/common/storage/nbsclient", features = ["starve"] }
+nbsclient = { path = "../../src/crates/common/storage/nbsclient", features = ["starve", "small_windows"] }
 raft = { path = "../../src/crates/common/cluster/raft" }
 
 # No CPU features, as net-fuzz has it and for its reason: the RustCrypto

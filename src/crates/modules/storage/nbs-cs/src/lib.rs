@@ -76,6 +76,8 @@ pub struct Shown {
     /// be.
     pub passed_on: u64,
     pub not_passed: u64,
+    /// Answers the channel would not take.
+    pub answers_lost: u64,
 }
 
 #[derive(Default)]
@@ -203,8 +205,9 @@ fn show(shared: &Shared, args: &str, out: &mut Output) {
     match v.cs {
         Some(cs) => {
             let _ = writeln!(out, "nbscs: cs {} -- {}: {} chunks held, {} open, {} volumes fenced, {} requests \
-                                   served, {} refused, {} writes passed on along chains, {} not", cs, s.state, v.held,
-                             v.open, v.fences.len(), v.served, v.refused, v.passed_on, v.not_passed);
+                                   served, {} refused, {} writes passed on along chains, {} not, {} answers \
+                                   lost", cs, s.state, v.held, v.open, v.fences.len(), v.served, v.refused,
+                             v.passed_on, v.not_passed, v.answers_lost);
         }
         None => {
             let _ = writeln!(out, "nbscs: {}", s.state);

@@ -243,8 +243,14 @@ to drive them (N10b-N10d):
   named by one map now -- a snapshot dropped meanwhile -- is given up (N10c):
   one left would hand its new chunk, copied as the old one was then, to a
   copy-up asked after the place was written directly.
-- `CopyDone { name, place, generation, chunk }` -- the map names the new
-  chunk, the old one counted down, freed at none.
+- `CopyDone { name, place, generation, chunk, incarnation }` -- the map
+  names the new chunk, the old one counted down, freed at none. Named by
+  its number and its incarnation both: a number is taken again once its
+  chunk is freed, and a copy-up given up -- a join of its set begun -- and
+  asked anew by a late copy of the writer's ask can be given the number it
+  had. Named by its number alone, the end of the old one's, late too, took
+  the new one's: the map named a chunk nobody had copied into, zeros where
+  the volume had data (found by the cluster target, N13c).
 
 A volume deleted, or an image, counts its chunks down: those a snapshot or a
 clone still names live on. A chunk's count is a u16; a map names a chunk
@@ -587,7 +593,7 @@ For example:
 
 ```
 a$ nbscs
-nbscs: cs 0 -- serving: 2 chunks held, 2 open, 1 volumes fenced, 9 requests served, 0 refused, 0 writes passed on along chains, 0 not
+nbscs: cs 0 -- serving: 2 chunks held, 2 open, 1 volumes fenced, 9 requests served, 0 refused, 0 writes passed on along chains, 0 not, 0 answers lost
   device 3    part:4f7661ab-0525-4f56-9d6b-9283d322e47c 292 MiB, 284 MiB free, 0 slots lost, active
 ```
 
@@ -899,7 +905,14 @@ What it holds to (plans/nbs.md, "Replication: the rules"):
   what was written before it, the failed one's too -- on its set's last
   active replica, which no ask takes out, it would say so of a write the
   replica lost (#95). A close is a flush, then
-  every chunk written closed at once. A cs taken out of every set holds
+  every chunk written closed -- 128 places at a time, the next as those are
+  done, as a stop and a pause close too: every replica's answer comes to the
+  session's mailbox, and a random writer's stop over 8 GiB closed some 2,000
+  chunks on three replicas at once, its mailbox's 1,024 places overflowed,
+  the answers past them lost, and the replicas that sent them asked out as
+  silent -- the head of every chain among them (N13b, the EX44; the mailbox
+  has 4,096 places now, and a cs counts the answers the channel would not
+  take: `nbscs`'s "answers lost"). A cs taken out of every set holds
   nothing the volume counts on: a flush, a close or a fence asked of it is
   done, not waited on -- nbs-test's repair phase found a close waiting for
   good on a cs the controller had taken out (`CsDown`) while it still owed
@@ -912,7 +925,19 @@ What it holds to (plans/nbs.md, "Replication: the rules"):
   reconcile takes what the replica holds.
 - A chunk written, flushed and idle for 3 s is closed on its replicas, so
   that a crash leaves few to reconcile. An operation not done in a minute
-  fails, said.
+  fails, said. A write that so fails, a piece of it not done sent to a
+  replica, may be on some of its replicas and not on others -- and a close
+  of its chunk later would keep them apart for good, a read answered by
+  whichever it went to -- so the session attaches anew then (decided
+  2026-11-12). One whose pieces not done reached no replica -- held for a
+  copy-up a stuck join holds back, its others on every replica -- fails as
+  any other: attached anew for it, the reconcile could wait on the same
+  join and fail the session. Attached anew, every operation out fails with
+  the old generation, whose requests the new one's fences refuse, and the
+  new one's reconcile makes every chunk the session left open the same on
+  its replicas, as it does a crashed writer's, before it serves again; a
+  stop asked meanwhile is begun then. A session taken over meanwhile is
+  refused it, and fails.
 - A writer that follows another -- by force, or after a crash -- holds what
   that one had done and not flushed as a crash would leave it: there or
   not, as the replica its reconcile read had it.
@@ -1182,11 +1207,23 @@ only its metadata.
   while that one is out or after it failed, may not be done before the
   replica is flushed -- the restart's judge holds what the replica has to
   what the last flush done made durable.
+  And now and then a write past its deadline (N13's decision): one active
+  replica of a chunk, not on the writer's host, cut off from every host but
+  its own -- its host up, the leader's look keeping it in -- while the
+  writer writes the chunk; the write fails at its deadline, the session
+  attaches anew, never closing a chunk of the old generation after it
+  (judged at every send), and, the cut healed, serves again at a newer one,
+  every replica alike. Judged by the replicas, not the client's word: a
+  write failed at its deadline that is on some active replica of a block
+  and not on another must have its session close nothing of its
+  generation after; one that reached none -- the session paused for a
+  snapshot as it came, say, and its fence of the replica cut off waiting --
+  is not held to it.
 
-  `--mutants` takes two hundred and ten rules out one at a time --
-  seventy-three of the metadata's, five of them the controller's;
+  `--mutants` takes two hundred and sixteen rules out one at a time --
+  seventy-four of the metadata's, five of them the controller's;
   forty-nine of the cs's engine; forty-one of the wire's, its `serve`'s,
-  the mds's, the copy's and the scrub's; forty-seven of the client's --
+  the mds's, the copy's and the scrub's; fifty-two of the client's --
   each caught: one, the client's copy-up ended only once every member
   active in its view has copied, only at the cluster seeds the gate runs
   past its range (`GATE_CLUSTER_ALSO`), its race having moved past the
