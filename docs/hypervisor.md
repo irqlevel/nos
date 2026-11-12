@@ -3658,13 +3658,17 @@ its magic, its one module, a memory map of RAM up to the guest's last byte
 in order -- and the entry to paging off. hv's unsafe count is still 4.
 
 **hvboot** (`src/crates/hypervisor/hvboot`, built by `make` and kept as `/lib/hvboot`
-in the system image) is a PVH ELF of 164 KiB, linked at 1 MiB, that runs in
+in the system image) is a PVH ELF of 227 KiB, linked at 1 MiB, that runs in
 the guest. It reads:
 
-- its start info: the memory map, the RSDP, and its command line --
-  `hvboot.entry=` (an entry by number, `N>M`, title or id, as GRUB's
-  `default` takes one), `hvboot.disk=N` (look on that disk alone) and
-  `hvboot.verbose` its own, every other word for the kernel (`start.rs`);
+- its start info: the memory map, the RSDP, its modules -- an `initrd=`
+  given to `hv start`, which it does not use, and says so -- and its
+  command line, split where Linux splits its own, at blanks outside double
+  quotes: `hvboot.entry=` (an entry by number, `N>M`, title or id, as
+  GRUB's `default` takes one; titles with spaces in them in double quotes),
+  `hvboot.disk=N` (look on that disk alone) and `hvboot.verbose` its own,
+  every other word for the kernel as it was given (`start.rs`,
+  `options.rs`);
 - the guest's legacy virtio disks on PCI bus 0, a request at a time with
   the interrupt never taken: each poll reads the ISR, a port, and the exit
   that takes is where hv hands back what is done -- a request not answered
@@ -3674,53 +3678,90 @@ the guest. It reads:
   same, so a late answer was taken for that one's (`virtio.rs`);
 - each disk's partitions, from its GPT -- header and array each checked by
   their CRC -- or an MBR, an XBOOTLDR partition (a /boot of its own, as
-  Ubuntu's) first, and a disk with no table looked at whole (`gpt.rs`);
+  Ubuntu's) first, and a disk with no table looked at whole; a partition
+  that runs past the disk's end is said and passed over (`gpt.rs`);
 - ext2, ext3 and ext4, read-only but for grubenv's block (below): extents and block maps, 64-bit
   descriptors, flex_bg, htree directories read as the linear ones they
   also are, inline data, symlinks, holes; an incompatible feature it does
-  not read is refused by name, and the journal is not replayed, as GRUB
-  does not replay it (`ext.rs`, over the format crate `src/crates/common/storage/extfmt`,
+  not read is refused by name, said as the filesystem is passed over and
+  again when no filesystem is found -- GRUB 2.06 reads `meta_bg` and
+  `encrypt`, which this refuses, and refuses `inline_data`, which this
+  reads -- and the journal is not replayed, as GRUB does not replay it
+  (`ext.rs`, over the format crate `src/crates/common/storage/extfmt`,
   which the kernel's ext4 driver reads through too);
 - the first `/boot/grub/grub.cfg` or `/grub/grub.cfg` (or grub2's) on
-  them, and grubenv beside it: the menu, submenus too, each entry's `linux`,
-  `initrd` and the `search` or `set root` naming its filesystem -- by UUID,
-  label, file or `hdN,gptM` -- and the default, grubenv's `next_entry` and
+  them -- a path that could not be looked for, a read that failed, ending
+  the search, said, rather than another filesystem's being booted -- and
+  grubenv beside it: the menu, submenus within submenus, each entry's
+  `linux`, `initrd` and the `search` or `set root` naming its filesystem --
+  by UUID, label, file or `hdN,gptM` -- the root set outside the entries,
+  which they start from, and the default, grubenv's `next_entry` and
   `saved_entry` where the script defers to them, as grub-mkconfig's does.
   A `next_entry` it boots it empties on the disk first, as that script's
   `save_env` does -- grubenv's block rewritten in place, every other
-  variable as it was, and only after the bytes there are found to be the
+  line as it was, and only after the bytes there are found to be the
   ones it read, nor where the journal is not replayed: the one write hvboot
   makes. `grub-reboot`'s entry is booted once, as under GRUB, and a disk
   that cannot be written says that the entry will be taken again.
   It is not GRUB's interpreter: it reads the script's words as GRUB does --
-  quotes, escapes, comments, variables -- and its blocks, but runs no
-  condition; every branch of an `if` is read, the last `search` and `linux`
-  an entry has win, and a variable has a value only where a `set` outside a
-  condition gives it one. What it cannot place it says (`grub.rs`).
+  quotes, escapes, comments, variables, a brace a token of its own -- and
+  makes a command's arguments of them as GRUB's script does, an unquoted
+  variable's value split at blanks; it reads the blocks but runs no
+  condition: every branch of an `if` is read, the last `search` and `linux`
+  an entry has win (a `linux` unloading the `initrd` before it), a variable
+  has a value only where an assignment outside a condition gives it one,
+  and the chosen entry's body is read with the variables as the whole file
+  leaves them, as GRUB runs it at boot. `default` names an entry as GRUB's
+  does: a number as `strtoul` reads one (`0x2`, `010`), a title or an id,
+  `>` into a submenu and `>>` for a `>` of a title's own, a submenu's first
+  entry when the rest names nothing. grubenv is read as GRUB reads it: its
+  signature or nothing, `\X` as X. Each of these is what GRUB 2.06 does,
+  found by booting it (`scripts/hvboot-test.py` has the cases). What it
+  cannot place it says: another file read for the menu (`configfile`,
+  `blscfg`), a variable with no value, a `}` that closes nothing. What it
+  holds is bounded and said where a bound is met: a grub.cfg of 128 KiB
+  and a grubenv of 4 KiB at most, 2048 menu items, 256 variables, 256 KiB
+  of what their values add, 64 initrds an entry (`grub.rs`, `plan.rs`).
 
 It loads the kernel at its `pref_address` and the initrds high, one after
-another at GRUB's 4-byte alignment, into RAM the memory map has, clear of
-itself; builds the zero page -- the start info's memory map as its e820,
-the RSDP -- and the command line GRUB would give, `BOOT_IMAGE=` first, then
-its own line's words after the entry's; resets the disks; and enters the
+another at GRUB's 4-byte alignment, the bytes between them zeros as GRUB's
+are, into RAM the memory map has, clear of itself; builds the zero page --
+the start info's memory map as its e820, the RSDP -- and the command line
+GRUB's `linux` would give, `BOOT_IMAGE=` first, an argument with a space in
+it in double quotes and `\`, `'` and `"` escaped, then its own line's words
+after the entry's, as hv gave them; resets the disks; and enters the
 kernel's 64-bit entry, as hv enters a bzImage (`bzimage.rs`, `boot.rs`).
 Whatever it cannot do it says on the console and turns the guest off through
 its ACPI -- the VM stops with "the guest powered itself off", the reason in
-its console, rather than sitting halted with nothing said; a fault in it is
-said too, with where it happened.
+its console, and when no filesystem or no grub.cfg is found, everything it
+passed over and why -- rather than sitting halted with nothing said; a fault
+in it is said too, with where it happened, and a heap run out with what the
+heap held.
 
 It runs in the guest, and what it reads is the guest's own: a bug in it is
 the guest's, not nos's, and the host's half of this is the PVH loader
-above. Its parsers -- `gpt`, `ext`, `grub`, `bzimage` -- are plain Rust over
-byte slices with no `unsafe`; its 29 unsafe sites are the platform's, in
-ports, physical memory, the heap, the virtio rings, the IDT and the jump.
-The parsers are compiled for the host too (`fuzz/hvboot`): read off Ubuntu
-24.04's and Debian 13's images, the kernels and initrds come out byte for
-byte as `debugfs` reads them, and `scripts/hvboot-test.py` holds them to
-the entry GRUB would boot on disks it makes -- GPT, MBR and none; ext4,
-ext3, ext2 of 1 KiB blocks into the double indirect ones; a default, a
-`next_entry`, a `saved_entry` into a submenu -- and fuzzes each disk's
-metadata.
+above. What it boots is `plan`'s to work out -- the filesystems, grub.cfg,
+the entry, where the kernel and the initrds go, the command line, and the
+reading of them into place -- over the disks and RAM it is given and
+nothing of the platform's; it and the parsers it reads through (`gpt`,
+`ext`, `grub`, `bzimage`) are plain Rust over byte slices with no
+`unsafe`. Its 41 unsafe sites are the platform's: ports, physical memory,
+the heap (`arena.rs`: first fit over its free blocks, a block given back
+merged with its neighbours, in place of a bump allocator that took back
+only its newest block -- an extent tree two levels deep, or a long enough
+grub.cfg, spent the heap through blocks it never took back), the virtio
+rings, the IDT and the jump. The host's harness (`fuzz/hvboot`) runs `plan`
+itself, not a second copy of its rules, under `arena.rs` over a stretch no
+bigger than hvboot's heap: read off Ubuntu 24.04's and Debian 13's images,
+the kernels and initrds come out byte for byte as `debugfs` reads them, and
+`scripts/hvboot-test.py` holds it to the entry GRUB would boot on disks it
+makes -- GPT, MBR and none; ext4, ext3, ext2 of 1 KiB blocks into the
+double indirect ones; a default, a `next_entry`, a `saved_entry` into a
+submenu; GRUB 2.06's own answers to how a grub.cfg is read; what is said
+when nothing boots; a grub.cfg as long as is read, of every shape that
+costs the reading the most, and an initrd whose extent tree is two levels
+deep, each inside the heap and all of it given back -- and fuzzes each
+disk's metadata, every run held to the heap the same way.
 
 What it does not do: boot what is not Linux -- Windows has no boot
 protocol of its own to be entered by, and needs firmware, which OVMF's

@@ -39,12 +39,78 @@ pub trait Sink: Source {
     fn write(&mut self, offset: u64, buf: &[u8]) -> Result<(), String>;
 }
 
+/// Why a source is no filesystem this reads: there is no ext superblock on
+/// it -- some other filesystem, or none -- or there is one this does not
+/// read, or that does not hold together, or it could not be read: the
+/// last worth saying wherever it is met.
+#[derive(Debug)]
+pub enum Unmounted {
+    NotExt,
+    Refused(String),
+}
+
+impl core::fmt::Display for Unmounted {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            Unmounted::NotExt => f.write_str("no ext2/3/4 filesystem"),
+            Unmounted::Refused(why) => f.write_str(why),
+        }
+    }
+}
+
+/// Why a path was not found: it is not there -- a name its directory does
+/// not have, a component that is no directory -- or it could not be read:
+/// a read that failed, metadata that does not hold together, a symlink
+/// loop. The first is a place to look on from; the second is not.
+#[derive(Debug)]
+pub enum Lookup {
+    NotThere(String),
+    Unreadable(String),
+}
+
+impl core::fmt::Display for Lookup {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            Lookup::NotThere(why) | Lookup::Unreadable(why) => f.write_str(why),
+        }
+    }
+}
+
+impl From<Lookup> for String {
+    fn from(l: Lookup) -> String {
+        match l {
+            Lookup::NotThere(why) | Lookup::Unreadable(why) => why,
+        }
+    }
+}
+
 /* Incompatible features: those read, and the rest refused. What GRUB reads
  * past -- a journal not replayed, MMP's block, ea_inode's attributes, the
  * seed of checksums it does not check -- is read past here too. */
 const INCOMPAT_READ: u32 = incompat::FILETYPE | incompat::RECOVER | incompat::EXTENTS | incompat::BIT64
     | incompat::MMP | incompat::FLEX_BG | incompat::EA_INODE | incompat::CSUM_SEED | incompat::LARGEDIR
     | incompat::INLINE_DATA;
+
+/// The incompatible features in `bits`, by the names mke2fs gives them.
+fn named(bits: u32) -> String {
+    const NAMES: [(u32, &str); 6] = [(incompat::COMPRESSION, "compression"), (incompat::META_BG, "meta_bg"),
+                                     (incompat::JOURNAL_DEV, "journal_dev"), (incompat::DIRDATA, "dirdata"),
+                                     (incompat::ENCRYPT, "encrypt"), (incompat::CASEFOLD, "casefold")];
+    let mut s = String::new();
+    let mut rest = bits;
+    for (bit, name) in NAMES {
+        if bits & bit != 0 {
+            s.push_str(if s.is_empty() { "" } else { ", " });
+            s.push_str(name);
+            rest &= !bit;
+        }
+    }
+    if rest != 0 {
+        s.push_str(if s.is_empty() { "" } else { ", " });
+        s.push_str("unknown ones");
+    }
+    s
+}
 
 const ROOT_INO: u32 = 2;
 
@@ -95,19 +161,26 @@ pub struct Fs<S> {
 
 impl<S: Source> Fs<S> {
     /// The filesystem on `src`, if there is one this reads.
-    pub fn mount(mut src: S) -> Result<Fs<S>, String> {
+    pub fn mount(mut src: S) -> Result<Fs<S>, Unmounted> {
         let mut raw = [0u8; extfmt::sb::SIZE];
-        src.read(extfmt::sb::OFFSET, &mut raw)?;
+        src.read(extfmt::sb::OFFSET, &mut raw)
+            .map_err(|e| Unmounted::Refused(alloc::format!("its superblock could not be read: {}", e)))?;
+        if extfmt::le16(&raw, extfmt::sb::S_MAGIC) != extfmt::sb::MAGIC {
+            return Err(Unmounted::NotExt);
+        }
         /* The magic and a geometry that holds together are the format's to
          * check; which block sizes and features are read is GRUB's. */
-        let sb = Super::parse(&raw)?;
+        let sb = Super::parse(&raw).map_err(|e| Unmounted::Refused(alloc::format!("an ext filesystem with {}", e)))?;
         let log = sb.log_block_size();
         if log > MAX_LOG_BLOCK_SIZE {
-            return Err(alloc::format!("blocks of {} KiB, more than this reads", 1u64 << log.min(20)));
+            return Err(Unmounted::Refused(alloc::format!("an ext filesystem of blocks of {} KiB, more than this reads",
+                                                         1u64 << log.min(20))));
         }
         let incompat = sb.incompat();
         if incompat & !INCOMPAT_READ != 0 {
-            return Err(alloc::format!("incompatible features {:#x} this does not read", incompat & !INCOMPAT_READ));
+            return Err(Unmounted::Refused(alloc::format!("an ext filesystem with incompatible features {:#x} ({}) this \
+                                                          does not read", incompat & !INCOMPAT_READ,
+                                                         named(incompat & !INCOMPAT_READ))));
         }
         let block_size = sb.block_size();
         let descriptors = (u64::from(sb.first_data_block()) + 1) * block_size;
@@ -271,7 +344,7 @@ impl<S: Source> Fs<S> {
     /// The whole of a file of at most `max` bytes.
     pub fn read_all(&mut self, inode: &Inode, max: u64) -> Result<Vec<u8>, String> {
         if inode.size > max {
-            return Err(alloc::format!("inode {}: {} bytes, more than {}", inode.ino, inode.size, max));
+            return Err(alloc::format!("a file of {} bytes, more than the {} this reads", inode.size, max));
         }
         let mut v = vec![0u8; inode.size as usize];
         self.read(inode, 0, &mut v)?;
@@ -281,11 +354,18 @@ impl<S: Source> Fs<S> {
     /// The inode named `name` in directory `dir`.
     fn find(&mut self, dir: &Inode, name: &[u8]) -> Result<Option<u32>, String> {
         if dir.flags & INLINE_DATA_FL != 0 {
-            /* An inline directory: its parent's inode first, then entries. */
+            /* An inline directory: its parent's inode first, then entries --
+             * and past the inode's 60 bytes, the rest of them in an extended
+             * attribute this does not read: refused, as a file's are, not
+             * searched in part and a name in the rest said not there. */
+            if dir.size > I_BLOCK_BYTES as u64 {
+                return Err(alloc::format!("inode {}: an inline directory past its inode, which this does not read",
+                                          dir.ino));
+            }
             if name == b".." {
                 return Ok(Some(extfmt::le32(&dir.block, 0)));
             }
-            let end = (dir.size as usize).min(I_BLOCK_BYTES);
+            let end = dir.size as usize;
             return extfmt::dir::find_entry(&dir.block[4.min(end)..end], name, dir.ino);
         }
         let bs = self.block_size;
@@ -321,8 +401,9 @@ impl<S: Source> Fs<S> {
     }
 
     /// The inode at `path`, from the root, symlinks followed.
-    pub fn lookup(&mut self, path: &str) -> Result<Inode, String> {
-        let root = self.inode(ROOT_INO)?;
+    pub fn lookup(&mut self, path: &str) -> Result<Inode, Lookup> {
+        let unreadable = |e: String| Lookup::Unreadable(alloc::format!("{}: {}", path, e));
+        let root = self.inode(ROOT_INO).map_err(unreadable)?;
         let mut dir = root.clone();
         /* The components still to walk, the next last. */
         let mut todo: Vec<Vec<u8>> = path.split('/').rev().map(|c| c.as_bytes().to_vec()).collect();
@@ -333,19 +414,19 @@ impl<S: Source> Fs<S> {
                 continue;
             }
             if !current.is_dir() {
-                return Err(alloc::format!("{}: a component is not a directory", path));
+                return Err(Lookup::NotThere(alloc::format!("{}: a component is not a directory", path)));
             }
             dir = current.clone();
-            let Some(ino) = self.find(&dir, &name)? else {
-                return Err(alloc::format!("{}: no such file", path));
+            let Some(ino) = self.find(&dir, &name).map_err(unreadable)? else {
+                return Err(Lookup::NotThere(alloc::format!("{}: no such file", path)));
             };
-            let node = self.inode(ino)?;
+            let node = self.inode(ino).map_err(unreadable)?;
             if node.is_link() {
                 links += 1;
                 if links > MAX_SYMLINKS {
-                    return Err(alloc::format!("{}: more than {} symlinks", path, MAX_SYMLINKS));
+                    return Err(Lookup::Unreadable(alloc::format!("{}: more than {} symlinks", path, MAX_SYMLINKS)));
                 }
-                let target = self.link_target(&node)?;
+                let target = self.link_target(&node).map_err(unreadable)?;
                 for c in target.split(|&b| b == b'/').rev() {
                     todo.push(c.to_vec());
                 }
