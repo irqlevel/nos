@@ -5066,7 +5066,16 @@ someone else's; then speed.
    guests had the banner both ways -- and four connections that never
    logged in held every slot for logging in, on the Hetzner boxes the only
    console there is. Forwards still draw on the same 64 connections the
-   machine has (item 5).
+   machine has, every forward together at most twelve relays -- 24 of them
+   -- where eight of eight each had been 128; and a relay closes its two
+   first, each then waiting out its close for a minute in TIME-WAIT: a
+   client that opened and closed through one forward about once a second
+   held all 64, and nos's sshd and API turned everyone away. The kernel
+   now takes such a slot back for a new connection when none is free --
+   one in TIME-WAIT the longest first, as Linux does past
+   `tcp_max_tw_buckets` (`Tcp::reclaim` in `layers/net/src/tcp.rs`);
+   net-fuzz's `tcp` target opens 72 in a row that the machine closes first,
+   each to be answered, and a build without the reclaim refused the 43rd.
 4. ~~**NAT lets a guest go anywhere nos can.**~~ Done: NAT keeps the
    guests from link-local, the private networks, the shared space and the
    uplink's own subnet unless `nat allow` lets a network through, the DNS

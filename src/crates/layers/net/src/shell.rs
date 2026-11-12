@@ -137,10 +137,10 @@ pub fn tcpstat(_args: &str, out: &mut Output) {
     let st = TCP.stats();
     let _ = writeln!(out, "TCP stats: tx={} rx={} rxerr={} retx={} conns={} refused={} halfopen={} rstheld={} \
         recoveries={} timeouts={} spurious={} probes={} undos={} dsacks={} reneged={} outside={} badack={} \
-        unkept={} overrun={}",
+        unkept={} overrun={} reclaimed={}",
         st.tx, st.rx, st.rx_err, st.retransmits, st.conns, st.syn_refused, st.half_open, st.rst_held,
         st.recoveries, st.timeouts, st.spurious, st.probes, st.undos, st.dsacks, st.reneged, st.rx_outside,
-        st.rx_badack, st.rx_unkept, st.rx_overrun);
+        st.rx_badack, st.rx_unkept, st.rx_overrun, st.reclaimed);
 
     for index in 0..crate::tcp::MAX_CONNECTIONS {
         let line = match TCP.snapshot(index) {
