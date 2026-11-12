@@ -74,11 +74,21 @@ pub struct Folder {
 
 /// Whether `name` may be a VM's: a letter or a digit, then letters, digits,
 /// `.`, `_` and `-`, at most `NAME_MAX` in all -- a folder's name, and a
-/// word of a command, with nothing in it a path or a shell reads otherwise.
+/// word of a command, with nothing in it a path or a shell reads otherwise
+/// -- and not a word the commands read as something else (`reserved`).
 pub fn valid_name(name: &str) -> bool {
     let b = name.as_bytes();
     !b.is_empty() && b.len() <= NAME_MAX && b[0].is_ascii_alphanumeric()
         && b.iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+        && !reserved(name)
+}
+
+/// What a VM's name may not be, a word the commands read otherwise: digits
+/// alone, a VM's number -- which `hv stop`, `exec`, `send` and the rest
+/// take as well as a name, and look up first, so that a VM named `1` was
+/// reached as whichever VM was number 1 -- and `all`, every VM to `hv stop`.
+pub fn reserved(name: &str) -> bool {
+    (!name.is_empty() && name.bytes().all(|c| c.is_ascii_digit())) || name == "all"
 }
 
 /// The VMs' folder `vms=` names, as hv keeps it: an absolute path, with no
@@ -135,6 +145,10 @@ pub fn find(root: &str, word: &str) -> Result<Option<Folder>, String> {
         String::from(word.trim_end_matches('/'))
     } else if valid_name(word) {
         join(root, word).ok_or_else(|| String::from("out of memory"))?
+    } else if reserved(word) {
+        /* No kernel's path, and no VM's name: a folder by that name is a
+         * VM's from before names were held to this, said so */
+        return Err(name_refused(word).unwrap_or_default() + " -- give its folder another name");
     } else {
         return Ok(None);
     };
@@ -146,21 +160,45 @@ pub fn find(root: &str, word: &str) -> Result<Option<Folder>, String> {
         return Err(alloc::format!("no vm {}: there is no {} -- hv create {} <kernel> ... makes one", word, file, word));
     }
     let name = path.rsplit('/').next().unwrap_or("");
-    if !valid_name(name) {
-        return Err(alloc::format!("{} has a {}, but \"{}\" is not a name a vm can have -- a letter or a digit, then \
-                                   letters, digits, . _ and -, at most {}", path, CONFIG, name, NAME_MAX));
+    if let Some(why) = name_refused(name) {
+        return Err(alloc::format!("{} has a {}, but {}", path, CONFIG, why));
     }
     Ok(Some(Folder { name: String::from(name), path }))
 }
 
-/// A UUID given a VM at its first start -- one whose vm.toml was written
-/// before VMs had them -- added to the end of its vm.toml, the operator's
-/// lines left as they are, for every start after to give it the same.
-pub fn add_uuid(folder: &Folder, uuid: &[u8; 16]) -> Result<(), String> {
+/// The vm.toml changes this module makes, one at a time: what `update`,
+/// `replace` and `keep_uuid` take for a file's read, change and write
+/// together. Two at once -- a forward kept and a disk added, through the
+/// bus, whose calls run side by side -- read the same text, and the second
+/// write took the first's change away, with vm.toml.prev no record of it.
+/// One for every folder: a change is an operator's, rare and quick. Held by
+/// `Vms`, so that whatever changes a vm.toml has one to give.
+pub struct Changes(kcore::sync::Mutex<()>);
+
+impl Changes {
+    pub fn new() -> Option<Changes> {
+        kcore::sync::Mutex::new(()).map(Changes)
+    }
+}
+
+/// The UUID of the VM in `folder` from its vm.toml, or -- one whose
+/// vm.toml was written before VMs had them -- `uuid`, written into it key
+/// by key as every change is, for every start after to give it the same:
+/// the one the file has. Two first starts at once thus agree on one. It was
+/// appended to the file, which a write cut short -- a disk full -- left
+/// unparseable, as two starts did by appending one each.
+pub fn keep_uuid(changes: &Changes, folder: &Folder, uuid: [u8; 16]) -> Result<[u8; 16], String> {
+    let _one = changes.0.lock();
+    let (text, was) = load_text(folder)?;
+    if let Some(had) = was.options.uuid {
+        return Ok(had);
+    }
+    let mut c = was.clone();
+    c.options.uuid = Some(uuid);
     let file = join(&folder.path, CONFIG).ok_or_else(|| String::from("out of memory"))?;
-    let lines = alloc::format!("\n# Given at its first start: the machine its OS knows it as (SMBIOS)\nuuid = \"{}\"\n",
-                               config::uuid_text(uuid));
-    kcore::fs::append(&file, lines.as_bytes()).map_err(|e| alloc::format!("{}: {}", file, e))
+    let new = config::rewrite(&text, &c).map_err(|e| alloc::format!("{}: {}", file, e))?;
+    write_config(folder, &text, &new)?;
+    Ok(uuid)
 }
 
 /// The folder's configuration, read and parsed; what is wrong with it
@@ -187,18 +225,34 @@ pub fn load_text(folder: &Folder) -> Result<(String, Config), String> {
 /// The folder's vm.toml made `text`, which was `was`: the old kept as
 /// vm.toml.prev, and each file replaced whole -- a full disk or a crash
 /// midway leaves it as it was, never half written (`kcore::fs::write`).
-pub fn write_config(folder: &Folder, was: &str, text: &str) -> Result<(), String> {
+/// Under `Changes`, which its callers here hold.
+fn write_config(folder: &Folder, was: &str, text: &str) -> Result<(), String> {
     let file = join(&folder.path, CONFIG).ok_or_else(|| String::from("out of memory"))?;
     let prev = join(&folder.path, CONFIG_PREV).ok_or_else(|| String::from("out of memory"))?;
     kcore::fs::write(&prev, was.as_bytes()).map_err(|e| alloc::format!("{} could not be written -- {}", prev, e))?;
     kcore::fs::write(&file, text.as_bytes()).map_err(|e| alloc::format!("{} could not be written -- {}", file, e))
 }
 
+/// The folder's vm.toml made `text` whole -- the bus's `config_set`, which
+/// has checked it as a start would: whether it changed.
+pub fn replace(changes: &Changes, folder: &Folder, text: &str) -> Result<bool, String> {
+    let _one = changes.0.lock();
+    let (was, _) = load_text(folder)?;
+    if was == text {
+        return Ok(false);
+    }
+    write_config(folder, &was, text)?;
+    Ok(true)
+}
+
 /// The folder's vm.toml changed by `change` -- checked as a start checks
 /// it, and written key by key (`config::rewrite`), the operator's lines left
 /// as they are: whether it changed. Nothing is written when `change` leaves
-/// it as it was.
-pub fn update(folder: &Folder, change: impl FnOnce(&mut Config) -> Result<(), String>) -> Result<bool, String> {
+/// it as it was. The read, the change and the write under `changes`.
+pub fn update(changes: &Changes, folder: &Folder, change: impl FnOnce(&mut Config) -> Result<(), String>)
+    -> Result<bool, String>
+{
+    let _one = changes.0.lock();
     let (text, was) = load_text(folder)?;
     let mut c = was.clone();
     change(&mut c)?;
@@ -251,6 +305,10 @@ pub fn options(folder: &Folder, c: &Config) -> Result<Options, String> {
 
 /// Why `name` is no VM's, or None for a name a VM may have.
 pub fn name_refused(name: &str) -> Option<String> {
+    if reserved(name) {
+        return Some(alloc::format!("\"{}\" is not a name a vm can have -- digits alone are a vm's number to hv's \
+                                    commands, and all is every vm", name));
+    }
     (!valid_name(name)).then(|| alloc::format!("\"{}\" is not a name a vm can have -- a letter or a digit, then \
                                                 letters, digits, . _ and -, at most {}", name, NAME_MAX))
 }
@@ -425,6 +483,7 @@ pub struct Deleted {
     /// Its devices, which a delete never touches.
     pub devices: Vec<String>,
     pub removed: usize,
+    /// The disks kept, by the paths the folder has them at.
     pub kept: Vec<String>,
 }
 
@@ -489,10 +548,29 @@ pub fn delete(root: &str, vms: &Vms, name: &str, keep: bool, force: bool) -> Res
         return Err(alloc::format!("{} is protected -- force deletes it all the same", name));
     }
     let config = join(&folder.path, CONFIG).ok_or_else(oom)?;
-    let inside = |path: &str| path.len() > folder.path.len() + 1 && path.starts_with(folder.path.as_str())
-        && path.as_bytes()[folder.path.len()] == b'/';
     let devices: Vec<String> = disks.iter().map(|(p, _)| p).filter(|p| !crate::devices::is_file(p)).cloned().collect();
-    let kept: Vec<String> = if keep { disks.into_iter().map(|(p, _)| p).filter(|p| inside(p)).collect() } else { Vec::new() };
+    /* The disks to keep, as files: which a file of the folder's is, is told
+     * by the file, not by how the vm.toml spells its path -- the VFS reads
+     * `./root.img`, `sub/../root.img` and a doubled slash as the file the
+     * walk below names `root.img`, and a delete that compared the strings
+     * took away the disk it then said it kept. Each held open for the
+     * walk: an identity is the same for two opens of one file while
+     * either is open. One the vm.toml names that is not there, or is
+     * outside the folder, is in no walk and keeps nothing. */
+    let mut keeping: Vec<(kcore::fs::File, kcore::fs::FileId)> = Vec::new();
+    if keep {
+        for (path, _) in disks.iter().filter(|(p, _)| crate::devices::is_file(p)) {
+            let Ok(file) = kcore::fs::File::open(path, false) else { continue };
+            if let Some(id) = file.identity() {
+                keeping.try_reserve(1).map_err(|_| oom())?;
+                keeping.push((file, id));
+            }
+        }
+    }
+    let is_kept = |path: &str| !keeping.is_empty()
+        && kcore::fs::File::open(path, false).ok().and_then(|f| f.identity())
+            .is_some_and(|id| keeping.iter().any(|(_, k)| *k == id));
+    let mut kept: Vec<String> = Vec::new();
 
     /* What is in it, every level down: its files, and its folders with how
      * deep each is. */
@@ -514,7 +592,12 @@ pub fn delete(root: &str, vms: &Vms, name: &str, keep: bool, force: bool) -> Res
                 }
                 folders.push((path.clone(), depth + 1));
                 walk.push((path, depth + 1));
-            } else if path != config && !kept.contains(&path) {
+            } else if path == config {
+                continue;
+            } else if is_kept(&path) {
+                kept.try_reserve(1).map_err(|_| oom())?;
+                kept.push(path);
+            } else {
                 files.push(path);
             }
         }
@@ -558,6 +641,15 @@ pub fn list(root: &str, vms: &Vms, out: &mut Output) {
     for entry in entries.iter().filter(|e| e.dir) {
         let Ok(name) = core::str::from_utf8(&entry.name) else { continue };
         if !valid_name(name) {
+            /* A VM's folder from before a name could not be a number: said,
+             * since it cannot be started by that name */
+            let has_config = join(root, name).and_then(|p| join(&p, CONFIG))
+                .is_some_and(|file| kcore::fs::size(&file).is_ok());
+            if reserved(name) && has_config {
+                any = true;
+                let _ = writeln!(out, "{}  {} -- give its folder another name", name,
+                                 name_refused(name).unwrap_or_default());
+            }
             continue;
         }
         let Some(path) = join(root, name) else { continue };
