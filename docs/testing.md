@@ -931,7 +931,8 @@ the interrupts or what is owed one only the first pair's, the pairs in use
 kept across a reset -- each within its first 4,807. The page walker over random page tables, the decoder, the
 Linux loader over headers that parse, the ACPI tables for any machine, the
 SMBIOS tables (`smbios`) from any name, version and UUID -- read back as
-Linux's `dmi_scan` reads them, the entry point where it scans, every string
+Linux's `dmi_scan` reads them, both entry points where it scans -- SMBIOS
+3's and the 32-bit one, each checksum, the same table -- every string
 there and printable, the UUID and the serial as the model says -- and the
 DHCP server over the frames a guest's client sends, well formed and not.
 `config` holds a VM's `vm.toml` (`modules/hypervisor/hv/src/config.rs`): whatever the
