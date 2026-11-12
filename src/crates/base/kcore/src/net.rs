@@ -46,8 +46,8 @@ impl ListenError {
     /// What `kernel_net_udp_listen` answered, when it was not 0.
     fn of(code: i32) -> Self {
         match code {
-            1 => ListenError::PortTaken,
-            2 => ListenError::TableFull,
+            net::NET_LISTEN_PORT_TAKEN => ListenError::PortTaken,
+            net::NET_LISTEN_TABLE_FULL => ListenError::TableFull,
             _ => ListenError::Invalid,
         }
     }
@@ -271,12 +271,12 @@ impl Nic {
     /// that device's address, until the returned value is dropped. One at a
     /// time in the whole kernel. Task context: it allocates its table.
     pub fn nat(&self) -> core::result::Result<Nat, NatError> {
-        let on = net::kernel_net_nat_enable(self.handle);
+        let on = net::kernel_net_nat_enable(crate::owner::here(), self.handle);
         match on.code {
-            0 => Ok(Nat { inner: self.handle, outer: Nic { handle: on.outer } }),
-            1 => Err(NatError::NoUplink),
-            3 => Err(NatError::Busy),
-            4 => Err(NatError::NoMemory),
+            net::NAT_ON => Ok(Nat { inner: self.handle, outer: Nic { handle: on.outer } }),
+            net::NAT_NO_UPLINK => Err(NatError::NoUplink),
+            net::NAT_BUSY => Err(NatError::Busy),
+            net::NAT_NO_MEMORY => Err(NatError::NoMemory),
             _ => Err(NatError::Device),
         }
     }
@@ -409,7 +409,9 @@ impl NetFrame {
 
     /// A frame to transmit, room for `data_len` bytes: from the frame pool --
     /// a per-CPU cache, no allocator -- whenever it fits one. `len()` is 0
-    /// until `set_len`.
+    /// until `set_len`. None past 2048 bytes, the most a frame holds: a
+    /// frame is one run of physical memory, which a device is pointed at
+    /// whole (`data_phys`).
     #[inline]
     pub fn alloc_tx(data_len: usize) -> Option<Self> {
         let h = net::kernel_netframe_alloc_tx(data_len);
@@ -474,7 +476,9 @@ impl NetFrame {
         unsafe { core::slice::from_raw_parts_mut(ptr, capacity.min(room)) }
     }
 
-    /// Physical address of the data buffer (for DMA descriptor programming).
+    /// Physical address of the data buffer, the start of one run of physical
+    /// memory as long as the frame's room: what a DMA descriptor is given,
+    /// with the frame's length.
     #[inline]
     pub fn data_phys(&self) -> u64 {
         unsafe { net::kernel_netframe_data_phys(self.raw()) }

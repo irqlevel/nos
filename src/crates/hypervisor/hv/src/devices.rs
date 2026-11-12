@@ -1,11 +1,13 @@
 //! What a guest reaches instead of the host's hardware: the devices this
 //! hypervisor emulates over port I/O and MMIO.
 //!
-//! Each is plain data -- a handful of registers -- because stage 5's live
-//! update needs every device to be serialisable, and because a device that
-//! held a pointer into kernel memory would be a way for a guest to reach it.
-//! The guest touches none of them directly: it stops at an intercept, and
-//! the run loop hands the exit to the device.
+//! The chipset's are plain data -- a handful of registers -- because stage
+//! 5's live update needs every device to be serialisable, and because a
+//! device that held a pointer into kernel memory would be a way for a guest
+//! to reach it. The virtio devices are not: a disk and a NIC own their
+//! backends (`Box<dyn Backend>`) and reach the guest's rings through its
+//! memory. The guest touches none of them directly: it stops at an
+//! intercept, and the run loop hands the exit to the device.
 
 /* The PC chipset's devices -- the 8259, the 8254, the MC146818, PCI's
  * configuration mechanism #1, ACPI's fixed hardware on its ports, the

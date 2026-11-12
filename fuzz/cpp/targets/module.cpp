@@ -265,10 +265,16 @@ extern "C" void rust_ipc_module_gone(const char*, ulong)
     fuzz::host_hal_unreachable("rust_ipc_module_gone");
 }
 
-/* Nor the bridge's, of the timers and handlers a module left */
+/* Nor the bridge's, of the timers and handlers a module left, nor the
+   tasks' */
 void kernel::sweep_module_slots(ulong, ulong, const char*)
 {
     fuzz::host_hal_unreachable("sweep_module_slots");
+}
+
+bool kernel::sweep_module_tasks(ulong, ulong, const char*)
+{
+    fuzz::host_hal_unreachable("sweep_module_tasks");
 }
 
 /* Nor the rest of a module's take-down: its commands and providers closed
@@ -281,6 +287,28 @@ extern "C" void rust_mgmt_close_range(ulong, ulong)
 extern "C" void rust_mgmt_drain_range(ulong, ulong, int)
 {
     fuzz::host_hal_unreachable("rust_mgmt_drain_range");
+}
+
+/* And the net layer's sweep of a listener or a sink it left */
+extern "C" void rust_net_close_range(ulong, ulong, const char*, ulong)
+{
+    fuzz::host_hal_unreachable("rust_net_close_range");
+}
+
+/* Nor the other layers' of what a module opened and left open */
+extern "C" void rust_events_module_gone(const char*, ulong)
+{
+    fuzz::host_hal_unreachable("rust_events_module_gone");
+}
+
+extern "C" void rust_block_module_gone(const char*, ulong)
+{
+    fuzz::host_hal_unreachable("rust_block_module_gone");
+}
+
+extern "C" void rust_fs_module_gone(const char*, ulong)
+{
+    fuzz::host_hal_unreachable("rust_fs_module_gone");
 }
 
 void kernel::Cmd::close_range(ulong, ulong)
@@ -440,7 +468,7 @@ Ko build(fuzz::Input& in)
     std::vector<uint8_t> info(info_size, 0);
     put_le(info, 0, INFO_MAGIC, 4);
     put_le(info, 4, INFO_VERSION, 4);
-    memcpy(info.data() + 8, "fuzz", 4);
+    memcpy(info.data() + 8, KERNEL_ABI, sizeof(KERNEL_ABI) - 1);
     memcpy(info.data() + 72, ko.name.data(), ko.name.size());
     memcpy(data.bytes.data() + info_off, info.data(), info_size);
 

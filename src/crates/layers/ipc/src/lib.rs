@@ -92,8 +92,8 @@ pub const MAX_MONITORS: usize = 512;
 pub const MAX_WATCHES_EACH: usize = 16;
 pub const MAX_WATCHES: usize = 256;
 /// A module's name, as the module table keeps it: kmod's NAME_LEN, less the
-/// NUL.
-pub const OWNER_NAME_MAX: usize = 31;
+/// NUL (kcore's `owner`, which every table of what a module opens shares).
+pub const OWNER_NAME_MAX: usize = kcore::owner::NAME_MAX;
 
 /// Tags at and above this one are the channel's own: a sender is refused
 /// them.
@@ -332,45 +332,15 @@ impl Reason {
     }
 }
 
-/// Whose a mailbox is: the image's, or a module's, by the module's name.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Owner {
-    len: u8,
-    name: [u8; OWNER_NAME_MAX],
-}
+/// Whose a mailbox is: the image's, or a module's, by the module's name --
+/// kcore's, which every table of what a module opens keeps.
+pub(crate) use kcore::owner::Owner;
 
-impl Owner {
-    pub(crate) const IMAGE: Owner = Owner { len: 0, name: [0; OWNER_NAME_MAX] };
-
-    /// A module's, by its name: None for one that is no module's name.
-    pub(crate) fn module(name: &[u8]) -> Option<Owner> {
-        if name.is_empty() || name.len() > OWNER_NAME_MAX || core::str::from_utf8(name).is_err() {
-            return None;
-        }
-        let mut o = Owner { len: name.len() as u8, name: [0; OWNER_NAME_MAX] };
-        o.name[..name.len()].copy_from_slice(name);
-        Some(o)
-    }
-
-    pub(crate) fn is_image(&self) -> bool {
-        self.len == 0
-    }
-
-    /// The module's name, or "kernel" for the image.
-    pub(crate) fn as_str(&self) -> &str {
-        if self.is_image() {
-            return "kernel";
-        }
-        /* Only a UTF-8 name is ever put in */
-        core::str::from_utf8(&self.name[..usize::from(self.len)]).unwrap_or("?")
-    }
-
-    /// The namespace a module's names are under: its name up to its first
-    /// `-` -- nbs-mds's and nbs-cs's both `nbs`.
-    fn namespace(&self) -> &str {
-        let name = self.as_str();
-        name.split('-').next().unwrap_or(name)
-    }
+/// The namespace a module's names are under: its name up to its first `-`
+/// -- nbs-mds's and nbs-cs's both `nbs`.
+fn owner_namespace(owner: &Owner) -> &str {
+    let name = owner.as_str();
+    name.split('-').next().unwrap_or(name)
 }
 
 /// A message's bytes, in pieces of `PIECE` -- the last one shorter.
@@ -784,7 +754,7 @@ fn may_register(owner: &Owner, name: &str) -> bool {
     if owner.is_image() {
         return true;
     }
-    !RESERVED.contains(&ns) && ns == owner.namespace()
+    !RESERVED.contains(&ns) && ns == owner_namespace(&owner)
 }
 
 /// The mailbox at `addr`, if it is still there.
@@ -1603,6 +1573,10 @@ pub enum CallError {
     Send(Error),
     /// The mailbox called went, before it answered.
     Down(Reason),
+    /// The request, to another host, did not get there, and the channel
+    /// said why (TAG_BOUNCED) -- at once, where it used to be waited out
+    /// as a timeout.
+    Bounced(Bounce),
     /// Nothing came in time.
     Timeout,
 }
@@ -1627,13 +1601,31 @@ pub fn call(mine: &Mailbox, to: To, tag: u32, payload: Payload, timeout: Duratio
             mine.demonitor(monitor);
             return Err(CallError::Timeout);
         }
-        let Some(msg) = mine.recv(Duration::from_nanos(deadline - now)) else { continue };
+        let msg = match wait(&mine.mbox, Duration::from_nanos(deadline - now), usize::MAX) {
+            Taken::Message(msg) => msg,
+            /* Closed under the call: nothing more will come, and a wait for
+             * it spun to the deadline */
+            Taken::Closed => {
+                mine.demonitor(monitor);
+                return Err(CallError::Send(Error::Gone));
+            }
+            Taken::Nothing | Taken::TooSmall { .. } => continue,
+        };
         if !msg.is_system() && msg.reference == reference && msg.from == target {
             mine.demonitor(monitor);
             return Ok(msg);
         }
         if msg.tag == TAG_DOWN && msg.reference == monitor {
             return Err(CallError::Down(msg.down().unwrap_or(Reason::Closed)));
+        }
+        if msg.tag == TAG_BOUNCED && msg.reference == reference {
+            let mut code = [0u8; 4];
+            let why = (msg.payload().read(0, &mut code) == code.len())
+                .then(|| Bounce::from_u32(u32::from_le_bytes(code)))
+                .flatten()
+                .unwrap_or(Bounce::Unsent);
+            mine.demonitor(monitor);
+            return Err(CallError::Bounced(why));
         }
         count(&STATS.stray);
     }
@@ -1819,13 +1811,7 @@ pub fn stop() {
 /// The owner a C ABI caller is, from an address in its code: the module
 /// whose image holds it, or the image.
 pub(crate) fn owner_at(addr: usize) -> Owner {
-    let mut name = [0u8; OWNER_NAME_MAX + 1];
-    /* `name` takes its length's bytes */
-    let n = unsafe { ffi::system::kernel_module_name_at(addr, name.as_mut_ptr(), name.len()) };
-    if n == 0 || n > OWNER_NAME_MAX {
-        return Owner::IMAGE;
-    }
-    Owner::module(&name[..n]).unwrap_or(Owner::IMAGE)
+    Owner::at(addr)
 }
 
 /// For the C ABI: a mailbox by its address, still open.

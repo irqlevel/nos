@@ -6,10 +6,11 @@
 //! machine check while the guest ran would be a shutdown that looks like
 //! the guest's triple fault, and the host would never hear of it. The guest
 //! reads back the CR4 it wrote, MCE as it left it. And a bit its CPUID does
-//! not offer -- PKE where its PKRU is not switched between guests, SMEP,
-//! FSGSBASE, LA57, CET, OSXSAVE on a CPU without XSAVE, PCIDE -- is the #GP a
-//! CPU without the feature gives, not a feature the guest has behind its
-//! CPUID's back.
+//! not offer is the #GP a CPU without the feature gives, not a feature the
+//! guest has behind its CPUID's back: which bits those are is the policy's
+//! to say (`policy::cr4_allowed`) -- LA57 and CET always, PKE where its PKRU
+//! is not switched between guests, OSXSAVE where XSAVE's state is not, and
+//! any whose feature the host has not got.
 //!
 //! And its XSETBV, which both stop it at -- XCR0 is the CPU's, and neither
 //! `vmrun` nor `vmlaunch` switches it -- performed as a CPU offering the
@@ -52,8 +53,11 @@ const CR0_WP: u64 = 1 << 16;
 const EFER_LMA: u64 = 1 << 10;
 /// CR3's PCID, its low twelve bits: 0 for PCIDE to be turned on.
 const CR3_PCID: u64 = 0xFFF;
-/// The control register whose accesses this performs.
+/// The control registers whose accesses this performs.
 const CR4: u8 = 4;
+const CR8: u8 = 8;
+/// What CR8 holds: the task priority, four bits; a write of more is a #GP.
+const CR8_BITS: u64 = 0xF;
 /// CR4.OSXSAVE: XGETBV and XSETBV may be run.
 const CR4_OSXSAVE: u64 = 1 << 18;
 /// The extended control register XSETBV writes, of those ECX names: XCR0,
@@ -80,7 +84,7 @@ impl Error {
         match self {
             Error::Fetch(e) => e.describe(),
             Error::Decode => "the instruction is no mov to or from a control register",
-            Error::Mismatch => "the instruction is not the access of CR4 the exit was for",
+            Error::Mismatch => "the instruction is not the access of a control register the exit was for",
         }
     }
 }
@@ -141,6 +145,28 @@ pub fn cr4_access(v: &mut Backend, memory: &GuestMemory, write: bool, allowed: u
     };
     v.skip_emulated(len);
     Ok(done)
+}
+
+/// Perform the `mov` to CR8 AMD-V stopped the guest at -- its exit names
+/// no register, nor its length, on a CPU without decode assists: the
+/// instruction fetched by the guest's paging and decoded, as for CR4. A
+/// value past CR8's four bits is the #GP a CPU gives, the instruction not
+/// run; otherwise it is the guest's task priority (`set_cr8`), and the
+/// instruction stepped past.
+pub fn cr8_write(v: &mut Backend, memory: &GuestMemory, bytes: &mut Bytes) -> Result<(), Error> {
+    let mode = mmio::fetch(v.save(), memory, bytes).map_err(Error::Fetch)?;
+    let mov = insn::decode_mov_cr(&bytes.b[..usize::from(bytes.len)], mode).ok_or(Error::Decode)?;
+    if mov.cr != CR8 || !mov.write {
+        return Err(Error::Mismatch);
+    }
+    let value = mmio::gpr(v.save(), v.regs(), mov.gpr);
+    if value & !CR8_BITS != 0 {
+        v.inject_gp();
+        return Ok(());
+    }
+    v.set_cr8(value as u8);
+    v.skip_emulated(u64::from(mov.len));
+    Ok(())
 }
 
 /// Whether a CPU takes `new` into CR4 over `old`, in the state `save` holds:

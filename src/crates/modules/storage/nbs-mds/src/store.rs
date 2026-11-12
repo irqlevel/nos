@@ -17,7 +17,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-use kcore::block::{Disk, Found};
+use kcore::block::{Disk, DiskClaim, Found};
 use kcore::cmd::Output;
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
@@ -104,12 +104,14 @@ fn contents(disk: &Disk, page: &mut DmaBuffer) -> Result<Holds, String> {
     Ok(nbscs::holds(&first[0], &first[1]))
 }
 
-/// The superblock's two pages zeroed, past the device's write cache.
-fn wipe_first(disk: &Disk, page: &mut DmaBuffer) -> Result<(), String> {
-    let per = page_sectors(disk)?;
+/// The superblock's two pages zeroed, past the device's write cache --
+/// under the claim the caller holds, which the writes are made by.
+fn wipe_first(claim: &DiskClaim, page: &mut DmaBuffer) -> Result<(), String> {
+    let disk = claim.disk();
+    let per = page_sectors(&disk)?;
     page.as_mut_slice()[..PAGE].fill(0);
     for k in 0..2u64 {
-        disk.write(k * per, &page.as_slice()[..PAGE], true)
+        claim.write(k * per, &page.as_slice()[..PAGE], true)
             .map_err(|e| alloc::format!("{}: its page {} not zeroed -- {}", disk.name(), k, e))?;
     }
     disk.flush().map_err(|e| alloc::format!("{} not flushed -- {}", disk.name(), e))
@@ -161,7 +163,7 @@ pub fn device_add(state: &ModState, word: &str, wipe: bool) -> Result<(String, u
        is on it as it was */
     let wiped = other.is_some();
     if wiped {
-        if let Err(why) = wipe_first(&disk, &mut page) {
+        if let Err(why) = wipe_first(&claim, &mut page) {
             return Err(Failure::Other(alloc::format!("{} is device {} in the metadata, and was not wiped: {} -- its \
                                                       cs leaves it alone", ident, id, why)));
         }

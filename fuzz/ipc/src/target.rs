@@ -1390,11 +1390,9 @@ fn watch(m: &mut Model, r: &mut Input) {
     let got = match (m.boxes[w].owner, &m.image[w]) {
         (Owner::Image, Some(mb)) => mb.watch(prefix).map_err(|_| ()),
         (Owner::Image, None) => return,
-        // SAFETY: the prefix is its length's bytes.
-        (Owner::Module(_), _) => match unsafe { abi::kernel_ipc_watch(m.boxes[w].addr, prefix.as_ptr(), prefix.len()) } {
-            0 => Err(()),
-            id => Ok(id),
-        },
+        /* A module's mailbox watches no names: the C ABI has no watch,
+         * which no module called */
+        (Owner::Module(_), _) => return,
     };
     let refused = !prefix_ok(prefix) || !m.boxes[w].open || m.boxes[w].watches.len() >= ipc::MAX_WATCHES_EACH
         || m.watches.len() >= ipc::MAX_WATCHES;
@@ -1415,8 +1413,7 @@ fn unwatch(m: &mut Model, r: &mut Input) {
     let (w, id) = held[r.below(held.len() as u64) as usize];
     match (m.boxes[w].owner, &m.image[w]) {
         (Owner::Image, Some(mb)) => mb.unwatch(id),
-        (Owner::Image, None) => return,
-        (Owner::Module(_), _) => abi::kernel_ipc_unwatch(m.boxes[w].addr, id),
+        (Owner::Image, None) | (Owner::Module(_), _) => return,
     }
     if !m.boxes[w].open {
         return;
@@ -1547,7 +1544,8 @@ fn event_op(m: &mut Model, r: &mut Input) {
                 say!("event {} the image's", m.events.len());
                 m.events.push(EventM { image: Some(ev), handle: 0, held: true, weak });
             } else {
-                let handle = abi_ev::kernel_shared_event_open();
+                /* A made-up module's, by an address in its image */
+                let handle = abi_ev::kernel_shared_event_open(MODULES[r.below(MODULES.len() as u64) as usize].0);
                 invariant!(handle != 0, "a module's event refused");
                 let weak = events::lookup(handle).map(|e| Arc::downgrade(&e)).expect("the handle just made");
                 say!("event {} a module's: {:x}", m.events.len(), handle);

@@ -1,8 +1,9 @@
 //! The message channel as a loadable module reaches it (docs/ipc.md): a
 //! mailbox of the module's own -- closed when dropped -- messages sent from
-//! it by address or by name and received into it, monitors that say when a
-//! peer is gone, and watches that say when a name comes and goes. Inside
-//! the kernel image the channel is the `ipc` crate itself.
+//! it by address or by name and received into it, and monitors that say
+//! when a peer is gone. Inside the kernel image the channel is the `ipc`
+//! crate itself, whose mailboxes also watch names come and go -- a watch
+//! no module called is no export (docs/ipc.md).
 //!
 //! The channel calls nothing of the module's: the module's own task takes
 //! its messages. A mailbox is named by its address, which the kernel looks
@@ -227,6 +228,21 @@ impl Limits {
     pub const DEFAULT: Limits = Limits { messages: 256, bytes: 4 << 20 };
 }
 
+/// What one look of `recv`'s found.
+enum Whole {
+    Message(Message),
+    /// Nothing came, or it was woken.
+    Nothing,
+    /// The mailbox is closed: nothing will come.
+    Closed,
+    /// A message it had no room for, taken off and said.
+    Dropped,
+}
+
+/// How much of a message `recv` could not hold is read off at a time, onto
+/// the stack.
+const DROP_PART: usize = 512;
+
 /// A message received: who sent it, its tag and reference, its bytes.
 pub struct Message {
     pub from: Addr,
@@ -292,18 +308,17 @@ pub const PIECE_MAX: usize = 64 * 1024;
 /// How a call ended, when no answer came.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallError {
-    /// The request was refused.
+    /// The request was refused -- or the calling mailbox closed under the
+    /// call (Gone).
     Send(Error),
     /// The mailbox called went before it answered.
     Down(Reason),
+    /// The request, to another host, did not get there, and the channel
+    /// said why (TAG_BOUNCED): said at once, where it used to be waited out
+    /// as a timeout.
+    Bounced(Bounce),
     /// Nothing came in time.
     Timeout,
-}
-
-/// An address in this module's own code: what the kernel knows the module
-/// by when a mailbox is made.
-fn here() -> usize {
-    here as fn() -> usize as usize
 }
 
 /// A mailbox of this module's: closed when dropped.
@@ -329,7 +344,7 @@ impl Mailbox {
     }
 
     fn open(limits: Limits, event: u64) -> Result<Mailbox, Error> {
-        let addr = ipc::kernel_ipc_open(here(), limits.messages, limits.bytes as u64, event);
+        let addr = ipc::kernel_ipc_open(crate::owner::here(), limits.messages, limits.bytes as u64, event);
         if addr == 0 {
             return Err(Error::Refused);
         }
@@ -381,30 +396,86 @@ impl Mailbox {
     /// came, the receiver was woken (`wake`), or the mailbox is closed -- and,
     /// made on a task's event (`new_on`), at the event's first signal that
     /// brought none. One task waits on a mailbox at a time.
+    ///
+    /// A message whose payload the heap has no room for in one block --
+    /// past its largest, 512 KiB, or met while it had none of the size --
+    /// is taken off in parts and dropped, said in the log, and the next
+    /// looked for without waiting again: left first, it was every later
+    /// call's answer too, a mailbox that took nothing more and a server
+    /// spinning on its `None`. `recv_pieces` takes any message.
     pub fn recv(&self, timeout: Duration) -> Option<Message> {
+        let mut wait = timeout;
+        loop {
+            match self.recv_whole(wait) {
+                Whole::Message(m) => return Some(m),
+                Whole::Nothing | Whole::Closed => return None,
+                /* Not waited for again: the wait that brought it may have
+                 * been a task's event's signal for something else too,
+                 * which the caller is to look at on this `None`. */
+                Whole::Dropped => wait = Duration::zero(),
+            }
+        }
+    }
+
+    /// One look for the next message, as `recv` describes.
+    fn recv_whole(&self, timeout: Duration) -> Whole {
         let mut h = ipc::IpcHeader::default();
         /* Asked with no room first: a message with no payload comes whole,
          * any other says how long it is and stays first */
         let got = unsafe { ipc::kernel_ipc_recv(self.addr, timeout.as_nanos(), &mut h, core::ptr::null_mut(), 0) };
         if got == 0 {
-            return Some(Message { from: Addr(h.from), tag: h.tag, reference: h.reference, data: Vec::new() });
+            return Whole::Message(Message { from: Addr(h.from), tag: h.tag, reference: h.reference, data: Vec::new() });
+        }
+        if got == ipc::IPC_RECV_CLOSED {
+            return Whole::Closed;
         }
         if got != ipc::IPC_RECV_TOO_SMALL {
-            return None;
+            return Whole::Nothing;
         }
-        let len = usize::try_from(h.len).ok()?;
+        let Ok(len) = usize::try_from(h.len) else { return Whole::Nothing };
         let mut data: Vec<u8> = Vec::new();
-        data.try_reserve_exact(len).ok()?;
+        if data.try_reserve_exact(len).is_err() {
+            self.drop_first(len);
+            return Whole::Dropped;
+        }
         /* The message is still first, and this task its one receiver: taken
          * now into room for all of it, which `data` has for `len` bytes */
         let got = unsafe { ipc::kernel_ipc_recv(self.addr, 0, &mut h, data.as_mut_ptr(), len) };
-        let Ok(n) = usize::try_from(got) else { return None };
+        let Ok(n) = usize::try_from(got) else { return Whole::Nothing };
         if n > len {
-            return None;
+            return Whole::Nothing;
         }
         /* The kernel wrote `n` bytes, no more than `len`, which `data` holds */
         unsafe { data.set_len(n) };
-        Some(Message { from: Addr(h.from), tag: h.tag, reference: h.reference, data })
+        Whole::Message(Message { from: Addr(h.from), tag: h.tag, reference: h.reference, data })
+    }
+
+    /// The first message, `len` bytes that `recv` could not hold, read off
+    /// in parts into a scrap of stack -- which takes it, with its last
+    /// byte -- and said in the log.
+    fn drop_first(&self, len: usize) {
+        let mut scrap = [0u8; DROP_PART];
+        let mut h = ipc::IpcHeader::default();
+        let mut ticket = 0u64;
+        let mut offset = 0usize;
+        let mut whole = len;
+        while offset < whole {
+            let want = scrap.len().min(whole - offset);
+            /* `scrap` has room for `want` bytes; the ticket is the first
+             * part's, which holds every part after it to this message */
+            let n = unsafe {
+                ipc::kernel_ipc_recv_part(self.addr, 0, &mut h, scrap.as_mut_ptr(), want, offset as u64, &mut ticket)
+            };
+            let Some(n) = usize::try_from(n).ok().filter(|&n| n > 0 && n <= want) else { break };
+            if offset == 0 {
+                /* The message's own length, as its first part gives it */
+                whole = usize::try_from(h.len).unwrap_or(whole);
+            }
+            offset += n;
+        }
+        crate::klog!(0, "ipc: a message of {} bytes from {:#x}, tag {:#x}, dropped: no room for it in one block of \
+                         the heap (recv_pieces takes one in pieces){}", whole, h.from, h.tag,
+                     if offset < whole { " -- and it could not be read off whole" } else { "" });
     }
 
     /// The next message, waiting up to `timeout` for one, in pieces of at
@@ -468,20 +539,6 @@ impl Mailbox {
 
     pub fn demonitor(&self, id: u64) {
         ipc::kernel_ipc_demonitor(self.addr, id);
-    }
-
-    /// This mailbox told of every name under `prefix` that comes and goes:
-    /// the watch's id. What is there already, `list` says.
-    pub fn watch(&self, prefix: &str) -> Result<u64, Error> {
-        /* `prefix` is its length's bytes */
-        match unsafe { ipc::kernel_ipc_watch(self.addr, prefix.as_ptr(), prefix.len()) } {
-            0 => Err(Error::Refused),
-            id => Ok(id),
-        }
-    }
-
-    pub fn unwatch(&self, id: u64) {
-        ipc::kernel_ipc_unwatch(self.addr, id);
     }
 
     /// A reference for a request of this mailbox's, no other of its own.
@@ -578,13 +635,27 @@ impl Mailbox {
                 self.demonitor(monitor);
                 return Err(CallError::Timeout);
             }
-            let Some(msg) = self.recv(Duration::from_nanos(deadline - now)) else { continue };
+            let msg = match self.recv_whole(Duration::from_nanos(deadline - now)) {
+                Whole::Message(msg) => msg,
+                /* Closed under the call: nothing more will come, and a wait
+                 * for it spun to the deadline */
+                Whole::Closed => {
+                    self.demonitor(monitor);
+                    return Err(CallError::Send(Error::Gone));
+                }
+                Whole::Nothing | Whole::Dropped => continue,
+            };
             if !msg.is_system() && msg.reference == reference && msg.from == to {
                 self.demonitor(monitor);
                 return Ok(msg);
             }
             if msg.tag == TAG_DOWN && msg.reference == monitor {
                 return Err(CallError::Down(msg.down().unwrap_or(Reason::Closed)));
+            }
+            if msg.tag == TAG_BOUNCED && msg.reference == reference {
+                let why = msg.bounced().map(|b| b.why).unwrap_or(Bounce::Unsent);
+                self.demonitor(monitor);
+                return Err(CallError::Bounced(why));
             }
         }
     }
@@ -597,7 +668,7 @@ impl Drop for Mailbox {
 }
 
 /// A host's name at most: a DNS label's.
-const HOST_NAME_MAX: usize = 63;
+const HOST_NAME_MAX: usize = ipc::IPC_HOST_NAME_MAX;
 
 /// The host a message from another host came from: the name of the peer
 /// whose number `addr`'s host part is, while it is up -- None for this
@@ -632,23 +703,26 @@ pub struct Name {
     pub scope: Scope,
 }
 
-/// The most names `list` asks for at once.
+/// The most names `list` gives.
 const LIST_MAX: usize = 256;
 
-/// The names under `prefix` on this host.
-pub fn list(prefix: &str) -> Vec<Name> {
+/// The names under `prefix` on this host: TooLarge when there are more than
+/// `LIST_MAX` -- asked for with room for one more, so that the first 256 no
+/// longer pass for all there is -- and NoMemory when there is no room to ask
+/// with, which once came back as an empty list.
+pub fn list(prefix: &str) -> Result<Vec<Name>, Error> {
     let mut out = Vec::new();
     let mut raw: Vec<ipc::IpcName> = Vec::new();
-    if raw.try_reserve_exact(LIST_MAX).is_err() {
-        return out;
+    raw.try_reserve_exact(LIST_MAX + 1).map_err(|_| Error::NoMemory)?;
+    /* `prefix` is its length's bytes; `raw` has room for LIST_MAX + 1
+     * entries */
+    let n = unsafe { ipc::kernel_ipc_list(prefix.as_ptr(), prefix.len(), raw.as_mut_ptr(), LIST_MAX + 1) };
+    if n > LIST_MAX {
+        return Err(Error::TooLarge);
     }
-    /* `prefix` is its length's bytes; `raw` has room for LIST_MAX entries */
-    let n = unsafe { ipc::kernel_ipc_list(prefix.as_ptr(), prefix.len(), raw.as_mut_ptr(), LIST_MAX) };
     /* The kernel wrote `n` entries, no more than LIST_MAX */
-    unsafe { raw.set_len(n.min(LIST_MAX)) };
-    if out.try_reserve_exact(raw.len()).is_err() {
-        return out;
-    }
+    unsafe { raw.set_len(n) };
+    out.try_reserve_exact(raw.len()).map_err(|_| Error::NoMemory)?;
     for r in &raw {
         let len = (r.len as usize).min(ipc::IPC_NAME_MAX);
         let Ok(text) = core::str::from_utf8(&r.name[..len]) else { continue };
@@ -660,5 +734,5 @@ pub fn list(prefix: &str) -> Vec<Name> {
         let scope = if r.scope == ipc::IPC_SCOPE_CLUSTER { Scope::Cluster } else { Scope::Host };
         out.push(Name { name, addr: Addr(r.addr), scope });
     }
-    out
+    Ok(out)
 }

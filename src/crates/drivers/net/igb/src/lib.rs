@@ -851,7 +851,7 @@ fn find_mmio_bar(pci_dev: &pci::PciDevice) -> u64 {
     }
     let is_64bit = (bar0 >> 1) & 0x3 == 0x2;
     if is_64bit {
-        pci_dev.get_bar64(0) & !0xFu64
+        pci_dev.bar_address(0)
     } else {
         (bar0 & !0xFu32) as u64
     }

@@ -87,9 +87,11 @@ const OFFERS_INVPCID: u8 = 1 << 2;
 
 /// What of RDTSCP, RDPID and INVPCID a guest is given: what the CPU first
 /// asked has and its extension runs in a guest, and that from then on, as a
-/// guest's CPUID has to stay. VT-x's controls are asked again of each CPU a
-/// guest is configured on, and one without them refuses it
-/// ([`vmx::Guest`]'s `NotRun::Controls`) -- none this kernel runs on.
+/// guest's CPUID has to stay. VT-x's controls are decided once in a guest's
+/// life, on the CPU of its first entry (`configure`), and a CPU without
+/// them refuses it there ([`vmx::Guest`]'s `NotRun::Controls`); a guest
+/// that moves after is not asked again -- every CPU of a machine this kernel
+/// runs on is alike.
 pub fn offers() -> Offers {
     let mut bits = OFFERS.load(Ordering::Relaxed);
     if bits & OFFERS_KNOWN == 0 {

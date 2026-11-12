@@ -35,7 +35,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use kcore::block::Disk;
+use kcore::block::{Disk, DiskClaim};
 use kcore::cmd::{Command, Output};
 use kcore::dma::DmaBuffer;
 use kcore::time::boot_time_ns;
@@ -243,7 +243,9 @@ impl Rng {
 /* What every worker reads; only the atomics change while they run */
 struct Shared {
     disk: Disk,
-    write: bool,
+    /// The device held for the test's writes, which are made under it: None
+    /// for a test that reads
+    claim: Option<DiskClaim>,
     random: bool,
     bs: usize,
     block_sectors: u64,
@@ -273,9 +275,9 @@ extern "C" fn worker_main(ctx: *mut u8) {
         let sector = block * shared.block_sectors;
 
         let start = boot_time_ns();
-        let done = match shared.write {
-            true => shared.disk.write(sector, buf, false),
-            false => shared.disk.read(sector, buf),
+        let done = match &shared.claim {
+            Some(claim) => claim.write(sector, buf, false),
+            None => shared.disk.read(sector, buf),
         };
         let end = boot_time_ns();
 
@@ -393,7 +395,7 @@ fn run(args: &str, out: &mut Output) -> Result<(), String> {
 
     /* Held to the end of the test: no mount, disk log or other writer can take
        the device -- or a disk or partition overlapping it -- meanwhile */
-    let _claim = if opts.write {
+    let claim = if opts.write {
         let claim = disk
             .claim()
             .map_err(|who| format!("{} is in use by {} -- not writing to it", opts.device, who))?;
@@ -427,7 +429,7 @@ fn run(args: &str, out: &mut Output) -> Result<(), String> {
     let start = boot_time_ns();
     let shared = Shared {
         disk,
-        write: opts.write,
+        claim,
         random: opts.pattern == Pattern::Random,
         bs: opts.bs as usize,
         block_sectors,

@@ -103,6 +103,11 @@ pub struct GuestMsrs {
     /// The IA32_SPEC_CTRL its last entry ran under -- its bits over the
     /// host's -- or None where the CPU has none, or before its first.
     ran_with: Option<u64>,
+    /// A check's: its entries read IA32_SPEC_CTRL back after loading it
+    /// (`measure`), so that `ran_with` is what the CPU held, not what was
+    /// meant -- a `wrmsr` dropped, or a per-CPU cache of what the MSR holds
+    /// gone stale, then shows.
+    measure: bool,
     id: u64,
 }
 
@@ -114,6 +119,7 @@ impl GuestMsrs {
             ibpbs: 0,
             answered: 0,
             ran_with: None,
+            measure: false,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -182,6 +188,17 @@ impl GuestMsrs {
     /// Its entry ran under `value` (`spec::State::load_guest`, or its VMCB's).
     pub(super) fn ran(&mut self, value: Option<u64>) {
         self.ran_with = value;
+    }
+
+    /// Have its entries read IA32_SPEC_CTRL back after loading it, for
+    /// `ran_with` to be what the CPU held: a built-in guest's check (`spec`),
+    /// a `rdmsr` an entry dearer.
+    pub fn measure(&mut self) {
+        self.measure = true;
+    }
+
+    pub(super) fn measuring(&self) -> bool {
+        self.measure
     }
 
     /// Put the guest's TSC_AUX into CPU `cpu` before its entry, unless the

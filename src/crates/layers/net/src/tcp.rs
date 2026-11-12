@@ -127,6 +127,13 @@ use kcore::trace::{self, TcpAck, TcpLoss, TcpLossWhat, TcpRecv, TcpRecovery, Tcp
                    TcpWaitFor, TcpWhy};
 
 pub const MAX_CONNECTIONS: usize = 64;
+
+/// A connection's word (`Tcp::word_of`): the slot's number and one in the
+/// low bits, the generation above them, as much of it as fits.
+const WORD_SLOT_BITS: u32 = 16;
+const WORD_SLOT_MASK: usize = (1 << WORD_SLOT_BITS) - 1;
+const WORD_GENERATION_MASK: u64 = (1 << (usize::BITS - WORD_SLOT_BITS)) - 1;
+const _: () = assert!(MAX_CONNECTIONS < WORD_SLOT_MASK);
 /* A slot's number is a byte in its tracepoints' records */
 const _: () = assert!(MAX_CONNECTIONS <= u8::MAX as usize + 1);
 /// What a slot buffers each way, in the slot itself.
@@ -245,7 +252,7 @@ const RX_LOOK_MS: u64 = 100;
 const TX_LOOK_MS: u64 = 100;
 /// The most networks a listener answers SYNs from when it is told which
 /// (`listen_allowed`): a cluster's hosts each by its address, with room.
-pub const ALLOW_MAX: usize = 64;
+pub const ALLOW_MAX: usize = ffi::tcp::TCP_ALLOW_MAX;
 /// Resets to segments for no connection, held to RST_RATE a second with
 /// bursts of RST_BURST, over the whole stack (FreeBSD's `icmplim` is 200):
 /// a flood at closed ports, its source addresses forged, does not make this
@@ -275,7 +282,7 @@ const _: () = assert!(LISTEN_BACKLOG <= u8::MAX as usize);
 
 /// What `recv` answers below zero.
 pub const RECV_ERROR: isize = -1;
-pub const RECV_TIMEOUT: isize = -2;
+pub const RECV_TIMEOUT: isize = ffi::tcp::TCP_RECV_TIMEOUT;
 
 const MAX_FRAME: usize = 1514;
 /// A SACK option's head: two NOPs, its kind and its length.
@@ -1266,6 +1273,11 @@ impl Inner {
         self.send_buf.attach(bulk);
     }
 
+    /// Whether either buffer is a bulk one, which goes back to the heap.
+    fn has_bulk(&self) -> bool {
+        self.recv_buf.bulk.is_some() || self.send_buf.bulk.is_some()
+    }
+
     /// The bulk send buffer back with its table, if there is one, for the
     /// caller to drop once no lock is held.
     fn detach_send(&mut self) -> Option<BulkBuf> {
@@ -1644,6 +1656,9 @@ pub struct Tcp {
     syn_refused: AtomicUsize,
     /// Connections given up half open
     half_open: AtomicUsize,
+    /// Slots taken back from connections their programs had let go of, for
+    /// a new connection with every slot taken (`Tcp::reclaim`)
+    reclaimed: AtomicUsize,
     /// Resets for no connection not sent: the bucket was empty
     rst_held: AtomicUsize,
     /// The reset bucket (GCRA): when its next reset is due, boot us
@@ -1698,6 +1713,7 @@ pub static TCP: Tcp = Tcp {
     conn_count: AtomicUsize::new(0),
     syn_refused: AtomicUsize::new(0),
     half_open: AtomicUsize::new(0),
+    reclaimed: AtomicUsize::new(0),
     rst_held: AtomicUsize::new(0),
     rst_due_us: AtomicU64::new(0),
     recoveries: AtomicUsize::new(0),
@@ -1856,10 +1872,31 @@ impl Tcp {
         Some(offset / size)
     }
 
-    /// The connection a caller outside Rust names by its address: one of the
-    /// pool's, or none.
-    pub fn by_handle(&'static self, handle: usize) -> Option<&'static Conn> {
-        self.slot_at(handle).map(|index| &self.conns[index])
+    /// A connection's slot in the pool: where the C ABI keeps whose it is
+    /// (abi.rs).
+    pub fn slot_index(&'static self, conn: &'static Conn) -> Option<usize> {
+        self.index_of(conn)
+    }
+
+    /// The word a connection crosses the C ABI as (ffi's tcp.rs): its slot's
+    /// number and one, and in the bits above them the generation of the
+    /// connection the slot holds now.
+    pub fn word_of(&'static self, conn: &'static Conn) -> usize {
+        let Some(index) = self.index_of(conn) else { return 0 };
+        let generation = conn.generation.load(Ordering::Acquire) & WORD_GENERATION_MASK;
+        ((generation as usize) << WORD_SLOT_BITS) | (index + 1)
+    }
+
+    /// The connection a word from outside names, while its slot still holds
+    /// the connection the word was made for: a word kept past a close is
+    /// nobody's once the slot is handed out again, where an address was
+    /// whoever's had the slot. A check, not a hold: a close racing a call of
+    /// the same owner's on the same word is the owner's to order.
+    pub fn by_word(&'static self, word: usize) -> Option<&'static Conn> {
+        let index = (word & WORD_SLOT_MASK).checked_sub(1)?;
+        let conn = self.conns.get(index)?;
+        let generation = conn.generation.load(Ordering::Acquire) & WORD_GENERATION_MASK;
+        (generation as usize == word >> WORD_SLOT_BITS).then_some(conn)
     }
 
     /// A fresh connection in a slot the pool has just handed out: locked,
@@ -1877,6 +1914,80 @@ impl Tcp {
         conn.generation.fetch_add(1, Ordering::AcqRel);
         conn.kicked.store(false, Ordering::Release);
         inner
+    }
+
+    /// A slot for `slot`: a free one, or -- every one taken -- one taken back
+    /// from a connection its program has let go of (`reclaim`).
+    fn take_slot(&'static self, pool: &mut Pool, slot: Slot) -> Option<usize> {
+        pool.alloc(slot).or_else(|| if self.reclaim(pool) { pool.alloc(slot) } else { None })
+    }
+
+    /// With every slot taken, take one back from the connections whose
+    /// programs have let them go and that only wait out their close: one
+    /// closed already and not yet swept, then the one in TIME-WAIT the
+    /// longest, then FIN-WAIT-2, then the rest of a close nobody will read.
+    /// Linux does the same past what it keeps of each (`tcp_max_tw_buckets`,
+    /// `tcp_max_orphans`). Without it, anyone who could open and close
+    /// connections to a port -- one a relay closes first, `hv forward`'s --
+    /// or leave them closing held every slot the machine has for the minute
+    /// of each TIME-WAIT, and nos's sshd and its API turned everyone away.
+    ///
+    /// One with nothing left to give back to the heap is freed here, and
+    /// true. One that still has a bulk buffer, which is not freed with the
+    /// pool's lock held, is closed for the sweep to free, and false: the new
+    /// connection is refused this once -- a SYN dropped, which its peer
+    /// sends again. The pool's lock is held, and each connection's is taken
+    /// under it, in the order the cleanup takes them.
+    fn reclaim(&'static self, pool: &mut Pool) -> bool {
+        /* The rank of a connection let go of and closing, lower first */
+        fn rank(state: State) -> Option<u8> {
+            match state {
+                State::Closed => Some(0),
+                State::TimeWait => Some(1),
+                State::FinWait2 => Some(2),
+                State::FinWait1 | State::Closing | State::LastAck => Some(3),
+                _ => None,
+            }
+        }
+        let mut best: Option<(u8, u64, usize)> = None;
+        for i in 0..MAX_CONNECTIONS {
+            if !pool.slots[i].used || pool.slots[i].listening {
+                continue;
+            }
+            let inner = self.conns[i].inner.lock();
+            if inner.owned_by_app {
+                continue;
+            }
+            let Some(r) = rank(inner.state) else { continue };
+            let key = (r, inner.time_wait_at);
+            if best.is_none_or(|(br, bt, _)| key < (br, bt)) {
+                best = Some((r, inner.time_wait_at, i));
+            }
+        }
+        let Some((_, _, i)) = best else { return false };
+        let conn = &self.conns[i];
+        let mut inner = conn.inner.lock();
+        /* Under the pool's lock since the look: nothing has taken it */
+        if inner.owned_by_app || rank(inner.state).is_none() {
+            return false;
+        }
+        self.reclaimed.fetch_add(1, Ordering::Relaxed);
+        if inner.has_bulk() {
+            inner.state = State::Closed;
+            inner.disarm();
+            inner.need_cleanup = true;
+            conn.conn_ready.store(true, Ordering::Release);
+            /* The sweep at once, under the connection's lock as `note` asks */
+            self.timer.note(now_ms());
+            return false;
+        }
+        inner.state = State::Free;
+        inner.disarm();
+        inner.need_cleanup = false;
+        drop(inner);
+        pool.free(i);
+        self.conn_count.fetch_sub(1, Ordering::Relaxed);
+        true
     }
 }
 
@@ -3822,7 +3933,7 @@ impl Tcp {
                 return;
             }
 
-            let index = match pool.alloc(Slot {
+            let index = match self.take_slot(&mut pool, Slot {
                 used: true, listening: false,
                 local_ip, local_port, remote_ip, remote_port,
                 device: Some(*nic), backlog: 0, bulk: false,
@@ -3970,7 +4081,8 @@ impl Tcp {
 /// Where a connection's sequence numbers start. From the entropy pool: an
 /// initial sequence number a stranger can guess is one they can inject into.
 fn initial_sequence() -> u32 {
-    kcore::random::random_u64().unwrap_or(0x1234_5678) as u32
+    static SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    kcore::random::random_u64_or_clock("TCP's initial sequence numbers", &SAID) as u32
 }
 
 /* ---- what an application calls ---- */
@@ -4025,7 +4137,7 @@ impl Tcp {
         };
 
         let local_ip = nic.ip();
-        let index = match pool.alloc(Slot {
+        let index = match self.take_slot(&mut pool, Slot {
             used: true, listening: false,
             local_ip, local_port: src_port, remote_ip: dst_ip, remote_port: dst_port,
             device: Some(*nic), backlog: 0, bulk: false,
@@ -4204,7 +4316,7 @@ impl Tcp {
         /* The wildcard address, which a segment for any address matches:
          * bound to the device's address of the moment, the port would answer
          * nobody once a lease renewal moved it. */
-        let index = pool.alloc(Slot {
+        let index = self.take_slot(&mut pool, Slot {
             used: true, listening: true,
             local_ip: 0, local_port: port, remote_ip: 0, remote_port: 0,
             device: Some(*nic),
@@ -4952,6 +5064,7 @@ impl Tcp {
             conns: self.conn_count.load(Ordering::Relaxed),
             syn_refused: self.syn_refused.load(Ordering::Relaxed),
             half_open: self.half_open.load(Ordering::Relaxed),
+            reclaimed: self.reclaimed.load(Ordering::Relaxed),
             rst_held: self.rst_held.load(Ordering::Relaxed),
             recoveries: self.recoveries.load(Ordering::Relaxed),
             timeouts: self.timeouts.load(Ordering::Relaxed),
@@ -5082,6 +5195,9 @@ pub struct Stats {
     pub syn_refused: usize,
     /// Connections given up half open, their ACK never come
     pub half_open: usize,
+    /// Slots taken back for a new connection, every one taken, from
+    /// connections their programs had let go of
+    pub reclaimed: usize,
     /// Resets for no connection the bucket held back
     pub rst_held: usize,
     /// Of connections that take SACK: recoveries RACK started, timeouts and

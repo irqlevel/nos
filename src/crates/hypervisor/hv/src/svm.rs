@@ -44,7 +44,14 @@ const CR4_DEFINED: u64 = 0x00F7_1FFF;
 pub const PAT_RESET: u64 = 0x0007_0406_0007_0406;
 const RFLAGS_RESERVED_ONE: u64 = 1 << 1;
 const DR6_RESET: u64 = 0xFFFF_0FF0;
+/// DR6.BS: the #DB was a single step's.
+const DR6_BS: u64 = 1 << 14;
+/// RFLAGS.TF: a single step after every instruction.
+const RFLAGS_TF: u64 = 1 << 8;
+const VECTOR_DB: u64 = 1;
 const DR7_RESET: u64 = 0x400;
+/// DR7's general-detect bit, which a CPU clears as it enters a #DB handler.
+const DR7_GD: u64 = 1 << 13;
 /// How many debug registers an exit code can name a `mov` of, each way.
 const DEBUG_REGS: u64 = 16;
 /// A real-mode segment's limit: 64 KiB.
@@ -69,96 +76,7 @@ const LEN_PAUSE: u64 = 2;
 /// PAUSE stopping it would cost a spinlock's waiter an exit for each look.
 const PAUSE_FILTER_COUNT: u16 = 128;
 
-/// A port access that stopped the guest.
-#[derive(Clone, Copy, Debug)]
-pub struct Io {
-    pub port: u16,
-    /// 1, 2 or 4 bytes.
-    pub size: u8,
-    /// IN rather than OUT.
-    pub input: bool,
-    /// INS or OUTS, which move memory and not RAX.
-    pub string: bool,
-    pub rep: bool,
-    /// Where the instruction ends: every CPU says so for an I/O intercept.
-    pub next_rip: u64,
-}
-
-/// Why a guest stopped.
-#[derive(Clone, Copy, Debug)]
-pub enum Exit {
-    /// One of the host's own interrupts -- an IRQ, an NMI, an SMI, an INIT --
-    /// took the CPU back. The host has handled it by the time this is read;
-    /// the guest goes straight back in.
-    Host,
-    /// Not entered at all: another CPU kicked the vCPU on its way in
-    /// (`hvarch::x86::svm::Kick`), and what it has for the guest -- a frame
-    /// -- is to be handed over first.
-    Kicked,
-    Io(Io),
-    Hlt,
-    Cpuid,
-    Msr { write: bool },
-    /// VMMCALL.
-    Hypercall,
-    /// The guest reached a point where it could take a virtual interrupt --
-    /// the interrupt window this hypervisor asked for (`request_irq_window`).
-    IrqWindow,
-    /// The guest may be able to take an NMI now: VT-x's NMI window, or on
-    /// AMD-V the IRET that ends the guest's NMI handler.
-    NmiWindow,
-    /// The guest touched a guest physical address with no memory behind it
-    /// -- or with memory it may not use that way.
-    NestedFault { gpa: u64, error: u64 },
-    Exception { vector: u8, error: Option<u32> },
-    /// A machine check, taken while the guest ran: the host's hardware
-    /// reporting an error, stopped on its way into the guest.
-    MachineCheck,
-    /// The guest triple-faulted.
-    Shutdown,
-    /// `vmrun` refused the VMCB.
-    Invalid,
-    /// A `mov` to (`write`) or from CR8 -- the task-priority register --
-    /// with general-purpose register `gpr` (numbered as the encoding does:
-    /// RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8-R15). VT-x stops the guest
-    /// there, since the real CR8 is the host's; AMD-V gives the guest a
-    /// shadow of its own and never exits.
-    Cr8 { write: bool, gpr: u8 },
-    /// A `mov` to CR0, or an `lmsw`, that changes a bit VT-x keeps for the
-    /// host -- PG, PE, NE -- with `value` what CR0 would become (the whole
-    /// register named, or for `lmsw` its low four bits over CR0's). AMD-V
-    /// intercepts no CR0 write, and never exits for one.
-    Cr0Write { value: u64 },
-    /// A `mov` to (`write`) or from CR4, which AMD-V stops a guest at every
-    /// time and VT-x at a write that changes a bit the host keeps -- MCE
-    /// among them: so that the CR4 it runs with keeps MCE, and it reads back
-    /// the one it wrote (`crate::cr`). `gpr` is the general-purpose register
-    /// where the exit names it -- VT-x's always -- and None where the
-    /// instruction is to be decoded for it.
-    Cr4 { write: bool, gpr: Option<u8> },
-    /// A `mov` to (`write`) or from debug register `dr`, which AMD-V stops
-    /// a guest at for DR0-DR3, the breakpoint addresses, and VT-x for every
-    /// one: they are the CPU's, not the VMCB's or the VMCS's, and the
-    /// guest's are kept apart from them and answered from there
-    /// (`crate::dr`) -- under VT-x DR6 too, which it does not switch, and
-    /// DR7, which it does but would not otherwise see written. `gpr` as for
-    /// [`Exit::Cr4`].
-    Dr { write: bool, dr: u8, gpr: Option<u8> },
-    /// The guest ended an interrupt in service by its x2APIC's EOI, which
-    /// the CPU performed -- VT-x's virtual-interrupt delivery -- and stopped
-    /// it after, `vector` being one whose end the host must hear of: a
-    /// level-triggered one, for the IO-APIC.
-    Eoi { vector: u8 },
-    /// PAUSE -- the guest spin-waiting: stopped so that whatever it waits
-    /// for that the host hands over, a timer's tick above all, is handed
-    /// over now rather than at the host's next interrupt.
-    Pause,
-    /// An instruction of a virtualization extension's own -- VMX's or
-    /// SVM's -- or GETSEC, which CPUID tells the guest it has not got and a
-    /// CPU without them faults #UD on: what the guest is given.
-    Undefined,
-    Other(u64),
-}
+pub use crate::exit::{Exit, Instr, Io};
 
 /// The state INIT and a start-up IPI with `vector` leave a CPU in, into
 /// `s`: real mode at `vector` * 4 KiB, as both backends start one. `efer` is
@@ -622,6 +540,7 @@ impl Vcpu {
             vmcb::exit::INTR | vmcb::exit::NMI | vmcb::exit::SMI | vmcb::exit::INIT => Exit::Host,
             vmcb::exit::CR4_READ => Exit::Cr4 { write: false, gpr: None },
             vmcb::exit::CR4_WRITE => Exit::Cr4 { write: true, gpr: None },
+            vmcb::exit::CR8_WRITE => Exit::Cr8 { write: true, gpr: None },
             code if (vmcb::exit::DR_READ..vmcb::exit::DR_READ + DEBUG_REGS).contains(&code) => {
                 Exit::Dr { write: false, dr: (code - vmcb::exit::DR_READ) as u8, gpr: None }
             }
@@ -656,6 +575,23 @@ impl Vcpu {
              * told it has no SVM is owed the #UD a CPU without it gives. */
             vmcb::exit::VMRUN | vmcb::exit::VMLOAD | vmcb::exit::VMSAVE | vmcb::exit::STGI
             | vmcb::exit::CLGI | vmcb::exit::SKINIT | vmcb::exit::INVLPGA => Exit::Undefined,
+            /* Every other instruction an intercept here or in `hvarch`
+             * asks for: by its name. RSM, which is any CPL's to run and a
+             * #UD outside SMM, was once an exit no arm answered -- a user
+             * process's `rsm` stopped its whole VM -- and INVD, a task switch
+             * and FERR# freeze were, from the guest's kernel. */
+            vmcb::exit::ICEBP => Exit::Instr(Instr::Icebp),
+            vmcb::exit::RDPMC => Exit::Instr(Instr::Rdpmc),
+            vmcb::exit::XSETBV => Exit::Instr(Instr::Xsetbv),
+            vmcb::exit::WBINVD => Exit::Instr(Instr::Wbinvd),
+            vmcb::exit::INVD => Exit::Instr(Instr::Invd),
+            vmcb::exit::MONITOR => Exit::Instr(Instr::Monitor),
+            vmcb::exit::MWAIT | vmcb::exit::MWAIT_ARMED => Exit::Instr(Instr::Mwait),
+            vmcb::exit::RDTSCP => Exit::Instr(Instr::Rdtscp),
+            vmcb::exit::RDPRU => Exit::Instr(Instr::Rdpru),
+            vmcb::exit::RSM => Exit::Instr(Instr::Rsm),
+            vmcb::exit::TASK_SWITCH => Exit::TaskSwitch,
+            vmcb::exit::FERR_FREEZE => Exit::FerrFreeze,
             vmcb::exit::VINTR => Exit::IrqWindow,
             vmcb::exit::NPF => Exit::NestedFault { gpa: c.exit_info2, error: c.exit_info1 },
             vmcb::exit::SHUTDOWN => Exit::Shutdown,
@@ -671,7 +607,7 @@ impl Vcpu {
                     }
                 }
             }
-            code => Exit::Other(code),
+            code => Exit::Other { code, vmx: false },
         }
     }
 
@@ -712,10 +648,32 @@ impl Vcpu {
     /// instruction also steps out of the interrupt shadow it may have been
     /// in: the one instruction after STI has now run.
     pub fn skip(&mut self, len: u64) {
+        self.step_over(len);
+        self.stepped();
+    }
+
+    /// `skip` with no single step after it: for ICEBP, whose own #DB the
+    /// run loop gives.
+    fn step_over(&mut self, len: u64) {
         let nrip = self.nrip;
         let v = self.guest.vmcb_mut();
         v.save.rip = if nrip { v.control.next_rip } else { v.save.rip.wrapping_add(len) };
         v.control.int_state &= !vmcb::int_state::SHADOW;
+    }
+
+    /// After every instruction the host stepped past for the guest: with
+    /// RFLAGS.TF set, the single step's #DB the instruction would have
+    /// raised, DR6.BS set -- the CPU raises none for an instruction it never
+    /// ran, and a debugger's `stepi` over a CPUID landed one instruction
+    /// late, a uprobe's step after it ran the next. Not over an event
+    /// already going in, which an instruction's intercept never cuts short.
+    fn stepped(&mut self) {
+        use vmcb::event;
+        let v = self.guest.vmcb_mut();
+        if v.save.rflags & RFLAGS_TF != 0 && v.control.event_inj & event::VALID == 0 {
+            v.save.dr6 |= DR6_BS;
+            v.control.event_inj = event::VALID | event::TYPE_EXCEPTION | VECTOR_DB;
+        }
     }
 
     /// Step past an instruction the host performed for the guest, `len`
@@ -726,6 +684,7 @@ impl Vcpu {
         let v = self.guest.vmcb_mut();
         v.save.rip = v.save.rip.wrapping_add(len);
         v.control.int_state &= !vmcb::int_state::SHADOW;
+        self.stepped();
     }
 
     /// Step past an I/O instruction: its end is always known.
@@ -733,6 +692,7 @@ impl Vcpu {
         let v = self.guest.vmcb_mut();
         v.save.rip = io.next_rip;
         v.control.int_state &= !vmcb::int_state::SHADOW;
+        self.stepped();
     }
 
     pub fn skip_hlt(&mut self) {
@@ -767,7 +727,7 @@ impl Vcpu {
     /// Step past an ICEBP (`int1`), intercepted: the #DB it raises, which
     /// the run loop gives the guest next, is a trap's, delivered after it.
     pub fn skip_icebp(&mut self) {
-        self.skip(LEN_ICEBP);
+        self.step_over(LEN_ICEBP);
     }
 
     /// Step past an XSETBV performed for the guest (`crate::cr::xsetbv`).
@@ -809,6 +769,16 @@ impl Vcpu {
     /// the VMCB as it took the exit, and it goes back in from there.
     pub fn reflect_exception(&mut self, vector: u8, error: Option<u32>) {
         use vmcb::event;
+        /* A CPU entering its #DB handler clears DR7.GD; an event injected
+         * through EVENTINJ does not, so it is done here, as VT-x's side
+         * does: left set, the handler's own first access of a debug
+         * register raised a #DB of its own. */
+        if u64::from(vector) == VECTOR_DB {
+            let dr7 = self.save().dr7;
+            if dr7 & DR7_GD != 0 {
+                self.save_mut().dr7 = dr7 & !DR7_GD;
+            }
+        }
         let code = error.map_or(0, |e| event::ERROR_VALID | (u64::from(e) << event::ERROR_SHIFT));
         self.guest.vmcb_mut().control.event_inj = event::VALID | event::TYPE_EXCEPTION | code | u64::from(vector);
     }
@@ -857,12 +827,26 @@ impl Vcpu {
         c.int_ctl |= int_ctl::V_IRQ | int_ctl::V_IGN_TPR;
     }
 
+    /// Stop the guest at its next write of its task priority: an interrupt
+    /// is requested that the TPR alone holds (`class` its class), and under
+    /// V_INTR_MASKING a `mov` to CR8 is the guest's own, no exit -- the
+    /// lowering was seen at the guest's next exit of another kind, a host
+    /// tick on. KVM's way (`svm_update_cr8_intercept`): the CR8 write
+    /// intercept, taken off with the window (`clear_irq_window`). Not a
+    /// V_IRQ at that priority: whether it is taken at a V_TPR equal to it
+    /// differs between QEMU's TCG, which takes it, and AMD's text -- a storm
+    /// of VINTR exits on one, nothing on the other.
+    pub fn request_tpr_window(&mut self, _class: u8) {
+        self.guest.vmcb_mut().control.intercept_cr |= vmcb::intercept::cr::WRITE_CR8;
+    }
+
     /// Take the interrupt-window request back once it is no longer needed.
     pub fn clear_irq_window(&mut self) {
         use vmcb::{int_ctl, intercept};
         let c = &mut self.guest.vmcb_mut().control;
         c.intercept_misc1 &= !intercept::misc1::VINTR;
         c.int_ctl &= !int_ctl::V_IRQ;
+        c.intercept_cr &= !intercept::cr::WRITE_CR8;
     }
 
     /// Inject an invalid-opcode fault on the next entry: what a CPU raises for

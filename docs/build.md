@@ -24,8 +24,25 @@ kernel in it -- no path dependency outside `common/` -- and
 tree to naming something there (`scripts/check-links.py`): the site's links
 to the source on GitHub's master, which a move or a rename would leave a 404
 nobody is told of, and the relative links of `docs/`, `plans/` and the
-top's documents. `make smoke` builds in Docker and runs the
-headless boot smoke test (`scripts/smoke-test.sh`).
+top's documents. And it holds every function that crosses a language or a
+crate to one signature wherever it is spelled (`scripts/check-ffi.py`): its
+declaration in the `ffi` crate, its `#[no_mangle]` definition in Rust or its
+definition in C++, the C++ declarations of a Rust export and the fuzzers'
+stand-ins -- by width and sign for an integer, as a pointer for any pointer
+or reference, by its own parameters for a function pointer. No compiler
+compares those, and the ABI digest a module carries hashes the declarations
+alone: a definition that drifted built, linked and loaded. The same check
+holds the Makefile's reading of the `ffi` crate's extern blocks as text --
+which names the functions a module may import -- to a parse of every block:
+one the reading does not see (indented, another ABI, on one line) exports
+nothing, a comment in one that names a function exports a name with no
+declaration, and a `static` in one is never exported, each a failure; and
+the structs both halves lay out (a task or a module listed, the memory's
+counters, a PCI function, a terminal, a random draw, a module's header)
+field by field, by name and width, where a size assert passed two fields of
+one width swapped. `make smoke`
+builds in Docker and runs the headless boot smoke test
+(`scripts/smoke-test.sh`).
 
 ## Four things the Makefile will not tell you
 
@@ -93,7 +110,12 @@ with commits that never touched them, and on x86-64 hv.ko was refused by
 now also holds every module it makes to the kernel it makes
 (`out/$(ARCH)/modules.bound`, a prerequisite of `all` and `nocheck`): each
 function a `.ko` imports must be in the export table, or the build fails
-naming the module and the functions.
+naming the module and the functions; and none may define a function the
+`ffi` crate declares -- a module whose crates reach a layer, `events` or
+`random` links a copy of their exports of its own, binds its calls to it,
+and keeps state in a table the kernel never sees. The digest itself is held
+to being one: a source of it that is missing, or a digest that is not 64
+hex digits (no `sha256sum`), stops the Makefile before it builds.
 
 **The C++ is built at -O2** -- until 2026-10 it had no -O at all, so clang's
 -O0 (`CXX_OPT` in the `Makefile`). What a stack walk needs is kept whatever

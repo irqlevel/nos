@@ -76,9 +76,10 @@ const MAX_CAPS: usize = 48;
 enum Regs {
     Modern {
         common: MmioRegion,
-        /// VA of the notify window, and the multiplier a queue's notify
-        /// offset is scaled by
+        /// VA of the notify window, its length, and the multiplier a
+        /// queue's notify offset is scaled by
         notify_base: usize,
+        notify_len: usize,
         notify_multiplier: u32,
         isr: MmioRegion,
         device: Option<MmioRegion>,
@@ -119,7 +120,7 @@ impl PciTransport {
         let mut mappings: [Option<PhysMapping>; MAX_BARS] = [None, None, None, None, None, None];
 
         let mut common = None;
-        let mut notify: Option<(usize, u32)> = None;
+        let mut notify: Option<(usize, usize, u32)> = None;
         let mut isr = None;
         let mut device = None;
 
@@ -141,13 +142,22 @@ impl PciTransport {
             if cfg_type != CAP_PCI {
                 let base = map_bar(dev, bar, &mut bars, &mut mappings);
                 match base {
-                    Some(base) => {
+                    Some((base, size)) => {
+                        /* The window the device says the block is at, held to
+                         * the BAR it is in: past it, a register's access went
+                         * past the mapping -- the device's word for where its
+                         * registers are is not taken on trust */
+                        if at.checked_add(length).is_none_or(|end| end as u64 > size) {
+                            klog!(0, "virtio-pci: capability type {} at {:#x}, {:#x} bytes, runs past the {:#x} of BAR {} \
+                                       mapped", cfg_type, at, length, size, bar);
+                            return None;
+                        }
                         let region = MmioRegion::new((base + at as u64) as *mut u8, length.max(1));
                         match cfg_type {
                             CAP_COMMON => common = Some(region),
                             CAP_NOTIFY => {
                                 let multiplier = dev.read_config32(offset as u16 + 16);
-                                notify = Some(((base + at as u64) as usize, multiplier));
+                                notify = Some(((base + at as u64) as usize, length, multiplier));
                             }
                             CAP_ISR => isr = Some(region),
                             CAP_DEVICE => device = Some(region),
@@ -168,7 +178,7 @@ impl PciTransport {
             Some(common) => common,
             None => return None,
         };
-        let (notify_base, notify_multiplier) = match notify {
+        let (notify_base, notify_len, notify_multiplier) = match notify {
             Some(notify) => notify,
             None => {
                 klog!(0, "virtio-pci: a common config with no notify window");
@@ -193,7 +203,7 @@ impl PciTransport {
         }
 
         Some(Self {
-            regs: Regs::Modern { common, notify_base, notify_multiplier, isr, device },
+            regs: Regs::Modern { common, notify_base, notify_len, notify_multiplier, isr, device },
             msix,
             msix_active: AtomicBool::new(false),
             notify: [const { AtomicUsize::new(0) }; MAX_CACHED_QUEUES],
@@ -244,30 +254,38 @@ impl PciTransport {
         }
     }
 
-    /// Where a queue's doorbell is, from the offset the device reports.
+    /// Where a queue's doorbell is, from the offset the device reports: its
+    /// two bytes inside the notify window, or 0 for none. The device's
+    /// offset and multiplier, taken as they came, aimed the doorbell's write
+    /// anywhere in the kernel's memory.
     fn notify_addr(&self, index: u16) -> usize {
         match &self.regs {
-            Regs::Modern { common, notify_base, notify_multiplier, .. } => {
+            Regs::Modern { common, notify_base, notify_len, notify_multiplier, .. } => {
                 common.write16(CFG_QUEUE_SELECT, index);
                 let offset = common.read16(CFG_QUEUE_NOTIFY_OFF) as usize;
-                notify_base + offset * *notify_multiplier as usize
+                match offset.checked_mul(*notify_multiplier as usize) {
+                    Some(at) if at.checked_add(2).is_some_and(|end| end <= *notify_len) => notify_base + at,
+                    _ => 0,
+                }
             }
             Regs::Legacy { .. } => 0,
         }
     }
 }
 
-/// Map a BAR once, remembering where it went. Returns the kernel VA.
+/// Map a BAR once, remembering where it went: the kernel VA, and the bytes
+/// mapped there -- the BAR's size, in whole pages -- which a capability's
+/// window is held to.
 fn map_bar(
     dev: &PciDevice, bar: u8, bars: &mut [u64; MAX_BARS],
     mappings: &mut [Option<PhysMapping>; MAX_BARS],
-) -> Option<u64> {
+) -> Option<(u64, u64)> {
     let index = bar as usize;
     if index >= MAX_BARS {
         return None;
     }
     if bars[index] != 0 {
-        return Some(bars[index]);
+        return Some((bars[index], mappings[index].as_ref().map_or(0, |m| m.len() as u64)));
     }
 
     let low = dev.get_bar(bar);
@@ -277,7 +295,7 @@ fn map_bar(
     }
 
     let is64 = low & 0x6 == 0x4 && index + 1 < MAX_BARS;
-    let phys = if is64 { dev.get_bar64(bar) & !0xF } else { (low & !0xF) as u64 };
+    let phys = if is64 { dev.bar_address(bar) } else { (low & !0xF) as u64 };
     if phys == 0 {
         return None;
     }
@@ -311,9 +329,10 @@ fn map_bar(
 
     klog!(0, "virtio-pci: BAR {} at {:#x}, {} pages, mapped at {:#x}", bar, phys, pages, va);
 
+    let mapped = mapping.len() as u64;
     bars[index] = va;
     mappings[index] = Some(mapping);
-    Some(va)
+    Some((va, mapped))
 }
 
 impl Transport for PciTransport {
@@ -433,8 +452,12 @@ impl Transport for PciTransport {
                 dma_wmb();
                 common.write16(CFG_QUEUE_ENABLE, 1);
 
+                let doorbell = self.notify_addr(index);
+                if doorbell == 0 {
+                    klog!(0, "virtio-pci: queue {}'s doorbell is past the device's notify window: never rung", index);
+                }
                 if (index as usize) < MAX_CACHED_QUEUES {
-                    self.notify[index as usize].store(self.notify_addr(index), Ordering::Release);
+                    self.notify[index as usize].store(doorbell, Ordering::Release);
                 }
             }
             Regs::Legacy { .. } => {

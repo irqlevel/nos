@@ -96,6 +96,9 @@ pub enum Error {
     /// 2 MiB blocks free as the guest's memory: with a pool, a guest's
     /// memory is the pool's, or the guest does not start.
     NoHugePages,
+    /// The kernel's command line is longer than its header says it takes
+    /// (`cmdline_size`) or than a guest's page for it holds.
+    CommandLineTooLong,
 }
 
 impl core::fmt::Display for Error {
@@ -113,6 +116,7 @@ impl core::fmt::Display for Error {
             Error::BadAddress => "not a guest physical address that can be given memory",
             Error::NoUnrestrictedGuest => "VT-x without unrestricted guest cannot start a guest's other CPUs, which start in real mode",
             Error::NoHugePages => "not that many 2 MiB pages free in the huge pool",
+            Error::CommandLineTooLong => "the command line is longer than the kernel takes",
         })
     }
 }
@@ -137,6 +141,7 @@ impl Error {
             Error::BadAddress => 10,
             Error::NoUnrestrictedGuest => 11,
             Error::NoHugePages => 12,
+            Error::CommandLineTooLong => 13,
         }
     }
 
@@ -156,6 +161,7 @@ impl Error {
             10 => Error::BadAddress,
             11 => Error::NoUnrestrictedGuest,
             12 => Error::NoHugePages,
+            13 => Error::CommandLineTooLong,
             _ => Error::EnableFailed,
         }
     }

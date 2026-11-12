@@ -27,6 +27,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use hvarch::{Error, Result};
 use kcore::consts::PAGE_SIZE;
+use kcore::chunked::Chunked;
 use kcore::dma::DmaBuffer;
 
 use crate::memory::MAX_GPA;
@@ -94,8 +95,11 @@ impl Table {
 
 pub struct Npt {
     /// Every table, the top level first. An arena: a table is found by its
-    /// index here, never by the address in an entry.
-    tables: Vec<Table>,
+    /// index here, never by the address in an entry. Kept in page-sized
+    /// chunks: one `Vec`, doubled as it grew, was past the heap's largest
+    /// block at 16384 tables -- a guest of 4 KiB pages stopped short of 16
+    /// GiB, "out of memory" on a machine with it free.
+    tables: Chunked<Table>,
     /// Its identity for the TLB: no other table has it.
     id: u64,
 }
@@ -110,9 +114,8 @@ fn index(gpa: u64, level: usize) -> usize {
 
 impl Npt {
     pub fn new() -> Result<Self> {
-        let mut tables = Vec::new();
-        tables.try_reserve(1).map_err(|_| Error::NoMemory)?;
-        tables.push(Table::new(false)?);
+        let mut tables = Chunked::new();
+        tables.try_push(Table::new(false)?).map_err(|_| Error::NoMemory)?;
         Ok(Self { tables, id: NEXT_ID.fetch_add(1, Ordering::Relaxed) })
     }
 
@@ -148,9 +151,7 @@ impl Npt {
                 if phys & !ADDRESS != 0 {
                     return Err(Error::BadAddress);
                 }
-                self.tables.try_reserve(1).map_err(|_| Error::NoMemory)?;
-                let id = self.tables.len();
-                self.tables.push(child);
+                let id = self.tables.try_push(child).map_err(|_| Error::NoMemory)?;
                 /* The child is zeroed and in the arena before the entry that
                  * makes it reachable is written. */
                 if !self.tables[table].page.store::<u64>(i * ENTRY_BYTES, phys | TABLE) {

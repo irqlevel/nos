@@ -14,7 +14,7 @@ use crate::net::Nic;
 /// a receive pass (`layers/net/src/vnic.rs` keeps that many): what a module hands
 /// in past them is refused. One number, the kernel's and every module's, so
 /// that a module sharing it out among its own senders shares what there is.
-pub const BACKLOG: usize = 256;
+pub const BACKLOG: usize = ffi::net::VNIC_BACKLOG;
 
 /// What a module attaches to a virtual NIC. `on_frame` runs on the transmit
 /// path of the device -- whichever CPU sends, interrupts off -- so it copies
@@ -86,7 +86,9 @@ pub struct Attached {
 
 impl Drop for Attached {
     fn drop(&mut self) {
-        unsafe { net::kernel_vnic_detach(self.handle) };
+        /* This attachment's alone: `ctx` stays this hold's until the release
+         * below, so no sink attached since has it */
+        unsafe { net::kernel_vnic_detach(self.handle, self.ctx) };
         /* No call is running and none will start: the sink may go. */
         unsafe { (self.release)(self.ctx) };
     }

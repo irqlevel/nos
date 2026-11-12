@@ -84,7 +84,7 @@ use crate::memory::GuestMemory;
 use crate::mmio;
 use crate::place::Shape;
 use crate::smp::{Doorbells, Mailbox, MAX_VCPUS};
-use crate::svm::Exit;
+use crate::svm::{Exit, Instr};
 use crate::vm::{Cpu, Refusal};
 
 pub use crate::smp::Doorbell;
@@ -171,10 +171,10 @@ const RFLAGS_IF: u64 = 1 << 9;
 
 /// The longest a halted vCPU's task sleeps before it looks again, when no
 /// timer edge is due sooner: a guest whose PIT is stopped, or in a one-shot
-/// mode this does not raise IRQ0 in, still has its time budget checked. One
-/// host tick -- `task::sleep` wakes at one anyway (`kernel::sleep` blocks
-/// until the deadline, and is woken at its CPU's next scheduling point, the
-/// tick at the latest).
+/// mode this does not raise IRQ0 in, still has its time budget checked. The
+/// wait is the doorbell's `Event::wait_for`, whose deadline arms its CPU's
+/// own timer -- woken at it, not at a tick -- so this is a bound on a look,
+/// not the wait's resolution.
 const MAX_HALT_WAIT_NS: u64 = 10 * kcore::consts::NS_PER_MS;
 /// Halt polling, as KVM has it: a halted vCPU's task spins this long for a
 /// ring before it sleeps (`Doorbell::poll`) -- grown, doubling from the
@@ -348,12 +348,12 @@ impl FastMsr<'_> {
     /// The TSC deadline written, and the host's timer armed for the
     /// soonest of its edge and the CPU's other deadlines, as the round's
     /// look before an entry made without it arms it. An edge come already
-    /// refuses the entry after (`Kick::entering`), for the round to give
-    /// its interrupt.
+    /// -- the timer's, or a devices' deadline that has passed, which was
+    /// once dropped here as no deadline at all -- refuses the entry after
+    /// (`Kick::entering`), for the round to take.
     fn tsc_deadline(&mut self, value: u64) -> bool {
         self.lapic.set_tsc_deadline(value, tsc_ns(value));
-        let now = time::boot_time_ns();
-        *self.asked = sooner(self.lapic.next_timer_ns(), self.other_due.filter(|&due| due > now));
+        *self.asked = sooner(self.lapic.next_timer_ns(), self.other_due);
         self.kick.arm_at(*self.asked);
         true
     }
@@ -399,6 +399,13 @@ pub enum Stop {
     /// It touched a guest physical address with no memory behind it: either
     /// a bug, or an MMIO device this hypervisor does not emulate.
     Mmio { gpa: u64, rip: u64 },
+    /// The CPU, delivering an interrupt or an exception, touched a device's
+    /// page -- the guest's stack or IDT put on the APIC's or the IO-APIC's
+    /// -- which no instruction did, and so none to emulate.
+    MmioDelivering { gpa: u64, rip: u64 },
+    /// An INS or an OUTS, to `port`: string port I/O, which no device here
+    /// emulates.
+    StringIo { port: u16, input: bool, rip: u64 },
     /// It triple-faulted.
     Shutdown { rip: u64 },
     /// It asked the machine to reset: `value` written to `port`, the 8042's
@@ -426,7 +433,9 @@ pub enum Stop {
     /// A `mov` to or from DR0-DR3 that could not be performed for it
     /// (`dr`): the instruction at `rip`, as far as it was read, and why.
     DrInsn { rip: u64, error: dr::Error, bytes: mmio::Bytes },
-    /// An exception the host intercepts (#DB, #AC, #MC) fired.
+    /// An exception the host intercepts fired that no guest is given back:
+    /// a machine check, or a built-in guest's own exception -- a Linux
+    /// guest's #DB and #AC go back to it.
     Exception { vector: u8, rip: u64 },
     /// The CPU refused the VMCB, or the extension went off under it.
     Refused(Refusal),
@@ -605,11 +614,13 @@ pub struct Counts {
     /// does not take.
     pub xsetbv: u64,
     pub xsetbv_refused: u64,
+    /// Entries made, each ended by an exit -- or turned back on its way in
+    /// by a kick (`Exit::Kicked`), which is counted here too: what `hv
+    /// list` calls exits is entries attempted.
     pub exits: u64,
 }
 
 impl Counts {
-    /// Another CPU's counts into these: a guest's, from its CPUs'.
     /// The timer's interrupts requested more than `LATE_NS` past their
     /// edges, however they were waited for.
     pub fn late(&self) -> u64 {
@@ -617,6 +628,7 @@ impl Counts {
             + self.late_host + self.late_exit + self.late_other
     }
 
+    /// Another CPU's counts into these: a guest's, from its CPUs'.
     pub fn add(&mut self, o: &Counts) {
         self.port_in += o.port_in;
         self.port_out += o.port_out;
@@ -824,6 +836,10 @@ pub struct GuestCpu {
     other_due: Option<u64>,
     /// What the host's timer was last asked for (`Kick::arm_at`).
     asked: Option<u64>,
+    /// Its local APIC as it last published it (`publish`): its addressing,
+    /// and whether it was software-enabled -- what decides whether a message
+    /// it was sent, or one that reached nobody, would be taken now.
+    published: (u64, bool),
     counts: Counts,
 }
 
@@ -1024,9 +1040,11 @@ impl LinuxGuest {
     /// the CPUs' -- a guest of more than one CPU only, since it delivers to
     /// local APICs -- and its APICs come out of reset in xAPIC mode, as a
     /// PC's firmware leaves them: x2APIC mode with an IO-APIC and no
-    /// interrupt remapping is not one the architecture has, and Linux,
-    /// finding its firmware left one so, turns it off -- through a page it
-    /// has not mapped, 6.1 and 6.18 alike, and faults.
+    /// interrupt remapping is not one the architecture has, and a Linux
+    /// built without KVM_GUEST, finding its firmware left one so, turns it
+    /// off -- through a page it has not mapped, 6.1 and 6.18 alike, and
+    /// faults. One built with it keeps it here, the CPUID's hypervisor range
+    /// being KVM's (`policy`), but xAPIC mode is the one every kernel takes.
     ///
     /// Its RAM is laid out as `linux::Ram` says, and is the huge pool's
     /// when `huge` -- every byte of it, 2 MiB a block, or `NoHugePages` --
@@ -1066,6 +1084,7 @@ impl LinuxGuest {
             let activity = if i == 0 { Activity::Running } else { Activity::WaitForSipi };
             let lapic = Lapic::new(i, i == 0, x2apic);
             let addressing = lapic.addressing().pack();
+            let published = (addressing, lapic.software_enabled());
             vcpus.push(GuestCpu {
                 index: i,
                 cpu,
@@ -1081,6 +1100,7 @@ impl LinuxGuest {
                 step: Step::Other,
                 other_due: None,
                 asked: None,
+                published,
                 counts: Counts::default(),
             });
             shared.push(CpuShared {
@@ -1616,10 +1636,15 @@ impl LinuxGuest {
                 && gc.activity == Activity::Running && !shared.mail.has_mail()
                 && shared.posted.as_ref().is_none_or(|p| !p.outstanding())
                 && gc.exception.is_none() && !gc.nmi_pending
-                && gc.lapic.next_timer_ns().is_none_or(|edge| edge > now);
+                && gc.lapic.next_timer_ns().is_none_or(|edge| edge > now)
+                /* A devices' deadline that has come -- the PIT's edge, a
+                 * NIC's held interrupts -- is a reason for the round, not no
+                 * deadline: dropped, its host timer had fired already, and
+                 * nothing rang for it until the next exit. */
+                && gc.other_due.is_none_or(|due| due > now);
             if fast {
                 let edge = gc.lapic.next_timer_ns();
-                gc.asked = sooner(edge, gc.other_due.filter(|&due| due > now));
+                gc.asked = sooner(edge, gc.other_due);
                 kick.arm_at(gc.asked);
                 fast = edge.is_none_or(|edge| edge > time::boot_time_ns());
             }
@@ -1686,6 +1711,7 @@ impl LinuxGuest {
              * The 8259 then has an interrupt for a CPU that takes them; and
              * an IO-APIC, what its pins send, delivered from here. */
             let mut extint = false;
+            let mut ring_takers = false;
             let mut pit_edge = None;
             let mut devices_due = None;
             if me == 0 {
@@ -1734,7 +1760,14 @@ impl LinuxGuest {
                 }).min();
                 pins |= sync_ioapic(&mut p, now);
                 self.ioapic_send(&mut p, pins, me as u32, &mut gc.lapic, &mut gc.counts);
-                extint = gc.lapic.accepts_extint() && p.pic.pending().is_some();
+                let pic_pending = p.pic.pending().is_some();
+                extint = gc.lapic.accepts_extint() && pic_pending;
+                /* The 8259's interrupt, when this CPU is not the one whose
+                 * LINT0 takes it: the CPUs that are rung for it -- the
+                 * round's own raise (the PIT's tick, a device's line) once
+                 * rang nobody, and a crash kernel on the second CPU took its
+                 * timer a halt's wait late. */
+                ring_takers = pic_pending && !gc.lapic.accepts_extint();
                 /* Not while IRQ0 is still requested or in service -- masked,
                  * say: none is handed over until the guest takes that one,
                  * and an owed edge, already due, would have the vCPU wake
@@ -1742,6 +1775,10 @@ impl LinuxGuest {
                 pit_edge = if timer_busy(&p, &gc.lapic) { None } else { p.pit.next_ch0_edge_ns() };
             } else if gc.lapic.accepts_extint() {
                 extint = self.platform.lock().pic.pending().is_some();
+            }
+            /* Off the platform's lock */
+            if ring_takers {
+                self.ring_extint(me);
             }
 
             match gc.activity {
@@ -1758,7 +1795,17 @@ impl LinuxGuest {
                             break;
                         }
                         Sleep::Wait => {
-                            bell.wait(ASLEEP_WAIT_NS.min(deadline.saturating_sub(now)).max(1));
+                            /* The first CPU's task does the devices' work
+                             * whatever its CPU does: asleep, it wakes for
+                             * their next edge too, as a halted one does --
+                             * a crash kernel's dump through a NIC held a
+                             * second a frame once, the boot CPU parked with
+                             * interrupts off in its NMI handler. */
+                            let until = pit_edge.unwrap_or(u64::MAX)
+                                .min(devices_due.unwrap_or(u64::MAX))
+                                .min(now.saturating_add(ASLEEP_WAIT_NS))
+                                .min(deadline);
+                            bell.wait(until.saturating_sub(now).max(1));
                             gc.step = Step::Spun;
                             continue;
                         }
@@ -1959,7 +2006,8 @@ impl LinuxGuest {
                     let sub = v.regs().rcx as u32;
                     let leaf = v.save().rax as u32;
                     let asker = crate::policy::Asker {
-                        apic_id: gc.lapic.id(), apic, cr4: v.cr4(), xcr0: v.xcr0(), shape: self.shape,
+                        apic_id: gc.lapic.id(), apic, apic_on: gc.lapic.enabled(), cr4: v.cr4(), xcr0: v.xcr0(),
+                        shape: self.shape,
                     };
                     let answer = crate::policy::cpuid(leaf, sub, &asker);
                     let (save, regs) = v.save_and_regs_mut();
@@ -2019,7 +2067,20 @@ impl LinuxGuest {
                     let data = error & (npf::PRESENT | npf::FETCH) == 0 && error & npf::FINAL != 0;
                     let plain_read = data && error & npf::WRITE == 0;
                     let apic_page = gpa & !(lapic::XAPIC_PAGE_SIZE - 1) == lapic::DEFAULT_BASE;
-                    if data && apic_page && self.has_apic() && gc.lapic.xapic() {
+                    /* An access the CPU made itself, delivering an event --
+                     * the pushes of an interrupt or exception onto a stack
+                     * the guest put on a device's page -- is no instruction
+                     * at RIP, which emulating would decode and perform in its
+                     * place. Stopped, said for what it is, as KVM gives up on
+                     * such a VM: the event was given back (`requeue_event`)
+                     * and is queued still. */
+                    let delivering = gc.cpu.backend().event_queued();
+                    if data && delivering && ((apic_page && self.has_apic() && gc.lapic.xapic())
+                        || (IoApic::owns(gpa) && self.has_ioapic()))
+                    {
+                        gc.counts.mmio += 1;
+                        Some(Stop::MmioDelivering { gpa, rip })
+                    } else if data && apic_page && self.has_apic() && gc.lapic.xapic() {
                         self.xapic_access(gc, gpa, error & npf::WRITE != 0)
                     } else if data && IoApic::owns(gpa) && self.has_ioapic() {
                         self.ioapic_access(gc, gpa, error & npf::WRITE != 0)
@@ -2045,7 +2106,7 @@ impl LinuxGuest {
                 /* `int1` -- AMD-V's intercept of it, or VT-x's of the #DB
                  * it raises, which exits at the instruction: stepped past,
                  * and its #DB given as the trap it is, after it. */
-                Exit::Other(vmcb::exit::ICEBP) => {
+                Exit::Instr(Instr::Icebp) => {
                     gc.counts.reflected += 1;
                     gc.cpu.backend_mut().skip_icebp();
                     gc.exception = Some((VECTOR_DB, None));
@@ -2058,7 +2119,7 @@ impl LinuxGuest {
                 }
                 /* RDPMC, of counters CPUID does not say are there: the #GP
                  * a CPU gives for a counter it has not got. */
-                Exit::Other(vmcb::exit::RDPMC) => {
+                Exit::Instr(Instr::Rdpmc) => {
                     gc.counts.ud += 1;
                     gc.cpu.backend_mut().inject_gp();
                     None
@@ -2068,29 +2129,30 @@ impl LinuxGuest {
                 /* The guest can take an interrupt, or an NMI, now; the next
                  * entry injects it. Nothing to do here. */
                 Exit::IrqWindow | Exit::NmiWindow => None,
-                Exit::Other(vmcb::exit::XSETBV) => {
+                Exit::Instr(Instr::Xsetbv) => {
                     gc.counts.xsetbv += 1;
                     if cr::xsetbv(gc.cpu.backend_mut()) != cr::Xcr::Written {
                         gc.counts.xsetbv_refused += 1;
                     }
                     None
                 }
-                Exit::Other(code) if matches!(code,
-                    vmcb::exit::MONITOR | vmcb::exit::MWAIT | vmcb::exit::MWAIT_ARMED
-                    | vmcb::exit::RDTSCP | vmcb::exit::RDPRU) =>
-                {
-                    /* Intercepted, and not offered by CPUID: the guest gets
-                     * what a CPU without them gives it. */
+                Exit::Instr(Instr::Monitor | Instr::Mwait | Instr::Rdtscp | Instr::Rdpru | Instr::Rsm) => {
+                    /* Intercepted, and not offered by CPUID -- or, for RSM,
+                     * outside SMM, where every guest is: the guest gets what
+                     * a CPU without them gives it, at any CPL. */
                     gc.counts.ud += 1;
                     gc.cpu.backend_mut().inject_ud();
                     None
                 }
-                Exit::Other(vmcb::exit::WBINVD) => {
+                /* WBINVD, and INVD -- which would throw away the host's
+                 * dirty lines with the guest's: stepped past, KVM's answer
+                 * to both. Counted together. */
+                Exit::Instr(Instr::Wbinvd | Instr::Invd) => {
                     gc.counts.wbinvd += 1;
                     gc.cpu.backend_mut().skip_wbinvd();
                     None
                 }
-                Exit::Cr8 { write, gpr } => {
+                Exit::Cr8 { write, gpr: Some(gpr) } => {
                     gc.counts.cr8 += 1;
                     let v = gc.cpu.backend_mut();
                     v.cr8_access(write, gpr);
@@ -2098,6 +2160,20 @@ impl LinuxGuest {
                      * one of the TPR too. */
                     gc.lapic.sync_cr8(v.cr8());
                     None
+                }
+                /* AMD-V's write, stopped at while an interrupt the task
+                 * priority alone held waited: decoded and performed, and
+                 * the round looks again at what it lets in. */
+                Exit::Cr8 { write: true, gpr: None } => {
+                    gc.counts.cr8 += 1;
+                    let mut bytes = mmio::Bytes::default();
+                    match cr::cr8_write(gc.cpu.backend_mut(), &self.memory, &mut bytes) {
+                        Ok(()) => {
+                            gc.lapic.sync_cr8(gc.cpu.backend().cr8());
+                            None
+                        }
+                        Err(error) => Some(Stop::CrInsn { rip, error, bytes }),
+                    }
                 }
                 Exit::Cr0Write { value } => {
                     gc.counts.cr0 += 1;
@@ -2300,8 +2376,15 @@ impl LinuxGuest {
             gc.pv_eoi_armed = false;
             self.publish(gc);
             gc.cpu.backend_mut().init_reset();
-            /* What the CPU had to deliver goes with the reset. */
+            /* What the CPU had to deliver goes with the reset -- an NMI
+             * latched before it too, which INIT discards as KVM's reset
+             * does: kept, the reset's clearing of the NMI mask let it in at
+             * the CPU's first instruction after its start-up IPI, through a
+             * real-mode vector table that is whatever low memory holds. */
             gc.exception = None;
+            gc.nmi_pending = false;
+            gc.last_from_pic = false;
+            gc.fast = false;
             self.set_activity(gc, Activity::WaitForSipi);
         }
         if let Some(vector) = mail.sipi {
@@ -2330,7 +2413,28 @@ impl LinuxGuest {
         let taken: u32 = mail.fixed.iter().map(|w| w.count_ones()).sum();
         if taken != 0 {
             gc.counts.ipi_taken += u64::from(taken);
-            gc.lapic.accept_all(&mail.fixed, &mail.level);
+            let refused = gc.lapic.accept_all(&mail.fixed, &mail.level);
+            if refused != [0; 4] {
+                self.levels_refused(&refused);
+            }
+        }
+    }
+
+    /// Level-triggered interrupts the IO-APIC posted to this CPU, `vectors`
+    /// a bit each, that its APIC refused -- software-disabled, say, or reset
+    /// by an INIT taken with them: the IO-APIC told, which waits for no EOI
+    /// of them and sends them again once a CPU's APIC changes so that one
+    /// may be taken (`publish`). Told nothing, the pins were dead for good.
+    fn levels_refused(&self, vectors: &[u64; 4]) {
+        let mut p = self.platform.lock();
+        let Some(io) = p.ioapic.as_mut() else { return };
+        for (w, &bits) in vectors.iter().enumerate() {
+            let mut left = bits;
+            while left != 0 {
+                let bit = left.trailing_zeros();
+                left &= left - 1;
+                io.refused((w as u32 * u64::BITS + bit) as u8);
+            }
         }
     }
 
@@ -2395,7 +2499,15 @@ impl LinuxGuest {
         gc.lapic.sync_cr8(cr8);
         let apic = if apicv { None } else { gc.lapic.pending() };
         if !extint && apic.is_none() {
-            gc.cpu.backend_mut().clear_irq_window();
+            let v = gc.cpu.backend_mut();
+            v.clear_irq_window();
+            /* One held by the task priority alone goes in when the guest
+             * lowers it -- which a `mov` to CR8 under AMD-V's V_TPR or
+             * VT-x's TPR shadow does without an exit: stopped there, rather
+             * than at its next exit of another kind, a host tick on. */
+            if let Some(class) = (!apicv).then(|| gc.lapic.held_by_tpr()).flatten() {
+                v.request_tpr_window(class);
+            }
             return;
         }
         let v = gc.cpu.backend_mut();
@@ -2494,12 +2606,13 @@ impl LinuxGuest {
         own
     }
 
-    /// Ring the CPUs that take the 8259's interrupts, after a port access of
-    /// another CPU's left one pending there: the first CPU, whose loop does
-    /// the devices' work, and any other whose APIC takes them.
-    fn ring_extint(&self) {
+    /// Ring the CPUs that take the 8259's interrupts, after an access or a
+    /// round of CPU `me`'s left one pending there: the first CPU, whose loop
+    /// does the devices' work, and any other whose APIC takes them -- `me`
+    /// not, which looks at it again itself.
+    fn ring_extint(&self, me: usize) {
         for (i, c) in self.cpus.iter().enumerate() {
-            if i == 0 || c.extint.load(Ordering::Relaxed) {
+            if i != me && (i == 0 || c.extint.load(Ordering::Relaxed)) {
                 if let Some(d) = self.doorbells.get(i) {
                     d.ring();
                 }
@@ -2665,12 +2778,17 @@ impl LinuxGuest {
     /// interrupt the local APIC takes as level-triggered, its EOI coming
     /// back to the IO-APIC. An NMI goes into the mailbox of each CPU named,
     /// the sender's own included, for its loop to take -- rung, so that one
-    /// already on its way into its guest turns back for it. An INIT from a
-    /// device is none a PC's firmware wires, and is dropped.
-    fn post_message(&self, mut by: Option<(u32, &mut Lapic)>, ipi: &Ipi, level: bool) {
+    /// already on its way into its guest turns back for it. Whether a local
+    /// APIC took it: the sender's own says so as it takes it, and one posted
+    /// to another CPU counts as taken -- the sender cannot ask, and that
+    /// CPU tells the IO-APIC of a level it refuses (`levels_refused`) --
+    /// while one that reaches no CPU is taken by none. A device has no other
+    /// delivery mode here (`lapic::msi`, the IO-APIC's `send`).
+    fn post_message(&self, mut by: Option<(u32, &mut Lapic)>, ipi: &Ipi, level: bool) -> bool {
         /* From outside every CPU -- a disk's task (`serve_disk`) -- no CPU
          * is the sender's own: each one named takes it through its mailbox */
         let me = by.as_ref().map_or(u32::MAX, |(m, _)| *m);
+        let mut taken = false;
         for (i, target) in self.cpus.iter().enumerate() {
             let id = i as u32;
             let addressing = match by.as_ref() {
@@ -2683,27 +2801,26 @@ impl LinuxGuest {
             let own = by.as_mut().filter(|(m, _)| *m == id).map(|(_, lapic)| lapic);
             let posted = match (ipi.delivery, own) {
                 (Delivery::Fixed | Delivery::LowestPriority, Some(lapic)) => {
-                    if level {
-                        lapic.accept_level(ipi.vector);
-                    } else {
-                        lapic.accept(ipi.vector);
-                    }
+                    taken |= if level { lapic.accept_level(ipi.vector) } else { lapic.accept(ipi.vector) };
                     false
                 }
                 (Delivery::Fixed | Delivery::LowestPriority, None) if !level => {
                     /* Posted or mailed, and its CPU notified or rung. */
                     self.post_edge(i, target, ipi.vector);
+                    taken = true;
                     false
                 }
                 (Delivery::Fixed | Delivery::LowestPriority, None) => {
                     target.mail.post_level(ipi.vector);
+                    taken = true;
                     true
                 }
                 (Delivery::Nmi, _) => {
                     target.mail.post_nmi();
+                    taken = true;
                     true
                 }
-                _ => return,
+                _ => return taken,
             };
             if posted {
                 if let Some(d) = self.doorbells.get(i) {
@@ -2711,23 +2828,37 @@ impl LinuxGuest {
                 }
             }
             if ipi.delivery == Delivery::LowestPriority {
-                return;
+                return taken;
             }
         }
+        taken
     }
 
     /// The interrupts the IO-APIC has to send for `pins`, delivered as its
-    /// messages say, by CPU `me`, whose local APIC is `lapic`.
+    /// messages say, by CPU `me`, whose local APIC is `lapic` -- the IO-APIC
+    /// told of each whether a local APIC took it, which is what its remote
+    /// IRR waits on (`IoApic::send`).
     fn ioapic_send(&self, p: &mut Platform, pins: Pins, me: u32, lapic: &mut Lapic, counts: &mut Counts) {
         let Some(io) = p.ioapic.as_mut() else { return };
         let mut left = pins;
         while left != 0 {
             let pin = left.trailing_zeros() as usize;
             left &= left - 1;
-            if let Some(m) = io.send(pin) {
+            io.send(pin, &mut |m| {
                 counts.ioapic += 1;
-                self.post_message(Some((me, &mut *lapic)), &m.ipi, m.level);
-            }
+                self.post_message(Some((me, &mut *lapic)), &m.ipi, m.level)
+            });
+        }
+    }
+
+    /// The IO-APIC's level-triggered interrupts no local APIC took, sent
+    /// again by CPU `gc`, whose APIC has just changed so that it may take
+    /// one (`publish`): the chip tries such a message again on its own.
+    fn send_untaken(&self, gc: &mut GuestCpu) {
+        let mut p = self.platform.lock();
+        let Some(pins) = p.ioapic.as_ref().map(|io| io.untaken()) else { return };
+        if pins != 0 {
+            self.ioapic_send(&mut p, pins, gc.index, &mut gc.lapic, &mut gc.counts);
         }
     }
 
@@ -2780,10 +2911,13 @@ impl LinuxGuest {
         let me = gc.index;
         let v = gc.cpu.backend_mut();
         if io.string {
-            /* No string I/O device is emulated; step past it. INS/OUTS to
-             * the console is not how a kernel drives a UART. */
-            v.skip_io(io);
-            return None;
+            /* No string I/O is emulated: it was stepped past with nothing
+             * done -- RCX not counted down, RSI and RDI where they were,
+             * an INS's buffer not filled -- a guest left to read bytes it
+             * never got as if it had. Stopped instead, naming the port:
+             * no kernel this is for drives a device by INS or OUTS (Linux's
+             * 8250 and virtio drivers do not), and one that does is told. */
+            return Some(Stop::StringIo { port: io.port, input: io.input, rip: v.save().rip });
         }
         if !io.input && io.size == 1 {
             let value = v.save().rax as u8;
@@ -2940,14 +3074,16 @@ impl LinuxGuest {
          * the SCI's, a device's line -- sent from here. */
         let pins = sync_ioapic(&mut p, time::boot_time_ns());
         self.ioapic_send(&mut p, pins, me, &mut gc.lapic, &mut gc.counts);
-        /* An interrupt left pending on the 8259 by another CPU's access --
-         * a device's, the serial port's -- is the first CPU's to take, and
-         * it may be asleep or in its guest: ring it. */
-        let ring = me != 0 && (p.pic.pending().is_some() || p.uart.irq_line());
+        /* An interrupt left pending on the 8259 by an access -- a
+         * device's, the serial port's -- is for the CPUs whose LINT0 takes
+         * it, which may be asleep or in their guests: rung, from another
+         * CPU's access, or from the first CPU's when it is not the taker. */
+        let pending = p.pic.pending().is_some() || p.uart.irq_line();
+        let ring = pending && (me != 0 || !gc.lapic.accepts_extint());
         drop(p);
         v.skip_io(io);
         if ring {
-            self.ring_extint();
+            self.ring_extint(me as usize);
         } else if first {
             if let Some(d) = self.doorbells.get(0) {
                 d.ring();
@@ -2958,10 +3094,18 @@ impl LinuxGuest {
 
     /// `gc`'s local APIC's addressing, where the other CPUs match their
     /// messages against it: after anything that may change it -- its mode,
-    /// its xAPIC logical ID and model, an INIT.
-    fn publish(&self, gc: &GuestCpu) {
+    /// its xAPIC logical ID and model, an INIT. And when that, or whether it
+    /// is software-enabled, did change, the IO-APIC's level-triggered
+    /// interrupts that no APIC took are sent again: one sent to nobody, or
+    /// to an APIC still off, may be this one's to take now.
+    fn publish(&self, gc: &mut GuestCpu) {
+        let addressing = gc.lapic.addressing().pack();
         if let Some(s) = self.cpus.get(gc.index as usize) {
-            s.addressing.store(gc.lapic.addressing().pack(), Ordering::Relaxed);
+            s.addressing.store(addressing, Ordering::Relaxed);
+        }
+        let now = (addressing, gc.lapic.software_enabled());
+        if core::mem::replace(&mut gc.published, now) != now {
+            self.send_untaken(gc);
         }
     }
 

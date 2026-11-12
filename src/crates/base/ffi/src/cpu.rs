@@ -2,18 +2,23 @@ unsafe extern "C" {
     pub safe fn kernel_get_cpu_id() -> u32;
     pub safe fn kernel_cpu_count() -> u32;
     pub safe fn kernel_cpu_online_mask() -> usize;
+    /// `handler(ctx)` on `cpu`, waited for: 1 when it ran there, 0 when it
+    /// did not -- `cpu` out of range, not running, or closed to IPI work
+    /// before it came. Task context: it waits.
     pub fn kernel_cpu_run_on(
         cpu: u32,
         handler: extern "C" fn(*mut u8),
         ctx: *mut u8,
-    );
+    ) -> i32;
     /// An interrupt to `cpu`, now, waiting for nothing: from any context,
     /// interrupts off included. What makes a vCPU running a guest there
-    /// leave it; any other CPU takes an interrupt with nothing to do.
+    /// leave it; any other CPU takes an interrupt with nothing to do, and a
+    /// CPU not running, or not there, none.
     pub safe fn kernel_cpu_kick(cpu: u32);
     /// The posted-interrupt notification to `cpu`, from any context: a vCPU
     /// in its guest there takes what was posted for it without an exit;
-    /// out of one it is an interrupt with nothing to do.
+    /// out of one it is an interrupt with nothing to do. Sent to the CPUs
+    /// the kick is.
     pub safe fn kernel_cpu_notify(cpu: u32);
     /// The vector `kernel_cpu_notify` sends.
     pub safe fn kernel_posted_interrupt_vector() -> u8;

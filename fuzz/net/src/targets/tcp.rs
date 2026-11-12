@@ -59,6 +59,10 @@ const STRANGER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0xC8];
 const STRANGER_PORT_BASE: u16 = 50000;
 /// A port nobody listens on
 const CLOSED_PORT: u16 = 9;
+/// The churn's listener (`State::churn`), and the stranger's ports for it:
+/// past the flood's and the stranger's own.
+const CHURN_PORT: u16 = 7005;
+const CHURN_PORT_BASE: u16 = 53000;
 const PEER_PORT_BASE: u16 = 8000;
 const PEER_SRC_BASE: u16 = 30000;
 
@@ -209,6 +213,10 @@ struct State {
     lossy: bool,
     /// eth1, when the input registered it.
     guest: Option<net::Nic>,
+    /// The stranger's next port for a churn (`churn`): each connection of
+    /// every churn its own, since a SYN for the four addresses of one still
+    /// in TIME-WAIT is that one's, as it should be.
+    churn_port: u16,
 }
 
 /// The floor a program asks for its connection's timeout, if it asks:
@@ -222,12 +230,14 @@ fn floor(r: &mut Input) -> Option<u64> {
     }
 }
 
+/// A connection's word, as the module ABI hands it out (`Tcp::word_of`):
+/// its slot and the generation the slot holds now.
 fn conn_word(c: &'static Conn) -> usize {
-    c as *const Conn as usize
+    TCP.word_of(c)
 }
 
 fn conn_of(word: usize) -> &'static Conn {
-    TCP.by_handle(word).expect("a connection the pool gave out")
+    TCP.by_word(word).expect("a connection the pool gave out, still the one its word was made for")
 }
 
 /// Whether the allowlist `allow` admits `ip`, as the model reads one -- None
@@ -715,6 +725,90 @@ impl State {
         }
     }
 
+    /// More connections than the machine has slots, one after another, from
+    /// the stranger to a listener of the churn's own: each accepted by the
+    /// machine's program and closed by it first, so that each waits out its
+    /// close in TIME-WAIT, and each answered with a SYN-ACK though every slot
+    /// is taken -- a slot taken back from one let go of (`Tcp::reclaim`).
+    /// Before, a client that did this through `hv forward`, whose relay
+    /// closes first, held every slot the machine had a minute at a time,
+    /// and the machine turned everyone away. A SYN the machine drops while
+    /// it frees a bulk buffer for it is sent again after a sweep.
+    fn churn(&mut self) {
+        if crate::machine::nic::wire().stalled[0] {
+            return;
+        }
+        let n = net::tcp::MAX_CONNECTIONS as u16 + 8;
+        let Some(next) = self.churn_port.checked_add(n) else { return };
+        let Some(l) = TCP.listen(&self.nic, CHURN_PORT) else { return };
+        let base = core::mem::replace(&mut self.churn_port, next);
+        let before = TCP.stats().reclaimed;
+        /* The slots taken back may be of connections the input's programs
+         * let go of, closing still: theirs may end in a reset now. */
+        for link in self.links.iter_mut() {
+            link.fragile = true;
+        }
+        /* The machine's segment to the stranger's `sport` with `flags`
+         * among its own, from `mark` on in what it sent */
+        fn find(sent: &[Vec<u8>], sport: u16, flags: u8) -> Option<(u32, u32)> {
+            sent.iter().filter_map(|f| crate::world::check::ipv4_parts(f)).find_map(|p| {
+                (p.proto == IP_PROTO_TCP && p.dst == STRANGER_IP && p.l4.len() >= seg::HDR_LEN
+                    && seg::dst_port(p.l4) == sport && seg::flags(p.l4) & flags == flags)
+                    .then(|| (seg::seq(p.l4), seg::ack(p.l4)))
+            })
+        }
+        /* Into the NIC past the link, as the flood's: what is tested is the
+         * pool, not the link's losses */
+        let send = |w: &mut World<Wire>, sport: u16, seq: u32, ack: u32, flags: u8| {
+            let s = frames::tcp(STRANGER_IP, ETH0_IP, sport, CHURN_PORT, seq, ack, flags, 65535, &frames::mss(1460),
+                                &[], Sum::Right);
+            let f = frames::ipv4(ETH0_MAC, STRANGER_MAC, &Ip::new(STRANGER_IP, ETH0_IP, IP_PROTO_TCP), &s);
+            crate::machine::nic::wire().inbound[0].push_back(f);
+            sched::softirq_raise(kcore::softirq::TYPE_NET_RX);
+            w.pump();
+        };
+        for i in 0..n {
+            let sport = base + i;
+            let iss = 0x4000_0000u32.wrapping_add(u32::from(i) << 16);
+            let mut mark = self.w.net.sent.len();
+            send(&mut self.w, sport, iss, 0, seg::SYN);
+            let mut synack = find(&self.w.net.sent[mark..], sport, seg::SYN | seg::ACK_FLAG);
+            if synack.is_none() {
+                /* Dropped this once while a bulk buffer goes back: a sweep,
+                 * and the SYN again, as a peer sends it again */
+                self.w.run_for((net::tcp::SWEEP_MS + 50) * MS);
+                mark = self.w.net.sent.len();
+                send(&mut self.w, sport, iss, 0, seg::SYN);
+                synack = find(&self.w.net.sent[mark..], sport, seg::SYN | seg::ACK_FLAG);
+            }
+            let held: Vec<(u16, net::tcp::State)> = (0..net::tcp::MAX_CONNECTIONS)
+                .filter_map(|k| TCP.snapshot(k).map(|c| (c.local_port, c.state))).collect();
+            invariant!(synack.is_some(), "the churn's connection {} of {} got no SYN-ACK, {} slots in use and {} \
+                       taken back: one closed first and waiting out its close held a slot a new connection was \
+                       refused -- {:?}", i + 1, n, held.len(), TCP.stats().reclaimed - before, held);
+            let Some((m_iss, _)) = synack else { return };
+            send(&mut self.w, sport, iss.wrapping_add(1), m_iss.wrapping_add(1), seg::ACK_FLAG);
+            let Some(c) = TCP.accept(l, 1) else {
+                invariant!(false, "the churn's connection {} was not accepted after its handshake", i + 1);
+                return;
+            };
+            mark = self.w.net.sent.len();
+            TCP.close(c);
+            self.w.pump();
+            let Some((fin_seq, _)) = find(&self.w.net.sent[mark..], sport, seg::FIN) else {
+                invariant!(false, "the churn's connection {} was closed by its program and sent no FIN", i + 1);
+                return;
+            };
+            /* Its FIN acknowledged and the stranger's own: TIME-WAIT */
+            send(&mut self.w, sport, iss.wrapping_add(1), fin_seq.wrapping_add(1), seg::FIN | seg::ACK_FLAG);
+        }
+        TCP.close(l);
+        self.w.pump();
+        if TCP.stats().reclaimed > before {
+            crate::common::runner::reached("tcp: a slot taken back from one closing, every one taken");
+        }
+    }
+
     /// The allowlisted listener's list changed: another of the input's, or
     /// anyone. What the listener holds already stays.
     fn set_allow(&mut self, r: &mut Input) {
@@ -926,7 +1020,8 @@ pub fn tcp(r: &mut Input) {
         None
     };
     let mut st = State { w, links: Vec::new(), listeners, accepts: Vec::new(), next_peer_port: PEER_PORT_BASE,
-                         next_src_port: PEER_SRC_BASE, nic, peer_ip, accepted: BTreeMap::new(), lossy, guest };
+                         next_src_port: PEER_SRC_BASE, nic, peer_ip, accepted: BTreeMap::new(), lossy, guest,
+                         churn_port: CHURN_PORT_BASE };
 
     while let Some(op) = r.op(25) {
         let k = if st.links.is_empty() { 0 } else { r.below(st.links.len() as u64) as usize };
@@ -1024,6 +1119,7 @@ pub fn tcp(r: &mut Input) {
             17 => st.guest_syn(r),
             18 => st.stranger(r),
             19 if r.u8() < 24 => st.flood(r),
+            23 if r.u8() < 16 => st.churn(),
             20 => st.set_allow(r),
             22 if some => st.wake(r, k),
             21 => {

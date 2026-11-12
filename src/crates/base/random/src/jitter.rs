@@ -59,10 +59,11 @@ fn collect(buf: &mut [u8]) -> bool {
         match walk.byte() {
             Some(value) => *byte = value,
             None => {
-                /* Every measurement took exactly as long as the one before
-                 * it: the counter is too coarse to see this much work, or it
-                 * is not running. Biased bytes would be worse than none. */
-                klog!(0, "Jitter: no variance in {} cycle-counter measurements", 2 * MAX_PAIRS_PER_BYTE);
+                /* Too few measurements took other than as long as the one
+                 * before them: the counter is too coarse to see this much
+                 * work, or it is not running. Biased bytes would be worse
+                 * than none. */
+                klog!(0, "Jitter: too little variance in {} cycle-counter measurements", 2 * MAX_PAIRS_PER_BYTE);
                 return false;
             }
         }

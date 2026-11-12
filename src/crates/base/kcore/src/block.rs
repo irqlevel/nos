@@ -9,16 +9,10 @@ pub use crate::lent::{Lent, Started};
 
 pub use ffi::block::BlockIo;
 
-/// What a BlockIo asks for
-pub const IO_READ: u8 = 0;
-pub const IO_WRITE: u8 = 1;
-pub const IO_FLUSH: u8 = 2;
-
-/// What a driver's submit answers
-pub const SUBMIT_OK: i32 = 0;
-pub const SUBMIT_BUSY: i32 = 1;
-pub const SUBMIT_INVALID: i32 = 2;
-pub const SUBMIT_UNSUPPORTED: i32 = 3;
+/// What a BlockIo asks for, and what a driver's submit answers: ffi's
+pub use ffi::block::{BLOCK_IO_FLUSH as IO_FLUSH, BLOCK_IO_READ as IO_READ, BLOCK_IO_WRITE as IO_WRITE,
+                     BLOCK_SUBMIT_BUSY as SUBMIT_BUSY, BLOCK_SUBMIT_INVALID as SUBMIT_INVALID,
+                     BLOCK_SUBMIT_OK as SUBMIT_OK, BLOCK_SUBMIT_UNSUPPORTED as SUBMIT_UNSUPPORTED};
 
 /// The most bytes of a claim's holder's name the kernel keeps: a name is cut
 /// there.
@@ -283,12 +277,6 @@ impl Disk {
         block::kernel_blockdev_can_discard(self.handle) != 0
     }
 
-    /// Its `count` sectors from `sector` given back to it: a writer's call,
-    /// under its claim. IoError when the device failed or takes no such thing.
-    pub fn discard(&self, sector: u64, count: u64) -> Result<()> {
-        if block::kernel_blockdev_discard(self.handle, sector, count) == 0 { Ok(()) } else { Err(Error::IoError) }
-    }
-
     /// Its size, in sectors
     pub fn sectors(&self) -> u64 {
         block::kernel_blockdev_capacity(self.handle)
@@ -302,16 +290,6 @@ impl Disk {
     pub fn read(&self, sector: u64, buf: &mut [u8]) -> Result<()> {
         let count = self.sector_count(buf.len())?;
         let rc = unsafe { block::kernel_blockdev_read(self.handle, sector, buf.as_mut_ptr(), count) };
-        if rc == 0 { Ok(()) } else { Err(Error::IoError) }
-    }
-
-    /// Writes buf -- a whole number of sectors -- from `sector` on; with
-    /// `fua`, past the device's write cache.
-    pub fn write(&self, sector: u64, buf: &[u8], fua: bool) -> Result<()> {
-        let count = self.sector_count(buf.len())?;
-        let rc = unsafe {
-            block::kernel_blockdev_write(self.handle, sector, buf.as_ptr(), count, fua as i32)
-        };
         if rc == 0 { Ok(()) } else { Err(Error::IoError) }
     }
 
@@ -336,11 +314,11 @@ impl Disk {
         /* `name` is `name.len()` bytes; `refused` takes HOLDER_MAX, and
          * `len` is ours. */
         let claim = unsafe {
-            block::kernel_blockdev_claim(self.handle, name.as_ptr(), name.len(), refused.bytes.as_mut_ptr(),
-                                         HOLDER_MAX, &mut len)
+            block::kernel_blockdev_claim(crate::owner::here(), self.handle, name.as_ptr(), name.len(),
+                                         refused.bytes.as_mut_ptr(), HOLDER_MAX, &mut len)
         };
         if claim != 0 {
-            return Ok(DiskClaim { claim });
+            return Ok(DiskClaim { claim, disk: *self });
         }
         refused.len = len.min(HOLDER_MAX);
         if refused.len == 0 {
@@ -360,26 +338,22 @@ impl Disk {
         block::kernel_blockdev_can_submit(self.handle) != 0
     }
 
-    /// Hands the device an I/O straight to or from physical memory and
-    /// returns at once; io.done is called when the device is done, exactly
-    /// once, from interrupt context. Task or softirq context. With kick false
-    /// the device may leave its doorbell for `kick` -- one doorbell for a
-    /// batch. The io is read before this returns, and may be submitted again
-    /// as it is after Busy.
+    /// Hands the device a read straight into physical memory and returns at
+    /// once; io.done is called when the device is done, exactly once, from
+    /// interrupt context. Task or softirq context. With kick false the device
+    /// may leave its doorbell for `kick` -- one doorbell for a batch. The io
+    /// is read before this returns, and may be submitted again as it is after
+    /// Busy. A read alone: a write or a flush is Invalid here, and its claim's
+    /// (`DiskClaim::submit`).
     ///
     /// # Safety
     /// io.phys names io.count sectors of physically contiguous memory, dword
-    /// aligned, that stay valid -- and, for a read, untouched -- until io.done
-    /// has run; io.ctx stays valid as long. io.done runs in interrupt context:
-    /// no sleeping, allocating or freeing in it.
+    /// aligned, that stay valid and untouched until io.done has run; io.ctx
+    /// stays valid as long. io.done runs in interrupt context: no sleeping,
+    /// allocating or freeing in it.
     #[inline]
     pub unsafe fn submit(&self, io: &BlockIo, kick: bool) -> core::result::Result<(), SubmitError> {
-        match unsafe { block::kernel_blockdev_submit(self.handle, io, kick as i32) } {
-            SUBMIT_OK => Ok(()),
-            SUBMIT_BUSY => Err(SubmitError::Busy),
-            SUBMIT_UNSUPPORTED => Err(SubmitError::Unsupported),
-            _ => Err(SubmitError::Invalid),
-        }
+        submitted(unsafe { block::kernel_blockdev_submit(self.handle, io, kick as i32) })
     }
 
     /// Rings the doorbell for what `submit(.., false)` queued.
@@ -397,9 +371,55 @@ impl Disk {
     }
 }
 
-/// A claim on a block device, from Disk::claim; given back on drop.
+fn submitted(code: i32) -> core::result::Result<(), SubmitError> {
+    match code {
+        SUBMIT_OK => Ok(()),
+        SUBMIT_BUSY => Err(SubmitError::Busy),
+        SUBMIT_UNSUPPORTED => Err(SubmitError::Unsupported),
+        _ => Err(SubmitError::Invalid),
+    }
+}
+
+/// A claim on a block device, from Disk::claim; given back on drop. What
+/// writes to the device: its writes, discards and write submissions are
+/// made under the claim, by the claim's word, so that a write without one
+/// cannot be asked -- `Disk` reads. ("Writing needs a claim first" was a
+/// comment: a safe `Disk::write` went to a partition a filesystem had
+/// mounted.)
 pub struct DiskClaim {
     claim: usize,
+    disk: Disk,
+}
+
+impl DiskClaim {
+    /// The device claimed, for what anyone may do with it: reads.
+    pub fn disk(&self) -> Disk {
+        self.disk
+    }
+
+    /// Writes buf -- a whole number of sectors -- from `sector` on; with
+    /// `fua`, past the device's write cache.
+    pub fn write(&self, sector: u64, buf: &[u8], fua: bool) -> Result<()> {
+        let count = self.disk.sector_count(buf.len())?;
+        let rc = unsafe { block::kernel_blockdev_write(self.claim, sector, buf.as_ptr(), count, fua as i32) };
+        if rc == 0 { Ok(()) } else { Err(Error::IoError) }
+    }
+
+    /// The device's `count` sectors from `sector` given back to it: IoError
+    /// when the device failed or takes no such thing.
+    pub fn discard(&self, sector: u64, count: u64) -> Result<()> {
+        if block::kernel_blockdev_discard(self.claim, sector, count) == 0 { Ok(()) } else { Err(Error::IoError) }
+    }
+
+    /// `Disk::submit` for any I/O -- a write and a flush among them.
+    ///
+    /// # Safety
+    /// As `Disk::submit`'s, and for a write the memory holds the data until
+    /// io.done has run.
+    #[inline]
+    pub unsafe fn submit(&self, io: &BlockIo, kick: bool) -> core::result::Result<(), SubmitError> {
+        submitted(unsafe { block::kernel_blockdev_submit_claimed(self.claim, io, kick as i32) })
+    }
 }
 
 impl Drop for DiskClaim {
@@ -477,8 +497,9 @@ impl Disk {
          * takes HOLDER_MAX and `len` is ours; the device and the event are
          * looked up. */
         let q = unsafe {
-            block::kernel_blockq_open(self.handle, i32::from(write), buffers, bytes, holder.as_ptr(), holder.len(),
-                                      at.as_mut_ptr(), refused.bytes.as_mut_ptr(), HOLDER_MAX, &mut len, event)
+            block::kernel_blockq_open(crate::owner::here(), self.handle, i32::from(write), buffers, bytes,
+                                      holder.as_ptr(), holder.len(), at.as_mut_ptr(), refused.bytes.as_mut_ptr(),
+                                      HOLDER_MAX, &mut len, event)
         };
         if q == 0 {
             if len == 0 {
@@ -492,7 +513,9 @@ impl Disk {
         match unsafe { Buffers::new(at, bytes) } {
             Ok(buffers) => Ok(DiskQueue { buffers, disk: self, q }),
             Err(_) => {
-                block::kernel_blockq_close(q);
+                /* Opened just now, by this call alone, and no slice of its
+                 * buffers made */
+                unsafe { block::kernel_blockq_close(q) };
                 Err(QueueError::Refused)
             }
         }
@@ -531,11 +554,13 @@ impl DiskQueue {
     /// doorbell waits for `kick`.
     pub fn start(&self, k: usize, write: bool, offset: u64, len: usize) -> Result<Started> {
         self.buffers.take(k)?;
-        match block::kernel_blockq_start(self.q, k, i32::from(write), offset, len) {
-            1 => Ok(Started::InFlight),
+        /* `take` made buffer `k` this call's: no `Lent` of it is out, and
+         * the queue is this one's alone */
+        match unsafe { block::kernel_blockq_start(self.q, k, i32::from(write), offset, len) } {
+            block::QUEUE_IN_FLIGHT => Ok(Started::InFlight),
             rc => {
                 self.buffers.untake(k);
-                if rc == 0 { Ok(Started::Done) } else { Err(Error::IoError) }
+                if rc == block::QUEUE_DONE { Ok(Started::Done) } else { Err(Error::IoError) }
             }
         }
     }
@@ -674,6 +699,6 @@ impl Drop for DiskQueue {
         /* Waits for what the device still has, frees the buffers and gives
          * the claim back: nothing reaches the buffers after -- a `Lent`
          * borrows the queue, and so is gone before this runs. */
-        block::kernel_blockq_close(self.q);
+        unsafe { block::kernel_blockq_close(self.q) };
     }
 }

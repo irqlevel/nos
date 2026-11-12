@@ -34,7 +34,7 @@ pub struct Method {
 }
 
 /// The most methods a provider has.
-pub const MAX_METHODS: usize = 48;
+pub const MAX_METHODS: usize = ffi::mgmt::MGMT_METHODS_MAX;
 
 type Handler = dyn Fn(&str, &[u8], &mut Call) -> Status + Send + Sync;
 

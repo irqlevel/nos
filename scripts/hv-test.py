@@ -143,12 +143,14 @@ def create_script(port):
     """What `hv create <name> <url>` is asked, from the test's web server --
     which QEMU's user network puts at 10.0.2.2 for nos -- and what each must
     answer (create_checks): a qcow2 image downloaded, made a disk and grown
-    to size=, given the seed and a vm.toml; the same name again refused; a
-    raw image taken as it is; a URL with nothing at it, a file that is no
-    image and a size= under the image's refused, each leaving nothing."""
+    to size=, given the seed and a vm.toml -- at a port of the switch of its
+    own, the first VM made, the VMs' folder not there yet; the same name
+    again refused; a raw image taken as it is; a URL with nothing at it, a
+    file that is no image and a size= under the image's refused, each
+    leaving nothing."""
     url = "http://10.0.2.2:%d/" % port
     return [
-        "hv create c1 %simg.qcow2 size=16M mem=512 password=nos" % url,
+        "hv create c1 %simg.qcow2 size=16M mem=512 password=nos port=3" % url,
         "ls /vms/c1",
         "sha256 /vms/c1/disk.raw",
         "cat /vms/c1/vm.toml",
@@ -307,7 +309,7 @@ HVBOOT = os.path.join(ROOT, "out", "x86_64", "hvboot")
 # What `hv run all` has to have said about each guest, beyond its verdict.
 GUESTS = {
     "exits": [r'said\s+"nos: ports and cpuid"', r"1 port in, 20 port out, 1 cpuid"],
-    "uart": [r"brought up the 8250 and sent 35 bytes through it"],
+    "uart": [r"brought up the 8250, read its scratch register back, and sent 35 bytes through it"],
     "hypercall": [r'said\s+"nos: long mode"', r"15 registers went out at the hypercall and 15 answers came back"],
     "fault": [r"nested page fault at gpa 0x1ff000, error 0x1[0-9a-f]{8}, rip 0x8009",
               r"the instruction it was told to, its state read whole"],
@@ -335,14 +337,26 @@ GUESTS = {
     # two EOIs through the guest's word, done by the host at the next exit,
     # and two by the register.
     "pveoi": [r"0x50 alone ended through the word, its EOI the host's at the next exit; 0x70, nested over 0x30, "
-              r"through it too, and 0x30's own EOI by the register after, whose exit did 0x70's first; nothing left "
-              r"in service; with PV EOI off, 0x50 by the register, the word never set -- 2 EOIs through the word, 2 "
-              r"by the register"],
+              r"through it too, the word read clear while 0x70 waited in IRR, and 0x30's own EOI by the register "
+              r"after, whose exit did 0x70's first; nothing left in service; with PV EOI off, 0x50 by the register, "
+              r"the word never set -- 2 EOIs through the word, 2 by the register"],
+    # At least one write answered in the world switch, or the guest looked
+    # at nothing (`check_kgs` refuses none); then the two bases as left.
+    # QEMU's TCG gives AMD-V no next-RIP save, and its world switch then
+    # answers no write: said so, the bases held to the same either way.
+    "kgs": [r"(?:[1-9]\d* of its 128 writes of the ICR and the TSC deadline answered in the world switch;|no "
+            r"next-RIP save, so none of its writes answered in the world switch -- and) the GS base and KERNEL_GS_BASE "
+            r"as its swapgs left them"],
+    "cache": [r"it read CR0 back as 0x[0-9a-f]+, CD and NW as it wrote them, and no host CPU's own CR0 has either"],
     # Who hands the second CPU's IPIs over -- the host here -- is said after
     # the colon; that the first took them all is what has to be the same.
     "posted": [r"the first CPU took all 1000 of the second's IPIs while it spun, the host handing each over"],
     "debug": [r"both #DBs its own handler's: the single step's with DR6\.BS, after the NOP; the ICEBP's with no bit",
               r"2 exceptions given back"],
+    # RSM, any CPL's, once stopped its whole VM under AMD-V, and INVD the
+    # guest's kernel's under both: a #UD of its own, and stepped past.
+    "instr": [r"its RSM a #UD of its own handler's, at the RSM -- (?:the host's to give|the CPU's own); its INVD "
+              r"stepped past; its single step over a CPUID a #DB after it, DR6.BS set; and it ran on to its halt"],
     # Its reads are stopped and answered by the host -- 11 accesses
     # performed -- except on QEMU's TCG, which checks a read of CR4 against
     # CR0's intercept and so never stops one: 5, its writes. The guest's own
@@ -369,11 +383,12 @@ GUESTS = {
     # host's alone after; three IBPBs asked each, all answered before the
     # next entry. Which the CPU has is `hv info`'s to say, and checked
     # against it below (`check_controls`).
-    "spec": [r"(?:no speculation control offered, as the CPU has none: every access to SPEC_CTRL and PRED_CMD a #GP"
+    "spec": [r"(?:no speculation control offered, as the host switches none -- the CPU's own CPUID offers "
+             r"SPEC_CTRL 0x[0-9a-f]+ and PRED_CMD 0x[0-9a-f]+: every access to SPEC_CTRL and PRED_CMD a #GP"
              r"|SPEC_CTRL 0x[0-9a-f]+ and PRED_CMD 0x[0-9a-f]+ offered, as the host switches them; vm B read "
-             r"SPEC_CTRL as 0 where vm A had left 0x[0-9a-f]+, each read back its own and ran under it over the "
-             r"host's, bit 62 refused, the CPU's the host's alone after; [03] IBPBs asked each, all answered before "
-             r"the next entry; PRED_CMD's read and bit 1 a #GP)",
+             r"SPEC_CTRL as 0 where vm A had left 0x[0-9a-f]+, each read back its own \(0x[0-9a-f]+ and 0x[0-9a-f]+\) "
+             r"and ran under it over the host's, as read off the CPU, bit 62 refused, the CPU's the host's alone "
+             r"after; [03] IBPBs asked each, all answered before the next entry; PRED_CMD's read and bit 1 a #GP)",
              r"\b4 and 4 rdmsr, 6 and 6 wrmsr"],
     # Two VMs, one after the other on the CPU the guests run on: the second
     # must read 0 where the first left its own, and each one's breakpoint,
@@ -408,10 +423,11 @@ GUESTS = {
     # every turn, whatever its XCR0 says of PKRU; RDPKRU a #UD before PKE.
     "pkru": [r"(?:PKU offered, OSPKE with CR4.PKE, XCR0 0x203 and 1, PKRU's component of 8 bytes at \d+; PKRU 0 "
              r"at each CPU's start, and its own at all 64 of its turns, put back \d+ and \d+ times"
-             r"|no PKU offered, as this CPU switches no PKRU: RDPKRU a #UD; all 64 turns each taken)"],
-    "tscaux": [r"RDTSCP yes, RDPID (?:yes|no), INVPCID (?:yes|no), as its CPUID said; vm B read TSC_AUX as 0 where "
-               r"vm A had left its own, each read back the value it wrote -- bit 32 refused -- and INVPCID "
-               r"(?:ran types 0 to 3, 4 a #GP|was a #UD)",
+             r"|no PKU offered, as this CPU switches no PKRU -- its own CPUID has(?: no)? PKU: RDPKRU a #UD; all 64 "
+             r"turns each taken)"],
+    "tscaux": [r"RDTSCP yes, RDPID (?:yes|no), INVPCID (?:yes|no), as its CPUID said -- the CPU's own CPUID "
+               r"has(?: no)? RDPID and has(?: no)? INVPCID; vm B read TSC_AUX as 0 where vm A had left its own, each "
+               r"read back the value it wrote -- bit 32 refused -- and INVPCID (?:ran types 0 to 3, 4 a #GP|was a #UD)",
                r"\b3 and 3 rdmsr, 2 and 2 wrmsr, 1 and 1 refused"],
 }
 
@@ -534,9 +550,10 @@ def create_checks(out, grown, raw):
     pt.check("the disk is the one the image was made of, grown with zeros to size= (its SHA-256)", grown in out[2],
              out[2] + "\nwant " + grown)
     pt.check("the vm.toml boots it by hvboot -- the system image's, unless told -- the disk first and the seed "
-             "read-only, on the switch, restarted",
+             "read-only, on the switch at the port asked for, restarted",
              all(w in out[3] for w in ('kernel = "/lib/hvboot"', "memory = 512",
-                                       'disks = ["disk.raw", "seed.iso:ro"]', "net = true", "restart = true")),
+                                       'disks = ["disk.raw", "seed.iso:ro"]', "net = true", "restart = true",
+                                       "port = 3")),
              out[3])
     pt.check("a name that has a vm.toml is refused", "is there already -- not written over" in out[4], out[4])
     pt.check("a raw image is taken as it is", "/vms/c2/vm.toml written" in out[5] and "a 2 MiB disk" in out[5], out[5])
@@ -563,7 +580,8 @@ def clone_checks(out, grown):
 
     pt.check("hv clone: c1's disk copied into c6 with its holes left out, a seed of its own made, its vm.toml written",
              re.search(r"/vms/c6/disk\.raw: \d+ MiB written of 16 MiB, the rest holes", out[0]) is not None
-             and "/vms/c6/vm.toml written -- hv start c6 boots it, cloud-init given a seed of its own" in out[0],
+             and "/vms/c6/vm.toml written -- hv start c6 boots it, at 10.0.100.2 (port 0), cloud-init given a seed of "
+                 "its own" in out[0],
              out[0])
     written = re.search(r"/vms/c6/disk\.raw: (\d+) MiB written of 16 MiB", out[0])
     pt.check("and only what the disk has written: its 16 MiB are mostly a hole",
@@ -572,10 +590,10 @@ def clone_checks(out, grown):
              all(f in out[1] for f in ("disk.raw", "seed.iso", "user-data", "vm.toml")), out[1])
     pt.check("the disk is c1's, byte for byte (its SHA-256)", grown in out[2], out[2] + "\nwant " + grown)
     uuid = re.search(r'uuid = "([0-9a-f-]{36})"', out[3])
-    pt.check("c6's vm.toml is c1's, with a UUID of its own",
+    pt.check("c6's vm.toml is c1's, with a UUID of its own and a port of its own: the lowest no vm.toml names",
              all(w in out[3] for w in ('kernel = "/lib/hvboot"', "memory = 512",
-                                       'disks = ["disk.raw", "seed.iso:ro"]', "net = true"))
-             and uuid is not None, out[3])
+                                       'disks = ["disk.raw", "seed.iso:ro"]', "net = true", "port = 0"))
+             and "port = 3" not in out[3] and uuid is not None, out[3])
     pt.check("a clone to a name that has a folder is refused", "is there already -- not written over" in out[4],
              out[4])
     added = answer(out[5])
@@ -764,7 +782,8 @@ def x86(args):
         # The last command's own output lands after the marker above: the
         # end of the script is waited for by it (`RC_DONE`).
         wait_done(log, 600)
-        x86_checks(blocks(log), script, digest, grown, raw)
+        expect = set(args.expect) | (set() if kvm else TCG_OFFERS)
+        x86_checks(blocks(log), script, digest, grown, raw, expect)
     finally:
         server.shutdown()
         pt.kill(p)
@@ -1097,6 +1116,9 @@ def check_all_guests(text, cpu, backend, apicv, posted):
         elif name in ("avx", "pkru"):
             # Both its CPUs there.
             good = good and re.search(r"ran on\s+cpu %d and cpu %d," % (cpu, cpu), report) is not None
+        elif name == "kgs":
+            # Its first CPU there; its second never started.
+            good = good and re.search(r"ran on\s+cpu %d and \(cpu 1 never entered\)," % cpu, report) is not None
         elif name != "refused":
             good = good and re.search(r"ran on\s+cpu %d," % cpu, report) is not None
         pt.check("  %s, on cpu %d" % (name, cpu), good, report or text)
@@ -1140,7 +1162,22 @@ def check_controls(info, text, cpu):
              % (cpu, "yes" if spec_ctrl else "no", "yes" if ibpb else "no"), good, report or text)
 
 
-def x86_checks(ran, script, digest, grown, raw):
+# What a guest is offered of the features a CPU may have and the hypervisor
+# may withhold -- PKU, RDTSCP, RDPID, INVPCID, the speculation controls --
+# is decided, said by `hv info` and expected by the guests' checks all from
+# the same few functions, which agreeing among themselves hold nothing to
+# the CPU: a change that stopped offering one would have its guest pass its
+# reduced branch, saying the CPU had none. So what a machine must offer is
+# said here, from outside: QEMU's TCG `-cpu max` -- the gate's -- offers
+# PKU, RDTSCP and RDPID, and a run on silicon names its own (`--expect`:
+# the EX44 all five, the AX41 SPEC_CTRL and IBPB). Each guest's sentence
+# says, besides, what the CPU's own CPUID has.
+TCG_OFFERS = {"pku", "rdtscp", "rdpid"}
+OFFER_NAMES = {"pku": "PKU", "rdtscp": "RDTSCP", "rdpid": "RDPID", "invpcid": "INVPCID", "spec": "SPEC_CTRL",
+               "ibpb": "IBPB"}
+
+
+def x86_checks(ran, script, digest, grown, raw, expect=frozenset()):
     if not pt.check("every line of the script ran", [c for c, _ in ran] == script,
                     "\n".join(c for c, _ in ran)):
         return
@@ -1158,6 +1195,10 @@ def x86_checks(ran, script, digest, grown, raw):
              re.search(r"AVX in a guest\s+yes", info) is not None, info)
     pt.check("and RDTSCP, its TSC_AUX switched with it -- every CPU this runs on has it",
              re.search(r"RDTSCP in a guest\s+yes", info) is not None, info)
+    for name in sorted(expect):
+        label = OFFER_NAMES[name]
+        pt.check("and %s for a guest, as this machine's CPU has it" % label,
+                 re.search(r"%s in a guest\s+yes" % label, info) is not None, info)
 
     pt.check("it is off for every CPU to begin with",
              "on for cpu none of %s" % ALL_CPUS in out[2], out[2])
@@ -1341,7 +1382,14 @@ def main():
     ap.add_argument("--arch", choices=("x86_64", "aarch64"), default="x86_64")
     ap.add_argument("--tcg", action="store_true", help="do not use KVM or HVF")
     ap.add_argument("--keep", action="store_true", help="keep the serial log")
+    ap.add_argument("--expect", type=lambda v: [w for w in v.split(",") if w], default=[],
+                    help="features this machine's CPU has that a guest must be offered, comma-separated: "
+                         + ", ".join(sorted(OFFER_NAMES)) + " (QEMU's TCG -cpu max: %s, always)"
+                         % ", ".join(sorted(TCG_OFFERS)))
     args = ap.parse_args()
+    unknown = [w for w in args.expect if w not in OFFER_NAMES]
+    if unknown:
+        sys.exit("hv-test: --expect takes %s, not %s" % (", ".join(sorted(OFFER_NAMES)), ", ".join(unknown)))
 
     if args.arch == "x86_64":
         x86(args)
