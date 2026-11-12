@@ -3437,12 +3437,14 @@ is nos's, `dev` and the commit, which such a build does not know.)
 
 - **The tables** are SMBIOS 3's, the 64-bit entry point at 0xF0000 -- where
   a kernel with no EFI scans for one, in the BIOS area the e820 map
-  reserves, after the ACPI tables -- and after it the BIOS (type 0, which
-  says the machine is a virtual one), the system (1: maker `nos`, product
-  `nos hv`, nos's version, the VM's name for its serial, and its UUID), its
-  chassis (3), the boot (32) and the end (127). Every string is the
-  operator's to have made -- a VM's name -- so each is cut to 64 bytes of
-  printable ASCII, anything else a `?`.
+  reserves, after the ACPI tables -- and SMBIOS 2.1's 32-bit one after it,
+  `_SM_` and its `_DMI_` half, the same table by its 32-bit address, for a
+  kernel before 4.0 or a `dmidecode` that knows no other; then the BIOS
+  (type 0, which says the machine is a virtual one), the system (1: maker
+  `nos`, product `nos hv`, nos's version, the VM's name for its serial,
+  and its UUID), its chassis (3), the boot (32) and the end (127). Every
+  string is the operator's to have made -- a VM's name -- so each is cut to
+  64 bytes of printable ASCII, anything else a `?`.
 - **The UUID is the VM's.** A VM's folder keeps it in its `vm.toml`
   (`uuid = "..."`), which `hv create` writes; a VM whose file was written
   before VMs had one is given one at its first start, added to the end of

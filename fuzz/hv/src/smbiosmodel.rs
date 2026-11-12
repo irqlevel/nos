@@ -1,7 +1,9 @@
 //! The `smbios` target: the tables a guest is told what it is by
 //! (`hypervisor/hv/src/smbios.rs`), made of what an operator says -- a VM's name, any
-//! UUID -- and read back as Linux's `dmi_scan` reads them: the entry point
-//! found where the scan looks, its checksum, the structures walked to their
+//! UUID -- and read back as Linux's `dmi_scan` reads them: both entry points
+//! found where the scan looks -- SMBIOS 3's, and the 32-bit one with its
+//! `_DMI_` half that a kernel before 4.0 reads -- their checksums, both
+//! saying the same table, the structures walked to their
 //! end by their lengths and their strings, every string a structure names
 //! there, printable and no longer than the most, and what the system says
 //! held to a model of its own: the UUID, its first three fields least
@@ -72,7 +74,8 @@ pub fn smbios_target(r: &mut Input) {
     let serial = if r.u8() < 16 { "x".repeat(r.below(200) as usize) } else { text(r, 80) };
     let version = text(r, 40);
     let room = if r.u8() < 32 { r.below(MAX_BYTES as u64 + 1) as usize } else { MAX_BYTES };
-    let mut buf = vec![0u8; room];
+    /* A buffer of zeros, as the run loop's is, or of something else. */
+    let mut buf = vec![if r.bool() { 0 } else { r.u8() }; room];
     let machine = Machine { uuid, serial: &serial, version: &version };
     let Some(len) = build(&machine, &mut buf) else {
         invariant!(room < MAX_BYTES, "tables that do not fit {} bytes", MAX_BYTES);
@@ -96,6 +99,38 @@ pub fn smbios_target(r: &mut Input) {
     let structures = walk(&b[start..]);
     let kinds: Vec<u8> = structures.iter().map(|s| s.0).collect();
     invariant!(kinds == [0, 1, 3, 32, 127], "structures {:?}", kinds);
+
+    /* The 32-bit entry point, on a 16-byte boundary after the first, as
+     * dmi_present reads one: `_SM_`, a length under 32 its checksum covers,
+     * and from 16 on `_DMI_` with a checksum of its own over 15 bytes, the
+     * same table -- its length, its 32-bit address, how many structures --
+     * and SMBIOS 3.2 again, in BCD too; its largest structure the largest
+     * walked. Nothing but zeros between the two, and before the table. */
+    let at = entry_len.next_multiple_of(16);
+    invariant!(at + 32 <= start, "the 32-bit entry point at {}, the table at {}", at, start);
+    let e = &b[at..at + 32];
+    invariant!(&e[..4] == b"_SM_", "no 32-bit entry point at {}", at);
+    let e_len = usize::from(e[5]);
+    invariant!(e_len == 0x1F, "a 32-bit entry point of {} bytes", e_len);
+    invariant!(e[..e_len].iter().fold(0u8, |s, &x| s.wrapping_add(x)) == 0, "the 32-bit entry point's checksum");
+    invariant!(&e[16..21] == b"_DMI_", "no _DMI_ in the 32-bit entry point");
+    invariant!(e[16..31].iter().fold(0u8, |s, &x| s.wrapping_add(x)) == 0, "the _DMI_ half's checksum");
+    invariant!(e[6] == 3 && e[7] == b[8] && e[30] == 0x30 | b[8], "SMBIOS {}.{}, BCD {:#x}, where the first says 3.{}",
+               e[6], e[7], e[30], b[8]);
+    let sizes: Vec<usize> = structures.iter().map(|(_, f, s)| {
+        f.len() + if s.is_empty() { 2 } else { s.iter().map(|x| x.len() + 1).sum::<usize>() + 1 }
+    }).collect();
+    let largest = sizes.iter().copied().max().unwrap_or(0);
+    invariant!(usize::from(u16::from_le_bytes([e[8], e[9]])) == largest, "the largest structure {} bytes, said {}",
+               largest, u16::from_le_bytes([e[8], e[9]]));
+    invariant!(usize::from(u16::from_le_bytes([e[22], e[23]])) == table_len
+                   && u64::from(u32::from_le_bytes([e[24], e[25], e[26], e[27]])) == table_at
+                   && usize::from(u16::from_le_bytes([e[28], e[29]])) == structures.len(),
+               "the 32-bit entry point says a table of {} bytes at {:#x}, {} structures: {} at {:#x}, {}",
+               u16::from_le_bytes([e[22], e[23]]), u32::from_le_bytes([e[24], e[25], e[26], e[27]]),
+               u16::from_le_bytes([e[28], e[29]]), table_len, table_at, structures.len());
+    invariant!(b[entry_len..at].iter().chain(&b[at + e_len..start]).all(|&x| x == 0),
+               "bytes between the entry points and the table not zero");
     for (kind, formatted, strings) in &structures {
         for s in strings {
             invariant!(!s.is_empty() && s.len() <= MAX_STRING && s.iter().all(|&c| (0x20..0x7F).contains(&c)),
