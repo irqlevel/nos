@@ -209,7 +209,8 @@ struct Model {
     quiet: [bool; MAX_PORTS],
     /// Each port's frames on `hv0`'s backlog since the stack's last pass,
     /// and those its share kept out; its sends to every port their rate
-    /// kept out, and its bucket for them: tokens, and when topped up.
+    /// kept out, and its bucket for them as time: what it holds -- a send's
+    /// worth is `FLOOD_SEND_NS` of it -- and when that was looked at.
     on_backlog: [usize; MAX_PORTS],
     over_share: [u64; MAX_PORTS],
     flooded: [u64; MAX_PORTS],
@@ -229,13 +230,19 @@ struct Model {
     advertised: u64,
     /// What the stack must have been handed through `hv0`.
     stack: Vec<Vec<u8>>,
-    dns: u32,
     refuse: bool,
     /// A port the next frame for -- or kept from, as another network's --
     /// is lost instead: what one sent as the port changes hands may come
     /// to, for the VM going or the VM coming (`hand_over`).
     lose: Option<usize>,
 }
+
+/// A send to every port's worth of a port's flood bucket, as time: what the
+/// rate gives one in -- a whole number of nanoseconds, which the model's
+/// arithmetic takes (checked below) -- and the whole bucket's.
+const FLOOD_SEND_NS: u64 = NS_PER_SEC / switch::FLOOD_PER_SEC;
+const FLOOD_FULL_NS: u64 = switch::FLOOD_BURST * FLOOD_SEND_NS;
+const _: () = assert!(NS_PER_SEC % switch::FLOOD_PER_SEC == 0);
 
 impl Model {
     fn new() -> Model {
@@ -253,7 +260,7 @@ impl Model {
             on_backlog: [0; MAX_PORTS],
             over_share: [0; MAX_PORTS],
             flooded: [0; MAX_PORTS],
-            flood: [(switch::FLOOD_BURST, 0); MAX_PORTS],
+            flood: [(FLOOD_FULL_NS, 0); MAX_PORTS],
             to_host: 0,
             refused: 0,
             dhcp: 0,
@@ -262,7 +269,6 @@ impl Model {
             uses: 0,
             advertised: 0,
             stack: Vec::new(),
-            dns: 0,
             refuse: false,
             lose: None,
         }
@@ -284,7 +290,7 @@ impl Model {
         self.on_backlog[p] = 0;
         self.over_share[p] = 0;
         self.flooded[p] = 0;
-        self.flood[p] = (switch::FLOOD_BURST, time::peek());
+        self.flood[p] = (FLOOD_FULL_NS, time::peek());
     }
 
     /// Port `p` given up, with what waited for its VM and the IPv6 addresses
@@ -433,6 +439,18 @@ impl Model {
                     at += 8;
                 }
                 proto => {
+                    /* A first fragment carries the whole of its upper
+                     * header, or hides what it carries (RFC 7112): UDP's 8
+                     * bytes, TCP's 20, ICMPv6's type, code and checksum. */
+                    let whole = match proto {
+                        17 => 8,
+                        6 => 20,
+                        58 => 4,
+                        _ => 0,
+                    };
+                    if fragment && at + whole > pkt.len() {
+                        return Admit::Foreign;
+                    }
                     carried = Some(proto);
                     break;
                 }
@@ -621,17 +639,17 @@ impl Model {
     }
 
     /// Whether port `p` may send to every port now: `FLOOD_BURST` at once,
-    /// and `FLOOD_PER_SEC` after.
+    /// and `FLOOD_PER_SEC` after -- a bucket that holds the time since it was
+    /// last looked at, up to `FLOOD_BURST` sends' worth, a send taking
+    /// `FLOOD_SEND_NS` of it. Kept as time, not as the switch's whole tokens
+    /// and the part of one: a sender just over the rate was let through half
+    /// of it once, when the part was thrown away at every top-up.
     fn may_flood(&mut self, p: usize) -> bool {
         let now = time::peek();
-        let (mut tokens, mut at) = self.flood[p];
-        let earned = now.saturating_sub(at).saturating_mul(switch::FLOOD_PER_SEC) / NS_PER_SEC;
-        if earned != 0 {
-            tokens = tokens.saturating_add(earned).min(switch::FLOOD_BURST);
-            at = now;
-        }
-        let may = tokens != 0;
-        self.flood[p] = (if may { tokens - 1 } else { tokens }, at);
+        let (held, at) = self.flood[p];
+        let held = held.saturating_add(now.saturating_sub(at)).min(FLOOD_FULL_NS);
+        let may = held >= FLOOD_SEND_NS;
+        self.flood[p] = (if may { held - FLOOD_SEND_NS } else { held }, now);
         may
     }
 
@@ -656,11 +674,20 @@ impl Model {
                     return;
                 }
                 Admit::Dhcp => {
-                    let net = dhcp::Network { server_ip: HOST_IP, server_mac: HOST_MAC, mask: MASK, dns: self.dns };
+                    /* The DNS server the kernel has as the message is answered,
+                     * not as some guest last started. */
+                    let net = dhcp::Network { server_ip: HOST_IP, server_mac: HOST_MAC, mask: MASK,
+                                              dns: network::dns::upstream() };
                     let mut reply = [0u8; dhcp::REPLY_MAX];
-                    if let Some(len) = dhcp::answer(frame, switch::port_ip(p), &net, &mut reply) {
-                        self.dhcp += 1;
-                        self.deliver(p, &reply[..len]);
+                    match dhcp::answer(frame, switch::port_ip(p), &net, &mut reply) {
+                        Some(len) => {
+                            judge_dhcp(frame, &reply[..len], switch::port_ip(p), net.dns);
+                            self.dhcp += 1;
+                            self.deliver(p, &reply[..len]);
+                        }
+                        /* Taken and not answered: counted, as nothing the
+                         * switch carries */
+                        None => self.foreign += 1,
                     }
                     return;
                 }
@@ -1169,7 +1196,9 @@ fn hand_over(r: &mut Input, sw: &Arc<Switch>, m: &mut Model, s: usize, q: usize,
 }
 
 /// A DHCP client's DISCOVER or REQUEST from port `p`, as udhcpc sends one:
-/// from no address yet, or -- renewing -- its own; now and then as another.
+/// from no address yet, or -- renewing -- its own; now and then as another;
+/// a RELEASE, which wants no answer; and an INFORM from a guest whose
+/// address is set by hand, its own mostly.
 fn dhcp_request(r: &mut Input, p: usize) -> Vec<u8> {
     let mut m = vec![0u8; 300];
     m[0] = 1;
@@ -1178,7 +1207,11 @@ fn dhcp_request(r: &mut Input, p: usize) -> Vec<u8> {
     m[4..8].copy_from_slice(&r.u32().to_le_bytes());
     m[28..34].copy_from_slice(&switch::port_mac(p));
     m[236..240].copy_from_slice(&0x6382_5363u32.to_be_bytes());
-    let kind = r.pick(&[1u8, 3, 3, 7]);
+    let kind = r.pick(&[1u8, 3, 3, 7, 8]);
+    if kind == 8 {
+        let ciaddr = if r.u8() < 200 { switch::port_ip(p) } else { r.u32() };
+        m[12..16].copy_from_slice(&ciaddr.to_be_bytes());
+    }
     let mut opts = vec![53, 1, kind];
     if kind == 3 {
         let asked = if r.u8() < 200 { switch::port_ip(p) } else { r.u32() };
@@ -1198,6 +1231,50 @@ fn dhcp_request(r: &mut Input, p: usize) -> Vec<u8> {
     f[udp::PAYLOAD_AT..n].copy_from_slice(&m);
     f.truncate(n);
     f
+}
+
+/// What the answer to a DHCP message must be, read out of the reply's own
+/// bytes (RFC 2131): to an INFORM, an ACK with no address in it and no
+/// lease, the router and the mask in it, from the address it has; and the
+/// DNS server `dns` the kernel has now in any answer that is no NAK.
+fn judge_dhcp(asked: &[u8], reply: &[u8], yours: u32, dns: u32) {
+    /* The asked message where its datagram has it -- past IP options it
+     * may carry -- and the reply's where the switch writes it, with none. */
+    let (Some(a), Some(m)) = (udp::parse(asked).map(|d| d.payload), reply.get(udp::PAYLOAD_AT..)) else {
+        invariant!(false, "a DHCP answer of {} bytes, to a message that is no datagram", reply.len());
+        return;
+    };
+    let option = |msg: &[u8], code: u8| -> Option<Vec<u8>> {
+        let mut i = 240;
+        while i < msg.len() {
+            match msg[i] {
+                255 => return None,
+                0 => i += 1,
+                c => {
+                    let len = usize::from(*msg.get(i + 1)?);
+                    let data = msg.get(i + 2..i + 2 + len)?;
+                    if c == code {
+                        return Some(data.to_vec());
+                    }
+                    i += 2 + len;
+                }
+            }
+        }
+        None
+    };
+    let kind = option(m, 53).and_then(|k| k.first().copied());
+    if option(a, 53).and_then(|k| k.first().copied()) == Some(8) {
+        invariant!(kind == Some(5), "an INFORM answered with message type {:?}, not an ACK", kind);
+        invariant!(m[16..20] == [0; 4], "an INFORM's ACK gives an address: {:?}", &m[16..20]);
+        invariant!(option(m, 51).is_none(), "an INFORM's ACK gives a lease");
+        invariant!(a[12..16] == yours.to_be_bytes(), "an INFORM from another address than its port's answered");
+        invariant!(option(m, 3) == Some(HOST_IP.to_be_bytes().to_vec()), "an INFORM's ACK names no router");
+    }
+    if kind != Some(6) {
+        let given = option(m, 6);
+        invariant!(given == (dns != 0).then(|| dns.to_be_bytes().to_vec()),
+                   "a DHCP answer gives DNS server {:?}, the kernel's being {:#x}", given, dns);
+    }
 }
 
 /// The switch: guests on ports, and `hv0`, sending frames of every kind at
@@ -1382,7 +1459,6 @@ pub fn switch_target(r: &mut Input) {
                 let dns = r.pick(&[0u32, 0x0808_0808, 0x0A00_0203]);
                 network::dns::UPSTREAM.store(dns, std::sync::atomic::Ordering::Relaxed);
                 invariant!(sw.dns() == (dns != 0).then_some(dns), "the switch told another DNS server");
-                m.dns = dns;
                 m.refuse = r.u8() < 64;
                 vnic::set_refuse(m.refuse);
                 invariant!(sw.way_out() == Err(crate::net::NatError::NoUplink), "a way out with no uplink");
