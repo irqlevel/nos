@@ -42,11 +42,19 @@ use core::sync::atomic::{AtomicU16, Ordering};
 use crate::io::Port;
 
 /* TCO register offsets relative to TCOBASE */
-const TCO_RLD:    u16 = 0x00; /* reload / current count (r/w, 9-bit) */
+const TCO_RLD:    u16 = 0x00; /* reload / current count (r/w, 10-bit) */
 const TCO1_STS:   u16 = 0x04; /* status 1 (bit 3 = TIMEOUT) */
 const TCO2_STS:   u16 = 0x06; /* status 2 (bit 1 = SECOND_TO_STS) */
 const TCO1_CNT:   u16 = 0x08; /* control 1 (bit 11 = TMR_HLT) */
-const TCO_TMR:    u16 = 0x12; /* timer initial value (lower 9 bits used) */
+const TCO_TMR:    u16 = 0x12; /* timer initial value (bits 9:0) */
+
+/* The timer's field: ten bits on every TCO from ICH6 on (version 2 and
+   later; Linux's iTCO_wdt masks 0x3FF and refuses less than 4), the values
+   0 to 3 ignored by the chipset. Nine bits were masked here, so a bit 9
+   the firmware left set stayed in the value programmed, and 2 was taken
+   as the least. */
+const TCO_TMR_MASK: u16 = 0x3FF;
+const TCO_TMR_MIN:  u16 = 4;
 
 /* TMR_HLT: bit 11 of TCO1_CNT halts the watchdog */
 const TMR_HLT: u16 = 1 << 11;
@@ -193,7 +201,11 @@ impl TcoWatchdog {
             if acpi_base == 0 || acpi_base == 0xFFFE {
                 return None;
             }
-            (acpi_base + ACPI_TCO_OFFSET, TcoBaseSource::LpcAcpiBase)
+            /* A PMBASE so high the TCO window -- 32 ports from the base --
+             * would wrap is none */
+            let base = acpi_base.checked_add(ACPI_TCO_OFFSET)?;
+            base.checked_add(!TCOBASE_MASK)?;
+            (base, TcoBaseSource::LpcAcpiBase)
         };
 
         if tco_base == 0 {
@@ -230,15 +242,17 @@ impl TcoWatchdog {
     /// Start the watchdog with the given timeout in seconds.
     /// The actual timeout is rounded to the nearest 0.6-second boundary.
     pub fn start(&self, timeout_secs: u32) {
-        /* Convert seconds to TCO ticks (round up, minimum 2 ticks) */
+        /* Convert seconds to TCO ticks, rounded up, clamped to what the
+         * field takes -- clamped before the cast: a timeout past 10.9 hours
+         * once wrapped to a handful of ticks */
         let ticks = {
-            let t = ((timeout_secs as u64) * 1_000_000_000 + TCO_TICK_NS - 1) / TCO_TICK_NS;
-            (t as u16).max(2).min(0x1FF)
+            let t = (u64::from(timeout_secs) * 1_000_000_000).div_ceil(TCO_TICK_NS);
+            t.clamp(u64::from(TCO_TMR_MIN), u64::from(TCO_TMR_MASK)) as u16
         };
 
         /* Write timeout value; spec requires write to TMR before RLD */
         let tmr = Port::<u16>::new(self.tco_base + TCO_TMR);
-        let cur = tmr.read() & !0x1FF;
+        let cur = tmr.read() & !TCO_TMR_MASK;
         tmr.write(cur | ticks);
         self.armed_ticks.store(ticks, Ordering::Relaxed);
 
@@ -261,9 +275,9 @@ impl TcoWatchdog {
         Port::<u16>::new(self.tco_base + TCO_RLD).write(0x0001);
     }
 
-    /// Current countdown value (9-bit field of TCO_RLD).
+    /// Current countdown value (the 10-bit field of TCO_RLD).
     pub fn current_count(&self) -> u16 {
-        Port::<u16>::new(self.tco_base + TCO_RLD).read() & 0x1FF
+        Port::<u16>::new(self.tco_base + TCO_RLD).read() & TCO_TMR_MASK
     }
 
     /// Returns `true` if the timer appears to be running.  Call this at

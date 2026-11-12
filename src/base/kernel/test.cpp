@@ -3336,6 +3336,39 @@ static void hold_call_task(void* ctx)
     Cmd::dispatch("modtest hold", out);
 }
 
+/* What test_module_unload holds the net layer's sweep to
+   (rust_net_close_range): modtest loaded again, its `modtest listen` taking
+   the port the unloaded copy left a listener on -- refused, that listener
+   outlived its module, its callbacks in freed pages -- and unloaded again,
+   the one it leaves now swept the same way */
+static bool check_listener_swept(stdlib::BufferPrinter& out)
+{
+    auto& modules = ModuleTable::get_instance();
+
+    out.reset();
+    stdlib::Error err = modules.load(nos_modtest_ko, nos_modtest_ko_size, "", out);
+    if (!err.ok())
+    {
+        klog(0, "test_module_unload: the load after the listener's: %s", out.get());
+        return false;
+    }
+
+    out.reset();
+    Cmd::dispatch("modtest listen", out);
+    const bool port_free = (stdlib::str_str(out.get(), "modtest listen: left listening") != nullptr);
+    if (!port_free)
+        klog(0, "test_module_unload: the listener the unload had to take off: %s", out.get());
+
+    out.reset();
+    stdlib::Error unloaded = modules.unload("modtest", out);
+    if (!unloaded.ok() || modules.is_loaded("modtest"))
+    {
+        klog(0, "test_module_unload: the unload after the listener's: %s", out.get());
+        return false;
+    }
+    return port_free;
+}
+
 bool test_module_unload()
 {
     static const ulong OUTPUT_SIZE = 1024;
@@ -3379,13 +3412,42 @@ bool test_module_unload()
     if (!ticking)
         klog(0, "test_module_unload: the timer: %s", out.get());
 
+    /* A UDP listener the module leaves, its callbacks the module's code:
+       the unload has to take it off (rust_net_close_range), which the next
+       load finds out by taking the port again (check_listener_swept). A
+       boot with no NIC has nothing to listen on: said, and not held
+       against it */
+    out.reset();
+    Cmd::dispatch("modtest listen", out);
+    const bool listening = (stdlib::str_str(out.get(), "modtest listen: left listening") != nullptr);
+    const bool no_nic = (stdlib::str_str(out.get(), "modtest listen: no ") != nullptr);
+    if (!listening)
+        klog(0, "test_module_unload: the listener: %s", out.get());
+
+    /* A task the module starts and leaves, its code the module's: the
+       unload has to ask it to stop and wait for it (sweep_module_tasks).
+       Left running, its next turn runs in the pages the unload frees -- a
+       fault, which is the check -- and one that will not stop keeps the
+       image, which images_kept says */
+    const ulong kept_before = modules.images_kept();
+    out.reset();
+    Cmd::dispatch("modtest task", out);
+    const bool tasked = (stdlib::str_str(out.get(), "modtest task: left running") != nullptr);
+    if (!tasked)
+        klog(0, "test_module_unload: the task: %s", out.get());
+
     /* Unloaded whatever came of that: the call returns only once the stop
        has run, and the unload, only once the call has returned */
     out.reset();
     stdlib::Error unloaded = modules.unload("modtest", out);
-    bool ok = unloaded.ok() && !modules.is_loaded("modtest") && ticking;
+    bool ok = unloaded.ok() && !modules.is_loaded("modtest") && ticking && (listening || no_nic) && tasked;
     if (!unloaded.ok() || modules.is_loaded("modtest"))
         klog(0, "test_module_unload: unload failed: %s", out.get());
+    if (modules.images_kept() != kept_before)
+    {
+        klog(0, "test_module_unload: the task the module left was not stopped: its image kept");
+        ok = false;
+    }
     sleep(LEFT_TIMER_NS);
     if (!holding)
     {
@@ -3411,6 +3473,9 @@ bool test_module_unload()
         hold->~HoldCall();
         mm::free(hold);
     }
+
+    if (ok && listening && !check_listener_swept(out))
+        ok = false;
 
     if (ok)
         klog(0, "test_module_unload: complete");
@@ -3483,6 +3548,62 @@ static bool check_ipc_unloaded(stdlib::BufferPrinter& out)
         klog(0, "test_module_ipc: names that outlived their module: %s", out.get());
         return false;
     }
+    return true;
+}
+
+/* A TCP listener modtest leaves open -- `modtest tcp`, its handle forgotten
+   -- closed by the unload by whose it was: loaded, left, unloaded, twice,
+   the second load's `modtest tcp` taking the port the first left. Refused,
+   the listener outlived its module and the port was taken for the uptime,
+   which a module's next load found Busy. A boot with no NIC has nothing to
+   listen on: said, and not held against it. */
+bool test_module_tcp_left()
+{
+    static const ulong OUTPUT_SIZE = 512;
+    static const ulong ROUNDS = 2;
+
+    auto& modules = ModuleTable::get_instance();
+    char output[OUTPUT_SIZE];
+    char said[OUTPUT_SIZE];
+    stdlib::BufferPrinter out(output, sizeof(output));
+
+    for (ulong round = 0; round < ROUNDS; round++)
+    {
+        out.reset();
+        stdlib::Error err = modules.load(nos_modtest_ko, nos_modtest_ko_size, "", out);
+        if (!err.ok())
+        {
+            klog(0, "test_module_tcp_left: load %lu failed: %s", round, out.get());
+            return false;
+        }
+
+        out.reset();
+        Cmd::dispatch("modtest tcp", out);
+        stdlib::BufferPrinter keep(said, sizeof(said));
+        keep.print_string(out.get());
+        const bool left = (stdlib::str_str(said, "modtest tcp: left listening") != nullptr);
+        const bool no_nic = (stdlib::str_str(said, "modtest tcp: no ") != nullptr);
+
+        out.reset();
+        stdlib::Error unloaded = modules.unload("modtest", out);
+        if (!unloaded.ok() || modules.is_loaded("modtest"))
+        {
+            klog(0, "test_module_tcp_left: unload %lu failed: %s", round, out.get());
+            return false;
+        }
+        if (no_nic)
+        {
+            klog(0, "test_module_tcp_left: %s -- not run", said);
+            return true;
+        }
+        if (!left)
+        {
+            klog(0, "test_module_tcp_left: load %lu: %s", round, said);
+            return false;
+        }
+    }
+
+    klog(0, "test_module_tcp_left: complete");
     return true;
 }
 

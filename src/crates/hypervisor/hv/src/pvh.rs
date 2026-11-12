@@ -215,13 +215,16 @@ impl Image {
                 return Err(Error::BadAddress);
             }
             read_exact(file, at, &mut ph[..phdr_bytes])?;
-            let (kind, offset, paddr, filesz, memsz) = if wide {
-                (u32_at(&ph, 0), u64_at(&ph, 8), u64_at(&ph, 24), u64_at(&ph, 32), u64_at(&ph, 40))
+            let (kind, offset, paddr, filesz, memsz, align) = if wide {
+                (u32_at(&ph, 0), u64_at(&ph, 8), u64_at(&ph, 24), u64_at(&ph, 32), u64_at(&ph, 40), u64_at(&ph, 48))
             } else {
                 (u32_at(&ph, 0), u32_at(&ph, 4) as u64, u32_at(&ph, 12) as u64, u32_at(&ph, 16) as u64,
-                 u32_at(&ph, 20) as u64)
+                 u32_at(&ph, 20) as u64, u32_at(&ph, 28) as u64)
             };
-            if filesz > memsz || offset.checked_add(filesz).is_none_or(|end| end > file_len) {
+            /* Its file bytes inside the file, whatever it is; more of them
+             * than its memory only matters to a segment that is loaded --
+             * a note's memory size is nothing anyone reads */
+            if offset.checked_add(filesz).is_none_or(|end| end > file_len) || (kind == PT_LOAD && filesz > memsz) {
                 return Err(Error::BadAddress);
             }
             match kind {
@@ -234,7 +237,7 @@ impl Image {
                     image.count += 1;
                 }
                 PT_NOTE => {
-                    if let Some(e) = find_entry(file, offset, filesz)? {
+                    if let Some(e) = find_entry(file, offset, filesz, align)? {
                         if entry.is_some_and(|had| had != e) {
                             /* Two entries: no telling which is meant. */
                             return Err(Error::BadAddress);
@@ -289,13 +292,16 @@ impl Image {
 /// The PVH entry in the notes of the segment at `offset`, `len` bytes: the
 /// descriptor of the `Xen` note of type 18, when there is one. A note is a
 /// 12-byte header -- name size, descriptor size, type -- then the name and
-/// the descriptor, each padded to 4 bytes.
-fn find_entry(file: &mut dyn ReadAt, offset: u64, len: u64) -> Result<Option<u32>> {
+/// the descriptor, each padded to the segment's alignment: 4 bytes, or 8
+/// for a segment aligned so (ELF64's `.note.gnu.property`), which a walk at
+/// 4 once read wrongly.
+fn find_entry(file: &mut dyn ReadAt, offset: u64, len: u64, align: u64) -> Result<Option<u32>> {
     let len = len.min(NOTES_MAX as u64) as usize;
     let mut notes = [0u8; NOTES_MAX];
     read_exact(file, offset, &mut notes[..len])?;
     let notes = &notes[..len];
-    let pad = |n: usize| n.checked_add(3).map(|v| v & !3);
+    let round = if align == 8 { 7 } else { 3 };
+    let pad = |n: usize| n.checked_add(round).map(|v| v & !round);
     let mut at = 0usize;
     while at + 12 <= notes.len() {
         let namesz = u32_at(notes, at) as usize;
@@ -307,7 +313,7 @@ fn find_entry(file: &mut dyn ReadAt, offset: u64, len: u64) -> Result<Option<u32
         };
         let desc_at = name_at.checked_add(name_len).ok_or(Error::BadAddress)?;
         let next = desc_at.checked_add(desc_len).ok_or(Error::BadAddress)?;
-        if next > notes.len() || desc_at + descsz > notes.len() {
+        if next > notes.len() {
             /* A note cut off by the segment, or by how much of it is read:
              * none past it can be read either. */
             return Ok(None);

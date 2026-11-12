@@ -25,11 +25,11 @@ use crate::machine::Machine;
 use crate::memory::GuestMemory;
 use crate::run::{Host, LinuxGuest};
 use crate::smp::Doorbells;
-use crate::svm::{Exit, Io, LongMode};
+use crate::svm::{Exit, Instr, Io, LongMode};
 use crate::targets::{apic_value, blk_segments, chain, gpa_in, DiskState, Disk, DriverQueue, Input, NicState, Nic,
                      APIC_EOI, APIC_REGS};
 use crate::vm::{self, Backend};
-use crate::x86::svm::vmcb::{exit as code, npf};
+use crate::x86::svm::vmcb::npf;
 use crate::{time, Vendor};
 
 /* Where things are in the machine `run.rs` builds (its constants). */
@@ -465,7 +465,7 @@ impl Script {
         } else {
             XcrExpect::Written { value, rip }
         });
-        Exit::Other(code::XSETBV)
+        Exit::Instr(Instr::Xsetbv)
     }
 
     /// A `mov` to or from DR0-DR3 at the guest's RIP, as a kernel makes one:
@@ -1425,24 +1425,32 @@ impl Script {
                 }
                 26 => Exit::Pause,
                 27 if v.has_vapic() => {
-                    /* A `mov` to CR8 under the TPR shadow: VTPR, no exit. */
+                    /* A `mov` to CR8 under the TPR shadow: VTPR, no exit --
+                     * but below the TPR threshold the run loop asked for, an
+                     * interrupt held by the TPR alone waiting. */
                     v.virtual_cr8(r.u8());
-                    continue;
+                    if v.tpr_window_hit() {
+                        Exit::IrqWindow
+                    } else {
+                        continue;
+                    }
                 }
                 27 => {
                     let write = r.bool();
                     let gpr = r.below(16) as u8;
                     v.regs_mut().rcx = r.value64();
                     v.regs_mut().r9 = r.value64();
-                    Exit::Cr8 { write, gpr }
+                    Exit::Cr8 { write, gpr: Some(gpr) }
                 }
                 /* An instruction the guest was told nothing of -- a VMX or
                  * SVM one, GETSEC -- answered #UD. */
                 28 if r.u8() < 48 => Exit::Undefined,
-                28 => Exit::Other(if r.rare() { code::INVD } else {
-                    r.pick(&[code::MONITOR, code::MWAIT, code::RDTSCP, code::WBINVD, code::RDPRU, code::RDPMC,
-                             code::ICEBP])
-                }),
+                /* And the ones the run loop answers by name -- RSM, INVD
+                 * among them, once stops of the whole guest -- now and then a
+                 * task switch, which stops it, naming it. */
+                28 if r.rare() && r.bool() => Exit::TaskSwitch,
+                28 => Exit::Instr(r.pick(&[Instr::Invd, Instr::Rsm, Instr::Monitor, Instr::Mwait, Instr::Rdtscp,
+                                           Instr::Wbinvd, Instr::Rdpru, Instr::Rdpmc, Instr::Icebp])),
                 29 => Exit::Hypercall,
                 30 => Exit::Host,
                 _ if r.rare() => match r.u8() % 4 {

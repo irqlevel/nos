@@ -134,3 +134,13 @@ unsafe extern "C" {
     /// A job told to stop: 0, or a status code below it.
     pub safe fn kernel_mgmt_job_cancel(id: u64) -> i32;
 }
+
+/* The numbers that cross with these functions, one copy of each: the
+ * layer that answers and kcore that reads them both use these, and this
+ * file is in the module interface's digest. They were written twice --
+ * a copy in the layer, literals in kcore -- outside it: a release that
+ * renumbered one built, hashed the same, and its modules misread the
+ * answers. */
+
+/// The most methods a provider registers.
+pub const MGMT_METHODS_MAX: usize = 48;

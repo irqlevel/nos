@@ -80,8 +80,10 @@ pub fn selftest() {
     let check = Check { frame: &frame, bad: AtomicU64::new(0) };
     let online = kcore::cpu::online_mask();
     for cpu in 0..MAX_CPUS as u32 {
+        /* A CPU that never ran the check read nothing wrong, and is no pass */
         if online & (1u64 << cpu) != 0 {
-            kcore::cpu::run_on_with(cpu, &check, check_here);
+            assert!(kcore::cpu::run_on_with(cpu, &check, check_here),
+                "frame selftest: cpu {} never ran the check", cpu);
         }
     }
     let bad = check.bad.load(Ordering::Relaxed);

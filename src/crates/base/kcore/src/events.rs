@@ -23,7 +23,7 @@ impl SharedEvent {
     /// None when the kernel has no memory for one, or holds as many for the
     /// modules as it takes.
     pub fn new() -> Option<SharedEvent> {
-        match events::kernel_shared_event_open() {
+        match events::kernel_shared_event_open(crate::owner::here()) {
             0 => None,
             handle => Some(SharedEvent { handle }),
         }

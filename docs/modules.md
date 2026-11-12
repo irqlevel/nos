@@ -137,9 +137,10 @@ module: sshd: init failed
 insmod: /sshd.ko failed, error 502
 ```
 
-They are at most 255 bytes (`ModuleTable::PARAMS_MAX`). Since its init takes
-them, the module's header is at layout version 2, and a module built before
-is refused with `header version 1, this kernel reads 2`: rebuild it.
+They are at most 255 bytes (`ModuleTable::PARAMS_MAX`). The module's header
+is at layout version 3 -- 2 when its init came to take them, 3 with its
+stop -- and a module built before is refused with `header version 2, this
+kernel reads 3`: rebuild it.
 
 ## Building
 
@@ -280,10 +281,22 @@ one order (`ModuleTable::take_down`), whatever module it is:
    running or able to start;
 5. **what the drop left registered is taken off**, each said in the log as
    the module's leaving it behind, and the mailboxes it left open are closed;
-   so are a timer it left running and an interrupt handler -- a line's or an
-   MSI-X entry's -- it left registered: the bridge's slots whose code is in
-   its image (`sweep_module_slots`), which would otherwise call into pages
-   about to be freed;
+   so are a UDP listener and a virtual NIC's sink whose code is in its image
+   (`rust_net_close_range`), a timer it left running and an interrupt
+   handler -- a line's or an MSI-X entry's -- it left registered: the
+   bridge's slots whose code is in its image (`sweep_module_slots`). Each
+   would otherwise call into pages about to be freed. A task it left running
+   is asked to stop and waited for (`sweep_module_tasks`); and then what it
+   opened through the C ABI and left open is closed, said the same way: a
+   TCP listener or connection and NAT (`rust_net_close_range`), a device
+   queue and a device's claim (`rust_block_module_gone`), an image and a file
+   (`rust_fs_module_gone`), an event (`rust_events_module_gone`). Each table
+   keeps whose every entry is -- the module, by the name the loader knows it
+   by, from an address in its code that the open passes (`kcore::owner`); an
+   accepted connection is its listener's owner's. Left open, a device stayed
+   claimed by a name nothing answered to, an image unwritable, a mount held
+   by a file, a port taken and NAT busy for the uptime, and the module's
+   next load refused the lot;
 
 and only then are its pages unmapped and freed. `rmmod` must not be run from
 the module's own command, which would wait for itself.
@@ -351,8 +364,10 @@ and the loader refuses a module whose digest is not the kernel's:
 module: built against another kernel interface (ffi 3fa81c..., this kernel 9b02e7...) -- rebuild it from this tree
 ```
 
-A module built outside the Makefile carries `unset` and is refused by a kernel
-that was not.
+A module built outside the Makefile carries `unset` and is refused, and so is
+one whose word is no digest at all -- an empty one, from a build with no
+`sha256sum`, once matched every module built the same way. The Makefile and
+kmod refuse to build with such a digest, and the loader to load one.
 
 A module cannot call another module. What it offers others -- the host API
 above all -- it offers on the [management bus](mgmt.md): `kcore::mgmt::
@@ -887,7 +902,16 @@ call that returns only once the module's stop has run, and unloads modtest
 under it. The stop must find modtest's command and provider closed already
 -- a call of the one says "not found", of the other `no_provider` -- the
 call says so as it returns, and modtest's drop panics if a call of its
-command is still running.
+command is still running. Before the unload modtest leaves a timer running
+(`modtest timer`) and a UDP listener registered on `eth0` (`modtest
+listen`), as a module's bug would: the timer's next tick after the unload
+would fault in the freed image, and a second load's `modtest listen` must
+find the port free again -- the sweep took the first listener off.
+`test_module_tcp_left`, run once TCP is up, does the same for what a module
+opens: modtest leaves a TCP listener with its handle forgotten (`modtest
+tcp`), and after the unload a second load's `modtest tcp` must take the port
+again -- the sweep closed the first by its owner. With the sweep taken out,
+the smoke boot fails it.
 
 `slowexit` (`src/crates/modules/test/slowexit`) is never loaded by the kernel itself:
 its exit takes eight seconds, for testing an `rmmod` that outlasts the
@@ -898,8 +922,10 @@ shell's wait by hand or from a script.
 - A module's image, function names included, is at most 16 MiB
   (`PageTable::MAX_LARGE_MAP_PAGES` pages), and so is the `.ko` file. The window
   they are mapped from holds 63 such runs at a time.
-- A module that registers a block device, a net device or a softirq handler
-  cannot be unloaded (above).
+- A module that registers a softirq handler (`kernel_softirq_register`, the
+  one name `PERMANENT_IMPORTS` holds) cannot be unloaded (above). A block or
+  a net device it cannot register at all; a virtual NIC it opens stays when
+  it goes, for its next load to find, and does not make it permanent.
 - An unload waits for a running call of the module's commands and providers
   for as long as it runs -- in a task of its own, so it holds up nothing
   else, and saying so in the log every so often; but a call that never

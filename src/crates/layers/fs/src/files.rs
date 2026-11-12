@@ -158,9 +158,22 @@ pub fn replace_file(path: &str, data: &[u8]) -> bool {
         _ => return false,
     };
 
+    /* One at a time: two replaces of one path at once both wrote
+     * `<path>.new`, and one could take away what the other had just put in
+     * place, then find no `.new` to rename -- neither file left. */
+    let _replacing = vfs.replacing();
+
     if let Some(st) = stat(vfs, path.as_bytes()) {
         if st.kind != Kind::File {
             klog!(0, "fs: replace_file: {} is not a file", path);
+            return false;
+        }
+    } else if stat(vfs, next.as_bytes()).is_some() {
+        /* A replace cut short between its remove and its rename left the
+         * only copy of the content in `<path>.new`, which the write below
+         * would truncate first, and remove on a failure: put in place
+         * before anything is written there. */
+        if !vfs.rename(next.as_bytes(), path.as_bytes()) || !vfs.sync() {
             return false;
         }
     }
@@ -325,7 +338,7 @@ pub unsafe extern "C" fn kernel_file_read_at(
 /// # Safety
 /// `path` points at `path_len` readable bytes.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_file_open(path: *const u8, path_len: usize, write: i32) -> usize {
+pub unsafe extern "C" fn kernel_file_open(owner: usize, path: *const u8, path_len: usize, write: i32) -> usize {
     let (vfs, path) = match (vfs_instance(), unsafe { ffi_path(path, path_len) }) {
         (Some(vfs), Some(path)) => (vfs, path),
         _ => return 0,
@@ -336,7 +349,32 @@ pub unsafe extern "C" fn kernel_file_open(path: *const u8, path_len: usize, writ
         None => return 0,
     };
     let flags = if write != 0 { OPEN_READ | OPEN_WRITE } else { OPEN_READ };
-    Handle::into_raw(vfs.open(at.as_bytes(), flags))
+    Handle::into_raw(vfs.open_for(at.as_bytes(), flags, kcore::owner::Owner::at(owner)))
+}
+
+/// What a module that went left open on the filesystems, closed: the disks'
+/// images its code opened, and the files -- an image held kept its file
+/// unwritable and unremovable for the uptime, a file kept its mount from
+/// unmounting -- each said as the module's bug. The loader's, at the
+/// module's take-down (`ModuleTable::take_down`). Task context.
+///
+/// # Safety
+/// `name` points at `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn rust_fs_module_gone(name: *const u8, len: usize) {
+    if name.is_null() || len == 0 || len > kcore::owner::NAME_MAX {
+        return;
+    }
+    let name = unsafe { core::slice::from_raw_parts(name, len) };
+    let shown = core::str::from_utf8(name).unwrap_or("?");
+    let images = crate::image::close_owned_by(name);
+    if images != 0 {
+        klog!(0, "module: {} left {} disk image(s) open: closed", shown, images);
+    }
+    let files = vfs_instance().map_or(0, |vfs| vfs.close_owned_by(name));
+    if files != 0 {
+        klog!(0, "module: {} left {} file(s) open: closed", shown, files);
+    }
 }
 
 /// Closes the file. A word that is no open file's is nothing to close.
@@ -484,7 +522,12 @@ pub unsafe extern "C" fn kernel_file_write(
 /// A new file with this content: 1, and nothing written, when there is one at
 /// the path already -- or the remains of a `replace_file` of it. For a file
 /// that must never be written over by mistake, a host key: a stat that failed
-/// on a bad block must not read as "there is none" and lose it.
+/// on a bad block must not read as "there is none" and lose it. -1 for every
+/// other failure -- the mount read-only, the parent missing, no inode or
+/// block left -- which once read as "there is one" for a file that was not
+/// there; and a file this call made and could not fill is taken away again,
+/// so that a disk that filled leaves no half-written key the next start
+/// cannot read and, being never written over, will not replace.
 ///
 /// # Safety
 /// `path` points at `path_len` bytes; `data` at `len`.
@@ -492,25 +535,32 @@ pub unsafe extern "C" fn kernel_file_write(
 pub unsafe extern "C" fn kernel_file_create(
     path: *const u8, path_len: usize, data: *const u8, len: usize,
 ) -> i32 {
+    use ffi::fs::{FILE_CREATED, FILE_REFUSED, FILE_THERE};
+
     let (vfs, path) = match (vfs_instance(), unsafe { ffi_path(path, path_len) }) {
         (Some(vfs), Some(path)) => (vfs, path),
-        _ => return -1,
+        _ => return FILE_REFUSED,
     };
     if data.is_null() && len != 0 {
-        return -1;
+        return FILE_REFUSED;
     }
 
     if locate(path).is_some() {
-        return 1;
+        return FILE_THERE;
     }
-    /* Refused by the filesystem itself when the file is there after all. */
     if !vfs.create(path.as_bytes(), false) {
-        return 1;
+        /* There after all -- made between the look and the create -- or
+         * refused for another reason, which is no file there */
+        return if locate(path).is_some() { FILE_THERE } else { FILE_REFUSED };
     }
     if !vfs.write_file(path.as_bytes(), unsafe { bytes(data, len) }) || !vfs.sync() {
-        return -1;
+        /* What this call made, and nothing of anyone else's: the create
+         * above was refused for a file that was there */
+        let _ = vfs.remove(path.as_bytes());
+        let _ = vfs.sync();
+        return FILE_REFUSED;
     }
-    0
+    FILE_CREATED
 }
 
 /// The file wherever it is -- at the path, and at `<path>.new` should a
@@ -583,12 +633,8 @@ pub unsafe extern "C" fn kernel_fs_space(path: *const u8, path_len: usize, out: 
 }
 
 /// What `kernel_dir_entry` says an entry is.
-pub const ENTRY_FILE: u32 = 1;
-pub const ENTRY_DIR: u32 = 2;
-/// What it answers past the last entry, and for a path that names no
-/// directory -- which an empty directory is not.
-pub const ENTRY_END: isize = -1;
-pub const ENTRY_NO_DIR: isize = -2;
+pub use ffi::fs::{FILE_ENTRY_DIR as ENTRY_DIR, FILE_ENTRY_END as ENTRY_END, FILE_ENTRY_FILE as ENTRY_FILE,
+                  FILE_ENTRY_NO_DIR as ENTRY_NO_DIR};
 
 /// The `index`'th entry of the directory at `path`: the length of its name,
 /// the name into `name` -- as much of it as `cap` holds -- its kind into

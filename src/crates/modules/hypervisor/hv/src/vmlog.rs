@@ -26,7 +26,7 @@ use crate::vms::Shared;
 /// The log's file in the VM's folder, and what is put after its name for
 /// the one before it.
 pub const FILE: &str = "console.log";
-const OLD_SUFFIX: &str = ".1";
+pub(crate) const OLD_SUFFIX: &str = ".1";
 /// The longest name of a file this writes in the folder.
 pub const LONGEST_NAME: usize = FILE.len() + OLD_SUFFIX.len();
 /// How big a log grows before it moves aside.

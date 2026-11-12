@@ -114,6 +114,20 @@ pub fn vectors(pairs: u16) -> u16 {
 /// host for good, the platform's lock with it (hv-fuzz's racing CPU).
 const PASS: usize = QUEUE_SIZE as usize;
 
+/// The most a transmit pass moves before it ends at its bound, the next
+/// round going on with the rest (`more`), as a disk's pass does
+/// (`blk::PASS_BYTES`): the frames it makes -- a send it cuts counted as the
+/// frames it is cut into -- and the bytes it copies out of the guest's
+/// memory, checked between chains. A pass runs under the platform's lock,
+/// which the guest's other CPUs' port and MMIO accesses wait for: bounded in
+/// chains alone, a ring of 256 sends of 64 KiB, each cut into 256 frames,
+/// was 16 MiB copied and 65,536 frames switched for one notify. A ring's
+/// worth of Linux's largest sends -- some fourteen of 64 KiB, with
+/// scatter-gather, 644 frames -- is one pass still; one send past the bound
+/// is the most a pass overshoots by.
+pub const TX_PASS_FRAMES: usize = 1024;
+pub const TX_PASS_BYTES: usize = 1 << 20;
+
 /// Features: the guest's checksums completed by the device, and checksums
 /// left partial handed to it; a MAC address of the device's; sends of TCP
 /// over IPv4 handed to it whole, and taken from it to cut; mergeable
@@ -198,6 +212,9 @@ pub struct Stats {
     /// The control queue's commands, and those answered with an error.
     pub commands: u64,
     pub refused: u64,
+    /// Transmit passes that ended at their bound on the frames or the bytes
+    /// they moved (`TX_PASS_FRAMES`, `TX_PASS_BYTES`).
+    pub cut: u64,
 }
 
 pub struct Net {
@@ -285,7 +302,7 @@ impl Net {
     pub fn identity() -> Identity {
         Identity {
             vendor: virtio::VENDOR,
-            device: virtio::LEGACY_DEVICE_BASE + VIRTIO_TYPE - 1,
+            device: virtio::LEGACY_NET,
             revision: 0,
             class: CLASS,
             subsystem_vendor: virtio::VENDOR,
@@ -429,7 +446,8 @@ impl Net {
     }
 
     /// What the driver has queued to send on `pair`, to the backend: a
-    /// pass's worth.
+    /// pass's worth -- a queue's chains, and the frames and bytes of
+    /// `TX_PASS_FRAMES` and `TX_PASS_BYTES`.
     fn send(&mut self, mem: &GuestMemory, pair: u16) -> Raise {
         let queue = tx_queue(pair);
         self.tx_more &= !(1 << pair);
@@ -438,27 +456,34 @@ impl Net {
         }
         let mut sent = false;
         let mut left = PASS;
+        let mut moved = Moved::default();
         loop {
-            if left == 0 {
+            if left == 0 || moved.frames >= TX_PASS_FRAMES || moved.bytes >= TX_PASS_BYTES {
+                if left != 0 {
+                    self.stats.cut += 1;
+                }
                 self.tx_more |= 1 << pair;
                 break;
             }
             left -= 1;
             let mut segs = core::mem::take(&mut self.segs);
-            let popped = match self.transport.queue(queue) {
-                Some(q) if q.ready() => q.pop(mem, &mut segs),
-                _ => Ok(None),
+            let Some(q) = self.transport.live(queue) else {
+                /* No queue set up: nothing to send, and nothing to ask of
+                 * its rings, which would be at page 0. */
+                self.segs = segs;
+                break;
             };
+            let popped = q.pop(mem, &mut segs);
             let result = match popped {
                 Ok(Some(head)) => {
-                    self.transmit(mem, &segs, pair);
-                    self.transport.queue(queue).ok_or(Broken::Index).and_then(|q| q.push(mem, head, 0))
+                    moved = moved.and(self.transmit(mem, &segs, pair));
+                    self.transport.live(queue).ok_or(Broken::Index).and_then(|q| q.push(mem, head, 0))
                 }
                 Ok(None) => {
                     self.segs = segs;
                     /* Every chain there was sent: a kick asked for the
                      * next, and what came before the ask sent now. */
-                    match self.transport.queue(queue).ok_or(Broken::Index).and_then(|q| q.ask_kick(mem)) {
+                    match self.transport.live(queue).ok_or(Broken::Index).and_then(|q| q.ask_kick(mem)) {
                         Ok(true) => continue,
                         Ok(false) => break,
                         Err(e) => {
@@ -478,7 +503,7 @@ impl Net {
                 }
             }
         }
-        let wants = sent && self.transport.queue(queue).map_or(false, |q| q.wants_interrupt(mem));
+        let wants = sent && self.transport.live(queue).map_or(false, |q| q.wants_interrupt(mem));
         if !wants {
             return Raise::default();
         }
@@ -489,8 +514,9 @@ impl Net {
     /// One chain the driver sent on `pair`: the header, then the frame -- or
     /// a send of TCP up to 64 KiB -- taken whole, its flow's frames for the
     /// guest steered to the pair from now on, and on to the backend as the
-    /// header says (`offload::transmit`).
-    fn transmit(&mut self, mem: &GuestMemory, segs: &[Seg], pair: u16) {
+    /// header says (`offload::transmit`). What it moved: the bytes copied out
+    /// of guest memory, and the frames made.
+    fn transmit(&mut self, mem: &GuestMemory, segs: &[Seg], pair: u16) -> Moved {
         let features = self.transport.driver_features();
         let offloads = Offloads { csum: features & F_CSUM != 0, tso4: features & F_HOST_TSO4 != 0 };
         let hdr = if features & F_MRG_RXBUF != 0 { HDR_MRG } else { HDR };
@@ -499,7 +525,7 @@ impl Net {
         let len = total as usize;
         if total < (hdr + MIN_FRAME) as u64 || total > most as u64 {
             self.stats.dropped += 1;
-            return;
+            return Moved::default();
         }
         let mut done = 0usize;
         for s in segs.iter().filter(|s| !s.write) {
@@ -508,7 +534,7 @@ impl Net {
             let Some(at) = s.at(0) else { continue };
             if mem.read(at, &mut self.tx_buf[done..done + n]).is_err() {
                 self.stats.dropped += 1;
-                return;
+                return Moved { frames: 0, bytes: done };
             }
             done += n;
         }
@@ -521,22 +547,28 @@ impl Net {
         let mut header = [0u8; HDR];
         header.copy_from_slice(&tx_buf[..HDR]);
         let header = TxHeader::parse(&header);
-        match offload::transmit(&header, &mut tx_buf[hdr..len], offloads) {
+        let frames = match offload::transmit(&header, &mut tx_buf[hdr..len], offloads) {
             Ok(Sent::Frame(frame, None)) => {
                 backend.send(frame);
-                stats.sent += 1;
+                1
             }
             Ok(Sent::Frame(frame, Some(partial))) => {
                 backend.send_partial(frame, partial);
-                stats.sent += 1;
+                1
             }
             Ok(Sent::Tcp4 { frame, layout }) => {
-                stats.sent += layout.frames(frame.len() - layout.headers()) as u64;
+                let frames = layout.frames(frame.len() - layout.headers());
                 stats.large += 1;
                 backend.send_tcp4(frame, layout);
+                frames
             }
-            Err(_) => stats.dropped += 1,
-        }
+            Err(_) => {
+                stats.dropped += 1;
+                0
+            }
+        };
+        stats.sent += frames as u64;
+        Moved { frames, bytes: done }
     }
 
     /// A round of the device at `now`, each time round the run loop: what a
@@ -630,7 +662,7 @@ impl Net {
                      * before the ask looked at now, the pass's bound
                      * bounding the looks. */
                     self.held = Some((len, rx));
-                    match self.transport.queue(queue).ok_or(Broken::Index).and_then(|q| q.ask_kick(mem)) {
+                    match self.transport.live(queue).ok_or(Broken::Index).and_then(|q| q.ask_kick(mem)) {
                         Ok(true) => continue,
                         Ok(false) => break,
                         Err(e) => {
@@ -675,7 +707,7 @@ impl Net {
     fn merge(&mut self, mem: &GuestMemory, queue: u16, total: usize, start: usize, segs: &mut Vec<Seg>)
         -> core::result::Result<Taken, Broken>
     {
-        let q = self.transport.queue(queue).ok_or(Broken::Index)?;
+        let q = self.transport.live(queue).ok_or(Broken::Index)?;
         let chains = match q.room_ahead(mem, total as u64, MAX_MERGE, segs)? {
             Room::Enough(n) => n,
             Room::Wait => return Ok(Taken::Wait),
@@ -684,13 +716,13 @@ impl Net {
         self.rx_buf[start + HDR..start + HDR_MRG].copy_from_slice(&chains.to_le_bytes());
         let mut done = 0usize;
         for _ in 0..chains {
-            let q = self.transport.queue(queue).ok_or(Broken::Index)?;
+            let q = self.transport.live(queue).ok_or(Broken::Index)?;
             /* The chains looked at a moment ago: a driver that took them
              * back meanwhile, from another CPU, has a frame cut short. */
             let Some(head) = q.pop(mem, segs)? else { break };
             let written = write_chain(mem, segs, &self.rx_buf[start + done..start + total]);
             done += written;
-            self.transport.queue(queue).ok_or(Broken::Index)?.push(mem, head, written as u32)?;
+            self.transport.live(queue).ok_or(Broken::Index)?.push(mem, head, written as u32)?;
         }
         Ok(if done == total { Taken::In } else { Taken::Dropped })
     }
@@ -701,11 +733,11 @@ impl Net {
     fn one_chain(&mut self, mem: &GuestMemory, queue: u16, total: usize, start: usize, segs: &mut Vec<Seg>)
         -> core::result::Result<Taken, Broken>
     {
-        let q = self.transport.queue(queue).ok_or(Broken::Index)?;
+        let q = self.transport.live(queue).ok_or(Broken::Index)?;
         let Some(head) = q.pop(mem, segs)? else { return Ok(Taken::Wait) };
         let room: u64 = segs.iter().filter(|s| s.write).map(|s| u64::from(s.len)).sum();
         let written = if room < total as u64 { 0 } else { write_chain(mem, segs, &self.rx_buf[start..start + total]) };
-        self.transport.queue(queue).ok_or(Broken::Index)?.push(mem, head, written as u32)?;
+        self.transport.live(queue).ok_or(Broken::Index)?.push(mem, head, written as u32)?;
         Ok(if written == total { Taken::In } else { Taken::Dropped })
     }
 
@@ -732,7 +764,7 @@ impl Net {
         let mut wanted = false;
         for pair in 0..self.pairs {
             let queue = rx_queue(pair);
-            if owed & (1 << pair) == 0 || !self.transport.queue(queue).map_or(false, |q| q.wants_interrupt(mem)) {
+            if owed & (1 << pair) == 0 || !self.transport.live(queue).map_or(false, |q| q.wants_interrupt(mem)) {
                 continue;
             }
             wanted = true;
@@ -762,19 +794,21 @@ impl Net {
         let mut answered = false;
         for _ in 0..PASS {
             let mut segs = core::mem::take(&mut self.segs);
-            let popped = match self.transport.queue(queue) {
-                Some(q) if q.ready() => q.pop(mem, &mut segs),
-                _ => Ok(None),
+            let Some(q) = self.transport.live(queue) else {
+                /* Not set up: no command to take, and nothing to ask. */
+                self.segs = segs;
+                break;
             };
+            let popped = q.pop(mem, &mut segs);
             let result = match popped {
                 Ok(Some(head)) => {
                     let ack = self.command(mem, &segs);
                     let written = write_chain(mem, &segs, &[ack]);
-                    self.transport.queue(queue).ok_or(Broken::Index).and_then(|q| q.push(mem, head, written as u32))
+                    self.transport.live(queue).ok_or(Broken::Index).and_then(|q| q.push(mem, head, written as u32))
                 }
                 Ok(None) => {
                     self.segs = segs;
-                    match self.transport.queue(queue).ok_or(Broken::Index).and_then(|q| q.ask_kick(mem)) {
+                    match self.transport.live(queue).ok_or(Broken::Index).and_then(|q| q.ask_kick(mem)) {
                         Ok(true) => continue,
                         Ok(false) => break,
                         Err(e) => {
@@ -794,7 +828,7 @@ impl Net {
                 }
             }
         }
-        let wants = answered && self.transport.queue(queue).map_or(false, |q| q.wants_interrupt(mem));
+        let wants = answered && self.transport.live(queue).map_or(false, |q| q.wants_interrupt(mem));
         let raised = if wants { self.transport.interrupt(queue) } else { Raise::default() };
         if self.active == before {
             return raised;
@@ -869,6 +903,20 @@ fn flow(frame: &[u8]) -> Option<u32> {
         }
     }
     Some(hash)
+}
+
+/// What a transmit pass has moved, chain by chain: the frames it made and
+/// the bytes it copied out of the guest's memory (`TX_PASS_FRAMES`).
+#[derive(Clone, Copy, Default)]
+struct Moved {
+    frames: usize,
+    bytes: usize,
+}
+
+impl Moved {
+    fn and(self, other: Moved) -> Moved {
+        Moved { frames: self.frames.saturating_add(other.frames), bytes: self.bytes.saturating_add(other.bytes) }
+    }
 }
 
 /// What became of a frame offered to the driver's buffers.

@@ -55,11 +55,13 @@ pub enum ListenError {
     Invalid,
 }
 
+/// How long a wait for a callback to return goes before it is said, and
+/// again: a join's ten seconds (`Task::wait`).
+const WAIT_REPORT_NS: u64 = 10 * kcore::consts::NS_PER_SEC;
+
 /// What `kernel_net_udp_listen` answers a module (kcore::net::ListenError).
-const LISTEN_OK: i32 = 0;
-const LISTEN_PORT_TAKEN: i32 = 1;
-const LISTEN_TABLE_FULL: i32 = 2;
-const LISTEN_INVALID: i32 = 3;
+use ffi::net::{NET_LISTEN_INVALID as LISTEN_INVALID, NET_LISTEN_OK as LISTEN_OK,
+               NET_LISTEN_PORT_TAKEN as LISTEN_PORT_TAKEN, NET_LISTEN_TABLE_FULL as LISTEN_TABLE_FULL};
 
 /// How many frames cross from a driver, or to one, in a single call.
 const HANDLE_CHUNK: usize = 64;
@@ -253,15 +255,15 @@ pub struct Lent<'a>(&'a Frame);
 
 impl Lent<'_> {
     /// The frame's bytes, Ethernet header first.
+    ///
+    /// Lent, and kept by nobody in the image past the call: a frame has one
+    /// owner here, so `data_mut` is one writer's. (A `retain` that made a
+    /// second owner of the same buffer, from `&self`, let safe code hold two
+    /// `&mut` slices of it; nothing called it. A module keeps a frame it was
+    /// lent through kcore's `Lent::retain`, across the C ABI, where no
+    /// reference of the image's is live.)
     pub fn bytes(&self) -> &[u8] {
         self.0.bytes()
-    }
-
-    /// The frame, to keep past the call -- to answer in, where it lies. The
-    /// receive path's own reference is then not the last, and it never looks
-    /// at the bytes again.
-    pub fn retain(self) -> Frame {
-        self.0.retain()
     }
 }
 
@@ -1039,10 +1041,65 @@ impl Device {
          * the lock. The count covers every listener on the device, not just
          * this port -- the table is compacted on removal, so a per-slot count
          * would not stay with its slot -- and a callback is microseconds, so
-         * waiting for a neighbour's costs nothing worth a second structure. */
+         * waiting for a neighbour's costs nothing worth a second structure.
+         * A callback that never returns made this a wait with no word: said
+         * every ten seconds it lasts, as a join is. */
+        let from = kcore::time::boot_time_ns();
+        let mut said_at = from;
         while self.listener_in_flight.load(Ordering::Acquire) != 0 {
             kcore::task::sleep_ms(1);
+            let now = kcore::time::boot_time_ns();
+            if now.saturating_sub(said_at) >= WAIT_REPORT_NS {
+                said_at = now;
+                klog!(0, "net: {}: port {}'s unlisten has waited {} s for a listener's callback to return",
+                      core::str::from_utf8(self.name()).unwrap_or("?"), port,
+                      now.saturating_sub(from) / kcore::consts::NS_PER_SEC);
+            }
         }
+    }
+
+    /// Every module callback whose code is in `lo..hi` -- a module's image,
+    /// about to be freed -- taken off this device: the ports it had, in
+    /// `ports`, and how many. Back once no call of one is still running, as
+    /// `unlisten_udp` is. What a module that left a listener registered as
+    /// it went would otherwise leave behind: a callback into pages the
+    /// unload frees, called by the next datagram to its port. Task context.
+    fn unlisten_range(&self, lo: usize, hi: usize, ports: &mut [u16; MAX_LISTENERS]) -> usize {
+        let in_image = |code: usize| (lo..hi).contains(&code);
+        let mut taken = 0;
+        {
+            let mut listeners = self.listeners.lock();
+            let mut count = listeners.count;
+            let mut at = 0;
+            while at < count {
+                let listener = listeners.table[at];
+                let left = match listener.sink {
+                    Some(Sink::Callback { frame_cb, batch_end, .. }) => {
+                        in_image(frame_cb as usize) || batch_end.is_some_and(|f| in_image(f as usize))
+                    }
+                    _ => false,
+                };
+                if left {
+                    ports[taken] = listener.port;
+                    taken += 1;
+                    listeners.table.copy_within(at + 1..count, at);
+                    listeners.table[count - 1] = NO_LISTENER;
+                    count -= 1;
+                } else {
+                    at += 1;
+                }
+            }
+            listeners.count = count;
+        }
+
+        /* As `unlisten_udp`: no new dispatch finds them; one that took the
+         * table before the lock is waited out. */
+        if taken != 0 {
+            while self.listener_in_flight.load(Ordering::Acquire) != 0 {
+                kcore::task::sleep_ms(1);
+            }
+        }
+        taken
     }
 
     /* ---- what the shell reports ---- */
@@ -1218,12 +1275,21 @@ impl DeviceTable {
 
         self.count.store(self.count() + 1, Ordering::Release);
 
-        /* One handler per softirq type, dispatching to every device */
+        /* One handler per softirq type, dispatching to every device. The
+         * types are this layer's: one somebody else holds -- a module that
+         * took it first -- would leave every NIC's receive or transmit
+         * unrun, a network dead without a word, so it stops here instead. */
         if !self.handlers_registered.swap(true, Ordering::AcqRel) {
-            kcore::softirq::register_for(
-                kcore::softirq::TYPE_NET_RX, self, DeviceTable::process_all_rx);
-            kcore::softirq::register_for(
-                kcore::softirq::TYPE_NET_TX, self, DeviceTable::process_all_tx);
+            if !kcore::softirq::register_for(
+                kcore::softirq::TYPE_NET_RX, self, DeviceTable::process_all_rx) {
+                panic!("net: the receive soft IRQ ({}) has a handler that is not the net layer's",
+                    kcore::softirq::TYPE_NET_RX);
+            }
+            if !kcore::softirq::register_for(
+                kcore::softirq::TYPE_NET_TX, self, DeviceTable::process_all_tx) {
+                panic!("net: the transmit soft IRQ ({}) has a handler that is not the net layer's",
+                    kcore::softirq::TYPE_NET_TX);
+            }
         }
 
         klog!(0, "net: {} registered, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -1234,7 +1300,10 @@ impl DeviceTable {
 
     /// The next slot, named. Registration is boot's, one driver at a time.
     fn claim(&'static self, name: &str, mac: Mac) -> Option<&'static Device> {
-        if name.is_empty() || name.len() >= NAME_MAX || name.as_bytes().contains(&0) {
+        /* A name a device has already is no name for another: a module's
+         * virtual NIC opened as `eth0` was registered beside the real one,
+         * and a lookup by the name found whichever came first */
+        if !Self::name_will_do(name) || self.named(name) {
             return None;
         }
 
@@ -1254,6 +1323,24 @@ impl DeviceTable {
             return None;
         }
         Some(dev)
+    }
+
+    fn name_will_do(name: &str) -> bool {
+        !name.is_empty() && name.len() < NAME_MAX && !name.as_bytes().contains(&0)
+    }
+
+    /// Whether a device is called `name`.
+    fn named(&'static self, name: &str) -> bool {
+        self.devices[..self.count()].iter().any(|dev| dev.name() == name.as_bytes())
+    }
+
+    /// Whether `register` would take a device called `name` now: a name
+    /// that will do, no device called so already, and room in the table. A
+    /// look, not a hold -- what a caller that has to make its driver
+    /// `'static`, for good, before it may register asks first
+    /// (`vnic::make`).
+    pub fn would_take(&'static self, name: &str) -> bool {
+        Self::name_will_do(name) && self.count() < MAX_DEVICES && !self.named(name)
     }
 
     /// The receive softirq: harvest every device, then dispatch what it
@@ -1498,4 +1585,44 @@ pub extern "C" fn kernel_net_rx_stats() -> ffi::net::RxStats {
 #[no_mangle]
 pub extern "C" fn rust_net_poll_rx() {
     DEVICES.poll_rx();
+}
+
+/// The loader's, at a module's unload (`ModuleTable::take_down`), after its
+/// exit: what of the module whose image is `lo..hi` is still registered with
+/// this layer -- a UDP listener's callback on any device, a virtual NIC's
+/// sink -- taken off, each said as the module's bug, and back once no call
+/// of one is still running. Left as they were, the next datagram to the port
+/// and the next frame out of the device called into the pages the unload
+/// frees. Its commands, providers, mailboxes, timers and interrupt handlers
+/// are swept beside this. Task context, no lock held.
+///
+/// # Safety
+/// `name` points at `len` readable bytes, or is null: the module's name.
+#[no_mangle]
+pub unsafe extern "C" fn rust_net_close_range(lo: usize, hi: usize, name: *const u8, len: usize) {
+    let name = if name.is_null() {
+        "?"
+    } else {
+        core::str::from_utf8(unsafe { core::slice::from_raw_parts(name, len) }).unwrap_or("?")
+    };
+
+    for dev in DEVICES.devices[..DEVICES.count()].iter() {
+        let mut ports = [0u16; MAX_LISTENERS];
+        let taken = dev.unlisten_range(lo, hi, &mut ports);
+        for port in &ports[..taken] {
+            klog!(0, "module: {} left a UDP listener on {}:{} registered: taken off", name,
+                core::str::from_utf8(dev.name()).unwrap_or("?"), port);
+        }
+    }
+    crate::vnic::detach_range(lo, hi, name);
+
+    /* What the module was handed by name rather than by its code: its TCP
+     * listeners and connections, and NAT */
+    let tcp = crate::abi::close_owned_by(name.as_bytes());
+    if tcp != 0 {
+        klog!(0, "module: {} left {} TCP listener(s) or connection(s) open: closed", name, tcp);
+    }
+    if crate::nat::disable_owned_in(lo, hi) {
+        klog!(0, "module: {} left NAT on: turned off", name);
+    }
 }

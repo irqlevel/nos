@@ -2666,17 +2666,30 @@ void Cmd::unregister_dynamic(ulong handle)
         return;
 
     DynamicCmd& entry = dynamic_[index - 1];
+    Task* me = Task::try_get_current_task();
+    const ulong my_pid = (me != nullptr) ? me->pid_ : 0;
     {
         stdlib::AutoLock lock(dynamic_lock_);
         if (entry.handle != handle)
             return;
+        /* The one call running began on this task, which is here: the
+           handler is dropping its own command, and the wait below would be
+           for itself, for good and without a word. Said as the bus's
+           unregister says it (layers/mgmt). */
+        if (my_pid != 0 && entry.running == 1 && entry.caller == my_pid)
+            PANIC("cmd: %s unregistered from its own handler: the unregister would wait for itself", entry.name);
         entry.removing = true;
     }
 
     /* Wait out the calls already made: the module may free the handler's ctx,
-       and unload its code, the moment this returns */
+       and unload its code, the moment this returns -- said every ten seconds
+       it lasts, as a join is (Task::wait) */
+    const ulong from = get_boot_time().get_value();
+    ulong said_at = from;
     for (;;)
     {
+        ulong running = 0;
+        ulong caller = 0;
         {
             stdlib::AutoLock lock(dynamic_lock_);
 
@@ -2690,8 +2703,18 @@ void Cmd::unregister_dynamic(ulong handle)
                 entry.handle = 0;
                 return;
             }
+            running = entry.running;
+            caller = entry.caller;
         }
         sleep(DYNAMIC_POLL_NS);
+
+        const ulong now = get_boot_time().get_value();
+        if (now - said_at >= DYNAMIC_REPORT_NS)
+        {
+            said_at = now;
+            klog(0, "cmd: %s: its unregister has waited %lu s for %lu call(s), the latest on pid %lu", entry.name,
+                (now - from) / consts::NANO_SECS_IN_SEC, running, caller);
+        }
     }
 }
 

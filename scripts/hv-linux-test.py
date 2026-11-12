@@ -285,7 +285,7 @@ def vm_commands(args):
     flood_console = "hv console %d bytes=200" % fv
     flood_stop = "hv stop %d secs=0" % fv
     flood_lines = [flood_start, flood_ready, FLOOD_BEFORE, flood_send, flood_wait, FLOOD_AFTER,
-                   flood_console, flood_stop]
+                   flood_console, flood_stop, flood_log(fv)]
     # A VM kept in a folder (`modules/hypervisor/hv/src/store.rs`): /vms/t0/vm.toml
     # written by hv create -- and not written over -- started by its name,
     # which every command then takes, refused a second time while it is on
@@ -614,6 +614,14 @@ FLOOD_AFTER = "dmesg 1 flood-after"
 DMESG_SLOTS = 2048
 
 
+def flood_log(fv):
+    """The log's lines of the flooding guest, read as soon as it stops: read
+    at the end of rc, with everything the VM phase logs after it, dmesg's
+    1024 lines held a few seconds of the flood -- two of its notices, where
+    the checks want three."""
+    return "dmesg hvvm%d|" % fv
+
+
 def flood_vm(args):
     """The flooding guest's number: after the lost-input guest and the six
     starts of the claim checks, each of which takes a number."""
@@ -644,7 +652,7 @@ def flood_checks(args, secs):
              took < FLOOD_LINES // 2, "%d lines at most" % took)
 
     # The log's lines from the guest, oldest first, each with its time.
-    log = output_of(secs, RC_LOG, 0) or ""
+    log = output_of(secs, flood_log(fv), 0) or ""
     lines = re.findall(r"(?m)^\d+:(\d+\.\d+):.*?hvvm%d\| (.*?)\s*$" % fv, log)
     checked, wrong, told_at, too_soon = 0, [], None, []
     left = last = said = said_at = None
@@ -1078,16 +1086,29 @@ def disk(args):
         # The image -- held while the guest ran -- says as it is let go of
         # what it read and wrote off the VFS's lock, and what through it:
         # the guest's reads and its writes over blocks the image had, off
-        # it (`fs::image`); its writes into holes, through it.
+        # it (`fs::image`); its writes into holes, through it. On NVMe, whose
+        # driver has an asynchronous path, a read or a write of whole mapped
+        # blocks goes to the device through the image's queue as it comes,
+        # never by the batch: there the guest's writes -- every one over
+        # blocks given ahead of it -- are among the requests served with the
+        # device asynchronously, and the batches written stay 0. Held to
+        # batches written there too, the check failed on NVMe whatever the
+        # tree.
         held = (r"image: /disk\.img let go of -- (\d+) batches read and (\d+) written off the VFS's lock, "
                 r"\d+ written through it")
         chunks = r"image: /disk\.img: (\d+) blocks given ahead of writes, (\d+) chunks refused, (\d+) blocks given back"
+        asynchronous = r"image: /disk\.img: (\d+) requests served with the device asynchronously"
         said = open(log, errors="replace").read() if args.acpi else (output_of(secs, "dmesg image:", 0) or "")
         m = re.search(held, said)
         g = re.search(chunks, said)
+        a = re.search(asynchronous, said)
         line = "\n".join(re.findall(r"(?m)^.*image: /disk\.img.*$", said)) or said[-600:]
-        pt.check("the guest's disk was read and written off the VFS's lock",
-                 m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0, line)
+        if getattr(args, "nvme_root", False):
+            pt.check("the guest's disk was served off the VFS's lock: with the device asynchronously",
+                     m is not None and a is not None and int(a.group(1)) > 0, line)
+        else:
+            pt.check("the guest's disk was read and written off the VFS's lock",
+                     m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0, line)
         # Its writes into holes: the chunk around each given to the file
         # first, its blocks zeros, and the guest's data written over them
         # off the lock -- a commit a chunk, rather than one a write. None

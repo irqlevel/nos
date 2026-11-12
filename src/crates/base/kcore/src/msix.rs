@@ -49,8 +49,12 @@ impl Drop for MsixTable {
 
 /// A registered MSI-X interrupt backed by a kernel callback slot.
 ///
-/// The assembly stub handles register save/restore and LAPIC EOI.
-/// The interrupt slot is freed when this handle is dropped.
+/// The assembly stub handles register save/restore and LAPIC EOI. Dropped,
+/// it turns its table entry away before the slot is anyone else's -- the
+/// entry masked, what it sends taken by no handler (x86's vector back at
+/// the IDT's default, arm64's LPI parked) -- and returns once no call of
+/// the handler is running; a table dropped first has turned MSI-X off
+/// already. A registration of the entry again unmasks it.
 pub struct MsixInterrupt {
     slot_handle: usize,
     vector: u8,
@@ -68,7 +72,7 @@ impl MsixInterrupt {
     /// anything else running, itself included -- registers, atomics, and
     /// locks that take interrupts off.
     ///
-    /// Returns `None` if all 16 MSI-X callback slots are in use or
+    /// Returns `None` if all 32 MSI-X callback slots are in use or
     /// if `MsixTable::enable_vector` fails (no free CPU vectors).
     pub fn register_for<T, F>(
         table: &MsixTable, msix_index: u16, target: &'static T, handler: F,

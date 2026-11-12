@@ -13,3 +13,6 @@ edition = "2021"
 kcore = { path = "../../base/kcore" }
 hvarch = { path = "../hvarch" }
 netwire = { path = "../../common/net/netwire" }
+# A Linux bzImage's header and the zero page it is handed: the one copy,
+# which hvboot loads a kernel by too.
+bzimage = { path = "../../common/boot/bzimage" }

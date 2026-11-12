@@ -122,6 +122,108 @@ fn timer(out: &mut Output) {
     }
 }
 
+/* What test_module_unload holds the loader's task sweep to
+   (sweep_module_tasks): `modtest task` starts a task and forgets its
+   handle, as a module's bug would. Its code is this module's, and it runs
+   until it is asked to stop. The loader has to ask it, and wait -- left
+   running, its next turn runs in the pages the unload has just freed. */
+
+/// The task `modtest task` leaves: 0 not started, 1 running, 2 asked to
+/// stop and stopping.
+static LEFT_TASK: AtomicU32 = AtomicU32::new(0);
+/// How long its start is waited for.
+const LEFT_TASK_START_MS: u64 = 2000;
+
+fn left_task() {
+    LEFT_TASK.store(1, Ordering::Release);
+    while !kcore::task::stopping() {
+        kcore::task::sleep_ms(1);
+    }
+    LEFT_TASK.store(2, Ordering::Release);
+}
+
+/// `modtest task`: the task started, seen running, and left.
+fn task(out: &mut Output) {
+    let Some(handle) = kcore::task::spawn("modtest-left", left_task) else {
+        let _ = writeln!(out, "modtest task: no task to be had");
+        return;
+    };
+    core::mem::forget(handle);
+    let mut ms = 0;
+    while LEFT_TASK.load(Ordering::Acquire) == 0 && ms < LEFT_TASK_START_MS {
+        kcore::task::sleep_ms(1);
+        ms += 1;
+    }
+    if LEFT_TASK.load(Ordering::Acquire) == 0 {
+        let _ = writeln!(out, "modtest task: started and never ran");
+    } else {
+        let _ = writeln!(out, "modtest task: left running");
+    }
+}
+
+/* What test_module_unload holds the net layer's sweep to
+   (rust_net_close_range): `modtest listen` takes a UDP port on the first
+   NIC and forgets the listener, as a module's bug would. Its callbacks are
+   this module's code. The unload has to take it off -- left, the next
+   datagram to the port is a call into the pages the unload frees -- and
+   then the port is free again for the next load's `modtest listen`, which
+   the test runs: refused, it says the listener outlived the module. */
+
+/// The NIC and the port `modtest listen` leaves a listener on.
+const LEFT_NIC: &str = "eth0";
+const LEFT_PORT: u16 = 7099;
+/// And the TCP port it leaves a listener on.
+const LEFT_TCP_PORT: u16 = 7098;
+
+/// What the left listener does with a datagram: nothing.
+struct Ignore;
+
+impl kcore::net::UdpHandler for Ignore {
+    fn on_frame(&self, _frame: kcore::net::Lent<'_>, _rx: &mut kcore::net::RxContext) {}
+}
+
+/// `modtest listen`: the listener made and left registered.
+fn listen(out: &mut Output) {
+    let Some(nic) = kcore::net::Nic::find(LEFT_NIC) else {
+        let _ = writeln!(out, "modtest listen: no {}", LEFT_NIC);
+        return;
+    };
+    match nic.listen(LEFT_PORT, Arc::new(Ignore)) {
+        Ok(listener) => {
+            core::mem::forget(listener);
+            let _ = writeln!(out, "modtest listen: left listening on {}:{}", LEFT_NIC, LEFT_PORT);
+        }
+        Err(e) => {
+            let _ = writeln!(out, "modtest listen: refused on {}:{}: {:?}", LEFT_NIC, LEFT_PORT, e);
+        }
+    }
+}
+
+/* What test_module_tcp_left holds the net layer's sweep of what a module
+   opened to (rust_net_close_range): `modtest tcp` listens on a TCP port and
+   forgets the listener, as a module's bug would. Not its code but its
+   handle: the unload closes it by whose it was -- left, the port stayed
+   taken for the uptime -- and the next load's `modtest tcp` takes the port
+   again, which the test runs: refused, it says the listener outlived the
+   module. */
+
+/// `modtest tcp`: a TCP listener made and left open.
+fn tcp(out: &mut Output) {
+    let Some(nic) = kcore::net::Nic::find(LEFT_NIC) else {
+        let _ = writeln!(out, "modtest tcp: no {}", LEFT_NIC);
+        return;
+    };
+    match kcore::tcp::TcpListener::bind(&nic, LEFT_TCP_PORT, 1) {
+        Ok(listener) => {
+            core::mem::forget(listener);
+            let _ = writeln!(out, "modtest tcp: left listening on {}:{}", LEFT_NIC, LEFT_TCP_PORT);
+        }
+        Err(e) => {
+            let _ = writeln!(out, "modtest tcp: refused on {}:{}: {}", LEFT_NIC, LEFT_TCP_PORT, e);
+        }
+    }
+}
+
 impl kmod::Module for ModTest {
     fn stop(&mut self) {
         let mut said = Vec::new();
@@ -243,6 +345,18 @@ fn init(params: &kmod::Params, out: &mut Output) -> Result<Box<dyn kmod::Module>
         }
         if args.trim() == "timer" {
             timer(out);
+            return;
+        }
+        if args.trim() == "listen" {
+            listen(out);
+            return;
+        }
+        if args.trim() == "task" {
+            task(out);
+            return;
+        }
+        if args.trim() == "tcp" {
+            tcp(out);
             return;
         }
         if args.trim() == "bus" {
@@ -523,6 +637,22 @@ fn ipc(keep: &Mutex<Option<Mailbox>>) -> core::result::Result<(), &'static str> 
             return Err("an echo received in pieces");
         }
     }
+    /* A message past one block of the heap, to a mailbox read with `recv`:
+     * dropped, said in the log, and the next one taken -- left first, it
+     * once wedged the mailbox, every later `recv` finding it again. A
+     * module cannot send one (its send is of one buffer); the shell's ping
+     * makes one in pieces, and waits a moment for an answer it will not
+     * get. */
+    {
+        let big = Mailbox::new(Limits { messages: 4, bytes: 2 << 20 }).map_err(|_| "a mailbox for a large message")?;
+        big.register("modtest.big", Scope::Host).map_err(|_| "the large one's name")?;
+        kcore::cmd::dispatch("ipc ping modtest.big count=1 bytes=600000 timeout=100", &mut |_: &[u8]| {});
+        mb.send(big.addr(), 9, 2, b"after").map_err(|_| "a message after the large one")?;
+        match big.recv(Duration::from_secs(1)) {
+            Some(m) if m.tag == 9 && m.reference == 2 && m.data == b"after" => {}
+            _ => return Err("the message after one too large for recv"),
+        }
+    }
     let gone = Mailbox::new(ROOMY).map_err(|_| "a mailbox")?.addr();
     if mb.send(gone, 1, 0, b"x") != Err(E::Gone) {
         return Err("a message to a mailbox closed");
@@ -540,7 +670,7 @@ fn ipc(keep: &Mutex<Option<Mailbox>>) -> core::result::Result<(), &'static str> 
     if mb.send(s, 1, 0, b"") != Ok(()) || mb.send(s, 1, 1, b"") != Ok(()) || mb.send(s, 1, 2, b"") != Err(E::Full) {
         return Err("a full mailbox");
     }
-    if !list("modtest.").iter().any(|n| n.name == "modtest.ipc" && n.addr == mb.addr()) {
+    if !list("modtest.").map_err(|_| "the names listed")?.iter().any(|n| n.name == "modtest.ipc" && n.addr == mb.addr()) {
         return Err("the module's name listed");
     }
     /* Left open on purpose: the sweep after the unload closes it */

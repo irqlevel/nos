@@ -7,10 +7,22 @@ use ffi::sync;
  * unlock is `unsafe` at a call site -- the one place that needs it is the
  * guard's own `Deref`, below, once per lock type.
  *
- * Guards are values: two may be held at once and dropped in either order
- * (`drop(a)` before `b` goes out of scope), and a function that takes a lock
- * on its caller's behalf returns the guard. A lock that guards nothing --
- * one that only serialises a stretch of code -- is a lock over `()`. */
+ * Guards are values: two may be held at once, and a function that takes a
+ * lock on its caller's behalf returns the guard. The order they are dropped
+ * in is free for a `Mutex`, a `PreemptSpinLock` and a `TryLock` -- a count,
+ * or nothing, is all they give back -- and not for the two that save the
+ * interrupt flag, a `SpinLock` and an `IrqSpinLock`: each puts back the flag
+ * as it found it, so the one taken first, released first, turns interrupts
+ * (and preemption) on under the other, and the other's release then leaves
+ * them off. Those are released innermost first; the release of one that
+ * finds interrupts on panics, naming it, rather than leave a deadlock for
+ * the next interrupt that takes the lock (`kernel_irq_restore`).
+ *
+ * None of the guards but a `TryLock`'s is `Send`: a `Mutex`'s belongs to
+ * the task that took it, and the spin locks' give back what they took of
+ * this CPU -- its interrupt flag -- and of this task -- its preemption
+ * count. A lock that guards nothing -- one that only serialises a stretch
+ * of code -- is a lock over `()`. */
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
@@ -18,7 +30,9 @@ use core::ops::{Deref, DerefMut};
 /// The kernel's mutex: a taker that finds it held gives its CPU to any other
 /// task that can run there, and spins only when none can (kernel/mutex.cpp)
 /// -- so a mutex held across a long call costs its waiters' CPUs whatever
-/// else they had to do. Task context only.
+/// else they had to do. Task context only. It has no owner and checks none:
+/// a second `lock` by its holder, or one made under a spinlock while the
+/// holder is off its CPU, yield-spins for good with nothing to report it.
 pub struct Mutex<T> {
     handle: usize,
     data: UnsafeCell<T>,
@@ -223,6 +237,60 @@ impl Drop for Event {
     }
 }
 
+/// How long a spin lock below is waited for before the wait is a panic that
+/// names it: a holder that long has deadlocked, or died holding it. The
+/// ten seconds of the kernel's own locks' watchdog (watchdog.cpp), which
+/// walks the C++ locks alone: one of these -- an atomic flag -- it never
+/// saw, and a deadlock on one was a CPU spinning with interrupts off that
+/// nothing named, found, if at all, as another CPU's TLB shootdown gone
+/// unanswered ten seconds later.
+const SPIN_REPORT_NS: u64 = 10 * crate::consts::NS_PER_SEC;
+
+/// Spins between two looks at the clock while a lock is waited for: the
+/// look is a call, and the wait's alone -- a lock taken at the first try
+/// pays nothing.
+const SPINS_PER_LOOK: u32 = 1 << 12;
+
+/// `held` taken: at once, or after spinning while another has it -- and a
+/// panic naming the lock and where it was waited for, once that has lasted
+/// `SPIN_REPORT_NS`.
+#[inline]
+#[track_caller]
+fn take(held: &AtomicBool, kind: &'static str) {
+    if !held.swap(true, Ordering::Acquire) {
+        return;
+    }
+    spin(held, kind, core::panic::Location::caller());
+}
+
+#[cold]
+#[inline(never)]
+fn spin(held: &AtomicBool, kind: &'static str, at: &'static core::panic::Location<'static>) {
+    let mut since: Option<u64> = None;
+    let mut spins: u32 = 0;
+    loop {
+        core::hint::spin_loop();
+        /* Looked at before it is swapped for: a waiter that writes the line
+         * while it is held only takes it from the holder */
+        if !held.load(Ordering::Relaxed) && !held.swap(true, Ordering::Acquire) {
+            return;
+        }
+        spins = spins.wrapping_add(1);
+        if spins % SPINS_PER_LOOK != 0 {
+            continue;
+        }
+        let now = crate::time::boot_time_ns();
+        match since {
+            None => since = Some(now),
+            Some(from) if now.saturating_sub(from) >= SPIN_REPORT_NS => {
+                panic!("{} at {:p} held {} s and more, waited for at {}:{}", kind, held,
+                       SPIN_REPORT_NS / crate::consts::NS_PER_SEC, at.file(), at.line());
+            }
+            Some(_) => {}
+        }
+    }
+}
+
 /// A spin lock made of an atomic flag, with interrupts and preemption off
 /// while it is held.
 ///
@@ -235,6 +303,7 @@ impl Drop for Event {
 ///
 /// Nothing that sleeps may run while it is held, and nothing that takes
 /// longer than a few hundred instructions: interrupts are off on this CPU.
+/// A wait for it that lasts ten seconds is a panic naming it (`take`).
 pub struct IrqSpinLock<T> {
     held: AtomicBool,
     data: UnsafeCell<T>,
@@ -248,14 +317,13 @@ impl<T> IrqSpinLock<T> {
         Self { held: AtomicBool::new(false), data: UnsafeCell::new(data) }
     }
 
+    #[track_caller]
     pub fn lock(&self) -> IrqSpinGuard<'_, T> {
         /* Interrupts off first: a CPU that takes an interrupt while holding
          * this, and whose handler takes it again, deadlocks against itself. */
         let flags = ffi::cpu::kernel_irq_save();
-        while self.held.swap(true, Ordering::Acquire) {
-            core::hint::spin_loop();
-        }
-        IrqSpinGuard { lock: self, flags }
+        take(&self.held, "an IrqSpinLock");
+        IrqSpinGuard { lock: self, flags, _not_send: PhantomData }
     }
 
     /// One attempt, no spin: None when someone else has it. For the panic
@@ -267,7 +335,7 @@ impl<T> IrqSpinLock<T> {
             unsafe { ffi::cpu::kernel_irq_restore(flags) };
             None
         } else {
-            Some(IrqSpinGuard { lock: self, flags })
+            Some(IrqSpinGuard { lock: self, flags, _not_send: PhantomData })
         }
     }
 
@@ -287,6 +355,9 @@ impl<T> IrqSpinLock<T> {
 pub struct IrqSpinGuard<'a, T> {
     lock: &'a IrqSpinLock<T>,
     flags: usize,
+    /// The flags are this CPU's and the preemption count this task's: the
+    /// guard is dropped where it was taken.
+    _not_send: PhantomData<*const ()>,
 }
 
 impl<T> Deref for IrqSpinGuard<'_, T> {
@@ -310,8 +381,10 @@ impl<T> Drop for IrqSpinGuard<'_, T> {
 }
 
 /// A spin lock made of an atomic flag that holds preemption off while it is
-/// taken -- the kernel's own `RawSpinLock`, in the shape Rust can put in a
-/// `static`.
+/// taken -- as the kernel's own `RawSpinLock` does, by the task's count it
+/// raised (`cpu::PreemptOff`): taken off a task stack it raises none, where
+/// a plain preempt_disable was a BUG_ON -- in the shape Rust can put in a
+/// `static`. A wait for it that lasts ten seconds is a panic naming it.
 ///
 /// Interrupts stay **on**. That is what makes it the wrong lock for anything
 /// a hard interrupt handler touches (use [`IrqSpinLock`] there) and the right
@@ -333,17 +406,20 @@ impl<T> PreemptSpinLock<T> {
         Self { held: AtomicBool::new(false), data: UnsafeCell::new(data) }
     }
 
+    #[track_caller]
     pub fn lock(&self) -> PreemptSpinGuard<'_, T> {
-        ffi::cpu::kernel_preempt_disable();
-        while self.held.swap(true, Ordering::Acquire) {
-            core::hint::spin_loop();
-        }
-        PreemptSpinGuard { lock: self }
+        let off = crate::cpu::PreemptOff::take();
+        take(&self.held, "a PreemptSpinLock");
+        PreemptSpinGuard { lock: self, _off: off }
     }
 }
 
 pub struct PreemptSpinGuard<'a, T> {
     lock: &'a PreemptSpinLock<T>,
+    /// Preemption held off for the task that took it, given back after
+    /// the lock is (a field's drop comes after the guard's own): the guard
+    /// is not `Send`, as `PreemptOff` is not, and is dropped by that task.
+    _off: crate::cpu::PreemptOff,
 }
 
 impl<T> Deref for PreemptSpinGuard<'_, T> {
@@ -362,7 +438,6 @@ impl<T> DerefMut for PreemptSpinGuard<'_, T> {
 impl<T> Drop for PreemptSpinGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.held.store(false, Ordering::Release);
-        unsafe { ffi::cpu::kernel_preempt_enable() };
     }
 }
 

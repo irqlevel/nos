@@ -62,6 +62,15 @@ impl Partition {
     }
 }
 
+/// A disk's table as read: the partitions in it, and those passed over --
+/// each by its number, and why: one that runs past the disk's end (an image
+/// put on a disk smaller than it), or ends before it begins.
+#[derive(Debug, Default)]
+pub struct Table {
+    pub parts: Vec<Partition>,
+    pub passed_over: Vec<(u32, String)>,
+}
+
 fn u16_at(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([b[o], b[o + 1]])
 }
@@ -72,42 +81,49 @@ fn u64_at(b: &[u8], o: usize) -> u64 {
     u64::from(u32_at(b, o)) | (u64::from(u32_at(b, o + 4)) << 32)
 }
 
+/// Why a partition from `first` to `last`, inclusive, is passed over on a
+/// disk of `sectors`.
+fn past_end(first: u64, last: u64, sectors: u64) -> String {
+    alloc::format!("sectors {} to {}, past the disk's end at {}", first, last, sectors)
+}
+
 /// The partitions of a disk of `sectors` sectors, `read` reading whole
-/// sectors from a sector on. An empty list for a disk with no table.
+/// sectors from a sector on. No partitions for a disk with no table.
 pub fn partitions(sectors: u64, read: &mut dyn FnMut(u64, &mut [u8]) -> Result<(), String>)
-    -> Result<Vec<Partition>, String>
+    -> Result<Table, String>
 {
     if sectors < 2 {
-        return Ok(Vec::new());
+        return Ok(Table::default());
     }
     let mut mbr = [0u8; SECTOR];
     read(0, &mut mbr)?;
     if u16_at(&mbr, 510) != MBR_SIGNATURE {
-        return Ok(Vec::new());
+        return Ok(Table::default());
     }
-    let entries: Vec<(u8, u64, u64)> = (0..4)
-        .map(|i| {
-            let e = &mbr[MBR_ENTRIES + i * MBR_ENTRY_BYTES..MBR_ENTRIES + (i + 1) * MBR_ENTRY_BYTES];
-            (e[4], u64::from(u32_at(e, 8)), u64::from(u32_at(e, 12)))
-        })
-        .collect();
+    let entries: [(u8, u64, u64); 4] = core::array::from_fn(|i| {
+        let e = &mbr[MBR_ENTRIES + i * MBR_ENTRY_BYTES..MBR_ENTRIES + (i + 1) * MBR_ENTRY_BYTES];
+        (e[4], u64::from(u32_at(e, 8)), u64::from(u32_at(e, 12)))
+    });
     if entries.iter().any(|e| e.0 == MBR_PROTECTIVE) {
         return gpt(sectors, read);
     }
-    let mut parts = Vec::new();
+    let mut table = Table::default();
     for (i, &(kind, first, count)) in entries.iter().enumerate() {
+        let number = i as u32 + 1;
         if kind == 0 || count == 0 || MBR_EXTENDED.contains(&kind) {
             continue;
         }
         if first.checked_add(count).is_none_or(|end| end > sectors) {
+            /* Both from 32-bit fields: no overflow. */
+            table.passed_over.push((number, past_end(first, first + count - 1, sectors)));
             continue;
         }
-        parts.push(Partition { number: i as u32 + 1, first, sectors: count, kind: Kind::Mbr(kind) });
+        table.parts.push(Partition { number, first, sectors: count, kind: Kind::Mbr(kind) });
     }
-    Ok(parts)
+    Ok(table)
 }
 
-fn gpt(sectors: u64, read: &mut dyn FnMut(u64, &mut [u8]) -> Result<(), String>) -> Result<Vec<Partition>, String> {
+fn gpt(sectors: u64, read: &mut dyn FnMut(u64, &mut [u8]) -> Result<(), String>) -> Result<Table, String> {
     let mut h = [0u8; SECTOR];
     read(1, &mut h)?;
     if &h[0..8] != GPT_SIGNATURE {
@@ -148,7 +164,7 @@ fn gpt(sectors: u64, read: &mut dyn FnMut(u64, &mut [u8]) -> Result<(), String>)
         return Err(String::from("the GPT array's CRC does not match"));
     }
 
-    let mut parts = Vec::new();
+    let mut table = Table::default();
     for i in 0..count as usize {
         let e = &array[i * entry_size as usize..i * entry_size as usize + GPT_ENTRY_MIN as usize];
         let mut kind = [0u8; 16];
@@ -156,11 +172,17 @@ fn gpt(sectors: u64, read: &mut dyn FnMut(u64, &mut [u8]) -> Result<(), String>)
         if kind == [0; 16] {
             continue;
         }
+        let number = i as u32 + 1;
         let (first, last) = (u64_at(e, 32), u64_at(e, 40));
-        if first > last || last >= sectors {
+        if first > last {
+            table.passed_over.push((number, alloc::format!("its last sector, {}, before its first, {}", last, first)));
             continue;
         }
-        parts.push(Partition { number: i as u32 + 1, first, sectors: last - first + 1, kind: Kind::Gpt(kind) });
+        if last >= sectors {
+            table.passed_over.push((number, past_end(first, last, sectors)));
+            continue;
+        }
+        table.parts.push(Partition { number, first, sectors: last - first + 1, kind: Kind::Gpt(kind) });
     }
-    Ok(parts)
+    Ok(table)
 }

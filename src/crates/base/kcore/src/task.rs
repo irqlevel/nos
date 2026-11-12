@@ -12,7 +12,9 @@ struct Start<C> {
 /// A task that is handed `ctx` by value, on every CPU `affinity` names (any,
 /// when it names none). The one place a start is boxed, and the one place it
 /// is unboxed: in the task, or here if no task was made to hand it to. `ctx`
-/// is the task's from then on, and dropped when `entry` returns.
+/// is the task's from then on, and dropped when `entry` returns. None when
+/// the kernel has no task to give; the box of the start is the heap's, a
+/// failure of which panics as every infallible allocation does.
 fn spawn_owned<C: Send + 'static>(
     name: &str, affinity: Option<u64>, ctx: C, entry: fn(C),
 ) -> Option<TaskHandle> {

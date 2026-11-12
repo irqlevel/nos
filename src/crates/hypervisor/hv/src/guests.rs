@@ -1,57 +1,36 @@
 //! Guests of a few bytes that the hypervisor carries to show itself working.
 //!
-//! Each is a handful of instructions -- assembled once with NASM and kept
-//! here as bytes beside the source they came from -- put in a VM of its own,
-//! run until it stops, and checked against what it was told to do. They are
-//! the first two rungs of `plans/03-hypervisor.md`, a guest that exits where
-//! it was told to and a guest in long mode under nested paging, and three
-//! more that show the host is still the host when a guest goes wrong on
-//! purpose:
-//!
-//!   exits      port I/O both ways and CPUID, answered by the host and read
-//!              back out of the guest's memory
-//!   hypercall  memory above 4 GiB through its own page table, then a
-//!              hypercall with every register across it both ways
-//!   fault      a write to memory its page table maps and the nested one
-//!              does not: stopped at the nested table, the address named
-//!   absent     a read of a device the platform does not have -- AMD's FCH,
-//!              which Linux on a Zen CPU reads at a fixed address -- answered
-//!              with all ones, and a write to it stopped
-//!   mmio       a device's registers in the MMIO window stored to and loaded
-//!              from by the forms of `mov` Linux's accessors are -- an
-//!              immediate of each size, REX registers and a high byte,
-//!              `movzx` and `movsx` -- each access a nested fault the host
-//!              decodes and performs, what came back checked in RAM
-//!   triple     a triple fault stops the guest, not the CPU
-//!   refused    a VMCB that breaks one of `vmrun`'s rules is never handed
-//!              to the CPU, and the refusal names the rule -- where the
-//!              CPU's own answer would be VMEXIT_INVALID and nothing more
-//!   spin       `cli; jmp $` does not keep the host's interrupts out, and
-//!              the host stops it when its time is up
-//!   tpr        CR8, the task priority register, written to 15 and read
-//!              back: the guest's own shadow, not the host CPU's, which
-//!              would otherwise keep every interrupt off that CPU
-//!   asid       three VMs on one CPU, each reading its own page at one
-//!              address: two taking turns never read each other's, and the
-//!              third, given an ASID one of them had, reads its own too --
-//!              what a TLB entry left under a reused ASID would get wrong
-//!   smp        a guest of two CPUs, each a task on a host CPU of its own:
-//!              the first starts the second -- INIT and a start-up IPI, as
-//!              a kernel does -- which comes up in real mode, climbs to long
-//!              mode through protected mode, and sends the first an IPI;
-//!              then the first's local APIC timer interrupts it
+//! Each is a handful of instructions -- assembled once with NASM, or clang
+//! where a listing says so, and kept here as bytes beside the source they
+//! came from -- put in a VM of its own, run until it stops, and checked
+//! against what it was told to do. They began as the first two rungs of
+//! `plans/03-hypervisor.md` -- a guest that exits where it was told to, and
+//! a guest in long mode under nested paging -- and grew a guest for each
+//! thing the hypervisor does that a guest can see go wrong: the host still
+//! the host when a guest goes wrong on purpose, two CPUs and their IPIs, the
+//! IO-APIC, posted interrupts, the CPU's own state switched between guests.
+//! Which there are is `names()`, and what each runs and is held to is the
+//! table in docs/hypervisor.md ("The built-in guests") -- kept there, and
+//! not here as well, where a second list fell behind.
 //!
 //! Every one starts in long mode with paging on, as a 64-bit Linux kernel
-//! is started -- but for the second CPU of `smp`, which starts where a
-//! start-up IPI starts every CPU, in real mode. QEMU's TCG before 9.2 does
-//! not put the accesses of a guest with paging off through the nested table
-//! at all -- it takes a guest physical address for a host one -- so a
-//! real-mode guest there runs out of the host's memory: `smp`, like a Linux
-//! guest of more than one CPU, needs 9.2 or later under TCG (`hv-test.py`
-//! refuses an older one), and a CPU's own extension anywhere else.
+//! is started -- but for the second CPU of `smp`, `posted`, `avx` and
+//! `pkru`, which starts where a start-up IPI starts every CPU, in real
+//! mode. QEMU's TCG before 9.2 does not put the accesses of a guest with
+//! paging off through the nested table at all -- it takes a guest physical
+//! address for a host one -- so a real-mode guest there runs out of the
+//! host's memory: those four, like a Linux guest of more than one CPU, need
+//! 9.2 or later under TCG (`hv-test.py` refuses an older one; `hv run`
+//! typed by hand does not), and a CPU's own extension anywhere else.
+//!
+//! A runner keeps its vCPUs and VMs where they were made, on the heap
+//! (`second_cpu`, `vm_onto`), and its frame is words: holding them by value
+//! -- popped, moved into a task's context, moved again -- the runners had
+//! 22 to 29 KiB of frame, of the 60 KiB a task's stack has.
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::fmt::Write;
 
 use hvarch::Result;
@@ -139,6 +118,11 @@ struct Run {
     serial: String,
     stop: Stop,
     ns: u64,
+    /// How long it was let run.
+    budget_ms: u64,
+    /// Whether its whole state could be read as it stopped: under VT-x only
+    /// on the CPU whose VMCS it is -- a task moved since cannot.
+    whole: bool,
 }
 
 /// What the host answers the hypercall with, register by register in the
@@ -177,6 +161,8 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
         serial: String::new(),
         stop: Stop::Budget,
         ns: 0,
+        budget_ms,
+        whole: false,
     };
     let start = time::boot_time_ns();
     let budget = budget_ms * kcore::consts::NS_PER_MS;
@@ -226,7 +212,9 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
                     run.port_in += 1;
                 } else {
                     let byte = v.save().rax as u8;
-                    if run.said.len() < SAID_MAX {
+                    /* Kept up to its cap, and -- as the serial port's -- with
+                     * no allocation that could fail by panicking. */
+                    if run.said.len() < SAID_MAX && run.said.try_reserve(1).is_ok() {
                         run.said.push(if byte.is_ascii_graphic() || byte == b' ' { byte as char } else { '.' });
                     }
                     run.port_out += 1;
@@ -310,7 +298,7 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
             Exit::Exception { vector, error } => break Stop::Exception { vector, error, rip },
             Exit::MachineCheck => break Stop::MachineCheck { rip },
             Exit::Invalid => break Stop::Invalid,
-            Exit::Cr8 { write, gpr } => {
+            Exit::Cr8 { write, gpr: Some(gpr) } => {
                 vm.vcpu_mut().cr8_access(write, gpr);
                 run.cr8 += 1;
             }
@@ -319,8 +307,9 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
     };
     run.ns = time::boot_time_ns().saturating_sub(start);
     /* Nothing enters the guest again: its state as that last exit left it,
-     * whole, for a check that fails to show. */
-    vm.vcpu_mut().read_whole_state();
+     * whole, for a check that fails to show -- and whether it could be read,
+     * for a check that reads it (`check_fault`). */
+    run.whole = vm.vcpu_mut().read_whole_state();
     run
 }
 
@@ -582,14 +571,24 @@ struct Tally {
     not_on: Option<u32>,
 }
 
-fn asid_vm(machine: &Machine, which: usize) -> core::result::Result<Vm, String> {
+/// VM `which` of the asid check, onto `vms` (`vm_onto`).
+fn asid_vm(machine: &Machine, which: usize, vms: &mut Vec<Vm>) -> core::result::Result<(), String> {
     let mut code = ASID_CODE;
     code[ASID_ROUNDS_AT..ASID_ROUNDS_AT + 4].copy_from_slice(&ASID_ROUNDS.to_le_bytes());
-    let mut vm = Vm::new(machine, ALL_EXCEPTIONS).map_err(|e| alloc::format!("no VM: {}", e))?;
-    board(&mut vm, &code).map_err(|e| alloc::format!("no guest: {}", e))?;
+    let vm = vm_onto(machine, ALL_EXCEPTIONS, vms)?;
+    board(vm, &code).map_err(|e| alloc::format!("no guest: {}", e))?;
     vm.memory_mut().write_obj(ASID_MARKER_AT, &ASID_MARKERS[which])
         .map_err(|e| alloc::format!("no marker: {}", e))?;
-    Ok(vm)
+    Ok(())
+}
+
+/// A VM made onto the end of `vms`, and kept there: a `Vm` is some 4 KiB,
+/// and a runner that held its VMs by value -- and the `Result`s they came
+/// through -- had 16 KiB of frame, beneath which `Vm::new`'s own is.
+fn vm_onto<'a>(machine: &Machine, exceptions: u32, vms: &'a mut Vec<Vm>) -> core::result::Result<&'a mut Vm, String> {
+    vms.try_reserve(1).map_err(|_| String::from("no VM: out of memory"))?;
+    vms.push(Vm::new(machine, exceptions).map_err(|e| alloc::format!("no VM: {}", e))?);
+    vms.last_mut().ok_or_else(|| String::from("no VM"))
 }
 
 /// Into `vm` until its next CPUID, which is answered, or its halt: true
@@ -644,26 +643,28 @@ fn asid_check(machine: &Machine, tally: &mut Tally) -> core::result::Result<Stri
     let _limit = hvarch::x86::svm::AsidLimit::new(ASID_LIMIT);
     let (cpu, before) = hvarch::x86::svm::asid_generation().ok_or_else(|| String::from("no ASIDs on this CPU"))?;
 
-    let mut a = asid_vm(machine, 0)?;
-    let mut b = asid_vm(machine, 1)?;
+    let mut vms = Vec::new();
+    asid_vm(machine, 0, &mut vms)?;
+    asid_vm(machine, 1, &mut vms)?;
+    let [a, b] = &mut vms[..] else { return Err(String::from("not two VMs")) };
     let (mut a_done, mut b_done) = (false, false);
     while !(a_done && b_done) {
         if !a_done {
-            a_done = asid_step(&mut a, machine, tally, deadline)?;
+            a_done = asid_step(a, machine, tally, deadline)?;
         }
         if !b_done {
-            b_done = asid_step(&mut b, machine, tally, deadline)?;
+            b_done = asid_step(b, machine, tally, deadline)?;
         }
     }
-    asid_found(&a, 0)?;
-    asid_found(&b, 1)?;
+    asid_found(a, 0)?;
+    asid_found(b, 1)?;
     let had = [a.vcpu().asid(), b.vcpu().asid()];
-    drop(a);
-    drop(b);
+    vms.clear();
 
-    let mut c = asid_vm(machine, 2)?;
-    while !asid_step(&mut c, machine, tally, deadline)? {}
-    asid_found(&c, 2)?;
+    asid_vm(machine, 2, &mut vms)?;
+    let [c] = &mut vms[..] else { return Err(String::from("not one VM")) };
+    while !asid_step(c, machine, tally, deadline)? {}
+    asid_found(c, 2)?;
     let given = c.vcpu().asid();
 
     /* VT-x's ASID is the VPID, held for a guest's life and given back at its
@@ -681,7 +682,8 @@ fn asid_check(machine: &Machine, tally: &mut Tally) -> core::result::Result<Stri
 
     let (cpu_after, after) = hvarch::x86::svm::asid_generation().ok_or_else(|| String::from("no ASIDs on this CPU"))?;
     if tally.cpus != 1u64 << cpu || cpu_after != cpu {
-        return Ok(String::from("each read its own page; on more than one CPU, so the end of a generation was not what C was given"));
+        return Err(alloc::format!("they ran on cpus {:#x}, the ASIDs' generations read on cpu {} and {}: not one CPU, \
+                                   whose generations are what is checked", tally.cpus, cpu, cpu_after));
     }
     if after == before {
         return Err(alloc::format!("with {} ASIDs a generation, three VMs ended none", ASID_LIMIT));
@@ -757,8 +759,9 @@ fn run_several(machine: &Machine, spec: &SeveralSpec, out: &mut dyn Write) -> bo
 /// The names of the built-in guests, for a command's help.
 pub fn names() -> impl Iterator<Item = &'static str> {
     GUESTS.iter().map(|g| g.name).chain(SEVERAL.iter().map(|g| g.name))
-        .chain([SMP_NAME, POSTED_NAME, IOAPIC_NAME, APICV_NAME, PVEOI_NAME, DEBUG_NAME, CR4_NAME, MSR_NAME, DR_NAME,
-                AVX_NAME, TSCAUX_NAME, SPEC_NAME, PKRU_NAME]
+        .chain([SMP_NAME, POSTED_NAME, IOAPIC_NAME, APICV_NAME, PVEOI_NAME, KGS_NAME, CACHE_NAME, DEBUG_NAME, INSTR_NAME,
+                CR4_NAME,
+                MSR_NAME, DR_NAME, AVX_NAME, TSCAUX_NAME, SPEC_NAME, PKRU_NAME]
             .into_iter())
 }
 
@@ -768,10 +771,11 @@ pub fn names() -> impl Iterator<Item = &'static str> {
 /// no such guest; otherwise whether it did what it was told.
 ///
 /// Each guest's runner is a frame of its own (`#[inline(never)]`), there
-/// only while that guest runs. Inlined here, the runners' frames came to
+/// only while that guest runs, and keeps its vCPUs and VMs on the heap
+/// (`second_cpu`, `vm_onto`): inlined here, the runners' frames came to
 /// 17.6 KiB under every guest, and with the `asid` guest's -- its VMs made
-/// beneath them -- to 57 KiB of the task's 64: one more runner's frame took
-/// the task off the end of its stack.
+/// beneath them -- to 57 KiB of the task's 64, one more runner's frame
+/// taking the task off the end of its stack.
 pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Option<bool> {
     if name == SMP_NAME {
         return Some(run_smp(machine, &SMP_GUEST, out));
@@ -788,8 +792,17 @@ pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Optio
     if name == PVEOI_NAME {
         return Some(run_ioapic(machine, &PVEOI_GUEST, out));
     }
+    if name == KGS_NAME {
+        return Some(run_smp(machine, &KGS_GUEST, out));
+    }
+    if name == CACHE_NAME {
+        return Some(run_ioapic(machine, &CACHE_GUEST, out));
+    }
     if name == DEBUG_NAME {
-        return Some(run_debug(machine, out));
+        return Some(run_one_cpu(machine, &DEBUG_GUEST, out));
+    }
+    if name == INSTR_NAME {
+        return Some(run_one_cpu(machine, &INSTR_GUEST, out));
     }
     if name == CR4_NAME {
         return Some(run_cr4(machine, out));
@@ -822,7 +835,10 @@ pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Optio
 #[inline(never)]
 fn run_spec(machine: &Machine, spec: &Spec, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", spec.name, spec.about);
-    let mut vm = match Vm::new(machine, spec.exceptions).and_then(|mut vm| (spec.build)(&mut vm).map(|_| vm)) {
+    let mut vms = Vec::new();
+    let made = vm_onto(machine, spec.exceptions, &mut vms)
+        .and_then(|vm| (spec.build)(vm).map(|_| vm).map_err(|e| alloc::format!("{}", e)));
+    let vm = match made {
         Ok(vm) => vm,
         Err(e) => {
             let _ = writeln!(out, "hv: guest {} FAILED -- could not be made: {}", spec.name, e);
@@ -830,7 +846,7 @@ fn run_spec(machine: &Machine, spec: &Spec, out: &mut dyn Write) -> bool {
         }
     };
 
-    let r = run(&mut vm, machine, spec.budget_ms);
+    let r = run(vm, machine, spec.budget_ms);
     if let (Stop::Refused(Refusal::NotOn(cpu)), 0) = (r.stop, r.cpus) {
         /* Not a finding about the guest: nothing ran. */
         let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first",
@@ -850,34 +866,10 @@ fn run_spec(machine: &Machine, spec: &Spec, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "  exits      {} port in, {} port out, {} cpuid, {} hypercall, {} host interrupt",
                      r.port_in, r.port_out, r.cpuid, r.hypercall, r.host);
     let _ = write!(out, "  stopped    ");
-    let _ = match r.stop {
-        Stop::Halted { rip } => writeln!(out, "hlt at {:#x}", rip),
-        Stop::Fault { gpa, error, rip } => writeln!(out, "nested page fault at gpa {:#x}, error {:#x}, rip {:#x}", gpa, error, rip),
-        Stop::Shutdown { rip } => writeln!(out, "shutdown (triple fault) at {:#x}", rip),
-        Stop::Exception { vector, error, rip } => match error {
-            Some(code) => writeln!(out, "exception {} error {:#x} at {:#x}", vector, code, rip),
-            None => writeln!(out, "exception {} at {:#x}", vector, rip),
-        },
-        Stop::MachineCheck { rip } => writeln!(out, "MACHINE CHECK while the guest ran, at {:#x}", rip),
-        Stop::Budget => writeln!(out, "by the host, after {} ms", spec.budget_ms),
-        Stop::Refused(Refusal::Vmcb(rule)) => writeln!(out, "not entered -- the VMCB breaks a rule: {}", rule),
-        Stop::Refused(Refusal::NotOn(cpu)) => writeln!(out, "not entered -- the extension went off for cpu {}", cpu),
-        Stop::Refused(Refusal::FiveLevelPaging(cpu)) => writeln!(
-            out, "not entered -- cpu {} translates with five levels, and a nested table of four would be walked as five", cpu),
-        Stop::Refused(Refusal::Flush(cpu)) => writeln!(
-            out, "not entered -- cpu {} would not drop what it had cached through the nested table (INVEPT)", cpu),
-        Stop::Refused(Refusal::NotItsMemory) => writeln!(
-            out, "not entered -- the CPU was handed memory other than its guest's"),
-        Stop::Refused(Refusal::Controls { cpu, field, missing }) => writeln!(
-            out, "not entered -- cpu {} will not take the {} controls {:#x}, which the host needs", cpu, field,
-            missing),
-        Stop::Refused(Refusal::Xstate { cpu, xcr0 }) => writeln!(
-            out, "not entered -- cpu {} does not switch every component of the guest's XCR0, {:#x}", cpu, xcr0),
-        Stop::Invalid => writeln!(out, "the CPU refused the entry (VMEXIT_INVALID on AMD-V, a VM-entry failure on VT-x)"),
-        Stop::Unexpected { exit, rip } => writeln!(out, "an exit with no answer here: {:?} at {:#x}", exit, rip),
-    };
+    let _ = describe(&r.stop, spec.budget_ms, out);
+    let _ = writeln!(out);
 
-    match (spec.check)(&vm, &r) {
+    match (spec.check)(vm, &r) {
         Ok(checked) => {
             if !checked.is_empty() {
                 let _ = writeln!(out, "  checked    {}", checked);
@@ -1076,22 +1068,38 @@ impl Host for Quiet {
     }
 }
 
-/// The second CPU of the smp guest, on a task of its own.
+/// The second CPU of the smp guest, on a task of its own: in a vector of
+/// its own, where `LinuxGuest::new` put it (`second_cpu`).
 struct SmpAp {
     guest: Arc<LinuxGuest>,
-    cpu: GuestCpu,
+    cpus: Vec<GuestCpu>,
     machine: Arc<Machine>,
     deadline: u64,
     counts: Arc<kcore::sync::Mutex<Counts>>,
 }
 
 fn smp_ap(run: SmpAp) {
-    let SmpAp { guest, mut cpu, machine, deadline, counts } = run;
-    let c = guest.run(&mut cpu, &machine, deadline, &Quiet);
-    *counts.lock() = c;
+    let SmpAp { guest, mut cpus, machine, deadline, counts } = run;
+    if let Some(cpu) = cpus.first_mut() {
+        *counts.lock() = guest.run(cpu, &machine, deadline, &Quiet);
+    }
     /* Its CPU goes in this task, before the guest: under VT-x the VMCS is
      * cleared off its host CPU from task context. */
-    drop(cpu);
+    drop(cpus);
+}
+
+/// A guest's CPUs past its first, out of `cpus` into a vector of their own
+/// -- for a task of their own -- moved as they lie, from one heap buffer to
+/// the other: a `GuestCpu` is some 4.8 KiB, and the runners held four to
+/// six of them by value -- popped, moved into a task's context, moved again
+/// -- 22 to 29 KiB of frame, of the 60 KiB a task's stack has. None for a
+/// guest of one CPU, and with no memory for the vector.
+fn second_cpu(cpus: &mut Vec<GuestCpu>) -> Option<Vec<GuestCpu>> {
+    let rest = cpus.len().checked_sub(1).filter(|&n| n > 0)?;
+    let mut second = Vec::new();
+    second.try_reserve_exact(rest).ok()?;
+    second.extend(cpus.drain(1..));
+    Some(second)
 }
 
 /// The guests' machine for the smp guest: `board`'s tables in memory it
@@ -1157,9 +1165,9 @@ fn run_smp(machine: &Arc<Machine>, spec: &SmpGuest, out: &mut dyn Write) -> bool
         Ok(made) => made,
         Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
     };
-    let Some(ap) = cpus.pop() else { return fail(out, "no second CPU") };
-    let Some(mut bsp) = cpus.pop() else { return fail(out, "no first CPU") };
-    if let Err(e) = smp_board(guest.memory(), &mut bsp, spec.bsp, spec.ap) {
+    let Some(ap) = second_cpu(&mut cpus) else { return fail(out, "no second CPU") };
+    let Some(bsp) = cpus.first_mut() else { return fail(out, "no first CPU") };
+    if let Err(e) = smp_board(guest.memory(), &mut *bsp, spec.bsp, spec.ap) {
         return fail(out, &alloc::format!("could not be made: {}", e));
     }
     guest.set_apicv(spec.apicv);
@@ -1173,13 +1181,13 @@ fn run_smp(machine: &Arc<Machine>, spec: &SmpGuest, out: &mut dyn Write) -> bool
     let ap_cpu = (0..u64::BITS).find(|&c| c != here && enabled & (1u64 << c) != 0).unwrap_or(here);
     let start = time::boot_time_ns();
     let deadline = start.saturating_add(SMP_BUDGET_MS * kcore::consts::NS_PER_MS);
-    let run = SmpAp { guest: guest.clone(), cpu: ap, machine: machine.clone(), deadline, counts: ap_counts.clone() };
+    let run = SmpAp { guest: guest.clone(), cpus: ap, machine: machine.clone(), deadline, counts: ap_counts.clone() };
     let Some(task) = kcore::task::spawn_on_with("hv/2cpu/cpu1", 1u64 << ap_cpu, run, smp_ap) else {
         return fail(out, "no task for its second CPU");
     };
-    let bsp_counts = guest.run(&mut bsp, machine, deadline, &Quiet);
+    let bsp_counts = guest.run(&mut *bsp, machine, deadline, &Quiet);
     drop(task);
-    drop(bsp);
+    drop(cpus);
     let ns = time::boot_time_ns().saturating_sub(start);
     let counts = [bsp_counts, *ap_counts.lock()];
     let stopped = guest.take_stopped()
@@ -1207,7 +1215,7 @@ fn run_smp(machine: &Arc<Machine>, spec: &SmpGuest, out: &mut dyn Write) -> bool
                          posted_stats.0, posted_stats.1);
     }
     let mut says = String::new();
-    let _ = crate::guests::describe_stop(&stopped.stop, &mut says);
+    let _ = describe_stop(&stopped.stop, 2, SMP_BUDGET_MS, &mut says);
     let _ = writeln!(out, "  stopped    {}", says);
 
     match (spec.check)(guest.memory(), &stopped, &counts, posted_stats, posted) {
@@ -1225,11 +1233,18 @@ fn run_smp(machine: &Arc<Machine>, spec: &SmpGuest, out: &mut dyn Write) -> bool
     }
 }
 
-/// How a guest of the Linux runtime stopped, in a line.
-fn describe_stop(stop: &GuestStop, out: &mut dyn Write) -> core::fmt::Result {
+/// How a guest of the Linux runtime with `cpus` CPUs, let run for
+/// `budget_ms`, stopped, in a line.
+fn describe_stop(stop: &GuestStop, cpus: usize, budget_ms: u64, out: &mut dyn Write) -> core::fmt::Result {
     match *stop {
-        GuestStop::Halted { rip } => write!(out, "both CPUs halted with interrupts off, the last at {:#x}", rip),
-        GuestStop::Budget => write!(out, "by the host, its {} ms up", SMP_BUDGET_MS),
+        GuestStop::Halted { rip } if cpus == 1 => write!(out, "its CPU halted with interrupts off at {:#x}", rip),
+        GuestStop::Halted { rip } if cpus == 2 => {
+            write!(out, "both CPUs halted with interrupts off, the last at {:#x}", rip)
+        }
+        GuestStop::Halted { rip } => {
+            write!(out, "all {} CPUs halted with interrupts off, the last at {:#x}", cpus, rip)
+        }
+        GuestStop::Budget => write!(out, "by the host, its {} ms up", budget_ms),
         other => write!(out, "{:?}", other),
     }
 }
@@ -1637,9 +1652,9 @@ fn run_ioapic(machine: &Arc<Machine>, spec: &IoGuest, out: &mut dyn Write) -> bo
         Ok(made) => made,
         Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
     };
-    let Some(ap) = cpus.pop() else { return fail(out, "no second CPU") };
-    let Some(mut bsp) = cpus.pop() else { return fail(out, "no first CPU") };
-    if let Err(e) = ioapic_board(guest.memory(), &mut bsp, spec.code) {
+    let Some(ap) = second_cpu(&mut cpus) else { return fail(out, "no second CPU") };
+    let Some(bsp) = cpus.first_mut() else { return fail(out, "no first CPU") };
+    if let Err(e) = ioapic_board(guest.memory(), &mut *bsp, spec.code) {
         return fail(out, &alloc::format!("could not be made: {}", e));
     }
     guest.set_apicv(spec.apicv);
@@ -1653,13 +1668,13 @@ fn run_ioapic(machine: &Arc<Machine>, spec: &IoGuest, out: &mut dyn Write) -> bo
     let ap_cpu = (0..u64::BITS).find(|&c| c != here && enabled & (1u64 << c) != 0).unwrap_or(here);
     let start = time::boot_time_ns();
     let deadline = start.saturating_add(SMP_BUDGET_MS * kcore::consts::NS_PER_MS);
-    let run = SmpAp { guest: guest.clone(), cpu: ap, machine: machine.clone(), deadline, counts: ap_counts.clone() };
+    let run = SmpAp { guest: guest.clone(), cpus: ap, machine: machine.clone(), deadline, counts: ap_counts.clone() };
     let Some(task) = kcore::task::spawn_on_with("hv/io/cpu1", 1u64 << ap_cpu, run, smp_ap) else {
         return fail(out, "no task for its second CPU");
     };
-    let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
+    let counts = guest.run(&mut *bsp, machine, deadline, &Quiet);
     drop(task);
-    drop(bsp);
+    drop(cpus);
     let ns = time::boot_time_ns().saturating_sub(start);
     let stopped = guest.take_stopped()
         .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
@@ -1679,7 +1694,7 @@ fn run_ioapic(machine: &Arc<Machine>, spec: &IoGuest, out: &mut dyn Write) -> bo
     let mut says = String::new();
     let _ = match stopped.stop {
         GuestStop::Halted { rip } => write!(says, "cpu 0 halted with interrupts off at {:#x}, cpu 1 never started", rip),
-        ref other => describe_stop(other, &mut says),
+        ref other => describe_stop(other, 2, SMP_BUDGET_MS, &mut says),
     };
     let _ = writeln!(out, "  stopped    {}", says);
 
@@ -1724,9 +1739,10 @@ fn check_ioapic(m: &GuestMemory, stopped: &Stopped, stats: &crate::devices::ioap
     }
     let wanted = u64::from(IOAPIC_EDGES_WANTED + IOAPIC_LEVELS_WANTED);
     let levels = u64::from(IOAPIC_LEVELS_WANTED);
-    if stats.sent != wanted || stats.level != levels || stats.eois != levels || stats.dropped != 0 {
-        return Err(alloc::format!("the IO-APIC sent {} ({} levels), ended {} and dropped {}, not {} ({}), {} and 0",
-                                  stats.sent, stats.level, stats.eois, stats.dropped, wanted, levels, levels));
+    if stats.sent != wanted || stats.level != levels || stats.eois != levels || stats.dropped != 0 || stats.untaken != 0 {
+        return Err(alloc::format!("the IO-APIC sent {} ({} levels), ended {}, dropped {} and saw {} levels no APIC \
+                                   took, not {} ({}), {}, 0 and 0", stats.sent, stats.level, stats.eois, stats.dropped,
+                                  stats.untaken, wanted, levels, levels));
     }
     Ok(String::from("version 0x20's 24 pins; two edges taken, none while masked; three levels, each sent again \
                      at its EOI while the line stayed up, its remote IRR set in service and clear after"))
@@ -2001,9 +2017,10 @@ fn check_apicv(m: &GuestMemory, stopped: &Stopped, stats: &crate::devices::ioapi
         return Err(alloc::format!("ISR read {:#x} at the end: an EOI lost", left));
     }
     let wanted = u64::from(APICV_LEVELS_WANTED);
-    if stats.sent != wanted || stats.level != wanted || stats.eois != wanted || stats.dropped != 0 {
-        return Err(alloc::format!("the IO-APIC sent {} ({} levels), ended {} and dropped {}, not {} each and 0",
-                                  stats.sent, stats.level, stats.eois, stats.dropped, wanted));
+    if stats.sent != wanted || stats.level != wanted || stats.eois != wanted || stats.dropped != 0 || stats.untaken != 0 {
+        return Err(alloc::format!("the IO-APIC sent {} ({} levels), ended {}, dropped {} and saw {} levels no APIC \
+                                   took, not {} each and 0 and 0", stats.sent, stats.level, stats.eois, stats.dropped,
+                                  stats.untaken, wanted));
     }
     /* Under virtual-interrupt delivery the host injects none of them and
      * hears of the three level EOIs alone; else it injects all six. */
@@ -2034,7 +2051,8 @@ fn check_apicv(m: &GuestMemory, stopped: &Stopped, stats: &crate::devices::ioapi
  * EOI at the next exit -- and the EOI register written if not. A self-IPI
  * 0x50 alone: the word set, and its EOI through it. A self-IPI 0x30, whose
  * handler sends itself 0x70 and takes it nested: the word not set while 0x70
- * waits, set for 0x70 once it is in -- and again after each of the two ISR
+ * waits -- the handler reads it there, before it lets 0x70 in, for the
+ * check -- set for 0x70 once it is in -- and again after each of the two ISR
  * reads in 0x70's handler, which exit -- and 0x70 ended through it; 0x30's
  * own EOI, with no exit since, finds the word clear and writes the
  * register, at whose exit 0x70's EOI is done first and 0x30's after. ISR
@@ -2052,10 +2070,10 @@ const PVEOI_CODE: &[u8] = &[
     0x48, 0x8D, 0x05, 0x3C, 0x01, 0x00, 0x00,               // lea rax, [rel h50] ; gate 0x50: a self-IPI alone
     0xBF, 0x00, 0xA5, 0x00, 0x00,                           // mov edi, 0xA500
     0xE8, 0xC9, 0x00, 0x00, 0x00,                           // call gate
-    0x48, 0x8D, 0x05, 0x68, 0x01, 0x00, 0x00,               // lea rax, [rel h70] ; gate 0x70: nested over 0x30
+    0x48, 0x8D, 0x05, 0x76, 0x01, 0x00, 0x00,               // lea rax, [rel h70] ; gate 0x70: nested over 0x30
     0xBF, 0x00, 0xA7, 0x00, 0x00,                           // mov edi, 0xA700
     0xE8, 0xB8, 0x00, 0x00, 0x00,                           // call gate
-    0x0F, 0x01, 0x1D, 0x87, 0x01, 0x00, 0x00,               // lidt [rel idtr]
+    0x0F, 0x01, 0x1D, 0x95, 0x01, 0x00, 0x00,               // lidt [rel idtr]
     0xB9, 0x1B, 0x00, 0x00, 0x00,                           // mov ecx, 0x1B ; IA32_APIC_BASE: firmware left xAPIC mode, the machine having an IO-APIC
     0x0F, 0x32,                                             // rdmsr
     0x0D, 0x00, 0x04, 0x00, 0x00,                           // or eax, 0x400 ; EXTD: x2APIC mode, its registers MSRs from here
@@ -2158,13 +2176,15 @@ const PVEOI_CODE: &[u8] = &[
     0x31, 0xD2,                                             // xor edx, edx
     0xB8, 0x70, 0x00, 0x00, 0x00,                           // mov eax, 0x70
     0x0F, 0x30,                                             // wrmsr
+    0x8B, 0x04, 0x25, 0x00, 0x71, 0x00, 0x00,               // mov eax, dword [0x7100] ; the word, 0x70 waiting in IRR
+    0x89, 0x04, 0x25, 0x30, 0x70, 0x00, 0x00,               // mov dword [0x7030], eax ; for the check: not set
     0xFB,                                                   // sti ; taken here, the handler nested
     0x90,                                                   // nop
     0x90,                                                   // nop
     0xFA,                                                   // cli
     0xB0, 0x31,                                             // mov al, 0x31 ; back in 0x30's handler after 0x70's
-    0xE8, 0x8A, 0xFF, 0xFF, 0xFF,                           // call record
-    0xE8, 0x9C, 0xFF, 0xFF, 0xFF,                           // call eoi ; the word clear: an exit, at which 0x70's EOI is done first
+    0xE8, 0x7C, 0xFF, 0xFF, 0xFF,                           // call record
+    0xE8, 0x8E, 0xFF, 0xFF, 0xFF,                           // call eoi ; the word clear: an exit, at which 0x70's EOI is done first
     0x5A,                                                   // pop rdx
     0x59,                                                   // pop rcx
     0x58,                                                   // pop rax
@@ -2173,14 +2193,14 @@ const PVEOI_CODE: &[u8] = &[
     0x51,                                                   // push rcx
     0x52,                                                   // push rdx
     0xB0, 0x70,                                             // mov al, 0x70
-    0xE8, 0x76, 0xFF, 0xFF, 0xFF,                           // call record
+    0xE8, 0x68, 0xFF, 0xFF, 0xFF,                           // call record
     0xB9, 0x11, 0x08, 0x00, 0x00,                           // mov ecx, 0x811 ; ISR, vectors 0x20-0x3F: 0x30 in service beneath
     0x0F, 0x32,                                             // rdmsr
     0x89, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,               // mov dword [0x7010], eax
     0xB9, 0x13, 0x08, 0x00, 0x00,                           // mov ecx, 0x813 ; ISR, vectors 0x60-0x7F: 0x70 itself
     0x0F, 0x32,                                             // rdmsr
     0x89, 0x04, 0x25, 0x14, 0x70, 0x00, 0x00,               // mov dword [0x7014], eax
-    0xE8, 0x6C, 0xFF, 0xFF, 0xFF,                           // call eoi ; the word set again after each read: ended by it
+    0xE8, 0x5E, 0xFF, 0xFF, 0xFF,                           // call eoi ; the word set again after each read: ended by it
     0x5A,                                                   // pop rdx
     0x59,                                                   // pop rcx
     0x58,                                                   // pop rax
@@ -2199,6 +2219,10 @@ const PVEOI_BY_REGISTER: u64 = RESULTS + 0x20;
 const PVEOI_WORD_AFTER: u64 = RESULTS + 0x24;
 const PVEOI_ISR_END: u64 = RESULTS + 0x28;
 const PVEOI_DONE: u64 = RESULTS + 0x2C;
+/// The word as 0x30's handler finds it right after sending itself 0x70:
+/// with 0x70 waiting in IRR, an EOI through the word would end 0x30 and
+/// leave 0x70 unseen until an exit -- the host must not have set it.
+const PVEOI_WORD_PENDING: u64 = RESULTS + 0x30;
 const PVEOI_MARK: u32 = u32::from_le_bytes(*b"PVEO");
 /// The order its handlers ran in.
 const PVEOI_ORDER_WANTED: [u8; 5] = [0x50, 0x30, 0x70, 0x31, 0x50];
@@ -2244,6 +2268,10 @@ fn check_pveoi(m: &GuestMemory, stopped: &Stopped, _stats: &crate::devices::ioap
         return Err(alloc::format!("{} EOIs through the word and {} by the register, not {} and {}", by_word,
                                   by_register, PVEOI_BY_WORD_WANTED, PVEOI_BY_REGISTER_WANTED));
     }
+    if word(PVEOI_WORD_PENDING)? & 1 != 0 {
+        return Err(String::from("the word was set while 0x70 waited in IRR, 0x30 in service: an EOI through it \
+                                 would have left 0x70 unseen"));
+    }
     if word(PVEOI_WORD_AFTER)? & 1 != 0 {
         return Err(String::from("the word was set with PV EOI off"));
     }
@@ -2253,9 +2281,198 @@ fn check_pveoi(m: &GuestMemory, stopped: &Stopped, _stats: &crate::devices::ioap
                                   counts.vid, PVEOI_INTERRUPTS, PVEOI_BY_WORD_WANTED));
     }
     Ok(String::from("0x50 alone ended through the word, its EOI the host's at the next exit; 0x70, nested over \
-                     0x30, through it too, and 0x30's own EOI by the register after, whose exit did 0x70's first; \
-                     nothing left in service; with PV EOI off, 0x50 by the register, the word never set -- 2 EOIs \
-                     through the word, 2 by the register"))
+                     0x30, through it too, the word read clear while 0x70 waited in IRR, and 0x30's own EOI by the \
+                     register after, whose exit did 0x70's first; nothing left in service; with PV EOI off, 0x50 \
+                     by the register, the word never set -- 2 EOIs through the word, 2 by the register"))
+}
+
+/* ---- kgs: a guest's swapgs, kept across the exits the world switch answers ---- */
+
+/* The kgs guest: the smp guest's machine -- its local APICs in x2APIC mode
+ * from the start -- its first CPU alone running, the second never started.
+ * It puts K in KERNEL_GS_BASE and G in the GS base, both straight into the
+ * CPU, which lets a guest's own bases through; stops for a CPUID, which the
+ * run loop takes whole; and runs `swapgs`: the GS base K, KERNEL_GS_BASE G.
+ * Then 64 rounds of a fixed IPI to the second CPU and a write of its TSC
+ * deadline -- each an exit the world switch answers itself where it can
+ * (`run::FastMsr`), entering the guest again at once -- `swapgs` back, and
+ * both registers read. VT-x loads KERNEL_GS_BASE from a list at every
+ * entry, and an entry made past an exit the world switch answered loaded it
+ * from the last full exit -- K, where the guest had G: its `swapgs` undone,
+ * and the GS base read back K. AMD-V moves it with `vmsave` and `vmload`.
+ * The output of `nasm -f bin`, `bits 64` and `org 0x8000`, its source's
+ * comments and labels. */
+const KGS_NAME: &str = "kgs";
+const KGS_ABOUT: &str = "KERNEL_GS_BASE as the guest's swapgs left it, across exits the world switch answers itself";
+
+const KGS_CODE: &[u8] = &[
+    0xB9, 0x02, 0x01, 0x00, 0xC0,                           // start: mov ecx, 0xC0000102 ; KERNEL_GS_BASE <- K, straight to the CPU
+    0xB8, 0x00, 0x53, 0x47, 0x4B,                           // mov eax, 0x4B475300
+    0xBA, 0x00, 0x7F, 0x00, 0x00,                           // mov edx, 0x00007F00
+    0x0F, 0x30,                                             // wrmsr
+    0xB9, 0x01, 0x01, 0x00, 0xC0,                           // mov ecx, 0xC0000101 ; GS base <- G
+    0xB8, 0x00, 0x53, 0x53, 0x47,                           // mov eax, 0x47535300
+    0xBA, 0x00, 0x7E, 0x00, 0x00,                           // mov edx, 0x00007E00
+    0x0F, 0x30,                                             // wrmsr
+    0x31, 0xC0,                                             // xor eax, eax ; an exit the run loop takes whole: K read back into its shadow
+    0x0F, 0xA2,                                             // cpuid
+    0x0F, 0x01, 0xF8,                                       // swapgs ; GS base K, KERNEL_GS_BASE G
+    0xBB, 0x40, 0x00, 0x00, 0x00,                           // mov ebx, ROUNDS ; 64
+    0xB9, 0x30, 0x08, 0x00, 0x00,                           // again: mov ecx, 0x830 ; x2APIC ICR: a fixed IPI to the other CPU, which never started
+    0xB8, 0x40, 0x00, 0x00, 0x00,                           // mov eax, 0x40
+    0xBA, 0x01, 0x00, 0x00, 0x00,                           // mov edx, 1
+    0x0F, 0x30,                                             // wrmsr ; an exit the world switch answers itself
+    0xB9, 0xE0, 0x06, 0x00, 0x00,                           // mov ecx, 0x6E0 ; the TSC deadline, 0: one too, where the host knows its TSC's rate
+    0x31, 0xC0,                                             // xor eax, eax
+    0x31, 0xD2,                                             // xor edx, edx
+    0x0F, 0x30,                                             // wrmsr
+    0xFF, 0xCB,                                             // dec ebx
+    0x75, 0xE0,                                             // jnz again
+    0x0F, 0x01, 0xF8,                                       // swapgs ; GS base G again, KERNEL_GS_BASE K
+    0xB9, 0x01, 0x01, 0x00, 0xC0,                           // mov ecx, 0xC0000101
+    0x0F, 0x32,                                             // rdmsr
+    0x89, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // mov [abs KGS_GS], eax ; 0x7000
+    0x89, 0x14, 0x25, 0x04, 0x70, 0x00, 0x00,               // mov [abs KGS_GS + 4], edx
+    0xB9, 0x02, 0x01, 0x00, 0xC0,                           // mov ecx, 0xC0000102
+    0x0F, 0x32,                                             // rdmsr
+    0x89, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00,               // mov [abs KGS_KERNEL], eax ; 0x7008
+    0x89, 0x14, 0x25, 0x0C, 0x70, 0x00, 0x00,               // mov [abs KGS_KERNEL + 4], edx
+    0xC7, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,               // mov dword [abs KGS_DONE], 0x2153474B ; 0x7010, "KGS!"
+    0x4B, 0x47, 0x53, 0x21,
+    0xFA,                                                   // cli
+    0xF4,                                                   // hlt
+];
+
+/// The second CPU's code, which nothing starts: `cli; hlt` in real mode.
+const KGS_AP_CODE: &[u8] = &[0xFA, 0xF4];
+
+/// Where it leaves the GS base and KERNEL_GS_BASE it read at its end, and
+/// its mark that it got there.
+const KGS_GS: u64 = RESULTS;
+const KGS_KERNEL: u64 = RESULTS + 0x8;
+const KGS_DONE: u64 = RESULTS + 0x10;
+const KGS_MARK: u32 = u32::from_le_bytes(*b"KGS!");
+/// What it puts in KERNEL_GS_BASE and in the GS base before its first
+/// `swapgs`, and so what each has to hold after its second.
+const KGS_KERNEL_WANTED: u64 = 0x0000_7F00_4B47_5300;
+const KGS_GS_WANTED: u64 = 0x0000_7E00_4753_5300;
+/// Its writes: an IPI and a TSC deadline a round.
+const KGS_WRITES: u64 = 128;
+
+const KGS_GUEST: SmpGuest =
+    SmpGuest { name: KGS_NAME, about: KGS_ABOUT, bsp: KGS_CODE, ap: KGS_AP_CODE, apicv: false, check: check_kgs };
+
+fn check_kgs(m: &GuestMemory, stopped: &Stopped, counts: &[Counts; 2], _posted: (u64, u64), _by_cpu: bool)
+    -> core::result::Result<String, String>
+{
+    if !matches!(stopped.stop, GuestStop::Halted { .. }) {
+        return Err(String::from("it did not run to its halt"));
+    }
+    let word = |gpa: u64| m.read_obj::<u32>(gpa).map_err(|e| alloc::format!("guest memory at {:#x}: {}", gpa, e));
+    let quad = |gpa: u64| m.read_obj::<u64>(gpa).map_err(|e| alloc::format!("guest memory at {:#x}: {}", gpa, e));
+    if word(KGS_DONE)? != KGS_MARK {
+        return Err(String::from("it never reached its end"));
+    }
+    let (gs, kernel) = (quad(KGS_GS)?, quad(KGS_KERNEL)?);
+    if (gs, kernel) != (KGS_GS_WANTED, KGS_KERNEL_WANTED) {
+        return Err(alloc::format!("after its swapgs, its writes and its swapgs back the GS base reads {:#x} and \
+                                   KERNEL_GS_BASE {:#x}, not {:#x} and {:#x}: an entry undid its swapgs",
+                                  gs, kernel, KGS_GS_WANTED, KGS_KERNEL_WANTED));
+    }
+    /* Not one write answered in the world switch is a guest that looked at
+     * nothing this is about -- but on AMD-V without next-RIP save, whose
+     * world switch answers none (it cannot step past what it has not
+     * decoded): QEMU's TCG, where `vmload` moves the register anyway. */
+    let answers = match hvarch::x86::Caps::probe().detail {
+        hvarch::x86::Detail::Svm(svm) => svm.has(hvarch::x86::svm::NRIP_SAVE),
+        _ => true,
+    };
+    if counts[0].answered == 0 && answers {
+        return Err(alloc::format!("none of its {} writes was answered in the world switch", KGS_WRITES));
+    }
+    if counts[0].answered == 0 {
+        return Ok(String::from("no next-RIP save, so none of its writes answered in the world switch -- and the GS \
+                                base and KERNEL_GS_BASE as its swapgs left them"));
+    }
+    Ok(alloc::format!("{} of its {} writes of the ICR and the TSC deadline answered in the world switch; the GS \
+                       base and KERNEL_GS_BASE as its swapgs left them", counts[0].answered, KGS_WRITES))
+}
+
+/* ---- cache: CR0's cache bits, the guest's and never the host's ---- */
+
+/* The cache guest: the IO-APIC's machine, its first CPU alone running. It
+ * sets CR0.CD and CR0.NW -- its caches' fill off, and their write-through
+ * -- reads CR0 back, and halts with both left set. It has to read back what
+ * it wrote, and no CPU of the host may have either bit after it: a VM exit
+ * puts neither back from the host's CR0, so under VT-x a guest's own write
+ * of CD, let through, left the host's CPU with its caches no longer filling
+ * for good (`hvarch::x86::vmx::CR0_CACHE_BITS`). AMD-V's exit puts the
+ * host's CR0 back whole. The output of `nasm -f bin`, `bits 64` and
+ * `org 0x8000`. */
+const CACHE_NAME: &str = "cache";
+const CACHE_ABOUT: &str = "CR0.CD and CR0.NW set by the guest and left so: what it reads back, and no host CPU's own";
+
+const CACHE_CODE: &[u8] = &[
+    0x0F, 0x20, 0xC0,                                       // start: mov rax, cr0
+    0x0D, 0x00, 0x00, 0x00, 0x60,                           // or eax, 0x60000000 ; CD and NW: the caches' fill off, write-through off
+    0x0F, 0x22, 0xC0,                                       // mov cr0, rax
+    0x0F, 0x20, 0xC3,                                       // mov rbx, cr0 ; read back: what it wrote
+    0x48, 0x89, 0x1C, 0x25, 0x00, 0x70, 0x00, 0x00,         // mov [abs CACHE_READ], rbx ; 0x7000
+    0xC7, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00,               // mov dword [abs CACHE_DONE], 0x21454843 ; 0x7008, "CHE!"
+    0x43, 0x48, 0x45, 0x21,
+    0xFA,                                                   // cli ; and left so: the host's CPU has to have neither
+    0xF4,                                                   // hlt
+];
+
+/// Where it leaves the CR0 it read back, and its mark that it got there.
+const CACHE_READ: u64 = RESULTS;
+const CACHE_DONE: u64 = RESULTS + 0x8;
+const CACHE_MARK: u32 = u32::from_le_bytes(*b"CHE!");
+/// CR0.NW and CR0.CD.
+const CACHE_BITS: u64 = 1 << 29 | 1 << 30;
+
+const CACHE_GUEST: IoGuest =
+    IoGuest { name: CACHE_NAME, about: CACHE_ABOUT, code: CACHE_CODE, apicv: false, check: check_cache };
+
+/// The host CPUs whose own CR0 has CD or NW set, a bit a CPU: each asked on
+/// itself, the guest's among them wherever its task ran.
+fn host_cache_bits_set() -> u64 {
+    fn look(seen: &core::sync::atomic::AtomicU64) {
+        if hvarch::x86::cpu::read_cr0() & CACHE_BITS != 0 {
+            seen.fetch_or(1u64 << kcore::cpu::id(), core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let seen = core::sync::atomic::AtomicU64::new(0);
+    let online = kcore::cpu::online_mask();
+    for cpu in 0..u64::BITS {
+        if online & (1u64 << cpu) != 0 {
+            kcore::cpu::run_on_with(cpu, &seen, look);
+        }
+    }
+    seen.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+fn check_cache(m: &GuestMemory, stopped: &Stopped, _stats: &crate::devices::ioapic::Stats, _counts: &Counts,
+               _vapic: bool) -> core::result::Result<String, String>
+{
+    if !matches!(stopped.stop, GuestStop::Halted { .. }) {
+        return Err(String::from("it did not run to its halt"));
+    }
+    let done = m.read_obj::<u32>(CACHE_DONE).map_err(|e| alloc::format!("guest memory: {}", e))?;
+    if done != CACHE_MARK {
+        return Err(String::from("it never reached its end"));
+    }
+    let read = m.read_obj::<u64>(CACHE_READ).map_err(|e| alloc::format!("guest memory: {}", e))?;
+    if read & CACHE_BITS != CACHE_BITS {
+        return Err(alloc::format!("it read CR0 back as {:#x}, without the CD and NW it wrote", read));
+    }
+    let set = host_cache_bits_set();
+    if set != 0 {
+        return Err(alloc::format!("the host's own CR0 has CD or NW on cpu(s) {:#x} after it: the guest's write \
+                                   reached the CPU's", set));
+    }
+    Ok(alloc::format!("it read CR0 back as {:#x}, CD and NW as it wrote them, and no host CPU's own CR0 has \
+                       either", read))
 }
 
 /* ---- debug: a guest's own #DB given back to it ---- */
@@ -2358,13 +2575,27 @@ fn one_cpu_board(m: &GuestMemory, bsp: &mut GuestCpu, code: &[u8]) -> Result<()>
     Ok(())
 }
 
-/// Run the debug guest: one CPU, through the run loop a Linux guest's go
-/// through, where a #DB of the guest's own is given back.
+/// A guest of one CPU, through the run loop a Linux guest's go through: its
+/// name, what it does, its code -- `one_cpu_board`'s machine -- and what it
+/// has to have done, by its memory, how it stopped and what it counted.
+struct OneCpuGuest {
+    name: &'static str,
+    about: &'static str,
+    code: &'static [u8],
+    check: fn(&GuestMemory, &Stopped, &Counts) -> core::result::Result<String, String>,
+}
+
+const DEBUG_GUEST: OneCpuGuest =
+    OneCpuGuest { name: DEBUG_NAME, about: DEBUG_ABOUT, code: DEBUG_CODE, check: |m, stopped, _| check_debug(m, stopped) };
+
+/// Run a guest of one CPU (`OneCpuGuest`) through the run loop a Linux
+/// guest's go through, where what the guest raises of its own -- a #DB, a
+/// #UD -- is given back to it.
 #[inline(never)]
-fn run_debug(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
-    let _ = writeln!(out, "hv: guest {} -- {}", DEBUG_NAME, DEBUG_ABOUT);
+fn run_one_cpu(machine: &Arc<Machine>, spec: &OneCpuGuest, out: &mut dyn Write) -> bool {
+    let _ = writeln!(out, "hv: guest {} -- {}", spec.name, spec.about);
     let fail = |out: &mut dyn Write, why: &str| {
-        let _ = writeln!(out, "hv: guest {} FAILED -- {}", DEBUG_NAME, why);
+        let _ = writeln!(out, "hv: guest {} FAILED -- {}", spec.name, why);
         false
     };
     let Some(doorbells) = Doorbells::new(1) else { return fail(out, "out of memory") };
@@ -2372,19 +2603,19 @@ fn run_debug(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
         Ok(made) => made,
         Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
     };
-    let Some(mut bsp) = cpus.pop() else { return fail(out, "no CPU") };
-    if let Err(e) = one_cpu_board(guest.memory(), &mut bsp, DEBUG_CODE) {
+    let Some(bsp) = cpus.first_mut() else { return fail(out, "no CPU") };
+    if let Err(e) = one_cpu_board(guest.memory(), &mut *bsp, spec.code) {
         return fail(out, &alloc::format!("could not be made: {}", e));
     }
     let start = time::boot_time_ns();
     let deadline = start.saturating_add(DEBUG_BUDGET_MS * kcore::consts::NS_PER_MS);
-    let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
-    drop(bsp);
+    let counts = guest.run(&mut *bsp, machine, deadline, &Quiet);
+    drop(cpus);
     let ns = time::boot_time_ns().saturating_sub(start);
     let stopped = guest.take_stopped()
         .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
     if let GuestStop::Refused(Refusal::NotOn(cpu)) = stopped.stop {
-        let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first", DEBUG_NAME, cpu);
+        let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first", spec.name, cpu);
         return false;
     }
     let host = guest.cpu_states().first().and_then(|&(_, h)| h);
@@ -2392,19 +2623,20 @@ fn run_debug(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
         Some(h) => { let _ = writeln!(out, "  ran on     cpu {}, {} us", h, ns / kcore::consts::NS_PER_US); }
         None => { let _ = writeln!(out, "  ran on     no cpu, {} us", ns / kcore::consts::NS_PER_US); }
     }
-    let _ = writeln!(out, "  exits      {}, {} exceptions given back", counts.exits, counts.reflected);
+    let _ = writeln!(out, "  exits      {}, {} exceptions given back, {} #UD and #GP given", counts.exits,
+                     counts.reflected, counts.ud);
     let mut says = String::new();
-    let _ = describe_stop(&stopped.stop, &mut says);
+    let _ = describe_stop(&stopped.stop, 1, DEBUG_BUDGET_MS, &mut says);
     let _ = writeln!(out, "  stopped    {}", says);
 
-    match check_debug(guest.memory(), &stopped) {
+    match (spec.check)(guest.memory(), &stopped, &counts) {
         Ok(checked) => {
             let _ = writeln!(out, "  checked    {}", checked);
-            let _ = writeln!(out, "hv: guest {} ok", DEBUG_NAME);
+            let _ = writeln!(out, "hv: guest {} ok", spec.name);
             true
         }
         Err(why) => {
-            let _ = writeln!(out, "hv: guest {} FAILED -- {}", DEBUG_NAME, why);
+            let _ = writeln!(out, "hv: guest {} FAILED -- {}", spec.name, why);
             let _ = writeln!(out, "  cpu {} as it stopped:", stopped.cpu);
             let _ = out.write_str(&stopped.dump);
             false
@@ -2439,6 +2671,122 @@ fn check_debug(m: &GuestMemory, stopped: &Stopped) -> core::result::Result<Strin
     }
     Ok(String::from("both #DBs its own handler's: the single step's with DR6.BS, after the NOP; the ICEBP's with \
                      no bit, after it -- and it ran on to its halt"))
+}
+
+/* ---- instr: instructions both extensions stop a guest at, answered ---- */
+
+/* The instr guest: one CPU, with an IDT of its own: a #UD handler that
+ * keeps where it faulted, counts, and returns past the two-byte RSM, and a
+ * #DB handler that keeps DR6 and where it returns to, counts, and clears TF
+ * in its frame. It runs RSM -- any CPL's to run, and a #UD outside SMM,
+ * where every guest is -- and INVD, which would throw away the host's dirty
+ * lines with the guest's; each is an intercept, or under VT-x an exit
+ * whatever the controls say, and each was once an exit no arm answered: RSM
+ * from a user process stopped its whole VM under AMD-V, and INVD from the
+ * guest's kernel under both. Now RSM is the #UD a CPU gives and INVD is
+ * stepped past, as KVM steps past it. Then TF, by POPFQ, over a CPUID: an
+ * exit the host performs, whose single step's #DB the CPU never raises, and
+ * the host has to -- after the CPUID, DR6.BS set; it once raised none, and
+ * a debugger's `stepi` over a CPUID landed one instruction late. The output
+ * of `nasm -f bin`, `bits 64` and `org 0x8000`. */
+const INSTR_NAME: &str = "instr";
+const INSTR_ABOUT: &str = "RSM and INVD, which both extensions stop a guest at, and a single step over a CPUID: the \
+                           #UD a CPU gives for the first, the second stepped past, and the step's #DB after the third";
+
+const INSTR_CODE: &[u8] = &[
+    0x48, 0x8D, 0x05, 0x69, 0x00, 0x00, 0x00,               // start: lea rax, [rel ud] ; gate 6, #UD
+    0xBF, 0x60, 0xA0, 0x00, 0x00,                           // mov edi, IDT_BASE + 6 * 16
+    0xE8, 0x39, 0x00, 0x00, 0x00,                           // call gate
+    0x48, 0x8D, 0x05, 0x76, 0x00, 0x00, 0x00,               // lea rax, [rel db] ; gate 1, #DB
+    0xBF, 0x10, 0xA0, 0x00, 0x00,                           // mov edi, IDT_BASE + 1 * 16
+    0xE8, 0x28, 0x00, 0x00, 0x00,                           // call gate
+    0x0F, 0x01, 0x1D, 0x91, 0x00, 0x00, 0x00,               // lidt [rel idtr]
+    0x0F, 0xAA,                                             // 29: rsm_at: rsm ; outside SMM: #UD, at any CPL -- the host's to give
+    0x0F, 0x08,                                             // invd ; the host's dirty lines: stepped past, not run
+    0x31, 0xC0,                                             // xor eax, eax
+    0x9C,                                                   // pushfq
+    0x48, 0x81, 0x0C, 0x24, 0x00, 0x01, 0x00, 0x00,         // or qword [rsp], 0x100 ; TF: a trap after the next instruction
+    0x9D,                                                   // popfq
+    0x0F, 0xA2,                                             // 39: cpuid ; performed by the host: its single step the host's to give
+    0xC7, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,               // 3b: after: mov dword [abs INSTR_DONE], 0x52534E49 ; "INSR"
+    0x49, 0x4E, 0x53, 0x52,
+    0xFA,                                                   // cli
+    0xF4,                                                   // .dead: hlt
+    0xEB, 0xFD,                                             // jmp .dead
+    0x66, 0x89, 0x07,                                       // gate: mov word [rdi], ax ; an interrupt gate for rax
+    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // mov word [rdi + 2], 0x08
+    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // mov word [rdi + 4], 0x8E00
+    0x48, 0xC1, 0xE8, 0x10,                                 // shr rax, 16
+    0x66, 0x89, 0x47, 0x06,                                 // mov word [rdi + 6], ax
+    0x48, 0xC1, 0xE8, 0x10,                                 // shr rax, 16
+    0x89, 0x47, 0x08,                                       // mov dword [rdi + 8], eax
+    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // mov dword [rdi + 12], 0
+    0xC3,                                                   // ret
+    0x50,                                                   // ud: push rax
+    0x48, 0x8B, 0x44, 0x24, 0x08,                           // mov rax, [rsp + 8] ; where it faulted
+    0x48, 0x89, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00,         // mov [abs INSTR_AT], rax
+    0xFF, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // inc dword [abs INSTR_COUNT]
+    0x48, 0x83, 0x44, 0x24, 0x08, 0x02,                     // add qword [rsp + 8], 2 ; past the rsm
+    0x58,                                                   // pop rax
+    0x48, 0xCF,                                             // iretq
+    0x50,                                                   // db: push rax
+    0x0F, 0x21, 0xF0,                                       // mov rax, dr6
+    0x48, 0x89, 0x04, 0x25, 0x28, 0x70, 0x00, 0x00,         // mov [abs INSTR_DR6], rax
+    0x48, 0x8B, 0x44, 0x24, 0x08,                           // mov rax, [rsp + 8] ; where it returns to
+    0x48, 0x89, 0x04, 0x25, 0x20, 0x70, 0x00, 0x00,         // mov [abs INSTR_DB_AT], rax
+    0xFF, 0x04, 0x25, 0x18, 0x70, 0x00, 0x00,               // inc dword [abs INSTR_DBS]
+    0x48, 0x81, 0x64, 0x24, 0x18, 0xFF, 0xFE, 0xFF, 0xFF,   // and qword [rsp + 24], ~0x100 ; TF off in the frame
+    0x58,                                                   // pop rax
+    0x48, 0xCF,                                             // iretq
+    0x6F, 0x00,                                             // idtr: dw 7 * 16 - 1 ; gates 0-6
+    0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // dq IDT_BASE
+];
+
+/// What it leaves at `RESULTS`: the #UDs its handler took and where the
+/// last was, its mark once at its end, and the #DBs its handler took, where
+/// the last returned to and the DR6 it read.
+const INSTR_COUNT: u64 = RESULTS;
+const INSTR_AT: u64 = RESULTS + 0x8;
+const INSTR_DONE: u64 = RESULTS + 0x10;
+const INSTR_DBS: u64 = RESULTS + 0x18;
+const INSTR_DB_AT: u64 = RESULTS + 0x20;
+const INSTR_DR6: u64 = RESULTS + 0x28;
+const INSTR_MARK: u32 = u32::from_le_bytes(*b"INSR");
+/// Where its RSM is, and where the instruction after its CPUID.
+const INSTR_RSM_AT: u64 = ENTRY + 0x29;
+const INSTR_AFTER_CPUID: u64 = ENTRY + 0x3B;
+const INSTR_DR6_BS: u64 = 1 << 14;
+
+const INSTR_GUEST: OneCpuGuest = OneCpuGuest { name: INSTR_NAME, about: INSTR_ABOUT, code: INSTR_CODE, check: check_instr };
+
+fn check_instr(m: &GuestMemory, stopped: &Stopped, counts: &Counts) -> core::result::Result<String, String> {
+    let read = |gpa| m.read_obj::<u64>(gpa).map_err(|e| alloc::format!("its results cannot be read: {}", e));
+    let count = read(INSTR_COUNT)? as u32;
+    if !matches!(stopped.stop, GuestStop::Halted { .. }) {
+        return Err(alloc::format!("it did not run to its halt -- an exit with no answer stops a guest -- its \
+                                   handler having run {} times", count));
+    }
+    let done = read(INSTR_DONE)? as u32;
+    let at = read(INSTR_AT)?;
+    if done != INSTR_MARK || count != 1 || at != INSTR_RSM_AT {
+        return Err(alloc::format!("its #UD handler ran {} times, the last at {:#x}, and its mark is {:#x}: wanted \
+                                   once, at the RSM at {:#x}", count, at, done, INSTR_RSM_AT));
+    }
+    /* AMD-V stops the guest at its RSM and the host gives the #UD; VT-x
+     * does not stop it there, and the CPU gives it. INVD stops it on both. */
+    if counts.ud > 1 || counts.wbinvd != 1 {
+        return Err(alloc::format!("the host gave {} #UDs and stepped past {} WBINVDs and INVDs, not at most 1 and 1",
+                                  counts.ud, counts.wbinvd));
+    }
+    let (dbs, db_at, dr6) = (read(INSTR_DBS)? as u32, read(INSTR_DB_AT)?, read(INSTR_DR6)?);
+    if dbs != 1 || db_at != INSTR_AFTER_CPUID || dr6 & INSTR_DR6_BS == 0 {
+        return Err(alloc::format!("its #DB handler ran {} times, the last returning to {:#x} with DR6 {:#x}: wanted \
+                                   once, after the CPUID it single-stepped at {:#x}, with BS -- the step's #DB the \
+                                   host owed it", dbs, db_at, dr6, INSTR_AFTER_CPUID));
+    }
+    Ok(alloc::format!("its RSM a #UD of its own handler's, at the RSM -- {}; its INVD stepped past; its single step \
+                       over a CPUID a #DB after it, DR6.BS set; and it ran on to its halt",
+                      if counts.ud == 1 { "the host's to give" } else { "the CPU's own" }))
 }
 
 /* ---- dr: a guest's DR0-DR3 its own ---- */
@@ -2591,21 +2939,21 @@ fn run_dr_vm(machine: &Arc<Machine>, pattern: u64, at: u64) -> core::result::Res
     let made = |e: hvarch::Error| alloc::format!("could not be made: {}", e);
     let Some(doorbells) = Doorbells::new(1) else { return Err(String::from("out of memory")) };
     let (guest, mut cpus) = LinuxGuest::new(machine, MEMORY, false, 1, Arc::new(doorbells), false, false).map_err(made)?;
-    let Some(mut bsp) = cpus.pop() else { return Err(String::from("no CPU")) };
+    let Some(bsp) = cpus.first_mut() else { return Err(String::from("no CPU")) };
     let m = guest.memory();
-    one_cpu_board(m, &mut bsp, DR_CODE)
+    one_cpu_board(m, &mut *bsp, DR_CODE)
         .and_then(|_| m.write_obj(DR_PATTERN, &pattern))
         .and_then(|_| m.write_obj(DR_BREAK, &at))
         .map_err(made)?;
     let start = time::boot_time_ns();
     let deadline = start.saturating_add(DR_BUDGET_MS * kcore::consts::NS_PER_MS);
-    let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
+    let counts = guest.run(&mut *bsp, machine, deadline, &Quiet);
     use hvarch::x86::svm::vmcb::intercept::dr::{READ_DR0_3, WRITE_DR0_3};
     let asked = match &*bsp.backend_mut() {
         Backend::Svm(v) => v.control().intercept_dr & (READ_DR0_3 | WRITE_DR0_3) == READ_DR0_3 | WRITE_DR0_3,
         Backend::Vmx(v) => v.stops_debug_movs(),
     };
-    drop(bsp);
+    drop(cpus);
     let us = time::boot_time_ns().saturating_sub(start) / kcore::consts::NS_PER_US;
     let stopped = guest.take_stopped()
         .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
@@ -2665,8 +3013,8 @@ fn run_dr(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
                      a.counts.exits, b.counts.exits, a.counts.dr, b.counts.dr, a.counts.reflected,
                      b.counts.reflected);
     let (mut says_a, mut says_b) = (String::new(), String::new());
-    let _ = describe_stop(&a.stopped.stop, &mut says_a);
-    let _ = describe_stop(&b.stopped.stop, &mut says_b);
+    let _ = describe_stop(&a.stopped.stop, 1, DR_BUDGET_MS, &mut says_a);
+    let _ = describe_stop(&b.stopped.stop, 1, DR_BUDGET_MS, &mut says_b);
     let _ = writeln!(out, "  stopped    vm A {}; vm B {}", says_a, says_b);
 
     match check_dr(a, b, vmx) {
@@ -3098,19 +3446,22 @@ const AVX_BUDGET_MS: u64 = 10_000;
 /// into a CPU that held the other's.
 struct AvxCpu {
     guest: Arc<LinuxGuest>,
-    cpu: GuestCpu,
+    /// Its one CPU, in a vector of its own (`second_cpu`).
+    cpus: Vec<GuestCpu>,
     machine: Arc<Machine>,
     deadline: u64,
     ran: Arc<kcore::sync::Mutex<(Counts, u64)>>,
 }
 
 fn avx_cpu(run: AvxCpu) {
-    let AvxCpu { guest, mut cpu, machine, deadline, ran } = run;
-    let counts = guest.run(&mut cpu, &machine, deadline, &Quiet);
-    *ran.lock() = (counts, cpu.backend_mut().fp_loads());
+    let AvxCpu { guest, mut cpus, machine, deadline, ran } = run;
+    if let Some(cpu) = cpus.first_mut() {
+        let counts = guest.run(cpu, &machine, deadline, &Quiet);
+        *ran.lock() = (counts, cpu.backend_mut().fp_loads());
+    }
     /* Its CPU goes in this task, before the guest: under VT-x the VMCS is
      * cleared off its host CPU from task context. */
-    drop(cpu);
+    drop(cpus);
 }
 
 /// What one CPU of the avx guest left, read out of its results.
@@ -3173,10 +3524,10 @@ fn run_avx(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
         Ok(made) => made,
         Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
     };
-    let Some(ap) = cpus.pop() else { return fail(out, "no second CPU") };
-    let Some(mut bsp) = cpus.pop() else { return fail(out, "no first CPU") };
+    let Some(ap) = second_cpu(&mut cpus) else { return fail(out, "no second CPU") };
+    let Some(bsp) = cpus.first_mut() else { return fail(out, "no first CPU") };
     let m = guest.memory();
-    let board = smp_board(m, &mut bsp, AVX_CODE, AVX_AP_CODE).and_then(|_| {
+    let board = smp_board(m, &mut *bsp, AVX_CODE, AVX_AP_CODE).and_then(|_| {
         for (&at, &(first, mxcsr, fcw)) in AVX_RESULTS.iter().zip(AVX_CPUS.iter()) {
             for w in 0..AVX_WORDS {
                 m.write_obj(at + AVX_PATTERN + w * 8, &(first + w))?;
@@ -3202,11 +3553,11 @@ fn run_avx(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let here = 1u64 << kcore::cpu::id();
     let start = time::boot_time_ns();
     let deadline = start.saturating_add(AVX_BUDGET_MS * kcore::consts::NS_PER_MS);
-    let second = AvxCpu { guest: guest.clone(), cpu: ap, machine: machine.clone(), deadline, ran: ran[1].clone() };
+    let second = AvxCpu { guest: guest.clone(), cpus: ap, machine: machine.clone(), deadline, ran: ran[1].clone() };
     let Some(second) = kcore::task::spawn_on_with("hv/avx/cpu1", here, second, avx_cpu) else {
         return fail(out, "no task for its second CPU");
     };
-    let first = AvxCpu { guest: guest.clone(), cpu: bsp, machine: machine.clone(), deadline, ran: ran[0].clone() };
+    let first = AvxCpu { guest: guest.clone(), cpus, machine: machine.clone(), deadline, ran: ran[0].clone() };
     let first = kcore::task::spawn_on_with("hv/avx/cpu0", here, first, avx_cpu);
     if first.is_none() {
         guest.stop(GuestStop::Requested);
@@ -3239,7 +3590,7 @@ fn run_avx(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
                      counts[1].exits, counts[1].xsetbv, counts[1].xsetbv_refused, counts[1].ipi_sent, counts[1].hlt);
     let _ = writeln!(out, "  registers  put back into the CPU {} times for cpu 0, {} for cpu 1", loads[0], loads[1]);
     let mut says = String::new();
-    let _ = describe_stop(&stopped.stop, &mut says);
+    let _ = describe_stop(&stopped.stop, 2, AVX_BUDGET_MS, &mut says);
     let _ = writeln!(out, "  stopped    {}", says);
 
     match check_avx(guest.memory(), &stopped, &counts, loads, &hosts) {
@@ -3363,8 +3714,11 @@ const TSCAUX_ABOUT: &str = "two VMs on one CPU, one after the other: each reads 
                             does not -- and neither reads the other's";
 
 /* A Linux guest's CPU, one, in long mode with an IDT of its own, whose #UD
- * and #GP handlers note the vector and go on past the step that faulted --
- * the address each step leaves at +0xF0. It reads what its CPUID offers --
+ * and #GP handlers note the vector -- a #GP's error code above it -- and go
+ * on past the step that faulted, the address each step leaves at +0xF0. Its
+ * IDT ends at gate 13, so an exception of a later vector comes in as a #GP
+ * whose error code names that vector's gate: a step's #GP is its #GP(0)
+ * alone. It reads what its CPUID offers --
  * 0x8000_0001's EDX, leaf 7's EBX and ECX -- then its TSC_AUX by RDTSCP, by
  * RDPID and by RDMSR; writes the host's word at +0x100 into it; reads the
  * TSC, then the TSC and TSC_AUX by RDTSCP, then the TSC; reads TSC_AUX by
@@ -3372,16 +3726,16 @@ const TSCAUX_ABOUT: &str = "two VMs on one CPU, one after the other: each reads 
  * reads it by RDMSR once more; runs INVPCID of types 0 to 3 on a descriptor
  * of PCID 0 and the host's address at +0x108, and of type 4, which is none;
  * leaves its mark and halts. Each step's value, and the vector it faulted
- * with or 0, a quadword each from `RESULTS` on. Assembled from this source
- * with clang, the offsets in the comments its listing's. */
+ * with (`Fault`) or 0, a quadword each from `RESULTS` on. Assembled from
+ * this source with clang, the offsets in the comments its listing's. */
 const TSCAUX_CODE: &[u8] = &[
     0x48, 0x8D, 0x05, 0x31, 0x02, 0x00, 0x00,               // 00: start: lea rax, [rip + ud] ; gate 6, #UD
     0xBF, 0x60, 0xA0, 0x00, 0x00,                           // 07: mov edi, 0xA060
-    0xE8, 0x53, 0x02, 0x00, 0x00,                           // 0c: call gate
+    0xE8, 0x5B, 0x02, 0x00, 0x00,                           // 0c: call gate
     0x48, 0x8D, 0x05, 0x2D, 0x02, 0x00, 0x00,               // 11: lea rax, [rip + gp] ; gate 13, #GP
     0xBF, 0xD0, 0xA0, 0x00, 0x00,                           // 18: mov edi, 0xA0D0
-    0xE8, 0x42, 0x02, 0x00, 0x00,                           // 1d: call gate
-    0x0F, 0x01, 0x1D, 0x61, 0x02, 0x00, 0x00,               // 22: lidt [rip + idtr]
+    0xE8, 0x4A, 0x02, 0x00, 0x00,                           // 1d: call gate
+    0x0F, 0x01, 0x1D, 0x69, 0x02, 0x00, 0x00,               // 22: lidt [rip + idtr]
     0x41, 0xBD, 0x00, 0x70, 0x00, 0x00,                     // 29: mov r13d, 0x7000 ; its results
     0x4D, 0x8B, 0xA5, 0x00, 0x01, 0x00, 0x00,               // 2f: mov r12, qword [r13 + 0x100] ; its pattern
     0xB8, 0x01, 0x00, 0x00, 0x80,                           // 36: mov eax, 0x80000001 ; what its CPUID offers
@@ -3497,30 +3851,34 @@ const TSCAUX_CODE: &[u8] = &[
     0xC3,                                                   // 237: ret
     0x49, 0xC7, 0x85, 0xF8, 0x00, 0x00, 0x00, 0x06,         // 238: ud: mov qword [r13 + 0xF8], 6 ; a #UD: the step's fault,
     0x00, 0x00, 0x00,
-    0xEB, 0x0F,                                             // 243: jmp recover
-    0x48, 0x83, 0xC4, 0x08,                                 // 245: gp: add rsp, 8 ; a #GP, its error code dropped
-    0x49, 0xC7, 0x85, 0xF8, 0x00, 0x00, 0x00, 0x0D,         // 249: mov qword [r13 + 0xF8], 13
-    0x00, 0x00, 0x00,
-    0x50,                                                   // 254: recover: push rax
-    0x49, 0x8B, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 255: mov rax, qword [r13 + 0xF0] ; and on past the step
-    0x48, 0x89, 0x44, 0x24, 0x08,                           // 25c: mov qword [rsp + 8], rax
-    0x58,                                                   // 261: pop rax
-    0x48, 0xCF,                                             // 262: iretq
-    0x66, 0x89, 0x07,                                       // 264: gate: mov word [rdi], ax ; a gate for rax
-    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // 267: mov word [rdi + 2], 0x08
-    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // 26d: mov word [rdi + 4], 0x8E00
-    0x48, 0xC1, 0xE8, 0x10,                                 // 273: shr rax, 16
-    0x66, 0x89, 0x47, 0x06,                                 // 277: mov word [rdi + 6], ax
+    0xEB, 0x17,                                             // 243: jmp recover
+    0x50,                                                   // 245: gp: push rax ; a #GP:
+    0x8B, 0x44, 0x24, 0x08,                                 // 246: mov eax, dword [rsp + 8] ; its error code,
+    0x48, 0xC1, 0xE0, 0x08,                                 // 24a: shl rax, 8 ; above the vector,
+    0x0C, 0x0D,                                             // 24e: or al, 13
+    0x49, 0x89, 0x85, 0xF8, 0x00, 0x00, 0x00,               // 250: mov qword [r13 + 0xF8], rax ; the step's fault
+    0x58,                                                   // 257: pop rax
+    0x48, 0x83, 0xC4, 0x08,                                 // 258: add rsp, 8 ; the error code
+    0x50,                                                   // 25c: recover: push rax
+    0x49, 0x8B, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 25d: mov rax, qword [r13 + 0xF0] ; and on past the step
+    0x48, 0x89, 0x44, 0x24, 0x08,                           // 264: mov qword [rsp + 8], rax
+    0x58,                                                   // 269: pop rax
+    0x48, 0xCF,                                             // 26a: iretq
+    0x66, 0x89, 0x07,                                       // 26c: gate: mov word [rdi], ax ; a gate for rax
+    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // 26f: mov word [rdi + 2], 0x08
+    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // 275: mov word [rdi + 4], 0x8E00
     0x48, 0xC1, 0xE8, 0x10,                                 // 27b: shr rax, 16
-    0x89, 0x47, 0x08,                                       // 27f: mov dword [rdi + 8], eax
-    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // 282: mov dword [rdi + 12], 0
-    0xC3,                                                   // 289: ret
-    0xDF, 0x00,                                             // 28a: idtr: dw 0xDF ; gates to 13
-    0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // 28c: dq 0xA000
+    0x66, 0x89, 0x47, 0x06,                                 // 27f: mov word [rdi + 6], ax
+    0x48, 0xC1, 0xE8, 0x10,                                 // 283: shr rax, 16
+    0x89, 0x47, 0x08,                                       // 287: mov dword [rdi + 8], eax
+    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // 28a: mov dword [rdi + 12], 0
+    0xC3,                                                   // 291: ret
+    0xDF, 0x00,                                             // 292: idtr: dw 0xDF ; gates to 13
+    0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // 294: dq 0xA000
 ];
 
 /* What the guest leaves at `RESULTS`, a quadword a slot: each step's value
- * and the vector it faulted with, 0 for none (`TA_*`); its mark at +0xC0;
+ * and the fault it took (`Fault`), 0 for none (`TA_*`); its mark at +0xC0;
  * what its CPUID offered at +0xC8, +0xD0 and +0xD8; and what the host gives
  * it at +0x100 and +0x108. */
 const TA_SLOTS: usize = 24;
@@ -3552,10 +3910,38 @@ const TA_LEAF7_EBX: u64 = RESULTS + 0xD0;
 const TA_LEAF7_ECX: u64 = RESULTS + 0xD8;
 const TA_PATTERN: u64 = RESULTS + 0x100;
 const TA_ADDRESS: u64 = RESULTS + 0x108;
-/// What a step that did not fault leaves, and the two vectors one can.
+/// What a step that did not fault leaves, and the two vectors one can: a
+/// #GP's error code is above its vector (`FAULT_ERROR_SHIFT`), so 13 is a
+/// #GP(0) and nothing else.
 const NO_FAULT: u64 = 0;
 const VECTOR_UD: u64 = 6;
 const VECTOR_GP: u64 = 13;
+const FAULT_ERROR_SHIFT: u32 = 8;
+const FAULT_VECTOR: u64 = 0xFF;
+
+/// A step's fault as the tscaux and spec guests leave it, said: none, a #UD,
+/// a #GP(0), or the vector and error code of whatever else came in.
+struct Fault(u64);
+
+impl core::fmt::Display for Fault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            NO_FAULT => f.write_str("none"),
+            VECTOR_UD => f.write_str("#UD"),
+            VECTOR_GP => f.write_str("#GP(0)"),
+            v => write!(f, "vector {} with error code {:#x}", v & FAULT_VECTOR, v >> FAULT_ERROR_SHIFT),
+        }
+    }
+}
+
+/// Steps' faults, said one after the other.
+fn faults(list: &[u64]) -> String {
+    let mut said = String::new();
+    for (i, &f) in list.iter().enumerate() {
+        let _ = write!(said, "{}{}", if i == 0 { "" } else { ", " }, Fault(f));
+    }
+    said
+}
 /// CPUID's RDTSCP (0x8000_0001 EDX), INVPCID (leaf 7 EBX) and RDPID (ECX).
 const EXT1_EDX_RDTSCP: u32 = 1 << 27;
 const LEAF7_EBX_INVPCID: u32 = 1 << 10;
@@ -3587,16 +3973,16 @@ fn run_tscaux_vm(machine: &Arc<Machine>, pattern: u32) -> core::result::Result<T
     let made = |e: hvarch::Error| alloc::format!("could not be made: {}", e);
     let Some(doorbells) = Doorbells::new(1) else { return Err(String::from("out of memory")) };
     let (guest, mut cpus) = LinuxGuest::new(machine, MEMORY, false, 1, Arc::new(doorbells), false, false).map_err(made)?;
-    let Some(mut bsp) = cpus.pop() else { return Err(String::from("no CPU")) };
+    let Some(bsp) = cpus.first_mut() else { return Err(String::from("no CPU")) };
     let m = guest.memory();
-    one_cpu_board(m, &mut bsp, TSCAUX_CODE)
+    one_cpu_board(m, &mut *bsp, TSCAUX_CODE)
         .and_then(|_| m.write_obj(TA_PATTERN, &u64::from(pattern)))
         .and_then(|_| m.write_obj(TA_ADDRESS, &ENTRY))
         .map_err(made)?;
     let start = time::boot_time_ns();
     let deadline = start.saturating_add(TSCAUX_BUDGET_MS * kcore::consts::NS_PER_MS);
-    let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
-    drop(bsp);
+    let counts = guest.run(&mut *bsp, machine, deadline, &Quiet);
+    drop(cpus);
     let us = time::boot_time_ns().saturating_sub(start) / kcore::consts::NS_PER_US;
     let stopped = guest.take_stopped()
         .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
@@ -3653,8 +4039,8 @@ fn run_tscaux(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
                      a.counts.exits, b.counts.exits, a.counts.msr_read, b.counts.msr_read, a.counts.msr_write,
                      b.counts.msr_write, a.counts.msr_gp, b.counts.msr_gp, a.counts.ud, b.counts.ud);
     let (mut says_a, mut says_b) = (String::new(), String::new());
-    let _ = describe_stop(&a.stopped.stop, &mut says_a);
-    let _ = describe_stop(&b.stopped.stop, &mut says_b);
+    let _ = describe_stop(&a.stopped.stop, 1, TSCAUX_BUDGET_MS, &mut says_a);
+    let _ = describe_stop(&b.stopped.stop, 1, TSCAUX_BUDGET_MS, &mut says_b);
     let _ = writeln!(out, "  stopped    vm A {}; vm B {}", says_a, says_b);
 
     match check_tscaux(a, b) {
@@ -3681,9 +4067,9 @@ fn tscaux_step(run: &TscAuxRun, at: usize, fault: u64, want: u64, what: &str) ->
     let (value, got) = (run.slots[at], run.slots[at + 1]);
     if got != fault || (fault == NO_FAULT && value != want) {
         return Err(if fault == NO_FAULT {
-            alloc::format!("{} read {:#x} with fault {}: wanted {:#x}", what, value, got, want)
+            alloc::format!("{} read {:#x} with fault {}: wanted {:#x}", what, value, Fault(got), want)
         } else {
-            alloc::format!("{} faulted with {}: wanted {}", what, got, fault)
+            alloc::format!("{} faulted with {}: wanted {}", what, Fault(got), Fault(fault))
         });
     }
     Ok(())
@@ -3735,7 +4121,8 @@ fn check_tscaux(a: &TscAuxRun, b: &TscAuxRun) -> core::result::Result<String, St
     for (name, run, pattern) in vms {
         let pattern = u64::from(pattern);
         if run.slots[TA_WRITE] != fault(tsc_aux, VECTOR_GP) {
-            return Err(alloc::format!("vm {}'s write of TSC_AUX faulted with {}", name, run.slots[TA_WRITE]));
+            return Err(alloc::format!("vm {}'s write of TSC_AUX faulted with {}: wanted {}", name,
+                                      Fault(run.slots[TA_WRITE]), Fault(fault(tsc_aux, VECTOR_GP))));
         }
         let want = fault(runs.rdtscp, VECTOR_UD);
         let (before, at, after) = (run.slots[TA_TSC_BEFORE], run.slots[TA_RDTSCP_TSC], run.slots[TA_TSC_AFTER]);
@@ -3744,16 +4131,16 @@ fn check_tscaux(a: &TscAuxRun, b: &TscAuxRun) -> core::result::Result<String, St
         {
             return Err(alloc::format!("vm {}'s RDTSCP read TSC_AUX {:#x} and the TSC {:#x} between {:#x} and {:#x}, \
                                        faulting with {}: wanted {:#x}, in order, and fault {}", name,
-                                      run.slots[TA_RDTSCP_AUX], at, before, after, run.slots[TA_RDTSCP_FAULT], pattern,
-                                      want));
+                                      run.slots[TA_RDTSCP_AUX], at, before, after,
+                                      Fault(run.slots[TA_RDTSCP_FAULT]), pattern, Fault(want)));
         }
         tscaux_step(run, TA_RDPID, fault(runs.rdpid, VECTOR_UD), pattern,
                     &alloc::format!("vm {}'s RDPID after its write", name))?;
         tscaux_step(run, TA_RDMSR, fault(tsc_aux, VECTOR_GP), pattern,
                     &alloc::format!("vm {}'s RDMSR after its write", name))?;
         if run.slots[TA_BAD_WRITE] != VECTOR_GP {
-            return Err(alloc::format!("vm {}'s write of TSC_AUX with bit 32 faulted with {}: wanted a #GP", name,
-                                      run.slots[TA_BAD_WRITE]));
+            return Err(alloc::format!("vm {}'s write of TSC_AUX with bit 32 faulted with {}: wanted a #GP(0)",
+                                      name, Fault(run.slots[TA_BAD_WRITE])));
         }
         tscaux_step(run, TA_AFTER_BAD, fault(tsc_aux, VECTOR_GP), pattern,
                     &alloc::format!("vm {}'s RDMSR after the write refused", name))?;
@@ -3766,8 +4153,8 @@ fn check_tscaux(a: &TscAuxRun, b: &TscAuxRun) -> core::result::Result<String, St
             [VECTOR_UD; TA_INVPCID_TYPES]
         };
         if types != want {
-            return Err(alloc::format!("vm {}'s INVPCID of types 0 to 4 faulted with {:?}: wanted {:?}", name, types,
-                                      want));
+            return Err(alloc::format!("vm {}'s INVPCID of types 0 to 4 faulted with {}: wanted {}", name,
+                                      faults(types), faults(&want)));
         }
     }
     for (name, run, _) in vms {
@@ -3782,9 +4169,11 @@ fn check_tscaux(a: &TscAuxRun, b: &TscAuxRun) -> core::result::Result<String, St
         }
     }
     let yes = |b: bool| if b { "yes" } else { "no" };
-    Ok(alloc::format!("RDTSCP {}, RDPID {}, INVPCID {}, as its CPUID said; vm B read TSC_AUX as 0 where vm A had left \
-                       its own, each read back the value it wrote -- bit 32 refused -- and INVPCID {}",
-                      yes(runs.rdtscp), yes(runs.rdpid), yes(runs.invpcid),
+    let host = host_has();
+    Ok(alloc::format!("RDTSCP {}, RDPID {}, INVPCID {}, as its CPUID said -- the CPU's own CPUID {} RDPID and {} \
+                       INVPCID; vm B read TSC_AUX as 0 where vm A had left its own, each read back the value it wrote \
+                       -- bit 32 refused -- and INVPCID {}",
+                      yes(runs.rdtscp), yes(runs.rdpid), yes(runs.invpcid), has(host.rdpid), has(host.invpcid),
                       if runs.invpcid { "ran types 0 to 3, 4 a #GP" } else { "was a #UD" }))
 }
 
@@ -3798,24 +4187,25 @@ const SPEC_ABOUT: &str = "two VMs on one CPU, one after the other: each reads wh
                           the host's alone again after, and each IBPB done before its next entry";
 
 /* A Linux guest's CPU, one, in long mode with an IDT of its own, whose #UD
- * and #GP handlers note the vector and go on past the step that faulted --
- * the address each step leaves at +0xF0, as the tscaux guest's do. It reads
+ * and #GP handlers note the vector -- a #GP's error code above it -- and go
+ * on past the step that faulted, the address each step leaves at +0xF0, as
+ * the tscaux guest's do. It reads
  * leaf 7's last subleaf and EDX, subleaf 2's EDX, 0x8000_0008's EBX and
  * 0x8000_0021's EAX; then IA32_SPEC_CTRL; writes the host's word at +0x100
  * into it -- every control its CPUID offers -- and reads it back; writes it
  * with bit 62 set as well and reads it again; writes IA32_PRED_CMD's IBPB
  * three times, reads PRED_CMD, and writes its bit 1; leaves its mark and
- * halts. Each step's value, and the vector it faulted with or 0, a quadword
- * each from `RESULTS` on. Assembled from this source with clang, the
+ * halts. Each step's value, and the vector it faulted with (`Fault`) or 0, a
+ * quadword each from `RESULTS` on. Assembled from this source with clang, the
  * offsets in the comments its listing's. */
 const SPEC_CODE: &[u8] = &[
     0x48, 0x8D, 0x05, 0xDC, 0x01, 0x00, 0x00,               // 00: start: lea rax, [rip + ud] ; gate 6, #UD
     0xBF, 0x60, 0xA0, 0x00, 0x00,                           // 07: mov edi, 0xA060
-    0xE8, 0xFE, 0x01, 0x00, 0x00,                           // 0c: call gate
+    0xE8, 0x06, 0x02, 0x00, 0x00,                           // 0c: call gate
     0x48, 0x8D, 0x05, 0xD8, 0x01, 0x00, 0x00,               // 11: lea rax, [rip + gp] ; gate 13, #GP
     0xBF, 0xD0, 0xA0, 0x00, 0x00,                           // 18: mov edi, 0xA0D0
-    0xE8, 0xED, 0x01, 0x00, 0x00,                           // 1d: call gate
-    0x0F, 0x01, 0x1D, 0x0C, 0x02, 0x00, 0x00,               // 22: lidt [rip + idtr]
+    0xE8, 0xF5, 0x01, 0x00, 0x00,                           // 1d: call gate
+    0x0F, 0x01, 0x1D, 0x14, 0x02, 0x00, 0x00,               // 22: lidt [rip + idtr]
     0x41, 0xBD, 0x00, 0x70, 0x00, 0x00,                     // 29: mov r13d, 0x7000 ; its results
     0x4D, 0x8B, 0xA5, 0x00, 0x01, 0x00, 0x00,               // 2f: mov r12, qword [r13 + 0x100] ; its SPEC_CTRL
     0xB8, 0x07, 0x00, 0x00, 0x00,                           // 36: mov eax, 7 ; what its CPUID offers
@@ -3918,30 +4308,34 @@ const SPEC_CODE: &[u8] = &[
     0xC3,                                                   // 1e2: ret
     0x49, 0xC7, 0x85, 0xF8, 0x00, 0x00, 0x00, 0x06,         // 1e3: ud: mov qword [r13 + 0xF8], 6 ; a #UD: the step's fault,
     0x00, 0x00, 0x00,
-    0xEB, 0x0F,                                             // 1ee: jmp recover
-    0x48, 0x83, 0xC4, 0x08,                                 // 1f0: gp: add rsp, 8 ; a #GP, its error code dropped
-    0x49, 0xC7, 0x85, 0xF8, 0x00, 0x00, 0x00, 0x0D,         // 1f4: mov qword [r13 + 0xF8], 13
-    0x00, 0x00, 0x00,
-    0x50,                                                   // 1ff: recover: push rax
-    0x49, 0x8B, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 200: mov rax, qword [r13 + 0xF0] ; and on past the step
-    0x48, 0x89, 0x44, 0x24, 0x08,                           // 207: mov qword [rsp + 8], rax
-    0x58,                                                   // 20c: pop rax
-    0x48, 0xCF,                                             // 20d: iretq
-    0x66, 0x89, 0x07,                                       // 20f: gate: mov word [rdi], ax ; a gate for rax
-    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // 212: mov word [rdi + 2], 0x08
-    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // 218: mov word [rdi + 4], 0x8E00
-    0x48, 0xC1, 0xE8, 0x10,                                 // 21e: shr rax, 16
-    0x66, 0x89, 0x47, 0x06,                                 // 222: mov word [rdi + 6], ax
+    0xEB, 0x17,                                             // 1ee: jmp recover
+    0x50,                                                   // 1f0: gp: push rax ; a #GP:
+    0x8B, 0x44, 0x24, 0x08,                                 // 1f1: mov eax, dword [rsp + 8] ; its error code,
+    0x48, 0xC1, 0xE0, 0x08,                                 // 1f5: shl rax, 8 ; above the vector,
+    0x0C, 0x0D,                                             // 1f9: or al, 13
+    0x49, 0x89, 0x85, 0xF8, 0x00, 0x00, 0x00,               // 1fb: mov qword [r13 + 0xF8], rax ; the step's fault
+    0x58,                                                   // 202: pop rax
+    0x48, 0x83, 0xC4, 0x08,                                 // 203: add rsp, 8 ; the error code
+    0x50,                                                   // 207: recover: push rax
+    0x49, 0x8B, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 208: mov rax, qword [r13 + 0xF0] ; and on past the step
+    0x48, 0x89, 0x44, 0x24, 0x08,                           // 20f: mov qword [rsp + 8], rax
+    0x58,                                                   // 214: pop rax
+    0x48, 0xCF,                                             // 215: iretq
+    0x66, 0x89, 0x07,                                       // 217: gate: mov word [rdi], ax ; a gate for rax
+    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // 21a: mov word [rdi + 2], 0x08
+    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // 220: mov word [rdi + 4], 0x8E00
     0x48, 0xC1, 0xE8, 0x10,                                 // 226: shr rax, 16
-    0x89, 0x47, 0x08,                                       // 22a: mov dword [rdi + 8], eax
-    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // 22d: mov dword [rdi + 12], 0
-    0xC3,                                                   // 234: ret
-    0xDF, 0x00,                                             // 235: idtr: dw 0xDF ; gates to 13
-    0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // 237: dq 0xA000
+    0x66, 0x89, 0x47, 0x06,                                 // 22a: mov word [rdi + 6], ax
+    0x48, 0xC1, 0xE8, 0x10,                                 // 22e: shr rax, 16
+    0x89, 0x47, 0x08,                                       // 232: mov dword [rdi + 8], eax
+    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // 235: mov dword [rdi + 12], 0
+    0xC3,                                                   // 23c: ret
+    0xDF, 0x00,                                             // 23d: idtr: dw 0xDF ; gates to 13
+    0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // 23f: dq 0xA000
 ];
 
 /* What the guest leaves at `RESULTS`, a quadword a slot: each step's value
- * and the vector it faulted with, 0 for none (`SG_*`); its mark at +0xC0;
+ * and the fault it took (`Fault`), 0 for none (`SG_*`); its mark at +0xC0;
  * what its CPUID offered at +0xC8 on; and what the host gives it, at +0x100. */
 const SG_SLOTS: usize = 13;
 /// SPEC_CTRL as it starts, with its fault; the fault of its write; SPEC_CTRL
@@ -3983,6 +4377,38 @@ const SPEC_BUDGET_MS: u64 = 10_000;
 
 /// What the guest's CPUID promised it of IA32_SPEC_CTRL and IA32_PRED_CMD,
 /// from the manuals: each control's bits, Intel's leaves and AMD's.
+/// What the host CPU's own CPUID says it has, read here and nowhere else in
+/// the hypervisor -- not through the functions (`fp::offered`,
+/// `spec::guest_controls`, `x86::offers`) that decide what a guest is
+/// offered, what its check expects and what `hv info` says, which agreeing
+/// among themselves held nothing to the CPU: a withheld feature's branch
+/// passed saying the CPU had none.
+struct HostHas {
+    pku: bool,
+    rdpid: bool,
+    invpcid: bool,
+    controls: hvarch::x86::spec::Controls,
+}
+
+fn host_has() -> HostHas {
+    use hvarch::x86::cpu::cpuid_count;
+    let (l7_eax, l7_ebx, l7_ecx, l7_edx) = cpuid_count(7, 0).map_or((0, 0, 0, 0), |c| (c.eax, c.ebx, c.ecx, c.edx));
+    let l72_edx = if l7_eax >= 2 { cpuid_count(7, 2).map_or(0, |c| c.edx) } else { 0 };
+    let e8_ebx = cpuid_count(0x8000_0008, 0).map_or(0, |c| c.ebx);
+    let e21_eax = cpuid_count(0x8000_0021, 0).map_or(0, |c| c.eax);
+    HostHas {
+        pku: l7_ecx & (1 << 3) != 0,
+        rdpid: l7_ecx & (1 << 22) != 0,
+        invpcid: l7_ebx & (1 << 10) != 0,
+        controls: sg_promised(l7_edx, l72_edx, e8_ebx, e21_eax),
+    }
+}
+
+/// "has" or "has no", for a sentence about what the CPU has.
+fn has(yes: bool) -> &'static str {
+    if yes { "has" } else { "has no" }
+}
+
 fn sg_promised(l7_edx: u32, l72_edx: u32, e8_ebx: u32, e21_eax: u32) -> hvarch::x86::spec::Controls {
     let bit = |word: u32, b: u32| word & (1 << b) != 0;
     let has = |yes: bool, v: u64| if yes { v } else { 0 };
@@ -4025,23 +4451,33 @@ fn run_spec_vm(machine: &Arc<Machine>, word: u64) -> core::result::Result<SpecRu
     let made = |e: hvarch::Error| alloc::format!("could not be made: {}", e);
     let Some(doorbells) = Doorbells::new(1) else { return Err(String::from("out of memory")) };
     let (guest, mut cpus) = LinuxGuest::new(machine, MEMORY, false, 1, Arc::new(doorbells), false, false).map_err(made)?;
-    let Some(mut bsp) = cpus.pop() else { return Err(String::from("no CPU")) };
+    let Some(bsp) = cpus.first_mut() else { return Err(String::from("no CPU")) };
     let m = guest.memory();
-    one_cpu_board(m, &mut bsp, SPEC_CODE).and_then(|_| m.write_obj(SG_WORD, &word)).map_err(made)?;
+    one_cpu_board(m, &mut *bsp, SPEC_CODE).and_then(|_| m.write_obj(SG_WORD, &word)).map_err(made)?;
+    /* What its entries ran under read off the CPU, not what was meant */
+    match bsp.backend_mut() {
+        Backend::Svm(v) => v.msrs_mut().measure(),
+        Backend::Vmx(v) => v.msrs_mut().measure(),
+    }
     let start = time::boot_time_ns();
     let deadline = start.saturating_add(SPEC_BUDGET_MS * kcore::consts::NS_PER_MS);
-    let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
-    /* Asked here, on the CPU it ran on, after its last exit. */
+    let counts = guest.run(&mut *bsp, machine, deadline, &Quiet);
+    /* Asked here, on the CPU it ran on, after its last exit -- held to be
+     * that CPU below. */
+    let here = kcore::cpu::id();
     let held = hvarch::x86::spec::held();
     let (asked, answered, ran_with) = match &*bsp.backend_mut() {
         Backend::Svm(v) => (v.msrs().ibpbs(), v.msrs().answered(), v.msrs().ran_with()),
         Backend::Vmx(v) => (v.msrs().ibpbs(), v.msrs().answered(), v.msrs().ran_with()),
     };
-    drop(bsp);
+    drop(cpus);
     let us = time::boot_time_ns().saturating_sub(start) / kcore::consts::NS_PER_US;
     let stopped = guest.take_stopped()
         .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
     let cpu = guest.cpu_states().first().and_then(|&(_, h)| h);
+    if let Some(ran) = cpu.filter(|&c| c != here) {
+        return Err(alloc::format!("it ran on cpu {}, and IA32_SPEC_CTRL was read back on cpu {}", ran, here));
+    }
     let unread = |e: hvarch::Error| alloc::format!("its results cannot be read: {}", e);
     let mut slots = [0u64; SG_SLOTS];
     for (i, slot) in slots.iter_mut().enumerate() {
@@ -4049,7 +4485,13 @@ fn run_spec_vm(machine: &Arc<Machine>, word: u64) -> core::result::Result<SpecRu
     }
     let dword = |at: u64| m.read_obj::<u32>(at).map_err(unread);
     let told = sg_promised(dword(SG_LEAF7_EDX)?, dword(SG_LEAF7_2_EDX)?, dword(SG_EXT8_EBX)?, dword(SG_EXT21_EAX)?);
-    let _ = dword(SG_LEAF7_EAX)?;
+    /* Subleaf 2 is read by a kernel only where leaf 7's EAX says it is
+     * there: controls it offers past that are offered to nobody. */
+    let (last, sub2) = (dword(SG_LEAF7_EAX)?, dword(SG_LEAF7_2_EDX)?);
+    if sub2 != 0 && last < 2 {
+        return Err(alloc::format!("leaf 7.2 EDX offers {:#x}, and leaf 7's EAX says its last subleaf is {}", sub2,
+                                  last));
+    }
     Ok(SpecRun { cpu, us, counts, stopped, slots, told, done: dword(SG_DONE)?, asked, answered, ran_with, held })
 }
 
@@ -4059,9 +4501,15 @@ fn run_spec_vm(machine: &Arc<Machine>, word: u64) -> core::result::Result<SpecRu
 fn run_spec_guest(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", SPEC_NAME, SPEC_ABOUT);
     let controls = hvarch::x86::spec::guest_controls();
-    let word = if controls.spec_ctrl != 0 { controls.spec_ctrl } else { SG_NONE_OFFERED };
+    /* Every control for vm A, the lowest one alone for vm B: B under A's
+     * bits shows where the two are not one. */
+    let words = if controls.spec_ctrl != 0 {
+        [controls.spec_ctrl, controls.spec_ctrl & controls.spec_ctrl.wrapping_neg()]
+    } else {
+        [SG_NONE_OFFERED; 2]
+    };
     let mut runs = alloc::vec::Vec::new();
-    for _ in 0..2 {
+    for word in words {
         match run_spec_vm(machine, word) {
             Ok(run) => {
                 if let GuestStop::Refused(Refusal::NotOn(cpu)) = run.stopped.stop {
@@ -4089,11 +4537,11 @@ fn run_spec_guest(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "  controls   SPEC_CTRL {:#x}, PRED_CMD {:#x}; IBPBs asked {} and {}, answered {} and {}",
                      controls.spec_ctrl, controls.pred_cmd, a.asked, b.asked, a.answered, b.answered);
     let (mut says_a, mut says_b) = (String::new(), String::new());
-    let _ = describe_stop(&a.stopped.stop, &mut says_a);
-    let _ = describe_stop(&b.stopped.stop, &mut says_b);
+    let _ = describe_stop(&a.stopped.stop, 1, SPEC_BUDGET_MS, &mut says_a);
+    let _ = describe_stop(&b.stopped.stop, 1, SPEC_BUDGET_MS, &mut says_b);
     let _ = writeln!(out, "  stopped    vm A {}; vm B {}", says_a, says_b);
 
-    match check_spec(a, b, controls, word) {
+    match check_spec(a, b, controls, words) {
         Ok(checked) => {
             let _ = writeln!(out, "  checked    {}", checked);
             let _ = writeln!(out, "hv: guest {} ok", SPEC_NAME);
@@ -4121,7 +4569,7 @@ fn run_spec_guest(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
 /// its next entry; a read of PRED_CMD and its bit 1 a #GP each, and where
 /// neither MSR is offered every access to it a #GP; and the run loop saw
 /// every RDMSR and WRMSR.
-fn check_spec(a: &SpecRun, b: &SpecRun, controls: hvarch::x86::spec::Controls, word: u64)
+fn check_spec(a: &SpecRun, b: &SpecRun, controls: hvarch::x86::spec::Controls, words: [u64; 2])
     -> core::result::Result<String, String>
 {
     let spec_ctrl = controls.spec_ctrl != 0;
@@ -4130,13 +4578,13 @@ fn check_spec(a: &SpecRun, b: &SpecRun, controls: hvarch::x86::spec::Controls, w
     if a.cpu.is_none() || a.cpu != b.cpu {
         return Err(alloc::format!("the VMs ran on {:?} and {:?}: not one CPU", a.cpu, b.cpu));
     }
-    let vms = [("A", a), ("B", b)];
-    for (name, run) in vms {
+    let vms = [("A", a, words[0]), ("B", b, words[1])];
+    for (name, run, _) in vms {
         if !matches!(run.stopped.stop, GuestStop::Halted { .. }) || run.done != SG_MARK {
             return Err(alloc::format!("vm {} did not run to its halt: its mark is {:#x}", name, run.done));
         }
     }
-    for (name, run) in vms {
+    for (name, run, _) in vms {
         if run.told != controls {
             return Err(alloc::format!("vm {}'s CPUID promised SPEC_CTRL {:#x} and PRED_CMD {:#x}: wanted {:#x} and \
                                        {:#x}, what the host switches", name, run.told.spec_ctrl,
@@ -4145,14 +4593,14 @@ fn check_spec(a: &SpecRun, b: &SpecRun, controls: hvarch::x86::spec::Controls, w
     }
     /* What each was to see first -- 0 where the other had left its own --
      * before the rest. */
-    for (name, run) in vms {
+    for (name, run, _) in vms {
         let s = &run.slots;
         if s[SG_FIRST + 1] != fault(spec_ctrl) || (spec_ctrl && s[SG_FIRST] != 0) {
             return Err(alloc::format!("vm {}'s SPEC_CTRL as it started read {:#x} with fault {}: wanted 0, fault {}",
-                                      name, s[SG_FIRST], s[SG_FIRST + 1], fault(spec_ctrl)));
+                                      name, s[SG_FIRST], Fault(s[SG_FIRST + 1]), Fault(fault(spec_ctrl))));
         }
     }
-    for (name, run) in vms {
+    for (name, run, word) in vms {
         let s = &run.slots;
         /* A read that does not fault reads its value back; one that faults
          * has none to read. */
@@ -4163,34 +4611,36 @@ fn check_spec(a: &SpecRun, b: &SpecRun, controls: hvarch::x86::spec::Controls, w
             || !read_ok(SG_AFTER_BAD, word)
         {
             return Err(alloc::format!("vm {}'s SPEC_CTRL: its write of {:#x} faulted with {}, read back {:#x} ({}), \
-                                       the write with bit 62 faulted with {}, read again {:#x} ({})", name, word,
-                                      s[SG_WRITE], s[SG_BACK], s[SG_BACK + 1], s[SG_BAD_WRITE], s[SG_AFTER_BAD],
-                                      s[SG_AFTER_BAD + 1]));
+                                       the write with bit 62 faulted with {}, read again {:#x} ({}): wanted {} for \
+                                       each but the write with bit 62, a #GP(0)", name, word, Fault(s[SG_WRITE]),
+                                      s[SG_BACK], Fault(s[SG_BACK + 1]), Fault(s[SG_BAD_WRITE]), s[SG_AFTER_BAD],
+                                      Fault(s[SG_AFTER_BAD + 1]), Fault(fault(spec_ctrl))));
         }
     }
-    for (name, run) in vms {
+    for (name, run, word) in vms {
         let host = hvarch::x86::spec::host_spec_ctrl();
         let want = host.map(|h| h | if spec_ctrl { word } else { 0 });
         if run.ran_with != want || run.held != host.map(|_| true) {
-            return Err(alloc::format!("vm {}'s last entry ran under SPEC_CTRL {:x?} and the CPU's after it was the \
-                                       host's: {:x?} -- wanted {:x?}, the host's {:x?} with its own over it, and \
-                                       the host's alone after", name, run.ran_with, run.held, want, host));
+            return Err(alloc::format!("vm {}'s last entry ran under SPEC_CTRL {:x?}, read off the CPU, and the CPU's \
+                                       after it was the host's: {:x?} -- wanted {:x?}, the host's {:x?} with its own \
+                                       over it, and the host's alone after", name, run.ran_with, run.held, want,
+                                      host));
         }
     }
-    for (name, run) in vms {
+    for (name, run, _) in vms {
         let s = &run.slots;
         let ibpbs = &s[SG_IBPBS..SG_IBPBS + SG_IBPBS_ASKED as usize];
         let asked = if ibpb { SG_IBPBS_ASKED } else { 0 };
         if ibpbs.iter().any(|&f| f != fault(ibpb)) || run.asked != asked || run.answered != asked
             || s[SG_PRED_READ] != VECTOR_GP || s[SG_PRED_BAD] != VECTOR_GP
         {
-            return Err(alloc::format!("vm {}'s IBPBs faulted with {:?}, {} asked and {} answered, its read of \
+            return Err(alloc::format!("vm {}'s IBPBs faulted with {}, {} asked and {} answered, its read of \
                                        PRED_CMD with {} and its bit 1 with {}: wanted {} each, {} asked and answered, \
-                                       and a #GP for both", name, ibpbs, run.asked, run.answered, s[SG_PRED_READ],
-                                      s[SG_PRED_BAD], fault(ibpb), asked));
+                                       and a #GP(0) for both", name, faults(ibpbs), run.asked, run.answered,
+                                      Fault(s[SG_PRED_READ]), Fault(s[SG_PRED_BAD]), Fault(fault(ibpb)), asked));
         }
     }
-    for (name, run) in vms {
+    for (name, run, _) in vms {
         let c = &run.counts;
         /* SPEC_CTRL's write with bit 62 -- or where it is not offered all
          * five of its accesses -- PRED_CMD's read and bit 1, and its IBPBs
@@ -4203,13 +4653,18 @@ fn check_spec(a: &SpecRun, b: &SpecRun, controls: hvarch::x86::spec::Controls, w
         }
     }
     Ok(match (spec_ctrl, ibpb) {
-        (false, false) => String::from("no speculation control offered, as the CPU has none: every access to \
-                                        SPEC_CTRL and PRED_CMD a #GP"),
+        (false, false) => {
+            let host = host_has().controls;
+            alloc::format!("no speculation control offered, as the host switches none -- the CPU's own CPUID offers \
+                            SPEC_CTRL {:#x} and PRED_CMD {:#x}: every access to SPEC_CTRL and PRED_CMD a #GP",
+                           host.spec_ctrl, host.pred_cmd)
+        }
         _ => alloc::format!("SPEC_CTRL {:#x} and PRED_CMD {:#x} offered, as the host switches them; vm B read \
-                             SPEC_CTRL as 0 where vm A had left {:#x}, each read back its own and ran under it over \
-                             the host's, bit 62 refused, the CPU's the host's alone after; {} IBPBs asked each, all \
-                             answered before the next entry; PRED_CMD's read and bit 1 a #GP",
-                            controls.spec_ctrl, controls.pred_cmd, word, if ibpb { SG_IBPBS_ASKED } else { 0 }),
+                             SPEC_CTRL as 0 where vm A had left {:#x}, each read back its own ({:#x} and {:#x}) and \
+                             ran under it over the host's, as read off the CPU, bit 62 refused, the CPU's the host's \
+                             alone after; {} IBPBs asked each, all answered before the next entry; PRED_CMD's read \
+                             and bit 1 a #GP", controls.spec_ctrl, controls.pred_cmd, words[0], words[0], words[1],
+                            if ibpb { SG_IBPBS_ASKED } else { 0 }),
     })
 }
 
@@ -4430,10 +4885,10 @@ fn run_pkru(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
         Ok(made) => made,
         Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
     };
-    let Some(ap) = cpus.pop() else { return fail(out, "no second CPU") };
-    let Some(mut bsp) = cpus.pop() else { return fail(out, "no first CPU") };
+    let Some(ap) = second_cpu(&mut cpus) else { return fail(out, "no second CPU") };
+    let Some(bsp) = cpus.first_mut() else { return fail(out, "no first CPU") };
     let m = guest.memory();
-    let board = smp_board(m, &mut bsp, PKRU_CODE, AVX_AP_CODE).and_then(|_| {
+    let board = smp_board(m, &mut *bsp, PKRU_CODE, AVX_AP_CODE).and_then(|_| {
         for (&at, &(pkru, xcr0)) in PK_RESULTS.iter().zip(PK_CPUS.iter()) {
             m.write_obj(at + PK_OWN, &pkru)?;
             m.write_obj(at + PK_WANT_XCR0, &xcr0)?;
@@ -4456,11 +4911,11 @@ fn run_pkru(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let here = 1u64 << kcore::cpu::id();
     let start = time::boot_time_ns();
     let deadline = start.saturating_add(PKRU_BUDGET_MS * kcore::consts::NS_PER_MS);
-    let second = AvxCpu { guest: guest.clone(), cpu: ap, machine: machine.clone(), deadline, ran: ran[1].clone() };
+    let second = AvxCpu { guest: guest.clone(), cpus: ap, machine: machine.clone(), deadline, ran: ran[1].clone() };
     let Some(second) = kcore::task::spawn_on_with("hv/pkru/cpu1", here, second, avx_cpu) else {
         return fail(out, "no task for its second CPU");
     };
-    let first = AvxCpu { guest: guest.clone(), cpu: bsp, machine: machine.clone(), deadline, ran: ran[0].clone() };
+    let first = AvxCpu { guest: guest.clone(), cpus, machine: machine.clone(), deadline, ran: ran[0].clone() };
     let first = kcore::task::spawn_on_with("hv/pkru/cpu0", here, first, avx_cpu);
     if first.is_none() {
         guest.stop(GuestStop::Requested);
@@ -4493,7 +4948,7 @@ fn run_pkru(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
                      counts[1].hlt);
     let _ = writeln!(out, "  registers  put back into the CPU {} times for cpu 0, {} for cpu 1", loads[0], loads[1]);
     let mut says = String::new();
-    let _ = describe_stop(&stopped.stop, &mut says);
+    let _ = describe_stop(&stopped.stop, 2, PKRU_BUDGET_MS, &mut says);
     let _ = writeln!(out, "  stopped    {}", says);
 
     match check_pkru(guest.memory(), &stopped, loads, &hosts) {
@@ -4580,8 +5035,8 @@ fn check_pkru(m: &GuestMemory, stopped: &Stopped, loads: [u64; 2], hosts: &[Opti
         }
     }
     if !pku {
-        return Ok(alloc::format!("no PKU offered, as this CPU switches no PKRU: RDPKRU a #UD; all {} turns each \
-                                  taken", PK_TURNS_EACH));
+        return Ok(alloc::format!("no PKU offered, as this CPU switches no PKRU -- its own CPUID {} PKU: RDPKRU a #UD; \
+                                  all {} turns each taken", has(host_has().pku), PK_TURNS_EACH));
     }
     /* The area's sizes, as a CPU computes them: AVX's end, or PKRU's past it,
      * at the offset the host's CPUID gives it. */
@@ -4630,13 +5085,14 @@ const CR4_ABOUT: &str = "a guest's CR4: MCE cleared in what it reads back and ke
                          does not offer, PAE cleared in long mode and a reserved bit each a #GP";
 
 /* A Linux guest's CPU, one, in long mode with an IDT of its own, whose #GP
- * handler counts each, keeps its error code and steps over the 3-byte `mov`
- * that raised it. It reads CR4; writes PAE alone, MCE cleared; then PAE and
- * a bit its CPUID does not offer, which the host gives it at +0x37 -- the
- * `mov`'s immediate (`cr4_refused_bit`); then 0, PAE cleared in long mode;
- * then PAE and PGE through R9, read back through R13; then a bit above 31 --
- * reading CR4 after each -- and leaves its mark and halts. Assembled from
- * this source with clang, the offsets in the comments its listing's. */
+ * handler counts each, ORs its error code into what the others' left and
+ * steps over the 3-byte `mov` that raised it. It reads CR4; writes PAE
+ * alone, MCE cleared; then PAE and a bit its CPUID does not offer, which
+ * the host gives it at +0x37 -- the `mov`'s immediate (`cr4_refused_bit`);
+ * then 0, PAE cleared in long mode; then PAE and PGE through R9, read back
+ * through R13; then a bit above 31 -- reading CR4 after each -- and leaves
+ * its mark and halts. Assembled from this source with clang, the offsets in
+ * the comments its listing's. */
 const CR4_CODE: &[u8] = &[
     0x48, 0x8D, 0x05, 0xB5, 0x00, 0x00, 0x00,               // 00: lea rax, [rip + gp] ; gate 13, #GP
     0xBF, 0xD0, 0xA0, 0x00, 0x00,                           // 07: mov edi, 0xA0D0
@@ -4680,8 +5136,8 @@ const CR4_CODE: &[u8] = &[
     0xC3,                                                   // bb: ret
     0x50,                                                   // bc: gp: push rax
     0xFF, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // bd: inc dword [0x7000] ; how many
-    0x8B, 0x44, 0x24, 0x08,                                 // c4: mov eax, dword [rsp + 8] ; its error code
-    0x89, 0x04, 0x25, 0x04, 0x70, 0x00, 0x00,               // c8: mov dword [0x7004], eax
+    0x8B, 0x44, 0x24, 0x08,                                 // c4: mov eax, dword [rsp + 8] ; its error code,
+    0x09, 0x04, 0x25, 0x04, 0x70, 0x00, 0x00,               // c8: or dword [0x7004], eax ; with the others'
     0x48, 0x83, 0x44, 0x24, 0x10, 0x03,                     // cf: add qword [rsp + 16], 3 ; past the mov
     0x58,                                                   // d5: pop rax
     0x48, 0x83, 0xC4, 0x08,                                 // d6: add rsp, 8 ; the error code
@@ -4690,9 +5146,9 @@ const CR4_CODE: &[u8] = &[
     0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // dq 0xA000
 ];
 
-/* What the guest leaves at `RESULTS`: the #GPs its handler took at +0, the
- * last one's error code at +4, the six CR4s it read at +8 on, and 'CR4!' at
- * +0x38 once done. */
+/* What the guest leaves at `RESULTS`: the #GPs its handler took at +0, their
+ * error codes ORed at +4, the six CR4s it read at +8 on, and 'CR4!' at +0x38
+ * once done. */
 const CR4_GPS: u64 = RESULTS;
 const CR4_ERROR: u64 = RESULTS + 0x4;
 const CR4_READS: u64 = RESULTS + 0x8;
@@ -4751,11 +5207,11 @@ fn run_cr4(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
         Ok(made) => made,
         Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
     };
-    let Some(mut bsp) = cpus.pop() else { return fail(out, "no CPU") };
+    let Some(bsp) = cpus.first_mut() else { return fail(out, "no CPU") };
     let refused = cr4_refused_bit();
     /* PAE and the bit, in 32 bits: the immediate of a `mov eax`. */
     let immediate = (CR4_PAE | refused) as u32;
-    if let Err(e) = one_cpu_board(guest.memory(), &mut bsp, CR4_CODE)
+    if let Err(e) = one_cpu_board(guest.memory(), &mut *bsp, CR4_CODE)
         .and_then(|_| guest.memory().write_obj(CR4_REFUSED_AT, &immediate))
     {
         return fail(out, &alloc::format!("could not be made: {}", e));
@@ -4763,7 +5219,7 @@ fn run_cr4(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let vmx = matches!(machine.ext(), Ok(hvarch::Ext::Vmx));
     let start = time::boot_time_ns();
     let deadline = start.saturating_add(CR4_BUDGET_MS * kcore::consts::NS_PER_MS);
-    let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
+    let counts = guest.run(&mut *bsp, machine, deadline, &Quiet);
     /* The CR4 the guest believes it has, the one the CPU ran it with, and
      * whether its VMCB asked to stop its reads of CR4 -- its VMCS, to keep
      * MCE for the host. */
@@ -4776,7 +5232,7 @@ fn run_cr4(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
             Backend::Vmx(v) => v.cr4_mask() & CR4_MCE != 0,
         },
     };
-    drop(bsp);
+    drop(cpus);
     let ns = time::boot_time_ns().saturating_sub(start);
     let stopped = guest.take_stopped()
         .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
@@ -4791,7 +5247,7 @@ fn run_cr4(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     }
     let _ = writeln!(out, "  exits      {}, {} of CR4 performed, {} refused", counts.exits, counts.cr4, counts.cr4_gp);
     let mut says = String::new();
-    let _ = describe_stop(&stopped.stop, &mut says);
+    let _ = describe_stop(&stopped.stop, 1, CR4_BUDGET_MS, &mut says);
     let _ = writeln!(out, "  stopped    {}", says);
 
     match check_cr4(guest.memory(), &stopped, &counts, &held, vmx, refused) {
@@ -4871,7 +5327,7 @@ fn check_cr4(m: &GuestMemory, stopped: &Stopped, counts: &Counts, held: &Held, v
             return Err(alloc::format!("it read CR4 {:#x?}, not {:#x?}", reads, want));
         }
         if gps != CR4_REFUSED || error != 0 {
-            return Err(alloc::format!("its #GPs were {}, the last's error code {:#x}: wanted {} and 0", gps, error,
+            return Err(alloc::format!("its #GPs were {}, their error codes ORed {:#x}: wanted {} and 0", gps, error,
                                       CR4_REFUSED));
         }
         if held.believed != CR4_PAE | CR4_PGE || held.register & !CR4_VMXE != CR4_PAE | CR4_PGE | CR4_MCE {
@@ -4905,7 +5361,7 @@ fn check_cr4(m: &GuestMemory, stopped: &Stopped, counts: &Counts, held: &Held, v
                                   if tcg { ", the register's on QEMU's TCG" } else { "" }));
     }
     if gps != CR4_REFUSED || error != 0 {
-        return Err(alloc::format!("its #GPs were {}, the last's error code {:#x}: wanted {} and 0", gps, error,
+        return Err(alloc::format!("its #GPs were {}, their error codes ORed {:#x}: wanted {} and 0", gps, error,
                                   CR4_REFUSED));
     }
     if held.believed != CR4_PAE | CR4_PGE || held.register != CR4_PAE | CR4_PGE | CR4_MCE {
@@ -4944,16 +5400,16 @@ const MSR_ABOUT: &str = "a guest's MSRs: VIRT_SPEC_CTRL and FLUSH_CMD, which its
                          registers and the PAT answered; and CPUID with no VIRT_SSBD, no INVLPGB and no PMU in it";
 
 /* A Linux guest's CPU, one, in long mode with an IDT of its own, whose #GP
- * handler counts each, keeps the MSR it was refused (ECX, eight at most)
- * and its error code, and steps over the 2-byte `rdmsr` or `wrmsr` that
- * raised it. It reads AMD's VIRT_SPEC_CTRL and writes an L1D flush to
- * FLUSH_CMD -- neither offered, where SPEC_CTRL and PRED_CMD may be (the
- * `spec` guest's); reads AMD's LS_CFG, which this policy names for no CPU;
- * turns its MTRRs on,
- * write-back; reads MCG_CAP, MCG_STATUS and the PAT; turns the MTRRs off --
- * which they are; then asks CPUID for 0x8000_0008, 0xA, 0 and 1 -- and
- * leaves its mark and halts. Assembled from this source with clang, the
- * offsets in the comments its listing's. */
+ * handler counts each, keeps the MSR it was refused (ECX, eight at most),
+ * ORs its error code into what the others' left, and steps over the 2-byte
+ * `rdmsr` or `wrmsr` that raised it. It reads AMD's VIRT_SPEC_CTRL and
+ * writes an L1D flush to FLUSH_CMD -- neither offered, where SPEC_CTRL and
+ * PRED_CMD may be (the `spec` guest's); reads AMD's LS_CFG, which this
+ * policy names for no CPU; turns its MTRRs on, write-back; reads MCG_CAP,
+ * MCG_STATUS and the PAT; turns the MTRRs off -- which they are; then asks
+ * CPUID for 0x8000_0008, 0xA, 0 and 1 -- and leaves its mark and halts.
+ * Assembled from this source with clang, the offsets in the comments its
+ * listing's. */
 const MSR_CODE: &[u8] = &[
     0x48, 0x8D, 0x05, 0xF3, 0x00, 0x00, 0x00,               // 00: lea rax, [rip + gp] ; gate 13, #GP
     0xBF, 0xD0, 0xA0, 0x00, 0x00,                           // 07: mov edi, 0xA0D0
@@ -5020,8 +5476,8 @@ const MSR_CODE: &[u8] = &[
     0x83, 0xE0, 0x07,                                       // 102: and eax, 7
     0x89, 0x0C, 0x85, 0x40, 0x70, 0x00, 0x00,               // 105: mov dword [0x7040 + rax * 4], ecx ; which MSR
     0xFF, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // 10c: inc dword [0x7000]
-    0x8B, 0x44, 0x24, 0x08,                                 // 113: mov eax, dword [rsp + 8] ; its error code
-    0x89, 0x04, 0x25, 0x04, 0x70, 0x00, 0x00,               // 117: mov dword [0x7004], eax
+    0x8B, 0x44, 0x24, 0x08,                                 // 113: mov eax, dword [rsp + 8] ; its error code,
+    0x09, 0x04, 0x25, 0x04, 0x70, 0x00, 0x00,               // 117: or dword [0x7004], eax ; with the others'
     0x48, 0x83, 0x44, 0x24, 0x10, 0x02,                     // 11e: add qword [rsp + 16], 2 ; past the rdmsr or wrmsr
     0x58,                                                   // 124: pop rax
     0x48, 0x83, 0xC4, 0x08,                                 // 125: add rsp, 8 ; the error code
@@ -5030,8 +5486,8 @@ const MSR_CODE: &[u8] = &[
     0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // dq 0xA000
 ];
 
-/* What the guest leaves at `RESULTS`: the #GPs its handler took at +0, the
- * last one's error code at +4; MCG_CAP, MCG_STATUS and the PAT at +0x10,
+/* What the guest leaves at `RESULTS`: the #GPs its handler took at +0, their
+ * error codes ORed at +4; MCG_CAP, MCG_STATUS and the PAT at +0x10,
  * +0x18 and +0x20; CPUID 0x8000_0008's EBX, 0xA's EAX, 0's EAX and 1's ECX
  * at +0x28 on; 'MSR!' at +0x38 once done; and the MSR of each #GP, in turn,
  * at +0x40. */
@@ -5076,14 +5532,14 @@ fn run_msr(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
         Ok(made) => made,
         Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
     };
-    let Some(mut bsp) = cpus.pop() else { return fail(out, "no CPU") };
-    if let Err(e) = one_cpu_board(guest.memory(), &mut bsp, MSR_CODE) {
+    let Some(bsp) = cpus.first_mut() else { return fail(out, "no CPU") };
+    if let Err(e) = one_cpu_board(guest.memory(), &mut *bsp, MSR_CODE) {
         return fail(out, &alloc::format!("could not be made: {}", e));
     }
     let start = time::boot_time_ns();
     let deadline = start.saturating_add(MSR_BUDGET_MS * kcore::consts::NS_PER_MS);
-    let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
-    drop(bsp);
+    let counts = guest.run(&mut *bsp, machine, deadline, &Quiet);
+    drop(cpus);
     let ns = time::boot_time_ns().saturating_sub(start);
     let stopped = guest.take_stopped()
         .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
@@ -5099,7 +5555,7 @@ fn run_msr(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "  exits      {}, {} rdmsr, {} wrmsr, {} refused", counts.exits, counts.msr_read,
                      counts.msr_write, counts.msr_gp);
     let mut says = String::new();
-    let _ = describe_stop(&stopped.stop, &mut says);
+    let _ = describe_stop(&stopped.stop, 1, MSR_BUDGET_MS, &mut says);
     let _ = writeln!(out, "  stopped    {}", says);
 
     match check_msr(guest.memory(), &stopped, &counts, &guest.msr_faults()) {
@@ -5138,8 +5594,8 @@ fn check_msr(m: &GuestMemory, stopped: &Stopped, counts: &Counts, faults: &[(u32
         *r = m.read_obj::<u32>(MSR_REFUSALS + 4 * i as u64).map_err(unread)?;
     }
     if gps as usize != MSR_REFUSED.len() || refused != MSR_REFUSED || error != 0 {
-        return Err(alloc::format!("its #GPs were {}, at MSRs {:#x?}, the last's error code {:#x}: wanted {:#x?} \
-                                   and 0", gps, refused, error, MSR_REFUSED));
+        return Err(alloc::format!("its #GPs were {}, at MSRs {:#x?}, their error codes ORed {:#x}: wanted \
+                                   {:#x?} and 0", gps, refused, error, MSR_REFUSED));
     }
     let host_saw: alloc::vec::Vec<u32> = faults.iter().map(|&(msr, _, _)| msr).collect();
     if counts.msr_gp != MSR_REFUSED.len() as u64 || host_saw != MSR_REFUSED
@@ -5238,10 +5694,47 @@ fn board(vm: &mut Vm, code: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// How a guest of this harness, let run for `budget_ms`, stopped, in a line.
+fn describe(stop: &Stop, budget_ms: u64, out: &mut dyn Write) -> core::fmt::Result {
+    match *stop {
+        Stop::Halted { rip } => write!(out, "hlt at {:#x}", rip),
+        Stop::Fault { gpa, error, rip } => {
+            write!(out, "nested page fault at gpa {:#x}, error {:#x}, rip {:#x}", gpa, error, rip)
+        }
+        Stop::Shutdown { rip } => write!(out, "shutdown (triple fault) at {:#x}", rip),
+        Stop::Exception { vector, error, rip } => match error {
+            Some(code) => write!(out, "exception {} error {:#x} at {:#x}", vector, code, rip),
+            None => write!(out, "exception {} at {:#x}", vector, rip),
+        },
+        Stop::MachineCheck { rip } => write!(out, "MACHINE CHECK while the guest ran, at {:#x}", rip),
+        Stop::Budget => write!(out, "by the host, after {} ms", budget_ms),
+        Stop::Refused(Refusal::Vmcb(rule)) => write!(out, "not entered -- the VMCB breaks a rule: {}", rule),
+        Stop::Refused(Refusal::NotOn(cpu)) => write!(out, "not entered -- the extension went off for cpu {}", cpu),
+        Stop::Refused(Refusal::FiveLevelPaging(cpu)) => write!(
+            out, "not entered -- cpu {} translates with five levels, and a nested table of four would be walked as \
+                  five", cpu),
+        Stop::Refused(Refusal::Flush(cpu)) => write!(
+            out, "not entered -- cpu {} would not drop what it had cached through the nested table (INVEPT)", cpu),
+        Stop::Refused(Refusal::NotItsMemory) => write!(
+            out, "not entered -- the CPU was handed memory other than its guest's"),
+        Stop::Refused(Refusal::Controls { cpu, field, missing }) => write!(
+            out, "not entered -- cpu {} will not take the {} controls {:#x}, which the host needs", cpu, field,
+            missing),
+        Stop::Refused(Refusal::Xstate { cpu, xcr0 }) => write!(
+            out, "not entered -- cpu {} does not switch every component of the guest's XCR0, {:#x}", cpu, xcr0),
+        Stop::Invalid => write!(out, "the CPU refused the entry (VMEXIT_INVALID on AMD-V, a VM-entry failure on VT-x)"),
+        Stop::Unexpected { exit, rip } => write!(out, "an exit with no answer here: {:?} at {:#x}", exit, rip),
+    }
+}
+
 fn halted_at(r: &Run, rip: u64) -> core::result::Result<(), String> {
     match r.stop {
         Stop::Halted { rip: at } if at == rip => Ok(()),
-        _ => Err(String::from("it did not stop at its hlt")),
+        ref other => {
+            let mut how = String::new();
+            let _ = describe(other, r.budget_ms, &mut how);
+            Err(alloc::format!("it did not stop at its hlt at {:#x}: {}", rip, how))
+        }
     }
 }
 
@@ -5310,26 +5803,76 @@ fn check_exits(vm: &Vm, r: &Run) -> core::result::Result<String, String> {
 /* An 8250 brought up the way a driver does -- disable interrupts, set the
  * divisor behind DLAB, 8N1, the FIFO on, DTR/RTS/OUT2 -- then a line polled
  * out of LSR.THRE a byte at a time. It writes 0xA5 to the scratch register
- * and reads it back first, a presence test the emulated UART has to pass. */
+ * and reads it back first, a presence test the emulated UART has to pass,
+ * and leaves what it read for the check: it once read it into R8 and
+ * nothing looked, so any scratch register passed. */
 const UART_CODE: &[u8] = &[
-    0x66, 0xBA, 0xF9, 0x03, 0x30, 0xC0, 0xEE, 0x66, 0xBA, 0xFB, 0x03, 0xB0, 0x80, 0xEE, 0x66, 0xBA, 0xF8, 0x03, 0xB0, 0x01, 0xEE, 0x66, 0xBA, 0xF9, 0x03, 0x30, 0xC0, 0xEE, 0x66, 0xBA, 0xFB, 0x03, 0xB0, 0x03, 0xEE, 0x66, 0xBA, 0xFA, 0x03, 0xB0, 0xC7, 0xEE, 0x66, 0xBA, 0xFC, 0x03, 0xB0, 0x0B, 0xEE, 0x66, 0xBA, 0xFF, 0x03, 0xB0, 0xA5, 0xEE, 0xEC, 0x41, 0x88, 0xC0, 0x48, 0x8D, 0x35, 0x18, 0x00, 0x00, 0x00, 0xAC, 0x84, 0xC0, 0x74, 0x12, 0x66, 0xBA, 0xFD, 0x03, 0x50, 0xEC, 0xA8, 0x20, 0x58, 0x74, 0xF5, 0x66, 0xBA, 0xF8, 0x03, 0xEE, 0xEB, 0xE9, 0xF4,
+    0x66, 0xBA, 0xF9, 0x03,                         // mov dx, 0x3f9      ; IER: no interrupts
+    0x30, 0xC0,                                     // xor al, al
+    0xEE,                                           // out dx, al
+    0x66, 0xBA, 0xFB, 0x03,                         // mov dx, 0x3fb      ; LCR: the divisor latch
+    0xB0, 0x80,                                     // mov al, 0x80
+    0xEE,                                           // out dx, al
+    0x66, 0xBA, 0xF8, 0x03,                         // mov dx, 0x3f8      ; divisor 1, 115200 baud
+    0xB0, 0x01,                                     // mov al, 1
+    0xEE,                                           // out dx, al
+    0x66, 0xBA, 0xF9, 0x03,                         // mov dx, 0x3f9
+    0x30, 0xC0,                                     // xor al, al
+    0xEE,                                           // out dx, al
+    0x66, 0xBA, 0xFB, 0x03,                         // mov dx, 0x3fb      ; LCR: 8N1, the latch closed
+    0xB0, 0x03,                                     // mov al, 3
+    0xEE,                                           // out dx, al
+    0x66, 0xBA, 0xFA, 0x03,                         // mov dx, 0x3fa      ; FCR: the FIFO on and cleared
+    0xB0, 0xC7,                                     // mov al, 0xc7
+    0xEE,                                           // out dx, al
+    0x66, 0xBA, 0xFC, 0x03,                         // mov dx, 0x3fc      ; MCR: DTR, RTS, OUT2
+    0xB0, 0x0B,                                     // mov al, 0x0b
+    0xEE,                                           // out dx, al
+    0x66, 0xBA, 0xFF, 0x03,                         // mov dx, 0x3ff      ; the scratch register
+    0xB0, 0xA5,                                     // mov al, 0xa5
+    0xEE,                                           // out dx, al
+    0xEC,                                           // in al, dx
+    0x88, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,       // mov [0x7000], al   ; what it read back, for the check
+    0x48, 0x8D, 0x35, 0x18, 0x00, 0x00, 0x00,       // lea rsi, [rel msg]
+    0xAC,                                           // .next: lodsb
+    0x84, 0xC0,                                     // test al, al
+    0x74, 0x12,                                     // jz .done
+    0x66, 0xBA, 0xFD, 0x03,                         // .wait: mov dx, 0x3fd ; LSR
+    0x50,                                           // push rax
+    0xEC,                                           // in al, dx
+    0xA8, 0x20,                                     // test al, 0x20      ; THRE
+    0x58,                                           // pop rax
+    0x74, 0xF5,                                     // jz .wait
+    0x66, 0xBA, 0xF8, 0x03,                         // mov dx, 0x3f8
+    0xEE,                                           // out dx, al
+    0xEB, 0xE9,                                     // jmp .next
+    0xF4,                                           // .done: hlt
     b'n', b'o', b's', b':', b' ', b'h', b'e', b'l', b'l', b'o', b' ', b'f', b'r', b'o', b'm',
     b' ', b'a', b' ', b'g', b'u', b'e', b's', b't', b' ', b'o', b'v', b'e', b'r', b' ',
-    b't', b't', b'y', b'S', b'0', 10, 0,
+    b't', b't', b'y', b'S', b'0', 10, 0,                // msg
 ];
-const UART_HLT: u64 = ENTRY + 0x5A;
+const UART_HLT: u64 = ENTRY + 0x5E;
 const UART_SAYS: &str = "nos: hello from a guest over ttyS0\n";
+/// What it wrote to the scratch register, and where it leaves what it read.
+const UART_SCRATCH: u8 = 0xA5;
+const UART_SCRATCH_AT: u64 = RESULTS;
 
 fn build_uart(vm: &mut Vm) -> Result<()> {
     board(vm, UART_CODE)
 }
 
-fn check_uart(_vm: &Vm, r: &Run) -> core::result::Result<String, String> {
+fn check_uart(vm: &Vm, r: &Run) -> core::result::Result<String, String> {
     halted_at(r, UART_HLT)?;
+    let scratch: u8 = read(vm, UART_SCRATCH_AT)?;
+    if scratch != UART_SCRATCH {
+        return Err(alloc::format!("its scratch register read back {:#x}, not the {:#x} written", scratch,
+                                  UART_SCRATCH));
+    }
     if r.serial != UART_SAYS {
         return Err(alloc::format!("the UART received {:?}", r.serial));
     }
-    Ok(alloc::format!("the guest brought up the 8250 and sent {} bytes through it", r.uart.written()))
+    Ok(alloc::format!("the guest brought up the 8250, read its scratch register back, and sent {} bytes through it",
+                      r.uart.written()))
 }
 
 const HYPERCALL_CODE: &[u8] = &[
@@ -5456,6 +5999,10 @@ fn check_fault(vm: &Vm, r: &Run) -> core::result::Result<String, String> {
         Stop::Fault { gpa, error, rip } if gpa == FAULT_GPA && rip == FAULT_RIP => {
             if error & npf::WRITE == 0 || error & npf::PRESENT != 0 || error & npf::FINAL == 0 {
                 return Err(alloc::format!("the fault was not a write to nothing: error {:#x}", error));
+            }
+            if !r.whole {
+                return Err(String::from("its state could not be read whole after its fault: the VMCS is no longer \
+                                         current on the CPU this runs on -- the task moved (hv run with no CPU)"));
             }
             let ds = vm.vcpu().save().ds.selector;
             if ds != 0 {
@@ -5700,6 +6247,12 @@ fn build_tpr(vm: &mut Vm) -> Result<()> {
 
 fn check_tpr(vm: &Vm, r: &Run) -> core::result::Result<String, String> {
     halted_at(r, TPR_HLT)?;
+    /* The host's CR8 is read where this runs: the CPU the guest ran on, or
+     * what it reads says nothing of the guest's run. */
+    let here = kcore::cpu::id();
+    if r.cpus != 1u64 << here {
+        return Err(alloc::format!("it ran on cpus {:#x}, and the host's CR8 would be read on cpu {}", r.cpus, here));
+    }
     let read: u64 = read(vm, RESULTS)?;
     if read != TPR_WRITTEN {
         return Err(alloc::format!("the guest read {} back from CR8, not the {} it wrote", read, TPR_WRITTEN));

@@ -47,7 +47,15 @@ pub const MSR_X2APIC_LAST: u32 = 0x8FF;
 
 /// Whether `msr` is one of this device's.
 pub fn owns(msr: u32) -> bool {
-    msr == MSR_APIC_BASE || (MSR_X2APIC_FIRST..=MSR_X2APIC_LAST).contains(&msr)
+    msr == MSR_APIC_BASE || x2apic_register(msr).is_some()
+}
+
+/// The register x2APIC MSR `msr` is, by its offset from 0x800: None for an
+/// MSR outside the x2APIC's range -- IA32_TSC_DEADLINE among them, the
+/// timer's but no register of the range's -- which no subtraction from it
+/// may then name.
+fn x2apic_register(msr: u32) -> Option<u32> {
+    (MSR_X2APIC_FIRST..=MSR_X2APIC_LAST).contains(&msr).then(|| msr - MSR_X2APIC_FIRST)
 }
 
 /* IA32_APIC_BASE: where the xAPIC page is, and the bits that say what the
@@ -300,8 +308,19 @@ pub struct Ipi {
 
 impl Ipi {
     /// Whether the CPU with APIC ID `id`, addressed as `target`, is among
-    /// those this is for, the sender's being `from`.
+    /// those this is for, the sender's being `from`. Never one whose APIC is
+    /// off (IA32_APIC_BASE.EN clear): it has no APIC to take a message with
+    /// -- an NMI, an INIT or a start-up IPI no more than a fixed interrupt --
+    /// as KVM leaves such an APIC out of its map. An 8-bit all-ones
+    /// destination is the broadcast to an APIC in xAPIC mode alone, from an
+    /// IPI: an x2APIC takes an xAPIC sender's 0xFF as an ID, as KVM matches
+    /// an IPI between the modes -- a device's message has its 0xFF made the
+    /// broadcast for every mode as it is made (`message`), KVM's quirk for
+    /// those. Only a guest with its CPUs in both modes at once can tell.
     pub fn reaches(&self, id: u32, target: Addressing, from: u32) -> bool {
+        if target.mode == Mode::Off {
+            return false;
+        }
         match self.destination {
             Destination::All => true,
             Destination::SelfOnly => id == from,
@@ -414,8 +433,12 @@ struct Timer {
     initial: u32,
     /// The divide configuration, as written.
     divide: u32,
-    /// When the count was loaded, host nanoseconds.
+    /// When the count was loaded, host nanoseconds -- or, since a divide
+    /// configuration was written while it counted, when that was.
     loaded_ns: u64,
+    /// The ticks it had counted by `loaded_ns`, at the rates before it: 0
+    /// from a count's load to the first divide configuration written.
+    counted: u64,
     /// When it next reaches zero -- the next interrupt -- or None when it
     /// has none to come: stopped, or a one-shot count that has run out.
     deadline: Option<u64>,
@@ -512,7 +535,7 @@ impl Lapic {
             esr_pending: 0,
             icr: 0,
             lvt: [LVT_MASKED; LVT_ENTRIES],
-            timer: Timer { initial: 0, divide: 0, loaded_ns: 0, deadline: None },
+            timer: Timer { initial: 0, divide: 0, loaded_ns: 0, counted: 0, deadline: None },
             tsc_deadline: 0,
             ldr: 0,
             dfr: DFR_RESET,
@@ -628,16 +651,23 @@ impl Lapic {
     }
 
     /// Several fixed interrupts at once, a bit a vector, and which of them
-    /// are level-triggered: what other CPUs posted while this one ran.
-    pub fn accept_all(&mut self, words: &[u64; 4], level: &[u64; 4]) {
+    /// are level-triggered: what other CPUs posted while this one ran. The
+    /// level-triggered ones it refused, a bit each: an IO-APIC's, which
+    /// waits for the EOI of one taken and has to be told of one that was not.
+    pub fn accept_all(&mut self, words: &[u64; 4], level: &[u64; 4]) -> [u64; 4] {
+        let mut refused = [0u64; 4];
         for (w, (&bits, &levels)) in words.iter().zip(level.iter()).enumerate() {
             let mut left = bits;
             while left != 0 {
                 let bit = left.trailing_zeros();
                 left &= left - 1;
-                self.accept_as((w as u32 * 64 + bit) as u8, levels & (1 << bit) != 0);
+                let is_level = levels & (1 << bit) != 0;
+                if !self.accept_as((w as u32 * 64 + bit) as u8, is_level) && is_level {
+                    refused[w] |= 1 << bit;
+                }
             }
         }
+        refused
     }
 
     /// Whether `vector` is requested and not yet taken: an edge sent for it
@@ -662,6 +692,22 @@ impl Lapic {
         }
         let vector = highest(&self.irr)?;
         (vector >> 4 > self.ppr() >> 4).then_some(vector)
+    }
+
+    /// The class of the highest interrupt requested that the task priority
+    /// alone holds back -- one nothing in service is above: what a lowering
+    /// of the task priority has to stop the guest for, where the `mov` to
+    /// CR8 does not (AMD-V's V_TPR, VT-x's TPR shadow), or it waits for the
+    /// guest's next exit of any other kind -- a host tick. None when the
+    /// highest is let through, or is held by what is in service, whose EOI
+    /// stops the guest anyway.
+    pub fn held_by_tpr(&self) -> Option<u8> {
+        if !self.software_enabled() {
+            return None;
+        }
+        let class = highest(&self.irr)? >> 4;
+        let isrv = highest(&self.isr).unwrap_or(0) >> 4;
+        (class > isrv && class <= self.tpr >> 4).then_some(class)
     }
 
     /// `vector` was injected: out of the request register and into service,
@@ -778,7 +824,12 @@ impl Lapic {
     /// IA32_TSC_DEADLINE reading 0. A periodic timer that fell behind is
     /// owed its periods, handed over one at a time and each only once the
     /// last is no longer waiting in the request register -- a second's worth
-    /// at most. True when an interrupt was requested.
+    /// at most. One whose edge requests nothing -- its entry masked, or its
+    /// vector one the APIC refuses -- owes nothing: every period gone by is
+    /// skipped, as an APIC loses a masked one. Moved a period a look, a
+    /// masked timer of a halted CPU, looked at every 10 ms, fell up to a
+    /// second behind, and handed over its periods back to back once it was
+    /// unmasked. True when an interrupt was requested.
     pub fn timer(&mut self, now: u64) -> bool {
         let Some(deadline) = self.timer.deadline else { return false };
         if now < deadline {
@@ -792,11 +843,17 @@ impl Lapic {
              * delivered once it has been. */
             return false;
         }
+        if self.timer_mode() == TimerMode::Deadline {
+            self.tsc_deadline = 0;
+        }
+        let requested = lvt & LVT_MASKED == 0 && self.accept(vector);
         self.timer.deadline = if periodic {
             let period = self.timer.span_ns().max(MIN_PERIOD_NS);
             let behind = now.saturating_sub(deadline);
-            let next = if behind > MOST_OWED_NS {
-                now + period
+            let next = if !requested {
+                deadline.saturating_add((behind / period + 1).saturating_mul(period))
+            } else if behind > MOST_OWED_NS {
+                now.saturating_add(period)
             } else {
                 deadline.saturating_add(period)
             };
@@ -804,13 +861,7 @@ impl Lapic {
         } else {
             None
         };
-        if self.timer_mode() == TimerMode::Deadline {
-            self.tsc_deadline = 0;
-        }
-        if lvt & LVT_MASKED != 0 {
-            return false;
-        }
-        self.accept(vector)
+        requested
     }
 
     /// When the timer next runs out, host nanoseconds: what a halted CPU
@@ -840,7 +891,7 @@ impl Lapic {
         if t.initial == 0 || self.timer_mode() == TimerMode::Deadline {
             return 0;
         }
-        let ticks = now.saturating_sub(t.loaded_ns) / t.ns_per_tick();
+        let ticks = t.counted.saturating_add(now.saturating_sub(t.loaded_ns) / t.ns_per_tick());
         let initial = u64::from(t.initial);
         if self.timer_mode() == TimerMode::Periodic {
             (initial - ticks % initial) as u32
@@ -851,6 +902,49 @@ impl Lapic {
         }
     }
 
+    /// The timer's entry unmasked at `now`: what ran out while it was masked
+    /// is lost, as on an APIC -- a periodic count's periods gone by skipped,
+    /// a one-shot's or a TSC deadline's end come and gone -- rather than
+    /// handed over now, back to back, for the time since the last look.
+    fn unmasked(&mut self, now: u64) {
+        let Some(deadline) = self.timer.deadline.filter(|&d| d <= now) else { return };
+        match self.timer_mode() {
+            TimerMode::Periodic => {
+                let period = self.timer.span_ns().max(MIN_PERIOD_NS);
+                let gone = (now - deadline) / period + 1;
+                self.timer.deadline = Some(deadline.saturating_add(gone.saturating_mul(period)));
+            }
+            TimerMode::OneShot => self.timer.deadline = None,
+            TimerMode::Deadline => {
+                self.timer.deadline = None;
+                self.tsc_deadline = 0;
+            }
+        }
+    }
+
+    /// The divide configuration written as `divide`, at `now`: a count under
+    /// way carries on from where it is, at the new rate -- as on an APIC, and
+    /// as KVM restarts its timer for -- the ticks it has counted kept, and a
+    /// deadline still to come moved to where the count left reaches 0. Kept
+    /// as it was, the count read at the new rate from the old start -- up to
+    /// 128 times off, a one-shot run out reading other than 0 again -- while
+    /// its interrupt came when the old rate said. A deadline come already,
+    /// owed, stays.
+    fn set_divide(&mut self, divide: u32, now: u64) {
+        let count = u64::from(self.current_count(now));
+        let old_tick = self.timer.ns_per_tick();
+        self.timer.divide = divide;
+        let tick = self.timer.ns_per_tick();
+        if tick == old_tick || self.timer.initial == 0 || self.timer_mode() == TimerMode::Deadline {
+            return;
+        }
+        self.timer.counted = u64::from(self.timer.initial) - count;
+        self.timer.loaded_ns = now;
+        if self.timer.deadline.is_some_and(|d| d > now) {
+            self.timer.deadline = Some(now.saturating_add(count * tick));
+        }
+    }
+
     /// A read of `msr`, at `now`: its value, or [`Refused`] -- a #GP.
     pub fn rdmsr(&self, msr: u32, now: u64) -> Result<u64, Refused> {
         if msr == MSR_APIC_BASE {
@@ -858,10 +952,10 @@ impl Lapic {
         }
         /* Every other register is x2APIC mode's: in xAPIC mode, or with the
          * APIC off, an MSR that is not there. */
+        let reg = x2apic_register(msr).ok_or(Refused)?;
         if !self.x2apic() {
             return Err(Refused);
         }
-        let reg = msr - MSR_X2APIC_FIRST;
         if reg == REG_ICR {
             return Ok(self.icr);
         }
@@ -968,10 +1062,10 @@ impl Lapic {
         if msr == MSR_APIC_BASE {
             return self.write_base(value);
         }
+        let reg = x2apic_register(msr).ok_or(Refused)?;
         if !self.x2apic() {
             return Err(Refused);
         }
-        let reg = msr - MSR_X2APIC_FIRST;
         if reg == REG_ICR {
             return self.write_icr(value, false).map(|ipi| ipi.map_or(Wrote::Done, Wrote::Ipi));
         }
@@ -1041,6 +1135,7 @@ impl Lapic {
                     entry |= LVT_MASKED;
                 }
                 let was_deadline = self.timer_mode() == TimerMode::Deadline;
+                let was_masked = self.lvt[i] & LVT_MASKED != 0;
                 self.lvt[i] = entry;
                 /* Into TSC-deadline mode or out of it, the timer is
                  * disarmed: no count, no deadline (SDM 11.5.4.1). */
@@ -1049,12 +1144,16 @@ impl Lapic {
                     self.timer.deadline = None;
                     self.tsc_deadline = 0;
                 }
+                if i == LVT_TIMER && was_masked && entry & LVT_MASKED == 0 {
+                    self.unmasked(now);
+                }
             }
             /* In TSC-deadline mode a count written is ignored. */
             REG_TIMER_INITIAL if self.timer_mode() == TimerMode::Deadline => {}
             REG_TIMER_INITIAL => {
                 self.timer.initial = v;
                 self.timer.loaded_ns = now;
+                self.timer.counted = 0;
                 self.timer.deadline = (v != 0).then(|| {
                     let span = if self.timer_mode() == TimerMode::Periodic {
                         self.timer.span_ns().max(MIN_PERIOD_NS)
@@ -1064,9 +1163,7 @@ impl Lapic {
                     now.saturating_add(span)
                 });
             }
-            REG_TIMER_DIVIDE => {
-                self.timer.divide = v & DIVIDE_WRITABLE;
-            }
+            REG_TIMER_DIVIDE => self.set_divide(v & DIVIDE_WRITABLE, now),
             REG_SELF_IPI if !xapic => {
                 /* The vector alone, in bits 7:0. */
                 if v & !0xFF != 0 {

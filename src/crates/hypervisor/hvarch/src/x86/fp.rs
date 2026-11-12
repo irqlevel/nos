@@ -24,6 +24,16 @@
 //! alone is switched (below); AVX-512, AMX and CET are neither switched nor
 //! offered, so none of that state is ever in a guest's reach.
 //!
+//! What is not switched on one kind of host: an AMD CPU before Zen 2, which
+//! has no XSAVEERPTR (CPUID 0x80000008 EBX bit 2), saves and restores the x87
+//! error pointers -- FIP, FDP, FOP -- only while an x87 exception is pending
+//! (Linux's X86_BUG_FXSAVE_LEAK). There a guest's restore leaves the last
+//! guest's last x87 instruction and operand addresses in the registers it
+//! can read. Linux clears them before each restore (`fnclex; emms; fild`);
+//! this does not -- the machines it runs on (Zen 2 and later, Intel's) have
+//! the feature -- and a host without it leaks those addresses between its
+//! guests, nothing more.
+//!
 //! PKRU, the protection keys' rights, is switched by RDPKRU after every
 //! exit and WRPKRU where the CPU holds another guest's -- not through the
 //! area: a guest changes it by WRPKRU whatever its XCR0 says, and an XSAVE

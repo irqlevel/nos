@@ -33,6 +33,7 @@ use alloc::sync::Arc;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use kcore::klog;
+use kcore::owner::Owner;
 use kcore::sync::{Event, IrqSpinLock};
 use kcore::time::Duration;
 
@@ -55,7 +56,9 @@ pub struct SharedEvent {
 
 impl SharedEvent {
     /// An event, the caller its one holder: None when the kernel has no
-    /// memory for one.
+    /// event to give. The `Arc`'s few bytes are the heap's own, and a heap
+    /// that has not even those panics, as every infallible allocation of
+    /// the image's does.
     pub fn new() -> Option<Arc<SharedEvent>> {
         let event = Event::new()?;
         LIVE.fetch_add(1, Ordering::Relaxed);
@@ -158,10 +161,12 @@ struct Slot {
     generation: u32,
     /// The table's count of its event, for as long as the handle is open.
     event: Option<Arc<SharedEvent>>,
+    /// The module that opened it: what `rust_events_module_gone` closes by.
+    owner: Owner,
 }
 
 static SLOTS: [IrqSpinLock<Slot>; MAX_EVENTS] =
-    [const { IrqSpinLock::new(Slot { generation: 0, event: None }) }; MAX_EVENTS];
+    [const { IrqSpinLock::new(Slot { generation: 0, event: None, owner: Owner::IMAGE }) }; MAX_EVENTS];
 
 /* The slot, plus one, below; the generation above. */
 const SLOT_BITS: u32 = 32;
@@ -191,11 +196,13 @@ pub fn lookup(event: u64) -> Option<Arc<SharedEvent>> {
     s.event.clone()
 }
 
-/// An event for a module: its handle, held by the table until
-/// `kernel_shared_event_close` -- or 0 when there is no memory for one, or
-/// every slot is taken.
+/// An event for a module -- the one whose code `owner` is in: its handle,
+/// held by the table until `kernel_shared_event_close`, or until the
+/// module goes (`rust_events_module_gone`) -- or 0 when there is no memory
+/// for one, or every slot is taken.
 #[no_mangle]
-pub extern "C" fn kernel_shared_event_open() -> u64 {
+pub extern "C" fn kernel_shared_event_open(owner: usize) -> u64 {
+    let owner = Owner::at(owner);
     /* Made before a slot is looked for: nothing is allocated under a slot's
      * lock */
     let Some(event) = SharedEvent::new() else { return 0 };
@@ -206,6 +213,7 @@ pub extern "C" fn kernel_shared_event_open() -> u64 {
         }
         s.generation = s.generation.wrapping_add(1);
         s.event = Some(event);
+        s.owner = owner;
         return word(at, s.generation);
     }
     klog!(0, "events: all {} events the modules may hold are taken", MAX_EVENTS);
@@ -228,6 +236,39 @@ pub extern "C" fn kernel_shared_event_close(event: u64) {
     };
     /* Off the lock: the table's count let go of, perhaps the last */
     drop(taken);
+}
+
+/// What a module that went left open, closed: each event its code opened
+/// and never closed -- an event that stays as long as whatever was made on
+/// it holds it, but a slot of the table's 256 that was kept for good -- and
+/// said, as the module's bug. The loader's, at the module's take-down
+/// (`ModuleTable::take_down`). Task context.
+///
+/// # Safety
+/// `name` points at `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn rust_events_module_gone(name: *const u8, len: usize) {
+    if name.is_null() || len == 0 || len > kcore::owner::NAME_MAX {
+        return;
+    }
+    let name = unsafe { core::slice::from_raw_parts(name, len) };
+    let mut left = 0usize;
+    for slot in SLOTS.iter() {
+        let taken = {
+            let mut s = slot.lock();
+            if !s.owner.is_module(name) || s.event.is_none() {
+                continue;
+            }
+            s.owner = Owner::IMAGE;
+            s.event.take()
+        };
+        /* Off the lock: the table's count let go of, perhaps the last */
+        drop(taken);
+        left += 1;
+    }
+    if left != 0 {
+        klog!(0, "module: {} left {} event(s) open: closed", core::str::from_utf8(name).unwrap_or("?"), left);
+    }
 }
 
 /// A wait of up to `timeout_ns` for a signal: 1 when one came, 0 when the

@@ -13,11 +13,12 @@
 //! scripts/unsafe-count.py hv hvarch
 //! ```
 //!
-//! Three sites are left here: the two IPI handlers that turn the extension
-//! on and off, and the one call that enters a guest (`Vm::enter`), whose
-//! preconditions are two invariants this crate keeps by construction --
-//! guest memory owns every page its nested table maps, and the machine
-//! never names a host save area that has been freed.
+//! Four sites are left here: the two IPI handlers that turn the extension
+//! on and off (`machine.rs`), and the call that enters a guest, one a
+//! backend (`svm.rs`, `vmx.rs`), whose preconditions are two invariants
+//! this crate keeps by construction -- guest memory owns every page its
+//! nested table maps, and the machine never names a host save area that
+//! has been freed.
 //!
 //! What is here: the machine's extension, turned on for the CPUs that will
 //! run a guest and off again when the module is taken out; a VM -- guest
@@ -46,6 +47,8 @@ pub mod place;
 mod npt;
 #[cfg(target_arch = "x86_64")]
 mod ept;
+#[cfg(target_arch = "x86_64")]
+pub mod exit;
 #[cfg(target_arch = "x86_64")]
 pub mod svm;
 #[cfg(target_arch = "x86_64")]

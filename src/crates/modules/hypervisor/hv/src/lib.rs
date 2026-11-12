@@ -106,7 +106,7 @@ hv boot <kernel> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noa
                                    cpus gives it N CPUs, each on a host CPU of its own, the
                                    first on cpu. The kernel is a bzImage, or a PVH ELF:
                                    /lib/hvboot boots the one its disk's grub.cfg names
-hv start <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [input=...] [log] [restart] [uuid=U] [net] [network=name] [port=N] [forward=nos:guest]... [cmdline=...]
+hv start <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [input=...] [log] [restart] [force] [uuid=U] [net] [network=name] [port=N] [forward=nos:guest]... [cmdline=...]
                                    a Linux guest that runs until hv stop; restart boots it
                                    again when it resets itself or panics; uuid= what its
                                    SMBIOS says it is; network= the guests it reaches on the
@@ -452,11 +452,11 @@ fn command(state: &State, args: &str, out: &mut Output) {
         "off" => switch(state, words.next(), false, out),
         "run" => run(machine, words.next(), words.next(), out),
         #[cfg(target_arch = "x86_64")]
-        "convert" => image::command(&state.vms_root, rest, &mut Shell { out, unloading: &state.unloading }),
+        "convert" => image::command(&state.vms_root, &state.vms, rest, &mut Shell { out, unloading: &state.unloading }),
         #[cfg(not(target_arch = "x86_64"))]
-        "convert" => image::command("", rest, &mut Shell { out, unloading: &state.unloading }),
+        "convert" => image::command("", &(), rest, &mut Shell { out, unloading: &state.unloading }),
         #[cfg(target_arch = "x86_64")]
-        "devices" => devices::command(&state.vms_root, out),
+        "devices" => devices::command(&state.vms_root, &state.vms, out),
         #[cfg(target_arch = "x86_64")]
         "disk" => devices::disk_command(&state.vms_root, &state.vms, rest, out),
         #[cfg(target_arch = "x86_64")]
@@ -550,7 +550,8 @@ fn forward_command(state: &State, args: &str, out: &mut Output) {
                 let _ = writeln!(out, "hv: the guests' switch is not up");
                 return;
             };
-            match state.forwards.add(port, vm, guest_port, ip, host, out) {
+            let to = forward::To { guest_ip: ip, guest_port, host, outer: state.vms.outer_nic() };
+            match state.forwards.add(port, vm, to, &|| state.vms.on_list(vm), out) {
                 Ok(()) => keep_forward(state, vm, port, Some(guest_port), out),
                 Err(e) => {
                     let _ = writeln!(out, "hv: {}", e);
@@ -583,8 +584,14 @@ fn forward_command(state: &State, args: &str, out: &mut Output) {
 #[cfg(target_arch = "x86_64")]
 fn keep_forward(state: &State, vm: u32, port: u16, guest_port: Option<u16>, out: &mut Output) {
     let Some(name) = state.vms.name_of(vm) else { return };
-    let kept = store::folder_of(&state.vms_root, &name).and_then(|folder| {
-        store::update(&folder, |c| {
+    /* The folder it was started from, which may be anywhere -- not the
+     * VMs' folder's of its name, which may be another VM's or none */
+    let folder = match state.vms.folder_listed(&name) {
+        Some(f) => Ok(f),
+        None => store::folder_of(&state.vms_root, &name),
+    };
+    let kept = folder.and_then(|folder| {
+        store::update(&state.vms, &folder, |c| {
             c.options.forwards.retain(|&(host, _)| host != port);
             if let Some(guest) = guest_port {
                 c.options.forwards.try_reserve(1).map_err(|_| String::from("out of memory"))?;
@@ -686,6 +693,13 @@ fn speculation(out: &mut Output, hardware: u64) {
     if a.smt_open {
         let _ = writeln!(out, "hv: a core's two threads share their branch predictors here, and the CPU has no STIBP to \
                                keep them apart");
+    }
+    if a.zenbleed_fix {
+        let _ = writeln!(out, "hv: a Zen 2 with microcode older than AMD's Zenbleed fix: DE_CFG's FP backup fix set \
+                               while the extension is on -- a guest reads no other's vector registers");
+    } else if a.zenbleed {
+        let _ = writeln!(out, "hv: this CPU is open to Zenbleed: its microcode predates the fix, and DE_CFG's FP backup \
+                               fix is not set");
     }
     let i = r.intel;
     let bhi = if i.bhi_dis_s { ", and BHI_DIS_S: nor by the branch history a guest leaves" } else { "" };
@@ -813,7 +827,7 @@ impl Job {
 
 /// `hv run <guest|all> [cpu]`: each guest in a VM of its own, on a task of
 /// its own -- a guest's CPU is a task, here as it will be for a Linux one --
-/// bound to `cpu` when one is named, and waited for.
+/// bound to `cpu`, or to one when none is named, and waited for.
 fn run(machine: &Arc<Machine>, which: Option<&str>, cpu: Option<&str>, out: &mut Output) {
     /* First, so that a machine with nothing to run a guest under says that,
      * and not that it has no such guest. */
@@ -835,10 +849,19 @@ fn run(machine: &Arc<Machine>, which: Option<&str>, cpu: Option<&str>, out: &mut
         return;
     }
 
+    /* Bound to one CPU whether or not one was named -- with none, this one
+     * where the extension is on for it, else the first it is on for: what a
+     * guest's check reads of the host after its run -- its CR8, its
+     * IA32_SPEC_CTRL, the VMCS still current, the ASIDs' generation -- is
+     * the CPU's it ran on only so. Unbound, a task moved between a run and
+     * its check read another CPU's. */
     let affinity = match cpu {
-        None => None,
+        None => {
+            let (here, on) = (kcore::cpu::id(), machine.enabled_mask());
+            if on & (1u64 << here) != 0 || on == 0 { 1u64 << here } else { 1u64 << on.trailing_zeros() }
+        }
         Some(word) => match word.parse::<usize>() {
-            Ok(cpu) if cpu < MAX_CPUS && kcore::cpu::online_mask() & (1u64 << cpu) != 0 => Some(1u64 << cpu),
+            Ok(cpu) if cpu < MAX_CPUS && kcore::cpu::online_mask() & (1u64 << cpu) != 0 => 1u64 << cpu,
             _ => {
                 let _ = writeln!(out, "hv: \"{}\" is not a running CPU", word);
                 return;
@@ -854,10 +877,7 @@ fn run(machine: &Arc<Machine>, which: Option<&str>, cpu: Option<&str>, out: &mut
         }
     };
     let job = Arc::new(Job { machine: machine.clone(), guests, report });
-    let task = match affinity {
-        Some(mask) => kcore::task::spawn_on_with("hv/vcpu", mask, job.clone(), Job::run),
-        None => kcore::task::spawn_with("hv/vcpu", job.clone(), Job::run),
-    };
+    let task = kcore::task::spawn_on_with("hv/vcpu", affinity, job.clone(), Job::run);
     match task {
         /* Dropping the handle waits for the task. */
         Some(task) => drop(task),
@@ -973,7 +993,11 @@ fn bench<'a>(machine: &Arc<Machine>, words: impl Iterator<Item = &'a str>, out: 
             if let Some(p) = b.profile {
                 /* Ticks to nanoseconds by the two clocks' own ratio over the
                  * run: whatever the TSC's rate, the parts add up to the whole. */
-                let part = |ticks: u64| ticks * ns / b.ticks.max(1) / p.entries.max(1);
+                /* In 128 bits: a part's ticks times the run's nanoseconds is
+                 * past 2^64 from some two million exits on the EX44's
+                 * numbers, and far sooner where an exit is slower */
+                let part = |ticks: u64| u64::try_from(u128::from(ticks) * u128::from(ns)
+                    / u128::from(b.ticks.max(1)) / u128::from(p.entries.max(1))).unwrap_or(u64::MAX);
                 let entry = part(p.checks) + part(p.sync_in) + part(p.switch_in) + part(p.world)
                     + part(p.switch_out) + part(p.sync_out);
                 let _ = if vmx {

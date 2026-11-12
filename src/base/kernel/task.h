@@ -194,6 +194,10 @@ public:
     void set_stopping();
     bool is_stopping();
 
+    /* Whether the function the task was started on is in [lo, hi): a
+       module's image, which is not to be freed under it */
+    bool entry_in(ulong lo, ulong hi);
+
     PRINTF_FORMAT(2, 3) void set_name(const char *fmt, ...);
     /* Its name, zero past its end to TASK_NAME_LEN */
     const char* get_name()
@@ -481,6 +485,11 @@ public:
     static const u32 SNAPSHOT_IDLING = 8;
 
     size_t snapshot(TaskSnapshot* out, size_t max);
+
+    /* The tasks not exited that were started on a function in [lo, hi) --
+       a module's image: how many there are, and the pids of the first max
+       of them in pids, read under the bucket locks */
+    size_t running_in(ulong lo, ulong hi, ulong* pids, size_t max);
 
 private:
     TaskTable(const TaskTable& other) = delete;

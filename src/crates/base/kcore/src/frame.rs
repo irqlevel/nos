@@ -38,6 +38,7 @@ use core::sync::atomic::{AtomicU16, Ordering};
 
 use ffi::frame;
 
+use crate::chunked::Chunked;
 use crate::consts::PAGE_SIZE;
 use crate::pod::Pod;
 
@@ -251,7 +252,9 @@ pub fn huge_pool() -> HugePool {
 /// A run's pages [`HUGE_PAGES`] at a time: one block of the pool, or that
 /// many frames -- fewer in a run's last piece -- each a page of its own, in a
 /// table of a page's worth so that no one allocation of it outgrows a page
-/// however many frames there are.
+/// however many frames there are. The run's table of pieces is kept so too
+/// ([`Chunked`]): one allocation of 24 bytes a piece, it stopped a run at
+/// 42.7 GiB, the heap's largest block.
 enum Piece {
     Huge(HugeFrame),
     Pages(Vec<Frame>),
@@ -270,7 +273,7 @@ pub struct Extent {
 
 /// The most frames one [`Mapped`] maps: a queue of 256 entries' rings are
 /// three pages.
-pub const MAPPED_MAX: usize = 4;
+pub const MAPPED_MAX: usize = ffi::frame::FRAMES_MAP_MAX;
 
 /// Pages owned together, and shared: a region of a guest's memory, which
 /// a mapping of some of them holds a share of ([`Mapped`]), so that they go
@@ -278,15 +281,23 @@ pub const MAPPED_MAX: usize = 4;
 /// them is undone, whichever of the run's holders goes last.
 #[derive(Clone)]
 pub struct Run {
-    pieces: Arc<Vec<Piece>>,
+    pieces: Arc<Chunked<Piece>>,
+}
+
+/// Why a run of the huge pool's could not be had.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shortage {
+    /// The pool has not that many blocks free.
+    Pool,
+    /// The heap had no room for the run's own table of them.
+    Memory,
 }
 
 impl Run {
     /// `count` zeroed frames, or None when they cannot all be had -- those
     /// taken by then going back as the attempt is dropped.
     pub fn new(count: usize) -> Option<Run> {
-        let mut pieces: Vec<Piece> = Vec::new();
-        pieces.try_reserve_exact(count.div_ceil(HUGE_PAGES)).ok()?;
+        let mut pieces: Chunked<Piece> = Chunked::new();
         let mut left = count;
         while left > 0 {
             let n = left.min(HUGE_PAGES);
@@ -295,26 +306,27 @@ impl Run {
             for _ in 0..n {
                 piece.push(Frame::new()?);
             }
-            pieces.push(Piece::Pages(piece));
+            pieces.try_push(Piece::Pages(piece)).ok()?;
             left -= n;
         }
         Some(Run { pieces: Arc::new(pieces) })
     }
 
     /// `count` zeroed pages, every one of them the huge pool's: whole
-    /// blocks, so a multiple of [`HUGE_PAGES`], or None -- as it is when the
-    /// pool cannot give them all, the blocks taken by then going back.
-    pub fn new_huge(count: usize) -> Option<Run> {
+    /// blocks, so a multiple of [`HUGE_PAGES`] -- or why not, the blocks
+    /// taken by then going back: the pool short of them (or `count` no
+    /// whole number of blocks), or the heap of room for the table.
+    pub fn new_huge(count: usize) -> Result<Run, Shortage> {
         if count % HUGE_PAGES != 0 {
-            return None;
+            return Err(Shortage::Pool);
         }
         let blocks = count / HUGE_PAGES;
-        let mut pieces: Vec<Piece> = Vec::new();
-        pieces.try_reserve_exact(blocks).ok()?;
+        let mut pieces: Chunked<Piece> = Chunked::new();
         for _ in 0..blocks {
-            pieces.push(Piece::Huge(HugeFrame::new()?));
+            let block = HugeFrame::new().ok_or(Shortage::Pool)?;
+            pieces.try_push(Piece::Huge(block)).map_err(|_| Shortage::Memory)?;
         }
-        Some(Run { pieces: Arc::new(pieces) })
+        Ok(Run { pieces: Arc::new(pieces) })
     }
 
     /// Its page `i`, to copy into and out of: None past its end.

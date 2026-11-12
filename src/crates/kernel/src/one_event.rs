@@ -90,7 +90,8 @@ fn other_cpu() -> u32 {
 /// queue's device would finish one: through the queue's own completion.
 fn complete(q: &mut block::queue::Queue) {
     let cmd = q.test_command(0).unwrap_or_else(|| panic!("one event selftest: a command of the queue's"));
-    kcore::cpu::run_on_with(other_cpu(), &cmd, |c| c.finish(true));
+    assert!(kcore::cpu::run_on_with(other_cpu(), &cmd, |c| c.finish(true)),
+        "one event selftest: the completion's CPU never ran it");
 }
 
 pub fn selftest() {

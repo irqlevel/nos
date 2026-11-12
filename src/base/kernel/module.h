@@ -92,6 +92,11 @@ public:
 
     bool is_loaded(const char* name);
 
+    /* Modules whose image take_down kept rather than freed since boot: a
+       task of the module's still running in it after it was asked to stop
+       (sweep_module_tasks) -- what test_module_unload holds to none */
+    ulong images_kept();
+
     /* lsmod: a line per module */
     void dump(stdlib::Printer& out);
 
@@ -178,6 +183,8 @@ private:
     stdlib::ListEntry list_;
     /* Set by unload_all, under the lock: nothing is put on the list after */
     bool halting_;
+    /* images_kept's count, under the lock */
+    ulong images_kept_;
 };
 
 }

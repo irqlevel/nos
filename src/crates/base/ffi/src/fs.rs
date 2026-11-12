@@ -14,7 +14,8 @@ unsafe extern "C" {
     /// without ever leaving it empty or half written.
     pub fn kernel_file_write(path: *const u8, path_len: usize, data: *const u8, len: usize) -> i32;
     /// A new file with this content: 1, and nothing written, when there is
-    /// one at the path already.
+    /// one at the path already; -1, and no file left, for any other
+    /// failure.
     pub fn kernel_file_create(path: *const u8, path_len: usize, data: *const u8, len: usize) -> i32;
     /// Makes a directory; 0 also when there is one by that name already.
     pub fn kernel_dir_create(path: *const u8, path_len: usize) -> i32;
@@ -45,7 +46,9 @@ unsafe extern "C" {
 unsafe extern "C" {
     /// Opens a regular file for reading, and with `write` not 0 for writing
     /// too: its handle, or 0.
-    pub fn kernel_file_open(path: *const u8, path_len: usize, write: i32) -> usize;
+    /// `owner` is an address in the opener's code: a file a module leaves
+    /// open is closed as it goes.
+    pub fn kernel_file_open(owner: usize, path: *const u8, path_len: usize, write: i32) -> usize;
     /// Closes it; a word that is no open file's is nothing to close.
     pub safe fn kernel_file_close(file: usize);
     /// Its size in bytes, or -1.
@@ -91,9 +94,13 @@ pub const IMAGE_QUEUE_MAX: usize = 256;
 unsafe extern "C" {
     /// Holds a regular file as an image, for reading, and with `write` not
     /// 0 for writing too: the image, or 0.
-    pub fn kernel_image_open(path: *const u8, path_len: usize, write: i32) -> usize;
-    /// Lets go of it; a word that is no image's is nothing to close.
-    pub safe fn kernel_image_close(image: usize);
+    /// `owner`, as kernel_file_open's: an image a module leaves open is
+    /// closed as it goes.
+    pub fn kernel_image_open(owner: usize, path: *const u8, path_len: usize, write: i32) -> usize;
+    /// Lets go of it -- its queue's buffers with it; a word that is no
+    /// image's is nothing to close. Not a `safe fn`: the caller is the
+    /// image's one owner and holds no slice of its queue's buffers.
+    pub fn kernel_image_close(image: usize);
     /// Its size in bytes, or -1.
     pub safe fn kernel_image_length(image: usize) -> i64;
     /// The mount its file is on, never 0 -- or 0. With `kernel_image_key`,
@@ -136,7 +143,9 @@ unsafe extern "C" {
     /// Buffer `buffer`'s request -- `len` bytes from `offset` read into it,
     /// or with `write` not 0 written from it: 1 while it is with the device
     /// (`kernel_image_reap` gives it back), 0 done now, -1 done and failed.
-    pub safe fn kernel_image_start(image: usize, buffer: usize, write: i32, offset: u64, len: usize) -> i32;
+    /// Not a `safe fn`: the caller is the queue's one owner and holds no
+    /// slice of `buffer`, which the device has from here.
+    pub fn kernel_image_start(image: usize, buffer: usize, write: i32, offset: u64, len: usize) -> i32;
     /// The doorbell for the requests started.
     pub safe fn kernel_image_kick(image: usize);
     /// Requests done into `out`, `max` at most: how many, or -1.
@@ -180,3 +189,24 @@ unsafe extern "C" {
     /// `fstest=on`: run the self-test on / once it is mounted.
     pub safe fn kernel_root_fstest() -> i32;
 }
+
+/* The numbers that cross with these functions, one copy of each: the
+ * layer that answers and kcore that reads them both use these, and this
+ * file is in the module interface's digest. They were written twice --
+ * a copy in the layer, literals in kcore -- outside it: a release that
+ * renumbered one built, hashed the same, and its modules misread the
+ * answers. */
+
+/// What `kernel_dir_entry` says an entry is.
+pub const FILE_ENTRY_FILE: u32 = 1;
+pub const FILE_ENTRY_DIR: u32 = 2;
+/// What it answers past the last entry, and for a path that names no
+/// directory -- which an empty directory is not.
+pub const FILE_ENTRY_END: isize = -1;
+pub const FILE_ENTRY_NO_DIR: isize = -2;
+
+/// What `kernel_file_create` answers: made, one there already (nothing
+/// written), and refused (no file left).
+pub const FILE_CREATED: i32 = 0;
+pub const FILE_THERE: i32 = 1;
+pub const FILE_REFUSED: i32 = -1;

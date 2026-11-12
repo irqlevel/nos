@@ -397,9 +397,13 @@ fn core_load(topo: &Topology, cpu: u32, load: &[u32; MAX_CPUS]) -> u32 {
 /// none of the guest's CPUs is on where there is one, since two threads of
 /// a core share its execution units; then one sharing the first's
 /// last-level cache, where the CPUs' lines and IPIs go no further; then one
-/// of the first's kind of core; then the least loaded, as the first. And its disks' task on an
-/// online CPU other than its first vCPU's -- that one's only on a machine of
-/// one CPU -- with the fewest vCPUs, the higher of two that tie, CPU 0 last.
+/// of the first's kind of core; then the least loaded, as the first. And its
+/// disks' task on an online CPU none of its vCPUs is on, whose core has the
+/// fewest vCPUs -- its own counted -- and then the CPU itself, the higher of
+/// two that tie, CPU 0 last; on a vCPU's only where every online CPU has
+/// one. Chosen by the other guests' load alone, it went to the guest's own
+/// second vCPU's CPU while others stood idle, and every completion took that
+/// vCPU out of its guest.
 fn shared(topo: &Topology, enabled: u64, online: u64, taken: &Taken, wanted: Option<u32>, n: u32)
     -> Result<Placement, Refused>
 {
@@ -443,19 +447,20 @@ fn shared(topo: &Topology, enabled: u64, online: u64, taken: &Taken, wanted: Opt
         vcpus.push(cpu);
     }
 
-    let mut disk: Option<u32> = None;
+    let mut disk: Option<(u32, (u32, u32))> = None;
     for cpu in 1..MAX_CPUS as u32 {
-        if cpu == first || online & bit(cpu) == 0 {
+        if online & bit(cpu) == 0 || vcpus.contains(&cpu) {
             continue;
         }
-        if disk.map_or(true, |d| taken.load[cpu as usize] <= taken.load[d as usize]) {
-            disk = Some(cpu);
+        let key = (core_load(topo, cpu, &load), load[cpu as usize]);
+        if disk.map_or(true, |(_, k)| key <= k) {
+            disk = Some((cpu, key));
         }
     }
     let disk = match disk {
-        Some(cpu) => cpu,
-        None if first != 0 => 0,
-        None => first,
+        Some((cpu, _)) => cpu,
+        None if !vcpus.contains(&0) => 0,
+        None => vcpus.last().copied().unwrap_or(first),
     };
     Ok(Placement { shape: Shape::of(topo, &vcpus), vcpus, disk })
 }

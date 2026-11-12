@@ -38,6 +38,9 @@ module that carries messages between hosts, `ipcnet`, comes next.
 - A **watch** says `NameUp` and `NameDown` for every name under a prefix that
   comes and goes. A watcher with no room for one is told, once, that its
   watch has ended (`TAG_WATCH_LOST`): watch again, and list what there is.
+  The image's mailboxes watch (`Mailbox::watch`); a module's do not -- the
+  C ABI had a watch no module called, and an export nobody calls is
+  deleted. A module that comes to need one is the reason to add it back.
 
 ## Using it
 
@@ -66,8 +69,12 @@ A `call` monitors what it calls, so it ends with the answer, a `Down` or its
 timeout -- never by waiting for a peer that is gone.
 
 A module's heap gives at most 512 KiB in one block, and a message may be a
-megabyte: `recv` copies a message into one `Vec`, and leaves first one it
-has no room for; `recv_pieces` takes any message, in pieces of at most 64
+megabyte: `recv` copies a message into one `Vec`, and drops one it has no
+room for -- read off in parts, said in the log, and the next looked for
+without waiting again; left first, it once wedged the mailbox, every later
+`recv` finding it again and its server spinning on the `None`. A server
+that may be sent a message that large receives with `recv_pieces`, which
+takes any message, in pieces of at most 64
 KiB, through `kernel_ipc_recv_part` -- a part of the first message at an
 offset, a ticket from its first part held to at every part after so that
 all of them are of one message, the message taken with its last byte. What

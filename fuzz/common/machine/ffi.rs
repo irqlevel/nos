@@ -42,6 +42,14 @@ pub extern "C" fn kernel_cycle_counter_hz() -> u64 {
     0
 }
 
+/// The machine has no cycle counter of its own: its clock's nanoseconds,
+/// which keeps what reads it -- kcore's clock fallback for an unseeded
+/// pool -- the same from one run of an input to the next.
+#[no_mangle]
+pub extern "C" fn kernel_read_cycle_counter() -> u64 {
+    sched::harness(sched::read_clock)
+}
+
 /* ---- the CPU ---- */
 
 #[no_mangle]
@@ -352,9 +360,10 @@ pub extern "C" fn kernel_softirq_pending(typ: usize) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn kernel_softirq_register(typ: usize, handler: extern "C" fn(*mut u8), ctx: *mut u8) {
+pub extern "C" fn kernel_softirq_register(typ: usize, handler: extern "C" fn(*mut u8), ctx: *mut u8) -> i32 {
     let ctx = ctx as usize;
-    sched::harness(|| sched::softirq_register(typ, handler, ctx))
+    sched::harness(|| sched::softirq_register(typ, handler, ctx));
+    1
 }
 
 #[no_mangle]

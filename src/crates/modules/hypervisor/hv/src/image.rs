@@ -10,13 +10,20 @@
 //! device reads as whatever it held -- through the device's queue, many
 //! writes at once, and the rest of the device given back to it where it
 //! takes that. A device is claimed while it is written: nothing else has it
-//! meanwhile.
+//! meanwhile. A pour's waits for the device end at a stop, and a device that
+//! answers none of its writes for `POUR_GIVE_UP_NS` is given up, said so.
+//! What is poured is a qcow2 image or a raw disk -- one with a partition
+//! table, or a filesystem or anything else a disk holds that
+//! `diskimage::contents` knows -- of at least a byte: a file that is neither,
+//! a page of HTML, and an empty one are refused, not poured over the device.
 //!
 //! Nothing is written over -- a disk that is there already is refused --
-//! and a conversion that fails leaves nothing behind: the disk is removed,
-//! and what was wrong is said, with where. A file that is not qcow2 is
-//! refused by what it is -- a raw disk is given to a guest as it is, a
-//! compressed stream is unpacked first -- not as a damaged image.
+//! and a conversion into a file that fails leaves nothing behind: the disk
+//! is removed, and what was wrong is said, with where. A pour cannot take
+//! back what it wrote: one that fails or is stopped says the device, or the
+//! volume, holds part of the image now. A file that is not qcow2 is refused
+//! by what it is -- a raw disk is given to a guest as it is, a compressed
+//! stream is unpacked first -- not as a damaged image.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -24,6 +31,8 @@ use alloc::vec::Vec;
 use core::cell::Cell;
 
 use diskimage::qcow2::{Error, Qcow2, Stats};
+#[cfg(target_arch = "x86_64")]
+use diskimage::contents;
 use diskimage::{detect, Format};
 #[cfg(target_arch = "x86_64")]
 use kcore::block::{DiskQueue, Started};
@@ -88,8 +97,15 @@ impl diskimage::Sink for Disk<'_> {
     }
 }
 
+/// What `hv convert` asks of the VMs: which devices are being given to one
+/// meanwhile (`devices::check`) -- none where no guest runs.
+#[cfg(target_arch = "x86_64")]
+pub type Vms = crate::vms::Vms;
+#[cfg(not(target_arch = "x86_64"))]
+pub type Vms = ();
+
 /// `hv convert <image> <disk|device> [force]`.
-pub fn command(root: &str, args: &str, work: &mut dyn Work) {
+pub fn command(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
     let mut words = args.split_ascii_whitespace();
     let (Some(from), Some(to)) = (words.next(), words.next()) else {
         let _ = writeln!(work, "{}", USAGE);
@@ -106,7 +122,7 @@ pub fn command(root: &str, args: &str, work: &mut dyn Work) {
     let result = if let Some(volume) = to.strip_prefix("nbs:").filter(|v| !v.is_empty()) {
         onto_volume(from, volume, force, work)
     } else if names_device(to) {
-        onto_device(root, from, to, force, work)
+        onto_device(root, vms, from, to, force, work)
     } else if force {
         Err(String::from("force is for a device: a file is never written over"))
     } else {
@@ -130,21 +146,24 @@ fn names_device(word: &str) -> bool {
 }
 
 /// `hv convert <image> <device> [force]`: the image poured onto the device,
-/// where it may be given (`devices::check`).
+/// where it may be given (`devices::check`). What a pour that fails leaves
+/// on the device, the pour says.
 #[cfg(target_arch = "x86_64")]
-fn onto_device(root: &str, from: &str, to: &str, force: bool, work: &mut dyn Work) -> Result<(), String> {
+fn onto_device(root: &str, vms: &Vms, from: &str, to: &str, force: bool, work: &mut dyn Work) -> Result<(), String> {
     let (disk, _) = crate::devices::given(to)?;
-    crate::devices::check(root, "", &disk, force)?;
+    crate::devices::check(root, vms, "", &disk, force)?;
     pour(from, disk, "hv convert", work).map(|_| ())
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn onto_device(_root: &str, _from: &str, to: &str, _force: bool, _work: &mut dyn Work) -> Result<(), String> {
+fn onto_device(_root: &str, _vms: &Vms, _from: &str, to: &str, _force: bool, _work: &mut dyn Work)
+               -> Result<(), String> {
     Err(alloc::format!("{}: a device is given to a guest on x86-64 alone, so far", to))
 }
 
 /// `hv convert <image> nbs:<volume> [force]`: the image poured onto the
-/// volume through its session (`pour_volume`).
+/// volume through its session (`pour_volume`), which says what one that
+/// fails leaves on the volume.
 #[cfg(target_arch = "x86_64")]
 fn onto_volume(from: &str, volume: &str, force: bool, work: &mut dyn Work) -> Result<(), String> {
     pour_volume(from, volume, force, work).map(|_| ())
@@ -166,6 +185,13 @@ const POUR_BYTES: usize = 256 * 1024;
 #[cfg(target_arch = "x86_64")]
 /// How long a pour waits for a write before it looks again.
 const POUR_WAIT_MS: u64 = 100;
+#[cfg(target_arch = "x86_64")]
+/// How long a pour waits for a device that gives back none of its writes
+/// before it takes the device for gone: what the queue's own drop waits for
+/// its I/O (`block::queue`). The NVMe driver ends no I/O command that never
+/// completes, and a pour's waits were for good -- `hv convert`, and the
+/// unload or the poweroff behind it, held with nothing said.
+const POUR_GIVE_UP_NS: u64 = 120 * NS_PER_SEC;
 
 /// A device the image's disk is poured onto: every byte of `[0, size)`
 /// written, in order -- what the converter leaves out, zeros -- through
@@ -186,6 +212,11 @@ struct Onto<'a> {
     out: usize,
     free: Vec<usize>,
     failed: bool,
+    /// A write was handed to the device: it holds part of the image.
+    wrote: bool,
+    /// The device gave back none of the writes it had for
+    /// `POUR_GIVE_UP_NS`: taken for gone.
+    hung: bool,
     stopped: &'a Cell<bool>,
 }
 
@@ -195,26 +226,44 @@ impl<'a> Onto<'a> {
         let mut free = Vec::new();
         free.try_reserve_exact(q.buffers()).ok()?;
         free.extend((0..q.buffers()).rev());
-        Some(Onto { q, size, at: 0, buf: None, run: 0, fill: 0, out: 0, free, failed: false, stopped })
+        Some(Onto { q, size, at: 0, buf: None, run: 0, fill: 0, out: 0, free, failed: false, wrote: false,
+                    hung: false, stopped })
     }
 
-    /// What the device is done with, back on the free list: waiting for one
-    /// when `wait` and none is free yet.
-    fn reap(&mut self, wait: bool) {
+    /// What the device is done with, back on the free list: how many came
+    /// back.
+    fn take_back(&mut self) -> usize {
+        let mut back = 0;
+        let mut bad = false;
+        self.q.reap(|k, ok| {
+            back += 1;
+            bad |= !ok;
+            /* Into the room taken at `new`: every buffer of the queue. */
+            if self.free.len() < self.free.capacity() {
+                self.free.push(k);
+            }
+        });
+        self.out -= back.min(self.out);
+        self.failed |= bad;
+        back
+    }
+
+    /// Waited for the device to give back `enough` of its writes -- a free
+    /// buffer, or all of them -- for as long as it gives some back within
+    /// `POUR_GIVE_UP_NS` of each other: not past a stop, nor past a device
+    /// that has gone quiet (`hung`, `failed`).
+    fn wait_for(&mut self, enough: impl Fn(&Self) -> bool) {
+        let mut since = kcore::time::boot_time_ns();
         loop {
-            let mut back = 0;
-            let mut bad = false;
-            self.q.reap(|k, ok| {
-                back += 1;
-                bad |= !ok;
-                /* Into the room taken at `new`: every buffer of the queue. */
-                if self.free.len() < self.free.capacity() {
-                    self.free.push(k);
-                }
-            });
-            self.out -= back.min(self.out);
-            self.failed |= bad;
-            if !wait || !self.free.is_empty() || self.out == 0 {
+            if self.take_back() != 0 {
+                since = kcore::time::boot_time_ns();
+            }
+            if enough(self) || self.stopped.get() {
+                return;
+            }
+            if kcore::time::boot_time_ns().saturating_sub(since) >= POUR_GIVE_UP_NS {
+                self.hung = true;
+                self.failed = true;
                 return;
             }
             self.q.wait(Duration::from_millis(POUR_WAIT_MS));
@@ -231,9 +280,13 @@ impl<'a> Onto<'a> {
         match self.q.start(k, true, self.run, self.fill) {
             Ok(Started::InFlight) => {
                 self.out += 1;
+                self.wrote = true;
                 self.q.kick();
             }
-            Ok(Started::Done) => self.free.push(k),
+            Ok(Started::Done) => {
+                self.wrote = true;
+                self.free.push(k);
+            }
             Err(e) => {
                 self.free.push(k);
                 return Err(e);
@@ -254,7 +307,7 @@ impl<'a> Onto<'a> {
             let k = match self.buf {
                 Some(k) => k,
                 None => {
-                    self.reap(true);
+                    self.wait_for(|o| !o.free.is_empty() || o.out == 0);
                     let k = self.free.pop().ok_or(kcore::error::Error::IoError)?;
                     (self.buf, self.run, self.fill) = (Some(k), self.at, 0);
                     k
@@ -285,13 +338,8 @@ impl<'a> Onto<'a> {
     fn finish(&mut self) -> kcore::error::Result<()> {
         self.put(self.size - self.at, None)?;
         self.send()?;
-        while self.out > 0 {
-            self.reap(true);
-            if self.out > 0 {
-                self.q.wait(Duration::from_millis(POUR_WAIT_MS));
-            }
-        }
-        if self.failed {
+        self.wait_for(|o| o.out == 0);
+        if self.failed || self.out != 0 {
             return Err(kcore::error::Error::IoError);
         }
         self.q.flush()
@@ -337,6 +385,9 @@ struct OntoVolume<'a> {
     run: u64,
     out: usize,
     failed: bool,
+    /// A write was handed to the session: the volume holds part of the
+    /// image.
+    wrote: bool,
     /// Never written before: what is not written reads as zeros.
     fresh: bool,
     stopped: &'a Cell<bool>,
@@ -373,6 +424,7 @@ impl OntoVolume<'_> {
         }
         self.d.submit(nbsdrive::Op::Write { offset: self.run }, data).map_err(|_| kcore::error::Error::NoMemory)?;
         self.out += 1;
+        self.wrote = true;
         self.reap(true);
         Ok(())
     }
@@ -433,47 +485,106 @@ impl diskimage::Sink for OntoVolume<'_> {
 }
 
 #[cfg(target_arch = "x86_64")]
-/// `from` -- a qcow2 image, or a raw disk -- poured onto volume `volume` of
-/// NBS's through its session, attached for writing here -- taken from a
-/// writer elsewhere with `force` -- and let go of after: Ok once every byte
-/// of the image's disk is on the volume's replicas, flushed, or why not,
-/// the volume then holding part of it, which is the caller's to say.
+/// What `image`, the file `from`, is to a pour onto `target`: a qcow2 image,
+/// read through its tables -- or None for a raw disk, poured as it is: one
+/// with a partition table, or with what `diskimage::contents` knows a disk
+/// holds at its start or its end -- a filesystem, a RAID member's
+/// superblock -- or nothing but zeros at its start. An empty file, an image
+/// of another kind, and bytes no disk holds -- a page of HTML, a text --
+/// are refused: a pour once took them for a raw disk, and wrote a page over
+/// a device, or gave a whole device back to it for an image of nothing.
+fn pour_source(image: &mut Image, from: &str, target: &str) -> Result<Option<Qcow2>, String> {
+    let len = image.len;
+    if len == 0 {
+        return Err(alloc::format!("{} is empty -- there is no disk in it to pour", from));
+    }
+    let read = |image: &mut Image, at: u64, n: u64| -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(n as usize).map_err(|_| String::from("out of memory"))?;
+        bytes.resize(n as usize, 0);
+        diskimage::Source::read_at(image, at, &mut bytes).map_err(|e| alloc::format!("{}: {}", from, e))?;
+        Ok(bytes)
+    };
+    let format = detect(&read(image, 0, len.min(diskimage::detect::HEAD as u64))?);
+    match format {
+        Format::Qcow2 => {
+            let img = Qcow2::open(image).map_err(|e| said(e, from, target))?;
+            if img.size() == 0 {
+                return Err(alloc::format!("{}'s disk is empty -- there is nothing to pour", from));
+            }
+            Ok(Some(img))
+        }
+        Format::Raw => Ok(None),
+        Format::Unknown => {
+            let head = read(image, 0, len.min(contents::HEAD as u64))?;
+            let tail_len = len.min(contents::TAIL as u64);
+            let tail = read(image, len - tail_len, tail_len)?;
+            match contents::contents(&head, &tail, len) {
+                Some(found) if !found.recognized() => {
+                    Err(alloc::format!("{} is no disk this knows -- no partition table, no filesystem, nothing a disk \
+                                        holds at its start or its end: not poured onto {}", from, target))
+                }
+                _ => Ok(None),
+            }
+        }
+        format => Err(refused(from, format)),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+/// Why a pour onto `target` failed -- `why` -- or that it was stopped,
+/// said with what it leaves there: once anything was written, part of the
+/// image, which a pour cannot take back.
+fn pour_failed(why: String, target: &str, stopped: bool, wrote: bool) -> String {
+    let left = if wrote {
+        alloc::format!("{} holds part of the image now", target)
+    } else {
+        alloc::format!("nothing was written to {}", target)
+    };
+    match (stopped, wrote) {
+        (true, _) => work::stopped_leaving(&left),
+        (false, true) => alloc::format!("{} -- {}", why, left),
+        (false, false) => why,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+/// `from` -- a qcow2 image, or a raw disk (`pour_source`) -- poured onto
+/// volume `volume` of NBS's through its session, attached for writing here
+/// -- taken from a writer elsewhere with `force` -- and let go of after: Ok
+/// once every byte of the image's disk is on the volume's replicas, flushed,
+/// or why not, said with what the volume holds then, and with a let-go that
+/// failed too.
 pub fn pour_volume(from: &str, volume: &str, force: bool, work: &mut dyn Work) -> Result<Poured, String> {
     let file = File::open(from, false).map_err(|e| alloc::format!("{}: {}", from, e))?;
     let len = file.size().map_err(|e| alloc::format!("{}: {}", from, e))?;
     let mut image = Image { file, len };
-    let mut head = Vec::new();
-    let take = len.min(diskimage::detect::HEAD as u64) as usize;
-    head.try_reserve_exact(take).map_err(|_| String::from("out of memory"))?;
-    head.resize(take, 0);
-    diskimage::Source::read_at(&mut image, 0, &mut head).map_err(|e| alloc::format!("{}: {}", from, e))?;
-    let format = detect(&head);
-    drop(head);
     let name = alloc::format!("nbs:{}", volume);
-    let img = match format {
-        Format::Qcow2 => Some(Qcow2::open(&mut image).map_err(|e| said(e, from, &name))?),
-        Format::Raw | Format::Unknown => None,
-        format => return Err(refused(from, format)),
-    };
+    let img = pour_source(&mut image, from, &name)?;
     let size = img.as_ref().map_or(len, |i| i.size());
+    /* The first write's buffer, before the volume is attached: each later
+     * one is taken as the one before is sent, and the first, grown under
+     * the image's first bytes, was taken from the allocator that panics. */
+    let mut first = Vec::new();
+    first.try_reserve_exact(VOLUME_POUR_BYTES).map_err(|_| String::from("out of memory"))?;
     let me = nbsdrive::this_host()?;
     let mut d = nbsdrive::Drive::open(volume, &me, true, force).map_err(|e| alloc::format!("{}: {}", name, e))?;
     let (room, fresh) = (d.session().size(), d.session().generation() == 1);
     /* The disk whole blocks of the volume's: a last part of one, zeros after */
     let disk = size.div_ceil(nbsdrive::BLOCK) * nbsdrive::BLOCK;
     if disk > room {
-        let _ = d.stop();
-        return Err(alloc::format!("{}'s disk is {} MiB, and {} is {} MiB", from, size.div_ceil(MIB), name,
-                                  room / MIB));
+        let let_go = d.stop().err().map(|e| alloc::format!(" -- and {} was not let go of: {}", name, e));
+        return Err(alloc::format!("{}'s disk is {} MiB, and {} is {} MiB{}", from, size.div_ceil(MIB), name,
+                                  room / MIB, let_go.unwrap_or_default()));
     }
     let _ = writeln!(work, "hv: {}: {} a disk of {} MiB -- onto {}, {} MiB{}", from,
                      if img.is_some() { "qcow2," } else { "raw," }, size.div_ceil(MIB), name, room / MIB,
                      if fresh { ", fresh: its zeros left out" } else { "" });
     let started = kcore::time::boot_time_ns();
     let stopped = Cell::new(false);
-    let poured = {
-        let mut onto = OntoVolume { d: &mut d, size: disk, at: 0, buf: Vec::new(), run: 0, out: 0, failed: false,
-                                    fresh, stopped: &stopped };
+    let (poured, wrote) = {
+        let mut onto = OntoVolume { d: &mut d, size: disk, at: 0, buf: first, run: 0, out: 0, failed: false,
+                                    wrote: false, fresh, stopped: &stopped };
         let mut reported = started;
         let mut progress = |at: u64| {
             if work.cancelled() {
@@ -518,12 +629,19 @@ pub fn pour_volume(from: &str, volume: &str, force: bool, work: &mut dyn Work) -
                 }
             }
         };
-        copied.and_then(|()| onto.finish().map_err(|e| alloc::format!("{}: writing it failed -- {}", name, e)))
+        let poured = copied.and_then(|()| onto.finish().map_err(|e| alloc::format!("{}: writing it failed -- {}", name, e)));
+        (poured, onto.wrote)
     };
     /* Let go of either way: the VM attaches it as it starts */
     let let_go = d.stop().map_err(|e| alloc::format!("{}: not let go of -- {}", name, e));
     if let Err(e) = poured {
-        return Err(if stopped.get() { String::from(work::STOPPED) } else { e });
+        let mut why = pour_failed(e, &name, stopped.get(), wrote);
+        /* Both said: the volume may be left attached here as well. */
+        if let Err(e) = let_go {
+            why.push_str(" -- and ");
+            why.push_str(&e);
+        }
+        return Err(why);
     }
     let_go?;
     let ns = kcore::time::boot_time_ns().saturating_sub(started);
@@ -541,29 +659,19 @@ pub struct Poured {
 }
 
 #[cfg(target_arch = "x86_64")]
-/// `from` -- a qcow2 image, or a raw disk -- poured onto `disk`, a device
-/// of nos's checked already, claimed for `holder` while it is written: Ok
-/// once every byte of the image's disk is on the device -- the rest of it
-/// given back where the device takes that -- or why not, the device then
-/// holding part of it, which is the caller's to say.
+/// `from` -- a qcow2 image, or a raw disk (`pour_source`) -- poured onto
+/// `disk`, a device of nos's checked already, claimed for `holder` while it
+/// is written: Ok once every byte of the image's disk is on the device --
+/// the rest of it given back where the device takes that -- or why not,
+/// said with what the device holds then. A device that gives back none of
+/// its writes for `POUR_GIVE_UP_NS` is given up, said so.
 pub fn pour(from: &str, disk: kcore::block::Disk, holder: &str, work: &mut dyn Work) -> Result<Poured, String> {
     let file = File::open(from, false).map_err(|e| alloc::format!("{}: {}", from, e))?;
     let len = file.size().map_err(|e| alloc::format!("{}: {}", from, e))?;
     let mut image = Image { file, len };
-    let mut head = Vec::new();
-    let take = len.min(diskimage::detect::HEAD as u64) as usize;
-    head.try_reserve_exact(take).map_err(|_| String::from("out of memory"))?;
-    head.resize(take, 0);
-    diskimage::Source::read_at(&mut image, 0, &mut head).map_err(|e| alloc::format!("{}: {}", from, e))?;
-    let format = detect(&head);
-    drop(head);
-    let img = match format {
-        Format::Qcow2 => Some(Qcow2::open(&mut image).map_err(|e| said(e, from, disk.name().as_str()))?),
-        Format::Raw | Format::Unknown => None,
-        format => return Err(refused(from, format)),
-    };
-    let size = img.as_ref().map_or(len, |i| i.size());
     let name = disk.name();
+    let img = pour_source(&mut image, from, name.as_str())?;
+    let size = img.as_ref().map_or(len, |i| i.size());
     let ss = disk.sector_size();
     let device = disk.sectors().saturating_mul(ss);
     if ss == 0 || size % ss != 0 {
@@ -597,29 +705,47 @@ pub fn pour(from: &str, disk: kcore::block::Disk, holder: &str, work: &mut dyn W
                              now.saturating_sub(started) / NS_PER_SEC);
         }
     };
-    let stopped_or = |e: String| if stopped.get() { String::from(work::STOPPED) } else { e };
-    match &img {
-        Some(img) => {
-            img.convert(&mut image, &mut onto, &mut progress).map_err(|e| stopped_or(said(e, from, name.as_str())))?;
-        }
-        None => {
-            /* Raw: read as it is, a chunk at a time. */
-            let mut chunk = Vec::new();
-            chunk.try_reserve_exact(POUR_BYTES).map_err(|_| String::from("out of memory"))?;
-            chunk.resize(POUR_BYTES, 0);
-            let mut at = 0u64;
-            while at < size {
-                let n = (size - at).min(POUR_BYTES as u64) as usize;
-                diskimage::Source::read_at(&mut image, at, &mut chunk[..n])
-                    .map_err(|e| alloc::format!("{}: reading it failed -- {}", from, e))?;
-                diskimage::Sink::write_at(&mut onto, at, &chunk[..n])
-                    .map_err(|e| stopped_or(alloc::format!("{}: writing it failed -- {}", name, e)))?;
-                at += n as u64;
-                progress(at);
+    let poured: Result<(), String> = 'pour: {
+        match &img {
+            Some(img) => {
+                if let Err(e) = img.convert(&mut image, &mut onto, &mut progress) {
+                    break 'pour Err(said(e, from, name.as_str()));
+                }
+            }
+            None => {
+                /* Raw: read as it is, a chunk at a time. */
+                let mut chunk = Vec::new();
+                if chunk.try_reserve_exact(POUR_BYTES).is_err() {
+                    break 'pour Err(String::from("out of memory"));
+                }
+                chunk.resize(POUR_BYTES, 0);
+                let mut at = 0u64;
+                while at < size {
+                    let n = (size - at).min(POUR_BYTES as u64) as usize;
+                    if let Err(e) = diskimage::Source::read_at(&mut image, at, &mut chunk[..n]) {
+                        break 'pour Err(alloc::format!("{}: reading it failed -- {}", from, e));
+                    }
+                    if let Err(e) = diskimage::Sink::write_at(&mut onto, at, &chunk[..n]) {
+                        break 'pour Err(alloc::format!("{}: writing it failed -- {}", name, e));
+                    }
+                    at += n as u64;
+                    progress(at);
+                }
             }
         }
+        onto.finish().map_err(|e| alloc::format!("{}: writing it failed -- {}", name, e))
+    };
+    if let Err(e) = poured {
+        /* A device gone quiet: said with how many of its writes it never
+         * gave back, which the queue's drop waits out after this. */
+        let why = if onto.hung {
+            alloc::format!("{} gave back none of its {} writes for {} s -- given up", name, onto.out,
+                           POUR_GIVE_UP_NS / NS_PER_SEC)
+        } else {
+            e
+        };
+        return Err(pour_failed(why, name.as_str(), stopped.get(), onto.wrote));
     }
-    onto.finish().map_err(|e| stopped_or(alloc::format!("{}: writing it failed -- {}", name, e)))?;
     /* What is past the disk, given back: the device's to say what it reads as. */
     let rest = device - size;
     let given_back = rest != 0 && gives_back && q.discard(size, rest).is_ok();

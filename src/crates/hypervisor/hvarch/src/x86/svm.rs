@@ -46,10 +46,12 @@ pub const AVIC: u32 = 1 << 13;
 pub const VMSAVE_VIRT: u32 = 1 << 15;
 pub const VGIF: u32 = 1 << 16;
 /// `vmrun` loads the guest's IA32_SPEC_CTRL from the VMCB (`Save::spec_ctrl`)
-/// and the `#vmexit` puts the host's back: there is no turning it off, and a
-/// CPU that has it runs a guest under the VMCB's value whatever the MSR held.
+/// and the `#vmexit` puts the host's back. As AMD describes it, the setting
+/// in effect while the guest runs is the VMCB's value OR-ed with what the
+/// host's MSR held -- not the VMCB's alone; the host's STIBP is OR-ed into
+/// the VMCB's value all the same (`spec`), so that it holds whichever way a
+/// CPU combines them.
 pub const V_SPEC_CTRL: u32 = 1 << 20;
-pub const VNMI: u32 = 1 << 24;
 
 /// The features worth a line in a report, and why each matters here. The
 /// ones with no note are read out and not yet used; they are in the list so
@@ -347,7 +349,14 @@ const HOST_MISC1: u32 = vmcb::intercept::misc1::INTR
     | vmcb::intercept::misc1::IOIO_PROT
     | vmcb::intercept::misc1::MSR_PROT
     | vmcb::intercept::misc1::SHUTDOWN
-    | vmcb::intercept::misc1::HLT;
+    | vmcb::intercept::misc1::HLT
+    /* The host's performance counters, as VT-x requires its RDPMC exit
+     * (`Refusal::Controls`): kept here, on this side of the crate line,
+     * not left to the policy to remember */
+    | vmcb::intercept::misc1::RDPMC;
+/* WBINVD -- the host's dirty lines -- MONITOR with MWAIT, and RDPRU (the
+ * host's MPERF and APERF): what VT-x's side requires of every guest as the
+ * host's to lose, required here too. */
 const HOST_MISC2: u32 = vmcb::intercept::misc2::VMRUN
     | vmcb::intercept::misc2::VMLOAD
     | vmcb::intercept::misc2::VMSAVE
@@ -356,7 +365,10 @@ const HOST_MISC2: u32 = vmcb::intercept::misc2::VMRUN
     | vmcb::intercept::misc2::SKINIT
     | vmcb::intercept::misc2::XSETBV
     | vmcb::intercept::misc2::MWAIT
-    | vmcb::intercept::misc2::MWAIT_ARMED;
+    | vmcb::intercept::misc2::MWAIT_ARMED
+    | vmcb::intercept::misc2::WBINVD
+    | vmcb::intercept::misc2::MONITOR
+    | vmcb::intercept::misc2::RDPRU;
 pub const VECTOR_DB: u32 = 1;
 pub const VECTOR_AC: u32 = 17;
 pub const VECTOR_MC: u32 = 18;
@@ -375,12 +387,15 @@ pub enum NotRun {
     /// The extension is not on there -- or is on with a host save area this
     /// hypervisor did not give it.
     Off { cpu: u32 },
-    /// It translates with five levels of page table. A nested table is
-    /// walked in the host's own paging mode, and the one this hypervisor
-    /// builds has four: walked as five, its top level would be taken for a
-    /// fifth and the guest's own memory for the last -- a guest choosing
-    /// its own host physical addresses. Nothing in this kernel turns LA57
-    /// on; this is where that would be found out, not a guest.
+    /// It translates with five levels of page table. Under AMD-V a nested
+    /// table is walked in the host's own paging mode, and the one this
+    /// hypervisor builds has four: walked as five, its top level would be
+    /// taken for a fifth and the guest's own memory for the last -- a guest
+    /// choosing its own host physical addresses. Under VT-x an EPT's walk
+    /// length is its own, the EPTP's, and the refusal stands there only
+    /// because no five-level host has run a guest here. Nothing in this
+    /// kernel turns LA57 on; this is where that would be found out, not a
+    /// guest.
     FiveLevelPaging { cpu: u32 },
     /// Another CPU kicked the vCPU on its way in ([`Kick`]): something is
     /// waiting for the guest that the caller is to hand over first. Nothing
@@ -907,7 +922,15 @@ impl Guest {
             /* Here, with interrupts off, so that the CPU the ASID is for is
              * the CPU `vmrun` runs on. Never 0, the host's: `vmrun` refuses
              * that itself, and the refusal hands the guest nothing. */
-            let (asid, mut control) = entries.asids.assign(tag, cpu, nested.id).ok_or(NotRun::Off { cpu })?;
+            let Some((asid, mut control)) = entries.asids.assign(tag, cpu, nested.id) else {
+                /* Past `entering`: not in the guest after all, as each of
+                 * VT-x's late refusals says -- or a notification sent now
+                 * would be taken for delivered. */
+                if let Some(k) = kick {
+                    k.left();
+                }
+                return Err(NotRun::Off { cpu });
+            };
             if flush_always {
                 control = vmcb::tlb::FLUSH_ALL;
             }
@@ -959,7 +982,10 @@ impl Guest {
                         vmcb.get_mut().save.spec_ctrl = value;
                         Some(value)
                     }
-                    None => entries.spec.load_guest(msrs.spec_ctrl()),
+                    None => {
+                        let meant = entries.spec.load_guest(msrs.spec_ctrl());
+                        if msrs.measuring() { entries.spec.read_spec_ctrl() } else { meant }
+                    }
                 };
                 msrs.ran(spec_ctrl);
 

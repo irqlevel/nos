@@ -293,13 +293,33 @@ bool SoftIrq::make_pending(CpuState& state, ulong type)
     return false;
 }
 
-void SoftIrq::register_handler(ulong type, void (*handler)(void* ctx), void* ctx)
+bool SoftIrq::register_handler(ulong type, void (*handler)(void* ctx), void* ctx)
+{
+    if (type >= MAX_TYPES || handler == nullptr)
+        return false;
+
+    /* The type taken, by one registration at most: the pair is then
+       written, and only then published -- a pass on any CPU reads it only
+       after it sees it ready (ready_handler) */
+    Handler& h = handlers_[type];
+    ulong expected = HANDLER_FREE;
+    if (!__atomic_compare_exchange_n(&h.state, &expected, HANDLER_WRITING, false,
+            __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return false;
+    h.func = handler;
+    h.ctx = ctx;
+    __atomic_store_n(&h.state, HANDLER_READY, __ATOMIC_RELEASE);
+    return true;
+}
+
+const SoftIrq::Handler* SoftIrq::ready_handler(ulong type) const
 {
     if (type >= MAX_TYPES)
-        return;
-
-    handlers_[type].func = handler;
-    handlers_[type].ctx = ctx;
+        return nullptr;
+    const Handler& h = handlers_[type];
+    if (__atomic_load_n(&h.state, __ATOMIC_ACQUIRE) != HANDLER_READY)
+        return nullptr;
+    return &h;
 }
 
 void SoftIrq::task_func(void* ctx)
@@ -319,7 +339,10 @@ void SoftIrq::run_handler(CpuState& state, ulong type, u64 raised)
         tp::emit_softirq_entry(type, wait_ns);
     }
 
-    handlers_[type].func(handlers_[type].ctx);
+    /* The caller found it ready (ready_handler), and a ready one stays */
+    const Handler* h = ready_handler(type);
+    if (h != nullptr)
+        h->func(h->ctx);
 
     /* Raised again while it ran -- an interrupt's, or the handler's own on
        its budget -- so that this loop runs it again */
@@ -390,12 +413,13 @@ void SoftIrq::run(CpuState& state)
 
             state.pending.clear_bit(i);
 
-            if (handlers_[i].func)
+            const Handler* h = ready_handler(i);
+            if (h != nullptr)
             {
                 if (unlikely(tp::on(tp::Id::SoftirqEntry) || tp::on(tp::Id::SoftirqExit)))
                     run_handler(state, i, raised);
                 else
-                    handlers_[i].func(handlers_[i].ctx);
+                    h->func(h->ctx);
                 handled = true;
             }
 

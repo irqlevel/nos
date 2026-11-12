@@ -16,9 +16,11 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
+#[cfg(target_arch = "x86_64")]
 use kcore::pci;
 use kcore::sync::SpinLock;
 use kcore::klog;
+#[cfg(not(target_arch = "x86_64"))]
 use virtio::mmio::{MmioTransport, Slot};
 use virtio::{Buf, Queue, Transport};
 
@@ -216,6 +218,7 @@ pub fn init() {}
 ///
 /// # Safety
 /// `slots` points at `count` slots, each naming a mapped register window.
+#[cfg(not(target_arch = "x86_64"))]
 #[no_mangle]
 pub unsafe extern "C" fn rust_virtio_rng_init_mmio(slots: *const Slot, count: usize) {
     if slots.is_null() {

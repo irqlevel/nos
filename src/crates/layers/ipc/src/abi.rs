@@ -6,8 +6,8 @@
 //! never one of the image's -- is closed, named, received from or sent from
 //! through here.
 
-use crate::{close, demonitor, handle, list, lookup, monitor, open, owner_at, register, send, unwatch, wait, wait_part,
-            watch, Addr, Error, Limits, Mbox, Part, Payload, Reason, Scope, Taken, To, MAX_PAYLOAD, NAME_MAX,
+use crate::{close, demonitor, handle, list, lookup, monitor, open, owner_at, register, send, wait, wait_part,
+            Addr, Error, Limits, Mbox, Part, Payload, Reason, Scope, Taken, To, MAX_PAYLOAD, NAME_MAX,
             OWNER_NAME_MAX};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -269,24 +269,6 @@ pub extern "C" fn kernel_ipc_monitor(mbox: u64, target: u64) -> u64 {
 pub extern "C" fn kernel_ipc_demonitor(mbox: u64, id: u64) {
     if let Some(m) = module_box(mbox) {
         demonitor(&m, id);
-    }
-}
-
-/// # Safety
-/// `prefix` is readable for `len` bytes.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_ipc_watch(mbox: u64, prefix: *const u8, len: usize) -> u64 {
-    let Some(m) = module_box(mbox) else { return 0 };
-    match unsafe { text(prefix, len, IPC_NAME_MAX) } {
-        Some(p) => watch(&m, p).unwrap_or(0),
-        None => 0,
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_ipc_unwatch(mbox: u64, id: u64) {
-    if let Some(m) = module_box(mbox) {
-        unwatch(&m, id);
     }
 }
 

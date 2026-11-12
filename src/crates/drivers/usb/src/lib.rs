@@ -196,12 +196,28 @@ pub extern "C" fn rust_usb_start() -> i32 {
     }
 }
 
-/// On the way down: the task finishes its pass and exits.
+/// How long a stop waits for a start that holds the task's slot, a
+/// millisecond a try.
+const STOP_TRIES: u32 = 1000;
+
+/// On the way down: the task finishes its pass and exits. The slot is held
+/// only by a start at the same moment: waited for, and if it never lets go,
+/// said -- a failed `try_lock` used to skip the stop without a word, the
+/// task left running through the halt.
 #[no_mangle]
 pub extern "C" fn rust_usb_stop() {
-    let handle = match TASK.try_lock() {
-        Some(mut task) => task.take(),
-        None => None,
+    let mut tries = 0;
+    let handle = loop {
+        if let Some(mut task) = TASK.try_lock() {
+            break task.take();
+        }
+        tries += 1;
+        if tries == STOP_TRIES {
+            klog!(0, "usb: the stop found the task's slot held by a start for {} ms: the task, if any, not stopped",
+                  STOP_TRIES);
+            return;
+        }
+        kcore::task::sleep_ms(1);
     };
 
     if let Some(handle) = handle {

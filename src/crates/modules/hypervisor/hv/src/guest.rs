@@ -92,7 +92,9 @@ pub struct Spec {
     pub restart: bool,
     /// `force`, for `hv start`: its volumes of NBS's (`disk=nbs:<volume>`)
     /// attached for writing even where a host writes them now -- that
-    /// host's writes fenced from then on.
+    /// host's writes fenced from then on. The first boot's alone: `launch`
+    /// clears it once that one is built, and every boot after attaches
+    /// plainly.
     pub force: bool,
     /// `net`, for `hv start`: a NIC on the guests' switch. Which port is
     /// `nic`'s, once `hv start` has claimed one.
@@ -245,6 +247,12 @@ pub fn spec(o: Options) -> Result<Spec, String> {
     }
     if o.disks.len() > MAX_DISKS {
         return Err(alloc::format!("at most {} disks", MAX_DISKS));
+    }
+    /* Past the most the NIC holds its interrupts apart, refused rather than
+     * made the most without a word */
+    let rxmod_max_us = hv::run::MAX_RX_MODERATION_NS / kcore::consts::NS_PER_US;
+    if o.rxmod_us.is_some_and(|us| us > rxmod_max_us) {
+        return Err(alloc::format!("rxmod= must be 0..{} us", rxmod_max_us));
     }
     let port = match o.port {
         Some(p) if !o.net => return Err(alloc::format!("port={} is a net guest's -- net too", p)),
@@ -494,6 +502,20 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
     };
     let image = plan(spec, initrd_len)?;
 
+    /* Its disks next, before its memory: the commonest refusal of a start
+     * -- an image another guest writes, a device in use -- once came only
+     * after gigabytes were taken and zeroed and the kernel read. All but a
+     * volume taken by force, which fences the writer elsewhere: that one is
+     * opened last of all, below, so that what can still refuse the guest
+     * has before another host's guest is cut off for it. */
+    let mut disks: Vec<Option<QueuedDisk>> = Vec::new();
+    disks.try_reserve_exact(spec.disks.len()).map_err(|_| String::from("out of memory"))?;
+    for (i, (path, ro)) in spec.disks.iter().enumerate() {
+        let index = u8::try_from(i).map_err(|_| String::from("more disks than a guest has"))?;
+        let forced = spec.force && matches!(crate::devices::source(path), crate::devices::Source::Volume(_));
+        disks.push(if forced { None } else { Some(QueuedDisk::open(path, *ro, false, runner, index)?) });
+    }
+
     let huge = from_pool();
     if huge {
         pool_has(spec.mem_bytes)?;
@@ -542,10 +564,13 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
         guest.add_nic(Box::new(nic.switch.backend(nic.port)), crate::net::port_mac(nic.port))
             .map_err(|e| alloc::format!("the NIC: {}", e))?;
     }
-    for (i, (path, ro)) in spec.disks.iter().enumerate() {
+    for (i, ((path, ro), opened)) in spec.disks.iter().zip(disks).enumerate() {
         let index = u8::try_from(i).map_err(|_| String::from("more disks than a guest has"))?;
         let letter = char::from(b'a'.saturating_add(index));
-        let disk = QueuedDisk::open(path, *ro, spec.force, runner, index)?;
+        let disk = match opened {
+            Some(d) => d,
+            None => QueuedDisk::open(path, *ro, true, runner, index)?,
+        };
         let mut id = String::new();
         match disk.serial() {
             Some(s) => id.push_str(s),
@@ -709,6 +734,13 @@ pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
             gpa, rip),
         Stop::Mmio { gpa, rip } => write!(out,
             "a touch of guest physical {:#x}, no memory and no device there, rip {:#x}", gpa, rip),
+        Stop::StringIo { port, input, rip } => write!(out,
+            "an {} of port {:#x} at rip {:#x}: string port I/O, which nothing here emulates",
+            if input { "INS" } else { "OUTS" }, port, rip),
+        Stop::MmioDelivering { gpa, rip } => write!(out,
+            "the CPU's own touch of a device's page at guest physical {:#x} as it delivered an interrupt or an \
+             exception, rip {:#x} -- a stack or an IDT put on the APIC's or the IO-APIC's page: no instruction \
+             to perform", gpa, rip),
         Stop::Shutdown { rip } => write!(out, "triple fault at {:#x}", rip),
         Stop::Reset { port, value, rip } => write!(out, "the guest asked for a reset, {:#04x} to port {:#x} ({}), at {:#x}",
             value, port, hv::run::reset_source(port), rip),
@@ -744,6 +776,12 @@ pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
         Stop::Requested => write!(out, "on request"),
         Stop::Unexpected { exit, rip } => write!(out, "an exit with no handler: {:?} at {:#x}", exit, rip),
     }
+}
+
+/// `part` of `whole` in percent, the product in 128 bits: the CPUs' sleep
+/// summed, times 100, is past 2^64 after a long enough run.
+fn percent(part: u64, whole: u64) -> u64 {
+    u64::try_from(u128::from(part) * 100 / u128::from(whole.max(1))).unwrap_or(u64::MAX)
 }
 
 /// How the run ended and what it counted: what `hv boot` and `hv stop` say.
@@ -798,7 +836,7 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
     let _ = writeln!(out, "  halted     slept {} ms in {} sleeps, {}% of the run{}; {} halts spun for a ring first, {} of them \
                            woken in the spin",
         total.slept_ns / NS_PER_MS, total.sleeps,
-        total.slept_ns * 100 / run_ns / counts.len().max(1) as u64,
+        percent(total.slept_ns, run_ns.saturating_mul(counts.len().max(1) as u64)),
         if counts.len() > 1 { " (of each CPU's, on average)" } else { "" }, total.polls, total.polled);
     /* What an exit costs the host past the world switch: its handling, and
      * the look at what is waiting before the next entry. */
@@ -872,8 +910,8 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
             total.mmio_done);
     }
     if let Some(io) = guest.ioapic_stats() {
-        let _ = writeln!(out, "  ioapic     {} interrupts sent, {} of them level-triggered, {} ended by EOI, {} of no delivery mode sent here",
-            io.sent, io.level, io.eois, io.dropped);
+        let _ = writeln!(out, "  ioapic     {} interrupts sent, {} of them level-triggered, {} ended by EOI, {} levels no local APIC took, {} of no delivery mode sent here",
+            io.sent, io.level, io.eois, io.untaken, io.dropped);
     }
     if counts.len() > 1 {
         let states = guest.cpu_states();
@@ -883,7 +921,7 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
             let (activity, host) = states.get(i).copied().unwrap_or((hv::run::Activity::Running, None));
             let _ = write!(out, "  cpu {:<2}     {} exits, {} apic irq, {} ipi sent, {} hlt, {} timer interrupts more than 1 \
                                  ms late, slept {}% -- {}",
-                i, c.exits, c.apic, c.ipi_sent, c.hlt, c.late(), c.slept_ns * 100 / run_ns, activity.name());
+                i, c.exits, c.apic, c.ipi_sent, c.hlt, c.late(), percent(c.slept_ns, run_ns), activity.name());
             match host {
                 Some(h) => { let _ = writeln!(out, ", on host cpu {}", h); }
                 None => { let _ = writeln!(out, ", never entered"); }
@@ -934,6 +972,10 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
         if pairs > 1 {
             let _ = write!(out, "; {} of {} queue pairs in use, {} commands ({} refused)", active, pairs, s.commands,
                 s.refused);
+        }
+        if s.cut != 0 {
+            let _ = write!(out, "; {} sending passes cut short at {} frames or {} KiB", s.cut, hv::nic::TX_PASS_FRAMES,
+                hv::nic::TX_PASS_BYTES / 1024);
         }
         let _ = writeln!(out, "{}{}", if broken { "; stopped over a ring the driver broke" } else { "" },
             copied_note(copied));
@@ -1068,22 +1110,48 @@ const CSI_MAX: usize = 32;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Esc {
     Text,
-    /// ESC: a sequence, one more byte long unless that byte is `[`.
+    /// ESC: a sequence, one more byte long unless that byte is `[` or
+    /// begins a string.
     Start,
     /// ESC [: a CSI sequence, to its final byte.
     Csi,
+    /// A string sequence -- ESC ], ESC P, ESC X, ESC ^, ESC _: a title, a
+    /// palette, a query -- to its BEL or its ST (ESC \). Its text was once
+    /// printed, ESC ] taken for a sequence of two bytes.
+    Str,
+    /// An ESC inside a string: `\` ends it.
+    StrEsc,
 }
 
 impl Esc {
-    /// The state after `byte`, and whether `byte` is text.
+    /// The state after `byte`, and whether `byte` is text. A newline ends
+    /// any sequence cut short, and is the line's end still: a guest's
+    /// broken sequence takes none of the lines after it.
     fn step(self, byte: u8) -> (Esc, bool) {
         match (self, byte) {
+            (Esc::Text, b'\n') | (Esc::Csi | Esc::Str | Esc::StrEsc | Esc::Start, b'\n') => (Esc::Text, true),
+            (Esc::Str, 0x07) => (Esc::Text, false),
+            (Esc::Str | Esc::StrEsc, 0x1B) => (Esc::StrEsc, false),
+            (Esc::StrEsc, b'\\') => (Esc::Text, false),
+            (Esc::Str | Esc::StrEsc, _) => (Esc::Str, false),
             (_, 0x1B) => (Esc::Start, false),
             (Esc::Start, b'[') => (Esc::Csi, false),
+            (Esc::Start, b']' | b'P' | b'X' | b'^' | b'_') => (Esc::Str, false),
             (Esc::Start, _) => (Esc::Text, false),
             (Esc::Csi, 0x40..=0x7E) => (Esc::Text, false),
             (Esc::Csi, _) => (Esc::Csi, false),
             (Esc::Text, _) => (Esc::Text, true),
+        }
+    }
+
+    /// The state a C1 control -- `c`, 0x80 to 0x9F, as the second byte of
+    /// its UTF-8 form `C2 c` -- leaves it in: the ESC form's. A terminal
+    /// reading UTF-8 takes `C2 9B` for a CSI and `C2 9D` for an OSC.
+    fn c1(c: u8) -> Esc {
+        match c {
+            0x9B => Esc::Csi,
+            0x90 | 0x98 | 0x9D | 0x9E | 0x9F => Esc::Str,
+            _ => Esc::Text,
         }
     }
 }
@@ -1108,8 +1176,8 @@ pub struct LogLine {
     tokens: u64,
     topped_at: u64,
     /// Lines left out that no notice has said yet, and when the last notice
-    /// was given: one a second at most, so that saying what was left out
-    /// does not cost the log as many lines again.
+    /// was in the log (`told`): one a second at most, so that saying what was
+    /// left out does not cost the log as many lines again.
     dropped: u64,
     told_at: u64,
 }
@@ -1124,12 +1192,22 @@ impl LogLine {
 
     /// Whether the line that ended goes to the kernel log, at `now`: Some,
     /// with how many lines left out the caller is to say before it -- zero
-    /// but once a second at most -- or None, and it is one more left out.
+    /// but once a second at most, the caller calling `told` once it has --
+    /// or None, and it is one more left out.
     pub fn admit(&mut self, now: u64) -> Option<u64> {
         let earned = now.saturating_sub(self.topped_at).saturating_mul(LOG_LINES_PER_SEC) / NS_PER_SEC;
         if earned != 0 {
-            self.tokens = self.tokens.saturating_add(earned).min(LOG_BURST);
-            self.topped_at = now;
+            let tokens = self.tokens.saturating_add(earned);
+            if tokens >= LOG_BURST {
+                self.tokens = LOG_BURST;
+                self.topped_at = now;
+            } else {
+                /* The time those lines earned, and no more: the part of a
+                 * line still being earned is kept. Moved to `now`, lines
+                 * 15 ms apart were let through 33 a second, not 50. */
+                self.tokens = tokens;
+                self.topped_at += earned * NS_PER_SEC / LOG_LINES_PER_SEC;
+            }
         }
         if self.tokens == 0 {
             self.dropped += 1;
@@ -1139,8 +1217,15 @@ impl LogLine {
         if self.dropped == 0 || now.saturating_sub(self.told_at) < NS_PER_SEC {
             return Some(0);
         }
-        self.told_at = now;
         Some(core::mem::take(&mut self.dropped))
+    }
+
+    /// A notice `admit` asked for is in the log, at `now`, read after the
+    /// log took it: the next a second after the log's own stamp on this one,
+    /// which the log takes after `admit`'s `now` -- from that `now`, two
+    /// notices were stamped 18 us short of a second apart.
+    pub fn told(&mut self, now: u64) {
+        self.told_at = now;
     }
 
     /// The lines left out that no notice has said yet: for the caller to say
@@ -1177,15 +1262,19 @@ impl LogLine {
 
 /// A guest's console on its way to a person's terminal, for `hv attach`: as
 /// it is -- colours, cursor movement, a line editor's redraws -- but for what
-/// a terminal would answer or act on. A query (a device status report,
-/// `ESC [ 6 n`; device attributes, `ESC [ c`; `ESC Z`) is taken out: the
-/// terminal's answer would be typed into the guest after the UART's own. The
-/// string sequences -- an operating-system command, `ESC ]`, and `ESC P`,
-/// `ESC _`, `ESC ^`, `ESC X` -- are taken out whole, to their end: they set a
-/// terminal's title, its clipboard, its palette, nothing a guest should reach
-/// on the person's machine. And NULs, which the kernel's printers end a
-/// string at. It keeps its place across calls: a sequence may be cut
-/// anywhere between two reads of the console.
+/// a terminal would answer or act on. A query is taken out: a device status
+/// report, `ESC [ 6 n`; device attributes, `ESC [ c`, `ESC Z`; the window's
+/// reports and moves, `ESC [ ... t`; DECRQM, `ESC [ ? Ps $ p`; DECREQTPARM,
+/// `ESC [ x`; XTVERSION, `ESC [ > q`; ENQ, the answerback -- the terminal's
+/// answer would be typed into the guest after the UART's own, or at nos's
+/// prompt after the detach. The string sequences -- an operating-system
+/// command, `ESC ]`, and `ESC P`, `ESC _`, `ESC ^`, `ESC X` -- are taken out
+/// whole, to their end: they set a terminal's title, its clipboard, its
+/// palette, nothing a guest should reach on the person's machine. Each of
+/// those in its C1 form too, as UTF-8 writes it -- `C2 9B` a CSI, `C2 9D` an
+/// OSC -- which a terminal reading UTF-8 takes for the same. And NULs,
+/// which the kernel's printers end a string at. It keeps its place across
+/// calls: a sequence may be cut anywhere between two reads of the console.
 pub struct TermFilter {
     state: Term,
     csi: [u8; CSI_MAX],
@@ -1205,11 +1294,25 @@ enum Term {
     Str,
     /// An ESC inside one: `\` ends it.
     StrEsc,
+    /// A C2 held back: what follows it says whether it begins a C1
+    /// control or a character.
+    Lead,
 }
 
 const BEL: u8 = 0x07;
 const ESC: u8 = 0x1B;
 const NUL: u8 = 0x00;
+/// ENQ: a terminal answers it with its answerback.
+const ENQ: u8 = 0x05;
+/// The first byte of a C1 control's UTF-8 form.
+const C1_LEAD: u8 = 0xC2;
+
+/// What `hv attach` writes to the person's terminal as it detaches: a soft
+/// reset (DECSTR), the main screen back, the mouse's reports off, the
+/// cursor shown, the ASCII set in G0 and shifted in -- so that a guest's
+/// alternate screen, mouse mode, hidden cursor or line-drawing set does
+/// not stay on nos's shell.
+pub const TERM_RESET: &[u8] = b"\x1b[!p\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b(B\x0f";
 
 impl TermFilter {
     pub fn new() -> TermFilter {
@@ -1221,12 +1324,19 @@ impl TermFilter {
     pub fn filter(&mut self, bytes: &[u8], out: &mut Vec<u8>) {
         for &b in bytes {
             self.state = match self.state {
-                Term::Text => match b {
-                    ESC => Term::Esc,
-                    NUL => Term::Text,
+                Term::Text => Self::text(b, out),
+                Term::Lead => match b {
+                    /* A C1 control: as its ESC form */
+                    0x9B => {
+                        self.csi_len = 0;
+                        Term::Csi
+                    }
+                    0x90 | 0x98 | 0x9D | 0x9E | 0x9F => Term::Str,
+                    0x80..=0x9F => Term::Text,
+                    /* A character's first byte after all */
                     _ => {
-                        out.push(b);
-                        Term::Text
+                        out.push(C1_LEAD);
+                        Self::text(b, out)
                     }
                 },
                 Term::Esc => match b {
@@ -1263,7 +1373,7 @@ impl TermFilter {
                     /* The final byte: a query goes, anything else is let
                      * through whole. */
                     0x40..=0x7E => {
-                        if b != b'n' && b != b'c' {
+                        if !self.query(b) {
                             self.flush_csi(out);
                             out.push(b);
                         }
@@ -1303,6 +1413,31 @@ impl TermFilter {
         }
     }
 
+    /// A byte of text: on, or the start of a sequence.
+    fn text(b: u8, out: &mut Vec<u8>) -> Term {
+        match b {
+            ESC => Term::Esc,
+            NUL | ENQ => Term::Text,
+            C1_LEAD => Term::Lead,
+            _ => {
+                out.push(b);
+                Term::Text
+            }
+        }
+    }
+
+    /// Whether the CSI held, ended by `last`, asks the terminal something
+    /// -- which it would answer into the guest -- or moves its window.
+    fn query(&self, last: u8) -> bool {
+        let held = &self.csi[..self.csi_len];
+        match last {
+            b'n' | b'c' | b't' | b'x' => true,
+            b'p' => held.contains(&b'$'),
+            b'q' => held.first() == Some(&b'>'),
+            _ => false,
+        }
+    }
+
     fn flush_csi(&mut self, out: &mut Vec<u8>) {
         out.push(ESC);
         out.push(b'[');
@@ -1332,7 +1467,7 @@ impl TermFilter {
             }
         }
         match (open, self.state) {
-            (Some((at, kept)), Term::Esc | Term::Csi | Term::Str | Term::StrEsc) if at > 0 => {
+            (Some((at, kept)), Term::Esc | Term::Csi | Term::Str | Term::StrEsc | Term::Lead) if at > 0 => {
                 out.truncate(kept);
                 *self = TermFilter::new();
                 at
@@ -1351,11 +1486,23 @@ pub fn printable(bytes: &[u8], out: &mut Vec<u8>) -> bool {
         return false;
     }
     let mut esc = Esc::Text;
+    /* Whether the byte last pushed was a C2 that may begin a C1 control */
+    let mut lead = false;
     for &b in bytes {
+        if lead && (0x80..=0x9F).contains(&b) {
+            /* `C2 b` is a C1 control in UTF-8: out with the C2, and on as
+             * its ESC form, which a client's terminal would take it for */
+            out.pop();
+            lead = false;
+            esc = Esc::c1(b);
+            continue;
+        }
         let (next, text) = esc.step(b);
         esc = next;
+        lead = false;
         if text && matches!(b, b'\n' | b'\t' | 0x20..=0x7E | 0x80..=0xFF) {
             out.push(b);
+            lead = b == 0xC2;
         }
     }
     true

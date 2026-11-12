@@ -41,14 +41,43 @@ MsixTable::MsixTable()
 
 MsixTable::~MsixTable()
 {
+    /* As x86's: the device's MSI-X off and its INTx back -- a driver's error
+       path after an enable used to leave both as the enable had them, its
+       INTx fallback never interrupting -- and each enabled entry's LPI
+       parked, so that nothing the device had on its way reaches a slot that
+       is someone else's by then. The table's own memory is not touched: it
+       may be in a BAR its driver has let go of. */
+    if (dev_ && cap_offset_ != 0 && pci_msix_enabled_)
+    {
+        auto& pci = Pci::get_instance();
+        u16 mc = pci.read_word(dev_->bus, dev_->slot, dev_->func, (u16)(cap_offset_ + 2));
+        mc = (u16)(mc & ~MSIX_CONTROL_ENABLE);
+        pci.write_word(dev_->bus, dev_->slot, dev_->func, (u16)(cap_offset_ + 2), mc);
+
+        u16 cmd = pci.read_word(dev_->bus, dev_->slot, dev_->func, 0x04);
+        cmd = (u16)(cmd & ~PCI_COMMAND_INTX_DISABLE);
+        pci.write_word(dev_->bus, dev_->slot, dev_->func, 0x04, cmd);
+    }
+
     if (entry_vector_)
     {
+        if (dev_)
+        {
+            const u32 device_id = ((u32)dev_->bus << 8) | ((u32)dev_->slot << 3) | dev_->func;
+            for (u16 i = 0; i < count_; i++)
+            {
+                if (entry_vector_[i] != 0)
+                    Its::get_instance().park_event(device_id, i);
+            }
+        }
         mm::free(entry_vector_);
         entry_vector_ = nullptr;
     }
     table_ = nullptr;
     count_ = 0;
     dev_ = nullptr;
+    cap_offset_ = 0;
+    pci_msix_enabled_ = false;
 }
 
 bool MsixTable::map_bar_for_table(Pci::DeviceInfo* dev, u8 bar, ulong offset_in_bar,
@@ -185,6 +214,8 @@ u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
         if (!Its::get_instance().rebind_event(device_id, index, handler))
             return 0;
         handler.on_interrupt_register((u8)0, (u8)0);
+        /* Masked by the disable_vector of the slot that had it */
+        unmask(index);
         return entry_vector_[index];
     }
 
@@ -221,6 +252,16 @@ u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
        the caller a failure -- for entry 255 and every 256th after it. */
     entry_vector_[index] = ENABLED_TOKEN;
     return entry_vector_[index];
+}
+
+void MsixTable::disable_vector(u16 index)
+{
+    if (!table_ || !dev_ || index >= count_ || entry_vector_ == nullptr || entry_vector_[index] == 0)
+        return;
+
+    mask(index);
+    const u32 device_id = ((u32)dev_->bus << 8) | ((u32)dev_->slot << 3) | dev_->func;
+    Its::get_instance().park_event(device_id, index);
 }
 
 void MsixTable::mask(u16 index)

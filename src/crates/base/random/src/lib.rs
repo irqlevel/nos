@@ -22,7 +22,7 @@
 //!   worthless cannot make the pool worse.
 //!
 //! The pool is a `static` with nothing to construct, behind a lock that
-//! allocates nothing: the boot seeds it from Main2, long before rust_init.
+//! allocates nothing: the boot seeds it from main2, long before rust_init.
 //! Inside the image a source registers as a trait object (`register_source`).
 //! The layers -- net, tls, fs -- and the loadable modules ask for bytes
 //! through `kcore::random`, which is the C ABI's `kernel_get_random`
@@ -58,13 +58,15 @@ pub trait Source: Sync + 'static {
 /// How much each source is asked for at a seeding: a ChaCha20 key is 32
 /// bytes, and there is nothing to gain by seeding it with more at once.
 const SEED_BYTES: usize = KEY_SIZE;
+/// The most of a request made from one key of its own (`Pool::fill`).
+const PART_BYTES: usize = 1 << 20;
 
 /// Four virtio-rng devices, the cpu instruction and the jitter collector,
 /// with room to spare
 const MAX_SOURCES: usize = 8;
 
-/// The trace level of what a reseed has to say about a source that gave
-/// nothing, as kernel/trace.h numbers the levels
+/// The log level of what a reseed has to say about a source that gave
+/// nothing, as kernel/klog.h numbers the levels
 const RANDOM_LL: u32 = 3;
 
 struct State {
@@ -172,6 +174,15 @@ impl Pool {
     /// a pool nothing has seeded, which is why `kernel_get_random` -- what a
     /// TLS handshake asks -- refuses until it is seeded.
     fn fill(&self, out: &mut [u8]) {
+        /* A part at a time, each from a key of its own: a block counter of
+         * 32 bits never comes round within one, and no part keeps the
+         * pool's lock for more than a block */
+        for part in out.chunks_mut(PART_BYTES) {
+            self.fill_part(part);
+        }
+    }
+
+    fn fill_part(&self, out: &mut [u8]) {
         if out.is_empty() {
             return;
         }
@@ -183,24 +194,38 @@ impl Pool {
         let fresh = kcore::random::hw_random();
         let stamp = cycle_counter();
 
-        let mut state = self.state.lock();
-        if let Some(fresh) = fresh {
-            for (k, f) in state.key[..8].iter_mut().zip(fresh.to_le_bytes()) {
-                *k ^= f;
+        /* Under the lock, one block: its first half the pool's next key,
+         * its other half this request's own key -- and nothing more, so
+         * that a request of megabytes holds no other CPU's request, nor its
+         * own interrupts, for longer than a block takes. Generated whole
+         * under the lock, it held them for every 32 bytes it asked. */
+        let mut call_key = [0u8; KEY_SIZE];
+        {
+            let mut state = self.state.lock();
+            if let Some(fresh) = fresh {
+                for (k, f) in state.key[..8].iter_mut().zip(fresh.to_le_bytes()) {
+                    *k ^= f;
+                }
             }
-        }
-        for (k, s) in state.key[8..16].iter_mut().zip(stamp.to_le_bytes()) {
-            *k ^= s;
+            for (k, s) in state.key[8..16].iter_mut().zip(stamp.to_le_bytes()) {
+                *k ^= s;
+            }
+            let mut block = state.generate();
+            call_key.copy_from_slice(&block[KEY_SIZE..]);
+            wipe(&mut block);
+            state.bytes_out = state.bytes_out.wrapping_add(out.len() as u64);
         }
 
-        for piece in out.chunks_mut(KEY_SIZE) {
-            let mut block = state.generate();
-            /* The half of the block the key was not taken from is the
-             * output. */
-            piece.copy_from_slice(&block[KEY_SIZE..KEY_SIZE + piece.len()]);
+        /* The request from its own key, a block a counter step, outside the
+         * lock; the key wiped after, so that nothing it made can be made
+         * again from what is left. */
+        let nonce = [0u8; chacha20::NONCE_SIZE];
+        for (i, piece) in out.chunks_mut(chacha20::BLOCK_SIZE).enumerate() {
+            let mut block = chacha20::block(&call_key, i as u32, &nonce);
+            piece.copy_from_slice(&block[..piece.len()]);
             wipe(&mut block);
         }
-        state.bytes_out = state.bytes_out.wrapping_add(out.len() as u64);
+        wipe(&mut call_key);
     }
 
     fn u64(&self) -> u64 {

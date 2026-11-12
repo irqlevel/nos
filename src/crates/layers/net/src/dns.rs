@@ -119,7 +119,8 @@ impl Dns {
          * and by this point in boot it has been fed. */
         {
             let mut state = self.state.lock();
-            state.next_id = (kcore::random::random_u64().unwrap_or(1) as u16) | 1;
+            static SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+            state.next_id = (kcore::random::random_u64_or_clock("DNS query ids", &SAID) as u16) | 1;
             state.nic = Some(nic);
             state.server_ip = server_ip;
         }

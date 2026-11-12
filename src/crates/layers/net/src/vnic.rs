@@ -160,16 +160,70 @@ impl Vnic {
         true
     }
 
-    /// No more calls of the handler: back once none is still running.
-    fn detach(&self) {
-        *self.sink.lock() = None;
+    /// No more calls of the handler attached with `ctx`: back once none is
+    /// still running. A sink attached since -- after a sweep took this one
+    /// off (`detach_range`) -- is not this caller's to take: the detach was
+    /// by the device alone, and took whoever's sink was there.
+    fn detach(&self, ctx: usize) {
+        {
+            let mut sink = self.sink.lock();
+            if !sink.is_some_and(|s| s.ctx == ctx) {
+                return;
+            }
+            *sink = None;
+        }
+        self.wait_out();
+    }
+
+    /// Back once no call of a handler taken away is still running: one
+    /// that read the sink before it was taken counted itself under the
+    /// lock.
+    /// A sink that never returns made this a wait with no word: said every
+    /// ten seconds it lasts, as a join is.
+    fn wait_out(&self) {
+        let from = kcore::time::boot_time_ns();
+        let mut said_at = from;
         while self.in_flight.load(Ordering::Acquire) != 0 {
             kcore::task::yield_to_runnable();
+            let now = kcore::time::boot_time_ns();
+            if now.saturating_sub(said_at) >= WAIT_REPORT_NS {
+                said_at = now;
+                let name = self.nic().map(|nic| nic.device().name());
+                klog!(0, "vnic: {}: a detach has waited {} s for its sink's call to return",
+                      name.and_then(|n| core::str::from_utf8(n).ok()).unwrap_or("?"),
+                      now.saturating_sub(from) / kcore::consts::NS_PER_SEC);
+            }
         }
     }
 
     pub fn nic(&self) -> Option<Nic> {
         self.nic.get().copied()
+    }
+}
+
+/// What a module whose image is `lo..hi` left attached as it went, detached
+/// and said: a sink of its code, called from the transmit path for every
+/// frame the stack sends out of the device, which the next frame would have
+/// called into the pages the unload frees -- and the module's next load been
+/// refused its attach ("attached already") until a reboot. Task context:
+/// back once no call of one is still running. The loader's, through
+/// `rust_net_close_range`.
+pub(crate) fn detach_range(lo: usize, hi: usize, module: &str) {
+    for v in VNICS.iter().filter_map(|slot| slot.get().copied()) {
+        let left = {
+            let mut sink = v.sink.lock();
+            let left = sink.is_some_and(|s| (lo..hi).contains(&(s.handler as usize)));
+            if left {
+                *sink = None;
+            }
+            left
+        };
+        if left {
+            v.wait_out();
+            let name = v.nic().map(|nic| nic.device().name());
+            klog!(0, "module: {} left its sink attached to {}: detached", module,
+                name.and_then(|n| core::str::from_utf8(n).ok()).unwrap_or("a virtual NIC"));
+        }
     }
 }
 
@@ -193,8 +247,19 @@ fn open(name: &str, mac: [u8; 6], ip: u32, mask: u32) -> Option<usize> {
     made
 }
 
+/// How long a wait for a sink's call to return goes before it is said, and
+/// again: a join's ten seconds (`Task::wait`).
+const WAIT_REPORT_NS: u64 = 10 * kcore::consts::NS_PER_SEC;
+
 fn make(name: &str, mac: [u8; 6], ip: u32, mask: u32) -> Option<usize> {
     let slot = VNICS.iter().position(|s| s.get().is_none())?;
+    /* Asked before the device is made `'static` -- for good, as a driver
+     * registered is: refused after, as it was for a name a device had or a
+     * table full, it was lost at every open that tried. Only a
+     * registration racing this one can refuse it now, and that is said. */
+    if !crate::device::DEVICES.would_take(name) {
+        return None;
+    }
     let vnic: &'static Vnic = alloc::boxed::Box::leak(alloc::boxed::Box::new(Vnic {
         sink: IrqSpinLock::new(None),
         in_flight: AtomicUsize::new(0),
@@ -207,7 +272,11 @@ fn make(name: &str, mac: [u8; 6], ip: u32, mask: u32) -> Option<usize> {
         from_module: AtomicUsize::new(0),
         refused: AtomicUsize::new(0),
     }));
-    let nic = crate::register(name, mac, vnic, (), ())?;
+    let Some(nic) = crate::register(name, mac, vnic, (), ()) else {
+        klog!(0, "vnic: {} refused by a registration that came first: its {} bytes kept for good",
+              name, core::mem::size_of::<Vnic>());
+        return None;
+    };
     nic.device().set_ip(ip);
     nic.device().set_mask(mask);
     let _ = vnic.nic.set(nic);
@@ -265,12 +334,12 @@ pub unsafe extern "C" fn kernel_vnic_attach(vnic: usize, handler: SinkFn, ctx: u
     }
 }
 
-/// No more calls of the attached handler; back once none is running. Task
-/// context.
+/// No more calls of the handler attached with `ctx`; back once none is
+/// running. Task context.
 #[no_mangle]
-pub extern "C" fn kernel_vnic_detach(vnic: usize) {
+pub extern "C" fn kernel_vnic_detach(vnic: usize, ctx: usize) {
     if let Some(v) = by_handle(vnic) {
-        v.detach();
+        v.detach(ctx);
     }
 }
 

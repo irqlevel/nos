@@ -1,7 +1,11 @@
 //! A bounded multi-producer multi-consumer queue of words: one
 //! compare-and-swap an operation, no lock anywhere and nothing that waits --
 //! a push to a full ring and a pop from an empty one fail at once -- so safe
-//! from any context, a hard IRQ handler's included. What the net frame pool
+//! from any context, a hard IRQ handler's included. "Full" and "empty" are
+//! not exact while another operation is half-way through (a consumer that
+//! has claimed a cell and not yet freed it makes a producer a lap behind
+//! find the ring full): a caller that counts the ring never full must still
+//! take a refused push for what it is, not for impossible. What the net frame pool
 //! recycles its frames through, and what the zero-copy block server passes
 //! requests with, between the receive path, its worker and the disk's
 //! interrupt handler.
@@ -37,10 +41,13 @@ pub struct LocklessRing {
 }
 
 impl LocklessRing {
-    /// A ring of `capacity` words -- a power of two, at most
-    /// `MAX_CAPACITY` -- or None, as when there is no memory for it.
+    /// A ring of `capacity` words -- a power of two, two at least and at
+    /// most `MAX_CAPACITY` -- or None, as when there is no memory for it.
+    /// One cell is refused: "filled at `pos`" (`seq == pos + 1`) and "free
+    /// for the next lap" (`seq == pos + capacity`) are then one number, a
+    /// second push overwrote the first and a pop spun for ever.
     pub fn new(capacity: usize) -> Option<Self> {
-        if capacity == 0 || !capacity.is_power_of_two() || capacity > MAX_CAPACITY {
+        if capacity < 2 || !capacity.is_power_of_two() || capacity > MAX_CAPACITY {
             return None;
         }
 

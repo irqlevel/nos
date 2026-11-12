@@ -1,79 +1,94 @@
-//! The heap: a bump allocator over a few MiB of the BSS. The loader runs
-//! once, briefly, on one CPU; what it allocates -- a configuration file, its
-//! parse, a few paths -- is small, and is never given back but for the last
-//! allocation, which is enough for a vector that grows. Out of it, an
-//! allocation fails, and `alloc` makes that a panic, which says so and
-//! turns the guest off.
+//! The heap: `arena.rs`'s first fit over a few MiB of the BSS. The loader
+//! runs once, briefly, on one CPU with interrupts off; what it allocates --
+//! a configuration file and its parse, a filesystem's blocks a few at a
+//! time, the virtio rings -- comes back to it as it is dropped, in whatever
+//! order. Out of it, an allocation fails, and `alloc` makes that a panic,
+//! which says so -- with what the heap held -- and turns the guest off.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-const HEAP_BYTES: usize = 4 << 20;
+use crate::arena::{Arena, HEAP_BYTES};
 
 #[repr(C, align(4096))]
 struct Space(UnsafeCell<[u8; HEAP_BYTES]>);
 
-// SAFETY: the loader is one thread on one CPU with interrupts off; the bump
-// pointer below hands each byte out once.
+// SAFETY: the loader is one thread on one CPU with interrupts off; the
+// arena hands each byte out to one block at a time.
 unsafe impl Sync for Space {}
 
 static SPACE: Space = Space(UnsafeCell::new([0; HEAP_BYTES]));
 
-/// The offset of the first free byte, and of the last allocation's start.
-struct Bump {
-    next: AtomicUsize,
-    last: AtomicUsize,
+struct Heap(UnsafeCell<Arena>);
+
+// SAFETY: as `Space`: one thread, and nothing the arena does calls back
+// into the heap, so its state is never reached twice at once.
+unsafe impl Sync for Heap {}
+
+#[global_allocator]
+static HEAP: Heap = Heap(UnsafeCell::new(Arena::EMPTY));
+
+impl Heap {
+    /// The arena, given its stretch the first time.
+    ///
+    /// # Safety
+    /// No other reference to the arena is live: the loader's one thread is
+    /// in the allocator, which does not call itself.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn arena(&self) -> &mut Arena {
+        // SAFETY: the caller's.
+        let arena = unsafe { &mut *self.0.get() };
+        if !arena.ready() {
+            // SAFETY: SPACE is the heap's alone, 4096-aligned, and this runs
+            // once, before any block is handed out.
+            unsafe { arena.init(SPACE.0.get().cast::<u8>(), HEAP_BYTES) };
+        }
+        arena
+    }
 }
 
-// SAFETY: every block is `size` bytes of `SPACE` at the alignment asked for,
-// handed out once: `next` only grows past it, but for a dealloc or realloc of
-// the last block, which no one else holds.
-unsafe impl GlobalAlloc for Bump {
+/* An allocation the arena had no room for: the bytes asked, and what the
+ * heap held then -- kept apart from the arena, so that the panic the
+ * failure becomes can say it without reaching into the allocator. */
+static FAILED_ASK: AtomicUsize = AtomicUsize::new(0);
+static FAILED_USED: AtomicUsize = AtomicUsize::new(0);
+
+fn note(p: *mut u8, asked: usize, arena: &Arena) -> *mut u8 {
+    if p.is_null() {
+        FAILED_ASK.store(asked, Ordering::Relaxed);
+        FAILED_USED.store(arena.usage().0, Ordering::Relaxed);
+    }
+    p
+}
+
+// SAFETY: every block is the arena's, handed out once until it is given
+// back; the arena keeps its headers outside the bytes it hands out.
+unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let base = SPACE.0.get() as usize;
-        let next = self.next.load(Ordering::Relaxed);
-        let Some(start) = (base + next).checked_add(layout.align() - 1).map(|v| v & !(layout.align() - 1)) else {
-            return core::ptr::null_mut();
-        };
-        let offset = start - base;
-        let Some(end) = offset.checked_add(layout.size()) else {
-            return core::ptr::null_mut();
-        };
-        if end > HEAP_BYTES {
-            return core::ptr::null_mut();
-        }
-        self.last.store(offset, Ordering::Relaxed);
-        self.next.store(end, Ordering::Relaxed);
-        start as *mut u8
+        // SAFETY: one thread, and the arena calls nothing back.
+        let arena = unsafe { self.arena() };
+        note(arena.alloc(layout), layout.size(), arena)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-        let offset = ptr as usize - SPACE.0.get() as usize;
-        if offset == self.last.load(Ordering::Relaxed) {
-            self.next.store(offset, Ordering::Relaxed);
-        }
+        // SAFETY: `ptr` is a block this heap handed out (GlobalAlloc's
+        // contract), and as `alloc`.
+        unsafe { self.arena().dealloc(ptr) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let offset = ptr as usize - SPACE.0.get() as usize;
-        if offset == self.last.load(Ordering::Relaxed) {
-            /* The last block grows, or shrinks, in place. */
-            if let Some(end) = offset.checked_add(new_size).filter(|&e| e <= HEAP_BYTES) {
-                self.next.store(end, Ordering::Relaxed);
-                return ptr;
-            }
-            return core::ptr::null_mut();
-        }
-        // SAFETY: as `GlobalAlloc::realloc`'s own default: a new block,
-        // the old one's bytes copied into it.
-        let new = unsafe { self.alloc(Layout::from_size_align_unchecked(new_size, layout.align())) };
-        if !new.is_null() {
-            unsafe { core::ptr::copy_nonoverlapping(ptr, new, layout.size().min(new_size)) };
-        }
-        new
+        // SAFETY: as `dealloc`, `layout` the block's own.
+        let arena = unsafe { self.arena() };
+        // SAFETY: as above.
+        let p = unsafe { arena.realloc(ptr, layout, new_size) };
+        note(p, new_size, arena)
     }
 }
 
-#[global_allocator]
-static HEAP: Bump = Bump { next: AtomicUsize::new(0), last: AtomicUsize::new(usize::MAX) };
+/// The last allocation the heap had no room for -- the bytes asked, and
+/// those in use then -- and the heap's size: what a panic says of it.
+pub fn failure() -> Option<(usize, usize, usize)> {
+    let asked = FAILED_ASK.load(Ordering::Relaxed);
+    (asked != 0).then(|| (asked, FAILED_USED.load(Ordering::Relaxed), HEAP_BYTES))
+}

@@ -8,28 +8,46 @@ use ffi::fs;
 use crate::error::{Error, Result};
 use crate::lent::Buffers;
 
-/// The whole of a regular file: NotFound when there is none, InvalidValue
-/// when it is longer than `max`. A `write` cut short between its two steps
-/// is read from where it left the content.
-pub fn read(path: &str, max: usize) -> Result<Vec<u8>> {
-    let size = unsafe { fs::kernel_file_size(path.as_ptr(), path.len()) };
-    if size < 0 {
-        return Err(Error::NotFound);
-    }
-    let size = size as usize;
-    if size > max {
-        return Err(Error::InvalidValue);
-    }
+/// How many times `read` sizes a file again that grew between its look and
+/// its read -- replaced by a longer one -- before it says Busy.
+const READ_TRIES: usize = 4;
 
-    let mut buf = Vec::new();
-    buf.try_reserve_exact(size).map_err(|_| Error::NoMemory)?;
-    buf.resize(size, 0);
-    let got = unsafe { fs::kernel_file_read(path.as_ptr(), path.len(), buf.as_mut_ptr(), size) };
-    if got < 0 {
-        return Err(Error::IoError);
+/// The whole of a regular file: NotFound when there is none, InvalidValue
+/// when it is longer than `max`, Busy when it grew under every one of a few
+/// tries. A `write` cut short between its two steps is read from where it
+/// left the content.
+///
+/// Sized, then read in one call that holds the file open throughout --
+/// asked for one byte more than the size, which comes only when the file
+/// grew between the two: sized again then, rather than taken cut short for
+/// Ok, as a file replaced by a longer one once was. A read of the size or
+/// less is a whole file, the one the call opened.
+pub fn read(path: &str, max: usize) -> Result<Vec<u8>> {
+    for _ in 0..READ_TRIES {
+        let size = unsafe { fs::kernel_file_size(path.as_ptr(), path.len()) };
+        if size < 0 {
+            return Err(Error::NotFound);
+        }
+        let size = size as usize;
+        if size > max {
+            return Err(Error::InvalidValue);
+        }
+
+        let want = size + 1;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(want).map_err(|_| Error::NoMemory)?;
+        buf.resize(want, 0);
+        let got = unsafe { fs::kernel_file_read(path.as_ptr(), path.len(), buf.as_mut_ptr(), want) };
+        if got < 0 {
+            return Err(Error::IoError);
+        }
+        let got = got as usize;
+        if got <= size {
+            buf.truncate(got);
+            return Ok(buf);
+        }
     }
-    buf.truncate(got as usize);
-    Ok(buf)
+    Err(Error::Busy)
 }
 
 /// The file's size in bytes: NotFound when there is no such file.
@@ -69,7 +87,7 @@ impl File {
     /// writing too. NotFound when there is none, or it cannot be opened so
     /// (a directory, a read-only mount).
     pub fn open(path: &str, write: bool) -> Result<File> {
-        let handle = unsafe { fs::kernel_file_open(path.as_ptr(), path.len(), i32::from(write)) };
+        let handle = unsafe { fs::kernel_file_open(crate::owner::here(), path.as_ptr(), path.len(), i32::from(write)) };
         if handle == 0 {
             return Err(Error::NotFound);
         }
@@ -149,7 +167,7 @@ impl Image {
     /// directory, a read-only mount, someone else writing it or holding it
     /// for writing, no memory.
     pub fn open(path: &str, write: bool) -> Result<Image> {
-        let handle = unsafe { fs::kernel_image_open(path.as_ptr(), path.len(), i32::from(write)) };
+        let handle = unsafe { fs::kernel_image_open(crate::owner::here(), path.as_ptr(), path.len(), i32::from(write)) };
         if handle == 0 {
             return Err(Error::NotFound);
         }
@@ -229,7 +247,9 @@ impl Image {
 
 impl Drop for Image {
     fn drop(&mut self) {
-        fs::kernel_image_close(self.handle);
+        /* This image's alone; its queue, which borrows it, is gone, and with
+         * it every `Lent` of the queue's buffers */
+        unsafe { fs::kernel_image_close(self.handle) };
     }
 }
 
@@ -311,11 +331,13 @@ impl ImageQueue {
     /// buffer lent or started already. Its doorbell waits for `kick`.
     pub fn start(&self, k: usize, write: bool, offset: u64, len: usize) -> Result<Started> {
         self.buffers.take(k)?;
-        match fs::kernel_image_start(self.image.handle, k, i32::from(write), offset, len) {
-            1 => Ok(Started::InFlight),
+        /* `take` made buffer `k` this call's: no `Lent` of it is out, and
+         * the queue is this one's alone */
+        match unsafe { fs::kernel_image_start(self.image.handle, k, i32::from(write), offset, len) } {
+            ffi::block::QUEUE_IN_FLIGHT => Ok(Started::InFlight),
             rc => {
                 self.buffers.untake(k);
-                if rc == 0 { Ok(Started::Done) } else { Err(Error::IoError) }
+                if rc == ffi::block::QUEUE_DONE { Ok(Started::Done) } else { Err(Error::IoError) }
             }
         }
     }
@@ -391,13 +413,14 @@ pub fn write(path: &str, data: &[u8]) -> Result<()> {
 }
 
 /// A new file with this content; Busy, and nothing written, when there is
-/// one at the path already -- also when `read` could not see it. For a file
-/// that must never be written over by mistake.
+/// one at the path already -- also when `read` could not see it; IoError,
+/// and no file left, for anything else that refused it. For a file that
+/// must never be written over by mistake.
 pub fn create(path: &str, data: &[u8]) -> Result<()> {
     let rc = unsafe { fs::kernel_file_create(path.as_ptr(), path.len(), data.as_ptr(), data.len()) };
     match rc {
-        0 => Ok(()),
-        1 => Err(Error::Busy),
+        fs::FILE_CREATED => Ok(()),
+        fs::FILE_THERE => Err(Error::Busy),
         _ => Err(Error::IoError),
     }
 }
@@ -417,9 +440,8 @@ pub fn create_dir(path: &str) -> Result<()> {
 const NAME_MAX: usize = 255;
 /// The most entries `list` reads of one directory.
 const LIST_MAX: usize = 4096;
-/* What `kernel_dir_entry` answers (layers/fs/src/files.rs). */
-const ENTRY_DIR: u32 = 2;
-const ENTRY_END: isize = -1;
+/* What `kernel_dir_entry` answers (layers/fs/src/files.rs) */
+use ffi::fs::{FILE_ENTRY_DIR as ENTRY_DIR, FILE_ENTRY_END as ENTRY_END};
 
 /// An entry of a directory, as `list` reads it: its name as the filesystem
 /// has it -- bytes, not necessarily UTF-8 -- whether it is a directory, and a
@@ -430,10 +452,13 @@ pub struct Entry {
     pub size: u64,
 }
 
-/// What the directory at `path` has, an entry each, at most `LIST_MAX` of
-/// them: NotFound when the path names no directory. Read an entry at a time
+/// What the directory at `path` has, an entry each: NotFound when the path
+/// names no directory, InvalidValue when it has more than `LIST_MAX` --
+/// which once came back as the first `LIST_MAX`, Ok. Read an entry at a time
 /// with nothing held between them, so a directory changing meanwhile may
-/// show an entry twice or not at all.
+/// show an entry twice or not at all; and each entry is a walk of the
+/// directory to its place, so a list costs its length squared: what
+/// `LIST_MAX` bounds.
 pub fn list(path: &str) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
     let mut name = [0u8; NAME_MAX];
@@ -452,6 +477,18 @@ pub fn list(path: &str) -> Result<Vec<Entry>> {
         entry.extend_from_slice(&name[..len]);
         entries.try_reserve(1).map_err(|_| Error::NoMemory)?;
         entries.push(Entry { name: entry, dir: kind == ENTRY_DIR, size });
+    }
+    if entries.len() == LIST_MAX {
+        /* One more look says whether that was all */
+        let (mut kind, mut size) = (0u32, 0u64);
+        /* `name` is writable for its length, `kind` and `size` are locals. */
+        let more = unsafe {
+            fs::kernel_dir_entry(path.as_ptr(), path.len(), LIST_MAX, name.as_mut_ptr(), name.len(), &mut kind,
+                                 &mut size)
+        };
+        if more != ENTRY_END {
+            return Err(Error::InvalidValue);
+        }
     }
     Ok(entries)
 }

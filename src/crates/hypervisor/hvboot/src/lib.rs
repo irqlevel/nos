@@ -14,9 +14,10 @@
 //!   on them, partition by partition, an ext2/3/4 filesystem with GRUB's
 //!   configuration (`pci`, `virtio`, `gpt`, `ext`);
 //! - picks the entry GRUB would boot -- its default, or grubenv's next or
-//!   saved one -- and reads its kernel and initrd (`grub`);
+//!   saved one -- and reads its kernel and initrd (`grub`, `plan`);
 //! - boots the kernel by Linux's 64-bit boot protocol, its command line the
-//!   entry's and then hv's (`bzimage`, `boot`).
+//!   entry's and then hv's (`boot`, over the crate hv loads one by,
+//!   `common/boot/bzimage`).
 //!
 //! Anything it cannot do it says on the console and turns the guest off: a
 //! VM whose loader failed stops, the reason in its console, rather than
@@ -24,17 +25,21 @@
 //! trusted by the host, and what it reads -- partition tables, filesystems,
 //! GRUB's scripts -- is the guest's own.
 //!
-//! The parsers (`gpt`, `ext`, `grub`, `bzimage`) are plain Rust over byte
-//! slices and `alloc`, with no `unsafe`; the rest -- ports, physical memory,
-//! the jump -- is the platform, and `unsafe` is there alone.
+//! What it boots is `plan`'s to work out, over the `disk::Device` and `ram`
+//! it is given and nothing of the platform's; the host's harness
+//! (fuzz/hvboot) runs that over disk images, under `arena`'s heap no bigger
+//! than this one's. It and the parsers it reads through (`gpt`, `ext`,
+//! `grub`, and `bzimage`'s) are plain Rust over byte slices and `alloc`, with no
+//! `unsafe`; the rest -- ports, physical memory, the heap, the jump -- is
+//! the platform, and `unsafe` is there alone.
 #![no_std]
 
 extern crate alloc;
 
 #[macro_use]
 mod console;
+mod arena;
 mod boot;
-mod bzimage;
 mod disk;
 mod ext;
 mod gpt;
@@ -42,8 +47,11 @@ mod grub;
 mod heap;
 mod idt;
 mod io;
+mod options;
 mod pci;
 mod phys;
+mod plan;
+mod ram;
 mod start;
 mod virtio;
 
@@ -56,6 +64,12 @@ use core::arch::global_asm;
  * long mode and paging, loads a GDT whose 64-bit code and data are at 0x10
  * and 0x18 -- the selectors Linux's 64-bit boot protocol asks for, which
  * the kernel is entered on -- and calls `main` with the start info.
+ *
+ * The stack's 128 KiB lie right above the page directory (`boot_pd`, then
+ * `boot_stack`, below): a stack that ran over would rewrite the identity
+ * map, not fault, the map being writable 2 MiB pages with no guard. Nothing
+ * in the loader recurses without a bound -- grub.rs's parse stops 32 blocks
+ * deep, extfmt's walks are loops -- and that is what keeps it inside.
  *
  * The note after it names the entry, which is how hv finds it: owner "Xen",
  * type XEN_ELFNOTE_PHYS32_ENTRY (18), a 4-byte physical address. */
@@ -204,5 +218,8 @@ extern "C" fn hvboot_main(start_info: u32) -> ! {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     say!("panic: {}", info);
+    if let Some((asked, used, size)) = heap::failure() {
+        say!("the heap had no room for {} bytes: {} KiB of its {} KiB in use", asked, used >> 10, size >> 10);
+    }
     io::power_off()
 }

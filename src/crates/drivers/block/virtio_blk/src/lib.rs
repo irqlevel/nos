@@ -27,9 +27,11 @@ use kcore::dma::{self, DmaBuffer};
 use kcore::interrupt::LegacyInterrupt;
 use kcore::msix::MsixInterrupt;
 use kcore::once::Once;
+#[cfg(target_arch = "x86_64")]
 use kcore::pci;
 use kcore::sync::{SpinLock, WaitGroup};
 use kcore::klog;
+#[cfg(not(target_arch = "x86_64"))]
 use virtio::mmio::{MmioTransport, Slot};
 use virtio::{Buf, Queue, Transport};
 
@@ -594,10 +596,15 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
     }
 }
 
+/// Where the device's line comes from: x86-64's devices are on the PCI
+/// bus, arm64's in the device tree's virtio-mmio windows, each arch's
+/// variant its own.
 enum IrqSource {
     /// A PCI device, whose line is used where MSI-X cannot be
+    #[cfg(target_arch = "x86_64")]
     Pci(pci::PciDevice),
     /// A bare interrupt number: the device tree's, for a virtio-mmio window
+    #[cfg(not(target_arch = "x86_64"))]
     Line(u8),
 }
 
@@ -618,7 +625,9 @@ fn arm_interrupt(blk: &'static Blk, source: IrqSource) -> Option<u16> {
     }
 
     let registered = match source {
+        #[cfg(target_arch = "x86_64")]
         IrqSource::Pci(dev) => LegacyInterrupt::register_level_for(&dev, blk, interrupt),
+        #[cfg(not(target_arch = "x86_64"))]
         IrqSource::Line(line) => LegacyInterrupt::register_irq_for(line, blk, interrupt),
     };
 
@@ -660,14 +669,11 @@ pub extern "C" fn rust_virtio_blk_init() {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-#[no_mangle]
-pub extern "C" fn rust_virtio_blk_init() {}
-
 /// The same for the virtio-mmio windows the device tree described.
 ///
 /// # Safety
 /// `slots` points at `count` slots, each naming a mapped register window.
+#[cfg(not(target_arch = "x86_64"))]
 #[no_mangle]
 pub unsafe extern "C" fn rust_virtio_blk_init_mmio(slots: *const Slot, count: usize) {
     if slots.is_null() {

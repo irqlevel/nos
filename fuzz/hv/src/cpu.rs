@@ -25,6 +25,7 @@ pub enum Error {
     BadAddress,
     NoUnrestrictedGuest,
     NoHugePages,
+    CommandLineTooLong,
 }
 
 impl core::fmt::Display for Error {
@@ -117,13 +118,57 @@ pub fn timer_at(deadline_ns: u64) {
     vm::arm_timer(deadline_ns);
 }
 
-/// `kcore::cpu::kick`: the IPI that takes a vCPU out of its guest. There is
-/// no guest to take out here.
-pub fn kick(_cpu: u32) {}
+/// `kcore::cpu::kick`: the IPI that takes a vCPU out of its guest -- one in
+/// it, or past `Kick::entering` with interrupts off, leaves it at its next
+/// step (`KICKED`); one outside takes it in the host and ends it.
+pub fn kick(cpu: u32) {
+    let Some(i) = usize::try_from(cpu).ok().filter(|&i| i < NOTIFY_CPUS) else { return };
+    if IN_GUEST[i].load(std::sync::atomic::Ordering::SeqCst) {
+        KICKED[i].store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// `kcore::cpu::notify`: the posted-interrupt notification, which the CPU
-/// model takes as the vCPU's turn comes again (`vm::Cpu::enter`).
-pub fn notify(_cpu: u32) {}
+/// model takes in the guest (`vm::Cpu::enter`) -- if it reached a CPU in
+/// its guest or on its way in with interrupts off (`IN_GUEST`), as a real
+/// one is taken there; else it is a host interrupt the host ends, and lost,
+/// as a real one is. Kick::notify once sent it from `prepare` on, with the
+/// host's interrupts still on: the guest then ran with an interrupt posted
+/// and nothing to take it, which this model let pass.
+pub fn notify(cpu: u32) {
+    let Some(i) = usize::try_from(cpu).ok().filter(|&i| i < NOTIFY_CPUS) else { return };
+    if IN_GUEST[i].load(std::sync::atomic::Ordering::SeqCst) {
+        NOTIFIED[i].store(true, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        NOTIFICATIONS_LOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+const NOTIFY_CPUS: usize = 64;
+/// Per CPU of the model: in its guest, or past `Kick::entering` on its way
+/// in -- interrupts off, where a notification is the guest's.
+static IN_GUEST: [std::sync::atomic::AtomicBool; NOTIFY_CPUS] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; NOTIFY_CPUS];
+/// A notification taken in the guest and not yet processed.
+static NOTIFIED: [std::sync::atomic::AtomicBool; NOTIFY_CPUS] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; NOTIFY_CPUS];
+/// A kick taken in the guest: an exit at its next step.
+static KICKED: [std::sync::atomic::AtomicBool; NOTIFY_CPUS] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; NOTIFY_CPUS];
+/// Notifications that found their CPU outside its guest: the host's.
+pub static NOTIFICATIONS_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The model's CPU `me` in its guest from here (`true`) -- or out of it, a
+/// notification it had not processed then the host's to end.
+fn in_guest(me: usize, now: bool) {
+    if me < NOTIFY_CPUS {
+        IN_GUEST[me].store(now, std::sync::atomic::Ordering::SeqCst);
+        if !now {
+            NOTIFIED[me].store(false, std::sync::atomic::Ordering::SeqCst);
+            KICKED[me].store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
 
 pub mod x86 {
     pub use crate::cpu::fast;
@@ -486,43 +531,10 @@ pub mod x86 {
     }
 }
 
-/// hv's own `svm`: the exits as the backends decode them, as they are there.
+/// hv's own `svm`: the exits as the backends decode them -- hv's `exit.rs`
+/// itself -- and the start states, as they are there.
 pub mod svm {
-    #[derive(Clone, Copy, Debug)]
-    pub struct Io {
-        pub port: u16,
-        pub size: u8,
-        pub input: bool,
-        pub string: bool,
-        pub rep: bool,
-        pub next_rip: u64,
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    pub enum Exit {
-        Host,
-        Kicked,
-        Io(Io),
-        Hlt,
-        Cpuid,
-        Msr { write: bool },
-        Hypercall,
-        IrqWindow,
-        NmiWindow,
-        NestedFault { gpa: u64, error: u64 },
-        Exception { vector: u8, error: Option<u32> },
-        MachineCheck,
-        Shutdown,
-        Invalid,
-        Cr8 { write: bool, gpr: u8 },
-        Cr0Write { value: u64 },
-        Cr4 { write: bool, gpr: Option<u8> },
-        Dr { write: bool, dr: u8, gpr: Option<u8> },
-        Eoi { vector: u8 },
-        Pause,
-        Undefined,
-        Other(u64),
-    }
+    pub use crate::exit::{Exit, Instr, Io};
 
     #[derive(Clone, Copy, Debug, Default)]
     pub struct LongMode {
@@ -619,6 +631,8 @@ pub mod vm {
         /// Queued for the next entry.
         pub event: Option<Event>,
         pub irq_window: bool,
+        /// The class a lowering of the task priority below is to exit at.
+        pub tpr_window: u8,
         pub nmi_window: bool,
         /// In the shadow of an STI or a MOV SS.
         pub shadow: bool,
@@ -695,6 +709,7 @@ pub mod vm {
                 regs: GuestRegs::default(),
                 event: None,
                 irq_window: false,
+                tpr_window: 0,
                 nmi_window: false,
                 shadow: false,
                 nmi_masked: false,
@@ -1035,6 +1050,10 @@ pub mod vm {
         pub fn posted_capable(&self) -> bool {
             self.vapic && self.pi_capable
         }
+        /// Whether an interrupt is posted for it and not taken (ON set).
+        pub fn posted_waiting(&self) -> bool {
+            self.posted.as_ref().is_some_and(|p| p.outstanding())
+        }
         pub fn set_posted(&mut self, posted: Arc<crate::x86::vmx::PostedInterrupts>) -> bool {
             if !self.posted_capable() {
                 return false;
@@ -1045,12 +1064,17 @@ pub mod vm {
             true
         }
         /// The model's, as the vCPU's turn comes again in its guest: a
-        /// notification outstanding is taken by the CPU -- what was posted
-        /// into VIRR -- with virtual-interrupt delivery on, and is an exit
-        /// otherwise, an external interrupt's.
-        pub fn posted_arrival(&mut self) -> Option<Exit> {
+        /// notification it was sent there is taken by the CPU -- what was
+        /// posted into VIRR -- with virtual-interrupt delivery on, and is an
+        /// exit otherwise, an external interrupt's. What was posted with no
+        /// notification sent there is not looked at: a CPU processes the
+        /// descriptor at a notification and at nothing else.
+        pub fn posted_arrival(&mut self, me: usize) -> Option<Exit> {
             let p = self.posted.as_ref()?;
             if !p.outstanding() {
+                return None;
+            }
+            if me >= super::NOTIFY_CPUS || !super::NOTIFIED[me].swap(false, std::sync::atomic::Ordering::SeqCst) {
                 return None;
             }
             if !self.apicv {
@@ -1208,6 +1232,24 @@ pub mod vm {
         }
         pub fn clear_irq_window(&mut self) {
             self.irq_window = false;
+            self.tpr_window = 0;
+        }
+        /// As the backends': an exit when the guest's task priority drops
+        /// below `class` -- the TPR threshold under VT-x's TPR shadow,
+        /// AMD-V's V_IRQ at that priority.
+        pub fn request_tpr_window(&mut self, class: u8) {
+            self.tpr_window = class & 0xF;
+        }
+        /// Whether a write of CR8 the CPU performed itself just dropped the
+        /// task priority below the class a window was asked for: the exit
+        /// the backends have the CPU make there.
+        pub fn tpr_window_hit(&mut self) -> bool {
+            let hit = self.tpr_window != 0 && !self.apicv && self.vtpr >> 4 < self.tpr_window;
+            if hit {
+                self.tpr_window = 0;
+                apicv_did("a task priority lowered below an interrupt it held");
+            }
+            hit
         }
         pub fn dump(&self, out: &mut dyn core::fmt::Write) -> core::fmt::Result {
             write!(out, "rip {:#x} rflags {:#x} event {:?}", self.save.rip, self.save.rflags, self.event)
@@ -1561,6 +1603,15 @@ pub mod vm {
                 LAST_TICK.with(|t| t.set(now));
                 ARMED.with(|a| a.set((now / HOST_TICK_NS + 1) * HOST_TICK_NS));
             }
+            /* Now and then another CPU runs first: the time between the
+             * round's last look and the entry, the host's interrupts still
+             * on -- where what is posted for this CPU finds it on its way in
+             * and not yet in. */
+            if !crate::cpu::fast_turn(self.backend.save().rip, crate::time::peek()) {
+                if let Some(to) = next_cpu(me) {
+                    switch_to(me, to);
+                }
+            }
             if let Some(k) = kick {
                 if !k.entering(me as u32) {
                     k.left();
@@ -1571,14 +1622,29 @@ pub mod vm {
                            "CPU {} enters its guest with the host's timer armed for {} ns, past the edge {:?} ns its \
                             loop asked for", me, armed, k.edge());
             }
+            crate::cpu::in_guest(me, true);
             self.backend.entered();
             let mut entered_at = crate::time::cycle_counter();
             let exit = loop {
                 crate::time::progressed();
                 /* A notification of what other CPUs posted while it ran. */
-                if let Some(exit) = self.backend.posted_arrival() {
+                if let Some(exit) = self.backend.posted_arrival(me) {
                     break exit;
                 }
+                /* A kick that reached it here: the exit it is for. */
+                if crate::cpu::KICKED.get(me).is_some_and(|k| k.swap(false, std::sync::atomic::Ordering::SeqCst)) {
+                    break Exit::Host;
+                }
+                /* What another CPU posted for it is delivered by a
+                 * notification taken here, or by a kick that ends the guest's
+                 * turn and has its loop take it: posted with neither on its
+                 * way, it waits for an exit of some other kind -- the host's
+                 * tick. A notification sent while the vCPU was on its way in
+                 * with the host's interrupts on was ended by the host. */
+                invariant!(!self.backend.posted_waiting()
+                           || crate::cpu::NOTIFIED.get(me).is_some_and(|n| n.load(std::sync::atomic::Ordering::SeqCst)),
+                           "CPU {} runs its guest with an interrupt posted for it, and neither a notification nor a \
+                            kick on its way to deliver it", me);
                 /* The host CPU's timer, armed for the guest's timer edge, at
                  * it: a host interrupt, and the edge goes in after it. */
                 if ARMED.with(|a| a.get()) <= crate::time::peek() {
@@ -1616,6 +1682,7 @@ pub mod vm {
                                    kernel's locks held", me, crate::sync::held());
                         if let Some(k) = kick {
                             if !k.entering(me as u32) {
+                                crate::cpu::in_guest(me, false);
                                 return Ok((Exit::Kicked, me as u32));
                             }
                             let armed = ARMED.with(|a| a.get());
@@ -1658,6 +1725,7 @@ pub mod vm {
                                    kernel's locks held", me, crate::sync::held());
                         if let Some(k) = kick {
                             if !k.entering(me as u32) {
+                                crate::cpu::in_guest(me, false);
                                 return Ok((Exit::Kicked, me as u32));
                             }
                         }
@@ -1670,6 +1738,7 @@ pub mod vm {
             };
             let timed = crate::trace::on::<crate::trace::HvExit>();
             self.last_run.next(timed, entered_at, crate::time::cycle_counter());
+            crate::cpu::in_guest(me, false);
             if let Some(k) = kick {
                 k.left();
             }

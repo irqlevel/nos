@@ -439,6 +439,52 @@ u32 Its::map_event(u32 device_id, u32 event_id, InterruptHandler& handler,
     return event_id; /* MSI data = event_id */
 }
 
+namespace
+{
+
+/* What a parked LPI is given (Its::park_event) */
+class ParkedLpi final : public InterruptHandler
+{
+public:
+    void on_interrupt_register(u8 irq, u8 vector) override
+    {
+        (void)irq;
+        (void)vector;
+    }
+
+    InterruptHandlerFn get_handler_fn() override
+    {
+        return nullptr;
+    }
+
+    void on_interrupt(Context* ctx) override
+    {
+        (void)ctx;
+    }
+};
+
+ParkedLpi& parked_lpi()
+{
+    static ParkedLpi parked;
+    return parked;
+}
+
+}
+
+void Its::park_event(u32 device_id, u32 event_id)
+{
+    for (u32 slot = 0; slot < MAX_LPIS; slot++)
+    {
+        LpiHandler& h = lpi_handlers_[slot];
+        if (__atomic_load_n(&h.handler, __ATOMIC_ACQUIRE) == nullptr ||
+            h.device_id != device_id || h.event_id != event_id)
+            continue;
+
+        __atomic_store_n(&h.handler, static_cast<InterruptHandler*>(&parked_lpi()), __ATOMIC_RELEASE);
+        return;
+    }
+}
+
 bool Its::rebind_event(u32 device_id, u32 event_id, InterruptHandler& handler)
 {
     for (u32 slot = 0; slot < MAX_LPIS; slot++)

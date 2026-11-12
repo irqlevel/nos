@@ -23,6 +23,35 @@ public:
     virtual void print_string(const char *s) = 0;
     virtual void backspace() = 0;
 
+    /* len bytes as they are, for output that is not text -- a file `cat`
+       prints. A printer that carries bytes on (an SSH session's) takes them
+       whole; one that shows text, which a NUL is not, is given the runs
+       between the NULs, a chunk at a time: a NUL used to end its chunk of
+       print_string, and what followed it to the chunk's end was lost
+       without a word. */
+    virtual void write(const char* buf, size_t len)
+    {
+        char chunk[WRITE_CHUNK];
+        size_t n = 0;
+        for (size_t i = 0; i < len; i++)
+        {
+            if (buf[i] == '\0')
+                continue;
+            chunk[n++] = buf[i];
+            if (n == sizeof(chunk) - 1)
+            {
+                chunk[n] = '\0';
+                print_string(chunk);
+                n = 0;
+            }
+        }
+        if (n != 0)
+        {
+            chunk[n] = '\0';
+            print_string(chunk);
+        }
+    }
+
     /* What the person at the other end types, for a command that reads it
        while it runs: up to len bytes, waiting up to timeout_ns for some.
        0 when the time passed with nothing, -1 when no one can type here --
@@ -44,6 +73,10 @@ public:
         (void)info;
         return false;
     }
+
+private:
+    /* write's piece of text for print_string, its NUL included */
+    static const size_t WRITE_CHUNK = 128;
 };
 
 /* A Printer into a buffer its owner provides: what a command printed, kept

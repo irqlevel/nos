@@ -76,6 +76,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bzimage"
+version = "0.1.0"
+
+[[package]]
 name = "cc"
 version = "1.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -442,6 +446,7 @@ dependencies = [
 name = "hv"
 version = "0.1.0"
 dependencies = [
+ "bzimage",
  "hvarch",
  "kcore",
  "netwire",
@@ -458,6 +463,7 @@ dependencies = [
 name = "hvboot"
 version = "0.1.0"
 dependencies = [
+ "bzimage",
  "crc",
  "extfmt",
 ]

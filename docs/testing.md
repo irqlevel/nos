@@ -222,7 +222,7 @@ swallowing panic messages whole.
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hypervisor/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry, `hv create` of VMs from a web server's images, `hv clone` and `hv delete`, and the `vm` provider's actions through `mgmt`; on both, `hv convert` |
 | `edit-test.py [--seed N] [--sessions N] [--seconds S] [--session N]` | host (CI) | the editor (`src/crates/common/text/edit`), from its own sources: key sessions held to what they leave in the file and on the screen, files read and saved back byte for byte, random sessions on a terminal of the test's own |
 | `diskimage-test.py [--image <qcow2>] [--iterations N]` | host (CI) | the disk image converter (`src/crates/common/storage/diskimage`, `hv convert`), from its own sources: qcow2 images qemu-img and qemu-io write -- versions 2 and 3, clusters of 512 bytes to 2 MiB, stored, compressed, extended, zero, discarded, preallocated, snapshotted, dirty -- converted and held byte for byte to what qemu-img reads, its holes kept; what it must refuse; its DEFLATE decoder against zlib; each image's metadata fuzzed; and the cloud-init seed's ISO 9660, read back by xorriso or bsdtar, blkid and Linux's isofs |
-| `hvboot-test.py [--image <disk.raw>] [--iterations N]` | host (CI) | hvboot's partition, ext2/3/4 and GRUB readers and its bzImage header, from their own sources: on disks it makes -- GPT, MBR and none, ext4, ext3 and 1 KiB-block ext2, a grub-mkconfig grub.cfg and grubenv -- the entry GRUB would boot and its files byte for byte, then each disk's metadata fuzzed |
+| `hvboot-test.py [--image <disk.raw>] [--iterations N]` | host (CI) | hvboot's own `plan` -- over its partition, ext2/3/4 and GRUB readers and its bzImage header, from their own sources -- under its own heap's arithmetic and size: on disks it makes -- GPT, MBR and none, ext4, ext3 and 1 KiB-block ext2, a grub-mkconfig grub.cfg and grubenv -- the entry GRUB would boot and its files byte for byte; grub.cfg read as GRUB 2.06 read each case when it was booted with it; what is said when nothing boots; a grub.cfg as long as is read, of each costliest shape, and a two-level extent tree, inside the heap; then each disk's metadata fuzzed, every run giving the heap back whole |
 | `extfmt-test.py [--iterations N] [--trials N]` | host (CI) | the ext2/3/4 format crate (`src/crates/common/storage/extfmt`) hvboot reads through and the kernel's ext4 driver is to: every checksum of filesystems mke2fs makes -- ext4 by default, with metadata_csum_seed, with 1 KiB blocks and 128-byte inodes and no 64bit, with gdt_csum, ext3, ext2 -- held to extfmt's, bytes they cover changed one at a time with extfmt and `e2fsck -fn` held to both saying so, and each image fuzzed; then journals debugfs leaves unreplayed, replayed by extfmt's planner and by `e2fsck -E journal_only` to the same image byte for byte, their ring turned so the log wraps, damaged and refused, and fuzzed; and the filesystems `extfmt::mkfs` makes for the shell's `format` -- ext4 and ext2, every block size, up to 3 GiB and 128 groups, the small ones made over noise -- clean to `e2fsck -fn`, their features and label dumpe2fs's, their lost+found debugfs's, and the devices it refuses refused |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hypervisor/hv/src/{insn,walk}.rs`), against the encodings clang gives |
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and its ACPI and SMBIOS tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on; and the virtio notifications, kicks and interrupts with EVENT_IDX and without, held to a Linux driver's every request served (`virtq`) |
@@ -284,7 +284,7 @@ how it works and what it found.
 | `hv create <name> <url>` (`modules/hypervisor/hv/src/cloud.rs`), the cloud-init seed's ISO 9660 (`common/storage/diskimage/src/iso.rs`), a module's HTTP download (`kernel_http_fetch` in `layers/net/src/abi.rs` over `net::wget::fetch`, `kcore::http`: its progress handed to the module, which may stop it) | `hv-test.py` (x86-64): VMs made from a web server of the test's own -- a qcow2 image downloaded, converted and grown to `size=`, its disk held by SHA-256, its seed and vm.toml; a raw one taken; a name that has a vm.toml, a 404, a file that is no image and a `size=` under the image's refused, nothing left behind. `diskimage-test.py` for the ISO: read back by Rock Ridge's names, blkid's label, Linux's isofs. Then `hv-distro-test.py --create <url>` (x86-64, **manual**): a cloud image fetched by nos itself and booted, cloud-init provisioned by nos's seed -- the user logs in with its password, NoCloud the datasource, the key nos's, the root grown. After touching the HTTP client (`layers/net/src/{http,wget}.rs`), `tcp-test.py` and `net-fuzz.py` too |
 | what is done to a VM's folder after it is made -- `hv clone` (`modules/hypervisor/hv/src/clone.rs`: its disks copied by their extents, its seed made anew from the `user-data` kept, its identity made its own), `hv delete`, a vm.toml changed key by key (`config::rewrite`, `conf::edit`, `vm.toml.prev`), a forward kept in it, `protected`, a name held while its folder is made, cloned or deleted (`Vms::reserve`) -- and the `vm` provider (`modules/hypervisor/hv/src/provider.rs`, `vm.descriptor.json`), the `Work` a long command and a job share (`work.rs`: lines, progress, a stop) | `hv-test.py` (x86-64): a VM made from a URL cloned -- the clone's disk held to the source's by SHA-256 and mostly a hole, its seed new, its UUID its own -- a clone to a name taken refused, a forward added through the provider and kept in the vm.toml with the rest of the file as it was, a protected VM's delete refused without `force`, a delete keeping the disks; `api-test.py --arch x86_64`: the provider through the host API -- start, stop, console read and streamed, a reader's typing refused, create, clone, delete, protected, and a create cancelled midway with nothing left; and `api panel create`'s create: a port of its own, a forward, `protected`, started by the same job; `hv-fuzz.py`'s `config` target (a commented vm.toml rewritten to another configuration read back as it, every comment kept in order); `fs-fuzz.py` (the extents a clone copies by); `web-test.py` (the descriptor) |
 | a VM's disk on a device of nos's -- a partition or a whole disk, the filesystem out of the way: the devices' ids (`layers/block/src/table.rs`'s `part_ident` and `disk_ident`, `BlockDriver::identity`, the NVMe's model and serial), the claims' holders and `in_the_way`, the device's queue (`layers/block/src/devq.rs`, `kcore::block::DiskQueue`, the buffers it shares with the image's queue in `base/kcore/src/lent.rs`), the NVMe's Dataset Management, what a device holds (`common/storage/diskimage/src/contents.rs`), `modules/hypervisor/hv/src/devices.rs` and a device's disk in `disk.rs`, the pour onto a device (`image.rs`'s `pour`, `cloud.rs`'s `onto=`); `root=` refusing a label or a UUID two devices carry (`layers/fs/src/rootfs.rs`) | `hv-device-test.py` (x86-64): two NVMe drives beside the root, one partitioned by the test -- every device's id from `disks`, what `hv devices` says each holds, an EFI System partition refused outright and an ext4 without `force`, a partition and a whole disk given by their ids and the disk under the partition refused, a qcow2 poured onto a partition and held to the image byte for byte, a running VM's partition held against the shell's write, a clone refused; then the drives swapped, every id found under the other name and the VM started by its own. Then `parttest.py` (the ids), `diskimage-test.py` (what a device holds -- against mke2fs, mkswap, mkfs.vfat, mkfs.xfs and mkfs.btrfs where the host has them), `fs-fuzz.py`'s `rootfs` (the two-candidate rule), `netblk-test.py` and `sshd-test.py` (the block ABI, the ffi digest), `hv-test.py` and `hv-fuzz.py` (the disk task, the virtio disk's features); for the provider `api-test.py --arch x86_64`, `web-test.py` (its descriptor, which the bus holds to 16 KiB) and the panel's tests |
-| PVH (`hypervisor/hv/src/pvh.rs`), the protected-mode start a PVH image is entered in (`svm::protected_mode`, both backends), hvboot (`src/crates/hypervisor/hvboot`) | `hv-fuzz.py` (the `pvh` target: ELFs of either class, the start info and the entry state held to what the guest was given); `hv-test.py`, whose last boot is hvboot started by PVH with no disk, on whichever backend the machine has; `hvboot-test.py` (host, in CI): hvboot's partition, ext2/3/4 and GRUB readers on disks it makes -- the entry GRUB would boot, and its kernel and initrds byte for byte -- then each disk's metadata fuzzed, and `--image` for a distribution's; then `hv-distro-test.py --ubuntu <cloudimg.raw> --debian <nocloud.raw> --hvboot` (x86-64, **manual**): the images booted off their own /boot by their own grub.cfg, nothing taken out of them, through the same checks as without. hvboot runs in the guest, and its parsers have no `unsafe`: keep them so, its platform's sites in its own few files |
+| PVH (`hypervisor/hv/src/pvh.rs`), the protected-mode start a PVH image is entered in (`svm::protected_mode`, both backends), hvboot (`src/crates/hypervisor/hvboot`) | `hv-fuzz.py` (the `pvh` target: ELFs of either class, the start info and the entry state held to what the guest was given); `hv-test.py`, whose last boot is hvboot started by PVH with no disk, on whichever backend the machine has; `hvboot-test.py` (host, in CI): hvboot's own `plan` and readers, under its own heap, on disks it makes -- the entry GRUB would boot, and its kernel and initrds byte for byte; grub.cfg read as GRUB 2.06 reads it; what is said when nothing boots; the heap held at the longest grub.cfg read, of every costliest shape -- then each disk's metadata fuzzed, and `--image` for a distribution's; then `hv-distro-test.py --ubuntu <cloudimg.raw> --debian <nocloud.raw> --hvboot` (x86-64, **manual**): the images booted off their own /boot by their own grub.cfg, nothing taken out of them, through the same checks as without. hvboot runs in the guest, and its parsers have no `unsafe`: keep them so, its platform's sites in its own few files |
 | the ext2/3/4 format: `src/crates/common/storage/extfmt` -- its views of the superblock, descriptors, inodes, extent trees, block maps, directory and attribute blocks, every checksum metadata_csum and gdt_csum put on them, `features::classify`, the journal's format (`jbd2`) and the plan of its replay (`recovery`) -- and hvboot's reader over it | `extfmt-test.py` (host, in CI): filesystems mke2fs makes -- ext4 as it makes one by default, with metadata_csum_seed and the UUID changed after, with 1 KiB blocks, 128-byte inodes and 32-byte descriptors, with gdt_csum, ext3, ext2 -- holding a two-level extent tree, directories indexed by `e2fsck -D` and attributes in a block of their own, every checksum of every metadata block held to extfmt's; then bytes the checksums cover changed one at a time, each kind in turn, and extfmt and `e2fsck -fn` held to both saying so; then each image fuzzed. Then journals debugfs writes and leaves unreplayed (`jo -c`, `jw -b`/`-r`/`-c`) -- v3 checksums and none, 64-bit tags and 32-bit, an escaped block, revokes before and after a write, a transaction of more blocks than a descriptor holds, one uncommitted -- replayed by the planner and by `e2fsck -E journal_only` to the same image byte for byte (but for the superblock fields e2fsck keeps for itself), and again with the ring turned so the log wraps; a torn commit ending the log where e2fsck ends it, a descriptor damaged under a sound commit and a copy failing its checksum refused; the planner fuzzed, and a log of 9000 transactions planned without asking the heap for more than the 512 KiB the kernel's gives at once. Then `hvboot-test.py`, hvboot's ext reader being extfmt's. The kernel's ext4 driver's judge in the fuzzer is not to share a line with extfmt |
 | the shell's `format` (`src/crates/layers/fs/src/format.rs`: the table of `Maker`s, the claim, the refusals, the batched writes through the device's queue) and what lays a filesystem out for it (`src/crates/common/storage/extfmt/src/mkfs.rs`: the geometry, the order of the writes -- the old superblock's place zeroed and flushed first, the new one written last) | `extfmt-test.py` (host, in CI): mkfs's filesystems -- ext4 and ext2, 1, 2 and 4 KiB blocks, from the smallest it makes to 3 GiB and 128 groups, those to 64 MiB made over noise -- clean to `e2fsck -fn`, dumpe2fs naming their features and label, debugfs their lost+found, and what it refuses refused. Then `fs-fuzz.py`'s `format` target (host, in CI): the command on the fuzzer's disks holding nothing, noise, an ext2 or ext4 of the fuzzer's own or a partition table, with options right and wrong, `force` or not, mounted or not, requests failing and the power going at any of them -- a refusal writing nothing; what it says it made the fuzzer's own judges' clean, of the geometry, label and UUID it said, mounted by the kernel's drivers, `fstest` passing and the unmount clean; a partition's making nothing outside it; any power cut's picture holding the old superblock, none, or the whole new filesystem -- and `fs-fuzz.py --e2fsck` holding its images, made and used, to e2fsck. Then `ext4-test.py` (arm64, in CI): two disks of noise formatted in a boot, written, and read by e2fsck, dumpe2fs, debugfs and Linux after. A new filesystem `format` makes is a `Maker`, and a target of the fuzzer's that judges it by a reader of its own |
 | the CRCs: `src/crates/common/crc` (CRC-32, CRC-32C and CRC-16, each as a message has it and as the bare register, slicing by eight) and what is checked by them -- GPT, the disk log, ext4's metadata_csum, gdt_csum and journal, raft's log -- and the `crc32` command (`kernel/src/crc32.rs`) | `crc-test.py` (host, in CI): each CRC's known answers, random messages of every length and alignment held to the CRC computed from its definition a bit at a time -- every form, from any register, whole and across a split, a checksum with a hole -- and CRC-32 to zlib's over messages past 64 KiB, whole and in pieces; every boot's `rust_test` holds the kernel's own build to the check values (`crc32::selftest`). Then the gates of the formats checked by what changed: `parttest.py` and `fs-fuzz.py` (GPT, the disk log), `extfmt-test.py` and `hvboot-test.py` (ext4's checksums and journal, hvboot's GPT), `raft-test.py` (the log), and `ext4-test.py`, whose files the `crc32` command sums against the host's |
@@ -931,7 +931,8 @@ the interrupts or what is owed one only the first pair's, the pairs in use
 kept across a reset -- each within its first 4,807. The page walker over random page tables, the decoder, the
 Linux loader over headers that parse, the ACPI tables for any machine, the
 SMBIOS tables (`smbios`) from any name, version and UUID -- read back as
-Linux's `dmi_scan` reads them, the entry point where it scans, every string
+Linux's `dmi_scan` reads them, both entry points where it scans -- SMBIOS
+3's and the 32-bit one, each checksum, the same table -- every string
 there and printable, the UUID and the serial as the model says -- and the
 DHCP server over the frames a guest's client sends, well formed and not.
 `config` holds a VM's `vm.toml` (`modules/hypervisor/hv/src/config.rs`): whatever the
@@ -2291,78 +2292,6 @@ provider saying it is protected and off, then forced; the provider's list;
 and the second deleted keeping its disks, which stay in a folder `hv vms`
 no longer lists.
 
-### `hv-device-test.py` -- a partition or a disk of nos's as a guest's disk
-
-A guest's disk on a device of nos's goes past the filesystem altogether
-([A device as a guest's disk](hypervisor.md#a-device-as-a-guests-disk)),
-and what keeps it from wrecking something is all in the giving: the id that
-finds the same device at the next boot, the claims, and the refusals. None
-of that shows in a guest that boots -- a VM given the wrong drive boots
-just as well, onto somebody's data -- so this gate looks at each:
-
-- two boots of `nos.iso` over one root with two NVMe drives beside it: A,
-  a GPT of four partitions the test writes itself (an ext4's superblock
-  labelled `devtest`, zeros, an EFI System partition, bytes of 0xFF), and
-  B, blank, each with a serial of its own;
-- the first boot: `disks` gives each partition its GUID and B its model
-  and serial; `hv devices` says what each holds -- the ext4 and its label,
-  empty, an EFI System partition, data nos does not recognize, the root
-  held by its mount; `hv create` refuses the EFI System partition outright
-  and the ext4 without `force`, gives the empty partition to d1 and B to d3,
-  each vm.toml naming its device by its id and never its name, and refuses
-  the whole of A for overlapping d1's partition; `hv convert` refuses the
-  0xFF partition for the bytes on it and pours a qcow2 image onto it with
-  `force` -- read back on the host after, byte for byte the image's disk,
-  its holes zeros over the 0xFF; hvboot booted on a partition by its name
-  reads it and finds nothing to boot; d1 started holds its partition --
-  `hv devices` says so, the shell's write is refused -- and stopped lets it
-  go; a device attached to d3 with `force` and detached; a clone of d1
-  refused;
-- the second boot with the drives the other way round, as the EX44's two
-  are from boot to boot: every id found where it was under the other name,
-  d1 started on its partition by its id, `hv delete d1` leaving the device
-  as it is.
-
-x86-64, under KVM where the host has an extension and TCG otherwise (QEMU
-9.2 or later, as `hv-test.py` wants): 15 s under TCG on an M4 Pro, a
-`UBSAN=1 RUSTUB=1` build's as long; `--keep` keeps the drives and the
-serial logs.
-
-### `hvboot-test.py` -- what hvboot would boot, decided on the host
-
-hvboot reads a guest's partition table, its ext2/3/4 /boot and its GRUB
-configuration, and boots the entry GRUB would: get any of that wrong and
-the guest boots something else -- an older kernel, the recovery entry --
-with nothing to say so. `fuzz/hvboot` compiles that code, its own sources
-(`src/crates/hypervisor/hvboot/src/{gpt,ext,grub,bzimage}.rs`, over extfmt and the
-tree's `crc`), into a host
-program, and the gate runs it over disks it makes: a GPT whose /boot is a
-partition of its own (an XBOOTLDR, as Ubuntu's image has, beside an ESP), an
-MBR whose /boot is on the root filesystem (as Debian's), and a disk that is
-one filesystem whole; ext4 with extents, ext3, and ext2 with 1 KiB blocks,
-whose 6 MiB kernel runs into the double-indirect blocks. On each, a
-grub.cfg written as grub-mkconfig writes Ubuntu's -- `load_env`, the
-`next_entry` conditional, `$menuentry_id_option`, `search --fs-uuid` in both
-branches of an `if`, a submenu, the firmware entry inside an `if` -- and the
-cases GRUB decides among: no grubenv, the first entry; `hvboot.entry=1>1`,
-the submenu's recovery entry; grubenv's `next_entry=1>2`, an older kernel
-with two initrds, joined at GRUB's 4-byte alignment; GRUB_DEFAULT=saved
-with `saved_entry` naming a submenu's entry by both their ids; and a
-`saved_entry` that names no entry, which boots the first and says so. Each
-must give the entry, the command line (`BOOT_IMAGE=` first) and the kernel
-and initrd bytes, read by hvboot's own reader, as they were written. The
-partition tables are the script's own, written by the UEFI specification's
-layout and CRCs; the filesystems are mke2fs's.
-
-Then each disk is fuzzed: the sectors a clean run reads as metadata --
-tables, superblocks, descriptors, inodes, extent and directory blocks,
-grub.cfg -- have up to eight bytes changed at random, a disk at a time, and
-the code is held to never panicking (overflow checks on), never reading
-outside the disk and always ending. `--image <disk.raw>` does the same for
-a distribution's image: Ubuntu 24.04's and Debian 13's were read so on
-2026-10-24 -- their kernels and initrds as `debugfs` reads them, byte for
-byte -- and fuzzed for 50,000 disks each, with no finding.
-
 In between it runs guests. Before `hv on`, and bound to a CPU the extension
 is off for, a guest is not run, and says which CPU. With it on everywhere,
 every [built-in guest](hypervisor.md#the-built-in-guests) runs bound to the
@@ -2491,7 +2420,14 @@ RDTSCs, and had a write of bit 32 refused, its value kept; that INVPCID's
 four types ran and a fifth was a #GP where it is offered -- the EX44's
 silicon -- and every one a #UD where not, QEMU's TCG and a Zen 2; and that
 the run loop saw its three RDMSRs and two WRMSRs and stopped it at no
-RDTSCP. And for `spec`, two VMs of one CPU each, one after the other on the
+RDTSCP. What a guest is offered, what its check expects and what `hv info`
+says all come from the same few functions, so the gate also says from
+outside what a machine must offer: QEMU's TCG `-cpu max` PKU, RDTSCP and
+RDPID, always, and a run on silicon what `--expect` names (`--expect
+pku,rdtscp,rdpid,invpcid,spec,ibpb` on the EX44, `--expect spec,ibpb` on the
+AX41) -- a change that stopped offering one fails there, not passes the
+guest's reduced branch; and each reduced branch's sentence says what the
+CPU's own CPUID has, read apart from those functions. And for `spec`, two VMs of one CPU each, one after the other on the
 CPU the guests run on: that each was offered exactly the speculation
 controls the host switches, as `hv info` says a guest has them -- none
 under QEMU's TCG, where every access to SPEC_CTRL and PRED_CMD has to be a
@@ -2589,6 +2525,136 @@ under AMD-V; on an Intel host it is TCG. `--arch aarch64` checks the other
 half -- that on a kernel running at EL1 the module loads, says a guest
 cannot run here and names the exception level, and refuses `hv on` and
 `hv run` rather than attempting them.
+
+What no built-in guest drives, and so only `hv-linux-test.py` -- a manual
+gate -- reaches: a vCPU moving between host CPUs (every guest is bound, and
+`avx` and `pkru` keep both their vCPUs on one CPU on purpose), so the
+per-CPU "what this CPU holds" caches -- the x87 owner, `LoadedDebugAddrs`,
+`spec::State::loaded`, TSC_AUX's, the VMCS's `vmclear` off the old CPU --
+are driven as two guests on one CPU and never as one guest on two; an NMI
+from one vCPU to another, NMI blocking until IRET and the NMI window; an
+event put back after an exit during its delivery (guest RAM is mapped whole
+before a run, so no delivery faults at the nested table); 2 MiB nested
+leaves (every guest is `huge = false`); the APIC timer in TSC-deadline and
+periodic modes, IPIs by logical destination or shorthand, an INIT to a
+running CPU; port I/O of 2 and 4 bytes; and #AC given back. A guest whose
+rounds are run by tasks bound to two CPUs in turn, its `GuestCpu` handed
+from one to the other, is what would cover the first five.
+
+### `hv-device-test.py` -- a partition or a disk of nos's as a guest's disk
+
+A guest's disk on a device of nos's goes past the filesystem altogether
+([A device as a guest's disk](hypervisor.md#a-device-as-a-guests-disk)),
+and what keeps it from wrecking something is all in the giving: the id that
+finds the same device at the next boot, the claims, and the refusals. None
+of that shows in a guest that boots -- a VM given the wrong drive boots
+just as well, onto somebody's data -- so this gate looks at each:
+
+- two boots of `nos.iso` over one root with two NVMe drives beside it: A,
+  a GPT of four partitions the test writes itself (an ext4's superblock
+  labelled `devtest`, zeros, an EFI System partition, bytes of 0xFF), and
+  B, blank, each with a serial of its own;
+- the first boot: `disks` gives each partition its GUID and B its model
+  and serial; `hv devices` says what each holds -- the ext4 and its label,
+  empty, an EFI System partition, data nos does not recognize, the root
+  held by its mount; `hv create` refuses the EFI System partition outright
+  and the ext4 without `force`, gives the empty partition to d1 and B to d3,
+  each vm.toml naming its device by its id and never its name, and refuses
+  the whole of A for overlapping d1's partition; `hv convert` refuses the
+  0xFF partition for the bytes on it and pours a qcow2 image onto it with
+  `force` -- read back on the host after, byte for byte the image's disk,
+  its holes zeros over the 0xFF; hvboot booted on a partition by its name
+  reads it and finds nothing to boot; d1 started holds its partition --
+  `hv devices` says so, the shell's write is refused -- and stopped lets it
+  go; a device attached to d3 with `force` and detached; a clone of d1
+  refused;
+- the second boot with the drives the other way round, as the EX44's two
+  are from boot to boot: every id found where it was under the other name,
+  d1 started on its partition by its id, `hv delete d1` leaving the device
+  as it is.
+
+x86-64, under KVM where the host has an extension and TCG otherwise (QEMU
+9.2 or later, as `hv-test.py` wants): 15 s under TCG on an M4 Pro, a
+`UBSAN=1 RUSTUB=1` build's as long; `--keep` keeps the drives and the
+serial logs.
+
+### `hvboot-test.py` -- what hvboot would boot, decided on the host
+
+hvboot reads a guest's partition table, its ext2/3/4 /boot and its GRUB
+configuration, and boots the entry GRUB would: get any of that wrong and
+the guest boots something else -- an older kernel, the recovery entry --
+with nothing to say so. What it boots is its `plan`'s to work out
+(`src/crates/hypervisor/hvboot/src/plan.rs`, with no platform in it), and
+`fuzz/hvboot` compiles that, with the readers it reads through
+(`{gpt,ext,grub}.rs`, over extfmt and the tree's `crc`, and the bzImage crate
+it loads a kernel by, `src/crates/common/boot/bzimage`), the RAM's
+bookkeeping and the loader's command line (`ram.rs`, `options.rs`), from
+their own sources into a host program: the boot's own rules, not a copy of
+them. It runs them under hvboot's own heap -- every allocation hvboot's code
+makes is `arena.rs`'s arithmetic over a stretch no bigger than hvboot's heap,
+less the platform's share -- and every run has to give all of it back: a run
+that would spend the loader's heap, or leave any of it behind, is a finding
+here too. The gate runs it over disks it makes: a GPT whose /boot is a
+partition of its own (an XBOOTLDR, as Ubuntu's image has, beside an ESP), an
+MBR whose /boot is on the root filesystem (as Debian's), and a disk that is
+one filesystem whole; ext4 with extents, ext3, and ext2 with 1 KiB blocks,
+whose 6 MiB kernel runs into the double-indirect blocks. On each, a
+grub.cfg written as grub-mkconfig writes Ubuntu's -- `load_env`, the
+`next_entry` conditional, `$menuentry_id_option`, `search --fs-uuid` in both
+branches of an `if`, a submenu, the firmware entry inside an `if` -- and the
+cases GRUB decides among: no grubenv, the first entry; `hvboot.entry=1>1`,
+the submenu's recovery entry; grubenv's `next_entry=1>2`, an older kernel
+with two initrds, joined at GRUB's 4-byte alignment; GRUB_DEFAULT=saved
+with `saved_entry` naming a submenu's entry by both their ids; and a
+`saved_entry` that names no entry, which boots the first and says so;
+`hvboot.entry=` naming titles with spaces in them, quoted, and hv's words
+after the entry's on the command line as hv gave them. Each must give the
+entry, the command line (`BOOT_IMAGE=` first) and the kernel and initrd
+bytes, read by hvboot's own reader into RAM that held other bytes -- the
+padding between two initrds zeros, as GRUB's -- as they were written. The
+partition tables are the script's own, written by the UEFI specification's
+layout and CRCs; the filesystems are mke2fs's and debugfs's.
+
+Then grub.cfg as GRUB 2.06 reads it (`hvboot-test grub`), each case's
+answer what GRUB itself did when it was booted with it (grub-mkrescue's
+i386-pc build under QEMU, the kernel printing the command line it was
+given): the command line's quoting and an unquoted variable's value split at
+blanks, byte for byte; `default` by number as `strtoul` reads one, by `>>`,
+into submenus within submenus and to a submenu's first entry; braces a
+token wherever they are not quoted, and an escaped one not; assignments
+without `set`; a `linux` unloading the initrd before it; `search`'s forms
+by GRUB's argument parser; menuentry's options before its title; the root
+set outside the entries and a submenu's; an entry's body read with the
+variables as the whole file leaves them; grubenv's escapes and its
+signature; what is said of another file read for the menu. Then what hvboot
+says when it cannot boot -- a filesystem refused for a feature, by name,
+and listed when nothing is found; a partition past the disk's end; a
+grubenv GRUB would not read; `hvboot.disk=` past the disks; a grub.cfg
+longer than it reads; an entry of more initrds than it loads; a grub.cfg
+that could not be looked for, which ends the search rather than another
+filesystem's being booted -- and the entries' files read off another
+filesystem than grub.cfg's, by a root set outside them. Then the heap: a
+grub.cfg as long as hvboot reads, of each of 22 shapes that cost its
+reading the most a byte -- one-letter words and initrds, words that
+alternate text and variables read as an argument, a value, a title and a
+command, assignments, empty entries and submenus, a submenu's thousands of
+roots and entries, a value made of another over and over, nesting --
+beside a grubenv as long as it reads, each booted inside hvboot's heap; an
+initrd whose extent tree is two levels deep (1444 runs of a block, the
+holes every other of 2900 files left), read byte for byte; and the heap's
+arithmetic itself held to a model of it (`hvboot-test arena`). A planted
+fault in any of these -- the old bump heap with the old extent walk among
+them, which runs the heap out on the two-level tree -- fails the gate.
+
+Then each disk is fuzzed: the sectors a clean run reads as metadata --
+tables, superblocks, descriptors, inodes, extent and directory blocks,
+grub.cfg -- have up to eight bytes changed at random, a disk at a time, and
+the code is held to never panicking (overflow checks on), never reading
+outside the disk, always ending, and staying inside hvboot's heap and
+giving all of it back. `--image <disk.raw>` does the same for
+a distribution's image: Ubuntu 24.04's and Debian 13's were read so on
+2026-10-24 -- their kernels and initrds as `debugfs` reads them, byte for
+byte -- and fuzzed for 50,000 disks each, with no finding.
 
 ### `extfmt-test.py` -- the ext2/3/4 format, held to e2fsprogs
 
@@ -3438,7 +3504,8 @@ driver takes ext2's batches of blocks its own way, and NVMe's is the one the
 AX41 runs -- and NVMe's is the one with an asynchronous path, so there the
 guest's requests go to the disk through the image's queue as they come,
 each back when it is done (`fs::image`'s `start` and `reap`; the image says
-how many it served so); on virtio-blk the queue serves every one by the
+how many it served so, and that count, not batches written, is what the
+check holds it to there); on virtio-blk the queue serves every one by the
 batch.
 
 `--cpus N` gives every guest of the run N CPUs, the boot's and the VMs'.

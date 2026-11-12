@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use crate::devices::blk::{self, Blk};
 use crate::devices::ioapic::{self, IoApic};
 use crate::devices::net::{self, Net};
+use crate::devices::offload::{self, TxHeader};
 use crate::devices::pci::{self, Function, PciBus};
 use crate::devices::pic::Pic;
 use crate::devices::pit::Pit;
@@ -263,7 +264,7 @@ fn pic(r: &mut Input) {
 fn pit(r: &mut Input) {
     const PORTS: [u16; 5] = [0x40, 0x41, 0x42, 0x43, 0x61];
     let mut p = Pit::new();
-    while let Some(op) = r.op(7) {
+    while let Some(op) = r.op(8) {
         match op {
             0 => {
                 p.read(r.pick(&PORTS));
@@ -278,6 +279,26 @@ fn pit(r: &mut Input) {
                     /* Due now or later -- never in the past it has given. */
                     let _ = at;
                 }
+            }
+            6 => {
+                /* Channel 0 programmed as a guest programs its tick: a
+                 * control word, then its count's low byte and high byte,
+                 * time going by between. The counter waits for the whole
+                 * count: no IRQ0 edge before it, none due. The old count ran
+                 * on in the new mode, and half a count already counted. */
+                const CH0_LOHI: u8 = 0x30;
+                const MODE_SHIFT: u8 = 1;
+                let mode = r.pick(&[0u8, 2, 3, 4]);
+                p.write(0x43, CH0_LOHI | (mode << MODE_SHIFT));
+                for byte in [Some(r.u8()), None] {
+                    time::advance(r.time_step());
+                    invariant!(!p.ch0_fire() && p.next_ch0_edge_ns().is_none(),
+                               "channel 0 has an edge in mode {} before its count is whole", mode);
+                    if let Some(low) = byte {
+                        p.write(0x40, low);
+                    }
+                }
+                p.write(0x40, r.u8());
             }
             _ => {
                 p.ch0_state();
@@ -528,11 +549,29 @@ fn apic_read(a: &Lapic, reg: u32, now: u64) -> Option<u32> {
     }
 }
 
+/// Write `reg` whole as the APIC's mode has it -- its MSR in x2APIC mode, the
+/// page in xAPIC mode -- and nothing with the APIC off: a guest's write that
+/// is sure to land.
+fn apic_set(a: &mut Lapic, reg: u32, value: u64, now: u64) {
+    if !a.enabled() {
+        return;
+    }
+    if a.xapic() {
+        a.mmio_write(reg << 4, 4, value as u32, now);
+    } else {
+        let _ = a.wrmsr(lapic::MSR_X2APIC_FIRST + reg, value, now);
+    }
+}
+
+/* The timer's entry: masked, and periodic. */
+const LVT_MASKED: u64 = 1 << 16;
+const TIMER_PERIODIC: u64 = 1 << 17;
+
 fn lapic_target(r: &mut Input) {
     let (id, bsp, x2apic) = (r.below(16) as u32, r.bool(), r.bool());
     let mut a = Lapic::new(id, bsp, x2apic);
     let mut now = time::boot_time_ns();
-    while let Some(op) = r.op(14) {
+    while let Some(op) = r.op(16) {
         match op {
             0 => {
                 let reg = apic_reg(r);
@@ -631,6 +670,50 @@ fn lapic_target(r: &mut Input) {
                     None => {}
                 }
             }
+            14 => {
+                /* The divide configuration written while a count runs: the
+                 * count goes on from where it is, at the new rate -- at the
+                 * write's instant it reads what it did before. Kept from the
+                 * old start, it read up to 128 times off. */
+                let before = apic_read(&a, APIC_TIMER_CURRENT, now);
+                let value = apic_value(r, APIC_TIMER_DIVIDE);
+                apic_write(&mut a, r, APIC_TIMER_DIVIDE, value, now);
+                let after = apic_read(&a, APIC_TIMER_CURRENT, now);
+                invariant!(before == after, "the count read {:?} before a divide configuration was written and {:?} \
+                           after, at one instant", before, after);
+            }
+            15 => {
+                /* A periodic timer masked while time goes by -- looked at or
+                 * not -- then unmasked: what it missed is lost, as on an
+                 * APIC, and nothing is handed over at the instant it is
+                 * unmasked. Moved a period a look and owed the rest, it came
+                 * out of its mask with up to a second of periods, back to
+                 * back. */
+                a.init();
+                let vector = 16 + r.below(240);
+                apic_set(&mut a, APIC_SVR, 0x1FF, now);
+                apic_set(&mut a, APIC_TIMER_DIVIDE, 0b1011, now);
+                apic_set(&mut a, APIC_LVT_TIMER, TIMER_PERIODIC | LVT_MASKED | vector, now);
+                apic_set(&mut a, APIC_TIMER_INITIAL, r.pick(&[1u64, 1000, 100_000, 1_000_000, 10_000_000]), now);
+                for _ in 0..r.below(8) {
+                    now = time::later(now, r.time_step());
+                    invariant!(!a.timer(now), "a masked timer requested its interrupt");
+                }
+                now = time::later(now, r.time_step());
+                apic_set(&mut a, APIC_LVT_TIMER, TIMER_PERIODIC | vector, now);
+                let mut handed = 0;
+                for _ in 0..4 {
+                    if !a.timer(now) {
+                        break;
+                    }
+                    handed += 1;
+                    if let Some(v) = a.pending() {
+                        a.acknowledge(v);
+                        apic_set(&mut a, APIC_EOI, 0, now);
+                    }
+                }
+                invariant!(handed == 0, "a periodic timer unmasked handed over {} interrupts at that instant", handed);
+            }
             _ => {
                 a.sync_cr8(r.u8() & 0xF);
                 let x = a.addressing();
@@ -649,11 +732,13 @@ fn ioapic_target(r: &mut Input) {
     let mut io = IoApic::new(r.u8());
     /* Each pin as the target has driven it: a line held up, asserted again,
      * is no edge, and sends nothing -- a level's interrupt went when it rose
-     * or when it was ended, and an NMI or an INIT is edge-triggered whatever
-     * its entry says (an NMI at every look was a guest's CPU 0 never entered
-     * again). */
+     * or when it was ended, an NMI is edge-triggered whatever its entry says
+     * (an NMI at every look was a guest's CPU 0 never entered again), and
+     * one no local APIC took is sent again only when a CPU's APIC changes
+     * (`untaken`). Whether a local APIC takes a message is the input's to
+     * say, as the CPUs it names would. */
     let mut up: u32 = 0;
-    while let Some(op) = r.op(8) {
+    while let Some(op) = r.op(10) {
         /* Its page's registers, mostly -- the select, the window, EOI. */
         let offset = if r.u8() < 200 { r.pick(&[0x00, 0x10, 0x40]) } else { r.below(ioapic::PAGE_SIZE) as u32 };
         let pin = r.below(32) as usize;
@@ -687,8 +772,21 @@ fn ioapic_target(r: &mut Input) {
                 io.route(pin);
                 0
             }
+            7 => {
+                /* A level posted to another CPU's mailbox, refused there. */
+                io.refused(r.u8());
+                0
+            }
+            8 => {
+                /* A CPU's APIC turned on, or addressed otherwise: what no
+                 * APIC took, sent again -- pins held up alone. */
+                let again = io.untaken();
+                invariant!(again & !up == 0, "pins {:#x} sent again, of which {:#x} are not asserted", again,
+                           again & !up);
+                again
+            }
             _ => {
-                let _ = io.send(pin);
+                ioapic_send(&mut io, pin, r.bool(), up);
                 0
             }
         };
@@ -697,9 +795,54 @@ fn ioapic_target(r: &mut Input) {
         while left != 0 {
             let p = left.trailing_zeros() as usize;
             left &= left - 1;
-            let _ = io.send(p);
+            ioapic_send(&mut io, p, r.bool(), up);
         }
     }
+}
+
+/// Pin `pin`'s redirection entry as a guest reads it through the window,
+/// its remote IRR among it.
+fn ioapic_entry(io: &mut IoApic, pin: usize) -> u64 {
+    const IOREGSEL: u32 = 0x00;
+    const IOWIN: u32 = 0x10;
+    let low = 0x10 + 2 * pin as u32;
+    io.mmio_write(IOREGSEL, 4, low);
+    let lo = u64::from(io.mmio_read(IOWIN, 4));
+    io.mmio_write(IOREGSEL, 4, low + 1);
+    lo | u64::from(io.mmio_read(IOWIN, 4)) << 32
+}
+
+/// Pin `pin`'s interrupt sent, a local APIC taking it or not (`took`), the
+/// pins asserted being `up`: a level-triggered entry's remote IRR set after
+/// exactly when one was taken -- now, or before and not yet ended -- and the
+/// pin among those to send again (`untaken`) exactly when, asserted and
+/// unmasked, none was. Set as it was made, a level nobody took left its pin
+/// dead for good: no EOI was coming.
+fn ioapic_send(io: &mut IoApic, pin: usize, took: bool, up: u32) {
+    const DELIVERY_FIXED: u64 = 0;
+    const DELIVERY_LOWEST: u64 = 1;
+    const REMOTE_IRR: u64 = 1 << 14;
+    const LEVEL: u64 = 1 << 15;
+    const MASKED: u64 = 1 << 16;
+    if pin >= ioapic::PINS {
+        io.send(pin, &mut |_| took);
+        return;
+    }
+    let before = ioapic_entry(io, pin);
+    io.send(pin, &mut |_| took);
+    let after = ioapic_entry(io, pin);
+    let level = before & LEVEL != 0 && matches!((before >> 8) & 0x7, DELIVERY_FIXED | DELIVERY_LOWEST);
+    if !level {
+        return;
+    }
+    let held = took || before & REMOTE_IRR != 0;
+    invariant!((after & REMOTE_IRR != 0) == held, "pin {}'s level sent, {} -- its remote IRR {} after, {} before",
+               pin, if took { "taken" } else { "taken by none" }, after & REMOTE_IRR != 0, before & REMOTE_IRR != 0);
+    let bit = 1u32 << pin;
+    let pending = up & bit != 0 && before & MASKED == 0 && !held;
+    invariant!((io.untaken() & bit != 0) == pending, "pin {} is {}among those to send again, {} up, masked {}, \
+               remote IRR {}", pin, if pending { "not " } else { "" }, if up & bit != 0 { "held" } else { "not" },
+               before & MASKED != 0, held);
 }
 
 fn msi(r: &mut Input) {
@@ -1094,7 +1237,7 @@ fn blk_target(r: &mut Input) {
         mem.refuse_maps(true);
     }
     let mut q = DriverQueue::default();
-    while let Some(op) = r.op(14) {
+    while let Some(op) = r.op(17) {
         match op {
             0 => {
                 disk.io_read(r.below(u64::from(blk::BAR_SIZE)) as u16, r.io_size());
@@ -1189,11 +1332,151 @@ fn blk_target(r: &mut Input) {
                 }
                 held_to_a_pass(&mem, || disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns()));
             }
+            14 => {
+                /* Its queue never set up after a reset, EVENT_IDX taken, and
+                 * the index a ring at page 0 would have saying a chain is
+                 * there: a notify finds no queue to work on. Nothing of page
+                 * 0 is read or written, the device is not stopped over what
+                 * it found there, and the pass does not end owing more -- it
+                 * once asked for a kick at page 0 and came back at once, for
+                 * good. */
+                blk_reset_drained(&mut disk, &mem, &state);
+                disk.io_write(GUEST_FEATURES, 4, u32::MAX, &mem, time::boot_time_ns());
+                q = DriverQueue::default();
+                let _ = mem.write(PAGE + 2, &1u16.to_le_bytes());
+                let mut low = vec![0u8; 3 * PAGE as usize];
+                let _ = mem.read(0, &mut low);
+                held_to_a_pass(&mem, || disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns()));
+                let mut after = vec![0u8; 3 * PAGE as usize];
+                let _ = mem.read(0, &mut after);
+                invariant!(!disk.more() && disk.broken().is_none() && after == low,
+                           "a notify of a queue that is down: more {}, broken {:?}, page 0 written {}", disk.more(),
+                           disk.broken(), after != low);
+            }
+            15 => {
+                /* Requests out at a reset, the old driver's; the new one's
+                 * queue set up and a request of its made: it is not handed
+                 * to the backend until the old ones are back -- beside them,
+                 * an old write and a new one to the same blocks could land in
+                 * either order. */
+                blk_queue_at(&mut disk, &mem, &mut q, u32::MAX);
+                for _ in 0..1 + r.below(4) {
+                    blk_read(&mem, &mut q, r);
+                }
+                disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns());
+                disk.io_write(DEVICE_STATUS, 1, 0, &mem, time::boot_time_ns());
+                let old = state.lock().unwrap().queued();
+                blk_queue_at(&mut disk, &mem, &mut q, u32::MAX);
+                blk_read(&mem, &mut q, r);
+                disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns());
+                let now = state.lock().unwrap().queued();
+                invariant!(old == 0 || now == old, "{} of the old driver's requests out at its reset, and {} with the \
+                           backend after the new driver's notify", old, now);
+            }
+            16 => {
+                /* A driver that took no FLUSH, which may take its disk to be
+                 * write-through: a write it makes is flushed before it is
+                 * answered -- the flush handed over as the write comes back,
+                 * and the write's status still unwritten until it does. */
+                blk_reset_drained(&mut disk, &mem, &state);
+                state.lock().unwrap().fail = false;
+                blk_queue_at(&mut disk, &mem, &mut q, u32::MAX & !(1 << 9));
+                let status = blk_write(&mem, &mut q, r);
+                disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns());
+                if state.lock().unwrap().queued() == 1 {
+                    state.lock().unwrap().ready = 1;
+                    disk.poll(&mem);
+                    let flush = state.lock().unwrap().queue.front().map(|q| q.op()) == Some(blk::Op::Flush);
+                    let mut s = [0u8];
+                    let _ = mem.read(status, &mut s);
+                    invariant!(flush && s[0] == BLK_UNSET, "a write of a driver with no FLUSH served: {} flush handed \
+                               over, its status {:#x}", if flush { "a" } else { "no" }, s[0]);
+                    state.lock().unwrap().ready = 1;
+                    disk.poll(&mem);
+                    let _ = mem.read(status, &mut s);
+                    invariant!(s[0] == 0, "a write flushed, answered {:#x}", s[0]);
+                }
+            }
             _ => {}
         }
     }
     PASSES_CUT.fetch_add(disk.stats.cut, std::sync::atomic::Ordering::Relaxed);
     mem.held_to_map_budget(since, 1);
+}
+
+/// What a status byte holds before the device writes it.
+const BLK_UNSET: u8 = 0xEE;
+
+/// The disk reset, and what its backend had of the old driver's taken back.
+fn blk_reset_drained(disk: &mut Blk, mem: &GuestMemory, state: &Arc<Mutex<DiskState>>) {
+    disk.io_write(DEVICE_STATUS, 1, 0, mem, time::boot_time_ns());
+    for _ in 0..blk::IN_FLIGHT {
+        let left = state.lock().unwrap().queued();
+        if left == 0 {
+            break;
+        }
+        {
+            let mut s = state.lock().unwrap();
+            s.ready += left;
+            s.fail = false;
+        }
+        disk.poll(mem);
+    }
+    state.lock().unwrap().ready = 0;
+}
+
+/// The disk's queue set up at page 1 by a driver taking `features`.
+fn blk_queue_at(disk: &mut Blk, mem: &GuestMemory, q: &mut DriverQueue, features: u32) {
+    disk.io_write(GUEST_FEATURES, 4, features, mem, time::boot_time_ns());
+    disk.io_write(QUEUE_SELECT, 2, 0, mem, time::boot_time_ns());
+    disk.io_write(QUEUE_PFN, 4, 1, mem, time::boot_time_ns());
+    *q = DriverQueue::at(1);
+}
+
+/// Where well-made requests' buffers go: past the rings at page 1.
+const BLK_BUFS: u64 = 0x8000;
+
+/// A read of one sector, well made, on `q`.
+fn blk_read(mem: &GuestMemory, q: &mut DriverQueue, r: &mut Input) {
+    blk_one(mem, q, r, 0);
+}
+
+/// A write of one sector, well made, on `q`: where its status byte is.
+fn blk_write(mem: &GuestMemory, q: &mut DriverQueue, r: &mut Input) -> u64 {
+    blk_one(mem, q, r, 1)
+}
+
+fn blk_one(mem: &GuestMemory, q: &mut DriverQueue, r: &mut Input, kind: u32) -> u64 {
+    let at = BLK_BUFS + (q.avail_idx % 16) as u64 * PAGE;
+    let (header, data, status) = (at, at + 0x100, at + 0x300);
+    let mut h = [0u8; 16];
+    h[..4].copy_from_slice(&kind.to_le_bytes());
+    mem.put(header, &h);
+    mem.put(status, &[BLK_UNSET]);
+    let _ = r;
+    chain_made_well(mem, q, &[(header, 16, false), (data, blk::SECTOR as u32, kind == 0), (status, 1, true)]);
+    status
+}
+
+/// `segs` a chain in `q`, as a driver that makes no mistake makes one:
+/// direct descriptors, each pointing at the next, the index one on.
+fn chain_made_well(mem: &dyn Memory, q: &mut DriverQueue, segs: &[(u64, u32, bool)]) {
+    if q.pfn == 0 || segs.is_empty() {
+        return;
+    }
+    let head = q.next_desc % QUEUE_SIZE;
+    for (i, &(addr, len, write)) in segs.iter().enumerate() {
+        let last = i + 1 == segs.len();
+        let flags = if write { DESC_WRITE } else { 0 } | if last { 0 } else { DESC_NEXT };
+        let next = ((q.next_desc + 1) % QUEUE_SIZE) as u16;
+        mem.put(q.desc(q.next_desc), &descriptor(addr, len, flags, next));
+        q.next_desc += 1;
+    }
+    let slot = u64::from(q.avail_idx) % QUEUE_SIZE;
+    mem.put(q.avail() + 4 + 2 * slot, &(head as u16).to_le_bytes());
+    q.avail_idx = q.avail_idx.wrapping_add(1);
+    mem.put(q.avail() + 2, &q.avail_idx.to_le_bytes());
+    mem.put(q.avail(), &0u16.to_le_bytes());
 }
 
 /// The guests' switch as a NIC's backend sees it: frames sent checked, and
@@ -1206,6 +1489,8 @@ pub struct NicState {
     /// What the device last told it its guest takes (`Backend::takes`),
     /// which `netrx` holds to the driver's features.
     pub takes: crate::offload::Takes,
+    /// Frames sent: each a frame on the switch.
+    pub sent: u64,
 }
 
 pub struct Nic(pub Arc<Mutex<NicState>>);
@@ -1213,6 +1498,7 @@ pub struct Nic(pub Arc<Mutex<NicState>>);
 impl net::Backend for Nic {
     fn send(&mut self, frame: &[u8]) {
         invariant!(frame.len() <= net::MAX_FRAME, "a frame of {} bytes sent, past {}", frame.len(), net::MAX_FRAME);
+        self.0.lock().unwrap().sent += 1;
     }
     /// The next frame finished -- whole, before it is cut to `buf` -- as
     /// the switch's own `recv` hands one; a send carried whole, which no
@@ -1253,6 +1539,36 @@ impl net::Backend for Nic {
     }
 }
 
+/// The most of the guest's memory one transmit pass reads: its bound's bytes
+/// and the send that crosses it, and for each chain of it -- a queue's worth
+/// at most -- its descriptors and the rings' words.
+const NET_PASS_MOST: u64 = (net::TX_PASS_BYTES + TxHeader::LEN + offload::MAX_SEND) as u64 + QUEUE_SIZE * 64;
+
+/// A send of TCP over IPv4 with `payload` bytes behind its headers, as a
+/// driver that leaves the cutting to the device hands it over: its
+/// checksums the device's to make.
+fn tcp4_send(payload: usize) -> Vec<u8> {
+    let mut f = vec![0u8; 54 + payload];
+    f[..6].copy_from_slice(&[2, 0, 0, 0, 0x64, 1]);
+    f[6..12].copy_from_slice(&[2, 0, 0, 0, 0x64, 2]);
+    f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    f[14] = 0x45;
+    f[16..18].copy_from_slice(&((40 + payload) as u16).to_be_bytes());
+    f[20..22].copy_from_slice(&0x4000u16.to_be_bytes());
+    f[22] = 64;
+    f[23] = 6;
+    f[26..30].copy_from_slice(&[10, 0, 100, 2]);
+    f[30..34].copy_from_slice(&[10, 0, 100, 1]);
+    f[34..36].copy_from_slice(&40000u16.to_be_bytes());
+    f[36..38].copy_from_slice(&80u16.to_be_bytes());
+    f[46] = 5 << 4;
+    f[47] = 0x18;
+    for (i, b) in f[54..].iter_mut().enumerate() {
+        *b = i as u8;
+    }
+    f
+}
+
 /// After a round of the NIC at `now` (`poll`): no receive interrupt still
 /// owed with its time up -- the round raises what is due -- and what it
 /// promised its backend, the next time it looks, ahead of `now`. Not after a
@@ -1291,7 +1607,7 @@ fn net_target(r: &mut Input) {
     }
     let count = 2 * usize::from(pairs) + usize::from(pairs > 1);
     let mut queues = vec![DriverQueue::default(); count];
-    while let Some(op) = r.op(16) {
+    while let Some(op) = r.op(17) {
         let which = r.below(count as u64) as usize;
         /* A pair's receive queue and its transmit queue. */
         let rx = 2 * r.below(u64::from(pairs)) as usize;
@@ -1367,6 +1683,51 @@ fn net_target(r: &mut Input) {
                  * multiqueue and its control queue among it. */
                 let features = if r.u8() < 200 { u32::MAX } else { r.value32() };
                 nic.io_write(GUEST_FEATURES, 4, features, &mem, time::boot_time_ns());
+            }
+            16 => {
+                /* A transmit ring of the largest sends of TCP, each to be cut
+                 * by a segment size down to Linux's least: each cut and sent,
+                 * none refused for its small segments -- refused under 256
+                 * bytes once, a guest's connection to a peer with a small MSS
+                 * stalled -- and a notify's pass held to its bound on the
+                 * frames it makes and the bytes it copies, where a ring of
+                 * them was once 65,536 frames and 16 MiB in one pass. */
+                const F_CSUM: u32 = 1 << 0;
+                const F_HOST_TSO4: u32 = 1 << 11;
+                const F_MRG_RXBUF: u32 = 1 << 15;
+                const TX: usize = 1;
+                const TX_PFN: u64 = 4;
+                const HEADER_AT: u64 = 0x1_0000;
+                const FRAME_AT: u64 = 0x2_0000;
+                nic.io_write(DEVICE_STATUS, 1, 0, &mem, time::boot_time_ns());
+                nic.io_write(GUEST_FEATURES, 4, u32::MAX & !F_MRG_RXBUF, &mem, time::boot_time_ns());
+                if nic.io_read(GUEST_FEATURES, 4) & (F_CSUM | F_HOST_TSO4) != F_CSUM | F_HOST_TSO4 {
+                    continue;
+                }
+                nic.io_write(QUEUE_SELECT, 2, TX as u32, &mem, time::boot_time_ns());
+                nic.io_write(QUEUE_PFN, 4, TX_PFN as u32, &mem, time::boot_time_ns());
+                queues[TX] = DriverQueue::at(TX_PFN);
+                let mss = r.pick(&[offload::MIN_SEGMENT, 64, 255, 1448]);
+                let payload = r.pick(&[1usize, 1000, offload::MAX_SEND - 54]);
+                let frame = tcp4_send(payload);
+                let header = TxHeader { flags: offload::NEEDS_CSUM, gso_type: offload::GSO_TCPV4, hdr_len: 54,
+                                        gso_size: mss as u16, csum_start: 34, csum_offset: 16 };
+                mem.put(HEADER_AT, &header.bytes());
+                mem.put(FRAME_AT, &frame);
+                for _ in 0..QUEUE_SIZE / 2 {
+                    chain_made_well(&mem, &mut queues[TX], &[(HEADER_AT, TxHeader::LEN as u32, false),
+                                                             (FRAME_AT, frame.len() as u32, false)]);
+                }
+                let (sent, dropped, moved) = (state.lock().unwrap().sent, nic.stats.dropped, mem.moved());
+                nic.io_write(QUEUE_NOTIFY, 2, TX as u32, &mem, time::boot_time_ns());
+                let (frames, moved) = (state.lock().unwrap().sent - sent, mem.moved() - moved);
+                let each = payload.div_ceil(mss).max(1) as u64;
+                invariant!(nic.stats.dropped == dropped && frames >= each,
+                           "sends of {} bytes cut at {}: {} frames sent, {} dropped", payload, mss, frames,
+                           nic.stats.dropped - dropped);
+                invariant!(frames <= net::TX_PASS_FRAMES as u64 + each && moved <= NET_PASS_MOST,
+                           "one notify's pass: {} frames and {} bytes of the guest's memory, past its bound of {} \
+                           frames and {} bytes and a send", frames, moved, net::TX_PASS_FRAMES, net::TX_PASS_BYTES);
             }
             15 => {
                 /* A command on the control queue -- the last, where a driver
@@ -1561,9 +1922,39 @@ fn linux(r: &mut Input) {
         let mut n = [0u8; 1];
         memory.read(0x7000 + 0x1e8, &mut n).expect("the e820 count");
         e820_held(&memory, 0x7000 + 0x2d0, 20, usize::from(n[0]), mem_bytes);
+        zero_page_held(&memory, &first, &l, usize::from(n[0]), firmware.map(|f| f.rsdp));
     }
     let mut vcpu = crate::vm::Backend::default();
     set_entry(&mut vcpu, &l);
+}
+
+/// The zero page at 0x7000 held to the boot protocol -- read by its offsets
+/// here, not through `bzimage`, which wrote it for hv and writes hvboot's:
+/// the header as the image has it, from 0x1f1 to the end its byte at 0x201
+/// says, but for what a loader owns and the memory map's `entries` laid
+/// over it; the loader's type undefined; loaded high; the command line at
+/// the loader's 0x20000; no heap, and the extended loader's bytes clear;
+/// the initrd where the plan put it; and the RSDP the firmware's, or none.
+fn zero_page_held(memory: &GuestMemory, first: &[u8], l: &crate::linux::Layout, entries: usize, rsdp: Option<u64>) {
+    let mut page = [0u8; 4096];
+    memory.read(0x7000, &mut page).expect("the zero page");
+    let word = |at: usize| u32::from_le_bytes(page[at..at + 4].try_into().unwrap());
+    let owned = [0x210..0x212, 0x218..0x220, 0x224..0x22C, 0x2D0..0x2D0 + entries * 20];
+    let end = (0x202 + usize::from(first[0x201])).min(first.len());
+    for at in (0x1F1..end).filter(|at| !owned.iter().any(|r| r.contains(at))) {
+        invariant!(page[at] == first[at], "the zero page's byte {:#x} is {:#x}, the image's {:#x}", at, page[at],
+                   first[at]);
+    }
+    invariant!(page[0x210] == 0xFF, "type_of_loader {:#x}, not an undefined loader's", page[0x210]);
+    invariant!(page[0x211] == first[0x211] | 1, "loadflags {:#x}, of the image's {:#x}: not loaded high",
+               page[0x211], first[0x211]);
+    invariant!(word(0x228) == 0x2_0000, "cmd_line_ptr {:#x}, where the line is at 0x20000", word(0x228));
+    invariant!(word(0x224) == 0, "heap_end_ptr and the extended loader's bytes {:#x}", word(0x224));
+    invariant!(u64::from(word(0x218)) == l.initrd_addr && u64::from(word(0x21C)) == l.initrd_len,
+               "the initrd at {:#x}, {:#x} bytes: planned at {:#x}, {:#x}", word(0x218), word(0x21C), l.initrd_addr,
+               l.initrd_len);
+    let at = u64::from_le_bytes(page[0x70..0x78].try_into().unwrap());
+    invariant!(at == rsdp.unwrap_or(0), "acpi_rsdp_addr {:#x}, where the firmware's is {:?}", at, rsdp);
 }
 
 /// A memory map of `n` entries at `map`, `stride` bytes apart, held to the

@@ -86,7 +86,7 @@ pub fn place_target(r: &mut Input) {
                 }
                 let rule = if own { Cores::Own } else { Cores::Shared };
                 let got = place::place(&topo, rule, enabled, online, &taken, wanted, n, disks);
-                check(&topo, own, enabled, online, taken.cpus, wanted, n, disks, &got);
+                check(&topo, own, enabled, online, &taken, wanted, n, disks, &got);
                 if let Ok(p) = got {
                     let vcpus = p.vcpus.iter().fold(0u64, |m, &c| m | bit(c));
                     guests.push(Guest { vcpus, disk: if disks { bit(p.disk) } else { 0 } });
@@ -107,9 +107,10 @@ pub fn place_target(r: &mut Input) {
 /// Hold one answer to the model: `taken` the CPUs of the guests already
 /// running, as the answer was given them.
 #[allow(clippy::too_many_arguments)]
-fn check(topo: &Topology, own: bool, enabled: u64, online: u64, taken: u64, wanted: Option<u32>, n: u32, disks: bool,
-         got: &Result<Placement, Refused>)
+fn check(topo: &Topology, own: bool, enabled: u64, online: u64, taken_by: &Taken, wanted: Option<u32>, n: u32,
+         disks: bool, got: &Result<Placement, Refused>)
 {
+    let taken = taken_by.cpus;
     /* The reason that comes first, or none. */
     let held = cores_of(topo, taken);
     let free = on_cores(topo, enabled, !held);
@@ -170,6 +171,9 @@ fn check(topo: &Topology, own: bool, enabled: u64, online: u64, taken: u64, want
         invariant!(online & bit(p.disk) != 0, "the disks' task on cpu {}, which is not online", p.disk);
     }
     if !own {
+        if disks {
+            shared_disk(topo, online, taken_by, mine, &p);
+        }
         return;
     }
 
@@ -230,6 +234,31 @@ fn check(topo: &Topology, own: bool, enabled: u64, online: u64, taken: u64, want
         invariant!(mine & bit(p.disk) != 0, "the disks' task on cpu {}, with nowhere but its own vCPUs' CPUs",
                    p.disk);
         placed("place: disks beside a vCPU of its own");
+    }
+}
+
+/// Under `Cores::Shared`, the disks' task: on an online CPU none of the
+/// guest's vCPUs is on, where there is one -- CPU 0 the last -- whose core
+/// has the fewest vCPUs of all the guests, this one's counted, and of those
+/// the fewest on the CPU itself; on a vCPU's CPU only where every online CPU
+/// has one. Chosen by the other guests' load alone, it went to the guest's
+/// own second vCPU's CPU while others stood idle.
+fn shared_disk(topo: &Topology, online: u64, taken: &Taken, mine: u64, p: &Placement) {
+    let load = |cpu: u32| taken.load[cpu as usize] + u32::from(mine & bit(cpu) != 0);
+    let core_load = |cpu: u32| (0..CPUS).filter(|&c| topo.core(c) == topo.core(cpu)).map(load).sum::<u32>();
+    let free = online & !mine;
+    if free & !1 != 0 {
+        let pool = free & !1;
+        let best = (0..CPUS).filter(|&c| pool & bit(c) != 0).map(|c| (core_load(c), load(c))).min();
+        invariant!(pool & bit(p.disk) != 0 && Some((core_load(p.disk), load(p.disk))) == best,
+                   "the disks' task on cpu {} (vCPUs {:?}): wanted one of {:#x} with the fewest vCPUs on its core, \
+                    then on it -- {:?}", p.disk, p.vcpus, pool, best);
+        placed("place: shared, disks on a CPU of no vCPU of its own");
+    } else if free != 0 {
+        invariant!(p.disk == 0, "the disks' task on cpu {}, where cpu 0 alone has no vCPU of its own", p.disk);
+    } else {
+        invariant!(mine & bit(p.disk) != 0, "the disks' task on cpu {}, with nowhere but its own vCPUs' CPUs", p.disk);
+        placed("place: shared, disks beside a vCPU of its own");
     }
 }
 
