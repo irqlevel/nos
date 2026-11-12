@@ -1172,8 +1172,8 @@ pub struct LogLine {
     tokens: u64,
     topped_at: u64,
     /// Lines left out that no notice has said yet, and when the last notice
-    /// was given: one a second at most, so that saying what was left out
-    /// does not cost the log as many lines again.
+    /// was in the log (`told`): one a second at most, so that saying what was
+    /// left out does not cost the log as many lines again.
     dropped: u64,
     told_at: u64,
 }
@@ -1188,7 +1188,8 @@ impl LogLine {
 
     /// Whether the line that ended goes to the kernel log, at `now`: Some,
     /// with how many lines left out the caller is to say before it -- zero
-    /// but once a second at most -- or None, and it is one more left out.
+    /// but once a second at most, the caller calling `told` once it has --
+    /// or None, and it is one more left out.
     pub fn admit(&mut self, now: u64) -> Option<u64> {
         let earned = now.saturating_sub(self.topped_at).saturating_mul(LOG_LINES_PER_SEC) / NS_PER_SEC;
         if earned != 0 {
@@ -1212,8 +1213,15 @@ impl LogLine {
         if self.dropped == 0 || now.saturating_sub(self.told_at) < NS_PER_SEC {
             return Some(0);
         }
-        self.told_at = now;
         Some(core::mem::take(&mut self.dropped))
+    }
+
+    /// A notice `admit` asked for is in the log, at `now`, read after the
+    /// log took it: the next a second after the log's own stamp on this one,
+    /// which the log takes after `admit`'s `now` -- from that `now`, two
+    /// notices were stamped 18 us short of a second apart.
+    pub fn told(&mut self, now: u64) {
+        self.told_at = now;
     }
 
     /// The lines left out that no notice has said yet: for the caller to say

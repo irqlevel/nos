@@ -56,6 +56,7 @@ impl Host for BootHost {
             if let Some(dropped) = c.line.admit(kcore::time::boot_time_ns()) {
                 if dropped != 0 {
                     kcore::klog!(0, "hvguest| ... {} lines not logged", dropped);
+                    c.line.told(kcore::time::boot_time_ns());
                 }
                 kcore::klog!(0, "hvguest| {}", c.line.text());
             }
