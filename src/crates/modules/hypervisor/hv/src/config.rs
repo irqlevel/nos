@@ -252,6 +252,42 @@ fn assign(c: &mut Config, key: Key, name: &str, value: Value, line: usize) -> Re
     Ok(())
 }
 
+/// `args` with every word `flag` before `cmdline=` taken out -- which takes
+/// the rest of the line, a word like it included -- and whether there was
+/// one; None for memory. Text alone, so that hv-fuzz's `config` target
+/// holds it to taking out that word and nothing else.
+pub fn take_flag(args: &str, flag: &str) -> Option<(String, bool)> {
+    let mut out = String::new();
+    out.try_reserve_exact(args.len()).ok()?;
+    let mut found = false;
+    let mut rest = args.trim_start();
+    while !rest.is_empty() {
+        if rest.starts_with("cmdline=") {
+            /* A word apart from the one before it: run on, `initrd=/x
+             * cmdline=...` was read as an initrd of `/xcmdline=...` and the
+             * command line's first word as an option -- every `hv create`
+             * with a cmdline= after another word was refused. */
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(rest);
+            break;
+        }
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let word = &rest[..end];
+        rest = rest[end..].trim_start();
+        if word == flag {
+            found = true;
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    Some((out, found))
+}
+
 /// What a command line says without its `ip=`: the switch gives a guest
 /// its address at every start, and a clone's source's would be another's.
 /// The line as it was when it has none; its other words in their order,

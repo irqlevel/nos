@@ -47,7 +47,9 @@
 //!   indirect branches on the other -- the IBPB at an exit clears this
 //!   thread's training, not the sibling's, which goes on. A guest runs with
 //!   it too, over its own SPEC_CTRL -- on a CPU with V_SPEC_CTRL through the
-//!   VMCB, whose value `vmrun` would give it otherwise.
+//!   VMCB's value as well, OR-ed in: AMD has the effective setting the
+//!   guest's OR-ed with the host's MSR, and the bit in the VMCB holds it
+//!   however a CPU combines the two.
 //! - HLT and MWAIT exits, whatever `hv` asks for (`svm::HOST_MISC1`): a
 //!   thread that idles switches its core between its SMT modes, and on Zen 1
 //!   and 2 a `ret` on the other thread may then be predicted from what this
@@ -86,8 +88,11 @@
 //! and TSA (Zen 3 and 4), which wants VERW before every entry; branch
 //! history cleared by the software sequence on a CPU with enhanced IBRS
 //! that is open to BHI and has no BHI_DIS_S (Ice Lake, Tiger Lake -- none
-//! of the machines here); and every CPU open to something with nothing here
-//! to close it is named by [`report`]; a guest's own L1D flush
+//! of the machines here); a report of every class a CPU is open to with
+//! nothing here to close it -- [`report`] names AMD's BTI, Retbleed, SRSO
+//! and SMT and Intel's BHI, and not an Intel CPU open to MDS, TAA, MMIO
+//! stale data or RFDS whose microcode has no clearing for it, whose VERW is
+//! then simply off; a guest's own L1D flush
 //! (IA32_FLUSH_CMD), which would have to run on the CPU its data was in
 //! before its task could move; and L1TF with hyper-threading, which the
 //! flush does not reach -- the sibling's guest reads the cache meanwhile --
@@ -687,7 +692,8 @@ impl State {
     }
 
     /// Where the CPU has virtual SPEC_CTRL, the value a guest's VMCB is to
-    /// give it: its bits over the host's. None where it has not, or no
+    /// give it: its bits over the host's -- the host's in it as well as in
+    /// the MSR, whichever way the CPU combines the two. None where it has not, or no
     /// IA32_SPEC_CTRL at all.
     pub(super) fn vmcb_spec_ctrl(&self, guest: u64) -> Option<u64> {
         self.amd.v_spec_ctrl.then_some(self.host?).map(|host| host | guest)

@@ -329,7 +329,7 @@ pub fn create(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
         return;
     }
     /* `force`: each device given over what is on it, or another VM's. */
-    let Some((rest, force)) = take_flag(rest, "force") else {
+    let Some((rest, force)) = config::take_flag(rest, "force") else {
         let _ = writeln!(work, "hv: out of memory");
         return;
     };
@@ -447,34 +447,6 @@ pub fn give_devices(root: &str, vm: &str, disks: &mut [(String, bool)], force: b
         *word = id;
     }
     Ok(())
-}
-
-/// `args` with every word `flag` before `cmdline=` taken out -- which takes
-/// the rest of the line, a word like it included -- and whether there was
-/// one; None for memory.
-pub(crate) fn take_flag(args: &str, flag: &str) -> Option<(String, bool)> {
-    let mut out = String::new();
-    out.try_reserve_exact(args.len()).ok()?;
-    let mut found = false;
-    let mut rest = args.trim_start();
-    while !rest.is_empty() {
-        if rest.starts_with("cmdline=") {
-            out.push_str(rest);
-            break;
-        }
-        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        let word = &rest[..end];
-        rest = rest[end..].trim_start();
-        if word == flag {
-            found = true;
-            continue;
-        }
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(word);
-    }
-    Some((out, found))
 }
 
 /// What `delete` did: how many files and folders it took away, and the

@@ -13,10 +13,13 @@
 //! clone, a forward or the host API's edits do, must be read back as that
 //! configuration, every comment of a line of its own still there and in its
 //! order. A command line made a clone's (`without_ip`) keeps every word but
-//! `ip=`'s, in order.
+//! `ip=`'s, in order. And `hv create`'s words with its `force` taken out
+//! (`take_flag`) are every other word in its order and the command line
+//! whole -- once glued to the word before it, which every `hv create` with a
+//! `cmdline=` after another word was refused for.
 
 use crate::targets::Input;
-use crate::vmconfig::{parse, render, rewrite, without_ip, Config, Options};
+use crate::vmconfig::{parse, render, rewrite, take_flag, without_ip, Config, Options};
 
 /// What strings are made of: the plain, and what quoting gets wrong.
 const CHARS: [char; 18] = ['a', 'z', '0', '9', '/', '.', '-', ' ', '"', '\\', '\'', '\n', '\t', '\r', '\u{0}',
@@ -183,8 +186,51 @@ fn round_trip(c: &Config) {
     }
 }
 
+/// Words as `guest::words` reads them: up to `cmdline=`, which takes the
+/// rest of the line -- its end's whitespace aside -- spaces and all.
+fn words_of(line: &str) -> (Vec<&str>, Option<&str>) {
+    let mut words = Vec::new();
+    let mut rest = line.trim_start();
+    while !rest.is_empty() {
+        if let Some(cmdline) = rest.strip_prefix("cmdline=") {
+            return (words, Some(cmdline.trim_end()));
+        }
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        words.push(&rest[..end]);
+        rest = rest[end..].trim_start();
+    }
+    (words, None)
+}
+
 pub fn config_target(r: &mut Input) {
-    match r.u8() % 5 {
+    match r.u8() % 6 {
+        5 => {
+            /* hv create's words, `force` among them or not, and a command
+             * line or not, apart from them by whatever whitespace */
+            let mut line = String::new();
+            for _ in 0..r.below(6) {
+                line.push_str(r.pick(&[" ", "  ", "\t", ""]));
+                line.push_str(r.pick(&["force", "mem=64", "initrd=/x", "cpus=2", "restart", "disk=/d:ro", "forced",
+                                       "noforce", "force=1"]));
+                line.push_str(r.pick(&[" ", "  ", "\t"]));
+            }
+            if r.bool() {
+                line.push_str("cmdline=");
+                line.push_str(&text(r, 30));
+            }
+            let Some((out, found)) = take_flag(&line, "force") else {
+                invariant!(false, "take_flag ran out of memory for {:?}", line);
+                return;
+            };
+            let (words, cmdline) = words_of(&line);
+            let kept: Vec<&str> = words.iter().copied().filter(|w| *w != "force").collect();
+            let (out_words, out_cmdline) = words_of(&out);
+            invariant!(out_words == kept, "{:?} with force taken out has the words {:?}, not {:?}", line, out_words,
+                       kept);
+            invariant!(out_cmdline == cmdline, "{:?} with force taken out has the command line {:?}, not {:?}", line,
+                       out_cmdline, cmdline);
+            invariant!(found == words.contains(&"force"), "{:?}: take_flag said force was there: {}", line, found);
+        }
         3 => {
             /* A hand's vm.toml rewritten to say another configuration: read
              * back as that one, its comments of their own kept in order. */

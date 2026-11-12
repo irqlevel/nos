@@ -289,8 +289,12 @@ impl Vcpu {
         let g = &self.guest;
         let reason = g.exit_reason();
         if reason & vmcs::reason::ENTRY_FAILURE != 0 {
-            /* A VM-entry failure that still took the exit path: bad guest
-             * state, an MSR load, a machine check on entry. */
+            /* A machine check on entry is the host's, raised to its handler
+             * (`hvarch`); the rest of the entry failures -- bad guest
+             * state, an MSR load -- are the guest's state refused. */
+            if reason & vmcs::reason::BASIC_MASK == vmcs::reason::ENTRY_FAIL_MACHINE_CHECK {
+                return Exit::MachineCheck;
+            }
             return Exit::Invalid;
         }
         use vmcs::reason as r;
@@ -462,6 +466,16 @@ impl Vcpu {
         } else {
             0
         };
+        if typ == intr::TYPE_NMI {
+            /* With virtual NMIs the CPU set blocking by NMI as it began to
+             * deliver this one; the delivery never happened, and an entry
+             * that injects an NMI with the bit still set fails its checks
+             * -- the VM stopped for a guest that did nothing wrong. */
+            let bits = self.guest.interruptibility();
+            if bits & vmcs::INTR_BLOCK_NMI != 0 {
+                self.guest.set_interruptibility(bits & !vmcs::INTR_BLOCK_NMI);
+            }
+        }
         self.guest.set_inject(event, errcode);
     }
 
@@ -506,6 +520,9 @@ impl Vcpu {
             || (value & CR0_NW != 0 && value & CR0_CD == 0)
             || (value & CR0_PG != 0 && value & CR0_PE == 0)
             || (pg_on && efer & EFER_LME != 0 && cr4 & CR4_PAE == 0)
+            /* Long mode on from a code segment whose L is set already: the
+             * CPU's #GP, which the entry would otherwise fail on */
+            || (pg_on && efer & EFER_LME != 0 && g.exit_cs_ar() & AR_L != 0)
             /* Paging off from 64-bit code, or with PCIDs on. */
             || (pg_off && (in_64bit || cr4 & CR4_PCIDE != 0));
         if refused {

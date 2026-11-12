@@ -33,8 +33,11 @@ pub const HEADER_BYTES: usize = 0x270;
 
 const BOOT_FLAG: u16 = 0xAA55;
 const HEADER_MAGIC: u32 = 0x5372_6448;
-/// The oldest protocol with a 64-bit entry and a relocatable kernel.
-const MIN_VERSION: u16 = 0x0205;
+/// The oldest protocol every field read here is in: `cmdline_size` is
+/// 2.06's, `pref_address` and `init_size` 2.10's, and the 64-bit entry's
+/// flag in `xloadflags` 2.12's. 2.05 was the floor once, and an older
+/// header passed by its bytes at 0x236 reading zero.
+const MIN_VERSION: u16 = 0x020C;
 const XLF_KERNEL_64: u16 = 1 << 0;
 const LOADFLAGS_LOADED_HIGH: u8 = 1 << 0;
 const LOADER_UNDEFINED: u8 = 0xFF;
@@ -117,7 +120,9 @@ impl Header {
 pub fn zero_page(first: &[u8], header: &Header, cmdline: u64, cmdline_len: usize, initrd: (u64, u64),
                  e820: &[MemEntry], rsdp: u64, page: &mut [u8; ZERO_PAGE_BYTES]) -> Result<(), String>
 {
-    if cmdline_len as u64 >= u64::from(header.cmdline_size) {
+    /* `cmdline_size` is the most characters, the terminating zero not
+     * counted: a line of exactly that many is the kernel's to take */
+    if cmdline_len as u64 > u64::from(header.cmdline_size) {
         return Err(alloc::format!("a command line of {} bytes, and the kernel takes {}", cmdline_len,
                                   header.cmdline_size));
     }

@@ -89,10 +89,10 @@ const MMIO_WINDOW: core::ops::Range<u64> = 0xC000_0000..0x1_0000_0000;
 /// walks the whole window is not probing for a device.
 #[cfg(target_arch = "x86_64")]
 const MAX_ABSENT_PAGES: usize = 64;
-/// The local APIC's page in xAPIC mode. A guest's APIC is an x2APIC, reached
-/// through MSRs, and never this page: a guest that reads it has left x2APIC
-/// mode, and is better stopped at the read, naming the page, than answered
-/// with an APIC whose every register is all ones.
+/// The local APIC's page in xAPIC mode: a guest's APIC reached here, each
+/// access decoded and performed on its emulated registers (`mmio.rs`,
+/// `lapic.rs`) -- never answered with all ones as an absent device's page
+/// is (`map_absent`).
 #[cfg(target_arch = "x86_64")]
 pub const XAPIC_PAGE: u64 = 0xFEE0_0000;
 
@@ -295,13 +295,13 @@ impl GuestMemory {
     /// on hardware that has one and in a guest that does not; all ones is
     /// what it takes for "no such device" and moves on from.
     ///
-    /// A write is not answered this way, nor a read anywhere else: discarding
-    /// a write needs the instruction's length, which is a decoder this
-    /// hypervisor does not have, and a read of an address outside the window
-    /// is a guest's mistake, not a probe. So a write to the page is still a
-    /// nested fault, and stops the guest; so is one read past its RAM. And
-    /// not the local APIC's own page (`XAPIC_PAGE`): a guest's APIC is an
-    /// x2APIC, and one that reads it there has left x2APIC mode.
+    /// A write is not answered this way, nor a read anywhere else: a write to
+    /// nothing is no probe a guest makes, and a read of an address outside
+    /// the window is a guest's mistake -- the decoder (`insn.rs`) could
+    /// step past either, and stopping says more. So a write to the page is
+    /// still a nested fault, and stops the guest; so is one read past its
+    /// RAM. And not the local APIC's own page (`XAPIC_PAGE`), whose accesses
+    /// are the APIC's in xAPIC mode (`run.rs`'s `xapic_access`).
     #[cfg(target_arch = "x86_64")]
     pub fn map_absent(&self, gpa: u64) -> Result<()> {
         let page = gpa & !(PAGE - 1);
