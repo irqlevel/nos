@@ -452,11 +452,11 @@ fn command(state: &State, args: &str, out: &mut Output) {
         "off" => switch(state, words.next(), false, out),
         "run" => run(machine, words.next(), words.next(), out),
         #[cfg(target_arch = "x86_64")]
-        "convert" => image::command(&state.vms_root, rest, &mut Shell { out, unloading: &state.unloading }),
+        "convert" => image::command(&state.vms_root, &state.vms, rest, &mut Shell { out, unloading: &state.unloading }),
         #[cfg(not(target_arch = "x86_64"))]
-        "convert" => image::command("", rest, &mut Shell { out, unloading: &state.unloading }),
+        "convert" => image::command("", &(), rest, &mut Shell { out, unloading: &state.unloading }),
         #[cfg(target_arch = "x86_64")]
-        "devices" => devices::command(&state.vms_root, out),
+        "devices" => devices::command(&state.vms_root, &state.vms, out),
         #[cfg(target_arch = "x86_64")]
         "disk" => devices::disk_command(&state.vms_root, &state.vms, rest, out),
         #[cfg(target_arch = "x86_64")]
@@ -550,7 +550,8 @@ fn forward_command(state: &State, args: &str, out: &mut Output) {
                 let _ = writeln!(out, "hv: the guests' switch is not up");
                 return;
             };
-            match state.forwards.add(port, vm, guest_port, ip, host, &|| state.vms.on_list(vm), out) {
+            let to = forward::To { guest_ip: ip, guest_port, host, outer: state.vms.outer_nic() };
+            match state.forwards.add(port, vm, to, &|| state.vms.on_list(vm), out) {
                 Ok(()) => keep_forward(state, vm, port, Some(guest_port), out),
                 Err(e) => {
                     let _ = writeln!(out, "hv: {}", e);
@@ -590,7 +591,7 @@ fn keep_forward(state: &State, vm: u32, port: u16, guest_port: Option<u16>, out:
         None => store::folder_of(&state.vms_root, &name),
     };
     let kept = folder.and_then(|folder| {
-        store::update(&state.vms.changes, &folder, |c| {
+        store::update(&state.vms, &folder, |c| {
             c.options.forwards.retain(|&(host, _)| host != port);
             if let Some(guest) = guest_port {
                 c.options.forwards.try_reserve(1).map_err(|_| String::from("out of memory"))?;

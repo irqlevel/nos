@@ -56,7 +56,7 @@ use kcore::task::TaskHandle;
 
 use crate::cores::{Cores, Hold};
 use crate::disk::{Claims, Holder, Runner, Wake};
-use crate::forward::Forwards;
+use crate::forward::{self, Forwards};
 use crate::guest::{self, Built, LogLine, NicSpec, Ring, Spec, TermFilter};
 use crate::net::{self, Switch};
 use crate::store::{self, Folder};
@@ -950,11 +950,34 @@ struct Table {
     vms: Vec<Vm>,
     /// The module is on its way out: no VM is added from here on.
     closing: bool,
-    /// Names held while their folders are made, cloned or deleted, with
-    /// what is being done: no VM of one starts, and nothing else of the
-    /// kind is done to it (`Vms::reserve`).
-    reserved: Vec<(String, &'static str)>,
+    /// Names held while their folders are made, cloned, deleted or changed,
+    /// or a VM of one is started: no VM of one starts, and nothing else of
+    /// the kind is done to it (`Vms::reserve`).
+    reserved: Vec<Reservation>,
 }
+
+/// A name held (`Table::reserved`): what is being done to its folder -- one
+/// of `MADE`, `CLONED`, `DELETED`, `CHANGED`, `STARTED` -- and what a VM
+/// being made or cloned has been given before its vm.toml says so: a port
+/// of the switch and devices, by their ids, which no other make, clone or
+/// change is given meanwhile (`Vms::ports_held`, `Vms::devices_given`). Two
+/// clones at once were given one port -- one MAC, one address -- and two
+/// makes one device, each checking only the vm.tomls written so far.
+struct Reservation {
+    name: String,
+    doing: &'static str,
+    port: Option<u32>,
+    devices: Vec<String>,
+}
+
+/// What a name is held for (`Vms::reserve`): said as "<name> is being
+/// <what>", and `DELETED` looked for by a change of a vm.toml
+/// (`store::update`), which a delete under way refuses.
+pub(crate) const MADE: &str = "made";
+pub(crate) const CLONED: &str = "cloned";
+pub(crate) const DELETED: &str = "deleted";
+pub(crate) const CHANGED: &str = "changed";
+const STARTED: &str = "started";
 
 /// Names held at once, at most: folders made, cloned -- each clone holds
 /// two -- and deleted together.
@@ -986,14 +1009,47 @@ pub struct Reserved<'a> {
 }
 
 impl Reserved<'_> {
+    /// The name it holds.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// The hold given up to the VM it was taken for, as that VM goes on the
     /// list -- in `table`, the same step: the name is the listed VM's from
     /// there, and no moment is left between the two for another to take it.
     /// What it held, to be freed off the lock; nothing left for the drop.
-    fn hand_over(&mut self, table: &mut Table) -> Option<(String, &'static str)> {
-        let at = table.reserved.iter().position(|(n, _)| *n == self.name);
+    fn hand_over(&mut self, table: &mut Table) -> Option<Reservation> {
+        let at = table.reserved.iter().position(|r| r.name == self.name);
         self.name.clear();
         at.map(|i| table.reserved.swap_remove(i))
+    }
+
+    /// Port `port` of the switch given to the VM this holds the name of,
+    /// until its vm.toml says so -- this goes once it is written: no other
+    /// make or clone is given it meanwhile (`Vms::ports_held`). Under the
+    /// lock of the vm.toml changes, which the look for a free port is made
+    /// under too (`store::take_port`).
+    pub fn keep_port(&self, port: u32) {
+        let mut table = self.vms.table.lock();
+        if let Some(r) = table.reserved.iter_mut().find(|r| r.name == self.name) {
+            r.port = Some(port);
+        }
+    }
+
+    /// The devices, by their ids, given to the VM this holds the name of,
+    /// until its vm.toml says so: what `devices::check` refuses another
+    /// meanwhile. Under the lock of the vm.toml changes, as the checks were
+    /// made (`store::give_devices`).
+    pub fn keep_devices(&self, ids: Vec<String>) {
+        let had = {
+            let mut table = self.vms.table.lock();
+            match table.reserved.iter_mut().find(|r| r.name == self.name) {
+                Some(r) => core::mem::replace(&mut r.devices, ids),
+                None => ids,
+            }
+        };
+        /* Freed off the lock. */
+        drop(had);
     }
 }
 
@@ -1004,7 +1060,7 @@ impl Drop for Reserved<'_> {
         }
         let gone = {
             let mut table = self.vms.table.lock();
-            table.reserved.iter().position(|(n, _)| *n == self.name).map(|i| table.reserved.swap_remove(i))
+            table.reserved.iter().position(|r| r.name == self.name).map(|i| table.reserved.swap_remove(i))
         };
         /* Freed off the lock. */
         drop(gone);
@@ -1118,11 +1174,11 @@ impl Vms {
         self.claims.clone()
     }
 
-    /// `name` held for what is done to its folder -- `what`: "made",
-    /// "cloned", "deleted" -- until the hold goes: no VM of it starts
-    /// meanwhile, and nothing else of the kind is done to it. Refused while
-    /// a VM of the name is on the list, the name is held already, or the
-    /// module is going.
+    /// `name` held for what is done to its folder -- `what`: `MADE`,
+    /// `CLONED`, `DELETED`, `CHANGED` -- until the hold goes: no VM of it
+    /// starts meanwhile, and nothing else of the kind is done to it. Refused
+    /// while a VM of the name is on the list, the name is held already, or
+    /// the module is going.
     pub fn reserve(&self, name: &str, what: &'static str) -> Result<Reserved<'_>, String> {
         let mut kept = String::new();
         let mut held = String::new();
@@ -1144,13 +1200,13 @@ impl Vms {
                 Some(No::Closing)
             } else if let Some(vm) = table.vms.iter().find(|vm| vm.name.as_deref() == Some(name)) {
                 Some(No::Listed(vm.shared.id))
-            } else if let Some((_, doing)) = table.reserved.iter().find(|(n, _)| n == name) {
-                Some(No::Doing(doing))
+            } else if let Some(r) = table.reserved.iter().find(|r| r.name == name) {
+                Some(No::Doing(r.doing))
             } else if table.reserved.len() >= MAX_RESERVED {
                 Some(No::Full)
             } else {
                 /* Into the room taken when the table was made. */
-                table.reserved.push((kept, what));
+                table.reserved.push(Reservation { name: kept, doing: what, port: None, devices: Vec::new() });
                 None
             }
         };
@@ -1188,7 +1244,7 @@ impl Vms {
                 }
                 None => {
                     /* Into the room taken when the table was made. */
-                    table.reserved.push((kept, "started"));
+                    table.reserved.push(Reservation { name: kept, doing: STARTED, port: None, devices: Vec::new() });
                     None
                 }
             }
@@ -1208,7 +1264,29 @@ impl Vms {
 
     /// What is being done to the folder of `name`, if it is held.
     pub fn doing(&self, name: &str) -> Option<&'static str> {
-        self.table.lock().reserved.iter().find(|(n, _)| n == name).map(|&(_, doing)| doing)
+        self.table.lock().reserved.iter().find(|r| r.name == name).map(|r| r.doing)
+    }
+
+    /// The devices given to VMs being made, cloned or changed -- all but
+    /// `except`'s -- whose vm.tomls do not say so yet (`Reserved::keep_devices`):
+    /// each VM's name and a device's id. What fits in memory.
+    pub fn devices_given(&self, except: &str) -> Vec<(String, String)> {
+        let mut given = Vec::new();
+        let table = self.table.lock();
+        for r in table.reserved.iter().filter(|r| r.name != except) {
+            for id in &r.devices {
+                let (mut n, mut i) = (String::new(), String::new());
+                if given.try_reserve(1).is_err() || n.try_reserve_exact(r.name.len()).is_err()
+                    || i.try_reserve_exact(id.len()).is_err()
+                {
+                    return given;
+                }
+                n.push_str(&r.name);
+                i.push_str(id);
+                given.push((n, i));
+            }
+        }
+        given
     }
 
     /// A running VM with a CPU on a host CPU in `mask`, if there is one, and
@@ -1330,7 +1408,7 @@ impl Vms {
         if let Some(vm) = table.vms.iter().find(|vm| vm.name.as_deref() == Some(n)) {
             return Some(Taken::Listed(vm.shared.id));
         }
-        table.reserved.iter().find(|(r, _)| r == n).map(|&(_, doing)| Taken::Doing(doing))
+        table.reserved.iter().find(|r| r.name == n).map(|r| Taken::Doing(r.doing))
     }
 
     /// Start the guest `spec` describes -- from its folder, given one, and
@@ -1404,7 +1482,7 @@ impl Vms {
         if spec.uuid.is_none() {
             let mut uuid = guest::random_uuid();
             if let Some((folder, _)) = &stored {
-                match store::keep_uuid(&self.changes, folder, uuid) {
+                match store::keep_uuid(self, folder, uuid) {
                     /* Ours, or one a start at the same moment kept first */
                     Ok(kept) => uuid = kept,
                     Err(e) => {
@@ -1575,10 +1653,11 @@ impl Vms {
         /* nos's ports it asks for, relayed to its own: each said as it is
          * added, or why not -- the guest runs either way. */
         if let (Some(port), Some(host)) = (port, self.host_nic()) {
+            let outer = self.outer_nic();
             for (host_port, guest_port) in wanted {
                 let listed = || self.on_list(id);
-                if let Err(e) = forwards.add(host_port, id, guest_port, net::port_ip(port), host.clone(), &listed, out)
-                {
+                let to = forward::To { guest_ip: net::port_ip(port), guest_port, host, outer };
+                if let Err(e) = forwards.add(host_port, id, to, &listed, out) {
                     let _ = writeln!(out, "hv: {}", e);
                 }
             }
@@ -2102,7 +2181,7 @@ impl Vms {
             let _ = writeln!(out, "hv stop <id|name|all> [secs=N]");
             return;
         }
-        match self.stop_vm(word, secs, forwards, &|| false) {
+        match self.stop_vm(word, secs, forwards, &|| false, &|| false) {
             Ok(s) => {
                 let _ = writeln!(out, "hv: vm {} stopped -- {}{}", s.id, s.reason, s.asked);
                 if s.forwarded != 0 {
@@ -2119,9 +2198,11 @@ impl Vms {
     /// The VM `word` names stopped (`stop`), given `secs` to turn itself off
     /// once its power button is pressed -- 0 to stop it where it is, and
     /// stopped there too once `give_up` says so: how it ended, or why it was
-    /// not stopped here.
-    pub fn stop_vm(&self, word: &str, secs: u64, forwards: &Forwards, give_up: &dyn Fn() -> bool)
-                   -> Result<Stopped, String> {
+    /// not stopped here. Once `left` says so -- a person's cancel of the
+    /// stop, not the module's going -- the wait ends and the guest is left
+    /// as it is, turning itself off or not, for another stop to end.
+    pub fn stop_vm(&self, word: &str, secs: u64, forwards: &Forwards, give_up: &dyn Fn() -> bool,
+                   left: &dyn Fn() -> bool) -> Result<Stopped, String> {
         let id = self.id_of(word)?;
         /* On the list while its power button has its time: its CPUs are
          * still in use, and an unload has to see it. */
@@ -2134,7 +2215,12 @@ impl Vms {
             /* An unload meanwhile gives it its own time, and whichever of
              * the two runs out first takes it off the list: this wait ends
              * there too, the guest no longer running. */
-            wait_shut_down(secs, || shared.shutting_down() && !give_up());
+            wait_shut_down(secs, || shared.shutting_down() && !give_up() && !left());
+            if left() && !give_up() && shared.running() {
+                shared.stopping.store(false, Ordering::Release);
+                return Err(crate::work::stopped_leaving(&alloc::format!("vm {} is left running, its power button \
+                                                                         pressed", id)));
+            }
         }
         let asked = shared.asked();
         let vm = {
@@ -2340,16 +2426,24 @@ impl Vms {
         self.switch.lock().as_ref().and_then(|s| s.host_nic())
     }
 
-    /// The ports of the switch the VMs on the list hold.
-    pub fn ports_held(&self) -> Vec<usize> {
+    /// The device the guests go out through, while NAT is on: what `hv
+    /// forward` listens on (`Switch::outer_nic`).
+    pub fn outer_nic(&self) -> Option<kcore::net::Nic> {
+        self.switch.lock().as_ref().and_then(|s| s.outer_nic())
+    }
+
+    /// The ports of the switch the VMs on the list hold, and those given to
+    /// VMs being made or cloned whose vm.tomls do not say so yet
+    /// (`Reserved::keep_port`). None out of memory: no port is known free.
+    pub fn ports_held(&self) -> Option<Vec<usize>> {
         let mut ports = Vec::new();
-        if ports.try_reserve_exact(MAX_VMS).is_err() {
-            return ports;
-        }
+        ports.try_reserve_exact(MAX_VMS + MAX_RESERVED).ok()?;
         let table = self.table.lock();
-        /* Into the room taken above: the table holds MAX_VMS at most. */
+        /* Into the room taken above: the table holds MAX_VMS at most, and
+         * MAX_RESERVED holds. */
         ports.extend(table.vms.iter().filter_map(|vm| vm.port));
-        ports
+        ports.extend(table.reserved.iter().filter_map(|r| r.port).map(|p| p as usize));
+        Some(ports)
     }
 
     /// The name of VM `id`, when it was started from its folder.
@@ -2362,13 +2456,13 @@ impl Vms {
         Some(copy)
     }
 
-    /// The address of the running VM `id`, when it has a NIC.
     /// Whether VM `id` is on the list: what `Forwards::add` asks, under its
     /// own lock, as a forward to it goes in.
     pub fn on_list(&self, id: u32) -> bool {
         self.table.lock().vms.iter().any(|vm| vm.shared.id == id)
     }
 
+    /// The address of the running VM `id`, when it has a NIC.
     pub fn address_of(&self, id: u32) -> Option<u32> {
         let table = self.table.lock();
         table.vms.iter().find(|vm| vm.shared.id == id && vm.shared.running())

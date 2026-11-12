@@ -27,6 +27,19 @@ pub struct Found {
     pub label: Option<String>,
 }
 
+/// What a device holds whose start is not all zeros but none of the kinds
+/// this knows.
+pub const UNRECOGNIZED: &str = "data nos does not recognize";
+
+impl Found {
+    /// Whether it is a kind this knows -- a filesystem, a partition table, a
+    /// RAID or LVM member, an encrypted volume -- and not bytes of no kind:
+    /// what tells a raw disk's image from a page of HTML (hv's pour).
+    pub fn recognized(&self) -> bool {
+        self.what != UNRECOGNIZED
+    }
+}
+
 impl core::fmt::Display for Found {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match &self.label {
@@ -175,7 +188,7 @@ pub fn contents(head: &[u8], tail: &[u8], size: u64) -> Option<Found> {
         return found("an MBR partition table", None);
     }
     if h.iter().any(|&b| b != 0) {
-        return found("data nos does not recognize", None);
+        return found(UNRECOGNIZED, None);
     }
     None
 }

@@ -14,7 +14,8 @@ Two boots of nos.iso over one root, two NVMe drives beside it:
     partition its GUID, a disk its model and serial -- and say what is on
     it; `hv create` refuses the EFI System partition outright and the ext4
     without force, gives p2 to d1 and the whole of B to d3 by their ids,
-    and refuses the whole of A, which overlaps d1's p2; `hv convert` refuses
+    refuses the whole of A outright -- the EFI System partition is on it --
+    and p2 to another VM, d1's vm.toml naming it; `hv convert` refuses
     p4 for the bytes on it and pours a qcow2 image onto it with force --
     the host holds p4 to the image byte for byte after, its holes zeros
     over the 0xFF; hvboot, booted on p2 by name, reads it and finds nothing
@@ -204,6 +205,7 @@ FIRST = [
     "hv disk detach d3 dev:nvme04",                             # 19
     "hv clone d1 d4",                                           # 20
     "hv devices",                                               # 21
+    "hv create d5 /hvboot mem=64 disk=dev:nvme02",              # 22
 ]
 
 # The second's, the drives the other way round.
@@ -309,12 +311,15 @@ def first_checks(o, a, image):
     pt.check("hv devices: p4's bytes something nos does not recognize",
              "data nos does not recognize" in line_of(dev, "nvme04"), dev)
     pt.check("hv devices: the root held by its mount", "held by" in line_of(dev, "vda"), dev)
+    pt.check("hv devices: the whole of A holds the EFI System partition, never given",
+             "nvme03, an EFI System partition: never given" in line_of(dev, "nvme0"), dev)
     pt.check("an EFI System partition refused outright", "the machine boots from it" in o[2], o[2])
     pt.check("the ext4 refused without force, what is on it said",
              "holds an ext4 filesystem" in o[3] and "force" in o[3] and "written" not in o[3], o[3])
     pt.check("p2 given to d1", "written" in o[4], o[4])
     pt.check("d1's vm.toml names p2 by its id, not its name", id_a(1) in o[5] and "nvme02" not in o[5], o[5])
-    pt.check("the whole of A refused: it overlaps d1's p2", "vm d1's disk already" in o[6], o[6])
+    pt.check("the whole of A refused outright: the EFI System partition is on it",
+             "holds nvme03" in o[6] and "the machine boots from it" in o[6] and "written" not in o[6], o[6])
     pt.check("the whole of B given to d3", "written" in o[7], o[7])
     pt.check("d3's vm.toml names B by its model and serial", ID_B in o[8], o[8])
     pt.check("hv convert refuses p4 for the bytes on it", "does not recognize" in o[9] and "force" in o[9], o[9])
@@ -328,6 +333,8 @@ def first_checks(o, a, image):
              "cannot boot" in o[11] and "the guest powered itself off" in o[11], o[11])
     pt.check("d1 starts on p2", re.search(r"hv: vm \d+ \(d1\) started", o[12]) is not None, o[12])
     pt.check("hv devices: p2 held by d1 while it runs", "held by vm d1's disk" in line_of(o[13], "nvme02"), o[13])
+    pt.check("hv devices: the whole of A in use by d1 on p2, nothing on it read",
+             "in use by vm d1's disk" in line_of(o[13], "nvme0") and "holds a" not in line_of(o[13], "nvme0"), o[13])
     pt.check("a write of the shell's to p2 is refused while d1 has it", "in use by vm d1's disk" in o[14], o[14])
     pt.check("p4 refused to d3 without force: the image is on it", "force" in o[16] and "now" not in o[16], o[16])
     pt.check("p4 attached to d3 with force", "d3's disk now" in o[17], o[17])
@@ -335,6 +342,8 @@ def first_checks(o, a, image):
     pt.check("p4 detached from d3, left as it is", "taken off d3's vm.toml" in o[19], o[19])
     pt.check("a clone of d1 refused: its disk is a device", "a device of nos's" in o[20], o[20])
     pt.check("hv devices: p2 let go once d1 stopped", "held by" not in line_of(o[21], "nvme02"), o[21])
+    pt.check("p2 refused to d5: d1's vm.toml names it", "vm d1's disk already" in o[22] and "written" not in o[22],
+             o[22])
 
 
 def second_checks(o):

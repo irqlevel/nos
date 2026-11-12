@@ -846,20 +846,42 @@ pub mod ipv6 {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum Upper {
         /// This protocol's header, at this offset in the packet -- in its
-        /// first fragment, if a fragment header came before it.
+        /// first fragment, if a fragment header came before it, and then
+        /// the whole of it there, where its size is known (`upper_len`).
         Found { protocol: u8, at: usize, fragment: bool },
         /// A fragment past the first: what it carries is the first's to say.
         LaterFragment,
-        /// The chain runs past the packet, or past `CHAIN_MAX` headers, and
-        /// so hides what it carries -- which a packet that passes a check of
-        /// what it carries must not do (RFC 7112): one that does is dropped.
+        /// The chain runs past the packet, or past `CHAIN_MAX` headers, or
+        /// a first fragment stops short of the end of the upper header it
+        /// names, and so hides what it carries -- which a packet that passes
+        /// a check of what it carries must not do (RFC 7112): one that does
+        /// is dropped.
         Hidden,
     }
+
+    /// The least an upper header the switch and its checks look into takes,
+    /// which a first fragment holds whole (RFC 7112): UDP's 8 bytes, TCP's
+    /// 20, an ICMPv6 message's type, code and checksum. 0 for any other,
+    /// whose header nothing here reads.
+    fn upper_len(protocol: u8) -> usize {
+        match protocol {
+            super::IP_PROTO_UDP => super::UDP_HDR_LEN,
+            super::IP_PROTO_TCP => super::tcp::HDR_LEN,
+            super::IP_PROTO_ICMPV6 => ICMPV6_HDR_LEN,
+            _ => 0,
+        }
+    }
+
+    /// An ICMPv6 message's header: its type, its code and its checksum.
+    const ICMPV6_HDR_LEN: usize = 4;
 
     /// What `pkt` -- a packet from its IPv6 header on -- carries: the chain
     /// of hop-by-hop, routing, destination options, fragment and
     /// authentication headers walked to the first header that is none of
-    /// them, every one of them inside the packet.
+    /// them, every one of them inside the packet -- and in a first
+    /// fragment, the upper header too: one that ended where a UDP header
+    /// began got past the switch's look at its source port, the later
+    /// fragment that held it being held to its sender's address alone.
     pub fn upper(pkt: &[u8]) -> Upper {
         if pkt.len() < IPV6_HDR_LEN {
             return Upper::Hidden;
@@ -887,7 +909,12 @@ pub mod ipv6 {
                     fragment = true;
                     8
                 }
-                protocol => return Upper::Found { protocol, at, fragment },
+                protocol => {
+                    if fragment && pkt.len() < at + upper_len(protocol) {
+                        return Upper::Hidden;
+                    }
+                    return Upper::Found { protocol, at, fragment };
+                }
             };
             if pkt.len() < at + len {
                 return Upper::Hidden;
