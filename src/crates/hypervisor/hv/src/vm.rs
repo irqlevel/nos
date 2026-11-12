@@ -320,6 +320,11 @@ impl Backend {
     pub fn clear_irq_window(&mut self) {
         match self { Backend::Svm(v) => v.clear_irq_window(), Backend::Vmx(v) => v.clear_irq_window() }
     }
+    /// Stop the guest when its task priority drops below `class`, an
+    /// interrupt of it held by the TPR alone ([`crate::lapic::Lapic::held_by_tpr`]).
+    pub fn request_tpr_window(&mut self, class: u8) {
+        match self { Backend::Svm(v) => v.request_tpr_window(class), Backend::Vmx(v) => v.request_tpr_window(class) }
+    }
     pub fn interruptible(&self) -> bool {
         match self { Backend::Svm(v) => v.interruptible(), Backend::Vmx(v) => v.interruptible() }
     }

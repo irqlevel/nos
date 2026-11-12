@@ -150,4 +150,39 @@ impl<T> CpuLocal<T> {
         unsafe { crate::cpu::irq_restore(flags) };
         result
     }
+
+    /// `with`, and then `after` with what `work` handed it: on the same
+    /// CPU, with interrupts and preemption still off since before `work`,
+    /// but the slot let go of -- for a step that has to come on this CPU
+    /// before anything else runs there, and that may itself reach the slot
+    /// (an interrupt handler `after` runs, whose IPI asks for it). Nothing
+    /// runs `after` where `work` did not run. VT-x's entry hands the host's
+    /// interrupt an exit acknowledged to its handler so (`hvarch`'s
+    /// `vmx::Guest::run`).
+    #[inline]
+    pub fn with_then<R, S>(&self, work: impl FnOnce(&mut T, usize) -> (R, S), after: impl FnOnce(S))
+        -> Option<R>
+    {
+        let flags = crate::cpu::irq_save();
+
+        let cpu = crate::cpu::id() as usize;
+        let done = match self.slots.get(cpu) {
+            Some(slot) if !slot.busy.load(Ordering::Relaxed) => {
+                slot.busy.store(true, Ordering::Relaxed);
+                /* As in `with`: this CPU's slot, and not inside another */
+                let done = work(unsafe { &mut *slot.value.get() }, cpu);
+                slot.busy.store(false, Ordering::Relaxed);
+                Some(done)
+            }
+            _ => None,
+        };
+        let result = done.map(|(result, then)| {
+            after(then);
+            result
+        });
+
+        /* The flags `irq_save` returned a few lines up, on this CPU. */
+        unsafe { crate::cpu::irq_restore(flags) };
+        result
+    }
 }

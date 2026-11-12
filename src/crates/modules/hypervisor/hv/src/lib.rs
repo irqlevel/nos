@@ -687,6 +687,13 @@ fn speculation(out: &mut Output, hardware: u64) {
         let _ = writeln!(out, "hv: a core's two threads share their branch predictors here, and the CPU has no STIBP to \
                                keep them apart");
     }
+    if a.zenbleed_fix {
+        let _ = writeln!(out, "hv: a Zen 2 with microcode older than AMD's Zenbleed fix: DE_CFG's FP backup fix set \
+                               while the extension is on -- a guest reads no other's vector registers");
+    } else if a.zenbleed {
+        let _ = writeln!(out, "hv: this CPU is open to Zenbleed: its microcode predates the fix, and DE_CFG's FP backup \
+                               fix is not set");
+    }
     let i = r.intel;
     let bhi = if i.bhi_dis_s { ", and BHI_DIS_S: nor by the branch history a guest leaves" } else { "" };
     match i.ibrs {

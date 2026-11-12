@@ -664,6 +664,22 @@ impl Lapic {
         (vector >> 4 > self.ppr() >> 4).then_some(vector)
     }
 
+    /// The class of the highest interrupt requested that the task priority
+    /// alone holds back -- one nothing in service is above: what a lowering
+    /// of the task priority has to stop the guest for, where the `mov` to
+    /// CR8 does not (AMD-V's V_TPR, VT-x's TPR shadow), or it waits for the
+    /// guest's next exit of any other kind -- a host tick. None when the
+    /// highest is let through, or is held by what is in service, whose EOI
+    /// stops the guest anyway.
+    pub fn held_by_tpr(&self) -> Option<u8> {
+        if !self.software_enabled() {
+            return None;
+        }
+        let class = highest(&self.irr)? >> 4;
+        let isrv = highest(&self.isr).unwrap_or(0) >> 4;
+        (class > isrv && class <= self.tpr >> 4).then_some(class)
+    }
+
     /// `vector` was injected: out of the request register and into service,
     /// until the guest's EOI.
     pub fn acknowledge(&mut self, vector: u8) {

@@ -907,7 +907,15 @@ impl Guest {
             /* Here, with interrupts off, so that the CPU the ASID is for is
              * the CPU `vmrun` runs on. Never 0, the host's: `vmrun` refuses
              * that itself, and the refusal hands the guest nothing. */
-            let (asid, mut control) = entries.asids.assign(tag, cpu, nested.id).ok_or(NotRun::Off { cpu })?;
+            let Some((asid, mut control)) = entries.asids.assign(tag, cpu, nested.id) else {
+                /* Past `entering`: not in the guest after all, as each of
+                 * VT-x's late refusals says -- or a notification sent now
+                 * would be taken for delivered. */
+                if let Some(k) = kick {
+                    k.left();
+                }
+                return Err(NotRun::Off { cpu });
+            };
             if flush_always {
                 control = vmcb::tlb::FLUSH_ALL;
             }
@@ -959,7 +967,10 @@ impl Guest {
                         vmcb.get_mut().save.spec_ctrl = value;
                         Some(value)
                     }
-                    None => entries.spec.load_guest(msrs.spec_ctrl()),
+                    None => {
+                        let meant = entries.spec.load_guest(msrs.spec_ctrl());
+                        if msrs.measuring() { entries.spec.read_spec_ctrl() } else { meant }
+                    }
                 };
                 msrs.ran(spec_ctrl);
 
