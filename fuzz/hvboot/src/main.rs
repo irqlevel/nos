@@ -30,18 +30,6 @@ mod gpt;
 mod ext;
 #[path = "../../../src/crates/hypervisor/hvboot/src/grub.rs"]
 mod grub;
-#[path = "../../../src/crates/hypervisor/hvboot/src/bzimage.rs"]
-mod bzimage;
-
-/// What bzimage.rs reaches of the start info: the memory map's entry.
-mod start {
-    #[derive(Clone, Copy, Debug)]
-    pub struct MemEntry {
-        pub addr: u64,
-        pub size: u64,
-        pub kind: u32,
-    }
-}
 
 const SECTOR: u64 = 512;
 const CONFIGS: [&str; 4] = ["/boot/grub/grub.cfg", "/grub/grub.cfg", "/boot/grub2/grub.cfg", "/grub2/grub.cfg"];
@@ -245,16 +233,19 @@ fn boot(disk: &mut Disk, entry_spec: Option<&str>) -> Result<Boot, String> {
         }
         initrd.extend(fs.read_all(&i, 2 << 30)?);
     }
-    let header = bzimage::Header::parse(&kernel)?;
+    let header = bzimage::Header::parse(&kernel).map_err(|e| e.to_string())?;
     let mut line = format!("BOOT_IMAGE={}", kernel_path);
     for a in &entry.args {
         line.push(' ');
         line.push_str(a);
     }
     let mut page = [0u8; bzimage::ZERO_PAGE_BYTES];
-    let map = [start::MemEntry { addr: 0, size: 0x9FC00, kind: 1 }, start::MemEntry { addr: 1 << 20, size: 1 << 30, kind: 1 }];
-    bzimage::zero_page(&kernel, &header, 0x2000, line.len(), (0x3000_0000, initrd.len() as u64), &map, 0xE0000,
-                       &mut page)?;
+    let map = [bzimage::E820Entry { addr: 0, size: 0x9FC00, kind: bzimage::E820_RAM },
+               bzimage::E820Entry { addr: 1 << 20, size: 1 << 30, kind: bzimage::E820_RAM }];
+    let initrd_len = u32::try_from(initrd.len()).map_err(|_| format!("an initrd of {} bytes", initrd.len()))?;
+    let loaded = bzimage::Loaded { cmdline: 0x2000, cmdline_len: line.len(), initrd: (0x3000_0000, initrd_len),
+                                   rsdp: 0xE0000 };
+    bzimage::zero_page(&kernel, &header, &loaded, &map, &mut page).map_err(|e| e.to_string())?;
     let name = match fss[at].part { Some(p) => format!("part {}", p), None => String::from("whole disk") };
     Ok(Boot { config: format!("{} {}", name, path), title: entry.title.clone(), why, kernel, initrd, line, cleared })
 }

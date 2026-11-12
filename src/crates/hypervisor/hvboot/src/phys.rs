@@ -6,7 +6,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::start::{MemEntry, E820_RAM};
+use bzimage::{E820Entry, E820_RAM};
 
 /// The identity map's reach (`pvh_entry` maps 4 GiB).
 const MAPPED: u64 = 1 << 32;
@@ -35,7 +35,7 @@ pub struct Ram {
 }
 
 impl Ram {
-    pub fn new(map: &[MemEntry], image: (u64, u64)) -> Ram {
+    pub fn new(map: &[E820Entry], image: (u64, u64)) -> Ram {
         let ram = map.iter().filter(|e| e.kind == E820_RAM).filter_map(|e| Some((e.addr, e.addr.checked_add(e.size)?)))
             .collect();
         Ram { ram, image, lent: Vec::new() }

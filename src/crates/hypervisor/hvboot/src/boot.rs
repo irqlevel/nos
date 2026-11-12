@@ -8,7 +8,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::Infallible;
 
-use crate::bzimage::{self, Header, ENTRY64_OFFSET, HEADER_BYTES, ZERO_PAGE_BYTES};
+use bzimage::{Header, Loaded, E820_RAM, ENTRY64_OFFSET, HEADER_BYTES, ZERO_PAGE_BYTES};
+
 use crate::disk::Part;
 use crate::ext::{Fs, Inode};
 use crate::gpt::{self, Kind, Partition, TYPE_XBOOTLDR};
@@ -210,7 +211,7 @@ fn open(disks: &mut [Disk], f: &Found, path: &str) -> Result<Inode, String> {
 pub fn run(start_info: u64) -> Result<Infallible, String> {
     let si = StartInfo::read(start_info)?;
     let opts = Options::parse(&si.cmdline)?;
-    let ram_bytes: u64 = si.memmap.iter().filter(|e| e.kind == crate::start::E820_RAM).map(|e| e.size).sum();
+    let ram_bytes: u64 = si.memmap.iter().filter(|e| e.kind == E820_RAM).map(|e| e.size).sum();
     say!("started by PVH: {} MiB of RAM, its command line \"{}\"", ram_bytes >> 20, si.cmdline);
     let mut ram = Ram::new(&si.memmap, crate::image_range());
     let t0 = rdtsc();
@@ -306,7 +307,15 @@ pub fn run(start_info: u64) -> Result<Infallible, String> {
     cmdline.push(0);
     let cmdline: &'static [u8] = cmdline.leak();
     let page: &'static mut [u8; ZERO_PAGE_BYTES] = alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; ZERO_PAGE_BYTES]));
-    bzimage::zero_page(&first, &header, cmdline.as_ptr() as u64, line.len(), initrd, &si.memmap, si.rsdp, page)?;
+    /* The zero page by the copy hv makes a guest's with (`bzimage`), the
+     * three addresses it holds 32 bits wide. */
+    let (Ok(cmdline_at), Ok(initrd_at), Ok(initrd_len)) =
+        (u32::try_from(cmdline.as_ptr() as u64), u32::try_from(initrd.0), u32::try_from(initrd.1))
+    else {
+        return Err(String::from("a command line or an initrd above 4 GiB"));
+    };
+    let loaded = Loaded { cmdline: cmdline_at, cmdline_len: line.len(), initrd: (initrd_at, initrd_len), rsdp: si.rsdp };
+    bzimage::zero_page(&first, &header, &loaded, &si.memmap, page).map_err(|e| alloc::format!("{}", e))?;
 
     let t1 = rdtsc();
     say!("{}{}: boot protocol {}.{:02}, {} KiB at {:#x}{}, initrd {} KiB at {:#x}, read in {} ms", name(&fss[kfs]),

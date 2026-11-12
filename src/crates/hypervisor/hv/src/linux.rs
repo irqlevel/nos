@@ -27,7 +27,16 @@
 //! BIOS area (`crate::acpi`): the zero page points at them, and the memory
 //! map reserves the area.
 
+use alloc::vec::Vec;
+
+use bzimage::{Loaded, E820_RAM, E820_RESERVED, ENTRY64_OFFSET, ZERO_PAGE_BYTES};
 use hvarch::{Error, Result};
+
+/// The setup header, as `bzimage` reads it: what a guest's kernel is
+/// planned (`plan`) and built (`build`) by.
+pub use bzimage::Header;
+/// An entry of the memory map: e820's, which PVH's start info carries too.
+pub(crate) use bzimage::E820Entry;
 
 use crate::acpi::Route;
 use crate::devices::ioapic;
@@ -35,49 +44,6 @@ use crate::lapic;
 use crate::memory::GuestMemory;
 use crate::svm::LongMode;
 use crate::vm::Backend;
-
-/* Offsets into the setup header / boot_params (they share a layout from
- * 0x1f1 on). From boot.rst and arch/x86/include/uapi/asm/bootparam.h. */
-const HDR_SETUP_SECTS: usize = 0x1f1;
-const HDR_BOOT_FLAG: usize = 0x1fe;
-const HDR_HEADER_MAGIC: usize = 0x202;
-const HDR_VERSION: usize = 0x206;
-const HDR_TYPE_OF_LOADER: usize = 0x210;
-const HDR_LOADFLAGS: usize = 0x211;
-const HDR_RAMDISK_IMAGE: usize = 0x218;
-const HDR_RAMDISK_SIZE: usize = 0x21c;
-const HDR_HEAP_END_PTR: usize = 0x224;
-const HDR_CMD_LINE_PTR: usize = 0x228;
-const HDR_INITRD_ADDR_MAX: usize = 0x22c;
-const HDR_KERNEL_ALIGNMENT: usize = 0x230;
-const HDR_RELOCATABLE: usize = 0x234;
-const HDR_XLOADFLAGS: usize = 0x236;
-const HDR_CMDLINE_SIZE: usize = 0x238;
-const HDR_PREF_ADDRESS: usize = 0x258;
-const HDR_INIT_SIZE: usize = 0x260;
-/// The last byte the header end is measured from.
-const HDR_LEN_AT: usize = 0x201;
-
-/// `boot_flag`, the 0xAA55 that says this is a kernel image at all.
-const BOOT_FLAG: u16 = 0xAA55;
-/// `header`, "HdrS": what says the boot protocol is 2.00 or newer.
-const HEADER_MAGIC: u32 = 0x5372_6448;
-/// The oldest protocol every field read here is in: `cmdline_size` is
-/// 2.06's, `pref_address` and `init_size` 2.10's, and the 64-bit entry's
-/// flag in `xloadflags` 2.12's. 2.05 was the floor once, and an older
-/// header passed by its bytes at 0x236 reading zero.
-const MIN_VERSION: u16 = 0x020C;
-/// `xloadflags` bit 0: the kernel has a 64-bit entry point.
-const XLF_KERNEL_64: u16 = 1 << 0;
-/// `loadflags` bit 0: the protected-mode kernel is loaded high (at 1 MiB or
-/// above), which the 64-bit protocol always is.
-const LOADFLAGS_LOADED_HIGH: u8 = 1 << 0;
-/// `type_of_loader`: an undefined boot loader, which is what this is as far
-/// as the kernel needs to know.
-const LOADER_UNDEFINED: u8 = 0xFF;
-
-/// The 64-bit entry point is the loaded kernel's start plus this.
-const ENTRY64_OFFSET: u64 = 0x200;
 
 /* The guest's fixed furniture, all in the first 640 KiB -- identity-mapped,
  * and clear of the kernel at pref_address (16 MiB) and of the initrd, which
@@ -196,16 +162,6 @@ const ISA_CASCADE: u8 = 2;
 /// The most PCI functions the table routes.
 const MP_MAX_PCI: usize = 8;
 
-/* boot_params: where the ACPI RSDP is (protocol 2.14; padding to an older
- * kernel, which scans the BIOS area for it), and the e820 map. */
-const BP_ACPI_RSDP_ADDR: usize = 0x070;
-const BP_E820_ENTRIES: usize = 0x1e8;
-const BP_E820_TABLE: usize = 0x2d0;
-const E820_ENTRY_BYTES: usize = 20;
-const E820_MAX_ENTRIES: usize = 128;
-const E820_RAM: u32 = 1;
-const E820_RESERVED: u32 = 2;
-
 /* Guest page-table entry bits. */
 const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITE: u64 = 1 << 1;
@@ -228,85 +184,6 @@ const GDT_CODE64: u64 = 0x00AF_9B00_0000_FFFF;
 const GDT_DATA: u64 = 0x00CF_9300_0000_FFFF;
 const TSS_LIMIT: u64 = 0x67;
 const TSS_BUSY_PRESENT: u64 = 0x8B;
-
-/// The setup header, as much of it as a loader reads.
-#[derive(Clone, Copy, Debug)]
-pub struct Header {
-    /// Sectors of real-mode setup; the 64-bit kernel begins after them.
-    pub setup_sects: u8,
-    pub version: u16,
-    pub pref_address: u64,
-    pub init_size: u64,
-    pub relocatable: bool,
-    pub kernel_alignment: u64,
-    pub initrd_addr_max: u64,
-    /// End of the header within the image, `0x202 + [0x201]`: how much is
-    /// copied into the zero page.
-    pub hdr_end: usize,
-    pub cmdline_size: u32,
-}
-
-fn u16_at(b: &[u8], o: usize) -> u16 {
-    u16::from_le_bytes([b[o], b[o + 1]])
-}
-fn u32_at(b: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
-}
-fn u64_at(b: &[u8], o: usize) -> u64 {
-    let mut v = [0u8; 8];
-    v.copy_from_slice(&b[o..o + 8]);
-    u64::from_le_bytes(v)
-}
-
-impl Header {
-    /// Parse the header out of the first bytes of the image. `first` has to
-    /// reach at least the end of the header (`0x268 + 8`); the caller reads
-    /// a page or two, which always does.
-    pub fn parse(first: &[u8]) -> Result<Header> {
-        if first.len() < 0x270 {
-            return Err(Error::BadAddress);
-        }
-        if u16_at(first, HDR_BOOT_FLAG) != BOOT_FLAG {
-            return Err(Error::BadAddress);
-        }
-        if u32_at(first, HDR_HEADER_MAGIC) != HEADER_MAGIC {
-            return Err(Error::BadAddress);
-        }
-        let version = u16_at(first, HDR_VERSION);
-        if version < MIN_VERSION {
-            return Err(Error::NotImplemented);
-        }
-        if u16_at(first, HDR_XLOADFLAGS) & XLF_KERNEL_64 == 0 {
-            /* No 64-bit entry point: this loader only takes the 64-bit
-             * protocol, which every x86-64 kernel of the last decade has. */
-            return Err(Error::NotImplemented);
-        }
-
-        /* setup_sects of 0 means 4, for old images. */
-        let setup_sects = match first[HDR_SETUP_SECTS] {
-            0 => 4,
-            n => n,
-        };
-        let hdr_end = HDR_HEADER_MAGIC + first[HDR_LEN_AT] as usize;
-
-        Ok(Header {
-            setup_sects,
-            version,
-            pref_address: u64_at(first, HDR_PREF_ADDRESS),
-            init_size: u32_at(first, HDR_INIT_SIZE) as u64,
-            relocatable: first[HDR_RELOCATABLE] != 0,
-            kernel_alignment: u32_at(first, HDR_KERNEL_ALIGNMENT) as u64,
-            initrd_addr_max: u32_at(first, HDR_INITRD_ADDR_MAX) as u64,
-            hdr_end,
-            cmdline_size: u32_at(first, HDR_CMDLINE_SIZE),
-        })
-    }
-
-    /// The offset in the file where the 64-bit kernel begins.
-    pub fn pm_offset(&self) -> u64 {
-        (self.setup_sects as u64 + 1) * 512
-    }
-}
 
 /// Where everything a Linux guest needs ends up in its physical memory, once
 /// the header and the sizes are known. The module streams the kernel and the
@@ -412,27 +289,38 @@ pub fn build(
         return Err(Error::CommandLineTooLong);
     }
 
-    /* The zero page: a clean page, then the header copied in where it sits,
-     * then the fields a loader owns. */
-    memory.write(BOOT_PARAMS, &[0u8; 8])?; // touch it, and fail early if unmapped
-    let hdr = &first[HDR_SETUP_SECTS..header.hdr_end.min(first.len())];
-    memory.write(BOOT_PARAMS + HDR_SETUP_SECTS as u64, hdr)?;
-
-    put8(memory, BOOT_PARAMS + HDR_TYPE_OF_LOADER as u64, LOADER_UNDEFINED)?;
-    let loadflags = first[HDR_LOADFLAGS] | LOADFLAGS_LOADED_HIGH;
-    put8(memory, BOOT_PARAMS + HDR_LOADFLAGS as u64, loadflags)?;
-    put32(memory, BOOT_PARAMS + HDR_CMD_LINE_PTR as u64, CMDLINE as u32)?;
-    put32(memory, BOOT_PARAMS + HDR_HEAP_END_PTR as u64, 0)?;
-    put32(memory, BOOT_PARAMS + HDR_RAMDISK_IMAGE as u64, layout.initrd_addr as u32)?;
-    put32(memory, BOOT_PARAMS + HDR_RAMDISK_SIZE as u64, layout.initrd_len as u32)?;
+    /* The zero page, made whole by the one copy hvboot makes it with too
+     * (`bzimage::zero_page`): the header copied in where it sits, then the
+     * fields a loader owns, the memory map among them -- and written over
+     * the page it has in one piece. Made on the heap: a page of frame here
+     * would be a page of stack beneath every caller. */
+    let mut entries = [E820Entry::default(); E820_ENTRIES];
+    let n = e820_entries(layout.mem_bytes, firmware, &mut entries)?;
+    /* Both below 4 GiB, as `plan` placed them: a guest's RAM there ends at
+     * `LOW_RAM_END`. */
+    let (Ok(initrd_addr), Ok(initrd_len)) = (u32::try_from(layout.initrd_addr), u32::try_from(layout.initrd_len))
+    else {
+        return Err(Error::BadAddress);
+    };
+    let loaded = Loaded {
+        cmdline: CMDLINE as u32,
+        cmdline_len: cmdline.len(),
+        initrd: (initrd_addr, initrd_len),
+        rsdp: firmware.map_or(0, |f| f.rsdp),
+    };
+    let mut page = Vec::new();
+    page.try_reserve_exact(ZERO_PAGE_BYTES).map_err(|_| Error::NoMemory)?;
+    page.resize(ZERO_PAGE_BYTES, 0u8);
+    let zero: &mut [u8; ZERO_PAGE_BYTES] = page.as_mut_slice().try_into().map_err(|_| Error::NoMemory)?;
+    bzimage::zero_page(first, header, &loaded, &entries[..n], zero).map_err(|refused| match refused {
+        bzimage::Refused::CommandLine { .. } => Error::CommandLineTooLong,
+        _ => Error::BadAddress,
+    })?;
+    memory.write(BOOT_PARAMS, &zero[..])?;
     /* The command line, NUL-terminated. */
     memory.write(CMDLINE, cmdline)?;
     put8(memory, CMDLINE + cmdline.len() as u64, 0)?;
 
-    if let Some(f) = firmware {
-        put64(memory, BOOT_PARAMS + BP_ACPI_RSDP_ADDR as u64, f.rsdp)?;
-    }
-    write_e820(memory, layout.mem_bytes, firmware)?;
     write_page_tables(memory)?;
     write_gdt(memory)?;
     /* A guest of one CPU has no APIC, and so no table of its CPUs. */
@@ -444,9 +332,6 @@ pub fn build(
 
 fn put8(m: &GuestMemory, gpa: u64, v: u8) -> Result<()> {
     m.write(gpa, &[v])
-}
-fn put32(m: &GuestMemory, gpa: u64, v: u32) -> Result<()> {
-    m.write(gpa, &v.to_le_bytes())
 }
 fn put64(m: &GuestMemory, gpa: u64, v: u64) -> Result<()> {
     m.write(gpa, &v.to_le_bytes())
@@ -546,17 +431,9 @@ pub(crate) fn write_mp_table(m: &GuestMemory, cpus: u32, pci: &[Route], ioapic: 
     m.write(MP_FLOATING, &f)
 }
 
-/// An entry of the memory map: e820's, which PVH's start info carries too.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct E820Entry {
-    pub addr: u64,
-    pub size: u64,
-    pub kind: u32,
-}
-
 /// How many entries [`e820_entries`] makes at most.
 pub(crate) const E820_ENTRIES: usize = 4;
-const _: () = assert!(E820_ENTRIES <= E820_MAX_ENTRIES);
+const _: () = assert!(E820_ENTRIES <= bzimage::E820_MAX_ENTRIES);
 
 /// The memory map a guest of `mem_bytes` reads instead of asking a BIOS:
 /// low RAM, the hole at 640 KiB -- in which the firmware's tables, when
@@ -586,20 +463,6 @@ pub(crate) fn e820_entries(mem_bytes: u64, firmware: Option<Firmware>, out: &mut
         n += 1;
     }
     Ok(n)
-}
-
-/// The memory map, [`e820_entries`], into the zero page.
-fn write_e820(m: &GuestMemory, mem_bytes: u64, firmware: Option<Firmware>) -> Result<()> {
-    let mut entries = [E820Entry::default(); E820_ENTRIES];
-    let n = e820_entries(mem_bytes, firmware, &mut entries)?;
-    put8(m, BOOT_PARAMS + BP_E820_ENTRIES as u64, n as u8)?;
-    for (i, e) in entries[..n].iter().enumerate() {
-        let at = BOOT_PARAMS + BP_E820_TABLE as u64 + (i * E820_ENTRY_BYTES) as u64;
-        put64(m, at, e.addr)?;
-        put64(m, at + 8, e.size)?;
-        put32(m, at + 16, e.kind)?;
-    }
-    Ok(())
 }
 
 /// Identity page tables covering the low `IDENTITY_GIB` GiB with 2 MiB

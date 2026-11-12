@@ -34,7 +34,6 @@ extern crate alloc;
 #[macro_use]
 mod console;
 mod boot;
-mod bzimage;
 mod disk;
 mod ext;
 mod gpt;

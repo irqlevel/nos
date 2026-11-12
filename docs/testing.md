@@ -2583,8 +2583,9 @@ hvboot reads a guest's partition table, its ext2/3/4 /boot and its GRUB
 configuration, and boots the entry GRUB would: get any of that wrong and
 the guest boots something else -- an older kernel, the recovery entry --
 with nothing to say so. `fuzz/hvboot` compiles that code, its own sources
-(`src/crates/hypervisor/hvboot/src/{gpt,ext,grub,bzimage}.rs`, over extfmt and the
-tree's `crc`), into a host
+(`src/crates/hypervisor/hvboot/src/{gpt,ext,grub}.rs`, over extfmt and the
+tree's `crc`), and the bzImage crate it loads a kernel by
+(`src/crates/common/boot/bzimage`), into a host
 program, and the gate runs it over disks it makes: a GPT whose /boot is a
 partition of its own (an XBOOTLDR, as Ubuntu's image has, beside an ESP), an
 MBR whose /boot is on the root filesystem (as Debian's), and a disk that is

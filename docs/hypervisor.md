@@ -3654,7 +3654,9 @@ another at GRUB's 4-byte alignment, into RAM the memory map has, clear of
 itself; builds the zero page -- the start info's memory map as its e820,
 the RSDP -- and the command line GRUB would give, `BOOT_IMAGE=` first, then
 its own line's words after the entry's; resets the disks; and enters the
-kernel's 64-bit entry, as hv enters a bzImage (`bzimage.rs`, `boot.rs`).
+kernel's 64-bit entry, as hv enters a bzImage (`boot.rs`) -- the header
+read and the zero page made by the crate hv makes a guest's with
+(`common/boot/bzimage`), one copy where there were two.
 Whatever it cannot do it says on the console and turns the guest off through
 its ACPI -- the VM stops with "the guest powered itself off", the reason in
 its console, rather than sitting halted with nothing said; a fault in it is
@@ -3662,9 +3664,10 @@ said too, with where it happened.
 
 It runs in the guest, and what it reads is the guest's own: a bug in it is
 the guest's, not nos's, and the host's half of this is the PVH loader
-above. Its parsers -- `gpt`, `ext`, `grub`, `bzimage` -- are plain Rust over
-byte slices with no `unsafe`; its 29 unsafe sites are the platform's, in
-ports, physical memory, the heap, the virtio rings, the IDT and the jump.
+above. Its parsers -- `gpt`, `ext`, `grub`, and `bzimage`'s -- are plain
+Rust over byte slices with no `unsafe`; its 29 unsafe sites are the
+platform's, in ports, physical memory, the heap, the virtio rings, the IDT
+and the jump.
 The parsers are compiled for the host too (`fuzz/hvboot`): read off Ubuntu
 24.04's and Debian 13's images, the kernels and initrds come out byte for
 byte as `debugfs` reads them, and `scripts/hvboot-test.py` holds them to
