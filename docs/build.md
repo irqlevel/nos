@@ -24,8 +24,16 @@ kernel in it -- no path dependency outside `common/` -- and
 tree to naming something there (`scripts/check-links.py`): the site's links
 to the source on GitHub's master, which a move or a rename would leave a 404
 nobody is told of, and the relative links of `docs/`, `plans/` and the
-top's documents. `make smoke` builds in Docker and runs the
-headless boot smoke test (`scripts/smoke-test.sh`).
+top's documents. And it holds every function that crosses a language or a
+crate to one signature wherever it is spelled (`scripts/check-ffi.py`): its
+declaration in the `ffi` crate, its `#[no_mangle]` definition in Rust or its
+definition in C++, the C++ declarations of a Rust export and the fuzzers'
+stand-ins -- by width and sign for an integer, as a pointer for any pointer
+or reference, by its own parameters for a function pointer. No compiler
+compares those, and the ABI digest a module carries hashes the declarations
+alone: a definition that drifted built, linked and loaded. `make smoke`
+builds in Docker and runs the headless boot smoke test
+(`scripts/smoke-test.sh`).
 
 ## Four things the Makefile will not tell you
 

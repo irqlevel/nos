@@ -345,11 +345,15 @@ endif
 # (scripts/check-crates.py: a crate in an area's directory and a member; one
 # under common/ with no kernel in it and its unsafe forbidden); and every
 # link the site and the documents make into the tree held to naming
-# something there (scripts/check-links.py).
+# something there (scripts/check-links.py); and every spelling of a function
+# that crosses a language or a crate -- its ffi declaration, its definition in
+# Rust or C++, a C++ declaration of a Rust export, a fuzzer's stand-in --
+# held to one signature (scripts/check-ffi.py).
 check: $(CXX_SRC)
 	cppcheck --error-exitcode=22 --inline-suppr -q src/base || exit 1
 	python3 scripts/check-crates.py
 	python3 scripts/check-links.py
+	python3 scripts/check-ffi.py
 
 # The kernel the ISO and the system image carry has no debug info: GRUB loads
 # its segments alone, and the machine names its frames by its own symbol
