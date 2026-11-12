@@ -769,6 +769,12 @@ void bp_startup(void* ctx)
 
         rust_tcp_init();
 
+        if (!test::test_module_tcp_left())
+        {
+            PANIC("Module TCP sweep test failed");
+            return;
+        }
+
         /* On a machine with no PS/2 controller the xHCI HID keyboard is the
            only way in, so bring it up before the shell starts: enumeration
            happens here, synchronously, while trace output still reaches the

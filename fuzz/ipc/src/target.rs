@@ -1544,7 +1544,8 @@ fn event_op(m: &mut Model, r: &mut Input) {
                 say!("event {} the image's", m.events.len());
                 m.events.push(EventM { image: Some(ev), handle: 0, held: true, weak });
             } else {
-                let handle = abi_ev::kernel_shared_event_open();
+                /* A made-up module's, by an address in its image */
+                let handle = abi_ev::kernel_shared_event_open(MODULES[r.below(MODULES.len() as u64) as usize].0);
                 invariant!(handle != 0, "a module's event refused");
                 let weak = events::lookup(handle).map(|e| Arc::downgrade(&e)).expect("the handle just made");
                 say!("event {} a module's: {:x}", m.events.len(), handle);

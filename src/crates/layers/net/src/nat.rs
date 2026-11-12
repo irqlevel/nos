@@ -1170,12 +1170,15 @@ use ffi::net::{NAT_BUSY, NAT_DEVICES, NAT_NO_MEMORY, NAT_NO_UPLINK, NAT_ON};
 /// out through the device the default route is on. Task context: it
 /// allocates the table.
 #[no_mangle]
-pub extern "C" fn kernel_net_nat_enable(inner: usize) -> ffi::net::NatOn {
+pub extern "C" fn kernel_net_nat_enable(owner: usize, inner: usize) -> ffi::net::NatOn {
     let refused = |code| ffi::net::NatOn { code, outer: 0 };
     let Some(dev) = DEVICES.by_handle(inner) else { return refused(NAT_DEVICES) };
     let Some(nat) = crate::abi::nat() else { return refused(NAT_NO_MEMORY) };
     match nat.enable(dev, None) {
-        Ok(outer) => ffi::net::NatOn { code: NAT_ON, outer: outer.handle() },
+        Ok(outer) => {
+            *NAT_OWNER.lock() = Some((owner, inner));
+            ffi::net::NatOn { code: NAT_ON, outer: outer.handle() }
+        }
         Err(NatError::NoUplink) => refused(NAT_NO_UPLINK),
         Err(NatError::Devices) => refused(NAT_DEVICES),
         Err(NatError::Busy) => refused(NAT_BUSY),
@@ -1187,9 +1190,37 @@ pub extern "C" fn kernel_net_nat_enable(inner: usize) -> ffi::net::NatOn {
 #[no_mangle]
 pub extern "C" fn kernel_net_nat_disable(inner: usize) -> i32 {
     match (DEVICES.by_handle(inner), crate::abi::nat()) {
-        (Some(dev), Some(nat)) if nat.disable(dev) => 1,
+        (Some(dev), Some(nat)) if nat.disable(dev) => {
+            let mut owner = NAT_OWNER.lock();
+            if owner.is_some_and(|(_, at)| at == inner) {
+                *owner = None;
+            }
+            1
+        }
         _ => 0,
     }
+}
+
+/// Who turned NAT on through the ABI -- an address in its code -- and from
+/// which device, while it is on: what the loader's take-down turns it off
+/// by, a module's image being an address range (`disable_owned_in`). Left
+/// on by a module that went, it was Busy for the module's next load.
+static NAT_OWNER: kcore::sync::IrqSpinLock<Option<(usize, usize)>> = kcore::sync::IrqSpinLock::new(None);
+
+/// NAT off, if code in `lo..hi` -- a module's image, about to be freed --
+/// turned it on and left it so: true when it was.
+pub(crate) fn disable_owned_in(lo: usize, hi: usize) -> bool {
+    let inner = {
+        let mut owner = NAT_OWNER.lock();
+        match *owner {
+            Some((by, inner)) if (lo..hi).contains(&by) => {
+                *owner = None;
+                inner
+            }
+            _ => return false,
+        }
+    };
+    matches!((DEVICES.by_handle(inner), crate::abi::nat()), (Some(dev), Some(nat)) if nat.disable(dev))
 }
 
 /// Every mapping of the guest at `ip` (host byte order) behind the device

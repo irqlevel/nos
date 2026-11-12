@@ -40,6 +40,7 @@ pub mod acpi;
 pub mod cmd;
 pub mod mgmt;
 pub mod ipc;
+pub mod owner;
 pub mod events;
 pub mod system;
 pub mod fs;
