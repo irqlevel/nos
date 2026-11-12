@@ -3551,6 +3551,62 @@ static bool check_ipc_unloaded(stdlib::BufferPrinter& out)
     return true;
 }
 
+/* A TCP listener modtest leaves open -- `modtest tcp`, its handle forgotten
+   -- closed by the unload by whose it was: loaded, left, unloaded, twice,
+   the second load's `modtest tcp` taking the port the first left. Refused,
+   the listener outlived its module and the port was taken for the uptime,
+   which a module's next load found Busy. A boot with no NIC has nothing to
+   listen on: said, and not held against it. */
+bool test_module_tcp_left()
+{
+    static const ulong OUTPUT_SIZE = 512;
+    static const ulong ROUNDS = 2;
+
+    auto& modules = ModuleTable::get_instance();
+    char output[OUTPUT_SIZE];
+    char said[OUTPUT_SIZE];
+    stdlib::BufferPrinter out(output, sizeof(output));
+
+    for (ulong round = 0; round < ROUNDS; round++)
+    {
+        out.reset();
+        stdlib::Error err = modules.load(nos_modtest_ko, nos_modtest_ko_size, "", out);
+        if (!err.ok())
+        {
+            klog(0, "test_module_tcp_left: load %lu failed: %s", round, out.get());
+            return false;
+        }
+
+        out.reset();
+        Cmd::dispatch("modtest tcp", out);
+        stdlib::BufferPrinter keep(said, sizeof(said));
+        keep.print_string(out.get());
+        const bool left = (stdlib::str_str(said, "modtest tcp: left listening") != nullptr);
+        const bool no_nic = (stdlib::str_str(said, "modtest tcp: no ") != nullptr);
+
+        out.reset();
+        stdlib::Error unloaded = modules.unload("modtest", out);
+        if (!unloaded.ok() || modules.is_loaded("modtest"))
+        {
+            klog(0, "test_module_tcp_left: unload %lu failed: %s", round, out.get());
+            return false;
+        }
+        if (no_nic)
+        {
+            klog(0, "test_module_tcp_left: %s -- not run", said);
+            return true;
+        }
+        if (!left)
+        {
+            klog(0, "test_module_tcp_left: load %lu: %s", round, said);
+            return false;
+        }
+    }
+
+    klog(0, "test_module_tcp_left: complete");
+    return true;
+}
+
 /* The message channel's module side, once there are tasks: the echo
    started, modtest loaded and its side run, the module unloaded under the
    echo's traffic, the echo stopped -- and the host's queues empty. */

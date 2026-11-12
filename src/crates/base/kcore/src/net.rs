@@ -271,7 +271,7 @@ impl Nic {
     /// that device's address, until the returned value is dropped. One at a
     /// time in the whole kernel. Task context: it allocates its table.
     pub fn nat(&self) -> core::result::Result<Nat, NatError> {
-        let on = net::kernel_net_nat_enable(self.handle);
+        let on = net::kernel_net_nat_enable(crate::owner::here(), self.handle);
         match on.code {
             net::NAT_ON => Ok(Nat { inner: self.handle, outer: Nic { handle: on.outer } }),
             net::NAT_NO_UPLINK => Err(NatError::NoUplink),

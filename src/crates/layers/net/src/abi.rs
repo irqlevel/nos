@@ -149,6 +149,8 @@ pub extern "C" fn rust_netconsole_panic_flush() {
 /* ---- TCP ---- */
 
 use crate::tcp::{Conn, Receive, TCP};
+use kcore::owner::Owner;
+use kcore::sync::PreemptSpinLock;
 
 /// What a module holds a connection as: a word of its slot and the slot's
 /// generation (ffi's tcp.rs), 0 for none.
@@ -161,6 +163,64 @@ const NO_CONN: ConnWord = 0;
 /// safe to look at in whatever state it is in.
 fn conn_of(conn: ConnWord) -> Option<&'static Conn> {
     TCP.by_word(conn)
+}
+
+/// Whose each word handed out is -- the module whose code asked for it --
+/// a slot of the pool's each: what the loader's take-down closes a module's
+/// connections and listeners by (`close_owned_by`), where a listener a
+/// module left kept its port, and a connection its slot, for the uptime. A
+/// word kept here past its connection's end is stale by its generation, and
+/// finds nothing.
+static OWNED: [PreemptSpinLock<(ConnWord, Owner)>; crate::tcp::MAX_CONNECTIONS] =
+    [const { PreemptSpinLock::new((NO_CONN, Owner::IMAGE)) }; crate::tcp::MAX_CONNECTIONS];
+
+/// `conn`'s word, kept as `owner`'s.
+fn handed(conn: &'static Conn, owner: Owner) -> ConnWord {
+    let word = TCP.word_of(conn);
+    if let Some(slot) = TCP.slot_index(conn).and_then(|i| OWNED.get(i)) {
+        *slot.lock() = (word, owner);
+    }
+    word
+}
+
+/// Whose `word` is, while it is the word kept for its slot.
+fn owner_of(word: ConnWord) -> Owner {
+    let Some(slot) = conn_of(word).and_then(|c| TCP.slot_index(c)).and_then(|i| OWNED.get(i)) else {
+        return Owner::IMAGE;
+    };
+    let kept = *slot.lock();
+    if kept.0 == word { kept.1 } else { Owner::IMAGE }
+}
+
+/// `word` closed: kept as nobody's.
+fn forget(word: ConnWord) {
+    if let Some(slot) = conn_of(word).and_then(|c| TCP.slot_index(c)).and_then(|i| OWNED.get(i)) {
+        let mut kept = slot.lock();
+        if kept.0 == word {
+            *kept = (NO_CONN, Owner::IMAGE);
+        }
+    }
+}
+
+/// The connections and listeners the module called `name` was handed and
+/// never closed, closed -- as its own close would: how many.
+pub(crate) fn close_owned_by(name: &[u8]) -> usize {
+    let mut closed = 0;
+    for slot in OWNED.iter() {
+        let word = {
+            let mut kept = slot.lock();
+            if kept.0 == NO_CONN || !kept.1.is_module(name) {
+                continue;
+            }
+            core::mem::replace(&mut *kept, (NO_CONN, Owner::IMAGE)).0
+        };
+        /* Off the slot's lock: a close takes the connection's */
+        if let Some(conn) = conn_of(word) {
+            TCP.close(conn);
+            closed += 1;
+        }
+    }
+    closed
 }
 
 /// Set the connection pool up and start its timer's task: 0 started, -1
@@ -217,7 +277,7 @@ pub unsafe extern "C" fn kernel_tcp_recv(
 /// again; `bulk`, that each connection it accepts is given bulk buffers both
 /// ways (`tcp::Buffers::Bulk`): a relay's.
 #[no_mangle]
-pub extern "C" fn kernel_tcp_listen(dev: usize, port: u16, backlog: usize, bulk: bool) -> ConnWord {
+pub extern "C" fn kernel_tcp_listen(owner: usize, dev: usize, port: u16, backlog: usize, bulk: bool) -> ConnWord {
     if dev == 0 || port == 0 {
         return NO_CONN;
     }
@@ -227,7 +287,7 @@ pub extern "C" fn kernel_tcp_listen(dev: usize, port: u16, backlog: usize, bulk:
     };
     let buffers = if bulk { crate::tcp::Buffers::Bulk } else { crate::tcp::Buffers::Small };
     match TCP.listen_with(&nic, port, backlog, buffers) {
-        Some(conn) => TCP.word_of(conn),
+        Some(conn) => handed(conn, Owner::at(owner)),
         None => NO_CONN,
     }
 }
@@ -257,7 +317,7 @@ unsafe fn nets_of(nets: *const ffi::tcp::TcpNet, count: usize) -> Option<([(u32,
 /// # Safety
 /// `nets` points at `count` readable `TcpNet`s when `count` is past 0.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_tcp_listen_allowed(dev: usize, port: u16, backlog: usize, bulk: bool,
+pub unsafe extern "C" fn kernel_tcp_listen_allowed(owner: usize, dev: usize, port: u16, backlog: usize, bulk: bool,
                                                    nets: *const ffi::tcp::TcpNet, count: usize) -> ConnWord {
     if dev == 0 || port == 0 {
         return NO_CONN;
@@ -267,7 +327,7 @@ pub unsafe extern "C" fn kernel_tcp_listen_allowed(dev: usize, port: u16, backlo
     let Some((list, n)) = (unsafe { nets_of(nets, count) }) else { return NO_CONN };
     let buffers = if bulk { crate::tcp::Buffers::Bulk } else { crate::tcp::Buffers::Small };
     match TCP.listen_allowed(&nic, port, backlog, buffers, &list[..n]) {
-        Some(conn) => TCP.word_of(conn),
+        Some(conn) => handed(conn, Owner::at(owner)),
         None => NO_CONN,
     }
 }
@@ -318,7 +378,7 @@ pub extern "C" fn kernel_tcp_set_rto_floor(conn: ConnWord, ms: u32) -> i32 {
 /// Blocks until the connection is up or the connect timeout has passed: null
 /// then, and for a handle that names no device.
 #[no_mangle]
-pub extern "C" fn kernel_tcp_connect(dev: usize, ip: u32, port: u16) -> ConnWord {
+pub extern "C" fn kernel_tcp_connect(owner: usize, dev: usize, ip: u32, port: u16) -> ConnWord {
     if dev == 0 || port == 0 {
         return NO_CONN;
     }
@@ -330,7 +390,7 @@ pub extern "C" fn kernel_tcp_connect(dev: usize, ip: u32, port: u16) -> ConnWord
      * them -- someone outside may have it open, and a bulk buffer each
      * would be heap for the asking. */
     match TCP.connect(&nic, ip, port, 0, Receive::Small) {
-        Some(conn) => TCP.word_of(conn),
+        Some(conn) => handed(conn, Owner::at(owner)),
         None => NO_CONN,
     }
 }
@@ -339,7 +399,7 @@ pub extern "C" fn kernel_tcp_connect(dev: usize, ip: u32, port: u16) -> ConnWord
 /// module whose connection carries as much as it takes in -- the cluster's
 /// link between hosts. Each buffer the slot's own when the heap has none.
 #[no_mangle]
-pub extern "C" fn kernel_tcp_connect_bulk(dev: usize, ip: u32, port: u16) -> ConnWord {
+pub extern "C" fn kernel_tcp_connect_bulk(owner: usize, dev: usize, ip: u32, port: u16) -> ConnWord {
     if dev == 0 || port == 0 {
         return NO_CONN;
     }
@@ -348,7 +408,7 @@ pub extern "C" fn kernel_tcp_connect_bulk(dev: usize, ip: u32, port: u16) -> Con
         None => return NO_CONN,
     };
     match TCP.connect(&nic, ip, port, 0, Receive::Both) {
-        Some(conn) => TCP.word_of(conn),
+        Some(conn) => handed(conn, Owner::at(owner)),
         None => NO_CONN,
     }
 }
@@ -406,12 +466,14 @@ pub unsafe extern "C" fn kernel_http_fetch(
 pub extern "C" fn kernel_tcp_accept(
     listener: ConnWord, timeout_ms: u64,
 ) -> ConnWord {
+    /* The connection is whoever's the listener is */
+    let owner = owner_of(listener);
     let listener = match conn_of(listener) {
         Some(listener) => listener,
         None => return NO_CONN,
     };
     match TCP.accept(listener, timeout_ms) {
-        Some(conn) => TCP.word_of(conn),
+        Some(conn) => handed(conn, owner),
         None => NO_CONN,
     }
 }
@@ -420,6 +482,7 @@ pub extern "C" fn kernel_tcp_accept(
 /// it again: the slot is another connection's before long.
 #[no_mangle]
 pub extern "C" fn kernel_tcp_close(conn: ConnWord) {
+    forget(conn);
     if let Some(conn) = conn_of(conn) {
         TCP.close(conn);
     }
@@ -429,6 +492,7 @@ pub extern "C" fn kernel_tcp_close(conn: ConnWord) {
 /// sit out TIME-WAIT. As with `kernel_tcp_close`, not used again.
 #[no_mangle]
 pub extern "C" fn kernel_tcp_abort(conn: ConnWord) {
+    forget(conn);
     if let Some(conn) = conn_of(conn) {
         TCP.abort(conn);
     }

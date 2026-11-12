@@ -338,7 +338,7 @@ pub unsafe extern "C" fn kernel_file_read_at(
 /// # Safety
 /// `path` points at `path_len` readable bytes.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_file_open(path: *const u8, path_len: usize, write: i32) -> usize {
+pub unsafe extern "C" fn kernel_file_open(owner: usize, path: *const u8, path_len: usize, write: i32) -> usize {
     let (vfs, path) = match (vfs_instance(), unsafe { ffi_path(path, path_len) }) {
         (Some(vfs), Some(path)) => (vfs, path),
         _ => return 0,
@@ -349,7 +349,32 @@ pub unsafe extern "C" fn kernel_file_open(path: *const u8, path_len: usize, writ
         None => return 0,
     };
     let flags = if write != 0 { OPEN_READ | OPEN_WRITE } else { OPEN_READ };
-    Handle::into_raw(vfs.open(at.as_bytes(), flags))
+    Handle::into_raw(vfs.open_for(at.as_bytes(), flags, kcore::owner::Owner::at(owner)))
+}
+
+/// What a module that went left open on the filesystems, closed: the disks'
+/// images its code opened, and the files -- an image held kept its file
+/// unwritable and unremovable for the uptime, a file kept its mount from
+/// unmounting -- each said as the module's bug. The loader's, at the
+/// module's take-down (`ModuleTable::take_down`). Task context.
+///
+/// # Safety
+/// `name` points at `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn rust_fs_module_gone(name: *const u8, len: usize) {
+    if name.is_null() || len == 0 || len > kcore::owner::NAME_MAX {
+        return;
+    }
+    let name = unsafe { core::slice::from_raw_parts(name, len) };
+    let shown = core::str::from_utf8(name).unwrap_or("?");
+    let images = crate::image::close_owned_by(name);
+    if images != 0 {
+        klog!(0, "module: {} left {} disk image(s) open: closed", shown, images);
+    }
+    let files = vfs_instance().map_or(0, |vfs| vfs.close_owned_by(name));
+    if files != 0 {
+        klog!(0, "module: {} left {} file(s) open: closed", shown, files);
+    }
 }
 
 /// Closes the file. A word that is no open file's is nothing to close.

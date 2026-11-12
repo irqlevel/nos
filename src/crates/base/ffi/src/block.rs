@@ -46,9 +46,11 @@ unsafe extern "C" {
     /// Synchronous, count in sectors: 0 once the data is in buf.
     pub fn kernel_blockdev_read(handle: usize, sector: u64, buf: *mut u8, count: u32) -> i32;
 
-    /// Synchronous, count in sectors: 0 once the device has the data.
+    /// Synchronous, under a claim -- its word (kernel_blockdev_claim), not
+    /// the device's -- count in sectors: 0 once the device has the data, -1
+    /// for a word that is no live claim's too.
     pub fn kernel_blockdev_write(
-        handle: usize, sector: u64, buf: *const u8, count: u32, fua: i32,
+        claim: usize, sector: u64, buf: *const u8, count: u32, fua: i32,
     ) -> i32;
 
     pub safe fn kernel_blockdev_flush(handle: usize) -> i32;
@@ -60,8 +62,11 @@ unsafe extern "C" {
     /// `cap` bytes at `refused` and its length into *refused_len -- while
     /// one of those is on it, on the disk it is a partition of, or on a
     /// partition of it.
+    /// `owner` is an address in the claimer's code: a claim a module leaves
+    /// held is released as it goes.
     pub fn kernel_blockdev_claim(
-        handle: usize, name: *const u8, name_len: usize, refused: *mut u8, cap: usize, refused_len: *mut usize,
+        owner: usize, handle: usize, name: *const u8, name_len: usize, refused: *mut u8, cap: usize,
+        refused_len: *mut usize,
     ) -> usize;
 
     pub safe fn kernel_blockdev_release(claim: usize);
@@ -76,8 +81,13 @@ unsafe extern "C" {
     /// once, from interrupt context -- 1 when the device has no room right
     /// now, 2 for an io it cannot take, 3 when it has no asynchronous path.
     /// io is read before this returns. kick 0 leaves the doorbell for
-    /// kernel_blockdev_kick.
+    /// kernel_blockdev_kick. A read alone: a write or a flush is 2 here,
+    /// and a claim's (kernel_blockdev_submit_claimed).
     pub fn kernel_blockdev_submit(handle: usize, io: *const BlockIo, kick: i32) -> i32;
+
+    /// The same under a claim, by its word, for any io: 2 for a word that
+    /// is no live claim's.
+    pub fn kernel_blockdev_submit_claimed(claim: usize, io: *const BlockIo, kick: i32) -> i32;
 
     pub safe fn kernel_blockdev_kick(handle: usize);
 
@@ -117,9 +127,10 @@ unsafe extern "C" {
 
     /// 1 when the device gives sectors back; and so its `count` sectors
     /// from `sector` given back -- inside it, or refused: 0 once it has been
-    /// told, -1 otherwise. A writer's call, under its claim.
+    /// told, -1 otherwise. A writer's call, made under its claim, by the
+    /// claim's word.
     pub safe fn kernel_blockdev_can_discard(handle: usize) -> i32;
-    pub safe fn kernel_blockdev_discard(handle: usize, sector: u64, count: u64) -> i32;
+    pub safe fn kernel_blockdev_discard(claim: usize, sector: u64, count: u64) -> i32;
 
     /// A queue on the device: `buffers` buffers of `bytes` each, a whole
     /// number of pages, their addresses into `out` -- the device claimed for
@@ -130,8 +141,10 @@ unsafe extern "C" {
     /// 0, is a task's event (kernel_shared_event_open) for the queue to be
     /// made on -- 0 returned for one that is no event's: its completions and
     /// wakes signal that event too, which the queue holds until it is closed.
+    /// `owner` is an address in the opener's code: a queue a module leaves
+    /// open is closed as it goes.
     pub fn kernel_blockq_open(
-        device: usize, write: i32, buffers: usize, bytes: usize, name: *const u8, name_len: usize,
+        owner: usize, device: usize, write: i32, buffers: usize, bytes: usize, name: *const u8, name_len: usize,
         out: *mut *mut u8, refused: *mut u8, cap: usize, refused_len: *mut usize, event: u64,
     ) -> usize;
 

@@ -283,7 +283,7 @@ fn start<'a>(reg: &Registry, mut words: impl Iterator<Item = &'a str>, out: &mut
         Some(claim)
     };
 
-    let shared = Shared::new(disk, nic, port, read_only, sector_size, size, max_io, poll_us * NS_PER_US)
+    let shared = Shared::new(disk, claim, nic, port, read_only, sector_size, size, max_io, poll_us * NS_PER_US)
         .ok_or_else(|| "no memory for its rings and slots".to_string())?;
 
     /* The worker holds the shared state for as long as it runs, and the
@@ -304,7 +304,6 @@ fn start<'a>(reg: &Registry, mut words: impl Iterator<Item = &'a str>, out: &mut
         shared: shared.clone(),
         listener: None,
         worker: Some(worker),
-        _claim: claim,
     };
 
     /* Last: requests may arrive from this moment */
@@ -519,8 +518,6 @@ struct Instance {
     shared: Arc<Shared>,
     listener: Option<UdpListener>,
     worker: Option<TaskHandle>,
-    /* Last to go */
-    _claim: Option<DiskClaim>,
 }
 
 impl Drop for Instance {
@@ -554,6 +551,11 @@ impl Drop for Instance {
    every handler before it lets go of its own hold. */
 struct Shared {
     disk: Disk,
+    /// The device held while it serves, for writing: what a write and a
+    /// flush are submitted under -- a read-only export's reads go by the
+    /// disk. Given back with the last hold of this, once the instance has
+    /// waited out every handler.
+    claim: Option<DiskClaim>,
     nic: Nic,
     mac: [u8; 6],
     port: u16,
@@ -593,6 +595,7 @@ unsafe impl Sync for Shared {}
 impl Shared {
     fn new(
         disk: Disk,
+        claim: Option<DiskClaim>,
         nic: Nic,
         port: u16,
         read_only: bool,
@@ -614,6 +617,7 @@ impl Shared {
 
         let shared = Arc::new(Self {
             disk,
+            claim,
             nic,
             mac: nic.mac(),
             port,
@@ -1337,7 +1341,11 @@ impl Worker<'_> {
             ctx: slot as *mut u8,
         };
 
-        match unsafe { sh.disk.submit(&io, false) } {
+        let submitted = match &sh.claim {
+            Some(claim) => unsafe { claim.submit(&io, false) },
+            None => unsafe { sh.disk.submit(&io, false) },
+        };
+        match submitted {
             Ok(()) => Issued::Submitted,
             Err(SubmitError::Busy) => Issued::Busy,
             Err(_) => Issued::Failed(ST_IO),
