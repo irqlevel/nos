@@ -78,7 +78,7 @@ pub fn netpool(_args: &str, out: &mut Output) {
     let _ = writeln!(out, "frames {} of {} bytes, {} in the ring, {} in cpu caches",
         st.frames, st.capacity, st.in_ring, st.in_caches);
     let _ = writeln!(out, "in flight {}", st.in_flight);
-    let _ = writeln!(out, "alloc hits {}, misses {}, oversized {}",
+    let _ = writeln!(out, "alloc hits {}, misses {}, oversized (refused) {}",
         st.hits, st.misses, st.oversized);
     let _ = writeln!(out, "ring refills {}, flushes {}", st.refills, st.flushes);
 }

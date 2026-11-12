@@ -409,7 +409,9 @@ impl NetFrame {
 
     /// A frame to transmit, room for `data_len` bytes: from the frame pool --
     /// a per-CPU cache, no allocator -- whenever it fits one. `len()` is 0
-    /// until `set_len`.
+    /// until `set_len`. None past 2048 bytes, the most a frame holds: a
+    /// frame is one run of physical memory, which a device is pointed at
+    /// whole (`data_phys`).
     #[inline]
     pub fn alloc_tx(data_len: usize) -> Option<Self> {
         let h = net::kernel_netframe_alloc_tx(data_len);
@@ -474,7 +476,9 @@ impl NetFrame {
         unsafe { core::slice::from_raw_parts_mut(ptr, capacity.min(room)) }
     }
 
-    /// Physical address of the data buffer (for DMA descriptor programming).
+    /// Physical address of the data buffer, the start of one run of physical
+    /// memory as long as the frame's room: what a DMA descriptor is given,
+    /// with the frame's length.
     #[inline]
     pub fn data_phys(&self) -> u64 {
         unsafe { net::kernel_netframe_data_phys(self.raw()) }

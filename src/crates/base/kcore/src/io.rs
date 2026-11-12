@@ -86,8 +86,9 @@ impl MmioRegion {
     /// The part of this window from `offset` on, as a window of its own: a
     /// block of registers that starts where a capability register says it
     /// does. It ends where this one ends, so an access past the mapping is
-    /// still an assert rather than a wild read. None when `offset` is not in
-    /// the window at all.
+    /// still an assert rather than a wild read -- and one the new window's
+    /// start leaves misaligned, too (`at`). None when `offset` is not in the
+    /// window at all.
     pub fn window(&self, offset: usize) -> Option<MmioRegion> {
         if offset >= self.size {
             return None;
@@ -95,47 +96,57 @@ impl MmioRegion {
         Some(MmioRegion { base: self.base.wrapping_add(offset), size: self.size - offset })
     }
 
+    /// Where an access of a `T` at `offset` goes, once it is known to be
+    /// one the window can take: every byte of it inside -- the end summed
+    /// without wrapping, as an offset near the top of the address space
+    /// once wrapped round to pass and reach before the mapping -- and the
+    /// address itself aligned for a `T`, not the offset alone, as a window
+    /// may start anywhere (`window`, a capability register's value). A
+    /// misaligned volatile access is undefined behaviour, and a fault on
+    /// arm64's device memory.
+    #[inline]
+    fn at<T>(&self, offset: usize) -> *mut T {
+        let width = core::mem::size_of::<T>();
+        assert!(offset.checked_add(width).is_some_and(|end| end <= self.size),
+            "mmio: {} bytes at {:#x}, past a window of {:#x}", width, offset, self.size);
+        let p = self.base.wrapping_add(offset).cast::<T>();
+        assert!(p.is_aligned(), "mmio: {} bytes at {:#x}, misaligned at {:p}", width, offset, p);
+        p
+    }
+
+    /* Each access: `at` has put the whole of it inside the window, which
+     * `new`'s caller mapped as device memory, at an address aligned for its
+     * width. */
+
     pub fn read8(&self, offset: usize) -> u8 {
-        assert!(offset < self.size);
-        unsafe { self.base.add(offset).read_volatile() }
+        unsafe { self.at::<u8>(offset).read_volatile() }
     }
 
     pub fn write8(&self, offset: usize, val: u8) {
-        assert!(offset < self.size);
-        unsafe { self.base.add(offset).write_volatile(val) }
+        unsafe { self.at::<u8>(offset).write_volatile(val) }
     }
 
     pub fn read16(&self, offset: usize) -> u16 {
-        assert!(offset % 2 == 0 && offset + 2 <= self.size);
-        unsafe { (self.base.add(offset) as *const u16).read_volatile() }
+        unsafe { self.at::<u16>(offset).read_volatile() }
     }
 
     pub fn write16(&self, offset: usize, val: u16) {
-        assert!(offset % 2 == 0 && offset + 2 <= self.size);
-        unsafe { (self.base.add(offset) as *mut u16).write_volatile(val) }
+        unsafe { self.at::<u16>(offset).write_volatile(val) }
     }
 
     pub fn read32(&self, offset: usize) -> u32 {
-        assert!(offset % 4 == 0 && offset + 4 <= self.size);
-        unsafe { (self.base.add(offset) as *const u32).read_volatile() }
+        unsafe { self.at::<u32>(offset).read_volatile() }
     }
 
     pub fn write32(&self, offset: usize, val: u32) {
-        assert!(offset % 4 == 0 && offset + 4 <= self.size);
-        unsafe {
-            (self.base.add(offset) as *mut u32).write_volatile(val);
-        }
+        unsafe { self.at::<u32>(offset).write_volatile(val) }
     }
 
     pub fn read64(&self, offset: usize) -> u64 {
-        assert!(offset % 8 == 0 && offset + 8 <= self.size);
-        unsafe { (self.base.add(offset) as *const u64).read_volatile() }
+        unsafe { self.at::<u64>(offset).read_volatile() }
     }
 
     pub fn write64(&self, offset: usize, val: u64) {
-        assert!(offset % 8 == 0 && offset + 8 <= self.size);
-        unsafe {
-            (self.base.add(offset) as *mut u64).write_volatile(val);
-        }
+        unsafe { self.at::<u64>(offset).write_volatile(val) }
     }
 }

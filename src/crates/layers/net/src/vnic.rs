@@ -163,6 +163,13 @@ impl Vnic {
     /// No more calls of the handler: back once none is still running.
     fn detach(&self) {
         *self.sink.lock() = None;
+        self.wait_out();
+    }
+
+    /// Back once no call of a handler taken away is still running: one
+    /// that read the sink before it was taken counted itself under the
+    /// lock.
+    fn wait_out(&self) {
         while self.in_flight.load(Ordering::Acquire) != 0 {
             kcore::task::yield_to_runnable();
         }
@@ -170,6 +177,32 @@ impl Vnic {
 
     pub fn nic(&self) -> Option<Nic> {
         self.nic.get().copied()
+    }
+}
+
+/// What a module whose image is `lo..hi` left attached as it went, detached
+/// and said: a sink of its code, called from the transmit path for every
+/// frame the stack sends out of the device, which the next frame would have
+/// called into the pages the unload frees -- and the module's next load been
+/// refused its attach ("attached already") until a reboot. Task context:
+/// back once no call of one is still running. The loader's, through
+/// `rust_net_close_range`.
+pub(crate) fn detach_range(lo: usize, hi: usize, module: &str) {
+    for v in VNICS.iter().filter_map(|slot| slot.get().copied()) {
+        let left = {
+            let mut sink = v.sink.lock();
+            let left = sink.is_some_and(|s| (lo..hi).contains(&(s.handler as usize)));
+            if left {
+                *sink = None;
+            }
+            left
+        };
+        if left {
+            v.wait_out();
+            let name = v.nic().map(|nic| nic.device().name());
+            klog!(0, "module: {} left its sink attached to {}: detached", module,
+                name.and_then(|n| core::str::from_utf8(n).ok()).unwrap_or("a virtual NIC"));
+        }
     }
 }
 

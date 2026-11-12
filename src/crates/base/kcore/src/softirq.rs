@@ -21,9 +21,13 @@ pub fn raise_mask(mask: usize) {
 }
 
 /// Have `handler(target)` run for a soft IRQ type: in task context, on one
-/// CPU at a time for a given type. Called once, before anything raises it.
-/// See `MsixInterrupt::register_for` for what a target and a handler are.
-pub fn register_for<T, F>(typ: usize, target: &'static T, handler: F)
+/// CPU at a time for a given type. False, and nothing changed, for a type
+/// past the types or one that has a handler already -- the kernel publishes
+/// the pair whole, once, so no pass runs one's function with another's
+/// target. See `MsixInterrupt::register_for` for what a target and a
+/// handler are.
+#[must_use]
+pub fn register_for<T, F>(typ: usize, target: &'static T, handler: F) -> bool
 where
     T: Sync + 'static,
     F: Fn(&'static T) + Copy + 'static,
@@ -33,7 +37,7 @@ where
 
     unsafe {
         ffi::softirq::kernel_softirq_register(
-            typ, crate::callback::trampoline::<T, F>, crate::callback::ctx_of(target))
+            typ, crate::callback::trampoline::<T, F>, crate::callback::ctx_of(target)) == 1
     }
 }
 

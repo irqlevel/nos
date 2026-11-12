@@ -152,19 +152,37 @@ pub fn interrupts_enabled() -> bool {
     ffi::cpu::kernel_interrupts_enabled() != 0
 }
 
-/// Preemption off for the calling task, and the task it was taken on -- or
-/// 0, when the stack is not a task's and there was nothing to raise. The
-/// answer goes back to `preempt_enable_task`, because the count belongs to
-/// the task that took it. Unlike the plain pair this is safe from the
-/// tracer's side and from an AP on its way up.
-#[inline]
-pub fn preempt_disable_task() -> usize {
-    ffi::cpu::kernel_preempt_disable_task()
+/// Preemption off for the calling task for as long as this lives, and back
+/// on when it is dropped. The count is the task's it was taken on, so the
+/// guard keeps the task's word itself: nothing hands back a word that is no
+/// task, another task's, or this one's twice -- which, handed to C++ as a
+/// `Task*`, was a decrement at any address or inside another task's
+/// spinlock section -- and, not `Send`, it is dropped by the task that
+/// took it. Nothing to count when the stack is not a task's or preemption
+/// is not on yet. Unlike `kernel_preempt_disable` and its pair this is safe
+/// from the tracer's side and from an AP on its way up.
+pub struct PreemptOff {
+    /// The task the count was raised on, 0 for none: `take`'s alone.
+    task: usize,
+    _not_send: core::marker::PhantomData<*const ()>,
 }
 
-#[inline]
-pub fn preempt_enable_task(task: usize) {
-    unsafe { ffi::cpu::kernel_preempt_enable_task(task) }
+impl PreemptOff {
+    #[inline]
+    pub fn take() -> Self {
+        Self { task: ffi::cpu::kernel_preempt_disable_task(), _not_send: core::marker::PhantomData }
+    }
+}
+
+impl Drop for PreemptOff {
+    #[inline]
+    fn drop(&mut self) {
+        /* `task` is what `kernel_preempt_disable_task` answered this
+         * guard, given back once, by the task that took it: the guard is
+         * made by `take` alone, is neither `Copy` nor `Send`, and drops
+         * once. */
+        unsafe { ffi::cpu::kernel_preempt_enable_task(self.task) }
+    }
 }
 
 /// Whether preemption is on at all yet. Before it is, no task will ever be

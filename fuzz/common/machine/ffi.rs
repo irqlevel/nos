@@ -352,9 +352,10 @@ pub extern "C" fn kernel_softirq_pending(typ: usize) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn kernel_softirq_register(typ: usize, handler: extern "C" fn(*mut u8), ctx: *mut u8) {
+pub extern "C" fn kernel_softirq_register(typ: usize, handler: extern "C" fn(*mut u8), ctx: *mut u8) -> i32 {
     let ctx = ctx as usize;
-    sched::harness(|| sched::softirq_register(typ, handler, ctx))
+    sched::harness(|| sched::softirq_register(typ, handler, ctx));
+    1
 }
 
 #[no_mangle]

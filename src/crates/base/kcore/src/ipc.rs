@@ -227,6 +227,19 @@ impl Limits {
     pub const DEFAULT: Limits = Limits { messages: 256, bytes: 4 << 20 };
 }
 
+/// What one look of `recv`'s found.
+enum Whole {
+    Message(Message),
+    /// Nothing came, it was woken, or the mailbox is closed.
+    Nothing,
+    /// A message it had no room for, taken off and said.
+    Dropped,
+}
+
+/// How much of a message `recv` could not hold is read off at a time, onto
+/// the stack.
+const DROP_PART: usize = 512;
+
 /// A message received: who sent it, its tag and reference, its bytes.
 pub struct Message {
     pub from: Addr,
@@ -381,30 +394,83 @@ impl Mailbox {
     /// came, the receiver was woken (`wake`), or the mailbox is closed -- and,
     /// made on a task's event (`new_on`), at the event's first signal that
     /// brought none. One task waits on a mailbox at a time.
+    ///
+    /// A message whose payload the heap has no room for in one block --
+    /// past its largest, 512 KiB, or met while it had none of the size --
+    /// is taken off in parts and dropped, said in the log, and the next
+    /// looked for without waiting again: left first, it was every later
+    /// call's answer too, a mailbox that took nothing more and a server
+    /// spinning on its `None`. `recv_pieces` takes any message.
     pub fn recv(&self, timeout: Duration) -> Option<Message> {
+        let mut wait = timeout;
+        loop {
+            match self.recv_whole(wait) {
+                Whole::Message(m) => return Some(m),
+                Whole::Nothing => return None,
+                /* Not waited for again: the wait that brought it may have
+                 * been a task's event's signal for something else too,
+                 * which the caller is to look at on this `None`. */
+                Whole::Dropped => wait = Duration::zero(),
+            }
+        }
+    }
+
+    /// One look for the next message, as `recv` describes.
+    fn recv_whole(&self, timeout: Duration) -> Whole {
         let mut h = ipc::IpcHeader::default();
         /* Asked with no room first: a message with no payload comes whole,
          * any other says how long it is and stays first */
         let got = unsafe { ipc::kernel_ipc_recv(self.addr, timeout.as_nanos(), &mut h, core::ptr::null_mut(), 0) };
         if got == 0 {
-            return Some(Message { from: Addr(h.from), tag: h.tag, reference: h.reference, data: Vec::new() });
+            return Whole::Message(Message { from: Addr(h.from), tag: h.tag, reference: h.reference, data: Vec::new() });
         }
         if got != ipc::IPC_RECV_TOO_SMALL {
-            return None;
+            return Whole::Nothing;
         }
-        let len = usize::try_from(h.len).ok()?;
+        let Ok(len) = usize::try_from(h.len) else { return Whole::Nothing };
         let mut data: Vec<u8> = Vec::new();
-        data.try_reserve_exact(len).ok()?;
+        if data.try_reserve_exact(len).is_err() {
+            self.drop_first(len);
+            return Whole::Dropped;
+        }
         /* The message is still first, and this task its one receiver: taken
          * now into room for all of it, which `data` has for `len` bytes */
         let got = unsafe { ipc::kernel_ipc_recv(self.addr, 0, &mut h, data.as_mut_ptr(), len) };
-        let Ok(n) = usize::try_from(got) else { return None };
+        let Ok(n) = usize::try_from(got) else { return Whole::Nothing };
         if n > len {
-            return None;
+            return Whole::Nothing;
         }
         /* The kernel wrote `n` bytes, no more than `len`, which `data` holds */
         unsafe { data.set_len(n) };
-        Some(Message { from: Addr(h.from), tag: h.tag, reference: h.reference, data })
+        Whole::Message(Message { from: Addr(h.from), tag: h.tag, reference: h.reference, data })
+    }
+
+    /// The first message, `len` bytes that `recv` could not hold, read off
+    /// in parts into a scrap of stack -- which takes it, with its last
+    /// byte -- and said in the log.
+    fn drop_first(&self, len: usize) {
+        let mut scrap = [0u8; DROP_PART];
+        let mut h = ipc::IpcHeader::default();
+        let mut ticket = 0u64;
+        let mut offset = 0usize;
+        let mut whole = len;
+        while offset < whole {
+            let want = scrap.len().min(whole - offset);
+            /* `scrap` has room for `want` bytes; the ticket is the first
+             * part's, which holds every part after it to this message */
+            let n = unsafe {
+                ipc::kernel_ipc_recv_part(self.addr, 0, &mut h, scrap.as_mut_ptr(), want, offset as u64, &mut ticket)
+            };
+            let Some(n) = usize::try_from(n).ok().filter(|&n| n > 0 && n <= want) else { break };
+            if offset == 0 {
+                /* The message's own length, as its first part gives it */
+                whole = usize::try_from(h.len).unwrap_or(whole);
+            }
+            offset += n;
+        }
+        crate::klog!(0, "ipc: a message of {} bytes from {:#x}, tag {:#x}, dropped: no room for it in one block of \
+                         the heap (recv_pieces takes one in pieces){}", whole, h.from, h.tag,
+                     if offset < whole { " -- and it could not be read off whole" } else { "" });
     }
 
     /// The next message, waiting up to `timeout` for one, in pieces of at

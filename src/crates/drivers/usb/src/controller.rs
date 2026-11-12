@@ -210,7 +210,10 @@ impl Controller {
         let cap_length = (cap_dw0 & 0xFF) as u8;
         let hci_version = ((cap_dw0 >> 16) & 0xFFFF) as u16;
 
-        if cap_length == 0 || cap_length == 0xFF {
+        /* The operational registers start a dword after a dword: a length
+         * that is not a multiple of four would leave every access to them
+         * misaligned. */
+        if cap_length == 0 || cap_length == 0xFF || cap_length % 4 != 0 {
             klog!(0, "Xhci: implausible CAPLENGTH {}", cap_length);
             return None;
         }
