@@ -151,12 +151,19 @@ const LEAF1_ECX_HYPERVISOR: u32 = 1 << 31;
 const LEAF6_EAX_ARAT: u32 = 1 << 2;
 /// Leaf 0x15 as a guest with an APIC is told it: the "crystal" the APIC
 /// timer counts is the emulated APIC's bus, 1 GHz (`lapic`), and the TSC's
-/// ratio to it is the host's TSC -- in kHz, over a denominator of a million
-/// kHz. Linux on Intel takes the APIC timer's rate from this leaf and skips
-/// measuring it; passed through, the leaf names the host's crystal, tens of
-/// MHz, and the guest's timer would fire tens of times too soon.
+/// ratio to it the host's TSC in MHz over a thousand. Linux on Intel takes
+/// the APIC timer's rate from this leaf and skips measuring it; passed
+/// through, the leaf names the host's crystal, tens of MHz, and the guest's
+/// timer would fire tens of times too soon. Linux works the TSC's rate out
+/// as `crystal_khz * numerator / denominator` in 32 bits
+/// (`native_calibrate_tsc`): the ratio was once the TSC in kHz over a
+/// million, whose product wrapped for any TSC past 4.3 MHz -- a guest that
+/// took the leaf, without `tsc_early_khz=`, had a TSC thousands of times
+/// too slow. So the ratio is one whose product fits, and the leaf is
+/// blank -- the guest measures -- where none gives the TSC exactly
+/// (`leaf15`).
 const LEAF15_CRYSTAL_HZ: u32 = 1_000_000_000;
-const LEAF15_DENOMINATOR_KHZ: u32 = 1_000_000;
+const LEAF15_DENOMINATOR: u32 = 1000;
 
 /* Leaf 1, ECX: the features kept. Everything not named here is cleared --
  * among them MONITOR, VMX and PDCM -- but for the XSAVE line
@@ -506,6 +513,22 @@ pub fn tsc_deadline() -> bool {
     kcore::time::cycle_counter_hz().is_some()
 }
 
+/// Leaf 0x15 for a guest with an APIC whose host's TSC runs at `tsc_khz`:
+/// the emulated APIC's 1 GHz crystal, and the TSC over it as a ratio that
+/// Linux's 32-bit arithmetic gives back exactly -- the TSC in whole MHz over
+/// a thousand, the product a million times at most 4294 -- or nothing.
+pub fn leaf15(tsc_khz: u64) -> Cpuid {
+    let crystal_khz = LEAF15_CRYSTAL_HZ / 1000;
+    let numerator = tsc_khz / u64::from(1_000_000 / LEAF15_DENOMINATOR);
+    let exact = tsc_khz != 0 && tsc_khz % u64::from(1_000_000 / LEAF15_DENOMINATOR) == 0;
+    match u32::try_from(numerator) {
+        Ok(n) if exact && crystal_khz.checked_mul(n).is_some() => {
+            Cpuid { eax: LEAF15_DENOMINATOR, ebx: n, ecx: LEAF15_CRYSTAL_HZ, edx: 0 }
+        }
+        _ => NONE,
+    }
+}
+
 /// What the guest's CPU `asker` is told for CPUID leaf `leaf`, subleaf
 /// `sub` (ECX on the way in, for the leaves that take one).
 pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
@@ -580,10 +603,7 @@ pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
              * ratio. Blank when the host does not say -- the guest then
              * measures. */
             let tsc_khz = (u64::from(ecx) * u64::from(ebx)).checked_div(u64::from(eax)).unwrap_or(0) / 1000;
-            match u32::try_from(tsc_khz) {
-                Ok(khz) if khz != 0 => Cpuid { eax: LEAF15_DENOMINATOR_KHZ, ebx: khz, ecx: LEAF15_CRYSTAL_HZ, edx: 0 },
-                _ => NONE,
-            }
+            leaf15(tsc_khz)
         }
         /* A guest with no APIC has no timer it counts: the leaf is the
          * host's TSC and crystal, which are the guest's too. */
