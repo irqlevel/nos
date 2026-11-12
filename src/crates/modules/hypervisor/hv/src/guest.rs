@@ -809,11 +809,11 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
             total.ud, total.wbinvd, total.cr8, total.cr0, total.reflected);
     }
     if total.cr4 != 0 {
-        let _ = writeln!(out, "  cr4        {} reads and writes performed (AMD-V), {} writes refused with #GP",
+        let _ = writeln!(out, "  cr4        {} reads and writes performed, {} writes refused with #GP",
             total.cr4, total.cr4_gp);
     }
     if total.dr != 0 {
-        let _ = writeln!(out, "  dr0-3      {} reads and writes of its own (AMD-V), {} not made: a #GP or a #DB in their place",
+        let _ = writeln!(out, "  dr0-3      {} reads and writes of its own, {} not made: a #GP or a #DB in their place",
             total.dr, total.dr_refused);
     }
     let absent = guest.absent_pages();
