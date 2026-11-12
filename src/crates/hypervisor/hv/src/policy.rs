@@ -133,7 +133,10 @@ const EXT1E_EBX_THREADS_SHIFT: u32 = 8;
 /// a deadline is turned into the host's time by.
 const LEAF1_ECX_TSC_DEADLINE: u32 = 1 << 24;
 /// Leaf 1: the APIC (EDX bit 9) and x2APIC mode (ECX bit 21), both
-/// emulated (`lapic`), set whatever the host has.
+/// emulated (`lapic`), set whatever the host has -- the APIC's bit only
+/// while the asking CPU's APIC is on (IA32_APIC_BASE.EN), as a CPU clears
+/// it for one turned off (SDM 11.4.3), and on AMD its mirror in 0x8000_0001
+/// EDX with it, a bit Intel's leaf has reserved.
 const LEAF1_EDX_APIC: u32 = 1 << 9;
 const LEAF1_ECX_X2APIC: u32 = 1 << 21;
 /// Leaf 1 ECX bit 31: a hypervisor is there. It is, and a kernel that
@@ -412,11 +415,15 @@ const EXT1_EDX_KEEP: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4)
 const EXT1_EDX_RDTSCP: u32 = 1 << 27;
 
 /* Extended leaf 0x80000008: in EAX the widths of a physical and a linear
- * address, the host's -- what a guest's page tables are held to -- and not
- * the width of a nested guest's. In EBX, what the CPU does as it is: CLZERO,
- * an instruction with nothing to intercept; the FP error pointers FXSAVE
- * always keeps; and two attacks it is not open to, speculative store bypass
- * and branch type confusion -- facts of the silicon, true of a guest on it;
+ * address -- the physical the host's, what a guest's page tables are held
+ * to, and not the width of a nested guest's; the linear 48 bits at most,
+ * LA57 not being offered (`LINEAR_BITS`): a host of 5-level paging says 57
+ * there, and a guest told so takes 57 for its canonical checks while its
+ * CPU runs 4-level and refuses its MSRs past 48. In EBX, what the CPU does
+ * as it is: CLZERO, an instruction with nothing to intercept; the FP error
+ * pointers FXSAVE always keeps; and two attacks it is not open to,
+ * speculative store bypass and branch type confusion -- facts of the
+ * silicon, true of a guest on it;
  * and the speculation controls (`EXT8_EBX_SPEC`), each only beside the MSR
  * that makes it true: IBPB was offered once while a write to PRED_CMD went
  * nowhere, and IBRS, STIBP and SSBD while SPEC_CTRL kept nothing, so a
@@ -425,7 +432,13 @@ const EXT1_EDX_RDTSCP: u32 = 1 << 27;
  * INVLPGB, which the VMCB does not enable (Linux 6.15 on Zen 3 would flush
  * its TLBs with it and take a #UD, by its source), RDPRU and WBNOINVD,
  * whose exits have no answer here, PPIN and CPPC, MSRs nobody answers. */
-const EXT8_EAX_KEEP: u32 = 0xFFFF;
+/// A width in 0x8000_0008 EAX: a byte -- the physical one's in 7:0, the
+/// linear one's in 15:8.
+const EXT8_EAX_WIDTH: u32 = 0xFF;
+const EXT8_EAX_LINEAR_SHIFT: u32 = 8;
+/// The width of a linear address a guest has: 4-level paging's, LA57 never
+/// offered -- what its addresses are held canonical to (`canonical`).
+const LINEAR_BITS: u32 = 48;
 const EXT8_EBX_KEEP: u32 = (1 << 0)   // CLZERO
     | (1 << 2)   // FP error pointers always saved
     | (1 << 26)  // not affected by speculative store bypass
@@ -469,13 +482,16 @@ const NONE: Cpuid = Cpuid { eax: 0, ebx: 0, ecx: 0, edx: 0 };
 
 /// Who asks a CPUID, as far as the answer is theirs: the guest's CPU's APIC
 /// ID; whether the guest has local APICs -- one of more than one CPU --
-/// which leaf 1 then says, the x2APIC and its TSC-deadline timer with it;
-/// the CPU's CR4 and XCR0, whose OSXSAVE leaf 1 mirrors and whose components
-/// leaf 0xD gives the XSAVE area's size for; and where the guest's CPUs sit.
+/// which leaf 1 then says, the x2APIC and its TSC-deadline timer with it,
+/// and whether the asking CPU's is on (IA32_APIC_BASE.EN), which the APIC's
+/// own bit follows; the CPU's CR4 and XCR0, whose OSXSAVE leaf 1 mirrors and
+/// whose components leaf 0xD gives the XSAVE area's size for; and where the
+/// guest's CPUs sit.
 #[derive(Clone, Copy, Debug)]
 pub struct Asker {
     pub apic_id: u32,
     pub apic: bool,
+    pub apic_on: bool,
     pub cr4: u64,
     pub xcr0: u64,
     pub shape: Shape,
@@ -484,7 +500,8 @@ pub struct Asker {
 impl Asker {
     /// A guest's first CPU out of reset, where nothing asked for depends on
     /// more: its signature, its features, its address widths.
-    pub const RESET: Asker = Asker { apic_id: 0, apic: true, cr4: 0, xcr0: fp::XCR0_X87, shape: Shape::cores(1) };
+    pub const RESET: Asker =
+        Asker { apic_id: 0, apic: true, apic_on: true, cr4: 0, xcr0: fp::XCR0_X87, shape: Shape::cores(1) };
 }
 
 /* The hypervisor's own range: KVM's signature, "KVMKVMKVM" in EBX, ECX and
@@ -544,7 +561,8 @@ pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
     }
     let Some(host) = cpu::cpuid_count(leaf, sub) else { return NONE };
     let (eax, ebx, ecx, edx) = (host.eax, host.ebx, host.ecx, host.edx);
-    let (apic_ecx, apic_edx) = if asker.apic { (LEAF1_ECX_X2APIC, LEAF1_EDX_APIC) } else { (0, 0) };
+    let apic_ecx = if asker.apic { LEAF1_ECX_X2APIC } else { 0 };
+    let apic_edx = if asker.apic && asker.apic_on { LEAF1_EDX_APIC } else { 0 };
     let apic = asker.apic;
     let avx = fp::offered() & fp::XCR0_AVX != 0;
     let runs = x86::offers();
@@ -611,16 +629,18 @@ pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
         LEAF_EXT => Cpuid { eax: eax.min(LEAF_EXT_TOP), ebx, ecx, edx },
         LEAF_EXT_FEATURES => {
             let rdtscp = if runs.rdtscp { EXT1_EDX_RDTSCP } else { 0 };
+            let mirror = if vendor() == Vendor::Amd { apic_edx } else { 0 };
             Cpuid {
                 eax,
                 ebx,
                 ecx: ecx & (EXT1_ECX_KEEP | EXT1_ECX_TOPOEXT),
-                edx: (edx & (EXT1_EDX_KEEP | rdtscp)) | apic_edx,
+                edx: (edx & (EXT1_EDX_KEEP | rdtscp)) | mirror,
             }
         }
         LEAF_EXT_POWER => Cpuid { eax: 0, ebx: 0, ecx: 0, edx: edx & EXT7_EDX_INVARIANT_TSC },
         LEAF_EXT_ADDRESS => Cpuid {
-            eax: eax & EXT8_EAX_KEEP,
+            eax: (eax & EXT8_EAX_WIDTH)
+                | (((eax >> EXT8_EAX_LINEAR_SHIFT) & EXT8_EAX_WIDTH).min(LINEAR_BITS) << EXT8_EAX_LINEAR_SHIFT),
             ebx: ebx & (EXT8_EBX_KEEP | speculation(EXT8_EBX_SPEC)),
             /* AMD's: the package's CPUs, and the APIC ID's width below the
              * package's. Intel's is reserved. */
@@ -697,6 +717,12 @@ fn topology(sub: u32, asker: &Asker) -> Cpuid {
 /// cache -- a core's threads, and for the last level the whole package's
 /// where they share the host's -- and with `cores`, leaf 4's, the
 /// package's cores. A subleaf with no cache in it ends the list, as it is.
+/// A limit: a cache below the last level that the host shares among more
+/// than a core's threads -- a hybrid part's L2, one to a cluster of four of
+/// its slower cores -- is said to be each guest CPU's own, its size the
+/// host's; which of the guest's CPUs sit in one cluster is not known here
+/// (`place::Topology` has cores and last-level caches, not clusters). Only a
+/// scheduler's heuristics and `lscpu` read it.
 fn cache_eax(eax: u32, shape: &Shape, leaf: u32, cores: bool) -> u32 {
     let kept = eax & LEAF4_EAX_KEEP;
     if eax & CACHE_TYPE_MASK == 0 {
@@ -843,12 +869,11 @@ fn xsave_leaf(sub: u32, host_eax: u32, xcr0: u64) -> Cpuid {
 /// architecture has at most, whatever a CPU -- or a hypervisor under this
 /// one -- says (hv-fuzz found the shift by a width of 64 or more).
 pub fn phys_bits() -> u32 {
-    match cpuid(LEAF_EXT_ADDRESS, 0, &Asker::RESET).eax & EXT8_EAX_PHYS_BITS {
+    match cpuid(LEAF_EXT_ADDRESS, 0, &Asker::RESET).eax & EXT8_EAX_WIDTH {
         0 => DEFAULT_PHYS_BITS,
         bits => bits.min(MAX_PHYS_BITS),
     }
 }
-const EXT8_EAX_PHYS_BITS: u32 = 0xFF;
 const DEFAULT_PHYS_BITS: u32 = 36;
 const MAX_PHYS_BITS: u32 = 52;
 
@@ -1145,7 +1170,8 @@ fn pat_valid(value: u64) -> bool {
 /// Whether an address is canonical: bits 63 to 47 all the same -- 48 bits
 /// of address, the guest not being offered LA57's 57.
 fn canonical(value: u64) -> bool {
-    (((value as i64) << 16) >> 16) as u64 == value
+    const SHIFT: u32 = u64::BITS - LINEAR_BITS;
+    (((value as i64) << SHIFT) >> SHIFT) as u64 == value
 }
 
 /// EFER bits the guest may set: SCE, LME, LMA and NXE -- SYSCALL, long mode
@@ -1159,8 +1185,9 @@ const EFER_GUEST_MASK: u64 = (1 << 0) | (1 << 8) | (1 << 10) | (1 << 11);
 /// silicon ignores it, rather than put into the guest's EFER, where it would
 /// be an entry the CPU refuses (VT-x checks it against its IA-32e control).
 const EFER_LMA: u64 = 1 << 10;
-/// The bit the CPU keeps set once long mode is active: the guest never
-/// clears it while it runs 64-bit code, and it is part of its EFER.
+/// SVM enable: the host's -- set in the EFER a guest runs with under AMD-V,
+/// which the hardware requires -- hidden from a guest's read and kept as it
+/// is on its write (`wrmsr`).
 const EFER_SVME: u64 = 1 << 12;
 /// Long mode enable: fixed while paging is on -- the CPU faults a write that
 /// changes it then, and a guest let change it would be one whose EFER says
