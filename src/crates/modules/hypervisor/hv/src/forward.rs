@@ -247,9 +247,11 @@ impl Forwards {
 
     /// `hv forward add <port> <vm> <guest-port>`: nos's `port` relayed to
     /// `guest_port` of VM `vm`, at `guest_ip` behind `host` -- said on `out`
-    /// once it listens -- or why not.
-    pub fn add(&self, port: u16, vm: u32, guest_port: u16, guest_ip: u32, host: Nic, out: &mut dyn Write)
-               -> Result<(), String> {
+    /// once it listens -- or why not. `listed` says whether the VM is on
+    /// the VMs' list still: asked under this table's lock as the forward
+    /// goes into it (`Vms::on_list`).
+    pub fn add(&self, port: u16, vm: u32, guest_port: u16, guest_ip: u32, host: Nic, listed: &dyn Fn() -> bool,
+               out: &mut dyn Write) -> Result<(), String> {
         let public = Nic::find(PUBLIC_IF).ok_or_else(|| alloc::format!("no {} to listen through", PUBLIC_IF))?;
         /* Asked under the lock, said after it: nothing is printed with the
          * table held, a VM's stop taking its forwards away waits on it. */
@@ -287,16 +289,26 @@ impl Forwards {
         let refused = {
             let mut table = self.table.lock();
             if table.len() >= MAX_FORWARDS || table.iter().any(|f| f.port == port) {
-                Some(forward)
+                Some((forward, "was forwarded meanwhile"))
+            } else if !listed() {
+                /* Asked here, as it goes in, under this lock: a VM's stop
+                 * takes it off the VMs' list and only then calls `drop_vm`,
+                 * which takes this lock -- so a forward put in while the VM
+                 * is listed is that `drop_vm`'s to take, and one asked for
+                 * after it left is refused. Asked before, with nothing held
+                 * between, one could land after the `drop_vm`: kept for a
+                 * number no stop names again, relaying nos's port to
+                 * whichever VM took that switch port next. */
+                Some((forward, "is not forwarded: the vm was stopped meanwhile"))
             } else {
                 /* Into the room taken at `new`. */
                 table.push(forward);
                 None
             }
         };
-        if let Some(f) = refused {
+        if let Some((f, why)) = refused {
             end(f);
-            return Err(alloc::format!("port {} was forwarded meanwhile", port));
+            return Err(alloc::format!("port {} {}", port, why));
         }
         let _ = writeln!(out, "hv: port {} forwarded to vm {}, {}:{}", port, vm, net::dotted(guest_ip), guest_port);
         Ok(())

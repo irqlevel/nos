@@ -304,7 +304,7 @@ pub fn attach(root: &str, vms: &crate::vms::Vms, vm: &str, word: &str, ro: bool,
             return Err(alloc::format!("{} is {}'s disk already, as {}", called(&disk), vm, other));
         }
     }
-    store::update(&folder, |c| {
+    store::update(&vms.changes, &folder, |c| {
         if c.options.disks.len() >= hv::run::MAX_DISKS {
             return Err(alloc::format!("{} has {} disks already, all a guest takes", vm, hv::run::MAX_DISKS));
         }
@@ -325,7 +325,7 @@ pub fn detach(root: &str, vms: &crate::vms::Vms, vm: &str, word: &str) -> Result
     let _held = vms.reserve(vm, "changed")?;
     let wanted = given(word).ok().map(|(disk, _)| disk);
     let mut named = None;
-    store::update(&folder, |c| {
+    store::update(&vms.changes, &folder, |c| {
         let at = c.options.disks.iter().position(|(w, _)| {
             is_device(w) && (w.eq_ignore_ascii_case(word)
                              || wanted.as_ref().is_some_and(|d| find(w).is_ok_and(|x| x.handle() == d.handle())))

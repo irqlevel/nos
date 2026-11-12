@@ -243,7 +243,8 @@ fn finish(p: Params, call: &mut Call) -> Result<(), Status> {
 fn name_param<'a>(p: &mut Params<'a>, key: &'a str, call: &mut Call) -> Result<&'a str, Status> {
     let name = p.str(key, store::NAME_MAX).map_err(|e| invalid(call, e))?;
     if !store::valid_name(name) {
-        return Err(refuse(call, Status::Invalid, "is a letter or a digit, then letters, digits, . _ and -", Some(key)));
+        return Err(refuse(call, Status::Invalid, "is a letter or a digit, then letters, digits, . _ and -, and not \
+                                                  digits alone nor all", Some(key)));
     }
     Ok(name)
 }
@@ -873,16 +874,10 @@ fn config_set(state: &State, mut p: Params, call: &mut Call) -> Status {
     if let Err(e) = checked {
         return refuse(call, Status::Invalid, &e, Some("text"));
     }
-    let (was, _) = match store::load_text(&folder) {
-        Ok(t) => t,
+    let changed = match store::replace(&state.vms.changes, &folder, text) {
+        Ok(c) => c,
         Err(e) => return refuse(call, Status::Failed, &e, None),
     };
-    let changed = was != text;
-    if changed {
-        if let Err(e) = store::write_config(&folder, &was, text) {
-            return refuse(call, Status::Failed, &e, None);
-        }
-    }
     answer(call, |w| {
         w.begin_object();
         w.field_bool("changed", changed);
@@ -916,7 +911,7 @@ fn forward_add(state: &State, mut p: Params, call: &mut Call) -> Status {
     if let Some(other) = state.forwards.vm_of(port).filter(|&vm| Some(vm) != id) {
         return refuse(call, Status::Conflict, &alloc::format!("port {} is forwarded to vm {}", port, other), Some("port"));
     }
-    let kept = store::update(&folder, |c| {
+    let kept = store::update(&state.vms.changes, &folder, |c| {
         c.options.forwards.retain(|&(host, _)| host != port);
         c.options.forwards.try_reserve(1).map_err(|_| String::from("out of memory"))?;
         c.options.forwards.push((port, guest_port));
@@ -934,7 +929,7 @@ fn forward_add(state: &State, mut p: Params, call: &mut Call) -> Status {
             if state.forwards.vm_of(port) == Some(id) {
                 let _ = state.forwards.del(port);
             }
-            match state.forwards.add(port, id, guest_port, ip, host, &mut Quiet) {
+            match state.forwards.add(port, id, guest_port, ip, host, &|| state.vms.on_list(id), &mut Quiet) {
                 Ok(()) => live = true,
                 Err(e) => return refuse(call, Status::Failed, &alloc::format!("kept in its vm.toml, but not relayed now \
                                                                                -- {}", e), None),
@@ -965,7 +960,7 @@ fn forward_del(state: &State, mut p: Params, call: &mut Call) -> Status {
         Ok(f) => f,
         Err(s) => return s,
     };
-    let kept = match store::update(&folder, |c| {
+    let kept = match store::update(&state.vms.changes, &folder, |c| {
         c.options.forwards.retain(|&(host, _)| host != port);
         Ok(())
     }) {
@@ -1057,7 +1052,7 @@ fn disk_add(state: &State, mut p: Params, call: &mut Call) -> Status {
     }
     let grown = kcore::fs::File::open(&path, true).and_then(|f| f.set_len(size));
     let named = grown.map_err(|e| alloc::format!("{}: {} bytes do not fit there -- {}", path, size, e))
-        .and_then(|()| store::update(&folder, |c| {
+        .and_then(|()| store::update(&state.vms.changes, &folder, |c| {
             c.options.disks.try_reserve(1).map_err(|_| String::from("out of memory"))?;
             c.options.disks.push((String::from(file), false));
             Ok(())
@@ -1123,11 +1118,12 @@ fn disk_grow(state: &State, mut p: Params, call: &mut Call) -> Status {
 /* ---- jobs ---- */
 
 /// Refused when the folder of `name` says it is protected and the call does
-/// not say `force`.
+/// not say `force`: the folder the VM on the list by that name was started
+/// from -- which may be anywhere -- or, with none on the list, the one
+/// under the VMs' folder.
 fn guarded(state: &State, name: &str, force: bool, call: &mut Call) -> Result<(), Status> {
-    let protected = store::folder_of(&state.vms_root, name).ok()
-        .and_then(|f| store::load(&f).ok())
-        .is_some_and(|c| c.protected);
+    let folder = state.vms.folder_listed(name).or_else(|| store::folder_of(&state.vms_root, name).ok());
+    let protected = folder.and_then(|f| store::load(&f).ok()).is_some_and(|c| c.protected);
     if protected && !force {
         return Err(refuse(call, Status::Conflict, &alloc::format!("{} is protected -- force does it all the same",
                                                                   name), Some("force")));
@@ -1186,7 +1182,8 @@ fn stop(state: &State, mut p: Params, call: &mut Call) -> Status {
     if let Err(s) = guarded(state, name, force, call) {
         return s;
     }
-    /* By its name, or a VM with no folder by its number. */
+    /* By its name, which is never a VM's number (`store::reserved`): the
+     * VM `guarded` looked at, and no other. */
     if state.vms.id_of(name).is_err() {
         return refuse(call, Status::NotFound, &alloc::format!("{} is not on the list -- not started", name),
                       Some("name"));
