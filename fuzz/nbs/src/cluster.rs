@@ -98,7 +98,7 @@ use nbsmeta::repair::{self, Seen};
 use nbsmeta::{Answer, Command, Replica, State};
 use nbswire::copy::{self, Copy};
 use nbswire::scrub::{self, Scrub};
-use nbswire::serve::{collect, serve, AskNow, Asker, Collected, Done, Requests};
+use nbswire::serve::{collect, serve, serve_relayed, AskNow, Asker, Collected, Done, Requests};
 use nbswire::{Answer as CsAnswer, Answered, Ask, Asking, Query, Question, Refusal, Reply, Request, Said, Saying, Told};
 
 use crate::cs::{Disk, Handle};
@@ -268,6 +268,32 @@ struct Flight {
     msg: u64,
     bytes: Vec<u8>,
     fut: Pin<Box<dyn Future<Output = Result<Done, Refusal>>>>,
+}
+
+/// The session a write passed along its chain answers (N13): the name it
+/// carries -- `w<client>@<host>` or `k<clone>@<host>` -- as the target names
+/// its sessions.
+/// A write piece of a session whose writes go along chains sent without
+/// its mark (N13): served as written once more each time it came, and a
+/// copy of it late, by another way than a newer write of its blocks, would
+/// put older data over that one.
+fn unmarked(chains: bool, bytes: &[u8], who: &str, id: u64, cs: u32) -> Result<(), String> {
+    match Request::decode_relayed(bytes) {
+        Some((r, None)) if chains && matches!(r.op, nbswire::Op::Write { .. }) => {
+            Err(format!("{} sent write #{} to cs {} without its mark, its writes going along chains", who, id, cs))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn named_end(answer: &str) -> Option<End> {
+    let (name, _) = answer.split_once('@')?;
+    let n: usize = name.get(1..)?.parse().ok()?;
+    match name.as_bytes().first()? {
+        b'w' => Some(End::Client(n)),
+        b'k' => Some(End::Clone(n)),
+        _ => None,
+    }
 }
 
 /// A host's cs's questions to its mds (N12c), as nbs-cs's go: each a
@@ -611,6 +637,12 @@ impl World {
                 }
                 Out::Send { to: To::Cs(cs), id, bytes } => {
                     let Some(h) = self.host_of_cs(cs) else { return Err(format!("a request to cs {}, none", cs)) };
+                    /* A write of a chain (N13): its head, or one of its
+                       replicas sent it directly, its chain slow */
+                    if let Some((_, Some(relay))) = Request::decode_relayed(&bytes) {
+                        self.count(if relay.next.is_empty() { "a chain's writes sent directly" } else { "chains begun" });
+                    }
+                    unmarked(self.clients[c].s.chains(), &bytes, &format!("client {}", c), id, cs)?;
                     /* Judged as sent: one sent before, while the view had the
                        cs in, may get there after */
                     if self.owed == Some((c, h)) && Request::decode(&bytes).is_some_and(|r| {
@@ -619,7 +651,7 @@ impl World {
                         self.count("flushes to a cs out of every set");
                     }
                     if self.trace {
-                        let what: String = Request::decode(&bytes).map_or(String::from("?"), |r| match &r.op {
+                        let what: String = Request::decode_relayed(&bytes).map_or(String::from("?"), |(r, _)| match &r.op {
                             nbswire::Op::Write { chunk, offset, data, .. } => {
                                 format!("write chunk {} v{} at {} +{}", chunk.chunk, chunk.epoch.version, offset,
                                         data.len())
@@ -878,6 +910,8 @@ impl World {
         let Some(m) = self.links.get_mut(&(from, to)).and_then(|q| q.pop_front()) else { return Ok(()) };
         match (from, to) {
             (End::Client(_) | End::Clone(_), End::Cs(h)) => self.at_cs(from, h, m),
+            /* A write passed along its chain (N13) */
+            (End::Cs(_), End::Cs(h)) => self.at_cs(from, h, m),
             /* A cs's question to its host's mds, and the answer (N12c) */
             (End::Cs(h), End::Mds(_)) => self.mds_for_cs(h, m),
             (End::Mds(_), End::Cs(h)) => self.told_cs(h, m),
@@ -981,6 +1015,19 @@ impl World {
         let Told::Joins(views) = nbswire::mds::told(&self.state, name, self.index, &Question::Joins) else {
             return Ok(());
         };
+        /* Each view's fences held to the metadata: every volume a writer has
+           had with a chunk in the set, at its newest generation (N13) */
+        for v in &views {
+            for vol in self.state.volumes().iter() {
+                let has = vol.map.iter().any(|&c| {
+                    self.state.chunks().get(c as usize).is_some_and(|ch| !ch.is_free() && ch.set == v.set)
+                });
+                if vol.generation != 0 && has && !v.fences.contains(&(vol.id, vol.generation)) {
+                    return Err(format!("host {}'s join of set {}: volume {} at generation {} not among its fences {:?}",
+                                       name, v.set, vol.id, vol.generation, v.fences));
+                }
+            }
+        }
         if !self.hosts[h].joins_seen {
             self.hosts[h].joins_seen = true;
             for v in views {
@@ -1007,6 +1054,15 @@ impl World {
             }
         }
         for v in views {
+            /* Fenced at its volumes' newest generations first, as nbs-cs
+               fences (N13); and held to it */
+            if !nbscs::now(copy::fence_for(store, &v)) {
+                continue;
+            }
+            if let Some(&(volume, g)) = v.fences.iter().find(|&&(volume, g)| store.fence_of(volume) < g) {
+                return Err(format!("host {}, joining set {}, fenced at {} for volume {}, the newest writer's {}",
+                                   name, v.set, store.fence_of(volume), volume, g));
+            }
             match copies.iter_mut().find(|c| c.set() == v.set && c.since() == v.since) {
                 Some(c) => c.refresh(v),
                 None => {
@@ -1399,6 +1455,21 @@ impl World {
         Ok(())
     }
 
+    /// Time on until every set is whole and nothing is on its way, or
+    /// SETTLE_NS on: whether it came to that.
+    fn quiet(&mut self) -> Result<bool, String> {
+        let until = self.now + SETTLE_NS;
+        while !(self.sets_whole() && self.links.values().all(|q| q.is_empty()) && self.scrub_q.is_empty()) {
+            if self.now >= until {
+                return Ok(false);
+            }
+            self.now += 5 * MS;
+            self.deliver()?;
+            self.tick()?;
+        }
+        Ok(true)
+    }
+
     /// The session of `e` -- a client, or a clone's writer -- with its
     /// buffers, and its host.
     fn session_of(&mut self, e: End) -> Option<(&mut Session, &mut Bufs, usize)> {
@@ -1437,18 +1508,42 @@ impl World {
             return Ok(());
         };
         let (vouched, asks) = (host.vouched.clone(), host.asks.clone());
+        /* A write passed along its chain: on to the next replica as it is
+           taken, before its own write is done (N13) */
+        let mut on = None;
+        if let Some((req, Some(relay))) = Request::decode_relayed(&m.bytes) {
+            if let Some((next, bytes)) = nbswire::relay_on(&req, &relay) {
+                on = Some((next, bytes, relay.next[0].id));
+            }
+        }
         if self.trace {
-            let what: String = Request::decode(&m.bytes).map_or(String::from("none"), |r| {
-                format!("#{} {:?}", r.id, r.op).chars().take(100).collect()
+            let what: String = Request::decode_relayed(&m.bytes).map_or(String::from("none"), |(r, relay)| {
+                let along = relay.map_or(String::new(), |x| format!(" along a chain, mark {}, {} on", x.mark,
+                                                                      x.next.len()));
+                let op: String = match &r.op {
+                    nbswire::Op::Write { chunk, offset, data, .. } => {
+                        format!("write chunk {} at {} +{}, epoch {}.{}", chunk.chunk, offset, data.len(),
+                                chunk.epoch.set, chunk.epoch.version)
+                    }
+                    other => format!("{:?}", other).chars().take(110).collect(),
+                };
+                format!("#{}{} {}", r.id, along, op)
             });
             eprintln!("  [{}] cs {} (host {}) gets from {:?}: {}", self.step, host.cs, host.name, from, what);
         }
         let bytes = m.bytes.clone();
         let fut = Box::pin(async move {
-            let Some(req) = Request::decode(&bytes) else { return Err(Refusal::Bad) };
-            serve(&store, &vouched, &req, &*asks).await
+            let Some((req, relay)) = Request::decode_relayed(&bytes) else { return Err(Refusal::Bad) };
+            serve_relayed(&store, &vouched, &req, relay.as_ref(), &*asks).await
         });
         host.flights.push(Flight { from, msg: m.id, bytes: m.bytes, fut });
+        if let Some((next, bytes, id)) = on {
+            let Some(to) = self.hosts.iter().position(|x| x.name == next) else {
+                return Err(format!("a write passed on to host {}, none", next));
+            };
+            self.count("writes passed on along a chain");
+            self.push(End::Cs(h), End::Cs(to), bytes, id);
+        }
         self.poll_cs(h)
     }
 
@@ -1545,10 +1640,17 @@ impl World {
     /// answered to `from`.
     fn served_at_cs(&mut self, from: End, h: usize, msg: u64, bytes: &[u8], result: Result<Done, Refusal>)
         -> Result<(), String> {
+        /* A write passed along its chain answers the session it names */
+        let relayed = Request::decode_relayed(bytes).and_then(|(_, r)| r.map(|r| named_end(r.answer)));
+        let from = match relayed {
+            Some(Some(end)) => end,
+            Some(None) => return Err(String::from("a write passed on names no session of the target's")),
+            None => from,
+        };
         let World { hosts, state, served, .. } = self;
         let host = &hosts[h];
         let name = host.name;
-        let answer = match Request::decode(bytes) {
+        let answer = match Request::decode_relayed(bytes).map(|(r, _)| r) {
             None => CsAnswer { id: 0, reply: Reply::Refused(nbswire::Refusal::Bad) }.encode(),
             Some(req) => {
                 if self.trace {
@@ -1673,6 +1775,15 @@ impl World {
             /* A copy-up's asks (N10), answered as nbs-mds's member does */
             ask @ (Ask::CopyUp { .. } | Ask::CopyDone { .. }) => {
                 let done = matches!(ask, Ask::CopyDone { .. });
+                /* A copy-up's end that moves the map on -- asked again once
+                   it has, the writes held for it may be out to the new chunk */
+                let ended = match &ask {
+                    Ask::CopyDone { name, place, chunk, .. } if self.state.volume(name)
+                        .and_then(|v| v.map.get(*place as usize)).is_some_and(|&c| c != *chunk) => {
+                        Some((name.clone(), *place))
+                    }
+                    _ => None,
+                };
                 let cmd = match ask {
                     Ask::CopyUp { name, place, generation } => Command::CopyUp { name, place, generation },
                     Ask::CopyDone { name, place, generation, chunk } => {
@@ -1687,6 +1798,9 @@ impl World {
                 }
                 match answer {
                     Answer::Chunk { chunk, incarnation } => {
+                        if let Some((name, place)) = &ended {
+                            self.copied_alike(name, *place)?;
+                        }
                         self.count(if done { "copy-ups done" } else { "copy-ups asked" });
                         Said::Chunk { chunk, incarnation, index: self.index }
                     }
@@ -1708,6 +1822,58 @@ impl World {
             }
         };
         self.push(End::Mds(at), from, Saying { id: a.id, said }.encode(), m.id);
+        Ok(())
+    }
+
+    /// A copy-up of volume `name`'s place `place` done (N10c): every block
+    /// written there read alike on every member of its set active now, its
+    /// host up, and as one of what the volume could hold there -- the new
+    /// chunk the map names now, which the writes held for it have not
+    /// reached yet: a member that never copied reads zeros. The client ends one only once each member
+    /// its view has active has copied: taken out, the rule left a clone's
+    /// chunk all zeros where a member the view had come to since never
+    /// copied, which its race came at one seed in a thousand; N13's chains
+    /// moved that race past the gate's, so it is judged here, as the mds
+    /// takes the end.
+    fn copied_alike(&mut self, name: &str, place: u32) -> Result<(), String> {
+        let per = SLOT / BLOCK;
+        let model = if name == VOLUME { &self.blocks } else { &self.cmodel };
+        let blocks: Vec<(u64, BTreeSet<u8>)> = model.history.keys().copied().filter(|&b| b / per == u64::from(place))
+            .map(|b| {
+                let mut may = model.readable(b, model.acked(b));
+                may.extend(model.durable(b));
+                (b, may)
+            }).collect();
+        for (b, may) in blocks {
+            let Some((volume, chunk, inside, _)) = self.replicas_in(name, b, 0) else { continue };
+            let Some(set) = self.state.sets().get(chunk.epoch.set as usize).cloned() else { continue };
+            let mut seen: Option<(usize, u8)> = None;
+            for i in 0..nbsmeta::REPLICAS {
+                if set.replicas[i] != Replica::Active {
+                    continue;
+                }
+                let Some(h) = self.host_of_cs(set.cs[i]) else { continue };
+                if self.hosts[h].store.is_none() {
+                    continue;
+                }
+                let v = self.block_on(h, volume, chunk, inside)
+                    .map_err(|e| format!("step {}: a copy-up's block {} on host {}: {}", self.step, b,
+                                         self.hosts[h].name, e))?;
+                if !may.contains(&v) {
+                    return Err(format!("step {}: a copy-up of {}'s place {} ended, and its block {} is {} on host {} \
+                                        -- an active member of set {} -- where the volume could hold {:?}", self.step,
+                                       name, place, b, v, self.hosts[h].name, chunk.epoch.set, may));
+                }
+                match seen {
+                    Some((g, w)) if w != v => {
+                        return Err(format!("step {}: a copy-up of {}'s place {} ended, and its block {} is {} on host \
+                                            {} and {} on host {} -- active members of set {} both", self.step, name,
+                                           place, b, w, self.hosts[g].name, v, self.hosts[h].name, chunk.epoch.set));
+                    }
+                    _ => seen = Some((h, v)),
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2078,9 +2244,13 @@ impl World {
         }
         let token = 1 + self.clone_r.below(u64::MAX - 1);
         let mut s = Session::new(CLONE, HOSTS[h], true, false, token);
+        let k = self.clones.len();
+        /* Its writes passed along their replicas (N13), now and then */
+        if self.clone_r.chance(70) {
+            s.answer_at(&format!("k{}", k));
+        }
         let mut out = Vec::new();
         s.start(self.now, &mut out);
-        let k = self.clones.len();
         self.clones.push(CloneW { host: h, s, bufs: Bufs::default(), ops: BTreeMap::new(), next_tag: 1, dead: false,
                                   stop_done: false, flush_failed_at: None });
         self.count("clones made");
@@ -2151,6 +2321,7 @@ impl World {
                 }
                 Out::Send { to: To::Cs(cs), id, bytes } => {
                     let Some(h) = self.host_of_cs(cs) else { return Err(format!("a request to cs {}, none", cs)) };
+                    unmarked(self.clones[k].s.chains(), &bytes, &format!("the clone's writer {}", k), id, cs)?;
                     if self.trace {
                         if let Some(r) = Request::decode(&bytes).filter(|r| matches!(r.op, nbswire::Op::CopyUp { .. })) {
                             eprintln!("  [{}] the clone's writer {} sends #{} to cs {}: {:?} -- view {}", self.step, k,
@@ -2660,6 +2831,11 @@ impl World {
         let c = self.clients.len();
         let token = 1 + self.r.below(u64::MAX - 1);
         let mut s = Session::new(VOLUME, HOSTS[h], true, true, token);
+        /* Its writes passed along their replicas (N13), now and then: the
+           rest to each replica directly, as `nbs io`'s go */
+        if Rng::new(mix(token, 0x6368_6169_6e)).chance(70) {
+            s.answer_at(&format!("w{}", c));
+        }
         let mut out = Vec::new();
         s.start(self.now, &mut out);
         self.clients.push(Client { host: h, s, bufs: Bufs::default(), ops: BTreeMap::new(), next_tag: 1, zombie: false,
@@ -3058,6 +3234,14 @@ impl World {
         self.submit_op(c, K::Flush, 0, 0)?;
         self.drive(c, &idle)?;
         if !self.serving(c) || self.down.is_some() {
+            return Ok(false);
+        }
+        /* The cluster quiet first -- every set whole, nothing on its way:
+           a join's copy filling the network holds a cs's answer past the
+           0.5 s it is given, which takes a live cs out rightly, and is no
+           starving's (found once N13's chains changed what the network
+           carries: a close's answer late behind two joins' pulls) */
+        if !self.quiet()? || !self.serving(c) {
             return Ok(false);
         }
         let failed = self.clients[c].failed;
@@ -3534,6 +3718,13 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
                 w.same(generation, "the end, detached")?;
                 if std::env::var_os("NBS_CLUSTER_STATS").is_some() {
                     eprintln!("cluster seed {}: {:?}", seed, w.stats);
+                }
+                /* Chains that went somewhere: a cs that passes nothing on
+                   leaves every chain to the clients' direct sends, which
+                   nothing else here would tell (N13) */
+                let begun = w.stats.get("chains begun").copied().unwrap_or(0);
+                if begun >= 20 && w.stats.get("writes passed on along a chain").copied().unwrap_or(0) == 0 {
+                    return Err(format!("{} chains begun, no write passed on along one", begun));
                 }
                 return Ok(());
             }

@@ -378,7 +378,7 @@ impl Volume {
     fn open(name: &str, read_only: bool, force: bool) -> Result<Volume, String> {
         let me = nbsdrive::this_host()?;
         let event = SharedEvent::new().ok_or_else(|| String::from("no event for its session"))?;
-        let drive = nbsdrive::Drive::open_on(name, &me, !read_only, force, &event)?;
+        let drive = nbsdrive::Drive::open_on(name, &me, !read_only, force, &event, Some("hv"))?;
         let mut slots = Vec::new();
         slots.try_reserve_exact(blk::IN_FLIGHT).map_err(|_| String::from("out of memory for its buffers"))?;
         for _ in 0..blk::IN_FLIGHT {

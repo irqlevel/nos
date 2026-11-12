@@ -43,7 +43,11 @@
 //! chunk found open part copied as the join is given up.
 //!
 //! At the end -- the copy done, every write delivered -- the joiner holds
-//! every chunk of the set the source does, each the source's byte for byte.
+//! every chunk of the set the source does, each the source's byte for byte;
+//! and, the join over, a writer taken over since, of a map from when a
+//! member back was still active, is refused every chunk the joiner holds,
+//! at every version before the join: the copy moved each one's epoch on,
+//! those its sums found the same among them (N13).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -214,7 +218,7 @@ impl World {
     fn view(&self) -> JoinView {
         JoinView { set: SET, place: 0, since: self.since, version: self.version, own: self.own,
                    until: if self.own { UNTIL } else { 0 }, sources: vec![(SOURCE, String::from("source"))],
-                   index: 1 }
+                   index: 1, fences: vec![(VOLUME, GEN)] }
     }
 
     /// A client's write of the request `op` done on one store as its cs
@@ -302,6 +306,32 @@ impl World {
                                 over: its copy would keep it over the set's", self.since, chunk, version));
         }
         self.stats[7] += 1;
+        Ok(())
+    }
+
+    /// The join over -- the joiner's marks dropped, as nbs-cs's at its end --
+    /// a writer taken over since, of a map from when a member back was still
+    /// active, writes every chunk the joiner holds, at every version before
+    /// the join: refused each time. The joiner is a member now, which the
+    /// writer after it has not fenced yet; taken, such a write would be on
+    /// it alone, the members fenced against that writer refusing it. A
+    /// member back held what its sums found the same at the epoch it last
+    /// knew, and took it there (found by the cluster target in N13, at one
+    /// seed in a thousand: aimed here).
+    fn zombie_after(&mut self) -> Result<(), String> {
+        self.joiner.leave(SET);
+        self.joining = false;
+        let held: Vec<u32> = self.joiner.holdings_in(SET, 0, nbswire::LIST_MAX).iter().map(|e| e.0).collect();
+        for chunk in held {
+            for version in 1..SINCE {
+                self.zseq += 1;
+                let d = data((0x7a6f_6d62 << 32) | self.zseq, SECTOR as usize);
+                if self.serve_write(true, chunk, 0, &d, version).is_ok() {
+                    return Err(format!("the join over, the joiner took a write of chunk {} at epoch {}, before its \
+                                        join at {}, of a writer taken over", chunk, version, self.since));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -452,6 +482,11 @@ impl World {
     /// The copy begun, its writes marked from now on.
     fn begin(&mut self) {
         self.closed_now.clear();
+        /* Fenced at the writer's generation first, as nbs-cs fences: it is
+           already, so nothing to do */
+        if !nbscs::now(copy::fence_for(&self.joiner, &self.view())) {
+            panic!("the joiner not fenced");
+        }
         self.joiner.join(SET, self.since);
         self.copy = Some(Copy::new(self.view(), JOINER, self.now));
     }
@@ -901,6 +936,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
             if w.r.chance(30) {
                 w.check_closed(jid).map_err(|e| format!("step {}: {}", step, e))?;
             }
+            w.zombie_after().map_err(|e| format!("step {}: {}", step, e))?;
             if std::env::var_os("NBS_JOIN_STATS").is_some() {
                 let s = w.copy.as_ref().map(|c| c.stats);
                 eprintln!("join seed {}: {:?}, own {}, cut {}, {} steps, writes {} old {} refused {}, rots {}, moves {}, \

@@ -736,6 +736,14 @@ def main():
         check("nbsload verify through the client: every block read back as last written",
               re.search(r"verify: \d+ reads held to their blocks' last writes as it went, \d+ blocks read back", out)
               is not None and "WRONG" not in out and "nbsload:" not in out, out)
+        # Its session named (nbsdrive's), its writes left a once, along their
+        # chains (N13): a's cs, the head, and the next passed them on, and
+        # none was left for the client to send directly
+        chains = [re.search(r"(\d+) writes passed on along chains, (\d+) not", x.run("nbscs")) for x in sh]
+        check("nbsload's writes passed along their chains, cs to cs, none left to the client",
+              all(chains) and sum(int(m.group(1)) for m in chains) > 0
+              and all(int(m.group(2)) == 0 for m in chains),
+              [m.group(0) if m else None for m in chains])
         out = b.run("insmod /nbsload.ko")
         out = b.run("nbsload disk1 randread secs=2 qd=8 span=8")
         check("and reads on b, read-only", re.search(r"\d+ reads: \d+ IOPS", out) is not None and "nbsload:" not in out,

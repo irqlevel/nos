@@ -19,7 +19,7 @@ use core::task::Poll;
 
 use nbscs::{ChunkRef, Device, Error, SlotState, Store};
 
-use crate::{Op, Question, Refusal, Reply, Request, Told, LIST_MAX};
+use crate::{Op, Question, Refusal, Relay, Reply, Request, Told, LIST_MAX};
 
 /// How a cs asks its host's mds: a question, and what it is told -- None
 /// where there is no mds, or it said nothing in time. nbs-cs.ko's sends it
@@ -87,7 +87,40 @@ pub struct Requests {
     order: RefCell<BTreeMap<u32, VecDeque<u64>>>,
     next: Cell<u64>,
     released: Cell<u64>,
+    relayed: RefCell<BTreeMap<u32, Relayed>>,
 }
+
+/// A volume's writer's writes passed along their chains, at this cs (N13):
+/// its generation; its mark -- every request of its below it answered --
+/// and the ids above the mark applied here, each with its chunk and the
+/// joins of its set begun here when it was. A write that comes again --
+/// along its chain, and directly once the chain was slow -- is applied once:
+/// the copy that comes late may come after the client's next write of the
+/// same blocks, and would put the older data back over it (found by
+/// fuzz/nbs's cluster target with chains, at once). But not across a join
+/// of its set begun since: its sectors not marked by it, the join's copy
+/// may have written the source's data over them, and the client, which
+/// sends it again because it is not done, is to have it written again --
+/// and marked (found by the cluster target: a member taken out and back
+/// answered a write the copy had undone as done).
+struct Relayed {
+    generation: u64,
+    mark: u64,
+    done: BTreeMap<u64, Applied>,
+}
+
+/// A relayed write applied: its chunk, and the joins of its set begun here
+/// when it was (`Store::joins_begun`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Applied {
+    chunk: u32,
+    incarnation: u32,
+    joins: u64,
+}
+
+/// The ids a writer's relayed writes keep above its mark, at most: past
+/// it, refused for now until the mark moves on.
+pub const RELAYED_MAX: usize = 65536;
 
 /// A chunk's order held, or waited for: let go when dropped.
 struct InOrder<'a> {
@@ -145,6 +178,42 @@ impl Requests {
     /// Chunks' turns held or waited for: none once every request is over.
     pub fn in_use(&self) -> usize {
         self.order.borrow().values().map(|q| q.len()).sum()
+    }
+
+    /// Whether write `id` of volume `volume`'s writer at `generation`, come
+    /// with mark `mark`, was applied here before as `now` has it -- the same
+    /// chunk, no join of its set begun since -- or is below the mark,
+    /// answered, and is answered as done, not written again. None where the
+    /// writer has too many ids above its mark kept: refused for now.
+    fn relayed_seen(&self, volume: u32, generation: u64, id: u64, mark: u64, now: Applied) -> Option<bool> {
+        let mut t = self.relayed.borrow_mut();
+        let e = t.entry(volume).or_insert(Relayed { generation, mark: 0, done: BTreeMap::new() });
+        if generation > e.generation {
+            *e = Relayed { generation, mark: 0, done: BTreeMap::new() };
+        }
+        /* An older writer's: the fence refuses it */
+        if generation < e.generation {
+            return Some(false);
+        }
+        if mark > e.mark {
+            e.mark = mark;
+            e.done = e.done.split_off(&mark);
+        }
+        if id < e.mark || e.done.get(&id) == Some(&now) {
+            return Some(true);
+        }
+        if e.done.len() >= RELAYED_MAX {
+            return None;
+        }
+        Some(false)
+    }
+
+    fn relayed_done(&self, volume: u32, generation: u64, id: u64, applied: Applied) {
+        if let Some(e) = self.relayed.borrow_mut().get_mut(&volume) {
+            if e.generation == generation && id >= e.mark {
+                e.done.insert(id, applied);
+            }
+        }
     }
 
     fn has_check(&self, key: &Check) -> bool {
@@ -269,6 +338,13 @@ impl Done {
 /// is not refused for it (N10d).
 pub async fn serve<D: Device, A: Asker>(store: &Store<D>, vouched: &Requests, req: &Request<'_>, ask: &A)
     -> Result<Done, Refusal> {
+    serve_noting(store, vouched, req, ask, &Cell::new(0)).await
+}
+
+/// `serve`, and for a write, the joins of its chunk's set the cs had begun
+/// as it was marked put in `joins` (`Store::write_marked`, N13).
+async fn serve_noting<D: Device, A: Asker>(store: &Store<D>, vouched: &Requests, req: &Request<'_>, ask: &A,
+                                           joins: &Cell<u64>) -> Result<Done, Refusal> {
     let (v, g) = (req.volume, req.generation);
     let _order = match req.op {
         Op::Write { chunk, .. } | Op::Read { chunk, .. } | Op::Close { chunk, .. } => {
@@ -307,13 +383,14 @@ pub async fn serve<D: Device, A: Asker>(store: &Store<D>, vouched: &Requests, re
         Op::Write { chunk, position, index, offset, data } => {
             let check = Check::of(v, g, chunk);
             let known = vouched.knows(store, &check, &chunk);
-            match store.write(v, g, chunk, offset, data, known).await {
+            let marked = match store.write_marked(v, g, chunk, offset, data, known).await {
                 Err(e) if unchecked(&e, known) => {
                     verify(store, vouched, ask, check, position, index, true).await?;
-                    store.write(v, g, chunk, offset, data, true).await.map_err(Refusal::of)?;
+                    store.write_marked(v, g, chunk, offset, data, true).await.map_err(Refusal::of)?
                 }
                 done => done.map_err(Refusal::of)?,
-            }
+            };
+            joins.set(marked);
             Ok(Done::Done)
         }
         Op::Read { chunk, position, index, offset, len } => {
@@ -379,6 +456,38 @@ pub async fn serve<D: Device, A: Asker>(store: &Store<D>, vouched: &Requests, re
             Ok(Done::Done)
         }
     }
+}
+
+/// `req` done on `store` as `serve` does it -- and, a write passed along its
+/// chain (N13), applied once: one that comes again, along its chain and
+/// directly, answered as done, not written again over what may have come
+/// after it (`Requests`'s relayed writes).
+pub async fn serve_relayed<D: Device, A: Asker>(store: &Store<D>, requests: &Requests, req: &Request<'_>,
+                                                relay: Option<&Relay<'_>>, ask: &A) -> Result<Done, Refusal> {
+    let Some(relay) = relay else { return serve(store, requests, req, ask).await };
+    let (v, g) = (req.volume, req.generation);
+    /* Only a write is relayed (`decode_relayed`) */
+    let Op::Write { chunk, .. } = req.op else { return serve(store, requests, req, ask).await };
+    let now = Applied { chunk: chunk.chunk, incarnation: chunk.incarnation, joins: store.joins_begun(chunk.epoch.set) };
+    match requests.relayed_seen(v, g, req.id, relay.mark, now) {
+        /* Applied before -- and answered as the store would answer it now:
+           refused to a writer a newer fence has taken the volume from */
+        Some(true) => {
+            let fence = store.fence_of(v);
+            return if fence > g { Err(Refusal::Fenced { generation: fence }) } else { Ok(Done::Done) };
+        }
+        None => return Err(Refusal::NotReady),
+        Some(false) => {}
+    }
+    /* With the joins begun as it was marked: one begun while it waited for
+       its turn or the mds -- or by the mds's answer -- marked it, one begun
+       as its data went to the device did not */
+    let joins = Cell::new(0);
+    let done = serve_noting(store, requests, req, ask, &joins).await;
+    if matches!(done, Ok(Done::Done)) {
+        requests.relayed_done(v, g, req.id, Applied { joins: joins.get(), ..now });
+    }
+    done
 }
 
 /// A copy-up's copy done on the store (N10) -- where the cs does not hold

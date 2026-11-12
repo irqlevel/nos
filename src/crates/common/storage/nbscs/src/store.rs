@@ -411,6 +411,9 @@ struct State {
     /// write is.
     joining: BTreeMap<u32, u32>,
     marks: BTreeMap<u32, Marks>,
+    /// The joins of each set this cs has begun, counted, those over among
+    /// them (`joins_begun`).
+    begun: BTreeMap<u32, u64>,
 }
 
 /// The sectors of a chunk that clients have written since the join of its
@@ -482,6 +485,7 @@ impl<D: Device> Store<D> {
                 fence_free: (0..FENCES_MAX as u32).rev().collect(),
                 found: BTreeMap::new(),
                 joining: BTreeMap::new(),
+                begun: BTreeMap::new(),
                 marks: BTreeMap::new(),
             }),
             chunk_turns: Turns::default(),
@@ -1042,6 +1046,14 @@ impl<D: Device> Store<D> {
     /// not hold yet, and for an epoch other than the one it knows.
     pub async fn write(&self, volume: u32, generation: u64, c: ChunkRef, offset: u32, data: &[u8], verified: bool)
         -> Result<(), Error> {
+        self.write_marked(volume, generation, c, offset, data, verified).await.map(|_| ())
+    }
+
+    /// `write`, and the joins of `c`'s set this cs had begun as the write
+    /// was marked (`joins_begun`): one begun after it, as its data went to
+    /// the device, did not mark it, and its copy may write over it (N13).
+    pub async fn write_marked(&self, volume: u32, generation: u64, c: ChunkRef, offset: u32, data: &[u8],
+                              verified: bool) -> Result<u64, Error> {
         let _volume = self.volume_turns.take(volume, false).await;
         let _chunk = self.chunk_turns.take(c.chunk, true).await;
         self.check_fence(volume, generation)?;
@@ -1091,12 +1103,13 @@ impl<D: Device> Store<D> {
         /* Marked before it is written, where its set is joined: a copy must
            not write over it, and a mark that cannot be kept refuses it */
         self.mark(&c, offset, data.len())?;
+        let joins = self.joins_begun(c.epoch.set);
         let dev = self.dev(dv);
         if dev.write_data(dev.data_at(slot, u64::from(offset)), data).await.is_err() {
             dev.fail();
             return Err(Error::Io);
         }
-        Ok(())
+        Ok(joins)
     }
 
     /// A slot taken for chunk `c`, which the cs does not hold, open for
@@ -1246,8 +1259,19 @@ impl<D: Device> Store<D> {
     pub fn join(&self, set: u32, since: u32) {
         if self.s.borrow().joining.get(&set) != Some(&since) {
             self.leave(set);
-            self.s.borrow_mut().joining.insert(set, since);
+            let mut s = self.s.borrow_mut();
+            s.joining.insert(set, since);
+            *s.begun.entry(set).or_insert(0) += 1;
         }
+    }
+
+    /// How many joins of set `set` this cs has begun -- those over, done or
+    /// given up, among them. A client's write applied here before the last
+    /// began was not marked by it, and its copy may have written the
+    /// source's data over it since: one that comes again is to be written
+    /// again, not taken as applied (nbswire's relayed writes, N13).
+    pub fn joins_begun(&self, set: u32) -> u64 {
+        self.s.borrow().begun.get(&set).copied().unwrap_or(0)
     }
 
     /// The join of set `set` over -- done, or given up: its marks dropped.
@@ -1555,7 +1579,8 @@ impl<D: Device> Store<D> {
 
     /// Chunk `c`'s copy done: its data flushed, then its record closed where
     /// no client has written it since the join began -- one a client has,
-    /// at its generation, is that client's to close.
+    /// at its generation, is that client's to close -- and its epoch moved
+    /// on to the copy's, `c`'s, where it was older.
     pub async fn close_copy(&self, c: ChunkRef) -> Result<(), Error> {
         let _chunk = self.chunk_turns.take(c.chunk, true).await;
         let Some((dv, slot, r)) = self.find(&c)? else { return Ok(()) };
@@ -1579,10 +1604,22 @@ impl<D: Device> Store<D> {
            kept, the joiner's crash made the chunk found open, and as its
            set's last member it was no source for the joiner after it) */
         let written = self.s.borrow().marks.get(&c.chunk).is_some_and(|m| m.incarnation == c.incarnation);
-        if r.state != SlotState::Open || (r.generation != 0 && written) {
+        let close = r.state == SlotState::Open && !(r.generation != 0 && written);
+        /* Known at the copy's epoch from now on, as the source knows it once
+           the copy has pulled or summed it: a member back keeps the chunks
+           its sums found the same at the epoch it last knew them at, and,
+           the join done, a writer taken over while it was out -- whose new
+           writer's fence never reached it -- would write them there
+           unfenced, by its view of before, which the members fenced
+           against it refuse (found by fuzz/nbs's cluster target, N13: a
+           chain passed such a write on to it). An epoch newer than the
+           copy's, a client's write since, is kept */
+        let known = if r.known.set == c.epoch.set && r.known.version < c.epoch.version { c.epoch } else { r.known };
+        if !close && known == r.known {
             return Ok(());
         }
-        self.put(dv, slot, Record { state: SlotState::Written, seq: r.seq + 1, ..r }).await
+        let state = if close { SlotState::Written } else { r.state };
+        self.put(dv, slot, Record { state, known, seq: r.seq + 1, ..r }).await
     }
 
     /// The chunks of set `set` the cs holds, from chunk number `from` on,
