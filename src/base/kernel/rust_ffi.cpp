@@ -43,11 +43,6 @@
 
 static const ulong RUST_ALLOC_TAG = 'rust';
 
-/* kernel_printer_write hands a Printer at most this much at a time */
-static const unsigned long PRINTER_CHUNK_SIZE = 128;
-
-/* Longer than any net device's name: VirtioNet's are at most 7 */
-
 /* kernel_cmd_dispatch: the longest command line it runs -- as long as a line
    of /etc/rc (cmd.cpp's SCRIPT_LINE_MAX): a guest's `hv start` over SSH with a
    distribution's kernel command line runs past two hundred characters before
@@ -105,13 +100,20 @@ public:
         char text[FORMAT_MAX];
         if (stdlib::vsn_printf(text, sizeof(text), fmt, args) < 0)
             return;
-        put(text);
+        put(text, stdlib::str_len(text));
     }
 
     virtual void print_string(const char *s) override
     {
         if (s != nullptr)
-            put(s);
+            put(s, stdlib::str_len(s));
+    }
+
+    /* The bytes as they are, a NUL among them: the session carries them on */
+    virtual void write(const char* buf, size_t len) override
+    {
+        if (buf != nullptr)
+            put(buf, len);
     }
 
     virtual void backspace() override
@@ -162,10 +164,10 @@ private:
     SinkPrinter(const SinkPrinter& other) = delete;
     SinkPrinter& operator=(const SinkPrinter& other) = delete;
 
-    void put(const char* s)
+    void put(const char* s, size_t n)
     {
         bool line_end = false;
-        for (; *s != '\0'; s++)
+        for (size_t i = 0; i < n; i++)
         {
             if (len_ == size_)
             {
@@ -178,8 +180,8 @@ private:
             }
             if (len_ == 0)
                 oldest_ = kernel::get_boot_time().get_value();
-            buf_[len_++] = (unsigned char)*s;
-            if (*s == '\n' || *s == '\r')
+            buf_[len_++] = (unsigned char)s[i];
+            if (s[i] == '\n' || s[i] == '\r')
                 line_end = true;
         }
 
@@ -230,7 +232,9 @@ void kernel_klog(unsigned int level, const unsigned char* msg, unsigned long len
     if (level > (unsigned int)kernel::Klog::get_instance().get_level())
         return;
 
-    char buf[512];
+    /* A line as long as the log carries one: what is past it would be cut
+       by Klog::output anyway, and ffi's klog! formats no more */
+    char buf[kernel::Klog::LINE_SIZE];
     unsigned long n = (len < sizeof(buf) - 1) ? len : sizeof(buf) - 1;
     stdlib::mem_cpy(buf, msg, n);
     buf[n] = '\0';
@@ -426,8 +430,23 @@ unsigned long long kernel_spinlock_lock(unsigned long handle)
     return (unsigned long long)flags;
 }
 
+/* A Rust guard that saved the interrupt flag, given back: interrupts are
+   off from its lock to its release, so finding them on means a guard taken
+   before this one was released before it -- the two out of order, the
+   outer's flags turning interrupts and preemption on under this lock -- or
+   something turned them on inside. Said here, at the inner release, where
+   it is certain, rather than left a deadlock for the next interrupt that
+   takes the lock and a task run on with interrupts off (kcore::sync). One
+   flags read; only Rust calls the two exports that make it. */
+static void check_interrupts_saved(const char* what)
+{
+    if (unlikely(hal::is_interrupt_enabled()))
+        PANIC("%s: released with interrupts on -- after a guard taken before it, or with them turned on inside", what);
+}
+
 void kernel_spinlock_unlock(unsigned long handle, unsigned long long flags)
 {
+    check_interrupts_saved("a SpinLock");
     reinterpret_cast<kernel::SpinLock*>(handle)->unlock((unsigned long)flags);
 }
 
@@ -611,25 +630,34 @@ struct RustIPIAdapter
 {
     void (*handler)(void*);
     void* ctx;
+    /* Set on the far CPU as the handler is called: an IPI task is completed
+       without running too, by a CPU that stopped taking them before it came
+       (Cpu::queue_ipi_task_async) */
+    bool ran;
 };
 
 static void rust_ipi_trampoline(void* actx, kernel::Context*)
 {
     auto* a = static_cast<RustIPIAdapter*>(actx);
+    a->ran = true;
     a->handler(a->ctx);
 }
 
 extern "C" {
 
-void kernel_cpu_run_on(unsigned int cpu,
+/* handler(ctx) on `cpu`, waited for: 1 when it ran there, 0 when it did not
+   -- the CPU out of range, not running, or closed to IPI work before the
+   task came -- which the caller used to be unable to tell from a run. */
+int kernel_cpu_run_on(unsigned int cpu,
     void (*handler)(void*), void* ctx)
 {
     if (!handler || cpu >= (unsigned int)kernel::MAX_CPUS)
-        return;
+        return 0;
 
     /* A CPU that never started or already exited will not drain its IPI task
-       list; queueing would block Completion.wait() forever (send_ipi_self
-       silently refuses to send in those states). */
+       list: queueing would block the completion's wait forever, and the IPI
+       itself is a BUG_ON for a CPU that is not running (send_ipi_self; only
+       a parked one is refused without a word). So it is looked at here. */
     auto& target = kernel::CpuTable::get_instance().get_cpu(cpu);
     ulong state = target.get_state();
     if (!(state & kernel::Cpu::STATE_RUNNING) ||
@@ -637,12 +665,15 @@ void kernel_cpu_run_on(unsigned int cpu,
     {
         klog(0, "kernel_cpu_run_on: cpu %lu not running (state 0x%lX)",
               (ulong)cpu, state);
-        return;
+        return 0;
     }
 
-    RustIPIAdapter a{handler, ctx};
+    RustIPIAdapter a{handler, ctx, false};
     kernel::IPITask task(rust_ipi_trampoline, &a);
     target.queue_ipi_task(task);
+    /* The task's completion is the far CPU's last word on it: what it did
+       with `a` is seen here (WaitGroup's done and its wait order them) */
+    return a.ran ? 1 : 0;
 }
 
 } /* extern "C" */
@@ -751,15 +782,26 @@ void kernel_cpu_latency(unsigned int cpu, int hold)
     target.queue_ipi_task(task);
 }
 
+/* Whether `cpu` is one the kick and the notification may be sent to: a CPU
+   that has started and not stopped (one atomic read). Any other number was
+   sent as it was -- on arm64 a number past the board's CPUs is taken for
+   an affinity of its own (Gic::send_sgi), a BUG_ON past 15 -- where the
+   declaration promises nothing. */
+static bool cpu_takes_ipis(unsigned int cpu)
+{
+    return cpu < (unsigned int)kernel::MAX_CPUS &&
+        (kernel::CpuTable::get_instance().get_running_cpus_no_lock() & (1UL << cpu)) != 0;
+}
+
 /* An interrupt to `cpu`, now, and nothing waited for: what makes a vCPU that
    is running a guest there leave it -- a physical interrupt ends the guest's
    turn -- and costs any other CPU an interrupt with nothing to do. Sent the
    way SoftIrq's kick is, straight to the interrupt controller: the caller may
    have interrupts off, and CpuTable::send_ipi takes locks its handler takes
-   too. A CPU that is not running holds it pending, or never sees it. */
+   too. Nothing for a CPU that is not running, or not there. */
 void kernel_cpu_kick(unsigned int cpu)
 {
-    if (cpu >= (unsigned int)kernel::MAX_CPUS)
+    if (!cpu_takes_ipis(cpu))
         return;
 
     hal::send_ipi(cpu, kernel::CpuTable::IPI_VECTOR);
@@ -768,10 +810,10 @@ void kernel_cpu_kick(unsigned int cpu)
 /* The notification of an interrupt posted for the vCPU running on `cpu`
    (hal::POSTED_VECTOR): the CPU takes it in the guest without an exit, and
    out of one it is an interrupt that only ends itself. Sent as the kick is,
-   from any context. */
+   from any context, and to the same CPUs. */
 void kernel_cpu_notify(unsigned int cpu)
 {
-    if (cpu >= (unsigned int)kernel::MAX_CPUS)
+    if (!cpu_takes_ipis(cpu))
         return;
 
     hal::send_ipi(cpu, hal::POSTED_VECTOR);
@@ -1089,10 +1131,10 @@ int kernel_softirq_pending(unsigned long type)
     return kernel::SoftIrq::get_instance().is_pending(type) ? 1 : 0;
 }
 
-void kernel_softirq_register(unsigned long type,
+int kernel_softirq_register(unsigned long type,
     void (*handler)(void*), void* ctx)
 {
-    kernel::SoftIrq::get_instance().register_handler(type, handler, ctx);
+    return kernel::SoftIrq::get_instance().register_handler(type, handler, ctx) ? 1 : 0;
 }
 
 /* ---- PCI ---- */
@@ -1250,11 +1292,21 @@ unsigned long kernel_msix_create(unsigned short bus, unsigned short slot,
     return (unsigned long)t;
 }
 
+} /* extern "C" */
+
+static void forget_msix_table(const kernel::MsixTable* table);
+
+extern "C" {
+
 void kernel_msix_destroy(unsigned long handle)
 {
     if (handle == 0)
         return;
     auto* t = reinterpret_cast<kernel::MsixTable*>(handle);
+    /* The slots still registered on it, kcore's interrupts dropped after
+       their table, forget it first: their unregister has no entry to turn
+       away after this -- the table turns MSI-X off as it goes */
+    forget_msix_table(t);
     t->~MsixTable();
     kernel::mm::free(t);
 }
@@ -1289,6 +1341,23 @@ int kernel_msix_is_ready(unsigned long handle)
 
 } /* extern "C" */
 
+/* ---- The callback slots' handles ---- */
+
+/* A slot's handle, as each table of callback slots below makes one -- the
+   line interrupts', the timers', the MSI-X entries': the slot's number and
+   one in the low half, and in the high half the generation of the tenant it
+   was given to, counted at each registration -- so that a handle kept past
+   its unregister, or given back twice, is not the handle of whoever has
+   the slot now. The interrupt tables' handles were the slot and one alone,
+   and a second unregister of one took its slot's next tenant off. */
+static const ulong SLOT_HANDLE_BITS = 32;
+static const ulong SLOT_HANDLE_MASK = (1UL << SLOT_HANDLE_BITS) - 1;
+
+static ulong slot_handle(ulong slot, u32 generation)
+{
+    return ((ulong)generation << SLOT_HANDLE_BITS) | (slot + 1);
+}
+
 /* ---- Legacy (INTx) interrupts ---- */
 
 static const ulong RUST_IRQ_SLOT_COUNT = 8;
@@ -1302,7 +1371,14 @@ struct RustIrqSlot
     void (*handler)(void*) = nullptr;
     void* ctx = nullptr;
     u8 vector = 0;
+    /* Taken: from its registration until its unregister is done with it --
+       the ISRs mid-call waited out, not merely its handler gone */
     bool used = false;
+    /* Being unregistered: no second unregister of it, and not yet anyone
+       else's */
+    bool stopping = false;
+    /* Its tenant's, the high half of its handle (slot_handle) */
+    u32 generation = 0;
     kernel::Atomic in_flight; /* ISRs currently executing Handler */
 };
 
@@ -1432,6 +1508,7 @@ unsigned long kernel_interrupt_register_level(
             rust_irq_slots[i].handler = handler;
             rust_irq_slots[i].ctx = ctx;
             rust_irq_slots[i].used = true;
+            rust_irq_slots[i].stopping = false;
             __atomic_store_n(&rust_irq_slots[i].vector, static_cast<u8>(0), __ATOMIC_RELAXED);
 
             auto& lh = get_legacy_handler(i);
@@ -1473,8 +1550,10 @@ unsigned long kernel_interrupt_register_level(
             }
 
             *out_vector = rust_irq_slots[i].vector;
+            rust_irq_slots[i].generation = rust_irq_slots[i].generation + 1;
+            const ulong handle = slot_handle(i, rust_irq_slots[i].generation);
             rust_irq_lock.write_unlock_irq_restore(flags);
-            return i + 1;
+            return handle;
         }
     }
     rust_irq_lock.write_unlock_irq_restore(flags);
@@ -1485,30 +1564,46 @@ unsigned long kernel_interrupt_register_level(
 
 void kernel_interrupt_unregister(unsigned long handle)
 {
-    if (handle == 0 || handle > RUST_IRQ_SLOT_COUNT)
+    const ulong slot = handle & SLOT_HANDLE_MASK;
+    if (slot == 0 || slot > RUST_IRQ_SLOT_COUNT)
         return;
-    ulong i = handle - 1;
+    ulong i = slot - 1;
     ulong flags = rust_irq_lock.write_lock_irq_save();
+
+    /* A handle that is not this slot's tenant's -- given back already, or
+       the slot's last tenant's -- takes nothing off */
+    if (!rust_irq_slots[i].used || rust_irq_slots[i].stopping ||
+        (ulong)rust_irq_slots[i].generation != (handle >> SLOT_HANDLE_BITS))
+    {
+        rust_irq_lock.write_unlock_irq_restore(flags);
+        return;
+    }
 
     /* Off its line first. The slot was all that used to be given back: the
        line's entry kept the handler and the IO-APIC's pin stayed unmasked,
        so a device that asserted the line again interrupted for ever with
        nobody to quiet it, and the slot's next registration found its own
        vector taken -- refused, or chained onto the line a second time. */
-    if (rust_irq_slots[i].used)
-        kernel::Interrupt::unregister_level(get_legacy_handler(i));
+    kernel::Interrupt::unregister_level(get_legacy_handler(i));
 
     rust_irq_slots[i].handler = nullptr;
     rust_irq_slots[i].ctx = nullptr;
-    rust_irq_slots[i].used = false;
+    rust_irq_slots[i].stopping = true;
     __atomic_store_n(&rust_irq_slots[i].vector, static_cast<u8>(0), __ATOMIC_RELAXED);
     rust_irq_lock.write_unlock_irq_restore(flags);
 
     /* Wait out an ISR mid-call on another CPU: the caller may free ctx the
        moment we return. An ISR on this CPU cannot be mid-call here --
-       interrupts run to completion. */
+       interrupts run to completion. The slot stays taken until then: given
+       back first, a registration in the gap counted its own ISRs in the
+       same in_flight this waits on. */
     while (rust_irq_slots[i].in_flight.get() != 0)
         cpu_relax();
+
+    flags = rust_irq_lock.write_lock_irq_save();
+    rust_irq_slots[i].stopping = false;
+    rust_irq_slots[i].used = false;
+    rust_irq_lock.write_unlock_irq_restore(flags);
 }
 
 } /* extern "C" */
@@ -1534,9 +1629,6 @@ struct RustTimerSlot
 
 static RustTimerSlot rust_timer_slots[RUST_TIMER_SLOT_COUNT];
 static kernel::RawRwSpinLock rust_timer_lock;
-
-static const ulong RUST_TIMER_SLOT_BITS = 32;
-static const ulong RUST_TIMER_SLOT_MASK = (1UL << RUST_TIMER_SLOT_BITS) - 1;
 
 class RustTimerAdapter : public kernel::TimerCallback
 {
@@ -1603,7 +1695,7 @@ unsigned long kernel_timer_start(
                 return 0;
             }
             rust_timer_lock.write_unlock_irq_restore(flags);
-            return (generation << RUST_TIMER_SLOT_BITS) | (i + 1);
+            return slot_handle(i, (u32)generation);
         }
     }
     rust_timer_lock.write_unlock_irq_restore(flags);
@@ -1612,7 +1704,7 @@ unsigned long kernel_timer_start(
 
 void kernel_timer_stop(unsigned long handle)
 {
-    const ulong slot = handle & RUST_TIMER_SLOT_MASK;
+    const ulong slot = handle & SLOT_HANDLE_MASK;
     if (slot == 0 || slot > RUST_TIMER_SLOT_COUNT)
         return;
     ulong i = slot - 1;
@@ -1632,7 +1724,7 @@ void kernel_timer_stop(unsigned long handle)
        slot's last tenant's -- stops nothing. */
     ulong flags = rust_timer_lock.write_lock_irq_save();
     if (!rust_timer_slots[i].active || rust_timer_slots[i].stopping ||
-        (ulong)rust_timer_slots[i].generation != (handle >> RUST_TIMER_SLOT_BITS))
+        (ulong)rust_timer_slots[i].generation != (handle >> SLOT_HANDLE_BITS))
     {
         rust_timer_lock.write_unlock_irq_restore(flags);
         return;
@@ -1661,11 +1753,21 @@ struct RustMsixSlot
 {
     void (*handler)(void*) = nullptr;
     void* ctx = nullptr;
+    /* Taken and being unregistered, as a line's slot is */
     bool used = false;
+    bool stopping = false;
+    u32 generation = 0;
     /* The CPU's vector the slot's interrupt comes at, as the table that
        enabled it said (on_interrupt_register, before it unmasked the entry):
        what its records name. An atomic, read by the interrupt on any CPU. */
     u8 vector = 0;
+    /* The table and the entry that send to the slot: what its unregister
+       turns away from it before the slot is anyone else's -- until then the
+       device's entry stayed unmasked and aimed at the slot's stub, and its
+       next tenant was called for another device's interrupts. Null once the
+       table is destroyed (kernel_msix_destroy), which turns MSI-X off. */
+    kernel::MsixTable* table = nullptr;
+    u16 index = 0;
     kernel::Atomic in_flight; /* ISRs currently executing Handler */
 };
 
@@ -1783,6 +1885,18 @@ static inline __attribute__((always_inline)) void run_rust_msix(int slot)
     hal::irq_eoi();
 }
 
+/* A table being destroyed, out of every slot that names it (kernel_msix_destroy) */
+static void forget_msix_table(const kernel::MsixTable* table)
+{
+    ulong flags = rust_msix_lock.write_lock_irq_save();
+    for (ulong i = 0; i < RUST_MSIX_SLOT_COUNT; i++)
+    {
+        if (rust_msix_slots[i].table == table)
+            rust_msix_slots[i].table = nullptr;
+    }
+    rust_msix_lock.write_unlock_irq_restore(flags);
+}
+
 extern "C" {
 
 /* x86's MSI-X: a slot's IDT stub's, with its records (tp::Irq) */
@@ -1817,6 +1931,7 @@ unsigned long kernel_msix_register_handler(
             rust_msix_slots[i].handler = handler;
             rust_msix_slots[i].ctx = ctx;
             rust_msix_slots[i].used = true;
+            rust_msix_slots[i].stopping = false;
 
             auto& mh = get_msix_slot_handler(i);
             mh.slot_index_ = i;
@@ -1831,9 +1946,13 @@ unsigned long kernel_msix_register_handler(
                 rust_msix_lock.write_unlock_irq_restore(flags);
                 return 0;
             }
+            rust_msix_slots[i].table = t;
+            rust_msix_slots[i].index = msix_index;
+            rust_msix_slots[i].generation = rust_msix_slots[i].generation + 1;
+            const ulong handle = slot_handle(i, rust_msix_slots[i].generation);
             *out_vector = vector;
             rust_msix_lock.write_unlock_irq_restore(flags);
-            return i + 1;
+            return handle;
         }
     }
     rust_msix_lock.write_unlock_irq_restore(flags);
@@ -1843,18 +1962,39 @@ unsigned long kernel_msix_register_handler(
 
 void kernel_msix_unregister_handler(unsigned long handle)
 {
-    if (handle == 0 || handle > RUST_MSIX_SLOT_COUNT)
+    const ulong slot = handle & SLOT_HANDLE_MASK;
+    if (slot == 0 || slot > RUST_MSIX_SLOT_COUNT)
         return;
-    ulong i = handle - 1;
+    ulong i = slot - 1;
     ulong flags = rust_msix_lock.write_lock_irq_save();
+    if (!rust_msix_slots[i].used || rust_msix_slots[i].stopping ||
+        (ulong)rust_msix_slots[i].generation != (handle >> SLOT_HANDLE_BITS))
+    {
+        rust_msix_lock.write_unlock_irq_restore(flags);
+        return;
+    }
     rust_msix_slots[i].handler = nullptr;
     rust_msix_slots[i].ctx = nullptr;
-    rust_msix_slots[i].used = false;
+    rust_msix_slots[i].stopping = true;
+
+    /* The device's entry masked and its interrupt sent to the slot's stub no
+       more, before the slot is free for another device's (disable_vector):
+       under the lock, so that a destroy of the table cannot come between
+       the look and the use, and in the order register takes its locks */
+    if (rust_msix_slots[i].table != nullptr)
+        rust_msix_slots[i].table->disable_vector(rust_msix_slots[i].index);
+    rust_msix_slots[i].table = nullptr;
     rust_msix_lock.write_unlock_irq_restore(flags);
 
-    /* Wait out an ISR mid-call on another CPU (see kernel_interrupt_unregister) */
+    /* Wait out an ISR mid-call on another CPU (see kernel_interrupt_unregister),
+       the slot still taken */
     while (rust_msix_slots[i].in_flight.get() != 0)
         cpu_relax();
+
+    flags = rust_msix_lock.write_lock_irq_save();
+    rust_msix_slots[i].stopping = false;
+    rust_msix_slots[i].used = false;
+    rust_msix_lock.write_unlock_irq_restore(flags);
 }
 
 } /* extern "C" */
@@ -1950,23 +2090,15 @@ void kernel_cmd_unregister(unsigned long handle)
     kernel::Cmd::get_instance().unregister_dynamic(handle);
 }
 
-/* out is the stdlib::Printer a command handler was given */
+/* out is the stdlib::Printer a command handler was given: the bytes as they
+   are, to a printer that carries them on, and what a screen shows of them to
+   one that shows text (Printer::write) */
 void kernel_printer_write(void* out, const unsigned char* buf, unsigned long len)
 {
     if (out == nullptr || buf == nullptr)
         return;
 
-    auto* printer = static_cast<stdlib::Printer*>(out);
-    char chunk[PRINTER_CHUNK_SIZE];
-    while (len != 0)
-    {
-        unsigned long n = (len < sizeof(chunk) - 1) ? len : sizeof(chunk) - 1;
-        stdlib::mem_cpy(chunk, buf, n);
-        chunk[n] = '\0';
-        printer->print_string(chunk);
-        buf += n;
-        len -= n;
-    }
+    static_cast<stdlib::Printer*>(out)->write(reinterpret_cast<const char*>(buf), len);
 }
 
 /* kernel_cmd_dispatch and kernel_cmd_dispatch_io: a command line run as the
@@ -2451,6 +2583,7 @@ unsigned long kernel_irq_save()
 
 void kernel_irq_restore(unsigned long flags)
 {
+    check_interrupts_saved("interrupts saved (an IrqSpinLock, irq_save)");
     kernel::preempt_irq_restore(flags);
 }
 
@@ -2516,10 +2649,13 @@ int kernel_panic_active()
 
 /* One decoded byte of a keystroke from a driver in Rust -- the USB
    keyboard -- to every observer: the shell, and whatever else is listening.
-   What it is is KeyboardObserver's (kernel/input.h). */
-void kernel_input_key(char c, unsigned char code)
+   What it is is KeyboardObserver's (kernel/input.h). A byte, as Rust passes
+   it: a `char` here was signed on x86-64 and unsigned on arm64, and clang
+   takes a signed one as its caller sign-extended it, which Rust's zero-
+   extended u8 is not past 0x7F (scripts/check-ffi.py) */
+void kernel_input_key(u8 c, u8 code)
 {
-    kernel::KeyboardInput::get_instance().emit(c, code);
+    kernel::KeyboardInput::get_instance().emit(static_cast<char>(c), code);
 }
 
 /* dhcp=off: the shell's `dhcp` says so rather than running one. */
@@ -2694,7 +2830,7 @@ void sweep_module_slots(ulong lo, ulong hi, const char* name)
         ulong flags = rust_timer_lock.write_lock_irq_save();
         const ulong code = reinterpret_cast<ulong>(rust_timer_slots[i].handler);
         if (rust_timer_slots[i].active && !rust_timer_slots[i].stopping && code >= lo && code < hi)
-            handle = ((ulong)rust_timer_slots[i].generation << RUST_TIMER_SLOT_BITS) | (i + 1);
+            handle = slot_handle(i, rust_timer_slots[i].generation);
         rust_timer_lock.write_unlock_irq_restore(flags);
 
         if (handle != 0)
@@ -2706,29 +2842,33 @@ void sweep_module_slots(ulong lo, ulong hi, const char* name)
 
     for (ulong i = 0; i < RUST_IRQ_SLOT_COUNT; i++)
     {
+        ulong handle = 0;
         ulong flags = rust_irq_lock.write_lock_irq_save();
         const ulong code = reinterpret_cast<ulong>(rust_irq_slots[i].handler);
-        const bool left = rust_irq_slots[i].used && code >= lo && code < hi;
+        if (rust_irq_slots[i].used && !rust_irq_slots[i].stopping && code >= lo && code < hi)
+            handle = slot_handle(i, rust_irq_slots[i].generation);
         rust_irq_lock.write_unlock_irq_restore(flags);
 
-        if (left)
+        if (handle != 0)
         {
             klog(0, "module: %s left a line's interrupt handler registered (slot %lu): taken off", name, i);
-            kernel_interrupt_unregister(i + 1);
+            kernel_interrupt_unregister(handle);
         }
     }
 
     for (ulong i = 0; i < RUST_MSIX_SLOT_COUNT; i++)
     {
+        ulong handle = 0;
         ulong flags = rust_msix_lock.write_lock_irq_save();
         const ulong code = reinterpret_cast<ulong>(rust_msix_slots[i].handler);
-        const bool left = rust_msix_slots[i].used && code >= lo && code < hi;
+        if (rust_msix_slots[i].used && !rust_msix_slots[i].stopping && code >= lo && code < hi)
+            handle = slot_handle(i, rust_msix_slots[i].generation);
         rust_msix_lock.write_unlock_irq_restore(flags);
 
-        if (left)
+        if (handle != 0)
         {
             klog(0, "module: %s left an MSI-X handler registered (slot %lu): taken off", name, i);
-            kernel_msix_unregister_handler(i + 1);
+            kernel_msix_unregister_handler(handle);
         }
     }
 }

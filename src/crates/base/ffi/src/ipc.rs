@@ -179,13 +179,6 @@ unsafe extern "C" {
     /// A monitor of `mbox`'s dropped. A Down already on its way still comes.
     pub safe fn kernel_ipc_demonitor(mbox: u64, id: u64);
 
-    /// `mbox` told of every name under `prefix` that comes and goes: the
-    /// watch's id, or 0 when refused.
-    pub fn kernel_ipc_watch(mbox: u64, prefix: *const u8, len: usize) -> u64;
-
-    /// A watch of `mbox`'s ended.
-    pub safe fn kernel_ipc_unwatch(mbox: u64, id: u64);
-
     /// The names under `prefix`, at most `max` of them, into `out`: how many
     /// were copied.
     pub fn kernel_ipc_list(prefix: *const u8, len: usize, out: *mut IpcName, max: usize) -> usize;
@@ -235,3 +228,13 @@ unsafe extern "C" {
     pub fn kernel_ipc_bounced(router: u64, peer: u32, sender: u64, target: u64, name: *const u8, name_len: usize,
                               tag: u32, reference: u64, why: u32) -> i32;
 }
+
+/* The numbers that cross with these functions, one copy of each: the
+ * layer that answers and kcore that reads them both use these, and this
+ * file is in the module interface's digest. They were written twice --
+ * a copy in the layer, literals in kcore -- outside it: a release that
+ * renumbered one built, hashed the same, and its modules misread the
+ * answers. */
+
+/// A host's name at most: a DNS label's.
+pub const IPC_HOST_NAME_MAX: usize = 63;

@@ -278,6 +278,8 @@ u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
         const u8 had = entry_vector_[index];
         Idt::get_instance().set_descriptor(had, IdtDescriptor::encode(handler.get_handler_fn()));
         handler.on_interrupt_register(0, had);
+        /* Masked by the disable_vector of the slot that had it */
+        unmask(index);
         return had;
     }
 
@@ -327,6 +329,18 @@ u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
 
     entry_vector_[index] = vector;
     return vector;
+}
+
+void MsixTable::disable_vector(u16 index)
+{
+    if (!table_ || index >= count_ || entry_vector_ == nullptr || entry_vector_[index] == 0)
+        return;
+
+    /* Masked first: the device holds what it raises from here as pending.
+       One already on its way is the vector's default handler's, named and
+       dismissed, as ~MsixTable leaves it. */
+    mask(index);
+    Idt::get_instance().reset_descriptor(entry_vector_[index]);
 }
 
 void MsixTable::mask(u16 index)

@@ -14,7 +14,7 @@ use hvarch::x86::svm::{GuestRegs, Kick, NotRun};
 use hvarch::{Caps, Result};
 
 use crate::memory::GuestMemory;
-use crate::svm::{Exit, Io, LongMode, ProtectedMode};
+use crate::svm::{Exit, Instr, Io, LongMode, ProtectedMode};
 use crate::vm::Refusal;
 
 /* Control-register and EFER bits a guest's starting state is made of. The
@@ -32,11 +32,8 @@ const CR0_LOW: u64 = 0xFFFF_FFFF;
 /// The CR0 bits LMSW loads: PE, MP, EM and TS.
 const LMSW_BITS: u64 = 0xF;
 
-/// Exit codes this decoder hands the run loop for instructions it does not
-/// answer itself, in the AMD-V namespace the loop already speaks -- so one
-/// set of `Exit::Other` arms serves both backends.
-use hvarch::x86::svm::vmcb::exit as svm_exit;
-/// Nested-fault error bits, likewise the AMD-V encoding the loop reads.
+/// Nested-fault error bits: the AMD-V encoding the run loop reads, into
+/// which an EPT violation's qualification is put.
 use hvarch::x86::svm::vmcb::npf;
 
 const RFLAGS_RESERVED_ONE: u64 = 1 << 1;
@@ -292,8 +289,12 @@ impl Vcpu {
         let g = &self.guest;
         let reason = g.exit_reason();
         if reason & vmcs::reason::ENTRY_FAILURE != 0 {
-            /* A VM-entry failure that still took the exit path: bad guest
-             * state, an MSR load, a machine check on entry. */
+            /* A machine check on entry is the host's, raised to its handler
+             * (`hvarch`); the rest of the entry failures -- bad guest
+             * state, an MSR load -- are the guest's state refused. */
+            if reason & vmcs::reason::BASIC_MASK == vmcs::reason::ENTRY_FAIL_MACHINE_CHECK {
+                return Exit::MachineCheck;
+            }
             return Exit::Invalid;
         }
         use vmcs::reason as r;
@@ -317,7 +318,7 @@ impl Vcpu {
                  * software exception -- the run loop steps past it and gives
                  * the #DB as the trap it is, as for AMD-V's intercept. */
                 if vector == VECTOR_DB && info & vmcs::intr::TYPE_MASK == vmcs::intr::TYPE_PRIV_SOFT_EXCEPTION {
-                    return Exit::Other(svm_exit::ICEBP);
+                    return Exit::Instr(Instr::Icebp);
                 }
                 let error = (info & vmcs::intr::DELIVER_ERRCODE != 0).then(|| g.exit_intr_errcode());
                 Exit::Exception { vector, error }
@@ -351,7 +352,10 @@ impl Vcpu {
              * stop of its whole VM for a user process's `vmxoff`. */
             r::VMCLEAR | r::VMLAUNCH | r::VMPTRLD | r::VMPTRST | r::VMREAD | r::VMRESUME | r::VMWRITE
             | r::VMXOFF | r::VMXON | r::INVEPT | r::INVVPID | r::VMFUNC | r::GETSEC => Exit::Undefined,
-            r::INTERRUPT_WINDOW => Exit::IrqWindow,
+            /* A window: the guest can take an interrupt now -- its
+             * interrupts on, or its task priority below the threshold the
+             * one held for is of. */
+            r::INTERRUPT_WINDOW | r::TPR_BELOW_THRESHOLD => Exit::IrqWindow,
             r::CR_ACCESS => {
                 /* CR8, which is the host's; a `mov` to CR0 or an `lmsw`
                  * changing a bit the host keeps of CR0 (`Guest::set_cr0`);
@@ -364,7 +368,9 @@ impl Vcpu {
                 let kind = q & cr::TYPE_MASK;
                 let gpr = ((q & cr::GPR_MASK) >> cr::GPR_SHIFT) as u8;
                 match (q & cr::CR_MASK, kind) {
-                    (8, cr::MOV_TO_CR) | (8, cr::MOV_FROM_CR) => Exit::Cr8 { write: kind == cr::MOV_TO_CR, gpr },
+                    (8, cr::MOV_TO_CR) | (8, cr::MOV_FROM_CR) => {
+                        Exit::Cr8 { write: kind == cr::MOV_TO_CR, gpr: Some(gpr) }
+                    }
                     (0, cr::MOV_TO_CR) => Exit::Cr0Write { value: self.gpr(gpr) },
                     (4, cr::MOV_TO_CR) => Exit::Cr4 { write: true, gpr: Some(gpr) },
                     (0, cr::LMSW) => {
@@ -374,7 +380,7 @@ impl Vcpu {
                         let src = (q >> cr::LMSW_SOURCE_SHIFT) & LMSW_BITS;
                         Exit::Cr0Write { value: (old & !LMSW_BITS) | src | (old & CR0_PE) }
                     }
-                    _ => Exit::Other(r::CR_ACCESS as u64),
+                    _ => Exit::Other { code: u64::from(r::CR_ACCESS), vmx: true },
                 }
             }
             r::DR_ACCESS => {
@@ -417,14 +423,17 @@ impl Vcpu {
             }
             r::TRIPLE_FAULT => Exit::Shutdown,
             /* The instructions the run loop answers in one place for both
-             * backends: hand it the AMD-V code it already matches. */
-            r::WBINVD => Exit::Other(svm_exit::WBINVD),
-            r::XSETBV => Exit::Other(svm_exit::XSETBV),
-            r::MONITOR => Exit::Other(svm_exit::MONITOR),
-            r::MWAIT => Exit::Other(svm_exit::MWAIT),
-            r::RDTSCP => Exit::Other(svm_exit::RDTSCP),
-            r::RDPMC => Exit::Other(svm_exit::RDPMC),
-            other => Exit::Other(other as u64),
+             * backends, by name. INVD exits whatever the controls say; it was
+             * once an exit no arm answered, its guest stopped. */
+            r::WBINVD => Exit::Instr(Instr::Wbinvd),
+            r::INVD => Exit::Instr(Instr::Invd),
+            r::XSETBV => Exit::Instr(Instr::Xsetbv),
+            r::MONITOR => Exit::Instr(Instr::Monitor),
+            r::MWAIT => Exit::Instr(Instr::Mwait),
+            r::RDTSCP => Exit::Instr(Instr::Rdtscp),
+            r::RDPMC => Exit::Instr(Instr::Rdpmc),
+            r::TASK_SWITCH => Exit::TaskSwitch,
+            other => Exit::Other { code: u64::from(other), vmx: true },
         }
     }
 
@@ -457,6 +466,16 @@ impl Vcpu {
         } else {
             0
         };
+        if typ == intr::TYPE_NMI {
+            /* With virtual NMIs the CPU set blocking by NMI as it began to
+             * deliver this one; the delivery never happened, and an entry
+             * that injects an NMI with the bit still set fails its checks
+             * -- the VM stopped for a guest that did nothing wrong. */
+            let bits = self.guest.interruptibility();
+            if bits & vmcs::INTR_BLOCK_NMI != 0 {
+                self.guest.set_interruptibility(bits & !vmcs::INTR_BLOCK_NMI);
+            }
+        }
         self.guest.set_inject(event, errcode);
     }
 
@@ -501,6 +520,9 @@ impl Vcpu {
             || (value & CR0_NW != 0 && value & CR0_CD == 0)
             || (value & CR0_PG != 0 && value & CR0_PE == 0)
             || (pg_on && efer & EFER_LME != 0 && cr4 & CR4_PAE == 0)
+            /* Long mode on from a code segment whose L is set already: the
+             * CPU's #GP, which the entry would otherwise fail on */
+            || (pg_on && efer & EFER_LME != 0 && g.exit_cs_ar() & AR_L != 0)
             /* Paging off from 64-bit code, or with PCIDs on. */
             || (pg_off && (in_64bit || cr4 & CR4_PCIDE != 0));
         if refused {
@@ -694,9 +716,10 @@ impl Vcpu {
         self.guest.save().efer & EFER_LMA != 0 && self.guest.exit_cs_ar() & AR_L != 0
     }
 
-    /// Step past the ICEBP whose #DB stopped the guest at it.
+    /// Step past the ICEBP whose #DB stopped the guest at it: its own #DB
+    /// the run loop gives, and no single step's beside it.
     pub fn skip_icebp(&mut self) {
-        self.skip();
+        self.step_over();
     }
 
     /// CR8 written for the guest -- its APIC's task priority, written
@@ -765,16 +788,38 @@ impl Vcpu {
     /// Step past the instruction the guest stopped at: VMX reports its length
     /// for every exit that has one, so there is no per-instruction constant.
     fn skip(&mut self) {
+        self.step_over();
+        self.stepped();
+    }
+
+    fn step_over(&mut self) {
         let len = self.guest.exit_instr_len() as u64;
         let s = self.guest.save_mut();
         s.rip = s.rip.wrapping_add(len);
         self.leave_shadow();
     }
 
+    /// After every instruction the host stepped past for the guest: with
+    /// RFLAGS.TF set, the single step's #DB the instruction would have
+    /// raised -- the CPU raises none for an instruction that exited -- as a
+    /// debug exception pending at the next entry, which the CPU delivers
+    /// before the guest's next instruction, and DR6.BS in the guest's DR6,
+    /// which VT-x does not switch and a `mov` from it is answered from.
+    fn stepped(&mut self) {
+        let s = self.guest.save_mut();
+        if s.rflags & RFLAGS_TF == 0 {
+            return;
+        }
+        let payload = vmcs::debug::BS;
+        s.dr6 = (((s.dr6 & !DR6_TRAP_BITS) | DR6_ACTIVE_LOW | payload) ^ (payload & DR6_ACTIVE_LOW)) & !DR6_BIT12;
+        self.guest.set_pending_single_step();
+    }
+
     pub fn skip_io(&mut self, io: &Io) {
         let s = self.guest.save_mut();
         s.rip = io.next_rip;
         self.leave_shadow();
+        self.stepped();
     }
 
     /// Step past an instruction the host performed for the guest, `len`
@@ -784,6 +829,7 @@ impl Vcpu {
         let s = self.guest.save_mut();
         s.rip = s.rip.wrapping_add(len);
         self.leave_shadow();
+        self.stepped();
     }
 
     /// Out of any interrupt shadow the stepped instruction was in -- a STI's
@@ -906,6 +952,17 @@ impl Vcpu {
 
     pub fn clear_irq_window(&mut self) {
         self.guest.set_irq_window(false);
+        self.guest.set_tpr_threshold(0);
+    }
+
+    /// Stop the guest when its task priority drops below `class`: an
+    /// interrupt of that class is requested and the TPR alone holds it.
+    /// Under the TPR shadow a `mov` to CR8 does not exit, and the TPR
+    /// threshold is what does; without it every `mov` of CR8 exits anyway.
+    /// While the CPU delivers the APIC's interrupts itself the run loop
+    /// holds nothing back, and asks for none.
+    pub fn request_tpr_window(&mut self, class: u8) {
+        self.guest.set_tpr_threshold(class);
     }
 
     /// The guest's state and the last exit, for a report.

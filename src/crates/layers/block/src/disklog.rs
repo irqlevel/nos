@@ -288,7 +288,7 @@ pub fn log(line: &[u8]) {
 /// cell and publishing it: the writer takes cells in order, and would wait
 /// behind that one for as long as the task stayed away.
 fn enqueue(line: &[u8]) -> bool {
-    let held = cpu::preempt_disable_task();
+    let held = cpu::PreemptOff::take();
 
     let queued = LINES.send(|slot| {
         let len = line.len().min(MSG_SIZE);
@@ -299,7 +299,7 @@ fn enqueue(line: &[u8]) -> bool {
         DROPPED_LINES.fetch_add(1, Ordering::Relaxed);
     }
 
-    cpu::preempt_enable_task(held);
+    drop(held);
     queued
 }
 
@@ -728,8 +728,8 @@ log to a prepared area");
         }
 
         let _ = writeln!(out, "disklog: no prepared area found");
-        let _ = writeln!(out, "  {} lines queued, {} dropped",
-            LINES.waiting(), DROPPED_LINES.load(Ordering::Relaxed));
+        let _ = writeln!(out, "  {} lines queued, {} dropped, {} slots lost",
+            LINES.waiting(), DROPPED_LINES.load(Ordering::Relaxed), LINES.lost());
         return;
     }
 

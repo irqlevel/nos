@@ -21,6 +21,7 @@
 //! one): its completions and wakes signal it too, and the queue holds it
 //! until it is closed (`queue::Queue`).
 
+use kcore::owner::Owner;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -101,10 +102,10 @@ impl DevQueue {
     /// or not: a VM that reads its disk has it to itself as well; made on
     /// `event`, a task's, when one is given. Who holds what overlaps it,
     /// when that is in the way; None for memory.
-    fn open(disk: Disk, writable: bool, holder: Holder, buffers: usize, bytes: usize,
+    fn open(disk: Disk, writable: bool, holder: Holder, owner: Owner, buffers: usize, bytes: usize,
             event: Option<Arc<SharedEvent>>) -> Result<Option<DevQueue>, Holder>
     {
-        let claim = Claim(table::claim(disk.handle(), holder)?);
+        let claim = Claim(table::claim(disk.handle(), holder, owner)?);
         let pages = bytes / PAGE_SIZE;
         let Some(queue) = Queue::new(Some(disk), buffers, pages, event) else { return Ok(None) };
         let (mut flights, mut done, mut pieces) = (Vec::new(), VecDeque::new(), Vec::new());
@@ -235,6 +236,8 @@ impl DevQueue {
 struct Slot {
     generation: u32,
     queue: Option<DevQueue>,
+    /// The module whose code opened it: what `close_owned_by` closes by.
+    owner: Owner,
 }
 
 static QUEUES: OnceBox<Vec<Mutex<Slot>>> = OnceBox::new();
@@ -250,7 +253,7 @@ fn slots() -> Option<&'static [Mutex<Slot>]> {
         let mut slots = Vec::new();
         slots.try_reserve_exact(MAX_QUEUES).ok()?;
         for _ in 0..MAX_QUEUES {
-            slots.push(Mutex::new(Slot { generation: 0, queue: None })?);
+            slots.push(Mutex::new(Slot { generation: 0, queue: None, owner: Owner::IMAGE })?);
         }
         Some(Box::new(slots))
     });
@@ -308,7 +311,7 @@ fn entry_of(q: usize) -> Option<usize> {
 /// `refused_len`, unless null, is writable.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_blockq_open(
-    device: usize, write: i32, buffers: usize, bytes: usize, name: *const u8, name_len: usize, out: *mut *mut u8,
+    owner: usize, device: usize, write: i32, buffers: usize, bytes: usize, name: *const u8, name_len: usize, out: *mut *mut u8,
     refused: *mut u8, cap: usize, refused_len: *mut usize, event: u64,
 ) -> usize {
     if let Some(len) = unsafe { refused_len.as_mut() } {
@@ -340,7 +343,8 @@ pub unsafe extern "C" fn kernel_blockq_open(
     /* Opened before a slot is looked for: a claim refused, or memory
      * short, takes no slot -- and a slot's lock is never held across the
      * allocation. */
-    let mut queue = match DevQueue::open(disk, write != 0, holder, buffers, bytes, event) {
+    let owner = Owner::at(owner);
+    let mut queue = match DevQueue::open(disk, write != 0, holder, owner, buffers, bytes, event) {
         Ok(Some(queue)) => queue,
         Ok(None) => return 0,
         Err(in_the_way) => {
@@ -365,6 +369,7 @@ pub unsafe extern "C" fn kernel_blockq_open(
         }
         slot.generation = slot.generation.wrapping_add(1);
         slot.queue = Some(queue);
+        slot.owner = owner;
         let generation = slot.generation;
         WAITS[at].store((generation as u64) << 32 | (entry as u64 + 1), Ordering::Release);
         return word(at, generation);
@@ -384,9 +389,9 @@ pub unsafe extern "C" fn kernel_blockq_open(
 #[no_mangle]
 pub extern "C" fn kernel_blockq_start(q: usize, buffer: usize, write: i32, offset: u64, len: usize) -> i32 {
     match with(q, |dq| dq.start(buffer, write != 0, offset, len)) {
-        Some(Started::InFlight) => 1,
-        Some(Started::Done(true)) => 0,
-        _ => -1,
+        Some(Started::InFlight) => ffi::block::QUEUE_IN_FLIGHT,
+        Some(Started::Done(true)) => ffi::block::QUEUE_DONE,
+        _ => ffi::block::QUEUE_FAILED,
     }
 }
 
@@ -477,6 +482,28 @@ pub extern "C" fn kernel_blockq_discard(q: usize, offset: u64, len: u64) -> i32 
 
 /// The queue closed: what the device still has waited for, its buffers
 /// freed and its claim given back. Its word names nothing after.
+#[no_mangle]
+/// The queues the module called `name` opened and never closed, closed --
+/// each drop waiting for its device, off its slot's lock: how many.
+pub(crate) fn close_owned_by(name: &[u8]) -> usize {
+    let Some(slots) = slots() else { return 0 };
+    let mut closed = 0;
+    for (at, slot) in slots.iter().enumerate() {
+        let taken = {
+            let mut slot = slot.lock();
+            if slot.queue.is_none() || !slot.owner.is_module(name) {
+                continue;
+            }
+            WAITS[at].store(0, Ordering::Release);
+            slot.owner = Owner::IMAGE;
+            slot.queue.take()
+        };
+        drop(taken);
+        closed += 1;
+    }
+    closed
+}
+
 #[no_mangle]
 pub extern "C" fn kernel_blockq_close(q: usize) {
     let Some(at) = (q & SLOT_MASK).checked_sub(1) else { return };

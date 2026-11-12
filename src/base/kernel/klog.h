@@ -51,6 +51,11 @@ const int MAX_LOG_LEVEL = 5;
 class Klog
 {
 public:
+    /* A line's bytes at most, its NUL included: what a dmesg record and the
+       disk log's carry, and so what output formats into and ffi's klog!
+       (LINE_BYTES) formats a Rust line into */
+    static const ulong LINE_SIZE = 256;
+
     static Klog& get_instance()
     {
         static Klog instance;

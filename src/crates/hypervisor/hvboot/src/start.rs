@@ -1,9 +1,11 @@
 //! What hv hands the loader: the PVH start info (src/crates/hypervisor/hv/src/pvh.rs,
-//! Xen's start_info.h) -- its command line, the memory map, the ACPI RSDP
-//! -- and the command line read for the loader's own words.
+//! Xen's start_info.h) -- its command line, the modules, the memory map,
+//! the ACPI RSDP.
 
 use alloc::string::String;
 use alloc::vec::Vec;
+
+use bzimage::E820Entry;
 
 use crate::phys;
 
@@ -11,27 +13,25 @@ const START_INFO_MAGIC: u32 = 0x336E_C578;
 /// Version 1: the first with the memory map.
 const MIN_VERSION: u32 = 1;
 const START_INFO_BYTES: usize = 56;
+const SI_NR_MODULES: usize = 12;
+const SI_MODLIST: usize = 16;
+const MODULE_BYTES: usize = 32;
 const MEMMAP_ENTRY_BYTES: usize = 24;
 /// The most memory map entries read: e820's own ceiling.
 const MAX_MEMMAP: usize = 128;
+/// The most modules read: hv gives one at most, an initrd.
+const MAX_MODULES: usize = 8;
 /// The longest command line read.
 const CMDLINE_MAX: usize = 4096;
-
-pub const E820_RAM: u32 = 1;
-
-/// An entry of the memory map, as e820 has them.
-#[derive(Clone, Copy, Debug)]
-pub struct MemEntry {
-    pub addr: u64,
-    pub size: u64,
-    pub kind: u32,
-}
 
 /// The start info, read.
 pub struct StartInfo {
     pub cmdline: String,
-    pub memmap: Vec<MemEntry>,
+    pub memmap: Vec<E820Entry>,
     pub rsdp: u64,
+    /// The modules hv loaded beside the loader -- an `initrd=` given to
+    /// `hv start`: where each is, and how long.
+    pub modules: Vec<(u64, u64)>,
 }
 
 fn u32_at(b: &[u8], o: usize) -> u32 {
@@ -71,6 +71,20 @@ impl StartInfo {
             cmdline = String::from_utf8_lossy(&buf[..n]).into_owned();
         }
 
+        let count = u32_at(&si, SI_NR_MODULES) as usize;
+        let list = u64_at(&si, SI_MODLIST);
+        if count > MAX_MODULES || (count != 0 && list == 0) {
+            return Err(alloc::format!("{} modules at {:#x}", count, list));
+        }
+        let mut modules = Vec::with_capacity(count);
+        for i in 0..count {
+            let mut m = [0u8; MODULE_BYTES];
+            let at = list.checked_add((i * MODULE_BYTES) as u64)
+                .ok_or_else(|| alloc::format!("a module list at {:#x}", list))?;
+            phys::read(at, &mut m)?;
+            modules.push((u64_at(&m, 0), u64_at(&m, 8)));
+        }
+
         let rsdp = u64_at(&si, 32);
         let memmap_at = u64_at(&si, 40);
         let entries = u32_at(&si, 48) as usize;
@@ -81,57 +95,8 @@ impl StartInfo {
         for i in 0..entries {
             let mut e = [0u8; MEMMAP_ENTRY_BYTES];
             phys::read(memmap_at + (i * MEMMAP_ENTRY_BYTES) as u64, &mut e)?;
-            memmap.push(MemEntry { addr: u64_at(&e, 0), size: u64_at(&e, 8), kind: u32_at(&e, 16) });
+            memmap.push(E820Entry { addr: u64_at(&e, 0), size: u64_at(&e, 8), kind: u32_at(&e, 16) });
         }
-        Ok(StartInfo { cmdline, memmap, rsdp })
-    }
-}
-
-/// The loader's command line: its own words -- `hvboot.<name>[=<value>]` --
-/// and the rest, which go on to the kernel after its entry's own: what hv
-/// adds a guest's line (the TSC's rate, `ip=`, `noapic`) and what the VM's
-/// `cmdline=` says.
-pub struct Options {
-    /// `hvboot.entry=`: the GRUB entry to boot in place of its default --
-    /// a number, `N>M` into a submenu, a title or an id, as GRUB's
-    /// `default` takes.
-    pub entry: Option<String>,
-    /// `hvboot.disk=N`: look for GRUB's configuration on disk N alone
-    /// (0 for `vda`).
-    pub disk: Option<usize>,
-    /// `hvboot.verbose`: say each filesystem looked at.
-    pub verbose: bool,
-    /// `tsc_early_khz=`, for timeouts: the TSC's rate, as hv knows it.
-    pub tsc_khz: Option<u64>,
-    /// Every other word, in order.
-    pub kernel_args: Vec<String>,
-}
-
-impl Options {
-    pub fn parse(line: &str) -> Result<Options, String> {
-        let mut o = Options { entry: None, disk: None, verbose: false, tsc_khz: None, kernel_args: Vec::new() };
-        for word in line.split_ascii_whitespace() {
-            if let Some(own) = word.strip_prefix("hvboot.") {
-                let (name, value) = match own.split_once('=') {
-                    Some((n, v)) => (n, Some(v)),
-                    None => (own, None),
-                };
-                match (name, value) {
-                    ("entry", Some(v)) if !v.is_empty() => o.entry = Some(String::from(v)),
-                    ("disk", Some(v)) => {
-                        o.disk = Some(v.parse().map_err(|_| alloc::format!("hvboot.disk={}: not a number", v))?);
-                    }
-                    ("verbose", None) => o.verbose = true,
-                    _ => return Err(alloc::format!("{}: not an option of hvboot's (hvboot.entry=, hvboot.disk=, \
-                                                    hvboot.verbose)", word)),
-                }
-                continue;
-            }
-            if let Some(khz) = word.strip_prefix("tsc_early_khz=") {
-                o.tsc_khz = khz.parse().ok().filter(|&k| k != 0);
-            }
-            o.kernel_args.push(String::from(word));
-        }
-        Ok(o)
+        Ok(StartInfo { cmdline, memmap, rsdp, modules })
     }
 }

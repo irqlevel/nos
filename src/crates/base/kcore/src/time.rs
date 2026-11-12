@@ -15,15 +15,17 @@ impl Duration {
         Self { nanos }
     }
 
+    /// Saturating, as `from_millis`: a wait "for ever" -- `u64::MAX`
+    /// seconds -- is the longest there is, not what its product wraps to.
     pub const fn from_secs(secs: u64) -> Self {
         Self {
-            nanos: secs * NS_PER_SEC,
+            nanos: secs.saturating_mul(NS_PER_SEC),
         }
     }
 
     pub const fn from_millis(ms: u64) -> Self {
         Self {
-            nanos: ms * 1_000_000,
+            nanos: ms.saturating_mul(1_000_000),
         }
     }
 

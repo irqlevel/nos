@@ -23,9 +23,17 @@ public:
     bool setup(Pci::DeviceInfo* dev, const ulong* mapped_bars = nullptr);
 
     /* Program table entry `index`, install IDT handler, return CPU vector 0 on failure.
-       An entry enabled already keeps its vector and takes the new handler:
-       the one it had may be gone (a slot unregistered and taken again). */
+       An entry enabled already keeps its vector and takes the new handler,
+       unmasked again: the one it had may be gone (a slot unregistered and
+       taken again). */
     u8 enable_vector(u16 index, InterruptHandler& handler);
+
+    /* An enabled entry turned away from its handler, whose slot is being
+       given back: masked, and what it sends taken by nobody's handler --
+       x86's vector back at the IDT's default, arm64's LPI parked -- the
+       vector or the LPI kept for the entry's next enable_vector. Nothing
+       for an entry never enabled. */
+    void disable_vector(u16 index);
 
     void mask(u16 index);
     void unmask(u16 index);

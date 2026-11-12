@@ -20,12 +20,16 @@ pub const MAX_FRAME: usize = 1514;
 /// makes: as much IPv4 as its 16-bit length can say, the Ethernet header in
 /// front of it.
 pub const MAX_SEND: usize = 65_535 + ETH_HDR_LEN;
-/// The least segment size a send may ask to be cut by: a send is then 256
-/// frames at most, a ring's worth, where a byte a segment would make one
-/// notify 65,000 frames on the switch -- free to the guest that asks, and
-/// costing the host's CPU and every inbox on the way. TCP on the switch's
-/// MTU cuts at 1,448.
-pub const MIN_SEGMENT: usize = 256;
+/// The least segment size a send may ask to be cut by: Linux's own least
+/// (`TCP_MIN_GSO_SIZE`, its least MSS of 48 less the most TCP options), so
+/// that no connection a guest's TCP keeps to a peer with a small MSS has its
+/// sends refused. It was 256 once, and a send of more than one segment to
+/// such a peer was dropped whole, the guest never told -- its connection
+/// down to a segment a retransmission timeout, the one send its TCP makes
+/// unsegmented. A send is 8,192 frames at most then; what bounds the work of
+/// a notify is the pass that cuts it (`net::TX_PASS_FRAMES`), which ends at
+/// its bound after it. TCP on the switch's MTU cuts at 1,448.
+pub const MIN_SEGMENT: usize = 8;
 
 /// The header's flag: the checksum is the device's to complete.
 pub const NEEDS_CSUM: u8 = 1;
@@ -392,8 +396,9 @@ pub fn segment_tcp4(frame: &[u8], t: Tcp4, seg: &mut [u8; MAX_FRAME], out: &mut 
     let (ip_at, tcp_at) = (ETH_HDR_LEN, ETH_HDR_LEN + ihl);
 
     for i in 0..count {
-        /* Under 64 KiB of payload in all, cut at 256 bytes at least: the
-         * offset fits a sequence number's step, and the count an ID's. */
+        /* Under 64 KiB of payload in all, cut at `MIN_SEGMENT` bytes at
+         * least: the offset fits a sequence number's step, and the count --
+         * 8,192 at most -- an ID's 16 bits. */
         let from = i * mss;
         let len = mss.min(payload.len() - from);
         let total = headers + len;

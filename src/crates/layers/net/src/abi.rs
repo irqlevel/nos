@@ -149,16 +149,78 @@ pub extern "C" fn rust_netconsole_panic_flush() {
 /* ---- TCP ---- */
 
 use crate::tcp::{Conn, Receive, TCP};
+use kcore::owner::Owner;
+use kcore::sync::PreemptSpinLock;
 
-/// What the C++ side sees a connection as.
-type ConnPtr = *mut u8;
+/// What a module holds a connection as: a word of its slot and the slot's
+/// generation (ffi's tcp.rs), 0 for none.
+type ConnWord = usize;
+const NO_CONN: ConnWord = 0;
 
-/// The connection a word from outside names: one of the pool's, or none.
-/// The pool is an array that lives as long as the kernel, so a word that is
-/// not the address of one of its slots is simply not a connection -- and one
-/// that is, is safe to look at whatever state it is in.
-fn conn_of(conn: ConnPtr) -> Option<&'static Conn> {
-    TCP.by_handle(conn as usize)
+/// The connection a word from outside names: one of the pool's, while it is
+/// still the connection the word was made for, or none. The pool is an array
+/// that lives as long as the kernel, so whatever the word, what it finds is
+/// safe to look at in whatever state it is in.
+fn conn_of(conn: ConnWord) -> Option<&'static Conn> {
+    TCP.by_word(conn)
+}
+
+/// Whose each word handed out is -- the module whose code asked for it --
+/// a slot of the pool's each: what the loader's take-down closes a module's
+/// connections and listeners by (`close_owned_by`), where a listener a
+/// module left kept its port, and a connection its slot, for the uptime. A
+/// word kept here past its connection's end is stale by its generation, and
+/// finds nothing.
+static OWNED: [PreemptSpinLock<(ConnWord, Owner)>; crate::tcp::MAX_CONNECTIONS] =
+    [const { PreemptSpinLock::new((NO_CONN, Owner::IMAGE)) }; crate::tcp::MAX_CONNECTIONS];
+
+/// `conn`'s word, kept as `owner`'s.
+fn handed(conn: &'static Conn, owner: Owner) -> ConnWord {
+    let word = TCP.word_of(conn);
+    if let Some(slot) = TCP.slot_index(conn).and_then(|i| OWNED.get(i)) {
+        *slot.lock() = (word, owner);
+    }
+    word
+}
+
+/// Whose `word` is, while it is the word kept for its slot.
+fn owner_of(word: ConnWord) -> Owner {
+    let Some(slot) = conn_of(word).and_then(|c| TCP.slot_index(c)).and_then(|i| OWNED.get(i)) else {
+        return Owner::IMAGE;
+    };
+    let kept = *slot.lock();
+    if kept.0 == word { kept.1 } else { Owner::IMAGE }
+}
+
+/// `word` closed: kept as nobody's.
+fn forget(word: ConnWord) {
+    if let Some(slot) = conn_of(word).and_then(|c| TCP.slot_index(c)).and_then(|i| OWNED.get(i)) {
+        let mut kept = slot.lock();
+        if kept.0 == word {
+            *kept = (NO_CONN, Owner::IMAGE);
+        }
+    }
+}
+
+/// The connections and listeners the module called `name` was handed and
+/// never closed, closed -- as its own close would: how many.
+pub(crate) fn close_owned_by(name: &[u8]) -> usize {
+    let mut closed = 0;
+    for slot in OWNED.iter() {
+        let word = {
+            let mut kept = slot.lock();
+            if kept.0 == NO_CONN || !kept.1.is_module(name) {
+                continue;
+            }
+            core::mem::replace(&mut *kept, (NO_CONN, Owner::IMAGE)).0
+        };
+        /* Off the slot's lock: a close takes the connection's */
+        if let Some(conn) = conn_of(word) {
+            TCP.close(conn);
+            closed += 1;
+        }
+    }
+    closed
 }
 
 /// Set the connection pool up and start its timer's task: 0 started, -1
@@ -183,7 +245,7 @@ pub extern "C" fn rust_tcp_init() -> i32 {
 /// `conn` came from a listen, accept or connect, and `buf` holds `len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_tcp_send_timeout(
-    conn: ConnPtr, buf: *const u8, len: usize, timeout_ms: u64,
+    conn: ConnWord, buf: *const u8, len: usize, timeout_ms: u64,
 ) -> isize {
     let conn = match conn_of(conn) { Some(conn) => conn, None => return -1 };
     if buf.is_null() {
@@ -198,7 +260,7 @@ pub unsafe extern "C" fn kernel_tcp_send_timeout(
 /// `conn` came from a listen, accept or connect, and `buf` takes `len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_tcp_recv(
-    conn: ConnPtr, buf: *mut u8, len: usize, timeout_ms: u64,
+    conn: ConnWord, buf: *mut u8, len: usize, timeout_ms: u64,
 ) -> isize {
     let conn = match conn_of(conn) { Some(conn) => conn, None => return -1 };
     if buf.is_null() {
@@ -215,18 +277,18 @@ pub unsafe extern "C" fn kernel_tcp_recv(
 /// again; `bulk`, that each connection it accepts is given bulk buffers both
 /// ways (`tcp::Buffers::Bulk`): a relay's.
 #[no_mangle]
-pub extern "C" fn kernel_tcp_listen(dev: usize, port: u16, backlog: usize, bulk: bool) -> ConnPtr {
+pub extern "C" fn kernel_tcp_listen(owner: usize, dev: usize, port: u16, backlog: usize, bulk: bool) -> ConnWord {
     if dev == 0 || port == 0 {
-        return core::ptr::null_mut();
+        return NO_CONN;
     }
     let nic = match Nic::from_handle(dev) {
         Some(nic) => nic,
-        None => return core::ptr::null_mut(),
+        None => return NO_CONN,
     };
     let buffers = if bulk { crate::tcp::Buffers::Bulk } else { crate::tcp::Buffers::Small };
     match TCP.listen_with(&nic, port, backlog, buffers) {
-        Some(conn) => conn as *const Conn as ConnPtr,
-        None => core::ptr::null_mut(),
+        Some(conn) => handed(conn, Owner::at(owner)),
+        None => NO_CONN,
     }
 }
 
@@ -255,18 +317,18 @@ unsafe fn nets_of(nets: *const ffi::tcp::TcpNet, count: usize) -> Option<([(u32,
 /// # Safety
 /// `nets` points at `count` readable `TcpNet`s when `count` is past 0.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_tcp_listen_allowed(dev: usize, port: u16, backlog: usize, bulk: bool,
-                                                   nets: *const ffi::tcp::TcpNet, count: usize) -> ConnPtr {
+pub unsafe extern "C" fn kernel_tcp_listen_allowed(owner: usize, dev: usize, port: u16, backlog: usize, bulk: bool,
+                                                   nets: *const ffi::tcp::TcpNet, count: usize) -> ConnWord {
     if dev == 0 || port == 0 {
-        return core::ptr::null_mut();
+        return NO_CONN;
     }
-    let Some(nic) = Nic::from_handle(dev) else { return core::ptr::null_mut() };
+    let Some(nic) = Nic::from_handle(dev) else { return NO_CONN };
     // SAFETY: the caller's contract, passed on.
-    let Some((list, n)) = (unsafe { nets_of(nets, count) }) else { return core::ptr::null_mut() };
+    let Some((list, n)) = (unsafe { nets_of(nets, count) }) else { return NO_CONN };
     let buffers = if bulk { crate::tcp::Buffers::Bulk } else { crate::tcp::Buffers::Small };
     match TCP.listen_allowed(&nic, port, backlog, buffers, &list[..n]) {
-        Some(conn) => conn as *const Conn as ConnPtr,
-        None => core::ptr::null_mut(),
+        Some(conn) => handed(conn, Owner::at(owner)),
+        None => NO_CONN,
     }
 }
 
@@ -275,7 +337,7 @@ pub unsafe extern "C" fn kernel_tcp_listen_allowed(dev: usize, port: u16, backlo
 /// # Safety
 /// `nets` points at `count` readable `TcpNet`s when `count` is past 0.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_tcp_set_allowed(listener: ConnPtr, nets: *const ffi::tcp::TcpNet, count: usize,
+pub unsafe extern "C" fn kernel_tcp_set_allowed(listener: ConnWord, nets: *const ffi::tcp::TcpNet, count: usize,
                                                 any: bool) -> i32 {
     let Some(conn) = conn_of(listener) else { return -1 };
     let done = if any {
@@ -291,7 +353,7 @@ pub unsafe extern "C" fn kernel_tcp_set_allowed(listener: ConnPtr, nets: *const 
 /// A task waiting in a receive on `conn` woken, as by a timeout, if the
 /// connection is still the one of `generation` (`Tcp::wake`).
 #[no_mangle]
-pub extern "C" fn kernel_tcp_wake(conn: ConnPtr, generation: u64) {
+pub extern "C" fn kernel_tcp_wake(conn: ConnWord, generation: u64) {
     if let Some(conn) = conn_of(conn) {
         TCP.wake(conn, generation);
     }
@@ -300,13 +362,13 @@ pub extern "C" fn kernel_tcp_wake(conn: ConnPtr, generation: u64) {
 /// What a wake of `conn` is held to (`Tcp::generation`): 0 for no
 /// connection.
 #[no_mangle]
-pub extern "C" fn kernel_tcp_generation(conn: ConnPtr) -> u64 {
+pub extern "C" fn kernel_tcp_generation(conn: ConnWord) -> u64 {
     conn_of(conn).map_or(0, |c| TCP.generation(c))
 }
 
 /// A connection's own floor for its timeout (`Tcp::set_rto_floor`).
 #[no_mangle]
-pub extern "C" fn kernel_tcp_set_rto_floor(conn: ConnPtr, ms: u32) -> i32 {
+pub extern "C" fn kernel_tcp_set_rto_floor(conn: ConnWord, ms: u32) -> i32 {
     let Some(conn) = conn_of(conn) else { return -1 };
     if TCP.set_rto_floor(conn, u64::from(ms)) { 0 } else { -1 }
 }
@@ -316,20 +378,20 @@ pub extern "C" fn kernel_tcp_set_rto_floor(conn: ConnPtr, ms: u32) -> i32 {
 /// Blocks until the connection is up or the connect timeout has passed: null
 /// then, and for a handle that names no device.
 #[no_mangle]
-pub extern "C" fn kernel_tcp_connect(dev: usize, ip: u32, port: u16) -> ConnPtr {
+pub extern "C" fn kernel_tcp_connect(owner: usize, dev: usize, ip: u32, port: u16) -> ConnWord {
     if dev == 0 || port == 0 {
-        return core::ptr::null_mut();
+        return NO_CONN;
     }
     let nic = match Nic::from_handle(dev) {
         Some(nic) => nic,
-        None => return core::ptr::null_mut(),
+        None => return NO_CONN,
     };
     /* The slot's own buffer: what a module opens -- hv's forwards among
      * them -- someone outside may have it open, and a bulk buffer each
      * would be heap for the asking. */
     match TCP.connect(&nic, ip, port, 0, Receive::Small) {
-        Some(conn) => conn as *const Conn as ConnPtr,
-        None => core::ptr::null_mut(),
+        Some(conn) => handed(conn, Owner::at(owner)),
+        None => NO_CONN,
     }
 }
 
@@ -337,17 +399,17 @@ pub extern "C" fn kernel_tcp_connect(dev: usize, ip: u32, port: u16) -> ConnPtr 
 /// module whose connection carries as much as it takes in -- the cluster's
 /// link between hosts. Each buffer the slot's own when the heap has none.
 #[no_mangle]
-pub extern "C" fn kernel_tcp_connect_bulk(dev: usize, ip: u32, port: u16) -> ConnPtr {
+pub extern "C" fn kernel_tcp_connect_bulk(owner: usize, dev: usize, ip: u32, port: u16) -> ConnWord {
     if dev == 0 || port == 0 {
-        return core::ptr::null_mut();
+        return NO_CONN;
     }
     let nic = match Nic::from_handle(dev) {
         Some(nic) => nic,
-        None => return core::ptr::null_mut(),
+        None => return NO_CONN,
     };
     match TCP.connect(&nic, ip, port, 0, Receive::Both) {
-        Some(conn) => conn as *const Conn as ConnPtr,
-        None => core::ptr::null_mut(),
+        Some(conn) => handed(conn, Owner::at(owner)),
+        None => NO_CONN,
     }
 }
 
@@ -402,22 +464,25 @@ pub unsafe extern "C" fn kernel_http_fetch(
 /// not a connection at all.
 #[no_mangle]
 pub extern "C" fn kernel_tcp_accept(
-    listener: ConnPtr, timeout_ms: u64,
-) -> ConnPtr {
+    listener: ConnWord, timeout_ms: u64,
+) -> ConnWord {
+    /* The connection is whoever's the listener is */
+    let owner = owner_of(listener);
     let listener = match conn_of(listener) {
         Some(listener) => listener,
-        None => return core::ptr::null_mut(),
+        None => return NO_CONN,
     };
     match TCP.accept(listener, timeout_ms) {
-        Some(conn) => conn as *const Conn as ConnPtr,
-        None => core::ptr::null_mut(),
+        Some(conn) => handed(conn, owner),
+        None => NO_CONN,
     }
 }
 
 /// Closes what a listen, accept or connect gave out. The caller does not use
 /// it again: the slot is another connection's before long.
 #[no_mangle]
-pub extern "C" fn kernel_tcp_close(conn: ConnPtr) {
+pub extern "C" fn kernel_tcp_close(conn: ConnWord) {
+    forget(conn);
     if let Some(conn) = conn_of(conn) {
         TCP.close(conn);
     }
@@ -426,7 +491,8 @@ pub extern "C" fn kernel_tcp_close(conn: ConnPtr) {
 /// A connection a server refuses or drops: reset, so that its slot does not
 /// sit out TIME-WAIT. As with `kernel_tcp_close`, not used again.
 #[no_mangle]
-pub extern "C" fn kernel_tcp_abort(conn: ConnPtr) {
+pub extern "C" fn kernel_tcp_abort(conn: ConnWord) {
+    forget(conn);
     if let Some(conn) = conn_of(conn) {
         TCP.abort(conn);
     }
@@ -438,7 +504,7 @@ pub extern "C" fn kernel_tcp_abort(conn: ConnPtr) {
 /// `ip` and `port` are writable or null.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_tcp_peer(
-    conn: ConnPtr, ip: *mut u32, port: *mut u16,
+    conn: ConnWord, ip: *mut u32, port: *mut u16,
 ) {
     let conn = match conn_of(conn) { Some(conn) => conn, None => return };
     let (addr, remote) = TCP.peer(conn);

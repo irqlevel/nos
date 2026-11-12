@@ -55,6 +55,12 @@ bool test_module_unload();
    after its exit. Needs tasks: run after rust_test. */
 bool test_module_ipc();
 
+/* What a module leaves open by its handle, not its code -- a TCP listener
+   -- the unload closes by whose it was (rust_net_close_range's TCP sweep):
+   modtest leaving one, unloaded, loaded again and taking the port again.
+   Needs TCP: run after rust_tcp_init. */
+bool test_module_tcp_left();
+
 }
 
 }

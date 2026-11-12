@@ -41,8 +41,12 @@ public:
        has already happened, or it cannot tell the two apart afterwards. */
     bool is_pending(ulong type);
 
-    /* Register a handler for a soft IRQ type */
-    void register_handler(ulong type, void (*handler)(void* ctx), void* ctx);
+    /* Register a handler for a soft IRQ type: false, and nothing changed,
+       for a type out of range or one that has one already -- a second
+       registration took the first's over without a word once, and a pass
+       on another CPU between its two stores ran the new function with the
+       old context */
+    bool register_handler(ulong type, void (*handler)(void* ctx), void* ctx);
 
     static const ulong TYPE_NET_RX = 0;
     static const ulong TYPE_BLK_IO = 1;
@@ -62,7 +66,18 @@ private:
     {
         void (*func)(void* ctx);
         void* ctx;
+        /* HANDLER_FREE, HANDLER_WRITING while one registration writes the
+           pair, HANDLER_READY once it is whole -- stored with release after
+           the pair, and loaded with acquire before a pass reads it */
+        ulong state;
     };
+
+    static const ulong HANDLER_FREE = 0;
+    static const ulong HANDLER_WRITING = 1;
+    static const ulong HANDLER_READY = 2;
+
+    /* The type's handler once one is whole, or nullptr */
+    const Handler* ready_handler(ulong type) const;
 
     struct CpuState
     {

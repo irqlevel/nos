@@ -27,6 +27,16 @@ pub fn name() -> Option<&'static str> {
 /// instruction out looks like too, and either way the CPUID bit says the
 /// instruction is there.
 pub fn self_test() -> bool {
+    /* Both instructions the pool draws on: the one each request mixes in
+     * (RDRAND) and the one the seed comes from (RDSEED where there is one).
+     * The seed's was not tried, so an RDSEED that answered one value passed
+     * and the pool said it had hardware entropy. */
+    draws_differ("HwRandom", hw_random) && draws_differ("HwRandom's seed", hw_random_seed)
+}
+
+/// Whether `draw` answers at least half of a few tries, and not with one
+/// value every time.
+fn draws_differ(what: &str, draw: fn() -> Option<u64>) -> bool {
     /* Eight draws: enough to tell a working source from one that answers the
      * same thing every time, cheap enough to do on every boot. */
     const DRAWS: usize = 8;
@@ -35,7 +45,7 @@ pub fn self_test() -> bool {
     let mut differs = false;
     let mut ok = 0;
     for _ in 0..DRAWS {
-        let Some(value) = hw_random() else { continue };
+        let Some(value) = draw() else { continue };
         ok += 1;
         match first {
             None => first = Some(value),
@@ -47,11 +57,11 @@ pub fn self_test() -> bool {
     /* Half the draws failing is a source not worth having either: the retry
      * loops inside the HAL have already been patient. */
     if ok < DRAWS / 2 {
-        klog!(0, "HwRandom: only {} of {} draws succeeded", ok, DRAWS);
+        klog!(0, "{}: only {} of {} draws succeeded", what, ok, DRAWS);
         return false;
     }
     if !differs {
-        klog!(0, "HwRandom: every draw returned {:#X}", first.unwrap_or(0));
+        klog!(0, "{}: every draw returned {:#X}", what, first.unwrap_or(0));
         return false;
     }
     true

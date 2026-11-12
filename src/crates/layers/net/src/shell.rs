@@ -78,9 +78,9 @@ pub fn netpool(_args: &str, out: &mut Output) {
     let _ = writeln!(out, "frames {} of {} bytes, {} in the ring, {} in cpu caches",
         st.frames, st.capacity, st.in_ring, st.in_caches);
     let _ = writeln!(out, "in flight {}", st.in_flight);
-    let _ = writeln!(out, "alloc hits {}, misses {}, oversized {}",
+    let _ = writeln!(out, "alloc hits {}, misses {}, oversized (refused) {}",
         st.hits, st.misses, st.oversized);
-    let _ = writeln!(out, "ring refills {}, flushes {}", st.refills, st.flushes);
+    let _ = writeln!(out, "ring refills {}, flushes {}, frames lost {}", st.refills, st.flushes, st.lost);
 }
 
 pub fn arp(_args: &str, out: &mut Output) {
@@ -137,10 +137,10 @@ pub fn tcpstat(_args: &str, out: &mut Output) {
     let st = TCP.stats();
     let _ = writeln!(out, "TCP stats: tx={} rx={} rxerr={} retx={} conns={} refused={} halfopen={} rstheld={} \
         recoveries={} timeouts={} spurious={} probes={} undos={} dsacks={} reneged={} outside={} badack={} \
-        unkept={} overrun={}",
+        unkept={} overrun={} reclaimed={}",
         st.tx, st.rx, st.rx_err, st.retransmits, st.conns, st.syn_refused, st.half_open, st.rst_held,
         st.recoveries, st.timeouts, st.spurious, st.probes, st.undos, st.dsacks, st.reneged, st.rx_outside,
-        st.rx_badack, st.rx_unkept, st.rx_overrun);
+        st.rx_badack, st.rx_unkept, st.rx_overrun, st.reclaimed);
 
     for index in 0..crate::tcp::MAX_CONNECTIONS {
         let line = match TCP.snapshot(index) {

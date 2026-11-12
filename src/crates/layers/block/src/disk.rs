@@ -53,7 +53,7 @@ pub fn register_driver(name: &str, driver: &'static dyn table::BlockDriver) -> O
 /// VFS does for as long as a filesystem is mounted on it. The error is who
 /// holds something overlapping.
 pub fn claim_as(device: usize, holder: &'static CStr) -> core::result::Result<usize, table::Holder> {
-    table::claim(device, table::Holder::of(holder))
+    table::claim(device, table::Holder::of(holder), kcore::owner::Owner::IMAGE)
 }
 
 /// The device whose id (`Disk::ident`) is `id`: `Found::One` -- or none,

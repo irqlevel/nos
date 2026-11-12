@@ -6,10 +6,12 @@ pub struct Timer {
 }
 
 impl Timer {
-    /// Start a periodic timer: `handler(target)` is called every `period`,
-    /// from IPI context on CPU 0. See `MsixInterrupt::register_for` for what
-    /// a target and a handler are. None if no timer slots are available or
-    /// the period is zero.
+    /// Start a periodic timer: `handler(target)` is called every `period` --
+    /// rounded up to the 10 ms tick -- in the boot CPU's tick: its own
+    /// timer's interrupt, or the tick's IPI where it has no per-CPU timer
+    /// (the boot CPU's index is its APIC id, not necessarily 0). See
+    /// `MsixInterrupt::register_for` for what a target and a handler are.
+    /// None if no timer slots are available or the period is zero.
     pub fn start_for<T, F>(period: Duration, target: &'static T, handler: F) -> Option<Self>
     where
         T: Sync + 'static,

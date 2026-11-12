@@ -15,6 +15,7 @@
 //! after. The claims are the one part that needs a lock, and sit inside the
 //! kernel's spinlock.
 
+use kcore::owner::Owner;
 use alloc::boxed::Box;
 use alloc::ffi::CString;
 use core::ffi::CStr;
@@ -22,7 +23,7 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use ffi::block::BlockIo;
-use kcore::block::{SubmitError, IO_FLUSH, SUBMIT_BUSY, SUBMIT_INVALID, SUBMIT_OK, SUBMIT_UNSUPPORTED};
+use kcore::block::{SubmitError, IO_FLUSH, IO_READ, SUBMIT_BUSY, SUBMIT_INVALID, SUBMIT_OK, SUBMIT_UNSUPPORTED};
 use kcore::cmd::Output;
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
@@ -759,9 +760,12 @@ struct ClaimEntry {
     holder: Holder,
     /// 0: the slot is free
     claim: usize,
+    /// The module whose code took it (the image for the image's): what
+    /// `rust_block_module_gone` releases by.
+    owner: Owner,
 }
 
-const NO_CLAIM: ClaimEntry = ClaimEntry { device: 0, holder: Holder::NONE, claim: 0 };
+const NO_CLAIM: ClaimEntry = ClaimEntry { device: 0, holder: Holder::NONE, claim: 0, owner: Owner::IMAGE };
 
 struct Claims {
     entries: [ClaimEntry; MAX_DEVICES],
@@ -831,7 +835,7 @@ fn overlap(a: usize, b: usize) -> bool {
 /// Claim a device against mounts, the disk log and other writers, naming
 /// the holder a refusal reports: the claim, for `release` -- or who stands
 /// in its way.
-pub(crate) fn claim(handle: usize, holder: Holder) -> Result<usize, Holder> {
+pub(crate) fn claim(handle: usize, holder: Holder, owner: Owner) -> Result<usize, Holder> {
     if handle == 0 || device(handle).is_none() {
         return Err(Holder::of(NO_DEVICE));
     }
@@ -856,8 +860,34 @@ pub(crate) fn claim(handle: usize, holder: Holder) -> Result<usize, Holder> {
 
     claims.generation += 1;
     let claim = (claims.generation << SLOT_BITS) | (slot + 1);
-    claims.entries[slot] = ClaimEntry { device: handle, holder, claim };
+    claims.entries[slot] = ClaimEntry { device: handle, holder, claim, owner };
     Ok(claim)
+}
+
+/// The device a live claim is on: None for a word that is no claim's -- a
+/// stale one, or one released. What a write is made under (W8): the claim
+/// itself, not the device, so that a write without one cannot be asked.
+pub(crate) fn claimed_device(claim: usize) -> Option<usize> {
+    let slot = (claim & SLOT_MASK).checked_sub(1)?;
+    let claims = CLAIMS.get()?.lock();
+    let entry = claims.entries.get(slot)?;
+    (entry.claim != 0 && entry.claim == claim).then_some(entry.device)
+}
+
+/// The claims the module called `name` took and never gave back, released:
+/// how many. The loader's sweep (`rust_block_module_gone`), after the
+/// module's queues have gone with theirs.
+fn release_owned_by(name: &[u8]) -> usize {
+    let Some(claims) = CLAIMS.get() else { return 0 };
+    let mut claims = claims.lock();
+    let mut released = 0;
+    for entry in claims.entries.iter_mut() {
+        if entry.claim != 0 && entry.owner.is_module(name) {
+            *entry = NO_CLAIM;
+            released += 1;
+        }
+    }
+    released
 }
 
 /// Who holds a claim on the device or on anything overlapping it -- what a
@@ -947,14 +977,18 @@ pub unsafe extern "C" fn kernel_blockdev_read(
     if read(handle, sector, unsafe { core::slice::from_raw_parts_mut(buf, len) }) { 0 } else { -1 }
 }
 
-/// Synchronous write, count in sectors: 0 once the device has the data.
+/// Synchronous write under a claim -- the claim's word, not the device's:
+/// a write was once asked of any device, and "writing needs a claim" was a
+/// comment -- count in sectors: 0 once the device has the data, -1 for a
+/// word that is no live claim's too.
 ///
 /// # Safety
 /// `buf` holds `count` sectors, and the device's driver may DMA out of it.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_blockdev_write(
-    handle: usize, sector: u64, buf: *const u8, count: u32, fua: i32,
+    claim: usize, sector: u64, buf: *const u8, count: u32, fua: i32,
 ) -> i32 {
+    let Some(handle) = claimed_device(claim) else { return -1 };
     let len = match byte_len(handle, count) {
         Some(len) if !buf.is_null() => len,
         _ => return -1,
@@ -973,8 +1007,18 @@ pub extern "C" fn kernel_blockdev_can_submit(handle: usize) -> i32 {
     can_submit(handle) as i32
 }
 
-/// Hand the device an I/O straight to or from physical memory. Never blocks;
-/// `io` is read before this returns.
+fn submit_code(handle: usize, io: &BlockIo, kick_now: bool) -> i32 {
+    match submit(handle, io, kick_now) {
+        Ok(()) => SUBMIT_OK,
+        Err(SubmitError::Busy) => SUBMIT_BUSY,
+        Err(SubmitError::Invalid) => SUBMIT_INVALID,
+        Err(SubmitError::Unsupported) => SUBMIT_UNSUPPORTED,
+    }
+}
+
+/// Hand the device a read straight into physical memory -- a read alone:
+/// a write or a flush is a claim's (`kernel_blockdev_submit_claimed`), and
+/// refused here. Never blocks; `io` is read before this returns.
 ///
 /// # Safety
 /// `io` points at a valid BlockIo whose memory stays valid until its `done`
@@ -983,17 +1027,23 @@ pub extern "C" fn kernel_blockdev_can_submit(handle: usize) -> i32 {
 pub unsafe extern "C" fn kernel_blockdev_submit(
     handle: usize, io: *const BlockIo, kick_now: i32,
 ) -> i32 {
-    let io = match unsafe { io.as_ref() } {
-        Some(io) => io,
-        None => return SUBMIT_INVALID,
-    };
-
-    match submit(handle, io, kick_now != 0) {
-        Ok(()) => SUBMIT_OK,
-        Err(SubmitError::Busy) => SUBMIT_BUSY,
-        Err(SubmitError::Invalid) => SUBMIT_INVALID,
-        Err(SubmitError::Unsupported) => SUBMIT_UNSUPPORTED,
+    match unsafe { io.as_ref() } {
+        Some(io) if io.op == IO_READ => submit_code(handle, io, kick_now != 0),
+        _ => SUBMIT_INVALID,
     }
+}
+
+/// The same under a claim, for any I/O -- a write and a flush among them:
+/// SUBMIT_INVALID for a word that is no live claim's.
+///
+/// # Safety
+/// As `kernel_blockdev_submit`'s.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_blockdev_submit_claimed(
+    claim: usize, io: *const BlockIo, kick_now: i32,
+) -> i32 {
+    let (Some(handle), Some(io)) = (claimed_device(claim), unsafe { io.as_ref() }) else { return SUBMIT_INVALID };
+    submit_code(handle, io, kick_now != 0)
 }
 
 /// Ring the doorbell for what a submit without a kick left queued.
@@ -1032,14 +1082,15 @@ pub(crate) unsafe fn copy_out(src: &[u8], out: *mut u8, cap: usize) -> usize {
 /// takes `cap` bytes; `refused_len`, unless null, is writable.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_blockdev_claim(
-    handle: usize, name: *const u8, name_len: usize, refused: *mut u8, cap: usize, refused_len: *mut usize,
+    owner: usize, handle: usize, name: *const u8, name_len: usize, refused: *mut u8, cap: usize,
+    refused_len: *mut usize,
 ) -> usize {
     let holder = if name.is_null() || name_len == 0 {
         Holder::of(MODULE_HOLDER)
     } else {
         Holder::named(unsafe { core::slice::from_raw_parts(name, name_len) })
     };
-    match claim(handle, holder) {
+    match claim(handle, holder, Owner::at(owner)) {
         Ok(claim) => claim,
         Err(in_the_way) => {
             let n = unsafe { copy_out(in_the_way.as_bytes(), refused, cap) };
@@ -1192,11 +1243,39 @@ pub extern "C" fn kernel_blockdev_can_discard(handle: usize) -> i32 {
 }
 
 /// The `count` sectors from `sector` given back to the device -- inside it,
-/// or refused: 0 once it has been told, -1 when it failed or takes no such
-/// thing. A writer's call, as a write is: under its claim.
+/// or refused: 0 once it has been told, -1 when it failed, takes no such
+/// thing, or `claim` is no live claim's. A writer's call, as a write is:
+/// made under the claim, by its word.
 #[no_mangle]
-pub extern "C" fn kernel_blockdev_discard(handle: usize, sector: u64, count: u64) -> i32 {
+pub extern "C" fn kernel_blockdev_discard(claim: usize, sector: u64, count: u64) -> i32 {
+    let Some(handle) = claimed_device(claim) else { return -1 };
     if discard(handle, sector, count) { 0 } else { -1 }
+}
+
+/// What a module that went left open on the block layer, closed: the device
+/// queues its code opened, and then the claims it took and never gave back
+/// -- a device it held stayed "held by" a name nothing answered to, its
+/// next load refused it -- each said as the module's bug. The loader's, at
+/// the module's take-down (`ModuleTable::take_down`). Task context: a
+/// queue's close waits for its device.
+///
+/// # Safety
+/// `name` points at `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn rust_block_module_gone(name: *const u8, len: usize) {
+    if name.is_null() || len == 0 || len > kcore::owner::NAME_MAX {
+        return;
+    }
+    let name = unsafe { core::slice::from_raw_parts(name, len) };
+    let shown = core::str::from_utf8(name).unwrap_or("?");
+    let queues = crate::devq::close_owned_by(name);
+    if queues != 0 {
+        klog!(0, "module: {} left {} device queue(s) open: closed", shown, queues);
+    }
+    let claims = release_owned_by(name);
+    if claims != 0 {
+        klog!(0, "module: {} left {} device claim(s) held: released", shown, claims);
+    }
 }
 
 #[no_mangle]

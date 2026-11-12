@@ -401,6 +401,9 @@ pub mod reason {
     pub const MWAIT: u32 = 36;
     pub const MONITOR: u32 = 39;
     pub const PAUSE: u32 = 40;
+    /// The guest's VTPR, written under the TPR shadow, dropped below the
+    /// TPR threshold: trap-like, after the write.
+    pub const TPR_BELOW_THRESHOLD: u32 = 43;
     pub const ENTRY_FAIL_MACHINE_CHECK: u32 = 41;
     /// An EOI virtualized of a vector the EOI-exit bitmap names, after the
     /// CPU has taken it out of VISR: trap-like, its vector in the
@@ -452,8 +455,11 @@ pub mod ept_viol {
 /// the low half of the capability MSR names bits that must be 1, the high
 /// half bits that may be 1. So force the required bits on and the forbidden
 /// bits off. A `desired` bit the CPU forbids is dropped -- the caller reads
-/// the result back to see what it got.
-pub fn adjust(desired: u32, cap_msr: u32) -> u32 {
+/// the result back to see what it got. `vmx`'s alone: `cap_msr` is read as
+/// it is given, and an MSR the CPU has not got is a #GP the handler panics
+/// on -- a safe function of any number would let safe code take the host
+/// down with one.
+pub(in crate::x86) fn adjust(desired: u32, cap_msr: u32) -> u32 {
     let cap = unsafe { cpu::rdmsr(cap_msr) };
     let allowed0 = cap as u32; // must be 1 where this is 1
     let allowed1 = (cap >> 32) as u32; // may be 1 where this is 1
@@ -536,13 +542,15 @@ impl VmcsPage {
 ///
 /// # Safety
 /// A VMCS of ours is current on this CPU and `field` is a real encoding;
-/// a bad encoding sets the failure flags, which this ignores and returns 0.
+/// a bad encoding sets the failure flags, which this ignores and returns 0:
+/// a failed VMREAD leaves its destination as it was, and the destination
+/// is given 0 first, so that it is 0 and not whatever the register held.
 #[inline]
 pub unsafe fn vmread(field: u32) -> u64 {
     let value: u64;
     unsafe {
         asm!("vmread {value}, {field}",
-             value = out(reg) value, field = in(reg) field as u64,
+             value = inout(reg) 0u64 => value, field = in(reg) field as u64,
              options(nostack));
     }
     value

@@ -23,7 +23,7 @@ use crate::cores::{Cores, Hold};
 use crate::disk::{Claims, Holder, Runner, Wake};
 use crate::guest::{self, LogLine, Ring, Spec};
 
-const USAGE: &str = "hv boot <kernel> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [input=...] [cmdline=...]";
+const USAGE: &str = "hv boot <kernel> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [input=...] [uuid=U] [force] [cmdline=...]";
 /// How long the guest runs by default, and at most: a Linux boot under TCG,
 /// itself under this hypervisor, is very far from quick.
 const DEFAULT_SECS: u64 = 60;
@@ -56,6 +56,7 @@ impl Host for BootHost {
             if let Some(dropped) = c.line.admit(kcore::time::boot_time_ns()) {
                 if dropped != 0 {
                     kcore::klog!(0, "hvguest| ... {} lines not logged", dropped);
+                    c.line.told(kcore::time::boot_time_ns());
                 }
                 kcore::klog!(0, "hvguest| {}", c.line.text());
             }

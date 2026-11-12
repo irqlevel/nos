@@ -64,7 +64,18 @@ pub fn block(key: &[u8; KEY_SIZE], counter: u32, nonce: &[u8; NONCE_SIZE]) -> [u
     for ((bytes, word), start) in out.chunks_exact_mut(4).zip(x).zip(state) {
         bytes.copy_from_slice(&word.wrapping_add(start).to_le_bytes());
     }
+    /* The state holds the key that made this block, and `x` what the
+     * rounds made of it: neither left in the dead frame for whatever reads
+     * the stack next -- the pool's key erasure is only as good as this.
+     * The caller wipes the block it is handed. */
+    wipe_words(&mut state);
+    wipe_words(&mut x);
     out
+}
+
+fn wipe_words(words: &mut [u32; STATE_WORDS]) {
+    words.fill(0);
+    core::hint::black_box(words);
 }
 
 /// RFC 8439, 2.3.2: the block function's own test vector -- key 00..1f,

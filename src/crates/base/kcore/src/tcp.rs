@@ -1,4 +1,3 @@
-use core::ffi::c_void;
 use ffi::tcp;
 
 use crate::error::{Error, Result};
@@ -6,12 +5,12 @@ use crate::net::Nic;
 
 /// What a receive returns when its wait ran out with nothing received
 /// (Tcp::Recv's TcpRecvTimeout).
-pub const RECV_TIMEOUT: isize = -2;
+pub const RECV_TIMEOUT: isize = tcp::TCP_RECV_TIMEOUT;
 
 /// No bound on the wait for room: what `send_all` sends with.
 const WAIT_FOREVER_MS: u64 = 0;
 
-fn send_all(conn: *mut c_void, mut buf: &[u8]) -> bool {
+fn send_all(conn: usize, mut buf: &[u8]) -> bool {
     while !buf.is_empty() {
         let sent = unsafe {
             tcp::kernel_tcp_send_timeout(conn, buf.as_ptr(), buf.len(), WAIT_FOREVER_MS)
@@ -24,7 +23,7 @@ fn send_all(conn: *mut c_void, mut buf: &[u8]) -> bool {
     true
 }
 
-fn recv(conn: *mut c_void, buf: &mut [u8], timeout_ms: u64) -> isize {
+fn recv(conn: usize, buf: &mut [u8], timeout_ms: u64) -> isize {
     if buf.is_empty() {
         return 0;
     }
@@ -32,7 +31,7 @@ fn recv(conn: *mut c_void, buf: &mut [u8], timeout_ms: u64) -> isize {
 }
 
 /// The most networks an allowlisted listener answers.
-pub const ALLOW_MAX: usize = 64;
+pub const ALLOW_MAX: usize = tcp::TCP_ALLOW_MAX;
 
 /// `nets` as the C ABI takes them, on the stack.
 fn nets_of(nets: &[(u32, u8)]) -> [tcp::TcpNet; ALLOW_MAX] {
@@ -48,13 +47,10 @@ fn nets_of(nets: &[(u32, u8)]) -> [tcp::TcpNet; ALLOW_MAX] {
 /// task waiting in `accept` gets None, and a peer that connected without
 /// being accepted yet is reset.
 pub struct TcpListener {
-    conn: *mut c_void,
+    conn: usize,
     port: u16,
 }
 
-/* The kernel's listen, accept and close take their own locks */
-unsafe impl Send for TcpListener {}
-unsafe impl Sync for TcpListener {}
 
 impl TcpListener {
     /// Listens on `port` of `nic`: a connection that comes in by `nic`, for
@@ -92,9 +88,9 @@ impl TcpListener {
         }
         let list = nets_of(nets);
         /* `list` holds `nets.len()` TcpNets */
-        let conn = unsafe { tcp::kernel_tcp_listen_allowed(nic.handle(), port, backlog, bulk, list.as_ptr(),
+        let conn = unsafe { tcp::kernel_tcp_listen_allowed(crate::owner::here(), nic.handle(), port, backlog, bulk, list.as_ptr(),
                                                            nets.len()) };
-        if conn.is_null() {
+        if conn == 0 {
             Err(Error::Busy)
         } else {
             Ok(Self { conn, port })
@@ -122,8 +118,8 @@ impl TcpListener {
         if port == 0 {
             return Err(Error::InvalidValue);
         }
-        let conn = tcp::kernel_tcp_listen(nic.handle(), port, backlog, bulk);
-        if conn.is_null() {
+        let conn = tcp::kernel_tcp_listen(crate::owner::here(), nic.handle(), port, backlog, bulk);
+        if conn == 0 {
             Err(Error::Busy)
         } else {
             Ok(Self { conn, port })
@@ -138,7 +134,7 @@ impl TcpListener {
     /// with nobody -- or the listener has been closed.
     pub fn accept(&self, timeout_ms: u64) -> Option<TcpStream> {
         let conn = tcp::kernel_tcp_accept(self.conn, timeout_ms);
-        if conn.is_null() {
+        if conn == 0 {
             None
         } else {
             Some(TcpStream { conn })
@@ -165,23 +161,21 @@ pub struct TcpWaker {
 
 impl TcpWaker {
     pub fn wake(&self) {
-        tcp::kernel_tcp_wake(self.conn as *mut c_void, self.generation);
+        tcp::kernel_tcp_wake(self.conn, self.generation);
     }
 }
 
 /// A connection a `TcpListener` accepted: closed -- the FIN exchange left
 /// to the kernel -- when dropped.
 pub struct TcpStream {
-    conn: *mut c_void,
+    conn: usize,
 }
 
-/* One task uses it at a time; the kernel's calls take their own locks */
-unsafe impl Send for TcpStream {}
 
 impl TcpStream {
     /// What wakes a task waiting in this stream's `recv`, from another task.
     pub fn waker(&self) -> TcpWaker {
-        TcpWaker { conn: self.conn as usize, generation: tcp::kernel_tcp_generation(self.conn) }
+        TcpWaker { conn: self.conn, generation: tcp::kernel_tcp_generation(self.conn) }
     }
 
     /// Its own floor for its retransmission timeout, `ms` (20 to 200): for
@@ -196,8 +190,8 @@ impl TcpStream {
     /// An active open to `ip`:`port` (host byte order) through `nic`, from an
     /// ephemeral port: None when nothing answered in time. Sleeps.
     pub fn connect(nic: &Nic, ip: u32, port: u16) -> Option<TcpStream> {
-        let conn = tcp::kernel_tcp_connect(nic.handle(), ip, port);
-        if conn.is_null() { None } else { Some(TcpStream { conn }) }
+        let conn = tcp::kernel_tcp_connect(crate::owner::here(), nic.handle(), ip, port);
+        if conn == 0 { None } else { Some(TcpStream { conn }) }
     }
 
     /// `connect`, with bulk buffers both ways -- up to 512 KiB each, from
@@ -206,8 +200,8 @@ impl TcpStream {
     /// some 27 MB/s at a data centre's 0.3 ms round trip. The slot's own 8
     /// KiB where the heap has none to give.
     pub fn connect_bulk(nic: &Nic, ip: u32, port: u16) -> Option<TcpStream> {
-        let conn = tcp::kernel_tcp_connect_bulk(nic.handle(), ip, port);
-        if conn.is_null() { None } else { Some(TcpStream { conn }) }
+        let conn = tcp::kernel_tcp_connect_bulk(crate::owner::here(), nic.handle(), ip, port);
+        if conn == 0 { None } else { Some(TcpStream { conn }) }
     }
 
     /// Sends the whole buffer, waiting for room as long as it takes; false

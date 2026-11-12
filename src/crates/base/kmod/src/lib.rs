@@ -80,6 +80,43 @@ pub const ABI: &str = match option_env!("NOS_MODULE_ABI") {
     None => "unset",
 };
 
+/// Whether `s` is a digest: 64 hex digits, as the Makefile's sha256sum
+/// gives one.
+const fn is_digest(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != ABI_LEN {
+        return false;
+    }
+    let mut i = 0;
+    while i < b.len() {
+        if !(b[i].is_ascii_digit() || (b[i] >= b'a' && b[i] <= b'f')) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const fn is_unset(s: &str) -> bool {
+    let (a, b) = (s.as_bytes(), b"unset");
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/* The build's digest or no word at all: an empty one -- a Makefile with no
+ * sha256sum -- was padded with zeros and matched a kernel built the same
+ * way. The loader refuses a module whose word is no digest. */
+const _: () = assert!(is_digest(ABI) || is_unset(ABI), "NOS_MODULE_ABI is no digest");
+
 /// The descriptor the loader looks up, by the name `nos_module_info`.
 #[repr(C)]
 pub struct ModuleInfo {

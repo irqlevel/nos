@@ -6,6 +6,15 @@ const NO_DEVICE: pci::PciDeviceInfo = pci::PciDeviceInfo {
     cls: 0, subclass: 0, prog_if: 0, revision: 0, irq_line: 0, irq_pin: 0,
 };
 
+/// The base address registers a function has, and what a BAR's low bits
+/// say: an I/O space BAR, a memory BAR's type (a 64-bit one is a pair), and
+/// the flag bits under a memory BAR's address.
+const BARS: u8 = 6;
+const BAR_IO: u32 = 1;
+const BAR_TYPE_MASK: u32 = 0x6;
+const BAR_TYPE_64: u32 = 0x4;
+const BAR_FLAGS: u32 = 0xF;
+
 #[derive(Clone, Copy, Debug)]
 pub struct PciDevice {
     pub bus: u16,
@@ -62,15 +71,34 @@ impl PciDevice {
         unsafe { pci::kernel_pci_write_config32(self.bus, self.slot, self.func, offset, val) }
     }
 
+    /// BAR `bar`'s raw word: 0 for an index past the six a function has --
+    /// whose config offset would be another register's.
     pub fn get_bar(&self, bar: u8) -> u32 {
+        if bar >= BARS {
+            return 0;
+        }
         unsafe { pci::kernel_pci_get_bar(self.bus, self.slot, self.func, bar) }
     }
 
-    /* Read a 64-bit memory BAR.  `bar` must be even; `bar+1` holds the high 32 bits. */
-    pub fn get_bar64(&self, bar: u8) -> u64 {
-        let low = self.get_bar(bar) as u64;
-        let high = self.get_bar(bar + 1) as u64;
-        (high << 32) | (low & !0xF)
+    /// The address memory BAR `bar` maps, read as its type bits say: the
+    /// pair `bar`, `bar + 1` for a 64-bit one -- any index, not only an
+    /// even one -- and `bar` alone for a 32-bit one; 0 for an I/O BAR, for
+    /// an index past the six or a pair that would run past them, or for
+    /// one nothing assigned. The high half was once ORed in from the next
+    /// BAR whatever the type, which for a 32-bit BAR is another's.
+    pub fn bar_address(&self, bar: u8) -> u64 {
+        let low = self.get_bar(bar);
+        if bar >= BARS || low & BAR_IO != 0 {
+            return 0;
+        }
+        let base = u64::from(low & !BAR_FLAGS);
+        if low & BAR_TYPE_MASK != BAR_TYPE_64 {
+            return base;
+        }
+        if bar + 1 >= BARS {
+            return 0;
+        }
+        (u64::from(self.get_bar(bar + 1)) << 32) | base
     }
 
     pub fn enable_bus_mastering(&self) {

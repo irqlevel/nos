@@ -650,11 +650,18 @@ impl World {
                 let data = crate::input::noise(r.u32(), fsops::length(r));
                 // SAFETY: both are their own lengths.
                 let got = unsafe { fs::files::kernel_file_create(text.as_ptr(), text.len(), data.as_ptr(), data.len()) };
-                let want = if located(m).is_some() || !m.create(&p, false) {
+                /* 1 only for a file there -- at the path, or a replace's
+                 * remains -- and -1 for any other refusal, the parent not a
+                 * directory among them; a file made and not filled is taken
+                 * away again */
+                let want = if located(m).is_some() {
                     1
+                } else if !m.create(&p, false) {
+                    -1
                 } else if m.write_file(&p, &data) {
                     0
                 } else {
+                    m.remove(&p);
                     -1
                 };
                 invariant!(got == want, "kernel_file_create of {} gave {}, and the model {}", text, got, want);

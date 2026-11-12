@@ -384,6 +384,12 @@ static void bp_startup_arm(void* ctx)
 
     rust_tcp_init();
 
+    if (!test::test_module_tcp_left())
+    {
+        PANIC("Module TCP sweep test failed");
+        return;
+    }
+
     auto& cmd = Cmd::get_instance();
     if (!Pl011::get_instance().register_observer(cmd))
     {

@@ -108,21 +108,22 @@ The split is the point, and it is measurable:
 
 ```
 $ scripts/unsafe-count.py hv hvarch
-hv         1917 lines     3 blocks    0 unsafe fn    0 unsafe impl  = 3
-hvarch     1991 lines    40 blocks   13 unsafe fn    1 unsafe impl  = 54
+hv        26087 lines     4 blocks    0 unsafe fn    0 unsafe impl  = 4
+hvarch     8362 lines   197 blocks   46 unsafe fn    1 unsafe impl  = 244
 ```
 
 The long-term goal of this kernel is other people's Linux guests on this
 machine, and the bug class that goal cannot survive is a guest reaching host
 memory. So the line is drawn once, in the crate graph, where a script can
-count it rather than a reviewer having to remember it. The three sites in
+count it rather than a reviewer having to remember it. The four sites in
 `hv` are the two calls into `hvarch` from the IPI handlers that turn the
-extension on and off, and the one call that enters a guest (`Vm::enter`),
-whose two preconditions are invariants of types in `hv` rather than
-promises at the call: guest memory owns every page its nested table maps,
-and the machine never names a host save area that has been freed. Guest
-memory, the nested page table, the VMCB's policy, the exit decoder and the
-guests above them -- 1450 lines -- have none.
+extension on and off (`machine.rs`), and the call that enters a guest, one
+per backend (`svm.rs`, `vmx.rs`), whose two preconditions are invariants of
+types in `hv` rather than promises at the call: guest memory owns every
+page its nested table maps, and the machine never names a host save area
+that has been freed. Guest memory, the nested page tables, the policy, the
+decoders, the emulated devices and the run loop -- the rest of its
+twenty-six thousand lines -- have none.
 
 ## AMD-V first, Intel VT-x second
 
@@ -355,11 +356,19 @@ The differences that are not hidden by the shadow at all:
   values, from the shadow) and a VM-exit MSR-load list (the host's, off the
   CPU), and the CPU loads each in turn. `KERNEL_GS_BASE` needs one more list:
   `swapgs` changes it without a `wrmsr` the host hears, so a VM-exit MSR-store
-  list saves the guest's live value back into the shadow -- otherwise the
-  guest's `swapgs`-established kernel GS base is lost each round, and the next
+  list saves the guest's live value -- otherwise the guest's
+  `swapgs`-established kernel GS base is lost each round, and the next
   `swapgs` returns junk. That was a real distribution kernel double-faulting
   on a garbage RSP the moment an interrupt returned to user mode; a
   purpose-built guest that never took one from user mode did not show it.
+  The store list's one entry is the entry-load list's own `KERNEL_GS_BASE`
+  entry, so what an exit stores is what the next entry loads, whichever path
+  makes it. It was a slot of its own once, copied into the load list by the
+  run loop alone: an exit the world switch answered itself (`hvarch::x86::fast`:
+  a write of the TSC deadline or of the ICR, a HLT) re-entered with the value
+  of the last full exit, and a guest's `swapgs` since was undone -- its user
+  GS base came back as its kernel's per-CPU address, which a 64-bit Linux
+  with 64-bit programs never looks at and a 32-bit program's TLS does.
   With all three lists, an unmodified Linux -- a tinyconfig to a BusyBox
   shell, and a full Alpine 3.24 to a root login with its clock, `apk`, disk
   and network -- runs under VT-x.
@@ -518,7 +527,7 @@ What the VMX backend does not do yet, and says so rather than pretends:
     hv on [cpu|all]             turn the extension on
     hv off [cpu|all]            turn it off
     hv run <guest|all> [cpu]    run a built-in guest, or all of them, on a
-                                task of its own -- bound to cpu when one is named
+                                task of its own -- bound to cpu, or to one
     hv boot <kernel> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
                                 load a Linux bzImage -- or a PVH ELF, such as
                                 hvboot, which boots the guest's own kernel
@@ -588,7 +597,9 @@ anything off, and a dropped guest's VMCS is current nowhere.
 A VM is guest memory behind a nested page table, the permission maps it runs
 under, and one CPU (`hv::vm::Vm`) -- or, for a Linux guest, as many as it is
 given ([More than one CPU](#more-than-one-cpu)). A guest's CPU is a task:
-`hv run` spawns one, bound to a CPU when asked, and waits for it, and the
+`hv run` spawns one, bound to the CPU asked for -- or, asked for none, to
+the one it runs on, so that what a check reads of the host after a run is
+the CPU's the guest ran on -- and waits for it, and the
 task enters the guest over and over from task context, handling each exit
 between entries.
 
@@ -938,14 +949,16 @@ against what it was told to do. All start in long mode
 at CPL 0 with paging on, 1 MiB of memory with a GDT, a TSS and a page table
 in it that maps the first 2 MiB to themselves -- the second of them with no
 memory behind it -- and 1 GiB to guest physical 4 GiB; all but the second
-CPU of `smp`, which starts where a start-up IPI starts every CPU, in real
-mode:
+CPU of `smp`, `posted`, `avx` and `pkru`, which starts where a start-up IPI
+starts every CPU, in real mode. `hv run` runs a guest on a task bound to one
+CPU -- the one named, or the one it runs on -- so that what its check reads
+of the host after its run is the CPU's it ran on:
 
 | Guest | Does | Shows |
 |---|---|---|
 | `exits` | reads and writes the debug port 0xE9, asks CPUID a leaf only this hypervisor answers, writes what it got to its memory | port I/O both ways; CPUID answered by the host; the answers read back out of guest memory |
 | `hypercall` | writes through its own page table to guest physical 4 GiB, puts a value of its own in every register, makes a hypercall, writes every register the host answered to its memory | long mode under nested paging, above 4 GiB; the run stub's register save and restore, all 15 registers both ways |
-| `uart` | brings up an 8250 the way a driver does -- divisor behind DLAB, 8N1, FIFO, a scratch-register presence test -- and sends a line polled out of LSR.THRE | the emulated serial port, over port I/O alone |
+| `uart` | brings up an 8250 the way a driver does -- divisor behind DLAB, 8N1, FIFO, a scratch-register presence test, what it read back left for the check -- and sends a line polled out of LSR.THRE | the emulated serial port, over port I/O alone: the scratch register keeps what was written |
 | `fault` | loads a null DS, then writes to 0x1FF000, which its page table maps and the nested one does not | stopped at the nested table, at that address and that instruction: a guest reaches nothing it was not given -- and the state its report shows is the guest's at the fault, the null DS in it, which under VT-x only reading the whole state for the report gives |
 | `absent` | reads AMD's FCH reset-status register at 0xFED803C0 twice, then writes to it | a read of a device the platform does not have finds all ones -- what Linux on a Zen CPU reads there -- through one read-only page; the write stops the guest |
 | `mmio` | stores to and loads from 32 bytes of a device's registers in the MMIO window, by every form of `mov` Linux's accessors are -- an immediate of each size, REX's registers and a high byte, `movzx` and `movsx` | each access's instruction fetched through the guest's paging, decoded and performed, every value where it belonged ([MMIO](#mmio)) |
@@ -959,13 +972,17 @@ mode:
 | `posted` | on the machine of `smp`, asking for its interrupts to be the CPU's: the second CPU, started as `smp`'s is, sends the first a thousand fixed IPIs, one at a time, while the first spins with interrupts on and no HLT, counting them | where the CPU has posted interrupts each is posted and notified and taken by the first CPU in its guest, which leaves it a handful of times rather than once an IPI; elsewhere the host hands each over ([Interrupts the CPU delivers itself](#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)) |
 | `apicv` | on the machine of `ioapic`, its first CPU's local APIC taken to x2APIC mode by the base MSR: with CR8 at 5 sends itself 0x50 and 0x30 and reads both in IRR; with CR8 at 0 takes 0x50, then 0x30, whose handler sends itself 0x70 and takes it nested, each handler reading ISR; then the serial port's pin through the IO-APIC as a level, three times, each ended by the x2APIC's EOI; and ISR read whole at the end | the same to the guest whoever delivers its interrupts: under VT-x with APIC virtualization the CPU delivers all six and takes their EOIs, stopping the guest after the three level-triggered ones for the IO-APIC; elsewhere the host injects them ([Interrupts the CPU delivers itself](#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)) |
 | `pveoi` | on the machine of `apicv`, its interrupts the host's to inject on either backend, KVM's PV EOI turned on with its word at 0x7100, each handler ending its interrupt as Linux's does -- the word's bit cleared if set, the EOI register written if not: a self-IPI 0x50 alone; 0x30, whose handler takes 0x70 nested and reads ISR in it; ISR read whole; PV EOI turned off and 0x50 once more | 0x50 and 0x70 ended through the word, each EOI the host's at the next exit -- 0x70's at the exit of 0x30's own EOI by the register, done before it -- the word not set while 0x70 waited in IRR nor after PV EOI went off, nothing left in service: two EOIs through the word, two by the register ([KVM's paravirtual interface](#kvms-paravirtual-interface-as-far-as-it-is-backed)) |
+| `kgs` | on the machine of `smp`, its first CPU alone running: puts one value in KERNEL_GS_BASE and another in the GS base, stops for a CPUID, runs `swapgs`, writes 64 times each a fixed IPI to the CPU that never started and its TSC deadline, runs `swapgs` again and reads both | the two bases as its `swapgs` left them, after writes the world switch answered itself (`hvarch::x86::fast`) -- under VT-x, whose entries load KERNEL_GS_BASE from a list, an entry past one loaded the value of the last full exit and undid the guest's `swapgs`; and at least one write answered there, or nothing was looked at |
+| `cache` | on the machine of `ioapic`, its first CPU alone running: sets CR0.CD and CR0.NW, reads CR0 back and halts with both left set | what it wrote read back, and neither bit in any host CPU's own CR0 after it: a VM exit does not put the host's CD and NW back, so under VT-x a guest's write let through left the host's CPU with its caches not filling for good -- the two are in the CR0 guest/host mask now and never in the CR0 a guest runs with (`hvarch::x86::vmx::CR0_CACHE_BITS`). Under AMD-V the exit puts the host's CR0 back whole, but while the guest runs its CD is the CPU's: a guest can make its own core -- and the sibling thread, its own or its disks' -- slow at will. Not closed yet: it wants CR0's write intercepted and its reads while CD or NW is set, as KVM has it, and QEMU's TCG -- the AMD-V this is tested under -- takes every CR read for a CR0 read |
+| `instr` | one CPU, through the run loop a Linux guest's go through, with #UD and #DB handlers of its own: runs RSM, then INVD, then sets TF and runs a CPUID | RSM the #UD a CPU outside SMM gives -- under AMD-V, which stops the guest at it, the host's to give; it was an exit nothing answered, and a user process's `rsm` stopped its whole VM -- and INVD stepped past under both, the host's dirty lines kept; both named by the backends (`hv::exit::Instr`), not by one extension's number; and the single step's #DB after the CPUID, DR6.BS set, which the CPU never raises for an instruction that exited and the host now does after every one it steps past -- a debugger's `stepi` over a CPUID once landed an instruction late |
 | `debug` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: sets TF with POPFQ and single-steps a NOP, then runs an ICEBP (`int1`) | each a #DB of the guest's own -- intercepted for the delivery loops a guest could make of it -- given back to its handler, the single step's with DR6.BS -- under VT-x, which writes no DR6 at a #DB that exits, the DR6 its exit said, and every `mov` of DR6 the host's |
 | `avx` | on the machine of `smp`, both CPUs on the one host CPU the guests run on, taking turns by IPI: each turns its local APIC on, runs an XSETBV with CR4.OSXSAVE clear, sets OSFXSR, OSXMMEXCPT and OSXSAVE, runs five XSETBVs a CPU refuses and its own, of the x87, SSE and AVX, reads leaf 1, leaf 0xD's first three subleaves and leaf 7, stores YMM0-15, and loads an x87 control word, an MXCSR and a pattern of its own into YMM0-15; then 64 turns each, a turn its peer's IPI, every one checking all of them against what it left and loading the pattern one more | YMM0-15 zero as each CPU starts, though the other's pattern was in the CPU's registers; its YMM registers, MXCSR and control word as it left them at every turn, put back by the host each time the other had had the CPU -- 64 times each at least; XSAVE and AVX offered, OSXSAVE as CR4 has it, XCR0 1 out of reset and 7 after its own; the XSETBV with OSXSAVE clear a #UD -- the CPU's own under VT-x, the host's under QEMU's TCG, whose intercept comes first -- and the five a #GP each; leaf 0xD's sizes 576 and 832, AVX's component at 576, no XSAVES |
 | `pkru` | on the machine of `smp`, both CPUs on the one host CPU the guests run on, taking turns by IPI, the second started by `avx`'s code: each turns its local APIC on, runs an RDPKRU with CR4.PKE clear, sets OSFXSR, OSXMMEXCPT and OSXSAVE, and where its CPUID offers PKU sets PKE, makes XCR0 its own -- PKRU in the first's, the x87 alone the second's -- reads leaf 7, leaf 0xD's subleaves 0 and 9 and PKRU, and loads its own into PKRU; then 64 turns each, a turn its peer's IPI, every one checking PKRU against what it left and loading it one key more | the RDPKRU a #UD; where PKU is offered -- QEMU's TCG, the EX44, not a Zen 2 -- OSPKE only once its CR4.PKE has it, leaf 0xD's components and sizes for its XCR0, PKRU's subleaf the host's; PKRU 0 as each CPU starts, though the other's was in the CPU's register, and its own at every turn, put back by the host each time the other had had the CPU -- 64 times each at least, whatever its XCR0 says of PKRU |
 | `dr` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own: each reads DR0-DR3, writes a pattern of its own into them through four registers and reads it back through a fifth, then points DR0 at a `ret` of its own -- each VM's elsewhere -- arms it in DR7 for execution and calls it, its #DB handler turning the breakpoint off | every `mov` of DR0-DR3 the host's: the second VM reads 0 where the first left its own, each reads back its pattern, and each one's breakpoint fires -- DR6.B0, at its `ret` -- which only its own DR0, made the CPU's before its entry, can do. An execution breakpoint and not a data one: QEMU 10.2's TCG never gets past a store a data breakpoint watches in a nested guest, retrying it for good with no interrupt taken, whoever's DR0-DR3 are the CPU's ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)); under VT-x, which stops a guest at every `mov` of a debug register, the same, its DR6 and DR7 the host's too |
-| `tscaux` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own whose #UD and #GP handlers note the vector and go on: each reads what its CPUID offers, reads its TSC_AUX by RDTSCP, RDPID and RDMSR, writes a value of its own into it, reads the TSC, RDTSCP and the TSC, reads TSC_AUX by RDPID and RDMSR again, writes it with bit 32 set and reads it once more, and runs INVPCID of types 0 to 4 | RDTSCP, RDPID and INVPCID offered exactly where they run in a guest, each run where offered and a #UD where not; TSC_AUX 0 as each VM starts, the second where the first had left its own -- its own put into the CPU before its entries (`hvarch::x86::msrs`); the value each wrote read back by every way it has, RDTSCP's TSC between the two RDTSCs; bit 32 a #GP, the value kept; RDMSR and WRMSR of it a #GP where neither instruction is offered; INVPCID's four types run and type 4 a #GP; every RDMSR and WRMSR seen by the run loop, and no RDTSCP where it runs |
-| `spec` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own whose #UD and #GP handlers note the vector and go on: each reads what its CPUID offers of the speculation controls, reads IA32_SPEC_CTRL, writes every control offered into it and reads it back, writes it with bit 62 set and reads it again, asks for three IBPBs by IA32_PRED_CMD, reads PRED_CMD and writes its bit 1 | offered exactly the controls the host switches (`spec::guest_controls`) -- none under QEMU's TCG, every access a #GP; SPEC_CTRL 0 as each VM starts, the second where the first had left its own; the bits it wrote read back, bit 62 a #GP and the value kept; its last entry run under its bits over the host's, and the CPU's the host's alone after; every IBPB it asked for answered by a barrier before its next entry; PRED_CMD's read and bit 1 a #GP; every RDMSR and WRMSR seen by the run loop |
-| `cr4` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: reads CR4, writes PAE alone -- MCE cleared -- then PAE and a bit its CPUID does not offer -- PKE, or CET where it is offered PKU -- 0, PAE and PGE through R9 (read back through R13), and bit 32, reading CR4 after each | every `mov` of CR4 performed by the host: the guest reads back what it wrote while the CPU's CR4 keeps MCE, and that bit PAE cleared in long mode and a reserved bit each a #GP, CR4 as it was ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)) -- the last two, which no CR4 takes in long mode, the CPU's own #GPs before its intercept where it makes them so, as the AX41's Zen 2 does under KVM; on QEMU's TCG, which stops no read of CR4, its reads are the register's, MCE in it, and the writes the host's all the same; under VT-x its reads are the read shadow's, and three of its writes -- those that change a bit the host keeps -- the host's, PAE cleared the CPU's own #GP |
+| `tscaux` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own whose #UD and #GP handlers note the vector -- a #GP's error code with it -- and go on: each reads what its CPUID offers, reads its TSC_AUX by RDTSCP, RDPID and RDMSR, writes a value of its own into it, reads the TSC, RDTSCP and the TSC, reads TSC_AUX by RDPID and RDMSR again, writes it with bit 32 set and reads it once more, and runs INVPCID of types 0 to 4 | RDTSCP, RDPID and INVPCID offered exactly where they run in a guest, each run where offered and a #UD where not; TSC_AUX 0 as each VM starts, the second where the first had left its own -- its own put into the CPU before its entries (`hvarch::x86::msrs`); the value each wrote read back by every way it has, RDTSCP's TSC between the two RDTSCs; bit 32 a #GP, the value kept; RDMSR and WRMSR of it a #GP where neither instruction is offered; INVPCID's four types run and type 4 a #GP; every #GP a #GP(0) -- its IDT ends at gate 13, and an exception past it comes in as a #GP whose error code names its gate; every RDMSR and WRMSR seen by the run loop, and no RDTSCP where it runs |
+| `spec` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own whose #UD and #GP handlers note the vector -- a #GP's error code with it -- and go on: each reads what its CPUID offers of the speculation controls, reads IA32_SPEC_CTRL, writes every control offered into it and reads it back, writes it with bit 62 set and reads it again, asks for three IBPBs by IA32_PRED_CMD, reads PRED_CMD and writes its bit 1 | offered exactly the controls the host switches (`spec::guest_controls`) -- none under QEMU's TCG, every access a #GP; SPEC_CTRL 0 as each VM starts, the second where the first had left its own; the bits it wrote read back, bit 62 a #GP and the value kept; its last entry run under its bits over the host's, and the CPU's the host's alone after; every IBPB it asked for answered by a barrier before its next entry; PRED_CMD's read and bit 1 a #GP; every #GP a #GP(0), as `tscaux`'s; every RDMSR and WRMSR seen by the run loop |
+| `cr4` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: reads CR4, writes PAE alone -- MCE cleared -- then PAE and a bit its CPUID does not offer -- PKE, or CET where it is offered PKU -- 0, PAE and PGE through R9 (read back through R13), and bit 32, reading CR4 after each | every `mov` of CR4 performed by the host: the guest reads back what it wrote while the CPU's CR4 keeps MCE, and that bit PAE cleared in long mode and a reserved bit each a #GP(0), CR4 as it was ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)) -- the last two, which no CR4 takes in long mode, the CPU's own #GPs before its intercept where it makes them so, as the AX41's Zen 2 does under KVM; on QEMU's TCG, which stops no read of CR4, its reads are the register's, MCE in it, and the writes the host's all the same; under VT-x its reads are the read shadow's, and three of its writes -- those that change a bit the host keeps -- the host's, PAE cleared the CPU's own #GP |
+| `msr` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own whose #GP handler notes what faulted: writes VIRT_SPEC_CTRL and FLUSH_CMD, which its CPUID does not offer, an MSR nobody names (LS_CFG) and MTRRs turned on; reads MCG_CAP, MCG_STATUS and the PAT; asks CPUID for VIRT_SSBD, INVLPGB and the PMU | each of the four a #GP(0) its own handler took, nothing written; the machine-check registers and the PAT answered; CPUID offering no VIRT_SSBD, no INVLPGB and no PMU, and saying a hypervisor is there ([The CPU a guest is shown](#the-cpu-a-guest-is-shown)) |
 
 ```
 $ hv run all 3
@@ -1000,7 +1017,7 @@ hv: guest ioapic -- an IO-APIC, through its page: the serial port's pin as an ed
   stopped    cpu 0 halted with interrupts off at 0x80d4, cpu 1 never started
   checked    version 0x20's 24 pins; two edges taken, none while masked; three levels, each sent again at its EOI while the line stayed up, its remote IRR set in service and clear after
 hv: guest ioapic ok
-hv: 15 of 15 guests ok
+hv: 27 of 27 guests ok
 ```
 
 A guest bound to a CPU the extension is not on for is not run, and says
@@ -1468,8 +1485,9 @@ here:
   three components, its sizes for the guest's own XCR0; XSAVEOPT, XSAVEC
   and XGETBV's ECX 1 as the host has them, never XSAVES -- and no AVX-512,
   AMX, whose state nothing switches; PKU where the CPU has it, the guest's
-  PKRU switched with it, and OSPKE as its CR4.PKE has it; no
-  paravirtualisation; the
+  PKRU switched with it, and OSPKE as its CR4.PKE has it; of
+  paravirtualisation KVM's signature, NOP_IO_DELAY and PV EOI alone ([KVM's
+  paravirtual interface](#kvms-paravirtual-interface-as-far-as-it-is-backed)); the
   speculation controls the host has -- IBRS and IBPB, STIBP, SSBD, and
   Intel's PSFD, IPRED_DIS, RRSBA_DIS, DDPD_U and BHI_DIS_S, AMD's PSFD and
   SBPB -- with IA32_SPEC_CTRL and IA32_PRED_CMD the guest's own ([What the
@@ -1512,7 +1530,8 @@ here:
   and off) and the machine-check registers (no banks, nothing to report),
   which leaf 1 offers and Linux reads with no fallback for a fault -- a
   fault on a machine-check register is a panic to it -- the microcode
-  revision, none, and of each vendor what Linux reads of every such CPU
+  revision, the host's on Intel (by which Linux keeps PCID on a Raptor Lake
+  whose microcode has the fix) and none elsewhere, and of each vendor what Linux reads of every such CPU
   without asking: Intel's platform ID and MISC_ENABLE, its fast strings as
   the host has them; ARCH_CAPABILITIES where leaf 7 offers it, read-only;
   AMD's HWCR, DE_CFG and NB_CFG, with the bits a Linux
@@ -1544,7 +1563,7 @@ here:
   shadow -- and the vCPU is not entered again until an interrupt is pending
   for it, its task asleep until the timer's next edge. It streams the
   guest's console to the kernel log a line at a time -- a boot's worth, a
-  thousand lines, and then fifty a second, what it leaves out said once a
+  thousand lines, and then at most fifty a second, what it leaves out said once a
   second at most (`... N lines not logged`), so that a guest printing as
   fast as it can does not have the host's log, serial line and netconsole
   for its own; the console itself, which the report and `hv console` show,
@@ -1639,8 +1658,16 @@ guest memory, where the guest may write any of them at any moment. Every
 index, address and length read from them is checked before it is used: a
 descriptor past the queue, a chain longer than the queue -- a loop --, more
 chains than the queue holds, an indirect descriptor where none was taken, a
-table the device will not follow, or a buffer outside guest memory stop the
-device, which takes nothing more until the driver resets it. **A disk's
+table the device will not follow, or a ring or a table outside guest memory
+stop the device, which takes nothing more until the driver resets it; a
+request's own buffer outside it is that request's error -- a disk's
+`S_IOERR`, a frame dropped -- and the device goes on. A queue the driver has
+not set up, or took down (a page frame number of 0), is none to work on at
+all: its rings would be at page 0, where a pass once asked for its kicks and
+gave back what it served, and, with EVENT_IDX, found more to do at every
+look -- the first CPU's round due again at once, for good. Taken down or set
+up anew, a disk's chains still with its backend are the old rings', given
+back to nobody, as a reset's are. **A disk's
 request is one entry of its ring** (`VIRTIO_RING_F_INDIRECT_DESC`, which the
 disks offer and the NICs do not): its buffers in a table of descriptors in
 guest memory that the chain's last descriptor names -- read 16 at a time,
@@ -1716,18 +1743,34 @@ Each time round the run loop what it has served is given back: a read's
 data copied into the guest, the status written, the chain on the used ring,
 an interrupt; and as it finishes each lot the task wakes a halted vCPU or
 kicks a running one out of its guest, the NICs' way ([A network](#a-network)).
-Guest memory is touched on the vCPU's task and nowhere else. At most 64
+Guest memory is touched under the platform's lock, on whichever task holds
+it: a vCPU's, or the disk's own as it gives back what it served
+(`LinuxGuest::serve_disk`) -- the lock, not the task, is what orders that
+against a reset and every other CPU's access. A reset, or the queue set up
+anew, forgets the chains still with the backend, and the new driver's
+requests start only once those are back: side by side, a crash kernel's
+journal write and its dead kernel's last write to the same blocks, over a
+backend that stalled, could land in either order (QEMU drains its backend
+at a reset for this). A driver that takes no FLUSH may take its disk to be
+write-through (virtio 1.x, 5.2.5.2): each of its writes is flushed before it
+is answered, as QEMU makes its backend write-through for one, and a flush it
+sends anyway is served, not refused. At most 64
 requests are out at once (`blk::IN_FLIGHT`), each in a 256 KiB buffer of the backend's taken
 when the disk is made (`Backend::with_buffer`) -- the driver is told a
 request carries at most 64 segments of a page (`seg_max`, `size_max`) --
 so nothing is allocated on the way, and a guest that keeps its ring full
-waits for its disk rather than growing anything of nos's. The buffers are
-the image's (`kcore::fs::ImageQueue`): its disk reads and writes them as
-they are, so a request's bytes are copied once, between the guest's memory
-and the buffer, on the vCPU.
+waits for its disk rather than growing anything of nos's -- the disk's task
+has its lists of them from the disk's opening too, so that a disk that could
+not have them refuses its VM's start rather than starting a guest whose disk
+never answers. The buffers are the image's (`kcore::fs::ImageQueue`): its
+disk reads and writes them as they are, so a request's bytes are copied
+once, between the guest's memory and the buffer. A volume of NBS's has
+buffers of its own, a slot each, which go with a request to its session and
+come back with the answer; the session makes a message of each request from
+the heap, which is the one thing on a volume's way that allocates.
 
 **The disk's bytes are a trait's** (`hv::disk::Backend`, which is handed a
-request and gives it back served): the module's `FileDisk` holds the image
+request and gives it back served): the module's `QueuedDisk` holds the image
 (`kcore::fs::Image`, whose word the kernel looks up on every call; nothing
 else may write the file, cut it, grow it, rename it or remove it while the
 disk has it, nor its filesystem be unmounted -- [A disk's
@@ -1896,7 +1939,7 @@ and all -- are refused rather than one taken.
 ```
 > hv devices
 vda         64 MiB  (no id)  whole disk  -- held by a mounted filesystem
-nvme0       64 MiB  disk:nvme-QEMU_NVMe_Ctrl_nosdevtesta  whole disk  -- holds a GPT partition table
+nvme0       64 MiB  disk:nvme-QEMU_NVMe_Ctrl_nosdevtesta  whole disk  -- holds nvme03, an EFI System partition: never given  -- holds a GPT partition table
 nvme1       64 MiB  disk:nvme-QEMU_NVMe_Ctrl_nosdevtestb  whole disk  -- empty
 nvme01       8 MiB  part:6e6f7364-...-000000000001  GPT type 0fc63daf-...  -- holds an ext4 filesystem labelled "devtest"
 nvme02      16 MiB  part:6e6f7364-...-000000000002  GPT type 0fc63daf-...  -- empty
@@ -1904,8 +1947,14 @@ nvme03       4 MiB  part:6e6f7364-...-000000000003  an EFI System partition  -- 
 nvme04      16 MiB  part:6e6f7364-...-000000000004  GPT type 0fc63daf-...  -- holds data nos does not recognize
 ```
 
-What is on a device nobody holds is read off its first 72 KiB and its last
-128 KiB, where each kind keeps its mark (`diskimage::contents`): ext2, ext3
+A device is "held by" what claimed it, and "in use by" what claimed
+something it overlaps -- a partition of it, the disk it is a partition of --
+which is as much in the way of giving it; the VMs whose vm.tomls name it,
+and those being made that are being given it, are said, and a vm.toml that
+cannot be read is said after the list, the devices it names not known. All
+the vm.tomls are read once for the whole list. What is on a device nothing
+is in the way of is read off its first 72 KiB and its last 128 KiB, where
+each kind keeps its mark (`diskimage::contents`): ext2, ext3
 and ext4 told apart by their features, XFS, btrfs, F2FS, swap, an LVM
 physical volume, an md RAID member of any superblock version, LUKS, ISO
 9660, NTFS, exFAT, FAT, squashfs, nanofs, nos's disk log, a GPT or an MBR --
@@ -1922,18 +1971,31 @@ hv: nvme01 (part:...-000000000001) holds an ext4 filesystem labelled "devtest" -
 > hv create d1 /spin.elf mem=64 disk=dev:nvme02
 hv: /vms/d1/vm.toml written -- hv start d1 boots it
 > hv create d2 /hvboot mem=64 disk=dev:nvme0
-hv: nvme0 (disk:nvme-QEMU_NVMe_Ctrl_nosdevtesta) is vm d1's disk already (its vm.toml names part:...-000000000002) -- two vms on one device wreck each other's data; give it anyway with force
+hv: nvme0 (disk:nvme-QEMU_NVMe_Ctrl_nosdevtesta) holds nvme03, an EFI System partition: the machine boots from it, and no vm is given it
+> hv create d5 /hvboot mem=64 disk=dev:nvme02
+hv: nvme02 (part:...-000000000002) is vm d1's disk already (its vm.toml names part:...-000000000002) -- two vms on one device wreck each other's data; give it anyway with force
 ```
 
 - never an EFI System partition or a BIOS boot partition, by their GPT
-  types or the MBR's 0xEF -- not even with `force`;
+  types or the MBR's 0xEF -- not even with `force` -- nor a device that
+  holds one or overlaps one: the whole disk the firmware boots from, which
+  was once given and poured over where nos's root was on the other drive
+  and nothing held the ESP's;
 - never a device something holds -- a mounted filesystem, the disk log, a
   guest running on it, `netblk` serving it for writing -- nor one
   overlapping something held:
   the disk under nos's root, a partition of a disk a guest has whole;
 - with `force` only, a device another VM's vm.toml names, or one
   overlapping it -- the whole of a disk one of whose partitions is d1's
-  above -- and a device with anything on it.
+  above -- one a VM being made or cloned is being given, a device while
+  some VM's vm.toml cannot be read, which may name it, and a device with
+  anything on it.
+
+The look and the write of the vm.toml that names a device are one step:
+`hv create` and `hv disk attach` make both under the lock every change of
+a vm.toml takes, and a VM being made keeps the devices it was given with
+its name's hold until its vm.toml says so -- two VMs given one device at
+once were each told no other VM named it, and both wrote it.
 
 `hv create <name> ... disk=<device>` and `hv disk attach <vm> <device>[:ro]
 [force]` give a device; `hv disk detach <vm> <device>` takes it off the
@@ -1943,8 +2005,10 @@ it was given by (`disks = ["part:6e6f7364-...-000000000002"]`). The checks
 are made where a device is given and not at every start: once given, what
 is on it is the guest's, the filesystem it makes included. A vm.toml
 written by hand, or by the `config_set` call, is taken as it says -- the
-EFI System partition and the claims are still refused when it starts, the
-rest is the writer's to have checked.
+EFI System partition and the claims are still refused when it starts, and
+so is a device named by this boot's name (`dev:nvme1`), which the next boot
+may give another drive: the start says the id to write instead. The rest
+is the writer's to have checked.
 
 **While its VM runs, a device is its VM's alone.** A start claims each of
 its devices for `vm <name>'s disk` in the block table, whose claims compare
@@ -1994,14 +2058,23 @@ hole does, so the pour writes zeros wherever the image has none -- in
 order, through the same queue -- and gives back the rest of the device
 past the image's disk where the device takes a discard; an image bigger
 than the device is refused before anything is written, and `size=` is
-refused with `onto=`, the device being the size it is. The checks are a
-given device's: `force` over what is on it, and never one in use.
+refused with `onto=`, the device being the size it is. What is poured is a
+qcow2 image or a raw disk: one with a partition table, or with what
+`diskimage::contents` knows a disk holds -- a filesystem, a RAID member --
+or a start of zeros. An empty file, and one of bytes no disk holds -- a
+page of HTML -- are refused, where they were once poured, the empty one
+giving the whole device back to it. The checks are a given device's:
+`force` over what is on it, and never one in use. A pour cannot take back
+what it wrote: one that fails, or is stopped, says the device -- or the
+volume -- holds part of the image now, and a device that gives back none
+of its writes for two minutes is given up, said so, rather than waited for
+by `hv convert`, and the unload or the poweroff behind it, for good.
 
 **What the folder's commands do with a device.** `hv clone` refuses a VM
 with one: the clone would share it, and two machines on one disk wreck it.
 `hv delete` takes away the folder and leaves the device as it is, saying
-so (`hv: part:...-000000000002 left as it is -- a device, which a delete
-never touches`). The `vm` provider's `devices`, `disk_attach` and
+so (`hv: part:...-000000000002 left as it is -- a device of nos's, which a
+delete never touches`; a volume of NBS's likewise). The `vm` provider's `devices`, `disk_attach` and
 `disk_detach`, and `create`'s `onto` and `force`, are the same functions
 ([On the management bus](#on-the-management-bus)), and the panel's
 "Create" offers the devices that may be given, saying why a refused one
@@ -2127,9 +2200,16 @@ its sequence number and its TCP checksum its own, FIN and PSH the last
 one's, CWR the first's. What the driver says about either -- where a
 checksum goes, where the headers end, the segment size -- is checked against
 the frame before it is used, and a send that does not hold up is dropped,
-counted. Not offered: ECN on a cut send, IPv6, UDP; and a segment under 256
-bytes is refused, so that one notify is 256 frames at most and not 65,000
-that a guest could ask for at no cost to itself.
+counted. Not offered: ECN on a cut send, IPv6, UDP. A segment of 8 bytes is
+taken, the least Linux's TCP makes (`TCP_MIN_GSO_SIZE`): a guest talking to
+a peer with a small MSS cuts its sends small, and refused under 256 bytes
+they were dropped whole, the guest never told -- its connection down to the
+one segment its TCP sends unsegmented after a timeout. What a notify may
+cost is held by the pass instead: a transmit pass ends at its bound on the
+frames it made or the bytes it copied out of the guest (1,024 frames, 1 MiB
+-- a ring of Linux's largest sends is one pass), the next round going on
+with the rest, where a ring of 64 KiB sends cut at 256 bytes was 65,536
+frames and 16 MiB under the platform's lock for one notify.
 
 Between two guests, the switch does neither where it need not. A guest
 whose driver takes checksums left to finish (`GUEST_CSUM`) is handed a
@@ -2343,11 +2423,22 @@ window now rings the first CPU, and 2,400 pings had none, 0.19 ms on
 average and 0.28 at most.
 
 **`hv forward` is how a guest is reached from outside.** The guests have
-addresses only on their switch; a forward listens on a port of nos's and,
-for each connection, opens one to the guest's port through `hv0`
-(`kcore::tcp::TcpStream::connect`, new for this) and relays the two with a
-task of its own. The kernel has 64 TCP connections and a forwarded one takes
-two, so a forward carries eight at once and refuses the rest. Its listener is
+addresses only on their switch; a forward listens on a port of nos's -- on
+the device the guests go out through by NAT, the default route's, which is
+the one the world reaches them by (`eth0` while NAT is off): on a machine
+whose uplink was not its first NIC, a forward on `eth0` said it was made and
+was reached by nobody -- and hands each connection to a relay task of its
+own, which opens one to the guest's port through `hv0`
+(`kcore::tcp::TcpStream::connect`, new for this) and relays the two. The
+connect is the relay's: one to a guest that does not answer waits out TCP's
+five seconds there, where the listener once did, every other client and the
+forward's own stop waiting behind it. The kernel has 64 TCP connections and a
+forwarded one takes two, so a forward carries eight at once and refuses the
+rest. A relay ends when either side's stream ends: there is no half-close, the
+kernel's TCP having no way for a program to end its sending and go on
+reading, so a client that shuts its sending side and waits for the answer
+(`nc -N`) gets none; and an idle relay looks at each side every few
+milliseconds, there being no event to wait on for two connections. Its listener is
 a bulk one (`TcpListener::bind_bulk`): a connection it accepts has buffers of
 up to 512 KiB each way and scales its window, where a connection's own 8 KiB
 would hold a client 62 ms away -- the EX44 from a desk in another country --
@@ -2444,15 +2535,23 @@ message never leaves its port: the switch answers it in place with the
 port's address -- the same as `ip=` gives -- a day's lease, the /24 mask, nos
 as the router, and nos's DNS server. Nothing is remembered, because there is
 nothing to choose: a request for any other address is refused (NAK) and the
-client starts again. A distribution that configures its ethernet by DHCP, as
-most do, needs nothing on its command line; one that takes `ip=` gets the
-same address from there.
+client starts again. A guest whose address is set by hand -- its port's --
+may ask for the rest with a DHCPINFORM, and is answered with an ACK that has
+no address and no lease in it (RFC 2131, 3.4). A message the switch takes and
+does not answer -- a release, a decline, one not well formed -- is counted
+with the frames it does not carry (`frames_foreign`), where it once went
+nowhere, counted nowhere. A distribution that configures its ethernet by
+DHCP, as most do, needs nothing on its command line; one that takes `ip=`
+gets the same address from there.
 
 **The DNS server the guests are given is nos's own** -- its resolver's, or
 the one its lease named (`kcore::net::dns_server`): 10.0.2.3 under QEMU's user
 network, Hetzner's resolvers on the Hetzner boxes. `ip=` carries it as `dns0`,
 which the kernel shows in `/proc/net/pnp` and Alpine's initramfs writes to
-`resolv.conf`, and DHCP as option 6, which systemd-resolved takes. The guests
+`resolv.conf`, and DHCP as option 6, which systemd-resolved takes. `ip=` has
+the one nos had when the guest started; DHCP asks the kernel as it answers,
+so a lease renewed after nos's own lease named another resolver has the new
+one -- it was the one nos had when some guest was last started. The guests
 ask it through NAT like any other server; nos runs no DNS server of its own.
 
 `scripts/hv-linux-test.py --net` is the network's gate: two guests, their
@@ -2508,9 +2607,10 @@ commands share is the console, its last 64 KiB in a ring; the bytes waiting to
 be typed at it, 4 KiB at most; a stop flag; and the loop's counters, which it
 publishes at every halt and every 4096 exits. The ring and the input queue
 are taken whole when the VM is made, so nothing on the guest's datapath
-allocates. Each vCPU is bound to one CPU the extension is on for: `cpu=` if
-given, else the one with fewest running VMs -- the highest of a tie, so the
-boot CPU's own work is the last to share its CPU with a guest.
+allocates. Each vCPU is bound to one CPU the extension is on for, where
+`hv::place` puts it (`cores.rs`): whole cores of its own by default, its
+disks' task on a core apart where there is one, `cpu=` naming its first CPU
+when given ([Where its CPUs sit](#where-its-cpus-sit)).
 
 **`hv exec` knows where its answer starts.** It types the line and a newline
 and waits for a prompt -- but only one printed after the line's last byte was
@@ -2543,9 +2643,10 @@ it nowhere -- and answers with that, from a buffer of its own: a guest that
 asks and never reads the answer costs the host no more than one that asks
 once, where the answer used to be appended to a queue without bound.
 
-**Stopping is a question, then a flag and a join.** `hv stop` takes the VM
-off the list first and presses its power button, and a guest that shuts
-down when it is pressed is given `secs` to ([ACPI](#acpi)); the one above,
+**Stopping is a question, then a flag and a join.** `hv stop` presses the
+VM's power button, and a guest that shuts down when it is pressed is given
+`secs` to ([ACPI](#acpi)) -- on the list meanwhile, `stopping`, its CPUs
+still counted where a new VM is placed, and off it after; the one above,
 a kernel without ACPI, never hears the button, and is stopped at once. Then
 the flag: the loop checks it before every entry, and a halted guest's task
 sleeps at most 10 ms at a time, so the stop comes within a tick or so, and
@@ -2843,12 +2944,17 @@ $ hv start noble
   cloud-init takes it for a new machine; its user-data gives the image's
   own user -- `ubuntu`, `debian` -- the keys nos's sshd lets in
   (`/etc/ssh/authorized_keys`), and with `password=` a password, for its
-  console. Every string in it is YAML's double-quoted, so that a key's
-  comment is never read as YAML. The user-data says nothing of the machine,
+  console. Every string in it is YAML's double-quoted -- the meta-data's
+  too, a VM named `1.5` or `true` being no string to YAML bare, and its
+  hostname then not set -- and everything but printable ASCII in it an
+  escape (`\u2028`), a C1 control or a line separator in a key's comment
+  or a password having once left the user-data unreadable or the password
+  another. The user-data says nothing of the machine,
   and is kept in the folder as `user-data`: a clone's seed gives its own
   first boot the same ([below](#cloned-deleted-changed)). The host API's
   create may give user-data of its own instead -- a job, which only an
-  admin starts.
+  admin starts -- and then no password, which was once dropped without a
+  word: the call is refused.
 - **The vm.toml**, written last: hvboot as its kernel (`/lib/hvboot`, the
   system image's, or `hvboot=`), which boots the kernel the image's own
   GRUB would ([A guest's own kernel](#a-guests-own-kernel-pvh-and-hvboot));
@@ -2859,11 +2965,18 @@ $ hv start noble
   sshd -- `cmdline=`, which hvboot puts after the entry's own line.
 - **Nothing is left of a failure**: what the command made -- the download,
   the disk, the seed, and the folder when it made that too -- goes, and
-  why it failed is said. Nor of a stop: the module's going, or the host
-  API's cancel of its job, ends the download as the next of the body
-  arrives, or the conversion at the next cluster, and takes the same away.
-  The name is held while the folder is made: no start of it meanwhile, and
-  no other create, clone or delete.
+  why it failed is said, with anything that could not be taken away. Nor
+  of a stop: the module's going, or the host API's cancel of its job, ends
+  the download as the next of the body arrives, or the conversion at the
+  next cluster, and takes the same away. Before anything is fetched, a
+  `disk.raw`, `seed.iso` or `user-data` in the folder already -- what `hv
+  delete <vm> keep-disks` leaves -- refuses it: one once failed the create
+  at the end of its download, every time. The name is held while the folder
+  is made: no start of it meanwhile, and no other create, clone or delete;
+  and what it is given meanwhile -- its `port=`, a device -- is kept with the
+  hold, no other VM's until its vm.toml says so. The URL is said without a
+  user's name and password, a query or a fragment: a job's log is read by
+  every client that may read jobs.
 
 What it does not do yet: check the image against its distribution's
 `SHA256SUMS` (TLS's certificate is what vouches for the bytes now), resume
@@ -2915,18 +3028,26 @@ hv: /vms/noble2/vm.toml written -- hv start noble2 boots it, cloud-init given a 
   switch -- an address and a MAC -- that no other VM's vm.toml names and no
   VM on the list holds, when the source had one (`port=` says which); no
   `forward`, which would be the source's ports; no `ip=` on its command
-  line; and not `protected`.
+  line; and not `protected`. The port is looked for, and kept with the new
+  name's hold until its vm.toml says so, under the lock vm.toml changes
+  take: two clones at once were once given one port, one MAC and one
+  address.
 
 It is refused while the source is on the list -- `hv stop` it first -- and
 when the new name has a folder; both names are held while it runs, so
-neither starts and nothing else is done to either. What fails, or is
-stopped -- the module's going, the host API's cancel -- leaves nothing
-behind.
+neither starts and nothing else is done to either. A source's `user-data`
+that is there and cannot be read refuses it, rather than giving the clone
+the default keys in its place. What fails, or is stopped -- the module's
+going, the host API's cancel -- leaves nothing behind, and what could not be
+taken away is said.
 
 `hv delete <name> [keep-disks] [force]` (`store::delete`) takes a VM's
 folder away: every file in it and every folder under it -- or, with
 `keep-disks`, all but the disks its vm.toml names in it, which stay where
-they are, the folder with them -- its vm.toml last, so that a delete that
+they are, the folder with them -- told by the file, not by the path's
+spelling: a vm.toml's `./root.img` or `sub/../root.img` is the file the
+folder lists as `root.img`, which a comparison of strings once took away
+and said it kept -- its vm.toml last, so that a delete that
 fails part way (a file open, a disk another VM holds) leaves the VM there
 for another. Disks its vm.toml names outside the folder are not touched.
 It is refused while the VM is on the list, and for a VM whose vm.toml says
@@ -2938,10 +3059,16 @@ lists no folder without a vm.toml: what a delete that kept the disks left.
 another replaced where it is, one taken away taken out, one the file has not
 added at its end -- and every other line, the operator's comments and blank
 lines among them, left as it was; the file as it was kept beside it as
-`vm.toml.prev`, each written whole before it takes the old one's place. So
+`vm.toml.prev`, each written whole before it takes the old one's place --
+one change at a time, under one lock, and none while the folder is being
+deleted: a change beside a delete once wrote `vm.toml.prev` into a folder
+the delete had walked, which was left with that alone in it. So
 does `hv forward add` -- a forward to a VM with a folder is kept in its
 `forward = [...]`, for its next start to have it, and `hv forward del` takes
 it out -- and so do the host API's edits ([below](#on-the-management-bus)).
+No disk or download is given a name of the folder's own files -- `vm.toml`,
+`vm.toml.prev`, the `.new` each is written through, `user-data`, the
+console's logs.
 
 ### On the management bus
 
@@ -2953,15 +3080,18 @@ commands are:
 | | |
 |---|---|
 | reads | `list` (every VM: its folder's, and those on the list without one), `get` (its configuration, disks and forwards), `host` (the extension, the cores, the huge pool, the switch -- and the host's address on it and each port's, the same before the switch is made), `networks`, `config_get`, `console_read` (a page of its console from a byte on -- its control sequences taken out, or for a terminal filtered as `hv attach` filters them, a sequence the page would cut in two left for the next), `disks` (a device's id and its name this boot among them), `forwards`, `devices` (every device of nos's: its id, type, size, who holds it, what is on it, and why it would be refused -- [A device as a guest's disk](#a-device-as-a-guests-disk)) |
-| actions | `config_set` (a vm.toml checked as a start checks it, the old one kept as `vm.toml.prev`), `forward_add` and `forward_del` (kept in its vm.toml, and made or taken away now when it runs), `console_write` (keys, control keys among them), `disk_add` (a new empty disk in its folder), `disk_grow`, `disk_attach` and `disk_detach` (a device given to a stopped VM by its id, `force` as `hv disk attach` takes it, and taken off again) |
+| actions | `config_set` (a vm.toml checked as a start checks it, the old one kept as `vm.toml.prev` as its bytes -- so one that no longer parses, a key misspelt by hand, can be mended), `forward_add` and `forward_del` (kept in its vm.toml, and made or taken away now when it runs), `console_write` (keys, control keys among them), `disk_add` (a new empty disk in its folder), `disk_grow`, `disk_attach` and `disk_detach` (a device given to a stopped VM by its id, `force` as `hv disk attach` takes it, and taken off again) |
 | jobs | `start`, `stop`, `restart`, `create` (a cloud's image by its URL, as `hv create <name> <url>`: with `onto` and `force`, poured onto a device of nos's; with `port`, a port of the switch of its own, checked as a clone's is -- no other VM's by its vm.toml or as it runs; `forwards`, nos's ports relayed to its own; `protected`; and `start`, started by the same job once made, which ends failed, saying it was made, if the start fails), `clone`, `delete` |
 
 A job says as it goes what the command would, as its log, and how far it
 has got; its cancel -- or the module's going -- stops a download, a
-conversion and a copy where they are, what they made taken away, and stops
-waiting for a guest's power button. A VM whose vm.toml says `protected =
-true` is stopped and deleted only when the call says `force`: the panel's
-own VM has it. When the module goes, the loader closes the provider with
+conversion and a copy where they are, what they made taken away. A stop's
+cancel stops its wait for the guest to turn itself off and leaves the guest
+as it is, its power button pressed -- it was once stopped at once, perhaps
+in the middle of the shutdown the job had asked for -- and the module's going
+stops it where it is. A VM whose vm.toml says `protected = true` -- or whose
+vm.toml cannot be read, which may say so -- is stopped, restarted and deleted
+only when the call says `force`: the panel's own VM has it. When the module goes, the loader closes the provider with
 the command -- its jobs told to stop -- and the module's stop unregisters
 it, waiting out its calls and jobs, before the forwards and the VMs go; the
 loader then waits out the command's calls, and only then is the module
@@ -3047,12 +3177,19 @@ console_log = true
 
 **The name** is the folder's: a letter or a digit, then letters, digits,
 `.`, `_` and `-`, at most 32 -- a word of a command and a component of a
-path, with nothing in it either reads otherwise. One VM of a name is on the
+path, with nothing in it either reads otherwise -- and neither digits alone
+nor `all`, which the commands read as a VM's number and as every VM
+(`store::reserved`). So a word is a name or a number and never both: a VM
+named `1` was once reached by `hv stop 1` -- and by the bus's `vm.stop`,
+whose `protected` was read from another folder -- as whichever VM was
+number 1. A folder named so from before is listed by `hv vms`, saying it,
+and is not started until it is renamed. One VM of a name is on the
 list at a time: a second `hv start web` is refused while vm 0 is web, even
 stopped -- `hv restart web` boots it again, `hv stop web` takes it off. Its
 disks are claimed as any guest's are (`disk::Claims`), so no other guest
-writes them meanwhile. A number is a VM's number before it is a name: a VM
-named by digits alone is found by its name only where no VM has that number.
+writes them meanwhile. What a VM's vm.toml says while it runs -- `protected`
+to the bus's `stop` and `delete` -- is read from the folder it was started
+from, wherever that is.
 
 **`console.log`** (`modules/hypervisor/hv/src/vmlog.rs`) is the guest's console as it
 wrote it, control sequences and all, appended a second at a time by a task
@@ -3172,8 +3309,10 @@ button and evdev.)
   ([The IO-APIC](#the-io-apic)). The MP table is still there: a kernel with
   ACPI finds its CPUs in the MADT, one without in the MP table, and both
   are told the same.
-- **The DSDT** is the one table in AML, and small: `\_S5`, and the PCI host
-  bridge. The bridge has to be there. A Linux with ACPI finds PCI through
+- **The DSDT** is the one table in AML, and small: `\_S5`, the PCI host
+  bridge, and the panic device `PEVT` (`QEMU0001`, its port) when the VM
+  has one ([A guest that panics](#a-guest-that-panics-pvpanic)) -- which the listing below, of a
+  VM without, leaves out. The bridge has to be there. A Linux with ACPI finds PCI through
   the namespace alone and never probes the bus -- `pci_legacy_init` is not
   even called -- so without one the guest would have no disks and no NICs.
   Its `_CRS` gives bus 0-255, the configuration ports, the I/O either side
@@ -3298,12 +3437,14 @@ is nos's, `dev` and the commit, which such a build does not know.)
 
 - **The tables** are SMBIOS 3's, the 64-bit entry point at 0xF0000 -- where
   a kernel with no EFI scans for one, in the BIOS area the e820 map
-  reserves, after the ACPI tables -- and after it the BIOS (type 0, which
-  says the machine is a virtual one), the system (1: maker `nos`, product
-  `nos hv`, nos's version, the VM's name for its serial, and its UUID), its
-  chassis (3), the boot (32) and the end (127). Every string is the
-  operator's to have made -- a VM's name -- so each is cut to 64 bytes of
-  printable ASCII, anything else a `?`.
+  reserves, after the ACPI tables -- and SMBIOS 2.1's 32-bit one after it,
+  `_SM_` and its `_DMI_` half, the same table by its 32-bit address, for a
+  kernel before 4.0 or a `dmidecode` that knows no other; then the BIOS
+  (type 0, which says the machine is a virtual one), the system (1: maker
+  `nos`, product `nos hv`, nos's version, the VM's name for its serial,
+  and its UUID), its chassis (3), the boot (32) and the end (127). Every
+  string is the operator's to have made -- a VM's name -- so each is cut to
+  64 bytes of printable ASCII, anything else a `?`.
 - **The UUID is the VM's.** A VM's folder keeps it in its `vm.toml`
   (`uuid = "..."`), which `hv create` writes; a VM whose file was written
   before VMs had one is given one at its first start, added to the end of
@@ -3550,60 +3691,112 @@ its magic, its one module, a memory map of RAM up to the guest's last byte
 in order -- and the entry to paging off. hv's unsafe count is still 4.
 
 **hvboot** (`src/crates/hypervisor/hvboot`, built by `make` and kept as `/lib/hvboot`
-in the system image) is a PVH ELF of 164 KiB, linked at 1 MiB, that runs in
+in the system image) is a PVH ELF of 227 KiB, linked at 1 MiB, that runs in
 the guest. It reads:
 
-- its start info: the memory map, the RSDP, and its command line --
-  `hvboot.entry=` (an entry by number, `N>M`, title or id, as GRUB's
-  `default` takes one), `hvboot.disk=N` (look on that disk alone) and
-  `hvboot.verbose` its own, every other word for the kernel (`start.rs`);
+- its start info: the memory map, the RSDP, its modules -- an `initrd=`
+  given to `hv start`, which it does not use, and says so -- and its
+  command line, split where Linux splits its own, at blanks outside double
+  quotes: `hvboot.entry=` (an entry by number, `N>M`, title or id, as
+  GRUB's `default` takes one; titles with spaces in them in double quotes),
+  `hvboot.disk=N` (look on that disk alone) and `hvboot.verbose` its own,
+  every other word for the kernel as it was given (`start.rs`,
+  `options.rs`);
 - the guest's legacy virtio disks on PCI bus 0, a request at a time with
   the interrupt never taken: each poll reads the ISR, a port, and the exit
   that takes is where hv hands back what is done -- a request not answered
-  in 30 s is said, not waited on (`virtio.rs`);
+  in 30 s is said, not waited on, and its disk reset and given up: the
+  device still held the chain, whose buffers the loader had given to
+  something else since, and the next request's slot and index were the
+  same, so a late answer was taken for that one's (`virtio.rs`);
 - each disk's partitions, from its GPT -- header and array each checked by
   their CRC -- or an MBR, an XBOOTLDR partition (a /boot of its own, as
-  Ubuntu's) first, and a disk with no table looked at whole (`gpt.rs`);
-- ext2, ext3 and ext4, read-only: extents and block maps, 64-bit
+  Ubuntu's) first, and a disk with no table looked at whole; a partition
+  that runs past the disk's end is said and passed over (`gpt.rs`);
+- ext2, ext3 and ext4, read-only but for grubenv's block (below): extents and block maps, 64-bit
   descriptors, flex_bg, htree directories read as the linear ones they
   also are, inline data, symlinks, holes; an incompatible feature it does
-  not read is refused by name, and the journal is not replayed, as GRUB
-  does not replay it (`ext.rs`, over the format crate `src/crates/common/storage/extfmt`,
+  not read is refused by name, said as the filesystem is passed over and
+  again when no filesystem is found -- GRUB 2.06 reads `meta_bg` and
+  `encrypt`, which this refuses, and refuses `inline_data`, which this
+  reads -- and the journal is not replayed, as GRUB does not replay it
+  (`ext.rs`, over the format crate `src/crates/common/storage/extfmt`,
   which the kernel's ext4 driver reads through too);
 - the first `/boot/grub/grub.cfg` or `/grub/grub.cfg` (or grub2's) on
-  them, and grubenv beside it: the menu, submenus too, each entry's `linux`,
-  `initrd` and the `search` or `set root` naming its filesystem -- by UUID,
-  label, file or `hdN,gptM` -- and the default, grubenv's `next_entry` and
+  them -- a path that could not be looked for, a read that failed, ending
+  the search, said, rather than another filesystem's being booted -- and
+  grubenv beside it: the menu, submenus within submenus, each entry's
+  `linux`, `initrd` and the `search` or `set root` naming its filesystem --
+  by UUID, label, file or `hdN,gptM` -- the root set outside the entries,
+  which they start from, and the default, grubenv's `next_entry` and
   `saved_entry` where the script defers to them, as grub-mkconfig's does.
+  A `next_entry` it boots it empties on the disk first, as that script's
+  `save_env` does -- grubenv's block rewritten in place, every other
+  line as it was, and only after the bytes there are found to be the
+  ones it read, nor where the journal is not replayed: the one write hvboot
+  makes. `grub-reboot`'s entry is booted once, as under GRUB, and a disk
+  that cannot be written says that the entry will be taken again.
   It is not GRUB's interpreter: it reads the script's words as GRUB does --
-  quotes, escapes, comments, variables -- and its blocks, but runs no
-  condition; every branch of an `if` is read, the last `search` and `linux`
-  an entry has win, and a variable has a value only where a `set` outside a
-  condition gives it one. What it cannot place it says (`grub.rs`).
+  quotes, escapes, comments, variables, a brace a token of its own -- and
+  makes a command's arguments of them as GRUB's script does, an unquoted
+  variable's value split at blanks; it reads the blocks but runs no
+  condition: every branch of an `if` is read, the last `search` and `linux`
+  an entry has win (a `linux` unloading the `initrd` before it), a variable
+  has a value only where an assignment outside a condition gives it one,
+  and the chosen entry's body is read with the variables as the whole file
+  leaves them, as GRUB runs it at boot. `default` names an entry as GRUB's
+  does: a number as `strtoul` reads one (`0x2`, `010`), a title or an id,
+  `>` into a submenu and `>>` for a `>` of a title's own, a submenu's first
+  entry when the rest names nothing. grubenv is read as GRUB reads it: its
+  signature or nothing, `\X` as X. Each of these is what GRUB 2.06 does,
+  found by booting it (`scripts/hvboot-test.py` has the cases). What it
+  cannot place it says: another file read for the menu (`configfile`,
+  `blscfg`), a variable with no value, a `}` that closes nothing. What it
+  holds is bounded and said where a bound is met: a grub.cfg of 128 KiB
+  and a grubenv of 4 KiB at most, 2048 menu items, 256 variables, 256 KiB
+  of what their values add, 64 initrds an entry (`grub.rs`, `plan.rs`).
 
 It loads the kernel at its `pref_address` and the initrds high, one after
-another at GRUB's 4-byte alignment, into RAM the memory map has, clear of
-itself; builds the zero page -- the start info's memory map as its e820,
-the RSDP -- and the command line GRUB would give, `BOOT_IMAGE=` first, then
-its own line's words after the entry's; resets the disks; and enters the
-kernel's 64-bit entry, as hv enters a bzImage (`bzimage.rs`, `boot.rs`).
+another at GRUB's 4-byte alignment, the bytes between them zeros as GRUB's
+are, into RAM the memory map has, clear of itself; builds the zero page --
+the start info's memory map as its e820, the RSDP -- and the command line
+GRUB's `linux` would give, `BOOT_IMAGE=` first, an argument with a space in
+it in double quotes and `\`, `'` and `"` escaped, then its own line's words
+after the entry's, as hv gave them; resets the disks; and enters the
+kernel's 64-bit entry, as hv enters a bzImage (`boot.rs`) -- the header
+read and the zero page made by the crate hv makes a guest's with
+(`common/boot/bzimage`), one copy where there were two.
 Whatever it cannot do it says on the console and turns the guest off through
 its ACPI -- the VM stops with "the guest powered itself off", the reason in
-its console, rather than sitting halted with nothing said; a fault in it is
-said too, with where it happened.
+its console, and when no filesystem or no grub.cfg is found, everything it
+passed over and why -- rather than sitting halted with nothing said; a fault
+in it is said too, with where it happened, and a heap run out with what the
+heap held.
 
 It runs in the guest, and what it reads is the guest's own: a bug in it is
 the guest's, not nos's, and the host's half of this is the PVH loader
-above. Its parsers -- `gpt`, `ext`, `grub`, `bzimage` -- are plain Rust over
-byte slices with no `unsafe`; its 29 unsafe sites are the platform's, in
-ports, physical memory, the heap, the virtio rings, the IDT and the jump.
-The parsers are compiled for the host too (`fuzz/hvboot`): read off Ubuntu
-24.04's and Debian 13's images, the kernels and initrds come out byte for
-byte as `debugfs` reads them, and `scripts/hvboot-test.py` holds them to
-the entry GRUB would boot on disks it makes -- GPT, MBR and none; ext4,
-ext3, ext2 of 1 KiB blocks into the double indirect ones; a default, a
-`next_entry`, a `saved_entry` into a submenu -- and fuzzes each disk's
-metadata.
+above. What it boots is `plan`'s to work out -- the filesystems, grub.cfg,
+the entry, where the kernel and the initrds go, the command line, and the
+reading of them into place -- over the disks and RAM it is given and
+nothing of the platform's; it and the parsers it reads through (`gpt`,
+`ext`, `grub`, and `bzimage`'s) are plain Rust over byte slices with no
+`unsafe`. Its 41 unsafe sites are the platform's: ports, physical memory,
+the heap (`arena.rs`: first fit over its free blocks, a block given back
+merged with its neighbours, in place of a bump allocator that took back
+only its newest block -- an extent tree two levels deep, or a long enough
+grub.cfg, spent the heap through blocks it never took back), the virtio
+rings, the IDT and the jump. The host's harness (`fuzz/hvboot`) runs `plan`
+itself, not a second copy of its rules, under `arena.rs` over a stretch no
+bigger than hvboot's heap: read off Ubuntu 24.04's and Debian 13's images,
+the kernels and initrds come out byte for byte as `debugfs` reads them, and
+`scripts/hvboot-test.py` holds it to the entry GRUB would boot on disks it
+makes -- GPT, MBR and none; ext4, ext3, ext2 of 1 KiB blocks into the
+double indirect ones; a default, a `next_entry`, a `saved_entry` into a
+submenu; GRUB 2.06's own answers to how a grub.cfg is read; what is said
+when nothing boots; a grub.cfg as long as is read, of every shape that
+costs the reading the most, and an initrd whose extent tree is two levels
+deep, each inside the heap and all of it given back -- and fuzzes each
+disk's metadata, every run held to the heap the same way.
 
 What it does not do: boot what is not Linux -- Windows has no boot
 protocol of its own to be entered by, and needs firmware, which OVMF's
@@ -3686,7 +3879,11 @@ placement `hv cores shared` gives: the first on the least loaded core, of
 the faster kind where loads tie, each other on a core none of the guest's
 CPUs is on yet where there is one, sharing the first's last-level cache
 where it can, of the first's kind, the least loaded of those, whoever else
-is there. That is for a machine whose guests are all one's own.
+is there; and its disks' task on a CPU none of its vCPUs is on, whose core
+has the fewest vCPUs, its own counted -- chosen by the other guests' load
+alone, it went to the guest's own second vCPU's CPU while others stood
+idle, and every completion took that vCPU out of its guest. That is for a
+machine whose guests are all one's own.
 
 ```
 $ hv boot /bzImage mem=256 secs=60 cpus=2 initrd=/initrd cmdline=earlyprintk=serial,ttyS0,115200 console=ttyS0 no_timer_check
@@ -3786,7 +3983,9 @@ each CPU its APIC ID in EBX[31:24]; leaf 6 says the timer keeps running in
 deep C-states (ARAT), which is true of one counted off the host's clock; and
 where the host's own leaf 0x15 gives its TSC's frequency -- an Intel host's
 does -- the guest's gives the timer's clock, a crystal of 1 GHz, and the
-TSC's ratio to it, so a kernel need not measure either. Passed through, the
+TSC's ratio to it -- what a kernel reads when it is not told the TSC's rate
+on its command line (`tsc_early_khz=`, which the module gives a Linux guest
+and Linux then takes over the leaf). Passed through, the
 leaf would name the host's crystal, tens of MHz, and a kernel that took the
 timer's rate from it would have its timer fire tens of times too soon;
 where the host has no frequency to give, the leaf is blank and the kernel
@@ -4106,9 +4305,14 @@ CPU leaves its guest at the deadline it was armed for, as a host interrupt.
 
 Each local APIC has its timer: one-shot and periodic, counting down at a bus
 clock of 1 GHz -- KVM's, and one that makes a count nanoseconds -- with the
-divide configuration a guest writes. A periodic timer that fell behind is
+divide configuration a guest writes; written while a count runs, the count
+goes on from where it is at the new rate, its interrupt with it, as KVM
+restarts its timer for. A periodic timer that fell behind is
 owed its periods, handed over one at a time as the guest takes each, a
-second's worth at most, as the PIT's channel 0 is. And TSC-deadline mode,
+second's worth at most, as the PIT's channel 0 is -- but one whose entry is
+masked, or whose vector the APIC refuses, owes none: every period gone by is
+skipped, as an APIC loses a masked one, and unmasked it does not hand over
+the periods it missed back to back. And TSC-deadline mode,
 which leaf 1 offers with the APIC wherever the host knows its TSC's rate: a
 write of IA32_TSC_DEADLINE (MSR 0x6E0) arms the timer to run out when the
 TSC reaches it -- the guest's TSC is the host's, so the deadline is turned
@@ -4217,11 +4421,13 @@ frames dropped a gigabyte. A guest of one CPU has no APIC, and keeps the
 
 ### What it does not do yet
 
-- **The first CPU's task does every device's work.** Between its guest's
-  turns it serves a disk's answer and a NIC's frames, with or without an
-  IO-APIC; only the interrupts that follow go where the guest steers them
-  -- through MSI-X, and with `ioapic` the PIT's and the serial port's too.
-  Without one, those two reach the first CPU only.
+- **The first CPU's task does most of the devices' work.** Between its
+  guest's turns it serves a NIC's frames and the chipset's devices, with or
+  without an IO-APIC -- a disk's own task hands over its completions and
+  posts their MSI-X itself (`LinuxGuest::serve_disk`); only the interrupts
+  that follow go where the guest steers them -- through MSI-X, and with
+  `ioapic` the PIT's and the serial port's too. Without one, those two
+  reach the first CPU only.
 - **Neither an MP table nor ACPI, one CPU.** A kernel built with neither
   `X86_MPPARSE` nor ACPI finds one CPU.
 
@@ -4353,17 +4559,24 @@ The tables say so: the MP table marks the IO-APIC usable and routes each
 PCI function's INTA, level and active low, and the MADT lists it with the
 timer's and the SCI's overrides ([ACPI](#acpi)); `noapic` is not added.
 
-An edge-triggered pin sends as it rises; a level-triggered one while its
-line is up and its last interrupt has been ended -- its remote IRR set as
-it sends, and cleared by the EOI of the local APIC that took it, which the
-APIC broadcasts for a vector it took as a level (its trigger-mode
-register), or by a write of the IO-APIC's EOI register; a line still up
-then sends again. Only a fixed or a lowest-priority interrupt is ever a
-level: an NMI or an INIT is in service nowhere and nothing ends it, so an
-entry of either is edge-triggered whatever its trigger bit says, as the
-82093AA treats one -- taken as a level, a guest that pointed the SCI's
-entry at NMI had one sent at every look while the SCI was up, and its CPU 0
-turned back its own entry for each, never to run again (hv-fuzz found it).
+An edge-triggered pin sends as it rises; a level-triggered one as it rises
+and again while its line is up once its last interrupt has been ended --
+its remote IRR set when a local APIC has taken it, as the 82093AA sets it,
+and cleared by the EOI of that APIC, which the APIC broadcasts for a vector
+it took as a level (its trigger-mode register), or by a write of the
+IO-APIC's EOI register; a line still up then sends again. A level no APIC
+took -- its destination no CPU's, or the APIC software-disabled, which
+refuses it, there or as the CPU it was mailed to takes its mail -- is in
+service nowhere and no EOI will come: its remote IRR stays clear, and it is
+sent again when a CPU's APIC is turned on or addressed otherwise, as the
+chip holds such a message and tries it again. Set as the message was made,
+the pin was dead for good. Only a fixed or a lowest-priority interrupt is
+ever a level: an NMI is in service nowhere and nothing ends it, so such an
+entry is edge-triggered whatever its trigger bit says, as the 82093AA
+treats one -- taken as a level, a guest that pointed the SCI's entry at NMI
+had one sent at every look while the SCI was up, and its CPU 0 turned back
+its own entry for each, never to run again (hv-fuzz found it). An entry of
+INIT, which no PC's firmware wires a device to, is counted and not sent.
 A message goes as a device's MSI does: into the local
 APIC of the CPU whose loop sent it, or through another's mailbox, the
 level bit with it. The serial port had to become a 16550 for this: its
@@ -4376,12 +4589,17 @@ vector is still requested in the first CPU's APIC.
 
 **Its local APICs come out of reset in xAPIC mode.** Linux keeps a
 firmware-enabled x2APIC with an IO-APIC only with interrupt remapping, or
-under a hypervisor it knows to support x2APIC without -- KVM, Xen, Hyper-V
--- and this one names none (CPUID's hypervisor range is blank). Finding
+under a hypervisor it knows to support x2APIC without -- KVM, Xen, Hyper-V.
+This one's CPUID names KVM's paravirtual interface ([KVM's paravirtual
+interface](#kvms-paravirtual-interface-as-far-as-it-is-backed)), and a Linux built with
+`KVM_GUEST` takes that for the answer (`x2apic_available` is
+`kvm_para_available` there); one built without it does not, and finding
 its firmware left x2APIC on, a Linux 6.1 or 6.18 turns it off, reading its
 APIC's ID through a page it has not mapped, and faults. So a machine with
-an IO-APIC is the PC most firmware makes, in xAPIC mode, and the kernel
-takes it as it is:
+an IO-APIC is the PC most firmware makes, in xAPIC mode, which every kernel
+takes as it is (whether a `KVM_GUEST` kernel with an IO-APIC runs right
+with its x2APIC kept, and no MMIO exit for its APIC, has not been measured
+yet: that is what starting such a guest in x2APIC mode would want first):
 
 ```
 $ hv boot /bzImage cpus=2 ioapic initrd=/initrd cmdline=console=ttyS0
@@ -4392,7 +4610,7 @@ $ hv boot /bzImage cpus=2 ioapic initrd=/initrd cmdline=console=ttyS0
 [    0.260088] ..TIMER: vector=0x30 apic1=0 pin1=2 apic2=0 pin2=0
 ...
   mmio       65657 accesses performed for the guest, its instructions decoded: the xAPIC page's and the IO-APIC's
-  ioapic     431 interrupts sent, 0 of them level-triggered, 0 ended by EOI, 0 of no delivery mode sent here
+  ioapic     431 interrupts sent, 0 of them level-triggered, 0 ended by EOI, 0 levels no local APIC took, 0 of no delivery mode sent here
 ```
 
 Every access of its APICs is then a decoded MMIO access ([What an exit
@@ -4893,7 +5111,14 @@ someone else's; then speed.
      What it was: `hv stop` gave the port back to the switch, and the next
      `hv start ... net` took the lowest free one -- the same MAC and the
      same address (`port_ip`) -- and with it the old VM's forwards and the
-     answers to its flows.
+     answers to its flows. And a forward added as its VM was stopped --
+     `forward=` of a start whose session was slow to take its line, `hv
+     forward add`, the bus's `forward_add` -- could land after the stop's
+     `drop_vm` and outlive the VM the same way: `Forwards::add` now asks
+     whether the VM is listed under its own lock as the forward goes in
+     (`Vms::on_list`), so the stop's `drop_vm`, which follows the VM off
+     the list, takes it or it is refused; and the stops take the forwards
+     before they give the switch port back.
    - ~~Two VMs can open one image read-write~~ -- done: a guest's disk
      claims its image as it opens it (`disk::Claims`), by the file -- its
      mount and inode (`kernel_file_mount`, `kernel_file_key`), so two
@@ -5006,15 +5231,17 @@ someone else's; then speed.
    both are allow-lists (`hypervisor/hv/src/policy.rs`, [A Linux
    guest](#a-linux-guest)). A leaf the policy does not name is all zeros,
    as is every leaf past the tops it reports, 0x16 and 0x8000_0021; of
-   leaf 6 a guest is told ARAT alone, of 0x80000008 the address widths,
+   leaf 6 a guest is told ARAT alone, of 0x80000008 the address widths --
+   the physical one the host's, the linear one 48 at most, LA57 not being
+   offered --
    CLZERO, the FP error pointers and two attacks the CPU is not open to, of
-   0x80000021 what is true of the silicon and asks nothing of the host. No
-   speculation control is offered -- none has its MSR behind it yet (item 1)
-   -- nor INVLPGB or AutoIBRS; the hypervisor bit is set. An MSR the policy
+   0x80000021 what is true of the silicon and asks nothing of the host. The
+   speculation controls are offered now, their MSRs behind them (item 1);
+   not INVLPGB nor AutoIBRS; the hypervisor bit is set. An MSR the policy
    does not name is a #GP both ways; what it names is the guest's own
    state, the TSC, or a constant that takes a write leaving it as it is and
    refuses any other: the MTRRs off, machine checks with no banks, the
-   microcode revision none, and of each vendor what Linux reads of every
+   microcode revision -- the host's on Intel, none elsewhere -- and of each vendor what Linux reads of every
    such CPU without asking. The guest's own state takes what the CPU would:
    a PAT entry that is no memory type, an address that is not canonical
    and an EFER bit the CPUID does not offer (FFXSR) are #GPs, where they were
@@ -5066,7 +5293,16 @@ someone else's; then speed.
    guests had the banner both ways -- and four connections that never
    logged in held every slot for logging in, on the Hetzner boxes the only
    console there is. Forwards still draw on the same 64 connections the
-   machine has (item 5).
+   machine has, every forward together at most twelve relays -- 24 of them
+   -- where eight of eight each had been 128; and a relay closes its two
+   first, each then waiting out its close for a minute in TIME-WAIT: a
+   client that opened and closed through one forward about once a second
+   held all 64, and nos's sshd and API turned everyone away. The kernel
+   now takes such a slot back for a new connection when none is free --
+   one in TIME-WAIT the longest first, as Linux does past
+   `tcp_max_tw_buckets` (`Tcp::reclaim` in `layers/net/src/tcp.rs`);
+   net-fuzz's `tcp` target opens 72 in a row that the machine closes first,
+   each to be answered, and a build without the reclaim refused the 43rd.
 4. ~~**NAT lets a guest go anywhere nos can.**~~ Done: NAT keeps the
    guests from link-local, the private networks, the shared space and the
    uplink's own subnet unless `nat allow` lets a network through, the DNS

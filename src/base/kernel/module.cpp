@@ -38,6 +38,17 @@ void rust_ipc_module_gone(const char* name, ulong len);
    shell commands are (Cmd::close_range, Cmd::drain_range) */
 void rust_mgmt_close_range(ulong lo, ulong hi);
 void rust_mgmt_drain_range(ulong lo, ulong hi, int take);
+/* And the network layer (src/crates/layers/net): a UDP listener's callback
+   and a virtual NIC's sink in [lo, hi), left registered by its exit, taken
+   off -- each said, as the module's bug */
+void rust_net_close_range(ulong lo, ulong hi, const char* name, ulong len);
+/* What a module opened through the kernel's C ABI and left open, by the
+   module's name: its events, its device claims and queues, its disks'
+   images and files (base/events, layers/block, layers/fs) -- the TCP side
+   and NAT go with rust_net_close_range */
+void rust_events_module_gone(const char* name, ulong len);
+void rust_block_module_gone(const char* name, ulong len);
+void rust_fs_module_gone(const char* name, ulong len);
 }
 
 namespace kernel
@@ -45,6 +56,9 @@ namespace kernel
 /* The bridge's slots -- timers, line and MSI-X handlers -- whose code is in
    [lo, hi) stopped and taken off (rust_ffi.cpp) */
 void sweep_module_slots(ulong lo, ulong hi, const char* name);
+/* The tasks started on code in [lo, hi) asked to stop and waited for a
+   while: false when one is still running there (task.cpp) */
+bool sweep_module_tasks(ulong lo, ulong hi, const char* name);
 }
 
 namespace kernel
@@ -145,8 +159,35 @@ struct ModuleInfo
 static_assert(sizeof(ModuleInfo) == 128, "kmod::ModuleInfo layout");
 static_assert(INFO_NAME_LEN == ModuleTable::NAME_LEN_MAX + 1, "kmod::NAME_LEN");
 
-const char KERNEL_ABI[] = NOS_MODULE_ABI;
-static_assert(sizeof(KERNEL_ABI) - 1 <= INFO_ABI_LEN, "NOS_MODULE_ABI is too long");
+constexpr char KERNEL_ABI[] = NOS_MODULE_ABI;
+
+/* Whether the len bytes at s are a digest: 64 hex digits, as the Makefile's
+   sha256sum gives one */
+constexpr bool is_digest(const char* s, ulong len)
+{
+    if (len != INFO_ABI_LEN)
+        return false;
+    for (ulong i = 0; i < len; i++)
+    {
+        if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f')))
+            return false;
+    }
+    return true;
+}
+
+constexpr bool same_word(const char* a, const char* b)
+{
+    for (; *a != '\0' && *a == *b; a++, b++)
+        ;
+    return *a == *b;
+}
+
+/* The build's digest, or the word that says there is none, for a build
+   outside the Makefile ("unset", which lets no module in). An empty one --
+   a Makefile whose sha256sum was missing -- matched every module built the
+   same way, and is refused here as the Makefile refuses it. */
+static_assert(is_digest(KERNEL_ABI, sizeof(KERNEL_ABI) - 1) || same_word(KERNEL_ABI, "unset"),
+    "NOS_MODULE_ABI is no digest");
 
 /* How much of each digest a refusal for a mismatch quotes */
 const ulong ABI_SHOWN = 12;
@@ -850,10 +891,13 @@ stdlib::Error check_info(const LoadCtx& ctx, const ModuleInfo& info, LoadedModul
         return make_error(stdlib::Error::INVALID_VALUE);
     }
 
+    /* A module whose word is no digest was built outside the Makefile, or
+       by one that could not make one: refused whatever this kernel's is,
+       which two such builds would otherwise match */
     char abi[INFO_ABI_LEN];
     stdlib::mem_set(abi, 0, sizeof(abi));
     stdlib::mem_cpy(abi, KERNEL_ABI, sizeof(KERNEL_ABI) - 1);
-    if (stdlib::mem_cmp(abi, info.abi, sizeof(abi)) != 0)
+    if (!is_digest(info.abi, sizeof(info.abi)) || stdlib::mem_cmp(abi, info.abi, sizeof(abi)) != 0)
     {
         char theirs[ABI_SHOWN + 1];
         char ours[ABI_SHOWN + 1];
@@ -1095,6 +1139,7 @@ void run_job(void* ctx)
 ModuleTable::ModuleTable()
     : lock_(false)
     , halting_(false)
+    , images_kept_(0)
 {
     list_.init();
 }
@@ -1139,11 +1184,17 @@ void ModuleTable::remove(LoadedModule* module)
       above all -- stays stopped. A call that started one after the exit
       had stopped them was the race this order closes;
    5. what the exit left registered taken off, said as the module's bug;
-      the mailboxes it left open closed (rust_ipc_module_gone); a timer it
-      left running stopped and an interrupt handler it left registered
-      taken off (sweep_module_slots);
-   and then it is off the list and its code freed. An init that failed has
-   no instance: steps 2 and 4 are not its. */
+      the mailboxes it left open closed (rust_ipc_module_gone); a UDP
+      listener and a virtual NIC's sink it left taken off (rust_net_close_range);
+      a timer it left running stopped and an interrupt handler it left
+      registered taken off (sweep_module_slots); a task it left running
+      asked to stop and waited for (sweep_module_tasks); and what it opened
+      and left open -- a TCP listener or connection and NAT
+      (rust_net_close_range), a device queue and a claim, an image and a
+      file, an event -- closed (rust_*_module_gone);
+   and then it is off the list and its code freed -- or, with a task of it
+   still running, kept and said, as freed it would be run in. An init that
+   failed has no instance: steps 2 and 4 are not its. */
 void ModuleTable::take_down(LoadedModule* module, bool live)
 {
     const ulong lo = module->image.base;
@@ -1166,12 +1217,37 @@ void ModuleTable::take_down(LoadedModule* module, bool live)
     Cmd::drain_range(lo, hi, module->name, true);
     rust_mgmt_drain_range(lo, hi, 1);
     rust_ipc_module_gone(module->name, len);
-    /* And what calls into its image by a slot of the bridge's: a timer, an
-       interrupt handler. Left as they were, they outlived the code. */
+    /* And what calls into its image from the net layer -- a UDP listener's
+       callback, a virtual NIC's sink -- or by a slot of the bridge's: a
+       timer, an interrupt handler. Left as they were, they outlived the
+       code. */
+    rust_net_close_range(lo, hi, module->name, len);
     sweep_module_slots(lo, hi, module->name);
+    const bool tasks_gone = sweep_module_tasks(lo, hi, module->name);
+    /* After its tasks: none of them is mid-call on what these close. The
+       queues and images first, which wait for their devices, then what was
+       made on them (an event) */
+    rust_fs_module_gone(module->name, len);
+    rust_block_module_gone(module->name, len);
+    rust_events_module_gone(module->name, len);
 
     remove(module);
-    release_module(module);
+    if (tasks_gone)
+    {
+        release_module(module);
+        return;
+    }
+    const ulong flags = lock_.lock_irq_save();
+    images_kept_++;
+    lock_.unlock_irq_restore(flags);
+}
+
+ulong ModuleTable::images_kept()
+{
+    const ulong flags = lock_.lock_irq_save();
+    const ulong kept = images_kept_;
+    lock_.unlock_irq_restore(flags);
+    return kept;
 }
 
 stdlib::Error ModuleTable::load(const void* image, ulong size, const char* params, stdlib::Printer& out)

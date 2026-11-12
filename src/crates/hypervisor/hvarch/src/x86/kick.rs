@@ -4,7 +4,7 @@
 //! Nothing here touches the CPU's virtualization: it is atomics and the
 //! kernel's calls, and hv-fuzz runs it as it is.
 
-use core::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 /// What another CPU does to have a guest that is running leave it -- the
 /// guests' switch with a frame for it, a disk's task with what it asked --
@@ -26,6 +26,13 @@ use core::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, Ordering};
 /// entry, however many kick.
 pub struct Kick {
     mode: AtomicU8,
+    /// Past `entering`, interrupts off on its CPU until the guest runs, and
+    /// until `left`: where a posted-interrupt notification is taken in the
+    /// guest (`notify`). `mode` says IN_GUEST from `prepare` on, with the
+    /// host's interrupts still on; a notification sent then was the host's
+    /// to take and end, and the guest was entered with it posted and not
+    /// notified -- late by up to a tick, every later post for it silent.
+    in_guest: AtomicBool,
     /// The CPU the vCPU last entered its guest on.
     cpu: AtomicU32,
     /// Interrupts sent: kicks that found the vCPU in its guest or on its
@@ -48,6 +55,7 @@ impl Kick {
     pub const fn new() -> Kick {
         Kick {
             mode: AtomicU8::new(OUTSIDE_GUEST),
+            in_guest: AtomicBool::new(false),
             cpu: AtomicU32::new(0),
             sent: AtomicU64::new(0),
             edge: AtomicU64::new(0),
@@ -110,16 +118,16 @@ impl Kick {
 
     /// Another CPU's, from any context, once it has posted an interrupt for
     /// the vCPU (`vmx::PostedInterrupts::post`): the posted-interrupt
-    /// notification to the CPU the vCPU is in its guest on, or on its way
-    /// in to -- which takes what was posted there without an exit -- and
-    /// true; false when it is neither, for the caller to wake it instead.
-    /// A vCPU on its way in looks at what was posted after `prepare`, so it
-    /// either finds the interrupt or is sent the notification; one that
-    /// left meanwhile takes the notification as a host interrupt with
+    /// notification to the CPU the vCPU is in its guest on, or past
+    /// `entering` on its way in to with interrupts off -- where it is taken
+    /// in the guest, pending until the entry if it comes first -- and true;
+    /// false otherwise, for the caller to ring it instead, which turns an
+    /// entry still to come back for the round to take what was posted. One
+    /// that left meanwhile takes the notification as a host interrupt with
     /// nothing to do, and what was posted at its next look.
     pub fn notify(&self) -> bool {
         fence(Ordering::SeqCst);
-        if self.mode.load(Ordering::SeqCst) != IN_GUEST {
+        if !self.in_guest.load(Ordering::SeqCst) {
             return false;
         }
         kcore::cpu::notify(self.cpu.load(Ordering::SeqCst));
@@ -137,6 +145,7 @@ impl Kick {
         self.cpu.store(cpu, Ordering::SeqCst);
         if self.mode.load(Ordering::SeqCst) != IN_GUEST {
             self.mode.store(OUTSIDE_GUEST, Ordering::SeqCst);
+            self.in_guest.store(false, Ordering::SeqCst);
             return false;
         }
         let edge = self.edge.load(Ordering::Relaxed);
@@ -150,10 +159,16 @@ impl Kick {
             kcore::cpu::timer_at(edge);
             if edge <= kcore::time::boot_time_ns() {
                 self.mode.store(OUTSIDE_GUEST, Ordering::SeqCst);
+                self.in_guest.store(false, Ordering::SeqCst);
                 self.edges_passed.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
         }
+        /* From here a notification is the guest's: sent after this, it is
+         * pending until the entry, interrupts being off; one that found this
+         * false rang instead, and its kick finds `mode` still IN_GUEST and
+         * interrupts the CPU, which leaves the guest at once. */
+        self.in_guest.store(true, Ordering::SeqCst);
         true
     }
 
@@ -166,6 +181,7 @@ impl Kick {
     }
 
     pub(crate) fn left(&self) {
+        self.in_guest.store(false, Ordering::SeqCst);
         self.mode.store(OUTSIDE_GUEST, Ordering::SeqCst);
     }
 }

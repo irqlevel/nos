@@ -218,7 +218,8 @@ impl Dhcp {
             /* The transaction id is the client's own; the entropy pool is a
              * better source than the boot time the C++ used, and by this
              * point it has been fed. */
-            state.xid = kcore::random::random_u64().unwrap_or(0x1234_5678) as u32;
+            static SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+            state.xid = kcore::random::random_u64_or_clock("DHCP transaction ids", &SAID) as u32;
         }
         self.ready.store(false, Ordering::Release);
 

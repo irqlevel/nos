@@ -79,6 +79,8 @@ pub mod acpi;
 pub mod cr;
 #[path = "../../../src/crates/hypervisor/hv/src/dr.rs"]
 pub mod dr;
+#[path = "../../../src/crates/hypervisor/hv/src/exit.rs"]
+pub mod exit;
 /// The guests' DHCP server, from the module: what a guest's DHCP client's
 /// frames reach.
 #[path = "../../../src/crates/modules/hypervisor/hv/src/dhcp.rs"]
