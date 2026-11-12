@@ -3433,7 +3433,9 @@ writes passed along their chains (N13), a cs passing each on as it takes it
 and the next replica answering the session by name, a chain slow at a hop
 gone around by the session's direct send -- a run that began chains and
 passed none on fails, and a write of a session that chains sent without
-its mark fails as it is sent; each joiner's view of its join held to the
+its mark fails as it is sent, as does a chain begun by a write the session
+had alone, its only one not done, which goes to each replica directly; each
+joiner's view of its join held to the
 metadata -- every volume a writer has had with a chunk in the set among
 its fences, at its newest generation -- and the joiner's cs fenced so
 before its copy begins; a write failed at its deadline that left its
@@ -3443,7 +3445,9 @@ after it -- and
 a session serving again at a newer generation finding every block no
 write is out to alike, which the `cut_write` end brings about: one active
 replica of a chunk cut off from every host but its own, its host up, while
-the writer writes the chunk past its deadline; never more of a session's
+the writer writes the chunk past its deadline, and that a write starved of
+memory past its deadline, reaching no replica, has none (the
+`starved_past_deadline` end); never more of a session's
 places closing at once than its window -- two, as the fuzzer builds
 nbsclient (`small_windows`) -- and a close asked alone of a few places done
 in a moment, every place closed on every active replica (the
@@ -3651,7 +3655,7 @@ little and now and then past a silence.
     longer.
 
 `--mutants` runs `fuzz/nbs/mutants.py`, which takes out one rule at a time.
-Each of its two hundred and sixteen must fail the gate -- run as `nbs-fuzz gate
+Each of its two hundred and nineteen must fail the gate -- run as `nbs-fuzz gate
 --first`, stopped at the first target that fails: the gate's verdict, sooner.
 The gate's cluster range is followed by a few seeds past it
 (`GATE_CLUSTER_ALSO`), each where a rule's race comes together that the

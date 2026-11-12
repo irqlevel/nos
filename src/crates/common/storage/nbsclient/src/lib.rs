@@ -488,6 +488,10 @@ pub struct Session {
     open: BTreeMap<u32, (u64, bool)>,
     /// Closes out for places idle: place -> cs's not answered.
     closing: BTreeMap<u32, BTreeSet<u32>>,
+    /// Places the reconcile mends whether or not a replica holds their
+    /// chunk open: those of the writes out when the session attached anew
+    /// (N13c).
+    mend_too: BTreeSet<u32>,
     mend: VecDeque<u32>,
     mending: Option<Mend>,
     scratch: Vec<u8>,
@@ -519,7 +523,8 @@ impl Session {
             index: 0, map: Map::default(), reading: None, next_id: 1, mds: None, downs: BTreeMap::new(),
             subs: BTreeMap::new(), pieces: BTreeMap::new(), next_piece: 1, ops: BTreeMap::new(), next_op: 1,
             queue: VecDeque::new(), parked: Vec::new(), fenced: BTreeSet::new(), held: BTreeMap::new(),
-            dirty: BTreeSet::new(), open: BTreeMap::new(), closing: BTreeMap::new(), mend: VecDeque::new(),
+            dirty: BTreeSet::new(), open: BTreeMap::new(), closing: BTreeMap::new(), mend_too: BTreeSet::new(),
+            mend: VecDeque::new(),
             mending: None, scratch: Vec::new(), stop: None, stop_flush: None, reads: BTreeMap::new(),
             copies: BTreeMap::new(), pausing: None, starved: false,
             #[cfg(feature = "starve")]
@@ -1143,6 +1148,17 @@ impl Session {
         out.chain(pieces).min().unwrap_or(self.next_id)
     }
 
+    /// Whether write piece `pid`'s operation is the only write out: no
+    /// piece of another's sent to a replica and not done (`Piece.left`). Its
+    /// pieces go to each replica directly then, a chain's hops one after
+    /// another being all its time at depth 1 (N13c).
+    fn alone(&self, pid: u64) -> bool {
+        let Some(op) = self.pieces.get(&pid).map(|p| p.op) else { return false };
+        !self.pieces.values().any(|q| {
+            q.op != op && q.left && self.ops.get(&q.op).is_some_and(|o| o.kind == Kind::Write)
+        })
+    }
+
     /// Whether piece `pid` is a write of a session whose writes go along
     /// chains: its ids the piece's (`piece_ids`).
     fn chained_write(&self, pid: u64) -> bool {
@@ -1201,9 +1217,17 @@ impl Session {
             }
             _ => {
                 /* A chunk shared, or a copy-up pending there (N10): the write
-                   held while it is copied up */
+                   held while it is copied up. The reconcile's own writes
+                   apart: what they write is what one of the chunk's replicas
+                   holds already, the same for every map that names it -- a
+                   snapshot's too, whose replicas it makes the same as well --
+                   and held for a copy-up, which waits for any join of the
+                   set, a join stuck failed the session at their deadline
+                   (found by fuzz/nbs's cluster target, N13c: a reconcile
+                   after a pause given up, the set's one source's device
+                   failed under its joiner) */
                 let place = p.place;
-                if self.map.shared.contains(&place) {
+                if self.map.shared.contains(&place) && o.tag & INTERNAL == 0 {
                     self.hold_for_copy(pid, place, now, out);
                     return;
                 }
@@ -1222,7 +1246,14 @@ impl Session {
                 if let Some(p) = self.pieces.get_mut(&pid) {
                     p.waiting = to.iter().copied().collect();
                 }
-                if to.len() > 1 && self.send_chain(pid, &to, now, bufs, out) {
+                /* Along a chain where another write is out with it: one
+                   copy leaves this host. A write alone goes to each replica
+                   directly, with its mark as a chain's sent directly does:
+                   its time the slowest replica's, not the chain's hops one
+                   after another -- at depth 1 the chain halved a 256 KiB
+                   write's speed, its middle replica taking the whole piece
+                   before it passed it on (N13b) */
+                if to.len() > 1 && !self.alone(pid) && self.send_chain(pid, &to, now, bufs, out) {
                     return;
                 }
                 for cs in to {
@@ -1234,6 +1265,13 @@ impl Session {
 
     /// A cs's answer to a request.
     pub fn on_cs(&mut self, bytes: &[u8], now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
+        /* Detached or failed: an answer to a request of before means
+           nothing, as the mds's does not -- a copy-up's member refusing its
+           copy as `NotAttached` once the stop had let the volume go failed
+           a session detached (found by fuzz/nbs's cluster target, N13c) */
+        if matches!(self.phase, Phase::Detached | Phase::Failed(_)) {
+            return;
+        }
         let Some(a) = Answer::decode(bytes) else { return };
         let Some(sub) = self.subs.get(&a.id) else { return };
         let (cs, what) = (sub.cs, sub.what);
@@ -1301,6 +1339,11 @@ impl Session {
     /// A request the channel gave back, by the id it went with: a cs that is
     /// not there is as one that does not answer -- asked out at once.
     pub fn on_bounce(&mut self, id: u64, gone: bool, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
+        /* Detached or failed: nothing of before to send again, nor any cs
+           to ask out */
+        if matches!(self.phase, Phase::Detached | Phase::Failed(_)) {
+            return;
+        }
         let Some(sub) = self.subs.get_mut(&id) else { return };
         sub.again = Some(now + AGAIN_NS);
         if gone {
@@ -1780,7 +1823,7 @@ impl Session {
         if self.held.values().any(|h| h.is_none()) {
             return;
         }
-        let mut places = BTreeSet::new();
+        let mut places = core::mem::take(&mut self.mend_too);
         for list in self.held.values().flatten() {
             for &(chunk, incarnation, _) in list {
                 if let Some(p) = self.map.places.iter().position(|&(c, i, _)| c == chunk && i == incarnation) {
@@ -2278,7 +2321,7 @@ impl Session {
     /// on its replicas, as it does a crashed writer's, before it serves
     /// again -- a stop asked meanwhile begun then. Its own only: a session
     /// taken over meanwhile is refused, and fails.
-    fn attach_anew(&mut self, now: u64, out: &mut Vec<Out>) {
+    fn attach_anew(&mut self, apart: BTreeSet<u32>, now: u64, out: &mut Vec<Out>) {
         out.push(Out::Say(alloc::format!("nbs: volume {}: a write not done in {} s, its replicas perhaps apart -- \
                                           attached anew, every operation out failed, the chunks it left open made \
                                           the same", self.name, DEADLINE_NS / 1_000_000_000)));
@@ -2296,7 +2339,21 @@ impl Session {
         self.open.clear();
         self.closing.clear();
         self.dirty.clear();
+        self.mend_too = apart;
         self.reattach(now, out);
+    }
+
+    /// The places of the driver's writes with a piece sent to a replica and
+    /// not done: each may be on some of its replicas and not on others, and
+    /// the reconcile of an attach anew mends it whether or not a replica
+    /// holds its chunk open still -- a join's copy of a write out closes
+    /// what it copies, and its source taken out and back left the chunk
+    /// open nowhere, its replicas apart for good (found by fuzz/nbs's
+    /// cluster target, N13c).
+    fn writes_out(&self) -> BTreeSet<u32> {
+        self.pieces.values().filter(|p| {
+            p.left && self.ops.get(&p.op).is_some_and(|o| o.kind == Kind::Write && o.tag & INTERNAL == 0)
+        }).map(|p| p.place).collect()
     }
 
     /// Its own attach anew, at a new generation: what the old one had out
@@ -2403,6 +2460,7 @@ impl Session {
         self.subs.clear();
         self.downs.clear();
         self.copies.clear();
+        self.mend_too.clear();
         self.pausing = None;
         self.mds = None;
         if let Some(tag) = self.stop.take() {
@@ -2495,8 +2553,9 @@ impl Session {
             let write = self.ops.get(&id).is_some_and(|o| o.kind == Kind::Write && o.tag & INTERNAL == 0)
                 && self.pieces.values().any(|p| p.op == id && p.left);
             if write && self.writable && matches!(self.phase, Phase::Serving | Phase::Stopping) {
+                let apart = self.writes_out();
                 self.op_done(id, false, out);
-                self.attach_anew(now, out);
+                self.attach_anew(apart, now, out);
                 return;
             }
             let pieces: Vec<u64> = self.pieces.iter().filter(|(_, p)| p.op == id).map(|(&k, _)| k).collect();
