@@ -18,9 +18,13 @@
 //! 4 KiB boundary -- the device's used ring. Everything in them is the
 //! guest's to write at any moment, so every index, address and length read
 //! from them is checked before it is used: a descriptor past the queue's
-//! size, a chain longer than the queue (a loop), a buffer outside guest
-//! memory make the ring `Broken`, and a device that finds one stops using the
-//! queue until the driver resets it -- rather than the host trusting it.
+//! size, a chain longer than the queue (a loop), a ring or an indirect
+//! table outside guest memory make the ring `Broken`, and a device that
+//! finds one stops using the queue until the driver resets it -- rather than
+//! the host trusting it. A request's own buffer outside guest memory is that
+//! request's error, or that frame dropped, and the device goes on. And a
+//! queue the driver has not set up, or has taken down, is no queue to work
+//! on at all (`Transport::live`): its rings would be at page 0.
 //!
 //! Each side tells the other when it wants to hear of the other's work. A
 //! driver that takes EVENT_IDX (`F_EVENT_IDX`) says at which used entry it
@@ -73,8 +77,12 @@ pub const NO_VECTOR: u16 = 0xFFFF;
 
 /// The PCI vendor every virtio device has.
 pub const VENDOR: u16 = 0x1AF4;
-/// A legacy device's PCI device id is this plus its virtio type, less one.
-pub const LEGACY_DEVICE_BASE: u16 = 0x1000;
+/// A legacy device's PCI device id, the transitional ones of virtio 1.x
+/// (4.1.2.1): a table, not a sum of a base and the virtio type -- 0x1000 a
+/// network card (type 1), 0x1001 a disk (2), but 0x1002 the balloon (5) and
+/// 0x1003 the console (3). Each device here names its own.
+pub const LEGACY_NET: u16 = 0x1000;
+pub const LEGACY_BLK: u16 = 0x1001;
 
 /// The interrupt status's bit for "a queue has used buffers".
 const ISR_QUEUE: u8 = 1;
@@ -161,7 +169,9 @@ pub enum Broken {
     /// will not follow: not whole descriptors, a table within a table, a
     /// descriptor that names one and a next one too.
     Indirect,
-    /// A ring, or a buffer, outside guest memory.
+    /// A ring or an indirect table outside guest memory -- or the buffer a
+    /// disk's status byte goes in, without which a request cannot be given
+    /// back at all. A request's data outside it is the request's error.
     Memory,
 }
 
@@ -588,6 +598,10 @@ pub enum Asked {
     Nothing,
     /// The driver has made buffers available on this queue.
     Notify(u16),
+    /// The driver set this queue up anew, or took it down (a page frame
+    /// number of 0): whatever the device still holds of the old rings'
+    /// chains is the old rings', given back to nobody.
+    Queue(u16),
     /// The driver wrote 0 to the status: everything back to how it began.
     Reset,
 }
@@ -718,8 +732,15 @@ impl Transport {
         self.queues.iter().any(|q| q.ready() && q.mapped.is_none())
     }
 
-    pub fn queue(&mut self, index: u16) -> Option<&mut Queue> {
-        self.queues.get_mut(usize::from(index))
+    /// Queue `index` to work on: there, and set up -- None for one the
+    /// driver has not set up or has taken down, whose rings would be at page
+    /// 0 of the guest's memory. Handed out regardless, a down queue's pass
+    /// still asked for kicks there and, with EVENT_IDX, found "more" at every
+    /// look -- a pass due again at once, for good, the first CPU never
+    /// sleeping -- and a request served after its queue went down was put on
+    /// a used ring at page 0.
+    pub fn live(&mut self, index: u16) -> Option<&mut Queue> {
+        self.queues.get_mut(usize::from(index)).filter(|q| q.ready())
     }
 
     /// Whether queue `index` is there and set up.
@@ -815,6 +836,7 @@ impl Transport {
                     let map = self.maps.take(now);
                     q.set_pfn(pfn, mem, map);
                 }
+                asked = Asked::Queue(self.select);
             }
         }
         if touches(QUEUE_NOTIFY, 2) {
