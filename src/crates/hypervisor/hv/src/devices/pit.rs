@@ -216,18 +216,29 @@ impl Pit {
             }
             CH0..=CH2 => {
                 let index = (port - CH0) as usize;
-                let value = match self.ch[index].latched.take() {
-                    Some(v) => v,
-                    None => self.ch[index].current(),
-                };
                 let ch = &mut self.ch[index];
+                let value = ch.latched.unwrap_or_else(|| ch.current());
+                /* A latched count lasts until its last byte is read: one
+                 * byte in lo-only and hi-only access, both in lo/hi -- the
+                 * high byte of the same count, not of the counter as it is
+                 * by then, which one exit later could be 256 ticks lower,
+                 * a counter running backwards. */
                 match ch.access {
-                    ACCESS_LO => value as u8,
-                    ACCESS_HI => (value >> 8) as u8,
+                    ACCESS_LO => {
+                        ch.latched = None;
+                        value as u8
+                    }
+                    ACCESS_HI => {
+                        ch.latched = None;
+                        (value >> 8) as u8
+                    }
                     _ => {
                         let byte = match ch.read_half {
                             Half::Lo => value as u8,
-                            Half::Hi => (value >> 8) as u8,
+                            Half::Hi => {
+                                ch.latched = None;
+                                (value >> 8) as u8
+                            }
                         };
                         ch.read_half = if ch.read_half == Half::Lo { Half::Hi } else { Half::Lo };
                         byte
@@ -355,8 +366,12 @@ impl Pit {
         }
         let access = (value >> ACCESS_SHIFT) & 0x3;
         if access == ACCESS_LATCH {
-            /* Latch the current count for a stable read. */
-            self.ch[index].latched = Some(self.ch[index].current());
+            /* Latch the current count for a stable read -- one latched and
+             * not yet read whole stays, as a second latch command is
+             * ignored by the chip. */
+            if self.ch[index].latched.is_none() {
+                self.ch[index].latched = Some(self.ch[index].current());
+            }
             return;
         }
         let ch = &mut self.ch[index];
