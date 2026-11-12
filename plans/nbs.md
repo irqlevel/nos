@@ -1659,17 +1659,28 @@ each new gate.
       flush (`DiskQueue::start_flush`) waits for N12c, its first caller.
       Gates: the smoke boots both arches, netblk-test and parttest (arm64,
       every disk virtio-blk), nbs-test both arches, fs-fuzz, hv-test.
-    - **N12b**, the engine planned, the table pages committed together:
-      nbs-fuzz's `cs` target over a disk whose completions come in any order
-      and whose power is cut with requests in flight -- a write out may or
-      may not be on the medium, a flush covers only what was done before it
-      began -- its judge promising what it promises now; a mutant for each
-      ordering rule.
+    - **N12b**, the engine planned, the table pages committed together --
+      done, in two steps: the operations as `async fn`s, what each does
+      unchanged, every caller driving one at a time through `nbscs::now`
+      (eec8a444); then requests in flight together -- a chunk's turn, a
+      volume's fence alone, commit rounds (copy A of every page marked on
+      every device, flushed, then copy B), each device's data writes and
+      flushes counted, a copy-up's slot held while it copies -- and
+      nbs-fuzz's `inflight` target: tens to a couple of hundred requests in
+      flight over disks that do theirs in any order, cut with requests out,
+      held to every promise after every cut, a read to the last write
+      asked before it, no wait for ever; five mutants of the new rules,
+      each caught. The `cs` target stays the engine's judge one request at
+      a time: its model is the richer.
     - **N12c**, nbs-cs's loop on one event, requests in flight up to the
-      queue's buffers, the queue's flush started and reaped as a write is; nbswire's serve, copy and scrub over the planned
-      engine. Gates: nbs-fuzz's every target and its mutants, nbs-test
-      (its N11 phase throttled from the first write: a look answered even
-      during a long request), hv-nbs-test.
+      queue's buffers, the queue's flush started and reaped as a write is
+      (`DiskQueue::start_flush`, kept from N12a): `QueueDevice`'s requests
+      futures that a reap ends; nbswire's serve, copy and scrub `async`,
+      their questions to the host's mds answered to the request that asked,
+      not waited for on the loop; devices taken in, collected and fenced
+      without stopping it. Gates: nbs-fuzz's every target and its mutants,
+      nbs-test (its N11 phase throttled from the first write: a look
+      answered even during a long request), hv-nbs-test.
     - **N12d**, the hardware: a slow flush taking no replica out; 4 KiB at
       depth; a stop's closes.
   - **Limits**: one task a cs, so one CPU's worth of checks and copies -- a

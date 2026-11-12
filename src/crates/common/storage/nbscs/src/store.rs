@@ -39,18 +39,36 @@
 //! cells borrowed between two awaits and never across one, so that the
 //! operations of many requests may be in flight at once on one task. Over
 //! a device that answers at once, an operation ends at its first poll
-//! (`now`).
+//! (`now`). Those in flight together are held to these:
+//! - **Turns** (`turns.rs`): a chunk's requests one at a time, in the order
+//!   they came; a volume's together, and its fence alone -- after every
+//!   request of the volume before it, before every one after, so that no
+//!   request of an older generation is done once a newer one's fence is
+//!   answered.
+//! - **Commit rounds**: a record or a fence changed marks its page; a round
+//!   writes copy A of every page marked, on every device, flushes, then
+//!   copy B, flushed -- never both copies of a page in flight -- and every
+//!   request whose page it took is answered once it is done: the opens,
+//!   closes and frees that came together made durable by one write of each
+//!   copy and two flushes.
+//! - **Counted flushes**: a flush covers what was done before it began --
+//!   each device counts its data writes done, and a flush the count it
+//!   began at -- so a close, a copy's end or a client's flush waits for a
+//!   flush begun after the writes it needs, joining one in flight that did.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::rc::Rc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::future::poll_fn;
+use core::task::Poll;
 
 use nbsmeta::Pieces;
 
 use crate::device::{Device, IoError};
 use crate::format::*;
+use crate::turns::Turns;
 use crate::{COPY_PIECE, GRANULE, PAGE, SECTOR, SLOT};
 
 /// Why a request was not done.
@@ -168,15 +186,20 @@ struct DevState {
     /// Free slots, the lowest on top.
     free: Pieces<u32>,
     lost: u32,
-    dirty: bool,
+    /// Data writes done on it, counted; how many of them the flushes done
+    /// cover -- those done before a flush began; and the flush in flight,
+    /// with the count it began at.
+    writes: u64,
+    flushed: u64,
+    flushing: Option<u64>,
     failed: bool,
     active: bool,
 }
 
 impl<D> Dev<D> {
     fn new(d: D, layout: Layout, sup: Super, records: Pieces<Record>, free: Pieces<u32>, lost: u32) -> Dev<D> {
-        Dev { d, layout, sup, st: RefCell::new(DevState { records, free, lost, dirty: false, failed: false,
-                                                          active: true }) }
+        Dev { d, layout, sup, st: RefCell::new(DevState { records, free, lost, writes: 0, flushed: 0, flushing: None,
+                                                          failed: false, active: true }) }
     }
 
     fn record(&self, slot: u32) -> Record {
@@ -215,7 +238,83 @@ impl<D> Dev<D> {
     }
 }
 
+/// A flush in flight on a device, its mark taken off however it ends.
+struct Flushing<'a> {
+    st: &'a RefCell<DevState>,
+}
+
+impl Drop for Flushing<'_> {
+    fn drop(&mut self) {
+        self.st.borrow_mut().flushing = None;
+    }
+}
+
 impl<D: Device> Dev<D> {
+    /// A data write -- a chunk's, a slot's zeros -- counted once done: what
+    /// a flush begun after it covers.
+    async fn write_data(&self, at: u64, data: &[u8]) -> Result<(), IoError> {
+        let done = self.d.write(at, data).await;
+        if done.is_ok() {
+            self.st.borrow_mut().writes += 1;
+        }
+        done
+    }
+
+    /// Zeros over `len` bytes from `at`, counted as one data write.
+    async fn zero_data(&self, at: u64, len: u64) -> Result<(), IoError> {
+        let done = self.d.zero(at, len).await;
+        if done.is_ok() {
+            self.st.borrow_mut().writes += 1;
+        }
+        done
+    }
+
+    /// A flush of the device, one at a time: the data writes done as it
+    /// begins covered once it is done. Failed, the device fails.
+    async fn flush_counted(&self) -> Result<(), IoError> {
+        poll_fn(|_| if self.st.borrow().flushing.is_none() { Poll::Ready(()) } else { Poll::Pending }).await;
+        let mark = {
+            let mut st = self.st.borrow_mut();
+            st.flushing = Some(st.writes);
+            st.writes
+        };
+        let held = Flushing { st: &self.st };
+        let done = self.d.flush().await;
+        drop(held);
+        let mut st = self.st.borrow_mut();
+        match done {
+            Ok(()) => st.flushed = st.flushed.max(mark),
+            Err(_) => st.failed = true,
+        }
+        done
+    }
+
+    /// Every data write done on the device before now durable: a flush in
+    /// flight that began after them waited for, or one begun now -- after
+    /// the one in flight, where that began before them.
+    async fn durable(&self) -> Result<(), IoError> {
+        let need = self.st.borrow().writes;
+        loop {
+            let flushing = {
+                let st = self.st.borrow();
+                if st.failed {
+                    return Err(IoError);
+                }
+                if st.flushed >= need {
+                    return Ok(());
+                }
+                st.flushing
+            };
+            match flushing {
+                Some(mark) => {
+                    poll_fn(|_| if self.st.borrow().flushing != Some(mark) { Poll::Ready(()) } else { Poll::Pending })
+                        .await
+                }
+                None => self.flush_counted().await?,
+            }
+        }
+    }
+
     /// Its table page `p`, in copy `copy`, as its records are now.
     async fn write_table_page(&self, p: u64, copy: usize) -> Result<(), IoError> {
         let page = self.table_page(p);
@@ -245,6 +344,46 @@ fn fence_page(fences: &[Fence], format: u64, p: u64) -> Vec<u8> {
 pub struct Store<D: Device> {
     devs: RefCell<Vec<Rc<Dev<D>>>>,
     s: RefCell<State>,
+    /// A chunk's turn, by its number; a volume's, by its number.
+    chunk_turns: Turns,
+    volume_turns: Turns,
+    commits: RefCell<Commits>,
+}
+
+/// The records and fences on their way to the devices: the pages marked
+/// since the round running began, and the rounds -- the next to begin,
+/// and the last done.
+struct Commits {
+    table: BTreeMap<usize, BTreeSet<u64>>,
+    fences: BTreeSet<u64>,
+    next: u64,
+    done: u64,
+    running: bool,
+}
+
+/// A round running: its pages marked again and the round let go, where it
+/// ends before it is done -- dropped mid-way.
+struct Round<'a> {
+    commits: &'a RefCell<Commits>,
+    round: u64,
+    table: BTreeMap<usize, BTreeSet<u64>>,
+    fences: BTreeSet<u64>,
+    finished: bool,
+}
+
+impl Drop for Round<'_> {
+    fn drop(&mut self) {
+        let mut c = self.commits.borrow_mut();
+        c.running = false;
+        if self.finished {
+            c.done = c.done.max(self.round);
+        } else {
+            for (dv, pages) in core::mem::take(&mut self.table) {
+                c.table.entry(dv).or_default().extend(pages);
+            }
+            c.fences.extend(core::mem::take(&mut self.fences));
+        }
+    }
 }
 
 struct State {
@@ -301,6 +440,21 @@ fn page_of(slot: u32) -> u64 {
     u64::from(slot) / RECORDS_PER_PAGE as u64
 }
 
+/// A slot taken off a device's free list for a copy-up: given back where
+/// the copy ends before its record is written.
+struct Held<'a, D> {
+    dev: &'a Dev<D>,
+    slot: Option<u32>,
+}
+
+impl<D> Drop for Held<'_, D> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            self.dev.st.borrow_mut().free.push(slot);
+        }
+    }
+}
+
 /// A device taken back out of an `Rc` no one else holds: the device the
 /// caller handed in, given back with a refusal.
 fn unwrap_dev<D>(dev: Rc<Dev<D>>) -> D {
@@ -323,7 +477,88 @@ impl<D: Device> Store<D> {
                 joining: BTreeMap::new(),
                 marks: BTreeMap::new(),
             }),
+            chunk_turns: Turns::default(),
+            volume_turns: Turns::default(),
+            commits: RefCell::new(Commits { table: BTreeMap::new(), fences: BTreeSet::new(), next: 1, done: 0,
+                                            running: false }),
         }
+    }
+
+    /// Turns held or waited for, and rounds running: none once every
+    /// operation is over.
+    pub fn busy(&self) -> usize {
+        self.chunk_turns.in_use() + self.volume_turns.in_use() + usize::from(self.commits.borrow().running)
+    }
+
+    /// What is held, in words: for a report of a wait that never ends.
+    pub fn held(&self) -> alloc::string::String {
+        let c = self.commits.borrow();
+        let flushing: Vec<Option<u64>> = self.devs.borrow().iter().map(|d| d.st.borrow().flushing).collect();
+        alloc::format!("chunk turns {}, volume turns {}, rounds next {} done {} running {}, pages marked {:?} \
+                        fences {:?}, flushes in flight {:?}", self.chunk_turns.held(), self.volume_turns.held(), c.next,
+                       c.done, c.running, c.table, c.fences, flushing)
+    }
+
+    /* ---- commit rounds ---- */
+
+    /// Until round `round` is done: run here where no round runs, and
+    /// waited for where one does.
+    async fn committed(&self, round: u64) {
+        loop {
+            let (done, running) = {
+                let c = self.commits.borrow();
+                (c.done, c.running)
+            };
+            if done >= round {
+                return;
+            }
+            if running {
+                poll_fn(|_| {
+                    let c = self.commits.borrow();
+                    if c.done >= round || !c.running { Poll::Ready(()) } else { Poll::Pending }
+                }).await;
+            } else {
+                self.commit_round().await;
+            }
+        }
+    }
+
+    /// A round: copy A of every page marked, on every device there was as
+    /// it began, each device flushed; then copy B, flushed. A device whose
+    /// write or flush fails is taken as failed.
+    async fn commit_round(&self) {
+        let mut round = {
+            let mut c = self.commits.borrow_mut();
+            c.running = true;
+            let round = c.next;
+            c.next += 1;
+            Round { commits: &self.commits, round, table: core::mem::take(&mut c.table),
+                    fences: core::mem::take(&mut c.fences), finished: false }
+        };
+        let devs = self.dev_count();
+        for copy in 0..2 {
+            for dv in 0..devs {
+                let dev = self.dev(dv);
+                let pages: Vec<u64> = round.table.get(&dv).map(|p| p.iter().copied().collect()).unwrap_or_default();
+                if dev.failed() || (pages.is_empty() && round.fences.is_empty()) {
+                    continue;
+                }
+                let mut ok = true;
+                for p in pages {
+                    ok = ok && dev.write_table_page(p, copy).await.is_ok();
+                }
+                let fences: Vec<u64> = round.fences.iter().copied().collect();
+                for p in fences {
+                    let page = fence_page(&self.s.borrow().fences, dev.sup.format, p);
+                    ok = ok && dev.d.write((FENCE_AT[copy] + p) * PAGE, &page).await.is_ok();
+                }
+                ok = ok && dev.flush_counted().await.is_ok();
+                if !ok {
+                    dev.fail();
+                }
+            }
+        }
+        round.finished = true;
     }
 
     /// Device `dv`.
@@ -514,6 +749,7 @@ impl<D: Device> Store<D> {
                 .filter(|(_, r)| matches!(r.state, SlotState::Open | SlotState::Written)).collect()
         };
         for (slot, r) in held {
+            let _turn = self.chunk_turns.take(r.chunk, true).await;
             let other = self.s.borrow().at.get(&r.chunk).copied();
             match other {
                 Some((dv, s)) if self.record(dv, s).incarnation >= r.incarnation => {
@@ -617,11 +853,13 @@ impl<D: Device> Store<D> {
     }
 
     /// Volume `volume` fenced at `generation`: written to every device and
-    /// flushed before it is answered -- with the fence there is now.
+    /// flushed before it is answered -- with the fence there is now. The
+    /// volume's turn alone: every request of it before the fence done.
     pub async fn fence(&self, volume: u32, generation: u64) -> Result<u64, Error> {
         if volume == 0 || generation == 0 {
             return Err(Error::Bad);
         }
+        let _turn = self.volume_turns.take(volume, true).await;
         let cur = self.fence_of(volume);
         if cur > generation {
             return Err(Error::Fenced { generation: cur });
@@ -640,12 +878,13 @@ impl<D: Device> Store<D> {
             s.fence_of.insert(volume, index);
             index
         };
-        self.write_fence_page_everywhere(u64::from(index) / FENCES_PER_PAGE as u64).await?;
+        self.fence_round(u64::from(index) / FENCES_PER_PAGE as u64).await?;
         Ok(generation)
     }
 
     /// Volume `volume`'s fence taken off: the volume is gone.
     pub async fn drop_fence(&self, volume: u32) -> Result<(), Error> {
+        let _turn = self.volume_turns.take(volume, true).await;
         let index = {
             let mut s = self.s.borrow_mut();
             let Some(index) = s.fence_of.remove(&volume) else { return Ok(()) };
@@ -654,7 +893,7 @@ impl<D: Device> Store<D> {
             s.fence_free.push(index);
             index
         };
-        self.write_fence_page_everywhere(u64::from(index) / FENCES_PER_PAGE as u64).await
+        self.fence_round(u64::from(index) / FENCES_PER_PAGE as u64).await
     }
 
     /// The volumes fenced.
@@ -678,27 +917,19 @@ impl<D: Device> Store<D> {
         Ok(())
     }
 
-    /// The fence table's page `p` in copy A of every device, flushed, then
-    /// in copy B: a device whose write fails is taken as failed; none left
-    /// that took it, an error.
-    async fn write_fence_page_everywhere(&self, p: u64) -> Result<(), Error> {
-        let fences = self.s.borrow().fences.clone();
-        for copy in 0..2 {
-            let mut any = false;
-            for dv in 0..self.dev_count() {
-                let dev = self.dev(dv);
-                if dev.failed() {
-                    continue;
-                }
-                if dev.write_fence_page(&fences, p, copy).await.is_ok() && dev.d.flush().await.is_ok() {
-                    any = true;
-                } else {
-                    dev.fail();
-                }
-            }
-            if !any && self.dev_count() != 0 {
-                return Err(Error::Io);
-            }
+    /// The fence table's page `p` onto every device by the next round: a
+    /// device whose write fails is taken as failed; none left that took it,
+    /// an error.
+    async fn fence_round(&self, p: u64) -> Result<(), Error> {
+        let round = {
+            let mut c = self.commits.borrow_mut();
+            c.fences.insert(p);
+            c.next
+        };
+        self.committed(round).await;
+        let devs = self.devs.borrow();
+        if !devs.is_empty() && devs.iter().all(|d| d.failed()) {
+            return Err(Error::Io);
         }
         Ok(())
     }
@@ -709,8 +940,8 @@ impl<D: Device> Store<D> {
         self.devs.borrow().get(dv).map(|d| d.record(slot)).unwrap_or_default()
     }
 
-    /// Slot `slot` of device `dv` holding `r`, its page written in copy A,
-    /// flushed, then in copy B, flushed.
+    /// Slot `slot` of device `dv` holding `r`, its page durable by the
+    /// round that takes it -- copy A of it written, flushed, then copy B.
     async fn put(&self, dv: usize, slot: u32, r: Record) -> Result<(), Error> {
         /* Written again in this run: no longer as it was found -- the chunk
            the slot held, and the one it holds now */
@@ -728,12 +959,14 @@ impl<D: Device> Store<D> {
         if let Some(cur) = dev.st.borrow_mut().records.get_mut(slot as usize) {
             *cur = r;
         }
-        let p = page_of(slot);
-        for copy in 0..2 {
-            if dev.write_table_page(p, copy).await.is_err() || dev.d.flush().await.is_err() {
-                dev.fail();
-                return Err(Error::Io);
-            }
+        let round = {
+            let mut c = self.commits.borrow_mut();
+            c.table.entry(dv).or_default().insert(page_of(slot));
+            c.next
+        };
+        self.committed(round).await;
+        if dev.failed() {
+            return Err(Error::Io);
         }
         Ok(())
     }
@@ -792,6 +1025,8 @@ impl<D: Device> Store<D> {
     /// not hold yet, and for an epoch other than the one it knows.
     pub async fn write(&self, volume: u32, generation: u64, c: ChunkRef, offset: u32, data: &[u8], verified: bool)
         -> Result<(), Error> {
+        let _volume = self.volume_turns.take(volume, false).await;
+        let _chunk = self.chunk_turns.take(c.chunk, true).await;
         self.check_fence(volume, generation)?;
         /* A joiner takes no write of an epoch before its join: one from a
            view that old -- a writer taken over since among them, which the
@@ -840,11 +1075,10 @@ impl<D: Device> Store<D> {
            not write over it, and a mark that cannot be kept refuses it */
         self.mark(&c, offset, data.len())?;
         let dev = self.dev(dv);
-        if dev.d.write(dev.data_at(slot, u64::from(offset)), data).await.is_err() {
+        if dev.write_data(dev.data_at(slot, u64::from(offset)), data).await.is_err() {
             dev.fail();
             return Err(Error::Io);
         }
-        dev.st.borrow_mut().dirty = true;
         Ok(())
     }
 
@@ -869,7 +1103,7 @@ impl<D: Device> Store<D> {
            record kept with its zeros lost would read what the slot held
            through this chunk -- another volume's data. (Found by fuzz/nbs's
            cs target.) */
-        if dev.d.zero(dev.data_at(slot, 0), SLOT).await.is_err() || dev.d.flush().await.is_err() {
+        if dev.zero_data(dev.data_at(slot, 0), SLOT).await.is_err() || dev.durable().await.is_err() {
             dev.fail();
             return Err(Error::Io);
         }
@@ -887,6 +1121,8 @@ impl<D: Device> Store<D> {
     /// `generation` 0 for a read-only attach, which no fence holds to.
     pub async fn read(&self, volume: u32, generation: u64, c: ChunkRef, offset: u32, buf: &mut [u8], verified: bool)
         -> Result<(), Error> {
+        let _volume = if generation != 0 { Some(self.volume_turns.take(volume, false).await) } else { None };
+        let _chunk = self.chunk_turns.take(c.chunk, true).await;
         if generation != 0 {
             self.check_fence(volume, generation)?;
         }
@@ -927,21 +1163,21 @@ impl<D: Device> Store<D> {
     /// durable where a newer writer's reconcile may have put other data
     /// (found by fuzz/nbs's cluster target).
     pub async fn flush_for(&self, volume: u32, generation: u64) -> Result<(), Error> {
+        let _volume = self.volume_turns.take(volume, false).await;
         self.check_fence(volume, generation)?;
         self.flush().await
     }
 
-    /// Everything written so far, durable.
+    /// Everything written so far, durable: on each device, a flush begun
+    /// after its writes done by now.
     pub async fn flush(&self) -> Result<(), Error> {
         let mut failed = false;
         for dv in 0..self.dev_count() {
             let dev = self.dev(dv);
-            if !dev.st.borrow().dirty || dev.failed() {
+            if dev.failed() {
                 continue;
             }
-            if dev.d.flush().await.is_ok() {
-                dev.st.borrow_mut().dirty = false;
-            } else {
+            if dev.durable().await.is_err() {
                 dev.fail();
                 failed = true;
             }
@@ -952,18 +1188,19 @@ impl<D: Device> Store<D> {
     /// Chunk `c` closed by `volume`'s attach at `generation`: its data
     /// flushed, then its record no longer open. Whether it was open.
     pub async fn close(&self, volume: u32, generation: u64, c: ChunkRef) -> Result<bool, Error> {
+        let _volume = self.volume_turns.take(volume, false).await;
+        let _chunk = self.chunk_turns.take(c.chunk, true).await;
         self.check_fence(volume, generation)?;
         let Some((dv, slot, r)) = self.find(&c)? else { return Ok(false) };
         if r.state != SlotState::Open || r.volume != volume || r.generation != generation {
             return Ok(false);
         }
+        /* Its data -- every write of it done, its turn this close's --
+           durable before the record that closes it */
         let dev = self.dev(dv);
-        if dev.st.borrow().dirty {
-            if dev.d.flush().await.is_err() {
-                dev.fail();
-                return Err(Error::Io);
-            }
-            dev.st.borrow_mut().dirty = false;
+        if dev.durable().await.is_err() {
+            dev.fail();
+            return Err(Error::Io);
         }
         self.put(dv, slot, Record { state: SlotState::Written, seq: r.seq + 1, ..r }).await?;
         Ok(true)
@@ -972,6 +1209,7 @@ impl<D: Device> Store<D> {
     /// Chunk `chunk`'s slot given back, the chunk freed in the metadata at
     /// `incarnation`: whether it held one -- at that incarnation or older.
     pub async fn free(&self, chunk: u32, incarnation: u32) -> Result<bool, Error> {
+        let _chunk = self.chunk_turns.take(chunk, true).await;
         let Some((dv, slot)) = self.s.borrow().at.get(&chunk).copied() else { return Ok(false) };
         if self.record(dv, slot).incarnation > incarnation || self.dev(dv).failed() {
             return Ok(false);
@@ -1070,6 +1308,7 @@ impl<D: Device> Store<D> {
     /// epoch moved on first (`advance`). The caller has had the joiner
     /// vouched for by its host's mds.
     pub async fn pull(&self, c: ChunkRef, offset: u32, buf: &mut [u8]) -> Result<(), Error> {
+        let _chunk = self.chunk_turns.take(c.chunk, true).await;
         self.not_found_open(&c)?;
         let (dv, slot) = self.advance(&c).await?;
         self.span(Some(dv), offset, buf.len())?;
@@ -1080,6 +1319,7 @@ impl<D: Device> Store<D> {
     /// bytes -- the last shorter where `len` ends inside one -- for its set's
     /// joiner, its epoch moved on first as a pull's is.
     pub async fn sums(&self, c: ChunkRef, offset: u32, len: u32) -> Result<Vec<u32>, Error> {
+        let _chunk = self.chunk_turns.take(c.chunk, true).await;
         self.not_found_open(&c)?;
         let (dv, slot) = self.advance(&c).await?;
         self.sums_at(dv, slot, offset, len).await
@@ -1102,6 +1342,7 @@ impl<D: Device> Store<D> {
     /// The same of this cs's own copy of chunk `c`: what a joiner holds its
     /// copy to its source's by.
     pub async fn own_sums(&self, c: ChunkRef, offset: u32, len: u32) -> Result<Vec<u32>, Error> {
+        let _chunk = self.chunk_turns.take(c.chunk, true).await;
         let Some((dv, slot, _)) = self.find(&c)? else { return Err(Error::NotHeld) };
         self.sums_at(dv, slot, offset, len).await
     }
@@ -1113,6 +1354,7 @@ impl<D: Device> Store<D> {
     /// now is refused nothing for it. The chunk is the one its number and
     /// incarnation name, as `find` holds every request to.
     pub async fn scrub(&self, c: ChunkRef) -> Result<(bool, u32, Vec<u32>), Error> {
+        let _chunk = self.chunk_turns.take(c.chunk, true).await;
         let Some((dv, slot, r)) = self.find(&c)? else { return Err(Error::NotHeld) };
         /* Open, it is in flight and compared with nothing: not read */
         if r.state == SlotState::Open {
@@ -1126,6 +1368,7 @@ impl<D: Device> Store<D> {
     /// joiner holds a granule that differs to its source's by, a sector at a
     /// time.
     pub async fn own_read(&self, c: ChunkRef, offset: u32, buf: &mut [u8]) -> Result<(), Error> {
+        let _chunk = self.chunk_turns.take(c.chunk, true).await;
         let Some((dv, slot, _)) = self.find(&c)? else { return Err(Error::NotHeld) };
         self.span(Some(dv), offset, buf.len())?;
         self.read_at(dv, slot, offset, buf).await
@@ -1159,6 +1402,7 @@ impl<D: Device> Store<D> {
     /// Refused where the set is not joined: with no marks kept, a copy could
     /// write over a client's write.
     pub async fn copy_in(&self, volume: u32, c: ChunkRef, offset: u32, data: &[u8]) -> Result<(), Error> {
+        let _chunk = self.chunk_turns.take(c.chunk, true).await;
         if !self.s.borrow().joining.contains_key(&c.epoch.set) || volume == 0 {
             return Err(Error::Bad);
         }
@@ -1206,11 +1450,10 @@ impl<D: Device> Store<D> {
         let dev = self.dev(dv);
         for (from, to) in runs {
             let at = dev.data_at(slot, u64::from(offset) + (from * sector) as u64);
-            if dev.d.write(at, &data[from * sector..to * sector]).await.is_err() {
+            if dev.write_data(at, &data[from * sector..to * sector]).await.is_err() {
                 dev.fail();
                 return Err(Error::Io);
             }
-            dev.st.borrow_mut().dirty = true;
         }
         Ok(())
     }
@@ -1228,10 +1471,18 @@ impl<D: Device> Store<D> {
     /// would keep for good.
     pub async fn copy_up(&self, volume: u32, generation: u64, from: ChunkRef, to: ChunkRef, verified: bool)
         -> Result<(), Error> {
+        /* The fence looked at under the volume's turn, which no fence takes
+           while it is held */
+        let _volume = self.volume_turns.take(volume, false).await;
         self.check_fence(volume, generation)?;
         if from.epoch != to.epoch || from.chunk == to.chunk {
             return Err(Error::Bad);
         }
+        /* Both chunks' turns, the lower number's first: two copy-ups of a
+           pair never wait for each other */
+        let (first, second) = (from.chunk.min(to.chunk), from.chunk.max(to.chunk));
+        let _first = self.chunk_turns.take(first, true).await;
+        let _second = self.chunk_turns.take(second, true).await;
         if self.find(&to)?.is_some() {
             return Ok(());
         }
@@ -1252,14 +1503,11 @@ impl<D: Device> Store<D> {
         }
         let dv = self.pick().ok_or(Error::NoRoom)?;
         let dev = self.dev(dv);
-        /* Taken off the free list only once its record is written: a copy
-           that fails before leaves the slot free, what it wrote there no
-           chunk's */
-        let slot = {
-            let st = dev.st.borrow();
-            let top = st.free.len().checked_sub(1).ok_or(Error::NoRoom)?;
-            *st.free.get(top).ok_or(Error::NoRoom)?
-        };
+        /* Taken off the free list for the copy -- no other request takes it
+           meanwhile -- and given back where the copy fails before its record
+           is written: what it wrote there no chunk's */
+        let slot = dev.st.borrow_mut().free.pop().ok_or(Error::NoRoom)?;
+        let mut held = Held { dev: &dev, slot: Some(slot) };
         let mut buf = Vec::new();
         buf.try_reserve_exact(COPY_PIECE as usize).map_err(|_| Error::NoMemory)?;
         let mut at = 0;
@@ -1267,7 +1515,7 @@ impl<D: Device> Store<D> {
             let n = (SLOT - at).min(COPY_PIECE);
             buf.resize(n as usize, 0);
             self.read_at(fdv, fslot, at as u32, &mut buf).await?;
-            if dev.d.write(dev.data_at(slot, at), &buf).await.is_err() {
+            if dev.write_data(dev.data_at(slot, at), &buf).await.is_err() {
                 dev.fail();
                 return Err(Error::Io);
             }
@@ -1275,17 +1523,15 @@ impl<D: Device> Store<D> {
         }
         /* The data durable before the record that names it: a device keeps
            or loses what it holds unflushed in any order */
-        if dev.d.flush().await.is_err() {
+        if dev.durable().await.is_err() {
             dev.fail();
             return Err(Error::Io);
         }
-        dev.st.borrow_mut().dirty = false;
         let old = self.record(dv, slot);
         self.put(dv, slot, Record { state: SlotState::Written, chunk: to.chunk, incarnation: to.incarnation,
                                     known: to.epoch, written: to.epoch, volume, generation: 0, seq: old.seq + 1 })
             .await?;
-        /* The slot looked at above: nothing has taken from the list since */
-        dev.st.borrow_mut().free.pop();
+        held.slot = None;
         self.s.borrow_mut().at.insert(to.chunk, (dv, slot));
         Ok(())
     }
@@ -1294,6 +1540,7 @@ impl<D: Device> Store<D> {
     /// no client has written it since the join began -- one a client has,
     /// at its generation, is that client's to close.
     pub async fn close_copy(&self, c: ChunkRef) -> Result<(), Error> {
+        let _chunk = self.chunk_turns.take(c.chunk, true).await;
         let Some((dv, slot, r)) = self.find(&c)? else { return Ok(()) };
         /* What the copy took in durable, whatever the record: one a client
            wrote meanwhile stays open at the writer's generation, as any
@@ -1302,12 +1549,9 @@ impl<D: Device> Store<D> {
            by fuzz/nbs's cluster target, N9d: the record left open, the
            flush was left out with it) */
         let dev = self.dev(dv);
-        if dev.st.borrow().dirty {
-            if dev.d.flush().await.is_err() {
-                dev.fail();
-                return Err(Error::Io);
-            }
-            dev.st.borrow_mut().dirty = false;
+        if dev.durable().await.is_err() {
+            dev.fail();
+            return Err(Error::Io);
         }
         /* Open at a writer's generation, the chunk that client's to close
            where a client has written it since the join began. A mark from
