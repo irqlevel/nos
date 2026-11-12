@@ -197,11 +197,12 @@ pub fn leaf_runs(root: &[u8], lblock: u64, end: u64, fs_blocks: u64, block_size:
     if lblock >= end {
         return Ok(lblock);
     }
-    let mut node: Vec<u8> = root.to_vec();
+    let mut below = Below::new(block_size);
     let mut limit = u64::MAX;
     let mut depth_wanted: Option<u16> = None;
     loop {
-        let h = header(&node).map_err(|e| alloc::format!("inode {}: {}", ino, e))?;
+        let node = below.node(root);
+        let h = header(node).map_err(|e| alloc::format!("inode {}: {}", ino, e))?;
         if depth_wanted.is_some_and(|d| d != h.depth) {
             return Err(alloc::format!("inode {}: an extent node of depth {} where {} belongs", ino, h.depth,
                                       depth_wanted.unwrap_or(0)));
@@ -214,7 +215,7 @@ pub fn leaf_runs(root: &[u8], lblock: u64, end: u64, fs_blocks: u64, block_size:
             let mut at = lblock;
             let mut prev_end = 0u64;
             for i in 0..entries {
-                let e = leaf(&node, i);
+                let e = leaf(node, i);
                 let (first, len) = (u64::from(e.first), u64::from(e.len));
                 if first < prev_end {
                     return Err(alloc::format!("inode {}: extents out of order at file block {}", ino, first));
@@ -250,7 +251,7 @@ pub fn leaf_runs(root: &[u8], lblock: u64, end: u64, fs_blocks: u64, block_size:
         /* The last index entry starting at or before the block. */
         let mut child = None;
         for i in 0..entries {
-            let e = index(&node, i);
+            let e = index(node, i);
             if u64::from(e.first) > lblock {
                 limit = limit.min(u64::from(e.first));
                 break;
@@ -262,10 +263,41 @@ pub fn leaf_runs(root: &[u8], lblock: u64, end: u64, fs_blocks: u64, block_size:
             out.push((Map::Hole { run }, false));
             return Ok(lblock + run);
         };
-        let mut next = vec![0u8; block_size];
-        read(child, &mut next)?;
-        node = next;
+        below.descend(child, read)?;
         depth_wanted = Some(h.depth - 1);
+    }
+}
+
+/// The node a walk down a tree is at: the root, in the inode, until the
+/// first step down, and from then on a block read into one buffer -- the
+/// same at every level, so that a walk of any depth takes one block of
+/// memory and gives it back as it ends. (A buffer a level, the one above
+/// dropped once the one below was had, was a block left behind a level
+/// under an allocator that takes back only its newest block: hvboot's.)
+struct Below {
+    buf: Vec<u8>,
+    block_size: usize,
+    /// Whether `buf` holds a node: a step down has been taken.
+    down: bool,
+}
+
+impl Below {
+    fn new(block_size: usize) -> Below {
+        Below { buf: Vec::new(), block_size, down: false }
+    }
+
+    /// The node the walk is at.
+    fn node<'a>(&'a self, root: &'a [u8]) -> &'a [u8] {
+        if self.down { &self.buf } else { root }
+    }
+
+    /// Down to block `child`: read over the node above.
+    fn descend(&mut self, child: u64, read: &mut ReadBlock) -> Result<(), String> {
+        if !self.down {
+            self.buf = vec![0u8; self.block_size];
+            self.down = true;
+        }
+        read(child, &mut self.buf)
     }
 }
 
@@ -274,13 +306,14 @@ pub fn leaf_runs(root: &[u8], lblock: u64, end: u64, fs_blocks: u64, block_size:
 /// whatever blocks it names.
 fn walk(root: &[u8], lblock: u64, fs_blocks: u64, block_size: usize, ino: u32, read: &mut ReadBlock,
         unwritten_held: bool) -> Result<(Map, bool), String> {
-    let mut node: Vec<u8> = root.to_vec();
+    let mut below = Below::new(block_size);
     /* The blocks this subtree covers end where the next index entry up
      * begins: no run reaches past it. */
     let mut limit = u64::MAX;
     let mut depth_wanted: Option<u16> = None;
     loop {
-        let h = header(&node).map_err(|e| alloc::format!("inode {}: {}", ino, e))?;
+        let node = below.node(root);
+        let h = header(node).map_err(|e| alloc::format!("inode {}: {}", ino, e))?;
         if depth_wanted.is_some_and(|d| d != h.depth) {
             return Err(alloc::format!("inode {}: an extent node of depth {} where {} belongs", ino, h.depth,
                                       depth_wanted.unwrap_or(0)));
@@ -288,7 +321,7 @@ fn walk(root: &[u8], lblock: u64, fs_blocks: u64, block_size: usize, ino: u32, r
         let entries = usize::from(h.entries);
         if h.depth == 0 {
             for i in 0..entries {
-                let e = leaf(&node, i);
+                let e = leaf(node, i);
                 let (first, len) = (u64::from(e.first), u64::from(e.len));
                 if lblock < first {
                     return Ok((Map::Hole { run: (first - lblock).min(limit.saturating_sub(lblock)) }, false));
@@ -309,7 +342,7 @@ fn walk(root: &[u8], lblock: u64, fs_blocks: u64, block_size: usize, ino: u32, r
         /* The last index entry starting at or before the block. */
         let mut child = None;
         for i in 0..entries {
-            let e = index(&node, i);
+            let e = index(node, i);
             if u64::from(e.first) > lblock {
                 limit = limit.min(u64::from(e.first));
                 break;
@@ -319,9 +352,7 @@ fn walk(root: &[u8], lblock: u64, fs_blocks: u64, block_size: usize, ino: u32, r
         let Some(child) = child else {
             return Ok((Map::Hole { run: limit.saturating_sub(lblock).max(1) }, false));
         };
-        let mut next = vec![0u8; block_size];
-        read(child, &mut next)?;
-        node = next;
+        below.descend(child, read)?;
         depth_wanted = Some(h.depth - 1);
     }
 }
