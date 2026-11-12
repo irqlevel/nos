@@ -35,6 +35,7 @@ const F_SEG_MAX: u32 = 1 << 2;
 const F_RO: u32 = 1 << 5;
 
 const T_IN: u32 = 0;
+const T_OUT: u32 = 1;
 const S_OK: u8 = 0;
 
 /* The ring (virtio 0.9.5, 2.3): descriptors, the available ring right after
@@ -77,6 +78,12 @@ pub struct Disk {
     segments: u32,
     next_avail: u16,
     tsc_khz: Option<u64>,
+    /// A request went unanswered: the device has been reset and nothing
+    /// more is asked of it. Its chain was the device's still, with the
+    /// addresses of buffers the loader had since given to something else
+    /// -- a stack frame that had returned -- and the next request reused
+    /// the slot and the index, so the late answer was taken for that one's.
+    given_up: bool,
 }
 
 fn round_up(v: usize, to: usize) -> usize {
@@ -140,6 +147,7 @@ impl Disk {
             segments: segments.min(MAX_SEGMENTS).min(u32::from(queue) - 2),
             next_avail: 0,
             tsc_khz,
+            given_up: false,
         };
         disk.write16(n * DESC_BYTES, AVAIL_NO_INTERRUPT);
         outl(io + QUEUE_PFN, (ring as usize >> PFN_SHIFT) as u32);
@@ -177,30 +185,53 @@ impl Disk {
 
     /// Read `buf.len()` bytes -- whole sectors -- from `sector` on.
     pub fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), String> {
-        if buf.len() as u64 % SECTOR != 0 {
-            return Err(alloc::format!("vd{}: a read of {} bytes, not whole sectors", self.letter, buf.len()));
+        self.transfer(T_IN, sector, buf.as_mut_ptr() as u64, buf.len())
+    }
+
+    /// Write `buf` -- whole sectors -- at `sector`: refused for a disk its
+    /// device says is read-only. grubenv's, as GRUB writes it.
+    pub fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), String> {
+        if self.read_only {
+            return Err(alloc::format!("vd{}: read-only", self.letter));
         }
-        let count = buf.len() as u64 / SECTOR;
+        self.transfer(T_OUT, sector, buf.as_ptr() as u64, buf.len())
+    }
+
+    /// `len` bytes at `addr` -- a buffer the caller holds for the call --
+    /// read into from `sector` on, or written there: in requests of as
+    /// many segments as the device takes.
+    fn transfer(&mut self, kind: u32, sector: u64, addr: u64, len: usize) -> Result<(), String> {
+        let what = if kind == T_IN { "read" } else { "write" };
+        if self.given_up {
+            return Err(alloc::format!("vd{}: given up after a request it did not answer", self.letter));
+        }
+        if len as u64 % SECTOR != 0 {
+            return Err(alloc::format!("vd{}: a {} of {} bytes, not whole sectors", self.letter, what, len));
+        }
+        let count = len as u64 / SECTOR;
         if sector.checked_add(count).is_none_or(|end| end > self.sectors) {
             return Err(alloc::format!("vd{}: sectors {}..+{} past its end, {}", self.letter, sector, count,
                                       self.sectors));
         }
         let per_request = self.segment_bytes as usize * self.segments as usize;
         let mut done = 0usize;
-        while done < buf.len() {
-            let n = (buf.len() - done).min(per_request);
-            self.request(sector + (done as u64 / SECTOR), &mut buf[done..done + n])?;
+        while done < len {
+            let n = (len - done).min(per_request);
+            self.request(kind, sector + (done as u64 / SECTOR), addr + done as u64, n)?;
             done += n;
         }
         Ok(())
     }
 
-    /// One request: its header, `buf` in segments, its status.
-    fn request(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), String> {
+    /// One request: its header, the `len` bytes at `addr` in segments --
+    /// written by the device for a read, read by it for a write -- its
+    /// status.
+    fn request(&mut self, kind: u32, sector: u64, addr: u64, len: usize) -> Result<(), String> {
+        let what = if kind == T_IN { "read" } else { "write" };
         // SAFETY: the header block is this device's: 16 bytes of header and
         // the status byte after them, in a page this allocated.
         unsafe {
-            core::ptr::write_volatile(self.header as *mut u32, T_IN);
+            core::ptr::write_volatile(self.header as *mut u32, kind);
             core::ptr::write_volatile(self.header.add(4) as *mut u32, 0);
             core::ptr::write_volatile(self.header.add(8) as *mut u64, sector);
             core::ptr::write_volatile(self.header.add(HEADER_BYTES), 0xFF);
@@ -208,13 +239,13 @@ impl Disk {
         let mut d = 0usize;
         self.descriptor(d, self.header as u64, HEADER_BYTES as u32, DESC_NEXT, 1);
         let seg = self.segment_bytes as usize;
+        let data = if kind == T_IN { DESC_WRITE | DESC_NEXT } else { DESC_NEXT };
         let mut at = 0usize;
-        while at < buf.len() {
-            let len = (buf.len() - at).min(seg);
+        while at < len {
+            let n = (len - at).min(seg);
             d += 1;
-            let addr = buf[at..].as_mut_ptr() as u64;
-            self.descriptor(d, addr, len as u32, DESC_WRITE | DESC_NEXT, (d + 1) as u16);
-            at += len;
+            self.descriptor(d, addr + at as u64, n as u32, data, (d + 1) as u16);
+            at += n;
         }
         d += 1;
         self.descriptor(d, self.header as u64 + HEADER_BYTES as u64, 1, DESC_WRITE, 0);
@@ -245,8 +276,13 @@ impl Disk {
                 None => polls > POLL_LIMIT,
             };
             if late {
-                return Err(alloc::format!("vd{}: no answer to a read of {} bytes at sector {} in {} s", self.letter,
-                                          buf.len(), sector, TIMEOUT_SECS));
+                /* Reset, which takes the chain back from the device -- hv
+                 * gives nothing back for one a reset found -- before `buf`
+                 * goes back to its owner; and given up for good. */
+                self.reset();
+                self.given_up = true;
+                return Err(alloc::format!("vd{}: no answer to a {} of {} bytes at sector {} in {} s -- reset, and \
+                                           nothing more asked of it", self.letter, what, len, sector, TIMEOUT_SECS));
             }
             core::hint::spin_loop();
         }
@@ -256,8 +292,8 @@ impl Disk {
         // chain on the used ring.
         let status = unsafe { core::ptr::read_volatile(self.header.add(HEADER_BYTES)) };
         if status != S_OK {
-            return Err(alloc::format!("vd{}: a read of {} bytes at sector {} failed, status {}", self.letter,
-                                      buf.len(), sector, status));
+            return Err(alloc::format!("vd{}: a {} of {} bytes at sector {} failed, status {}", self.letter, what,
+                                      len, sector, status));
         }
         Ok(())
     }
