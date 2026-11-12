@@ -285,7 +285,18 @@ one order (`ModuleTable::take_down`), whatever module it is:
    (`rust_net_close_range`), a timer it left running and an interrupt
    handler -- a line's or an MSI-X entry's -- it left registered: the
    bridge's slots whose code is in its image (`sweep_module_slots`). Each
-   would otherwise call into pages about to be freed;
+   would otherwise call into pages about to be freed. A task it left running
+   is asked to stop and waited for (`sweep_module_tasks`); and then what it
+   opened through the C ABI and left open is closed, said the same way: a
+   TCP listener or connection and NAT (`rust_net_close_range`), a device
+   queue and a device's claim (`rust_block_module_gone`), an image and a file
+   (`rust_fs_module_gone`), an event (`rust_events_module_gone`). Each table
+   keeps whose every entry is -- the module, by the name the loader knows it
+   by, from an address in its code that the open passes (`kcore::owner`); an
+   accepted connection is its listener's owner's. Left open, a device stayed
+   claimed by a name nothing answered to, an image unwritable, a mount held
+   by a file, a port taken and NAT busy for the uptime, and the module's
+   next load refused the lot;
 
 and only then are its pages unmapped and freed. `rmmod` must not be run from
 the module's own command, which would wait for itself.
@@ -896,6 +907,11 @@ command is still running. Before the unload modtest leaves a timer running
 listen`), as a module's bug would: the timer's next tick after the unload
 would fault in the freed image, and a second load's `modtest listen` must
 find the port free again -- the sweep took the first listener off.
+`test_module_tcp_left`, run once TCP is up, does the same for what a module
+opens: modtest leaves a TCP listener with its handle forgotten (`modtest
+tcp`), and after the unload a second load's `modtest tcp` must take the port
+again -- the sweep closed the first by its owner. With the sweep taken out,
+the smoke boot fails it.
 
 `slowexit` (`src/crates/modules/test/slowexit`) is never loaded by the kernel itself:
 its exit takes eight seconds, for testing an `rmmod` that outlasts the
