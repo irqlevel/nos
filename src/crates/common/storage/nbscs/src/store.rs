@@ -192,6 +192,8 @@ struct DevState {
     writes: u64,
     flushed: u64,
     flushing: Option<u64>,
+    /// Flushes ended, counted: what a wait for one is polled again for.
+    ended: u64,
     failed: bool,
     active: bool,
 }
@@ -199,7 +201,7 @@ struct DevState {
 impl<D> Dev<D> {
     fn new(d: D, layout: Layout, sup: Super, records: Pieces<Record>, free: Pieces<u32>, lost: u32) -> Dev<D> {
         Dev { d, layout, sup, st: RefCell::new(DevState { records, free, lost, writes: 0, flushed: 0, flushing: None,
-                                                          failed: false, active: true }) }
+                                                          ended: 0, failed: false, active: true }) }
     }
 
     fn record(&self, slot: u32) -> Record {
@@ -245,7 +247,9 @@ struct Flushing<'a> {
 
 impl Drop for Flushing<'_> {
     fn drop(&mut self) {
-        self.st.borrow_mut().flushing = None;
+        let mut st = self.st.borrow_mut();
+        st.flushing = None;
+        st.ended = st.ended.wrapping_add(1);
     }
 }
 
@@ -359,6 +363,8 @@ struct Commits {
     next: u64,
     done: u64,
     running: bool,
+    /// Rounds ended, done or not, counted.
+    ended: u64,
 }
 
 /// A round running: its pages marked again and the round let go, where it
@@ -375,6 +381,7 @@ impl Drop for Round<'_> {
     fn drop(&mut self) {
         let mut c = self.commits.borrow_mut();
         c.running = false;
+        c.ended = c.ended.wrapping_add(1);
         if self.finished {
             c.done = c.done.max(self.round);
         } else {
@@ -480,7 +487,7 @@ impl<D: Device> Store<D> {
             chunk_turns: Turns::default(),
             volume_turns: Turns::default(),
             commits: RefCell::new(Commits { table: BTreeMap::new(), fences: BTreeSet::new(), next: 1, done: 0,
-                                            running: false }),
+                                            running: false, ended: 0 }),
         }
     }
 
@@ -488,6 +495,16 @@ impl<D: Device> Store<D> {
     /// operation is over.
     pub fn busy(&self) -> usize {
         self.chunk_turns.in_use() + self.volume_turns.in_use() + usize::from(self.commits.borrow().running)
+    }
+
+    /// What has moved in the store, counted: a turn let go, a round ended,
+    /// a flush ended -- all that an operation waiting in the store waits
+    /// for. An executor that polls its operations again until this and its
+    /// devices' own moves stay put has polled every one that could go on.
+    pub fn moves(&self) -> u64 {
+        let devices = self.devs.borrow().iter().fold(0u64, |n, d| n.wrapping_add(d.st.borrow().ended));
+        self.chunk_turns.released().wrapping_add(self.volume_turns.released())
+            .wrapping_add(self.commits.borrow().ended).wrapping_add(devices)
     }
 
     /// What is held, in words: for a report of a wait that never ends.

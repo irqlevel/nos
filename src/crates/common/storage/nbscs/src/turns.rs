@@ -5,7 +5,8 @@
 //! waited for by being polled (no waker is kept anywhere: the executor
 //! polls every operation that may have moved on), and let go when its
 //! guard drops -- however the operation ends, a power cut's drop of every
-//! future in flight among them.
+//! future in flight among them. Each let go is counted (`released`): what
+//! the executor polls again for.
 
 use alloc::collections::{BTreeMap, VecDeque};
 use core::cell::{Cell, RefCell};
@@ -17,6 +18,7 @@ use core::task::Poll;
 pub(crate) struct Turns {
     queues: RefCell<BTreeMap<u32, VecDeque<(u64, bool)>>>,
     next: Cell<u64>,
+    released: Cell<u64>,
 }
 
 /// A turn held, or waited for: let go when dropped.
@@ -28,6 +30,7 @@ pub(crate) struct Turn<'a> {
 
 impl Drop for Turn<'_> {
     fn drop(&mut self) {
+        self.turns.released.set(self.turns.released.get().wrapping_add(1));
         let mut q = self.turns.queues.borrow_mut();
         if let Some(waiting) = q.get_mut(&self.key) {
             waiting.retain(|&(t, _)| t != self.ticket);
@@ -63,6 +66,11 @@ impl Turns {
         let turn = Turn { turns: self, key, ticket };
         poll_fn(|_| if self.may_go(key, ticket) { Poll::Ready(()) } else { Poll::Pending }).await;
         turn
+    }
+
+    /// Turns let go, counted.
+    pub(crate) fn released(&self) -> u64 {
+        self.released.get()
     }
 
     /// Turns held or waited for: none once every operation is over.
