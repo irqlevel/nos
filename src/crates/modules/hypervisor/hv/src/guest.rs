@@ -973,6 +973,10 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
             let _ = write!(out, "; {} of {} queue pairs in use, {} commands ({} refused)", active, pairs, s.commands,
                 s.refused);
         }
+        if s.cut != 0 {
+            let _ = write!(out, "; {} sending passes cut short at {} frames or {} KiB", s.cut, hv::nic::TX_PASS_FRAMES,
+                hv::nic::TX_PASS_BYTES / 1024);
+        }
         let _ = writeln!(out, "{}{}", if broken { "; stopped over a ring the driver broke" } else { "" },
             copied_note(copied));
     }
