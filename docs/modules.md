@@ -280,10 +280,11 @@ one order (`ModuleTable::take_down`), whatever module it is:
    running or able to start;
 5. **what the drop left registered is taken off**, each said in the log as
    the module's leaving it behind, and the mailboxes it left open are closed;
-   so are a timer it left running and an interrupt handler -- a line's or an
-   MSI-X entry's -- it left registered: the bridge's slots whose code is in
-   its image (`sweep_module_slots`), which would otherwise call into pages
-   about to be freed;
+   so are a UDP listener and a virtual NIC's sink whose code is in its image
+   (`rust_net_close_range`), a timer it left running and an interrupt
+   handler -- a line's or an MSI-X entry's -- it left registered: the
+   bridge's slots whose code is in its image (`sweep_module_slots`). Each
+   would otherwise call into pages about to be freed;
 
 and only then are its pages unmapped and freed. `rmmod` must not be run from
 the module's own command, which would wait for itself.
@@ -887,7 +888,11 @@ call that returns only once the module's stop has run, and unloads modtest
 under it. The stop must find modtest's command and provider closed already
 -- a call of the one says "not found", of the other `no_provider` -- the
 call says so as it returns, and modtest's drop panics if a call of its
-command is still running.
+command is still running. Before the unload modtest leaves a timer running
+(`modtest timer`) and a UDP listener registered on `eth0` (`modtest
+listen`), as a module's bug would: the timer's next tick after the unload
+would fault in the freed image, and a second load's `modtest listen` must
+find the port free again -- the sweep took the first listener off.
 
 `slowexit` (`src/crates/modules/test/slowexit`) is never loaded by the kernel itself:
 its exit takes eight seconds, for testing an `rmmod` that outlasts the

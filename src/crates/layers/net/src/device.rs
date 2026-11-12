@@ -1045,6 +1045,50 @@ impl Device {
         }
     }
 
+    /// Every module callback whose code is in `lo..hi` -- a module's image,
+    /// about to be freed -- taken off this device: the ports it had, in
+    /// `ports`, and how many. Back once no call of one is still running, as
+    /// `unlisten_udp` is. What a module that left a listener registered as
+    /// it went would otherwise leave behind: a callback into pages the
+    /// unload frees, called by the next datagram to its port. Task context.
+    fn unlisten_range(&self, lo: usize, hi: usize, ports: &mut [u16; MAX_LISTENERS]) -> usize {
+        let in_image = |code: usize| (lo..hi).contains(&code);
+        let mut taken = 0;
+        {
+            let mut listeners = self.listeners.lock();
+            let mut count = listeners.count;
+            let mut at = 0;
+            while at < count {
+                let listener = listeners.table[at];
+                let left = match listener.sink {
+                    Some(Sink::Callback { frame_cb, batch_end, .. }) => {
+                        in_image(frame_cb as usize) || batch_end.is_some_and(|f| in_image(f as usize))
+                    }
+                    _ => false,
+                };
+                if left {
+                    ports[taken] = listener.port;
+                    taken += 1;
+                    listeners.table.copy_within(at + 1..count, at);
+                    listeners.table[count - 1] = NO_LISTENER;
+                    count -= 1;
+                } else {
+                    at += 1;
+                }
+            }
+            listeners.count = count;
+        }
+
+        /* As `unlisten_udp`: no new dispatch finds them; one that took the
+         * table before the lock is waited out. */
+        if taken != 0 {
+            while self.listener_in_flight.load(Ordering::Acquire) != 0 {
+                kcore::task::sleep_ms(1);
+            }
+        }
+        taken
+    }
+
     /* ---- what the shell reports ---- */
 
     pub fn stats(&self) -> Stats {
@@ -1218,12 +1262,21 @@ impl DeviceTable {
 
         self.count.store(self.count() + 1, Ordering::Release);
 
-        /* One handler per softirq type, dispatching to every device */
+        /* One handler per softirq type, dispatching to every device. The
+         * types are this layer's: one somebody else holds -- a module that
+         * took it first -- would leave every NIC's receive or transmit
+         * unrun, a network dead without a word, so it stops here instead. */
         if !self.handlers_registered.swap(true, Ordering::AcqRel) {
-            kcore::softirq::register_for(
-                kcore::softirq::TYPE_NET_RX, self, DeviceTable::process_all_rx);
-            kcore::softirq::register_for(
-                kcore::softirq::TYPE_NET_TX, self, DeviceTable::process_all_tx);
+            if !kcore::softirq::register_for(
+                kcore::softirq::TYPE_NET_RX, self, DeviceTable::process_all_rx) {
+                panic!("net: the receive soft IRQ ({}) has a handler that is not the net layer's",
+                    kcore::softirq::TYPE_NET_RX);
+            }
+            if !kcore::softirq::register_for(
+                kcore::softirq::TYPE_NET_TX, self, DeviceTable::process_all_tx) {
+                panic!("net: the transmit soft IRQ ({}) has a handler that is not the net layer's",
+                    kcore::softirq::TYPE_NET_TX);
+            }
         }
 
         klog!(0, "net: {} registered, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -1498,4 +1551,34 @@ pub extern "C" fn kernel_net_rx_stats() -> ffi::net::RxStats {
 #[no_mangle]
 pub extern "C" fn rust_net_poll_rx() {
     DEVICES.poll_rx();
+}
+
+/// The loader's, at a module's unload (`ModuleTable::take_down`), after its
+/// exit: what of the module whose image is `lo..hi` is still registered with
+/// this layer -- a UDP listener's callback on any device, a virtual NIC's
+/// sink -- taken off, each said as the module's bug, and back once no call
+/// of one is still running. Left as they were, the next datagram to the port
+/// and the next frame out of the device called into the pages the unload
+/// frees. Its commands, providers, mailboxes, timers and interrupt handlers
+/// are swept beside this. Task context, no lock held.
+///
+/// # Safety
+/// `name` points at `len` readable bytes, or is null: the module's name.
+#[no_mangle]
+pub unsafe extern "C" fn rust_net_close_range(lo: usize, hi: usize, name: *const u8, len: usize) {
+    let name = if name.is_null() {
+        "?"
+    } else {
+        core::str::from_utf8(unsafe { core::slice::from_raw_parts(name, len) }).unwrap_or("?")
+    };
+
+    for dev in DEVICES.devices[..DEVICES.count()].iter() {
+        let mut ports = [0u16; MAX_LISTENERS];
+        let taken = dev.unlisten_range(lo, hi, &mut ports);
+        for port in &ports[..taken] {
+            klog!(0, "module: {} left a UDP listener on {}:{} registered: taken off", name,
+                core::str::from_utf8(dev.name()).unwrap_or("?"), port);
+        }
+    }
+    crate::vnic::detach_range(lo, hi, name);
 }

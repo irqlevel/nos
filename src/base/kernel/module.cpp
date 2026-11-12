@@ -38,6 +38,10 @@ void rust_ipc_module_gone(const char* name, ulong len);
    shell commands are (Cmd::close_range, Cmd::drain_range) */
 void rust_mgmt_close_range(ulong lo, ulong hi);
 void rust_mgmt_drain_range(ulong lo, ulong hi, int take);
+/* And the network layer (src/crates/layers/net): a UDP listener's callback
+   and a virtual NIC's sink in [lo, hi), left registered by its exit, taken
+   off -- each said, as the module's bug */
+void rust_net_close_range(ulong lo, ulong hi, const char* name, ulong len);
 }
 
 namespace kernel
@@ -1139,9 +1143,10 @@ void ModuleTable::remove(LoadedModule* module)
       above all -- stays stopped. A call that started one after the exit
       had stopped them was the race this order closes;
    5. what the exit left registered taken off, said as the module's bug;
-      the mailboxes it left open closed (rust_ipc_module_gone); a timer it
-      left running stopped and an interrupt handler it left registered
-      taken off (sweep_module_slots);
+      the mailboxes it left open closed (rust_ipc_module_gone); a UDP
+      listener and a virtual NIC's sink it left taken off (rust_net_close_range);
+      a timer it left running stopped and an interrupt handler it left
+      registered taken off (sweep_module_slots);
    and then it is off the list and its code freed. An init that failed has
    no instance: steps 2 and 4 are not its. */
 void ModuleTable::take_down(LoadedModule* module, bool live)
@@ -1166,8 +1171,11 @@ void ModuleTable::take_down(LoadedModule* module, bool live)
     Cmd::drain_range(lo, hi, module->name, true);
     rust_mgmt_drain_range(lo, hi, 1);
     rust_ipc_module_gone(module->name, len);
-    /* And what calls into its image by a slot of the bridge's: a timer, an
-       interrupt handler. Left as they were, they outlived the code. */
+    /* And what calls into its image from the net layer -- a UDP listener's
+       callback, a virtual NIC's sink -- or by a slot of the bridge's: a
+       timer, an interrupt handler. Left as they were, they outlived the
+       code. */
+    rust_net_close_range(lo, hi, module->name, len);
     sweep_module_slots(lo, hi, module->name);
 
     remove(module);

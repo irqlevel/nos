@@ -122,6 +122,42 @@ fn timer(out: &mut Output) {
     }
 }
 
+/* What test_module_unload holds the net layer's sweep to
+   (rust_net_close_range): `modtest listen` takes a UDP port on the first
+   NIC and forgets the listener, as a module's bug would. Its callbacks are
+   this module's code. The unload has to take it off -- left, the next
+   datagram to the port is a call into the pages the unload frees -- and
+   then the port is free again for the next load's `modtest listen`, which
+   the test runs: refused, it says the listener outlived the module. */
+
+/// The NIC and the port `modtest listen` leaves a listener on.
+const LEFT_NIC: &str = "eth0";
+const LEFT_PORT: u16 = 7099;
+
+/// What the left listener does with a datagram: nothing.
+struct Ignore;
+
+impl kcore::net::UdpHandler for Ignore {
+    fn on_frame(&self, _frame: kcore::net::Lent<'_>, _rx: &mut kcore::net::RxContext) {}
+}
+
+/// `modtest listen`: the listener made and left registered.
+fn listen(out: &mut Output) {
+    let Some(nic) = kcore::net::Nic::find(LEFT_NIC) else {
+        let _ = writeln!(out, "modtest listen: no {}", LEFT_NIC);
+        return;
+    };
+    match nic.listen(LEFT_PORT, Arc::new(Ignore)) {
+        Ok(listener) => {
+            core::mem::forget(listener);
+            let _ = writeln!(out, "modtest listen: left listening on {}:{}", LEFT_NIC, LEFT_PORT);
+        }
+        Err(e) => {
+            let _ = writeln!(out, "modtest listen: refused on {}:{}: {:?}", LEFT_NIC, LEFT_PORT, e);
+        }
+    }
+}
+
 impl kmod::Module for ModTest {
     fn stop(&mut self) {
         let mut said = Vec::new();
@@ -243,6 +279,10 @@ fn init(params: &kmod::Params, out: &mut Output) -> Result<Box<dyn kmod::Module>
         }
         if args.trim() == "timer" {
             timer(out);
+            return;
+        }
+        if args.trim() == "listen" {
+            listen(out);
             return;
         }
         if args.trim() == "bus" {
@@ -521,6 +561,22 @@ fn ipc(keep: &Mutex<Option<Mailbox>>) -> core::result::Result<(), &'static str> 
         }
         if got.tag != 8 || got.reference != 99 || got.from != echo || got.len != n || at != n {
             return Err("an echo received in pieces");
+        }
+    }
+    /* A message past one block of the heap, to a mailbox read with `recv`:
+     * dropped, said in the log, and the next one taken -- left first, it
+     * once wedged the mailbox, every later `recv` finding it again. A
+     * module cannot send one (its send is of one buffer); the shell's ping
+     * makes one in pieces, and waits a moment for an answer it will not
+     * get. */
+    {
+        let big = Mailbox::new(Limits { messages: 4, bytes: 2 << 20 }).map_err(|_| "a mailbox for a large message")?;
+        big.register("modtest.big", Scope::Host).map_err(|_| "the large one's name")?;
+        kcore::cmd::dispatch("ipc ping modtest.big count=1 bytes=600000 timeout=100", &mut |_: &[u8]| {});
+        mb.send(big.addr(), 9, 2, b"after").map_err(|_| "a message after the large one")?;
+        match big.recv(Duration::from_secs(1)) {
+            Some(m) if m.tag == 9 && m.reference == 2 && m.data == b"after" => {}
+            _ => return Err("the message after one too large for recv"),
         }
     }
     let gone = Mailbox::new(ROOMY).map_err(|_| "a mailbox")?.addr();
