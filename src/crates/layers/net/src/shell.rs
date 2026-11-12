@@ -6,6 +6,7 @@
 //! `scripts/netconsole-test.py` and `scripts/netblk-test.py` drive the stack
 //! through these and match on what they say.
 
+use alloc::vec::Vec;
 use core::fmt::Write;
 
 use kcore::cmd::Output;
@@ -15,7 +16,7 @@ use kcore::time::Duration;
 use crate::abi;
 use crate::device::{Device, DEVICES};
 use crate::dns::MAX_DOMAIN_LEN;
-use crate::frame::POOL;
+use crate::frame::{self, POOL};
 use crate::netconsole::NETCONSOLE;
 use crate::tcp::TCP;
 use crate::wire::{Ipv4 as Ip, MacHex};
@@ -68,10 +69,14 @@ pub fn net(_args: &str, out: &mut Output) {
     let _ = writeln!(out, "rx polls {}, poll work {}, stalls {}", polls, work, stalls);
 }
 
-pub fn netpool(_args: &str, out: &mut Output) {
+pub fn netpool(args: &str, out: &mut Output) {
     let st = POOL.stats();
     if !st.ready {
         let _ = writeln!(out, "netpool: not set up");
+        return;
+    }
+    if args.trim() == "bench" {
+        netpool_bench(out);
         return;
     }
 
@@ -81,6 +86,43 @@ pub fn netpool(_args: &str, out: &mut Output) {
     let _ = writeln!(out, "alloc hits {}, misses {}, oversized (refused) {}",
         st.hits, st.misses, st.oversized);
     let _ = writeln!(out, "ring refills {}, flushes {}, frames lost {}", st.refills, st.flushes, st.lost);
+}
+
+/// `netpool bench`: what a frame's allocation and release cost on this CPU,
+/// as the image takes one and as a module does -- its room zeroed, so that
+/// nothing of the frame's last user goes out with it -- one at a time, hot in
+/// this CPU's cache, and a ring's worth at a time, through the pool's ring.
+fn netpool_bench(out: &mut Output) {
+    /* Frames a transmit ring holds, about: a driver's ring is 256 here. */
+    const RING: usize = 256;
+    /* Frames each case allocates and releases in all. */
+    const FRAMES: usize = 1 << 20;
+    let Some(hz) = kcore::time::cycle_counter_hz() else {
+        let _ = writeln!(out, "netpool bench: the cycle counter's rate is not known");
+        return;
+    };
+    let cases: [(&str, usize, bool); 4] = [
+        ("as the image takes one, 1472 bytes", 1472, false),
+        ("as a module does, 64 bytes zeroed", 64, true),
+        ("as a module does, 1472 bytes zeroed", 1472, true),
+        ("as a module does, 2048 bytes zeroed", 2048, true),
+    ];
+    for (what, len, module) in cases {
+        let mut ns = [0u64; 2];
+        for (i, at_once) in [1usize, RING].into_iter().enumerate() {
+            let mut held = Vec::new();
+            if held.try_reserve_exact(at_once).is_err() {
+                let _ = writeln!(out, "netpool bench: no memory");
+                return;
+            }
+            let Some(cycles) = frame::bench_alloc(len, module, FRAMES / at_once, &mut held) else {
+                let _ = writeln!(out, "netpool bench: the pool ran short of {} frames", at_once);
+                return;
+            };
+            ns[i] = (cycles as u128 * 1_000_000_000 / hz as u128 / FRAMES as u128) as u64;
+        }
+        let _ = writeln!(out, "a frame {}: {} ns one at a time, {} ns {} at a time", what, ns[0], ns[1], RING);
+    }
 }
 
 pub fn arp(_args: &str, out: &mut Output) {
@@ -368,7 +410,7 @@ pub fn dhcp(args: &str, out: &mut Output) {
 pub fn register_all() {
     let commands: &[(&str, &str, fn(&str, &mut Output))] = &[
         ("net", "net - show network devices", net),
-        ("netpool", "netpool - recycled net frame pool state", netpool),
+        ("netpool", "netpool [bench] - recycled net frame pool state, or what taking a frame costs", netpool),
         ("arp", "arp - show ARP table", arp),
         ("nat", "nat [allow|deny <a.b.c.d[/n]>] - NAT state, where guests are kept from, counters and mappings", crate::nat::shell),
         ("netconsole", "netconsole - kernel log over UDP state", netconsole),

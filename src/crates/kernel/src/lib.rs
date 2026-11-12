@@ -147,6 +147,9 @@ pub extern "C" fn rust_test() {
     sha256::selftest();
     crc32::selftest();
     frames::selftest();
+    /* A module's frame to send: the pool, built by now, gives frames back as
+       their last user left them */
+    net::frame::module_frame_selftest();
     ring::selftest();
     trace::selftest();
 }

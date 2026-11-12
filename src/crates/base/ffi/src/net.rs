@@ -92,6 +92,9 @@ unsafe extern "C" {
     pub safe fn kernel_net_resolve(dev: usize, ip: u32) -> Resolved;
     pub safe fn kernel_net_rx_stats() -> RxStats;
 
+    /// A frame to send: room for `data_len` bytes, zeroed -- the pool gives
+    /// frames back as their last user left them -- and its room, length and
+    /// capacity held to them.
     pub safe fn kernel_netframe_alloc_tx(data_len: usize) -> usize;
     /// Another reference to the frame.
     pub fn kernel_netframe_get(handle: usize);
@@ -99,8 +102,11 @@ unsafe extern "C" {
     pub fn kernel_netframe_data(handle: usize) -> *mut u8;
     pub fn kernel_netframe_data_phys(handle: usize) -> u64;
     pub fn kernel_netframe_len(handle: usize) -> usize;
-    /// How many bytes the frame's buffer has room for.
+    /// How many bytes of the frame its holder may write and send: the whole
+    /// buffer, but for a frame from `kernel_netframe_alloc_tx` what was asked
+    /// for.
     pub fn kernel_netframe_capacity(handle: usize) -> usize;
+    /// Its length, never past what `kernel_netframe_capacity` says.
     pub fn kernel_netframe_set_len(handle: usize, len: usize);
 }
 
