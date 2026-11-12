@@ -188,12 +188,14 @@ const Field HV_EXIT_FIELDS[] = {
        hypercall RAX, cr0 the value, cr4 and cr8 the general-purpose
        register's number (0xFF where the instruction is decoded for it), dr
        the debug register's; host the host's vector that took it out --
-       VT-x's, 0 under AMD-V, which does not say; other the CPU's own exit
-       code */
+       VT-x's, 0 under AMD-V, which does not say; other AMD-V's exit code
+       for an instruction both extensions stop a guest at, and the CPU's own
+       exit code for the rest -- VT-x's basic reason where info is 1 */
     { "detail", __builtin_offsetof(HvExit, detail), sizeof(u64), Kind::Hex, nullptr, 0 },
     /* And more, by its reason: io its size, 0x100 an IN, 0x200 a string,
        0x400 REP; msr, cr0, cr4, cr8 and dr 1 for a write; cpuid the
-       subleaf; npf and exception the error code */
+       subleaf; npf and exception the error code; other 1 for VT-x's own
+       exit reason */
     { "info", __builtin_offsetof(HvExit, info), sizeof(u32), Kind::Hex, nullptr, 0 },
     /* In the guest: from its entry -- vmrun, vmlaunch, vmresume -- to its
        exit, as the cycle counter has them; 0 for one kicked, never entered */

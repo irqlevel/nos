@@ -69,96 +69,7 @@ const LEN_PAUSE: u64 = 2;
 /// PAUSE stopping it would cost a spinlock's waiter an exit for each look.
 const PAUSE_FILTER_COUNT: u16 = 128;
 
-/// A port access that stopped the guest.
-#[derive(Clone, Copy, Debug)]
-pub struct Io {
-    pub port: u16,
-    /// 1, 2 or 4 bytes.
-    pub size: u8,
-    /// IN rather than OUT.
-    pub input: bool,
-    /// INS or OUTS, which move memory and not RAX.
-    pub string: bool,
-    pub rep: bool,
-    /// Where the instruction ends: every CPU says so for an I/O intercept.
-    pub next_rip: u64,
-}
-
-/// Why a guest stopped.
-#[derive(Clone, Copy, Debug)]
-pub enum Exit {
-    /// One of the host's own interrupts -- an IRQ, an NMI, an SMI, an INIT --
-    /// took the CPU back. The host has handled it by the time this is read;
-    /// the guest goes straight back in.
-    Host,
-    /// Not entered at all: another CPU kicked the vCPU on its way in
-    /// (`hvarch::x86::svm::Kick`), and what it has for the guest -- a frame
-    /// -- is to be handed over first.
-    Kicked,
-    Io(Io),
-    Hlt,
-    Cpuid,
-    Msr { write: bool },
-    /// VMMCALL.
-    Hypercall,
-    /// The guest reached a point where it could take a virtual interrupt --
-    /// the interrupt window this hypervisor asked for (`request_irq_window`).
-    IrqWindow,
-    /// The guest may be able to take an NMI now: VT-x's NMI window, or on
-    /// AMD-V the IRET that ends the guest's NMI handler.
-    NmiWindow,
-    /// The guest touched a guest physical address with no memory behind it
-    /// -- or with memory it may not use that way.
-    NestedFault { gpa: u64, error: u64 },
-    Exception { vector: u8, error: Option<u32> },
-    /// A machine check, taken while the guest ran: the host's hardware
-    /// reporting an error, stopped on its way into the guest.
-    MachineCheck,
-    /// The guest triple-faulted.
-    Shutdown,
-    /// `vmrun` refused the VMCB.
-    Invalid,
-    /// A `mov` to (`write`) or from CR8 -- the task-priority register --
-    /// with general-purpose register `gpr` (numbered as the encoding does:
-    /// RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8-R15). VT-x stops the guest
-    /// there, since the real CR8 is the host's; AMD-V gives the guest a
-    /// shadow of its own and never exits.
-    Cr8 { write: bool, gpr: u8 },
-    /// A `mov` to CR0, or an `lmsw`, that changes a bit VT-x keeps for the
-    /// host -- PG, PE, NE -- with `value` what CR0 would become (the whole
-    /// register named, or for `lmsw` its low four bits over CR0's). AMD-V
-    /// intercepts no CR0 write, and never exits for one.
-    Cr0Write { value: u64 },
-    /// A `mov` to (`write`) or from CR4, which AMD-V stops a guest at every
-    /// time and VT-x at a write that changes a bit the host keeps -- MCE
-    /// among them: so that the CR4 it runs with keeps MCE, and it reads back
-    /// the one it wrote (`crate::cr`). `gpr` is the general-purpose register
-    /// where the exit names it -- VT-x's always -- and None where the
-    /// instruction is to be decoded for it.
-    Cr4 { write: bool, gpr: Option<u8> },
-    /// A `mov` to (`write`) or from debug register `dr`, which AMD-V stops
-    /// a guest at for DR0-DR3, the breakpoint addresses, and VT-x for every
-    /// one: they are the CPU's, not the VMCB's or the VMCS's, and the
-    /// guest's are kept apart from them and answered from there
-    /// (`crate::dr`) -- under VT-x DR6 too, which it does not switch, and
-    /// DR7, which it does but would not otherwise see written. `gpr` as for
-    /// [`Exit::Cr4`].
-    Dr { write: bool, dr: u8, gpr: Option<u8> },
-    /// The guest ended an interrupt in service by its x2APIC's EOI, which
-    /// the CPU performed -- VT-x's virtual-interrupt delivery -- and stopped
-    /// it after, `vector` being one whose end the host must hear of: a
-    /// level-triggered one, for the IO-APIC.
-    Eoi { vector: u8 },
-    /// PAUSE -- the guest spin-waiting: stopped so that whatever it waits
-    /// for that the host hands over, a timer's tick above all, is handed
-    /// over now rather than at the host's next interrupt.
-    Pause,
-    /// An instruction of a virtualization extension's own -- VMX's or
-    /// SVM's -- or GETSEC, which CPUID tells the guest it has not got and a
-    /// CPU without them faults #UD on: what the guest is given.
-    Undefined,
-    Other(u64),
-}
+pub use crate::exit::{Exit, Instr, Io};
 
 /// The state INIT and a start-up IPI with `vector` leave a CPU in, into
 /// `s`: real mode at `vector` * 4 KiB, as both backends start one. `efer` is
@@ -656,6 +567,23 @@ impl Vcpu {
              * told it has no SVM is owed the #UD a CPU without it gives. */
             vmcb::exit::VMRUN | vmcb::exit::VMLOAD | vmcb::exit::VMSAVE | vmcb::exit::STGI
             | vmcb::exit::CLGI | vmcb::exit::SKINIT | vmcb::exit::INVLPGA => Exit::Undefined,
+            /* Every other instruction an intercept here or in `hvarch`
+             * asks for: by its name. RSM, which is any CPL's to run and a
+             * #UD outside SMM, was once an exit no arm answered -- a user
+             * process's `rsm` stopped its whole VM -- and INVD, a task switch
+             * and FERR# freeze were, from the guest's kernel. */
+            vmcb::exit::ICEBP => Exit::Instr(Instr::Icebp),
+            vmcb::exit::RDPMC => Exit::Instr(Instr::Rdpmc),
+            vmcb::exit::XSETBV => Exit::Instr(Instr::Xsetbv),
+            vmcb::exit::WBINVD => Exit::Instr(Instr::Wbinvd),
+            vmcb::exit::INVD => Exit::Instr(Instr::Invd),
+            vmcb::exit::MONITOR => Exit::Instr(Instr::Monitor),
+            vmcb::exit::MWAIT | vmcb::exit::MWAIT_ARMED => Exit::Instr(Instr::Mwait),
+            vmcb::exit::RDTSCP => Exit::Instr(Instr::Rdtscp),
+            vmcb::exit::RDPRU => Exit::Instr(Instr::Rdpru),
+            vmcb::exit::RSM => Exit::Instr(Instr::Rsm),
+            vmcb::exit::TASK_SWITCH => Exit::TaskSwitch,
+            vmcb::exit::FERR_FREEZE => Exit::FerrFreeze,
             vmcb::exit::VINTR => Exit::IrqWindow,
             vmcb::exit::NPF => Exit::NestedFault { gpa: c.exit_info2, error: c.exit_info1 },
             vmcb::exit::SHUTDOWN => Exit::Shutdown,
@@ -671,7 +599,7 @@ impl Vcpu {
                     }
                 }
             }
-            code => Exit::Other(code),
+            code => Exit::Other { code, vmx: false },
         }
     }
 

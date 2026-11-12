@@ -757,8 +757,9 @@ fn run_several(machine: &Machine, spec: &SeveralSpec, out: &mut dyn Write) -> bo
 /// The names of the built-in guests, for a command's help.
 pub fn names() -> impl Iterator<Item = &'static str> {
     GUESTS.iter().map(|g| g.name).chain(SEVERAL.iter().map(|g| g.name))
-        .chain([SMP_NAME, POSTED_NAME, IOAPIC_NAME, APICV_NAME, PVEOI_NAME, DEBUG_NAME, CR4_NAME, MSR_NAME, DR_NAME,
-                AVX_NAME, TSCAUX_NAME, SPEC_NAME, PKRU_NAME]
+        .chain([SMP_NAME, POSTED_NAME, IOAPIC_NAME, APICV_NAME, PVEOI_NAME, KGS_NAME, CACHE_NAME, DEBUG_NAME, INSTR_NAME,
+                CR4_NAME,
+                MSR_NAME, DR_NAME, AVX_NAME, TSCAUX_NAME, SPEC_NAME, PKRU_NAME]
             .into_iter())
 }
 
@@ -788,8 +789,17 @@ pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Optio
     if name == PVEOI_NAME {
         return Some(run_ioapic(machine, &PVEOI_GUEST, out));
     }
+    if name == KGS_NAME {
+        return Some(run_smp(machine, &KGS_GUEST, out));
+    }
+    if name == CACHE_NAME {
+        return Some(run_ioapic(machine, &CACHE_GUEST, out));
+    }
     if name == DEBUG_NAME {
-        return Some(run_debug(machine, out));
+        return Some(run_one_cpu(machine, &DEBUG_GUEST, out));
+    }
+    if name == INSTR_NAME {
+        return Some(run_one_cpu(machine, &INSTR_GUEST, out));
     }
     if name == CR4_NAME {
         return Some(run_cr4(machine, out));
@@ -2258,6 +2268,195 @@ fn check_pveoi(m: &GuestMemory, stopped: &Stopped, _stats: &crate::devices::ioap
                      through the word, 2 by the register"))
 }
 
+/* ---- kgs: a guest's swapgs, kept across the exits the world switch answers ---- */
+
+/* The kgs guest: the smp guest's machine -- its local APICs in x2APIC mode
+ * from the start -- its first CPU alone running, the second never started.
+ * It puts K in KERNEL_GS_BASE and G in the GS base, both straight into the
+ * CPU, which lets a guest's own bases through; stops for a CPUID, which the
+ * run loop takes whole; and runs `swapgs`: the GS base K, KERNEL_GS_BASE G.
+ * Then 64 rounds of a fixed IPI to the second CPU and a write of its TSC
+ * deadline -- each an exit the world switch answers itself where it can
+ * (`run::FastMsr`), entering the guest again at once -- `swapgs` back, and
+ * both registers read. VT-x loads KERNEL_GS_BASE from a list at every
+ * entry, and an entry made past an exit the world switch answered loaded it
+ * from the last full exit -- K, where the guest had G: its `swapgs` undone,
+ * and the GS base read back K. AMD-V moves it with `vmsave` and `vmload`.
+ * The output of `nasm -f bin`, `bits 64` and `org 0x8000`, its source's
+ * comments and labels. */
+const KGS_NAME: &str = "kgs";
+const KGS_ABOUT: &str = "KERNEL_GS_BASE as the guest's swapgs left it, across exits the world switch answers itself";
+
+const KGS_CODE: &[u8] = &[
+    0xB9, 0x02, 0x01, 0x00, 0xC0,                           // start: mov ecx, 0xC0000102 ; KERNEL_GS_BASE <- K, straight to the CPU
+    0xB8, 0x00, 0x53, 0x47, 0x4B,                           // mov eax, 0x4B475300
+    0xBA, 0x00, 0x7F, 0x00, 0x00,                           // mov edx, 0x00007F00
+    0x0F, 0x30,                                             // wrmsr
+    0xB9, 0x01, 0x01, 0x00, 0xC0,                           // mov ecx, 0xC0000101 ; GS base <- G
+    0xB8, 0x00, 0x53, 0x53, 0x47,                           // mov eax, 0x47535300
+    0xBA, 0x00, 0x7E, 0x00, 0x00,                           // mov edx, 0x00007E00
+    0x0F, 0x30,                                             // wrmsr
+    0x31, 0xC0,                                             // xor eax, eax ; an exit the run loop takes whole: K read back into its shadow
+    0x0F, 0xA2,                                             // cpuid
+    0x0F, 0x01, 0xF8,                                       // swapgs ; GS base K, KERNEL_GS_BASE G
+    0xBB, 0x40, 0x00, 0x00, 0x00,                           // mov ebx, ROUNDS ; 64
+    0xB9, 0x30, 0x08, 0x00, 0x00,                           // again: mov ecx, 0x830 ; x2APIC ICR: a fixed IPI to the other CPU, which never started
+    0xB8, 0x40, 0x00, 0x00, 0x00,                           // mov eax, 0x40
+    0xBA, 0x01, 0x00, 0x00, 0x00,                           // mov edx, 1
+    0x0F, 0x30,                                             // wrmsr ; an exit the world switch answers itself
+    0xB9, 0xE0, 0x06, 0x00, 0x00,                           // mov ecx, 0x6E0 ; the TSC deadline, 0: one too, where the host knows its TSC's rate
+    0x31, 0xC0,                                             // xor eax, eax
+    0x31, 0xD2,                                             // xor edx, edx
+    0x0F, 0x30,                                             // wrmsr
+    0xFF, 0xCB,                                             // dec ebx
+    0x75, 0xE0,                                             // jnz again
+    0x0F, 0x01, 0xF8,                                       // swapgs ; GS base G again, KERNEL_GS_BASE K
+    0xB9, 0x01, 0x01, 0x00, 0xC0,                           // mov ecx, 0xC0000101
+    0x0F, 0x32,                                             // rdmsr
+    0x89, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // mov [abs KGS_GS], eax ; 0x7000
+    0x89, 0x14, 0x25, 0x04, 0x70, 0x00, 0x00,               // mov [abs KGS_GS + 4], edx
+    0xB9, 0x02, 0x01, 0x00, 0xC0,                           // mov ecx, 0xC0000102
+    0x0F, 0x32,                                             // rdmsr
+    0x89, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00,               // mov [abs KGS_KERNEL], eax ; 0x7008
+    0x89, 0x14, 0x25, 0x0C, 0x70, 0x00, 0x00,               // mov [abs KGS_KERNEL + 4], edx
+    0xC7, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,               // mov dword [abs KGS_DONE], 0x2153474B ; 0x7010, "KGS!"
+    0x4B, 0x47, 0x53, 0x21,
+    0xFA,                                                   // cli
+    0xF4,                                                   // hlt
+];
+
+/// The second CPU's code, which nothing starts: `cli; hlt` in real mode.
+const KGS_AP_CODE: &[u8] = &[0xFA, 0xF4];
+
+/// Where it leaves the GS base and KERNEL_GS_BASE it read at its end, and
+/// its mark that it got there.
+const KGS_GS: u64 = RESULTS;
+const KGS_KERNEL: u64 = RESULTS + 0x8;
+const KGS_DONE: u64 = RESULTS + 0x10;
+const KGS_MARK: u32 = u32::from_le_bytes(*b"KGS!");
+/// What it puts in KERNEL_GS_BASE and in the GS base before its first
+/// `swapgs`, and so what each has to hold after its second.
+const KGS_KERNEL_WANTED: u64 = 0x0000_7F00_4B47_5300;
+const KGS_GS_WANTED: u64 = 0x0000_7E00_4753_5300;
+/// Its writes: an IPI and a TSC deadline a round.
+const KGS_WRITES: u64 = 128;
+
+const KGS_GUEST: SmpGuest =
+    SmpGuest { name: KGS_NAME, about: KGS_ABOUT, bsp: KGS_CODE, ap: KGS_AP_CODE, apicv: false, check: check_kgs };
+
+fn check_kgs(m: &GuestMemory, stopped: &Stopped, counts: &[Counts; 2], _posted: (u64, u64), _by_cpu: bool)
+    -> core::result::Result<String, String>
+{
+    if !matches!(stopped.stop, GuestStop::Halted { .. }) {
+        return Err(String::from("it did not run to its halt"));
+    }
+    let word = |gpa: u64| m.read_obj::<u32>(gpa).map_err(|e| alloc::format!("guest memory at {:#x}: {}", gpa, e));
+    let quad = |gpa: u64| m.read_obj::<u64>(gpa).map_err(|e| alloc::format!("guest memory at {:#x}: {}", gpa, e));
+    if word(KGS_DONE)? != KGS_MARK {
+        return Err(String::from("it never reached its end"));
+    }
+    let (gs, kernel) = (quad(KGS_GS)?, quad(KGS_KERNEL)?);
+    if (gs, kernel) != (KGS_GS_WANTED, KGS_KERNEL_WANTED) {
+        return Err(alloc::format!("after its swapgs, its writes and its swapgs back the GS base reads {:#x} and \
+                                   KERNEL_GS_BASE {:#x}, not {:#x} and {:#x}: an entry undid its swapgs",
+                                  gs, kernel, KGS_GS_WANTED, KGS_KERNEL_WANTED));
+    }
+    /* Not one write answered in the world switch is a guest that looked at
+     * nothing this is about -- but on AMD-V without next-RIP save, whose
+     * world switch answers none (it cannot step past what it has not
+     * decoded): QEMU's TCG, where `vmload` moves the register anyway. */
+    let answers = match hvarch::x86::Caps::probe().detail {
+        hvarch::x86::Detail::Svm(svm) => svm.has(hvarch::x86::svm::NRIP_SAVE),
+        _ => true,
+    };
+    if counts[0].answered == 0 && answers {
+        return Err(alloc::format!("none of its {} writes was answered in the world switch", KGS_WRITES));
+    }
+    if counts[0].answered == 0 {
+        return Ok(String::from("no next-RIP save, so none of its writes answered in the world switch -- and the GS \
+                                base and KERNEL_GS_BASE as its swapgs left them"));
+    }
+    Ok(alloc::format!("{} of its {} writes of the ICR and the TSC deadline answered in the world switch; the GS \
+                       base and KERNEL_GS_BASE as its swapgs left them", counts[0].answered, KGS_WRITES))
+}
+
+/* ---- cache: CR0's cache bits, the guest's and never the host's ---- */
+
+/* The cache guest: the IO-APIC's machine, its first CPU alone running. It
+ * sets CR0.CD and CR0.NW -- its caches' fill off, and their write-through
+ * -- reads CR0 back, and halts with both left set. It has to read back what
+ * it wrote, and no CPU of the host may have either bit after it: a VM exit
+ * puts neither back from the host's CR0, so under VT-x a guest's own write
+ * of CD, let through, left the host's CPU with its caches no longer filling
+ * for good (`hvarch::x86::vmx::CR0_CACHE_BITS`). AMD-V's exit puts the
+ * host's CR0 back whole. The output of `nasm -f bin`, `bits 64` and
+ * `org 0x8000`. */
+const CACHE_NAME: &str = "cache";
+const CACHE_ABOUT: &str = "CR0.CD and CR0.NW set by the guest and left so: what it reads back, and no host CPU's own";
+
+const CACHE_CODE: &[u8] = &[
+    0x0F, 0x20, 0xC0,                                       // start: mov rax, cr0
+    0x0D, 0x00, 0x00, 0x00, 0x60,                           // or eax, 0x60000000 ; CD and NW: the caches' fill off, write-through off
+    0x0F, 0x22, 0xC0,                                       // mov cr0, rax
+    0x0F, 0x20, 0xC3,                                       // mov rbx, cr0 ; read back: what it wrote
+    0x48, 0x89, 0x1C, 0x25, 0x00, 0x70, 0x00, 0x00,         // mov [abs CACHE_READ], rbx ; 0x7000
+    0xC7, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00,               // mov dword [abs CACHE_DONE], 0x21454843 ; 0x7008, "CHE!"
+    0x43, 0x48, 0x45, 0x21,
+    0xFA,                                                   // cli ; and left so: the host's CPU has to have neither
+    0xF4,                                                   // hlt
+];
+
+/// Where it leaves the CR0 it read back, and its mark that it got there.
+const CACHE_READ: u64 = RESULTS;
+const CACHE_DONE: u64 = RESULTS + 0x8;
+const CACHE_MARK: u32 = u32::from_le_bytes(*b"CHE!");
+/// CR0.NW and CR0.CD.
+const CACHE_BITS: u64 = 1 << 29 | 1 << 30;
+
+const CACHE_GUEST: IoGuest =
+    IoGuest { name: CACHE_NAME, about: CACHE_ABOUT, code: CACHE_CODE, apicv: false, check: check_cache };
+
+/// The host CPUs whose own CR0 has CD or NW set, a bit a CPU: each asked on
+/// itself, the guest's among them wherever its task ran.
+fn host_cache_bits_set() -> u64 {
+    fn look(seen: &core::sync::atomic::AtomicU64) {
+        if hvarch::x86::cpu::read_cr0() & CACHE_BITS != 0 {
+            seen.fetch_or(1u64 << kcore::cpu::id(), core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let seen = core::sync::atomic::AtomicU64::new(0);
+    let online = kcore::cpu::online_mask();
+    for cpu in 0..u64::BITS {
+        if online & (1u64 << cpu) != 0 {
+            kcore::cpu::run_on_with(cpu, &seen, look);
+        }
+    }
+    seen.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+fn check_cache(m: &GuestMemory, stopped: &Stopped, _stats: &crate::devices::ioapic::Stats, _counts: &Counts,
+               _vapic: bool) -> core::result::Result<String, String>
+{
+    if !matches!(stopped.stop, GuestStop::Halted { .. }) {
+        return Err(String::from("it did not run to its halt"));
+    }
+    let done = m.read_obj::<u32>(CACHE_DONE).map_err(|e| alloc::format!("guest memory: {}", e))?;
+    if done != CACHE_MARK {
+        return Err(String::from("it never reached its end"));
+    }
+    let read = m.read_obj::<u64>(CACHE_READ).map_err(|e| alloc::format!("guest memory: {}", e))?;
+    if read & CACHE_BITS != CACHE_BITS {
+        return Err(alloc::format!("it read CR0 back as {:#x}, without the CD and NW it wrote", read));
+    }
+    let set = host_cache_bits_set();
+    if set != 0 {
+        return Err(alloc::format!("the host's own CR0 has CD or NW on cpu(s) {:#x} after it: the guest's write \
+                                   reached the CPU's", set));
+    }
+    Ok(alloc::format!("it read CR0 back as {:#x}, CD and NW as it wrote them, and no host CPU's own CR0 has \
+                       either", read))
+}
+
 /* ---- debug: a guest's own #DB given back to it ---- */
 
 const DEBUG_NAME: &str = "debug";
@@ -2358,13 +2557,27 @@ fn one_cpu_board(m: &GuestMemory, bsp: &mut GuestCpu, code: &[u8]) -> Result<()>
     Ok(())
 }
 
-/// Run the debug guest: one CPU, through the run loop a Linux guest's go
-/// through, where a #DB of the guest's own is given back.
+/// A guest of one CPU, through the run loop a Linux guest's go through: its
+/// name, what it does, its code -- `one_cpu_board`'s machine -- and what it
+/// has to have done, by its memory, how it stopped and what it counted.
+struct OneCpuGuest {
+    name: &'static str,
+    about: &'static str,
+    code: &'static [u8],
+    check: fn(&GuestMemory, &Stopped, &Counts) -> core::result::Result<String, String>,
+}
+
+const DEBUG_GUEST: OneCpuGuest =
+    OneCpuGuest { name: DEBUG_NAME, about: DEBUG_ABOUT, code: DEBUG_CODE, check: |m, stopped, _| check_debug(m, stopped) };
+
+/// Run a guest of one CPU (`OneCpuGuest`) through the run loop a Linux
+/// guest's go through, where what the guest raises of its own -- a #DB, a
+/// #UD -- is given back to it.
 #[inline(never)]
-fn run_debug(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
-    let _ = writeln!(out, "hv: guest {} -- {}", DEBUG_NAME, DEBUG_ABOUT);
+fn run_one_cpu(machine: &Arc<Machine>, spec: &OneCpuGuest, out: &mut dyn Write) -> bool {
+    let _ = writeln!(out, "hv: guest {} -- {}", spec.name, spec.about);
     let fail = |out: &mut dyn Write, why: &str| {
-        let _ = writeln!(out, "hv: guest {} FAILED -- {}", DEBUG_NAME, why);
+        let _ = writeln!(out, "hv: guest {} FAILED -- {}", spec.name, why);
         false
     };
     let Some(doorbells) = Doorbells::new(1) else { return fail(out, "out of memory") };
@@ -2373,7 +2586,7 @@ fn run_debug(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
         Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
     };
     let Some(mut bsp) = cpus.pop() else { return fail(out, "no CPU") };
-    if let Err(e) = one_cpu_board(guest.memory(), &mut bsp, DEBUG_CODE) {
+    if let Err(e) = one_cpu_board(guest.memory(), &mut bsp, spec.code) {
         return fail(out, &alloc::format!("could not be made: {}", e));
     }
     let start = time::boot_time_ns();
@@ -2384,7 +2597,7 @@ fn run_debug(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let stopped = guest.take_stopped()
         .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
     if let GuestStop::Refused(Refusal::NotOn(cpu)) = stopped.stop {
-        let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first", DEBUG_NAME, cpu);
+        let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first", spec.name, cpu);
         return false;
     }
     let host = guest.cpu_states().first().and_then(|&(_, h)| h);
@@ -2392,19 +2605,20 @@ fn run_debug(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
         Some(h) => { let _ = writeln!(out, "  ran on     cpu {}, {} us", h, ns / kcore::consts::NS_PER_US); }
         None => { let _ = writeln!(out, "  ran on     no cpu, {} us", ns / kcore::consts::NS_PER_US); }
     }
-    let _ = writeln!(out, "  exits      {}, {} exceptions given back", counts.exits, counts.reflected);
+    let _ = writeln!(out, "  exits      {}, {} exceptions given back, {} #UD and #GP given", counts.exits,
+                     counts.reflected, counts.ud);
     let mut says = String::new();
     let _ = describe_stop(&stopped.stop, &mut says);
     let _ = writeln!(out, "  stopped    {}", says);
 
-    match check_debug(guest.memory(), &stopped) {
+    match (spec.check)(guest.memory(), &stopped, &counts) {
         Ok(checked) => {
             let _ = writeln!(out, "  checked    {}", checked);
-            let _ = writeln!(out, "hv: guest {} ok", DEBUG_NAME);
+            let _ = writeln!(out, "hv: guest {} ok", spec.name);
             true
         }
         Err(why) => {
-            let _ = writeln!(out, "hv: guest {} FAILED -- {}", DEBUG_NAME, why);
+            let _ = writeln!(out, "hv: guest {} FAILED -- {}", spec.name, why);
             let _ = writeln!(out, "  cpu {} as it stopped:", stopped.cpu);
             let _ = out.write_str(&stopped.dump);
             false
@@ -2439,6 +2653,87 @@ fn check_debug(m: &GuestMemory, stopped: &Stopped) -> core::result::Result<Strin
     }
     Ok(String::from("both #DBs its own handler's: the single step's with DR6.BS, after the NOP; the ICEBP's with \
                      no bit, after it -- and it ran on to its halt"))
+}
+
+/* ---- instr: instructions both extensions stop a guest at, answered ---- */
+
+/* The instr guest: one CPU, with an IDT of its own and a #UD handler that
+ * keeps where it faulted, counts, and returns past the two-byte RSM. It runs
+ * RSM -- any CPL's to run, and a #UD outside SMM, where every guest is --
+ * and INVD, which would throw away the host's dirty lines with the guest's.
+ * Each is an intercept, or under VT-x an exit whatever the controls say,
+ * and each was once an exit no arm answered: RSM from a user process
+ * stopped its whole VM under AMD-V, and INVD from the guest's kernel under
+ * both. Now RSM is the #UD a CPU gives and INVD is stepped past, as KVM
+ * steps past it. The output of `nasm -f bin`, `bits 64` and `org 0x8000`. */
+const INSTR_NAME: &str = "instr";
+const INSTR_ABOUT: &str = "RSM and INVD, which both extensions stop a guest at: the #UD a CPU gives for the first, \
+                           and the second stepped past";
+
+const INSTR_CODE: &[u8] = &[
+    0x48, 0x8D, 0x05, 0x4A, 0x00, 0x00, 0x00,               // start: lea rax, [rel ud] ; gate 6, #UD
+    0xBF, 0x60, 0xA0, 0x00, 0x00,                           // mov edi, IDT_BASE + 6 * 16 ; 0xA060
+    0xE8, 0x1A, 0x00, 0x00, 0x00,                           // call gate
+    0x0F, 0x01, 0x1D, 0x57, 0x00, 0x00, 0x00,               // lidt [rel idtr]
+    0x0F, 0xAA,                                             // 18: rsm_at: rsm ; outside SMM: #UD, at any CPL -- the host's to give
+    0x0F, 0x08,                                             // 1a: invd ; the host's dirty lines: stepped past, not run
+    0xC7, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,               // mov dword [abs INSTR_DONE], 0x52534E49 ; 0x7010, "INSR"
+    0x49, 0x4E, 0x53, 0x52,
+    0xFA,                                                   // cli
+    0xF4,                                                   // .dead: hlt
+    0xEB, 0xFD,                                             // jmp .dead
+    0x66, 0x89, 0x07,                                       // gate: mov word [rdi], ax ; an interrupt gate for rax
+    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // mov word [rdi + 2], 0x08
+    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // mov word [rdi + 4], 0x8E00
+    0x48, 0xC1, 0xE8, 0x10,                                 // shr rax, 16
+    0x66, 0x89, 0x47, 0x06,                                 // mov word [rdi + 6], ax
+    0x48, 0xC1, 0xE8, 0x10,                                 // shr rax, 16
+    0x89, 0x47, 0x08,                                       // mov dword [rdi + 8], eax
+    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // mov dword [rdi + 12], 0
+    0xC3,                                                   // ret
+    0x50,                                                   // ud: push rax
+    0x48, 0x8B, 0x44, 0x24, 0x08,                           // mov rax, [rsp + 8] ; where it faulted
+    0x48, 0x89, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00,         // mov [abs INSTR_AT], rax ; 0x7008
+    0xFF, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // inc dword [abs INSTR_COUNT] ; 0x7000
+    0x48, 0x83, 0x44, 0x24, 0x08, 0x02,                     // add qword [rsp + 8], 2 ; past the rsm
+    0x58,                                                   // pop rax
+    0x48, 0xCF,                                             // iretq
+    0x6F, 0x00,                                             // idtr: dw 7 * 16 - 1 ; gates 0-6
+    0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // dq IDT_BASE
+];
+
+/// What it leaves at `RESULTS`: the #UDs its handler took, where the last
+/// was, and its mark once at its end.
+const INSTR_COUNT: u64 = RESULTS;
+const INSTR_AT: u64 = RESULTS + 0x8;
+const INSTR_DONE: u64 = RESULTS + 0x10;
+const INSTR_MARK: u32 = u32::from_le_bytes(*b"INSR");
+/// Where its RSM is.
+const INSTR_RSM_AT: u64 = ENTRY + 0x18;
+
+const INSTR_GUEST: OneCpuGuest = OneCpuGuest { name: INSTR_NAME, about: INSTR_ABOUT, code: INSTR_CODE, check: check_instr };
+
+fn check_instr(m: &GuestMemory, stopped: &Stopped, counts: &Counts) -> core::result::Result<String, String> {
+    let read = |gpa| m.read_obj::<u64>(gpa).map_err(|e| alloc::format!("its results cannot be read: {}", e));
+    let count = read(INSTR_COUNT)? as u32;
+    if !matches!(stopped.stop, GuestStop::Halted { .. }) {
+        return Err(alloc::format!("it did not run to its halt -- an exit with no answer stops a guest -- its \
+                                   handler having run {} times", count));
+    }
+    let done = read(INSTR_DONE)? as u32;
+    let at = read(INSTR_AT)?;
+    if done != INSTR_MARK || count != 1 || at != INSTR_RSM_AT {
+        return Err(alloc::format!("its #UD handler ran {} times, the last at {:#x}, and its mark is {:#x}: wanted \
+                                   once, at the RSM at {:#x}", count, at, done, INSTR_RSM_AT));
+    }
+    /* AMD-V stops the guest at its RSM and the host gives the #UD; VT-x
+     * does not stop it there, and the CPU gives it. INVD stops it on both. */
+    if counts.ud > 1 || counts.wbinvd != 1 {
+        return Err(alloc::format!("the host gave {} #UDs and stepped past {} WBINVDs and INVDs, not at most 1 and 1",
+                                  counts.ud, counts.wbinvd));
+    }
+    Ok(alloc::format!("its RSM a #UD of its own handler's, at the RSM -- {}; its INVD stepped past, and it ran on \
+                       to its halt", if counts.ud == 1 { "the host's to give" } else { "the CPU's own" }))
 }
 
 /* ---- dr: a guest's DR0-DR3 its own ---- */

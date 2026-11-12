@@ -551,6 +551,16 @@ const CR4_MCE: u64 = 1 << 6;
 /// guest/host mask -- a `mov` that would change one of them exits -- and
 /// set in the register, the guest reading the read shadow's instead.
 const CR4_HOST_KEEPS: u64 = CR4_MCE | CR4_VMXE_BIT;
+/// CR0.NW and CR0.CD: the cache's write-through and its fill turned off. A
+/// VM exit puts neither back from the host-state field (SDM vol. 3C,
+/// "Loading Host Control Registers": CR0's ET, CD and NW are not modified):
+/// a guest's `mov` to CR0 that set CD, let through, would leave the host's
+/// CPU with its caches no longer filling, after the exit, after `hv off`,
+/// for every guest after.
+/// So they are in the guest/host mask -- the `mov` exits, the guest reads
+/// what it wrote from the read shadow -- and never in the CR0 a guest runs
+/// with ([`Guest::hw_cr0`]), as KVM keeps them (`KVM_VM_CR0_ALWAYS_OFF`).
+pub const CR0_CACHE_BITS: u64 = 1 << 29 | 1 << 30;
 
 /* The controls without which a guest would reach what is the host's -- its
  * interrupts and NMIs, its ports, its CR8 (the local APIC's task priority),
@@ -761,13 +771,27 @@ const SWAP_MSRS: [u32; 5] = [
 /// next `swapgs` returns junk -- a garbage RSP on the interrupt-return path,
 /// which is what Alpine's kernel double-faulted on before this.
 const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
+/// Its place in [`SWAP_MSRS`], and so in the entry-load list.
+const KERNEL_GS_BASE_INDEX: usize = 4;
+const _: () = assert!(SWAP_MSRS[KERNEL_GS_BASE_INDEX] == MSR_KERNEL_GS_BASE);
 
 /// Where each list sits in the MSR page: 16 bytes an entry (index, reserved,
-/// value), the entry-load list at the start, the exit-load list past it, and
-/// the exit-store list (KERNEL_GS_BASE alone) past that.
+/// value), the entry-load list at the start and the exit-load list past it.
 const MSR_ENTRY_BASE: usize = 0;
 const MSR_EXIT_BASE: usize = 0x100;
-const MSR_STORE_BASE: usize = 0x200;
+const MSR_ENTRY_BYTES: usize = 16;
+/// The exit-store list is one entry, and it is the entry-load list's own
+/// KERNEL_GS_BASE: what an exit stores of the guest's is what the next entry
+/// loads, whichever path makes that entry -- the run loop's, after the
+/// shadow has been read and written back, or the world switch's own at once
+/// after an exit `super::fast` answered, which writes nothing back. Two
+/// slots, and a copy from one to the other on one path, once undid a
+/// guest's `swapgs` at every entry the fast path made: the list's value was
+/// the one of the last full exit, and the guest's user GS base came back as
+/// its kernel's per-CPU address. The SDM bounds the two lists' addresses and
+/// counts, not their overlap.
+const MSR_KERNEL_GS_BASE_ENTRY: usize = MSR_ENTRY_BASE + KERNEL_GS_BASE_INDEX * MSR_ENTRY_BYTES;
+const _: () = assert!(MSR_KERNEL_GS_BASE_ENTRY % MSR_ENTRY_BYTES == 0);
 
 /// The MSR bitmap: a bit an MSR, set for one whose `rdmsr` or `wrmsr` exits,
 /// in four 1 KiB quarters -- reads of 0..0x1FFF, reads of 0xC0000000..,
@@ -830,7 +854,9 @@ pub struct Guest {
     vmcs: vmcs::VmcsPage,
     /// One page holding the VM-entry MSR-load list (the guest's values of
     /// [`SWAP_MSRS`]) and the VM-exit MSR-load list (the host's), each an
-    /// array of 16-byte entries the CPU reads.
+    /// array of 16-byte entries the CPU reads -- and, as the VM-exit
+    /// MSR-store list, the entry list's KERNEL_GS_BASE entry, which the CPU
+    /// writes.
     msr_area: kcore::dma::DmaBuffer,
     /// One page: the MSR bitmap above.
     msr_bitmap: kcore::dma::DmaBuffer,
@@ -890,9 +916,10 @@ pub struct Guest {
     /// to CR0 that would change one exits instead, and the guest reads them
     /// from the read shadow. PG, because turning paging on or off with EFER.LME
     /// set turns long mode on or off, which the "IA-32e mode guest" entry
-    /// control has to follow; PE with it; and every bit VMX fixes -- NE
-    /// above all, which a CPU coming out of INIT has clear and VMX needs set,
-    /// so the guest is let believe it wrote what it wrote.
+    /// control has to follow; PE with it; every bit VMX fixes -- NE above
+    /// all, which a CPU coming out of INIT has clear and VMX needs set, so
+    /// the guest is let believe it wrote what it wrote; and CD and NW
+    /// ([`CR0_CACHE_BITS`]), which are never the guest's in the register.
     cr0_mask: u64,
     /// The policy wrote CR0 (`set_cr0`): the next entry writes the VMCS's
     /// CR0 and its read shadow.
@@ -1038,7 +1065,7 @@ impl Guest {
         if unrestricted {
             fixed_on &= !(CR0_PE | CR0_PG);
         }
-        let cr0_mask = CR0_PE | CR0_PG | CR0_NE | fixed_on | (!caps.cr0_fixed1 & 0xFFFF_FFFF);
+        let cr0_mask = CR0_PE | CR0_PG | CR0_NE | CR0_CACHE_BITS | fixed_on | (!caps.cr0_fixed1 & 0xFFFF_FFFF);
 
         Ok(Self {
             vmcs,
@@ -1311,13 +1338,14 @@ impl Guest {
 
     /// CR0 as the VMCS holds it for a guest that reads `value`: with the
     /// bits VMX forces set -- all but PE and PG, with unrestricted guest --
-    /// and the ones it forbids clear.
+    /// and the ones it forbids clear, and never CD or NW
+    /// ([`CR0_CACHE_BITS`]).
     fn hw_cr0(&self, value: u64) -> u64 {
         let mut fixed_on = self.cr0_fixed0;
         if self.unrestricted {
             fixed_on &= !(CR0_PE | CR0_PG);
         }
-        (value | fixed_on) & self.cr0_fixed1
+        (value | fixed_on) & self.cr0_fixed1 & !CR0_CACHE_BITS
     }
 
     /// The VM-entry controls for a guest whose EFER is `efer`: "IA-32e mode
@@ -1679,7 +1707,7 @@ impl Guest {
             vmwrite(VMENTRY_MSR_LOAD_COUNT, SWAP_MSRS.len() as u64);
             vmwrite(VMEXIT_MSR_LOAD_ADDR, msr_phys + MSR_EXIT_BASE as u64);
             vmwrite(VMEXIT_MSR_LOAD_COUNT, SWAP_MSRS.len() as u64);
-            vmwrite(VMEXIT_MSR_STORE_ADDR, msr_phys + MSR_STORE_BASE as u64);
+            vmwrite(VMEXIT_MSR_STORE_ADDR, msr_phys + MSR_KERNEL_GS_BASE_ENTRY as u64);
             vmwrite(VMEXIT_MSR_STORE_COUNT, 1);
             vmwrite(TSC_OFFSET, 0);
             /* The guest owns CR0 but for the bits of `cr0_mask`, and CR4
@@ -1905,18 +1933,17 @@ impl Guest {
     fn fill_host_msrs(&mut self) {
         for (i, &msr) in SWAP_MSRS.iter().enumerate() {
             let host = unsafe { cpu::rdmsr(msr) };
-            let e = MSR_ENTRY_BASE + i * 16;
-            let x = MSR_EXIT_BASE + i * 16;
+            let e = MSR_ENTRY_BASE + i * MSR_ENTRY_BYTES;
+            let x = MSR_EXIT_BASE + i * MSR_ENTRY_BYTES;
             self.msr_area.store::<u32>(e, msr);
             self.msr_area.store::<u32>(e + 4, 0);
             self.msr_area.store::<u32>(x, msr);
             self.msr_area.store::<u32>(x + 4, 0);
             self.msr_area.store::<u64>(x + 8, host);
         }
-        /* The exit-store list, one entry: the CPU writes the guest's live
-         * KERNEL_GS_BASE (which its `swapgs` may have changed) at +8. */
-        self.msr_area.store::<u32>(MSR_STORE_BASE, MSR_KERNEL_GS_BASE);
-        self.msr_area.store::<u32>(MSR_STORE_BASE + 4, 0);
+        /* The exit-store list is the entry-load list's KERNEL_GS_BASE entry
+         * (`MSR_KERNEL_GS_BASE_ENTRY`), whose index the loop above wrote:
+         * the CPU writes the guest's live value at +8 on every exit. */
     }
 
     /// Fill the VM-entry MSR-load list's values with the guest's `SWAP_MSRS`
@@ -1927,16 +1954,17 @@ impl Guest {
             self.save.sfmask, self.save.kernel_gs_base,
         ];
         for (i, &gval) in guest.iter().enumerate() {
-            self.msr_area.store::<u64>(MSR_ENTRY_BASE + i * 16 + 8, gval);
+            self.msr_area.store::<u64>(MSR_ENTRY_BASE + i * MSR_ENTRY_BYTES + 8, gval);
         }
     }
 
     /// The guest's KERNEL_GS_BASE the exit stored, back into the shadow, so
-    /// the next entry loads what the guest's `swapgs` left, not a stale
-    /// `wrmsr` value. Read before the policy handles a `wrmsr` of it, which
-    /// then overrides this with the written value.
+    /// that what the policy reads, and the next `fill_guest_msrs` writes
+    /// back, is what the guest's `swapgs` left. Read before the policy
+    /// handles a `wrmsr` of it, which then overrides this with the written
+    /// value.
     fn read_stored_kernel_gs_base(&mut self) {
-        if let Some(v) = self.msr_area.load::<u64>(MSR_STORE_BASE + 8) {
+        if let Some(v) = self.msr_area.load::<u64>(MSR_KERNEL_GS_BASE_ENTRY + 8) {
             self.save.kernel_gs_base = v;
         }
     }

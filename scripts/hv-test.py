@@ -338,11 +338,23 @@ GUESTS = {
               r"through it too, and 0x30's own EOI by the register after, whose exit did 0x70's first; nothing left "
               r"in service; with PV EOI off, 0x50 by the register, the word never set -- 2 EOIs through the word, 2 "
               r"by the register"],
+    # At least one write answered in the world switch, or the guest looked
+    # at nothing (`check_kgs` refuses none); then the two bases as left.
+    # QEMU's TCG gives AMD-V no next-RIP save, and its world switch then
+    # answers no write: said so, the bases held to the same either way.
+    "kgs": [r"(?:[1-9]\d* of its 128 writes of the ICR and the TSC deadline answered in the world switch;|no "
+            r"next-RIP save, so none of its writes answered in the world switch -- and) the GS base and KERNEL_GS_BASE "
+            r"as its swapgs left them"],
+    "cache": [r"it read CR0 back as 0x[0-9a-f]+, CD and NW as it wrote them, and no host CPU's own CR0 has either"],
     # Who hands the second CPU's IPIs over -- the host here -- is said after
     # the colon; that the first took them all is what has to be the same.
     "posted": [r"the first CPU took all 1000 of the second's IPIs while it spun, the host handing each over"],
     "debug": [r"both #DBs its own handler's: the single step's with DR6\.BS, after the NOP; the ICEBP's with no bit",
               r"2 exceptions given back"],
+    # RSM, any CPL's, once stopped its whole VM under AMD-V, and INVD the
+    # guest's kernel's under both: a #UD of its own, and stepped past.
+    "instr": [r"its RSM a #UD of its own handler's, at the RSM -- (?:the host's to give|the CPU's own); its INVD "
+              r"stepped past, and it ran on to its halt"],
     # Its reads are stopped and answered by the host -- 11 accesses
     # performed -- except on QEMU's TCG, which checks a read of CR4 against
     # CR0's intercept and so never stops one: 5, its writes. The guest's own
@@ -1097,6 +1109,9 @@ def check_all_guests(text, cpu, backend, apicv, posted):
         elif name in ("avx", "pkru"):
             # Both its CPUs there.
             good = good and re.search(r"ran on\s+cpu %d and cpu %d," % (cpu, cpu), report) is not None
+        elif name == "kgs":
+            # Its first CPU there; its second never started.
+            good = good and re.search(r"ran on\s+cpu %d and \(cpu 1 never entered\)," % cpu, report) is not None
         elif name != "refused":
             good = good and re.search(r"ran on\s+cpu %d," % cpu, report) is not None
         pt.check("  %s, on cpu %d" % (name, cpu), good, report or text)

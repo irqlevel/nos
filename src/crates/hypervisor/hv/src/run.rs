@@ -84,7 +84,7 @@ use crate::memory::GuestMemory;
 use crate::mmio;
 use crate::place::Shape;
 use crate::smp::{Doorbells, Mailbox, MAX_VCPUS};
-use crate::svm::Exit;
+use crate::svm::{Exit, Instr};
 use crate::vm::{Cpu, Refusal};
 
 pub use crate::smp::Doorbell;
@@ -2045,7 +2045,7 @@ impl LinuxGuest {
                 /* `int1` -- AMD-V's intercept of it, or VT-x's of the #DB
                  * it raises, which exits at the instruction: stepped past,
                  * and its #DB given as the trap it is, after it. */
-                Exit::Other(vmcb::exit::ICEBP) => {
+                Exit::Instr(Instr::Icebp) => {
                     gc.counts.reflected += 1;
                     gc.cpu.backend_mut().skip_icebp();
                     gc.exception = Some((VECTOR_DB, None));
@@ -2058,7 +2058,7 @@ impl LinuxGuest {
                 }
                 /* RDPMC, of counters CPUID does not say are there: the #GP
                  * a CPU gives for a counter it has not got. */
-                Exit::Other(vmcb::exit::RDPMC) => {
+                Exit::Instr(Instr::Rdpmc) => {
                     gc.counts.ud += 1;
                     gc.cpu.backend_mut().inject_gp();
                     None
@@ -2068,24 +2068,25 @@ impl LinuxGuest {
                 /* The guest can take an interrupt, or an NMI, now; the next
                  * entry injects it. Nothing to do here. */
                 Exit::IrqWindow | Exit::NmiWindow => None,
-                Exit::Other(vmcb::exit::XSETBV) => {
+                Exit::Instr(Instr::Xsetbv) => {
                     gc.counts.xsetbv += 1;
                     if cr::xsetbv(gc.cpu.backend_mut()) != cr::Xcr::Written {
                         gc.counts.xsetbv_refused += 1;
                     }
                     None
                 }
-                Exit::Other(code) if matches!(code,
-                    vmcb::exit::MONITOR | vmcb::exit::MWAIT | vmcb::exit::MWAIT_ARMED
-                    | vmcb::exit::RDTSCP | vmcb::exit::RDPRU) =>
-                {
-                    /* Intercepted, and not offered by CPUID: the guest gets
-                     * what a CPU without them gives it. */
+                Exit::Instr(Instr::Monitor | Instr::Mwait | Instr::Rdtscp | Instr::Rdpru | Instr::Rsm) => {
+                    /* Intercepted, and not offered by CPUID -- or, for RSM,
+                     * outside SMM, where every guest is: the guest gets what
+                     * a CPU without them gives it, at any CPL. */
                     gc.counts.ud += 1;
                     gc.cpu.backend_mut().inject_ud();
                     None
                 }
-                Exit::Other(vmcb::exit::WBINVD) => {
+                /* WBINVD, and INVD -- which would throw away the host's
+                 * dirty lines with the guest's: stepped past, KVM's answer
+                 * to both. Counted together. */
+                Exit::Instr(Instr::Wbinvd | Instr::Invd) => {
                     gc.counts.wbinvd += 1;
                     gc.cpu.backend_mut().skip_wbinvd();
                     None
