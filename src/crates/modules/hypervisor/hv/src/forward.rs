@@ -16,7 +16,14 @@
 //! fail.
 //!
 //! The kernel has 64 TCP connections in all and a forwarded one takes two,
-//! so a forward relays at most `MAX_CONNS` at once and refuses the rest.
+//! so a forward relays at most `MAX_CONNS` at once, every forward together
+//! at most `MAX_RELAYS` -- what is left of the 64 is nos's own: its sshd, its
+//! API, a download -- and the rest are refused. A relay that ends closes its
+//! two first, and each then waits out its close in the kernel for up to a
+//! minute (TIME-WAIT), counted by no forward: the kernel takes such a slot
+//! back for a new connection when it has none free (`net::tcp`'s
+//! `reclaim`), so a client that opens and closes through a forward as fast
+//! as it likes no longer holds every slot the machine has.
 //! Taking a forward away closes its port, and waits out its relays.
 
 use alloc::string::String;
@@ -36,6 +43,28 @@ use crate::relay::{self, Ended, Read};
 
 pub const MAX_FORWARDS: usize = 8;
 const MAX_CONNS: usize = 8;
+/// Relays of every forward together, at most: 24 of the kernel's 64
+/// connections. Eight forwards of eight each were 128 once, and a client
+/// that held idle connections open through four of them took every one.
+const MAX_RELAYS: usize = 12;
+/// Relays of every forward running now.
+static RELAYS: AtomicUsize = AtomicUsize::new(0);
+
+/// One of `MAX_RELAYS` taken, or false when every one is.
+fn take_relay() -> bool {
+    let mut n = RELAYS.load(Ordering::Acquire);
+    while n < MAX_RELAYS {
+        match RELAYS.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => n = now,
+        }
+    }
+    false
+}
+
+fn give_relay() {
+    RELAYS.fetch_sub(1, Ordering::AcqRel);
+}
 /// Connections the kernel holds for a forward's port that its listener has
 /// not taken yet, at most: it takes each within a wait, so a few are
 /// plenty, and a flood of SYNs at the port costs the kernel's 64 connection
@@ -107,12 +136,13 @@ fn listen(start: Listen) {
     while !shared.stop.load(Ordering::Acquire) {
         let Some(client) = listener.accept(ACCEPT_WAIT_MS) else { continue };
         reap(&shared);
-        if shared.active.load(Ordering::Acquire) >= MAX_CONNS {
+        if shared.active.load(Ordering::Acquire) >= MAX_CONNS || !take_relay() {
             shared.refused.fetch_add(1, Ordering::Relaxed);
             client.abort();
             continue;
         }
         let Some(guest) = TcpStream::connect(&shared.host, shared.guest_ip, shared.guest_port) else {
+            give_relay();
             shared.failed.fetch_add(1, Ordering::Relaxed);
             client.abort();
             continue;
@@ -126,6 +156,7 @@ fn listen(start: Listen) {
              * failed: both are closed. */
             None => {
                 shared.active.fetch_sub(1, Ordering::AcqRel);
+                give_relay();
                 shared.failed.fetch_add(1, Ordering::Relaxed);
             }
             Some(task) => {
@@ -203,6 +234,7 @@ fn relay_task(relay: Relay) {
     drop(a);
     drop(b);
     shared.active.fetch_sub(1, Ordering::AcqRel);
+    give_relay();
     done.store(true, Ordering::Release);
 }
 
