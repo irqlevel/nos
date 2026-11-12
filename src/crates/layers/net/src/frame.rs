@@ -64,6 +64,11 @@ struct RawFrame {
     capacity: usize,
     /// Bytes in the frame now
     len: AtomicUsize,
+    /// What its holder outside the image may write and send of the buffer:
+    /// all of it, but for a frame a module asked for to send, the length it
+    /// asked for -- zeroed (`kernel_netframe_alloc_tx`). The pool hands
+    /// frames out as their last user left them.
+    room: AtomicUsize,
     /// When this reaches zero the frame goes back where it came from
     refcount: AtomicIsize,
     /// Back to the pool, that is, rather than to the allocator
@@ -114,6 +119,7 @@ impl RawFrame {
                 data_phys,
                 capacity,
                 len: AtomicUsize::new(0),
+                room: AtomicUsize::new(capacity),
                 refcount: AtomicIsize::new(0),
                 pooled,
             });
@@ -128,6 +134,18 @@ impl RawFrame {
     /// Never past the buffer, whoever asks: `bytes` trusts this.
     fn set_len(&self, len: usize) {
         self.len.store(len.min(self.capacity), Ordering::Relaxed);
+    }
+
+    /// What a holder outside the image may use (`room`): never more than the
+    /// buffer.
+    fn room(&self) -> usize {
+        self.room.load(Ordering::Relaxed)
+    }
+
+    /// A module's length: never past its room, so that what it did not write
+    /// does not go out with what it did.
+    fn set_len_in_room(&self, len: usize) {
+        self.len.store(len.min(self.room()), Ordering::Relaxed);
     }
 
     fn bytes(&self) -> &[u8] {
@@ -155,6 +173,7 @@ impl IdleFrame {
         let header = self.header();
         header.next.set(core::ptr::null_mut());
         header.len.store(0, Ordering::Relaxed);
+        header.room.store(header.capacity, Ordering::Relaxed);
         header.refcount.store(1, Ordering::Release);
         Frame(self.0)
     }
@@ -234,6 +253,31 @@ impl Frame {
     /// Bytes it has room for.
     pub fn capacity(&self) -> usize {
         self.header().capacity
+    }
+
+    /// What a module may write and send of it (`RawFrame::room`).
+    pub fn room(&self) -> usize {
+        self.header().room()
+    }
+
+    /// Its length as a module sets it: never past its room.
+    pub fn set_len_in_room(&mut self, len: usize) {
+        self.header().set_len_in_room(len);
+    }
+
+    /// A frame a module asks for to send, with room for `len` bytes: those
+    /// zeroed, and its room -- what the module may write and send of it --
+    /// no more. The pool gives a frame back as its last user left it:
+    /// another connection's bytes, a guest's, a packet off the wire; a
+    /// module that padded a short frame by its length, or wrote less than it
+    /// sent, put them on the wire. The image's own senders write every byte
+    /// they send and are given their frames as they are.
+    pub fn alloc_for_module(len: usize) -> Option<Frame> {
+        let mut frame = Frame::alloc_tx(len)?;
+        let room = len.min(frame.capacity());
+        frame.data_raw_mut(room).fill(0);
+        frame.header().room.store(room, Ordering::Relaxed);
+        Some(frame)
     }
 
     /// Where a device is pointed to read or write the buffer.
@@ -735,9 +779,11 @@ unsafe fn peek<'a>(handle: usize) -> Option<&'a RawFrame> {
     unsafe { (handle as *const RawFrame).as_ref() }
 }
 
+/// A frame for a module to send: room for `len` bytes, zeroed, and no more
+/// (`Frame::alloc_for_module`).
 #[no_mangle]
 pub extern "C" fn kernel_netframe_alloc_tx(len: usize) -> usize {
-    Frame::alloc_tx(len).map_or(0, Frame::into_handle)
+    Frame::alloc_for_module(len).map_or(0, Frame::into_handle)
 }
 
 /// # Safety
@@ -765,7 +811,7 @@ pub unsafe extern "C" fn kernel_netframe_len(frame: usize) -> usize {
 /// `frame` is 0 or a reference the caller holds.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_netframe_capacity(frame: usize) -> usize {
-    unsafe { peek(frame) }.map_or(0, |frame| frame.capacity)
+    unsafe { peek(frame) }.map_or(0, RawFrame::room)
 }
 
 /// # Safety
@@ -773,7 +819,7 @@ pub unsafe extern "C" fn kernel_netframe_capacity(frame: usize) -> usize {
 #[no_mangle]
 pub unsafe extern "C" fn kernel_netframe_set_len(frame: usize, len: usize) {
     if let Some(frame) = unsafe { peek(frame) } {
-        frame.set_len(len);
+        frame.set_len_in_room(len);
     }
 }
 
@@ -796,4 +842,83 @@ pub unsafe extern "C" fn kernel_netframe_get(frame: usize) {
 #[no_mangle]
 pub unsafe extern "C" fn kernel_netframe_put(frame: usize) {
     drop(unsafe { Frame::from_handle(frame) });
+}
+
+/* ---- the boot's check of a module's frame ---- */
+
+/// The boot's check that a frame a module asks for to send carries nothing
+/// of its last user's (`Frame::alloc_for_module`): a pool frame written over
+/// whole and given back, then asked for again as a module asks -- the same
+/// frame, this CPU's cache handing back what it was given last -- holds
+/// zeros where the module may write, says it has room for no more than was
+/// asked, and keeps a module's length there. The bytes past its room are
+/// still the last user's: the room is what keeps them in. A failure panics,
+/// as the boot's other self-tests do; a frame other than the one given back,
+/// which an interrupt's allocation between the two can cause, is tried again.
+pub fn module_frame_selftest() {
+    const ASK: usize = 100;
+    const STALE: u8 = 0xA5;
+    const TRIES: usize = 16;
+    for _ in 0..TRIES {
+        let Some(mut old) = Frame::alloc_tx(FRAME_CAPACITY) else {
+            panic!("net frame selftest: no frame to write over");
+        };
+        let capacity = old.capacity();
+        old.data_raw_mut(capacity).fill(STALE);
+        old.set_len(capacity);
+        let was = old.as_lent();
+        drop(old);
+
+        let Some(mut frame) = Frame::alloc_for_module(ASK) else {
+            panic!("net frame selftest: no frame for a module");
+        };
+        if frame.as_lent() != was {
+            continue;
+        }
+        let capacity = frame.capacity();
+        let bytes = frame.data_raw_mut(capacity);
+        assert!(bytes[..ASK].iter().all(|&b| b == 0),
+            "net frame selftest: a module's frame holds its last user's bytes where it may write");
+        assert!(bytes[ASK..].iter().all(|&b| b == STALE),
+            "net frame selftest: the bytes past a module's room changed");
+        assert!(frame.room() == ASK, "net frame selftest: a module's frame says it has room for {}, not {}",
+            frame.room(), ASK);
+        frame.set_len_in_room(capacity);
+        assert!(frame.len() == ASK, "net frame selftest: a module's length went past its room to {}", frame.len());
+        drop(frame);
+
+        /* And the next user of it has the whole buffer again. */
+        let Some(next) = Frame::alloc_tx(FRAME_CAPACITY) else {
+            panic!("net frame selftest: no frame after");
+        };
+        if next.as_lent() == was {
+            assert!(next.room() == next.capacity(), "net frame selftest: a module's room outlived its frame");
+        }
+        klog!(0, "net frame selftest: passed -- a module's frame zeroed in its room of {}, held to it", ASK);
+        return;
+    }
+    panic!("net frame selftest: the pool never gave the same frame back in {} tries", TRIES);
+}
+
+/* ---- what `netpool bench` measures ---- */
+
+/// The cycles `rounds` times `held.capacity()` allocations and releases of a
+/// frame with room for `len` bytes take on this CPU -- as the image takes one
+/// (`alloc_tx`), or as a module does (`alloc_for_module`: its room zeroed) --
+/// `held.capacity()` frames held at a time before all are given back: one,
+/// and the same frame comes back from this CPU's cache, hot; a ring's worth,
+/// and they go through the pool's ring as a transmit ring's frames do. None
+/// when the pool runs short.
+pub fn bench_alloc(len: usize, module: bool, rounds: usize, held: &mut alloc::vec::Vec<Frame>) -> Option<u64> {
+    let at_once = held.capacity();
+    let from = kcore::time::cycle_counter();
+    for _ in 0..rounds {
+        for _ in 0..at_once {
+            let frame = if module { Frame::alloc_for_module(len) } else { Frame::alloc_tx(len) };
+            /* Within the room `held` was made with: no allocation here. */
+            held.push(frame?);
+        }
+        held.clear();
+    }
+    Some(kcore::time::cycle_counter().wrapping_sub(from))
 }

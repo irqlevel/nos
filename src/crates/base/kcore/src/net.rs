@@ -407,9 +407,12 @@ impl NetFrame {
         self.handle.get()
     }
 
-    /// A frame to transmit, room for `data_len` bytes: from the frame pool --
-    /// a per-CPU cache, no allocator -- whenever it fits one. `len()` is 0
-    /// until `set_len`. None past 2048 bytes, the most a frame holds: a
+    /// A frame to transmit, room for `data_len` bytes -- zeroed, and no more:
+    /// from the frame pool -- a per-CPU cache, no allocator -- whenever it
+    /// fits one, which gives frames back as their last user left them, so
+    /// the room is cleared and the frame held to it (`data_raw_mut`,
+    /// `set_len`): what was not written cannot go out with what was. `len()`
+    /// is 0 until `set_len`. None past 2048 bytes, the most a frame holds: a
     /// frame is one run of physical memory, which a device is pointed at
     /// whole (`data_phys`).
     #[inline]
@@ -465,7 +468,8 @@ impl NetFrame {
     }
 
     /// Mutable slice of the allocated buffer, up to `capacity` bytes of it --
-    /// fewer if the frame has room for fewer.
+    /// fewer if the frame has room for fewer: a frame from `alloc_tx` has the
+    /// room it asked for, one it was lent its whole buffer.
     ///
     /// Use this when you need to write into a freshly allocated frame before
     /// calling `set_len`.
@@ -490,6 +494,7 @@ impl NetFrame {
         unsafe { net::kernel_netframe_len(self.raw()) }
     }
 
+    /// The frame's length from now on: never past its room (`data_raw_mut`).
     #[inline]
     pub fn set_len(&mut self, len: usize) {
         unsafe { net::kernel_netframe_set_len(self.raw(), len) }
