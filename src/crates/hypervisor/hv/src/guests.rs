@@ -1734,9 +1734,10 @@ fn check_ioapic(m: &GuestMemory, stopped: &Stopped, stats: &crate::devices::ioap
     }
     let wanted = u64::from(IOAPIC_EDGES_WANTED + IOAPIC_LEVELS_WANTED);
     let levels = u64::from(IOAPIC_LEVELS_WANTED);
-    if stats.sent != wanted || stats.level != levels || stats.eois != levels || stats.dropped != 0 {
-        return Err(alloc::format!("the IO-APIC sent {} ({} levels), ended {} and dropped {}, not {} ({}), {} and 0",
-                                  stats.sent, stats.level, stats.eois, stats.dropped, wanted, levels, levels));
+    if stats.sent != wanted || stats.level != levels || stats.eois != levels || stats.dropped != 0 || stats.untaken != 0 {
+        return Err(alloc::format!("the IO-APIC sent {} ({} levels), ended {}, dropped {} and saw {} levels no APIC \
+                                   took, not {} ({}), {}, 0 and 0", stats.sent, stats.level, stats.eois, stats.dropped,
+                                  stats.untaken, wanted, levels, levels));
     }
     Ok(String::from("version 0x20's 24 pins; two edges taken, none while masked; three levels, each sent again \
                      at its EOI while the line stayed up, its remote IRR set in service and clear after"))
@@ -2011,9 +2012,10 @@ fn check_apicv(m: &GuestMemory, stopped: &Stopped, stats: &crate::devices::ioapi
         return Err(alloc::format!("ISR read {:#x} at the end: an EOI lost", left));
     }
     let wanted = u64::from(APICV_LEVELS_WANTED);
-    if stats.sent != wanted || stats.level != wanted || stats.eois != wanted || stats.dropped != 0 {
-        return Err(alloc::format!("the IO-APIC sent {} ({} levels), ended {} and dropped {}, not {} each and 0",
-                                  stats.sent, stats.level, stats.eois, stats.dropped, wanted));
+    if stats.sent != wanted || stats.level != wanted || stats.eois != wanted || stats.dropped != 0 || stats.untaken != 0 {
+        return Err(alloc::format!("the IO-APIC sent {} ({} levels), ended {}, dropped {} and saw {} levels no APIC \
+                                   took, not {} each and 0 and 0", stats.sent, stats.level, stats.eois, stats.dropped,
+                                  stats.untaken, wanted));
     }
     /* Under virtual-interrupt delivery the host injects none of them and
      * hears of the three level EOIs alone; else it injects all six. */

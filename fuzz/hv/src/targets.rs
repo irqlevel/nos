@@ -263,7 +263,7 @@ fn pic(r: &mut Input) {
 fn pit(r: &mut Input) {
     const PORTS: [u16; 5] = [0x40, 0x41, 0x42, 0x43, 0x61];
     let mut p = Pit::new();
-    while let Some(op) = r.op(7) {
+    while let Some(op) = r.op(8) {
         match op {
             0 => {
                 p.read(r.pick(&PORTS));
@@ -278,6 +278,26 @@ fn pit(r: &mut Input) {
                     /* Due now or later -- never in the past it has given. */
                     let _ = at;
                 }
+            }
+            6 => {
+                /* Channel 0 programmed as a guest programs its tick: a
+                 * control word, then its count's low byte and high byte,
+                 * time going by between. The counter waits for the whole
+                 * count: no IRQ0 edge before it, none due. The old count ran
+                 * on in the new mode, and half a count already counted. */
+                const CH0_LOHI: u8 = 0x30;
+                const MODE_SHIFT: u8 = 1;
+                let mode = r.pick(&[0u8, 2, 3, 4]);
+                p.write(0x43, CH0_LOHI | (mode << MODE_SHIFT));
+                for byte in [Some(r.u8()), None] {
+                    time::advance(r.time_step());
+                    invariant!(!p.ch0_fire() && p.next_ch0_edge_ns().is_none(),
+                               "channel 0 has an edge in mode {} before its count is whole", mode);
+                    if let Some(low) = byte {
+                        p.write(0x40, low);
+                    }
+                }
+                p.write(0x40, r.u8());
             }
             _ => {
                 p.ch0_state();
@@ -528,11 +548,29 @@ fn apic_read(a: &Lapic, reg: u32, now: u64) -> Option<u32> {
     }
 }
 
+/// Write `reg` whole as the APIC's mode has it -- its MSR in x2APIC mode, the
+/// page in xAPIC mode -- and nothing with the APIC off: a guest's write that
+/// is sure to land.
+fn apic_set(a: &mut Lapic, reg: u32, value: u64, now: u64) {
+    if !a.enabled() {
+        return;
+    }
+    if a.xapic() {
+        a.mmio_write(reg << 4, 4, value as u32, now);
+    } else {
+        let _ = a.wrmsr(lapic::MSR_X2APIC_FIRST + reg, value, now);
+    }
+}
+
+/* The timer's entry: masked, and periodic. */
+const LVT_MASKED: u64 = 1 << 16;
+const TIMER_PERIODIC: u64 = 1 << 17;
+
 fn lapic_target(r: &mut Input) {
     let (id, bsp, x2apic) = (r.below(16) as u32, r.bool(), r.bool());
     let mut a = Lapic::new(id, bsp, x2apic);
     let mut now = time::boot_time_ns();
-    while let Some(op) = r.op(14) {
+    while let Some(op) = r.op(16) {
         match op {
             0 => {
                 let reg = apic_reg(r);
@@ -631,6 +669,50 @@ fn lapic_target(r: &mut Input) {
                     None => {}
                 }
             }
+            14 => {
+                /* The divide configuration written while a count runs: the
+                 * count goes on from where it is, at the new rate -- at the
+                 * write's instant it reads what it did before. Kept from the
+                 * old start, it read up to 128 times off. */
+                let before = apic_read(&a, APIC_TIMER_CURRENT, now);
+                let value = apic_value(r, APIC_TIMER_DIVIDE);
+                apic_write(&mut a, r, APIC_TIMER_DIVIDE, value, now);
+                let after = apic_read(&a, APIC_TIMER_CURRENT, now);
+                invariant!(before == after, "the count read {:?} before a divide configuration was written and {:?} \
+                           after, at one instant", before, after);
+            }
+            15 => {
+                /* A periodic timer masked while time goes by -- looked at or
+                 * not -- then unmasked: what it missed is lost, as on an
+                 * APIC, and nothing is handed over at the instant it is
+                 * unmasked. Moved a period a look and owed the rest, it came
+                 * out of its mask with up to a second of periods, back to
+                 * back. */
+                a.init();
+                let vector = 16 + r.below(240);
+                apic_set(&mut a, APIC_SVR, 0x1FF, now);
+                apic_set(&mut a, APIC_TIMER_DIVIDE, 0b1011, now);
+                apic_set(&mut a, APIC_LVT_TIMER, TIMER_PERIODIC | LVT_MASKED | vector, now);
+                apic_set(&mut a, APIC_TIMER_INITIAL, r.pick(&[1u64, 1000, 100_000, 1_000_000, 10_000_000]), now);
+                for _ in 0..r.below(8) {
+                    now = time::later(now, r.time_step());
+                    invariant!(!a.timer(now), "a masked timer requested its interrupt");
+                }
+                now = time::later(now, r.time_step());
+                apic_set(&mut a, APIC_LVT_TIMER, TIMER_PERIODIC | vector, now);
+                let mut handed = 0;
+                for _ in 0..4 {
+                    if !a.timer(now) {
+                        break;
+                    }
+                    handed += 1;
+                    if let Some(v) = a.pending() {
+                        a.acknowledge(v);
+                        apic_set(&mut a, APIC_EOI, 0, now);
+                    }
+                }
+                invariant!(handed == 0, "a periodic timer unmasked handed over {} interrupts at that instant", handed);
+            }
             _ => {
                 a.sync_cr8(r.u8() & 0xF);
                 let x = a.addressing();
@@ -649,11 +731,13 @@ fn ioapic_target(r: &mut Input) {
     let mut io = IoApic::new(r.u8());
     /* Each pin as the target has driven it: a line held up, asserted again,
      * is no edge, and sends nothing -- a level's interrupt went when it rose
-     * or when it was ended, and an NMI or an INIT is edge-triggered whatever
-     * its entry says (an NMI at every look was a guest's CPU 0 never entered
-     * again). */
+     * or when it was ended, an NMI is edge-triggered whatever its entry says
+     * (an NMI at every look was a guest's CPU 0 never entered again), and
+     * one no local APIC took is sent again only when a CPU's APIC changes
+     * (`untaken`). Whether a local APIC takes a message is the input's to
+     * say, as the CPUs it names would. */
     let mut up: u32 = 0;
-    while let Some(op) = r.op(8) {
+    while let Some(op) = r.op(10) {
         /* Its page's registers, mostly -- the select, the window, EOI. */
         let offset = if r.u8() < 200 { r.pick(&[0x00, 0x10, 0x40]) } else { r.below(ioapic::PAGE_SIZE) as u32 };
         let pin = r.below(32) as usize;
@@ -687,8 +771,21 @@ fn ioapic_target(r: &mut Input) {
                 io.route(pin);
                 0
             }
+            7 => {
+                /* A level posted to another CPU's mailbox, refused there. */
+                io.refused(r.u8());
+                0
+            }
+            8 => {
+                /* A CPU's APIC turned on, or addressed otherwise: what no
+                 * APIC took, sent again -- pins held up alone. */
+                let again = io.untaken();
+                invariant!(again & !up == 0, "pins {:#x} sent again, of which {:#x} are not asserted", again,
+                           again & !up);
+                again
+            }
             _ => {
-                let _ = io.send(pin);
+                ioapic_send(&mut io, pin, r.bool(), up);
                 0
             }
         };
@@ -697,9 +794,54 @@ fn ioapic_target(r: &mut Input) {
         while left != 0 {
             let p = left.trailing_zeros() as usize;
             left &= left - 1;
-            let _ = io.send(p);
+            ioapic_send(&mut io, p, r.bool(), up);
         }
     }
+}
+
+/// Pin `pin`'s redirection entry as a guest reads it through the window,
+/// its remote IRR among it.
+fn ioapic_entry(io: &mut IoApic, pin: usize) -> u64 {
+    const IOREGSEL: u32 = 0x00;
+    const IOWIN: u32 = 0x10;
+    let low = 0x10 + 2 * pin as u32;
+    io.mmio_write(IOREGSEL, 4, low);
+    let lo = u64::from(io.mmio_read(IOWIN, 4));
+    io.mmio_write(IOREGSEL, 4, low + 1);
+    lo | u64::from(io.mmio_read(IOWIN, 4)) << 32
+}
+
+/// Pin `pin`'s interrupt sent, a local APIC taking it or not (`took`), the
+/// pins asserted being `up`: a level-triggered entry's remote IRR set after
+/// exactly when one was taken -- now, or before and not yet ended -- and the
+/// pin among those to send again (`untaken`) exactly when, asserted and
+/// unmasked, none was. Set as it was made, a level nobody took left its pin
+/// dead for good: no EOI was coming.
+fn ioapic_send(io: &mut IoApic, pin: usize, took: bool, up: u32) {
+    const DELIVERY_FIXED: u64 = 0;
+    const DELIVERY_LOWEST: u64 = 1;
+    const REMOTE_IRR: u64 = 1 << 14;
+    const LEVEL: u64 = 1 << 15;
+    const MASKED: u64 = 1 << 16;
+    if pin >= ioapic::PINS {
+        io.send(pin, &mut |_| took);
+        return;
+    }
+    let before = ioapic_entry(io, pin);
+    io.send(pin, &mut |_| took);
+    let after = ioapic_entry(io, pin);
+    let level = before & LEVEL != 0 && matches!((before >> 8) & 0x7, DELIVERY_FIXED | DELIVERY_LOWEST);
+    if !level {
+        return;
+    }
+    let held = took || before & REMOTE_IRR != 0;
+    invariant!((after & REMOTE_IRR != 0) == held, "pin {}'s level sent, {} -- its remote IRR {} after, {} before",
+               pin, if took { "taken" } else { "taken by none" }, after & REMOTE_IRR != 0, before & REMOTE_IRR != 0);
+    let bit = 1u32 << pin;
+    let pending = up & bit != 0 && before & MASKED == 0 && !held;
+    invariant!((io.untaken() & bit != 0) == pending, "pin {} is {}among those to send again, {} up, masked {}, \
+               remote IRR {}", pin, if pending { "not " } else { "" }, if up & bit != 0 { "held" } else { "not" },
+               before & MASKED != 0, held);
 }
 
 fn msi(r: &mut Input) {
