@@ -116,13 +116,20 @@ pub fn microcode_revision() -> u32 {
     if vendor_id() != *b"GenuineIntel" || __cpuid(1).ecx & LEAF1_ECX_HYPERVISOR != 0 {
         return 0;
     }
-    // SAFETY: every Intel CPU since the P6 has IA32_BIOS_SIGN_ID, and the
-    // protocol writes it 0 before the CPUID that loads the revision into it
-    // -- the write changes nothing but what the next read returns.
-    unsafe { wrmsr(MSR_BIOS_SIGN_ID, 0) };
-    let _ = __cpuid(1);
-    // SAFETY: as above.
-    (unsafe { rdmsr(MSR_BIOS_SIGN_ID) } >> 32) as u32
+    /* The three on one CPU, with interrupts and preemption off between:
+     * moved after the write, the CPUID ran on another CPU and the read
+     * came back 0 -- a guest told microcode revision 0, which on a Raptor
+     * Lake turns its PCIDs off. */
+    kcore::cpu::with_interrupts_off(|_| {
+        // SAFETY: every Intel CPU since the P6 has IA32_BIOS_SIGN_ID, and
+        // the protocol writes it 0 before the CPUID that loads the revision
+        // into it -- the write changes nothing but what the next read
+        // returns.
+        unsafe { wrmsr(MSR_BIOS_SIGN_ID, 0) };
+        let _ = __cpuid(1);
+        // SAFETY: as above.
+        (unsafe { rdmsr(MSR_BIOS_SIGN_ID) } >> 32) as u32
+    })
 }
 
 /// # Safety

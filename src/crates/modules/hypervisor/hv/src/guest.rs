@@ -734,6 +734,13 @@ pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
             gpa, rip),
         Stop::Mmio { gpa, rip } => write!(out,
             "a touch of guest physical {:#x}, no memory and no device there, rip {:#x}", gpa, rip),
+        Stop::StringIo { port, input, rip } => write!(out,
+            "an {} of port {:#x} at rip {:#x}: string port I/O, which nothing here emulates",
+            if input { "INS" } else { "OUTS" }, port, rip),
+        Stop::MmioDelivering { gpa, rip } => write!(out,
+            "the CPU's own touch of a device's page at guest physical {:#x} as it delivered an interrupt or an \
+             exception, rip {:#x} -- a stack or an IDT put on the APIC's or the IO-APIC's page: no instruction \
+             to perform", gpa, rip),
         Stop::Shutdown { rip } => write!(out, "triple fault at {:#x}", rip),
         Stop::Reset { port, value, rip } => write!(out, "the guest asked for a reset, {:#04x} to port {:#x} ({}), at {:#x}",
             value, port, hv::run::reset_source(port), rip),

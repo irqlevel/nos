@@ -50,6 +50,8 @@ const DR6_BS: u64 = 1 << 14;
 const RFLAGS_TF: u64 = 1 << 8;
 const VECTOR_DB: u64 = 1;
 const DR7_RESET: u64 = 0x400;
+/// DR7's general-detect bit, which a CPU clears as it enters a #DB handler.
+const DR7_GD: u64 = 1 << 13;
 /// How many debug registers an exit code can name a `mov` of, each way.
 const DEBUG_REGS: u64 = 16;
 /// A real-mode segment's limit: 64 KiB.
@@ -767,6 +769,16 @@ impl Vcpu {
     /// the VMCB as it took the exit, and it goes back in from there.
     pub fn reflect_exception(&mut self, vector: u8, error: Option<u32>) {
         use vmcb::event;
+        /* A CPU entering its #DB handler clears DR7.GD; an event injected
+         * through EVENTINJ does not, so it is done here, as VT-x's side
+         * does: left set, the handler's own first access of a debug
+         * register raised a #DB of its own. */
+        if u64::from(vector) == VECTOR_DB {
+            let dr7 = self.save().dr7;
+            if dr7 & DR7_GD != 0 {
+                self.save_mut().dr7 = dr7 & !DR7_GD;
+            }
+        }
         let code = error.map_or(0, |e| event::ERROR_VALID | (u64::from(e) << event::ERROR_SHIFT));
         self.guest.vmcb_mut().control.event_inj = event::VALID | event::TYPE_EXCEPTION | code | u64::from(vector);
     }

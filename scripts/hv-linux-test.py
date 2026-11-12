@@ -285,7 +285,7 @@ def vm_commands(args):
     flood_console = "hv console %d bytes=200" % fv
     flood_stop = "hv stop %d secs=0" % fv
     flood_lines = [flood_start, flood_ready, FLOOD_BEFORE, flood_send, flood_wait, FLOOD_AFTER,
-                   flood_console, flood_stop]
+                   flood_console, flood_stop, flood_log(fv)]
     # A VM kept in a folder (`modules/hypervisor/hv/src/store.rs`): /vms/t0/vm.toml
     # written by hv create -- and not written over -- started by its name,
     # which every command then takes, refused a second time while it is on
@@ -614,6 +614,14 @@ FLOOD_AFTER = "dmesg 1 flood-after"
 DMESG_SLOTS = 2048
 
 
+def flood_log(fv):
+    """The log's lines of the flooding guest, read as soon as it stops: read
+    at the end of rc, with everything the VM phase logs after it, dmesg's
+    1024 lines held a few seconds of the flood -- two of its notices, where
+    the checks want three."""
+    return "dmesg hvvm%d|" % fv
+
+
 def flood_vm(args):
     """The flooding guest's number: after the lost-input guest and the six
     starts of the claim checks, each of which takes a number."""
@@ -644,7 +652,7 @@ def flood_checks(args, secs):
              took < FLOOD_LINES // 2, "%d lines at most" % took)
 
     # The log's lines from the guest, oldest first, each with its time.
-    log = output_of(secs, RC_LOG, 0) or ""
+    log = output_of(secs, flood_log(fv), 0) or ""
     lines = re.findall(r"(?m)^\d+:(\d+\.\d+):.*?hvvm%d\| (.*?)\s*$" % fv, log)
     checked, wrong, told_at, too_soon = 0, [], None, []
     left = last = said = said_at = None

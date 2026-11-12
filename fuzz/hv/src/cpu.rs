@@ -25,6 +25,7 @@ pub enum Error {
     BadAddress,
     NoUnrestrictedGuest,
     NoHugePages,
+    CommandLineTooLong,
 }
 
 impl core::fmt::Display for Error {

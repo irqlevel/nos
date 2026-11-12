@@ -108,21 +108,22 @@ The split is the point, and it is measurable:
 
 ```
 $ scripts/unsafe-count.py hv hvarch
-hv         1917 lines     3 blocks    0 unsafe fn    0 unsafe impl  = 3
-hvarch     1991 lines    40 blocks   13 unsafe fn    1 unsafe impl  = 54
+hv        26087 lines     4 blocks    0 unsafe fn    0 unsafe impl  = 4
+hvarch     8362 lines   197 blocks   46 unsafe fn    1 unsafe impl  = 244
 ```
 
 The long-term goal of this kernel is other people's Linux guests on this
 machine, and the bug class that goal cannot survive is a guest reaching host
 memory. So the line is drawn once, in the crate graph, where a script can
-count it rather than a reviewer having to remember it. The three sites in
+count it rather than a reviewer having to remember it. The four sites in
 `hv` are the two calls into `hvarch` from the IPI handlers that turn the
-extension on and off, and the one call that enters a guest (`Vm::enter`),
-whose two preconditions are invariants of types in `hv` rather than
-promises at the call: guest memory owns every page its nested table maps,
-and the machine never names a host save area that has been freed. Guest
-memory, the nested page table, the VMCB's policy, the exit decoder and the
-guests above them -- 1450 lines -- have none.
+extension on and off (`machine.rs`), and the call that enters a guest, one
+per backend (`svm.rs`, `vmx.rs`), whose two preconditions are invariants of
+types in `hv` rather than promises at the call: guest memory owns every
+page its nested table maps, and the machine never names a host save area
+that has been freed. Guest memory, the nested page tables, the policy, the
+decoders, the emulated devices and the run loop -- the rest of its
+twenty-six thousand lines -- have none.
 
 ## AMD-V first, Intel VT-x second
 
@@ -968,7 +969,7 @@ mode:
 | `apicv` | on the machine of `ioapic`, its first CPU's local APIC taken to x2APIC mode by the base MSR: with CR8 at 5 sends itself 0x50 and 0x30 and reads both in IRR; with CR8 at 0 takes 0x50, then 0x30, whose handler sends itself 0x70 and takes it nested, each handler reading ISR; then the serial port's pin through the IO-APIC as a level, three times, each ended by the x2APIC's EOI; and ISR read whole at the end | the same to the guest whoever delivers its interrupts: under VT-x with APIC virtualization the CPU delivers all six and takes their EOIs, stopping the guest after the three level-triggered ones for the IO-APIC; elsewhere the host injects them ([Interrupts the CPU delivers itself](#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)) |
 | `pveoi` | on the machine of `apicv`, its interrupts the host's to inject on either backend, KVM's PV EOI turned on with its word at 0x7100, each handler ending its interrupt as Linux's does -- the word's bit cleared if set, the EOI register written if not: a self-IPI 0x50 alone; 0x30, whose handler takes 0x70 nested and reads ISR in it; ISR read whole; PV EOI turned off and 0x50 once more | 0x50 and 0x70 ended through the word, each EOI the host's at the next exit -- 0x70's at the exit of 0x30's own EOI by the register, done before it -- the word not set while 0x70 waited in IRR nor after PV EOI went off, nothing left in service: two EOIs through the word, two by the register ([KVM's paravirtual interface](#kvms-paravirtual-interface-as-far-as-it-is-backed)) |
 | `kgs` | on the machine of `smp`, its first CPU alone running: puts one value in KERNEL_GS_BASE and another in the GS base, stops for a CPUID, runs `swapgs`, writes 64 times each a fixed IPI to the CPU that never started and its TSC deadline, runs `swapgs` again and reads both | the two bases as its `swapgs` left them, after writes the world switch answered itself (`hvarch::x86::fast`) -- under VT-x, whose entries load KERNEL_GS_BASE from a list, an entry past one loaded the value of the last full exit and undid the guest's `swapgs`; and at least one write answered there, or nothing was looked at |
-| `cache` | on the machine of `ioapic`, its first CPU alone running: sets CR0.CD and CR0.NW, reads CR0 back and halts with both left set | what it wrote read back, and neither bit in any host CPU's own CR0 after it: a VM exit does not put the host's CD and NW back, so under VT-x a guest's write let through left the host's CPU with its caches not filling for good -- the two are in the CR0 guest/host mask now and never in the CR0 a guest runs with (`hvarch::x86::vmx::CR0_CACHE_BITS`) |
+| `cache` | on the machine of `ioapic`, its first CPU alone running: sets CR0.CD and CR0.NW, reads CR0 back and halts with both left set | what it wrote read back, and neither bit in any host CPU's own CR0 after it: a VM exit does not put the host's CD and NW back, so under VT-x a guest's write let through left the host's CPU with its caches not filling for good -- the two are in the CR0 guest/host mask now and never in the CR0 a guest runs with (`hvarch::x86::vmx::CR0_CACHE_BITS`). Under AMD-V the exit puts the host's CR0 back whole, but while the guest runs its CD is the CPU's: a guest can make its own core -- and the sibling thread, its own or its disks' -- slow at will. Not closed yet: it wants CR0's write intercepted and its reads while CD or NW is set, as KVM has it, and QEMU's TCG -- the AMD-V this is tested under -- takes every CR read for a CR0 read |
 | `instr` | one CPU, through the run loop a Linux guest's go through, with #UD and #DB handlers of its own: runs RSM, then INVD, then sets TF and runs a CPUID | RSM the #UD a CPU outside SMM gives -- under AMD-V, which stops the guest at it, the host's to give; it was an exit nothing answered, and a user process's `rsm` stopped its whole VM -- and INVD stepped past under both, the host's dirty lines kept; both named by the backends (`hv::exit::Instr`), not by one extension's number; and the single step's #DB after the CPUID, DR6.BS set, which the CPU never raises for an instruction that exited and the host now does after every one it steps past -- a debugger's `stepi` over a CPUID once landed an instruction late |
 | `debug` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: sets TF with POPFQ and single-steps a NOP, then runs an ICEBP (`int1`) | each a #DB of the guest's own -- intercepted for the delivery loops a guest could make of it -- given back to its handler, the single step's with DR6.BS -- under VT-x, which writes no DR6 at a #DB that exits, the DR6 its exit said, and every `mov` of DR6 the host's |
 | `avx` | on the machine of `smp`, both CPUs on the one host CPU the guests run on, taking turns by IPI: each turns its local APIC on, runs an XSETBV with CR4.OSXSAVE clear, sets OSFXSR, OSXMMEXCPT and OSXSAVE, runs five XSETBVs a CPU refuses and its own, of the x87, SSE and AVX, reads leaf 1, leaf 0xD's first three subleaves and leaf 7, stores YMM0-15, and loads an x87 control word, an MXCSR and a pattern of its own into YMM0-15; then 64 turns each, a turn its peer's IPI, every one checking all of them against what it left and loading the pattern one more | YMM0-15 zero as each CPU starts, though the other's pattern was in the CPU's registers; its YMM registers, MXCSR and control word as it left them at every turn, put back by the host each time the other had had the CPU -- 64 times each at least; XSAVE and AVX offered, OSXSAVE as CR4 has it, XCR0 1 out of reset and 7 after its own; the XSETBV with OSXSAVE clear a #UD -- the CPU's own under VT-x, the host's under QEMU's TCG, whose intercept comes first -- and the five a #GP each; leaf 0xD's sizes 576 and 832, AVX's component at 576, no XSAVES |
@@ -1479,8 +1480,9 @@ here:
   three components, its sizes for the guest's own XCR0; XSAVEOPT, XSAVEC
   and XGETBV's ECX 1 as the host has them, never XSAVES -- and no AVX-512,
   AMX, whose state nothing switches; PKU where the CPU has it, the guest's
-  PKRU switched with it, and OSPKE as its CR4.PKE has it; no
-  paravirtualisation; the
+  PKRU switched with it, and OSPKE as its CR4.PKE has it; of
+  paravirtualisation KVM's signature, NOP_IO_DELAY and PV EOI alone ([KVM's
+  paravirtual interface](#kvms-paravirtual-interface-as-far-as-it-is-backed)); the
   speculation controls the host has -- IBRS and IBPB, STIBP, SSBD, and
   Intel's PSFD, IPRED_DIS, RRSBA_DIS, DDPD_U and BHI_DIS_S, AMD's PSFD and
   SBPB -- with IA32_SPEC_CTRL and IA32_PRED_CMD the guest's own ([What the
@@ -1523,7 +1525,8 @@ here:
   and off) and the machine-check registers (no banks, nothing to report),
   which leaf 1 offers and Linux reads with no fallback for a fault -- a
   fault on a machine-check register is a panic to it -- the microcode
-  revision, none, and of each vendor what Linux reads of every such CPU
+  revision, the host's on Intel (by which Linux keeps PCID on a Raptor Lake
+  whose microcode has the fix) and none elsewhere, and of each vendor what Linux reads of every such CPU
   without asking: Intel's platform ID and MISC_ENABLE, its fast strings as
   the host has them; ARCH_CAPABILITIES where leaf 7 offers it, read-only;
   AMD's HWCR, DE_CFG and NB_CFG, with the bits a Linux
@@ -3195,8 +3198,10 @@ button and evdev.)
   ([The IO-APIC](#the-io-apic)). The MP table is still there: a kernel with
   ACPI finds its CPUs in the MADT, one without in the MP table, and both
   are told the same.
-- **The DSDT** is the one table in AML, and small: `\_S5`, and the PCI host
-  bridge. The bridge has to be there. A Linux with ACPI finds PCI through
+- **The DSDT** is the one table in AML, and small: `\_S5`, the PCI host
+  bridge, and the panic device `PEVT` (`QEMU0001`, its port) when the VM
+  has one ([A guest that panics](#a-guest-that-panics-pvpanic)) -- which the listing below, of a
+  VM without, leaves out. The bridge has to be there. A Linux with ACPI finds PCI through
   the namespace alone and never probes the bus -- `pci_legacy_init` is not
   even called -- so without one the guest would have no disks and no NICs.
   Its `_CRS` gives bus 0-255, the configuration ports, the I/O either side
@@ -3818,7 +3823,9 @@ each CPU its APIC ID in EBX[31:24]; leaf 6 says the timer keeps running in
 deep C-states (ARAT), which is true of one counted off the host's clock; and
 where the host's own leaf 0x15 gives its TSC's frequency -- an Intel host's
 does -- the guest's gives the timer's clock, a crystal of 1 GHz, and the
-TSC's ratio to it, so a kernel need not measure either. Passed through, the
+TSC's ratio to it -- what a kernel reads when it is not told the TSC's rate
+on its command line (`tsc_early_khz=`, which the module gives a Linux guest
+and Linux then takes over the leaf). Passed through, the
 leaf would name the host's crystal, tens of MHz, and a kernel that took the
 timer's rate from it would have its timer fire tens of times too soon;
 where the host has no frequency to give, the leaf is blank and the kernel
@@ -4249,11 +4256,13 @@ frames dropped a gigabyte. A guest of one CPU has no APIC, and keeps the
 
 ### What it does not do yet
 
-- **The first CPU's task does every device's work.** Between its guest's
-  turns it serves a disk's answer and a NIC's frames, with or without an
-  IO-APIC; only the interrupts that follow go where the guest steers them
-  -- through MSI-X, and with `ioapic` the PIT's and the serial port's too.
-  Without one, those two reach the first CPU only.
+- **The first CPU's task does most of the devices' work.** Between its
+  guest's turns it serves a NIC's frames and the chipset's devices, with or
+  without an IO-APIC -- a disk's own task hands over its completions and
+  posts their MSI-X itself (`LinuxGuest::serve_disk`); only the interrupts
+  that follow go where the guest steers them -- through MSI-X, and with
+  `ioapic` the PIT's and the serial port's too. Without one, those two
+  reach the first CPU only.
 - **Neither an MP table nor ACPI, one CPU.** A kernel built with neither
   `X86_MPPARSE` nor ACPI finds one CPU.
 
@@ -5047,13 +5056,13 @@ someone else's; then speed.
    as is every leaf past the tops it reports, 0x16 and 0x8000_0021; of
    leaf 6 a guest is told ARAT alone, of 0x80000008 the address widths,
    CLZERO, the FP error pointers and two attacks the CPU is not open to, of
-   0x80000021 what is true of the silicon and asks nothing of the host. No
-   speculation control is offered -- none has its MSR behind it yet (item 1)
-   -- nor INVLPGB or AutoIBRS; the hypervisor bit is set. An MSR the policy
+   0x80000021 what is true of the silicon and asks nothing of the host. The
+   speculation controls are offered now, their MSRs behind them (item 1);
+   not INVLPGB nor AutoIBRS; the hypervisor bit is set. An MSR the policy
    does not name is a #GP both ways; what it names is the guest's own
    state, the TSC, or a constant that takes a write leaving it as it is and
    refuses any other: the MTRRs off, machine checks with no banks, the
-   microcode revision none, and of each vendor what Linux reads of every
+   microcode revision -- the host's on Intel, none elsewhere -- and of each vendor what Linux reads of every
    such CPU without asking. The guest's own state takes what the CPU would:
    a PAT entry that is no memory type, an address that is not canonical
    and an EFER bit the CPUID does not offer (FFXSR) are #GPs, where they were

@@ -21,38 +21,31 @@ pub const FC_VMXON_IN_SMX: u64 = 1 << 1;
 pub const FC_VMXON: u64 = 1 << 2;
 
 pub const MSR_VMX_BASIC: u32 = 0x480;
-pub const MSR_VMX_PROCBASED_CTLS: u32 = 0x482;
 pub const MSR_VMX_CR0_FIXED0: u32 = 0x486;
 pub const MSR_VMX_CR0_FIXED1: u32 = 0x487;
 pub const MSR_VMX_CR4_FIXED0: u32 = 0x488;
 pub const MSR_VMX_CR4_FIXED1: u32 = 0x489;
-pub const MSR_VMX_PROCBASED_CTLS2: u32 = 0x48B;
 pub const MSR_VMX_EPT_VPID_CAP: u32 = 0x48C;
 
 pub const CR4_VMXE: u64 = 1 << 13;
 
-/// The primary processor-based control that says the secondary ones exist:
-/// without it `IA32_VMX_PROCBASED_CTLS2` must not even be read.
-pub const PROC_SECONDARY_CTLS: u32 = 1 << 31;
-
-pub const SEC_EPT: u32 = 1 << 1;
-pub const SEC_ENABLE_RDTSCP: u32 = 1 << 3;
-pub const SEC_VIRTUALIZE_X2APIC: u32 = 1 << 4;
-pub const SEC_VPID: u32 = 1 << 5;
-pub const SEC_UNRESTRICTED_GUEST: u32 = 1 << 7;
-pub const SEC_VIRTUAL_INTR_DELIVERY: u32 = 1 << 9;
-pub const SEC_ENABLE_INVPCID: u32 = 1 << 12;
-
-/// The primary control the two above are built on: CR8 and the virtual
-/// APIC's task priority in a page of the guest's own.
-pub const PROC_TPR_SHADOW: u32 = 1 << 21;
-
-/// The pin-based control that takes a posted interrupt into the guest
-/// without an exit, and the VM-exit control it needs.
-pub const PIN_POSTED_INTERRUPTS: u32 = 1 << 7;
-pub const EXIT_ACK_INTR_ON_EXIT: u32 = 1 << 15;
-const MSR_VMX_PINBASED: u32 = 0x481;
-const MSR_VMX_EXIT: u32 = 0x483;
+/* The controls and the capability MSRs `Caps` asks the CPU for, under the
+ * names it reads them by: one definition each, `vmcs`'s, which
+ * `decide_controls` reads by its own. Two copies once held them, and a bit
+ * corrected in one would have had `Caps` promise what `decide_controls`
+ * then refused. */
+pub use vmcs::{EXIT_ACK_INTR_ON_EXIT, MSR_VMX_PROCBASED_CTLS, MSR_VMX_PROCBASED_CTLS2, PIN_POSTED_INTERRUPTS,
+               PROC_SECONDARY_CTLS};
+pub use vmcs::PROC2_ENABLE_EPT as SEC_EPT;
+pub use vmcs::PROC2_ENABLE_INVPCID as SEC_ENABLE_INVPCID;
+pub use vmcs::PROC2_ENABLE_RDTSCP as SEC_ENABLE_RDTSCP;
+pub use vmcs::PROC2_ENABLE_VPID as SEC_VPID;
+pub use vmcs::PROC2_UNRESTRICTED_GUEST as SEC_UNRESTRICTED_GUEST;
+pub use vmcs::PROC2_VIRTUAL_INTR_DELIVERY as SEC_VIRTUAL_INTR_DELIVERY;
+pub use vmcs::PROC2_VIRTUALIZE_X2APIC as SEC_VIRTUALIZE_X2APIC;
+pub use vmcs::PROC_USE_TPR_SHADOW as PROC_TPR_SHADOW;
+use vmcs::MSR_VMX_EXIT_CTLS as MSR_VMX_EXIT;
+use vmcs::MSR_VMX_PINBASED_CTLS as MSR_VMX_PINBASED;
 
 /* IA32_VMX_EPT_VPID_CAP: INVEPT and INVVPID are there, and which of their
  * types. */
@@ -539,9 +532,6 @@ const EFER_LMA: u64 = 1 << 10;
 
 /// CR4.LA57: five levels of paging (see [`NotRun::FiveLevelPaging`]).
 const CR4_LA57: u64 = 1 << 12;
-/// CR4.VMXE, which VMX forces set in the guest's CR0/CR4 fixed bits even
-/// though the guest is told it has no VMX: masked so the guest reads 0.
-const CR4_VMXE_BIT: u64 = 1 << 13;
 /// CR4.MCE: a machine check an exception, not a shutdown. With it clear in
 /// the CR4 a guest runs with, a machine check while it ran would be a
 /// shutdown -- the guest's triple fault, as the exit has it -- and the host
@@ -549,8 +539,10 @@ const CR4_VMXE_BIT: u64 = 1 << 13;
 const CR4_MCE: u64 = 1 << 6;
 /// The CR4 bits the host keeps whatever is asked of [`Guest::new`]: in its
 /// guest/host mask -- a `mov` that would change one of them exits -- and
-/// set in the register, the guest reading the read shadow's instead.
-const CR4_HOST_KEEPS: u64 = CR4_MCE | CR4_VMXE_BIT;
+/// set in the register, the guest reading the read shadow's instead. MCE,
+/// above; and VMXE, which VMX forces set in the guest's CR4 though the guest
+/// is told it has no VMX: masked, so the guest reads 0.
+const CR4_HOST_KEEPS: u64 = CR4_MCE | CR4_VMXE;
 /// CR0.NW and CR0.CD: the cache's write-through and its fill turned off. A
 /// VM exit puts neither back from the host-state field (SDM vol. 3C,
 /// "Loading Host Control Registers": CR0's ET, CD and NW are not modified):
@@ -636,7 +628,10 @@ struct Gpr {
 /// The host state the CPU restores on a VM exit, as this CPU has it now:
 /// captured on the CPU the entry runs on, because every field of it is that
 /// CPU's own -- its GS base is where its per-CPU data is, its TR its own
-/// task register. Written into the VMCS host area before the entry.
+/// task register. Written into the VMCS host area before the entry. What
+/// an exit does not restore: the GDTR's and IDTR's limits, which it leaves
+/// at 0xFFFF, and the LDTR, left null -- of no consequence in a kernel with
+/// no user mode and no LDT, and reloaded by nothing here.
 struct HostRegs {
     cr0: u64,
     cr3: u64,
@@ -747,10 +742,6 @@ impl HostRegs {
     }
 }
 
-/// A guest's CPU as VT-x keeps it: one VMCS, a shadow of the guest state
-/// that policy above reads and writes as though it were a VMCB's save area
-/// (`Save`), the registers the launch stub moves, and the x87, SSE and AVX
-/// state and XCR0, which `vmlaunch` does not switch.
 /// The MSRs the CPU switches around a guest through the VM-entry and VM-exit
 /// load lists, because they are not VMCS fields and a guest that ran with the
 /// host's would be catastrophic: `SYSCALL` jumps to the host's `LSTAR`, and
@@ -850,6 +841,10 @@ struct Synced {
     entry_ctls: u32,
 }
 
+/// A guest's CPU as VT-x keeps it: one VMCS, a shadow of the guest state
+/// that policy above reads and writes as though it were a VMCB's save area
+/// (`Save`), the registers the launch stub moves, and the x87, SSE and AVX
+/// state and XCR0, which `vmlaunch` does not switch.
 pub struct Guest {
     vmcs: vmcs::VmcsPage,
     /// One page holding the VM-entry MSR-load list (the guest's values of
@@ -1226,6 +1221,12 @@ impl Guest {
     pub fn mark_full_sync(&mut self) {
         self.full_sync = true;
         self.whole_state = true;
+        /* CR0, CR3, CR4 and EFER are rewritten by VMWRITE, which flushes
+         * nothing as the instructions would: what the TLB cached under the
+         * guest's VPID goes with them here, rather than at each caller's
+         * memory -- a reset of a guest that has run, made without it, ran
+         * on the last boot's translations. */
+        self.flush_vpid = true;
     }
 
     /// Set the guest's RSP, which the guest otherwise keeps in the VMCS
@@ -1697,6 +1698,12 @@ impl Guest {
             vmwrite(PROC_BASED_CTLS, self.proc1 as u64);
             vmwrite(PROC_BASED_CTLS2, self.proc2 as u64);
             vmwrite(VMEXIT_CTLS, self.exit_ctls as u64);
+            /* No event to inject until one is set, said rather than left to
+             * the page's zero fill: a VMCS field nobody wrote holds whatever
+             * it held, the region's layout being the CPU's own. */
+            vmwrite(VMENTRY_INTR_INFO, 0);
+            vmwrite(VMENTRY_EXCEPTION_ERRCODE, 0);
+            vmwrite(VMENTRY_INSTRUCTION_LEN, 0);
             /* VMENTRY_CTLS the first entry writes, from the guest's EFER. */
             /* Intercept #DB, #AC and #MC always -- the same delivery-loop
              * denial-of-service the AMD side guards against -- over whatever
@@ -2146,23 +2153,31 @@ impl Guest {
             /* An idle guest halts with interrupts on, waiting for the timer;
              * one that halts with them off has stopped for good, and is
              * dumped -- so read the heavy state only for the latter. */
-            const IF: u64 = 1 << 9;
-            return self.save.rflags & IF == 0;
+            return self.save.rflags & RFLAGS_IF == 0;
         }
+        /* Every exit a running guest makes in the ordinary way: a host's
+         * NMI or an exception given back to the guest (each `profile`
+         * sample, every single step under a guest's debugger), an EOI of a
+         * level vector, the instructions stepped past -- once all read the
+         * heavy state, some 45 VMREADs, each an exit of its own under a
+         * nested hypervisor. One that does stop the guest has it read on
+         * demand before the dump (`read_whole_state`). */
         !matches!(
             basic,
             r::IO_INSTRUCTION | r::CPUID | r::RDMSR | r::WRMSR
                 | r::EXTERNAL_INTERRUPT | r::INIT | r::SIPI | r::NMI_WINDOW
                 | r::INTERRUPT_WINDOW | r::VMCALL | r::PAUSE | r::RDTSC | r::RDPMC
                 | r::CR_ACCESS | r::DR_ACCESS | r::EPT_VIOLATION
+                | r::EXCEPTION_NMI | r::EOI_INDUCED | r::XSETBV | r::WBINVD | r::RDTSCP
+                | r::MONITOR | r::MWAIT | r::INVD | r::TPR_BELOW_THRESHOLD
         )
     }
 
-    /// Read the exit information the decoder needs, after an exit.
+    /// Read the exit information the decoder needs, after an exit whose
+    /// reason the entry loop has read into `exit_reason` already.
     unsafe fn read_exit(&mut self) {
         use vmcs::reason as r;
         use vmcs::*;
-        self.exit_reason = unsafe { vmread(EXIT_REASON) } as u32;
         let basic = self.exit_reason & r::BASIC_MASK;
         /* What the decoder reads of an exit depends on the exit, and the
          * frequent ones need little: the host's interrupt nothing, an
@@ -2601,7 +2616,16 @@ impl Guest {
             if failed != 0 {
                 break (failed, t3, t4);
             }
-            self.launched.store(true, Ordering::Release);
+            /* Launched only by an entry that reached the guest: one that
+             * failed after its checks -- bad guest state, an MSR load, a
+             * machine check, reason bit 31 -- leaves the launch state clear,
+             * and a VMRESUME of it would fail on its own (error 5). The
+             * reason read once, here, for the fast path and `read_exit`. */
+            let reason = unsafe { vmcs::vmread(vmcs::EXIT_REASON) } as u32;
+            self.exit_reason = reason;
+            if reason & vmcs::reason::ENTRY_FAILURE == 0 {
+                self.launched.store(true, Ordering::Release);
+            }
             let Some(f) = fast.as_deref_mut() else { break (0, t3, t4) };
             /* A WRMSR, past which nothing is owed; or a HLT with interrupts
              * on and nothing waiting in the virtual APIC, where posted
@@ -2609,7 +2633,6 @@ impl Guest {
              * single-step, whose #DB after the instruction is the run loop's
              * to give, and the HLT not with a window asked for, which means
              * the run loop has something waiting to inject. */
-            let reason = unsafe { vmcs::vmread(vmcs::EXIT_REASON) } as u32;
             let rflags = unsafe { vmcs::vmread(vmcs::GUEST_RFLAGS) };
             if rflags & RFLAGS_TF != 0 {
                 break (0, t3, t4);
@@ -2666,7 +2689,10 @@ impl Guest {
         if let Some(k) = kick { k.left(); }
         let t5 = stamp(timed);
 
-        /* The event, if any, was delivered on entry: not again. */
+        /* The event, if any, was delivered on entry: not again. An entry
+         * that failed -- VMfail, or an entry-failure exit -- did not deliver
+         * it, and leaves its valid bit in the VMCS: the guest stops on
+         * either (`Exit::Invalid`, `NotRun`), and is not entered again. */
         self.inject = 0;
 
         self.save.rax = gpr.rax;
@@ -2684,6 +2710,15 @@ impl Guest {
             self.exit_reason = vmcs::reason::WRMSR;
             unsafe { self.read_guest_state() };
             self.read_stored_kernel_gs_base();
+            /* The guest has moved on past the answered exits: the whole
+             * state read before them, and the last slow exit's words, are
+             * no longer its -- a stop's report would print the boot's CR0
+             * and segments as current, which `read_whole_state` says never
+             * happens. */
+            self.whole_state = false;
+            self.exit_instr_len = 0;
+            self.exit_qual = 0;
+            self.host_vector = None;
             return Err(NotRun::Kicked { cpu });
         }
         if failed != 0 {
@@ -2733,6 +2768,13 @@ impl Guest {
                 } else if self.exit_intr_info & vmcs::intr::VECTOR_MASK == VECTOR_MC {
                     unsafe { core::arch::asm!("int 0x12") };
                 }
+            }
+            /* A machine check during the entry itself -- basic reason 41,
+             * an entry failure -- was not delivered either: raised the
+             * same way, to the handler that treats one as fatal, rather
+             * than read as a guest refused (KVM's kvm_machine_check). */
+            if self.exit_reason & vmcs::reason::BASIC_MASK == vmcs::reason::ENTRY_FAIL_MACHINE_CHECK {
+                unsafe { core::arch::asm!("int 0x12") };
             }
         }
         if let Some(p) = self.profile.as_mut() {

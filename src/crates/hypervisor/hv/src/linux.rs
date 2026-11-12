@@ -62,8 +62,11 @@ const HDR_LEN_AT: usize = 0x201;
 const BOOT_FLAG: u16 = 0xAA55;
 /// `header`, "HdrS": what says the boot protocol is 2.00 or newer.
 const HEADER_MAGIC: u32 = 0x5372_6448;
-/// The oldest protocol with a 64-bit entry and a relocatable kernel.
-const MIN_VERSION: u16 = 0x0205;
+/// The oldest protocol every field read here is in: `cmdline_size` is
+/// 2.06's, `pref_address` and `init_size` 2.10's, and the 64-bit entry's
+/// flag in `xloadflags` 2.12's. 2.05 was the floor once, and an older
+/// header passed by its bytes at 0x236 reading zero.
+const MIN_VERSION: u16 = 0x020C;
 /// `xloadflags` bit 0: the kernel has a 64-bit entry point.
 const XLF_KERNEL_64: u16 = 1 << 0;
 /// `loadflags` bit 0: the protected-mode kernel is loaded high (at 1 MiB or
@@ -402,8 +405,11 @@ pub fn build(
     pci: &[Route],
     ioapic: bool,
 ) -> Result<()> {
-    if cmdline.len() >= CMDLINE_MAX || cmdline.len() as u32 >= header.cmdline_size {
-        return Err(Error::BadAddress);
+    /* `cmdline_size` is the most characters, the terminating zero not
+     * counted: a line of exactly that many is the kernel's to take. A line
+     * too long is said as one, not as a bad address. */
+    if cmdline.len() >= CMDLINE_MAX || cmdline.len() > header.cmdline_size as usize {
+        return Err(Error::CommandLineTooLong);
     }
 
     /* The zero page: a clean page, then the header copied in where it sits,

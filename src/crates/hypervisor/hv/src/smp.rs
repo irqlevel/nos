@@ -181,10 +181,14 @@ impl Doorbells {
     }
 }
 
-/* A start-up IPI waiting, as the mailbox keeps it: the vector, and a bit so
- * that vector 0 is a message too. */
+/* An INIT and a start-up IPI waiting, as the mailbox keeps them, in one
+ * word: the start-up IPI's vector, a bit so that vector 0 is a message too,
+ * and the INIT's bit. One word, so that a take is one swap of it -- with
+ * two, one of the two orders of a post against a take was always open: a
+ * start-up IPI sent before an INIT could be taken after it. */
 const SIPI_PENDING: u32 = 1 << 8;
 const SIPI_VECTOR: u32 = 0xFF;
+const INIT_PENDING: u32 = 1 << 9;
 
 /// What other CPUs have sent one CPU and it has not yet taken: fixed
 /// interrupts, a bit a vector, and which of them an IO-APIC's
@@ -192,13 +196,17 @@ const SIPI_VECTOR: u32 = 0xFF;
 /// Written by any of the guest's CPUs at once, read by its own, all
 /// lock-free.
 pub struct Mailbox {
-    fixed: [AtomicU64; 4],
-    /// Level-triggered, among `fixed`: set before its `fixed` bit, and taken
-    /// only with it (`take`).
+    /// Edge-triggered fixed interrupts, a bit a vector.
+    edge: [AtomicU64; 4],
+    /// Level-triggered ones -- an IO-APIC's level pin -- in a bitmap of their
+    /// own: each a `fetch_or` to post and a `swap` to take, with nothing
+    /// held between the two words. Kept as a subset of one shared word, a
+    /// level bit could go with an earlier edge post of its vector and the
+    /// vector be handed on as edge-triggered.
     level: [AtomicU64; 4],
     nmi: AtomicBool,
-    init: AtomicBool,
-    sipi: AtomicU32,
+    /// The INIT and the start-up IPI (`INIT_PENDING`, `SIPI_PENDING`).
+    start: AtomicU32,
 }
 
 /// What a CPU took out of its mailbox.
@@ -221,25 +229,20 @@ impl Mail {
 impl Mailbox {
     pub const fn new() -> Mailbox {
         Mailbox {
-            fixed: [const { AtomicU64::new(0) }; 4],
+            edge: [const { AtomicU64::new(0) }; 4],
             level: [const { AtomicU64::new(0) }; 4],
             nmi: AtomicBool::new(false),
-            init: AtomicBool::new(false),
-            sipi: AtomicU32::new(0),
+            start: AtomicU32::new(0),
         }
     }
 
     pub fn post_fixed(&self, vector: u8) {
-        self.fixed[usize::from(vector / 64)].fetch_or(1 << (vector % 64), Ordering::AcqRel);
+        self.edge[usize::from(vector / 64)].fetch_or(1 << (vector % 64), Ordering::AcqRel);
     }
 
-    /// A fixed interrupt from a level-triggered pin: its level bit first,
-    /// then its fixed one -- so that whoever takes the fixed bit finds the
-    /// level bit set already.
+    /// A fixed interrupt from a level-triggered pin.
     pub fn post_level(&self, vector: u8) {
-        let (w, bit) = (usize::from(vector / 64), 1u64 << (vector % 64));
-        self.level[w].fetch_or(bit, Ordering::AcqRel);
-        self.fixed[w].fetch_or(bit, Ordering::AcqRel);
+        self.level[usize::from(vector / 64)].fetch_or(1 << (vector % 64), Ordering::AcqRel);
     }
 
     pub fn post_nmi(&self) {
@@ -247,58 +250,60 @@ impl Mailbox {
     }
 
     /// An INIT: it forgets any start-up IPI sent before it, which a CPU
-    /// that was not waiting for one when it came ignored.
+    /// that was not waiting for one when it came ignored -- one store of
+    /// the word, the INIT's bit alone.
     pub fn post_init(&self) {
-        self.sipi.store(0, Ordering::Release);
-        self.init.store(true, Ordering::Release);
+        self.start.store(INIT_PENDING, Ordering::Release);
     }
 
+    /// A start-up IPI, in place of any sent before it and beside an INIT
+    /// that waits: the INIT's bit kept.
     pub fn post_sipi(&self, vector: u8) {
-        self.sipi.store(SIPI_PENDING | u32::from(vector), Ordering::Release);
+        let sipi = SIPI_PENDING | u32::from(vector);
+        let mut old = self.start.load(Ordering::Acquire);
+        loop {
+            match self.start.compare_exchange_weak(old, (old & INIT_PENDING) | sipi, Ordering::AcqRel,
+                                                   Ordering::Acquire) {
+                Ok(_) => break,
+                Err(now) => old = now,
+            }
+        }
     }
 
     /// Whether anything waits in it, taken out or not: what a CPU going to
     /// sleep looks at after it has said so (`crate::run`).
     pub fn has_mail(&self) -> bool {
-        self.sipi.load(Ordering::Acquire) != 0
-            || self.init.load(Ordering::Acquire)
+        self.start.load(Ordering::Acquire) != 0
             || self.nmi.load(Ordering::Acquire)
-            || self.fixed.iter().any(|w| w.load(Ordering::Acquire) != 0)
+            || self.edge.iter().any(|w| w.load(Ordering::Acquire) != 0)
+            || self.level.iter().any(|w| w.load(Ordering::Acquire) != 0)
     }
 
     /// Everything posted so far, taken out. What a CPU does with it is in
     /// the order a real one would: the INIT first -- it resets the CPU --
     /// and then the start-up IPI it waits for; a start-up IPI posted before
-    /// the INIT was forgotten by `post_init`.
-    ///
-    /// The start-up IPI is taken before the INIT, the reverse of the order
-    /// they are posted in: an INIT and a start-up IPI posted between the two
-    /// swaps then leave the start-up IPI for the next take, after the INIT
-    /// it follows -- where the other order would take the start-up IPI now,
-    /// to a CPU not yet waiting for one, and lose it.
+    /// the INIT was forgotten by `post_init`, and one posted after it is
+    /// taken with it, to be honoured after it. Each word one swap, nothing
+    /// to order between two.
     pub fn take(&self) -> Mail {
-        let sipi = self.sipi.swap(0, Ordering::AcqRel);
-        let init = self.init.swap(false, Ordering::AcqRel);
+        let start = self.start.swap(0, Ordering::AcqRel);
         let mut fixed = [0u64; 4];
         let mut level = [0u64; 4];
-        for (w, word) in self.fixed.iter().enumerate() {
-            /* A look before the swap: most of the time there is nothing,
+        for w in 0..4 {
+            /* A look before each swap: most of the time there is nothing,
              * and a load leaves the line shared where a swap would take it. */
-            if word.load(Ordering::Acquire) != 0 {
-                fixed[w] = word.swap(0, Ordering::AcqRel);
-                /* The level bits of the vectors taken, and only theirs: a
-                 * level bit whose fixed bit is not in yet -- posted between
-                 * the swap and here -- stays, for the take that finds its
-                 * fixed bit, and does not go as a level with no interrupt. */
-                level[w] = self.level[w].fetch_and(!fixed[w], Ordering::AcqRel) & fixed[w];
-            }
+            let edge = if self.edge[w].load(Ordering::Acquire) != 0 { self.edge[w].swap(0, Ordering::AcqRel) } else { 0 };
+            level[w] = if self.level[w].load(Ordering::Acquire) != 0 { self.level[w].swap(0, Ordering::AcqRel) } else { 0 };
+            /* A vector posted both ways before this take is taken once, as
+             * the level one: what needs its end of interrupt said */
+            fixed[w] = edge | level[w];
         }
         Mail {
             fixed,
             level,
             nmi: self.nmi.swap(false, Ordering::AcqRel),
-            init,
-            sipi: (sipi & SIPI_PENDING != 0).then_some((sipi & SIPI_VECTOR) as u8),
+            init: start & INIT_PENDING != 0,
+            sipi: (start & SIPI_PENDING != 0).then_some((start & SIPI_VECTOR) as u8),
         }
     }
 }
