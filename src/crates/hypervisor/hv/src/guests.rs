@@ -310,7 +310,7 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
             Exit::Exception { vector, error } => break Stop::Exception { vector, error, rip },
             Exit::MachineCheck => break Stop::MachineCheck { rip },
             Exit::Invalid => break Stop::Invalid,
-            Exit::Cr8 { write, gpr } => {
+            Exit::Cr8 { write, gpr: Some(gpr) } => {
                 vm.vcpu_mut().cr8_access(write, gpr);
                 run.cr8 += 1;
             }
@@ -2657,27 +2657,40 @@ fn check_debug(m: &GuestMemory, stopped: &Stopped) -> core::result::Result<Strin
 
 /* ---- instr: instructions both extensions stop a guest at, answered ---- */
 
-/* The instr guest: one CPU, with an IDT of its own and a #UD handler that
- * keeps where it faulted, counts, and returns past the two-byte RSM. It runs
- * RSM -- any CPL's to run, and a #UD outside SMM, where every guest is --
- * and INVD, which would throw away the host's dirty lines with the guest's.
- * Each is an intercept, or under VT-x an exit whatever the controls say,
- * and each was once an exit no arm answered: RSM from a user process
- * stopped its whole VM under AMD-V, and INVD from the guest's kernel under
- * both. Now RSM is the #UD a CPU gives and INVD is stepped past, as KVM
- * steps past it. The output of `nasm -f bin`, `bits 64` and `org 0x8000`. */
+/* The instr guest: one CPU, with an IDT of its own: a #UD handler that
+ * keeps where it faulted, counts, and returns past the two-byte RSM, and a
+ * #DB handler that keeps DR6 and where it returns to, counts, and clears TF
+ * in its frame. It runs RSM -- any CPL's to run, and a #UD outside SMM,
+ * where every guest is -- and INVD, which would throw away the host's dirty
+ * lines with the guest's; each is an intercept, or under VT-x an exit
+ * whatever the controls say, and each was once an exit no arm answered: RSM
+ * from a user process stopped its whole VM under AMD-V, and INVD from the
+ * guest's kernel under both. Now RSM is the #UD a CPU gives and INVD is
+ * stepped past, as KVM steps past it. Then TF, by POPFQ, over a CPUID: an
+ * exit the host performs, whose single step's #DB the CPU never raises, and
+ * the host has to -- after the CPUID, DR6.BS set; it once raised none, and
+ * a debugger's `stepi` over a CPUID landed one instruction late. The output
+ * of `nasm -f bin`, `bits 64` and `org 0x8000`. */
 const INSTR_NAME: &str = "instr";
-const INSTR_ABOUT: &str = "RSM and INVD, which both extensions stop a guest at: the #UD a CPU gives for the first, \
-                           and the second stepped past";
+const INSTR_ABOUT: &str = "RSM and INVD, which both extensions stop a guest at, and a single step over a CPUID: the \
+                           #UD a CPU gives for the first, the second stepped past, and the step's #DB after the third";
 
 const INSTR_CODE: &[u8] = &[
-    0x48, 0x8D, 0x05, 0x4A, 0x00, 0x00, 0x00,               // start: lea rax, [rel ud] ; gate 6, #UD
-    0xBF, 0x60, 0xA0, 0x00, 0x00,                           // mov edi, IDT_BASE + 6 * 16 ; 0xA060
-    0xE8, 0x1A, 0x00, 0x00, 0x00,                           // call gate
-    0x0F, 0x01, 0x1D, 0x57, 0x00, 0x00, 0x00,               // lidt [rel idtr]
-    0x0F, 0xAA,                                             // 18: rsm_at: rsm ; outside SMM: #UD, at any CPL -- the host's to give
-    0x0F, 0x08,                                             // 1a: invd ; the host's dirty lines: stepped past, not run
-    0xC7, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,               // mov dword [abs INSTR_DONE], 0x52534E49 ; 0x7010, "INSR"
+    0x48, 0x8D, 0x05, 0x69, 0x00, 0x00, 0x00,               // start: lea rax, [rel ud] ; gate 6, #UD
+    0xBF, 0x60, 0xA0, 0x00, 0x00,                           // mov edi, IDT_BASE + 6 * 16
+    0xE8, 0x39, 0x00, 0x00, 0x00,                           // call gate
+    0x48, 0x8D, 0x05, 0x76, 0x00, 0x00, 0x00,               // lea rax, [rel db] ; gate 1, #DB
+    0xBF, 0x10, 0xA0, 0x00, 0x00,                           // mov edi, IDT_BASE + 1 * 16
+    0xE8, 0x28, 0x00, 0x00, 0x00,                           // call gate
+    0x0F, 0x01, 0x1D, 0x91, 0x00, 0x00, 0x00,               // lidt [rel idtr]
+    0x0F, 0xAA,                                             // 29: rsm_at: rsm ; outside SMM: #UD, at any CPL -- the host's to give
+    0x0F, 0x08,                                             // invd ; the host's dirty lines: stepped past, not run
+    0x31, 0xC0,                                             // xor eax, eax
+    0x9C,                                                   // pushfq
+    0x48, 0x81, 0x0C, 0x24, 0x00, 0x01, 0x00, 0x00,         // or qword [rsp], 0x100 ; TF: a trap after the next instruction
+    0x9D,                                                   // popfq
+    0x0F, 0xA2,                                             // 39: cpuid ; performed by the host: its single step the host's to give
+    0xC7, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,               // 3b: after: mov dword [abs INSTR_DONE], 0x52534E49 ; "INSR"
     0x49, 0x4E, 0x53, 0x52,
     0xFA,                                                   // cli
     0xF4,                                                   // .dead: hlt
@@ -2693,23 +2706,38 @@ const INSTR_CODE: &[u8] = &[
     0xC3,                                                   // ret
     0x50,                                                   // ud: push rax
     0x48, 0x8B, 0x44, 0x24, 0x08,                           // mov rax, [rsp + 8] ; where it faulted
-    0x48, 0x89, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00,         // mov [abs INSTR_AT], rax ; 0x7008
-    0xFF, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // inc dword [abs INSTR_COUNT] ; 0x7000
+    0x48, 0x89, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00,         // mov [abs INSTR_AT], rax
+    0xFF, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // inc dword [abs INSTR_COUNT]
     0x48, 0x83, 0x44, 0x24, 0x08, 0x02,                     // add qword [rsp + 8], 2 ; past the rsm
+    0x58,                                                   // pop rax
+    0x48, 0xCF,                                             // iretq
+    0x50,                                                   // db: push rax
+    0x0F, 0x21, 0xF0,                                       // mov rax, dr6
+    0x48, 0x89, 0x04, 0x25, 0x28, 0x70, 0x00, 0x00,         // mov [abs INSTR_DR6], rax
+    0x48, 0x8B, 0x44, 0x24, 0x08,                           // mov rax, [rsp + 8] ; where it returns to
+    0x48, 0x89, 0x04, 0x25, 0x20, 0x70, 0x00, 0x00,         // mov [abs INSTR_DB_AT], rax
+    0xFF, 0x04, 0x25, 0x18, 0x70, 0x00, 0x00,               // inc dword [abs INSTR_DBS]
+    0x48, 0x81, 0x64, 0x24, 0x18, 0xFF, 0xFE, 0xFF, 0xFF,   // and qword [rsp + 24], ~0x100 ; TF off in the frame
     0x58,                                                   // pop rax
     0x48, 0xCF,                                             // iretq
     0x6F, 0x00,                                             // idtr: dw 7 * 16 - 1 ; gates 0-6
     0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // dq IDT_BASE
 ];
 
-/// What it leaves at `RESULTS`: the #UDs its handler took, where the last
-/// was, and its mark once at its end.
+/// What it leaves at `RESULTS`: the #UDs its handler took and where the
+/// last was, its mark once at its end, and the #DBs its handler took, where
+/// the last returned to and the DR6 it read.
 const INSTR_COUNT: u64 = RESULTS;
 const INSTR_AT: u64 = RESULTS + 0x8;
 const INSTR_DONE: u64 = RESULTS + 0x10;
+const INSTR_DBS: u64 = RESULTS + 0x18;
+const INSTR_DB_AT: u64 = RESULTS + 0x20;
+const INSTR_DR6: u64 = RESULTS + 0x28;
 const INSTR_MARK: u32 = u32::from_le_bytes(*b"INSR");
-/// Where its RSM is.
-const INSTR_RSM_AT: u64 = ENTRY + 0x18;
+/// Where its RSM is, and where the instruction after its CPUID.
+const INSTR_RSM_AT: u64 = ENTRY + 0x29;
+const INSTR_AFTER_CPUID: u64 = ENTRY + 0x3B;
+const INSTR_DR6_BS: u64 = 1 << 14;
 
 const INSTR_GUEST: OneCpuGuest = OneCpuGuest { name: INSTR_NAME, about: INSTR_ABOUT, code: INSTR_CODE, check: check_instr };
 
@@ -2732,8 +2760,15 @@ fn check_instr(m: &GuestMemory, stopped: &Stopped, counts: &Counts) -> core::res
         return Err(alloc::format!("the host gave {} #UDs and stepped past {} WBINVDs and INVDs, not at most 1 and 1",
                                   counts.ud, counts.wbinvd));
     }
-    Ok(alloc::format!("its RSM a #UD of its own handler's, at the RSM -- {}; its INVD stepped past, and it ran on \
-                       to its halt", if counts.ud == 1 { "the host's to give" } else { "the CPU's own" }))
+    let (dbs, db_at, dr6) = (read(INSTR_DBS)? as u32, read(INSTR_DB_AT)?, read(INSTR_DR6)?);
+    if dbs != 1 || db_at != INSTR_AFTER_CPUID || dr6 & INSTR_DR6_BS == 0 {
+        return Err(alloc::format!("its #DB handler ran {} times, the last returning to {:#x} with DR6 {:#x}: wanted \
+                                   once, after the CPUID it single-stepped at {:#x}, with BS -- the step's #DB the \
+                                   host owed it", dbs, db_at, dr6, INSTR_AFTER_CPUID));
+    }
+    Ok(alloc::format!("its RSM a #UD of its own handler's, at the RSM -- {}; its INVD stepped past; its single step \
+                       over a CPUID a #DB after it, DR6.BS set; and it ran on to its halt",
+                      if counts.ud == 1 { "the host's to give" } else { "the CPU's own" }))
 }
 
 /* ---- dr: a guest's DR0-DR3 its own ---- */
@@ -4323,6 +4358,11 @@ fn run_spec_vm(machine: &Arc<Machine>, word: u64) -> core::result::Result<SpecRu
     let Some(mut bsp) = cpus.pop() else { return Err(String::from("no CPU")) };
     let m = guest.memory();
     one_cpu_board(m, &mut bsp, SPEC_CODE).and_then(|_| m.write_obj(SG_WORD, &word)).map_err(made)?;
+    /* What its entries ran under read off the CPU, not what was meant */
+    match bsp.backend_mut() {
+        Backend::Svm(v) => v.msrs_mut().measure(),
+        Backend::Vmx(v) => v.msrs_mut().measure(),
+    }
     let start = time::boot_time_ns();
     let deadline = start.saturating_add(SPEC_BUDGET_MS * kcore::consts::NS_PER_MS);
     let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
@@ -4354,9 +4394,15 @@ fn run_spec_vm(machine: &Arc<Machine>, word: u64) -> core::result::Result<SpecRu
 fn run_spec_guest(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", SPEC_NAME, SPEC_ABOUT);
     let controls = hvarch::x86::spec::guest_controls();
-    let word = if controls.spec_ctrl != 0 { controls.spec_ctrl } else { SG_NONE_OFFERED };
+    /* Every control for vm A, the lowest one alone for vm B: B under A's
+     * bits shows where the two are not one. */
+    let words = if controls.spec_ctrl != 0 {
+        [controls.spec_ctrl, controls.spec_ctrl & controls.spec_ctrl.wrapping_neg()]
+    } else {
+        [SG_NONE_OFFERED; 2]
+    };
     let mut runs = alloc::vec::Vec::new();
-    for _ in 0..2 {
+    for word in words {
         match run_spec_vm(machine, word) {
             Ok(run) => {
                 if let GuestStop::Refused(Refusal::NotOn(cpu)) = run.stopped.stop {
@@ -4388,7 +4434,7 @@ fn run_spec_guest(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let _ = describe_stop(&b.stopped.stop, &mut says_b);
     let _ = writeln!(out, "  stopped    vm A {}; vm B {}", says_a, says_b);
 
-    match check_spec(a, b, controls, word) {
+    match check_spec(a, b, controls, words) {
         Ok(checked) => {
             let _ = writeln!(out, "  checked    {}", checked);
             let _ = writeln!(out, "hv: guest {} ok", SPEC_NAME);
@@ -4416,7 +4462,7 @@ fn run_spec_guest(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
 /// its next entry; a read of PRED_CMD and its bit 1 a #GP each, and where
 /// neither MSR is offered every access to it a #GP; and the run loop saw
 /// every RDMSR and WRMSR.
-fn check_spec(a: &SpecRun, b: &SpecRun, controls: hvarch::x86::spec::Controls, word: u64)
+fn check_spec(a: &SpecRun, b: &SpecRun, controls: hvarch::x86::spec::Controls, words: [u64; 2])
     -> core::result::Result<String, String>
 {
     let spec_ctrl = controls.spec_ctrl != 0;
@@ -4425,13 +4471,13 @@ fn check_spec(a: &SpecRun, b: &SpecRun, controls: hvarch::x86::spec::Controls, w
     if a.cpu.is_none() || a.cpu != b.cpu {
         return Err(alloc::format!("the VMs ran on {:?} and {:?}: not one CPU", a.cpu, b.cpu));
     }
-    let vms = [("A", a), ("B", b)];
-    for (name, run) in vms {
+    let vms = [("A", a, words[0]), ("B", b, words[1])];
+    for (name, run, _) in vms {
         if !matches!(run.stopped.stop, GuestStop::Halted { .. }) || run.done != SG_MARK {
             return Err(alloc::format!("vm {} did not run to its halt: its mark is {:#x}", name, run.done));
         }
     }
-    for (name, run) in vms {
+    for (name, run, _) in vms {
         if run.told != controls {
             return Err(alloc::format!("vm {}'s CPUID promised SPEC_CTRL {:#x} and PRED_CMD {:#x}: wanted {:#x} and \
                                        {:#x}, what the host switches", name, run.told.spec_ctrl,
@@ -4440,14 +4486,14 @@ fn check_spec(a: &SpecRun, b: &SpecRun, controls: hvarch::x86::spec::Controls, w
     }
     /* What each was to see first -- 0 where the other had left its own --
      * before the rest. */
-    for (name, run) in vms {
+    for (name, run, _) in vms {
         let s = &run.slots;
         if s[SG_FIRST + 1] != fault(spec_ctrl) || (spec_ctrl && s[SG_FIRST] != 0) {
             return Err(alloc::format!("vm {}'s SPEC_CTRL as it started read {:#x} with fault {}: wanted 0, fault {}",
                                       name, s[SG_FIRST], s[SG_FIRST + 1], fault(spec_ctrl)));
         }
     }
-    for (name, run) in vms {
+    for (name, run, word) in vms {
         let s = &run.slots;
         /* A read that does not fault reads its value back; one that faults
          * has none to read. */
@@ -4463,16 +4509,17 @@ fn check_spec(a: &SpecRun, b: &SpecRun, controls: hvarch::x86::spec::Controls, w
                                       s[SG_AFTER_BAD + 1]));
         }
     }
-    for (name, run) in vms {
+    for (name, run, word) in vms {
         let host = hvarch::x86::spec::host_spec_ctrl();
         let want = host.map(|h| h | if spec_ctrl { word } else { 0 });
         if run.ran_with != want || run.held != host.map(|_| true) {
-            return Err(alloc::format!("vm {}'s last entry ran under SPEC_CTRL {:x?} and the CPU's after it was the \
-                                       host's: {:x?} -- wanted {:x?}, the host's {:x?} with its own over it, and \
-                                       the host's alone after", name, run.ran_with, run.held, want, host));
+            return Err(alloc::format!("vm {}'s last entry ran under SPEC_CTRL {:x?}, read off the CPU, and the CPU's \
+                                       after it was the host's: {:x?} -- wanted {:x?}, the host's {:x?} with its own \
+                                       over it, and the host's alone after", name, run.ran_with, run.held, want,
+                                      host));
         }
     }
-    for (name, run) in vms {
+    for (name, run, _) in vms {
         let s = &run.slots;
         let ibpbs = &s[SG_IBPBS..SG_IBPBS + SG_IBPBS_ASKED as usize];
         let asked = if ibpb { SG_IBPBS_ASKED } else { 0 };
@@ -4485,7 +4532,7 @@ fn check_spec(a: &SpecRun, b: &SpecRun, controls: hvarch::x86::spec::Controls, w
                                       s[SG_PRED_BAD], fault(ibpb), asked));
         }
     }
-    for (name, run) in vms {
+    for (name, run, _) in vms {
         let c = &run.counts;
         /* SPEC_CTRL's write with bit 62 -- or where it is not offered all
          * five of its accesses -- PRED_CMD's read and bit 1, and its IBPBs
@@ -4501,10 +4548,11 @@ fn check_spec(a: &SpecRun, b: &SpecRun, controls: hvarch::x86::spec::Controls, w
         (false, false) => String::from("no speculation control offered, as the CPU has none: every access to \
                                         SPEC_CTRL and PRED_CMD a #GP"),
         _ => alloc::format!("SPEC_CTRL {:#x} and PRED_CMD {:#x} offered, as the host switches them; vm B read \
-                             SPEC_CTRL as 0 where vm A had left {:#x}, each read back its own and ran under it over \
-                             the host's, bit 62 refused, the CPU's the host's alone after; {} IBPBs asked each, all \
-                             answered before the next entry; PRED_CMD's read and bit 1 a #GP",
-                            controls.spec_ctrl, controls.pred_cmd, word, if ibpb { SG_IBPBS_ASKED } else { 0 }),
+                             SPEC_CTRL as 0 where vm A had left {:#x}, each read back its own ({:#x} and {:#x}) and \
+                             ran under it over the host's, as read off the CPU, bit 62 refused, the CPU's the host's \
+                             alone after; {} IBPBs asked each, all answered before the next entry; PRED_CMD's read \
+                             and bit 1 a #GP", controls.spec_ctrl, controls.pred_cmd, words[0], words[0], words[1],
+                            if ibpb { SG_IBPBS_ASKED } else { 0 }),
     })
 }
 

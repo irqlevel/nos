@@ -354,7 +354,7 @@ GUESTS = {
     # RSM, any CPL's, once stopped its whole VM under AMD-V, and INVD the
     # guest's kernel's under both: a #UD of its own, and stepped past.
     "instr": [r"its RSM a #UD of its own handler's, at the RSM -- (?:the host's to give|the CPU's own); its INVD "
-              r"stepped past, and it ran on to its halt"],
+              r"stepped past; its single step over a CPUID a #DB after it, DR6.BS set; and it ran on to its halt"],
     # Its reads are stopped and answered by the host -- 11 accesses
     # performed -- except on QEMU's TCG, which checks a read of CR4 against
     # CR0's intercept and so never stops one: 5, its writes. The guest's own
@@ -383,9 +383,9 @@ GUESTS = {
     # against it below (`check_controls`).
     "spec": [r"(?:no speculation control offered, as the CPU has none: every access to SPEC_CTRL and PRED_CMD a #GP"
              r"|SPEC_CTRL 0x[0-9a-f]+ and PRED_CMD 0x[0-9a-f]+ offered, as the host switches them; vm B read "
-             r"SPEC_CTRL as 0 where vm A had left 0x[0-9a-f]+, each read back its own and ran under it over the "
-             r"host's, bit 62 refused, the CPU's the host's alone after; [03] IBPBs asked each, all answered before "
-             r"the next entry; PRED_CMD's read and bit 1 a #GP)",
+             r"SPEC_CTRL as 0 where vm A had left 0x[0-9a-f]+, each read back its own \(0x[0-9a-f]+ and 0x[0-9a-f]+\) "
+             r"and ran under it over the host's, as read off the CPU, bit 62 refused, the CPU's the host's alone "
+             r"after; [03] IBPBs asked each, all answered before the next entry; PRED_CMD's read and bit 1 a #GP)",
              r"\b4 and 4 rdmsr, 6 and 6 wrmsr"],
     # Two VMs, one after the other on the CPU the guests run on: the second
     # must read 0 where the first left its own, and each one's breakpoint,

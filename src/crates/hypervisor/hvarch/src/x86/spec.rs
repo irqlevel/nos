@@ -53,6 +53,12 @@
 //!   and 2 a `ret` on the other thread may then be predicted from what this
 //!   one left in the return stack (SMT_RSB) -- idled in the host, after the
 //!   exit's refill, it left only the host's.
+//! - DE_CFG's FP backup fix while the extension is on, on a Zen 2 (the
+//!   AX41) whose microcode predates AMD's Zenbleed fix: otherwise a guest
+//!   reads, at any privilege, what the sibling thread and the guest before
+//!   it moved through the upper halves of the vector registers -- Linux's
+//!   answer for old microcode (`zen2_zenbleed_check`). Not under a
+//!   hypervisor, whose CPU it is to close.
 //!
 //! Under VT-x, decided for each CPU as the extension is turned on there,
 //! from what CPUID and IA32_ARCH_CAPABILITIES say of it:
@@ -154,6 +160,17 @@ const FAMILY_ZEN: u32 = 0x17;
 const FAMILY_HYGON: u32 = 0x18;
 const MSR_EFER: u32 = 0xC000_0080;
 const EFER_AIBRSE: u64 = 1 << 21;
+/// CPUID 1 EAX's model, the base one in bits 7:4 and the extended one in
+/// bits 19:16 above it; and ECX's hypervisor bit.
+const MODEL_SHIFT: u32 = 4;
+const EXT_MODEL_SHIFT: u32 = 16;
+const MODEL_MASK: u32 = 0xF;
+const LEAF1_ECX_HYPERVISOR: u32 = 1 << 31;
+/// AMD's patch level -- the microcode revision -- and DE_CFG, whose bit 9
+/// keeps Zen 2's vector registers from Zenbleed (CVE-2023-20593).
+const MSR_AMD_PATCH_LEVEL: u32 = 0x8B;
+const MSR_AMD_DE_CFG: u32 = 0xC001_1029;
+const DE_CFG_ZEN2_FP_BACKUP_FIX: u64 = 1 << 9;
 /// CPUID 7: the structured features -- subleaf 0's EBX and EDX, subleaf 2's
 /// EDX, and in subleaf 0's EAX the last subleaf there is.
 const LEAF_STRUCTURED: u32 = 7;
@@ -352,6 +369,15 @@ pub struct Amd {
     /// Virtual SPEC_CTRL: a guest's IA32_SPEC_CTRL goes in through its
     /// VMCB, which `vmrun` loads it from whatever the MSR holds.
     pub v_spec_ctrl: bool,
+    /// Open to Zenbleed (CVE-2023-20593): a Zen 2 whose microcode predates
+    /// AMD's fix, where code at any privilege -- a guest's -- reads what the
+    /// sibling thread and the guest before moved through the upper halves
+    /// of the vector registers. Not decided under a hypervisor, whose CPU
+    /// it is to close.
+    pub zenbleed: bool,
+    /// DE_CFG's FP backup fix set by `on`, closing it -- Linux's answer for
+    /// old microcode (`zen2_zenbleed_check`).
+    pub zenbleed_fix: bool,
 }
 
 /// What [`on`] did on a CPU, to undo, what that CPU's entries do, and the
@@ -359,6 +385,8 @@ pub struct Amd {
 pub(super) struct State {
     /// EFER.AIBRSE was set here.
     auto_ibrs: bool,
+    /// DE_CFG's FP backup fix was set here (Zenbleed).
+    fp_backup_fix: bool,
     /// IA32_SPEC_CTRL as it was, to put back, where `on` changed it.
     spec_ctrl_was: Option<u64>,
     /// IA32_SPEC_CTRL as the host has it while the extension is on -- what
@@ -380,6 +408,7 @@ pub(super) struct State {
 impl ConstInit for State {
     const INIT: Self = State {
         auto_ibrs: false,
+        fp_backup_fix: false,
         spec_ctrl_was: None,
         host: None,
         loaded: 0,
@@ -394,6 +423,8 @@ impl ConstInit for State {
             srso_open: false,
             smt_open: false,
             v_spec_ctrl: false,
+            zenbleed: false,
+            zenbleed_fix: false,
         },
         last: None,
     };
@@ -445,8 +476,37 @@ fn amd_decide() -> (Amd, u64) {
         srso_open: srso && !(ibpb && brtype),
         smt_open: smt && !stibp,
         v_spec_ctrl: cpu::cpuid(LEAF_SVM).is_some_and(|r| r.edx & super::svm::V_SPEC_CTRL != 0),
+        zenbleed: amd && zenbleed_open(family),
+        zenbleed_fix: false,
     };
     (decided, if stibp { SPEC_CTRL_STIBP } else { 0 })
+}
+
+/// Whether the AMD CPU this runs on, of `family`, is a Zen 2 whose
+/// microcode predates the Zenbleed fix -- AMD's revisions as Linux has them
+/// (`cpu_has_zenbleed_microcode`); a Zen 2 model it has none for is taken
+/// for open. Never under a hypervisor, as Linux has it: the CPU is the
+/// outer host's to close, and DE_CFG the outer host's to refuse.
+fn zenbleed_open(family: u32) -> bool {
+    let Some(r) = cpu::cpuid(LEAF_FEATURES) else { return false };
+    if family != FAMILY_ZEN || r.ecx & LEAF1_ECX_HYPERVISOR != 0 {
+        return false;
+    }
+    let model = ((r.eax >> MODEL_SHIFT) & MODEL_MASK) | (((r.eax >> EXT_MODEL_SHIFT) & MODEL_MASK) << 4);
+    let fixed_at: u32 = match model {
+        0x30..=0x3F => 0x0830_107B,
+        0x60..=0x67 => 0x0860_010C,
+        0x68..=0x6F => 0x0860_8107,
+        0x70..=0x7F => 0x0870_1033,
+        0xA0..=0xAF => 0x08A0_0009,
+        /* Zen 2 with no revision known here: taken for open */
+        0x40..=0x4F | 0x90..=0x91 => u32::MAX,
+        /* Zen 1 and Zen+: not Zen 2 */
+        _ => return false,
+    };
+    /* Every family 17h part has the patch level MSR. */
+    let revision = unsafe { cpu::rdmsr(MSR_AMD_PATCH_LEVEL) } as u32;
+    revision < fixed_at
 }
 
 /// What the CPU this runs on is to have under VT-x, from what it says of
@@ -518,6 +578,17 @@ pub unsafe fn on(intel: bool) {
             s.host = Some(value);
             s.loaded = value;
         }
+        /* Zenbleed on a Zen 2 with old microcode: DE_CFG's FP backup fix,
+         * Linux's answer, while the extension is on. */
+        if !intel && s.amd.zenbleed {
+            /* DE_CFG is on every family 17h part, which `zenbleed` is. */
+            let de_cfg = unsafe { cpu::rdmsr(MSR_AMD_DE_CFG) };
+            if de_cfg & DE_CFG_ZEN2_FP_BACKUP_FIX == 0 {
+                unsafe { cpu::wrmsr(MSR_AMD_DE_CFG, de_cfg | DE_CFG_ZEN2_FP_BACKUP_FIX) };
+                s.fp_backup_fix = true;
+            }
+            s.amd.zenbleed_fix = true;
+        }
         if intel || !has_auto_ibrs() {
             return;
         }
@@ -538,6 +609,11 @@ pub unsafe fn on(intel: bool) {
 pub unsafe fn off() {
     ENTRIES.with(|e, _| {
         let s = &mut e.spec;
+        if core::mem::take(&mut s.fp_backup_fix) {
+            /* Set by `on`, on a part that has the MSR. */
+            let de_cfg = unsafe { cpu::rdmsr(MSR_AMD_DE_CFG) };
+            unsafe { cpu::wrmsr(MSR_AMD_DE_CFG, de_cfg & !DE_CFG_ZEN2_FP_BACKUP_FIX) };
+        }
         if core::mem::take(&mut s.auto_ibrs) {
             let efer = unsafe { cpu::rdmsr(MSR_EFER) };
             unsafe { cpu::wrmsr(MSR_EFER, efer & !EFER_AIBRSE) };
@@ -600,6 +676,14 @@ impl State {
             self.loaded = value;
         }
         Some(value)
+    }
+
+    /// IA32_SPEC_CTRL as the CPU holds it, read: for a check that wants what
+    /// an entry is to run under, not what was meant (`GuestMsrs::measure`).
+    /// None where the CPU has none.
+    pub(super) fn read_spec_ctrl(&self) -> Option<u64> {
+        /* The MSR is there: `host` is Some only where `on` read it. */
+        self.host.map(|_| unsafe { cpu::rdmsr(MSR_SPEC_CTRL) })
     }
 
     /// Where the CPU has virtual SPEC_CTRL, the value a guest's VMCB is to

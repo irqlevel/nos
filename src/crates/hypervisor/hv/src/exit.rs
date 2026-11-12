@@ -58,8 +58,11 @@ pub enum Exit {
     /// with general-purpose register `gpr` (numbered as the encoding does:
     /// RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8-R15). VT-x stops the guest
     /// there, since the real CR8 is the host's; AMD-V gives the guest a
-    /// shadow of its own and never exits.
-    Cr8 { write: bool, gpr: u8 },
+    /// shadow of its own, and stops it at a write only while an interrupt
+    /// the task priority alone holds waits (`request_tpr_window`) -- its
+    /// exit naming no register, the instruction decoded for it (`gpr`
+    /// None), as for [`Exit::Cr4`].
+    Cr8 { write: bool, gpr: Option<u8> },
     /// A `mov` to CR0, or an `lmsw`, that changes a bit VT-x keeps for the
     /// host -- PG, PE, NE -- with `value` what CR0 would become (the whole
     /// register named, or for `lmsw` its low four bits over CR0's). AMD-V

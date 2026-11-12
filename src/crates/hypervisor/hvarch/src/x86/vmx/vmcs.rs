@@ -401,6 +401,9 @@ pub mod reason {
     pub const MWAIT: u32 = 36;
     pub const MONITOR: u32 = 39;
     pub const PAUSE: u32 = 40;
+    /// The guest's VTPR, written under the TPR shadow, dropped below the
+    /// TPR threshold: trap-like, after the write.
+    pub const TPR_BELOW_THRESHOLD: u32 = 43;
     pub const ENTRY_FAIL_MACHINE_CHECK: u32 = 41;
     /// An EOI virtualized of a vector the EOI-exit bitmap names, after the
     /// CPU has taken it out of VISR: trap-like, its vector in the
