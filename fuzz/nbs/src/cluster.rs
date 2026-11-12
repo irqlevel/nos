@@ -670,9 +670,25 @@ impl World {
                 Out::Send { to: To::Cs(cs), id, bytes } => {
                     let Some(h) = self.host_of_cs(cs) else { return Err(format!("a request to cs {}, none", cs)) };
                     /* A write of a chain (N13): its head, or one of its
-                       replicas sent it directly, its chain slow */
+                       replicas sent it directly -- its chain slow, or the
+                       write alone, which goes to each replica directly. A
+                       write the session has alone -- its only one not done,
+                       or none of its own but the reconcile's -- begins no
+                       chain (N13c) */
                     if let Some((_, Some(relay))) = Request::decode_relayed(&bytes) {
-                        self.count(if relay.next.is_empty() { "a chain's writes sent directly" } else { "chains begun" });
+                        let writes = self.clients[c].ops.values().filter(|o| matches!(o.kind, K::Write(_))).count();
+                        if !relay.next.is_empty() && writes <= 1 {
+                            return Err(format!("client {} began a chain with write #{} to cs {}, the only write it \
+                                                had out: one alone goes to each replica directly -- {}", c, id, cs,
+                                               self.clients[c].s.report()));
+                        }
+                        self.count(if !relay.next.is_empty() {
+                            "chains begun"
+                        } else if writes <= 1 {
+                            "writes alone sent to each replica directly"
+                        } else {
+                            "a chain's writes sent directly"
+                        });
                     }
                     unmarked(self.clients[c].s.chains(), &bytes, &format!("client {}", c), id, cs)?;
                     if let (Some(g), Some(r)) = (self.clients[c].failed_write_gen, Request::decode(&bytes)) {
@@ -3454,6 +3470,63 @@ impl World {
         Ok(true)
     }
 
+    /// A write starved of memory past its deadline (N13c): every request of
+    /// it made finds none, so that it reaches no replica, and fails at its
+    /// deadline -- its replicas not apart, which the session's attach anew
+    /// is for: it goes on at its generation, and once its memory is back a
+    /// write of the block is done and read back. Attached anew for it, a
+    /// reconcile could wait for what held the write -- a stuck join -- and
+    /// fail the session (seed 1960 of N13c's campaign, the race lost to the
+    /// next change: aimed here). Drawn of `r`.
+    fn starved_past_deadline(&mut self, r: &mut Rng) -> Result<bool, String> {
+        let Some(c) = self.current() else { return Ok(false) };
+        let idle = |w: &World, c: usize| w.clients[c].ops.is_empty() || !w.serving(c);
+        self.drive(c, &|w, c| {
+            w.serving(c) || w.clients[c].zombie || matches!(w.clients[c].s.phase(), Phase::Failed(_) | Phase::Detached)
+        })?;
+        self.drive(c, &idle)?;
+        if !self.serving(c) || self.down.is_some() || !self.quiet()? || !self.serving(c) {
+            return Ok(false);
+        }
+        let blocks = VOLUME_MIB << 20 >> 12;
+        let first = r.below(blocks - 4);
+        let (anew, generation, failed) = (self.clients[c].anew, self.clients[c].s.generation(), self.clients[c].failed);
+        let until = self.now + DEADLINE_NS + 5_000 * MS;
+        self.clients[c].s.starve_until(until);
+        self.clients[c].starved_until = until;
+        self.clients[c].asked_starved = 0;
+        let tag = self.clients[c].next_tag;
+        self.submit_op(c, K::Write(1 + r.below(255) as u8), first, 1)?;
+        self.drive(c, &|w, c| !w.clients[c].ops.contains_key(&tag) || !w.serving(c))?;
+        let starved = self.clients[c].s.report();
+        if self.clients[c].anew != anew {
+            return Err(format!("client {} attached anew for a write starved of memory all its life, which reached \
+                                no replica: {}", c, starved));
+        }
+        if !self.serving(c) || self.clients[c].ops.contains_key(&tag) {
+            return Ok(false);
+        }
+        if self.clients[c].failed != failed + 1 || self.clients[c].s.generation() != generation {
+            return Err(format!("client {}'s write starved past its deadline: {} failed, generation {} -> {}: {}", c,
+                               self.clients[c].failed - failed, generation, self.clients[c].s.generation(), starved));
+        }
+        /* Its memory back: the block written and read */
+        self.drive(c, &|w, _| w.now >= until)?;
+        self.clients[c].starved_until = 0;
+        if !self.serving(c) {
+            return Ok(false);
+        }
+        self.submit_op(c, K::Write(1 + r.below(255) as u8), first, 1)?;
+        self.submit_op(c, K::Read, first, 1)?;
+        self.drive(c, &idle)?;
+        if self.serving(c) && self.clients[c].failed != failed + 1 {
+            return Err(format!("client {}'s write after its memory was back failed: {}", c,
+                               self.clients[c].s.report()));
+        }
+        self.count("writes starved past their deadline, no attach anew");
+        Ok(true)
+    }
+
     /// A write failed at its deadline (N13's open question, decided: the
     /// session attaches anew). One active replica of a chunk, on another
     /// host than the writer's, is cut off from every host but its own --
@@ -3927,6 +4000,12 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     let mut alone = Rng::new(mix(seed, 0x636c_6f73));
     if !shaped && lost.is_none() && alone.chance(30) {
         w.close_all_written(&mut alone).map_err(|e| format!("the end: {}", e))?;
+    }
+    /* A write starved past its deadline, reaching no replica (N13c): drawn
+       of its own too */
+    let mut starve = Rng::new(mix(seed, 0x7374_7276));
+    if !shaped && lost.is_none() && starve.chance(25) {
+        w.starved_past_deadline(&mut starve).map_err(|e| format!("the end: {}", e))?;
     }
     /* A write past its deadline, a replica cut off (N13's decision): drawn
        of its own too */

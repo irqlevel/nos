@@ -58,9 +58,17 @@ const CLUSTER_STEPS: u64 = 2000;
 /// to a copy-up asked anew late given that number again (1219, 3663); a
 /// session attached anew for a write that reached no replica, its reconcile
 /// held by the stuck join that held the write (1960), and the end that cuts
-/// a replica off as its write was never sent (2149). A stopgap: a race moved
-/// on by the next change is lost again, which the mutants say.
-const GATE_CLUSTER_ALSO: [u64; 9] = [1232, 2759, 5241, 6647, 7786, 1219, 1960, 2149, 3663];
+/// a replica off as its write was never sent (2149); and its lone writes'
+/// campaign's: a join's copy of a write out that closed what it copied,
+/// its source then taken out and back, an attach anew's reconcile finding
+/// it open nowhere (5316); a reconcile's mend of a shared place held for a
+/// copy-up a stuck join held back (7225); and a write out by a view of its
+/// set that a map read finds changed sent again by the new view
+/// (`client_resend_changed`), its race moved past the range by the lone
+/// writes' course (2758, 4206: a write done that a replica lacks). A
+/// stopgap: a race moved on by the next change is lost again, which the
+/// mutants say.
+const GATE_CLUSTER_ALSO: [u64; 13] = [1232, 2759, 5241, 6647, 7786, 1219, 1960, 2149, 3663, 5316, 7225, 2758, 4206];
 const GATE_JOIN_SEEDS: u64 = 800;
 const JOIN_STEPS: u64 = 3000;
 const GATE_INFLIGHT_SEEDS: u64 = 600;

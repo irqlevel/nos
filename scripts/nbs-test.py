@@ -750,6 +750,15 @@ def main():
         # is the cs's silence to its client
         check("no cs's answer lost: the sessions' mailboxes had room for them all",
               all(chains) and all(int(m.group(3)) == 0 for m in chains), [m.group(0) if m else None for m in chains])
+        # At depth 1 a write is alone, and goes to each replica directly
+        # (N13c): no cs passes one on
+        before = [int(m.group(1)) for m in chains if m]
+        out = a.run("nbsload disk1 write secs=2 qd=1 span=8")
+        written = re.search(r"(\d+) writes: \d+ IOPS", out)
+        after = [re.search(r"(\d+) writes passed on along chains", x.run("nbscs")) for x in sh]
+        check("nbsload at depth 1: each write alone, sent to each replica directly -- none passed on",
+              written is not None and int(written.group(1)) > 0 and "nbsload:" not in out and all(after)
+              and [int(m.group(1)) for m in after] == before, (out, before, [m.group(0) if m else None for m in after]))
         out = b.run("insmod /nbsload.ko")
         out = b.run("nbsload disk1 randread secs=2 qd=8 span=8")
         check("and reads on b, read-only", re.search(r"\d+ reads: \d+ IOPS", out) is not None and "nbsload:" not in out,
