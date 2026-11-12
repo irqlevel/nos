@@ -1850,12 +1850,34 @@ each new gate.
     at `LOST_LAST`, and the next attach mends; or (c) the chunk is never
     closed by that session, left to the next writer, its replicas apart
     meanwhile. (a) is the recommendation; a decision for the user.
+  - **N13b, the numbers** (2026-11-12; the EX44's bare metal and the
+    AX41's two VMs, volume `bench`, nbsload writing on the EX44, three
+    rounds of each; 6651c38c's modules swapped in without a reboot, the
+    VMs' roots updated). Writes at depth up from N12d's 56 MiB/s -- two
+    copies on the EX44's line -- to 84-91: 256 KiB at depth 8 84, 90 and
+    89 MiB/s, at depth 16 91, 88 and 90, 64 KiB at depth 16 86, 89 and 70
+    -- each piece leaving the EX44 once, ax41a passing it on to ax41c over
+    their own link; 4 KiB at depth 32 12.0-12.8k IOPS (N12d 13.0k), the
+    same. At depth 1 the chain costs: 256 KiB 14, 15 and 11 MiB/s (N12d
+    25), 4 KiB 163-175 IOPS (N12d 223) -- the middle replica, a VM, takes
+    the whole piece before it passes it on, through its links' TLS twice.
+    Every write passed on along its chain, none left to the client (the
+    EX44's cs 878,323, ax41a's 878,323, the tail's none). The writer asked
+    the EX44's own cs, every chain's head, out of a set twice in the last
+    tests (64 KiB at depth 16), and the leader's look -- over the EX44's
+    line, full -- let it be taken out; it joined back. To look into: the
+    head's answers late or lost (its session's mailbox, 1024 messages, three
+    answers a piece at 12k IOPS?), and the look behind a full line.
+  - **Left from N13**: the head's take-outs above; depth 1's cost -- a
+    session with one write out could send it to each replica directly; and
+    the deadline question above.
 
 ## What to expect
 
-- **Writes over 1 GbE**: two copies leave the writer's host, so some 55 MB/s
-  a host; a small write's latency is a round trip and the slower replica's
-  device.
+- **Writes over 1 GbE**: one copy leaves the writer's host along its chain
+  (N13), some 85-90 MiB/s a host at depth (N13b; two copies before, 55); a
+  small write's latency is a round trip, a hop more, and the slowest
+  replica's device -- at depth 1 slower than before N13.
 - **Reads** from the local replica: the device's speed, less the copies --
   guest to the client's buffer, to a message, to the cs's buffer.
 - **The first write to a cold chunk** waits for the open mark's commit round
