@@ -3504,7 +3504,8 @@ driver takes ext2's batches of blocks its own way, and NVMe's is the one the
 AX41 runs -- and NVMe's is the one with an asynchronous path, so there the
 guest's requests go to the disk through the image's queue as they come,
 each back when it is done (`fs::image`'s `start` and `reap`; the image says
-how many it served so); on virtio-blk the queue serves every one by the
+how many it served so, and that count, not batches written, is what the
+check holds it to there); on virtio-blk the queue serves every one by the
 batch.
 
 `--cpus N` gives every guest of the run N CPUs, the boot's and the VMs'.
