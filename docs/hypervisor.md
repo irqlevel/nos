@@ -3870,7 +3870,11 @@ placement `hv cores shared` gives: the first on the least loaded core, of
 the faster kind where loads tie, each other on a core none of the guest's
 CPUs is on yet where there is one, sharing the first's last-level cache
 where it can, of the first's kind, the least loaded of those, whoever else
-is there. That is for a machine whose guests are all one's own.
+is there; and its disks' task on a CPU none of its vCPUs is on, whose core
+has the fewest vCPUs, its own counted -- chosen by the other guests' load
+alone, it went to the guest's own second vCPU's CPU while others stood
+idle, and every completion took that vCPU out of its guest. That is for a
+machine whose guests are all one's own.
 
 ```
 $ hv boot /bzImage mem=256 secs=60 cpus=2 initrd=/initrd cmdline=earlyprintk=serial,ttyS0,115200 console=ttyS0 no_timer_check
@@ -5218,7 +5222,9 @@ someone else's; then speed.
    both are allow-lists (`hypervisor/hv/src/policy.rs`, [A Linux
    guest](#a-linux-guest)). A leaf the policy does not name is all zeros,
    as is every leaf past the tops it reports, 0x16 and 0x8000_0021; of
-   leaf 6 a guest is told ARAT alone, of 0x80000008 the address widths,
+   leaf 6 a guest is told ARAT alone, of 0x80000008 the address widths --
+   the physical one the host's, the linear one 48 at most, LA57 not being
+   offered --
    CLZERO, the FP error pointers and two attacks the CPU is not open to, of
    0x80000021 what is true of the silicon and asks nothing of the host. The
    speculation controls are offered now, their MSRs behind them (item 1);

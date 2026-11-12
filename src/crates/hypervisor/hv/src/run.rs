@@ -2006,7 +2006,8 @@ impl LinuxGuest {
                     let sub = v.regs().rcx as u32;
                     let leaf = v.save().rax as u32;
                     let asker = crate::policy::Asker {
-                        apic_id: gc.lapic.id(), apic, cr4: v.cr4(), xcr0: v.xcr0(), shape: self.shape,
+                        apic_id: gc.lapic.id(), apic, apic_on: gc.lapic.enabled(), cr4: v.cr4(), xcr0: v.xcr0(),
+                        shape: self.shape,
                     };
                     let answer = crate::policy::cpuid(leaf, sub, &asker);
                     let (save, regs) = v.save_and_regs_mut();
