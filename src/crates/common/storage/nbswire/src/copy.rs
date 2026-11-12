@@ -21,7 +21,9 @@
 //!   write it there -- the members fenced against that writer refuse it,
 //!   the member out was not fenced (found by fuzz/nbs's cluster target,
 //!   N9d). The sums move the chunk's epoch on at the source, so that no
-//!   writer of the map before the join writes it past them.
+//!   writer of the map before the join writes it past them -- and closing
+//!   it moves it on here (`Store::close_copy`), so that none writes it here
+//!   once the join is done (N13).
 //! - **A chunk pulled is held to the source's** by sums (`Op::Sums`). A
 //!   granule whose sums differ is pulled again and held to the source's a
 //!   sector at a time, the sectors a client has written since the join
@@ -163,9 +165,30 @@ async fn differing<D: Device>(store: &Store<D>, c: ChunkRef, offset: u32, mine: 
         .count() as u64)
 }
 
+/// The joiner fenced at every volume of join `view`'s set at its newest
+/// writer's generation, durable, before its join's marks begin and again as
+/// its view is refreshed (N13): false where one could not be had -- no room
+/// in the fence table, a device failed -- the join not begun then, looked
+/// at again next time. A writer taken over while this cs was out holds its
+/// fence still; its view as new as the join, its writes would be taken
+/// here alone -- unasked, at the epoch the copy moved the chunks on to --
+/// the members its successor fenced refusing them.
+pub async fn fence_for<D: Device>(store: &Store<D>, view: &JoinView) -> bool {
+    for &(volume, generation) in &view.fences {
+        if store.fence_of(volume) >= generation {
+            continue;
+        }
+        if store.fence(volume, generation).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 impl Copy {
     /// The copy of join `view` by cs `me`, begun at `now`. The driver has
-    /// the store mark the set's writes first (`Store::join`).
+    /// fenced the store (`fence_for`) and had it mark the set's writes
+    /// first (`Store::join`).
     pub fn new(view: JoinView, me: u32, now: u64) -> Copy {
         Copy { view, me, source: 0, silent: 0, from: 0, listed: false,
                page: VecDeque::new(), work: None, sent: BTreeMap::new(), hold_until: 0, progress_at: now,

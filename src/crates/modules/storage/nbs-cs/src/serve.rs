@@ -51,12 +51,12 @@ use core::future::{poll_fn, Future};
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
-use kcore::ipc::{Limits, Mailbox, Message, Scope, TAG_BULK};
+use kcore::ipc::{Error, Limits, Mailbox, Message, Scope, TAG_BULK};
 use kcore::klog;
 use kcore::time::{boot_time_ns, Duration};
 use nbscs::{Device, Identity as DevIdentity, OpenError, SlotState, Store};
 use nbswire::copy::{self, Copy};
-use nbswire::serve::{collect, serve, Asker, Requests};
+use nbswire::serve::{collect, serve_relayed, Asker, Requests};
 use nbswire::{Answer, Answered, Op, Query, Question, Refusal, Reply, Request, Told, CS_NAME, TAG_ANSWER,
               TAG_QUERY, TAG_REQUEST, TAG_TOLD};
 
@@ -135,6 +135,11 @@ struct Cs {
     refused: Cell<u64>,
     /// Requests refused for the backlog full.
     overflowed: Cell<u64>,
+    /// Writes passed on along their chains (N13), and those that could not
+    /// be -- no memory for them now, or no way there: their clients send
+    /// them directly.
+    passed_on: Cell<u64>,
+    not_passed: Cell<u64>,
 }
 
 /// A question out to the mds: its id let go of however the ask ends.
@@ -184,7 +189,8 @@ pub fn run(shared: Arc<Shared>) {
         told: RefCell::new(BTreeMap::new()), copy_answers: RefCell::new(VecDeque::new()), cluster: Cell::new([0; 16]),
         cs: Cell::new(None), taken: RefCell::new(BTreeSet::new()), trouble: RefCell::new(Vec::new()),
         idents: RefCell::new(Vec::new()), serving: Cell::new(false), changed: Cell::new(false),
-        served: Cell::new(0), refused: Cell::new(0), overflowed: Cell::new(0),
+        served: Cell::new(0), refused: Cell::new(0), overflowed: Cell::new(0), passed_on: Cell::new(0),
+        not_passed: Cell::new(0),
     });
     let mut own: Vec<Task> = Vec::new();
     own.push(Box::pin(devices(cs.clone())));
@@ -240,20 +246,22 @@ pub fn run(shared: Arc<Shared>) {
 
 /// A request, served by nbswire's `serve` and answered.
 async fn request(cs: Rc<Cs>, m: Message) {
-    let Some(req) = Request::decode(&m.data) else {
-        cs.answer(&m, Answer { id: request_id(&m), reply: Reply::Refused(Refusal::Bad) });
+    let Some((req, relay)) = Request::decode_relayed(&m.data) else {
+        cs.answer(&m, None, Answer { id: request_id(&m), reply: Reply::Refused(Refusal::Bad) });
         return;
     };
+    /* A write passed along its chain answers its client by name (N13) */
+    let to = relay.as_ref().map(|r| r.answer);
     if !cs.serving.get() {
-        cs.answer(&m, Answer { id: req.id, reply: Reply::Refused(Refusal::NotReady) });
+        cs.answer(&m, to, Answer { id: req.id, reply: Reply::Refused(Refusal::NotReady) });
         return;
     }
     if matches!(req.op, Op::Fence | Op::Close { .. } | Op::CopyUp { .. }) {
         cs.changed.set(true);
     }
-    match serve(&cs.store, &cs.requests, &req, &*cs).await {
-        Ok(done) => cs.answer(&m, Answer { id: req.id, reply: done.reply() }),
-        Err(why) => cs.answer(&m, Answer { id: req.id, reply: Reply::Refused(why) }),
+    match serve_relayed(&cs.store, &cs.requests, &req, relay.as_ref(), &*cs).await {
+        Ok(done) => cs.answer(&m, to, Answer { id: req.id, reply: done.reply() }),
+        Err(why) => cs.answer(&m, to, Answer { id: req.id, reply: Reply::Refused(why) }),
     }
 }
 
@@ -354,15 +362,19 @@ impl Cs {
                 }
                 TAG_REQUEST => {
                     let look = Request::decode(&m.data).is_some_and(|r| matches!(r.op, Op::Ping));
+                    if !look {
+                        self.pass_on(&m);
+                    }
                     if look {
                         let reply = if self.serving.get() { Reply::Done } else { Reply::Refused(Refusal::NotReady) };
-                        self.answer(&m, Answer { id: request_id(&m), reply });
+                        self.answer(&m, None, Answer { id: request_id(&m), reply });
                     } else if !stopping && backlog.len() < BACKLOG_MAX && bytes < MAILBOX_BYTES {
                         bytes += m.data.len();
                         backlog.push_back(m);
                     } else {
                         self.overflowed.set(self.overflowed.get() + 1);
-                        self.answer(&m, Answer { id: request_id(&m), reply: Reply::Refused(Refusal::NotReady) });
+                        let to = Request::decode_relayed(&m.data).and_then(|(_, r)| r.map(|r| r.answer));
+                        self.answer(&m, to, Answer { id: request_id(&m), reply: Reply::Refused(Refusal::NotReady) });
                     }
                 }
                 /* A late answer of the mds's, or the channel's own: dropped */
@@ -513,7 +525,42 @@ impl Cs {
 
     /* ---- requests ---- */
 
-    fn answer(&self, m: &Message, a: Answer<'_>) {
+    /// A write of a chain (N13), passed on to the next replica as it is
+    /// taken -- before this cs has done its own -- with the next replica's
+    /// id and mark, to answer the client by name too. One that cannot be --
+    /// no memory for it now, no way there -- is left to its client, which
+    /// sends it directly once its answer is late.
+    fn pass_on(&self, m: &Message) {
+        let Some((req, Some(relay))) = Request::decode_relayed(&m.data) else { return };
+        let Some(first) = relay.next.first() else { return };
+        let to = alloc::format!("{}@{}", CS_NAME, first.host);
+        let sent = nbswire::relay_on(&req, &relay).is_some_and(|(_, bytes)| {
+            self.send_named(&to, REQUEST, 0, &bytes).is_ok()
+        });
+        let counter = if sent { &self.passed_on } else { &self.not_passed };
+        counter.set(counter.get() + 1);
+    }
+
+    /// `bytes` to the mailbox `name@host` names: on a peer, or -- `host`
+    /// this one, which is no peer of its own, and which the channel answers
+    /// `NoRoute` -- here, by the name alone. The writer's own host's cs, its
+    /// chain's head, answers its session so (N13: as first written its
+    /// answers went nowhere, and every write of a chain waited for its
+    /// deadline -- nbs-test's slow-cs phase on the hardware, where the
+    /// fuzzer's network had delivered by any name).
+    fn send_named(&self, name: &str, tag: u32, reference: u64, bytes: &[u8]) -> Result<(), Error> {
+        match self.mb.send_to(name, tag, reference, bytes) {
+            Err(Error::NoRoute) => match name.split_once('@') {
+                Some((bare, _)) => self.mb.send_to(bare, tag, reference, bytes),
+                None => Err(Error::NoRoute),
+            },
+            r => r,
+        }
+    }
+
+    /// Answer `a` to request `m`: to its sender, or -- a write passed along
+    /// its chain -- to the client's mailbox named `to`.
+    fn answer(&self, m: &Message, to: Option<&str>, a: Answer<'_>) {
         /* A read's answer is a piece's data: refused for now where the heap
            has no room for it -- its client asks again in a moment (#97) --
            never the host's panic */
@@ -526,7 +573,10 @@ impl Cs {
         } else {
             self.served.set(self.served.get() + 1);
         }
-        let _ = self.mb.reply(m, ANSWER, &bytes);
+        let _ = match to {
+            Some(name) => self.send_named(name, ANSWER, m.reference, &bytes),
+            None => self.mb.reply(m, ANSWER, &bytes),
+        };
     }
 
     /// What the shell shows of the cs.
@@ -552,7 +602,8 @@ impl Cs {
         held.truncate(CHUNKS_SHOWN);
         self.shared.show(Shown { cs: self.cs.get(), devices, held: count, open, chunks: held,
                                  fences: self.store.fenced_volumes(), served: self.served.get(),
-                                 refused: self.refused.get() + self.overflowed.get() });
+                                 refused: self.refused.get() + self.overflowed.get(),
+                                 passed_on: self.passed_on.get(), not_passed: self.not_passed.get() });
     }
 }
 
@@ -601,6 +652,12 @@ impl Joins {
         }
         let now = boot_time_ns();
         for v in views {
+            /* Fenced at its volumes' newest generations first, and as they
+               move on (N13) */
+            if !copy::fence_for(&cs.store, &v).await {
+                klog!(0, "nbs-cs: set {}'s volumes not fenced here: its join waits", v.set);
+                continue;
+            }
             match self.copies.iter_mut().find(|c| c.set() == v.set && c.since() == v.since) {
                 Some(c) => c.refresh(v),
                 None => {

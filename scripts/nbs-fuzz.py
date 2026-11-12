@@ -69,7 +69,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--seed", type=int, default=1, help="the campaign's first seed (1)")
     p.add_argument("--seconds", type=int, help="a campaign this long, instead of the gate")
-    p.add_argument("--target", choices=["meta", "cs", "wire", "scrub", "cluster", "join"], default="meta",
+    p.add_argument("--target", choices=["meta", "cs", "inflight", "wire", "scrub", "cluster", "join"], default="meta",
                    help="the campaign's target (meta)")
     p.add_argument("--mutants", action="store_true", help="the mutants too, after the gate")
     args = p.parse_args()

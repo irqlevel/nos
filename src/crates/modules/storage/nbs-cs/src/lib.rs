@@ -72,6 +72,10 @@ pub struct Shown {
     pub fences: Vec<(u32, u64)>,
     pub served: u64,
     pub refused: u64,
+    /// Writes passed on along their chains (N13), and those that could not
+    /// be.
+    pub passed_on: u64,
+    pub not_passed: u64,
 }
 
 #[derive(Default)]
@@ -199,8 +203,8 @@ fn show(shared: &Shared, args: &str, out: &mut Output) {
     match v.cs {
         Some(cs) => {
             let _ = writeln!(out, "nbscs: cs {} -- {}: {} chunks held, {} open, {} volumes fenced, {} requests \
-                                   served, {} refused", cs, s.state, v.held, v.open, v.fences.len(), v.served,
-                             v.refused);
+                                   served, {} refused, {} writes passed on along chains, {} not", cs, s.state, v.held,
+                             v.open, v.fences.len(), v.served, v.refused, v.passed_on, v.not_passed);
         }
         None => {
             let _ = writeln!(out, "nbscs: {}", s.state);

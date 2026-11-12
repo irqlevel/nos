@@ -27,7 +27,11 @@
 //! nothing. Before each run: a disk with anything at all
 //! past a superblock's bytes in its first two pages -- a boot sector, a
 //! filesystem, a partition table -- is never taken for blank, nor written;
-//! a cs's of another identity is told apart.
+//! a cs's of another identity is told apart; and a write of a chain (N13),
+//! served as nbs-cs serves one (`serve_relayed`), is applied once -- come
+//! again under a newer write of its blocks, or below its writer's mark,
+//! answered as done and not written -- and refused as fenced once a newer
+//! fence has come, as the store refuses its writer's every request.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -36,8 +40,8 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use nbscs::{ChunkRef, Device, Epoch, Error, Identity, IoError, OpenError, SlotState, Store, COPY_PIECE, PAGE, SLOT};
-use nbswire::serve::{collect, serve, AskNow, Asker, Done, Requests};
-use nbswire::{Op as WireOp, Question, Refusal, Request, Told};
+use nbswire::serve::{collect, serve, serve_relayed, AskNow, Asker, Done, Requests};
+use nbswire::{Op as WireOp, Question, Refusal, Relay, Request, Told};
 
 use crate::rng::{mix, Rng};
 
@@ -1397,10 +1401,72 @@ fn strangers(r: &mut Rng, sector: u64) -> Result<(), String> {
     }
 }
 
+/// A write of a chain (N13) on a cs of its own, served as nbs-cs serves
+/// one (`serve_relayed`), on draws of its own: applied once -- come again
+/// after a newer write of the same blocks, or below its writer's mark,
+/// answered as done and the newer data kept -- and, once a newer writer's
+/// fence has come, refused as fenced, as the store refuses every request of
+/// a generation the volume was taken from: answered as done, the old writer
+/// would hold a write of its done there after the fence.
+fn relayed(seed: u64, sector: u64) -> Result<(), String> {
+    let mut q = Rng::new(mix(seed, 0x7265_6c61));
+    let disk = Rc::new(RefCell::new(Disk::new(sector, 12 * SLOT)));
+    let store = Store::new();
+    nbscs::now(store.format_device(Handle(disk), Identity { cluster: [7; 16], cs: 5, device: 77 }, 9))
+        .map_err(|(_, e)| format!("relayed: a disk not formatted: {:?}", e))?;
+    let requests = Requests::new();
+    let volume = 1 + q.below(4) as u32;
+    let g = 1 + q.below(5);
+    nbscs::now(store.fence(volume, g)).map_err(|e| format!("relayed: volume {} not fenced: {:?}", volume, e))?;
+    let chunk = ChunkRef { chunk: q.below(100) as u32, incarnation: 1, epoch: Epoch { set: 3, version: 1 } };
+    let offset = (q.below(SLOT / sector - 1) * sector) as u32;
+    let (older, newer) = (vec![0x5a; sector as usize], vec![0xa5; sector as usize]);
+    let p = 2 + q.below(1000);
+    let mark = 1 + q.below(p - 1);
+    let vouch = AskNow::new(|_| Some(Told::Verified));
+    let serve_it = |req: &Request<'_>, mark: u64| {
+        let relay = Relay { answer: "w@a", mark, next: Vec::new() };
+        nbscs::now(serve_relayed(&store, &requests, req, Some(&relay), &vouch))
+    };
+    let read = || {
+        let mut buf = vec![0u8; sector as usize];
+        nbscs::now(store.read(volume, 0, chunk, offset, &mut buf, true)).map(|()| buf[0])
+    };
+    let older_w = Request { id: p, volume, generation: g,
+                            op: WireOp::Write { chunk, position: 0, index: 1, offset, data: &older } };
+    let newer_w = Request { id: p + 1 + q.below(9), volume, generation: g,
+                            op: WireOp::Write { chunk, position: 0, index: 1, offset, data: &newer } };
+    for (what, req, m) in [("a write", &older_w, mark), ("a newer write of its blocks", &newer_w, mark)] {
+        let got = serve_it(req, m);
+        if !matches!(got, Ok(Done::Done)) {
+            return Err(format!("relayed: {} of a chain at generation {} answered {:?}", what, g, got));
+        }
+    }
+    /* Come again, along its chain or directly: done, not written again --
+       at the mark it went with, and below the newer one its writer sent */
+    for m in [mark, p + 1] {
+        let got = serve_it(&older_w, m);
+        if !matches!(got, Ok(Done::Done)) || read() != Ok(0xa5) {
+            return Err(format!("relayed: a write of a chain come again at mark {} under a newer write of its blocks \
+                                answered {:?}, the block reading {:?}", m, got, read()));
+        }
+    }
+    nbscs::now(store.fence(volume, g + 1)).map_err(|e| format!("relayed: volume {} not fenced: {:?}", volume, e))?;
+    for (what, req) in [("the write", &older_w), ("the newer one", &newer_w)] {
+        let got = serve_it(req, mark);
+        if !matches!(got, Err(Refusal::Fenced { generation }) if generation == g + 1) {
+            return Err(format!("relayed: {} of a chain at generation {} come again once the volume was fenced at \
+                                {}: {:?}", what, g, g + 1, got));
+        }
+    }
+    Ok(())
+}
+
 pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     let mut r = Rng::new(mix(seed, 0x6373));
     let sector = if r.chance(30) { PAGE } else { 512 };
     strangers(&mut r, sector)?;
+    relayed(seed, sector)?;
     let disks = 1 + r.below(3) as usize;
     let mut identities = Vec::new();
     let mut handles = Vec::new();

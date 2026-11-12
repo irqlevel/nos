@@ -118,7 +118,9 @@ fn open(state: &ModState, name: &str, force: bool) -> Result<u64, String> {
     if let Some(old) = state.io.with(|io| io.remove(name)) {
         let _ = old.stop();
     }
-    let d = Drive::open(name, &me(state)?, true, force)?;
+    /* Its writes to each replica directly, as before N13: nbs-test's
+       path for those, nbsload's and hv's along chains */
+    let d = Drive::open(name, &me(state)?, true, force, None)?;
     let generation = d.session().generation();
     state.io.with(|io| {
         io.insert(String::from(name), d);
@@ -217,7 +219,7 @@ fn read(state: &ModState, name: &str, offset: u64, len: u64, out: &mut Output) -
         return kept(state, name, out, show);
     }
     /* No session here: one read-only, for this read alone */
-    let mut d = Drive::open(name, &me(state)?, false, false)?;
+    let mut d = Drive::open(name, &me(state)?, false, false, None)?;
     let result = show(&mut d, out);
     let stopped = d.stop();
     result.and(stopped)

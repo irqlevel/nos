@@ -218,6 +218,14 @@ pub struct JoinView {
     pub sources: Vec<(u32, String)>,
     /// The entry the mds has applied: a source's mds is asked to be as far.
     pub index: u64,
+    /// The volumes with chunks in the set, each at its newest writer's
+    /// generation: the joiner fenced so before its join's marks begin
+    /// (`copy::fence_for`, N13). Out when the volume's writer of now fenced
+    /// the set's members, it holds the fence of the one before, and that
+    /// one, taken over, its view as new as the join, would write it there
+    /// as nowhere else -- unasked, the chunks the copy moved on at the
+    /// join's epoch (found by fuzz/nbs's cluster target).
+    pub fences: Vec<(u32, u64)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -486,13 +494,43 @@ impl Request<'_> {
 impl<'a> Request<'a> {
     pub fn decode(b: &'a [u8]) -> Option<Request<'a>> {
         let mut r = Reader::new(b);
+        let req = Request::decode_from(&mut r)?;
+        r.done().then_some(req)
+    }
+
+    /// A request as a cs takes it (N13): one of its own, or a write passed
+    /// along its replicas, with what its chain says after it.
+    pub fn decode_relayed(b: &'a [u8]) -> Option<(Request<'a>, Option<Relay<'a>>)> {
+        let mut r = Reader::new(b);
+        let req = Request::decode_from(&mut r)?;
+        if r.done() {
+            return Some((req, None));
+        }
+        if !matches!(req.op, Op::Write { .. }) || r.u8()? != RELAY_MARK {
+            return None;
+        }
+        let answer = relay_name(&mut r)?;
+        let mark = r.u64()?;
+        let count = r.u8()? as usize;
+        if count > RELAY_HOPS_MAX {
+            return None;
+        }
+        let mut next = Vec::new();
+        next.try_reserve_exact(count).ok()?;
+        for _ in 0..count {
+            next.push(Hop { id: r.u64()?, mark: r.u64()?, host: relay_name(&mut r)? });
+        }
+        r.done().then_some((req, Some(Relay { answer, mark, next })))
+    }
+
+    fn decode_from(r: &mut Reader<'a>) -> Option<Request<'a>> {
         let id = r.u64()?;
         let volume = r.u32()?;
         let generation = r.u64()?;
         let op = match r.u8()? {
             1 => Op::Fence,
             2 => {
-                let chunk = read_chunk_ref(&mut r)?;
+                let chunk = read_chunk_ref(r)?;
                 let (position, index, offset) = (r.u32()?, r.u64()?, r.u32()?);
                 let len = r.u32()?;
                 if len > DATA_MAX {
@@ -501,7 +539,7 @@ impl<'a> Request<'a> {
                 Op::Write { chunk, position, index, offset, data: r.bytes(len as usize)? }
             }
             3 => {
-                let chunk = read_chunk_ref(&mut r)?;
+                let chunk = read_chunk_ref(r)?;
                 let (position, index, offset, len) = (r.u32()?, r.u64()?, r.u32()?, r.u32()?);
                 if len > DATA_MAX {
                     return None;
@@ -509,13 +547,13 @@ impl<'a> Request<'a> {
                 Op::Read { chunk, position, index, offset, len }
             }
             4 => Op::Flush,
-            5 => Op::Close { chunk: read_chunk_ref(&mut r)?, position: r.u32()?, index: r.u64()? },
+            5 => Op::Close { chunk: read_chunk_ref(r)?, position: r.u32()?, index: r.u64()? },
             6 => Op::Held,
             7 => Op::Ping,
             8 => Op::Holdings { set: r.u32()?, from: r.u32()?, joiner: r.u32()?, version: r.u32()?, index: r.u64()? },
             code @ (9 | 10) => {
                 let pull = code == 9;
-                let chunk = read_chunk_ref(&mut r)?;
+                let chunk = read_chunk_ref(r)?;
                 let (joiner, index, offset, len) = (r.u32()?, r.u64()?, r.u32()?, r.u32()?);
                 /* A pull is data, as a read is; a sum reads at most a chunk */
                 if (pull && len > DATA_MAX) || u64::from(len) > nbscs::SLOT {
@@ -527,13 +565,105 @@ impl<'a> Request<'a> {
                     Op::Sums { chunk, joiner, index, offset, len }
                 }
             }
-            11 => Op::Scrub { chunk: read_chunk_ref(&mut r)? },
-            12 => Op::CopyUp { from: read_chunk_ref(&mut r)?, to: read_chunk_ref(&mut r)?, position: r.u32()?,
+            11 => Op::Scrub { chunk: read_chunk_ref(r)? },
+            12 => Op::CopyUp { from: read_chunk_ref(r)?, to: read_chunk_ref(r)?, position: r.u32()?,
                                index: r.u64()? },
             _ => return None,
         };
-        r.done().then_some(Request { id, volume, generation, op })
+        Some(Request { id, volume, generation, op })
     }
+}
+
+/// A write passed along its replicas (N13): the replicas after the one it
+/// is sent to, in order, each with a request id of its own -- the client
+/// knows each answer by it -- and the writer session's mailbox, by name
+/// and host, for each replica to answer to: an ipc address is the host's
+/// that holds it, and means nothing to a third. And `mark`: every request
+/// of the session's to this replica below it has been answered -- a write
+/// that comes again, along the chain and directly, is applied once
+/// (`serve::Requests`'s relayed writes), and one late, under a newer write
+/// of its blocks, never over it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Relay<'a> {
+    pub answer: &'a str,
+    pub mark: u64,
+    pub next: Vec<Hop<'a>>,
+}
+
+/// A replica a write is to be passed on to: its request's id and mark, and
+/// the name of the host whose cs it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hop<'a> {
+    pub id: u64,
+    pub mark: u64,
+    pub host: &'a str,
+}
+
+/// What follows a write that is passed on.
+const RELAY_MARK: u8 = 0xC4;
+/// A relay's name at most -- a mailbox's with its host's, or a host's.
+pub const RELAY_NAME_MAX: usize = 128;
+/// A relay's hops at most: a set's replicas but the first, and its joiner.
+pub const RELAY_HOPS_MAX: usize = nbsmeta::REPLICAS;
+
+fn relay_name<'a>(r: &mut Reader<'a>) -> Option<&'a str> {
+    let len = r.u16()? as usize;
+    if len == 0 || len > RELAY_NAME_MAX {
+        return None;
+    }
+    core::str::from_utf8(r.bytes(len)?).ok()
+}
+
+fn relay_name_ok(name: &str) -> bool {
+    !name.is_empty() && name.len() <= RELAY_NAME_MAX
+}
+
+impl Request<'_> {
+    /// A write's bytes with `relay` after them -- what a replica of its
+    /// chain is sent; refused rather than had where there is no memory for
+    /// it, as `try_encode` is. None for a request that is not a write, or a
+    /// relay that is not one.
+    pub fn try_encode_relayed(&self, relay: &Relay<'_>) -> Option<Vec<u8>> {
+        let Op::Write { data, .. } = &self.op else { return None };
+        if relay.next.len() > RELAY_HOPS_MAX || !relay_name_ok(relay.answer)
+            || relay.next.iter().any(|h| !relay_name_ok(h.host))
+        {
+            return None;
+        }
+        let tail = 12 + relay.answer.len() + relay.next.iter().map(|h| 18 + h.host.len()).sum::<usize>();
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(REQUEST_HEAD_MAX + data.len() + tail).ok()?;
+        let mut w = Writer { buf };
+        self.encode_into(&mut w);
+        w.u8(RELAY_MARK);
+        w.u16(relay.answer.len() as u16);
+        w.fixed(relay.answer.as_bytes());
+        w.u64(relay.mark);
+        w.u8(relay.next.len() as u8);
+        for h in &relay.next {
+            w.u64(h.id);
+            w.u64(h.mark);
+            w.u16(h.host.len() as u16);
+            w.fixed(h.host.as_bytes());
+        }
+        Some(w.buf)
+    }
+}
+
+/// What the cs a write came to with `relay` passes on (N13): the next
+/// replica's host, and the write as that replica is to take it -- its own
+/// id, the hops after it, the same mailbox to answer to. None where this is
+/// the chain's last, or there is no memory for it now: that replica is then
+/// sent the write by its client, which waits for its answer.
+pub fn relay_on(req: &Request<'_>, relay: &Relay<'_>) -> Option<(String, Vec<u8>)> {
+    let (first, rest) = relay.next.split_first()?;
+    let mut next = Vec::new();
+    next.try_reserve_exact(rest.len()).ok()?;
+    next.extend_from_slice(rest);
+    let on = Relay { answer: relay.answer, mark: first.mark, next };
+    let bytes = Request { id: first.id, volume: req.volume, generation: req.generation, op: req.op.clone() }
+        .try_encode_relayed(&on)?;
+    Some((String::from(first.host), bytes))
 }
 
 /// The most an answer is but for what it carries -- a read's data, a list:
@@ -868,6 +998,11 @@ impl Answered {
                         w.str(host);
                     }
                     w.u64(j.index);
+                    w.u32(j.fences.len() as u32);
+                    for &(volume, generation) in &j.fences {
+                        w.u32(volume);
+                        w.u64(generation);
+                    }
                 }
             }
         }
@@ -937,7 +1072,18 @@ impl Answered {
                         let cs = r.u32()?;
                         sources.push((cs, String::from(r.str(nbsmeta::NAME_MAX)?)));
                     }
-                    joins.push(JoinView { set, place, since, version, own, until, sources, index: r.u64()? });
+                    let index = r.u64()?;
+                    let f = r.u32()? as usize;
+                    /* Each fence is 12 bytes */
+                    if f > LIST_MAX || f * 12 > r.remaining() {
+                        return None;
+                    }
+                    let mut fences = Vec::new();
+                    fences.try_reserve_exact(f).ok()?;
+                    for _ in 0..f {
+                        fences.push((r.u32()?, r.u64()?));
+                    }
+                    joins.push(JoinView { set, place, since, version, own, until, sources, index, fences });
                 }
                 Told::Joins(joins)
             }

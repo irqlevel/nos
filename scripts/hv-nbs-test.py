@@ -377,7 +377,11 @@ def main():
         out = a.run(x(va, "dd if=/dev/urandom of=/w2 bs=1M count=%d 2>/dev/null; md5sum /w2" % LONG_MIB, 120))
         long_sum = md5_of(out)
         need("16 MiB more of noise made", long_sum is not None, out)
-        a.run("hv send %d dd if=/w2 of=/dev/vda bs=1M seek=%d conv=fsync 2>/dev/null; echo nos-long-rc=$?\\n"
+        # The marker split by empty quotes as typed: the shell's echo of the
+        # line is not what the waits below take for the write's end -- as
+        # first written they matched it at once, and the check that follows
+        # held the write to end within a few commands of c's death
+        a.run("hv send %d dd if=/w2 of=/dev/vda bs=1M seek=%d conv=fsync 2>/dev/null; echo nos-long-rc\"\"=$?\\n"
               % (va, WRITE_MIB))
         mem("before c is killed, a's guest writing")
         time.sleep(3)
