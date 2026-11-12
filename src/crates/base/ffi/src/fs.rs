@@ -185,3 +185,24 @@ unsafe extern "C" {
     /// `fstest=on`: run the self-test on / once it is mounted.
     pub safe fn kernel_root_fstest() -> i32;
 }
+
+/* The numbers that cross with these functions, one copy of each: the
+ * layer that answers and kcore that reads them both use these, and this
+ * file is in the module interface's digest. They were written twice --
+ * a copy in the layer, literals in kcore -- outside it: a release that
+ * renumbered one built, hashed the same, and its modules misread the
+ * answers. */
+
+/// What `kernel_dir_entry` says an entry is.
+pub const FILE_ENTRY_FILE: u32 = 1;
+pub const FILE_ENTRY_DIR: u32 = 2;
+/// What it answers past the last entry, and for a path that names no
+/// directory -- which an empty directory is not.
+pub const FILE_ENTRY_END: isize = -1;
+pub const FILE_ENTRY_NO_DIR: isize = -2;
+
+/// What `kernel_file_create` answers: made, one there already (nothing
+/// written), and refused (no file left).
+pub const FILE_CREATED: i32 = 0;
+pub const FILE_THERE: i32 = 1;
+pub const FILE_REFUSED: i32 = -1;

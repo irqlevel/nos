@@ -127,6 +127,13 @@ use kcore::trace::{self, TcpAck, TcpLoss, TcpLossWhat, TcpRecv, TcpRecovery, Tcp
                    TcpWaitFor, TcpWhy};
 
 pub const MAX_CONNECTIONS: usize = 64;
+
+/// A connection's word (`Tcp::word_of`): the slot's number and one in the
+/// low bits, the generation above them, as much of it as fits.
+const WORD_SLOT_BITS: u32 = 16;
+const WORD_SLOT_MASK: usize = (1 << WORD_SLOT_BITS) - 1;
+const WORD_GENERATION_MASK: u64 = (1 << (usize::BITS - WORD_SLOT_BITS)) - 1;
+const _: () = assert!(MAX_CONNECTIONS < WORD_SLOT_MASK);
 /* A slot's number is a byte in its tracepoints' records */
 const _: () = assert!(MAX_CONNECTIONS <= u8::MAX as usize + 1);
 /// What a slot buffers each way, in the slot itself.
@@ -245,7 +252,7 @@ const RX_LOOK_MS: u64 = 100;
 const TX_LOOK_MS: u64 = 100;
 /// The most networks a listener answers SYNs from when it is told which
 /// (`listen_allowed`): a cluster's hosts each by its address, with room.
-pub const ALLOW_MAX: usize = 64;
+pub const ALLOW_MAX: usize = ffi::tcp::TCP_ALLOW_MAX;
 /// Resets to segments for no connection, held to RST_RATE a second with
 /// bursts of RST_BURST, over the whole stack (FreeBSD's `icmplim` is 200):
 /// a flood at closed ports, its source addresses forged, does not make this
@@ -275,7 +282,7 @@ const _: () = assert!(LISTEN_BACKLOG <= u8::MAX as usize);
 
 /// What `recv` answers below zero.
 pub const RECV_ERROR: isize = -1;
-pub const RECV_TIMEOUT: isize = -2;
+pub const RECV_TIMEOUT: isize = ffi::tcp::TCP_RECV_TIMEOUT;
 
 const MAX_FRAME: usize = 1514;
 /// A SACK option's head: two NOPs, its kind and its length.
@@ -1865,10 +1872,25 @@ impl Tcp {
         Some(offset / size)
     }
 
-    /// The connection a caller outside Rust names by its address: one of the
-    /// pool's, or none.
-    pub fn by_handle(&'static self, handle: usize) -> Option<&'static Conn> {
-        self.slot_at(handle).map(|index| &self.conns[index])
+    /// The word a connection crosses the C ABI as (ffi's tcp.rs): its slot's
+    /// number and one, and in the bits above them the generation of the
+    /// connection the slot holds now.
+    pub fn word_of(&'static self, conn: &'static Conn) -> usize {
+        let Some(index) = self.index_of(conn) else { return 0 };
+        let generation = conn.generation.load(Ordering::Acquire) & WORD_GENERATION_MASK;
+        ((generation as usize) << WORD_SLOT_BITS) | (index + 1)
+    }
+
+    /// The connection a word from outside names, while its slot still holds
+    /// the connection the word was made for: a word kept past a close is
+    /// nobody's once the slot is handed out again, where an address was
+    /// whoever's had the slot. A check, not a hold: a close racing a call of
+    /// the same owner's on the same word is the owner's to order.
+    pub fn by_word(&'static self, word: usize) -> Option<&'static Conn> {
+        let index = (word & WORD_SLOT_MASK).checked_sub(1)?;
+        let conn = self.conns.get(index)?;
+        let generation = conn.generation.load(Ordering::Acquire) & WORD_GENERATION_MASK;
+        (generation as usize == word >> WORD_SLOT_BITS).then_some(conn)
     }
 
     /// A fresh connection in a slot the pool has just handed out: locked,
@@ -4053,7 +4075,8 @@ impl Tcp {
 /// Where a connection's sequence numbers start. From the entropy pool: an
 /// initial sequence number a stranger can guess is one they can inject into.
 fn initial_sequence() -> u32 {
-    kcore::random::random_u64().unwrap_or(0x1234_5678) as u32
+    static SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    kcore::random::random_u64_or_clock("TCP's initial sequence numbers", &SAID) as u32
 }
 
 /* ---- what an application calls ---- */

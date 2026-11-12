@@ -273,7 +273,7 @@ pub struct Extent {
 
 /// The most frames one [`Mapped`] maps: a queue of 256 entries' rings are
 /// three pages.
-pub const MAPPED_MAX: usize = 4;
+pub const MAPPED_MAX: usize = ffi::frame::FRAMES_MAP_MAX;
 
 /// Pages owned together, and shared: a region of a guest's memory, which
 /// a mapping of some of them holds a share of ([`Mapped`]), so that they go

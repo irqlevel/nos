@@ -674,7 +674,7 @@ impl Drop for Mailbox {
 }
 
 /// A host's name at most: a DNS label's.
-const HOST_NAME_MAX: usize = 63;
+const HOST_NAME_MAX: usize = ipc::IPC_HOST_NAME_MAX;
 
 /// The host a message from another host came from: the name of the peer
 /// whose number `addr`'s host part is, while it is up -- None for this
@@ -709,23 +709,26 @@ pub struct Name {
     pub scope: Scope,
 }
 
-/// The most names `list` asks for at once.
+/// The most names `list` gives.
 const LIST_MAX: usize = 256;
 
-/// The names under `prefix` on this host.
-pub fn list(prefix: &str) -> Vec<Name> {
+/// The names under `prefix` on this host: TooLarge when there are more than
+/// `LIST_MAX` -- asked for with room for one more, so that the first 256 no
+/// longer pass for all there is -- and NoMemory when there is no room to ask
+/// with, which once came back as an empty list.
+pub fn list(prefix: &str) -> Result<Vec<Name>, Error> {
     let mut out = Vec::new();
     let mut raw: Vec<ipc::IpcName> = Vec::new();
-    if raw.try_reserve_exact(LIST_MAX).is_err() {
-        return out;
+    raw.try_reserve_exact(LIST_MAX + 1).map_err(|_| Error::NoMemory)?;
+    /* `prefix` is its length's bytes; `raw` has room for LIST_MAX + 1
+     * entries */
+    let n = unsafe { ipc::kernel_ipc_list(prefix.as_ptr(), prefix.len(), raw.as_mut_ptr(), LIST_MAX + 1) };
+    if n > LIST_MAX {
+        return Err(Error::TooLarge);
     }
-    /* `prefix` is its length's bytes; `raw` has room for LIST_MAX entries */
-    let n = unsafe { ipc::kernel_ipc_list(prefix.as_ptr(), prefix.len(), raw.as_mut_ptr(), LIST_MAX) };
     /* The kernel wrote `n` entries, no more than LIST_MAX */
-    unsafe { raw.set_len(n.min(LIST_MAX)) };
-    if out.try_reserve_exact(raw.len()).is_err() {
-        return out;
-    }
+    unsafe { raw.set_len(n) };
+    out.try_reserve_exact(raw.len()).map_err(|_| Error::NoMemory)?;
     for r in &raw {
         let len = (r.len as usize).min(ipc::IPC_NAME_MAX);
         let Ok(text) = core::str::from_utf8(&r.name[..len]) else { continue };
@@ -737,5 +740,5 @@ pub fn list(prefix: &str) -> Vec<Name> {
         let scope = if r.scope == ipc::IPC_SCOPE_CLUSTER { Scope::Cluster } else { Scope::Host };
         out.push(Name { name, addr: Addr(r.addr), scope });
     }
-    out
+    Ok(out)
 }

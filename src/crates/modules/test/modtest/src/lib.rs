@@ -639,7 +639,7 @@ fn ipc(keep: &Mutex<Option<Mailbox>>) -> core::result::Result<(), &'static str> 
     if mb.send(s, 1, 0, b"") != Ok(()) || mb.send(s, 1, 1, b"") != Ok(()) || mb.send(s, 1, 2, b"") != Err(E::Full) {
         return Err("a full mailbox");
     }
-    if !list("modtest.").iter().any(|n| n.name == "modtest.ipc" && n.addr == mb.addr()) {
+    if !list("modtest.").map_err(|_| "the names listed")?.iter().any(|n| n.name == "modtest.ipc" && n.addr == mb.addr()) {
         return Err("the module's name listed");
     }
     /* Left open on purpose: the sweep after the unload closes it */

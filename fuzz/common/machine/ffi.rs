@@ -42,6 +42,14 @@ pub extern "C" fn kernel_cycle_counter_hz() -> u64 {
     0
 }
 
+/// The machine has no cycle counter of its own: its clock's nanoseconds,
+/// which keeps what reads it -- kcore's clock fallback for an unseeded
+/// pool -- the same from one run of an input to the next.
+#[no_mangle]
+pub extern "C" fn kernel_read_cycle_counter() -> u64 {
+    sched::harness(sched::read_clock)
+}
+
 /* ---- the CPU ---- */
 
 #[no_mangle]

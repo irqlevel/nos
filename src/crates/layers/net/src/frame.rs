@@ -266,12 +266,6 @@ impl Frame {
         unsafe { core::slice::from_raw_parts_mut(header.data.as_ptr(), len) }
     }
 
-    /// One more reference to the same frame: how a listener keeps what it
-    /// was lent.
-    pub fn retain(&self) -> Frame {
-        self.header().refcount.fetch_add(1, Ordering::AcqRel);
-        Frame(self.0)
-    }
 
     /// The whole of `data` as the frame's contents. False when it has no
     /// room for that much.

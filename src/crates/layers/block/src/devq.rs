@@ -384,9 +384,9 @@ pub unsafe extern "C" fn kernel_blockq_open(
 #[no_mangle]
 pub extern "C" fn kernel_blockq_start(q: usize, buffer: usize, write: i32, offset: u64, len: usize) -> i32 {
     match with(q, |dq| dq.start(buffer, write != 0, offset, len)) {
-        Some(Started::InFlight) => 1,
-        Some(Started::Done(true)) => 0,
-        _ => -1,
+        Some(Started::InFlight) => ffi::block::QUEUE_IN_FLIGHT,
+        Some(Started::Done(true)) => ffi::block::QUEUE_DONE,
+        _ => ffi::block::QUEUE_FAILED,
     }
 }
 

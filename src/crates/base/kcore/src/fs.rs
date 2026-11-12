@@ -334,10 +334,10 @@ impl ImageQueue {
         /* `take` made buffer `k` this call's: no `Lent` of it is out, and
          * the queue is this one's alone */
         match unsafe { fs::kernel_image_start(self.image.handle, k, i32::from(write), offset, len) } {
-            1 => Ok(Started::InFlight),
+            ffi::block::QUEUE_IN_FLIGHT => Ok(Started::InFlight),
             rc => {
                 self.buffers.untake(k);
-                if rc == 0 { Ok(Started::Done) } else { Err(Error::IoError) }
+                if rc == ffi::block::QUEUE_DONE { Ok(Started::Done) } else { Err(Error::IoError) }
             }
         }
     }
@@ -419,8 +419,8 @@ pub fn write(path: &str, data: &[u8]) -> Result<()> {
 pub fn create(path: &str, data: &[u8]) -> Result<()> {
     let rc = unsafe { fs::kernel_file_create(path.as_ptr(), path.len(), data.as_ptr(), data.len()) };
     match rc {
-        0 => Ok(()),
-        1 => Err(Error::Busy),
+        fs::FILE_CREATED => Ok(()),
+        fs::FILE_THERE => Err(Error::Busy),
         _ => Err(Error::IoError),
     }
 }
@@ -440,9 +440,8 @@ pub fn create_dir(path: &str) -> Result<()> {
 const NAME_MAX: usize = 255;
 /// The most entries `list` reads of one directory.
 const LIST_MAX: usize = 4096;
-/* What `kernel_dir_entry` answers (layers/fs/src/files.rs). */
-const ENTRY_DIR: u32 = 2;
-const ENTRY_END: isize = -1;
+/* What `kernel_dir_entry` answers (layers/fs/src/files.rs) */
+use ffi::fs::{FILE_ENTRY_DIR as ENTRY_DIR, FILE_ENTRY_END as ENTRY_END};
 
 /// An entry of a directory, as `list` reads it: its name as the filesystem
 /// has it -- bytes, not necessarily UTF-8 -- whether it is a directory, and a
@@ -453,10 +452,13 @@ pub struct Entry {
     pub size: u64,
 }
 
-/// What the directory at `path` has, an entry each, at most `LIST_MAX` of
-/// them: NotFound when the path names no directory. Read an entry at a time
+/// What the directory at `path` has, an entry each: NotFound when the path
+/// names no directory, InvalidValue when it has more than `LIST_MAX` --
+/// which once came back as the first `LIST_MAX`, Ok. Read an entry at a time
 /// with nothing held between them, so a directory changing meanwhile may
-/// show an entry twice or not at all.
+/// show an entry twice or not at all; and each entry is a walk of the
+/// directory to its place, so a list costs its length squared: what
+/// `LIST_MAX` bounds.
 pub fn list(path: &str) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
     let mut name = [0u8; NAME_MAX];
@@ -475,6 +477,18 @@ pub fn list(path: &str) -> Result<Vec<Entry>> {
         entry.extend_from_slice(&name[..len]);
         entries.try_reserve(1).map_err(|_| Error::NoMemory)?;
         entries.push(Entry { name: entry, dir: kind == ENTRY_DIR, size });
+    }
+    if entries.len() == LIST_MAX {
+        /* One more look says whether that was all */
+        let (mut kind, mut size) = (0u32, 0u64);
+        /* `name` is writable for its length, `kind` and `size` are locals. */
+        let more = unsafe {
+            fs::kernel_dir_entry(path.as_ptr(), path.len(), LIST_MAX, name.as_mut_ptr(), name.len(), &mut kind,
+                                 &mut size)
+        };
+        if more != ENTRY_END {
+            return Err(Error::InvalidValue);
+        }
     }
     Ok(entries)
 }

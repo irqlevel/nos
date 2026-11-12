@@ -2435,9 +2435,9 @@ pub unsafe extern "C" fn kernel_image_queue(image: usize, buffers: usize, bytes:
 #[no_mangle]
 pub extern "C" fn kernel_image_start(image: usize, buffer: usize, write: i32, offset: u64, len: usize) -> i32 {
     match with(image, |img| img.start(buffer, write != 0, offset, len)) {
-        Some(Started::InFlight) => 1,
-        Some(Started::Done(true)) => 0,
-        _ => -1,
+        Some(Started::InFlight) => ffi::block::QUEUE_IN_FLIGHT,
+        Some(Started::Done(true)) => ffi::block::QUEUE_DONE,
+        _ => ffi::block::QUEUE_FAILED,
     }
 }
 

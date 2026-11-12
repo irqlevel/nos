@@ -47,3 +47,14 @@ unsafe extern "C" {
     /// lock held.
     pub fn kernel_frames_unmap(va: usize, count: usize);
 }
+
+/* The numbers that cross with these functions, one copy of each: the
+ * layer that answers and kcore that reads them both use these, and this
+ * file is in the module interface's digest. They were written twice --
+ * a copy in the layer, literals in kcore -- outside it: a release that
+ * renumbered one built, hashed the same, and its modules misread the
+ * answers. */
+
+/// The most pages `kernel_frames_map` maps at once -- the bridge's
+/// FRAMES_MAP_MAX, which make check holds to this (check-ffi.py).
+pub const FRAMES_MAP_MAX: usize = 4;

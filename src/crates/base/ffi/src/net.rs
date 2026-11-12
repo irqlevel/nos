@@ -163,9 +163,10 @@ unsafe extern "C" {
     /// Frames the stack sends go to handler(ctx, ...) until the detach: 0,
     /// or -1 for a bad handle or a handler attached already.
     pub fn kernel_vnic_attach(vnic: usize, handler: VnicSink, ctx: usize) -> i32;
-    /// No more calls of the handler; back once none is running. Task
-    /// context: it waits.
-    pub fn kernel_vnic_detach(vnic: usize);
+    /// No more calls of the handler attached with `ctx` -- and nothing for
+    /// another's attached since -- back once none is running. Task context:
+    /// it waits.
+    pub fn kernel_vnic_detach(vnic: usize, ctx: usize);
     /// A frame into the stack as if received: 0, or -1 when it will not fit,
     /// the backlog is full or the pool is dry.
     pub fn kernel_vnic_receive(vnic: usize, frame: *const u8, len: usize) -> i32;
@@ -174,3 +175,26 @@ unsafe extern "C" {
     /// How many receive passes have emptied its backlog; 0 for a bad handle.
     pub safe fn kernel_vnic_drains(vnic: usize) -> u64;
 }
+
+/* The numbers that cross with these functions, one copy of each: the
+ * layer that answers and kcore that reads them both use these, and this
+ * file is in the module interface's digest. They were written twice --
+ * a copy in the layer, literals in kcore -- outside it: a release that
+ * renumbered one built, hashed the same, and its modules misread the
+ * answers. */
+
+/// What `kernel_net_udp_listen` answers.
+pub const NET_LISTEN_OK: i32 = 0;
+pub const NET_LISTEN_PORT_TAKEN: i32 = 1;
+pub const NET_LISTEN_TABLE_FULL: i32 = 2;
+pub const NET_LISTEN_INVALID: i32 = 3;
+
+/// What `kernel_net_nat_enable` answers in its `code`.
+pub const NAT_ON: i32 = 0;
+pub const NAT_NO_UPLINK: i32 = 1;
+pub const NAT_DEVICES: i32 = 2;
+pub const NAT_BUSY: i32 = 3;
+pub const NAT_NO_MEMORY: i32 = 4;
+
+/// The frames a virtual NIC holds from its sink's senders before it drops.
+pub const VNIC_BACKLOG: usize = 256;

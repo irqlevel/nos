@@ -1164,11 +1164,7 @@ fn hop(packet: &mut [u8], ihl: usize) {
 /* ---- the C ABI a module binds (kcore::net::Nat) ---- */
 
 /// What `kernel_net_nat_enable` answers in its `code`.
-const NAT_ON: i32 = 0;
-const NAT_NO_UPLINK: i32 = 1;
-const NAT_DEVICES: i32 = 2;
-const NAT_BUSY: i32 = 3;
-const NAT_NO_MEMORY: i32 = 4;
+use ffi::net::{NAT_BUSY, NAT_DEVICES, NAT_NO_MEMORY, NAT_NO_UPLINK, NAT_ON};
 
 /// NAT on, from the device `inner` names -- a `kernel_net_find` handle --
 /// out through the device the default route is on. Task context: it
