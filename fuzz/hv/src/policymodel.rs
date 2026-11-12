@@ -386,8 +386,19 @@ fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u3
                 _ => want(g == [0; 4], "nothing: no component past AVX's but PKRU's"),
             }
         }
-        0x15 if apic => want(g == [0; 4] || (g[0] == 1_000_000 && g[1] != 0 && g[2] == 1_000_000_000 && g[3] == 0),
-                             "the TSC over the emulated APIC's 1 GHz, or nothing"),
+        0x15 if apic => {
+            /* What Linux makes of it, in its own 32 bits
+             * (`native_calibrate_tsc`): the host's TSC, exactly, or the leaf
+             * blank for the guest to measure. */
+            let host_khz = (u64::from(h[2]) * u64::from(h[1])).checked_div(u64::from(h[0])).unwrap_or(0) / 1000;
+            let linux_khz = if g[0] == 0 || g[1] == 0 {
+                None
+            } else {
+                Some(u64::from((g[2] / 1000).wrapping_mul(g[1]) / g[0]))
+            };
+            want(g == [0; 4] || (g[2] == 1_000_000_000 && g[3] == 0 && linux_khz == Some(host_khz)),
+                 "the TSC over the emulated APIC's 1 GHz as Linux's 32-bit arithmetic gives it back, or nothing")
+        }
         0x15 => want(g == h, "the host's"),
         l if WHOLE.contains(&l) => want(g == h, "the host's, whole"),
         0x8000_0001 => {
