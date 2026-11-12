@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use nbscs::{ChunkRef, Epoch};
 use nbsmeta::{DeviceState, Replica, State};
 
-use crate::{Device, Identity, Place, Question, Refusal, ReplicaState, Said, Told, MAP_MAX};
+use crate::{Device, Identity, JoinView, Place, Question, Refusal, ReplicaState, Said, Told, LIST_MAX, MAP_MAX};
 
 /// Question `q` of host `host`'s cs, answered from state `s`, applied as far
 /// as entry `applied`.
@@ -42,15 +42,13 @@ pub fn told(s: &State, host: &str, applied: u64, q: &Question) -> Told {
             let (Some(set), Some(me)) = (s.sets().get(ch.set as usize), mine) else {
                 return Told::Refused(Refusal::NotHere);
             };
-            /* A replica taken out serves nothing; one being copied onto is
-               written, not read */
-            let Some(at) = set.cs.iter().position(|&c| c == me.id) else {
+            /* A member taken out serves nothing; the joiner -- being copied
+               onto, its own place's member back or another cs -- is written,
+               not read */
+            let joining = set.joiner.is_some_and(|j| j.cs == me.id);
+            let active = set.cs.iter().position(|&c| c == me.id).is_some_and(|at| set.replicas[at] == Replica::Active);
+            if !(active || (joining && *writing)) {
                 return Told::Refused(Refusal::NotHere);
-            };
-            match set.replicas[at] {
-                Replica::Down => return Told::Refused(Refusal::NotHere),
-                Replica::Rebuilding if !*writing => return Told::Refused(Refusal::NotHere),
-                _ => {}
             }
             let known = Epoch { set: ch.set, version: set.version };
             if known != chunk.epoch {
@@ -61,8 +59,88 @@ pub fn told(s: &State, host: &str, applied: u64, q: &Question) -> Told {
             if (*writing || *generation != 0) && v.writer.as_ref().is_none_or(|w| w.generation != *generation) {
                 return Told::Refused(Refusal::NotAttached);
             }
+            /* The joiner told so: it marks what clients write from now on,
+               which its copy is not to write over */
+            match set.joiner.filter(|_| !active) {
+                Some(j) => Told::VerifiedJoining { since: j.since },
+                None => Told::Verified,
+            }
+        }
+        /* A source's check of a joiner's ask: the joiner the set's at the
+           version it names, this host's cs an active member of the set */
+        Question::VerifyJoin { set, joiner, version, index } => {
+            if applied < *index {
+                return Told::Refused(Refusal::Behind { applied });
+            }
+            let Some(st) = s.sets().get(*set as usize) else { return Told::Refused(Refusal::NotTheJoiner) };
+            if st.joiner.is_none_or(|j| j.cs != *joiner) {
+                return Told::Refused(Refusal::NotTheJoiner);
+            }
+            if st.version != *version {
+                return Told::Refused(Refusal::Epoch { known: Epoch { set: *set, version: st.version } });
+            }
+            let Some(me) = mine else { return Told::Refused(Refusal::NotHere) };
+            if !st.cs.iter().zip(st.replicas.iter()).any(|(&c, &r)| c == me.id && r == Replica::Active) {
+                return Told::Refused(Refusal::NotHere);
+            }
             Told::Verified
         }
+        Question::Joins => {
+            let Some(me) = mine else { return Told::Joins(Vec::new()) };
+            Told::Joins(s.sets().iter().enumerate().filter_map(|(id, st)| {
+                let j = st.joiner.filter(|j| j.cs == me.id)?;
+                let k = usize::from(j.place);
+                let sources = (0..nbsmeta::REPLICAS).filter(|&m| st.replicas[m] == Replica::Active)
+                    .filter_map(|m| s.cs().get(st.cs[m] as usize).map(|c| (c.id, c.host.clone()))).collect();
+                /* Every volume a writer has had with a chunk in the set, at
+                   its newest generation: the joiner fences itself so first */
+                let fences: Vec<(u32, u64)> = s.volumes().iter().filter(|v| v.generation != 0 && v.map.iter()
+                    .any(|&c| s.chunks().get(c as usize).is_some_and(|ch| !ch.is_free() && ch.set as usize == id)))
+                    .map(|v| (v.id, v.generation)).collect();
+                /* Past what a view carries -- never in a cluster of this size
+                   -- the join waits, not begun unfenced */
+                if fences.len() > LIST_MAX {
+                    return None;
+                }
+                Some(JoinView { set: id as u32, place: j.place, since: j.since, version: st.version,
+                                own: st.cs.get(k) == Some(&me.id), until: st.active_until.get(k).copied().unwrap_or(0),
+                                sources, index: applied, fences })
+            }).take(LIST_MAX).collect())
+        }
+        /* A copy-up's copy on this host's cs (N10): pending at that place of
+           that volume, from that chunk to that one, asked by the volume's
+           writer of now, this host's cs an active member of their set at its
+           version now */
+        Question::VerifyCopy { volume, generation, position, from, to, index } => {
+            if applied < *index {
+                return Told::Refused(Refusal::Behind { applied });
+            }
+            let Some(v) = s.volumes().iter().find(|v| v.id == *volume) else {
+                return Told::Refused(Refusal::NotTheMap);
+            };
+            if s.copying().get(&(*volume, *position)) != Some(&(to.chunk, from.chunk)) {
+                return Told::Refused(Refusal::NotTheMap);
+            }
+            let live = |c: &ChunkRef| s.chunks().get(c.chunk as usize)
+                .filter(|ch| !ch.is_free() && ch.incarnation == c.incarnation).copied();
+            let (Some(ch), Some(_)) = (live(from), live(to)) else { return Told::Refused(Refusal::NotTheMap) };
+            let (Some(set), Some(me)) = (s.sets().get(ch.set as usize), mine) else {
+                return Told::Refused(Refusal::NotHere);
+            };
+            if !set.cs.iter().zip(set.replicas.iter()).any(|(&c, &r)| c == me.id && r == Replica::Active) {
+                return Told::Refused(Refusal::NotHere);
+            }
+            let known = Epoch { set: ch.set, version: set.version };
+            if from.epoch != known || to.epoch != known {
+                return Told::Refused(Refusal::Epoch { known });
+            }
+            if *generation == 0 || v.writer.as_ref().is_none_or(|w| w.generation != *generation) {
+                return Told::Refused(Refusal::NotAttached);
+            }
+            Told::Verified
+        }
+        /* Proposals: nbs-mds's, through raft, not answered from the state */
+        Question::JoinDone { .. } | Question::GiveUp { .. } => Told::Refused(Refusal::NoMds),
         Question::Live { chunks } => Told::Gone(chunks.iter()
             .filter(|(c, inc)| s.chunks().get(*c as usize).is_none_or(|ch| ch.is_free() || ch.incarnation != *inc))
             .map(|&(c, _)| c).collect()),
@@ -74,7 +152,6 @@ pub fn told(s: &State, host: &str, applied: u64, q: &Question) -> Told {
 fn replica_state(r: Replica) -> ReplicaState {
     match r {
         Replica::Active => ReplicaState::Active,
-        Replica::Rebuilding => ReplicaState::Rebuilding,
         Replica::Down => ReplicaState::Down,
     }
 }
@@ -104,8 +181,12 @@ pub fn map(s: &State, applied: u64, name: &str, from: u32, count: u32, index: u6
             chunk: ChunkRef { chunk: c, incarnation: ch.incarnation, epoch: Epoch { set: ch.set, version: set.version } },
             cs: set.cs,
             replicas: [replica_state(set.replicas[0]), replica_state(set.replicas[1]), replica_state(set.replicas[2])],
+            joiner: set.joiner.map(|j| j.cs),
+            /* Another map's too (N10) -- and so where a copy-up is pending,
+               which the metadata gives up of a chunk named by one map */
+            shared: ch.count > 1,
         });
-        for &cs in &set.cs {
+        for cs in set.cs.iter().copied().chain(set.joiner.map(|j| j.cs)) {
             if !named.contains(&cs) {
                 named.push(cs);
             }

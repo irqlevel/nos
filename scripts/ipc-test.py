@@ -132,11 +132,12 @@ def accel_of(arch):
     return "kvm" if os.path.exists("/dev/kvm") and platform.machine() in ("x86_64", "AMD64") else "tcg"
 
 
-def qemu(arch, accel, image, log, hub, i, iso, disks=()):
+def qemu(arch, accel, image, log, hub, i, iso, disks=(), monitor=None):
     """Host i's QEMU: its root `image`, and each of `disks` -- raw images --
-    a virtio disk of its own after it."""
+    a virtio disk of its own after it, drives more0, more1 and on; with
+    `monitor`, QMP on that unix socket (`hmp`)."""
     lan_mac = hub.mac(i)
-    more = []
+    more = ["-qmp", "unix:%s,server,nowait" % monitor] if monitor else []
     for k, d in enumerate(disks):
         tag = "more%d" % k
         dev = "virtio-blk-device,drive=%s" % tag if arch == "aarch64" else \
@@ -163,6 +164,38 @@ def qemu(arch, accel, image, log, hub, i, iso, disks=()):
         "-device", "virtio-net-pci,netdev=lan,mac=%s,disable-legacy=on,disable-modern=off" % lan_mac,
         "-netdev", hub.netdev(i),
         "-device", "virtio-rng-pci"] + more
+
+
+def hmp(path, command, timeout=30):
+    """`command`, a human monitor's, given to QEMU through QMP on the unix
+    socket at `path`: what it answered, or None."""
+    import json
+    import socket
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect(path)
+    f = s.makefile("rwb")
+
+    def reply():
+        while True:
+            line = f.readline()
+            if not line:
+                return None
+            msg = json.loads(line)
+            if "event" not in msg:
+                return msg
+
+    try:
+        reply()
+        for ask in ({"execute": "qmp_capabilities"},
+                    {"execute": "human-monitor-command", "arguments": {"command-line": command}}):
+            f.write(json.dumps(ask).encode() + b"\n")
+            f.flush()
+            got = reply()
+        return got.get("return") if got else None
+    finally:
+        f.close()
+        s.close()
 
 
 PING = re.compile(r"ipc ping: to=\S+ sent=(\d+) answered=(\d+) wrong=(\d+) bounced=(\d+) timeouts=(\d+) "

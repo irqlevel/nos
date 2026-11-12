@@ -431,7 +431,7 @@ fn run(args: &str, out: &mut Output) -> Result<(), String> {
     STOPPING.store(false, Ordering::Relaxed);
     let o = parse(args)?;
     let me = nbsdrive::this_host()?;
-    let d = Drive::open(o.volume, &me, o.mode.writes(), o.force)?;
+    let d = Drive::open(o.volume, &me, o.mode.writes(), o.force, Some("nbsload"))?;
     let size = d.session().size();
     let span = match (o.span, o.mode) {
         (Some(s), _) => s.min(size),

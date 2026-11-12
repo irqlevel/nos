@@ -230,10 +230,12 @@ type Up = Option<(Session, Arc<Peer>, usize, u64)>;
 /// Hello said and heard, and the peer's session joined.
 fn dial(shared: &Arc<Shared>, peer: Arc<Peer>, class: usize, session: u64) -> Up {
     let ip = peer.conf.ip;
+    /* Its own port where it says one (#99), else ipcnet's */
+    let port = if peer.conf.port != 0 { peer.conf.port } else { super::files::DEFAULT_PORT };
     let stream = if class == BULK {
-        TcpStream::connect_bulk(&shared.nic, ip, shared.cfg.port)
+        TcpStream::connect_bulk(&shared.nic, ip, port)
     } else {
-        TcpStream::connect(&shared.nic, ip, shared.cfg.port)
+        TcpStream::connect(&shared.nic, ip, port)
     };
     let Some(stream) = stream else {
         peer.lose(&shared.router, session, "no answer");
@@ -594,6 +596,7 @@ fn run(shared: &Arc<Shared>, sess: &mut Session, peer: &Arc<Peer>, class: usize,
 fn serve_link(shared: &Arc<Shared>, sess: &mut Session, peer: &Arc<Peer>, class: usize, session: u64)
               -> &'static str {
     let Some(number) = peer.number(session) else { return "the session ended" };
+    let waker = sess.waker();
     let mut sender = Sender { open: Vec::new(), promised: 0, next_num: 1, turn: 0 };
     let mut asm = Assembler::new(OPEN_MAX, OPEN_BYTES_MAX, PIECES_MAX);
     let mut inbuf: Vec<u8> = Vec::new();
@@ -621,7 +624,15 @@ fn serve_link(shared: &Arc<Shared>, sess: &mut Session, peer: &Arc<Peer>, class:
         }
         /* Out: frames into the session while it has room */
         let mut moved = false;
-        while sess.pending() < MAX_PENDING && sender.next(peer, class, &mut frame) {
+        let mut capped = false;
+        loop {
+            if sess.pending() >= MAX_PENDING {
+                capped = true;
+                break;
+            }
+            if !sender.next(peer, class, &mut frame) {
+                break;
+            }
             if !sess.write(&frame, WRITE_ROOM) {
                 return failed(&sess);
             }
@@ -632,6 +643,19 @@ fn serve_link(shared: &Arc<Shared>, sess: &mut Session, peer: &Arc<Peer>, class:
                 Flush::Failed => return failed(&sess),
                 Flush::Done | Flush::More => {}
             }
+        }
+        /* More to go, and TCP took all of it: no wait for what comes in.
+         * The socket is woken first, so that the read below comes back at
+         * once when nothing is there -- with what is, when something is --
+         * and the next turn puts the next frames in. Without it a turn put
+         * MAX_PENDING in, TCP sent it in a few hundred microseconds, and
+         * the read then waited out its millisecond for data that was not
+         * coming: 64 KiB a turn of 2.4 ms, some 27 MB/s a connection
+         * whatever the link -- the same between two VMs on one bridge as
+         * across 1 GbE (N11). Waking its own socket costs the router's
+         * next wake nothing: the loop is on its way to the queues. */
+        if capped && sess.pending() == 0 {
+            waker.wake();
         }
         /* In: what came -- for a millisecond while things go out, and while
          * nothing does until the next Ping is due: the socket's wait ends

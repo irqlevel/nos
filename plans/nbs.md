@@ -731,23 +731,1261 @@ each new gate.
     elsewhere, a volume moved between hosts, a forced start fencing the old
     guest, a host killed under a write.
 - **N9, repair.** A host or a device lost, epochs, a rebuild under writes, a
-  host back; a scrub comparing replicas by checksum.
-- **N10.** Snapshots, images and clones.
+  host back; a scrub comparing replicas by checksum. **Done** in six steps,
+  N9a-N9f (2026-11-08..09): the metadata of repair, the copy, the leader's
+  controller, all of it under the cluster target's crashes and writes, the
+  scrub -- which says what differs, a person taking a member down -- and
+  nbs-test end to end on four hosts. The design, as decided before it is
+  built:
+  - **A set and its joiner.** A set keeps its three members, each Active or
+    Down -- the version a member went down at kept with it -- and at most
+    one *joiner*: a cs being copied onto, written and not read, which takes
+    a member's place once its copy is done. One mechanism for every case:
+    a cs back before `out_after` joins in its own place and copies only what
+    it missed; a cs out -- `out_after` past, its host removed -- is replaced
+    by a new one in the place it leaves; a cs drained is replaced while it
+    stays active, four copies for a while and never two. Joining and the
+    join's end each raise the set's version.
+  - **Rule 3, by the epochs the cs's keep per chunk.** The joiner pulls each
+    chunk from an active member with the join's epoch: the source moves the
+    chunk's known epoch on before it reads it (checked with its own mds),
+    so a write of the epoch before is refused there from then on, and its
+    writer, its map read again, writes the joiner too. A write the joiner
+    has from a client marks its granules, and the copy leaves those alone:
+    the client's are newer.
+  - **What a cs back copies**: the chunks its source wrote at or after the
+    version the member went down at -- the writes it may have missed -- and
+    every chunk it no longer holds (a device lost with them); its other
+    chunks are the same on every replica already.
+  - **Verified before the end**: every granule copied is held to the
+    source's by checksum before the joiner says it is done; one that
+    differs and was not written meanwhile is copied again and said.
+  - **The controller** is a pure function of the committed state and of
+    what the leader sees of each cs -- answering or not, for how long, in
+    maintenance or not -- in nbsmeta, the same that the fuzzer runs: a cs
+    silent 5 s is down (`CsDown`: every set it is a member of, and every
+    join it is the joiner of), one silent `out_after` (10 min, held off by
+    the registry's maintenance flag) is out (`CsOut`); a set with a member
+    down or out, or drained, is given a joiner (`Join`), those with one
+    active member left first; `place` picks a new one -- up, not in the set,
+    its host not a member's, the room for every chunk of the set, the most
+    room first. A set is rebuilt whole: the batches of 64 the plan began
+    with would mean splitting a set, which comes when the numbers ask for
+    it. The leader proposes, every 10 s and at every change it hears of;
+    the joiner's cs says when it is done (`Joined`), and a join whose joiner
+    goes down is dropped with it.
+  - **Steps**: N9a, nbsmeta's commands, the joiner, the controller and
+    `place` for a joiner, the snapshot NBM5, the `meta` target's model and
+    its progress rule (every set back at three active members within so
+    many turns once hosts and room allow); N9b, the copy -- nbswire's pulls
+    and checksums, nbscs's granule marks, nbs-cs's joiner; N9c, the
+    controller in nbs-mds -- monitors of every `nbs.cs`, the timers, `nbs
+    status`'s counts; N9d, the client writing the joiner, and the `cluster`
+    target losing, bringing back and draining hosts under writes; N9e, the
+    scrub; N9f, nbs-test with a short `out_after` -- a host of four lost for
+    good and every chunk back at three, a host back that copies only what
+    was written meanwhile -- docs and gates.
+  - **N9a, done** (2026-11-08): a cs up, down or out (`CsDown`, `CsUp`,
+    `CsOut`), a set's members down with the version each was active until,
+    its joiner (`Join` at the version it was planned at, `Joined`,
+    `Unjoin`), new chunks only into a set every member of which is active
+    and with no joiner, and only on cs's that are up, an empty set made
+    again before a new one; the snapshot NBM5; `nbsmeta::repair` -- the
+    controller and the counts `nbs status` will show; the `meta` target's
+    model of all of it, and its progress rule. What came up on the way:
+    - **A cs's change and a join in one turn**: a join planned on the state
+      before its cs came back up was refused as in place. The controller
+      proposes the cs's changes alone, and joins at the next turn.
+    - **A placement's count of the sets it takes** (found reading it): the
+      trial counted every empty set as one to make again, the real pass
+      only those whose version can move on, and the trial did not see that
+      making again the empty clean set of three cs's picked later leaves
+      those three needing one more -- with the table full, an
+      `unreachable!` in nbs-mds. The count and the pass now share one rule
+      (`spare`): an empty set is made again only where it is no clean set
+      the placement fills. The table is never full in the fuzzer; the model
+      holds the order the rule gives, and its own mutant fails the gate.
+    - **Mutants**: twenty-two of N9a's and five re-pointed, 75 in all. Two
+      survived the first run: `cs_down_keeps_last` took out a check that
+      `touches` had made redundant -- the rule is in one place now -- and
+      `joiner_checked` was out of reach of spoiling bytes at random, so a
+      set's joiner is now found by its values and spoiled on purpose.
+      `replica_down_drops_joiner` was caught by luck only, until a writer's
+      `ReplicaDown` was drawn of a volume there is, of a set it has chunks
+      in, and now and then of the set's joiner. Three mutants wait for N9d's
+      `cluster` target with joins: the mds vouching a joiner for writes
+      only, the client writing the joiner, the map naming its host.
+  - **N9b, done** (2026-11-08): the copy, as nbs-cs.ko runs it --
+    nbswire's `copy`, sans-I/O, beside its `serve`, so that the fuzzer's
+    cs's run the same one:
+    - **Its asks of a source**, an active member: `Op::Holdings` (the set's
+      chunks it holds, a page of 4096 at a time), `Op::Pull`, `Op::Sums`,
+      `Op::Touch`. Each names the joiner and the set's version, which the
+      source's mds vouches for (`Question::VerifyJoin`) -- asked once, then
+      kept. A pull, a sum and a touch move the chunk's known epoch on at the
+      source, durable before it reads (`Store::advance`). From then on, a
+      write of the epoch before is refused there. Its writer must have
+      every active member's acknowledgement, so it reads its map again and
+      writes the joiner too.
+    - **The marks**: a write vouched for as the joiner's
+      (`Told::VerifiedJoining { since }`) has the store mark the set's
+      writes from then on, a bit a 512-byte sector, in memory alone. A copy
+      writes only where no sector is marked (`Store::copy_in`), and one into
+      a set not joined is refused. The marks belong to one join: a join of
+      another `since` drops them, as the source may have newer data than
+      they kept. A joiner never resumes a join: one found as nbs-cs starts
+      is given up (`Question::GiveUp`).
+    - **A member back** pulls a chunk the source last wrote at or after the
+      version it went down at, one it does not hold, and one it found open
+      (taken as the copy begins, before a write clears it). It touches the
+      rest: the touch moves the epoch on and tells, with the move, the
+      version the chunk was last written at, so a write the member missed
+      since the listing has it pulled after all (found designing the
+      `join` target: decided at the listing, it would have been lost).
+    - **The check**: a chunk pulled is summed against the source's. A
+      granule that differs is pulled again and held to the source's a
+      sector at a time, the marked sectors left out. A sector that differs
+      is copied in and read back, and one that does not read back as
+      copied is a round; past three, the join is given up and said. (Found
+      by the `join` target: left out whole for a client's write in it, a
+      granule's rot went unchecked.) The chunk is then closed at no
+      writer's generation (`Store::close_copy`), its data flushed first.
+    - **A found-open chunk**, refused to its own writer as failed since N8,
+      is written by its set's joiner. The cs asks its mds first where the
+      store does not know of the join yet. (Found by the `join` target: the
+      writer asked the member back out at its first write, and its join was
+      dropped each time it was made.)
+    - **The end**: every chunk done, the joiner asks its mds for the join's
+      end (`Question::JoinDone`), which nbs-mds proposes as `Joined`; a copy
+      that fails asks for `Unjoin` likewise.
+    - **What the `join` target found** besides, each with its mutant now:
+      a write in flight of an epoch the cs's cache had vouched for was taken
+      after a pull had moved the chunk on, and moved its epoch back (true of
+      N8's taking out too) -- an epoch older than the one a chunk is known
+      at is refused, vouched for or not; and a copy given up part way had
+      written the record of a chunk found open, which was found open no
+      more, and the next join's copy touched it -- such a chunk is suspect
+      until a copy has pulled it whole and closed it; and a record of the
+      copy's, at generation 0 -- no writer's -- read back as bad, so that
+      every chunk a copy had taken in was lost at the cs's next start. The
+      target's checks after a cut had compared the chunks still held: none
+      were, and they passed. They now hold the joiner to no record lost.
+    - **Focused runs**: five of the copy's mutants survived a hundred random
+      runs, caught once in thousands -- each a race of several steps. A
+      tenth of the runs each now sets one of them up: the power failing
+      inside a close, an old writer at the epoch a closed chunk was left at,
+      one between a member back's listing and its touch, a write on the
+      joiner held from the source past the copy, a found-open chunk part
+      copied when the join is given up.
+    - **The gate's seeds**: an epoch older than a chunk's refused made two of
+      N8's races rarer in the `cluster` target -- a flush refused to a writer
+      with a chunk found open, a flush done only after those before it --
+      caught once in some 150 runs; and the sector-by-sector check's in the
+      `join` target once in some 120. The gate now runs the `cluster` target
+      over 1000 seeds and the `join` target over 800, about half a minute.
+    - **Tests**: fuzz/nbs's `join` target, a join between two engines over
+      a network that drops, repeats and reorders, with writers of the map
+      now -- up to three in flight -- and of maps before, the set moving on,
+      rejoins, rot, members back with chunks found open, and the joiner's
+      power failing mid-copy; at its end every chunk of the set on the
+      joiner is the source's, and every one the copy closed still is after
+      a power cut. Fifteen mutants of its rules; the wire target's new
+      messages.
+  - **N9c, done** (2026-11-08): the controller in nbs-mds, run by the
+    leader:
+    - **What it watches**: every cs, once a second, by the look it takes
+      before a replica is taken out (`Op::Ping`): a cs answering and
+      serving is seen up; one silent 2.5 s past its last answer, silent.
+      Its silence counts from when this leader began to watch it, so that a
+      new leader takes none for down at once; a member that is no leader
+      keeps nothing of it.
+    - **What it proposes**: every 10 s -- and a second after its last plan
+      at the soonest where the state moved on (a cs changed, a join done or
+      dropped, so that a cs back in many sets is not ten seconds a pair of
+      joins) or a cs went silent past `DOWN_AFTER_MS` or came back -- what
+      `nbsmeta::repair::plan` makes of the state and of what it saw: cs's
+      down, up and out, then joins. One plan at a time: none is made while
+      one is still to be applied, and after a refusal the ten seconds'
+      alone, each refusal said, so that one is not proposed again every
+      second. `out_after=<seconds>` (10 to 86400, ten minutes unless given)
+      is how long a cs is silent before it is out and its places taken by
+      others. The registry's maintenance flag is not read yet.
+    - **`nbs status`** says how far from three the chunks are: at three
+      replicas, at two, at one, being copied and by how many joins, and the
+      cs's down and out.
+    - **Found by nbs-test's repair phase, in the client**: c had
+      acknowledged a write; killed, it was taken out of every set -- there
+      by the controller's `CsDown`, which the client read in its map at the
+      next write -- and the close's flush then went to it and waited for
+      good, no set being left to ask it out of. A flush now goes only to the
+      cs's some set of the volume still writes, and a flush, a close or a
+      fence asked of a cs no set writes is done, not waited on. The
+      `cluster` target could not have seen it: its hosts always came back,
+      and its writes reach three of the volume's six chunks, so a host lost
+      was never out of every set by the writer's own taking out, the one
+      way it has. At the end of some runs a host is now lost for good --
+      the one down kept down where every chunk can do without it, or
+      nbs-test's case shaped: every chunk written, a host that holds some
+      lost, every chunk written past it, then a flush and a close, which
+      must be done, and no flush sent to that cs. The flush's half has its
+      mutant (`client_flush_written`), 91 in all. The other half -- what was
+      asked of a cs before a map read dropped it, done once the cs is found
+      silent -- is the one cover where the request went first: a cs the
+      controller has down, or a drained cs's place taken by its joiner,
+      while a flush or a close to it is out. N9d's `cluster` target, with
+      the controller in it, is to reach that, and its mutant then join the
+      three above.
+    - **nbs-test's phases before the repair one** reboot c and unload its
+      cs: under TCG a boot is past `DOWN_AFTER_MS`, so the controller has c
+      down and its replicas out until its joins are done -- x86-64 read c's
+      data from a, not c. A read on c from its own replica now waits for
+      every set to be whole again.
+    - **Tests**: nbs-test's repair phase, on both arches: a volume written,
+      c killed -- the leader's controller has its cs down -- the volume
+      written past it and closed, c booted again: its cs up, joined in its
+      own place, every chunk at three again with none being copied, and a
+      read on c of what was written while it was gone, which its join's
+      copy took. nbs-test 148 of 148 on arm64 (HVF) and x86-64 (TCG).
+  - **N9d, done** (2026-11-08): the controller and the copy in the `cluster`
+    target, and what they found:
+    - **The target**: the leader's controller runs there as in nbs-mds --
+      `repair::plan` takes its thresholds now (`repair::After`, nbs-mds's
+      `DOWN_AFTER_MS` and `out_after=`; the target's two seconds down,
+      four out, its outages 0.4 to 4.4 s: at a second and three nearly every
+      restart had left its sets first, and N8's rules for a member back with
+      a chunk found open were reached no more) -- every half second, on what
+      it sees of each host; each host's cs looks at its joins as nbs-cs
+      does and runs nbswire's copy over the target's network, a source's cs
+      serving it by `serve`; a copy done or given up proposed as `Joined` or
+      `Unjoin`; a host drained now and then, one a run. At the end every set
+      is held to
+      three active members, none on a drained cs, no joiner -- within ten
+      minutes of the network's time -- and every proposal of the
+      controller's to be applied, none refused.
+    - **What it found in the client**: a set's version taken from a
+      take-out's answer two past the view -- a join begun between, which the
+      view lacked -- so the joiner was never written: an answer one past is
+      that take-out alone, one further marks the set behind, its writes held
+      until the map is read again; a write out by a view the map read since
+      changed, waiting for a down last replica alone, done once that one was
+      taken out -- by no replica: a map read sends a changed set's writes out
+      again by the new view; a member joined while the start fenced, never
+      fenced, the start waiting for good; a read with no active replica in a
+      view behind its set, which failed a reconcile and its session -- it
+      waits for the map; a session detached failed by a late answer; an
+      ask-out refused as no replica of its set -- a cs lost for good, its
+      places joined by others -- asked again a second on for good, the map
+      never read again, the stop waiting on the cs: a refusal has the map
+      read again, which drops every ask about a set that no longer writes
+      its cs; and a close a cs back refused as not in the chunk's set
+      (`NotHere`), sent again on each map read for good -- done so now.
+    - **In the cs**: a copy's close that left out its flush where a client's
+      write left the chunk open at its generation -- copied sectors lost to
+      a power cut once the join was done; a pull's moving the epoch on,
+      which took a found-open chunk's mark off, so its writer went on with a
+      replica short of a write; a found-open chunk serving as a source --
+      refused now, the copy waiting or taking another; a joiner taking a
+      write of an epoch before its join, from a writer taken over since,
+      which the copy then kept marked -- refused now; a copy keeping an open
+      mark from before its join -- the joiner a member then, taken out with
+      the chunk open, its writer closing it on those it had left -- which
+      the joiner's crash made found open, its set's last member then no
+      source for the joiner after it: the copy closes at its end a mark no
+      client has written since the join began, whether it wrote the chunk
+      or found it the source's already.
+    - **In the copy**: a member back touched the chunks it thought it had not
+      missed, and kept a write a writer taken over had made on it while it
+      was out -- unfenced, the members fenced against that writer refusing
+      it. It holds every chunk to its source's by sums now, copying only
+      what differs; `Op::Touch` is gone from the wire, `serve` and the store.
+    - **The judges**: the flush owed a host lost for good is judged as
+      sent -- one sent while the view had the host in got there after, a
+      false finding; a writer asks a cs out of a set only where its view
+      writes it there, else it would ask for as long as it lives; and an
+      operation fails only at its deadline or with its session -- a read in
+      a view with no active replica among them failed at once, unjudged,
+      the rule caught by 4 runs in 3000 until then, by 5 in the first 63
+      after.
+    - **Mutants**: 104 in all, each caught. Taken out as redundant, each
+      surviving 1000 seeds as it must: `serve`'s fence of a cs come into the
+      view while reconciling (its writer taken over writes from a view before
+      the join, which the joiner refuses), `ask_out`'s re-send of a write
+      waiting for a cs the view dropped (the map read sends it again), and
+      the mds vouching a joiner for writes alone (a view naming it active is
+      from before its join, whose epoch is refused), a found-open mark put
+      back after a pull's epoch move (no pull reaches such a chunk now), and
+      a chunk found open kept suspect until a copy pulled it whole, though
+      written since, and then a member back pulling whole what it found
+      open at all (it holds every chunk it keeps to its source's by sums,
+      which find what a power cut lost; the join target's focus on a member
+      back with every chunk found open, its last writes cut, holds without
+      it). `client_cs_wide_out` and `client_resend_changed`, which no
+      random run reached, are caught by the end shaped for them: the
+      controller has the host lost down before the writer touches its sets.
+      `client_refused_rereads` and
+      `client_close_not_here`, which random runs reached no more once the
+      copy's rule was in `close_copy`, by two more: the host lost's places
+      all others' before the writer touches its sets, and a drained host
+      back with its chunks found open, sent closes by a writer stalled while
+      its cs was taken down; `found_open_no_source`, by a third: a set's
+      first source back at once with its chunks found open, the last writes
+      on it unflushed, while another member is drained and the writer
+      stalls -- drawn of their own, so that a run they do not shape goes as
+      it did.
+    - **The cost**: the target's 1000 seeds take some 90 s now, against 11:
+      copies move whole chunks. The gate keeps its 1000 seeds: several of
+      the new rules are caught only a few times in a thousand -- a joiner
+      fenced while the start fences, a read waiting for the map, a found-open
+      chunk no source, the copy's flush.
+    - **Tests**: the `cluster` target 3000 seeds; the gate; 104 mutants,
+      each caught; nbs-test 148 of 148 on arm64 (HVF) and x86-64 (TCG);
+      raft-test; make check, both arches and their modules built.
+  - **N9e, done** (2026-11-08): the scrub.
+    - **What it holds**: a chunk closed on every active member of its set
+      is the same on each -- held by the CRC-32C of each 64 KiB granule, the
+      sums the copy holds a chunk to its source's by. The leader looks at a
+      chunk at a time (`nbswire::scrub`, sans-I/O, the one nbs-mds runs and
+      the cluster target does; `scrub=<seconds>` its pace in nbs-mds, ten
+      unless given, 0 for none), asking each active member by `Op::Scrub`,
+      which moves no epoch on and reads nothing of an open chunk. An open
+      chunk, a set moved on, an answer late or refused: let be, for a later
+      round. A member that holds none of the chunk is compared as what that
+      reads as, zeros (`nbscs::zero_sums`): one that lost a chunk the others
+      hold differs as a rotted one does. A chunk held by none was never
+      written, and the next is looked at a hundredth of the pace on (not at
+      once: the member's turn follows each answer, and empty chunks would be
+      asked about as fast as answers came) -- found by nbs-test, whose
+      volumes at the end were never written: every look was let be, and a
+      volume mostly unwritten would have taken a round of ten seconds a
+      chunk.
+    - **Two looks**: a difference is a finding only when a second look, two
+      seconds on, finds every member's answer as the first did -- a write
+      and a close between two members' answers would show one that is none.
+    - **It says, and takes nothing down** -- changed from the design as
+      first proposed, which had the odd one of three taken down at once. The
+      cluster target found why not: a joiner copied a source that had rotted
+      before the scrub found it, two members were alike in rot, and the scrub
+      took the one good copy down, its join back about to copy the rot over
+      it. With no checksum of its own data a cs keeps, two alike are no
+      proof which holds it. So the scrub says what it found -- the log, `nbs
+      status`: the chunk, its set and version, the member unlike the two
+      others where two agree -- once for the set's version, and a person
+      takes the member down: `nbs replica bad <set> <host>`
+      (`Command::ReplicaBad` at the set's version now: refused as stale past
+      it and with a joiner in the set, as a join is -- `set_at`, one copy of
+      those checks now -- for a member down already, `AlreadyDown`, and
+      never the last active member, as a replica taken out -- `member_down`,
+      one copy of that). `nbs status` names the command with each finding,
+      and shows a finding of a set that has moved on since as history. The
+      controller has it
+      join its own place again; its copy holds every chunk to a source's by
+      sums. Taking down by itself waits for checksums a cs keeps of its own
+      data.
+    - **Tests**: the `cluster` target runs the scrub as the leader's, its
+      asks and answers in a queue and a randomness of their own so that a
+      run goes as it would without them, held to finding nothing the target
+      did not rot; once every set is whole at the end, a sector of a closed
+      chunk rots on one member -- or on two -- the finding is held to what
+      was rotted (one member: the one unlike the two others; two: no two
+      alike), said once, and the members taken down half a minute on as a
+      person would are copied again: every replica alike. 198 single and 51
+      double rots in the gate's 1000 seeds, each found as it was and mended.
+      The target's 1000 seeds take some 130 s now, against 95: each look
+      reads a chunk whole on three members (the fuzzer's disk reads were
+      made one pass over the cache a read, rather than a sector). A target
+      of its own, `scrub`, holds the scrub alone over members the target
+      models: a writer's writes and closes on one way to each member -- a
+      close once every member has the writes before it -- the scrub's asks on
+      another, granules rotted on one member or two, every finding held to
+      what each member held when it answered; it is where the second look's
+      rule is caught, a race the cluster target's chunks, closed seconds
+      after their last write, never put together. Its members hold a chunk
+      once its first write reaches them, its writer writes half the chunks
+      seldom, and a member loses a chunk now and then; a look at a chunk
+      held by none is to be followed by the next well inside half a look's
+      turn. The `meta` target models
+      `ReplicaBad`; the `wire` target draws `Op::Scrub` and its answer.
+      nbs-test runs nbs-mds with `scrub=1` and holds the leader's scrub to
+      having found a chunk written at the end alike, the volumes' others
+      held by none, none unlike. Mutants: 113, the scrub's eight and
+      `ReplicaBad`'s one among them -- its other rules are the join's and the
+      take-out's, which now share their code with it. The first full run
+      left two: `counters_checked`, an N8 rule of the snapshot's that the
+      meta target's random spoils had reached by luck, the seeds that did so
+      moved by `ReplicaBad`'s draw -- the counters are now aimed at, of a
+      randomness of their own, and a device and a volume added to what was
+      taken; and `scrub_set_as_asked`, whose set the cluster target's runs no
+      longer moved under a look -- the scrub target now takes members down
+      and back under its looks, and both targets hold every finding to the
+      set's version now. The scrub target also sets up the two races its
+      second look and its closed-chunks rule are for (one member's answer
+      taken before a write and a close the others' come after; a close
+      held back on one member), its writer leaving a chunk alone while its
+      close is on its way and its end closing a chunk only once the writes
+      are delivered, as a client does; and its person acts a few seconds
+      after a finding, so that one said twice would show.
+    - **Not yet**: an nbs-test phase with rot -- a sector spoiled on one
+      host's device while it is off, found, and copied again by `nbs replica
+      bad` -- goes with N9f.
+  - **N9f, nbs-test end to end** (2026-11-09):
+    - **A short `out_after`**: every host's nbs-mds is loaded with
+      `out_after=10`, the least it takes. With three hosts nothing can take
+      a lost host's places -- a set's three are on three hosts -- so a host
+      gone past it comes back into its own places as before; its cs is out
+      meanwhile, and the repair phase now waits for it down and then out.
+    - **A host back copies only what it missed**: the repair phase writes
+      both chunks of its volume before c goes, and one of them while c is
+      gone. Between, the sets move on (b's cs taken away and back): a chunk
+      written at the version a member was last active at may be one it
+      missed -- a write on its way as it went -- and is pulled whole, as the
+      copy's rule has it (found by the first run, which lost c at the
+      version both chunks were written at: both pulled); one written before
+      is one it held through, held to its source's by sums. nbs-cs's "set S
+      joined" line now says what the join's copy did
+      (`copy::Stats`: chunks copied, those found as the source's, bytes
+      pulled, granules pulled again); over c's joins, read through `dmesg`
+      -- klog's lines do not reach the serial console once the shell runs
+      -- the bytes pulled are the chunk written meanwhile, whole, and the
+      other chunk is found as its source's.
+    - **A host of four lost for good**: a fourth host, d, boots late, is
+      invited into the registry and added to the NBS cluster, and its cs
+      takes its device in. A volume made before it, on a, b and c, is
+      written; one of the three, not the leader, is killed for good: its cs
+      down at 5 s, out at 10, and d joins every set it was in, in its place
+      -- every chunk back at three, none being copied, the volume read off
+      d's own replica. The lost host is removed: three members again.
+    - **Rot, found and copied again** (N9e's deferred phase): a chunk written
+      and closed, its bytes found in each of its three hosts' pool images
+      (by an mmap search: 64 KiB of a byte no other volume writes), and a
+      sector of them spoiled on one host -- running -- through QEMU's QMP
+      (`human-monitor-command`: `qemu-io more0 "write -P ..."`), under its
+      cs with no cache between. Spoiled while the host was off, it would be
+      mended by its member back's copy before any scrub looked: a member
+      back holds every chunk to a source's by sums. The leader's scrub says
+      it in `nbs status`, with the command; the test runs it (`nbs replica
+      bad`); the member joins its own place again and its copy pulls what
+      differs; the chunk reads back off that host's replica as written,
+      the image's sector as it was, and the finding is shown as history.
+    - The later phases run on the hosts alive; the last scrub check holds
+      the leader to no finding of now -- the rot's is history.
+    - **Done**: nbs-test 189 of 189 on arm64 (HVF) and x86-64 (TCG), and on
+      arm64's `UBSAN=1 RUSTUB=1` build.
+- **N10, snapshots, images and clones.** Decided 2026-11-09: thin room, an
+  attached volume's snapshot by pausing its writer, a shared chunk copied
+  locally on its cs's, deletes allowed while others share the chunks. The
+  design, as decided before it is built:
+  - **The metadata** has the fields already: a volume's `kind` and
+    `origin`, a chunk's `count` of the maps that name it. New commands:
+    - `Snapshot { volume, name, generation }`: the volume's map copied into
+      a volume of kind snapshot, every chunk's count up; at the writer's
+      generation -- the writer that paused for it -- or 0 for a detached
+      volume. Of a volume only: an image or a snapshot is read-only, cloned
+      rather than snapshotted.
+    - `Freeze { volume }`: a volume made an image, read-only for good;
+      refused while attached.
+    - `Clone { from, name, host }`: a volume whose map is an image's or a
+      snapshot's, every chunk's count up; its origin kept.
+    - `CopyUp { volume, place, generation }` and `CopyDone { volume, place,
+      generation, chunk }`, the writer's, below.
+    - A delete counts its chunks down, a chunk at none freed, as now --
+      allowed while snapshots or clones share them, which keep them.
+  - **Room, thin**: a snapshot or a clone reserves nothing. A copy-up takes
+    a slot on each of its set's cs's, refused where one has none left; it
+    may take the room kept to rebuild a host -- a guest's write failing
+    while there is room would be worse -- and `nbs status` says when the
+    room left could not rebuild the biggest host.
+  - **A copy-up, in two steps, eager**: a write to a shared chunk -- one
+    whose count is more than one, as the map the client reads says -- is
+    held while the writer asks `CopyUp`: a new chunk in the same set (rule
+    7), its room taken, pending -- the volume's map still names the old
+    one, which so stays alive. The writer has each active member copy the
+    old chunk's slot into the new one's locally (`Op::CopyUp`, idempotent,
+    durable before it answers), then asks `CopyDone`: the map names the new
+    chunk, the old one's count goes down -- freed at none -- and the write
+    goes on. Copied lazily instead, on a cs's first request for the new
+    chunk, the old one could be freed -- its last snapshot deleted -- before
+    a slow cs had copied it. A crash between the two steps leaves the
+    copy-up pending: the next writer's asks find it and finish it; a
+    member down meanwhile has the new chunk by its join's copy, as any
+    chunk it does not hold; a volume deleted frees its pending ones.
+    Copy-ups and joins never meet in a set (found designing N10b): a joiner
+    lists what its source holds once, so a new chunk behind its listing
+    would never reach it. A copy-up into a set being joined is refused
+    (`Joining`), and a join gives up its set's copy-ups pending as it
+    begins; their writers ask again once it is over -- a write to a shared
+    chunk of a set being joined waits for the join -- and what the cs's
+    copied for them is garbage, freed as any chunk gone.
+  - **An attached volume's snapshot**: the leader asks the writer's session
+    to pause -- nothing new sent, its writes out answered, a flush -- and
+    to answer with its generation; commits the snapshot at it; tells the
+    session to go on, which reads its map again: every chunk shared.
+    Refused where the writer does not answer in time. Without the pause a
+    write already on its way would land in a chunk the snapshot now
+    shares.
+  - **hv**: `hv convert <file> nbs:<image>` and `hv create <vm> <url> nbs`
+    pour into a volume frozen after; `hv create <vm> image=nbs:<image>
+    size=...` clones it, a VM up at once.
+  - **Tests**: the meta target's model of the commands, counts, pending
+    copy-ups and room; the cluster target -- snapshots and clones under
+    writes, copy-ups racing joins, crashes and deletes, a snapshot held to
+    read for good what the volume held at it; the cs target -- a local
+    copy through power cuts; nbs-test and hv-nbs-test phases.
+  - **Steps**: N10a the metadata and its model; N10b the cs's copy and its
+    target; N10c the client's copy-up and the snapshot's pause, in the
+    cluster target; N10d hv and the commands; N10e nbs-test, docs, gates.
+  - **N10a, done** (2026-11-09): nbsmeta's `Snapshot`, `Freeze`, `Clone`,
+    `CopyUp` and `CopyDone`, `Answer::Chunk`, `Refusal::NotFrozen`; the
+    copy-ups pending in the state and in its snapshot, NBM6, held to a
+    volume's place whose map names the old chunk and to the old chunk's set,
+    and read-only volumes to no writer and to a volume made before them. A
+    count's overflow is no refusal: a map names a chunk once at most, and
+    `VOLUMES_MAX` is below a u16's range -- an assertion of the constants'.
+    The meta target's model knows a chunk by an identity of its own, shared
+    and counted, and learns the metadata's number for it as it first shows,
+    a copy-up's new chunk numbered by the metadata's answer, holding it from
+    then on: one number one chunk. Its draws take snapshots, freezes, clones
+    and copy-ups, biased to places shared and to copy-ups pending a detach,
+    a freeze or a delete meets; aimed spoils of a copy-up pending and of a
+    read-only volume, of randomnesses of their own; fsck's rules of both.
+    Mutants: 135, each caught. The metadata's twenty-two new ones: the first
+    runs left five, caught once the draws and the spoils reached them. The
+    first full run left two old ones, their seeds moved by the new draws:
+    `free_list_checked`, now aimed at as well -- a free chunk's link made one
+    in use, itself or the list's end -- and `spare_not_used`, a placement's
+    rare case, caught at seed 548: the meta target's gate runs 1000 seeds
+    now, not 300 (two seconds). The meta target 30000 seeds; raft-test; the
+    gate; make check, both arches and their modules built.
+  - **N10b, done** (2026-11-09): the cs's copy-up. nbsmeta: copy-ups and
+    joins never meet in a set; a join still needs room for every chunk of
+    the set, the pending ones' among it -- the controller plans none with
+    less, so a join's room less them would be a rule nothing reaches.
+    nbswire: `Op::CopyUp { from, to, position,
+    index }` and `Question::VerifyCopy`, which the mds answers from its
+    state -- the copy-up pending at that place, from that chunk to that one
+    at their incarnations, both at the set's version now, the host's cs an
+    active member, the volume's writer of now asking; `serve` asks it where
+    the cs does not hold the new chunk. nbscs's `Store::copy_up`: the whole
+    chunk, 256 KiB at a time, into a slot taken off the free list only once
+    the record is written; the data flushed before the record -- closed, the
+    volume's, written at the set's version now, so that a member back copies
+    it; asked again with the new chunk held, nothing; of a chunk never
+    written here, nothing taken; refused of a chunk found open, and of an
+    epoch older than the one the cs knows. Another volume's chunk is read
+    and written once the mds vouches that this volume's map names it -- a
+    snapshot's, a clone's, or a clone's alone once its image is deleted --
+    and written, it is the writer's volume's from then on, as its reconcile
+    looks for it; `NotTheVolumes` is gone, and a joiner's copy holds a chunk
+    as whichever volume's it was. The cs target serves copy-ups through
+    `serve`, the fuzzer the mds, power cut at any of their writes; another
+    volume's reads and writes; the meta target holds what the mds vouches of
+    a copy-up to its model. Mutants: 158, the twenty-three new ones each
+    caught -- the copy-up's power cut aimed past its data, where its
+    record's first flush is, and its stale epoch at the one the cs knows,
+    which random draws reached in 5 and 10 of the gate's 200 seeds.
+  - **For N10c, found on the way**: the snapshot's pause closes every chunk
+    the writer has open, as well as flushing, so that a snapshot shares
+    closed chunks only -- the scrub compares no open chunk, and one left open
+    for good would be found open at every start of its cs. `serve`'s
+    refusal of a chunk found open to its writer compares the writer's volume
+    as well as its generation: a clone writes a chunk recorded as another
+    volume's once its image is deleted, and generations are counted by
+    volume. A writer refused `Joining` waits for the join and asks again.
+    A volume with no writer has no chunk open -- the client closes every
+    chunk it wrote before it detaches, and a writer that dies stays attached
+    until the next one's reconcile -- which a snapshot of it, or a freeze,
+    leans on.
+  - **N10c, as it is to be built** (2026-11-09), in two:
+    - **N10c1, the writer's copy-up.** The map says of each place whether
+      its chunk is shared -- named by another map, or a copy-up pending
+      there (`Place.shared`). A write to such a place holds its pieces while
+      the session asks `CopyUp` (`Ask::CopyUp`, `Said::Chunk`), has each
+      active member of the set copy (`Op::CopyUp`) -- one that refuses as
+      failed, or is silent 0.5 s, asked out as for a write -- then asks
+      `CopyDone`; its map names the new chunk then, and the pieces go to
+      it. A copy-up of a chunk shared no longer is answered the chunk
+      itself, written as it is. `Joining` is asked again; past the
+      operation's deadline the write fails, said. A copy-up pending is
+      finished by the next writer, sent to it by the map's flag. The
+      cluster target takes snapshots of the volume between writers -- the
+      writer stopped cleanly (flush, closes, detach), a snapshot, a writer
+      again -- deletes some, and holds each snapshot to reading what the
+      volume held at it, on every active replica and every time; copy-ups
+      race joins, crashes and takeovers.
+    - **N10c1, done** (2026-11-09). nbswire: `Place.shared` -- the chunk's
+      count past one, which a copy-up pending's is, as the metadata gives up
+      one of a chunk named by one map now -- `Ask::CopyUp`, `Ask::CopyDone`
+      and `Said::Chunk`, which nbs-mds proposes as it does an attach; a
+      copy-up into a set with a member drained refused as `Draining` and
+      asked again, as `Joining` is. The client's copy-up as designed above,
+      a take-out past the view having it asked again from its start. A read
+      of a chunk the cs does not hold is vouched for by the mds -- one freed
+      since is not one never written -- and what the mds vouched for is
+      taken only for a chunk held. The garbage pass is nbswire's `collect`,
+      which nbs-cs and the cluster target run. The cluster target takes
+      snapshots between writers and holds each to what the volume held at
+      it. It found a bug of N9's copy, never met before -- a chunk freed
+      under a join dropped with its asks in flight, which were taken for
+      the next chunk's -- and in N10's own: the copy-up done without the one
+      member a stale view asked, the vouched cache letting a stale epoch in
+      for a chunk not held, a copy-up refused for room where a member is
+      drained. Mutants: 171, the thirteen new ones each caught.
+    - **N10c2, done** (2026-11-09). The wire: `Said::Pause`, `Ask::Paused`,
+      `Said::GoOn`, `Ask::Reattach`. The client pauses as decided below; with
+      no word it attaches anew by `Command::Reattach` -- the writer's own
+      attach only, refused where it was taken over -- not by letting go and
+      attaching again, which left a window where a writer after it, on
+      another host or on this one, was taken back. raftmember's
+      `App::take` offers the shell's requests to the app first; nbs-mds
+      takes a snapshot asked with `PAUSE_FIRST` and pauses the session it
+      knows by its attach and its asks since, proposes at its generation
+      once answered, says go on only where it never proposed or once the
+      proposal was applied, and gives a pause up in 5 s. `nbs volume
+      snapshot`. The cluster target pauses its writer as nbs-mds does, the
+      word now and then lost, the snapshot now and then applied late, and
+      judges every chunk closed at the answer and a writer whose pause was
+      given up going on with no attach anew; nbs-test takes a snapshot of a
+      volume `nbs io` writes, its session driven by the snapshot's command
+      while it pauses (`raftmember::ask_turning`) -- left alone between its
+      commands it would not pause. Read over before its gates, which found:
+      a stop asked while paused was begun at once -- it could let go of the
+      volume mid-pause, a take-out on its way then refused as not the
+      writer's, and with no word its flush, queued behind the pause's
+      writes, was begun a second time after the attach anew, the stop told
+      done before the volume was let go of. It is held until the pause is
+      over now, as one asked while starting is, and a stop asked again is
+      refused where it was let overwrite the first. The cluster target saw
+      none of it: it did not judge a stop's end, and its stops' tags had the
+      bit of the session's own operations set, so a flush done out of turn
+      was told to nobody. It holds every stop to being done once, as its
+      session ends, stops a writer paused at some ends, and its tags are the
+      driver's; `stop` refuses a tag of the session's own, as `submit` does.
+      The pause's first stage, waiting for nothing at all to be out, was
+      taken out: its mutant survived, as a write out keeps its place open
+      and the closes wait for it already. nbs-mds keeps a volume's session
+      only by the asks of its writer as applied, not of one taken over on
+      the host. A campaign of the cluster target found its own judge wrong:
+      a writer taken over while it paused answers all the same, and what is
+      open then is the writer's after it -- judged so now, its snapshot to
+      be refused. And the full run of the mutants left N9d's
+      `joiner_epoch_since` uncaught: the one cluster seed that caught it had
+      moved on with the target's course. It is aimed in the join target
+      now -- a writer taken over, of a map from when a member back was
+      still active, writing it as it joins -- which a tenth of its runs
+      reach. Mutants: 182, the eleven new ones each caught.
+    - **N10c2, the snapshot's pause**, an attached volume's -- decided
+      2026-11-09: asked on the writer's host only, whose mds pauses its own
+      session (one asked elsewhere is refused, naming the host). The session
+      paused sends nothing new, waits for what it has out, flushes and closes
+      every chunk it has open, and answers with its generation; the mds
+      proposes the snapshot at it, and once it is applied tells the session to
+      go on, which reads its map again -- every chunk shared. A session that
+      goes on by its own timeout attaches again, so that a snapshot at its old
+      generation is refused.
+    - **Clones in the cluster target** (with N10d): a second volume cloned
+      from a snapshot and written by its own writer -- through chunks the
+      snapshot shares no longer, found open at another volume's generation
+      -- where `serve`'s found-open refusal comparing the volume is judged.
+      Found building N10d1: the cluster's own flows never reach that
+      refusal. A snapshot is taken with every chunk closed (the pause), and
+      a chunk two volumes' writers can reach is shared until one copies it
+      up, so no active replica holds a chunk one volume's writer left open
+      where another's reaches it. The refusal by volume is the store's and
+      `serve`'s contract all the same, and the cs target judges it
+      directly. What a clone's writer in the cluster target is for: a
+      volume born with every chunk shared, reads of chunks recorded as
+      another volume's vouched for by the mds through crashes and joins, a
+      write in place once the snapshot is dropped, and the garbage passes
+      with clones about.
+  - **N10d, in three** (2026-11-11): N10d1 the commands and the provider,
+    and `serve`'s found-open refusal by volume; N10d2 clones in the cluster
+    target; N10d3 hv over the bus, its commands' form to be put to the user
+    first.
+    - **N10d1, done** (2026-11-11). `nbs volume freeze <name>` and `nbs
+      volume clone <from> <name> [host=<host>]`; `nbs volumes` and `nbs
+      volume` say what each is -- an image, a snapshot of its volume, a clone
+      of its image or snapshot. The `nbs` provider: `volume_snapshot`
+      (through `io::snapshot`, as the command), `volume_freeze`,
+      `volume_clone`, and each volume's `kind` and `origin`; the panel's
+      mock and a test of them. nbscs's `found_open_by(volume, ...)`, and
+      `serve` refusing a chunk found open to its writer alone -- the
+      volume's as well as the generation's. Judged directly in the cs
+      target, as the cluster target has no second writer yet: a chunk found
+      open, read through `serve` by another volume's writer at its
+      generation, served (every seed of its 200 catches either mutant).
+      nbs-test: a volume cloned refused; a snapshot cloned, read on a third
+      host through chunks recorded as another volume's, written there --
+      copied up, its snapshot as it was; the clone made an image, written
+      refused, cloned, deleted under that clone, whose write then takes the
+      chunk in place. Mutants: 184.
+    - **N10d2, done** (2026-11-11). The cluster target's clone: made of the
+      newest snapshot -- once each block of it that may hold anything but
+      zeros was read, which seeds the clone's model as writes done and
+      flushed before any -- and written and read by a writer of its own, on
+      the network as `End::Clone`, apart from the volume's writers and their
+      judges (`at_cs` and `at_mds` take who asked; the fenced judge is the
+      volume's writers'). Dropped now and then with every host up, at once
+      where its writer is lost or fails as its last replica refuses it --
+      let go of by force then -- and at the end, after the host down is
+      back, each block held to its model on every active replica; a host is
+      lost for good at the end only where the clone does without it too.
+      Found on the way, the target's own: a stop asked of a clone's writer
+      while a chunk's last replica in was on a host down held it up for good
+      -- the drive does not bring the host back -- as it would the volume's
+      writer, whose stop the target asks only with every host up. And a
+      campaign found the target's judge of a flush wrong for both writers:
+      a flush out with one before it that failed at its deadline fails with
+      it, before its own -- the client's rule. In 300 runs: 545 clones in
+      271 of them, 10517 writes and 8494 reads of theirs, 130 held at the
+      end, 115 let go of by force. Mutants: 184.
+    - **N10d3, decided** (the user, 2026-11-11): a command of its own for
+      an image, `hv image <name> <file|url>` -- the image poured onto a
+      volume made for it, the download first where it is a URL, and the
+      volume frozen; and `hv create <vm> image=nbs:<image> [size=N]` -- the
+      image cloned into the VM's volume, grown to `size=` where it is given,
+      the VM made with it as its disk, as `hv create` makes one of a URL.
+      hv asks NBS through the bus (`nbs`'s `volume_create`, `volume_freeze`,
+      `volume_clone`, `volume_resize`). Then the flush question below.
+    - **N10d3, done** (2026-11-11). `hv image <name> <file|url>`
+      (`image.rs`'s `make_image`): the name held on the host
+      (`Vms::reserve` of `nbs:<name>`, which no VM's name can be) and
+      refused where NBS has it; a URL downloaded into the vms' folder,
+      removed after; the volume made of the disk's size, poured -- a fresh
+      volume, its zeros left out -- and frozen; one that fails deleted
+      while it is a volume still and this host's: a create of a name that
+      is there is answered as made where the size is the same, so an image
+      another host made of it meanwhile must not be taken for this one's.
+      `hv create <vm> image=nbs:<image> [size=N] [onto=nbs:<volume>]`
+      (`cloud.rs`'s `Source::Image`, `clone_image`): a plain volume, a
+      clone's name NBS has and a `size=` under the image's refused before
+      anything is made; the clone made, grown, and deleted by `Made::undo`
+      when a later step fails. hv's bus client is `nbs.rs`, its refusals
+      said with the volume's name. Found by hv-nbs-test: a VM of an image
+      did not boot -- hvboot read 512 bytes at sector 0 of a disk of 4 KiB
+      blocks, which hv's device refuses as it says it would (`F_BLK_SIZE`);
+      hvboot now reads such a disk in whole blocks, the ends through a
+      block's buffer. Gates: hv-nbs-test on the AX41 under KVM (the new
+      phase: an image of a disk hvboot boots, two VMs of it on two hosts
+      booted by their names off clones of their own, a write over a chunk
+      the image shares seen by one alone, the refusals), hv-test there
+      (no NBS: both commands refused before a download, nothing left),
+      hvboot-test, make check, both arches. Left: `hv delete` leaves the
+      clone, and the host API's `create` takes a URL alone. And found by
+      the same run, past the new phase, not of this step: host a panics
+      `alloc error: 262201 bytes` in the client's send when host c is
+      killed under its guest's write -- with 690 MiB free (`--mem`): a
+      piece's request, 256 KiB and a header, takes a 512 KiB block of the
+      heap, whose window for that class holds about 170 on a 1 GiB host,
+      and the client holds one a replica for its resends and clones one
+      for every send. The next step's.
+    - **A flush after one that failed, done** (#95, 2026-11-11). The
+      cs's a failed flush waited for are dirty again, for the next flush to
+      ask -- the second of the two ways the question named, the first
+      failing every flush after one that failed until a person looks. The
+      cluster target's end that makes it happen (`flush_after_failed`): a
+      chunk's last active replica, the set's two others taken out by
+      `ReplicaDown` as the writer would ask, the controller held off; its
+      host crashes with a write of the chunk in its cache, every write the
+      cache held lost (the disk model's `lose_next`, one of a cut's
+      outcomes); a flush waits for it to its deadline and fails; a write to
+      a chunk the host holds nothing of, and a flush after it -- asked while
+      the first is out, or after it failed; then the host back, and the
+      restart's judge. Each way's rule now has a mutant: a failed flush's
+      cs's not asked again (3 of the first 150 seeds catch it, 28 the
+      first), and the rule before it, that a failed flush fails those out
+      after it, back (10 of 150, 13 the first). Mutants: 188.
+    - **What a request out costs, done** (2026-11-11, after N10d3). A
+      request out keeps no bytes: its stamp -- the session's generation, the
+      map's index, the chunks it names -- and the piece's data, the
+      driver's until the operation is done, make it again as it first went;
+      the bytes are the send's alone (no clone), handed to the mailbox,
+      which keeps them in pages. A write's request is made fallibly
+      (`Request::try_encode`): no room now is a send again in a moment
+      (`AGAIN_NS`), said once, its cs not counted silent for it -- `went`.
+      The cs's answer the same (`Answer::try_encode`): no room is
+      `NotReady`, asked again. Judged by the cluster target's end that
+      starves the writer (nbsclient's `starve` feature, the fuzzer's
+      alone): every host up, writes starved of memory 1.5 s -- each done,
+      none failed, no cs asked out anew meanwhile (an ask asked again goes
+      by its id), each read back; first written and flushed unstarved, as a
+      chunk whose last replica lost what it was given fails a session at
+      its first write. Two mutants (186).
+    - **Closed (#95, 2026-11-11), see below.** The question as it stood:
+      fails, with a flush that failed, those out with it -- and no target
+      catches that rule taken out: not one of the cluster target's first
+      thousand seeds. And one not out yet when the first failed -- waiting
+      on a write before it -- is launched later and may be done: it flushes
+      the cs's acknowledged since it began, and so may say durable what the
+      failed one did not make so on a cs still in its set (its last active
+      replica, say, which the writer cannot take out). To be looked at: a
+      flush done only once every flush before it was done, not failed --
+      or the cs's of the one that failed carried into the next -- and a
+      judge of its own: a flush done while one before it failed.
+    - **A limit, and what would lift it.** A write to a shared chunk of a
+      set being joined waits for the join, and fails past the operation's
+      deadline: a join of a big set takes minutes. Lifting it: copy-ups into
+      a set being joined, the joiner written as a member is -- its first
+      write of the new chunk takes a slot, marked, which its copy fills --
+      and the join's end refused while the set had chunks born since its
+      copy's last pass (a count of births in the joiner's record, which
+      `JoinDone` carries as the copy saw it). Kept as a limit for now, said
+      in docs/nbs.md (the user, 2026-11-09).
 - **N11, numbers.** On the hardware, and what they ask for: pages that move
   instead of copies (a message's pages lent to a `DiskQueue`), chain
   replication (the writer's NIC sending one copy instead of two), TCP's T4
   (SACK, RACK-TLP) if retransmissions cost,
   a UDP bulk path on a private link only if TCP measures as the limit.
+  - **Where it ran** (2026-11-11): the EX44's bare metal, nos at the branch's
+    head, NBS on its 15 GiB p6; two nos VMs under KVM on the AX41 -- 4 vCPUs
+    and 4 GiB each, a raw file O_DIRECT on the AX41's RAID1 of NVMe for the
+    pool, tap and vhost on a bridge -- behind the AX41's one address, each at
+    a port of its own (#99: a host's address is `ip[:port]`); the hairpin
+    between the two SNATed to that address, so that ipcnet's check of where
+    a peer comes from holds. A volume of 8 GiB, its replicas on the three.
+  - **The devices alone** (blkload): the EX44's p6, 332 MiB/s written, 4 KiB
+    writes at queue depth 1 in 10 us, a flush 1.2 ms; a VM's pool, 4 KiB
+    writes in 58 us, a flush 10 ms.
+  - **First numbers**: 256 KiB writes at 24-30 MiB/s whatever the depth from
+    2, 8 MiB/s at depth 1 (24 ms each). TCP was never the limit -- the
+    connections near empty, windows open, no timeout -- nor a CPU. The same
+    ~30 MB/s between the two VMs on one bridge: ipcnet's link loop. A turn
+    put 64 KiB into the session, TCP sent it in a few hundred microseconds,
+    and the read then waited out its millisecond for data that was not
+    coming -- 64 KiB a turn of 2.4 ms. Fixed: the loop wakes its own socket
+    when more waits and TCP took all of it (docs/ipc.md). 256 KiB there and
+    back, 25 -> 9 ms; writes 22 MiB/s at depth 1, 52 at 2.
+  - **Every busy writer's stop took the slower replicas out.** A stop closes
+    every chunk written, on every replica, at once; a close is the chunk's
+    record written twice with a flush after each; the cs serves one request
+    at a time. On a VM's 10 ms flush, 140 closes were seconds of queue at
+    each AX41 cs; the client asked them out after 0.5 s, and the leader's
+    look (`Op::Ping`, 250 ms), behind the same queue, found them silent:
+    both out of the set, then copied anew (2.6 GB at 48 MB/s). Fixed: the
+    cs answers looks ahead of its queue (docs/nbs.md, "The chunk server");
+    nbs-test's N11 phase throttles c's pool through QEMU's monitor and
+    holds c in its set through a stop's closes -- the tree before fails it.
+  - **With both** (8953bd84), and no replica taken out by any writer's stop:
+    256 KiB writes 28 MiB/s at depth 1 (6.7 ms), 50 at 2, 56 from 4 on --
+    1 GbE with two copies leaving the writer, as "What to expect" said.
+    Reads from the writer's own replica, a volume written whole: 256 KiB
+    929 MiB/s at depth 1 (0.25 ms), 1143 at 8; 4 KiB 14.5k IOPS at 1
+    (58 us), 17.5k at 32 -- the cs one request at a time, where the device
+    alone does 68k. 4 KiB writes into open chunks 1.4 ms at depth 1 (a round
+    trip to the AX41 and its write), 11.3k IOPS at 32. A cold chunk's first
+    write: p99 20 ms, p99.9 35 ms -- the open mark's two table writes and two
+    flushes on every replica, a VM's flush 10 ms, not the 1-4 ms expected of
+    the NVMe itself. A rejoin that finds its chunks the same pulls nothing
+    (619 compared in 18 s); one that missed writes pulls them whole -- 8 GiB
+    in 160 s at the line.
+  - **Still taken out, and why it is the next question**: a single request
+    past the leader's 250 ms look -- one flush of a VM's pool after a new
+    region (sparse files on the AX41's ext4: the host's journal commits) --
+    took a replica out (a cold chunk's write waited 676 ms); and under a
+    join's copy and cold writes at depth 8 at once, all three replicas were
+    silent 0.5 s at the same moment, two taken out, the writer's own kept as
+    the last. The cs serves one request at a time, a pull or a sum moves the
+    chunk's epoch -- a record written durable -- before it reads, and a
+    request the engine has not checked waits up to 5 s for this host's mds:
+    each a turn a look cannot get past. A real disk's 300 ms hiccup is a
+    take-out and a copy; whether a look should be answered by more than the
+    serving task, the look's time or decision 6's 0.5 s itself, is the
+    user's to weigh with the numbers above. (Weighed: N12, below.)
+  - **A host lost**: under 4 KiB writes at depth 8, ax41b quit by QEMU --
+    the longest write 779 ms (0.5 s, the leader's look, a commit), then on
+    to two replicas; booted again, it pulled the 16 chunks written meanwhile
+    and held the other 2032 to the source's by sums, whole 86 s after its
+    boot began. **Lost for good** with a fourth host: its cs down at 16 s,
+    out at 10 min 13 s (`out_after`), its places given to the fourth, which
+    copied the set whole -- 8 GiB in 184 s, some 47 MB/s -- every chunk at
+    three replicas 13 min 21 s after the kill.
+  - **What the numbers ask next**: closes a cs makes durable together, one
+    write of each table page and two flushes for all that came at once,
+    where today each costs three flushes (a VM's stop of 140 chunks is ~4 s
+    of them); a cs with more than one request at its device at a time (the
+    `DiskQueue` is one slot), which the 4 KiB reads (17.5k of the device's
+    68k) and the look both want; and the CPU -- at ~53 MB/s each way a
+    connection's task is most of a CPU, all of TLS in software, as the
+    kernel keeps SSE off. Chain replication and a UDP path wait on these:
+    the link and TCP were not the limit.
+- **N12, an event-driven cs** (decided 2026-11-11, from N11's numbers; chain
+  replication after it, as a step of its own with its design first). The
+  cs serves one request at a time and waits on its device for each: a look
+  waits behind whatever the cs is doing, so a slow disk -- a VM's flush of
+  0.7 s -- reads as a dead host, a take-out and a copy; and the device sees
+  one request at a time -- 4 KiB reads at 17.5k IOPS of the device's 68k, a
+  stop's closes three flushes each, one after another. The shape is the
+  one "The cs" first had: one task, asleep on one event for its mailbox and
+  its device queues, which never waits on a device.
+  - **Nothing waits on a device**: every read, write and flush is started
+    and reaped. A look is answered at the next turn whatever the device is
+    doing. A step not done within the queue's 30 s fails the device, as a
+    request does now, and the cs refuses as failed -- out with no look.
+  - **The engine plans** (`nbscs::Store`): an operation is the device steps
+    it needs and what each must wait for; its effect on the store's state
+    is applied when the step it hangs on is done, and its answer goes then.
+    What orders the steps of different requests:
+    - a slot's record durable before data is written into it (the open
+      mark), and data before the record that closes it -- a flush covers
+      what was done before it started;
+    - a fence durable on every device before it is answered;
+    - two operations on one chunk in the order they came;
+    - a table page written whole, both copies, each followed by a flush,
+      with every record changed on it since its last write: the opens,
+      closes and frees that came together made durable by one write of each
+      copy and two flushes, where each costs that now -- a stop's 140 closes
+      some 30 ms on a VM instead of ~4 s.
+  - **The engine's form** (decided 2026-11-12): its operations are `async
+    fn`s over an asynchronous `Device` -- read, write and flush each a
+    future -- driven by one task's executor: nbs-cs's, and the fuzzer's on
+    the host. A completion or a message makes ready the futures that wait
+    on it, and the executor polls those (`Waker::noop` and readiness flags:
+    no waker kept anywhere). The compiler makes each operation's state
+    machine, so its steps cannot be written out of order; what operations
+    share -- the slot tables, the fences, a chunk's turn, the table pages
+    waiting for their commit -- sits in cells borrowed only between two
+    awaits, never across one, which the fuzzer's interleavings would catch
+    as a panic. An operation is boxed when it starts: an allocation a
+    request, as its message is already.
+  - **The device queue**: a flush started and reaped as a write is
+    (`IO_FLUSH` on the asynchronous path, which NVMe has); and virtio-blk
+    given the asynchronous path -- the VMs' pools are virtio disks, which
+    the queue served synchronously before it.
+  - **Steps**:
+    - **N12a**, the block layer -- done: virtio-blk's asynchronous path,
+      once its interrupt is in place (a request in a slot of its own, its
+      caller told from the completion; a flush where the device has a write
+      cache; one request at most `size_max`, 256 KiB unless the device says
+      less). The image's fast path now takes a virtio-blk root as it takes
+      an NVMe one -- hv-test's disk trace holds it to that. The queue's
+      flush (`DiskQueue::start_flush`) waits for N12c, its first caller.
+      Gates: the smoke boots both arches, netblk-test and parttest (arm64,
+      every disk virtio-blk), nbs-test both arches, fs-fuzz, hv-test.
+    - **N12b**, the engine planned, the table pages committed together --
+      done, in two steps: the operations as `async fn`s, what each does
+      unchanged, every caller driving one at a time through `nbscs::now`
+      (eec8a444); then requests in flight together -- a chunk's turn, a
+      volume's fence alone, commit rounds (copy A of every page marked on
+      every device, flushed, then copy B), each device's data writes and
+      flushes counted, a copy-up's slot held while it copies -- and
+      nbs-fuzz's `inflight` target: tens to a couple of hundred requests in
+      flight over disks that do theirs in any order, cut with requests out,
+      held to every promise after every cut, a read to the last write
+      asked before it, no wait for ever; five mutants of the new rules,
+      each caught. The `cs` target stays the engine's judge one request at
+      a time: its model is the richer.
+    - **N12c**, nbs-cs's loop on one event -- done, in two steps: the
+      queue's flush started and reaped as a write is
+      (`DiskQueue::start_flush`, kept from N12a) and `QueueDevice`'s
+      requests futures over the queue's buffers, waited out where polled
+      (ce0daabb); then the loop: one task asleep on its one event, up to 64
+      requests in flight as futures, the leader's look answered as it is
+      taken, the mds's answers handed to the request that asked (nbswire's
+      `serve`, `collect` and the join's copy `async`, an `Asker` the cs's or
+      the fuzzer's), the devices' taking in and the garbage pass one task,
+      the joins and their copies another, every future polled again while
+      anything moved (`Store::moves`, the devices', the chunks' orders').
+      What it found: a chunk's requests must end in the order they came
+      across their questions to the mds, not only inside the store -- a
+      write sent twice, the second copy waiting for the mds, ended after its
+      client's close and opened the chunk again, or wrote older data over
+      newer (fuzz/nbs's cluster target, its cs's asking their mds over its
+      network: 5 runs in 317) -- and the garbage pass frees a chunk in that
+      order, or a read the mds vouched for reads zeros of a chunk freed as
+      its answer came (seen by reading the code; the cs target holds it
+      now); and the client's copy-up ends only once every member active in
+      its view then has copied -- one asked of the single member its view
+      had active, which crashed, the view read again since with two members
+      joined, was told done copied by none, the new chunk zeros under the
+      writes after (the cluster target, its cs's answering later now).
+      Gates: nbs-fuzz's every target and its mutants, nbs-test (its N11
+      phase throttled from the first write, each write slower at c than the
+      client's 0.5 s: c stays only where the look is answered whatever its
+      device is doing; the closes' records written together, the stop
+      fast), hv-nbs-test.
+    - **N12d**, the hardware -- done (2026-11-12), N11's three hosts at
+      6125b9df: the EX44's bare metal, ax41a and ax41c under KVM on the
+      AX41 (ax41b, lost for good in N11, removed from both clusters first,
+      so that one host at a time could be taken down), NBS's `bench` of 8
+      GiB, nbsload on the EX44 against N11's numbers:
+      - **Reads from the writer's own replica**, 4 KiB: 47-50k IOPS at
+        depth 8 and on, where N11 had 17.5k at 32 -- the device sees as
+        many requests as the queue has buffers; 256 KiB at depth 8, 1.5-1.6
+        GiB/s (N11: 1.1). At depth 1, 10-13k IOPS, 73-84 us a read, where
+        N11 had 14.5k and 58 us: each request a future, two wake-ups of the
+        cs's task, more than the old loop's work. A spin of 50 us on the
+        event before sleeping, where a request is out on a device, gave back
+        some 8 us of it, three rounds each way, nothing at depth: not taken,
+        the CPU it burns for so little; where the rest goes is for a trace
+        of the cs's turn to say.
+      - **Writes**: the line, as before -- 256 KiB 25-26 MiB/s at depth 1, 53
+        at 2, 56 from 8; 4 KiB into open chunks 1.5-1.7 ms at depth 1, 12.8-
+        13.0k IOPS at 32 (N11 11.3k).
+      - **A stop's closes**: 1024 chunks opened by 30 s of cold 4 KiB writes
+        closed in under a second (N11: 140 in some 4 s) -- their records
+        written together, a round's two writes and two flushes for all.
+      - **Cold chunks**, a fresh volume of 4 GiB written at depth 8: p50 0.9
+        ms, p99 1.3-5.6 ms (N11 20), p99.9 41-78 ms (N11 35), the max 81-103
+        ms -- an open that just misses a round waits for it and its own, two
+        flushes each on a VM's 10 ms: the price of the rounds, under the
+        client's 0.5 s and the look's 250 ms. Rounds that overlap where
+        their pages differ would take the tail in.
+      - **No replica taken out** in any of it: cold writes at depth 8 for 60
+        s while ax41c, quit by QMP and started again, had its places joined
+        (N11's case, where all three went silent and two were taken out):
+        0; ax41c's pool held to 20 IOPS by QEMU for 30 s, writes waiting 2-4
+        s on it: 0 -- the client asked it out, the leader looked, the cs
+        answered, the writes waited. A slow device costs its writes'
+        latency, not a copy -- decision 6 as N12 meant it.
+      - **Found on the way**: a member back that had gone down at the version
+        its last writes were made at pulls everything whole -- ax41c, quit
+        after the cold writes, pulled 12 GiB at the line in 4 min where a
+        member back with nothing missed holds its chunks to the source's by
+        sums in a minute (N9f's rule is by version, and those writes were at
+        the version it went down at).
+  - **Limits**: one task a cs, so one CPU's worth of checks and copies -- a
+    1 GbE host's; a look says the cs's task turns, not that its device
+    answers: a device stuck short of 30 s keeps its replicas in, its writes
+    waiting -- the price of a disk's hiccup not being a copy.
+- **N13, chain replication** (decided 2026-11-12, from N12d's numbers). The
+  writer's host sends every write twice -- a copy to each replica not its
+  own -- so 1 GbE carries some 56 MB/s of writes; the links are not the
+  limit (each link's task 23-36% of a CPU at 28 MB/s, ChaCha20 in
+  software), the line is. A write's piece leaves the writer once:
+  - **The chain**: the piece's replicas as the client's view has them --
+    the set's active members and its joiner -- its own host's first where
+    it has one, the others in the set's order. The client sends the piece
+    to the first, with the rest of the chain; each replica passes it on to
+    the next as it takes it, before its own write is done, and writes its
+    own copy.
+  - **Each replica answers the client itself**, to the writer session's
+    mailbox by name (`<module>.nbsw.<id>@<host>`, registered for the
+    cluster under the driving module's namespace, the only one a module
+    may name a mailbox under -- as first written, `nbs.w.`, only nbs-mds's
+    `nbs io` could have it, and hv's and nbsload's sessions went direct
+    in silence, which nbs-test's look at the cs's counters found): an
+    ipc address is the host that holds it's, and means nothing to a third.
+    Each hop has its own request id, so that the client knows which replica
+    answered; its bookkeeping is unchanged -- a piece held until every
+    replica it wrote to answered, decision 6's 0.5 s and the leader's look,
+    fences, epochs and the mds's checks each replica's own as now.
+  - **A hop that does not pass a piece on** is gone around: a replica that
+    has not answered 0.25 s after the replica before it answered is sent it
+    directly -- one whose replica before it is taken out of the piece
+    unanswered, at once -- and the 0.5 s counts from then: a forwarder that
+    died, or a link down between two replicas, never has a live replica
+    asked out. (As built: the plan counted the 0.25 s from the piece's
+    leaving, which under a chain slow all along sent every hop after the
+    first twice.) A replica
+    sent the piece twice writes it once (as built: the plan had it write
+    both copies, in the order the chunk's turn (N12c) keeps, and the
+    cluster target had a late copy along the chain put older data over the
+    client's next write of the blocks at once). Each request of a chain
+    carries the session's mark for its replica -- every request of its
+    there below it answered -- and keeps one id for the piece's life,
+    however often and whichever way it is sent; the cs keeps the ids above
+    the mark it applied, and answers one that comes again as done -- or as
+    fenced, a newer writer's fence come since -- unless a join of its set
+    began at the cs since, whose copy may have written over it: then it is
+    written again, and marked.
+  - **What is chained**: writes' pieces, the bytes. Fences, flushes,
+    closes, copy-ups and reads go to each replica directly, as now. A
+    driver that gives its session no name -- `nbs io` -- writes as now.
+  - **Limits**: the last replica's answer one hop later (some 0.3-1 ms
+    here); a replica in the middle carries the piece in and out, its NIC's
+    and its link's CPU; a chain is as fast as its slowest hop, and one
+    link's task, ChaCha20 in software, its CPU at some 80-100 MB/s.
+  - **Steps**: N13a, the wire (a write's chain and the answer's name), the
+    cs's passing on and answering by name, the client's chain and the
+    0.25 s way round, nbsdrive's session named; fuzz/nbs's cluster target
+    with chains -- a forwarder crashed, a hop silent, a piece twice -- and a
+    mutant for each rule; nbs-test both arches. N13b, the hardware: N12d's
+    numbers again, writes at depth.
+  - **What the fuzzer found in N13a** (each fixed, each a mutant, each a
+    judge of its own where the cluster target came on it at one seed in a
+    thousand): a late copy along a chain wrote older data over the
+    client's next write of the blocks -- a write of a chain applied once,
+    by id and mark; sent again after a map read under new ids, a copy
+    reopened a chunk closed since -- one id per piece and replica for the
+    piece's life; a write come again answered as done after a newer
+    writer's fence -- refused as fenced (the cs target's `relayed`); a
+    member back, its join done, took a write of a writer taken over while
+    it was out, the chunks its sums found the same kept at the epoch it
+    last knew -- `close_copy` moves the epoch on (the join target writes
+    every chunk at every older version once the join is over; a direct
+    send before N13 would have been taken the same way); a member taken
+    out and back answered as done a write its copy had undone -- written
+    again across a join of its set begun since, counted as the write is
+    marked (the inflight target begins and ends joins among its requests);
+    and the 0.25 s counted from the piece's leaving sent every hop of a
+    chain slow all along twice -- counted from the answer before it; a
+    piece sent again to one replica, after a `NotFenced`, went without its
+    mark, and late by another way than a newer write of its blocks put
+    older data over that one -- every send of such a write marked (and
+    judged so as sent); and a joiner whose new writer's fence never came
+    to it, down at the takeover, took the old writer's writes once it read
+    the map anew -- joiners fenced at their set's volumes' generations as
+    their joins begin (`JoinView::fences`, `copy::fence_for`).
+  - **What nbs-test found on the hardware** (x86-64, the AX41), where the
+    fuzzer's network had delivered by any name: the session's name,
+    `nbs.w.<hex>`, was refused to every module but nbs-mds -- a module
+    names mailboxes under its own namespace alone -- and to most sessions
+    anyway, a name's part beginning with a digit, so hv's and nbsload's
+    writes went direct in silence (`<module>.nbsw.s<hex>` now, a name not
+    had said); and the chain's head, the writer's own host's cs, answered
+    `name@host` with its own host's name, which the channel routes to
+    peers alone -- every answer lost, every write of a chain at its
+    deadline (the cs answers its own host by the name alone now).
+  - **Decided and done (2026-11-12, the user's (a)): a write failed at its
+    deadline left its replicas apart.** An operation not done in a minute
+    fails; a write's pieces are dropped with whatever replicas have taken
+    them, and the session later closes the chunk as it closes any -- its
+    replicas apart for good, a read answered by whichever it goes to. Not
+    N13's: the same before it, rare -- a set churning for a minute, the
+    writer's view a step behind every refusal; the cluster target's end came
+    on it once in eight thousand runs while chains crowded its network (seed
+    2905 of that tree). The way out is the reconcile's, which makes a
+    crashed writer's open chunks the same: (a) the session attaches anew at
+    a write's failure -- every operation out failed with it, its open chunks
+    mended by the new generation's reconcile, as `attach_again` does after a
+    pause given up -- the volume going on; or (b) the session fails, as at
+    `LOST_LAST`, and the next attach mends; or (c) the chunk is never closed
+    by that session, left to the next writer, its replicas apart meanwhile.
+    The user took (a): `Session::attach_anew`, the cluster target's
+    `cut_write` end (a replica cut off, its host up, the write past its
+    deadline) and its judge that no close of the old generation goes after
+    such a failure; mutant `anew_on_failed_write`. A campaign of the tree
+    after it (cluster seeds 1001-4000) failed four, three causes. (1) Not
+    (a)'s, there before it: a copy-up's end named its chunk by number alone
+    -- a join of the set gave the copy-up up, a late copy of the writer's
+    first ask began it anew and was given the number freed, at the next
+    incarnation, and the writer's end of the old one, late too, took it: the
+    map named a chunk nobody copied into (seeds 1219, 3663). `CopyDone`
+    names the incarnation now, the mds refusing an end of another as `Stale`
+    and the writer asking its copy-up again from the start; mutant
+    `copy_done_incarnation`. (2) (a) too wide: a write whose pieces not done
+    had reached no replica -- held all their life for a copy-up a stuck join
+    (its source's device failed) held back -- had the session attach anew,
+    and the reconcile then waited on that join and failed the session
+    (1960): only a write with a piece not done sent to a replica has it now
+    (`Piece.left`); mutant `anew_only_left`. (3) The judge: it took any
+    write failed at its deadline as leaving its replicas apart, and the
+    `cut_write` end its write as sent -- one came as the session paused for
+    a snapshot, attached again and its fence of the replica cut off waited,
+    as the leader on that replica's host found it up (2149). Both judge by
+    the replicas now: a block of the write on some active replica and not on
+    another. The four seeds run with the gate (`GATE_CLUSTER_ALSO`).
+  - **N13b, the numbers** (2026-11-12; the EX44's bare metal and the
+    AX41's two VMs, volume `bench`, nbsload writing on the EX44, three
+    rounds of each; 6651c38c's modules swapped in without a reboot, the
+    VMs' roots updated). Writes at depth up from N12d's 56 MiB/s -- two
+    copies on the EX44's line -- to 84-91: 256 KiB at depth 8 84, 90 and
+    89 MiB/s, at depth 16 91, 88 and 90, 64 KiB at depth 16 86, 89 and 70
+    -- each piece leaving the EX44 once, ax41a passing it on to ax41c over
+    their own link; 4 KiB at depth 32 12.0-12.8k IOPS (N12d 13.0k), the
+    same. At depth 1 the chain costs: 256 KiB 14, 15 and 11 MiB/s (N12d
+    25), 4 KiB 163-175 IOPS (N12d 223) -- the middle replica, a VM, takes
+    the whole piece before it passes it on, through its links' TLS twice.
+    Every write passed on along its chain, none left to the client (the
+    EX44's cs 878,323, ax41a's 878,323, the tail's none). The writer asked
+    the EX44's own cs, every chain's head, out of a set twice in the last
+    tests (64 KiB at depth 16), and the leader's look -- over the EX44's
+    line, full -- let it be taken out; it joined back.
+  - **The head's take-outs, explained and closed (2026-11-12).** Not the
+    writes: the session's mailbox stayed near empty under them (`ipc
+    boxes`, sampled through a run). The stop: a random writer's over 8 GiB
+    closes some 2,000 chunks, every one on its three replicas at once, and
+    their answers overflowed the mailbox's 1,024 places -- `ipc`'s "refused
+    full" up some 4,000 a run, a sequential writer's stop over a hundred
+    chunks none -- the answers past them lost, their replicas asked out as
+    silent at 0.5 s, before the client's 1 s ask again; the EX44's own cs,
+    the head of every chain, among them, and the look let it go. Now the
+    session closes 128 places at a time, the next as those are done (stop,
+    pause and a close of the driver's alike), its mailbox has 4,096 places,
+    and a cs counts the answers the channel would not take ("answers lost").
+    On the hardware after it: the same run, "refused full" unchanged, no
+    take-out, no answer lost on any of the three cs's; and N13b's whole
+    bench again, three rounds, likewise -- none refused, no take-out, none
+    lost -- at the same numbers: 256 KiB at depth 8 and 16 87-90 MiB/s,
+    64 KiB at depth 16 84-87, 4 KiB at depth 32 12.5k IOPS (depth 1 as
+    before, 10-12 MiB/s and 170 IOPS). nbs-test checks no answer is lost.
+    The fuzzer's network has no mailboxes, so its build lets two places
+    out at a time (`small_windows`): its `close_all_written` end, every
+    place closed when a close asked alone is done, and in a moment; and
+    every session's places closing at once held to the window.
+  - **Depth 1's cost, done (N13c, 2026-11-12)**: a write alone -- its
+    session's only write out, none of another's pieces sent and not done
+    -- goes to each replica directly, with its marks, as a chain's hop sent
+    directly does (`Session::alone`); with another out, along its chain.
+    The fuzzer's cluster target holds a client to it: a chain begun by its
+    only write not done fails (mutants `alone_fans_out`,
+    `alone_of_others_left`). nbs-test: nbsload at depth 1 has no cs pass a
+    write on. The EX44 another session's that day, the numbers are the
+    AX41's alone: its three VMs on its bridge (ax41a, ax41c, and ax41d made
+    for it in VM slot b; n11's old volumes deleted, `ab` made, its chunks
+    at three), nbsload on ax41a, the client's module the only thing changed
+    -- n13c's against the tree's -- three rounds of each, alternated. Its
+    chunks open (16 MiB to 64 MiB written): 4 KiB at depth 1 1361, 1377
+    and 1350 IOPS along chains, 2002, 1954 and 1966 alone (0.73 ms a write
+    to 0.51); 256 KiB 25.0, 24.6 and 24.9 MiB/s, 47.9, 47.4 and 46.7. Over
+    the whole 4 GiB, 256 KiB at depth 1 23-25 against 33-44, 4 KiB at
+    depth 1 116-148 IOPS both ways -- each write a cold chunk's, its open
+    mark's commit round all its time; at depth 2 (45-52 MiB/s), 8 (72-76)
+    and 4 KiB at 32 (8.6-9.5k IOPS) the same both ways, chains in both. On
+    the EX44's line, its middle replica a VM over the WAN, the chain cost
+    more (N12d 25 against N13b's 11-15): to be measured there when it is
+    free again.
+  - **What the lone writes' timing brought up** (campaigns of cluster seeds
+    1001-9000; each a hole before them, its seed's course moved): (1) a
+    copy-up's member refusing its copy as `NotAttached` once the stop had
+    let the volume go failed a session detached -- `on_cs` and `on_bounce`
+    now take no answer once detached or failed, as `on_mds` and `tick`
+    did -- no mutant of it: no seed of 1001-9000 reaches it with the guard
+    taken out (a copy-up's member late past the stop), and the guard is
+    theirs. (2) A reconcile's mend of a shared place waited
+    for a copy-up, which waits for any join of the set; a join stuck --
+    its one source's device failed -- failed the session at the mend's
+    deadline (7225; 1960 the same through an attach anew): the reconcile
+    writes a shared chunk in place, what it writes a replica of it held
+    already (`mend_in_place`). (3) A lone write out to a and b, b cut off;
+    e joined the set and copied the chunk from a, the write in it, closing
+    what it copied; a stale ask took a out, and a's join back closed its
+    copy too; the write failed at its deadline, the session attached anew,
+    and its reconcile found the chunk open nowhere -- b without the write,
+    e with it, for good (5316). An attach anew's reconcile now mends the
+    places of every write it had out that reached a replica, open anywhere
+    or not (`mend_too`, mutant `anew_mends_writes_out`). And the end
+    `starved_past_deadline` holds the attach anew's other side: a write
+    starved of memory past its deadline reaches no replica and has none
+    (`anew_only_left`'s one seed lost to the lone writes' course).
+  - **Open, for the user (found in N13c): a join's copy closes what it
+    copies.** (3)'s hole without the attach anew: a writer that crashes
+    with a write out its source has and another member has not, the source
+    copied by a joiner -- the copy closed -- and then taken out and back:
+    the next writer's reconcile goes by open marks and finds none, the
+    members apart for good. Options: (a) the copy keeps the source's open
+    mark -- the source's sums answered with the generation that has the
+    chunk open there (tried: right for (3), but a writer's close with a
+    view from before the join reaches the source alone, the store's close
+    takes any epoch, and the joiner's mark stays open past the writer's
+    pause, which the cluster target fails a fifth of its seeds on; it
+    needs closes refused at an epoch past the writer's view, as writes are,
+    and a close's places sent again to the set's new members once the map
+    is read again); (b) a source holding the chunk open is no source for it
+    -- the join waits for its close (a chunk written all the time holds
+    the join for good); (c) leave it, the window being a crash inside a
+    join's copy of the very chunk.
 
 ## What to expect
 
-- **Writes over 1 GbE**: two copies leave the writer's host, so some 55 MB/s
-  a host; a small write's latency is a round trip and the slower replica's
-  device.
+- **Writes over 1 GbE**: one copy leaves the writer's host along its chain
+  (N13), some 85-90 MiB/s a host at depth (N13b; two copies before, 55); a
+  small write's latency is a round trip, a hop more, and the slowest
+  replica's device -- at depth 1 slower than before N13.
 - **Reads** from the local replica: the device's speed, less the copies --
   guest to the client's buffer, to a message, to the cs's buffer.
-- **The first write to a cold chunk** waits for the open mark's sync, 1 to 4
-  ms on these drives.
+- **The first write to a cold chunk** waits for the open mark's commit round
+  -- two table writes and two flushes on each replica, shared by the opens
+  that come together: a p99 of 1 to 6 ms on these drives, tens of ms at
+  the tail where an open just misses a round (N12d).
 - **A host lost**: the writes to its chunks stall 0.5 s, the leader's look
   at the cs and a commit, then go on to two replicas.
 
@@ -762,8 +2000,11 @@ each new gate.
    mds.
 4. Decided: one writer a volume, the attach fenced; a VM moved by a forced
    attach.
-5. Decided: 4 MiB chunks; room reserved at create, a clone's too; data on
-   write.
+5. Decided: 4 MiB chunks; a volume's room reserved at create; data on
+   write. Snapshots and clones thin (decided 2026-11-09): they reserve
+   nothing, and a write that needs a copy-up where a set's cs's have no
+   room left fails, said -- the price of not holding a volume's size again
+   for every snapshot.
 6. Decided (2026-11-07): the client writes to all three at once and is
    answered when all three have it; a replica silent for 0.5 s -- not the
    2 s first written -- is taken out of the set first, and only once the

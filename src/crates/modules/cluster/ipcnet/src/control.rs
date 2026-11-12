@@ -20,7 +20,7 @@ use kcore::klog;
 use kcore::net::Nic;
 use kcore::time::Duration;
 
-use super::files::{self, Ip, PeerConf};
+use super::files::{self, PeerConf};
 use super::server::Server;
 use super::{config, edit_peers, State};
 
@@ -156,10 +156,12 @@ fn join(state: &State, cluster: &[u8; 16]) -> Result<(), String> {
 fn set_peers(state: &State, p: &Peers) -> Result<(), String> {
     let mut list: Vec<PeerConf> = Vec::with_capacity(p.peers.len());
     for peer in &p.peers {
-        if list.iter().any(|q| q.ip == peer.ip) {
-            return Err(alloc::format!("{} is two peers' address", Ip(peer.ip)));
+        let conf = PeerConf { name: peer.name.clone(), ip: peer.ip, port: peer.port, keys: peer.keys.clone(),
+                              only: peer.only.clone() };
+        if list.iter().any(|q| q.same_place(&conf)) {
+            return Err(alloc::format!("{} is two peers' address", files::Addr(peer.ip, peer.port)));
         }
-        list.push(PeerConf { name: peer.name.clone(), ip: peer.ip, keys: peer.keys.clone(), only: peer.only.clone() });
+        list.push(conf);
     }
     edit_peers(state, |cfg, peers| {
         if p.cluster != cfg.cluster {

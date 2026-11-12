@@ -156,6 +156,15 @@ unsafe extern "C" {
     /// (kcore's `Lent`), and the caller is to be the queue's one owner and
     /// hold no slice of `buffer`.
     pub fn kernel_blockq_start(q: usize, buffer: usize, write: i32, offset: u64, len: usize) -> i32;
+
+    /// Buffer `buffer`'s request a flush of the device's write cache --
+    /// what the device had done when it began made durable -- started as
+    /// kernel_blockq_start's are: 1 while the device has it, 0 done now
+    /// (a device with no asynchronous flush), -1 done and failed; reaped as
+    /// theirs are. The buffer's bytes are not the device's. Not a `safe fn`,
+    /// as kernel_blockq_start is not: the caller is to be the queue's one
+    /// owner, and the buffer its own, no slice of it lent.
+    pub fn kernel_blockq_start_flush(q: usize, buffer: usize) -> i32;
     pub safe fn kernel_blockq_kick(q: usize);
 
     /// Requests done, `max` at most, into `out`: how many, -1 for no queue.

@@ -30,7 +30,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use kcore::events::SharedEvent;
-use kcore::ipc::{Bounce, Error, Limits, Mailbox, TAG_BULK};
+use kcore::ipc::{Bounce, Error, Limits, Mailbox, Scope, TAG_BULK};
 use kcore::klog;
 use kcore::time::{boot_time_ns, Duration};
 use nbsclient::{Buffers, Out, Phase, Session, To, UserOp};
@@ -51,8 +51,12 @@ const START_NS: u64 = 120_000_000_000;
 /// which fails it first.
 const WAIT_NS: u64 = 2 * nbsclient::DEADLINE_NS;
 /// The session's mailbox: room for the answers of the requests a disk keeps
-/// out -- a read's data comes in pieces of up to 256 KiB.
-const LIMITS: Limits = Limits { messages: 1024, bytes: 8 << 20 };
+/// out -- a read's data comes in pieces of up to 256 KiB -- and for every
+/// answer its requests out can bring, with some to spare: closes are let out
+/// 128 places at a time (nbsclient's `CLOSING_MAX`), writes and reads by the
+/// driver's depth. An answer refused for room is lost, and its replica asked
+/// out as silent (N13b: 1,024 places, overflowed by a stop's closes).
+const LIMITS: Limits = Limits { messages: 4096, bytes: 8 << 20 };
 
 /// The driver's buffers, by an operation's tag: a write's bytes, the room
 /// a read's go to.
@@ -115,24 +119,47 @@ impl Drive {
     /// taking it from a writer elsewhere, or read-only -- and its session
     /// serving: fenced, its open chunks reconciled. On an error the attach
     /// may stand: a writer's is taken by the next attach with `force`.
-    pub fn open(name: &str, me: &str, writable: bool, force: bool) -> Result<Drive, String> {
+    /// `chains`: the namespace of the module that drives it, a writer's
+    /// writes passed along their replicas (N13) -- each answering its
+    /// mailbox named there; none, each sent to every replica directly.
+    pub fn open(name: &str, me: &str, writable: bool, force: bool, chains: Option<&str>)
+        -> Result<Drive, String> {
         let mb = Mailbox::new(LIMITS).map_err(|e| alloc::format!("no mailbox: {}", e.name()))?;
-        Self::start_with(mb, name, me, writable, force)
+        Self::start_with(mb, name, me, writable, force, chains)
     }
 
     /// As `open`, its mailbox made on `event`: what comes to the session
     /// signals it, so that a task waiting on it for more than the session
     /// -- a disk's, for its guest's requests -- wakes for either.
-    pub fn open_on(name: &str, me: &str, writable: bool, force: bool, event: &SharedEvent) -> Result<Drive, String> {
+    pub fn open_on(name: &str, me: &str, writable: bool, force: bool, event: &SharedEvent, chains: Option<&str>)
+        -> Result<Drive, String> {
         let mb = Mailbox::new_on(LIMITS, event).map_err(|e| alloc::format!("no mailbox: {}", e.name()))?;
-        Self::start_with(mb, name, me, writable, force)
+        Self::start_with(mb, name, me, writable, force, chains)
     }
 
-    fn start_with(mb: Mailbox, name: &str, me: &str, writable: bool, force: bool) -> Result<Drive, String> {
+    fn start_with(mb: Mailbox, name: &str, me: &str, writable: bool, force: bool, chains: Option<&str>)
+        -> Result<Drive, String> {
         let token = kcore::random::random_u64().filter(|&t| t != 0)
             .ok_or_else(|| String::from("no randomness for the session's token"))?;
-        let mut d = Drive { s: Session::new(name, me, writable, force, token), mb, me: String::from(me),
-                            bufs: Bufs::default(), done: BTreeMap::new(), next_tag: 1, last: String::new() };
+        let mut s = Session::new(name, me, writable, force, token);
+        /* A writer's mailbox named for the cluster, its token in the name,
+           under its module's namespace -- a module names mailboxes under
+           its own alone (docs/ipc.md), and each part of a name begins with
+           a letter (`s` before the token's hex): its writes passed along
+           their replicas, each answering it there (N13). Where the name
+           cannot be had, each sent directly, and said: as first written --
+           `nbs.w.<hex>` -- hv's and nbsload's sessions were refused it, and
+           most of nbs io's, and went direct in silence */
+        if let (true, Some(ns)) = (writable, chains) {
+            let named = alloc::format!("{}.nbsw.s{:016x}", ns, token);
+            match mb.register(&named, Scope::Cluster) {
+                Ok(()) => s.answer_at(&named),
+                Err(e) => klog!(0, "nbsdrive: volume {}: the session's name {} not had ({}): its writes go to each \
+                                    replica directly", name, named, e.name()),
+            }
+        }
+        let mut d = Drive { s, mb, me: String::from(me), bufs: Bufs::default(), done: BTreeMap::new(), next_tag: 1,
+                            last: String::new() };
         let mut out = Vec::new();
         d.s.start(boot_time_ns(), &mut out);
         d.handle(out);

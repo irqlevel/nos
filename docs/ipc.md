@@ -330,9 +330,14 @@ hosts and back.
   rekey`), the server and every peer's clients made anew with it and the
   connections up kept. It answers while the module is loaded, serving or
   not (docs/cluster.md).
-- **Two TCP connections a peer**, control and bulk, on one port (39240), on
-  the interface hosts.toml names (eth0 unless told; never hv0, so that no
-  guest reaches it). The listener answers the peers' addresses alone: to
+- **Two TCP connections a peer**, control and bulk, on the host's one port
+  -- 39240 unless hosts.toml's `port` says another -- on the interface
+  hosts.toml names (eth0 unless told; never hv0, so that no guest reaches
+  it). A peer is called at the port its address says, `<ip>:<port>` in
+  hosts.toml and in the registry, and at 39240 where it says none: two
+  hosts behind one address, a NAT's, are told apart by their ports, and
+  each is known by its key and its Hello, the address the connection
+  comes from checked to be the peer's (#99). The listener answers the peers' addresses alone: to
   anyone else the port is not there, no SYN-ACK and no reset, and no slot
   taken (TCP's allowlist, plans/tcp.md T3). At most two handshakes at once,
   one a source, each given 3 s. Each connection has a link's 20 ms floor
@@ -372,6 +377,16 @@ hosts and back.
   the median on `scripts/hub.py`'s LAN under HVF, where it was 7 ms while
   the task polled; what is left of polling is a send waiting for room in
   TCP's buffer, a millisecond at a time.
+- **No wait while there is more to send**: a turn puts at most 64 KiB of
+  TLS into the session (`MAX_PENDING`) and flushes it to TCP; where TCP took
+  all of it and more frames wait, the task wakes its own socket before the
+  read, which then comes back at once when nothing has arrived, and the
+  next turn goes on. Before, the read waited out its millisecond for data
+  that was not coming: a turn of 64 KiB took some 2.4 ms, ~27 MB/s a
+  connection whatever the link -- the same between two VMs on one bridge
+  as between the EX44 and the AX41 (plans/nbs.md, N11). A 256 KiB message
+  there and back went from 25 ms to 9 ms; a connection's task, all of TLS
+  on it in software, is then most of a CPU at ~53 MB/s each way.
 
 `ipcnet` says each peer's state -- up and as which number, or down and why
 -- and what went between them; `ipc ping kernel.echo@<host>` sends to a
