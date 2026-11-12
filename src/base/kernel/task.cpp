@@ -991,6 +991,90 @@ size_t TaskTable::sample_cpu(CpuSample* out, size_t max)
     return n;
 }
 
+bool Task::entry_in(ulong lo, ulong hi)
+{
+    const ulong entry = reinterpret_cast<ulong>(function_);
+    return entry >= lo && entry < hi;
+}
+
+size_t TaskTable::running_in(ulong lo, ulong hi, ulong* pids, size_t max)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < stdlib::array_size(task_list_); i++)
+    {
+        stdlib::AutoLock lock(lock_[i]);
+
+        size_t walked = 0;
+        for (auto curr_entry = task_list_[i].flink;
+            curr_entry != &task_list_[i];
+            curr_entry = curr_entry->flink)
+        {
+            if (++walked > MAX_TASKS_PER_LIST)
+            {
+                klog(0, "running_in: task list %lu does not end after %lu entries",
+                    (ulong)i, (ulong)MAX_TASKS_PER_LIST);
+                break;
+            }
+
+            Task* task = CONTAINING_RECORD(curr_entry, Task, table_list_entry_);
+            if (task->state_.get() == Task::STATE_EXITED || !task->entry_in(lo, hi))
+                continue;
+            if (n < max)
+                pids[n] = task->pid_;
+            n++;
+        }
+    }
+
+    return n;
+}
+
+/* What a module left running as it went (ModuleTable::take_down): a task
+   started on code in [lo, hi) -- the module's image, about to be freed --
+   whose handle it forgot, or kept in a static its exit did not empty. Its
+   timers and handlers are swept (sweep_module_slots); a task went on
+   running code in pages freed under it, a fault far from its cause. Each
+   is said, asked to stop as kcore's own stop asks (set_stopping), and
+   waited for a while: true when none is left, false when one still runs
+   there -- whose image the caller then keeps rather than free. Called as
+   an unload is, from a task, with no lock held. */
+bool sweep_module_tasks(ulong lo, ulong hi, const char* name)
+{
+    /* How many are named and asked at a time: a scan again asks the rest */
+    static const size_t ASKED_MAX = 8;
+    static const ulong WAIT_NS = 10 * consts::NANO_SECS_IN_SEC;
+    static const ulong POLL_NS = 10 * consts::NANO_SECS_IN_MS;
+
+    auto& table = TaskTable::get_instance();
+    ulong pids[ASKED_MAX];
+    const stdlib::Time deadline = get_boot_time() + stdlib::Time(WAIT_NS);
+    bool said = false;
+
+    for (;;)
+    {
+        const size_t left = table.running_in(lo, hi, pids, ASKED_MAX);
+        if (left == 0)
+            return true;
+        if (get_boot_time() >= deadline)
+        {
+            klog(0, "module: %s: %lu of its tasks still running after %lu s -- its image kept, not freed "
+                "under them", name, (ulong)left, WAIT_NS / consts::NANO_SECS_IN_SEC);
+            return false;
+        }
+
+        for (size_t i = 0; i < left && i < ASKED_MAX; i++)
+        {
+            ObjectPtr<Task> task(table.lookup(pids[i]));
+            if (!task)
+                continue;
+            if (!said)
+                klog(0, "module: %s left task %lu (%s) running: asked to stop", name, pids[i], task->get_name());
+            task->set_stopping();
+        }
+        said = true;
+        sleep(POLL_NS);
+    }
+}
+
 size_t TaskTable::snapshot(TaskSnapshot* out, size_t max)
 {
     if (out == nullptr)

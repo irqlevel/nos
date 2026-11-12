@@ -265,10 +265,16 @@ extern "C" void rust_ipc_module_gone(const char*, ulong)
     fuzz::host_hal_unreachable("rust_ipc_module_gone");
 }
 
-/* Nor the bridge's, of the timers and handlers a module left */
+/* Nor the bridge's, of the timers and handlers a module left, nor the
+   tasks' */
 void kernel::sweep_module_slots(ulong, ulong, const char*)
 {
     fuzz::host_hal_unreachable("sweep_module_slots");
+}
+
+bool kernel::sweep_module_tasks(ulong, ulong, const char*)
+{
+    fuzz::host_hal_unreachable("sweep_module_tasks");
 }
 
 /* Nor the rest of a module's take-down: its commands and providers closed
@@ -446,7 +452,7 @@ Ko build(fuzz::Input& in)
     std::vector<uint8_t> info(info_size, 0);
     put_le(info, 0, INFO_MAGIC, 4);
     put_le(info, 4, INFO_VERSION, 4);
-    memcpy(info.data() + 8, "fuzz", 4);
+    memcpy(info.data() + 8, KERNEL_ABI, sizeof(KERNEL_ABI) - 1);
     memcpy(info.data() + 72, ko.name.data(), ko.name.size());
     memcpy(data.bytes.data() + info_off, info.data(), info_size);
 

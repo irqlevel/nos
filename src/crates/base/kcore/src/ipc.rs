@@ -1,8 +1,9 @@
 //! The message channel as a loadable module reaches it (docs/ipc.md): a
 //! mailbox of the module's own -- closed when dropped -- messages sent from
-//! it by address or by name and received into it, monitors that say when a
-//! peer is gone, and watches that say when a name comes and goes. Inside
-//! the kernel image the channel is the `ipc` crate itself.
+//! it by address or by name and received into it, and monitors that say
+//! when a peer is gone. Inside the kernel image the channel is the `ipc`
+//! crate itself, whose mailboxes also watch names come and go -- a watch
+//! no module called is no export (docs/ipc.md).
 //!
 //! The channel calls nothing of the module's: the module's own task takes
 //! its messages. A mailbox is named by its address, which the kernel looks
@@ -230,8 +231,10 @@ impl Limits {
 /// What one look of `recv`'s found.
 enum Whole {
     Message(Message),
-    /// Nothing came, it was woken, or the mailbox is closed.
+    /// Nothing came, or it was woken.
     Nothing,
+    /// The mailbox is closed: nothing will come.
+    Closed,
     /// A message it had no room for, taken off and said.
     Dropped,
 }
@@ -305,10 +308,15 @@ pub const PIECE_MAX: usize = 64 * 1024;
 /// How a call ended, when no answer came.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallError {
-    /// The request was refused.
+    /// The request was refused -- or the calling mailbox closed under the
+    /// call (Gone).
     Send(Error),
     /// The mailbox called went before it answered.
     Down(Reason),
+    /// The request, to another host, did not get there, and the channel
+    /// said why (TAG_BOUNCED): said at once, where it used to be waited out
+    /// as a timeout.
+    Bounced(Bounce),
     /// Nothing came in time.
     Timeout,
 }
@@ -406,7 +414,7 @@ impl Mailbox {
         loop {
             match self.recv_whole(wait) {
                 Whole::Message(m) => return Some(m),
-                Whole::Nothing => return None,
+                Whole::Nothing | Whole::Closed => return None,
                 /* Not waited for again: the wait that brought it may have
                  * been a task's event's signal for something else too,
                  * which the caller is to look at on this `None`. */
@@ -423,6 +431,9 @@ impl Mailbox {
         let got = unsafe { ipc::kernel_ipc_recv(self.addr, timeout.as_nanos(), &mut h, core::ptr::null_mut(), 0) };
         if got == 0 {
             return Whole::Message(Message { from: Addr(h.from), tag: h.tag, reference: h.reference, data: Vec::new() });
+        }
+        if got == ipc::IPC_RECV_CLOSED {
+            return Whole::Closed;
         }
         if got != ipc::IPC_RECV_TOO_SMALL {
             return Whole::Nothing;
@@ -536,20 +547,6 @@ impl Mailbox {
         ipc::kernel_ipc_demonitor(self.addr, id);
     }
 
-    /// This mailbox told of every name under `prefix` that comes and goes:
-    /// the watch's id. What is there already, `list` says.
-    pub fn watch(&self, prefix: &str) -> Result<u64, Error> {
-        /* `prefix` is its length's bytes */
-        match unsafe { ipc::kernel_ipc_watch(self.addr, prefix.as_ptr(), prefix.len()) } {
-            0 => Err(Error::Refused),
-            id => Ok(id),
-        }
-    }
-
-    pub fn unwatch(&self, id: u64) {
-        ipc::kernel_ipc_unwatch(self.addr, id);
-    }
-
     /// A reference for a request of this mailbox's, no other of its own.
     pub fn next_reference(&self) -> u64 {
         self.references.fetch_add(1, Ordering::Relaxed)
@@ -644,13 +641,27 @@ impl Mailbox {
                 self.demonitor(monitor);
                 return Err(CallError::Timeout);
             }
-            let Some(msg) = self.recv(Duration::from_nanos(deadline - now)) else { continue };
+            let msg = match self.recv_whole(Duration::from_nanos(deadline - now)) {
+                Whole::Message(msg) => msg,
+                /* Closed under the call: nothing more will come, and a wait
+                 * for it spun to the deadline */
+                Whole::Closed => {
+                    self.demonitor(monitor);
+                    return Err(CallError::Send(Error::Gone));
+                }
+                Whole::Nothing | Whole::Dropped => continue,
+            };
             if !msg.is_system() && msg.reference == reference && msg.from == to {
                 self.demonitor(monitor);
                 return Ok(msg);
             }
             if msg.tag == TAG_DOWN && msg.reference == monitor {
                 return Err(CallError::Down(msg.down().unwrap_or(Reason::Closed)));
+            }
+            if msg.tag == TAG_BOUNCED && msg.reference == reference {
+                let why = msg.bounced().map(|b| b.why).unwrap_or(Bounce::Unsent);
+                self.demonitor(monitor);
+                return Err(CallError::Bounced(why));
             }
         }
     }

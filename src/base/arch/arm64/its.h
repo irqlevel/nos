@@ -39,6 +39,13 @@ public:
        never mapped */
     bool rebind_event(u32 device_id, u32 event_id, InterruptHandler& handler);
 
+    /* An event's LPI taken from its handler and given one that does nothing
+       -- the dispatch's EOI all there is -- so that the LPI stays the
+       event's for its next handler (rebind_event), and one already on its
+       way runs nobody's: what MsixTable::disable_vector and ~MsixTable leave
+       an entry's. Nothing for an event never mapped. */
+    void park_event(u32 device_id, u32 event_id);
+
     u32 map_event(u32 device_id, u32 event_id, InterruptHandler& handler,
         u64& msi_addr);
 

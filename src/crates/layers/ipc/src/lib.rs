@@ -1603,6 +1603,10 @@ pub enum CallError {
     Send(Error),
     /// The mailbox called went, before it answered.
     Down(Reason),
+    /// The request, to another host, did not get there, and the channel
+    /// said why (TAG_BOUNCED) -- at once, where it used to be waited out
+    /// as a timeout.
+    Bounced(Bounce),
     /// Nothing came in time.
     Timeout,
 }
@@ -1627,13 +1631,31 @@ pub fn call(mine: &Mailbox, to: To, tag: u32, payload: Payload, timeout: Duratio
             mine.demonitor(monitor);
             return Err(CallError::Timeout);
         }
-        let Some(msg) = mine.recv(Duration::from_nanos(deadline - now)) else { continue };
+        let msg = match wait(&mine.mbox, Duration::from_nanos(deadline - now), usize::MAX) {
+            Taken::Message(msg) => msg,
+            /* Closed under the call: nothing more will come, and a wait for
+             * it spun to the deadline */
+            Taken::Closed => {
+                mine.demonitor(monitor);
+                return Err(CallError::Send(Error::Gone));
+            }
+            Taken::Nothing | Taken::TooSmall { .. } => continue,
+        };
         if !msg.is_system() && msg.reference == reference && msg.from == target {
             mine.demonitor(monitor);
             return Ok(msg);
         }
         if msg.tag == TAG_DOWN && msg.reference == monitor {
             return Err(CallError::Down(msg.down().unwrap_or(Reason::Closed)));
+        }
+        if msg.tag == TAG_BOUNCED && msg.reference == reference {
+            let mut code = [0u8; 4];
+            let why = (msg.payload().read(0, &mut code) == code.len())
+                .then(|| Bounce::from_u32(u32::from_le_bytes(code)))
+                .flatten()
+                .unwrap_or(Bounce::Unsent);
+            mine.demonitor(monitor);
+            return Err(CallError::Bounced(why));
         }
         count(&STATS.stray);
     }
