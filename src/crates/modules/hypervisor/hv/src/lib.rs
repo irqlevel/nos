@@ -827,7 +827,7 @@ impl Job {
 
 /// `hv run <guest|all> [cpu]`: each guest in a VM of its own, on a task of
 /// its own -- a guest's CPU is a task, here as it will be for a Linux one --
-/// bound to `cpu` when one is named, and waited for.
+/// bound to `cpu`, or to one when none is named, and waited for.
 fn run(machine: &Arc<Machine>, which: Option<&str>, cpu: Option<&str>, out: &mut Output) {
     /* First, so that a machine with nothing to run a guest under says that,
      * and not that it has no such guest. */
@@ -849,10 +849,19 @@ fn run(machine: &Arc<Machine>, which: Option<&str>, cpu: Option<&str>, out: &mut
         return;
     }
 
+    /* Bound to one CPU whether or not one was named -- with none, this one
+     * where the extension is on for it, else the first it is on for: what a
+     * guest's check reads of the host after its run -- its CR8, its
+     * IA32_SPEC_CTRL, the VMCS still current, the ASIDs' generation -- is
+     * the CPU's it ran on only so. Unbound, a task moved between a run and
+     * its check read another CPU's. */
     let affinity = match cpu {
-        None => None,
+        None => {
+            let (here, on) = (kcore::cpu::id(), machine.enabled_mask());
+            if on & (1u64 << here) != 0 || on == 0 { 1u64 << here } else { 1u64 << on.trailing_zeros() }
+        }
         Some(word) => match word.parse::<usize>() {
-            Ok(cpu) if cpu < MAX_CPUS && kcore::cpu::online_mask() & (1u64 << cpu) != 0 => Some(1u64 << cpu),
+            Ok(cpu) if cpu < MAX_CPUS && kcore::cpu::online_mask() & (1u64 << cpu) != 0 => 1u64 << cpu,
             _ => {
                 let _ = writeln!(out, "hv: \"{}\" is not a running CPU", word);
                 return;
@@ -868,10 +877,7 @@ fn run(machine: &Arc<Machine>, which: Option<&str>, cpu: Option<&str>, out: &mut
         }
     };
     let job = Arc::new(Job { machine: machine.clone(), guests, report });
-    let task = match affinity {
-        Some(mask) => kcore::task::spawn_on_with("hv/vcpu", mask, job.clone(), Job::run),
-        None => kcore::task::spawn_with("hv/vcpu", job.clone(), Job::run),
-    };
+    let task = kcore::task::spawn_on_with("hv/vcpu", affinity, job.clone(), Job::run);
     match task {
         /* Dropping the handle waits for the task. */
         Some(task) => drop(task),
