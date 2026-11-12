@@ -1,5 +1,6 @@
-//! ext2, ext3 and ext4, read-only: what GRUB reads a Linux disk's kernel
-//! from. Enough of the format to find a file by its path and read it --
+//! ext2, ext3 and ext4, read-only but for one file's first block rewritten
+//! in place -- grubenv's, as GRUB's `save_env` rewrites it (`rewrite`): what
+//! GRUB reads a Linux disk's kernel from. Enough of the format to find a file by its path and read it --
 //! extents and block maps, 64-bit descriptors, flex_bg, htree directories
 //! (read as the linear ones they also are), inline data, fast and slow
 //! symlinks, holes -- and a refusal, saying which, of any incompatible
@@ -30,6 +31,12 @@ use extfmt::Map;
 /// sectors.
 pub trait Source {
     fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), String>;
+}
+
+/// A source that takes writes too, by whole sectors: a disk that is not
+/// read-only.
+pub trait Sink: Source {
+    fn write(&mut self, offset: u64, buf: &[u8]) -> Result<(), String>;
 }
 
 /* Incompatible features: those read, and the rest refused. What GRUB reads
@@ -240,6 +247,27 @@ impl<S: Source> Fs<S> {
         Ok(())
     }
 
+    /// Where the file's first `len` bytes are on the source: one run of
+    /// them, in its first block -- what GRUB's `save_env` writes grubenv's
+    /// block back to. Refused for data in the inode, a hole (an unwritten
+    /// extent is one), and more than a block.
+    pub fn place(&mut self, inode: &Inode, len: u64) -> Result<u64, String> {
+        if inode.flags & INLINE_DATA_FL != 0 {
+            return Err(alloc::format!("inode {}: its data is in the inode", inode.ino));
+        }
+        if len == 0 || len > inode.size || len > self.block_size {
+            return Err(alloc::format!("inode {}: {} bytes of a file of {}, in blocks of {}", inode.ino, len,
+                                      inode.size, self.block_size));
+        }
+        match self.map(inode, 0)? {
+            Map::Hole { .. } => Err(alloc::format!("inode {}: its first block is a hole", inode.ino)),
+            Map::Blocks { block, .. } if block >= self.blocks => {
+                Err(alloc::format!("inode {}: block {} of a filesystem of {}", inode.ino, block, self.blocks))
+            }
+            Map::Blocks { block, .. } => Ok(block * self.block_size),
+        }
+    }
+
     /// The whole of a file of at most `max` bytes.
     pub fn read_all(&mut self, inode: &Inode, max: u64) -> Result<Vec<u8>, String> {
         if inode.size > max {
@@ -327,5 +355,33 @@ impl<S: Source> Fs<S> {
             current = node;
         }
         Ok(current)
+    }
+}
+
+impl<S: Sink> Fs<S> {
+    /// The file's first `new.len()` bytes -- `was` when it was read --
+    /// made `new` in place, as GRUB's `save_env` rewrites grubenv's block:
+    /// nothing allocated, nothing but those bytes written. Refused where the
+    /// journal is not replayed (what is on the disk may not be the file),
+    /// and unless the bytes there are still `was`; read back after.
+    pub fn rewrite(&mut self, inode: &Inode, was: &[u8], new: &[u8]) -> Result<(), String> {
+        if was.len() != new.len() {
+            return Err(alloc::format!("{} bytes to put over {}", new.len(), was.len()));
+        }
+        if self.needs_recovery() {
+            return Err(String::from("its filesystem's journal is not replayed, and GRUB writes none"));
+        }
+        let at = self.place(inode, new.len() as u64)?;
+        let mut there = vec![0u8; new.len()];
+        self.src.read(at, &mut there)?;
+        if there != was {
+            return Err(String::from("the bytes where it lies are not what was read as the file"));
+        }
+        self.src.write(at, new)?;
+        self.src.read(at, &mut there)?;
+        if there != new {
+            return Err(String::from("it read back other than written"));
+        }
+        Ok(())
     }
 }

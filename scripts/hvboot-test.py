@@ -18,6 +18,10 @@ disks made here:
     (its default), grubenv's next_entry into the submenu, GRUB_DEFAULT=saved
     with saved_entry naming an entry by its id, and `hvboot.entry=` naming
     one;
+  - and next_entry booted once: the image written as hvboot writes a
+    guest's disk, the variable emptied in grubenv's block in place -- the
+    others as they were, the block GRUB's still, the filesystem clean to
+    e2fsck -- and the boot after taking the default;
 
 and holds it to the entry GRUB would boot, the command line it would give,
 and the kernel and initrds -- two of them concatenated at GRUB's alignment
@@ -32,8 +36,8 @@ ending.
     python3 scripts/hvboot-test.py --image ubuntu.raw   # a distribution's, made raw
 
 The partition tables are written here, by the UEFI specification's layout
-and the MBR's; the filesystems by mke2fs. Needs cargo and mke2fs (e2fsprogs)
-on the host -- Linux; on a Mac, in a container. Exit code 0 = every check
+and the MBR's; the filesystems by mke2fs. Needs cargo and e2fsprogs (mke2fs,
+e2fsck, debugfs) on the host -- Linux; on a Mac, in a container. Exit code 0 = every check
 passed.
 """
 
@@ -228,10 +232,13 @@ def write_mbr(path, first, count, kind):
 
 
 class Disk:
-    def __init__(self, name, path, files):
+    def __init__(self, name, path, files, first=0, sectors=0):
         self.name = name
         self.path = path
         self.files = files
+        # Where its filesystem is, in sectors.
+        self.first = first
+        self.sectors = sectors
 
 
 def make_disk(tmp, name, layout, fs, rng, saved=False, env=lambda uuid: []):
@@ -281,14 +288,29 @@ def make_disk(tmp, name, layout, fs, rng, saved=False, env=lambda uuid: []):
     count = sectors * SECTOR // blocks
     subprocess.run(["mke2fs", "-q", "-F", "-t", fs, "-b", str(blocks), "-U", uuid, "-L", "BOOT",
                     "-E", "offset=%d" % (first * 512), "-d", content, disk, str(count)], check=True)
-    return Disk(name, disk, files)
+    return Disk(name, disk, files, first, sectors)
 
 
-def run(disk, entry=None):
-    """hvboot-test image: its report, and the kernel and initrd it read."""
+def filesystem_of(disk, tmp):
+    """The disk's filesystem, copied out to a file of its own: what e2fsck
+    and debugfs are given."""
+    path = os.path.join(tmp, disk.name + ".fs")
+    with open(disk.path, "rb") as f:
+        f.seek(disk.first * SECTOR)
+        data = f.read(disk.sectors * SECTOR)
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
+def run(disk, entry=None, write=False):
+    """hvboot-test image: its report, and the kernel and initrd it read --
+    the image open to be written, as hvboot finds a guest's disk, with
+    `write`."""
     dump = disk.path + ".dump"
     os.makedirs(dump, exist_ok=True)
-    argv = [BIN, "image", disk.path, "--dump", dump] + (["--entry", entry] if entry else [])
+    argv = [BIN, "image", disk.path, "--dump", dump] + (["--entry", entry] if entry else []) \
+        + (["--write"] if write else [])
     r = subprocess.run(argv, capture_output=True, text=True)
     out = r.stdout + r.stderr
     kernel = initrd = b""
@@ -340,6 +362,35 @@ def gate(args, tmp):
         check("%s: grubenv's next_entry 1>2 -- the older kernel, two initrds joined" % name,
               "next_entry, 1>2" in out and kernel == f[old_k] and initrd == joined(f, old_i), out)
 
+        # Booted once, as GRUB boots it: the image written as hvboot writes
+        # a guest's disk, next_entry is emptied where grubenv's block lies,
+        # and the boot after takes the default.
+        env = [("saved_entry", "gnulinux-advanced-x"), ("next_entry", "1>2"), ("tricky", "a\\b c=d")]
+        once = make_disk(tmp, name + "-once", layout, fs, rng, env=lambda uuid: env)
+        before = open(once.path, "rb").read()
+        out, kernel, initrd = run(once, write=True)
+        check("%s: next_entry booted, then emptied on the disk as GRUB empties it" % name,
+              "next_entry, 1>2" in out and "next_entry cleared" in out and kernel == once.files[old_k], out)
+        out, kernel, initrd = run(once)
+        check("%s: and the boot after it takes the default, the first entry" % name,
+              'entry: "Ubuntu", the default, 0' in out and kernel == once.files[new_k], out)
+        fs_path = filesystem_of(once, tmp)
+        r = subprocess.run(["e2fsck", "-fn", fs_path], capture_output=True, text=True)
+        check("%s: e2fsck finds the filesystem clean after the write" % name, r.returncode == 0,
+              r.stdout + r.stderr)
+        r = subprocess.run(["debugfs", "-R", "cat %s/grub/grubenv" % prefix, fs_path], capture_output=True)
+        want = grubenv([("saved_entry", "gnulinux-advanced-x"), ("next_entry", ""), ("tricky", "a\\b c=d")])
+        check("%s: grubenv is GRUB's block, next_entry empty and every other variable as it was" % name,
+              r.stdout == want, "%r\nwanted %r" % (r.stdout, want))
+        after = open(once.path, "rb").read()
+        changed = [i for i in range(len(before)) if before[i] != after[i]]
+        check("%s: nothing written but grubenv's bytes" % name,
+              len(changed) > 0 and changed[-1] - changed[0] < 1024, "%d bytes changed" % len(changed))
+        ro = make_disk(tmp, name + "-once-ro", layout, fs, rng, env=lambda uuid: env)
+        out, kernel, initrd = run(ro)
+        check("%s: a disk not to be written: next_entry booted, and said to stay" % name,
+              "next_entry, 1>2" in out and "next_entry could not be cleared -- read-only" in out, out)
+
         # A submenu's entry, named as GRUB names one: the submenu, '>', the
         # entry -- here each by its id.
         saved = make_disk(tmp, name + "-saved", layout, fs, rng, saved=True,
@@ -387,7 +438,7 @@ def main():
     ap.add_argument("--keep", action="store_true", help="keep the disks made")
     args = ap.parse_args()
 
-    tools = ["cargo"] + ([] if args.image else ["mke2fs"])
+    tools = ["cargo"] + ([] if args.image else ["mke2fs", "e2fsck", "debugfs"])
     for t in tools:
         if shutil.which(t) is None:
             sys.exit("hvboot-test needs %s" % t)

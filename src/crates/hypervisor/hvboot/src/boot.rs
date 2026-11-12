@@ -113,8 +113,11 @@ fn name(f: &Found) -> String {
 }
 
 /// The first of `fss` with GRUB's configuration on it: which, the
-/// configuration's path and text, and grubenv's beside it.
-fn config(disks: &mut [Disk], fss: &[Found]) -> Result<(usize, &'static str, String, String), String> {
+/// configuration's path and text, and grubenv beside it -- its inode and
+/// its bytes -- when there is one.
+fn config(disks: &mut [Disk], fss: &[Found])
+    -> Result<(usize, &'static str, String, Option<(Inode, Vec<u8>)>), String>
+{
     for (i, f) in fss.iter().enumerate() {
         let mut fs = mount(disks, f)?;
         for path in CONFIGS {
@@ -125,11 +128,10 @@ fn config(disks: &mut [Disk], fss: &[Found]) -> Result<(usize, &'static str, Str
             let text = fs.read_all(&inode, CONFIG_MAX)?;
             let env_path = alloc::format!("{}env", path.trim_end_matches(".cfg"));
             let env = match fs.lookup(&env_path) {
-                Ok(e) if e.is_file() => fs.read_all(&e, ENV_MAX).unwrap_or_default(),
-                _ => Vec::new(),
+                Ok(e) if e.is_file() => fs.read_all(&e, ENV_MAX).ok().map(|bytes| (e, bytes)),
+                _ => None,
             };
-            return Ok((i, path, String::from_utf8_lossy(&text).into_owned(),
-                       String::from_utf8_lossy(&env).into_owned()));
+            return Ok((i, path, String::from_utf8_lossy(&text).into_owned(), env));
         }
     }
     Err(String::from("no grub.cfg on any of the guest's disks (looked for /boot/grub/grub.cfg and \
@@ -177,6 +179,24 @@ fn on<'a>(fss: &[Found], root: usize, path: &'a str) -> Result<(usize, &'a str),
     }
 }
 
+/// grubenv's `next_entry` emptied on its disk -- what the script
+/// grub-mkconfig writes does before it boots that entry -- so that the
+/// entry `grub-reboot` named is booted once, as under GRUB; and said, done
+/// or not: left, it was booted at every boot after, a trial kernel's panic
+/// a restart's loop.
+fn clear_next_entry(disks: &mut [Disk], f: &Found, env: &Inode, was: &[u8]) {
+    let done = match grub::env_without(was, "next_entry") {
+        None => Err(String::from("grubenv is not a block GRUB wrote")),
+        Some(new) => mount(disks, f).and_then(|mut fs| fs.rewrite(env, was, &new)),
+    };
+    match done {
+        Ok(()) => say!("{}: grubenv's next_entry cleared, as GRUB clears it -- the next boot takes the default",
+                       name(f)),
+        Err(e) => say!("{}: grubenv's next_entry could not be cleared, and is taken again at the next boot -- {}",
+                       name(f), e),
+    }
+}
+
 /// Look `path` up and read the inode, with what went wrong said by where.
 fn open(disks: &mut [Disk], f: &Found, path: &str) -> Result<Inode, String> {
     let mut fs = mount(disks, f)?;
@@ -213,11 +233,14 @@ pub fn run(start_info: u64) -> Result<Infallible, String> {
         return Err(String::from("no ext2/3/4 filesystem on the guest's disks"));
     }
 
-    let (cfg_at, cfg_path, text, env_text) = config(&mut disks, &fss)?;
+    let (cfg_at, cfg_path, text, env_file) = config(&mut disks, &fss)?;
     let cfg = grub::parse(&text);
-    let env = grub::parse_env(&env_text);
-    let (entry, why) = grub::choose(&cfg, &env, opts.entry.as_deref())?;
+    let env = env_file.as_ref().map(|(_, bytes)| grub::parse_env(&String::from_utf8_lossy(bytes))).unwrap_or_default();
+    let (entry, why, once) = grub::choose(&cfg, &env, opts.entry.as_deref())?;
     say!("{}{}: \"{}\", {}", name(&fss[cfg_at]), cfg_path, entry.title, why);
+    if let (true, Some((inode, bytes))) = (once, &env_file) {
+        clear_next_entry(&mut disks, &fss[cfg_at], inode, bytes);
+    }
     if !cfg.unknown.is_empty() {
         say!("grub.cfg's variables {} have no value here, and are read as empty", cfg.unknown.join(", "));
     }

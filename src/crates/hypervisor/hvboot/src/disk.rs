@@ -3,7 +3,7 @@
 
 use alloc::string::String;
 
-use crate::ext::Source;
+use crate::ext::{Sink, Source};
 use crate::virtio::{Disk, SECTOR};
 
 pub struct Part<'a> {
@@ -12,17 +12,33 @@ pub struct Part<'a> {
     pub sectors: u64,
 }
 
-impl Source for Part<'_> {
-    fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), String> {
-        if offset % SECTOR != 0 || buf.len() as u64 % SECTOR != 0 {
-            return Err(alloc::format!("a read of {} bytes at {}, not whole sectors", buf.len(), offset));
+impl Part<'_> {
+    /// The disk's sector `len` bytes at `offset` start at: whole sectors,
+    /// inside the partition.
+    fn sector(&self, what: &str, offset: u64, len: usize) -> Result<u64, String> {
+        if offset % SECTOR != 0 || len as u64 % SECTOR != 0 {
+            return Err(alloc::format!("a {} of {} bytes at {}, not whole sectors", what, len, offset));
         }
         let sector = offset / SECTOR;
-        let count = buf.len() as u64 / SECTOR;
+        let count = len as u64 / SECTOR;
         if sector.checked_add(count).is_none_or(|end| end > self.sectors) {
-            return Err(alloc::format!("a read past the partition's end: sector {} of {}", sector + count,
-                                      self.sectors));
+            return Err(alloc::format!("a {} past the partition's end: sector {} of {}", what,
+                                      sector.saturating_add(count), self.sectors));
         }
-        self.disk.read(self.first + sector, buf)
+        Ok(self.first + sector)
+    }
+}
+
+impl Source for Part<'_> {
+    fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), String> {
+        let sector = self.sector("read", offset, buf.len())?;
+        self.disk.read(sector, buf)
+    }
+}
+
+impl Sink for Part<'_> {
+    fn write(&mut self, offset: u64, buf: &[u8]) -> Result<(), String> {
+        let sector = self.sector("write", offset, buf.len())?;
+        self.disk.write(sector, buf)
     }
 }

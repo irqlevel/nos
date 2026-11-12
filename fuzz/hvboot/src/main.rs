@@ -5,7 +5,9 @@
 //!
 //! says which grub.cfg it found, the entry it would boot and why, the
 //! kernel's header and the command line; with --dump, writes the kernel and
-//! the initrd as its reader read them, to compare with e2fsprogs'.
+//! the initrd as its reader read them, to compare with e2fsprogs'; with
+//! --write, opens the image to be written, as hvboot finds a guest's disk,
+//! and empties grubenv's next_entry once it has booted it, as hvboot does.
 //!
 //!     hvboot-test fuzz <disk.raw> [--seed N] [--iterations N]
 //!
@@ -20,7 +22,7 @@
 extern crate alloc;
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 #[path = "../../../src/crates/hypervisor/hvboot/src/gpt.rs"]
 mod gpt;
@@ -56,6 +58,8 @@ struct Disk {
     /// The sectors of the reads of metadata's size -- not a kernel's
     /// megabytes -- when they are being noted.
     noted: Option<Vec<u64>>,
+    /// Opened to be written (`--write`).
+    writable: bool,
 }
 
 /// The most a read is that is noted: metadata comes a block or a few at a
@@ -85,6 +89,21 @@ impl Disk {
         }
         Ok(())
     }
+
+    /// Whole sectors at `offset`: refused for an image not opened to be
+    /// written, and held to its bounds as a read is.
+    fn write(&mut self, offset: u64, buf: &[u8]) -> Result<(), String> {
+        assert!(offset % SECTOR == 0 && buf.len() as u64 % SECTOR == 0, "an unaligned write: {} at {}", buf.len(),
+                offset);
+        assert!(offset + buf.len() as u64 <= self.len, "a write past the disk: {} at {} of {}", buf.len(), offset,
+                self.len);
+        if !self.writable {
+            return Err(String::from("read-only"));
+        }
+        let f = &mut self.file;
+        f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+        f.write_all(buf).map_err(|e| e.to_string())
+    }
 }
 
 /// A partition of it, as hvboot's `disk::Part` is.
@@ -105,6 +124,20 @@ impl ext::Source for Part<'_> {
             return Err(format!("a read past the partition's end: sector {} of {}", sector + count, self.sectors));
         }
         self.disk.read((self.first + sector) * SECTOR, buf)
+    }
+}
+
+impl ext::Sink for Part<'_> {
+    fn write(&mut self, offset: u64, buf: &[u8]) -> Result<(), String> {
+        if offset % SECTOR != 0 || buf.len() as u64 % SECTOR != 0 {
+            return Err(format!("a write of {} bytes at {}, not whole sectors", buf.len(), offset));
+        }
+        let sector = offset / SECTOR;
+        let count = buf.len() as u64 / SECTOR;
+        if sector.checked_add(count).is_none_or(|end| end > self.sectors) {
+            return Err(format!("a write past the partition's end: sector {} of {}", sector + count, self.sectors));
+        }
+        self.disk.write((self.first + sector) * SECTOR, buf)
     }
 }
 
@@ -147,6 +180,9 @@ struct Boot {
     kernel: Vec<u8>,
     initrd: Vec<u8>,
     line: String,
+    /// grubenv's next_entry emptied, as hvboot empties it once it has
+    /// chosen that entry, or why not -- None when the entry was another.
+    cleared: Option<Result<(), String>>,
 }
 
 fn boot(disk: &mut Disk, entry_spec: Option<&str>) -> Result<Boot, String> {
@@ -162,16 +198,28 @@ fn boot(disk: &mut Disk, entry_spec: Option<&str>) -> Result<Boot, String> {
             let text = fs.read_all(&inode, 1 << 20)?;
             let env_path = format!("{}env", path.trim_end_matches(".cfg"));
             let env = fs.lookup(&env_path).ok().filter(|e| e.is_file())
-                .and_then(|e| fs.read_all(&e, 65536).ok()).unwrap_or_default();
-            cfg_at = Some((i, path, String::from_utf8_lossy(&text).into_owned(),
-                           String::from_utf8_lossy(&env).into_owned()));
+                .and_then(|e| fs.read_all(&e, 65536).ok().map(|bytes| (e, bytes)));
+            cfg_at = Some((i, path, String::from_utf8_lossy(&text).into_owned(), env));
             break 'find;
         }
     }
-    let Some((at, path, text, env_text)) = cfg_at else { return Err(String::from("no grub.cfg")) };
+    let Some((at, path, text, env_file)) = cfg_at else { return Err(String::from("no grub.cfg")) };
     let cfg = grub::parse(&text);
-    let env = grub::parse_env(&env_text);
-    let (entry, why) = grub::choose(&cfg, &env, entry_spec)?;
+    let env = env_file.as_ref().map(|(_, bytes)| grub::parse_env(&String::from_utf8_lossy(bytes))).unwrap_or_default();
+    let (entry, why, once) = grub::choose(&cfg, &env, entry_spec)?;
+    /* As hvboot's boot.rs: the entry grubenv's next_entry named, booted
+     * once -- the variable emptied on the disk where it is written to */
+    let cleared = match (once, &env_file) {
+        (true, Some((inode, bytes))) => Some(match grub::env_without(bytes, "next_entry") {
+            None => Err(String::from("grubenv is not a block GRUB wrote")),
+            Some(new) => {
+                let f = &fss[at];
+                ext::Fs::mount(Part { disk: &mut *disk, first: f.first, sectors: f.sectors })
+                    .and_then(|mut fs| fs.rewrite(inode, bytes, &new))
+            }
+        }),
+        _ => None,
+    };
     let mut root = at;
     for r in &entry.roots {
         let hit = match r {
@@ -208,13 +256,18 @@ fn boot(disk: &mut Disk, entry_spec: Option<&str>) -> Result<Boot, String> {
     bzimage::zero_page(&kernel, &header, 0x2000, line.len(), (0x3000_0000, initrd.len() as u64), &map, 0xE0000,
                        &mut page)?;
     let name = match fss[at].part { Some(p) => format!("part {}", p), None => String::from("whole disk") };
-    Ok(Boot { config: format!("{} {}", name, path), title: entry.title.clone(), why, kernel, initrd, line })
+    Ok(Boot { config: format!("{} {}", name, path), title: entry.title.clone(), why, kernel, initrd, line, cleared })
 }
 
 fn open(path: &str) -> Disk {
-    let file = File::open(path).unwrap_or_else(|e| panic!("{}: {}", path, e));
+    open_as(path, false)
+}
+
+fn open_as(path: &str, writable: bool) -> Disk {
+    let file = std::fs::OpenOptions::new().read(true).write(writable).open(path)
+        .unwrap_or_else(|e| panic!("{}: {}", path, e));
     let len = file.metadata().map(|m| m.len()).unwrap_or(0) / SECTOR * SECTOR;
-    Disk { file, len, patches: Vec::new(), reads: 0, noted: None }
+    Disk { file, len, patches: Vec::new(), reads: 0, noted: None, writable }
 }
 
 /// A seeded generator: xorshift64*.
@@ -252,11 +305,16 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("image") => {
             let path = args.get(2).expect("hvboot-test image <disk.raw>");
-            let mut disk = open(path);
+            let mut disk = open_as(path, args.iter().any(|a| a == "--write"));
             match boot(&mut disk, flag("--entry").as_deref()) {
                 Ok(b) => {
                     println!("grub.cfg: {}", b.config);
                     println!("entry: \"{}\", {}", b.title, b.why);
+                    match &b.cleared {
+                        Some(Ok(())) => println!("grubenv's next_entry cleared, as GRUB clears it"),
+                        Some(Err(e)) => println!("grubenv's next_entry could not be cleared -- {}", e),
+                        None => {}
+                    }
                     println!("kernel: {} bytes; initrd: {} bytes", b.kernel.len(), b.initrd.len());
                     println!("command line: {}", b.line);
                     println!("reads: {}", disk.reads);
@@ -303,8 +361,8 @@ fn main() {
                      iterations, booted, targets.len());
         }
         _ => {
-            eprintln!("hvboot-test image <disk.raw> [--dump <dir>] [--entry <spec>] | fuzz <disk.raw> [--seed N] \
-                       [--iterations N]");
+            eprintln!("hvboot-test image <disk.raw> [--dump <dir>] [--entry <spec>] [--write] | fuzz <disk.raw> \
+                       [--seed N] [--iterations N]");
             std::process::exit(2);
         }
     }
