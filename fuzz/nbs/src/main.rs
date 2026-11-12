@@ -53,9 +53,14 @@ const CLUSTER_STEPS: u64 = 2000;
 /// -- the client's copy-up ended only once every member active in its view
 /// has copied (`client_copy_every_active`: a clone's or a volume's copy-up
 /// asked at a view a member had left, NotHere, those that had come since
-/// never asked), lost to N13's chains, found again at these. A stopgap: a
-/// race moved on by the next change is lost again, which the mutants say.
-const GATE_CLUSTER_ALSO: [u64; 5] = [1232, 2759, 5241, 6647, 7786];
+/// never asked), lost to N13's chains, found again at these; and N13c's
+/// campaign's: a copy-up's end named by its chunk's number alone, matched
+/// to a copy-up asked anew late given that number again (1219, 3663); a
+/// session attached anew for a write that reached no replica, its reconcile
+/// held by the stuck join that held the write (1960), and the end that cuts
+/// a replica off as its write was never sent (2149). A stopgap: a race moved
+/// on by the next change is lost again, which the mutants say.
+const GATE_CLUSTER_ALSO: [u64; 9] = [1232, 2759, 5241, 6647, 7786, 1219, 1960, 2149, 3663];
 const GATE_JOIN_SEEDS: u64 = 800;
 const JOIN_STEPS: u64 = 3000;
 const GATE_INFLIGHT_SEEDS: u64 = 600;

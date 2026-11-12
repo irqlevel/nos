@@ -140,6 +140,10 @@ struct Cs {
     /// them directly.
     passed_on: Cell<u64>,
     not_passed: Cell<u64>,
+    /// Answers the channel would not take -- the client's mailbox full, its
+    /// session gone: each one its client takes for the cs's silence (N13b,
+    /// where a stop's closes overflowed it and the cs was asked out).
+    answers_lost: Cell<u64>,
 }
 
 /// A question out to the mds: its id let go of however the ask ends.
@@ -190,7 +194,7 @@ pub fn run(shared: Arc<Shared>) {
         cs: Cell::new(None), taken: RefCell::new(BTreeSet::new()), trouble: RefCell::new(Vec::new()),
         idents: RefCell::new(Vec::new()), serving: Cell::new(false), changed: Cell::new(false),
         served: Cell::new(0), refused: Cell::new(0), overflowed: Cell::new(0), passed_on: Cell::new(0),
-        not_passed: Cell::new(0),
+        not_passed: Cell::new(0), answers_lost: Cell::new(0),
     });
     let mut own: Vec<Task> = Vec::new();
     own.push(Box::pin(devices(cs.clone())));
@@ -573,10 +577,13 @@ impl Cs {
         } else {
             self.served.set(self.served.get() + 1);
         }
-        let _ = match to {
+        let sent = match to {
             Some(name) => self.send_named(name, ANSWER, m.reference, &bytes),
             None => self.mb.reply(m, ANSWER, &bytes),
         };
+        if sent.is_err() {
+            self.answers_lost.set(self.answers_lost.get() + 1);
+        }
     }
 
     /// What the shell shows of the cs.
@@ -603,7 +610,8 @@ impl Cs {
         self.shared.show(Shown { cs: self.cs.get(), devices, held: count, open, chunks: held,
                                  fences: self.store.fenced_volumes(), served: self.served.get(),
                                  refused: self.refused.get() + self.overflowed.get(),
-                                 passed_on: self.passed_on.get(), not_passed: self.not_passed.get() });
+                                 passed_on: self.passed_on.get(), not_passed: self.not_passed.get(),
+                                 answers_lost: self.answers_lost.get() });
     }
 }
 

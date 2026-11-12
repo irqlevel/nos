@@ -93,7 +93,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use nbsclient::{Buffers, Out, Phase, Session, To, UserOp, BLOCK, DEADLINE_NS, LOST_LAST, PAUSE_NS};
-use nbscs::{ChunkRef, Epoch, Identity, Store, SLOT};
+use nbscs::{ChunkRef, Epoch, Identity, SlotState, Store, SLOT};
 use nbsmeta::repair::{self, Seen};
 use nbsmeta::{Answer, Command, Replica, State};
 use nbswire::copy::{self, Copy};
@@ -122,6 +122,12 @@ const STARVED_WRITES: u64 = 6;
 const DISK_SLOTS: u64 = 20;
 const DISK_SECTOR: u64 = 4096;
 const MS: u64 = 1_000_000;
+/// How long a close asked alone of a few places may take: its windows' round
+/// trips -- well under the 3 s a place idles before it is closed of itself.
+const CLOSE_ALONE_NS: u64 = 2_500 * MS;
+/// The places a session closes at once, at most: nbsclient's `CLOSING_MAX`
+/// as the fuzzer builds it (`small_windows`).
+const CLOSING_FUZZ: usize = 2;
 /// How long a cs waits for its mds's answer, as nbs-cs does.
 const MDS_WAIT: u64 = 5_000 * MS;
 /// How long a run lasts at most, in the network's time: well under an
@@ -226,6 +232,8 @@ struct CloneW {
     /// When a flush of its last failed at its deadline: those out with it
     /// fail then too.
     flush_failed_at: Option<u64>,
+    /// Its attaches anew for a write failed at its deadline, counted.
+    anew: u64,
 }
 
 struct Msg {
@@ -446,6 +454,15 @@ struct Client {
     /// new asks out it made meanwhile.
     starved_until: u64,
     asked_starved: u64,
+    /// The generation it last came to serve at: a newer one is its own
+    /// attach anew.
+    served_gen: u64,
+    /// Its attaches anew for a write failed at its deadline, counted.
+    anew: u64,
+    /// The generation a write of its failed at its deadline at: no close of
+    /// that generation's is to go after it -- the session attaches anew,
+    /// its reconcile to make the chunk's replicas the same.
+    failed_write_gen: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -575,7 +592,11 @@ struct World {
     pausing: Option<Pausing>,
     late: Option<Late>,
     pause_next: u64,
-    given_up: Option<(usize, u64)>,
+    given_up: Option<(usize, u64, u64)>,
+    /// A host whose cs is cut off from every host but its own: nothing on
+    /// its links to and from others delivered while it lasts -- its host
+    /// up, so that the leader's look keeps it in.
+    cut: Option<usize>,
     /// The word a pause's answer gets, as an end shaped it: 0 the snapshot
     /// applied late, 1 the word lost, 2 the word said.
     pause_word: Option<u64>,
@@ -608,9 +629,20 @@ impl World {
 
     /// A client's outputs: its messages queued, its operations checked.
     fn outs(&mut self, c: usize, out: Vec<Out>) -> Result<(), String> {
+        /* Closes let out a window at a time (N13b): never more places
+           closing at once than the window */
+        if self.clients[c].s.closing() > CLOSING_FUZZ {
+            return Err(format!("client {} closing {} places at once, past the window of {}", c,
+                               self.clients[c].s.closing(), CLOSING_FUZZ));
+        }
         for o in out {
             match o {
                 Out::Send { to: To::Mds, id, bytes } => {
+                    if self.trace {
+                        if let Some(a @ (Ask::CopyUp { .. } | Ask::CopyDone { .. })) = Asking::decode(&bytes).map(|a| a.ask) {
+                            eprintln!("  [{}] client {} asks #{}: {:?}", self.step, c, id, a);
+                        }
+                    }
                     /* A cs asked out of a set only where the view writes it
                        there: one the view has out already -- read since, its
                        place another's -- would be asked about for as long as
@@ -643,6 +675,13 @@ impl World {
                         self.count(if relay.next.is_empty() { "a chain's writes sent directly" } else { "chains begun" });
                     }
                     unmarked(self.clients[c].s.chains(), &bytes, &format!("client {}", c), id, cs)?;
+                    if let (Some(g), Some(r)) = (self.clients[c].failed_write_gen, Request::decode(&bytes)) {
+                        if r.generation == g && matches!(r.op, nbswire::Op::Close { .. }) {
+                            return Err(format!("client {} closed a chunk at generation {} after a write of that \
+                                                generation failed at its deadline: its replicas perhaps apart, \
+                                                closed so for good", c, g));
+                        }
+                    }
                     /* Judged as sent: one sent before, while the view had the
                        cs in, may get there after */
                     if self.owed == Some((c, h)) && Request::decode(&bytes).is_some_and(|r| {
@@ -665,6 +704,10 @@ impl World {
                 }
                 Out::Done { tag, ok } => self.done(c, tag, ok)?,
                 Out::Say(line) => {
+                    if line.contains("attached anew") {
+                        self.clients[c].anew += 1;
+                        self.count("writes failed at their deadline, the session attached anew");
+                    }
                     if self.trace {
                         eprintln!("  [{}] client {}: {}", self.step, c, line);
                     }
@@ -735,6 +778,38 @@ impl World {
         Ok(v)
     }
 
+    /// Whether a write of value `value` to blocks `first`+`n` of the volume,
+    /// failed at its deadline, left their replicas apart: a block of it on
+    /// some active replica up of its chunk and not on another -- what the
+    /// session's attach anew is for. One that reached none of them, or each,
+    /// left none apart, and neither did one whose value a block had before
+    /// (unseen then, and so judged less, never wrongly). A replica found
+    /// apart for another reason -- its unflushed writes lost in a crash --
+    /// has not the value either way.
+    fn apart(&mut self, first: u64, n: u64, value: u8) -> bool {
+        for b in first..first + n {
+            let Some((volume, chunk, inside, _)) = self.replicas(b, 0) else { continue };
+            let Some(set) = self.state.sets().get(chunk.epoch.set as usize).cloned() else { continue };
+            let mut has = BTreeSet::new();
+            for i in 0..nbsmeta::REPLICAS {
+                if set.replicas[i] != Replica::Active {
+                    continue;
+                }
+                let Some(h) = self.host_of_cs(set.cs[i]) else { continue };
+                if self.hosts[h].store.is_none() {
+                    continue;
+                }
+                if let Ok(v) = self.block_on(h, volume, chunk, inside) {
+                    has.insert(v == value);
+                }
+            }
+            if has.len() > 1 {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Whether a flush or a close of `op` failing now, before its own
     /// deadline, is one the client fails with a flush before it that failed
     /// at its deadline -- out with it: the client's rule. `failed_at` is when
@@ -776,9 +851,21 @@ impl World {
            to another replica, or has the map read again (a read in a view
            with no active replica among them failed at once: found by this
            target, N9d) */
-        let lost = self.clients[c].zombie || matches!(self.clients[c].s.phase(), Phase::Failed(_));
+        let anew = self.clients[c].served
+            && matches!(self.clients[c].s.phase(), Phase::Attaching | Phase::Fencing | Phase::Reconciling);
+        let lost = self.clients[c].zombie || matches!(self.clients[c].s.phase(), Phase::Failed(_)) || anew;
         if !ok && op.kind != K::Read {
             self.clients[c].failed += 1;
+        }
+        /* A write failed at its deadline that left its replicas apart: the
+           session attaches anew, closing nothing of that generation after
+           it (N13c). One that reached none -- held all its life for a
+           copy-up a stuck join held back -- fails as any other */
+        if let K::Write(value) = op.kind {
+            if !ok && self.now >= op.at + DEADLINE_NS && !self.clients[c].zombie && self.apart(first, n, value) {
+                self.clients[c].failed_write_gen = Some(generation);
+                self.count("writes failed at their deadline, their replicas apart");
+            }
         }
         if !ok && matches!(op.kind, K::Flush | K::Close) && self.now >= op.at + DEADLINE_NS {
             self.clients[c].flush_failed_at = Some(self.now);
@@ -880,9 +967,57 @@ impl World {
         Ok(())
     }
 
+    /// A close of client `c`'s asked with nothing else out and done: every
+    /// place written closed on every active replica up of its chunk -- none
+    /// open at the session's generation. Its closes go a window at a time
+    /// (nbsclient's `CLOSING_MAX`, two places here): one done when its first
+    /// window was would leave the rest open (N13b).
+    fn closed_all(&self, c: usize) -> Result<(), String> {
+        let per = SLOT / BLOCK;
+        let generation = self.clients[c].s.generation();
+        let places: BTreeSet<u64> = self.blocks.history.keys().map(|b| b / per).collect();
+        let Some(v) = self.state.volume(VOLUME) else { return Ok(()) };
+        for place in &places {
+            let Some(&chunk) = v.map.get(*place as usize) else { continue };
+            let Some(ch) = self.state.chunks().get(chunk as usize) else { continue };
+            let Some(set) = self.state.sets().get(ch.set as usize) else { continue };
+            for i in 0..nbsmeta::REPLICAS {
+                if set.replicas[i] != Replica::Active {
+                    continue;
+                }
+                let Some(h) = self.host_of_cs(set.cs[i]) else { continue };
+                let Some(store) = self.hosts[h].store.as_ref() else { continue };
+                /* One found open as its cs restarted is that cs's to refuse */
+                if store.found_open(chunk, ch.incarnation).is_some() {
+                    continue;
+                }
+                if store.holding(chunk).is_some_and(|x| {
+                    x.incarnation == ch.incarnation && x.state == SlotState::Open && x.generation == generation
+                }) {
+                    return Err(format!("step {}: client {}'s close done, nothing else out, and place {}'s chunk {} \
+                                        open on host {} at generation {}", self.step, c, place, chunk,
+                                       self.hosts[h].name, generation));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Every replica the metadata has in, of every block written, alike.
     fn same(&mut self, generation: u64, when: &str) -> Result<(), String> {
-        let blocks: Vec<u64> = self.blocks.history.keys().copied().collect();
+        self.same_of(generation, when, false)
+    }
+
+    /// `same`, but for the blocks a write is out to: a session come to
+    /// serve again sends at once what was asked while it attached anew.
+    fn same_settled(&mut self, generation: u64, when: &str) -> Result<(), String> {
+        self.same_of(generation, when, true)
+    }
+
+    fn same_of(&mut self, generation: u64, when: &str, settled: bool) -> Result<(), String> {
+        let blocks: Vec<u64> = self.blocks.history.iter()
+            .filter(|(_, h)| !settled || !h.iter().any(|w| w.2 == WState::Out))
+            .map(|(&b, _)| b).collect();
         for b in blocks {
             let Some((volume, chunk, inside, hosts)) = self.replicas(b, generation) else { continue };
             let mut seen: Option<(usize, u8)> = None;
@@ -903,9 +1038,21 @@ impl World {
 
     /* ---- the network ---- */
 
+    /// Whether the link from `from` to `to` is cut: one end the cut host's
+    /// cs, the other not its host's mds.
+    fn is_cut(&self, from: End, to: End) -> bool {
+        let Some(x) = self.cut else { return false };
+        match (from, to) {
+            (End::Cs(h), End::Mds(m)) | (End::Mds(m), End::Cs(h)) if h == x => m != x,
+            (End::Cs(h), _) | (_, End::Cs(h)) => h == x,
+            _ => false,
+        }
+    }
+
     /// One message delivered, of a pair picked at random.
     fn deliver(&mut self) -> Result<(), String> {
-        let keys: Vec<(End, End)> = self.links.iter().filter(|(_, q)| !q.is_empty()).map(|(&k, _)| k).collect();
+        let keys: Vec<(End, End)> = self.links.iter().filter(|(&(f, t), q)| !q.is_empty() && !self.is_cut(f, t))
+            .map(|(&k, _)| k).collect();
         let Some(&(from, to)) = self.r.pick(&keys).as_ref() else { return Ok(()) };
         let Some(m) = self.links.get_mut(&(from, to)).and_then(|q| q.pop_front()) else { return Ok(()) };
         match (from, to) {
@@ -1727,7 +1874,7 @@ impl World {
                                                                         index),
             Ask::Down { set, cs, refused, name, generation } => {
                 let up = self.host_of_cs(cs).is_some_and(|h| self.hosts[h].store.is_some());
-                if up && !refused && (self.lost_for_good.is_some() || !self.r.chance(10)) {
+                if up && !refused && (self.lost_for_good.is_some() || self.cut.is_some() || !self.r.chance(10)) {
                     self.count("downs refused: the cs answers the leader");
                     Said::NotNow(String::from("the cs answers the leader"))
                 } else {
@@ -1784,17 +1931,24 @@ impl World {
                     }
                     _ => None,
                 };
+                let asked = match &ask {
+                    Ask::CopyUp { name, place, generation } => format!("{} place {} at {}", name, place, generation),
+                    Ask::CopyDone { name, place, generation, chunk, incarnation } => {
+                        format!("{} place {} at {}, chunk {}.{}", name, place, generation, chunk, incarnation)
+                    }
+                    _ => String::new(),
+                };
                 let cmd = match ask {
                     Ask::CopyUp { name, place, generation } => Command::CopyUp { name, place, generation },
-                    Ask::CopyDone { name, place, generation, chunk } => {
-                        Command::CopyDone { name, place, generation, chunk }
+                    Ask::CopyDone { name, place, generation, chunk, incarnation } => {
+                        Command::CopyDone { name, place, generation, chunk, incarnation }
                     }
                     _ => return Ok(()),
                 };
                 let answer = self.apply(cmd);
                 if self.trace {
-                    eprintln!("  [{}] mds: {:?} asks a copy-up{}: {:?}", self.step, from,
-                              if done { "'s end" } else { "" }, answer);
+                    eprintln!("  [{}] mds: {:?} asks a copy-up{} (#{}: {}): {:?}", self.step, from,
+                              if done { "'s end" } else { "" }, a.id, asked, answer);
                 }
                 match answer {
                     Answer::Chunk { chunk, incarnation } => {
@@ -2136,7 +2290,7 @@ impl World {
             let (c, pause) = (p.c, p.pause);
             self.pausing = None;
             self.count("pauses given up");
-            self.given_up = Some((c, self.clients[c].s.generation()));
+            self.given_up = Some((c, self.clients[c].s.generation(), self.clients[c].anew));
             if self.trace {
                 eprintln!("  [{}] mds: client {}'s pause {} given up: {}", self.step, c, pause, self.clients[c].s.report());
             }
@@ -2145,9 +2299,13 @@ impl World {
         }
         /* The writer of a pause given up goes on at its generation: none was
            taken, so it attaches again for none */
-        if let Some((c, generation)) = self.given_up {
+        if let Some((c, generation, anew)) = self.given_up {
             let s = &self.clients[c].s;
-            if self.clients[c].zombie || matches!(s.phase(), Phase::Failed(_) | Phase::Detached) {
+            /* Attached anew for a write failed at its deadline meanwhile:
+               not for the pause */
+            if self.clients[c].zombie || matches!(s.phase(), Phase::Failed(_) | Phase::Detached)
+                || self.clients[c].anew != anew
+            {
                 self.given_up = None;
             } else if s.generation() != generation {
                 return Err(format!("client {}, its pause given up, attached again: generation {}, {} before", c,
@@ -2252,7 +2410,7 @@ impl World {
         let mut out = Vec::new();
         s.start(self.now, &mut out);
         self.clones.push(CloneW { host: h, s, bufs: Bufs::default(), ops: BTreeMap::new(), next_tag: 1, dead: false,
-                                  stop_done: false, flush_failed_at: None });
+                                  stop_done: false, flush_failed_at: None, anew: 0 });
         self.count("clones made");
         if self.trace {
             eprintln!("  [{}] clone {} made of snapshot {}, its writer {} on host {}", self.step, CLONE, from, k,
@@ -2332,6 +2490,13 @@ impl World {
                 }
                 Out::Done { tag, ok } => self.clone_done(k, tag, ok)?,
                 Out::Say(line) => {
+                    /* Attached anew: what its writer had done and not flushed
+                       as the reconcile's source holds it, there or not */
+                    if line.contains("attached anew") {
+                        self.clones[k].anew += 1;
+                        self.cmodel.lose_unflushed();
+                        self.count("a clone's writes failed at their deadline, its session attached anew");
+                    }
                     if self.trace {
                         eprintln!("  [{}] the clone's writer {}: {}", self.step, k, line);
                     }
@@ -2374,7 +2539,9 @@ impl World {
         let Some(op) = self.clones[k].ops.remove(&tag) else { return Ok(()) };
         let data = self.clones[k].bufs.0.remove(&tag).unwrap_or_default();
         let (first, n) = (op.offset / BLOCK, u64::from(op.len) / BLOCK);
-        let lost = self.clones[k].dead || matches!(self.clones[k].s.phase(), Phase::Failed(_));
+        let anew = self.clones[k].anew > 0
+            && matches!(self.clones[k].s.phase(), Phase::Attaching | Phase::Fencing | Phase::Reconciling);
+        let lost = self.clones[k].dead || matches!(self.clones[k].s.phase(), Phase::Failed(_)) || anew;
         if !ok && matches!(op.kind, K::Flush | K::Close) && self.now >= op.at + DEADLINE_NS {
             self.clones[k].flush_failed_at = Some(self.now);
         }
@@ -2625,8 +2792,25 @@ impl World {
     /// Client `c` come to serve -- in a delivery or a tick before: every
     /// replica alike.
     fn served(&mut self, c: usize, _was: Phase) -> Result<(), String> {
+        /* Serving again at a newer generation -- its own attach anew, for a
+           write failed at its deadline or a pause given up: what it had done
+           and not flushed as the reconcile's source holds it, there or not,
+           and the newer generation the one fences hold to */
+        let generation = self.clients[c].s.generation();
+        if *self.clients[c].s.phase() == Phase::Serving && self.clients[c].served && !self.clients[c].zombie
+            && generation > self.clients[c].served_gen
+        {
+            self.clients[c].served_gen = generation;
+            self.clients[c].failed_write_gen = None;
+            self.served = self.served.max(generation);
+            self.blocks.lose_unflushed();
+            self.count("sessions serving again, attached anew");
+            self.same_settled(generation, "a writer come to serve again")?;
+            return Ok(());
+        }
         if *self.clients[c].s.phase() == Phase::Serving && !self.clients[c].served && !self.clients[c].zombie {
             self.clients[c].served = true;
+            self.clients[c].served_gen = generation;
             self.served = self.served.max(self.clients[c].s.generation());
             self.count("sessions serving");
             self.blocks.lose_unflushed();
@@ -2842,7 +3026,7 @@ impl World {
                                    dead: false, served: false, unflushed: Vec::new(), quiet: false,
                                    shown: Phase::Attaching, failed: 0, stop_done: false,
                                    flush_failed_at: None, downs_asked: BTreeSet::new(), starved_until: 0,
-                                   asked_starved: 0 });
+                                   asked_starved: 0, served_gen: 0, anew: 0, failed_write_gen: None });
         self.outs(c, out)
     }
 
@@ -2903,7 +3087,7 @@ impl World {
                 break;
             }
             self.now += 5 * MS;
-            if self.links.values().all(|q| q.is_empty()) {
+            if self.links.iter().all(|(&(f, t), q)| q.is_empty() || self.is_cut(f, t)) {
                 self.now += 200 * MS;
             }
             self.deliver()?;
@@ -3270,6 +3454,124 @@ impl World {
         Ok(true)
     }
 
+    /// A write failed at its deadline (N13's open question, decided: the
+    /// session attaches anew). One active replica of a chunk, on another
+    /// host than the writer's, is cut off from every host but its own --
+    /// its host up, so that the leader's look keeps it in, as it keeps a
+    /// slow one -- while the writer writes the chunk: the write waits past
+    /// its deadline and fails, taken by the replicas it reached and not by
+    /// the one cut off. The session attaches anew -- no close of the old
+    /// generation's after the write failed, judged at every send -- and,
+    /// the cut healed, serves again at a newer generation, its reconcile
+    /// having made the chunk the same on its replicas. Drawn of `r`.
+    fn cut_write(&mut self, r: &mut Rng) -> Result<bool, String> {
+        let Some(c) = self.current() else { return Ok(false) };
+        let idle = |w: &World, c: usize| w.clients[c].ops.is_empty() || !w.serving(c);
+        self.drive(c, &|w, c| {
+            w.serving(c) || w.clients[c].zombie || matches!(w.clients[c].s.phase(), Phase::Failed(_) | Phase::Detached)
+        })?;
+        self.drive(c, &idle)?;
+        if !self.serving(c) || self.down.is_some() {
+            return Ok(false);
+        }
+        let blocks = VOLUME_MIB << 20 >> 12;
+        let first = r.below(blocks - 4);
+        let Some((_, chunk, _, _)) = self.replicas(first, 0) else { return Ok(false) };
+        let Some(set) = self.state.sets().get(chunk.epoch.set as usize).cloned() else { return Ok(false) };
+        let me = self.clients[c].host;
+        let others: Vec<usize> = (0..nbsmeta::REPLICAS).filter(|&i| set.replicas[i] == Replica::Active)
+            .filter_map(|i| self.host_of_cs(set.cs[i])).filter(|&h| h != me && self.hosts[h].store.is_some())
+            .collect();
+        if others.is_empty() {
+            return Ok(false);
+        }
+        let x = others[r.below(others.len() as u64) as usize];
+        let (anew, generation, tag) = (self.clients[c].anew, self.clients[c].s.generation(), self.clients[c].next_tag);
+        let value = 1 + r.below(255) as u8;
+        self.cut = Some(x);
+        if self.trace {
+            eprintln!("  [{}] host {}'s cs cut off, client {} writing block {}", self.step, self.hosts[x].name, c, first);
+        }
+        self.submit_op(c, K::Write(value), first, 1)?;
+        let ended = |w: &World, c: usize| {
+            w.clients[c].anew != anew || !w.clients[c].ops.contains_key(&tag) || w.clients[c].zombie
+                || matches!(w.clients[c].s.phase(), Phase::Failed(_) | Phase::Detached)
+        };
+        self.drive(c, &ended)?;
+        /* Judged where the write left the replicas apart -- on some, not on
+           the one cut off. One the session never sent -- paused for a
+           snapshot as it came, attached again, and its fence of the replica
+           cut off waiting as the leader, on its host, finds it up -- reached
+           none, and needs no attach anew */
+        let apart = self.apart(first, 1, value);
+        self.cut = None;
+        if self.clients[c].zombie || matches!(self.clients[c].s.phase(), Phase::Failed(_) | Phase::Detached) {
+            return Ok(false);
+        }
+        if self.clients[c].anew == anew && !apart {
+            return Ok(false);
+        }
+        if self.clients[c].anew == anew {
+            return Err(format!("client {}'s write to block {}, host {}'s replica cut off, ended without its session \
+                                attaching anew: {}", c, first, self.hosts[x].name, self.clients[c].s.report()));
+        }
+        /* The cut healed: on to serve again, at a newer generation */
+        self.drive(c, &|w, c| {
+            (w.serving(c) && w.clients[c].s.generation() > generation) || w.clients[c].zombie
+                || matches!(w.clients[c].s.phase(), Phase::Failed(_) | Phase::Detached)
+        })?;
+        if self.clients[c].zombie || matches!(self.clients[c].s.phase(), Phase::Failed(_) | Phase::Detached) {
+            return Ok(false);
+        }
+        if !self.serving(c) || self.clients[c].s.generation() <= generation {
+            return Err(format!("client {}, attached anew past its write's deadline, never served again: {}", c,
+                               self.clients[c].s.report()));
+        }
+        self.count("writes cut off past their deadline, the session attached anew");
+        Ok(true)
+    }
+
+    /// A close of the writer's asked with nothing else out, after a block
+    /// written into each of a few places: done in a moment, every place
+    /// written closed on every active replica -- its closes going two places
+    /// at a time here, window after window, each as the one before is done:
+    /// not each after the places' 3 s of idleness. Drawn of `r`.
+    fn close_all_written(&mut self, r: &mut Rng) -> Result<bool, String> {
+        let Some(c) = self.current() else { return Ok(false) };
+        let idle = |w: &World, c: usize| w.clients[c].ops.is_empty() || !w.serving(c);
+        self.drive(c, &|w, c| {
+            w.serving(c) || w.clients[c].zombie || matches!(w.clients[c].s.phase(), Phase::Failed(_) | Phase::Detached)
+        })?;
+        self.drive(c, &idle)?;
+        if !self.serving(c) || self.down.is_some() {
+            return Ok(false);
+        }
+        let per = SLOT / BLOCK;
+        let places = (VOLUME_MIB << 20) / SLOT;
+        for place in 0..places {
+            if r.chance(70) {
+                self.submit_op(c, K::Write(1 + r.below(255) as u8), place * per + r.below(per), 1)?;
+            }
+        }
+        self.drive(c, &idle)?;
+        if !self.serving(c) || self.down.is_some() {
+            return Ok(false);
+        }
+        let (tag, asked) = (self.clients[c].next_tag, self.now);
+        self.submit_op(c, K::Close, 0, 0)?;
+        self.drive(c, &|w, c| !w.clients[c].ops.contains_key(&tag) || !w.serving(c))?;
+        if !self.serving(c) || self.down.is_some() || self.clients[c].ops.contains_key(&tag) {
+            return Ok(false);
+        }
+        self.closed_all(c)?;
+        if self.now - asked >= CLOSE_ALONE_NS {
+            return Err(format!("client {}'s close asked alone took {} ms: its windows waited on more than their \
+                                answers", c, (self.now - asked) / MS));
+        }
+        self.count("closes asked alone, every place closed");
+        Ok(true)
+    }
+
     /// A flush after one that failed (#95): the last active replica of a
     /// chunk's set, on host `x` -- its two others taken out, as the writer
     /// would ask -- holds a write not yet flushed when `x` crashes, every
@@ -3390,7 +3692,7 @@ fn setup(r: &mut Rng) -> Result<World, String> {
                         seq: 1, down: None, served: 0, rest: None, owed: None, plan_at: 0, drained: None,
                         scrub: Scrub::new(SCRUB_EVERY), scrub_q: Vec::new(), scrub_r: Rng::new(0), scrub_id: 1,
                         rotted: Vec::new(), snaps: Vec::new(), snap_r: Rng::new(0), snap_next: 1, garbage_at: 0, lost_for_good: None,
-                        pausing: None, late: None, pause_next: 1, given_up: None, pause_word: None,
+                        pausing: None, late: None, pause_next: 1, given_up: None, cut: None, pause_word: None,
                         clones: Vec::new(), cmodel: Blocks::default(), clone_r: Rng::new(0),
                         stats: BTreeMap::new() };
     w.apply(Command::Init { cluster: CLUSTER, name: String::from("nbs"), host: String::from(HOSTS[0]), member: 1 });
@@ -3620,6 +3922,17 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     let mut starve = Rng::new(mix(seed, 0x7374_6172));
     if !shaped && lost.is_none() && starve.chance(30) {
         w.starved_writes(&mut starve).map_err(|e| format!("the end: {}", e))?;
+    }
+    /* A close asked alone, window after window: drawn of its own too */
+    let mut alone = Rng::new(mix(seed, 0x636c_6f73));
+    if !shaped && lost.is_none() && alone.chance(30) {
+        w.close_all_written(&mut alone).map_err(|e| format!("the end: {}", e))?;
+    }
+    /* A write past its deadline, a replica cut off (N13's decision): drawn
+       of its own too */
+    let mut cut = Rng::new(mix(seed, 0x6375_7477));
+    if !shaped && lost.is_none() && cut.chance(15) {
+        w.cut_write(&mut cut).map_err(|e| format!("the end: {}", e))?;
     }
     /* The stop asked of a writer paused for a snapshot, a write held behind
        the pause -- the word to go on said, lost, or the snapshot applied

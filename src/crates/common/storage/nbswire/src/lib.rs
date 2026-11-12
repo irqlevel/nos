@@ -1163,8 +1163,11 @@ pub enum Ask {
     /// told the chunk each active member of the set is to copy the old one
     /// into -- or the old one, shared no longer.
     CopyUp { name: String, place: u32, generation: u64 },
-    /// The copy-up at place `place` done: the map names chunk `chunk` there.
-    CopyDone { name: String, place: u32, generation: u64, chunk: u32 },
+    /// The copy-up at place `place` done: the map names chunk `chunk` there
+    /// -- at `incarnation`, the one its members copied into: a number is
+    /// taken again once its chunk is freed, and a copy-up given up and asked
+    /// anew may be given the number it had (`Command::CopyDone`).
+    CopyDone { name: String, place: u32, generation: u64, chunk: u32, incarnation: u32 },
     /// Paused for snapshot `pause` (N10c2): every chunk the writer at
     /// `generation` wrote closed, nothing new sent.
     Paused { name: String, generation: u64, pause: u64 },
@@ -1278,12 +1281,13 @@ impl Asking {
                 w.u32(*place);
                 w.u64(*generation);
             }
-            Ask::CopyDone { name, place, generation, chunk } => {
+            Ask::CopyDone { name, place, generation, chunk, incarnation } => {
                 w.u8(6);
                 w.str(name);
                 w.u32(*place);
                 w.u64(*generation);
                 w.u32(*chunk);
+                w.u32(*incarnation);
             }
             Ask::Paused { name, generation, pause } => {
                 w.u8(7);
@@ -1341,8 +1345,8 @@ impl Asking {
             }
             6 => {
                 let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);
-                let (place, generation) = (r.u32()?, r.u64()?);
-                Ask::CopyDone { name, place, generation, chunk: r.u32()? }
+                let (place, generation, chunk) = (r.u32()?, r.u64()?, r.u32()?);
+                Ask::CopyDone { name, place, generation, chunk, incarnation: r.u32()? }
             }
             7 => {
                 let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);

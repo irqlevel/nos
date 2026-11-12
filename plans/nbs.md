@@ -1834,22 +1834,45 @@ each new gate.
     `name@host` with its own host's name, which the channel routes to
     peers alone -- every answer lost, every write of a chain at its
     deadline (the cs answers its own host by the name alone now).
-  - **Open, found in N13a: a write failed at its deadline leaves its
-    replicas apart.** An operation not done in a minute fails; a write's
-    pieces are dropped with whatever replicas have taken them, and the
-    session later closes the chunk as it closes any -- its replicas apart
-    for good, a read answered by whichever it goes to. Not N13's: the
-    same before it, rare -- a set churning for a minute, the writer's view
-    a step behind every refusal; the cluster target's end came on it once
-    in eight thousand runs while chains crowded its network (seed 2905 of
-    that tree). The way out is the reconcile's, which makes a crashed
-    writer's open chunks the same: (a) the session attaches anew at a
-    write's failure -- every operation out failed with it, its open chunks
-    mended by the new generation's reconcile, as `attach_again` does after
-    a pause given up -- the volume going on; or (b) the session fails, as
-    at `LOST_LAST`, and the next attach mends; or (c) the chunk is never
-    closed by that session, left to the next writer, its replicas apart
-    meanwhile. (a) is the recommendation; a decision for the user.
+  - **Decided and done (2026-11-12, the user's (a)): a write failed at its
+    deadline left its replicas apart.** An operation not done in a minute
+    fails; a write's pieces are dropped with whatever replicas have taken
+    them, and the session later closes the chunk as it closes any -- its
+    replicas apart for good, a read answered by whichever it goes to. Not
+    N13's: the same before it, rare -- a set churning for a minute, the
+    writer's view a step behind every refusal; the cluster target's end came
+    on it once in eight thousand runs while chains crowded its network (seed
+    2905 of that tree). The way out is the reconcile's, which makes a
+    crashed writer's open chunks the same: (a) the session attaches anew at
+    a write's failure -- every operation out failed with it, its open chunks
+    mended by the new generation's reconcile, as `attach_again` does after a
+    pause given up -- the volume going on; or (b) the session fails, as at
+    `LOST_LAST`, and the next attach mends; or (c) the chunk is never closed
+    by that session, left to the next writer, its replicas apart meanwhile.
+    The user took (a): `Session::attach_anew`, the cluster target's
+    `cut_write` end (a replica cut off, its host up, the write past its
+    deadline) and its judge that no close of the old generation goes after
+    such a failure; mutant `anew_on_failed_write`. A campaign of the tree
+    after it (cluster seeds 1001-4000) failed four, three causes. (1) Not
+    (a)'s, there before it: a copy-up's end named its chunk by number alone
+    -- a join of the set gave the copy-up up, a late copy of the writer's
+    first ask began it anew and was given the number freed, at the next
+    incarnation, and the writer's end of the old one, late too, took it: the
+    map named a chunk nobody copied into (seeds 1219, 3663). `CopyDone`
+    names the incarnation now, the mds refusing an end of another as `Stale`
+    and the writer asking its copy-up again from the start; mutant
+    `copy_done_incarnation`. (2) (a) too wide: a write whose pieces not done
+    had reached no replica -- held all their life for a copy-up a stuck join
+    (its source's device failed) held back -- had the session attach anew,
+    and the reconcile then waited on that join and failed the session
+    (1960): only a write with a piece not done sent to a replica has it now
+    (`Piece.left`); mutant `anew_only_left`. (3) The judge: it took any
+    write failed at its deadline as leaving its replicas apart, and the
+    `cut_write` end its write as sent -- one came as the session paused for
+    a snapshot, attached again and its fence of the replica cut off waited,
+    as the leader on that replica's host found it up (2149). Both judge by
+    the replicas now: a block of the write on some active replica and not on
+    another. The four seeds run with the gate (`GATE_CLUSTER_ALSO`).
   - **N13b, the numbers** (2026-11-12; the EX44's bare metal and the
     AX41's two VMs, volume `bench`, nbsload writing on the EX44, three
     rounds of each; 6651c38c's modules swapped in without a reboot, the
@@ -1865,12 +1888,31 @@ each new gate.
     EX44's cs 878,323, ax41a's 878,323, the tail's none). The writer asked
     the EX44's own cs, every chain's head, out of a set twice in the last
     tests (64 KiB at depth 16), and the leader's look -- over the EX44's
-    line, full -- let it be taken out; it joined back. To look into: the
-    head's answers late or lost (its session's mailbox, 1024 messages, three
-    answers a piece at 12k IOPS?), and the look behind a full line.
-  - **Left from N13**: the head's take-outs above; depth 1's cost -- a
-    session with one write out could send it to each replica directly; and
-    the deadline question above.
+    line, full -- let it be taken out; it joined back.
+  - **The head's take-outs, explained and closed (2026-11-12).** Not the
+    writes: the session's mailbox stayed near empty under them (`ipc
+    boxes`, sampled through a run). The stop: a random writer's over 8 GiB
+    closes some 2,000 chunks, every one on its three replicas at once, and
+    their answers overflowed the mailbox's 1,024 places -- `ipc`'s "refused
+    full" up some 4,000 a run, a sequential writer's stop over a hundred
+    chunks none -- the answers past them lost, their replicas asked out as
+    silent at 0.5 s, before the client's 1 s ask again; the EX44's own cs,
+    the head of every chain, among them, and the look let it go. Now the
+    session closes 128 places at a time, the next as those are done (stop,
+    pause and a close of the driver's alike), its mailbox has 4,096 places,
+    and a cs counts the answers the channel would not take ("answers lost").
+    On the hardware after it: the same run, "refused full" unchanged, no
+    take-out, no answer lost on any of the three cs's; and N13b's whole
+    bench again, three rounds, likewise -- none refused, no take-out, none
+    lost -- at the same numbers: 256 KiB at depth 8 and 16 87-90 MiB/s,
+    64 KiB at depth 16 84-87, 4 KiB at depth 32 12.5k IOPS (depth 1 as
+    before, 10-12 MiB/s and 170 IOPS). nbs-test checks no answer is lost.
+    The fuzzer's network has no mailboxes, so its build lets two places
+    out at a time (`small_windows`): its `close_all_written` end, every
+    place closed when a close asked alone is done, and in a moment; and
+    every session's places closing at once held to the window.
+  - **Left from N13**: depth 1's cost -- a session with one write out could
+    send it to each replica directly.
 
 ## What to expect
 

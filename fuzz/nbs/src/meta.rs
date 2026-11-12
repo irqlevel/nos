@@ -1115,14 +1115,16 @@ impl Model {
                 self.fresh = Some(to);
                 Ok(Answer::Chunk { chunk: FRESH, incarnation: 0 })
             }
-            Command::CopyDone { name, place, generation, chunk } => {
+            Command::CopyDone { name, place, generation, chunk, incarnation } => {
                 let (id, from) = self.writers_place(name, *place, *generation)?;
-                if self.mchunks.get(&from).and_then(|c| c.real).map(|r| r.0) == Some(*chunk) {
+                /* Named by its number and incarnation both: a number is taken
+                   again once freed */
+                let named = Some((*chunk, *incarnation));
+                if self.mchunks.get(&from).and_then(|c| c.real) == named {
                     return Ok(self.answer_of(from));
                 }
                 let to = match self.pending.get(&(id, *place)) {
-                    Some(&(to, was)) if was == from
-                        && self.mchunks.get(&to).and_then(|c| c.real).map(|r| r.0) == Some(*chunk) => to,
+                    Some(&(to, was)) if was == from && self.mchunks.get(&to).and_then(|c| c.real) == named => to,
                     _ => return Err(Stale),
                 };
                 self.pending.remove(&(id, *place));
@@ -1722,10 +1724,19 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
                         _ => to,
                     };
                     let generation = if r.chance(90) { generation } else { generation + 1 };
-                    Command::CopyDone { name, place, generation, chunk }
+                    /* Mostly its incarnation; else one before -- an end asked
+                       of the number's chunk given up -- or any */
+                    let now = s.chunks().get(chunk as usize).map_or(0, |c| c.incarnation);
+                    let incarnation = match r.below(10) {
+                        0 => now.wrapping_sub(1),
+                        1 => r.below(4) as u32,
+                        _ => now,
+                    };
+                    Command::CopyDone { name, place, generation, chunk, incarnation }
                 }
                 _ => Command::CopyDone { name: volume(r), place: r.below(4) as u32, generation: r.below(4),
-                                         chunk: r.below(s.chunks().len() as u64 + 2) as u32 },
+                                         chunk: r.below(s.chunks().len() as u64 + 2) as u32,
+                                         incarnation: r.below(4) as u32 },
             }
         }
         /* A member the scrub found unlike the others (N9e): mostly of a set
