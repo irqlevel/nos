@@ -188,6 +188,48 @@ impl DevQueue {
         Started::InFlight
     }
 
+    /// A flush of the device's write cache as buffer `k`'s request: what
+    /// the device had done when it began made durable -- in flight and
+    /// reaped as a write is, or done there and then where the device has
+    /// no asynchronous flush (no write cache, no asynchronous path). A
+    /// buffer with a request already is done, and failed, as `start` does
+    /// it; a queue opened for reading has nothing to flush.
+    fn start_flush(&mut self, k: usize) -> Started {
+        if self.flights.get(k).is_none_or(|f| f.busy) || !self.writable {
+            return Started::Done(false);
+        }
+        if self.queue.asynchronous().is_none() {
+            return Started::Done(self.disk.flush().is_ok());
+        }
+        let began = boot_time_ns();
+        self.flights[k] = Flight { busy: true, left: 1, ok: true };
+        loop {
+            match self.queue.start_flush(k) {
+                Ok(()) => return Started::InFlight,
+                Err(SubmitError::Busy) if boot_time_ns().saturating_sub(began) < BUSY_GIVE_UP_NS => {
+                    /* As `start` waits for room: one of its own commands
+                     * done makes it, or someone else's shortly */
+                    self.queue.kick();
+                    let step = if self.queue.in_flight() > 0 { BUSY_STEP_MS } else { 1 };
+                    self.queue.wait(Duration::from_millis(step));
+                    self.collect();
+                }
+                Err(SubmitError::Unsupported) => {
+                    /* A disk with no flush of its own to start: no write
+                     * cache, nothing to push -- the synchronous path */
+                    self.flights[k].busy = false;
+                    return Started::Done(self.disk.flush().is_ok());
+                }
+                Err(_) => {
+                    klog!(0, "block: {}: a flush was refused, or found no room for {} s", self.disk.name(),
+                          BUSY_GIVE_UP_NS / 1_000_000_000);
+                    self.flights[k].busy = false;
+                    return Started::Done(false);
+                }
+            }
+        }
+    }
+
     /// The synchronous path: `len` bytes of buffer `k` from its start, a
     /// page at a time, from `sector` on.
     fn now(&mut self, k: usize, write: bool, sector: u64, len: usize) -> bool {
@@ -384,6 +426,18 @@ pub unsafe extern "C" fn kernel_blockq_open(
 #[no_mangle]
 pub extern "C" fn kernel_blockq_start(q: usize, buffer: usize, write: i32, offset: u64, len: usize) -> i32 {
     match with(q, |dq| dq.start(buffer, write != 0, offset, len)) {
+        Some(Started::InFlight) => 1,
+        Some(Started::Done(true)) => 0,
+        _ => -1,
+    }
+}
+
+/// Buffer `buffer`'s request a flush of the device's write cache, started
+/// as `kernel_blockq_start`'s are: 1 while the device has it, 0 done now,
+/// -1 done and failed.
+#[no_mangle]
+pub extern "C" fn kernel_blockq_start_flush(q: usize, buffer: usize) -> i32 {
+    match with(q, |dq| dq.start_flush(buffer)) {
         Some(Started::InFlight) => 1,
         Some(Started::Done(true)) => 0,
         _ => -1,
