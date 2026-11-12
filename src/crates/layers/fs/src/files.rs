@@ -484,7 +484,12 @@ pub unsafe extern "C" fn kernel_file_write(
 /// A new file with this content: 1, and nothing written, when there is one at
 /// the path already -- or the remains of a `replace_file` of it. For a file
 /// that must never be written over by mistake, a host key: a stat that failed
-/// on a bad block must not read as "there is none" and lose it.
+/// on a bad block must not read as "there is none" and lose it. -1 for every
+/// other failure -- the mount read-only, the parent missing, no inode or
+/// block left -- which once read as "there is one" for a file that was not
+/// there; and a file this call made and could not fill is taken away again,
+/// so that a disk that filled leaves no half-written key the next start
+/// cannot read and, being never written over, will not replace.
 ///
 /// # Safety
 /// `path` points at `path_len` bytes; `data` at `len`.
@@ -503,11 +508,16 @@ pub unsafe extern "C" fn kernel_file_create(
     if locate(path).is_some() {
         return 1;
     }
-    /* Refused by the filesystem itself when the file is there after all. */
     if !vfs.create(path.as_bytes(), false) {
-        return 1;
+        /* There after all -- made between the look and the create -- or
+         * refused for another reason, which is no file there */
+        return if locate(path).is_some() { 1 } else { -1 };
     }
     if !vfs.write_file(path.as_bytes(), unsafe { bytes(data, len) }) || !vfs.sync() {
+        /* What this call made, and nothing of anyone else's: the create
+         * above was refused for a file that was there */
+        let _ = vfs.remove(path.as_bytes());
+        let _ = vfs.sync();
         return -1;
     }
     0

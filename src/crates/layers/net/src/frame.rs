@@ -446,7 +446,17 @@ pub struct FramePool {
     oversized: AtomicUsize,
     ring_refills: AtomicUsize,
     ring_flushes: AtomicUsize,
+    /// Frames the ring would not take back -- refused for longer than a
+    /// release tried, by a pop half-way through on another CPU -- and so
+    /// left out of the pool for good: one fewer, counted rather than gone
+    /// without a word.
+    lost: AtomicUsize,
 }
+
+/// How many times a frame's way back onto the ring is tried before it is
+/// counted lost: enough for a pop on another CPU to finish, and no wait for
+/// good, on a path that may be an interrupt's.
+const RING_PUSH_TRIES: usize = 64;
 
 pub static POOL: FramePool = FramePool {
     ring: Once::new(),
@@ -457,6 +467,7 @@ pub static POOL: FramePool = FramePool {
     oversized: AtomicUsize::new(0),
     ring_refills: AtomicUsize::new(0),
     ring_flushes: AtomicUsize::new(0),
+    lost: AtomicUsize::new(0),
 };
 
 impl FramePool {
@@ -620,9 +631,21 @@ impl FramePool {
         });
 
         /* No cache took it -- this CPU has none, or its own would not drain.
-         * The ring always has room for every frame. */
+         * The ring has room for every frame, but answers full for the
+         * moment a pop is half-way through: tried again, then counted. */
         if let Some(idle) = idle {
-            ring.push(idle.word());
+            let word = idle.word();
+            let mut pushed = false;
+            for _ in 0..RING_PUSH_TRIES {
+                if ring.push(word) {
+                    pushed = true;
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            if !pushed {
+                self.lost.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -674,6 +697,7 @@ impl FramePool {
             oversized: self.oversized.load(Ordering::Relaxed),
             refills: self.ring_refills.load(Ordering::Relaxed),
             flushes: self.ring_flushes.load(Ordering::Relaxed),
+            lost: self.lost.load(Ordering::Relaxed),
         }
     }
 }
@@ -691,6 +715,7 @@ pub struct Stats {
     pub oversized: usize,
     pub refills: usize,
     pub flushes: usize,
+    pub lost: usize,
 }
 
 /* ---- what the kernel calls ---- */

@@ -35,11 +35,6 @@ impl LocalCounter {
     }
 
     #[inline]
-    pub fn sub(&self, n: usize) {
-        self.0.store(self.0.load(Ordering::Relaxed).wrapping_sub(n), Ordering::Relaxed);
-    }
-
-    #[inline]
     pub fn set(&self, n: usize) {
         self.0.store(n, Ordering::Relaxed);
     }

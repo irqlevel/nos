@@ -55,7 +55,9 @@ pub struct SharedEvent {
 
 impl SharedEvent {
     /// An event, the caller its one holder: None when the kernel has no
-    /// memory for one.
+    /// event to give. The `Arc`'s few bytes are the heap's own, and a heap
+    /// that has not even those panics, as every infallible allocation of
+    /// the image's does.
     pub fn new() -> Option<Arc<SharedEvent>> {
         let event = Event::new()?;
         LIVE.fetch_add(1, Ordering::Relaxed);
