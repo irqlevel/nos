@@ -910,8 +910,8 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
             total.mmio_done);
     }
     if let Some(io) = guest.ioapic_stats() {
-        let _ = writeln!(out, "  ioapic     {} interrupts sent, {} of them level-triggered, {} ended by EOI, {} of no delivery mode sent here",
-            io.sent, io.level, io.eois, io.dropped);
+        let _ = writeln!(out, "  ioapic     {} interrupts sent, {} of them level-triggered, {} ended by EOI, {} levels no local APIC took, {} of no delivery mode sent here",
+            io.sent, io.level, io.eois, io.untaken, io.dropped);
     }
     if counts.len() > 1 {
         let states = guest.cpu_states();

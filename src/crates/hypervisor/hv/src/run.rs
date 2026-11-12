@@ -836,6 +836,10 @@ pub struct GuestCpu {
     other_due: Option<u64>,
     /// What the host's timer was last asked for (`Kick::arm_at`).
     asked: Option<u64>,
+    /// Its local APIC as it last published it (`publish`): its addressing,
+    /// and whether it was software-enabled -- what decides whether a message
+    /// it was sent, or one that reached nobody, would be taken now.
+    published: (u64, bool),
     counts: Counts,
 }
 
@@ -1036,9 +1040,11 @@ impl LinuxGuest {
     /// the CPUs' -- a guest of more than one CPU only, since it delivers to
     /// local APICs -- and its APICs come out of reset in xAPIC mode, as a
     /// PC's firmware leaves them: x2APIC mode with an IO-APIC and no
-    /// interrupt remapping is not one the architecture has, and Linux,
-    /// finding its firmware left one so, turns it off -- through a page it
-    /// has not mapped, 6.1 and 6.18 alike, and faults.
+    /// interrupt remapping is not one the architecture has, and a Linux
+    /// built without KVM_GUEST, finding its firmware left one so, turns it
+    /// off -- through a page it has not mapped, 6.1 and 6.18 alike, and
+    /// faults. One built with it keeps it here, the CPUID's hypervisor range
+    /// being KVM's (`policy`), but xAPIC mode is the one every kernel takes.
     ///
     /// Its RAM is laid out as `linux::Ram` says, and is the huge pool's
     /// when `huge` -- every byte of it, 2 MiB a block, or `NoHugePages` --
@@ -1078,6 +1084,7 @@ impl LinuxGuest {
             let activity = if i == 0 { Activity::Running } else { Activity::WaitForSipi };
             let lapic = Lapic::new(i, i == 0, x2apic);
             let addressing = lapic.addressing().pack();
+            let published = (addressing, lapic.software_enabled());
             vcpus.push(GuestCpu {
                 index: i,
                 cpu,
@@ -1093,6 +1100,7 @@ impl LinuxGuest {
                 step: Step::Other,
                 other_due: None,
                 asked: None,
+                published,
                 counts: Counts::default(),
             });
             shared.push(CpuShared {
@@ -2404,7 +2412,28 @@ impl LinuxGuest {
         let taken: u32 = mail.fixed.iter().map(|w| w.count_ones()).sum();
         if taken != 0 {
             gc.counts.ipi_taken += u64::from(taken);
-            gc.lapic.accept_all(&mail.fixed, &mail.level);
+            let refused = gc.lapic.accept_all(&mail.fixed, &mail.level);
+            if refused != [0; 4] {
+                self.levels_refused(&refused);
+            }
+        }
+    }
+
+    /// Level-triggered interrupts the IO-APIC posted to this CPU, `vectors`
+    /// a bit each, that its APIC refused -- software-disabled, say, or reset
+    /// by an INIT taken with them: the IO-APIC told, which waits for no EOI
+    /// of them and sends them again once a CPU's APIC changes so that one
+    /// may be taken (`publish`). Told nothing, the pins were dead for good.
+    fn levels_refused(&self, vectors: &[u64; 4]) {
+        let mut p = self.platform.lock();
+        let Some(io) = p.ioapic.as_mut() else { return };
+        for (w, &bits) in vectors.iter().enumerate() {
+            let mut left = bits;
+            while left != 0 {
+                let bit = left.trailing_zeros();
+                left &= left - 1;
+                io.refused((w as u32 * u64::BITS + bit) as u8);
+            }
         }
     }
 
@@ -2748,12 +2777,17 @@ impl LinuxGuest {
     /// interrupt the local APIC takes as level-triggered, its EOI coming
     /// back to the IO-APIC. An NMI goes into the mailbox of each CPU named,
     /// the sender's own included, for its loop to take -- rung, so that one
-    /// already on its way into its guest turns back for it. An INIT from a
-    /// device is none a PC's firmware wires, and is dropped.
-    fn post_message(&self, mut by: Option<(u32, &mut Lapic)>, ipi: &Ipi, level: bool) {
+    /// already on its way into its guest turns back for it. Whether a local
+    /// APIC took it: the sender's own says so as it takes it, and one posted
+    /// to another CPU counts as taken -- the sender cannot ask, and that
+    /// CPU tells the IO-APIC of a level it refuses (`levels_refused`) --
+    /// while one that reaches no CPU is taken by none. A device has no other
+    /// delivery mode here (`lapic::msi`, the IO-APIC's `send`).
+    fn post_message(&self, mut by: Option<(u32, &mut Lapic)>, ipi: &Ipi, level: bool) -> bool {
         /* From outside every CPU -- a disk's task (`serve_disk`) -- no CPU
          * is the sender's own: each one named takes it through its mailbox */
         let me = by.as_ref().map_or(u32::MAX, |(m, _)| *m);
+        let mut taken = false;
         for (i, target) in self.cpus.iter().enumerate() {
             let id = i as u32;
             let addressing = match by.as_ref() {
@@ -2766,27 +2800,26 @@ impl LinuxGuest {
             let own = by.as_mut().filter(|(m, _)| *m == id).map(|(_, lapic)| lapic);
             let posted = match (ipi.delivery, own) {
                 (Delivery::Fixed | Delivery::LowestPriority, Some(lapic)) => {
-                    if level {
-                        lapic.accept_level(ipi.vector);
-                    } else {
-                        lapic.accept(ipi.vector);
-                    }
+                    taken |= if level { lapic.accept_level(ipi.vector) } else { lapic.accept(ipi.vector) };
                     false
                 }
                 (Delivery::Fixed | Delivery::LowestPriority, None) if !level => {
                     /* Posted or mailed, and its CPU notified or rung. */
                     self.post_edge(i, target, ipi.vector);
+                    taken = true;
                     false
                 }
                 (Delivery::Fixed | Delivery::LowestPriority, None) => {
                     target.mail.post_level(ipi.vector);
+                    taken = true;
                     true
                 }
                 (Delivery::Nmi, _) => {
                     target.mail.post_nmi();
+                    taken = true;
                     true
                 }
-                _ => return,
+                _ => return taken,
             };
             if posted {
                 if let Some(d) = self.doorbells.get(i) {
@@ -2794,23 +2827,37 @@ impl LinuxGuest {
                 }
             }
             if ipi.delivery == Delivery::LowestPriority {
-                return;
+                return taken;
             }
         }
+        taken
     }
 
     /// The interrupts the IO-APIC has to send for `pins`, delivered as its
-    /// messages say, by CPU `me`, whose local APIC is `lapic`.
+    /// messages say, by CPU `me`, whose local APIC is `lapic` -- the IO-APIC
+    /// told of each whether a local APIC took it, which is what its remote
+    /// IRR waits on (`IoApic::send`).
     fn ioapic_send(&self, p: &mut Platform, pins: Pins, me: u32, lapic: &mut Lapic, counts: &mut Counts) {
         let Some(io) = p.ioapic.as_mut() else { return };
         let mut left = pins;
         while left != 0 {
             let pin = left.trailing_zeros() as usize;
             left &= left - 1;
-            if let Some(m) = io.send(pin) {
+            io.send(pin, &mut |m| {
                 counts.ioapic += 1;
-                self.post_message(Some((me, &mut *lapic)), &m.ipi, m.level);
-            }
+                self.post_message(Some((me, &mut *lapic)), &m.ipi, m.level)
+            });
+        }
+    }
+
+    /// The IO-APIC's level-triggered interrupts no local APIC took, sent
+    /// again by CPU `gc`, whose APIC has just changed so that it may take
+    /// one (`publish`): the chip tries such a message again on its own.
+    fn send_untaken(&self, gc: &mut GuestCpu) {
+        let mut p = self.platform.lock();
+        let Some(pins) = p.ioapic.as_ref().map(|io| io.untaken()) else { return };
+        if pins != 0 {
+            self.ioapic_send(&mut p, pins, gc.index, &mut gc.lapic, &mut gc.counts);
         }
     }
 
@@ -3046,10 +3093,18 @@ impl LinuxGuest {
 
     /// `gc`'s local APIC's addressing, where the other CPUs match their
     /// messages against it: after anything that may change it -- its mode,
-    /// its xAPIC logical ID and model, an INIT.
-    fn publish(&self, gc: &GuestCpu) {
+    /// its xAPIC logical ID and model, an INIT. And when that, or whether it
+    /// is software-enabled, did change, the IO-APIC's level-triggered
+    /// interrupts that no APIC took are sent again: one sent to nobody, or
+    /// to an APIC still off, may be this one's to take now.
+    fn publish(&self, gc: &mut GuestCpu) {
+        let addressing = gc.lapic.addressing().pack();
         if let Some(s) = self.cpus.get(gc.index as usize) {
-            s.addressing.store(gc.lapic.addressing().pack(), Ordering::Relaxed);
+            s.addressing.store(addressing, Ordering::Relaxed);
+        }
+        let now = (addressing, gc.lapic.software_enabled());
+        if core::mem::replace(&mut gc.published, now) != now {
+            self.send_untaken(gc);
         }
     }
 

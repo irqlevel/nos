@@ -63,7 +63,7 @@ enum Half {
 
 /// One counter.
 struct Channel {
-    /// The reload value; 0 means 65536, as the 8254 has it.
+    /// The count loaded last; 0 means 65536, as the 8254 has it.
     reload: u16,
     /// The access mode from the last control word: lo, hi or lo/hi.
     access: u8,
@@ -72,28 +72,51 @@ struct Channel {
     /// For lo/hi access, which byte comes next on a write or a read.
     write_half: Half,
     read_half: Half,
+    /// The low byte of a lo/hi count, until its high byte is written: a
+    /// count is loaded whole, and nothing counts by half of one. Put into
+    /// the reload as it came, the counter ran meanwhile on the old count's
+    /// high byte and the new one's low, its edge count started again: one
+    /// IRQ0 the chip never gives, or a one-shot up to 256 ticks early.
+    low: u8,
     /// A latched count, if the guest latched one; read back before the live
     /// counter.
     latched: Option<u16>,
-    /// When the current count was loaded, in host nanoseconds -- the zero
-    /// from which the counter has been counting down.
-    loaded_ns: u64,
-    /// Whether the counter is counting: channel 0 always is; channel 2 only
-    /// while its gate (port 0x61 bit 0) is set.
-    running: bool,
+    /// Whether a count has been loaded since the control word that set the
+    /// mode: until one is, the counter waits, counting nothing.
+    loaded: bool,
+    /// The ticks counted before `since_ns`: where a count that stopped -- its
+    /// gate low, its first byte written in mode 0, a control word -- had got.
+    counted: u64,
+    /// When the count last started counting, in host nanoseconds: None while
+    /// it does not count. Channel 0's gate is tied high; channel 2's is port
+    /// 0x61 bit 0.
+    since_ns: Option<u64>,
+}
+
+/// The 8254's ticks in `ns` nanoseconds. In 128 bits: nanoseconds times 1.19
+/// MHz outgrows 64 bits after some four hours of a channel counting, and
+/// saturating there would freeze the counter -- the guest's tick would stop
+/// with nothing said. The quotient fits: a u64 of nanoseconds is 2^64 *
+/// 1.19e6 / 1e9 ticks.
+fn ticks(ns: u64) -> u64 {
+    (ns as u128 * PIT_HZ as u128 / kcore::consts::NS_PER_SEC as u128) as u64
 }
 
 impl Channel {
-    fn new() -> Self {
+    /// Out of reset: counting, or -- channel 2, whose gate starts low --
+    /// held.
+    fn new(counting: bool) -> Self {
         Self {
             reload: 0,
             access: ACCESS_LOHI,
             mode: 0,
             write_half: Half::Lo,
             read_half: Half::Lo,
+            low: 0,
             latched: None,
-            loaded_ns: time::boot_time_ns(),
-            running: true,
+            loaded: true,
+            counted: 0,
+            since_ns: counting.then(time::boot_time_ns),
         }
     }
 
@@ -107,22 +130,53 @@ impl Channel {
         self.reload_ticks().max(MIN_EDGE_TICKS)
     }
 
-    /// Ticks elapsed since the count was loaded.
-    fn elapsed(&self) -> u64 {
-        let ns = time::boot_time_ns().saturating_sub(self.loaded_ns);
-        /* In 128 bits: nanoseconds times 1.19 MHz outgrows 64 bits after some
-         * four hours of a channel counting, and saturating there would freeze
-         * the counter -- the guest's tick would stop with nothing said. The
-         * quotient fits: a u64 of nanoseconds is 2^64 * 1.19e6 / 1e9 ticks. */
-        (ns as u128 * PIT_HZ as u128 / kcore::consts::NS_PER_SEC as u128) as u64
+    /// Whether the count is counting now.
+    fn counting(&self) -> bool {
+        self.since_ns.is_some()
     }
 
-    /// The counter as it reads now, 16 bits.
+    /// Ticks counted since the count was loaded.
+    fn elapsed(&self) -> u64 {
+        let running = self.since_ns.map_or(0, |since| ticks(time::boot_time_ns().saturating_sub(since)));
+        self.counted.saturating_add(running)
+    }
+
+    /// The count stopped where it is.
+    fn hold(&mut self) {
+        self.counted = self.elapsed();
+        self.since_ns = None;
+    }
+
+    /// Port 0x61's gate bit set where it was clear: in modes 0 and 4 the
+    /// count goes on from where it stopped -- unless it waits for a count,
+    /// or for the high byte of one in mode 0 -- and in the others it starts
+    /// again from its reload, the gate's rise a trigger (the 8254's table of
+    /// gate operations).
+    fn gate_rose(&mut self) {
+        if !self.loaded || (self.mode == 0 && self.write_half == Half::Hi) {
+            return;
+        }
+        let now = time::boot_time_ns();
+        if !one_shot(self.mode) {
+            self.counted = 0;
+            self.since_ns = Some(now);
+        } else if self.since_ns.is_none() {
+            self.since_ns = Some(now);
+        }
+    }
+
+    /// Port 0x61's gate bit cleared: the count held where it is, in every
+    /// mode but 1 and 5, whose gate is a trigger and no more.
+    fn gate_fell(&mut self) {
+        if !matches!(self.mode, 1 | 5) {
+            self.hold();
+        }
+    }
+
+    /// The counter as it reads now, 16 bits: where it stopped, while it does
+    /// not count.
     fn current(&self) -> u16 {
         let reload = self.reload_ticks();
-        if !self.running {
-            return self.reload as u16;
-        }
         let elapsed = self.elapsed();
         match self.mode {
             /* The one-shot modes, 0 and 4 and their gate-triggered 1 and 5:
@@ -142,9 +196,14 @@ impl Channel {
 
     /// Channel-2's output line: mode 0 goes high at the terminal count and
     /// stays; the periodic modes pulse, reading high for most of the cycle.
+    /// Out of a control word it is low in mode 0 and high in the others
+    /// until a count comes, and a periodic mode's gate low sets it high.
     fn output_high(&self) -> bool {
-        if !self.running {
-            return false;
+        if !self.loaded {
+            return self.mode != 0;
+        }
+        if !self.counting() && periodic(self.mode) {
+            return true;
         }
         let reload = self.reload_ticks();
         let elapsed = self.elapsed();
@@ -156,10 +215,12 @@ impl Channel {
         }
     }
 
-    fn load(&mut self, reload: u16, running: bool) {
+    /// A whole count, `reload`, loaded: counted from now when `counting`.
+    fn load(&mut self, reload: u16, counting: bool) {
         self.reload = reload;
-        self.loaded_ns = time::boot_time_ns();
-        self.running = running;
+        self.loaded = true;
+        self.counted = 0;
+        self.since_ns = counting.then(time::boot_time_ns);
         self.latched = None;
     }
 }
@@ -190,9 +251,11 @@ fn periodic(mode: u8) -> bool {
 }
 
 impl Pit {
+    /// Out of reset: channels 0 and 1 counting, their gates tied high, and
+    /// channel 2 held -- port 0x61's gate bit is clear.
     pub fn new() -> Self {
         Self {
-            ch: [Channel::new(), Channel::new(), Channel::new()],
+            ch: [Channel::new(true), Channel::new(true), Channel::new(false)],
             port61: 0,
             ch0_edges_given: 0,
             ch0_armed: false,
@@ -253,15 +316,13 @@ impl Pit {
     pub fn write(&mut self, port: u16, value: u8) {
         match port {
             PORT_61 => {
+                let was = self.port61 & P61_CH2_GATE != 0;
                 self.port61 = value & (P61_CH2_GATE | P61_SPEAKER);
                 let gate = value & P61_CH2_GATE != 0;
-                /* Enabling the gate (re)starts channel 2 counting from its
-                 * reload; clearing it freezes the count. */
-                let ch = &mut self.ch[2];
-                if gate && !ch.running {
-                    ch.load(ch.reload, true);
-                } else if !gate {
-                    ch.running = false;
+                match (was, gate) {
+                    (false, true) => self.ch[2].gate_rose(),
+                    (true, false) => self.ch[2].gate_fell(),
+                    _ => {}
                 }
             }
             CONTROL => self.control(value),
@@ -269,11 +330,15 @@ impl Pit {
                 let index = (port - CH0) as usize;
                 let loaded = self.write_counter(index, value);
                 if index == 0 {
-                    /* A fresh channel-0 program restarts its edge count; a
-                     * count loaded in a one-shot mode is one edge to come. */
-                    self.ch0_edges_given = 0;
                     if loaded {
+                        /* A count loaded restarts channel 0's edge count; in
+                         * a one-shot mode it is one edge to come. */
+                        self.ch0_edges_given = 0;
                         self.ch0_armed = one_shot(self.ch[0].mode);
+                    } else if self.ch[0].mode == 0 {
+                        /* Mode 0's first byte stops the count: a shot armed
+                         * is not one now, until the high byte loads one. */
+                        self.ch0_armed = false;
                     }
                 }
             }
@@ -297,7 +362,7 @@ impl Pit {
     /// clocksource, not from a flood.
     pub fn ch0_fire(&mut self) -> bool {
         let ch = &self.ch[0];
-        if !ch.running {
+        if !ch.counting() {
             return false;
         }
         if one_shot(ch.mode) {
@@ -325,19 +390,18 @@ impl Pit {
 
     /// When, in host nanoseconds since boot, channel 0 next raises IRQ0: the
     /// edge after the last one `ch0_fire` reported, or a one-shot's one edge.
-    /// None when channel 0 has no edge to come -- stopped, a one-shot that has
-    /// fired, a mode that makes none. What a halted vCPU sleeps until: the
-    /// only thing here that becomes pending with time.
+    /// None when channel 0 has no edge to come -- not counting, a one-shot
+    /// that has fired, a mode that makes none. What a halted vCPU sleeps
+    /// until: the only thing here that becomes pending with time.
     pub fn next_ch0_edge_ns(&self) -> Option<u64> {
         let ch = &self.ch[0];
-        if !ch.running {
-            return None;
-        }
+        let since = ch.since_ns?;
         /* Edge k is due once `elapsed()` reaches k times the ticks between
          * edges -- the reload, or the floor for a periodic count -- which is
-         * the first nanosecond at or past that many ticks' 1e9 / PIT_HZ:
-         * rounded up, so that at that instant `ch0_fire` does see it. A
-         * one-shot's one edge is edge 1, at its reload. */
+         * the first nanosecond at or past that many ticks' 1e9 / PIT_HZ past
+         * when it began counting, less what it counted before: rounded up,
+         * so that at that instant `ch0_fire` does see it. A one-shot's one
+         * edge is edge 1, at its reload. */
         let (edge, every) = if one_shot(ch.mode) && self.ch0_armed {
             (1, ch.reload_ticks())
         } else if periodic(ch.mode) {
@@ -345,15 +409,15 @@ impl Pit {
         } else {
             return None;
         };
-        let ticks = edge * every as u128;
+        let ticks = (edge * every as u128).saturating_sub(u128::from(ch.counted));
         let ns = (ticks * kcore::consts::NS_PER_SEC as u128).div_ceil(PIT_HZ as u128);
-        let at = (ch.loaded_ns as u128).saturating_add(ns);
+        let at = u128::from(since).saturating_add(ns);
         Some(u64::try_from(at).unwrap_or(u64::MAX))
     }
 
-    /// Channel 0's mode, reload and running flag, for a diagnostic.
+    /// Channel 0's mode, reload and whether it counts, for a diagnostic.
     pub fn ch0_state(&self) -> (u8, u16, bool) {
-        (self.ch[0].mode, self.ch[0].reload, self.ch[0].running)
+        (self.ch[0].mode, self.ch[0].reload, self.ch[0].counting())
     }
 
     fn control(&mut self, value: u8) {
@@ -379,9 +443,13 @@ impl Pit {
         ch.mode = (value >> MODE_SHIFT) & 0x7;
         ch.write_half = Half::Lo;
         ch.read_half = Half::Lo;
+        /* A new mode counts nothing until its count is written: the counter
+         * waits -- the old count does not run on in the new mode, its edges
+         * channel 0's IRQ0 -- and a one-shot armed before it is not one
+         * now. */
+        ch.hold();
+        ch.loaded = false;
         if index == 0 {
-            /* A new mode counts nothing until its count is written: a
-             * one-shot armed before it is not one now. */
             self.ch0_armed = false;
         }
     }
@@ -389,21 +457,25 @@ impl Pit {
     /// A byte of a count: true once a whole count has been loaded.
     fn write_counter(&mut self, index: usize, value: u8) -> bool {
         let ch = &mut self.ch[index];
-        let running = index != 2 || self.port61 & P61_CH2_GATE != 0;
+        let counting = index != 2 || self.port61 & P61_CH2_GATE != 0;
         match ch.access {
-            ACCESS_LO => ch.load(value as u16, running),
-            ACCESS_HI => ch.load((value as u16) << 8, running),
+            ACCESS_LO => ch.load(value as u16, counting),
+            ACCESS_HI => ch.load((value as u16) << 8, counting),
             _ => match ch.write_half {
                 Half::Lo => {
-                    /* Keep the low byte until the high one arrives; the
-                     * counter reloads on the high byte. */
-                    ch.reload = (ch.reload & 0xFF00) | value as u16;
+                    /* Kept until the high byte comes, which loads the two:
+                     * in mode 0 the first byte stops the count until then,
+                     * and in the others it changes nothing that counts. */
+                    ch.low = value;
                     ch.write_half = Half::Hi;
+                    if ch.mode == 0 {
+                        ch.hold();
+                    }
                     return false;
                 }
                 Half::Hi => {
-                    let reload = (ch.reload & 0x00FF) | ((value as u16) << 8);
-                    ch.load(reload, running);
+                    let reload = u16::from(ch.low) | (u16::from(value) << 8);
+                    ch.load(reload, counting);
                     ch.write_half = Half::Lo;
                 }
             },
