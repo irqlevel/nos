@@ -2532,10 +2532,13 @@ int kernel_panic_active()
 
 /* One decoded byte of a keystroke from a driver in Rust -- the USB
    keyboard -- to every observer: the shell, and whatever else is listening.
-   What it is is KeyboardObserver's (kernel/input.h). */
-void kernel_input_key(char c, unsigned char code)
+   What it is is KeyboardObserver's (kernel/input.h). A byte, as Rust passes
+   it: a `char` here was signed on x86-64 and unsigned on arm64, and clang
+   takes a signed one as its caller sign-extended it, which Rust's zero-
+   extended u8 is not past 0x7F (scripts/check-ffi.py) */
+void kernel_input_key(u8 c, u8 code)
 {
-    kernel::KeyboardInput::get_instance().emit(c, code);
+    kernel::KeyboardInput::get_instance().emit(static_cast<char>(c), code);
 }
 
 /* dhcp=off: the shell's `dhcp` says so rather than running one. */
