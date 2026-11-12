@@ -309,7 +309,7 @@ HVBOOT = os.path.join(ROOT, "out", "x86_64", "hvboot")
 # What `hv run all` has to have said about each guest, beyond its verdict.
 GUESTS = {
     "exits": [r'said\s+"nos: ports and cpuid"', r"1 port in, 20 port out, 1 cpuid"],
-    "uart": [r"brought up the 8250 and sent 35 bytes through it"],
+    "uart": [r"brought up the 8250, read its scratch register back, and sent 35 bytes through it"],
     "hypercall": [r'said\s+"nos: long mode"', r"15 registers went out at the hypercall and 15 answers came back"],
     "fault": [r"nested page fault at gpa 0x1ff000, error 0x1[0-9a-f]{8}, rip 0x8009",
               r"the instruction it was told to, its state read whole"],
@@ -337,9 +337,9 @@ GUESTS = {
     # two EOIs through the guest's word, done by the host at the next exit,
     # and two by the register.
     "pveoi": [r"0x50 alone ended through the word, its EOI the host's at the next exit; 0x70, nested over 0x30, "
-              r"through it too, and 0x30's own EOI by the register after, whose exit did 0x70's first; nothing left "
-              r"in service; with PV EOI off, 0x50 by the register, the word never set -- 2 EOIs through the word, 2 "
-              r"by the register"],
+              r"through it too, the word read clear while 0x70 waited in IRR, and 0x30's own EOI by the register "
+              r"after, whose exit did 0x70's first; nothing left in service; with PV EOI off, 0x50 by the register, "
+              r"the word never set -- 2 EOIs through the word, 2 by the register"],
     # At least one write answered in the world switch, or the guest looked
     # at nothing (`check_kgs` refuses none); then the two bases as left.
     # QEMU's TCG gives AMD-V no next-RIP save, and its world switch then
@@ -383,7 +383,8 @@ GUESTS = {
     # host's alone after; three IBPBs asked each, all answered before the
     # next entry. Which the CPU has is `hv info`'s to say, and checked
     # against it below (`check_controls`).
-    "spec": [r"(?:no speculation control offered, as the CPU has none: every access to SPEC_CTRL and PRED_CMD a #GP"
+    "spec": [r"(?:no speculation control offered, as the host switches none -- the CPU's own CPUID offers "
+             r"SPEC_CTRL 0x[0-9a-f]+ and PRED_CMD 0x[0-9a-f]+: every access to SPEC_CTRL and PRED_CMD a #GP"
              r"|SPEC_CTRL 0x[0-9a-f]+ and PRED_CMD 0x[0-9a-f]+ offered, as the host switches them; vm B read "
              r"SPEC_CTRL as 0 where vm A had left 0x[0-9a-f]+, each read back its own \(0x[0-9a-f]+ and 0x[0-9a-f]+\) "
              r"and ran under it over the host's, as read off the CPU, bit 62 refused, the CPU's the host's alone "
@@ -422,10 +423,11 @@ GUESTS = {
     # every turn, whatever its XCR0 says of PKRU; RDPKRU a #UD before PKE.
     "pkru": [r"(?:PKU offered, OSPKE with CR4.PKE, XCR0 0x203 and 1, PKRU's component of 8 bytes at \d+; PKRU 0 "
              r"at each CPU's start, and its own at all 64 of its turns, put back \d+ and \d+ times"
-             r"|no PKU offered, as this CPU switches no PKRU: RDPKRU a #UD; all 64 turns each taken)"],
-    "tscaux": [r"RDTSCP yes, RDPID (?:yes|no), INVPCID (?:yes|no), as its CPUID said; vm B read TSC_AUX as 0 where "
-               r"vm A had left its own, each read back the value it wrote -- bit 32 refused -- and INVPCID "
-               r"(?:ran types 0 to 3, 4 a #GP|was a #UD)",
+             r"|no PKU offered, as this CPU switches no PKRU -- its own CPUID has(?: no)? PKU: RDPKRU a #UD; all 64 "
+             r"turns each taken)"],
+    "tscaux": [r"RDTSCP yes, RDPID (?:yes|no), INVPCID (?:yes|no), as its CPUID said -- the CPU's own CPUID "
+               r"has(?: no)? RDPID and has(?: no)? INVPCID; vm B read TSC_AUX as 0 where vm A had left its own, each "
+               r"read back the value it wrote -- bit 32 refused -- and INVPCID (?:ran types 0 to 3, 4 a #GP|was a #UD)",
                r"\b3 and 3 rdmsr, 2 and 2 wrmsr, 1 and 1 refused"],
 }
 
@@ -780,7 +782,8 @@ def x86(args):
         # The last command's own output lands after the marker above: the
         # end of the script is waited for by it (`RC_DONE`).
         wait_done(log, 600)
-        x86_checks(blocks(log), script, digest, grown, raw)
+        expect = set(args.expect) | (set() if kvm else TCG_OFFERS)
+        x86_checks(blocks(log), script, digest, grown, raw, expect)
     finally:
         server.shutdown()
         pt.kill(p)
@@ -1159,7 +1162,22 @@ def check_controls(info, text, cpu):
              % (cpu, "yes" if spec_ctrl else "no", "yes" if ibpb else "no"), good, report or text)
 
 
-def x86_checks(ran, script, digest, grown, raw):
+# What a guest is offered of the features a CPU may have and the hypervisor
+# may withhold -- PKU, RDTSCP, RDPID, INVPCID, the speculation controls --
+# is decided, said by `hv info` and expected by the guests' checks all from
+# the same few functions, which agreeing among themselves hold nothing to
+# the CPU: a change that stopped offering one would have its guest pass its
+# reduced branch, saying the CPU had none. So what a machine must offer is
+# said here, from outside: QEMU's TCG `-cpu max` -- the gate's -- offers
+# PKU, RDTSCP and RDPID, and a run on silicon names its own (`--expect`:
+# the EX44 all five, the AX41 SPEC_CTRL and IBPB). Each guest's sentence
+# says, besides, what the CPU's own CPUID has.
+TCG_OFFERS = {"pku", "rdtscp", "rdpid"}
+OFFER_NAMES = {"pku": "PKU", "rdtscp": "RDTSCP", "rdpid": "RDPID", "invpcid": "INVPCID", "spec": "SPEC_CTRL",
+               "ibpb": "IBPB"}
+
+
+def x86_checks(ran, script, digest, grown, raw, expect=frozenset()):
     if not pt.check("every line of the script ran", [c for c, _ in ran] == script,
                     "\n".join(c for c, _ in ran)):
         return
@@ -1177,6 +1195,10 @@ def x86_checks(ran, script, digest, grown, raw):
              re.search(r"AVX in a guest\s+yes", info) is not None, info)
     pt.check("and RDTSCP, its TSC_AUX switched with it -- every CPU this runs on has it",
              re.search(r"RDTSCP in a guest\s+yes", info) is not None, info)
+    for name in sorted(expect):
+        label = OFFER_NAMES[name]
+        pt.check("and %s for a guest, as this machine's CPU has it" % label,
+                 re.search(r"%s in a guest\s+yes" % label, info) is not None, info)
 
     pt.check("it is off for every CPU to begin with",
              "on for cpu none of %s" % ALL_CPUS in out[2], out[2])
@@ -1360,7 +1382,14 @@ def main():
     ap.add_argument("--arch", choices=("x86_64", "aarch64"), default="x86_64")
     ap.add_argument("--tcg", action="store_true", help="do not use KVM or HVF")
     ap.add_argument("--keep", action="store_true", help="keep the serial log")
+    ap.add_argument("--expect", type=lambda v: [w for w in v.split(",") if w], default=[],
+                    help="features this machine's CPU has that a guest must be offered, comma-separated: "
+                         + ", ".join(sorted(OFFER_NAMES)) + " (QEMU's TCG -cpu max: %s, always)"
+                         % ", ".join(sorted(TCG_OFFERS)))
     args = ap.parse_args()
+    unknown = [w for w in args.expect if w not in OFFER_NAMES]
+    if unknown:
+        sys.exit("hv-test: --expect takes %s, not %s" % (", ".join(sorted(OFFER_NAMES)), ", ".join(unknown)))
 
     if args.arch == "x86_64":
         x86(args)
