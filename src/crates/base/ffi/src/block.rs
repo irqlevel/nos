@@ -139,8 +139,10 @@ unsafe extern "C" {
     /// device read into it, or written from it -- started: 1 while the
     /// device has it, 0 done now, -1 done and failed. The buffer is the
     /// device's until kernel_blockq_reap gives it back: the caller keeps off
-    /// it.
-    pub safe fn kernel_blockq_start(q: usize, buffer: usize, write: i32, offset: u64, len: usize) -> i32;
+    /// it. Not a `safe fn`: the buffers are lent to the caller as slices
+    /// (kcore's `Lent`), and the caller is to be the queue's one owner and
+    /// hold no slice of `buffer`.
+    pub fn kernel_blockq_start(q: usize, buffer: usize, write: i32, offset: u64, len: usize) -> i32;
     pub safe fn kernel_blockq_kick(q: usize);
 
     /// Requests done, `max` at most, into `out`: how many, -1 for no queue.
@@ -160,6 +162,7 @@ unsafe extern "C" {
 
     /// The queue closed: what the device still has waited for, its buffers
     /// freed, its claim given back. The buffers' addresses name nothing
-    /// after.
-    pub safe fn kernel_blockq_close(q: usize);
+    /// after. Not a `safe fn`: the caller is the queue's one owner and holds
+    /// no slice of its buffers, which are freed here.
+    pub fn kernel_blockq_close(q: usize);
 }

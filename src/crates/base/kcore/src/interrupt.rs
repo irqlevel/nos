@@ -18,7 +18,9 @@ impl LegacyInterrupt {
     /// assembly stub does that. See `MsixInterrupt::register_for` for what a
     /// target and a handler are.
     ///
-    /// Returns `None` if all 8 legacy slots are already in use.
+    /// Returns `None` if all 8 legacy slots are already in use, or the line
+    /// is refused: its GSI an edge handler's, no IO-APIC pin for it, its
+    /// shared list full.
     pub fn register_level_for<T, F>(
         dev: &PciDevice, target: &'static T, handler: F,
     ) -> Option<Self>

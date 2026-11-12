@@ -30,7 +30,9 @@ use core::ops::{Deref, DerefMut};
 /// The kernel's mutex: a taker that finds it held gives its CPU to any other
 /// task that can run there, and spins only when none can (kernel/mutex.cpp)
 /// -- so a mutex held across a long call costs its waiters' CPUs whatever
-/// else they had to do. Task context only.
+/// else they had to do. Task context only. It has no owner and checks none:
+/// a second `lock` by its holder, or one made under a spinlock while the
+/// holder is off its CPU, yield-spins for good with nothing to report it.
 pub struct Mutex<T> {
     handle: usize,
     data: UnsafeCell<T>,

@@ -728,8 +728,8 @@ log to a prepared area");
         }
 
         let _ = writeln!(out, "disklog: no prepared area found");
-        let _ = writeln!(out, "  {} lines queued, {} dropped",
-            LINES.waiting(), DROPPED_LINES.load(Ordering::Relaxed));
+        let _ = writeln!(out, "  {} lines queued, {} dropped, {} slots lost",
+            LINES.waiting(), DROPPED_LINES.load(Ordering::Relaxed), LINES.lost());
         return;
     }
 

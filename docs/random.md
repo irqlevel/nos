@@ -117,9 +117,13 @@ RFC's own test vector by `random::selftest`) is the only primitive.
 ```
 
 **Output — fast key erasure.** A request generates one ChaCha20 block over the
-32-byte key, keeps the first half of the block as the next key and hands the
-second half out. The state that produced a value is gone by the time the caller
-has it, so no output leads back to an earlier one. Where the CPU has a random
+32-byte key under the pool's lock, keeps the first half of the block as the
+next key and takes the second half as a key of the request's own, from which
+its bytes are made outside the lock, a block a counter step, a megabyte a key
+-- so a large request holds no other CPU's, nor its own interrupts, for longer
+than a block. The request's key, the blocks and the block function's working
+state are wiped as they are done with: the state that produced a value is gone
+by the time the caller has it, so no output leads back to an earlier one. Where the CPU has a random
 instruction, one draw from it is also XORed into the key on every request: a
 few hundred cycles, no lock and no device, and it means the stream keeps taking
 in fresh entropy with no timer to drive it.
