@@ -829,7 +829,7 @@ def trace_records(text):
     return recs
 
 
-def trace_checks(out, apicv):
+def trace_checks(out):
     """The hypervisor's tracepoints: what `TRACE` ran, by its lines."""
     pt.check("trace on hv turns the group's events on", re.search(r"\b6\b", out[2]) is not None
              and "no event" not in out[2], out[2])
@@ -882,13 +882,17 @@ def trace_checks(out, apicv):
     timers = [f for e, f in recs if e == "hv_timer"]
     pt.check("hv_timer: CPU 0's one-shot APIC timer asked for once",
              len(timers) == 1 and timers[0].get("vcpu") == 0, out[8])
+    # Injected under VT-x's APIC virtualization too: the CPU delivers a guest's
+    # interrupts itself only to an x2APIC its guest has software-enabled
+    # (`Lapic::delivers_itself`), and the smp guest never sets its SVR's
+    # enable bit -- so its IPI and its timer's interrupt are the run loop's to
+    # inject whatever the CPU offers. Held to "none injected" where the CPU
+    # had APIC virtualization, the check failed under nested VT-x on every
+    # tree; the apicv guest is the one whose interrupts the CPU delivers.
     injects = [f for e, f in recs if e == "hv_inject" and f.get("kind") == "apic"]
-    if apicv:
-        pt.check("hv_inject: no APIC interrupt the host's to inject, the CPU delivering them", injects == [], out[8])
-    else:
-        pt.check("hv_inject: the IPI and the timer's interrupt each injected into CPU 0 once",
-                 sorted(f.get("vector") for f in injects) == [SMP_IPI_VECTOR, SMP_TIMER_VECTOR]
-                 and all(f.get("vcpu") == 0 for f in injects), out[8])
+    pt.check("hv_inject: the IPI and the timer's interrupt each injected into CPU 0 once",
+             sorted(f.get("vector") for f in injects) == [SMP_IPI_VECTOR, SMP_TIMER_VECTOR]
+             and all(f.get("vcpu") == 0 for f in injects), out[8])
     # A halt and what woke it, one after the other, CPU by CPU.
     halts = [(e, f) for e, f in recs if e in ("hv_halt", "hv_wake")]
     alternate = True
@@ -1319,7 +1323,7 @@ def x86_checks(ran, script, digest, grown, raw, expect=frozenset()):
     create_checks(out[at:at + created], grown, raw)
     pt.check("and unloads after it", "hv unloaded" in out[at + created], out[at + created])
     at += created + 1
-    trace_checks(out[at:at + len(TRACE)], apicv)
+    trace_checks(out[at:at + len(TRACE)])
 
 
 def arm64(args):
