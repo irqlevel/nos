@@ -38,6 +38,9 @@ module that carries messages between hosts, `ipcnet`, comes next.
 - A **watch** says `NameUp` and `NameDown` for every name under a prefix that
   comes and goes. A watcher with no room for one is told, once, that its
   watch has ended (`TAG_WATCH_LOST`): watch again, and list what there is.
+  The image's mailboxes watch (`Mailbox::watch`); a module's do not -- the
+  C ABI had a watch no module called, and an export nobody calls is
+  deleted. A module that comes to need one is the reason to add it back.
 
 ## Using it
 

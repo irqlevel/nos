@@ -8,28 +8,46 @@ use ffi::fs;
 use crate::error::{Error, Result};
 use crate::lent::Buffers;
 
-/// The whole of a regular file: NotFound when there is none, InvalidValue
-/// when it is longer than `max`. A `write` cut short between its two steps
-/// is read from where it left the content.
-pub fn read(path: &str, max: usize) -> Result<Vec<u8>> {
-    let size = unsafe { fs::kernel_file_size(path.as_ptr(), path.len()) };
-    if size < 0 {
-        return Err(Error::NotFound);
-    }
-    let size = size as usize;
-    if size > max {
-        return Err(Error::InvalidValue);
-    }
+/// How many times `read` sizes a file again that grew between its look and
+/// its read -- replaced by a longer one -- before it says Busy.
+const READ_TRIES: usize = 4;
 
-    let mut buf = Vec::new();
-    buf.try_reserve_exact(size).map_err(|_| Error::NoMemory)?;
-    buf.resize(size, 0);
-    let got = unsafe { fs::kernel_file_read(path.as_ptr(), path.len(), buf.as_mut_ptr(), size) };
-    if got < 0 {
-        return Err(Error::IoError);
+/// The whole of a regular file: NotFound when there is none, InvalidValue
+/// when it is longer than `max`, Busy when it grew under every one of a few
+/// tries. A `write` cut short between its two steps is read from where it
+/// left the content.
+///
+/// Sized, then read in one call that holds the file open throughout --
+/// asked for one byte more than the size, which comes only when the file
+/// grew between the two: sized again then, rather than taken cut short for
+/// Ok, as a file replaced by a longer one once was. A read of the size or
+/// less is a whole file, the one the call opened.
+pub fn read(path: &str, max: usize) -> Result<Vec<u8>> {
+    for _ in 0..READ_TRIES {
+        let size = unsafe { fs::kernel_file_size(path.as_ptr(), path.len()) };
+        if size < 0 {
+            return Err(Error::NotFound);
+        }
+        let size = size as usize;
+        if size > max {
+            return Err(Error::InvalidValue);
+        }
+
+        let want = size + 1;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(want).map_err(|_| Error::NoMemory)?;
+        buf.resize(want, 0);
+        let got = unsafe { fs::kernel_file_read(path.as_ptr(), path.len(), buf.as_mut_ptr(), want) };
+        if got < 0 {
+            return Err(Error::IoError);
+        }
+        let got = got as usize;
+        if got <= size {
+            buf.truncate(got);
+            return Ok(buf);
+        }
     }
-    buf.truncate(got as usize);
-    Ok(buf)
+    Err(Error::Busy)
 }
 
 /// The file's size in bytes: NotFound when there is no such file.

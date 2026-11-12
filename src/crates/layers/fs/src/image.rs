@@ -2413,15 +2413,16 @@ pub unsafe extern "C" fn kernel_image_queue(image: usize, buffers: usize, bytes:
         for (k, o) in out.iter_mut().enumerate() {
             *o = img.buffer_address(k)?;
         }
-        img.queue_entry()
+        let entry = img.queue_entry()?;
+        /* Under the slot's lock, which kernel_image_close clears it under:
+         * published after it, as it once was, a close of the image in
+         * between left the word naming an entry the close had given back,
+         * and a wait with the closed word slept on another queue's. */
+        WAITS[at].store(((image >> SLOT_BITS) as u64) << 32 | (entry as u64 + 1), Ordering::Release);
+        Some(entry)
     });
     match made {
-        Some(Some(entry)) => {
-            /* Under no lock: a word stale by now is the next image's, whose
-             * wake is a spurious one -- never a wait on what is gone. */
-            WAITS[at].store(((image >> SLOT_BITS) as u64) << 32 | (entry as u64 + 1), Ordering::Release);
-            0
-        }
+        Some(Some(_)) => 0,
         _ => -1,
     }
 }

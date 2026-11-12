@@ -16,15 +16,22 @@ pub fn wants(level: u32) -> bool {
     kernel_klog_wants(level) != 0
 }
 
+/// A log line's bytes at most, as the kernel's log carries one
+/// (`Klog::LINE_SIZE`, the size of its dmesg records and of the disk log's):
+/// what `klog!` formats into. It was 512 here and in the bridge, and
+/// whatever went past 256 was cut there anyway -- a size that said more
+/// reached the log than did, in twice the stack.
+pub const LINE_BYTES: usize = 256;
+
 pub struct KlogBuf {
-    buf: [u8; 512],
+    buf: [u8; LINE_BYTES],
     pos: usize,
 }
 
 impl KlogBuf {
     pub const fn new() -> Self {
         Self {
-            buf: [0u8; 512],
+            buf: [0u8; LINE_BYTES],
             pos: 0,
         }
     }
@@ -62,8 +69,8 @@ impl core::fmt::Write for KlogBuf {
 macro_rules! klog {
     ($level:expr, $($arg:tt)*) => {{
         let level: u32 = $level;
-        /* The level first: a line is formatted -- core::fmt, into 512 bytes
-         * of stack -- only when the log keeps it. A klog!(3, ..) on a hot
+        /* The level first: a line is formatted -- core::fmt, into
+         * LINE_BYTES of stack -- only when the log keeps it. A klog!(3, ..) on a hot
          * path used to be formatted at every level and thrown away by the
          * C++ side's own look at it. */
         if $crate::klog::wants(level) {

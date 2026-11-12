@@ -471,9 +471,24 @@ MODULE_LDFLAGS = -m $(MODULE_LDEMU_$(ARCH)) -shared -Bsymbolic --gc-sections \
 # the kernel's emit(), which holds them to the kernel's descriptions. The
 # boot holds the image's payloads to those; a module of other payloads is
 # one the loader refuses, not records printed wrong or an emit()'s BUG_ON.
-MODULE_FFI_SRC = $(sort $(wildcard src/crates/base/ffi/src/*.rs))
+#
+# The ffi crate's sources are every .rs under its src, those in a directory
+# of their own too: one there was neither hashed nor scanned for exports.
+# And the digest is held to being one: a source it names that is not there
+# (moved away, as events.rs could be) was left out of it without a word --
+# the shell takes no notice of cat's failure -- and on a host with no
+# sha256sum it was empty, which every module built so matched.
+MODULE_FFI_SRC = $(sort $(shell find src/crates/base/ffi/src -name '*.rs'))
 MODULE_ABI_SRC = $(MODULE_FFI_SRC) src/crates/base/kcore/src/trace/events.rs
 MODULE_ABI := $(shell cat $(MODULE_ABI_SRC) | sha256sum | cut -c1-64)
+ifneq ($(filter-out clean,$(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)),)
+ifneq ($(filter-out $(wildcard $(MODULE_ABI_SRC)),$(MODULE_ABI_SRC)),)
+$(error the module interface's digest names what is not there: $(filter-out $(wildcard $(MODULE_ABI_SRC)),$(MODULE_ABI_SRC)))
+endif
+ifneq ($(shell printf '%s' '$(MODULE_ABI)' | grep -Ec '^[0-9a-f]{64}$$'),1)
+$(error the module interface's digest is "$(MODULE_ABI)", not 64 hex digits: is sha256sum there?)
+endif
+endif
 
 modules: $(MODULE_KO)
 
@@ -517,7 +532,9 @@ $(HVBOOT): $(RUST_SRC) src/crates/hypervisor/hvboot/hvboot.ld $(FLAVOR_STAMP)
 $(OUT)/kernel/module.o: CXXFLAGS += -DNOS_MODULE_ABI=\"$(MODULE_ABI)\"
 $(OUT)/kernel/module.o: $(MODULE_ABI_SRC)
 
-# The functions the ffi crate declares in its extern blocks, one a line.
+# The functions the ffi crate declares in its extern blocks, one a line --
+# read as text, which make check holds to a parse of every block
+# (scripts/check-ffi.py): a block this does not see exports nothing.
 define ffi_functions
 awk '/^(unsafe )?extern "C" \{/ { inblock = 1; next } inblock && /^\}/ { inblock = 0; next } inblock && match($$0, /fn [A-Za-z_][A-Za-z0-9_]*/) { print substr($$0, RSTART + 3, RLENGTH - 3) }' $(MODULE_FFI_SRC) | LC_ALL=C sort -u
 endef
@@ -553,13 +570,24 @@ $(OUT)/ffi_keep.rsp: $(RUST_LIB) $(MODULE_FFI_SRC)
 # function a .ko imports is in the kernel's export table. One that is not is
 # refused by insmod at run time -- with the build green, and found only by
 # the test that loads that module, on the arch it is built for.
-$(OUT)/modules.bound: $(MODULE_KO) $(OUT)/module_exports.S
+#
+# And none defines a function the ffi crate declares: a module whose crates
+# reach one that defines kernel exports -- a layer, events, random -- links
+# a copy of its own, -Bsymbolic binds the module's calls to it, and the
+# check above sees no import to miss. Its state is then a second table the
+# kernel never sees: an event of the module's own looked up in the kernel's
+# as another module's.
+$(OUT)/modules.bound: $(MODULE_KO) $(OUT)/module_exports.S $(MODULE_FFI_SRC)
 	@grep -o '\.asciz "[A-Za-z0-9_]*"' $(OUT)/module_exports.S | sed 's/^\.asciz "//; s/"$$//' | LC_ALL=C sort -u > $@.exports
+	@$(ffi_functions) > $@.ffi
 	@fail=0; for ko in $(MODULE_KO); do \
 	    llvm-nm -u --format=just-symbols $$ko | LC_ALL=C sort -u | LC_ALL=C comm -23 - $@.exports > $@.missing; \
 	    if [ -s $@.missing ]; then fail=1; \
 	        echo "$$ko imports what the kernel this build makes does not export: $$(tr '\n' ' ' < $@.missing)"; fi; \
-	done; rm -f $@.exports $@.missing; [ $$fail = 0 ]
+	    llvm-nm --defined-only --format=just-symbols $$ko | LC_ALL=C sort -u | LC_ALL=C comm -12 - $@.ffi > $@.own; \
+	    if [ -s $@.own ]; then fail=1; \
+	        echo "$$ko defines what the kernel exports, a copy of its own: $$(tr '\n' ' ' < $@.own)"; fi; \
+	done; rm -f $@.exports $@.ffi $@.missing $@.own; [ $$fail = 0 ]
 	@touch $@
 
 $(OUT)/module_exports.o: $(OUT)/module_exports.S
