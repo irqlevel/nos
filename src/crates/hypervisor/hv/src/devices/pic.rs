@@ -84,16 +84,18 @@ impl Chip {
         }
     }
 
-    /// The highest-priority line (0 the highest) that is requested, not
-    /// masked, and not behind one already in service.
-    fn highest(&self) -> Option<u8> {
+    /// The highest-priority line (0 the highest) that is requested -- in
+    /// IRR, or among `lines`, which are up as well -- not masked, and not
+    /// behind one already in service.
+    fn highest(&self, lines: u8) -> Option<u8> {
+        let requested = self.irr | lines;
         for irq in 0..8 {
             let bit = 1u8 << irq;
             if self.isr & bit != 0 {
                 /* A line in service blocks it and everything below. */
                 return None;
             }
-            if self.irr & bit != 0 && self.imr & bit == 0 {
+            if requested & bit != 0 && self.imr & bit == 0 {
                 return Some(irq);
             }
         }
@@ -180,15 +182,24 @@ impl Pic {
         matches!(port, MASTER_CMD | MASTER_DATA | SLAVE_CMD | SLAVE_DATA | ELCR1 | ELCR2)
     }
 
-    /// Raise IRQ `irq` (0-15): mark it requested. 8-15 are the slave's, and
-    /// also raise the cascade line on the master.
+    /// Raise IRQ `irq` (0-15): mark it requested. 8-15 are the slave's;
+    /// the master's IR2 is the slave's INT output, up exactly while the
+    /// slave has a request it would deliver (`cascade`) -- not a bit latched
+    /// here, which a request the slave masked held up, and every master line
+    /// below it held off with it.
     pub fn raise(&mut self, irq: u8) {
         if irq < 8 {
             self.master.irr |= 1 << irq;
         } else if irq < 16 {
             self.slave.irr |= 1 << (irq - 8);
-            self.master.irr |= 1 << CASCADE_IRQ;
         }
+    }
+
+    /// The master's IR2 as the slave drives it: up while the slave has a
+    /// request it would deliver -- unmasked, not behind one of its own in
+    /// service.
+    fn cascade(&self) -> u8 {
+        if self.slave.highest(0).is_some() { 1 << CASCADE_IRQ } else { 0 }
     }
 
     /// Withdraw IRQ `irq`'s request, if it has one the CPU has not taken: a
@@ -198,17 +209,7 @@ impl Pic {
     pub fn lower(&mut self, irq: u8) {
         match irq {
             0..=7 => self.master.irr &= !(1 << irq),
-            8..=15 => {
-                let bit = 1 << (irq - 8);
-                if self.slave.irr & bit != 0 {
-                    self.slave.irr &= !bit;
-                    /* The cascade line goes down with the slave's last
-                     * request, as `acknowledge` has it. */
-                    if self.slave.irr == 0 {
-                        self.master.irr &= !(1 << CASCADE_IRQ);
-                    }
-                }
-            }
+            8..=15 => self.slave.irr &= !(1 << (irq - 8)),
             _ => {}
         }
     }
@@ -239,10 +240,11 @@ impl Pic {
     /// now, and the IRQ it is, without acknowledging it. `None` when nothing
     /// is pending or everything is masked or blocked.
     pub fn pending(&self) -> Option<(u8, u8)> {
-        let m = self.master.highest()?;
+        let m = self.master.highest(self.cascade())?;
         if m == CASCADE_IRQ {
-            /* The interrupt is really the slave's; find which. */
-            let s = self.slave.highest()?;
+            /* The interrupt is really the slave's -- which has one it would
+             * deliver, or IR2 would be down. */
+            let s = self.slave.highest(0)?;
             Some((8 + s, self.slave.vector_base + s))
         } else {
             Some((m, self.master.vector_base + m))
@@ -259,19 +261,16 @@ impl Pic {
         } else if irq < 16 {
             self.slave.isr |= 1 << (irq - 8);
             self.slave.irr &= !(1 << (irq - 8));
-            /* The master's cascade line clears once the slave has no more
-             * requests waiting -- and only then: it used to clear whatever
-             * the slave still had, and with two devices on the slave the
-             * second's interrupt waited for a third to raise the line. */
+            /* The cascade in service on the master; its request is the
+             * slave's to drive (`cascade`). */
             self.master.isr |= 1 << CASCADE_IRQ;
-            if self.slave.irr == 0 {
-                self.master.irr &= !(1 << CASCADE_IRQ);
-            }
         }
     }
 
     pub fn read(&mut self, port: u16) -> u8 {
         match port {
+            /* IRR's IR2 is the slave's INT output, as the line is wired */
+            MASTER_CMD if !self.master.read_isr => self.master.read_command() | self.cascade(),
             MASTER_CMD => self.master.read_command(),
             MASTER_DATA => self.master.read_data(),
             SLAVE_CMD => self.slave.read_command(),
