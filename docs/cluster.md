@@ -42,7 +42,7 @@ cluster hosts                   every host: node, voter or learner, addresses, k
 cluster remove <host>           a host out, for good: its key refused from then on
 cluster revoke <host>           its open invitation taken back, its token good for nothing
 cluster maintenance <host> on|off   a host being worked on, or back
-cluster address <host> <role> <ip|none>   a host's address for ipc, underlay or public
+cluster address <host> <role> <ip[:port]|none>   a host's address for ipc, underlay or public
 cluster rekey                   this host moved to a new key, no connection lost
 cluster recover [<cluster>]     on the last host standing: what it does, then -- the cluster's name given -- does it
 ```
@@ -92,8 +92,10 @@ insmod /lib/modules/cluster.ko
 
 1. **Its key first**: `ipcnet id` on the new host prints its key's
    fingerprint, the key made at ipcnet's first start.
-2. **`cluster invite <host> <ip> <key>`** on any member commits an
-   invitation: the host's name, the address it will come from, its key, the
+2. **`cluster invite <host> <ip>[:<port>] <key>`** on any member commits an
+   invitation: the host's name, the address it will come from -- and the
+   port its ipcnet listens on, where it is not ipcnet's own 39240: one of
+   two hosts behind a NAT's address (#99) -- its key, the
    hash of a secret, and when it ends -- fifteen minutes on by the leader's
    clock. The command prints the token, once: the cluster's id, this
    member's name, address, port and key, the invitation's number and the
@@ -192,30 +194,53 @@ asks, and the typed name is the admin's word that they are gone.
 ## How a member runs
 
 - **One task**, `cluster/raft`: raft's `Rsm` over the log in `raft/`, a tick
-  every 100 ms, its mailbox `cluster.raft` -- a `Cluster` name -- and its
+  every 100 ms, the log's committed entries applied as it starts, before
+  any message is taken -- so that nothing is answered from the snapshot's
+  state alone (nbs-test: an mds just started told its cs the devices of
+  its snapshot, one added since missing, and the cs served on them) --
+  its mailbox `cluster.raft` -- a `Cluster` name -- and its
   messages to `cluster.raft@<host>`, those over 4 KiB on ipcnet's bulk
   connection. A message is taken only from the host whose node it says it
   is from: which host sent it is ipcnet's word (`kcore::ipc::peer_name`),
   looked up in the registry.
-- **Commands**: the shell hands its command to its member's task; a member
-  that does not lead hands it to the leader and passes the answer back --
-  taken from that leader alone, and, should another be elected meanwhile,
-  given up at once to be asked of the new one. What could not be taken yet
-  -- no leader, a leader without its session yet -- the shell asks again,
-  for up to 30 s. A leader submits under a session of its own, asked as it
-  comes to lead and again whenever it goes; its requests are numbered from a
-  random start each time the member starts, so that a registration of an
+- **Commands**: the shell hands its command to its member's task, which
+  asks it of the group until it knows what became of it -- applied once,
+  whoever leads (`raft::asks`; [Raft](raft.md), "A member's own asks").
+  Each command gets a session of its own, registered for it and ended
+  after; the command goes under it -- submitted by the leader itself,
+  handed to it from any other member (`TAG_SESSION`) -- and is sent again,
+  the same session and number, to whichever member leads: at once when the
+  leader changes, after 5 s otherwise, and a moment after the leader
+  refuses it (its own removal, waiting for the lead handed on). The member
+  learns what became of it as it applies the log itself, and from the
+  leader that applied it (`TAG_TOLD`, as are its refusals and the session
+  it made), whichever comes first: a member far behind does not wait for
+  its log, and the leader of two asked to remove itself hears from the new
+  leader that it was -- in the five seconds a removed host stays a peer --
+  though it never applies the entry. A command whose first try was in a
+  log as its leader stepped down is answered from the session, not applied
+  twice. A
+  command not heard of in 30 s is told it may yet be applied, never that it
+  failed; one never sent, that nothing was done. Before, the shell's
+  command went under the leader's own session and was asked again under a
+  new number when the leader changed: nbs-test's x86-64 run had `cluster
+  invite c` in the log as its leader stepped down -- b, just joined, slow
+  to answer, and CheckQuorum -- applied twice, the second refusing it: the
+  invitation made, and the shell told it failed. The group's own commands
+  -- a joining host's, nbs-mds's controller's and its clients' -- are
+  submitted under the leader's session, asked as it comes to lead and
+  again whenever it goes, a member that does not lead handing them to the
+  leader and passing the answer back; they are made so that asking twice
+  is harmless. The member's requests are numbered from a random start each
+  time it starts, the asks' from another, so that a registration of an
   earlier start, applied again as the member starts over its log, is never
-  taken for this start's (recover, which elects its member at once over the
-  whole log, found it). The leader's answer says the entry the command was
-  applied at, and the shell is answered once this host's member has
-  published a view that far, for 5 s at most: what is read next on the host
-  it was typed at holds the change. Without that, an answer could come
-  before the view that holds its change. The member fills in the answer
-  during its turn and publishes its view at the turn's end, and a member
-  that does not lead can have the leader's answer before the append that
-  commits the entry: one over 4 KiB goes by the bulk connection, which is
-  not ordered with the other. nbs-test's x86-64 run, under TCG on a busy
+  taken for this start's (recover, which elects its member at once over
+  the whole log, found it). The shell is answered once this host's member
+  has published a view as far as the entry the command was applied at, for
+  5 s at most: what is read next on the host it was typed at holds the
+  change. Without that, an answer could come before the view that holds
+  its change: the member fills in the answer during its turn and publishes
+  its view at the turn's end. nbs-test's x86-64 run, under TCG on a busy
   host, read the chunk servers on the host a volume was just made at, and
   the volume was not there.
 - **Raft's membership** follows the registry a change at a time, made by the
@@ -231,9 +256,15 @@ asks, and the typed name is the admin's word that they are gone.
   gives this host -- every other host and every open invitation -- whenever
   they change; ipcnet writes hosts.toml (a new file, synced, renamed over
   the old) and gives the running server the list: one writer of the file.
-  A host added is pinned at once, a host removed has its connections closed
-  at once. A list ipcnet refuses is said in the log and told again ten
-  seconds later.
+  A host added is pinned at once; a host removed stays a peer five seconds
+  more, held to the member's mailbox -- where it is refused whatever it
+  says, the registry having no host of it -- and then has its connections
+  closed: the answer the new leader owes it, to the removal it asked of it
+  when it led, gets out first. Closed at once, the answer went with the
+  link, and the removed host said no leader was known (cluster-test's
+  leader-of-two step, now and then -- the second of two runs, once). A list
+  ipcnet refuses is said
+  in the log and told again ten seconds later.
 - **`init`** starts the member over a new log with this host its one voter,
   commits `Init`, and only then writes `member`; should any of it fail, the
   member is stopped and its log and `member` removed, for an `init` again --

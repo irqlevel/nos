@@ -335,7 +335,11 @@ pub struct Rsm<S: LogStore, M: StateMachine> {
 impl<S: LogStore, M: StateMachine> Rsm<S, M> {
     /// A member over what `store` holds -- its snapshot restored into `sm`,
     /// which is to be the state machine as new; what is committed past it
-    /// is applied again as the node hands it out. `nonce` is this start's
+    /// is applied again as the node hands it out, at the first `process`:
+    /// until then `state` is the snapshot's alone, and nothing is to be
+    /// answered from it (raftmember processes before it takes a message:
+    /// an mds just started told its cs the devices of its snapshot, one
+    /// added since missing). `nonce` is this start's
     /// own: random, or a count of starts kept durably -- never the same as
     /// an earlier start's of this member, whose reads' answers may still be
     /// on their way. Starting from 1 every time, a read asked after a
@@ -435,10 +439,18 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
     /// A session for a client, asked of this member as request `request`:
     /// `Registered` once it is applied. The leader's alone to do.
     pub fn register(&mut self, request: u64) -> Result<u64, RsmError> {
+        self.register_for(self.node.id(), request)
+    }
+
+    /// A session asked of member `origin` as its request `request` and
+    /// handed to the leader: its `Registered` names `origin`, which tells
+    /// the session from another member's of the same request number
+    /// (`asks`). The leader's alone to do.
+    pub fn register_for(&mut self, origin: NodeId, request: u64) -> Result<u64, RsmError> {
         self.check()?;
         let mut data = Vec::with_capacity(17);
         data.push(KIND_REGISTER);
-        data.extend_from_slice(&self.node.id().to_le_bytes());
+        data.extend_from_slice(&origin.to_le_bytes());
         data.extend_from_slice(&request.to_le_bytes());
         self.node.propose(data).map_err(RsmError::Node)
     }

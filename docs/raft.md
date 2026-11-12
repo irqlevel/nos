@@ -193,6 +193,57 @@ request ids it chose and by the client and sequence number of a command.
   applying goes on; the store then compacts the log. A leader's snapshot
   restores the sessions and the state.
 
+## A member's own asks
+
+`raft::asks` is what a member does with commands asked of it -- a shell's,
+on whichever member it runs -- so that each is applied once, whoever
+leads. Each ask gets a session of its own: a registration
+(`Rsm::register_for`, which names the asking member, so that its
+`Registered` is told from another member's of the same request number),
+then its one command under that session's number 1, then the session
+ended. Until the asking member's own log says what became of the command,
+it is sent again -- the same session, the same number -- to whichever
+member leads: at once when the leader changes, and after a while
+otherwise. A command whose first try is in a log as its leader steps down
+is answered from the session when it is asked again, not applied twice.
+The asking member learns what became of it as it applies the log itself;
+and the leader that applies a registration or a command it took for
+another member tells that member too (`asks::Tell`) -- at once, where the
+member may be far behind in the log (a host just booted, catching up by a
+snapshot that skips the entry's own event), or never apply the entry at
+all (a host the command removes from the group). Either word is the same
+entry's, so whichever comes first is taken, and a word lost is no matter.
+
+What became of an ask: `Applied`, with the entry and the answer; `Lost`
+(applied once, its answer too long to keep and its application not seen
+here, a snapshot taken in over it); `NotAsked` (its time up with its
+command never sent -- not applied, ever); `Unknown` (its time up with its
+command sent and not heard of -- it may yet be applied, once; its session
+is ended then, so a try still on its way is not applied where the end
+comes first). A refusal of the leader's before it submits is never final:
+an earlier try may be in a log already, so the command is sent again in a
+moment, the refusal kept for what the ask is told if its time runs out.
+
+raftmember (`src/crates/modules/cluster/raftmember`) runs it for the
+shell of every group's module: the leader does what is to be sent itself;
+another member hands it to the leader as `TAG_SESSION`, and the leader's
+word -- a refusal, a session made, a command applied -- comes back as
+`TAG_TOLD`. Its first version had no word from the leader: a member far
+behind waited for its own log at each step, and the leader of two asked to
+remove itself, the lead handed on, never heard that it had been removed --
+its shell told after 30 s that the command may yet be applied
+(cluster-test). Before it, raftmember submitted a
+shell's command under the leader's own session and asked it again under a
+new number when the leader changed: a `cluster invite` whose first try
+was in the log as the leader stepped down was applied twice, and its
+second application refused it -- the invitation made, the shell told it
+failed.
+
+The one gap: a session evicted (past `MAX_SESSIONS` newer ones) after its
+command was applied, where the asking member did not see the application,
+makes the next try `Expired` and the command asked again under a new
+session -- which takes a thousand registrations within one ask's life.
+
 ## A group of one, by force
 
 `raft::recover::force_alone(store, me)` makes a member's store -- while no
@@ -222,8 +273,10 @@ fuzzed over a network that fails in every way, checked at every step against
 Raft's properties, a member fed messages no correct member sends, the log
 on disk through power cuts, torn writes and lost ones, and a register
 through the replicated state machine whose clients' histories are checked
-for linearizability -- every allocation of it to the 512 KiB one block of
-the kernel's heap is;
+for linearizability, and every member's own asks under losses, doubles,
+cuts, leaders' refusals and snapshots taken in -- none applied twice, each
+told truly what became of it -- every allocation of it to the 512 KiB one
+block of the kernel's heap is;
 `fuzz/raft/mutants.py` holds the gate to catching each rule taken out.
 
 ## Limits
@@ -264,7 +317,9 @@ least recently used in the log's order. It keeps an answer for a retry only
 up to 1 KiB: a retry of a longer one is told `Lost`. It keeps at most 4096
 reads waiting. A client has one command at a time; a second before the
 first is answered is the first's retry if it has its number, and otherwise
-moves the session on, after which the first's answer is `Stale`.
+moves the session on, after which the first's answer is `Stale`. A member
+has at most 64 asks in flight (`asks::MAX_ASKS`); one more is refused at
+once.
 
 ## Next
 

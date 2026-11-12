@@ -15,11 +15,21 @@
 //!   that comes in is taken only from the host the app has for the node it
 //!   says it is from: a host of the group cannot speak for another's node.
 //! - **What it is asked**: the shell's commands come in a queue
-//!   (`Shared::requests`). On the leader one is submitted under the member's
-//!   session; on another member it is handed to the leader's (`TAG_PROPOSE`),
-//!   which answers once it is applied. A group's commands are to be made so
-//!   that asking twice is harmless: a request lost with a leader is asked
-//!   again by whoever waits for it.
+//!   (`Shared::requests`), and each is applied once, whoever leads
+//!   (`raft::asks`): under a session of its own, registered for it, its
+//!   command sent under that session's one number -- done by the leader,
+//!   handed to it from any other member (`TAG_SESSION`) -- and sent again,
+//!   the same, to whichever member leads by then, until this member's own
+//!   log says what became of it, or the leader that applied it does
+//!   (`TAG_TOLD`: at once, to a member behind in the log, or one the
+//!   command removes, which never applies it). A command whose first try is
+//!   in a log as
+//!   its leader steps down is answered from the session, not applied twice;
+//!   one not heard of in `ASK_TOTAL_MS` is told it may yet be applied, not
+//!   that it failed. The group's own commands (`Pending::App`) are
+//!   submitted under the leader's session, handed to it by `TAG_PROPOSE`,
+//!   and are to be made so that asking twice is harmless: one lost with a
+//!   leader is asked again by whoever waits for it.
 //! - **What the leader keeps in step**: raft's membership with the voters
 //!   and learners the app's state names, a change at a time -- a node added
 //!   as a learner, made a voter once it holds the log, a removed one taken
@@ -44,6 +54,7 @@ use kcore::ipc::{Addr, Limits, Mailbox, Message, Scope, TAG_BULK};
 use kcore::klog;
 use kcore::sync::Mutex;
 use kcore::time::{boot_time_ns, Duration};
+use raft::asks::{self, Asks, Done, Outcome as AskOutcome, Send, Tell, Timing, Told};
 use raft::log::DiskLog;
 use raft::rsm::StateMachine;
 use raft::{ChangeKind, ConfChange, ConfState, Event, NodeId, Role, Rsm};
@@ -65,8 +76,29 @@ pub const TAG_PROPOSE: u32 = 0x101;
 /// not -- the entry it was applied at (0 for none), then the answer's bytes,
 /// or what went wrong in words.
 pub const TAG_ANSWER: u32 = 0x102;
+/// A shell's ask, handed to the leader by another member: a kind --
+/// `SESSION_REGISTER`, `SESSION_COMMAND`, `SESSION_UNREGISTER` -- then the
+/// request's number or the session's, then the command (`raft::asks`).
+pub const TAG_SESSION: u32 = 0x103;
+/// What the leader tells a member of its ask: a kind, a number, the rest
+/// -- `TOLD_REFUSED` (`App::before_submit`): the session, why in words;
+/// `TOLD_REGISTERED`: the request, the session; `TOLD_APPLIED`: the
+/// session, the entry, the answer; `TOLD_LOST`: the session.
+pub const TAG_TOLD: u32 = 0x104;
 /// The first tag a group's own messages may have: below it the engine's.
-pub const TAG_APP: u32 = 0x103;
+pub const TAG_APP: u32 = 0x105;
+/// What a `TAG_SESSION` asks of the leader.
+const SESSION_REGISTER: u8 = 1;
+const SESSION_COMMAND: u8 = 2;
+const SESSION_UNREGISTER: u8 = 3;
+/// A `TAG_SESSION`'s head: its kind, and a request's or a session's number.
+const SESSION_HEAD: usize = 1 + 8;
+/// What a `TAG_TOLD` says, and its head: the kind and a number.
+const TOLD_REFUSED: u8 = 1;
+const TOLD_REGISTERED: u8 = 2;
+const TOLD_APPLIED: u8 = 3;
+const TOLD_LOST: u8 = 4;
+const TOLD_HEAD: usize = 1 + 8;
 /// A raft message past this goes by the bulk connection: a snapshot's piece,
 /// appends that carry much.
 const BULK_BYTES: usize = 4096;
@@ -77,12 +109,18 @@ const CAUGHT_UP: u64 = 8;
 const CHANGE_RETRY_MS: u64 = 5000;
 /// How long a request handed to the leader waits for its answer.
 pub const ANSWER_MS: u64 = 10_000;
-/// How long the shell asks a command for, all its tries together, how often
-/// again while the member cannot take it yet, and how often it looks for the
-/// answer.
+/// A shell's ask (`raft::asks`): how long it is asked for, all its tries
+/// together; how long a try not heard of waits before the next, a leader's
+/// change sending it again at once; how soon one the leader refused is
+/// sent again.
 const ASK_TOTAL_MS: u64 = 30_000;
+const ASK_RESEND_MS: u64 = 5000;
 const ASK_RETRY_MS: u64 = 250;
+/// How often the shell looks for its answer; and how long past the ask's
+/// own time it waits for the member's task to say it -- the app's own
+/// answer (`App::take`) the same.
 const ANSWER_POLL_MS: u64 = 20;
+const ASK_GRACE_MS: u64 = 5000;
 /// How long a change the leader answered is waited for in this member's
 /// view: applied here too, what the shell reads next holds it.
 const VIEW_WAIT_MS: u64 = 5000;
@@ -151,7 +189,9 @@ pub trait App: Sized {
 
     /// A command about to be submitted, as the leader: `Err` refuses it,
     /// saying why -- the leader's own removal, say, waiting for the lead
-    /// handed on first.
+    /// handed on first. A shell's ask refused is sent again in a moment,
+    /// until it is taken or its time is up: never final, as an earlier try
+    /// of it may be in a log already.
     fn before_submit(&mut self, _core: &mut Core<Self>, _cmd: &Self::Command) -> Result<(), String> {
         Ok(())
     }
@@ -160,6 +200,14 @@ pub trait App: Sized {
     /// the entry it was applied at -- 0 where it was not: what a waiter that
     /// reads the state after it waits for this member to have applied.
     fn finish(&mut self, _core: &mut Core<Self>, _w: Self::Waiter, _outcome: Outcome<Self>, _index: u64) {}
+
+    /// A command the shell asks for, offered before the engine asks it: the
+    /// app's to take -- answering its slot in its own time, as NBS's
+    /// snapshot of an attached volume does once its writer has paused -- or,
+    /// handed back, asked as any. Every one handed back, by default.
+    fn take(&mut self, _core: &mut Core<Self>, r: Request<Self>) -> Option<Request<Self>> {
+        Some(r)
+    }
 
     /// What the group does at every turn, after raft's work.
     fn turn(&mut self, _core: &mut Core<Self>) {}
@@ -262,12 +310,14 @@ pub struct Core<A: App> {
     refused: u64,
     /// When a message of another group was last said in the log.
     other_group_said: u64,
+    /// The shell's asks in flight, each under a session of its own.
+    asks: Asks<Slot<A>>,
+    /// As the leader, the members owed word of what it did for their asks.
+    tell: Tell<Addr>,
 }
 
 /// Who waits for a command submitted here.
 pub enum Pending<A: App> {
-    /// The shell, on this host.
-    Local(Slot<A>),
     /// Another member, which handed the command to this one.
     Remote { to: Addr, request: u64 },
     /// One of the group's own: a host joining.
@@ -298,6 +348,10 @@ impl<A: App> Core<A> {
            again as it starts, and one of the same number would be taken for
            this start's -- a session long used, whose next command is stale */
         let first = kcore::random::random_u64().ok_or_else(|| String::from("no randomness for the member's start"))?;
+        /* The asks' own, from a start of their own: their sessions are this
+           member's too, and one of a number the member's own session was
+           asked under would be taken for it */
+        let asks_first = kcore::random::random_u64().ok_or_else(|| String::from("no randomness for the member's start"))?;
         let mb = Mailbox::new(A::LIMITS).map_err(|e| alloc::format!("no mailbox: {}", e.name()))?;
         mb.register(A::NAME, Scope::Cluster).map_err(|e| alloc::format!("{} not named: {}", A::NAME, e.name()))?;
         Ok(Core {
@@ -314,6 +368,12 @@ impl<A: App> Core<A> {
             change: None,
             refused: 0,
             other_group_said: 0,
+            asks: Asks::new(node, asks_first | 1, Timing {
+                total: ASK_TOTAL_MS * NS_PER_MS,
+                resend: ASK_RESEND_MS * NS_PER_MS,
+                retry: ASK_RETRY_MS * NS_PER_MS,
+            }),
+            tell: Tell::new(),
         })
     }
 
@@ -451,7 +511,6 @@ impl<A: App> Core<A> {
     /// was not.
     fn finish(&mut self, app: &mut A, w: Pending<A>, outcome: Outcome<A>, index: u64) {
         match w {
-            Pending::Local(slot) => slot.with(|s| *s = Some((outcome, index))),
             Pending::Remote { to, request } => self.answer_remote(app, to, request, outcome, index),
             Pending::App(w) => app.finish(self, w, outcome, index),
         }
@@ -518,6 +577,8 @@ impl<A: App> Core<A> {
             TAG_RAFT => self.on_raft(app, &m),
             TAG_PROPOSE => self.on_propose(app, &m),
             TAG_ANSWER => self.on_answer(app, &m),
+            TAG_SESSION => self.on_session(app, &m),
+            TAG_TOLD => self.on_told(app, &m),
             _ => app.on_message(self, &m),
         }
     }
@@ -579,6 +640,174 @@ impl<A: App> Core<A> {
         self.finish(app, w, outcome, index);
     }
 
+    /// A shell's ask another member hands this one, as the leader: done as
+    /// that member's own would be here. Not the leader, nothing is done:
+    /// the member sends it again to whichever leads.
+    fn on_session(&mut self, app: &mut A, m: &Message) {
+        let Some(data) = self.unframed(app, m) else { return };
+        let Some(from) = self.sender_node(app, m) else {
+            self.refused += 1;
+            return;
+        };
+        if data.len() < SESSION_HEAD {
+            self.refused += 1;
+            return;
+        }
+        if self.rsm.role() != Role::Leader {
+            return;
+        }
+        let number = u64::from_le_bytes(data[1..SESSION_HEAD].try_into().unwrap_or([0; 8]));
+        match data[0] {
+            SESSION_REGISTER => {
+                /* Made, the member told at once: it may be far behind */
+                if self.rsm.register_for(from, number).is_ok() {
+                    self.tell.registering(from, number, m.from);
+                }
+            }
+            SESSION_COMMAND => self.submit_ask(app, number, &data[SESSION_HEAD..], Some(m.from)),
+            SESSION_UNREGISTER => {
+                let _ = self.rsm.unregister(number);
+            }
+            _ => self.refused += 1,
+        }
+    }
+
+    /// What a leader says of an ask: a refusal from the leader alone; what
+    /// it did from any member of the group -- the leader that applied it,
+    /// which may be one this member no longer follows, or one whose group
+    /// no longer has this member (`cluster remove` of this host).
+    fn on_told(&mut self, app: &mut A, m: &Message) {
+        let Some(data) = self.unframed(app, m) else { return };
+        let sender = self.sender_node(app, m);
+        if data.len() < TOLD_HEAD || sender.is_none() {
+            self.refused += 1;
+            return;
+        }
+        let number = u64::from_le_bytes(data[1..TOLD_HEAD].try_into().unwrap_or([0; 8]));
+        let rest = &data[TOLD_HEAD..];
+        let second = (rest.len() >= 8).then(|| u64::from_le_bytes(rest[..8].try_into().unwrap_or([0; 8])));
+        let mut done = Vec::new();
+        match (data[0], second) {
+            (TOLD_REFUSED, _) if sender == Some(self.rsm.leader()) => {
+                self.asks.refused(number, String::from_utf8_lossy(rest).into_owned(), boot_time_ns());
+            }
+            (TOLD_REGISTERED, Some(client)) => {
+                self.asks.told(Told::Registered { request: number, client }, &mut done);
+            }
+            (TOLD_APPLIED, Some(index)) => {
+                self.asks.told(Told::Applied { client: number, index, answer: Vec::from(&rest[8..]) }, &mut done);
+            }
+            (TOLD_LOST, _) => self.asks.told(Told::Lost { client: number }, &mut done),
+            _ => self.refused += 1,
+        }
+        Self::tell_asks(done);
+    }
+
+    /// The member at `to` told a kind of word of its ask: a number, and
+    /// what follows it.
+    fn send_told(&self, app: &A, to: Addr, kind: u8, number: u64, second: Option<u64>, rest: &[u8]) {
+        let mut data = Vec::with_capacity(TOLD_HEAD + 8 + rest.len());
+        data.push(kind);
+        data.extend_from_slice(&number.to_le_bytes());
+        if let Some(second) = second {
+            data.extend_from_slice(&second.to_le_bytes());
+        }
+        data.extend_from_slice(rest);
+        let framed = self.framed(app, &data);
+        let tag = if framed.len() > BULK_BYTES { TAG_TOLD | TAG_BULK } else { TAG_TOLD };
+        let _ = self.mb.send(to, tag, 0, &framed);
+    }
+
+    /// An ask's command of session `client`, as the leader: the app's look
+    /// first (`before_submit`), its refusal said to whoever asked -- `to`,
+    /// or this member's own asks -- then submitted under the ask's session
+    /// and its one number. Not taken by raft, nothing is said: it is sent
+    /// again, as one not heard of is.
+    fn submit_ask(&mut self, app: &mut A, client: u64, command: &[u8], to: Option<Addr>) {
+        let looked = match A::decode_command(command) {
+            Some(cmd) => app.before_submit(self, &cmd),
+            None => Err(String::from("not a command")),
+        };
+        match (looked, to) {
+            (Ok(()), to) => {
+                /* Taken for another member: told it as it is applied here */
+                if self.rsm.submit(client, asks::SEQ, command).is_ok() {
+                    if let Some(to) = to {
+                        self.tell.submitted(client, to);
+                    }
+                }
+            }
+            (Err(why), Some(to)) => self.send_told(app, to, TOLD_REFUSED, client, None, why.as_bytes()),
+            (Err(why), None) => self.asks.refused(client, why, boot_time_ns()),
+        }
+    }
+
+    /// The shell's asks: what is due sent -- done here as the leader,
+    /// handed to it otherwise -- and those that ended told.
+    fn turn_asks(&mut self, app: &mut A) {
+        let leading = self.rsm.role() == Role::Leader;
+        let to = if leading { None } else { app.host_of(self, self.rsm.leader()) };
+        let mut out = Vec::new();
+        let mut done = Vec::new();
+        self.asks.poll(boot_time_ns(), leading || to.is_some(), &mut out, &mut done);
+        for s in out {
+            if leading {
+                match s {
+                    Send::Register { request } => {
+                        let _ = self.rsm.register_for(self.node, request);
+                    }
+                    Send::Command { client, command } => self.submit_ask(app, client, &command, None),
+                    Send::Unregister { client } => {
+                        let _ = self.rsm.unregister(client);
+                    }
+                }
+            } else if let Some(host) = &to {
+                let mut data = Vec::new();
+                match s {
+                    Send::Register { request } => {
+                        data.push(SESSION_REGISTER);
+                        data.extend_from_slice(&request.to_le_bytes());
+                    }
+                    Send::Command { client, command } => {
+                        data.push(SESSION_COMMAND);
+                        data.extend_from_slice(&client.to_le_bytes());
+                        data.extend_from_slice(&command);
+                    }
+                    Send::Unregister { client } => {
+                        data.push(SESSION_UNREGISTER);
+                        data.extend_from_slice(&client.to_le_bytes());
+                    }
+                }
+                let framed = self.framed(app, &data);
+                let tag = if framed.len() > BULK_BYTES { TAG_SESSION | TAG_BULK } else { TAG_SESSION };
+                /* Not sent, it is sent again: as one not heard of is */
+                let _ = self.mb.send_to(&alloc::format!("{}@{}", A::NAME, host), tag, 0, &framed);
+            }
+        }
+        Self::tell_asks(done);
+    }
+
+    /// Asks that ended, each told in the shell's words.
+    fn tell_asks(done: Vec<Done<Slot<A>>>) {
+        for d in done {
+            let outcome: (Outcome<A>, u64) = match d.outcome {
+                AskOutcome::Applied { index, answer } => {
+                    (A::decode_answer(&answer).ok_or_else(|| String::from("an answer that is none")), index)
+                }
+                AskOutcome::Lost => (Err(String::from("applied, once -- its answer too long to be kept, and not seen \
+                                                       here: the state says what it did")), 0),
+                AskOutcome::NotAsked => (Err(alloc::format!("not asked: no leader took it in {} s -- nothing was \
+                                                             done", ASK_TOTAL_MS / 1000)), 0),
+                AskOutcome::Unknown { refused } => {
+                    let said = refused.map(|w| alloc::format!(" (the leader refused it: {})", w)).unwrap_or_default();
+                    (Err(alloc::format!("no answer in {} s{} -- it may yet be applied, once: look before asking \
+                                         again", ASK_TOTAL_MS / 1000, said)), 0)
+                }
+            };
+            d.waiter.with(|s| *s = Some(outcome));
+        }
+    }
+
     /* ---- what the member does ---- */
 
     fn on_event(&mut self, app: &mut A, e: Event) {
@@ -632,6 +861,7 @@ impl<A: App> Core<A> {
             self.register_session();
         } else {
             /* What waited here is asked again by whoever waits */
+            self.tell.clear();
             let waiting = core::mem::take(&mut self.pending);
             for (_, w) in waiting {
                 self.finish(app, w, Err(String::from("the leader changed -- ask again")), 0);
@@ -650,6 +880,7 @@ impl<A: App> Core<A> {
         if leader == raft::NONE {
             return;
         }
+        self.asks.leader_changed();
         let gone: Vec<u64> = self.forwarded.iter().filter(|(_, &(_, _, to))| to != leader).map(|(&r, _)| r).collect();
         for r in gone {
             if let Some((w, _, _)) = self.forwarded.remove(&r) {
@@ -671,6 +902,20 @@ impl<A: App> Core<A> {
                 self.on_leader(app, ss.leader);
             }
             for e in out.events {
+                let mut done = Vec::new();
+                self.asks.on_event(&e, &mut done);
+                Self::tell_asks(done);
+                if let Some((to, told)) = self.tell.on_event(&e) {
+                    match told {
+                        Told::Registered { request, client } => {
+                            self.send_told(app, to, TOLD_REGISTERED, request, Some(client), &[]);
+                        }
+                        Told::Applied { client, index, answer } => {
+                            self.send_told(app, to, TOLD_APPLIED, client, Some(index), &answer);
+                        }
+                        Told::Lost { client } => self.send_told(app, to, TOLD_LOST, client, None, &[]),
+                    }
+                }
                 self.on_event(app, e);
             }
             if idle && !self.rsm.node().has_ready() {
@@ -755,6 +1000,16 @@ pub fn run<A: App>((shared, m): (Arc<Shared<A>>, Member<A>)) {
     let Member { mut app, mut core } = m;
     let tick = TICK_MS * NS_PER_MS;
     let mut next_tick = boot_time_ns() + tick;
+    /* What the log holds committed, applied before any message is taken:
+       the app answers from the state the log left, never from its
+       snapshot's alone. (nbs-test: a cs asking its devices of an mds just
+       started was told the snapshot's -- a device added since missing, one
+       drained since taken for active -- and served on it) */
+    if let Err(why) = core.process(&mut app) {
+        klog!(0, "{}: the member stopped: {} -- `rmmod` and `insmod` start it again", A::LOG, why);
+        shared.view.with(|v| *v = Some(core.view(Some(why))));
+        return;
+    }
     shared.view.with(|v| *v = Some(core.view(None)));
     while !shared.stop.load(Ordering::Acquire) {
         let wait = (next_tick.saturating_sub(boot_time_ns()) / NS_PER_MS).clamp(1, POLL_MS);
@@ -774,13 +1029,19 @@ pub fn run<A: App>((shared, m): (Arc<Shared<A>>, Member<A>)) {
         }
         let requests: Vec<Request<A>> = shared.requests.with(|q| q.drain(..).collect());
         for r in requests {
-            core.ask(&mut app, r.cmd, Pending::Local(r.done));
+            if let Some(r) = app.take(&mut core, r) {
+                if let Err(slot) = core.asks.ask(A::encode_command(&r.cmd), r.done, boot_time_ns()) {
+                    slot.with(|s| *s = Some((Err(alloc::format!("{} commands asked at once on this host already -- \
+                                                                  ask again", asks::MAX_ASKS)), 0)));
+                }
+            }
         }
         if let Err(why) = core.process(&mut app) {
             klog!(0, "{}: the member stopped: {} -- `rmmod` and `insmod` start it again", A::LOG, why);
             shared.view.with(|v| *v = Some(core.view(Some(why))));
             return;
         }
+        core.turn_asks(&mut app);
         app.turn(&mut core);
         if let Some(why) = app.halt(&core) {
             klog!(0, "{}: the member stopped: {}", A::LOG, why);
@@ -801,42 +1062,45 @@ fn seen<A: App>(shared: &Shared<A>, index: u64) {
     }
 }
 
-/// `cmd`, as the member's state answers it -- asked of the member's task by
-/// the shell, again while the member cannot take it yet. `no_member` is
-/// what is said where there is no member to ask. Answered once this
-/// member's view holds the change too, so that what the shell reads next on
-/// this host has it, whichever member led -- or after VIEW_WAIT_MS of a view
-/// that lags further, the change made all the same.
+/// `cmd`, as the member's state answers it -- asked of the member's task,
+/// which asks it of the group until it knows what became of it, applied
+/// once whoever leads (`raft::asks`). `no_member` is what is said where
+/// there is no member to ask. Answered once this member's view holds the
+/// change too, so that what the shell reads next on this host has it --
+/// or after VIEW_WAIT_MS of a view that lags further, the change made all
+/// the same.
 pub fn ask<A: App>(shared: &Shared<A>, cmd: &A::Command, no_member: &str) -> Result<A::Answer, String> {
-    let mut last = String::from("no answer");
-    let end = boot_time_ns() + ASK_TOTAL_MS * NS_PER_MS;
-    while boot_time_ns() < end {
+    ask_turning(shared, cmd, no_member, &mut |ms| kcore::task::sleep_ms(ms))
+}
+
+/// `ask`, the time between two looks at the answer `turn`'s, in ms, where
+/// `ask` sleeps: for a command that drives something of its own as it
+/// waits -- nbs-mds's snapshot, the session of `nbs io`'s it pauses.
+pub fn ask_turning<A: App>(shared: &Shared<A>, cmd: &A::Command, no_member: &str, turn: &mut dyn FnMut(u64))
+    -> Result<A::Answer, String>
+{
+    if shared.view().is_none_or(|v| v.stopped.is_some()) {
+        return Err(String::from(no_member));
+    }
+    let slot: Slot<A> = Arc::new(Locked::new(None).ok_or_else(|| String::from("out of memory"))?);
+    shared.requests.with(|q| q.push_back(Request { cmd: cmd.clone(), done: slot.clone() }));
+    /* The member's task tells it, its time up at the latest: past that and
+       a grace, the task is not turning */
+    let end = boot_time_ns() + (ASK_TOTAL_MS + ASK_GRACE_MS) * NS_PER_MS;
+    loop {
+        if let Some((outcome, index)) = slot.with(|s| s.take()) {
+            if outcome.is_ok() {
+                seen(shared, index);
+            }
+            return outcome;
+        }
         if shared.view().is_none_or(|v| v.stopped.is_some()) {
             return Err(String::from(no_member));
         }
-        let slot: Slot<A> = Arc::new(Locked::new(None).ok_or_else(|| String::from("out of memory"))?);
-        shared.requests.with(|q| q.push_back(Request { cmd: cmd.clone(), done: slot.clone() }));
-        let until = (boot_time_ns() + (ANSWER_MS + 2000) * NS_PER_MS).min(end);
-        let (outcome, index) = loop {
-            if let Some(o) = slot.with(|s| s.take()) {
-                break o;
-            }
-            if boot_time_ns() >= until {
-                break (Err(String::from("no answer -- ask again")), 0);
-            }
-            kcore::task::sleep_ms(ANSWER_POLL_MS);
-        };
-        match outcome {
-            Ok(a) => {
-                seen(shared, index);
-                return Ok(a);
-            }
-            Err(why) if why.ends_with("ask again") || why.ends_with("ask again in a moment") => {
-                last = why;
-                kcore::task::sleep_ms(ASK_RETRY_MS);
-            }
-            Err(why) => return Err(why),
+        if boot_time_ns() >= end {
+            return Err(String::from("no answer from this host's member -- it may yet be applied: look before asking \
+                                     again"));
         }
+        turn(ANSWER_POLL_MS);
     }
-    Err(last)
 }

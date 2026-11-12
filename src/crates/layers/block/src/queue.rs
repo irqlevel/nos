@@ -37,7 +37,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use events::SharedEvent;
 use ffi::block::BlockIo;
-use kcore::block::{SubmitError, IO_READ, IO_WRITE};
+use kcore::block::{SubmitError, IO_FLUSH, IO_READ, IO_WRITE};
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
 use kcore::once::OnceBox;
@@ -307,6 +307,44 @@ impl Queue {
          * buffer with I/O on it (`bytes`). The context is a number. */
         if let Err(e) = unsafe { disk.submit(&io, false) } {
             bio_done(self.entry, buffer, false, true);
+            return Err(e);
+        }
+        self.busy[buffer] += 1;
+        self.in_flight += 1;
+        Ok(())
+    }
+
+    /// A flush of the disk's write cache, as buffer `buffer`'s I/O: what
+    /// the device had done when it began made durable, its completion
+    /// reaped as a read's or a write's is. The buffer's bytes are not the
+    /// device's to touch; the buffer is how its owner tells this one from
+    /// the others. Unsupported where the disk has no asynchronous flush --
+    /// no write cache, or no asynchronous path -- for the owner to flush by
+    /// the synchronous path.
+    pub fn start_flush(&mut self, buffer: usize) -> Result<(), SubmitError> {
+        let disk = self.disk.ok_or(SubmitError::Unsupported)?;
+        if self.max == 0 {
+            return Err(SubmitError::Unsupported);
+        }
+        if buffer >= self.bufs.len() {
+            return Err(SubmitError::Invalid);
+        }
+        if self.in_flight >= IN_FLIGHT_MAX {
+            return Err(SubmitError::Busy);
+        }
+        let io = BlockIo {
+            op: IO_FLUSH,
+            fua: 0,
+            reserved: 0,
+            count: 0,
+            sector: 0,
+            phys: 0,
+            done: on_done,
+            ctx: context(self.entry, buffer),
+        };
+        /* A flush names no memory: nothing of the buffer's is handed over.
+         * The context is a number. */
+        if let Err(e) = unsafe { disk.submit(&io, false) } {
             return Err(e);
         }
         self.busy[buffer] += 1;

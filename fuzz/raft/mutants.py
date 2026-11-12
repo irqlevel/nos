@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Mutants of the raft crate -- and of the cluster's registry, its first user,
-and NBS's metadata, its second -- the gate must catch: each one rule taken out of
+NBS's metadata, its second, and the asks a member of either sends -- the gate must catch: each one rule taken out of
 src/crates/common/cluster/raft/src/node.rs (or the file a mutant names), the fuzzer built
 over it, and `raft-fuzz gate`
 run -- which must fail; and so must the scenario written for that rule, on
@@ -23,6 +23,7 @@ SRC = os.path.join(ROOT, 'src', 'crates', 'common', 'cluster', 'raft', 'src')
 # The registry's and nbsmeta's mutants name their file from SRC.
 REGISTRY = os.path.join('..', '..', 'registry', 'src', 'lib.rs')
 NBSMETA = os.path.join('..', '..', '..', 'storage', 'nbsmeta', 'src', 'lib.rs')
+ASKS = 'asks.rs'
 OUT = os.path.join(ROOT, 'out', 'raft-mutants')
 BINARY = os.path.join(OUT, 'release', 'raft-fuzz')
 # The kernel's vendored crates, for nbsmeta's sha2 (scripts/raft-test.py).
@@ -178,9 +179,13 @@ MUTANTS = [
      'if false && self.hosts[at].keys.len() == 1 {\n                    return Err(Refusal::LastKey);',
      'registry_keys', REGISTRY),
     ('registry_address_taken', "an address another host has given to a host",
-     'if *ip != 0 && taken {',
-     'if false && *ip != 0 && taken {',
+     'if *ip != 0 && self.address_in_use(*ip, *port, Some(at)) {',
+     'if false && *ip != 0 && self.address_in_use(*ip, *port, Some(at)) {',
      'registry_addresses', REGISTRY),
+    ('registry_port_ignored', "a host's address told from another's by its IP alone, its port not looked at",
+     'self.ip == ip && self.port == port',
+     'self.ip == ip',
+     'registry_ports', REGISTRY),
     ('nbsmeta_removed_back', 'an incarnation removed taken again',
      'if self.id_removed(*member) {\n                    return Err(Refusal::MemberRemoved);',
      'if false && self.id_removed(*member) {\n                    return Err(Refusal::MemberRemoved);',
@@ -205,6 +210,30 @@ MUTANTS = [
      'if self.id_removed(m.id) {\n                return Err(RestoreError("a member removed"));',
      'if false && self.id_removed(m.id) {\n                return Err(RestoreError("a member removed"));',
      'nbsmeta_snapshot_rules', NBSMETA),
+    ('asks_resend_new_session', 'an ask sent again to a new leader under a new session: a command in a log twice, '
+     'applied twice',
+     'for a in self.asks.iter_mut() {\n            a.due = 0;\n        }',
+     'for a in self.asks.iter_mut() {\n            a.due = 0;\n            a.client = None;\n        }',
+     'asks_once', ASKS),
+    ('asks_expired_ignored', 'a try under a session gone not asked again under a new one',
+     'if let Some(at) = self.asks.iter().position(|a| a.client == Some(client)) {\n                    let request',
+     'if let Some(at) = self.asks.iter().position(|a| false && a.client == Some(client)) {\n                    '
+     'let request',
+     'asks_expired', ASKS),
+    ('asks_unknown_said_not_asked', 'an ask whose command was sent, its time up, told it was never asked',
+     'let outcome = if a.sent {',
+     'let outcome = if false && a.sent {',
+     'asks_unknown', ASKS),
+    ('asks_leader_tells_no_outcome', 'the leader that applied a command it took for another member not telling it',
+     'self.owed.remove(&client).map(|to| (to, Told::Applied { client, index, answer: answer.clone() }))',
+     'self.owed.remove(&client).filter(|_| false).map(|to| (to, Told::Applied { client, index, answer: '
+     'answer.clone() }))',
+     'asks_told', ASKS),
+    ('asks_leader_tells_no_session', 'the leader that made a session another member asked for not telling it',
+     'self.registering.remove(&(origin, request)).map(|to| (to, Told::Registered { request, client }))',
+     'self.registering.remove(&(origin, request)).filter(|_| false).map(|to| (to, Told::Registered { request, '
+     'client }))',
+     'asks_told', ASKS),
 ]
 
 

@@ -41,6 +41,10 @@ pub const MESSAGE_MAX: usize = 1 << 20;
 pub const NAME_MAX: usize = 48;
 /// A host's name at most: a DNS label's.
 pub const HOST_MAX: usize = 63;
+/// ipcnet's port, beside the host API's 39234: what a host listens on
+/// unless its hosts.toml says another, and what a peer whose address says
+/// no port is called at (#99).
+pub const PORT: u16 = 39240;
 
 /// What a frame is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

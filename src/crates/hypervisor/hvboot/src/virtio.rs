@@ -4,8 +4,16 @@
 //! ISR, a port, which takes its CPU out of the guest -- and that is where
 //! hv hands back what the disk has done. A request that is never answered
 //! is a timeout said on the console, not a loader spinning for good.
+//!
+//! A device whose blocks are larger than a sector says so (`F_BLK_SIZE`) --
+//! hv's for a volume of NBS's, of 4 KiB -- and hv holds every request to
+//! whole blocks of it: such a disk is read and written in whole blocks, the
+//! part of one a read or a write takes at either end through a block's
+//! buffer of the disk's own -- a write's read first, changed, and written
+//! whole (grubenv's, a kilobyte at its block's start).
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::sync::atomic::{fence, Ordering};
 
 use crate::disk::{Device, SECTOR};
@@ -25,6 +33,8 @@ const ISR: u16 = 0x13;
 const CONFIG_CAPACITY: u16 = 0x14;
 const CONFIG_SIZE_MAX: u16 = 0x1C;
 const CONFIG_SEG_MAX: u16 = 0x20;
+/// The device's block, in bytes, after the geometry (virtio 1.x, 5.2.4).
+const CONFIG_BLK_SIZE: u16 = 0x28;
 
 const STATUS_ACKNOWLEDGE: u8 = 1;
 const STATUS_DRIVER: u8 = 2;
@@ -34,6 +44,7 @@ const STATUS_FAILED: u8 = 0x80;
 const F_SIZE_MAX: u32 = 1 << 1;
 const F_SEG_MAX: u32 = 1 << 2;
 const F_RO: u32 = 1 << 5;
+const F_BLK_SIZE: u32 = 1 << 6;
 
 const T_IN: u32 = 0;
 const T_OUT: u32 = 1;
@@ -84,6 +95,11 @@ pub struct Disk {
     /// -- a stack frame that had returned -- and the next request reused
     /// the slot and the index, so the late answer was taken for that one's.
     given_up: bool,
+    /// The device's block, in sectors: 1, or what `F_BLK_SIZE` says.
+    block_sectors: u64,
+    /// A block's buffer, for the part of one a read or a write takes: empty
+    /// where a block is a sector.
+    bounce: Vec<u8>,
 }
 
 fn round_up(v: usize, to: usize) -> usize {
@@ -110,7 +126,7 @@ impl Disk {
         outb(io + STATUS, STATUS_ACKNOWLEDGE);
         outb(io + STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
         let offered = inl(io + DEVICE_FEATURES);
-        let wanted = offered & (F_SIZE_MAX | F_SEG_MAX | F_RO);
+        let wanted = offered & (F_SIZE_MAX | F_SEG_MAX | F_RO | F_BLK_SIZE);
         outl(io + DRIVER_FEATURES, wanted);
 
         outw(io + QUEUE_SELECT, 0);
@@ -131,6 +147,21 @@ impl Disk {
             outb(io + STATUS, STATUS_FAILED);
             return Err(alloc::format!("vd{}: requests of {} segments of {} bytes", letter, segments, segment_bytes));
         }
+        /* A block of a power of two of sectors, up to a page -- what hv's
+         * device says -- and a buffer of one where it is more than one. */
+        let block = if wanted & F_BLK_SIZE != 0 { u64::from(inl(io + CONFIG_BLK_SIZE)) } else { SECTOR };
+        if !block.is_power_of_two() || !(SECTOR..=PAGE as u64).contains(&block) {
+            outb(io + STATUS, STATUS_FAILED);
+            return Err(alloc::format!("vd{}: blocks of {} bytes", letter, block));
+        }
+        let mut bounce = Vec::new();
+        if block > SECTOR {
+            if bounce.try_reserve_exact(block as usize).is_err() {
+                outb(io + STATUS, STATUS_FAILED);
+                return Err(alloc::format!("vd{}: no memory for a block", letter));
+            }
+            bounce.resize(block as usize, 0);
+        }
 
         let disk = Disk {
             io,
@@ -148,6 +179,8 @@ impl Disk {
             next_avail: 0,
             tsc_khz,
             given_up: false,
+            block_sectors: block / SECTOR,
+            bounce,
         };
         disk.write16(n * DESC_BYTES, AVAIL_NO_INTERRUPT);
         outl(io + QUEUE_PFN, (ring as usize >> PFN_SHIFT) as u32);
@@ -184,8 +217,9 @@ impl Disk {
     }
 
     /// `len` bytes at `addr` -- a buffer the caller holds for the call --
-    /// read into from `sector` on, or written there: in requests of as
-    /// many segments as the device takes.
+    /// read into from `sector` on, or written there: whole blocks of the
+    /// device's, the first's first sector on, in requests of as many whole
+    /// blocks as the device takes at once.
     fn transfer(&mut self, kind: u32, sector: u64, addr: u64, len: usize) -> Result<(), String> {
         let what = if kind == T_IN { "read" } else { "write" };
         if self.given_up {
@@ -199,7 +233,15 @@ impl Disk {
             return Err(alloc::format!("vd{}: sectors {}..+{} past its end, {}", self.letter, sector, count,
                                       self.sectors));
         }
-        let per_request = self.segment_bytes as usize * self.segments as usize;
+        let block = (self.block_sectors * SECTOR) as usize;
+        if len % block != 0 || sector % self.block_sectors != 0 {
+            return Err(alloc::format!("vd{}: a {} of {} bytes at sector {}, not whole blocks of {}", self.letter,
+                                      what, len, sector, block));
+        }
+        let per_request = (self.segment_bytes as usize * self.segments as usize) / block * block;
+        if per_request == 0 {
+            return Err(alloc::format!("vd{}: a request holds less than a block of {}", self.letter, block));
+        }
         let mut done = 0usize;
         while done < len {
             let n = (len - done).min(per_request);
@@ -293,6 +335,13 @@ impl Disk {
     pub fn reset(&self) {
         outb(self.io + STATUS, 0);
     }
+
+    /// The block from `sector` on -- a block's first -- read into the
+    /// block's buffer, or written from it.
+    fn through_bounce(&mut self, kind: u32, sector: u64) -> Result<(), String> {
+        let (addr, len) = (self.bounce.as_mut_ptr() as u64, self.bounce.len());
+        self.transfer(kind, sector, addr, len)
+    }
 }
 
 impl Device for Disk {
@@ -300,16 +349,74 @@ impl Device for Disk {
         self.sectors
     }
 
+    /// Whole blocks of the device's straight into `buf`, the part of one at
+    /// either end through the block's buffer.
     fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), String> {
-        self.transfer(T_IN, sector, buf.as_mut_ptr() as u64, buf.len())
+        let per = self.block_sectors;
+        if per == 1 {
+            return self.transfer(T_IN, sector, buf.as_mut_ptr() as u64, buf.len());
+        }
+        if buf.len() as u64 % SECTOR != 0 {
+            return Err(alloc::format!("vd{}: a read of {} bytes, not whole sectors", self.letter, buf.len()));
+        }
+        let (mut at, mut s) = (0usize, sector);
+        while at < buf.len() {
+            let into = s % per;
+            let left = (buf.len() - at) as u64 / SECTOR;
+            if into == 0 && left >= per {
+                let len = ((left / per) * per * SECTOR) as usize;
+                self.transfer(T_IN, s, buf[at..].as_mut_ptr() as u64, len)?;
+                at += len;
+                s += len as u64 / SECTOR;
+            } else {
+                /* Its block whole into the buffer, the part asked copied out */
+                self.through_bounce(T_IN, s - into)?;
+                let n = (per - into).min(left);
+                let (from, len) = ((into * SECTOR) as usize, (n * SECTOR) as usize);
+                buf[at..at + len].copy_from_slice(&self.bounce[from..from + len]);
+                at += len;
+                s += n;
+            }
+        }
+        Ok(())
     }
 
     /// Refused for a disk its device says is read-only. grubenv's, as GRUB
-    /// writes it.
+    /// writes it: whole blocks of the device's straight from `buf`, the
+    /// part of one at either end read into the block's buffer, changed and
+    /// written whole.
     fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), String> {
         if self.read_only {
             return Err(alloc::format!("vd{}: read-only", self.letter));
         }
-        self.transfer(T_OUT, sector, buf.as_ptr() as u64, buf.len())
+        let per = self.block_sectors;
+        if per == 1 {
+            return self.transfer(T_OUT, sector, buf.as_ptr() as u64, buf.len());
+        }
+        if buf.len() as u64 % SECTOR != 0 {
+            return Err(alloc::format!("vd{}: a write of {} bytes, not whole sectors", self.letter, buf.len()));
+        }
+        let (mut at, mut s) = (0usize, sector);
+        while at < buf.len() {
+            let into = s % per;
+            let left = (buf.len() - at) as u64 / SECTOR;
+            if into == 0 && left >= per {
+                let len = ((left / per) * per * SECTOR) as usize;
+                self.transfer(T_OUT, s, buf[at..].as_ptr() as u64, len)?;
+                at += len;
+                s += len as u64 / SECTOR;
+            } else {
+                /* Its block read whole, the part given put over it, the block
+                   written back whole */
+                self.through_bounce(T_IN, s - into)?;
+                let n = (per - into).min(left);
+                let (to, len) = ((into * SECTOR) as usize, (n * SECTOR) as usize);
+                self.bounce[to..to + len].copy_from_slice(&buf[at..at + len]);
+                self.through_bounce(T_OUT, s - into)?;
+                at += len;
+                s += n;
+            }
+        }
+        Ok(())
     }
 }

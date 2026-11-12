@@ -7,11 +7,15 @@
 //!
 //!       name = "ex44"
 //!       cluster = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
-//!       peers = ["ax41 65.109.93.213 9c1e...64 hex", "box3 10.0.0.3 ab... cd..."]
+//!       peers = ["ax41 65.109.93.213 9c1e...64 hex", "box3 10.0.0.3 ab... cd...",
+//!                "vm2 65.109.93.213:39242 ef...64 hex"]
 //!       nic = "eth0"
 //!       port = 39240
 //!
 //!   A peer's second key is the one it moves to while it changes its own.
+//!   A peer's address may say the port it listens on -- two hosts behind
+//!   one address, a NAT's, are told apart so (#99); one that does not is
+//!   called at ipcnet's own, 39240.
 //!   Every key but `name` and `cluster` is optional; one the file does not
 //!   have, or one given twice, is refused with its line, and so is a peer
 //!   named twice or given an address another has.
@@ -27,8 +31,8 @@ use tls::pinned::Fingerprint;
 use zeroize::Zeroize;
 
 pub const DEFAULT_DIR: &str = "/etc/ipc";
-/// ipcnet's port, beside the host API's 39234.
-pub const DEFAULT_PORT: u16 = 39240;
+/// ipcnet's port, beside the host API's 39234: ipcwire's, the one copy.
+pub const DEFAULT_PORT: u16 = ipcwire::PORT;
 /// The interface it listens on and dials from unless told: never hv0, so
 /// that no guest reaches it.
 pub const DEFAULT_NIC: &str = "eth0";
@@ -98,35 +102,16 @@ fn nic_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= NIC_NAME_MAX && name.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-/// An IPv4 address in dotted form, host order.
+/// The addresses hosts.toml has, as netwire reads and prints them: `a.b.c.d`,
+/// and `a.b.c.d:port` for a peer that says its port (#99).
+pub use netwire::{Ipv4 as Ip, Ipv4Port as Addr};
+
 pub fn parse_ip(text: &str) -> Option<u32> {
-    let mut parts = text.split('.');
-    let mut ip = 0u32;
-    for _ in 0..4 {
-        let p = parts.next()?;
-        if p.is_empty() || p.len() > 3 || !p.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        let v: u32 = p.parse().ok()?;
-        if v > 255 {
-            return None;
-        }
-        ip = (ip << 8) | v;
-    }
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(ip)
+    netwire::parse_ipv4(text.as_bytes())
 }
 
-/// An address as `a.b.c.d`.
-pub struct Ip(pub u32);
-
-impl core::fmt::Display for Ip {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let b = self.0.to_be_bytes();
-        write!(f, "{}.{}.{}.{}", b[0], b[1], b[2], b[3])
-    }
+pub fn parse_addr(text: &str) -> Option<(u32, u16)> {
+    netwire::parse_ipv4_port(text)
 }
 
 /// A host of the cluster, as hosts.toml has it.
@@ -134,6 +119,9 @@ impl core::fmt::Display for Ip {
 pub struct PeerConf {
     pub name: String,
     pub ip: u32,
+    /// The port it listens on, which this host dials: 0 for ipcnet's own,
+    /// `DEFAULT_PORT`.
+    pub port: u16,
     pub keys: Vec<Fingerprint>,
     /// The one name of this host's it may reach, by that name alone: a host
     /// invited to the cluster, which reaches the cluster's member and
@@ -144,7 +132,7 @@ pub struct PeerConf {
 impl PeerConf {
     /// The entry hosts.toml writes for it.
     pub fn line(&self) -> String {
-        let mut s = alloc::format!("{} {}", self.name, Ip(self.ip));
+        let mut s = alloc::format!("{} {}", self.name, Addr(self.ip, self.port));
         for k in &self.keys {
             s.push(' ');
             s.push_str(&hex(k));
@@ -161,7 +149,13 @@ impl PeerConf {
     /// change with no connection lost -- a connection keeps the key it was
     /// made with, and the next is made with a key the peer has then.
     pub fn same_link(&self, other: &PeerConf) -> bool {
-        self.name == other.name && self.ip == other.ip
+        self.name == other.name && self.ip == other.ip && self.port == other.port
+    }
+
+    /// Whether `other` is at the same address and port: two peers never
+    /// are.
+    pub fn same_place(&self, other: &PeerConf) -> bool {
+        self.ip == other.ip && self.port == other.port
     }
 }
 
@@ -179,13 +173,15 @@ pub struct Config {
 fn parse_peer(line: usize, text: &str) -> Result<PeerConf, String> {
     let mut words = text.split_whitespace();
     let (Some(name), Some(ip)) = (words.next(), words.next()) else {
-        return Err(error(line, &alloc::format!("\"{}\": a peer is \"<name> <address> <key> [<key>]\"", text)));
+        return Err(error(line, &alloc::format!("\"{}\": a peer is \"<name> <address>[:<port>] <key> [<key>]\"",
+                                                text)));
     };
     if !valid_host(name) {
         return Err(error(line, &alloc::format!("\"{}\" is not a host's name: lowercase letters, digits and -, up \
                                                 to {}", name, ipcwire::HOST_MAX)));
     }
-    let ip = parse_ip(ip).ok_or_else(|| error(line, &alloc::format!("\"{}\" is not an IPv4 address", ip)))?;
+    let (ip, port) = parse_addr(ip)
+        .ok_or_else(|| error(line, &alloc::format!("\"{}\" is not an IPv4 address, with a port or not", ip)))?;
     let mut keys = Vec::new();
     let mut only = None;
     for w in words {
@@ -206,7 +202,7 @@ fn parse_peer(line: usize, text: &str) -> Result<PeerConf, String> {
     if keys.is_empty() {
         return Err(error(line, &alloc::format!("{} has no key", name)));
     }
-    Ok(PeerConf { name: name.to_string(), ip, keys, only })
+    Ok(PeerConf { name: name.to_string(), ip, port, keys, only })
 }
 
 struct Reader {
@@ -248,14 +244,14 @@ impl conf::Keys for Reader {
                 }
                 for e in &entries {
                     let p = parse_peer(line, e)?;
-                    if self.peers.iter().any(|q| q.name == p.name || q.ip == p.ip) {
+                    if self.peers.iter().any(|q| q.name == p.name || q.same_place(&p)) {
                         return Err(error(line, &alloc::format!("{}: a name or an address given twice", p.name)));
                     }
                     self.peers.try_reserve(1).map_err(|_| String::from("out of memory"))?;
                     self.peers.push(p);
                 }
             }
-            ("peers", _) => return Err(error(line, "peers is a list: [\"<name> <address> <key>\", ...]")),
+            ("peers", _) => return Err(error(line, "peers is a list: [\"<name> <address>[:<port>] <key>\", ...]")),
             _ => return Err(error(line, &alloc::format!("\"{}\" is not a key hosts.toml has", key))),
         }
         Ok(())
