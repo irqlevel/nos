@@ -1086,16 +1086,29 @@ def disk(args):
         # The image -- held while the guest ran -- says as it is let go of
         # what it read and wrote off the VFS's lock, and what through it:
         # the guest's reads and its writes over blocks the image had, off
-        # it (`fs::image`); its writes into holes, through it.
+        # it (`fs::image`); its writes into holes, through it. On NVMe, whose
+        # driver has an asynchronous path, a read or a write of whole mapped
+        # blocks goes to the device through the image's queue as it comes,
+        # never by the batch: there the guest's writes -- every one over
+        # blocks given ahead of it -- are among the requests served with the
+        # device asynchronously, and the batches written stay 0. Held to
+        # batches written there too, the check failed on NVMe whatever the
+        # tree.
         held = (r"image: /disk\.img let go of -- (\d+) batches read and (\d+) written off the VFS's lock, "
                 r"\d+ written through it")
         chunks = r"image: /disk\.img: (\d+) blocks given ahead of writes, (\d+) chunks refused, (\d+) blocks given back"
+        asynchronous = r"image: /disk\.img: (\d+) requests served with the device asynchronously"
         said = open(log, errors="replace").read() if args.acpi else (output_of(secs, "dmesg image:", 0) or "")
         m = re.search(held, said)
         g = re.search(chunks, said)
+        a = re.search(asynchronous, said)
         line = "\n".join(re.findall(r"(?m)^.*image: /disk\.img.*$", said)) or said[-600:]
-        pt.check("the guest's disk was read and written off the VFS's lock",
-                 m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0, line)
+        if getattr(args, "nvme_root", False):
+            pt.check("the guest's disk was served off the VFS's lock: with the device asynchronously",
+                     m is not None and a is not None and int(a.group(1)) > 0, line)
+        else:
+            pt.check("the guest's disk was read and written off the VFS's lock",
+                     m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0, line)
         # Its writes into holes: the chunk around each given to the file
         # first, its blocks zeros, and the guest's data written over them
         # off the lock -- a commit a chunk, rather than one a write. None
