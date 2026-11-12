@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::bzimage::{Header, HEADER_BYTES};
+use bzimage::{Header, HEADER_BYTES};
 use crate::disk::{Device, Part, SECTOR};
 use crate::ext::{Fs, Inode, Lookup, Unmounted};
 use crate::gpt::{self, Kind, Partition, TYPE_XBOOTLDR};

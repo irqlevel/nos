@@ -3761,7 +3761,9 @@ the start info's memory map as its e820, the RSDP -- and the command line
 GRUB's `linux` would give, `BOOT_IMAGE=` first, an argument with a space in
 it in double quotes and `\`, `'` and `"` escaped, then its own line's words
 after the entry's, as hv gave them; resets the disks; and enters the
-kernel's 64-bit entry, as hv enters a bzImage (`bzimage.rs`, `boot.rs`).
+kernel's 64-bit entry, as hv enters a bzImage (`boot.rs`) -- the header
+read and the zero page made by the crate hv makes a guest's with
+(`common/boot/bzimage`), one copy where there were two.
 Whatever it cannot do it says on the console and turns the guest off through
 its ACPI -- the VM stops with "the guest powered itself off", the reason in
 its console, and when no filesystem or no grub.cfg is found, everything it
@@ -3775,7 +3777,7 @@ above. What it boots is `plan`'s to work out -- the filesystems, grub.cfg,
 the entry, where the kernel and the initrds go, the command line, and the
 reading of them into place -- over the disks and RAM it is given and
 nothing of the platform's; it and the parsers it reads through (`gpt`,
-`ext`, `grub`, `bzimage`) are plain Rust over byte slices with no
+`ext`, `grub`, and `bzimage`'s) are plain Rust over byte slices with no
 `unsafe`. Its 41 unsafe sites are the platform's: ports, physical memory,
 the heap (`arena.rs`: first fit over its free blocks, a block given back
 merged with its neighbours, in place of a bump allocator that took back
