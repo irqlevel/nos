@@ -622,6 +622,7 @@ impl Host for VmHost {
                     if let Some(dropped) = line.admit(kcore::time::boot_time_ns()) {
                         if dropped != 0 {
                             kcore::klog!(0, "hvvm{}| ... {} lines not logged", self.shared.id, dropped);
+                            line.told(kcore::time::boot_time_ns());
                         }
                         kcore::klog!(0, "hvvm{}| {}", self.shared.id, line.text());
                     }
