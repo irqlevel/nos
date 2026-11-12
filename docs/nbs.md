@@ -656,7 +656,21 @@ then       the slots, 4 MiB each: the chunks' data
 - **A slot is zeros before a chunk takes it**, the zeros flushed before the
   record that gives it the slot: what was freed is never read through another
   chunk.
-- **A close is durable only after the chunk's data is**: it flushes first.
+- **A close is durable only after the chunk's data is**: a flush begun after
+  the chunk's last write was done comes first.
+- **Requests in flight together** (N12b: the engine's operations are `async
+  fn`s, many of them out at once on the cs's one task): a chunk's requests
+  are done one at a time, in the order they came; a volume's together, and
+  its fence alone -- after every request of the volume asked before it,
+  before every one asked after -- so that no request of an older generation
+  is done once a newer one's fence is answered. A record or a fence changed
+  marks its page, and a commit round writes copy A of every page marked on
+  every device, flushes, then copy B, flushed: never both copies of a page
+  in flight, and the opens, closes and frees that came together made durable
+  by one write of each copy and two flushes. A flush covers the writes done
+  before it began -- each device counts its data writes done, a flush the
+  count it began at -- so a close or a client's flush waits for one begun
+  after the writes it needs, joining one in flight that did.
 - **Another volume's chunk is read or written only once the host's mds
   vouches** that this volume's map names it (N10b): a snapshot's or a
   clone's map shares the chunks of what it was made of, and a clone whose
@@ -980,6 +994,19 @@ only its metadata.
   open mark answered, every chunk closed reading what it held, every sector
   one of the values it may have, no record lost; before each run, a disk with
   something else on it never taken for blank, and another cs's told apart.
+  Its `inflight` target (N12b) is the same engine with many requests'
+  operations in flight at once on one task -- tens to a couple of hundred --
+  over disks whose requests are in flight too, done in any order, a flush
+  covering only the writes done before it was asked, and power cuts with
+  requests out: each write in flight or in the cache kept, lost or torn, a
+  page of the cs's own torn inside now and then. Held to: a read answers the
+  last write of its chunk asked before it; no write of a generation answered
+  once a newer fence of its volume has been; every request answered once
+  nothing more is asked, and then no turn held and no round running; and
+  after every cut no record lost, every fence answered there, every chunk
+  written and not closed since open, a chunk closed reading what it held at
+  its close, and every other sector what the last flush or close answered
+  after its write left, or a value written since.
   Its `wire` target holds nbswire's messages to their encoding, and reads
   noise as none.
 
