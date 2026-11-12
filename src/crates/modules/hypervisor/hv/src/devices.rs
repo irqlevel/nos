@@ -11,10 +11,15 @@
 //! is written down by its id.
 //!
 //! A device is given to a VM (`hv create ... disk=`, `hv disk attach`) only
-//! where the machine does not boot from it and nothing holds it or anything
-//! overlapping it; and unless told (`force`), only where no other VM's
-//! vm.toml names it or anything overlapping it, and nothing is on it -- the
-//! refusal saying what is there.
+//! where the machine does not boot from it -- nor from a partition of it, or
+//! one overlapping it -- and nothing holds it or anything overlapping it; and
+//! unless told (`force`), only where no other VM's vm.toml names it or
+//! anything overlapping it, no other VM being made is being given it, every
+//! VM's vm.toml can be read, and nothing is on it -- the refusal saying what
+//! is there. The look and the write of the vm.toml that names it are one
+//! step, under the lock every vm.toml change takes (`store::give_devices`,
+//! `store::update`): two VMs given one device at once were each told no other
+//! VM named it.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -28,6 +33,7 @@ use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
 
 use crate::store;
+use crate::vms::Vms;
 
 /// What a disk's word in a vm.toml or on a command line is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -137,38 +143,99 @@ pub fn holds(disk: &Disk) -> Result<Option<Holds>, String> {
     Ok(contents::contents(&head, &tail, size))
 }
 
-/// The VMs under `root` whose vm.toml names `disk` or a device overlapping
-/// it -- other than `vm` -- each with the word it names it by.
-fn named_by(root: &str, vm: &str, disk: &Disk) -> Vec<(String, String)> {
-    let mut found = Vec::new();
-    let Ok(entries) = kcore::fs::list(root) else { return found };
-    for entry in entries.iter().filter(|e| e.dir) {
-        let Ok(name) = core::str::from_utf8(&entry.name) else { continue };
-        if name == vm || !store::valid_name(name) {
-            continue;
-        }
-        let Ok(folder) = store::folder_of(root, name) else { continue };
-        let Ok(config) = store::load(&folder) else { continue };
-        for (word, _) in &config.options.disks {
-            if !is_device(word) {
+/// The VMs' vm.tomls under `root`, read once for every device looked at:
+/// each VM's name and the devices its vm.toml names, and the VMs whose
+/// vm.toml could not be read -- which might name any device -- with why.
+pub struct Named {
+    vms: Vec<(String, Vec<String>)>,
+    unread: Vec<(String, String)>,
+}
+
+impl Named {
+    pub fn read(root: &str) -> Named {
+        let mut named = Named { vms: Vec::new(), unread: Vec::new() };
+        let Ok(entries) = kcore::fs::list(root) else { return named };
+        for entry in entries.iter().filter(|e| e.dir) {
+            let Ok(name) = core::str::from_utf8(&entry.name) else { continue };
+            if !store::valid_name(name) {
                 continue;
             }
-            if find(word).is_ok_and(|d| d.overlaps(disk)) && found.try_reserve(1).is_ok() {
-                found.push((String::from(name), word.clone()));
+            /* No vm.toml: no VM's folder -- what a delete that kept the
+             * disks left. */
+            let Ok(folder) = store::folder_of(root, name) else { continue };
+            match store::load(&folder) {
+                Ok(config) => {
+                    let words: Vec<String> = config.options.disks.into_iter().map(|(w, _)| w)
+                        .filter(|w| is_device(w)).collect();
+                    if named.vms.try_reserve(1).is_ok() {
+                        named.vms.push((folder.name, words));
+                    }
+                }
+                Err(why) => {
+                    if named.unread.try_reserve(1).is_ok() {
+                        named.unread.push((folder.name, why));
+                    }
+                }
             }
         }
+        named
     }
-    found
+
+    /// The VMs -- other than `vm` -- whose vm.toml names `disk` or a device
+    /// overlapping it, each with the word it names it by.
+    fn by(&self, vm: &str, disk: &Disk) -> Vec<(&str, &str)> {
+        let mut found = Vec::new();
+        for (name, words) in self.vms.iter().filter(|(n, _)| n != vm) {
+            for word in words {
+                if find(word).is_ok_and(|d| d.overlaps(disk)) && found.try_reserve(1).is_ok() {
+                    found.push((name.as_str(), word.as_str()));
+                }
+            }
+        }
+        found
+    }
+}
+
+/// What on `disk` a machine's firmware boots from -- the device itself, a
+/// partition of it, or one overlapping it, an EFI System or a BIOS boot
+/// partition -- if anything: that device, and what it is. Asked of the
+/// device alone, the whole disk that held the machine's ESP on its other
+/// drive could be given, and poured over.
+pub fn boots_the_machine(disk: &Disk) -> Option<(Disk, &'static str)> {
+    if let Some(what) = disk.kind().boots_the_machine() {
+        return Some((*disk, what));
+    }
+    (0..Disk::count()).filter_map(Disk::at)
+        .find_map(|d| d.kind().boots_the_machine().filter(|_| d.overlaps(disk)).map(|what| (d, what)))
+}
+
+/// Why `disk`, `called` so, is never given to a guest: the machine boots
+/// from it or from a partition on it.
+fn boots_said(called: &str, disk: &Disk) -> Option<String> {
+    let (d, what) = boots_the_machine(disk)?;
+    Some(if d.handle() == disk.handle() {
+        alloc::format!("{} is {}: the machine boots from it, and no vm is given it", called, what)
+    } else {
+        alloc::format!("{} holds {}, {}: the machine boots from it, and no vm is given it", called, d.name(), what)
+    })
 }
 
 /// Whether `disk` may be given to VM `vm` under `root`: Ok -- or why not.
-/// Never where the machine boots from it or something holds it or anything
-/// overlapping it; without `force`, not where another VM's vm.toml names it
-/// or anything overlapping it, nor where anything is on it.
-pub fn check(root: &str, vm: &str, disk: &Disk, force: bool) -> Result<(), String> {
+/// Never where the machine boots from it or from a partition on it, or
+/// something holds it or anything overlapping it; without `force`, not where
+/// another VM's vm.toml names it or anything overlapping it, a VM being made
+/// is being given it (`Vms::devices_given`), a VM's vm.toml cannot be read,
+/// or anything is on it.
+pub fn check(root: &str, vms: &Vms, vm: &str, disk: &Disk, force: bool) -> Result<(), String> {
+    let named = if force { Named { vms: Vec::new(), unread: Vec::new() } } else { Named::read(root) };
+    check_with(&named, vms, vm, disk, force)
+}
+
+/// `check`, with the vm.tomls read already.
+pub fn check_with(named: &Named, vms: &Vms, vm: &str, disk: &Disk, force: bool) -> Result<(), String> {
     let called = called(disk);
-    if let Some(what) = disk.kind().boots_the_machine() {
-        return Err(alloc::format!("{} is {}: the machine boots from it, and no vm is given it", called, what));
+    if let Some(why) = boots_said(&called, disk) {
+        return Err(why);
     }
     /* Held now -- a mount, the disk log, a guest -- on it or on anything
      * overlapping it: asked, nothing taken, so that the look gets in no
@@ -179,9 +246,18 @@ pub fn check(root: &str, vm: &str, disk: &Disk, force: bool) -> Result<(), Strin
     if force {
         return Ok(());
     }
-    if let Some((other, word)) = named_by(root, vm, disk).into_iter().next() {
+    if let Some((other, word)) = named.by(vm, disk).into_iter().next() {
         return Err(alloc::format!("{} is vm {}'s disk already (its vm.toml names {}) -- two vms on one device wreck \
                                    each other's data; give it anyway with force", called, other, word));
+    }
+    let given = vms.devices_given(vm);
+    if let Some((other, _)) = given.iter().find(|(_, id)| find(id).is_ok_and(|d| d.overlaps(disk))) {
+        return Err(alloc::format!("{} is being given to vm {}, which is being made -- two vms on one device wreck \
+                                   each other's data; give it anyway with force", called, other));
+    }
+    if let Some((other, why)) = named.unread.iter().find(|(n, _)| n != vm) {
+        return Err(alloc::format!("vm {}'s vm.toml cannot be read -- {}: it may name {}; mend it, or give it anyway \
+                                   with force", other, why, called));
     }
     match holds(disk)? {
         Some(what) => Err(alloc::format!("{} holds {} -- the vm would have its data over it; give it anyway with \
@@ -216,26 +292,46 @@ fn size_text(bytes: u64) -> String {
     }
 }
 
-/// `hv devices`: every device nos has, what it is found by, what holds it
-/// or names it -- and, of one nothing holds, what is on it.
-pub fn command(root: &str, out: &mut Output) {
+/// `hv devices`: every device nos has, what it is found by, what is in the
+/// way of giving it -- what holds it, or anything overlapping it -- which VMs
+/// name it or are being given it, and, of one nothing is in the way of, what
+/// is on it. The vm.tomls read once, and one that cannot be read said: the
+/// devices it names are not known.
+pub fn command(root: &str, vms: &Vms, out: &mut Output) {
     let count = Disk::count();
     if count == 0 {
         let _ = writeln!(out, "hv: no block devices");
         return;
     }
+    let named = Named::read(root);
+    let given = vms.devices_given("");
     for index in 0..count {
         let Some(disk) = Disk::at(index) else { continue };
         let _ = write!(out, "{:<8} {:>9}  {}  {}", disk.name().as_str(),
                        size_text(disk.sectors().saturating_mul(disk.sector_size())),
                        disk.ident().as_ref().map_or("(no id)", |id| id.as_str()), kind_text(disk.kind()));
-        if let Some(by) = disk.holder() {
-            let _ = write!(out, "  -- held by {}", by);
+        if let Some((d, what)) = boots_the_machine(&disk).filter(|(d, _)| d.handle() != disk.handle()) {
+            let _ = write!(out, "  -- holds {}, {}: never given", d.name(), what);
         }
-        for (vm, _) in named_by(root, "", &disk) {
+        /* Who holds it, or -- what is as much in the way of giving it --
+         * something it overlaps: the disk under nos's root partition. */
+        let in_the_way = disk.in_the_way();
+        match (disk.holder(), &in_the_way) {
+            (Some(by), _) => {
+                let _ = write!(out, "  -- held by {}", by);
+            }
+            (None, Some(by)) => {
+                let _ = write!(out, "  -- in use by {}, on what it overlaps", by);
+            }
+            (None, None) => {}
+        }
+        for (vm, _) in named.by("", &disk) {
             let _ = write!(out, "  -- named by vm {}", vm);
         }
-        if disk.holder().is_none() {
+        for (vm, _) in given.iter().filter(|(_, id)| find(id).is_ok_and(|d| d.overlaps(&disk))) {
+            let _ = write!(out, "  -- being given to vm {}", vm);
+        }
+        if in_the_way.is_none() {
             match holds(&disk) {
                 Ok(Some(what)) => {
                     let _ = write!(out, "  -- holds {}", what);
@@ -250,13 +346,16 @@ pub fn command(root: &str, out: &mut Output) {
         }
         let _ = writeln!(out);
     }
+    for (vm, why) in &named.unread {
+        let _ = writeln!(out, "hv: vm {}'s vm.toml cannot be read -- {}: which devices it names is not known", vm, why);
+    }
 }
 
 const DISK_USAGE: &str = "hv disk attach <vm> <device>[:ro] [force] | hv disk detach <vm> <device> -- a device is \
                           dev:<name>, part:<id> or disk:<id> (hv devices)";
 
 /// `hv disk attach <vm> <device>[:ro] [force]`, `hv disk detach <vm> <device>`.
-pub fn disk_command(root: &str, vms: &crate::vms::Vms, args: &str, out: &mut Output) {
+pub fn disk_command(root: &str, vms: &Vms, args: &str, out: &mut Output) {
     let mut words = args.split_ascii_whitespace();
     let (Some(what), Some(vm), Some(word)) = (words.next(), words.next(), words.next()) else {
         let _ = writeln!(out, "{}", DISK_USAGE);
@@ -290,21 +389,22 @@ pub fn disk_command(root: &str, vms: &crate::vms::Vms, args: &str, out: &mut Out
 
 /// The device `word` names made a disk of VM `vm`'s, read-only to it with
 /// `ro`, where `check` lets it be given: written into its vm.toml by its id,
-/// read at its next start. The id, or why not.
-pub fn attach(root: &str, vms: &crate::vms::Vms, vm: &str, word: &str, ro: bool, force: bool) -> Result<String, String> {
+/// read at its next start. The id, or why not. The check is made under the
+/// lock the write is (`store::update`), so that two VMs given one device at
+/// once are not both told it is nobody's.
+pub fn attach(root: &str, vms: &Vms, vm: &str, word: &str, ro: bool, force: bool) -> Result<String, String> {
     let folder = store::folder_of(root, vm)?;
     /* Held while its vm.toml changes -- refused while it is on the list:
      * hv stop it first. */
-    let _held = vms.reserve(vm, "changed")?;
+    let _held = vms.reserve(vm, crate::vms::CHANGED)?;
     let (disk, id) = given(word)?;
-    check(root, vm, &disk, force)?;
-    let theirs = store::load(&folder)?;
-    for (other, _) in theirs.options.disks.iter().filter(|(w, _)| is_device(w)) {
-        if find(other).is_ok_and(|d| d.overlaps(&disk)) {
-            return Err(alloc::format!("{} is {}'s disk already, as {}", called(&disk), vm, other));
+    store::update(vms, &folder, |c| {
+        check(root, vms, vm, &disk, force)?;
+        for (other, _) in c.options.disks.iter().filter(|(w, _)| is_device(w)) {
+            if find(other).is_ok_and(|d| d.overlaps(&disk)) {
+                return Err(alloc::format!("{} is {}'s disk already, as {}", called(&disk), vm, other));
+            }
         }
-    }
-    store::update(&vms.changes, &folder, |c| {
         if c.options.disks.len() >= hv::run::MAX_DISKS {
             return Err(alloc::format!("{} has {} disks already, all a guest takes", vm, hv::run::MAX_DISKS));
         }
@@ -318,14 +418,14 @@ pub fn attach(root: &str, vms: &crate::vms::Vms, vm: &str, word: &str, ro: bool,
 /// The device `word` names -- by its id, or by its name or id resolved to
 /// the device -- taken off VM `vm`'s vm.toml: what its vm.toml named it by,
 /// or why not. The device itself is left as it is.
-pub fn detach(root: &str, vms: &crate::vms::Vms, vm: &str, word: &str) -> Result<String, String> {
+pub fn detach(root: &str, vms: &Vms, vm: &str, word: &str) -> Result<String, String> {
     let folder = store::folder_of(root, vm)?;
     /* Held while its vm.toml changes -- refused while it is on the list:
      * hv stop it first. */
-    let _held = vms.reserve(vm, "changed")?;
+    let _held = vms.reserve(vm, crate::vms::CHANGED)?;
     let wanted = given(word).ok().map(|(disk, _)| disk);
     let mut named = None;
-    store::update(&vms.changes, &folder, |c| {
+    store::update(vms, &folder, |c| {
         let at = c.options.disks.iter().position(|(w, _)| {
             is_device(w) && (w.eq_ignore_ascii_case(word)
                              || wanted.as_ref().is_some_and(|d| find(w).is_ok_and(|x| x.handle() == d.handle())))

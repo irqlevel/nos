@@ -1735,13 +1735,18 @@ requests are out at once (`blk::IN_FLIGHT`), each in a 256 KiB buffer of the bac
 when the disk is made (`Backend::with_buffer`) -- the driver is told a
 request carries at most 64 segments of a page (`seg_max`, `size_max`) --
 so nothing is allocated on the way, and a guest that keeps its ring full
-waits for its disk rather than growing anything of nos's. The buffers are
-the image's (`kcore::fs::ImageQueue`): its disk reads and writes them as
-they are, so a request's bytes are copied once, between the guest's memory
-and the buffer, on the vCPU.
+waits for its disk rather than growing anything of nos's -- the disk's task
+has its lists of them from the disk's opening too, so that a disk that could
+not have them refuses its VM's start rather than starting a guest whose disk
+never answers. The buffers are the image's (`kcore::fs::ImageQueue`): its
+disk reads and writes them as they are, so a request's bytes are copied
+once, between the guest's memory and the buffer. A volume of NBS's has
+buffers of its own, a slot each, which go with a request to its session and
+come back with the answer; the session makes a message of each request from
+the heap, which is the one thing on a volume's way that allocates.
 
 **The disk's bytes are a trait's** (`hv::disk::Backend`, which is handed a
-request and gives it back served): the module's `FileDisk` holds the image
+request and gives it back served): the module's `QueuedDisk` holds the image
 (`kcore::fs::Image`, whose word the kernel looks up on every call; nothing
 else may write the file, cut it, grow it, rename it or remove it while the
 disk has it, nor its filesystem be unmounted -- [A disk's
@@ -1910,7 +1915,7 @@ and all -- are refused rather than one taken.
 ```
 > hv devices
 vda         64 MiB  (no id)  whole disk  -- held by a mounted filesystem
-nvme0       64 MiB  disk:nvme-QEMU_NVMe_Ctrl_nosdevtesta  whole disk  -- holds a GPT partition table
+nvme0       64 MiB  disk:nvme-QEMU_NVMe_Ctrl_nosdevtesta  whole disk  -- holds nvme03, an EFI System partition: never given  -- holds a GPT partition table
 nvme1       64 MiB  disk:nvme-QEMU_NVMe_Ctrl_nosdevtestb  whole disk  -- empty
 nvme01       8 MiB  part:6e6f7364-...-000000000001  GPT type 0fc63daf-...  -- holds an ext4 filesystem labelled "devtest"
 nvme02      16 MiB  part:6e6f7364-...-000000000002  GPT type 0fc63daf-...  -- empty
@@ -1918,8 +1923,14 @@ nvme03       4 MiB  part:6e6f7364-...-000000000003  an EFI System partition  -- 
 nvme04      16 MiB  part:6e6f7364-...-000000000004  GPT type 0fc63daf-...  -- holds data nos does not recognize
 ```
 
-What is on a device nobody holds is read off its first 72 KiB and its last
-128 KiB, where each kind keeps its mark (`diskimage::contents`): ext2, ext3
+A device is "held by" what claimed it, and "in use by" what claimed
+something it overlaps -- a partition of it, the disk it is a partition of --
+which is as much in the way of giving it; the VMs whose vm.tomls name it,
+and those being made that are being given it, are said, and a vm.toml that
+cannot be read is said after the list, the devices it names not known. All
+the vm.tomls are read once for the whole list. What is on a device nothing
+is in the way of is read off its first 72 KiB and its last 128 KiB, where
+each kind keeps its mark (`diskimage::contents`): ext2, ext3
 and ext4 told apart by their features, XFS, btrfs, F2FS, swap, an LVM
 physical volume, an md RAID member of any superblock version, LUKS, ISO
 9660, NTFS, exFAT, FAT, squashfs, nanofs, nos's disk log, a GPT or an MBR --
@@ -1936,18 +1947,31 @@ hv: nvme01 (part:...-000000000001) holds an ext4 filesystem labelled "devtest" -
 > hv create d1 /spin.elf mem=64 disk=dev:nvme02
 hv: /vms/d1/vm.toml written -- hv start d1 boots it
 > hv create d2 /hvboot mem=64 disk=dev:nvme0
-hv: nvme0 (disk:nvme-QEMU_NVMe_Ctrl_nosdevtesta) is vm d1's disk already (its vm.toml names part:...-000000000002) -- two vms on one device wreck each other's data; give it anyway with force
+hv: nvme0 (disk:nvme-QEMU_NVMe_Ctrl_nosdevtesta) holds nvme03, an EFI System partition: the machine boots from it, and no vm is given it
+> hv create d5 /hvboot mem=64 disk=dev:nvme02
+hv: nvme02 (part:...-000000000002) is vm d1's disk already (its vm.toml names part:...-000000000002) -- two vms on one device wreck each other's data; give it anyway with force
 ```
 
 - never an EFI System partition or a BIOS boot partition, by their GPT
-  types or the MBR's 0xEF -- not even with `force`;
+  types or the MBR's 0xEF -- not even with `force` -- nor a device that
+  holds one or overlaps one: the whole disk the firmware boots from, which
+  was once given and poured over where nos's root was on the other drive
+  and nothing held the ESP's;
 - never a device something holds -- a mounted filesystem, the disk log, a
   guest running on it, `netblk` serving it for writing -- nor one
   overlapping something held:
   the disk under nos's root, a partition of a disk a guest has whole;
 - with `force` only, a device another VM's vm.toml names, or one
   overlapping it -- the whole of a disk one of whose partitions is d1's
-  above -- and a device with anything on it.
+  above -- one a VM being made or cloned is being given, a device while
+  some VM's vm.toml cannot be read, which may name it, and a device with
+  anything on it.
+
+The look and the write of the vm.toml that names a device are one step:
+`hv create` and `hv disk attach` make both under the lock every change of
+a vm.toml takes, and a VM being made keeps the devices it was given with
+its name's hold until its vm.toml says so -- two VMs given one device at
+once were each told no other VM named it, and both wrote it.
 
 `hv create <name> ... disk=<device>` and `hv disk attach <vm> <device>[:ro]
 [force]` give a device; `hv disk detach <vm> <device>` takes it off the
@@ -1957,8 +1981,10 @@ it was given by (`disks = ["part:6e6f7364-...-000000000002"]`). The checks
 are made where a device is given and not at every start: once given, what
 is on it is the guest's, the filesystem it makes included. A vm.toml
 written by hand, or by the `config_set` call, is taken as it says -- the
-EFI System partition and the claims are still refused when it starts, the
-rest is the writer's to have checked.
+EFI System partition and the claims are still refused when it starts, and
+so is a device named by this boot's name (`dev:nvme1`), which the next boot
+may give another drive: the start says the id to write instead. The rest
+is the writer's to have checked.
 
 **While its VM runs, a device is its VM's alone.** A start claims each of
 its devices for `vm <name>'s disk` in the block table, whose claims compare
@@ -2008,14 +2034,23 @@ hole does, so the pour writes zeros wherever the image has none -- in
 order, through the same queue -- and gives back the rest of the device
 past the image's disk where the device takes a discard; an image bigger
 than the device is refused before anything is written, and `size=` is
-refused with `onto=`, the device being the size it is. The checks are a
-given device's: `force` over what is on it, and never one in use.
+refused with `onto=`, the device being the size it is. What is poured is a
+qcow2 image or a raw disk: one with a partition table, or with what
+`diskimage::contents` knows a disk holds -- a filesystem, a RAID member --
+or a start of zeros. An empty file, and one of bytes no disk holds -- a
+page of HTML -- are refused, where they were once poured, the empty one
+giving the whole device back to it. The checks are a given device's:
+`force` over what is on it, and never one in use. A pour cannot take back
+what it wrote: one that fails, or is stopped, says the device -- or the
+volume -- holds part of the image now, and a device that gives back none
+of its writes for two minutes is given up, said so, rather than waited for
+by `hv convert`, and the unload or the poweroff behind it, for good.
 
 **What the folder's commands do with a device.** `hv clone` refuses a VM
 with one: the clone would share it, and two machines on one disk wreck it.
 `hv delete` takes away the folder and leaves the device as it is, saying
-so (`hv: part:...-000000000002 left as it is -- a device, which a delete
-never touches`). The `vm` provider's `devices`, `disk_attach` and
+so (`hv: part:...-000000000002 left as it is -- a device of nos's, which a
+delete never touches`; a volume of NBS's likewise). The `vm` provider's `devices`, `disk_attach` and
 `disk_detach`, and `create`'s `onto` and `force`, are the same functions
 ([On the management bus](#on-the-management-bus)), and the panel's
 "Create" offers the devices that may be given, saying why a refused one
@@ -2357,11 +2392,22 @@ window now rings the first CPU, and 2,400 pings had none, 0.19 ms on
 average and 0.28 at most.
 
 **`hv forward` is how a guest is reached from outside.** The guests have
-addresses only on their switch; a forward listens on a port of nos's and,
-for each connection, opens one to the guest's port through `hv0`
-(`kcore::tcp::TcpStream::connect`, new for this) and relays the two with a
-task of its own. The kernel has 64 TCP connections and a forwarded one takes
-two, so a forward carries eight at once and refuses the rest. Its listener is
+addresses only on their switch; a forward listens on a port of nos's -- on
+the device the guests go out through by NAT, the default route's, which is
+the one the world reaches them by (`eth0` while NAT is off): on a machine
+whose uplink was not its first NIC, a forward on `eth0` said it was made and
+was reached by nobody -- and hands each connection to a relay task of its
+own, which opens one to the guest's port through `hv0`
+(`kcore::tcp::TcpStream::connect`, new for this) and relays the two. The
+connect is the relay's: one to a guest that does not answer waits out TCP's
+five seconds there, where the listener once did, every other client and the
+forward's own stop waiting behind it. The kernel has 64 TCP connections and a
+forwarded one takes two, so a forward carries eight at once and refuses the
+rest. A relay ends when either side's stream ends: there is no half-close, the
+kernel's TCP having no way for a program to end its sending and go on
+reading, so a client that shuts its sending side and waits for the answer
+(`nc -N`) gets none; and an idle relay looks at each side every few
+milliseconds, there being no event to wait on for two connections. Its listener is
 a bulk one (`TcpListener::bind_bulk`): a connection it accepts has buffers of
 up to 512 KiB each way and scales its window, where a connection's own 8 KiB
 would hold a client 62 ms away -- the EX44 from a desk in another country --
@@ -2458,15 +2504,23 @@ message never leaves its port: the switch answers it in place with the
 port's address -- the same as `ip=` gives -- a day's lease, the /24 mask, nos
 as the router, and nos's DNS server. Nothing is remembered, because there is
 nothing to choose: a request for any other address is refused (NAK) and the
-client starts again. A distribution that configures its ethernet by DHCP, as
-most do, needs nothing on its command line; one that takes `ip=` gets the
-same address from there.
+client starts again. A guest whose address is set by hand -- its port's --
+may ask for the rest with a DHCPINFORM, and is answered with an ACK that has
+no address and no lease in it (RFC 2131, 3.4). A message the switch takes and
+does not answer -- a release, a decline, one not well formed -- is counted
+with the frames it does not carry (`frames_foreign`), where it once went
+nowhere, counted nowhere. A distribution that configures its ethernet by
+DHCP, as most do, needs nothing on its command line; one that takes `ip=`
+gets the same address from there.
 
 **The DNS server the guests are given is nos's own** -- its resolver's, or
 the one its lease named (`kcore::net::dns_server`): 10.0.2.3 under QEMU's user
 network, Hetzner's resolvers on the Hetzner boxes. `ip=` carries it as `dns0`,
 which the kernel shows in `/proc/net/pnp` and Alpine's initramfs writes to
-`resolv.conf`, and DHCP as option 6, which systemd-resolved takes. The guests
+`resolv.conf`, and DHCP as option 6, which systemd-resolved takes. `ip=` has
+the one nos had when the guest started; DHCP asks the kernel as it answers,
+so a lease renewed after nos's own lease named another resolver has the new
+one -- it was the one nos had when some guest was last started. The guests
 ask it through NAT like any other server; nos runs no DNS server of its own.
 
 `scripts/hv-linux-test.py --net` is the network's gate: two guests, their
@@ -2859,12 +2913,17 @@ $ hv start noble
   cloud-init takes it for a new machine; its user-data gives the image's
   own user -- `ubuntu`, `debian` -- the keys nos's sshd lets in
   (`/etc/ssh/authorized_keys`), and with `password=` a password, for its
-  console. Every string in it is YAML's double-quoted, so that a key's
-  comment is never read as YAML. The user-data says nothing of the machine,
+  console. Every string in it is YAML's double-quoted -- the meta-data's
+  too, a VM named `1.5` or `true` being no string to YAML bare, and its
+  hostname then not set -- and everything but printable ASCII in it an
+  escape (`\u2028`), a C1 control or a line separator in a key's comment
+  or a password having once left the user-data unreadable or the password
+  another. The user-data says nothing of the machine,
   and is kept in the folder as `user-data`: a clone's seed gives its own
   first boot the same ([below](#cloned-deleted-changed)). The host API's
   create may give user-data of its own instead -- a job, which only an
-  admin starts.
+  admin starts -- and then no password, which was once dropped without a
+  word: the call is refused.
 - **The vm.toml**, written last: hvboot as its kernel (`/lib/hvboot`, the
   system image's, or `hvboot=`), which boots the kernel the image's own
   GRUB would ([A guest's own kernel](#a-guests-own-kernel-pvh-and-hvboot));
@@ -2875,11 +2934,18 @@ $ hv start noble
   sshd -- `cmdline=`, which hvboot puts after the entry's own line.
 - **Nothing is left of a failure**: what the command made -- the download,
   the disk, the seed, and the folder when it made that too -- goes, and
-  why it failed is said. Nor of a stop: the module's going, or the host
-  API's cancel of its job, ends the download as the next of the body
-  arrives, or the conversion at the next cluster, and takes the same away.
-  The name is held while the folder is made: no start of it meanwhile, and
-  no other create, clone or delete.
+  why it failed is said, with anything that could not be taken away. Nor
+  of a stop: the module's going, or the host API's cancel of its job, ends
+  the download as the next of the body arrives, or the conversion at the
+  next cluster, and takes the same away. Before anything is fetched, a
+  `disk.raw`, `seed.iso` or `user-data` in the folder already -- what `hv
+  delete <vm> keep-disks` leaves -- refuses it: one once failed the create
+  at the end of its download, every time. The name is held while the folder
+  is made: no start of it meanwhile, and no other create, clone or delete;
+  and what it is given meanwhile -- its `port=`, a device -- is kept with the
+  hold, no other VM's until its vm.toml says so. The URL is said without a
+  user's name and password, a query or a fragment: a job's log is read by
+  every client that may read jobs.
 
 What it does not do yet: check the image against its distribution's
 `SHA256SUMS` (TLS's certificate is what vouches for the bytes now), resume
@@ -2931,13 +2997,18 @@ hv: /vms/noble2/vm.toml written -- hv start noble2 boots it, cloud-init given a 
   switch -- an address and a MAC -- that no other VM's vm.toml names and no
   VM on the list holds, when the source had one (`port=` says which); no
   `forward`, which would be the source's ports; no `ip=` on its command
-  line; and not `protected`.
+  line; and not `protected`. The port is looked for, and kept with the new
+  name's hold until its vm.toml says so, under the lock vm.toml changes
+  take: two clones at once were once given one port, one MAC and one
+  address.
 
 It is refused while the source is on the list -- `hv stop` it first -- and
 when the new name has a folder; both names are held while it runs, so
-neither starts and nothing else is done to either. What fails, or is
-stopped -- the module's going, the host API's cancel -- leaves nothing
-behind.
+neither starts and nothing else is done to either. A source's `user-data`
+that is there and cannot be read refuses it, rather than giving the clone
+the default keys in its place. What fails, or is stopped -- the module's
+going, the host API's cancel -- leaves nothing behind, and what could not be
+taken away is said.
 
 `hv delete <name> [keep-disks] [force]` (`store::delete`) takes a VM's
 folder away: every file in it and every folder under it -- or, with
@@ -2957,10 +3028,16 @@ lists no folder without a vm.toml: what a delete that kept the disks left.
 another replaced where it is, one taken away taken out, one the file has not
 added at its end -- and every other line, the operator's comments and blank
 lines among them, left as it was; the file as it was kept beside it as
-`vm.toml.prev`, each written whole before it takes the old one's place. So
+`vm.toml.prev`, each written whole before it takes the old one's place --
+one change at a time, under one lock, and none while the folder is being
+deleted: a change beside a delete once wrote `vm.toml.prev` into a folder
+the delete had walked, which was left with that alone in it. So
 does `hv forward add` -- a forward to a VM with a folder is kept in its
 `forward = [...]`, for its next start to have it, and `hv forward del` takes
 it out -- and so do the host API's edits ([below](#on-the-management-bus)).
+No disk or download is given a name of the folder's own files -- `vm.toml`,
+`vm.toml.prev`, the `.new` each is written through, `user-data`, the
+console's logs.
 
 ### On the management bus
 
@@ -2972,15 +3049,18 @@ commands are:
 | | |
 |---|---|
 | reads | `list` (every VM: its folder's, and those on the list without one), `get` (its configuration, disks and forwards), `host` (the extension, the cores, the huge pool, the switch -- and the host's address on it and each port's, the same before the switch is made), `networks`, `config_get`, `console_read` (a page of its console from a byte on -- its control sequences taken out, or for a terminal filtered as `hv attach` filters them, a sequence the page would cut in two left for the next), `disks` (a device's id and its name this boot among them), `forwards`, `devices` (every device of nos's: its id, type, size, who holds it, what is on it, and why it would be refused -- [A device as a guest's disk](#a-device-as-a-guests-disk)) |
-| actions | `config_set` (a vm.toml checked as a start checks it, the old one kept as `vm.toml.prev`), `forward_add` and `forward_del` (kept in its vm.toml, and made or taken away now when it runs), `console_write` (keys, control keys among them), `disk_add` (a new empty disk in its folder), `disk_grow`, `disk_attach` and `disk_detach` (a device given to a stopped VM by its id, `force` as `hv disk attach` takes it, and taken off again) |
+| actions | `config_set` (a vm.toml checked as a start checks it, the old one kept as `vm.toml.prev` as its bytes -- so one that no longer parses, a key misspelt by hand, can be mended), `forward_add` and `forward_del` (kept in its vm.toml, and made or taken away now when it runs), `console_write` (keys, control keys among them), `disk_add` (a new empty disk in its folder), `disk_grow`, `disk_attach` and `disk_detach` (a device given to a stopped VM by its id, `force` as `hv disk attach` takes it, and taken off again) |
 | jobs | `start`, `stop`, `restart`, `create` (a cloud's image by its URL, as `hv create <name> <url>`: with `onto` and `force`, poured onto a device of nos's; with `port`, a port of the switch of its own, checked as a clone's is -- no other VM's by its vm.toml or as it runs; `forwards`, nos's ports relayed to its own; `protected`; and `start`, started by the same job once made, which ends failed, saying it was made, if the start fails), `clone`, `delete` |
 
 A job says as it goes what the command would, as its log, and how far it
 has got; its cancel -- or the module's going -- stops a download, a
-conversion and a copy where they are, what they made taken away, and stops
-waiting for a guest's power button. A VM whose vm.toml says `protected =
-true` is stopped and deleted only when the call says `force`: the panel's
-own VM has it. When the module goes, the loader closes the provider with
+conversion and a copy where they are, what they made taken away. A stop's
+cancel stops its wait for the guest to turn itself off and leaves the guest
+as it is, its power button pressed -- it was once stopped at once, perhaps
+in the middle of the shutdown the job had asked for -- and the module's going
+stops it where it is. A VM whose vm.toml says `protected = true` -- or whose
+vm.toml cannot be read, which may say so -- is stopped, restarted and deleted
+only when the call says `force`: the panel's own VM has it. When the module goes, the loader closes the provider with
 the command -- its jobs told to stop -- and the module's stop unregisters
 it, waiting out its calls and jobs, before the forwards and the VMs go; the
 loader then waits out the command's calls, and only then is the module

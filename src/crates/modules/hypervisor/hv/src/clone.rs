@@ -17,16 +17,16 @@
 //!   which a distribution writes once (`docs/hypervisor.md`);
 //! - its vm.toml the source's, the operator's lines kept, with what makes a
 //!   machine itself made new: a new UUID, a port of the switch -- a MAC and
-//!   an address -- that no other VM's vm.toml names, when the source had one
-//!   (`port=` says which), no forwards, no `ip=` on its command line, and
-//!   not protected.
+//!   an address -- that no other VM's vm.toml names and no other VM being
+//!   made or cloned has been given, when the source had one (`port=` says
+//!   which), no forwards, no `ip=` on its command line, and not protected.
 //!
 //! Refused while the source is on the list -- hv stop it first: its disks
 //! are held to read while they are copied (`kcore::fs::Image`), which a guest
 //! writing them would refuse -- and when the new name has a folder. Both
 //! names are held while it runs. The room it takes is asked for before
 //! anything is written (`kcore::fs::space`), and what fails, or is stopped,
-//! leaves nothing behind.
+//! leaves nothing behind -- what could not be taken away is said.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -123,44 +123,6 @@ fn in_folder<'a>(folder: &Folder, path: &'a str) -> Option<&'a str> {
     path.strip_prefix(folder.path.as_str())?.strip_prefix('/').filter(|rest| !rest.is_empty())
 }
 
-/// A port of the switch for a clone, or a VM made with one of its own:
-/// `asked`, or the lowest no VM's vm.toml under `root` names and no VM on
-/// the list holds.
-pub fn port_for(root: &str, vms: &Vms, asked: Option<u32>) -> Result<u32, String> {
-    let mut used = [false; net::MAX_PORTS];
-    for p in vms.ports_held() {
-        if let Some(u) = used.get_mut(p) {
-            *u = true;
-        }
-    }
-    let mut named: Vec<(u32, String)> = Vec::new();
-    for entry in kcore::fs::list(root).map_err(|e| alloc::format!("{}: {}", root, e))? {
-        let Ok(name) = core::str::from_utf8(&entry.name) else { continue };
-        if !entry.dir || !store::valid_name(name) {
-            continue;
-        }
-        let Ok(folder) = store::folder_of(root, name) else { continue };
-        if let Ok(c) = store::load(&folder) {
-            if let Some(p) = c.options.port {
-                if let Some(u) = used.get_mut(p as usize) {
-                    *u = true;
-                }
-                named.push((p, folder.name));
-            }
-        }
-    }
-    match asked {
-        Some(p) if p as usize >= net::MAX_PORTS => Err(alloc::format!("port= must be 0..{}", net::MAX_PORTS - 1)),
-        Some(p) => match named.iter().find(|(q, _)| *q == p) {
-            Some((_, owner)) => Err(alloc::format!("port {} is {}'s, as its vm.toml says", p, owner)),
-            None if used[p as usize] => Err(alloc::format!("port {} is held by a vm that runs", p)),
-            None => Ok(p),
-        },
-        None => used.iter().position(|u| !u).map(|p| p as u32)
-            .ok_or_else(|| alloc::format!("every one of the switch's {} ports is some vm's", net::MAX_PORTS)),
-    }
-}
-
 /// What of the image is data: its runs, as its filesystem has them.
 fn data_of(image: &Image, path: &str, work: &dyn Work) -> Result<u64, String> {
     let size = image.size().map_err(|e| alloc::format!("{}: {}", path, e))?;
@@ -195,9 +157,9 @@ pub fn clone(root: &str, vms: &Vms, from: &str, to: &str, port: Option<u32>, wor
     }
     /* Both names held while it runs: the source started -- its disks
      * written -- or deleted meanwhile, and the new name made twice, are
-     * refused. */
-    let _from = vms.reserve(from, "cloned")?;
-    let _to = vms.reserve(to, "made")?;
+     * refused. The port it is given goes with the new name's hold. */
+    let _from = vms.reserve(from, crate::vms::CLONED)?;
+    let held = vms.reserve(to, crate::vms::MADE)?;
     let (text, was) = store::load_text(&source)?;
     let o = store::options(&source, &was)?;
     /* A device is the VM's own: a clone would have two VMs on it -- or,
@@ -250,9 +212,12 @@ pub fn clone(root: &str, vms: &Vms, from: &str, to: &str, port: Option<u32>, wor
     }
     drop(copy);
     c.options.uuid = Some(guest::random_uuid());
+    /* A port no other VM's -- by its vm.toml, as it runs, or given to one
+     * being made or cloned meanwhile -- kept with the hold until its vm.toml
+     * says so: two clones at once were given one. */
     c.options.port = match (was.options.port, port) {
         (None, None) => None,
-        (_, asked) => Some(port_for(root, vms, asked)?),
+        (_, asked) => Some(store::take_port(root, vms, &held, asked)?),
     };
     c.options.forwards.clear();
     c.options.cmdline = c.options.cmdline.as_deref().map(crate::config::without_ip);
@@ -266,12 +231,19 @@ pub fn clone(root: &str, vms: &Vms, from: &str, to: &str, port: Option<u32>, wor
     let user_path = store::join(&source.path, cloud::USER_DATA).ok_or_else(oom)?;
     let user = match kcore::fs::read(&user_path, MAX_USER_DATA) {
         Ok(bytes) => Some(String::from_utf8(bytes).map_err(|_| alloc::format!("{} is not UTF-8 text", user_path))?),
-        Err(_) if seed => {
+        Err(kcore::error::Error::NotFound) if seed => {
             let _ = writeln!(work, "hv: {} has no user-data kept -- {}'s seed gives the keys nos's sshd lets in, and \
                                     no password", from, to);
             Some(cloud::user_data(&cloud::keys(), None))
         }
-        Err(_) => None,
+        Err(kcore::error::Error::NotFound) => None,
+        /* There, and not read: what its source was given is not known, and
+         * the clone is not given the default keys in its place. */
+        Err(kcore::error::Error::InvalidValue) => {
+            return Err(alloc::format!("{} is more than the {} bytes a vm's user-data may be", user_path,
+                                      MAX_USER_DATA));
+        }
+        Err(e) => return Err(alloc::format!("{} could not be read -- {}", user_path, e)),
     };
     let seed_image = match (&user, seed) {
         (Some(u), true) => Some(cloud::seed(to, u)?),
@@ -299,38 +271,73 @@ pub fn clone(root: &str, vms: &Vms, from: &str, to: &str, port: Option<u32>, wor
     let mut made = Made::new();
     store::make_dirs(&target.path).map_err(|_| alloc::format!("{} could not be made", target.path))?;
     made.folder = Some(target.path.clone());
-    let mut copied = Vec::new();
-    let mut buf = Vec::new();
-    buf.try_reserve_exact(CHUNK).map_err(|_| oom())?;
-    buf.resize(CHUNK, 0);
-    let started = kcore::time::boot_time_ns();
-    let mut progress = Progress { done: 0, total: data, started, reported: started };
-    for each in &copies {
-        let _ = writeln!(work, "hv: {} -- {} MiB, {} MiB of it data -- into {}", each.from, each.size.div_ceil(MIB),
-                         each.data.div_ceil(MIB), each.to);
-        kcore::fs::create(&each.to, &[]).map_err(|e| alloc::format!("{} could not be made -- {}", each.to, e))?;
-        made.files.push(each.to.clone());
-        let written = copy_file(each, &mut buf, &mut progress, work)?;
-        copied.push((each.to.clone(), each.size, written));
+    let fill = Fill { target: &target, copies: &copies, data, user: user.as_deref(), seed: seed_image.as_deref(),
+                      config: &config };
+    match fill.write(&mut made, work) {
+        Ok((copied, file)) => {
+            made.keep();
+            Ok(Cloned { file, copied, port: c.options.port, seed: seed_image.is_some() })
+        }
+        /* What it made taken away -- and what could not be, said with why
+         * it failed: a folder left with a file in it is a name nothing
+         * else takes. */
+        Err(e) => Err(made.undone(e)),
     }
-    if let Some(u) = &user {
-        let path = store::join(&target.path, cloud::USER_DATA).ok_or_else(oom)?;
-        kcore::fs::create(&path, u.as_bytes()).map_err(|e| alloc::format!("{} could not be written -- {}", path, e))?;
-        made.files.push(path);
+}
+
+/// What a clone's folder is filled with, once it is made: the files
+/// copied, `data` bytes of them read, the user-data and the seed, and its
+/// vm.toml.
+struct Fill<'a> {
+    target: &'a Folder,
+    copies: &'a [Copy],
+    data: u64,
+    user: Option<&'a str>,
+    seed: Option<&'a [u8]>,
+    config: &'a str,
+}
+
+impl Fill<'_> {
+    /// Each file written, in order -- the copies, the user-data, the seed and
+    /// last the vm.toml -- and kept in `made` once its create says it made
+    /// it: what was copied, and the vm.toml's path.
+    fn write(&self, made: &mut Made, work: &mut dyn Work) -> Result<(Vec<(String, u64, u64)>, String), String> {
+        let oom = || String::from("out of memory");
+        let mut copied = Vec::new();
+        copied.try_reserve_exact(self.copies.len()).map_err(|_| oom())?;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(CHUNK).map_err(|_| oom())?;
+        buf.resize(CHUNK, 0);
+        let started = kcore::time::boot_time_ns();
+        let mut progress = Progress { done: 0, total: self.data, started, reported: started };
+        for each in self.copies {
+            let _ = writeln!(work, "hv: {} -- {} MiB, {} MiB of it data -- into {}", each.from,
+                             each.size.div_ceil(MIB), each.data.div_ceil(MIB), each.to);
+            kcore::fs::create(&each.to, &[]).map_err(|e| alloc::format!("{} could not be made -- {}", each.to, e))?;
+            made.files.push(each.to.clone());
+            let written = copy_file(each, &mut buf, &mut progress, work)?;
+            copied.push((each.to.clone(), each.size, written));
+        }
+        if let Some(u) = self.user {
+            let path = store::join(&self.target.path, cloud::USER_DATA).ok_or_else(oom)?;
+            kcore::fs::create(&path, u.as_bytes())
+                .map_err(|e| alloc::format!("{} could not be written -- {}", path, e))?;
+            made.files.push(path);
+        }
+        if let Some(image) = self.seed {
+            let path = store::join(&self.target.path, cloud::SEED).ok_or_else(oom)?;
+            kcore::fs::create(&path, image).map_err(|e| alloc::format!("{} could not be written -- {}", path, e))?;
+            made.files.push(path);
+        }
+        let file = store::join(&self.target.path, store::CONFIG).ok_or_else(oom)?;
+        kcore::fs::create(&file, self.config.as_bytes())
+            .map_err(|e| alloc::format!("{} could not be written -- {}", file, e))?;
+        made.files.push(file.clone());
+        if work.cancelled() {
+            return Err(String::from(work::STOPPED));
+        }
+        Ok((copied, file))
     }
-    if let Some(image) = &seed_image {
-        let path = store::join(&target.path, cloud::SEED).ok_or_else(oom)?;
-        kcore::fs::create(&path, image).map_err(|e| alloc::format!("{} could not be written -- {}", path, e))?;
-        made.files.push(path);
-    }
-    let file = store::join(&target.path, store::CONFIG).ok_or_else(oom)?;
-    kcore::fs::create(&file, config.as_bytes()).map_err(|e| alloc::format!("{} could not be written -- {}", file, e))?;
-    made.files.push(file.clone());
-    if work.cancelled() {
-        return Err(String::from(work::STOPPED));
-    }
-    made.keep();
-    Ok(Cloned { file, copied, port: c.options.port, seed: seed_image.is_some() })
 }
 
 /// How far the copy has got, over every file: what of the data has been
