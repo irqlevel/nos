@@ -607,6 +607,59 @@ pub fn parse_env(text: &str) -> Vec<(String, String)> {
     vars
 }
 
+/// The signature GRUB's environment block begins with.
+const ENV_SIGNATURE: &[u8] = b"# GRUB Environment Block\n";
+
+/// GRUB's environment block -- `text`, the file as it was read -- as its
+/// `save_env` leaves it with `name` set empty: the same length, the
+/// variable's line made `name=`, every other line as it was, the block
+/// padded with `#` to its length again. None for what is not a block GRUB
+/// wrote, or has no `name` in it. A line ends at a newline that is not
+/// escaped: GRUB writes a backslash before a newline in a value.
+pub fn env_without(text: &[u8], name: &str) -> Option<Vec<u8>> {
+    let body = text.strip_prefix(ENV_SIGNATURE)?;
+    let mut out = Vec::with_capacity(text.len());
+    out.extend_from_slice(ENV_SIGNATURE);
+    let mut found = false;
+    let mut at = 0usize;
+    while at < body.len() {
+        /* The line from `at`: to its unescaped newline, or the end */
+        let mut end = at;
+        while end < body.len() && body[end] != b'\n' {
+            end += if body[end] == b'\\' { 2 } else { 1 };
+        }
+        let end = (end + 1).min(body.len());
+        let line = &body[at..end];
+        at = end;
+        if line.starts_with(b"#") {
+            /* The padding: made again below */
+            continue;
+        }
+        if line.strip_prefix(name.as_bytes()).is_some_and(|rest| rest.starts_with(b"=")) {
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(b"=\n");
+            found = true;
+        } else {
+            out.extend_from_slice(line);
+        }
+    }
+    if !found || out.len() > text.len() {
+        return None;
+    }
+    out.resize(text.len(), b'#');
+    /* Every other variable as it was, and this one empty: what is written
+     * is held to that, not trusted to the scan above. */
+    let read = |b: &[u8]| parse_env(&String::from_utf8_lossy(b));
+    let mut was = read(text);
+    let mut now = read(&out);
+    was.retain(|(n, _)| n != name);
+    if now.iter().any(|(n, v)| n == name && !v.is_empty()) {
+        return None;
+    }
+    now.retain(|(n, _)| n != name);
+    (was == now).then_some(out)
+}
+
 fn env_get<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
     env.iter().rev().find(|(n, _)| n == name).map(|(_, v)| v.as_str()).filter(|v| !v.is_empty())
 }
@@ -638,13 +691,16 @@ fn find<'a>(items: &'a [Item], spec: &str) -> Option<&'a Entry> {
 }
 
 /// The entry GRUB would boot -- or the one `wanted` names, from
-/// `hvboot.entry=` -- and why that one.
+/// `hvboot.entry=` -- why that one, and whether it is grubenv's
+/// `next_entry`, which the script grub-mkconfig writes empties before it
+/// boots it (`set next_entry=` and `save_env next_entry`): the caller's to
+/// clear (`env_without`), or `grub-reboot`'s entry is booted for good.
 pub fn choose<'a>(cfg: &'a Config, env: &[(String, String)], wanted: Option<&str>)
-    -> Result<(&'a Entry, String), String>
+    -> Result<(&'a Entry, String, bool), String>
 {
     if let Some(w) = wanted {
         return match find(&cfg.items, w) {
-            Some(e) => Ok((e, alloc::format!("hvboot.entry={}", w))),
+            Some(e) => Ok((e, alloc::format!("hvboot.entry={}", w), false)),
             None => Err(alloc::format!("hvboot.entry={}: no such entry in grub.cfg", w)),
         };
     }
@@ -652,7 +708,7 @@ pub fn choose<'a>(cfg: &'a Config, env: &[(String, String)], wanted: Option<&str
     if cfg.next {
         if let Some(n) = env_get(env, "next_entry") {
             if let Some(e) = find(&cfg.items, n) {
-                return Ok((e, alloc::format!("grubenv's next_entry, {}", n)));
+                return Ok((e, alloc::format!("grubenv's next_entry, {}", n), true));
             }
             tried.push(alloc::format!("next_entry {}", n));
         }
@@ -660,20 +716,20 @@ pub fn choose<'a>(cfg: &'a Config, env: &[(String, String)], wanted: Option<&str
     if cfg.saved {
         if let Some(n) = env_get(env, "saved_entry") {
             if let Some(e) = find(&cfg.items, n) {
-                return Ok((e, alloc::format!("grubenv's saved_entry, {}", n)));
+                return Ok((e, alloc::format!("grubenv's saved_entry, {}", n), false));
             }
             tried.push(alloc::format!("saved_entry {}", n));
         }
     }
     if let Some(d) = &cfg.default {
         if let Some(e) = find(&cfg.items, d) {
-            return Ok((e, alloc::format!("the default, {}", d)));
+            return Ok((e, alloc::format!("the default, {}", d), false));
         }
         tried.push(alloc::format!("default {}", d));
     }
     match find(&cfg.items, "0") {
-        Some(e) if tried.is_empty() => Ok((e, String::from("the first entry"))),
-        Some(e) => Ok((e, alloc::format!("the first entry, no entry being {}", tried.join(" or ")))),
+        Some(e) if tried.is_empty() => Ok((e, String::from("the first entry"), false)),
+        Some(e) => Ok((e, alloc::format!("the first entry, no entry being {}", tried.join(" or ")), false)),
         None => Err(String::from("grub.cfg has no menu entry")),
     }
 }

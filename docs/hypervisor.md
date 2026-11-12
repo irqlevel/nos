@@ -3571,11 +3571,14 @@ the guest. It reads:
 - the guest's legacy virtio disks on PCI bus 0, a request at a time with
   the interrupt never taken: each poll reads the ISR, a port, and the exit
   that takes is where hv hands back what is done -- a request not answered
-  in 30 s is said, not waited on (`virtio.rs`);
+  in 30 s is said, not waited on, and its disk reset and given up: the
+  device still held the chain, whose buffers the loader had given to
+  something else since, and the next request's slot and index were the
+  same, so a late answer was taken for that one's (`virtio.rs`);
 - each disk's partitions, from its GPT -- header and array each checked by
   their CRC -- or an MBR, an XBOOTLDR partition (a /boot of its own, as
   Ubuntu's) first, and a disk with no table looked at whole (`gpt.rs`);
-- ext2, ext3 and ext4, read-only: extents and block maps, 64-bit
+- ext2, ext3 and ext4, read-only but for grubenv's block (below): extents and block maps, 64-bit
   descriptors, flex_bg, htree directories read as the linear ones they
   also are, inline data, symlinks, holes; an incompatible feature it does
   not read is refused by name, and the journal is not replayed, as GRUB
@@ -3586,6 +3589,12 @@ the guest. It reads:
   `initrd` and the `search` or `set root` naming its filesystem -- by UUID,
   label, file or `hdN,gptM` -- and the default, grubenv's `next_entry` and
   `saved_entry` where the script defers to them, as grub-mkconfig's does.
+  A `next_entry` it boots it empties on the disk first, as that script's
+  `save_env` does -- grubenv's block rewritten in place, every other
+  variable as it was, and only after the bytes there are found to be the
+  ones it read, nor where the journal is not replayed: the one write hvboot
+  makes. `grub-reboot`'s entry is booted once, as under GRUB, and a disk
+  that cannot be written says that the entry will be taken again.
   It is not GRUB's interpreter: it reads the script's words as GRUB does --
   quotes, escapes, comments, variables -- and its blocks, but runs no
   condition; every branch of an `if` is read, the last `search` and `linux`
