@@ -8,6 +8,7 @@
 use alloc::string::String;
 use core::sync::atomic::{fence, Ordering};
 
+use crate::disk::{Device, SECTOR};
 use crate::io::{inb, inl, inw, outb, outl, outw, rdtsc};
 
 /* The legacy register block, in the I/O BAR. */
@@ -51,7 +52,6 @@ const MAX_QUEUE: u16 = 256;
 
 /// A request's header: type, reserved, sector.
 const HEADER_BYTES: usize = 16;
-pub const SECTOR: u64 = 512;
 /// The most data descriptors a request carries, whatever the device
 /// allows, and the bytes each, when it says no limit.
 const MAX_SEGMENTS: u32 = 64;
@@ -183,20 +183,6 @@ impl Disk {
         self.write16(at + 14, next);
     }
 
-    /// Read `buf.len()` bytes -- whole sectors -- from `sector` on.
-    pub fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), String> {
-        self.transfer(T_IN, sector, buf.as_mut_ptr() as u64, buf.len())
-    }
-
-    /// Write `buf` -- whole sectors -- at `sector`: refused for a disk its
-    /// device says is read-only. grubenv's, as GRUB writes it.
-    pub fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), String> {
-        if self.read_only {
-            return Err(alloc::format!("vd{}: read-only", self.letter));
-        }
-        self.transfer(T_OUT, sector, buf.as_ptr() as u64, buf.len())
-    }
-
     /// `len` bytes at `addr` -- a buffer the caller holds for the call --
     /// read into from `sector` on, or written there: in requests of as
     /// many segments as the device takes.
@@ -281,8 +267,12 @@ impl Disk {
                  * goes back to its owner; and given up for good. */
                 self.reset();
                 self.given_up = true;
-                return Err(alloc::format!("vd{}: no answer to a {} of {} bytes at sector {} in {} s -- reset, and \
-                                           nothing more asked of it", self.letter, what, len, sector, TIMEOUT_SECS));
+                let waited = match limit {
+                    Some(_) => alloc::format!("{} s", TIMEOUT_SECS),
+                    None => alloc::format!("{} polls, the TSC's rate not given", POLL_LIMIT),
+                };
+                return Err(alloc::format!("vd{}: no answer to a {} of {} bytes at sector {} in {} -- reset, and \
+                                           nothing more asked of it", self.letter, what, len, sector, waited));
             }
             core::hint::spin_loop();
         }
@@ -302,5 +292,24 @@ impl Disk {
     /// and no write of its can reach memory the kernel has by then.
     pub fn reset(&self) {
         outb(self.io + STATUS, 0);
+    }
+}
+
+impl Device for Disk {
+    fn sectors(&self) -> u64 {
+        self.sectors
+    }
+
+    fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), String> {
+        self.transfer(T_IN, sector, buf.as_mut_ptr() as u64, buf.len())
+    }
+
+    /// Refused for a disk its device says is read-only. grubenv's, as GRUB
+    /// writes it.
+    fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), String> {
+        if self.read_only {
+            return Err(alloc::format!("vd{}: read-only", self.letter));
+        }
+        self.transfer(T_OUT, sector, buf.as_ptr() as u64, buf.len())
     }
 }

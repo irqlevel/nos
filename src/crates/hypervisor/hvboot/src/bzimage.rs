@@ -7,7 +7,7 @@
 
 use alloc::string::String;
 
-use crate::start::MemEntry;
+use crate::ram::MemEntry;
 
 /* Offsets into the setup header / boot_params, which share a layout from
  * 0x1f1 on. */
@@ -86,7 +86,8 @@ impl Header {
         }
         let version = u16_at(first, HDR_VERSION);
         if version < MIN_VERSION {
-            return Err(alloc::format!("boot protocol {:#x}, older than 2.05", version));
+            return Err(alloc::format!("boot protocol {}.{:02}, older than {}.{:02}", version >> 8, version & 0xFF,
+                                      MIN_VERSION >> 8, MIN_VERSION & 0xFF));
         }
         if u16_at(first, HDR_XLOADFLAGS) & XLF_KERNEL_64 == 0 {
             return Err(String::from("a kernel with no 64-bit entry"));
