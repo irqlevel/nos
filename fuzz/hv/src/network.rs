@@ -244,6 +244,14 @@ pub mod net {
         pub outer: usize,
     }
 
+    /// What `kernel_net_nat_enable` answers in its `code`: ffi's numbers,
+    /// which the net crate's export reads from `ffi::net` (here, this).
+    pub const NAT_ON: i32 = 0;
+    pub const NAT_NO_UPLINK: i32 = 1;
+    pub const NAT_DEVICES: i32 = 2;
+    pub const NAT_BUSY: i32 = 3;
+    pub const NAT_NO_MEMORY: i32 = 4;
+
     #[derive(Clone, Copy)]
     pub struct Nic {
         handle: usize,
@@ -270,7 +278,7 @@ pub mod net {
             crate::device::DEVICES.by_handle(self.handle).map_or(0, |d| d.ip())
         }
         pub fn nat(&self) -> core::result::Result<Nat, NatError> {
-            let on = crate::nat::kernel_net_nat_enable(self.handle);
+            let on = crate::nat::kernel_net_nat_enable(0, self.handle);
             match on.code {
                 0 => Ok(Nat { inner: self.handle, outer: Nic { handle: on.outer } }),
                 1 => Err(NatError::NoUplink),

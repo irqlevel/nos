@@ -88,7 +88,7 @@ impl TcpListener {
         }
         let list = nets_of(nets);
         /* `list` holds `nets.len()` TcpNets */
-        let conn = unsafe { tcp::kernel_tcp_listen_allowed(nic.handle(), port, backlog, bulk, list.as_ptr(),
+        let conn = unsafe { tcp::kernel_tcp_listen_allowed(crate::owner::here(), nic.handle(), port, backlog, bulk, list.as_ptr(),
                                                            nets.len()) };
         if conn == 0 {
             Err(Error::Busy)
@@ -118,7 +118,7 @@ impl TcpListener {
         if port == 0 {
             return Err(Error::InvalidValue);
         }
-        let conn = tcp::kernel_tcp_listen(nic.handle(), port, backlog, bulk);
+        let conn = tcp::kernel_tcp_listen(crate::owner::here(), nic.handle(), port, backlog, bulk);
         if conn == 0 {
             Err(Error::Busy)
         } else {
@@ -190,7 +190,7 @@ impl TcpStream {
     /// An active open to `ip`:`port` (host byte order) through `nic`, from an
     /// ephemeral port: None when nothing answered in time. Sleeps.
     pub fn connect(nic: &Nic, ip: u32, port: u16) -> Option<TcpStream> {
-        let conn = tcp::kernel_tcp_connect(nic.handle(), ip, port);
+        let conn = tcp::kernel_tcp_connect(crate::owner::here(), nic.handle(), ip, port);
         if conn == 0 { None } else { Some(TcpStream { conn }) }
     }
 
@@ -200,7 +200,7 @@ impl TcpStream {
     /// some 27 MB/s at a data centre's 0.3 ms round trip. The slot's own 8
     /// KiB where the heap has none to give.
     pub fn connect_bulk(nic: &Nic, ip: u32, port: u16) -> Option<TcpStream> {
-        let conn = tcp::kernel_tcp_connect_bulk(nic.handle(), ip, port);
+        let conn = tcp::kernel_tcp_connect_bulk(crate::owner::here(), nic.handle(), ip, port);
         if conn == 0 { None } else { Some(TcpStream { conn }) }
     }
 

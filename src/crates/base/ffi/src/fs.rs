@@ -46,7 +46,9 @@ unsafe extern "C" {
 unsafe extern "C" {
     /// Opens a regular file for reading, and with `write` not 0 for writing
     /// too: its handle, or 0.
-    pub fn kernel_file_open(path: *const u8, path_len: usize, write: i32) -> usize;
+    /// `owner` is an address in the opener's code: a file a module leaves
+    /// open is closed as it goes.
+    pub fn kernel_file_open(owner: usize, path: *const u8, path_len: usize, write: i32) -> usize;
     /// Closes it; a word that is no open file's is nothing to close.
     pub safe fn kernel_file_close(file: usize);
     /// Its size in bytes, or -1.
@@ -92,7 +94,9 @@ pub const IMAGE_QUEUE_MAX: usize = 256;
 unsafe extern "C" {
     /// Holds a regular file as an image, for reading, and with `write` not
     /// 0 for writing too: the image, or 0.
-    pub fn kernel_image_open(path: *const u8, path_len: usize, write: i32) -> usize;
+    /// `owner`, as kernel_file_open's: an image a module leaves open is
+    /// closed as it goes.
+    pub fn kernel_image_open(owner: usize, path: *const u8, path_len: usize, write: i32) -> usize;
     /// Lets go of it -- its queue's buffers with it; a word that is no
     /// image's is nothing to close. Not a `safe fn`: the caller is the
     /// image's one owner and holds no slice of its queue's buffers.

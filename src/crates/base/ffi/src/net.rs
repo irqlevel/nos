@@ -111,7 +111,7 @@ unsafe extern "C" {
 unsafe extern "C" {
     /// NAT on, from the device `inner` names -- a kernel_net_find handle.
     /// Task context: it allocates its table.
-    pub safe fn kernel_net_nat_enable(inner: usize) -> NatOn;
+    pub safe fn kernel_net_nat_enable(owner: usize, inner: usize) -> NatOn;
     /// NAT off, if it is on for the device `inner` names: 1 when it was.
     pub safe fn kernel_net_nat_disable(inner: usize) -> i32;
     /// Every mapping of the guest at `ip` (host byte order) behind the

@@ -8,9 +8,10 @@
    and its generation, looked up on every call, so one that is no event's is
    nothing: every call is sound for any handle. */
 unsafe extern "C" {
-    /// An event, held for its handle until kernel_shared_event_close: the
-    /// handle, or 0 when there is no memory or every slot is taken.
-    pub safe fn kernel_shared_event_open() -> u64;
+    /// An event, held for its handle until kernel_shared_event_close -- or
+    /// until the module whose code `owner` is in goes: the handle, or 0
+    /// when there is no memory or every slot is taken.
+    pub safe fn kernel_shared_event_open(owner: usize) -> u64;
 
     /// The handle let go of: the event goes once nothing made on it holds it
     /// either. Task context.

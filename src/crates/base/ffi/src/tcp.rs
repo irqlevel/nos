@@ -25,15 +25,15 @@ unsafe extern "C" {
    returns null once timeout_ms (0: forever) passes with nobody, or once the
    listener is closed. */
 unsafe extern "C" {
-    pub safe fn kernel_tcp_listen(dev: usize, port: u16, backlog: usize, bulk: bool) -> usize;
+    pub safe fn kernel_tcp_listen(owner: usize, dev: usize, port: u16, backlog: usize, bulk: bool) -> usize;
     /// An active open to ip:port (host byte order) through the device, from
     /// an ephemeral port: null when nothing answered in time. Sleeps.
-    pub safe fn kernel_tcp_connect(dev: usize, ip: u32, port: u16) -> usize;
+    pub safe fn kernel_tcp_connect(owner: usize, dev: usize, ip: u32, port: u16) -> usize;
     /// `kernel_tcp_connect`, with bulk buffers both ways -- up to 512 KiB
     /// each, from the heap, the window scaled when the peer offers to: a
     /// connection that sends as much as it takes in. Each the slot's own
     /// 8 KiB when the heap has none to give.
-    pub safe fn kernel_tcp_connect_bulk(dev: usize, ip: u32, port: u16) -> usize;
+    pub safe fn kernel_tcp_connect_bulk(owner: usize, dev: usize, ip: u32, port: u16) -> usize;
     pub safe fn kernel_tcp_accept(listener: usize, timeout_ms: u64) -> usize;
     pub safe fn kernel_tcp_close(conn: usize);
     /// A RST instead of the FIN exchange: the slot comes back at once, not
@@ -55,7 +55,7 @@ unsafe extern "C" {
     /// backlog and before a slot, with no SYN-ACK and no reset. Null for more
     /// than 64 networks or a prefix past 32, and for what kernel_tcp_listen
     /// refuses.
-    pub fn kernel_tcp_listen_allowed(dev: usize, port: u16, backlog: usize, bulk: bool, nets: *const TcpNet,
+    pub fn kernel_tcp_listen_allowed(owner: usize, dev: usize, port: u16, backlog: usize, bulk: bool, nets: *const TcpNet,
                                      count: usize) -> usize;
     /// A listener's allowlist changed: the `count` networks at `nets` from
     /// now on -- anyone, with `any`. What it holds already stays. 0 done,

@@ -87,7 +87,7 @@ impl File {
     /// writing too. NotFound when there is none, or it cannot be opened so
     /// (a directory, a read-only mount).
     pub fn open(path: &str, write: bool) -> Result<File> {
-        let handle = unsafe { fs::kernel_file_open(path.as_ptr(), path.len(), i32::from(write)) };
+        let handle = unsafe { fs::kernel_file_open(crate::owner::here(), path.as_ptr(), path.len(), i32::from(write)) };
         if handle == 0 {
             return Err(Error::NotFound);
         }
@@ -167,7 +167,7 @@ impl Image {
     /// directory, a read-only mount, someone else writing it or holding it
     /// for writing, no memory.
     pub fn open(path: &str, write: bool) -> Result<Image> {
-        let handle = unsafe { fs::kernel_image_open(path.as_ptr(), path.len(), i32::from(write)) };
+        let handle = unsafe { fs::kernel_image_open(crate::owner::here(), path.as_ptr(), path.len(), i32::from(write)) };
         if handle == 0 {
             return Err(Error::NotFound);
         }

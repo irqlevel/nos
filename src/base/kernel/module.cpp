@@ -42,6 +42,13 @@ void rust_mgmt_drain_range(ulong lo, ulong hi, int take);
    and a virtual NIC's sink in [lo, hi), left registered by its exit, taken
    off -- each said, as the module's bug */
 void rust_net_close_range(ulong lo, ulong hi, const char* name, ulong len);
+/* What a module opened through the kernel's C ABI and left open, by the
+   module's name: its events, its device claims and queues, its disks'
+   images and files (base/events, layers/block, layers/fs) -- the TCP side
+   and NAT go with rust_net_close_range */
+void rust_events_module_gone(const char* name, ulong len);
+void rust_block_module_gone(const char* name, ulong len);
+void rust_fs_module_gone(const char* name, ulong len);
 }
 
 namespace kernel
@@ -1181,7 +1188,10 @@ void ModuleTable::remove(LoadedModule* module)
       listener and a virtual NIC's sink it left taken off (rust_net_close_range);
       a timer it left running stopped and an interrupt handler it left
       registered taken off (sweep_module_slots); a task it left running
-      asked to stop and waited for (sweep_module_tasks);
+      asked to stop and waited for (sweep_module_tasks); and what it opened
+      and left open -- a TCP listener or connection and NAT
+      (rust_net_close_range), a device queue and a claim, an image and a
+      file, an event -- closed (rust_*_module_gone);
    and then it is off the list and its code freed -- or, with a task of it
    still running, kept and said, as freed it would be run in. An init that
    failed has no instance: steps 2 and 4 are not its. */
@@ -1214,6 +1224,12 @@ void ModuleTable::take_down(LoadedModule* module, bool live)
     rust_net_close_range(lo, hi, module->name, len);
     sweep_module_slots(lo, hi, module->name);
     const bool tasks_gone = sweep_module_tasks(lo, hi, module->name);
+    /* After its tasks: none of them is mid-call on what these close. The
+       queues and images first, which wait for their devices, then what was
+       made on them (an event) */
+    rust_fs_module_gone(module->name, len);
+    rust_block_module_gone(module->name, len);
+    rust_events_module_gone(module->name, len);
 
     remove(module);
     if (tasks_gone)

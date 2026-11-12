@@ -1615,4 +1615,14 @@ pub unsafe extern "C" fn rust_net_close_range(lo: usize, hi: usize, name: *const
         }
     }
     crate::vnic::detach_range(lo, hi, name);
+
+    /* What the module was handed by name rather than by its code: its TCP
+     * listeners and connections, and NAT */
+    let tcp = crate::abi::close_owned_by(name.as_bytes());
+    if tcp != 0 {
+        klog!(0, "module: {} left {} TCP listener(s) or connection(s) open: closed", name, tcp);
+    }
+    if crate::nat::disable_owned_in(lo, hi) {
+        klog!(0, "module: {} left NAT on: turned off", name);
+    }
 }

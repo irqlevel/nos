@@ -2518,16 +2518,16 @@ pub fn nat_target(r: &mut Input) {
                      * table, every mapping gone. */
                     invariant!(nat::kernel_net_nat_disable(HV0.handle()) == 1, "NAT was not on");
                     invariant!(nat::kernel_net_nat_disable(HV0.handle()) == 0, "NAT off twice");
-                    let on = nat::kernel_net_nat_enable(HV0.handle());
+                    let on = nat::kernel_net_nat_enable(0, HV0.handle());
                     invariant!(on.code == 0 && on.outer == ETH0.handle(), "NAT back on: {:?}", on);
                     m.fresh();
                 }
                 4 => {
                     /* A device NAT cannot take -- none, hv0 as its own way
                      * out -- NAT on while it is, and `nat` while it is off. */
-                    invariant!(nat::kernel_net_nat_enable(0).code == 2, "NAT on for no device");
+                    invariant!(nat::kernel_net_nat_enable(0, 0).code == 2, "NAT on for no device");
                     invariant!(nat.enable(&HV0, Some(&HV0)).is_err(), "NAT through hv0 itself");
-                    invariant!(nat::kernel_net_nat_enable(HV0.handle()).code == 3, "NAT on twice");
+                    invariant!(nat::kernel_net_nat_enable(0, HV0.handle()).code == 3, "NAT on twice");
                     if r.bool() {
                         nat::kernel_net_nat_disable(HV0.handle());
                         let mut out = crate::cmd::Output::default();
@@ -2535,9 +2535,9 @@ pub fn nat_target(r: &mut Input) {
                         invariant!(out.0.starts_with("nat: off"), "nat said {:?} when off", out.0.lines().next());
                         let gw = ETH0.gw();
                         ETH0.set(ETH0_MAC, ETH0.ip(), ETH0.mask(), 0);
-                        invariant!(nat::kernel_net_nat_enable(HV0.handle()).code == 1, "NAT on with no uplink");
+                        invariant!(nat::kernel_net_nat_enable(0, HV0.handle()).code == 1, "NAT on with no uplink");
                         ETH0.set(ETH0_MAC, ETH0.ip(), ETH0.mask(), gw);
-                        invariant!(nat::kernel_net_nat_enable(HV0.handle()).code == 0, "NAT back on");
+                        invariant!(nat::kernel_net_nat_enable(0, HV0.handle()).code == 0, "NAT back on");
                         m.fresh();
                     }
                 }

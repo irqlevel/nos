@@ -295,6 +295,22 @@ extern "C" void rust_net_close_range(ulong, ulong, const char*, ulong)
     fuzz::host_hal_unreachable("rust_net_close_range");
 }
 
+/* Nor the other layers' of what a module opened and left open */
+extern "C" void rust_events_module_gone(const char*, ulong)
+{
+    fuzz::host_hal_unreachable("rust_events_module_gone");
+}
+
+extern "C" void rust_block_module_gone(const char*, ulong)
+{
+    fuzz::host_hal_unreachable("rust_block_module_gone");
+}
+
+extern "C" void rust_fs_module_gone(const char*, ulong)
+{
+    fuzz::host_hal_unreachable("rust_fs_module_gone");
+}
+
 void kernel::Cmd::close_range(ulong, ulong)
 {
     fuzz::host_hal_unreachable("Cmd::close_range");

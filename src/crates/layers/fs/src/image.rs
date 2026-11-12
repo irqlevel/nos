@@ -68,6 +68,7 @@
 //! may be made on a task's event, which its completions and wakes then
 //! signal too (`block::queue::Queue`, plans/ipc.md I2).
 
+use kcore::owner::Owner;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -2146,6 +2147,8 @@ const MAX_IMAGES: usize = 128;
 struct Slot {
     generation: u32,
     image: Option<Image>,
+    /// The module whose code opened it: what `close_owned_by` closes by.
+    owner: Owner,
 }
 
 static IMAGES: OnceBox<Vec<Mutex<Slot>>> = OnceBox::new();
@@ -2155,7 +2158,7 @@ fn images() -> Option<&'static [Mutex<Slot>]> {
         let mut slots = Vec::new();
         slots.try_reserve_exact(MAX_IMAGES).ok()?;
         for _ in 0..MAX_IMAGES {
-            slots.push(Mutex::new(Slot { generation: 0, image: None })?);
+            slots.push(Mutex::new(Slot { generation: 0, image: None, owner: Owner::IMAGE })?);
         }
         Some(Box::new(slots))
     });
@@ -2211,7 +2214,8 @@ fn with<R>(image: usize, work: impl FnOnce(&mut Image) -> R) -> Option<R> {
 /// # Safety
 /// `path` points at `path_len` readable bytes.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_image_open(path: *const u8, path_len: usize, write: i32) -> usize {
+pub unsafe extern "C" fn kernel_image_open(owner: usize, path: *const u8, path_len: usize, write: i32) -> usize {
+    let owner = Owner::at(owner);
     let (Some(vfs), Some(path), Some(table)) =
         (crate::vfs_instance(), unsafe { crate::path(path, path_len) }, images())
     else {
@@ -2225,6 +2229,7 @@ pub unsafe extern "C" fn kernel_image_open(path: *const u8, path_len: usize, wri
         let mut slot = slot.lock();
         if slot.image.is_none() {
             slot.image = image.take();
+            slot.owner = owner;
             return word(index, slot.generation);
         }
     }
@@ -2232,6 +2237,30 @@ pub unsafe extern "C" fn kernel_image_open(path: *const u8, path_len: usize, wri
     /* Closed as it goes, with no slot's lock held. */
     drop(image);
     0
+}
+
+/// The images the module called `name` opened and never closed, closed --
+/// each as its close does, off its slot's lock: how many.
+pub(crate) fn close_owned_by(name: &[u8]) -> usize {
+    let Some(table) = images() else { return 0 };
+    let mut closed = 0;
+    for (at, slot) in table.iter().enumerate() {
+        let taken = {
+            let mut slot = slot.lock();
+            if slot.image.is_none() || !slot.owner.is_module(name) {
+                continue;
+            }
+            WAITS[at].store(0, Ordering::Release);
+            slot.owner = Owner::IMAGE;
+            let taken = slot.image.take();
+            /* The module's word names nothing from here on */
+            slot.generation = slot.generation.wrapping_add(1);
+            taken
+        };
+        drop(taken);
+        closed += 1;
+    }
+    closed
 }
 
 /// Lets go of the image; a word that is no image's is nothing to close.

@@ -37,6 +37,7 @@ use alloc::vec::Vec;
 use core::num::NonZeroUsize;
 
 use kcore::sync::{Mutex, MutexGuard};
+use kcore::owner::Owner;
 use kcore::klog;
 
 use crate::vnode::{Kind, NodeId, Tree, NAME_MAX};
@@ -477,6 +478,10 @@ struct OpenFile {
     node: NodeId,
     pos: usize,
     flags: usize,
+    /// Whose it is: the module that opened it through the file ABI, which
+    /// `Vfs::close_owned_by` closes it for as the module goes -- the image
+    /// for the image's own.
+    owner: Owner,
 }
 
 struct FileSlot {
@@ -527,6 +532,26 @@ impl Files {
         /* The handle names nothing from here on, whatever takes the slot. */
         slot.generation = slot.generation.wrapping_add(1);
         Some(file)
+    }
+
+    /// The handles of the files the module called `name` has open -- but its
+    /// disks' images, which their own table lets go of -- on the mount in
+    /// slot `mount_slot`.
+    fn owned_by(&self, mount_slot: usize, name: &[u8]) -> Vec<Handle> {
+        let mut handles = Vec::new();
+        for (index, slot) in self.slots.iter().enumerate() {
+            let Some(file) = &slot.file else { continue };
+            if !file.owner.is_module(name) || file.flags & OPEN_HOLD != 0 {
+                continue;
+            }
+            if handles.try_reserve(1).is_err() {
+                break;
+            }
+            if let Some(handle) = Handle::new(mount_slot, index, slot.generation) {
+                handles.push(handle);
+            }
+        }
+        handles
     }
 
     /// Every file abandoned: its mount is going, and a handle kept past the
@@ -1066,6 +1091,12 @@ impl Vfs {
     }
 
     pub fn open(&self, path: &[u8], flags: usize) -> Option<Handle> {
+        self.open_for(path, flags, Owner::IMAGE)
+    }
+
+    /// `open`, the file the module `owner` is's: closed for it as it goes
+    /// (`close_owned_by`). The file ABI's open.
+    pub fn open_for(&self, path: &[u8], flags: usize, owner: Owner) -> Option<Handle> {
         let mut flags = flags;
         if flags & OPEN_APPEND != 0 {
             flags |= OPEN_WRITE;
@@ -1136,7 +1167,7 @@ impl Vfs {
 
         let pos = if flags & OPEN_APPEND != 0 { size } else { 0 };
 
-        let handle = slot.files.add(slot.index, OpenFile { node, pos, flags })?;
+        let handle = slot.files.add(slot.index, OpenFile { node, pos, flags, owner })?;
 
         if let Some(found) = mount.fs.tree_mut().get_mut(node) {
             found.open_count += 1;
@@ -1160,6 +1191,21 @@ impl Vfs {
 
     pub fn close(&self, handle: Handle) {
         self.close_as(handle, false);
+    }
+
+    /// The files the module called `name` opened through the file ABI and
+    /// never closed, closed: how many. Each mount's handles are gathered
+    /// under its lock and closed after it, each close taking it again.
+    pub fn close_owned_by(&self, name: &[u8]) -> usize {
+        let mut closed = 0;
+        for index in 0..MAX_MOUNTS {
+            let handles = self.mounts[index].lock().files.owned_by(index, name);
+            for handle in handles {
+                self.close(handle);
+                closed += 1;
+            }
+        }
+        closed
     }
 
     /// Lets go of a file held as a disk's image: what its image does as it

@@ -321,12 +321,6 @@ pub enum CallError {
     Timeout,
 }
 
-/// An address in this module's own code: what the kernel knows the module
-/// by when a mailbox is made.
-fn here() -> usize {
-    here as fn() -> usize as usize
-}
-
 /// A mailbox of this module's: closed when dropped.
 pub struct Mailbox {
     addr: u64,
@@ -350,7 +344,7 @@ impl Mailbox {
     }
 
     fn open(limits: Limits, event: u64) -> Result<Mailbox, Error> {
-        let addr = ipc::kernel_ipc_open(here(), limits.messages, limits.bytes as u64, event);
+        let addr = ipc::kernel_ipc_open(crate::owner::here(), limits.messages, limits.bytes as u64, event);
         if addr == 0 {
             return Err(Error::Refused);
         }

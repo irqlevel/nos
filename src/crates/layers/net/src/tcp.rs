@@ -1872,6 +1872,12 @@ impl Tcp {
         Some(offset / size)
     }
 
+    /// A connection's slot in the pool: where the C ABI keeps whose it is
+    /// (abi.rs).
+    pub fn slot_index(&'static self, conn: &'static Conn) -> Option<usize> {
+        self.index_of(conn)
+    }
+
     /// The word a connection crosses the C ABI as (ffi's tcp.rs): its slot's
     /// number and one, and in the bits above them the generation of the
     /// connection the slot holds now.

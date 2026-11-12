@@ -172,6 +172,8 @@ fn task(out: &mut Output) {
 /// The NIC and the port `modtest listen` leaves a listener on.
 const LEFT_NIC: &str = "eth0";
 const LEFT_PORT: u16 = 7099;
+/// And the TCP port it leaves a listener on.
+const LEFT_TCP_PORT: u16 = 7098;
 
 /// What the left listener does with a datagram: nothing.
 struct Ignore;
@@ -193,6 +195,31 @@ fn listen(out: &mut Output) {
         }
         Err(e) => {
             let _ = writeln!(out, "modtest listen: refused on {}:{}: {:?}", LEFT_NIC, LEFT_PORT, e);
+        }
+    }
+}
+
+/* What test_module_tcp_left holds the net layer's sweep of what a module
+   opened to (rust_net_close_range): `modtest tcp` listens on a TCP port and
+   forgets the listener, as a module's bug would. Not its code but its
+   handle: the unload closes it by whose it was -- left, the port stayed
+   taken for the uptime -- and the next load's `modtest tcp` takes the port
+   again, which the test runs: refused, it says the listener outlived the
+   module. */
+
+/// `modtest tcp`: a TCP listener made and left open.
+fn tcp(out: &mut Output) {
+    let Some(nic) = kcore::net::Nic::find(LEFT_NIC) else {
+        let _ = writeln!(out, "modtest tcp: no {}", LEFT_NIC);
+        return;
+    };
+    match kcore::tcp::TcpListener::bind(&nic, LEFT_TCP_PORT, 1) {
+        Ok(listener) => {
+            core::mem::forget(listener);
+            let _ = writeln!(out, "modtest tcp: left listening on {}:{}", LEFT_NIC, LEFT_TCP_PORT);
+        }
+        Err(e) => {
+            let _ = writeln!(out, "modtest tcp: refused on {}:{}: {}", LEFT_NIC, LEFT_TCP_PORT, e);
         }
     }
 }
@@ -326,6 +353,10 @@ fn init(params: &kmod::Params, out: &mut Output) -> Result<Box<dyn kmod::Module>
         }
         if args.trim() == "task" {
             task(out);
+            return;
+        }
+        if args.trim() == "tcp" {
+            tcp(out);
             return;
         }
         if args.trim() == "bus" {
