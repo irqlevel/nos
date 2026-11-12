@@ -4597,9 +4597,18 @@ interface](#kvms-paravirtual-interface-as-far-as-it-is-backed)), and a Linux bui
 its firmware left x2APIC on, a Linux 6.1 or 6.18 turns it off, reading its
 APIC's ID through a page it has not mapped, and faults. So a machine with
 an IO-APIC is the PC most firmware makes, in xAPIC mode, which every kernel
-takes as it is (whether a `KVM_GUEST` kernel with an IO-APIC runs right
-with its x2APIC kept, and no MMIO exit for its APIC, has not been measured
-yet: that is what starting such a guest in x2APIC mode would want first):
+takes as it is -- and which costs a `KVM_GUEST` kernel nothing: it turns
+x2APIC on by itself, KVM's interface being there, and runs as one started
+in x2APIC mode runs. Measured on the EX44 (VT-x; Linux 6.18 with
+`KVM_GUEST`, two CPUs, an IO-APIC): started in x2APIC mode, by a build of
+hv that kept it with an IO-APIC, the kernel said `x2apic: enabled by BIOS`;
+started in xAPIC mode, as hv starts it, `x2apic enabled`; routed by
+`physical x2apic` both ways, its serial port's IRQ 4 through the IO-APIC,
+the CPU delivering its APICs' interrupts and taking their EOIs (APICv), 34
+and 38 exits a second idle, and 2,000 sleeps of 500 us in 1.22 s and 16.4
+thousand exits each. The same 6.18 without `KVM_GUEST`, started in x2APIC
+mode, faults in `enable_IR_x2apic` as said above. So xAPIC out of reset
+stays:
 
 ```
 $ hv boot /bzImage cpus=2 ioapic initrd=/initrd cmdline=console=ttyS0
