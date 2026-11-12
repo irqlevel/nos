@@ -18,3 +18,6 @@ path = "src/lib.rs"
 extfmt = { path = "../../common/storage/extfmt" }
 # GPT's CRC-32: the tree's one, with no kernel in it.
 crc = { path = "../../common/crc" }
+# A Linux bzImage's header and the zero page it is handed, as hv loads one
+# by: the one copy.
+bzimage = { path = "../../common/boot/bzimage" }

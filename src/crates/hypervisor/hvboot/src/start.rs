@@ -5,8 +5,9 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use bzimage::E820Entry;
+
 use crate::phys;
-use crate::ram::MemEntry;
 
 const START_INFO_MAGIC: u32 = 0x336E_C578;
 /// Version 1: the first with the memory map.
@@ -26,7 +27,7 @@ const CMDLINE_MAX: usize = 4096;
 /// The start info, read.
 pub struct StartInfo {
     pub cmdline: String,
-    pub memmap: Vec<MemEntry>,
+    pub memmap: Vec<E820Entry>,
     pub rsdp: u64,
     /// The modules hv loaded beside the loader -- an `initrd=` given to
     /// `hv start`: where each is, and how long.
@@ -94,7 +95,7 @@ impl StartInfo {
         for i in 0..entries {
             let mut e = [0u8; MEMMAP_ENTRY_BYTES];
             phys::read(memmap_at + (i * MEMMAP_ENTRY_BYTES) as u64, &mut e)?;
-            memmap.push(MemEntry { addr: u64_at(&e, 0), size: u64_at(&e, 8), kind: u32_at(&e, 16) });
+            memmap.push(E820Entry { addr: u64_at(&e, 0), size: u64_at(&e, 8), kind: u32_at(&e, 16) });
         }
         Ok(StartInfo { cmdline, memmap, rsdp, modules })
     }
