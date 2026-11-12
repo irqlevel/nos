@@ -1555,7 +1555,7 @@ here:
   shadow -- and the vCPU is not entered again until an interrupt is pending
   for it, its task asleep until the timer's next edge. It streams the
   guest's console to the kernel log a line at a time -- a boot's worth, a
-  thousand lines, and then fifty a second, what it leaves out said once a
+  thousand lines, and then at most fifty a second, what it leaves out said once a
   second at most (`... N lines not logged`), so that a guest printing as
   fast as it can does not have the host's log, serial line and netconsole
   for its own; the console itself, which the report and `hv console` show,
@@ -2519,9 +2519,10 @@ commands share is the console, its last 64 KiB in a ring; the bytes waiting to
 be typed at it, 4 KiB at most; a stop flag; and the loop's counters, which it
 publishes at every halt and every 4096 exits. The ring and the input queue
 are taken whole when the VM is made, so nothing on the guest's datapath
-allocates. Each vCPU is bound to one CPU the extension is on for: `cpu=` if
-given, else the one with fewest running VMs -- the highest of a tie, so the
-boot CPU's own work is the last to share its CPU with a guest.
+allocates. Each vCPU is bound to one CPU the extension is on for, where
+`hv::place` puts it (`cores.rs`): whole cores of its own by default, its
+disks' task on a core apart where there is one, `cpu=` naming its first CPU
+when given ([Where its CPUs sit](#where-its-cpus-sit)).
 
 **`hv exec` knows where its answer starts.** It types the line and a newline
 and waits for a prompt -- but only one printed after the line's last byte was
@@ -2554,9 +2555,10 @@ it nowhere -- and answers with that, from a buffer of its own: a guest that
 asks and never reads the answer costs the host no more than one that asks
 once, where the answer used to be appended to a queue without bound.
 
-**Stopping is a question, then a flag and a join.** `hv stop` takes the VM
-off the list first and presses its power button, and a guest that shuts
-down when it is pressed is given `secs` to ([ACPI](#acpi)); the one above,
+**Stopping is a question, then a flag and a join.** `hv stop` presses the
+VM's power button, and a guest that shuts down when it is pressed is given
+`secs` to ([ACPI](#acpi)) -- on the list meanwhile, `stopping`, its CPUs
+still counted where a new VM is placed, and off it after; the one above,
 a kernel without ACPI, never hears the button, and is stopped at once. Then
 the flag: the loop checks it before every entry, and a halted guest's task
 sleeps at most 10 ms at a time, so the stop comes within a tick or so, and
@@ -2937,7 +2939,10 @@ behind.
 `hv delete <name> [keep-disks] [force]` (`store::delete`) takes a VM's
 folder away: every file in it and every folder under it -- or, with
 `keep-disks`, all but the disks its vm.toml names in it, which stay where
-they are, the folder with them -- its vm.toml last, so that a delete that
+they are, the folder with them -- told by the file, not by the path's
+spelling: a vm.toml's `./root.img` or `sub/../root.img` is the file the
+folder lists as `root.img`, which a comparison of strings once took away
+and said it kept -- its vm.toml last, so that a delete that
 fails part way (a file open, a disk another VM holds) leaves the VM there
 for another. Disks its vm.toml names outside the folder are not touched.
 It is refused while the VM is on the list, and for a VM whose vm.toml says
@@ -3058,12 +3063,19 @@ console_log = true
 
 **The name** is the folder's: a letter or a digit, then letters, digits,
 `.`, `_` and `-`, at most 32 -- a word of a command and a component of a
-path, with nothing in it either reads otherwise. One VM of a name is on the
+path, with nothing in it either reads otherwise -- and neither digits alone
+nor `all`, which the commands read as a VM's number and as every VM
+(`store::reserved`). So a word is a name or a number and never both: a VM
+named `1` was once reached by `hv stop 1` -- and by the bus's `vm.stop`,
+whose `protected` was read from another folder -- as whichever VM was
+number 1. A folder named so from before is listed by `hv vms`, saying it,
+and is not started until it is renamed. One VM of a name is on the
 list at a time: a second `hv start web` is refused while vm 0 is web, even
 stopped -- `hv restart web` boots it again, `hv stop web` takes it off. Its
 disks are claimed as any guest's are (`disk::Claims`), so no other guest
-writes them meanwhile. A number is a VM's number before it is a name: a VM
-named by digits alone is found by its name only where no VM has that number.
+writes them meanwhile. What a VM's vm.toml says while it runs -- `protected`
+to the bus's `stop` and `delete` -- is read from the folder it was started
+from, wherever that is.
 
 **`console.log`** (`modules/hypervisor/hv/src/vmlog.rs`) is the guest's console as it
 wrote it, control sequences and all, appended a second at a time by a task
@@ -4913,7 +4925,14 @@ someone else's; then speed.
      What it was: `hv stop` gave the port back to the switch, and the next
      `hv start ... net` took the lowest free one -- the same MAC and the
      same address (`port_ip`) -- and with it the old VM's forwards and the
-     answers to its flows.
+     answers to its flows. And a forward added as its VM was stopped --
+     `forward=` of a start whose session was slow to take its line, `hv
+     forward add`, the bus's `forward_add` -- could land after the stop's
+     `drop_vm` and outlive the VM the same way: `Forwards::add` now asks
+     whether the VM is listed under its own lock as the forward goes in
+     (`Vms::on_list`), so the stop's `drop_vm`, which follows the VM off
+     the list, takes it or it is refused; and the stops take the forwards
+     before they give the switch port back.
    - ~~Two VMs can open one image read-write~~ -- done: a guest's disk
      claims its image as it opens it (`disk::Claims`), by the file -- its
      mount and inode (`kernel_file_mount`, `kernel_file_key`), so two

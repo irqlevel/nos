@@ -378,7 +378,12 @@ impl Volume {
     fn open(name: &str, read_only: bool, force: bool) -> Result<Volume, String> {
         let me = nbsdrive::this_host()?;
         let event = SharedEvent::new().ok_or_else(|| String::from("no event for its session"))?;
-        let drive = nbsdrive::Drive::open_on(name, &me, !read_only, force, &event)?;
+        /* Everything the disk needs first, its 16 MiB of buffers above all,
+         * and the attach last: once attached for writing, a new generation
+         * taken and every chunk server fenced, only the drop of a `Volume`
+         * holding the drive lets go of it -- a failure after the attach
+         * left the volume attached here, refused to readers and to another
+         * host without `force`. */
         let mut slots = Vec::new();
         slots.try_reserve_exact(blk::IN_FLIGHT).map_err(|_| String::from("out of memory for its buffers"))?;
         for _ in 0..blk::IN_FLIGHT {
@@ -387,13 +392,19 @@ impl Volume {
             buf.resize(blk::REQUEST_BYTES, 0);
             slots.push(Mutex::new(buf).ok_or_else(|| String::from("out of memory for its buffers"))?);
         }
-        Ok(Volume {
-            name: String::from(name),
-            drive: Mutex::new(Some(drive)).ok_or_else(|| String::from("out of memory"))?,
+        let mut owned = String::new();
+        owned.try_reserve_exact(name.len()).map_err(|_| String::from("out of memory"))?;
+        owned.push_str(name);
+        let volume = Volume {
+            name: owned,
+            drive: Mutex::new(None).ok_or_else(|| String::from("out of memory"))?,
             slots,
             tags: Mutex::new(BTreeMap::new()).ok_or_else(|| String::from("out of memory"))?,
             event,
-        })
+        };
+        let drive = nbsdrive::Drive::open_on(name, &me, !read_only, force, &volume.event)?;
+        *volume.drive.lock() = Some(drive);
+        Ok(volume)
     }
 
     /// The session's size, its volume's number and generation.

@@ -532,7 +532,11 @@ the volume's size, its serial `nbs-<number>`; its task drives the session --
 attached as the guest starts, every cs fenced, the open chunks reconciled --
 and the guest stopped lets the volume go: flushed, closed, detached. `hv
 start <name> force` takes the VM's volumes from a writer elsewhere: a VM
-moved off a host that is gone. No vm.toml says force.
+moved off a host that is gone. No vm.toml says force, and it is the first
+boot's alone: a reboot of the VM -- its own reset under `restart`, an `hv
+restart` -- attaches plainly, and fails, saying so, where another host has
+taken the volume since; kept, it took the volume back by force, and two
+hosts fenced each other in turn.
 
 An image is poured onto a volume made beforehand (`nbs volume create`):
 

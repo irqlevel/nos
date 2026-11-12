@@ -106,7 +106,7 @@ hv boot <kernel> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noa
                                    cpus gives it N CPUs, each on a host CPU of its own, the
                                    first on cpu. The kernel is a bzImage, or a PVH ELF:
                                    /lib/hvboot boots the one its disk's grub.cfg names
-hv start <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [input=...] [log] [restart] [uuid=U] [net] [network=name] [port=N] [forward=nos:guest]... [cmdline=...]
+hv start <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [input=...] [log] [restart] [force] [uuid=U] [net] [network=name] [port=N] [forward=nos:guest]... [cmdline=...]
                                    a Linux guest that runs until hv stop; restart boots it
                                    again when it resets itself or panics; uuid= what its
                                    SMBIOS says it is; network= the guests it reaches on the
@@ -550,7 +550,7 @@ fn forward_command(state: &State, args: &str, out: &mut Output) {
                 let _ = writeln!(out, "hv: the guests' switch is not up");
                 return;
             };
-            match state.forwards.add(port, vm, guest_port, ip, host, out) {
+            match state.forwards.add(port, vm, guest_port, ip, host, &|| state.vms.on_list(vm), out) {
                 Ok(()) => keep_forward(state, vm, port, Some(guest_port), out),
                 Err(e) => {
                     let _ = writeln!(out, "hv: {}", e);
@@ -583,8 +583,14 @@ fn forward_command(state: &State, args: &str, out: &mut Output) {
 #[cfg(target_arch = "x86_64")]
 fn keep_forward(state: &State, vm: u32, port: u16, guest_port: Option<u16>, out: &mut Output) {
     let Some(name) = state.vms.name_of(vm) else { return };
-    let kept = store::folder_of(&state.vms_root, &name).and_then(|folder| {
-        store::update(&folder, |c| {
+    /* The folder it was started from, which may be anywhere -- not the
+     * VMs' folder's of its name, which may be another VM's or none */
+    let folder = match state.vms.folder_listed(&name) {
+        Some(f) => Ok(f),
+        None => store::folder_of(&state.vms_root, &name),
+    };
+    let kept = folder.and_then(|folder| {
+        store::update(&state.vms.changes, &folder, |c| {
             c.options.forwards.retain(|&(host, _)| host != port);
             if let Some(guest) = guest_port {
                 c.options.forwards.try_reserve(1).map_err(|_| String::from("out of memory"))?;
@@ -980,7 +986,11 @@ fn bench<'a>(machine: &Arc<Machine>, words: impl Iterator<Item = &'a str>, out: 
             if let Some(p) = b.profile {
                 /* Ticks to nanoseconds by the two clocks' own ratio over the
                  * run: whatever the TSC's rate, the parts add up to the whole. */
-                let part = |ticks: u64| ticks * ns / b.ticks.max(1) / p.entries.max(1);
+                /* In 128 bits: a part's ticks times the run's nanoseconds is
+                 * past 2^64 from some two million exits on the EX44's
+                 * numbers, and far sooner where an exit is slower */
+                let part = |ticks: u64| u64::try_from(u128::from(ticks) * u128::from(ns)
+                    / u128::from(b.ticks.max(1)) / u128::from(p.entries.max(1))).unwrap_or(u64::MAX);
                 let entry = part(p.checks) + part(p.sync_in) + part(p.switch_in) + part(p.world)
                     + part(p.switch_out) + part(p.sync_out);
                 let _ = if vmx {
