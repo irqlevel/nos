@@ -540,6 +540,23 @@ impl DiskQueue {
         }
     }
 
+    /// A flush of the device's write cache as buffer `k`'s request: what
+    /// the device had done when it began made durable -- `InFlight` until
+    /// `reap` gives the buffer back, or `Done` where the device has no
+    /// asynchronous flush and it was done there and then. A write reaped
+    /// before it started is covered; one still in flight may not be. The
+    /// buffer's bytes are not touched. Its doorbell waits for `kick`.
+    pub fn start_flush(&self, k: usize) -> Result<Started> {
+        self.buffers.take(k)?;
+        match block::kernel_blockq_start_flush(self.q, k) {
+            1 => Ok(Started::InFlight),
+            rc => {
+                self.buffers.untake(k);
+                if rc == 0 { Ok(Started::Done) } else { Err(Error::IoError) }
+            }
+        }
+    }
+
     /// The doorbell for the requests started.
     pub fn kick(&self) {
         block::kernel_blockq_kick(self.q);
