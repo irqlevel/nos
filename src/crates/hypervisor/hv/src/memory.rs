@@ -224,7 +224,10 @@ impl GuestMemory {
     /// many free, the blocks taken by then going back.
     pub fn add_huge(&mut self, base: u64, size: u64, leaves_2m: bool) -> Result<()> {
         let pages = self.check_new(base, size, HUGE_SIZE)?;
-        let frames = Run::new_huge(pages).ok_or(Error::NoHugePages)?;
+        let frames = Run::new_huge(pages).map_err(|short| match short {
+            kcore::frame::Shortage::Pool => Error::NoHugePages,
+            kcore::frame::Shortage::Memory => Error::NoMemory,
+        })?;
         self.place(base, size, frames, true, leaves_2m)
     }
 

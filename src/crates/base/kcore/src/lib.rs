@@ -32,6 +32,7 @@ pub mod cpu;
 pub mod block;
 pub mod net;
 pub mod bitmap;
+pub mod chunked;
 pub mod ring;
 pub mod static_ring;
 pub mod hpet;
