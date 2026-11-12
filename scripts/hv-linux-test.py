@@ -763,9 +763,18 @@ def check_boot(args, txt):
         # keeps its spinlocks native.
         pt.check("the guest found KVM's paravirtual interface", "Hypervisor detected: KVM" in block, block[-1500:])
         if args.cpus > 1:
-            pt.check("and made EOIs through its PV EOI word, done by the host at the next exit",
-                     re.search(r"(?m)^\s+pv eoi\s+[1-9]\d* EOIs the guest made through its word", txt) is not None,
-                     txt[-2500:])
+            # Its EOIs through the PV EOI word, done by the host at the next
+            # exit -- or, where the CPU delivers its interrupts itself (VT-x's
+            # APIC virtualization, on by default under KVM's nested VT-x and
+            # on the EX44), the CPU's: the host never arms the word then, and
+            # the guest's EOI falls through to the register, which the CPU
+            # takes. Held to the word alone, the check failed under nested
+            # VT-x on every tree.
+            pveoi = re.search(r"(?m)^\s+pv eoi\s+[1-9]\d* EOIs the guest made through its word", txt)
+            cpu = re.search(r"(?m)^\s+apicv\s+[1-9]\d* entries with the CPU delivering", txt)
+            pt.check("and made its EOIs through its PV EOI word, done by the host at the next exit -- or had the "
+                     "CPU take them, delivering its interrupts itself",
+                     pveoi is not None or cpu is not None, txt[-2500:])
             pt.check("and kept its spinlocks native, offered no PV unhalt",
                      "kvm-guest: PV spinlocks disabled, no host support" in block, block[-1500:])
     if args.apicv and args.cpus > 1 and not (args.xapic or args.ioapic) and accel_args(args)[1] == "host" \
