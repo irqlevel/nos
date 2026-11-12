@@ -143,12 +143,14 @@ def create_script(port):
     """What `hv create <name> <url>` is asked, from the test's web server --
     which QEMU's user network puts at 10.0.2.2 for nos -- and what each must
     answer (create_checks): a qcow2 image downloaded, made a disk and grown
-    to size=, given the seed and a vm.toml; the same name again refused; a
-    raw image taken as it is; a URL with nothing at it, a file that is no
-    image and a size= under the image's refused, each leaving nothing."""
+    to size=, given the seed and a vm.toml -- at a port of the switch of its
+    own, the first VM made, the VMs' folder not there yet; the same name
+    again refused; a raw image taken as it is; a URL with nothing at it, a
+    file that is no image and a size= under the image's refused, each
+    leaving nothing."""
     url = "http://10.0.2.2:%d/" % port
     return [
-        "hv create c1 %simg.qcow2 size=16M mem=512 password=nos" % url,
+        "hv create c1 %simg.qcow2 size=16M mem=512 password=nos port=3" % url,
         "ls /vms/c1",
         "sha256 /vms/c1/disk.raw",
         "cat /vms/c1/vm.toml",
@@ -546,9 +548,10 @@ def create_checks(out, grown, raw):
     pt.check("the disk is the one the image was made of, grown with zeros to size= (its SHA-256)", grown in out[2],
              out[2] + "\nwant " + grown)
     pt.check("the vm.toml boots it by hvboot -- the system image's, unless told -- the disk first and the seed "
-             "read-only, on the switch, restarted",
+             "read-only, on the switch at the port asked for, restarted",
              all(w in out[3] for w in ('kernel = "/lib/hvboot"', "memory = 512",
-                                       'disks = ["disk.raw", "seed.iso:ro"]', "net = true", "restart = true")),
+                                       'disks = ["disk.raw", "seed.iso:ro"]', "net = true", "restart = true",
+                                       "port = 3")),
              out[3])
     pt.check("a name that has a vm.toml is refused", "is there already -- not written over" in out[4], out[4])
     pt.check("a raw image is taken as it is", "/vms/c2/vm.toml written" in out[5] and "a 2 MiB disk" in out[5], out[5])
@@ -575,7 +578,8 @@ def clone_checks(out, grown):
 
     pt.check("hv clone: c1's disk copied into c6 with its holes left out, a seed of its own made, its vm.toml written",
              re.search(r"/vms/c6/disk\.raw: \d+ MiB written of 16 MiB, the rest holes", out[0]) is not None
-             and "/vms/c6/vm.toml written -- hv start c6 boots it, cloud-init given a seed of its own" in out[0],
+             and "/vms/c6/vm.toml written -- hv start c6 boots it, at 10.0.100.2 (port 0), cloud-init given a seed of "
+                 "its own" in out[0],
              out[0])
     written = re.search(r"/vms/c6/disk\.raw: (\d+) MiB written of 16 MiB", out[0])
     pt.check("and only what the disk has written: its 16 MiB are mostly a hole",
@@ -584,10 +588,10 @@ def clone_checks(out, grown):
              all(f in out[1] for f in ("disk.raw", "seed.iso", "user-data", "vm.toml")), out[1])
     pt.check("the disk is c1's, byte for byte (its SHA-256)", grown in out[2], out[2] + "\nwant " + grown)
     uuid = re.search(r'uuid = "([0-9a-f-]{36})"', out[3])
-    pt.check("c6's vm.toml is c1's, with a UUID of its own",
+    pt.check("c6's vm.toml is c1's, with a UUID of its own and a port of its own: the lowest no vm.toml names",
              all(w in out[3] for w in ('kernel = "/lib/hvboot"', "memory = 512",
-                                       'disks = ["disk.raw", "seed.iso:ro"]', "net = true"))
-             and uuid is not None, out[3])
+                                       'disks = ["disk.raw", "seed.iso:ro"]', "net = true", "port = 0"))
+             and "port = 3" not in out[3] and uuid is not None, out[3])
     pt.check("a clone to a name that has a folder is refused", "is there already -- not written over" in out[4],
              out[4])
     added = answer(out[5])

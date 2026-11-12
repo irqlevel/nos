@@ -20,11 +20,14 @@
 //!   `delete`. Each says as it goes what the command
 //!   would, its progress and whether it is stopped; a cancel -- or the
 //!   module's going -- stops a download, a conversion and a copy where they
-//!   are, what they made taken away.
+//!   are, what they made taken away. A stop's cancel stops its wait for the
+//!   guest to turn itself off and leaves the guest as it is, its power button
+//!   pressed; the module's going stops the guest where it is.
 //!
-//! A VM whose vm.toml says `protected` is stopped and deleted only when the
-//! call says `force`: the management panel's own VM has it. x86-64 alone,
-//! where the guests are.
+//! A VM whose vm.toml says `protected` -- or whose vm.toml cannot be read,
+//! which may say so -- is stopped, restarted and deleted only when the call
+//! says `force`: the management panel's own VM has it. x86-64 alone, where
+//! the guests are.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -105,10 +108,11 @@ fn answer(call: &mut Call, write: impl FnOnce(&mut Writer)) -> Status {
     if call.json(write) { Status::Ok } else { Status::TooLarge }
 }
 
-/// What a job that failed ended with: Cancelled where it was stopped, and
+/// What a job that failed ended with: Cancelled where it was stopped -- what
+/// it made taken away, or what it leaves said (`work::is_stop`) -- and
 /// Failed with why otherwise.
 fn failed(call: &mut Call, why: &str) -> Status {
-    if why == work::STOPPED {
+    if work::is_stop(why) {
         refuse(call, Status::Cancelled, why, None)
     } else {
         refuse(call, Status::Failed, why, None)
@@ -300,9 +304,13 @@ fn vm_json(w: &mut Writer, name: Option<&str>, c: Option<&Result<config::Config,
         (None, None) => 0,
     };
     w.field_uint("cpus", cpus);
+    /* What a start of it gives it: a vm.toml with no `mem` is given the one
+     * default whatever its kernel -- `hv create`'s cloud default is written
+     * into the file -- and this once said 1024 for one hvboot boots, which a
+     * start gave 256. */
     let mem = match (l, o) {
         (Some(l), _) => l.mem_mib,
-        (None, Some(o)) => o.mem_mib.unwrap_or(if o.kernel == cloud::HVBOOT { 1024 } else { crate::guest::DEFAULT_MEM_MIB }),
+        (None, Some(o)) => o.mem_mib.unwrap_or(crate::guest::DEFAULT_MEM_MIB),
         (None, None) => 0,
     };
     w.field_uint("memory_mib", mem);
@@ -491,8 +499,9 @@ fn disks_json(w: &mut Writer, name: &str, folder: &Folder, o: &Options) {
 
 /// What `devices` says of one: its name and id, its size and type, who
 /// holds it, which VMs name it, what is on it -- and whether a VM may be
-/// given it as it is, and if not why.
-fn device_json(w: &mut Writer, root: &str, disk: &kcore::block::Disk) {
+/// given it as it is, and if not why, with every vm.toml read once already
+/// (`named`).
+fn device_json(w: &mut Writer, named: &crate::devices::Named, vms: &crate::vms::Vms, disk: &kcore::block::Disk) {
     w.begin_object();
     w.field_str("name", disk.name().as_str());
     w.key("id");
@@ -528,14 +537,17 @@ fn device_json(w: &mut Writer, root: &str, disk: &kcore::block::Disk) {
         Some(h) => w.str(h.as_str()),
         None => w.null(),
     }
+    /* What is on it, where nothing is in the way of giving it: the disk
+     * under nos's root partition is in use, and is not said to hold a
+     * partition table as if it could be given. */
     w.key("holds");
-    match disk.holder().is_none().then(|| crate::devices::holds(disk)) {
+    match disk.in_the_way().is_none().then(|| crate::devices::holds(disk)) {
         Some(Ok(Some(what))) => w.str(&alloc::format!("{}", what)),
         _ => w.null(),
     }
     /* Whether a VM may have it as it is: why not, when not. */
     w.key("refused");
-    match crate::devices::check(root, "", disk, false) {
+    match crate::devices::check_with(named, vms, "", disk, false) {
         Ok(()) => w.null(),
         Err(why) => w.str(&why),
     }
@@ -555,13 +567,14 @@ fn devices(state: &State, p: Params, call: &mut Call) -> Status {
             disks.push(d);
         }
     }
-    let root = state.vms_root.as_str();
+    /* Every vm.toml read once, for all of them. */
+    let named = crate::devices::Named::read(&state.vms_root);
     answer(call, |w| {
         w.begin_object();
         w.key("devices");
         w.begin_list();
         for d in &disks {
-            device_json(w, root, d);
+            device_json(w, &named, &state.vms, d);
         }
         w.end_list();
         w.end_object();
@@ -874,7 +887,7 @@ fn config_set(state: &State, mut p: Params, call: &mut Call) -> Status {
     if let Err(e) = checked {
         return refuse(call, Status::Invalid, &e, Some("text"));
     }
-    let changed = match store::replace(&state.vms.changes, &folder, text) {
+    let changed = match store::replace(&state.vms, &folder, text) {
         Ok(c) => c,
         Err(e) => return refuse(call, Status::Failed, &e, None),
     };
@@ -911,7 +924,7 @@ fn forward_add(state: &State, mut p: Params, call: &mut Call) -> Status {
     if let Some(other) = state.forwards.vm_of(port).filter(|&vm| Some(vm) != id) {
         return refuse(call, Status::Conflict, &alloc::format!("port {} is forwarded to vm {}", port, other), Some("port"));
     }
-    let kept = store::update(&state.vms.changes, &folder, |c| {
+    let kept = store::update(&state.vms, &folder, |c| {
         c.options.forwards.retain(|&(host, _)| host != port);
         c.options.forwards.try_reserve(1).map_err(|_| String::from("out of memory"))?;
         c.options.forwards.push((port, guest_port));
@@ -929,7 +942,8 @@ fn forward_add(state: &State, mut p: Params, call: &mut Call) -> Status {
             if state.forwards.vm_of(port) == Some(id) {
                 let _ = state.forwards.del(port);
             }
-            match state.forwards.add(port, id, guest_port, ip, host, &|| state.vms.on_list(id), &mut Quiet) {
+            let to = forward::To { guest_ip: ip, guest_port, host, outer: state.vms.outer_nic() };
+            match state.forwards.add(port, id, to, &|| state.vms.on_list(id), &mut Quiet) {
                 Ok(()) => live = true,
                 Err(e) => return refuse(call, Status::Failed, &alloc::format!("kept in its vm.toml, but not relayed now \
                                                                                -- {}", e), None),
@@ -960,7 +974,7 @@ fn forward_del(state: &State, mut p: Params, call: &mut Call) -> Status {
         Ok(f) => f,
         Err(s) => return s,
     };
-    let kept = match store::update(&state.vms.changes, &folder, |c| {
+    let kept = match store::update(&state.vms, &folder, |c| {
         c.options.forwards.retain(|&(host, _)| host != port);
         Ok(())
     }) {
@@ -1006,11 +1020,11 @@ fn console_write(state: &State, mut p: Params, call: &mut Call) -> Status {
 }
 
 /// A disk's file in a VM's folder: a name of letters, digits, `.`, `_` and
-/// `-`, none of the folder's own files'.
+/// `-`, none of the folder's own files' (`store::folders_own`).
 fn file_param<'a>(p: &mut Params<'a>, call: &mut Call) -> Result<&'a str, Status> {
     let file = p.str("file", FILE_MAX).map_err(|e| invalid(call, e))?;
     let ok = !file.starts_with('.') && file.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
-        && ![store::CONFIG, store::CONFIG_PREV, cloud::USER_DATA, "console.log", "console.log.1"].contains(&file);
+        && !store::folders_own(file);
     if !ok {
         return Err(refuse(call, Status::Invalid, "is a file's name in the folder: letters, digits, . _ and -",
                           Some("file")));
@@ -1052,7 +1066,7 @@ fn disk_add(state: &State, mut p: Params, call: &mut Call) -> Status {
     }
     let grown = kcore::fs::File::open(&path, true).and_then(|f| f.set_len(size));
     let named = grown.map_err(|e| alloc::format!("{}: {} bytes do not fit there -- {}", path, size, e))
-        .and_then(|()| store::update(&state.vms.changes, &folder, |c| {
+        .and_then(|()| store::update(&state.vms, &folder, |c| {
             c.options.disks.try_reserve(1).map_err(|_| String::from("out of memory"))?;
             c.options.disks.push((String::from(file), false));
             Ok(())
@@ -1117,18 +1131,23 @@ fn disk_grow(state: &State, mut p: Params, call: &mut Call) -> Status {
 
 /* ---- jobs ---- */
 
-/// Refused when the folder of `name` says it is protected and the call does
-/// not say `force`: the folder the VM on the list by that name was started
-/// from -- which may be anywhere -- or, with none on the list, the one
-/// under the VMs' folder.
+/// Refused when the folder of `name` says it is protected -- or its vm.toml
+/// cannot be read, which may say so, as `store::delete` takes it -- and the
+/// call does not say `force`: the folder the VM on the list by that name was
+/// started from -- which may be anywhere -- or, with none on the list, the
+/// one under the VMs' folder. A VM with no folder is no folder's to protect.
 fn guarded(state: &State, name: &str, force: bool, call: &mut Call) -> Result<(), Status> {
-    let folder = state.vms.folder_listed(name).or_else(|| store::folder_of(&state.vms_root, name).ok());
-    let protected = folder.and_then(|f| store::load(&f).ok()).is_some_and(|c| c.protected);
-    if protected && !force {
-        return Err(refuse(call, Status::Conflict, &alloc::format!("{} is protected -- force does it all the same",
-                                                                  name), Some("force")));
+    if force {
+        return Ok(());
     }
-    Ok(())
+    let folder = state.vms.folder_listed(name).or_else(|| store::folder_of(&state.vms_root, name).ok());
+    let why = match folder.map(|f| store::load(&f)) {
+        Some(Ok(c)) if c.protected => alloc::format!("{} is protected -- force does it all the same", name),
+        Some(Err(e)) => alloc::format!("{} -- whether {} is protected is not known: force does it all the same", e,
+                                       name),
+        _ => return Ok(()),
+    };
+    Err(refuse(call, Status::Conflict, &why, Some("force")))
 }
 
 fn start(state: &State, mut p: Params, call: &mut Call) -> Status {
@@ -1188,9 +1207,14 @@ fn stop(state: &State, mut p: Params, call: &mut Call) -> Status {
         return refuse(call, Status::NotFound, &alloc::format!("{} is not on the list -- not started", name),
                       Some("name"));
     }
+    /* The module's going stops it where it is; the job's cancel -- a
+     * person's -- stops the waiting and leaves it as it is, its power
+     * button pressed: the guest was once stopped at once, perhaps in the
+     * middle of the shutdown the same job had asked it for. */
     let stopped = {
         let job = Job::new(call, &state.unloading);
-        state.vms.stop_vm(name, secs, &state.forwards, &|| job.cancelled())
+        state.vms.stop_vm(name, secs, &state.forwards, &|| job.unloading.load(Ordering::Acquire),
+                          &|| job.call.cancelled())
     };
     match stopped {
         Ok(s) => answer(call, |w| {
@@ -1210,7 +1234,16 @@ fn restart(state: &State, mut p: Params, call: &mut Call) -> Status {
         Ok(n) => n,
         Err(s) => return s,
     };
+    let force = match p.opt_bool("force") {
+        Ok(f) => f.unwrap_or(false),
+        Err(e) => return invalid(call, e),
+    };
     if let Err(s) = finish(p, call) {
+        return s;
+    }
+    /* A reset with no power button pressed first: as much a stop of what
+     * runs in it as a stop, and as protected. */
+    if let Err(s) = guarded(state, name, force, call) {
         return s;
     }
     if state.vms.id_of(name).is_err() {
@@ -1269,6 +1302,12 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
     if network.is_some_and(|n| !config::valid_network(n)) {
         return refuse(call, Status::Invalid, "is a network's name: a letter or a digit, then letters, digits, . _ and -",
                       Some("network"));
+    }
+    /* The user-data is what cloud-init reads: a password beside it was
+     * dropped without a word, the answer saying `keys: 0`. */
+    if password.is_some() && user_data.is_some() {
+        return refuse(call, Status::Invalid, "is given in the user-data, when the call gives user-data of its own",
+                      Some("password"));
     }
     if store::folder_of(&state.vms_root, name).is_ok() {
         return refuse(call, Status::Conflict, &alloc::format!("{} is there already", name), Some("name"));

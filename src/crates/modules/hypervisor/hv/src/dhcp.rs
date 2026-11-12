@@ -7,7 +7,11 @@
 //! The switch answers it, not a service on `hv0`: a DHCP message from a port
 //! is answered into that port and goes nowhere else. Nothing is remembered,
 //! because there is nothing to choose -- a port has one address, and a lease
-//! on it is always granted again.
+//! on it is always granted again. A guest whose address is set by hand may
+//! ask for the rest -- the router, the mask, the DNS server -- with a
+//! DHCPINFORM, and is told it in an ACK with no address and no lease (RFC
+//! 2131, 3.4). The DNS server is nos's as it is when the guest asks, not as
+//! it was when the guest started.
 
 use netwire::{self as wire, eth, udp, Mac, ETH_TYPE_IP, MAC_BROADCAST};
 
@@ -52,6 +56,7 @@ const OFFER: u8 = 2;
 const REQUEST: u8 = 3;
 const ACK: u8 = 5;
 const NAK: u8 = 6;
+const INFORM: u8 = 8;
 
 /// A day, renewed at half of it.
 const LEASE_SECS: u32 = 86_400;
@@ -130,8 +135,9 @@ fn put(buf: &mut [u8], at: usize, code: u8, data: &[u8]) -> usize {
 
 /// The answer to a client's message from the guest whose address is
 /// `yours`, into `reply`: the frame's length, or None for a message that
-/// wants none -- a release, a decline, a request of another server, or
-/// anything that is not a well-formed request.
+/// wants none -- a release, a decline, a request of another server, an
+/// INFORM from an address that is not its port's, or anything that is not a
+/// well-formed request.
 pub fn answer(frame: &[u8], yours: u32, net: &Network, reply: &mut [u8; REPLY_MAX]) -> Option<usize> {
     let d = udp::parse(frame)?;
     let m = d.payload;
@@ -145,6 +151,7 @@ pub fn answer(frame: &[u8], yours: u32, net: &Network, reply: &mut [u8; REPLY_MA
         return None;
     }
     let ciaddr = wire::be32(m, CIADDR);
+    let mut inform = false;
     let kind = match asked.kind? {
         DISCOVER => OFFER,
         /* The address it asks for -- or, renewing, the one it has -- is its
@@ -153,6 +160,13 @@ pub fn answer(frame: &[u8], yours: u32, net: &Network, reply: &mut [u8; REPLY_MA
             asked if asked == yours => ACK,
             _ => NAK,
         },
+        /* Its address set by hand, the rest asked for: an ACK with no
+         * address and no lease, to the address it has (RFC 2131, 4.3.5) --
+         * which is its port's, or what it sends from it goes nowhere. */
+        INFORM if ciaddr == yours => {
+            inform = true;
+            ACK
+        }
         _ => return None,
     };
 
@@ -166,7 +180,7 @@ pub fn answer(frame: &[u8], yours: u32, net: &Network, reply: &mut [u8; REPLY_MA
     if kind == ACK {
         wire::set_be32(body, CIADDR, ciaddr);
     }
-    if kind != NAK {
+    if kind != NAK && !inform {
         wire::set_be32(body, YIADDR, yours);
     }
     body[GIADDR..GIADDR + 4].copy_from_slice(&m[GIADDR..GIADDR + 4]);
@@ -176,7 +190,9 @@ pub fn answer(frame: &[u8], yours: u32, net: &Network, reply: &mut [u8; REPLY_MA
     let mut at = put(body, OPTIONS, OPT_MESSAGE_TYPE, &[kind]);
     at = put(body, at, OPT_SERVER_ID, &net.server_ip.to_be_bytes());
     if kind != NAK {
-        at = put(body, at, OPT_LEASE_TIME, &LEASE_SECS.to_be_bytes());
+        if !inform {
+            at = put(body, at, OPT_LEASE_TIME, &LEASE_SECS.to_be_bytes());
+        }
         at = put(body, at, OPT_MASK, &net.mask.to_be_bytes());
         at = put(body, at, OPT_ROUTER, &net.server_ip.to_be_bytes());
         if net.dns != 0 {

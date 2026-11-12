@@ -25,9 +25,13 @@
 //! `password=`, and `hvboot=`, where hvboot is: /lib/hvboot, the system
 //! image's, unless told. The host API's create gives the same as a job's
 //! parameters (`provider`). The name is held while the folder is made, so
-//! no VM of it starts and nothing else is done to it meanwhile; what fails,
-//! or is stopped, leaves nothing behind: what this made goes, the folder
-//! too when this made it.
+//! no VM of it starts and nothing else is done to it meanwhile -- and what
+//! it is given meanwhile, a port of the switch, a device, no other VM is;
+//! the files it makes are looked for before anything is fetched, and one
+//! there refuses it. What fails, or is stopped, leaves nothing behind: what
+//! this made goes, the folder too when this made it -- and what could not
+//! be taken away is said. The image's URL is said without a user's name and
+//! password, a query or a fragment: a job's log is every reader's.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -151,7 +155,10 @@ pub fn command(root: &str, vms: &Vms, name: &str, url: &str, words: &str, force:
 }
 
 /// What this has made so far, to take away again if it fails: files, and
-/// the folder when it made that too.
+/// the folder when it made that too. A file is recorded once its create
+/// has answered that it made it: a create that fails takes away what it
+/// made (`kcore::fs::create`), and one refused for a file there already
+/// made nothing of this work's.
 pub struct Made {
     pub files: Vec<String>,
     pub folder: Option<String>,
@@ -168,20 +175,53 @@ impl Made {
         self.folder = None;
     }
 
-    pub fn undo(&mut self) {
+    /// What it made taken away -- the files, then the folder -- and what
+    /// could not be, said in the kernel's log and returned: a folder left
+    /// with a file in it is a name nothing else takes (`hv clone` and `hv
+    /// create` find it there, `hv delete` finds no vm.toml in it), which
+    /// was once left in silence.
+    pub fn undo(&mut self) -> Vec<String> {
+        let mut left = Vec::new();
         for path in self.files.iter().rev() {
-            let _ = kcore::fs::remove(path);
+            /* NotFound for nothing there and for one that would not go:
+             * which, the look after says */
+            if kcore::fs::remove(path).is_err() && kcore::fs::size(path).is_ok() {
+                kcore::klog!(0, "hv: {} could not be taken away -- left behind", path);
+                if left.try_reserve(1).is_ok() {
+                    left.push(path.clone());
+                }
+            }
         }
         if let Some(folder) = &self.folder {
-            let _ = kcore::fs::remove(folder);
+            if kcore::fs::remove(folder).is_err() && kcore::fs::list(folder).is_ok() {
+                kcore::klog!(0, "hv: {} could not be taken away -- left behind", folder);
+                if left.try_reserve(1).is_ok() {
+                    left.push(folder.clone());
+                }
+            }
         }
         self.keep();
+        left
+    }
+
+    /// `why` a work failed, what it made taken away -- and what could not
+    /// be said after it, for whoever reads why.
+    pub fn undone(&mut self, why: String) -> String {
+        let left = self.undo();
+        if left.is_empty() {
+            return why;
+        }
+        let mut said = why;
+        for path in &left {
+            let _ = write!(said, " -- {} could not be taken away: take it away by hand", path);
+        }
+        said
     }
 }
 
 impl Drop for Made {
     fn drop(&mut self) {
-        self.undo();
+        let _ = self.undo();
     }
 }
 
@@ -250,22 +290,50 @@ fn image_name(url: &str) -> &str {
     let last = path.rsplit('/').next().unwrap_or("");
     let ok = !last.is_empty() && last.len() <= MAX_IMAGE_NAME && !last.starts_with('.')
         && last.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
-        && ![DISK, SEED, USER_DATA, store::CONFIG, store::CONFIG_PREV, "console.log", "console.log.1"].contains(&last);
+        && ![DISK, SEED].contains(&last) && !store::folders_own(last);
     if ok { last } else { IMAGE }
 }
 
-/// `"text"` as YAML has a double-quoted string: what a key's comment or a
-/// password holds read as written, never as YAML.
+/// The URL as a line of what a create did says it: its scheme, host and
+/// path -- nothing of a user's name and password before the host, nor of a
+/// query, a signed URL's signature, or a fragment after it. A job's log is
+/// read by every client of the host API that may read jobs, and was once
+/// the URL whole as its first line.
+fn url_said(url: &str) -> String {
+    let url = &url[..url.find(['?', '#']).unwrap_or(url.len())];
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+            let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+            alloc::format!("{}://{}{}", scheme, host, path)
+        }
+        None => String::from(url),
+    }
+}
+
+/// `"text"` as YAML has a double-quoted string: what a VM's name, a key's
+/// comment or a password holds read as written, never as YAML -- all digits
+/// or `true` a string still, a C1 control or U+2028 an escape rather than a
+/// character PyYAML refuses in the stream or folds into a space. Everything
+/// but printable ASCII is escaped (`\x`, `\u`, `\U`, which YAML reads back
+/// as the character), so the seed's text is ASCII throughout.
 fn quoted(text: &str) -> String {
     let mut q = String::from("\"");
     for c in text.chars() {
         match c {
             '"' => q.push_str("\\\""),
             '\\' => q.push_str("\\\\"),
-            c if (c as u32) < 0x20 || c as u32 == 0x7F => {
+            ' ' => q.push(' '),
+            c if c.is_ascii_graphic() => q.push(c),
+            c if (c as u32) <= 0xFF => {
                 let _ = write!(q, "\\x{:02x}", c as u32);
             }
-            c => q.push(c),
+            c if (c as u32) <= 0xFFFF => {
+                let _ = write!(q, "\\u{:04x}", c as u32);
+            }
+            c => {
+                let _ = write!(q, "\\U{:08x}", c as u32);
+            }
         }
     }
     q.push('"');
@@ -314,10 +382,14 @@ pub fn user_data(keys: &[String], password: Option<&str>) -> String {
 /// cloud-init's seed for the VM `name`: its meta-data naming the machine,
 /// with an instance-id of its own -- a new one for every VM made or cloned,
 /// so that cloud-init runs for it as for a new machine: its own name, its
-/// own SSH host keys -- and `user_data`.
+/// own SSH host keys -- and `user_data`. Each of the meta-data's strings is
+/// YAML's double-quoted: a VM's name may be `1.5`, `1_000` or `true`
+/// (`store::valid_name`), which bare is no string to the YAML cloud-init
+/// reads it with, and its hostname was then not set.
 pub fn seed(name: &str, user_data: &str) -> Result<Vec<u8>, String> {
     let mut meta = String::new();
-    let _ = write!(meta, "instance-id: nos-{}-{}\nlocal-hostname: {}\n", name, kcore::time::wall_clock_secs(), name);
+    let id = alloc::format!("nos-{}-{}", name, kcore::time::wall_clock_secs());
+    let _ = write!(meta, "instance-id: {}\nlocal-hostname: {}\n", quoted(&id), quoted(name));
     let files = [iso::File { name: "meta-data", data: meta.as_bytes() },
                  iso::File { name: USER_DATA, data: user_data.as_bytes() }];
     iso::image(SEED_LABEL, &files, now()).map_err(|e| alloc::format!("the seed: {}", e))
@@ -340,37 +412,65 @@ pub fn create(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options
     if recipe.user_data.is_some_and(|u| u.len() > MAX_USER_DATA) {
         return Err(alloc::format!("its user-data is more than {} bytes", MAX_USER_DATA));
     }
+    /* Two answers to one question: the user-data's would be the one
+     * cloud-init reads, and the password was dropped without a word. */
+    if recipe.user_data.is_some() && recipe.password.is_some() {
+        return Err(String::from("a password and user-data of its own both -- the user-data is what cloud-init \
+                                 reads: give the password in it"));
+    }
+    if recipe.onto.is_some() && recipe.size.is_some() {
+        return Err(String::from("size= is a file's: a device's disk is the device's size, a volume's the \
+                                 volume's"));
+    }
     o.kernel = String::from(recipe.hvboot);
     o.mem_mib = o.mem_mib.or(Some(DEFAULT_MEM_MIB));
     o.net = true;
     o.restart = true;
     o.uuid = o.uuid.or_else(|| Some(crate::guest::random_uuid()));
+    let path = store::join(root, name).ok_or_else(|| String::from("out of memory"))?;
+    let folder = Folder { name: String::from(name), path };
+    let file = store::join(&folder.path, store::CONFIG).ok_or_else(|| String::from("out of memory"))?;
+    if kcore::fs::size(&file).is_ok() {
+        return Err(alloc::format!("{} is there already -- not written over", file));
+    }
+    if kcore::fs::size(recipe.hvboot).is_err() {
+        return Err(alloc::format!("no {} -- hvboot= says where hvboot is", recipe.hvboot));
+    }
+    /* The files this makes, looked for before anything is fetched: one
+     * there already -- what `hv delete <vm> keep-disks` leaves -- refused
+     * the create that wrote it at the end of a download of gigabytes, every
+     * time. */
+    let disk_file = recipe.onto.is_none().then_some(DISK);
+    for f in [disk_file, Some(SEED), Some(USER_DATA)].into_iter().flatten() {
+        let there = store::join(&folder.path, f).ok_or_else(|| String::from("out of memory"))?;
+        if kcore::fs::size(&there).is_ok() {
+            return Err(alloc::format!("{} is there already -- not written over: take it away, or make the vm with \
+                                       another name", there));
+        }
+    }
+    /* Held from here on: no start of it, and no other create, clone or
+     * delete of it, until this is done -- the vm.toml written last, by a
+     * create that refuses one there. What it is given -- a port, devices --
+     * is kept with the hold, no other VM's meanwhile. */
+    let held = vms.reserve(name, crate::vms::MADE)?;
     /* Its first disk: a file in its folder -- or the device the image is
      * poured onto, by its id, where it may be given -- or the volume. */
     let onto = match recipe.onto {
-        Some(word) => {
-            if recipe.size.is_some() {
-                return Err(String::from("size= is a file's: a device's disk is the device's size, a volume's the \
-                                         volume's"));
+        Some(word) => match crate::devices::source(word) {
+            crate::devices::Source::Volume(v) => Some((Onto::Volume(v), String::from(word))),
+            _ => {
+                let (disk, id) = crate::devices::given(word)?;
+                Some((Onto::Device(disk), id))
             }
-            match crate::devices::source(word) {
-                crate::devices::Source::Volume(v) => Some((Onto::Volume(v), String::from(word))),
-                _ => {
-                    let (disk, id) = crate::devices::given(word)?;
-                    crate::devices::check(root, name, &disk, recipe.force)?;
-                    Some((Onto::Device(disk), id))
-                }
-            }
-        }
+        },
         None => None,
     };
     let mut theirs = core::mem::take(&mut o.disks);
-    store::give_devices(root, name, &mut theirs, recipe.force)?;
-    if let Some((Onto::Device(disk), _)) = &onto {
-        if theirs.iter().any(|(w, _)| crate::devices::find(w).is_ok_and(|d| d.overlaps(disk))) {
-            return Err(String::from("onto= is one of its disk= too, or overlaps one"));
-        }
-    }
+    let onto_device = match &onto {
+        Some((Onto::Device(disk), id)) => Some((disk, id.as_str())),
+        _ => None,
+    };
+    store::give_devices(root, vms, &held, &mut theirs, onto_device, recipe.force)?;
     if let Some((Onto::Volume(v), _)) = &onto {
         if theirs.iter().any(|(w, _)| crate::devices::source(w) == crate::devices::Source::Volume(v)) {
             return Err(String::from("onto= is one of its disk= too"));
@@ -379,26 +479,14 @@ pub fn create(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options
     o.disks.push((onto.as_ref().map_or_else(|| String::from(DISK), |(_, id)| id.clone()), false));
     o.disks.push((String::from(SEED), true));
     o.disks.extend(theirs);
-    let path = store::join(root, name).ok_or_else(|| String::from("out of memory"))?;
-    let folder = Folder { name: String::from(name), path };
     let mut config = Config::new(o);
     config.protected = recipe.protected;
     store::options_checked(&folder, &config)?;
-    /* A port of its own is no other VM's, by its vm.toml or as it runs. */
+    /* A port of its own is no other VM's: by its vm.toml, as it runs, or
+     * given to one being made. */
     if let Some(p) = config.options.port {
-        crate::clone::port_for(root, vms, Some(p))?;
+        store::take_port(root, vms, &held, Some(p))?;
     }
-    let file = store::join(&folder.path, store::CONFIG).ok_or_else(|| String::from("out of memory"))?;
-    if kcore::fs::size(&file).is_ok() {
-        return Err(alloc::format!("{} is there already -- not written over", file));
-    }
-    if kcore::fs::size(recipe.hvboot).is_err() {
-        return Err(alloc::format!("no {} -- hvboot= says where hvboot is", recipe.hvboot));
-    }
-    /* Held from here on: no start of it, and no other create, clone or
-     * delete of it, until this is done -- the vm.toml written last, by a
-     * create that refuses one there. */
-    let _held = vms.reserve(name, "made")?;
     let text = config::render(&config).ok_or_else(|| String::from("out of memory"))?;
 
     let mut made = Made::new();
@@ -406,9 +494,13 @@ pub fn create(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options
         store::make_dirs(&folder.path).map_err(|_| alloc::format!("{} could not be made", folder.path))?;
         made.folder = Some(folder.path.clone());
     }
-    let created = fill(&folder, recipe, onto.map(|(disk, _)| disk), &text, &file, &mut made, work)?;
-    made.keep();
-    Ok(created)
+    match fill(&folder, recipe, onto.map(|(disk, _)| disk), &text, &file, &mut made, work) {
+        Ok(created) => {
+            made.keep();
+            Ok(created)
+        }
+        Err(e) => Err(made.undone(e)),
+    }
 }
 
 /// Where the image's disk is poured, in place of a file in the folder.
@@ -433,7 +525,7 @@ fn fill(folder: &Folder, recipe: &Recipe, onto: Option<Onto<'_>>, text: &str, fi
     let seed_path = join(SEED)?;
     let user_path = join(USER_DATA)?;
 
-    let _ = writeln!(work, "hv: {} -- into {}", url, download);
+    let _ = writeln!(work, "hv: {} -- into {}", url_said(url), download);
     let started = kcore::time::boot_time_ns();
     let mut reported = started;
     let mut progress = |done: u64, total: u64| {
@@ -455,7 +547,7 @@ fn fill(folder: &Folder, recipe: &Recipe, onto: Option<Onto<'_>>, text: &str, fi
     };
     let len = kcore::http::fetch(url, &download, &mut progress).map_err(|e| match e {
         kcore::http::Error::Cancelled => String::from(work::STOPPED),
-        e => alloc::format!("{}: {}", url, e),
+        e => alloc::format!("{}: {}", url_said(url), e),
     })?;
     let ns = kcore::time::boot_time_ns().saturating_sub(started);
     let _ = writeln!(work, "download: {} bytes in {}.{} s, {}", len, ns / NS_PER_SEC, ns % NS_PER_SEC / NS_PER_TENTH,
@@ -463,21 +555,19 @@ fn fill(folder: &Folder, recipe: &Recipe, onto: Option<Onto<'_>>, text: &str, fi
     made.files.push(download.clone());
 
     /* Onto a device: poured, the download taken away after. What a pour
-     * that fails leaves on the device is the device's -- said. */
+     * that fails or is stopped leaves on the device is the device's -- the
+     * pour says so, once it has written anything. */
     let poured = match onto {
         Some(Onto::Device(disk)) => {
-            let device = disk.name();
             let holder = alloc::format!("hv create {}", folder.name);
-            let poured = image::pour(&download, disk, &holder, work)
-                .map_err(|e| alloc::format!("{} -- {} holds part of the image now", e, device))?;
+            let poured = image::pour(&download, disk, &holder, work)?;
             if kcore::fs::remove(&download).is_ok() {
                 made.files.retain(|f| *f != download);
             }
             Some(poured.size + poured.rest)
         }
         Some(Onto::Volume(v)) => {
-            let poured = image::pour_volume(&download, v, recipe.force, work)
-                .map_err(|e| alloc::format!("{} -- nbs:{} holds part of the image now", e, v))?;
+            let poured = image::pour_volume(&download, v, recipe.force, work)?;
             if kcore::fs::remove(&download).is_ok() {
                 made.files.retain(|f| *f != download);
             }

@@ -11,13 +11,18 @@
 //! name already on the list is refused -- and its disks are claimed as any
 //! guest's are, so no other guest writes them meanwhile. While a folder is
 //! made, cloned or deleted its name is held (`Vms::reserve`): no VM of it
-//! starts, and nothing else of the kind is done to it.
+//! starts, and nothing else of the kind is done to it. What a VM being made
+//! or cloned is given before its vm.toml says so -- a port of the switch, a
+//! device of nos's -- is kept with that hold, and no other VM is given it
+//! meanwhile.
 //!
 //! What hv changes in a vm.toml after it is made -- a forward added or taken
-//! away, a disk, the host API's edits -- it changes key by key
-//! (`config::rewrite`), the operator's comments and lines left as they are,
-//! and the file as it was kept beside it as `vm.toml.prev`. `hv delete`
-//! takes a folder away, its disks too unless told to keep them.
+//! away, a disk, the UUID of a first start, the host API's edits -- it
+//! changes key by key (`config::rewrite`), the operator's comments and lines
+//! left as they are, and the file as it was kept beside it as
+//! `vm.toml.prev`: one change at a time (`Changes`), and none of a folder
+//! being deleted. `hv delete` takes a folder away, its disks too unless told
+//! to keep them.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -115,6 +120,17 @@ pub fn root(path: &str) -> Result<String, String> {
     Ok(kept)
 }
 
+/// Whether `file` is a name hv itself writes in a VM's folder: its vm.toml
+/// and vm.toml.prev -- and the `.new` each is written through first
+/// (`kcore::fs::write`) -- the user-data kept for a clone, and the console's
+/// logs. No disk or download is given one: a disk added as `vm.toml.new`
+/// was written over by the next change of the vm.toml.
+pub fn folders_own(file: &str) -> bool {
+    let stem = file.strip_suffix(REPLACING).unwrap_or(file);
+    [CONFIG, CONFIG_PREV, crate::cloud::USER_DATA].contains(&stem)
+        || stem.strip_prefix(vmlog::FILE).is_some_and(|rest| rest.is_empty() || rest == vmlog::OLD_SUFFIX)
+}
+
 /// Makes the folder, and the folders above it that are missing.
 pub(crate) fn make_dirs(path: &str) -> kcore::error::Result<()> {
     for (i, _) in path.match_indices('/').skip(1) {
@@ -172,7 +188,10 @@ pub fn find(root: &str, word: &str) -> Result<Option<Folder>, String> {
 /// bus, whose calls run side by side -- read the same text, and the second
 /// write took the first's change away, with vm.toml.prev no record of it.
 /// One for every folder: a change is an operator's, rare and quick. Held by
-/// `Vms`, so that whatever changes a vm.toml has one to give.
+/// `Vms`, so that whatever changes a vm.toml has one to give. What is given
+/// to a VM before its vm.toml names it -- a port, a device -- is looked for
+/// and kept under it too (`take_port`, `give_devices`), as a delete takes
+/// its hold of the name (`delete`).
 pub struct Changes(kcore::sync::Mutex<()>);
 
 impl Changes {
@@ -181,14 +200,28 @@ impl Changes {
     }
 }
 
+/// The changes' lock taken for a change of `folder`'s vm.toml -- refused
+/// while the folder is being deleted: a delete takes its hold of the name
+/// under this lock (`delete`), so a change either comes first, and what it
+/// wrote is in the delete's walk, or sees the delete and writes nothing. A
+/// change beside a delete once wrote vm.toml.prev into a folder the delete
+/// had walked, which was then left with that alone in it.
+fn changing<'a>(vms: &'a Vms, folder: &Folder) -> Result<kcore::sync::MutexGuard<'a, ()>, String> {
+    let one = vms.changes.0.lock();
+    if vms.doing(&folder.name) == Some(crate::vms::DELETED) {
+        return Err(alloc::format!("{} is being deleted -- its {} is not changed", folder.name, CONFIG));
+    }
+    Ok(one)
+}
+
 /// The UUID of the VM in `folder` from its vm.toml, or -- one whose
 /// vm.toml was written before VMs had them -- `uuid`, written into it key
 /// by key as every change is, for every start after to give it the same:
 /// the one the file has. Two first starts at once thus agree on one. It was
 /// appended to the file, which a write cut short -- a disk full -- left
 /// unparseable, as two starts did by appending one each.
-pub fn keep_uuid(changes: &Changes, folder: &Folder, uuid: [u8; 16]) -> Result<[u8; 16], String> {
-    let _one = changes.0.lock();
+pub fn keep_uuid(vms: &Vms, folder: &Folder, uuid: [u8; 16]) -> Result<[u8; 16], String> {
+    let _one = changing(vms, folder)?;
     let (text, was) = load_text(folder)?;
     if let Some(had) = was.options.uuid {
         return Ok(had);
@@ -197,7 +230,7 @@ pub fn keep_uuid(changes: &Changes, folder: &Folder, uuid: [u8; 16]) -> Result<[
     c.options.uuid = Some(uuid);
     let file = join(&folder.path, CONFIG).ok_or_else(|| String::from("out of memory"))?;
     let new = config::rewrite(&text, &c).map_err(|e| alloc::format!("{}: {}", file, e))?;
-    write_config(folder, &text, &new)?;
+    write_config(folder, text.as_bytes(), &new)?;
     Ok(uuid)
 }
 
@@ -207,16 +240,22 @@ pub fn load(folder: &Folder) -> Result<Config, String> {
     load_text(folder).map(|(_, c)| c)
 }
 
+/// The folder's vm.toml as its bytes -- what is wrong otherwise, said with
+/// its path -- and that path.
+fn read_config(folder: &Folder) -> Result<(String, Vec<u8>), String> {
+    let file = join(&folder.path, CONFIG).ok_or_else(|| String::from("out of memory"))?;
+    match kcore::fs::read(&file, config::MAX_BYTES) {
+        Ok(bytes) => Ok((file, bytes)),
+        Err(kcore::error::Error::InvalidValue) => {
+            Err(alloc::format!("{} is more than the {} bytes a vm.toml may be", file, config::MAX_BYTES))
+        }
+        Err(e) => Err(alloc::format!("{}: {}", file, e)),
+    }
+}
+
 /// The folder's vm.toml as it is written, and the configuration it says.
 pub fn load_text(folder: &Folder) -> Result<(String, Config), String> {
-    let file = join(&folder.path, CONFIG).ok_or_else(|| String::from("out of memory"))?;
-    let bytes = match kcore::fs::read(&file, config::MAX_BYTES) {
-        Ok(bytes) => bytes,
-        Err(kcore::error::Error::InvalidValue) => {
-            return Err(alloc::format!("{} is more than the {} bytes a vm.toml may be", file, config::MAX_BYTES));
-        }
-        Err(e) => return Err(alloc::format!("{}: {}", file, e)),
-    };
+    let (file, bytes) = read_config(folder)?;
     let text = String::from_utf8(bytes).map_err(|_| alloc::format!("{} is not UTF-8 text", file))?;
     let c = config::parse(&text).map_err(|e| alloc::format!("{}: {}", file, e))?;
     Ok((text, c))
@@ -226,19 +265,23 @@ pub fn load_text(folder: &Folder) -> Result<(String, Config), String> {
 /// vm.toml.prev, and each file replaced whole -- a full disk or a crash
 /// midway leaves it as it was, never half written (`kcore::fs::write`).
 /// Under `Changes`, which its callers here hold.
-fn write_config(folder: &Folder, was: &str, text: &str) -> Result<(), String> {
+fn write_config(folder: &Folder, was: &[u8], text: &str) -> Result<(), String> {
     let file = join(&folder.path, CONFIG).ok_or_else(|| String::from("out of memory"))?;
     let prev = join(&folder.path, CONFIG_PREV).ok_or_else(|| String::from("out of memory"))?;
-    kcore::fs::write(&prev, was.as_bytes()).map_err(|e| alloc::format!("{} could not be written -- {}", prev, e))?;
+    kcore::fs::write(&prev, was).map_err(|e| alloc::format!("{} could not be written -- {}", prev, e))?;
     kcore::fs::write(&file, text.as_bytes()).map_err(|e| alloc::format!("{} could not be written -- {}", file, e))
 }
 
 /// The folder's vm.toml made `text` whole -- the bus's `config_set`, which
-/// has checked it as a start would: whether it changed.
-pub fn replace(changes: &Changes, folder: &Folder, text: &str) -> Result<bool, String> {
-    let _one = changes.0.lock();
-    let (was, _) = load_text(folder)?;
-    if was == text {
+/// has checked it as a start would: whether it changed. The one there is
+/// read as bytes, and kept as vm.toml.prev as it is: the vm.toml an editor
+/// is needed for most is one that does not parse -- a key misspelt by hand,
+/// or one this build does not have -- which was refused with its own parse
+/// error whatever was sent.
+pub fn replace(vms: &Vms, folder: &Folder, text: &str) -> Result<bool, String> {
+    let _one = changing(vms, folder)?;
+    let (_, was) = read_config(folder)?;
+    if was == text.as_bytes() {
         return Ok(false);
     }
     write_config(folder, &was, text)?;
@@ -248,11 +291,13 @@ pub fn replace(changes: &Changes, folder: &Folder, text: &str) -> Result<bool, S
 /// The folder's vm.toml changed by `change` -- checked as a start checks
 /// it, and written key by key (`config::rewrite`), the operator's lines left
 /// as they are: whether it changed. Nothing is written when `change` leaves
-/// it as it was. The read, the change and the write under `changes`.
-pub fn update(changes: &Changes, folder: &Folder, change: impl FnOnce(&mut Config) -> Result<(), String>)
+/// it as it was. The read, the change and the write under the changes' lock
+/// (`changing`): what `change` checks -- that no other VM's vm.toml names a
+/// device it adds -- holds for the write.
+pub fn update(vms: &Vms, folder: &Folder, change: impl FnOnce(&mut Config) -> Result<(), String>)
     -> Result<bool, String>
 {
-    let _one = changes.0.lock();
+    let _one = changing(vms, folder)?;
     let (text, was) = load_text(folder)?;
     let mut c = was.clone();
     change(&mut c)?;
@@ -262,7 +307,7 @@ pub fn update(changes: &Changes, folder: &Folder, change: impl FnOnce(&mut Confi
     let file = join(&folder.path, CONFIG).ok_or_else(|| String::from("out of memory"))?;
     options_checked(folder, &c).map_err(|e| alloc::format!("{}: {}", file, e))?;
     let new = config::rewrite(&text, &c).map_err(|e| alloc::format!("{}: {}", file, e))?;
-    write_config(folder, &text, &new)?;
+    write_config(folder, text.as_bytes(), &new)?;
     Ok(true)
 }
 
@@ -358,8 +403,26 @@ pub fn create(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
     };
     let folder = Folder { name: String::from(name), path };
     let mut given = given;
-    /* Each device by its id from here on, and only where it may be given. */
-    if let Err(e) = give_devices(root, name, &mut given.disks, force) {
+    /* There already: said as such, before the name is asked for -- which a
+     * VM of it running would refuse. */
+    if kcore::fs::size(&file).is_ok() {
+        let _ = writeln!(out, "hv: {} is there already -- not written over", file);
+        return;
+    }
+    /* Held while the folder is made: no start of it meanwhile, nor a
+     * clone or delete -- and what it is given, kept with the hold. */
+    let held = match vms.reserve(name, crate::vms::MADE) {
+        Ok(held) => held,
+        Err(e) => {
+            let _ = writeln!(out, "hv: {}", e);
+            return;
+        }
+    };
+    /* Each device by its id from here on, only where it may be given, and
+     * no other VM's while this is made; a port of its own no other VM's. */
+    let gave = give_devices(root, vms, &held, &mut given.disks, None, force)
+        .and_then(|()| given.port.map_or(Ok(()), |p| take_port(root, vms, &held, Some(p)).map(|_| ())));
+    if let Err(e) = gave {
         let _ = writeln!(out, "hv: {}", e);
         return;
     }
@@ -375,21 +438,6 @@ pub fn create(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
     let Some(text) = config::render(&config) else {
         let _ = writeln!(out, "hv: out of memory");
         return;
-    };
-    /* There already: said as such, before the name is asked for -- which a
-     * VM of it running would refuse. */
-    if kcore::fs::size(&file).is_ok() {
-        let _ = writeln!(out, "hv: {} is there already -- not written over", file);
-        return;
-    }
-    /* Held while the folder is made: no start of it meanwhile, nor a
-     * clone or delete. */
-    let _held = match vms.reserve(name, "made") {
-        Ok(held) => held,
-        Err(e) => {
-            let _ = writeln!(out, "hv: {}", e);
-            return;
-        }
     };
     if make_dirs(&folder.path).is_err() {
         let _ = writeln!(out, "hv: {} could not be made", folder.path);
@@ -422,37 +470,135 @@ pub fn create(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
 }
 
 /// The folder's configuration as a start checks it: the guest it says, its
-/// paths made nos's, given its defaults and held to every rule.
+/// paths made nos's, given its defaults and held to every rule -- and no
+/// device named by this boot's name (`dev:nvme1`), which the next boot may
+/// give another disk: a vm.toml written by hand that said so was started as
+/// it said, and after a reboot that numbered the drives the other way round
+/// wrote over the other drive. The id that finds it again is said.
 pub fn options_checked(folder: &Folder, c: &Config) -> Result<guest::Spec, String> {
+    let by_name = c.options.disks.iter().map(|(w, _)| w.as_str())
+        .find(|w| matches!(crate::devices::source(w), crate::devices::Source::Name(_)));
+    if let Some(word) = by_name {
+        return Err(match crate::devices::given(word) {
+            Ok((_, id)) => alloc::format!("its disk {} is this boot's name for a device, which the next boot may give \
+                                           another disk -- name it by its id: {}", word, id),
+            Err(e) => alloc::format!("its disk {} is a device by this boot's name, which the next boot may give \
+                                      another disk -- name it by its id (hv devices): {}", word, e),
+        });
+    }
     guest::spec(options(folder, c)?)
 }
 
 /// The devices among `disks` given as they are -- an id kept, a name made
-/// its device's id (`devices::given`) -- each where `devices::check` lets it
-/// be given to VM `vm` under `root`, and no two of them on one stretch of a
-/// disk: why not, otherwise.
-pub fn give_devices(root: &str, vm: &str, disks: &mut [(String, bool)], force: bool) -> Result<(), String> {
+/// its device's id (`devices::given`) -- and `onto`, the device a cloud's
+/// image is poured onto, with its id: each where `devices::check` lets it be
+/// given to the VM `held` holds the name of, under `root`, and no two of
+/// them on one stretch of a disk -- why not, otherwise. Looked at under the
+/// changes' lock, and their ids kept with `held` until its vm.toml names
+/// them (`Reserved::keep_devices`): two VMs made at once, each finding no
+/// vm.toml that named the device, were both given it.
+pub fn give_devices(root: &str, vms: &Vms, held: &crate::vms::Reserved, disks: &mut [(String, bool)],
+                    onto: Option<(&kcore::block::Disk, &str)>, force: bool) -> Result<(), String> {
+    let oom = || String::from("out of memory");
+    let vm = held.name();
     let mut given: Vec<kcore::block::Disk> = Vec::new();
-    given.try_reserve_exact(disks.len()).map_err(|_| String::from("out of memory"))?;
+    let mut ids: Vec<String> = Vec::new();
+    given.try_reserve_exact(disks.len()).map_err(|_| oom())?;
+    ids.try_reserve_exact(disks.len() + 1).map_err(|_| oom())?;
+    let _one = vms.changes.0.lock();
+    if let Some((disk, id)) = onto {
+        crate::devices::check(root, vms, vm, disk, force)?;
+        let mut kept = String::new();
+        kept.try_reserve_exact(id.len()).map_err(|_| oom())?;
+        kept.push_str(id);
+        ids.push(kept);
+    }
     for (word, _) in disks.iter_mut() {
         if !crate::devices::is_device(word) {
             continue;
         }
         let (disk, id) = crate::devices::given(word)?;
+        if onto.is_some_and(|(o, _)| o.overlaps(&disk)) {
+            return Err(String::from("onto= is one of its disk= too, or overlaps one"));
+        }
         if given.iter().any(|d| d.overlaps(&disk)) {
             return Err(alloc::format!("{} is given twice, or overlaps another of its disks", word));
         }
-        crate::devices::check(root, vm, &disk, force)?;
+        crate::devices::check(root, vms, vm, &disk, force)?;
+        let mut kept = String::new();
+        kept.try_reserve_exact(id.len()).map_err(|_| oom())?;
+        kept.push_str(&id);
+        ids.push(kept);
         given.push(disk);
         *word = id;
     }
+    held.keep_devices(ids);
     Ok(())
+}
+
+/// A port of the switch for the VM `held` holds the name of, being made or
+/// cloned: `asked`, or the lowest no VM's vm.toml under `root` names, no VM
+/// on the list holds and no other make or clone has taken -- kept with
+/// `held` until its vm.toml says so. Looked for and kept under the changes'
+/// lock: two clones at once were each given the lowest free one, the same,
+/// and with it one MAC and one address.
+pub fn take_port(root: &str, vms: &Vms, held: &crate::vms::Reserved, asked: Option<u32>) -> Result<u32, String> {
+    let _one = vms.changes.0.lock();
+    let port = port_for(root, vms, asked)?;
+    held.keep_port(port);
+    Ok(port)
+}
+
+/// `asked`, or the lowest port no VM's vm.toml under `root` names and no
+/// VM holds or is being given (`Vms::ports_held`). No VMs' folder yet -- the
+/// first VM made, which makes it -- is no vm.toml naming any: it was "not
+/// found", and the first `hv create ... port=N` refused.
+fn port_for(root: &str, vms: &Vms, asked: Option<u32>) -> Result<u32, String> {
+    let mut used = [false; net::MAX_PORTS];
+    for p in vms.ports_held().ok_or_else(|| String::from("out of memory"))? {
+        if let Some(u) = used.get_mut(p) {
+            *u = true;
+        }
+    }
+    let entries = match kcore::fs::list(root) {
+        Ok(entries) => entries,
+        Err(kcore::error::Error::NotFound) if kcore::fs::size(root).is_err() => Vec::new(),
+        Err(e) => return Err(alloc::format!("{}: {}", root, e)),
+    };
+    let mut named: Vec<(u32, String)> = Vec::new();
+    for entry in entries {
+        let Ok(name) = core::str::from_utf8(&entry.name) else { continue };
+        if !entry.dir || !valid_name(name) {
+            continue;
+        }
+        let Ok(folder) = folder_of(root, name) else { continue };
+        if let Ok(c) = load(&folder) {
+            if let Some(p) = c.options.port {
+                if let Some(u) = used.get_mut(p as usize) {
+                    *u = true;
+                }
+                named.try_reserve(1).map_err(|_| String::from("out of memory"))?;
+                named.push((p, folder.name));
+            }
+        }
+    }
+    match asked {
+        Some(p) if p as usize >= net::MAX_PORTS => Err(alloc::format!("port= must be 0..{}", net::MAX_PORTS - 1)),
+        Some(p) => match named.iter().find(|(q, _)| *q == p) {
+            Some((_, owner)) => Err(alloc::format!("port {} is {}'s, as its vm.toml says", p, owner)),
+            None if used[p as usize] => Err(alloc::format!("port {} is held by a vm that runs, or one being made", p)),
+            None => Ok(p),
+        },
+        None => used.iter().position(|u| !u).map(|p| p as u32)
+            .ok_or_else(|| alloc::format!("every one of the switch's {} ports is some vm's", net::MAX_PORTS)),
+    }
 }
 
 /// What `delete` did: how many files and folders it took away, and the
 /// disks it kept.
 pub struct Deleted {
-    /// Its devices, which a delete never touches.
+    /// Its devices of nos's and its volumes of NBS's, which a delete never
+    /// touches.
     pub devices: Vec<String>,
     pub removed: usize,
     /// The disks kept, by the paths the folder has them at.
@@ -486,7 +632,11 @@ pub fn delete_command(root: &str, vms: &Vms, args: &str, out: &mut dyn Write) {
                 let _ = writeln!(out, "hv: {} kept", disk);
             }
             for device in &d.devices {
-                let _ = writeln!(out, "hv: {} left as it is -- a device, which a delete never touches", device);
+                let what = match crate::devices::source(device) {
+                    crate::devices::Source::Volume(_) => "a volume of NBS's",
+                    _ => "a device of nos's",
+                };
+                let _ = writeln!(out, "hv: {} left as it is -- {}, which a delete never touches", device, what);
             }
         }
         Err(e) => {
@@ -505,7 +655,13 @@ pub fn delete_command(root: &str, vms: &Vms, args: &str, out: &mut dyn Write) {
 /// folder are not touched, and nothing is followed out of it.
 pub fn delete(root: &str, vms: &Vms, name: &str, keep: bool, force: bool) -> Result<Deleted, String> {
     let folder = folder_of(root, name)?;
-    let _held = vms.reserve(name, "deleted")?;
+    /* Held under the changes' lock: a change of its vm.toml made before is
+     * done -- what it wrote is in the walk below -- and one after sees the
+     * hold and writes nothing (`changing`). */
+    let _held = {
+        let _one = vms.changes.0.lock();
+        vms.reserve(name, crate::vms::DELETED)?
+    };
     let oom = || String::from("out of memory");
     let (protected, disks) = match load(&folder) {
         Ok(c) => (c.protected, options(&folder, &c)?.disks),

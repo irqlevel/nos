@@ -48,16 +48,19 @@
 //! nowhere, and a neighbour discovery message of its must give its own MAC
 //! wherever it gives one, and come whole, not in fragments (RFC 6980). A
 //! packet whose chain of extension headers hides what it carries -- past
-//! its length, or a first fragment that stops short of it -- goes nowhere
-//! either: a router advertisement could be one (RFC 7112). The packet looked
-//! at is the one its receiver takes, to the length its header says.
+//! its length, or a first fragment that stops short of the end of the upper
+//! header it names, a UDP header's 8 bytes among them (`netwire::ipv6::upper`)
+//! -- goes nowhere either: a router advertisement or a DHCPv6 server's reply
+//! could be one (RFC 7112). The packet looked at is the one its receiver
+//! takes, to the length its header says.
 //!
 //! The switch is also the guests' way out: while it exists, NAT is on from
 //! `hv0` through the device nos's default route is on, so a guest reaches
 //! whatever nos can, from nos's address (`layers/net/src/nat.rs`). And it answers
 //! DHCP itself (`dhcp.rs`): a guest that asks is told its port's address,
-//! nos as its router and the DNS server nos was given as its own -- which
-//! `ip=` also carries, as its `dns0`.
+//! nos as its router and the DNS server nos has as its own as it asks --
+//! which `ip=` also carries, as its `dns0`, as it was at the guest's start;
+//! one whose address is set by hand is told the rest (DHCPINFORM).
 //!
 //! A port's inbox holds what waits for the guest's NIC: as many frames as the
 //! guest posts buffers for, so that a burst its ring would take is not
@@ -335,8 +338,9 @@ impl Inbox {
     }
 }
 
-/// A port's sends to every port: how many it may make now, and when that was
-/// last topped up.
+/// A port's sends to every port: how many it may make now, and from when
+/// the part of one being earned counts -- a token bucket of `FLOOD_BURST`,
+/// filled at `FLOOD_PER_SEC`.
 struct Flood {
     tokens: u64,
     at: u64,
@@ -346,12 +350,21 @@ impl Flood {
     const FULL: Flood = Flood { tokens: FLOOD_BURST, at: 0 };
 
     /// Whether one more may go at `now`: `FLOOD_BURST` at once, and
-    /// `FLOOD_PER_SEC` after.
+    /// `FLOOD_PER_SEC` after. The whole tokens earned since `at` are added
+    /// and `at` moved on by the time they stand for, the part of the next
+    /// one kept: moved to `now` at each one, the part was thrown away, and a
+    /// sender just over the rate was held to half of it. A full bucket earns
+    /// nothing while it is full: `at` is then `now`.
     fn take(&mut self, now: u64) -> bool {
         let earned = now.saturating_sub(self.at).saturating_mul(FLOOD_PER_SEC) / NS_PER_SEC;
-        if earned != 0 {
-            self.tokens = self.tokens.saturating_add(earned).min(FLOOD_BURST);
+        if self.tokens.saturating_add(earned) >= FLOOD_BURST {
+            self.tokens = FLOOD_BURST;
             self.at = now;
+        } else if earned != 0 {
+            /* Under FLOOD_BURST tokens' time: no overflow, and never past
+             * `now` */
+            self.tokens += earned;
+            self.at += earned * NS_PER_SEC / FLOOD_PER_SEC;
         }
         if self.tokens == 0 {
             return false;
@@ -419,14 +432,13 @@ pub struct Ports {
     vnic: Vnic,
     to_host: AtomicU64,
     refused: AtomicU64,
-    /// The DNS server DHCP hands out, as last asked of the kernel; 0 for
-    /// none.
-    dns: AtomicU32,
     /// DHCP messages answered.
     dhcp: AtomicU64,
     /// Frames from the guests the switch does not carry: neither IPv4, ARP
     /// nor IPv6, too short to be, IPv6 for nos -- which speaks none -- or
-    /// IPv6 hiding what it carries.
+    /// IPv6 hiding what it carries; and DHCP messages it takes and does not
+    /// answer -- a release, a decline, one not well-formed -- which went
+    /// nowhere, counted nowhere.
     foreign: AtomicU64,
     /// The IPv6 addresses the guests have bound (`Bindings`).
     bindings: IrqSpinLock<Bindings>,
@@ -866,15 +878,25 @@ impl Ports {
         self.deliver(port, &frame, None);
     }
 
+    /// A guest's DHCP message answered into its port -- with the DNS server
+    /// nos has now, asked of the kernel as each is answered: the one it had
+    /// when a guest was last started was handed out until the next start,
+    /// whatever nos's own lease said since. One it does not answer is
+    /// counted with what the switch does not carry.
     fn answer_dhcp(&self, port: usize, frame: &[u8]) {
         let network = dhcp::Network {
             server_ip: HOST_IP, server_mac: HOST_MAC, mask: MASK,
-            dns: self.dns.load(Ordering::Relaxed),
+            dns: kcore::net::dns_server().unwrap_or(0),
         };
         let mut reply = [0u8; dhcp::REPLY_MAX];
-        if let Some(len) = dhcp::answer(frame, port_ip(port), &network, &mut reply) {
-            self.dhcp.fetch_add(1, Ordering::Relaxed);
-            self.deliver(port, &reply[..len], None);
+        match dhcp::answer(frame, port_ip(port), &network, &mut reply) {
+            Some(len) => {
+                self.dhcp.fetch_add(1, Ordering::Relaxed);
+                self.deliver(port, &reply[..len], None);
+            }
+            None => {
+                self.foreign.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -1095,7 +1117,7 @@ impl Switch {
         }
         let ports = Arc::new(Ports {
             ports, in_use: AtomicUsize::new(0), vnic, to_host: AtomicU64::new(0), refused: AtomicU64::new(0),
-            dns: AtomicU32::new(0), dhcp: AtomicU64::new(0), foreign: AtomicU64::new(0),
+            dhcp: AtomicU64::new(0), foreign: AtomicU64::new(0),
             bindings: IrqSpinLock::new(bindings), advertised: AtomicU64::new(0),
         });
         let nat = Mutex::new(None).ok_or_else(|| String::from("out of memory for the switch"))?;
@@ -1128,12 +1150,16 @@ impl Switch {
         self.nat.lock().as_ref().map(|n| n.outer().ip())
     }
 
+    /// The device the guests go out through, while NAT is on: the one the
+    /// world reaches them by, and so the one `hv forward` listens on.
+    pub fn outer_nic(&self) -> Option<kcore::net::Nic> {
+        self.nat.lock().as_ref().map(|n| n.outer())
+    }
+
     /// The DNS server the guests are given, asked of the kernel afresh: for
-    /// `ip=`, and for what DHCP hands out from here on.
+    /// a guest's `ip=` as it starts. DHCP asks as it answers.
     pub fn dns(&self) -> Option<u32> {
-        let dns = kcore::net::dns_server();
-        self.ports.dns.store(dns.unwrap_or(0), Ordering::Relaxed);
-        dns
+        kcore::net::dns_server()
     }
 
     /// A free port for `vm`, on `network` or alone: its number, or why there
@@ -1239,8 +1265,22 @@ impl Switch {
     }
 
     /// The port given up, and its VM with it -- dropped here, the lock down.
+    /// What was the VM's goes first, and the port last: given up first, a
+    /// start that claimed it in between had its own first IPv6 binding and
+    /// NAT mapping forgotten by this release, and NAT's answers to the old
+    /// VM's flows put in its inbox. The VM's tasks are joined by now, so
+    /// nothing of it makes new ones meanwhile.
     pub fn release(&self, port: usize) {
         let Some(p) = self.ports.ports.get(port) else { return };
+        /* Its IPv6 addresses go with its VM: the next to claim the port, or
+         * any port, may have them. */
+        self.ports.bindings.lock().release(port);
+        /* The port's address goes with it to the next VM to claim it: what
+         * NAT has mapped for this one's flows goes now, or the next would be
+         * answered for them -- a TCP connection's sequence numbers too. */
+        if let Some(n) = self.nat.lock().as_ref() {
+            n.forget(port_ip(port));
+        }
         let (owner, group) = {
             let mut inbox = p.inbox.lock();
             inbox.clear();
@@ -1257,15 +1297,6 @@ impl Switch {
             if let Some(n) = self.networks.lock().get_mut(group as usize - 1) {
                 n.ports = n.ports.saturating_sub(1);
             }
-        }
-        /* Its IPv6 addresses go with its VM: the next to claim the port, or
-         * any port, may have them. */
-        self.ports.bindings.lock().release(port);
-        /* The port's address goes with it to the next VM to claim it: what
-         * NAT has mapped for this one's flows goes now, or the next would be
-         * answered for them -- a TCP connection's sequence numbers too. */
-        if let Some(n) = self.nat.lock().as_ref() {
-            n.forget(port_ip(port));
         }
     }
 

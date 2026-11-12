@@ -21,27 +21,36 @@
 //! own. The device hands a request over (`Backend::submit`) and the task
 //! starts it the moment it finds it, so the disk has every request the
 //! guest has out; each comes back when it is done -- not with the slowest
-//! of a batch -- and what came back goes the other way, each lot waking the
-//! vCPU (`Wake`) -- a halted one's task out of its wait, a running one out
-//! of its guest -- to give it to the guest. A flush, a discard and a write
-//! of zeros are served on their own, the image's I/O in flight done first.
-//! The way there and the way back are queues under one lock, with room for
-//! every request the device can have out taken when the disk is opened, so
-//! nothing on the way allocates; the vCPU looks at a count first, every time
-//! round its loop, and takes the lock only when something is there. The task
-//! sleeps on its image's queue, which a request handed over wakes as well as
-//! a command done -- spinning for it first while the guest keeps its disk
-//! busy, for as long as its waits have been short (`POLL_MAX_NS`), so that
-//! neither costs a sleep and a wake.
+//! of a batch -- and what came back goes the other way: the disk's own task
+//! gives each lot to the guest, under the guest's platform lock, where the
+//! guest lets it (`Wake::served`, `hv::run::LinuxGuest::serve_disk`), and
+//! wakes the vCPU -- a halted one's task out of its wait, a running one out
+//! of its guest -- only when its round has to come anyway, or when no guest
+//! is there to give it to. A flush, a discard and a write of zeros are
+//! served on their own, the image's I/O in flight done first. The way there
+//! and the way back are queues under one lock, with room for every request
+//! the device can have out taken when the disk is opened -- the task's own
+//! lists too, so that a disk that could not have them refuses the start
+//! rather than starting a guest whose disk never answers -- and for an
+//! image and a device nothing on the way allocates; the vCPU looks at a
+//! count first, every time round its loop, and takes the lock only when
+//! something is there. The task sleeps on its image's queue, which a request
+//! handed over wakes as well as a command done -- spinning for it first
+//! while the guest keeps its disk busy, for as long as its waits have been
+//! short (`POLL_MAX_NS`), so that neither costs a sleep and a wake.
 //!
 //! A volume of NBS's (`nbs:<volume>`, plans/nbs.md, N8) is a disk the same
 //! way: its media is the volume's session (nbsdrive's `Drive`), attached
 //! as the disk opens -- for writing at a new generation, every cs fenced,
 //! what its last writer left open reconciled -- whose requests the task
-//! starts and whose answers it takes as an image's, its buffers the
-//! session's own, its waits on the session's mailbox and the guest's
-//! requests alike. The disk going lets the volume go: flushed, its chunks
-//! closed, detached.
+//! starts and whose answers it takes as an image's, its waits on the
+//! session's mailbox and the guest's requests alike. Its buffers are the
+//! disk's own, a slot each, which go with a request -- a write's bytes, the
+//! room a read's come back in -- and come back with its answer, and its
+//! requests are told apart by a slot's tag, kept with no allocation; the
+//! session itself makes a message of each request it sends, from the heap,
+//! which is the one thing on a volume's way that allocates. The disk going
+//! lets the volume go: flushed, its chunks closed, detached.
 //!
 //! The task is on a CPU of its own, not the vCPU's (`hv::place`): the disk
 //! works while the guest runs rather than when it stops -- a thread of the
@@ -50,7 +59,7 @@
 //! request it is serving, if any -- and waits for it, and what it had not
 //! served goes with the queues.
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -221,13 +230,22 @@ struct Pipe {
 
 /// What the disk's task starts from: the pipe, and the image's queue -- its
 /// calls the task's alone; the vCPU only lends its buffers and wakes it --
-/// and the disk's number among its guest's, which its records say.
+/// the disk's number among its guest's, which its records say, and the
+/// task's own lists, with room for every request the device can have out:
+/// taken where a failure refuses the start (`QueuedDisk::open`). Taken by
+/// the task once it ran, a want of memory there left a started guest whose
+/// disk never answered.
 struct Serve {
     pipe: Arc<Pipe>,
     queue: Arc<dyn Media>,
     disk: u8,
     /// The CPU it is bound to, held to wake quickly while it serves.
     cpu: u32,
+    /// Requests handed over and not yet started, those done and not yet
+    /// handed back, and those with the media, by slot.
+    new: Vec<Request>,
+    finished: Vec<Request>,
+    flying: Vec<Option<Request>>,
 }
 
 /// How long the task sleeps with nothing to do before it looks again: a
@@ -361,14 +379,17 @@ impl Media for DiskQueue {
 
 /// A volume of NBS's as a disk's media: its session -- the disk's task's
 /// alone, but for the take at the end -- a buffer a request the device can
-/// have out, each request's slot by the session's tag for it, and the
-/// event the session's mailbox is made on, which a request handed over
-/// signals too.
+/// have out, which goes with its request to the session and comes back with
+/// its answer, the session's tag for each slot's request, and the event the
+/// session's mailbox is made on, which a request handed over signals too.
+/// The tags are a slot's each, not a map: a request on its way allocated a
+/// node of one now and then, and a read a buffer of up to 256 KiB of its
+/// own, both from the allocator that panics.
 struct Volume {
     name: String,
     drive: Mutex<Option<nbsdrive::Drive>>,
     slots: Vec<Mutex<Vec<u8>>>,
-    tags: Mutex<BTreeMap<u64, usize>>,
+    tags: Mutex<[Option<u64>; blk::IN_FLIGHT]>,
     event: SharedEvent,
 }
 
@@ -399,7 +420,7 @@ impl Volume {
             name: owned,
             drive: Mutex::new(None).ok_or_else(|| String::from("out of memory"))?,
             slots,
-            tags: Mutex::new(BTreeMap::new()).ok_or_else(|| String::from("out of memory"))?,
+            tags: Mutex::new([None; blk::IN_FLIGHT]).ok_or_else(|| String::from("out of memory"))?,
             event,
         };
         let drive = nbsdrive::Drive::open_on(name, &me, !read_only, force, &volume.event)?;
@@ -415,26 +436,46 @@ impl Volume {
         })
     }
 
-    /// What the session has done, each back in its slot -- a read's bytes
-    /// copied into it, a write's buffer put back -- and said by `done`.
+    /// What the session has done, each buffer back in its slot -- a read's
+    /// with its bytes in it, a write's as it went -- and said by `done`.
     fn take(&self, d: &mut nbsdrive::Drive, done: &mut dyn FnMut(usize, bool)) -> usize {
         let mut n = 0;
         while let Some(t) = d.take_done() {
-            let Some(k) = self.tags.lock().remove(&t.tag) else { continue };
-            if let Some(slot) = self.slots.get(k) {
-                let mut buf = slot.lock();
-                if buf.is_empty() {
-                    /* A write's: its own buffer, whole again */
-                    *buf = t.data;
-                    buf.resize(blk::REQUEST_BYTES, 0);
-                } else if let Some(to) = buf.get_mut(..t.data.len()) {
-                    to.copy_from_slice(&t.data);
+            let k = {
+                let mut tags = self.tags.lock();
+                let k = tags.iter().position(|&tag| tag == Some(t.tag));
+                if let Some(k) = k {
+                    tags[k] = None;
                 }
-            }
+                k
+            };
+            let Some(k) = k else { continue };
+            self.refill(k, t.data);
             done(k, t.ok);
             n += 1;
         }
         n
+    }
+
+    /// Slot `k` given its buffer back, `REQUEST_BYTES` long again -- the one
+    /// its request took, as the session gives it back: within its room, no
+    /// allocation. One the session did not give back -- a request it
+    /// refused -- has its room taken afresh, and where there is none the
+    /// slot is left empty, said: each request the device hands it then fails
+    /// as an error the guest is told of, where growing it was a panic.
+    fn refill(&self, k: usize, mut data: Vec<u8>) {
+        let Some(slot) = self.slots.get(k) else { return };
+        if data.capacity() < blk::REQUEST_BYTES {
+            data.clear();
+            if data.try_reserve_exact(blk::REQUEST_BYTES).is_err() {
+                kcore::klog!(0, "hv: nbs:{}: no memory for a request's buffer -- slot {} fails what it is handed",
+                             self.name, k);
+                *slot.lock() = Vec::new();
+                return;
+            }
+        }
+        data.resize(blk::REQUEST_BYTES, 0);
+        *slot.lock() = data;
     }
 }
 
@@ -446,24 +487,35 @@ impl Media for Volume {
     fn start(&self, k: usize, write: bool, offset: u64, len: usize) -> kcore::error::Result<Started> {
         use kcore::error::Error;
         let slot = self.slots.get(k).ok_or(Error::InvalidValue)?;
+        let read_len = u32::try_from(len).map_err(|_| Error::InvalidValue)?;
         let mut d = self.drive.lock();
         let d = d.as_mut().ok_or(Error::IoError)?;
-        let tag = if write {
-            /* The slot's buffer goes with the write, and comes back with it */
-            let mut data = core::mem::take(&mut *slot.lock());
+        /* The slot's buffer goes with the request and comes back with its
+         * answer: a write's bytes, cut to its length, or the room a read's
+         * come back in -- the session takes a read's room as it is, having
+         * as much as it asks for. One the device left empty (`refill`)
+         * carries nothing. */
+        let mut data = core::mem::take(&mut *slot.lock());
+        if data.len() < len {
+            *slot.lock() = data;
+            return Err(Error::NoMemory);
+        }
+        let op = if write {
             data.truncate(len);
-            match d.submit(nbsdrive::Op::Write { offset }, data) {
-                Ok(tag) => tag,
-                Err(_) => {
-                    slot.lock().resize(blk::REQUEST_BYTES, 0);
-                    return Err(Error::NoMemory);
-                }
-            }
+            nbsdrive::Op::Write { offset }
         } else {
-            let len = u32::try_from(len).map_err(|_| Error::InvalidValue)?;
-            d.submit(nbsdrive::Op::Read { offset, len }, Vec::new()).map_err(|_| Error::NoMemory)?
+            data.clear();
+            nbsdrive::Op::Read { offset, len: read_len }
         };
-        self.tags.lock().insert(tag, k);
+        let tag = match d.submit(op, data) {
+            Ok(tag) => tag,
+            Err(_) => {
+                /* The buffer went with the refusal: room for the slot again */
+                self.refill(k, Vec::new());
+                return Err(Error::NoMemory);
+            }
+        };
+        self.tags.lock()[k] = Some(tag);
         Ok(Started::InFlight)
     }
 
@@ -579,11 +631,14 @@ impl QueuedDisk {
         let mut todo = VecDeque::new();
         let mut done = VecDeque::new();
         let mut name = String::new();
+        let (mut new, mut finished, mut flying) = (Vec::new(), Vec::new(), Vec::new());
         if todo.try_reserve_exact(blk::IN_FLIGHT).is_err() || done.try_reserve_exact(blk::IN_FLIGHT).is_err()
-            || name.try_reserve(runner.name.len() + 8).is_err()
+            || name.try_reserve(runner.name.len() + 8).is_err() || new.try_reserve_exact(blk::IN_FLIGHT).is_err()
+            || finished.try_reserve_exact(blk::IN_FLIGHT).is_err() || flying.try_reserve_exact(blk::IN_FLIGHT).is_err()
         {
             return Err(alloc::format!("{}: out of memory for its queues", word));
         }
+        flying.resize_with(blk::IN_FLIGHT, || None::<Request>);
         let Some(requests) = Mutex::new(Requests { todo, done, stop: false }) else {
             return Err(alloc::format!("{}: out of memory for its queues", word));
         };
@@ -592,9 +647,9 @@ impl QueuedDisk {
         let letter = char::from(b'a'.saturating_add(index));
         let _ = write!(name, "hv/{}/vd{}", runner.name, letter);
         let queue = served.queue.clone();
-        let task = kcore::task::spawn_on_with(&name, 1u64 << runner.cpu,
-                                              Serve { pipe: pipe.clone(), queue: queue.clone(), disk: index,
-                                                      cpu: runner.cpu }, serve)
+        let start = Serve { pipe: pipe.clone(), queue: queue.clone(), disk: index, cpu: runner.cpu, new, finished,
+                            flying };
+        let task = kcore::task::spawn_on_with(&name, 1u64 << runner.cpu, start, serve)
             .ok_or_else(|| alloc::format!("{}: no task to serve it", word))?;
         Ok(QueuedDisk { pipe, queue, size: served.size, read_only, discard_sectors: served.discard_sectors,
                         discards: served.discards, writes_zeroes: served.writes_zeroes,
@@ -632,8 +687,10 @@ fn open_file(path: &str, read_only: bool, runner: &Runner) -> Result<Served, Str
         .identity().ok_or_else(|| alloc::format!("{}: the kernel does not know it", path))?;
     let claim = runner.claims.claim(id, !read_only, runner.holder)
         .map_err(|why| alloc::format!("{}: {}", path, why))?;
+    /* The kernel says no more than that it was refused: each reason it has. */
     let image = Image::open(path, !read_only).map_err(|_| {
-        alloc::format!("{}: cannot be held as a disk -- nos has it open for writing, or cannot write it here", path)
+        alloc::format!("{}: cannot be held as a disk -- nos has it open for writing, cannot write it here, has every \
+                        image it holds at once held already, or is short of memory", path)
     })?;
     let queue = image.into_queue(blk::IN_FLIGHT, blk::REQUEST_BYTES)
         .map_err(|_| alloc::format!("{}: out of memory for its buffers", path))?;
@@ -661,12 +718,17 @@ fn open_file(path: &str, read_only: bool, runner: &Runner) -> Result<Served, Str
 /// a kernel its name -- held as a disk: claimed in the block layer for
 /// `runner`'s guest, whether it writes it or not, so that nothing else does
 /// meanwhile -- no mount, disk log or other guest, nor anything overlapping
-/// it -- and refused outright where the machine's firmware boots from it.
+/// it -- and refused outright where the machine's firmware boots from it or
+/// from a partition on it.
 fn open_device(word: &str, read_only: bool, runner: &Runner) -> Result<Served, String> {
     let disk = crate::devices::find(word)?;
-    if let Some(what) = disk.kind().boots_the_machine() {
-        return Err(alloc::format!("{} ({}) is {}: the machine boots from it, and no guest is given it", word,
-                                  disk.name(), what));
+    if let Some((d, what)) = crate::devices::boots_the_machine(&disk) {
+        return Err(if d.handle() == disk.handle() {
+            alloc::format!("{} ({}) is {}: the machine boots from it, and no guest is given it", word, disk.name(), what)
+        } else {
+            alloc::format!("{} ({}) holds {}, {}: the machine boots from it, and no guest is given it", word,
+                           disk.name(), d.name(), what)
+        });
     }
     let ss = disk.sector_size();
     if ss != blk::SECTOR && ss != 4096 {
@@ -757,21 +819,11 @@ impl Drop for QueuedDisk {
 /// `disk_start` is recorded as it is picked up, and its `disk_done` as it is
 /// done -- before it goes back the other way.
 fn serve(start: Serve) {
-    let Serve { pipe, queue, disk, cpu } = start;
+    let Serve { pipe, queue, disk, cpu, mut new, mut finished, mut flying } = start;
     /* The CPU it serves from held to wake quickly while it does: its idles
      * between the guest's requests out of the C-state between C1 and the
      * deepest, whose wake each request after one would wait for. */
     let _latency = kcore::cpu::Latency::hold(cpu);
-    let (mut new, mut finished, mut flying) = (Vec::new(), Vec::new(), Vec::new());
-    if new.try_reserve_exact(blk::IN_FLIGHT).is_err() || finished.try_reserve_exact(blk::IN_FLIGHT).is_err()
-        || flying.try_reserve_exact(blk::IN_FLIGHT).is_err()
-    {
-        /* Nothing served: the guest's requests stay with the device, and
-         * its disk goes quiet -- said, for whoever looks. */
-        kcore::klog!(0, "hv: a disk's task has no memory for its requests");
-        return;
-    }
-    flying.resize_with(blk::IN_FLIGHT, || None::<Request>);
     /* How long the next wait spins first (POLL_FIRST_NS) */
     let mut poll_ns = 0u64;
     loop {
