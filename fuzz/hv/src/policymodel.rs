@@ -91,10 +91,10 @@ const EXT1_EDX: u32 = 0x1FF | (1 << 11) | (0x3F << 12) | (1 << 20) | (1 << 22) |
 const EXT1_EDX_RDTSCP: u32 = 1 << 27;
 /* 0x8000_0007 EDX: the invariant TSC. */
 const EXT7_EDX: u32 = 1 << 8;
-/* 0x8000_0008 EAX: the physical and linear address widths. EBX: CLZERO,
+/* 0x8000_0008 EAX: the physical and linear address widths -- the second
+ * 48 at most, LA57 not being offered. EBX: CLZERO,
  * the FP error pointers always saved, and two the CPU is not affected by
  * -- speculative store bypass, branch type confusion. */
-const EXT8_EAX: u32 = 0xFFFF;
 const EXT8_EBX: u32 = (1 << 0) | (1 << 2) | (1 << 26) | (1 << 29);
 /* 0x8000_0021 EAX: no nested data breakpoints, LFENCE serializing, VERW
  * clearing what TSA leaves, a null selector clearing the base, and not
@@ -289,7 +289,12 @@ fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u3
             bad = Some(what.to_string());
         }
     };
-    let (x2apic, apic_bit, arat) = if apic { (LEAF1_ECX_X2APIC, LEAF1_EDX_APIC, LEAF6_EAX_ARAT) } else { (0, 0, 0) };
+    let (x2apic, arat) = if apic { (LEAF1_ECX_X2APIC, LEAF6_EAX_ARAT) } else { (0, 0) };
+    /* The APIC's own bit while it is on (IA32_APIC_BASE.EN): a CPU clears
+     * it for one turned off (SDM 11.4.3) -- and AMD's mirror of it in
+     * 0x8000_0001 EDX, a bit Intel's leaf has reserved. */
+    let apic_bit = if apic && asker.apic_on { LEAF1_EDX_APIC } else { 0 };
+    let mirror = if cpu::host_is_intel() { 0 } else { apic_bit };
     let offered = fp::offered();
     let avx = offered & fp::XCR0_AVX != 0;
     /* Leaf 1's XSAVE line, exactly; and the AVX line's other bits, which
@@ -323,7 +328,7 @@ fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u3
             want(g[2] & LEAF1_ECX_TSC_DEADLINE == deadline, "the TSC-deadline timer exactly when the guest has APICs");
             want(g[2] & LEAF1_ECX_HYPERVISOR != 0, "the hypervisor bit");
             want(leaked(g[3], h[3], LEAF1_EDX, apic_bit | htt) == 0, "EDX within the model's");
-            want(g[3] & LEAF1_EDX_APIC == apic_bit, "the APIC exactly when the guest has APICs");
+            want(g[3] & LEAF1_EDX_APIC == apic_bit, "the APIC exactly when the guest has APICs and this one is on");
             want(g[3] & LEAF1_EDX_HTT == htt, "HTT exactly when a package has room for more than one APIC ID");
         }
         4 => {
@@ -404,12 +409,16 @@ fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u3
         0x8000_0001 => {
             want(g[0] == h[0] && g[1] == h[1], "EAX and EBX: the host's");
             want(leaked(g[2], h[2], EXT1_ECX | EXT1_ECX_TOPOEXT, 0) == 0, "ECX within the model's");
-            want(leaked(g[3], h[3], EXT1_EDX | bit(runs.rdtscp, EXT1_EDX_RDTSCP), apic_bit) == 0,
+            want(leaked(g[3], h[3], EXT1_EDX | bit(runs.rdtscp, EXT1_EDX_RDTSCP), mirror) == 0,
                  "EDX within the model's");
+            want(g[3] & LEAF1_EDX_APIC == mirror, "AMD's mirror of the APIC bit, as leaf 1's, and on AMD alone");
         }
         0x8000_0007 => want(g == [0, 0, 0, h[3] & EXT7_EDX], "the invariant TSC alone"),
         0x8000_0008 => {
-            want(g[0] == h[0] & EXT8_EAX, "EAX: the address widths, the host's");
+            /* The linear width 48 at most: LA57 is not offered, and its
+             * 57 would have a guest's canonical checks not its CPU's. */
+            let linear = ((h[0] >> 8) & 0xFF).min(48);
+            want(g[0] == (h[0] & 0xFF) | linear << 8, "EAX: the host's physical width, a linear one of 48 at most");
             want(leaked(g[1], h[1], EXT8_EBX | EXT8_EBX_SPEC, 0) == 0, "EBX within the model's");
             let ecx = if cpu::host_is_intel() { 0 } else { ((shape.cpus() - 1) & 0xFF) | package_shift(shape) << 12 };
             want(g[2] == ecx && g[3] == 0, "ECX: AMD's, the package's CPUs and its APIC IDs' width; EDX nothing");
@@ -842,7 +851,7 @@ pub fn policy_target(r: &mut Input) {
     let vcpus: Vec<u32> = (0..n).map(|i| if r.u8() < 232 { i } else { r.below(64) as u32 }).collect();
     let shape = if r.u8() < 32 { Shape::cores(n) } else { Shape::of(&topo, &vcpus) };
     let apic_id = r.below(u64::from(shape.cpus())) as u32;
-    let asker = Asker { apic_id, apic: r.bool(), cr4: r.value64(), xcr0, shape };
+    let asker = Asker { apic_id, apic: r.bool(), apic_on: r.u8() >= 32, cr4: r.value64(), xcr0, shape };
     let told = tops(&asker);
     for leaf in (0..=0x30u32).chain(0x4000_0000..=0x4000_0010).chain(0x8000_0000..=0x8000_0030) {
         check_leaf(leaf, r.below(4) as u32, &asker, told);
