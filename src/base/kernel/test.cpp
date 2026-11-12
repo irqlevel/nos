@@ -3424,13 +3424,30 @@ bool test_module_unload()
     if (!listening)
         klog(0, "test_module_unload: the listener: %s", out.get());
 
+    /* A task the module starts and leaves, its code the module's: the
+       unload has to ask it to stop and wait for it (sweep_module_tasks).
+       Left running, its next turn runs in the pages the unload frees -- a
+       fault, which is the check -- and one that will not stop keeps the
+       image, which images_kept says */
+    const ulong kept_before = modules.images_kept();
+    out.reset();
+    Cmd::dispatch("modtest task", out);
+    const bool tasked = (stdlib::str_str(out.get(), "modtest task: left running") != nullptr);
+    if (!tasked)
+        klog(0, "test_module_unload: the task: %s", out.get());
+
     /* Unloaded whatever came of that: the call returns only once the stop
        has run, and the unload, only once the call has returned */
     out.reset();
     stdlib::Error unloaded = modules.unload("modtest", out);
-    bool ok = unloaded.ok() && !modules.is_loaded("modtest") && ticking && (listening || no_nic);
+    bool ok = unloaded.ok() && !modules.is_loaded("modtest") && ticking && (listening || no_nic) && tasked;
     if (!unloaded.ok() || modules.is_loaded("modtest"))
         klog(0, "test_module_unload: unload failed: %s", out.get());
+    if (modules.images_kept() != kept_before)
+    {
+        klog(0, "test_module_unload: the task the module left was not stopped: its image kept");
+        ok = false;
+    }
     sleep(LEFT_TIMER_NS);
     if (!holding)
     {

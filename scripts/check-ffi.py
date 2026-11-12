@@ -20,6 +20,18 @@ sign, every raw pointer and reference as a pointer, a function pointer (an
 `Option` of one included) by its own parameters and result, a type alias or
 a typedef by what it names, a struct passed by value by its name.
 
+Two more things no compiler holds, held here too. The Makefile takes the
+functions a module may import from the ffi crate's extern blocks by reading
+them as text (`ffi_functions`): a block it does not see -- indented, an ABI
+other than "C", on one line -- exports nothing, and a comment line naming a
+function in one exports a name with no declaration; so what that reading
+finds is held to a parse of every extern block, and a `static` in one, which
+is never exported, is refused. And the structs both halves lay out -- a task
+or a module listed, the memory's counters, a PCI function, a terminal, a
+random draw, a module's own header -- are held field by field, in order, by
+name and width: a size assert passes two fields of one width swapped, or one
+renamed on one side.
+
 Run by `make check`. Exit code 22 when two spellings disagree, each listed
 with where it is, as check-crates.py's.
 """
@@ -220,23 +232,133 @@ def rust_fn_at(text, m, aliases):
     return rust_sig(text[open_at + 1:close], r.group(1) if r else "", aliases)
 
 
-def ffi_declarations(spellings, ffi_names):
+# An extern block, wherever it is and whatever its ABI string (blanked by
+# `strip`): `extern "C" {`, `pub(crate) unsafe extern "C-unwind" {`, `extern {`.
+EXTERN_BLOCK = re.compile(r'\bextern\s*(?:""\s*)?\{')
+
+
+def ffi_declarations(spellings, ffi_names, statics):
     alias_ffi = {}
     texts = {}
     for path in walk([FFI], (".rs",)):
         texts[path] = strip(open(path, encoding="utf-8").read(), True)
         alias_ffi.update(rust_aliases(texts[path]))
     for path, text in texts.items():
-        for block in re.finditer(r'^unsafe extern ""\s*\{', text, re.M):
-            end = matching(text, text.index("{", block.start()))
-            body_at = block.end()
-            for m in FN_HEAD.finditer(text, body_at, end):
+        for block in EXTERN_BLOCK.finditer(text):
+            open_at = text.index("{", block.start())
+            end = matching(text, open_at)
+            for m in FN_HEAD.finditer(text, open_at + 1, end):
                 name = m.group(1)
                 sig = rust_fn_at(text, m, alias_ffi)
                 if sig:
                     ffi_names.add(name)
                     spellings.setdefault(name, []).append((sig, path, line_of(text, m.start()), "ffi declaration"))
+            for m in re.finditer(r"\bstatic\s+(?:mut\s+)?(\w+)\s*:", text[open_at + 1:end]):
+                statics.append((m.group(1), path, line_of(text, open_at + 1 + m.start())))
     return alias_ffi
+
+
+def makefile_scan():
+    """The names the Makefile's `ffi_functions` takes from the ffi crate, as
+    its awk takes them: a block opens at a line beginning `extern "C" {` or
+    `unsafe extern "C" {`, ends at a line beginning `}`, and every line in
+    between that has `fn <name>` in it -- a comment's too -- gives a name."""
+    names = {}
+    for path in walk([FFI], (".rs",)):
+        inblock = False
+        for number, line in enumerate(open(path, encoding="utf-8").read().split("\n"), 1):
+            if not inblock:
+                if re.match(r'^(unsafe )?extern "C" \{', line):
+                    inblock = True
+                continue
+            if line.startswith("}"):
+                inblock = False
+                continue
+            m = re.search(r"fn [A-Za-z_][A-Za-z0-9_]*", line)
+            if m:
+                names.setdefault(m.group(0)[3:], (path, number))
+    return names
+
+
+# ---- the structs both halves lay out ----
+
+# (Rust file, its struct, C++ file, its struct): each field by name, in
+# order, of one width -- an array's element's; its length is the size
+# asserts' on each side.
+SHARED_STRUCTS = [
+    ("src/crates/base/ffi/src/system.rs", "TaskInfo", "src/base/kernel/task.h", "TaskSnapshot"),
+    ("src/crates/base/ffi/src/system.rs", "ModuleInfo", "src/base/kernel/module.h", "ModuleSnapshot"),
+    ("src/crates/base/ffi/src/system.rs", "MemInfo", "src/base/kernel/rust_ffi.cpp", "RustMemInfo"),
+    ("src/crates/base/ffi/src/pci.rs", "PciDeviceInfo", "src/base/kernel/rust_ffi.cpp", "RustPciDeviceInfo"),
+    ("src/crates/base/ffi/src/cmd.rs", "CmdTerminal", "src/base/lib/printer.h", "TerminalInfo"),
+    ("src/crates/base/ffi/src/random.rs", "HwRandomDraw", "src/base/kernel/rust_ffi.cpp", "HwRandomDraw"),
+    ("src/crates/base/kmod/src/lib.rs", "ModuleInfo", "src/base/kernel/module.cpp", "ModuleInfo"),
+]
+
+WIDTH = {"u8": 1, "i8": 1, "bool": 1, "u16": 2, "i16": 2, "u32": 4, "i32": 4, "f32": 4,
+         "u64": 8, "i64": 8, "f64": 8, "ptr": 8}
+
+
+def kind(t):
+    """A field's type, made comparable: a width, an array of a width, or a
+    pointer -- a function's included."""
+    if t == "ptr" or t.startswith("fn("):
+        return "ptr"
+    return str(WIDTH.get(t, t))
+
+
+def rust_struct(text, name):
+    m = re.search(r"\bstruct\s+%s\s*\{" % name, text)
+    if not m:
+        return None
+    open_at = text.index("{", m.start())
+    fields = []
+    for part in split_top(text[open_at + 1:matching(text, open_at)]):
+        f = re.match(r"^(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?(\w+)\s*:(.*)$", part, re.S)
+        if not f:
+            return None
+        t = f.group(2).strip()
+        a = re.match(r"^\[(.*);.*\]$", t, re.S)
+        fields.append((f.group(1), "[" + kind(rust_type(a.group(1), {})) + "]" if a else kind(rust_type(t, {}))))
+    return fields
+
+
+def cpp_struct(text, name):
+    m = re.search(r"\bstruct\s+%s\s*\{" % name, text)
+    if not m:
+        return None
+    open_at = text.index("{", m.start())
+    fields = []
+    for decl in text[open_at + 1:matching(text, open_at)].split(";"):
+        decl = re.sub(r"\s+", " ", decl).strip()
+        if not decl or decl.startswith(("static ", "using ", "typedef ")):
+            continue
+        fp = re.match(r"^(.*?)\(\s*\*\s*(\w+)\s*\)\s*\(.*\)$", decl)
+        if fp:
+            fields.append((fp.group(2), "ptr"))
+            continue
+        a = re.match(r"^(.*?)\b(\w+)\s*\[[^\]]*\]$", decl)
+        if a:
+            fields.append((a.group(2), "[" + kind(cpp_type(a.group(1), {})) + "]"))
+            continue
+        f = re.match(r"^(.*?)\b(\w+)$", decl)
+        if not f:
+            return None
+        fields.append((f.group(2), kind(cpp_type(f.group(1), {}))))
+    return fields
+
+
+def shared_structs():
+    bad = []
+    for rust_file, rust_name, cpp_file, cpp_name in SHARED_STRUCTS:
+        r = rust_struct(strip(open(os.path.join(ROOT, rust_file), encoding="utf-8").read(), True), rust_name)
+        c = cpp_struct(strip(open(os.path.join(ROOT, cpp_file), encoding="utf-8").read(), False), cpp_name)
+        if r is None or c is None:
+            bad.append("%s in %s or %s in %s not found, or not read" % (rust_name, rust_file, cpp_name, cpp_file))
+        elif r != c:
+            bad.append("%s (%s) and %s (%s) are laid out differently:\n        %s\n        %s"
+                       % (rust_name, rust_file, cpp_name, cpp_file, r, c))
+    return bad
 
 
 def rust_definitions(spellings, ffi_names, alias_ffi):
@@ -379,9 +501,30 @@ def cpp_spellings(spellings):
 def main():
     spellings = {}
     ffi_names = set()
-    alias_ffi = ffi_declarations(spellings, ffi_names)
+    statics = []
+    alias_ffi = ffi_declarations(spellings, ffi_names, statics)
     rust_definitions(spellings, ffi_names, alias_ffi)
     cpp_spellings(spellings)
+
+    failed = False
+    scanned = makefile_scan()
+    for name in sorted(ffi_names - set(scanned)):
+        failed = True
+        path, line, _ = next(s for s in spellings[name] if s[3] == "ffi declaration")[1:]
+        print("check-ffi: %s (%s:%d) is declared in a block the Makefile's scan does not see -- indented, "
+              "another ABI, or on one line: it is no export" % (name, os.path.relpath(path, ROOT), line))
+    for name in sorted(set(scanned) - ffi_names):
+        failed = True
+        path, line = scanned[name]
+        print("check-ffi: the Makefile's scan takes %s (%s:%d) for an export, which is no declaration -- a "
+              "comment that names it?" % (name, os.path.relpath(path, ROOT), line))
+    for name, path, line in statics:
+        failed = True
+        print("check-ffi: %s (%s:%d) is a static in an extern block: a module can import no data, and it "
+              "is never exported" % (name, os.path.relpath(path, ROOT), line))
+    for problem in shared_structs():
+        failed = True
+        print("check-ffi: " + problem)
 
     bad = 0
     compared = 0
@@ -399,7 +542,10 @@ def main():
     if bad:
         print("check-ffi: %d of %d functions disagree with themselves" % (bad, compared))
         return 22
-    print("check-ffi: %d functions, every spelling of each the same" % compared)
+    if failed:
+        return 22
+    print("check-ffi: %d functions, every spelling of each the same; %d exports as the Makefile scans them; "
+          "%d structs laid out alike" % (compared, len(scanned), len(SHARED_STRUCTS)))
     return 0
 
 

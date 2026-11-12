@@ -30,10 +30,12 @@ use kcore::dma::DmaBuffer;
 use kcore::interrupt::LegacyInterrupt;
 use kcore::msix::MsixInterrupt;
 use kcore::once::Once;
+#[cfg(target_arch = "x86_64")]
 use kcore::pci;
 use kcore::softirq;
 use kcore::klog;
 use net::{Frame, FrameQueue, NetDriver, RxQueue, TxQueue};
+#[cfg(not(target_arch = "x86_64"))]
 use virtio::mmio::{MmioTransport, Slot};
 use virtio::{Buf, Queue, Transport, UsedWatch};
 
@@ -416,8 +418,12 @@ fn interrupt(net: &'static Net) {
 
 /* ---- bring-up ---- */
 
+/// Where the device's line comes from, each arch's variant its own (as
+/// virtio-blk's).
 enum IrqSource {
+    #[cfg(target_arch = "x86_64")]
     Pci(pci::PciDevice),
+    #[cfg(not(target_arch = "x86_64"))]
     Line(u8),
 }
 
@@ -591,7 +597,9 @@ fn arm_interrupt(net: &'static Net, source: IrqSource) -> Option<u16> {
     }
 
     let registered = match source {
+        #[cfg(target_arch = "x86_64")]
         IrqSource::Pci(dev) => LegacyInterrupt::register_level_for(&dev, net, interrupt),
+        #[cfg(not(target_arch = "x86_64"))]
         IrqSource::Line(line) => LegacyInterrupt::register_irq_for(line, net, interrupt),
     };
 
@@ -632,14 +640,11 @@ pub extern "C" fn rust_virtio_net_init() {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-#[no_mangle]
-pub extern "C" fn rust_virtio_net_init() {}
-
 /// The same for the virtio-mmio windows the device tree described.
 ///
 /// # Safety
 /// `slots` points at `count` slots, each naming a mapped register window.
+#[cfg(not(target_arch = "x86_64"))]
 #[no_mangle]
 pub unsafe extern "C" fn rust_virtio_net_init_mmio(slots: *const Slot, count: usize) {
     if slots.is_null() {

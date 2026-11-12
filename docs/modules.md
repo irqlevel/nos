@@ -353,8 +353,10 @@ and the loader refuses a module whose digest is not the kernel's:
 module: built against another kernel interface (ffi 3fa81c..., this kernel 9b02e7...) -- rebuild it from this tree
 ```
 
-A module built outside the Makefile carries `unset` and is refused by a kernel
-that was not.
+A module built outside the Makefile carries `unset` and is refused, and so is
+one whose word is no digest at all -- an empty one, from a build with no
+`sha256sum`, once matched every module built the same way. The Makefile and
+kmod refuse to build with such a digest, and the loader to load one.
 
 A module cannot call another module. What it offers others -- the host API
 above all -- it offers on the [management bus](mgmt.md): `kcore::mgmt::

@@ -18,11 +18,13 @@ pub fn online_mask() -> u64 {
     ffi::cpu::kernel_cpu_online_mask() as u64
 }
 
-/// Run `handler(ctx)` synchronously on the given CPU via IPI.
-/// Blocks the calling CPU until the remote CPU completes the call.
-/// Has no effect if `cpu` is out of range or `cpu` is not running.
-pub fn run_on(cpu: u32, handler: extern "C" fn(*mut u8), ctx: *mut u8) {
-    unsafe { ffi::cpu::kernel_cpu_run_on(cpu, handler, ctx) }
+/// Run `handler(ctx)` synchronously on the given CPU via IPI, blocking the
+/// calling task until the remote CPU has: true when it ran there, false
+/// when it did not -- `cpu` out of range, not running, or stopped taking
+/// IPI work before this came -- and then whatever the handler was to do or
+/// say is undone and unsaid.
+pub fn run_on(cpu: u32, handler: extern "C" fn(*mut u8), ctx: *mut u8) -> bool {
+    unsafe { ffi::cpu::kernel_cpu_run_on(cpu, handler, ctx) != 0 }
 }
 
 /// Run `f(arg)` on `cpu` and return once it has: `run_on` with the context a
@@ -35,7 +37,8 @@ pub fn run_on(cpu: u32, handler: extern "C" fn(*mut u8), ctx: *mut u8) {
 /// interrupt context on the far CPU: registers, atomics and IRQ-safe locks,
 /// no sleeping and no allocating. Whatever it has to say comes back through
 /// an atomic in `arg`.
-pub fn run_on_with<T: Sync>(cpu: u32, arg: &T, f: fn(&T)) {
+/// True when `f` ran there, as `run_on` answers.
+pub fn run_on_with<T: Sync>(cpu: u32, arg: &T, f: fn(&T)) -> bool {
     struct Call<'a, T> {
         arg: &'a T,
         f: fn(&T),
@@ -49,7 +52,7 @@ pub fn run_on_with<T: Sync>(cpu: u32, arg: &T, f: fn(&T)) {
     }
 
     let call = Call { arg, f };
-    run_on(cpu, trampoline::<T>, &call as *const Call<'_, T> as *mut u8);
+    run_on(cpu, trampoline::<T>, &call as *const Call<'_, T> as *mut u8)
 }
 
 /// An interrupt to `cpu`, now, waiting for nothing -- `run_on`'s opposite:
@@ -95,12 +98,13 @@ extern "C" fn nothing(_ctx: *mut u8) {}
 /// then: a handler runs with interrupts off, and the IPI this sends each CPU
 /// is only taken after it. What makes it safe to free what a device's
 /// completion callback may still have been touching on its way out. Task
-/// context: it waits.
+/// context: it waits. A CPU that stopped between the look and the IPI runs
+/// no handler any more, and is not waited for.
 pub fn synchronize() {
     let mask = online_mask();
     for cpu in 0..u64::BITS {
         if mask & (1u64 << cpu) != 0 {
-            run_on(cpu, nothing, core::ptr::null_mut());
+            let _ = run_on(cpu, nothing, core::ptr::null_mut());
         }
     }
 }

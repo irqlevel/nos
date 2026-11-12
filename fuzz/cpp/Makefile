@@ -19,8 +19,12 @@ SAN := -fsanitize=address,undefined -fno-sanitize=function,vptr -fno-sanitize-re
 # src/base/lib only for quoted includes, as the kernel's headers reach it
 # ("stdlib.h"): as an ordinary path it would stand in for the host's own
 # <stdlib.h>.
+# The module interface's digest the loader is built with, shaped as the
+# kernel's Makefile gives one -- 64 hex digits, which the loader holds a
+# module's to -- and which the module target's modules carry
+FUZZ_MODULE_ABI := 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 CPPFLAGS := -I$(ROOT)/fuzz/cpp/host -I$(ROOT)/src/base -iquote $(ROOT)/src/base/lib -I$(ROOT)/fuzz/cpp/common \
-            -DNOS_MODULE_ABI=\"fuzz\"
+            -DNOS_MODULE_ABI=\"$(FUZZ_MODULE_ABI)\"
 CXXFLAGS := -std=c++20 -g -O1 -fno-omit-frame-pointer -fno-exceptions -fno-rtti $(SAN) \
             -Wall -Wextra -Wno-unused-parameter -Wno-implicit-exception-spec-mismatch
 LDFLAGS := $(SAN)

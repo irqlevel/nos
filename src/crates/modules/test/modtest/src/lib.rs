@@ -122,6 +122,45 @@ fn timer(out: &mut Output) {
     }
 }
 
+/* What test_module_unload holds the loader's task sweep to
+   (sweep_module_tasks): `modtest task` starts a task and forgets its
+   handle, as a module's bug would. Its code is this module's, and it runs
+   until it is asked to stop. The loader has to ask it, and wait -- left
+   running, its next turn runs in the pages the unload has just freed. */
+
+/// The task `modtest task` leaves: 0 not started, 1 running, 2 asked to
+/// stop and stopping.
+static LEFT_TASK: AtomicU32 = AtomicU32::new(0);
+/// How long its start is waited for.
+const LEFT_TASK_START_MS: u64 = 2000;
+
+fn left_task() {
+    LEFT_TASK.store(1, Ordering::Release);
+    while !kcore::task::stopping() {
+        kcore::task::sleep_ms(1);
+    }
+    LEFT_TASK.store(2, Ordering::Release);
+}
+
+/// `modtest task`: the task started, seen running, and left.
+fn task(out: &mut Output) {
+    let Some(handle) = kcore::task::spawn("modtest-left", left_task) else {
+        let _ = writeln!(out, "modtest task: no task to be had");
+        return;
+    };
+    core::mem::forget(handle);
+    let mut ms = 0;
+    while LEFT_TASK.load(Ordering::Acquire) == 0 && ms < LEFT_TASK_START_MS {
+        kcore::task::sleep_ms(1);
+        ms += 1;
+    }
+    if LEFT_TASK.load(Ordering::Acquire) == 0 {
+        let _ = writeln!(out, "modtest task: started and never ran");
+    } else {
+        let _ = writeln!(out, "modtest task: left running");
+    }
+}
+
 /* What test_module_unload holds the net layer's sweep to
    (rust_net_close_range): `modtest listen` takes a UDP port on the first
    NIC and forgets the listener, as a module's bug would. Its callbacks are
@@ -283,6 +322,10 @@ fn init(params: &kmod::Params, out: &mut Output) -> Result<Box<dyn kmod::Module>
         }
         if args.trim() == "listen" {
             listen(out);
+            return;
+        }
+        if args.trim() == "task" {
+            task(out);
             return;
         }
         if args.trim() == "bus" {

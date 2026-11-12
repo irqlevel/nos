@@ -49,6 +49,9 @@ namespace kernel
 /* The bridge's slots -- timers, line and MSI-X handlers -- whose code is in
    [lo, hi) stopped and taken off (rust_ffi.cpp) */
 void sweep_module_slots(ulong lo, ulong hi, const char* name);
+/* The tasks started on code in [lo, hi) asked to stop and waited for a
+   while: false when one is still running there (task.cpp) */
+bool sweep_module_tasks(ulong lo, ulong hi, const char* name);
 }
 
 namespace kernel
@@ -149,8 +152,35 @@ struct ModuleInfo
 static_assert(sizeof(ModuleInfo) == 128, "kmod::ModuleInfo layout");
 static_assert(INFO_NAME_LEN == ModuleTable::NAME_LEN_MAX + 1, "kmod::NAME_LEN");
 
-const char KERNEL_ABI[] = NOS_MODULE_ABI;
-static_assert(sizeof(KERNEL_ABI) - 1 <= INFO_ABI_LEN, "NOS_MODULE_ABI is too long");
+constexpr char KERNEL_ABI[] = NOS_MODULE_ABI;
+
+/* Whether the len bytes at s are a digest: 64 hex digits, as the Makefile's
+   sha256sum gives one */
+constexpr bool is_digest(const char* s, ulong len)
+{
+    if (len != INFO_ABI_LEN)
+        return false;
+    for (ulong i = 0; i < len; i++)
+    {
+        if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f')))
+            return false;
+    }
+    return true;
+}
+
+constexpr bool same_word(const char* a, const char* b)
+{
+    for (; *a != '\0' && *a == *b; a++, b++)
+        ;
+    return *a == *b;
+}
+
+/* The build's digest, or the word that says there is none, for a build
+   outside the Makefile ("unset", which lets no module in). An empty one --
+   a Makefile whose sha256sum was missing -- matched every module built the
+   same way, and is refused here as the Makefile refuses it. */
+static_assert(is_digest(KERNEL_ABI, sizeof(KERNEL_ABI) - 1) || same_word(KERNEL_ABI, "unset"),
+    "NOS_MODULE_ABI is no digest");
 
 /* How much of each digest a refusal for a mismatch quotes */
 const ulong ABI_SHOWN = 12;
@@ -854,10 +884,13 @@ stdlib::Error check_info(const LoadCtx& ctx, const ModuleInfo& info, LoadedModul
         return make_error(stdlib::Error::INVALID_VALUE);
     }
 
+    /* A module whose word is no digest was built outside the Makefile, or
+       by one that could not make one: refused whatever this kernel's is,
+       which two such builds would otherwise match */
     char abi[INFO_ABI_LEN];
     stdlib::mem_set(abi, 0, sizeof(abi));
     stdlib::mem_cpy(abi, KERNEL_ABI, sizeof(KERNEL_ABI) - 1);
-    if (stdlib::mem_cmp(abi, info.abi, sizeof(abi)) != 0)
+    if (!is_digest(info.abi, sizeof(info.abi)) || stdlib::mem_cmp(abi, info.abi, sizeof(abi)) != 0)
     {
         char theirs[ABI_SHOWN + 1];
         char ours[ABI_SHOWN + 1];
@@ -1099,6 +1132,7 @@ void run_job(void* ctx)
 ModuleTable::ModuleTable()
     : lock_(false)
     , halting_(false)
+    , images_kept_(0)
 {
     list_.init();
 }
@@ -1146,9 +1180,11 @@ void ModuleTable::remove(LoadedModule* module)
       the mailboxes it left open closed (rust_ipc_module_gone); a UDP
       listener and a virtual NIC's sink it left taken off (rust_net_close_range);
       a timer it left running stopped and an interrupt handler it left
-      registered taken off (sweep_module_slots);
-   and then it is off the list and its code freed. An init that failed has
-   no instance: steps 2 and 4 are not its. */
+      registered taken off (sweep_module_slots); a task it left running
+      asked to stop and waited for (sweep_module_tasks);
+   and then it is off the list and its code freed -- or, with a task of it
+   still running, kept and said, as freed it would be run in. An init that
+   failed has no instance: steps 2 and 4 are not its. */
 void ModuleTable::take_down(LoadedModule* module, bool live)
 {
     const ulong lo = module->image.base;
@@ -1177,9 +1213,25 @@ void ModuleTable::take_down(LoadedModule* module, bool live)
        code. */
     rust_net_close_range(lo, hi, module->name, len);
     sweep_module_slots(lo, hi, module->name);
+    const bool tasks_gone = sweep_module_tasks(lo, hi, module->name);
 
     remove(module);
-    release_module(module);
+    if (tasks_gone)
+    {
+        release_module(module);
+        return;
+    }
+    const ulong flags = lock_.lock_irq_save();
+    images_kept_++;
+    lock_.unlock_irq_restore(flags);
+}
+
+ulong ModuleTable::images_kept()
+{
+    const ulong flags = lock_.lock_irq_save();
+    const ulong kept = images_kept_;
+    lock_.unlock_irq_restore(flags);
+    return kept;
 }
 
 stdlib::Error ModuleTable::load(const void* image, ulong size, const char* params, stdlib::Printer& out)

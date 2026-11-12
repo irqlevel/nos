@@ -45,7 +45,7 @@ Klog::~Klog()
 
 void Klog::output(const char *fmt, ...)
 {
-    char msg[256];
+    char msg[LINE_SIZE];
 
     va_list args;
     va_start(args, fmt);
