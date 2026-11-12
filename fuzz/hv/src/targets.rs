@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use crate::devices::blk::{self, Blk};
 use crate::devices::ioapic::{self, IoApic};
 use crate::devices::net::{self, Net};
+use crate::devices::offload::{self, TxHeader};
 use crate::devices::pci::{self, Function, PciBus};
 use crate::devices::pic::Pic;
 use crate::devices::pit::Pit;
@@ -1236,7 +1237,7 @@ fn blk_target(r: &mut Input) {
         mem.refuse_maps(true);
     }
     let mut q = DriverQueue::default();
-    while let Some(op) = r.op(14) {
+    while let Some(op) = r.op(17) {
         match op {
             0 => {
                 disk.io_read(r.below(u64::from(blk::BAR_SIZE)) as u16, r.io_size());
@@ -1331,11 +1332,151 @@ fn blk_target(r: &mut Input) {
                 }
                 held_to_a_pass(&mem, || disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns()));
             }
+            14 => {
+                /* Its queue never set up after a reset, EVENT_IDX taken, and
+                 * the index a ring at page 0 would have saying a chain is
+                 * there: a notify finds no queue to work on. Nothing of page
+                 * 0 is read or written, the device is not stopped over what
+                 * it found there, and the pass does not end owing more -- it
+                 * once asked for a kick at page 0 and came back at once, for
+                 * good. */
+                blk_reset_drained(&mut disk, &mem, &state);
+                disk.io_write(GUEST_FEATURES, 4, u32::MAX, &mem, time::boot_time_ns());
+                q = DriverQueue::default();
+                let _ = mem.write(PAGE + 2, &1u16.to_le_bytes());
+                let mut low = vec![0u8; 3 * PAGE as usize];
+                let _ = mem.read(0, &mut low);
+                held_to_a_pass(&mem, || disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns()));
+                let mut after = vec![0u8; 3 * PAGE as usize];
+                let _ = mem.read(0, &mut after);
+                invariant!(!disk.more() && disk.broken().is_none() && after == low,
+                           "a notify of a queue that is down: more {}, broken {:?}, page 0 written {}", disk.more(),
+                           disk.broken(), after != low);
+            }
+            15 => {
+                /* Requests out at a reset, the old driver's; the new one's
+                 * queue set up and a request of its made: it is not handed
+                 * to the backend until the old ones are back -- beside them,
+                 * an old write and a new one to the same blocks could land in
+                 * either order. */
+                blk_queue_at(&mut disk, &mem, &mut q, u32::MAX);
+                for _ in 0..1 + r.below(4) {
+                    blk_read(&mem, &mut q, r);
+                }
+                disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns());
+                disk.io_write(DEVICE_STATUS, 1, 0, &mem, time::boot_time_ns());
+                let old = state.lock().unwrap().queued();
+                blk_queue_at(&mut disk, &mem, &mut q, u32::MAX);
+                blk_read(&mem, &mut q, r);
+                disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns());
+                let now = state.lock().unwrap().queued();
+                invariant!(old == 0 || now == old, "{} of the old driver's requests out at its reset, and {} with the \
+                           backend after the new driver's notify", old, now);
+            }
+            16 => {
+                /* A driver that took no FLUSH, which may take its disk to be
+                 * write-through: a write it makes is flushed before it is
+                 * answered -- the flush handed over as the write comes back,
+                 * and the write's status still unwritten until it does. */
+                blk_reset_drained(&mut disk, &mem, &state);
+                state.lock().unwrap().fail = false;
+                blk_queue_at(&mut disk, &mem, &mut q, u32::MAX & !(1 << 9));
+                let status = blk_write(&mem, &mut q, r);
+                disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns());
+                if state.lock().unwrap().queued() == 1 {
+                    state.lock().unwrap().ready = 1;
+                    disk.poll(&mem);
+                    let flush = state.lock().unwrap().queue.front().map(|q| q.op()) == Some(blk::Op::Flush);
+                    let mut s = [0u8];
+                    let _ = mem.read(status, &mut s);
+                    invariant!(flush && s[0] == BLK_UNSET, "a write of a driver with no FLUSH served: {} flush handed \
+                               over, its status {:#x}", if flush { "a" } else { "no" }, s[0]);
+                    state.lock().unwrap().ready = 1;
+                    disk.poll(&mem);
+                    let _ = mem.read(status, &mut s);
+                    invariant!(s[0] == 0, "a write flushed, answered {:#x}", s[0]);
+                }
+            }
             _ => {}
         }
     }
     PASSES_CUT.fetch_add(disk.stats.cut, std::sync::atomic::Ordering::Relaxed);
     mem.held_to_map_budget(since, 1);
+}
+
+/// What a status byte holds before the device writes it.
+const BLK_UNSET: u8 = 0xEE;
+
+/// The disk reset, and what its backend had of the old driver's taken back.
+fn blk_reset_drained(disk: &mut Blk, mem: &GuestMemory, state: &Arc<Mutex<DiskState>>) {
+    disk.io_write(DEVICE_STATUS, 1, 0, mem, time::boot_time_ns());
+    for _ in 0..blk::IN_FLIGHT {
+        let left = state.lock().unwrap().queued();
+        if left == 0 {
+            break;
+        }
+        {
+            let mut s = state.lock().unwrap();
+            s.ready += left;
+            s.fail = false;
+        }
+        disk.poll(mem);
+    }
+    state.lock().unwrap().ready = 0;
+}
+
+/// The disk's queue set up at page 1 by a driver taking `features`.
+fn blk_queue_at(disk: &mut Blk, mem: &GuestMemory, q: &mut DriverQueue, features: u32) {
+    disk.io_write(GUEST_FEATURES, 4, features, mem, time::boot_time_ns());
+    disk.io_write(QUEUE_SELECT, 2, 0, mem, time::boot_time_ns());
+    disk.io_write(QUEUE_PFN, 4, 1, mem, time::boot_time_ns());
+    *q = DriverQueue::at(1);
+}
+
+/// Where well-made requests' buffers go: past the rings at page 1.
+const BLK_BUFS: u64 = 0x8000;
+
+/// A read of one sector, well made, on `q`.
+fn blk_read(mem: &GuestMemory, q: &mut DriverQueue, r: &mut Input) {
+    blk_one(mem, q, r, 0);
+}
+
+/// A write of one sector, well made, on `q`: where its status byte is.
+fn blk_write(mem: &GuestMemory, q: &mut DriverQueue, r: &mut Input) -> u64 {
+    blk_one(mem, q, r, 1)
+}
+
+fn blk_one(mem: &GuestMemory, q: &mut DriverQueue, r: &mut Input, kind: u32) -> u64 {
+    let at = BLK_BUFS + (q.avail_idx % 16) as u64 * PAGE;
+    let (header, data, status) = (at, at + 0x100, at + 0x300);
+    let mut h = [0u8; 16];
+    h[..4].copy_from_slice(&kind.to_le_bytes());
+    mem.put(header, &h);
+    mem.put(status, &[BLK_UNSET]);
+    let _ = r;
+    chain_made_well(mem, q, &[(header, 16, false), (data, blk::SECTOR as u32, kind == 0), (status, 1, true)]);
+    status
+}
+
+/// `segs` a chain in `q`, as a driver that makes no mistake makes one:
+/// direct descriptors, each pointing at the next, the index one on.
+fn chain_made_well(mem: &dyn Memory, q: &mut DriverQueue, segs: &[(u64, u32, bool)]) {
+    if q.pfn == 0 || segs.is_empty() {
+        return;
+    }
+    let head = q.next_desc % QUEUE_SIZE;
+    for (i, &(addr, len, write)) in segs.iter().enumerate() {
+        let last = i + 1 == segs.len();
+        let flags = if write { DESC_WRITE } else { 0 } | if last { 0 } else { DESC_NEXT };
+        let next = ((q.next_desc + 1) % QUEUE_SIZE) as u16;
+        mem.put(q.desc(q.next_desc), &descriptor(addr, len, flags, next));
+        q.next_desc += 1;
+    }
+    let slot = u64::from(q.avail_idx) % QUEUE_SIZE;
+    mem.put(q.avail() + 4 + 2 * slot, &(head as u16).to_le_bytes());
+    q.avail_idx = q.avail_idx.wrapping_add(1);
+    mem.put(q.avail() + 2, &q.avail_idx.to_le_bytes());
+    mem.put(q.avail(), &0u16.to_le_bytes());
 }
 
 /// The guests' switch as a NIC's backend sees it: frames sent checked, and
@@ -1348,6 +1489,8 @@ pub struct NicState {
     /// What the device last told it its guest takes (`Backend::takes`),
     /// which `netrx` holds to the driver's features.
     pub takes: crate::offload::Takes,
+    /// Frames sent: each a frame on the switch.
+    pub sent: u64,
 }
 
 pub struct Nic(pub Arc<Mutex<NicState>>);
@@ -1355,6 +1498,7 @@ pub struct Nic(pub Arc<Mutex<NicState>>);
 impl net::Backend for Nic {
     fn send(&mut self, frame: &[u8]) {
         invariant!(frame.len() <= net::MAX_FRAME, "a frame of {} bytes sent, past {}", frame.len(), net::MAX_FRAME);
+        self.0.lock().unwrap().sent += 1;
     }
     /// The next frame finished -- whole, before it is cut to `buf` -- as
     /// the switch's own `recv` hands one; a send carried whole, which no
@@ -1395,6 +1539,36 @@ impl net::Backend for Nic {
     }
 }
 
+/// The most of the guest's memory one transmit pass reads: its bound's bytes
+/// and the send that crosses it, and for each chain of it -- a queue's worth
+/// at most -- its descriptors and the rings' words.
+const NET_PASS_MOST: u64 = (net::TX_PASS_BYTES + TxHeader::LEN + offload::MAX_SEND) as u64 + QUEUE_SIZE * 64;
+
+/// A send of TCP over IPv4 with `payload` bytes behind its headers, as a
+/// driver that leaves the cutting to the device hands it over: its
+/// checksums the device's to make.
+fn tcp4_send(payload: usize) -> Vec<u8> {
+    let mut f = vec![0u8; 54 + payload];
+    f[..6].copy_from_slice(&[2, 0, 0, 0, 0x64, 1]);
+    f[6..12].copy_from_slice(&[2, 0, 0, 0, 0x64, 2]);
+    f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    f[14] = 0x45;
+    f[16..18].copy_from_slice(&((40 + payload) as u16).to_be_bytes());
+    f[20..22].copy_from_slice(&0x4000u16.to_be_bytes());
+    f[22] = 64;
+    f[23] = 6;
+    f[26..30].copy_from_slice(&[10, 0, 100, 2]);
+    f[30..34].copy_from_slice(&[10, 0, 100, 1]);
+    f[34..36].copy_from_slice(&40000u16.to_be_bytes());
+    f[36..38].copy_from_slice(&80u16.to_be_bytes());
+    f[46] = 5 << 4;
+    f[47] = 0x18;
+    for (i, b) in f[54..].iter_mut().enumerate() {
+        *b = i as u8;
+    }
+    f
+}
+
 /// After a round of the NIC at `now` (`poll`): no receive interrupt still
 /// owed with its time up -- the round raises what is due -- and what it
 /// promised its backend, the next time it looks, ahead of `now`. Not after a
@@ -1433,7 +1607,7 @@ fn net_target(r: &mut Input) {
     }
     let count = 2 * usize::from(pairs) + usize::from(pairs > 1);
     let mut queues = vec![DriverQueue::default(); count];
-    while let Some(op) = r.op(16) {
+    while let Some(op) = r.op(17) {
         let which = r.below(count as u64) as usize;
         /* A pair's receive queue and its transmit queue. */
         let rx = 2 * r.below(u64::from(pairs)) as usize;
@@ -1509,6 +1683,51 @@ fn net_target(r: &mut Input) {
                  * multiqueue and its control queue among it. */
                 let features = if r.u8() < 200 { u32::MAX } else { r.value32() };
                 nic.io_write(GUEST_FEATURES, 4, features, &mem, time::boot_time_ns());
+            }
+            16 => {
+                /* A transmit ring of the largest sends of TCP, each to be cut
+                 * by a segment size down to Linux's least: each cut and sent,
+                 * none refused for its small segments -- refused under 256
+                 * bytes once, a guest's connection to a peer with a small MSS
+                 * stalled -- and a notify's pass held to its bound on the
+                 * frames it makes and the bytes it copies, where a ring of
+                 * them was once 65,536 frames and 16 MiB in one pass. */
+                const F_CSUM: u32 = 1 << 0;
+                const F_HOST_TSO4: u32 = 1 << 11;
+                const F_MRG_RXBUF: u32 = 1 << 15;
+                const TX: usize = 1;
+                const TX_PFN: u64 = 4;
+                const HEADER_AT: u64 = 0x1_0000;
+                const FRAME_AT: u64 = 0x2_0000;
+                nic.io_write(DEVICE_STATUS, 1, 0, &mem, time::boot_time_ns());
+                nic.io_write(GUEST_FEATURES, 4, u32::MAX & !F_MRG_RXBUF, &mem, time::boot_time_ns());
+                if nic.io_read(GUEST_FEATURES, 4) & (F_CSUM | F_HOST_TSO4) != F_CSUM | F_HOST_TSO4 {
+                    continue;
+                }
+                nic.io_write(QUEUE_SELECT, 2, TX as u32, &mem, time::boot_time_ns());
+                nic.io_write(QUEUE_PFN, 4, TX_PFN as u32, &mem, time::boot_time_ns());
+                queues[TX] = DriverQueue::at(TX_PFN);
+                let mss = r.pick(&[offload::MIN_SEGMENT, 64, 255, 1448]);
+                let payload = r.pick(&[1usize, 1000, offload::MAX_SEND - 54]);
+                let frame = tcp4_send(payload);
+                let header = TxHeader { flags: offload::NEEDS_CSUM, gso_type: offload::GSO_TCPV4, hdr_len: 54,
+                                        gso_size: mss as u16, csum_start: 34, csum_offset: 16 };
+                mem.put(HEADER_AT, &header.bytes());
+                mem.put(FRAME_AT, &frame);
+                for _ in 0..QUEUE_SIZE / 2 {
+                    chain_made_well(&mem, &mut queues[TX], &[(HEADER_AT, TxHeader::LEN as u32, false),
+                                                             (FRAME_AT, frame.len() as u32, false)]);
+                }
+                let (sent, dropped, moved) = (state.lock().unwrap().sent, nic.stats.dropped, mem.moved());
+                nic.io_write(QUEUE_NOTIFY, 2, TX as u32, &mem, time::boot_time_ns());
+                let (frames, moved) = (state.lock().unwrap().sent - sent, mem.moved() - moved);
+                let each = payload.div_ceil(mss).max(1) as u64;
+                invariant!(nic.stats.dropped == dropped && frames >= each,
+                           "sends of {} bytes cut at {}: {} frames sent, {} dropped", payload, mss, frames,
+                           nic.stats.dropped - dropped);
+                invariant!(frames <= net::TX_PASS_FRAMES as u64 + each && moved <= NET_PASS_MOST,
+                           "one notify's pass: {} frames and {} bytes of the guest's memory, past its bound of {} \
+                           frames and {} bytes and a send", frames, moved, net::TX_PASS_FRAMES, net::TX_PASS_BYTES);
             }
             15 => {
                 /* A command on the control queue -- the last, where a driver

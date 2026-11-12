@@ -17,13 +17,26 @@
 //! that needs a write done before another waits for it, and before a
 //! flush. Each time round the run loop (`poll`) what the backend has served
 //! is given back: a read's data copied into the guest, the status written,
-//! the chain on the used ring, and an interrupt.
-//! The guest's memory is only ever touched here, on the vCPU's task: the
-//! backend sees its own buffers and nothing else. They are the backend's --
-//! one a request it may be handed, which the device reaches by number
-//! (`Backend::with_buffer`) while the request is not with the backend -- so
-//! that a backend can have its device read and write them as they are,
-//! with no copy of its own.
+//! the chain on the used ring, and an interrupt -- and so does the disk's
+//! own task as it serves something (`LinuxGuest::serve_disk`), taking more
+//! off the ring as it goes. The guest's memory is touched only here, under
+//! the platform's lock, by whichever task holds it -- a vCPU's or the
+//! disk's: the lock, not the task, is what orders it against a reset and
+//! every other access. The backend sees its own buffers and nothing else.
+//! They are the backend's -- one a request it may be handed, which the
+//! device reaches by number (`Backend::with_buffer`) while the request is
+//! not with the backend -- so that a backend can have its device read and
+//! write them as they are, with no copy of its own.
+//!
+//! A reset, or the queue set up anew, forgets the chains the backend still
+//! has requests of: they are the old driver's, given back to nobody. And
+//! the new driver's requests are not started until those are back: served
+//! beside them, an old write and a new one to the same blocks could land in
+//! either order -- a crash kernel's journal under its dead kernel's last
+//! writes, over a backend that stalled (QEMU drains its backend at a reset
+//! for this). A driver that takes no FLUSH may take its disk to be
+//! write-through (virtio 1.x, 5.2.5.2): each write of one is flushed before
+//! it is answered, as QEMU puts its backend in writethrough mode for one.
 //!
 //! A discard and a write of zeros come as ranges -- sectors, a count, and
 //! for a write of zeros whether the blocks may be given back -- which the
@@ -327,11 +340,24 @@ struct Slot {
     /// Whether the backend has the slot's request, and its buffer.
     out: bool,
     /// The chain being served, until it is given back. None when the slot is
-    /// free -- or when a reset forgot its chain while the backend still has
-    /// the request, which is then taken back and given to nobody.
+    /// free -- or when a reset, or the queue set up anew, forgot its chain
+    /// while the backend still has the request, which is then taken back and
+    /// given to nobody.
     head: Option<u16>,
     /// The chain's buffers: room for the longest chain the queue holds.
     segs: Vec<Seg>,
+    /// A write the slot's request is the flush behind, for a driver that
+    /// took no FLUSH: what it was -- its op, its bytes, a discard's or a
+    /// write of zeros' ranges -- answered for when the flush comes back.
+    behind: Option<(Op, usize, [u8; MAX_RANGES * RANGE_BYTES])>,
+}
+
+impl Slot {
+    /// Holds a request a reset, or the queue set up anew, took the chain of
+    /// away: the old driver's, still with the backend.
+    fn orphan(&self) -> bool {
+        self.out && self.head.is_none()
+    }
 }
 
 /// What a request comes to once its header is read.
@@ -386,7 +412,7 @@ impl Blk {
         for _ in 0..IN_FLIGHT {
             let mut segs = Vec::new();
             segs.try_reserve_exact(usize::from(QUEUE_SIZE)).map_err(|_| Error::NoMemory)?;
-            slots.push(Slot { out: false, head: None, segs });
+            slots.push(Slot { out: false, head: None, segs, behind: None });
         }
         let mut name = [0u8; ID_BYTES];
         let n = id.len().min(ID_BYTES);
@@ -419,7 +445,7 @@ impl Blk {
     pub fn identity() -> Identity {
         Identity {
             vendor: virtio::VENDOR,
-            device: virtio::LEGACY_DEVICE_BASE + VIRTIO_TYPE - 1,
+            device: virtio::LEGACY_BLK,
             revision: 0,
             class: CLASS,
             subsystem_vendor: virtio::VENDOR,
@@ -521,19 +547,30 @@ impl Blk {
                 if answered { self.interrupt(mem) } else { Raise::default() }
             }
             Asked::Reset => {
-                /* The chains with the backend are the old driver's: nothing
-                 * is given back for them, and their buffers are taken back
-                 * as they come. */
-                for s in self.slots.iter_mut() {
-                    s.head = None;
-                }
+                self.forget_chains();
                 self.waiting = false;
                 self.kickless = false;
                 self.more = false;
                 self.broken = None;
                 Raise::default()
             }
+            /* Its one queue set up anew, or taken down: the chains with the
+             * backend were on the old rings. */
+            Asked::Queue(0) => {
+                self.forget_chains();
+                Raise::default()
+            }
             _ => Raise::default(),
+        }
+    }
+
+    /// The chains with the backend made the old driver's -- or the old
+    /// rings': nothing is given back for them, their buffers are taken back
+    /// as they come, and nothing new is started until they have come
+    /// (`fill`).
+    fn forget_chains(&mut self) {
+        for s in self.slots.iter_mut() {
+            s.head = None;
         }
     }
 
@@ -572,7 +609,7 @@ impl Blk {
     /// The interrupt, when the driver wants one: the line, when none is
     /// waiting already, or the queue's MSI-X vector.
     fn interrupt(&mut self, mem: &GuestMemory) -> Raise {
-        let wants = self.transport.queue(0).map_or(false, |q| q.wants_interrupt(mem));
+        let wants = self.transport.live(0).map_or(false, |q| q.wants_interrupt(mem));
         if !wants {
             return Raise::default();
         }
@@ -588,6 +625,13 @@ impl Blk {
         self.waiting = false;
         self.kickless = false;
         self.more = false;
+        if self.slots.iter().any(Slot::orphan) {
+            /* The old driver's requests, which a reset or the queue set up
+             * anew left with the backend, done first: the ring is looked
+             * at again as the last of them comes back (`poll`). */
+            self.waiting = true;
+            return false;
+        }
         let mut answered = false;
         let mut left = PASS;
         while self.broken.is_none() {
@@ -606,10 +650,13 @@ impl Blk {
                 break;
             };
             let mut segs = core::mem::take(&mut self.slots[slot].segs);
-            let popped = match self.transport.queue(0) {
-                Some(q) if q.ready() => q.pop(mem, &mut segs),
-                _ => Ok(None),
+            let Some(q) = self.transport.live(0) else {
+                /* No queue set up: nothing to take, and nothing to ask of
+                 * its rings, which would be at page 0. */
+                self.slots[slot].segs = segs;
+                break;
             };
+            let popped = q.pop(mem, &mut segs);
             let result = match popped {
                 Ok(Some(head)) => self.start(mem, slot, head, &segs),
                 Ok(None) => {
@@ -624,12 +671,12 @@ impl Blk {
                      * asked for the next, and what came before the ask
                      * taken now. */
                     if self.slots.iter().filter(|s| s.out).count() >= KICKLESS_OUT
-                        && self.transport.queue(0).is_some_and(|q| q.event_idx())
+                        && self.transport.live(0).is_some_and(|q| q.event_idx())
                     {
                         self.kickless = true;
                         break;
                     }
-                    match self.transport.queue(0).ok_or(Broken::Index).and_then(|q| q.ask_kick(mem)) {
+                    match self.transport.live(0).ok_or(Broken::Index).and_then(|q| q.ask_kick(mem)) {
                         Ok(true) => continue,
                         Ok(false) => break,
                         Err(e) => {
@@ -703,11 +750,27 @@ impl Blk {
     fn complete(&mut self, mem: &GuestMemory, req: Request) -> bool {
         let Request { op, offset, len, ok, slot, ranges } = req;
         crate::tp::blk_complete(self.index, slot, op, offset, len, ok);
+        let flushes = self.transport.driver_features() & F_FLUSH != 0;
         let Some(s) = self.slots.get_mut(slot) else {
             return false;
         };
         let head = s.head.take();
         s.out = false;
+        let behind = s.behind.take();
+        if let (Some(chain), true, None) = (head, ok && op.writes() && !flushes, behind) {
+            if self.broken.is_none() {
+                /* Done, for a driver that took no FLUSH, which may take its
+                 * disk to be write-through: flushed before it is answered,
+                 * the flush in its slot and answering for it. */
+                (s.head, s.out, s.behind) = (Some(chain), true, Some((op, len, ranges)));
+                crate::tp::blk_submit(self.index, slot, Op::Flush, 0, 0);
+                self.backend.submit(Request { op: Op::Flush, offset: 0, len: 0, ok: false, slot,
+                                              ranges: [0; MAX_RANGES * RANGE_BYTES] });
+                return false;
+            }
+        }
+        /* A flush behind a write answers as the write it was behind. */
+        let (op, len, ranges) = behind.unwrap_or((op, len, ranges));
         let segs = core::mem::take(&mut s.segs);
         let answered = match head {
             Some(head) if self.broken.is_none() => {
@@ -767,10 +830,12 @@ impl Blk {
     /// Write the status -- the last byte the device may write -- and give
     /// the chain back with what was written.
     fn finish(&mut self, mem: &GuestMemory, segs: &[Seg], head: u16, status: u8, written: u32) -> core::result::Result<(), Broken> {
+        /* The queue first: with it down nothing of the chain's is written
+         * (a chain is never held past its queue going: `forget_chains`). */
+        let q = self.transport.live(0).ok_or(Broken::Index)?;
         let last = segs.iter().rev().find(|s| s.write && s.len != 0).ok_or(Broken::Memory)?;
         let at = last.at(u64::from(last.len) - 1).ok_or(Broken::Memory)?;
         mem.write(at, &[status]).map_err(|_| Broken::Memory)?;
-        let q = self.transport.queue(0).ok_or(Broken::Index)?;
         q.push(mem, head, written.saturating_add(1))
     }
 
@@ -800,14 +865,10 @@ impl Blk {
                 Next::Answer(S_IOERR, 0)
             }
             T_OUT => self.data_request(Op::Write, sector, readable.saturating_sub(HEADER as u64)),
-            T_FLUSH => {
-                if self.transport.driver_features() & F_FLUSH != 0 {
-                    Next::Serve(Op::Flush, 0, 0)
-                } else {
-                    self.stats.errors += 1;
-                    Next::Answer(S_IOERR, 0)
-                }
-            }
+            /* Served whether or not the driver took FLUSH, as QEMU serves
+             * it: what was answered as written is on stable storage after,
+             * which no driver can be wrong to ask. */
+            T_FLUSH => Next::Serve(Op::Flush, 0, 0),
             T_GET_ID => {
                 let n = (room as usize).min(ID_BYTES);
                 if copy_in(mem, segs, 0, &self.id[..n]) {

@@ -1653,8 +1653,16 @@ guest memory, where the guest may write any of them at any moment. Every
 index, address and length read from them is checked before it is used: a
 descriptor past the queue, a chain longer than the queue -- a loop --, more
 chains than the queue holds, an indirect descriptor where none was taken, a
-table the device will not follow, or a buffer outside guest memory stop the
-device, which takes nothing more until the driver resets it. **A disk's
+table the device will not follow, or a ring or a table outside guest memory
+stop the device, which takes nothing more until the driver resets it; a
+request's own buffer outside it is that request's error -- a disk's
+`S_IOERR`, a frame dropped -- and the device goes on. A queue the driver has
+not set up, or took down (a page frame number of 0), is none to work on at
+all: its rings would be at page 0, where a pass once asked for its kicks and
+gave back what it served, and, with EVENT_IDX, found more to do at every
+look -- the first CPU's round due again at once, for good. Taken down or set
+up anew, a disk's chains still with its backend are the old rings', given
+back to nobody, as a reset's are. **A disk's
 request is one entry of its ring** (`VIRTIO_RING_F_INDIRECT_DESC`, which the
 disks offer and the NICs do not): its buffers in a table of descriptors in
 guest memory that the chain's last descriptor names -- read 16 at a time,
@@ -1730,7 +1738,18 @@ Each time round the run loop what it has served is given back: a read's
 data copied into the guest, the status written, the chain on the used ring,
 an interrupt; and as it finishes each lot the task wakes a halted vCPU or
 kicks a running one out of its guest, the NICs' way ([A network](#a-network)).
-Guest memory is touched on the vCPU's task and nowhere else. At most 64
+Guest memory is touched under the platform's lock, on whichever task holds
+it: a vCPU's, or the disk's own as it gives back what it served
+(`LinuxGuest::serve_disk`) -- the lock, not the task, is what orders that
+against a reset and every other CPU's access. A reset, or the queue set up
+anew, forgets the chains still with the backend, and the new driver's
+requests start only once those are back: side by side, a crash kernel's
+journal write and its dead kernel's last write to the same blocks, over a
+backend that stalled, could land in either order (QEMU drains its backend
+at a reset for this). A driver that takes no FLUSH may take its disk to be
+write-through (virtio 1.x, 5.2.5.2): each of its writes is flushed before it
+is answered, as QEMU makes its backend write-through for one, and a flush it
+sends anyway is served, not refused. At most 64
 requests are out at once (`blk::IN_FLIGHT`), each in a 256 KiB buffer of the backend's taken
 when the disk is made (`Backend::with_buffer`) -- the driver is told a
 request carries at most 64 segments of a page (`seg_max`, `size_max`) --
@@ -2176,9 +2195,16 @@ its sequence number and its TCP checksum its own, FIN and PSH the last
 one's, CWR the first's. What the driver says about either -- where a
 checksum goes, where the headers end, the segment size -- is checked against
 the frame before it is used, and a send that does not hold up is dropped,
-counted. Not offered: ECN on a cut send, IPv6, UDP; and a segment under 256
-bytes is refused, so that one notify is 256 frames at most and not 65,000
-that a guest could ask for at no cost to itself.
+counted. Not offered: ECN on a cut send, IPv6, UDP. A segment of 8 bytes is
+taken, the least Linux's TCP makes (`TCP_MIN_GSO_SIZE`): a guest talking to
+a peer with a small MSS cuts its sends small, and refused under 256 bytes
+they were dropped whole, the guest never told -- its connection down to the
+one segment its TCP sends unsegmented after a timeout. What a notify may
+cost is held by the pass instead: a transmit pass ends at its bound on the
+frames it made or the bytes it copied out of the guest (1,024 frames, 1 MiB
+-- a ring of Linux's largest sends is one pass), the next round going on
+with the rest, where a ring of 64 KiB sends cut at 256 bytes was 65,536
+frames and 16 MiB under the platform's lock for one notify.
 
 Between two guests, the switch does neither where it need not. A guest
 whose driver takes checksums left to finish (`GUEST_CSUM`) is handed a
