@@ -36,9 +36,14 @@
 //! - A chunk written and flushed, and not written since for a while, is
 //!   closed on every replica, so that a crash leaves few chunks to
 //!   reconcile. A close of the driver's flushes, as a flush does, then
-//!   closes every chunk written before it at once.
+//!   closes every chunk written before it, `CLOSING_MAX` places at a time.
 //! - An operation not done in a minute fails, said -- a stalled disk is
-//!   reported, not left hanging.
+//!   reported, not left hanging. A write that so fails, a piece of it not
+//!   done sent to a replica, may be on some of its replicas and not on
+//!   others: the session attaches anew then, every operation out failing
+//!   with the old generation, and the new one's reconcile makes the chunks
+//!   it left open the same on their replicas, as a crashed writer's, before
+//!   it serves again.
 //! - A write to a place whose chunk is shared -- a snapshot's or a clone's
 //!   too, as a copy-up pending's is -- is held while the chunk is copied up
 //!   (N10): a new chunk asked of the mds (`CopyUp`), each active member of
@@ -82,6 +87,19 @@ pub const SILENT_NS: u64 = 500_000_000;
 pub const RESEND_NS: u64 = 1_000_000_000;
 /// How long before an ask refused for now is asked again.
 pub const AGAIN_NS: u64 = 200_000_000;
+/// Places being closed at once, at most. A stop, a pause or a close of the
+/// driver's closes every chunk written, and every replica's answer comes to
+/// the session's mailbox: a random writer's stop over 8 GiB closed some
+/// 2,000 chunks on three replicas at once, the mailbox's 1,024 places
+/// overflowed, the answers past them lost, and the replicas that sent them
+/// were asked out as silent -- the writer's own host's cs, the head of every
+/// chain, taken out (N13b, the EX44). The next places go as these are done.
+#[cfg(not(feature = "small_windows"))]
+const CLOSING_MAX: usize = 128;
+/// The fuzzer's: two at a time, its volumes a few chunks each.
+#[cfg(feature = "small_windows")]
+const CLOSING_MAX: usize = 2;
+
 /// How long a replica a write was passed along to is waited for, once the
 /// replica before it in the chain has answered, before it is sent the piece
 /// directly (N13): a link down between two replicas, or no memory there to
@@ -318,6 +336,10 @@ struct Piece {
     waiting: BTreeSet<u32>,
     /// A read's replicas tried.
     tried: BTreeSet<u32>,
+    /// Sent to a replica: a write's, not done, may be on some of its
+    /// replicas and not on others. One held for a copy-up or parked all its
+    /// life has reached none, and one done is on every replica.
+    left: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -511,6 +533,11 @@ impl Session {
     /// replica directly.
     pub fn answer_at(&mut self, mailbox: &str) {
         self.answer = Some(alloc::format!("{}@{}", mailbox, self.me));
+    }
+
+    /// The places being closed now: never more than `CLOSING_MAX`.
+    pub fn closing(&self) -> usize {
+        self.closing.len()
     }
 
     /// Whether its writes go along chains (N13): a name to be answered at.
@@ -1007,6 +1034,7 @@ impl Session {
                         s.first = now;
                     }
                 }
+                self.left(what);
                 self.starved = false;
             }
             Err(Unmade::Gone) => {
@@ -1070,8 +1098,18 @@ impl Session {
         /* The id is the request's first eight bytes */
         bytes[..8].copy_from_slice(&ids[0].to_le_bytes());
         out.push(Out::Send { to: To::Cs(chain[0]), id: ids[0], bytes });
+        self.left(what);
         self.starved = false;
         true
+    }
+
+    /// A request of `what` sent: a piece's has reached a replica.
+    fn left(&mut self, what: What) {
+        if let What::Piece(pid) = what {
+            if let Some(p) = self.pieces.get_mut(&pid) {
+                p.left = true;
+            }
+        }
     }
 
     /// Request `id` answered, whatever it says: the replica after it in its
@@ -1574,7 +1612,7 @@ impl Session {
     fn ask_copy(&mut self, place: u32, done: bool, now: u64, out: &mut Vec<Out>) {
         let (name, generation) = (self.name.clone(), self.generation);
         let ask = match self.copies.get(&place).and_then(|c| c.to) {
-            Some((chunk, _)) if done => Ask::CopyDone { name, place, generation, chunk },
+            Some((chunk, incarnation)) if done => Ask::CopyDone { name, place, generation, chunk, incarnation },
             _ => Ask::CopyUp { name, place, generation },
         };
         let id = self.take_id();
@@ -1951,7 +1989,7 @@ impl Session {
             self.next_piece += 1;
             self.pieces.insert(pid, Piece { op: id, place, inside: inside as u32, len: n as u32,
                                             at: (at - offset) as u32, waiting: BTreeSet::new(),
-                                            tried: BTreeSet::new() });
+                                            tried: BTreeSet::new(), left: false });
             made.push((pid, place));
             at += n;
         }
@@ -2033,10 +2071,13 @@ impl Session {
     /// Close `op` done once the places it closes are closed -- or written
     /// again, or out of the map.
     fn close_progress(&mut self, op: u64, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
-        let closing = &self.closing;
+        let (closing, open) = (&self.closing, &self.open);
         let Some(o) = self.ops.get_mut(&op) else { return };
+        let started = o.started;
         let Some(places) = o.closing.as_mut() else { return };
-        places.retain(|p| closing.contains_key(p));
+        /* Being closed, or open still and not written since it began -- its
+           turn to close not come yet (`CLOSING_MAX`) */
+        places.retain(|p| closing.contains_key(p) || open.get(p).is_some_and(|&(when, _)| when <= started));
         if !places.is_empty() {
             return;
         }
@@ -2119,9 +2160,13 @@ impl Session {
         self.pause_step(now, bufs, out);
     }
 
-    /// Every close of the driver's that waits on its places, looked at.
+    /// Every close of the driver's that waits on its places, looked at --
+    /// the next of them closed first, as room is made (`CLOSING_MAX`).
     fn closes_progress(&mut self, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
         let waiting: Vec<u64> = self.ops.iter().filter(|(_, o)| o.closing.is_some()).map(|(&id, _)| id).collect();
+        if !waiting.is_empty() {
+            self.close_idle(now, bufs, out, true);
+        }
         for op in waiting {
             self.close_progress(op, now, bufs, out);
         }
@@ -2130,10 +2175,11 @@ impl Session {
     /// Places written, flushed and idle: closed on every replica.
     fn close_idle(&mut self, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>, all: bool) {
         let busy: BTreeSet<u32> = self.pieces.values().map(|p| p.place).collect();
+        let room = CLOSING_MAX.saturating_sub(self.closing.len());
         let idle: Vec<u32> = self.open.iter()
             .filter(|(p, &(when, flushed))| (all || (flushed && now >= when + CLOSE_IDLE_NS))
                 && !busy.contains(p) && !self.closing.contains_key(p))
-            .map(|(&p, _)| p).collect();
+            .map(|(&p, _)| p).take(room).collect();
         for place in idle {
             let to: BTreeSet<u32> = self.map.set_of(place).map(|(_, s)| s.written().collect()).unwrap_or_default();
             if to.is_empty() {
@@ -2218,6 +2264,44 @@ impl Session {
     fn attach_again(&mut self, now: u64, out: &mut Vec<Out>) {
         out.push(Out::Say(alloc::format!("nbs: volume {}: paused for a snapshot, and no word of it in {} s -- attached \
                                           again", self.name, PAUSE_NS / 1_000_000_000)));
+        self.reattach(now, out);
+    }
+
+    /// A write failed at its deadline (decided 2026-11-12, N13), a piece of
+    /// it not done sent to a replica: let go of with whatever replicas had
+    /// taken it, its chunk's replicas may be apart -- and a close of it later
+    /// would keep them so for good,
+    /// a read answered by whichever it went to. So the session attaches
+    /// anew, as after a pause given up: every operation out fails with the
+    /// old generation, whose requests the new one's fences refuse, and the
+    /// new one's reconcile makes every chunk the session left open the same
+    /// on its replicas, as it does a crashed writer's, before it serves
+    /// again -- a stop asked meanwhile begun then. Its own only: a session
+    /// taken over meanwhile is refused, and fails.
+    fn attach_anew(&mut self, now: u64, out: &mut Vec<Out>) {
+        out.push(Out::Say(alloc::format!("nbs: volume {}: a write not done in {} s, its replicas perhaps apart -- \
+                                          attached anew, every operation out failed, the chunks it left open made \
+                                          the same", self.name, DEADLINE_NS / 1_000_000_000)));
+        let ops: Vec<u64> = self.ops.keys().copied().collect();
+        for id in ops {
+            self.op_done(id, false, out);
+        }
+        /* The stop's flush among them, told to nobody: the stop itself
+           stands, begun again once the session serves */
+        self.stop_flush = None;
+        self.queue.clear();
+        self.pieces.clear();
+        self.parked.clear();
+        self.piece_ids.clear();
+        self.open.clear();
+        self.closing.clear();
+        self.dirty.clear();
+        self.reattach(now, out);
+    }
+
+    /// Its own attach anew, at a new generation: what the old one had out
+    /// let go of, the start begun again from the attach.
+    fn reattach(&mut self, now: u64, out: &mut Vec<Out>) {
         self.pausing = None;
         self.reading = None;
         self.subs.clear();
@@ -2399,6 +2483,21 @@ impl Session {
             if self.ops.get(&id).is_some_and(|o| o.kind.flushes()) {
                 self.flush_failed(id, now, bufs, out);
                 continue;
+            }
+            /* A write of the driver's with a piece not done that reached a
+               replica: its replicas perhaps apart -- the session attaches
+               anew, the reconcile to make them the same. One whose pieces
+               not done reached none -- held all their life for a copy-up a
+               stuck join holds back, its others done on every replica --
+               fails as any other: attached anew for it, the reconcile could
+               meet the same join and fail the session (found by fuzz/nbs's
+               cluster target, N13c) */
+            let write = self.ops.get(&id).is_some_and(|o| o.kind == Kind::Write && o.tag & INTERNAL == 0)
+                && self.pieces.values().any(|p| p.op == id && p.left);
+            if write && self.writable && matches!(self.phase, Phase::Serving | Phase::Stopping) {
+                self.op_done(id, false, out);
+                self.attach_anew(now, out);
+                return;
             }
             let pieces: Vec<u64> = self.pieces.iter().filter(|(_, p)| p.op == id).map(|(&k, _)| k).collect();
             for pid in pieces {

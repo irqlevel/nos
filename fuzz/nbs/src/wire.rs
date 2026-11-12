@@ -301,7 +301,8 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                 6 => Ask::Reattach { name: name(r, nbsmeta::VOLUME_NAME_MAX), generation: r.below(u64::MAX),
                                      token: r.below(u64::MAX) },
                 _ => Ask::CopyDone { name: name(r, nbsmeta::VOLUME_NAME_MAX), place: r.below(1 << 32) as u32,
-                                     generation: r.below(u64::MAX), chunk: r.below(1 << 32) as u32 },
+                                     generation: r.below(u64::MAX), chunk: r.below(1 << 32) as u32,
+                                     incarnation: r.below(1 << 32) as u32 },
             };
             let ok = match &ask {
                 Ask::Attach { name, .. } | Ask::Detach { name, .. } => name.len() <= nbsmeta::VOLUME_NAME_MAX,

@@ -319,8 +319,10 @@ impl State {
             Command::CopyUp { name, place, generation } => {
                 self.copy_up(name, *place, *generation).map(|(chunk, incarnation)| Answer::Chunk { chunk, incarnation })
             }
-            Command::CopyDone { name, place, generation, chunk } => self.copy_done(name, *place, *generation, *chunk)
-                .map(|(chunk, incarnation)| Answer::Chunk { chunk, incarnation }),
+            Command::CopyDone { name, place, generation, chunk, incarnation } => {
+                self.copy_done(name, *place, *generation, (*chunk, *incarnation))
+                    .map(|(chunk, incarnation)| Answer::Chunk { chunk, incarnation })
+            }
             /* The members' are lib.rs's */
             Command::Init { .. } | Command::Add { .. } | Command::Remove { .. } => Err(Refusal::Malformed),
         };
@@ -622,17 +624,22 @@ impl State {
         Ok((to, self.incarnation_of(to)))
     }
 
-    /// A copy-up's second step: the map names pending chunk `chunk` at
-    /// `place`, the old one counted down. Done where it names it already.
-    fn copy_done(&mut self, name: &str, place: u32, generation: u64, chunk: u32) -> Result<(u32, u32), Refusal> {
+    /// A copy-up's second step: the map names pending chunk `chunk` -- its
+    /// number and incarnation -- at `place`, the old one counted down. Done
+    /// where it names it already. A number alone would not do: a copy-up
+    /// given up and asked anew can be given the number it had, freed
+    /// (`Command::CopyDone`).
+    fn copy_done(&mut self, name: &str, place: u32, generation: u64, chunk: (u32, u32))
+                 -> Result<(u32, u32), Refusal> {
         let (id, from) = self.writers_place(name, place, generation)?;
-        if from == chunk {
-            return Ok((chunk, self.incarnation_of(chunk)));
+        if (from, self.incarnation_of(from)) == chunk {
+            return Ok(chunk);
         }
         match self.copying.get(&(id, place)) {
-            Some(&(to, was)) if to == chunk && was == from => {}
+            Some(&(to, was)) if (to, self.incarnation_of(to)) == chunk && was == from => {}
             _ => return Err(Refusal::Stale),
         }
+        let chunk = chunk.0;
         self.copying.remove(&(id, place));
         let at = self.volume_at(name).ok_or(Refusal::NoSuchVolume)?;
         if let Some(c) = self.volumes.get_mut(at).and_then(|v| v.map.get_mut(place as usize)) {

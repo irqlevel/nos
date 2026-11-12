@@ -51,8 +51,12 @@ const START_NS: u64 = 120_000_000_000;
 /// which fails it first.
 const WAIT_NS: u64 = 2 * nbsclient::DEADLINE_NS;
 /// The session's mailbox: room for the answers of the requests a disk keeps
-/// out -- a read's data comes in pieces of up to 256 KiB.
-const LIMITS: Limits = Limits { messages: 1024, bytes: 8 << 20 };
+/// out -- a read's data comes in pieces of up to 256 KiB -- and for every
+/// answer its requests out can bring, with some to spare: closes are let out
+/// 128 places at a time (nbsclient's `CLOSING_MAX`), writes and reads by the
+/// driver's depth. An answer refused for room is lost, and its replica asked
+/// out as silent (N13b: 1,024 places, overflowed by a stop's closes).
+const LIMITS: Limits = Limits { messages: 4096, bytes: 8 << 20 };
 
 /// The driver's buffers, by an operation's tag: a write's bytes, the room
 /// a read's go to.

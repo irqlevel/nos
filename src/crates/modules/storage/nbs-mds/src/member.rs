@@ -747,8 +747,8 @@ impl Mds {
                 (Command::ReplicaDown { set, cs, refused, name, generation }, Kind::Down)
             }
             Ask::CopyUp { name, place, generation } => (Command::CopyUp { name, place, generation }, Kind::Copy),
-            Ask::CopyDone { name, place, generation, chunk } => {
-                (Command::CopyDone { name, place, generation, chunk }, Kind::Copy)
+            Ask::CopyDone { name, place, generation, chunk, incarnation } => {
+                (Command::CopyDone { name, place, generation, chunk, incarnation }, Kind::Copy)
             }
             Ask::Map { name, from, count, index } => {
                 let said = nbswire::mds::map(core.state(), core.rsm().applied(), &name, from, count, index);

@@ -739,11 +739,17 @@ def main():
         # Its session named (nbsdrive's), its writes left a once, along their
         # chains (N13): a's cs, the head, and the next passed them on, and
         # none was left for the client to send directly
-        chains = [re.search(r"(\d+) writes passed on along chains, (\d+) not", x.run("nbscs")) for x in sh]
+        chains = [re.search(r"(\d+) writes passed on along chains, (\d+) not, (\d+) answers lost", x.run("nbscs"))
+                  for x in sh]
         check("nbsload's writes passed along their chains, cs to cs, none left to the client",
               all(chains) and sum(int(m.group(1)) for m in chains) > 0
               and all(int(m.group(2)) == 0 for m in chains),
               [m.group(0) if m else None for m in chains])
+        # Every answer of the cs's taken by the channel: one refused -- the
+        # session's mailbox full, as a stop's closes once filled it (N13b) --
+        # is the cs's silence to its client
+        check("no cs's answer lost: the sessions' mailboxes had room for them all",
+              all(chains) and all(int(m.group(3)) == 0 for m in chains), [m.group(0) if m else None for m in chains])
         out = b.run("insmod /nbsload.ko")
         out = b.run("nbsload disk1 randread secs=2 qd=8 span=8")
         check("and reads on b, read-only", re.search(r"\d+ reads: \d+ IOPS", out) is not None and "nbsload:" not in out,

@@ -116,11 +116,17 @@ pub enum Command {
     /// Asked again, answered the pending one; asked of a chunk shared no
     /// longer, the chunk itself.
     CopyUp { name: String, place: u32, generation: u64 },
-    /// A copy-up's second step: pending chunk `chunk` of place `place`
-    /// copied onto its set's active members -- volume `name`'s map names it,
-    /// and the old one's count goes down, at none freed. Done where the map
-    /// names it already.
-    CopyDone { name: String, place: u32, generation: u64, chunk: u32 },
+    /// A copy-up's second step: pending chunk `chunk` of place `place`, at
+    /// `incarnation`, copied onto its set's active members -- volume `name`'s
+    /// map names it, and the old one's count goes down, at none freed. Done
+    /// where the map names it already. Refused (`Stale`) where the pending
+    /// chunk is that number at another incarnation: a copy-up given up -- a
+    /// join of its set begun -- and asked anew, by an ask of the writer's
+    /// asked again and late, is given a new chunk, which can be the number
+    /// freed; an end of the old one's then would have the map name a chunk
+    /// nobody copied into, zeros where the volume had data (found by
+    /// fuzz/nbs's cluster target, N13c).
+    CopyDone { name: String, place: u32, generation: u64, chunk: u32, incarnation: u32 },
 }
 
 const INIT: u8 = 1;
@@ -290,12 +296,13 @@ impl Command {
                 w.u64(*generation);
                 w.u64(*token);
             }
-            Command::CopyDone { name, place, generation, chunk } => {
+            Command::CopyDone { name, place, generation, chunk, incarnation } => {
                 w.u8(COPY_DONE);
                 w.str(name);
                 w.u32(*place);
                 w.u64(*generation);
                 w.u32(*chunk);
+                w.u32(*incarnation);
             }
         }
         w.buf
@@ -407,8 +414,8 @@ impl Command {
             COPY_DONE => {
                 let name = volume(&mut r)?;
                 let place = r.u32()?;
-                let generation = r.u64()?;
-                Command::CopyDone { name, place, generation, chunk: r.u32()? }
+                let (generation, chunk) = (r.u64()?, r.u32()?);
+                Command::CopyDone { name, place, generation, chunk, incarnation: r.u32()? }
             }
             REATTACH => {
                 let (name, host) = (volume(&mut r)?, host(&mut r)?);
