@@ -132,11 +132,13 @@ OUT_S = 10
 LATE = "d"
 ALL = HOSTS + [LATE]
 CHUNK_MIB = 4
-# A slow cs (N11): c's pool held to this many operations a second while a
-# writer that opened this many chunks stops -- some seconds of closes queued
-# at c, each closed one at a time.
-BURST_IOPS = 40
-BURST_CHUNKS = 32
+# A slow cs (N11, N12c): c's pool held to this many operations a second
+# while a writer opens this many chunks and stops -- fences, open marks and
+# closes queued at c's device, each write slower there than the client's
+# 0.5 s of silence.
+BURST_IOPS = 20
+BURST_CHUNKS = 16
+SILENT_S = 0.5
 
 
 def part_slots(sectors):
@@ -277,6 +279,20 @@ def eventually(sh, cmd, ok):
         out = sh.run(cmd)
         if ok(out) or time.time() >= end:
             return out
+        time.sleep(0.3)
+
+
+def said_by_one(shells, cmd, ok):
+    """The first of `shells` whose `cmd` output `ok` holds of, and that
+    output -- polled until one does, or the first's last one."""
+    end = time.time() + APPLIED_S
+    while True:
+        outs = [(s, s.run(cmd)) for s in shells]
+        for s, out in outs:
+            if ok(out):
+                return s, out
+        if time.time() >= end:
+            return outs[0]
         time.sleep(0.3)
 
 
@@ -631,6 +647,11 @@ def main():
               ipct.wait_for(lambda: serving(0, 2) and all(d[5] == "active" for d in devices_of(a)), CS_S, 1),
               a.run("nbscs"))
 
+        # The cluster settled first: a cs the leader's controller took for
+        # down as it took its devices in has its places joined again, and a
+        # write under way meanwhile reaches it as a joiner
+        need("every chunk at three replicas, none being copied, no cs down: the cluster settled",
+             ipct.wait_for(lambda: whole(a), 60, 1), a.run("nbs status"))
         out = a.run("nbs io write disk1 0 65536 0x5a")
         m = re.search(r"65536 bytes of 0x5a written at 0 of disk1, generation (\d+): 1 chunks, to every replica in",
                       out)
@@ -640,7 +661,7 @@ def main():
         # What `nbscs` shows is what the cs's task last made of it: a second old at most
         check("every cs fences disk1 at a's generation",
               ipct.wait_for(lambda: all(fences_of(x).get(vol1) == gen1 for x in sh), 5, 0.5),
-              [x.run("nbscs") for x in sh])
+              [x.run("nbscs") + x.run("dmesg 8192 nbs") for x in sh])
         end = CHUNK_MIB << 20
         out = a.run("nbs io write disk1 %d 8192 0x33" % (end - 4096))
         check("8 KiB across a chunk's end: two chunks", "8192 bytes of 0x33" in out and ": 2 chunks" in out, out)
@@ -720,35 +741,40 @@ def main():
         check("and reads on b, read-only", re.search(r"\d+ reads: \d+ IOPS", out) is not None and "nbsload:" not in out,
               out)
 
-        # -- a cs slow, not silent (N11): c's pool throttled by QEMU to
-        # BURST_IOPS operations a second -- a close's two table writes among
-        # them -- and a writer's stop, which closes every chunk it opened on
-        # every replica at once: a burst c serves one at a time, seconds of
-        # queue. The client asks c out of the set after 0.5 s; the leader's
-        # look (`Op::Ping`, 250 ms) is answered ahead of c's queue, so c
-        # stays. Before, the look waited behind the closes, and every stop of
-        # a writer that had written many chunks took the slower hosts out of
-        # its sets, to be copied anew (found on the hardware, N11) --
+        # -- a cs slow, not silent (N11, N12c): c's pool throttled by QEMU to
+        # BURST_IOPS operations a second from the writer's first write on --
+        # its fence, each chunk's open mark, each close -- and a writer's
+        # stop, which closes every chunk it opened on every replica at once:
+        # seconds of queue at c's device. The client asks c out of the set
+        # after 0.5 s; the leader's look (`Op::Ping`, 250 ms) is answered
+        # whatever c's device is doing -- the cs's task never waits on it --
+        # so c stays. Before N11 the look waited behind the closes, and every
+        # stop of a writer that had written many chunks took the slower hosts
+        # out of its sets, to be copied anew (found on the hardware); before
+        # N12c it waited behind whatever request the cs was in --
         out = a.run("nbs volume create burst %d" % (BURST_CHUNKS * CHUNK_MIB))
         need("a volume of %d chunks" % BURST_CHUNKS, "nbs: volume burst" in out, out)
         taken = len(re.findall(r"taken out of volume burst", a.run("dmesg 65536 nbs")))
-        outs = [a.run("nbs io write burst %d 4096 0x5b" % (k * (CHUNK_MIB << 20))) for k in range(BURST_CHUNKS)]
-        check("a writes a block into each of burst's chunks, each open on every replica",
-              all("written at" in o for o in outs), [o for o in outs if "written at" not in o][:3])
-        # c slowed once the chunks are open: its closes alone queued, each a
-        # short request -- a fence or an open mark on a slowed device is one
-        # long one, which a look rightly waits behind
         ipct.hmp(qmp(2), "block_set_io_throttle more0 0 0 0 %d 0 0" % BURST_IOPS)
         try:
+            t0 = time.time()
+            outs = [a.run("nbs io write burst %d 4096 0x5b" % (k * (CHUNK_MIB << 20))) for k in range(BURST_CHUNKS)]
+            wrote = time.time() - t0
             t0 = time.time()
             out = a.run("nbs io detach burst")
             took = time.time() - t0
         finally:
             ipct.hmp(qmp(2), "block_set_io_throttle more0 0 0 0 0 0 0")
-        check("a detaches burst, every chunk closed on c one at a time, c in its set throughout: %.1f s" % took,
-              "burst detached" in out and took > 0.5, out)
+        check("a writes a block into each of burst's chunks, each open on every replica", all("written at" in o for o in outs),
+              [o for o in outs if "written at" not in o][:3])
+        # Each write slower at c than the client waits before it asks c out:
+        # c stays only where the leader's look is answered meanwhile
+        check("each write slower than the client's %.1f s of silence, c's device queued: %.2f s a write"
+              % (SILENT_S, wrote / BURST_CHUNKS), wrote / BURST_CHUNKS > SILENT_S)
+        check("a detaches burst, every chunk closed -- their records together: %.1f s" % took, "burst detached" in out,
+              out)
         log = a.run("dmesg 65536 nbs")
-        check("c not taken out of burst's set for the length of its queue: the leader's look answered ahead of it",
+        check("c not taken out of burst's sets, slow as it was: the leader's look answered whatever its device did",
               len(re.findall(r"taken out of volume burst", log)) == taken,
               [l for l in log.split("\n") if "burst" in l][-6:])
         check("burst's chunks at three replicas still", ipct.wait_for(lambda: whole(a), 30, 1),
@@ -1060,7 +1086,9 @@ def main():
             need("a sector of it spoiled on %s, under its cs" % ALL[yi], f.read(4096) == b"\xb1" * 4096)
         finding = re.compile(r"nbs: scrub: chunk (\d+) of set (\d+) \(version (\d+)\): (\w+)'s copy is unlike the two "
                              r"others' -- `nbs replica bad (\d+) (\w+)` has it copied again")
-        out = eventually(ld, "nbs status", lambda o: finding.search(o) is not None)
+        # The leader's scrub: whichever member leads by then -- a leader
+        # may change under a loaded host, the finding then the new one's
+        sld, out = said_by_one([sh[i] for i in live], "nbs status", lambda o: finding.search(o) is not None)
         m = finding.search(out)
         need("the leader's scrub says %s's copy unlike the two others', with the command" % ALL[yi],
              m is not None and m.group(4) == ALL[yi] and m.group(6) == ALL[yi], out)
@@ -1075,7 +1103,7 @@ def main():
         with open(pools[yi], "rb") as f:
             f.seek(held[yi])
             check("and the sector spoiled on its pool as it was", f.read(65536) == rot)
-        out = eventually(ld, "nbs status", lambda o: "copy was unlike the two others' -- the set is at version" in o)
+        out = eventually(sld, "nbs status", lambda o: "copy was unlike the two others' -- the set is at version" in o)
         check("the finding shown as history: the set moved on", finding.search(out) is None
               and "copy was unlike the two others' -- the set is at version" in out, out)
 

@@ -29,13 +29,14 @@
 //! filesystem, a partition table -- is never taken for blank, nor written;
 //! a cs's of another identity is told apart.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::future::{ready, Future};
+use std::future::{poll_fn, ready, Future};
 use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
 
 use nbscs::{ChunkRef, Device, Epoch, Error, Identity, IoError, OpenError, SlotState, Store, COPY_PIECE, PAGE, SLOT};
-use nbswire::serve::{serve, Done, Vouched};
+use nbswire::serve::{collect, serve, AskNow, Asker, Done, Requests};
 use nbswire::{Op as WireOp, Question, Refusal, Request, Told};
 
 use crate::rng::{mix, Rng};
@@ -402,7 +403,7 @@ struct Run {
     seed: u64,
     /// The last copy-up done (N10): its volume and two chunks, to ask again.
     copied: Option<(u32, ChunkRef, ChunkRef)>,
-    vouched: Vouched,
+    vouched: Requests,
 }
 
 fn sectors_per_chunk(sector: u64) -> u32 {
@@ -597,7 +598,7 @@ impl Run {
         let req = Request { id: 0, volume: w, generation: g,
                             op: WireOp::Read { chunk: self.cref(c), position: 0, index: 0, offset: 0,
                                                len: self.sector as u32 } };
-        let got = serve(&mut self.store, &mut self.vouched, &req, &mut |_| Some(Told::Verified));
+        let got = nbscs::now(serve(&self.store, &self.vouched, &req, &AskNow::new(|_| Some(Told::Verified))));
         self.count("chunks found open read by another volume's writer at their generation");
         if got == Err(Refusal::Failed) {
             return Err(format!("chunk {}, found open at generation {} of volume {:?}, refused as found open to volume \
@@ -979,13 +980,17 @@ impl Run {
                     _ => None,
                 };
                 if let Some(req) = &probe {
-                    let got = serve(&mut self.store, &mut self.vouched, req, &mut |_| Some(Told::Verified));
+                    let got = nbscs::now(serve(&self.store, &self.vouched, req, &AskNow::new(|_| Some(Told::Verified))));
                     if !matches!(got, Ok(Done::Data(_))) {
                         return Err(format!("step {}: chunk {} read at a newer epoch, vouched for: {:?}", step, c, got));
                     }
                 }
                 let m = &self.chunks[c as usize];
-                if tell {
+                let racing = tell && probe.is_none() && !self.dead() && aim.chance(25)
+                    && self.store.holding(c).is_some_and(|h| h.incarnation == m.incarnation && h.known.set == m.epoch.set);
+                if racing {
+                    self.free_racing_a_read(c, step)?;
+                } else if tell {
                     match nbscs::now(self.store.free(c, m.incarnation)) {
                         Err(Error::Io) if self.dead() => {}
                         r => {
@@ -996,8 +1001,8 @@ impl Run {
                 if let Some(req) = &probe {
                     if !self.dead() && self.store.holding(c).is_none() {
                         self.count("reads of a chunk freed asked again");
-                        let got = serve(&mut self.store, &mut self.vouched, req,
-                                        &mut |_| Some(Told::Refused(Refusal::NotTheMap)));
+                        let got = nbscs::now(serve(&self.store, &self.vouched, req,
+                                                   &AskNow::new(|_| Some(Told::Refused(Refusal::NotTheMap)))));
                         if got != Err(Refusal::NotTheMap) {
                             return Err(format!("step {}: chunk {}, freed, read as vouched for before: {:?}", step, c,
                                                got.map(|d| format!("{:?}", d).chars().take(40).collect::<String>())));
@@ -1063,6 +1068,78 @@ impl Run {
             }
         }
         Ok(())
+    }
+
+    /// Chunk `c` freed by the garbage pass (`collect`) while a read of it is
+    /// out with its question to the mds, the mds vouching for the chunk as it
+    /// was before the metadata dropped it (N12c): the read ends with what the
+    /// chunk held -- the free waits for it, in the chunk's order -- never
+    /// with zeros, as a chunk freed reads as one never written.
+    fn free_racing_a_read(&mut self, c: u32, step: u64) -> Result<(), String> {
+        let m = &self.chunks[c as usize];
+        let (volume, incarnation) = (m.volume, m.incarnation);
+        let Some(held) = self.store.holding(c) else { return Ok(()) };
+        let mut was = vec![0u8; self.sector as usize];
+        let mut cref = self.cref(c);
+        cref.epoch = held.known;
+        if nbscs::now(self.store.read(volume, 0, cref, 0, &mut was, true)).is_err() {
+            return Ok(());
+        }
+        /* At an epoch the cs does not know: asked of the mds */
+        cref.epoch.version = held.known.version + 1;
+        let req = Request { id: step, volume, generation: 0,
+                            op: WireOp::Read { chunk: cref, position: 0, index: step, offset: 0,
+                                               len: self.sector as u32 } };
+        let ask = Later::default();
+        let gone = AskNow::new(|q| match q {
+            Question::Live { .. } => Some(Told::Gone(vec![c])),
+            Question::Volumes { .. } => Some(Told::Gone(Vec::new())),
+            _ => None,
+        });
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut read = Box::pin(serve(&self.store, &self.vouched, &req, &ask));
+        if read.as_mut().poll(&mut cx).is_ready() || !ask.asked.get() {
+            return Err(format!("step {}: a read of chunk {} at an epoch the cs does not know, not asked of the mds",
+                               step, c));
+        }
+        let mut pass = Box::pin(collect(&self.store, &self.vouched, &gone));
+        let first = match pass.as_mut().poll(&mut cx) {
+            Poll::Ready(done) => Some(done),
+            Poll::Pending => None,
+        };
+        let freed_first = first.is_some();
+        *ask.told.borrow_mut() = Some(Told::Verified);
+        let got = match read.as_mut().poll(&mut cx) {
+            Poll::Ready(got) => got,
+            Poll::Pending => return Err(format!("step {}: a read of chunk {} vouched for not ended", step, c)),
+        };
+        let done = match first {
+            Some(done) => done,
+            None => match pass.as_mut().poll(&mut cx) {
+                Poll::Ready(done) => done,
+                Poll::Pending => return Err(format!("step {}: the garbage pass not ended once the read was", step)),
+            },
+        };
+        drop(read);
+        drop(pass);
+        /* The device failed under it -- a fuse the target armed: nothing
+           there to hold it to */
+        if self.dead() {
+            return Ok(());
+        }
+        self.count("frees racing a read vouched for");
+        if freed_first {
+            self.count("frees racing a read: the free first");
+        }
+        if done.freed != [(c, incarnation)] {
+            return Err(format!("step {}: the garbage pass freed {:?}, not chunk {}", step, done.freed, c));
+        }
+        match got {
+            Ok(Done::Data(d)) if d != was => Err(format!("step {}: chunk {} freed as a read vouched for was out: it read \
+                                                          {:?}..., the chunk held {:?}...", step, c, &d[..4],
+                                                         &was[..4])),
+            _ => Ok(()),
+        }
     }
 
     /// A copy-up (N10): chunk `from` copied into a new chunk `to` of its set
@@ -1185,10 +1262,10 @@ impl Run {
         let (position, index) = (a.below(1 << 20) as u32, step);
         let req = Request { id: step, volume: v, generation: g, op: WireOp::CopyUp { from, to, position, index } };
         let mut asked: Option<Question> = None;
-        let got = serve(&mut self.store, &mut self.vouched, &req, &mut |q| {
+        let got = nbscs::now(serve(&self.store, &self.vouched, &req, &AskNow::new(|q| {
             asked = Some(q);
             Some(if vouch { Told::Verified } else { Told::Refused(Refusal::NotTheMap) })
-        });
+        })));
         let question = Question::VerifyCopy { volume: v, generation: g, position, from, to, index };
         match &asked {
             None if asks => return Err(format!("step {}: a copy-up of chunk {} into {}, not held, not asked of the mds",
@@ -1353,7 +1430,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     }).collect();
     let mut run = Run { r, disks: handles, identities, store, generation: [0; VOLUMES as usize + 1],
                         fenced: [0; VOLUMES as usize + 1], chunks, sector, trace, stats: BTreeMap::new(),
-                        last: None, seed, copied: None, vouched: Vouched::new() };
+                        last: None, seed, copied: None, vouched: Requests::new() };
     for step in 1..=steps {
         run.step(step)?;
     }
@@ -1363,4 +1440,22 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         eprintln!("cs seed {}: sector {}, {} disks: {:?}", seed, sector, disks, run.stats);
     }
     Ok(())
+}
+
+/// An mds whose answer comes later: the question kept, and what it is told
+/// once the target says.
+#[derive(Default)]
+struct Later {
+    asked: Cell<bool>,
+    told: RefCell<Option<Told>>,
+}
+
+impl Asker for Later {
+    fn ask(&self, _question: Question) -> impl Future<Output = Option<Told>> + '_ {
+        self.asked.set(true);
+        poll_fn(|_| match self.told.borrow_mut().take() {
+            Some(t) => Poll::Ready(Some(t)),
+            None => Poll::Pending,
+        })
+    }
 }

@@ -178,8 +178,9 @@ struct CopyUp {
     ask: Option<CopyAsk>,
     /// The new chunk and its incarnation, once told.
     to: Option<(u32, u32)>,
-    /// The members asked to copy, not answered.
+    /// The members asked to copy, not answered; and those that have copied.
     waiting: BTreeSet<u32>,
+    copied: BTreeSet<u32>,
     /// To be asked again from its start once the map is read again.
     after_map: bool,
     /// The write pieces held for it.
@@ -1074,6 +1075,7 @@ impl Session {
             (What::CopyUp(place), Reply::Done) => {
                 if let Some(c) = self.copies.get_mut(&place) {
                     c.waiting.remove(&cs);
+                    c.copied.insert(cs);
                 }
                 self.copy_progress(place, now, out);
             }
@@ -1314,20 +1316,16 @@ impl Session {
         }
         /* Copy-ups of that set waiting for it: done without it, which copies
            the new chunk when it comes back, as any chunk written while it was
-           out (N10) -- but by a view behind the set, asked again from their
-           start once the map is read again: the members it asked may not be
-           the set's, and one it lacks has copied nothing (found by fuzz/nbs's
-           cluster target, N10c: the one member asked, down, taken out, and the
-           copy-up done by none, the new chunk zeros under the writes after) */
-        let stale = self.map.sets.get(&set).is_some_and(|s| s.stale);
+           out (N10) -- ended only once every member the view has active then
+           has copied (`copy_progress`): by a view behind the set, the members
+           it asked may not be the set's, and one it lacks has copied nothing
+           (found by fuzz/nbs's cluster target, N10c: the one member asked,
+           down, taken out, and the copy-up done by none, the new chunk zeros
+           under the writes after) */
         let copies: Vec<u32> = self.copies.iter()
             .filter(|(&place, c)| c.waiting.contains(&cs) && self.map.set_of(place).is_some_and(|(s, _)| s == set))
             .map(|(&place, _)| place).collect();
         for place in copies {
-            if stale {
-                self.restart_copy(place);
-                continue;
-            }
             self.drop_subs(cs, What::CopyUp(place));
             if let Some(c) = self.copies.get_mut(&place) {
                 c.waiting.remove(&cs);
@@ -1469,6 +1467,7 @@ impl Session {
         }
         if let Some(c) = self.copies.get_mut(&place) {
             c.waiting = members.iter().copied().collect();
+            c.copied.clear();
         }
         for cs in members {
             self.send(cs, What::CopyUp(place), now, bufs, out);
@@ -1476,10 +1475,29 @@ impl Session {
     }
 
     /// Place `place`'s copy-up told done to the mds once every member asked
-    /// has copied, or is out.
+    /// has copied, or is out -- and every member the view has active now has
+    /// copied, by a view not behind the set: one the view made active since
+    /// its members were asked -- a join done as the map was read again for
+    /// another reason -- has copied nothing, and neither has a member a view
+    /// behind the set lacks; the copy-up is asked again from its start then,
+    /// the map read first. A member asked and taken out would otherwise end
+    /// it copied by none, the new chunk zeros under the writes after (found
+    /// by fuzz/nbs's cluster target: N10c, a take-out past the view; N12c, a
+    /// clone's copy-up asked of the one member active at its view, which
+    /// crashed, its view read again for another copy-up with two members
+    /// joined since, the one asked taken out at the next version).
     fn copy_progress(&mut self, place: u32, now: u64, out: &mut Vec<Out>) {
         let Some(c) = self.copies.get(&place) else { return };
         if c.to.is_some() && c.ask.is_none() && c.waiting.is_empty() && !c.after_map {
+            let unasked = match self.map.set_of(place) {
+                Some((_, set)) if !set.stale => set.cs.iter().any(|&m| set.active(m) && !c.copied.contains(&m)),
+                _ => true,
+            };
+            if unasked {
+                self.restart_copy(place);
+                self.refresh(now, out);
+                return;
+            }
             self.ask_copy(place, true, now, out);
         }
     }
@@ -1492,6 +1510,7 @@ impl Session {
             c.ask = None;
             c.to = None;
             c.waiting.clear();
+            c.copied.clear();
             c.after_map = true;
         }
     }

@@ -1672,15 +1672,35 @@ each new gate.
       asked before it, no wait for ever; five mutants of the new rules,
       each caught. The `cs` target stays the engine's judge one request at
       a time: its model is the richer.
-    - **N12c**, nbs-cs's loop on one event, requests in flight up to the
-      queue's buffers, the queue's flush started and reaped as a write is
-      (`DiskQueue::start_flush`, kept from N12a): `QueueDevice`'s requests
-      futures that a reap ends; nbswire's serve, copy and scrub `async`,
-      their questions to the host's mds answered to the request that asked,
-      not waited for on the loop; devices taken in, collected and fenced
-      without stopping it. Gates: nbs-fuzz's every target and its mutants,
-      nbs-test (its N11 phase throttled from the first write: a look
-      answered even during a long request), hv-nbs-test.
+    - **N12c**, nbs-cs's loop on one event -- done, in two steps: the
+      queue's flush started and reaped as a write is
+      (`DiskQueue::start_flush`, kept from N12a) and `QueueDevice`'s
+      requests futures over the queue's buffers, waited out where polled
+      (ce0daabb); then the loop: one task asleep on its one event, up to 64
+      requests in flight as futures, the leader's look answered as it is
+      taken, the mds's answers handed to the request that asked (nbswire's
+      `serve`, `collect` and the join's copy `async`, an `Asker` the cs's or
+      the fuzzer's), the devices' taking in and the garbage pass one task,
+      the joins and their copies another, every future polled again while
+      anything moved (`Store::moves`, the devices', the chunks' orders').
+      What it found: a chunk's requests must end in the order they came
+      across their questions to the mds, not only inside the store -- a
+      write sent twice, the second copy waiting for the mds, ended after its
+      client's close and opened the chunk again, or wrote older data over
+      newer (fuzz/nbs's cluster target, its cs's asking their mds over its
+      network: 5 runs in 317) -- and the garbage pass frees a chunk in that
+      order, or a read the mds vouched for reads zeros of a chunk freed as
+      its answer came (seen by reading the code; the cs target holds it
+      now); and the client's copy-up ends only once every member active in
+      its view then has copied -- one asked of the single member its view
+      had active, which crashed, the view read again since with two members
+      joined, was told done copied by none, the new chunk zeros under the
+      writes after (the cluster target, its cs's answering later now).
+      Gates: nbs-fuzz's every target and its mutants, nbs-test (its N11
+      phase throttled from the first write, each write slower at c than the
+      client's 0.5 s: c stays only where the look is answered whatever its
+      device is doing; the closes' records written together, the stop
+      fast), hv-nbs-test.
     - **N12d**, the hardware: a slow flush taking no replica out; 4 KiB at
       depth; a stop's closes.
   - **Limits**: one task a cs, so one CPU's worth of checks and copies -- a
