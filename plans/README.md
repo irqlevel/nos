@@ -54,6 +54,8 @@ user, and [nbs.md](nbs.md) the replicated block storage for VM disks, images
 and snapshots that is built on all of them. [vmctl.md](vmctl.md) sketches
 what comes after them: the cluster's VMs, placed by a scheduler on hosts
 with room and restarted where their host died.
+[review-2026-11-open.md](review-2026-11-open.md) is what the review of
+2026-11-12 -- the Rust ffi, base and hypervisor -- left open.
 
 ### Reordering history
 
