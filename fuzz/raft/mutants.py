@@ -93,8 +93,87 @@ MUTANTS = [
      'self.chunks.drain(..whole);',
      'self.chunks.drain(..whole);\n        self.chunks = self.chunks.concat().chunks(4096).map(|c| c.to_vec()).collect();',
      'snapshot_long_tail', 'storage.rs'),
+    # The review of 2026-11 (fuzz/raft/src/review2.rs): each rule it added.
+    ('snapshot_piece_twice', "a snapshot's answer that says nothing new answered with a piece",
+     '        if next == sending.acked {',
+     '        if false && next == sending.acked {',
+     'snapshot_pieces_bounded'),
+    ('snapshot_resend_always', "a snapshot's piece sent again at every heartbeat, moving or not",
+     '&& pr.sending.as_mut().is_some_and(|s| !mem::replace(&mut s.moved, false));',
+     '&& pr.sending.is_some();',
+     'snapshot_pieces_bounded'),
+    ('term_below_log_kept', "a member started at a term below its own log's last entry's",
+     'let (term, vote) = if last_term > hs.term {',
+     'let (term, vote) = if false && last_term > hs.term {',
+     'term_behind_log'),
+    ('probe_kept_on_match', 'a probe answered with what the leader knew left probing',
+     'let probe_answered = pr.state == State::Probe && pr.matched == index;',
+     'let probe_answered = false;',
+     'probe_leaves_on_match'),
+    ('stale_vote_answered_as_vote', "a vote request of a term gone by answered with a vote's no",
+     '                Body::Append { .. } | Body::Heartbeat { .. } | Body::Snapshot { .. } | Body::Vote { .. } => {',
+     '                Body::Vote { pre, .. } => {\n'
+     '                    let pre = *pre;\n'
+     '                    self.send(from, Body::VoteResp { pre, granted: false });\n'
+     '                }\n'
+     '                Body::Append { .. } | Body::Heartbeat { .. } | Body::Snapshot { .. } => {',
+     'stale_vote_not_counted'),
+    ('regress_not_repaired', 'a member that lost what it acknowledged probed with the same append for good',
+     '        if rejected <= self.matched {\n            /* The probe it refused',
+     '        if false && rejected <= self.matched {\n            /* The probe it refused',
+     'regressed_follower_repaired', 'progress.rs'),
+    ('added_voter_unheard', "a voter added in one step counted as not heard from by CheckQuorum's next look",
+     '                    pr.recent_active = true;\n                    self.progress.insert(*id, pr);',
+     '                    self.progress.insert(*id, pr);',
+     'added_voter_heard'),
+    ('transfer_unreachable_armed', 'a hand-over armed to a voter not heard from in an election\'s time',
+     'if self.progress.get(&to).is_none_or(|p| p.idle >= self.cfg.election_ticks) {',
+     'if false && self.progress.get(&to).is_none_or(|p| p.idle >= self.cfg.election_ticks) {',
+     'transfer_unreachable_refused'),
+    ('read_refusal_dropped', "a follower's read the leader refused dropped, not handed out failed",
+     '                    self.push_read_failed(ctx);',
+     '                    let _ = ctx;',
+     'follower_read_refused'),
+    ('leader_reads_unbounded', "a leader's reads taken past the room a Ready hands out",
+     'if self.waiting_reads.len() + self.reads.len() + self.read_states.len() >= MAX_PENDING_READS {',
+     'if self.waiting_reads.len() + self.reads.len() >= MAX_PENDING_READS {',
+     'leader_reads_bounded'),
+    ('rsm_read_never_aged', 'a read whose request or answer was lost waited for for good',
+     'let limit = 4 * u64::from(self.node.config().election_ticks);',
+     'let limit = u64::MAX;',
+     'rsm_read_lost_fails', 'rsm.rs'),
+    ('rsm_install_before_restore', "a leader's snapshot made the whole of the log before the state machine read it",
+     '                self.restore(&snap)?;\n'
+     '                self.node.storage_mut().apply_snapshot(snap).map_err(|e| self.stop(RsmError::Store(e)))?;',
+     '                self.node.storage_mut().apply_snapshot(snap.clone()).map_err(|e| self.stop(RsmError::Store(e)))?;\n'
+     '                self.restore(&snap)?;',
+     'rsm_snapshot_refused_keeps_store', 'rsm.rs'),
+    ('rsm_seq_zero_submitted', 'a command numbered 0 submitted',
+     '        if seq == 0 {\n            return Err(RsmError::BadSeq);\n        }\n',
+     '',
+     'rsm_seq_zero', 'rsm.rs'),
+    ('rsm_seq_zero_applied', 'a command numbered 0 in the log answered from its session',
+     '                _ if seq == 0 => out.events.push(Event::Stale { client, seq }),\n',
+     '',
+     'rsm_seq_zero', 'rsm.rs'),
+    ('rsm_caught_up_early', 'a member taken for caught up before the log it had committed is applied',
+     '        self.applied >= self.start_commit\n',
+     '        true\n',
+     'rsm_caught_up', 'rsm.rs'),
+    ('rsm_sync_always', 'every Ready synced, nothing in it to be durable or not',
+     '            if must_sync {\n                self.node.storage_mut().sync()',
+     '            if true {\n                self.node.storage_mut().sync()',
+     'rsm_sync_when_needed', 'rsm.rs'),
+    ('rsm_entries_not_synced', "a Ready's entries not synced before what it sends goes",
+     'let mut must_sync = !rd.entries.is_empty();',
+     'let mut must_sync = false;',
+     'rsm_sync_when_needed', 'rsm.rs'),
+    ('rsm_vote_not_synced', "a Ready's vote not synced before it is answered",
+     'must_sync |= hs.term != self.written.term || hs.vote != self.written.vote;',
+     'must_sync |= false;',
+     'rsm_vote_durable', 'rsm.rs'),
     ('log_no_crc', "a log record read whatever its CRC says",
-     '|| record_crc(&p) != crc {',
+     '|| record_crc(format, seq, at, &p) != crc {',
      '{',
      'log_torn_tail', 'log.rs'),
     ('log_no_seal', 'a segment not synced before the next is begun',
@@ -102,9 +181,19 @@ MUTANTS = [
      'let seq',
      'log_sealed_segments', 'log.rs'),
     ('log_open_not_synced', 'what an open reads -- a cut, a name -- not made the medium\'s before it is used',
-     'for s in self.segments.clone().iter() {\n            self.io(|f| f.sync(&wal_name(s.seq)))?;\n        }\n        self.io(|f| f.sync_dir())?;\n',
+     '        for s in self.segments.clone().iter() {\n'
+     '            self.io(|f| f.sync(&wal_name(s.seq)))?;\n'
+     '        }\n'
+     '        if let Some(m) = base {\n'
+     '            self.io(|f| f.sync(&snap_name(m.index)))?;\n'
+     '        }\n'
+     '        self.io(|f| f.sync_dir())?;\n',
      '',
      'log_open_syncs', 'log.rs'),
+    ('log_short_head_kept', "a last segment shorter than its head kept, and written after",
+     '        if last && len < HEAD {\n            /* Shorter',
+     '        if false && last && len < HEAD {\n            /* Shorter',
+     'log_short_head', 'log.rs'),
     ('log_snapshot_not_synced', 'a snapshot renamed before its bytes are on the medium',
      'self.io(|f| f.sync(&tmp))?;\n        self.io(|f| f.rename(&tmp, &name))?;',
      'self.io(|f| f.rename(&tmp, &name))?;',
@@ -117,6 +206,42 @@ MUTANTS = [
      'if let Some(m) = reset {',
      'if let Some(m) = reset.filter(|_| false) {',
      'log_install_drops_log', 'log.rs'),
+    ('log_head_torn_anywhere', "the last segment's synced head that does not check read as a crash as it was begun",
+     'let unfinished = last && len <= HEAD;',
+     'let unfinished = last;',
+     'log_head_refused', 'log.rs'),
+    ('log_destroys_before_refusing', 'snapshots the newest marker does not name removed before the log is known whole',
+     '        self.fresh = self.segments.is_empty();\n        if self.fresh && !snaps.is_empty() {',
+     '        self.fresh = self.segments.is_empty();\n'
+     '        for &i in snaps.iter() {\n'
+     '            if found.marker.map(|m| m.index) != Some(i) {\n'
+     '                let _ = self.files.remove(&snap_name(i));\n'
+     '            }\n'
+     '        }\n'
+     '        if self.fresh && !snaps.is_empty() {',
+     'log_head_refused', 'log.rs'),
+    ('log_snapshot_without_log', 'a snapshot with no segment opened as an empty log',
+     '        if self.fresh && !snaps.is_empty() {',
+     '        if false && self.fresh && !snaps.is_empty() {',
+     'log_snapshot_no_log', 'log.rs'),
+    ('log_full_unheld', 'entries taken past the segments a log keeps, opened again',
+     '        if self.segments.len() >= MAX_SEGMENTS {\n            return Err(LogError::Full);\n        }\n        let from',
+     '        let from',
+     'log_full_holds', 'log.rs'),
+    ('log_crc_unplaced', "a record's CRC over its length and payload alone, not its place",
+     '    if format == WAL_PLACED {',
+     '    if false && format == WAL_PLACED {',
+     'log_stale_record_not_read', 'log.rs'),
+    ('log_index_unbounded', 'a marker past any index a group reaches taken',
+     '                    if index >= MAX_TERM_OR_INDEX || term >= MAX_TERM_OR_INDEX {\n'
+     '                        return Err(LogError::Corrupt("a marker past',
+     '                    if false {\n'
+     '                        return Err(LogError::Corrupt("a marker past',
+     'log_index_bounds', 'log.rs'),
+    ('log_sync_always', 'a sync with nothing written a call of the files all the same',
+     '        if !self.unsynced {\n            return Ok(());\n        }\n',
+     '',
+     'log_sync_needs_writes', 'log.rs'),
     ('rsm_no_dedup', 'a command retried under its number applied again',
      'Some(s) if seq == s.last => {',
      'Some(s) if seq == s.last && false => {',
@@ -126,9 +251,100 @@ MUTANTS = [
      'let Some',
      'rsm_read_waits', 'rsm.rs'),
     ('rsm_late_index', 'a snapshot named at the index applied when it is done, not when it was frozen',
-     'return match self.node.storage_mut().create_snapshot(t.index, t.conf, t.out.finish()) {',
-     'let late = self.applied;\n                let conf = self.node.conf_state_at(late).unwrap_or(t.conf);\n                return match self.node.storage_mut().create_snapshot(late, conf, t.out.finish()) {',
+     '        match self.node.storage_mut().begin_snapshot(index, conf, out.finish()) {',
+     '        let index = self.applied;\n'
+     '        let conf = self.node.conf_state_at(index).unwrap_or(conf);\n'
+     '        match self.node.storage_mut().begin_snapshot(index, conf, out.finish()) {',
      'rsm_snapshot_frozen', 'rsm.rs'),
+    ('rsm_gathered_whole', "a snapshot's pieces gathered all in one call",
+     '        for _ in 0..PIECES_A_CALL {',
+     '        for _ in 0..usize::MAX {',
+     'rsm_snapshot_in_steps', 'rsm.rs'),
+    ('rsm_written_whole', "a snapshot's pieces written all in one call",
+     'continue_snapshot(PIECES_A_CALL)',
+     'continue_snapshot(usize::MAX)',
+     'rsm_snapshot_in_steps', 'rsm.rs'),
+    ('rsm_snapshot_unbounded', "a snapshot of the member's own gathered past what it may hold",
+     'SnapshotBuilder::with_limit(self.node.config().max_snapshot_bytes)',
+     'SnapshotBuilder::new()',
+     'rsm_snapshot_too_large', 'rsm.rs'),
+    ('builder_limit_ignored', "a snapshot's bytes taken past the limit it was made with",
+     'if self.len.saturating_add(bytes.len() as u64) > self.limit {',
+     'if self.len.saturating_add(bytes.len() as u64) > MAX_SNAPSHOT_BYTES {',
+     'rsm_snapshot_too_large', 'types.rs'),
+    ('log_snapshot_whole_call', "a snapshot's pieces all written in its first step",
+     '        while w.next < total && n < pieces {',
+     '        while w.next < total {',
+     'log_snapshot_stepped', 'log.rs'),
+    ('log_piece_no_crc', "a snapshot's piece sent whatever its CRC says",
+     '    if !read_full(files, &name, at + RECORD_HEADER as u64, &mut piece, len).map_err(SnapFault::Io)?\n'
+     '        || piece_crc(&piece) != le32(&ph[4..8])\n'
+     '    {',
+     '    if !read_full(files, &name, at + RECORD_HEADER as u64, &mut piece, len).map_err(SnapFault::Io)?\n'
+     '    {',
+     'log_snapshot_pieces', 'log.rs'),
+    ('log_short_piece_taken', "a snapshot's file with a short piece before its last opened",
+     'if plen == 0 || plen > PIECE_MAX || plen as u64 > left || (plen < PIECE_MAX && plen as u64 != left) {',
+     'if plen == 0 || plen > PIECE_MAX || plen as u64 > left {',
+     'log_snapshot_short_piece', 'log.rs'),
+    ('log_given_up_kept', "a snapshot being written kept as a leader's is taken in",
+     '        if let Some(w) = self.writing.take() {\n'
+     '            self.remove_quietly(&tmp_name(w.meta.index))?;\n'
+     '        }\n',
+     '',
+     'log_snapshot_given_up', 'log.rs'),
+    ('node_snapshot_limit_unchecked', 'a snapshot larger than the member may hold taken in, piece by piece',
+     '            if total > self.cfg.max_snapshot_bytes {',
+     '            if false && total > self.cfg.max_snapshot_bytes {',
+     'snapshot_refused_counted'),
+    ('node_snapshot_refusal_unsaid', "a follower's refusal of a snapshot not counted by its leader",
+     '            pr.become_probe();\n            self.stats.snapshots_rejected += 1;',
+     '            pr.become_probe();',
+     'snapshot_refused_counted'),
+    ('successors_unheard', 'the lead handed on to a voter not heard from in an election\'s time',
+     '            .filter(|&id| self.idle_ticks(id).is_some_and(|t| t < election))\n',
+     '',
+     'successors_heard'),
+    ('keep_stuck_without_heir', 'a leader to leave the voters waiting for a voter to hand the lead to, none there',
+     '    if !voters.contains(&me) && can_hand {',
+     '    if !voters.contains(&me) {',
+     'membership_goes_on', 'keep.rs'),
+    ('truncate_changes_kept', 'a change written over by a new leader\'s log kept in force',
+     '    fn truncate_changes(&mut self, index: u64) {\n        if self.changes.last()',
+     '    fn truncate_changes(&mut self, index: u64) {\n        if false && self.changes.last()',
+     'change_written_over_undone'),
+    ('piece_anywhere', "a snapshot's piece taken wherever it says it goes",
+     '        if offset != inc.built.len() {',
+     '        if false && offset != inc.built.len() {',
+     'piece_at_its_place'),
+    ('leader_changes_itself', 'a leader proposing its own removal or demotion',
+     '        if cc.node == self.id && cc.kind != ChangeKind::AddVoter {',
+     '        if false && cc.node == self.id && cc.kind != ChangeKind::AddVoter {',
+     'leader_changes_not_itself'),
+    ('no_lease', 'a vote request taken from a member while a leader is heard from',
+     'if self.in_lease() && !*transfer {',
+     'if false && self.in_lease() && !*transfer {',
+     'lease_holds'),
+    ('no_check_quorum', 'a leader that hears from no majority staying the leader',
+     '            if self.cfg.check_quorum && !self.quorum_active() {',
+     '            if false && self.cfg.check_quorum && !self.quorum_active() {',
+     'quorum_lost_steps_down'),
+    ('timeout_now_at_once', "a hand-over's TimeoutNow sent to a member that does not hold the log",
+     'let caught_up = self.progress.get(&to).is_some_and(|p| p.matched == self.log.last_index());',
+     'let caught_up = true;',
+     'timeout_now_when_caught_up'),
+    ('hint_ignored', "a refused append's hint not looked at: the leader probes one entry back a round trip",
+     'if hint_term > 0 { self.log.find_conflict_by_term(hint_index, hint_term).0 } else { hint_index };',
+     'index.saturating_sub(1);',
+     'hint_skips_a_term'),
+    ('session_evicted_newest', 'the session used last evicted for a new one, not the least recently used',
+     'self.sessions.iter().min_by_key(|(c, s)| (s.used, **c))',
+     'self.sessions.iter().max_by_key(|(c, s)| (s.used, **c))',
+     'rsm_session_evicted', 'rsm.rs'),
+    ('keep_leader_removed_first', 'the leader proposing its own removal, the lead not handed on',
+     'conf.voters.iter().chain(conf.learners.iter()).find(|n| **n != me && !named(n))',
+     'conf.voters.iter().chain(conf.learners.iter()).find(|n| !named(n))',
+     'membership_goes_on', 'keep.rs'),
     ('rsm_ctx_reused', "a read's context the same from start to start, an answer to one before a restart taken for one after",
      'let ctx = self.nonce.wrapping_add(self.next_ctx);',
      'let ctx = self.next_ctx;',
@@ -251,11 +467,26 @@ def build():
                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE).returncode
 
 
+# A run past this is cut short and counted as failing: a mutant that breaks
+# a rule of safety can make a run go on for ever -- a gate in CI would hang,
+# which is a failure too -- and what it said by then is kept.
+RUN_LIMIT = 600
+
+
 def run(*args):
     """A run's exit code and its first failing line."""
-    p = subprocess.run([BINARY] + list(args), cwd=ROOT, capture_output=True, text=True, timeout=900)
-    first = next((l for l in p.stdout.splitlines() if l.startswith('FAIL')), '')
-    return p.returncode, first
+    p = subprocess.Popen([BINARY] + list(args), cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         text=True)
+    try:
+        out, _ = p.communicate(timeout=RUN_LIMIT)
+        code = p.returncode
+    except subprocess.TimeoutExpired:
+        p.kill()
+        out, _ = p.communicate()
+        code = -1
+    lines = out.splitlines()
+    first = next((l for l in lines if l.startswith('FAIL')), 'cut short after %d s' % RUN_LIMIT if code == -1 else '')
+    return code, first
 
 
 def main():
