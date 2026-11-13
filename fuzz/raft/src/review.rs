@@ -32,10 +32,12 @@ fn ensure(ok: bool, what: &str) -> Result<(), String> {
 }
 
 /// A storage over a `MemStorage` that fails to read one entry's term, or
-/// any entries at all.
+/// any entries at all -- the term from when it is armed, after the member
+/// started over it (a start reads the last entry's term, and a failure
+/// there is the start's to refuse).
 struct Failing {
     inner: MemStorage,
-    term_at: Option<u64>,
+    term_at: std::cell::Cell<Option<u64>>,
     entries: bool,
 }
 
@@ -50,7 +52,7 @@ impl Storage for Failing {
         self.inner.entries(lo, hi, max_bytes, out)
     }
     fn term(&self, index: u64) -> Result<u64, StorageError> {
-        if Some(index) == self.term_at {
+        if Some(index) == self.term_at.get() {
             return Err(StorageError::Corrupt);
         }
         self.inner.term(index)
@@ -75,8 +77,12 @@ fn storage_fault_vote() -> Result<(), String> {
     let ents: Vec<Entry> = (4..=10u64).map(|i| Entry { term: 2, index: i, kind: EntryKind::Normal, data: vec![1] }).collect();
     s.append(&ents).map_err(|e| format!("{:?}", e))?;
     s.set_hard_state(HardState { term: 2, vote: 0, commit: 10 });
-    let mut n = RawNode::new(Config::new(1), Failing { inner: s, term_at: Some(10), entries: false })
+    /* Unable to read it as it starts, the member does not start */
+    let bad = Failing { inner: s.clone(), term_at: std::cell::Cell::new(Some(10)), entries: false };
+    ensure(RawNode::new(Config::new(1), bad).is_err(), "a member started over a last term it could not read")?;
+    let mut n = RawNode::new(Config::new(1), Failing { inner: s, term_at: std::cell::Cell::new(None), entries: false })
         .map_err(|e| e.to_string())?;
+    n.storage().term_at.set(Some(10));
     let _ = n.step(Message { from: 2, to: 1, term: 3, body: Body::Vote { pre: false, transfer: false, last_index: 3, last_term: 1 } });
     for _ in 0..4 {
         if !n.has_ready() {
@@ -95,7 +101,8 @@ fn storage_fault_vote() -> Result<(), String> {
 /// does not hand out empty `Ready`s for good, saying nothing. (The first
 /// version did, 100,000 of them.)
 fn storage_fault_spin() -> Result<(), String> {
-    let mut n = RawNode::new(Config::new(1), Failing { inner: MemStorage::bootstrap(&[1], &[]), term_at: None, entries: false })
+    let mut n = RawNode::new(Config::new(1), Failing { inner: MemStorage::bootstrap(&[1], &[]),
+                                                      term_at: std::cell::Cell::new(None), entries: false })
         .map_err(|e| e.to_string())?;
     let drain = |n: &mut RawNode<Failing>, limit: usize| -> usize {
         let mut k = 0;

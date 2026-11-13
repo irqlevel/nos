@@ -18,10 +18,15 @@ pub enum StorageError {
     Compacted,
     /// After the last entry.
     Unavailable,
-    /// A snapshot no newer than the one there.
+    /// A snapshot no newer than the one there -- or, asked a piece of one,
+    /// no longer the newest.
     SnapshotOutOfDate,
     /// The storage is not a log: it says what cannot be.
     Corrupt,
+    /// A read of the medium failed.
+    Io,
+    /// No memory for what was read: the heap refused it.
+    NoMemory,
 }
 
 /// What a node starts from.
@@ -45,8 +50,30 @@ pub trait Storage {
     fn first_index(&self) -> u64;
     /// The last entry the log has -- the snapshot's index when it has none.
     fn last_index(&self) -> u64;
-    /// The newest snapshot.
+    /// The newest snapshot, all of its bytes.
     fn snapshot(&self) -> Result<Snapshot, StorageError>;
+    /// The newest snapshot's place and membership, and how many bytes it
+    /// has, without them: what a leader starts sending it by. A storage
+    /// that keeps its snapshot's bytes on a disk reads none of them here.
+    fn snapshot_head(&self) -> Result<(SnapshotMeta, u64), StorageError> {
+        self.snapshot().map(|s| {
+            let len = s.data.len();
+            (s.meta, len)
+        })
+    }
+    /// Up to `max` bytes of the snapshot at `index` from `offset`, within the
+    /// piece that holds `offset`, after `out`'s: a piece a leader sends.
+    /// `SnapshotOutOfDate` where that snapshot is no longer the newest.
+    fn snapshot_piece(&self, index: u64, offset: u64, max: usize, out: &mut Vec<u8>) -> Result<(), StorageError> {
+        let s = self.snapshot()?;
+        if s.meta.index != index {
+            return Err(StorageError::SnapshotOutOfDate);
+        }
+        let piece = s.data.read(offset, max);
+        out.try_reserve_exact(piece.len()).map_err(|_| StorageError::NoMemory)?;
+        out.extend_from_slice(piece);
+        Ok(())
+    }
 }
 
 /// Entries a piece of the log holds: 1024, some 48 KiB of them besides their
@@ -282,5 +309,9 @@ impl Storage for MemStorage {
 
     fn snapshot(&self) -> Result<Snapshot, StorageError> {
         Ok(self.snapshot.clone())
+    }
+
+    fn snapshot_head(&self) -> Result<(SnapshotMeta, u64), StorageError> {
+        Ok((self.snapshot.meta.clone(), self.snapshot.data.len()))
     }
 }

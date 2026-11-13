@@ -72,7 +72,10 @@ pub enum Send {
 /// What became of an ask.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// Applied, once, at `index`: what applying it answered.
+    /// Applied, once: what applying it answered, and `index`, the entry it
+    /// was applied at -- or, where the answer came from its session, the
+    /// entry of the try that was answered so, at or past the one applied:
+    /// what a reader of the state waits to have applied either way.
     Applied { index: u64, answer: Vec<u8> },
     /// Applied, once, and its answer gone: too long for its session to
     /// keep, and its application not seen here -- a snapshot taken in over
@@ -226,6 +229,16 @@ impl<W> Asks<W> {
 
     pub fn is_empty(&self) -> bool {
         self.asks.is_empty()
+    }
+
+    /// Every ask in flight given up, its waiter handed back: the member
+    /// stops, and each is told so rather than left to wait out its time.
+    /// The sessions made for them are not ended -- the member that runs
+    /// over the log next does not know them, and one left is evicted in
+    /// time as any other is.
+    pub fn drain(&mut self) -> Vec<W> {
+        self.ending.clear();
+        self.asks.drain(..).map(|a| a.waiter).collect()
     }
 
     fn take_request(&mut self) -> u64 {
