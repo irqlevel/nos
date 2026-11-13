@@ -173,7 +173,7 @@ MUTANTS = [
      'must_sync |= false;',
      'rsm_vote_durable', 'rsm.rs'),
     ('log_no_crc', "a log record read whatever its CRC says",
-     '|| record_crc(&p) != crc {',
+     '|| record_crc(format, seq, at, &p) != crc {',
      '{',
      'log_torn_tail', 'log.rs'),
     ('log_no_seal', 'a segment not synced before the next is begun',
@@ -181,9 +181,19 @@ MUTANTS = [
      'let seq',
      'log_sealed_segments', 'log.rs'),
     ('log_open_not_synced', 'what an open reads -- a cut, a name -- not made the medium\'s before it is used',
-     'for s in self.segments.clone().iter() {\n            self.io(|f| f.sync(&wal_name(s.seq)))?;\n        }\n        self.io(|f| f.sync_dir())?;\n',
+     '        for s in self.segments.clone().iter() {\n'
+     '            self.io(|f| f.sync(&wal_name(s.seq)))?;\n'
+     '        }\n'
+     '        if let Some(m) = base {\n'
+     '            self.io(|f| f.sync(&snap_name(m.index)))?;\n'
+     '        }\n'
+     '        self.io(|f| f.sync_dir())?;\n',
      '',
      'log_open_syncs', 'log.rs'),
+    ('log_short_head_kept', "a last segment shorter than its head kept, and written after",
+     '        if last && len < HEAD {\n            /* Shorter',
+     '        if false && last && len < HEAD {\n            /* Shorter',
+     'log_short_head', 'log.rs'),
     ('log_snapshot_not_synced', 'a snapshot renamed before its bytes are on the medium',
      'self.io(|f| f.sync(&tmp))?;\n        self.io(|f| f.rename(&tmp, &name))?;',
      'self.io(|f| f.rename(&tmp, &name))?;',
@@ -196,6 +206,42 @@ MUTANTS = [
      'if let Some(m) = reset {',
      'if let Some(m) = reset.filter(|_| false) {',
      'log_install_drops_log', 'log.rs'),
+    ('log_head_torn_anywhere', "the last segment's synced head that does not check read as a crash as it was begun",
+     'let unfinished = last && len <= HEAD;',
+     'let unfinished = last;',
+     'log_head_refused', 'log.rs'),
+    ('log_destroys_before_refusing', 'snapshots the newest marker does not name removed before the log is known whole',
+     '        self.fresh = self.segments.is_empty();\n        if self.fresh && !snaps.is_empty() {',
+     '        self.fresh = self.segments.is_empty();\n'
+     '        for &i in snaps.iter() {\n'
+     '            if found.marker.map(|m| m.index) != Some(i) {\n'
+     '                let _ = self.files.remove(&snap_name(i));\n'
+     '            }\n'
+     '        }\n'
+     '        if self.fresh && !snaps.is_empty() {',
+     'log_head_refused', 'log.rs'),
+    ('log_snapshot_without_log', 'a snapshot with no segment opened as an empty log',
+     '        if self.fresh && !snaps.is_empty() {',
+     '        if false && self.fresh && !snaps.is_empty() {',
+     'log_snapshot_no_log', 'log.rs'),
+    ('log_full_unheld', 'entries taken past the segments a log keeps, opened again',
+     '        if self.segments.len() >= MAX_SEGMENTS {\n            return Err(LogError::Full);\n        }\n        let from',
+     '        let from',
+     'log_full_holds', 'log.rs'),
+    ('log_crc_unplaced', "a record's CRC over its length and payload alone, not its place",
+     '    if format == WAL_PLACED {',
+     '    if false && format == WAL_PLACED {',
+     'log_stale_record_not_read', 'log.rs'),
+    ('log_index_unbounded', 'a marker past any index a group reaches taken',
+     '                    if index >= MAX_TERM_OR_INDEX || term >= MAX_TERM_OR_INDEX {\n'
+     '                        return Err(LogError::Corrupt("a marker past',
+     '                    if false {\n'
+     '                        return Err(LogError::Corrupt("a marker past',
+     'log_index_bounds', 'log.rs'),
+    ('log_sync_always', 'a sync with nothing written a call of the files all the same',
+     '        if !self.unsynced {\n            return Ok(());\n        }\n',
+     '',
+     'log_sync_needs_writes', 'log.rs'),
     ('rsm_no_dedup', 'a command retried under its number applied again',
      'Some(s) if seq == s.last => {',
      'Some(s) if seq == s.last && false => {',
