@@ -7,7 +7,18 @@ use core::cell::Cell;
 use core::cmp;
 
 use crate::storage::{Storage, StorageError};
-use crate::types::{Entry, Snapshot};
+use crate::types::{Entry, Snapshot, SnapshotMeta};
+
+/// What came of a read of a snapshot's piece.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Piece {
+    Read,
+    /// The snapshot is no longer the newest: a newer one is sent from its
+    /// start.
+    Stale,
+    /// Not read now -- no memory, or a failed read kept as the fault.
+    NotNow,
+}
 
 /// The entries and the snapshot a `Ready` has to hand the caller to write.
 #[derive(Debug, Default)]
@@ -131,16 +142,31 @@ impl<S: Storage> RaftLog<S> {
         }
     }
 
-    /// The newest snapshot, to send: None while the storage has none yet
-    /// to give (`Unavailable`, asked again later); any other error is a
-    /// failed read.
-    pub fn snapshot(&self) -> Option<Snapshot> {
-        match self.storage.snapshot() {
-            Ok(s) => Some(s),
+    /// The newest snapshot's place and length, to send it by: None while
+    /// the storage has none yet to give (`Unavailable`, asked again later);
+    /// any other error is a failed read.
+    pub fn snapshot_head(&self) -> Option<(SnapshotMeta, u64)> {
+        match self.storage.snapshot_head() {
+            Ok(m) => Some(m),
             Err(StorageError::Unavailable) => None,
             Err(e) => {
                 self.failed(e);
                 None
+            }
+        }
+    }
+
+    /// A piece of the snapshot at `index` from `offset`, into `out`: what
+    /// came of it. A failed read is kept as the log's fault; no memory for
+    /// the piece is not -- it is sent at the next heartbeat.
+    pub fn snapshot_piece(&self, index: u64, offset: u64, max: usize, out: &mut Vec<u8>) -> Piece {
+        match self.storage.snapshot_piece(index, offset, max, out) {
+            Ok(()) => Piece::Read,
+            Err(StorageError::SnapshotOutOfDate) => Piece::Stale,
+            Err(StorageError::NoMemory) => Piece::NotNow,
+            Err(e) => {
+                self.failed(e);
+                Piece::NotNow
             }
         }
     }

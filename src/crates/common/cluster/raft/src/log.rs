@@ -37,14 +37,15 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 
 use crate::conf::MAX_MEMBERS;
 use crate::node::MAX_TERM_OR_INDEX;
 use crc::crc32c;
 use crate::storage::{bootstrap_entries, MemStorage, RaftState, Storage, StorageError, BOOTSTRAP_TERM};
 use crate::types::{
-    ConfState, Entry, HardState, NodeId, Snapshot, SnapshotBuilder, SnapshotData, SnapshotMeta, MAX_SNAPSHOT_BYTES,
-    NONE, PIECE_MAX,
+    ConfState, Entry, HardState, NodeId, PushError, Snapshot, SnapshotBuilder, SnapshotData, SnapshotMeta,
+    MAX_SNAPSHOT_BYTES, NONE, PIECE_MAX,
 };
 use crate::wire;
 
@@ -110,6 +111,8 @@ pub enum LogError {
     Full,
     /// An earlier call failed: the log is to be opened again.
     Stopped,
+    /// No memory for what the log reads or writes: the heap refused it.
+    NoMemory,
 }
 
 /// How the log cuts its segments.
@@ -289,11 +292,184 @@ enum Scan {
 /// A record read: its payload, or nothing at all that checks.
 type Read = Option<Vec<u8>>;
 
+/// The newest snapshot's file as the log knows it: where its pieces are.
+#[derive(Clone, Copy, Debug, Default)]
+struct SnapFile {
+    /// Its data's bytes.
+    len: u64,
+    /// Its membership's bytes after the header: the first piece's place.
+    conf_len: usize,
+}
+
+/// A snapshot of the state machine's own being written, a few pieces a
+/// call (`continue_snapshot`): the member that takes it goes on meanwhile.
+struct Writing {
+    meta: SnapshotMeta,
+    data: SnapshotData,
+    /// The next piece to write.
+    next: usize,
+    /// A piece's header and bytes, one append each: allocated once.
+    buf: Vec<u8>,
+    /// Its membership's bytes after the header.
+    conf_len: usize,
+}
+
+/// Why a snapshot's file does not read.
+enum SnapFault {
+    Corrupt(&'static str),
+    Io(FileError),
+    NoMemory,
+}
+
+/// `buf` filled from `offset` of `name`, a file `len` long: false, with
+/// nothing to read, where it does not hold that much.
+fn read_full<F: Files>(files: &mut F, name: &str, offset: u64, buf: &mut [u8], len: u64) -> Result<bool, FileError> {
+    if len < offset || len - offset < buf.len() as u64 {
+        return Ok(false);
+    }
+    let mut done = 0;
+    while done < buf.len() {
+        let n = files.read_at(name, offset + done as u64, &mut buf[done..])?;
+        if n == 0 {
+            return Ok(false);
+        }
+        done += n;
+    }
+    Ok(true)
+}
+
+/// `n` bytes of zeros, asked of the heap so that a refusal is an error.
+fn zeroed(n: usize) -> Result<Vec<u8>, SnapFault> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).map_err(|_| SnapFault::NoMemory)?;
+    v.resize(n, 0);
+    Ok(v)
+}
+
+/// The snapshot's file at `index`, as its marker names it, checked from
+/// end to end -- every piece but the last full, so that a piece is found by
+/// its number: its place and membership, where its pieces are, and -- with
+/// `keep` -- its bytes.
+fn read_snapshot<F: Files>(files: &mut F, index: u64, term: u64, keep: bool)
+    -> Result<(SnapshotMeta, SnapFile, Option<SnapshotData>), SnapFault>
+{
+    let name = snap_name(index);
+    let len = match files.len(&name) {
+        Ok(len) => len,
+        Err(FileError::NotFound) => return Err(SnapFault::Corrupt("the snapshot the log names is not there")),
+        Err(e) => return Err(SnapFault::Io(e)),
+    };
+    let mut h = [0u8; SNAP_HEADER];
+    if !read_full(files, &name, 0, &mut h, len).map_err(SnapFault::Io)?
+        || h[..8] != SNAP_MAGIC
+        || le32(&h[8..12]) != SNAP_FORMAT
+    {
+        return Err(SnapFault::Corrupt("a snapshot's header does not check"));
+    }
+    let (hindex, hterm, data_len) = (le64(&h[12..20]), le64(&h[20..28]), le64(&h[28..36]));
+    let conf_len = le32(&h[36..40]) as usize;
+    if hindex != index || hterm != term || data_len > MAX_SNAPSHOT_BYTES || conf_len > MAX_CONF_BYTES {
+        return Err(SnapFault::Corrupt("a snapshot that is not the one its marker names"));
+    }
+    let mut conf_bytes = zeroed(conf_len)?;
+    if !read_full(files, &name, SNAP_HEADER as u64, &mut conf_bytes, len).map_err(SnapFault::Io)?
+        || crc32c::update(crc32c::checksum(&h[..40]), &conf_bytes) != le32(&h[40..44])
+    {
+        return Err(SnapFault::Corrupt("a snapshot's header does not check"));
+    }
+    let conf = wire::decode_conf_state(&conf_bytes).map_err(|_| SnapFault::Corrupt("a snapshot's membership"))?;
+    let mut at = (SNAP_HEADER + conf_len) as u64;
+    let mut left = data_len;
+    let mut kept = if keep { Some(SnapshotBuilder::new()) } else { None };
+    let mut piece = zeroed(0)?;
+    piece.try_reserve_exact(PIECE_MAX.min(data_len as usize)).map_err(|_| SnapFault::NoMemory)?;
+    while left > 0 {
+        let mut ph = [0u8; RECORD_HEADER];
+        if !read_full(files, &name, at, &mut ph, len).map_err(SnapFault::Io)? {
+            return Err(SnapFault::Corrupt("a snapshot cut short"));
+        }
+        let plen = le32(&ph[0..4]) as usize;
+        /* Every piece but the last full: a short one is the last */
+        if plen == 0 || plen > PIECE_MAX || plen as u64 > left || (plen < PIECE_MAX && plen as u64 != left) {
+            return Err(SnapFault::Corrupt("a snapshot's piece does not check"));
+        }
+        piece.resize(plen, 0);
+        if !read_full(files, &name, at + RECORD_HEADER as u64, &mut piece, len).map_err(SnapFault::Io)?
+            || piece_crc(&piece) != le32(&ph[4..8])
+        {
+            return Err(SnapFault::Corrupt("a snapshot's piece does not check"));
+        }
+        if let Some(b) = kept.as_mut() {
+            b.try_push(&piece).map_err(|e| match e {
+                PushError::TooLarge => SnapFault::Corrupt("a snapshot past the largest there is"),
+                PushError::NoMemory => SnapFault::NoMemory,
+            })?;
+        }
+        left -= plen as u64;
+        at += (RECORD_HEADER + plen) as u64;
+    }
+    if at != len {
+        return Err(SnapFault::Corrupt("bytes after a snapshot's end"));
+    }
+    Ok((SnapshotMeta { index, term, conf }, SnapFile { len: data_len, conf_len }, kept.map(SnapshotBuilder::finish)))
+}
+
+/// Up to `max` bytes of the snapshot at `index` from `offset`, within the
+/// piece that holds it, after `out`'s: read from its file -- the piece's
+/// CRC checked -- as a leader sends it.
+fn read_piece<F: Files>(files: &mut F, index: u64, snap: SnapFile, offset: u64, max: usize, out: &mut Vec<u8>)
+    -> Result<(), SnapFault>
+{
+    if offset >= snap.len || max == 0 {
+        return Ok(());
+    }
+    let k = offset / PIECE_MAX as u64;
+    let plen = (snap.len - k * PIECE_MAX as u64).min(PIECE_MAX as u64) as usize;
+    let at = (SNAP_HEADER + snap.conf_len) as u64 + k * (RECORD_HEADER + PIECE_MAX) as u64;
+    let name = snap_name(index);
+    let len = match files.len(&name) {
+        Ok(len) => len,
+        Err(FileError::NotFound) => return Err(SnapFault::Corrupt("the snapshot the log names is not there")),
+        Err(e) => return Err(SnapFault::Io(e)),
+    };
+    let mut ph = [0u8; RECORD_HEADER];
+    if !read_full(files, &name, at, &mut ph, len).map_err(SnapFault::Io)? || le32(&ph[0..4]) as usize != plen {
+        return Err(SnapFault::Corrupt("a snapshot's piece out of its place"));
+    }
+    let mut piece = zeroed(plen)?;
+    if !read_full(files, &name, at + RECORD_HEADER as u64, &mut piece, len).map_err(SnapFault::Io)?
+        || piece_crc(&piece) != le32(&ph[4..8])
+    {
+        return Err(SnapFault::Corrupt("a snapshot's piece does not check"));
+    }
+    let from = (offset % PIECE_MAX as u64) as usize;
+    let to = plen.min(from.saturating_add(max));
+    out.try_reserve_exact(to - from).map_err(|_| SnapFault::NoMemory)?;
+    out.extend_from_slice(&piece[from..to]);
+    Ok(())
+}
+
+/// What a snapshot's file that does not read is to a reader of the log.
+fn storage_fault(f: SnapFault) -> StorageError {
+    match f {
+        SnapFault::Corrupt(_) => StorageError::Corrupt,
+        SnapFault::Io(_) => StorageError::Io,
+        SnapFault::NoMemory => StorageError::NoMemory,
+    }
+}
+
 pub struct DiskLog<F: Files> {
-    files: F,
+    /// The files: in a cell, as a leader reads a snapshot's pieces through
+    /// `Storage`, which takes the log by reference.
+    files: RefCell<F>,
     config: LogConfig,
-    /// What the member reads: the snapshot and the log after it.
+    /// What the member reads: the snapshot and the log after it -- the
+    /// snapshot's place and membership, not its bytes, which stay in their
+    /// file (`snap`) and are read a piece at a time as they are sent.
     mem: MemStorage,
+    snap: SnapFile,
+    /// The snapshot of the state machine's own being written.
+    writing: Option<Writing>,
     /// The segments, oldest first, their seqs one after another; the last
     /// is the one written to.
     segments: Vec<Segment>,
@@ -322,9 +498,11 @@ impl<F: Files> DiskLog<F> {
     pub fn open(files: F, config: LogConfig) -> Result<DiskLog<F>, LogError> {
         let config = LogConfig { segment_bytes: config.segment_bytes.max(MIN_SEGMENT_BYTES) };
         let mut log = DiskLog {
-            files,
+            files: RefCell::new(files),
             config,
             mem: MemStorage::new(),
+            snap: SnapFile::default(),
+            writing: None,
             segments: Vec::new(),
             marker_seq: 0,
             reset_seq: 0,
@@ -365,14 +543,15 @@ impl<F: Files> DiskLog<F> {
         self.mem.snapshot_meta()
     }
 
-    pub fn files(&self) -> &F {
-        &self.files
-    }
-
     /// The files back, with nothing more written: what was not synced may
     /// or may not be on the medium.
     pub fn into_files(self) -> F {
-        self.files
+        self.files.into_inner()
+    }
+
+    /// Whether a snapshot of the state machine's own is being written.
+    pub fn writing_snapshot(&self) -> bool {
+        self.writing.is_some()
     }
 
     /// How many segments there are now.
@@ -384,7 +563,7 @@ impl<F: Files> DiskLog<F> {
 
     fn load(&mut self) -> Result<(), LogError> {
         let mut names = Vec::new();
-        self.files.list(&mut names).map_err(LogError::Io)?;
+        self.files.get_mut().list(&mut names).map_err(LogError::Io)?;
         let mut seqs = Vec::new();
         let mut snaps = Vec::new();
         let mut temps = Vec::new();
@@ -435,11 +614,20 @@ impl<F: Files> DiskLog<F> {
             return Err(LogError::Corrupt("a snapshot and no log"));
         }
 
-        /* The snapshot the newest marker names, and no other */
+        /* The snapshot the newest marker names, and no other: every piece
+         * of it checked, and none kept -- they are read from the file as
+         * they are sent, and all of them once as the member starts */
         let base = found.marker;
         if let Some(m) = base {
-            let snap = self.read_snapshot(m.index, m.term)?;
-            self.mem.apply_snapshot(snap).map_err(|_| LogError::Corrupt("a snapshot at index 0"))?;
+            let (meta, snap) = match read_snapshot(self.files.get_mut(), m.index, m.term, false) {
+                Ok((meta, snap, _)) => (meta, snap),
+                Err(SnapFault::Io(e)) => return Err(self.fail(e)),
+                Err(SnapFault::Corrupt(what)) => return Err(LogError::Corrupt(what)),
+                Err(SnapFault::NoMemory) => return Err(LogError::NoMemory),
+            };
+            self.mem.apply_snapshot(Snapshot { meta, data: SnapshotData::default() })
+                .map_err(|_| LogError::Corrupt("a snapshot at index 0"))?;
+            self.snap = snap;
             self.marker_seq = m.seq;
         }
         self.reset_seq = found.reset.map_or(0, |m| m.seq);
@@ -674,65 +862,11 @@ impl<F: Files> DiskLog<F> {
         Ok(Some(p))
     }
 
-    /// The snapshot file at `index`, as its marker names it.
-    fn read_snapshot(&mut self, index: u64, term: u64) -> Result<Snapshot, LogError> {
-        let name = snap_name(index);
-        let len = match self.files.len(&name) {
-            Ok(len) => len,
-            Err(FileError::NotFound) => return Err(LogError::Corrupt("the snapshot the log names is not there")),
-            Err(e) => return Err(self.fail(e)),
-        };
-        let mut h = [0u8; SNAP_HEADER];
-        if !self.read_exact(&name, 0, &mut h, len)? || h[..8] != SNAP_MAGIC || le32(&h[8..12]) != SNAP_FORMAT {
-            return Err(LogError::Corrupt("a snapshot's header does not check"));
-        }
-        let (hindex, hterm, data_len) = (le64(&h[12..20]), le64(&h[20..28]), le64(&h[28..36]));
-        let conf_len = le32(&h[36..40]) as usize;
-        if hindex != index || hterm != term || data_len > MAX_SNAPSHOT_BYTES || conf_len > MAX_CONF_BYTES {
-            return Err(LogError::Corrupt("a snapshot that is not the one its marker names"));
-        }
-        let mut conf_bytes = vec![0u8; conf_len];
-        if !self.read_exact(&name, SNAP_HEADER as u64, &mut conf_bytes, len)?
-            || crc32c::update(crc32c::checksum(&h[..40]), &conf_bytes) != le32(&h[40..44])
-        {
-            return Err(LogError::Corrupt("a snapshot's header does not check"));
-        }
-        let conf = wire::decode_conf_state(&conf_bytes).map_err(|_| LogError::Corrupt("a snapshot's membership"))?;
-        let mut at = (SNAP_HEADER + conf_len) as u64;
-        let mut left = data_len;
-        let mut b = SnapshotBuilder::new();
-        while left > 0 {
-            let mut ph = [0u8; RECORD_HEADER];
-            if !self.read_exact(&name, at, &mut ph, len)? {
-                return Err(LogError::Corrupt("a snapshot cut short"));
-            }
-            let plen = le32(&ph[0..4]) as usize;
-            if plen == 0 || plen > PIECE_MAX || plen as u64 > left {
-                return Err(LogError::Corrupt("a snapshot's piece does not check"));
-            }
-            let mut piece = vec![0u8; plen];
-            if !self.read_exact(&name, at + RECORD_HEADER as u64, &mut piece, len)?
-                || piece_crc(&piece) != le32(&ph[4..8])
-            {
-                return Err(LogError::Corrupt("a snapshot's piece does not check"));
-            }
-            if !b.push(&piece) {
-                return Err(LogError::Corrupt("a snapshot past the largest there is"));
-            }
-            left -= plen as u64;
-            at += (RECORD_HEADER + plen) as u64;
-        }
-        if at != len {
-            return Err(LogError::Corrupt("bytes after a snapshot's end"));
-        }
-        Ok(Snapshot { meta: SnapshotMeta { index, term, conf }, data: b.finish() })
-    }
-
     /* ---- writing ---- */
 
     /// A call of the files: a failure stops the log.
     fn io<T>(&mut self, call: impl FnOnce(&mut F) -> Result<T, FileError>) -> Result<T, LogError> {
-        call(&mut self.files).map_err(|e| self.fail(e))
+        call(self.files.get_mut()).map_err(|e| self.fail(e))
     }
 
     fn fail(&mut self, e: FileError) -> LogError {
@@ -908,57 +1042,137 @@ impl<F: Files> DiskLog<F> {
         if snap.meta.index <= self.mem.snapshot_meta().index || snap.meta.index < self.mem.hard_state().commit {
             return Err(LogError::Refused(StorageError::SnapshotOutOfDate));
         }
-        let (index, term) = (snap.meta.index, snap.meta.term);
-        self.write_snapshot(&snap)?;
-        self.mark(MARK_INSTALLED, index, term)?;
+        /* A snapshot of the state machine's own being written is given up:
+         * the leader's is past anything it holds */
+        if let Some(w) = self.writing.take() {
+            self.remove_quietly(&tmp_name(w.meta.index))?;
+        }
+        let Snapshot { meta, data } = snap;
+        let mut w = self.begin_write(meta, data)?;
+        self.write_pieces(&mut w, usize::MAX)?;
+        self.seal(&w)?;
+        self.mark(MARK_INSTALLED, w.meta.index, w.meta.term)?;
         self.reset_seq = self.marker_seq;
-        self.mem.apply_snapshot(snap).map_err(LogError::Refused)?;
+        let Writing { meta, data, conf_len, .. } = w;
+        let index = meta.index;
+        self.mem.apply_snapshot(Snapshot { meta, data: SnapshotData::default() }).map_err(LogError::Refused)?;
+        self.snap = SnapFile { len: data.len(), conf_len };
         self.compact(index)
     }
 
     /// The state as of entry `index` -- `conf` its membership then, `data`
     /// the state machine's bytes -- made the newest snapshot, and the
-    /// entries up to it dropped. Durable when this returns.
+    /// entries up to it dropped. Durable when this returns: all of it
+    /// written in this one call, which `begin_snapshot` and
+    /// `continue_snapshot` take a few pieces at a time.
     pub fn create_snapshot(&mut self, index: u64, conf: ConfState, data: SnapshotData) -> Result<(), LogError> {
+        self.begin_snapshot(index, conf, data)?;
+        match self.continue_snapshot(usize::MAX)? {
+            true => Ok(()),
+            false => Err(LogError::Stopped),
+        }
+    }
+
+    /// `create_snapshot`'s first step: the snapshot's file begun, its
+    /// header and membership written; its pieces then a few a call
+    /// (`continue_snapshot`), the log taking entries, hard states and syncs
+    /// between them -- written whole in one call, a state of tens of MiB
+    /// kept the member from ticking for seconds, a leader losing its term
+    /// at every snapshot it took. One at a time; a leader's snapshot taken
+    /// in meanwhile gives it up.
+    pub fn begin_snapshot(&mut self, index: u64, conf: ConfState, data: SnapshotData) -> Result<(), LogError> {
         self.check()?;
-        if index <= self.mem.snapshot_meta().index {
+        if self.writing.is_some() || index <= self.mem.snapshot_meta().index {
             return Err(LogError::Refused(StorageError::SnapshotOutOfDate));
         }
         if index > self.mem.last_index() {
             return Err(LogError::Refused(StorageError::Unavailable));
         }
         let term = self.mem.term(index).map_err(LogError::Refused)?;
-        let snap = Snapshot { meta: SnapshotMeta { index, term, conf: conf.clone() }, data: data.clone() };
-        self.write_snapshot(&snap)?;
-        self.mark(MARK_TAKEN, index, term)?;
-        self.mem.create_snapshot(index, conf, data).map_err(LogError::Refused)?;
-        self.compact(index)
+        let w = self.begin_write(SnapshotMeta { index, term, conf }, data)?;
+        self.writing = Some(w);
+        Ok(())
     }
 
-    /// The snapshot's file, all of it on the medium under its own name
-    /// before anything names it.
-    fn write_snapshot(&mut self, snap: &Snapshot) -> Result<(), LogError> {
-        let (tmp, name) = (tmp_name(snap.meta.index), snap_name(snap.meta.index));
+    /// Up to `pieces` more pieces of the snapshot begun, written: true
+    /// once it is the newest, durably, and the log compacted by it -- or
+    /// where none is being written.
+    pub fn continue_snapshot(&mut self, pieces: usize) -> Result<bool, LogError> {
+        self.check()?;
+        let Some(mut w) = self.writing.take() else { return Ok(true) };
+        if !self.write_pieces(&mut w, pieces)? {
+            self.writing = Some(w);
+            return Ok(false);
+        }
+        self.seal(&w)?;
+        self.mark(MARK_TAKEN, w.meta.index, w.meta.term)?;
+        let Writing { meta, data, conf_len, .. } = w;
+        let index = meta.index;
+        self.mem.create_snapshot(index, meta.conf, SnapshotData::default()).map_err(LogError::Refused)?;
+        self.snap = SnapFile { len: data.len(), conf_len };
+        self.compact(index)?;
+        Ok(true)
+    }
+
+    /// `name` removed where it is there -- and no call to remove where it is
+    /// not: a failure but its absence stops the log.
+    fn remove_quietly(&mut self, name: &str) -> Result<(), LogError> {
+        match self.files.get_mut().len(name) {
+            Err(FileError::NotFound) => Ok(()),
+            Err(e) => Err(self.fail(e)),
+            Ok(_) => self.io(|f| f.remove(name)),
+        }
+    }
+
+    /// A snapshot's file begun under its temporary name: its header and
+    /// its membership -- and what its pieces are written through.
+    fn begin_write(&mut self, meta: SnapshotMeta, data: SnapshotData) -> Result<Writing, LogError> {
+        let tmp = tmp_name(meta.index);
+        /* One of this index left by a write given up goes first: what
+         * follows starts the file */
+        self.remove_quietly(&tmp)?;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(RECORD_HEADER + PIECE_MAX).map_err(|_| LogError::NoMemory)?;
         let mut conf = Vec::with_capacity(MAX_CONF_BYTES);
-        wire::encode_conf_state(&snap.meta.conf, &mut conf);
+        wire::encode_conf_state(&meta.conf, &mut conf);
         let mut head = Vec::with_capacity(SNAP_HEADER + conf.len());
         head.extend_from_slice(&SNAP_MAGIC);
         head.extend_from_slice(&SNAP_FORMAT.to_le_bytes());
-        head.extend_from_slice(&snap.meta.index.to_le_bytes());
-        head.extend_from_slice(&snap.meta.term.to_le_bytes());
-        head.extend_from_slice(&snap.data.len().to_le_bytes());
+        head.extend_from_slice(&meta.index.to_le_bytes());
+        head.extend_from_slice(&meta.term.to_le_bytes());
+        head.extend_from_slice(&data.len().to_le_bytes());
         head.extend_from_slice(&(conf.len() as u32).to_le_bytes());
         let crc = crc32c::update(crc32c::checksum(&head), &conf);
         head.extend_from_slice(&crc.to_le_bytes());
         head.extend_from_slice(&conf);
         self.io(|f| f.append(&tmp, &head))?;
-        for piece in snap.data.pieces() {
-            let mut h = [0u8; RECORD_HEADER];
-            h[..4].copy_from_slice(&(piece.len() as u32).to_le_bytes());
-            h[4..].copy_from_slice(&piece_crc(piece).to_le_bytes());
-            self.io(|f| f.append(&tmp, &h))?;
-            self.io(|f| f.append(&tmp, piece))?;
+        Ok(Writing { meta, data, next: 0, buf, conf_len: conf.len() })
+    }
+
+    /// Up to `pieces` of the pieces left written, each its header and
+    /// bytes in one append: whether all are.
+    fn write_pieces(&mut self, w: &mut Writing, pieces: usize) -> Result<bool, LogError> {
+        let tmp = tmp_name(w.meta.index);
+        let total = w.data.pieces().len();
+        let mut n = 0;
+        while w.next < total && n < pieces {
+            let piece = &w.data.pieces()[w.next];
+            w.buf.clear();
+            w.buf.extend_from_slice(&(piece.len() as u32).to_le_bytes());
+            w.buf.extend_from_slice(&piece_crc(piece).to_le_bytes());
+            w.buf.extend_from_slice(piece);
+            let buf = &w.buf;
+            self.io(|f| f.append(&tmp, buf))?;
+            w.next += 1;
+            n += 1;
         }
+        Ok(w.next == total)
+    }
+
+    /// The snapshot's file, all of it on the medium under its own name
+    /// before anything names it.
+    fn seal(&mut self, w: &Writing) -> Result<(), LogError> {
+        let (tmp, name) = (tmp_name(w.meta.index), snap_name(w.meta.index));
         self.io(|f| f.sync(&tmp))?;
         self.io(|f| f.rename(&tmp, &name))?;
         self.io(|f| f.sync_dir())
@@ -1034,7 +1248,31 @@ impl<F: Files> Storage for DiskLog<F> {
         self.mem.last_index()
     }
 
+    /// The newest snapshot, read from its file whole: what a member starts
+    /// from. Its bytes are kept nowhere else -- a leader sends them a piece
+    /// at a time, read as they go (`snapshot_piece`).
     fn snapshot(&self) -> Result<Snapshot, StorageError> {
-        self.mem.snapshot()
+        let meta = self.mem.snapshot_meta();
+        if meta.index == 0 {
+            return self.mem.snapshot();
+        }
+        let mut files = self.files.try_borrow_mut().map_err(|_| StorageError::Io)?;
+        match read_snapshot(&mut *files, meta.index, meta.term, true) {
+            Ok((meta, _, Some(data))) => Ok(Snapshot { meta, data }),
+            Ok((_, _, None)) => Err(StorageError::Corrupt),
+            Err(f) => Err(storage_fault(f)),
+        }
+    }
+
+    fn snapshot_head(&self) -> Result<(SnapshotMeta, u64), StorageError> {
+        Ok((self.mem.snapshot_meta().clone(), self.snap.len))
+    }
+
+    fn snapshot_piece(&self, index: u64, offset: u64, max: usize, out: &mut Vec<u8>) -> Result<(), StorageError> {
+        if index == 0 || index != self.mem.snapshot_meta().index {
+            return Err(StorageError::SnapshotOutOfDate);
+        }
+        let mut files = self.files.try_borrow_mut().map_err(|_| StorageError::Io)?;
+        read_piece(&mut *files, index, self.snap, offset, max, out).map_err(storage_fault)
     }
 }
