@@ -32,8 +32,14 @@
 //!   in and read back; one that does not read back as copied is a round,
 //!   and past `ROUNDS_MAX` rounds the join is given up, and said. A chunk
 //!   held to its source's is closed (`Store::close_copy`).
-//! - **Its end**: every chunk done, `State::Done`, and the driver asks the
-//!   joiner's mds to end the join.
+//! - **What the source has not**: every chunk done, what this cs still
+//!   holds of the set at an epoch before its join -- a chunk the source
+//!   listed none of, which reads as zeros on the set's members -- dropped
+//!   (`Store::drop_stale`). A member back kept a chunk a writer cut off with
+//!   it had written there alone, and, made active, read it back where the
+//!   others read zeros (found by the review of 2026-11).
+//! - **Its end**: then `State::Done`, and the driver asks the joiner's mds
+//!   to end the join.
 //!
 //! A refusal that says the set moved on, or that the join is not the
 //! joiner's, stops it until its view is refreshed (`refresh`). A source
@@ -46,7 +52,7 @@ use alloc::vec::Vec;
 
 use nbscs::{ChunkRef, Device, Epoch, SlotState, Store, GRANULE, SLOT};
 
-use crate::{JoinView, Op, Refusal, Reply, Request, DATA_MAX, LIST_MAX};
+use crate::{JoinView, Op, Refusal, Reply, Request, DATA_MAX, PAGE};
 
 /// A pull's bytes.
 const PULL: u32 = DATA_MAX;
@@ -100,6 +106,9 @@ pub struct Stats {
     pub bytes: u64,
     /// Granules pulled again for differing from the source's.
     pub again: u64,
+    /// Chunks this cs held of the set from before the join that the source
+    /// had not: dropped.
+    pub dropped: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +221,12 @@ impl Copy {
         self.sent.contains_key(&id)
     }
 
+    /// The host of the source asked now: whose answers alone are this
+    /// copy's.
+    pub fn source_host(&self) -> Option<&str> {
+        self.view.sources.get(self.source).map(|(_, h)| h.as_str())
+    }
+
     /// Whether the set's chunks have all been listed.
     pub fn listed(&self) -> bool {
         self.listed
@@ -273,7 +288,7 @@ impl Copy {
                                             version: self.view.version, index: self.view.index };
                     self.send(op, Ask::List, now, next_id, out);
                 }
-            } else if self.sent.is_empty() {
+            } else if self.sent.is_empty() && self.sweep(store, out).await {
                 self.state = State::Done;
             }
             return;
@@ -335,7 +350,7 @@ impl Copy {
                 self.progress_at = now;
                 self.page.extend(list.iter().copied());
                 match list.last() {
-                    Some(&(c, ..)) if list.len() >= LIST_MAX && c < u32::MAX => self.from = c + 1,
+                    Some(&(c, ..)) if list.len() >= PAGE && c < u32::MAX => self.from = c + 1,
                     _ => self.listed = true,
                 }
             }
@@ -423,6 +438,33 @@ impl Copy {
         }
         /* Held to the source's a sector at a time, and then closed */
         w.verify = differ;
+    }
+
+    /// What this cs holds of the set at an epoch before its join, dropped as
+    /// the copy ends: every chunk the copy took it moved on to the join's
+    /// epoch, and a client writes the joiner at that epoch or after, so what
+    /// is left before it the source listed none of. Whether it was done.
+    async fn sweep<D: Device>(&mut self, store: &Store<D>, out: &mut Vec<Out>) -> bool {
+        let (set, since) = (self.view.set, self.view.since);
+        let mut from = 0u32;
+        loop {
+            let page = store.stale_in(set, since, from, PAGE);
+            let Some(&last) = page.last() else { return true };
+            for &c in &page {
+                match store.drop_stale(c, set, since).await {
+                    Ok(true) => self.stats.dropped += 1,
+                    Ok(false) => {}
+                    Err(e) => {
+                        self.fail(alloc::format!("chunk {}, the source's none, not dropped: {:?}", c, e), out);
+                        return false;
+                    }
+                }
+            }
+            if page.len() < PAGE || last == u32::MAX {
+                return true;
+            }
+            from = last + 1;
+        }
     }
 
     /// The chunk copied and held to its source's: closed, and the next one.

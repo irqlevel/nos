@@ -29,7 +29,7 @@ pub use device::{Device, IoError};
 pub use exec::now;
 pub use format::{device_slots, holds, layout, Decoded, Epoch, Holds, Identity, Layout, Record, SlotState, Super,
                  FENCES_MAX};
-pub use store::{ChunkRef, DeviceInfo, Error, Holding, OpenError, Repairs, Store};
+pub use store::{ChunkRef, DeviceInfo, Error, Holding, OpenError, Repairs, Store, PAGE_OF_CHUNKS};
 
 /// A chunk's slot: 4 MiB, as the metadata's chunks are.
 pub const SLOT: u64 = (nbsmeta::CHUNK_MIB as u64) << 20;
@@ -45,6 +45,7 @@ pub const GRANULE: u32 = 64 << 10;
 /// A copy-up's piece (N10): a chunk read and written this much at a time,
 /// a buffer the kernel's heap gives at once.
 pub const COPY_PIECE: u64 = 256 << 10;
+
 
 /// The sums of a chunk of zeros, one a `GRANULE`, as `Store::sums` and
 /// `Store::scrub` give them: what a chunk a cs does not hold reads as -- a

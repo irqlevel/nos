@@ -472,8 +472,12 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
     }
 
     /// Whether everything the store held committed as the member started is
-    /// applied: the state is the one the member left, and may be answered
-    /// from.
+    /// applied: as far as its commit was durable when the member stopped --
+    /// which can be short of what it had applied by a batch, the commit
+    /// index written after the entries. What names no entry of the asker's
+    /// to be applied as far as is answered only once a read the leader
+    /// confirms is served (`read`), not on this alone (found by the review
+    /// of 2026-11: nbs-mds told its cs that chunks made since were gone).
     pub fn caught_up(&self) -> bool {
         self.applied >= self.start_commit
     }

@@ -26,7 +26,15 @@
     },
     "volumes": {
       "kind": "read",
-      "title": {"en": "Volumes", "ru": "Тома"}
+      "title": {"en": "Volumes", "ru": "Тома"},
+      "help": {
+        "en": "Up to 256 volumes by their numbers, from `from` on; `next` is where the rest begin.",
+        "ru": "До 256 томов по их номерам, начиная с `from`; `next` — откуда начинаются остальные."
+      },
+      "params": {
+        "from": {"type": "int", "title": {"en": "From number", "ru": "С номера"}},
+        "limit": {"type": "int", "title": {"en": "At most", "ru": "Не больше"}}
+      }
     },
     "volume": {
       "kind": "read",

@@ -10,6 +10,13 @@ edition = "2021"
 # will (N8), and fuzz/nbs's wire target reads it from noise.
 [lib]
 
+# The fuzzer's alone (fuzz/nbs): a list asked for at once -- a set's chunks
+# to its joiner, a volume's open chunks, the garbage pass's asks -- a few
+# entries a page (`PAGE`), so that a target whose cs's hold a few chunks
+# steps every list past its first page. Never in a kernel's build.
+[features]
+small_pages = []
+
 [dependencies]
 codec = { path = "../../codec" }
 nbscs = { path = "../nbscs" }
