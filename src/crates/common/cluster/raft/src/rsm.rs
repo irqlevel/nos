@@ -35,8 +35,10 @@
 //! **Snapshots** are begun once the entries applied since the last are as
 //! large as the state -- so that a byte of log costs at most a byte of
 //! snapshot -- with a floor. The state is frozen at the index applied then
-//! ([`StateMachine::freeze`]), written a few pieces a call while applying
-//! goes on, and handed to the store, which compacts the log.
+//! ([`StateMachine::freeze`]), gathered a few pieces a call while applying
+//! goes on -- no more than `Config::max_snapshot_bytes`, or it is given up
+//! and counted -- and handed to the store, which writes it a few pieces a
+//! call too and then compacts the log.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -81,6 +83,14 @@ pub trait LogStore: Storage {
     /// The state as of `index` made the newest snapshot, durably, and the
     /// log up to it compacted.
     fn create_snapshot(&mut self, index: u64, conf: ConfState, data: SnapshotData) -> Result<(), StoreError>;
+    /// `create_snapshot` begun, what it writes written a few pieces a call
+    /// by `continue_snapshot`, the member going on between them: a store
+    /// that writes all at once writes it here. One at a time; a leader's
+    /// snapshot applied meanwhile gives it up.
+    fn begin_snapshot(&mut self, index: u64, conf: ConfState, data: SnapshotData) -> Result<(), StoreError>;
+    /// Up to `pieces` more of the snapshot begun written: true once it is
+    /// the newest, durably, and the log compacted by it.
+    fn continue_snapshot(&mut self, pieces: usize) -> Result<bool, StoreError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +120,14 @@ impl LogStore for MemStorage {
     fn create_snapshot(&mut self, index: u64, conf: ConfState, data: SnapshotData) -> Result<(), StoreError> {
         MemStorage::create_snapshot(self, index, conf, data).map_err(StoreError::Storage)
     }
+
+    fn begin_snapshot(&mut self, index: u64, conf: ConfState, data: SnapshotData) -> Result<(), StoreError> {
+        MemStorage::create_snapshot(self, index, conf, data).map_err(StoreError::Storage)
+    }
+
+    fn continue_snapshot(&mut self, _pieces: usize) -> Result<bool, StoreError> {
+        Ok(true)
+    }
 }
 
 impl<F: Files> LogStore for DiskLog<F> {
@@ -131,6 +149,14 @@ impl<F: Files> LogStore for DiskLog<F> {
 
     fn create_snapshot(&mut self, index: u64, conf: ConfState, data: SnapshotData) -> Result<(), StoreError> {
         DiskLog::create_snapshot(self, index, conf, data).map_err(StoreError::Log)
+    }
+
+    fn begin_snapshot(&mut self, index: u64, conf: ConfState, data: SnapshotData) -> Result<(), StoreError> {
+        DiskLog::begin_snapshot(self, index, conf, data).map_err(StoreError::Log)
+    }
+
+    fn continue_snapshot(&mut self, pieces: usize) -> Result<bool, StoreError> {
+        DiskLog::continue_snapshot(self, pieces).map_err(StoreError::Log)
     }
 }
 
@@ -306,12 +332,12 @@ struct Session {
     answer: Option<Vec<u8>>,
 }
 
-/// A snapshot being taken.
-struct Taking<Z> {
-    index: u64,
-    conf: ConfState,
-    frozen: Z,
-    out: SnapshotBuilder,
+/// A snapshot being taken: frozen at `index` and its bytes gathered a few
+/// pieces a call -- then handed to the store, which writes them a few
+/// pieces a call too.
+enum Taking<Z> {
+    Gathering { index: u64, conf: ConfState, frozen: Z, out: SnapshotBuilder },
+    Writing,
 }
 
 /// A committed entry's payload, as this writes it.
@@ -782,51 +808,85 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
     }
 
     /// A snapshot begun when the log calls for one, its next pieces
-    /// written, and handed to the store once whole.
+    /// gathered -- then handed to the store, and its next pieces written:
+    /// a few a call, so that the member ticks, sends and answers between
+    /// them. Written whole in one call, a state of tens of MiB kept a leader
+    /// from its heartbeats for longer than an election timeout, at every
+    /// snapshot it took.
     fn snapshot_step(&mut self) -> Result<(), RsmError> {
         if self.taking.is_none() {
             let state = self.sm.size().saturating_add(self.sessions.len() as u64 * 32);
-            let at = self.node.storage().snapshot().map(|s| s.meta.index).unwrap_or(0);
+            /* The snapshot's place alone: a store on a disk reads none of
+             * its bytes for it */
+            let at = self.node.storage().snapshot_head().map(|(m, _)| m.index).unwrap_or(0);
             if self.log_bytes < state.max(self.floor) || self.applied <= at {
                 return Ok(());
             }
             let index = self.applied;
             let Some(conf) = self.node.conf_state_at(index) else { return Ok(()) };
-            let mut out = SnapshotBuilder::new();
+            /* No larger than the member may hold: a snapshot is held whole
+             * while it is taken -- and while a follower takes it in */
+            let mut out = SnapshotBuilder::with_limit(self.node.config().max_snapshot_bytes);
             self.log_bytes = 0;
             if !self.write_sessions(&mut out) {
-                /* Past the largest snapshot there is: given up, and said */
+                /* Past what it may hold: given up, and said */
                 self.stats.snapshots_given_up += 1;
                 return Ok(());
             }
-            self.taking = Some(Taking { index, conf, frozen: self.sm.freeze(), out });
+            self.taking = Some(Taking::Gathering { index, conf, frozen: self.sm.freeze(), out });
         }
-        let Some(t) = self.taking.as_mut() else { return Ok(()) };
+        if matches!(self.taking, Some(Taking::Writing)) {
+            return match self.node.storage_mut().continue_snapshot(PIECES_A_CALL) {
+                Ok(true) => {
+                    self.taking = None;
+                    self.stats.snapshots += 1;
+                    Ok(())
+                }
+                Ok(false) => Ok(()),
+                Err(e) => Err(self.stop(RsmError::Store(e))),
+            };
+        }
+        let Some(Taking::Gathering { frozen, out, .. }) = self.taking.as_mut() else { return Ok(()) };
+        let mut gathered = false;
+        let mut given_up = false;
         for _ in 0..PIECES_A_CALL {
             let mut piece = Vec::new();
-            t.frozen.write(PIECE_MAX, &mut piece);
-            if piece.is_empty() {
-                let Some(t) = self.taking.take() else { return Ok(()) };
-                return match self.node.storage_mut().create_snapshot(t.index, t.conf, t.out.finish()) {
-                    Ok(()) => {
-                        self.stats.snapshots += 1;
-                        Ok(())
-                    }
-                    /* A leader's snapshot came past it meanwhile */
-                    Err(StoreError::Storage(StorageError::SnapshotOutOfDate))
-                    | Err(StoreError::Log(LogError::Refused(StorageError::SnapshotOutOfDate))) => Ok(()),
-                    Err(e) => Err(self.stop(RsmError::Store(e))),
-                };
+            if piece.try_reserve_exact(PIECE_MAX).is_err() {
+                given_up = true;
+                break;
             }
-            if !t.out.push(&piece) {
-                /* Past the largest snapshot there is: given up, and said --
-                 * the log is not compacted by it, and grows */
-                self.taking = None;
-                self.stats.snapshots_given_up += 1;
-                return Ok(());
+            frozen.write(PIECE_MAX, &mut piece);
+            if piece.is_empty() {
+                gathered = true;
+                break;
+            }
+            if out.try_push(&piece).is_err() {
+                /* Past what the member may hold, or no memory for it:
+                 * given up, and said -- the log is not compacted by it,
+                 * and grows */
+                given_up = true;
+                break;
             }
         }
-        Ok(())
+        if given_up {
+            self.taking = None;
+            self.stats.snapshots_given_up += 1;
+            return Ok(());
+        }
+        if !gathered {
+            return Ok(());
+        }
+        let Some(Taking::Gathering { index, conf, out, .. }) = self.taking.take() else { return Ok(()) };
+        match self.node.storage_mut().begin_snapshot(index, conf, out.finish()) {
+            Ok(()) => {
+                self.taking = Some(Taking::Writing);
+                Ok(())
+            }
+            /* A leader's snapshot came past it meanwhile */
+            Err(StoreError::Storage(StorageError::SnapshotOutOfDate))
+            | Err(StoreError::Log(LogError::Refused(StorageError::SnapshotOutOfDate))) => Ok(()),
+            Err(e) => Err(self.stop(RsmError::Store(e))),
+        }
     }
 
     /// The sessions and the state machine made what a snapshot says.

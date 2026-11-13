@@ -28,11 +28,11 @@ use core::mem;
 
 use crate::conf::{self, ChangeError, Changes, Membership};
 use crate::progress::{Decr, Progress, State};
-use crate::raft_log::RaftLog;
+use crate::raft_log::{Piece, RaftLog};
 use crate::rand::Rng;
 use crate::storage::{Storage, StorageError};
 use crate::types::{
-    Body, ChangeKind, ConfChange, ConfState, Entry, EntryKind, HardState, Message, NodeId, Snapshot,
+    Body, ChangeKind, ConfChange, ConfState, Entry, EntryKind, HardState, Message, NodeId, PushError, Snapshot,
     SnapshotBuilder, SnapshotMeta, MAX_SNAPSHOT_BYTES, NONE, PIECE_MAX,
 };
 use crate::wire;
@@ -102,7 +102,12 @@ pub struct Config {
     pub max_apply_bytes: u64,
     /// The bytes of a snapshot one message carries.
     pub snapshot_piece_bytes: usize,
-    /// The largest snapshot a follower takes in.
+    /// The largest snapshot this member holds -- one a leader sends it,
+    /// or one of its own state `Rsm` takes -- each held in memory whole
+    /// while it is taken in or taken, in pieces of one size class of the
+    /// heap: a kernel's caller sets it from what its heap gives that class
+    /// (raftmember does), so that one larger is refused and said, not a
+    /// panic of the machine.
     pub max_snapshot_bytes: u64,
     /// The election timeouts' randomness.
     pub seed: u64,
@@ -315,6 +320,12 @@ pub struct Stats {
     /// entries they acknowledged -- a disk cut where it went bad, or put
     /// back from an older copy. Each is sent what it lacks again.
     pub regressed: u64,
+    /// Snapshots this member, a follower, would not take in: larger than
+    /// `max_snapshot_bytes`, or no memory for a piece.
+    pub snapshots_refused: u64,
+    /// Snapshots this member, a leader, sent and had refused: the
+    /// follower is behind for good until it can take one in.
+    pub snapshots_rejected: u64,
 }
 
 /// What `ready` handed out, for `advance` to mark done.
@@ -1340,6 +1351,9 @@ impl<S: Storage> RawNode<S> {
         }
         if !same {
             if total > self.cfg.max_snapshot_bytes {
+                /* More than this member may hold: refused, and counted --
+                 * it stays behind until it can take one in */
+                self.stats.snapshots_refused += 1;
                 self.send(from, Body::SnapshotResp { index, next: 0, reject: true });
                 return;
             }
@@ -1347,7 +1361,8 @@ impl<S: Storage> RawNode<S> {
                 self.send(from, Body::SnapshotResp { index, next: 0, reject: false });
                 return;
             }
-            self.incoming = Some(Incoming { meta, total, built: SnapshotBuilder::new(), idle: 0 });
+            let built = SnapshotBuilder::with_limit(self.cfg.max_snapshot_bytes);
+            self.incoming = Some(Incoming { meta, total, built, idle: 0 });
         }
         let Some(inc) = self.incoming.as_mut() else { return };
         if offset != inc.built.len() {
@@ -1355,12 +1370,23 @@ impl<S: Storage> RawNode<S> {
             self.send(from, Body::SnapshotResp { index, next, reject: false });
             return;
         }
-        if !inc.built.push(&data) {
-            /* Past any snapshot there is: `total`, checked against the
-             * configuration's limit, says it cannot be. */
-            self.stats.invalid += 1;
-            self.incoming = None;
-            return;
+        match inc.built.try_push(&data) {
+            Ok(()) => {}
+            Err(PushError::TooLarge) => {
+                /* Past any snapshot there is: `total`, checked against the
+                 * configuration's limit, says it cannot be. */
+                self.stats.invalid += 1;
+                self.incoming = None;
+                return;
+            }
+            Err(PushError::NoMemory) => {
+                /* No room in the heap for its next piece: refused, and
+                 * counted, rather than a panic of the machine's */
+                self.stats.snapshots_refused += 1;
+                self.incoming = None;
+                self.send(from, Body::SnapshotResp { index, next: 0, reject: true });
+                return;
+            }
         }
         if inc.built.len() < total {
             let next = inc.built.len();
@@ -1437,22 +1463,33 @@ impl<S: Storage> RawNode<S> {
     }
 
     fn start_snapshot(&mut self, to: NodeId) -> bool {
-        let Some(snapshot) = self.log.snapshot() else { return false };
-        if snapshot.meta.index == 0 {
+        let Some((meta, total)) = self.log.snapshot_head() else { return false };
+        if meta.index == 0 {
             return false;
         }
         let Some(pr) = self.progress.get_mut(&to) else { return false };
-        pr.become_snapshot(snapshot);
+        pr.become_snapshot(meta, total);
         self.send_snapshot_piece(to);
         true
     }
 
+    /// The piece of the snapshot on its way to `to` that its member has
+    /// asked for, read from the storage as it goes: the leader holds none
+    /// of a snapshot's bytes while it sends it. One newer taken meanwhile
+    /// is sent from its start, as the next probe finds it.
     fn send_snapshot_piece(&mut self, to: NodeId) {
         let Some(sending) = self.progress.get(&to).and_then(|p| p.sending.as_ref()) else { return };
-        let snap = &sending.snapshot;
-        let data = snap.data.read(sending.acked, self.cfg.snapshot_piece_bytes).to_vec();
-        let body = Body::Snapshot { meta: snap.meta.clone(), offset: sending.acked, total: snap.data.len(), data };
-        self.send(to, body);
+        let (meta, offset, total) = (sending.meta.clone(), sending.acked, sending.total);
+        let mut data = Vec::new();
+        match self.log.snapshot_piece(meta.index, offset, self.cfg.snapshot_piece_bytes, &mut data) {
+            Piece::Read => self.send(to, Body::Snapshot { meta, offset, total, data }),
+            Piece::Stale => {
+                if let Some(pr) = self.progress.get_mut(&to) {
+                    pr.become_probe();
+                }
+            }
+            Piece::NotNow => {}
+        }
     }
 
     fn peers(&self) -> Vec<NodeId> {
@@ -1526,7 +1563,7 @@ impl<S: Storage> RawNode<S> {
         match pr.state {
             State::Probe => pr.become_replicate(),
             State::Snapshot => {
-                let done = pr.sending.as_ref().is_none_or(|s| pr.matched >= s.snapshot.meta.index);
+                let done = pr.sending.as_ref().is_none_or(|s| pr.matched >= s.meta.index);
                 if done {
                     pr.become_probe();
                 }
@@ -1574,11 +1611,15 @@ impl<S: Storage> RawNode<S> {
             return;
         }
         let Some(sending) = pr.sending.as_mut() else { return };
-        if sending.snapshot.meta.index != index || next > sending.snapshot.data.len() {
+        if sending.meta.index != index || next > sending.total {
             return;
         }
         if reject {
+            /* It will not take this one: too large for it, or no memory to
+             * take it in -- counted, as nothing else would say so; probed
+             * again, and sent it again, at the next heartbeat's answer */
             pr.become_probe();
+            self.stats.snapshots_rejected += 1;
             return;
         }
         if next == sending.acked {
@@ -1591,7 +1632,7 @@ impl<S: Storage> RawNode<S> {
          * and starts over */
         sending.acked = next;
         sending.moved = true;
-        if next < sending.snapshot.data.len() {
+        if next < sending.total {
             self.send_snapshot_piece(from);
         }
     }

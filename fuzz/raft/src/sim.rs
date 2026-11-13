@@ -127,6 +127,8 @@ pub struct Params {
     pub max_inflight_msgs: usize,
     pub snapshot_piece_bytes: usize,
     pub max_uncommitted_entries: u64,
+    /// The largest snapshot a member takes in.
+    pub max_snapshot_bytes: u64,
     /// In a hundred messages delivered at random, lost and doubled.
     pub drop_pct: u64,
     pub dup_pct: u64,
@@ -148,6 +150,7 @@ impl Params {
             max_inflight_msgs: 16,
             snapshot_piece_bytes: 256,
             max_uncommitted_entries: 256,
+            max_snapshot_bytes: raft::MAX_SNAPSHOT_BYTES,
             drop_pct: 0,
             dup_pct: 0,
             read_fail_one_in: 0,
@@ -167,6 +170,7 @@ impl Params {
             snapshot_piece_bytes: rng.range(16, 600) as usize,
             /* Small at times: a follower then takes appends in part. */
             max_uncommitted_entries: if rng.chance(30) { rng.range(max_entries_per_msg as u64, 24) } else { 256 },
+            max_snapshot_bytes: raft::MAX_SNAPSHOT_BYTES,
             drop_pct: rng.below(20),
             dup_pct: rng.below(10),
             read_fail_one_in: if rng.chance(20) { rng.range(30, 3000) } else { 0 },
@@ -342,6 +346,7 @@ impl Sim {
         c.max_inflight_msgs = self.p.max_inflight_msgs;
         c.snapshot_piece_bytes = self.p.snapshot_piece_bytes;
         c.max_uncommitted_entries = self.p.max_uncommitted_entries;
+        c.max_snapshot_bytes = self.p.max_snapshot_bytes;
         c.seed = mix(self.seed, id);
         c
     }
