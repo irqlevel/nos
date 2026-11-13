@@ -20,11 +20,11 @@ use std::rc::Rc;
 
 use raft::types::Body;
 use raft::{
-    Config, DiskLog, Error, Event, Frozen, LogConfig, MemStorage, Message, NodeId, RestoreError, Rsm, RsmError,
-    SnapshotReader, StateMachine,
+    Config, DiskLog, Entry, EntryKind, Error, Event, Frozen, HardState, LogConfig, MemStorage, Message, NodeId,
+    RestoreError, Rsm, RsmError, SnapshotReader, StateMachine, Storage,
 };
 
-use crate::logfuzz::{Disk, SimFiles};
+use crate::logfuzz::{Disk, Fate, SimFiles};
 use crate::rng::{mix, Rng};
 
 /* ---- the register ---- */
@@ -55,6 +55,9 @@ fn byte_at(value: u64, k: usize) -> u8 {
 #[derive(Clone, Debug, Default)]
 pub struct Reg {
     pub value: u64,
+    /// A register that cannot read any snapshot: one of another version's,
+    /// say.
+    pub refuses: bool,
 }
 
 pub struct FrozenReg {
@@ -110,6 +113,9 @@ impl StateMachine for Reg {
     }
 
     fn restore(&mut self, r: &mut SnapshotReader<'_>) -> Result<(), RestoreError> {
+        if self.refuses {
+            return Err(RestoreError("a register that reads no snapshot"));
+        }
         if r.remaining() != (8 + BALLAST) as u64 {
             return Err(RestoreError("a register's snapshot of another length"));
         }
@@ -760,6 +766,12 @@ pub const SCENARIOS: &[(&str, fn() -> Result<(), String>)] = &[
     ("rsm_read_waits", read_waits),
     ("rsm_linearizable_check", linearizable_check),
     ("rsm_read_after_restart", read_after_restart),
+    ("rsm_read_lost_fails", read_lost_fails),
+    ("rsm_snapshot_refused_keeps_store", snapshot_refused_keeps_store),
+    ("rsm_seq_zero", seq_zero),
+    ("rsm_caught_up", caught_up),
+    ("rsm_sync_when_needed", sync_when_needed),
+    ("rsm_vote_durable", vote_durable),
 ];
 
 type Lone = Rsm<MemStorage, Reg>;
@@ -982,12 +994,20 @@ fn read_after_restart() -> Result<(), String> {
         ms.push(Rsm::new(config(id, 1), MemStorage::bootstrap(&voters, &[]), Reg::default(), 7)
             .map_err(|e| format!("{:?}", e))?);
     }
-    /* Rounds of work and delivery; what `held` says is kept back */
+    /* Rounds of work and delivery, a tick each; what `held` says is kept
+     * back */
     fn run(ms: &mut [Rsm<MemStorage, Reg>], kept: &mut Vec<Message>, held: &dyn Fn(&Message) -> bool)
         -> Result<Vec<(usize, Event)>, String>
     {
+        run_for(ms, kept, held, 50)
+    }
+    /* `run`, for `rounds` -- fewer than a read's answer may be kept back
+     * before the read is failed back for its age */
+    fn run_for(ms: &mut [Rsm<MemStorage, Reg>], kept: &mut Vec<Message>, held: &dyn Fn(&Message) -> bool,
+               rounds: usize) -> Result<Vec<(usize, Event)>, String>
+    {
         let mut events = Vec::new();
-        for _ in 0..50 {
+        for _ in 0..rounds {
             let mut wire = Vec::new();
             for (i, m) in ms.iter_mut().enumerate() {
                 m.tick();
@@ -1042,7 +1062,7 @@ fn read_after_restart() -> Result<(), String> {
     for msg in stale {
         let _ = ms[2].step(msg);
     }
-    let early = run(&mut ms, &mut kept, &both)?;
+    let early = run_for(&mut ms, &mut kept, &both, 15)?;
     if let Some((_, e)) = early.iter().find(|(i, e)| *i == 2 && matches!(e, Event::Read { request: 51, .. })) {
         return Err(format!("a read after a restart answered by an answer to one before it: {:?}", e));
     }
@@ -1054,4 +1074,279 @@ fn read_after_restart() -> Result<(), String> {
         Some((_, Event::Read { answer, .. })) if answer == &2u64.to_le_bytes() => Ok(()),
         other => Err(format!("the read after the restart: {:?}", other)),
     }
+}
+
+/* ---- the review of 2026-11: the replicated state machine's findings ---- */
+
+/// Rounds of every member's work and of delivery -- a tick each where
+/// `tick`, and what `dropped` says lost: every member's events, by member.
+fn rounds(ms: &mut [Rsm<MemStorage, Reg>], n: usize, tick: bool, dropped: &dyn Fn(&Message) -> bool)
+    -> Result<Vec<(usize, Event)>, String>
+{
+    let mut events = Vec::new();
+    for _ in 0..n {
+        let mut wire = Vec::new();
+        for (i, m) in ms.iter_mut().enumerate() {
+            if tick {
+                m.tick();
+            }
+            let out = m.process().map_err(|e| format!("member {}: {:?}", i + 1, e))?;
+            wire.extend(out.messages);
+            events.extend(out.events.into_iter().map(|e| (i, e)));
+        }
+        for msg in wire {
+            if !dropped(&msg) {
+                let _ = ms[(msg.to - 1) as usize].step(msg);
+            }
+        }
+    }
+    Ok(events)
+}
+
+/// Three members over memory, their registers `regs`, member 1 leading.
+fn three_of(floor: u64, regs: [Reg; 3]) -> Result<Vec<Rsm<MemStorage, Reg>>, String> {
+    let voters = [1, 2, 3];
+    let mut ms = Vec::new();
+    for (k, reg) in regs.into_iter().enumerate() {
+        let id = voters[k];
+        let mut m = Rsm::new(config(id, 1), MemStorage::bootstrap(&voters, &[]), reg, 1000 * id)
+            .map_err(|e| format!("{:?}", e))?;
+        m.set_snapshot_floor(floor);
+        ms.push(m);
+    }
+    ms[0].campaign().map_err(|e| format!("{:?}", e))?;
+    rounds(&mut ms, 30, false, &|_| false)?;
+    if ms[0].role() != raft::Role::Leader {
+        return Err("member 1 does not lead".into());
+    }
+    Ok(ms)
+}
+
+fn three(floor: u64) -> Result<Vec<Rsm<MemStorage, Reg>>, String> {
+    three_of(floor, [Reg::default(), Reg::default(), Reg::default()])
+}
+
+/// A follower's read whose request never reaches the leader -- neither it
+/// nor its answer is sent again -- is failed back once past twice the
+/// longest election timeout, and its room taken back. (It waited for good,
+/// and 4096 of them left the member taking no read at all.)
+fn read_lost_fails() -> Result<(), String> {
+    let mut ms = three(1 << 30)?;
+    let election = ms[2].node().config().election_ticks as usize;
+    ms[2].read(77, Vec::new()).map_err(|e| format!("{:?}", e))?;
+    let lost = |m: &Message| matches!(m.body, Body::ReadIndex { .. });
+    let events = rounds(&mut ms, 4 * election + 4, true, &lost)?;
+    if !events.iter().any(|(i, e)| *i == 2 && matches!(e, Event::ReadFailed { request: 77 })) {
+        return Err("a read whose request was lost neither served nor failed back".into());
+    }
+    if ms[2].stats().reads_aged != 1 {
+        return Err(format!("{} reads aged", ms[2].stats().reads_aged));
+    }
+    ms[2].read(78, Vec::new()).map_err(|e| format!("{:?}", e))?;
+    let events = rounds(&mut ms, 10, true, &|_| false)?;
+    if !events.iter().any(|(i, e)| *i == 2 && matches!(e, Event::Read { request: 78, .. })) {
+        return Err("a read asked after one failed back for its age not served".into());
+    }
+    Ok(())
+}
+
+/// A follower sent a snapshot its state machine cannot read stops over the
+/// store it had: started again over that store, with a state machine that
+/// reads it, it comes back. (The snapshot was made the whole of its log
+/// first, the log and snapshot before it removed: no start could read it
+/// either.)
+fn snapshot_refused_keeps_store() -> Result<(), String> {
+    let refusing = Reg { refuses: true, ..Reg::default() };
+    let mut ms = three_of(256, [Reg::default(), Reg::default(), refusing])?;
+    ms[0].register(1).map_err(|e| format!("{:?}", e))?;
+    let client = rounds(&mut ms, 10, false, &|_| false)?
+        .into_iter()
+        .find_map(|(i, e)| match e {
+            Event::Registered { client, origin: 1, .. } if i == 0 => Some(client),
+            _ => None,
+        })
+        .ok_or("no session")?;
+    /* Member 3 cut off while member 1 applies past a snapshot of its own */
+    let to3 = |m: &Message| m.to == 3 || m.from == 3;
+    let mut seq = 1;
+    while ms[0].node().storage().snapshot_meta().index == 0 {
+        ms[0].submit(client, seq, &Op::Add(1).command()).map_err(|e| format!("{:?}", e))?;
+        seq += 1;
+        rounds(&mut ms, 3, false, &to3)?;
+        if seq > 500 {
+            return Err("no snapshot taken".into());
+        }
+    }
+    let (snap_before, last_before) = (ms[2].node().storage().snapshot_meta().index, ms[2].node().storage().last_index());
+    /* Healed: member 3 is sent the snapshot, which it cannot read */
+    let mut stopped = None;
+    for _ in 0..300 {
+        let mut wire = Vec::new();
+        for (i, m) in ms.iter_mut().enumerate() {
+            m.tick();
+            match m.process() {
+                Ok(out) => wire.extend(out.messages),
+                Err(e) if i == 2 => stopped = Some(e),
+                Err(e) => return Err(format!("member {}: {:?}", i + 1, e)),
+            }
+        }
+        for msg in wire {
+            let _ = ms[(msg.to - 1) as usize].step(msg);
+        }
+        if stopped.is_some() {
+            break;
+        }
+    }
+    match stopped {
+        Some(RsmError::Restore(_)) => {}
+        other => return Err(format!("member 3, sent a snapshot it cannot read: {:?}", other)),
+    }
+    let store = ms.remove(2).into_store();
+    if store.snapshot_meta().index != snap_before || store.last_index() != last_before {
+        return Err(format!("member 3 stopped on a snapshot it could not read, its store changed: snapshot {} -> {}, \
+                            last {} -> {}", snap_before, store.snapshot_meta().index, last_before, store.last_index()));
+    }
+    ms.push(Rsm::new(config(3, 1), store, Reg::default(), 3003).map_err(|e| format!("{:?}", e))?);
+    rounds(&mut ms, 100, true, &|_| false)?;
+    if ms[2].state().value != ms[0].state().value {
+        return Err(format!("member 3 started again: {} where the leader has {}", ms[2].state().value,
+                           ms[0].state().value));
+    }
+    Ok(())
+}
+
+/// A command numbered 0 is refused as it is submitted, and one in a log
+/// anyway -- another version's -- is answered stale and not applied. (It
+/// was answered `Lost`: "applied, once, its answer lost", and never was.)
+fn seq_zero() -> Result<(), String> {
+    let (mut m, client) = lone(1 << 30)?;
+    match m.submit(client, 0, &Op::Add(5).command()) {
+        Err(RsmError::BadSeq) => {}
+        other => return Err(format!("a command numbered 0 submitted: {:?}", other)),
+    }
+    /* In a log anyway: a session at entry 2 (rsm's register envelope),
+     * its command numbered 0 at entry 3 (its command envelope) */
+    let mut store = MemStorage::bootstrap(&[1], &[]);
+    let mut register = vec![1u8];
+    register.extend_from_slice(&1u64.to_le_bytes());
+    register.extend_from_slice(&9u64.to_le_bytes());
+    let mut command = vec![2u8];
+    command.extend_from_slice(&2u64.to_le_bytes());
+    command.extend_from_slice(&0u64.to_le_bytes());
+    command.extend_from_slice(&Op::Add(5).command());
+    store
+        .append(&[
+            Entry { term: 1, index: 2, kind: EntryKind::Normal, data: register },
+            Entry { term: 1, index: 3, kind: EntryKind::Normal, data: command },
+        ])
+        .map_err(|e| format!("{:?}", e))?;
+    store.set_hard_state(HardState { term: 1, vote: 0, commit: 3 });
+    let mut m = Rsm::new(config(1, 1), store, Reg::default(), 1).map_err(|e| format!("{:?}", e))?;
+    let events = drain(&mut m)?;
+    let stale = events.iter().any(|e| matches!(e, Event::Stale { client: 2, seq: 0 }));
+    if m.state().value != 0 || !stale || events.iter().any(|e| matches!(e, Event::Lost { .. })) {
+        return Err(format!("a command numbered 0 in the log: the register {}, {:?}", m.state().value, events));
+    }
+    Ok(())
+}
+
+/// A member started over a log whose committed tail is more than one
+/// `process` applies is not caught up until all of it is applied.
+/// (raftmember took messages after 16 batches, answering from a state as
+/// it was seconds before.)
+fn caught_up() -> Result<(), String> {
+    let (mut m, client) = lone(1 << 40)?;
+    for seq in 1..=5000 {
+        m.submit(client, seq, &Op::Add(1).command()).map_err(|e| format!("{:?}", e))?;
+        if seq % 1000 == 0 {
+            drain(&mut m)?;
+        }
+    }
+    drain(&mut m)?;
+    let value = m.state().value;
+    let mut again = Rsm::new(config(1, 1), m.into_store(), Reg::default(), 2).map_err(|e| format!("{:?}", e))?;
+    if again.caught_up() {
+        return Err("caught up before anything was applied".into());
+    }
+    again.process().map_err(|e| format!("{:?}", e))?;
+    if again.caught_up() {
+        return Err(format!("caught up after one process, applied to {}", again.applied()));
+    }
+    drain(&mut again)?;
+    if !again.caught_up() || again.state().value != value {
+        return Err(format!("started again: caught up {}, the register {} where it was {}", again.caught_up(),
+                           again.state().value, value));
+    }
+    Ok(())
+}
+
+/// A `Ready` is synced only where something in it must be durable before
+/// what it sends goes -- entries, a term, a vote: a group idle syncs
+/// nothing at its heartbeats, and an entry is synced on every member that
+/// takes it. (Every `Ready` was: a flush of the device each, ten a second a
+/// member.)
+fn sync_when_needed() -> Result<(), String> {
+    let mut ms = three(1 << 30)?;
+    rounds(&mut ms, 10, true, &|_| false)?;
+    let before: Vec<raft::RsmStats> = ms.iter().map(|m| m.stats()).collect();
+    rounds(&mut ms, 30, true, &|_| false)?;
+    for (i, m) in ms.iter().enumerate() {
+        let (b, a) = (before[i], m.stats());
+        if a.syncs != b.syncs || a.syncs_skipped <= b.syncs_skipped {
+            return Err(format!("member {} idle for 30 ticks: {} syncs, {} skipped", i + 1, a.syncs - b.syncs,
+                               a.syncs_skipped - b.syncs_skipped));
+        }
+    }
+    ms[0].register(5).map_err(|e| format!("{:?}", e))?;
+    rounds(&mut ms, 10, false, &|_| false)?;
+    for (i, m) in ms.iter().enumerate() {
+        if m.stats().syncs <= before[i].syncs {
+            return Err(format!("member {} took an entry with no sync", i + 1));
+        }
+    }
+    Ok(())
+}
+
+/// A vote is on the disk before it is answered, now that a `Ready` is
+/// synced only where it must be: a member over the log on disk that gave
+/// its vote, its power then cut and every write not synced lost, has the
+/// vote when it starts again.
+fn vote_durable() -> Result<(), String> {
+    let voters = [1, 2, 3];
+    let disk = SimFiles(Rc::new(RefCell::new(Disk::new(5))));
+    let log = DiskLog::bootstrap(disk.clone(), LogConfig::default(), &voters, &[]).map_err(|e| format!("{:?}", e))?;
+    let mut two = Rsm::new(config(2, 1), log, Reg::default(), 2).map_err(|e| format!("{:?}", e))?;
+    let mut one =
+        Rsm::new(config(1, 1), MemStorage::bootstrap(&voters, &[]), Reg::default(), 1).map_err(|e| format!("{:?}", e))?;
+    one.campaign().map_err(|e| format!("{:?}", e))?;
+    let mut voted = false;
+    for _ in 0..10 {
+        for m in one.process().map_err(|e| format!("{:?}", e))?.messages {
+            if m.to == 2 {
+                two.step(m).map_err(|e| format!("{:?}", e))?;
+            }
+        }
+        for m in two.process().map_err(|e| format!("{:?}", e))?.messages {
+            voted |= m.to == 1 && matches!(m.body, Body::VoteResp { pre: false, granted: true });
+            if m.to == 1 {
+                one.step(m).map_err(|e| format!("{:?}", e))?;
+            }
+        }
+        if voted {
+            break;
+        }
+    }
+    if !voted {
+        return Err("member 2 never voted".into());
+    }
+    let term = one.node().term();
+    drop(two);
+    disk.0.borrow_mut().crash_with(0, &mut |_, _| Fate::Lost, &mut Rng::new(1));
+    let log = DiskLog::open(disk, LogConfig::default()).map_err(|e| format!("{:?}", e))?;
+    let again = Rsm::new(config(2, 1), log, Reg::default(), 3).map_err(|e| format!("{:?}", e))?;
+    if again.node().vote() != 1 || again.node().term() != term {
+        return Err(format!("member 2 voted for 1 in term {}, and after a cut has a vote for {} in term {}", term,
+                           again.node().vote(), again.node().term()));
+    }
+    Ok(())
 }
