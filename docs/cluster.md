@@ -194,15 +194,31 @@ asks, and the typed name is the admin's word that they are gone.
 ## How a member runs
 
 - **One task**, `cluster/raft`: raft's `Rsm` over the log in `raft/`, a tick
-  every 100 ms, the log's committed entries applied as it starts, before
-  any message is taken -- so that nothing is answered from the snapshot's
-  state alone (nbs-test: an mds just started told its cs the devices of
-  its snapshot, one added since missing, and the cs served on them) --
-  its mailbox `cluster.raft` -- a `Cluster` name -- and its
-  messages to `cluster.raft@<host>`, those over 4 KiB on ipcnet's bulk
-  connection. A message is taken only from the host whose node it says it
-  is from: which host sent it is ipcnet's word (`kcore::ipc::peer_name`),
-  looked up in the registry.
+  every 100 ms -- ticks missed while the task was held up dropped and the
+  stall said, not given at once to run a follower's election out -- the
+  log's committed entries applied as the member is made, every batch of
+  them (`raftmember::catch_up`), before it is shown or takes a message --
+  so that nothing is answered from the snapshot's state and a part of the
+  log after it (nbs-test: an mds just started told its cs the devices of
+  its snapshot, one added since missing, and the cs served on them; then
+  only the first sixteen batches were applied) -- its mailbox
+  `cluster.raft` -- a `Cluster` name -- and its messages to
+  `cluster.raft@<host>`: appends and a snapshot's pieces on ipcnet's bulk
+  connection whatever their size, so that they keep their order (a small
+  append that overtook a large one was refused, and the window sent again),
+  the rest there when over 4 KiB. A message is taken only from the host
+  whose node it says it is from: which host sent it is ipcnet's word
+  (`kcore::ipc::peer_name`), looked up in the registry -- or, for a host
+  the registry applied here does not have yet and has not removed, in the
+  hosts this host's join was answered with: a member restored from a
+  snapshot older than the joining of the host that leads takes its
+  messages, and ipcnet is told those hosts too, held to the member's
+  mailbox. A host it knows of neither way it refuses, and says so. What
+  raft counts of a group gone wrong -- messages dropped for room, a
+  snapshot refused, a follower that lost entries it held -- is said in the
+  log as it moves, once a minute at most. A largest snapshot is set from
+  the heap (`raftmember::snapshot_limit`). Stopped, the member tells
+  whoever waits why.
 - **Commands**: the shell hands its command to its member's task, which
   asks it of the group until it knows what became of it -- applied once,
   whoever leads (`raft::asks`; [Raft](raft.md), "A member's own asks").
@@ -250,7 +266,14 @@ asks, and the typed name is the admin's word that they are gone.
   another voter while every host still reaches it -- the removal drops the
   removed host's connections as each member applies it, and a group of two
   would lose the very connection the hand-over needs -- and the command,
-  asked again, reaches the new leader.
+  asked again, reaches the new leader. The lead goes to the voter that
+  stays, of those heard from in an election's time, that holds the most of
+  the log; one raft gave up is not armed again for two seconds, raft
+  refusing every proposal while one is, and its voter tried after the
+  others (the first voter by number was taken, heard from or not: a dead
+  one's armed again at every turn). A leader to leave the voters with none
+  to hand the lead to goes on with the other changes -- a voter that stays
+  made -- rather than keep the membership as it is for good.
 - **ipcnet's peers**: the member tells ipcnet's control mailbox,
   `ipcnet.ctl` (`ipcwire::control`, a `Host` name), the peers the registry
   gives this host -- every other host and every open invitation -- whenever

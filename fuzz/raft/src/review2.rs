@@ -19,6 +19,8 @@ use crate::sim::{Disk, Params, Sim};
 pub const ALL: &[(&str, fn() -> Result<(), String>)] = &[
     ("snapshot_pieces_bounded", snapshot_pieces_bounded),
     ("snapshot_refused_counted", snapshot_refused_counted),
+    ("successors_heard", successors_heard),
+    ("membership_goes_on", membership_goes_on),
     ("term_behind_log", term_behind_log),
     ("probe_leaves_on_match", probe_leaves_on_match),
     ("stale_vote_not_counted", stale_vote_not_counted),
@@ -126,6 +128,67 @@ fn pieces_sent(seed: u64, doubled: usize) -> Result<(), String> {
 fn snapshot_pieces_bounded() -> Result<(), String> {
     pieces_sent(201, 0)?;
     pieces_sent(211, 3)
+}
+
+/// The voters a leader hands the lead to as it leaves (`successors`) are
+/// those it heard from within an election's time: of five, one cut off is
+/// not among them. (raftmember took the first voter by number, heard from
+/// or not: a dead one's hand-over armed again at every turn, and the group
+/// took almost no proposal while it was.)
+fn successors_heard() -> Result<(), String> {
+    let mut s = Sim::new(Params::plain(), 231, &[1, 2, 3, 4, 5], &[]);
+    elect(&mut s, 1)?;
+    for _ in 0..5 {
+        s.propose(1);
+    }
+    s.flush(80);
+    let all = s.node(1).map(|n| n.successors(&[2, 3, 4, 5])).unwrap_or_default();
+    ensure(all.len() == 4, format!("every voter heard from, and the successors {:?}", all))?;
+    s.isolate(2);
+    let election = u64::from(Params::plain().election_ticks);
+    let mut none = 0;
+    for _ in 0..2 * election {
+        tick_all(&mut s);
+        round(&mut s, &mut none, &|_| false);
+    }
+    leader_is(&s, 1)?;
+    let heard = s.node(1).map(|n| n.successors(&[2, 3, 4, 5])).unwrap_or_default();
+    ensure(!heard.contains(&2) && heard.len() == 3,
+           format!("member 2 cut off for two elections' time: the successors {:?}", heard))?;
+    let staying = s.node(1).map(|n| n.successors(&[3, 4])).unwrap_or_default();
+    ensure(staying.len() == 2 && !staying.contains(&5), format!("of 3 and 4 staying: {:?}", staying))
+}
+
+/// The leader keeps raft's membership to what its state names a step at a
+/// time (`keep::next_change`): a member removed taken out before the
+/// leader hands the lead on; the leader to leave hands it on where it can;
+/// where it cannot, the other changes go on -- a voter that stays made.
+/// (Removed with a voter-to-be still a learner, the leader stayed for
+/// good: it could neither hand the lead on nor make the learner a voter.)
+fn membership_goes_on() -> Result<(), String> {
+    use raft::keep::{next_change, Next};
+    use raft::{ChangeKind, ConfChange, ConfState};
+    let conf = |voters: &[u64], learners: &[u64]| ConfState { voters: voters.to_vec(), learners: learners.to_vec() };
+    let all = |_: u64| 100u64;
+    let change = |kind, node| Next::Change(ConfChange { kind, node });
+    /* [1], 2 added as a learner and 1 removed at once: 2 made a voter */
+    let got = next_change(&conf(&[1], &[2]), 1, &[2], &[], false, &all, 100, 8);
+    ensure(got == change(ChangeKind::AddVoter, 2), format!("1 removed, 2 a learner to be a voter: {:?}", got))?;
+    /* ... and once 2 votes and is heard from, the lead handed to it */
+    let got = next_change(&conf(&[1, 2], &[]), 1, &[2], &[], true, &all, 100, 8);
+    ensure(got == Next::HandLead, format!("1 removed, 2 a voter heard from: {:?}", got))?;
+    /* A member removed taken out first -- never the leader itself */
+    let got = next_change(&conf(&[1, 2, 3, 4], &[]), 1, &[2, 3], &[], true, &all, 100, 8);
+    ensure(got == change(ChangeKind::Remove, 4), format!("1 and 4 removed: {:?}", got))?;
+    let got = next_change(&conf(&[1, 2, 3], &[]), 1, &[2, 3], &[], true, &all, 100, 8);
+    ensure(got == Next::HandLead, format!("1 removed of three: {:?}", got))?;
+    /* The leader named a learner hands the lead on; its own demotion is
+     * never proposed by it */
+    let got = next_change(&conf(&[1, 2, 3], &[]), 1, &[2, 3], &[1], false, &all, 100, 8);
+    ensure(got == Next::Nothing, format!("1 to be a learner, no voter heard from: {:?}", got))?;
+    /* A learner far behind is not made a voter yet */
+    let got = next_change(&conf(&[1], &[2]), 1, &[1, 2], &[], false, &|n| if n == 2 { 10 } else { 100 }, 100, 8);
+    ensure(got == Next::Nothing, format!("2 far behind: {:?}", got))
 }
 
 /// A follower sent a snapshot larger than it may hold refuses it at its

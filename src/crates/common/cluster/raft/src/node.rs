@@ -626,6 +626,23 @@ impl<S: Storage> RawNode<S> {
         if self.role == Role::Leader { self.lead_transferee } else { NONE }
     }
 
+    /// On a leader, whom it may hand the lead to as it leaves the voters:
+    /// the voters of `staying` but itself that it heard from within an
+    /// election's time, the one holding the most of the log first -- it
+    /// takes the lead soonest. Empty on any other role. (Its user took the
+    /// first voter by number, heard from or not: a dead one's hand-over
+    /// was armed again and again, and while one is, no proposal is taken.)
+    pub fn successors(&self, staying: &[NodeId]) -> Vec<NodeId> {
+        let election = self.cfg.election_ticks;
+        let mut by: Vec<(u64, NodeId)> = self.membership().voters.iter().copied()
+            .filter(|&id| id != self.id && staying.contains(&id))
+            .filter(|&id| self.idle_ticks(id).is_some_and(|t| t < election))
+            .map(|id| (self.matched(id).unwrap_or(0), id))
+            .collect();
+        by.sort_unstable_by(|a, b| b.cmp(a));
+        by.into_iter().map(|(_, id)| id).collect()
+    }
+
     /// On a leader, the ticks since member `id` was last heard from. None
     /// on any other role, or for a member it does not track.
     pub fn idle_ticks(&self, id: NodeId) -> Option<u32> {

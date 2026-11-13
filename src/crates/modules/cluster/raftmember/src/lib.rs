@@ -7,13 +7,20 @@
 //! cluster.md), nbs-mds.ko's metadata the next (plans/nbs.md). What is the
 //! same in every such group is here; what is a group's own is its [`App`]'s.
 //!
+//! - **Its start**: what the log holds committed is applied -- every batch
+//!   of it ([`catch_up`]) -- before the member is shown or takes a message.
 //! - **Its clock**: a tick every `TICK_MS`; an election after ten to twenty
-//!   of them, a heartbeat at each.
+//!   of them, a heartbeat at each. Ticks missed while the task was held up
+//!   are dropped, and the stall said, not given all at once.
 //! - **Its messages** go over ipc to `<App::NAME>@<host>` -- a `Cluster`
-//!   name, which ipcnet delivers from pinned hosts alone -- by the bulk
-//!   connection when large, behind the group's id where the app has one. One
-//!   that comes in is taken only from the host the app has for the node it
-//!   says it is from: a host of the group cannot speak for another's node.
+//!   name, which ipcnet delivers from pinned hosts alone -- appends and a
+//!   snapshot's pieces by the bulk connection whatever their size, so that
+//!   they keep their order, the rest by it when large; behind the group's
+//!   id where the app has one. One that comes in is taken only from the
+//!   host the app has for the node it says it is from: a host of the group
+//!   cannot speak for another's node. One refused for that is said.
+//! - **What it counts**: raft's counters of what a correct group never
+//!   sees, or of why a member stays behind, said when they move.
 //! - **What it is asked**: the shell's commands come in a queue
 //!   (`Shared::requests`), and each is applied once, whoever leads
 //!   (`raft::asks`): under a session of its own, registered for it, its
@@ -34,7 +41,10 @@
 //!   and learners the app's state names, a change at a time -- a node added
 //!   as a learner, made a voter once it holds the log, a removed one taken
 //!   out, the leader's own removal waiting for the lead handed to a voter
-//!   that stays.
+//!   that stays ([`Core::hand_lead_on`]), the other changes going on while
+//!   there is none to hand it to.
+//! - **Its stop**: the view says why, and whoever waits is told -- the
+//!   shell's requests not yet taken, its asks, the commands submitted.
 
 extern crate alloc;
 
@@ -55,9 +65,10 @@ use kcore::klog;
 use kcore::sync::Mutex;
 use kcore::time::{boot_time_ns, Duration};
 use raft::asks::{self, Asks, Done, Outcome as AskOutcome, Send, Tell, Timing, Told};
+use raft::keep::Next;
 use raft::log::DiskLog;
-use raft::rsm::StateMachine;
-use raft::{ChangeKind, ConfChange, ConfState, Event, NodeId, Role, Rsm};
+use raft::rsm::{RsmStats, StateMachine};
+use raft::{Body, ChangeKind, ConfChange, ConfState, Event, NodeId, Role, Rsm, Stats};
 
 pub const TICK_MS: u64 = 100;
 const NS_PER_MS: u64 = 1_000_000;
@@ -126,6 +137,20 @@ const ASK_GRACE_MS: u64 = 5000;
 const VIEW_WAIT_MS: u64 = 5000;
 /// How often a message of another group is said in the log at most.
 const OTHER_GROUP_SAY_MS: u64 = 10_000;
+/// How often a raft message refused for the host it came from, and a stall
+/// of the member's task, are said at most.
+const REFUSED_SAY_MS: u64 = 10_000;
+const STALL_SAY_MS: u64 = 10_000;
+/// How often raft's counters are looked at, and what moved said.
+const STATS_MS: u64 = 60_000;
+/// A hand-over of the lead that raft gave up is not asked again for this
+/// long: raft refuses every proposal while one is armed.
+const HAND_RETRY_MS: u64 = 2000;
+/// The least `snapshot_limit` gives, whatever the RAM.
+const MIN_SNAPSHOT_LIMIT: u64 = 4 << 20;
+/// `process` calls in a row that apply nothing before a start's catch-up
+/// gives up.
+const CATCH_UP_IDLE: u32 = 4;
 /// A group's id, before every message of the engine's where the app has one.
 pub const GROUP_BYTES: usize = 16;
 /// An answer's head: the request's number, applied or not, the entry.
@@ -305,11 +330,25 @@ pub struct Core<A: App> {
     next_request: u64,
     /// The voter this leader, removed, hands the lead to.
     handing_to: Option<u64>,
+    /// The voter whose hand-over raft last gave up -- tried after the
+    /// others -- and when the next may be armed.
+    hand_failed: Option<u64>,
+    hand_retry: u64,
     /// The membership change proposed and not yet in force, and when.
     change: Option<(ConfChange, u64)>,
     refused: u64,
-    /// When a message of another group was last said in the log.
+    /// When a message of another group was last said in the log; a raft
+    /// message refused for its host; a stall of the task.
     other_group_said: u64,
+    refused_said: u64,
+    stall_said: u64,
+    /// Ticks dropped since a stall was last said.
+    ticks_dropped: u64,
+    /// When raft's counters are next looked at, and what they were then.
+    stats_due: u64,
+    said_stats: Stats,
+    said_rsm: RsmStats,
+    said_refused: u64,
     /// The shell's asks in flight, each under a session of its own.
     asks: Asks<Slot<A>>,
     /// As the leader, the members owed word of what it did for their asks.
@@ -322,6 +361,18 @@ pub enum Pending<A: App> {
     Remote { to: Addr, request: u64 },
     /// One of the group's own: a host joining.
     App(A::Waiter),
+}
+
+/// What came of handing the lead on (`Core::hand_lead_on`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handing {
+    /// On its way to `node` -- `first` the turn it was armed, for the
+    /// caller to say so once.
+    To { node: u64, first: bool },
+    /// Raft gave the last one up: another is armed in a moment.
+    Waiting,
+    /// No voter that stays is heard from.
+    NoOne,
 }
 
 /// The member: the app's half and the engine's.
@@ -365,9 +416,18 @@ impl<A: App> Core<A> {
             forwarded: BTreeMap::new(),
             next_request: first | 1,
             handing_to: None,
+            hand_failed: None,
+            hand_retry: 0,
             change: None,
             refused: 0,
             other_group_said: 0,
+            refused_said: 0,
+            stall_said: 0,
+            ticks_dropped: 0,
+            stats_due: boot_time_ns() + STATS_MS * NS_PER_MS,
+            said_stats: Stats::default(),
+            said_rsm: RsmStats::default(),
+            said_refused: 0,
             asks: Asks::new(node, asks_first | 1, Timing {
                 total: ASK_TOTAL_MS * NS_PER_MS,
                 resend: ASK_RESEND_MS * NS_PER_MS,
@@ -413,15 +473,48 @@ impl<A: App> Core<A> {
         self.refused += 1;
     }
 
-    /// The lead handed to `to` -- asked again at every turn by whoever
-    /// wants it, raft taking the same hand-over once: None where raft
-    /// refuses it, `Some(true)` the first time it is asked for `to`, for the
-    /// caller to say so once.
-    pub fn hand_lead_to(&mut self, to: u64) -> Option<bool> {
-        self.rsm.transfer_leader(to).ok()?;
-        let first = self.handing_to != Some(to);
-        self.handing_to = Some(to);
-        Some(first)
+    /// The lead handed on to a voter of `staying` -- asked again at every
+    /// turn by whoever wants it, raft taking the same hand-over once: the
+    /// first of raft's `successors` -- of those heard from within an
+    /// election's time, the one that holds the most of the log -- and where
+    /// raft refuses one, the next. A hand-over raft
+    /// gave up -- its voter did not take the lead in an election's time --
+    /// is not armed again for `HAND_RETRY_MS`, as raft refuses every
+    /// proposal while one is, and its voter is tried after the others.
+    /// (The first voter by number was taken, heard from or not: a dead
+    /// one's hand-over armed again at every turn, the group took almost no
+    /// command while it was.)
+    pub fn hand_lead_on(&mut self, staying: &[u64]) -> Handing {
+        let now = boot_time_ns();
+        let node = self.rsm.node();
+        let on_way = node.transferring();
+        if let Some(to) = self.handing_to {
+            if on_way == to {
+                return Handing::To { node: to, first: false };
+            }
+            /* Given up by raft: still leading, and nothing on its way */
+            self.handing_to = None;
+            self.hand_failed = Some(to);
+            self.hand_retry = now + HAND_RETRY_MS * NS_PER_MS;
+        }
+        if now < self.hand_retry {
+            return Handing::Waiting;
+        }
+        /* raft's order -- the most of the log first -- but the one given up
+           last tried after the others */
+        let mut voters = node.successors(staying);
+        if let Some(at) = voters.iter().position(|&v| Some(v) == self.hand_failed) {
+            let failed = voters.remove(at);
+            voters.push(failed);
+        }
+        for to in voters {
+            if self.rsm.transfer_leader(to).is_ok() {
+                self.handing_to = Some(to);
+                /* Said once a voter: not again as the same one is retried */
+                return Handing::To { node: to, first: self.hand_failed != Some(to) };
+            }
+        }
+        Handing::NoOne
     }
 
     pub fn view(&self, stopped: Option<String>) -> View<A> {
@@ -561,12 +654,17 @@ impl<A: App> Core<A> {
 
     fn send_raft(&self, app: &A, m: raft::Message) {
         let Some(host) = app.host_of(self, m.to) else { return };
+        /* Appends and a snapshot's pieces by the bulk connection whatever
+           their size: ipc keeps a connection's order alone, and a small
+           append that overtook a large one on the other was refused, its
+           follower probed and the window sent again */
+        let ordered = matches!(m.body, Body::Append { .. } | Body::Snapshot { .. });
         let mut bytes = Vec::new();
         if raft::wire::encode(&m, &mut bytes).is_err() {
             return;
         }
         let bytes = self.framed(app, &bytes);
-        let tag = if bytes.len() > BULK_BYTES { TAG_RAFT | TAG_BULK } else { TAG_RAFT };
+        let tag = if ordered || bytes.len() > BULK_BYTES { TAG_RAFT | TAG_BULK } else { TAG_RAFT };
         let _ = self.mb.send_to(&alloc::format!("{}@{}", A::NAME, host), tag, 0, &bytes);
     }
 
@@ -589,12 +687,39 @@ impl<A: App> Core<A> {
             self.refused += 1;
             return;
         };
-        /* From the host whose node it says it is from, to this one */
-        if self.sender_node(app, m) != Some(rm.from) || rm.to != self.node {
+        /* To this node, from the host whose node it says it is from */
+        if rm.to != self.node {
             self.refused += 1;
             return;
         }
+        let sender = self.sender_node(app, m);
+        if sender != Some(rm.from) {
+            self.refused += 1;
+            self.say_refused(m, rm.from, sender);
+            return;
+        }
         let _ = self.rsm.step(rm);
+    }
+
+    /// A raft message refused for the host it came from, said -- once in
+    /// `REFUSED_SAY_MS` at most: a member whose state has the host as
+    /// another node, or not at all and the app knew nothing of it before,
+    /// refuses all that host sends, and would stay behind with nothing but
+    /// a counter to say so.
+    fn say_refused(&mut self, m: &Message, node: u64, known: Option<u64>) {
+        let now = boot_time_ns();
+        if now < self.refused_said {
+            return;
+        }
+        self.refused_said = now + REFUSED_SAY_MS * NS_PER_MS;
+        let host = kcore::ipc::peer_name(m.from).unwrap_or_else(|| String::from("this host"));
+        match known {
+            Some(n) => klog!(0, "{}: raft messages from {} as node {} refused: this member has that host as node {}",
+                             A::LOG, host, node, n),
+            None => klog!(0, "{}: raft messages from {} as node {} refused: a host this member does not know -- its \
+                              state older than that host's joining, it catches up from a leader it knows", A::LOG,
+                          host, node),
+        }
     }
 
     /// A command another member hands this one, as the leader.
@@ -824,10 +949,13 @@ impl<A: App> Core<A> {
                     self.finish(app, w, outcome, index);
                 }
             }
-            Event::Expired { client, seq } | Event::Stale { client, seq } | Event::Lost { client, seq }
-                if Some(client) == self.session =>
-            {
-                if let Some(w) = self.pending.remove(&seq) {
+            Event::Expired { client, .. } if Some(client) == self.session => {
+                /* The session gone: every command submitted under it is
+                   expired, not only this one -- each told now, and one new
+                   session asked. (Only the one the event named was: the
+                   others waited for a change of leader) */
+                let waiting = core::mem::take(&mut self.pending);
+                for (_, w) in waiting {
                     self.finish(app, w, Err(String::from("the member's session went -- ask again")), 0);
                 }
                 /* A leader is never left without one */
@@ -835,6 +963,21 @@ impl<A: App> Core<A> {
                     self.register_session();
                 } else {
                     self.session = None;
+                }
+            }
+            Event::Lost { client, seq } if Some(client) == self.session => {
+                /* Applied, once, the session going on: its answer too long
+                   to keep, its application not seen here */
+                if let Some(w) = self.pending.remove(&seq) {
+                    self.finish(app, w, Err(String::from("applied, once -- its answer lost: the state says what it \
+                                                          did")), 0);
+                }
+            }
+            Event::Stale { client, seq } if Some(client) == self.session => {
+                /* Not applied: the session past its number, which nothing
+                   of this member's submits */
+                if let Some(w) = self.pending.remove(&seq) {
+                    self.finish(app, w, Err(String::from("not applied: its number was gone by -- ask again")), 0);
                 }
             }
             _ => {}
@@ -856,6 +999,16 @@ impl<A: App> Core<A> {
         self.registering = self.rsm.register(request).is_ok().then_some(request);
     }
 
+    /// As the leader, a session to submit under: asked again at every turn
+    /// while the last ask was not taken. (It was asked once, as the member
+    /// came to lead: refused then, the leader answered every command of the
+    /// group's own "not ready" until it stepped down.)
+    fn keep_session(&mut self) {
+        if self.rsm.role() == Role::Leader && self.session.is_none() && self.registering.is_none() {
+            self.register_session();
+        }
+    }
+
     fn on_role(&mut self, app: &mut A, role: Role) {
         if role == Role::Leader {
             self.register_session();
@@ -870,6 +1023,8 @@ impl<A: App> Core<A> {
             self.registering = None;
             self.change = None;
             self.handing_to = None;
+            self.hand_failed = None;
+            self.hand_retry = 0;
         }
     }
 
@@ -945,41 +1100,101 @@ impl<A: App> Core<A> {
             self.change = None;
         }
         let (voters, learners) = app.wanted(self);
-        let member = |n: &u64| conf.voters.contains(n) || conf.learners.contains(n);
-        let next = if let Some(&n) = conf.voters.iter().chain(conf.learners.iter())
-            .find(|n| !voters.contains(n) && !learners.contains(n))
-        {
-            /* A removed node taken out -- never the leader itself, which
-               hands the lead to a voter that stays, whose own turn here then
-               takes it out. Asked again at every turn: raft takes the same
-               hand-over once */
-            if n == self.node {
-                if let Some(&to) = conf.voters.iter().find(|&&v| v != n && voters.contains(&v)) {
-                    if self.hand_lead_to(to) == Some(true) {
-                        klog!(0, "{}: this host is removed: the lead handed to node {}", A::LOG, to);
-                    }
+        let node = self.rsm.node();
+        /* A voter that stays to hand the lead to, or a hand-over already
+           on its way or about to be armed again */
+        let can_hand = self.handing_to.is_some() || now < self.hand_retry || !node.successors(&voters).is_empty();
+        let next = raft::keep::next_change(&conf, self.node, &voters, &learners, can_hand,
+                                           &|n| node.matched(n).unwrap_or(0), node.committed(), CAUGHT_UP);
+        match next {
+            Next::Change(cc) => {
+                if self.rsm.propose_change(cc).is_ok() {
+                    klog!(0, "{}: membership: {:?} node {}", A::LOG, cc.kind, cc.node);
+                    self.change = Some((cc, now));
                 }
-                None
-            } else {
-                Some(ConfChange { kind: ChangeKind::Remove, node: n })
             }
-        } else if let Some(&n) = voters.iter().chain(learners.iter()).find(|n| !member(n)) {
-            /* A node added: a learner first, whatever it will be */
-            Some(ConfChange { kind: ChangeKind::AddLearner, node: n })
-        } else if let Some(&n) = voters.iter().find(|n| conf.learners.contains(n)) {
-            /* A voter to be, once it holds the log */
-            let committed = self.rsm.node().committed();
-            let held = self.rsm.node().matched(n).unwrap_or(0);
-            (held + CAUGHT_UP >= committed).then_some(ConfChange { kind: ChangeKind::AddVoter, node: n })
-        } else {
-            learners.iter().find(|n| conf.voters.contains(n))
-                .map(|&n| ConfChange { kind: ChangeKind::AddLearner, node: n })
-        };
-        if let Some(cc) = next {
-            if self.rsm.propose_change(cc).is_ok() {
-                klog!(0, "{}: membership: {:?} node {}", A::LOG, cc.kind, cc.node);
-                self.change = Some((cc, now));
+            Next::HandLead => {
+                if let Handing::To { node, first: true } = self.hand_lead_on(&voters) {
+                    klog!(0, "{}: this host is to leave the voters: the lead handed to node {}", A::LOG, node);
+                }
             }
+            Next::Nothing => {}
+        }
+    }
+
+    /// The task was held up `missed` ticks, dropped: said once in
+    /// `STALL_SAY_MS` at most, with all that were dropped since.
+    fn stalled(&mut self, missed: u64) {
+        self.ticks_dropped += missed;
+        let now = boot_time_ns();
+        if now < self.stall_said {
+            return;
+        }
+        self.stall_said = now + STALL_SAY_MS * NS_PER_MS;
+        klog!(0, "{}: the member's task was held up: {} ticks of {} ms dropped", A::LOG, self.ticks_dropped, TICK_MS);
+        self.ticks_dropped = 0;
+    }
+
+    /// Raft's counters of what a correct group never sees, or of why a
+    /// member stays behind, said where they moved -- once in `STATS_MS` at
+    /// most. (Nothing read them: messages dropped for room, a snapshot
+    /// refused, a follower that lost what it had acknowledged, all passed
+    /// in silence.)
+    fn say_stats(&mut self) {
+        let now = boot_time_ns();
+        if now < self.stats_due {
+            return;
+        }
+        self.stats_due = now + STATS_MS * NS_PER_MS;
+        let (n, r) = (self.rsm.node().stats(), self.rsm.stats());
+        let (was, was_rsm) = (self.said_stats, self.said_rsm);
+        let mut line = String::new();
+        for (what, count, before) in [
+            ("messages that cannot be", n.invalid, was.invalid),
+            ("messages not sent for room", n.unsent, was.unsent),
+            ("appends taken in part for room", n.dropped, was.dropped),
+            ("followers found to have lost entries they held", n.regressed, was.regressed),
+            ("snapshots given up half taken in", n.snapshots_abandoned, was.snapshots_abandoned),
+            ("snapshots refused, too large to hold", n.snapshots_refused, was.snapshots_refused),
+            ("snapshots a follower refused", n.snapshots_rejected, was.snapshots_rejected),
+            ("reads refused for room", n.reads_refused, was.reads_refused),
+            ("snapshots of its own given up, too large to hold", r.snapshots_given_up, was_rsm.snapshots_given_up),
+            ("reads failed back for their age", r.reads_aged, was_rsm.reads_aged),
+            ("messages refused for their host or group", self.refused, self.said_refused),
+        ] {
+            if count > before {
+                line.push_str(&alloc::format!("; {} {}", count - before, what));
+            }
+        }
+        self.said_stats = n;
+        self.said_rsm = r;
+        self.said_refused = self.refused;
+        if !line.is_empty() {
+            klog!(0, "{}: in the last {} s{}", A::LOG, STATS_MS / 1000, line);
+        }
+    }
+
+    /// The member stopped, for `why`: the view says so, and whoever waits
+    /// is told -- the shell's requests not yet taken (never asked), its
+    /// asks and the commands submitted or handed to the leader (asked, and
+    /// perhaps applied) -- rather than left to wait out their time, or a
+    /// request left in the queue taken by the member that runs next on the
+    /// same `Shared` (`cluster recover`).
+    fn stop(&mut self, app: &mut A, shared: &Shared<A>, why: &str) {
+        shared.view.with(|v| *v = Some(self.view(Some(String::from(why)))));
+        let requests: Vec<Request<A>> = shared.requests.with(|q| q.drain(..).collect());
+        for r in requests {
+            r.done.with(|s| *s = Some((Err(alloc::format!("not asked: the member stopped -- {}", why)), 0)));
+        }
+        let may = alloc::format!("the member stopped -- {}: it may yet be applied, look before asking again", why);
+        for slot in self.asks.drain() {
+            slot.with(|s| *s = Some((Err(may.clone()), 0)));
+        }
+        for (_, w) in core::mem::take(&mut self.pending) {
+            self.finish(app, w, Err(may.clone()), 0);
+        }
+        for (_, (w, _, _)) in core::mem::take(&mut self.forwarded) {
+            self.finish(app, w, Err(may.clone()), 0);
         }
     }
 
@@ -995,62 +1210,128 @@ impl<A: App> Core<A> {
     }
 }
 
-/// The member's task: until the module goes, or its log fails.
+/// What the log holds committed, applied -- every batch of it, as many
+/// `process` calls as it takes -- before the member is shown or takes a
+/// message: the shell and the group's members are answered from the state
+/// the log left, never from its snapshot's and a part of the log after it.
+/// What `process` hands out meanwhile is nobody's: the old entries' events,
+/// and no message, from a member not yet ticking or campaigning. Called by
+/// the module that makes the member, over `Rsm::new`'s. (Only the first 16
+/// batches were applied: a log of a hundred thousand entries past its
+/// snapshot was answered from as it had been seconds before -- what
+/// nbs-test had found of the snapshot alone: a cs asking its devices of an
+/// mds just started was told the snapshot's, a device added since missing.)
+pub fn catch_up<S: StateMachine>(rsm: &mut Rsm<Log, S>) -> Result<(), String> {
+    let mut idle = 0;
+    while !rsm.caught_up() {
+        let before = rsm.applied();
+        rsm.process().map_err(|e| alloc::format!("{:?}", e))?;
+        idle = if rsm.applied() == before { idle + 1 } else { 0 };
+        if idle >= CATCH_UP_IDLE {
+            return Err(alloc::format!("the log's committed entries past {} are not applied", before));
+        }
+    }
+    Ok(())
+}
+
+/// The largest snapshot a member over this kernel's heap holds
+/// (`raft::Config::max_snapshot_bytes`): one is held whole, in pieces of
+/// 64 KiB, while the member takes one of its own or takes one in, and the
+/// heap gives that size class a window of 70% of RAM over 8 -- half of it
+/// for a snapshot, the rest for all else of its size; at least
+/// `MIN_SNAPSHOT_LIMIT`, at most raft's own limit. One larger is refused
+/// and counted, not a panic of the machine at a piece the window has no
+/// room for.
+pub fn snapshot_limit() -> u64 {
+    let m = kcore::system::memory();
+    let ram = m.total_pages.saturating_mul(m.page_bytes);
+    (ram / 10 * 7 / 8 / 2).clamp(MIN_SNAPSHOT_LIMIT, raft::MAX_SNAPSHOT_BYTES)
+}
+
+/// The member's task: until the module goes, or its log fails -- and then
+/// whoever waits told (`Core::stop`).
 pub fn run<A: App>((shared, m): (Arc<Shared<A>>, Member<A>)) {
     let Member { mut app, mut core } = m;
+    let why = match turns(&shared, &mut app, &mut core) {
+        Ok(()) => String::from("it was told to stop"),
+        Err(why) => why,
+    };
+    core.stop(&mut app, &shared, &why);
+}
+
+/// The member's turns: until it is told to stop (`Ok`), or it fails -- its
+/// log, or the app's halt -- said in the log (`Err`, why).
+fn turns<A: App>(shared: &Shared<A>, app: &mut A, core: &mut Core<A>) -> Result<(), String> {
     let tick = TICK_MS * NS_PER_MS;
     let mut next_tick = boot_time_ns() + tick;
-    /* What the log holds committed, applied before any message is taken:
-       the app answers from the state the log left, never from its
-       snapshot's alone. (nbs-test: a cs asking its devices of an mds just
-       started was told the snapshot's -- a device added since missing, one
-       drained since taken for active -- and served on it) */
-    if let Err(why) = core.process(&mut app) {
+    /* The log's committed entries were applied as the member was made
+       (`catch_up`); what is left -- a campaign's messages -- goes before
+       the first message is taken */
+    if let Err(why) = core.process(app) {
         klog!(0, "{}: the member stopped: {} -- `rmmod` and `insmod` start it again", A::LOG, why);
-        shared.view.with(|v| *v = Some(core.view(Some(why))));
-        return;
+        return Err(why);
     }
     shared.view.with(|v| *v = Some(core.view(None)));
     while !shared.stop.load(Ordering::Acquire) {
         let wait = (next_tick.saturating_sub(boot_time_ns()) / NS_PER_MS).clamp(1, POLL_MS);
         if let Some(msg) = core.mb.recv(Duration::from_millis(wait)) {
-            core.on_message(&mut app, msg);
+            core.on_message(app, msg);
             for _ in 0..BATCH {
                 match core.mb.try_recv() {
-                    Some(more) => core.on_message(&mut app, more),
+                    Some(more) => core.on_message(app, more),
                     None => break,
                 }
             }
         }
-        if boot_time_ns() >= next_tick {
+        let now = boot_time_ns();
+        if now >= next_tick {
             core.rsm.tick();
+            core.expire_forwarded(app);
             next_tick += tick;
-            core.expire_forwarded(&mut app);
+            if next_tick <= now {
+                /* One tick a turn, those missed dropped and said: given
+                   one a turn after a stall -- a slow sync, a long apply --
+                   a follower's election ran out between two heartbeats */
+                let missed = (now - next_tick) / tick + 1;
+                next_tick = now + tick;
+                core.stalled(missed);
+            }
         }
         let requests: Vec<Request<A>> = shared.requests.with(|q| q.drain(..).collect());
         for r in requests {
-            if let Some(r) = app.take(&mut core, r) {
+            if let Some(r) = app.take(core, r) {
                 if let Err(slot) = core.asks.ask(A::encode_command(&r.cmd), r.done, boot_time_ns()) {
                     slot.with(|s| *s = Some((Err(alloc::format!("{} commands asked at once on this host already -- \
                                                                   ask again", asks::MAX_ASKS)), 0)));
                 }
             }
         }
-        if let Err(why) = core.process(&mut app) {
+        if let Err(why) = core.process(app) {
             klog!(0, "{}: the member stopped: {} -- `rmmod` and `insmod` start it again", A::LOG, why);
-            shared.view.with(|v| *v = Some(core.view(Some(why))));
-            return;
+            return Err(why);
         }
-        core.turn_asks(&mut app);
-        app.turn(&mut core);
-        if let Some(why) = app.halt(&core) {
+        core.keep_session();
+        core.turn_asks(app);
+        app.turn(core);
+        if let Some(why) = app.halt(core) {
             klog!(0, "{}: the member stopped: {}", A::LOG, why);
-            shared.view.with(|v| *v = Some(core.view(Some(why))));
-            return;
+            return Err(why);
         }
-        core.keep_membership(&mut app);
+        core.keep_membership(app);
+        core.say_stats();
         shared.view.with(|v| *v = Some(core.view(None)));
     }
+    Ok(())
+}
+
+/// Why an ask cannot be asked of this host's member: `no_member` where
+/// there is none, why it stopped where it did -- the stop's words, not
+/// "no member" for one that ran and failed. None while it runs.
+fn stopped<A: App>(shared: &Shared<A>, no_member: &str) -> Option<String> {
+    shared.view.with(|v| match v {
+        None => Some(String::from(no_member)),
+        Some(v) => v.stopped.as_ref().map(|why| alloc::format!("the member stopped: {}", why)),
+    })
 }
 
 /// Until this member's view has applied entry `index`, or VIEW_WAIT_MS has
@@ -1079,8 +1360,8 @@ pub fn ask<A: App>(shared: &Shared<A>, cmd: &A::Command, no_member: &str) -> Res
 pub fn ask_turning<A: App>(shared: &Shared<A>, cmd: &A::Command, no_member: &str, turn: &mut dyn FnMut(u64))
     -> Result<A::Answer, String>
 {
-    if shared.view().is_none_or(|v| v.stopped.is_some()) {
-        return Err(String::from(no_member));
+    if let Some(why) = stopped(shared, no_member) {
+        return Err(why);
     }
     let slot: Slot<A> = Arc::new(Locked::new(None).ok_or_else(|| String::from("out of memory"))?);
     shared.requests.with(|q| q.push_back(Request { cmd: cmd.clone(), done: slot.clone() }));
@@ -1094,8 +1375,8 @@ pub fn ask_turning<A: App>(shared: &Shared<A>, cmd: &A::Command, no_member: &str
             }
             return outcome;
         }
-        if shared.view().is_none_or(|v| v.stopped.is_some()) {
-            return Err(String::from(no_member));
+        if let Some(why) = stopped(shared, no_member) {
+            return Err(why);
         }
         if boot_time_ns() >= end {
             return Err(String::from("no answer from this host's member -- it may yet be applied: look before asking \

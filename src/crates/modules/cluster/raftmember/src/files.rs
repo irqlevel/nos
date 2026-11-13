@@ -16,20 +16,25 @@ pub struct KFiles {
 
 /// Every folder of `path` that is not there made, from the root down:
 /// `/nbs/mds` on a host with no `/nbs`. One that cannot be made is the
-/// next call's to say.
+/// next call's to say. The root itself -- `/`, or `""` as a root of `/`
+/// trimmed of its slash -- is there already. (`""[1..]` panicked: a
+/// module's `conf=/` and a `cluster init`, the kernel down.)
 pub fn create_dirs(path: &str) {
     let mut at = 0;
-    while let Some(i) = path[at + 1..].find('/').map(|i| i + at + 1) {
+    while let Some(i) = path.get(at + 1..).and_then(|rest| rest.find('/')).map(|i| i + at + 1) {
         let _ = kcore::fs::create_dir(&path[..i]);
         at = i;
     }
-    let _ = kcore::fs::create_dir(path);
+    if !path.is_empty() {
+        let _ = kcore::fs::create_dir(path);
+    }
 }
 
 impl KFiles {
     /// The log's folder, `<root>/<sub>`, and the root, made where they are
     /// not there; `<root>/.sync`, an empty file a sync of the folder syncs --
-    /// nos's file system makes everything durable at any file's sync.
+    /// nos's file system makes everything durable at any file's sync. A
+    /// root of `/` is the file system's own: the folder is `/<sub>`.
     pub fn new(root: &str, sub: &str) -> Result<KFiles, String> {
         let root = root.trim_end_matches('/');
         create_dirs(root);
@@ -71,6 +76,20 @@ fn file_error(e: Error) -> FileError {
     if e == Error::NotFound { FileError::NotFound } else { FileError::Io }
 }
 
+impl KFiles {
+    /// A call of kcore's that failed with NotFound -- which kcore says of
+    /// any failure of a size or a remove -- told apart by the folder's
+    /// listing: `name` there is an I/O error. (A snapshot's file whose
+    /// length could not be read was taken for one not there, and the log
+    /// refused as corrupt.)
+    fn not_found_or_io(&self, name: &str) -> FileError {
+        match kcore::fs::list(&self.dir) {
+            Ok(entries) if !entries.iter().any(|e| !e.dir && e.name == name.as_bytes()) => FileError::NotFound,
+            _ => FileError::Io,
+        }
+    }
+}
+
 impl Files for KFiles {
     fn list(&mut self, out: &mut Vec<String>) -> Result<(), FileError> {
         for e in kcore::fs::list(&self.dir).map_err(file_error)? {
@@ -86,7 +105,7 @@ impl Files for KFiles {
     }
 
     fn len(&mut self, name: &str) -> Result<u64, FileError> {
-        kcore::fs::size(&self.path(name)).map_err(file_error)
+        kcore::fs::size(&self.path(name)).map_err(|_| self.not_found_or_io(name))
     }
 
     fn read_at(&mut self, name: &str, offset: u64, buf: &mut [u8]) -> Result<usize, FileError> {
@@ -115,6 +134,6 @@ impl Files for KFiles {
     }
 
     fn remove(&mut self, name: &str) -> Result<(), FileError> {
-        kcore::fs::remove(&self.path(name)).map_err(file_error)
+        kcore::fs::remove(&self.path(name)).map_err(|_| self.not_found_or_io(name))
     }
 }

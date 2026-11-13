@@ -228,6 +228,16 @@ impl<W> Asks<W> {
         self.asks.is_empty()
     }
 
+    /// Every ask in flight given up, its waiter handed back: the member
+    /// stops, and each is told so rather than left to wait out its time.
+    /// The sessions made for them are not ended -- the member that runs
+    /// over the log next does not know them, and one left is evicted in
+    /// time as any other is.
+    pub fn drain(&mut self) -> Vec<W> {
+        self.ending.clear();
+        self.asks.drain(..).map(|a| a.waiter).collect()
+    }
+
     fn take_request(&mut self) -> u64 {
         let request = self.next_request;
         self.next_request = self.next_request.wrapping_add(1).max(1);

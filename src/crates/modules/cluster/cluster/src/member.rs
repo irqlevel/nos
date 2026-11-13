@@ -33,7 +33,7 @@ use kcore::ipc::{Addr, Message, TAG_BULK};
 use kcore::klog;
 use kcore::time::boot_time_ns;
 use raft::{Role, Rsm};
-use raftmember::{App, Core, Outcome, Pending};
+use raftmember::{App, Core, Handing, Outcome, Pending};
 use registry::{Answer, Command, State};
 
 use crate::files;
@@ -195,21 +195,27 @@ impl App for Registry {
         Answer::decode(bytes)
     }
 
-    /// The node host `name` is: the registry's, or -- before it has a
-    /// cluster -- what this host's join was answered.
+    /// The node host `name` is: the registry's -- or, where the registry
+    /// this member has applied has neither the host nor its node and has
+    /// not removed it, what this host's join was answered. A member whose
+    /// registry is older than the joining of a host that leads -- restored
+    /// from a snapshot taken before it -- takes that leader's messages by
+    /// it. (Only a member with no cluster at all did: one restored so
+    /// refused all its leader sent, and stayed on that snapshot.)
     fn node_of(&self, core: &Core<Registry>, name: &str) -> Option<u64> {
-        if core.state().cluster().is_some() {
-            return core.state().host(name).map(|h| h.node);
+        let state = core.state();
+        if let Some(h) = state.host(name) {
+            return Some(h.node);
         }
-        self.me.hosts.iter().find(|h| h.name == name).map(|h| h.node)
+        self.joined(core, |h| h.name == name).map(|h| h.node)
     }
 
     /// The host node `node` is, as `node_of` has them.
     fn host_of(&self, core: &Core<Registry>, node: u64) -> Option<String> {
-        if core.state().cluster().is_some() {
-            return core.state().host_of_node(node).map(|h| h.name.clone());
+        if let Some(h) = core.state().host_of_node(node) {
+            return Some(h.name.clone());
         }
-        self.me.hosts.iter().find(|h| h.node == node).map(|h| h.name.clone())
+        self.joined(core, |h| h.node == node).map(|h| h.name.clone())
     }
 
     fn wanted(&self, core: &Core<Registry>) -> (Vec<u64>, Vec<u64>) {
@@ -240,18 +246,17 @@ impl App for Registry {
         if !core.state().host(host).is_some_and(|h| h.node == core.node()) {
             return Ok(());
         }
-        let conf = core.membership();
         let keeps = core.state().voters();
-        let me = core.node();
-        let to = conf.voters.iter().copied().find(|&v| v != me && keeps.contains(&v));
-        let why = match to.map(|to| (to, core.hand_lead_to(to))) {
-            Some((to, Some(first))) => {
+        let why = match core.hand_lead_on(&keeps) {
+            Handing::To { node, first } => {
                 if first {
-                    klog!(0, "cluster: asked to remove this host, the leader: the lead handed to node {} first", to);
+                    klog!(0, "cluster: asked to remove this host, the leader: the lead handed to node {} first", node);
                 }
                 "this host leads: the lead is handed on first -- ask again in a moment"
             }
-            _ => "this host leads, and no other host votes yet to take the lead -- ask again in a moment",
+            Handing::Waiting => "this host leads, and the lead could not be handed on just now -- ask again in a moment",
+            Handing::NoOne => "this host leads, and no other host that votes is heard from to take the lead -- ask \
+                               again in a moment",
         };
         Err(String::from(why))
     }
@@ -289,6 +294,17 @@ impl App for Registry {
 }
 
 impl Registry {
+    /// A host this host's join was answered with that `which` names, where
+    /// the registry applied here has neither its name nor its node -- it is
+    /// older than that host's joining -- and has not removed it.
+    fn joined(&self, core: &Core<Registry>, which: impl Fn(&files::Known) -> bool) -> Option<&files::Known> {
+        let state = core.state();
+        self.me.hosts.iter().find(|h| which(h)).filter(|h| {
+            state.host(&h.name).is_none() && state.host_of_node(h.node).is_none()
+                && !state.removed().iter().any(|r| r.name == h.name)
+        })
+    }
+
     /// A member asking whether this one is there: answered for a host of
     /// the cluster alone.
     fn on_probe(&mut self, core: &mut Core<Registry>, m: &Message) {
@@ -383,6 +399,19 @@ impl Registry {
                 for (p, _) in &self.leaving {
                     if !peers.iter().any(|q| q.name == p.name) {
                         peers.push(p.clone());
+                    }
+                }
+                /* A host this host's join was answered with that the
+                   registry applied here does not have -- older than its
+                   joining -- and has not removed: kept, held to this
+                   member's mailbox, so that its raft messages reach the
+                   member until the registry has it (`node_of`) */
+                for h in self.me.hosts.iter() {
+                    if h.name != self.me.name && !peers.iter().any(|q| q.name == h.name)
+                        && self.joined(core, |k| k.name == h.name).is_some()
+                    {
+                        peers.push(control::Peer { name: h.name.clone(), ip: h.ip, port: h.port, keys: h.keys.clone(),
+                                                   only: Some(String::from(NAME)) });
                     }
                 }
                 (c.id, peers)
