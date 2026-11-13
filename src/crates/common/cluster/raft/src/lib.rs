@@ -63,6 +63,7 @@ mod raft_log;
 mod rand;
 
 pub mod asks;
+pub mod keep;
 pub mod log;
 pub mod node;
 pub mod recover;

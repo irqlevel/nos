@@ -320,6 +320,27 @@ command was applied, where the asking member did not see the application,
 makes the next try `Expired` and the command asked again under a new
 session -- which takes a thousand registrations within one ask's life.
 
+## The membership a group's state names
+
+A group whose state says who its members are -- the cluster's registry,
+NBS's metadata -- has its leader keep raft's membership to it a change at a
+time, `raft::keep::next_change` saying the next: a member the state no
+longer names taken out, never the leader itself; the leader, to leave the
+voters, handing the lead on first where a voter that stays is heard from
+(`RawNode::successors`: those heard from within an election's time, the
+one holding the most of the log first); where none is, the other changes
+going on -- a node named added as a learner, a learner named a voter made
+one once it holds the log, a voter named a learner made one -- so that a
+voter that stays is made, rather than the membership kept as it is for
+good. raftmember runs it at every turn of a leader; a hand-over raft gave
+up is armed again two seconds later, its voter tried after the others.
+Before, the first voter by number was taken, heard from or not -- a dead
+one's hand-over armed again at every turn, and raft takes no proposal while
+one is -- and a leader removed with nobody to hand the lead to changed
+nothing more, ever: a group of [a], b added as a learner and a removed at
+once, stayed on a. The scenarios `successors_heard` and
+`membership_goes_on` hold it, three mutants each failing one of them.
+
 ## A group of one, by force
 
 `raft::recover::force_alone(store, me)` makes a member's store -- while no
