@@ -26,6 +26,7 @@ mod logfuzz;
 mod nbsmetafuzz;
 mod registryfuzz;
 mod review;
+mod review2;
 mod rng;
 mod rsmfuzz;
 mod scenarios;
@@ -137,7 +138,7 @@ fn unit() -> u32 {
 
 fn scenarios(only: Option<&str>) -> u32 {
     let mut failed = 0;
-    for (name, f) in scenarios::ALL.iter().chain(review::ALL).chain(logfuzz::SCENARIOS).chain(rsmfuzz::SCENARIOS)
+    for (name, f) in scenarios::ALL.iter().chain(review::ALL).chain(review2::ALL).chain(logfuzz::SCENARIOS).chain(rsmfuzz::SCENARIOS)
         .chain(registryfuzz::SCENARIOS).chain(nbsmetafuzz::SCENARIOS).chain(asksfuzz::SCENARIOS) {
         if only.is_some_and(|o| o != *name) {
             continue;

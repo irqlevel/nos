@@ -212,7 +212,9 @@ pub enum Body {
     /// Taken: `index` is the follower's last entry that matches. Refused:
     /// `index` is the `prev_index` refused, and the hint where the leader
     /// may look next -- the follower's last entry of a term no later than
-    /// the one asked about.
+    /// the one asked about. Refused with all three 0: the answer to a
+    /// request of a term gone by -- an append, a heartbeat, a snapshot's
+    /// piece, a vote -- which tells its sender the term there is now.
     AppendResp { reject: bool, index: u64, hint_index: u64, hint_term: u64 },
     /// The leader is there; and how far a follower may take the commit to,
     /// no further than what it is known to hold. `ctx` names a round of
