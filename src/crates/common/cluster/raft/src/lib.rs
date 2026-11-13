@@ -27,7 +27,9 @@
 //!   leader's own term (the paper's figure 8);
 //! - snapshots: the caller's bytes, sent to a follower too far behind in
 //!   pieces;
-//! - learners, which hold everything and do not vote; membership changed one
+//! - learners, which hold everything and are not counted: nobody asks them
+//!   for a vote, nor counts an entry or a read by them (one that is asked
+//!   answers, and keeps its vote, as any member does); membership changed one
 //!   server at a time, each change in force as it is appended, with the 2015
 //!   fix: no change before the leader has committed an entry of its term,
 //!   and never two changes not yet committed;
