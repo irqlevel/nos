@@ -78,6 +78,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use nbscs::{ChunkRef, Epoch, SLOT};
+use nbsmeta::Pieces;
 use nbswire::{Answer, Ask, Asking, Hop, Op, Refusal, Relay, Reply, ReplicaState, Request, Said, Saying, DATA_MAX,
               MAP_MAX};
 
@@ -118,6 +119,14 @@ pub const DEADLINE_NS: u64 = 60_000_000_000;
 pub const ATTACH_NS: u64 = 10_000_000_000;
 /// How long a chunk written and flushed stays open with nothing written to it.
 pub const CLOSE_IDLE_NS: u64 = 3_000_000_000;
+/// How often a writer serving tells its host's mds it is there (`Ask::Here`):
+/// an mds started again knows the session a snapshot pauses within it.
+pub const HERE_NS: u64 = 5_000_000_000;
+/// The entries of each of its tables a report says by name, at most: the
+/// rest counted -- a report past what the kernel's heap gives at once was a
+/// panic on the path that says why a session is stuck (the review of
+/// 2026-11).
+const REPORT_NAMED: usize = 16;
 /// How long a session paused for a snapshot waits for word, once it has
 /// answered, before it attaches again (N10c2).
 pub const PAUSE_NS: u64 = 10_000_000_000;
@@ -265,8 +274,11 @@ impl SetInfo {
 struct Map {
     volume: u32,
     size: u64,
-    /// Each place's chunk, its incarnation, its set.
-    places: Vec<(u32, u32, u32)>,
+    /// Each place's chunk, its incarnation, its set: in pieces, as the
+    /// metadata keeps a map -- in one block it was past what the kernel's
+    /// heap gives at the 32,769th place, and a volume past 128 GiB a panic of
+    /// every host that attached it (found by the review of 2026-11).
+    places: Pieces<(u32, u32, u32)>,
     sets: BTreeMap<u32, SetInfo>,
     hosts: BTreeMap<u32, String>,
     /// The places whose chunk is shared (N10).
@@ -347,7 +359,9 @@ enum What {
     Piece(u64),
     Fence,
     Flush(u64),
-    Held,
+    /// The volume's chunks the cs holds open, from chunk number this on: a
+    /// page of them (`nbswire::PAGE`), the next asked until one is short.
+    Held(u32),
     Close(u32),
     /// A member's copy of a place's chunk into its copy-up's (N10).
     CopyUp(u32),
@@ -415,12 +429,13 @@ struct MdsAsk {
     again: Option<u64>,
 }
 
-/// A replica asked out.
+/// A replica asked out, of its set at `version` as the view had it.
 struct DownAsk {
     id: u64,
     bytes: Vec<u8>,
     sent: u64,
     again: Option<u64>,
+    version: u32,
     /// Asked out as refusing this attach, not as silent.
     refused: bool,
     /// Its refusal said in the log already.
@@ -480,7 +495,11 @@ pub struct Session {
     /// Pieces waiting for the map read again.
     parked: Vec<u64>,
     fenced: BTreeSet<u32>,
-    held: BTreeMap<u32, Option<Vec<(u32, u32, u64)>>>,
+    /// The start's reconcile: whether each cs has told every chunk of the
+    /// volume it holds open -- a page at a time -- and those told, each by
+    /// number and incarnation.
+    held: BTreeMap<u32, bool>,
+    held_chunks: BTreeSet<(u32, u32)>,
     /// The cs's written to since the last flush began.
     dirty: BTreeSet<u32>,
     /// Places written and not closed: when last written, and whether a
@@ -488,11 +507,20 @@ pub struct Session {
     open: BTreeMap<u32, (u64, bool)>,
     /// Closes out for places idle: place -> cs's not answered.
     closing: BTreeMap<u32, BTreeSet<u32>>,
+    /// Places written again while their close was out: each write to one
+    /// goes to every replica directly, behind that close on the way, and the
+    /// close is sent no more -- until the place is closed again, when every
+    /// close of before has come. Along a chain the write could pass the
+    /// close, and a close sent again could come after it: either closed the
+    /// chunk over the write, and a writer taken over before its next close
+    /// found the chunk open nowhere, its reconcile leaving the replicas apart
+    /// (found by fuzz/nbs's cluster target after the review of 2026-11).
+    direct: BTreeSet<u32>,
     /// Places the reconcile mends whether or not a replica holds their
     /// chunk open: those of the writes out when the session attached anew
     /// (N13c).
     mend_too: BTreeSet<u32>,
-    mend: VecDeque<u32>,
+    mend: BTreeSet<u32>,
     mending: Option<Mend>,
     scratch: Vec<u8>,
     /// The operation `stop` was asked by, once it is.
@@ -506,6 +534,21 @@ pub struct Session {
     pausing: Option<Pause>,
     /// Whether a request found no memory, since one last went: said once.
     starved: bool,
+    /// Requests to send once the session serves again, or its map is read
+    /// again: each with a stamp made then (`resend_later`, `reattach`).
+    after_map: Vec<(u32, What)>,
+    /// The attach under way is the session's own anew (`reattach`): it may
+    /// take the volume from nobody, and is asked for as long as it takes;
+    /// and when it was last said that it is.
+    reattaching: bool,
+    said_attach: u64,
+    /// When the writer last told its host's mds it is there (`Ask::Here`).
+    here_at: u64,
+    /// The volume's first attach for writing, made empty and no clone: all
+    /// of it reads as zeros (`fresh`).
+    fresh: bool,
+    /// The reconcile's pieces done, counted (`progress`).
+    mended: u64,
     /// The fuzzer's (#97): a write's request made until then finds no
     /// memory.
     #[cfg(feature = "starve")]
@@ -523,10 +566,13 @@ impl Session {
             index: 0, map: Map::default(), reading: None, next_id: 1, mds: None, downs: BTreeMap::new(),
             subs: BTreeMap::new(), pieces: BTreeMap::new(), next_piece: 1, ops: BTreeMap::new(), next_op: 1,
             queue: VecDeque::new(), parked: Vec::new(), fenced: BTreeSet::new(), held: BTreeMap::new(),
-            dirty: BTreeSet::new(), open: BTreeMap::new(), closing: BTreeMap::new(), mend_too: BTreeSet::new(),
-            mend: VecDeque::new(),
+            held_chunks: BTreeSet::new(),
+            dirty: BTreeSet::new(), open: BTreeMap::new(), closing: BTreeMap::new(), direct: BTreeSet::new(),
+            mend_too: BTreeSet::new(),
+            mend: BTreeSet::new(),
             mending: None, scratch: Vec::new(), stop: None, stop_flush: None, reads: BTreeMap::new(),
-            copies: BTreeMap::new(), pausing: None, starved: false,
+            copies: BTreeMap::new(), pausing: None, starved: false, after_map: Vec::new(), reattaching: false,
+            said_attach: 0, here_at: 0, fresh: false, mended: 0,
             #[cfg(feature = "starve")]
             starve_until: 0,
         }
@@ -588,9 +634,32 @@ impl Session {
         self.generation
     }
 
+    /// Whether this is the volume's first attach for writing, the volume
+    /// made empty and no clone: every byte of it reads as zeros, which a
+    /// pour onto it leaves out. A generation of 1 said so before the
+    /// cluster's generations were counted together; a clone's first
+    /// attach -- its origin's data under it -- never is (the review of
+    /// 2026-11: a pour onto a clone left the image's zeros out, the
+    /// origin's bytes showing through).
+    pub fn fresh(&self) -> bool {
+        self.fresh
+    }
+
     /// The host cs `cs` is on.
     pub fn host_of(&self, cs: u32) -> Option<&str> {
         self.map.hosts.get(&cs).map(|h| h.as_str())
+    }
+
+    /// Whether host `name` has a cs of the volume's map: one whose answers
+    /// its driver takes as a cs's.
+    pub fn knows_host(&self, name: &str) -> bool {
+        self.map.hosts.values().chain(self.reading.iter().flat_map(|r| r.hosts.values())).any(|h| h == name)
+    }
+
+    /// The start's moves: each piece of the reconcile's done counts one, so
+    /// that its driver waits for a start that goes on, however long.
+    pub fn progress(&self) -> u64 {
+        self.mended
     }
 
     /// Read pieces each cs has answered, by the cs's number.
@@ -637,29 +706,50 @@ impl Session {
 
     /// What the session waits on, for a person: its operations, requests,
     /// closes and asks out.
+    ///
+    /// Each table's first `REPORT_NAMED` entries are named, the rest counted:
+    /// a session stuck with thousands of places open said them all, past
+    /// what the kernel's heap gives at once (found by the review of 2026-11).
     pub fn report(&self) -> String {
+        fn more(s: &mut String, n: usize) {
+            if n > REPORT_NAMED {
+                *s += &alloc::format!(" ... and {} more", n - REPORT_NAMED);
+            }
+        }
         let mut s = alloc::format!("{:?}, generation {}: {} operations", self.phase, self.generation, self.ops.len());
-        for (id, o) in &self.ops {
+        for (id, o) in self.ops.iter().take(REPORT_NAMED) {
             s += &alloc::format!(" [#{} {:?} {}+{} pieces {} waiting {:?} out {}]", id, o.kind, o.offset, o.len,
                                  o.pieces, o.waiting, o.out);
         }
-        s += &alloc::format!("; pieces {:?}; queue {:?}; parked {:?}; requests",
-                             self.pieces.iter().map(|(id, p)| (*id, p.op, p.place)).collect::<Vec<_>>(), self.queue,
-                             self.parked);
-        for (id, sub) in &self.subs {
+        more(&mut s, self.ops.len());
+        s += &alloc::format!("; pieces {:?}", self.pieces.iter().take(REPORT_NAMED).map(|(id, p)| (*id, p.op, p.place))
+            .collect::<Vec<_>>());
+        more(&mut s, self.pieces.len());
+        s += &alloc::format!("; queue {:?}", self.queue.iter().take(REPORT_NAMED).collect::<Vec<_>>());
+        more(&mut s, self.queue.len());
+        s += &alloc::format!("; parked {:?}", self.parked.iter().take(REPORT_NAMED).collect::<Vec<_>>());
+        more(&mut s, self.parked.len());
+        s += "; requests";
+        for (id, sub) in self.subs.iter().take(REPORT_NAMED) {
             s += &alloc::format!(" [#{} cs {} {:?}]", id, sub.cs, sub.what);
         }
-        s += &alloc::format!("; open {:?}; closing {:?}; asked out {:?}; stop {:?}/{:?}; mds {:?}", self.open,
-                             self.closing, self.downs.keys().collect::<Vec<_>>(), self.stop, self.stop_flush,
-                             self.mds.as_ref().map(|m| m.want));
+        more(&mut s, self.subs.len());
+        s += &alloc::format!("; open {:?}", self.open.iter().take(REPORT_NAMED).collect::<Vec<_>>());
+        more(&mut s, self.open.len());
+        s += &alloc::format!("; closing {:?}", self.closing.iter().take(REPORT_NAMED).collect::<Vec<_>>());
+        more(&mut s, self.closing.len());
+        s += &alloc::format!("; asked out {:?}", self.downs.keys().take(REPORT_NAMED).collect::<Vec<_>>());
+        more(&mut s, self.downs.len());
+        s += &alloc::format!("; stop {:?}/{:?}; mds {:?}", self.stop, self.stop_flush, self.mds.as_ref().map(|m| m.want));
         if let Some(p) = &self.pausing {
             s += &alloc::format!("; paused for snapshot {} ({:?}) since {}", p.pause, p.stage, p.since);
         }
-        for (place, c) in &self.copies {
-            s += &alloc::format!("; copy-up of place {}: to {:?}, members {:?}, held {:?}, asking {:?}{}", place,
-                                 c.to, c.waiting, c.held, c.ask.as_ref().map(|a| if a.done { "done" } else { "up" }),
+        for (place, c) in self.copies.iter().take(REPORT_NAMED) {
+            s += &alloc::format!("; copy-up of place {}: to {:?}, members {:?}, held {} pieces, asking {:?}{}", place,
+                                 c.to, c.waiting, c.held.len(), c.ask.as_ref().map(|a| if a.done { "done" } else { "up" }),
                                  if c.after_map { ", after the map" } else { "" });
         }
+        more(&mut s, self.copies.len());
         s
     }
 
@@ -721,8 +811,16 @@ impl Session {
                 self.index = self.index.max(index);
                 self.taken_out(key.0, key.1, version, now, bufs, out);
             }
+            /* Asked again in a moment -- while there is still a reason to:
+               the replica answered since, nothing waits for it, and the ask
+               is let go of. Kept for the session's life, it was asked every
+               200 ms, a look of the leader's at the replica every 2 s, and
+               the first look a moment late took a replica out that nothing
+               waited for (found by the review of 2026-11) */
             Said::NotNow(_) | Said::Behind { .. } => {
-                if let Some(d) = self.downs.get_mut(&key) {
+                if !refused && !self.waits_for(key.0, key.1, now) {
+                    self.downs.remove(&key);
+                } else if let Some(d) = self.downs.get_mut(&key) {
                     d.again = Some(now + AGAIN_NS);
                 }
             }
@@ -775,8 +873,11 @@ impl Session {
                     m.again = Some(now + AGAIN_NS);
                 }
             }
-            (MdsWant::Attach, Said::Attached { generation, index }) => {
+            (MdsWant::Attach, Said::Attached { generation, index, first }) => {
                 self.mds = None;
+                if !self.reattaching {
+                    self.fresh = first;
+                }
                 self.generation = generation;
                 self.index = index;
                 self.phase = Phase::Mapping;
@@ -882,14 +983,18 @@ impl Session {
                 for pid in parked {
                     self.send_piece(pid, now, bufs, out);
                 }
+                self.send_after_map(now, bufs, out);
                 /* An ask to take a cs out of a set the view no longer writes it
                    in dropped: asked again, it would be refused for as long as
                    the session lives. What waits for that cs is settled as it
                    comes due: a request to a cs no set writes done as silent
                    (`ask_out`), a close it is not in the chunk's set for done
-                   as refused so */
+                   as refused so. One of a set at another version now dropped
+                   too: the metadata refuses it as stale, and a replica still
+                   silent is asked out again, of the set as it is */
                 let map = &self.map;
-                self.downs.retain(|&(set, cs), _| map.sets.get(&set).is_some_and(|s| s.written_to(cs)));
+                self.downs.retain(|&(set, cs), d| map.sets.get(&set).is_some_and(|s| s.written_to(cs)
+                                                                                  && s.version == d.version));
                 /* Copy-ups that waited for the map: asked again from their
                    start -- or, their chunk shared no longer as the map says
                    now, over */
@@ -941,7 +1046,7 @@ impl Session {
     /// is not in the map, or gone.
     fn stamp(&self, what: What) -> Option<Stamp> {
         let (chunk, to) = match what {
-            What::Fence | What::Held | What::Flush(_) => (None, None),
+            What::Fence | What::Held(_) | What::Flush(_) => (None, None),
             What::Close(place) => (Some(self.map.chunk(place)?), None),
             What::CopyUp(place) => {
                 let from = self.map.chunk(place)?;
@@ -961,8 +1066,8 @@ impl Session {
         let (volume, generation, index) = (self.map.volume, stamp.generation, stamp.index);
         let named = |c: Option<ChunkRef>| c.ok_or(Unmade::Gone);
         let op = match what {
-            What::Fence => Op::Fence,
-            What::Held => Op::Held,
+            What::Fence => Op::Fence { index },
+            What::Held(from) => Op::Held { from },
             What::Flush(_) => Op::Flush,
             What::Close(place) => Op::Close { chunk: named(stamp.chunk)?, position: place, index },
             What::CopyUp(place) => Op::CopyUp { from: named(stamp.chunk)?, to: named(stamp.to)?, position: place, index },
@@ -1153,7 +1258,11 @@ impl Session {
     /// pieces go to each replica directly then, a chain's hops one after
     /// another being all its time at depth 1 (N13c).
     fn alone(&self, pid: u64) -> bool {
-        let Some(op) = self.pieces.get(&pid).map(|p| p.op) else { return false };
+        let Some((op, place)) = self.pieces.get(&pid).map(|p| (p.op, p.place)) else { return false };
+        /* Behind a close of before (`direct`) */
+        if self.direct.contains(&place) {
+            return true;
+        }
         !self.pieces.values().any(|q| {
             q.op != op && q.left && self.ops.get(&q.op).is_some_and(|o| o.kind == Kind::Write)
         })
@@ -1314,9 +1423,17 @@ impl Session {
                 self.fenced.insert(cs);
                 self.fences_done(now, bufs, out);
             }
-            (What::Held, Reply::Held(list)) => {
-                self.held.insert(cs, Some(list));
-                self.helds_done(now, bufs, out);
+            (What::Held(_), Reply::Held(list)) => {
+                self.held_chunks.extend(list.iter().map(|&(c, i, _)| (c, i)));
+                match list.last() {
+                    Some(&(last, ..)) if list.len() >= nbswire::PAGE && last < u32::MAX => {
+                        self.send(cs, What::Held(last + 1), now, bufs, out);
+                    }
+                    _ => {
+                        self.held.insert(cs, true);
+                        self.helds_done(now, bufs, out);
+                    }
+                }
             }
             (What::Flush(op), Reply::Done) => {
                 if let Some(o) = self.ops.get_mut(&op) {
@@ -1396,10 +1513,14 @@ impl Session {
                     s.again = Some(now + AGAIN_NS);
                 }
             }
-            /* A member with no slot free yet for a copy-up's chunk, which the
-               metadata counted room for: its slots of chunks gone are given
-               back as it looks for them (N10) */
-            Refusal::NoRoom if matches!(what, What::CopyUp(_)) => {
+            /* A member with no slot free yet for a chunk the metadata counted
+               room for -- a copy-up's, or a write's first of its chunk: its
+               slots of chunks gone are given back as it looks for them (N10).
+               A write's failed at once before, its piece on the replicas
+               that took it, though the room was only not given back yet
+               (found by the review of 2026-11); asked again, its deadline
+               holds -- and attaches anew where its replicas are apart */
+            Refusal::NoRoom if matches!(what, What::CopyUp(_) | What::Piece(_)) => {
                 if let Some(s) = self.subs.get_mut(&id) {
                     s.again = Some(now + RESEND_NS);
                 }
@@ -1412,7 +1533,8 @@ impl Session {
                 }
                 self.ask_out(cs, what, true, now, bufs, out);
             }
-            /* A joiner's (N9), never a client's: as a request the cs found bad */
+            /* A joiner's (N9), or a cs's of no room for what is no write: as a
+               request the cs found bad */
             Refusal::NoRoom | Refusal::Bad | Refusal::TooManyFences | Refusal::NotHeld | Refusal::NotTheJoiner => {
                 self.subs.remove(&id);
                 out.push(Out::Say(alloc::format!("nbs: cs {} refused a request of volume {}: {}", cs, self.name,
@@ -1426,11 +1548,23 @@ impl Session {
         }
     }
 
-    /// `what` sent to `cs` again once the map is read again.
-    fn resend_later(&mut self, cs: u32, what: What, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
-        self.send(cs, what, now, bufs, out);
-        if let Some((_, s)) = self.subs.iter_mut().rev().find(|(_, s)| s.cs == cs && s.what == what) {
-            s.again = Some(now + AGAIN_NS);
+    /// `what` sent to `cs` again once the map is read again, made by it
+    /// then. Sent at once, by the view it was refused by, it was refused
+    /// again as fast as the cs answered until the map came (found by the
+    /// review of 2026-11).
+    fn resend_later(&mut self, cs: u32, what: What, _now: u64, _bufs: &mut dyn Buffers, _out: &mut Vec<Out>) {
+        if !self.after_map.contains(&(cs, what)) {
+            self.after_map.push((cs, what));
+        }
+    }
+
+    /// The requests that waited for the map, or for the session to serve
+    /// again, sent: each by the view there is now.
+    fn send_after_map(&mut self, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
+        for (cs, what) in core::mem::take(&mut self.after_map) {
+            if !self.subs.values().any(|s| s.cs == cs && s.what == what) {
+                self.send(cs, what, now, bufs, out);
+            }
         }
     }
 
@@ -1494,18 +1628,41 @@ impl Session {
                 }
             }
         }
+        /* A read-only session asks nobody out: a replica is taken out only by
+           the volume's writer of now, and the metadata refuses one of no
+           generation as not the writer -- which failed the session as
+           fenced, its reads with it, at the first replica 0.5 s late (found
+           by the review of 2026-11). Its reads go to another replica */
+        if !self.writable {
+            return;
+        }
         for set in sets {
             /* Asked already -- but one asked as silent is asked again as
                refusing, which the leader need not look at */
             if self.downs.get(&(set, cs)).is_some_and(|d| d.refused || !refused) {
                 continue;
             }
+            let version = self.map.sets.get(&set).map_or(0, |s| s.version);
             let id = self.take_id();
-            let ask = Ask::Down { set, cs, refused, name: self.name.clone(), generation: self.generation };
+            let ask = Ask::Down { set, cs, refused, name: self.name.clone(), generation: self.generation, version };
             let bytes = Asking { id, ask }.encode();
             out.push(Out::Send { to: To::Mds, id, bytes: bytes.clone() });
-            self.downs.insert((set, cs), DownAsk { id, bytes, sent: now, again: None, refused, said: false });
+            self.downs.insert((set, cs), DownAsk { id, bytes, sent: now, again: None, version, refused, said: false });
         }
+    }
+
+    /// Whether a request to cs `cs` of set `set` -- or one of every set the
+    /// cs is written in, a fence, a flush, the open chunks asked -- is still
+    /// silent past `SILENT_NS`: the reason an ask of it out stands.
+    fn waits_for(&self, set: u32, cs: u32, now: u64) -> bool {
+        self.subs.values().any(|s| {
+            let of_set = match s.what {
+                What::Piece(pid) => self.pieces.get(&pid).and_then(|p| self.map.set_of(p.place)).map(|(id, _)| id),
+                What::Close(place) | What::CopyUp(place) => self.map.set_of(place).map(|(id, _)| id),
+                What::Fence | What::Flush(_) | What::Held(_) => None,
+            };
+            s.cs == cs && s.went && now >= s.first + SILENT_NS && of_set.is_none_or(|id| id == set)
+        })
     }
 
     fn drop_subs(&mut self, cs: u32, what: What) {
@@ -1614,8 +1771,8 @@ impl Session {
                 What::Fence => {
                     self.fences_done(now, bufs, out);
                 }
-                What::Held => {
-                    self.held.insert(cs, Some(Vec::new()));
+                What::Held(_) => {
+                    self.held.insert(cs, true);
                     self.helds_done(now, bufs, out);
                 }
                 What::Flush(op) => {
@@ -1805,11 +1962,12 @@ impl Session {
             return;
         }
         self.phase = Phase::Reconciling;
+        self.held_chunks.clear();
         for &cs in &need {
-            self.held.insert(cs, None);
+            self.held.insert(cs, false);
         }
         for cs in need {
-            self.send(cs, What::Held, now, bufs, out);
+            self.send(cs, What::Held(0), now, bufs, out);
         }
         self.helds_done(now, bufs, out);
     }
@@ -1820,19 +1978,22 @@ impl Session {
         if self.phase != Phase::Reconciling || self.mending.is_some() || !self.mend.is_empty() {
             return;
         }
-        if self.held.values().any(|h| h.is_none()) {
+        if self.held.values().any(|&told| !told) {
             return;
         }
+        /* Every chunk told open looked up by one walk of the map, not a walk
+           of it for each */
         let mut places = core::mem::take(&mut self.mend_too);
-        for list in self.held.values().flatten() {
-            for &(chunk, incarnation, _) in list {
-                if let Some(p) = self.map.places.iter().position(|&(c, i, _)| c == chunk && i == incarnation) {
+        let held = core::mem::take(&mut self.held_chunks);
+        if !held.is_empty() {
+            for (p, &(c, i, _)) in self.map.places.iter().enumerate() {
+                if held.contains(&(c, i)) {
                     places.insert(p as u32);
                 }
             }
         }
         self.held.clear();
-        self.mend = places.into_iter().collect();
+        self.mend = places;
         if self.mend.is_empty() {
             self.serve(now, bufs, out);
             return;
@@ -1852,7 +2013,7 @@ impl Session {
         let pieces = (SLOT / u64::from(DATA_MAX)) as u32;
         loop {
             let Some(m) = self.mending.as_mut() else {
-                let Some(place) = self.mend.pop_front() else {
+                let Some(place) = self.mend.pop_first() else {
                     self.scratch = Vec::new();
                     self.serve(now, bufs, out);
                     return;
@@ -1897,6 +2058,7 @@ impl Session {
             self.fail("a chunk left open could not be made the same on its replicas", out);
             return;
         }
+        self.mended += 1;
         if let Some(m) = self.mending.as_mut() {
             m.op = None;
             if m.writing {
@@ -1916,6 +2078,14 @@ impl Session {
             return;
         }
         self.phase = Phase::Serving;
+        self.reattaching = false;
+        /* What was out as the session attached anew, sent again by the view
+           it serves by */
+        let parked = core::mem::take(&mut self.parked);
+        for pid in parked {
+            self.send_piece(pid, now, bufs, out);
+        }
+        self.send_after_map(now, bufs, out);
         self.pump(now, bufs, out);
         if let Some(tag) = self.stop.take() {
             self.stop(tag, now, bufs, out);
@@ -1973,11 +2143,26 @@ impl Session {
                 self.queue.remove(k);
                 continue;
             };
+            /* Past its deadline before its turn came: failed, unsent -- sent,
+               it was failed a moment on, a write of it attaching anew, its
+               replicas apart for nothing (found by the review of 2026-11) */
+            if o.tag & INTERNAL == 0 && now >= o.started + DEADLINE_NS {
+                self.queue.remove(k);
+                self.late_unsent(id, now, bufs, out);
+                continue;
+            }
             /* Serving, or stopping: what was asked before the stop is done
                before it -- and nothing of the driver's while paused for a
                snapshot (N10c2) */
             let serving = (matches!(self.phase, Phase::Serving | Phase::Stopping) && self.pausing.is_none())
                 || o.tag & INTERNAL != 0;
+            /* A flush of the driver's too, as a read and a write: flushed
+               while an attach anew's reconcile mended, it took the cs's that
+               the reconcile had written, and was done with writes done before
+               it, on others, not yet durable (found by the review of
+               2026-11). One of a stop's, or the session's own, while paused:
+               it changes nothing a snapshot holds */
+            let flush_ready = serving || self.pausing.is_some() || Some(id) == self.stop_flush;
             let ready = match o.kind {
                 Kind::Read => serving,
                 Kind::Write => {
@@ -1985,7 +2170,9 @@ impl Session {
                         && !self.ops.iter().any(|(&other, x)| other < id && x.kind == Kind::Write
                             && overlaps(x.offset, x.len, o.offset, o.len))
                 }
-                Kind::Flush | Kind::Close => !self.ops.iter().any(|(&other, x)| other < id && x.kind == Kind::Write),
+                Kind::Flush | Kind::Close => {
+                    flush_ready && !self.ops.iter().any(|(&other, x)| other < id && x.kind == Kind::Write)
+                }
             };
             if !ready {
                 k += 1;
@@ -2017,8 +2204,20 @@ impl Session {
             self.flush_progress(id, now, bufs, out);
             return;
         }
-        if offset.checked_add(u64::from(len)).is_none_or(|e| e > self.map.size) {
+        /* Inside the volume -- or, the reconcile's own, inside its last
+           chunk: a chunk is whole on its replicas whatever the volume's size,
+           and the reconcile copies it whole. Bounded by the volume's size, a
+           volume not whole chunks stopped its every start at its last
+           chunk's mend: the piece past the end failed told to nobody, and
+           nothing ever went on (found by the review of 2026-11) */
+        let end = if self.ops.get(&id).is_some_and(|o| o.tag & INTERNAL != 0) {
+            self.map.places.len() as u64 * SLOT
+        } else {
+            self.map.size
+        };
+        if offset.checked_add(u64::from(len)).is_none_or(|e| e > end) {
             self.op_done(id, false, out);
+            self.after_op(id, false, now, bufs, out);
             return;
         }
         let mut at = offset;
@@ -2043,7 +2242,11 @@ impl Session {
         for (pid, place) in made {
             if kind == Kind::Write {
                 self.open.insert(place, (now, false));
-                reopened |= self.closing.remove(&place).is_some();
+                if self.closing.remove(&place).is_some() {
+                    reopened = true;
+                    self.subs.retain(|_, s| s.what != What::Close(place));
+                    self.direct.insert(place);
+                }
             }
             self.send_piece(pid, now, bufs, out);
         }
@@ -2160,6 +2363,42 @@ impl Session {
         self.flush_progress(op, now, bufs, out);
     }
 
+    /// Operation `id` past its deadline before it went: failed, said, and
+    /// nothing of it sent -- a flush failed as one out is, what it would
+    /// have asked dirty still.
+    fn late_unsent(&mut self, id: u64, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
+        let Some(kind) = self.ops.get(&id).map(|o| o.kind) else { return };
+        out.push(Out::Say(alloc::format!("nbs: volume {}: an operation not begun in {} s -- failed", self.name,
+                                         DEADLINE_NS / 1_000_000_000)));
+        if kind.flushes() {
+            if let Some(o) = self.ops.get_mut(&id) {
+                o.out = true;
+                o.ok = false;
+            }
+            self.flush_failed(id, now, bufs, out);
+            return;
+        }
+        self.op_done(id, false, out);
+        self.after_op(id, false, now, bufs, out);
+    }
+
+    /// Pieces `gone` held for copy-ups no longer: a copy-up that holds none
+    /// given up -- its ask let go of, the metadata's pending one given up by
+    /// the volume's next attach or taken up by its next write there. Kept, it
+    /// was asked for every 200 ms for the session's life once the write held
+    /// for it had failed (found by the review of 2026-11).
+    fn forget_held(&mut self, gone: &[u64]) {
+        if gone.is_empty() {
+            return;
+        }
+        for c in self.copies.values_mut() {
+            c.held.retain(|pid| !gone.contains(pid));
+        }
+        self.copies.retain(|_, c| !c.held.is_empty());
+        let places: BTreeSet<u32> = self.copies.keys().copied().collect();
+        self.subs.retain(|_, s| !matches!(s.what, What::CopyUp(p) if !places.contains(&p)));
+    }
+
     /// Operation `id` done: its driver told, unless it is the session's own.
     fn op_done(&mut self, id: u64, ok: bool, out: &mut Vec<Out>) {
         let Some(o) = self.ops.remove(&id) else { return };
@@ -2186,7 +2425,10 @@ impl Session {
     fn closed(&mut self, place: u32, cs: u32, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
         if let Some(m) = self.mending.as_mut() {
             if m.place == place && m.closing.remove(&cs) && m.closing.is_empty() {
+                /* Closed: no longer open for the session -- its own writes
+                   put it there, and it was closed again later, for nothing */
                 self.mending = None;
+                self.open.remove(&place);
                 self.next_mend(now, bufs, out);
                 return;
             }
@@ -2196,6 +2438,7 @@ impl Session {
             if w.is_empty() {
                 self.closing.remove(&place);
                 self.open.remove(&place);
+                self.direct.remove(&place);
             }
         }
         self.closes_progress(now, bufs, out);
@@ -2338,7 +2581,13 @@ impl Session {
         self.piece_ids.clear();
         self.open.clear();
         self.closing.clear();
-        self.dirty.clear();
+        /* Closes of before refused from the fence on */
+        self.direct.clear();
+        /* What is dirty kept: a write done before, not flushed, is on its
+           replicas' caches still, and the next flush asks them (the review of
+           2026-11) */
+        self.subs.clear();
+        self.after_map.clear();
         self.mend_too = apart;
         self.reattach(now, out);
     }
@@ -2361,13 +2610,34 @@ impl Session {
     fn reattach(&mut self, now: u64, out: &mut Vec<Out>) {
         self.pausing = None;
         self.reading = None;
-        self.subs.clear();
+        /* What is out goes again once the session serves, made by its new
+           view and generation: a read, a flush, a close. Its requests let go
+           of, it was left waiting to its deadline, the session serving (found
+           by the review of 2026-11) */
+        let subs = core::mem::take(&mut self.subs);
+        for s in subs.values() {
+            match s.what {
+                What::Piece(pid) => {
+                    if self.pieces.contains_key(&pid) && !self.parked.contains(&pid) {
+                        self.parked.push(pid);
+                    }
+                }
+                What::Flush(_) | What::Close(_) => {
+                    if !self.after_map.contains(&(s.cs, s.what)) {
+                        self.after_map.push((s.cs, s.what));
+                    }
+                }
+                What::Fence | What::Held(_) | What::CopyUp(_) => {}
+            }
+        }
         self.downs.clear();
         self.copies.clear();
         self.fenced.clear();
         self.held.clear();
         self.phase = Phase::Attaching;
         self.attach_from = now;
+        self.said_attach = now;
+        self.reattaching = true;
         self.token = self.token.wrapping_add(1).max(1);
         let ask = Ask::Reattach { name: self.name.clone(), generation: self.generation, token: self.token };
         self.ask_mds(MdsWant::Attach, ask, now, out);
@@ -2440,7 +2710,7 @@ impl Session {
 
     fn detach(&mut self, now: u64, out: &mut Vec<Out>) {
         let generation = if self.writable { self.generation } else { 0 };
-        let ask = Ask::Detach { name: self.name.clone(), generation };
+        let ask = Ask::Detach { name: self.name.clone(), generation, token: self.token };
         self.ask_mds(MdsWant::Detach, ask, now, out);
     }
 
@@ -2476,9 +2746,30 @@ impl Session {
         if matches!(self.phase, Phase::Failed(_) | Phase::Detached) {
             return;
         }
+        /* The first attach is given up past ATTACH_NS, so that an attach of
+           its arriving late never takes the volume from a writer since; one
+           anew takes it from nobody -- the metadata refuses it where the
+           writer is no longer this one -- and is asked for as long as it
+           takes, said every ATTACH_NS: given up, a pause or a write's
+           deadline that met a moment of no leader failed the guest's disk
+           for good, its data path whole (found by the review of 2026-11) */
         if self.phase == Phase::Attaching && now >= self.attach_from + ATTACH_NS {
-            self.fail("the volume's attach not answered in time", out);
-            return;
+            if !self.reattaching {
+                self.fail("the volume's attach not answered in time", out);
+                return;
+            }
+            if now >= self.said_attach + ATTACH_NS {
+                self.said_attach = now;
+                out.push(Out::Say(alloc::format!("nbs: volume {}: its attach anew not answered in {} s -- asked on",
+                                                 self.name, (now - self.attach_from) / 1_000_000_000)));
+            }
+        }
+        /* A writer serving tells its host's mds it is there, every HERE_NS */
+        if self.writable && self.phase == Phase::Serving && now >= self.here_at + HERE_NS {
+            self.here_at = now;
+            let id = self.take_id();
+            let bytes = Asking { id, ask: Ask::Here { name: self.name.clone(), generation: self.generation } }.encode();
+            out.push(Out::Send { to: To::Mds, id, bytes });
         }
         if let Some(m) = self.mds.as_mut() {
             let due = m.again.map_or(now >= m.sent + RESEND_NS, |a| now >= a);
@@ -2487,6 +2778,13 @@ impl Session {
                 m.again = None;
                 out.push(Out::Send { to: To::Mds, id: m.id, bytes: m.bytes.clone() });
             }
+        }
+        /* An ask out no longer asked where nothing waits for its replica */
+        let gone: Vec<(u32, u32)> = self.downs.iter()
+            .filter(|(&(set, cs), d)| !d.refused && d.again.is_some_and(|a| now >= a) && !self.waits_for(set, cs, now))
+            .map(|(&k, _)| k).collect();
+        for k in gone {
+            self.downs.remove(&k);
         }
         for d in self.downs.values_mut() {
             let due = d.again.map_or(now >= d.sent + RESEND_NS, |a| now >= a);
@@ -2529,6 +2827,14 @@ impl Session {
         for (cs, what) in silent {
             self.silent(cs, what, now, bufs, out);
         }
+        /* Waiting its turn past its deadline: failed, unsent */
+        let waiting: Vec<u64> = self.ops.iter().filter(|(_, o)| !o.out && o.tag & INTERNAL == 0
+                                                                && now >= o.started + DEADLINE_NS)
+            .map(|(&id, _)| id).collect();
+        for id in waiting {
+            self.queue.retain(|&q| q != id);
+            self.late_unsent(id, now, bufs, out);
+        }
         let late: Vec<u64> = self.ops.iter().filter(|(_, o)| o.out && now >= o.started + DEADLINE_NS)
             .map(|(&id, _)| id).collect();
         for id in late {
@@ -2559,11 +2865,13 @@ impl Session {
                 return;
             }
             let pieces: Vec<u64> = self.pieces.iter().filter(|(_, p)| p.op == id).map(|(&k, _)| k).collect();
-            for pid in pieces {
+            for &pid in &pieces {
                 self.pieces.remove(&pid);
                 self.subs.retain(|_, s| s.what != What::Piece(pid));
                 self.piece_ids.retain(|&(x, _), _| x != pid);
+                self.parked.retain(|&x| x != pid);
             }
+            self.forget_held(&pieces);
             self.subs.retain(|_, s| s.what != What::Flush(id));
             self.op_done(id, false, out);
             self.after_op(id, false, now, bufs, out);

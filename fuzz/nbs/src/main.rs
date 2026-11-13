@@ -5,14 +5,16 @@
 //! everything the gate holds: the meta target over seeds 1 to 1000, the cs
 //! target over 1 to 200, the inflight target over 1 to 600, the wire target
 //! over 1 to 100, the scrub target over 1 to 300, the cluster target over 1
-//! to 1000 and the join target over 1 to 800 -- the races of
+//! to 1000, the join target over 1 to 800 and the tail target -- the
+//! cluster target's over a volume no whole number of chunks -- over 1 to
+//! 200: the races of
 //! some of their mutants come once in a few hundred runs -- every allocation
 //! held to what the kernel's heap
 //! gives at once (fuzz/raft's `heap`). Exit 0 when everything held, 1 with
 //! what did not -- a finding with its seed, to run again with
 //! `<target> --seed N --trace`.
 //!
-//!     nbs-fuzz meta|cs|inflight|wire|scrub|cluster|join [--seed N] [--seeds K] [--steps S] [--seconds T] [--trace]
+//!     nbs-fuzz meta|cs|inflight|wire|scrub|cluster|join|tail [--seed N] [--seeds K] [--steps S] [--seconds T] [--trace]
 //!
 //! one target; with `--seconds`, seeds on from the first until the time is
 //! up -- a campaign.
@@ -65,11 +67,28 @@ const CLUSTER_STEPS: u64 = 2000;
 /// copy-up a stuck join held back (7225); and a write out by a view of its
 /// set that a map read finds changed sent again by the new view
 /// (`client_resend_changed`), its race moved past the range by the lone
-/// writes' course (2758, 4206: a write done that a replica lacks). A
+/// writes' course (2758, 4206: a write done that a replica lacks). And
+/// those the review of 2026-11's fixes moved on, found again by a campaign
+/// of each mutant: a write of a chain applied before a join of its set
+/// began written again as it comes again (`relayed_joins`, 5375); the
+/// copy-up ended only once every member active in the view has copied
+/// (`client_copy_every_active`, 2962), one asked by a view behind its set
+/// asked again from its start (`client_copy_stale_view`, 9122) and one a
+/// member refuses as of another epoch or map asked again
+/// (`client_copy_refused_again`, 8918); a writer's start reconciling the
+/// open chunks past a cs's first page of three (`client_held_pages`, 4710);
+/// and a write to a place whose close is out sent to each replica
+/// directly, the close sent no more (`client_reopened_direct`, 10774: a
+/// close sent again came after the write and closed the chunk over it, the
+/// writer taken over before its next close, its replicas left apart). A
 /// stopgap: a race moved on by the next change is lost again, which the
 /// mutants say.
-const GATE_CLUSTER_ALSO: [u64; 13] = [1232, 2759, 5241, 6647, 7786, 1219, 1960, 2149, 3663, 5316, 7225, 2758, 4206];
+const GATE_CLUSTER_ALSO: [u64; 19] = [1232, 2759, 5241, 6647, 7786, 1219, 1960, 2149, 3663, 5316, 7225, 2758, 4206,
+                                      5375, 2962, 9122, 8918, 4710, 10774];
 const GATE_JOIN_SEEDS: u64 = 800;
+/// The `tail` target's: the cluster target's over a volume no whole number of
+/// chunks (the review of 2026-11).
+const GATE_TAIL_SEEDS: u64 = 200;
 const JOIN_STEPS: u64 = 3000;
 const GATE_INFLIGHT_SEEDS: u64 = 600;
 const INFLIGHT_STEPS: u64 = 400;
@@ -140,7 +159,7 @@ fn main() -> ExitCode {
             /* `--first`: stopped at the first target that fails -- the
                gate's verdict, sooner (mutants.py's) */
             let first = args.iter().any(|a| a == "--first");
-            let targets: [(&str, fn(u64, u64, bool) -> Result<(), String>, u64, u64); 7] = [
+            let targets: [(&str, fn(u64, u64, bool) -> Result<(), String>, u64, u64); 8] = [
                 ("meta", meta::run, GATE_META_SEEDS, META_STEPS),
                 ("cs", cs::run, GATE_CS_SEEDS, CS_STEPS),
                 ("inflight", inflight::run, GATE_INFLIGHT_SEEDS, INFLIGHT_STEPS),
@@ -148,6 +167,7 @@ fn main() -> ExitCode {
                 ("scrub", scrub::run, GATE_SCRUB_SEEDS, SCRUB_STEPS),
                 ("cluster", cluster::run, GATE_CLUSTER_SEEDS, CLUSTER_STEPS),
                 ("join", join::run, GATE_JOIN_SEEDS, JOIN_STEPS),
+                ("tail", cluster::run_tail, GATE_TAIL_SEEDS, CLUSTER_STEPS),
             ];
             let mut failed = 0;
             for (name, run, seeds, steps) in targets {
@@ -173,8 +193,9 @@ fn main() -> ExitCode {
         Some("scrub") => one("scrub", scrub::run, SCRUB_STEPS),
         Some("cluster") => one("cluster", cluster::run, CLUSTER_STEPS),
         Some("join") => one("join", join::run, JOIN_STEPS),
+        Some("tail") => one("tail", cluster::run_tail, CLUSTER_STEPS),
         Some(other) => {
-            eprintln!("nbs-fuzz: no target {} -- gate, meta, cs, inflight, wire, scrub, cluster, join", other);
+            eprintln!("nbs-fuzz: no target {} -- gate, meta, cs, inflight, wire, scrub, cluster, join, tail", other);
             return ExitCode::from(2);
         }
     };

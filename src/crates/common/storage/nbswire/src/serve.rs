@@ -17,9 +17,9 @@ use core::cell::{Cell, RefCell};
 use core::future::{poll_fn, ready, Future};
 use core::task::Poll;
 
-use nbscs::{ChunkRef, Device, Error, SlotState, Store};
+use nbscs::{ChunkRef, Device, Error, Store};
 
-use crate::{Op, Question, Refusal, Relay, Reply, Request, Told, LIST_MAX};
+use crate::{Op, Question, Refusal, Relay, Reply, Request, Told, PAGE};
 
 /// How a cs asks its host's mds: a question, and what it is told -- None
 /// where there is no mds, or it said nothing in time. nbs-cs.ko's sends it
@@ -180,6 +180,20 @@ impl Requests {
         self.order.borrow().values().map(|q| q.len()).sum()
     }
 
+    /// The chunks' order as it stands: every request of a chunk that has
+    /// taken its turn so far is below it (`ended_before`).
+    fn mark(&self) -> u64 {
+        self.next.get()
+    }
+
+    /// Until every request of a chunk below `mark` has ended.
+    async fn ended_before(&self, mark: u64) {
+        poll_fn(|_| {
+            let busy = self.order.borrow().values().any(|q| q.iter().any(|&t| t < mark));
+            if busy { Poll::Pending } else { Poll::Ready(()) }
+        }).await
+    }
+
     /// Whether write `id` of volume `volume`'s writer at `generation`, come
     /// with mark `mark`, was applied here before as `now` has it -- the same
     /// chunk, no join of its set begun since -- or is below the mark,
@@ -252,33 +266,44 @@ pub struct Collected {
     pub failed: Vec<(u32, Error)>,
 }
 
-/// The chunks `store` holds that the metadata freed -- or whose number is
-/// another chunk's now -- freed, and the fences of volumes gone taken off:
-/// as the host's mds says, asked in lists of LIST_MAX, and nothing where it
-/// says nothing. nbs-cs's every 30 s, and the cluster target's cs's.
+/// The chunks `store` holds that the metadata has gone -- freed, their
+/// number another chunk's now, or of a set the cs is no replica of -- freed,
+/// and the fences of volumes gone taken off: as the host's mds says, asked
+/// a page at a time (`PAGE`) -- what a cs holds is never one list -- and
+/// nothing where it says nothing. nbs-cs's every 30 s, and the cluster
+/// target's cs's.
 ///
 /// A chunk is freed in its order among the requests (`Requests`): never
 /// between a request's look at it and what the request does -- a read the
 /// mds vouched for, its answer on its way as the metadata dropped the
 /// chunk, would read zeros where the chunk held data, as a chunk freed
-/// reads as one never written.
+/// reads as one never written. And only as it was found: one a copy or a
+/// client has written since, at a join's epoch, is kept (`Store::free`).
 pub async fn collect<D: Device, A: Asker>(store: &Store<D>, requests: &Requests, ask: &A) -> Collected {
     let mut done = Collected::default();
-    let held: Vec<(u32, u32)> = store.holdings().iter().map(|h| (h.chunk, h.incarnation)).collect();
-    for batch in held.chunks(LIST_MAX) {
-        let Some(Told::Gone(gone)) = ask.ask(Question::Live { chunks: batch.to_vec() }).await else { return done };
+    let mut from = 0u32;
+    loop {
+        let page: Vec<(u32, u32, nbscs::Epoch)> = store.holdings_from(from, PAGE).iter()
+            .map(|h| (h.chunk, h.incarnation, h.known)).collect();
+        let Some(&(last, ..)) = page.last() else { break };
+        let chunks = page.iter().map(|&(c, i, _)| (c, i)).collect();
+        let Some(Told::Gone(gone)) = ask.ask(Question::Live { chunks }).await else { return done };
         for c in gone {
-            let Some(&(_, incarnation)) = batch.iter().find(|(n, _)| *n == c) else { continue };
+            let Some(&(_, incarnation, known)) = page.iter().find(|(n, ..)| *n == c) else { continue };
             let _order = requests.in_order(c).await;
-            match store.free(c, incarnation).await {
+            match store.free(c, incarnation, known).await {
                 Ok(true) => done.freed.push((c, incarnation)),
                 Ok(false) => {}
                 Err(e) => done.failed.push((c, e)),
             }
         }
+        if page.len() < PAGE || last == u32::MAX {
+            break;
+        }
+        from = last + 1;
     }
     let volumes: Vec<u32> = store.fenced_volumes().iter().map(|&(v, _)| v).collect();
-    for batch in volumes.chunks(LIST_MAX) {
+    for batch in volumes.chunks(PAGE) {
         let Some(Told::Gone(gone)) = ask.ask(Question::Volumes { volumes: batch.to_vec() }).await else { return done };
         for v in gone {
             match store.drop_fence(v).await {
@@ -379,7 +404,18 @@ async fn serve_noting<D: Device, A: Asker>(store: &Store<D>, vouched: &Requests,
         }
     }
     match req.op {
-        Op::Fence => store.fence(v, g).await.map(|g| Done::Fenced { generation: g }).map_err(Refusal::of),
+        Op::Fence { index } => {
+            /* One no higher than the fence the cs has is the store's to answer
+               -- refused, or done already; a newer one asked of the mds */
+            if g > store.fence_of(v) {
+                match ask.ask(Question::VerifyFence { volume: v, generation: g, index }).await {
+                    Some(Told::Verified) => {}
+                    Some(Told::Refused(why)) => return Err(why),
+                    _ => return Err(Refusal::NoMds),
+                }
+            }
+            store.fence(v, g).await.map(|g| Done::Fenced { generation: g }).map_err(Refusal::of)
+        }
         Op::Write { chunk, position, index, offset, data } => {
             let check = Check::of(v, g, chunk);
             let known = vouched.knows(store, &check, &chunk);
@@ -422,19 +458,39 @@ async fn serve_noting<D: Device, A: Asker>(store: &Store<D>, vouched: &Requests,
                 done => done.map(Done::Closed).map_err(Refusal::of),
             }
         }
-        Op::Held => Ok(Done::Held(store.holdings().iter()
-            .filter(|h| h.volume == v && h.state == SlotState::Open)
-            .take(LIST_MAX).map(|h| (h.chunk, h.incarnation, h.generation)).collect())),
+        /* A page of them: the rest asked from the last on. The first 4096
+           alone were told before, and nothing said there were more: the
+           chunks past them were served as they were, their replicas apart
+           (found by the review of 2026-11) */
+        Op::Held { from } => Ok(Done::Held(store.open_of(v, from, PAGE))),
         /* The leader's look: there, and serving -- the caller's not serving
            refused it before here */
         Op::Ping => Ok(Done::Done),
         /* A joiner's asks of this cs as a source (N9) */
+        /* The set's chunks once every request of a chunk that came before
+           has ended: a client's first write of a chunk, vouched for at the
+           set's version before the join, takes the chunk in only once its
+           slot is zeros and flushed -- listed before that, the chunk was
+           never copied, and the joiner, made a member, read zeros where the
+           write was done (found by the review of 2026-11). One that comes
+           after is the mds's to vouch for at the join's epoch, which a write
+           of the epoch before is not. A cs that has lost a chunk -- a device
+           failed, a record lost -- is no source: it would leave the chunk
+           out (the same review) */
         Op::Holdings { set, from, joiner, version, index } => {
+            let mark = vouched.mark();
             joined(vouched, ask, set, joiner, version, index).await?;
-            Ok(Done::Chunks(store.holdings_in(set, from, LIST_MAX)))
+            vouched.ended_before(mark).await;
+            if !store.whole() {
+                return Err(Refusal::Failed);
+            }
+            Ok(Done::Chunks(store.holdings_in(set, from, PAGE)))
         }
         Op::Pull { chunk, joiner, index, offset, len } => {
             joined(vouched, ask, chunk.epoch.set, joiner, chunk.epoch.version, index).await?;
+            if !store.whole() {
+                return Err(Refusal::Failed);
+            }
             let mut buf = Vec::new();
             if buf.try_reserve_exact(len as usize).is_err() {
                 return Err(Refusal::NotReady);
@@ -445,6 +501,9 @@ async fn serve_noting<D: Device, A: Asker>(store: &Store<D>, vouched: &Requests,
         }
         Op::Sums { chunk, joiner, index, offset, len } => {
             joined(vouched, ask, chunk.epoch.set, joiner, chunk.epoch.version, index).await?;
+            if !store.whole() {
+                return Err(Refusal::Failed);
+            }
             store.sums(chunk, offset, len).await.map(Done::Sums).map_err(Refusal::of)
         }
         /* The leader's scrub (N9e): sums and a record, nothing moved on and

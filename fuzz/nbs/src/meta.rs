@@ -32,7 +32,12 @@
 //!   N10b): vouched for only where the model has that copy-up pending, its
 //!   writer asking, the host's cs an active member of the set at its version
 //!   now -- asked of a copy-up pending, one of its pieces now and then made
-//!   another.
+//!   another;
+//! - and everything else it tells its cs (`told_check`, the review of
+//!   2026-11): a client's request verified, a joiner's ask of a source, a
+//!   fence, the chunks and volumes still there, the cs's identity and joins
+//!   -- each held to the model, and those that name no entry told only by
+//!   a member that has confirmed a read.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -76,6 +81,8 @@ struct MDevice {
     ident: String,
     slots: u32,
     active: bool,
+    /// Its format as its cs found it, 0 for none (the review of 2026-11).
+    format: u64,
 }
 
 /// A cs's being there as the leader committed it (N9).
@@ -156,6 +163,21 @@ struct MVol {
     origin: u32,
     /// Each chunk's identity in the model: the same where maps share it.
     keys: Vec<u64>,
+    /// The tokens of the sessions that let it go, the newest last: an
+    /// attach of one of those is stale (the review of 2026-11).
+    released: Vec<u64>,
+}
+
+impl MVol {
+    fn release(&mut self, token: u64) {
+        if token == 0 || self.released.contains(&token) {
+            return;
+        }
+        if self.released.len() >= nbsmeta::RELEASED_KEPT {
+            self.released.remove(0);
+        }
+        self.released.push(token);
+    }
 }
 
 /// A chunk in use, by the model's identity (N10).
@@ -177,6 +199,9 @@ struct Model {
     vols: BTreeMap<String, MVol>,
     next_device: u32,
     next_volume: u32,
+    /// The next attach generation: the cluster's, never given twice (the
+    /// review of 2026-11).
+    next_generation: u64,
     /// Every set: made where three cs's have no clean one, the lowest empty
     /// one made again first (N9).
     sets: Vec<MSet>,
@@ -314,7 +339,7 @@ impl Model {
         self.next_volume += 1;
         self.vols.insert(String::from(name), MVol { id, size_mib: of.size_mib, host: String::from(host), generation: 0,
                                                    writer: None, readers: Vec::new(), chunks: of.chunks.clone(),
-                                                   kind, origin: of.id, keys: of.keys.clone() });
+                                                   kind, origin: of.id, keys: of.keys.clone(), released: Vec::new() });
         Ok(Answer::Volume { id })
     }
 
@@ -655,7 +680,14 @@ impl Model {
                 for c in &self.cs {
                     if let Some(d) = c.devices.iter().find(|d| &d.ident == ident) {
                         return match (&c.host == host, d.slots == *slots) {
-                            (true, true) => Ok(Answer::Device { id: d.id }),
+                            (true, true) => {
+                                /* Added again: taking new chunks again, drained or not */
+                                let id = d.id;
+                                if let Some(d) = self.cs.iter_mut().flat_map(|c| c.devices.iter_mut()).find(|d| d.id == id) {
+                                    d.active = true;
+                                }
+                                Ok(Answer::Device { id })
+                            }
                             (true, false) => Err(DeviceChanged),
                             (false, _) => Err(DeviceElsewhere),
                         };
@@ -676,7 +708,8 @@ impl Model {
                 }
                 let id = self.next_device;
                 self.next_device += 1;
-                self.cs[at].devices.push(MDevice { id, ident: ident.clone(), slots: *slots, active: true });
+                self.cs[at].devices.push(MDevice { id, ident: ident.clone(), slots: *slots, active: true,
+                                                   format: 0 });
                 Ok(Answer::Device { id })
             }
             Command::DeviceDrain { host, ident } => {
@@ -687,6 +720,20 @@ impl Model {
                 let d = c.devices.iter_mut().find(|d| &d.ident == ident).ok_or(NoSuchDevice)?;
                 d.active = false;
                 Ok(Answer::Device { id: d.id })
+            }
+            /* Recorded where none is, the same again, another refused; 0
+               the record dropped */
+            Command::DeviceFormatted { device, format } => {
+                if !self.init {
+                    return Err(NotInitialized);
+                }
+                let d = self.cs.iter_mut().flat_map(|c| c.devices.iter_mut()).find(|d| d.id == *device)
+                    .ok_or(NoSuchDevice)?;
+                if *format != 0 && d.format != 0 && d.format != *format {
+                    return Err(OtherFormat);
+                }
+                d.format = *format;
+                Ok(Answer::Device { id: *device })
             }
             Command::VolumeCreate { name, size_mib, host } => {
                 if !self.init {
@@ -722,7 +769,7 @@ impl Model {
                 self.next_volume += 1;
                 self.vols.insert(name.clone(), MVol { id, size_mib: *size_mib, host: host.clone(), generation: 0,
                                                       writer: None, readers: Vec::new(), chunks, kind: Kind::Volume,
-                                                      origin: 0, keys });
+                                                      origin: 0, keys, released: Vec::new() });
                 Ok(Answer::Volume { id })
             }
             Command::VolumeDelete { name } => {
@@ -780,13 +827,18 @@ impl Model {
                 if !self.is_member(host) {
                     return Err(NotAMember);
                 }
+                let next = self.next_generation;
                 let v = self.vols.get_mut(name).ok_or(NoSuchVolume)?;
+                /* A copy of an attach of a session that let the volume go */
+                if *token != 0 && v.released.contains(token) {
+                    return Err(Stale);
+                }
                 if *writable {
                     if v.kind != Kind::Volume {
                         return Err(ReadOnly);
                     }
                     if let Some((_, g, _)) = v.writer.as_ref().filter(|(h, _, t)| *token != 0 && t == token && h == host) {
-                        return Ok(Answer::Attached { generation: *g });
+                        return Ok(Answer::Attached { generation: *g, first: false });
                     }
                     if !*force {
                         if v.writer.as_ref().is_some_and(|(h, _, _)| h != host) {
@@ -796,10 +848,19 @@ impl Model {
                             return Err(ReadersAttached);
                         }
                     }
+                    let first = v.generation == 0 && v.origin == 0;
+                    let old = v.writer.as_ref().map(|(_, _, t)| *t);
                     v.readers.clear();
-                    v.generation += 1;
-                    v.writer = Some((host.clone(), v.generation, *token));
-                    return Ok(Answer::Attached { generation: v.generation });
+                    v.generation = next;
+                    v.writer = Some((host.clone(), next, *token));
+                    if let Some(t) = old.filter(|t| t != token) {
+                        v.release(t);
+                    }
+                    let id = v.id;
+                    self.next_generation += 1;
+                    /* The copy-ups the writer before left pending given up */
+                    self.give_up(id);
+                    return Ok(Answer::Attached { generation: next, first });
                 }
                 if v.writer.is_some() {
                     return Err(Writing);
@@ -810,7 +871,7 @@ impl Model {
                     }
                     v.readers.push(host.clone());
                 }
-                Ok(Answer::Attached { generation: 0 })
+                Ok(Answer::Attached { generation: 0, first: false })
             }
             Command::Reattach { name, host, generation, token } => {
                 if !self.init {
@@ -819,34 +880,46 @@ impl Model {
                 if !self.is_member(host) {
                     return Err(NotAMember);
                 }
+                let next = self.next_generation;
                 let v = self.vols.get_mut(name).ok_or(NoSuchVolume)?;
                 if let Some((_, g, _)) = v.writer.as_ref().filter(|(h, _, t)| *token != 0 && t == token && h == host) {
-                    return Ok(Answer::Attached { generation: *g });
+                    return Ok(Answer::Attached { generation: *g, first: false });
+                }
+                if *token != 0 && v.released.contains(token) {
+                    return Err(Stale);
                 }
                 if *generation == 0 || !v.writer.as_ref().is_some_and(|(h, g, _)| h == host && g == generation) {
                     return Err(NotTheWriter);
                 }
-                v.generation += 1;
-                v.writer = Some((host.clone(), v.generation, *token));
-                Ok(Answer::Attached { generation: v.generation })
+                let old = v.writer.as_ref().map_or(0, |(_, _, t)| *t);
+                v.release(old);
+                v.generation = next;
+                v.writer = Some((host.clone(), next, *token));
+                let id = v.id;
+                self.next_generation += 1;
+                self.give_up(id);
+                Ok(Answer::Attached { generation: next, first: false })
             }
-            Command::Detach { name, host, generation } => {
+            Command::Detach { name, host, generation, token } => {
                 if !self.init {
                     return Err(NotInitialized);
                 }
-                let Some(v) = self.vols.get_mut(name) else { return Ok(Answer::Attached { generation: 0 }) };
+                let none = Answer::Attached { generation: 0, first: false };
+                let Some(v) = self.vols.get_mut(name) else { return Ok(none) };
                 if *generation == 0 {
                     v.readers.retain(|r| r != host);
-                    return Ok(Answer::Attached { generation: 0 });
+                    v.release(*token);
+                    return Ok(none);
                 }
                 if v.writer.as_ref().is_some_and(|(h, g, _)| h == host && g == generation) {
-                    v.writer = None;
-                    return Ok(Answer::Attached { generation: *generation });
+                    let had = v.writer.take().map_or(0, |(_, _, t)| t);
+                    v.release(had);
+                    return Ok(Answer::Attached { generation: *generation, first: false });
                 }
-                Ok(Answer::Attached { generation: 0 })
+                Ok(none)
             }
             Command::Digest { .. } => Ok(Answer::Checked),
-            Command::ReplicaDown { set, cs, name, generation, .. } => {
+            Command::ReplicaDown { set, cs, name, generation, version, .. } => {
                 if !self.init {
                     return Err(NotInitialized);
                 }
@@ -858,15 +931,21 @@ impl Model {
                     return Err(NoSuchSet);
                 }
                 let s = self.sets.get(*set as usize).ok_or(NoSuchSet)?;
+                /* A member down already, and no joiner of its place: done */
+                let member = s.cs.iter().position(|c| c == cs);
+                if member.is_some_and(|k| s.down[k]) && s.joiner.is_none_or(|(j, _, _)| j != *cs) {
+                    return Ok(Answer::Set { version: s.version });
+                }
+                /* Asked at a version of the set's before: stale */
+                if version.is_some_and(|v| v != s.version) {
+                    return Err(Stale);
+                }
                 /* The joiner silent to the writer: its join dropped */
                 if let Some((_, _, since)) = s.joiner.filter(|(j, _, _)| j == cs) {
                     return self.unjoin(*set as usize, *cs, since);
                 }
                 let s = self.sets.get_mut(*set as usize).ok_or(NoSuchSet)?;
-                let at = s.cs.iter().position(|c| c == cs).ok_or(NoSuchSet)?;
-                if s.down[at] {
-                    return Ok(Answer::Set { version: s.version });
-                }
+                let at = member.ok_or(NoSuchSet)?;
                 if (0..REPLICAS).all(|i| i == at || s.down[i]) {
                     return Err(LastReplica);
                 }
@@ -1097,7 +1176,10 @@ impl Model {
                 if self.sets[ch.set].cs.iter().any(|&c| self.cs[c as usize].drained()) {
                     return Err(Draining);
                 }
-                if self.pending.len() >= COPYING_MAX || self.live() >= CHUNKS_MAX {
+                if self.pending.len() >= COPYING_MAX {
+                    return Err(CopiesPending);
+                }
+                if self.live() >= CHUNKS_MAX {
                     return Err(TooMany);
                 }
                 /* Thin: a slot of every cs of the set, the room kept to rebuild
@@ -1161,9 +1243,9 @@ fn differs(s: &State, m: &Model) -> Option<String> {
         }
         for (d, md) in c.devices.iter().zip(mc.devices.iter()) {
             let active = d.state == nbsmeta::DeviceState::Active;
-            if d.id != md.id || d.ident != md.ident || d.slots != md.slots || active != md.active {
-                return Some(format!("cs {}'s device {:?}, the model {} {} {} {}", i, d, md.id, md.ident, md.slots,
-                                    md.active));
+            if d.id != md.id || d.ident != md.ident || d.slots != md.slots || active != md.active || d.format != md.format {
+                return Some(format!("cs {}'s device {:?}, the model {} {} {} {} {:x}", i, d, md.id, md.ident, md.slots,
+                                    md.active, md.format));
             }
         }
     }
@@ -1446,8 +1528,265 @@ fn verify_copy(a: &mut Rng, s: &State, m: &Model, applied: u64) -> Option<Result
         Told::Verified
     })();
     let q = Question::VerifyCopy { volume, generation, position, from, to, index };
-    let got = nbswire::mds::told(s, &host, applied, &q);
+    /* A verify is answered as far as its index, a read confirmed or not */
+    let got = nbswire::mds::told(s, &host, applied, &q, a.chance(50));
     Some(if got == want { Ok(got) } else { Err(format!("{:?} of host {}'s cs told {:?}, the model {:?}", q, host, got, want)) })
+}
+
+/// What a host's mds tells its cs, held to the model (the review of 2026-11:
+/// of the rules `told` holds a cs to, the gate held the set's version alone
+/// -- a member taken out vouching, a joiner read, a chunk of another place
+/// or incarnation, a writer of before, a source no member, an answer of a
+/// member behind its client, all unseen). A question of each kind -- a
+/// client's request verified, a joiner's ask of a source, a fence, the
+/// chunks and volumes still there, the cs's identity and its joins -- mostly
+/// as the model has things, now and then with a field made another, asked
+/// of a member that has confirmed a read or has not, and answered by `told`
+/// and by the model, in the order of refusals the plan gives. Its kind, or
+/// what differed.
+fn told_check(a: &mut Rng, s: &State, m: &Model, applied: u64) -> Option<Result<String, String>> {
+    use nbswire::Refusal as Why;
+    let host_of = |cs: u32| m.cs.get(cs as usize).map(|c| c.host.clone());
+    let me_of = |host: &str| m.cs.iter().position(|c| c.host == host).map(|i| i as u32);
+    let writer_of = |id: u32| m.vols.values().find(|v| v.id == id).and_then(|v| v.writer.as_ref()).map(|w| w.1);
+    let active_in = |st: &MSet, me: u32| st.cs.iter().zip(st.down.iter()).any(|(&c, &d)| c == me && !d);
+    let confirmed = a.chance(75);
+    let mut index = applied.saturating_sub(a.below(3));
+    if a.chance(5) {
+        index = applied + 1 + a.below(3);
+    }
+    let any_host = |a: &mut Rng| String::from(HOSTS[a.below(HOSTS.len() as u64) as usize]);
+    let (q, host, want) = match a.below(7) {
+        /* A client's request, as a cs asks it of a chunk it has not checked */
+        0 => {
+            let names: Vec<&String> = m.vols.keys().collect();
+            let v = &m.vols[a.pick(&names)?];
+            if v.keys.is_empty() {
+                return None;
+            }
+            let place = a.below(v.keys.len() as u64) as usize;
+            let mc = m.mchunks.get(&v.keys[place])?;
+            let (n, inc) = mc.real?;
+            let st = m.sets.get(mc.set)?;
+            let mut cands: Vec<u32> = st.cs.to_vec();
+            if let Some((j, _, _)) = st.joiner {
+                cands.push(j);
+            }
+            let mut host = if a.chance(90) { host_of(a.pick(&cands)?)? } else { any_host(a) };
+            let (mut volume, mut position) = (v.id, place as u32);
+            let mut chunk = ChunkRef { chunk: n, incarnation: inc, epoch: Epoch { set: mc.set as u32, version: st.version } };
+            let mut generation = match (v.writer.as_ref(), a.chance(70)) {
+                (Some(w), true) => w.1,
+                _ => 0,
+            };
+            let mut writing = a.chance(50);
+            match a.below(24) {
+                0 => volume = volume.wrapping_add(1 + a.below(2) as u32),
+                1 => position = position.wrapping_add(1),
+                2 => chunk.chunk = chunk.chunk.wrapping_add(1),
+                3 => chunk.incarnation = chunk.incarnation.wrapping_add(1),
+                4 => chunk.incarnation = chunk.incarnation.wrapping_sub(1),
+                5 => chunk.epoch.version = chunk.epoch.version.wrapping_sub(1),
+                6 => chunk.epoch.set = chunk.epoch.set.wrapping_add(1),
+                7 => generation = generation.wrapping_add(1),
+                8 => generation = 0,
+                9 => writing = !writing,
+                10 => host = any_host(a),
+                _ => {}
+            }
+            let want = (|| {
+                if applied < index {
+                    return Told::Refused(Why::Behind { applied });
+                }
+                let Some(v) = m.vols.values().find(|v| v.id == volume) else { return Told::Refused(Why::NotTheMap) };
+                let Some(mc) = v.keys.get(position as usize).and_then(|k| m.mchunks.get(k)) else {
+                    return Told::Refused(Why::NotTheMap);
+                };
+                if mc.real != Some((chunk.chunk, chunk.incarnation)) {
+                    return Told::Refused(Why::NotTheMap);
+                }
+                let st = &m.sets[mc.set];
+                let Some(me) = me_of(&host) else { return Told::Refused(Why::NotHere) };
+                let active = active_in(st, me);
+                let joining = st.joiner.is_some_and(|(j, _, _)| j == me);
+                /* A member taken out vouches for nothing; the joiner is
+                   written, never read */
+                if !(active || (joining && writing)) {
+                    return Told::Refused(Why::NotHere);
+                }
+                let known = Epoch { set: mc.set as u32, version: st.version };
+                if chunk.epoch != known {
+                    return Told::Refused(Why::Epoch { known });
+                }
+                if (writing || generation != 0) && writer_of(volume) != Some(generation) {
+                    return Told::Refused(Why::NotAttached);
+                }
+                match st.joiner {
+                    Some((_, _, since)) if !active => Told::VerifiedJoining { since },
+                    _ => Told::Verified,
+                }
+            })();
+            let q = Question::Verify { volume, generation, chunk, position, index, writing };
+            (q, host, want)
+        }
+        /* A joiner's ask of a source, which the source's cs checks */
+        1 => {
+            let with: Vec<usize> = (0..m.sets.len()).filter(|&i| m.sets[i].joiner.is_some()).collect();
+            let set = match a.pick(&with) {
+                Some(i) if a.chance(85) => i,
+                _ => a.below(m.sets.len() as u64 + 1) as usize,
+            };
+            let st = m.sets.get(set);
+            let mut joiner = st.and_then(|x| x.joiner).map_or(a.below(8) as u32, |j| j.0);
+            let mut version = st.map_or(0, |x| x.version);
+            let members: Vec<u32> = st.map_or(Vec::new(), |x| x.cs.to_vec());
+            let mut host = match a.pick(&members) {
+                Some(c) if a.chance(90) => host_of(c)?,
+                _ => any_host(a),
+            };
+            match a.below(12) {
+                0 => joiner = joiner.wrapping_add(1),
+                1 => version = version.wrapping_add(1),
+                2 => version = version.wrapping_sub(1),
+                3 => host = any_host(a),
+                _ => {}
+            }
+            let want = (|| {
+                if applied < index {
+                    return Told::Refused(Why::Behind { applied });
+                }
+                let Some(st) = m.sets.get(set) else { return Told::Refused(Why::NotTheJoiner) };
+                if st.joiner.is_none_or(|j| j.0 != joiner) {
+                    return Told::Refused(Why::NotTheJoiner);
+                }
+                if st.version != version {
+                    return Told::Refused(Why::Epoch { known: Epoch { set: set as u32, version: st.version } });
+                }
+                /* The source an active member of the set */
+                match me_of(&host) {
+                    Some(me) if active_in(st, me) => Told::Verified,
+                    _ => Told::Refused(Why::NotHere),
+                }
+            })();
+            (Question::VerifyJoin { set: set as u32, joiner, version, index }, host, want)
+        }
+        /* A fence past the one a cs knows: the volume's writer's of now */
+        2 => {
+            let ids: Vec<(u32, u64)> = m.vols.values().map(|v| (v.id, v.writer.as_ref().map_or(0, |w| w.1))).collect();
+            let (mut volume, mut generation) = a.pick(&ids).unwrap_or((1, 0));
+            match a.below(10) {
+                0 => volume = volume.wrapping_add(1),
+                1 => generation = generation.wrapping_add(1),
+                2 => generation = generation.wrapping_sub(1),
+                3 => generation = 0,
+                _ => {}
+            }
+            let want = if applied < index {
+                Told::Refused(Why::Behind { applied })
+            } else if !m.vols.values().any(|v| v.id == volume) {
+                Told::Refused(Why::NotTheMap)
+            } else if generation == 0 || writer_of(volume) != Some(generation) {
+                Told::Refused(Why::NotAttached)
+            } else {
+                Told::Verified
+            };
+            (Question::VerifyFence { volume, generation, index }, any_host(a), want)
+        }
+        /* The chunks a cs holds, still the metadata's: gone where freed,
+           their number another's now, or of a set the cs is no member nor
+           the joiner of */
+        3 => {
+            let live: Vec<(u32, u32)> = m.mchunks.values().filter_map(|c| c.real).collect();
+            let k = a.below(6) as usize;
+            let chunks: Vec<(u32, u32)> = (0..k).map(|_| match a.pick(&live) {
+                Some((c, i)) if a.chance(70) => (c, i),
+                Some((c, i)) if a.chance(50) => (c, i.wrapping_sub(1)),
+                _ => (a.below(64) as u32, a.below(4) as u32),
+            }).collect();
+            let host = if a.chance(80) { m.cs.get(a.below(m.cs.len().max(1) as u64) as usize)
+                .map_or_else(|| any_host(a), |c| c.host.clone()) } else { any_host(a) };
+            let me = me_of(&host);
+            let gone = chunks.iter().filter(|&&(c, i)| {
+                match m.mchunks.values().find(|x| x.real == Some((c, i))) {
+                    None => true,
+                    Some(x) => me.is_some_and(|me| {
+                        let st = &m.sets[x.set];
+                        !st.cs.contains(&me) && st.joiner.is_none_or(|j| j.0 != me)
+                    }),
+                }
+            }).map(|&(c, _)| c).collect();
+            (Question::Live { chunks }, host, Told::Gone(gone))
+        }
+        /* The volumes a cs fences, still the metadata's */
+        4 => {
+            let k = a.below(5) as usize;
+            let volumes: Vec<u32> = (0..k).map(|_| a.below(u64::from(m.next_volume) + 2) as u32).collect();
+            let gone = volumes.iter().filter(|&&v| !m.vols.values().any(|x| x.id == v)).copied().collect();
+            (Question::Volumes { volumes }, any_host(a), Told::Gone(gone))
+        }
+        /* Whose cs a host's is, and its devices */
+        5 => {
+            let host = any_host(a);
+            let want = Told::Identity(me_of(&host).map(|me| nbswire::Identity {
+                cluster: s.cluster().map_or([0; 16], |c| c.id),
+                cs: me,
+                devices: m.cs[me as usize].devices.iter().map(|d| nbswire::Device {
+                    ident: d.ident.clone(), device: d.id, slots: d.slots, draining: !d.active, format: d.format,
+                }).collect(),
+            }));
+            (Question::Identity, host, want)
+        }
+        /* The joins a host's cs is the joiner of: each set's place, its
+           versions, its sources and the fences the joiner lays first */
+        _ => {
+            let joining: Vec<u32> = m.sets.iter().filter_map(|st| st.joiner.map(|j| j.0)).collect();
+            let host = match a.pick(&joining) {
+                Some(j) if a.chance(80) => host_of(j)?,
+                _ => any_host(a),
+            };
+            let want = Told::Joins(match me_of(&host) {
+                None => Vec::new(),
+                Some(me) => m.sets.iter().enumerate().filter(|(_, st)| st.joiner.is_some_and(|j| j.0 == me))
+                    .map(|(id, st)| {
+                        let (_, place, since) = st.joiner.unwrap_or((0, 0, 0));
+                        let mut fences: Vec<(u32, u64)> = m.vols.values().filter(|v| v.generation != 0)
+                            .filter(|v| v.keys.iter().any(|k| m.mchunks.get(k).is_some_and(|c| c.set == id)))
+                            .map(|v| (v.id, v.generation)).collect();
+                        fences.sort_unstable();
+                        nbswire::JoinView {
+                            set: id as u32, place: place as u8, since, version: st.version, own: st.cs[place] == me,
+                            until: st.until[place],
+                            sources: (0..REPLICAS).filter(|&k| !st.down[k])
+                                .filter_map(|k| host_of(st.cs[k]).map(|h| (st.cs[k], h))).collect(),
+                            index: applied, fences,
+                        }
+                    }).collect(),
+            });
+            (Question::Joins, host, want)
+        }
+    };
+    let kind = format!("{:?}", q).split([' ', '{']).next().unwrap_or("").to_string();
+    /* No cluster yet: nothing told; and what names no entry to be applied
+       as far as is told only by a member that has confirmed a read */
+    let want = if !m.init || (!confirmed && nbswire::mds::needs_read(&q)) { Told::Refused(Why::NoMds) } else { want };
+    let mut got = nbswire::mds::told(s, &host, applied, &q, confirmed);
+    /* A join's fences in an order of their own: held as a set */
+    if let Told::Joins(views) = &mut got {
+        for v in views.iter_mut() {
+            v.fences.sort_unstable();
+        }
+    }
+    Some(if got == want {
+        let said = match &got {
+            Told::Refused(why) => format!("{:?}", why).split([' ', '{']).next().unwrap_or("").to_string(),
+            Told::Gone(g) => format!("Gone {}", if g.is_empty() { "none" } else { "some" }),
+            Told::Joins(j) => format!("Joins {}", if j.is_empty() { "none" } else { "some" }),
+            other => format!("{:?}", other).split([' ', '(', '{']).next().unwrap_or("").to_string(),
+        };
+        Ok(format!("{} {}", kind, said))
+    } else {
+        Err(format!("{:?} of host {}'s cs (confirmed {}) told {:?}, the model {:?}", q, host, confirmed, got, want))
+    })
 }
 
 /// A volume with copy-ups pending, by name (N10).
@@ -1501,10 +1840,14 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
             let slots = r.pick(&[0u32, 1, 2, 4, 8, 16, 40, 64, 300, 50_000, SLOTS_MAX + 1]).unwrap_or(8);
             Command::DeviceAdd { host: h, ident, slots }
         }
-        25..=27 => {
+        25..=26 => {
             let h = member(r);
             Command::DeviceDrain { ident: format!("disk:{}{}", h, r.below(3)), host: h }
         }
+        /* A device's format recorded -- one of a few, so that the same and
+           another both come -- or the record dropped, as a wipe does */
+        27 => Command::DeviceFormatted { device: r.below(8) as u32,
+                                         format: if r.chance(20) { 0 } else { 1 + r.below(3) } },
         28..=49 => {
             let size_mib = r.pick(&[0u64, 1, 3, 4, 5, 8, 16, 33, 64, 100, 256, 1024, VOLUME_MIB_MAX + 1]).unwrap_or(4);
             let name = if r.chance(3) {
@@ -1535,7 +1878,7 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
             Command::VolumeResize { name, size_mib }
         }
         68..=79 => Command::Attach { name: volume(r), host: member(r), writable: r.chance(60), force: r.chance(15),
-                                     token: r.below(4) },
+                                     token: if r.chance(60) { r.below(4) } else { 1000 + r.below(1 << 20) } },
         80..=86 => {
             let name = match pending_volume(r, s, m) {
                 Some(n) if r.chance(30) => n,
@@ -1545,7 +1888,7 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
                 Some((h, g, _)) if r.chance(70) => (h, g),
                 _ => (member(r), r.pick(&[0u64, 1, 2, 7]).unwrap_or(0)),
             };
-            Command::Detach { name, host: h, generation }
+            Command::Detach { name, host: h, generation, token: if r.chance(50) { r.below(4) } else { 0 } }
         }
         /* A replica taken out: mostly of a set the volume has chunks in, and
            of one of its members or now and then its joiner -- a writer finds
@@ -1573,7 +1916,15 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
                 Some((_, g, _)) if r.chance(80) => g,
                 _ => r.below(4),
             };
-            Command::ReplicaDown { set, cs, refused: r.chance(30), name, generation }
+            /* At the set's version mostly, at one before now and then, or
+               at none, as an entry of before the version was carried */
+            let version = match m.sets.get(set as usize).map(|ms| ms.version) {
+                Some(v) if r.chance(70) => Some(v),
+                Some(v) if r.chance(50) => Some(v.saturating_sub(1)),
+                _ if r.chance(50) => None,
+                _ => Some(r.below(8) as u32),
+            };
+            Command::ReplicaDown { set, cs, refused: r.chance(30), name, generation, version }
         }
         90..=99 => {
             /* The leader's digest: the true one of the newest checkpoint, or
@@ -1918,10 +2269,14 @@ fn spoil_joiner(r: &mut Rng, s: &State, bytes: &mut [u8]) -> bool {
 fn spoil_counters(r: &mut Rng, s: &State, m: &Model, bytes: &mut [u8]) -> bool {
     let mut head = m.next_device.to_le_bytes().to_vec();
     head.extend_from_slice(&m.next_volume.to_le_bytes());
+    head.extend_from_slice(&m.next_generation.to_le_bytes());
     let free = s.free_head().to_le_bytes();
-    let Some(at) = bytes.windows(20).position(|w| w[..8] == head[..] && w[16..] == free) else { return false };
-    let k = if r.chance(50) { at } else { at + 4 };
-    bytes[k..k + 4].fill(0);
+    let Some(at) = bytes.windows(28).position(|w| w[..16] == head[..] && w[24..] == free) else { return false };
+    match r.below(3) {
+        0 => bytes[at..at + 4].fill(0),
+        1 => bytes[at + 4..at + 8].fill(0),
+        _ => bytes[at + 8..at + 16].fill(0),
+    }
     true
 }
 
@@ -2049,6 +2404,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     let mut m = Model::default();
     m.next_device = 1;
     m.next_volume = 1;
+    m.next_generation = 1;
     let mut replica = State::new();
     let mut restored: Option<State> = None;
     let mut answers: BTreeMap<String, u64> = BTreeMap::new();
@@ -2132,6 +2488,16 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
                     *answers.entry(format!("VerifyCopy {}", what.split([' ', '(', '{']).nth(1).unwrap_or(&what)))
                         .or_default() += 1;
                 }
+                None => {}
+            }
+        }
+        /* What a host's mds tells its cs of everything else (the review of
+           2026-11), of a randomness of its own too */
+        let mut told_r = Rng::new(mix(mix(seed, 0x746f_6c64), step));
+        if told_r.chance(50) {
+            match told_check(&mut told_r, &s, &m, index) {
+                Some(Err(d)) => return Err(format!("step {} after {:?}: {}", step, decoded, d)),
+                Some(Ok(kind)) => *answers.entry(format!("told {}", kind)).or_default() += 1,
                 None => {}
             }
         }

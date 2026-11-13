@@ -137,13 +137,28 @@ struct Request<'a> {
     done: usize,
     out: Option<(usize, usize)>,
     flush_asked: bool,
+    /// Since when it has waited for a buffer, every one out: past
+    /// `IO_TIMEOUT_NS` the device failed, as for a request out that long. A
+    /// device that stopped answering kept its buffers out for good, and every
+    /// request after waited for one for good -- a commit round among them,
+    /// every device's fences and closes with it, while the cs answered the
+    /// leader's look (found by the review of 2026-11).
+    waiting: Option<u64>,
 }
 
 impl Request<'_> {
     /// The next piece started: Ready where it cannot be, Pending started or
     /// with every buffer out.
     fn start(&mut self) -> Poll<Result<(), IoError>> {
-        let Some(k) = self.dev.take() else { return Poll::Pending };
+        let Some(k) = self.dev.take() else {
+            let now = boot_time_ns();
+            let since = *self.waiting.get_or_insert(now);
+            if now.saturating_sub(since) > IO_TIMEOUT_NS {
+                return Poll::Ready(Err(IoError));
+            }
+            return Poll::Pending;
+        };
+        self.waiting = None;
         let n = (self.kind.len() - self.done).min(self.dev.q.buffer_len());
         if let Kind::Write(d) = &self.kind {
             let Some(mut lent) = self.dev.q.lend(k) else {
@@ -257,15 +272,15 @@ impl Device for QueueDevice {
     }
 
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> impl Future<Output = Result<(), IoError>> + 'a {
-        Request { dev: self, kind: Kind::Read(buf), offset, done: 0, out: None, flush_asked: false }
+        Request { dev: self, kind: Kind::Read(buf), offset, done: 0, out: None, flush_asked: false, waiting: None }
     }
 
     fn write<'a>(&'a self, offset: u64, data: &'a [u8]) -> impl Future<Output = Result<(), IoError>> + 'a {
-        Request { dev: self, kind: Kind::Write(data), offset, done: 0, out: None, flush_asked: false }
+        Request { dev: self, kind: Kind::Write(data), offset, done: 0, out: None, flush_asked: false, waiting: None }
     }
 
     fn flush(&self) -> impl Future<Output = Result<(), IoError>> + '_ {
-        Request { dev: self, kind: Kind::Flush, offset: 0, done: 0, out: None, flush_asked: false }
+        Request { dev: self, kind: Kind::Flush, offset: 0, done: 0, out: None, flush_asked: false, waiting: None }
     }
 
     /* A buffer's worth of zeros a request: a slot's 4 MiB in sixteen */
