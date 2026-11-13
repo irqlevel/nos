@@ -113,7 +113,10 @@ hard state and its newest snapshot -- in a directory its user hands it as
 directory, rename, remove. The promises it is held to are POSIX's: a file's
 writes are on the medium once that file is synced, a name made, renamed or
 removed once the directory is. In nos, `kcore::fs` gives every call, and a
-`File::sync` flushes the whole file system, so there the two syncs are one.
+`File::sync` flushes the whole file system, so there the two syncs are one
+-- which is why a `sync` with nothing written since the last makes no call
+at all. A rename onto a name that is there is refused in nos; the log never
+asks for one (log fuzz's files hold it to that).
 
 ```
 let mut log = DiskLog::open(files, LogConfig::default())?;        // or DiskLog::bootstrap(files, config, voters, learners)
@@ -134,9 +137,13 @@ needless. An error stops the log -- every call after says `Stopped` -- and
 
 How it is laid out:
 - **Segments** (`wal.<seq>`) are written only at their end, as etcd's WAL
-  is. Each is a header, then records: a length, a CRC32C over the length and
-  the payload, and the payload. A payload is an entry, the hard state, or a
-  snapshot's marker.
+  is. Each is a header, then records: a length, a CRC32C, and the payload --
+  the CRC over the segment's seq and the record's offset as well as the
+  length and the payload, so that a record whole in a tail that was never
+  this one's (a file system that hands back blocks it never wrote) does not
+  check there. A segment of the first format, its CRCs over the length and
+  payload alone, is read and finished as it is; new ones are begun in the
+  second. A payload is an entry, the hard state, or a snapshot's marker.
 - **Entries that replace others** are written after them, not over them.
   Reading the log back replays the records in order, so nothing is ever cut
   and then written again in place.
@@ -146,21 +153,29 @@ How it is laid out:
   each. It is written as `.tmp`, synced and renamed, and the directory
   synced, before a marker in the log names it, as taken or as installed.
 
-Opening the log reads it twice:
-1. **The first pass checks every record.** It cuts the last segment's tail
-   at the first record that does not check -- a crash's torn write is never
-   read as an entry -- and finds the newest marker and hard state. Any other
-   segment was synced before the next was begun, so a bad record there is
-   corruption, and the log refuses to open.
-2. **Everything read is then made the medium's.** Every segment, the
-   snapshot and the directory are synced before anything is told of them. A
-   program started over after a failure, with no power cut, sees what was
-   written and never synced, and a member that answered for it would lose it
-   at the next cut.
-3. **The second pass replays the entries past the snapshot.** It skips
+Opening the log reads it twice, and changes nothing until it knows the log
+whole -- one it refuses is left as it was, its snapshot among it:
+1. **The first pass checks every record.** It finds where the last
+   segment's tail does not check -- a crash's torn write is never read as an
+   entry -- and the newest marker and hard state. Any other segment was
+   synced before the next was begun, and the last one's head -- its header
+   and the hard state after it -- before anything was written after them:
+   a bad record in either, where more follows, is a medium gone bad, which
+   no crash makes, and the log refuses to open. A last segment no longer
+   than its head, its head not whole, was begun as the crash came.
+2. **The second pass replays the entries past the snapshot.** It skips
    everything before the newest installed snapshot, which dropped it. An
    entry in the snapshot that comes after entries past it drops them again,
-   as it did when it was written.
+   as it did when it was written. A snapshot with no segment at all, an
+   index or term past what a group reaches, a hard state committing past
+   the log's end: refused.
+3. **Only then is the log changed, and made the medium's.** A half-made
+   snapshot's file goes, the torn tail is cut, a segment begun and never
+   made whole goes, every snapshot the newest marker does not name goes;
+   then every segment, the snapshot and the directory are synced before
+   anything is told of them. A program started over after a failure, with
+   no power cut, sees what was written and never synced, and a member that
+   answered for it would lose it at the next cut.
 
 As etcd does, the log since the snapshot is held in memory (`MemStorage`,
 in pieces), and the files are for its durability. After a snapshot, segments
@@ -341,16 +356,20 @@ agree to anything, and the crate's promise to it is only that it does not
 panic, keeps its own term, vote and commit, and stays within those limits.
 
 The log on disk reads at most a record or a piece at a time and gathers its
-writes in 128 KiB; it keeps up to 8192 segments (`MAX_SEGMENTS`, 8 MiB each
-by default), and past them it stops (`Full`) until a snapshot compacts it.
-It refuses a leader's snapshot below what is committed, as a node never
-restores one there. It cannot tell a byte of the last segment that went
-bad after it was synced from a torn write: either is cut there, so a disk
-that corrupts what it has written can cost the newest entries. In any other
-segment, or in the snapshot, the log refuses to open. A sync that fails is
-taken as having written nothing -- the log stops -- but a file system that
-then marks the pages clean and lets a later sync succeed (Linux's "fsync
-gate") is outside what it can know.
+writes in 128 KiB; it takes entries into up to 4000 segments
+(`MAX_SEGMENTS`, 8 MiB each by default -- fewer names, with what an open and
+a marker may begin past them, than a directory of nos's lists at once), and
+past them refuses entries (`Full`) before writing any, the log going on,
+until a snapshot compacts it, opened again or not. It refuses a leader's
+snapshot below what is committed, as a node never restores one there. It
+cannot tell a byte past the last segment's head that went bad after it was
+synced from a torn write: either is cut there, so a disk that corrupts what
+it has written can cost the newest entries. In the head of the last
+segment where more follows it, in any other segment, or in the snapshot,
+the log refuses to open, and changes nothing. A sync that fails is taken
+as having written nothing -- the log stops -- but a file system that then
+marks the pages clean and lets a later sync succeed (Linux's "fsync gate")
+is outside what it can know.
 
 The replicated state machine keeps at most 1024 sessions, evicting the
 least recently used in the log's order. It keeps an answer for a retry only
