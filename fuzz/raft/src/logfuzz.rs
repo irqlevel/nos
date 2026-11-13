@@ -522,10 +522,15 @@ impl Run {
             Ok(log) => log,
             Err(e) => return Err(format!("a log the crash model allows was refused: {:?}", e)),
         };
-        let got = digest(&log);
+        /* What it reads back looked at with the disk's faults off: its
+         * snapshot's bytes are read from their file, and a failure there
+         * is the reader's, not a state */
+        self.set_faults(false);
+        let (got, shown) = (digest(&log), describe(&log));
+        self.set_faults(true);
         if exact {
             if got != digest(&self.model) {
-                return Err(format!("read back as {}, written as {}", describe(&log), describe(&self.model)));
+                return Err(format!("read back as {}, written as {}", shown, describe(&self.model)));
             }
         } else {
             match self.matched(got) {
@@ -544,7 +549,7 @@ impl Run {
                     return Err(format!(
                         "read back as {}, which is neither the state at the last sync ({}) with some of the {} \
                          records written after it nor the state a failed snapshot would have left",
-                        describe(&log),
+                        shown,
                         describe(&self.synced),
                         self.pending.len()
                     ))
@@ -955,6 +960,10 @@ pub const SCENARIOS: &[(&str, fn() -> Result<(), String>)] = &[
     ("log_index_bounds", index_bounds),
     ("log_sync_needs_writes", sync_needs_writes),
     ("log_short_head", short_head),
+    ("log_snapshot_stepped", snapshot_stepped),
+    ("log_snapshot_pieces", snapshot_pieces),
+    ("log_snapshot_given_up", snapshot_given_up),
+    ("log_snapshot_short_piece", snapshot_short_piece),
 ];
 
 fn entry(index: u64, term: u64, len: usize) -> Entry {
@@ -1425,6 +1434,182 @@ fn short_head() -> Result<(), String> {
     if entries_of(&log) != ents {
         return Err(format!("after a torn tail: {}", describe(&log)));
     }
+    Ok(())
+}
+
+/// `n` bytes a snapshot of the scenario's own carries.
+fn snapshot_bytes(n: usize, seed: u64) -> SnapshotData {
+    let mut b = SnapshotBuilder::new();
+    let bytes: Vec<u8> = (0..n as u64).map(|k| mix(seed, k) as u8).collect();
+    assert!(b.push(&bytes), "a snapshot's bytes refused");
+    b.finish()
+}
+
+/// A snapshot written a few pieces a call, entries taken and synced
+/// between them: cut in the middle, the log reads back as it was before it
+/// -- the half-made file gone -- and finished, the snapshot is the log's,
+/// its bytes what was taken. (It was written whole in one call: a state of
+/// tens of MiB kept a leader from its heartbeats for seconds.)
+fn snapshot_stepped() -> Result<(), String> {
+    let conf = ConfState { voters: vec![1, 2, 3], learners: vec![] };
+    for cut_at in [Some(2usize), None] {
+        let (disk, mut log) = fresh(1 << 20);
+        let ents: Vec<Entry> = (1..=30).map(|i| entry(i, 1, 50)).collect();
+        log.append(&ents).map_err(err)?;
+        log.set_hard_state(HardState { term: 1, vote: 0, commit: 30 }).map_err(err)?;
+        log.sync().map_err(err)?;
+        let before = digest(&log);
+        let data = snapshot_bytes(5 * raft::PIECE_MAX + 17, 7);
+        log.begin_snapshot(20, conf.clone(), data.clone()).map_err(err)?;
+        let mut steps = 0;
+        let mut next = 31;
+        while cut_at != Some(steps) {
+            /* The log goes on between the pieces */
+            log.append(&[entry(next, 1, 50)]).map_err(err)?;
+            log.sync().map_err(err)?;
+            next += 1;
+            steps += 1;
+            if log.continue_snapshot(1).map_err(err)? {
+                break;
+            }
+            if steps > 20 {
+                return Err("a snapshot of six pieces not written in twenty steps".into());
+            }
+        }
+        if cut_at.is_some() {
+            /* What was synced is the log's: the entries after `before` too */
+            let synced = digest(&log);
+            drop(log);
+            disk.0.borrow_mut().crash_with(0, &mut |_, _| Fate::Lost, &mut Rng::new(3));
+            let log = DiskLog::open(disk.clone(), LogConfig { segment_bytes: 1 << 20 }).map_err(err)?;
+            if digest(&log) != synced || digest(&log) == before
+                || disk.0.borrow().names().iter().any(|n| n.ends_with(".tmp"))
+            {
+                return Err(format!("cut half way through a snapshot: {}, files {:?}", describe(&log),
+                                   disk.0.borrow().names()));
+            }
+            continue;
+        }
+        if steps < 6 {
+            return Err(format!("a snapshot of six pieces written in {} steps", steps));
+        }
+        let snap = log.snapshot().map_err(err)?;
+        if snap.meta.index != 20 || snap.data != data || log.last_index() != next - 1 {
+            return Err(format!("after a snapshot written in steps: {}", describe(&log)));
+        }
+        drop(log);
+        let log = DiskLog::open(disk, LogConfig { segment_bytes: 1 << 20 }).map_err(err)?;
+        if log.snapshot().map_err(err)?.data != data {
+            return Err("the snapshot written in steps read back other".into());
+        }
+    }
+    Ok(())
+}
+
+/// A snapshot's pieces read from its file as a leader sends them -- at
+/// every offset, in the piece that holds it, its CRC checked -- are its
+/// bytes; a piece gone bad on the medium is refused, the others still
+/// read; one asked of a snapshot no longer the newest is out of date.
+fn snapshot_pieces() -> Result<(), String> {
+    let (disk, mut log) = fresh(1 << 20);
+    let ents: Vec<Entry> = (1..=10).map(|i| entry(i, 1, 10)).collect();
+    log.append(&ents).map_err(err)?;
+    log.sync().map_err(err)?;
+    let data = snapshot_bytes(3 * raft::PIECE_MAX + 1000, 11);
+    let conf = ConfState { voters: vec![1], learners: vec![] };
+    log.create_snapshot(8, conf.clone(), data.clone()).map_err(err)?;
+    let (meta, len) = log.snapshot_head().map_err(err)?;
+    if meta.index != 8 || len != data.len() {
+        return Err(format!("the snapshot's head: {:?}, {} bytes", meta, len));
+    }
+    for (offset, max) in [(0u64, 100usize), (5, raft::PIECE_MAX), (raft::PIECE_MAX as u64 - 3, 10),
+                          (raft::PIECE_MAX as u64, raft::PIECE_MAX), (3 * raft::PIECE_MAX as u64 + 999, 64),
+                          (len - 1, 1), (len, 10)] {
+        let mut out = Vec::new();
+        log.snapshot_piece(8, offset, max, &mut out).map_err(|e| format!("a piece at {}: {:?}", offset, e))?;
+        if out != data.read(offset, max) {
+            return Err(format!("{} bytes from {} read as {} bytes of another kind", max, offset, out.len()));
+        }
+    }
+    /* A bit of the third piece's bytes changed on the medium: the last
+     * piece is 1000 bytes and its header, the third's bytes before them */
+    let name = format!("snap.{:016x}", 8);
+    let end = disk.0.borrow().len_of(&name);
+    disk.0.borrow_mut().flip(&name, end - (8 + 1000) - raft::PIECE_MAX + 5, 3);
+    match log.snapshot_piece(8, 2 * raft::PIECE_MAX as u64 + 100, 10, &mut Vec::new()) {
+        Err(raft::StorageError::Corrupt) => {}
+        other => return Err(format!("a piece gone bad on the medium read: {:?}", other)),
+    }
+    let mut out = Vec::new();
+    log.snapshot_piece(8, 10, 10, &mut out).map_err(|e| format!("a piece beside the bad one: {:?}", e))?;
+    if out != data.read(10, 10) {
+        return Err("a piece beside the bad one read other".into());
+    }
+    log.create_snapshot(10, conf, snapshot_bytes(100, 12)).map_err(err)?;
+    match log.snapshot_piece(8, 0, 10, &mut Vec::new()) {
+        Err(raft::StorageError::SnapshotOutOfDate) => Ok(()),
+        other => Err(format!("a piece of a snapshot no longer the newest: {:?}", other)),
+    }
+}
+
+/// A snapshot's file with a piece short of full before its last is refused
+/// as the log opens, its CRCs all good: every piece but the last full is
+/// what a piece is found by, by its number, as a leader sends it -- opened,
+/// the leader would send another place's bytes, or stop on a piece "out of
+/// its place" in the middle of a send.
+fn snapshot_short_piece() -> Result<(), String> {
+    let (disk, mut log) = fresh(1 << 20);
+    let ents: Vec<Entry> = (1..=10).map(|i| entry(i, 1, 10)).collect();
+    log.append(&ents).map_err(err)?;
+    log.sync().map_err(err)?;
+    let data = snapshot_bytes(2 * raft::PIECE_MAX + 100, 21);
+    log.create_snapshot(8, ConfState { voters: vec![1], learners: vec![] }, data.clone()).map_err(err)?;
+    drop(log);
+    /* The same bytes in pieces of another cut, each with its length and
+     * CRC: the first short by ten */
+    let name = format!("snap.{:016x}", 8);
+    let bytes = disk.0.borrow().bytes_of(&name);
+    let all: Vec<u8> = data.pieces().concat();
+    let mut file = bytes[..bytes.len() - (3 * 8 + all.len())].to_vec();
+    let max = raft::PIECE_MAX;
+    for (from, to) in [(0, max - 10), (max - 10, 2 * max - 10), (2 * max - 10, all.len())] {
+        let piece = &all[from..to];
+        let len = (piece.len() as u32).to_le_bytes();
+        file.extend_from_slice(&len);
+        file.extend_from_slice(&crc::crc32c::update(crc::crc32c::checksum(&len), piece).to_le_bytes());
+        file.extend_from_slice(piece);
+    }
+    disk.0.borrow_mut().put_file(&name, &file);
+    match DiskLog::open(disk, LogConfig { segment_bytes: 1 << 20 }) {
+        Err(LogError::Corrupt(_)) => Ok(()),
+        Ok(log) => Err(format!("a snapshot with a short piece before its last opened: {}", describe(&log))),
+        Err(e) => Err(format!("a snapshot with a short piece before its last: {:?}", e)),
+    }
+}
+
+/// A leader's snapshot taken in while one of the member's own is being
+/// written gives that up -- its file gone -- and the next of its own is
+/// taken. (Kept as being written, it would refuse every snapshot after.)
+fn snapshot_given_up() -> Result<(), String> {
+    let (disk, mut log) = fresh(1 << 20);
+    let ents: Vec<Entry> = (1..=20).map(|i| entry(i, 1, 10)).collect();
+    log.append(&ents).map_err(err)?;
+    log.set_hard_state(HardState { term: 1, vote: 0, commit: 10 }).map_err(err)?;
+    log.sync().map_err(err)?;
+    let conf = ConfState { voters: vec![1], learners: vec![] };
+    log.begin_snapshot(10, conf.clone(), snapshot_bytes(4 * raft::PIECE_MAX, 13)).map_err(err)?;
+    log.continue_snapshot(1).map_err(err)?;
+    let leader = Snapshot { meta: SnapshotMeta { index: 30, term: 2, conf: conf.clone() }, data: snapshot_bytes(500, 14) };
+    log.apply_snapshot(leader.clone()).map_err(err)?;
+    if disk.0.borrow().names().iter().any(|n| n.ends_with(".tmp")) {
+        return Err(format!("a snapshot given up left its file: {:?}", disk.0.borrow().names()));
+    }
+    if log.snapshot().map_err(err)? != leader {
+        return Err(format!("the leader's snapshot: {}", describe(&log)));
+    }
+    log.append(&[entry(31, 2, 10), entry(32, 2, 10)]).map_err(err)?;
+    log.sync().map_err(err)?;
+    log.create_snapshot(32, conf, snapshot_bytes(10, 15)).map_err(|e| format!("the next snapshot: {:?}", e))?;
     Ok(())
 }
 

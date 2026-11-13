@@ -14,14 +14,14 @@
 //! that a snapshot spans several calls with applying going on between
 //! them; and it checks its own bytes when read back.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 
 use raft::types::Body;
 use raft::{
     Config, DiskLog, Entry, EntryKind, Error, Event, Frozen, HardState, LogConfig, MemStorage, Message, NodeId,
-    RestoreError, Rsm, RsmError, SnapshotReader, StateMachine, Storage,
+    RestoreError, Rsm, RsmError, SnapshotReader, StateMachine, Storage, PIECE_MAX,
 };
 
 use crate::logfuzz::{Disk, Fate, SimFiles};
@@ -772,6 +772,8 @@ pub const SCENARIOS: &[(&str, fn() -> Result<(), String>)] = &[
     ("rsm_caught_up", caught_up),
     ("rsm_sync_when_needed", sync_when_needed),
     ("rsm_vote_durable", vote_durable),
+    ("rsm_snapshot_in_steps", snapshot_in_steps),
+    ("rsm_snapshot_too_large", snapshot_too_large),
 ];
 
 type Lone = Rsm<MemStorage, Reg>;
@@ -1305,6 +1307,217 @@ fn sync_when_needed() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// A state of `len` bytes, its value's pattern -- a snapshot of many
+/// pieces -- that says it is small, so that one is taken at the floor; and
+/// a count of the pieces its frozen views have written, shared.
+struct Big {
+    value: u64,
+    len: usize,
+    pieces: Rc<Cell<usize>>,
+}
+
+struct FrozenBig {
+    value: u64,
+    len: usize,
+    written: usize,
+    pieces: Rc<Cell<usize>>,
+}
+
+impl Frozen for FrozenBig {
+    fn write(&mut self, max: usize, out: &mut Vec<u8>) {
+        let n = (self.len - self.written).min(max);
+        out.extend((self.written..self.written + n).map(|k| byte_at(self.value, k)));
+        self.written += n;
+        if n > 0 {
+            self.pieces.set(self.pieces.get() + 1);
+        }
+    }
+}
+
+impl StateMachine for Big {
+    type Frozen = FrozenBig;
+
+    fn apply(&mut self, _index: u64, command: &[u8]) -> Vec<u8> {
+        if command.len() == 9 && command[0] == OP_ADD {
+            self.value = self.value.wrapping_add(le64(&command[1..9]));
+        }
+        self.value.to_le_bytes().to_vec()
+    }
+
+    fn query(&self, _query: &[u8]) -> Vec<u8> {
+        self.value.to_le_bytes().to_vec()
+    }
+
+    fn size(&self) -> u64 {
+        0
+    }
+
+    fn freeze(&self) -> FrozenBig {
+        FrozenBig { value: self.value, len: self.len, written: 0, pieces: self.pieces.clone() }
+    }
+
+    fn restore(&mut self, r: &mut SnapshotReader<'_>) -> Result<(), RestoreError> {
+        if r.remaining() != self.len as u64 {
+            return Err(RestoreError("a big state's snapshot of another length"));
+        }
+        /* A piece at a time, as the kernel's heap gives no more at once */
+        let mut b = vec![0u8; PIECE_MAX];
+        let (mut value, mut at) = (0, 0);
+        while at < self.len {
+            let n = (self.len - at).min(PIECE_MAX);
+            if !r.read_exact(&mut b[..n]) {
+                return Err(RestoreError("a big state's snapshot cut short"));
+            }
+            if at == 0 {
+                value = le64(&b[..8]);
+            }
+            if (0..n).any(|k| b[k] != byte_at(value, at + k)) {
+                return Err(RestoreError("a big state's snapshot whose bytes disagree"));
+            }
+            at += n;
+        }
+        self.value = value;
+        Ok(())
+    }
+}
+
+/// The pieces of a big state's snapshot.
+const BIG_PIECES: usize = 20;
+
+/// A member alone over the log on disk, its state `BIG_PIECES` pieces --
+/// and `limit` the largest snapshot it may hold -- leading, with a session;
+/// no snapshot taken until its floor is set.
+fn big_lone(disk: &SimFiles, limit: u64, nonce: u64)
+    -> Result<(Rsm<DiskLog<SimFiles>, Big>, u64, Rc<Cell<usize>>), String>
+{
+    let there = disk.0.borrow().names().iter().any(|n| n.starts_with("wal."));
+    let log = if there {
+        DiskLog::open(disk.clone(), LogConfig::default())
+    } else {
+        DiskLog::bootstrap(disk.clone(), LogConfig::default(), &[1], &[])
+    }
+    .map_err(|e| format!("{:?}", e))?;
+    let pieces = Rc::new(Cell::new(0));
+    let big = Big { value: 0, len: BIG_PIECES * PIECE_MAX + 5, pieces: pieces.clone() };
+    let mut cfg = config(1, 1);
+    cfg.max_snapshot_bytes = limit;
+    let mut m = Rsm::new(cfg, log, big, nonce).map_err(|e| format!("{:?}", e))?;
+    m.set_snapshot_floor(u64::MAX);
+    m.campaign().map_err(|e| format!("{:?}", e))?;
+    let mut client = None;
+    for k in 0..100 {
+        if k == 10 {
+            m.register(nonce).map_err(|e| format!("{:?}", e))?;
+        }
+        for e in m.process().map_err(|e| format!("{:?}", e))?.events {
+            if let Event::Registered { client: c, .. } = e {
+                client = Some(c);
+            }
+        }
+        if client.is_some() && !m.taking_snapshot() {
+            break;
+        }
+    }
+    Ok((m, client.ok_or("no session")?, pieces))
+}
+
+/// The bytes of snapshots being written, on the disk.
+fn tmp_bytes(disk: &SimFiles) -> usize {
+    let d = disk.0.borrow();
+    d.names().iter().filter(|n| n.ends_with(".tmp")).map(|n| d.len_of(n)).sum()
+}
+
+/// The bytes of every snapshot's file on the disk, being written or not.
+fn snap_bytes(disk: &SimFiles) -> usize {
+    let d = disk.0.borrow();
+    d.names().iter().filter(|n| n.starts_with("snap.")).map(|n| d.len_of(n)).sum()
+}
+
+/// A snapshot of a state of twenty pieces is gathered a few pieces a call
+/// and written a few a call, the member applying between: no call does
+/// more than eight; taken, it reads back as the state frozen. (It was
+/// gathered and written whole in one call: a state of tens of MiB kept a
+/// leader from its heartbeats for longer than an election timeout.)
+fn snapshot_in_steps() -> Result<(), String> {
+    let disk = SimFiles(Rc::new(RefCell::new(Disk::new(11))));
+    let (mut m, client, pieces) = big_lone(&disk, raft::MAX_SNAPSHOT_BYTES, 1)?;
+    /* The member's first snapshot: no file of one is removed as it is
+     * taken, so that what the files hold only grows */
+    m.set_snapshot_floor(1);
+    let (mut seq, mut calls, mut held) = (1, 0, snap_bytes(&disk));
+    let index = loop {
+        m.submit(client, seq, &Op::Add(1).command()).map_err(|e| format!("{:?}", e))?;
+        seq += 1;
+        let before = pieces.get();
+        m.process().map_err(|e| format!("{:?}", e))?;
+        let (gathered, now) = (pieces.get() - before, snap_bytes(&disk));
+        if gathered > 8 || now > held + 8 * (PIECE_MAX + 8) {
+            return Err(format!("in one call {} pieces gathered, {} bytes written", gathered, now.saturating_sub(held)));
+        }
+        held = now;
+        calls += m.taking_snapshot() as u64;
+        let index = m.node().storage().snapshot_meta().index;
+        if index > 0 && !m.taking_snapshot() {
+            break index;
+        }
+        if seq > 400 {
+            return Err("no snapshot taken in 400 calls".into());
+        }
+    };
+    if calls < 4 {
+        return Err(format!("a snapshot of {} pieces taken over {} calls", BIG_PIECES, calls));
+    }
+    for _ in 0..3 {
+        m.process().map_err(|e| format!("{:?}", e))?;
+    }
+    let value = m.state().value;
+    drop(m);
+    let (again, _, _) = big_lone(&disk, raft::MAX_SNAPSHOT_BYTES, 2)?;
+    if again.node().storage().snapshot_meta().index < index || again.state().value != value {
+        return Err(format!("started again from the snapshot at {}: the state {} where it was {}", index,
+                           again.state().value, value));
+    }
+    Ok(())
+}
+
+/// A snapshot of a state larger than the member may hold is given up --
+/// counted, the log not compacted, nothing left on the disk -- and the
+/// member goes on; one that may hold it takes it. (It was gathered whole,
+/// whatever its size, and every piece asked of the heap as one that could
+/// not fail.)
+fn snapshot_too_large() -> Result<(), String> {
+    let disk = SimFiles(Rc::new(RefCell::new(Disk::new(12))));
+    let limit = (BIG_PIECES as u64 / 2) * PIECE_MAX as u64;
+    let (mut m, client, _) = big_lone(&disk, limit, 1)?;
+    m.set_snapshot_floor(1);
+    for seq in 1..=60 {
+        m.submit(client, seq, &Op::Add(1).command()).map_err(|e| format!("{:?}", e))?;
+        m.process().map_err(|e| format!("{:?}", e))?;
+    }
+    for _ in 0..20 {
+        m.process().map_err(|e| format!("{:?}", e))?;
+    }
+    let given_up = m.stats().snapshots_given_up;
+    if given_up == 0 || m.stats().snapshots != 0 || m.node().storage().snapshot_meta().index != 0 || tmp_bytes(&disk) != 0
+        || m.state().value != 60
+    {
+        return Err(format!("a snapshot past what the member may hold: {} given up, {} taken, at {}, {} bytes of \
+                            it on the disk, the state {}", given_up, m.stats().snapshots,
+                           m.node().storage().snapshot_meta().index, tmp_bytes(&disk), m.state().value));
+    }
+    drop(m);
+    let (mut again, client, _) = big_lone(&disk, raft::MAX_SNAPSHOT_BYTES, 2)?;
+    again.set_snapshot_floor(1);
+    for seq in 61..=200 {
+        again.submit(client, seq, &Op::Add(1).command()).map_err(|e| format!("{:?}", e))?;
+        again.process().map_err(|e| format!("{:?}", e))?;
+        if again.stats().snapshots > 0 {
+            return Ok(());
+        }
+    }
+    Err("a member that may hold the snapshot never took one".into())
 }
 
 /// A vote is on the disk before it is answered, now that a `Ready` is

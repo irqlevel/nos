@@ -3,7 +3,7 @@
 
 use alloc::collections::VecDeque;
 
-use crate::types::Snapshot;
+use crate::types::SnapshotMeta;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -73,7 +73,10 @@ impl Inflights {
 /// on its way twice for good, and every heartbeat would add one more.
 #[derive(Clone, Debug)]
 pub struct Sending {
-    pub snapshot: Snapshot,
+    /// Which snapshot -- its bytes the storage's, read a piece at a time as
+    /// they go, so that a leader sending holds none of them.
+    pub meta: SnapshotMeta,
+    pub total: u64,
     pub acked: u64,
     /// Whether `acked` moved since the leader's last heartbeat: the piece
     /// on its way is sent again only where it did not -- lost, it seems.
@@ -143,7 +146,7 @@ impl Progress {
     pub fn become_probe(&mut self) {
         /* Back from a snapshot: from what it now has, or the snapshot's end. */
         let after = match &self.sending {
-            Some(s) if self.state == State::Snapshot => core::cmp::max(self.matched, s.snapshot.meta.index) + 1,
+            Some(s) if self.state == State::Snapshot => core::cmp::max(self.matched, s.meta.index) + 1,
             _ => self.matched + 1,
         };
         self.reset_state(State::Probe);
@@ -155,9 +158,9 @@ impl Progress {
         self.next = self.matched + 1;
     }
 
-    pub fn become_snapshot(&mut self, snapshot: Snapshot) {
+    pub fn become_snapshot(&mut self, meta: SnapshotMeta, total: u64) {
         self.reset_state(State::Snapshot);
-        self.sending = Some(Sending { snapshot, acked: 0, moved: true });
+        self.sending = Some(Sending { meta, total, acked: 0, moved: true });
     }
 
     /// The member has everything up to `n`: whether that is news.

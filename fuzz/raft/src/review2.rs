@@ -18,6 +18,7 @@ use crate::sim::{Disk, Params, Sim};
 
 pub const ALL: &[(&str, fn() -> Result<(), String>)] = &[
     ("snapshot_pieces_bounded", snapshot_pieces_bounded),
+    ("snapshot_refused_counted", snapshot_refused_counted),
     ("term_behind_log", term_behind_log),
     ("probe_leaves_on_match", probe_leaves_on_match),
     ("stale_vote_not_counted", stale_vote_not_counted),
@@ -58,6 +59,10 @@ fn round(s: &mut Sim, count: &mut u64, counted: &dyn Fn(&Message) -> bool) {
 fn behind_a_snapshot(seed: u64, piece: usize, filler: usize) -> Result<(Sim, u64), String> {
     let mut p = Params::plain();
     p.snapshot_piece_bytes = piece;
+    behind_a_snapshot_with(p, seed, filler)
+}
+
+fn behind_a_snapshot_with(p: Params, seed: u64, filler: usize) -> Result<(Sim, u64), String> {
     let mut s = Sim::new(p, seed, &[1, 2, 3], &[]);
     elect(&mut s, 1)?;
     s.isolate(3);
@@ -121,6 +126,32 @@ fn pieces_sent(seed: u64, doubled: usize) -> Result<(), String> {
 fn snapshot_pieces_bounded() -> Result<(), String> {
     pieces_sent(201, 0)?;
     pieces_sent(211, 3)
+}
+
+/// A follower sent a snapshot larger than it may hold refuses it at its
+/// first piece -- counted, as its leader counts the refusal, for nothing
+/// else would say why it stays behind -- and is sent it again no more than
+/// once a heartbeat. (It took the pieces in until the heap refused one: in
+/// a kernel, a panic of the machine.)
+fn snapshot_refused_counted() -> Result<(), String> {
+    let mut p = Params::plain();
+    p.snapshot_piece_bytes = 16;
+    p.max_snapshot_bytes = 1000;
+    let (mut s, index) = behind_a_snapshot_with(p, 221, 1616)?;
+    const TICKS: u64 = 20;
+    let mut sent = 0u64;
+    for r in 0..8 * TICKS {
+        if r % 8 == 0 {
+            tick_all(&mut s);
+        }
+        round(&mut s, &mut sent, &|m| m.from == 1 && m.to == 3 && matches!(m.body, Body::Snapshot { .. }));
+    }
+    let refused = s.node(3).map_or(0, |n| n.stats().snapshots_refused);
+    let rejected = s.node(1).map_or(0, |n| n.stats().snapshots_rejected);
+    ensure(!snapshot_in(&s, 3, index), "member 3 took in a snapshot larger than it may hold")?;
+    ensure(refused >= 1 && rejected >= 1, format!("refused {} times, the leader told of {}", refused, rejected))?;
+    ensure(refused == sent, format!("{} pieces sent, {} refusals: not refused at the first piece", sent, refused))?;
+    ensure(sent <= TICKS + 2, format!("a snapshot refused sent {} times in {} heartbeats", sent, TICKS))
 }
 
 /// Members 2 and 3 of three, the leader of term 3 gone for good: member 2

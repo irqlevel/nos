@@ -66,7 +66,13 @@ nothing (`MemStorage::new()`) and is sent the group by its leader.
   way at a time: the next goes as the follower says it has the one before,
   and a heartbeat sends the piece on its way again only where no piece was
   answered since the last -- a piece sent twice otherwise stays on its way
-  twice, and every heartbeat adds one more.
+  twice, and every heartbeat adds one more. A leader reads each piece of
+  the storage as it sends it (`Storage::snapshot_piece`) and holds none of
+  the snapshot's bytes; a follower takes in none larger than
+  `Config::max_snapshot_bytes`, nor one whose next piece the heap has no
+  room for: refused at once, and counted on both sides
+  (`Stats::snapshots_refused`, and the leader's `snapshots_rejected`), as
+  nothing else would say why it stays behind.
 - Learners; membership changed one server at a time, each change in force as
   it is appended, never before the leader has committed an entry of its term
   (the 2015 erratum) and never two not yet committed.
@@ -131,9 +137,17 @@ send rd.messages ...
 ```
 
 A snapshot of the state machine's own goes in with `create_snapshot(index,
-conf, data)`, durable when it returns; the log then drops what it made
-needless. An error stops the log -- every call after says `Stopped` -- and
-`DiskLog::open` over the same files starts it again from what they hold.
+conf, data)`, durable when it returns -- or a few pieces a call, with
+`begin_snapshot` and then `continue_snapshot` until it says the snapshot is
+the log's, the log taking entries, hard states and syncs between them: a
+state of tens of MiB written in one call kept a leader from its heartbeats
+for longer than an election timeout. A leader's snapshot taken in meanwhile
+gives the one being written up. Either way the log then drops what the
+snapshot made needless. Its bytes stay in its file: the log keeps its place
+and membership, a leader reads it a piece at a time as it sends it (each
+piece's CRC checked), and only a start reads it whole. An error stops the
+log -- every call after says `Stopped` -- and `DiskLog::open` over the same
+files starts it again from what they hold.
 
 How it is laid out:
 - **Segments** (`wal.<seq>`) are written only at their end, as etcd's WAL
@@ -150,8 +164,10 @@ How it is laid out:
 - **The hard state rides the `Ready`'s one sync.** It is a record, and every
   segment begins with it as it stood.
 - **A snapshot** is a file of its own (`snap.<index>`), in pieces with a CRC
-  each. It is written as `.tmp`, synced and renamed, and the directory
-  synced, before a marker in the log names it, as taken or as installed.
+  each, every piece full but the last -- so that a piece is found by its
+  number, and a file where one is not is refused as the log opens. It is
+  written as `.tmp`, synced and renamed, and the directory synced, before a
+  marker in the log names it, as taken or as installed.
 
 Opening the log reads it twice, and changes nothing until it knows the log
 whole -- one it refuses is left as it was, its snapshot among it:
@@ -178,8 +194,10 @@ whole -- one it refuses is left as it was, its snapshot among it:
    answered for it would lose it at the next cut.
 
 As etcd does, the log since the snapshot is held in memory (`MemStorage`,
-in pieces), and the files are for its durability. After a snapshot, segments
-are removed oldest first while none holds an entry past it.
+in pieces), and the files are for its durability -- the snapshot's bytes
+are not: they are read from their file as they are needed. After a
+snapshot, segments are removed oldest first while none holds an entry past
+it.
 
 ## The replicated state machine
 
@@ -242,8 +260,11 @@ say.
   its own last write's, so that it reads its writes.
 - **Snapshots** are taken once the entries applied since the last are as
   large as the state, with a floor (`SNAPSHOT_FLOOR`, 1 MiB). The state is
-  frozen at the index applied then and written a few pieces a call while
-  applying goes on; the store then compacts the log. A leader's snapshot
+  frozen at the index applied then and gathered a few pieces a call while
+  applying goes on -- no more than `Config::max_snapshot_bytes`, past which
+  it is given up and counted (`RsmStats::snapshots_given_up`: the log is not
+  compacted, and grows) -- then handed to the store, which writes it a few
+  pieces a call too and compacts the log. A leader's snapshot
   restores the sessions and the state -- read by the state machine before
   the store makes it the whole of the log, so that one it cannot read stops
   the member over the store it had, which a start can still read.
@@ -340,7 +361,12 @@ Nothing the crate allocates is larger than a block of the kernel's heap,
 however long the log or busy the group: a message is at most 512 KiB
 (`wire::MAX_MESSAGE_BYTES`), an entry 256 KiB, an append's entries 256 KiB
 of data and 4096 of them, the entries waiting to be written 4096, a batch
-handed out to apply 4096 entries, a snapshot 1 GiB in 64 KiB pieces, the
+handed out to apply 4096 entries, a snapshot 1 GiB in 64 KiB pieces --
+each asked of the heap so that a refusal is an error, not a panic, and the
+whole held in memory only while a member takes one of its own, takes one
+in or starts from one, never more than `Config::max_snapshot_bytes`
+(but for a start, which reads the snapshot it has), which a kernel's caller
+sets from what its heap gives that size class (raftmember does) -- the
 membership changes in the log kept in pieces of 1024, `MemStorage`'s log
 in pieces of 1024 that a snapshot drops whole rather than copying what
 comes after it; a `Ready` hands out
