@@ -215,7 +215,7 @@ MUTANTS = [
      '        self.fresh = self.segments.is_empty();\n'
      '        for &i in snaps.iter() {\n'
      '            if found.marker.map(|m| m.index) != Some(i) {\n'
-     '                let _ = self.files.remove(&snap_name(i));\n'
+     '                let _ = self.files.get_mut().remove(&snap_name(i));\n'
      '            }\n'
      '        }\n'
      '        if self.fresh && !snaps.is_empty() {',
