@@ -507,6 +507,15 @@ pub struct Session {
     open: BTreeMap<u32, (u64, bool)>,
     /// Closes out for places idle: place -> cs's not answered.
     closing: BTreeMap<u32, BTreeSet<u32>>,
+    /// Places written again while their close was out: each write to one
+    /// goes to every replica directly, behind that close on the way, and the
+    /// close is sent no more -- until the place is closed again, when every
+    /// close of before has come. Along a chain the write could pass the
+    /// close, and a close sent again could come after it: either closed the
+    /// chunk over the write, and a writer taken over before its next close
+    /// found the chunk open nowhere, its reconcile leaving the replicas apart
+    /// (found by fuzz/nbs's cluster target after the review of 2026-11).
+    direct: BTreeSet<u32>,
     /// Places the reconcile mends whether or not a replica holds their
     /// chunk open: those of the writes out when the session attached anew
     /// (N13c).
@@ -558,7 +567,8 @@ impl Session {
             subs: BTreeMap::new(), pieces: BTreeMap::new(), next_piece: 1, ops: BTreeMap::new(), next_op: 1,
             queue: VecDeque::new(), parked: Vec::new(), fenced: BTreeSet::new(), held: BTreeMap::new(),
             held_chunks: BTreeSet::new(),
-            dirty: BTreeSet::new(), open: BTreeMap::new(), closing: BTreeMap::new(), mend_too: BTreeSet::new(),
+            dirty: BTreeSet::new(), open: BTreeMap::new(), closing: BTreeMap::new(), direct: BTreeSet::new(),
+            mend_too: BTreeSet::new(),
             mend: BTreeSet::new(),
             mending: None, scratch: Vec::new(), stop: None, stop_flush: None, reads: BTreeMap::new(),
             copies: BTreeMap::new(), pausing: None, starved: false, after_map: Vec::new(), reattaching: false,
@@ -1248,7 +1258,11 @@ impl Session {
     /// pieces go to each replica directly then, a chain's hops one after
     /// another being all its time at depth 1 (N13c).
     fn alone(&self, pid: u64) -> bool {
-        let Some(op) = self.pieces.get(&pid).map(|p| p.op) else { return false };
+        let Some((op, place)) = self.pieces.get(&pid).map(|p| (p.op, p.place)) else { return false };
+        /* Behind a close of before (`direct`) */
+        if self.direct.contains(&place) {
+            return true;
+        }
         !self.pieces.values().any(|q| {
             q.op != op && q.left && self.ops.get(&q.op).is_some_and(|o| o.kind == Kind::Write)
         })
@@ -2228,7 +2242,11 @@ impl Session {
         for (pid, place) in made {
             if kind == Kind::Write {
                 self.open.insert(place, (now, false));
-                reopened |= self.closing.remove(&place).is_some();
+                if self.closing.remove(&place).is_some() {
+                    reopened = true;
+                    self.subs.retain(|_, s| s.what != What::Close(place));
+                    self.direct.insert(place);
+                }
             }
             self.send_piece(pid, now, bufs, out);
         }
@@ -2420,6 +2438,7 @@ impl Session {
             if w.is_empty() {
                 self.closing.remove(&place);
                 self.open.remove(&place);
+                self.direct.remove(&place);
             }
         }
         self.closes_progress(now, bufs, out);
@@ -2562,6 +2581,8 @@ impl Session {
         self.piece_ids.clear();
         self.open.clear();
         self.closing.clear();
+        /* Closes of before refused from the fence on */
+        self.direct.clear();
         /* What is dirty kept: a write done before, not flushed, is on its
            replicas' caches still, and the next flush asks them (the review of
            2026-11) */

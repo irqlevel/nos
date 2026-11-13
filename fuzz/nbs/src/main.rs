@@ -67,10 +67,24 @@ const CLUSTER_STEPS: u64 = 2000;
 /// copy-up a stuck join held back (7225); and a write out by a view of its
 /// set that a map read finds changed sent again by the new view
 /// (`client_resend_changed`), its race moved past the range by the lone
-/// writes' course (2758, 4206: a write done that a replica lacks). A
+/// writes' course (2758, 4206: a write done that a replica lacks). And
+/// those the review of 2026-11's fixes moved on, found again by a campaign
+/// of each mutant: a write of a chain applied before a join of its set
+/// began written again as it comes again (`relayed_joins`, 5375); the
+/// copy-up ended only once every member active in the view has copied
+/// (`client_copy_every_active`, 2962), one asked by a view behind its set
+/// asked again from its start (`client_copy_stale_view`, 9122) and one a
+/// member refuses as of another epoch or map asked again
+/// (`client_copy_refused_again`, 8918); a writer's start reconciling the
+/// open chunks past a cs's first page of three (`client_held_pages`, 4710);
+/// and a write to a place whose close is out sent to each replica
+/// directly, the close sent no more (`client_reopened_direct`, 10774: a
+/// close sent again came after the write and closed the chunk over it, the
+/// writer taken over before its next close, its replicas left apart). A
 /// stopgap: a race moved on by the next change is lost again, which the
 /// mutants say.
-const GATE_CLUSTER_ALSO: [u64; 13] = [1232, 2759, 5241, 6647, 7786, 1219, 1960, 2149, 3663, 5316, 7225, 2758, 4206];
+const GATE_CLUSTER_ALSO: [u64; 19] = [1232, 2759, 5241, 6647, 7786, 1219, 1960, 2149, 3663, 5316, 7225, 2758, 4206,
+                                      5375, 2962, 9122, 8918, 4710, 10774];
 const GATE_JOIN_SEEDS: u64 = 800;
 /// The `tail` target's: the cluster target's over a volume no whole number of
 /// chunks (the review of 2026-11).
