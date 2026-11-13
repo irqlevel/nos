@@ -25,7 +25,7 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -44,18 +44,26 @@ pub const TURN_NS: u64 = 50_000_000;
 pub const BLOCK: u64 = nbsclient::BLOCK;
 /// A request to a cs as it goes: between hosts by the bulk connection.
 const REQUEST: u32 = TAG_REQUEST | TAG_BULK;
-/// How long a start or a stop is waited for: the attach's own limit, then
-/// the map, the fences and a reconcile of a whole volume's open chunks.
+/// How long a start or a stop is waited for with nothing moving: the
+/// attach's own limit, then the map, the fences and the reconcile -- whose
+/// every chunk mended counts as moving, so that one of thousands of chunks
+/// open, 4 MiB each, goes on for as long as it moves (the review of
+/// 2026-11: a big one was given up at 120 s, each try begun again).
 const START_NS: u64 = 120_000_000_000;
 /// How long an operation is waited for: past the session's own deadline,
 /// which fails it first.
 const WAIT_NS: u64 = 2 * nbsclient::DEADLINE_NS;
-/// The session's mailbox: room for the answers of the requests a disk keeps
-/// out -- a read's data comes in pieces of up to 256 KiB -- and for every
-/// answer its requests out can bring, with some to spare: closes are let out
-/// 128 places at a time (nbsclient's `CLOSING_MAX`), writes and reads by the
-/// driver's depth. An answer refused for room is lost, and its replica asked
-/// out as silent (N13b: 1,024 places, overflowed by a stop's closes).
+/// The session's mailbox: room for every answer its requests out can bring
+/// by count -- closes are let out 128 places at a time (nbsclient's
+/// `CLOSING_MAX`), writes and reads by the driver's depth (N13b: 1,024
+/// places, overflowed by a stop's closes). Not by bytes: a read's data comes
+/// in pieces of up to 256 KiB, and hv's disk keeps 64 out, 16 MiB, where a
+/// module's mailboxes hold 64 MiB together -- a mailbox that big would leave
+/// hv four volumes. What it holds is taken at every turn, and an answer the
+/// mailbox has no room for is lost: its request is sent again in a second,
+/// and its replica asked out only where the leader's look finds it silent
+/// too -- the ask let go of once the replica answers (the review of
+/// 2026-11, which found the room said here for bytes it was not).
 const LIMITS: Limits = Limits { messages: 4096, bytes: 8 << 20 };
 
 /// The driver's buffers, by an operation's tag: a write's bytes, the room
@@ -104,6 +112,12 @@ pub struct Drive {
     next_tag: u64,
     /// The session's last line: why an operation failed, as it said it.
     last: String,
+    /// The hosts, by their number on the channel, whose answers are taken
+    /// as a cs's: the session's map's, each learned at its first answer.
+    /// What another host sends is no cs's word, and dropped (the review of
+    /// 2026-11): a request's id is a count, and the mds's word comes from
+    /// this host alone.
+    answer_hosts: BTreeSet<u16>,
 }
 
 /// Tags of the driver's own blocking calls: past those `submit` hands out.
@@ -159,11 +173,12 @@ impl Drive {
             }
         }
         let mut d = Drive { s, mb, me: String::from(me), bufs: Bufs::default(), done: BTreeMap::new(), next_tag: 1,
-                            last: String::new() };
+                            last: String::new(), answer_hosts: BTreeSet::new() };
         let mut out = Vec::new();
         d.s.start(boot_time_ns(), &mut out);
         d.handle(out);
-        let end = boot_time_ns() + START_NS;
+        let mut end = boot_time_ns() + START_NS;
+        let mut moved = d.s.progress();
         loop {
             match d.s.phase() {
                 Phase::Serving => return Ok(d),
@@ -171,8 +186,13 @@ impl Drive {
                 Phase::Detached => return Err(String::from("detached before it served")),
                 _ => {}
             }
+            if d.s.progress() != moved {
+                moved = d.s.progress();
+                end = boot_time_ns() + START_NS;
+            }
             if boot_time_ns() >= end {
-                return Err(alloc::format!("{} not serving in {} s: {}", name, START_NS / 1_000_000_000, d.s.report()));
+                return Err(alloc::format!("{} not serving, nothing moving in {} s: {}", name, START_NS / 1_000_000_000,
+                                          d.s.report()));
             }
             d.turn(TURN_NS);
         }
@@ -250,10 +270,26 @@ impl Drive {
             return;
         }
         match m.tag & !TAG_BULK {
-            TAG_ANSWER => self.s.on_cs(&m.data, now, &mut self.bufs, out),
-            TAG_SAID => self.s.on_mds(&m.data, now, &mut self.bufs, out),
+            TAG_ANSWER if self.from_a_cs(m) => self.s.on_cs(&m.data, now, &mut self.bufs, out),
+            TAG_SAID if m.from.host() == 0 => self.s.on_mds(&m.data, now, &mut self.bufs, out),
             _ => {}
         }
+    }
+
+    /// Whether message `m` comes from a host a cs of the session's map is on:
+    /// this one, or one learned so -- its name looked up at its first answer
+    /// alone, a set's look after.
+    fn from_a_cs(&mut self, m: &kcore::ipc::Message) -> bool {
+        let h = m.from.host();
+        if h == 0 || self.answer_hosts.contains(&h) {
+            return true;
+        }
+        let Some(name) = kcore::ipc::peer_name(m.from) else { return false };
+        if !self.s.knows_host(&name) {
+            return false;
+        }
+        self.answer_hosts.insert(h);
+        true
     }
 
     /// What the session asks done: its messages sent -- one the channel

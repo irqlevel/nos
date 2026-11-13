@@ -244,6 +244,13 @@ pub trait App: Sized {
     fn halt(&self, _core: &Core<Self>) -> Option<String> {
         None
     }
+
+    /// A read the app asked (`Core::read`), as request `request`: `served`
+    /// once the leader confirmed it and this member has applied as far --
+    /// its state as new as everything committed before it was asked -- or
+    /// not: the leadership changed, the leader had no room for it, or no
+    /// confirmation came in time.
+    fn on_read(&mut self, _core: &mut Core<Self>, _request: u64, _served: bool) {}
 }
 
 /// What a request is answered: the command's answer, or what went wrong.
@@ -466,6 +473,13 @@ impl<A: App> Core<A> {
 
     pub fn mailbox(&self) -> &Mailbox {
         &self.mb
+    }
+
+    /// A linearizable read, as request `request`: the app's `on_read` once
+    /// it is served or failed. `Err` where it cannot be asked now -- no
+    /// leader, as many reads waiting as are kept.
+    pub fn read(&mut self, request: u64) -> Result<(), String> {
+        self.rsm.read(request, Vec::new()).map_err(|e| alloc::format!("{:?}", e))
     }
 
     /// A message the app took for no one's.
@@ -980,6 +994,8 @@ impl<A: App> Core<A> {
                     self.finish(app, w, Err(String::from("not applied: its number was gone by -- ask again")), 0);
                 }
             }
+            Event::Read { request, .. } => app.on_read(self, request, true),
+            Event::ReadFailed { request } => app.on_read(self, request, false),
             _ => {}
         }
     }

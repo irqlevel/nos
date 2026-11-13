@@ -36,10 +36,12 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::future::{poll_fn, ready, Future};
+use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
-use nbscs::{ChunkRef, Device, Epoch, Error, Identity, IoError, OpenError, SlotState, Store, COPY_PIECE, PAGE, SLOT};
+use nbscs::{ChunkRef, Decoded, Device, Epoch, Error, Identity, IoError, OpenError, SlotState, Store, Super, COPY_PIECE,
+            PAGE, SLOT};
 use nbswire::serve::{collect, serve, serve_relayed, AskNow, Asker, Done, Requests};
 use nbswire::{Op as WireOp, Question, Refusal, Relay, Request, Told};
 
@@ -392,6 +394,9 @@ struct Run {
     r: Rng,
     disks: Vec<Rc<RefCell<Disk>>>,
     identities: Vec<Identity>,
+    /// Each disk's format, as the metadata would record it: every reopen
+    /// held to it (the review of 2026-11).
+    formats: Vec<u64>,
     store: Store<Handle>,
     /// Each volume's generation now, and the fence answered.
     generation: [u64; VOLUMES as usize + 1],
@@ -433,7 +438,7 @@ impl Run {
     /// Every slot of every device free, held by a chunk, or lost -- none
     /// leaked, none twice.
     fn accounted(&self) -> Result<(), String> {
-        let held = self.store.holdings();
+        let held = holdings(&self.store);
         for d in self.store.devices() {
             let on = held.iter().filter(|h| h.device == d.device).count() as u32;
             if d.free + on + d.lost != d.slots {
@@ -451,7 +456,7 @@ impl Run {
             order.reverse();
         }
         for i in order {
-            match nbscs::now(store.open_device(Handle(self.disks[i].clone()), self.identities[i])) {
+            match nbscs::now(store.open_device(Handle(self.disks[i].clone()), self.identities[i], self.formats[i])) {
                 Ok((_, rep)) => {
                     if self.trace {
                         eprintln!("  reopen disk {}: {:?}", i, rep);
@@ -651,6 +656,30 @@ impl Run {
         Ok(())
     }
 
+    /// A device failed under the step, until the cut: no flush of the cs's
+    /// says done -- what was written to the device may be gone -- and the
+    /// cs is no join's source, whose listing of a set's chunks would leave
+    /// out what the device holds (the review of 2026-11: a flush answered
+    /// done with nothing flushed, and a joiner made a member without the
+    /// chunks on its source's failed device).
+    fn failed_device(&mut self, step: u64) -> Result<(), String> {
+        if !self.store.devices().iter().any(|d| d.failed) {
+            return Ok(());
+        }
+        self.count("devices failed under a step");
+        if let Ok(()) = nbscs::now(self.store.flush()) {
+            return Err(format!("step {}: a flush done with a device failed", step));
+        }
+        let set = self.chunks[self.r.below(u64::from(CHUNKS)) as usize].epoch.set;
+        let req = Request { id: step, volume: 0, generation: 0,
+                            op: WireOp::Holdings { set, from: 0, joiner: 7, version: 1, index: 0 } };
+        match nbscs::now(serve(&self.store, &self.vouched, &req, &AskNow::new(|_| Some(Told::Verified)))) {
+            Err(Refusal::Failed) => Ok(()),
+            got => Err(format!("step {}: set {}'s chunks listed for a joiner with a device failed: {:?}", step, set,
+                               got.map(|d| format!("{:?}", d).chars().take(60).collect::<String>()))),
+        }
+    }
+
     /// Whether a disk's power has failed under the step.
     fn dead(&self) -> bool {
         self.disks.iter().any(|d| d.borrow().dead)
@@ -664,6 +693,7 @@ impl Run {
         }
         self.op(step)?;
         if self.dead() {
+            self.failed_device(step)?;
             /* The cut it was: what the step did not get answered may be
                there or not */
             self.count("cuts in a request");
@@ -966,6 +996,7 @@ impl Run {
                or not -- a cs that missed it */
             88..=93 => {
                 let tell = self.r.chance(60);
+                let mut kept = false;
                 self.count(if tell { "frees told" } else { "frees missed" });
                 let m = &self.chunks[c as usize];
                 /* Now and then a read vouched for first -- at an epoch the cs
@@ -995,8 +1026,26 @@ impl Run {
                 if racing {
                     self.free_racing_a_read(c, step)?;
                 } else if tell {
-                    match nbscs::now(self.store.free(c, m.incarnation)) {
+                    /* At the epoch the garbage pass listed it at -- now and
+                       then one it moved on from since, a copy's or a write's,
+                       which keeps it (the review of 2026-11) */
+                    let at = self.store.holding(c).filter(|h| h.incarnation == m.incarnation);
+                    let moved = at.is_some() && aim.chance(10);
+                    let known = match at {
+                        Some(h) if moved => Epoch { set: h.known.set, version: h.known.version.wrapping_add(1) },
+                        Some(h) => h.known,
+                        None => m.epoch,
+                    };
+                    match nbscs::now(self.store.free(c, m.incarnation, known)) {
                         Err(Error::Io) if self.dead() => {}
+                        Ok(true) if moved => {
+                            return Err(format!("step {}: chunk {} freed as listed at {:?}, held at {:?} since", step,
+                                               c, known, at.map(|h| h.known)));
+                        }
+                        Ok(_) if moved => {
+                            self.count("frees of a chunk moved on since its listing, kept");
+                            kept = true;
+                        }
                         r => {
                             r.map_err(|e| format!("step {}: free of {}: {:?}", step, c, e))?;
                         }
@@ -1023,7 +1072,7 @@ impl Run {
                 m.maybe_volume = None;
                 m.closed = false;
                 m.at_close = None;
-                m.told_free = tell;
+                m.told_free = tell && !kept;
             }
             /* The chunk's set changed: its version up */
             94..=95 => {
@@ -1354,15 +1403,174 @@ impl Run {
     }
 }
 
+/// A future polled once, with nothing to wake.
+fn poll_once<T>(f: &mut Pin<Box<dyn Future<Output = T> + '_>>) -> Poll<T> {
+    f.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+}
+
+/// A chunk's first write still waiting for the mds's word as a joiner asks
+/// a source for the set's chunks: the listing waits for it, and names the
+/// chunk once it is written (the review of 2026-11: listed at once, it left
+/// the chunk out -- its slot not yet taken -- and the joiner was made a
+/// member without it, reading zeros where the set had data).
+fn first_write_listed(r: &mut Rng, sector: u64) -> Result<(), String> {
+    let id = Identity { cluster: [7; 16], cs: 3, device: 98 };
+    let d = Rc::new(RefCell::new(Disk::new(sector, 12 * SLOT)));
+    let store = Store::new();
+    if let Err((_, e)) = nbscs::now(store.format_device(Handle(d.clone()), id, 11)) {
+        return Err(format!("a disk not formatted: {:?}", e));
+    }
+    let (volume, generation, set) = (1u32, 1u64, 4u32);
+    nbscs::now(store.fence(volume, generation)).map_err(|e| format!("not fenced: {:?}", e))?;
+    let chunk = ChunkRef { chunk: 1 + r.below(30) as u32, incarnation: 1, epoch: Epoch { set, version: 2 } };
+    let data = vec![0x5au8; sector as usize];
+    let requests = Requests::new();
+    let mds = Later::default();
+    let write = Request { id: 1, volume, generation,
+                          op: WireOp::Write { chunk, position: 0, index: 0, offset: 0, data: &data } };
+    let mut w: Pin<Box<dyn Future<Output = Result<Done, Refusal>>>> = Box::pin(serve(&store, &requests, &write, &mds));
+    if poll_once(&mut w).is_ready() {
+        return Err(String::from("a first write of a chunk not held answered before the mds's word"));
+    }
+    let listing = Request { id: 2, volume: 0, generation: 0,
+                            op: WireOp::Holdings { set, from: 0, joiner: 9, version: 2, index: 0 } };
+    let joined = AskNow::new(|_| Some(Told::Verified));
+    let mut l: Pin<Box<dyn Future<Output = Result<Done, Refusal>>>> = Box::pin(serve(&store, &requests, &listing, &joined));
+    let early = poll_once(&mut l);
+    *mds.told.borrow_mut() = Some(Told::Verified);
+    match poll_once(&mut w) {
+        Poll::Ready(Ok(_)) => {}
+        other => return Err(format!("the first write, its word given: {:?}", other.map(|x| x.map(|_| ())))),
+    }
+    let listed = match early {
+        Poll::Ready(got) => got,
+        Poll::Pending => match poll_once(&mut l) {
+            Poll::Ready(got) => got,
+            Poll::Pending => return Err(String::from("the listing still waits once the write before it is done")),
+        },
+    };
+    match listed {
+        Ok(Done::Chunks(list)) if list.iter().any(|e| e.0 == chunk.chunk) => Ok(()),
+        other => Err(format!("set {}'s chunks listed with chunk {}'s first write on its way: {:?}", set, chunk.chunk,
+                             other.map(|d| format!("{:?}", d)))),
+    }
+}
+
+/// An mds that, once let speak, says chunk `gone` is gone and no volume is.
+struct SaysGone {
+    open: Cell<bool>,
+    gone: u32,
+}
+
+impl Asker for SaysGone {
+    fn ask(&self, question: Question) -> impl Future<Output = Option<Told>> + '_ {
+        poll_fn(move |_| {
+            if !self.open.get() {
+                return Poll::Pending;
+            }
+            Poll::Ready(Some(match &question {
+                Question::Live { .. } => Told::Gone(vec![self.gone]),
+                Question::Volumes { .. } => Told::Gone(Vec::new()),
+                _ => Told::Verified,
+            }))
+        })
+    }
+}
+
+/// The garbage pass's chunk taken at a newer epoch of its set between the
+/// listing and the mds's word that it is gone -- a copy's write, the cs made
+/// the set's joiner meanwhile: kept. The word was of the chunk as listed,
+/// and a free at the epoch it is held at now would take what the copy wrote
+/// (the review of 2026-11: a replica taken out kept its chunks for good, and
+/// the fix frees them only as listed).
+fn listed_epoch_kept(r: &mut Rng, sector: u64) -> Result<(), String> {
+    let id = Identity { cluster: [7; 16], cs: 3, device: 96 };
+    let d = Rc::new(RefCell::new(Disk::new(sector, 12 * SLOT)));
+    let store = Store::new();
+    if let Err((_, e)) = nbscs::now(store.format_device(Handle(d.clone()), id, 15)) {
+        return Err(format!("a disk not formatted: {:?}", e));
+    }
+    let (volume, generation) = (3u32, 1u64);
+    nbscs::now(store.fence(volume, generation)).map_err(|e| format!("not fenced: {:?}", e))?;
+    let chunk = 1 + r.below(30) as u32;
+    let listed = ChunkRef { chunk, incarnation: 1, epoch: Epoch { set: 6, version: 2 } };
+    let data = vec![0x33u8; sector as usize];
+    nbscs::now(store.write(volume, generation, listed, 0, &data, true)).map_err(|e| format!("not written: {:?}", e))?;
+    let requests = Requests::new();
+    let mds = SaysGone { open: Cell::new(false), gone: chunk };
+    let mut pass: Pin<Box<dyn Future<Output = nbswire::serve::Collected>>> = Box::pin(collect(&store, &requests, &mds));
+    if poll_once(&mut pass).is_ready() {
+        return Err(String::from("the garbage pass done before its mds's word"));
+    }
+    let taken = ChunkRef { epoch: Epoch { set: 6, version: 3 }, ..listed };
+    nbscs::now(store.write(volume, generation, taken, 0, &data, true)).map_err(|e| format!("not written: {:?}", e))?;
+    mds.open.set(true);
+    let Poll::Ready(done) = poll_once(&mut pass) else {
+        return Err(String::from("the garbage pass still waits once its mds has spoken"));
+    };
+    if done.freed.iter().any(|&(c, _)| c == chunk) || store.holding(chunk).is_none() {
+        return Err(format!("chunk {} freed as gone when listed at {:?}, taken at {:?} since", chunk, listed.epoch,
+                           taken.epoch));
+    }
+    Ok(())
+}
+
+/// A fence past the one the cs has, asked of it by anyone: laid only once
+/// the mds vouches it the volume's writer's now -- refused as the mds says
+/// otherwise, the fence as it was, and its writer's requests still taken
+/// (the review of 2026-11: any host of the registry could fence any volume
+/// at any generation, up to the last, and its writer was refused).
+fn fence_vouched(r: &mut Rng, sector: u64) -> Result<(), String> {
+    let id = Identity { cluster: [7; 16], cs: 3, device: 97 };
+    let d = Rc::new(RefCell::new(Disk::new(sector, 12 * SLOT)));
+    let store = Store::new();
+    if let Err((_, e)) = nbscs::now(store.format_device(Handle(d.clone()), id, 13)) {
+        return Err(format!("a disk not formatted: {:?}", e));
+    }
+    let (volume, writer) = (2u32, 1 + r.below(5));
+    nbscs::now(store.fence(volume, writer)).map_err(|e| format!("not fenced: {:?}", e))?;
+    let requests = Requests::new();
+    let stranger = writer + 1 + r.below(u64::MAX - writer - 1);
+    let req = Request { id: 1, volume, generation: stranger, op: WireOp::Fence { index: r.below(1000) } };
+    let mds = AskNow::new(|q| match q {
+        Question::VerifyFence { .. } => Some(Told::Refused(Refusal::NotAttached)),
+        _ => Some(Told::Verified),
+    });
+    match nbscs::now(serve(&store, &requests, &req, &mds)) {
+        Err(Refusal::NotAttached) => {}
+        got => return Err(format!("a fence at {} the mds refuses, the cs at {}: {:?}", stranger, writer,
+                                  got.map(|d| format!("{:?}", d)))),
+    }
+    if store.fence_of(volume) != writer {
+        return Err(format!("a fence the mds refused laid: {} for {}", store.fence_of(volume), writer));
+    }
+    /* Vouched for, it is laid */
+    let mds = AskNow::new(|_| Some(Told::Verified));
+    match nbscs::now(serve(&store, &requests, &req, &mds)) {
+        Ok(_) if store.fence_of(volume) == stranger => Ok(()),
+        got => Err(format!("a fence the mds vouches for not laid: {:?}, the cs at {}",
+                           got.map(|d| format!("{:?}", d)), store.fence_of(volume))),
+    }
+}
+
 /// What a disk that is not a cs's of this identity opens as: blank where it
 /// is zeros, refused and left as it is where it has anything else in its
 /// first two pages, told apart where it is another cs's.
 fn strangers(r: &mut Rng, sector: u64) -> Result<(), String> {
     let id = Identity { cluster: [7; 16], cs: 3, device: 99 };
     let d = Rc::new(RefCell::new(Disk::new(sector, 12 * SLOT)));
-    match nbscs::now(Store::new().open_device(Handle(d.clone()), id)) {
+    match nbscs::now(Store::new().open_device(Handle(d.clone()), id, 0)) {
         Err((_, OpenError::Blank)) => {}
         other => return Err(format!("a blank disk opened as {:?}", other.map(|(_, rep)| rep).map_err(|(_, e)| e))),
+    }
+    /* Blank where the metadata has a format of it: wiped or rotten, what
+       it held lost -- not one to format again (the review of 2026-11) */
+    match nbscs::now(Store::new().open_device(Handle(d.clone()), id, 1 + r.below(u64::MAX - 1))) {
+        Err((_, OpenError::Lost)) => {}
+        other => {
+            return Err(format!("a blank disk of a format recorded opened as {:?}",
+                               other.map(|(_, rep)| rep).map_err(|(_, e)| e)));
+        }
     }
     /* One byte past a superblock's: a boot sector's signature, a GPT
        header, ext's superblock at 1 KiB, or anywhere in the two pages */
@@ -1379,7 +1587,7 @@ fn strangers(r: &mut Rng, sector: u64) -> Result<(), String> {
         disk.durable.insert(at / sector, v);
     }
     let before = d.borrow().durable.clone();
-    match nbscs::now(Store::new().open_device(Handle(d.clone()), id)) {
+    match nbscs::now(Store::new().open_device(Handle(d.clone()), id, 0)) {
         Err((_, OpenError::Corrupt(_))) => {}
         other => {
             return Err(format!("a disk with a byte at {} of its first pages opened as {:?}", at,
@@ -1395,10 +1603,50 @@ fn strangers(r: &mut Rng, sector: u64) -> Result<(), String> {
     if let Err((_, e)) = nbscs::now(Store::new().format_device(Handle(other.clone()), theirs, 5)) {
         return Err(format!("a disk not formatted: {:?}", e));
     }
-    match nbscs::now(Store::new().open_device(Handle(other.clone()), id)) {
-        Err((_, OpenError::Foreign(i))) if i == theirs => Ok(()),
-        got => Err(format!("another cs's disk opened as {:?}", got.map(|(_, rep)| rep).map_err(|(_, e)| e))),
+    match nbscs::now(Store::new().open_device(Handle(other.clone()), id, 0)) {
+        Err((_, OpenError::Foreign(i))) if i == theirs => {}
+        got => return Err(format!("another cs's disk opened as {:?}", got.map(|(_, rep)| rep).map_err(|(_, e)| e))),
     }
+    /* Its own, at another format than the metadata has -- formatted again,
+       an old copy -- refused; at the one it has, or where it has none,
+       opened */
+    match nbscs::now(Store::new().open_device(Handle(other.clone()), theirs, 6)) {
+        Err((_, OpenError::OtherFormat(5))) => {}
+        got => return Err(format!("a disk of format 5 opened as of 6: {:?}", got.map(|(_, rep)| rep).map_err(|(_, e)| e))),
+    }
+    for recorded in [0, 5] {
+        if let Err((_, e)) = nbscs::now(Store::new().open_device(Handle(other.clone()), theirs, recorded)) {
+            return Err(format!("a disk of format 5 not opened, its format recorded as {}: {:?}", recorded, e));
+        }
+    }
+    /* A format cut after its copy A of the superblock, or a copy rotted:
+       the other written again as the disk is opened -- left as it was, one
+       bit of the good copy rotted later read as blank, and a blank disk was
+       formatted over what it held (the review of 2026-11) */
+    let torn = Rc::new(RefCell::new(Disk::new(sector, 12 * SLOT)));
+    if let Err((_, e)) = nbscs::now(Store::new().format_device(Handle(torn.clone()), theirs, 9)) {
+        return Err(format!("a disk not formatted: {:?}", e));
+    }
+    let copy = r.below(2);
+    {
+        let mut disk = torn.borrow_mut();
+        let per = PAGE / sector;
+        for k in copy * per..(copy + 1) * per {
+            disk.durable.remove(&k);
+        }
+    }
+    if let Err((_, e)) = nbscs::now(Store::new().open_device(Handle(torn.clone()), theirs, 9)) {
+        return Err(format!("a disk with its superblock's copy {} gone not opened: {:?}", copy, e));
+    }
+    for k in 0..2 {
+        let mut page = vec![0u8; PAGE as usize];
+        Handle(torn.clone()).read_now(k * PAGE, &mut page).map_err(|_| String::from("a superblock not read"))?;
+        if !matches!(Super::decode(&page), Decoded::Valid(_)) {
+            return Err(format!("the superblock's copy {} not written again at the open, copy {} gone before", k,
+                               copy));
+        }
+    }
+    Ok(())
 }
 
 /// A write of a chain (N13) on a cs of its own, served as nbs-cs serves
@@ -1466,9 +1714,13 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     let mut r = Rng::new(mix(seed, 0x6373));
     let sector = if r.chance(30) { PAGE } else { 512 };
     strangers(&mut r, sector)?;
+    first_write_listed(&mut r, sector)?;
+    fence_vouched(&mut r, sector)?;
+    listed_epoch_kept(&mut r, sector)?;
     relayed(seed, sector)?;
     let disks = 1 + r.below(3) as usize;
     let mut identities = Vec::new();
+    let mut formats = Vec::new();
     let mut handles = Vec::new();
     for i in 0..disks {
         /* Small disks, so that a run fills them: 12 to 40 slots */
@@ -1478,7 +1730,9 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     }
     let store = Store::new();
     for (i, d) in handles.iter().enumerate() {
-        if let Err((_, e)) = nbscs::now(store.format_device(Handle(d.clone()), identities[i], 1 + r.below(u64::MAX - 1))) {
+        let format = 1 + r.below(u64::MAX - 1);
+        formats.push(format);
+        if let Err((_, e)) = nbscs::now(store.format_device(Handle(d.clone()), identities[i], format)) {
             return Err(format!("disk {} not formatted: {:?}", i, e));
         }
     }
@@ -1494,7 +1748,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         told_free: false,
         maybe_volume: None,
     }).collect();
-    let mut run = Run { r, disks: handles, identities, store, generation: [0; VOLUMES as usize + 1],
+    let mut run = Run { r, disks: handles, identities, formats, store, generation: [0; VOLUMES as usize + 1],
                         fenced: [0; VOLUMES as usize + 1], chunks, sector, trace, stats: BTreeMap::new(),
                         last: None, seed, copied: None, vouched: Requests::new() };
     for step in 1..=steps {
@@ -1523,5 +1777,19 @@ impl Asker for Later {
             Some(t) => Poll::Ready(Some(t)),
             None => Poll::Pending,
         })
+    }
+}
+
+/// Every chunk store `store` holds, a page at a time as nbs-cs reads them.
+fn holdings<D: nbscs::Device>(store: &Store<D>) -> Vec<nbscs::Holding> {
+    let mut all: Vec<nbscs::Holding> = Vec::new();
+    loop {
+        let from = all.last().map_or(0, |h| h.chunk + 1);
+        let page = store.holdings_from(from, nbscs::PAGE_OF_CHUNKS);
+        let n = page.len();
+        all.extend(page);
+        if n < nbscs::PAGE_OF_CHUNKS || all.last().is_some_and(|h| h.chunk == u32::MAX) {
+            return all;
+        }
     }
 }

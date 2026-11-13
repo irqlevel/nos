@@ -80,10 +80,15 @@ pub struct Shown {
     pub answers_lost: u64,
 }
 
+/// What the shell shows, as the task last made it: shared, so that the
+/// shell prints a copy of the handle with no lock held -- a print to a
+/// session whose client takes nothing waits up to minutes, and the task's
+/// next `show` waited on the lock as long, serving nothing, until the leader
+/// took the cs for down (found by the review of 2026-11).
 #[derive(Default)]
 struct Status {
     state: String,
-    shown: Shown,
+    shown: Arc<Shown>,
 }
 
 /// Between the cs's task and the shell.
@@ -111,6 +116,7 @@ impl Shared {
     /// What the shell shows, made again; the one before dropped off the
     /// lock.
     pub fn show(&self, shown: Shown) {
+        let shown = Arc::new(shown);
         let old = core::mem::replace(&mut self.status.lock().shown, shown);
         drop(old);
     }
@@ -177,8 +183,10 @@ fn state_name(s: SlotState) -> &'static str {
 }
 
 fn show(shared: &Shared, args: &str, out: &mut Output) {
-    let s = shared.status.lock();
-    let v = &s.shown;
+    let (state, v) = {
+        let s = shared.status.lock();
+        (s.state.clone(), s.shown.clone())
+    };
     match args.trim() {
         "" => {}
         "chunks" => {
@@ -206,11 +214,11 @@ fn show(shared: &Shared, args: &str, out: &mut Output) {
         Some(cs) => {
             let _ = writeln!(out, "nbscs: cs {} -- {}: {} chunks held, {} open, {} volumes fenced, {} requests \
                                    served, {} refused, {} writes passed on along chains, {} not, {} answers \
-                                   lost", cs, s.state, v.held, v.open, v.fences.len(), v.served, v.refused,
+                                   lost", cs, state, v.held, v.open, v.fences.len(), v.served, v.refused,
                              v.passed_on, v.not_passed, v.answers_lost);
         }
         None => {
-            let _ = writeln!(out, "nbscs: {}", s.state);
+            let _ = writeln!(out, "nbscs: {}", state);
         }
     }
     for d in &v.devices {

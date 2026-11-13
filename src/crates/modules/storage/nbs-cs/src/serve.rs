@@ -15,9 +15,13 @@
 //!   rest kept; a step of one not done in 30 s fails its device.
 //! - **Its devices**, from this host's mds (`Question::Identity`), asked
 //!   again every few seconds: each taken in -- opened, or formatted where it
-//!   is blank -- and one that is NBS's but another cluster's or cs's, or
-//!   holds something else, left as it is, said, and tried again each time:
-//!   `nbs devices add ... wipe` clears it, a claim that was in the way goes.
+//!   is blank and the metadata has no format of it -- and one that is NBS's
+//!   but another cluster's or cs's, or holds something else, or is blank
+//!   where the metadata has its format (wiped or rotten: what it held lost),
+//!   left as it is, said, and tried again each time: `nbs devices add ...
+//!   wipe` clears it, a claim that was in the way goes. A device's format is
+//!   proposed for the metadata to record (`Question::Formatted`) until it
+//!   has it.
 //! - **Requests** on `nbs.cs`, each answered to the mailbox it came from --
 //!   and only once every device the metadata gives the cs is taken in: with
 //!   one missing, a chunk on it would read as nothing, and its first write
@@ -54,10 +58,10 @@ use core::task::{Context, Poll, Waker};
 use kcore::ipc::{Error, Limits, Mailbox, Message, Scope, TAG_BULK};
 use kcore::klog;
 use kcore::time::{boot_time_ns, Duration};
-use nbscs::{Device, Identity as DevIdentity, OpenError, SlotState, Store};
+use nbscs::{Device, Identity as DevIdentity, OpenError, Store};
 use nbswire::copy::{self, Copy};
 use nbswire::serve::{collect, serve_relayed, Asker, Requests};
-use nbswire::{Answer, Answered, Op, Query, Question, Refusal, Reply, Request, Told, CS_NAME, TAG_ANSWER,
+use nbswire::{Answer, Answered, JoinView, Op, Query, Question, Refusal, Reply, Request, Told, CS_NAME, TAG_ANSWER,
               TAG_QUERY, TAG_REQUEST, TAG_TOLD};
 
 use crate::disk::QueueDevice;
@@ -71,6 +75,11 @@ use crate::{DeviceShown, Shared, Shown, CHUNKS_SHOWN};
 const IDENTITY_EVERY_MS: u64 = 5_000;
 const IDENTITY_MISSING_MS: u64 = 1_000;
 const GARBAGE_EVERY_MS: u64 = 30_000;
+/// How soon the garbage pass runs again, at the soonest, once a request was
+/// refused for room: the slots of chunks the metadata freed are given back
+/// by it, and a first write placed into their room waited half a minute
+/// (the review of 2026-11).
+const GARBAGE_SOON_MS: u64 = 2_000;
 /// How long the mds is waited for.
 const MDS_WAIT_MS: u64 = 5_000;
 /// How long the task sleeps at most: the grain of every time it keeps.
@@ -144,6 +153,9 @@ struct Cs {
     /// session gone: each one its client takes for the cs's silence (N13b,
     /// where a stop's closes overflowed it and the cs was asked out).
     answers_lost: Cell<u64>,
+    /// A request refused for room since the garbage pass last ran: it runs
+    /// again soon (`GARBAGE_SOON_MS`).
+    no_room: Cell<bool>,
 }
 
 /// A question out to the mds: its id let go of however the ask ends.
@@ -194,7 +206,7 @@ pub fn run(shared: Arc<Shared>) {
         cs: Cell::new(None), taken: RefCell::new(BTreeSet::new()), trouble: RefCell::new(Vec::new()),
         idents: RefCell::new(Vec::new()), serving: Cell::new(false), changed: Cell::new(false),
         served: Cell::new(0), refused: Cell::new(0), overflowed: Cell::new(0), passed_on: Cell::new(0),
-        not_passed: Cell::new(0), answers_lost: Cell::new(0),
+        not_passed: Cell::new(0), answers_lost: Cell::new(0), no_room: Cell::new(false),
     });
     let mut own: Vec<Task> = Vec::new();
     own.push(Box::pin(devices(cs.clone())));
@@ -260,12 +272,17 @@ async fn request(cs: Rc<Cs>, m: Message) {
         cs.answer(&m, to, Answer { id: req.id, reply: Reply::Refused(Refusal::NotReady) });
         return;
     }
-    if matches!(req.op, Op::Fence | Op::Close { .. } | Op::CopyUp { .. }) {
+    if matches!(req.op, Op::Fence { .. } | Op::Close { .. } | Op::CopyUp { .. }) {
         cs.changed.set(true);
     }
     match serve_relayed(&cs.store, &cs.requests, &req, relay.as_ref(), &*cs).await {
         Ok(done) => cs.answer(&m, to, Answer { id: req.id, reply: done.reply() }),
-        Err(why) => cs.answer(&m, to, Answer { id: req.id, reply: Reply::Refused(why) }),
+        Err(why) => {
+            if why == Refusal::NoRoom {
+                cs.no_room.set(true);
+            }
+            cs.answer(&m, to, Answer { id: req.id, reply: Reply::Refused(why) })
+        }
     }
 }
 
@@ -281,8 +298,10 @@ async fn devices(cs: Rc<Cs>) {
             identity_at = boot_time_ns() + every * NS_PER_MS;
         }
         let taken = !cs.taken.borrow().is_empty();
-        if taken && boot_time_ns() >= garbage_at {
+        let soon = cs.no_room.get() && boot_time_ns() + (GARBAGE_EVERY_MS - GARBAGE_SOON_MS) * NS_PER_MS >= garbage_at;
+        if taken && (boot_time_ns() >= garbage_at || soon) {
             garbage_at = boot_time_ns() + GARBAGE_EVERY_MS * NS_PER_MS;
+            cs.no_room.set(false);
             cs.collect().await;
         }
         until(boot_time_ns() + TICK_MS * NS_PER_MS).await;
@@ -293,7 +312,7 @@ async fn devices(cs: Rc<Cs>) {
 /// while it serves, each copied -- the answers to its requests handed to
 /// it as they come, its step taken every tick.
 async fn joins(cs: Rc<Cs>) {
-    let mut j = Joins { copies: Vec::new(), copy_id: 1, seen: false, end_at: 0 };
+    let mut j = Joins { copies: Vec::new(), copy_id: 1, seen: false, give_up: Vec::new(), end_at: 0 };
     let mut joins_at = 0u64;
     loop {
         if cs.serving.get() && boot_time_ns() >= joins_at {
@@ -357,7 +376,11 @@ impl Cs {
         for _ in 0..TAKE_MAX {
             let Some(m) = self.mb.try_recv() else { return false };
             match m.tag & !TAG_BULK {
-                TAG_TOLD => self.answered(&m),
+                /* This host's mds's word alone: a question's id is a count, and
+                   any host of the registry could have one of its own taken for
+                   it (the review of 2026-11) */
+                TAG_TOLD if m.from.host() == 0 => self.answered(&m),
+                TAG_TOLD => {}
                 TAG_ANSWER => {
                     let mut answers = self.copy_answers.borrow_mut();
                     if answers.len() < COPY_ANSWERS_MAX {
@@ -447,10 +470,24 @@ impl Cs {
                 if let Some(i) = self.store.device_index(d.device) {
                     self.store.set_active(i, !d.draining);
                 }
+                /* Its format, for the metadata to record where it has none:
+                   from then on the device read blank is lost, not formatted
+                   again (the review of 2026-11). Asked again next time where
+                   it is not recorded by then */
+                let format = self.store.devices().iter().find(|x| x.device == d.device).map(|x| x.format);
+                if let (0, Some(format)) = (d.format, format) {
+                    match self.ask(Question::Formatted { device: d.device, format }).await {
+                        Some(Told::Verified) => klog!(1, "nbs-cs: device {} ({})'s format recorded", d.device, d.ident),
+                        Some(Told::Refused(why)) => {
+                            klog!(0, "nbs-cs: device {} ({})'s format not recorded: {:?}", d.device, d.ident, why);
+                        }
+                        _ => {}
+                    }
+                }
                 continue;
             }
             let ident = DevIdentity { cluster: id.cluster, cs: id.cs, device: d.device };
-            match self.take(&d.ident, ident, d.slots).await {
+            match self.take(&d.ident, ident, d.slots, d.format).await {
                 Ok(how) => {
                     klog!(1, "nbs-cs: device {} ({}) {}", d.device, d.ident, how);
                     self.taken.borrow_mut().insert(d.device);
@@ -483,14 +520,15 @@ impl Cs {
         }
     }
 
-    /// Device `name` taken in as `ident`'s: opened, or formatted if blank.
-    async fn take(&self, name: &str, ident: DevIdentity, slots: u32) -> Result<&'static str, String> {
+    /// Device `name` taken in as `ident`'s: opened, or formatted if blank
+    /// and of no format the metadata has (`recorded`, 0 for none).
+    async fn take(&self, name: &str, ident: DevIdentity, slots: u32, recorded: u64) -> Result<&'static str, String> {
         let dev = QueueDevice::open(name, &self.shared.event, self.moves.clone())?;
         let have = nbscs::device_slots(dev.bytes());
         if have != slots {
             return Err(alloc::format!("{} slots on it, {} in the metadata -- the device changed size", have, slots));
         }
-        match self.store.open_device(dev, ident).await {
+        match self.store.open_device(dev, ident, recorded).await {
             Ok((_, rep)) => {
                 if rep.lost != 0 {
                     klog!(0, "nbs-cs: {}: {} slots' records lost, those slots never used again", name, rep.lost);
@@ -507,6 +545,12 @@ impl Cs {
                 "NBS's device of another cluster or cs (its cs {}, device {}) -- a disk moved here", other.cs,
                 other.device)),
             Err((_, OpenError::Corrupt(why))) => Err(alloc::format!("{} -- it is left as it is", why)),
+            Err((_, OpenError::Lost)) => Err(String::from(
+                "blank, and formatted before as the metadata has it: wiped or rotten -- what it held is lost to this \
+                 cs, which serves nothing without it; `nbs devices add ... wipe` has it formatted anew")),
+            Err((_, OpenError::OtherFormat(f))) => Err(alloc::format!(
+                "this cs's, of another format ({:016x}) than the metadata has: formatted again, or an old copy of it \
+                 -- it is left as it is", f)),
             Err((_, OpenError::Small)) => Err(String::from("too small for a slot")),
             Err((_, OpenError::Io)) => Err(String::from("it failed to read")),
         }
@@ -603,10 +647,11 @@ impl Cs {
             trouble: Some(why.clone()),
         })).collect();
         drop(idents);
-        let mut held = self.store.holdings();
-        let open = held.iter().filter(|h| h.state == SlotState::Open).count() as u64;
-        let count = held.len() as u64;
-        held.truncate(CHUNKS_SHOWN);
+        /* Counted, and the first CHUNKS_SHOWN listed: every chunk in one
+           list, once a second, was past what the kernel's heap gives at
+           10,922 chunks (found by the review of 2026-11) */
+        let (count, open) = self.store.counts();
+        let held = self.store.holdings_from(0, CHUNKS_SHOWN);
         self.shared.show(Shown { cs: self.cs.get(), devices, held: count, open, chunks: held,
                                  fences: self.store.fenced_volumes(), served: self.served.get(),
                                  refused: self.refused.get() + self.overflowed.get(),
@@ -618,12 +663,19 @@ impl Cs {
 /* ---- joins (N9) ---- */
 
 /// The joins' task's own: the copies, their requests' ids, whether the
-/// joins found as it started were given up, when a copy's end may be asked
-/// again.
+/// joins this cs found as it started are known, those of them not yet given
+/// up, when a copy's end may be asked again.
 struct Joins {
     copies: Vec<Copy>,
     copy_id: u64,
     seen: bool,
+    /// A join found as the cs started -- its marks gone -- by its set and
+    /// `since`: given up, asked again until the mds says it is, and never
+    /// copied. Given up once, a refusal of its end -- no leader in reach --
+    /// left it to be taken for a new join at the next look, its copy begun
+    /// without the marks of the writes applied before the start, which it
+    /// could write over (found by the review of 2026-11).
+    give_up: Vec<(u32, u32)>,
     end_at: u64,
 }
 
@@ -638,10 +690,18 @@ impl Joins {
             self.seen = true;
             for v in &views {
                 klog!(0, "nbs-cs: the join of set {} given up: the cs started again", v.set);
-                self.end(cs, v.set, v.since, false, None).await;
+                self.give_up.push((v.set, v.since));
             }
-            return;
         }
+        /* Those found at the start: asked to be given up until they are, or
+           are over -- none of them is copied */
+        for (set, since) in core::mem::take(&mut self.give_up) {
+            if views.iter().any(|v| v.set == set && v.since == since) && !self.end(cs, set, since, false, None).await {
+                self.give_up.push((set, since));
+            }
+        }
+        let give_up = &self.give_up;
+        let views: Vec<JoinView> = views.into_iter().filter(|v| !give_up.contains(&(v.set, v.since))).collect();
         let mut kept = Vec::new();
         for c in core::mem::take(&mut self.copies) {
             if views.iter().any(|v| v.set == c.set() && v.since == c.since()) {
@@ -696,7 +756,7 @@ impl Joins {
             _ => None,
         }).collect();
         for (set, since, done, stats) in ended {
-            self.end(cs, set, since, done, Some(stats)).await;
+            let _ = self.end(cs, set, since, done, Some(stats)).await;
         }
     }
 
@@ -705,14 +765,16 @@ impl Joins {
     /// once that is applied, or once it is not the join it was; asked again
     /// in a moment where the mds could not. A join done says what its copy
     /// did: a member back pulls whole only what it may have missed (N9f).
-    async fn end(&mut self, cs: &Cs, set: u32, since: u32, done: bool, stats: Option<copy::Stats>) {
+    /// Whether it was: false where the mds could not say, to be asked again.
+    async fn end(&mut self, cs: &Cs, set: u32, since: u32, done: bool, stats: Option<copy::Stats>) -> bool {
         let question = if done { Question::JoinDone { set, since } } else { Question::GiveUp { set, since } };
         match cs.ask(question).await {
             Some(Told::Verified) => {
                 match (done, stats) {
                     (true, Some(s)) => klog!(0, "nbs-cs: set {} joined: this cs is its member now -- {} chunks copied, \
                                                 {} of them found as the source's, {} bytes pulled, {} granules \
-                                                pulled again", set, s.chunks, s.kept, s.bytes, s.again),
+                                                pulled again, {} chunks the source had not dropped", set, s.chunks,
+                                             s.kept, s.bytes, s.again, s.dropped),
                     (true, None) => klog!(0, "nbs-cs: set {} joined: this cs is its member now", set),
                     (false, _) => {}
                 }
@@ -720,12 +782,13 @@ impl Joins {
             Some(Told::Refused(Refusal::NotTheJoiner)) => klog!(1, "nbs-cs: the join of set {} was over", set),
             _ => {
                 self.end_at = boot_time_ns() + END_AGAIN_MS * NS_PER_MS;
-                return;
+                return false;
             }
         }
         self.copies.retain(|c| !(c.set() == set && c.since() == since));
         cs.store.leave(set);
         cs.changed.set(true);
+        true
     }
 
     /// An answer to a copy's request.
@@ -733,7 +796,10 @@ impl Joins {
         let Some(a) = Answer::decode(&m.data) else { return };
         let now = boot_time_ns();
         let mut out = Vec::new();
-        if let Some(c) = self.copies.iter_mut().find(|c| c.sent(a.id)) {
+        /* From the source it was asked of, and no other host: an id is a
+           count (the review of 2026-11) */
+        let from = kcore::ipc::peer_name(m.from);
+        if let Some(c) = self.copies.iter_mut().find(|c| c.sent(a.id) && from.as_deref() == c.source_host()) {
             c.answer(&cs.store, a.id, &a.reply, now, &mut out).await;
             c.step(&cs.store, now, &mut self.copy_id, &mut out).await;
         }

@@ -3,8 +3,9 @@
 //! of the member, or a snapshot being written -- costs a handle a piece, and
 //! a change copies the one piece it touches, and only while a copy holds it
 //! (plans/nbs.md, "The mds's state on disk": taken without stopping). No
-//! piece is ever bigger than a few KiB, where the kernel's heap gives no
-//! block past 512 KiB.
+//! piece is ever bigger than 1024 records -- 176 KiB of volumes, 52 KiB of
+//! sets, a few KiB of chunks or of a map's places -- where the kernel's heap
+//! gives no block past 512 KiB.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

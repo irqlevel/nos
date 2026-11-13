@@ -20,8 +20,10 @@ use crate::{Cluster, Member, Removed, State, MEMBERS_MAX, NAME_MAX, REMOVED_MAX}
 
 /* NBM3: chunks carry their incarnation; NBM4: a writer its client's token;
    NBM5: a cs its state, a set its joiner and its members' last active
-   versions (N9); NBM6: the copy-ups pending (N10) */
-const MAGIC: [u8; 4] = *b"NBM6";
+   versions (N9); NBM6: the copy-ups pending (N10); NBM7: the next attach
+   generation, the cluster's, and the tokens of the sessions that let each
+   volume go (the review of 2026-11) */
+const MAGIC: [u8; 4] = *b"NBM7";
 /// Chunks or map entries a record of the stream carries at most.
 const BATCH: usize = 256;
 /// How much a digest asks of the stream at a time.
@@ -80,6 +82,7 @@ impl FrozenState {
                 }
                 w.u32(s.next_device);
                 w.u32(s.next_volume);
+                w.u64(s.next_generation);
                 w.u64(s.next_check);
                 w.u32(s.free_head);
                 w.u8(s.members.len() as u8);
@@ -120,6 +123,7 @@ impl FrozenState {
                         w.str(&d.ident);
                         w.u32(d.slots);
                         w.u8(device_state_code(d.state));
+                        w.u64(d.format);
                     }
                     At::Cs(i + 1)
                 }
@@ -192,6 +196,9 @@ impl FrozenState {
                     w.u8(v.readers.len() as u8);
                     for r in &v.readers {
                         w.str(r);
+                    }
+                    for &t in &v.released {
+                        w.u64(t);
                     }
                     w.u32(v.map.len() as u32);
                     At::Map(i, 0)
@@ -342,6 +349,7 @@ pub(crate) fn read<S: Source>(r: &mut Stream<S>) -> Result<State, RestoreError> 
     };
     s.next_device = r.u32().ok_or(BAD)?;
     s.next_volume = r.u32().ok_or(BAD)?;
+    s.next_generation = r.u64().ok_or(BAD)?;
     s.next_check = r.u64().ok_or(BAD)?;
     s.free_head = r.u32().ok_or(BAD)?;
     let n = usize::from(r.u8().ok_or(BAD)?);
@@ -382,7 +390,8 @@ pub(crate) fn read<S: Source>(r: &mut Stream<S>) -> Result<State, RestoreError> 
             let ident = r.str(IDENT_MAX).ok_or(BAD)?;
             let slots = r.u32().ok_or(BAD)?;
             let state = device_state(r.u8().ok_or(BAD)?).ok_or(BAD)?;
-            devices.push(Device { id, ident, slots, state });
+            let format = r.u64().ok_or(BAD)?;
+            devices.push(Device { id, ident, slots, state, format });
         }
         s.cs.push(Cs { id, host, devices, reserved, state });
     }
@@ -431,6 +440,10 @@ pub(crate) fn read<S: Source>(r: &mut Stream<S>) -> Result<State, RestoreError> 
     if n > VOLUMES_MAX {
         return Err(RestoreError("more volumes than are kept"));
     }
+    /* The places of every map together bounded as they are read: each map
+       alone bounded by CHUNKS_MAX, 4,096 of them were 64 GiB asked of the
+       heap before the state was held to any rule (the review of 2026-11) */
+    let mut places = 0u64;
     for _ in 0..n {
         let id = r.u32().ok_or(BAD)?;
         let name = r.str(VOLUME_NAME_MAX).ok_or(BAD)?;
@@ -456,15 +469,23 @@ pub(crate) fn read<S: Source>(r: &mut Stream<S>) -> Result<State, RestoreError> 
         for _ in 0..k {
             readers.push(r.str(ipcwire::HOST_MAX).ok_or(BAD)?);
         }
+        let mut released = [0u64; RELEASED_KEPT];
+        for t in released.iter_mut() {
+            *t = r.u64().ok_or(BAD)?;
+        }
         let k = r.u32().ok_or(BAD)? as u64;
         if k != chunks_for(size_mib) || k > CHUNKS_MAX as u64 {
             return Err(RestoreError("a volume's map not of its size"));
+        }
+        places += k;
+        if places > PLACES_MAX {
+            return Err(RestoreError("more places of maps than are kept"));
         }
         let mut map = Pieces::new();
         for _ in 0..k {
             map.push(r.u32().ok_or(BAD)?);
         }
-        s.volumes.push(Volume { id, name, size_mib, kind, origin, host, generation, writer, readers, map });
+        s.volumes.push(Volume { id, name, size_mib, kind, origin, host, generation, writer, readers, released, map });
     }
     let n = r.u32().ok_or(BAD)? as usize;
     if n > COPYING_MAX {
@@ -494,7 +515,9 @@ impl State {
            from 1, a digest no sooner than CHECK_EVERY. Without this a state
            of no volumes and a next number of 0 passed, and its next volume
            was numbered 0 (found by fuzz/nbs's meta target) */
-        if self.next_device == 0 || self.next_volume == 0 || self.next_check < crate::CHECK_EVERY {
+        if self.next_device == 0 || self.next_volume == 0 || self.next_generation == 0
+            || self.next_check < crate::CHECK_EVERY
+        {
             return Err(RestoreError("a counter of the state's at a value applying never leaves it at"));
         }
         let mut idents: Vec<&str> = Vec::new();
@@ -549,14 +572,26 @@ impl State {
         /* Every chunk in use: in a set, counted by as many maps as name it;
            every free one on the free list, which ends */
         let mut named: Pieces<u16> = Pieces::new();
+        /* The volume that named each chunk last, by its place in the table
+           plus one: a map names a chunk once at most, which `share` counts
+           on -- a snapshot of a map naming one chunk at every place was taken,
+           and a clone of it overflowed the chunk's count (found by the review
+           of 2026-11) */
+        let mut last: Pieces<u32> = Pieces::new();
         for _ in 0..self.chunks.len() {
             named.push(0);
+            last.push(0);
         }
-        for v in self.volumes.iter() {
+        for (i, v) in self.volumes.iter().enumerate() {
+            let me = i as u32 + 1;
             for &c in v.map.iter() {
-                let Some(n) = named.get_mut(c as usize) else {
+                let (Some(n), Some(l)) = (named.get_mut(c as usize), last.get_mut(c as usize)) else {
                     return Err(RestoreError("a volume's map naming no chunk"));
                 };
+                if *l == me {
+                    return Err(RestoreError("a volume's map naming a chunk twice"));
+                }
+                *l = me;
                 *n = n.checked_add(1).ok_or(RestoreError("a chunk named too often"))?;
             }
         }
@@ -647,7 +682,7 @@ impl State {
                 return Err(RestoreError("a volume of no name, size, number or host"));
             }
             if v.writer.as_ref().is_some_and(|w| w.generation == 0 || w.generation > v.generation)
-                || (v.writer.is_some() && !v.readers.is_empty())
+                || (v.writer.is_some() && !v.readers.is_empty()) || v.generation >= self.next_generation
             {
                 return Err(RestoreError("a volume's writer of a generation it never gave, or with readers"));
             }

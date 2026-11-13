@@ -82,6 +82,9 @@ const ANSWERED_NS: u64 = 2_500_000_000;
 const PLAN_NS: u64 = 10_000_000_000;
 /// The leader's look at a cs, as it goes.
 const PROBE: u32 = nbswire::TAG_REQUEST | TAG_BULK;
+/// This host's cs's questions waiting for a read, at most: past it, the cs
+/// is told there is no mds for now, and asks again.
+const READS_MAX: usize = 64;
 
 pub type Member = raftmember::Member<Mds>;
 pub type Shared = raftmember::Shared<Mds>;
@@ -202,6 +205,15 @@ pub struct Mds {
     sessions: BTreeMap<String, (u64, Addr)>,
     pausing: Option<Pausing>,
     next_pause: u64,
+    /// This host's cs's questions answered only once a read the leader
+    /// confirmed is served (`nbswire::mds::needs_read`), by the read's
+    /// request: the cs's address, its question's id, the question.
+    reads: BTreeMap<u64, (Addr, u64, Question)>,
+    next_read: u64,
+    /// The leader's looks given up for their time, kept a while by their id:
+    /// an answer late of one says the cs is there all the same, which the
+    /// controller counts -- no take-out's verdict is made of it.
+    late: BTreeMap<u64, (u32, u64)>,
 }
 
 /// A snapshot asked of an attached volume (N10c2): its writer, on this host,
@@ -268,7 +280,8 @@ pub fn new(rsm: Rsm<raftmember::Log, State>, me: files::Member, lost: Lost, dir:
                                   planned: 0, planned_index: 0, plan_at: 0, refused: false,
                                   after: repair::After { down_ms: repair::DOWN_AFTER_MS, out_ms: out_after_ms },
                                   repairing: 0, scrub: None, scrub_every_ns: scrub_ms * 1_000_000, scrubbed,
-                                  sessions: BTreeMap::new(), pausing: None, next_pause: 1 },
+                                  sessions: BTreeMap::new(), pausing: None, next_pause: 1, reads: BTreeMap::new(),
+                                  next_read: 1, late: BTreeMap::new() },
                             rsm, id)
 }
 
@@ -344,7 +357,7 @@ impl App for Mds {
     fn before_submit(&mut self, core: &mut Core<Mds>, cmd: &Command) -> Result<(), String> {
         /* The cs's own refusal as failed is taken as it is: it answers, and
            what it refused is what is wrong */
-        let Command::ReplicaDown { set, cs, refused: false, name, generation } = cmd else { return Ok(()) };
+        let Command::ReplicaDown { set, cs, refused: false, name, generation, .. } = cmd else { return Ok(()) };
         /* What applying refuses or does again anyway -- not the writer's, no
            such set or replica, one out already, the last active one -- is
            applied as it is, with no look */
@@ -379,7 +392,7 @@ impl App for Mds {
             Waiter::Client { to, id, kind, volume } => {
                 /* The writer's session on this host as its attach, or its
                    detach, is applied (N10c2) */
-                if let (Some(name), Ok(Answer::Attached { generation })) = (volume, &outcome) {
+                if let (Some(name), Ok(Answer::Attached { generation, .. })) = (volume, &outcome) {
                     match kind {
                         Kind::Attach => {
                             self.sessions.insert(name, (*generation, to));
@@ -407,7 +420,9 @@ impl App for Mds {
             }
             Waiter::Cs { to, id } => {
                 let told = match outcome {
-                    Ok(Answer::Set { .. }) => Told::Verified,
+                    Ok(Answer::Set { .. } | Answer::Device { .. }) => Told::Verified,
+                    /* A device's format another than the one recorded */
+                    Ok(Answer::Refused(Refusal::OtherFormat)) => Told::Refused(nbswire::Refusal::NotHere),
                     /* Not the join it was: ended or given up meanwhile */
                     Ok(_) => Told::Refused(nbswire::Refusal::NotTheJoiner),
                     /* No leader, or not ready: asked again */
@@ -431,14 +446,14 @@ impl App for Mds {
             }
         };
         let said = match (outcome, kind) {
-            (Ok(Answer::Attached { generation }), Kind::Attach) => Said::Attached { generation, index },
+            (Ok(Answer::Attached { generation, first }), Kind::Attach) => Said::Attached { generation, index, first },
             (Ok(Answer::Attached { .. }), Kind::Detach) => Said::Detached { index },
             (Ok(Answer::Set { version }), Kind::Down) => Said::Down { version, index },
             (Ok(Answer::Refused(Refusal::LastReplica)), Kind::Down) => Said::LastReplica,
             (Ok(Answer::Refused(Refusal::NotTheWriter)), Kind::Down | Kind::Copy) => Said::NotTheWriter,
             /* A copy-up's chunk (N10); a set being joined asked again */
             (Ok(Answer::Chunk { chunk, incarnation }), Kind::Copy) => Said::Chunk { chunk, incarnation, index },
-            (Ok(Answer::Refused(why @ (Refusal::Joining | Refusal::Draining))), Kind::Copy) => {
+            (Ok(Answer::Refused(why @ (Refusal::Joining | Refusal::Draining | Refusal::CopiesPending))), Kind::Copy) => {
                 Said::NotNow(String::from(why.says()))
             }
             (Ok(Answer::Refused(why)), _) => Said::Refused(String::from(why.says())),
@@ -503,24 +518,41 @@ impl App for Mds {
         }
         let state = core.state();
         self.lost.with(|l| l.retain(|host, &mut (id, _)| state.member(host).is_some_and(|m| m.id == id)));
+        /* A session of a volume whose writer here it no longer is -- taken
+           over elsewhere, let go of, deleted -- forgotten: kept, the table
+           grew for the member's life (the review of 2026-11) */
+        let me = &self.me.host;
+        self.sessions.retain(|name, &mut (g, _)| {
+            state.volume(name).and_then(|v| v.writer.as_ref()).is_some_and(|w| w.generation == g && w.host == *me)
+        });
         if core.role() != Role::Leader {
-            /* What this member saw as a leader is of no use to the next */
+            /* What this member saw as a leader is of no use to the next -- its
+               looks under way among it: left, each became a verdict of silence
+               at the next lead's first turn, a cs never looked at taken out
+               (the review of 2026-11) */
             self.watch.clear();
             self.repairing = 0;
             self.refused = false;
             self.scrub = None;
+            self.probes.clear();
+            self.verdicts.clear();
+            self.late.clear();
             return;
         }
-        /* A look not answered in time: the cs is silent */
+        /* A look not answered in time: the cs is silent -- the look kept a
+           while, an answer late of it said to the controller */
         let now = boot_time_ns();
         let verdicts = &mut self.verdicts;
+        let late = &mut self.late;
         self.probes.retain(|p| {
             if now < p.until {
                 return true;
             }
             verdicts.insert(p.cs, (false, now));
+            late.insert(p.id, (p.cs, now + ANSWERED_NS));
             false
         });
+        self.late.retain(|_, &mut (_, until)| now < until);
         self.verdicts.retain(|_, &mut (_, when)| now < when + VERDICT_NS);
         if let Some((at, digest)) = core.state().checks().latest() {
             if at > self.proposed {
@@ -538,6 +570,19 @@ impl App for Mds {
             s.tick(core.state(), now, next_probe, &mut out);
             self.scrub_out(core, out);
         }
+    }
+
+    /// A cs's question's read served -- the state as new as everything
+    /// committed before it came -- or not: answered from the state, or told
+    /// there is no mds for now, which the cs takes for nothing said.
+    fn on_read(&mut self, core: &mut Core<Mds>, request: u64, served: bool) {
+        let Some((to, id, question)) = self.reads.remove(&request) else { return };
+        let told = if served {
+            nbswire::mds::told(core.state(), &self.me.host, core.rsm().applied(), &question, true)
+        } else {
+            Told::Refused(nbswire::Refusal::NoMds)
+        };
+        let _ = core.mailbox().send(to, nbswire::TAG_TOLD, 0, &Answered { id, told }.encode());
     }
 
     /// A state whose digest is not the leader's: this member serves nothing
@@ -683,6 +728,18 @@ impl Mds {
 
     /// A cs's answer to the leader's look: there, and serving, or not.
     fn on_probe_answer(&mut self, a: &nbswire::Answer<'_>) {
+        /* An answer to a look given up for its time: the cs is there, as the
+           controller counts it -- dropped, a cs that answered every look in
+           300 ms was taken for down in 5 s (the review of 2026-11). No
+           verdict for a take-out is made of it: decision 6's 250 ms stands */
+        if let Some((cs, _)) = self.late.remove(&a.id) {
+            if matches!(a.reply, nbswire::Reply::Done) {
+                if let Some(w) = self.watch.get_mut(&cs) {
+                    w.1 = boot_time_ns();
+                }
+            }
+            return;
+        }
         let Some(at) = self.probes.iter().position(|p| p.id == a.id) else { return };
         let p = self.probes.swap_remove(at);
         let serving = matches!(a.reply, nbswire::Reply::Done);
@@ -720,7 +777,8 @@ impl Mds {
            host asks at a generation before it, and is not the one to pause */
         match &a.ask {
             Ask::Down { name, generation, .. } | Ask::CopyUp { name, generation, .. }
-            | Ask::CopyDone { name, generation, .. } | Ask::Paused { name, generation, .. } => {
+            | Ask::CopyDone { name, generation, .. } | Ask::Paused { name, generation, .. }
+            | Ask::Here { name, generation } => {
                 let writer = core.state().volume(name).and_then(|v| v.writer.as_ref())
                     .is_some_and(|w| w.generation == *generation && w.host == host);
                 if writer {
@@ -736,6 +794,8 @@ impl Mds {
             _ => None,
         };
         let (cmd, kind) = match a.ask {
+            /* The writer there: said, and answered by nothing */
+            Ask::Here { .. } => return,
             /* A pause answered: the snapshot proposed at the writer's
                generation. One this member does not know -- given up, done, or
                of before its start -- is answered by none: the session goes on
@@ -754,12 +814,12 @@ impl Mds {
             Ask::Attach { name, writable, force, token } => {
                 (Command::Attach { name, host, writable, force, token }, Kind::Attach)
             }
-            Ask::Detach { name, generation } => (Command::Detach { name, host, generation }, Kind::Detach),
+            Ask::Detach { name, generation, token } => (Command::Detach { name, host, generation, token }, Kind::Detach),
             Ask::Reattach { name, generation, token } => {
                 (Command::Reattach { name, host, generation, token }, Kind::Attach)
             }
-            Ask::Down { set, cs, refused, name, generation } => {
-                (Command::ReplicaDown { set, cs, refused, name, generation }, Kind::Down)
+            Ask::Down { set, cs, refused, name, generation, version } => {
+                (Command::ReplicaDown { set, cs, refused, name, generation, version: Some(version) }, Kind::Down)
             }
             Ask::CopyUp { name, place, generation } => (Command::CopyUp { name, place, generation }, Kind::Copy),
             Ask::CopyDone { name, place, generation, chunk, incarnation } => {
@@ -797,7 +857,43 @@ impl Mds {
             core.ask(self, cmd, Pending::App(Waiter::Cs { to: m.from, id: q.id }));
             return;
         }
-        let told = nbswire::mds::told(core.state(), &self.me.host, core.rsm().applied(), &q.question);
+        /* A device's format, as this host's cs found it: recorded, for one
+           read blank later to be lost rather than formatted again -- of a
+           device of this host's cs alone, and never a record's drop, which
+           is a person's (`nbs devices add ... wipe`) */
+        if let Question::Formatted { device, format } = q.question {
+            let mine = core.state().cs_of(&self.me.host).is_some_and(|c| c.devices.iter().any(|d| d.id == device));
+            if !mine || format == 0 {
+                let told = Told::Refused(nbswire::Refusal::NotHere);
+                let _ = core.mailbox().send(m.from, nbswire::TAG_TOLD, 0, &Answered { id: q.id, told }.encode());
+                return;
+            }
+            core.ask(self, Command::DeviceFormatted { device, format }, Pending::App(Waiter::Cs { to: m.from, id: q.id }));
+            return;
+        }
+        /* Whose cs this is, which of its chunks and volumes are gone, which
+           joins are its: answered once a read the leader confirms is served,
+           this member as far as everything committed before the question --
+           one replaced, or started again behind what it had applied, answered
+           from what it had so far, and its cs freed what was made since
+           (found by the review of 2026-11) */
+        if nbswire::mds::needs_read(&q.question) {
+            if self.reads.len() >= READS_MAX {
+                let told = Told::Refused(nbswire::Refusal::NoMds);
+                let _ = core.mailbox().send(m.from, nbswire::TAG_TOLD, 0, &Answered { id: q.id, told }.encode());
+                return;
+            }
+            let request = self.next_read;
+            self.next_read = self.next_read.wrapping_add(1).max(1);
+            if core.read(request).is_err() {
+                let told = Told::Refused(nbswire::Refusal::NoMds);
+                let _ = core.mailbox().send(m.from, nbswire::TAG_TOLD, 0, &Answered { id: q.id, told }.encode());
+                return;
+            }
+            self.reads.insert(request, (m.from, q.id, q.question));
+            return;
+        }
+        let told = nbswire::mds::told(core.state(), &self.me.host, core.rsm().applied(), &q.question, false);
         let _ = core.mailbox().send(m.from, nbswire::TAG_TOLD, 0, &Answered { id: q.id, told }.encode());
     }
 
