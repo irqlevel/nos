@@ -301,20 +301,25 @@ impl App for Mds {
         Some(self.me.cluster)
     }
 
-    /// The incarnation host `name`'s member is: the metadata's, or -- before
-    /// this host's log has caught up -- the offer's.
+    /// The incarnation host `name`'s member is: the metadata's -- or, where
+    /// the metadata applied here has neither the host nor the incarnation
+    /// and has not removed it, the offer's. A member whose metadata is older
+    /// than the coming of a member that leads -- restored from a snapshot
+    /// taken before it -- takes that leader's messages by it. (Only a
+    /// member with no cluster at all did: one restored so refused all its
+    /// leader sent, and stayed on that snapshot.)
     fn node_of(&self, core: &Core<Mds>, name: &str) -> Option<u64> {
-        if core.state().cluster().is_some() {
-            return core.state().member(name).map(|m| m.id);
+        if let Some(m) = core.state().member(name) {
+            return Some(m.id);
         }
-        self.me.known.iter().find(|k| k.host == name).map(|k| k.id)
+        self.offered(core, |k| k.host == name).map(|k| k.id)
     }
 
     fn host_of(&self, core: &Core<Mds>, node: u64) -> Option<String> {
-        if core.state().cluster().is_some() {
-            return core.state().member_of_id(node).map(|m| m.host.clone());
+        if let Some(m) = core.state().member_of_id(node) {
+            return Some(m.host.clone());
         }
-        self.me.known.iter().find(|k| k.id == node).map(|k| k.host.clone())
+        self.offered(core, |k| k.id == node).map(|k| k.host.clone())
     }
 
     fn wanted(&self, core: &Core<Mds>) -> (Vec<u64>, Vec<u64>) {
@@ -547,6 +552,16 @@ impl App for Mds {
 }
 
 impl Mds {
+    /// A member the offer this host took named that `which` names, where
+    /// the metadata applied here has neither its host nor its incarnation
+    /// -- it is older than that member's coming -- and has not removed it.
+    fn offered(&self, core: &Core<Mds>, which: impl Fn(&Known) -> bool) -> Option<&Known> {
+        let state = core.state();
+        self.me.known.iter().find(|k| which(k)).filter(|k| {
+            state.member(&k.host).is_none() && state.member_of_id(k.id).is_none() && !state.id_removed(k.id)
+        })
+    }
+
     /// The controller's turn, as the leader: every cs looked at once a
     /// second, and a plan made every ten -- sooner where the state moved on
     /// or a cs went silent or came back -- and proposed, once what it
