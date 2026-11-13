@@ -32,7 +32,12 @@
 //!   N10b): vouched for only where the model has that copy-up pending, its
 //!   writer asking, the host's cs an active member of the set at its version
 //!   now -- asked of a copy-up pending, one of its pieces now and then made
-//!   another.
+//!   another;
+//! - and everything else it tells its cs (`told_check`, the review of
+//!   2026-11): a client's request verified, a joiner's ask of a source, a
+//!   fence, the chunks and volumes still there, the cs's identity and joins
+//!   -- each held to the model, and those that name no entry told only by
+//!   a member that has confirmed a read.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1528,6 +1533,262 @@ fn verify_copy(a: &mut Rng, s: &State, m: &Model, applied: u64) -> Option<Result
     Some(if got == want { Ok(got) } else { Err(format!("{:?} of host {}'s cs told {:?}, the model {:?}", q, host, got, want)) })
 }
 
+/// What a host's mds tells its cs, held to the model (the review of 2026-11:
+/// of the rules `told` holds a cs to, the gate held the set's version alone
+/// -- a member taken out vouching, a joiner read, a chunk of another place
+/// or incarnation, a writer of before, a source no member, an answer of a
+/// member behind its client, all unseen). A question of each kind -- a
+/// client's request verified, a joiner's ask of a source, a fence, the
+/// chunks and volumes still there, the cs's identity and its joins -- mostly
+/// as the model has things, now and then with a field made another, asked
+/// of a member that has confirmed a read or has not, and answered by `told`
+/// and by the model, in the order of refusals the plan gives. Its kind, or
+/// what differed.
+fn told_check(a: &mut Rng, s: &State, m: &Model, applied: u64) -> Option<Result<String, String>> {
+    use nbswire::Refusal as Why;
+    let host_of = |cs: u32| m.cs.get(cs as usize).map(|c| c.host.clone());
+    let me_of = |host: &str| m.cs.iter().position(|c| c.host == host).map(|i| i as u32);
+    let writer_of = |id: u32| m.vols.values().find(|v| v.id == id).and_then(|v| v.writer.as_ref()).map(|w| w.1);
+    let active_in = |st: &MSet, me: u32| st.cs.iter().zip(st.down.iter()).any(|(&c, &d)| c == me && !d);
+    let confirmed = a.chance(75);
+    let mut index = applied.saturating_sub(a.below(3));
+    if a.chance(5) {
+        index = applied + 1 + a.below(3);
+    }
+    let any_host = |a: &mut Rng| String::from(HOSTS[a.below(HOSTS.len() as u64) as usize]);
+    let (q, host, want) = match a.below(7) {
+        /* A client's request, as a cs asks it of a chunk it has not checked */
+        0 => {
+            let names: Vec<&String> = m.vols.keys().collect();
+            let v = &m.vols[a.pick(&names)?];
+            if v.keys.is_empty() {
+                return None;
+            }
+            let place = a.below(v.keys.len() as u64) as usize;
+            let mc = m.mchunks.get(&v.keys[place])?;
+            let (n, inc) = mc.real?;
+            let st = m.sets.get(mc.set)?;
+            let mut cands: Vec<u32> = st.cs.to_vec();
+            if let Some((j, _, _)) = st.joiner {
+                cands.push(j);
+            }
+            let mut host = if a.chance(90) { host_of(a.pick(&cands)?)? } else { any_host(a) };
+            let (mut volume, mut position) = (v.id, place as u32);
+            let mut chunk = ChunkRef { chunk: n, incarnation: inc, epoch: Epoch { set: mc.set as u32, version: st.version } };
+            let mut generation = match (v.writer.as_ref(), a.chance(70)) {
+                (Some(w), true) => w.1,
+                _ => 0,
+            };
+            let mut writing = a.chance(50);
+            match a.below(24) {
+                0 => volume = volume.wrapping_add(1 + a.below(2) as u32),
+                1 => position = position.wrapping_add(1),
+                2 => chunk.chunk = chunk.chunk.wrapping_add(1),
+                3 => chunk.incarnation = chunk.incarnation.wrapping_add(1),
+                4 => chunk.incarnation = chunk.incarnation.wrapping_sub(1),
+                5 => chunk.epoch.version = chunk.epoch.version.wrapping_sub(1),
+                6 => chunk.epoch.set = chunk.epoch.set.wrapping_add(1),
+                7 => generation = generation.wrapping_add(1),
+                8 => generation = 0,
+                9 => writing = !writing,
+                10 => host = any_host(a),
+                _ => {}
+            }
+            let want = (|| {
+                if applied < index {
+                    return Told::Refused(Why::Behind { applied });
+                }
+                let Some(v) = m.vols.values().find(|v| v.id == volume) else { return Told::Refused(Why::NotTheMap) };
+                let Some(mc) = v.keys.get(position as usize).and_then(|k| m.mchunks.get(k)) else {
+                    return Told::Refused(Why::NotTheMap);
+                };
+                if mc.real != Some((chunk.chunk, chunk.incarnation)) {
+                    return Told::Refused(Why::NotTheMap);
+                }
+                let st = &m.sets[mc.set];
+                let Some(me) = me_of(&host) else { return Told::Refused(Why::NotHere) };
+                let active = active_in(st, me);
+                let joining = st.joiner.is_some_and(|(j, _, _)| j == me);
+                /* A member taken out vouches for nothing; the joiner is
+                   written, never read */
+                if !(active || (joining && writing)) {
+                    return Told::Refused(Why::NotHere);
+                }
+                let known = Epoch { set: mc.set as u32, version: st.version };
+                if chunk.epoch != known {
+                    return Told::Refused(Why::Epoch { known });
+                }
+                if (writing || generation != 0) && writer_of(volume) != Some(generation) {
+                    return Told::Refused(Why::NotAttached);
+                }
+                match st.joiner {
+                    Some((_, _, since)) if !active => Told::VerifiedJoining { since },
+                    _ => Told::Verified,
+                }
+            })();
+            let q = Question::Verify { volume, generation, chunk, position, index, writing };
+            (q, host, want)
+        }
+        /* A joiner's ask of a source, which the source's cs checks */
+        1 => {
+            let with: Vec<usize> = (0..m.sets.len()).filter(|&i| m.sets[i].joiner.is_some()).collect();
+            let set = match a.pick(&with) {
+                Some(i) if a.chance(85) => i,
+                _ => a.below(m.sets.len() as u64 + 1) as usize,
+            };
+            let st = m.sets.get(set);
+            let mut joiner = st.and_then(|x| x.joiner).map_or(a.below(8) as u32, |j| j.0);
+            let mut version = st.map_or(0, |x| x.version);
+            let members: Vec<u32> = st.map_or(Vec::new(), |x| x.cs.to_vec());
+            let mut host = match a.pick(&members) {
+                Some(c) if a.chance(90) => host_of(c)?,
+                _ => any_host(a),
+            };
+            match a.below(12) {
+                0 => joiner = joiner.wrapping_add(1),
+                1 => version = version.wrapping_add(1),
+                2 => version = version.wrapping_sub(1),
+                3 => host = any_host(a),
+                _ => {}
+            }
+            let want = (|| {
+                if applied < index {
+                    return Told::Refused(Why::Behind { applied });
+                }
+                let Some(st) = m.sets.get(set) else { return Told::Refused(Why::NotTheJoiner) };
+                if st.joiner.is_none_or(|j| j.0 != joiner) {
+                    return Told::Refused(Why::NotTheJoiner);
+                }
+                if st.version != version {
+                    return Told::Refused(Why::Epoch { known: Epoch { set: set as u32, version: st.version } });
+                }
+                /* The source an active member of the set */
+                match me_of(&host) {
+                    Some(me) if active_in(st, me) => Told::Verified,
+                    _ => Told::Refused(Why::NotHere),
+                }
+            })();
+            (Question::VerifyJoin { set: set as u32, joiner, version, index }, host, want)
+        }
+        /* A fence past the one a cs knows: the volume's writer's of now */
+        2 => {
+            let ids: Vec<(u32, u64)> = m.vols.values().map(|v| (v.id, v.writer.as_ref().map_or(0, |w| w.1))).collect();
+            let (mut volume, mut generation) = a.pick(&ids).unwrap_or((1, 0));
+            match a.below(10) {
+                0 => volume = volume.wrapping_add(1),
+                1 => generation = generation.wrapping_add(1),
+                2 => generation = generation.wrapping_sub(1),
+                3 => generation = 0,
+                _ => {}
+            }
+            let want = if applied < index {
+                Told::Refused(Why::Behind { applied })
+            } else if !m.vols.values().any(|v| v.id == volume) {
+                Told::Refused(Why::NotTheMap)
+            } else if generation == 0 || writer_of(volume) != Some(generation) {
+                Told::Refused(Why::NotAttached)
+            } else {
+                Told::Verified
+            };
+            (Question::VerifyFence { volume, generation, index }, any_host(a), want)
+        }
+        /* The chunks a cs holds, still the metadata's: gone where freed,
+           their number another's now, or of a set the cs is no member nor
+           the joiner of */
+        3 => {
+            let live: Vec<(u32, u32)> = m.mchunks.values().filter_map(|c| c.real).collect();
+            let k = a.below(6) as usize;
+            let chunks: Vec<(u32, u32)> = (0..k).map(|_| match a.pick(&live) {
+                Some((c, i)) if a.chance(70) => (c, i),
+                Some((c, i)) if a.chance(50) => (c, i.wrapping_sub(1)),
+                _ => (a.below(64) as u32, a.below(4) as u32),
+            }).collect();
+            let host = if a.chance(80) { m.cs.get(a.below(m.cs.len().max(1) as u64) as usize)
+                .map_or_else(|| any_host(a), |c| c.host.clone()) } else { any_host(a) };
+            let me = me_of(&host);
+            let gone = chunks.iter().filter(|&&(c, i)| {
+                match m.mchunks.values().find(|x| x.real == Some((c, i))) {
+                    None => true,
+                    Some(x) => me.is_some_and(|me| {
+                        let st = &m.sets[x.set];
+                        !st.cs.contains(&me) && st.joiner.is_none_or(|j| j.0 != me)
+                    }),
+                }
+            }).map(|&(c, _)| c).collect();
+            (Question::Live { chunks }, host, Told::Gone(gone))
+        }
+        /* The volumes a cs fences, still the metadata's */
+        4 => {
+            let k = a.below(5) as usize;
+            let volumes: Vec<u32> = (0..k).map(|_| a.below(u64::from(m.next_volume) + 2) as u32).collect();
+            let gone = volumes.iter().filter(|&&v| !m.vols.values().any(|x| x.id == v)).copied().collect();
+            (Question::Volumes { volumes }, any_host(a), Told::Gone(gone))
+        }
+        /* Whose cs a host's is, and its devices */
+        5 => {
+            let host = any_host(a);
+            let want = Told::Identity(me_of(&host).map(|me| nbswire::Identity {
+                cluster: s.cluster().map_or([0; 16], |c| c.id),
+                cs: me,
+                devices: m.cs[me as usize].devices.iter().map(|d| nbswire::Device {
+                    ident: d.ident.clone(), device: d.id, slots: d.slots, draining: !d.active, format: d.format,
+                }).collect(),
+            }));
+            (Question::Identity, host, want)
+        }
+        /* The joins a host's cs is the joiner of: each set's place, its
+           versions, its sources and the fences the joiner lays first */
+        _ => {
+            let joining: Vec<u32> = m.sets.iter().filter_map(|st| st.joiner.map(|j| j.0)).collect();
+            let host = match a.pick(&joining) {
+                Some(j) if a.chance(80) => host_of(j)?,
+                _ => any_host(a),
+            };
+            let want = Told::Joins(match me_of(&host) {
+                None => Vec::new(),
+                Some(me) => m.sets.iter().enumerate().filter(|(_, st)| st.joiner.is_some_and(|j| j.0 == me))
+                    .map(|(id, st)| {
+                        let (_, place, since) = st.joiner.unwrap_or((0, 0, 0));
+                        let mut fences: Vec<(u32, u64)> = m.vols.values().filter(|v| v.generation != 0)
+                            .filter(|v| v.keys.iter().any(|k| m.mchunks.get(k).is_some_and(|c| c.set == id)))
+                            .map(|v| (v.id, v.generation)).collect();
+                        fences.sort_unstable();
+                        nbswire::JoinView {
+                            set: id as u32, place: place as u8, since, version: st.version, own: st.cs[place] == me,
+                            until: st.until[place],
+                            sources: (0..REPLICAS).filter(|&k| !st.down[k])
+                                .filter_map(|k| host_of(st.cs[k]).map(|h| (st.cs[k], h))).collect(),
+                            index: applied, fences,
+                        }
+                    }).collect(),
+            });
+            (Question::Joins, host, want)
+        }
+    };
+    let kind = format!("{:?}", q).split([' ', '{']).next().unwrap_or("").to_string();
+    /* No cluster yet: nothing told; and what names no entry to be applied
+       as far as is told only by a member that has confirmed a read */
+    let want = if !m.init || (!confirmed && nbswire::mds::needs_read(&q)) { Told::Refused(Why::NoMds) } else { want };
+    let mut got = nbswire::mds::told(s, &host, applied, &q, confirmed);
+    /* A join's fences in an order of their own: held as a set */
+    if let Told::Joins(views) = &mut got {
+        for v in views.iter_mut() {
+            v.fences.sort_unstable();
+        }
+    }
+    Some(if got == want {
+        let said = match &got {
+            Told::Refused(why) => format!("{:?}", why).split([' ', '{']).next().unwrap_or("").to_string(),
+            Told::Gone(g) => format!("Gone {}", if g.is_empty() { "none" } else { "some" }),
+            Told::Joins(j) => format!("Joins {}", if j.is_empty() { "none" } else { "some" }),
+            other => format!("{:?}", other).split([' ', '(', '{']).next().unwrap_or("").to_string(),
+        };
+        Ok(format!("{} {}", kind, said))
+    } else {
+        Err(format!("{:?} of host {}'s cs (confirmed {}) told {:?}, the model {:?}", q, host, confirmed, got, want))
+    })
+}
+
 /// A volume with copy-ups pending, by name (N10).
 fn pending_volume(r: &mut Rng, s: &State, m: &Model) -> Option<String> {
     let ids: Vec<u32> = s.copying().keys().map(|&(v, _)| v).collect();
@@ -2227,6 +2488,16 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
                     *answers.entry(format!("VerifyCopy {}", what.split([' ', '(', '{']).nth(1).unwrap_or(&what)))
                         .or_default() += 1;
                 }
+                None => {}
+            }
+        }
+        /* What a host's mds tells its cs of everything else (the review of
+           2026-11), of a randomness of its own too */
+        let mut told_r = Rng::new(mix(mix(seed, 0x746f_6c64), step));
+        if told_r.chance(50) {
+            match told_check(&mut told_r, &s, &m, index) {
+                Some(Err(d)) => return Err(format!("step {} after {:?}: {}", step, decoded, d)),
+                Some(Ok(kind)) => *answers.entry(format!("told {}", kind)).or_default() += 1,
                 None => {}
             }
         }
