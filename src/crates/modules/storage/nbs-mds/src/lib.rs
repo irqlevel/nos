@@ -300,9 +300,11 @@ fn start(state: &ModState, me: files::Member, fresh: bool) -> Result<(), String>
     .map_err(|e| alloc::format!("the log in {}/raft: {:?}", state.dir, e))?;
     let mut cfg = Config::new(me.id);
     cfg.seed = kcore::random::random_u64().unwrap_or(me.id);
+    cfg.max_snapshot_bytes = raftmember::snapshot_limit();
     let nonce = kcore::random::random_u64().ok_or_else(|| String::from("no randomness for the member's start"))?;
     let mut rsm = Rsm::new(cfg, log, State::new(), nonce).map_err(|e| alloc::format!("the member: {:?}", e))?;
     rsm.set_snapshot_floor(state.compact);
+    raftmember::catch_up(&mut rsm).map_err(|e| alloc::format!("the member: {}", e))?;
     if fresh {
         /* Its group's one voter: leading at once rather than at a timeout */
         let _ = rsm.campaign();

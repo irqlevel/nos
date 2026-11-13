@@ -27,12 +27,12 @@ use core::fmt;
 use core::mem;
 
 use crate::conf::{self, ChangeError, Changes, Membership};
-use crate::progress::{Progress, State};
-use crate::raft_log::RaftLog;
+use crate::progress::{Decr, Progress, State};
+use crate::raft_log::{Piece, RaftLog};
 use crate::rand::Rng;
 use crate::storage::{Storage, StorageError};
 use crate::types::{
-    Body, ChangeKind, ConfChange, ConfState, Entry, EntryKind, HardState, Message, NodeId, Snapshot,
+    Body, ChangeKind, ConfChange, ConfState, Entry, EntryKind, HardState, Message, NodeId, PushError, Snapshot,
     SnapshotBuilder, SnapshotMeta, MAX_SNAPSHOT_BYTES, NONE, PIECE_MAX,
 };
 use crate::wire;
@@ -50,7 +50,10 @@ const MAX_APPLY_BYTES: u64 = 1024 * 1024;
 /// Appends on their way to one follower, at most whatever the caller says:
 /// its window is a list a block of the kernel's heap holds.
 const MAX_INFLIGHT_MSGS_LIMIT: usize = 4096;
-/// Reads waiting for their round, at most: past them a read is refused.
+/// Reads a leader has taken and not yet handed out -- waiting for its
+/// term's first commit, in a round, or confirmed -- at most: past them a
+/// read is refused as it is asked. And a follower's confirmations, and
+/// failures, one `Ready` hands out.
 const MAX_PENDING_READS: usize = 1024;
 /// An election timeout's ticks, at most: the timeout drawn, up to twice it,
 /// is counted in a u32.
@@ -90,16 +93,23 @@ pub struct Config {
     pub max_inflight_bytes: u64,
     /// The largest entry a proposal may make.
     pub max_entry_bytes: usize,
-    /// Entries appended and not yet committed, at most -- a leader's
-    /// proposals past it are refused (`Busy`), a follower's appends past
-    /// it dropped and sent again.
+    /// Entries a member holds and has not yet done with, at most: on a
+    /// leader, appended and not yet committed -- proposals past it are
+    /// refused (`Busy`); on a follower, taken and not yet handed out to be
+    /// written (its unstable entries) -- what an append brings past it is
+    /// left for the leader to send again.
     pub max_uncommitted_entries: u64,
     /// Bytes of committed entries a `Ready` hands to apply, at most (but
     /// always one entry).
     pub max_apply_bytes: u64,
     /// The bytes of a snapshot one message carries.
     pub snapshot_piece_bytes: usize,
-    /// The largest snapshot a follower takes in.
+    /// The largest snapshot this member holds -- one a leader sends it,
+    /// or one of its own state `Rsm` takes -- each held in memory whole
+    /// while it is taken in or taken, in pieces of one size class of the
+    /// heap: a kernel's caller sets it from what its heap gives that class
+    /// (raftmember does), so that one larger is refused and said, not a
+    /// panic of the machine.
     pub max_snapshot_bytes: u64,
     /// The election timeouts' randomness.
     pub seed: u64,
@@ -182,11 +192,15 @@ pub enum Role {
     Leader,
 }
 
-/// What a member is and whom it follows: nothing of it need be durable.
+/// What a member is and whom it follows, and in which term: nothing of it
+/// need be durable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SoftState {
     pub leader: NodeId,
     pub role: Role,
+    /// The term: the same member leading a later term has none of the
+    /// reads it was asked in the one before.
+    pub term: u64,
 }
 
 /// A read confirmed: it may be served once everything up to `index` has
@@ -216,6 +230,10 @@ pub struct Ready {
     /// Committed entries to apply, in order.
     pub committed: Vec<Entry>,
     pub read_states: Vec<ReadState>,
+    /// The contexts of reads asked of this member that will not be
+    /// confirmed: the leader refused them for room, or no room was left
+    /// here to hand their confirmation out. Asked again, or failed back.
+    pub reads_failed: Vec<u64>,
 }
 
 /// Why something was refused, or could not be done.
@@ -232,6 +250,9 @@ pub enum Error {
     ChangeRefused(Refusal),
     /// Not a voter of the group.
     UnknownNode,
+    /// A voter not heard from in an election's time: a hand-over to it
+    /// would not be taken.
+    Unreachable,
     BadConfig(&'static str),
     Storage(StorageError),
     /// A message for another member.
@@ -266,6 +287,7 @@ impl fmt::Display for Error {
             Error::Busy => f.write_str("too many entries wait to be committed"),
             Error::ChangeRefused(r) => write!(f, "membership change refused: {:?}", r),
             Error::UnknownNode => f.write_str("not a voter of the group"),
+            Error::Unreachable => f.write_str("a voter not heard from in an election's time"),
             Error::BadConfig(what) => write!(f, "a configuration that cannot run: {}", what),
             Error::Storage(e) => write!(f, "storage: {:?}", e),
             Error::NotForMe => f.write_str("a message for another member"),
@@ -296,6 +318,16 @@ pub struct Stats {
     /// Snapshots taken in part and given up: no piece for two election
     /// timeouts.
     pub snapshots_abandoned: u64,
+    /// Members found holding less than they had said they held: lost
+    /// entries they acknowledged -- a disk cut where it went bad, or put
+    /// back from an older copy. Each is sent what it lacks again.
+    pub regressed: u64,
+    /// Snapshots this member, a follower, would not take in: larger than
+    /// `max_snapshot_bytes`, or no memory for a piece.
+    pub snapshots_refused: u64,
+    /// Snapshots this member, a leader, sent and had refused: the
+    /// follower is behind for good until it can take one in.
+    pub snapshots_rejected: u64,
 }
 
 /// What `ready` handed out, for `advance` to mark done.
@@ -369,6 +401,7 @@ pub struct RawNode<S: Storage> {
     incoming: Option<Incoming>,
     msgs: Vec<Message>,
     read_states: Vec<crate::node::ReadState>,
+    reads_failed: Vec<u64>,
     prev_soft: SoftState,
     prev_hard: HardState,
     handed: Option<Handed>,
@@ -392,13 +425,30 @@ impl<S: Storage> RawNode<S> {
             return Err(Error::Storage(StorageError::Corrupt));
         }
         let log = RaftLog::new(storage, hs.commit).map_err(Error::Storage)?;
+        /* A term below its own log's last entry's: what a crash leaves
+         * between a `Ready`'s entries -- or the leader's snapshot it
+         * installed -- and the hard state written after them, the term that
+         * came with them lost. Its vote requests would name a last term past
+         * their own, which every member refuses as one that cannot be, and
+         * with PreVote nothing would ever raise its term: two members of
+         * three up, this one with the newest log, and no leader. The term is
+         * the last entry's; nothing was said in it -- every message waits
+         * for its `Ready` to be on the disk -- so no vote was given in it. */
+        let last_term = log.last_term();
+        if let Some(e) = log.fault() {
+            return Err(Error::Storage(e));
+        }
+        if last_term >= MAX_TERM_OR_INDEX {
+            return Err(Error::Storage(StorageError::Corrupt));
+        }
+        let (term, vote) = if last_term > hs.term { (last_term, NONE) } else { (hs.term, hs.vote) };
         let base = Membership::from_state(&state.conf);
         let mut node = RawNode {
             id: cfg.id,
             rng: Rng::new(cfg.seed),
             cfg,
-            term: hs.term,
-            vote: hs.vote,
+            term,
+            vote,
             leader: NONE,
             role: Role::Follower,
             log,
@@ -418,13 +468,13 @@ impl<S: Storage> RawNode<S> {
             incoming: None,
             msgs: Vec::new(),
             read_states: Vec::new(),
-            prev_soft: SoftState { leader: NONE, role: Role::Follower },
+            reads_failed: Vec::new(),
+            prev_soft: SoftState { leader: NONE, role: Role::Follower, term },
             prev_hard: hs,
             handed: None,
             stats: Stats::default(),
         };
         node.load_changes()?;
-        let term = node.term;
         node.become_follower(term, NONE);
         Ok(node)
     }
@@ -568,7 +618,43 @@ impl<S: Storage> RawNode<S> {
     }
 
     fn soft_state(&self) -> SoftState {
-        SoftState { leader: self.leader, role: self.role }
+        SoftState { leader: self.leader, role: self.role, term: self.term }
+    }
+
+    /// On a leader, the voter the leadership is being handed to, `NONE`
+    /// for none: a hand-over given up after an election's time is `NONE`
+    /// again with the same leader -- and none of it said otherwise.
+    pub fn transferring(&self) -> NodeId {
+        if self.role == Role::Leader { self.lead_transferee } else { NONE }
+    }
+
+    /// On a leader, whom it may hand the lead to as it leaves the voters:
+    /// the voters of `staying` but itself that it heard from within an
+    /// election's time, the one holding the most of the log first -- it
+    /// takes the lead soonest. Empty on any other role. (Its user took the
+    /// first voter by number, heard from or not: a dead one's hand-over
+    /// was armed again and again, and while one is, no proposal is taken.)
+    pub fn successors(&self, staying: &[NodeId]) -> Vec<NodeId> {
+        let election = self.cfg.election_ticks;
+        let mut by: Vec<(u64, NodeId)> = self.membership().voters.iter().copied()
+            .filter(|&id| id != self.id && staying.contains(&id))
+            .filter(|&id| self.idle_ticks(id).is_some_and(|t| t < election))
+            .map(|id| (self.matched(id).unwrap_or(0), id))
+            .collect();
+        by.sort_unstable_by(|a, b| b.cmp(a));
+        by.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// On a leader, the ticks since member `id` was last heard from. None
+    /// on any other role, or for a member it does not track.
+    pub fn idle_ticks(&self, id: NodeId) -> Option<u32> {
+        if self.role != Role::Leader {
+            return None;
+        }
+        if id == self.id {
+            return Some(0);
+        }
+        self.progress.get(&id).map(|p| p.idle)
     }
 
     /* ---- what it is asked ---- */
@@ -733,6 +819,11 @@ impl<S: Storage> RawNode<S> {
         if !self.membership.is_voter(to) {
             return Err(Error::UnknownNode);
         }
+        /* A voter not heard from in an election's time takes no hand-over:
+         * armed, it would refuse every proposal meanwhile for nothing */
+        if self.progress.get(&to).is_none_or(|p| p.idle >= self.cfg.election_ticks) {
+            return Err(Error::Unreachable);
+        }
         self.lead_transferee = to;
         self.election_elapsed = 0;
         let caught_up = self.progress.get(&to).is_some_and(|p| p.matched == self.log.last_index());
@@ -757,6 +848,12 @@ impl<S: Storage> RawNode<S> {
     fn tick_leader(&mut self) {
         self.heartbeat_elapsed = self.heartbeat_elapsed.saturating_add(1);
         self.election_elapsed = self.election_elapsed.saturating_add(1);
+        let me = self.id;
+        for (id, pr) in self.progress.iter_mut() {
+            if *id != me {
+                pr.idle = pr.idle.saturating_add(1);
+            }
+        }
         if self.election_elapsed >= self.cfg.election_ticks {
             self.election_elapsed = 0;
             if self.cfg.check_quorum && !self.quorum_active() {
@@ -928,8 +1025,12 @@ impl<S: Storage> RawNode<S> {
 
     fn send_term(&mut self, to: NodeId, term: u64, body: Body) {
         /* Past what one `Ready` hands out, dropped as a network drops a
-         * message -- Raft sends again what is lost -- so that a caller
-         * that lets them wait does not make the list too large to hold. */
+         * message, so that a caller that lets them wait does not make the
+         * list too large to hold. Raft sends again what is lost of its
+         * appends, votes, heartbeats and a snapshot's pieces; a read's
+         * ReadIndex and its answer, and a hand-over's TimeoutNow, it does
+         * not -- the read is failed back for its age (`Rsm`), the hand-over
+         * given up after an election's time. */
         if self.msgs.len() >= MAX_OUTBOX {
             self.stats.unsent += 1;
             return;
@@ -937,14 +1038,27 @@ impl<S: Storage> RawNode<S> {
         self.msgs.push(Message { from: self.id, to, term, body });
     }
 
-    /// A read confirmed, for the caller: past what one `Ready` hands out,
-    /// refused, as a read the leader had no room for is.
+    /// A read confirmed, for the caller. A leader takes no read it would
+    /// have no room to hand out (`leader_read`); a follower's, confirmed
+    /// past that room, are handed out failed.
     fn push_read_state(&mut self, rs: ReadState) {
         if self.read_states.len() >= MAX_PENDING_READS {
             self.stats.reads_refused += 1;
+            self.push_read_failed(rs.ctx);
             return;
         }
         self.read_states.push(rs);
+    }
+
+    /// A read that will not be confirmed, for the caller -- past what one
+    /// `Ready` hands out, dropped and counted, for the asker's own time to
+    /// tell.
+    fn push_read_failed(&mut self, ctx: u64) {
+        if self.reads_failed.len() >= MAX_PENDING_READS {
+            self.stats.reads_refused += 1;
+            return;
+        }
+        self.reads_failed.push(ctx);
     }
 
     /// A message from another member.
@@ -989,17 +1103,17 @@ impl<S: Storage> RawNode<S> {
                  * every request answered: it may never hear of it otherwise
                  * -- PreVote and CheckQuorum keep our term from coming to it
                  * in a vote request, and a member whose membership leaves it
-                 * out asks it for no vote at all -- and would lead on alone. */
-                Body::Append { .. } | Body::Heartbeat { .. } | Body::Snapshot { .. } => {
+                 * out asks it for no vote at all -- and would lead on alone.
+                 * And a candidate of a term gone by, told of ours the same
+                 * way: a voter of an older membership that stands in term
+                 * after term behind ours would otherwise never catch up. A
+                 * refused append is what tells either: never a vote's answer,
+                 * which the candidate, come to our term meanwhile, would
+                 * count as this member's answer to the question it asks now
+                 * -- the first answer of each voter is the one counted, and
+                 * the vote this member gave it would be lost. */
+                Body::Append { .. } | Body::Heartbeat { .. } | Body::Snapshot { .. } | Body::Vote { .. } => {
                     self.send(from, Body::AppendResp { reject: true, index: 0, hint_index: 0, hint_term: 0 });
-                }
-                /* A candidate of a term gone by, told of ours (the paper's
-                 * rule for any request): a voter of an older membership that
-                 * stands in term after term ahead of it would otherwise keep
-                 * it from ever catching up. */
-                Body::Vote { pre, .. } => {
-                    let pre = *pre;
-                    self.send(from, Body::VoteResp { pre, granted: false });
                 }
                 _ => {}
             }
@@ -1146,10 +1260,14 @@ impl<S: Storage> RawNode<S> {
                     self.campaign_real(true);
                 }
             }
-            Body::ReadIndexResp { ctx, index, ok } => {
-                /* From the leader it asked: no one else answers a read. */
-                if ok && from == self.leader {
+            /* From the leader it asked: no one else answers a read. One the
+             * leader refused is handed out refused, for its asker to ask
+             * again or fail back -- dropped here, it would wait for good. */
+            Body::ReadIndexResp { ctx, index, ok } if from == self.leader => {
+                if ok {
                     self.push_read_state(ReadState { index, ctx });
+                } else {
+                    self.push_read_failed(ctx);
                 }
             }
             _ => {}
@@ -1159,6 +1277,7 @@ impl<S: Storage> RawNode<S> {
     fn step_leader(&mut self, from: NodeId, body: Body) {
         if let Some(pr) = self.progress.get_mut(&from) {
             pr.recent_active = true;
+            pr.idle = 0;
         }
         match body {
             Body::AppendResp { reject, index, hint_index, hint_term } => {
@@ -1255,6 +1374,9 @@ impl<S: Storage> RawNode<S> {
         }
         if !same {
             if total > self.cfg.max_snapshot_bytes {
+                /* More than this member may hold: refused, and counted --
+                 * it stays behind until it can take one in */
+                self.stats.snapshots_refused += 1;
                 self.send(from, Body::SnapshotResp { index, next: 0, reject: true });
                 return;
             }
@@ -1262,7 +1384,8 @@ impl<S: Storage> RawNode<S> {
                 self.send(from, Body::SnapshotResp { index, next: 0, reject: false });
                 return;
             }
-            self.incoming = Some(Incoming { meta, total, built: SnapshotBuilder::new(), idle: 0 });
+            let built = SnapshotBuilder::with_limit(self.cfg.max_snapshot_bytes);
+            self.incoming = Some(Incoming { meta, total, built, idle: 0 });
         }
         let Some(inc) = self.incoming.as_mut() else { return };
         if offset != inc.built.len() {
@@ -1270,12 +1393,23 @@ impl<S: Storage> RawNode<S> {
             self.send(from, Body::SnapshotResp { index, next, reject: false });
             return;
         }
-        if !inc.built.push(&data) {
-            /* Past any snapshot there is: `total`, checked against the
-             * configuration's limit, says it cannot be. */
-            self.stats.invalid += 1;
-            self.incoming = None;
-            return;
+        match inc.built.try_push(&data) {
+            Ok(()) => {}
+            Err(PushError::TooLarge) => {
+                /* Past any snapshot there is: `total`, checked against the
+                 * configuration's limit, says it cannot be. */
+                self.stats.invalid += 1;
+                self.incoming = None;
+                return;
+            }
+            Err(PushError::NoMemory) => {
+                /* No room in the heap for its next piece: refused, and
+                 * counted, rather than a panic of the machine's */
+                self.stats.snapshots_refused += 1;
+                self.incoming = None;
+                self.send(from, Body::SnapshotResp { index, next: 0, reject: true });
+                return;
+            }
         }
         if inc.built.len() < total {
             let next = inc.built.len();
@@ -1352,22 +1486,33 @@ impl<S: Storage> RawNode<S> {
     }
 
     fn start_snapshot(&mut self, to: NodeId) -> bool {
-        let Some(snapshot) = self.log.snapshot() else { return false };
-        if snapshot.meta.index == 0 {
+        let Some((meta, total)) = self.log.snapshot_head() else { return false };
+        if meta.index == 0 {
             return false;
         }
         let Some(pr) = self.progress.get_mut(&to) else { return false };
-        pr.become_snapshot(snapshot);
+        pr.become_snapshot(meta, total);
         self.send_snapshot_piece(to);
         true
     }
 
+    /// The piece of the snapshot on its way to `to` that its member has
+    /// asked for, read from the storage as it goes: the leader holds none
+    /// of a snapshot's bytes while it sends it. One newer taken meanwhile
+    /// is sent from its start, as the next probe finds it.
     fn send_snapshot_piece(&mut self, to: NodeId) {
         let Some(sending) = self.progress.get(&to).and_then(|p| p.sending.as_ref()) else { return };
-        let snap = &sending.snapshot;
-        let data = snap.data.read(sending.acked, self.cfg.snapshot_piece_bytes).to_vec();
-        let body = Body::Snapshot { meta: snap.meta.clone(), offset: sending.acked, total: snap.data.len(), data };
-        self.send(to, body);
+        let (meta, offset, total) = (sending.meta.clone(), sending.acked, sending.total);
+        let mut data = Vec::new();
+        match self.log.snapshot_piece(meta.index, offset, self.cfg.snapshot_piece_bytes, &mut data) {
+            Piece::Read => self.send(to, Body::Snapshot { meta, offset, total, data }),
+            Piece::Stale => {
+                if let Some(pr) = self.progress.get_mut(&to) {
+                    pr.become_probe();
+                }
+            }
+            Piece::NotNow => {}
+        }
     }
 
     fn peers(&self) -> Vec<NodeId> {
@@ -1381,15 +1526,21 @@ impl<S: Storage> RawNode<S> {
     }
 
     /// A heartbeat to every member, asking for round `ctx` of reads; on the
-    /// `regular` ones, a piece of a snapshot lost on the way sent again.
+    /// `regular` ones, the piece of a snapshot on its way sent again where
+    /// no piece was answered since the last: lost on the way, it seems.
     fn broadcast_heartbeat(&mut self, ctx: u64, regular: bool) {
         let committed = self.log.committed;
         for id in self.peers() {
-            let Some(pr) = self.progress.get(&id) else { continue };
-            let (commit, snapshotting) = (cmp::min(pr.matched, committed), pr.state == State::Snapshot);
+            let Some(pr) = self.progress.get_mut(&id) else { continue };
+            let commit = cmp::min(pr.matched, committed);
+            /* Sent again only where nothing moved: a piece sent again
+             * while the one before it is still on its way is one more on
+             * its way, and its answer one more piece sent */
+            let stalled = regular
+                && pr.state == State::Snapshot
+                && pr.sending.as_mut().is_some_and(|s| !mem::replace(&mut s.moved, false));
             self.send(id, Body::Heartbeat { commit, ctx });
-            if snapshotting && regular {
-                /* A piece lost on the way, sent again. */
+            if stalled {
                 self.send_snapshot_piece(id);
             }
         }
@@ -1402,11 +1553,17 @@ impl<S: Storage> RawNode<S> {
                 if hint_term > 0 { self.log.find_conflict_by_term(hint_index, hint_term).0 } else { hint_index };
             let next_probe = cmp::min(next_probe, last);
             let Some(pr) = self.progress.get_mut(&from) else { return };
-            if pr.maybe_decr_to(index, next_probe) {
-                if pr.state == State::Replicate {
-                    pr.become_probe();
+            match pr.maybe_decr_to(index, next_probe) {
+                Decr::Stale => {}
+                decr => {
+                    if decr == Decr::Regressed {
+                        self.stats.regressed += 1;
+                    }
+                    if pr.state == State::Replicate {
+                        pr.become_probe();
+                    }
+                    self.maybe_send_append(from, true);
                 }
-                self.maybe_send_append(from, true);
             }
             return;
         }
@@ -1418,13 +1575,18 @@ impl<S: Storage> RawNode<S> {
         }
         let Some(pr) = self.progress.get_mut(&from) else { return };
         let was_paused = pr.is_paused();
-        if !pr.maybe_update(index) {
+        /* A probe answered with what the leader knew already still says
+         * where the member's log stops: it is replicated to from there --
+         * left probing, it would be sent an empty probe and its answer at
+         * every heartbeat, and the next entry only after one */
+        let probe_answered = pr.state == State::Probe && pr.matched == index;
+        if !pr.maybe_update(index) && !probe_answered {
             return;
         }
         match pr.state {
             State::Probe => pr.become_replicate(),
             State::Snapshot => {
-                let done = pr.sending.as_ref().is_none_or(|s| pr.matched >= s.snapshot.meta.index);
+                let done = pr.sending.as_ref().is_none_or(|s| pr.matched >= s.meta.index);
                 if done {
                     pr.become_probe();
                 }
@@ -1472,15 +1634,28 @@ impl<S: Storage> RawNode<S> {
             return;
         }
         let Some(sending) = pr.sending.as_mut() else { return };
-        if sending.snapshot.meta.index != index || next > sending.snapshot.data.len() {
+        if sending.meta.index != index || next > sending.total {
             return;
         }
         if reject {
+            /* It will not take this one: too large for it, or no memory to
+             * take it in -- counted, as nothing else would say so; probed
+             * again, and sent it again, at the next heartbeat's answer */
             pr.become_probe();
+            self.stats.snapshots_rejected += 1;
             return;
         }
+        if next == sending.acked {
+            /* Nothing new: an answer to a piece that came twice, or to one
+             * sent again -- the piece after it is on its way already, and
+             * one more sent now would stay on its way beside it for good */
+            return;
+        }
+        /* Further on -- or back, where the member lost what it had taken in
+         * and starts over */
         sending.acked = next;
-        if next < sending.snapshot.data.len() {
+        sending.moved = true;
+        if next < sending.total {
             self.send_snapshot_piece(from);
         }
     }
@@ -1517,24 +1692,24 @@ impl<S: Storage> RawNode<S> {
     /// A read asked of the leader by `from` -- itself, or a follower --
     /// taken, or refused for room (false).
     fn leader_read(&mut self, from: NodeId, ctx: u64) -> bool {
+        /* Every read taken and not yet handed out -- waiting for the term's
+         * first commit, in a round, or confirmed and waiting for a `Ready`
+         * -- held to one bound: a read is refused as it is asked, never
+         * dropped for room once its asker was told it was taken. */
+        if self.waiting_reads.len() + self.reads.len() + self.read_states.len() >= MAX_PENDING_READS {
+            self.refuse_read(from, ctx);
+            return false;
+        }
         if self.log.committed < self.term_start {
             /* Not knowing yet how far the log is committed: after this
              * term's first commit. */
-            if self.waiting_reads.len() < MAX_PENDING_READS {
-                self.waiting_reads.push_back((from, ctx));
-                return true;
-            }
-            self.refuse_read(from, ctx);
-            return false;
+            self.waiting_reads.push_back((from, ctx));
+            return true;
         }
         let index = self.log.committed;
         if self.membership.voters().len() == 1 && self.membership.is_voter(self.id) {
             self.release_read(from, ctx, index);
             return true;
-        }
-        if self.reads.len() >= MAX_PENDING_READS {
-            self.refuse_read(from, ctx);
-            return false;
         }
         /* A round of heartbeats a majority answers proves no other leader
          * was elected meanwhile: the read is as new as `index`. */
@@ -1625,7 +1800,12 @@ impl<S: Storage> RawNode<S> {
             let members: Vec<NodeId> = self.membership.members().collect();
             for id in &members {
                 if !self.progress.contains_key(id) {
-                    let pr = Progress::new(last + 1, self.cfg.max_inflight_msgs, self.cfg.max_inflight_bytes);
+                    let mut pr = Progress::new(last + 1, self.cfg.max_inflight_msgs, self.cfg.max_inflight_bytes);
+                    /* Counted as heard from: a voter added in one step, its
+                     * first answer not yet in, would otherwise cost the
+                     * leader that added it its term at the next look of
+                     * CheckQuorum's */
+                    pr.recent_active = true;
                     self.progress.insert(*id, pr);
                 }
             }
@@ -1655,6 +1835,7 @@ impl<S: Storage> RawNode<S> {
             || self.hard_state() != self.prev_hard
             || !self.msgs.is_empty()
             || !self.read_states.is_empty()
+            || !self.reads_failed.is_empty()
             || self.log.unstable_snapshot().is_some()
             || !self.log.unstable_entries().is_empty()
             || self.log.has_next_committed()
@@ -1676,6 +1857,7 @@ impl<S: Storage> RawNode<S> {
             messages: mem::take(&mut self.msgs),
             committed: self.log.next_committed(self.cfg.max_apply_bytes, wire::MAX_ENTRIES),
             read_states: mem::take(&mut self.read_states),
+            reads_failed: mem::take(&mut self.reads_failed),
         };
         if self.fault().is_some() {
             /* A read for it failed: none of it is handed out. */

@@ -127,6 +127,8 @@ pub struct Params {
     pub max_inflight_msgs: usize,
     pub snapshot_piece_bytes: usize,
     pub max_uncommitted_entries: u64,
+    /// The largest snapshot a member takes in.
+    pub max_snapshot_bytes: u64,
     /// In a hundred messages delivered at random, lost and doubled.
     pub drop_pct: u64,
     pub dup_pct: u64,
@@ -148,6 +150,7 @@ impl Params {
             max_inflight_msgs: 16,
             snapshot_piece_bytes: 256,
             max_uncommitted_entries: 256,
+            max_snapshot_bytes: raft::MAX_SNAPSHOT_BYTES,
             drop_pct: 0,
             dup_pct: 0,
             read_fail_one_in: 0,
@@ -167,6 +170,7 @@ impl Params {
             snapshot_piece_bytes: rng.range(16, 600) as usize,
             /* Small at times: a follower then takes appends in part. */
             max_uncommitted_entries: if rng.chance(30) { rng.range(max_entries_per_msg as u64, 24) } else { 256 },
+            max_snapshot_bytes: raft::MAX_SNAPSHOT_BYTES,
             drop_pct: rng.below(20),
             dup_pct: rng.below(10),
             read_fail_one_in: if rng.chance(20) { rng.range(30, 3000) } else { 0 },
@@ -230,6 +234,8 @@ pub struct Sim {
     leader_reads: BTreeMap<(NodeId, u64), u64>,
     /// Members stopped by a read their disk failed.
     pub faults: u64,
+    /// Reads failed back, by member and context.
+    pub reads_failed: BTreeSet<(NodeId, u64)>,
     /// Every read asked, confirmed or not: a doubled answer comes again.
     asked: BTreeSet<(NodeId, u64)>,
     max_committed: u64,
@@ -309,6 +315,7 @@ impl Sim {
             reads: BTreeMap::new(),
             leader_reads: BTreeMap::new(),
             faults: 0,
+            reads_failed: BTreeSet::new(),
             asked: BTreeSet::new(),
             max_committed: 0,
             to_retire: BTreeSet::new(),
@@ -339,6 +346,7 @@ impl Sim {
         c.max_inflight_msgs = self.p.max_inflight_msgs;
         c.snapshot_piece_bytes = self.p.snapshot_piece_bytes;
         c.max_uncommitted_entries = self.p.max_uncommitted_entries;
+        c.max_snapshot_bytes = self.p.max_snapshot_bytes;
         c.seed = mix(self.seed, id);
         c
     }
@@ -561,6 +569,14 @@ impl Sim {
                 None if self.asked.contains(&(id, rs.ctx)) => {}
                 None => self.fail(format!("member {} confirmed read {}, which nobody asked of it", id, rs.ctx)),
             }
+        }
+        /* A read failed back is answered: owed nothing more */
+        for &ctx in &rd.reads_failed {
+            self.leader_reads.remove(&(id, ctx));
+            if self.reads.remove(&(id, ctx)).is_none() && !self.asked.contains(&(id, ctx)) {
+                self.fail(format!("member {} failed read {}, which nobody asked of it", id, ctx));
+            }
+            self.reads_failed.insert((id, ctx));
         }
         if let Some(node) = m.node.as_mut() {
             node.advance();
@@ -839,6 +855,16 @@ impl Sim {
     /// dropped.
     pub fn snapshot(&mut self, id: NodeId) {
         let filler = self.rng.below(1500) as usize;
+        self.snapshot_sized(id, filler);
+    }
+
+    /// Reads asked of member `id` and neither confirmed nor failed yet.
+    pub fn reads_open(&self, id: NodeId) -> usize {
+        self.reads.keys().filter(|(m, _)| *m == id).count()
+    }
+
+    /// `snapshot`, the state's bytes followed by `filler` bytes more.
+    pub fn snapshot_sized(&mut self, id: NodeId, filler: usize) {
         let Some(m) = self.members.get_mut(&id) else { return };
         let sm = m.sm;
         let Some(node) = m.node.as_mut() else { return };

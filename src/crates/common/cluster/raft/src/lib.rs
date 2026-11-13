@@ -27,7 +27,9 @@
 //!   leader's own term (the paper's figure 8);
 //! - snapshots: the caller's bytes, sent to a follower too far behind in
 //!   pieces;
-//! - learners, which hold everything and do not vote; membership changed one
+//! - learners, which hold everything and are not counted: nobody asks them
+//!   for a vote, nor counts an entry or a read by them (one that is asked
+//!   answers, and keeps its vote, as any member does); membership changed one
 //!   server at a time, each change in force as it is appended, with the 2015
 //!   fix: no change before the leader has committed an entry of its term,
 //!   and never two changes not yet committed;
@@ -63,6 +65,7 @@ mod raft_log;
 mod rand;
 
 pub mod asks;
+pub mod keep;
 pub mod log;
 pub mod node;
 pub mod recover;
@@ -74,6 +77,8 @@ pub mod wire;
 pub use conf::{ChangeError, MAX_MEMBERS};
 pub use node::{Config, Error, Ready, RawNode, ReadState, Refusal, Role, SoftState, Stats};
 pub use log::{DiskLog, FileError, Files, LogConfig, LogError};
-pub use rsm::{Event, Frozen, LogStore, Output, RestoreError, Rsm, RsmError, SnapshotReader, StateMachine, StoreError};
+pub use rsm::{
+    Event, Frozen, LogStore, Output, RestoreError, Rsm, RsmError, RsmStats, SnapshotReader, StateMachine, StoreError,
+};
 pub use storage::{MemStorage, RaftState, Storage, StorageError};
 pub use types::*;
