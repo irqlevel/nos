@@ -43,6 +43,10 @@ const METHODS: [Method; 11] = [
 ];
 
 const HOST_MAX: usize = 63;
+/// The volumes `volumes` answers at once, at most, and unless asked fewer:
+/// the rest from `next` on. All of them in one answer were past what a
+/// caller takes at a few hundred (the review of 2026-11).
+const VOLUMES_PAGE: u64 = 256;
 
 /// The provider registered, its calls answered from `state` -- until it is
 /// dropped, which waits out every call of it.
@@ -287,7 +291,18 @@ fn volume_json(w: &mut Writer, s: &nbsmeta::State, v: &Volume, hosts: bool) {
     w.end_object();
 }
 
-fn volumes(state: &ModState, p: Params<'_>, call: &mut Call) -> Status {
+/// The volumes from number `from` on, `limit` of them at most -- by their
+/// numbers, in order -- and `next`, the number to ask from for the rest:
+/// null where there are none.
+fn volumes(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status {
+    let from = match p.opt_uint("from", 0, u64::from(u32::MAX)) {
+        Ok(f) => f.unwrap_or(0) as u32,
+        Err(e) => return invalid(call, e),
+    };
+    let limit = match p.opt_uint("limit", 1, VOLUMES_PAGE) {
+        Ok(l) => l.unwrap_or(VOLUMES_PAGE) as usize,
+        Err(e) => return invalid(call, e),
+    };
     if let Err(e) = p.finish() {
         return invalid(call, e);
     }
@@ -295,14 +310,22 @@ fn volumes(state: &ModState, p: Params<'_>, call: &mut Call) -> Status {
         Ok(v) => v,
         Err(why) => return failed(call, Failure::Other(why)),
     };
+    let mut vols: alloc::vec::Vec<&Volume> = v.state.volumes().iter().filter(|x| x.id >= from).collect();
+    vols.sort_unstable_by_key(|x| x.id);
+    let next = vols.get(limit).map(|x| x.id);
     answer(call, |w| {
         w.begin_object();
         w.key("volumes");
         w.begin_list();
-        for vol in v.state.volumes().iter() {
+        for vol in vols.iter().take(limit) {
             volume_json(w, &v.state, vol, false);
         }
         w.end_list();
+        w.key("next");
+        match next {
+            Some(n) => w.uint(u64::from(n)),
+            None => w.null(),
+        }
         w.end_object();
     })
 }

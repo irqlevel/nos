@@ -112,6 +112,11 @@ const CLUSTER: [u8; 16] = [5; 16];
 const VOLUME: &str = "v";
 /// The volume: six chunks.
 const VOLUME_MIB: u64 = 24;
+/// The `tail` target's volume: no whole number of chunks, its last half past
+/// its end -- written now and then, left open by a crash, mended whole by
+/// the next writer's start (the review of 2026-11: the piece past the end
+/// failed, told to nobody, and every start stopped there).
+const TAIL_MIB: u64 = 22;
 /// How long the writer's write requests find no memory in the end that
 /// starves it (#97): longer than a cs is given to answer.
 const STARVED_NS: u64 = 3 * nbsclient::SILENT_NS;
@@ -541,6 +546,8 @@ impl Blocks {
 
 struct World {
     r: Rng,
+    /// The volume's size: `VOLUME_MIB`, or the `tail` target's `TAIL_MIB`.
+    mib: u64,
     now: u64,
     step: u64,
     trace: bool,
@@ -606,6 +613,14 @@ struct World {
     clones: Vec<CloneW>,
     cmodel: Blocks,
     clone_r: Rng,
+    /// A flush asked as the writer attaches anew, nothing of its own before
+    /// it: of a randomness of its own, so that a run without one goes as it
+    /// did.
+    anew_r: Rng,
+    /// The places, by volume, whose copy-up the metadata refused for want
+    /// of room: a write held for one fails as it is told, before its
+    /// deadline -- the cluster full, as the client says (`not copied up`).
+    no_room: BTreeSet<(String, u32)>,
     stats: BTreeMap<&'static str, u64>,
 }
 
@@ -870,6 +885,14 @@ impl World {
         let anew = self.clients[c].served
             && matches!(self.clients[c].s.phase(), Phase::Attaching | Phase::Fencing | Phase::Reconciling);
         let lost = self.clients[c].zombie || matches!(self.clients[c].s.phase(), Phase::Failed(_)) || anew;
+        /* A flush or a close says durable what was written before it: never
+           done while an attach anew's reconcile still mends what the session
+           wrote (the review of 2026-11: answered there, it said durable a
+           write whose replicas had not been asked to flush it) */
+        if ok && matches!(op.kind, K::Flush | K::Close) && anew {
+            return Err(format!("client {}'s {:?} done as it attaches anew, {:?}: {}", c, op.kind,
+                               self.clients[c].s.phase(), self.clients[c].s.report()));
+        }
         if !ok && op.kind != K::Read {
             self.clients[c].failed += 1;
         }
@@ -888,6 +911,7 @@ impl World {
         }
         if !ok && !lost && self.now < op.at + DEADLINE_NS
             && !self.failed_with_one_before(&op, self.clients[c].flush_failed_at, &self.clients[c].ops)
+            && !self.held_for_no_room(VOLUME, &op)
         {
             return Err(format!("client {}'s {:?} of blocks {}+{} failed {} ms after it was asked, before its deadline",
                                c, op.kind, first, n, (self.now - op.at) / MS));
@@ -1175,7 +1199,7 @@ impl World {
         }
         self.hosts[h].joins_at = self.now + JOINS_EVERY;
         let name = self.hosts[h].name;
-        let Told::Joins(views) = nbswire::mds::told(&self.state, name, self.index, &Question::Joins) else {
+        let Told::Joins(views) = nbswire::mds::told(&self.state, name, self.index, &Question::Joins, true) else {
             return Ok(());
         };
         /* Each view's fences held to the metadata: every volume a writer has
@@ -1368,7 +1392,7 @@ impl World {
                 let Some(store) = host.store.as_mut() else { continue };
                 let Some(req) = Request::decode(&bytes) else { continue };
                 let (name, applied) = (host.name, *index);
-                let ask = AskNow::new(|q| Some(nbswire::mds::told(state, name, applied, &q)));
+                let ask = AskNow::new(|q| Some(nbswire::mds::told(state, name, applied, &q, true)));
                 let answer = match nbscs::now(serve(store, &host.vouched, &req, &ask)) {
                     Ok(done) => CsAnswer { id: req.id, reply: done.reply() }.encode(),
                     Err(why) => CsAnswer { id: req.id, reply: Reply::Refused(why) }.encode(),
@@ -1782,7 +1806,8 @@ impl World {
     /// answer on its way back.
     fn mds_for_cs(&mut self, h: usize, m: Msg) -> Result<(), String> {
         let Some(q) = Query::decode(&m.bytes) else { return Err(String::from("a cs's question that is none")) };
-        let told = nbswire::mds::told(&self.state, self.hosts[h].name, self.index, &q.question);
+        /* The world's one state is the leader's: a read of it confirmed */
+        let told = nbswire::mds::told(&self.state, self.hosts[h].name, self.index, &q.question, true);
         self.count("cs questions answered");
         self.push(End::Mds(h), End::Cs(h), Answered { id: q.id, told }.encode(), q.id);
         Ok(())
@@ -1878,23 +1903,25 @@ impl World {
         let said = match a.ask {
             Ask::Attach { name, writable, force, token } => match self.apply(Command::Attach { name, host, writable,
                                                                                               force, token }) {
-                Answer::Attached { generation } => Said::Attached { generation, index: self.index },
+                Answer::Attached { generation, first } => Said::Attached { generation, index: self.index, first },
                 Answer::Refused(why) => Said::Refused(why.says().to_string()),
                 other => Said::Refused(format!("{:?}", other)),
             },
-            Ask::Detach { name, generation } => match self.apply(Command::Detach { name, host, generation }) {
+            Ask::Detach { name, generation, token } => match self.apply(Command::Detach { name, host, generation,
+                                                                                          token }) {
                 Answer::Refused(why) => Said::Refused(why.says().to_string()),
                 _ => Said::Detached { index: self.index },
             },
             Ask::Map { name, from, count, index } => nbswire::mds::map(&self.state, self.index, &name, from, count,
                                                                         index),
-            Ask::Down { set, cs, refused, name, generation } => {
+            Ask::Down { set, cs, refused, name, generation, version } => {
                 let up = self.host_of_cs(cs).is_some_and(|h| self.hosts[h].store.is_some());
                 if up && !refused && (self.lost_for_good.is_some() || self.cut.is_some() || !self.r.chance(10)) {
                     self.count("downs refused: the cs answers the leader");
                     Said::NotNow(String::from("the cs answers the leader"))
                 } else {
-                    let answer = self.apply(Command::ReplicaDown { set, cs, refused, name, generation });
+                    let answer = self.apply(Command::ReplicaDown { set, cs, refused, name, generation,
+                                                                   version: Some(version) });
                     if self.trace {
                         eprintln!("  [{}] mds: {:?} asks cs {} of set {} out (refused {}): {:?}", self.step, from, cs,
                                   set, refused, answer);
@@ -1909,6 +1936,12 @@ impl World {
                             self.count("downs refused: not the writer");
                             Said::NotTheWriter
                         }
+                        /* Asked at a version of the set's before now: the
+                           view behind, read again (the review of 2026-11) */
+                        Answer::Refused(nbsmeta::Refusal::Stale) => {
+                            self.count("downs refused: asked of a set changed since");
+                            Said::Refused(nbsmeta::Refusal::Stale.says().to_string())
+                        }
                         Answer::Refused(why) => Said::Refused(why.says().to_string()),
                         other => Said::Refused(format!("{:?}", other)),
                     }
@@ -1917,9 +1950,9 @@ impl World {
             /* A writer's own attach anew, a pause with no word (N10c2) */
             Ask::Reattach { name, generation, token } => {
                 match self.apply(Command::Reattach { name, host, generation, token }) {
-                    Answer::Attached { generation } => {
+                    Answer::Attached { generation, first } => {
                         self.count("writers attached anew");
-                        Said::Attached { generation, index: self.index }
+                        Said::Attached { generation, index: self.index, first }
                     }
                     Answer::Refused(why) => {
                         self.count("writers attached anew refused");
@@ -1928,9 +1961,14 @@ impl World {
                     other => Said::Refused(format!("{:?}", other)),
                 }
             }
-            /* A pause answered (N10c2) */
+            /* The writer there: answered by nothing, as nbs-mds's member
+               does (the review of 2026-11) */
+            Ask::Here { .. } => {
+                self.count("writers there said");
+                return Ok(());
+            }
             /* A pause answered: of the volume's writers alone, whom the
-               writer's host's mds pauses */
+               writer's host's mds pauses (N10c2) */
             Ask::Paused { generation, pause, .. } => match from {
                 End::Client(c) => return self.paused(c, a.id, generation, pause),
                 _ => return Err(format!("{:?} answered a pause it was never asked", from)),
@@ -1938,6 +1976,10 @@ impl World {
             /* A copy-up's asks (N10), answered as nbs-mds's member does */
             ask @ (Ask::CopyUp { .. } | Ask::CopyDone { .. }) => {
                 let done = matches!(ask, Ask::CopyDone { .. });
+                let at = match &ask {
+                    Ask::CopyUp { name, place, .. } => Some((name.clone(), *place)),
+                    _ => None,
+                };
                 /* A copy-up's end that moves the map on -- asked again once
                    it has, the writes held for it may be out to the new chunk */
                 let ended = match &ask {
@@ -1985,6 +2027,12 @@ impl World {
                     Answer::Refused(nbsmeta::Refusal::NotTheWriter) => Said::NotTheWriter,
                     Answer::Refused(why) => {
                         self.count(if done { "copy-ups' ends refused" } else { "copy-ups refused" });
+                        if why == nbsmeta::Refusal::NoRoom {
+                            if let Some(at) = at {
+                                self.count("copy-ups refused for want of room");
+                                self.no_room.insert(at);
+                            }
+                        }
                         Said::Refused(why.says().to_string())
                     }
                     other => Said::Refused(format!("{:?}", other)),
@@ -2437,7 +2485,7 @@ impl World {
 
     /// An operation of the clone's writer: a write, a read, or a flush.
     fn clone_op(&mut self, k: usize) -> Result<(), String> {
-        let blocks = VOLUME_MIB << 20 >> 12;
+        let blocks = self.mib << 20 >> 12;
         let first = self.clone_r.below(blocks.min(3 * SLOT / BLOCK));
         let n = (1 + self.clone_r.below(4)).min(blocks - first);
         let kind = match self.clone_r.below(10) {
@@ -2563,6 +2611,7 @@ impl World {
         }
         if !ok && !lost && self.now < op.at + DEADLINE_NS
             && !self.failed_with_one_before(&op, self.clones[k].flush_failed_at, &self.clones[k].ops)
+            && !self.held_for_no_room(CLONE, &op)
         {
             return Err(format!("the clone's writer {}: {:?} of blocks {}+{} failed {} ms after it was asked, before \
                                 its deadline", k, op.kind, first, n, (self.now - op.at) / MS));
@@ -2703,10 +2752,10 @@ impl World {
             let token = 1 + self.clone_r.below(u64::MAX - 1);
             let attached = self.apply(Command::Attach { name: String::from(CLONE), host: host.clone(), writable: true,
                                                         force: true, token });
-            let Answer::Attached { generation } = attached else {
+            let Answer::Attached { generation, .. } = attached else {
                 return Err(format!("the clone, its writer lost, not taken by force: {:?}", attached));
             };
-            match self.apply(Command::Detach { name: String::from(CLONE), host, generation }) {
+            match self.apply(Command::Detach { name: String::from(CLONE), host, generation, token }) {
                 Answer::Refused(why) => return Err(format!("the clone, taken by force, not let go of: {:?}", why)),
                 _ => self.count("clones let go of by force"),
             }
@@ -2869,10 +2918,13 @@ impl World {
 
     /// An operation of the writer's -- a write or a flush alone, `writes`.
     fn op(&mut self, c: usize, writes: bool) -> Result<(), String> {
-        let blocks = VOLUME_MIB << 20 >> 12;
-        /* A few blocks, near each other, now and then across a chunk's end */
+        let blocks = self.mib << 20 >> 12;
+        /* A few blocks, near each other, now and then across a chunk's end
+           -- or, of a volume no whole number of chunks, in its last chunk,
+           half past its end */
         let first = match self.r.below(4) {
             0 => SLOT / BLOCK - 1 - self.r.below(2),
+            1 if self.mib % u64::from(nbsmeta::CHUNK_MIB) != 0 => blocks - 1 - self.r.below(4),
             _ => self.r.below(blocks.min(3 * SLOT / BLOCK)),
         };
         let n = (1 + self.r.below(4)).min(blocks - first);
@@ -2992,11 +3044,15 @@ impl World {
         }
         let store = Store::new();
         let handle = Handle(self.hosts[h].disk.clone());
-        if let Err((_, e)) = nbscs::now(store.open_device(handle, self.hosts[h].identity)) {
+        /* As nbs-cs takes it in: at the format the metadata recorded */
+        let recorded = self.state.cs().get(self.hosts[h].cs as usize)
+            .and_then(|c| c.devices.iter().find(|d| d.id == self.hosts[h].identity.device)).map_or(0, |d| d.format);
+        if let Err((_, e)) = nbscs::now(store.open_device(handle, self.hosts[h].identity, recorded)) {
             return Err(format!("host {}'s disk not opened again: {:?}", self.hosts[h].name, e));
         }
         if self.trace {
-            let open: Vec<(u32, u64)> = store.holdings().iter().filter(|x| x.state == nbscs::SlotState::Open)
+            let open: Vec<(u32, u64)> = store.holdings_from(0, nbscs::PAGE_OF_CHUNKS).iter()
+                .filter(|x| x.state == nbscs::SlotState::Open)
                 .map(|x| (x.chunk, x.generation)).collect();
             eprintln!("  [{}] host {} finds open (chunk, generation): {:?}", self.step, self.hosts[h].name, open);
         }
@@ -3044,6 +3100,21 @@ impl World {
                                    flush_failed_at: None, downs_asked: BTreeSet::new(), starved_until: 0,
                                    asked_starved: 0, served_gen: 0, anew: 0, failed_write_gen: None });
         self.outs(c, out)
+    }
+
+    /// Whether write `op` of volume `name` touches a place whose copy-up the
+    /// metadata refused for want of room: failed as the client is told, the
+    /// cluster full.
+    fn held_for_no_room(&mut self, name: &str, op: &MOp) -> bool {
+        if !matches!(op.kind, K::Write(_)) || op.len == 0 {
+            return false;
+        }
+        let (first, last) = (op.offset / SLOT, (op.offset + u64::from(op.len) - 1) / SLOT);
+        let held = (first..=last).any(|p| self.no_room.contains(&(String::from(name), p as u32)));
+        if held {
+            self.count("writes failed for want of room for their copy-up");
+        }
+        held
     }
 
     /// Whether every chunk of the volume has a replica in on a host other
@@ -3129,7 +3200,7 @@ impl World {
         if !self.serving(c) {
             return Ok(None);
         }
-        let places = (VOLUME_MIB << 20) / SLOT;
+        let places = (self.mib << 20) / SLOT;
         for p in 0..places {
             let v = 1 + self.r.below(255) as u8;
             self.submit_op(c, K::Write(v), p * (SLOT / BLOCK), 1)?;
@@ -3231,7 +3302,7 @@ impl World {
         if !self.serving(c) {
             return Ok(false);
         }
-        let places = (VOLUME_MIB << 20) / SLOT;
+        let places = (self.mib << 20) / SLOT;
         for p in 0..places {
             let v = 1 + self.r.below(255) as u8;
             self.submit_op(c, K::Write(v), p * (SLOT / BLOCK), 1)?;
@@ -3296,7 +3367,7 @@ impl World {
         if !self.serving(c) {
             return Ok(false);
         }
-        let places = (VOLUME_MIB << 20) / SLOT;
+        let places = (self.mib << 20) / SLOT;
         for round in 0..2 {
             for p in 0..places {
                 let v = 1 + self.r.below(255) as u8;
@@ -3378,7 +3449,7 @@ impl World {
         /* Flushed first: what the crash may lose is the writes below alone */
         self.submit_op(c, K::Flush, 0, 0)?;
         self.drive(c, &idle)?;
-        let places = (VOLUME_MIB << 20) / SLOT;
+        let places = (self.mib << 20) / SLOT;
         for p in 0..places {
             for k in 0..3 {
                 let v = 1 + self.r.below(255) as u8;
@@ -3426,7 +3497,7 @@ impl World {
         if !self.serving(c) || self.down.is_some() {
             return Ok(false);
         }
-        let blocks = VOLUME_MIB << 20 >> 12;
+        let blocks = self.mib << 20 >> 12;
         let picks: Vec<(u64, u64)> = (0..STARVED_WRITES).map(|_| (r.below(blocks - 4), 1 + r.below(4))).collect();
         for &(first, n) in &picks {
             self.submit_op(c, K::Write(1 + r.below(255) as u8), first, n)?;
@@ -3488,7 +3559,7 @@ impl World {
         if !self.serving(c) || self.down.is_some() || !self.quiet()? || !self.serving(c) {
             return Ok(false);
         }
-        let blocks = VOLUME_MIB << 20 >> 12;
+        let blocks = self.mib << 20 >> 12;
         let first = r.below(blocks - 4);
         let (anew, generation, failed) = (self.clients[c].anew, self.clients[c].s.generation(), self.clients[c].failed);
         let until = self.now + DEADLINE_NS + 5_000 * MS;
@@ -3547,7 +3618,7 @@ impl World {
         if !self.serving(c) || self.down.is_some() {
             return Ok(false);
         }
-        let blocks = VOLUME_MIB << 20 >> 12;
+        let blocks = self.mib << 20 >> 12;
         let first = r.below(blocks - 4);
         let Some((_, chunk, _, _)) = self.replicas(first, 0) else { return Ok(false) };
         let Some(set) = self.state.sets().get(chunk.epoch.set as usize).cloned() else { return Ok(false) };
@@ -3620,7 +3691,7 @@ impl World {
             return Ok(false);
         }
         let per = SLOT / BLOCK;
-        let places = (VOLUME_MIB << 20) / SLOT;
+        let places = (self.mib << 20) / SLOT;
         for place in 0..places {
             if r.chance(70) {
                 self.submit_op(c, K::Write(1 + r.below(255) as u8), place * per + r.below(per), 1)?;
@@ -3722,8 +3793,9 @@ impl World {
             return Ok(false);
         };
         for cs in others {
+            let version = self.state.sets().get(set as usize).map(|s| s.version);
             if !matches!(self.apply(Command::ReplicaDown { set, cs, refused: false, name: String::from(VOLUME),
-                                                           generation }), Answer::Set { .. }) {
+                                                           generation, version }), Answer::Set { .. }) {
                 return Ok(false);
             }
         }
@@ -3759,14 +3831,15 @@ impl World {
     }
 }
 
-fn setup(r: &mut Rng) -> Result<World, String> {
-    let mut w = World { r: Rng::new(r.below(u64::MAX)), now: 0, step: 0, trace: false, state: State::new(), index: 0,
+fn setup(r: &mut Rng, mib: u64) -> Result<World, String> {
+    let mut w = World { r: Rng::new(r.below(u64::MAX)), mib, now: 0, step: 0, trace: false, state: State::new(), index: 0,
                         hosts: Vec::new(), links: BTreeMap::new(), clients: Vec::new(), blocks: Blocks::default(),
                         seq: 1, down: None, served: 0, rest: None, owed: None, plan_at: 0, drained: None,
                         scrub: Scrub::new(SCRUB_EVERY), scrub_q: Vec::new(), scrub_r: Rng::new(0), scrub_id: 1,
                         rotted: Vec::new(), snaps: Vec::new(), snap_r: Rng::new(0), snap_next: 1, garbage_at: 0, lost_for_good: None,
                         pausing: None, late: None, pause_next: 1, given_up: None, cut: None, pause_word: None,
-                        clones: Vec::new(), cmodel: Blocks::default(), clone_r: Rng::new(0),
+                        clones: Vec::new(), cmodel: Blocks::default(), clone_r: Rng::new(0), anew_r: Rng::new(0),
+                        no_room: BTreeSet::new(),
                         stats: BTreeMap::new() };
     w.apply(Command::Init { cluster: CLUSTER, name: String::from("nbs"), host: String::from(HOSTS[0]), member: 1 });
     for (k, h) in HOSTS.iter().enumerate().skip(1) {
@@ -3781,19 +3854,25 @@ fn setup(r: &mut Rng) -> Result<World, String> {
         }
     }
     let home = HOSTS[r.below(HOSTS.len() as u64) as usize];
-    match w.apply(Command::VolumeCreate { name: String::from(VOLUME), size_mib: VOLUME_MIB, host: home.to_string() }) {
+    match w.apply(Command::VolumeCreate { name: String::from(VOLUME), size_mib: mib, host: home.to_string() }) {
         Answer::Volume { .. } => {}
         other => return Err(format!("the volume not made: {:?}", other)),
     }
     for h in HOSTS {
-        let cs = w.state.cs_of(h).ok_or_else(|| format!("no cs of {}", h))?;
-        let identity = Identity { cluster: CLUSTER, cs: cs.id, device: cs.devices[0].id };
+        let cs = w.state.cs_of(h).map(|c| (c.id, c.devices[0].id)).ok_or_else(|| format!("no cs of {}", h))?;
+        let identity = Identity { cluster: CLUSTER, cs: cs.0, device: cs.1 };
         let disk = Rc::new(RefCell::new(Disk::new(DISK_SECTOR, bytes)));
         let store = Store::new();
-        if let Err((_, e)) = nbscs::now(store.format_device(Handle(disk.clone()), identity, 1 + r.below(u64::MAX - 1))) {
+        let format = 1 + r.below(u64::MAX - 1);
+        if let Err((_, e)) = nbscs::now(store.format_device(Handle(disk.clone()), identity, format)) {
             return Err(format!("disk of {} not formatted: {:?}", h, e));
         }
-        w.hosts.push(Host { name: h, cs: cs.id, disk, identity, store: Some(Rc::new(store)),
+        /* Its format recorded, as nbs-cs has its mds do */
+        match w.apply(Command::DeviceFormatted { device: identity.device, format }) {
+            Answer::Device { .. } => {}
+            other => return Err(format!("the format of {}'s disk not recorded: {:?}", h, other)),
+        }
+        w.hosts.push(Host { name: h, cs: cs.0, disk, identity, store: Some(Rc::new(store)),
                             vouched: Rc::new(Requests::new()), flights: Vec::new(), asks: Rc::new(Asks::default()),
                             garbage: None,
                             down_since: None, copies: Vec::new(), joins_seen: false, joins_at: 0, copy_id: 1 });
@@ -3802,8 +3881,18 @@ fn setup(r: &mut Rng) -> Result<World, String> {
 }
 
 pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
+    run_sized(seed, steps, trace, VOLUME_MIB)
+}
+
+/// The `tail` target: the cluster target's runs over a volume no whole
+/// number of chunks (`TAIL_MIB`).
+pub fn run_tail(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
+    run_sized(seed, steps, trace, TAIL_MIB)
+}
+
+fn run_sized(seed: u64, steps: u64, trace: bool, mib: u64) -> Result<(), String> {
     let mut r = Rng::new(mix(seed, 0x636c_7573));
-    let mut w = setup(&mut r)?;
+    let mut w = setup(&mut r, mib)?;
     w.trace = trace;
     /* The scrub's randomness of its own, so that the run goes as it would
        without it */
@@ -3811,6 +3900,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     /* The snapshots' too (N10c) */
     w.snap_r = Rng::new(mix(seed, 0x736e_6170));
     w.clone_r = Rng::new(mix(seed, 0x636c_6f6e));
+    w.anew_r = Rng::new(mix(seed, 0x616e_6577));
     let first = w.r.below(HOSTS.len() as u64) as usize;
     w.writer(first)?;
     let mut back_at = 0u64;
@@ -3911,6 +4001,18 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
                     w.clients[c].quiet = w.clients[c].s.busy() == 0;
                     w.writer(h).map_err(|e| format!("step {}: {}", step, e))?;
                 }
+            }
+        }
+        /* A flush asked as the writer attaches anew, nothing of its own
+           before it: done only once it serves again -- answered as its
+           reconcile mended, it said durable what the mend had not written
+           (the review of 2026-11) */
+        if let Some(c) = w.current() {
+            let cl = &w.clients[c];
+            let anew = cl.served && matches!(cl.s.phase(), Phase::Attaching | Phase::Fencing | Phase::Reconciling);
+            if anew && !cl.zombie && cl.ops.values().all(|o| o.kind == K::Read) && w.anew_r.chance(40) {
+                w.count("flushes asked as the writer attaches anew");
+                w.submit_op(c, K::Flush, 0, 0).map_err(|e| format!("step {}: {}", step, e))?;
             }
         }
         /* A snapshot between two writers now and then, one dropped, and every
@@ -4040,7 +4142,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
                 .map_err(|e| format!("the end: {}", e))?;
             if w.clients[c].s.paused() {
                 w.count("stops asked of a writer paused for a snapshot");
-                let first = stops.below((VOLUME_MIB << 20 >> 12).min(3 * SLOT / BLOCK));
+                let first = stops.below((w.mib << 20 >> 12).min(3 * SLOT / BLOCK));
                 w.submit_op(c, K::Write(1 + stops.below(255) as u8), first, 1).map_err(|e| format!("the end: {}", e))?;
             }
         }

@@ -117,6 +117,18 @@ fn me(state: &ModState) -> Result<String, String> {
 fn open(state: &ModState, name: &str, force: bool) -> Result<u64, String> {
     if let Some(old) = state.io.with(|io| io.remove(name)) {
         let _ = old.stop();
+    } else if !force {
+        /* Attached for writing on this host by a session not this command's
+           -- a guest's: the metadata lets this host's attach take it with no
+           force, for a session that died with its module, and `nbs io write`
+           took a running VM's volume from it in silence (the review of
+           2026-11). Refused here unless forced */
+        let view = member_view(state)?;
+        let here = this_host(&view)?;
+        if view.state.volume(name).and_then(|v| v.writer.as_ref()).is_some_and(|w| w.host == here) {
+            return Err(alloc::format!("{} is attached for writing on this host by another session -- a guest's? \
+                                       `nbs io attach {} force` takes it from that one", name, name));
+        }
     }
     /* Its writes to each replica directly, as before N13: nbs-test's
        path for those, nbsload's and hv's along chains */
@@ -290,7 +302,7 @@ fn held(state: &ModState, name: &str, out: &mut Output) -> Result<(), String> {
     for (k, h) in hosts_of(&view, v).iter().enumerate() {
         let to = if *h == me { String::from(CS_NAME) } else { alloc::format!("{}@{}", CS_NAME, h) };
         let id = k as u64 + 1;
-        let req = Request { id, volume: v.id, generation: 0, op: Op::Held }.encode();
+        let req = Request { id, volume: v.id, generation: 0, op: Op::Held { from: 0 } }.encode();
         let line = match mb.send_to(&to, TAG_REQUEST | TAG_BULK, id, &req) {
             Err(e) => alloc::format!("{} out of reach: {}", to, e.name()),
             Ok(()) => held_answer(&mb, &to, id, name),
@@ -321,7 +333,8 @@ fn held_answer(mb: &Mailbox, to: &str, id: u64, name: &str) -> String {
         let Some(a) = Answer::decode(&m.data).filter(|a| a.id == id) else { continue };
         return match a.reply {
             Reply::Held(list) => {
-                let mut line = alloc::format!("{} chunks of {} open:", list.len(), name);
+                let more = if list.len() >= nbswire::PAGE { " or more" } else { "" };
+                let mut line = alloc::format!("{}{} chunks of {} open:", list.len(), more, name);
                 for (c, inc, g) in list.iter().take(RUNS_SHOWN) {
                     let _ = write!(line, " {}.{}@{}", c, inc, g);
                 }

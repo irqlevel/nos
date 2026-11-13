@@ -25,6 +25,15 @@ pub enum Command {
     /// Device `ident` of `host`'s cs given no new chunks; moving what it holds
     /// comes with repair (N9). Done again where it drains already.
     DeviceDrain { host: String, ident: String },
+    /// Device `device`'s format as its cs found it: `format` the 64 random
+    /// bits its superblock carries -- recorded where none is, done again where
+    /// it is that one, refused (`OtherFormat`) where another is. With 0, the
+    /// record dropped: a person's wipe of a device whose contents are lost
+    /// (`nbs devices add ... wipe`), for its cs to format it anew. A cs never
+    /// formats a device the metadata has a format of: one it reads blank is
+    /// wiped or rotten, its chunks lost, and said so -- formatted, its
+    /// replicas read as zeros where they held data (the review of 2026-11).
+    DeviceFormatted { device: u32, format: u64 },
     /// Volume `name`, `size_mib` MiB, placed with one replica on `host` --
     /// its own host, where it is made and attached from -- where that has
     /// room. Made again with the same size, it is answered as it is.
@@ -40,8 +49,11 @@ pub enum Command {
     /// lost -- is answered with the generation it gave, not another.
     Attach { name: String, host: String, writable: bool, force: bool, token: u64 },
     /// Volume `name` let go by `host`: the writer of `generation`, or -- with
-    /// generation 0 -- a reader. Done where it is not so attached.
-    Detach { name: String, host: String, generation: u64 },
+    /// generation 0 -- a reader. Done where it is not so attached. `token`:
+    /// the session's that let go, kept with the volume so that an attach of
+    /// the same session's, applied late, attaches it to nobody (the review
+    /// of 2026-11); 0 in an entry of before it.
+    Detach { name: String, host: String, generation: u64, token: u64 },
     /// Volume `name`'s writer on `host` at `generation` attached anew, at a
     /// new generation, `token` its session's now (N10c2): a session paused
     /// for a snapshot that heard no word, so that a snapshot of its pause
@@ -61,8 +73,11 @@ pub enum Command {
     /// never the set's last active replica, which writes go on to. Asked by
     /// volume `name`'s writer at `generation`, of a set of its chunks: a
     /// writer fenced since takes nothing out -- else its write would be done
-    /// by taking out the replicas that refuse it.
-    ReplicaDown { set: u32, cs: u32, refused: bool, name: String, generation: u64 },
+    /// by taking out the replicas that refuse it. `version`: the set's as the
+    /// writer's map had it -- refused as stale once the set has moved on, a
+    /// member asked out late taken out of nothing it has joined since (the
+    /// review of 2026-11); none in an entry of before it, taken as it is.
+    ReplicaDown { set: u32, cs: u32, refused: bool, name: String, generation: u64, version: Option<u32> },
     /// cs `cs` silent past the controller's 5 s, as the leader sees it
     /// (N9): down in every set it is a member of -- never the last active
     /// member of one -- dropped as the joiner of any, and given no new
@@ -154,6 +169,9 @@ const CLONE: u8 = 22;
 const COPY_UP: u8 = 23;
 const COPY_DONE: u8 = 24;
 const REATTACH: u8 = 25;
+const REPLICA_DOWN_AT: u8 = 26;
+const DETACH_TOKEN: u8 = 27;
+const DEVICE_FORMATTED: u8 = 28;
 
 const WRITABLE: u8 = 1;
 const FORCE: u8 = 2;
@@ -189,6 +207,11 @@ impl Command {
                 w.str(host);
                 w.str(ident);
             }
+            Command::DeviceFormatted { device, format } => {
+                w.u8(DEVICE_FORMATTED);
+                w.u32(*device);
+                w.u64(*format);
+            }
             Command::VolumeCreate { name, size_mib, host } => {
                 w.u8(VOLUME_CREATE);
                 w.str(name);
@@ -211,24 +234,30 @@ impl Command {
                 w.u8(if *writable { WRITABLE } else { 0 } | if *force { FORCE } else { 0 });
                 w.u64(*token);
             }
-            Command::Detach { name, host, generation } => {
-                w.u8(DETACH);
+            Command::Detach { name, host, generation, token } => {
+                w.u8(if *token != 0 { DETACH_TOKEN } else { DETACH });
                 w.str(name);
                 w.str(host);
                 w.u64(*generation);
+                if *token != 0 {
+                    w.u64(*token);
+                }
             }
             Command::Digest { at, digest } => {
                 w.u8(DIGEST);
                 w.u64(*at);
                 w.fixed(digest);
             }
-            Command::ReplicaDown { set, cs, refused, name, generation } => {
-                w.u8(REPLICA_DOWN);
+            Command::ReplicaDown { set, cs, refused, name, generation, version } => {
+                w.u8(if version.is_some() { REPLICA_DOWN_AT } else { REPLICA_DOWN });
                 w.u32(*set);
                 w.u32(*cs);
                 w.u8(u8::from(*refused));
                 w.str(name);
                 w.u64(*generation);
+                if let Some(v) = version {
+                    w.u32(*v);
+                }
             }
             Command::CsDown { cs } => {
                 w.u8(CS_DOWN);
@@ -336,6 +365,10 @@ impl Command {
                 let host = host(&mut r)?;
                 Command::DeviceDrain { host, ident: String::from(r.str(crate::IDENT_MAX)?) }
             }
+            DEVICE_FORMATTED => {
+                let device = r.u32()?;
+                Command::DeviceFormatted { device, format: r.u64()? }
+            }
             VOLUME_CREATE => {
                 let name = volume(&mut r)?;
                 let size_mib = r.u64()?;
@@ -356,16 +389,18 @@ impl Command {
                 Command::Attach { name, host, writable: flags & WRITABLE != 0, force: flags & FORCE != 0,
                                   token: r.u64()? }
             }
-            DETACH => {
+            code @ (DETACH | DETACH_TOKEN) => {
                 let name = volume(&mut r)?;
                 let host = host(&mut r)?;
-                Command::Detach { name, host, generation: r.u64()? }
+                let generation = r.u64()?;
+                let token = if code == DETACH_TOKEN { r.u64().filter(|&t| t != 0)? } else { 0 };
+                Command::Detach { name, host, generation, token }
             }
             DIGEST => {
                 let at = r.u64()?;
                 Command::Digest { at, digest: r.fixed()? }
             }
-            REPLICA_DOWN => {
+            code @ (REPLICA_DOWN | REPLICA_DOWN_AT) => {
                 let (set, cs) = (r.u32()?, r.u32()?);
                 let refused = match r.u8()? {
                     0 => false,
@@ -373,7 +408,9 @@ impl Command {
                     _ => return None,
                 };
                 let name = volume(&mut r)?;
-                Command::ReplicaDown { set, cs, refused, name, generation: r.u64()? }
+                let generation = r.u64()?;
+                let version = if code == REPLICA_DOWN_AT { Some(r.u32()?) } else { None };
+                Command::ReplicaDown { set, cs, refused, name, generation, version }
             }
             CS_DOWN => Command::CsDown { cs: r.u32()? },
             CS_UP => Command::CsUp { cs: r.u32()? },
@@ -488,8 +525,8 @@ pub enum Refusal {
     Writing,
     /// An image or a snapshot: read-only.
     ReadOnly,
-    /// As many volumes, chunks, devices, chunk servers or readers as the
-    /// metadata keeps.
+    /// As many as the metadata keeps -- volumes, places of maps, chunks,
+    /// devices, chunk servers, readers -- or a number at its end.
     TooMany,
     /// No such replica set, or the cs is no replica of it.
     NoSuchSet,
@@ -499,8 +536,8 @@ pub enum Refusal {
     NotTheWriter,
     /// No chunk server of that number.
     NoSuchCs,
-    /// The set has moved on since the plan was made, or that is not its
-    /// join.
+    /// Asked of what has moved on since: the set's version, its join, a
+    /// copy-up's pending chunk, or a session that let the volume go.
     Stale,
     /// A join of the set is under way already.
     Joining,
@@ -510,8 +547,9 @@ pub enum Refusal {
     AlreadyMember,
     /// The cs is not up: it joins nothing.
     NotUp,
-    /// The member in that place is active and stays: not down, nor its cs
-    /// out or drained.
+    /// The member in that place stays: active, or down with its cs neither
+    /// out nor gone -- its place is another's only from a cs out, gone or
+    /// drained.
     InPlace,
     /// The member is down already: the controller has it join its place
     /// again.
@@ -521,6 +559,13 @@ pub enum Refusal {
     /// A copy-up into a set with a member drained, whose place is to be
     /// joined by another cs first (N10).
     Draining,
+    /// As many copy-ups pending as the metadata keeps: asked again in a
+    /// moment, as they end (the review of 2026-11: said as the bound of
+    /// volumes, chunks, devices, cs's and readers, it failed the write).
+    CopiesPending,
+    /// Another format of the device's is recorded: formatted again since,
+    /// which only a wipe lets it be (`DeviceFormatted`).
+    OtherFormat,
 }
 
 impl Refusal {
@@ -538,7 +583,8 @@ impl Refusal {
             Refusal::Full => "as many members as an NBS cluster takes, or as many removed as it keeps",
             Refusal::NoSuchHost => "no member of that host",
             Refusal::LastMember => "the NBS cluster's last member",
-            Refusal::NotAMember => "the host is no member of the NBS cluster",
+            Refusal::NotAMember => "the host -- the one named, or the chunk server's -- is no member of the NBS \
+                                    cluster",
             Refusal::BadDevice => "not a device's id (part:..., disk:...), or a device of no slots",
             Refusal::DeviceElsewhere => "the device is another host's in the NBS cluster -- a disk moved between servers",
             Refusal::DeviceChanged => "the device is this host's already, of another size",
@@ -556,20 +602,26 @@ impl Refusal {
             Refusal::ReadersAttached => "the volume is attached read-only -- `force` takes it",
             Refusal::Writing => "the volume is attached for writing",
             Refusal::ReadOnly => "an image or a snapshot is read-only",
-            Refusal::TooMany => "as many volumes, chunks, devices, chunk servers or readers as the metadata keeps",
+            Refusal::TooMany => "as many as the metadata keeps -- volumes, places of maps, chunks, devices, chunk \
+                                 servers, readers -- or a number at its end",
             Refusal::NoSuchSet => "no such replica set, or the chunk server is no replica of it",
             Refusal::LastReplica => "the set's last active replica: writes go on to it alone",
             Refusal::NotTheWriter => "not the volume's writer: attached elsewhere since",
             Refusal::NoSuchCs => "no chunk server of that number",
-            Refusal::Stale => "the set has moved on since, or that is not its join",
+            Refusal::Stale => "asked of what has moved on since: the set's version, its join, a copy-up's pending \
+                               chunk, or a session that let the volume go",
             Refusal::Joining => "a join of the set is under way already",
             Refusal::NotDown => "the member is active: it needs no join",
             Refusal::AlreadyMember => "the chunk server is a member of the set already",
             Refusal::NotUp => "the chunk server is not up",
-            Refusal::InPlace => "the member in that place is active and stays",
+            Refusal::InPlace => "the member in that place stays: its place is another's only from a chunk server \
+                                 out, gone or drained",
             Refusal::AlreadyDown => "the member is down already: it joins its place again",
             Refusal::NotFrozen => "a clone is of an image or a snapshot -- freeze or snapshot the volume first",
             Refusal::Draining => "a member of the set is drained: its place is to be joined by another cs first",
+            Refusal::CopiesPending => "as many copy-ups pending as the metadata keeps -- asked again as they end",
+            Refusal::OtherFormat => "another format of the device's is recorded -- `nbs devices add ... wipe` takes \
+                                     it anew",
         }
     }
 
@@ -617,6 +669,8 @@ impl Refusal {
             Refusal::AlreadyDown => 40,
             Refusal::NotFrozen => 41,
             Refusal::Draining => 42,
+            Refusal::CopiesPending => 43,
+            Refusal::OtherFormat => 44,
         }
     }
 
@@ -664,6 +718,8 @@ impl Refusal {
             40 => Refusal::AlreadyDown,
             41 => Refusal::NotFrozen,
             42 => Refusal::Draining,
+            43 => Refusal::CopiesPending,
+            44 => Refusal::OtherFormat,
             _ => return None,
         })
     }
@@ -680,8 +736,10 @@ pub enum Answer {
     /// that was gone.
     Volume { id: u32 },
     /// An attach's generation; a detach's, or 0 where it let go of nothing --
-    /// and 0 for a reader's either way.
-    Attached { generation: u64 },
+    /// and 0 for a reader's either way. `first`: the attach is the first for
+    /// writing of a volume made empty -- no clone -- so that everything of it
+    /// reads as zeros, which a pour leaves out.
+    Attached { generation: u64, first: bool },
     /// A digest held to.
     Checked,
     /// A replica taken out, a join begun, done or given up: its set's
@@ -704,6 +762,7 @@ const CHECKED: u8 = 5;
 const SET: u8 = 6;
 const CHANGED: u8 = 7;
 const CHUNK: u8 = 8;
+const ATTACHED_FIRST: u8 = 9;
 
 impl Answer {
     pub fn encode(&self) -> Vec<u8> {
@@ -725,8 +784,8 @@ impl Answer {
                 w.u8(VOLUME);
                 w.u32(*id);
             }
-            Answer::Attached { generation } => {
-                w.u8(ATTACHED);
+            Answer::Attached { generation, first } => {
+                w.u8(if *first { ATTACHED_FIRST } else { ATTACHED });
                 w.u64(*generation);
             }
             Answer::Checked => w.u8(CHECKED),
@@ -754,7 +813,8 @@ impl Answer {
             REFUSED => Answer::Refused(Refusal::from_code(r.u8()?)?),
             DEVICE => Answer::Device { id: r.u32()? },
             VOLUME => Answer::Volume { id: r.u32()? },
-            ATTACHED => Answer::Attached { generation: r.u64()? },
+            ATTACHED => Answer::Attached { generation: r.u64()?, first: false },
+            ATTACHED_FIRST => Answer::Attached { generation: r.u64()?, first: true },
             CHECKED => Answer::Checked,
             SET => Answer::Set { version: r.u32()? },
             CHANGED => Answer::Changed { sets: r.u32()? },

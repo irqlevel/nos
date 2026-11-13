@@ -14,7 +14,8 @@
 //!     nbs host replace <host>    on a member: a host that lost its state, back as a new member
 //!     nbs hosts                  every member: its incarnation, its vote, the leader
 //!     nbs                        this host's member: role, term, leader, what it applied
-//!     nbs devices add <id|name> [wipe]   a device of this host's for its chunk server
+//!     nbs devices add <id|name> [wipe]   a device of this host's for its chunk server; wipe: whatever is
+//!                                on it -- or a device its cs found blank where it had formatted it
 //!     nbs devices drain <id>     given no new chunks
 //!     nbs replica bad <set> <host>   <host>'s cs taken down in <set>, for its join back to copy it again
 //!     nbs cs                     every host's chunk server: its devices and room
@@ -99,7 +100,8 @@ const USAGE: &str = "usage: nbs                          this host's member: inc
                      \x20      nbs host replace <host>    <host>, which lost its state, back as a new member\n\
                      \x20      nbs devices add <id|name> [wipe]   a device of this host's for its chunk server: \
                      with wipe,\n\
-                     \x20                                 even one with something else on it\n\
+                     \x20                                 even one with something else on it, or one its cs\n\
+                     \x20                                 found blank where it had formatted it\n\
                      \x20      nbs devices drain <id>     given no new chunks\n\
                      \x20      nbs replica bad <set> <host>   <host>'s cs taken down in <set>, to copy its chunks \
                      again\n\

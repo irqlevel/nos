@@ -2,6 +2,7 @@
 //! (plans/nbs.md, "The cs" and "The client, in hv"): the one copy that
 //! nbs-mds.ko answers with and fuzz/nbs's cluster target's mds does.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -11,16 +12,29 @@ use nbsmeta::{DeviceState, Replica, State};
 use crate::{Device, Identity, JoinView, Place, Question, Refusal, ReplicaState, Said, Told, LIST_MAX, MAP_MAX};
 
 /// Question `q` of host `host`'s cs, answered from state `s`, applied as far
-/// as entry `applied`.
-pub fn told(s: &State, host: &str, applied: u64, q: &Question) -> Told {
+/// as entry `applied`. `confirmed`: the member has had a read the leader
+/// confirmed served since the question came -- it has applied everything
+/// committed before it. A question that names no entry to be applied as far
+/// as -- whose cs it is, which of its chunks and volumes are gone, which
+/// joins are its -- is answered only so (`NoMds` else): a member that knows
+/// less than its cs has acted on -- one replaced, brought the log from the
+/// start, or started again behind what it had applied, its commit not
+/// synced -- told the cs that the chunks and volumes made since were gone,
+/// and the cs freed them and took their fences off; and a join's copy
+/// dropped as over, with its marks (found by the review of 2026-11).
+pub fn told(s: &State, host: &str, applied: u64, q: &Question, confirmed: bool) -> Told {
     let Some(cluster) = s.cluster() else { return Told::Refused(Refusal::NoMds) };
     let mine = s.cs_of(host);
+    if !confirmed && needs_read(q) {
+        return Told::Refused(Refusal::NoMds);
+    }
     match q {
         Question::Identity => Told::Identity(mine.map(|cs| Identity {
             cluster: cluster.id,
             cs: cs.id,
             devices: cs.devices.iter().map(|d| Device { ident: d.ident.clone(), device: d.id, slots: d.slots,
-                                                          draining: d.state != DeviceState::Active })
+                                                          draining: d.state != DeviceState::Active,
+                                                          format: d.format })
                 .collect(),
         })),
         Question::Verify { volume, generation, chunk, position, index, writing } => {
@@ -87,25 +101,42 @@ pub fn told(s: &State, host: &str, applied: u64, q: &Question) -> Told {
         }
         Question::Joins => {
             let Some(me) = mine else { return Told::Joins(Vec::new()) };
-            Told::Joins(s.sets().iter().enumerate().filter_map(|(id, st)| {
-                let j = st.joiner.filter(|j| j.cs == me.id)?;
+            let joined: Vec<u32> = s.sets().iter().enumerate().filter(|(_, st)| st.joiner.is_some_and(|j| j.cs == me.id))
+                .map(|(id, _)| id as u32).take(LIST_MAX).collect();
+            /* Every volume a writer has had with a chunk in each set joined,
+               at its newest generation -- the joiner fences itself so first:
+               the maps walked once for all of them, not once a set */
+            let mut fences: BTreeMap<u32, Vec<(u32, u64)>> = BTreeMap::new();
+            if !joined.is_empty() {
+                for v in s.volumes().iter().filter(|v| v.generation != 0) {
+                    for &c in v.map.iter() {
+                        let Some(ch) = s.chunks().get(c as usize).filter(|ch| !ch.is_free()) else { continue };
+                        if !joined.contains(&ch.set) {
+                            continue;
+                        }
+                        let f = fences.entry(ch.set).or_default();
+                        if f.last().is_none_or(|&(last, _)| last != v.id) {
+                            f.push((v.id, v.generation));
+                        }
+                    }
+                }
+            }
+            Told::Joins(joined.iter().filter_map(|&id| {
+                let st = s.sets().get(id as usize)?;
+                let j = st.joiner?;
                 let k = usize::from(j.place);
                 let sources = (0..nbsmeta::REPLICAS).filter(|&m| st.replicas[m] == Replica::Active)
                     .filter_map(|m| s.cs().get(st.cs[m] as usize).map(|c| (c.id, c.host.clone()))).collect();
-                /* Every volume a writer has had with a chunk in the set, at
-                   its newest generation: the joiner fences itself so first */
-                let fences: Vec<(u32, u64)> = s.volumes().iter().filter(|v| v.generation != 0 && v.map.iter()
-                    .any(|&c| s.chunks().get(c as usize).is_some_and(|ch| !ch.is_free() && ch.set as usize == id)))
-                    .map(|v| (v.id, v.generation)).collect();
+                let fences = fences.remove(&id).unwrap_or_default();
                 /* Past what a view carries -- never in a cluster of this size
                    -- the join waits, not begun unfenced */
                 if fences.len() > LIST_MAX {
                     return None;
                 }
-                Some(JoinView { set: id as u32, place: j.place, since: j.since, version: st.version,
+                Some(JoinView { set: id, place: j.place, since: j.since, version: st.version,
                                 own: st.cs.get(k) == Some(&me.id), until: st.active_until.get(k).copied().unwrap_or(0),
                                 sources, index: applied, fences })
-            }).take(LIST_MAX).collect())
+            }).collect())
         }
         /* A copy-up's copy on this host's cs (N10): pending at that place of
            that volume, from that chunk to that one, asked by the volume's
@@ -139,14 +170,49 @@ pub fn told(s: &State, host: &str, applied: u64, q: &Question) -> Told {
             }
             Told::Verified
         }
+        /* A fence of the volume's writer of now (`Op::Fence`): no other is
+           to raise a cs's fence -- nor a writer taken over to lay one again
+           where the volume's was taken off */
+        Question::VerifyFence { volume, generation, index } => {
+            if applied < *index {
+                return Told::Refused(Refusal::Behind { applied });
+            }
+            let Some(v) = s.volumes().iter().find(|v| v.id == *volume) else {
+                return Told::Refused(Refusal::NotTheMap);
+            };
+            if *generation == 0 || v.writer.as_ref().is_none_or(|w| w.generation != *generation) {
+                return Told::Refused(Refusal::NotAttached);
+            }
+            Told::Verified
+        }
         /* Proposals: nbs-mds's, through raft, not answered from the state */
-        Question::JoinDone { .. } | Question::GiveUp { .. } => Told::Refused(Refusal::NoMds),
+        Question::JoinDone { .. } | Question::GiveUp { .. } | Question::Formatted { .. } => {
+            Told::Refused(Refusal::NoMds)
+        }
+        /* Gone: freed, the number another chunk's now, or of a set this cs
+           is neither a member nor the joiner of -- a member replaced by
+           another's join, whose copy is no replica's any more: kept, the
+           metadata gave its room to new chunks that did not fit beside it
+           (found by the review of 2026-11) */
         Question::Live { chunks } => Told::Gone(chunks.iter()
-            .filter(|(c, inc)| s.chunks().get(*c as usize).is_none_or(|ch| ch.is_free() || ch.incarnation != *inc))
+            .filter(|(c, inc)| match s.chunks().get(*c as usize) {
+                Some(ch) if !ch.is_free() && ch.incarnation == *inc => mine.is_some_and(|me| {
+                    s.sets().get(ch.set as usize)
+                        .is_none_or(|set| !set.cs.contains(&me.id) && set.joiner.is_none_or(|j| j.cs != me.id))
+                }),
+                _ => true,
+            })
             .map(|&(c, _)| c).collect()),
         Question::Volumes { volumes } => Told::Gone(volumes.iter()
             .filter(|&&v| !s.volumes().iter().any(|x| x.id == v)).copied().collect()),
     }
+}
+
+/// Whether question `q` is answered only by a member that has confirmed it
+/// is as far as the leader (`told`'s `confirmed`): one that names no entry
+/// of its own to be applied as far as.
+pub fn needs_read(q: &Question) -> bool {
+    matches!(q, Question::Identity | Question::Live { .. } | Question::Volumes { .. } | Question::Joins)
 }
 
 fn replica_state(r: Replica) -> ReplicaState {
