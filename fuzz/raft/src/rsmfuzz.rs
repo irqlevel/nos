@@ -774,6 +774,7 @@ pub const SCENARIOS: &[(&str, fn() -> Result<(), String>)] = &[
     ("rsm_vote_durable", vote_durable),
     ("rsm_snapshot_in_steps", snapshot_in_steps),
     ("rsm_snapshot_too_large", snapshot_too_large),
+    ("rsm_session_evicted", session_evicted),
 ];
 
 type Lone = Rsm<MemStorage, Reg>;
@@ -1305,6 +1306,43 @@ fn sync_when_needed() -> Result<(), String> {
         if m.stats().syncs <= before[i].syncs {
             return Err(format!("member {} took an entry with no sync", i + 1));
         }
+    }
+    Ok(())
+}
+
+/// Past `MAX_SESSIONS`, a new session evicts the one least recently used --
+/// whose last command, or registration, is the oldest in the log -- and not
+/// one in use. (No run came near a thousand sessions: evicting any one
+/// failed nothing.)
+fn session_evicted() -> Result<(), String> {
+    let (mut m, first) = lone(1 << 40)?;
+    let registered = |events: Vec<Event>| {
+        events.into_iter().find_map(|e| match e {
+            Event::Registered { client, .. } => Some(client),
+            _ => None,
+        })
+    };
+    let mut second = None;
+    for r in 1..raft::rsm::MAX_SESSIONS as u64 {
+        m.register(1000 + r).map_err(|e| format!("{:?}", e))?;
+        let client = registered(drain(&mut m)?).ok_or("a session not made")?;
+        second.get_or_insert(client);
+    }
+    let second = second.ok_or("no second session")?;
+    /* The first used again: the second is now the least recently used */
+    add(&mut m, first, 1, 5)?;
+    m.register(5000).map_err(|e| format!("{:?}", e))?;
+    registered(drain(&mut m)?).ok_or("the session past the most not made")?;
+    if m.sessions() != raft::rsm::MAX_SESSIONS {
+        return Err(format!("{} sessions kept", m.sessions()));
+    }
+    let used = add(&mut m, first, 2, 1)?;
+    if !used.iter().any(|e| matches!(e, Event::Applied { client, seq: 2, .. } if *client == first)) {
+        return Err(format!("the session used last evicted: {:?}", used));
+    }
+    let old = add(&mut m, second, 1, 1)?;
+    if !old.iter().any(|e| matches!(e, Event::Expired { client, .. } if *client == second)) {
+        return Err(format!("the session least recently used kept: {:?}", old));
     }
     Ok(())
 }

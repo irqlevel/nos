@@ -93,9 +93,11 @@ pub struct Config {
     pub max_inflight_bytes: u64,
     /// The largest entry a proposal may make.
     pub max_entry_bytes: usize,
-    /// Entries appended and not yet committed, at most -- a leader's
-    /// proposals past it are refused (`Busy`), a follower's appends past
-    /// it dropped and sent again.
+    /// Entries a member holds and has not yet done with, at most: on a
+    /// leader, appended and not yet committed -- proposals past it are
+    /// refused (`Busy`); on a follower, taken and not yet handed out to be
+    /// written (its unstable entries) -- what an append brings past it is
+    /// left for the leader to send again.
     pub max_uncommitted_entries: u64,
     /// Bytes of committed entries a `Ready` hands to apply, at most (but
     /// always one entry).
@@ -1023,8 +1025,12 @@ impl<S: Storage> RawNode<S> {
 
     fn send_term(&mut self, to: NodeId, term: u64, body: Body) {
         /* Past what one `Ready` hands out, dropped as a network drops a
-         * message -- Raft sends again what is lost -- so that a caller
-         * that lets them wait does not make the list too large to hold. */
+         * message, so that a caller that lets them wait does not make the
+         * list too large to hold. Raft sends again what is lost of its
+         * appends, votes, heartbeats and a snapshot's pieces; a read's
+         * ReadIndex and its answer, and a hand-over's TimeoutNow, it does
+         * not -- the read is failed back for its age (`Rsm`), the hand-over
+         * given up after an election's time. */
         if self.msgs.len() >= MAX_OUTBOX {
             self.stats.unsent += 1;
             return;
