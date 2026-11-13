@@ -54,14 +54,28 @@ pub const MDS_NAME: &str = "nbs.mds";
 pub const DATA_MAX: u32 = 256 * 1024;
 /// The most chunks or volumes a question names, or an answer gives.
 pub const LIST_MAX: usize = 4096;
+/// The most a list asked for at once gives -- a set's chunks to its joiner,
+/// a volume's open chunks to its writer's start, the chunks and volumes the
+/// garbage pass asks about: a page of it, the rest asked from the last on.
+/// A few in fuzz/nbs's builds, so that every list goes past its first page
+/// there (`small_pages`); `LIST_MAX` everywhere else.
+#[cfg(not(feature = "small_pages"))]
+pub const PAGE: usize = LIST_MAX;
+#[cfg(feature = "small_pages")]
+pub const PAGE: usize = 3;
+const _: () = assert!(PAGE <= LIST_MAX && PAGE <= nbscs::PAGE_OF_CHUNKS);
 /// A device's id at most, as the metadata keeps it.
 pub const IDENT_MAX: usize = nbsmeta::IDENT_MAX;
 
 /// What a client asks of a cs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op<'a> {
-    /// The volume fenced at the request's generation.
-    Fence,
+    /// The volume fenced at the request's generation -- that of its
+    /// writer's attach, applied at entry `index`, which the cs's mds
+    /// vouches for: no other host, and no writer since taken over, fences a
+    /// volume (the review of 2026-11: a deleted volume's old writer fenced
+    /// itself anew and wrote a snapshot's chunks).
+    Fence { index: u64 },
     /// `data` written at `offset` in the chunk, at map place `position` of
     /// the volume, as the metadata had it at entry `index`.
     Write { chunk: ChunkRef, position: u32, index: u64, offset: u32, data: &'a [u8] },
@@ -70,8 +84,10 @@ pub enum Op<'a> {
     Flush,
     /// The chunk closed: every replica of it flushed.
     Close { chunk: ChunkRef, position: u32, index: u64 },
-    /// The volume's chunks the cs holds open, for a reconcile.
-    Held,
+    /// The volume's chunks the cs holds open, for a reconcile, from chunk
+    /// number `from` on: a page of them (`PAGE`), the next asked from the
+    /// last on until one is short.
+    Held { from: u32 },
     /// Whether the cs is there and serving: the leader's look at a cs a client
     /// says did not answer it (N8).
     Ping,
@@ -198,6 +214,13 @@ pub enum Question {
     JoinDone { set: u32, since: u32 },
     /// The join given up: the cs started again, and its marks are gone.
     GiveUp { set: u32, since: u32 },
+    /// A fence asked of this cs (`Op::Fence`): the volume's writer of now at
+    /// `generation`, as the metadata has it at entry `index` at least.
+    VerifyFence { volume: u32, generation: u64, index: u64 },
+    /// Device `device` of this host's cs found at format `format`: the
+    /// metadata's record of it proposed (`DeviceFormatted`), and told once
+    /// applied.
+    Formatted { device: u32, format: u64 },
 }
 
 /// A join this host's cs is the joiner of (N9), as its mds tells it.
@@ -241,6 +264,10 @@ pub struct Device {
     pub device: u32,
     pub slots: u32,
     pub draining: bool,
+    /// The format the metadata has of it, 0 for none: one the cs reads
+    /// blank, of a format recorded, is no device to format again
+    /// (`nbscs::take_in`).
+    pub format: u64,
 }
 
 /// Whose cs this host's is.
@@ -425,7 +452,10 @@ impl Request<'_> {
         w.u32(self.volume);
         w.u64(self.generation);
         match &self.op {
-            Op::Fence => w.u8(1),
+            Op::Fence { index } => {
+                w.u8(1);
+                w.u64(*index);
+            }
             Op::Write { chunk, position, index, offset, data } => {
                 w.u8(2);
                 chunk_ref(w, chunk);
@@ -450,7 +480,10 @@ impl Request<'_> {
                 w.u32(*position);
                 w.u64(*index);
             }
-            Op::Held => w.u8(6),
+            Op::Held { from } => {
+                w.u8(6);
+                w.u32(*from);
+            }
             Op::Ping => w.u8(7),
             Op::Holdings { set, from, joiner, version, index } => {
                 w.u8(8);
@@ -528,7 +561,7 @@ impl<'a> Request<'a> {
         let volume = r.u32()?;
         let generation = r.u64()?;
         let op = match r.u8()? {
-            1 => Op::Fence,
+            1 => Op::Fence { index: r.u64()? },
             2 => {
                 let chunk = read_chunk_ref(r)?;
                 let (position, index, offset) = (r.u32()?, r.u64()?, r.u32()?);
@@ -548,7 +581,7 @@ impl<'a> Request<'a> {
             }
             4 => Op::Flush,
             5 => Op::Close { chunk: read_chunk_ref(r)?, position: r.u32()?, index: r.u64()? },
-            6 => Op::Held,
+            6 => Op::Held { from: r.u32()? },
             7 => Op::Ping,
             8 => Op::Holdings { set: r.u32()?, from: r.u32()?, joiner: r.u32()?, version: r.u32()?, index: r.u64()? },
             code @ (9 | 10) => {
@@ -891,6 +924,17 @@ impl Query {
                 chunk_ref(&mut w, to);
                 w.u64(*index);
             }
+            Question::VerifyFence { volume, generation, index } => {
+                w.u8(10);
+                w.u32(*volume);
+                w.u64(*generation);
+                w.u64(*index);
+            }
+            Question::Formatted { device, format } => {
+                w.u8(11);
+                w.u32(*device);
+                w.u64(*format);
+            }
         }
         w.buf
     }
@@ -942,6 +986,8 @@ impl Query {
                 let (from, to) = (read_chunk_ref(&mut r)?, read_chunk_ref(&mut r)?);
                 Question::VerifyCopy { volume, generation, position, from, to, index: r.u64()? }
             }
+            10 => Question::VerifyFence { volume: r.u32()?, generation: r.u64()?, index: r.u64()? },
+            11 => Question::Formatted { device: r.u32()?, format: r.u64()? },
             _ => return None,
         };
         r.done().then_some(Query { id, question })
@@ -964,6 +1010,7 @@ impl Answered {
                     w.u32(d.device);
                     w.u32(d.slots);
                     w.u8(u8::from(d.draining));
+                    w.u64(d.format);
                 }
             }
             Told::Verified => w.u8(3),
@@ -1030,7 +1077,7 @@ impl Answered {
                         1 => true,
                         _ => return None,
                     };
-                    devices.push(Device { ident, device, slots, draining });
+                    devices.push(Device { ident, device, slots, draining, format: r.u64()? });
                 }
                 Told::Identity(Some(Identity { cluster, cs, devices }))
             }
@@ -1149,15 +1196,19 @@ pub enum Ask {
     /// session's own, so that the attach asked again is answered as it was.
     Attach { name: String, writable: bool, force: bool, token: u64 },
     /// Volume `name` let go of: the writer of `generation`, or with 0 a
-    /// reader.
-    Detach { name: String, generation: u64 },
+    /// reader; `token` the session's, kept by the metadata so that an attach
+    /// of its applied late attaches the volume to nobody.
+    Detach { name: String, generation: u64, token: u64 },
     /// `count` places of volume `name`'s map from place `from`, as the
     /// metadata has them at entry `index` at least.
     Map { name: String, from: u32, count: u32, index: u64 },
     /// Replica `cs` of set `set` taken out: it did not answer the client --
     /// or, `refused`, it refused as failed. Asked as volume `name`'s writer
-    /// at `generation`.
-    Down { set: u32, cs: u32, refused: bool, name: String, generation: u64 },
+    /// at `generation`, of the set at `version` as its map has it: refused as
+    /// stale once the set has moved on, so that an ask late -- the member
+    /// back by a join since, or joining -- takes nothing out again (the
+    /// review of 2026-11).
+    Down { set: u32, cs: u32, refused: bool, name: String, generation: u64, version: u32 },
     /// A new chunk for place `place` of volume `name`, whose chunk is shared
     /// (N10): asked by its writer at `generation` before it writes there,
     /// told the chunk each active member of the set is to copy the old one
@@ -1175,6 +1226,12 @@ pub enum Ask {
     /// word -- refused where it is no longer the writer. `token` its
     /// session's now, by which it is asked again.
     Reattach { name: String, generation: u64, token: u64 },
+    /// The writer of volume `name` at `generation` there: said every few
+    /// seconds, answered by nothing, so that this host's mds started again
+    /// knows the session a snapshot pauses (the review of 2026-11: one that
+    /// asked nothing of the mds was not known to it, and its volume took no
+    /// snapshot until its guest started again).
+    Here { name: String, generation: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1187,8 +1244,9 @@ pub struct Asking {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Said {
     /// Attached: the generation -- 0 read-only -- and the entry it was
-    /// applied at.
-    Attached { generation: u64, index: u64 },
+    /// applied at; `first`: the volume's first attach for writing, made
+    /// empty, no clone -- everything of it reads as zeros.
+    Attached { generation: u64, index: u64, first: bool },
     /// Let go of, at entry `index`.
     Detached { index: u64 },
     /// Volume `volume`, `size_mib` MiB of `places` places: those asked for,
@@ -1255,10 +1313,11 @@ impl Asking {
                 w.u8(u8::from(*writable) | u8::from(*force) << 1);
                 w.u64(*token);
             }
-            Ask::Detach { name, generation } => {
+            Ask::Detach { name, generation, token } => {
                 w.u8(2);
                 w.str(name);
                 w.u64(*generation);
+                w.u64(*token);
             }
             Ask::Map { name, from, count, index } => {
                 w.u8(3);
@@ -1267,13 +1326,14 @@ impl Asking {
                 w.u32(*count);
                 w.u64(*index);
             }
-            Ask::Down { set, cs, refused, name, generation } => {
+            Ask::Down { set, cs, refused, name, generation, version } => {
                 w.u8(4);
                 w.u32(*set);
                 w.u32(*cs);
                 w.u8(u8::from(*refused));
                 w.str(name);
                 w.u64(*generation);
+                w.u32(*version);
             }
             Ask::CopyUp { name, place, generation } => {
                 w.u8(5);
@@ -1301,6 +1361,11 @@ impl Asking {
                 w.u64(*generation);
                 w.u64(*token);
             }
+            Ask::Here { name, generation } => {
+                w.u8(9);
+                w.str(name);
+                w.u64(*generation);
+            }
         }
         w.buf
     }
@@ -1319,7 +1384,7 @@ impl Asking {
             }
             2 => {
                 let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);
-                Ask::Detach { name, generation: r.u64()? }
+                Ask::Detach { name, generation: r.u64()?, token: r.u64()? }
             }
             3 => {
                 let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);
@@ -1337,7 +1402,7 @@ impl Asking {
                     _ => return None,
                 };
                 let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);
-                Ask::Down { set, cs, refused, name, generation: r.u64()? }
+                Ask::Down { set, cs, refused, name, generation: r.u64()?, version: r.u32()? }
             }
             5 => {
                 let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);
@@ -1356,6 +1421,10 @@ impl Asking {
                 let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);
                 Ask::Reattach { name, generation: r.u64()?, token: r.u64()? }
             }
+            9 => {
+                let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);
+                Ask::Here { name, generation: r.u64()? }
+            }
             _ => return None,
         };
         r.done().then_some(Asking { id, ask })
@@ -1367,10 +1436,11 @@ impl Saying {
         let mut w = Writer::new();
         w.u64(self.id);
         match &self.said {
-            Said::Attached { generation, index } => {
+            Said::Attached { generation, index, first } => {
                 w.u8(1);
                 w.u64(*generation);
                 w.u64(*index);
+                w.u8(u8::from(*first));
             }
             Said::Detached { index } => {
                 w.u8(2);
@@ -1444,8 +1514,13 @@ impl Saying {
         let id = r.u64()?;
         let said = match r.u8()? {
             1 => {
-                let generation = r.u64()?;
-                Said::Attached { generation, index: r.u64()? }
+                let (generation, index) = (r.u64()?, r.u64()?);
+                let first = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                };
+                Said::Attached { generation, index, first }
             }
             2 => Said::Detached { index: r.u64()? },
             3 => {

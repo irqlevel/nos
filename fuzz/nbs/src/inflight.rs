@@ -329,6 +329,8 @@ struct Run {
     r: Rng,
     disks: Vec<AHandle>,
     identities: Vec<Identity>,
+    /// Each disk's format, as the metadata would record it.
+    formats: Vec<u64>,
     store: Rc<Store<AHandle>>,
     out: Vec<Out>,
     clock: u64,
@@ -614,7 +616,7 @@ impl Run {
         }
         let store = Store::new();
         for (i, d) in self.disks.clone().iter().enumerate() {
-            match drive(store.open_device(d.clone(), self.identities[i]), &self.disks) {
+            match drive(store.open_device(d.clone(), self.identities[i], self.formats[i]), &self.disks) {
                 Ok((_, rep)) if rep.lost == 0 => {}
                 Ok((_, rep)) => return Err(format!("disk {} opened with {} records lost", i, rep.lost)),
                 Err((_, e)) => return Err(format!("disk {} not opened again: {:?}", i, e)),
@@ -736,6 +738,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     let disks = 1 + r.below(2) as usize;
     let mut handles = Vec::new();
     let mut identities = Vec::new();
+    let mut formats = Vec::new();
     for i in 0..disks {
         let slots = 10 + r.below(10);
         handles.push(AHandle(Rc::new(RefCell::new(ADisk::new(sector, slots * SLOT)))));
@@ -743,7 +746,9 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     }
     let store = Store::new();
     for (i, d) in handles.iter().enumerate() {
-        if let Err((_, e)) = drive(store.format_device(d.clone(), identities[i], 1 + r.below(u64::MAX - 1)), &handles) {
+        let format = 1 + r.below(u64::MAX - 1);
+        formats.push(format);
+        if let Err((_, e)) = drive(store.format_device(d.clone(), identities[i], format), &handles) {
             return Err(format!("disk {} not formatted: {:?}", i, e));
         }
     }
@@ -752,7 +757,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     }
     let chunks = (0..CHUNKS).map(|_| MChunk { sectors: vec![MSec { now: Some(0), ..MSec::default() }; SECTORS as usize],
                                              ..MChunk::default() }).collect();
-    let mut run = Run { r, disks: handles, identities, store: Rc::new(store), out: Vec::new(), clock: 0,
+    let mut run = Run { r, disks: handles, identities, formats, store: Rc::new(store), out: Vec::new(), clock: 0,
                         generation: [1; VOLUMES as usize + 1], fenced: [1; VOLUMES as usize + 1], chunks,
                         stats: BTreeMap::new(), trace };
     /* Bursts: requests asked faster than the disks do them, then let be */

@@ -79,8 +79,14 @@ pub const REMOVED_MAX: usize = 1024;
 /// A cluster's name at most.
 pub const NAME_MAX: usize = 63;
 /// How many entries apart a member takes its state's digest, which the
-/// leader proposes for every member to hold its own to.
+/// leader proposes for every member to hold its own to -- at the least:
+/// a state bigger than `CHECK_EVERY` times `CHECK_BYTES` takes it once every
+/// `size / CHECK_BYTES` entries, so that the digest's hashing costs an
+/// entry `CHECK_BYTES` on the average, and a big state's apply is not held
+/// for its whole hash every 64 entries (found by the review of 2026-11: two
+/// seconds a digest at a GiB of maps).
 pub const CHECK_EVERY: u64 = 64;
+pub const CHECK_BYTES: u64 = 256 << 10;
 
 /// Whether `name` is a cluster's or a host's name: a DNS label's letters,
 /// as ipc's hosts have them.
@@ -125,6 +131,14 @@ pub struct State {
     /// The next device's number and the next volume's: never taken again.
     next_device: u32,
     next_volume: u32,
+    /// The next attach generation, of every volume's: a writer is its volume
+    /// and its generation, and a generation is never given twice -- a volume
+    /// made again under a name its old one had begins past every one given,
+    /// so that a command of the old one's writer, late, is never taken for
+    /// the new one's (found by the review of 2026-11: a snapshot of the old
+    /// writer's pause shared a new writer's chunks, which went on being
+    /// written in place).
+    next_generation: u64,
     /// The first entry from which the next digest is taken.
     next_check: u64,
     /// The free list's first chunk, `NO_CHUNK` for none.
@@ -133,6 +147,10 @@ pub struct State {
     /// chunk, and the old one the map names still.
     copying: BTreeMap<(u32, u32), (u32, u32)>,
     /* Of the tables above, made again from them: never in a snapshot */
+    /// The copy-ups pending by the chunk they copy, and the volume and place
+    /// each is of: what a chunk named by one map no longer gives up, looked
+    /// up rather than every copy-up pending walked for each chunk.
+    copying_from: BTreeSet<(u32, u32, u32)>,
     /// The clean sets -- every member active, no joiner -- by their three
     /// cs's and number: where new chunks on those three go, the lowest first.
     set_of: BTreeSet<([u32; REPLICAS], u32)>,
@@ -154,9 +172,11 @@ impl Default for State {
             volumes: Pieces::new(),
             next_device: 1,
             next_volume: 1,
+            next_generation: 1,
             next_check: CHECK_EVERY,
             free_head: NO_CHUNK,
             copying: BTreeMap::new(),
+            copying_from: BTreeSet::new(),
             set_of: BTreeSet::new(),
             free_count: 0,
             checks: Checks::default(),
@@ -171,6 +191,7 @@ impl PartialEq for State {
         self.cluster == o.cluster && self.members == o.members && self.removed == o.removed && self.cs == o.cs
             && self.sets == o.sets && self.chunks == o.chunks && self.volumes == o.volumes
             && self.next_device == o.next_device && self.next_volume == o.next_volume
+            && self.next_generation == o.next_generation
             && self.next_check == o.next_check && self.free_head == o.free_head && self.copying == o.copying
     }
 }
@@ -367,6 +388,7 @@ impl State {
     fn read<S: codec::Source>(r: &mut Stream<S>) -> Result<State, RestoreError> {
         let mut s = snapshot::read(r)?;
         s.free_count = s.chunks.iter().filter(|c| c.is_free()).count() as u32;
+        s.copying_from = s.copying.iter().map(|(&(v, place), &(_, from))| (from, v, place)).collect();
         for id in 0..s.sets.len() as u32 {
             s.index(id);
         }
@@ -417,7 +439,7 @@ impl StateMachine for State {
             None => Answer::Refused(Refusal::Malformed),
         };
         if index >= self.next_check {
-            self.next_check = index.saturating_add(CHECK_EVERY);
+            self.next_check = index.saturating_add(CHECK_EVERY.max(self.size() / CHECK_BYTES));
             let digest = self.digest();
             self.checks.push(index, digest);
         }

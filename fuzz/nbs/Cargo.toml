@@ -14,7 +14,8 @@ edition = "2021"
 [dependencies]
 nbsmeta = { path = "../../src/crates/common/storage/nbsmeta" }
 nbscs = { path = "../../src/crates/common/storage/nbscs" }
-nbswire = { path = "../../src/crates/common/storage/nbswire" }
+# Its lists a few entries a page, so that every list goes past its first
+nbswire = { path = "../../src/crates/common/storage/nbswire", features = ["small_pages"] }
 # With its `starve` seam: the cluster target starves a writer of memory (#97)
 nbsclient = { path = "../../src/crates/common/storage/nbsclient", features = ["starve", "small_windows"] }
 raft = { path = "../../src/crates/common/cluster/raft" }

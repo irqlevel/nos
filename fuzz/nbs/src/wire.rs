@@ -143,7 +143,7 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
         0 => {
             let n = len(r, u64::from(DATA_MAX));
             let op = match r.below(12) {
-                0 => Op::Fence,
+                0 => Op::Fence { index: r.below(u64::MAX) },
                 1 => Op::Write { chunk: chunk(r), position: r.below(1 << 32) as u32, index: r.below(u64::MAX),
                                  offset: r.below(1 << 32) as u32, data: &data[..n] },
                 2 => Op::Read { chunk: chunk(r), position: r.below(1 << 32) as u32, index: r.below(u64::MAX),
@@ -151,7 +151,7 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                 3 => Op::Flush,
                 4 => Op::Close { chunk: chunk(r), position: r.below(1 << 32) as u32, index: r.below(u64::MAX) },
                 5 if r.chance(50) => Op::Ping,
-                5 => Op::Held,
+                5 => Op::Held { from: r.below(1 << 32) as u32 },
                 /* A joiner's asks of a source (N9) */
                 6 => Op::Holdings { set: r.below(1 << 32) as u32, from: r.below(1 << 32) as u32,
                                     joiner: r.below(1 << 32) as u32, version: r.below(1 << 32) as u32,
@@ -199,7 +199,7 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
             (1, Answer { id, reply }.encode(), true)
         }
         2 => {
-            let question = match r.below(9) {
+            let question = match r.below(10) {
                 0 => Question::Identity,
                 1 => Question::Verify { volume: r.below(1 << 32) as u32, generation: r.below(u64::MAX), chunk: chunk(r),
                                         position: r.below(1 << 32) as u32, index: r.below(u64::MAX),
@@ -218,6 +218,9 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                 5 => Question::Joins,
                 6 => Question::JoinDone { set: r.below(1 << 32) as u32, since: r.below(1 << 32) as u32 },
                 7 => Question::GiveUp { set: r.below(1 << 32) as u32, since: r.below(1 << 32) as u32 },
+                /* A fence past the one a cs knows (the review of 2026-11) */
+                8 => Question::VerifyFence { volume: r.below(1 << 32) as u32, generation: r.below(u64::MAX),
+                                             index: r.below(u64::MAX) },
                 /* A copy-up's copy (N10) */
                 _ => Question::VerifyCopy { volume: r.below(1 << 32) as u32, generation: r.below(u64::MAX),
                                             position: r.below(1 << 32) as u32, from: chunk(r), to: chunk(r),
@@ -235,6 +238,7 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                         device: r.below(1 << 32) as u32,
                         slots: r.below(1 << 32) as u32,
                         draining: r.chance(30),
+                        format: r.below(u64::MAX),
                     }).collect();
                     let mut cluster = [0u8; 16];
                     for b in cluster.iter_mut() {
@@ -277,10 +281,11 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
             (3, Answered { id, told }.encode(), ok)
         }
         4 => {
-            let ask = match r.below(8) {
+            let ask = match r.below(9) {
                 0 => Ask::Attach { name: name(r, nbsmeta::VOLUME_NAME_MAX), writable: r.chance(50),
                                    force: r.chance(50), token: r.below(u64::MAX) },
-                1 => Ask::Detach { name: name(r, nbsmeta::VOLUME_NAME_MAX), generation: r.below(u64::MAX) },
+                1 => Ask::Detach { name: name(r, nbsmeta::VOLUME_NAME_MAX), generation: r.below(u64::MAX),
+                                   token: r.below(u64::MAX) },
                 2 => {
                     /* At the limit and past it, often: either side of it is the reader's to hold */
                     let count = match r.below(8) {
@@ -292,7 +297,8 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                                index: r.below(u64::MAX) }
                 }
                 3 => Ask::Down { set: r.below(1 << 32) as u32, cs: r.below(1 << 32) as u32, refused: r.chance(50),
-                                 name: name(r, nbsmeta::VOLUME_NAME_MAX), generation: r.below(u64::MAX) },
+                                 name: name(r, nbsmeta::VOLUME_NAME_MAX), generation: r.below(u64::MAX),
+                                 version: r.below(1 << 32) as u32 },
                 /* A copy-up's asks (N10), a pause's answer (N10c2) */
                 4 => Ask::CopyUp { name: name(r, nbsmeta::VOLUME_NAME_MAX), place: r.below(1 << 32) as u32,
                                    generation: r.below(u64::MAX) },
@@ -300,6 +306,8 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                                    pause: r.below(u64::MAX) },
                 6 => Ask::Reattach { name: name(r, nbsmeta::VOLUME_NAME_MAX), generation: r.below(u64::MAX),
                                      token: r.below(u64::MAX) },
+                /* The writer there, now and then (the review of 2026-11) */
+                7 => Ask::Here { name: name(r, nbsmeta::VOLUME_NAME_MAX), generation: r.below(u64::MAX) },
                 _ => Ask::CopyDone { name: name(r, nbsmeta::VOLUME_NAME_MAX), place: r.below(1 << 32) as u32,
                                      generation: r.below(u64::MAX), chunk: r.below(1 << 32) as u32,
                                      incarnation: r.below(1 << 32) as u32 },
@@ -308,7 +316,7 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                 Ask::Attach { name, .. } | Ask::Detach { name, .. } => name.len() <= nbsmeta::VOLUME_NAME_MAX,
                 Ask::Map { name, count, .. } => name.len() <= nbsmeta::VOLUME_NAME_MAX && *count <= MAP_MAX,
                 Ask::Down { name, .. } | Ask::CopyUp { name, .. } | Ask::CopyDone { name, .. }
-                | Ask::Paused { name, .. } | Ask::Reattach { name, .. } => {
+                | Ask::Paused { name, .. } | Ask::Reattach { name, .. } | Ask::Here { name, .. } => {
                     name.len() <= nbsmeta::VOLUME_NAME_MAX
                 }
             };
@@ -316,7 +324,7 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
         }
         _ => {
             let said = match r.below(12) {
-                0 => Said::Attached { generation: r.below(u64::MAX), index: r.below(u64::MAX) },
+                0 => Said::Attached { generation: r.below(u64::MAX), index: r.below(u64::MAX), first: r.chance(50) },
                 1 => Said::Detached { index: r.below(u64::MAX) },
                 2 => {
                     let k = len(r, u64::from(MAP_MAX));

@@ -32,7 +32,10 @@
 //! In about a third of the runs a member back joins its own place. It
 //! holds the set's chunks as they were when it went down: some were written
 //! since on the source alone, and some it found open, its last writes lost
-//! to a power cut.
+//! to a power cut. Half of those hold a chunk of the set the source has none
+//! of -- written by a writer cut off with the member, never reaching the
+//! others -- which the copy drops as it ends (the review of 2026-11: kept,
+//! it came up as the set's once the member was active again).
 //!
 //! A tenth of the runs each set out to reach one race a random run seldom
 //! puts together (`Focus`): the power failing inside a close; a writer of a
@@ -524,7 +527,7 @@ impl World {
         drop(std::mem::replace(&mut self.joiner, Store::new()));
         disk.borrow_mut().cut(&mut self.r);
         let s = Store::new();
-        nbscs::now(s.open_device(Handle(disk), id)).map_err(|(_, e)| format!("the joiner not opened after a cut: {:?}", e))?;
+        nbscs::now(s.open_device(Handle(disk), id, 0)).map_err(|(_, e)| format!("the joiner not opened after a cut: {:?}", e))?;
         self.joiner = s;
         if let Some(d) = self.joiner.devices().iter().find(|d| d.lost != 0) {
             return Err(format!("{} records lost on the joiner's device after a cut", d.lost));
@@ -586,7 +589,7 @@ impl World {
         drop(std::mem::replace(&mut self.joiner, Store::new()));
         disk.borrow_mut().cut(&mut self.r);
         let s = Store::new();
-        nbscs::now(s.open_device(Handle(disk), id)).map_err(|(_, e)| format!("the joiner not opened after a cut: {:?}", e))?;
+        nbscs::now(s.open_device(Handle(disk), id, 0)).map_err(|(_, e)| format!("the joiner not opened after a cut: {:?}", e))?;
         self.joiner = s;
         /* The chunk the copy was at among them: a close the cut cut short
            that left its record closed is to have left its data too */
@@ -727,11 +730,23 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         }
     }
     nbscs::now(source.flush()).map_err(|e| format!("source not flushed: {:?}", e))?;
+    /* A member back's chunk of the set the source has none of, at a version
+       it was active at, kept past any cut: of a randomness of its own, so
+       that a run without one goes as it did */
+    let mut sr = Rng::new(mix(seed, 0x7374_7261));
+    if own && sr.chance(50) {
+        let stray = 40 + sr.below(20) as u32;
+        let d = data(0x57a7 ^ u64::from(stray), (2 * SECTOR) as usize);
+        let at = (sr.below(SLOT / SECTOR - 2) * SECTOR) as u32;
+        nbscs::now(joiner.write(VOLUME, GEN, cref(stray, sr.range(1, u64::from(UNTIL) - 1) as u32), at, &d, true))
+            .map_err(|e| format!("the member back's own chunk not written: {:?}", e))?;
+        nbscs::now(joiner.flush()).map_err(|e| format!("joiner not flushed: {:?}", e))?;
+    }
     if cut {
         drop(joiner);
         jdisk.borrow_mut().cut(&mut r);
         let s = Store::new();
-        nbscs::now(s.open_device(Handle(jdisk.clone()), jid)).map_err(|(_, e)| format!("the joiner not opened again: {:?}", e))?;
+        nbscs::now(s.open_device(Handle(jdisk.clone()), jid, 0)).map_err(|(_, e)| format!("the joiner not opened again: {:?}", e))?;
         joiner = s;
     } else {
         nbscs::now(joiner.flush()).map_err(|e| format!("joiner not flushed: {:?}", e))?;
