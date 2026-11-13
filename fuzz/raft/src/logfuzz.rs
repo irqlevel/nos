@@ -80,6 +80,8 @@ pub struct Disk {
     /// Every call of this kind fails while it is set: "remove", "sync_dir".
     pub fail_kind: Option<&'static str>,
     pub failures: u64,
+    /// Files' syncs done.
+    pub syncs: u64,
     rng: Rng,
 }
 
@@ -96,6 +98,7 @@ impl Disk {
             fail_one_in: 0,
             fail_kind: None,
             failures: 0,
+            syncs: 0,
             rng: Rng::new(seed ^ 0xD15C),
         }
     }
@@ -240,6 +243,21 @@ impl Disk {
     pub fn len_of(&self, name: &str) -> usize {
         self.ino(name).ok().and_then(|i| self.data.get(&i)).map_or(0, |d| d.len())
     }
+
+    /// What `name` holds now.
+    pub fn bytes_of(&self, name: &str) -> Vec<u8> {
+        self.ino(name).ok().and_then(|i| self.data.get(&i)).cloned().unwrap_or_default()
+    }
+
+    /// `bytes` after the end of `name`, on the medium at once: what a file
+    /// system that hands back blocks it never wrote there leaves.
+    pub fn append_durable(&mut self, name: &str, bytes: &[u8]) {
+        let _own = Exempt::new();
+        let Ok(ino) = self.ino(name) else { return };
+        for d in [&mut self.data, &mut self.durable] {
+            d.entry(ino).or_default().extend_from_slice(bytes);
+        }
+    }
 }
 
 fn put(file: &mut Vec<u8>, at: usize, bytes: &[u8]) {
@@ -338,6 +356,7 @@ impl Files for SimFiles {
         let now = d.data.get(&ino).cloned().unwrap_or_default();
         d.durable.insert(ino, now);
         d.pending.remove(&ino);
+        d.syncs += 1;
         Ok(())
     }
 
@@ -357,6 +376,9 @@ impl Files for SimFiles {
         if d.fault() {
             return Err(FileError::Io);
         }
+        /* nos's file system refuses a rename onto a name that is there, and
+         * the log promises never to ask for one: asked, a finding */
+        assert!(!d.dir.contains_key(to), "the log renamed {} onto {}, which is there", from, to);
         let ino = d.dir.remove(from).ok_or(FileError::NotFound)?;
         d.dir.insert(to.to_string(), ino);
         d.dir_ops.push(DirOp::Rename(from.to_string(), to.to_string()));
@@ -373,6 +395,12 @@ impl Files for SimFiles {
         Ok(())
     }
 }
+
+/// What the log writes and syncs at a segment's head before anything else
+/// goes into it: the header (24 bytes) and the hard state's record (8 and
+/// 25) -- in the last segment, past it, a crash's torn tail; within it, where
+/// more follows, a medium gone bad.
+const LAST_HEAD: usize = 24 + 8 + 25;
 
 /* ---- states in one number ---- */
 
@@ -760,8 +788,10 @@ impl Run {
         self.reopen(false)
     }
 
-    /// A byte of a sealed segment or of the snapshot changed on the medium:
-    /// the log refuses to open; the byte put back, it reads as it was.
+    /// A byte of a sealed segment, of the snapshot, or of the head of the
+    /// last segment where more follows it -- all synced -- changed on the
+    /// medium: the log refuses to open, and changes nothing; the byte put
+    /// back, it reads as it was.
     fn flip(&mut self) -> Result<(), String> {
         match self.log().sync() {
             Ok(()) => {}
@@ -774,13 +804,20 @@ impl Run {
         self.log = None;
         let names = self.disk.0.borrow().names();
         let mut wal: Vec<&String> = names.iter().filter(|n| n.starts_with("wal.")).collect();
-        wal.pop();
-        let mut sealed: Vec<&String> = names.iter().filter(|n| n.starts_with("snap.")).collect();
-        sealed.extend(wal);
-        let Some(&name) = sealed.get(self.r.below(sealed.len() as u64) as usize) else {
+        let last = wal.pop();
+        /* Each name and the bytes of it that are synced */
+        let mut spots: Vec<(&String, usize)> = Vec::new();
+        for name in names.iter().filter(|n| n.starts_with("snap.")).chain(wal) {
+            spots.push((name, self.disk.0.borrow().len_of(name)));
+        }
+        if let Some(last) = last {
+            if self.disk.0.borrow().len_of(last) > LAST_HEAD {
+                spots.push((last, LAST_HEAD));
+            }
+        }
+        let Some(&(name, len)) = spots.get(self.r.below(spots.len() as u64) as usize) else {
             return self.reopen(true);
         };
-        let len = self.disk.0.borrow().len_of(name);
         if len == 0 {
             return self.reopen(true);
         }
@@ -911,6 +948,13 @@ pub const SCENARIOS: &[(&str, fn() -> Result<(), String>)] = &[
     ("log_compaction", compaction),
     ("log_open_syncs", open_syncs),
     ("log_install_drops_log", install_drops_log),
+    ("log_head_refused", head_refused),
+    ("log_snapshot_no_log", snapshot_no_log),
+    ("log_full_holds", full_holds),
+    ("log_stale_record_not_read", stale_record_not_read),
+    ("log_index_bounds", index_bounds),
+    ("log_sync_needs_writes", sync_needs_writes),
+    ("log_short_head", short_head),
 ];
 
 fn entry(index: u64, term: u64, len: usize) -> Entry {
@@ -1142,6 +1186,263 @@ fn install_drops_log() -> Result<(), String> {
     let log = DiskLog::open(disk, LogConfig { segment_bytes: 4096 }).map_err(|e| format!("open: {:?}", e))?;
     if log.snapshot_meta().index != 40 || log.last_index() != 40 {
         return Err(format!("the log before a leader's snapshot read back: {}", describe(&log)));
+    }
+    Ok(())
+}
+
+/* ---- the review of 2026-11: the log's findings ---- */
+
+fn err<E: std::fmt::Debug>(e: E) -> String {
+    format!("{:?}", e)
+}
+
+/// The newest segment's name and seq.
+fn last_segment(disk: &SimFiles) -> Result<(String, u64), String> {
+    let name = disk.0.borrow().names().into_iter().filter(|n| n.starts_with("wal.")).max().ok_or("no segment")?;
+    let seq = u64::from_str_radix(&name[4..], 16).map_err(err)?;
+    Ok((name, seq))
+}
+
+/// A record as the log writes it in a segment of its second format: its
+/// length, then a CRC32C over the segment's seq, the record's offset, the
+/// length and the payload -- made here by hand, for records the log never
+/// wrote at that place.
+fn placed_record(seq: u64, at: u64, payload: &[u8]) -> Vec<u8> {
+    let mut place = Vec::new();
+    place.extend_from_slice(&seq.to_le_bytes());
+    place.extend_from_slice(&at.to_le_bytes());
+    let len = (payload.len() as u32).to_le_bytes();
+    let crc = crc::crc32c::update(crc::crc32c::update(crc::crc32c::checksum(&place), &len), payload);
+    let mut out = Vec::new();
+    out.extend_from_slice(&len);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// A snapshot's file as the log writes one, of no data: its header and
+/// its membership.
+fn snapshot_file(index: u64, term: u64, conf: &ConfState) -> Vec<u8> {
+    let mut c = Vec::new();
+    raft::wire::encode_conf_state(conf, &mut c);
+    let mut h = Vec::new();
+    h.extend_from_slice(b"RAFTSNAP");
+    h.extend_from_slice(&1u32.to_le_bytes());
+    h.extend_from_slice(&index.to_le_bytes());
+    h.extend_from_slice(&term.to_le_bytes());
+    h.extend_from_slice(&0u64.to_le_bytes());
+    h.extend_from_slice(&(c.len() as u32).to_le_bytes());
+    let crc = crc::crc32c::update(crc::crc32c::checksum(&h), &c);
+    h.extend_from_slice(&crc.to_le_bytes());
+    h.extend_from_slice(&c);
+    h
+}
+
+/// The last segment's head -- its header and its first hard state, synced
+/// before anything goes after them -- gone bad where more follows, or the
+/// marker of a snapshot that compacted every segment before it: the log
+/// refuses to open and changes nothing; put back, it opens as it was. (A
+/// bad header or hard state was read as a crash as the segment was begun:
+/// the segment removed, the snapshot with it, and an empty log opened -- no
+/// term, no vote, no entry. A bad marker was refused -- after the snapshot
+/// had been removed.)
+fn head_refused() -> Result<(), String> {
+    /* The header and the hard state with an older segment kept -- a snapshot
+     * at 15 keeps the segment of entries to 20 -- so that a log opened
+     * without the last segment would open; the marker with every older
+     * segment compacted, so that a log opened without it cannot */
+    for (at, snap) in [(3usize, 15), (30, 15), (60, 20)] {
+        let (disk, mut log) = fresh(1 << 20);
+        let ents: Vec<Entry> = (1..=20).map(|i| entry(i, 1, 50)).collect();
+        log.append(&ents).map_err(err)?;
+        log.set_hard_state(HardState { term: 2, vote: 1, commit: 20 }).map_err(err)?;
+        log.sync().map_err(err)?;
+        log.create_snapshot(snap, ConfState { voters: vec![1], learners: vec![] }, SnapshotData::default())
+            .map_err(err)?;
+        log.append(&[entry(21, 2, 50)]).map_err(err)?;
+        log.sync().map_err(err)?;
+        let want = digest(&log);
+        drop(log);
+        let (last, _) = last_segment(&disk)?;
+        if disk.0.borrow().len_of(&last) <= LAST_HEAD + 30 {
+            return Err("the last segment holds no more than its head and the marker".into());
+        }
+        disk.0.borrow_mut().flip(&last, at, 3);
+        match DiskLog::open(disk.clone(), LogConfig { segment_bytes: 1 << 20 }) {
+            Err(LogError::Corrupt(_)) => {}
+            Ok(log) => return Err(format!("byte {} of the last segment changed: opened as {}", at, describe(&log))),
+            Err(e) => return Err(format!("byte {} of the last segment changed: {:?}", at, e)),
+        }
+        disk.0.borrow_mut().flip(&last, at, 3);
+        let log = DiskLog::open(disk, LogConfig { segment_bytes: 1 << 20 }).map_err(|e| format!("put back: {:?}", e))?;
+        if digest(&log) != want {
+            return Err(format!("byte {} put back: read as {}", at, describe(&log)));
+        }
+    }
+    Ok(())
+}
+
+/// A snapshot's file with no segment of the log -- its segments lost: the
+/// log refuses it, rather than open empty and remove the snapshot.
+fn snapshot_no_log() -> Result<(), String> {
+    let disk = SimFiles(Rc::new(RefCell::new(Disk::new(3))));
+    let conf = ConfState { voters: vec![1], learners: vec![] };
+    disk.0.borrow_mut().put_file(&format!("snap.{:016x}", 40), &snapshot_file(40, 2, &conf));
+    match DiskLog::open(disk.clone(), LogConfig::default()) {
+        Err(LogError::Corrupt(_)) => {}
+        Ok(log) => return Err(format!("a snapshot and no log opened, as {}", describe(&log))),
+        Err(e) => return Err(format!("a snapshot and no log: {:?}", e)),
+    }
+    if disk.0.borrow().names() != [format!("snap.{:016x}", 40)] {
+        return Err(format!("a snapshot and no log refused, and the folder changed: {:?}", disk.0.borrow().names()));
+    }
+    Ok(())
+}
+
+/// A log at as many segments as it keeps refuses entries before any is
+/// written, and goes on: opened again and again, it holds that line -- and
+/// opens -- until a snapshot compacts it, and takes entries again. (The
+/// line was looked at only as a segment filled: each open's new segment
+/// took entries, and the fourth open found more segments than a log keeps.)
+fn full_holds() -> Result<(), String> {
+    let config = LogConfig { segment_bytes: raft::log::MIN_SEGMENT_BYTES };
+    let disk = SimFiles(Rc::new(RefCell::new(Disk::new(4))));
+    let mut log = DiskLog::open(disk.clone(), config).map_err(err)?;
+    let mut i = 1;
+    loop {
+        match log.append(&[entry(i, 1, 3000)]) {
+            Ok(()) => i += 1,
+            Err(LogError::Full) => break,
+            Err(e) => return Err(format!("entry {}: {:?}", i, e)),
+        }
+        if i > 3 * raft::log::MAX_SEGMENTS as u64 {
+            return Err("never full".into());
+        }
+    }
+    let last = log.last_index();
+    log.sync().map_err(|e| format!("a log full: {:?}", e))?;
+    drop(log);
+    for k in 0..4 {
+        let mut log = DiskLog::open(disk.clone(), config).map_err(|e| format!("open {} of a log full: {:?}", k, e))?;
+        match log.append(&[entry(last + 1, 1, 3000)]) {
+            Err(LogError::Full) => {}
+            other => return Err(format!("open {}: an entry past the line: {:?}", k, other)),
+        }
+        log.sync().map_err(err)?;
+    }
+    let mut log = DiskLog::open(disk, config).map_err(err)?;
+    log.create_snapshot(last, ConfState { voters: vec![1], learners: vec![] }, SnapshotData::default())
+        .map_err(|e| format!("a snapshot of a log full: {:?}", e))?;
+    log.append(&[entry(last + 1, 1, 3000)]).map_err(|e| format!("an entry after the snapshot: {:?}", e))?;
+    Ok(())
+}
+
+/// A record whole in a tail that was never this one's -- an older record
+/// of the log's, which a file system that hands back blocks it never wrote
+/// may leave past the end -- is not read as the log's: its CRC is over its
+/// place too. (A copy of entry 5's record after entry 10 was read, and the
+/// entries after 4 dropped for it.)
+fn stale_record_not_read() -> Result<(), String> {
+    let (disk, mut log) = fresh(1 << 20);
+    let ents: Vec<Entry> = (1..=10).map(|i| entry(i, 1, 40)).collect();
+    log.append(&ents).map_err(err)?;
+    log.sync().map_err(err)?;
+    drop(log);
+    let (last, _) = last_segment(&disk)?;
+    let bytes = disk.0.borrow().bytes_of(&last);
+    /* Entry 5's record: past the head, four records in */
+    let mut at = LAST_HEAD;
+    for _ in 0..4 {
+        at += 8 + u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize;
+    }
+    let len = 8 + u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize;
+    let copy = bytes[at..at + len].to_vec();
+    disk.0.borrow_mut().append_durable(&last, &copy);
+    let log = DiskLog::open(disk, LogConfig { segment_bytes: 1 << 20 }).map_err(err)?;
+    if entries_of(&log) != ents {
+        return Err(format!("an older record whole in the tail read as the log's: {}", describe(&log)));
+    }
+    Ok(())
+}
+
+/// A marker that names a snapshot past any index a group reaches -- the
+/// snapshot's file there, every CRC good: the log refuses it, and does not
+/// panic. (Taken, the snapshot's index and one overflowed.)
+fn index_bounds() -> Result<(), String> {
+    let (disk, mut log) = fresh(1 << 20);
+    log.append(&[entry(1, 1, 10)]).map_err(err)?;
+    log.sync().map_err(err)?;
+    drop(log);
+    let (last, seq) = last_segment(&disk)?;
+    let index = u64::MAX;
+    let mut marker = vec![3u8];
+    marker.extend_from_slice(&index.to_le_bytes());
+    marker.extend_from_slice(&1u64.to_le_bytes());
+    marker.push(0);
+    let at = disk.0.borrow().len_of(&last) as u64;
+    disk.0.borrow_mut().append_durable(&last, &placed_record(seq, at, &marker));
+    let conf = ConfState { voters: vec![1], learners: vec![] };
+    disk.0.borrow_mut().put_file(&format!("snap.{:016x}", index), &snapshot_file(index, 1, &conf));
+    match DiskLog::open(disk, LogConfig { segment_bytes: 1 << 20 }) {
+        Err(LogError::Corrupt(_)) => Ok(()),
+        Ok(log) => Err(format!("a snapshot at index {} opened, as {}", index, describe(&log))),
+        Err(e) => Err(format!("a snapshot at index {}: {:?}", index, e)),
+    }
+}
+
+/// A last segment shorter than its head -- its header alone, the crash came
+/// as it was begun -- is not written after: removed, and the next begun
+/// with a head synced whole, so that a torn tail after it is cut, never
+/// taken for a head gone bad. (Kept, it took the next records right after
+/// its header; torn there, the log refused to open -- log seed 4336.)
+fn short_head() -> Result<(), String> {
+    let (disk, mut log) = fresh(1 << 20);
+    let ents: Vec<Entry> = (1..=5).map(|i| entry(i, 1, 40)).collect();
+    log.append(&ents).map_err(err)?;
+    log.sync().map_err(err)?;
+    drop(log);
+    let (_, seq) = last_segment(&disk)?;
+    let mut h = Vec::new();
+    h.extend_from_slice(b"RAFTWAL\0");
+    h.extend_from_slice(&2u32.to_le_bytes());
+    h.extend_from_slice(&(seq + 1).to_le_bytes());
+    let crc = crc::crc32c::checksum(&h);
+    h.extend_from_slice(&crc.to_le_bytes());
+    disk.0.borrow_mut().put_file(&format!("wal.{:016x}", seq + 1), &h);
+    let mut log = DiskLog::open(disk.clone(), LogConfig { segment_bytes: 1 << 20 }).map_err(err)?;
+    /* Larger than what is gathered: on the disk at once, not synced */
+    log.append(&[entry(6, 1, 200 * 1024)]).map_err(err)?;
+    drop(log);
+    disk.0.borrow_mut().crash_with(
+        usize::MAX,
+        &mut |_, op| match op {
+            Op::Write { bytes, .. } if bytes.len() > 1000 => Fate::Torn { keep: 100, fill: Fill::Noise },
+            _ => Fate::Kept,
+        },
+        &mut Rng::new(9),
+    );
+    let log = DiskLog::open(disk, LogConfig { segment_bytes: 1 << 20 }).map_err(|e| format!("after a torn tail: {:?}", e))?;
+    if entries_of(&log) != ents {
+        return Err(format!("after a torn tail: {}", describe(&log)));
+    }
+    Ok(())
+}
+
+/// A sync with nothing written since the last makes no call of the files:
+/// on nos a file's sync is a flush of the whole device.
+fn sync_needs_writes() -> Result<(), String> {
+    let (disk, mut log) = fresh(1 << 20);
+    log.append(&[entry(1, 1, 10)]).map_err(err)?;
+    let before = disk.0.borrow().syncs;
+    log.sync().map_err(err)?;
+    let once = disk.0.borrow().syncs;
+    log.sync().map_err(err)?;
+    log.set_hard_state(log.hard_state()).map_err(err)?;
+    log.sync().map_err(err)?;
+    let after = disk.0.borrow().syncs;
+    if once != before + 1 || after != once {
+        return Err(format!("a sync after an append made {} calls; two with nothing written after it {}",
+                           once - before, after - once));
     }
     Ok(())
 }
