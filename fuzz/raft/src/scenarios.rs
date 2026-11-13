@@ -21,11 +21,11 @@ pub const ALL: &[(&str, fn() -> Result<(), String>)] = &[
     ("force_alone_after_loss", force_alone_after_loss),
 ];
 
-fn votes(m: &Message) -> bool {
+pub(crate) fn votes(m: &Message) -> bool {
     matches!(m.body, Body::Vote { .. } | Body::VoteResp { .. })
 }
 
-fn between(m: &Message, a: NodeId, b: NodeId) -> bool {
+pub(crate) fn between(m: &Message, a: NodeId, b: NodeId) -> bool {
     (m.from == a && m.to == b) || (m.from == b && m.to == a)
 }
 
@@ -33,12 +33,12 @@ fn carries(m: &Message, index: u64) -> bool {
     matches!(&m.body, Body::Append { entries, .. } if entries.iter().any(|e| e.index == index))
 }
 
-fn involves(m: &Message, id: NodeId) -> bool {
+pub(crate) fn involves(m: &Message, id: NodeId) -> bool {
     m.from == id || m.to == id
 }
 
 /// Nothing found, and every member back to agreeing: the scenario's end.
-fn finish(mut s: Sim) -> Result<(), String> {
+pub(crate) fn finish(mut s: Sim) -> Result<(), String> {
     if s.failures.is_empty() {
         s.check_logs();
     }
@@ -49,7 +49,7 @@ fn finish(mut s: Sim) -> Result<(), String> {
     if s.failures.is_empty() { Ok(()) } else { Err(s.failures.join("; ")) }
 }
 
-fn leader_is(s: &Sim, id: NodeId) -> Result<(), String> {
+pub(crate) fn leader_is(s: &Sim, id: NodeId) -> Result<(), String> {
     match s.node(id).map(|n| n.role()) {
         Some(Role::Leader) => Ok(()),
         r => Err(format!("member {} was to lead, and is {:?} (failures so far: {:?})", id, r, s.failures)),
@@ -57,7 +57,7 @@ fn leader_is(s: &Sim, id: NodeId) -> Result<(), String> {
 }
 
 /// Member `id` elected with every message delivered.
-fn elect(s: &mut Sim, id: NodeId) -> Result<(), String> {
+pub(crate) fn elect(s: &mut Sim, id: NodeId) -> Result<(), String> {
     s.campaign(id);
     s.flush(100);
     leader_is(s, id)

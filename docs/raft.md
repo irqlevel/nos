@@ -62,20 +62,44 @@ nothing (`MemStorage::new()`) and is sent the group by its leader.
 - A commit counted only on an entry of the leader's own term (the paper's
   figure 8); a leader's own entries counted once they are on its disk.
 - Snapshots: the caller's bytes, sent to a follower the log no longer
-  reaches in pieces of `snapshot_piece_bytes`, each acknowledged.
+  reaches in pieces of `snapshot_piece_bytes`, each acknowledged, one on its
+  way at a time: the next goes as the follower says it has the one before,
+  and a heartbeat sends the piece on its way again only where no piece was
+  answered since the last -- a piece sent twice otherwise stays on its way
+  twice, and every heartbeat adds one more.
 - Learners; membership changed one server at a time, each change in force as
   it is appended, never before the leader has committed an entry of its term
   (the 2015 erratum) and never two not yet committed.
-- Leadership transfer (TimeoutNow) and linearizable reads (ReadIndex).
+- Leadership transfer (TimeoutNow) and linearizable reads (ReadIndex). A
+  hand-over to a voter not heard from in an election's time is refused
+  (`Error::Unreachable`) rather than armed for nothing; `transferring` and
+  `idle_ticks` say on a leader what is armed and whom it hears.
 - Every request of an older term answered with ours -- an append, a vote --
-  as the paper has it.
+  as the paper has it: by a refused append, never a vote's answer, which a
+  candidate come to our term meanwhile would count as this member's answer
+  to the question it asks now.
 - A read's round asked again by every heartbeat, as etcd's are, so that one
   whose own heartbeats were lost is answered by the next; a round a change
-  of voters has confirmed answered then.
+  of voters has confirmed answered then. A leader takes no more reads than
+  it can hand out, refusing the rest as they are asked; a follower hands a
+  refusal of its leader's out (`Ready::reads_failed`), and `SoftState`
+  carries the term, so that the same leader in a later term -- which has
+  none of the reads of the one before -- is a change of leadership too.
 - A follower takes as much of an append as there is room for and says how
   far; a leader whose follower is behind sends it an empty append with each
   heartbeat's answer, which it refuses if it has not everything -- lost, or
-  not taken -- and is probed from what it has.
+  not taken -- and is probed from what it has. A probe answered with what
+  the leader knew already is left for replicating from there.
+- A member that refuses the entry it said it had -- its disk cut where it
+  went bad, or put back from an older copy -- is counted as holding nothing
+  until it says again what it holds (`Stats::regressed`) and probed from
+  its hint: the commit never goes back, so this only commits later.
+- A member started over a term below its own log's last entry's -- what a
+  crash leaves between a `Ready`'s entries, or a leader's snapshot taken
+  in, and the hard state written after them -- starts at that entry's term,
+  with no vote: its vote requests would otherwise name a last term past
+  their own, which every member refuses, and with PreVote nothing would
+  ever raise its term.
 
 What it does not do: there is no clock, network, thread or lock in it, no
 leader leases (a read costs a round of heartbeats), no joint consensus (one

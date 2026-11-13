@@ -67,11 +67,29 @@ impl Inflights {
 }
 
 /// A snapshot on its way to a member: which one, and how much of it the
-/// member has said it has.
+/// member has said it has. One piece is on its way at a time, the next
+/// sent as the member says it has the one before: an answer that says
+/// nothing new sends nothing -- one that did would keep a piece sent twice
+/// on its way twice for good, and every heartbeat would add one more.
 #[derive(Clone, Debug)]
 pub struct Sending {
     pub snapshot: Snapshot,
     pub acked: u64,
+    /// Whether `acked` moved since the leader's last heartbeat: the piece
+    /// on its way is sent again only where it did not -- lost, it seems.
+    pub moved: bool,
+}
+
+/// What a refused append did to a member's progress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decr {
+    /// Nothing: an answer to an append long overtaken.
+    Stale,
+    /// `next` moved back: the next probe goes.
+    Moved,
+    /// The member holds less than it said it had: it is counted as holding
+    /// nothing until it says again what it has, and probed from its hint.
+    Regressed,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +105,9 @@ pub struct Progress {
     pub inflights: Inflights,
     /// Heard from since CheckQuorum last looked.
     pub recent_active: bool,
+    /// Ticks since the member was last heard from: whether a hand-over to
+    /// it could be taken.
+    pub idle: u32,
     pub sending: Option<Sending>,
 }
 
@@ -99,6 +120,7 @@ impl Progress {
             probe_sent: false,
             inflights: Inflights::new(max_inflight, max_inflight_bytes),
             recent_active: false,
+            idle: 0,
             sending: None,
         }
     }
@@ -135,7 +157,7 @@ impl Progress {
 
     pub fn become_snapshot(&mut self, snapshot: Snapshot) {
         self.reset_state(State::Snapshot);
-        self.sending = Some(Sending { snapshot, acked: 0 });
+        self.sending = Some(Sending { snapshot, acked: 0, moved: true });
     }
 
     /// The member has everything up to `n`: whether that is news.
@@ -152,21 +174,38 @@ impl Progress {
     }
 
     /// An append whose `prev_index` was `rejected` refused, with the hint
-    /// that the member's log has nothing past `hint` that matches: whether
-    /// `next` moved back -- an answer to an append long overtaken does not.
-    pub fn maybe_decr_to(&mut self, rejected: u64, hint: u64) -> bool {
+    /// that the member's log has nothing past `hint` that matches: what
+    /// comes of it.
+    pub fn maybe_decr_to(&mut self, rejected: u64, hint: u64) -> Decr {
         if self.state == State::Replicate {
             if rejected <= self.matched {
-                return false;
+                /* An answer to an append long overtaken -- or the member
+                 * lost what it said it had, which the probe this sends it
+                 * to next finds out */
+                return Decr::Stale;
             }
             self.next = self.matched + 1;
-            return true;
+            return Decr::Moved;
         }
         if self.next == 0 || self.next - 1 != rejected {
-            return false;
+            return Decr::Stale;
         }
+        if rejected <= self.matched {
+            /* The probe it refused names the entry it said it has: it lost
+             * what it said -- its disk cut where it went bad, or put back
+             * from an older copy. Counted as holding nothing until it says
+             * again what it holds, which only commits later (the commit
+             * never goes back), and probed from its hint: sent the probe
+             * it refused again and again, it would refuse each. */
+            self.matched = 0;
+            self.next = core::cmp::max(core::cmp::min(rejected, hint + 1), 1);
+            self.probe_sent = false;
+            return Decr::Regressed;
+        }
+        /* Below `rejected` (= next - 1), and above `matched`: next moves
+         * back */
         self.next = core::cmp::max(core::cmp::min(rejected, hint + 1), self.matched + 1);
         self.probe_sent = false;
-        true
+        Decr::Moved
     }
 }
