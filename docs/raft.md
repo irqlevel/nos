@@ -73,9 +73,13 @@ nothing (`MemStorage::new()`) and is sent the group by its leader.
   room for: refused at once, and counted on both sides
   (`Stats::snapshots_refused`, and the leader's `snapshots_rejected`), as
   nothing else would say why it stays behind.
-- Learners; membership changed one server at a time, each change in force as
-  it is appended, never before the leader has committed an entry of its term
-  (the 2015 erratum) and never two not yet committed.
+- Learners: they hold the log and are not counted -- nobody asks them for a
+  vote or counts an entry by them (one asked answers and keeps its vote, as
+  any member does). Membership changed one server at a time, each change in
+  force as it is appended -- and no longer once a new leader's log writes
+  it over -- never before the leader has committed an entry of its term
+  (the 2015 erratum), never two not yet committed, and never the leader's
+  own removal or demotion: it hands the lead on first.
 - Leadership transfer (TimeoutNow) and linearizable reads (ReadIndex). A
   hand-over to a voter not heard from in an election's time is refused
   (`Error::Unreachable`) rather than armed for nothing; `transferring` and
@@ -374,7 +378,14 @@ for linearizability, and every member's own asks under losses, doubles,
 cuts, leaders' refusals and snapshots taken in -- none applied twice, each
 told truly what became of it -- every allocation of it to the 512 KiB one
 block of the kernel's heap is;
-`fuzz/raft/mutants.py` holds the gate to catching each rule taken out.
+`fuzz/raft/mutants.py` holds the gate to catching each rule taken out. The
+review of 2026-11 took rules out one by one and found eight the gate was
+silent on -- a change written over undone, a snapshot's piece taken at its
+own place alone, the leader not changing itself, the lease of a leader
+heard from, a leader with no majority stepping down, a hand-over's
+TimeoutNow only to a member that holds the log, a refused append's hint, a
+session evicted least recently used -- each held by a scenario now
+(`fuzz/raft/src/gaps.rs`, and `rsm_session_evicted`) and a mutant.
 
 ## Limits
 
