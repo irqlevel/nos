@@ -93,6 +93,51 @@ MUTANTS = [
      'self.chunks.drain(..whole);',
      'self.chunks.drain(..whole);\n        self.chunks = self.chunks.concat().chunks(4096).map(|c| c.to_vec()).collect();',
      'snapshot_long_tail', 'storage.rs'),
+    # The review of 2026-11 (fuzz/raft/src/review2.rs): each rule it added.
+    ('snapshot_piece_twice', "a snapshot's answer that says nothing new answered with a piece",
+     '        if next == sending.acked {',
+     '        if false && next == sending.acked {',
+     'snapshot_pieces_bounded'),
+    ('snapshot_resend_always', "a snapshot's piece sent again at every heartbeat, moving or not",
+     '&& pr.sending.as_mut().is_some_and(|s| !mem::replace(&mut s.moved, false));',
+     '&& pr.sending.is_some();',
+     'snapshot_pieces_bounded'),
+    ('term_below_log_kept', "a member started at a term below its own log's last entry's",
+     'let (term, vote) = if last_term > hs.term {',
+     'let (term, vote) = if false && last_term > hs.term {',
+     'term_behind_log'),
+    ('probe_kept_on_match', 'a probe answered with what the leader knew left probing',
+     'let probe_answered = pr.state == State::Probe && pr.matched == index;',
+     'let probe_answered = false;',
+     'probe_leaves_on_match'),
+    ('stale_vote_answered_as_vote', "a vote request of a term gone by answered with a vote's no",
+     '                Body::Append { .. } | Body::Heartbeat { .. } | Body::Snapshot { .. } | Body::Vote { .. } => {',
+     '                Body::Vote { pre, .. } => {\n'
+     '                    let pre = *pre;\n'
+     '                    self.send(from, Body::VoteResp { pre, granted: false });\n'
+     '                }\n'
+     '                Body::Append { .. } | Body::Heartbeat { .. } | Body::Snapshot { .. } => {',
+     'stale_vote_not_counted'),
+    ('regress_not_repaired', 'a member that lost what it acknowledged probed with the same append for good',
+     '        if rejected <= self.matched {\n            /* The probe it refused',
+     '        if false && rejected <= self.matched {\n            /* The probe it refused',
+     'regressed_follower_repaired', 'progress.rs'),
+    ('added_voter_unheard', "a voter added in one step counted as not heard from by CheckQuorum's next look",
+     '                    pr.recent_active = true;\n                    self.progress.insert(*id, pr);',
+     '                    self.progress.insert(*id, pr);',
+     'added_voter_heard'),
+    ('transfer_unreachable_armed', 'a hand-over armed to a voter not heard from in an election\'s time',
+     'if self.progress.get(&to).is_none_or(|p| p.idle >= self.cfg.election_ticks) {',
+     'if false && self.progress.get(&to).is_none_or(|p| p.idle >= self.cfg.election_ticks) {',
+     'transfer_unreachable_refused'),
+    ('read_refusal_dropped', "a follower's read the leader refused dropped, not handed out failed",
+     '                    self.push_read_failed(ctx);',
+     '                    let _ = ctx;',
+     'follower_read_refused'),
+    ('leader_reads_unbounded', "a leader's reads taken past the room a Ready hands out",
+     'if self.waiting_reads.len() + self.reads.len() + self.read_states.len() >= MAX_PENDING_READS {',
+     'if self.waiting_reads.len() + self.reads.len() >= MAX_PENDING_READS {',
+     'leader_reads_bounded'),
     ('log_no_crc', "a log record read whatever its CRC says",
      '|| record_crc(&p) != crc {',
      '{',
@@ -251,11 +296,26 @@ def build():
                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE).returncode
 
 
+# A run past this is cut short and counted as failing: a mutant that breaks
+# a rule of safety can make a run go on for ever -- a gate in CI would hang,
+# which is a failure too -- and what it said by then is kept.
+RUN_LIMIT = 600
+
+
 def run(*args):
     """A run's exit code and its first failing line."""
-    p = subprocess.run([BINARY] + list(args), cwd=ROOT, capture_output=True, text=True, timeout=900)
-    first = next((l for l in p.stdout.splitlines() if l.startswith('FAIL')), '')
-    return p.returncode, first
+    p = subprocess.Popen([BINARY] + list(args), cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         text=True)
+    try:
+        out, _ = p.communicate(timeout=RUN_LIMIT)
+        code = p.returncode
+    except subprocess.TimeoutExpired:
+        p.kill()
+        out, _ = p.communicate()
+        code = -1
+    lines = out.splitlines()
+    first = next((l for l in lines if l.startswith('FAIL')), 'cut short after %d s' % RUN_LIMIT if code == -1 else '')
+    return code, first
 
 
 def main():

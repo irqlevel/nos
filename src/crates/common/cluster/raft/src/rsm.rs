@@ -349,7 +349,7 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
     pub fn new(cfg: Config, store: S, sm: M, nonce: u64) -> Result<Rsm<S, M>, RsmError> {
         let snap = store.snapshot().map_err(|e| RsmError::Node(Error::Storage(e)))?;
         let node = RawNode::new(cfg, store).map_err(RsmError::Node)?;
-        let soft = SoftState { leader: node.leader(), role: node.role() };
+        let soft = SoftState { leader: node.leader(), role: node.role(), term: node.term() };
         let mut rsm = Rsm {
             node,
             sm,
@@ -556,11 +556,19 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
                     self.waiting.insert((rs.index, k), asked);
                 }
             }
+            /* Refused by the leader for room, or not handed out here for
+             * room: failed back, to be asked again */
+            for ctx in rd.reads_failed {
+                if let Some((request, _)) = self.asked.remove(&ctx) {
+                    out.events.push(Event::ReadFailed { request });
+                }
+            }
             if let Some(ss) = rd.soft_state {
-                if ss.leader != self.soft.leader || ss.role != self.soft.role {
+                if ss != self.soft {
                     /* A read not yet confirmed never is once the leadership
-                     * changed: the node let it go. Asked again, of the
-                     * leader there is now. */
+                     * changed -- another leader, or the same one in a later
+                     * term: the node let it go. Asked again, of the leader
+                     * there is now. */
                     for (_, (request, _)) in core::mem::take(&mut self.asked) {
                         out.events.push(Event::ReadFailed { request });
                     }
