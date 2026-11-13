@@ -675,7 +675,7 @@ pub fn pour_volume(from: &str, volume: &str, force: bool, work: &mut dyn Work) -
     let me = nbsdrive::this_host()?;
     let mut d = nbsdrive::Drive::open(volume, &me, true, force, Some("hv"))
         .map_err(|e| alloc::format!("{}: {}", name, e))?;
-    let (room, fresh) = (d.session().size(), d.session().generation() == 1);
+    let (room, fresh) = (d.session().size(), d.session().fresh());
     /* The disk whole blocks of the volume's: a last part of one, zeros after */
     let disk = size.div_ceil(nbsdrive::BLOCK) * nbsdrive::BLOCK;
     if disk > room {

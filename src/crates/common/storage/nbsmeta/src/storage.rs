@@ -15,9 +15,10 @@
 //!   in rather than every chunk. A set and its version are a chunk's epoch.
 //!   A join can leave two sets on the same three cs's; placement takes the
 //!   lowest-numbered of them.
-//! - **A chunk** -- 4 MiB of a volume -- is 8 bytes: its set, how many maps
-//!   name it, its flags. A free one is on the free list, chained through
-//!   its own record, so no other table keeps it.
+//! - **A chunk** -- 4 MiB of a volume -- is 12 bytes: its set, how many
+//!   maps name it, its flags, its incarnation; and 4 more in each map that
+//!   names it. A free one is on the free list, chained through its own
+//!   record, so no other table keeps it.
 //! - **A volume**: its name and size, its kind, its own host, its attach,
 //!   and its map, a chunk's number for each 4 MiB of it.
 //! - **Snapshots, images and clones** (N10) share their chunks with the
@@ -64,12 +65,24 @@ pub const SETS_MAX: usize = 1 << 16;
 /// What a free chunk's record has for the end of the free list.
 pub const NO_CHUNK: u32 = u32::MAX;
 /// Copy-ups pending at once, at most (N10): a writer has a few under way,
-/// and leaves those it had where it stops.
+/// and those it leaves where it stops are given up by the volume's next
+/// attach for writing.
 pub const COPYING_MAX: usize = 4096;
+/// The places of every map, at most: the volumes', the snapshots' and the
+/// clones' together. A clone's map shares its origin's pieces in memory, but
+/// the snapshot and the digest write every place of every map, and a state
+/// read back holds each map whole: 1,000 clones of a 1 TiB image were a GiB
+/// of snapshot -- never taken past raft's limit, the log grown for good --
+/// and two seconds of the member's every 64th entry (found by the review of
+/// 2026-11). 64 MiB of maps.
+pub const PLACES_MAX: u64 = 1 << 24;
+/// The tokens of the sessions that let a volume go, kept with it (`Detach`).
+pub const RELEASED_KEPT: usize = 4;
 
 /// A chunk on the free list.
 pub const CHUNK_FREE: u8 = 0x80;
-/// A chunk written to at least once (the cs's say so, from N7 on).
+/// A chunk written to at least once: kept by the snapshot's format, set by
+/// no command yet -- what is stored does not know which chunks were written.
 pub const CHUNK_WRITTEN: u8 = 0x01;
 
 /// The chunks a volume of `size_mib` MiB has.
@@ -98,7 +111,8 @@ pub enum DeviceState {
     Active,
     /// Takes no new chunks; what it has is to move (N9).
     Draining,
-    /// Lost: what it had is to be rebuilt (N9).
+    /// Lost: what it had is to be rebuilt (N9). Kept by the snapshot's
+    /// format, set by no command yet.
     Failed,
 }
 
@@ -108,6 +122,9 @@ pub struct Device {
     pub ident: String,
     pub slots: u32,
     pub state: DeviceState,
+    /// The format its cs found it at (`DeviceFormatted`): 0 for none
+    /// recorded -- a device new, or wiped by a person since.
+    pub format: u64,
 }
 
 /// What the leader has committed of a cs's being there (N9): what the
@@ -267,6 +284,12 @@ pub struct Volume {
     pub writer: Option<Attach>,
     /// The hosts that have it read-only.
     pub readers: Vec<String>,
+    /// The tokens of the sessions that let it go last, the newest last, 0 for
+    /// none: an attach of one of those, applied late -- after its session's
+    /// detach, or after its attach anew took another token -- is refused as
+    /// stale, rather than attach the volume to nobody (found by the review of
+    /// 2026-11).
+    pub released: [u64; RELEASED_KEPT],
     /// A chunk's number for each 4 MiB of it.
     pub map: Pieces<u32>,
 }
@@ -277,6 +300,9 @@ impl State {
         let done = match command {
             Command::DeviceAdd { host, ident, slots } => self.device_add(host, ident, *slots).map(|id| Answer::Device { id }),
             Command::DeviceDrain { host, ident } => self.device_drain(host, ident).map(|id| Answer::Device { id }),
+            Command::DeviceFormatted { device, format } => {
+                self.device_formatted(*device, *format).map(|id| Answer::Device { id })
+            }
             Command::VolumeCreate { name, size_mib, host } => {
                 self.volume_create(name, *size_mib, host).map(|id| Answer::Volume { id })
             }
@@ -284,21 +310,18 @@ impl State {
             Command::VolumeResize { name, size_mib } => {
                 self.volume_resize(name, *size_mib).map(|id| Answer::Volume { id })
             }
-            Command::Attach { name, host, writable, force, token } => {
-                self.attach(name, host, *writable, *force, *token).map(|generation| Answer::Attached { generation })
-            }
-            Command::Detach { name, host, generation } => {
-                self.detach(name, host, *generation).map(|generation| Answer::Attached { generation })
-            }
-            Command::Reattach { name, host, generation, token } => {
-                self.reattach(name, host, *generation, *token).map(|generation| Answer::Attached { generation })
-            }
+            Command::Attach { name, host, writable, force, token } => self.attach(name, host, *writable, *force, *token)
+                .map(|(generation, first)| Answer::Attached { generation, first }),
+            Command::Detach { name, host, generation, token } => self.detach(name, host, *generation, *token)
+                .map(|generation| Answer::Attached { generation, first: false }),
+            Command::Reattach { name, host, generation, token } => self.reattach(name, host, *generation, *token)
+                .map(|generation| Answer::Attached { generation, first: false }),
             Command::Digest { at, digest } => {
                 self.checks.compare(*at, digest, index);
                 Ok(Answer::Checked)
             }
-            Command::ReplicaDown { set, cs, name, generation, .. } => {
-                self.replica_down(*set, *cs, name, *generation).map(|version| Answer::Set { version })
+            Command::ReplicaDown { set, cs, name, generation, version, .. } => {
+                self.replica_down(*set, *cs, name, *generation, *version).map(|version| Answer::Set { version })
             }
             Command::CsDown { cs } => self.cs_gone(*cs, CsState::Down).map(|sets| Answer::Changed { sets }),
             Command::CsOut { cs } => self.cs_gone(*cs, CsState::Out).map(|sets| Answer::Changed { sets }),
@@ -370,7 +393,19 @@ impl State {
         }
         if let Some((cs, d)) = self.device(ident) {
             return match (cs.host == host, d.slots == slots) {
-                (true, true) => Ok(d.id),
+                /* Added again: and taking new chunks again, where it was
+                   drained -- a drain was for good, and on three hosts one by
+                   mistake refused every copy-up of the cs's sets for good
+                   (the review of 2026-11) */
+                (true, true) => {
+                    let id = d.id;
+                    if let Some(d) = self.cs.iter_mut().flat_map(|c| c.devices.iter_mut()).find(|d| d.id == id) {
+                        if d.state == DeviceState::Draining {
+                            d.state = DeviceState::Active;
+                        }
+                    }
+                    Ok(id)
+                }
                 (true, false) => Err(Refusal::DeviceChanged),
                 (false, _) => Err(Refusal::DeviceElsewhere),
             };
@@ -390,9 +425,23 @@ impl State {
             return Err(Refusal::TooMany);
         }
         let id = self.next_device;
-        self.next_device += 1;
-        self.cs[at].devices.push(Device { id, ident: String::from(ident), slots, state: DeviceState::Active });
+        self.next_device = id.checked_add(1).ok_or(Refusal::TooMany)?;
+        self.cs[at].devices.push(Device { id, ident: String::from(ident), slots, state: DeviceState::Active,
+                                          format: 0 });
         Ok(id)
+    }
+
+    /// Device `device`'s format recorded as `format` -- or, with 0, the
+    /// record dropped (`Command::DeviceFormatted`).
+    fn device_formatted(&mut self, device: u32, format: u64) -> Result<u32, Refusal> {
+        self.ready()?;
+        let d = self.cs.iter_mut().flat_map(|c| c.devices.iter_mut()).find(|d| d.id == device)
+            .ok_or(Refusal::NoSuchDevice)?;
+        if format != 0 && d.format != 0 && d.format != format {
+            return Err(Refusal::OtherFormat);
+        }
+        d.format = format;
+        Ok(device)
     }
 
     fn device_drain(&mut self, host: &str, ident: &str) -> Result<u32, Refusal> {
@@ -419,10 +468,14 @@ impl State {
             return Err(Refusal::TooMany);
         }
         let id = self.next_volume;
+        let next = id.checked_add(1).ok_or(Refusal::TooMany)?;
         let n = chunks_for(size_mib);
+        if self.places().saturating_add(n) > PLACES_MAX {
+            return Err(Refusal::TooMany);
+        }
         let mut map = Pieces::new();
         self.place_chunks(id, host, 0, n, &mut map)?;
-        self.next_volume += 1;
+        self.next_volume = next;
         self.volumes.push(Volume {
             id,
             name: String::from(name),
@@ -433,9 +486,15 @@ impl State {
             generation: 0,
             writer: None,
             readers: Vec::new(),
+            released: [0; RELEASED_KEPT],
             map,
         });
         Ok(id)
+    }
+
+    /// The places of every map, together (`PLACES_MAX`).
+    pub fn places(&self) -> u64 {
+        self.volumes.iter().map(|v| v.map.len() as u64).sum()
     }
 
     fn volume_resize(&mut self, name: &str, size_mib: u64) -> Result<u32, Refusal> {
@@ -455,6 +514,9 @@ impl State {
             return Err(Refusal::Shrink);
         }
         let want = chunks_for(size_mib);
+        if want > had && self.places().saturating_add(want - had) > PLACES_MAX {
+            return Err(Refusal::TooMany);
+        }
         if want > had {
             let mut map = core::mem::take(&mut self.volumes.get_mut(at).ok_or(Refusal::NoSuchVolume)?.map);
             let placed = self.place_chunks(id, &host, had, want - had, &mut map);
@@ -558,6 +620,11 @@ impl State {
         if self.volumes.len() >= VOLUMES_MAX {
             return Err(Refusal::TooMany);
         }
+        let id = self.next_volume;
+        let next = id.checked_add(1).ok_or(Refusal::TooMany)?;
+        if self.places().saturating_add(map.len() as u64) > PLACES_MAX {
+            return Err(Refusal::TooMany);
+        }
         /* A map names a chunk once at most, and a copy-up's new chunk is
            named by none: no count passes the volumes there can be */
         for &c in map.iter() {
@@ -565,8 +632,7 @@ impl State {
                 ch.count += 1;
             }
         }
-        let id = self.next_volume;
-        self.next_volume += 1;
+        self.next_volume = next;
         self.volumes.push(Volume {
             id,
             name: String::from(name),
@@ -577,6 +643,7 @@ impl State {
             generation: 0,
             writer: None,
             readers: Vec::new(),
+            released: [0; RELEASED_KEPT],
             map,
         });
         Ok(id)
@@ -609,7 +676,10 @@ impl State {
         {
             return Err(Refusal::Draining);
         }
-        if self.copying.len() >= COPYING_MAX || self.live_chunks() >= CHUNKS_MAX as u64 {
+        if self.copying.len() >= COPYING_MAX {
+            return Err(Refusal::CopiesPending);
+        }
+        if self.live_chunks() >= CHUNKS_MAX as u64 {
             return Err(Refusal::TooMany);
         }
         /* Thin: the room is taken now, where there is any -- a slot on each
@@ -620,7 +690,7 @@ impl State {
             return Err(Refusal::NoRoom);
         }
         let to = self.new_chunk(ch.set);
-        self.copying.insert((id, place), (to, from));
+        self.copying_insert((id, place), (to, from));
         Ok((to, self.incarnation_of(to)))
     }
 
@@ -640,7 +710,7 @@ impl State {
             _ => return Err(Refusal::Stale),
         }
         let chunk = chunk.0;
-        self.copying.remove(&(id, place));
+        self.copying_remove(&(id, place));
         let at = self.volume_at(name).ok_or(Refusal::NoSuchVolume)?;
         if let Some(c) = self.volumes.get_mut(at).and_then(|v| v.map.get_mut(place as usize)) {
             *c = chunk;
@@ -671,25 +741,49 @@ impl State {
 
     /// Volume `id`'s copy-ups pending given up: their new chunks freed.
     fn give_up_copies(&mut self, id: u32) {
-        let gone: Vec<u32> = self.copying.range((id, 0)..=(id, u32::MAX)).map(|(_, &(to, _))| to).collect();
-        self.copying.retain(|&(v, _), _| v != id);
-        for to in gone {
-            self.release_chunk(to);
+        let gone: Vec<(u32, u32)> = self.copying.range((id, 0)..=(id, u32::MAX)).map(|(&at, _)| at).collect();
+        for at in gone {
+            if let Some((to, _)) = self.copying_remove(&at) {
+                self.release_chunk(to);
+            }
         }
     }
 
-    fn attach(&mut self, name: &str, host: &str, writable: bool, force: bool, token: u64) -> Result<u64, Refusal> {
+    /// A copy-up pending, in the table and its index by the chunk it copies.
+    fn copying_insert(&mut self, at: (u32, u32), (to, from): (u32, u32)) {
+        if let Some((_, was)) = self.copying.insert(at, (to, from)) {
+            self.copying_from.remove(&(was, at.0, at.1));
+        }
+        self.copying_from.insert((from, at.0, at.1));
+    }
+
+    /// A copy-up pending out of the table and its index: what it was.
+    fn copying_remove(&mut self, at: &(u32, u32)) -> Option<(u32, u32)> {
+        let (to, from) = self.copying.remove(at)?;
+        self.copying_from.remove(&(from, at.0, at.1));
+        Some((to, from))
+    }
+
+    /// Volume `name` attached on `host`: its generation, and whether it is the
+    /// first attach for writing of a volume made empty (`Answer::Attached`).
+    fn attach(&mut self, name: &str, host: &str, writable: bool, force: bool, token: u64)
+        -> Result<(u64, bool), Refusal> {
         self.ready()?;
         self.member_host(host)?;
         let Some(at) = self.volume_at(name) else { return Err(Refusal::NoSuchVolume) };
+        let next = self.next_generation;
         let v = self.volumes.get_mut(at).ok_or(Refusal::NoSuchVolume)?;
+        /* A session's that let the volume go: a copy of its attach, late */
+        if token != 0 && v.released.contains(&token) {
+            return Err(Refusal::Stale);
+        }
         if writable {
             if v.kind != Kind::Volume {
                 return Err(Refusal::ReadOnly);
             }
             /* The writer's own attach asked again: answered as it was */
             if let Some(w) = v.writer.as_ref().filter(|w| token != 0 && w.token == token && w.host == host) {
-                return Ok(w.generation);
+                return Ok((w.generation, false));
             }
             if !force {
                 if v.writer.as_ref().is_some_and(|w| w.host != host) {
@@ -701,11 +795,25 @@ impl State {
             }
             /* A new generation for every attach for writing, the same host's
                again included: what its own older one still has in flight is
-               fenced by it too */
+               fenced by it too -- the cluster's next, never given before */
+            let generation = next;
+            let after = generation.checked_add(1).ok_or(Refusal::TooMany)?;
+            let first = v.generation == 0 && v.origin == 0;
+            let old = v.writer.as_ref().map(|w| w.token);
             v.readers.clear();
-            v.generation += 1;
-            v.writer = Some(Attach { host: String::from(host), generation: v.generation, token });
-            return Ok(v.generation);
+            v.generation = generation;
+            v.writer = Some(Attach { host: String::from(host), generation, token });
+            if let Some(t) = old.filter(|&t| t != 0 && t != token) {
+                Self::release_token(v, t);
+            }
+            let id = v.id;
+            self.next_generation = after;
+            /* The copy-ups the writer before left pending given up: this one
+               asks again for any place it writes (the review of 2026-11: left,
+               they filled the table, and every copy-up of the cluster was
+               refused) */
+            self.give_up_copies(id);
+            return Ok((generation, first));
         }
         if v.writer.is_some() {
             return Err(Refusal::Writing);
@@ -716,7 +824,16 @@ impl State {
             }
             v.readers.push(String::from(host));
         }
-        Ok(0)
+        Ok((0, false))
+    }
+
+    /// Token `token` kept as a session's that let volume `v` go.
+    fn release_token(v: &mut Volume, token: u64) {
+        if token == 0 || v.released.contains(&token) {
+            return;
+        }
+        v.released.rotate_left(1);
+        v.released[RELEASED_KEPT - 1] = token;
     }
 
     /// The writer's own attach anew (N10c2): a new generation, only where the
@@ -726,28 +843,42 @@ impl State {
         self.ready()?;
         self.member_host(host)?;
         let Some(at) = self.volume_at(name) else { return Err(Refusal::NoSuchVolume) };
+        let next = self.next_generation;
         let v = self.volumes.get_mut(at).ok_or(Refusal::NoSuchVolume)?;
         if let Some(w) = v.writer.as_ref().filter(|w| token != 0 && w.token == token && w.host == host) {
             return Ok(w.generation);
         }
+        if token != 0 && v.released.contains(&token) {
+            return Err(Refusal::Stale);
+        }
         if generation == 0 || !v.writer.as_ref().is_some_and(|w| w.host == host && w.generation == generation) {
             return Err(Refusal::NotTheWriter);
         }
-        v.generation += 1;
-        v.writer = Some(Attach { host: String::from(host), generation: v.generation, token });
-        Ok(v.generation)
+        let after = next.checked_add(1).ok_or(Refusal::TooMany)?;
+        /* The token it had let go of: its attach, late, takes nothing back */
+        let old = v.writer.as_ref().map_or(0, |w| w.token);
+        Self::release_token(v, old);
+        v.generation = next;
+        v.writer = Some(Attach { host: String::from(host), generation: next, token });
+        let id = v.id;
+        self.next_generation = after;
+        /* Its own copy-ups pending given up: the session asks again */
+        self.give_up_copies(id);
+        Ok(next)
     }
 
-    fn detach(&mut self, name: &str, host: &str, generation: u64) -> Result<u64, Refusal> {
+    fn detach(&mut self, name: &str, host: &str, generation: u64, token: u64) -> Result<u64, Refusal> {
         self.ready()?;
         let Some(at) = self.volume_at(name) else { return Ok(0) };
         let v = self.volumes.get_mut(at).ok_or(Refusal::NoSuchVolume)?;
         if generation == 0 {
             v.readers.retain(|r| r != host);
+            Self::release_token(v, token);
             return Ok(0);
         }
         if v.writer.as_ref().is_some_and(|w| w.host == host && w.generation == generation) {
-            v.writer = None;
+            let had = v.writer.take().map_or(0, |w| w.token);
+            Self::release_token(v, had);
             return Ok(generation);
         }
         Ok(0)
@@ -862,8 +993,13 @@ impl State {
 
     /// Replica `cs` of set `set` taken out: its version now. The set keeps
     /// it among its three, for repair to bring back or replace (N9), and
-    /// the room it holds; never the last active one.
-    fn replica_down(&mut self, set: u32, cs: u32, name: &str, generation: u64) -> Result<u32, Refusal> {
+    /// the room it holds; never the last active one. Asked at the set's
+    /// `version` -- where the ask says one -- and refused as stale once the
+    /// set has moved on: a down member's join begun or done since, an ask
+    /// applied late would drop it or take the member out again (found by
+    /// the review of 2026-11). Asked again of a member down already, done.
+    fn replica_down(&mut self, set: u32, cs: u32, name: &str, generation: u64, version: Option<u32>)
+        -> Result<u32, Refusal> {
         self.ready()?;
         let v = self.volume(name).ok_or(Refusal::NoSuchVolume)?;
         /* Asked by the volume's writer now: one fenced since would have its
@@ -876,15 +1012,19 @@ impl State {
             return Err(Refusal::NoSuchSet);
         }
         let s = self.sets.get(set as usize).ok_or(Refusal::NoSuchSet)?;
+        let at = s.cs.iter().position(|&c| c == cs);
+        if at.is_some_and(|k| s.replicas[k] == Replica::Down) && s.joiner.is_none_or(|j| j.cs != cs) {
+            return Ok(s.version);
+        }
+        if version.is_some_and(|v| v != s.version) {
+            return Err(Refusal::Stale);
+        }
         /* The joiner silent to the writer: its join dropped, as its going
            down would drop it -- the writer's writes go on to the members */
         if let Some(j) = s.joiner.filter(|j| j.cs == cs) {
             return self.unjoin(set, cs, j.since);
         }
-        let at = s.cs.iter().position(|&c| c == cs).ok_or(Refusal::NoSuchSet)?;
-        if s.replicas[at] == Replica::Down {
-            return Ok(s.version);
-        }
+        let at = at.ok_or(Refusal::NoSuchSet)?;
         self.member_down(set, at)
     }
 
@@ -1009,7 +1149,7 @@ impl State {
         }
         let since = version.checked_add(1).ok_or(Refusal::TooMany)?;
         for (at, to) in pending {
-            self.copying.remove(&at);
+            self.copying_remove(&at);
             self.release_chunk(to);
         }
         let chunks = self.sets.get(set as usize).map_or(0, |s| s.chunks);
@@ -1191,11 +1331,15 @@ impl State {
                copied as the old one was then, to a copy-up of the old one asked
                after the place was written directly (N10) */
             if count == 1 {
-                let gone: Vec<((u32, u32), u32)> = self.copying.iter().filter(|(_, &(_, from))| from == id)
-                    .map(|(&at, &(to, _))| (at, to)).collect();
-                for (at, to) in gone {
-                    self.copying.remove(&at);
-                    self.release_chunk(to);
+                /* By the index of the copy-ups by the chunk they copy: walking
+                   every one for each chunk, a delete of a snapshot of 1 TiB
+                   held the member two seconds (the review of 2026-11) */
+                let gone: Vec<(u32, u32)> = self.copying_from.range((id, 0, 0)..=(id, u32::MAX, u32::MAX))
+                    .map(|&(_, v, place)| (v, place)).collect();
+                for at in gone {
+                    if let Some((to, _)) = self.copying_remove(&at) {
+                        self.release_chunk(to);
+                    }
                 }
             }
             return;

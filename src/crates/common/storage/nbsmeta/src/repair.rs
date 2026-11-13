@@ -117,12 +117,17 @@ pub fn plan(s: &State, seen: &[Seen], after: After) -> Vec<Command> {
     }
     /* The room this turn's joins take, which the state does not count yet */
     let mut taken = vec![0u64; s.cs().len()];
-    let mut order: Vec<(usize, u32)> = s.sets().iter().enumerate()
-        .filter(|(_, set)| set.joiner.is_none() && set.chunks > 0)
-        .map(|(id, set)| (set.active(), id as u32)).collect();
-    order.sort_unstable();
+    /* The sets with the fewest members active first, the lowest-numbered
+       first among them: a pass for each count, no list of every set made --
+       one of 16 bytes a set was past what the kernel's heap gives at 32,768
+       sets (the review of 2026-11) */
+    let order = (1..=REPLICAS).flat_map(|active| {
+        s.sets().iter().enumerate()
+            .filter(move |(_, set)| set.joiner.is_none() && set.chunks > 0 && set.active() == active)
+            .map(|(id, _)| id as u32)
+    });
     let mut proposed = 0;
-    for (_, id) in order {
+    for id in order {
         if proposed >= JOINS_PER_TURN {
             break;
         }

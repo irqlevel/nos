@@ -11,7 +11,11 @@
 //! the disk log, a guest of hv's -- or that has something on it that is not
 //! this NBS cluster's: a filesystem, a partition table, another cluster's
 //! cs. `wipe` takes such a device all the same, its first pages zeroed once
-//! the metadata has it, and what was on it gone.
+//! the metadata has it, and what was on it gone. Of a device the metadata
+//! has already, `wipe` zeroes its first pages and drops the metadata's
+//! record of its format: a device its cs found blank where it had formatted
+//! it -- wiped or rotten, what it held lost -- is left alone until then,
+//! and formatted anew after (the review of 2026-11).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -143,9 +147,20 @@ pub fn device_add(state: &ModState, word: &str, wipe: bool) -> Result<(String, u
         return Err(Failure::Other(alloc::format!("{} is too small for a chunk server: {} MiB", ident, bytes >> 20)));
     }
     /* This host's already, as it is: the same device -- its cs's, which
-       holds it -- answered as it is, nothing read or written */
+       holds it -- answered as it is, nothing read or written. One drained is
+       added again: it takes new chunks again (the metadata's). With `wipe`,
+       wiped: its record of a format dropped */
     if let Some((_, d)) = v.state.device(&ident).filter(|(c, d)| c.host == host && d.slots == slots) {
-        return Ok((ident, slots, d.id, false));
+        if wipe {
+            return wipe_known(state, &disk, ident, slots, d.id);
+        }
+        if d.state != DeviceState::Draining {
+            return Ok((ident, slots, d.id, false));
+        }
+        return match ask(state, &Command::DeviceAdd { host, ident: ident.clone(), slots })? {
+            Answer::Device { id } => Ok((ident, slots, id, false)),
+            other => Err(Failure::Other(alloc::format!("answered {:?}", other))),
+        };
     }
     /* Nothing else holds it while it is looked at, recorded and wiped; then
        the cs takes it, and keeps it */
@@ -176,6 +191,27 @@ pub fn device_add(state: &ModState, word: &str, wipe: bool) -> Result<(String, u
     }
     drop(claim);
     Ok((ident, slots, id, wiped))
+}
+
+/// Device `ident`, number `id` in the metadata, wiped as a person asks: its
+/// first pages zeroed -- what was on it lost -- and the metadata's record of
+/// its format dropped, for its cs to format it anew. Refused while its cs
+/// holds it: one it serves is no device whose contents are lost.
+fn wipe_known(state: &ModState, disk: &Disk, ident: String, slots: u32, id: u32)
+              -> Result<(String, u32, u32, bool), Failure> {
+    let claim = disk.claim_as("nbs")
+        .map_err(|holder| alloc::format!("{} is held by {} -- a device its cs serves is not wiped", ident, holder))?;
+    let mut page = DmaBuffer::new(1).ok_or_else(|| String::from("no memory for a page to write it through"))?;
+    wipe_first(&claim, &mut page).map_err(|why| alloc::format!("{} was not wiped: {}", ident, why))?;
+    match ask(state, &Command::DeviceFormatted { device: id, format: 0 })? {
+        Answer::Device { .. } => {}
+        other => {
+            return Err(Failure::Other(alloc::format!("{} wiped, its format's record not dropped: answered {:?} -- \
+                                                      asked again, it is", ident, other)));
+        }
+    }
+    drop(claim);
+    Ok((ident, slots, id, true))
 }
 
 /// Host `host`'s cs taken down in set `set` as a person finds its copy bad
