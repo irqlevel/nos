@@ -74,6 +74,8 @@ pub mod wire;
 pub use conf::{ChangeError, MAX_MEMBERS};
 pub use node::{Config, Error, Ready, RawNode, ReadState, Refusal, Role, SoftState, Stats};
 pub use log::{DiskLog, FileError, Files, LogConfig, LogError};
-pub use rsm::{Event, Frozen, LogStore, Output, RestoreError, Rsm, RsmError, SnapshotReader, StateMachine, StoreError};
+pub use rsm::{
+    Event, Frozen, LogStore, Output, RestoreError, Rsm, RsmError, RsmStats, SnapshotReader, StateMachine, StoreError,
+};
 pub use storage::{MemStorage, RaftState, Storage, StorageError};
 pub use types::*;

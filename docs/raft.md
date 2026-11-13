@@ -176,7 +176,8 @@ are removed oldest first while none holds an entry past it.
 It is still driven, with no clock and no network:
 
 ```
-let mut rsm = Rsm::new(config, store, State::new(), nonce)?;   // the store's snapshot restored, the log after it applied again
+let mut rsm = Rsm::new(config, store, State::new(), nonce)?;   // the store's snapshot restored
+while !rsm.caught_up() { rsm.process()?; }                     // the log after it applied again, a batch a call
 every tick:          rsm.tick()
 a message arrives:   rsm.step(m)
 a client asks:       rsm.register(request), rsm.submit(client, seq, &command),
@@ -185,11 +186,20 @@ then:                let out = rsm.process()?;
                      send out.messages; answer clients with out.events
 ```
 
-`process` writes and syncs what the node's `Ready` says before it hands out
-a message. It applies what is committed, serves the reads that may be
-served, and takes the next steps of a snapshot. Every member applies every
-entry and says so: the caller answers the clients that are its own, by the
-request ids it chose and by the client and sequence number of a command.
+`process` writes what the node's `Ready` says and, where something in it
+must be durable before what it sends goes -- entries, a term, a vote --
+syncs it; a `Ready` of heartbeats and their answers, or of a commit alone,
+is not synced (etcd's MustSync), which an idle group would otherwise pay a
+flush of the device for at every heartbeat. It applies what is committed,
+serves the reads that may be served, and takes the next steps of a
+snapshot. Every member applies every entry and says so: the caller answers
+the clients that are its own, by the request ids it chose and by the client
+and sequence number of a command. A member started over a log with a
+committed tail applies it a batch -- 4096 entries, or 1 MiB -- a `process`:
+`caught_up` says when its state is the one it left, and nothing is to be
+answered from it before. `stats` counts snapshots taken and given up, reads
+failed back for their age, and syncs done and not needed, for its caller to
+say.
 
 - **The state machine.** `apply(index, command)` gives the answer, and must
   give the same on every member: nothing in it may depend on a clock or the
@@ -198,14 +208,18 @@ request ids it chose and by the client and sequence number of a command.
   not change (copy-on-write, cheap), written a piece at a time, and
   `restore` reads one back.
 - **Sessions.** A client registers -- an entry, whose index is its id --
-  and numbers its commands, one at a time. A command retried under the
-  number last applied is answered from the session (`Applied`) and not
-  applied again; one under that is `Stale`; one of a session that is gone,
-  `Expired`, after which the client registers again. Sessions are part of
-  the state, carried by the snapshot.
+  and numbers its commands from 1, one at a time (`submit` refuses 0, the
+  number of none applied, and one in a log anyway is `Stale`). A command
+  retried under the number last applied is answered from the session
+  (`Applied`) and not applied again; one under that is `Stale`; one of a
+  session that is gone, `Expired`, after which the client registers again.
+  Sessions are part of the state, carried by the snapshot.
 - **Reads.** `read` is linearizable: the leader confirms it with a round of
   heartbeats (ReadIndex), and it is served once applied as far, or failed
-  back (`ReadFailed`) if the leadership changes first. Its context carries
+  back (`ReadFailed`) -- the leadership changed first, the leader refused
+  it for room, or no confirmation came in twice the longest election
+  timeout (its request or the answer lost: neither is sent again). Every
+  read asked ends one way or the other. Its context carries
   `nonce`, a number of this start's own -- random, or a count of starts --
   so that a leader's answer to a read the member asked before it was
   started again, arriving after, is never taken for a later read's. `read_at` is served
@@ -215,7 +229,9 @@ request ids it chose and by the client and sequence number of a command.
   large as the state, with a floor (`SNAPSHOT_FLOOR`, 1 MiB). The state is
   frozen at the index applied then and written a few pieces a call while
   applying goes on; the store then compacts the log. A leader's snapshot
-  restores the sessions and the state.
+  restores the sessions and the state -- read by the state machine before
+  the store makes it the whole of the log, so that one it cannot read stops
+  the member over the store it had, which a start can still read.
 
 ## A member's own asks
 

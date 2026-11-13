@@ -24,9 +24,13 @@
 //!
 //! **Reads**: [`Rsm::read`] is linearizable -- confirmed by the leader's
 //! ReadIndex, served once applied as far as it confirms, failed back to
-//! the caller if the leadership changes before. [`Rsm::read_at`] serves a
-//! read on any member once it has applied as far as an index its client
-//! names: its own last write's, say.
+//! the caller if the leadership changes before, if the leader refuses it
+//! for room, or if no confirmation comes in twice the longest election
+//! timeout (its
+//! request or the answer lost: neither is sent again). Every read asked
+//! ends one way or the other. [`Rsm::read_at`] serves a read on any member
+//! once it has applied as far as an index its client names: its own last
+//! write's, say.
 //!
 //! **Snapshots** are begun once the entries applied since the last are as
 //! large as the state -- so that a byte of log costs at most a byte of
@@ -259,8 +263,36 @@ pub enum RsmError {
     Corrupt(&'static str),
     /// As many reads waiting as are kept.
     Busy,
+    /// A command numbered 0: a session's commands are numbered from 1, 0
+    /// being the number of none applied yet.
+    BadSeq,
     /// An earlier failure stopped the member.
     Stopped,
+}
+
+/// What a replicated state machine has counted, for its caller to say.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RsmStats {
+    /// Snapshots taken: frozen, written, the log compacted.
+    pub snapshots: u64,
+    /// Snapshots begun and given up: larger than any there is -- the log is
+    /// not compacted by them, and grows.
+    pub snapshots_given_up: u64,
+    /// Reads failed back for their age: no confirmation in twice the
+    /// longest election timeout -- their request or its answer lost.
+    pub reads_aged: u64,
+    /// `Ready`s whose store was synced, and those that needed no sync:
+    /// nothing in them -- no entry, no term, no vote -- need be durable.
+    pub syncs: u64,
+    pub syncs_skipped: u64,
+}
+
+/// A linearizable read asked of the leader, not yet confirmed: the
+/// caller's request, the query, and the tick it was asked at.
+struct Asked {
+    request: u64,
+    query: Vec<u8>,
+    at: u64,
 }
 
 /// A client's session.
@@ -315,9 +347,18 @@ pub struct Rsm<S: LogStore, M: StateMachine> {
     log_bytes: u64,
     /// The least the log comes to before a snapshot is taken.
     floor: u64,
-    /// Reads asked of the leader and not yet confirmed: by the context the
-    /// node is handed, the caller's request and the query.
-    asked: BTreeMap<u64, (u64, Vec<u8>)>,
+    /// Reads asked of the leader and not yet confirmed, by the context the
+    /// node is handed.
+    asked: BTreeMap<u64, Asked>,
+    /// Ticks since the start: a read's age.
+    ticks: u64,
+    /// The commit the store held as the member started: everything up to it
+    /// applied again, the state is the one the member left (`caught_up`).
+    start_commit: u64,
+    /// The hard state as the store last had it written: whether a `Ready`'s
+    /// changes it in what must be durable -- its term or its vote.
+    written: HardState,
+    stats: RsmStats,
     /// Reads confirmed, or asked at an index, waiting for the applied index
     /// to come as far: by that index and their order of arrival.
     waiting: BTreeMap<(u64, u64), (u64, Vec<u8>)>,
@@ -335,11 +376,12 @@ pub struct Rsm<S: LogStore, M: StateMachine> {
 impl<S: LogStore, M: StateMachine> Rsm<S, M> {
     /// A member over what `store` holds -- its snapshot restored into `sm`,
     /// which is to be the state machine as new; what is committed past it
-    /// is applied again as the node hands it out, at the first `process`:
-    /// until then `state` is the snapshot's alone, and nothing is to be
-    /// answered from it (raftmember processes before it takes a message:
-    /// an mds just started told its cs the devices of its snapshot, one
-    /// added since missing). `nonce` is this start's
+    /// is applied again as the node hands it out, a batch a `process`, as
+    /// many calls as it takes (`caught_up` says when): until then `state` is
+    /// the snapshot's and what of the log is applied so far, and nothing is
+    /// to be answered from it (raftmember processes until caught up before
+    /// it takes a message: an mds just started told its cs the devices of
+    /// its snapshot, one added since missing). `nonce` is this start's
     /// own: random, or a count of starts kept durably -- never the same as
     /// an earlier start's of this member, whose reads' answers may still be
     /// on their way. Starting from 1 every time, a read asked after a
@@ -348,8 +390,10 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
     /// rsm target, seed 63606).
     pub fn new(cfg: Config, store: S, sm: M, nonce: u64) -> Result<Rsm<S, M>, RsmError> {
         let snap = store.snapshot().map_err(|e| RsmError::Node(Error::Storage(e)))?;
+        let written = store.initial_state().map_err(|e| RsmError::Node(Error::Storage(e)))?.hard_state;
         let node = RawNode::new(cfg, store).map_err(RsmError::Node)?;
         let soft = SoftState { leader: node.leader(), role: node.role(), term: node.term() };
+        let start_commit = node.committed();
         let mut rsm = Rsm {
             node,
             sm,
@@ -358,6 +402,10 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
             log_bytes: 0,
             floor: SNAPSHOT_FLOOR,
             asked: BTreeMap::new(),
+            ticks: 0,
+            start_commit,
+            written,
+            stats: RsmStats::default(),
             waiting: BTreeMap::new(),
             next_ctx: 1,
             nonce,
@@ -397,6 +445,17 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
         self.applied
     }
 
+    /// Whether everything the store held committed as the member started is
+    /// applied: the state is the one the member left, and may be answered
+    /// from.
+    pub fn caught_up(&self) -> bool {
+        self.applied >= self.start_commit
+    }
+
+    pub fn stats(&self) -> RsmStats {
+        self.stats
+    }
+
     /// The sessions there are.
     pub fn sessions(&self) -> usize {
         self.sessions.len()
@@ -425,6 +484,7 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
     pub fn tick(&mut self) {
         if !self.stopped {
             self.node.tick();
+            self.ticks += 1;
         }
     }
 
@@ -457,9 +517,15 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
 
     /// Client `client`'s command `seq`: `Applied` -- or `Expired`,
     /// `Stale`, `Lost` -- once it is committed. A retry is the same `seq`
-    /// again, of whichever member leads by then. The leader's alone to do.
+    /// again, of whichever member leads by then. A session's commands are
+    /// numbered from 1: 0 is the number of none applied, and a command of
+    /// it would be answered as applied without being so. The leader's alone
+    /// to do.
     pub fn submit(&mut self, client: u64, seq: u64, command: &[u8]) -> Result<u64, RsmError> {
         self.check()?;
+        if seq == 0 {
+            return Err(RsmError::BadSeq);
+        }
         let mut data = Vec::with_capacity(17 + command.len());
         data.push(KIND_COMMAND);
         data.extend_from_slice(&client.to_le_bytes());
@@ -479,7 +545,10 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
 
     /// A linearizable read, asked as request `request`: `Read` once the
     /// leader has confirmed it and this member has applied as far, or
-    /// `ReadFailed` if the leadership changes before.
+    /// `ReadFailed` -- the leadership changed before, the leader refused it
+    /// for room, or no confirmation came in twice the longest election
+    /// timeout (its
+    /// request or the answer lost: neither is sent again).
     pub fn read(&mut self, request: u64, query: Vec<u8>) -> Result<(), RsmError> {
         self.check()?;
         if self.asked.len() + self.waiting.len() >= MAX_READS {
@@ -488,7 +557,7 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
         let ctx = self.nonce.wrapping_add(self.next_ctx);
         self.next_ctx += 1;
         self.node.read_index(ctx).map_err(RsmError::Node)?;
-        self.asked.insert(ctx, (request, query));
+        self.asked.insert(ctx, Asked { request, query, at: self.ticks });
         Ok(())
     }
 
@@ -535,16 +604,33 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
         if self.node.has_ready() {
             let rd = self.node.ready();
             if let Some(snap) = rd.snapshot.clone() {
-                /* A leader's: the log is it now, and the state too */
+                /* A leader's: the state is it now, and the log too. Read by
+                 * the state machine first: one it cannot read stops the
+                 * member over the store it had -- made the whole of the
+                 * log first, it would leave a store that no start can
+                 * read either. */
                 self.taking = None;
-                self.node.storage_mut().apply_snapshot(snap.clone()).map_err(|e| self.stop(RsmError::Store(e)))?;
                 self.restore(&snap)?;
+                self.node.storage_mut().apply_snapshot(snap).map_err(|e| self.stop(RsmError::Store(e)))?;
             }
             self.node.storage_mut().append(&rd.entries).map_err(|e| self.stop(RsmError::Store(e)))?;
+            /* Synced where something in it must be durable before what it
+             * sends goes: entries, a term, a vote. A commit alone need not
+             * be -- etcd's MustSync -- and a leader's heartbeats, a
+             * follower's answers to them, would otherwise each wait for a
+             * flush of the device: ten a second a member, the group idle. */
+            let mut must_sync = !rd.entries.is_empty();
             if let Some(hs) = rd.hard_state {
+                must_sync |= hs.term != self.written.term || hs.vote != self.written.vote;
                 self.node.storage_mut().set_hard_state(hs).map_err(|e| self.stop(RsmError::Store(e)))?;
+                self.written = hs;
             }
-            self.node.storage_mut().sync().map_err(|e| self.stop(RsmError::Store(e)))?;
+            if must_sync {
+                self.node.storage_mut().sync().map_err(|e| self.stop(RsmError::Store(e)))?;
+                self.stats.syncs += 1;
+            } else {
+                self.stats.syncs_skipped += 1;
+            }
             out.messages = rd.messages;
             for e in rd.committed.iter() {
                 self.apply(e, &mut out)?;
@@ -553,14 +639,14 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
                 if let Some(asked) = self.asked.remove(&rs.ctx) {
                     let k = self.next_ctx;
                     self.next_ctx += 1;
-                    self.waiting.insert((rs.index, k), asked);
+                    self.waiting.insert((rs.index, k), (asked.request, asked.query));
                 }
             }
             /* Refused by the leader for room, or not handed out here for
              * room: failed back, to be asked again */
             for ctx in rd.reads_failed {
-                if let Some((request, _)) = self.asked.remove(&ctx) {
-                    out.events.push(Event::ReadFailed { request });
+                if let Some(asked) = self.asked.remove(&ctx) {
+                    out.events.push(Event::ReadFailed { request: asked.request });
                 }
             }
             if let Some(ss) = rd.soft_state {
@@ -569,8 +655,8 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
                      * changed -- another leader, or the same one in a later
                      * term: the node let it go. Asked again, of the leader
                      * there is now. */
-                    for (_, (request, _)) in core::mem::take(&mut self.asked) {
-                        out.events.push(Event::ReadFailed { request });
+                    for (_, asked) in core::mem::take(&mut self.asked) {
+                        out.events.push(Event::ReadFailed { request: asked.request });
                     }
                 }
                 self.soft = ss;
@@ -578,9 +664,28 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
             }
             self.node.advance();
         }
+        self.age_reads(&mut out);
         self.serve_reads(&mut out);
         self.snapshot_step()?;
         Ok(out)
+    }
+
+    /// The reads asked of the leader that no confirmation came for in twice
+    /// the longest election timeout (an election's is `election_ticks` and
+    /// up to as many again), failed back: their request or its answer was
+    /// lost, and neither is sent again -- waiting for them, a client would
+    /// wait for good, and the reads kept would fill the room for more.
+    fn age_reads(&mut self, out: &mut Output) {
+        let limit = 4 * u64::from(self.node.config().election_ticks);
+        let ticks = self.ticks;
+        let old: Vec<u64> =
+            self.asked.iter().filter(|(_, a)| ticks.saturating_sub(a.at) >= limit).map(|(&ctx, _)| ctx).collect();
+        for ctx in old {
+            if let Some(asked) = self.asked.remove(&ctx) {
+                self.stats.reads_aged += 1;
+                out.events.push(Event::ReadFailed { request: asked.request });
+            }
+        }
     }
 
     /// A committed entry applied.
@@ -609,6 +714,10 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
                 out.events.push(Event::Registered { origin, request, client: e.index });
             }
             Envelope::Command { client, seq, command } => match self.sessions.get_mut(&client) {
+                /* Numbered 0 -- which `submit` refuses: 0 is the number of
+                 * none applied, and a command of it would be answered from
+                 * the session as applied, its answer lost, without being so */
+                _ if seq == 0 => out.events.push(Event::Stale { client, seq }),
                 None => out.events.push(Event::Expired { client, seq }),
                 Some(s) if seq < s.last => out.events.push(Event::Stale { client, seq }),
                 Some(s) if seq == s.last => {
@@ -684,11 +793,13 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
             let index = self.applied;
             let Some(conf) = self.node.conf_state_at(index) else { return Ok(()) };
             let mut out = SnapshotBuilder::new();
+            self.log_bytes = 0;
             if !self.write_sessions(&mut out) {
+                /* Past the largest snapshot there is: given up, and said */
+                self.stats.snapshots_given_up += 1;
                 return Ok(());
             }
             self.taking = Some(Taking { index, conf, frozen: self.sm.freeze(), out });
-            self.log_bytes = 0;
         }
         let Some(t) = self.taking.as_mut() else { return Ok(()) };
         for _ in 0..PIECES_A_CALL {
@@ -697,7 +808,10 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
             if piece.is_empty() {
                 let Some(t) = self.taking.take() else { return Ok(()) };
                 return match self.node.storage_mut().create_snapshot(t.index, t.conf, t.out.finish()) {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {
+                        self.stats.snapshots += 1;
+                        Ok(())
+                    }
                     /* A leader's snapshot came past it meanwhile */
                     Err(StoreError::Storage(StorageError::SnapshotOutOfDate))
                     | Err(StoreError::Log(LogError::Refused(StorageError::SnapshotOutOfDate))) => Ok(()),
@@ -705,8 +819,10 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
                 };
             }
             if !t.out.push(&piece) {
-                /* Past the largest snapshot there is: given up */
+                /* Past the largest snapshot there is: given up, and said --
+                 * the log is not compacted by it, and grows */
                 self.taking = None;
+                self.stats.snapshots_given_up += 1;
                 return Ok(());
             }
         }
