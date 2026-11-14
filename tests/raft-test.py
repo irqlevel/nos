@@ -3,7 +3,7 @@
 
 The crate is the consensus the cluster's registry and NBS's metadata service
 run on (plans/raft.md): a member of a group as a state machine with no I/O,
-its messages as bytes, a storage in memory. fuzz/raft compiles it, as it is,
+its messages as bytes, a storage in memory. tests/fuzz/raft compiles it, as it is,
 into a host program that holds it to:
 
   - known answers: every kind of message written and read back, the bytes
@@ -69,13 +69,13 @@ into a host program that holds it to:
     handed out of order or unwritten, nothing sent the wire would refuse;
 
 and every allocation of all of it held to the 512 KiB one block of the
-kernel's heap gives (fuzz/raft/src/heap.rs).
+kernel's heap gives (tests/fuzz/raft/src/heap.rs).
 
     python3 tests/raft-test.py                         # the gate
     python3 tests/raft-test.py --seed 9 --seconds 600  # a node campaign
     python3 tests/raft-test.py --mutants               # and the mutants
 
-fuzz/raft/mutants.py takes one rule at a time out of the crate and must see
+tests/fuzz/raft/mutants.py takes one rule at a time out of the crate and must see
 the gate fail, and the scenario written for that rule fail on its own.
 
 Needs cargo on the host. Exit code 0 = every check held.
@@ -88,7 +88,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-FUZZ = os.path.join(ROOT, "fuzz", "raft")
+FUZZ = os.path.join(HERE, "fuzz", "raft")
 OUT = os.path.join(ROOT, "out", "raft-test")
 VENDOR = os.path.join(ROOT, "src", "crates", "vendor")
 BIN = os.path.join(OUT, "release", "raft-fuzz")
@@ -109,7 +109,7 @@ def main():
                         "--config", 'source.crates-io.replace-with="vendored-sources"',
                         "--config", 'source.vendored-sources.directory="%s"' % VENDOR], cwd=FUZZ)
     if r.returncode != 0:
-        sys.exit("raft-test: fuzz/raft did not build")
+        sys.exit("raft-test: tests/fuzz/raft did not build")
 
     if args.seed is not None:
         sys.exit(subprocess.run([BIN, "node", "--seed", str(args.seed), "--seconds", str(args.seconds)]).returncode)

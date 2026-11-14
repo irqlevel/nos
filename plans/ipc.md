@@ -356,12 +356,12 @@ What TCP has to get first is a plan of its own, [tcp.md](tcp.md):
 **I1, the channel in the image** -- done on branch `ipc-raft`
 (docs/ipc.md). The `ipc` crate, the ABI and `kcore::ipc`; the `ipc` command
 and kernel.echo; the selftest and `test_module_ipc`. Its tracepoints and its
-provider on the bus wait for I4, where there are hosts to show. `fuzz/ipc` (host, in CI): the crate as it is, over the
-fuzzers' common machine (`fuzz/common/`, tasks one at a time, the lock rules
+provider on the bus wait for I4, where there are hosts to show. `tests/fuzz/ipc` (host, in CI): the crate as it is, over the
+fuzzers' common machine (`tests/fuzz/common/`, tasks one at a time, the lock rules
 checked), held to a model -- every message sent `Ok` received once, in order,
 unless its mailbox closed first; every monitor firing exactly once; names
 unique; the pool back to empty when every mailbox has closed, and never past
-its caps. Gates: the smoke boots on both arches, UB builds too; `fuzz/ipc`;
+its caps. Gates: the smoke boots on both arches, UB builds too; `tests/fuzz/ipc`;
 `sshd-test.py` (the ffi digest); `cpp-fuzz.py --target module`.
 
 **I2, one event to wait on.** A mailbox, a `DiskQueue` and an `ImageQueue`

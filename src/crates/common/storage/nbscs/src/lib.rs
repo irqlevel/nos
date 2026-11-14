@@ -3,7 +3,7 @@
 //! a cs's requests over them (`store.rs`) -- fences, open marks, reads,
 //! writes, flushes, closes, the chunks freed -- each device the caller's
 //! (`device.rs`): a device's queue in nbs-cs.ko, a disk that power cuts
-//! lose and tear in fuzz/nbs's cs target.
+//! lose and tear in tests/fuzz/nbs's cs target.
 //!
 //! A chunk is held by its number and its incarnation (nbsmeta's): a number
 //! is taken again once its chunk is freed, and a slot of the chunk it was

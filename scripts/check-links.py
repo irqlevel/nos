@@ -23,14 +23,16 @@ is held to the tree, which is what GitHub's master holds once it is pushed:
 A gate, a tool or a fuzzer is named by its path far more often than it is
 linked to -- in CI's steps, the Makefile, a usage line, a document's
 command, a comment's "(tests/hv-test.py)" -- and moving the gates from
-scripts/ to tests/ rewrote hundreds of such names that no link is among.
-One left behind fails only when it is read: a CI step at once, a gate run
-by hand the day it is next run. So these are held as well:
+scripts/ to tests/, and the fuzzers from fuzz/ to tests/fuzz/, rewrote
+hundreds of such names that no link is among. One left behind fails only
+when it is read: a CI step at once, a gate run by hand the day it is next
+run. So these are held as well:
 
-  - anywhere in the tree, every path that starts at scripts/, tests/ or
-    fuzz/ (with ./ or nos/ before it, or not), globs and {a,b} included:
-    from the top, and in web/'s and panel/'s own files from the top of
-    their project too;
+  - anywhere in the tree, every path that starts at scripts/ or tests/
+    (with ./, nos/, or a $(ROOT)/ that holds the top before it, or not),
+    globs and {a,b} included: from the top, and in web/'s and panel/'s
+    own files from the top of their project too -- and every one at
+    fuzz/, which names nothing since the fuzzers moved;
   - in every Python file, every os.path.join of the directory the file is
     in -- __file__, and the HERE and ROOT a script makes of it with
     dirname and abspath -- that has nothing but literals after it, a glob
@@ -61,14 +63,19 @@ CODE = re.compile(r"`[^`\n]*`")
 
 # A path from the top to a gate, a tool or a fuzzer: what follows a word
 # character, a dot, a slash, a dash, ~ or $ is the inside of another path
-# (a URL, $(OUT)/..., ~/src/nos/...), not the start of one.
-NAMED = re.compile(r"(?<![A-Za-z0-9_./~$-])(?:\./|nos/)?"
-                   r"((?:scripts|tests|fuzz)(?:/(?:[A-Za-z0-9_.*-]|\{[A-Za-z0-9_.,*/-]*\})+)+)")
+# (a URL, $(OUT)/..., ~/src/nos/...), not the start of one. fuzz/ is the
+# fuzzers' old place, kept here so that a name of it left behind is found.
+NAMED_PATH = r"((?:scripts|tests|fuzz)(?:/(?:[A-Za-z0-9_.*-]|\{[A-Za-z0-9_.,*/-]*\})+)+)"
+NAMED = re.compile(r"(?<![A-Za-z0-9_./~$-])(?:\./|nos/)?" + NAMED_PATH)
+# The same from the top a Makefile or a shell script holds in ROOT
+# (tests/fuzz/cpp/Makefile's include path).
+ROOTED = re.compile(r"\$(?:\(ROOT\)|\{ROOT\}|ROOT)/" + NAMED_PATH)
 # Named where the reader is in another tree: Linux's own scripts/config, run
 # in linux/ (web/content/howto/linux-guest).
 ELSEWHERE = {"scripts/config"}
 # The top's directories a script's path has to be found in; anything else a
 # join reaches -- out/, bin/, an image or a kernel at the top -- a build makes.
+# fuzz/ for a join left behind, as above.
 SOURCE = {"bench", "build", "docs", "fuzz", "panel", "plans", "scripts", "src", "tests", "web"}
 MADE = SKIP | {"out", "__pycache__"}
 SOURCE_TEXT = TEXT + (".py", ".sh", ".rs", ".toml", ".yml", ".yaml", ".cpp", ".h", ".c", ".S", ".asm",
@@ -218,7 +225,7 @@ def main():
             text = open(os.path.join(ROOT, f), encoding="utf-8").read()
         except UnicodeDecodeError:
             continue
-        for m in NAMED.finditer(text):
+        for m in list(NAMED.finditer(text)) + list(ROOTED.finditer(text)):
             path = m.group(1).rstrip(".,;:")
             if path in ELSEWHERE:
                 continue

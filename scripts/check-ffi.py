@@ -6,7 +6,7 @@ A function the kernel's two halves -- or a module and the kernel, or a
 fuzzer and the code it stands in for -- call each other by is written down
 several times: declared in the `ffi` crate (src/crates/base/ffi), defined
 `#[no_mangle]` in a layer or in rust_ffi.cpp, declared again in the C++ that
-calls a Rust export, and stood in for by the host's fuzzers (fuzz/). Nothing
+calls a Rust export, and stood in for by the host's fuzzers (tests/fuzz/). Nothing
 else compares those: rustc compares extern declarations with each other, the
 linker compares names, the C++ compiler sees one translation unit at a time,
 and the ABI digest a module carries hashes the declarations alone. A
@@ -42,8 +42,8 @@ import sys
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 FFI = os.path.join(ROOT, "src", "crates", "base", "ffi", "src")
-RUST_TREES = [os.path.join(ROOT, "src", "crates"), os.path.join(ROOT, "fuzz")]
-CPP_TREES = [os.path.join(ROOT, "src", "base"), os.path.join(ROOT, "fuzz", "cpp")]
+RUST_TREES = [os.path.join(ROOT, "src", "crates"), os.path.join(ROOT, "tests", "fuzz")]
+CPP_TREES = [os.path.join(ROOT, "src", "base"), os.path.join(ROOT, "tests", "fuzz", "cpp")]
 SKIP_DIRS = {"vendor", "target", ".git", "node_modules"}
 CROSSING = re.compile(r"^(kernel|rust)_\w+$")
 
@@ -410,7 +410,7 @@ def rust_definitions(spellings, ffi_names, alias_ffi):
                 continue
             sig = rust_fn_at(text, m, aliases)
             if sig:
-                what = "fuzz stand-in" if path.startswith(os.path.join(ROOT, "fuzz") + os.sep) else "Rust definition"
+                what = "fuzz stand-in" if path.startswith(os.path.join(ROOT, "tests", "fuzz") + os.sep) else "Rust definition"
                 spellings.setdefault(name, []).append((sig, path, line_of(text, m.start()), what))
 
 
@@ -515,7 +515,7 @@ def cpp_spellings(spellings):
                 what = "C++ definition"
             else:
                 continue
-            if path.startswith(os.path.join(ROOT, "fuzz") + os.sep):
+            if path.startswith(os.path.join(ROOT, "tests", "fuzz") + os.sep):
                 what += " (fuzz)"
             ret = cpp_type(m.group(2), aliases)
             if "[[noreturn]]" in m.group(1):

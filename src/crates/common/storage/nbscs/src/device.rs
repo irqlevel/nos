@@ -1,6 +1,6 @@
 //! The device a cs's engine runs over: the caller's. nbs-cs.ko's is a
 //! device's queue (`kcore::block::DiskQueue`), its requests waited out one
-//! at a time; fuzz/nbs's is a disk with a write cache that a power cut
+//! at a time; tests/fuzz/nbs's is a disk with a write cache that a power cut
 //! loses or tears.
 //!
 //! A write may sit in the device's cache until a flush: only a flush makes

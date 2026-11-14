@@ -9,7 +9,7 @@
 //! way. So is a key vm.toml does not have, and one given twice -- `memroy =
 //! 4096` would otherwise boot a guest of the default size without a word.
 //!
-//! No kernel in it: the fuzzer builds it as it is (`fuzz/hv`, the `config`
+//! No kernel in it: the fuzzer builds it as it is (`tests/fuzz/hv`, the `config`
 //! target), and holds `parse` to never panicking, and `parse` and `render`
 //! to giving each other back what they were given.
 

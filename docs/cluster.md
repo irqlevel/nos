@@ -298,7 +298,7 @@ asks, and the typed name is the admin's word that they are gone.
 
 ## Tested
 
-- **`fuzz/raft`'s `registry` target** (docs/testing.md): the state machine
+- **`tests/fuzz/raft`'s `registry` target** (docs/testing.md): the state machine
   against a model of its own, alone and as a group through `raft::rsm` over
   a lossy network, with scenarios and six mutants.
 - **net-fuzz's `ipcnet` target**: the control mailbox's requests among its

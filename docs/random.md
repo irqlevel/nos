@@ -18,7 +18,7 @@ lock that allocates nothing (`IrqSpinLock`), because the boot seeds it from
   through `kcore::random` (`fill_random`, `random_u64`), which is the C ABI's
   `kernel_get_random`, defined in the crate. In the image that is a call from
   Rust into Rust across the C ABI, and it is on purpose: it is the seam the
-  fuzzers stand in for (`fuzz/common/machine`), so that what is random in a
+  fuzzers stand in for (`tests/fuzz/common/machine`), so that what is random in a
   fuzzer is the input's -- the TCP target hands out sequence numbers that are
   about to wrap.
 - **a hardware generator's driver** registers as a trait object,

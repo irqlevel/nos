@@ -8,10 +8,10 @@ edition = "2021"
 # read, a replica that does not answer taken out -- as a state machine fed
 # what comes and the time, and telling its driver what to send. No kernel in
 # it and no unsafe: hv's nbs: disks, nbs io and nbsload drive it over ipc,
-# and fuzz/nbs's cluster target drives it over a network of its own.
+# and tests/fuzz/nbs's cluster target drives it over a network of its own.
 [lib]
 
-# The fuzzer's alone (fuzz/nbs, #97): a session's write requests made to
+# The fuzzer's alone (tests/fuzz/nbs, #97): a session's write requests made to
 # find no memory until a time (`Session::starve_until`), as a kernel's heap
 # may refuse one -- never in a kernel's build.
 [features]

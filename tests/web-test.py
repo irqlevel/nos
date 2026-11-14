@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The host API's wire crates on the host: src/crates/common/net/web and
-src/crates/common/ipc/mgmtwire, as the API module links them (fuzz/web).
+src/crates/common/ipc/mgmtwire, as the API module links them (tests/fuzz/web).
 
 1. Known answers: SHA-1's FIPS 180 vectors, RFC 6455's accept key and
    frames, requests, frames, JSON texts, parameters, networks and
@@ -58,7 +58,7 @@ def build():
     # outside src/crates, whose .cargo/config.toml would make any build under
     # it a kernel build.
     return subprocess.run(['cargo', 'build', '--release', '--offline', '--quiet',
-                           '--manifest-path', os.path.join(ROOT, 'fuzz', 'web', 'Cargo.toml'),
+                           '--manifest-path', os.path.join(HERE, 'fuzz', 'web', 'Cargo.toml'),
                            '--target-dir', OUT,
                            '--config', 'source.crates-io.replace-with="vendored-sources"',
                            '--config', 'source.vendored-sources.directory="%s"' % VENDOR],
