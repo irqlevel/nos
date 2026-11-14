@@ -19,6 +19,11 @@
 //!   yet is waited for.
 //! - The sets with one active member left first; at most `JOINS_PER_CS`
 //!   joins with one joiner, and `JOINS_PER_TURN` proposed at a turn.
+//! - A join the leader has seen stand past `join_limit_ms` given up
+//!   (`Unjoin`), its set planned again at the next turn: one whose joiner
+//!   answers the leader but never ends it held its set from any other join
+//!   and every copy-up of its chunks for good (the review of 2026-11, its
+//!   question 2).
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -48,6 +53,28 @@ impl Default for After {
 
 /// Joins one cs is the joiner of at once, at most.
 pub const JOINS_PER_CS: usize = 2;
+/// How long a join may stand, as the leader has seen it, before it is
+/// given up: half an hour, and a second more for each chunk of its set --
+/// 4 MiB copied at 4 MiB/s, a slow link's. A copy that moves, however
+/// slowly, ends well inside it; one stuck gives itself up in five minutes
+/// (nbswire's `copy::STUCK_NS`) where its joiner can say so.
+pub const JOIN_MIN_MS: u64 = 30 * 60 * 1000;
+pub const JOIN_PER_CHUNK_MS: u64 = 1000;
+
+/// How long a join of a set of `chunks` chunks may stand.
+pub fn join_limit_ms(chunks: u32) -> u64 {
+    JOIN_MIN_MS + u64::from(chunks) * JOIN_PER_CHUNK_MS
+}
+
+/// A join as the leader has seen it: its set, its `since`, and for how long
+/// it has stood -- from when this leader first saw it, so that a new one
+/// gives it its whole time again, never less.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Joining {
+    pub set: u32,
+    pub since: u32,
+    pub age_ms: u64,
+}
 /// Joins the leader proposes at a turn, at most.
 pub const JOINS_PER_TURN: usize = 16;
 
@@ -73,9 +100,10 @@ enum Need {
 }
 
 /// What the leader proposes at a turn of its: cs's down, up and out as it
-/// sees them, silent past the cluster's `after` -- or where none is to
-/// change, joins.
-pub fn plan(s: &State, seen: &[Seen], after: After) -> Vec<Command> {
+/// sees them, silent past the cluster's `after`, and the joins it has seen
+/// stand past their time (`joining`) given up -- or where none is to change,
+/// joins.
+pub fn plan(s: &State, seen: &[Seen], joining: &[Joining], after: After) -> Vec<Command> {
     let mut out = Vec::new();
     let view = |c: &Cs| seen.iter().find(|v| v.cs == c.id);
     for c in s.cs() {
@@ -96,10 +124,21 @@ pub fn plan(s: &State, seen: &[Seen], after: After) -> Vec<Command> {
             _ => {}
         }
     }
+    /* A join stood past its time, given up: its joiner answers the leader,
+       or it would be down and the join over, but the copy is never ended --
+       its host's mds gone, say, which a copy asks its end of */
+    for (id, set) in s.sets().iter().enumerate() {
+        let Some(j) = set.joiner else { continue };
+        let age = joining.iter().find(|x| x.set == id as u32 && x.since == j.since).map_or(0, |x| x.age_ms);
+        if age >= join_limit_ms(set.chunks) {
+            out.push(Command::Unjoin { set: id as u32, cs: j.cs, since: j.since });
+        }
+    }
     /* A cs's change changes its sets and what a join of them may be: the
        joins wait for the next turn, planned on the state it leaves (found
        by fuzz/nbs's meta target: a join planned in the same turn as its
-       cs's coming back was refused as in place) */
+       cs's coming back was refused as in place); and a join given up
+       frees its set for the next */
     if !out.is_empty() {
         return out;
     }

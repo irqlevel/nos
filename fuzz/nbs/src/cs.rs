@@ -605,7 +605,7 @@ impl Run {
             self.generation[w as usize] = self.generation[w as usize].max(g);
         }
         let req = Request { id: 0, volume: w, generation: g,
-                            op: WireOp::Read { chunk: self.cref(c), position: 0, index: 0, offset: 0,
+                            op: WireOp::Read { chunk: self.cref(c), position: 0, index: 0, offset: 0, as_of: 0,
                                                len: self.sector as u32 } };
         let got = nbscs::now(serve(&self.store, &self.vouched, &req, &AskNow::new(|_| Some(Told::Verified))));
         self.count("chunks found open read by another volume's writer at their generation");
@@ -613,6 +613,72 @@ impl Run {
             return Err(format!("chunk {}, found open at generation {} of volume {:?}, refused as found open to volume \
                                 {}'s writer at that generation", c, g, owner, w));
         }
+        Ok(())
+    }
+
+    /// A read of a read-only session's through `serve`, carrying `as_of`,
+    /// the generation a writer would have been given as it attached:
+    /// refused as fenced once the volume's fence is there or past it -- a
+    /// writer's attached since -- and served below it (the review of
+    /// 2026-11, its question 4). On draws of its own.
+    fn reader_fenced(&mut self, step: u64) -> Result<(), String> {
+        let mut r = Rng::new(mix(mix(self.seed, 0x7265_6164), step));
+        let v = 1 + r.below(u64::from(VOLUMES)) as u32;
+        let fence = self.store.fence_of(v);
+        let as_of = match r.below(3) {
+            0 => fence,
+            1 => fence + 1,
+            _ => r.below(fence + 2),
+        };
+        let c = r.below(u64::from(CHUNKS)) as u32;
+        let req = Request { id: 0, volume: v, generation: 0,
+                            op: WireOp::Read { chunk: self.cref(c), position: 0, index: step, offset: 0, as_of,
+                                               len: self.sector as u32 } };
+        let got = nbscs::now(serve(&self.store, &self.vouched, &req, &AskNow::new(|_| Some(Told::Verified))));
+        if got == Err(Refusal::Io) && self.dead() {
+            return Ok(());
+        }
+        let fenced = matches!(got, Err(Refusal::Fenced { .. }));
+        if fenced != (as_of != 0 && fence >= as_of) {
+            return Err(format!("step {}: a reader's read of volume {} as of generation {}, its fence {}: {:?}", step,
+                               v, as_of, fence, got));
+        }
+        self.count(if fenced { "readers' reads fenced" } else { "readers' reads below the fence" });
+        Ok(())
+    }
+
+    /// A writer's close held to its epoch as a write is (the review of
+    /// 2026-11, its question 5), of a chunk no other step names, in a set
+    /// none does: unheld, in a set not joined, done only once vouched for
+    /// -- a joiner not told of its join learns it so first; and on a
+    /// joiner, one of an epoch before its join refused. The join left at
+    /// once, nothing else of the run touched.
+    fn closes_held_to_epoch(&mut self, step: u64) -> Result<(), String> {
+        let mut r = Rng::new(mix(mix(self.seed, 0x636c_6f73), step));
+        let v = 1 + r.below(u64::from(VOLUMES)) as u32;
+        let g = self.store.fence_of(v);
+        if g == 0 || self.dead() {
+            return Ok(());
+        }
+        const SET: u32 = 1 << 20;
+        let since = 2 + r.below(8) as u32;
+        let c = ChunkRef { chunk: CHUNKS + 1 + r.below(64) as u32, incarnation: 1, epoch: Epoch { set: SET, version: since } };
+        let unvouched = nbscs::now(self.store.close(v, g, c, false));
+        let vouched = nbscs::now(self.store.close(v, g, c, true));
+        if unvouched != Err(Error::Unverified) || vouched != Ok(false) {
+            return Err(format!("step {}: a close of a chunk not held, of a set not joined: unvouched {:?}, vouched {:?}",
+                               step, unvouched, vouched));
+        }
+        self.store.join(SET, since);
+        let before = ChunkRef { epoch: Epoch { set: SET, version: since - 1 }, ..c };
+        let old = nbscs::now(self.store.close(v, g, before, true));
+        let at = nbscs::now(self.store.close(v, g, c, false));
+        self.store.leave(SET);
+        if old != Err(Error::Epoch { known: Epoch { set: SET, version: since } }) || at != Ok(false) {
+            return Err(format!("step {}: closes on a joiner since version {}: of the version before {:?}, at it {:?}",
+                               step, since, old, at));
+        }
+        self.count("closes held to their epoch");
         Ok(())
     }
 
@@ -960,7 +1026,14 @@ impl Run {
                 let was_open = m.open == Some(g) && held;
                 let may = m.maybe_open == Some(g) && held;
                 let now: BTreeMap<u32, u8> = m.sectors.iter().map(|(&k, s)| (k, s.now())).collect();
-                let got = match nbscs::now(self.store.close(v, g, cref)) {
+                /* Its epoch held as a write's: one the store does not know
+                   asked of the mds, which vouches -- as the module does */
+                let verified = self.r.chance(60);
+                let mut first = nbscs::now(self.store.close(v, g, cref, verified));
+                if !verified && matches!(first, Err(Error::Unverified) | Err(Error::Epoch { .. })) {
+                    first = nbscs::now(self.store.close(v, g, cref, true));
+                }
+                let got = match first {
                     Err(Error::Io) if self.dead() => {
                         /* Cut in the close: open still, or closed */
                         let m = &mut self.chunks[c as usize];
@@ -1009,7 +1082,7 @@ impl Run {
                         let mut cref = self.cref(c);
                         cref.epoch.version = h.known.version + 1;
                         Some(Request { id: step, volume: m.volume, generation: 0,
-                                       op: WireOp::Read { chunk: cref, position: 0, index: step, offset: 0,
+                                       op: WireOp::Read { chunk: cref, position: 0, index: step, offset: 0, as_of: 0,
                                                           len: self.sector as u32 } })
                     }
                     _ => None,
@@ -1096,6 +1169,8 @@ impl Run {
                         return Err(format!("step {}: chunk {}'s incarnation before read: {:?}", step, c, got));
                     }
                 }
+                self.reader_fenced(step)?;
+                self.closes_held_to_epoch(step)?;
             }
             /* The power cut, or a fence's copies torn in turn */
             98 if self.r.chance(50) => self.fence_tears()?,
@@ -1141,7 +1216,7 @@ impl Run {
         /* At an epoch the cs does not know: asked of the mds */
         cref.epoch.version = held.known.version + 1;
         let req = Request { id: step, volume, generation: 0,
-                            op: WireOp::Read { chunk: cref, position: 0, index: step, offset: 0,
+                            op: WireOp::Read { chunk: cref, position: 0, index: step, offset: 0, as_of: 0,
                                                len: self.sector as u32 } };
         let ask = Later::default();
         let gone = AskNow::new(|q| match q {

@@ -484,9 +484,26 @@ struct State {
     /// write is.
     joining: BTreeMap<u32, u32>,
     marks: BTreeMap<u32, Marks>,
+    /// The chunks of the sets this cs joins that a client has closed here
+    /// since the join began, each at the newest generation it was closed
+    /// at: a copy keeps open what its source held open only where the
+    /// writer has not closed it here already (`close_copy`).
+    closes: BTreeMap<u32, Closed>,
     /// The joins of each set this cs has begun, counted, those over among
     /// them (`joins_begun`).
     begun: BTreeMap<u32, u64>,
+}
+
+/// A chunk a client closed on a joiner, as the join's marks keep it: in
+/// memory alone, dropped with the join. By the writer of `volume`: another
+/// volume's writer -- a reconcile's mend of a chunk a snapshot shares --
+/// closes nothing of the writer whose mark the source holds.
+#[derive(Clone, Copy)]
+struct Closed {
+    set: u32,
+    incarnation: u32,
+    volume: u32,
+    generation: u64,
 }
 
 /// The sectors of a chunk that clients have written since the join of its
@@ -556,6 +573,7 @@ impl<D: Device> Store<D> {
                 joining: BTreeMap::new(),
                 begun: BTreeMap::new(),
                 marks: BTreeMap::new(),
+                closes: BTreeMap::new(),
             }),
             chunk_turns: Turns::default(),
             volume_turns: Turns::default(),
@@ -1337,11 +1355,35 @@ impl<D: Device> Store<D> {
 
     /// Chunk `c` closed by `volume`'s attach at `generation`: its data
     /// flushed, then its record no longer open. Whether it was open.
-    pub async fn close(&self, volume: u32, generation: u64, c: ChunkRef) -> Result<bool, Error> {
+    ///
+    /// Its epoch held as a write's is (the review of 2026-11, its question
+    /// 5): a close by a view older than the chunk's is refused -- a join's
+    /// copy has moved it on, and the joiner may hold it open as this cs
+    /// did (`close_copy`), which its writer, its map read again, closes
+    /// too -- and one by an epoch this cs does not know, or of a chunk it
+    /// holds none of in a set it is joining no join of, is done only once
+    /// its host's mds has vouched for it (`verified`): a joiner not told
+    /// of its join yet learns it so first, and keeps the close in mind
+    /// (`closes`) before its copy of the chunk ends.
+    pub async fn close(&self, volume: u32, generation: u64, c: ChunkRef, verified: bool) -> Result<bool, Error> {
         let _volume = self.volume_turns.take(volume, false).await;
         let _chunk = self.chunk_turns.take(c.chunk, true).await;
         self.check_fence(volume, generation)?;
-        let Some((dv, slot, r)) = self.find(&c)? else { return Ok(false) };
+        let joining = self.s.borrow().joining.get(&c.epoch.set).copied();
+        if let Some(since) = joining.filter(|&since| since > c.epoch.version) {
+            return Err(Error::Epoch { known: Epoch { set: c.epoch.set, version: since } });
+        }
+        let Some((dv, slot, r)) = self.find(&c)? else {
+            if joining.is_none() && !verified {
+                return Err(Error::Unverified);
+            }
+            self.closed_here(volume, &c, generation);
+            return Ok(false);
+        };
+        if r.known != c.epoch && (!verified || older(c.epoch, r.known)) {
+            return Err(Error::Epoch { known: r.known });
+        }
+        self.closed_here(volume, &c, generation);
         if r.state != SlotState::Open || r.volume != volume || r.generation != generation {
             return Ok(false);
         }
@@ -1440,6 +1482,31 @@ impl<D: Device> Store<D> {
         let mut s = self.s.borrow_mut();
         s.joining.remove(&set);
         s.marks.retain(|_, m| m.set != set);
+        s.closes.retain(|_, x| x.set != set);
+    }
+
+    /// A close of chunk `c` by `volume`'s writer at `generation` kept in
+    /// mind, where its set is joined: the newest generation it was closed at
+    /// here.
+    fn closed_here(&self, volume: u32, c: &ChunkRef, generation: u64) {
+        let mut s = self.s.borrow_mut();
+        if !s.joining.contains_key(&c.epoch.set) {
+            return;
+        }
+        let now = Closed { set: c.epoch.set, incarnation: c.incarnation, volume, generation };
+        let x = s.closes.entry(c.chunk).or_insert(now);
+        if x.incarnation != c.incarnation || x.set != c.epoch.set || x.volume != volume {
+            *x = now;
+        }
+        x.generation = x.generation.max(generation);
+    }
+
+    /// The newest generation `volume`'s writer has closed chunk `c` at here
+    /// since the join of its set began.
+    fn closed_since_join(&self, volume: u32, c: &ChunkRef) -> Option<u64> {
+        self.s.borrow().closes.get(&c.chunk)
+            .filter(|x| x.incarnation == c.incarnation && x.set == c.epoch.set && x.volume == volume)
+            .map(|x| x.generation)
     }
 
     /// The join of set `set` this cs marks for: its `since`.
@@ -1519,12 +1586,16 @@ impl<D: Device> Store<D> {
 
     /// The CRC-32C of each `GRANULE` of chunk `c` from `offset` for `len`
     /// bytes -- the last shorter where `len` ends inside one -- for its set's
-    /// joiner, its epoch moved on first as a pull's is.
-    pub async fn sums(&self, c: ChunkRef, offset: u32, len: u32) -> Result<Vec<u32>, Error> {
+    /// joiner, its epoch moved on first as a pull's is; and the generation
+    /// its record is open at, if it is -- what the joiner's copy keeps open
+    /// there too (`close_copy`).
+    pub async fn sums(&self, c: ChunkRef, offset: u32, len: u32) -> Result<(Vec<u32>, Option<u64>), Error> {
         let _chunk = self.chunk_turns.take(c.chunk, true).await;
         self.not_found_open(&c)?;
         let (dv, slot) = self.advance(&c).await?;
-        self.sums_at(dv, slot, offset, len).await
+        let r = self.record(dv, slot);
+        let open = (r.state == SlotState::Open).then_some(r.generation);
+        Ok((self.sums_at(dv, slot, offset, len).await?, open))
     }
 
     /// Chunk `c` no source of a copy where it was found open: it may lack
@@ -1742,7 +1813,18 @@ impl<D: Device> Store<D> {
     /// no client has written it since the join began -- one a client has,
     /// at its generation, is that client's to close -- and its epoch moved
     /// on to the copy's, `c`'s, where it was older.
-    pub async fn close_copy(&self, c: ChunkRef) -> Result<(), Error> {
+    ///
+    /// `open`: the generation the source held the chunk open at as it was
+    /// summed for the copy, if it did. The copy keeps it open here at that
+    /// generation, where its writer has not closed it here since the join
+    /// began: what the source held open its writer may have written to it
+    /// alone, or a power cut on the way taken from another replica, and a
+    /// mark is what has the next writer's reconcile make the replicas the
+    /// same. Closed by the copy, the source taken out later took the last
+    /// mark with it, and the replicas left apart stayed so (found by
+    /// fuzz/nbs's cluster target, seed 14649, past the gate's range after
+    /// the review of 2026-11 -- its question 5).
+    pub async fn close_copy(&self, c: ChunkRef, open: Option<u64>) -> Result<(), Error> {
         let _chunk = self.chunk_turns.take(c.chunk, true).await;
         let Some((dv, slot, r)) = self.find(&c)? else { return Ok(()) };
         /* What the copy took in durable, whatever the record: one a client
@@ -1776,6 +1858,18 @@ impl<D: Device> Store<D> {
            chain passed such a write on to it). An epoch newer than the
            copy's, a client's write since, is kept */
         let known = if r.known.set == c.epoch.set && r.known.version < c.epoch.version { c.epoch } else { r.known };
+        /* The source's mark kept, at its generation -- unless a client's
+           own is here, to be closed by it, or its writer, or one after it,
+           has closed the chunk here since the join began */
+        let clients = r.state == SlotState::Open && !close;
+        let kept = open.filter(|&g| !clients && self.closed_since_join(r.volume, &c).is_none_or(|closed| closed < g));
+        if let Some(g) = kept {
+            if r.state == SlotState::Open && r.generation == g && r.known == known {
+                return Ok(());
+            }
+            return self.put(dv, slot, Record { state: SlotState::Open, generation: g, known, seq: r.seq + 1, ..r })
+                .await;
+        }
         if !close && known == r.known {
             return Ok(());
         }

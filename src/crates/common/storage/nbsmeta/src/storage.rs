@@ -824,7 +824,12 @@ impl State {
             }
             v.readers.push(String::from(host));
         }
-        Ok((0, false))
+        /* The generation a writer would be given next: one attached after
+           this reader -- by force, which lets the readers go -- fences the
+           volume there or past it, and the reader's reads, which carry it,
+           are refused from then on (the review of 2026-11, its question 4:
+           read at no generation, the reader read on under the writer) */
+        Ok((next, false))
     }
 
     /// Token `token` kept as a session's that let volume `v` go.

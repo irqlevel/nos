@@ -312,7 +312,8 @@ async fn devices(cs: Rc<Cs>) {
 /// while it serves, each copied -- the answers to its requests handed to
 /// it as they come, its step taken every tick.
 async fn joins(cs: Rc<Cs>) {
-    let mut j = Joins { copies: Vec::new(), copy_id: 1, seen: false, give_up: Vec::new(), end_at: 0 };
+    let mut j = Joins { copies: Vec::new(), copy_id: 1, seen: false, give_up: Vec::new(), end_at: 0,
+                        unfenced: BTreeMap::new() };
     let mut joins_at = 0u64;
     loop {
         if cs.serving.get() && boot_time_ns() >= joins_at {
@@ -677,6 +678,12 @@ struct Joins {
     /// could write over (found by the review of 2026-11).
     give_up: Vec<(u32, u32)>,
     end_at: u64,
+    /// The joins whose copy cannot begin -- their volumes not fenced here --
+    /// each from when it first could not: given up past `copy::STUCK_NS`,
+    /// as a copy with no answer it can use is. It waited for good, holding
+    /// its set from any other join and every copy-up of its chunks (the
+    /// review of 2026-11, its question 2).
+    unfenced: BTreeMap<(u32, u32), u64>,
 }
 
 impl Joins {
@@ -719,13 +726,24 @@ impl Joins {
             }
         }
         let now = boot_time_ns();
+        self.unfenced.retain(|k, _| views.iter().any(|v| (v.set, v.since) == *k));
         for v in views {
             /* Fenced at its volumes' newest generations first, and as they
                move on (N13) */
             if !copy::fence_for(&cs.store, &v).await {
-                klog!(0, "nbs-cs: set {}'s volumes not fenced here: its join waits", v.set);
+                let first = *self.unfenced.entry((v.set, v.since)).or_insert(now);
+                if now >= first + copy::STUCK_NS {
+                    klog!(0, "nbs-cs: set {}'s volumes not fenced here in {} s: its join given up", v.set,
+                          copy::STUCK_NS / 1_000_000_000);
+                    if self.end(cs, v.set, v.since, false, None).await {
+                        self.unfenced.remove(&(v.set, v.since));
+                    }
+                } else {
+                    klog!(0, "nbs-cs: set {}'s volumes not fenced here: its join waits", v.set);
+                }
                 continue;
             }
+            self.unfenced.remove(&(v.set, v.since));
             match self.copies.iter_mut().find(|c| c.set() == v.set && c.since() == v.since) {
                 Some(c) => c.refresh(v),
                 None => {

@@ -402,7 +402,7 @@ impl Run {
                 })
             }
             What::Close { volume, generation, chunk } => {
-                Box::pin(async move { Said::Closed(st.close(volume, generation, cref(chunk)).await) })
+                Box::pin(async move { Said::Closed(st.close(volume, generation, cref(chunk), true).await) })
             }
             What::Flush { volume, generation } => {
                 Box::pin(async move { Said::Unit(st.flush_for(volume, generation).await) })

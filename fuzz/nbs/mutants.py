@@ -424,8 +424,8 @@ MUTANTS = [
      ''),
     ('client_close_not_here', "a close the cs is not in the chunk's set for done as refused so",
      'nbsclient/src/lib.rs',
-     "                    What::Close(place) if matches!(why, Refusal::NotHere) => self.closed(place, cs, now, bufs, out),",
-     "                    What::Close(place) if false && matches!(why, Refusal::NotHere) => self.closed(place, cs, now, bufs, out),"),
+     "                    What::Close(place) if matches!(why, Refusal::NotHere) => {",
+     "                    What::Close(place) if false && matches!(why, Refusal::NotHere) => {"),
     ('client_moot_downs', "an ask-out of a set the view no longer writes the cs in dropped, once the map is read",
      'nbsclient/src/lib.rs',
      '                self.downs.retain(|&(set, cs), d| map.sets.get(&set).is_some_and(|s| s.written_to(cs)\n                                                                                  && s.version == d.version));',
@@ -1082,21 +1082,83 @@ MUTANTS = [
      'nbswire/src/mds.rs',
      '            if !st.cs.iter().zip(st.replicas.iter()).any(|(&c, &r)| c == me.id && r == Replica::Active) {\n                return Told::Refused(Refusal::NotHere);\n            }\n            Told::Verified\n        }\n        Question::Joins',
      '            Told::Verified\n        }\n        Question::Joins'),
+    # An open chunk's mark kept by a join's copy (the review of 2026-11, its
+    # question 5): the source's sums say what it holds open, the joiner
+    # keeps it so unless the writer has closed it there, a close by a view
+    # older than the chunk refused, and the writer's closes sent to the view
+    # its map read finds -- each the cluster target's `marked_where_apart`,
+    # `closed_all` and the pause's to catch
+    ('copy_keeps_open', "a join's copy keeps open what its source held open",
+     'nbscs/src/store.rs',
+     'let kept = open.filter(|&g| !clients',
+     'let kept = open.filter(|_| false).filter(|&g| !clients'),
+    ('sums_say_open', "a source's sums say the generation it holds the chunk open at",
+     'nbscs/src/store.rs',
+     '        let open = (r.state == SlotState::Open).then_some(r.generation);',
+     '        let open: Option<u64> = None;'),
+    ('joiner_remembers_closes', "a copy keeps no mark its writer has closed on the joiner since the join began",
+     'nbscs/src/store.rs',
+     'self.closed_since_join(r.volume, &c).is_none_or(|closed| closed < g)',
+     'true'),
+    ('close_older_epoch', "a close by a view older than the chunk refused",
+     'nbscs/src/store.rs',
+     '        if r.known != c.epoch && (!verified || older(c.epoch, r.known)) {\n            return Err(Error::Epoch { known: r.known });\n        }\n        self.closed_here(volume, &c, generation);',
+     '        if r.known != c.epoch && !verified && !older(c.epoch, r.known) {\n            return Err(Error::Epoch { known: r.known });\n        }\n        self.closed_here(volume, &c, generation);'),
+    ('close_epoch_since', "a joiner takes no close of an epoch before its join",
+     'nbscs/src/store.rs',
+     'if let Some(since) = joining.filter(|&since| since > c.epoch.version) {',
+     'if let Some(since) = joining.filter(|_| false) {'),
+    ('close_unheld_verified', "a close of a chunk not held, in a set not joined, vouched for first",
+     'nbscs/src/store.rs',
+     '            if joining.is_none() && !verified {\n                return Err(Error::Unverified);',
+     '            if false && joining.is_none() && !verified {\n                return Err(Error::Unverified);'),
+    ('join_time_limit', "a join that stood past its time given up by the controller",
+     'nbsmeta/src/repair.rs',
+     '        if age >= join_limit_ms(set.chunks) {',
+     '        if false && age >= join_limit_ms(set.chunks) {'),
+    ('reader_fenced', "a reader's read refused once a writer attached after it fenced the volume",
+     'nbswire/src/serve.rs',
+     '                if fence >= as_of {\n                    return Err(Refusal::Fenced { generation: fence });',
+     '                if false && fence >= as_of {\n                    return Err(Refusal::Fenced { generation: fence });'),
+    ('client_reopened_after_map', "a close to be sent again after the map read no more once its place is written again",
+     'nbsclient/src/lib.rs',
+     '                    self.after_map.retain(|&(_, w)| w != What::Close(place));\n',
+     ''),
+    ('client_close_after_write', "a close of the driver's waiting on a place a write took as it began closes it once the write is done",
+     'nbsclient/src/lib.rs',
+     '        if self.ops.values().any(|o| o.closing.is_some()) {\n            self.closes_progress(now, bufs, out);\n        }\n    }',
+     '    }'),
+    ('client_not_here_waits_map', "a close refused as no replica's not taken for closed until the map is read",
+     'nbsclient/src/lib.rs',
+     '                        self.close_moved.insert(place);\n                        self.closed(place, cs, now, bufs, out)',
+     '                        self.closed(place, cs, now, bufs, out)'),
+    ('client_taken_out_waits_map', "a close waiting on a cs taken out of every set not taken for closed until the map is read",
+     'nbsclient/src/lib.rs',
+     '                    self.close_moved.insert(place);\n                    self.refresh(now, out);\n                    self.closed(place, cs, now, bufs, out)',
+     '                    self.closed(place, cs, now, bufs, out)'),
+    ('client_closes_to_view', "a close out sent to the replicas a changed view has",
+     'nbsclient/src/lib.rs',
+     '                self.closes_to_view(before, now, bufs, out);\n',
+     ''),
 ]
 
 
 # Rules whose races the gate's seeds lost when the review of 2026-11's
 # fixes moved the client's course -- fewer replicas asked out, so fewer
-# joins and fewer views behind their sets -- each hunted over ten thousand
-# cluster seeds past the gate's range and found at none the good tree
-# passes. Each is a known gap of the cluster target's, said as one and not
-# counted a failure, until a seed or a scenario of its own holds it again;
-# one caught is said too, to be taken off this list.
+# joins and fewer views behind their sets -- each hunted over fifteen
+# thousand cluster seeds past the gate's range and found at none the good
+# tree passes: an attach anew's mend of the places of the writes it had out
+# (a mark lost was what it was for, and a join's copy keeps its source's
+# now), the reconcile's writes in place, and a session detached deaf to the
+# answers of before (the target holds a session over to send nothing, and
+# none has). Each is a known gap of the cluster target's, said as one and
+# not counted a failure, until a seed or a scenario of its own holds it
+# again; one caught is said too, to be taken off this list -- as
+# `client_close_not_here` and `client_stop_waits` were in the review's
+# questions' round.
 KNOWN_GAPS = {
     'anew_mends_writes_out',
-    'client_close_not_here',
     'client_detached_deaf',
-    'client_stop_waits',
     'mend_in_place',
 }
 
