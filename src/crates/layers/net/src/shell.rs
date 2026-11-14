@@ -2,8 +2,8 @@
 //! `kernel/cmd.cpp`, which has no view of a device, a socket or a resolver
 //! to reach through any more.
 //!
-//! Every message is the one the C++ printed: `scripts/tcp-test.py`,
-//! `scripts/netconsole-test.py` and `scripts/netblk-test.py` drive the stack
+//! Every message is the one the C++ printed: `tests/tcp-test.py`,
+//! `tests/netconsole-test.py` and `tests/netblk-test.py` drive the stack
 //! through these and match on what they say.
 
 use alloc::vec::Vec;

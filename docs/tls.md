@@ -236,6 +236,6 @@ pool -- `entropy` in the shell says which sources exist.
   Only ChaCha20-Poly1305 carries a 1 GbE link (117 MB/s) with room to
   spare, so a link between hosts (ipcnet) asks for it first. On an Apple
   M-series core under HVF, arm64's: AES-GCM 160–195 MB/s, ChaCha20 440.
-  `scripts/tlsbench.py` boots nos with the module and runs it: under KVM
+  `tests/tlsbench.py` boots nos with the module and runs it: under KVM
   on a server -- nos a guest, nothing rebooted -- it says what the cores
   give; under TCG, nothing worth quoting.

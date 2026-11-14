@@ -211,4 +211,4 @@ On a server installed from a system image built from master ([Install nos on a s
 - [A VM from a URL](/blog/vms-from-cloud-images): how each piece works and how it was tested.
 - In the reference: [A VM in a folder](/docs/hypervisor#a-vm-in-a-folder), [A VM of a cloud's image](/docs/hypervisor#a-vm-of-a-clouds-image), [A disk from a cloud's image](/docs/hypervisor#a-disk-from-a-clouds-image).
 - [Boot a Linux guest](/howto/linux-guest): guests from a kernel you build yourself, with disks, a network and several CPUs.
-- `nos/scripts/hv-distro-test.py --create <url>` runs this guide as a test and checks the guest from the inside ([Run the gates](/howto/run-the-gates)).
+- `nos/tests/hv-distro-test.py --create <url>` runs this guide as a test and checks the guest from the inside ([Run the gates](/howto/run-the-gates)).

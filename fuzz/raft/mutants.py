@@ -26,7 +26,7 @@ NBSMETA = os.path.join('..', '..', '..', 'storage', 'nbsmeta', 'src', 'lib.rs')
 ASKS = 'asks.rs'
 OUT = os.path.join(ROOT, 'out', 'raft-mutants')
 BINARY = os.path.join(OUT, 'release', 'raft-fuzz')
-# The kernel's vendored crates, for nbsmeta's sha2 (scripts/raft-test.py).
+# The kernel's vendored crates, for nbsmeta's sha2 (tests/raft-test.py).
 VENDOR = os.path.join(ROOT, 'src', 'crates', 'vendor')
 
 # name, what it takes out, the text it changes, what it becomes, and the

@@ -141,9 +141,9 @@ $
 To check a build without watching the boot, run a smoke test. It boots nos headless and reports the result in its exit code: 0 means every marker appeared, and 1 means the boot failed, for example with a panic or a timeout. The third command runs the arm64 test under HVF instead of TCG:
 
 ```sh
-./scripts/smoke-test.sh --skip-build
-./scripts/smoke-arm64.sh --skip-build
-SMOKE_HVF=1 ./scripts/smoke-arm64.sh --skip-build
+./tests/smoke-test.sh --skip-build
+./tests/smoke-arm64.sh --skip-build
+SMOKE_HVF=1 ./tests/smoke-arm64.sh --skip-build
 ```
 
 The smoke scripts create their own scratch disks and write the log to a temporary directory. `SMOKE_TIMEOUT` sets how long to wait (300 seconds by default), and `SMOKE_LOG` sets the log's path. Without `--skip-build`, they first build nos in the `nos-builder` container.

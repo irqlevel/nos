@@ -1,7 +1,7 @@
 # The raft crate on the host: members of a group in one process over a
 # simulated network and simulated disks, held at every step to Raft's
 # properties, the known traps as scripted scenarios, and the wire's decoder
-# fed noise (scripts/raft-test.py). Its dependencies are the tree's own
+# fed noise (tests/raft-test.py). Its dependencies are the tree's own
 # crates, by path, so it builds offline.
 [package]
 name = "raft-fuzz"

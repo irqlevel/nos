@@ -195,7 +195,7 @@ on its way back.
   letting go first, the two keeping it; the event freed with the last of
   them), and modtest's side of it first in `modtest ipc` (a mailbox and a
   device's queue on a module's event, through the C ABI).
-- **`scripts/ipc-fuzz.py`** (host, in CI): the crate as it is over the
+- **`tests/ipc-fuzz.py`** (host, in CI): the crate as it is over the
   fuzzers' common machine, against a model of its own -- every answer, every
   queue in order, every count, the `Down`s and the names; mailboxes of the
   image's and of made-up modules, receivers asleep until a message, a wake or
@@ -374,7 +374,7 @@ hosts and back.
   whoever queues something for the connection ends early (`TcpWaker`, held
   to the connection's generation, so that a wake of one gone reaches
   nobody). A small message's round trip between two hosts is some 0.4 ms at
-  the median on `scripts/hub.py`'s LAN under HVF, where it was 7 ms while
+  the median on `tests/hub.py`'s LAN under HVF, where it was 7 ms while
   the task polled; what is left of polling is a send waiting for room in
   TCP's buffer, a millisecond at a time.
 - **No wait while there is more to send**: a turn puts at most 64 KiB of
@@ -392,8 +392,8 @@ hosts and back.
 -- and what went between them; `ipc ping kernel.echo@<host>` sends to a
 peer's echo. Its gates are net-fuzz's `ipcnet` target (the module's source
 on the host against a world that is the other host, docs/testing.md) and
-`scripts/ipc-test.py` (both arches), three nos on
-`scripts/hub.py`'s LAN: keys pinned both ways, pings small and of a
+`tests/ipc-test.py` (both arches), three nos on
+`tests/hub.py`'s LAN: keys pinned both ways, pings small and of a
 megabyte held to every byte and to their order, bounces of a name nobody
 has and of a full mailbox, the wire lossy and late, a cut seen within 3 s
 on both sides and its monitors told, a host with the wrong key never let

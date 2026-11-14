@@ -17,7 +17,7 @@
 //! as the whole script left them, as GRUB runs it at boot. What
 //! grub-mkconfig writes -- Debian's and Ubuntu's grub.cfg -- is read as GRUB
 //! reads it; what would take more -- another file read for the menu, a
-//! variable with no value here -- is said, not guessed. scripts/hvboot-test.py
+//! variable with no value here -- is said, not guessed. tests/hvboot-test.py
 //! holds this to what GRUB 2.06 itself did with each of its cases.
 //!
 //! It holds no more than what it reads for: the text is lexed where it

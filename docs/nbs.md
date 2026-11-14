@@ -1267,7 +1267,7 @@ only its metadata.
 
 ## Tested
 
-- **`scripts/nbs-fuzz.py`** (host, in CI; [testing.md](testing.md)): `fuzz/nbs`'s
+- **`tests/nbs-fuzz.py`** (host, in CI; [testing.md](testing.md)): `fuzz/nbs`'s
   `meta` target, the state against a model of its own:
   - every command's answer and everything the state shows held to the
     model's, the placement to the model's own; among the commands, cs's
@@ -1462,7 +1462,7 @@ only its metadata.
 - **`fuzz/raft`'s `nbsmeta` target**: the members' part of the state, its
   commands from pools of names and incarnations that meet and from wide ones
   that fill the cluster. There are four scenarios and six mutants.
-- **`scripts/nbs-test.py`** (three nos on `scripts/hub.py`'s LAN, after the
+- **`tests/nbs-test.py`** (three nos on `tests/hub.py`'s LAN, after the
   cluster registry is made among them, and a fourth booted late; every
   nbs-mds with `out_after=10`, the least it takes, and `scrub=1`). It
   covers:
@@ -1536,7 +1536,7 @@ only its metadata.
     history; at the end, a chunk written and found alike, the volumes'
     others held by none, and no finding of now;
   - nothing panicked.
-- **`scripts/hv-nbs-test.py`** (x86-64, manual: a guest kernel and an
+- **`tests/hv-nbs-test.py`** (x86-64, manual: a guest kernel and an
   initrd): Linux guests of hv's on volumes -- an image poured with `hv
   convert` read by a guest on another host; a guest's writes read back past
   its page cache, and by a guest on another host after it stops; a start

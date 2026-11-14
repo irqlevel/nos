@@ -49,14 +49,14 @@ fn crc32(args: &str, out: &mut Output) {
             }
         }
     }
-    /* As the command has always said it: scripts/ext4-test.py reads it */
+    /* As the command has always said it: tests/ext4-test.py reads it */
     let _ = writeln!(out, "{}: crc32 0x{:X}, {} bytes", path, crc, total);
 }
 
 /// Each CRC's check value -- what every implementation of it gives for
 /// "123456789" -- as the kernel's build of the crate computes it, whole and
 /// fed in pieces as the command feeds a file. The crate is held to far more
-/// on the host (scripts/crc-test.py); this holds the kernel's own build of
+/// on the host (tests/crc-test.py); this holds the kernel's own build of
 /// it, both architectures. Run at boot, from `rust_test`; a wrong value
 /// stops the boot.
 pub fn selftest() {

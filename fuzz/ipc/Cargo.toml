@@ -2,7 +2,7 @@
 # over `kcore` and `ffi` as they are, linked into a host program that is the
 # rest of the kernel -- the C++ half the `ffi` crate declares (fuzz/common):
 # its tasks one at a time, its mutexes and events, the lock rules checked.
-# scripts/ipc-fuzz.py builds and runs it.
+# tests/ipc-fuzz.py builds and runs it.
 [package]
 name = "ipc-fuzz"
 version = "0.1.0"

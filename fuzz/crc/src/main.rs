@@ -1,5 +1,5 @@
 //! The tree's CRCs (src/crates/common/crc) on the host, run by
-//! scripts/crc-test.py:
+//! tests/crc-test.py:
 //!
 //! - `all --seed N --cases M`: the known answers -- each CRC's check value
 //!   and RFC 3720's CRC-32C vectors -- then `M` random messages, each CRC

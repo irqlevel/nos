@@ -6,7 +6,7 @@ on both architectures. The short version of the flow is in
 with the ordering constraints that are not obvious from reading it.
 
 Three markers divide the boot, and the smoke tests
-(`scripts/smoke-test.sh`, `scripts/smoke-arm64.sh`) assert all three in
+(`tests/smoke-test.sh`, `tests/smoke-arm64.sh`) assert all three in
 order: **`After test`** (the self-tests passed), **`Preempt is now on`**
 (the scheduler is live and the APs are up), **`boot: complete`** (the shell
 and the network services are running). A `PANIC:` anywhere fails the run.

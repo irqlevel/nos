@@ -1,5 +1,5 @@
 # NBS on the host (plans/nbs.md, "Tested"): its crates as they are, each
-# held to a model of its own (scripts/nbs-fuzz.py): the metadata's state
+# held to a model of its own (tests/nbs-fuzz.py): the metadata's state
 # machine -- the `meta` target (N6) -- the cs's engine over disks that power
 # cuts lose and tear -- `cs` (N7) -- and the messages between NBS's
 # services, `wire` (N7); whole clusters over a simulated channel come with

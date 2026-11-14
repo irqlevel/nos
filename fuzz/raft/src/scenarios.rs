@@ -1,7 +1,7 @@
 //! The known traps, each played out step by step: the schedule that breaks
 //! a Raft missing one rule, run against this one, which must come through
 //! with nothing found. Each is aimed at a rule a mutant takes out
-//! (`scripts/raft-mutants.py`), and the mutant must not come through.
+//! (`fuzz/raft/mutants.py`), and the mutant must not come through.
 
 use raft::{Body, ChangeKind, ConfChange, Entry, EntryKind, MemStorage, Message, NodeId, Role};
 

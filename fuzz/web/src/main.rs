@@ -10,7 +10,7 @@
 //!   back what its writer wrote, to answering a prefix of anything whole
 //!   with "not yet", and to the limits it is given;
 //! - `web-test cert <dir>`: certificates and keys written out for OpenSSL and
-//!   Python's ssl to judge (scripts/web-test.py);
+//!   Python's ssl to judge (tests/web-test.py);
 //! - `web-test descriptor <file>...`: providers' descriptors checked as the
 //!   bus checks them, each for the methods it says it has.
 //!
