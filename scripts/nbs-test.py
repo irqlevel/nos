@@ -56,7 +56,9 @@ what it stores, then a volume's bytes through the chunk servers.
   and its fence back; a host's nbs-cs unloaded -- a request to it bounced
   and said at once -- and loaded again, serving;
 - repair (N9): a volume written, c killed -- the leader's controller has its
-  cs down -- the volume written past it, c booted again: its cs up, joined in
+  cs down; the volume's health through the bus `degraded`, each of its
+  chunks at two replicas, `ok` again once c is back -- the volume written
+  past it, c booted again: its cs up, joined in
   its own place, every chunk at three replicas again, and c's own replica
   holding the write made while it was gone, which its join's copy took;
 - the leader killed: the other two elect one of themselves and commit; the
@@ -985,6 +987,10 @@ def main():
         b.run("insmod /nbs-cs.ko")
         # c's cs, unloaded a while just now, may be joining again yet
         check("every chunk at three replicas", ipct.wait_for(lambda: whole(a), 240, 3), a.run("nbs status"))
+        js = json_of(a.run('mgmt call nbs volume {"name":"rep"}'))
+        check("rep's health through the bus: whole, no chunk short of three",
+              js is not None and js.get("health") == "ok" and js.get("chunks_at_two") == 0
+              and js.get("chunks_copying") == 0, js)
         kill(2)
         others = [sh[0], sh[1]]
         check("c gone: the leader's controller has its cs down",
@@ -997,11 +1003,18 @@ def main():
         check("written past c, to a's and b's replicas", "65536 bytes of 0x32 written" in out, out)
         out = a.run("nbs io close rep")
         check("and closed there", "closed on its replicas" in out, out)
+        js = json_of(a.run('mgmt call nbs volume {"name":"rep"}'))
+        check("rep's health through the bus, c's replicas down: degraded, both its chunks at two replicas",
+              js is not None and js.get("health") == "degraded" and js.get("chunks_at_two") == 2
+              and js.get("chunks_at_one") == 0 and js.get("chunks_unreachable") == 0, js)
         need("c boots again", pt.wait_log(boot(2), "boot: complete", 300) and addressed(2))
         sh[2] = c = ipct.Shell(hub.shell(2))
         need("c back: three voters, one leader", ipct.wait_for(lambda: agreed(sh, 3), 90, 1))
         check("c's cs up, joined in its own place, its copy done: every chunk at three replicas, none being "
               "copied, no cs down", ipct.wait_for(lambda: whole(a), 240, 3), [x.run("nbs status") for x in sh])
+        js = json_of(a.run('mgmt call nbs volume {"name":"rep"}'))
+        check("and rep whole again through the bus", js is not None and js.get("health") == "ok"
+              and js.get("chunks_at_two") == 0 and js.get("chunks_copying") == 0, js)
         out = a.run("nbs io detach rep")
         check("a lets rep go", "rep detached" in out, out)
         out = c.run("nbs io read rep 0 131072")

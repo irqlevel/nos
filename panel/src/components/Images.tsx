@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState } from 'react';
 
 import { JobWatch } from './JobWatch';
 import { MethodForm } from './MethodForm';
+import { Shown } from './ToneDot';
 import { call, startJob } from '@/lib/client';
 import { bytes, Descriptor } from '@/lib/descriptor';
 import { Locale, text, Words } from '@/lib/i18n';
@@ -60,7 +61,16 @@ export function Images({ host, vm, nbs, locale, w }: {
                 <tbody>
                   {rows.map((v) => [
                     <tr key={v.name} className="border-t border-line">
-                      <td className="px-4 py-2 font-mono text-xs text-fg whitespace-nowrap">{v.name}</td>
+                      <td className="px-4 py-2 font-mono text-xs text-fg whitespace-nowrap">
+                        <span className="inline-flex items-center gap-2">
+                          {v.name}
+                          {v.health !== undefined && (
+                            <span className="font-sans text-fg-soft">
+                              <Shown f={nbs?.resources?.volumes?.fields.health} v={v.health} locale={locale} />
+                            </span>
+                          )}
+                        </span>
+                      </td>
                       <td className="px-4 py-2 text-xs text-fg-soft whitespace-nowrap">{v.kind === 'image' ? w.image : w.snapshot}</td>
                       <td className="px-4 py-2 font-mono text-xs text-fg-soft whitespace-nowrap">{bytes(v.size)}</td>
                       <td className="px-4 py-2 font-mono text-xs text-fg-soft whitespace-nowrap">{v.origin ?? '—'}</td>

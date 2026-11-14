@@ -27,6 +27,7 @@ use alloc::sync::Arc;
 use kcore::mgmt::{Call, Kind as MethodKind, Method, Provider, Status, Writer};
 use mgmtwire::{Invalid, Params, Value};
 use nbsmeta::{Kind, Refusal, Volume, VOLUME_MIB_MAX, VOLUME_NAME_MAX};
+use nbsmeta::repair::VolumeHealth;
 use raft::Role;
 
 use crate::store::{self, Failure};
@@ -468,10 +469,49 @@ fn cs(state: &ModState, p: Params<'_>, call: &mut Call) -> Status {
     })
 }
 
-fn volume_json(w: &mut Writer, s: &nbsmeta::State, v: &Volume, hosts: bool) {
+/// A volume's health in a word, the worst of what its chunks say: one with
+/// no active replica, or replicas the scrub found unlike -- `failed`; one
+/// with a replica alone -- `critical`; one with two, or a copy onto a
+/// joiner under way -- `degraded`; else `ok`.
+fn health_word(h: &VolumeHealth, unlike: u64) -> &'static str {
+    if h.by_active[0] != 0 || unlike != 0 {
+        "failed"
+    } else if h.by_active[1] != 0 {
+        "critical"
+    } else if h.by_active[2] != 0 || h.joining != 0 {
+        "degraded"
+    } else {
+        "ok"
+    }
+}
+
+/// The chunks the leader's scrub found a replica of unlike the others' in a
+/// set as it still is -- what `nbs replica bad` has not settled, which takes
+/// the odd member out and so moves the set's version on. Known on the
+/// leader's host alone, where the scrub runs; its newest findings alone.
+fn unlike_now(state: &ModState, s: &nbsmeta::State) -> alloc::vec::Vec<u32> {
+    let found: alloc::vec::Vec<(u32, u32, u32)> =
+        state.scrubbed.with(|x| x.found.iter().map(|&(chunk, set, version, _)| (chunk, set, version)).collect());
+    found.into_iter()
+        .filter(|&(_, set, version)| s.sets().get(set as usize).is_some_and(|now| now.version == version))
+        .map(|(chunk, _, _)| chunk)
+        .collect()
+}
+
+fn volume_json(w: &mut Writer, s: &nbsmeta::State, v: &Volume, hosts: bool, unlike: &[u32]) {
     w.begin_object();
     w.field_str("name", &v.name);
     w.field_uint("volume", u64::from(v.id));
+    /* How it is: its chunks by their replicas -- and those the scrub found
+       unlike, where this host leads */
+    let h = nbsmeta::repair::volume_health(s, v);
+    let odd = if unlike.is_empty() { 0 } else { v.map.iter().filter(|c| unlike.contains(c)).count() as u64 };
+    w.field_str("health", health_word(&h, odd));
+    w.field_uint("chunks_at_two", h.by_active[2]);
+    w.field_uint("chunks_at_one", h.by_active[1]);
+    w.field_uint("chunks_unreachable", h.by_active[0]);
+    w.field_uint("chunks_copying", h.joining);
+    w.field_uint("chunks_unlike", odd);
     /* What it is (N10d): a volume, an image, a snapshot -- and what it was
        made of, by name while that is there */
     w.field_str("kind", match v.kind {
@@ -535,12 +575,13 @@ fn volumes(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status {
     let mut vols: alloc::vec::Vec<&Volume> = v.state.volumes().iter().filter(|x| x.id >= from).collect();
     vols.sort_unstable_by_key(|x| x.id);
     let next = vols.get(limit).map(|x| x.id);
+    let unlike = unlike_now(state, &v.state);
     answer(call, |w| {
         w.begin_object();
         w.key("volumes");
         w.begin_list();
         for vol in vols.iter().take(limit) {
-            volume_json(w, &v.state, vol, false);
+            volume_json(w, &v.state, vol, false, &unlike);
         }
         w.end_list();
         w.key("next");
@@ -575,7 +616,8 @@ fn volume(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status {
     let Some(vol) = v.state.volume(name) else {
         return failed(call, Failure::Refused(Refusal::NoSuchVolume));
     };
-    answer(call, |w| volume_json(w, &v.state, vol, true))
+    let unlike = unlike_now(state, &v.state);
+    answer(call, |w| volume_json(w, &v.state, vol, true, &unlike))
 }
 
 fn volume_create(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status {
