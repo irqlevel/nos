@@ -2038,9 +2038,28 @@ page at a time on the spot. What the
 guest's device offers follows the backend: discard where the device can
 give blocks back -- an NVMe whose controller has Dataset Management (ONCS
 bit 2), which nos now sends -- and not on a read-only disk; no write of
-zeros, which a guest then writes itself; and a device of 4 KiB sectors
-says so (`VIRTIO_BLK_F_BLK_SIZE`), the guest's every request a multiple of
-it, refused otherwise.
+zeros, which a guest then writes itself; and a device of 4 KiB sectors is
+shown in 512-byte sectors still, as every disk hv gives a guest:
+
+**A disk's sectors are 512 bytes, whatever its backend's block.** A
+device of 4 KiB sectors and a volume of NBS's (4 KiB blocks) are shown to
+the guest with 512-byte sectors -- its logical block -- and the backend's
+block as the physical one (`VIRTIO_BLK_F_TOPOLOGY`, its least I/O a
+block): a partition table and filesystems laid out in sectors, as every
+distribution's image is, are read as they were written. Shown its blocks as
+its sectors (`VIRTIO_BLK_F_BLK_SIZE`), as it once was, Ubuntu's kernel
+looked for the GPT of its own image a block in, found no partition and
+stopped in its initramfs, its root's label nowhere. The device serves a
+read of part of a block from the blocks around it; a write of part of one
+reads them, merges the guest's sectors in and writes them whole -- alone:
+it waits for every write out to come back, and no write is handed over
+while it is out, or two of them in one block, or a whole one beside it,
+would write back each other's sectors as they were (`blk::Pad`; hv-fuzz's
+`blk` target holds a sector one write alone wrote to what it wrote, the
+backend serving in any order). A guest of 4 KiB-aligned I/O -- Linux, told
+the physical block -- seldom sends one: the partition tables' reads, a
+superblock's kilobyte, a FAT's sectors. A write of zeros is not offered on
+such a disk, and a discard gives back the whole blocks it covers.
 
 **A device poured from a cloud's image.** `hv convert <image> <device>
 [force]` writes an image's disk onto a device -- qcow2 converted as it
@@ -3034,11 +3053,11 @@ $ hv start v1
   `volume_freeze`, `volume_clone`, `volume_delete`), so hv.ko links nothing
   of nbs-mds's; without it both commands say to `insmod /nbs-mds.ko`, before
   anything is downloaded.
-- A volume is a disk of 4 KiB blocks, which hv's device says to its driver
-  (`F_BLK_SIZE`) and holds every request to; hvboot reads such a disk in
-  whole blocks, the parts at either end of a read through a block's buffer
-  of its own -- its partition tables and superblocks are reads of 512 and
-  1024 bytes.
+- A volume is a disk of 4 KiB blocks, which hv's device shows its guest
+  in 512-byte sectors, the block its physical one: a cloud's image poured
+  onto it boots as off any disk, its partitions where its GPT says ([A
+  disk's sectors](#a-device-as-a-guests-disk)). hvboot reads it
+  in sectors, a part of a block served by the device in whole ones.
 
 The host API's `create` takes an image of NBS's as `image`, in place of
 `url` -- one of the two -- its clone named by `onto` (`nbs:<volume>`) where
@@ -3777,10 +3796,11 @@ the guest. It reads:
   device still held the chain, whose buffers the loader had given to
   something else since, and the next request's slot and index were the
   same, so a late answer was taken for that one's; a disk of blocks larger
-  than a sector (`F_BLK_SIZE`: a volume of NBS's, 4 KiB) read and written
-  in whole blocks, the part of one at either end of a read or a write
-  through a block's buffer -- a write's read first, changed and written
-  whole (grubenv's) (`virtio.rs`);
+  than a sector (`F_BLK_SIZE`: QEMU's of a 4Kn disk -- hv's show 512-byte
+  sectors whatever their backend's block) read and written in whole
+  blocks, the part of one at either end of a read or a write through a
+  block's buffer -- a write's read first, changed and written whole
+  (grubenv's) (`virtio.rs`);
 - each disk's partitions, from its GPT -- header and array each checked by
   their CRC -- or an MBR, an XBOOTLDR partition (a /boot of its own, as
   Ubuntu's) first, and a disk with no table looked at whole; a partition
