@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { useCallback, useEffect, useState } from 'react';
 
+import { DiskIo } from './DiskIo';
 import { MethodForm } from './MethodForm';
 import { ResourceTable } from './ResourceTable';
 import { Terminal } from './Terminal';
@@ -101,6 +102,7 @@ export function VmView({ host, name, d, locale, w }: { host: string; name: strin
 
       {tab === 'disks' && (
         <div className="space-y-4">
+          {d.methods.disk_io && <DiskIo host={host} name={name} locale={locale} w={w} />}
           <DiskList host={host} name={name} locale={locale} d={d} w={w} />
           {(['disk_add', 'disk_attach', 'disk_detach'] as const).map((m) => d.methods[m] && (
             <div key={m} className="rounded-xl border border-line bg-card p-4">

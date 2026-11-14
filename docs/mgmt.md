@@ -168,7 +168,7 @@ and this one would be waiting for the halt.
 | `api` | `modules/mgmt/api` | `status`, `clients` | | |
 | `cluster` | `modules/cluster/cluster` | `status`, `hosts` | `init`, `invite`, `revoke`, `remove`, `maintenance`, `address`, `rekey` | `join` |
 | `nbs` | `modules/storage/nbs-mds` | `status`, `hosts`, `cs`, `devices`, `volumes`, `volume` | `init`, `host_remove`, `device_add`, `device_drain`, `volume_create`, `volume_delete`, `volume_resize`, `volume_snapshot`, `volume_freeze`, `volume_clone` | `host_add`, `host_replace` |
-| `vm` | `modules/hypervisor/hv` (x86-64) | `list`, `get`, `host`, `networks`, `config_get`, `console_read`, `disks`, `forwards`, `devices` | `config_set`, `forward_add`, `forward_del`, `console_write`, `disk_add`, `disk_grow`, `disk_attach`, `disk_detach`, `snapshot` | `start`, `stop`, `restart`, `create`, `clone`, `delete`, `image` |
+| `vm` | `modules/hypervisor/hv` (x86-64) | `list`, `get`, `host`, `networks`, `config_get`, `console_read`, `disks`, `disk_io`, `forwards`, `devices` | `config_set`, `forward_add`, `forward_del`, `console_write`, `disk_add`, `disk_grow`, `disk_attach`, `disk_detach`, `snapshot` | `start`, `stop`, `restart`, `create`, `clone`, `delete`, `image` |
 | `modtest` | `modules/test/modtest`, the loader's self-test | `echo` | | `wait`, `nap` |
 
 A module's provider is unregistered with the module, which waits out its
