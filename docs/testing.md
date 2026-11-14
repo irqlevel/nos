@@ -665,7 +665,10 @@ on each, a `Cluster` name, and `ipc ping` is what goes between them:
   answered whole and in order, the retransmissions counted;
 - the link cut: both hosts lose each other within 3 s and a margin, and a
   ping running across it ends with its monitor's Down; healed, up and
-  talking again;
+  talking again -- and its session, up past the ten seconds the kernel
+  reports a join at, said by neither host as a dialer's join that may never
+  end: a dialer waits its session out without joining its links (every
+  session up said one every five minutes on the demo stand);
 - `c`, whose key is not the one pinned for it, never up -- its handshake
   refused by `a`, which dials it -- and its SYNs to `b`'s port, where it is a
   stranger, dropped and counted with no slot taken;
