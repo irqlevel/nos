@@ -125,7 +125,7 @@ INFO returns the device's size and limits. A READ may ask for up to 16 datagrams
 
 [scripts/netblk.py](https://github.com/irqlevel/nos/blob/master/scripts/netblk.py) is the client, with `info`, `read`, `write`, `flush`, `verify` and `bench`. Its `--window` sets how many requests stay in flight.
 
-[scripts/netblk-test.py](https://github.com/irqlevel/nos/blob/master/scripts/netblk-test.py) boots the kernel in QEMU with NVMe disks, loads the module over the [UDP shell](/docs/udp-shell) and works it from outside. Written data must read back, and the kernel's own `diskread` must see it too. Bad requests must be refused, and `stop` and `rmmod` must leave nothing behind. Since September 19 the test serves a partition as well ([977c2d5](https://github.com/irqlevel/nos/commit/977c2d5)). It runs on x86-64 and arm64, and with `--nic igb` over QEMU's 82576, whose driver is the one the AX41's I210 runs.
+[tests/netblk-test.py](https://github.com/irqlevel/nos/blob/master/tests/netblk-test.py) boots the kernel in QEMU with NVMe disks, loads the module over the [UDP shell](/docs/udp-shell) and works it from outside. Written data must read back, and the kernel's own `diskread` must see it too. Bad requests must be refused, and `stop` and `rmmod` must leave nothing behind. Since September 19 the test serves a partition as well ([977c2d5](https://github.com/irqlevel/nos/commit/977c2d5)). It runs on x86-64 and arm64, and with `--nic igb` over QEMU's 82576, whose driver is the one the AX41's I210 runs.
 
 ## The numbers, and two lost ticks
 

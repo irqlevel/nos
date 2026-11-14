@@ -392,7 +392,7 @@ On a server installed from the system image ([Install nos on a server](/howto/in
 
 ## Next steps
 
-- Let the project's gates do all of this. `nos/scripts/hv-linux-test.py --bzimage linux/arch/x86/boot/bzImage --initrd guest/initrd` boots a guest and runs the long-lived VMs, and `--disk`, `--net`, `--cpus N` and `--attach` cover the rest. `nos/scripts/hv-distro-test.py --iso alpine-virt-3.24.2-x86_64.iso` covers Alpine. Both use the `nos.iso` and the modules built in the tree ([Run the gates](/howto/run-the-gates)).
+- Let the project's gates do all of this. `nos/tests/hv-linux-test.py --bzimage linux/arch/x86/boot/bzImage --initrd guest/initrd` boots a guest and runs the long-lived VMs, and `--disk`, `--net`, `--cpus N` and `--attach` cover the rest. `nos/tests/hv-distro-test.py --iso alpine-virt-3.24.2-x86_64.iso` covers Alpine. Both use the `nos.iso` and the modules built in the tree ([Run the gates](/howto/run-the-gates)).
 - [The hypervisor](/hypervisor), and in the reference: [A Linux guest](/docs/hypervisor#a-linux-guest), [Guests that stay up](/docs/hypervisor#guests-that-stay-up), [More than one CPU](/docs/hypervisor#more-than-one-cpu).
 - [Make a VM from a cloud image](/howto/cloud-vm): Debian's cloud image from its URL, booting its own kernel and kept in a folder across reboots.
 - [Install nos on a server](/howto/install-on-a-server) to run guests on real hardware.

@@ -24,7 +24,11 @@ kernel in it -- no path dependency outside `common/` -- and
 tree to naming something there (`scripts/check-links.py`): the site's links
 to the source on GitHub's master, which a move or a rename would leave a 404
 nobody is told of, and the relative links of `docs/`, `plans/` and the
-top's documents. And it holds every function that crosses a language or a
+top's documents; and every path to a gate, a tool or a fuzzer the tree
+names anywhere -- a CI step, the Makefile, a usage line, a document's
+command, a comment, and a script's `os.path.join` of its own directory --
+which no link check reads and a gate run by hand reaches for only the day
+it is next run. And it holds every function that crosses a language or a
 crate to one signature wherever it is spelled (`scripts/check-ffi.py`): its
 declaration in the `ffi` crate, its `#[no_mangle]` definition in Rust or its
 definition in C++, the C++ declarations of a Rust export and the fuzzers'
@@ -42,7 +46,7 @@ counters, a PCI function, a terminal, a random draw, a module's header)
 field by field, by name and width, where a size assert passed two fields of
 one width swapped. `make smoke`
 builds in Docker and runs the headless boot smoke test
-(`scripts/smoke-test.sh`).
+(`tests/smoke-test.sh`).
 
 ## Four things the Makefile will not tell you
 
@@ -219,7 +223,7 @@ The first report is a panic, with the site:
 which makes every gate a UB check over the code it drives: build with
 `UBSAN=1`, and run the gate on the images as they are (`--skip-build` where it
 builds). A gate that loads a module takes it from the flavour the stamp names
-(`module_path` in `scripts/parttest.py`): a module from `out/$(ARCH)/` loads
+(`module_path` in `tests/parttest.py`): a module from `out/$(ARCH)/` loads
 into the instrumented kernel just as well, and a gate run that way would pass
 without the module's own checks. CI boots it on both architectures, after
 everything else. To collect

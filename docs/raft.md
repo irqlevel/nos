@@ -368,7 +368,7 @@ commits that entry, elects itself and commits on its own -- and two mutants
 
 ## Tested
 
-`scripts/raft-test.py` ([Tests and gates](testing.md)) builds `fuzz/raft`
+`tests/raft-test.py` ([Tests and gates](testing.md)) builds `fuzz/raft`
 and holds the crate to known answers, the known traps played out, groups
 fuzzed over a network that fails in every way, checked at every step against
 Raft's properties, a member fed messages no correct member sends, the log

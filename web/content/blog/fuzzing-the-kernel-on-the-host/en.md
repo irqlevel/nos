@@ -113,9 +113,9 @@ Over many exits (an exit is the moment the CPU leaves the guest and hands contro
 Run with no arguments, each fuzzer feeds in a fixed number of inputs starting from seed 1, the same inputs every time. That makes it a gate, a check that every change has to pass. CI runs all four on every push: hv and fs in its x86-64 job, net and C++ in the arm64 one. Each takes from half a minute to a couple of minutes. A campaign, a longer hunt for new bugs, is the same program with a seed of its own:
 
 ```sh
-python3 scripts/hv-fuzz.py                          # the gate
-python3 scripts/hv-fuzz.py --seed 7 --seconds 300   # five minutes a target
-python3 scripts/hv-fuzz.py --replay platform out/hv-fuzz/findings/X.hex
+python3 tests/hv-fuzz.py                          # the gate
+python3 tests/hv-fuzz.py --seed 7 --seconds 300   # five minutes a target
+python3 tests/hv-fuzz.py --replay platform out/hv-fuzz/findings/X.hex
 ```
 
 Every finding comes with the seed and iteration that reproduce it, and the input is saved for `--replay`. The exit code is 0 when nothing was found, 1 for a finding and 3 for a hang. We measure how deep the inputs go instead of hoping. `HV_FUZZ_STATS=1` reports how the whole-machine runs ended, and on its first day the hv gate covered 94% of the code regions in the sources it compiles, by clang's coverage.

@@ -5,7 +5,7 @@
 # kernel's system provider, over `kcore` and `ffi` as they are -- linked into
 # a host program that is the rest of the kernel: the C++ half the `ffi` crate
 # declares (locks, tasks, timers, soft IRQs, the clock, the command table), a
-# NIC, and the network around the machine. scripts/net-fuzz.py builds and
+# NIC, and the network around the machine. tests/net-fuzz.py builds and
 # runs it.
 [package]
 name = "net-fuzz"

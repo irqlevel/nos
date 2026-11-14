@@ -92,7 +92,7 @@ needs a replicated state later.
 
 ## Tested
 
-`fuzz/raft` (host, in CI, through `scripts/raft-test.py`). Fixed inputs are
+`fuzz/raft` (host, in CI, through `tests/raft-test.py`). Fixed inputs are
 the gate; `--seed N --seconds S` runs a campaign.
 
 - **`node`**: three to seven members in one process over a simulated network

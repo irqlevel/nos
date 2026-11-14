@@ -3,7 +3,7 @@
 # decoder, page walker and emulator, the Linux loader and ACPI tables, and
 # the run loop that dispatches a guest's exits (hypervisor/hv/src/run.rs), and the
 # guests' DHCP server -- compiled from their own sources over stand-ins for
-# the kernel and the CPU (scripts/hv-fuzz.py builds and runs it). Nothing
+# the kernel and the CPU (tests/hv-fuzz.py builds and runs it). Nothing
 # but netwire, conf and bzimage, paths of their own, so it builds offline.
 [package]
 name = "hv-fuzz"

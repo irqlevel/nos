@@ -70,7 +70,7 @@ The driver also walks hubs up to four tiers deep, reaching each device by its ro
 
 ## A test that types
 
-Three weeks later, `drivers/usb/` was 3,606 lines of C++ that no test touched: no boot smoke test attaches a USB controller. Yet on the laptop this driver is the only way in, so before the port we wrote its gate, the test the port would have to pass ([33c24ab](https://github.com/irqlevel/nos/commit/33c24ab)). [`scripts/usb-test.py`](https://github.com/irqlevel/nos/blob/master/scripts/usb-test.py) boots the ordinary ISO with an emulated xHCI controller, a keyboard on a root port, a hub with a second keyboard behind it, and a mouse:
+Three weeks later, `drivers/usb/` was 3,606 lines of C++ that no test touched: no boot smoke test attaches a USB controller. Yet on the laptop this driver is the only way in, so before the port we wrote its gate, the test the port would have to pass ([33c24ab](https://github.com/irqlevel/nos/commit/33c24ab)). [`tests/usb-test.py`](https://github.com/irqlevel/nos/blob/master/tests/usb-test.py) boots the ordinary ISO with an emulated xHCI controller, a keyboard on a root port, a hub with a second keyboard behind it, and a mouse:
 
 ```python
 argv = ["qemu-system-x86_64", "-m", "1024", "-smp", "2", "-cdrom", iso,
