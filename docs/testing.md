@@ -3520,7 +3520,9 @@ the writer writes the chunk past its deadline, and that a write starved of
 memory past its deadline, reaching no replica, has none (the
 `starved_past_deadline` end); never more of a session's
 places closing at once than its window -- two, as the fuzzer builds
-nbsclient (`small_windows`) -- and a close asked alone of a few places done
+nbsclient (`small_windows`) -- nor more bytes of its reads and writes out,
+more than one out, than its window of them -- two blocks there
+(`WINDOW_BYTES`): past it is what ipcnet's queue bounces -- and a close asked alone of a few places done
 in a moment, every place closed on every active replica (the
 `close_all_written` end); the leader's look at a cs before it is taken out
 the fuzzer's, mostly that it answers -- always once a host is lost for good
@@ -3726,7 +3728,7 @@ little and now and then past a silence.
     longer.
 
 `--mutants` runs `tests/fuzz/nbs/mutants.py`, which takes out one rule at a time.
-Each of its two hundred and seventy-one must fail the gate -- but the three
+Each of its two hundred and seventy-four must fail the gate -- but the three
 `KNOWN_GAPS` names, said as known gaps (below) -- run as
 `nbs-fuzz gate --first`, stopped at the first target that fails: the gate's
 verdict, sooner.
