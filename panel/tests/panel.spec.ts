@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { expect, Page, test } from '@playwright/test';
 
-import { MOCK_B, PASSWORD, STATE_B } from '../playwright.config';
+import { MOCK_B, PANEL_VERSION, PASSWORD, STATE_B } from '../playwright.config';
 import { addressFor, copyable, ipOfUrl, isPublic } from '../src/lib/fills';
 
 async function login(page: Page, locale = 'en') {
@@ -67,6 +67,18 @@ test('the dashboard: the host online, its numbers moving', async ({ page }) => {
   await expect(page.getByText(/^\d+(\.\d)? %$/).first()).toBeVisible({ timeout: 15_000 });
   await expect(page.getByTestId('log')).toContainText('boot: complete', { timeout: 15_000 });
   expect(host).toMatch(/^[0-9a-f-]{36}$/);
+});
+
+test('the panel\'s version in its footer, said to a session alone; the nos each host runs, on its page and among the hosts', async ({ page }) => {
+  await page.goto('/en/login');
+  await expect(page.getByTestId('panel-version')).toHaveCount(0);
+  await login(page);
+  await expect(page.getByTestId('panel-version')).toContainText(PANEL_VERSION);
+  /* The host's system provider's info: its version, the commit, the architecture */
+  await expect(page.getByTestId('host-nos')).toHaveText('nos 0.0.28-mock · rev-mock-a · x86_64', { timeout: 15_000 });
+  await page.goto('/ru/hosts');
+  await expect(page.getByTestId('panel-version')).toContainText(PANEL_VERSION);
+  await expect(page.getByTestId('host-nos').first()).toHaveText('nos 0.0.28-mock · rev-mock-a · x86_64');
 });
 
 test('a provider\'s page is made of its descriptor, in both languages', async ({ page }) => {

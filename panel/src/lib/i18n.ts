@@ -112,6 +112,8 @@ const en = {
   copy: 'Copy',
   copied: 'Copied',
   copyFailed: 'Not copied: select it and copy',
+  nosVersion: 'The nos this host runs: its version, the commit it was built of, the architecture',
+  panelVersion: 'The panel\'s version',
 } as const;
 
 export type Words = { [K in keyof typeof en]: string };
@@ -218,6 +220,8 @@ const ru: Words = {
   copy: 'Копировать',
   copied: 'Скопировано',
   copyFailed: 'Не скопировалось: выделите и скопируйте',
+  nosVersion: 'nos на этом хосте: версия, коммит сборки, архитектура',
+  panelVersion: 'Версия панели',
 };
 
 const dictionaries: Record<Locale, Words> = { en, ru };

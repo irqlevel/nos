@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from 'react';
 
 import { Chart } from './Chart';
 import { bytes } from '@/lib/descriptor';
+import type { NosInfo } from '@/lib/hub';
 import type { Words } from '@/lib/i18n';
 
 interface Sample { ms: number; cpu: number | null; mem: number | null; rx: number | null; tx: number | null }
@@ -13,6 +14,12 @@ interface Job { id: number; provider: string; method: string; state: string; sta
 /** What the dashboard keeps: an hour, a second at a time. */
 const KEEP = 3600;
 
+/** The nos a host runs, as a line: its version, the commit it was built of
+ * and the machine's architecture. */
+export function nosText(n: NosInfo): string {
+  return ['nos ' + n.version, n.revision, n.arch].filter(Boolean).join(' · ');
+}
+
 export function Dashboard({ locale, host, name, w }: { locale: string; host: string; name: string; w: Words }) {
   const [samples, setSamples] = useState<Sample[]>([]);
   const [online, setOnline] = useState<boolean | null>(null);
@@ -21,6 +28,7 @@ export function Dashboard({ locale, host, name, w }: { locale: string; host: str
   const [total, setTotal] = useState<number | null>(null);
   const [log, setLog] = useState<LogLine[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [nos, setNos] = useState<NosInfo | null>(null);
 
   useEffect(() => {
     let gone = false;
@@ -36,6 +44,8 @@ export function Dashboard({ locale, host, name, w }: { locale: string; host: str
       if (e.type === 'state') {
         setOnline(e.online);
         setWhy(e.why || '');
+      } else if (e.type === 'nos') {
+        setNos({ version: e.version, revision: e.revision, arch: e.arch });
       } else if (e.type === 'metrics') {
         setOnline(true);
         setCpus(e.cpus);
@@ -65,6 +75,11 @@ export function Dashboard({ locale, host, name, w }: { locale: string; host: str
         <span className={`text-sm ${online ? 'text-ok' : 'text-bad'}`} data-testid="host-state">
           {online === null ? '…' : online ? w.online : `${w.offline}${why ? ' -- ' + why : ''}`}
         </span>
+        {nos && (
+          <span className="font-mono text-xs text-muted" title={w.nosVersion} data-testid="host-nos">
+            {nosText(nos)}
+          </span>
+        )}
       </div>
 
       <div className="grid gap-4 md:grid-cols-3">
