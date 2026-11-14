@@ -1,6 +1,7 @@
 'use client';
 
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useState } from 'react';
 import type { Words } from '@/lib/i18n';
 
@@ -17,6 +18,10 @@ export function HostsManager({ locale, w }: { locale: string; w: Words }) {
   const [url, setUrl] = useState('');
   const [pin, setPin] = useState('');
   const [error, setError] = useState('');
+  /* The header's picker is the layout's, which a page's own fetches never
+   * draw again: refreshed as the hosts change, or it listed the hosts of the
+   * first page loaded until the next reload */
+  const router = useRouter();
 
   const load = useCallback(async () => {
     const r = await fetch('/api/hosts');
@@ -42,6 +47,7 @@ export function HostsManager({ locale, w }: { locale: string; w: Words }) {
       setPin('');
       setError('');
       void load();
+      router.refresh();
     } else {
       setError((await r.json()).error?.message ?? String(r.status));
     }
@@ -50,6 +56,7 @@ export function HostsManager({ locale, w }: { locale: string; w: Words }) {
   async function remove(id: string) {
     await fetch('/api/hosts?id=' + encodeURIComponent(id), { method: 'DELETE' });
     void load();
+    router.refresh();
   }
 
   const input = 'mt-1 w-full rounded-lg border border-line bg-bg px-3 py-2 text-fg';

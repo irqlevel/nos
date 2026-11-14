@@ -341,6 +341,14 @@ test('a cluster: a second host added by its address and its key, the panel let i
   await form.getByRole('button', { name: 'Add a host' }).click();
   const b = page.getByTestId('host-nos-b');
   await expect(b).toContainText('online', { timeout: 20_000 });
+  /* The header's picker has it at once, the page not loaded again -- and
+   * takes the panel to it */
+  const picker = page.getByRole('banner').getByRole('combobox', { name: 'Hosts' });
+  await expect(picker.locator('option', { hasText: 'nos-b' })).toHaveCount(1);
+  await picker.selectOption({ label: 'nos-b' });
+  await expect(page).toHaveURL(/\/en\/h\/[0-9a-f-]{36}$/);
+  await expect(page.getByTestId('host-state')).toHaveText('online', { timeout: 15_000 });
+  await page.goto('/en/hosts');
 
   /* Its own pages, its own numbers: the panel reaches it with its key --
    * from cold, within what the host lets in at once */
