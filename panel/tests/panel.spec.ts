@@ -559,6 +559,77 @@ test('a VM of an image of NBS\'s: its disk a clone, named as asked; one onto a v
   await expect(page.getByTestId('job')).toContainText('nbs:web-root: 3584 MiB poured');
 });
 
+test('images and snapshots: an image of a URL as a job, a VM of it from its row, its snapshot from the VM\'s page and a VM of that', async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/images`);
+  await expect(page.getByRole('heading', { name: 'Images', exact: true })).toBeVisible();
+  const form = page.getByTestId('new-image');
+  /* A name NBS would refuse, refused before anything is fetched */
+  await form.locator('input[name=name]').fill('Not One');
+  await form.getByRole('button', { name: 'New image' }).click();
+  await expect(form.getByRole('alert')).toContainText('lowercase');
+  await form.locator('input[name=name]').fill('pw-img');
+  await form.getByRole('button', { name: 'New image' }).click();
+  await expect(form.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+  await expect(form.getByTestId('job')).toContainText('nbs:pw-img is an image now');
+  const images = page.getByTestId('images');
+  await expect(images.getByRole('row', { name: /pw-img/ })).toContainText('image');
+
+  /* A VM of it from its row: the image picked already */
+  await images.getByRole('row', { name: /pw-img/ }).getByRole('link', { name: 'Create a VM' }).click();
+  await expect(page.getByTestId('source').getByLabel(/An image of NBS/)).toBeChecked();
+  await expect(page.locator('select[name=image]')).toHaveValue('pw-img');
+  await page.fill('input[name=name]', 'im1');
+  await page.getByRole('button', { name: 'Create' }).click();
+  await expect(page.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+  await expect(page.getByTestId('job')).toContainText('nbs:im1 cloned from nbs:pw-img');
+
+  /* Its snapshot, from its page: listed there, a VM made of it from its row */
+  await page.goto(`/en/h/${host}/vms/im1`);
+  await expect(page.getByTestId('vm-snapshots')).toContainText('Nothing yet');
+  await page.getByRole('button', { name: 'Snapshot' }).click();
+  const snap = page.getByTestId('form-vm-snapshot');
+  await snap.locator('input[name=snapshot]').fill('im1-s1');
+  await snap.getByRole('button', { name: 'Snapshot' }).click();
+  await expect(snap.getByTestId('answer')).toContainText('"snapshot": "im1-s1"');
+  const snaps = page.getByTestId('vm-snapshots');
+  await expect(snaps.getByRole('row', { name: /im1-s1/ })).toBeVisible();
+  /* Taken again by the name: refused, the name NBS's already */
+  await snap.getByRole('button', { name: 'Snapshot' }).click();
+  await expect(snap.getByRole('alert')).toContainText('is a snapshot already');
+  await snaps.getByRole('row', { name: /im1-s1/ }).getByRole('link', { name: 'Create a VM' }).click();
+  await expect(page.locator('select[name=image]')).toHaveValue('im1-s1');
+  await page.fill('input[name=name]', 'im2');
+  await page.getByRole('button', { name: 'Create' }).click();
+  await expect(page.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+  await expect(page.getByTestId('job')).toContainText('nbs:im2 cloned from nbs:im1-s1');
+
+  /* A VM of a file has no snapshot: said, though what it is said of -- the
+   * VM's name -- is no field of the form */
+  await page.goto(`/en/h/${host}/vms/web`);
+  await page.getByRole('button', { name: 'Snapshot' }).click();
+  const fileSnap = page.getByTestId('form-vm-snapshot');
+  await fileSnap.locator('input[name=snapshot]').fill('web-s1');
+  await fileSnap.getByRole('button', { name: 'Snapshot' }).click();
+  await expect(fileSnap.getByRole('alert')).toContainText("no volume of NBS's");
+
+  /* The images page has the snapshot too; the image deleted only once its
+   * name is typed again */
+  await page.goto(`/en/h/${host}/images`);
+  await expect(images.getByRole('row', { name: /im1-s1/ })).toContainText('snapshot');
+  await images.getByRole('row', { name: /pw-img/ }).getByRole('button', { name: 'Delete' }).click();
+  const del = page.getByTestId('form-nbs-volume_delete');
+  await del.getByRole('button', { name: 'Delete' }).click();
+  const confirm = del.getByRole('button', { name: 'Confirm' });
+  await expect(confirm).toBeDisabled();
+  await del.getByLabel('Type it here').fill('pw-img');
+  await confirm.click();
+  await expect(images).not.toContainText('pw-img');
+  await page.goto(`/ru/h/${host}/images`);
+  await expect(page.getByRole('heading', { name: 'Образы', exact: true })).toBeVisible();
+  await expect(page.getByTestId('images').getByRole('row', { name: /im1-s1/ })).toContainText('снимок');
+});
+
 test('the theme switches, and the language', async ({ page }) => {
   const host = await login(page);
   const dark = await page.evaluate(() => document.documentElement.classList.contains('dark'));

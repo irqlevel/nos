@@ -12,12 +12,16 @@
 //! - actions: `config_set` (a vm.toml checked as a start checks it, the old
 //!   one kept as vm.toml.prev), `forward_add` and `forward_del` (kept in its
 //!   vm.toml, and made or taken away now if it runs), `console_write`,
-//!   `disk_add`, `disk_grow`;
-//! - jobs: `start`, `stop`, `restart`, `create` (a cloud's image by its URL:
-//!   the user-data of the caller's own if given -- a job, which only an
+//!   `disk_add`, `disk_grow`, `snapshot` (of a disk of the VM's that is a
+//!   volume of NBS's, as `nbs volume snapshot` takes one: a running guest's
+//!   session paused for it);
+//! - jobs: `start`, `stop`, `restart`, `create` (a cloud's image by its URL,
+//!   or an image of NBS's -- an image or a snapshot -- by its name: the
+//!   user-data of the caller's own if given -- a job, which only an
 //!   admin starts -- a port of the switch of its own, nos's ports forwarded,
 //!   `protected`, and started once made, as the call asks), `clone`,
-//!   `delete`. Each says as it goes what the command
+//!   `delete`, `image` (an image of NBS's made of a URL's or a file's, as
+//!   `hv image` makes one). Each says as it goes what the command
 //!   would, its progress and whether it is stopped; a cancel -- or the
 //!   module's going -- stops a download, a conversion and a copy where they
 //!   are, what they made taken away. A stop's cancel stops its wait for the
@@ -48,7 +52,7 @@ use crate::State;
 
 const DESCRIPTOR: &str = include_str!("vm.descriptor.json");
 
-const METHODS: [Method; 23] = [
+const METHODS: [Method; 25] = [
     Method { name: "list", kind: Kind::Read },
     Method { name: "get", kind: Kind::Read },
     Method { name: "host", kind: Kind::Read },
@@ -66,12 +70,14 @@ const METHODS: [Method; 23] = [
     Method { name: "disk_grow", kind: Kind::Action },
     Method { name: "disk_attach", kind: Kind::Action },
     Method { name: "disk_detach", kind: Kind::Action },
+    Method { name: "snapshot", kind: Kind::Action },
     Method { name: "start", kind: Kind::Job },
     Method { name: "stop", kind: Kind::Job },
     Method { name: "restart", kind: Kind::Job },
     Method { name: "create", kind: Kind::Job },
     Method { name: "clone", kind: Kind::Job },
     Method { name: "delete", kind: Kind::Job },
+    Method { name: "image", kind: Kind::Job },
 ];
 
 /// What a page of the console is, by default and at most.
@@ -231,12 +237,14 @@ fn provide(state: &State, method: &str, params: &[u8], call: &mut Call) -> Statu
         "disk_grow" => disk_grow(state, p, call),
         "disk_attach" => disk_attach(state, p, call),
         "disk_detach" => disk_detach(state, p, call),
+        "snapshot" => snapshot(state, p, call),
         "start" => start(state, p, call),
         "stop" => stop(state, p, call),
         "restart" => restart(state, p, call),
         "create" => create(state, p, call),
         "clone" => clone(state, p, call),
         "delete" => delete(state, p, call),
+        "image" => image(state, p, call),
         _ => Status::NoMethod,
     }
 }
@@ -1286,8 +1294,10 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
         }
         (Ok(Some(u)), Ok(None)) if cloud::is_url(u) => cloud::Source::Url(u),
         (Ok(Some(_)), Ok(None)) => return refuse(call, Status::Invalid, "is an http:// or https:// URL", Some("url")),
-        (Ok(None), Ok(Some(""))) => return refuse(call, Status::Invalid, "is an image's name", Some("image")),
-        (Ok(None), Ok(Some(i))) => cloud::Source::Image(i),
+        (Ok(None), Ok(Some(i))) => match i.strip_prefix("nbs:").unwrap_or(i) {
+            "" => return refuse(call, Status::Invalid, "is an image's name", Some("image")),
+            i => cloud::Source::Image(i),
+        },
     };
     let fields = (|| -> Result<_, Invalid> {
         let size = p.opt_uint("size_bytes", 1, u64::MAX)?;
@@ -1379,6 +1389,102 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
             w.end_object();
         }),
         (Err(e), _) => failed(call, &e),
+    }
+}
+
+/// What a volume's name may be, said where one is refused.
+const VOLUME_NAME: &str = "is a volume's name: lowercase letters, digits, . _ and -, a letter or a digit first, up to 63";
+
+/// `snapshot`: a snapshot named `snapshot` of a disk of VM `name`'s that is
+/// a volume of NBS's -- its first disk, or `disk`, one of its `nbs:` disks
+/// -- taken as `nbs volume snapshot` takes one: where the VM runs here, its
+/// guest's session paused for it, the disk as a power cut would leave it;
+/// of one that runs on another host, refused, naming that host. A VM of a
+/// file or a device has no snapshot: a clone copies it whole.
+fn snapshot(state: &State, mut p: Params, call: &mut Call) -> Status {
+    let name = match name_param(&mut p, "name", call) {
+        Ok(n) => n,
+        Err(s) => return s,
+    };
+    let (snap, disk) = match (p.str("snapshot", IMAGE_MAX), p.opt_str("disk", DEVICE_MAX)) {
+        (Ok(s), Ok(d)) => (s, d),
+        (Err(e), _) | (_, Err(e)) => return invalid(call, e),
+    };
+    if let Err(s) = finish(p, call) {
+        return s;
+    }
+    if !nbsmeta::valid_volume(snap) {
+        return refuse(call, Status::Invalid, VOLUME_NAME, Some("snapshot"));
+    }
+    let folder = match folder(state, name, call) {
+        Ok(f) => f,
+        Err(s) => return s,
+    };
+    let options = match store::load(&folder).and_then(|c| store::options(&folder, &c)) {
+        Ok(o) => o,
+        Err(e) => return refuse(call, Status::Failed, &e, None),
+    };
+    let (word, field) = match disk {
+        Some(d) => match options.disks.iter().find(|(w, _)| w.as_str() == d) {
+            Some((w, _)) => (w.as_str(), "disk"),
+            None => return refuse(call, Status::NotFound, &alloc::format!("is none of {}'s disks", name), Some("disk")),
+        },
+        None => match options.disks.first() {
+            Some((w, _)) => (w.as_str(), "name"),
+            None => return refuse(call, Status::NotFound, &alloc::format!("{} has no disk", name), Some("name")),
+        },
+    };
+    let crate::devices::Source::Volume(volume) = crate::devices::source(word) else {
+        return refuse(call, Status::Conflict, &alloc::format!("{}'s disk {} is no volume of NBS's, and a snapshot is of \
+                                                              one -- a clone of the vm copies it whole", name, word),
+                      Some(field));
+    };
+    match crate::nbs::snapshot(volume, snap) {
+        Ok(id) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("vm", name);
+            w.field_str("volume", volume);
+            w.field_str("snapshot", snap);
+            w.field_uint("number", u64::from(id));
+            w.end_object();
+        }),
+        Err(e) => failed(call, &e),
+    }
+}
+
+/// `image`: an image of NBS's named `name` made of `from` -- a cloud's
+/// image, qcow2 or raw, by its http(s):// URL, downloaded first, or a file
+/// of nos's by its path -- as `hv image` makes one: a volume of its disk's
+/// size, the image poured onto it, frozen; what fails leaves nothing. VMs
+/// are made of clones of it (`create`'s `image`).
+fn image(state: &State, mut p: Params, call: &mut Call) -> Status {
+    let (name, from) = match (p.str("name", IMAGE_MAX), p.str("from", URL_MAX)) {
+        (Ok(n), Ok(f)) => (n, f),
+        (Err(e), _) | (_, Err(e)) => return invalid(call, e),
+    };
+    if let Err(s) = finish(p, call) {
+        return s;
+    }
+    let name = name.strip_prefix("nbs:").unwrap_or(name);
+    if !nbsmeta::valid_volume(name) {
+        return refuse(call, Status::Invalid, VOLUME_NAME, Some("name"));
+    }
+    if !cloud::is_url(from) && !from.starts_with('/') {
+        return refuse(call, Status::Invalid, "is an http:// or https:// URL, or a file of nos's by its path",
+                      Some("from"));
+    }
+    let made = {
+        let mut job = Job::new(call, &state.unloading);
+        crate::image::make_image(&state.vms_root, &state.vms, name, from, &mut job)
+    };
+    match made {
+        Ok(size) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("image", name);
+            w.field_uint("size_bytes", size);
+            w.end_object();
+        }),
+        Err(e) => failed(call, &e),
     }
 }
 

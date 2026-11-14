@@ -499,6 +499,12 @@ pub fn create(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options
      * poured onto, by its id, where it may be given -- or the volume; or an
      * image's clone (N10d3), of the VM's name unless onto=nbs: names it. */
     let onto = match (recipe.source, recipe.onto) {
+        /* The VM's name is its clone's: a name with a capital in it is a VM's
+         * and no volume's, refused before anything is made */
+        (Source::Image(_), None) if !nbsmeta::valid_volume(name) => {
+            return Err(alloc::format!("{} is no volume's name, which its clone would have: onto=nbs:<volume> names \
+                                       it", name));
+        }
         (Source::Image(_), None) => Some((Onto::Clone(name), alloc::format!("nbs:{}", name))),
         (Source::Image(_), Some(word)) => match crate::devices::source(word) {
             crate::devices::Source::Volume(v) => Some((Onto::Clone(v), String::from(word))),

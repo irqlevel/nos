@@ -618,6 +618,39 @@ const actions = {
     }
     return nbsShare(from, need(p, 'name'), 'volume', host);
   },
+  /* A snapshot of a VM's disk that is a volume of NBS's -- its first, or
+   * `disk` -- as the vm provider takes one; a VM of a file refused. */
+  'vm.snapshot': (p) => {
+    const v = vmNamed(p);
+    const snap = need(p, 'snapshot');
+    if (!NBS_NAME.test(snap)) {
+      throw new Refused('invalid', "is a volume's name: lowercase letters, digits, . _ and -, a letter or a digit "
+        + 'first, up to 63', 'snapshot');
+    }
+    const field = p.disk !== undefined ? 'disk' : 'name';
+    const d = p.disk !== undefined ? v.disks.find((x) => x.file === p.disk) : v.disks[0];
+    if (!d) {
+      throw new Refused('not_found', p.disk !== undefined ? "is none of " + v.name + "'s disks" : v.name + ' has no disk',
+        field);
+    }
+    if (!String(d.file).startsWith('nbs:')) {
+      throw new Refused('conflict', v.name + "'s disk " + diskPath(v, d) + " is no volume of NBS's, and a snapshot is "
+        + 'of one -- a clone of the vm copies it whole', field);
+    }
+    nbsMember();
+    const volume = String(d.file).slice('nbs:'.length);
+    const from = nbs.volumes.find((x) => x.name === volume);
+    if (!from) {
+      throw new Refused('failed', 'nbs:' + snap + ' of nbs:' + volume + ': no volume of that name');
+    }
+    const had = nbs.volumes.find((x) => x.name === snap);
+    if (had) {
+      throw new Refused('failed', 'nbs:' + snap + ' of nbs:' + volume + ': ' + snap + ' is a ' + (had.kind || 'volume')
+        + ' already, made before: a name is not taken again -- delete it first');
+    }
+    const made = nbsShare(from, snap, 'snapshot', from.host);
+    return { vm: v.name, volume, snapshot: snap, number: made.volume };
+  },
   'nbs.init': (p) => {
     if (nbs.member) {
       throw new Refused('conflict', 'this host is a member of an NBS cluster already', 'name');
@@ -896,6 +929,36 @@ const guarded = (v, p) => {
 };
 
 const jobMethods = {
+  /* An image of NBS's made of a URL's image or a file's, as `hv image`
+   * makes one: downloaded, a volume of its disk's size, poured, frozen. */
+  'vm.image': (p) => {
+    const given = String(need(p, 'name'));
+    const name = given.startsWith('nbs:') ? given.slice('nbs:'.length) : given;
+    if (!NBS_NAME.test(name)) {
+      throw new Refused('invalid', "is a volume's name: lowercase letters, digits, . _ and -, a letter or a digit "
+        + 'first, up to 63', 'name');
+    }
+    const from = String(need(p, 'from'));
+    const url = /^https?:\/\//.test(from);
+    if (!url && !from.startsWith('/')) {
+      throw new Refused('invalid', "is an http:// or https:// URL, or a file of nos's by its path", 'from');
+    }
+    nbsMember();
+    if (nbs.volumes.some((x) => x.name === name)) {
+      throw new Refused('failed', 'nbs:' + name + ' is there already');
+    }
+    const steps = [...(url ? ['download: 120 MiB of 590 MiB, 20%', 'download: 590 MiB of 590 MiB, 100%'] : []),
+      'hv: ' + (url ? '/vms/.image-' + name : from) + ': qcow2, a disk of 3584 MiB -- onto nbs:' + name
+        + ', 3584 MiB, fresh: its zeros left out',
+      'hv: nbs:' + name + ' is an image now, 3584 MiB, read-only for good -- hv create <vm> image=nbs:' + name
+        + ' makes a vm of a clone of it'];
+    return job('vm', 'image', steps.length, (i) => steps[i], () => {
+      nbs.volumes.push({ name, volume: nbs.next, kind: 'image', origin: null, size_mib: 3584, host: nbs.hosts[0].host,
+        writer: null, generation: 0, readers: [] });
+      nbs.next += 1;
+      return { image: name, size_bytes: 3584 * MIB };
+    });
+  },
   'nbs.host_add': (p) => {
     nbsMember();
     const host = nbsHostNamed(p);
