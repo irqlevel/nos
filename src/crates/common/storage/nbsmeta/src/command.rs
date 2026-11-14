@@ -736,7 +736,9 @@ pub enum Answer {
     /// that was gone.
     Volume { id: u32 },
     /// An attach's generation; a detach's, or 0 where it let go of nothing --
-    /// and 0 for a reader's either way. `first`: the attach is the first for
+    /// and 0 for a reader's. A reader's attach: the generation a writer
+    /// would be given next, which its reads carry (`Op::Read`'s `as_of`),
+    /// so that a writer attached after it fences them. `first`: the attach is the first for
     /// writing of a volume made empty -- no clone -- so that everything of it
     /// reads as zeros, which a pour leaves out.
     Attached { generation: u64, first: bool },

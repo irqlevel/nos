@@ -3721,7 +3721,7 @@ little and now and then past a silence.
     longer.
 
 `--mutants` runs `fuzz/nbs/mutants.py`, which takes out one rule at a time.
-Each of its two hundred and fifty-eight must fail the gate -- but the five
+Each of its two hundred and seventy-one must fail the gate -- but the three
 `KNOWN_GAPS` names, said as known gaps (below) -- run as
 `nbs-fuzz gate --first`, stopped at the first target that fails: the gate's
 verdict, sooner.
@@ -3935,6 +3935,36 @@ ten thousand each, and are `KNOWN_GAPS` in `fuzz/nbs/mutants.py` --
 `anew_mends_writes_out`, `client_close_not_here`, `client_detached_deaf`,
 `client_stop_waits`, `mend_in_place` -- said as such, and said as caught
 once a seed or a scenario holds one again.
+
+The review's questions' round added thirteen more, with what catches them:
+of the cs's engine, a join's copy keeping open what its source held open,
+the source's sums saying the generation it holds a chunk open at, the
+joiner keeping no mark its writer has closed there since the join began, a
+close by a view older than the chunk refused, a joiner taking no close of
+an epoch before its join, and a close of a chunk not held in a set not
+joined vouched for first -- the cluster target's `marked_where_apart` (a
+chunk whose active replicas are apart is open where the next reconcile
+asks, held each time a set changes), the pause's check, and the cs
+target's `closes_held_to_epoch`; of the controller's, a join that stood
+past its time given up (the meta target holds every plan to it); of the
+wire's, a reader's read refused once a writer attached after it fenced
+the volume (the cs target's `reader_fenced`); and of the client's five, a
+close out sent to the replicas a changed view has, a close to be sent
+again after the map read sent no more once its place is written again, a
+close settled by a view that changed -- refused as no replica's, or
+waiting on a cs taken out -- not taken for closed until the map read, and
+a close of the driver's waiting on a place a write took as it began closed
+once the write is done. Those last three the new invariants found the good
+tree failing at, past the range (20346, 18153, 25047, 17081): the end now
+holds what was asked of a writer right before its stop, every host up, to
+be done, and a session over to send nothing (`quiet_once_over`). Their
+fixes moved the course again: `client_copy_stale_view`,
+`client_flush_serving` and `relayed_joins` were found again at 61339,
+60065 and 60834; `client_close_not_here` and `client_stop_waits` are
+caught, and three known gaps are left -- `anew_mends_writes_out`,
+`client_detached_deaf`, `mend_in_place` -- none found at a seed of fifteen
+thousand more. A run of the 271 on this tree: 268 caught, the three said
+as gaps.
 
 `--seed N --seconds S` runs a campaign, of the target `--target` names
 (`meta` unless it names another). The `tail` target is the `cluster` target
