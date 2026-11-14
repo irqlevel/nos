@@ -89,9 +89,12 @@ pub trait Backend: Send {
         true
     }
     /// The bytes of the backend's block -- `SECTOR`, or a power of two of
-    /// them up to a page -- which every request is whole ones of and starts
-    /// on: the device tells its driver (`F_BLK_SIZE`), and refuses a request
-    /// that is not. `SECTOR` unless the backend says otherwise.
+    /// them up to a page -- which every request it is handed is whole ones
+    /// of and starts on. The guest is shown sectors still, the block as the
+    /// disk's physical one (`F_TOPOLOGY`): a partition table, a filesystem
+    /// laid out in sectors -- every distribution's image -- is read as it
+    /// was written. A request of part of a block is the device's to serve
+    /// in whole ones (`Pad`). `SECTOR` unless the backend says otherwise.
     fn block_size(&self) -> u32 {
         SECTOR as u32
     }
@@ -160,14 +163,14 @@ impl Request {
         self.op
     }
 
-    /// Where on the disk, in bytes: whole sectors, inside it (a read or a
-    /// write).
+    /// Where on the disk, in bytes: whole blocks of the backend's, inside it
+    /// (a read or a write).
     pub fn offset(&self) -> u64 {
         self.offset
     }
 
-    /// A read's or a write's bytes: whole sectors, at most `REQUEST_BYTES`,
-    /// from the start of its buffer.
+    /// A read's or a write's bytes: whole blocks of the backend's, at most
+    /// `REQUEST_BYTES`, from the start of its buffer.
     pub fn len(&self) -> usize {
         self.len
     }
@@ -239,14 +242,17 @@ const KICKLESS_OUT: usize = 8;
 
 /// Features: a limit on a segment's size and on the segments a request may
 /// have, flush, a disk that is read-only, and -- one that is not -- discard
-/// and a write of zeros; and the ring's EVENT_IDX, the device asking for a
-/// kick only when it has taken every chain there was, and none while its
-/// buffers are all with the backend -- a buffer coming back has it look --
-/// and its indirect descriptors (`QUEUE_SIZE`).
+/// and a write of zeros; a backend's block larger than a sector as the
+/// disk's physical block, its sectors still `SECTOR` (`F_TOPOLOGY`, never
+/// `F_BLK_SIZE`, which would make the block the guest's sector); and the
+/// ring's EVENT_IDX, the device asking for a kick only when it has taken
+/// every chain there was, and none while its buffers are all with the
+/// backend -- a buffer coming back has it look -- and its indirect
+/// descriptors (`QUEUE_SIZE`).
 const F_SIZE_MAX: u32 = 1 << 1;
 const F_SEG_MAX: u32 = 1 << 2;
-const F_BLK_SIZE: u32 = 1 << 6;
 const F_RO: u32 = 1 << 5;
+const F_TOPOLOGY: u32 = 1 << 10;
 const F_FLUSH: u32 = 1 << 9;
 const F_DISCARD: u32 = 1 << 13;
 const F_WRITE_ZEROES: u32 = 1 << 14;
@@ -261,9 +267,12 @@ const RANGE_UNMAP: u32 = 1;
 /// otherwise (`Backend::discard_sectors`): 4 KiB, a block.
 pub const DISCARD_ALIGNMENT: u32 = 8;
 /// What a request may carry, which the driver is told: data segments of at
-/// most a page, and this many of them.
+/// most a page, and this many of them -- two fewer where the backend's
+/// block is larger than a sector, so that a request and the parts of the
+/// blocks at either end of it (`Pad`) fit a buffer still.
 const SIZE_MAX: u32 = 4096;
 const SEG_MAX: u32 = 64;
+const PAD_SEGS: u32 = 2;
 /// The most data one request has, and so the size of a buffer.
 pub const REQUEST_BYTES: usize = (SIZE_MAX * SEG_MAX) as usize;
 /// The most data a pass moves between the guest's memory and the backend's
@@ -304,6 +313,8 @@ const CFG_CAPACITY: u16 = 0;
 const CFG_SIZE_MAX: u16 = 8;
 const CFG_SEG_MAX: u16 = 12;
 const CFG_BLK_SIZE: u16 = 20;
+const CFG_PHYSICAL_BLOCK_EXP: u16 = 24;
+const CFG_MIN_IO_SIZE: u16 = 26;
 const CFG_MAX_DISCARD_SECTORS: u16 = 36;
 const CFG_MAX_DISCARD_SEG: u16 = 40;
 const CFG_DISCARD_ALIGNMENT: u16 = 44;
@@ -360,6 +371,41 @@ struct Slot {
     /// The cycle counter when its request went to the backend: what its
     /// wait is counted from (`Stats::wait_ns`).
     at: u64,
+    /// Whether the request with the backend changes what the disk holds: a
+    /// write of part of a block waits for every one to come back.
+    wrote: bool,
+    /// A read or a write of part of a block, served in whole ones: what the
+    /// guest asked of the blocks handed over.
+    pad: Option<Pad>,
+}
+
+/// A read or a write of whole sectors that are not whole blocks of the
+/// backend's, served in the blocks around it -- the span. A read of them
+/// gives the guest its part; a write reads them first, merges the guest's
+/// data in and writes them whole, and while it does no other write is
+/// handed over (`Blk::rmw`): beside it, a write of another part of the same
+/// block -- or of the whole of it -- would be undone by its writing back
+/// what it read before.
+#[derive(Clone, Copy)]
+struct Pad {
+    /// The guest's bytes: `len` of them, `skip` into the span.
+    skip: usize,
+    len: usize,
+    /// A write's span being read, its data not merged in yet.
+    reading: bool,
+}
+
+/// A request taken off the ring that has to wait for the writes with the
+/// backend -- a write of part of a block for every one of them, any other
+/// write for such a write -- as it was checked, its chain in its slot.
+#[derive(Clone, Copy)]
+struct Parked {
+    slot: usize,
+    head: u16,
+    op: Op,
+    offset: u64,
+    len: usize,
+    ranges: [u8; MAX_RANGES * RANGE_BYTES],
 }
 
 impl Slot {
@@ -407,6 +453,13 @@ pub struct Blk {
     /// Set when the driver made a ring this device will not follow: no more
     /// requests are taken until it resets the device.
     broken: Option<Broken>,
+    /// A write of part of a block is with the backend -- its span being
+    /// read, or written back: no other write is handed over until it is
+    /// back (`Pad`).
+    rmw: bool,
+    /// A request that waits for the writes with the backend, nothing more
+    /// taken off the ring behind it: started first as they come back.
+    parked: Option<Parked>,
     pub stats: Stats,
 }
 
@@ -422,23 +475,26 @@ impl Blk {
         for _ in 0..IN_FLIGHT {
             let mut segs = Vec::new();
             segs.try_reserve_exact(usize::from(QUEUE_SIZE)).map_err(|_| Error::NoMemory)?;
-            slots.push(Slot { out: false, head: None, segs, behind: None, at: 0 });
+            slots.push(Slot { out: false, head: None, segs, behind: None, at: 0, wrote: false, pad: None });
         }
         let mut name = [0u8; ID_BYTES];
         let n = id.len().min(ID_BYTES);
         name[..n].copy_from_slice(&id.as_bytes()[..n]);
         /* A disk that may only be read has nothing to give back; one that
-         * may be written, what its backend takes of the two. */
+         * may be written, what its backend takes of the two -- a write of
+         * zeros only where a block is a sector: of part of one it would be
+         * a read, a merge and a write of its own. */
+        let bs = block_bytes(&*backend);
         let ro = if backend.read_only() {
             F_RO
         } else {
-            (if backend.discards() { F_DISCARD } else { 0 }) | (if backend.writes_zeroes() { F_WRITE_ZEROES } else { 0 })
+            (if backend.discards() { F_DISCARD } else { 0 })
+                | (if backend.writes_zeroes() && bs == SECTOR { F_WRITE_ZEROES } else { 0 })
         };
-        let bs = block_bytes(&*backend);
-        let blk_size = if bs != SECTOR { F_BLK_SIZE } else { 0 };
+        let topology = if bs != SECTOR { F_TOPOLOGY } else { 0 };
         Ok(Blk {
             transport: Transport::new(F_SIZE_MAX | F_SEG_MAX | F_FLUSH | virtio::F_EVENT_IDX | virtio::F_INDIRECT_DESC
-                                      | ro | blk_size, queues),
+                                      | ro | topology, queues),
             backend,
             slots,
             waiting: false,
@@ -448,6 +504,8 @@ impl Blk {
             id: name,
             index,
             broken: None,
+            rmw: false,
+            parked: None,
             stats: Stats::default(),
         })
     }
@@ -465,7 +523,53 @@ impl Blk {
 
     /// Its size, in sectors.
     pub fn sectors(&self) -> u64 {
-        self.backend.size() / SECTOR
+        self.disk_bytes() / SECTOR
+    }
+
+    /// The backend's block, in bytes (`Backend::block_size`).
+    fn block(&self) -> u64 {
+        block_bytes(&*self.backend)
+    }
+
+    /// The disk's bytes the guest is shown: whole blocks of the backend's,
+    /// so that the blocks around any sector of it are inside it.
+    fn disk_bytes(&self) -> u64 {
+        let bs = self.block();
+        self.backend.size() / bs * bs
+    }
+
+    /// The segments a request may have, which the driver is told
+    /// (`PAD_SEGS`).
+    fn seg_max(&self) -> u32 {
+        if self.block() == SECTOR { SEG_MAX } else { SEG_MAX - PAD_SEGS }
+    }
+
+    /// The blocks of the backend's a read or a write of `len` bytes at
+    /// `offset` lies in -- where they start, and their bytes -- or the
+    /// request itself, where it is whole blocks or neither.
+    fn span(&self, op: Op, offset: u64, len: usize) -> (u64, usize) {
+        let bs = self.block();
+        if !matches!(op, Op::Read | Op::Write) || bs == SECTOR {
+            return (offset, len);
+        }
+        /* Inside the disk, its bytes whole blocks (`range`, `disk_bytes`) */
+        let at = offset / bs * bs;
+        let end = offset.saturating_add(len as u64).div_ceil(bs).saturating_mul(bs);
+        (at, end.saturating_sub(at) as usize)
+    }
+
+    /// Whether a request may be handed over now: a read or a flush always;
+    /// no write while a write of part of a block is out; a write of part of
+    /// a block only with no write out at all (`Pad`).
+    fn may_start(&self, op: Op, offset: u64, len: usize) -> bool {
+        if !op.writes() {
+            return true;
+        }
+        if self.rmw {
+            return false;
+        }
+        let padded = op == Op::Write && self.span(op, offset, len) != (offset, len);
+        !padded || !self.slots.iter().any(|s| s.out && s.wrote)
     }
 
     /// Its number among its guest's disks, vda 0.
@@ -497,9 +601,17 @@ impl Blk {
         let at = usize::from(CFG_SIZE_MAX);
         c[at..at + 4].copy_from_slice(&SIZE_MAX.to_le_bytes());
         let at = usize::from(CFG_SEG_MAX);
-        c[at..at + 4].copy_from_slice(&SEG_MAX.to_le_bytes());
+        c[at..at + 4].copy_from_slice(&self.seg_max().to_le_bytes());
+        /* A sector, to a driver that reads it unoffered; and the backend's
+         * block as the physical one, and as the least a request should be */
         let at = usize::from(CFG_BLK_SIZE);
-        c[at..at + 4].copy_from_slice(&(block_bytes(&*self.backend) as u32).to_le_bytes());
+        c[at..at + 4].copy_from_slice(&(SECTOR as u32).to_le_bytes());
+        let per_block = self.block() / SECTOR;
+        if per_block > 1 {
+            c[usize::from(CFG_PHYSICAL_BLOCK_EXP)] = per_block.trailing_zeros() as u8;
+            let at = usize::from(CFG_MIN_IO_SIZE);
+            c[at..at + 2].copy_from_slice(&(per_block as u16).to_le_bytes());
+        }
         for (at, value) in [(CFG_MAX_DISCARD_SECTORS, MAX_RANGE_SECTORS), (CFG_MAX_DISCARD_SEG, MAX_RANGES as u32),
                             (CFG_DISCARD_ALIGNMENT, self.backend.discard_sectors().clamp(1, MAX_RANGE_SECTORS)),
                             (CFG_MAX_ZEROES_SECTORS, MAX_RANGE_SECTORS),
@@ -582,6 +694,8 @@ impl Blk {
         for s in self.slots.iter_mut() {
             s.head = None;
         }
+        /* A request parked was never handed over: its slot is free again */
+        self.parked = None;
     }
 
     /// What the backend has served, given back to the guest -- a read's data
@@ -643,6 +757,24 @@ impl Blk {
             return false;
         }
         let mut answered = false;
+        if let Some(p) = self.parked {
+            if !self.may_start(p.op, p.offset, p.len) {
+                /* Still waiting: looked at again as the next comes back */
+                self.waiting = true;
+                return false;
+            }
+            self.parked = None;
+            let segs = core::mem::take(&mut self.slots[p.slot].segs);
+            let result = self.serve(mem, p.slot, p.head, &segs, p.op, p.offset, p.len, p.ranges);
+            self.slots[p.slot].segs = segs;
+            match result {
+                Ok(now) => answered |= now,
+                Err(e) => {
+                    self.broken = Some(e);
+                    return answered;
+                }
+            }
+        }
         let mut left = PASS;
         while self.broken.is_none() {
             if left == 0 || self.moved >= PASS_BYTES {
@@ -705,6 +837,11 @@ impl Blk {
                     break;
                 }
             }
+            if self.parked.is_some() {
+                /* Nothing more taken until it is handed over: the ring is
+                 * looked at again as a request comes back (`poll`). */
+                break;
+            }
         }
         answered
     }
@@ -733,24 +870,49 @@ impl Blk {
         if let Some(ranges) = ranges {
             copy[..len].copy_from_slice(&ranges[..len]);
         }
-        if op == Op::Write {
+        if !self.may_start(op, offset, len) {
+            /* Held in its slot, as checked, until the writes it waits for
+             * are back: nothing more is taken off the ring meanwhile, and
+             * it is the first started then (`fill`). */
+            self.slots[slot].head = Some(head);
+            self.parked = Some(Parked { slot, head, op, offset, len, ranges: copy });
+            self.waiting = true;
+            return Ok(false);
+        }
+        self.serve(mem, slot, head, segs, op, offset, len, copy)
+    }
+
+    /// Hand the request at `head` over from `slot`, as checked: a write's
+    /// data copied into its buffer first -- or, for part of a block, the
+    /// blocks around it to be read first (`Pad`). False, or true where it
+    /// was answered at once, failed.
+    #[allow(clippy::too_many_arguments)]
+    fn serve(&mut self, mem: &GuestMemory, slot: usize, head: u16, segs: &[Seg], op: Op, offset: u64, len: usize,
+             ranges: [u8; MAX_RANGES * RANGE_BYTES]) -> core::result::Result<bool, Broken> {
+        let (at, span) = self.span(op, offset, len);
+        let pad = ((at, span) != (offset, len)).then_some(Pad { skip: (offset - at) as usize, len,
+                                                                  reading: op == Op::Write });
+        if op == Op::Write && pad.is_none() {
             self.moved = self.moved.saturating_add(len);
-        }
-        if op == Op::Write
-            && !self.backend.with_buffer(slot, &mut |buf| {
+            if !self.backend.with_buffer(slot, &mut |buf| {
                 buf.len() >= len && copy_out(mem, segs, HEADER as u64, &mut buf[..len])
-            })
-        {
-            self.stats.errors += 1;
-            self.finish(mem, segs, head, S_IOERR, 0)?;
-            return Ok(true);
+            }) {
+                self.stats.errors += 1;
+                self.finish(mem, segs, head, S_IOERR, 0)?;
+                return Ok(true);
+            }
         }
+        if pad.is_some_and(|p| p.reading) {
+            self.rmw = true;
+        }
+        /* Part of a block: the blocks around it read, whichever it is */
+        let (op, offset, len) = if pad.is_some() { (Op::Read, at, span) } else { (op, offset, len) };
         let s = &mut self.slots[slot];
-        (s.head, s.out, s.at) = (Some(head), true, kcore::time::cycle_counter());
+        (s.head, s.out, s.at, s.wrote, s.pad) = (Some(head), true, kcore::time::cycle_counter(), op.writes(), pad);
         /* Before the hand-off: what the backend's task does with it is
          * recorded after this. */
         crate::tp::blk_submit(self.index, slot, op, offset, len);
-        self.backend.submit(Request { op, offset, len, ok: false, slot, ranges: copy });
+        self.backend.submit(Request { op, offset, len, ok: false, slot, ranges });
         Ok(false)
     }
 
@@ -766,8 +928,46 @@ impl Blk {
         };
         let head = s.head.take();
         s.out = false;
+        s.wrote = false;
         let at = s.at;
         let behind = s.behind.take();
+        let pad = s.pad.take();
+        let (mut op, mut len, mut ok) = (op, len, ok);
+        if let Some(p) = pad {
+            if p.reading {
+                /* A write's span, read: the guest's data merged in and the
+                 * span written whole -- the write still the one write out */
+                if let (Some(chain), true) = (head, ok && self.broken.is_none()) {
+                    let segs = core::mem::take(&mut self.slots[slot].segs);
+                    let merged = p.skip.checked_add(p.len).is_some_and(|end| end <= len)
+                        && self.backend.with_buffer(slot, &mut |buf| {
+                            buf.len() >= len && copy_out(mem, &segs, HEADER as u64, &mut buf[p.skip..p.skip + p.len])
+                        });
+                    self.slots[slot].segs = segs;
+                    if merged {
+                        self.moved = self.moved.saturating_add(p.len);
+                        let s = &mut self.slots[slot];
+                        (s.head, s.out, s.wrote, s.pad) = (Some(chain), true, true, Some(Pad { reading: false, ..p }));
+                        crate::tp::blk_submit(self.index, slot, Op::Write, offset, len);
+                        self.backend.submit(Request { op: Op::Write, offset, len, ok: false, slot, ranges });
+                        return false;
+                    }
+                }
+                /* Not read, its data not had, or its chain gone: given up,
+                 * answered -- where there is still a chain -- as a write
+                 * that failed */
+                self.rmw = false;
+                ok = false;
+            } else if op == Op::Write {
+                /* Written back: other writes may be handed over again */
+                self.rmw = false;
+            }
+            /* Answered as what the guest asked: its write, or its part of
+             * the span read */
+            op = if p.reading { Op::Write } else { op };
+            len = p.len;
+        }
+        let s = &mut self.slots[slot];
         if let (Some(chain), true, None) = (head, ok && op.writes() && !flushes, behind) {
             if self.broken.is_none() {
                 /* Done, for a driver that took no FLUSH, which may take its
@@ -788,12 +988,15 @@ impl Blk {
                 if ok && op == Op::Read {
                     self.moved = self.moved.saturating_add(len);
                 }
+                /* A part of the blocks read: from where it is in them */
+                let skip = pad.map_or(0, |p| p.skip);
                 let (status, written) = if !ok {
                     (S_IOERR, 0)
                 } else if op != Op::Read {
                     (S_OK, 0)
                 } else if self.backend.with_buffer(slot, &mut |buf| {
-                    buf.len() >= len && copy_in(mem, &segs, 0, &buf[..len])
+                    skip.checked_add(len).is_some_and(|end| buf.len() >= end)
+                        && copy_in(mem, &segs, 0, &buf[skip..skip + len])
                 }) {
                     (S_OK, clamp32(len as u64))
                 } else {
@@ -934,14 +1137,48 @@ impl Blk {
                 return Next::Answer(S_IOERR, 0);
             }
         }
-        Next::Ranges(op, count, ranges)
+        let bs = self.block();
+        if bs == SECTOR {
+            return Next::Ranges(op, count, ranges);
+        }
+        if op != Op::Discard {
+            /* A write of zeros is not offered where a block is more than a
+             * sector: a driver that was not told it may does not send one */
+            return Next::Answer(S_UNSUPP, 0);
+        }
+        /* The whole blocks each range has, alone, given back -- a discard
+         * need give back nothing -- and a range of no whole block left out:
+         * the backend is handed whole blocks, as every request */
+        let mut kept = [0u8; MAX_RANGES * RANGE_BYTES];
+        let mut n = 0;
+        for r in ranges[..count * RANGE_BYTES].chunks_exact(RANGE_BYTES) {
+            let sector = u64::from_le_bytes([r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]]);
+            let sectors = u32::from_le_bytes([r[8], r[9], r[10], r[11]]);
+            /* Inside the disk, checked above */
+            let start = sector.saturating_mul(SECTOR);
+            let end = start.saturating_add(u64::from(sectors) * SECTOR);
+            let (first, last) = (start.div_ceil(bs).saturating_mul(bs), end / bs * bs);
+            if last > first {
+                let out = &mut kept[n * RANGE_BYTES..(n + 1) * RANGE_BYTES];
+                out[..8].copy_from_slice(&(first / SECTOR).to_le_bytes());
+                out[8..12].copy_from_slice(&(((last - first) / SECTOR) as u32).to_le_bytes());
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return Next::Answer(S_OK, 0);
+        }
+        Next::Ranges(op, n, kept)
     }
 
-    /// A read or a write of `len` bytes from `sector`.
+    /// A read or a write of `len` bytes from `sector`: the blocks around it
+    /// a buffer's worth at most.
     fn data_request(&mut self, op: Op, sector: u64, len: u64) -> Next {
         match self.range(sector, len) {
             Some(_) if len == 0 => Next::Answer(S_OK, 0),
-            Some(offset) if len <= REQUEST_BYTES as u64 => Next::Serve(op, offset, len as usize),
+            Some(offset) if len <= REQUEST_BYTES as u64 && self.span(op, offset, len as usize).1 <= REQUEST_BYTES => {
+                Next::Serve(op, offset, len as usize)
+            }
             _ => {
                 self.stats.errors += 1;
                 Next::Answer(S_IOERR, 0)
@@ -950,12 +1187,11 @@ impl Blk {
     }
 
     /// The byte offset of `sector`, when `len` bytes from there are whole
-    /// blocks of the backend's (`Backend::block_size`) within the disk.
+    /// sectors within the disk.
     fn range(&self, sector: u64, len: u64) -> Option<u64> {
-        let bs = block_bytes(&*self.backend);
         let offset = sector.checked_mul(SECTOR)?;
         let end = offset.checked_add(len)?;
-        (offset % bs == 0 && len % bs == 0 && end <= self.backend.size()).then_some(offset)
+        (len % SECTOR == 0 && end <= self.disk_bytes()).then_some(offset)
     }
 }
 

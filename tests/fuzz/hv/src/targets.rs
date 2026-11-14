@@ -7,7 +7,7 @@
 //! a disk request outside the disk, a frame longer than a frame -- is
 //! checked where it would be handed over, by the backends here.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use crate::devices::blk::{self, Blk};
@@ -1057,6 +1057,12 @@ fn setup_queue(r: &mut Input, write: &mut dyn FnMut(u16, u8, u32), q: &mut Drive
 pub struct DiskState {
     size: u64,
     read_only: bool,
+    /// Its block (`Backend::block_size`): every request whole ones of it.
+    block: u64,
+    /// What it holds, a sector at a time, where it keeps it (`keep`): the
+    /// 512e scenario's. A sector not here holds zeros.
+    store: HashMap<u64, [u8; 512]>,
+    keep: bool,
     /// A request's buffer a slot, as a backend has them, and which of them
     /// it has the request of.
     bufs: Vec<Vec<u8>>,
@@ -1071,8 +1077,18 @@ pub struct DiskState {
 
 impl DiskState {
     pub fn new(size: u64, read_only: bool) -> DiskState {
+        DiskState::with_block(size, read_only, blk::SECTOR)
+    }
+
+    pub fn with_block(size: u64, read_only: bool, block: u64) -> DiskState {
         let bufs = (0..blk::IN_FLIGHT).map(|_| vec![0u8; blk::REQUEST_BYTES]).collect();
-        DiskState { size, read_only, bufs, queue: VecDeque::new(), ready: 0, fail: false, order: 0 }
+        DiskState { size, read_only, block, store: HashMap::new(), keep: false, bufs, queue: VecDeque::new(),
+                    ready: 0, fail: false, order: 0 }
+    }
+
+    /// What sector `n` holds, where the disk keeps what it is written.
+    fn sector(&self, n: u64) -> [u8; 512] {
+        self.store.get(&n).copied().unwrap_or([0u8; 512])
     }
 
     pub fn size(&self) -> u64 {
@@ -1094,6 +1110,9 @@ impl blk::Backend for Disk {
     fn read_only(&self) -> bool {
         self.0.lock().unwrap().read_only
     }
+    fn block_size(&self) -> u32 {
+        self.0.lock().unwrap().block as u32
+    }
     fn with_buffer(&mut self, slot: usize, use_it: &mut dyn FnMut(&mut [u8]) -> bool) -> bool {
         let mut s = self.0.lock().unwrap();
         /* The device reaches a buffer only while the request of it is not
@@ -1114,6 +1133,11 @@ impl blk::Backend for Disk {
         match req.op() {
             blk::Op::Read | blk::Op::Write => {
                 invariant!(req.offset() % blk::SECTOR == 0, "a request at byte {}, not a sector", req.offset());
+                /* Whole blocks of the backend's, a guest's part of one
+                 * served through the blocks around it */
+                invariant!(req.offset() % s.block == 0 && len % s.block == 0,
+                           "a request of {} bytes at {} handed to a backend of {}-byte blocks", len, req.offset(),
+                           s.block);
                 invariant!(req.offset().checked_add(len).is_some_and(|end| end <= s.size),
                            "a request of {} bytes at {} on a disk of {}", len, req.offset(), s.size);
             }
@@ -1122,9 +1146,11 @@ impl blk::Backend for Disk {
                 /* The device's copy, checked: what the backend acts on */
                 let ranges: Vec<blk::Range> = req.ranges().collect();
                 invariant!(!ranges.is_empty() && ranges.len() <= 8, "{} ranges handed over", ranges.len());
+                invariant!(s.block == blk::SECTOR || req.op() == blk::Op::Discard,
+                           "a write of zeros handed to a backend of {}-byte blocks, which is not offered one", s.block);
                 for r in &ranges {
-                    invariant!(r.offset % blk::SECTOR == 0 && r.len % blk::SECTOR == 0,
-                               "a range of {} bytes at {}, not whole sectors", r.len, r.offset);
+                    invariant!(r.offset % s.block == 0 && r.len % s.block == 0,
+                               "a range of {} bytes at {}, not whole blocks of {}", r.len, r.offset, s.block);
                     invariant!(r.offset.checked_add(r.len).is_some_and(|end| end <= s.size),
                                "a range of {} bytes at {} on a disk of {}", r.len, r.offset, s.size);
                     invariant!(!r.unmap || req.op() == blk::Op::WriteZeroes, "an unmap flag handed over on a discard");
@@ -1156,6 +1182,26 @@ impl blk::Backend for Disk {
         }
         let mut req = s.queue.remove(at)?;
         req.done(!fail);
+        if s.keep && !fail {
+            /* Served now, in the order the backend chose: what it holds read
+             * or written, a sector at a time */
+            let (slot, first, sectors) = (req.slot(), req.offset() / blk::SECTOR, req.len() as u64 / blk::SECTOR);
+            for i in 0..sectors {
+                let at = (i * blk::SECTOR) as usize..((i + 1) * blk::SECTOR) as usize;
+                match req.op() {
+                    blk::Op::Read => {
+                        let v = s.sector(first + i);
+                        s.bufs[slot][at].copy_from_slice(&v);
+                    }
+                    blk::Op::Write => {
+                        let mut v = [0u8; 512];
+                        v.copy_from_slice(&s.bufs[slot][at]);
+                        s.store.insert(first + i, v);
+                    }
+                    _ => {}
+                }
+            }
+        }
         Some(req)
     }
 }
@@ -1226,7 +1272,10 @@ fn blk_target(r: &mut Input) {
     let mem = GuestMemory::with_size(MEM);
     let since = time::boot_time_ns();
     let size = if r.bool() { blk::SECTOR * r.below(1 << 16) } else { r.value64() & !(blk::SECTOR - 1) };
-    let state = Arc::new(Mutex::new(DiskState::new(size, r.bool())));
+    /* A backend of 4 KiB blocks, as a volume of NBS's is, on some inputs:
+     * shown to the guest in sectors still (`blk::Pad`) */
+    let block = if r.u8() < 96 { 4096 } else { blk::SECTOR };
+    let state = Arc::new(Mutex::new(DiskState::with_block(size, r.bool(), block)));
     let mut disk = Blk::new(Box::new(Disk(state.clone())), "fuzz", 0).expect("a disk");
     if r.bool() {
         disk.offer_msix(2);
@@ -1237,7 +1286,7 @@ fn blk_target(r: &mut Input) {
         mem.refuse_maps(true);
     }
     let mut q = DriverQueue::default();
-    while let Some(op) = r.op(17) {
+    while let Some(op) = r.op(18) {
         match op {
             0 => {
                 disk.io_read(r.below(u64::from(blk::BAR_SIZE)) as u16, r.io_size());
@@ -1384,6 +1433,12 @@ fn blk_target(r: &mut Input) {
                 let status = blk_write(&mem, &mut q, r);
                 disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns());
                 if state.lock().unwrap().queued() == 1 {
+                    if state.lock().unwrap().block > blk::SECTOR {
+                        /* A sector of a larger block: the blocks around it
+                         * read first, the write handed over as they come */
+                        state.lock().unwrap().ready = 1;
+                        disk.poll(&mem);
+                    }
                     state.lock().unwrap().ready = 1;
                     disk.poll(&mem);
                     let flush = state.lock().unwrap().queue.front().map(|q| q.op()) == Some(blk::Op::Flush);
@@ -1397,11 +1452,188 @@ fn blk_target(r: &mut Input) {
                     invariant!(s[0] == 0, "a write flushed, answered {:#x}", s[0]);
                 }
             }
+            17 => blk_512e(&mut disk, &mem, &state, &mut q, r),
             _ => {}
         }
     }
     PASSES_CUT.fetch_add(disk.stats.cut, std::sync::atomic::Ordering::Relaxed);
     mem.held_to_map_budget(since, 1);
+}
+
+/// Where the 512e scenario's requests' buffers go, past `BLK_BUFS`'s: a
+/// request's room each, its header, its data and its status.
+const E_BUFS: u64 = 0x40000;
+const E_ROOM: u64 = 0x4000;
+/// The blocks its requests fall in: few, so that they share blocks.
+const E_BLOCKS: u64 = 3;
+
+/// A sector as the scenario's write `id` writes it: whose, and which sector.
+fn e_sector(id: u8, sector: u64) -> [u8; 512] {
+    let mut b = [0u8; 512];
+    for (i, x) in b.iter_mut().enumerate() {
+        *x = id ^ (i as u8) ^ (sector as u8).wrapping_mul(31);
+    }
+    b[0] = id;
+    b[1..9].copy_from_slice(&sector.to_le_bytes());
+    b
+}
+
+/// One of the scenario's requests: a read or a write of `count` sectors from
+/// the region's `at`, and where its data and its status are.
+struct ERequest {
+    write: bool,
+    at: u64,
+    count: u64,
+    id: u8,
+    data: u64,
+    status: u64,
+}
+
+/// The disk a guest of 512-byte sectors has on a backend of larger blocks
+/// (`blk::Pad`): reads and writes of sectors in a few blocks, all at once,
+/// the backend serving them in any order and failing some -- a driver that
+/// took FLUSH or one that did not. Then every request is answered; every
+/// sector one write alone of them wrote, and that was answered done, holds
+/// what it wrote -- a write of part of a block written back over another
+/// write beside it would have undone it -- one no write wrote holds what it
+/// held, and any other one of those; a read's sectors were one of them too;
+/// and the disk read back through the device is what it holds.
+fn blk_512e(disk: &mut Blk, mem: &GuestMemory, state: &Arc<Mutex<DiskState>>, q: &mut DriverQueue, r: &mut Input) {
+    let (block, size, read_only) = {
+        let s = state.lock().unwrap();
+        (s.block, s.size, s.read_only)
+    };
+    let per = block / blk::SECTOR;
+    let blocks = size / block;
+    if per == 1 || read_only || blocks < E_BLOCKS {
+        return;
+    }
+    blk_reset_drained(disk, mem, state);
+    {
+        let mut s = state.lock().unwrap();
+        s.keep = true;
+        s.fail = false;
+    }
+    let flushes = r.bool();
+    blk_queue_at(disk, mem, q, if flushes { u32::MAX } else { u32::MAX & !(1 << 9) });
+    let first = r.below(blocks - E_BLOCKS + 1) * per;
+    let span = E_BLOCKS * per;
+    let before: Vec<[u8; 512]> = {
+        let s = state.lock().unwrap();
+        (0..span).map(|k| s.sector(first + k)).collect()
+    };
+
+    let n = 2 + r.below(7);
+    let mut reqs = Vec::new();
+    for i in 0..n {
+        let write = r.u8() < 170;
+        let at = r.below(span);
+        let count = (1 + r.below(2 * per)).min(span - at);
+        let id = 1 + i as u8;
+        let room = E_BUFS + i * E_ROOM;
+        let (header, data) = (room, room + 0x100);
+        let status = data + count * blk::SECTOR;
+        let mut h = [0u8; 16];
+        h[..4].copy_from_slice(&u32::from(write).to_le_bytes());
+        h[8..].copy_from_slice(&(first + at).to_le_bytes());
+        mem.put(header, &h);
+        for k in 0..count {
+            let bytes = if write { e_sector(id, first + at + k) } else { [0xEEu8; 512] };
+            mem.put(data + k * blk::SECTOR, &bytes);
+        }
+        mem.put(status, &[BLK_UNSET]);
+        chain_made_well(mem, q, &[(header, 16, false), (data, (count * blk::SECTOR) as u32, !write), (status, 1, true)]);
+        reqs.push(ERequest { write, at, count, id, data, status });
+    }
+    disk.io_write(QUEUE_NOTIFY, 2, 0, mem, time::boot_time_ns());
+
+    let status_of = |e: &ERequest| {
+        let mut b = [0u8];
+        let _ = mem.read(e.status, &mut b);
+        b[0]
+    };
+    /* Each request is three of the backend's at most -- a span read, its
+     * write, a flush behind it -- and a round serves one at least */
+    let mut rounds = 0u64;
+    while reqs.iter().any(|e| status_of(e) == BLK_UNSET) && rounds < 3 * n + 8 {
+        rounds += 1;
+        {
+            let mut s = state.lock().unwrap();
+            s.ready += 1 + r.below(3) as usize;
+            s.order = r.u64();
+            s.fail = r.u8() % 16 == 0;
+        }
+        disk.poll(mem);
+    }
+    let statuses: Vec<u8> = reqs.iter().map(&status_of).collect();
+    invariant!(statuses.iter().all(|&st| st == 0 || st == 1), "the 512e batch on {}-byte blocks: {} rounds, statuses \
+               {:?} -- a request never answered, with the backend serving all it was handed", block, rounds, statuses);
+
+    let s = state.lock().unwrap();
+    for k in 0..span {
+        let now = s.sector(first + k);
+        let over: Vec<&ERequest> = reqs.iter().filter(|e| e.write && e.at <= k && k < e.at + e.count).collect();
+        let done: Vec<&&ERequest> = over.iter().filter(|e| status_of(e) == 0).collect();
+        if over.is_empty() {
+            invariant!(now == before[k as usize], "sector {} of a {}-byte block, which no write of the batch wrote, \
+                       changed", first + k, block);
+        } else if over.len() == 1 && done.len() == 1 {
+            E_ALONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            invariant!(now == e_sector(over[0].id, first + k), "sector {} of a {}-byte block, written by write {} \
+                       alone and answered done, holds {}: written back over by another write of its block",
+                       first + k, block, over[0].id, if now == before[k as usize] { "what it held before" } else {
+                       "something else" });
+        } else {
+            invariant!(now == before[k as usize] || over.iter().any(|e| now == e_sector(e.id, first + k)),
+                       "sector {} of a {}-byte block holds what neither it held nor a write over it wrote",
+                       first + k, block);
+        }
+    }
+    for e in reqs.iter().filter(|e| !e.write && status_of(e) == 0) {
+        for k in 0..e.count {
+            let mut got = [0u8; 512];
+            let _ = mem.read(e.data + k * blk::SECTOR, &mut got);
+            let sector = e.at + k;
+            let over: Vec<&ERequest> =
+                reqs.iter().filter(|w| w.write && w.at <= sector && sector < w.at + w.count).collect();
+            invariant!(got == before[sector as usize] || over.iter().any(|w| got == e_sector(w.id, first + sector)),
+                       "a read of sector {} of a {}-byte block got what neither it held nor a write over it wrote",
+                       first + sector, block);
+        }
+    }
+    drop(s);
+
+    /* Read back through the device, the batch over: what the disk holds */
+    let room = E_BUFS + n * E_ROOM;
+    let (header, data) = (room, room + 0x100);
+    let status = data + span * blk::SECTOR;
+    let mut h = [0u8; 16];
+    h[8..].copy_from_slice(&first.to_le_bytes());
+    mem.put(header, &h);
+    mem.put(status, &[BLK_UNSET]);
+    chain_made_well(mem, q, &[(header, 16, false), (data, (span * blk::SECTOR) as u32, true), (status, 1, true)]);
+    disk.io_write(QUEUE_NOTIFY, 2, 0, mem, time::boot_time_ns());
+    for _ in 0..4 {
+        {
+            let mut s = state.lock().unwrap();
+            s.ready += 1;
+            s.fail = false;
+        }
+        disk.poll(mem);
+    }
+    let mut st = [0u8];
+    let _ = mem.read(status, &mut st);
+    invariant!(st[0] == 0, "the region read back answered {:#x}", st[0]);
+    let s = state.lock().unwrap();
+    for k in 0..span {
+        let mut got = [0u8; 512];
+        let _ = mem.read(data + k * blk::SECTOR, &mut got);
+        invariant!(got == s.sector(first + k), "sector {} of a {}-byte block read back unlike what the disk holds",
+                   first + k, block);
+    }
+    drop(s);
+    state.lock().unwrap().keep = false;
+    E_BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// What a status byte holds before the device writes it.
@@ -2111,6 +2343,10 @@ static DISK_OUT_OF_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 static RANGES_SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// A disk's passes ended at their bound on the data they moved.
 static PASSES_CUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The 512e scenario's batches run, and the sectors of them held to the one
+/// write alone over them (`blk_512e`).
+static E_BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static E_ALONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn report() {
     use std::sync::atomic::Ordering::Relaxed;
@@ -2120,6 +2356,8 @@ pub fn report() {
               handed over; {} chains made with buffers in an indirect table; {} passes cut short by the data they \
               moved", DISK_OUT_OF_ORDER.load(Relaxed), RANGES_SERVED.load(Relaxed), INDIRECT_MADE.load(Relaxed),
              PASSES_CUT.load(Relaxed));
+    println!("  512e: {} batches on blocks larger than a sector, {} sectors held to the one write over them",
+             E_BATCHES.load(Relaxed), E_ALONE.load(Relaxed));
 }
 
 fn pvh(r: &mut Input) {
