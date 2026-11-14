@@ -3,9 +3,13 @@
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useState } from 'react';
+import { nosText } from './Dashboard';
+import type { NosInfo } from '@/lib/hub';
 import type { Words } from '@/lib/i18n';
 
-interface HostRow { id: string; name: string; url: string; pin: string; online: boolean; why: string | null }
+interface HostRow {
+  id: string; name: string; url: string; pin: string; online: boolean; why: string | null; nos: NosInfo | null;
+}
 
 /** The hosts the panel manages, whether each answers -- and why not, when
  * it does not -- and another added: its API's address and its key, which
@@ -72,6 +76,7 @@ export function HostsManager({ locale, w }: { locale: string; w: Words }) {
               <Link href={`/${locale}/h/${h.id}`} className="font-medium text-accent hover:underline">{h.name}</Link>
               <span className="ml-2 font-mono text-xs text-muted">{h.url}</span>
               <div className="font-mono text-xs text-muted">{h.pin.slice(0, 16)}…</div>
+              {h.nos && <div className="font-mono text-xs text-fg-soft" title={w.nosVersion} data-testid="host-nos">{nosText(h.nos)}</div>}
               {!h.online && h.why && <div className="mt-1 break-words text-xs text-bad">{h.why}</div>}
             </div>
             <div className="flex shrink-0 items-center gap-3">

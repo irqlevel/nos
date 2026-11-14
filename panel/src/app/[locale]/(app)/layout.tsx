@@ -8,6 +8,7 @@ import { ThemeToggle } from '@/components/ThemeToggle';
 import { COOKIE, session } from '@/lib/auth';
 import { hosts } from '@/lib/hosts';
 import { isLocale, words } from '@/lib/i18n';
+import { panelVersion } from '@/lib/version';
 
 export default async function AppLayout({ children, params }: { children: React.ReactNode; params: Promise<{ locale: string }> }) {
   const { locale } = await params;
@@ -17,7 +18,7 @@ export default async function AppLayout({ children, params }: { children: React.
   const w = words(locale);
   const other = locale === 'en' ? 'ru' : 'en';
   return (
-    <div className="min-h-screen">
+    <div className="flex min-h-screen flex-col">
       <header className="sticky top-0 z-20 flex h-14 items-center gap-4 border-b border-line bg-bg/90 px-4 backdrop-blur">
         <Link href={`/${locale}`} className="font-mono text-lg font-semibold text-fg">
           nos<span className="text-accent">_</span>
@@ -33,7 +34,13 @@ export default async function AppLayout({ children, params }: { children: React.
           <LogoutButton locale={locale} label={w.logout} />
         </nav>
       </header>
-      {children}
+      <div className="flex-1">{children}</div>
+      {/* The panel's version: on the pages of a session alone, nothing said
+          of it to who has not logged in */}
+      <footer className="border-t border-line px-4 py-3 text-xs text-muted" data-testid="panel-version"
+        title={w.panelVersion}>
+        {w.appName} <span className="font-mono">{panelVersion()}</span>
+      </footer>
     </div>
   );
 }
