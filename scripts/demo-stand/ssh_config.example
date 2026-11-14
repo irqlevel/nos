@@ -1,0 +1,22 @@
+# The demo stand's EX44, as ex44-deploy.sh and neighbours.sh reach it
+# (DEMO_SSH_CONFIG names a copy of this): nos's sshd, and Ubuntu's, which
+# the machine boots when nos's one boot is over. The two OSes show two host
+# keys at one address: keep Ubuntu's in a known_hosts of its own, so that
+# neither is ever taken for the other.
+Host ex44-nos
+  HostName 65.108.38.184
+  User root
+  BatchMode yes
+  ConnectTimeout 20
+  ServerAliveInterval 10
+  ServerAliveCountMax 3
+
+Host ex44-ubuntu
+  HostName 65.108.38.184
+  User root
+  BatchMode yes
+  ConnectTimeout 20
+  ServerAliveInterval 10
+  ServerAliveCountMax 3
+  UserKnownHostsFile ~/.ssh/known_hosts.ex44-ubuntu
+  StrictHostKeyChecking yes
