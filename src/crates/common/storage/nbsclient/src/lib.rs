@@ -476,6 +476,10 @@ pub struct Session {
     attach_from: u64,
     phase: Phase,
     generation: u64,
+    /// A read-only session's: the generation a writer would have been given
+    /// as it attached, which its reads carry -- a writer attached since
+    /// fences them (the review of 2026-11, its question 4). 0 for a writer.
+    as_of: u64,
     /// The metadata's entry the map was read at, at least: what every
     /// request carries.
     index: u64,
@@ -507,6 +511,10 @@ pub struct Session {
     open: BTreeMap<u32, (u64, bool)>,
     /// Closes out for places idle: place -> cs's not answered.
     closing: BTreeMap<u32, BTreeSet<u32>>,
+    /// Places whose close a cs refused as no replica of the chunk's set any
+    /// more: not taken for closed until the map is read, which sends the
+    /// close to the one that took that cs's place (`closes_to_view`).
+    close_moved: BTreeSet<u32>,
     /// Places written again while their close was out: each write to one
     /// goes to every replica directly, behind that close on the way, and the
     /// close is sent no more -- until the place is closed again, when every
@@ -562,12 +570,13 @@ impl Session {
         Session {
             name: String::from(name), me: String::from(me), answer: None, piece_ids: BTreeMap::new(), writable, force,
             token, attach_from: 0,
-            phase: Phase::Attaching, generation: 0,
+            phase: Phase::Attaching, generation: 0, as_of: 0,
             index: 0, map: Map::default(), reading: None, next_id: 1, mds: None, downs: BTreeMap::new(),
             subs: BTreeMap::new(), pieces: BTreeMap::new(), next_piece: 1, ops: BTreeMap::new(), next_op: 1,
             queue: VecDeque::new(), parked: Vec::new(), fenced: BTreeSet::new(), held: BTreeMap::new(),
             held_chunks: BTreeSet::new(),
-            dirty: BTreeSet::new(), open: BTreeMap::new(), closing: BTreeMap::new(), direct: BTreeSet::new(),
+            dirty: BTreeSet::new(), open: BTreeMap::new(), closing: BTreeMap::new(), close_moved: BTreeSet::new(),
+            direct: BTreeSet::new(),
             mend_too: BTreeSet::new(),
             mend: BTreeSet::new(),
             mending: None, scratch: Vec::new(), stop: None, stop_flush: None, reads: BTreeMap::new(),
@@ -878,7 +887,11 @@ impl Session {
                 if !self.reattaching {
                     self.fresh = first;
                 }
-                self.generation = generation;
+                if self.writable {
+                    self.generation = generation;
+                } else {
+                    self.as_of = generation;
+                }
                 self.index = index;
                 self.phase = Phase::Mapping;
                 self.reading = Some(Map::default());
@@ -984,6 +997,8 @@ impl Session {
                     self.send_piece(pid, now, bufs, out);
                 }
                 self.send_after_map(now, bufs, out);
+                self.closes_to_view(before, now, bufs, out);
+                self.moved_closes_done(now, bufs, out);
                 /* An ask to take a cs out of a set the view no longer writes it
                    in dropped: asked again, it would be refused for as long as
                    the session lives. What waits for that cs is settled as it
@@ -1015,6 +1030,41 @@ impl Session {
                     self.unpause(now, bufs, out);
                 }
             }
+        }
+    }
+
+    /// The closes out -- the driver's and the reconcile's -- of places whose
+    /// set the map read finds at another version, sent to every replica the
+    /// view writes now that the close waits on no answer from: a joiner
+    /// come since among them, which may hold the chunk open as the source
+    /// it copied it from did (`Store::close_copy`), and is closed only by
+    /// the writer whose mark it is. Sent by the view before alone, the
+    /// close was done and the joiner's mark left open at the writer's own
+    /// generation; a source refuses a close by a view older than its chunk,
+    /// so that its writer reads its map and comes here (the review of
+    /// 2026-11, its question 5). A replica that has closed the chunk already
+    /// closes nothing again.
+    fn closes_to_view(&mut self, before: &BTreeMap<u32, u32>, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
+        let changed = |map: &Map, place: u32| -> Option<BTreeSet<u32>> {
+            map.set_of(place).filter(|(set, s)| before.get(set) != Some(&s.version)).map(|(_, s)| s.written().collect())
+        };
+        let mut sends: Vec<(u32, u32)> = Vec::new();
+        for (&place, waiting) in self.closing.iter_mut() {
+            for cs in changed(&self.map, place).unwrap_or_default() {
+                if waiting.insert(cs) {
+                    sends.push((cs, place));
+                }
+            }
+        }
+        if let Some(m) = self.mending.as_mut().filter(|m| !m.closing.is_empty()) {
+            for cs in changed(&self.map, m.place).unwrap_or_default() {
+                if m.closing.insert(cs) {
+                    sends.push((cs, m.place));
+                }
+            }
+        }
+        for (cs, place) in sends {
+            self.send(cs, What::Close(place), now, bufs, out);
         }
     }
 
@@ -1076,7 +1126,8 @@ impl Session {
                 let o = self.ops.get(&p.op).ok_or(Unmade::Gone)?;
                 let chunk = named(stamp.chunk)?;
                 match o.kind {
-                    Kind::Read => Op::Read { chunk, position: p.place, index, offset: p.inside, len: p.len },
+                    Kind::Read => Op::Read { chunk, position: p.place, index, offset: p.inside, len: p.len,
+                                             as_of: if self.writable { 0 } else { self.as_of } },
                     _ => {
                         let all = if o.tag & INTERNAL != 0 { &self.scratch[..] } else { bufs.data(o.tag) };
                         let data = all.get(p.at as usize..(p.at + p.len) as usize).ok_or(Unmade::Gone)?;
@@ -1499,7 +1550,19 @@ impl Session {
                        fuzz/nbs's cluster target, N9d: the close sent again on
                        each map read and refused each time, and the writer's
                        stop waited for good) */
-                    What::Close(place) if matches!(why, Refusal::NotHere) => self.closed(place, cs, now, bufs, out),
+                    /* And the place not taken for closed until the map is
+                       read: the cs that took that one's place -- a joiner
+                       made a member -- may hold the chunk open as the
+                       source it copied it from did, and only the map read
+                       sends it the close (`closes_to_view`). Taken for
+                       closed at once, the close sent by the view before
+                       left that mark open at the writer's own generation
+                       (found by fuzz/nbs's cluster target, seed 18153, once
+                       a copy kept its source's mark) */
+                    What::Close(place) if matches!(why, Refusal::NotHere) => {
+                        self.close_moved.insert(place);
+                        self.closed(place, cs, now, bufs, out)
+                    }
                     /* A copy-up's member by a view behind the set, or the
                        copy-up given up meanwhile: asked again from its start
                        once the map is read again */
@@ -1781,7 +1844,16 @@ impl Session {
                     }
                     self.flush_progress(op, now, bufs, out);
                 }
-                What::Close(place) => self.closed(place, cs, now, bufs, out),
+                /* As a close refused as no replica's: the place waits for
+                   the map read, which sends the close to the cs that took
+                   that one's place (found by fuzz/nbs's cluster target,
+                   seed 25047: the cs taken out, its close done, and the
+                   joiner made a member left open) */
+                What::Close(place) => {
+                    self.close_moved.insert(place);
+                    self.refresh(now, out);
+                    self.closed(place, cs, now, bufs, out)
+                }
                 What::CopyUp(place) => {
                     if let Some(c) = self.copies.get_mut(&place) {
                         c.waiting.remove(&cs);
@@ -2244,6 +2316,15 @@ impl Session {
                 self.open.insert(place, (now, false));
                 if self.closing.remove(&place).is_some() {
                     reopened = true;
+                    /* A close refused, to be sent again once the map is read
+                       (`resend_later`), no more either: sent after the write,
+                       it closed the chunk over it on the replicas that took
+                       both, the replica refusing the write's epoch still to
+                       take it -- apart, and open on none (found by fuzz/nbs's
+                       cluster target, seed 20346, once a close by a view
+                       older than its chunk was refused) */
+                    self.after_map.retain(|&(_, w)| w != What::Close(place));
+                    self.close_moved.remove(&place);
                     self.subs.retain(|_, s| s.what != What::Close(place));
                     self.direct.insert(place);
                 }
@@ -2417,14 +2498,24 @@ impl Session {
             return;
         }
         self.pump(now, bufs, out);
+        /* A close of the driver's waits on a place a write took as it began
+           -- at the very moment, so taken as written before it: closed once
+           the write is done, and nothing else would close it; every flush
+           after it waited to its deadline (found by fuzz/nbs's cluster
+           target, seed 17081, once the end held what was asked before a
+           stop to be done) */
+        if self.ops.values().any(|o| o.closing.is_some()) {
+            self.closes_progress(now, bufs, out);
+        }
     }
 
     /* ---- closes ---- */
 
     /// Close of `place` answered by `cs`.
     fn closed(&mut self, place: u32, cs: u32, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
+        let moved = self.close_moved.contains(&place);
         if let Some(m) = self.mending.as_mut() {
-            if m.place == place && m.closing.remove(&cs) && m.closing.is_empty() {
+            if m.place == place && m.closing.remove(&cs) && m.closing.is_empty() && !moved {
                 /* Closed: no longer open for the session -- its own writes
                    put it there, and it was closed again later, for nothing */
                 self.mending = None;
@@ -2435,7 +2526,7 @@ impl Session {
         }
         if let Some(w) = self.closing.get_mut(&place) {
             w.remove(&cs);
-            if w.is_empty() {
+            if w.is_empty() && !moved {
                 self.closing.remove(&place);
                 self.open.remove(&place);
                 self.direct.remove(&place);
@@ -2444,6 +2535,33 @@ impl Session {
         self.closes_progress(now, bufs, out);
         self.maybe_stop(now, bufs, out);
         self.pause_step(now, bufs, out);
+    }
+
+    /// The places a close of which a cs refused as no replica of their set,
+    /// the map read now and the close sent to the view's new replicas
+    /// (`closes_to_view`): closed where nothing more waits.
+    fn moved_closes_done(&mut self, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
+        let mut done = false;
+        for place in core::mem::take(&mut self.close_moved) {
+            if self.mending.as_ref().is_some_and(|m| m.place == place && m.op.is_none() && m.closing.is_empty()) {
+                self.mending = None;
+                self.open.remove(&place);
+                self.next_mend(now, bufs, out);
+                done = true;
+                continue;
+            }
+            if self.closing.get(&place).is_some_and(|w| w.is_empty()) {
+                self.closing.remove(&place);
+                self.open.remove(&place);
+                self.direct.remove(&place);
+                done = true;
+            }
+        }
+        if done {
+            self.closes_progress(now, bufs, out);
+            self.maybe_stop(now, bufs, out);
+            self.pause_step(now, bufs, out);
+        }
     }
 
     /// Every close of the driver's that waits on its places, looked at --
@@ -2581,6 +2699,7 @@ impl Session {
         self.piece_ids.clear();
         self.open.clear();
         self.closing.clear();
+        self.close_moved.clear();
         /* Closes of before refused from the fence on */
         self.direct.clear();
         /* What is dirty kept: a write done before, not flushed, is on its
@@ -2745,6 +2864,11 @@ impl Session {
     pub fn tick(&mut self, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
         if matches!(self.phase, Phase::Failed(_) | Phase::Detached) {
             return;
+        }
+        /* Closes waiting for a map read (`close_moved`): one asked as soon
+           as no other ask of the mds is out */
+        if !self.close_moved.is_empty() {
+            self.refresh(now, out);
         }
         /* The first attach is given up past ATTACH_NS, so that an attach of
            its arriving late never takes the volume from a writer since; one

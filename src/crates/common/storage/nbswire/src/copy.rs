@@ -31,7 +31,12 @@
 //!   with one of them would go unchecked. A sector that differs is copied
 //!   in and read back; one that does not read back as copied is a round,
 //!   and past `ROUNDS_MAX` rounds the join is given up, and said. A chunk
-//!   held to its source's is closed (`Store::close_copy`).
+//!   held to its source's is closed (`Store::close_copy`) -- or, one the
+//!   source held open as it summed it, kept open at its writer's
+//!   generation, unless that writer has closed it here since: an open
+//!   chunk's replicas may differ, and the mark is what has the next
+//!   writer's reconcile make them the same, which the source taken out
+//!   later would take with it (the review of 2026-11, its question 5).
 //! - **What the source has not**: every chunk done, what this cs still
 //!   holds of the set at an epoch before its join -- a chunk the source
 //!   listed none of, which reads as zeros on the set's members -- dropped
@@ -144,6 +149,9 @@ struct Work {
     summed: bool,
     /// Its sums asked.
     checking: bool,
+    /// The generation the source held it open at as it summed it, if it
+    /// did: kept open here at it as the copy closes it (`close_copy`).
+    open: Option<u64>,
 }
 
 /// One join's copy.
@@ -380,8 +388,11 @@ impl Copy {
                 self.progress_at = now;
                 self.verify(store, offset, d, version, rounds, out).await;
             }
-            (Ask::Sums, Reply::Sums(theirs)) => {
+            (Ask::Sums, Reply::Sums { sums: theirs, open }) => {
                 self.progress_at = now;
+                if let Some(w) = self.work.as_mut() {
+                    w.open = *open;
+                }
                 self.check(store, theirs, out).await;
             }
             /* An answer that is not the request's: the source left */
@@ -403,7 +414,7 @@ impl Copy {
             .is_some_and(|h| h.incarnation == incarnation && h.volume == volume && h.state != SlotState::Lost);
         let held = self.view.own && written < self.view.until && held;
         self.work = Some(Work { chunk, incarnation, volume, next: if held { CHUNK } else { 0 }, again: Vec::new(),
-                                verify: Vec::new(), held, summed: false, checking: false });
+                                verify: Vec::new(), held, summed: false, checking: false, open: None });
         true
     }
 
@@ -467,10 +478,12 @@ impl Copy {
         }
     }
 
-    /// The chunk copied and held to its source's: closed, and the next one.
+    /// The chunk copied and held to its source's: closed -- or kept open at
+    /// the generation the source held it open at -- and the next one.
     async fn close<D: Device>(&mut self, store: &Store<D>, out: &mut Vec<Out>) {
         let c = self.chunk_ref();
-        if let Err(e) = store.close_copy(c).await {
+        let open = self.work.as_ref().and_then(|w| w.open);
+        if let Err(e) = store.close_copy(c, open).await {
             return self.fail(alloc::format!("chunk {}'s copy not closed: {:?}", c.chunk, e), out);
         }
         self.stats.chunks += 1;
