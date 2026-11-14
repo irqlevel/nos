@@ -25,7 +25,7 @@
 
 extern crate alloc;
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -56,15 +56,25 @@ const WAIT_NS: u64 = 2 * nbsclient::DEADLINE_NS;
 /// The session's mailbox: room for every answer its requests out can bring
 /// by count -- closes are let out 128 places at a time (nbsclient's
 /// `CLOSING_MAX`), writes and reads by the driver's depth (N13b: 1,024
-/// places, overflowed by a stop's closes). Not by bytes: a read's data comes
-/// in pieces of up to 256 KiB, and hv's disk keeps 64 out, 16 MiB, where a
-/// module's mailboxes hold 64 MiB together -- a mailbox that big would leave
-/// hv four volumes. What it holds is taken at every turn, and an answer the
-/// mailbox has no room for is lost: its request is sent again in a second,
-/// and its replica asked out only where the leader's look finds it silent
-/// too -- the ask let go of once the replica answers (the review of
-/// 2026-11, which found the room said here for bytes it was not).
+/// places, overflowed by a stop's closes) -- and by bytes, the reads out
+/// held to `READS_OUT`. Not bigger: a module's mailboxes hold 64 MiB
+/// together (ipc's `OWNER_MAX_BYTES`), and hv's are a volume's each -- at 8
+/// MiB, eight volumes. What it holds is taken at every turn.
 const LIMITS: Limits = Limits { messages: 4096, bytes: 8 << 20 };
+/// The bytes of reads the drive has out to its session at once, at most:
+/// half the mailbox, less a MiB for everything else that comes to it -- so
+/// that the answers of every read out fit come each twice (a request
+/// unanswered a second is sent again, and the first answer may come after
+/// all), with the writes', the closes', the reconcile's one read and the
+/// mds's beside them. A read past it waits in the drive, in the order it
+/// came, and is let out as reads before it end; one bigger than it goes
+/// alone. Before, nothing held them: hv's disk keeps 64 reads of 256 KiB
+/// out, 16 MiB of answers for a mailbox of 8, and an answer with no room
+/// was lost -- its request sent again a second on, its replica asked out
+/// where the leader's look found it silent too (the review of 2026-11,
+/// m26). A cs slower than that second still has some answers come three
+/// times, and one lost so is sent again as before.
+const READS_OUT: u64 = (LIMITS.bytes / 2 - (1 << 20)) as u64;
 
 /// The driver's buffers, by an operation's tag: a write's bytes, the room
 /// a read's go to.
@@ -118,6 +128,11 @@ pub struct Drive {
     /// 2026-11): a request's id is a count, and the mds's word comes from
     /// this host alone.
     answer_hosts: BTreeSet<u16>,
+    /// The reads out to the session, by tag, each's bytes; their sum; and
+    /// those that wait for room (`READS_OUT`), in the order they came.
+    reads: BTreeMap<u64, u32>,
+    reads_out: u64,
+    held: VecDeque<(u64, u64, u32)>,
 }
 
 /// Tags of the driver's own blocking calls: past those `submit` hands out.
@@ -173,7 +188,8 @@ impl Drive {
             }
         }
         let mut d = Drive { s, mb, me: String::from(me), bufs: Bufs::default(), done: BTreeMap::new(), next_tag: 1,
-                            last: String::new(), answer_hosts: BTreeSet::new() };
+                            last: String::new(), answer_hosts: BTreeSet::new(), reads: BTreeMap::new(), reads_out: 0,
+                            held: VecDeque::new() };
         let mut out = Vec::new();
         d.s.start(boot_time_ns(), &mut out);
         d.handle(out);
@@ -217,6 +233,16 @@ impl Drive {
             Op::Read { offset, len } => {
                 data.try_reserve_exact(len as usize).map_err(|_| String::from("no memory for the read"))?;
                 data.resize(len as usize, 0);
+                /* Past the bytes of reads out, or behind one that waits: it
+                   waits its turn */
+                if !self.held.is_empty() || (self.reads_out != 0 && self.reads_out + u64::from(len) > READS_OUT) {
+                    self.held.try_reserve(1).map_err(|_| String::from("no memory for the read"))?;
+                    self.bufs.0.insert(tag, data);
+                    self.held.push_back((tag, offset, len));
+                    return Ok(tag);
+                }
+                self.reads.insert(tag, len);
+                self.reads_out += u64::from(len);
                 UserOp::Read { tag, offset, len }
             }
             Op::Write { offset } => {
@@ -321,6 +347,10 @@ impl Drive {
                     }
                     Out::Done { tag, ok } => {
                         self.done.insert(tag, ok);
+                        if let Some(len) = self.reads.remove(&tag) {
+                            self.reads_out -= u64::from(len);
+                            self.let_out(&mut more);
+                        }
                     }
                     Out::Say(line) => {
                         klog!(0, "{}", line);
@@ -329,6 +359,27 @@ impl Drive {
                 }
             }
             out = more;
+        }
+    }
+
+    /// The reads that wait, let out to the session in the order they came
+    /// as far as `READS_OUT` has room -- the first of them alone whatever
+    /// its size -- or failed, where the session is over and serves none.
+    fn let_out(&mut self, out: &mut Vec<Out>) {
+        if matches!(self.s.phase(), Phase::Failed(_) | Phase::Detached) {
+            for (tag, ..) in core::mem::take(&mut self.held) {
+                self.done.insert(tag, false);
+            }
+            return;
+        }
+        while let Some(&(tag, offset, len)) = self.held.front() {
+            if self.reads_out != 0 && self.reads_out + u64::from(len) > READS_OUT {
+                return;
+            }
+            self.held.pop_front();
+            self.reads.insert(tag, len);
+            self.reads_out += u64::from(len);
+            self.s.submit(UserOp::Read { tag, offset, len }, boot_time_ns(), &mut self.bufs, out);
         }
     }
 
