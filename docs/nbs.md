@@ -129,7 +129,20 @@ The same is on the management bus as the `nbs` provider (`provider.rs`,
   `chunks_at_one`, `chunks_unreachable`, `chunks_copying`, `chunks_unlike`).
   The panel colours it by the tones the descriptor gives it -- yellow,
   orange, red, green -- and a VM's disk on the volume by the worse of it
-  and the guest's I/O: red while its reads and writes fail;
+  and the guest's I/O: red while its reads and writes fail, yellow while
+  they wait past 50 ms on the average;
+- what a person should look at, `alerts`, the worst first -- or one row
+  saying all is well: this host's member stopped, no leader (no quorum:
+  nothing changed or repaired, the volumes attached going on), chunks with
+  no replica active, replicas the scrub found unlike, a device failed,
+  fewer than three hosts with room (no new chunk, no repair), chunks with
+  one replica, chunk servers down or out, chunks at two or being copied, a
+  chunk server under a tenth free, a host the registry has in maintenance
+  holding replicas -- asked of the `cluster` provider through the bus, as
+  NBS's controller does not read the flag yet -- and a device draining;
+  each with its host, its detail and its count where it has one, its tone
+  the descriptor's. The panel shows it first on NBS's page, and a VM's
+  disk on a volume of NBS's yellow while there is no leader;
 - to change: `volume_create`, `volume_delete`, `volume_resize`, and
   `volume_snapshot`, `volume_freeze`, `volume_clone` (N10d) -- a snapshot of
   an attached volume asked on its writer's host, as the command is;

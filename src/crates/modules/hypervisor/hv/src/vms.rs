@@ -947,6 +947,8 @@ pub struct DiskCounts {
     pub errors: u64,
     pub discards: u64,
     pub zeroings: u64,
+    /// What its backend took over the requests answered, in nanoseconds.
+    pub wait_ns: u64,
 }
 
 /// What `disk_io` says of a VM: whether its guest runs, how many times it
@@ -1387,6 +1389,7 @@ impl Vms {
             disks.push((w, DiskCounts {
                 reads: s.reads, writes: s.writes, read_bytes: s.read_bytes, written_bytes: s.written_bytes,
                 flushes: s.flushes, errors: s.errors, discards: s.discards, zeroings: s.zeroings,
+                wait_ns: s.wait_ns,
             }));
         }
         Ok(DiskIo { running: true, restarts, at_ns, disks })

@@ -331,6 +331,13 @@ pub struct Stats {
     pub interrupts: u64,
     /// Passes ended at their bound on the data they moved (`PASS_BYTES`).
     pub cut: u64,
+    /// What the backend took over the requests answered, from the hand-off
+    /// to the answer -- a flush behind a write counted with the write -- in
+    /// nanoseconds, each request's at most 2^32 of them as the trace's
+    /// records clamp a time (`tp::ns`): a client's latency is its growth
+    /// over the requests' between two looks. Two reads of the cycle counter
+    /// a request.
+    pub wait_ns: u64,
 }
 
 /// A request with the backend, as the device keeps it: the chain it came in
@@ -350,6 +357,9 @@ struct Slot {
     /// took no FLUSH: what it was -- its op, its bytes, a discard's or a
     /// write of zeros' ranges -- answered for when the flush comes back.
     behind: Option<(Op, usize, [u8; MAX_RANGES * RANGE_BYTES])>,
+    /// The cycle counter when its request went to the backend: what its
+    /// wait is counted from (`Stats::wait_ns`).
+    at: u64,
 }
 
 impl Slot {
@@ -412,7 +422,7 @@ impl Blk {
         for _ in 0..IN_FLIGHT {
             let mut segs = Vec::new();
             segs.try_reserve_exact(usize::from(QUEUE_SIZE)).map_err(|_| Error::NoMemory)?;
-            slots.push(Slot { out: false, head: None, segs, behind: None });
+            slots.push(Slot { out: false, head: None, segs, behind: None, at: 0 });
         }
         let mut name = [0u8; ID_BYTES];
         let n = id.len().min(ID_BYTES);
@@ -736,7 +746,7 @@ impl Blk {
             return Ok(true);
         }
         let s = &mut self.slots[slot];
-        (s.head, s.out) = (Some(head), true);
+        (s.head, s.out, s.at) = (Some(head), true, kcore::time::cycle_counter());
         /* Before the hand-off: what the backend's task does with it is
          * recorded after this. */
         crate::tp::blk_submit(self.index, slot, op, offset, len);
@@ -756,6 +766,7 @@ impl Blk {
         };
         let head = s.head.take();
         s.out = false;
+        let at = s.at;
         let behind = s.behind.take();
         if let (Some(chain), true, None) = (head, ok && op.writes() && !flushes, behind) {
             if self.broken.is_none() {
@@ -811,6 +822,9 @@ impl Blk {
                 } else {
                     self.stats.errors += 1;
                 }
+                /* A counter behind the hand-off -- another CPU's -- is no wait */
+                let waited = crate::tp::ns(kcore::time::cycle_counter().saturating_sub(at));
+                self.stats.wait_ns = self.stats.wait_ns.saturating_add(u64::from(waited));
                 match self.finish(mem, &segs, head, status, written) {
                     Ok(()) => true,
                     Err(e) => {

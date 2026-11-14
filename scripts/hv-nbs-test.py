@@ -23,8 +23,8 @@ device. Then:
   taken again refused, and a VM of the snapshot made on b by the provider
   and booted: its disk v1's as the snapshot was taken, v1's write among it;
   v1's disk activity through the bus (`disk_io`) -- its volume's reads and
-  the MiB it wrote counted, under the word it was started with -- twice,
-  the counters only growing;
+  the MiB it wrote counted, under the word it was started with, and the time
+  its requests waited -- twice, the counters only growing;
 - a guest on a with `disk=nbs:gdisk`: its disk the volume's size, its serial
   `nbs-<number>`; written with dd, synced, read back past the page cache the
   same; stopped -- the volume let go of, detached;
@@ -385,7 +385,7 @@ def main():
         check("v1's disk activity through the bus: its volume's reads, and the MiB it wrote, counted",
               io1 is not None and io1.get("running") is True and isinstance(io1.get("at_ms"), int)
               and d1.get("file") == "nbs:v1" and d1.get("reads", 0) > 0 and d1.get("writes", 0) > 0
-              and d1.get("written_bytes", 0) >= 1 << 20, io1)
+              and d1.get("written_bytes", 0) >= 1 << 20 and d1.get("wait_ns", 0) > 0, io1)
         a.run(x(v1, "echo 3 > /proc/sys/vm/drop_caches; dd if=/dev/vda of=/dev/null bs=1M count=4 2>/dev/null; echo nos-rc=$?",
                   120))
         io2 = json_of(a.run('mgmt call vm disk_io {"name":"v1"}'))
@@ -393,7 +393,8 @@ def main():
         check("asked again after a read: later, its reads and their bytes grown, nothing gone back",
               io2 is not None and io1 is not None and io2.get("at_ms", 0) > io1.get("at_ms", 0)
               and d2.get("reads", 0) > d1.get("reads", 0) and d2.get("read_bytes", 0) >= d1.get("read_bytes", 0) + (4 << 20)
-              and d2.get("writes", 0) >= d1.get("writes", 0), (io1, io2))
+              and d2.get("writes", 0) >= d1.get("writes", 0) and d2.get("wait_ns", 0) > d1.get("wait_ns", 0),
+              (io1, io2))
 
         # -- v1's disk snapshotted as it runs, through the bus as the panel takes one -- its guest's
         # session paused for it -- and a VM of the snapshot booted on b: its disk v1's then --
