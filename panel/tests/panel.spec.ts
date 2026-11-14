@@ -14,6 +14,20 @@ async function login(page: Page, locale = 'en') {
   return page.url().split('/h/')[1]!.split('/')[0]!;
 }
 
+/** How many times the page asks after a job's record in `ms`: none, once
+ * the job is done -- a page drawn again began the polling anew, and a job
+ * done was asked again in a loop. */
+async function jobAsksIn(page: Page, ms: number): Promise<number> {
+  let asked = 0;
+  const count = (r: { url(): string }) => {
+    if (/\/api\/h\/[^/]+\/jobs\/\d+/.test(r.url())) asked += 1;
+  };
+  page.on('request', count);
+  await page.waitForTimeout(ms);
+  page.off('request', count);
+  return asked;
+}
+
 /** How many connections a host has reset for going past what it lets in at
  * once, as its api.status says (`busy`): asked through the panel. */
 async function pastLimits(page: Page, host: string): Promise<number> {
@@ -207,6 +221,11 @@ test('VMs: listed, created as a job, cloned, deleted with a confirm', async ({ p
   await page.fill('input[name=to]', 'pw2');
   await page.getByTestId('form-vm-clone').getByRole('button', { name: 'Clone' }).click();
   await expect(page.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+  /* Its log said once, as the page around it is drawn again every three
+   * seconds; and once it is done, nothing more asked of it */
+  await expect(page.getByTestId('job').locator('pre')).toHaveText(
+    'disk.raw -- 20480 MiB, 2215 MiB of it data\n1100 of 2215 MiB copied\nvm.toml written');
+  expect(await jobAsksIn(page, 3500)).toBe(0);
 
   await page.goto(`/en/h/${host}/vms/pw2`);
   await page.getByRole('button', { name: 'Delete' }).click();
@@ -230,9 +249,11 @@ test('a VM made onto a device: its disk the device, one with something on it giv
   const host = await login(page);
   await page.goto(`/en/h/${host}/vms/new`);
   /* What the host may give is offered, what it may not is not: its root's
-   * disk, its EFI System partition and its mounted root are left out. */
+   * disk, its EFI System partition and its mounted root are left out. NBS's
+   * volumes are offered too, its images and snapshots not. */
   const onto = page.locator('select[name=onto]');
-  await expect(onto.locator('option')).toHaveText([/A file in its folder/, /nvme16/, /nvme17/]);
+  await expect(onto.locator('option')).toContainText([/A file in its folder/, /nvme16/, /nvme17/, /sda/, /nbs:web-root/]);
+  await expect(onto.locator('option', { hasText: /nvme0 |nvme01|nvme02|nbs:pw-snap/ })).toHaveCount(0);
   await page.fill('input[name=name]', 'dv1');
   await onto.selectOption('part:704db7dd-0007-4e69-94e6-46e271b44854');
   await expect(page.locator('input[name=disk]')).toBeDisabled();
@@ -334,6 +355,208 @@ test('a cluster: a second host added by its address and its key, the panel let i
   await page.getByTestId('host-nos-b').getByRole('button', { name: 'Remove' }).click();
   await expect(page.getByTestId('host-nos-b')).toHaveCount(0);
   await expect(page.getByTestId('host-wrong')).toHaveCount(0);
+});
+
+/** A host added to the panel by its address and its key: its id, once it is
+ * online and its page open. */
+async function addHost(page: Page, name: string, port: number, state: string): Promise<string> {
+  await page.goto('/en/hosts');
+  const form = page.locator('form');
+  await form.locator('input[name=name]').fill(name);
+  await form.locator('input[name=url]').fill(`127.0.0.1:${port}`);
+  await form.locator('input[name=pin]').fill(pinOf(state));
+  await form.getByRole('button', { name: 'Add a host' }).click();
+  const row = page.getByTestId(`host-${name}`);
+  await expect(row).toContainText('online', { timeout: 20_000 });
+  await row.getByRole('link', { name }).click();
+  await expect(page.getByTestId('host-state')).toHaveText('online', { timeout: 15_000 });
+  return page.url().split('/h/')[1]!.split('/')[0]!;
+}
+
+async function removeHost(page: Page, name: string) {
+  await page.goto('/en/hosts');
+  await page.getByTestId(`host-${name}`).getByRole('button', { name: 'Remove' }).click();
+  await expect(page.getByTestId(`host-${name}`)).toHaveCount(0);
+}
+
+test('a host of no cluster: its registry made, then its NBS, a device given to its chunk server and drained', async ({ page }) => {
+  await login(page);
+  const b = await addHost(page, 'nos-b', MOCK_B, STATE_B);
+  /* Added again after the test before took it away: the connections of then
+   * closed with it, none of now reset past the four of one key */
+  expect(await pastLimits(page, b)).toBe(0);
+
+  /* No cluster yet: its tables say so, and its status says this host as an
+   * invitation elsewhere asks for it */
+  await page.goto(`/en/h/${b}/p/cluster`);
+  await expect(page.getByTestId('resource-hosts')).toContainText('no member');
+  await page.getByRole('button', { name: /^Member/ }).click();
+  const status = page.getByTestId('form-cluster-status');
+  await status.getByRole('button', { name: 'Member' }).click();
+  await expect(status.getByTestId('answer')).toContainText('"member": false');
+  await expect(status.getByTestId('answer')).toContainText('"name": "nos-b"');
+
+  /* Made, of this host alone: a name not one refused first */
+  await page.getByRole('button', { name: /^Make a cluster/ }).click();
+  const init = page.getByTestId('form-cluster-init');
+  await init.locator('input[name=name]').fill('Not One');
+  await init.getByRole('button', { name: 'Make a cluster' }).click();
+  await expect(init).toContainText("is not a cluster's name");
+  await init.locator('input[name=name]').fill('pw-cluster');
+  await init.getByRole('button', { name: 'Make a cluster' }).click();
+  await expect(init.getByTestId('answer')).toContainText('"cluster": "pw-cluster"');
+  await page.goto(`/en/h/${b}/p/cluster`);
+  await expect(page.getByTestId('resource-hosts')).toContainText('nos-b');
+
+  /* A join is a host's of no cluster: a job refused here now, saying why */
+  await page.getByRole('button', { name: /^Join a cluster/ }).click();
+  const join = page.getByTestId('form-cluster-join');
+  await join.locator('input[name=token]').fill('nos1-' + 'ab'.repeat(40));
+  await join.getByRole('button', { name: 'Join a cluster' }).click();
+  await expect(join.getByTestId('job')).toContainText('a member of a cluster already', { timeout: 20_000 });
+
+  /* Its NBS: none yet, then one of this host alone */
+  await page.goto(`/en/h/${b}/p/nbs`);
+  await expect(page.getByTestId('resource-hosts')).toContainText('in no NBS cluster');
+  await page.getByRole('button', { name: /^Make an NBS cluster/ }).click();
+  const nbsInit = page.getByTestId('form-nbs-init');
+  await nbsInit.locator('input[name=name]').fill('pw-store');
+  await nbsInit.getByRole('button', { name: 'Make an NBS cluster' }).click();
+  await expect(nbsInit.getByTestId('answer')).toContainText('"cluster": "pw-store"');
+  await page.goto(`/en/h/${b}/p/nbs`);
+  await expect(page.getByTestId('resource-hosts')).toContainText('nos-b');
+  await expect(page.getByTestId('resource-devices')).toContainText('Nothing');
+
+  /* A device with a filesystem on it: refused, then taken with wipe -- the
+   * confirm asked each time */
+  await page.getByRole('button', { name: /^Add a device/ }).click();
+  const add = page.getByTestId('form-nbs-device_add');
+  await add.locator('input[name=device]').fill('nvme17');
+  await add.getByRole('button', { name: 'Add a device' }).click();
+  await add.getByRole('button', { name: 'Confirm' }).click();
+  await expect(add).toContainText("not NBS's");
+  await add.locator('select[name=wipe]').selectOption('true');
+  await add.getByRole('button', { name: 'Add a device' }).click();
+  await add.getByRole('button', { name: 'Confirm' }).click();
+  await expect(add.getByTestId('answer')).toContainText('"wiped": true');
+  await page.goto(`/en/h/${b}/p/nbs`);
+  const devices = page.getByTestId('resource-devices');
+  await expect(devices).toContainText('part:704db7dd-0007');
+  await expect(devices).toContainText('active');
+  /* A VM is not given what NBS's chunk server has now */
+  await page.goto(`/en/h/${b}/vms/new`);
+  await expect(page.locator('select[name=onto]').locator('option')).toContainText([/nvme16/]);
+  await expect(page.locator('select[name=onto]').locator('option', { hasText: 'nvme17' })).toHaveCount(0);
+
+  /* Drained, with the confirm the descriptor says */
+  await page.goto(`/en/h/${b}/p/nbs`);
+  await devices.getByRole('row', { name: /704db7dd-0007/ }).getByRole('button', { name: 'Drain' }).click();
+  const drain = page.getByTestId('form-nbs-device_drain');
+  await drain.getByRole('button', { name: 'Drain' }).click();
+  await expect(drain).toContainText('until it is added again');
+  await drain.getByRole('button', { name: 'Confirm' }).click();
+  await expect(devices).toContainText('draining');
+
+  await removeHost(page, 'nos-b');
+});
+
+test('NBS\'s members: one removed with its name typed, a host off the registry not reached, one added and replaced as jobs', async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/p/nbs`);
+  const hosts = page.getByTestId('resource-hosts');
+  await expect(hosts).toContainText('mock-d');
+  await hosts.getByRole('row', { name: /mock-d/ }).getByRole('button', { name: 'Remove' }).click();
+  const remove = page.getByTestId('form-nbs-host_remove');
+  await remove.getByRole('button', { name: 'Remove' }).click();
+  await expect(remove).toContainText('for good');
+  const confirm = remove.getByRole('button', { name: 'Confirm' });
+  await expect(confirm).toBeDisabled();
+  await remove.getByLabel('Type it here').fill('mock-d');
+  await confirm.click();
+  await expect(hosts).not.toContainText('mock-d');
+
+  /* A host the registry has not: its offer reaches nobody, and says so */
+  await page.getByRole('button', { name: /^Add a host/ }).click();
+  const add = page.getByTestId('form-nbs-host_add');
+  await add.locator('input[name=host]').fill('mock-q');
+  await add.getByRole('button', { name: 'Add a host' }).click();
+  await expect(add.getByTestId('job-status')).toHaveText('failed', { timeout: 20_000 });
+  await expect(add.getByTestId('job')).toContainText('out of reach');
+
+  /* The one removed, added again: a new member */
+  await page.goto(`/en/h/${host}/p/nbs`);
+  await page.getByRole('button', { name: /^Add a host/ }).click();
+  await add.locator('input[name=host]').fill('mock-d');
+  await add.getByRole('button', { name: 'Add a host' }).click();
+  await expect(add.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+  await page.goto(`/en/h/${host}/p/nbs`);
+  await expect(hosts).toContainText('mock-d');
+
+  /* Replaced from its row, its name typed: the job's log said once, and
+   * the table loaded again once at its end -- not a loop of it */
+  await hosts.getByRole('row', { name: /mock-d/ }).getByRole('button', { name: 'Replace' }).click();
+  const replace = page.getByTestId('form-nbs-host_replace');
+  await replace.getByRole('button', { name: 'Replace' }).click();
+  await replace.getByLabel('Type it here').fill('mock-d');
+  await replace.getByRole('button', { name: 'Confirm' }).click();
+  await expect(replace.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+  await expect(replace.getByTestId('job').locator('pre')).toHaveText(/^mock-d's old member \d+ removed\smock-d offered the NBS cluster anew$/);
+  expect(await jobAsksIn(page, 3000)).toBe(0);
+});
+
+test('a VM of an image of NBS\'s: its disk a clone, named as asked; one onto a volume of NBS\'s', async ({ page }) => {
+  const host = await login(page);
+  /* A snapshot of its own to make VMs of */
+  const snap = await page.request.post(`/api/h/${host}/call/nbs/volume_snapshot`, {
+    headers: { Origin: new URL(page.url()).origin }, data: { volume: 'web-root', name: 'pw-base' },
+  });
+  expect(snap.status()).toBe(200);
+
+  await page.goto(`/en/h/${host}/vms/new`);
+  await page.fill('input[name=name]', 'nb1');
+  await page.getByTestId('source').getByLabel(/An image of NBS/).check();
+  const image = page.locator('select[name=image]');
+  /* Images and snapshots, no volume */
+  await expect(image.locator('option', { hasText: 'web-root' })).toHaveCount(0);
+  await image.selectOption('pw-base');
+  await expect(page.locator('input[name=disk]')).toHaveAttribute('placeholder', '2.0');
+  await page.getByRole('button', { name: 'Create' }).click();
+  await expect(page.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+  await expect(page.getByTestId('job')).toContainText('nbs:nb1 cloned from nbs:pw-base');
+  await page.goto(`/en/h/${host}/p/nbs`);
+  await expect(page.getByTestId('resource-volumes').getByRole('row', { name: /^\s*nb1\s/ })).toContainText('pw-base');
+  await page.goto(`/en/h/${host}/vms/nb1`);
+  await page.getByRole('tab', { name: 'Disks' }).click();
+  await expect(page.getByTestId('vm-disks')).toContainText('nbs:nb1');
+
+  /* Its clone named otherwise, grown -- and refused where that name is a
+   * volume already, before anything is made */
+  await page.goto(`/en/h/${host}/vms/new`);
+  await page.fill('input[name=name]', 'nb2');
+  await page.getByTestId('source').getByLabel(/An image of NBS/).check();
+  await page.locator('select[name=image]').selectOption('pw-base');
+  await page.fill('input[name=clone]', 'nb1');
+  await page.getByRole('button', { name: 'Create' }).click();
+  await expect(page.getByTestId('job')).toContainText('nbs:nb1 is there already', { timeout: 20_000 });
+  await page.goto(`/en/h/${host}/vms/new`);
+  await page.fill('input[name=name]', 'nb2');
+  await page.getByTestId('source').getByLabel(/An image of NBS/).check();
+  await page.locator('select[name=image]').selectOption('pw-base');
+  await page.fill('input[name=clone]', 'nb2-disk');
+  await page.fill('input[name=disk]', '4');
+  await page.getByRole('button', { name: 'Create' }).click();
+  await expect(page.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+  await expect(page.getByTestId('job')).toContainText('nbs:nb2-disk cloned from nbs:pw-base, 4096 MiB');
+
+  /* A URL's image poured onto a volume of NBS's: no size asked, the volume's */
+  await page.goto(`/en/h/${host}/vms/new`);
+  await page.fill('input[name=name]', 'nb3');
+  await page.locator('select[name=onto]').selectOption('nbs:web-root');
+  await expect(page.locator('input[name=disk]')).toBeDisabled();
+  await expect(page.getByTestId('onto-volume')).toContainText('poured over whatever the volume holds');
+  await page.getByRole('button', { name: 'Create' }).click();
+  await expect(page.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+  await expect(page.getByTestId('job')).toContainText('nbs:web-root: 3584 MiB poured');
 });
 
 test('the theme switches, and the language', async ({ page }) => {
