@@ -630,6 +630,31 @@ test('images and snapshots: an image of a URL as a job, a VM of it from its row,
   await expect(page.getByTestId('images').getByRole('row', { name: /im1-s1/ })).toContainText('снимок');
 });
 
+test('a VM\'s disks: each one\'s IOPS and bandwidth charted as it runs, a volume of NBS\'s among them; one that is off says so', async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/vms/web`);
+  await page.getByRole('tab', { name: 'Disks' }).click();
+  const disk = page.getByTestId('disk-io').getByTestId('disk-io-disk.raw');
+  await expect(disk.getByTestId('disk-io-now')).toContainText(/Reads [1-9]\d* IOPS · .+\/s\s+Writes [1-9]\d* IOPS/,
+    { timeout: 15_000 });
+  await expect(disk.getByTestId('chart')).toHaveCount(2, { timeout: 15_000 });
+
+  /* A VM on a volume of NBS's, started: its disk's activity the same way */
+  await page.goto(`/en/h/${host}/vms/im1`);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await page.getByTestId('form-vm-start').getByRole('button', { name: 'Start', exact: true }).click();
+  await expect(page.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+  await page.getByRole('tab', { name: 'Disks' }).click();
+  const nbs = page.getByTestId('disk-io').getByTestId('disk-io-nbs:im1');
+  await expect(nbs).toContainText('NBS');
+  await expect(nbs.getByTestId('disk-io-now')).toContainText(/Reads [1-9]\d* IOPS/, { timeout: 15_000 });
+
+  /* One that is off has nothing to chart, and says so */
+  await page.goto(`/ru/h/${host}/vms/db`);
+  await page.getByRole('tab', { name: 'Диски' }).click();
+  await expect(page.getByTestId('disk-io')).toContainText('Не работает');
+});
+
 test('the theme switches, and the language', async ({ page }) => {
   const host = await login(page);
   const dark = await page.evaluate(() => document.documentElement.classList.contains('dark'));

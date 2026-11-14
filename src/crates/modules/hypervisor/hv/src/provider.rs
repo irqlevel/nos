@@ -8,7 +8,9 @@
 //!
 //! - reads: `list` (every VM: its folder's, and those on the list without
 //!   one), `get`, `host`, `networks`, `config_get`, `console_read` (a page of
-//!   the console, its control sequences taken out), `disks`, `forwards`;
+//!   the console, its control sequences taken out), `disks`, `disk_io` (each
+//!   disk's counters since the guest's boot, and when they were read: a
+//!   client makes its rates of two), `forwards`;
 //! - actions: `config_set` (a vm.toml checked as a start checks it, the old
 //!   one kept as vm.toml.prev), `forward_add` and `forward_del` (kept in its
 //!   vm.toml, and made or taken away now if it runs), `console_write`,
@@ -38,6 +40,7 @@ use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use kcore::consts::NS_PER_MS;
 use kcore::mgmt::{Call, Kind, Method, Provider, Status, Writer};
 use mgmtwire::{Invalid, Params, Value};
 
@@ -52,7 +55,7 @@ use crate::State;
 
 const DESCRIPTOR: &str = include_str!("vm.descriptor.json");
 
-const METHODS: [Method; 25] = [
+const METHODS: [Method; 26] = [
     Method { name: "list", kind: Kind::Read },
     Method { name: "get", kind: Kind::Read },
     Method { name: "host", kind: Kind::Read },
@@ -60,6 +63,7 @@ const METHODS: [Method; 25] = [
     Method { name: "config_get", kind: Kind::Read },
     Method { name: "console_read", kind: Kind::Read },
     Method { name: "disks", kind: Kind::Read },
+    Method { name: "disk_io", kind: Kind::Read },
     Method { name: "devices", kind: Kind::Read },
     Method { name: "forwards", kind: Kind::Read },
     Method { name: "config_set", kind: Kind::Action },
@@ -227,6 +231,7 @@ fn provide(state: &State, method: &str, params: &[u8], call: &mut Call) -> Statu
         "config_get" => config_get(state, p, call),
         "console_read" => console_read(state, p, call),
         "disks" => disks(state, p, call),
+        "disk_io" => disk_io(state, p, call),
         "devices" => devices(state, p, call),
         "forwards" => forwards(state, p, call),
         "config_set" => config_set(state, p, call),
@@ -853,6 +858,51 @@ fn disks(state: &State, mut p: Params, call: &mut Call) -> Status {
             w.end_object();
         }),
         Err(e) => refuse(call, Status::Failed, &e, None),
+    }
+}
+
+/// `disk_io`: what each disk of a VM on the list has done since its
+/// guest's boot -- reads, writes and their bytes, flushes, errors, discards
+/// and writes of zeros -- each by the word it was started with, and when
+/// that was read: a client makes its rates -- IOPS, bandwidth -- of two.
+/// No disks while the guest does not run; how many times it was booted
+/// again says where the counters began anew.
+fn disk_io(state: &State, mut p: Params, call: &mut Call) -> Status {
+    let name = match name_param(&mut p, "name", call) {
+        Ok(n) => n,
+        Err(s) => return s,
+    };
+    if let Err(s) = finish(p, call) {
+        return s;
+    }
+    match state.vms.disk_io(name) {
+        Ok(io) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("vm", name);
+            w.field_bool("running", io.running);
+            w.field_uint("restarts", u64::from(io.restarts));
+            w.field_uint("at_ms", io.at_ns / NS_PER_MS);
+            w.key("disks");
+            w.begin_list();
+            for (word, c) in &io.disks {
+                w.begin_object();
+                w.field_str("file", word);
+                w.field_uint("reads", c.reads);
+                w.field_uint("writes", c.writes);
+                w.field_uint("read_bytes", c.read_bytes);
+                w.field_uint("written_bytes", c.written_bytes);
+                w.field_uint("flushes", c.flushes);
+                w.field_uint("errors", c.errors);
+                w.field_uint("discards", c.discards);
+                w.field_uint("zeroings", c.zeroings);
+                w.end_object();
+            }
+            w.end_list();
+            w.end_object();
+        }),
+        Err(e) if e.starts_with("no vm ") => refuse(call, Status::NotFound, &alloc::format!("{} on the list -- it is \
+                                                                                          off", e), Some("name")),
+        Err(e) => refuse(call, Status::Busy, &e, None),
     }
 }
 
