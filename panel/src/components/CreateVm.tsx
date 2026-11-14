@@ -7,17 +7,10 @@ import { JobWatch } from './JobWatch';
 import { call, startJob } from '@/lib/client';
 import { bytes } from '@/lib/descriptor';
 import type { Words } from '@/lib/i18n';
+import { CLOUD_IMAGES as IMAGES, NbsVolume as Volume, VOLUME_NAME as VOLUME } from '@/lib/images';
 
-/** Images a VM is made of in a click: the distributions' own cloud images,
- * which nos fetches itself. */
-const IMAGES = [
-  { label: 'Debian 13 (trixie)', url: 'https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2' },
-  { label: 'Ubuntu 24.04 LTS', url: 'https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img' },
-];
 const GIB = 1024 ** 3;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
-/** A volume's name of NBS's, as nbsmeta takes one: an image's clone's. */
-const VOLUME = /^[a-z0-9][a-z0-9._-]{0,62}$/;
 /** What `onto` names a volume of NBS's by. */
 const NBS = 'nbs:';
 
@@ -30,25 +23,20 @@ interface Device {
   boots_the_machine: string | null; refused: string | null;
 }
 
-/** A volume of NBS's (the nbs provider's `volumes`): an image or a snapshot
- * a VM is made of -- cloned, its clone the VM's disk -- or a volume a URL's
- * image is poured onto, taken from a writer elsewhere with force. */
-interface Volume {
-  name: string; kind: 'volume' | 'image' | 'snapshot'; size: number; writer: string | null;
-}
-
 function usable(d: Device): boolean {
   return d.id !== null && d.in_use_by === null && d.boots_the_machine === null;
 }
 
-export function CreateVm({ host, locale, w }: { host: string; locale: string; w: Words }) {
+export function CreateVm({ host, locale, w, image: given }: { host: string; locale: string; w: Words; image?: string }) {
   const ru = locale === 'ru';
   const [name, setName] = useState('');
-  const [source, setSource] = useState<'url' | 'image'>('url');
+  /* An image or a snapshot named in the address -- its row's "Create a VM"
+   * -- is the one picked */
+  const [source, setSource] = useState<'url' | 'image'>(given ? 'image' : 'url');
   const [url, setUrl] = useState(IMAGES[0]!.url);
-  const [image, setImage] = useState('');
+  const [image, setImage] = useState(given ?? '');
   const [clone, setClone] = useState('');
-  const [disk, setDisk] = useState('20');
+  const [disk, setDisk] = useState(given ? '' : '20');
   const [mem, setMem] = useState('1024');
   const [cpus, setCpus] = useState('1');
   const [password, setPassword] = useState('');
@@ -205,10 +193,10 @@ export function CreateVm({ host, locale, w }: { host: string; locale: string; w:
           </>
         ) : (
           <>
-            {images.length === 0 ? (
+            {volumes === null ? null : images.length === 0 ? (
               <p className="text-sm text-muted" data-testid="no-images">
-                {ru ? 'В NBS нет ни образов, ни снимков: они делаются на странице блочного хранилища.' :
-                  'NBS holds no image or snapshot yet: the Block storage page makes them.'}
+                {ru ? 'В NBS нет ни образов, ни снимков: образ делается на странице «Образы», снимок -- на странице машины.' :
+                  'NBS holds no image or snapshot yet: the Images page makes an image, a VM\'s page a snapshot.'}
               </p>
             ) : (
               <label className="block text-sm text-fg-soft">{ru ? 'Образ NBS' : 'An image of NBS\'s'}
