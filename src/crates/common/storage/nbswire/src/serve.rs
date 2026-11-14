@@ -324,7 +324,7 @@ pub enum Done {
     Closed(bool),
     Held(Vec<(u32, u32, u64)>),
     Chunks(Vec<(u32, u32, u32, u32)>),
-    Sums(Vec<u32>),
+    Sums { sums: Vec<u32>, open: Option<u64> },
     Scrub { open: bool, written: u32, sums: Vec<u32> },
 }
 
@@ -338,7 +338,7 @@ impl Done {
             Done::Closed(c) => Reply::Closed(*c),
             Done::Held(h) => Reply::Held(h.clone()),
             Done::Chunks(c) => Reply::Chunks(c.clone()),
-            Done::Sums(s) => Reply::Sums(s.clone()),
+            Done::Sums { sums, open } => Reply::Sums { sums: sums.clone(), open: *open },
             Done::Scrub { open, written, sums } => Reply::Scrub { open: *open, written: *written, sums: sums.clone() },
         }
     }
@@ -429,7 +429,17 @@ async fn serve_noting<D: Device, A: Asker>(store: &Store<D>, vouched: &Requests,
             joins.set(marked);
             Ok(Done::Done)
         }
-        Op::Read { chunk, position, index, offset, len } => {
+        Op::Read { chunk, position, index, offset, len, as_of } => {
+            /* A reader's, refused once a writer attached after it has fenced
+               the volume here: read at no generation, it read on under the
+               writer, what it read torn between the two (the review of
+               2026-11, its question 4) */
+            if g == 0 && as_of != 0 {
+                let fence = store.fence_of(v);
+                if fence >= as_of {
+                    return Err(Refusal::Fenced { generation: fence });
+                }
+            }
             let mut buf = Vec::new();
             if buf.try_reserve_exact(len as usize).is_err() {
                 return Err(Refusal::NotReady);
@@ -450,10 +460,14 @@ async fn serve_noting<D: Device, A: Asker>(store: &Store<D>, vouched: &Requests,
         Op::Close { chunk, position, index } => {
             let check = Check::of(v, g, chunk);
             let known = vouched.knows(store, &check, &chunk);
-            match store.close(v, g, chunk).await {
+            /* Its epoch held as a write's (`Store::close`): one this cs does
+               not know vouched for by the mds first -- a joiner learns its
+               join so -- and one older than the chunk's refused, for its
+               writer to read its map and close the joiner too */
+            match store.close(v, g, chunk, known).await {
                 Err(e) if unchecked(&e, known) => {
                     verify(store, vouched, ask, check, position, index, true).await?;
-                    store.close(v, g, chunk).await.map(Done::Closed).map_err(Refusal::of)
+                    store.close(v, g, chunk, true).await.map(Done::Closed).map_err(Refusal::of)
                 }
                 done => done.map(Done::Closed).map_err(Refusal::of),
             }
@@ -504,7 +518,7 @@ async fn serve_noting<D: Device, A: Asker>(store: &Store<D>, vouched: &Requests,
             if !store.whole() {
                 return Err(Refusal::Failed);
             }
-            store.sums(chunk, offset, len).await.map(Done::Sums).map_err(Refusal::of)
+            store.sums(chunk, offset, len).await.map(|(sums, open)| Done::Sums { sums, open }).map_err(Refusal::of)
         }
         /* The leader's scrub (N9e): sums and a record, nothing moved on and
            no data -- answered as a ping is, unvouched */

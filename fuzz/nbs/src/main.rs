@@ -80,11 +80,33 @@ const CLUSTER_STEPS: u64 = 2000;
 /// and a write to a place whose close is out sent to each replica
 /// directly, the close sent no more (`client_reopened_direct`, 10774: a
 /// close sent again came after the write and closed the chunk over it, the
-/// writer taken over before its next close, its replicas left apart). A
+/// writer taken over before its next close, its replicas left apart). And
+/// those of the review's question 5, found by a campaign of its mutants: a
+/// join's copy keeping open what its source held open (`copy_keeps_open`,
+/// `sums_say_open`: 11883, 16293, 16662 -- closed by the copy, the source taken
+/// out took the last mark, and two active replicas were apart with none);
+/// and a close refused for its view, to be sent again after the map read,
+/// sent no more once its place is written again (`client_reopened_after_map`,
+/// 20346: sent after the write, it closed the chunk over it); and those
+/// the invariants of that round found the good tree failing at: a close of
+/// the driver's waiting on a place a write took as it began, closed by
+/// nobody, the flushes after it failed at their deadline
+/// (`client_close_after_write`: 17081, 17235), and a close settled by a
+/// view that changed -- refused as no replica's, or waiting on a cs taken
+/// out -- taken for closed before the map read sent it to the joiner made a
+/// member, which held the chunk open (`client_not_here_waits_map`,
+/// `client_taken_out_waits_map`: 18153, 18466, 25047, 25064); and three
+/// rules of before whose races that round's course moved past the range,
+/// found again by a campaign of each mutant: a copy-up by a view behind its
+/// set asked again from its start (`client_copy_stale_view`, 61339), a
+/// flush answered only once the session serves (`client_flush_serving`,
+/// 60065, 61530), and a write of a chain applied before a join of its set
+/// began written again as it comes again (`relayed_joins`, 60834, 70881). A
 /// stopgap: a race moved on by the next change is lost again, which the
 /// mutants say.
-const GATE_CLUSTER_ALSO: [u64; 19] = [1232, 2759, 5241, 6647, 7786, 1219, 1960, 2149, 3663, 5316, 7225, 2758, 4206,
-                                      5375, 2962, 9122, 8918, 4710, 10774];
+const GATE_CLUSTER_ALSO: [u64; 34] = [1232, 2759, 5241, 6647, 7786, 1219, 1960, 2149, 3663, 5316, 7225, 2758, 4206,
+                                      5375, 2962, 9122, 8918, 4710, 10774, 11883, 16293, 16662, 20346,
+                                      17081, 17235, 18153, 18466, 25047, 25064, 61339, 60065, 61530, 60834, 70881];
 const GATE_JOIN_SEEDS: u64 = 800;
 /// The `tail` target's: the cluster target's over a volume no whole number of
 /// chunks (the review of 2026-11).

@@ -871,7 +871,10 @@ impl Model {
                     }
                     v.readers.push(host.clone());
                 }
-                Ok(Answer::Attached { generation: 0, first: false })
+                /* A reader's: the generation a writer would be given next,
+                   which its reads carry (the review of 2026-11, its
+                   question 4) */
+                Ok(Answer::Attached { generation: next, first: false })
             }
             Command::Reattach { name, host, generation, token } => {
                 if !self.init {
@@ -2120,7 +2123,25 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
                 let silent_ms = if answering { 0 } else { r.pick(&[1_000u64, 6_000, 700_000]).unwrap_or(6_000) };
                 Seen { cs, answering, silent_ms, maintenance: r.chance(10) }
             }).collect();
-            let mut plan = repair::plan(s, &seen, repair::After::default());
+            /* The joins standing, as the leader has seen them: some past
+               their time, given up */
+            let joining: Vec<repair::Joining> = s.sets().iter().enumerate().filter_map(|(id, set)| {
+                let j = set.joiner?;
+                let age_ms = if r.chance(20) { repair::join_limit_ms(set.chunks) + r.below(1000) } else { r.below(60_000) };
+                Some(repair::Joining { set: id as u32, since: j.since, age_ms })
+            }).collect();
+            let mut plan = repair::plan(s, &seen, &joining, repair::After::default());
+            /* Every join past its time given up, and none before it (the
+               review of 2026-11, its question 2) */
+            for j in &joining {
+                let Some(set) = s.sets().get(j.set as usize) else { continue };
+                let Some(joiner) = set.joiner else { continue };
+                let unjoin = Command::Unjoin { set: j.set, cs: joiner.cs, since: j.since };
+                if (j.age_ms >= repair::join_limit_ms(set.chunks)) != plan.contains(&unjoin) {
+                    panic!("the controller's plan {:?}, a join of set {} {} ms old (its time {} ms)", plan, j.set,
+                           j.age_ms, repair::join_limit_ms(set.chunks));
+                }
+            }
             if plan.is_empty() {
                 Command::CsUp { cs: r.below(m.cs.len() as u64 + 1) as u32 }
             } else {
@@ -2146,7 +2167,7 @@ fn settle(s: &State, gone: &[bool]) -> Option<String> {
     let turns = 4 * (t.sets().len() + 4);
     let mut index = 2_000_000u64;
     for _ in 0..turns {
-        let cmds = repair::plan(&t, &seen, repair::After::default());
+        let cmds = repair::plan(&t, &seen, &[], repair::After::default());
         for c in &cmds {
             index += 1;
             if let Some(Answer::Refused(why)) = Answer::decode(&t.apply(index, &c.encode())) {

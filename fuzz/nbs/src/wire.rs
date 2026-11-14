@@ -147,6 +147,7 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                 1 => Op::Write { chunk: chunk(r), position: r.below(1 << 32) as u32, index: r.below(u64::MAX),
                                  offset: r.below(1 << 32) as u32, data: &data[..n] },
                 2 => Op::Read { chunk: chunk(r), position: r.below(1 << 32) as u32, index: r.below(u64::MAX),
+                                as_of: if r.chance(50) { 0 } else { r.below(u64::MAX) },
                                 offset: r.below(1 << 32) as u32, len: r.below(u64::from(DATA_MAX) + 1) as u32 },
                 3 => Op::Flush,
                 4 => Op::Close { chunk: chunk(r), position: r.below(1 << 32) as u32, index: r.below(u64::MAX) },
@@ -187,7 +188,8 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
                 }
                 6 => {
                     let k = len(r, nbswire::SUMS_MAX as u64);
-                    Reply::Sums((0..k).map(|_| r.below(1 << 32) as u32).collect())
+                    Reply::Sums { sums: (0..k).map(|_| r.below(1 << 32) as u32).collect(),
+                                  open: r.chance(50).then(|| r.below(u64::MAX)) }
                 }
                 7 => {
                     let k = len(r, nbswire::SUMS_MAX as u64);
