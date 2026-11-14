@@ -134,7 +134,7 @@ UDP shell with `-smp 4`:
   shell input, SMP via PSCI `CPU_ON`, PSCI SYSTEM_OFF/RESET.
 - virtio-mmio (modern v2) behind `VirtioTransport`: blk/net/rng work
   end-to-end (nanofs format/mount/write, DHCP + ping, entropy).
-- Verified: `scripts/smoke-arm64.sh` green under TCG (16s) and HVF (4s);
+- Verified: `tests/smoke-arm64.sh` green under TCG (16s) and HVF (4s);
   x86 smoke green after every step.
 
 **Follow-ups landed (branch arm64-follow-ups):** Rust on arm64

@@ -57,7 +57,7 @@ pub const LIST_MAX: usize = 4096;
 /// The most a list asked for at once gives -- a set's chunks to its joiner,
 /// a volume's open chunks to its writer's start, the chunks and volumes the
 /// garbage pass asks about: a page of it, the rest asked from the last on.
-/// A few in fuzz/nbs's builds, so that every list goes past its first page
+/// A few in tests/fuzz/nbs's builds, so that every list goes past its first page
 /// there (`small_pages`); `LIST_MAX` everywhere else.
 #[cfg(not(feature = "small_pages"))]
 pub const PAGE: usize = LIST_MAX;
@@ -253,7 +253,7 @@ pub struct JoinView {
     /// the set's members, it holds the fence of the one before, and that
     /// one, taken over, its view as new as the join, would write it there
     /// as nowhere else -- unasked, the chunks the copy moved on at the
-    /// join's epoch (found by fuzz/nbs's cluster target).
+    /// join's epoch (found by tests/fuzz/nbs's cluster target).
     pub fences: Vec<(u32, u64)>,
 }
 

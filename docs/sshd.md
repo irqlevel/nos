@@ -237,7 +237,7 @@ within a minute.
 
 ## Testing
 
-`scripts/sshd-test.py` is its end-to-end test, against OpenSSH's own client.
+`tests/sshd-test.py` is its end-to-end test, against OpenSSH's own client.
 On arm64 (`--arch aarch64`, the default; HVF on an Apple Silicon Mac) it loads
 the module over the UDP shell and works it: commands, a shell with a terminal
 and one without, 3 MiB of output through the client's window with rekeys in

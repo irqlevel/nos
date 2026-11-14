@@ -11,7 +11,7 @@ It was a chain of bugs rather than one. The last two, both fixed on September 13
 
 ## Nobody had pressed the button
 
-The bugs surfaced so late because nothing ran the shutdown path. Both smoke tests wait for their boot markers, exit, and kill QEMU on the way out ([`smoke-test.sh`](https://github.com/irqlevel/nos/blob/master/scripts/smoke-test.sh)), and a QEMU session in development usually ends the same way. A kernel that faulted on the way down looked exactly like one that did not.
+The bugs surfaced so late because nothing ran the shutdown path. Both smoke tests wait for their boot markers, exit, and kill QEMU on the way out ([`smoke-test.sh`](https://github.com/irqlevel/nos/blob/master/tests/smoke-test.sh)), and a QEMU session in development usually ends the same way. A kernel that faulted on the way down looked exactly like one that did not.
 
 That changed on September 9, when nos got a read-write ext2 root filesystem ([7e0b5db](https://github.com/irqlevel/nos/commit/7e0b5db2a57c8e3741fdfff1263201e7c87b17bb)). Like Linux, the driver clears the `valid` bit in the superblock when it mounts read-write and sets it again at a clean unmount. A boot that ends any other way shows up at the next mount as "not cleanly unmounted". From then on, `poweroff` had real work to do.
 
@@ -66,7 +66,7 @@ Everything above `PrepareHalt` runs on a live machine. Everything below it is th
 
 But a single halt is not a place where a CPU stays. On arm64 `Hlt()` is WFI, and WFI may complete at any moment: a pending interrupt ends it even while interrupts are masked. Under HVF (the Apple Hypervisor.framework that QEMU uses on Apple Silicon), all three APs of a four-CPU guest were out of their WFI within milliseconds. Each one returned from the IPI into the task it had interrupted. Meanwhile CPU 0 had seen `StateExited` and was freeing the tasks, their stacks and at last the heap. One of the APs wrote to a page that had just been unmapped and took a data abort, in the middle of CPU 0's static destructors.
 
-The report is where we went wrong. The panic path writes to the PL011 serial port without taking the console lock. So the AP's report came out interleaved, character by character, with CPU 0's traces from the destructors. Read that way, it looked like a fault in `TaskTable::~TaskTable` itself, and the bug went by that name for a while. The SSH server's test, written the day before the fix, accepts a panic at its poweroff and blames `TaskTable::~TaskTable` in a comment ([`sshd-test.py`](https://github.com/irqlevel/nos/blob/master/scripts/sshd-test.py)).
+The report is where we went wrong. The panic path writes to the PL011 serial port without taking the console lock. So the AP's report came out interleaved, character by character, with CPU 0's traces from the destructors. Read that way, it looked like a fault in `TaskTable::~TaskTable` itself, and the bug went by that name for a while. The SSH server's test, written the day before the fix, accepts a panic at its poweroff and blames `TaskTable::~TaskTable` in a comment ([`sshd-test.py`](https://github.com/irqlevel/nos/blob/master/tests/sshd-test.py)).
 
 The single halt was old. It came in 2018 with a commit called "kernel: fix crash on shutdown" ([28ba855](https://github.com/irqlevel/nos/commit/28ba855c298d452d91abadd1362a6a47bd1fd42a)), which replaced an endless spin loop with it. On x86 a halt with interrupts off lasts until the first NMI (non-maskable interrupt). The arm64 port runs the same code, and WFI makes no such promise.
 

@@ -292,10 +292,10 @@ the symbol table backtraces name functions by.
 
 ## Tested
 
-`scripts/api-test.py` (arm64, and `--arch x86_64` its short form):
+`tests/api-test.py` (arm64, and `--arch x86_64` its short form):
 docs/testing.md has what it checks -- on x86-64, `api panel create` from
 /etc/rc and what it leaves on nos's root, read once nos is off.
-`scripts/panel-appliance-test.py` runs the panel's bundle as its VM does, in
+`tests/panel-appliance-test.py` runs the panel's bundle as its VM does, in
 Debian's image against the mock API; `image-test.py` holds `nos-install
 --panel` to its password and its lines of /etc/rc. `net-fuzz.py`'s `api` target runs the
 module's own source on the host, against clients of each role and of none

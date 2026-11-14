@@ -3,9 +3,9 @@
 //! would boot, its kernel's header, where the kernel and its initrds go in
 //! RAM, and the command line -- then the kernel and the initrds read into
 //! place. No platform in it: the boot (`boot.rs`) runs it over the virtio
-//! disks and guest RAM, and the host's harness (fuzz/hvboot) over a disk
+//! disks and guest RAM, and the host's harness (tests/fuzz/hvboot) over a disk
 //! image and buffers of its own -- one copy of these rules, which
-//! scripts/hvboot-test.py holds to what GRUB would boot.
+//! tests/hvboot-test.py holds to what GRUB would boot.
 //!
 //! What goes wrong on the way is said where it is met, and a boot that
 //! finds nothing says everything it passed over: a filesystem refused for
@@ -29,7 +29,7 @@ use crate::ram::{Loan, Ram, MAPPED};
 pub const CONFIGS: [&str; 4] = ["/boot/grub/grub.cfg", "/grub/grub.cfg", "/boot/grub2/grub.cfg", "/grub2/grub.cfg"];
 /// The most of a grub.cfg read: grub-mkconfig's is some 1.5 KiB a kernel
 /// installed, so this is some 85 of them. Its reading, of whatever shape,
-/// fits in the loader's heap with the rest of the boot: scripts/hvboot-test.py
+/// fits in the loader's heap with the rest of the boot: tests/hvboot-test.py
 /// boots a grub.cfg of this many bytes of each shape that costs the reading
 /// the most a byte, beside a grubenv of `ENV_MAX`, inside hvboot's own heap.
 pub const CONFIG_MAX: u64 = 128 * 1024;

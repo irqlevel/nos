@@ -9,7 +9,7 @@ edition = "2021"
 # and the journal's (JBD2's) with a planner of its replay -- as plain Rust
 # over bytes, with no kernel in it: hvboot reads a guest's
 # /boot through it, the kernel's ext4 driver is to read and write through
-# it, and fuzz/extfmt holds it to the filesystems e2fsprogs makes and to
+# it, and tests/fuzz/extfmt holds it to the filesystems e2fsprogs makes and to
 # what e2fsck says of them damaged. No dependency but the tree's own `crc`
 # (its CRC32C and CRC16), so it builds offline; nothing in it is unsafe
 # (`forbid`).

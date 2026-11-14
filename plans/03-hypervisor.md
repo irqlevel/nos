@@ -71,7 +71,7 @@ Done so far, against **3.1**:
   under one lock, freed only after the CPU says it is done.
 - `modules/hypervisor/hv`: the `hv` command, and a `Drop` that turns the extension off
   and reads back what is left.
-- `scripts/hv-test.py`, on both architectures.
+- `tests/hv-test.py`, on both architectures.
 
 And against **3.2 and 3.3**, under AMD-V -- the first two of the four demos:
 
@@ -158,7 +158,7 @@ TCG has no VMX to bring one up under slowly:
   runs out of host memory -- which is why every guest starts paged.
 
 And against **3.4 and 3.5** -- the third demo, a `bzImage` printing its early
-console (`hv boot`, `scripts/hv-linux-test.py`):
+console (`hv boot`, `tests/hv-linux-test.py`):
 
 - guest memory is now [frames](../docs/hypervisor.md#a-linux-guest) -- pages
   of RAM mapped nowhere but the guest's nested table (`kcore::frame`), not
@@ -374,4 +374,4 @@ All met, under AMD-V (SVM) and Intel VT-x; the arm64 EL2 backend remains.
 - ~~Full boot to an interactive shell over the emulated UART, with initramfs,
   on one vCPU~~ — a BusyBox shell that runs a command typed at it
   (`hv boot ... input='id\n'` → `uid=0 gid=0`). Gate:
-  `scripts/hv-linux-test.py`.
+  `tests/hv-linux-test.py`.

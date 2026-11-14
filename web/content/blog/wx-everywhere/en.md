@@ -85,7 +85,7 @@ static void WxProbeHeap()
 }
 ```
 
-[wx-test.sh](https://github.com/irqlevel/nos/blob/master/scripts/wx-test.sh) boots the kernel once for each probe. On x86-64 the command line comes from GRUB, so each probe boots from an ISO of its own; on arm64 the script passes it with `-append`. The test passes only if every boot dies with a panic that names the address the probe printed. That address is in `cr2` on x86-64 and in `far` on arm64, the registers that hold the faulting address. A kernel that keeps running prints `SUCCEEDED (W^X broken!)`, and the script fails.
+[wx-test.sh](https://github.com/irqlevel/nos/blob/master/tests/wx-test.sh) boots the kernel once for each probe. On x86-64 the command line comes from GRUB, so each probe boots from an ISO of its own; on arm64 the script passes it with `-append`. The test passes only if every boot dies with a panic that names the address the probe printed. That address is in `cr2` on x86-64 and in `far` on arm64, the registers that hold the faulting address. A kernel that keeps running prints `SUCCEEDED (W^X broken!)`, and the script fails.
 
 On September 17 the text probe died at the image base. On x86-64 the heap probe died with error code 0x11 (present, instruction fetch) and `rip == cr2`, which means the CPU faulted fetching the instruction itself. On arm64 it died with exception class 0x21, an instruction abort, and `far == elr`, which means the same.
 

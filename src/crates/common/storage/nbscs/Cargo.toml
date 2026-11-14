@@ -8,7 +8,7 @@ edition = "2021"
 # table of slots kept twice, the 4 MiB slots -- and the cs's engine over a
 # device of the caller's: fences, open marks, reads, writes, flushes, the
 # chunks freed. No kernel in it and no unsafe: nbs-cs.ko runs it over its
-# devices' queues, nbs-mds.ko takes a device's slots from it, and fuzz/nbs's
+# devices' queues, nbs-mds.ko takes a device's slots from it, and tests/fuzz/nbs's
 # cs target runs it over disks that lose and tear what they were not told to
 # flush.
 [lib]

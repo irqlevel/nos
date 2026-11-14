@@ -7,10 +7,10 @@ edition = "2021"
 # (plans/nbs.md, N7): a client's requests to a chunk server and its
 # answers, and a chunk server's questions to its own host's mds. No kernel
 # in it and no unsafe: nbs-cs.ko and nbs-mds.ko speak it, the client in hv
-# will (N8), and fuzz/nbs's wire target reads it from noise.
+# will (N8), and tests/fuzz/nbs's wire target reads it from noise.
 [lib]
 
-# The fuzzer's alone (fuzz/nbs): a list asked for at once -- a set's chunks
+# The fuzzer's alone (tests/fuzz/nbs): a list asked for at once -- a set's chunks
 # to its joiner, a volume's open chunks, the garbage pass's asks -- a few
 # entries a page (`PAGE`), so that a target whose cs's hold a few chunks
 # steps every list past its first page. Never in a kernel's build.

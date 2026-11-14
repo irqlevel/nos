@@ -514,7 +514,7 @@ impl State {
         /* The counters as applying keeps them: devices and volumes numbered
            from 1, a digest no sooner than CHECK_EVERY. Without this a state
            of no volumes and a next number of 0 passed, and its next volume
-           was numbered 0 (found by fuzz/nbs's meta target) */
+           was numbered 0 (found by tests/fuzz/nbs's meta target) */
         if self.next_device == 0 || self.next_volume == 0 || self.next_generation == 0
             || self.next_check < crate::CHECK_EVERY
         {

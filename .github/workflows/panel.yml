@@ -8,9 +8,9 @@ name: Panel
 on:
   push:
     branches: [master]
-    paths: ['panel/**', 'src/crates/**/*.descriptor.json', 'scripts/panel-*.py', '.github/workflows/panel.yml']
+    paths: ['panel/**', 'src/crates/**/*.descriptor.json', 'scripts/panel-bundle.py', 'tests/panel-appliance-test.py', '.github/workflows/panel.yml']
   pull_request:
-    paths: ['panel/**', 'src/crates/**/*.descriptor.json', 'scripts/panel-*.py', '.github/workflows/panel.yml']
+    paths: ['panel/**', 'src/crates/**/*.descriptor.json', 'scripts/panel-bundle.py', 'tests/panel-appliance-test.py', '.github/workflows/panel.yml']
 
 jobs:
   panel:
@@ -46,7 +46,7 @@ jobs:
   # The bundle a release has (scripts/panel-bundle.py) -- Node and Caddy held
   # to their pinned checksums, the panel built standalone in Node's image --
   # run as the panel's VM runs it, in Debian's image, against the mock API
-  # (scripts/panel-appliance-test.py).
+  # (tests/panel-appliance-test.py).
   bundle:
     runs-on: ubuntu-24.04
     steps:
@@ -57,4 +57,4 @@ jobs:
         run: python3 scripts/panel-bundle.py --version ci --out out/panel
 
       - name: The appliance, run
-        run: python3 scripts/panel-appliance-test.py out/panel/nos-panel-ci.tar.gz
+        run: python3 tests/panel-appliance-test.py out/panel/nos-panel-ci.tar.gz

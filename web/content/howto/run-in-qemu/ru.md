@@ -141,9 +141,9 @@ $
 Чтобы проверить сборку, не следя за загрузкой, запустите smoke-тест. Он загружает nos без окна и сообщает результат кодом возврата: 0 значит, что появились все маркеры, 1 — что загрузка не удалась, например из-за паники или таймаута. Третья команда запускает тест arm64 под HVF вместо TCG:
 
 ```sh
-./scripts/smoke-test.sh --skip-build
-./scripts/smoke-arm64.sh --skip-build
-SMOKE_HVF=1 ./scripts/smoke-arm64.sh --skip-build
+./tests/smoke-test.sh --skip-build
+./tests/smoke-arm64.sh --skip-build
+SMOKE_HVF=1 ./tests/smoke-arm64.sh --skip-build
 ```
 
 Smoke-скрипты сами создают себе рабочие диски и пишут лог во временный каталог. `SMOKE_TIMEOUT` задаёт время ожидания (по умолчанию 300 секунд), а `SMOKE_LOG` — путь к логу. Без `--skip-build` скрипты сначала собирают nos в контейнере `nos-builder`.

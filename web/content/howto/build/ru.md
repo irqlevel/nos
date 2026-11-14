@@ -112,10 +112,10 @@ make
 | `make image` | `nos-x86_64.squashfs` (только x86-64, нужен `mksquashfs`) |
 | `make nocheck UBSAN=1` | C++ под UB-санитайзером clang (см. ниже) |
 | `make nocheck RUSTUB=1` | Rust с проверками предусловий unsafe-операций `core` и переполнений (см. ниже) |
-| `make smoke` | запускает `scripts/smoke-test.sh`: сборка в Docker и загрузка без экрана |
+| `make smoke` | запускает `tests/smoke-test.sh`: сборка в Docker и загрузка без экрана |
 | `make clean` | удаляет `out/`, ядра, `nos-arm64.img`, ISO и системный образ и выполняет `cargo clean` |
 
-`ARCH` выбирает архитектуру: `x86_64` (по умолчанию) или `aarch64`. Объектные файлы попадают в `out/$(ARCH)/`. Для сборки только под arm64 достаточно make, clang, lld, llvm и nightly: больше релизный workflow для неё ничего не ставит. `make smoke` собирает в Docker. С тулчейном на своей машине соберите ядро через `make nocheck`, а затем запустите `./scripts/smoke-test.sh --skip-build`.
+`ARCH` выбирает архитектуру: `x86_64` (по умолчанию) или `aarch64`. Объектные файлы попадают в `out/$(ARCH)/`. Для сборки только под arm64 достаточно make, clang, lld, llvm и nightly: больше релизный workflow для неё ничего не ставит. `make smoke` собирает в Docker. С тулчейном на своей машине соберите ядро через `make nocheck`, а затем запустите `./tests/smoke-test.sh --skip-build`.
 
 ## Что получится
 
@@ -164,11 +164,11 @@ PANIC:Report():ubsan.cpp,267: UBSAN: shift exponent 64 is too large for 64-bit t
 - **Об успехе прогона судите по коду возврата.** Прежде чем отправить изменение, соберите и загрузите обе архитектуры:
 
 ```sh
-make nocheck && ./scripts/smoke-test.sh --skip-build
-make nocheck ARCH=aarch64 && ./scripts/smoke-arm64.sh --skip-build
+make nocheck && ./tests/smoke-test.sh --skip-build
+make nocheck ARCH=aarch64 && ./tests/smoke-arm64.sh --skip-build
 ```
 
-На macOS запускайте `./scripts/smoke-test.sh` и `./scripts/smoke-arm64.sh` без `--skip-build`: тогда каждый скрипт сначала сам инкрементально соберёт ядро в контейнере `nos-builder`. Smoke-скрипт завершается с кодом 0, если загрузка вывела все маркеры, и с кодом 1 при панике, таймауте или неудачной сборке. Что покрывает каждая проверка, описано в руководстве [«Запуск гейтов»](/howto/run-the-gates).
+На macOS запускайте `./tests/smoke-test.sh` и `./tests/smoke-arm64.sh` без `--skip-build`: тогда каждый скрипт сначала сам инкрементально соберёт ядро в контейнере `nos-builder`. Smoke-скрипт завершается с кодом 0, если загрузка вывела все маркеры, и с кодом 1 при панике, таймауте или неудачной сборке. Что покрывает каждая проверка, описано в руководстве [«Запуск гейтов»](/howto/run-the-gates).
 
 ## Решение проблем
 
