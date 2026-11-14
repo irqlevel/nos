@@ -412,7 +412,7 @@ impl<S: LogStore, M: StateMachine> Rsm<S, M> {
     /// an earlier start's of this member, whose reads' answers may still be
     /// on their way. Starting from 1 every time, a read asked after a
     /// restart was answered with the index a read before it had been, and
-    /// served state older than a write already acknowledged (fuzz/raft's
+    /// served state older than a write already acknowledged (tests/fuzz/raft's
     /// rsm target, seed 63606).
     pub fn new(cfg: Config, store: S, sm: M, nonce: u64) -> Result<Rsm<S, M>, RsmError> {
         let snap = store.snapshot().map_err(|e| RsmError::Node(Error::Storage(e)))?;

@@ -6,7 +6,7 @@ entries in the same order and none applied is lost while a majority of them
 lives. It is what the cluster's registry and NBS's metadata service are to
 run on ([plans/raft.md](../plans/raft.md)); nothing of nos is in it -- no
 kcore, no `unsafe`, no dependency but the tree's own `crc` (the log's
-CRC32C) -- so a module links it as it is and `fuzz/raft` runs it on the
+CRC32C) -- so a module links it as it is and `tests/fuzz/raft` runs it on the
 host.
 
 ## Driving a member
@@ -368,7 +368,7 @@ commits that entry, elects itself and commits on its own -- and two mutants
 
 ## Tested
 
-`tests/raft-test.py` ([Tests and gates](testing.md)) builds `fuzz/raft`
+`tests/raft-test.py` ([Tests and gates](testing.md)) builds `tests/fuzz/raft`
 and holds the crate to known answers, the known traps played out, groups
 fuzzed over a network that fails in every way, checked at every step against
 Raft's properties, a member fed messages no correct member sends, the log
@@ -378,14 +378,14 @@ for linearizability, and every member's own asks under losses, doubles,
 cuts, leaders' refusals and snapshots taken in -- none applied twice, each
 told truly what became of it -- every allocation of it to the 512 KiB one
 block of the kernel's heap is;
-`fuzz/raft/mutants.py` holds the gate to catching each rule taken out. The
+`tests/fuzz/raft/mutants.py` holds the gate to catching each rule taken out. The
 review of 2026-11 took rules out one by one and found eight the gate was
 silent on -- a change written over undone, a snapshot's piece taken at its
 own place alone, the leader not changing itself, the lease of a leader
 heard from, a leader with no majority stepping down, a hand-over's
 TimeoutNow only to a member that holds the log, a refused append's hint, a
 session evicted least recently used -- each held by a scenario now
-(`fuzz/raft/src/gaps.rs`, and `rsm_session_evicted`) and a mutant.
+(`tests/fuzz/raft/src/gaps.rs`, and `rsm_session_evicted`) and a mutant.
 
 ## Limits
 
@@ -442,5 +442,5 @@ once.
 
 The crate's users: the cluster's registry ([plans/cluster.md](../plans/cluster.md),
 C1 and C2) -- its state machine is `src/crates/common/cluster/registry`, a `StateMachine`
-of its own, held by fuzz/raft's `registry` target -- then NBS's metadata
+of its own, held by tests/fuzz/raft's `registry` target -- then NBS's metadata
 service ([plans/nbs.md](../plans/nbs.md)).

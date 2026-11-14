@@ -8,7 +8,7 @@
 //!
 //! There is no kernel in it and nothing unsafe: hvboot reads a guest's
 //! /boot through it, the kernel's ext4 driver is to read and write through
-//! it, and fuzz/extfmt holds it to the filesystems e2fsprogs makes and to
+//! it, and tests/fuzz/extfmt holds it to the filesystems e2fsprogs makes and to
 //! what e2fsck says of them damaged (tests/extfmt-test.py).
 //!
 //! Everything on a disk is untrusted. A view is made only over a buffer

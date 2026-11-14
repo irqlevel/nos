@@ -176,7 +176,7 @@ def main():
                 f.write('%s|%s|%s\n' % (''.join(b), e, a))
         print('%d reference instructions' % len(listed), flush=True)
         r = subprocess.run(['cargo', 'run', '--release', '--offline', '--quiet',
-                            '--manifest-path', os.path.join(HERE, 'insn-check', 'Cargo.toml'),
+                            '--manifest-path', os.path.join(HERE, 'fuzz', 'insn', 'Cargo.toml'),
                             '--target-dir', os.path.join(tmp, 'target'), '--', path])
         sys.exit(r.returncode)
     finally:

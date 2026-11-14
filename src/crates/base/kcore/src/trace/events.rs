@@ -1,6 +1,6 @@
 //! The kernel's events Rust records: their numbers and their payloads, and
 //! nothing of the kernel besides -- so that a fuzzer compiles this file as it
-//! is (fuzz/hv) and its sites build the payloads the kernel's do.
+//! is (tests/fuzz/hv) and its sites build the payloads the kernel's do.
 
 use crate::pod::Pod;
 

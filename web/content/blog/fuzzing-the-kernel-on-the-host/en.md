@@ -20,7 +20,7 @@ A test boot under QEMU only ever sees the inputs that QEMU happens to produce. S
 
 ## Compiling the kernel's sources for the host
 
-Most of the code that needed fuzzing was already portable. The block, network and filesystem layers are Rust crates built on `kcore` and `ffi`, the two crates through which Rust reaches the kernel's services ([how they got there](/blog/cpp-to-rust-layers) is another story). Cargo builds them for the host as easily as for the kernel. [`fuzz/fs`](https://github.com/irqlevel/nos/blob/master/fuzz/fs/Cargo.toml) depends on them by path and uses the build profile of a `RUSTUB=1` kernel. So an overflow on the host is the same panic it would be in that kernel, not a silent wrap-around:
+Most of the code that needed fuzzing was already portable. The block, network and filesystem layers are Rust crates built on `kcore` and `ffi`, the two crates through which Rust reaches the kernel's services ([how they got there](/blog/cpp-to-rust-layers) is another story). Cargo builds them for the host as easily as for the kernel. [`tests/fuzz/fs`](https://github.com/irqlevel/nos/blob/master/tests/fuzz/fs/Cargo.toml) depends on them by path and uses the build profile of a `RUSTUB=1` kernel. So an overflow on the host is the same panic it would be in that kernel, not a silent wrap-around:
 
 ```toml
 [dependencies]
@@ -38,7 +38,7 @@ debug-assertions = true
 panic = "unwind"
 ```
 
-The hypervisor takes more work. Its files import `hvarch`, the crate that drives the CPU's virtualization extension and holds all of the hypervisor's `unsafe` code. No host program can run that code, so [`fuzz/hv`](https://github.com/irqlevel/nos/blob/master/fuzz/hv/src/main.rs) compiles the hypervisor's files one by one as modules of its own, and itself answers to the crate names `ffi`, `hv`, `hvarch` and `kcore`. Everything those files reach outside themselves, from the clock to the CPU, is a stand-in in the same program:
+The hypervisor takes more work. Its files import `hvarch`, the crate that drives the CPU's virtualization extension and holds all of the hypervisor's `unsafe` code. No host program can run that code, so [`tests/fuzz/hv`](https://github.com/irqlevel/nos/blob/master/tests/fuzz/hv/src/main.rs) compiles the hypervisor's files one by one as modules of its own, and itself answers to the crate names `ffi`, `hv`, `hvarch` and `kcore`. Everything those files reach outside themselves, from the clock to the CPU, is a stand-in in the same program:
 
 ```rust
 extern crate alloc;
@@ -56,11 +56,11 @@ pub mod acpi;
 pub mod dhcp;
 ```
 
-The C++ gets the same treatment by other means. [`fuzz/cpp/Makefile`](https://github.com/irqlevel/nos/blob/master/fuzz/cpp/Makefile) compiles the kernel's files unchanged, under ASan and UBSan (the address and undefined-behaviour sanitizers). A host version of the HAL, the kernel's hardware abstraction layer, comes first on the include path and takes the place of each architecture's inline one. It uses no privileged instructions, and it makes the MMU's hooks visible to a fuzz target that models the MMU. All four fuzzers live in `fuzz/` rather than under `src/crates/`, because the `.cargo/config.toml` there turns any cargo build beneath it into a kernel build.
+The C++ gets the same treatment by other means. [`tests/fuzz/cpp/Makefile`](https://github.com/irqlevel/nos/blob/master/tests/fuzz/cpp/Makefile) compiles the kernel's files unchanged, under ASan and UBSan (the address and undefined-behaviour sanitizers). A host version of the HAL, the kernel's hardware abstraction layer, comes first on the include path and takes the place of each architecture's inline one. It uses no privileged instructions, and it makes the MMU's hooks visible to a fuzz target that models the MMU. All four fuzzers live in `tests/fuzz/` rather than under `src/crates/`, because the `.cargo/config.toml` there turns any cargo build beneath it into a kernel build.
 
 ## A machine to run them on
 
-The network and storage layers expect a kernel underneath them. [`fuzz/common`](https://github.com/irqlevel/nos/blob/master/fuzz/common/machine/sched.rs), shared by the net and fs fuzzers, is a kernel written just for this purpose. Every task is a host thread, but only one task runs at a time. Wherever a task blocks or releases a lock, the input decides which task runs next.
+The network and storage layers expect a kernel underneath them. [`tests/fuzz/common`](https://github.com/irqlevel/nos/blob/master/tests/fuzz/common/machine/sched.rs), shared by the net and fs fuzzers, is a kernel written just for this purpose. Every task is a host thread, but only one task runs at a time. Wherever a task blocks or releases a lock, the input decides which task runs next.
 
 Nothing sleeps on a real clock. When every task is waiting, the clock jumps to the next deadline, so an hour of a DHCP lease costs only as much as its timers. And the kernel's rules are checked on the very line that breaks them:
 
@@ -81,7 +81,7 @@ pub fn check_may_wait(what: &str) {
 
 The same goes for two locks taken in opposite orders, an allocation with interrupts off and a task that ends while holding a lock. Each one is reported as a finding, the fuzzers' word for a caught bug, right where it happens. Every input runs in a process of its own, forked from one machine that has already booted, so one input's static state never leaks into the next.
 
-None of this is coverage-guided: inputs are not steered by which code earlier inputs reached. An input is random bytes generated from a seed. A generator that knows the format reads those bytes as a stream of choices ([`input.rs`](https://github.com/irqlevel/nos/blob/master/fuzz/common/input.rs)). Every read past the end of the input returns zero, and zero is always the ordinary choice. Anything that ends a run early has to be rare, or the runs never get deep:
+None of this is coverage-guided: inputs are not steered by which code earlier inputs reached. An input is random bytes generated from a seed. A generator that knows the format reads those bytes as a stream of choices ([`input.rs`](https://github.com/irqlevel/nos/blob/master/tests/fuzz/common/input.rs)). Every read past the end of the input returns zero, and zero is always the ordinary choice. Anything that ends a run early has to be rare, or the runs never get deep:
 
 ```rust
 /// True about once in 4096: for what ends a run, which has to be much
@@ -95,18 +95,18 @@ pub fn rare(&mut self) -> bool {
 
 | Fuzzer | Built from | Targets | Checked against |
 |---|---|---|---|
-| `fuzz/hv` | the hypervisor's devices, local APIC and IO-APIC, MMIO decoder, page walker, Linux loader, ACPI tables, CPUID/MSR policy and run loop; the guests' switch, DHCP server and NAT | 22 | invariants on every device; models of the switch, NAT, the policy and guest placement |
-| `fuzz/net` | the `net`, `netwire`, `tls`, `fs` and `ssh` crates, and the sshd module's source | 10 | a model of the outside world, one protocol at a time |
-| `fuzz/fs` | the `block` and `fs` crates | 9 | a model of the file tree, its own e2fsck, power cuts |
-| `fuzz/cpp` | the C++ that reads what firmware, the bootloader or a disk hands it; the module loader; printf; the page tables and the heap | 11 | a model of what each header promises, under ASan and UBSan |
+| `tests/fuzz/hv` | the hypervisor's devices, local APIC and IO-APIC, MMIO decoder, page walker, Linux loader, ACPI tables, CPUID/MSR policy and run loop; the guests' switch, DHCP server and NAT | 22 | invariants on every device; models of the switch, NAT, the policy and guest placement |
+| `tests/fuzz/net` | the `net`, `netwire`, `tls`, `fs` and `ssh` crates, and the sshd module's source | 10 | a model of the outside world, one protocol at a time |
+| `tests/fuzz/fs` | the `block` and `fs` crates | 9 | a model of the file tree, its own e2fsck, power cuts |
+| `tests/fuzz/cpp` | the C++ that reads what firmware, the bootloader or a disk hands it; the module loader; printf; the page tables and the heap | 11 | a model of what each header promises, under ASan and UBSan |
 
 The most ambitious hv target, `platform`, builds a Linux guest's machine the way `hv boot` builds it. Then it runs that machine on the real run loop, `LinuxGuest::run`, one vCPU thread at a time. Wherever the loop would enter the guest, a script decides what the guest does next: an I/O port access, an MSR access, a fault on a device's page together with the instruction behind it, or a halt.
 
 Over many exits (an exit is the moment the CPU leaves the guest and hands control back to the hypervisor), the script does what drivers do, from filling MSI-X tables to starting the secondary CPUs (APs) with INIT and SIPI. Two things count as findings here: a vCPU entering its guest with a lock held, and the run loop reading the clock a million times without either entering the guest or waiting.
 
-`fuzz/net` surrounds the machine with a simulated world ([`src/world`](https://github.com/irqlevel/nos/blob/master/fuzz/net/src/world/check.rs)). It has a link that delays, reorders, duplicates and drops packets, and a TCP peer that keeps every byte of both streams. It also has a rustls server with the fuzzer's own certificate authority, DHCP and DNS servers that lie, and a full SSH client.
+`tests/fuzz/net` surrounds the machine with a simulated world ([`src/world`](https://github.com/irqlevel/nos/blob/master/tests/fuzz/net/src/world/check.rs)). It has a link that delays, reorders, duplicates and drops packets, and a TCP peer that keeps every byte of both streams. It also has a rustls server with the fuzzer's own certificate authority, DHCP and DNS servers that lie, and a full SSH client.
 
-`fuzz/fs` gives the storage layers disks with a volatile write cache, a power switch and requests that fail ([`disk.rs`](https://github.com/irqlevel/nos/blob/master/fuzz/fs/src/machine/disk.rs)). It judges the resulting images with an e2fsck of its own, which was checked against e2fsprogs on hundreds of images.
+`tests/fuzz/fs` gives the storage layers disks with a volatile write cache, a power switch and requests that fail ([`disk.rs`](https://github.com/irqlevel/nos/blob/master/tests/fuzz/fs/src/machine/disk.rs)). It judges the resulting images with an e2fsck of its own, which was checked against e2fsprogs on hundreds of images.
 
 ## Gates and campaigns
 
@@ -211,6 +211,6 @@ Three were missed at first. In two cases the generators never reached the edge: 
 
 The hv fuzzer's CPU is a stand-in, so nothing in `hvarch` is fuzzed: not its `unsafe` code, not the VMCB and VMCS (the structures in which AMD-V and VT-x keep a guest's state), and not the world switch between host and guest. The interleavings come from the script too. It walks every path between the CPUs, but it cannot find a race that way.
 
-`fuzz/cpp` does not reach `PageTable::Setup`, which runs on the bootstrap linear map, or anything that needs a second CPU. And `fuzz/fs` leaves one known limitation on record: after a device error in the middle of a create or a rename, the directory in memory can disagree with the disk until the next mount.
+`tests/fuzz/cpp` does not reach `PageTable::Setup`, which runs on the bootstrap linear map, or anything that needs a second CPU. And `tests/fuzz/fs` leaves one known limitation on record: after a device error in the middle of a create or a rename, the directory in memory can disagree with the disk until the next mount.
 
 The fuzzers stay on as gates, and new targets keep coming: guest placement, the CPUID and MSR policy (checked against a model written from the vendors' manuals, not from the code), and Intel's microcode file. [Tests and gates](/docs/testing) says which gate covers what, and running them has [a how-to of its own](/howto/run-the-gates).

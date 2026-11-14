@@ -5,7 +5,7 @@ extfmt (src/crates/common/storage/extfmt) is the format hvboot reads a guest's /
 through and the kernel's ext4 driver is to read and write through: views
 over the superblock, group descriptors, inodes, extent trees, block maps,
 directory and extended attribute blocks, and every checksum metadata_csum
--- and gdt_csum before it -- puts on them. fuzz/extfmt compiles it into a
+-- and gdt_csum before it -- puts on them. tests/fuzz/extfmt compiles it into a
 host program, and this runs it over filesystems mke2fs makes here:
 
   - ext4 as mke2fs makes it by default (metadata_csum, 64bit, flex_bg,
@@ -59,7 +59,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-FUZZ = os.path.join(ROOT, "fuzz", "extfmt")
+FUZZ = os.path.join(HERE, "fuzz", "extfmt")
 OUT = os.path.join(ROOT, "out", "extfmt-test")
 BIN = os.path.join(OUT, "release", "extfmt-test")
 
@@ -484,7 +484,7 @@ def main():
             sys.exit("extfmt-test needs %s (on a Mac, run it in the nos-builder container)" % t)
     r = subprocess.run(["cargo", "build", "--release", "--offline", "--quiet", "--target-dir", OUT], cwd=FUZZ)
     if r.returncode != 0:
-        sys.exit("extfmt-test: fuzz/extfmt did not build")
+        sys.exit("extfmt-test: tests/fuzz/extfmt did not build")
 
     r = run([BIN, "crc"])
     check("CRC32C and CRC16 against known answers", r.returncode == 0, r.stdout + r.stderr)

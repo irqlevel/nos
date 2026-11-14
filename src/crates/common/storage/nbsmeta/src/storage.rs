@@ -1009,7 +1009,7 @@ impl State {
         let v = self.volume(name).ok_or(Refusal::NoSuchVolume)?;
         /* Asked by the volume's writer now: one fenced since would have its
            write done by taking out the replicas that refuse it (found by
-           fuzz/nbs's cluster target) */
+           tests/fuzz/nbs's cluster target) */
         if v.writer.as_ref().is_none_or(|w| w.generation != generation) {
             return Err(Refusal::NotTheWriter);
         }

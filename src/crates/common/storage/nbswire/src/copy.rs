@@ -1,5 +1,5 @@
 //! A joiner's copy of a set (plans/nbs.md, "How three are kept"; N9): the
-//! one copy nbs-cs.ko runs and fuzz/nbs's cluster target's cs's do. It has
+//! one copy nbs-cs.ko runs and tests/fuzz/nbs's cluster target's cs's do. It has
 //! no I/O of its own: what it sends is handed back, what is answered handed
 //! in, and the store it copies into is lent to each call -- `step` and
 //! `answer` are `async`, the store's operations awaited among the requests
@@ -19,7 +19,7 @@
 //!   it kept each chunk at the epoch
 //!   it last knew, and a writer since taken over, its view as old, could
 //!   write it there -- the members fenced against that writer refuse it,
-//!   the member out was not fenced (found by fuzz/nbs's cluster target,
+//!   the member out was not fenced (found by tests/fuzz/nbs's cluster target,
 //!   N9d). The sums move the chunk's epoch on at the source, so that no
 //!   writer of the map before the join writes it past them -- and closing
 //!   it moves it on here (`Store::close_copy`), so that none writes it here
@@ -556,7 +556,7 @@ impl Copy {
                and its asks still in flight dropped, so that their answers are
                of none: taken for the next chunk's, a late refusal dropped that
                one too, and a late pull's data would be written into it (found
-               by fuzz/nbs's cluster target, N10c: the source's garbage pass
+               by tests/fuzz/nbs's cluster target, N10c: the source's garbage pass
                freed a chunk a copy-up had left, under the join) */
             Refusal::NotHeld | Refusal::StaleChunk { .. } if ask != Ask::List => {
                 self.progress_at = now;

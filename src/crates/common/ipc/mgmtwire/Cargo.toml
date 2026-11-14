@@ -8,7 +8,7 @@ edition = "2021"
 # writer that keeps to the rules it reads by, the parameters a method is
 # handed taken strictly, and the status codes. The bus (src/crates/layers/mgmt), the
 # providers in the image and in modules, and the API module all link it;
-# fuzz/web runs it on the host (tests/web-test.py). No dependency, and
+# tests/fuzz/web runs it on the host (tests/web-test.py). No dependency, and
 # nothing in it is unsafe (`forbid`).
 [lib]
 

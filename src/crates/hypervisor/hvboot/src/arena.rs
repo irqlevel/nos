@@ -7,7 +7,7 @@
 //! -- the extent tree's walk a level at a time, the lexer's tokens growing
 //! between the words they held -- left it behind for good, and a deep enough
 //! tree or a long enough grub.cfg spent the heap. What is in use, and the
-//! most ever, is counted: the harness (fuzz/hvboot) runs hvboot's own code
+//! most ever, is counted: the harness (tests/fuzz/hvboot) runs hvboot's own code
 //! over this, its heap no bigger than [`HEAP_BYTES`].
 //!
 //! A block is a header -- its size, the header's included, and a word that

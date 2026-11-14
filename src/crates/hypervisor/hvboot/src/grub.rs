@@ -28,7 +28,7 @@
 //! what variables add, the variables and the menu's items are held to
 //! bounds, said when they are met. So a grub.cfg as long as the loader reads
 //! (`plan::CONFIG_MAX`), of whatever shape, is read inside its heap -- the
-//! harness holds it to that (fuzz/hvboot).
+//! harness holds it to that (tests/fuzz/hvboot).
 
 use alloc::string::String;
 use alloc::vec::Vec;

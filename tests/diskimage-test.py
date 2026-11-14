@@ -4,7 +4,7 @@ decided on the host.
 
 `hv convert` (src/crates/modules/hypervisor/hv/src/image.rs) makes a cloud's qcow2 image
 the raw disk a guest is given, through src/crates/common/storage/diskimage -- a download,
-read by code in the kernel. fuzz/diskimage compiles that crate, as it is,
+read by code in the kernel. tests/fuzz/diskimage compiles that crate, as it is,
 into a host program, and this holds it to QEMU's own reading:
 
   - images qemu-img writes, from a disk made here: versions 2 and 3,
@@ -51,7 +51,7 @@ import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-FUZZ = os.path.join(ROOT, "fuzz", "diskimage")
+FUZZ = os.path.join(HERE, "fuzz", "diskimage")
 OUT = os.path.join(ROOT, "out", "diskimage-test")
 BIN = os.path.join(OUT, "release", "diskimage-test")
 
@@ -1048,7 +1048,7 @@ def main():
             sys.exit("diskimage-test needs %s" % t)
     r = subprocess.run(["cargo", "build", "--release", "--offline", "--quiet", "--target-dir", OUT], cwd=FUZZ)
     if r.returncode != 0:
-        sys.exit("diskimage-test: fuzz/diskimage did not build")
+        sys.exit("diskimage-test: tests/fuzz/diskimage did not build")
 
     if args.image:
         image(args)

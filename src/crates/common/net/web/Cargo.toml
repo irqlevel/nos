@@ -8,7 +8,7 @@ edition = "2021"
 # allocated; a response's head written with nothing a value could inject;
 # WebSocket frames read and written; SHA-1 for the handshake's key; IPv4
 # networks for an allowlist; and a self-signed X.509 certificate made for a
-# P-256 key. The API module (modules/mgmt/api) links it; fuzz/web runs it on the
+# P-256 key. The API module (modules/mgmt/api) links it; tests/fuzz/web runs it on the
 # host (tests/web-test.py). Nothing in it is unsafe (`forbid`).
 [lib]
 

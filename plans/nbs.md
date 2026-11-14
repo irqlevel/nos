@@ -414,7 +414,7 @@ since there is no third host to put them on. Keeping three on its own takes
 four hosts or more.
 
 **Tested**:
-- fuzz/nbs's `meta` target holds `place` and the controller to the rules:
+- tests/fuzz/nbs's `meta` target holds `place` and the controller to the rules:
   three hosts, room never exceeded, the volume's host taken where it can be,
   chunks spread. It also holds them to progress: after any failures, once
   hosts and room allow, every chunk is back at three within so many turns.
@@ -483,14 +483,14 @@ four hosts or more.
 
 ## Tested
 
-1. **`fuzz/nbs`** (host, in CI): the crates as they are, several hosts in one
+1. **`tests/fuzz/nbs`** (host, in CI): the crates as they are, several hosts in one
    process, nothing real. A simulated channel (order per pair, delays, what
    was in flight lost when a connection breaks, partitions), simulated
    devices (the fuzzers' common disks: a write cache, a power switch, requests
    that fail, torn writes), a simulated root for each mds (what was not synced
    lost or torn at a crash), and a clock. Every run the same for its seed, as
    in TigerBeetle's VOPR and FoundationDB's simulation. Raft itself is
-   `fuzz/raft`'s ([raft.md](raft.md)); here it runs as `nbs-mds` runs it.
+   `tests/fuzz/raft`'s ([raft.md](raft.md)); here it runs as `nbs-mds` runs it.
    Targets:
    - `meta`: the state machine against a model of its own: volumes, chunks,
      counts, three distinct hosts a chunk, no room reserved twice.
@@ -542,7 +542,7 @@ each new gate.
     `common/codec` the same way.
   - **nbsmeta** for now holds the cluster's identity and its members by
     incarnation, the removed ones, and the voters (the first five). Its
-    fuzz target is `fuzz/raft`'s `nbsmeta`, beside the registry's; fuzz/nbs
+    fuzz target is `tests/fuzz/raft`'s `nbsmeta`, beside the registry's; tests/fuzz/nbs
     comes with N6, which grows the state.
   - **The join is an offer**: the member `nbs host add` is typed at offers
     the cluster to `nbs.mds@<host>`. The host's mds, in no cluster, makes its
@@ -618,10 +618,10 @@ each new gate.
       name, and refuses one with no id or one that something holds.
       Nothing is written to it before N7.
   - **Tests**:
-    - `fuzz/nbs`'s `meta` target against a model of its own (its own
+    - `tests/fuzz/nbs`'s `meta` target against a model of its own (its own
       placement, an fsck of its own, snapshots read back, spoiled and
       continued, and two members' digests), with fifteen mutants;
-    - `fuzz/raft`'s `nbsmeta` target, taken along;
+    - `tests/fuzz/raft`'s `nbsmeta` target, taken along;
     - nbs-test's N6 phase on three hosts' pools, through restarts, a host
       replaced by a snapshot, and a member removed.
 - **N7, the cs.** `nbscs` and its target; `nbs-cs.ko`: its pool (ids,
@@ -649,7 +649,7 @@ each new gate.
     slot of the chunk it was is never read or written for the one it is. The
     plan had no such thing; without it, a cs that missed a free would serve a
     new chunk the old one's data.
-  - **What the fuzzer found**, through power cuts (`fuzz/nbs`'s `cs`
+  - **What the fuzzer found**, through power cuts (`tests/fuzz/nbs`'s `cs`
     target): a slot's zeros not flushed before the record that takes it,
     which let a record kept with its zeros lost read another volume's data; a
     record's first write torn in copy A taken for a lost record; a fence page
@@ -669,7 +669,7 @@ each new gate.
     detaches a volume from the shell, as N8's client will: fence each cs
     before its first write, write every replica, read one.
   - **Tests**:
-    - `fuzz/nbs`'s `cs` target (power cuts with torn sectors and rot, every
+    - `tests/fuzz/nbs`'s `cs` target (power cuts with torn sectors and rot, every
       fence, open mark, close and sector held to what it may be) and `wire`
       target, with seventeen mutants of the two crates;
     - nbs-test's N7 phase: devices taken in and formatted, a device with
@@ -883,7 +883,7 @@ each new gate.
       caught once in some 150 runs; and the sector-by-sector check's in the
       `join` target once in some 120. The gate now runs the `cluster` target
       over 1000 seeds and the `join` target over 800, about half a minute.
-    - **Tests**: fuzz/nbs's `join` target, a join between two engines over
+    - **Tests**: tests/fuzz/nbs's `join` target, a join between two engines over
       a network that drops, repeats and reorders, with writers of the map
       now -- up to three in flight -- and of maps before, the set moving on,
       rejoins, rot, members back with chunks found open, and the joiner's
@@ -1687,7 +1687,7 @@ each new gate.
       across their questions to the mds, not only inside the store -- a
       write sent twice, the second copy waiting for the mds, ended after its
       client's close and opened the chunk again, or wrote older data over
-      newer (fuzz/nbs's cluster target, its cs's asking their mds over its
+      newer (tests/fuzz/nbs's cluster target, its cs's asking their mds over its
       network: 5 runs in 317) -- and the garbage pass frees a chunk in that
       order, or a read the mds vouched for reads zeros of a chunk freed as
       its answer came (seen by reading the code; the cs target holds it
@@ -1795,7 +1795,7 @@ each new gate.
     link's task, ChaCha20 in software, its CPU at some 80-100 MB/s.
   - **Steps**: N13a, the wire (a write's chain and the answer's name), the
     cs's passing on and answering by name, the client's chain and the
-    0.25 s way round, nbsdrive's session named; fuzz/nbs's cluster target
+    0.25 s way round, nbsdrive's session named; tests/fuzz/nbs's cluster target
     with chains -- a forwarder crashed, a hop silent, a piece twice -- and a
     mutant for each rule; nbs-test both arches. N13b, the hardware: N12d's
     numbers again, writes at depth.

@@ -20,7 +20,7 @@ bin
 *.vmdk
 src/base/kernel/symtab_data.cpp
 src/crates/target/
-tests/*/target/
+tests/fuzz/*/target/
 out/
 .claude/
 

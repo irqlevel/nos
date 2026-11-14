@@ -162,7 +162,7 @@ voter answers, and says what it is about to do.
 
 ## Tested
 
-- **`fuzz/raft`'s `registry` target**: the state machine against a model of
+- **`tests/fuzz/raft`'s `registry` target**: the state machine against a model of
   its own -- hosts, tombstones, invitations and their expiry, rekeys,
   addresses -- run on several members over the simulated network that the
   `node` target uses.
@@ -195,7 +195,7 @@ of its own with no kernel in it, `src/crates/common/cluster/registry` -- the sta
 commands (init, invite, join, remove, revoke) and their answers, every
 command carrying the proposer's clock and every invitation past its time let
 go of at the entry, the snapshot and the rules one read back is held to, the
-voters' policy (the first five to join) -- and `fuzz/raft`'s `registry`
+voters' policy (the first five to join) -- and `tests/fuzz/raft`'s `registry`
 target with its scenarios and six mutants (docs/testing.md). C1b:
 `cluster.ko` -- the member as a task over raft's `rsm` and a `DiskLog` in
 /etc/cluster, raft's messages over ipc, commands handed to the leader,

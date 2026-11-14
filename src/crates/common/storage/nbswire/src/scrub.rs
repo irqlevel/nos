@@ -1,6 +1,6 @@
 //! The scrub (plans/nbs.md, N9e): the leader's look at every chunk closed on
 //! its set's active members, held alike by the CRC-32C of each granule --
-//! the one scrub nbs-mds's leader runs and fuzz/nbs's cluster target's does.
+//! the one scrub nbs-mds's leader runs and tests/fuzz/nbs's cluster target's does.
 //! It has no I/O: what it asks is handed back, what is answered handed in,
 //! and the state it plans from lent to each call.
 //!
@@ -28,7 +28,7 @@
 //!   of its own data, and two members alike are no proof -- a joiner that
 //!   copied a rotted source makes two alike in rot, and a scrub that took
 //!   the odd one down would have taken the one good copy down, its join back
-//!   copying the rot over it (found by fuzz/nbs's cluster target, N9e). A
+//!   copying the rot over it (found by tests/fuzz/nbs's cluster target, N9e). A
 //!   person takes a member down (`Command::ReplicaBad`), for the controller
 //!   to have it join its own place again -- a member back, whose copy holds
 //!   every chunk to a source's by sums and pulls what differs. Each finding

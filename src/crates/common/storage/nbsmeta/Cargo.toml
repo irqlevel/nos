@@ -7,8 +7,8 @@ edition = "2021"
 # replicated through raft's rsm, and the commands that change it -- the NBS
 # cluster's identity and its members (N5), and what is stored and where:
 # chunk servers and their devices, volumes, chunks, replica sets (N6). No
-# kernel in it and no unsafe: nbs-mds.ko builds it, fuzz/raft's nbsmeta
-# target holds it under raft, and fuzz/nbs's meta target to a model of its
+# kernel in it and no unsafe: nbs-mds.ko builds it, tests/fuzz/raft's nbsmeta
+# target holds it under raft, and tests/fuzz/nbs's meta target to a model of its
 # own.
 [lib]
 

@@ -6,7 +6,7 @@ One crate computes every CRC the tree's formats are checked by -- CRC-32
 metadata_csum and journal, raft's log) and CRC-16 (ext4's gdt_csum) -- for
 the kernel, for hvboot in a guest and for the host's fuzzers alike. A CRC
 computed wrong looks like a disk that is corrupt, or one that is not:
-fuzz/crc compiles the crate, as it is, into a host program and holds it to
+tests/fuzz/crc compiles the crate, as it is, into a host program and holds it to
 
   - the known answers: each CRC's check value, CRC-32's of the quick brown
     fox, RFC 3720's CRC-32C vectors, CRC-16 from 0 (ARC) and from !0
@@ -37,7 +37,7 @@ import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-FUZZ = os.path.join(ROOT, "fuzz", "crc")
+FUZZ = os.path.join(HERE, "fuzz", "crc")
 OUT = os.path.join(ROOT, "out", "crc-test")
 BIN = os.path.join(OUT, "release", "crc-test")
 
@@ -63,7 +63,7 @@ def main():
 
     r = subprocess.run(["cargo", "build", "--release", "--offline", "--quiet", "--target-dir", OUT], cwd=FUZZ)
     if r.returncode != 0:
-        sys.exit("crc-test: fuzz/crc did not build")
+        sys.exit("crc-test: tests/fuzz/crc did not build")
 
     r = subprocess.run([BIN, "all", "--seed", str(args.seed), "--cases", str(args.cases)])
     if r.returncode != 0:

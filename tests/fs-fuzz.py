@@ -6,11 +6,11 @@ the machine, an image somebody made, a filesystem another kernel left half
 written -- and a device says itself how big it is and how big a sector is.
 So a panic, an overflow, a lock broken, a loop that never ends, a write
 where nothing may write, anywhere on the paths that read a disk, is one
-somebody else can cause. fuzz/fs is a host program built from the kernel's
+somebody else can cause. tests/fuzz/fs is a host program built from the kernel's
 own crates -- `block` (the device table, the partition tables, the claims,
 the disk log) and `fs` (the VFS, ext2, ext4, ramfs, procfs, the file ABI,
 the shell's commands), over `kcore` and `ffi` as they are -- linked with the
-rest of a kernel written for the purpose (fuzz/common) and disks whose media
+rest of a kernel written for the purpose (tests/fuzz/common) and disks whose media
 are the fuzzer's: each with a volatile write cache, a power switch, and
 requests that fail.
 
@@ -54,7 +54,7 @@ by `e2fsck -E journal_only` first) and every directory and file of its
 manifest in what `debugfs rdump` reads out, byte for byte; an ext2 image
 the judge called clean clean by e2fsck, and one it called unclean not. It
 needs e2fsprogs: Linux, or on a Mac the nos-builder container. And always,
-a gate of its own: no judge under fuzz/fs/src/image/ may share a line with
+a gate of its own: no judge under tests/fuzz/fs/src/image/ may share a line with
 extfmt, the format crate the kernel's driver reads through -- a judge that
 did would hold the driver to itself.
 """
@@ -76,7 +76,7 @@ VENDOR = os.path.join(ROOT, 'src', 'crates', 'vendor')
 # The gate's seed. How many inputs of each target it runs is the target's
 # own (targets/mod.rs).
 GATE_SEED = '1'
-JUDGES = os.path.join(ROOT, 'fuzz', 'fs', 'src', 'image')
+JUDGES = os.path.join(HERE, 'fuzz', 'fs', 'src', 'image')
 
 
 def independent():
@@ -434,7 +434,7 @@ def main():
     # for the kernel -- and makes any build under it a kernel build -- so it
     # is said here, and cargo is run from the root.
     build = subprocess.run(['cargo', 'build', '--release', '--offline', '--quiet',
-                            '--manifest-path', os.path.join(ROOT, 'fuzz', 'fs', 'Cargo.toml'),
+                            '--manifest-path', os.path.join(HERE, 'fuzz', 'fs', 'Cargo.toml'),
                             '--target-dir', OUT,
                             '--config', 'source.crates-io.replace-with="vendored-sources"',
                             '--config', 'source.vendored-sources.directory="%s"' % VENDOR],
