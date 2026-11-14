@@ -1250,8 +1250,9 @@ hold its last write is said, with where.
 ### A guest's disk: `nbs:<volume>`
 
 hv's guests take a volume as a disk: `disk=nbs:<volume>` on `hv start`, or
-in a vm.toml's `disk`. The disk is a virtio block device of 4 KiB blocks,
-the volume's size, its serial `nbs-<number>`; its task drives the session --
+in a vm.toml's `disk`. The disk is a virtio block device of 512-byte
+sectors over the volume's 4 KiB blocks -- its physical block, so that a
+distribution's image boots off it as off any disk -- the volume's size, its serial `nbs-<number>`; its task drives the session --
 attached as the guest starts, every cs fenced, the open chunks reconciled --
 and the guest stopped lets the volume go: flushed, closed, detached. `hv
 start <name> force` takes the VM's volumes from a writer elsewhere: a VM

@@ -588,7 +588,8 @@ pub struct QueuedDisk {
     /// (`Backend::discard_sectors`): the image's chunk.
     discard_sectors: u32,
     /// What the virtio device offers the guest of a discard and a write of
-    /// zeros, and the block every request is whole ones of.
+    /// zeros, and the block every request it hands over is whole ones of --
+    /// the guest shown sectors still (`blk::Backend::block_size`).
     discards: bool,
     writes_zeroes: bool,
     block_size: u32,
@@ -667,7 +668,8 @@ impl QueuedDisk {
 
 /// Volume `name` of NBS's as a disk: its session started -- attached, the
 /// cs's fenced, what its last writer left open reconciled -- its blocks
-/// the volume's 4 KiB, which every request is whole ones of.
+/// the volume's 4 KiB, which every request it is handed is whole ones of,
+/// the guest shown 512-byte sectors (`blk::Pad`).
 fn open_volume(name: &str, read_only: bool, force: bool) -> Result<Served, String> {
     let v = Volume::open(name, read_only, force).map_err(|e| alloc::format!("nbs:{}: {}", name, e))?;
     let (size, number, generation) = v.shape();
