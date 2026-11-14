@@ -9,8 +9,11 @@ export function HostPicker({ locale, hosts, label }: { locale: string; hosts: Ar
     return <span className="text-sm text-muted">{hosts[0]?.name}</span>;
   }
   return (
-    <select aria-label={label} value={params.host ?? ''} onChange={(e) => router.push(`/${locale}/h/${e.target.value}`)}
+    <select aria-label={label} value={params.host ?? ''}
+      onChange={(e) => e.target.value && router.push(`/${locale}/h/${e.target.value}`)}
       className="rounded-lg border border-line bg-bg px-2 py-1 text-sm text-fg">
+      {/* A page of no host's: a choice of none, or the first host could not be chosen */}
+      {!params.host && <option value="">{label}…</option>}
       {hosts.map((h) => <option key={h.id} value={h.id}>{h.name}</option>)}
     </select>
   );
