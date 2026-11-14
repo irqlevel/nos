@@ -863,7 +863,8 @@ fn disks(state: &State, mut p: Params, call: &mut Call) -> Status {
 
 /// `disk_io`: what each disk of a VM on the list has done since its
 /// guest's boot -- reads, writes and their bytes, flushes, errors, discards
-/// and writes of zeros -- each by the word it was started with, and when
+/// and writes of zeros, and the time its backend took over them, its
+/// latency of two looks -- each by the word it was started with, and when
 /// that was read: a client makes its rates -- IOPS, bandwidth -- of two.
 /// No disks while the guest does not run; how many times it was booted
 /// again says where the counters began anew.
@@ -895,6 +896,7 @@ fn disk_io(state: &State, mut p: Params, call: &mut Call) -> Status {
                 w.field_uint("errors", c.errors);
                 w.field_uint("discards", c.discards);
                 w.field_uint("zeroings", c.zeroings);
+                w.field_uint("wait_ns", c.wait_ns);
                 w.end_object();
             }
             w.end_list();

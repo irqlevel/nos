@@ -426,6 +426,10 @@ test('a host of no cluster: its registry made, then its NBS, a device given to i
   await page.goto(`/en/h/${b}/p/nbs`);
   await expect(page.getByTestId('resource-hosts')).toContainText('nos-b');
   await expect(page.getByTestId('resource-devices')).toContainText('Nothing');
+  /* No device on any host yet: room on fewer than three, said first */
+  const alerts = page.getByTestId('resource-alerts');
+  await expect(alerts.getByRole('row', { name: /fewer than three hosts with room/ }).locator('[data-tone]'))
+    .toHaveAttribute('data-tone', 'bad');
 
   /* A device with a filesystem on it: refused, then taken with wipe -- the
    * confirm asked each time */
@@ -670,6 +674,24 @@ test('NBS\'s volumes: each one\'s health, coloured as its descriptor tones it', 
   await expect(row('web-root')).toContainText('в норме');
 });
 
+test('NBS\'s alerts: what to look at, the worst first, each coloured as its descriptor tones it', async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/p/nbs`);
+  const alerts = page.getByTestId('resource-alerts');
+  /* The page's first table */
+  await expect(page.locator('[data-testid^="resource-"]').first()).toHaveAttribute('data-testid', 'resource-alerts');
+  const row = (text: RegExp) => alerts.getByRole('row', { name: text });
+  for (const [what, tone, count] of [[/no replica active/, 'bad', '1'], [/one replica left/, 'alarm', '2'],
+    [/chunks at two replicas/, 'warn', '3'], [/being copied/, 'warn', '4']] as const) {
+    await expect(row(what).locator('[data-tone]')).toHaveAttribute('data-tone', tone);
+    await expect(row(what)).toContainText(count);
+  }
+  /* The worst first */
+  await expect(alerts.locator('tbody tr').first()).toContainText('no replica active');
+  await page.goto(`/ru/h/${host}/p/nbs`);
+  await expect(row(/одной репликой/)).toBeVisible();
+});
+
 test('a VM\'s disk coloured as it is: its volume\'s health, and red while its I/O fails', async ({ page }) => {
   const host = await login(page);
   await page.goto(`/en/h/${host}/vms/web`);
@@ -677,6 +699,8 @@ test('a VM\'s disk coloured as it is: its volume\'s health, and red while its I/
   const file = page.getByTestId('disk-io-disk.raw');
   await expect(file).toHaveAttribute('data-tone', 'good', { timeout: 15_000 });
   await expect(file.getByTestId('disk-health')).toContainText('no I/O errors');
+  await expect(file.getByTestId('disk-health')).toContainText(/latency \d+(\.\d)? ms/, { timeout: 15_000 });
+  await expect(file.getByTestId('disk-slow')).toHaveCount(0);
 
   /* A replica down: yellow, the counts behind it said */
   await page.goto(`/en/h/${host}/vms/store`);
@@ -685,6 +709,8 @@ test('a VM\'s disk coloured as it is: its volume\'s health, and red while its I/
   await expect(deg).toHaveAttribute('data-tone', 'warn', { timeout: 15_000 });
   await expect(deg.getByTestId('disk-health')).toContainText('a replica down or copying');
   await expect(deg.getByTestId('disk-health')).toContainText('Chunks at two replicas: 3');
+  /* And slow: its requests' average latency past 50 ms, said */
+  await expect(deg.getByTestId('disk-slow')).toContainText(/slow: average latency \d+(\.\d)? ms/, { timeout: 15_000 });
 
   /* A chunk unreachable, its guest's I/O failing: red */
   await page.goto(`/en/h/${host}/vms/broken`);

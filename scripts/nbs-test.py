@@ -57,7 +57,10 @@ what it stores, then a volume's bytes through the chunk servers.
   and said at once -- and loaded again, serving;
 - repair (N9): a volume written, c killed -- the leader's controller has its
   cs down; the volume's health through the bus `degraded`, each of its
-  chunks at two replicas, `ok` again once c is back -- the volume written
+  chunks at two replicas, `ok` again once c is back; NBS's alerts through
+  the bus saying, the worst first, fewer than three hosts with room -- no
+  repair -- c's chunk server out and chunks at two replicas, and none of
+  them once c is back -- the volume written
   past it, c booted again: its cs up, joined in
   its own place, every chunk at three replicas again, and c's own replica
   holding the write made while it was gone, which its join's copy took;
@@ -1007,6 +1010,17 @@ def main():
         check("rep's health through the bus, c's replicas down: degraded, both its chunks at two replicas",
               js is not None and js.get("health") == "degraded" and js.get("chunks_at_two") == 2
               and js.get("chunks_at_one") == 0 and js.get("chunks_unreachable") == 0, js)
+        js = json_of(a.run("mgmt call nbs alerts"))
+        rows = (js or {}).get("alerts") or []
+        kinds = [r.get("kind") for r in rows]
+        # c's out by now -- the check before waited for it -- or down yet
+        gone = [r.get("kind") for r in rows if r.get("host") == "c" and r.get("kind") in ("cs_down", "cs_out")]
+        check("NBS's alerts through the bus, the worst first: fewer than three hosts with room -- no repair -- c's "
+              "chunk server out, chunks at two replicas",
+              len(gone) == 1 and "chunks_at_two" in kinds
+              and any(r.get("kind") == "no_room" and r.get("count") == 2 for r in rows)
+              and "ok" not in kinds and "no_leader" not in kinds and "stopped" not in kinds
+              and kinds.index("no_room") < kinds.index(gone[0]) < kinds.index("chunks_at_two"), js)
         need("c boots again", pt.wait_log(boot(2), "boot: complete", 300) and addressed(2))
         sh[2] = c = ipct.Shell(hub.shell(2))
         need("c back: three voters, one leader", ipct.wait_for(lambda: agreed(sh, 3), 90, 1))
@@ -1015,6 +1029,12 @@ def main():
         js = json_of(a.run('mgmt call nbs volume {"name":"rep"}'))
         check("and rep whole again through the bus", js is not None and js.get("health") == "ok"
               and js.get("chunks_at_two") == 0 and js.get("chunks_copying") == 0, js)
+        js = json_of(a.run("mgmt call nbs alerts"))
+        kinds = [r.get("kind") for r in (js or {}).get("alerts") or []]
+        check("and NBS's alerts say none of them: room on three hosts, no chunk server down or out, no chunk short of "
+              "three, none copied",
+              js is not None and not {"no_room", "cs_down", "cs_out", "chunks_at_two", "chunks_at_one",
+                                      "chunks_unreachable", "copying", "no_leader", "stopped"} & set(kinds), js)
         out = a.run("nbs io detach rep")
         check("a lets rep go", "rep detached" in out, out)
         out = c.run("nbs io read rep 0 131072")
