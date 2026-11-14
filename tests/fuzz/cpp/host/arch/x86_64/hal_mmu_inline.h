@@ -1,0 +1,5 @@
+// The host's own, in place of src/base/arch/x86_64/hal_mmu_inline.h: tests/fuzz/cpp/host
+// comes before src/base on a fuzzer's include path (tests/fuzz/cpp/Makefile).
+#pragma once
+
+#include "../../hal_mmu_host.h"

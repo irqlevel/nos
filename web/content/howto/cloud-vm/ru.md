@@ -211,4 +211,4 @@ hv create noble https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24
 - [ВМ по ссылке](/blog/vms-from-cloud-images): как устроена каждая часть и как её проверяли.
 - В справочнике: [A VM in a folder](/docs/hypervisor#a-vm-in-a-folder), [A VM of a cloud's image](/docs/hypervisor#a-vm-of-a-clouds-image), [A disk from a cloud's image](/docs/hypervisor#a-disk-from-a-clouds-image).
 - [Linux-гость под гипервизором nos](/howto/linux-guest): гости из ядра, которое вы собрали сами, с дисками, сетью и несколькими CPU.
-- `nos/scripts/hv-distro-test.py --create <url>` прогоняет это руководство как тест и проверяет гостя изнутри ([Гейты: как проверять изменения в nos](/howto/run-the-gates)).
+- `nos/tests/hv-distro-test.py --create <url>` прогоняет это руководство как тест и проверяет гостя изнутри ([Гейты: как проверять изменения в nos](/howto/run-the-gates)).

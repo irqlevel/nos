@@ -1,6 +1,6 @@
 //! What a host's mds tells its cs and its clients, from its applied state
 //! (plans/nbs.md, "The cs" and "The client, in hv"): the one copy that
-//! nbs-mds.ko answers with and fuzz/nbs's cluster target's mds does.
+//! nbs-mds.ko answers with and tests/fuzz/nbs's cluster target's mds does.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;

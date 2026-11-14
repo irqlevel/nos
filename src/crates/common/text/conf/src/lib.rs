@@ -11,7 +11,7 @@
 //! What a VM's vm.toml (modules/hypervisor/hv) and the host API's api.toml
 //! (modules/mgmt/api) are written in. A crate with no kernel in it and no unsafe:
 //! each module is linked on its own and cannot share a layer, and the
-//! fuzzer builds it as it is (`fuzz/hv`, the `config` target), holding the
+//! fuzzer builds it as it is (`tests/fuzz/hv`, the `config` target), holding the
 //! reader to never panicking and to giving back what a file's writer wrote.
 
 #![no_std]

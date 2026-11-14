@@ -70,7 +70,7 @@ that time twice over.
 **Unloading is a gate of its own.** A hypervisor that can be taken out has
 to prove, every time, that it turned the extension off before its code was
 freed -- and the check for that is the same check live update (stage 5) will
-need, years earlier than it would otherwise be written. `scripts/hv-test.py`
+need, years earlier than it would otherwise be written. `tests/hv-test.py`
 loads, turns it on for every CPU, unloads *without* turning it off, and
 loads again to ask every CPU what it has. If the first unload left anything
 on, the second load says so.
@@ -1446,17 +1446,17 @@ qemu-system-x86_64 -cpu max -smp 4 -m 1G -cdrom nos.iso \
 Under KVM on a Linux host, `-enable-kvm -cpu host` gives the guest the host's
 own extension (nested virtualization: `kvm_intel nested=1` or
 `kvm_amd nested=1`), which is far faster than TCG and is how the VMX path is
-exercised before it reaches real hardware. `scripts/hv-test.py` uses it on
+exercised before it reaches real hardware. `tests/hv-test.py` uses it on
 both: AMD-V on an AMD host, Intel VT-x (nested) on an Intel one, and AMD-V
 under TCG's `-cpu max` where there is no KVM -- TCG has no VMX, so the Intel
 backend is reached only through KVM. The two guests whose verdict differs by
 vendor (`refused`, `asid`) have their expected output chosen from `hv info`.
 
-The gate is `scripts/hv-test.py` ([Tests and gates](testing.md)):
+The gate is `tests/hv-test.py` ([Tests and gates](testing.md)):
 
 ```sh
-scripts/hv-test.py                  # x86-64: the extension on and off and off again, and every guest
-scripts/hv-test.py --arch aarch64   # arm64: that it reports and refuses
+tests/hv-test.py                  # x86-64: the extension on and off and off again, and every guest
+tests/hv-test.py --arch aarch64   # arm64: that it reports and refuses
 ```
 
 ## A Linux guest
@@ -1599,7 +1599,7 @@ uid=0 gid=0
 The shell reads what is typed at it: `hv boot ... input='id\n'` hands the
 guest a line once it is at a prompt, and the 8250's receive path -- with the
 answer to the cursor-position query (`ESC[6n`) a line editor sends first --
-carries it. The gate is `scripts/hv-linux-test.py`, a manual one (a `bzImage`
+carries it. The gate is `tests/hv-linux-test.py`, a manual one (a `bzImage`
 is megabytes and CI cannot build one in its time), pointed at a kernel by
 hand; with `--initrd` it checks the guest reaches its `init` and a shell, and
 `--input 'id\n' --expect uid=0` checks it runs the command.
@@ -1835,7 +1835,7 @@ On the AX41 a Debian guest writes at 1.2 GB/s and reads at 1.6 GB/s, and
 what `apt-get update` leaves dirty goes down in a few hundredths of a
 second where it took half a minute ([On real hardware](#on-real-hardware)).
 
-`scripts/hv-linux-test.py --disk` is its gate: an ext4 image with a file in
+`tests/hv-linux-test.py --disk` is its gate: an ext4 image with a file in
 it on nos's root, the guest mounting it, reading the file, writing 4 MiB and
 a file of its own, syncing and reading back after a remount -- and then
 nos's root judged by `e2fsck`, and the image, taken back out of it, judged
@@ -1894,7 +1894,7 @@ allocation. QEMU reads past a file's end as zeros; here a table or a cluster
 that *starts* past it, and a compressed one that runs past its last sector
 and does not decode, are refused, asking "is the image whole?": what has
 them is a download cut short, and a disk of zeros where its data should be
-is a failure nobody would hear of. Its gate is `scripts/diskimage-test.py`
+is a failure nobody would hear of. Its gate is `tests/diskimage-test.py`
 (host, in CI): images qemu-img and qemu-io write, of every version, cluster
 size and kind, converted and held byte for byte to what qemu-img reads; the
 refusals; the decoder against zlib over streams made and broken at random;
@@ -2091,7 +2091,7 @@ QD32 at 147%, its 1 MiB reads and writes at 100% and 95%, the kernel build at
 QD32 at 71% (169k IOPS against 238k), the one row where KVM gained more from
 the partition than nos did.
 
-Its gate is `scripts/hv-device-test.py` (x86-64): two boots over one root
+Its gate is `tests/hv-device-test.py` (x86-64): two boots over one root
 with two NVMe drives beside it, one partitioned by the test and one blank.
 The first boot gives each its id and has `hv devices` say what is on it,
 refuses the EFI System partition outright and an ext4 without `force`,
@@ -2135,7 +2135,7 @@ subnet, and the stack forwards nothing. `hv list` says each port's network
 or `alone`, and so does `hv vms` of a folder's. A guest on a cloud's
 machines is in the same place -- its tenant's network, and nobody else's.
 
-The gate is `scripts/hv-linux-test.py --net`, whose two guests are on one
+The gate is `tests/hv-linux-test.py --net`, whose two guests are on one
 network and ping each other, and whose VM from a folder, alone, pings nos
 and gets nothing from the other network's guest -- not by ARP, whose
 question that guest never hears, and not by a frame sent to its MAC, which
@@ -2555,7 +2555,7 @@ so a lease renewed after nos's own lease named another resolver has the new
 one -- it was the one nos had when some guest was last started. The guests
 ask it through NAT like any other server; nos runs no DNS server of its own.
 
-`scripts/hv-linux-test.py --net` is the network's gate: two guests, their
+`tests/hv-linux-test.py --net` is the network's gate: two guests, their
 addresses, pings between each guest and nos and between the guests, nos's
 ping out of `hv0`, and a page from one guest's `httpd` fetched from outside
 the machine through `hv forward`; then the way out -- `dns0` in the guest's
@@ -2860,7 +2860,7 @@ waits out every call still running (an `hv start` still reading its files
 finds the module going when it comes to add its guest, and stops it itself);
 and only then the extension, on every CPU.
 
-The gate is `scripts/hv-linux-test.py` with `--initrd`: two VMs started side
+The gate is `tests/hv-linux-test.py` with `--initrd`: two VMs started side
 by side and one stopped mid-boot, a line typed at the other before its shell
 is up and another at its prompt, `send`, `wait`, `console`, the refused
 `hv off`, and an `rmmod` that presses the guest's power button, stops it
@@ -2983,8 +2983,8 @@ What it does not do yet: check the image against its distribution's
 `SHA256SUMS` (TLS's certificate is what vouches for the bytes now), resume
 a download that broke off -- the client gives up after ten seconds of
 silence -- or hold less than the download and the disk at once on nos's
-root while it converts. `scripts/hv-test.py` (x86-64) makes VMs so from a
-web server of the test's own, and `scripts/hv-distro-test.py --create
+root while it converts. `tests/hv-test.py` (x86-64) makes VMs so from a
+web server of the test's own, and `tests/hv-distro-test.py --create
 <url>` makes and boots one, cloud-init provisioned by the seed
 ([Testing](testing.md)): Debian 13's genericcloud image, fetched by nos
 itself through Debian's redirect, booted by hvboot off its own /boot, its
@@ -3042,7 +3042,7 @@ $ hv start v1
 
 What it does not do yet: `hv delete` leaves the VM's clone, as it leaves
 any `nbs:` disk -- `nbs volume delete` takes it away -- and the host API's
-`create` takes a URL alone. `scripts/hv-nbs-test.py` makes an image of a
+`create` takes a URL alone. `tests/hv-nbs-test.py` makes an image of a
 disk hvboot boots and two VMs of it on two hosts, each booted by its name
 off a clone of its own, one written over a chunk the image shares and the
 other still the image's ([Testing](testing.md)).
@@ -3464,13 +3464,13 @@ bit second, and the second stops the VM where the guest wrote it --
 turns itself off stays off. A sleep type the DSDT does not offer is left
 alone, and the report says the guest asked for it.
 
-The gate is `scripts/hv-linux-test.py --acpi`, with a kernel built with
+The gate is `tests/hv-linux-test.py --acpi`, with a kernel built with
 ACPI, its button and evdev: the boot's lines above and nothing of a firmware
 bug, a TSC the watchdog marked unstable or a PM timer that failed its checks;
 reboots through 0xCF9; the SCI on IRQ 9 and the PM timer a clocksource;
 `hv stop` answered by `acpid` with a power-off; and a guest that hears the
 button and does nothing, stopped when its time is up. The tables themselves
-were checked with `iasl` as they were written. `scripts/hv-distro-test.py`
+were checked with `iasl` as they were written. `tests/hv-distro-test.py`
 boots Alpine and Debian on their ACPI, and has `hv stop` shut Debian down --
 or, with `--acpi-off`, boots them as before.
 
@@ -3508,7 +3508,7 @@ is nos's, `dev` and the commit, which such a build does not know.)
   at every start after. One started from its kernel's path takes `uuid=`,
   or a random one, kept across its restarts; its serial is its number.
 
-The gate is `scripts/hv-linux-test.py --smbios` with a kernel built with
+The gate is `tests/hv-linux-test.py --smbios` with a kernel built with
 `DMI` and `DMIID`: what `/sys/class/dmi/id` says, a VM whose `vm.toml` had
 no UUID given one and written into the file, the same UUID at its next
 start, and a VM started with `uuid=` told it. The hv fuzzer's `smbios`
@@ -3531,7 +3531,7 @@ it: the report says the guest's kernel panicked, and a VM started with
 limit. CRASH_LOADED -- a crash kernel loaded, which the guest boots itself
 -- is counted, and the guest goes on.
 
-The gate is `scripts/hv-linux-test.py --pvpanic`, with a kernel built with
+The gate is `tests/hv-linux-test.py --pvpanic`, with a kernel built with
 ACPI and `PVPANIC_MMIO`: a guest with no init stopped by its panic, before
 `panic=1` reboots it; one with `restart` booted again at each until the loop
 is called one; a running guest's driver bound to `QEMU0001:00`, its init's
@@ -3681,7 +3681,7 @@ lock, and QEMU throws away its translations of a page that held a guest's
 code as the page is written -- a guest that had run for half a minute took
 36 s to rebuild. The zeroing is done off the lock now (`PageTable::alloc_page`).
 
-The gate is `scripts/hv-distro-test.py --iso alpine-virt-*-x86_64.iso
+The gate is `tests/hv-distro-test.py --iso alpine-virt-*-x86_64.iso
 [--debian debian-*-nocloud-amd64.raw] [--internet]` ([Tests and
 gates](testing.md)): manual, since the images are downloads; `--internet`
 adds what needs the test machine's own way out, a name looked up and a
@@ -3809,7 +3809,7 @@ the guest. It reads:
   `>` into a submenu and `>>` for a `>` of a title's own, a submenu's first
   entry when the rest names nothing. grubenv is read as GRUB reads it: its
   signature or nothing, `\X` as X. Each of these is what GRUB 2.06 does,
-  found by booting it (`scripts/hvboot-test.py` has the cases). What it
+  found by booting it (`tests/hvboot-test.py` has the cases). What it
   cannot place it says: another file read for the menu (`configfile`,
   `blscfg`), a variable with no value, a `}` that closes nothing. What it
   holds is bounded and said where a bound is met: a grub.cfg of 128 KiB
@@ -3845,11 +3845,11 @@ the heap (`arena.rs`: first fit over its free blocks, a block given back
 merged with its neighbours, in place of a bump allocator that took back
 only its newest block -- an extent tree two levels deep, or a long enough
 grub.cfg, spent the heap through blocks it never took back), the virtio
-rings, the IDT and the jump. The host's harness (`fuzz/hvboot`) runs `plan`
+rings, the IDT and the jump. The host's harness (`tests/fuzz/hvboot`) runs `plan`
 itself, not a second copy of its rules, under `arena.rs` over a stretch no
 bigger than hvboot's heap: read off Ubuntu 24.04's and Debian 13's images,
 the kernels and initrds come out byte for byte as `debugfs` reads them, and
-`scripts/hvboot-test.py` holds it to the entry GRUB would boot on disks it
+`tests/hvboot-test.py` holds it to the entry GRUB would boot on disks it
 makes -- GPT, MBR and none; ext4, ext3, ext2 of 1 KiB blocks into the
 double indirect ones; a default, a `next_entry`, a `saved_entry` into a
 submenu; GRUB 2.06's own answers to how a grub.cfg is read; what is said
@@ -4497,12 +4497,12 @@ Both run under AMD-V -- QEMU's TCG, and nested KVM on the AX41 -- and under
 VT-x, nested KVM on an i5-13500, where the second CPU's climb from real mode
 is the two CR0 writes the policy emulates.
 
-- `scripts/hv-test.py` runs the built-in `smp` guest on the first and the
+- `tests/hv-test.py` runs the built-in `smp` guest on the first and the
   last CPU: two CPUs, the second started by INIT and a start-up IPI into
   real mode, climbing to long mode and sending the first an IPI, whose
   one-shot APIC timer then interrupts it. A run with the start-up IPI
   ignored, and one with the timer never firing, both fail it.
-- `scripts/hv-linux-test.py --cpus N` boots a real Linux with N CPUs --
+- `tests/hv-linux-test.py --cpus N` boots a real Linux with N CPUs --
   `smp: Brought up 1 node, N CPUs`, and the report's `N-1 started by the
   guest` -- then runs the VM phase with them: every CPU online, each taking
   its own local timer's interrupts, rescheduling IPIs between them, and
@@ -5064,7 +5064,7 @@ someone else's; then speed.
    Done: a pass takes a queue's worth of chains at most -- all a driver can
    have available at once -- and leaves the rest to the next round of the
    devices (`PASS` in `devices/net.rs` and `devices/blk.rs`); hv-fuzz's
-   racing CPU (`Racer` in `fuzz/hv/src/memory.rs`) tops a ring up while a
+   racing CPU (`Racer` in `tests/fuzz/hv/src/memory.rs`) tops a ring up while a
    notify or a round runs, and found both old loops in its first ten
    inputs. What it was: the
    virtio-net transmit loop (`Net::send`) and the virtio-blk one
@@ -5651,7 +5651,7 @@ someone else's; then speed.
 - `hv-linux-test.py` and `hv-distro-test.py` are run by hand; a pinned
   tinyconfig bzImage and a BusyBox cpio, built once and cached, would put
   the first in CI.
-- `fuzz/hv` compiles neither `hypervisor/hv/src/{svm,vmx,vm,machine,npt,ept}.rs` nor
+- `tests/fuzz/hv` compiles neither `hypervisor/hv/src/{svm,vmx,vm,machine,npt,ept}.rs` nor
   any of `hvarch` but the VMCB's layout, nor the module's `vms`, `guest`,
   `disk` and `forward`, and puts its own `memory.rs` in the real one's
   place. Three targets would have caught this review's bugs: the exit

@@ -3,7 +3,7 @@
 //! reach through any more.
 //!
 //! Every message here is the one the C++ printed, because the tests match on
-//! them -- `scripts/ext2-test.py` and `scripts/ext4-test.py` drive the
+//! them -- `tests/ext2-test.py` and `tests/ext4-test.py` drive the
 //! filesystem entirely through these commands.
 
 use core::fmt::Write;

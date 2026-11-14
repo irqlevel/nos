@@ -114,7 +114,7 @@ One TCP bug hit slow readers. `Send` used to push a byte of data into a shut win
 
 ## The gate
 
-`scripts/sshd-test.py` tests the server end to end against OpenSSH's own client ([sshd](/docs/sshd#testing)). On arm64 it boots nos in QEMU, loads the module over the UDP shell and works it: commands, shells with and without a terminal, 3 MiB of output through the client's 2 MiB window, a key it must refuse, four sessions at once, `sshd stop` with a session open, and `rmmod sshd` from inside one. Then it puts the module in `/etc/rc`, reboots and checks that the server came back by itself with the same host key. On x86-64 it boots a root image that already starts the server, and just logs in.
+`tests/sshd-test.py` tests the server end to end against OpenSSH's own client ([sshd](/docs/sshd#testing)). On arm64 it boots nos in QEMU, loads the module over the UDP shell and works it: commands, shells with and without a terminal, 3 MiB of output through the client's 2 MiB window, a key it must refuse, four sessions at once, `sshd stop` with a session open, and `rmmod sshd` from inside one. Then it puts the module in `/etc/rc`, reboots and checks that the server came back by itself with the same host key. On x86-64 it boots a root image that already starts the server, and just logs in.
 
 One check sends the 3 MiB again with `RekeyLimit=16K`. A server busy streaming sees a rekey request only when it next reads, which here is when the window runs out. So the test asks for rekeys mid-output, not for one every 16 KiB. Another opens 70 connections and closes them at once, then six that just sit there. Four of the six must get a session, two must be reset, and no TCP slot may be left in a closing state.
 

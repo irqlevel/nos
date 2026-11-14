@@ -12,7 +12,7 @@
 //! period of latency, which nobody can feel, and the driver never has to be
 //! safe from interrupt context.
 //!
-//! `scripts/usb-test.py` is its test: it types at an emulated keyboard
+//! `tests/usb-test.py` is its test: it types at an emulated keyboard
 //! through QEMU's monitor and reads the shell's answer.
 
 #![no_std]

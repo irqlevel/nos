@@ -3,7 +3,7 @@
 //! chunks, as a state machine. It is fed what comes -- its host's mds's
 //! answers, the cs's -- and the time, and says what to send and which of
 //! its driver's operations are done; the driver is hv's `nbs:` disk, `nbs
-//! io` or nbsload over ipc, or fuzz/nbs's cluster target over a network of
+//! io` or nbsload over ipc, or tests/fuzz/nbs's cluster target over a network of
 //! its own. No kernel in it.
 //!
 //! A session's life:
@@ -522,7 +522,7 @@ pub struct Session {
     /// close, and a close sent again could come after it: either closed the
     /// chunk over the write, and a writer taken over before its next close
     /// found the chunk open nowhere, its reconcile leaving the replicas apart
-    /// (found by fuzz/nbs's cluster target after the review of 2026-11).
+    /// (found by tests/fuzz/nbs's cluster target after the review of 2026-11).
     direct: BTreeSet<u32>,
     /// Places the reconcile mends whether or not a replica holds their
     /// chunk open: those of the writes out when the session attached anew
@@ -852,7 +852,7 @@ impl Session {
                    set no longer the volume's -- the view is behind: the map
                    read again, which drops the ask, and what waits for the cs
                    is done as it comes due, by a view that no longer writes
-                   it there (found by fuzz/nbs's cluster target, N9d: a cs
+                   it there (found by tests/fuzz/nbs's cluster target, N9d: a cs
                    lost for good, its places joined by others, and the
                    writer's stop waited for it for good) */
                 if !said {
@@ -1383,7 +1383,7 @@ impl Session {
                    snapshot's too, whose replicas it makes the same as well --
                    and held for a copy-up, which waits for any join of the
                    set, a join stuck failed the session at their deadline
-                   (found by fuzz/nbs's cluster target, N13c: a reconcile
+                   (found by tests/fuzz/nbs's cluster target, N13c: a reconcile
                    after a pause given up, the set's one source's device
                    failed under its joiner) */
                 let place = p.place;
@@ -1428,7 +1428,7 @@ impl Session {
         /* Detached or failed: an answer to a request of before means
            nothing, as the mds's does not -- a copy-up's member refusing its
            copy as `NotAttached` once the stop had let the volume go failed
-           a session detached (found by fuzz/nbs's cluster target, N13c) */
+           a session detached (found by tests/fuzz/nbs's cluster target, N13c) */
         if matches!(self.phase, Phase::Detached | Phase::Failed(_)) {
             return;
         }
@@ -1547,7 +1547,7 @@ impl Session {
                        nor as its joiner, as the mds has it at the view's index
                        or after -- taken out, its place another's since:
                        nothing of the chunk there is to close (found by
-                       fuzz/nbs's cluster target, N9d: the close sent again on
+                       tests/fuzz/nbs's cluster target, N9d: the close sent again on
                        each map read and refused each time, and the writer's
                        stop waited for good) */
                     /* And the place not taken for closed until the map is
@@ -1557,7 +1557,7 @@ impl Session {
                        sends it the close (`closes_to_view`). Taken for
                        closed at once, the close sent by the view before
                        left that mark open at the writer's own generation
-                       (found by fuzz/nbs's cluster target, seed 18153, once
+                       (found by tests/fuzz/nbs's cluster target, seed 18153, once
                        a copy kept its source's mark) */
                     What::Close(place) if matches!(why, Refusal::NotHere) => {
                         self.close_moved.insert(place);
@@ -1801,7 +1801,7 @@ impl Session {
            out (N10) -- ended only once every member the view has active then
            has copied (`copy_progress`): by a view behind the set, the members
            it asked may not be the set's, and one it lacks has copied nothing
-           (found by fuzz/nbs's cluster target, N10c: the one member asked,
+           (found by tests/fuzz/nbs's cluster target, N10c: the one member asked,
            down, taken out, and the copy-up done by none, the new chunk zeros
            under the writes after) */
         let copies: Vec<u32> = self.copies.iter()
@@ -1846,7 +1846,7 @@ impl Session {
                 }
                 /* As a close refused as no replica's: the place waits for
                    the map read, which sends the close to the cs that took
-                   that one's place (found by fuzz/nbs's cluster target,
+                   that one's place (found by tests/fuzz/nbs's cluster target,
                    seed 25047: the cs taken out, its close done, and the
                    joiner made a member left open) */
                 What::Close(place) => {
@@ -1973,7 +1973,7 @@ impl Session {
     /// behind the set lacks; the copy-up is asked again from its start then,
     /// the map read first. A member asked and taken out would otherwise end
     /// it copied by none, the new chunk zeros under the writes after (found
-    /// by fuzz/nbs's cluster target: N10c, a take-out past the view; N12c, a
+    /// by tests/fuzz/nbs's cluster target: N10c, a take-out past the view; N12c, a
     /// clone's copy-up asked of the one member active at its view, which
     /// crashed, its view read again for another copy-up with two members
     /// joined since, the one asked taken out at the next version).
@@ -2320,7 +2320,7 @@ impl Session {
                        (`resend_later`), no more either: sent after the write,
                        it closed the chunk over it on the replicas that took
                        both, the replica refusing the write's epoch still to
-                       take it -- apart, and open on none (found by fuzz/nbs's
+                       take it -- apart, and open on none (found by tests/fuzz/nbs's
                        cluster target, seed 20346, once a close by a view
                        older than its chunk was refused) */
                     self.after_map.retain(|&(_, w)| w != What::Close(place));
@@ -2501,7 +2501,7 @@ impl Session {
         /* A close of the driver's waits on a place a write took as it began
            -- at the very moment, so taken as written before it: closed once
            the write is done, and nothing else would close it; every flush
-           after it waited to its deadline (found by fuzz/nbs's cluster
+           after it waited to its deadline (found by tests/fuzz/nbs's cluster
            target, seed 17081, once the end held what was asked before a
            stop to be done) */
         if self.ops.values().any(|o| o.closing.is_some()) {
@@ -2716,7 +2716,7 @@ impl Session {
     /// the reconcile of an attach anew mends it whether or not a replica
     /// holds its chunk open still -- a join's copy of a write out closes
     /// what it copies, and its source taken out and back left the chunk
-    /// open nowhere, its replicas apart for good (found by fuzz/nbs's
+    /// open nowhere, its replicas apart for good (found by tests/fuzz/nbs's
     /// cluster target, N13c).
     fn writes_out(&self) -> BTreeSet<u32> {
         self.pieces.values().filter(|p| {
@@ -2978,7 +2978,7 @@ impl Session {
                not done reached none -- held all their life for a copy-up a
                stuck join holds back, its others done on every replica --
                fails as any other: attached anew for it, the reconcile could
-               meet the same join and fail the session (found by fuzz/nbs's
+               meet the same join and fail the session (found by tests/fuzz/nbs's
                cluster target, N13c) */
             let write = self.ops.get(&id).is_some_and(|o| o.kind == Kind::Write && o.tag & INTERNAL == 0)
                 && self.pieces.values().any(|p| p.op == id && p.left);

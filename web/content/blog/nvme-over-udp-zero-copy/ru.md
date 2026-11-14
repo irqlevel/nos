@@ -125,7 +125,7 @@ INFO сообщает размер устройства и его огранич
 
 Клиентом служит [scripts/netblk.py](https://github.com/irqlevel/nos/blob/master/scripts/netblk.py) с командами `info`, `read`, `write`, `flush`, `verify` и `bench`. Его параметр `--window` задаёт, сколько запросов держать в полёте.
 
-[scripts/netblk-test.py](https://github.com/irqlevel/nos/blob/master/scripts/netblk-test.py) запускает ядро в QEMU с NVMe-дисками, загружает модуль через [UDP-шелл](/docs/udp-shell) и проверяет его снаружи. Записанное должно читаться обратно, и его должна видеть собственная команда ядра `diskread`. Плохие запросы должны отклоняться, а после `stop` и `rmmod` не должно ничего оставаться. С 19 сентября тест отдаёт по сети ещё и раздел ([977c2d5](https://github.com/irqlevel/nos/commit/977c2d5)). Тест работает на x86-64 и arm64, а с `--nic igb` идёт через эмулируемую QEMU карту 82576, у которой тот же драйвер, что у I210 на AX41.
+[tests/netblk-test.py](https://github.com/irqlevel/nos/blob/master/tests/netblk-test.py) запускает ядро в QEMU с NVMe-дисками, загружает модуль через [UDP-шелл](/docs/udp-shell) и проверяет его снаружи. Записанное должно читаться обратно, и его должна видеть собственная команда ядра `diskread`. Плохие запросы должны отклоняться, а после `stop` и `rmmod` не должно ничего оставаться. С 19 сентября тест отдаёт по сети ещё и раздел ([977c2d5](https://github.com/irqlevel/nos/commit/977c2d5)). Тест работает на x86-64 и arm64, а с `--nic igb` идёт через эмулируемую QEMU карту 82576, у которой тот же драйвер, что у I210 на AX41.
 
 ## Цифры и два потерянных тика
 

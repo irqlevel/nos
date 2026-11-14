@@ -90,14 +90,14 @@ port off networks you do not trust.
 and `bench` (`randread`, `randwrite`, `read`, `write`, with latency
 percentiles). `--window` sets how many requests it keeps in flight.
 
-`scripts/netblk-test.py` is the end-to-end test: it boots the kernel in QEMU
+`tests/netblk-test.py` is the end-to-end test: it boots the kernel in QEMU
 with an NVMe disk, loads the module over the UDP shell, and checks from outside
 that what is written reads back -- also through the kernel's own `diskread` --
 that bad requests are refused, and that `stop` and `rmmod` leave nothing
 behind. `--arch aarch64` does the same on QEMU's `virt` board:
 
     docker run --rm --device /dev/kvm -v /root/nos:/root/nos -w /root/nos \
-        nos-builder scripts/netblk-test.py [--arch aarch64]
+        nos-builder tests/netblk-test.py [--arch aarch64]
 
 `--nic igb` puts QEMU's igb (an 82576) in place of virtio-net, which runs the
 kernel's Rust igb driver -- the one that drives the I210 on real hardware. It
@@ -105,7 +105,7 @@ needs QEMU 8.0 or later, which nos-builder's 6.2 is not; with the host's, in a
 network namespace of its own so that its port forwards touch nothing of the
 host's:
 
-    unshare -n bash -c 'ip link set lo up && scripts/netblk-test.py --nic igb'
+    unshare -n bash -c 'ip link set lo up && tests/netblk-test.py --nic igb'
 
 ### Which network cards
 

@@ -405,7 +405,7 @@ So self-modifying code, executing from a heap buffer, or writing through a
 pointer into `.rodata` faults instead of silently working. `wxprobe=text`
 deliberately writes to `.text` and `wxprobe=heap` deliberately calls into a
 page the allocator just handed out, to prove both halves are on;
-`scripts/wx-test.sh` runs both boots and fails if either survives.
+`tests/wx-test.sh` runs both boots and fails if either survives.
 
 On x86-64 the NX bit means nothing until `EFER.NXE` is set, and bit 63 is a
 *reserved* bit until it is — a PTE carrying it faults on the first touch. So

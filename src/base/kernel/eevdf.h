@@ -28,7 +28,7 @@ namespace kernel
    the 128-bit products are multiplications only, never a division the
    compiler would turn into a library call. It knows nothing of tasks,
    locks or CPUs: an entity and the queue it is on, so that it can be held to
-   a model of its own on the host (fuzz/cpp/targets/eevdf.cpp). */
+   a model of its own on the host (tests/fuzz/cpp/targets/eevdf.cpp). */
 struct SchedEntity
 {
     SchedEntity();
