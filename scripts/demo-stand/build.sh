@@ -18,7 +18,14 @@ BUNDLE=$(sed -n 's/^panel-bundle: \([^,]*\),.*/\1/p' out/demo/bundle.txt)
 [ -f "$BUNDLE" ] || { echo "no bundle made"; exit 1; }
 NAME=$(basename "$BUNDLE")
 REL=out/demo/$NAME
-docker run --platform linux/amd64 --rm -v "$ROOT":/src -w /src nos-builder sh -c \
+# What nos says it is (`version`, the system provider's info, the panel's
+# host pages): worked out here -- the builder image has no git, and a
+# worktree's .git is a file naming a directory it does not mount
+VERSION=${VERSION:-$(git describe --tags --exact-match 2>/dev/null || echo dev)}
+GIT_DESC=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+if git status --porcelain -uno 2>/dev/null | grep -q .; then GIT_DESC=$GIT_DESC-dirty; fi
+docker run --platform linux/amd64 --rm -e "VERSION=$VERSION" -e "GIT_DESC=$GIT_DESC" -v "$ROOT":/src -w /src \
+    nos-builder sh -c \
     "make nocheck && make nos-test.iso TEST_ISO_ARGS=udpshell=9100 && \
      make image PANEL_BUNDLE=$REL PANEL_BUNDLE_URL=http://$AX41:39299/$NAME"
 ls -la nos-x86_64.squashfs nos-test.iso "$BUNDLE"
