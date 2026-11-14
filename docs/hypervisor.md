@@ -3845,7 +3845,7 @@ the heap (`arena.rs`: first fit over its free blocks, a block given back
 merged with its neighbours, in place of a bump allocator that took back
 only its newest block -- an extent tree two levels deep, or a long enough
 grub.cfg, spent the heap through blocks it never took back), the virtio
-rings, the IDT and the jump. The host's harness (`fuzz/hvboot`) runs `plan`
+rings, the IDT and the jump. The host's harness (`tests/fuzz/hvboot`) runs `plan`
 itself, not a second copy of its rules, under `arena.rs` over a stretch no
 bigger than hvboot's heap: read off Ubuntu 24.04's and Debian 13's images,
 the kernels and initrds come out byte for byte as `debugfs` reads them, and
@@ -5064,7 +5064,7 @@ someone else's; then speed.
    Done: a pass takes a queue's worth of chains at most -- all a driver can
    have available at once -- and leaves the rest to the next round of the
    devices (`PASS` in `devices/net.rs` and `devices/blk.rs`); hv-fuzz's
-   racing CPU (`Racer` in `fuzz/hv/src/memory.rs`) tops a ring up while a
+   racing CPU (`Racer` in `tests/fuzz/hv/src/memory.rs`) tops a ring up while a
    notify or a round runs, and found both old loops in its first ten
    inputs. What it was: the
    virtio-net transmit loop (`Net::send`) and the virtio-blk one
@@ -5651,7 +5651,7 @@ someone else's; then speed.
 - `hv-linux-test.py` and `hv-distro-test.py` are run by hand; a pinned
   tinyconfig bzImage and a BusyBox cpio, built once and cached, would put
   the first in CI.
-- `fuzz/hv` compiles neither `hypervisor/hv/src/{svm,vmx,vm,machine,npt,ept}.rs` nor
+- `tests/fuzz/hv` compiles neither `hypervisor/hv/src/{svm,vmx,vm,machine,npt,ept}.rs` nor
   any of `hvarch` but the VMCB's layout, nor the module's `vms`, `guest`,
   `disk` and `forward`, and puts its own `memory.rs` in the real one's
   place. Three targets would have caught this review's bugs: the exit

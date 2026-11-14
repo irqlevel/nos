@@ -5,7 +5,7 @@ hvboot (src/crates/hypervisor/hvboot) is the loader hv starts a guest in by PVH;
 the guest's own partition table, its ext2/3/4 /boot and its GRUB
 configuration, and boots the entry GRUB would. What it boots is its `plan`'s
 to work out -- src/crates/hypervisor/hvboot/src/plan.rs, with no platform in
-it -- and fuzz/hvboot compiles that, and the readers it reads through
+it -- and tests/fuzz/hvboot compiles that, and the readers it reads through
 ({gpt,ext,grub}.rs over extfmt and the tree's CRCs, and the bzImage crate,
 src/crates/common/boot/bzimage), as they are,
 into a host program: the boot's own rules, not a second copy of them, run
@@ -80,7 +80,7 @@ import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-FUZZ = os.path.join(ROOT, "fuzz", "hvboot")
+FUZZ = os.path.join(HERE, "fuzz", "hvboot")
 OUT = os.path.join(ROOT, "out", "hvboot-test")
 BIN = os.path.join(OUT, "release", "hvboot-test")
 
@@ -891,7 +891,7 @@ def main():
             sys.exit("hvboot-test needs %s" % t)
     r = subprocess.run(["cargo", "build", "--release", "--offline", "--quiet", "--target-dir", OUT], cwd=FUZZ)
     if r.returncode != 0:
-        sys.exit("hvboot-test: fuzz/hvboot did not build")
+        sys.exit("hvboot-test: tests/fuzz/hvboot did not build")
 
     if args.image:
         image(args)

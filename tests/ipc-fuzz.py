@@ -5,8 +5,8 @@ Every service of the kernel's talks through the channel (src/crates/layers/ipc,
 docs/ipc.md) -- the image's tasks and the modules alike -- so a message
 lost, doubled or out of order, a Down that never comes, a name that outlives
 its mailbox or a queue that holds more than it says is a bug in each of them
-at once. fuzz/ipc is a host program built from the channel's own crate, over
-`kcore` and `ffi` as they are and the fuzzers' common machine (fuzz/common:
+at once. tests/fuzz/ipc is a host program built from the channel's own crate, over
+`kcore` and `ffi` as they are and the fuzzers' common machine (tests/fuzz/common:
 the kernel's tasks run one at a time, its mutexes and events, the lock rules
 checked), with overflow checks on as a RUSTUB=1 kernel has them.
 
@@ -57,7 +57,7 @@ def main():
     # fuzzer's manifest is outside src/crates, whose .cargo/config.toml would
     # make any build under it a kernel build, so it is said here.
     build = subprocess.run(['cargo', 'build', '--release', '--offline', '--quiet',
-                            '--manifest-path', os.path.join(ROOT, 'fuzz', 'ipc', 'Cargo.toml'),
+                            '--manifest-path', os.path.join(HERE, 'fuzz', 'ipc', 'Cargo.toml'),
                             '--target-dir', OUT,
                             '--config', 'source.crates-io.replace-with="vendored-sources"',
                             '--config', 'source.vendored-sources.directory="%s"' % VENDOR],

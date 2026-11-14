@@ -27,7 +27,7 @@
 //!
 //! What it boots is `plan`'s to work out, over the `disk::Device` and `ram`
 //! it is given and nothing of the platform's; the host's harness
-//! (fuzz/hvboot) runs that over disk images, under `arena`'s heap no bigger
+//! (tests/fuzz/hvboot) runs that over disk images, under `arena`'s heap no bigger
 //! than this one's. It and the parsers it reads through (`gpt`, `ext`,
 //! `grub`, and `bzimage`'s) are plain Rust over byte slices and `alloc`, with no
 //! `unsafe`; the rest -- ports, physical memory, the heap, the jump -- is

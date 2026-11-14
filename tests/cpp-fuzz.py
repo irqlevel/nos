@@ -10,10 +10,10 @@ made them's to choose, and a read past an end, an index out of range or a
 wrap there is a boot that dies without a word, or a page handed out that the
 firmware still uses. Under all of it is the memory management, whose error
 paths no boot takes.
-fuzz/cpp holds a host program for each: the kernel's own sources, compiled
+tests/fuzz/cpp holds a host program for each: the kernel's own sources, compiled
 as they are under the address and undefined-behaviour sanitizers, over
-stand-ins for the kernel around them (fuzz/cpp/common) and a host HAL in
-place of each arch's inline one (fuzz/cpp/host). Each target builds its
+stand-ins for the kernel around them (tests/fuzz/cpp/common) and a host HAL in
+place of each arch's inline one (tests/fuzz/cpp/host). Each target builds its
 input from random bytes -- a tree of QEMU virt's shape, a firmware map, a
 block grub-editenv could have written, and each of them damaged -- and holds
 what the code makes of it to a model of what its header says it does.
@@ -53,14 +53,14 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-FUZZ = os.path.join(ROOT, 'fuzz', 'cpp')
+FUZZ = os.path.join(HERE, 'fuzz', 'cpp')
 # The findings, whichever host found them; the programs, one host's apiece
 # -- a tree shared with a container would otherwise take a Mac's for its own.
 FINDINGS = os.path.join(ROOT, 'out', 'cpp-fuzz', 'findings')
 OUT = os.path.join(ROOT, 'out', 'cpp-fuzz', '%s-%s' % (platform.system().lower(), platform.machine()))
 
 # The gate's seed. How many inputs of each target it runs is the target's
-# own (fuzz/cpp/targets).
+# own (tests/fuzz/cpp/targets).
 GATE_SEED = '1'
 
 

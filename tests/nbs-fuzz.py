@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NBS fuzz: NBS's crates on the host (fuzz/nbs, plans/nbs.md, "Tested"),
+"""NBS fuzz: NBS's crates on the host (tests/fuzz/nbs, plans/nbs.md, "Tested"),
 each held to a model of its own. The metadata's state machine, the `meta`
 target (src/crates/common/storage/nbsmeta, N6):
   - random histories of every command -- members, devices, volumes made,
@@ -21,7 +21,7 @@ target (src/crates/common/storage/nbsmeta, N6):
     digests, one restored part way the same at the end; a checkpoint's digest
     the state's own, a false digest of the leader's said as a divergence;
 and every allocation the crate makes held to the 512 KiB one block of the
-kernel's heap gives (fuzz/raft's heap.rs, which the crate shares).
+kernel's heap gives (tests/fuzz/raft's heap.rs, which the crate shares).
 
 The chunk server's engine, the `cs` target (src/crates/common/storage/nbscs,
 N7): fences, writes, reads, flushes, closes and frees over disks with a write
@@ -47,9 +47,9 @@ joiner is the source's.
     python3 tests/nbs-fuzz.py --target cs --seconds 600    # a cs campaign
     python3 tests/nbs-fuzz.py --target cluster --seconds 600   # the client's
     python3 tests/nbs-fuzz.py --target join --seconds 600      # the copy's
-    python3 tests/nbs-fuzz.py --mutants                    # and fuzz/nbs/mutants.py
+    python3 tests/nbs-fuzz.py --mutants                    # and tests/fuzz/nbs/mutants.py
 
-fuzz/nbs/mutants.py takes one rule at a time out of the crate and must see the
+tests/fuzz/nbs/mutants.py takes one rule at a time out of the crate and must see the
 gate fail. Needs cargo on the host. Exit code 0 = every check held.
 """
 
@@ -60,7 +60,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-FUZZ = os.path.join(ROOT, "fuzz", "nbs")
+FUZZ = os.path.join(HERE, "fuzz", "nbs")
 OUT = os.path.join(ROOT, "out", "nbs-fuzz")
 VENDOR = os.path.join(ROOT, "src", "crates", "vendor")
 
@@ -81,7 +81,7 @@ def main():
                         "--config", 'source.crates-io.replace-with="vendored-sources"',
                         "--config", 'source.vendored-sources.directory="%s"' % VENDOR], cwd=FUZZ)
     if r.returncode != 0:
-        sys.exit("nbs-fuzz: fuzz/nbs did not build")
+        sys.exit("nbs-fuzz: tests/fuzz/nbs did not build")
     binary = os.path.join(OUT, "release", "nbs-fuzz")
     if args.seconds is not None:
         run = [binary, args.target, "--seed", str(args.seed), "--seconds", str(args.seconds)]

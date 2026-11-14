@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Editor test: `edit` (src/crates/common/text/edit), decided on the host.
 
-The edit module runs src/crates/common/text/edit in an SSH session; fuzz/edit compiles that
+The edit module runs src/crates/common/text/edit in an SSH session; tests/fuzz/edit compiles that
 crate, as it is, into a host program that runs it the same way -- the bytes
 a terminal sends through the key decoder, the editor's saves and quits
 answered, its frames drawn on a terminal of the test's own, which does what
@@ -36,7 +36,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-FUZZ = os.path.join(ROOT, "fuzz", "edit")
+FUZZ = os.path.join(HERE, "fuzz", "edit")
 OUT = os.path.join(ROOT, "out", "edit-test")
 BIN = os.path.join(OUT, "release", "edit-test")
 
@@ -51,7 +51,7 @@ def main():
 
     r = subprocess.run(["cargo", "build", "--release", "--offline", "--quiet", "--target-dir", OUT], cwd=FUZZ)
     if r.returncode != 0:
-        sys.exit("edit-test: fuzz/edit did not build")
+        sys.exit("edit-test: tests/fuzz/edit did not build")
 
     if args.session is not None:
         argv = [BIN, "--session", str(args.session)]

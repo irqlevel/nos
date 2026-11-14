@@ -1,6 +1,6 @@
 //! A relay between two byte streams: `hv forward`'s, between a client of
 //! nos's port and a guest's server. It is kept apart from the TCP it runs
-//! over so that the host can drive it with a script (fuzz/hv's `relay`).
+//! over so that the host can drive it with a script (tests/fuzz/hv's `relay`).
 //!
 //! Each direction has a buffer of what one side sent that the other has not
 //! taken yet, and a side is read from only when its buffer is empty: a side

@@ -12,7 +12,7 @@
 //! now be served. Once the caller has done that, it says so (`advance`).
 //! There is no clock, no network, no thread and no lock in here -- one owner
 //! drives a node -- so the same code runs in a kernel module over its message
-//! channel and in a host program over a simulated network (fuzz/raft).
+//! channel and in a host program over a simulated network (tests/fuzz/raft).
 //!
 //! What is in it, by the paper and the dissertation (Ongaro, 2014):
 //!
@@ -52,7 +52,7 @@
 //! log or busy the group: a list that grows with the log is kept in pieces,
 //! every batch is held to a count as well as to bytes, a message fits one
 //! block, and the configuration is refused where it would let one grow
-//! past (docs/raft.md, "Limits"; fuzz/raft holds every allocation to it).
+//! past (docs/raft.md, "Limits"; tests/fuzz/raft holds every allocation to it).
 
 #![no_std]
 #![forbid(unsafe_code)]

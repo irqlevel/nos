@@ -3,7 +3,7 @@
 //! would boot, its kernel's header, where the kernel and its initrds go in
 //! RAM, and the command line -- then the kernel and the initrds read into
 //! place. No platform in it: the boot (`boot.rs`) runs it over the virtio
-//! disks and guest RAM, and the host's harness (fuzz/hvboot) over a disk
+//! disks and guest RAM, and the host's harness (tests/fuzz/hvboot) over a disk
 //! image and buffers of its own -- one copy of these rules, which
 //! tests/hvboot-test.py holds to what GRUB would boot.
 //!

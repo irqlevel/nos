@@ -533,7 +533,7 @@ impl<D: Device> Default for Store<D> {
 /// refused, vouched for or not. The mds vouches for the epoch that is the
 /// set's now, but the cs keeps what it vouched for, and a write in flight
 /// comes after the epoch has moved on -- a pull's for a joiner, a replica
-/// taken out (found by fuzz/nbs's join target: such a write taken moved the
+/// taken out (found by tests/fuzz/nbs's join target: such a write taken moved the
 /// chunk's epoch back, and a writer of the map before the join wrote past
 /// the joiner).
 fn older(e: Epoch, known: Epoch) -> bool {
@@ -813,7 +813,7 @@ impl<D: Device> Store<D> {
         /* Its fences, each in its place; a page of which one copy is stale or
            torn written again below, as the table's are -- left as it was, a
            cut in the next write of its other copy would leave neither good
-           (found by fuzz/nbs's cs target) */
+           (found by tests/fuzz/nbs's cs target) */
         let mut fences = vec![Fence::default(); FENCES_MAX];
         let mut fences_stale = BTreeSet::new();
         for p in 0..FENCE_PAGES {
@@ -1189,7 +1189,7 @@ impl<D: Device> Store<D> {
         /* A joiner takes no write of an epoch before its join: one from a
            view that old -- a writer taken over since among them, which the
            members fenced against it refuse -- would be marked, and the copy
-           keep it over the set's (found by fuzz/nbs's cluster target, N9d).
+           keep it over the set's (found by tests/fuzz/nbs's cluster target, N9d).
            Its writer reads its map again, and writes at the join's epoch */
         if let Some(since) = self.s.borrow().joining.get(&c.epoch.set).copied() {
             if c.epoch.version < since {
@@ -1263,7 +1263,7 @@ impl<D: Device> Store<D> {
         /* Zeros, flushed before the record that takes the slot is written: a
            device keeps or loses what it holds unflushed in any order, and a
            record kept with its zeros lost would read what the slot held
-           through this chunk -- another volume's data. (Found by fuzz/nbs's
+           through this chunk -- another volume's data. (Found by tests/fuzz/nbs's
            cs target.) */
         if dev.zero_data(dev.data_at(slot, 0), SLOT).await.is_err() || dev.durable().await.is_err() {
             dev.fail();
@@ -1324,7 +1324,7 @@ impl<D: Device> Store<D> {
     /// `generation`: refused to an older one the fence has taken the volume
     /// from -- its flush done would tell its writer that what it wrote is
     /// durable where a newer writer's reconcile may have put other data
-    /// (found by fuzz/nbs's cluster target).
+    /// (found by tests/fuzz/nbs's cluster target).
     pub async fn flush_for(&self, volume: u32, generation: u64) -> Result<(), Error> {
         let _volume = self.volume_turns.take(volume, false).await;
         self.check_fence(volume, generation)?;
@@ -1565,7 +1565,7 @@ impl<D: Device> Store<D> {
         }
         if r.known != c.epoch {
             /* A chunk found open never comes here (`not_found_open`): the
-               record written would take its mark off (found by fuzz/nbs's
+               record written would take its mark off (found by tests/fuzz/nbs's
                cluster target, N9d: a joiner's pull did, and the writer went
                on with a replica short of a write it had done) */
             self.put(dv, slot, Record { known: c.epoch, seq: r.seq + 1, ..r }).await?;
@@ -1600,7 +1600,7 @@ impl<D: Device> Store<D> {
 
     /// Chunk `c` no source of a copy where it was found open: it may lack
     /// what its writer wrote since its last flush, which a joiner would take
-    /// as the set's (found by fuzz/nbs's cluster target, N9d: a joiner
+    /// as the set's (found by tests/fuzz/nbs's cluster target, N9d: a joiner
     /// copied from such a replica, and once it was active held a write done
     /// as it was before). Refused as failed: the copy takes another source,
     /// or waits for the writer to take this one out, or for a writer's
@@ -1822,7 +1822,7 @@ impl<D: Device> Store<D> {
     /// mark is what has the next writer's reconcile make the replicas the
     /// same. Closed by the copy, the source taken out later took the last
     /// mark with it, and the replicas left apart stayed so (found by
-    /// fuzz/nbs's cluster target, seed 14649, past the gate's range after
+    /// tests/fuzz/nbs's cluster target, seed 14649, past the gate's range after
     /// the review of 2026-11 -- its question 5).
     pub async fn close_copy(&self, c: ChunkRef, open: Option<u64>) -> Result<(), Error> {
         let _chunk = self.chunk_turns.take(c.chunk, true).await;
@@ -1831,7 +1831,7 @@ impl<D: Device> Store<D> {
            wrote meanwhile stays open at the writer's generation, as any
            chunk it writes, but the join's end makes this cs a member, and a
            power cut after must not take the copy's sectors with it (found
-           by fuzz/nbs's cluster target, N9d: the record left open, the
+           by tests/fuzz/nbs's cluster target, N9d: the record left open, the
            flush was left out with it) */
         let dev = self.dev(dv);
         if dev.durable().await.is_err() {
@@ -1843,7 +1843,7 @@ impl<D: Device> Store<D> {
            before the join -- this cs a member then, taken out with the chunk
            open, its writer closing it on the members it had left -- is
            nobody's but the copy's, whether the copy wrote the chunk or found
-           it the source's already (found by fuzz/nbs's cluster target, N9d:
+           it the source's already (found by tests/fuzz/nbs's cluster target, N9d:
            kept, the joiner's crash made the chunk found open, and as its
            set's last member it was no source for the joiner after it) */
         let written = self.s.borrow().marks.get(&c.chunk).is_some_and(|m| m.incarnation == c.incarnation);
@@ -1854,7 +1854,7 @@ impl<D: Device> Store<D> {
            the join done, a writer taken over while it was out -- whose new
            writer's fence never reached it -- would write them there
            unfenced, by its view of before, which the members fenced
-           against it refuse (found by fuzz/nbs's cluster target, N13: a
+           against it refuse (found by tests/fuzz/nbs's cluster target, N13: a
            chain passed such a write on to it). An epoch newer than the
            copy's, a client's write since, is kept */
         let known = if r.known.set == c.epoch.set && r.known.version < c.epoch.version { c.epoch } else { r.known };

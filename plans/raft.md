@@ -92,7 +92,7 @@ needs a replicated state later.
 
 ## Tested
 
-`fuzz/raft` (host, in CI, through `tests/raft-test.py`). Fixed inputs are
+`tests/fuzz/raft` (host, in CI, through `tests/raft-test.py`). Fixed inputs are
 the gate; `--seed N --seconds S` runs a campaign.
 
 - **`node`**: three to seven members in one process over a simulated network
@@ -168,7 +168,7 @@ the gate; `--seed N --seconds S` runs a campaign.
   - **What opening adds**: every segment, the snapshot and the directory
     synced before the log is used -- a program started over after a failure,
     the machine never down, sees what was written and never synced.
-  - **The fuzzer** (`fuzz/raft`'s `log` target, on a disk of its own with
+  - **The fuzzer** (`tests/fuzz/raft`'s `log` target, on a disk of its own with
     POSIX's promises and no more) found four bugs, each now a scenario:
     1. A leader's snapshot below the commit was taken. The log then
        committed past its own end, and refused to open.
@@ -181,7 +181,7 @@ the gate; `--seed N --seconds S` runs a campaign.
     4. An entry below a taken snapshot, written after entries past it, was
        skipped on replay together with the truncation it had made. The
        entries it had replaced came back.
-  - **Mutants** (`fuzz/raft/mutants.py`, `log_*`): the CRC check, the seal
+  - **Mutants** (`tests/fuzz/raft/mutants.py`, `log_*`): the CRC check, the seal
     before a new segment, the syncs at open, the snapshot's sync before its
     rename, the compaction's bound, the installed snapshot's drop -- each
     taken out, the gate and its scenario fail.
@@ -222,7 +222,7 @@ the gate; `--seed N --seconds S` runs a campaign.
     for linearizability (Wing and Gong's search). Mutants: the session's
     answer for a retry, the read's wait for its index, the freeze at the
     snapshot's index, the sessions in the snapshot. As run:
-    - fuzz/raft's `rsm` target: 100 runs of 1500 steps, 300 to 600
+    - tests/fuzz/raft's `rsm` target: 100 runs of 1500 steps, 300 to 600
       operations each, snapshots every few hundred entries;
     - five scenarios, one of them the check itself held to known
       histories;
