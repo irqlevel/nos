@@ -459,7 +459,8 @@ pub fn create(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options
         return Err(String::from("a password and user-data of its own both -- the user-data is what cloud-init \
                                  reads: give the password in it"));
     }
-    if recipe.onto.is_some() && recipe.size.is_some() {
+    /* A clone of an image is grown to size= whatever its name. */
+    if recipe.onto.is_some() && recipe.size.is_some() && matches!(recipe.source, Source::Url(_)) {
         return Err(String::from("size= is a file's: a device's disk is the device's size, a volume's the \
                                  volume's"));
     }

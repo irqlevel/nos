@@ -81,6 +81,9 @@ const CONSOLE_PAGE_MAX: u64 = 64 * 1024;
 const TYPE_MAX: usize = 4096;
 /// The longest URL an image is fetched by, and a disk's file's name.
 const URL_MAX: usize = 2047;
+/// The longest name of an image of NBS's: a volume's (nbsmeta's
+/// `VOLUME_NAME_MAX`).
+const IMAGE_MAX: usize = 63;
 const FILE_MAX: usize = 64;
 /// The longest line of a job's log: what the bus keeps of one.
 const LINE_MAX: usize = 240;
@@ -1269,10 +1272,22 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
         Ok(n) => n,
         Err(s) => return s,
     };
-    let url = match p.str("url", URL_MAX) {
-        Ok(u) if cloud::is_url(u) => u,
-        Ok(_) => return refuse(call, Status::Invalid, "is an http:// or https:// URL", Some("url")),
-        Err(e) => return invalid(call, e),
+    /* What its disk is made of: a cloud's image by its URL, or an image of
+     * NBS's by its name (`hv create <name> image=nbs:<image>`) -- one of
+     * the two. */
+    let source = match (p.opt_str("url", URL_MAX), p.opt_str("image", IMAGE_MAX)) {
+        (Err(e), _) | (_, Err(e)) => return invalid(call, e),
+        (Ok(Some(_)), Ok(Some(_))) => {
+            return refuse(call, Status::Invalid, "is given with a URL: a VM is made of one image, a URL's or NBS's",
+                          Some("image"));
+        }
+        (Ok(None), Ok(None)) => {
+            return refuse(call, Status::Invalid, "is wanted -- or an image of NBS's, `image`", Some("url"));
+        }
+        (Ok(Some(u)), Ok(None)) if cloud::is_url(u) => cloud::Source::Url(u),
+        (Ok(Some(_)), Ok(None)) => return refuse(call, Status::Invalid, "is an http:// or https:// URL", Some("url")),
+        (Ok(None), Ok(Some(""))) => return refuse(call, Status::Invalid, "is an image's name", Some("image")),
+        (Ok(None), Ok(Some(i))) => cloud::Source::Image(i),
     };
     let fields = (|| -> Result<_, Invalid> {
         let size = p.opt_uint("size_bytes", 1, u64::MAX)?;
@@ -1331,8 +1346,7 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
         forwards,
         ..Options::default()
     };
-    let recipe = cloud::Recipe { source: cloud::Source::Url(url), size, onto, force, password, hvboot: cloud::HVBOOT,
-                                 user_data, protected };
+    let recipe = cloud::Recipe { source, size, onto, force, password, hvboot: cloud::HVBOOT, user_data, protected };
     let mut job = Job::new(call, &state.unloading);
     let created = cloud::create(&state.vms_root, &state.vms, name, &recipe, o, &mut job);
     /* Started once it is made, when asked: by the same job, its reservation
