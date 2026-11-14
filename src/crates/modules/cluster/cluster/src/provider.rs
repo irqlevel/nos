@@ -2,13 +2,17 @@
 //! API, the panel and `mgmt` reach it -- through the same functions the
 //! commands are, so that what a command does a call does.
 //!
-//! - reads: `status` (this host's member), `hosts` (every host, the
-//!   invitations open, how many were removed);
-//! - actions: `invite` (the token answered, once, and kept nowhere),
-//!   `revoke`, `remove`, `maintenance`, `address`, `rekey` (this host's).
+//! - reads: `status` (this host's member, and this host as ipcnet has it:
+//!   its name, key and address, which another host's `invite` asks for),
+//!   `hosts` (every host, the invitations open, how many were removed);
+//! - actions: `init` (a cluster of this host alone), `invite` (the token
+//!   answered, once, and kept nowhere), `revoke`, `remove`, `maintenance`,
+//!   `address`, `rekey` (this host's);
+//! - a job: `join`, on the host invited, its token another host's
+//!   `invite` answered -- for as long as the inviting member takes to
+//!   answer, a minute at most.
 //!
-//! `join` and `recover` are a host's own business, typed at its shell: a
-//! join's token comes from another host, and a recover is unsafe by
+//! `recover` is typed at a host's own shell alone: it is unsafe by
 //! design.
 
 use alloc::sync::Arc;
@@ -18,14 +22,16 @@ use mgmtwire::{Invalid, Params, Value};
 use raft::Role;
 use registry::Role as AddrRole;
 
-use crate::{files, op_address, op_invite, op_maintenance, op_rekey, op_remove, op_revoke, parse_ip, view,
-            ModState, INVITE_SECS};
+use crate::{files, op_address, op_init, op_invite, op_join, op_maintenance, op_rekey, op_remove, op_revoke, parse_ip,
+            view, ModState, INVITE_SECS};
 
 const DESCRIPTOR: &str = include_str!("cluster.descriptor.json");
 
-const METHODS: [Method; 8] = [
+const METHODS: [Method; 10] = [
     Method { name: "status", kind: Kind::Read },
     Method { name: "hosts", kind: Kind::Read },
+    Method { name: "init", kind: Kind::Action },
+    Method { name: "join", kind: Kind::Job },
     Method { name: "invite", kind: Kind::Action },
     Method { name: "revoke", kind: Kind::Action },
     Method { name: "remove", kind: Kind::Action },
@@ -39,6 +45,9 @@ const HOST_MAX: usize = 63;
 const IP_MAX: usize = 15;
 const KEY_MAX: usize = 64;
 const ROLE_MAX: usize = 8;
+/// A cluster's name, and a join's token in text, at most.
+const NAME_MAX: usize = 63;
+const TOKEN_MAX: usize = 512;
 
 /// The provider registered, its calls answered from `state` -- until it is
 /// dropped, which waits out every call of it.
@@ -88,6 +97,8 @@ fn provide(state: &ModState, method: &str, params: &[u8], call: &mut Call) -> St
     match method {
         "status" => status(state, p, call),
         "hosts" => hosts(state, p, call),
+        "init" => init(state, p, call),
+        "join" => join(state, p, call),
         "invite" => invite(state, p, call),
         "revoke" => revoke(state, p, call),
         "remove" => remove(state, p, call),
@@ -147,6 +158,27 @@ fn ip_or_null(w: &mut Writer, ip: Option<u32>) {
     }
 }
 
+/// This host as ipcnet has it: what another host's `invite` asks for --
+/// its name, its key, its address -- and whether it serves; null where
+/// ipcnet is not there.
+fn this_host(w: &mut Writer) {
+    w.key("this_host");
+    match raftmember::ipcnet::identity() {
+        Ok(id) => {
+            w.begin_object();
+            w.field_str("name", &id.name);
+            w.field_str("key", &files::hex(&id.key));
+            w.key("ip");
+            ip_or_null(w, (id.ip != 0).then_some(id.ip));
+            w.key("port");
+            port_or_null(w, if id.port == crate::IPC_PORT { 0 } else { id.port });
+            w.field_bool("serving", id.serving);
+            w.end_object();
+        }
+        Err(_) => w.null(),
+    }
+}
+
 fn status(state: &ModState, p: Params<'_>, call: &mut Call) -> Status {
     if let Err(e) = p.finish() {
         return invalid(call, e);
@@ -155,12 +187,14 @@ fn status(state: &ModState, p: Params<'_>, call: &mut Call) -> Status {
         return answer(call, |w| {
             w.begin_object();
             w.field_bool("member", false);
+            this_host(w);
             w.end_object();
         });
     };
     answer(call, |w| {
         w.begin_object();
         w.field_bool("member", true);
+        this_host(w);
         w.key("cluster");
         match v.state.cluster() {
             Some(c) => w.str(&c.name),
@@ -247,6 +281,65 @@ fn hosts(state: &ModState, p: Params<'_>, call: &mut Call) -> Status {
         w.field_uint("removed", v.state.removed().len() as u64);
         w.end_object();
     })
+}
+
+/// A refusal of a cluster made or joined, said as the call's: this host in
+/// one already -- a conflict; a name or a token not one -- invalid;
+/// anything else failed.
+fn refused_member(call: &mut Call, why: &str, field: &'static str) -> Status {
+    let status = if why.starts_with("this host is a member of a cluster already") {
+        Status::Conflict
+    } else if why.contains("is not a cluster's name") || why.starts_with("not a token") {
+        Status::Invalid
+    } else {
+        Status::Failed
+    };
+    refuse(call, status, why, Some(field))
+}
+
+fn init(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status {
+    let name = match p.str("name", NAME_MAX) {
+        Ok(n) => n,
+        Err(e) => return invalid(call, e),
+    };
+    if let Err(e) = p.finish() {
+        return invalid(call, e);
+    }
+    match op_init(state, name) {
+        Ok((host, node)) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("cluster", name);
+            w.field_str("host", &host);
+            w.field_uint("node", node);
+            w.end_object();
+        }),
+        Err(why) => refused_member(call, &why, "name"),
+    }
+}
+
+fn join(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status {
+    let token = match p.str("token", TOKEN_MAX) {
+        Ok(t) => t,
+        Err(e) => return invalid(call, e),
+    };
+    if let Err(e) = p.finish() {
+        return invalid(call, e);
+    }
+    call.note("cluster: the join asked of the inviting member");
+    let got = {
+        let c: &Call = call;
+        op_join(state, token, &|| c.cancelled())
+    };
+    match got {
+        Ok((host, node, hosts)) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("host", &host);
+            w.field_uint("node", node);
+            w.field_uint("hosts", hosts as u64);
+            w.end_object();
+        }),
+        Err(why) => refused_member(call, &why, "token"),
+    }
 }
 
 fn invite(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status {

@@ -229,10 +229,14 @@ pub fn replica_bad(state: &ModState, set: u32, host: &str) -> Result<u32, Failur
     }
 }
 
-/// Device `ident` of this host's given no new chunks.
-pub fn device_drain(state: &ModState, ident: &str) -> Result<u32, Failure> {
+/// Device `ident` of `host`'s -- this host's where none is given -- given no
+/// new chunks: a change of the metadata's alone, which any member asks.
+pub fn device_drain(state: &ModState, host: Option<&str>, ident: &str) -> Result<u32, Failure> {
     let v = caught_up(state)?;
-    let host = this_host(&v)?;
+    let host = match host {
+        Some(h) => String::from(h),
+        None => this_host(&v)?,
+    };
     match ask(state, &Command::DeviceDrain { host, ident: String::from(ident) })? {
         Answer::Device { id } => Ok(id),
         other => Err(Failure::Other(alloc::format!("answered {:?}", other))),

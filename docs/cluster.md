@@ -48,12 +48,17 @@ cluster recover [<cluster>]     on the last host standing: what it does, then --
 ```
 
 The same are the `cluster` provider's on the management bus -- reads
-`status` and `hosts`, actions `invite` (the token answered once, kept
-nowhere), `revoke`, `remove` (its host's name typed again), `maintenance`,
-`address` and `rekey` -- so that the panel lists the hosts and an admin
-invites one from its page (`cluster.descriptor.json`). `join` and `recover`
-are typed at the host's own shell: a token comes from another host, and a
-recover is unsafe by design.
+`status` (this member, and this host as ipcnet has it: its name, its key
+and its address, what an invitation on another host asks for) and `hosts`;
+actions `init` (a cluster of this host alone), `invite` (the token answered
+once, kept nowhere), `revoke`, `remove` (its host's name typed again),
+`maintenance`, `address` and `rekey`; and a job, `join`, on the host
+invited, with the token another host's `invite` answered -- asked of the
+inviting member until it answers, a minute at most, and given up when the
+job is cancelled. So the panel makes a cluster on one host's page, invites
+another from there with what that host's status says, and joins it on the
+other's (`cluster.descriptor.json`). `recover` is typed at the host's own
+shell alone: it is unsafe by design.
 
 At boot, /etc/rc loads both and starts ipcnet; the member starts by itself
 over its log:
@@ -311,10 +316,13 @@ asks, and the typed name is the admin's word that they are gone.
   delivered past the restriction, a monitor taken, a restriction lifted by
   dropping the peer, a peer made anew.
 - **`scripts/cluster-test.py`** (both arches, three nos on
-  `scripts/hub.py`'s LAN): a cluster made on one host; two invited and
-  joined, one through a member that does not lead, after a join with a wrong
-  secret refused, and while invited its pings to a member's echo refused;
-  the provider answering through the bus; maintenance and an address seen
+  `scripts/hub.py`'s LAN): a cluster made on one host, through the bus as
+  the panel makes it, and a second init refused at the shell and through
+  the bus; a host's status through the bus saying what an invitation asks
+  of it -- its name, key, address and port; two invited and joined, one as
+  a job through the bus, one through a member that does not lead, after a
+  join with a wrong secret refused, and while invited its pings to a
+  member's echo refused; the provider answering through the bus; maintenance and an address seen
   by every host; a rekey under 6000 pings, every one answered and no
   connection lost, the old key refused after; every host rebooted at once;
   recover on the last of three, refused first, and a host installed anew

@@ -483,8 +483,9 @@ pub(crate) fn caught_up(state: &ModState) -> Result<View, String> {
 
 /// `host` offered the cluster: the incarnation its mds is -- made now, or
 /// the one it was already -- asked again until its connection is up and it
-/// answers.
-fn offer(v: &View, host: &str) -> Result<u64, String> {
+/// answers, or `stop` says to give up (a provider's job told to: its
+/// module going, a cancel).
+fn offer(v: &View, host: &str, stop: &dyn Fn() -> bool) -> Result<u64, String> {
     let c = v.state.cluster().ok_or_else(|| String::from("no NBS cluster yet -- this member's log is behind"))?;
     let o = Offer {
         cluster: c.id,
@@ -497,6 +498,9 @@ fn offer(v: &View, host: &str) -> Result<u64, String> {
     let end = boot_time_ns() + OFFER_TOTAL_MS * NS_PER_MS;
     let mut last = alloc::format!("no answer from {}", host);
     while boot_time_ns() < end {
+        if stop() {
+            return Err(alloc::format!("the offer to {} stopped: {}", host, last));
+        }
         if let Err(e) = mb.send_to(&to, member::TAG_OFFER, 0, &data) {
             last = alloc::format!("{} out of reach: {} -- is it a host of the cluster registry, with nbs-mds loaded?",
                                   host, e.name());
@@ -528,16 +532,18 @@ fn offer(v: &View, host: &str) -> Result<u64, String> {
     Err(last)
 }
 
-fn op_add(state: &ModState, host: &str) -> Result<u64, String> {
+/// `host` made a member: offered the cluster, then added -- `nbs host add`
+/// and the provider's `host_add`. Its incarnation.
+pub(crate) fn op_add(state: &ModState, host: &str, stop: &dyn Fn() -> bool) -> Result<u64, String> {
     let v = caught_up(state)?;
     if !nbsmeta::valid_name(host) {
         return Err(alloc::format!("\"{}\" is not a host's name", host));
     }
-    let id = offer(&v, host)?;
+    let id = offer(&v, host, stop)?;
     ask(state, &Command::Add { host: String::from(host), member: id })
 }
 
-fn op_remove(state: &ModState, host: &str) -> Result<u64, String> {
+pub(crate) fn op_remove(state: &ModState, host: &str) -> Result<u64, String> {
     member_view(state)?;
     ask(state, &Command::Remove { host: String::from(host) })
 }
@@ -545,7 +551,7 @@ fn op_remove(state: &ModState, host: &str) -> Result<u64, String> {
 /// A host that lost its state taken back: its old member removed -- for
 /// good, its incarnation never taken again -- and the host offered the
 /// cluster as a new one.
-fn op_replace(state: &ModState, host: &str) -> Result<(u64, u64), String> {
+pub(crate) fn op_replace(state: &ModState, host: &str, stop: &dyn Fn() -> bool) -> Result<(u64, u64), String> {
     let v = caught_up(state)?;
     let old = v.state.member(host).map(|m| m.id);
     let removed = match old {
@@ -560,7 +566,7 @@ fn op_replace(state: &ModState, host: &str) -> Result<(u64, u64), String> {
         kcore::task::sleep_ms(20);
         v = member_view(state)?;
     }
-    let id = offer(&v, host).map_err(|why| {
+    let id = offer(&v, host, stop).map_err(|why| {
         alloc::format!("{}'s old member {} is removed, and the offer of a new one failed: {} -- `nbs host add {}` \
                         once it answers", host, removed, why, host)
     })?;
@@ -580,7 +586,7 @@ fn run(state: &Arc<ModState>, args: &str, out: &mut Output) -> Result<(), String
         ["init", name] => init_cluster(state, name, out),
         ["hosts"] => hosts(state, out),
         ["host", "add", host] => {
-            let id = op_add(state, host)?;
+            let id = op_add(state, host, &|| false)?;
             let _ = writeln!(out, "nbs: {} is member {} -- a learner until it holds the log, then a voter while fewer \
                                    than five vote", host, id);
             Ok(())
@@ -591,7 +597,7 @@ fn run(state: &Arc<ModState>, args: &str, out: &mut Output) -> Result<(), String
             Ok(())
         }
         ["host", "replace", host] => {
-            let (old, new) = op_replace(state, host)?;
+            let (old, new) = op_replace(state, host, &|| false)?;
             let _ = writeln!(out, "nbs: {}'s member {} removed, and {} is member {} now", host, old, host, new);
             Ok(())
         }
@@ -615,7 +621,7 @@ fn run(state: &Arc<ModState>, args: &str, out: &mut Output) -> Result<(), String
             Ok(())
         }
         ["devices", "drain", ident] => {
-            let id = store::device_drain(state, ident).map_err(|f| f.says())?;
+            let id = store::device_drain(state, None, ident).map_err(|f| f.says())?;
             let _ = writeln!(out, "nbs: device {} ({}) takes no new chunks", ident, id);
             Ok(())
         }
@@ -683,6 +689,23 @@ fn run(state: &Arc<ModState>, args: &str, out: &mut Output) -> Result<(), String
 }
 
 fn init_cluster(state: &Arc<ModState>, name: &str, out: &mut Output) -> Result<(), String> {
+    let made = op_init(state, name)?;
+    let _ = writeln!(out, "nbs: NBS cluster {} made ({}), {} its first member ({}) -- `nbs host add` the next", name,
+                     codec::hex(&made.cluster), made.host, made.member);
+    Ok(())
+}
+
+/// An NBS cluster made of this host alone: its id, this host's name and
+/// its member's incarnation.
+pub(crate) struct Made {
+    pub cluster: [u8; 16],
+    pub host: String,
+    pub member: u64,
+}
+
+/// An NBS cluster named `name` made of this host alone -- `nbs init` and the
+/// provider's `init`: undone where it does not finish, for an init again.
+pub(crate) fn op_init(state: &Arc<ModState>, name: &str) -> Result<Made, String> {
     if !nbsmeta::valid_name(name) {
         return Err(alloc::format!("\"{}\" is not a cluster's name: lowercase letters, digits and -", name));
     }
@@ -720,11 +743,7 @@ fn init_cluster(state: &Arc<ModState>, name: &str, out: &mut Output) -> Result<(
     let made = ask(state, &Command::Init { cluster, name: String::from(name), host: id.name.clone(), member })
         .and_then(|_| files::create_member(&state.dir, &me));
     match made {
-        Ok(()) => {
-            let _ = writeln!(out, "nbs: NBS cluster {} made ({}), {} its first member ({}) -- `nbs host add` the next",
-                             name, codec::hex(&cluster), id.name, member);
-            Ok(())
-        }
+        Ok(()) => Ok(Made { cluster, host: id.name, member }),
         Err(why) => Err(undo(why)),
     }
 }

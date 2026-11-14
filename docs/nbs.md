@@ -115,13 +115,22 @@ number, nothing read or written.
 
 The same is on the management bus as the `nbs` provider (`provider.rs`,
 `nbs.descriptor.json`), which the panel shows:
-- to read: `status`, `hosts`, `cs`, `volumes`, `volume` -- each volume with
-  its `kind` (`volume`, `image` or `snapshot`) and its `origin`, the image or
-  snapshot a clone was made of and the volume a snapshot was taken of, by
-  name while that is there;
+- to read: `status`, `hosts`, `cs`, `devices` (every host's chunk server's
+  devices: their ids, sizes and states), `volumes`, `volume` -- each volume
+  with its `kind` (`volume`, `image` or `snapshot`) and its `origin`, the
+  image or snapshot a clone was made of and the volume a snapshot was taken
+  of, by name while that is there;
 - to change: `volume_create`, `volume_delete`, `volume_resize`, and
   `volume_snapshot`, `volume_freeze`, `volume_clone` (N10d) -- a snapshot of
-  an attached volume asked on its writer's host, as the command is.
+  an attached volume asked on its writer's host, as the command is;
+- the cluster itself, as `nbs init` and `nbs host` make it: `init`, an NBS
+  cluster of this host alone; `host_add` and `host_replace`, jobs -- an
+  offer is waited on for up to 30 seconds, and given up when the job is
+  cancelled; `host_remove`, the host's name typed again in the panel;
+- the devices: `device_add`, a device of this host's to its chunk server,
+  with `wipe` as the command's; `device_drain`, of any host's (`host`, this
+  one where none is given) -- a change to the metadata alone, its device
+  taking no new chunks until it is added again.
 
 Reads are this member's view, at the entry it has applied. Every change is a
 command through the leader, answered once this member has applied it too:
@@ -1466,17 +1475,19 @@ only its metadata.
   cluster registry is made among them, and a fourth booted late; every
   nbs-mds with `out_after=10`, the least it takes, and `scrub=1`). It
   covers:
-  - an NBS cluster made and two hosts added, one through a member that does
-    not lead;
+  - an NBS cluster made through the bus, as the panel makes it, and two
+    hosts added, one through a member that does not lead, as a job through
+    the bus;
   - an add asked again answered with the same incarnation, and a second init
-    refused;
+    refused, at the shell and through the bus;
   - a commit through the majority;
   - the leader killed: the other two elect one of themselves and commit, and
     the killed host comes back from its log;
   - the leader cut off by the hub: the other two elect and commit while it
     commits nothing, then it follows once healed;
   - a host's folder removed: the leader says its state is gone, an add of it
-    is refused, and `replace` takes it back as a new member;
+    is refused, and a replace -- a job through the bus -- takes it back as a
+    new member;
   - a member removed, and its old incarnation refused when added again;
   - what is stored, on a pool disk of three partitions a host (N6):
     - no volume before three hosts have a device;
@@ -1486,7 +1497,9 @@ only its metadata.
     - volumes made, made again, refused for another size, grown, refused
       smaller, refused past the room;
     - the room filled to its last slot, then given back by a delete;
-    - a device drained;
+    - a device added through the bus, and one drained -- again from another
+      host through the bus, naming its host, and refused naming a host it
+      is not on -- the provider's devices saying each host's and its state;
     - the provider answering through the bus as the command does;
     - every host's digest at the same entry and the same;
     - every log compacted into a snapshot;

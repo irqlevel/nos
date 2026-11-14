@@ -12,13 +12,38 @@
       "kind": "read",
       "title": {"en": "Member", "ru": "Участник"},
       "help": {
-        "en": "This host's member of the registry: its node, its role, the leader it follows and how far it has applied.",
-        "ru": "Участник реестра на этом хосте: его узел, роль, лидер, за которым он идёт, и докуда он применил журнал."
+        "en": "This host's member of the registry: its node, its role, the leader it follows and how far it has applied; and this host as ipcnet has it -- its name, key and address, what another host's invitation asks for.",
+        "ru": "Участник реестра на этом хосте: его узел, роль, лидер, за которым он идёт, и докуда он применил журнал; и сам этот хост для ipcnet -- имя, ключ и адрес, которые нужны приглашению на другом хосте."
       }
     },
     "hosts": {
       "kind": "read",
       "title": {"en": "Hosts", "ru": "Хосты"}
+    },
+    "init": {
+      "kind": "action",
+      "title": {"en": "Make a cluster", "ru": "Создать кластер"},
+      "help": {
+        "en": "A cluster of this host alone, named so; the other hosts are invited to it after. ipcnet must serve, on an address.",
+        "ru": "Кластер из одного этого хоста с этим именем; остальные хосты приглашаются в него после. ipcnet должен работать и иметь адрес."
+      },
+      "params": {
+        "name": {
+          "type": "string", "required": true, "title": {"en": "Name", "ru": "Имя"},
+          "help": {"en": "Lowercase letters, digits and -.", "ru": "Строчные буквы, цифры и -."}
+        }
+      }
+    },
+    "join": {
+      "kind": "job",
+      "title": {"en": "Join a cluster", "ru": "Войти в кластер"},
+      "help": {
+        "en": "On the host invited: into the cluster with the token another host's invitation showed, within its 15 minutes.",
+        "ru": "На приглашённом хосте: войти в кластер с токеном, который показало приглашение на другом хосте, в течение его 15 минут."
+      },
+      "params": {
+        "token": {"type": "string", "required": true, "title": {"en": "Token", "ru": "Токен"}}
+      }
     },
     "invite": {
       "kind": "action",
