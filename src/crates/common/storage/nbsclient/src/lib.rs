@@ -26,6 +26,10 @@
 //!   the write is done when the mds says it is out -- never on a set the mds
 //!   would not vouch for. Meanwhile the request is sent again every second.
 //! - Two writes that overlap are never out at once: the second waits.
+//! - The bytes of the reads and writes out at once are `WINDOW_BYTES` at
+//!   most -- half what a link holds waiting for a peer -- or those of one
+//!   alone: the rest wait their turn here, sent as those out are done, and
+//!   nothing goes past the link's queue to bounce and go again in a moment.
 //! - A flush waits for every write before it, then asks every cs that has
 //!   acknowledged a write since the last flush began to make its writes
 //!   durable; it is done once they have, and once every flush before it is
@@ -111,6 +115,21 @@ const CLOSING_MAX: usize = 2;
 /// twice -- what the chain is there to spare. One whose replica before it
 /// is taken out of the piece unanswered is sent it at once.
 pub const CHAIN_WAIT_NS: u64 = 250_000_000;
+/// The bytes of the driver's reads and writes a session has out at once, at
+/// most: the rest wait their turn in it (`pump`), sent as those out are done
+/// -- one alone goes whatever its size. A guest keeps up to 64 requests of
+/// 248 KiB in flight, 16 MiB, and all of it went at once, past what ipcnet
+/// holds waiting for a peer (4 MiB a class, its `QUEUE_BYTES`): the rest
+/// bounced, went again AGAIN_NS on, bounced again, the link idle between --
+/// writes of 1.5 s at 10 MiB/s on the demo stand, whose links carry 69 MB/s
+/// and answer in a millisecond. Half that queue, so that two volumes written
+/// from one host at once fit it; and well above what keeps a link busy, its
+/// bandwidth times a chain's round trip.
+#[cfg(not(feature = "small_windows"))]
+pub const WINDOW_BYTES: u64 = 2 << 20;
+/// The fuzzer's: two blocks, its operations a few blocks each.
+#[cfg(feature = "small_windows")]
+pub const WINDOW_BYTES: u64 = 2 * BLOCK;
 /// How long an operation may take before it fails.
 pub const DEADLINE_NS: u64 = 60_000_000_000;
 /// How long the attach is asked for before the session fails: a session
@@ -681,6 +700,13 @@ impl Session {
         self.ops.values().filter(|o| o.tag & INTERNAL == 0).count()
     }
 
+    /// The driver's reads and writes out -- their bytes, and how many --
+    /// which the window holds to `WINDOW_BYTES`, or to one alone (`pump`).
+    pub fn in_flight(&self) -> (u64, usize) {
+        self.ops.values().filter(|o| o.out && matches!(o.kind, Kind::Read | Kind::Write) && o.tag & INTERNAL == 0)
+            .fold((0, 0), |(bytes, n), o| (bytes + u64::from(o.len), n + 1))
+    }
+
     /// Whether it is paused for a snapshot (N10c2).
     pub fn paused(&self) -> bool {
         self.pausing.is_some()
@@ -725,7 +751,10 @@ impl Session {
                 *s += &alloc::format!(" ... and {} more", n - REPORT_NAMED);
             }
         }
-        let mut s = alloc::format!("{:?}, generation {}: {} operations", self.phase, self.generation, self.ops.len());
+        let (flying, many) = self.in_flight();
+        let mut s = alloc::format!("{:?}, generation {}: {} operations, {} reads and writes out of {} bytes, the \
+                                    window {}", self.phase, self.generation, self.ops.len(), many, flying,
+                                   WINDOW_BYTES);
         for (id, o) in self.ops.iter().take(REPORT_NAMED) {
             s += &alloc::format!(" [#{} {:?} {}+{} pieces {} waiting {:?} out {}]", id, o.kind, o.offset, o.len,
                                  o.pieces, o.waiting, o.out);
@@ -2249,6 +2278,17 @@ impl Session {
             if !ready {
                 k += 1;
                 continue;
+            }
+            /* The window (`WINDOW_BYTES`): a read or a write of the driver's
+               goes with room for it among those out, or alone -- the rest,
+               those behind it too, wait their turn, nothing of them sent.
+               Counted anew each time: a launch can end an operation, and
+               start others, before it comes back here */
+            if matches!(o.kind, Kind::Read | Kind::Write) && o.tag & INTERNAL == 0 {
+                let (flying, _) = self.in_flight();
+                if flying != 0 && flying + u64::from(o.len) > WINDOW_BYTES {
+                    break;
+                }
             }
             self.queue.remove(k);
             self.launch(id, now, bufs, out);

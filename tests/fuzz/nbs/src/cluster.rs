@@ -136,6 +136,10 @@ const CLOSE_MAP_READ_NS: u64 = 3_000 * MS;
 /// The places a session closes at once, at most: nbsclient's `CLOSING_MAX`
 /// as the fuzzer builds it (`small_windows`).
 const CLOSING_FUZZ: usize = 2;
+/// The bytes of a session's reads and writes out at once, at most, more
+/// than one out: nbsclient's `WINDOW_BYTES` as the fuzzer builds it --
+/// two blocks.
+const WINDOW_FUZZ: u64 = 2 * 4096;
 /// How long a cs waits for its mds's answer, as nbs-cs does.
 const MDS_WAIT: u64 = 5_000 * MS;
 /// How long a run lasts at most, in the network's time: well under an
@@ -664,6 +668,23 @@ impl World {
         self.links.entry((from, to)).or_default().push_back(Msg { bytes, id });
     }
 
+    /// A session's reads and writes out held to the window: their bytes at
+    /// most `WINDOW_FUZZ` where more than one is out -- what goes past it is
+    /// what a link's queue bounces, sent again in a moment, its link idle
+    /// meanwhile (the demo stand's 1.5 s writes). Counted where some wait
+    /// their turn with the window full.
+    fn window_held(&mut self, who: &str, s: (u64, usize, usize)) -> Result<(), String> {
+        let (bytes, out, busy) = s;
+        if out > 1 && bytes > WINDOW_FUZZ {
+            return Err(format!("{} has {} reads and writes out, {} bytes, past the window of {}", who, out, bytes,
+                               WINDOW_FUZZ));
+        }
+        if busy > out && bytes + 4096 > WINDOW_FUZZ {
+            self.count("operations waiting with the window full");
+        }
+        Ok(())
+    }
+
     /// A client's outputs: its messages queued, its operations checked.
     fn outs(&mut self, c: usize, out: Vec<Out>) -> Result<(), String> {
         /* Closes let out a window at a time (N13b): never more places
@@ -672,6 +693,9 @@ impl World {
             return Err(format!("client {} closing {} places at once, past the window of {}", c,
                                self.clients[c].s.closing(), CLOSING_FUZZ));
         }
+        let (bytes, many) = self.clients[c].s.in_flight();
+        let busy = self.clients[c].s.busy();
+        self.window_held(&format!("client {}", c), (bytes, many, busy))?;
         for o in out {
             match o {
                 Out::Send { to: To::Mds, id, bytes } => {
@@ -2652,6 +2676,9 @@ impl World {
     /// The clone's writer's outputs: its messages queued, its operations
     /// checked.
     fn clone_outs(&mut self, k: usize, out: Vec<Out>) -> Result<(), String> {
+        let (bytes, many) = self.clones[k].s.in_flight();
+        let busy = self.clones[k].s.busy();
+        self.window_held(&format!("the clone's writer {}", k), (bytes, many, busy))?;
         for o in out {
             match o {
                 Out::Send { to: To::Mds, id, bytes } => {
