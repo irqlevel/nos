@@ -1,8 +1,9 @@
 //! NBS as hv asks it (N10d3): through the management bus, as the host API
 //! and the panel ask it -- nbs-mds is a module of its own, and a module
 //! reaches another's only so. Its `nbs` provider's `volume`, and its
-//! `volume_create`, `volume_resize`, `volume_freeze`, `volume_clone` and
-//! `volume_delete`: a refusal said back as the provider says it.
+//! `volume_create`, `volume_resize`, `volume_freeze`, `volume_clone`,
+//! `volume_snapshot` and `volume_delete`: a refusal said back as the
+//! provider says it.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -126,6 +127,19 @@ pub fn clone(from: &str, name: &str) -> Result<u32, String> {
         w.field_str("name", name);
         w.end_object();
     }).map_err(|(_, why)| alloc::format!("nbs:{} of nbs:{}: {}", name, from, why))?)
+}
+
+/// Snapshot `name` of volume `volume` taken: of one with no writer as it
+/// is, of one attached only on its writer's host -- which pauses the
+/// writer's session for it, a guest's disk among them -- elsewhere refused,
+/// naming that host. Its number.
+pub fn snapshot(volume: &str, name: &str) -> Result<u32, String> {
+    number(call("volume_snapshot", &|w| {
+        w.begin_object();
+        w.field_str("volume", volume);
+        w.field_str("name", name);
+        w.end_object();
+    }).map_err(|(_, why)| alloc::format!("nbs:{} of nbs:{}: {}", name, volume, why))?)
 }
 
 /// Volume `name` deleted: what a make that failed leaves taken away.

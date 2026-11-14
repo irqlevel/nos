@@ -3043,8 +3043,13 @@ $ hv start v1
 The host API's `create` takes an image of NBS's as `image`, in place of
 `url` -- one of the two -- its clone named by `onto` (`nbs:<volume>`) where
 not the VM's, and grown to `size_bytes`; and a URL's image poured onto a
-volume with `onto=nbs:<volume>`. The panel's create offers both: NBS's
-images and snapshots to make a VM of, and its volumes to pour onto.
+volume with `onto=nbs:<volume>`. Its `image` makes an image as `hv image`
+does, and `snapshot` takes a snapshot of a VM's volume -- a running one's
+too, its session paused for it -- of which VMs are made as of an image. The
+panel has them all: an Images page (NBS's images and snapshots, a new image
+of a URL, each a click from a VM of it), a Snapshot on a VM's page and the
+VM's snapshots listed there, and a create that offers NBS's images and
+snapshots to make a VM of, and its volumes to pour onto.
 
 What it does not do yet: `hv delete` leaves the VM's clone, as it leaves
 any `nbs:` disk -- `nbs volume delete` takes it away. `scripts/hv-nbs-test.py`
@@ -3143,8 +3148,8 @@ commands are:
 | | |
 |---|---|
 | reads | `list` (every VM: its folder's, and those on the list without one), `get` (its configuration, disks and forwards), `host` (the extension, the cores, the huge pool, the switch -- and the host's address on it and each port's, the same before the switch is made), `networks`, `config_get`, `console_read` (a page of its console from a byte on -- its control sequences taken out, or for a terminal filtered as `hv attach` filters them, a sequence the page would cut in two left for the next), `disks` (a device's id and its name this boot among them), `forwards`, `devices` (every device of nos's: its id, type, size, who holds it, what is on it, and why it would be refused -- [A device as a guest's disk](#a-device-as-a-guests-disk)) |
-| actions | `config_set` (a vm.toml checked as a start checks it, the old one kept as `vm.toml.prev` as its bytes -- so one that no longer parses, a key misspelt by hand, can be mended), `forward_add` and `forward_del` (kept in its vm.toml, and made or taken away now when it runs), `console_write` (keys, control keys among them), `disk_add` (a new empty disk in its folder), `disk_grow`, `disk_attach` and `disk_detach` (a device given to a stopped VM by its id, `force` as `hv disk attach` takes it, and taken off again) |
-| jobs | `start`, `stop`, `restart`, `create` (a cloud's image by its URL, as `hv create <name> <url>`, or an image of NBS's by its name, `image`, as `hv create <name> image=nbs:<image>`: with `onto` and `force`, a URL's poured onto a device of nos's or a volume of NBS's, and an image's clone named; with `port`, a port of the switch of its own, checked as a clone's is -- no other VM's by its vm.toml or as it runs; `forwards`, nos's ports relayed to its own; `protected`; and `start`, started by the same job once made, which ends failed, saying it was made, if the start fails), `clone`, `delete` |
+| actions | `config_set` (a vm.toml checked as a start checks it, the old one kept as `vm.toml.prev` as its bytes -- so one that no longer parses, a key misspelt by hand, can be mended), `forward_add` and `forward_del` (kept in its vm.toml, and made or taken away now when it runs), `console_write` (keys, control keys among them), `disk_add` (a new empty disk in its folder), `disk_grow`, `disk_attach` and `disk_detach` (a device given to a stopped VM by its id, `force` as `hv disk attach` takes it, and taken off again), `snapshot` (a snapshot of a disk of the VM's that is a volume of NBS's -- its first, or `disk` -- as `nbs volume snapshot` takes one: of a VM running here, its guest's session paused for it, the disk as a power cut would leave it; of one running on another host, refused, naming the host; of a VM of a file or a device, refused: a clone copies it whole) |
+| jobs | `start`, `stop`, `restart`, `create` (a cloud's image by its URL, as `hv create <name> <url>`, or an image of NBS's by its name, `image`, as `hv create <name> image=nbs:<image>`: with `onto` and `force`, a URL's poured onto a device of nos's or a volume of NBS's, and an image's clone named; with `port`, a port of the switch of its own, checked as a clone's is -- no other VM's by its vm.toml or as it runs; `forwards`, nos's ports relayed to its own; `protected`; and `start`, started by the same job once made, which ends failed, saying it was made, if the start fails), `clone`, `delete`, `image` (an image of NBS's made of a cloud's image by its URL, or of a file of nos's, as `hv image` makes one; a name NBS would refuse refused before anything is fetched) |
 
 A job says as it goes what the command would, as its log, and how far it
 has got; its cancel -- or the module's going -- stops a download, a

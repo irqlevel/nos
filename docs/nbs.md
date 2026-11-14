@@ -1257,9 +1257,14 @@ hv create <vm> image=nbs:<image> [size=N] [onto=nbs:<volume>] [words]
                                                 a VM whose first disk is a clone of the image: a volume of the VM's name, or onto='s, grown to size=
 ```
 
+The vm provider does the same through the bus, as the panel asks it: its
+`image` is `hv image`, and its `snapshot` a snapshot of a VM's volume --
+taken where the VM runs, its guest's session paused for it, as `nbs volume
+snapshot` pauses a writer's -- of which `create`'s `image` makes VMs.
+
 hv asks NBS through the management bus, as the host API does: nbs-mds's
 `nbs` provider (`volume`, `volume_create`, `volume_resize`,
-`volume_freeze`, `volume_clone`, `volume_delete`), so hv.ko links nothing of
+`volume_freeze`, `volume_clone`, `volume_snapshot`, `volume_delete`), so hv.ko links nothing of
 nbs-mds's, and without it says to `insmod /nbs-mds.ko`. `hv image` holds
 the name on its host while it makes the image -- a second of it there is
 refused -- refuses one NBS has, downloads a URL into the vms' folder

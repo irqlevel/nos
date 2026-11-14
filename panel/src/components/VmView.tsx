@@ -1,13 +1,15 @@
 'use client';
 
+import Link from 'next/link';
 import { useCallback, useEffect, useState } from 'react';
 
 import { MethodForm } from './MethodForm';
 import { ResourceTable } from './ResourceTable';
 import { Terminal } from './Terminal';
 import { call } from '@/lib/client';
-import { Descriptor, show } from '@/lib/descriptor';
+import { bytes, Descriptor, show } from '@/lib/descriptor';
 import { Locale, text, Words } from '@/lib/i18n';
+import { NbsVolume } from '@/lib/images';
 
 const TABS = ['overview', 'console', 'config', 'disks', 'forwards'] as const;
 type Tab = (typeof TABS)[number];
@@ -19,6 +21,8 @@ export function VmView({ host, name, d, locale, w }: { host: string; name: strin
   const [got, setGot] = useState<Record<string, unknown> | null>(null);
   const [error, setError] = useState('');
   const [action, setAction] = useState<string | null>(null);
+  /* Counted up as a snapshot is taken: its list loaded again */
+  const [taken, setTaken] = useState(0);
 
   const load = useCallback(async () => {
     const r = await call(host, 'vm', 'get', { name });
@@ -37,7 +41,10 @@ export function VmView({ host, name, d, locale, w }: { host: string; name: strin
   const vm = (got?.vm ?? {}) as Record<string, unknown>;
   const fields = d.resources?.vms?.fields ?? {};
   const label: Record<Tab, string> = { overview: w.overview, console: w.console, config: w.config, disks: w.disks, forwards: w.forwards };
-  const actions = ['start', 'stop', 'restart', 'clone', 'delete'].filter((m) => d.methods[m]);
+  const actions = ['start', 'stop', 'restart', 'snapshot', 'clone', 'delete'].filter((m) => d.methods[m]);
+  /* Its disks that are volumes of NBS's: what has snapshots */
+  const volumes = ((got?.disks ?? []) as Array<{ file?: unknown }>).map((x) => String(x.file ?? ''))
+    .filter((f) => f.startsWith('nbs:')).map((f) => f.slice('nbs:'.length));
 
   return (
     <div className="space-y-4">
@@ -78,9 +85,13 @@ export function VmView({ host, name, d, locale, w }: { host: string; name: strin
           {action && d.methods[action] && (
             <div className="rounded-xl border border-line bg-card p-4">
               <MethodForm key={action} host={host} provider="vm" name={action} method={d.methods[action]!} fixed={{ name }}
-                locale={locale} w={w} onDone={() => void load()} />
+                locale={locale} w={w} onDone={() => {
+                  void load();
+                  if (action === 'snapshot') setTaken((n) => n + 1);
+                }} />
             </div>
           )}
+          {volumes.length > 0 && <Snapshots host={host} volumes={volumes} taken={taken} locale={locale} w={w} />}
         </div>
       )}
 
@@ -112,6 +123,50 @@ export function VmView({ host, name, d, locale, w }: { host: string; name: strin
         </div>
       )}
     </div>
+  );
+}
+
+/** The snapshots of a VM's volumes of NBS's, each a click from a VM of a
+ * clone of it. */
+function Snapshots({ host, volumes, taken, locale, w }: {
+  host: string; volumes: string[]; taken: number; locale: Locale; w: Words;
+}) {
+  const [rows, setRows] = useState<NbsVolume[] | null>(null);
+  const of = volumes.join(' ');
+  useEffect(() => {
+    let live = true;
+    void call(host, 'nbs', 'volumes').then((r) => {
+      if (!live || !r.ok) return;
+      const mine = of.split(' ');
+      setRows(((r.data as { volumes?: NbsVolume[] }).volumes ?? [])
+        .filter((v) => v.kind === 'snapshot' && v.origin !== null && mine.includes(v.origin)));
+    });
+    return () => {
+      live = false;
+    };
+  }, [host, of, taken]);
+  if (rows === null) return null;
+  return (
+    <section className="rounded-xl border border-line bg-card" data-testid="vm-snapshots">
+      <h2 className="border-b border-line px-4 py-2 text-sm font-medium text-fg">{w.snapshots}</h2>
+      {rows.length === 0 ? <p className="px-4 py-3 text-sm text-muted">{w.nothingYet}</p> : (
+        <table className="w-full text-sm">
+          <tbody>
+            {rows.map((v) => (
+              <tr key={v.name} className="border-t border-line first:border-t-0">
+                <td className="px-4 py-2 font-mono text-xs text-fg">{v.name}</td>
+                <td className="px-4 py-2 font-mono text-xs text-fg-soft">{v.origin}</td>
+                <td className="px-4 py-2 font-mono text-xs text-fg-soft">{bytes(v.size)}</td>
+                <td className="px-4 py-2 text-right">
+                  <Link href={`/${locale}/h/${host}/vms/new?image=${encodeURIComponent(v.name)}`}
+                    className="rounded px-2 py-0.5 text-xs text-accent hover:bg-accent-soft">{w.createVm}</Link>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </section>
   );
 }
 

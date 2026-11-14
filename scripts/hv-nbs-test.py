@@ -16,7 +16,12 @@ device. Then:
   b's, started after, still the image's; the refusals: the image's name
   again, a VM of a plain volume, a size= under the image's, a clone's name
   taken -- each leaving nothing -- and through the bus a URL and an image
-  both;
+  both; an image made of the same file by the vm provider (`image`, a job
+  through the bus, as the panel makes one), a name NBS would refuse refused
+  first; v1's disk snapshotted as it runs, through the bus as the panel
+  takes one (`snapshot`) -- its guest's session paused for it -- the name
+  taken again refused, and a VM of the snapshot made on b by the provider
+  and booted: its disk v1's as the snapshot was taken, v1's write among it;
 - a guest on a with `disk=nbs:gdisk`: its disk the volume's size, its serial
   `nbs-<number>`; written with dd, synced, read back past the page cache the
   same; stopped -- the volume let go of, detached;
@@ -312,6 +317,19 @@ def main():
         check("nbs:img an image, of the disk's size", "an image" in out and ("%d MiB" % BOOT_MIB) in out, out)
         out = a.run("hv image img /boot.raw")
         check("hv image of the name again refused", "nbs:img is there already" in out, out)
+        out = job_done(a, a.run('mgmt start vm image {"name":"Img2","from":"/boot.raw"}'))
+        check("the vm provider's image of a name NBS would refuse: refused before anything is made",
+              out is not None and re.search(r"^job \d+ vm\.image done invalid", out, re.M) is not None, out)
+        out = job_done(a, a.run('mgmt start vm image {"name":"img2","from":"/boot.raw"}'), 300)
+        js = json_of(out)
+        check("an image made by the vm provider of a file of nos's, a job through the bus",
+              out is not None and re.search(r"^job \d+ vm\.image done ok", out, re.M) is not None
+              and "nbs:img2 is an image now" in out and js is not None and js.get("image") == "img2"
+              and js.get("size_bytes") == BOOT_MIB << 20, out)
+        out = a.run("nbs volume img2")
+        check("nbs:img2 an image, of the disk's size", "an image" in out and ("%d MiB" % BOOT_MIB) in out, out)
+        out = a.run("nbs volume delete img2")
+        check("and deleted", "deleted" in out, out)
         out = a.run("hv create v3 image=nbs:gdisk")
         check("a VM of a plain volume refused", "nbs:gdisk is a volume" in out, out)
         out = a.run("hv create v4 image=nbs:img size=1M")
@@ -357,6 +375,31 @@ def main():
         got, out = volume_sum(a, v1, 0, BOOT_MIB)
         check("read back past the page cache: the write, and the rest of the chunk the image's", got == copied_sum,
               out)
+
+        # -- v1's disk snapshotted as it runs, through the bus as the panel takes one -- its guest's
+        # session paused for it -- and a VM of the snapshot booted on b: its disk v1's then --
+        js = json_of(a.run('mgmt call vm snapshot {"name":"v1","snapshot":"v1-snap"}'))
+        check("a snapshot of v1's disk taken by the vm provider as v1 runs",
+              js is not None and js.get("vm") == "v1" and js.get("volume") == "v1" and js.get("snapshot") == "v1-snap",
+              js)
+        out = a.run("nbs volume v1-snap")
+        check("nbs:v1-snap a snapshot of v1", "a snapshot of v1" in out, out)
+        out = a.run('mgmt call vm snapshot {"name":"v1","snapshot":"v1-snap"}')
+        check("taken again by the name: refused", "mgmt: failed" in out and "already" in out, out)
+        out = job_done(b, b.run('mgmt start vm create {"name":"v9","image":"v1-snap","memory_mib":%d}' % GUEST_MIB),
+                       300)
+        check("v9 made of the snapshot on b by the vm provider",
+              out is not None and re.search(r"^job \d+ vm\.create done ok", out, re.M) is not None
+              and "nbs:v9 cloned from nbs:v1-snap" in out, out)
+        out = b.run("hv start v9")
+        v9 = started(out)
+        need("v9 started by its name on b", v9 is not None, out)
+        need("its shell up, off a clone of the snapshot", shell_up(b, v9))
+        got, out = volume_sum(b, v9, 0, BOOT_MIB)
+        check("v9's disk holds v1's as the snapshot was taken: v1's write among it", got == copied_sum, out)
+        b.run("hv stop %d" % v9)
+        check("v9 stopped, its clone let go of", ipct.wait_for(lambda: "detached" in b.run("nbs volume v9"), 120, 1),
+              b.run("nbs volumes"))
 
         out = b.run("hv start v2")
         v2 = started(out)
