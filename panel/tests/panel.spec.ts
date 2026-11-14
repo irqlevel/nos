@@ -5,6 +5,7 @@ import path from 'node:path';
 import { expect, Page, test } from '@playwright/test';
 
 import { MOCK_B, PASSWORD, STATE_B } from '../playwright.config';
+import { addressFor, copyable, ipOfUrl, isPublic } from '../src/lib/fills';
 
 async function login(page: Page, locale = 'en') {
   await page.goto(`/${locale}/login`);
@@ -363,6 +364,66 @@ test('a cluster: a second host added by its address and its key, the panel let i
   await page.getByTestId('host-nos-b').getByRole('button', { name: 'Remove' }).click();
   await expect(page.getByTestId('host-nos-b')).toHaveCount(0);
   await expect(page.getByTestId('host-wrong')).toHaveCount(0);
+});
+
+test('an invitation filled in from another host of the panel\'s, its token copied in a click', async ({ page, context }) => {
+  const host = await login(page);
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await addHost(page, 'nos-b', MOCK_B, STATE_B);
+  await page.goto(`/en/h/${host}/p/cluster`);
+  await page.getByRole('button', { name: /Invite a host/ }).click();
+  const form = page.getByTestId('form-cluster-invite');
+  /* The panel's other hosts to choose from: not the one whose page it is */
+  const from = form.locator('select[name=fill_from]');
+  await expect(from.locator('option')).toHaveText(['—', 'nos-b']);
+  await from.selectOption({ label: 'nos-b' });
+  /* Its name, its ipcnet key and its port as its status says them; its
+   * address its own -- a private one, the panel reaching it at a loopback */
+  await expect(form.getByTestId('fill-note')).toHaveText('Filled in from nos-b.');
+  await expect(form.locator('input[name=host]')).toHaveValue('nos-b');
+  await expect(form.locator('input[name=key]')).toHaveValue(crypto.createHash('sha256').update('nos-b').digest('hex'));
+  await expect(form.locator('input[name=ip]')).toHaveValue('10.9.0.5');
+  await expect(form.locator('input[name=port]')).toHaveValue('');
+  await form.getByRole('button', { name: /Invite a host/ }).click();
+  const answer = form.getByTestId('answer');
+  await expect(answer).toContainText('nos1-');
+  const token = (JSON.parse((await answer.textContent()) ?? '{}') as { token: string }).token;
+  /* The token copied in a click -- the one thing too long to select by eye */
+  await expect(form.getByRole('button', { name: /^Copy / })).toHaveCount(1);
+  const copy = form.getByRole('button', { name: 'Copy token' });
+  await copy.click();
+  await expect(copy).toContainText('Copied');
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(token);
+  /* Taken back, and the host away again */
+  const res = await page.request.post(`/api/h/${host}/call/cluster/revoke`, {
+    headers: { Origin: new URL(page.url()).origin }, data: { host: 'nos-b' },
+  });
+  expect(res.status()).toBe(200);
+  await removeHost(page, 'nos-b');
+});
+
+test('the address an invitation is filled in with: a public one first, the host\'s own before the panel\'s', () => {
+  /* The demo stand's neighbour: its own address the AX41's bridge's, the
+   * panel reaching it at the AX41's -- the NAT's */
+  expect(addressFor('10.77.0.11', ipOfUrl('65.109.93.213:39251'))).toEqual({ ip: '65.109.93.213', from: 'reached' });
+  /* A host of a public address of its own, the panel on its switch */
+  expect(addressFor('65.108.38.184', ipOfUrl('10.0.0.1:39234'))).toEqual({ ip: '65.108.38.184', from: 'own' });
+  /* Hosts of one private network */
+  expect(addressFor('192.168.1.5', ipOfUrl('192.168.1.5:39234'))).toEqual({ ip: '192.168.1.5', from: 'own' });
+  expect(addressFor('192.168.1.5', ipOfUrl('10.8.0.5:39234'))).toEqual({ ip: '192.168.1.5', from: 'own' });
+  /* None of its own: the panel's, where it is an address */
+  expect(addressFor(null, '203.0.113.7')).toEqual({ ip: '203.0.113.7', from: 'reached' });
+  expect(addressFor(null, ipOfUrl('nos.example:39234'))).toEqual({ ip: '', from: 'none' });
+  expect(ipOfUrl('[fd00::1]:39234')).toBeNull();
+  expect(['10.1.2.3', '172.16.0.1', '172.31.255.255', '192.168.0.1', '100.64.0.1', '100.127.0.1', '127.0.0.1',
+    '169.254.1.1', '0.0.0.0', '224.0.0.1', '255.255.255.255', '256.1.1.1', '1.2.3', 'x'].filter(isPublic)).toEqual([]);
+  expect(['172.15.0.1', '172.32.0.1', '100.63.0.1', '100.128.0.1', '8.8.8.8', '65.109.93.213'].every(isPublic)).toBe(true);
+  /* What a button copies: strings too long to select by eye, nested ones by
+   * their path; a list's are not */
+  expect(copyable({ host: 'ax41a', token: 'nos1-' + 'ab'.repeat(20), expires_s: 1,
+    this_host: { name: 'n', key: 'cd'.repeat(32) }, hosts: ['x'.repeat(20)] }))
+    .toEqual([['token', 'nos1-' + 'ab'.repeat(20)], ['this_host.key', 'cd'.repeat(32)]]);
+  expect(copyable('x'.repeat(40))).toEqual([]);
 });
 
 /** A host added to the panel by its address and its key: its id, once it is
