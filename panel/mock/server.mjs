@@ -12,15 +12,17 @@
 // against a real host, with ECONNRESET.
 //
 //     node mock/server.mjs [--port 39234] [--state mock/state] [--name nos]
-//                          [--trust <admin.crt>]
+//                          [--trust <admin.crt>] [--fresh]
 //
 // It makes, in its state folder, the host's key and certificate and an
 // admin's and a reader's, and prints the host's key and where the clients'
 // are -- what the panel is pointed at (panel/README.md). Its id is its key's,
 // so each state folder is a host of its own; --name names it, and --trust
 // lets another's key in as an admin -- the panel's, made for the first
-// host, as `api client add` lets it in on a second (a cluster). No
-// dependency but Node's own and openssl for the keys.
+// host, as `api client add` lets it in on a second (a cluster). --fresh
+// makes it a host of no cluster yet, its registry's or NBS's, for the
+// panel to make one of. No dependency but Node's own and openssl for the
+// keys.
 
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -41,6 +43,7 @@ const PORT = Number(opt('port', '39234'));
 const STATE = path.resolve(opt('state', path.join(HERE, 'state')));
 const NAME = opt('name', 'nos');
 const TRUST = opt('trust', null);
+const FRESH = args.includes('--fresh');
 
 /* ---- keys ---- */
 
@@ -150,7 +153,13 @@ const DEVICES = [
     type: '0fc63daf-8483-4772-8e79-3d69d8477de4', boots_the_machine: null, held_by: null,
     in_use_by: null, holds: 'an ext4 filesystem labelled "data"',
     refused: 'nvme17 holds an ext4 filesystem labelled "data" -- the vm would have its data over it; give it anyway with force' },
+  { name: 'sda', id: 'disk:ata-ST4000NM0035_ZC1A2B3C', disk: null, size_bytes: 64 * 1024 * MIB, type: null,
+    boots_the_machine: null, held_by: null, in_use_by: null, holds: null, refused: null },
 ];
+
+/* Where a VM's disk is, as `disks` says it: a device's id and a volume of
+ * NBS's (nbs:<volume>) as they are, a file in its folder. */
+const diskPath = (v, d) => (d.device || String(d.file).startsWith('nbs:') ? d.file : '/vms/' + v.name + '/' + d.file);
 
 /* What a device's disk is, as `disks` lists it: its id the word. */
 function deviceDisk(d, readOnly) {
@@ -174,6 +183,12 @@ function deviceGiven(word, force) {
 vm('panel', { protected: true, port: 0, forwards: [{ port: 39233, guest_port: 443 }] });
 vm('web', { cpus: 2, memory_mib: 2048, port: 3, forwards: [{ port: 2201, guest_port: 22 }] });
 vm('db', { memory_mib: 4096, network: 'back' });
+if (!FRESH) {
+  /* On volumes of NBS's: one with a replica down, one with a chunk unreachable */
+  const seed = { file: 'seed.iso', size_bytes: 65536, read_only: true };
+  vm('store', { disks: [{ file: 'nbs:deg-vol', size_bytes: null, read_only: false }, seed] });
+  vm('broken', { disks: [{ file: 'nbs:lost-vol', size_bytes: null, read_only: false }, seed] });
+}
 
 /** A VM started: on the list, its console printing a boot. */
 function startVm(v) {
@@ -183,8 +198,10 @@ function startVm(v) {
   v.reason = null;
   v.console += '\r\n\x1b[1mhvboot\x1b[0m: booting /boot/vmlinuz-6.12 from /dev/vda1\r\n';
 }
-for (const name of ['panel', 'web']) {
-  startVm(vms.get(name));
+for (const name of ['panel', 'web', 'store', 'broken']) {
+  if (vms.has(name)) {
+    startVm(vms.get(name));
+  }
 }
 setInterval(() => {
   for (const v of vms.values()) {
@@ -295,8 +312,18 @@ const vmNamed = (p) => {
 
 /* ---- the cluster's registry, as a member of it has it ---- */
 
+/** This host as ipcnet has it: the registry's first host, where the mock is
+ * a member of its own; its own name, where it is fresh. */
+const me = {
+  name: FRESH ? NAME : 'mock-a', ip: FRESH ? '10.9.0.5' : '10.9.0.1',
+  key: crypto.createHash('sha256').update(FRESH ? NAME : 'mock-a').digest('hex'),
+};
+const HOST_NAME = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+const CLUSTER_NO_MEMBER = 'this host is no member -- `cluster init`, or a join';
 const cluster = {
-  hosts: [
+  member: !FRESH,
+  name: FRESH ? null : 'test',
+  hosts: FRESH ? [] : [
     { name: 'mock-a', node: 1, vote: 'voter', leader: true, ip: '10.9.0.1', underlay: null, public: null, maintenance: false,
       key: crypto.createHash('sha256').update('mock-a').digest('hex'), moving_to: null },
     { name: 'mock-b', node: 2, vote: 'voter', leader: false, ip: '10.9.0.2', underlay: null, public: '203.0.113.7',
@@ -308,6 +335,18 @@ const cluster = {
   removed: 0,
 };
 const clusterHost = (name) => cluster.hosts.find((h) => h.name === name);
+const clusterMember = () => {
+  if (!cluster.member) {
+    throw new Refused('failed', CLUSTER_NO_MEMBER);
+  }
+};
+const clusterFresh = (field) => {
+  if (cluster.member) {
+    throw new Refused('conflict', 'this host is a member of a cluster already', field);
+  }
+};
+/** This host as the registry's status says it: what an invitation asks. */
+const thisHost = () => ({ name: me.name, key: (clusterHost(me.name) || me).key, ip: me.ip, port: null, serving: true });
 
 /* ---- NBS's metadata, as this host's member has it: the registry's three
    hosts its members, a chunk server of one device on each, and the volumes
@@ -316,10 +355,44 @@ const clusterHost = (name) => cluster.hosts.find((h) => h.name === name);
 const SLOT = 4 * MIB;
 const NBS_SLOTS = 1022;
 const NBS_NAME = /^[a-z0-9][a-z0-9._-]{0,62}$/;
+const NBS_NO_MEMBER = 'this host is in no NBS cluster -- `nbs init <name>`, or `nbs host add <this host>` on a member';
 const nbs = {
+  member: !FRESH,
+  name: FRESH ? null : 'store',
   hosts: cluster.hosts.map((h, i) => ({ host: h.name, member: 4096 + i, vote: 'voter', leader: i === 0 })),
-  volumes: [{ name: 'web-root', volume: 1, size_mib: 2048, host: 'mock-a', writer: null, generation: 0, readers: [] }],
-  next: 2,
+  /* A volume in each state of health NBS says beside the whole one: its
+   * chunks' counts by their replicas, as a fixture sets them */
+  volumes: FRESH ? [] : [
+    { name: 'web-root', volume: 1, size_mib: 2048, host: 'mock-a', writer: null, generation: 0, readers: [] },
+    { name: 'deg-vol', volume: 2, size_mib: 64, host: 'mock-a', writer: 'mock-a', generation: 1, readers: [],
+      counts: { chunks_at_two: 3 } },
+    { name: 'copy-vol', volume: 3, size_mib: 64, host: 'mock-a', writer: null, generation: 0, readers: [],
+      counts: { chunks_copying: 4 } },
+    { name: 'crit-vol', volume: 4, size_mib: 64, host: 'mock-a', writer: null, generation: 0, readers: [],
+      counts: { chunks_at_one: 2 } },
+    { name: 'lost-vol', volume: 5, size_mib: 64, host: 'mock-a', writer: 'mock-a', generation: 1, readers: [],
+      counts: { chunks_unreachable: 1 } },
+  ],
+  next: 6,
+  /* Each host's chunk server's devices: one each, every slot of it the
+   * cluster's */
+  devices: cluster.hosts.map((h, i) => ({ host: h.name, device: i + 1, id: 'part:'
+    + crypto.createHash('sha256').update(h.name).digest('hex').slice(0, 8) + '-0000-4000-8000-000000000001',
+  size: NBS_SLOTS * SLOT, state: 'active' })),
+};
+nbs.nextMember = 4096 + nbs.hosts.length;
+nbs.nextDevice = nbs.devices.length + 1;
+const nbsMember = () => {
+  if (!nbs.member) {
+    throw new Refused('conflict', NBS_NO_MEMBER);
+  }
+};
+const nbsHostNamed = (p) => {
+  const host = need(p, 'host');
+  if (!HOST_NAME.test(host)) {
+    throw new Refused('invalid', "a host's name: lowercase letters, digits and -", 'host');
+  }
+  return host;
 };
 const nbsChunks = (size) => Math.ceil(size / 4);
 const nbsTaken = () => nbs.volumes.reduce((n, v) => n + nbsChunks(v.size_mib), 0);
@@ -335,8 +408,17 @@ const nbsRoom = (more) => {
     throw new Refused('failed', 'not room for its chunks on three hosts');
   }
 };
+/** A volume's health as NBS says it (nbs-mds's `health_word`): the worst of
+ * its chunks' counts by their replicas. */
+const nbsHealth = (v) => {
+  const c = { chunks_at_two: 0, chunks_at_one: 0, chunks_unreachable: 0, chunks_copying: 0, chunks_unlike: 0,
+    ...(v.counts || {}) };
+  const health = c.chunks_unreachable || c.chunks_unlike ? 'failed' : c.chunks_at_one ? 'critical'
+    : c.chunks_at_two || c.chunks_copying ? 'degraded' : 'ok';
+  return { health, ...c };
+};
 const nbsJson = (v, replicas) => ({
-  name: v.name, volume: v.volume, kind: v.kind || 'volume',
+  name: v.name, volume: v.volume, kind: v.kind || 'volume', ...nbsHealth(v),
   origin: (nbs.volumes.find((o) => v.origin && o.volume === v.origin) || { name: null }).name,
   size: v.size_mib * MIB, chunks: nbsChunks(v.size_mib), host: v.host, writer: v.writer,
   generation: v.generation, readers: v.readers,
@@ -402,8 +484,7 @@ const reads = {
       vm: vmJson(v),
       config: { kernel: v.kernel, initrd: null, cmdline: null, forward: v.forwards, restart: true, console_log: true,
         uuid: '7c1e5f3a-0000-4000-8000-' + String(v.name).padEnd(12, '0').slice(0, 12).replace(/[^0-9a-f]/g, '0') },
-      disks: v.disks.map((d) => ({ device: false, device_name: null, ...d,
-        path: d.device ? d.file : '/vms/' + v.name + '/' + d.file, vm: v.name })),
+      disks: v.disks.map((d) => ({ device: false, device_name: null, ...d, path: diskPath(v, d), vm: v.name })),
       forwards: v.state === 'running' ? v.forwards.map((f) => ({ ...f, vm: v.name, id: v.id,
         guest_ip: '10.0.100.' + ((v.port ?? 0) + 2), active: 0, accepted: 3, refused: 0, failed: 0, stalled: 0 })) : [],
     };
@@ -436,28 +517,122 @@ const reads = {
     return { from, next: from + page.length, total, text: p.terminal ? page : page.replace(/\x1b\[[0-9;]*m/g, '') };
   },
   'vm.devices': () => ({ devices: DEVICES }),
-  'vm.disks': (p) => ({ disks: vmNamed(p).disks.map((d) => ({ device: false, device_name: null, ...d,
-    path: d.device ? d.file : '/vms/' + p.name + '/' + d.file, vm: p.name })) }),
+  /* Each disk's counters since its guest's boot, moving as a guest's would:
+   * its first disk busy, a wave on it, its others near idle. */
+  'vm.disk_io': (p) => {
+    const v = vmNamed(p);
+    const now = uptimeMs();
+    if (v.state !== 'running') {
+      return { vm: v.name, running: false, restarts: v.restarts, at_ms: now, disks: [] };
+    }
+    const zero = () => ({ reads: 0, writes: 0, read_bytes: 0, written_bytes: 0, flushes: 0, errors: 0, discards: 0,
+      zeroings: 0, wait_ns: 0 });
+    if (!v.io || v.ioBoot !== v.bootMs) {
+      v.io = [];
+      v.ioBoot = v.bootMs;
+      v.ioAt = v.bootMs;
+    }
+    while (v.io.length < v.disks.length) {
+      v.io.push(zero());
+    }
+    const secs = (now - v.ioAt) / 1000;
+    v.ioAt = now;
+    v.disks.forEach((d, i) => {
+      const c = v.io[i];
+      const vol = String(d.file).startsWith('nbs:') ? nbs.volumes.find((x) => 'nbs:' + x.name === d.file) : null;
+      if (vol?.counts?.chunks_unreachable) {
+        c.errors += Math.max(1, Math.round(2 * secs));
+      }
+      const wave = 1 + 0.6 * Math.sin(now / 9000 + i);
+      const reads = Math.round((i === 0 ? 220 : 1) * wave * secs);
+      const writes = d.read_only ? 0 : Math.round((i === 0 ? 70 : 0) * wave * secs);
+      c.reads += reads;
+      c.read_bytes += reads * 16384;
+      c.writes += writes;
+      c.written_bytes += writes * 65536;
+      c.flushes += Math.round(writes / 8);
+      /* A volume with a replica down answers slowly: 80 ms a request */
+      const ms = vol?.counts?.chunks_at_two ? 80 : 1;
+      c.wait_ns = (c.wait_ns || 0) + Math.round((reads + writes) * ms * 1e6);
+    });
+    return { vm: v.name, running: true, restarts: v.restarts, at_ms: now,
+      disks: v.disks.map((d, i) => ({ file: d.file, ...v.io[i] })) };
+  },
+  'vm.disks': (p) => {
+    const v = vmNamed(p);
+    return { disks: v.disks.map((d) => ({ device: false, device_name: null, ...d, path: diskPath(v, d), vm: v.name })) };
+  },
   'vm.forwards': () => ({ forwards: [...vms.values()].filter((v) => v.state === 'running').flatMap((v) => v.forwards.map((f) => ({
     ...f, vm: v.name, id: v.id, guest_ip: '10.0.100.' + ((v.port ?? 0) + 2), active: 0, accepted: 3, refused: 0, failed: 0, stalled: 0 }))) }),
-  'cluster.status': () => ({
-    member: true, cluster: 'test', node: 1, role: 'leader', term: 3, leader: 'mock-a', applied: 40 + cluster.invitations.length,
+  'cluster.status': () => (cluster.member ? {
+    member: true, this_host: thisHost(), cluster: cluster.name, node: (clusterHost(me.name) || { node: 1 }).node,
+    role: 'leader', term: 3, leader: cluster.hosts[0].name, applied: 40 + cluster.invitations.length,
     hosts: cluster.hosts.length, voters: cluster.hosts.length, learners: 0, refused: 0, stopped: null,
-  }),
-  'cluster.hosts': () => ({ hosts: cluster.hosts, invitations: cluster.invitations, removed: cluster.removed }),
-  'nbs.status': () => ({
-    member: true, cluster: 'store', node: nbs.hosts[0].member, role: 'leader', term: 2, leader: nbs.hosts[0].host,
+  } : { member: false, this_host: thisHost() }),
+  'cluster.hosts': () => {
+    clusterMember();
+    return { hosts: cluster.hosts, invitations: cluster.invitations, removed: cluster.removed };
+  },
+  'nbs.status': () => (!nbs.member ? { member: false } : {
+    member: true, cluster: nbs.name, node: nbs.hosts[0].member, role: 'leader', term: 2, leader: nbs.hosts[0].host,
     applied: 70 + nbs.next, members: nbs.hosts.length, volumes: nbs.volumes.length, chunks: nbsTaken(), digest_at: 64,
     digest: crypto.createHash('sha256').update('nbs').digest('hex'), stopped: null,
   }),
-  'nbs.hosts': () => ({ hosts: nbs.hosts }),
-  'nbs.cs': () => ({ cs: nbs.hosts.map((h, i) => ({
-    host: h.host, member: true, size: NBS_SLOTS * SLOT, reserved: nbsTaken() * SLOT, free: (NBS_SLOTS - nbsTaken()) * SLOT,
-    devices: [{ device: i + 1, id: 'part:' + crypto.createHash('sha256').update(h.host).digest('hex').slice(0, 8)
-      + '-0000-4000-8000-000000000001', size: NBS_SLOTS * SLOT, state: 'active' }],
-  })) }),
-  'nbs.volumes': () => ({ volumes: nbs.volumes.map((v) => nbsJson(v, false)) }),
-  'nbs.volume': (p) => nbsJson(nbsVolume(p), true),
+  'nbs.hosts': () => {
+    nbsMember();
+    return { hosts: nbs.hosts };
+  },
+  'nbs.cs': () => {
+    nbsMember();
+    return { cs: nbs.hosts.map((h) => {
+      const devices = nbs.devices.filter((d) => d.host === h.host);
+      const size = devices.filter((d) => d.state === 'active').reduce((n, d) => n + d.size, 0);
+      const reserved = Math.min(size, nbsTaken() * SLOT);
+      return { host: h.host, member: true, size, reserved, free: size - reserved,
+        devices: devices.map(({ device, id, size: bytes, state }) => ({ device, id, size: bytes, state })) };
+    }) };
+  },
+  'nbs.devices': () => {
+    nbsMember();
+    return { devices: nbs.devices };
+  },
+  /* What to look at, the worst first, as nbs-mds's `alerts` says it: the
+   * volumes' chunks short of three, devices, room, hosts in maintenance */
+  'nbs.alerts': () => {
+    const order = ['stopped', 'no_leader', 'chunks_unreachable', 'unlike', 'device_failed', 'no_room', 'chunks_at_one',
+      'cs_down', 'cs_out', 'chunks_at_two', 'copying', 'cs_full', 'maintenance', 'device_draining', 'no_member', 'ok'];
+    const out = [];
+    const add = (kind, host = null, detail = null, count = null) => out.push({ kind, host, detail, count });
+    if (!nbs.member) {
+      add('no_member');
+    } else {
+      const sum = (k) => nbs.volumes.reduce((n, v) => n + ((v.counts || {})[k] || 0), 0);
+      for (const [kind, k] of [['chunks_unreachable', 'chunks_unreachable'], ['chunks_at_one', 'chunks_at_one'],
+        ['chunks_at_two', 'chunks_at_two'], ['copying', 'chunks_copying']]) {
+        if (sum(k)) add(kind, null, null, sum(k));
+      }
+      for (const d of nbs.devices) {
+        if (d.state === 'draining') add('device_draining', d.host, d.id);
+        if (d.state === 'failed') add('device_failed', d.host, d.id);
+      }
+      const withRoom = nbs.hosts.filter((h) => nbs.devices.some((d) => d.host === h.host && d.state === 'active')).length;
+      if (withRoom < 3) add('no_room', null, null, withRoom);
+      for (const h of cluster.hosts) {
+        if (h.maintenance && nbs.hosts.some((x) => x.host === h.name)) add('maintenance', h.name);
+      }
+    }
+    if (!out.length) add('ok');
+    out.sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind));
+    return { alerts: out.map((a, id) => ({ id, ...a })) };
+  },
+  'nbs.volumes': () => {
+    nbsMember();
+    return { volumes: nbs.volumes.map((v) => nbsJson(v, false)) };
+  },
+  'nbs.volume': (p) => {
+    nbsMember();
+    return nbsJson(nbsVolume(p), true);
+  },
 };
 
 const actions = {
@@ -541,7 +716,118 @@ const actions = {
     }
     return nbsShare(from, need(p, 'name'), 'volume', host);
   },
+  /* A snapshot of a VM's disk that is a volume of NBS's -- its first, or
+   * `disk` -- as the vm provider takes one; a VM of a file refused. */
+  'vm.snapshot': (p) => {
+    const v = vmNamed(p);
+    const snap = need(p, 'snapshot');
+    if (!NBS_NAME.test(snap)) {
+      throw new Refused('invalid', "is a volume's name: lowercase letters, digits, . _ and -, a letter or a digit "
+        + 'first, up to 63', 'snapshot');
+    }
+    const field = p.disk !== undefined ? 'disk' : 'name';
+    const d = p.disk !== undefined ? v.disks.find((x) => x.file === p.disk) : v.disks[0];
+    if (!d) {
+      throw new Refused('not_found', p.disk !== undefined ? "is none of " + v.name + "'s disks" : v.name + ' has no disk',
+        field);
+    }
+    if (!String(d.file).startsWith('nbs:')) {
+      throw new Refused('conflict', v.name + "'s disk " + diskPath(v, d) + " is no volume of NBS's, and a snapshot is "
+        + 'of one -- a clone of the vm copies it whole', field);
+    }
+    nbsMember();
+    const volume = String(d.file).slice('nbs:'.length);
+    const from = nbs.volumes.find((x) => x.name === volume);
+    if (!from) {
+      throw new Refused('failed', 'nbs:' + snap + ' of nbs:' + volume + ': no volume of that name');
+    }
+    const had = nbs.volumes.find((x) => x.name === snap);
+    if (had) {
+      throw new Refused('failed', 'nbs:' + snap + ' of nbs:' + volume + ': ' + snap + ' is a ' + (had.kind || 'volume')
+        + ' already, made before: a name is not taken again -- delete it first');
+    }
+    const made = nbsShare(from, snap, 'snapshot', from.host);
+    return { vm: v.name, volume, snapshot: snap, number: made.volume };
+  },
+  'nbs.init': (p) => {
+    if (nbs.member) {
+      throw new Refused('conflict', 'this host is a member of an NBS cluster already', 'name');
+    }
+    const name = need(p, 'name');
+    if (!HOST_NAME.test(name)) {
+      throw new Refused('invalid', '"' + name + '" is not a cluster\'s name: lowercase letters, digits and -', 'name');
+    }
+    nbs.member = true;
+    nbs.name = name;
+    nbs.hosts = [{ host: me.name, member: nbs.nextMember++, vote: 'voter', leader: true }];
+    return { cluster: name, id: crypto.randomBytes(16).toString('hex'), host: me.name, member: nbs.hosts[0].member };
+  },
+  'nbs.host_remove': (p) => {
+    nbsMember();
+    const host = nbsHostNamed(p);
+    const at = nbs.hosts.findIndex((h) => h.host === host);
+    if (at < 0) {
+      throw new Refused('conflict', host + ' is no member -- `nbs host add ' + host + '`', 'host');
+    }
+    const [h] = nbs.hosts.splice(at, 1);
+    nbs.devices = nbs.devices.filter((d) => d.host !== host);
+    return { host, member: h.member };
+  },
+  /* A device of this host's to its chunk server, as store::device_add takes
+   * it: refused where something holds it, or something not NBS's is on it
+   * and wipe is not said. */
+  'nbs.device_add': (p) => {
+    nbsMember();
+    const word = need(p, 'device');
+    const d = DEVICES.find((x) => x.id === word || x.name === word || 'dev:' + x.name === word);
+    if (!d) {
+      throw new Refused('failed', 'no device is ' + word, 'device');
+    }
+    const had = nbs.devices.find((x) => x.id === d.id && x.host === me.name);
+    if (had) {
+      had.state = 'active';
+      return { id: d.id, device: had.device, size: had.size, wiped: false };
+    }
+    if (d.in_use_by || d.boots_the_machine) {
+      throw new Refused('failed', d.id + ' is held by ' + (d.in_use_by || d.boots_the_machine), 'device');
+    }
+    if (d.holds && p.wipe !== true) {
+      throw new Refused('failed', d.id + " has something on it that is not NBS's -- a filesystem, a partition table? "
+        + '-- `nbs devices add ' + word + ' wipe` takes it all the same, and what is on it is lost', 'device');
+    }
+    const size = Math.floor(d.size_bytes / SLOT) * SLOT;
+    const added = { host: me.name, device: nbs.nextDevice++, id: d.id, size, state: 'active' };
+    nbs.devices.push(added);
+    const wiped = Boolean(d.holds);
+    Object.assign(d, { holds: "NBS's chunk server's", in_use_by: "NBS's chunk server", held_by: 'nbs',
+      refused: d.name + " is in use by NBS's chunk server" });
+    return { id: d.id, device: added.device, size, wiped };
+  },
+  'nbs.device_drain': (p) => {
+    nbsMember();
+    const id = need(p, 'device');
+    const host = p.host ?? me.name;
+    const d = nbs.devices.find((x) => x.id === id && x.host === host);
+    if (!d) {
+      throw new Refused('not_found', 'no device ' + id + ' of ' + host + "'s chunk server");
+    }
+    d.state = 'draining';
+    return { id, device: d.device };
+  },
+  'cluster.init': (p) => {
+    clusterFresh('name');
+    const name = need(p, 'name');
+    if (!HOST_NAME.test(name)) {
+      throw new Refused('invalid', '"' + name + '" is not a cluster\'s name: lowercase letters, digits and -', 'name');
+    }
+    cluster.member = true;
+    cluster.name = name;
+    cluster.hosts = [{ name: me.name, node: 1, vote: 'voter', leader: true, ip: me.ip, underlay: null, public: null,
+      maintenance: false, key: me.key, moving_to: null }];
+    return { cluster: name, host: me.name, node: 1 };
+  },
   'cluster.invite': (p) => {
+    clusterMember();
     const host = need(p, 'host');
     if (!/^[0-9a-f]{64}$/.test(need(p, 'key'))) {
       throw new Refused('invalid', '64 hex digits, as `ipcnet id` says them', 'key');
@@ -554,6 +840,7 @@ const actions = {
     return { host, token: 'nos1-' + crypto.randomBytes(40).toString('hex'), expires_s };
   },
   'cluster.revoke': (p) => {
+    clusterMember();
     const at = cluster.invitations.findIndex((i) => i.host === need(p, 'host'));
     if (at < 0) {
       throw new Refused('not_found', 'no open invitation of ' + p.host);
@@ -562,6 +849,7 @@ const actions = {
     return { host: p.host };
   },
   'cluster.remove': (p) => {
+    clusterMember();
     const h = clusterHost(need(p, 'host'));
     if (!h) {
       throw new Refused('not_found', 'no host of that name');
@@ -571,6 +859,7 @@ const actions = {
     return { host: h.name, node: h.node };
   },
   'cluster.maintenance': (p) => {
+    clusterMember();
     const h = clusterHost(need(p, 'host'));
     if (!h) {
       throw new Refused('not_found', 'no host of that name');
@@ -579,6 +868,7 @@ const actions = {
     return { host: h.name, maintenance: h.maintenance };
   },
   'cluster.address': (p) => {
+    clusterMember();
     const h = clusterHost(need(p, 'host'));
     if (!h) {
       throw new Refused('not_found', 'no host of that name');
@@ -588,6 +878,7 @@ const actions = {
     return { host: h.name, role, ip: p.ip ?? null };
   },
   'cluster.rekey': () => {
+    clusterMember();
     const me = cluster.hosts[0];
     const old = me.key;
     me.key = crypto.randomBytes(32).toString('hex');
@@ -662,6 +953,73 @@ const actions = {
   },
 };
 
+const SEED_DISK = { file: 'seed.iso', size_bytes: 65536, read_only: true };
+
+/** A VM of an image of NBS's (`image=nbs:<image>`): a clone of it its disk,
+ * named the VM's unless onto=nbs:<volume> names it, grown to size_bytes --
+ * refused as cloud::create refuses. */
+function createOfImage(name, p) {
+  nbsMember();
+  const image = nbs.volumes.find((v) => v.name === p.image);
+  if (!image) {
+    throw new Refused('failed', 'no image nbs:' + p.image + ' -- `hv image` makes one');
+  }
+  if ((image.kind || 'volume') === 'volume') {
+    throw new Refused('failed', 'nbs:' + image.name + ' is a volume: a VM is made of an image, or a snapshot -- '
+      + '`hv image` makes one');
+  }
+  let clone = name;
+  if (p.onto !== undefined) {
+    if (!String(p.onto).startsWith('nbs:')) {
+      throw new Refused('failed', "onto= of a VM of an image is its clone's name, nbs:<volume>");
+    }
+    clone = String(p.onto).slice(4);
+  }
+  if (nbs.volumes.some((v) => v.name === clone)) {
+    throw new Refused('failed', 'nbs:' + clone + " is there already: a VM's disk is a clone of its own -- "
+      + 'onto=nbs:<volume> names it otherwise');
+  }
+  const sizeMib = p.size_bytes !== undefined ? Math.ceil(p.size_bytes / MIB) : image.size_mib;
+  if (sizeMib < image.size_mib) {
+    throw new Refused('failed', "size= is less than the image's disk, " + image.size_mib + ' MiB');
+  }
+  return job('vm', 'create', 2, (i) => ['hv: nbs:' + clone + ' cloned from nbs:' + image.name + ', ' + sizeMib
+    + ' MiB -- thin: its chunks copied as they are written', '/vms/' + name + '/vm.toml written'][i], () => {
+    nbsShare(image, clone, 'volume', nbs.hosts[0].host);
+    nbs.volumes.find((v) => v.name === clone).size_mib = sizeMib;
+    vm(name, { memory_mib: p.memory_mib ?? 1024, cpus: p.cpus ?? 1, network: p.network ?? null,
+      disks: [{ file: 'nbs:' + clone, size_bytes: null, read_only: false }, SEED_DISK] });
+    return { name, file: '/vms/' + name + '/vm.toml', disk_bytes: sizeMib * MIB, keys: 1, port: null, id: null };
+  });
+}
+
+/** A URL's image poured onto a volume of NBS's (onto=nbs:<volume>): over
+ * what is on it, taken from a writer elsewhere with force. */
+function createOntoVolume(name, p) {
+  nbsMember();
+  const word = p.onto.slice(4);
+  const v = nbs.volumes.find((x) => x.name === word);
+  if (!v) {
+    throw new Refused('failed', 'no volume nbs:' + word);
+  }
+  if ((v.kind || 'volume') !== 'volume') {
+    throw new Refused('failed', 'nbs:' + word + ' is an ' + v.kind + ", read-only: a URL's image is poured onto a volume");
+  }
+  if (p.size_bytes !== undefined) {
+    throw new Refused('invalid', "size= is a file's: a device's disk is the device's size, a volume's the volume's",
+      'size_bytes');
+  }
+  if (v.writer && v.writer !== me.name && p.force !== true) {
+    throw new Refused('conflict', 'nbs:' + word + ' is attached on host ' + v.writer + ' -- force takes it', 'onto');
+  }
+  return job('vm', 'create', 4, (i) => ['download: 120 MiB of 590 MiB, 20%', 'download: 590 MiB of 590 MiB, 100%',
+    'nbs:' + word + ': 3584 MiB poured, the rest of the volume zeroes', '/vms/' + name + '/vm.toml written'][i], () => {
+    vm(name, { memory_mib: p.memory_mib ?? 1024, cpus: p.cpus ?? 1, network: p.network ?? null,
+      disks: [{ file: 'nbs:' + word, size_bytes: null, read_only: false }, SEED_DISK] });
+    return { name, file: '/vms/' + name + '/vm.toml', disk_bytes: v.size_mib * MIB, keys: 1, port: null, id: null };
+  });
+}
+
 const guarded = (v, p) => {
   if (v.protected && !p.force) {
     throw new Refused('conflict', v.name + ' is protected -- force does it all the same', 'force');
@@ -669,6 +1027,86 @@ const guarded = (v, p) => {
 };
 
 const jobMethods = {
+  /* An image of NBS's made of a URL's image or a file's, as `hv image`
+   * makes one: downloaded, a volume of its disk's size, poured, frozen. */
+  'vm.image': (p) => {
+    const given = String(need(p, 'name'));
+    const name = given.startsWith('nbs:') ? given.slice('nbs:'.length) : given;
+    if (!NBS_NAME.test(name)) {
+      throw new Refused('invalid', "is a volume's name: lowercase letters, digits, . _ and -, a letter or a digit "
+        + 'first, up to 63', 'name');
+    }
+    const from = String(need(p, 'from'));
+    const url = /^https?:\/\//.test(from);
+    if (!url && !from.startsWith('/')) {
+      throw new Refused('invalid', "is an http:// or https:// URL, or a file of nos's by its path", 'from');
+    }
+    nbsMember();
+    if (nbs.volumes.some((x) => x.name === name)) {
+      throw new Refused('failed', 'nbs:' + name + ' is there already');
+    }
+    const steps = [...(url ? ['download: 120 MiB of 590 MiB, 20%', 'download: 590 MiB of 590 MiB, 100%'] : []),
+      'hv: ' + (url ? '/vms/.image-' + name : from) + ': qcow2, a disk of 3584 MiB -- onto nbs:' + name
+        + ', 3584 MiB, fresh: its zeros left out',
+      'hv: nbs:' + name + ' is an image now, 3584 MiB, read-only for good -- hv create <vm> image=nbs:' + name
+        + ' makes a vm of a clone of it'];
+    return job('vm', 'image', steps.length, (i) => steps[i], () => {
+      nbs.volumes.push({ name, volume: nbs.next, kind: 'image', origin: null, size_mib: 3584, host: nbs.hosts[0].host,
+        writer: null, generation: 0, readers: [] });
+      nbs.next += 1;
+      return { image: name, size_bytes: 3584 * MIB };
+    });
+  },
+  'nbs.host_add': (p) => {
+    nbsMember();
+    const host = nbsHostNamed(p);
+    if (nbs.hosts.some((h) => h.host === host)) {
+      throw new Refused('failed', host + ' is a member already', 'host');
+    }
+    return job('nbs', 'host_add', 2, (i) => [host + ' offered the NBS cluster', host + ' took the offer'][i], () => {
+      /* The offer reaches a host of the registry's, its mds there */
+      if (!clusterHost(host)) {
+        throw new Refused('failed', 'the offer to ' + host + ' stopped: ' + host + ' out of reach: no route -- is it a '
+          + 'host of the cluster registry, with nbs-mds loaded?');
+      }
+      const m = { host, member: nbs.nextMember++, vote: nbs.hosts.length < 5 ? 'voter' : 'learner', leader: false };
+      nbs.hosts.push(m);
+      return { host, member: m.member };
+    });
+  },
+  'nbs.host_replace': (p) => {
+    nbsMember();
+    const host = nbsHostNamed(p);
+    const h = nbs.hosts.find((x) => x.host === host);
+    if (!h) {
+      throw new Refused('conflict', host + ' is no member -- `nbs host add ' + host + '`', 'host');
+    }
+    return job('nbs', 'host_replace', 2, (i) => [host + "'s old member " + h.member + ' removed',
+      host + ' offered the NBS cluster anew'][i], () => {
+      const removed = h.member;
+      h.member = nbs.nextMember++;
+      return { host, removed, member: h.member };
+    });
+  },
+  'cluster.join': (p) => {
+    clusterFresh('token');
+    const token = need(p, 'token');
+    if (!/^nos1-[0-9a-f]{16,}$/.test(token)) {
+      throw new Refused('invalid', 'not a token: `cluster invite` prints one', 'token');
+    }
+    return job('cluster', 'join', 2, (i) => ['cluster: the join asked of the inviting member',
+      'cluster: ' + me.name + ' let in as node 5'][i], () => {
+      cluster.member = true;
+      cluster.name = 'test';
+      cluster.hosts = [
+        { name: 'mock-a', node: 1, vote: 'voter', leader: true, ip: '10.9.0.1', underlay: null, public: null,
+          maintenance: false, key: crypto.createHash('sha256').update('mock-a').digest('hex'), moving_to: null },
+        { name: me.name, node: 5, vote: 'learner', leader: false, ip: me.ip, underlay: null, public: null,
+          maintenance: false, key: me.key, moving_to: null },
+      ];
+      return { host: me.name, node: 5, hosts: cluster.hosts.length };
+    });
+  },
   'vm.start': (p) => {
     const v = vmNamed(p);
     if (v.state === 'running') {
@@ -699,9 +1137,20 @@ const jobMethods = {
   },
   'vm.create': (p) => {
     const name = need(p, 'name');
-    need(p, 'url');
+    if (p.url !== undefined && p.image !== undefined) {
+      throw new Refused('invalid', "is given with a URL: a VM is made of one image, a URL's or NBS's", 'image');
+    }
+    if (p.url === undefined && p.image === undefined) {
+      throw new Refused('invalid', "is wanted -- or an image of NBS's, `image`", 'url');
+    }
     if (vms.has(name)) {
       throw new Refused('conflict', name + ' is there already', 'name');
+    }
+    if (p.image !== undefined) {
+      return createOfImage(name, p);
+    }
+    if (typeof p.onto === 'string' && p.onto.startsWith('nbs:')) {
+      return createOntoVolume(name, p);
     }
     /* Onto a device: refused before anything is fetched, as the host does. */
     const onto = p.onto ? deviceGiven(p.onto, p.force === true) : null;

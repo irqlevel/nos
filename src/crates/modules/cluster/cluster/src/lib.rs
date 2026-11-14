@@ -243,13 +243,6 @@ fn ask(state: &ModState, cmd: &Command) -> Result<Answer, String> {
     raftmember::ask(&state.shared, cmd, NO_MEMBER)
 }
 
-fn said(a: Answer, done: impl FnOnce(u64) -> String) -> Result<String, String> {
-    match a {
-        Answer::Done { node } => Ok(done(node)),
-        Answer::Refused(why) => Err(String::from(why.says())),
-    }
-}
-
 /// A command's answer as a result: the node it names, or why it was refused.
 fn done(a: Answer) -> Result<u64, String> {
     match a {
@@ -521,6 +514,15 @@ fn run(state: &ModState, args: &str, out: &mut Output) -> Result<(), String> {
 }
 
 fn init_cluster(state: &ModState, name: &str, out: &mut Output) -> Result<(), String> {
+    let (host, node) = op_init(state, name)?;
+    let _ = writeln!(out, "cluster: {} made, {} its first host (node {}) -- `cluster invite` the next", name, host, node);
+    Ok(())
+}
+
+/// A cluster named `name` made of this host alone -- `cluster init` and the
+/// provider's `init`: this host's name and node. Undone where it does not
+/// finish, for an init again.
+pub(crate) fn op_init(state: &ModState, name: &str) -> Result<(String, u64), String> {
     if !registry::valid_name(name) {
         return Err(alloc::format!("\"{}\" is not a cluster's name: lowercase letters, digits and -", name));
     }
@@ -543,14 +545,10 @@ fn init_cluster(state: &ModState, name: &str, out: &mut Output) -> Result<(), St
     let made = ask(state, &Command::Init { now: kcore::time::wall_clock_secs(), cluster: id.cluster,
                                            name: String::from(name), host: id.name.clone(), key: id.key, ip: id.ip,
                                            port })
-        .and_then(|a| said(a, |node| alloc::format!("cluster: {} made, {} its first host (node {}) -- `cluster \
-                                                     invite` the next", name, id.name, node)))
-        .and_then(|line| files::create_member(&state.dir, &me).map(|()| line));
+        .and_then(done)
+        .and_then(|node| files::create_member(&state.dir, &me).map(|()| node));
     match made {
-        Ok(line) => {
-            let _ = writeln!(out, "{}", line);
-            Ok(())
-        }
+        Ok(node) => Ok((id.name, node)),
         Err(why) => {
             /* Nobody else knows of the cluster yet: undone, for an init again */
             stop(state);
@@ -578,6 +576,17 @@ fn invite(state: &ModState, host: &str, ip: &str, key: &str, out: &mut Output) -
 /// proved to that member, and this host's member started over an empty log
 /// that raft fills.
 fn join_cluster(state: &ModState, text: &str, out: &mut Output) -> Result<(), String> {
+    let (host, node, hosts) = op_join(state, text, &|| false)?;
+    let _ = writeln!(out, "cluster: {} joined as node {}, with {} hosts -- the registry follows from the leader", host,
+                     node, hosts);
+    Ok(())
+}
+
+/// This host into the cluster the token `text` names -- `cluster join` and
+/// the provider's `join`, on the host invited: its name, its node and the
+/// hosts the join was answered with. Asked of the inviting member until it
+/// answers, or `stop` says to give up (a provider's job told to).
+pub(crate) fn op_join(state: &ModState, text: &str, stop: &dyn Fn() -> bool) -> Result<(String, u64, usize), String> {
     let t = Token::decode(text).ok_or_else(|| String::from("not a token: `cluster invite` prints one"))?;
     let _starting = Starting::take(state)?;
     if files::read_member(&state.dir)?.is_some() || view(state).is_some() {
@@ -596,7 +605,7 @@ fn join_cluster(state: &ModState, text: &str, out: &mut Output) -> Result<(), St
     if !identity()?.serving {
         return Err(String::from("ipcnet is not serving -- `ipcnet start`, then join again"));
     }
-    let joined = ask_join(&t)?;
+    let joined = ask_join(&t, stop)?;
     /* In the cluster from here on: what fails now says the way back. The
        member file holds the hosts the join was answered with, which the
        member tells ipcnet and knows the others by until its log has caught
@@ -612,14 +621,12 @@ fn join_cluster(state: &ModState, text: &str, out: &mut Output) -> Result<(), St
         return Err(alloc::format!("{} joined the cluster as node {}, but its member did not start: {} -- `rmmod \
                                    cluster` and `insmod` start it again", id.name, node, why));
     }
-    let _ = writeln!(out, "cluster: {} joined as node {}, with {} hosts -- the registry follows from the leader",
-                     id.name, node, hosts);
-    Ok(())
+    Ok((id.name, node, hosts))
 }
 
 /// The join asked of the inviting member, again until its connection is up
-/// and it answers.
-fn ask_join(t: &Token) -> Result<member::Joined, String> {
+/// and it answers, or `stop` says to give up.
+fn ask_join(t: &Token, stop: &dyn Fn() -> bool) -> Result<member::Joined, String> {
     let mb = Mailbox::new(Limits { messages: 8, bytes: 16 * 1024 }).map_err(|e| alloc::format!("no mailbox: {}", e.name()))?;
     let mut data = alloc::vec::Vec::with_capacity(40);
     data.extend_from_slice(&t.invitation.to_le_bytes());
@@ -628,6 +635,9 @@ fn ask_join(t: &Token) -> Result<member::Joined, String> {
     let end = kcore::time::boot_time_ns() + JOIN_TOTAL_MS * 1_000_000;
     let mut last = String::from("no answer");
     'tries: while kcore::time::boot_time_ns() < end {
+        if stop() {
+            return Err(alloc::format!("the join stopped: {}", last));
+        }
         if let Err(e) = mb.send_to(&to, member::TAG_JOIN_REQ, 0, &data) {
             last = alloc::format!("{} out of reach: {}", t.member, e.name());
             kcore::task::sleep_ms(1000);

@@ -23,10 +23,22 @@ sessions, the pages -- is here, in Linux; nos keeps its API alone.
   every page, nothing framed; a page with no session sent to the login.
 - Pages: the dashboard; every provider's page made of its descriptor alone
   (`ProviderView`: its resources as tables, their rows' actions, every
-  other method a form) -- a provider the panel has never heard of gets its
-  pages the same way; the VMs' own (a list, a create from a cloud image, a
-  VM's overview, its console in xterm.js, its vm.toml, disks and forwards);
-  the jobs; the hosts; the settings. English and Russian.
+  other method a form; an enum's value with the dot of its tone where the
+  descriptor gives its values `tones` -- docs/mgmt.md) -- a provider the panel has never heard of gets its
+  pages the same way -- the cluster's and NBS's among them, from making
+  each on a host of none to its hosts and devices; the VMs' own (a list, a
+  create from a cloud image or an image of NBS's, onto a file, a device or
+  a volume of NBS's, a VM's overview -- a snapshot of its volume taken there
+  and its snapshots listed, each a click from a VM of it -- its console in
+  xterm.js, its vm.toml, its disks -- each one's IOPS and bandwidth, read and
+  written, charted as the vm provider's `disk_io` is asked every two seconds,
+  a volume of NBS's as any disk, its edge coloured by the worst of its I/O
+  -- red while it fails, yellow while its requests wait past 50 ms on the
+  average -- what NBS says of the volume's replicas, and NBS having no
+  leader -- and forwards); NBS's page has what to look at first, its
+  alerts, each in its tone; the images (NBS's images and
+  snapshots, a new image of a URL); the jobs; the hosts; the settings.
+  English and Russian.
 
 ## On the mock
 
@@ -56,6 +68,9 @@ node mock/server.mjs --port 39300 --state /tmp/nos-mock-b --name nos-b --trust /
 ```
 
 then add it on the Hosts page by `127.0.0.1:39300` and the key it prints.
+With `--fresh` a mock is a host of no cluster yet -- the registry's or
+NBS's -- for the panel to make one of; without it, it is a member of a
+cluster of three and of an NBS cluster of them.
 
 ## More hosts
 
@@ -80,9 +95,18 @@ digits.
 `npx playwright test` builds nothing itself: `npm run build` first. It
 starts the mock and the panel (`playwright.config.ts`) and drives a browser
 through the login, the dashboard, the providers' pages in both languages, a
-VM made, cloned and deleted as jobs -- its name typed again before it goes
--- a protected one's delete refused, a console typed at, a second host
+VM made, cloned and deleted as jobs -- its name typed again before it goes,
+a job's log said once and nothing asked of it once it is done -- a
+protected one's delete refused, a console typed at, a second host
 added and reached by the panel's key while one showing another key is not,
+added again once taken away -- its connections of then closed with it --
+and a cluster and an NBS cluster made there, a device given to its chunk
+server and drained; NBS's members removed, added and replaced as jobs; VMs
+made of an image of NBS's and poured onto a volume of it; an image of a URL,
+a VM of it, its snapshot from its page and a VM of that, a VM of a file's
+refused -- said, though its name is no field of the form; a VM's disks'
+IOPS and bandwidth charted as it runs, a volume of NBS's among them, and one
+that is off saying so;
 the theme and the language -- the charts drawn in the theme the page is in,
 switched on an open page too, and a table's values each on one line in a
 narrow window -- and that through all of it, and a dozen requests at once,

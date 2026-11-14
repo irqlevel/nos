@@ -49,8 +49,10 @@ use kcore::klog;
 pub const MAX_PROVIDERS: usize = 32;
 /// Methods a provider has, at most.
 pub const MAX_METHODS: usize = ffi::mgmt::MGMT_METHODS_MAX;
-/// A descriptor's bytes, at most.
-pub const MAX_DESCRIPTOR: usize = 16 * 1024;
+/// A descriptor's bytes, at most: thirty-two providers' at that, a MiB, in
+/// one block each. 16 KiB was the vm provider's whole room, every method
+/// added to it some other's text cut down.
+pub const MAX_DESCRIPTOR: usize = 32 * 1024;
 /// Calls and jobs running at once, in all.
 pub const MAX_CALLS: usize = 64;
 /// An answer's bytes, at most, whatever its caller would take.

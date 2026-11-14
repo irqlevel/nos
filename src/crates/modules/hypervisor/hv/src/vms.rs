@@ -929,6 +929,44 @@ struct Vm {
     /// Its console.log being written, when it has one: finished after its
     /// task, so that how it ended is in it.
     log: Option<Log>,
+    /// Its disks' words as it was started with, its `vda` first: what
+    /// `disk_io` says each disk's counters of -- its vm.toml may have
+    /// changed since.
+    disks: Vec<String>,
+}
+
+/// What a disk of a guest's has done since the guest's boot: the virtio
+/// disk's own counters.
+#[derive(Clone, Copy, Default)]
+pub struct DiskCounts {
+    pub reads: u64,
+    pub writes: u64,
+    pub read_bytes: u64,
+    pub written_bytes: u64,
+    pub flushes: u64,
+    pub errors: u64,
+    pub discards: u64,
+    pub zeroings: u64,
+    /// What its backend took over the requests answered, in nanoseconds.
+    pub wait_ns: u64,
+}
+
+/// What `disk_io` says of a VM: whether its guest runs, how many times it
+/// was booted again, when the counters were read -- the host's boot time,
+/// what a rate is made against -- and each disk's word and counters.
+pub struct DiskIo {
+    pub running: bool,
+    pub restarts: u32,
+    pub at_ns: u64,
+    pub disks: Vec<(String, DiskCounts)>,
+}
+
+/// `s` copied, or None out of memory.
+fn copied(s: &str) -> Option<String> {
+    let mut c = String::new();
+    c.try_reserve_exact(s.len()).ok()?;
+    c.push_str(s);
+    Some(c)
 }
 
 /// A VM as `hv list` shows it, copied out of the table under its lock: what
@@ -1307,10 +1345,54 @@ impl Vms {
     /// number 1.
     fn find(&self, word: &str) -> Result<Arc<Shared>, String> {
         let table = self.table.lock();
+        Self::found(&table, word).map(|vm| vm.shared.clone()).ok_or_else(|| alloc::format!("no vm {}", word))
+    }
+
+    /// `find`'s lookup, in the table its caller holds locked.
+    fn found<'a>(table: &'a Table, word: &str) -> Option<&'a Vm> {
         let by_id = word.parse::<u32>().ok().and_then(|id| table.vms.iter().find(|vm| vm.shared.id == id));
         by_id.or_else(|| table.vms.iter().find(|vm| vm.name.as_deref() == Some(word)))
-            .map(|vm| vm.shared.clone())
-            .ok_or_else(|| alloc::format!("no vm {}", word))
+    }
+
+    /// What each disk of the VM `word` names (`find`) has done since its
+    /// guest's boot, its word as the VM was started with -- and when that
+    /// was read; no disks while its guest does not run (stopped, or between
+    /// boots). The counters are read under `serving`'s lock, the guest
+    /// borrowed and never held past it: a guest is let go of by its own
+    /// task alone.
+    pub fn disk_io(&self, word: &str) -> Result<DiskIo, String> {
+        let oom = || String::from("out of memory");
+        let (shared, words) = {
+            let table = self.table.lock();
+            let vm = Self::found(&table, word).ok_or_else(|| alloc::format!("no vm {}", word))?;
+            let mut words = Vec::new();
+            words.try_reserve_exact(vm.disks.len()).map_err(|_| oom())?;
+            for w in &vm.disks {
+                words.push(copied(w).ok_or_else(oom)?);
+            }
+            (vm.shared.clone(), words)
+        };
+        let at_ns = kcore::time::boot_time_ns();
+        let stats = shared.serving.lock().as_ref().map(|guest| guest.disk_stats());
+        let restarts = shared.restarts.load(Ordering::Relaxed);
+        let Some(stats) = stats else {
+            return Ok(DiskIo { running: false, restarts, at_ns, disks: Vec::new() });
+        };
+        /* One a disk, in the order it was given its disks; none at all when
+         * there was no memory to say them in */
+        if stats.len() != words.len() {
+            return Err(oom());
+        }
+        let mut disks = Vec::new();
+        disks.try_reserve_exact(words.len()).map_err(|_| oom())?;
+        for (w, (_, s, _, _)) in words.into_iter().zip(stats) {
+            disks.push((w, DiskCounts {
+                reads: s.reads, writes: s.writes, read_bytes: s.read_bytes, written_bytes: s.written_bytes,
+                flushes: s.flushes, errors: s.errors, discards: s.discards, zeroings: s.zeroings,
+                wait_ns: s.wait_ns,
+            }));
+        }
+        Ok(DiskIo { running: true, restarts, at_ns, disks })
     }
 
     /// The number of the VM `word` names (`find`).
@@ -1595,6 +1677,12 @@ impl Vms {
             let _ = write!(note, "started on {} -- {}", host_cpus, said);
             shared.note(note);
         }
+        /* Its disks' words, for `disk_io`: the spec goes into its task */
+        let mut disk_words = Vec::new();
+        disk_words.try_reserve_exact(spec.disks.len()).map_err(|_| not_started(&"out of memory"))?;
+        for (word, _) in &spec.disks {
+            disk_words.push(copied(word).ok_or_else(|| not_started(&"out of memory"))?);
+        }
         let start = Start {
             shared: shared.clone(), built, machine: machine.clone(), spec, runner, placement, hold: core_hold,
         };
@@ -1611,7 +1699,7 @@ impl Vms {
         let port = hold.as_ref().map(|h| h.port);
         let vm = Vm {
             shared: shared.clone(), task: Some(task), cpus, disk_cpu: has_disks.then_some(disk_cpu), kernel, mem_mib,
-            port, name: vm_name, folder: vm_folder, log,
+            port, name: vm_name, folder: vm_folder, log, disks: disk_words,
         };
         let mut handed = None;
         let refused = {

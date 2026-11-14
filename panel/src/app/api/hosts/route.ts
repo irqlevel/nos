@@ -6,6 +6,7 @@
 
 import { addHost, fingerprint, hosts, removeHost } from '@/lib/hosts';
 import { hub, syncHubs } from '@/lib/hub';
+import { forgetHost } from '@/lib/nosapi';
 import { gate, json, refused } from '@/lib/route';
 
 export async function GET(req: Request) {
@@ -47,6 +48,8 @@ export async function DELETE(req: Request) {
   if (ok instanceof Response) return ok;
   const id = new URL(req.url).searchParams.get('id') || '';
   removeHost(id);
+  /* Its connections closed with it: its stream (the hub's) and its requests' */
   syncHubs();
+  forgetHost(id);
   return json(200, { removed: id });
 }

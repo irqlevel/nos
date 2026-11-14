@@ -5,12 +5,15 @@ and a pool disk of three partitions -- the cluster registry made first, so
 that the hosts trust each other, then an NBS cluster of its members, then
 what it stores, then a volume's bytes through the chunk servers.
 
-- `nbs` on a host in no NBS cluster says so; `nbs init` on a makes one, a
-  its leader and one voter; a second init refused;
+- `nbs` on a host in no NBS cluster says so, and the `nbs` provider's
+  status through the bus; the init on a made through the bus, as the panel
+  makes it (`mgmt call nbs init`) -- a its leader and one voter; a second
+  init refused, at the shell and through the bus;
 - b added from a -- offered the cluster, its incarnation made there -- and c
-  from b, a member that does not lead (the command handed to the leader):
-  three members, three voters, one leader, as every host says; an add asked
-  again answered with the same incarnation;
+  from b, a member that does not lead (the command handed to the leader),
+  as a job through the bus (`mgmt start nbs host_add`): three members,
+  three voters, one leader, as every host says; an add asked again answered
+  with the same incarnation;
 - a commit, through the majority: an entry's answer comes only once it is
   committed and applied, and `nbs host remove nosuch`'s refusal is one;
 - what is stored (N6): no volume before three hosts have a device; a pool's
@@ -21,8 +24,11 @@ what it stores, then a volume's bytes through the chunk servers.
   servers and their room. A volume made, made again the same, refused with
   another size, grown, refused smaller, refused past the room or with a
   name that is none, made from b for c; the room filled to its last slot
-  and given back by a delete; a device drained, what it holds counted
-  against the room its host has left; the `nbs` provider answering through
+  and given back by a delete; c's second device added through the bus, its
+  first drained, what it holds counted against the room its host has left,
+  drained again from a through the bus naming c -- the same device -- and
+  refused naming a host it is not on; the provider's devices, every host's
+  and their states; the `nbs` provider answering through
   the bus as the command does; the state's digest taken at the same entry
   on every host, the same, the leader's held to it; every host's log
   compacted into a snapshot (`compact=`);
@@ -50,7 +56,12 @@ what it stores, then a volume's bytes through the chunk servers.
   and its fence back; a host's nbs-cs unloaded -- a request to it bounced
   and said at once -- and loaded again, serving;
 - repair (N9): a volume written, c killed -- the leader's controller has its
-  cs down -- the volume written past it, c booted again: its cs up, joined in
+  cs down; the volume's health through the bus `degraded`, each of its
+  chunks at two replicas, `ok` again once c is back; NBS's alerts through
+  the bus saying, the worst first, fewer than three hosts with room -- no
+  repair -- c's chunk server out and chunks at two replicas, and none of
+  them once c is back -- the volume written
+  past it, c booted again: its cs up, joined in
   its own place, every chunk at three replicas again, and c's own replica
   holding the write made while it was gone, which its join's copy took;
 - the leader killed: the other two elect one of themselves and commit; the
@@ -61,9 +72,12 @@ what it stores, then a volume's bytes through the chunk servers.
   follows the new leader;
 - a host's state lost -- its mds unloaded, its folder removed, loaded again:
   the leader says that host's mds has no member of its incarnation; an add
-  of it refused, its old member being the cluster's; `nbs host replace`
-  takes it back as a new member, the old incarnation removed for good, sent
-  the state as a snapshot;
+  of it refused, its old member being the cluster's; a replace -- a job
+  through the bus, as the panel asks it -- takes it back as a new member,
+  the old incarnation removed for good, sent the state as a snapshot;
+- a fourth host, d, and one of the four lost for good (N9f): d joins every
+  set the lost one was in, in its place, and reads a volume from its own
+  replica; the lost host removed through the bus -- three members again;
 - a member removed: two members left; its old incarnation refused when it is
   added again, since it never lost its state; its chunk server kept, taking
   no new chunks, and so a volume refused;
@@ -345,11 +359,41 @@ def whole(sh):
 
 
 def json_of(out):
-    m = re.search(r"(\{.*\})", out, re.S)
+    m = re.search(r"(\{.*\})", out or "", re.S)
     try:
         return json.loads(m.group(1)) if m else None
     except ValueError:
         return None
+
+
+def job_done(sh, out, secs=90):
+    """The job `mgmt start` said it started in `out`, followed to its end:
+    `mgmt job`'s last answer -- its record, its log and its result -- or
+    None where it did not end in `secs`."""
+    m = re.search(r"mgmt: job (\d+) started", out)
+    if not m:
+        return None
+    end = time.time() + secs
+    while time.time() < end:
+        got = sh.run("mgmt job %s" % m.group(1))
+        if re.search(r"^job %s \S+ done " % m.group(1), got, re.M):
+            return got
+        time.sleep(1)
+    return None
+
+
+def num(v):
+    """A whole number as the bus writes one: a number, or past 2^53 -- an
+    incarnation, 64 random bits -- its digits in a string, kept exact
+    (mgmtwire's SAFE_INT); None for anything else."""
+    if isinstance(v, int) and not isinstance(v, bool):
+        return v
+    return int(v) if isinstance(v, str) and v.isdigit() else None
+
+
+def job_ok(out, method):
+    """Whether `job_done`'s answer is `method`'s, ended ok."""
+    return out is not None and re.search(r"^job \d+ %s done ok" % re.escape(method), out, re.M) is not None
 
 
 def key_of(sh):
@@ -474,20 +518,32 @@ def main():
         # -- an NBS cluster of a, then b and c added --
         out = a.run("nbs")
         check("a, in no NBS cluster yet, says so", "in no NBS cluster" in out, out)
-        out = a.run("nbs init store")
-        need("a makes the NBS cluster", "NBS cluster store made" in out, out)
+        js = json_of(a.run("mgmt call nbs status"))
+        check("and through the bus", js == {"member": False}, js)
+        # Made through the bus, as the panel makes it
+        out = a.run('mgmt call nbs init {"name":"store"}')
+        js = json_of(out)
+        need("a makes the NBS cluster through the bus: its name, its id, a and its member answered",
+             js is not None and js.get("cluster") == "store" and re.fullmatch(r"[0-9a-f]{32}", js.get("id") or "")
+             and js.get("host") == "a" and num(js.get("member")) is not None, out)
         need("a leads it, its one member and voter",
              ipct.wait_for(lambda: (status(a) or {}).get("leader") == "a" and status(a)["voters"] == 1, 10, 0.5))
         out = a.run("nbs init again")
         check("a second init refused", "member of an NBS cluster already" in out, out)
+        out = a.run('mgmt call nbs init {"name":"again"}')
+        check("and through the bus: a conflict, said", "mgmt: conflict" in out
+              and "member of an NBS cluster already" in out, out)
         out = a.run("nbs host add b")
         m = re.search(r"b is member (\d+)", out)
         need("b added from a, offered the cluster", m is not None, out)
         b_member = int(m.group(1))
         need("b holds the log: two members, as b itself says",
              ipct.wait_for(lambda: (status(b) or {}).get("members") == 2, 30, 1))
-        out = b.run("nbs host add c")
-        need("c added from b, a member that does not lead", re.search(r"c is member \d+", out) is not None, out)
+        out = job_done(b, b.run('mgmt start nbs host_add {"host":"c"}'))
+        js = json_of(out)
+        need("c added from b, a member that does not lead -- a job through the bus, as the panel adds it",
+             job_ok(out, "nbs.host_add") and js is not None and js.get("host") == "c"
+             and num(js.get("member")) is not None, out)
         need("three members, three voters, one leader, as every host says", ipct.wait_for(lambda: agreed(sh, 3), 60, 1))
         out = a.run("nbs host add b")
         check("b added again: the same incarnation", ("b is member %d" % b_member) in out, out)
@@ -583,8 +639,10 @@ def main():
         out = a.run("nbs volume create more 4")
         check("its room given back", "volume more (" in out, out)
 
-        out = c.run("nbs devices add %s" % ids["c"][1])
-        check("c's second partition a device too", "in the metadata" in out, out)
+        js = json_of(c.run('mgmt call nbs device_add {"device":"%s"}' % ids["c"][1]))
+        check("c's second partition a device too, added through the bus",
+              js is not None and js.get("id") == ids["c"][1] and js.get("size") == room << 20
+              and js.get("wiped") is False and isinstance(js.get("device"), int), js)
         out = c.run("nbs devices drain %s" % ids["c"][0])
         check("c's first drained", "takes no new chunks" in out, out)
         out = c.run("nbs cs")
@@ -594,6 +652,16 @@ def main():
                         out, re.M) is not None
               and re.search(r"device %d\s+%s\s+\d+ MiB draining" % (dev["c"], re.escape(ids["c"][0])), out) is not None,
               out)
+        js = json_of(a.run('mgmt call nbs device_drain {"device":"%s","host":"c"}' % ids["c"][0]))
+        check("drained again from a through the bus, c named its host: the same device",
+              js is not None and js.get("device") == dev["c"] and js.get("id") == ids["c"][0], js)
+        out = a.run('mgmt call nbs device_drain {"device":"%s","host":"b"}' % ids["c"][0])
+        check("and of a host it is not on: not found", "mgmt: not_found" in out, out)
+        js = json_of(b.run("mgmt call nbs devices"))
+        got = sorted((d.get("host"), d.get("id"), d.get("size"), d.get("state")) for d in (js or {}).get("devices", []))
+        want = sorted([("a", ids["a"][0], room << 20, "active"), ("b", ids["b"][0], room << 20, "active"),
+                       ("c", ids["c"][0], room << 20, "draining"), ("c", ids["c"][1], room << 20, "active")])
+        check("the provider's devices through the bus, on b: every host's, c's first draining", got == want, js)
 
         js = json_of(b.run('mgmt call nbs volume {"name":"disk1"}'))
         check("the provider's volume, through the bus, as the command says it",
@@ -922,6 +990,10 @@ def main():
         b.run("insmod /nbs-cs.ko")
         # c's cs, unloaded a while just now, may be joining again yet
         check("every chunk at three replicas", ipct.wait_for(lambda: whole(a), 240, 3), a.run("nbs status"))
+        js = json_of(a.run('mgmt call nbs volume {"name":"rep"}'))
+        check("rep's health through the bus: whole, no chunk short of three",
+              js is not None and js.get("health") == "ok" and js.get("chunks_at_two") == 0
+              and js.get("chunks_copying") == 0, js)
         kill(2)
         others = [sh[0], sh[1]]
         check("c gone: the leader's controller has its cs down",
@@ -934,11 +1006,35 @@ def main():
         check("written past c, to a's and b's replicas", "65536 bytes of 0x32 written" in out, out)
         out = a.run("nbs io close rep")
         check("and closed there", "closed on its replicas" in out, out)
+        js = json_of(a.run('mgmt call nbs volume {"name":"rep"}'))
+        check("rep's health through the bus, c's replicas down: degraded, both its chunks at two replicas",
+              js is not None and js.get("health") == "degraded" and js.get("chunks_at_two") == 2
+              and js.get("chunks_at_one") == 0 and js.get("chunks_unreachable") == 0, js)
+        js = json_of(a.run("mgmt call nbs alerts"))
+        rows = (js or {}).get("alerts") or []
+        kinds = [r.get("kind") for r in rows]
+        # c's out by now -- the check before waited for it -- or down yet
+        gone = [r.get("kind") for r in rows if r.get("host") == "c" and r.get("kind") in ("cs_down", "cs_out")]
+        check("NBS's alerts through the bus, the worst first: fewer than three hosts with room -- no repair -- c's "
+              "chunk server out, chunks at two replicas",
+              len(gone) == 1 and "chunks_at_two" in kinds
+              and any(r.get("kind") == "no_room" and r.get("count") == 2 for r in rows)
+              and "ok" not in kinds and "no_leader" not in kinds and "stopped" not in kinds
+              and kinds.index("no_room") < kinds.index(gone[0]) < kinds.index("chunks_at_two"), js)
         need("c boots again", pt.wait_log(boot(2), "boot: complete", 300) and addressed(2))
         sh[2] = c = ipct.Shell(hub.shell(2))
         need("c back: three voters, one leader", ipct.wait_for(lambda: agreed(sh, 3), 90, 1))
         check("c's cs up, joined in its own place, its copy done: every chunk at three replicas, none being "
               "copied, no cs down", ipct.wait_for(lambda: whole(a), 240, 3), [x.run("nbs status") for x in sh])
+        js = json_of(a.run('mgmt call nbs volume {"name":"rep"}'))
+        check("and rep whole again through the bus", js is not None and js.get("health") == "ok"
+              and js.get("chunks_at_two") == 0 and js.get("chunks_copying") == 0, js)
+        js = json_of(a.run("mgmt call nbs alerts"))
+        kinds = [r.get("kind") for r in (js or {}).get("alerts") or []]
+        check("and NBS's alerts say none of them: room on three hosts, no chunk server down or out, no chunk short of "
+              "three, none copied",
+              js is not None and not {"no_room", "cs_down", "cs_out", "chunks_at_two", "chunks_at_one",
+                                      "chunks_unreachable", "copying", "no_leader", "stopped"} & set(kinds), js)
         out = a.run("nbs io detach rep")
         check("a lets rep go", "rep detached" in out, out)
         out = c.run("nbs io read rep 0 131072")
@@ -1011,10 +1107,12 @@ def main():
         out = sh[li].run("nbs host add %s" % lost)
         check("an add of %s refused, the cluster having it as its old member" % lost,
               "has it as member %d" % old in out and "replace" in out, out)
-        out = sh[li].run("nbs host replace %s" % lost)
-        m = re.search(r"member %d removed, and %s is member (\d+) now" % (old, lost), out)
-        need("%s replaced: its old member removed, and back as a new one" % lost, m is not None, out)
-        new = int(m.group(1))
+        out = job_done(sh[li], sh[li].run('mgmt start nbs host_replace {"host":"%s"}' % lost), 120)
+        js = json_of(out)
+        need("%s replaced -- a job through the bus, as the panel replaces it: its old member removed, and back as a "
+             "new one" % lost, job_ok(out, "nbs.host_replace") and js is not None and js.get("host") == lost
+             and num(js.get("removed")) == old and num(js.get("member")) not in (None, old), out)
+        new = num(js["member"])
         need("three voters again, %s's new member among them" % lost,
              ipct.wait_for(lambda: agreed(sh, 3) and (status(sh[fi]) or {}).get("member") == new, 60, 1))
         out = sh[li].run("nbs host add %s" % lost)
@@ -1075,8 +1173,9 @@ def main():
         out = d.run("nbs io read api1 %d 65536" % (CHUNK_MIB << 20))
         check("and its second chunk", ("65536 bytes at %d of api1, from d: 0x62x65536" % (CHUNK_MIB << 20)) in out,
               out)
-        out = sh[li].run("nbs host remove %s" % gone_for_good)
-        check("%s removed, for good" % gone_for_good, "removed, for good" in out, out)
+        js = json_of(sh[li].run('mgmt call nbs host_remove {"host":"%s"}' % gone_for_good))
+        check("%s removed, for good -- through the bus" % gone_for_good,
+              js is not None and js.get("host") == gone_for_good and num(js.get("member")) is not None, js)
         need("three members again, d among them, as every host alive says",
              ipct.wait_for(lambda: agreed([sh[i] for i in live], 3), 60, 1))
 

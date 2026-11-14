@@ -9,12 +9,22 @@ device. Then:
   read by a guest on b: what its /dev/vda holds is what was poured;
 - a disk hvboot boots -- ext4, a grub.cfg naming the guest's kernel and
   initrd -- made an image of NBS's by `hv image` (N10d3), and two VMs made
-  of it by `hv create <vm> image=nbs:<image>`, one on a and one on b, each
+  of it, one on a by `hv create <vm> image=nbs:<image>` and one on b by the
+  vm provider's create, a job through the bus as the panel starts it, each
   booted by its name, by hvboot, off a clone of its own: a's grown to
   size=, zeros past the image, and written over a chunk the image shares --
   b's, started after, still the image's; the refusals: the image's name
   again, a VM of a plain volume, a size= under the image's, a clone's name
-  taken -- each leaving nothing;
+  taken -- each leaving nothing -- and through the bus a URL and an image
+  both; an image made of the same file by the vm provider (`image`, a job
+  through the bus, as the panel makes one), a name NBS would refuse refused
+  first; v1's disk snapshotted as it runs, through the bus as the panel
+  takes one (`snapshot`) -- its guest's session paused for it -- the name
+  taken again refused, and a VM of the snapshot made on b by the provider
+  and booted: its disk v1's as the snapshot was taken, v1's write among it;
+  v1's disk activity through the bus (`disk_io`) -- its volume's reads and
+  the MiB it wrote counted, under the word it was started with, and the time
+  its requests waited -- twice, the counters only growing;
 - a guest on a with `disk=nbs:gdisk`: its disk the volume's size, its serial
   `nbs-<number>`; written with dd, synced, read back past the page cache the
   same; stopped -- the volume let go of, detached;
@@ -40,6 +50,7 @@ Exit code 0 = every check passed.
 import argparse
 import hashlib
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -155,6 +166,30 @@ def started(out):
     """The number of the VM `hv start` started, or None."""
     m = re.search(r"hv: vm (\d+)(?: \([^)]*\))? started", out)
     return int(m.group(1)) if m else None
+
+
+def job_done(sh, out, secs=120):
+    """The job `mgmt start` said it started in `out`, followed to its end:
+    `mgmt job`'s last answer -- its record, its log and its result -- or
+    None where it did not end in `secs`."""
+    m = re.search(r"mgmt: job (\d+) started", out)
+    if not m:
+        return None
+    end = time.time() + secs
+    while time.time() < end:
+        got = sh.run("mgmt job %s" % m.group(1))
+        if re.search(r"^job %s \S+ done " % m.group(1), got, re.M):
+            return got
+        time.sleep(1)
+    return None
+
+
+def json_of(out):
+    m = re.search(r"(\{.*\})", out or "", re.S)
+    try:
+        return json.loads(m.group(1)) if m else None
+    except ValueError:
+        return None
 
 
 def md5_of(out):
@@ -285,6 +320,19 @@ def main():
         check("nbs:img an image, of the disk's size", "an image" in out and ("%d MiB" % BOOT_MIB) in out, out)
         out = a.run("hv image img /boot.raw")
         check("hv image of the name again refused", "nbs:img is there already" in out, out)
+        out = job_done(a, a.run('mgmt start vm image {"name":"Img2","from":"/boot.raw"}'))
+        check("the vm provider's image of a name NBS would refuse: refused before anything is made",
+              out is not None and re.search(r"^job \d+ vm\.image done invalid", out, re.M) is not None, out)
+        out = job_done(a, a.run('mgmt start vm image {"name":"img2","from":"/boot.raw"}'), 300)
+        js = json_of(out)
+        check("an image made by the vm provider of a file of nos's, a job through the bus",
+              out is not None and re.search(r"^job \d+ vm\.image done ok", out, re.M) is not None
+              and "nbs:img2 is an image now" in out and js is not None and js.get("image") == "img2"
+              and js.get("size_bytes") == BOOT_MIB << 20, out)
+        out = a.run("nbs volume img2")
+        check("nbs:img2 an image, of the disk's size", "an image" in out and ("%d MiB" % BOOT_MIB) in out, out)
+        out = a.run("nbs volume delete img2")
+        check("and deleted", "deleted" in out, out)
         out = a.run("hv create v3 image=nbs:gdisk")
         check("a VM of a plain volume refused", "nbs:gdisk is a volume" in out, out)
         out = a.run("hv create v4 image=nbs:img size=1M")
@@ -300,8 +348,19 @@ def main():
         out = a.run("hv vms") + a.run("nbs volumes")
         check("the refused left nothing: no folder, no volume",
               not any(n in out for n in ("v3", "v4", "v5")) and "v1" in out, out)
-        out = b.run("hv create v2 image=nbs:img mem=%d" % GUEST_MIB)
-        check("hv create v2 image=nbs:img on b: made", "/vms/v2/vm.toml written" in out, out)
+        out = job_done(b, b.run('mgmt start vm create {"name":"v6","url":"http://10.9.0.1/x.img","image":"img"}'))
+        check("the vm provider's create of a URL and an image both refused", out is not None
+              and re.search(r"^job \d+ vm\.create done invalid", out, re.M) is not None
+              and "is given with a URL" in out, out)
+        # b's made through the bus, as the panel makes one
+        out = job_done(b, b.run('mgmt start vm create {"name":"v2","image":"img","memory_mib":%d}' % GUEST_MIB), 300)
+        js = json_of(out)
+        check("v2 made of nbs:img on b by the vm provider, a job through the bus: a clone of its own its disk",
+              out is not None and re.search(r"^job \d+ vm\.create done ok", out, re.M) is not None
+              and "nbs:v2 cloned from nbs:img" in out and js is not None and js.get("name") == "v2"
+              and js.get("disk_bytes") == BOOT_MIB << 20, out)
+        out = b.run("hv vms") + b.run("nbs volumes")
+        check("the refused left nothing", "v6" not in out, out)
 
         out = a.run("hv start v1")
         v1 = started(out)
@@ -319,6 +378,48 @@ def main():
         got, out = volume_sum(a, v1, 0, BOOT_MIB)
         check("read back past the page cache: the write, and the rest of the chunk the image's", got == copied_sum,
               out)
+
+        # -- v1's disk activity through the bus, as the panel charts it: its volume's counters --
+        io1 = json_of(a.run('mgmt call vm disk_io {"name":"v1"}'))
+        d1 = ((io1 or {}).get("disks") or [{}])[0]
+        check("v1's disk activity through the bus: its volume's reads, and the MiB it wrote, counted",
+              io1 is not None and io1.get("running") is True and isinstance(io1.get("at_ms"), int)
+              and d1.get("file") == "nbs:v1" and d1.get("reads", 0) > 0 and d1.get("writes", 0) > 0
+              and d1.get("written_bytes", 0) >= 1 << 20 and d1.get("wait_ns", 0) > 0, io1)
+        a.run(x(v1, "echo 3 > /proc/sys/vm/drop_caches; dd if=/dev/vda of=/dev/null bs=1M count=4 2>/dev/null; echo nos-rc=$?",
+                  120))
+        io2 = json_of(a.run('mgmt call vm disk_io {"name":"v1"}'))
+        d2 = ((io2 or {}).get("disks") or [{}])[0]
+        check("asked again after a read: later, its reads and their bytes grown, nothing gone back",
+              io2 is not None and io1 is not None and io2.get("at_ms", 0) > io1.get("at_ms", 0)
+              and d2.get("reads", 0) > d1.get("reads", 0) and d2.get("read_bytes", 0) >= d1.get("read_bytes", 0) + (4 << 20)
+              and d2.get("writes", 0) >= d1.get("writes", 0) and d2.get("wait_ns", 0) > d1.get("wait_ns", 0),
+              (io1, io2))
+
+        # -- v1's disk snapshotted as it runs, through the bus as the panel takes one -- its guest's
+        # session paused for it -- and a VM of the snapshot booted on b: its disk v1's then --
+        js = json_of(a.run('mgmt call vm snapshot {"name":"v1","snapshot":"v1-snap"}'))
+        check("a snapshot of v1's disk taken by the vm provider as v1 runs",
+              js is not None and js.get("vm") == "v1" and js.get("volume") == "v1" and js.get("snapshot") == "v1-snap",
+              js)
+        out = a.run("nbs volume v1-snap")
+        check("nbs:v1-snap a snapshot of v1", "a snapshot of v1" in out, out)
+        out = a.run('mgmt call vm snapshot {"name":"v1","snapshot":"v1-snap"}')
+        check("taken again by the name: refused", "mgmt: failed" in out and "already" in out, out)
+        out = job_done(b, b.run('mgmt start vm create {"name":"v9","image":"v1-snap","memory_mib":%d}' % GUEST_MIB),
+                       300)
+        check("v9 made of the snapshot on b by the vm provider",
+              out is not None and re.search(r"^job \d+ vm\.create done ok", out, re.M) is not None
+              and "nbs:v9 cloned from nbs:v1-snap" in out, out)
+        out = b.run("hv start v9")
+        v9 = started(out)
+        need("v9 started by its name on b", v9 is not None, out)
+        need("its shell up, off a clone of the snapshot", shell_up(b, v9))
+        got, out = volume_sum(b, v9, 0, BOOT_MIB)
+        check("v9's disk holds v1's as the snapshot was taken: v1's write among it", got == copied_sum, out)
+        b.run("hv stop %d" % v9)
+        check("v9 stopped, its clone let go of", ipct.wait_for(lambda: "detached" in b.run("nbs volume v9"), 120, 1),
+              b.run("nbs volumes"))
 
         out = b.run("hv start v2")
         v2 = started(out)

@@ -10,15 +10,17 @@
 //! of `SCHEMA`; it names the provider; its methods are the registered ones,
 //! each once and of its kind; every text a person reads is there in each of
 //! `LANGUAGES`; every field has a type a client knows, and an enum its
-//! values; a resource is listed by a read and acted on by what is not one,
+//! values -- and, where it says how a thing is, each value's tone, which a
+//! client colours it by; a resource is listed by a read and acted on by
+//! what is not one,
 //! its columns among its fields; a metric is read by a read. Nothing is
 //! there that the format does not have: a misspelt member is refused rather
 //! than left for a client to ignore.
 
 use crate::json::{parse, Limits, Value};
 
-/// What a descriptor may make, at most.
-pub const LIMITS: Limits = Limits { bytes: 16 * 1024, depth: 12, values: 4096, members: 256, string: 2048 };
+/// What a descriptor may make, at most: the bus's `MAX_DESCRIPTOR` of bytes.
+pub const LIMITS: Limits = Limits { bytes: 32 * 1024, depth: 12, values: 4096, members: 256, string: 2048 };
 
 /// The version of the format this checks.
 pub const SCHEMA: u64 = 1;
@@ -35,6 +37,11 @@ pub const TYPES: [&str; 13] = [
 
 /// What kind a method is, by its name on the bus.
 pub const KINDS: [&str; 3] = ["read", "action", "job"];
+
+/// How an enum's value says a thing is, where it says one (`tones`): well,
+/// a warning, an alarm, bad -- and idle, neither. A client colours a value by
+/// its tone: green, yellow, orange, red, grey.
+pub const TONES: [&str; 5] = ["good", "warn", "alarm", "bad", "idle"];
 
 /// Why a descriptor was refused: where in it, and what is wrong.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,7 +221,8 @@ fn check_method(m: &Value, kind: &str) -> Result<(), DescriptorError> {
 
 fn check_field(f: &Value, at: &'static str) -> Result<(), DescriptorError> {
     let Some(members) = f.as_object() else { return refuse(at, "are fields: objects") };
-    only(members, &["type", "title", "help", "unit", "min", "max", "values", "required", "default", "of"], at)?;
+    only(members, &["type", "title", "help", "unit", "min", "max", "values", "tones", "required", "default", "of"],
+         at)?;
     let Some(ty) = f.get("type").and_then(Value::as_str) else { return refuse(at, "have a type") };
     if !TYPES.contains(&ty) {
         return refuse(at, "have a type the format has");
@@ -254,6 +262,22 @@ fn check_field(f: &Value, at: &'static str) -> Result<(), DescriptorError> {
         }
         ("enum", None) => return refuse(at, "have an enum's values"),
         (_, Some(_)) => return refuse(at, "have values only for an enum"),
+        _ => {}
+    }
+    match (ty, f.get("tones")) {
+        ("enum", Some(tones)) => {
+            let Some(tones) = tones.as_object() else { return refuse(at, "have tones: an object") };
+            let values = f.get("values").and_then(Value::as_object).unwrap_or(&[]);
+            for (value, tone) in tones {
+                if !values.iter().any(|(v, _)| v == value) {
+                    return refuse(at, "have tones of their own values alone");
+                }
+                if !tone.as_str().is_some_and(|t| TONES.contains(&t)) {
+                    return refuse(at, "have tones the format has");
+                }
+            }
+        }
+        (_, Some(_)) => return refuse(at, "have tones only for an enum"),
         _ => {}
     }
     match (ty, f.get("of")) {
