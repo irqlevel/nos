@@ -299,7 +299,7 @@ it finds one. So does an `/etc/rc` that loads a module from outside
 - A server whose disks or network card nos has no driver for is not one this
   works on: see the first section.
 
-`scripts/image-test.py` is the test of all of this: it pours the image onto
+`tests/image-test.py` is the test of all of this: it pours the image onto
 a partition with `nos-install` under Linux, boots the disk through a GRUB
 standing in for a server's, logs in with the key it gave, checks that no UDP
 shell answers and that the next boot is the server's own, then updates,

@@ -2,7 +2,7 @@
 # tests -- compiled as they are, under the address and undefined-behaviour
 # sanitizers -- the stand-ins for the kernel around them (common/), the
 # host's HAL in place of each arch's inline one (host/, first on the include
-# path), and the target's own file (targets/). scripts/cpp-fuzz.py builds
+# path), and the target's own file (targets/). tests/cpp-fuzz.py builds
 # them with this and runs them; `make -C fuzz/cpp` alone builds them all.
 #
 # The source lists are explicit, as the kernel's are: a kernel file a target
@@ -81,7 +81,7 @@ SRC_heap := $(COMMON) $(CPU) fuzz/cpp/targets/heap.cpp \
 
 all: $(TARGETS:%=$(OUT)/bin/%)
 
-# What scripts/cpp-fuzz.py runs, in this order
+# What tests/cpp-fuzz.py runs, in this order
 print-targets:
 	@echo $(TARGETS)
 

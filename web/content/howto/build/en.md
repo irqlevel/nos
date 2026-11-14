@@ -112,10 +112,10 @@ make
 | `make image` | builds `nos-x86_64.squashfs` (x86-64 only; needs `mksquashfs`) |
 | `make nocheck UBSAN=1` | builds the C++ under clang's UB sanitizer (see below) |
 | `make nocheck RUSTUB=1` | builds the Rust with `core`'s unsafe-precondition and overflow checks (see below) |
-| `make smoke` | runs `scripts/smoke-test.sh`, which builds in Docker and boots headless |
+| `make smoke` | runs `tests/smoke-test.sh`, which builds in Docker and boots headless |
 | `make clean` | removes `out/`, the kernels, `nos-arm64.img`, the ISO and the system image, and runs `cargo clean` |
 
-`ARCH` selects the architecture: `x86_64` (the default) or `aarch64`. Objects go to `out/$(ARCH)/`. An arm64-only build needs only make, clang, lld, llvm and the nightly; that's all the release workflow installs for it. `make smoke` builds in Docker. With a native toolchain, build with `make nocheck` and then run `./scripts/smoke-test.sh --skip-build`.
+`ARCH` selects the architecture: `x86_64` (the default) or `aarch64`. Objects go to `out/$(ARCH)/`. An arm64-only build needs only make, clang, lld, llvm and the nightly; that's all the release workflow installs for it. `make smoke` builds in Docker. With a native toolchain, build with `make nocheck` and then run `./tests/smoke-test.sh --skip-build`.
 
 ## What you get
 
@@ -164,11 +164,11 @@ Two things to watch for:
 - **Judge a run by its exit code.** Before you send a change, build both architectures and boot both:
 
 ```sh
-make nocheck && ./scripts/smoke-test.sh --skip-build
-make nocheck ARCH=aarch64 && ./scripts/smoke-arm64.sh --skip-build
+make nocheck && ./tests/smoke-test.sh --skip-build
+make nocheck ARCH=aarch64 && ./tests/smoke-arm64.sh --skip-build
 ```
 
-On macOS, run `./scripts/smoke-test.sh` and `./scripts/smoke-arm64.sh` without `--skip-build`. Without that flag, each script first builds incrementally in the `nos-builder` container. A smoke script exits with 0 when the boot printed all its markers, and with 1 on a panic, a timeout or a failed build. To see what each check covers, read [Run the gates](/howto/run-the-gates).
+On macOS, run `./tests/smoke-test.sh` and `./tests/smoke-arm64.sh` without `--skip-build`. Without that flag, each script first builds incrementally in the `nos-builder` container. A smoke script exits with 0 when the boot printed all its markers, and with 1 on a panic, a timeout or a failed build. To see what each check covers, read [Run the gates](/howto/run-the-gates).
 
 ## Troubleshooting
 

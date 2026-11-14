@@ -117,7 +117,7 @@ what maintenance as evacuation and rebalancing are built from.
   their own, with hosts failing, partitions and leases. It holds that room
   is never exceeded; that the constraints hold; and that a lost host's VMs
   are started again once, and never run twice.
-- **`vmctl-test.py`** on `scripts/hub.py`:
+- **`vmctl-test.py`** on `tests/hub.py`:
   - VMs placed across hosts by room;
   - a host killed, and its VMs started elsewhere after the lease;
   - a partitioned host stopping its own VMs;

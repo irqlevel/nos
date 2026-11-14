@@ -508,7 +508,7 @@ four hosts or more.
      written.
 2. **On the kernel**: ipc's gates ([ipc.md](ipc.md)); `nbs-test.py` (both
    arches; three to five arm64 nos under HVF are the fast loop) on
-   `scripts/hub.py`: a cluster from `/etc/rc`, volumes made, `nbsload`
+   `tests/hub.py`: a cluster from `/etc/rc`, volumes made, `nbsload`
    writing and verifying, hosts' QEMUs killed and booted again, partitions,
    the leader killed, a device pulled, every rebuild's replicas compared; then
    `hv-nbs-test.py` (x86-64): a guest on an NBS disk, its host killed, the VM
@@ -557,7 +557,7 @@ each new gate.
     too; `nbs hosts` names `nbs status`'s list.
   - **The folder is `/nbs/mds`** (`member`, `raft/`). `/nbs/nbs.toml` waits
     for the cs's devices (N7).
-  - **Tests**: `scripts/nbs-test.py`, three arm64 nos on hub.py with the
+  - **Tests**: `tests/nbs-test.py`, three arm64 nos on hub.py with the
     registry made among them first.
 - **N6, the metadata.** `nbsmeta` and its target: volumes, hosts, devices,
   placement, the snapshot of the state, the digest; the commands and the

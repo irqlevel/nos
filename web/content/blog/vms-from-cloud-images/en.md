@@ -87,7 +87,7 @@ The interesting part is the DEFLATE decoder. A compressed cluster is raw DEFLATE
 //! zlib, so a cluster this accepts must be one QEMU reads, to the byte, and
 //! one QEMU refuses must be refused: every rule here is zlib's, checked in
 //! zlib's order (its inflate.c and inftrees.c), and
-//! scripts/diskimage-test.py holds the two to the same answer over streams
+//! tests/diskimage-test.py holds the two to the same answer over streams
 //! made and broken at random.
 ```
 

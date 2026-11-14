@@ -5,7 +5,7 @@
 # program that is the rest of the kernel: the C++ half the `ffi` crate
 # declares (fuzz/common) and disks whose media are the fuzzer's. What is on
 # a disk is whoever wrote it's to choose, so every byte the layers read off
-# one is an input. scripts/fs-fuzz.py builds and runs it.
+# one is an input. tests/fs-fuzz.py builds and runs it.
 [package]
 name = "fs-fuzz"
 version = "0.1.0"

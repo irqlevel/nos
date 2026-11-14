@@ -538,7 +538,7 @@ receive batch ends, and lends both calls the `RxContext` that reaches what
 only the receive path touches (`RxOwned`) with no lock -- here, the `TxBatch`
 the replies gather in. The module has no `unsafe` in it; the frame formats
 are the `netwire` crate's, which the network layer is built on too.
-`scripts/netload-test.py` is its test ([Tests and gates](testing.md)).
+`tests/netload-test.py` is its test ([Tests and gates](testing.md)).
 
 ## netblk
 
@@ -592,7 +592,7 @@ or `ssh -t <host> edit /etc/rc`. The image's `/etc/rc` loads it after sshd;
 on a machine whose `/etc/rc` came before that, `insmod /lib/modules/edit.ko`
 does, and a line saying so in `/etc/rc` keeps it -- an edit, now, of `/etc/rc`
 itself. The editor is a crate with no kernel in it, `src/crates/common/text/edit`, which
-`scripts/edit-test.py` runs on the host; the module is its seat in the
+`tests/edit-test.py` runs on the host; the module is its seat in the
 kernel: the command, the file read and written, and the session's terminal
 -- the keys typed (`Output::read_input`) and its size, which the session
 tells the command it runs (`Output::terminal`, [sshd](sshd.md#the-shell-behind-it)).
@@ -656,7 +656,7 @@ that has been freed and given to somebody else, with the code that would
 have turned it off unmapped. So the module turns the extension off in its
 own `Drop` -- after the command is unregistered, so nothing can ask it
 anything -- reads back what every CPU has, and says so if anything is left.
-`scripts/hv-test.py` is that round trip: load, turn on, unload without
+`tests/hv-test.py` is that round trip: load, turn on, unload without
 turning off, load again and ask the CPUs.
 
 Before any of that, its guests stop. A guest `hv start`ed runs on a vCPU task
@@ -666,7 +666,7 @@ time; the module's stop stops both -- which is also what lets an `hv exec` or
 of the command still running before it drops the module -- and the `Drop`
 then unregisters the command, and only then turns the extension off. An `hv start` still reading its files when the
 unload begins finds the module going when it comes to add its guest, and
-stops that guest itself before it returns. `scripts/hv-linux-test.py` unloads with a
+stops that guest itself before it returns. `tests/hv-linux-test.py` unloads with a
 guest running and checks the order in the log
 ([Guests that stay up](hypervisor.md#guests-that-stay-up)).
 
@@ -757,7 +757,7 @@ chacha20-poly1305  handshake 1.2 ms; 64 MB client->server 204.6 MB/s, server->cl
 Each way, the sender encrypts in one task and the receiver decrypts in
 another, as two hosts would -- on two CPUs where there are two. The suite
 the two agreed on is checked to be the one asked for (`Session::suite`).
-`scripts/tlsbench.py [--arch ...] [--mb N] [--cpus N]` boots nos with it and
+`tests/tlsbench.py [--arch ...] [--mb N] [--cpus N]` boots nos with it and
 prints what it said; the numbers above are the AX41's, under KVM
 (docs/tls.md, "What it costs").
 
@@ -791,8 +791,8 @@ $ ipc ping kernel.echo@b count=100
 and its connections closed; one whose address changed is lost and dialed
 again; one whose keys changed keeps its connections -- each made with a key
 it had -- and the next is made with a key it has now (to cut a key's
-connections at once, `remove` the peer). `scripts/ipc-test.py` runs three of them on a LAN of
-`scripts/hub.py`'s.
+connections at once, `remove` the peer). `tests/ipc-test.py` runs three of them on a LAN of
+`tests/hub.py`'s.
 
 A host of a cluster has its peers from the cluster's registry instead
 (below): ipcnet's control mailbox, `ipcnet.ctl` (`ipcwire::control`, a Host
@@ -826,7 +826,7 @@ $ cluster remove b
 It is on the management bus as the `cluster` provider too, whose
 descriptor the panel builds the cluster's page of.
 
-`scripts/cluster-test.py` makes a cluster of three on `scripts/hub.py`'s
+`tests/cluster-test.py` makes a cluster of three on `tests/hub.py`'s
 LAN.
 
 ## nbs-mds and nbs-cs
@@ -852,7 +852,7 @@ $ nbs io write disk1 0 65536 0x5a                  # a volume's bytes, through t
 $ nbscs                                            # the cs: its devices, what it served
 ```
 
-`scripts/nbs-test.py` runs both on three hosts of `scripts/hub.py`'s LAN.
+`tests/nbs-test.py` runs both on three hosts of `tests/hub.py`'s LAN.
 
 ## Backtraces
 

@@ -67,7 +67,7 @@ An indirect branch prediction barrier (IBPB) makes the predictors forget what ea
     }
 ```
 
-The `unsafe` here is sound because the `IBPB` flag is only ever set from CPUID's answer, read once when the extension is switched on. Asking CPUID at every entry would cost an exit of its own whenever nos itself runs under another hypervisor. [`hv-test.py`](https://github.com/irqlevel/nos/blob/master/scripts/hv-test.py) checks `hv`'s counters: at least two switches per built-in guest, each with an IBPB where the CPU has one. On the EX44's real hardware, one session issued 159 of them.
+The `unsafe` here is sound because the `IBPB` flag is only ever set from CPUID's answer, read once when the extension is switched on. Asking CPUID at every entry would cost an exit of its own whenever nos itself runs under another hypervisor. [`hv-test.py`](https://github.com/irqlevel/nos/blob/master/tests/hv-test.py) checks `hv`'s counters: at least two switches per built-in guest, each with an IBPB where the CPU has one. On the EX44's real hardware, one session issued 159 of them.
 
 ## The host's own branches: IBRS and its relatives
 

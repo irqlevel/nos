@@ -173,7 +173,7 @@ voter answers, and says what it is about to do.
   a refusal leaving it as it was. The join's own refusals -- a wrong secret,
   another host's token, a token used again or expired -- are the registry
   target's and `cluster-test.py`'s.
-- **`cluster-test.py`** (both arches, on `scripts/hub.py`), C1 as built:
+- **`cluster-test.py`** (both arches, on `tests/hub.py`), C1 as built:
   - a cluster made on one host, two more invited and joined -- one through a
     member that does not lead -- and every host reaching every other;
   - a wrong secret, another host's token, a token used again and a second

@@ -392,7 +392,7 @@ initramfs Alpine загружает `virtio_blk`, находит ISO на `vda` 
 
 ## Что дальше
 
-- Всё это может проделать за вас гейт проекта. `nos/scripts/hv-linux-test.py --bzimage linux/arch/x86/boot/bzImage --initrd guest/initrd` загружает гостя и прогоняет долгоживущие VM, а `--disk`, `--net`, `--cpus N` и `--attach` покрывают остальное. `nos/scripts/hv-distro-test.py --iso alpine-virt-3.24.2-x86_64.iso` проверяет Alpine. Оба скрипта используют `nos.iso` и модули, собранные в дереве ([Гейты: как проверять изменения в nos](/howto/run-the-gates)).
+- Всё это может проделать за вас гейт проекта. `nos/tests/hv-linux-test.py --bzimage linux/arch/x86/boot/bzImage --initrd guest/initrd` загружает гостя и прогоняет долгоживущие VM, а `--disk`, `--net`, `--cpus N` и `--attach` покрывают остальное. `nos/tests/hv-distro-test.py --iso alpine-virt-3.24.2-x86_64.iso` проверяет Alpine. Оба скрипта используют `nos.iso` и модули, собранные в дереве ([Гейты: как проверять изменения в nos](/howto/run-the-gates)).
 - [Гипервизор](/hypervisor) и справочник: [A Linux guest](/docs/hypervisor#a-linux-guest), [Guests that stay up](/docs/hypervisor#guests-that-stay-up), [More than one CPU](/docs/hypervisor#more-than-one-cpu).
 - [ВМ из облачного образа](/howto/cloud-vm): облачный образ Debian по ссылке, со своим ядром и в папке, которая переживает перезагрузки.
 - [Установка nos на выделенный сервер](/howto/install-on-a-server), чтобы запускать гостей на настоящем железе.

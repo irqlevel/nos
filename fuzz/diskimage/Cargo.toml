@@ -2,7 +2,7 @@
 # module runs it: images made by qemu-img converted here and by qemu-img,
 # to compare; its DEFLATE decoder held to zlib's answers; and images with
 # their metadata changed at random, the code held to never panicking,
-# never writing outside the disk and always ending (scripts/diskimage-test.py).
+# never writing outside the disk and always ending (tests/diskimage-test.py).
 # Nothing but the tree's own crates, by path, so it builds offline.
 [package]
 name = "diskimage-test"

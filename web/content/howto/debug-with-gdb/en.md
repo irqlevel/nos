@@ -181,7 +181,7 @@ When a boot hangs in some unrelated place, and only on one architecture, it may 
 
 ```sh
 make nocheck UBSAN=1 RUSTUB=1
-./scripts/smoke-test.sh --skip-build
+./tests/smoke-test.sh --skip-build
 ```
 
 The first undefined operation in the C++ panics and names its site. In the Rust, `core` (Rust's base library) checks the preconditions of unsafe operations, and the first one it finds violated panics the same way. With `ubsan=warn` on the command line, the kernel instead prints every C++ report of the boot and keeps going. Each site is reported once, with a backtrace. For more, see [Build nos](/howto/build).

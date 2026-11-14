@@ -3,7 +3,7 @@
 # its parameters and statuses), as the API module links them. Known-answer
 # vectors, the parsers fuzzed with random and broken inputs, and the
 # certificates written out for OpenSSL and Python's ssl to judge
-# (scripts/web-test.py). Its dependencies are the kernel's vendored ones, so
+# (tests/web-test.py). Its dependencies are the kernel's vendored ones, so
 # it builds offline.
 [package]
 name = "web-test"

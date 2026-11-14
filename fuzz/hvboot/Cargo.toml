@@ -4,7 +4,7 @@
 # by (src/crates/common/boot/bzimage), run over a disk image --
 # what hvboot would boot off it, and the kernel and initrd read out by its
 # own reader, to compare with what e2fsprogs reads -- and over random inputs
-# (scripts/hvboot-test.py). Its dependencies are the format crate ext.rs
+# (tests/hvboot-test.py). Its dependencies are the format crate ext.rs
 # reads through, the CRC-32 gpt.rs checks by and the bzImage crate, paths of
 # the tree's, so it builds offline.
 [package]

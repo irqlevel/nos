@@ -2,7 +2,7 @@
 # sessions with what they must leave in the file and on the screen, files
 # read and written back byte for byte, and sessions of random keys on a
 # terminal of the test's own, the editor held to its promises after every
-# key (scripts/edit-test.py). Nothing but the crate itself, so it builds
+# key (tests/edit-test.py). Nothing but the crate itself, so it builds
 # offline.
 [package]
 name = "edit-test"

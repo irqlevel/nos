@@ -95,7 +95,7 @@ of the floor besides.
   20 ms in five seconds, either of which would cut off an ssh session on a
   flaky link -- the user's Wi-Fi and VPN to the servers are one. A
   handshake is still given up after eight tries.
-- Measured on `scripts/hub.py` (I4's harness, [ipc.md](ipc.md)), which
+- Measured on `tests/hub.py` (I4's harness, [ipc.md](ipc.md)), which
   drops the last segment of a burst on purpose: the stall, a second today,
   should become the RTO -- 200 ms, and tens of ms on a link between nos
   hosts.
@@ -145,7 +145,7 @@ closed port -- with eight mutants caught.
   limit.
 
 **T4, recovery from loss and reordering.** Asked for 2026-11-06 and done
-on branch `ipc-raft`, measured with `scripts/tcp-loss-bench.py`: two nos on
+on branch `ipc-raft`, measured with `tests/tcp-loss-bench.py`: two nos on
 hub.py's LAN, ipcnet's bulk connection between them, megabytes echoed under
 each impairment on links made fresh for it.
 

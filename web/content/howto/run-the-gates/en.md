@@ -28,7 +28,7 @@ You need:
 Every check here passes or fails by its **exit code**, never by what it prints. Grepping the output is exactly how a failure gets mistaken for success. For example, a build that stops on a stale dependency file prints `No rule to make target`, not `error`. And a boot log that was never written has no `PANIC:` in it either.
 
 ```sh
-./scripts/smoke-test.sh --skip-build
+./tests/smoke-test.sh --skip-build
 echo "exit: $?"
 ```
 
@@ -50,9 +50,9 @@ To add a test, write a `TestXxx()` and register it in the `Test()` dispatcher. T
 A smoke boot starts the kernel in QEMU and checks that it comes all the way up. **Every change must keep both smoke boots green.** CI runs them on every push to `master` and on every pull request. A change to common code that builds only on x86 is a broken change.
 
 ```sh
-./scripts/smoke-test.sh
-./scripts/smoke-arm64.sh
-SMOKE_HVF=1 ./scripts/smoke-arm64.sh
+./tests/smoke-test.sh
+./tests/smoke-arm64.sh
+SMOKE_HVF=1 ./tests/smoke-arm64.sh
 ```
 
 What the scripts do:
@@ -82,7 +82,7 @@ Run the gates on these images as they are: pass `--skip-build` to the scripts th
 
 ## 4. The gate for what you touched
 
-What a smoke boot cannot notice has a test of its own in `scripts/`. Each one exists for a failure that looks like success, and most were written the day after we ran into one. They all expect the kernel to be built already. Each takes `--keep` to leave its scratch directory behind, and exits with 0 only if every check passed. Several run on arm64 only: they drive the shell over UDP, and the arm64 boot is the one whose command line turns that shell on. The code they test is the same on both architectures.
+What a smoke boot cannot notice has a test of its own in `tests/`. Each one exists for a failure that looks like success, and most were written the day after we ran into one. They all expect the kernel to be built already. Each takes `--keep` to leave its scratch directory behind, and exits with 0 only if every check passed. Several run on arm64 only: they drive the shell over UDP, and the arm64 boot is the one whose command line turns that shell on. The code they test is the same on both architectures.
 
 | After changing | Run | Where |
 |---|---|---|
@@ -126,10 +126,10 @@ Four programs compile the kernel's own sources for the host and feed them random
 With no arguments, a fuzzer works as a **gate**: it runs fixed inputs from a fixed seed, the same on every run. That takes from well under a minute (`hv-fuzz.py`) to a couple of minutes (`net-fuzz.py`, `fs-fuzz.py`). In a **campaign**, each target gets a number of seconds and a seed of its own:
 
 ```sh
-python3 scripts/hv-fuzz.py
-python3 scripts/net-fuzz.py --seed 7 --seconds 300
-python3 scripts/fs-fuzz.py --target ext2 --target ext4
-python3 scripts/net-fuzz.py --replay tcp out/net-fuzz/findings/X.hex --trace
+python3 tests/hv-fuzz.py
+python3 tests/net-fuzz.py --seed 7 --seconds 300
+python3 tests/fs-fuzz.py --target ext2 --target ext4
+python3 tests/net-fuzz.py --replay tcp out/net-fuzz/findings/X.hex --trace
 ```
 
 - **Findings** are saved under `out/<fuzzer>/findings/`, and `--replay` runs one again. `--trace` works with `net-fuzz.py`, `fs-fuzz.py` and `cpp-fuzz.py`.
