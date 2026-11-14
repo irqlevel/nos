@@ -62,6 +62,10 @@ export function MethodForm({ host, provider, name, method, fixed = {}, locale, w
   const mustType = method.confirm_typed
     ? String(method.confirm_typed in fixed ? fixed[method.confirm_typed] ?? '' : raw[method.confirm_typed] ?? '')
     : null;
+  /* A refusal of a parameter the form shows is said by its field; one of a
+   * parameter fixed -- a row's key, a VM's name -- below the form, or it
+   * was said nowhere */
+  const byField = error?.field !== undefined && params.some(([k]) => k === error.field);
 
   async function run() {
     const body: Record<string, unknown> = { ...fixed };
@@ -166,7 +170,7 @@ export function MethodForm({ host, provider, name, method, fixed = {}, locale, w
           </button>
         )}
       </div>
-      {error && !error.field && <p role="alert" className="text-sm text-bad">{error.message}</p>}
+      {error && !byField && <p role="alert" className="text-sm text-bad">{error.message}</p>}
       {answer !== null && (
         <pre className="max-h-64 overflow-auto rounded-lg bg-bg-soft p-2 font-mono text-xs text-fg-soft" data-testid="answer">
           {JSON.stringify(answer, null, 2)}

@@ -6,6 +6,22 @@
 
 import { Locale, Text, text } from './i18n';
 
+/** How an enum's value says a thing is (the format's `tones`, mgmtwire's
+ * TONES): a client colours it so. */
+export type Tone = 'good' | 'warn' | 'alarm' | 'bad' | 'idle';
+
+export const TONE_COLOR: Record<Tone, string> = {
+  good: 'var(--tone-good)', warn: 'var(--tone-warn)', alarm: 'var(--tone-alarm)', bad: 'var(--tone-bad)',
+  idle: 'var(--tone-idle)',
+};
+
+/** The tones from the worst: what two of them make together is the worse. */
+const TONE_RANK: Tone[] = ['bad', 'alarm', 'warn', 'good', 'idle'];
+
+export function worst(a: Tone, b: Tone): Tone {
+  return TONE_RANK.indexOf(a) <= TONE_RANK.indexOf(b) ? a : b;
+}
+
 export interface Field {
   type: string;
   title: Text;
@@ -14,6 +30,7 @@ export interface Field {
   min?: number;
   max?: number;
   values?: Record<string, Text>;
+  tones?: Record<string, Tone>;
   required?: boolean;
   default?: string | number | boolean | null;
   of?: string;
@@ -106,6 +123,11 @@ export function show(f: Field | undefined, v: unknown, locale: Locale): string {
     default:
       return typeof v === 'object' ? JSON.stringify(v) : String(v);
   }
+}
+
+/** The tone a field's value is in, where its descriptor says one. */
+export function toneOf(f: Field | undefined, v: unknown): Tone | undefined {
+  return f?.type === 'enum' && typeof v === 'string' ? f.tones?.[v] : undefined;
 }
 
 /** The methods a section of the sidebar is made of: a provider's

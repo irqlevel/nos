@@ -605,9 +605,17 @@ impl Drop for Scratch {
 /// -- its zeros left out, a volume new reading as zeros -- and frozen.
 /// Nothing is left of one that fails: the download removed, the volume
 /// deleted -- while it is a volume still, and this host's: never an image
-/// another host made of the name meanwhile.
+/// another host made of the name meanwhile. Its size, in bytes: the disk's,
+/// as the volume has it -- `hv image` and the vm provider's `image`.
 #[cfg(target_arch = "x86_64")]
-fn make_image(root: &str, vms: &crate::vms::Vms, name: &str, from: &str, work: &mut dyn Work) -> Result<(), String> {
+pub(crate) fn make_image(root: &str, vms: &crate::vms::Vms, name: &str, from: &str, work: &mut dyn Work)
+                         -> Result<u64, String> {
+    /* A name NBS would refuse refused first: after a download of gigabytes,
+     * the volume's create refused it */
+    if !nbsmeta::valid_volume(name) {
+        return Err(alloc::format!("{:?} is no volume's name: lowercase letters, digits, . _ and -, a letter or a \
+                                   digit first, up to {}", name, nbsmeta::VOLUME_NAME_MAX));
+    }
     let target = alloc::format!("nbs:{}", name);
     /* No second make of the name on this host meanwhile -- the download is
      * this one's alone -- and no unload under it. No VM's name has a `:`. */
@@ -650,7 +658,7 @@ fn make_image(root: &str, vms: &crate::vms::Vms, name: &str, from: &str, work: &
     }
     let _ = writeln!(work, "hv: {} is an image now, {} MiB, read-only for good -- hv create <vm> image={} makes a vm \
                             of a clone of it", target, size.div_ceil(MIB), target);
-    Ok(())
+    Ok(size.div_ceil(MIB) * MIB)
 }
 
 #[cfg(target_arch = "x86_64")]

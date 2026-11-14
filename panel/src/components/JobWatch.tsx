@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { cancelJob, jobRecord, JobRecord } from '@/lib/client';
 import type { Words } from '@/lib/i18n';
@@ -11,6 +11,16 @@ export function JobWatch({ host, id, w, onDone }: { host: string; id: number; w:
   onDone?: (r: JobRecord) => void }) {
   const [rec, setRec] = useState<JobRecord | null>(null);
   const [notes, setNotes] = useState<Array<{ seq: number; text: string }>>([]);
+  /* The end told to the caller's latest `onDone`, kept apart from the
+   * polling: a page draws its forms again with a new one each time -- a
+   * VM's every three seconds, a table once it is loaded again -- and the
+   * polling began anew with each, from the log's first line: the log was
+   * said twice, and a job done asked the host again in a loop, its end
+   * loading the table that began it again. */
+  const told = useRef(onDone);
+  useEffect(() => {
+    told.current = onDone;
+  }, [onDone]);
 
   useEffect(() => {
     let since = 0;
@@ -23,7 +33,7 @@ export function JobWatch({ host, id, w, onDone }: { host: string; id: number; w:
         if (r.notes.length) setNotes((n) => [...n, ...r.notes]);
         since = r.notes_next;
         if (r.state === 'done') {
-          onDone?.(r);
+          told.current?.(r);
           return;
         }
       }
@@ -33,7 +43,7 @@ export function JobWatch({ host, id, w, onDone }: { host: string; id: number; w:
     return () => {
       stop = true;
     };
-  }, [host, id, onDone]);
+  }, [host, id]);
 
   const pct = rec && rec.total ? Math.min(100, Math.round((rec.done * 100) / rec.total)) : null;
   const error = (rec?.result as { error?: { message?: string } } | null)?.error;

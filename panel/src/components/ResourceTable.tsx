@@ -3,8 +3,9 @@
 import { useCallback, useEffect, useState } from 'react';
 
 import { MethodForm } from './MethodForm';
+import { Shown } from './ToneDot';
 import { call } from '@/lib/client';
-import { Descriptor, Resource, show } from '@/lib/descriptor';
+import { Descriptor, Resource } from '@/lib/descriptor';
 import { Locale, text, Words } from '@/lib/i18n';
 
 type Row = Record<string, unknown>;
@@ -68,7 +69,7 @@ export function ResourceTable({ host, d, id, r, locale, w, every = 0, extra }: {
                       /* A value on one line: the table scrolls in its box where
                        * the window is narrow, not "8,192 / MiB" */
                       <td key={c} className="px-4 py-2 font-mono text-xs text-fg-soft whitespace-nowrap">
-                        {extra && c === r.key ? extra(row) : show(r.fields[c], row[c], locale)}
+                        {extra && c === r.key ? extra(row) : <Shown f={r.fields[c]} v={row[c]} locale={locale} />}
                       </td>
                     ))}
                     {(r.actions?.length ?? 0) > 0 && (

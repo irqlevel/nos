@@ -205,6 +205,8 @@ class Pool {
   private idle: tls.TLSSocket[] = [];
   private busy = 0;
   private waiting: Array<() => void> = [];
+  /* Closed: what is given back is let go of, not kept */
+  private closed = false;
 
   constructor(private link: HostLink) {}
 
@@ -231,7 +233,7 @@ class Pool {
 
   private give(s: tls.TLSSocket, keep: boolean) {
     this.busy -= 1;
-    if (keep && !s.destroyed) {
+    if (keep && !s.destroyed && !this.closed) {
       this.idle.push(s);
     } else {
       s.destroy();
@@ -263,8 +265,24 @@ class Pool {
   }
 
   close() {
+    this.closed = true;
     for (const s of this.idle) s.destroy();
     this.idle = [];
+  }
+}
+
+/** A host taken away: its connections closed, and those out with a request
+ * closed as it is answered. Kept, a host counts each against the panel's
+ * key until it lets an idle one go -- a minute, on nos; never, on the mock
+ * -- and the host added again meanwhile had its fifth reset past the four
+ * of one key, its pages failing with ECONNRESET (found by the panel's tests
+ * of 2026-11, a host removed and added again). */
+export function forgetHost(id: string) {
+  const pools = g.__nosPools;
+  const had = pools?.get(id);
+  if (had) {
+    had.pool.close();
+    pools!.delete(id);
   }
 }
 
