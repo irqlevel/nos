@@ -183,6 +183,12 @@ function deviceGiven(word, force) {
 vm('panel', { protected: true, port: 0, forwards: [{ port: 39233, guest_port: 443 }] });
 vm('web', { cpus: 2, memory_mib: 2048, port: 3, forwards: [{ port: 2201, guest_port: 22 }] });
 vm('db', { memory_mib: 4096, network: 'back' });
+if (!FRESH) {
+  /* On volumes of NBS's: one with a replica down, one with a chunk unreachable */
+  const seed = { file: 'seed.iso', size_bytes: 65536, read_only: true };
+  vm('store', { disks: [{ file: 'nbs:deg-vol', size_bytes: null, read_only: false }, seed] });
+  vm('broken', { disks: [{ file: 'nbs:lost-vol', size_bytes: null, read_only: false }, seed] });
+}
 
 /** A VM started: on the list, its console printing a boot. */
 function startVm(v) {
@@ -192,8 +198,10 @@ function startVm(v) {
   v.reason = null;
   v.console += '\r\n\x1b[1mhvboot\x1b[0m: booting /boot/vmlinuz-6.12 from /dev/vda1\r\n';
 }
-for (const name of ['panel', 'web']) {
-  startVm(vms.get(name));
+for (const name of ['panel', 'web', 'store', 'broken']) {
+  if (vms.has(name)) {
+    startVm(vms.get(name));
+  }
 }
 setInterval(() => {
   for (const v of vms.values()) {
@@ -352,9 +360,20 @@ const nbs = {
   member: !FRESH,
   name: FRESH ? null : 'store',
   hosts: cluster.hosts.map((h, i) => ({ host: h.name, member: 4096 + i, vote: 'voter', leader: i === 0 })),
-  volumes: FRESH ? [] : [{ name: 'web-root', volume: 1, size_mib: 2048, host: 'mock-a', writer: null, generation: 0,
-    readers: [] }],
-  next: 2,
+  /* A volume in each state of health NBS says beside the whole one: its
+   * chunks' counts by their replicas, as a fixture sets them */
+  volumes: FRESH ? [] : [
+    { name: 'web-root', volume: 1, size_mib: 2048, host: 'mock-a', writer: null, generation: 0, readers: [] },
+    { name: 'deg-vol', volume: 2, size_mib: 64, host: 'mock-a', writer: 'mock-a', generation: 1, readers: [],
+      counts: { chunks_at_two: 3 } },
+    { name: 'copy-vol', volume: 3, size_mib: 64, host: 'mock-a', writer: null, generation: 0, readers: [],
+      counts: { chunks_copying: 4 } },
+    { name: 'crit-vol', volume: 4, size_mib: 64, host: 'mock-a', writer: null, generation: 0, readers: [],
+      counts: { chunks_at_one: 2 } },
+    { name: 'lost-vol', volume: 5, size_mib: 64, host: 'mock-a', writer: 'mock-a', generation: 1, readers: [],
+      counts: { chunks_unreachable: 1 } },
+  ],
+  next: 6,
   /* Each host's chunk server's devices: one each, every slot of it the
    * cluster's */
   devices: cluster.hosts.map((h, i) => ({ host: h.name, device: i + 1, id: 'part:'
@@ -389,8 +408,17 @@ const nbsRoom = (more) => {
     throw new Refused('failed', 'not room for its chunks on three hosts');
   }
 };
+/** A volume's health as NBS says it (nbs-mds's `health_word`): the worst of
+ * its chunks' counts by their replicas. */
+const nbsHealth = (v) => {
+  const c = { chunks_at_two: 0, chunks_at_one: 0, chunks_unreachable: 0, chunks_copying: 0, chunks_unlike: 0,
+    ...(v.counts || {}) };
+  const health = c.chunks_unreachable || c.chunks_unlike ? 'failed' : c.chunks_at_one ? 'critical'
+    : c.chunks_at_two || c.chunks_copying ? 'degraded' : 'ok';
+  return { health, ...c };
+};
 const nbsJson = (v, replicas) => ({
-  name: v.name, volume: v.volume, kind: v.kind || 'volume',
+  name: v.name, volume: v.volume, kind: v.kind || 'volume', ...nbsHealth(v),
   origin: (nbs.volumes.find((o) => v.origin && o.volume === v.origin) || { name: null }).name,
   size: v.size_mib * MIB, chunks: nbsChunks(v.size_mib), host: v.host, writer: v.writer,
   generation: v.generation, readers: v.readers,
@@ -511,6 +539,10 @@ const reads = {
     v.ioAt = now;
     v.disks.forEach((d, i) => {
       const c = v.io[i];
+      const vol = String(d.file).startsWith('nbs:') ? nbs.volumes.find((x) => 'nbs:' + x.name === d.file) : null;
+      if (vol?.counts?.chunks_unreachable) {
+        c.errors += Math.max(1, Math.round(2 * secs));
+      }
       const wave = 1 + 0.6 * Math.sin(now / 9000 + i);
       const reads = Math.round((i === 0 ? 220 : 1) * wave * secs);
       const writes = d.read_only ? 0 : Math.round((i === 0 ? 70 : 0) * wave * secs);

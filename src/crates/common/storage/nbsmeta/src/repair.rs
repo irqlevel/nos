@@ -29,7 +29,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::place::tie;
-use crate::storage::{Cs, CsState, Replica, Set, REPLICAS};
+use crate::storage::{Cs, CsState, Replica, Set, Volume, REPLICAS};
 use crate::{Command, State};
 
 /// A cs silent this long is down: writes go on to its sets' other members.
@@ -246,6 +246,29 @@ pub struct Health {
     /// The cs's down, and out.
     pub down: u32,
     pub out: u32,
+}
+
+/// How far from three one volume's chunks are, as `health` counts a
+/// cluster's: its chunks by how many members of their set are active, and
+/// those being copied onto a joiner -- a chunk it shares with an image or a
+/// snapshot counted as its own. What the `nbs` provider says a volume's
+/// health by.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VolumeHealth {
+    pub by_active: [u64; REPLICAS + 1],
+    pub joining: u64,
+}
+
+pub fn volume_health(s: &State, v: &Volume) -> VolumeHealth {
+    let mut h = VolumeHealth::default();
+    for &c in v.map.iter() {
+        let Some(set) = s.chunks().get(c as usize).and_then(|ch| s.sets().get(ch.set as usize)) else { continue };
+        h.by_active[set.active()] += 1;
+        if set.joiner.is_some() {
+            h.joining += 1;
+        }
+    }
+    h
 }
 
 pub fn health(s: &State) -> Health {

@@ -23,7 +23,8 @@ sessions, the pages -- is here, in Linux; nos keeps its API alone.
   every page, nothing framed; a page with no session sent to the login.
 - Pages: the dashboard; every provider's page made of its descriptor alone
   (`ProviderView`: its resources as tables, their rows' actions, every
-  other method a form) -- a provider the panel has never heard of gets its
+  other method a form; an enum's value with the dot of its tone where the
+  descriptor gives its values `tones` -- docs/mgmt.md) -- a provider the panel has never heard of gets its
   pages the same way -- the cluster's and NBS's among them, from making
   each on a host of none to its hosts and devices; the VMs' own (a list, a
   create from a cloud image or an image of NBS's, onto a file, a device or
@@ -31,7 +32,9 @@ sessions, the pages -- is here, in Linux; nos keeps its API alone.
   and its snapshots listed, each a click from a VM of it -- its console in
   xterm.js, its vm.toml, its disks -- each one's IOPS and bandwidth, read and
   written, charted as the vm provider's `disk_io` is asked every two seconds,
-  a volume of NBS's as any disk -- and forwards); the images (NBS's images and
+  a volume of NBS's as any disk, its edge coloured by the worse of its I/O
+  -- red while it fails -- and what NBS says of the volume's replicas -- and
+  forwards); the images (NBS's images and
   snapshots, a new image of a URL); the jobs; the hosts; the settings.
   English and Russian.
 

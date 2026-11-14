@@ -80,6 +80,10 @@ line in the log saying where and why, if it does not hold:
   `values`), `bytes`, `duration_ns`, `duration_ms`, `time_s`, `ipv4`,
   `mac`, `port`, or a `list` `of` one of them -- a `title`, and optionally
   `help`, `unit`, `min` and `max` (numbers), `required` and a `default`;
+  an `enum` that says how a thing is may give its values `tones` -- each of
+  its own values one of `good`, `warn`, `alarm`, `bad` and `idle`
+  (`mgmtwire::descriptor::TONES`) -- which a client colours it by, green,
+  yellow, orange, red and grey: the nbs provider's volumes' `health`;
 - **every text a person reads** -- each `title`, `help`, `confirm` and
   enum value -- an object of exactly `en` and `ru`, neither empty;
 - **nothing the format does not have**: a misspelt member is refused rather

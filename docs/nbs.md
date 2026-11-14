@@ -119,7 +119,17 @@ The same is on the management bus as the `nbs` provider (`provider.rs`,
   devices: their ids, sizes and states), `volumes`, `volume` -- each volume
   with its `kind` (`volume`, `image` or `snapshot`) and its `origin`, the
   image or snapshot a clone was made of and the volume a snapshot was taken
-  of, by name while that is there;
+  of, by name while that is there; and its `health`, the worst of what its
+  chunks say (`nbsmeta::repair::volume_health`, as `nbs status` counts the
+  cluster's): `failed` where a chunk has no active replica, or the scrub
+  found its replicas unlike in a set as it still is -- known on the
+  leader's host alone, its newest findings alone -- `critical` where one has
+  a replica alone, `degraded` where one has two or is being copied onto a
+  joiner, else `ok`; with the counts behind it (`chunks_at_two`,
+  `chunks_at_one`, `chunks_unreachable`, `chunks_copying`, `chunks_unlike`).
+  The panel colours it by the tones the descriptor gives it -- yellow,
+  orange, red, green -- and a VM's disk on the volume by the worse of it
+  and the guest's I/O: red while its reads and writes fail;
 - to change: `volume_create`, `volume_delete`, `volume_resize`, and
   `volume_snapshot`, `volume_freeze`, `volume_clone` (N10d) -- a snapshot of
   an attached volume asked on its writer's host, as the command is;
@@ -1488,6 +1498,9 @@ only its metadata.
   - a commit through the majority;
   - the leader killed: the other two elect one of themselves and commit, and
     the killed host comes back from its log;
+  - a volume's health through the bus: `degraded` while a host's replicas
+    are down, each of its chunks at two, and `ok` once the host is back and
+    joined;
   - the leader cut off by the hub: the other two elect and commit while it
     commits nothing, then it follows once healed;
   - a host's folder removed: the leader says its state is gone, an add of it

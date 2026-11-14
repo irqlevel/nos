@@ -655,6 +655,46 @@ test('a VM\'s disks: each one\'s IOPS and bandwidth charted as it runs, a volume
   await expect(page.getByTestId('disk-io')).toContainText('Не работает');
 });
 
+test('NBS\'s volumes: each one\'s health, coloured as its descriptor tones it', async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/p/nbs`);
+  const volumes = page.getByTestId('resource-volumes');
+  const row = (name: string) => volumes.getByRole('row', { name: new RegExp(`^\\s*${name}\\s`) });
+  for (const [name, tone] of [['web-root', 'good'], ['deg-vol', 'warn'], ['copy-vol', 'warn'], ['crit-vol', 'alarm'],
+    ['lost-vol', 'bad']]) {
+    await expect(row(name!).locator('[data-tone]')).toHaveAttribute('data-tone', tone!);
+  }
+  await expect(row('crit-vol')).toContainText('one replica left');
+  await page.goto(`/ru/h/${host}/p/nbs`);
+  await expect(row('lost-vol')).toContainText('недоступен или реплики разные');
+  await expect(row('web-root')).toContainText('в норме');
+});
+
+test('a VM\'s disk coloured as it is: its volume\'s health, and red while its I/O fails', async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/vms/web`);
+  await page.getByRole('tab', { name: 'Disks' }).click();
+  const file = page.getByTestId('disk-io-disk.raw');
+  await expect(file).toHaveAttribute('data-tone', 'good', { timeout: 15_000 });
+  await expect(file.getByTestId('disk-health')).toContainText('no I/O errors');
+
+  /* A replica down: yellow, the counts behind it said */
+  await page.goto(`/en/h/${host}/vms/store`);
+  await page.getByRole('tab', { name: 'Disks' }).click();
+  const deg = page.getByTestId('disk-io-nbs:deg-vol');
+  await expect(deg).toHaveAttribute('data-tone', 'warn', { timeout: 15_000 });
+  await expect(deg.getByTestId('disk-health')).toContainText('a replica down or copying');
+  await expect(deg.getByTestId('disk-health')).toContainText('Chunks at two replicas: 3');
+
+  /* A chunk unreachable, its guest's I/O failing: red */
+  await page.goto(`/en/h/${host}/vms/broken`);
+  await page.getByRole('tab', { name: 'Disks' }).click();
+  const lost = page.getByTestId('disk-io-nbs:lost-vol');
+  await expect(lost).toHaveAttribute('data-tone', 'bad', { timeout: 15_000 });
+  await expect(lost.getByTestId('disk-health')).toContainText('I/O errors in the last minute', { timeout: 15_000 });
+  await expect(lost.getByTestId('disk-health')).toContainText('Chunks unreachable: 1');
+});
+
 test('the theme switches, and the language', async ({ page }) => {
   const host = await login(page);
   const dark = await page.evaluate(() => document.documentElement.classList.contains('dark'));

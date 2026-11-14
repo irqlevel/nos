@@ -9,7 +9,8 @@ export const CLOUD_IMAGES = [
 /** A volume of NBS's as the nbs provider's `volumes` lists it. */
 export interface NbsVolume {
   name: string; kind: 'volume' | 'image' | 'snapshot'; size: number; origin: string | null; writer: string | null;
-  host: string;
+  host: string; health?: string; chunks_at_two?: number; chunks_at_one?: number; chunks_unreachable?: number;
+  chunks_copying?: number; chunks_unlike?: number;
 }
 
 /** A volume's name, as NBS takes one: an image's, a snapshot's, a clone's. */

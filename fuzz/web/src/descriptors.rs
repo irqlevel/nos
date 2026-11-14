@@ -21,7 +21,7 @@ const BASE: &str = r#"{"schema": 1, "provider": "demo",
   "make": {"kind": "action", "title": {"en": "Make", "ru": "Создать"}, "confirm": {"en": "Sure?", "ru": "Точно?"}, "confirm_typed": "label",
     "params": {"label": {"type": "string", "required": true, "title": {"en": "Label", "ru": "Метка"}},
                "size": {"type": "bytes", "min": 1, "max": 100, "unit": "B", "default": 10, "title": {"en": "Size", "ru": "Размер"}},
-               "mode": {"type": "enum", "title": {"en": "Mode", "ru": "Режим"}, "values": {"a": {"en": "A", "ru": "А"}}},
+               "mode": {"type": "enum", "title": {"en": "Mode", "ru": "Режим"}, "values": {"a": {"en": "A", "ru": "А"}, "b": {"en": "B", "ru": "Б"}}, "tones": {"a": "good", "b": "bad"}},
                "tags": {"type": "list", "of": "string", "title": {"en": "Tags", "ru": "Метки"}}}},
   "drop": {"kind": "job", "title": {"en": "Drop", "ru": "Удалить"}}
  },
@@ -40,7 +40,7 @@ const METHODS: [(&str, &str); 4] = [("list", "read"), ("get", "read"), ("make", 
 
 /// Each defect, as what in BASE becomes what: the descriptor it makes must
 /// be refused.
-const DEFECTS: [(&str, &str, &str); 35] = [
+const DEFECTS: [(&str, &str, &str); 39] = [
     ("another schema", r#""schema": 1"#, r#""schema": 2"#),
     ("a text without a language", r#""title": {"en": "Demo", "ru": "Демо"}"#, r#""title": {"en": "Demo"}"#),
     ("a text in a language more", r#""title": {"en": "Demo", "ru": "Демо"}"#, r#""title": {"en": "Demo", "ru": "Демо", "de": "Demo"}"#),
@@ -55,7 +55,11 @@ const DEFECTS: [(&str, &str, &str); 35] = [
     ("a member the format does not have", r#""schema": 1,"#, r#""schema": 1, "extra": 1,"#),
     ("a method's member the format does not have", r#""drop": {"kind": "job""#, r#""drop": {"role": "admin", "kind": "job""#),
     ("a type the format does not have", r#""type": "bytes", "min": 1"#, r#""type": "float", "min": 1"#),
-    ("an enum without its values", r#", "values": {"a": {"en": "A", "ru": "А"}}"#, ""),
+    ("an enum without its values", r#", "values": {"a": {"en": "A", "ru": "А"}, "b": {"en": "B", "ru": "Б"}}"#, ""),
+    ("a tone of a value there is not", r#""tones": {"a": "good", "b": "bad"}"#, r#""tones": {"a": "good", "c": "bad"}"#),
+    ("a tone the format does not have", r#""tones": {"a": "good", "b": "bad"}"#, r#""tones": {"a": "good", "b": "red"}"#),
+    ("tones that are no object", r#""tones": {"a": "good", "b": "bad"}"#, r#""tones": ["good", "bad"]"#),
+    ("tones for what is no enum", r#""type": "list", "of": "string""#, r#""type": "list", "of": "string", "tones": {"a": "good"}"#),
     ("values for what is no enum", r#""type": "list", "of": "string""#, r#""type": "list", "of": "string", "values": {"a": {"en": "A", "ru": "А"}}"#),
     ("a list of nothing said", r#", "of": "string""#, ""),
     ("a list of lists", r#""of": "string""#, r#""of": "list""#),

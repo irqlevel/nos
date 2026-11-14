@@ -17,7 +17,9 @@ type Tab = (typeof TABS)[number];
 
 /** A VM's page: what it is and how it runs, its actions; its console; its
  * vm.toml; its disks; its forwards. */
-export function VmView({ host, name, d, locale, w }: { host: string; name: string; d: Descriptor; locale: Locale; w: Words }) {
+export function VmView({ host, name, d, nbs = null, locale, w }: {
+  host: string; name: string; d: Descriptor; nbs?: Descriptor | null; locale: Locale; w: Words;
+}) {
   const [tab, setTab] = useState<Tab>('overview');
   const [got, setGot] = useState<Record<string, unknown> | null>(null);
   const [error, setError] = useState('');
@@ -102,7 +104,7 @@ export function VmView({ host, name, d, locale, w }: { host: string; name: strin
 
       {tab === 'disks' && (
         <div className="space-y-4">
-          {d.methods.disk_io && <DiskIo host={host} name={name} locale={locale} w={w} />}
+          {d.methods.disk_io && <DiskIo host={host} name={name} nbs={nbs} locale={locale} w={w} />}
           <DiskList host={host} name={name} locale={locale} d={d} w={w} />
           {(['disk_add', 'disk_attach', 'disk_detach'] as const).map((m) => d.methods[m] && (
             <div key={m} className="rounded-xl border border-line bg-card p-4">
