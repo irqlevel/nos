@@ -1,6 +1,6 @@
 // /api/hosts: the hosts the panel manages.
 //
-//   GET     each, and whether the panel reaches it now
+//   GET     each, whether the panel reaches it now, and the nos it runs
 //   POST    {name, url, pin}: one added -- its key pinned as given
 //   DELETE  ?id=<id>: one taken away, its history with it
 
@@ -17,7 +17,7 @@ export async function GET(req: Request) {
     panel_key: fingerprint(),
     hosts: hosts().map((h) => {
       const hb = hub(h.id);
-      return { ...h, online: hb?.online ?? false, why: hb?.why || null };
+      return { ...h, online: hb?.online ?? false, why: hb?.why || null, nos: hb?.nos ?? null };
     }),
   });
 }
