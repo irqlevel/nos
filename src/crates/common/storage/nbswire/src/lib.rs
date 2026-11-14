@@ -79,7 +79,11 @@ pub enum Op<'a> {
     /// `data` written at `offset` in the chunk, at map place `position` of
     /// the volume, as the metadata had it at entry `index`.
     Write { chunk: ChunkRef, position: u32, index: u64, offset: u32, data: &'a [u8] },
-    Read { chunk: ChunkRef, position: u32, index: u64, offset: u32, len: u32 },
+    /// `as_of`: a read-only session's -- the generation a writer would have
+    /// been given as it attached (`Said::Attached`); a fence there or past
+    /// it is a writer's attached since, and the read is refused as fenced.
+    /// 0 for a writer's, whose generation the request carries.
+    Read { chunk: ChunkRef, position: u32, index: u64, offset: u32, len: u32, as_of: u64 },
     /// Everything written so far durable.
     Flush,
     /// The chunk closed: every replica of it flushed.
@@ -171,8 +175,10 @@ pub enum Reply<'a> {
     /// A set's chunks the source holds (N9): number, incarnation, volume,
     /// the version each was last written at.
     Chunks(Vec<(u32, u32, u32, u32)>),
-    /// A sum of each granule asked.
-    Sums(Vec<u32>),
+    /// A sum of each granule asked, and the generation the source's record
+    /// of the chunk is open at, if it is: what the joiner keeps open too
+    /// (`Store::close_copy`).
+    Sums { sums: Vec<u32>, open: Option<u64> },
     /// What the scrub asked of a chunk: whether its record is open, the
     /// version it was last written at, and a sum of each granule.
     Scrub { open: bool, written: u32, sums: Vec<u32> },
@@ -465,13 +471,14 @@ impl Request<'_> {
                 w.u32(data.len() as u32);
                 w.fixed(data);
             }
-            Op::Read { chunk, position, index, offset, len } => {
+            Op::Read { chunk, position, index, offset, len, as_of } => {
                 w.u8(3);
                 chunk_ref(w, chunk);
                 w.u32(*position);
                 w.u64(*index);
                 w.u32(*offset);
                 w.u32(*len);
+                w.u64(*as_of);
             }
             Op::Flush => w.u8(4),
             Op::Close { chunk, position, index } => {
@@ -573,11 +580,11 @@ impl<'a> Request<'a> {
             }
             3 => {
                 let chunk = read_chunk_ref(r)?;
-                let (position, index, offset, len) = (r.u32()?, r.u64()?, r.u32()?, r.u32()?);
+                let (position, index, offset, len, as_of) = (r.u32()?, r.u64()?, r.u32()?, r.u32()?, r.u64()?);
                 if len > DATA_MAX {
                     return None;
                 }
-                Op::Read { chunk, position, index, offset, len }
+                Op::Read { chunk, position, index, offset, len, as_of }
             }
             4 => Op::Flush,
             5 => Op::Close { chunk: read_chunk_ref(r)?, position: r.u32()?, index: r.u64()? },
@@ -718,7 +725,7 @@ impl Answer<'_> {
             Reply::Data(d) => d.len(),
             Reply::Held(list) => list.len() * 16,
             Reply::Chunks(list) => list.len() * 16,
-            Reply::Sums(sums) => sums.len() * 4,
+            Reply::Sums { sums, .. } => sums.len() * 4,
             Reply::Scrub { sums, .. } => sums.len() * 4,
             _ => 0,
         };
@@ -769,11 +776,18 @@ impl Answer<'_> {
                     w.u32(at);
                 }
             }
-            Reply::Sums(sums) => {
+            Reply::Sums { sums, open } => {
                 w.u8(8);
                 w.u32(sums.len() as u32);
                 for &s in sums {
                     w.u32(s);
+                }
+                match open {
+                    None => w.u8(0),
+                    Some(g) => {
+                        w.u8(1);
+                        w.u64(*g);
+                    }
                 }
             }
             Reply::Scrub { open, written, sums } => {
@@ -842,7 +856,12 @@ impl<'a> Answer<'a> {
                 for _ in 0..n {
                     sums.push(r.u32()?);
                 }
-                Reply::Sums(sums)
+                let open = match r.u8()? {
+                    0 => None,
+                    1 => Some(r.u64()?),
+                    _ => return None,
+                };
+                Reply::Sums { sums, open }
             }
             9 => {
                 let open = match r.u8()? {
@@ -1243,9 +1262,10 @@ pub struct Asking {
 /// What a client is told.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Said {
-    /// Attached: the generation -- 0 read-only -- and the entry it was
-    /// applied at; `first`: the volume's first attach for writing, made
-    /// empty, no clone -- everything of it reads as zeros.
+    /// Attached: the generation -- a reader's, the generation a writer
+    /// would be given next, which its reads carry as `as_of` -- and the
+    /// entry it was applied at; `first`: the volume's first attach for
+    /// writing, made empty, no clone -- everything of it reads as zeros.
     Attached { generation: u64, index: u64, first: bool },
     /// Let go of, at entry `index`.
     Detached { index: u64 },
