@@ -6,7 +6,7 @@
 //! nothing, and every device the table counts answers to the name it is
 //! registered under with the handle the walk gave.
 //!
-//! The partition readers are judged by `scripts/parttest.py`, which boots
+//! The partition readers are judged by `tests/parttest.py`, which boots
 //! with tables it writes itself; a self-test cannot, because a boot has only
 //! the disks it was given.
 

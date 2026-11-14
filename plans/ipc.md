@@ -356,12 +356,12 @@ What TCP has to get first is a plan of its own, [tcp.md](tcp.md):
 **I1, the channel in the image** -- done on branch `ipc-raft`
 (docs/ipc.md). The `ipc` crate, the ABI and `kcore::ipc`; the `ipc` command
 and kernel.echo; the selftest and `test_module_ipc`. Its tracepoints and its
-provider on the bus wait for I4, where there are hosts to show. `fuzz/ipc` (host, in CI): the crate as it is, over the
-fuzzers' common machine (`fuzz/common/`, tasks one at a time, the lock rules
+provider on the bus wait for I4, where there are hosts to show. `tests/fuzz/ipc` (host, in CI): the crate as it is, over the
+fuzzers' common machine (`tests/fuzz/common/`, tasks one at a time, the lock rules
 checked), held to a model -- every message sent `Ok` received once, in order,
 unless its mailbox closed first; every monitor firing exactly once; names
 unique; the pool back to empty when every mailbox has closed, and never past
-its caps. Gates: the smoke boots on both arches, UB builds too; `fuzz/ipc`;
+its caps. Gates: the smoke boots on both arches, UB builds too; `tests/fuzz/ipc`;
 `sshd-test.py` (the ffi digest); `cpp-fuzz.py --target module`.
 
 **I2, one event to wait on.** A mailbox, a `DiskQueue` and an `ImageQueue`
@@ -486,7 +486,7 @@ module's source against hosts with the right key, a stranger's and none,
 breaking the wire and TLS -- held to no delivery to a `Host` name from
 outside, nothing delivered twice or after its `Down`, memory bounded);
 `ipc-test.py` (both arches), the first user of a harness NBS reuses:
-`scripts/hub.py`, a learning Ethernet switch over QEMU's UDP socket netdevs
+`tests/hub.py`, a learning Ethernet switch over QEMU's UDP socket netdevs
 that drops, delays and cuts, and two or three nos on it. It checks keys
 pinned both ways; a stranger's SYNs dropped with no slot taken, and the
 other services still answering; a stranger with an address on the list
@@ -554,7 +554,7 @@ pieces, in the order they are to be built and gated:
   connections alone -- two connections a peer, the `Hello`, heartbeats and
   the 3 s loss, `Bounced`, the shell's `ipc host` commands and `ipc hosts`.
 - **Its gates**: net-fuzz's `ipcnet` target and `ipc-test.py` on
-  `scripts/hub.py`, as the step says.
+  `tests/hub.py`, as the step says.
 
 Confirmed by the user (2026-11-05). Written on branch `ipc-raft`: the wire
 (`ipcwire`, fuzzed by `ipc-fuzz.py --target wire`), and the channel's side
@@ -573,7 +573,7 @@ a module's heap gives 512 KiB at once, and the router is handed messages of
 a megabyte -- and `deliver_remote`'s payload in pieces; a router's close no
 longer heard by itself, which the fuzz model found. `ipcwire`'s Hello
 carries the session, its assembler a bound on its pieces. `ipc-test.py` on
-`scripts/hub.py`'s LAN passes on arm64 under HVF; what it found was the
+`tests/hub.py`'s LAN passes on arm64 under HVF; what it found was the
 sender's own, two messages of one pair begun at once and delivered out of
 order, which it now never does. The links' polling is gone
 too: TCP's receive waits on an event of its connection's, which the

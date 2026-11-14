@@ -313,7 +313,7 @@ RUST_LIB = $(RUST_LIB_$(ARCH))
 # Cargo works out what to recompile, but make has to know when to call it at
 # all: without these prerequisites the $(RUST_LIB) rule never re-runs once the
 # archive exists, and a plain `make` after editing Rust silently links the
-# stale staticlib.  Hence `make rust && make nocheck` in scripts/smoke-test.sh.
+# stale staticlib.  Hence `make rust && make nocheck` in tests/smoke-test.sh.
 # Every file of a crate's src/ is one, not its .rs alone: what a crate takes
 # in whole as it compiles (include_str!, a provider's descriptor) is a
 # source too -- a descriptor changed alone rebuilt nothing, and hv.ko went on
@@ -344,8 +344,9 @@ endif
 # cppcheck over the C++; the Rust workspace's layout held to its rules
 # (scripts/check-crates.py: a crate in an area's directory and a member; one
 # under common/ with no kernel in it and its unsafe forbidden); and every
-# link the site and the documents make into the tree held to naming
-# something there (scripts/check-links.py); and every spelling of a function
+# link the site and the documents make into the tree, and every path to a
+# gate, a tool or a fuzzer the tree names, held to naming something there
+# (scripts/check-links.py); and every spelling of a function
 # that crosses a language or a crate -- its ffi declaration, its definition in
 # Rust or C++, a C++ declaration of a Rust export, a fuzzer's stand-in --
 # held to one signature (scripts/check-ffi.py).
@@ -668,7 +669,7 @@ $(IMAGE): $(KERNEL) $(MODULE_KO) $(HVBOOT) build/image/nos.cfg build/image/rc sc
 	mv $@.tmp $@
 
 smoke:
-	./scripts/smoke-test.sh
+	./tests/smoke-test.sh
 
 # The link is three-pass. Pass 1 is what the module export table is made
 # from. Pass 2 is the final link without the symbol table -- the export table

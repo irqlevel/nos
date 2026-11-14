@@ -36,7 +36,7 @@ A filesystem driver and its test usually share a parser. Then they agree with ea
 
 **The driver** ([src/crates/layers/fs/src/ext4](https://github.com/irqlevel/nos/tree/master/src/crates/layers/fs/src/ext4)) is the kernel's side: 5,139 lines in 14 files, also with no `unsafe`. It mounts, reads through `extfmt`, and writes through its journal.
 
-**The judge** is the fuzzer's own ext4: a mkfs, a checker, a JBD2 replay and an orphan release, written separately in [fuzz/fs/src/image/ext4](https://github.com/irqlevel/nos/tree/master/fuzz/fs/src/image/ext4). `fs-fuzz.py` checks that no judge names `extfmt` before it runs anything. The judge is held to e2fsprogs in turn: `fs-fuzz.py --e2fsck` has e2fsck check the judge's images and its verdicts on damaged ones, and compares the judge's replay with e2fsck's, byte for byte.
+**The judge** is the fuzzer's own ext4: a mkfs, a checker, a JBD2 replay and an orphan release, written separately in [tests/fuzz/fs/src/image/ext4](https://github.com/irqlevel/nos/tree/master/tests/fuzz/fs/src/image/ext4). `fs-fuzz.py` checks that no judge names `extfmt` before it runs anything. The judge is held to e2fsprogs in turn: `fs-fuzz.py --e2fsck` has e2fsck check the judge's images and its verdicts on damaged ones, and compares the judge's replay with e2fsck's, byte for byte.
 
 ## Reading first
 
@@ -125,7 +125,7 @@ The rest, in brief:
 - **An abort was the journal's alone.** The device went on taking writes, the next transaction of a call of several among them. Now the device refuses them.
 - **Some walks kept a list of every node to visit,** which passes 512 KiB at 65,537 of them. They now walk the tree by its own links.
 
-The 917,504 bytes and the 65,537 nodes have the same cause as the 520 KiB: the fuzzers' allocator never said no. So now it does. [fuzz/common/machine/heap.rs](https://github.com/irqlevel/nos/blob/master/fuzz/common/machine/heap.rs) refuses every allocation of the kernel's code past 128 pages, exactly as `kernel_alloc` would, and prints the backtrace of what asked. The fuzzer's own big allocations — its models, images and judges — are marked as its own and let through. Every fix has a control that fails on the code before it:
+The 917,504 bytes and the 65,537 nodes have the same cause as the 520 KiB: the fuzzers' allocator never said no. So now it does. [tests/fuzz/common/machine/heap.rs](https://github.com/irqlevel/nos/blob/master/tests/fuzz/common/machine/heap.rs) refuses every allocation of the kernel's code past 128 pages, exactly as `kernel_alloc` would, and prints the backtrace of what asked. The fuzzer's own big allocations — its models, images and judges — are marked as its own and let through. Every fix has a control that fails on the code before it:
 
 - `extfmt-test.py` now plans a log of 9000 transactions and allows no allocation past 512 KiB; the old planner asks for 917,504 bytes.
 - The new `ext4sys` target mounts for writing over a file whose extent names an inode table, the descriptors or the journal's log. It tries a write, a read, a cut, a remove and a disk's image of that file, and every one must be refused, with those blocks unchanged at the unmount. On the old driver, the very first input's write goes into the inode table.

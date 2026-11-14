@@ -1,7 +1,7 @@
 //! The controller (plans/nbs.md, "How three are kept"; N9): what the leader
 //! proposes to keep every set at three active members, from the committed
 //! state and what the leader sees of each cs -- a pure function of the two,
-//! the same in nbs-mds as in fuzz/nbs, so that the fuzzer holds the leader's
+//! the same in nbs-mds as in tests/fuzz/nbs, so that the fuzzer holds the leader's
 //! plans to their rules. It keeps no plan of its own between turns: each is
 //! made from the state as it is, so a new leader goes on where the old one
 //! was and nothing heard twice or missed once misleads it; and a join made
@@ -136,7 +136,7 @@ pub fn plan(s: &State, seen: &[Seen], joining: &[Joining], after: After) -> Vec<
     }
     /* A cs's change changes its sets and what a join of them may be: the
        joins wait for the next turn, planned on the state it leaves (found
-       by fuzz/nbs's meta target: a join planned in the same turn as its
+       by tests/fuzz/nbs's meta target: a join planned in the same turn as its
        cs's coming back was refused as in place); and a join given up
        frees its set for the next */
     if !out.is_empty() {

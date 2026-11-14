@@ -140,7 +140,7 @@ pub enum Command {
     /// asked again and late, is given a new chunk, which can be the number
     /// freed; an end of the old one's then would have the map name a chunk
     /// nobody copied into, zeros where the volume had data (found by
-    /// fuzz/nbs's cluster target, N13c).
+    /// tests/fuzz/nbs's cluster target, N13c).
     CopyDone { name: String, place: u32, generation: u64, chunk: u32, incarnation: u32 },
 }
 

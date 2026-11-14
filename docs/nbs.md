@@ -402,7 +402,7 @@ task, whose mds tells it its joins (`Question::Joins`) with its devices.
   active member, its writer's next request there fails as the last replica
   refused (`LOST_LAST`), and the next writer's start reconciles it. Refused,
   they keep the mark too: a pull's moving the epoch on writes the chunk's
-  record, which would take it off. (Both found by fuzz/nbs's cluster
+  record, which would take it off. (Both found by tests/fuzz/nbs's cluster
   target, N9d: a joiner copied from such a replica, and a pull from one had
   taken the mark off.)
 - **The marks**: what clients write to the set from the join on is marked,
@@ -463,7 +463,7 @@ task, whose mds tells it its joins (`Question::Joins`) with its devices.
   replicas may differ, and the mark is what has the next writer's reconcile
   make them the same: closed by the copy, the source taken out later took
   the last mark with it, and two active replicas stayed apart for good
-  (found by fuzz/nbs's cluster target at seed 14649, past the gate's range,
+  (found by tests/fuzz/nbs's cluster target at seed 14649, past the gate's range,
   after the review of 2026-11 -- its question 5). So that the writer's own
   close comes to the joiner too, a close is held to its epoch as a write
   is: one by a view older than the chunk's -- the copy has moved it on -- is
@@ -656,7 +656,7 @@ again.
 `nbs-cs.ko` is a host's cs: one task, `nbs/cs`, that holds the host's devices
 and serves `nbs.cs`, a `Cluster` name, to NBS's clients on any host of the
 registry. What it does to its devices is `nbscs`
-(`src/crates/common/storage/nbscs`, no kernel in it), which `fuzz/nbs` runs
+(`src/crates/common/storage/nbscs`, no kernel in it), which `tests/fuzz/nbs` runs
 over disks that lose power. What a client says to a cs, and a cs to its mds,
 is `nbswire` (`src/crates/common/storage/nbswire`).
 
@@ -802,7 +802,7 @@ then       the slots, 4 MiB each: the chunks' data
   marked by that join, and its copy may have put the source's data over it
   -- the write that comes again then, sent again because it is not done,
   is written again and marked (`Store::joins_begun`, counted as the write
-  is marked: found by fuzz/nbs's cluster target, N13, where a member taken
+  is marked: found by tests/fuzz/nbs's cluster target, N13, where a member taken
   out and back answered as done a write its copy had undone). A write that
   comes late from before the join is refused by the epoch, as any is.
 - **A chunk's requests end in the order they came** (N12c), each from its
@@ -874,7 +874,7 @@ What the mds vouched for is kept, up to 65536 of them, and taken only for a
 chunk the cs holds (N10c), whose record refuses an epoch older than its own
 even so. One the cs does not hold -- never written, or freed since -- is
 asked about every time: nothing here refuses its epoch but the mds (found by
-fuzz/nbs's cluster target: a read of a chunk never written, vouched for at
+tests/fuzz/nbs's cluster target: a read of a chunk never written, vouched for at
 a set's version, kept; the set joined; the writer's first write of it, by
 its view of before, taken as vouched for, and the joiner never written). A
 copy-up's copy it
@@ -889,7 +889,7 @@ Every 30 s the cs asks its mds which of the chunks it holds are gone --
 freed, their number another chunk's now, or of a set the cs is neither a
 member nor the joiner of any more, a member replaced by another's join --
 and gives their slots back, and which of the volumes it fences are gone,
-and takes their fences off (nbswire's `collect`, which fuzz/nbs's cluster
+and takes their fences off (nbswire's `collect`, which tests/fuzz/nbs's cluster
 target's cs's run too). A page of 4,096 chunks at a time; a chunk freed only
 at the epoch it was listed at -- one a copy or a client has taken at a newer
 epoch since, the cs made the set's joiner meanwhile, is kept. And sooner
@@ -908,7 +908,7 @@ A volume is used through a session of it (`nbsclient::Session`): a state
 machine that is handed what comes -- its host's mds's answers, the cs's --
 and the time, and says what to send and which of its driver's operations
 are done. No kernel is in it; `nbsdrive::Drive` drives it over a mailbox of
-its own in the kernel, and fuzz/nbs's `cluster` target over a network of
+its own in the kernel, and tests/fuzz/nbs's `cluster` target over a network of
 its own.
 
 A session's life:
@@ -1021,7 +1021,7 @@ What it holds to (plans/nbs.md, "Replication: the rules"):
   comes again, along the chain after the direct one or the other way, is
   answered as done, not written again -- it could come after the session's
   next write of the same blocks and put the older data back (found by
-  fuzz/nbs's cluster target at once) -- and so does every other send of a
+  tests/fuzz/nbs's cluster target at once) -- and so does every other send of a
   write of a session that chains, to one replica again after a refusal or
   to each where its chain could not be had: sent without its mark, a late
   copy by another way than a newer write of its blocks put older data over
@@ -1267,7 +1267,7 @@ only its metadata.
 
 ## Tested
 
-- **`scripts/nbs-fuzz.py`** (host, in CI; [testing.md](testing.md)): `fuzz/nbs`'s
+- **`tests/nbs-fuzz.py`** (host, in CI; [testing.md](testing.md)): `tests/fuzz/nbs`'s
   `meta` target, the state against a model of its own:
   - every command's answer and everything the state shows held to the
     model's, the placement to the model's own; among the commands, cs's
@@ -1447,7 +1447,7 @@ only its metadata.
   copy's and the scrub's; sixty-four of the client's -- each caught but
   three: some only at the cluster seeds the gate runs past its range
   (`GATE_CLUSTER_ALSO`), their races moved past the range's by a change of
-  the target's course. The three are known gaps (`fuzz/nbs/mutants.py`'s
+  the target's course. The three are known gaps (`tests/fuzz/nbs/mutants.py`'s
   `KNOWN_GAPS`): rules of the client's whose races no campaign has found a
   seed of, past fifteen thousand each, said as gaps until a seed or a
   scenario holds them -- an attach anew mending the places of the writes it
@@ -1459,10 +1459,10 @@ only its metadata.
   gaps before, are caught: the first at the gate's own seeds, the second by
   the end holding what was asked of a writer right before its stop, every
   host up, to be done.
-- **`fuzz/raft`'s `nbsmeta` target**: the members' part of the state, its
+- **`tests/fuzz/raft`'s `nbsmeta` target**: the members' part of the state, its
   commands from pools of names and incarnations that meet and from wide ones
   that fill the cluster. There are four scenarios and six mutants.
-- **`scripts/nbs-test.py`** (three nos on `scripts/hub.py`'s LAN, after the
+- **`tests/nbs-test.py`** (three nos on `tests/hub.py`'s LAN, after the
   cluster registry is made among them, and a fourth booted late; every
   nbs-mds with `out_after=10`, the least it takes, and `scrub=1`). It
   covers:
@@ -1536,7 +1536,7 @@ only its metadata.
     history; at the end, a chunk written and found alike, the volumes'
     others held by none, and no finding of now;
   - nothing panicked.
-- **`scripts/hv-nbs-test.py`** (x86-64, manual: a guest kernel and an
+- **`tests/hv-nbs-test.py`** (x86-64, manual: a guest kernel and an
   initrd): Linux guests of hv's on volumes -- an image poured with `hv
   convert` read by a guest on another host; a guest's writes read back past
   its page cache, and by a guest on another host after it stops; a start

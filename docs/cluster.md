@@ -298,7 +298,7 @@ asks, and the typed name is the admin's word that they are gone.
 
 ## Tested
 
-- **`fuzz/raft`'s `registry` target** (docs/testing.md): the state machine
+- **`tests/fuzz/raft`'s `registry` target** (docs/testing.md): the state machine
   against a model of its own, alone and as a group through `raft::rsm` over
   a lossy network, with scenarios and six mutants.
 - **net-fuzz's `ipcnet` target**: the control mailbox's requests among its
@@ -310,8 +310,8 @@ asks, and the typed name is the admin's word that they are gone.
   monitor of its taken. Four bugs planted in ipcnet each fail it: a message
   delivered past the restriction, a monitor taken, a restriction lifted by
   dropping the peer, a peer made anew.
-- **`scripts/cluster-test.py`** (both arches, three nos on
-  `scripts/hub.py`'s LAN): a cluster made on one host; two invited and
+- **`tests/cluster-test.py`** (both arches, three nos on
+  `tests/hub.py`'s LAN): a cluster made on one host; two invited and
   joined, one through a member that does not lead, after a join with a wrong
   secret refused, and while invited its pings to a member's echo refused;
   the provider answering through the bus; maintenance and an address seen

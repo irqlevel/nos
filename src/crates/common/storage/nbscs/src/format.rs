@@ -333,7 +333,7 @@ impl Record {
         /* A chunk's record names one, and its volume; a free one, none. Its
            generation is 0 where a join's copy took the chunk in and no
            writer has written it since (N9): found as bad, every chunk of a
-           copy's was lost at the cs's next start (found by fuzz/nbs's join
+           copy's was lost at the cs's next start (found by tests/fuzz/nbs's join
            target) */
         let holds = state != SlotState::Free;
         if holds == (r.incarnation == 0) || (holds && r.volume == 0) {
@@ -357,7 +357,7 @@ pub fn choose<T: Copy>(a: Decoded<T>, b: Decoded<T>, seq: impl Fn(&T) -> u64) ->
         (Decoded::Empty, Decoded::Empty) => Some(Decoded::Empty),
         /* The record's first write, cut in copy A: B is written only once A
            is durable, so it was never written -- the record never was.
-           (Taken for lost before; found by fuzz/nbs's cs target) */
+           (Taken for lost before; found by tests/fuzz/nbs's cs target) */
         (Decoded::Bad, Decoded::Empty) => Some(Decoded::Empty),
         /* Copy A never written, B neither good nor zeros: no tear of ours */
         _ => None,

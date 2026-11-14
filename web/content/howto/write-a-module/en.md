@@ -254,9 +254,9 @@ Backtraces name the frames in a module's code the same way as the kernel's own, 
 ## Test it
 
 - **Every boot tests the loader.** On both architectures, the boot self-test loads `modtest`, a module embedded in the kernel image. It then feeds the loader damaged copies of it: truncated, built for another machine, with an import the kernel lacks, with no header, with a bad magic number, and built for another kernel interface. So the smoke boots cover the loader too ([Run the gates](/howto/run-the-gates)).
-- **After changing the loader or the `ffi` declarations,** run `scripts/sshd-test.py`.
+- **After changing the loader or the `ffi` declarations,** run `tests/sshd-test.py`.
 - **To run under the undefined-behaviour checks,** build with `make nocheck RUSTUB=1`. This rebuilds the modules with overflow checks and with `core`'s checks of its unsafe preconditions turned on. The first violation then becomes a panic that names where it happened.
-- **Test your own module** by hand. If it can fail in a way that looks like success, give it a gate of its own: `netload`, for example, has `scripts/netload-test.py`.
+- **Test your own module** by hand. If it can fail in a way that looks like success, give it a gate of its own: `netload`, for example, has `tests/netload-test.py`.
 
 ## Troubleshooting
 

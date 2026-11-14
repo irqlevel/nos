@@ -39,9 +39,9 @@ jobs:
       - name: Boot smoke test (${{ matrix.arch }}, TCG)
         run: |
           if [ "${{ matrix.arch }}" = "x86_64" ]; then
-            ./scripts/smoke-test.sh --skip-build
+            ./tests/smoke-test.sh --skip-build
           else
-            ./scripts/smoke-arm64.sh --skip-build
+            ./tests/smoke-arm64.sh --skip-build
           fi
 
       # What a release's system image does on a server (docs/install.md):
@@ -55,7 +55,7 @@ jobs:
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           make image
-          python3 scripts/image-test.py
+          python3 tests/image-test.py
 
       # The hypervisor's MMIO decoder turns a guest's bytes into the access
       # it performs for it, and a wrong decode looks like success: checked
@@ -64,7 +64,7 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          python3 scripts/insn-test.py
+          python3 tests/insn-test.py
 
       # A guest decides every value the hypervisor's devices and run loop are
       # handed, and a panic, an overflow or a spin there is the host's: the
@@ -73,7 +73,7 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          python3 scripts/hv-fuzz.py
+          python3 tests/hv-fuzz.py
 
       # What hvboot boots off a guest's disk is the disk's to say -- its
       # partitions, its filesystem, its grub.cfg -- and the wrong entry, or a
@@ -84,7 +84,7 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          python3 scripts/hvboot-test.py
+          python3 tests/hvboot-test.py
 
       # The ext2/3/4 format hvboot reads through, and the kernel's ext4
       # driver is to: a checksum computed wrong is a filesystem the driver
@@ -98,7 +98,7 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          python3 scripts/extfmt-test.py
+          python3 tests/extfmt-test.py
 
       # One crate computes every CRC the formats are checked by -- GPT's,
       # the disk log's, ext4's, raft's log's -- for the kernel,
@@ -109,7 +109,7 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          python3 scripts/crc-test.py
+          python3 tests/crc-test.py
 
       # A cloud's image is a download, and `hv convert` reads it in the
       # kernel: a cluster read wrong is a guest's disk with the wrong bytes
@@ -119,7 +119,7 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          python3 scripts/diskimage-test.py
+          python3 tests/diskimage-test.py
 
       # The editor runs in the kernel on a person's files: a byte changed on
       # a save, an undo that gives back the wrong text, a screen drawn wrong
@@ -130,7 +130,7 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          python3 scripts/edit-test.py
+          python3 tests/edit-test.py
 
       # What is on a disk is whoever wrote it's to choose, and a panic, a
       # write where nothing may write or an image left corrupt there is
@@ -140,7 +140,7 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          python3 scripts/fs-fuzz.py
+          python3 tests/fs-fuzz.py
 
       # A judge wrong about the format holds every driver to the wrong
       # thing, and agrees with it: the images the fuzzer's judges make and
@@ -152,7 +152,7 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          python3 scripts/fs-fuzz.py --e2fsck
+          python3 tests/fs-fuzz.py --e2fsck
 
       # Everything the network hands the kernel is somebody else's to choose,
       # and a panic, a lock broken or a spin there is anyone's to cause: the
@@ -162,7 +162,7 @@ jobs:
         if: matrix.arch == 'aarch64'
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          python3 scripts/net-fuzz.py
+          python3 tests/net-fuzz.py
 
       # The host API reads what anyone who connects sends it: a request, a
       # WebSocket frame, a JSON text -- and a misread is a panic in the
@@ -173,7 +173,7 @@ jobs:
         if: matrix.arch == 'aarch64'
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          python3 scripts/web-test.py
+          python3 tests/web-test.py
 
       # Every service talks through the message channel -- the image's tasks
       # and the modules alike -- and a message lost, doubled or out of
@@ -184,7 +184,7 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          python3 scripts/ipc-fuzz.py
+          python3 tests/ipc-fuzz.py
       # Consensus that loses a committed entry, elects two leaders in a term
       # or confirms a stale read looks like a group that works -- until the
       # schedule that breaks it. The raft crate on the host: the known traps
@@ -195,7 +195,7 @@ jobs:
         if: matrix.arch == 'aarch64'
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          python3 scripts/raft-test.py
+          python3 tests/raft-test.py
 
       # A metadata that places a chunk's two replicas on one host, reserves
       # room twice or forks between members looks like one that works --
@@ -207,7 +207,7 @@ jobs:
         if: matrix.arch == 'aarch64'
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          python3 scripts/nbs-fuzz.py
+          python3 tests/nbs-fuzz.py
 
       # The device tree the arm64 boot is handed, the Multiboot2 tags and
       # the ACPI tables the x86 one is, the firmware's memory map, the
@@ -218,12 +218,12 @@ jobs:
       # under the address and UB sanitizers, the same inputs every run.
       - name: C++ fuzz (host)
         if: matrix.arch == 'aarch64'
-        run: python3 scripts/cpp-fuzz.py
+        run: python3 tests/cpp-fuzz.py
 
       # The smoke disks carry no partition table, so nothing else here would
       # notice the partition reader breaking.
       - name: Partition table test (${{ matrix.arch }}, TCG)
-        run: python3 scripts/parttest.py --arch ${{ matrix.arch }} --tcg
+        run: python3 tests/parttest.py --arch ${{ matrix.arch }} --tcg
 
       # The smoke boots' roots are ext4, as new installs' are; this boot's is
       # ext2, as the roots made before ext4 are: its fstest checks that ext2
@@ -232,7 +232,7 @@ jobs:
       # which is the arm64 boot's command line.
       - name: ext2 write test (e2fsck, TCG)
         if: matrix.arch == 'aarch64'
-        run: python3 scripts/ext2-test.py --tcg
+        run: python3 tests/ext2-test.py --tcg
 
       # The fuzzer holds ext4 to images of its own; this holds it to
       # mke2fs's, as Linux's distributions make them -- read, names written
@@ -243,13 +243,13 @@ jobs:
       # for writing.
       - name: ext4 test (mke2fs, debugfs, TCG)
         if: matrix.arch == 'aarch64'
-        run: python3 scripts/ext4-test.py --tcg
+        run: python3 tests/ext4-test.py --tcg
 
       # On the machines with no serial port the kernel log over UDP is the
       # only console there is, and a panic is when it matters most.
       - name: netconsole test (TCG)
         if: matrix.arch == 'aarch64'
-        run: python3 scripts/netconsole-test.py --tcg
+        run: python3 tests/netconsole-test.py --tcg
 
       # The halt with something still running: a shell inside a module's
       # command as the machine is told to go, and another shell asking for a
@@ -258,25 +258,25 @@ jobs:
       # shells being waited for before the modules are told to stop.
       - name: Halt test (TCG)
         if: matrix.arch == 'aarch64'
-        run: python3 scripts/halt-test.py --tcg
+        run: python3 tests/halt-test.py --tcg
 
       # The connecting side of TCP, which the sshd test does not reach.
       - name: TCP test (TCG)
         if: matrix.arch == 'aarch64'
-        run: python3 scripts/tcp-test.py --tcg
+        run: python3 tests/tcp-test.py --tcg
 
       # The load target answers from inside the receive path, and is the one
       # thing here that would notice a frame pool that was never built.
       - name: netload test (TCG)
         if: matrix.arch == 'aarch64'
-        run: python3 scripts/netload-test.py --tcg
+        run: python3 tests/netload-test.py --tcg
 
       # The host API end to end (docs/api.md): a stranger refused in the
       # handshake with not a byte parsed, the roles, jobs, the stream, the
       # limits, no TIME-WAIT left on its port, an unload under a handshake.
       - name: Host API test (TCG)
         if: matrix.arch == 'aarch64'
-        run: python3 scripts/api-test.py --tcg
+        run: python3 tests/api-test.py --tcg
 
       # The same kernel with both halves checking themselves (docs/build.md):
       # UBSAN=1 puts clang's sanitizer in front of every operation the C++
@@ -292,7 +292,7 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           make nocheck ARCH=${{ matrix.arch }} UBSAN=1 RUSTUB=1
           if [ "${{ matrix.arch }}" = "x86_64" ]; then
-            ./scripts/smoke-test.sh --skip-build
+            ./tests/smoke-test.sh --skip-build
           else
-            ./scripts/smoke-arm64.sh --skip-build
+            ./tests/smoke-arm64.sh --skip-build
           fi

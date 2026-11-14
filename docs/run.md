@@ -26,7 +26,7 @@ The repository scripts wrap the common cases (serial console goes to `nos.log`):
 ./scripts/qemu.sh        # ISO boot, 2 CPUs, virtio-net, GDB stub on :1234
 ./scripts/qemu-disk.sh   # disk boot with virtio-blk/scsi/nvme/net/rng attached
 ./scripts/run.sh         # Linux/KVM, all host CPUs, isa-debug-exit device
-./scripts/smoke-test.sh  # headless boot smoke test, gate on its exit code
+./tests/smoke-test.sh  # headless boot smoke test, gate on its exit code
 ```
 
 ### UEFI boot (OVMF)
@@ -68,7 +68,7 @@ HVF is about 4x faster). virtio-mmio blk/net/rng are attached, serial goes to
 
 ```sh
 ./scripts/qemu-arm64.sh
-./scripts/smoke-arm64.sh              # boot smoke test (SMOKE_HVF=1 for HVF)
+./tests/smoke-arm64.sh              # boot smoke test (SMOKE_HVF=1 for HVF)
 NOS_UDPSHELL=9000 ./scripts/qemu-arm64.sh
 python3 scripts/udpsh.py 127.0.0.1    # remote shell over UDP
 ```

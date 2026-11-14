@@ -1,6 +1,6 @@
 //! Driving the engine's futures one at a time (N12): how the fuzzers'
 //! targets whose disks answer at once drive an operation, said once.
-//! nbs-cs.ko drives its own many at once on its task (N12c), and fuzz/nbs's
+//! nbs-cs.ko drives its own many at once on its task (N12c), and tests/fuzz/nbs's
 //! inflight target its own.
 
 use alloc::boxed::Box;

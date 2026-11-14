@@ -2,7 +2,7 @@
 //! done on the cs's store, checked first with the host's mds where the
 //! store's engine has not checked it -- a chunk it does not hold yet, an
 //! epoch other than the one it knows. The one copy that nbs-cs.ko serves
-//! with and fuzz/nbs's cluster target's cs's do; how the mds is asked is
+//! with and tests/fuzz/nbs's cluster target's cs's do; how the mds is asked is
 //! the caller's (`Asker`).
 //!
 //! Every request is an `async fn` over the store's (N12c): many in flight
@@ -78,7 +78,7 @@ struct Join {
 /// -- a write sent twice, the first answered -- could end after the
 /// client's next request of the chunk, a close or a newer write, had been
 /// answered, and undo it: the chunk open again, or older data over newer
-/// (found by fuzz/nbs's cluster target once its cs's asked their mds over
+/// (found by tests/fuzz/nbs's cluster target once its cs's asked their mds over
 /// its network). The engine's own turns order a chunk's requests only
 /// inside the store, not across a question to the mds.
 #[derive(Default)]
@@ -97,7 +97,7 @@ pub struct Requests {
 /// along its chain, and directly once the chain was slow -- is applied once:
 /// the copy that comes late may come after the client's next write of the
 /// same blocks, and would put the older data back over it (found by
-/// fuzz/nbs's cluster target with chains, at once). But not across a join
+/// tests/fuzz/nbs's cluster target with chains, at once). But not across a join
 /// of its set begun since: its sectors not marked by it, the join's copy
 /// may have written the source's data over them, and the client, which
 /// sends it again because it is not done, is to have it written again --
@@ -352,10 +352,10 @@ impl Done {
 /// to that same writer as `Failed`, which takes this replica out of its set
 /// (N8): never read or written as if it were the others' (`found_open`) --
 /// nor flushed for it, as a flush done would say that what it wrote here
-/// before is durable (found by fuzz/nbs's cluster target). But not where the
+/// before is durable (found by tests/fuzz/nbs's cluster target). But not where the
 /// cs is the set's joiner (N9): written and not read, its copy pulls every
 /// chunk it found open -- the mds asked first where the store has not been
-/// told yet, as a member back's first write comes (found by fuzz/nbs's join
+/// told yet, as a member back's first write comes (found by tests/fuzz/nbs's join
 /// target: refused, the writer asked it out, and its join was dropped every
 /// time it was made). That same writer is the volume's as well as the
 /// generation's (`found_open_by`): generations are counted by volume, and a
