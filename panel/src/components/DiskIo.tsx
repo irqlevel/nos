@@ -12,6 +12,7 @@ import { Locale, text, Words } from '@/lib/i18n';
  * `disk_io` says them. */
 interface Counts {
   file: string; reads: number; writes: number; read_bytes: number; written_bytes: number; errors: number;
+  flushes: number; discards: number; zeroings: number; wait_ns: number;
 }
 interface Io { running: boolean; restarts: number; at_ms: number; disks: Counts[] }
 
@@ -19,8 +20,9 @@ interface Io { running: boolean; restarts: number; at_ms: number; disks: Counts[
  * written, at a moment (seconds, the wall clock's: the chart's time). */
 interface Rate { t: number; ri: number; wi: number; rb: number; wb: number }
 
-/** A disk's errors counter as it was asked, by the wall clock's seconds. */
-interface Errs { t: number; errors: number }
+/** A disk's errors counter, its requests answered and the time its backend
+ * took over them, as they were asked, by the wall clock's seconds. */
+interface Errs { t: number; errors: number; ops: number; wait: number }
 
 /** How often the counters are asked, and how much of them is kept: five
  * minutes; how often a volume's health; what errors make a disk red. */
@@ -28,6 +30,16 @@ const EVERY_MS = 2000;
 const KEEP = 150;
 const HEALTH_EVERY_MS = 10_000;
 const ERRORS_SECS = 60;
+/** Its latency is its backend's time over its requests in the last
+ * LATENCY_SECS; slow, yellow, where that is past SLOW_MS over SLOW_OPS or
+ * more of them. */
+const LATENCY_SECS = 20;
+const SLOW_MS = 50;
+const SLOW_OPS = 5;
+/** NBS's alerts that hold for each of its volumes, not one: none of them
+ * fails a disk's I/O -- the volumes attached go on -- but nothing is
+ * repaired meanwhile. */
+const CLUSTER_ALERTS = ['no_leader', 'stopped'];
 
 /** What NBS says of a volume (the nbs provider's `volume`): its health in a
  * word and the counts behind it. */
@@ -61,6 +73,17 @@ function recentErrors(log: Errs[]): number {
   return Math.max(0, last.errors - from.errors);
 }
 
+/** Its latency in the last LATENCY_SECS, in milliseconds, and over how many
+ * requests: none where none were answered. */
+function latency(log: Errs[]): { ms: number; ops: number } | null {
+  const last = log[log.length - 1];
+  if (!last) return null;
+  const from = log.find((e) => e.t >= last.t - LATENCY_SECS) ?? last;
+  const ops = last.ops - from.ops;
+  const wait = last.wait - from.wait;
+  return ops > 0 && wait >= 0 ? { ms: wait / ops / 1e6, ops } : null;
+}
+
 /** What a running VM's disks are doing: each disk's IOPS and bandwidth, read
  * and written, charted as the counters are asked every two seconds -- and
  * how it is, its edge coloured by the worse of the two: red while its I/O
@@ -75,6 +98,9 @@ export function DiskIo({ host, name, nbs = null, locale, w }: {
   const [errs, setErrs] = useState<Record<string, Errs[]>>({});
   const [running, setRunning] = useState<boolean | null>(null);
   const [health, setHealth] = useState<Record<string, Health | null>>({});
+  /* NBS's alerts that hold for every volume of it: no leader, this host's
+   * member stopped */
+  const [cluster, setCluster] = useState<string[]>([]);
   const last = useRef<Io | null>(null);
 
   useEffect(() => {
@@ -95,7 +121,8 @@ export function DiskIo({ host, name, nbs = null, locale, w }: {
         const next: Record<string, Errs[]> = {};
         for (const d of io.disks) {
           const kept = before && before.restarts !== io.restarts ? [] : now[d.file] ?? [];
-          next[d.file] = [...kept, { t, errors: d.errors }].slice(-KEEP);
+          const ops = d.reads + d.writes + d.flushes + d.discards + d.zeroings + d.errors;
+          next[d.file] = [...kept, { t, errors: d.errors, ops, wait: d.wait_ns }].slice(-KEEP);
         }
         return next;
       });
@@ -131,7 +158,12 @@ export function DiskIo({ host, name, nbs = null, locale, w }: {
         const r = await call(host, 'nbs', 'volume', { name: f.slice('nbs:'.length) });
         got[f] = r.ok ? (r.data as Health) : null;
       }
-      if (live) setHealth(got);
+      const a = await call(host, 'nbs', 'alerts');
+      const kinds = a.ok ? ((a.data as { alerts?: Array<{ kind: string }> }).alerts ?? []).map((x) => x.kind) : [];
+      if (live) {
+        setHealth(got);
+        setCluster(kinds.filter((k) => CLUSTER_ALERTS.includes(k)));
+      }
     };
     void look();
     const timer = setInterval(() => void look(), HEALTH_EVERY_MS);
@@ -148,6 +180,7 @@ export function DiskIo({ host, name, nbs = null, locale, w }: {
   const iops = (v: number) => Math.round(v) + ' IOPS';
   const rate = (v: number) => bytes(Math.round(v)) + '/s';
   const fields = nbs?.resources?.volumes?.fields ?? {};
+  const alertKind = nbs?.resources?.alerts?.fields.kind;
   return (
     <section className="space-y-3" data-testid="disk-io">
       <h2 className="text-sm font-medium text-fg">{w.diskIo}</h2>
@@ -161,7 +194,11 @@ export function DiskIo({ host, name, nbs = null, locale, w }: {
         const ever = log[log.length - 1]?.errors ?? 0;
         const vol = f.startsWith('nbs:') ? health[f] : undefined;
         const volTone = vol ? toneOf(fields.health, vol.health) : undefined;
-        const tone: Tone = worst(recent > 0 ? 'bad' : 'good', volTone ?? 'good');
+        const lat = latency(log);
+        const slow = lat !== null && lat.ops >= SLOW_OPS && lat.ms > SLOW_MS;
+        const nbsWide = f.startsWith('nbs:') ? cluster : [];
+        let tone: Tone = worst(recent > 0 ? 'bad' : 'good', volTone ?? 'good');
+        if (slow || nbsWide.length) tone = worst(tone, 'warn');
         const counts = vol ? HEALTH_COUNTS.filter((k) => typeof vol[k] === 'number' && (vol[k] as number) > 0) : [];
         return (
           <div key={f} className="rounded-xl border border-line bg-card p-4" data-testid={`disk-io-${f}`} data-tone={tone}
@@ -185,7 +222,11 @@ export function DiskIo({ host, name, nbs = null, locale, w }: {
               ) : (
                 <span>{w.noIoErrors}</span>
               )}
+              {lat && (slow
+                ? <span className="text-warn" data-testid="disk-slow">{w.slow} {lat.ms.toFixed(1)} {w.ms}</span>
+                : <span>{w.latency} {lat.ms.toFixed(1)} {w.ms}</span>)}
               {vol && <Shown f={fields.health} v={vol.health} locale={locale} />}
+              {nbsWide.map((k) => <Shown key={k} f={alertKind} v={k} locale={locale} />)}
               {counts.map((k) => <span key={k}>{text(fields[k]?.title, locale) || k}: {String(vol![k])}</span>)}
             </div>
             {rs.length > 1 && (

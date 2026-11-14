@@ -186,6 +186,14 @@
         "ru": "Устройства каждого сервера чанков, как их знают метаданные."
       }
     },
+    "alerts": {
+      "kind": "read",
+      "title": {"en": "What to look at", "ru": "На что обратить внимание"},
+      "help": {
+        "en": "What a person should look at in the NBS cluster as this host's member has it, the worst first -- or that all is well.",
+        "ru": "На что стоит обратить внимание в кластере NBS по данным участника этого хоста, худшее первым -- или что всё в порядке."
+      }
+    },
     "device_add": {
       "kind": "action",
       "title": {"en": "Add a device", "ru": "Добавить устройство"},
@@ -225,6 +233,42 @@
     }
   },
   "resources": {
+    "alerts": {
+      "title": {"en": "What to look at", "ru": "На что обратить внимание"},
+      "list": "alerts",
+      "items": "alerts",
+      "key": "id",
+      "fields": {
+        "id": {"type": "int", "title": {"en": "Number", "ru": "Номер"}},
+        "kind": {
+          "type": "enum",
+          "title": {"en": "What", "ru": "Что"},
+          "values": {
+            "ok": {"en": "all well: every chunk at three replicas, nothing failing", "ru": "всё в порядке: у каждого чанка три реплики, сбоев нет"},
+            "no_member": {"en": "this host is in no NBS cluster", "ru": "этот хост не в кластере NBS"},
+            "stopped": {"en": "this host's member stopped: its state's digest unlike the leader's", "ru": "участник этого хоста остановлен: дайджест его состояния разошёлся с лидерским"},
+            "no_leader": {"en": "no leader, no quorum: nothing changed or repaired; volumes attached go on", "ru": "нет лидера и кворума: ничего не меняется и не чинится; подключённые тома работают"},
+            "chunks_unreachable": {"en": "chunks with no replica active: their reads and writes fail", "ru": "чанки без активных реплик: их чтение и запись не проходят"},
+            "unlike": {"en": "replicas the scrub found unlike: a person decides (nbs replica bad)", "ru": "scrub нашёл реплики разными: решает человек (nbs replica bad)"},
+            "device_failed": {"en": "a device failed", "ru": "устройство отказало"},
+            "no_room": {"en": "fewer than three hosts with room: no new chunk, no repair", "ru": "место есть меньше чем на трёх хостах: ни новых чанков, ни ремонта"},
+            "chunks_at_one": {"en": "chunks with one replica left", "ru": "чанки с одной репликой"},
+            "cs_down": {"en": "a chunk server down: its replicas taken out of their sets", "ru": "сервер чанков недоступен: его реплики выведены из наборов"},
+            "cs_out": {"en": "a chunk server out: other hosts take its places", "ru": "сервер чанков выведен: его места занимают другие хосты"},
+            "chunks_at_two": {"en": "chunks at two replicas", "ru": "чанки на двух репликах"},
+            "copying": {"en": "chunks being copied onto a new replica", "ru": "чанки копируются на новую реплику"},
+            "cs_full": {"en": "a chunk server nearly full", "ru": "сервер чанков почти заполнен"},
+            "maintenance": {"en": "a host in maintenance holds replicas: NBS takes it out as any other", "ru": "хост на обслуживании держит реплики: NBS выведет его как любой другой"},
+            "device_draining": {"en": "a device draining: it takes no new chunks", "ru": "устройство выводится: новых чанков не получает"}
+          },
+          "tones": {"ok": "good", "no_member": "idle", "stopped": "bad", "no_leader": "bad", "chunks_unreachable": "bad", "unlike": "bad", "device_failed": "bad", "no_room": "bad", "chunks_at_one": "alarm", "cs_down": "warn", "cs_out": "warn", "chunks_at_two": "warn", "copying": "warn", "cs_full": "warn", "maintenance": "warn", "device_draining": "warn"}
+        },
+        "host": {"type": "string", "title": {"en": "Host", "ru": "Хост"}},
+        "detail": {"type": "string", "title": {"en": "Detail", "ru": "Подробности"}},
+        "count": {"type": "int", "title": {"en": "How many", "ru": "Сколько"}}
+      },
+      "columns": ["kind", "host", "detail", "count"]
+    },
     "volumes": {
       "title": {"en": "Volumes", "ru": "Тома"},
       "list": "volumes",

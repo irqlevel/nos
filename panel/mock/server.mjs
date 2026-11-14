@@ -526,7 +526,7 @@ const reads = {
       return { vm: v.name, running: false, restarts: v.restarts, at_ms: now, disks: [] };
     }
     const zero = () => ({ reads: 0, writes: 0, read_bytes: 0, written_bytes: 0, flushes: 0, errors: 0, discards: 0,
-      zeroings: 0 });
+      zeroings: 0, wait_ns: 0 });
     if (!v.io || v.ioBoot !== v.bootMs) {
       v.io = [];
       v.ioBoot = v.bootMs;
@@ -551,6 +551,9 @@ const reads = {
       c.writes += writes;
       c.written_bytes += writes * 65536;
       c.flushes += Math.round(writes / 8);
+      /* A volume with a replica down answers slowly: 80 ms a request */
+      const ms = vol?.counts?.chunks_at_two ? 80 : 1;
+      c.wait_ns = (c.wait_ns || 0) + Math.round((reads + writes) * ms * 1e6);
     });
     return { vm: v.name, running: true, restarts: v.restarts, at_ms: now,
       disks: v.disks.map((d, i) => ({ file: d.file, ...v.io[i] })) };
@@ -592,6 +595,35 @@ const reads = {
   'nbs.devices': () => {
     nbsMember();
     return { devices: nbs.devices };
+  },
+  /* What to look at, the worst first, as nbs-mds's `alerts` says it: the
+   * volumes' chunks short of three, devices, room, hosts in maintenance */
+  'nbs.alerts': () => {
+    const order = ['stopped', 'no_leader', 'chunks_unreachable', 'unlike', 'device_failed', 'no_room', 'chunks_at_one',
+      'cs_down', 'cs_out', 'chunks_at_two', 'copying', 'cs_full', 'maintenance', 'device_draining', 'no_member', 'ok'];
+    const out = [];
+    const add = (kind, host = null, detail = null, count = null) => out.push({ kind, host, detail, count });
+    if (!nbs.member) {
+      add('no_member');
+    } else {
+      const sum = (k) => nbs.volumes.reduce((n, v) => n + ((v.counts || {})[k] || 0), 0);
+      for (const [kind, k] of [['chunks_unreachable', 'chunks_unreachable'], ['chunks_at_one', 'chunks_at_one'],
+        ['chunks_at_two', 'chunks_at_two'], ['copying', 'chunks_copying']]) {
+        if (sum(k)) add(kind, null, null, sum(k));
+      }
+      for (const d of nbs.devices) {
+        if (d.state === 'draining') add('device_draining', d.host, d.id);
+        if (d.state === 'failed') add('device_failed', d.host, d.id);
+      }
+      const withRoom = nbs.hosts.filter((h) => nbs.devices.some((d) => d.host === h.host && d.state === 'active')).length;
+      if (withRoom < 3) add('no_room', null, null, withRoom);
+      for (const h of cluster.hosts) {
+        if (h.maintenance && nbs.hosts.some((x) => x.host === h.name)) add('maintenance', h.name);
+      }
+    }
+    if (!out.length) add('ok');
+    out.sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind));
+    return { alerts: out.map((a, id) => ({ id, ...a })) };
   },
   'nbs.volumes': () => {
     nbsMember();

@@ -26,7 +26,7 @@ use alloc::sync::Arc;
 
 use kcore::mgmt::{Call, Kind as MethodKind, Method, Provider, Status, Writer};
 use mgmtwire::{Invalid, Params, Value};
-use nbsmeta::{Kind, Refusal, Volume, VOLUME_MIB_MAX, VOLUME_NAME_MAX};
+use nbsmeta::{CsState, DeviceState, Kind, Refusal, Volume, REPLICAS, VOLUME_MIB_MAX, VOLUME_NAME_MAX};
 use nbsmeta::repair::VolumeHealth;
 use raft::Role;
 
@@ -35,7 +35,7 @@ use crate::{member_view, view, ModState};
 
 const DESCRIPTOR: &str = include_str!("nbs.descriptor.json");
 
-const METHODS: [Method; 18] = [
+const METHODS: [Method; 19] = [
     Method { name: "status", kind: MethodKind::Read },
     Method { name: "hosts", kind: MethodKind::Read },
     Method { name: "cs", kind: MethodKind::Read },
@@ -52,6 +52,7 @@ const METHODS: [Method; 18] = [
     Method { name: "host_remove", kind: MethodKind::Action },
     Method { name: "host_replace", kind: MethodKind::Job },
     Method { name: "devices", kind: MethodKind::Read },
+    Method { name: "alerts", kind: MethodKind::Read },
     Method { name: "device_add", kind: MethodKind::Action },
     Method { name: "device_drain", kind: MethodKind::Action },
 ];
@@ -120,6 +121,7 @@ fn provide(state: &Arc<ModState>, method: &str, params: &[u8], call: &mut Call) 
         "hosts" => hosts(state, p, call),
         "cs" => cs(state, p, call),
         "volumes" => volumes(state, p, call),
+        "alerts" => alerts(state, p, call),
         "volume" => volume(state, p, call),
         "volume_create" => volume_create(state, p, call),
         "volume_delete" => volume_delete(state, p, call),
@@ -462,6 +464,157 @@ fn cs(state: &ModState, p: Params<'_>, call: &mut Call) -> Status {
                 w.end_object();
             }
             w.end_list();
+            w.end_object();
+        }
+        w.end_list();
+        w.end_object();
+    })
+}
+
+/// What a person should look at in the NBS cluster: its kind -- the
+/// descriptor's word for it, and its tone -- and the host, the detail and
+/// the count it is of, where it is of one.
+struct Alert {
+    kind: &'static str,
+    host: Option<String>,
+    detail: Option<String>,
+    count: Option<u64>,
+}
+
+/// The alerts' kinds, the worst first: the order they are said in.
+const ALERTS: [&str; 16] = [
+    "stopped", "no_leader", "chunks_unreachable", "unlike", "device_failed", "no_room", "chunks_at_one", "cs_down",
+    "cs_out", "chunks_at_two", "copying", "cs_full", "maintenance", "device_draining", "no_member", "ok",
+];
+
+/// A chunk server whose room is under this tenth free is nearly full.
+const FULL_TENTHS: u64 = 1;
+
+/// The most of the registry's answer taken: its hosts.
+const HOSTS_ANSWER_MAX: usize = 64 * 1024;
+
+/// The hosts the cluster's registry has in maintenance, asked of its
+/// `cluster` provider through the bus: none where there is no registry here,
+/// or it does not answer. NBS's controller does not read the flag yet --
+/// such a host goes out at `out_after` as any other -- which is what makes
+/// a host in maintenance holding replicas worth saying.
+fn maintenance_hosts() -> alloc::vec::Vec<String> {
+    let mut text = alloc::vec::Vec::new();
+    let status = kcore::mgmt::call("cluster", "hosts", b"{}", HOSTS_ANSWER_MAX, &mut |b: &[u8]| {
+        text.try_reserve(b.len()).is_ok() && {
+            text.extend_from_slice(b);
+            true
+        }
+    });
+    if status != Status::Ok {
+        return alloc::vec::Vec::new();
+    }
+    let Ok(answer) = mgmtwire::json::parse(&text, &mgmtwire::Limits::PARAMS) else { return alloc::vec::Vec::new() };
+    let mut hosts = alloc::vec::Vec::new();
+    for h in answer.get("hosts").and_then(Value::as_list).unwrap_or(&[]) {
+        if h.get("maintenance").and_then(Value::as_bool) == Some(true) {
+            if let Some(name) = h.get("name").and_then(Value::as_str) {
+                hosts.push(String::from(name));
+            }
+        }
+    }
+    hosts
+}
+
+/// `alerts`: what a person should look at in the NBS cluster as this host's
+/// member has it, the worst first -- one saying all is well where nothing
+/// is: this member stopped, or no leader (no quorum: nothing changed or
+/// repaired, the volumes attached going on); chunks by how short of three
+/// replicas they are, and those being copied; replicas the scrub found
+/// unlike (on the leader's host); chunk servers down or out, nearly full,
+/// fewer than three with room; devices failed or draining; hosts the
+/// registry has in maintenance holding replicas.
+fn alerts(state: &ModState, p: Params<'_>, call: &mut Call) -> Status {
+    if let Err(e) = p.finish() {
+        return invalid(call, e);
+    }
+    let mut out: alloc::vec::Vec<Alert> = alloc::vec::Vec::new();
+    let mut add = |kind: &'static str, host: Option<&str>, detail: Option<String>, count: Option<u64>| {
+        out.push(Alert { kind, host: host.map(String::from), detail, count });
+    };
+    match view(state) {
+        None => add("no_member", None, None, None),
+        Some(v) => {
+            if let Some(why) = &v.stopped {
+                add("stopped", None, Some(why.clone()), None);
+            } else if v.state.member_of_id(v.leader).is_none() {
+                add("no_leader", None, None, None);
+            }
+            let h = nbsmeta::repair::health(&v.state);
+            for (kind, n) in [("chunks_unreachable", h.by_active[0]), ("chunks_at_one", h.by_active[1]),
+                              ("chunks_at_two", h.by_active[2]), ("copying", h.joining)] {
+                if n != 0 {
+                    add(kind, None, None, Some(n));
+                }
+            }
+            let unlike = unlike_now(state, &v.state).len() as u64;
+            if unlike != 0 {
+                add("unlike", None, None, Some(unlike));
+            }
+            let mut with_room = 0;
+            for c in v.state.cs() {
+                match c.state {
+                    CsState::Down => add("cs_down", Some(&c.host), None, None),
+                    CsState::Out => add("cs_out", Some(&c.host), None, None),
+                    CsState::Up => {}
+                }
+                for d in &c.devices {
+                    match d.state {
+                        DeviceState::Failed => add("device_failed", Some(&c.host), Some(d.ident.clone()), None),
+                        DeviceState::Draining => add("device_draining", Some(&c.host), Some(d.ident.clone()), None),
+                        DeviceState::Active => {}
+                    }
+                }
+                let (slots, free) = (c.slots(), c.free());
+                if c.state == CsState::Up && free != 0 {
+                    with_room += 1;
+                }
+                if slots != 0 && free * 10 < slots * FULL_TENTHS {
+                    add("cs_full", Some(&c.host), Some(alloc::format!("{}% used", 100 - free * 100 / slots)), None);
+                }
+            }
+            if with_room < REPLICAS {
+                add("no_room", None, None, Some(with_room as u64));
+            }
+            for host in maintenance_hosts() {
+                if v.state.cs().iter().any(|c| c.host == host && c.reserved != 0) {
+                    add("maintenance", Some(&host), None, None);
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(Alert { kind: "ok", host: None, detail: None, count: None });
+    }
+    out.sort_by_key(|a| ALERTS.iter().position(|k| *k == a.kind).unwrap_or(ALERTS.len()));
+    answer(call, |w| {
+        w.begin_object();
+        w.key("alerts");
+        w.begin_list();
+        for (i, a) in out.iter().enumerate() {
+            w.begin_object();
+            w.field_uint("id", i as u64);
+            w.field_str("kind", a.kind);
+            w.key("host");
+            match &a.host {
+                Some(h) => w.str(h),
+                None => w.null(),
+            }
+            w.key("detail");
+            match &a.detail {
+                Some(d) => w.str(d),
+                None => w.null(),
+            }
+            w.key("count");
+            match a.count {
+                Some(n) => w.uint(n),
+                None => w.null(),
+            }
             w.end_object();
         }
         w.end_list();

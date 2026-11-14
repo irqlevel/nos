@@ -32,9 +32,11 @@ sessions, the pages -- is here, in Linux; nos keeps its API alone.
   and its snapshots listed, each a click from a VM of it -- its console in
   xterm.js, its vm.toml, its disks -- each one's IOPS and bandwidth, read and
   written, charted as the vm provider's `disk_io` is asked every two seconds,
-  a volume of NBS's as any disk, its edge coloured by the worse of its I/O
-  -- red while it fails -- and what NBS says of the volume's replicas -- and
-  forwards); the images (NBS's images and
+  a volume of NBS's as any disk, its edge coloured by the worst of its I/O
+  -- red while it fails, yellow while its requests wait past 50 ms on the
+  average -- what NBS says of the volume's replicas, and NBS having no
+  leader -- and forwards); NBS's page has what to look at first, its
+  alerts, each in its tone; the images (NBS's images and
   snapshots, a new image of a URL); the jobs; the hosts; the settings.
   English and Russian.
 
