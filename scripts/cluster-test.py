@@ -4,9 +4,14 @@ C2): three nos on a LAN of scripts/hub.py's, each with ipcnet.ko and
 cluster.ko -- a cluster made on one, the others invited and joined, and
 every host's ipcnet pinning every other's key from the registry alone.
 
-- `cluster init` on a: a cluster of a alone, a its leader;
-- b invited from a with the key `ipcnet id` says on b, and joined with the
-  token: a voter, and a and b up to each other;
+- a cluster of a alone, a its leader -- made through the bus, as the
+  panel makes it (`mgmt call cluster init`), a second init refused both at
+  the shell and through the bus;
+- b's status through the bus before it joins: no member, and what an
+  invitation asks of it -- its name, the key `ipcnet id` says, its address;
+- b invited from a with that key, and joined with the token as a job
+  through the bus (`mgmt start cluster join`), as the panel joins: a voter,
+  and a and b up to each other;
 - c invited from b, a member that does not lead (the command handed to the
   leader), at the port it listens on, one of its own -- every host reaches
   it there, its address said with its port (#99) -- a join with a secret
@@ -123,6 +128,30 @@ def key_of(sh):
     return m.group(1) if m else None
 
 
+def json_of(out):
+    m = re.search(r"(\{.*\})", out or "", re.S)
+    try:
+        return json.loads(m.group(1)) if m else None
+    except ValueError:
+        return None
+
+
+def job_done(sh, out, secs=90):
+    """The job `mgmt start` said it started in `out`, followed to its end:
+    `mgmt job`'s last answer -- its record, its log and its result -- or
+    None where it did not end in `secs`."""
+    m = re.search(r"mgmt: job (\d+) started", out)
+    if not m:
+        return None
+    end = time.time() + secs
+    while time.time() < end:
+        got = sh.run("mgmt job %s" % m.group(1))
+        if re.search(r"^job %s \S+ done " % m.group(1), got, re.M):
+            return got
+        time.sleep(1)
+    return None
+
+
 def token_of(out):
     m = re.search(r"cluster join (nos1-[0-9a-f]+)", out)
     return m.group(1) if m else None
@@ -206,22 +235,35 @@ def main():
             check("%s serves, started by /etc/rc, with no peers yet" % HOSTS[i],
                   "-- serving" in out and not re.search(r"^  \S", out, re.M), out)
 
-        # -- a cluster of a alone --
-        out = a.run("cluster init test")
-        need("a makes the cluster", "made" in out, out)
+        # -- a cluster of a alone, made through the bus as the panel makes it --
+        out = a.run('mgmt call cluster init {"name":"test"}')
+        js = json_of(out)
+        need("a makes the cluster through the bus: its name, a and node 1 answered",
+             js is not None and js.get("cluster") == "test" and js.get("host") == "a" and js.get("node") == 1, out)
         need("a leads it, its one voter", ipct.wait_for(lambda: voters(a) == ["a"], 10, 0.5))
         out = a.run("cluster init again")
         check("a second init refused", "a member of a cluster already" in out, out)
+        out = a.run('mgmt call cluster init {"name":"again"}')
+        check("and through the bus: a conflict, said", "mgmt: conflict" in out and "a member of a cluster already" in out,
+              out)
 
-        # -- b invited from a, with the key b's ipcnet has, and joined --
+        # -- b invited from a, with the key b's ipcnet has, and joined as a job through the bus --
         kb = key_of(b)
+        js = json_of(b.run("mgmt call cluster status"))
+        me = (js or {}).get("this_host") or {}
+        check("b's status through the bus: no member, and what an invitation asks of it -- its name, key and address",
+              js is not None and js.get("member") is False and me.get("name") == "b" and me.get("key") == kb
+              and me.get("ip") == ip(1) and me.get("port") is None and me.get("serving") is True, js)
         out = a.run("cluster invite b %s %s" % (ip(1), kb))
         tb = token_of(out)
         need("a invites b and prints a token", tb is not None, out)
         out = c.run("cluster join %s" % tb)
         check("c refuses b's token, the invitation not its", "the invitation is for b" in out, out)
-        out = b.run("cluster join %s" % tb)
-        need("b joins with it", "joined as node 2" in out, out)
+        out = job_done(b, b.run('mgmt start cluster join {"token":"%s"}' % tb))
+        js = json_of(out)
+        need("b joins with it, a job through the bus: node 2 of two hosts",
+             out is not None and re.search(r"^job \d+ cluster\.join done ok", out, re.M) is not None
+             and js is not None and js.get("host") == "b" and js.get("node") == 2 and js.get("hosts") == 2, out)
         need("b is a voter, as a and b both say",
              ipct.wait_for(lambda: voters(a) == ["a", "b"] and voters(b) == ["a", "b"], 30, 1))
         need("a and b are up to each other",
@@ -231,6 +273,8 @@ def main():
 
         # -- c invited from b, which hands it to the leader; a wrong secret refused --
         kc = key_of(c)
+        me = (json_of(c.run("mgmt call cluster status")) or {}).get("this_host") or {}
+        check("c's status says the port it listens on, its own", me.get("key") == kc and me.get("port") == C_PORT, me)
         out = b.run("cluster invite c %s:%d %s" % (ip(2), C_PORT, kc))
         tc = token_of(out)
         need("b invites c, a member that does not lead", tc is not None, out)

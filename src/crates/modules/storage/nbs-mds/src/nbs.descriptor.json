@@ -130,6 +130,98 @@
           }
         }
       }
+    },
+    "init": {
+      "kind": "action",
+      "title": {"en": "Make an NBS cluster", "ru": "Создать кластер NBS"},
+      "help": {
+        "en": "An NBS cluster of this host alone, its first member; the other hosts of the cluster registry are added to it after.",
+        "ru": "Кластер NBS из одного этого хоста, его первый участник; остальные хосты реестра кластера добавляются в него после."
+      },
+      "params": {
+        "name": {
+          "type": "string", "required": true, "title": {"en": "Name", "ru": "Имя"},
+          "help": {"en": "Lowercase letters, digits and -.", "ru": "Строчные буквы, цифры и -."}
+        }
+      }
+    },
+    "host_add": {
+      "kind": "job",
+      "title": {"en": "Add a host", "ru": "Добавить хост"},
+      "help": {
+        "en": "A host of the cluster registry made a member: it learns the log, then votes while fewer than five do. Its own mds takes the offer.",
+        "ru": "Хост реестра кластера становится участником: сначала догоняет журнал, потом голосует, пока голосующих меньше пяти. Предложение принимает его собственный mds."
+      },
+      "params": {"host": {"type": "string", "required": true, "title": {"en": "Host", "ru": "Хост"}}}
+    },
+    "host_remove": {
+      "kind": "action",
+      "title": {"en": "Remove", "ru": "Удалить"},
+      "confirm": {
+        "en": "The host's member leaves the NBS cluster for good; added again, it is a new member.",
+        "ru": "Участник этого хоста покидает кластер NBS навсегда; добавленный снова, он будет новым участником."
+      },
+      "confirm_typed": "host",
+      "params": {"host": {"type": "string", "required": true, "title": {"en": "Host", "ru": "Хост"}}}
+    },
+    "host_replace": {
+      "kind": "job",
+      "title": {"en": "Replace", "ru": "Заменить"},
+      "help": {
+        "en": "A host that lost its state -- a new disk, its folder gone -- taken back: its old member removed for good, a new one added.",
+        "ru": "Хост, потерявший состояние (новый диск, папка удалена), принимается обратно: старый участник удаляется навсегда, добавляется новый."
+      },
+      "confirm": {
+        "en": "Only for a host that lost its state: its old member is removed for good.",
+        "ru": "Только для хоста, потерявшего состояние: его старый участник удаляется навсегда."
+      },
+      "confirm_typed": "host",
+      "params": {"host": {"type": "string", "required": true, "title": {"en": "Host", "ru": "Хост"}}}
+    },
+    "devices": {
+      "kind": "read",
+      "title": {"en": "Devices", "ru": "Устройства"},
+      "help": {
+        "en": "Every chunk server's devices, as the metadata has them.",
+        "ru": "Устройства каждого сервера чанков, как их знают метаданные."
+      }
+    },
+    "device_add": {
+      "kind": "action",
+      "title": {"en": "Add a device", "ru": "Добавить устройство"},
+      "help": {
+        "en": "A device of this host's given to its chunk server, by its id (part:... or disk:...) or its name; the Block page lists them.",
+        "ru": "Устройство этого хоста отдаётся его серверу чанков, по id (part:... или disk:...) или имени; их список на странице блочных устройств."
+      },
+      "confirm": {
+        "en": "With wipe, whatever is on the device is lost.",
+        "ru": "С очисткой всё, что лежит на устройстве, будет потеряно."
+      },
+      "params": {
+        "device": {"type": "string", "required": true, "title": {"en": "Device", "ru": "Устройство"}},
+        "wipe": {
+          "type": "bool", "title": {"en": "Wipe", "ru": "Очистить"},
+          "help": {
+            "en": "Take it even with something else on it, or found blank where it was formatted.",
+            "ru": "Взять, даже если на нём что-то есть или оно оказалось пустым там, где было размечено."
+          }
+        }
+      }
+    },
+    "device_drain": {
+      "kind": "action",
+      "title": {"en": "Drain", "ru": "Вывести"},
+      "confirm": {
+        "en": "The device takes no new chunks until it is added again; a host whose every device drains has its places in the sets taken by other hosts.",
+        "ru": "Устройство не получает новых чанков, пока его не добавят снова; места хоста, все устройства которого выводятся, в наборах занимают другие хосты."
+      },
+      "params": {
+        "device": {"type": "string", "required": true, "title": {"en": "Device", "ru": "Устройство"}},
+        "host": {
+          "type": "string", "title": {"en": "Its host", "ru": "Его хост"},
+          "help": {"en": "This one when none is given.", "ru": "Этот, если не указан."}
+        }
+      }
     }
   },
   "resources": {
@@ -199,7 +291,36 @@
         },
         "leader": {"type": "bool", "title": {"en": "Leads", "ru": "Лидер"}}
       },
-      "columns": ["host", "member", "vote", "leader"]
+      "columns": ["host", "member", "vote", "leader"],
+      "actions": [
+        {"method": "host_replace", "params": {"host": "$host"}},
+        {"method": "host_remove", "params": {"host": "$host"}}
+      ]
+    },
+    "devices": {
+      "title": {"en": "Devices", "ru": "Устройства"},
+      "list": "devices",
+      "items": "devices",
+      "key": "id",
+      "fields": {
+        "host": {"type": "string", "title": {"en": "Host", "ru": "Хост"}},
+        "device": {"type": "int", "title": {"en": "Number", "ru": "Номер"}},
+        "id": {"type": "string", "title": {"en": "Id", "ru": "Id"}},
+        "size": {"type": "bytes", "title": {"en": "Size", "ru": "Размер"}},
+        "state": {
+          "type": "enum",
+          "title": {"en": "State", "ru": "Состояние"},
+          "values": {
+            "active": {"en": "active", "ru": "работает"},
+            "draining": {"en": "draining", "ru": "выводится"},
+            "failed": {"en": "failed", "ru": "отказало"}
+          }
+        }
+      },
+      "columns": ["host", "id", "size", "state"],
+      "actions": [
+        {"method": "device_drain", "params": {"device": "$id", "host": "$host"}}
+      ]
     }
   }
 }

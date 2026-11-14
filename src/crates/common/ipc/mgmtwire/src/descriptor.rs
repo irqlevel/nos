@@ -17,8 +17,8 @@
 
 use crate::json::{parse, Limits, Value};
 
-/// What a descriptor may make, at most.
-pub const LIMITS: Limits = Limits { bytes: 16 * 1024, depth: 12, values: 4096, members: 256, string: 2048 };
+/// What a descriptor may make, at most: the bus's `MAX_DESCRIPTOR` of bytes.
+pub const LIMITS: Limits = Limits { bytes: 32 * 1024, depth: 12, values: 4096, members: 256, string: 2048 };
 
 /// The version of the format this checks.
 pub const SCHEMA: u64 = 1;

@@ -9,13 +9,19 @@
 //! - actions: `volume_create`, `volume_delete`, `volume_resize`; and
 //!   `volume_snapshot` (an attached volume's asked on its writer's host),
 //!   `volume_freeze` (an image), `volume_clone` (of an image or a snapshot)
-//!   -- N10d.
+//!   -- N10d;
+//! - the cluster itself, as the panel makes and keeps it: `init` (an NBS
+//!   cluster of this host alone), `host_add` and `host_replace` (jobs: the
+//!   host's own mds offered the cluster, for as long as it takes to answer),
+//!   `host_remove`; and the chunk servers' devices -- `devices` (every cs's),
+//!   `device_add` (this host's: the device is here), `device_drain` (any
+//!   host's, the metadata's change alone).
 //!
 //! Its changes can be asked again with the same result, as an automation that
 //! retries needs: a volume made again by its name and size is answered as it
-//! is, one deleted that is gone succeeds. Devices are added at a host's own
-//! shell (`nbs devices add`), where the device is.
+//! is, one deleted that is gone succeeds.
 
+use alloc::string::String;
 use alloc::sync::Arc;
 
 use kcore::mgmt::{Call, Kind as MethodKind, Method, Provider, Status, Writer};
@@ -28,7 +34,7 @@ use crate::{member_view, view, ModState};
 
 const DESCRIPTOR: &str = include_str!("nbs.descriptor.json");
 
-const METHODS: [Method; 11] = [
+const METHODS: [Method; 18] = [
     Method { name: "status", kind: MethodKind::Read },
     Method { name: "hosts", kind: MethodKind::Read },
     Method { name: "cs", kind: MethodKind::Read },
@@ -40,7 +46,17 @@ const METHODS: [Method; 11] = [
     Method { name: "volume_snapshot", kind: MethodKind::Action },
     Method { name: "volume_freeze", kind: MethodKind::Action },
     Method { name: "volume_clone", kind: MethodKind::Action },
+    Method { name: "init", kind: MethodKind::Action },
+    Method { name: "host_add", kind: MethodKind::Job },
+    Method { name: "host_remove", kind: MethodKind::Action },
+    Method { name: "host_replace", kind: MethodKind::Job },
+    Method { name: "devices", kind: MethodKind::Read },
+    Method { name: "device_add", kind: MethodKind::Action },
+    Method { name: "device_drain", kind: MethodKind::Action },
 ];
+
+/// A device's word: its id (`part:...`, `disk:...`) or its name, at most.
+const DEVICE_MAX: usize = nbsmeta::IDENT_MAX;
 
 const HOST_MAX: usize = 63;
 /// The volumes `volumes` answers at once, at most, and unless asked fewer:
@@ -85,7 +101,7 @@ fn answer(call: &mut Call, write: impl FnOnce(&mut Writer)) -> Status {
     if call.json(write) { Status::Ok } else { Status::TooLarge }
 }
 
-fn provide(state: &ModState, method: &str, params: &[u8], call: &mut Call) -> Status {
+fn provide(state: &Arc<ModState>, method: &str, params: &[u8], call: &mut Call) -> Status {
     let value = if params.is_empty() {
         Value::Null
     } else {
@@ -110,7 +126,213 @@ fn provide(state: &ModState, method: &str, params: &[u8], call: &mut Call) -> St
         "volume_snapshot" => volume_snapshot(state, p, call),
         "volume_freeze" => volume_freeze(state, p, call),
         "volume_clone" => volume_clone(state, p, call),
+        "init" => init(state, p, call),
+        "host_add" => host_add(state, p, call),
+        "host_remove" => host_remove(state, p, call),
+        "host_replace" => host_replace(state, p, call),
+        "devices" => devices(state, p, call),
+        "device_add" => device_add(state, p, call),
+        "device_drain" => device_drain(state, p, call),
         _ => Status::NoMethod,
+    }
+}
+
+/// A refusal of a change to the cluster itself, said as the call's: this
+/// host in it already, or in none, or the host no member -- a conflict; a
+/// name not one -- invalid; anything else failed.
+fn failed_text(call: &mut Call, why: String, field: Option<&str>) -> Status {
+    let status = if why.starts_with("this host is a member of an NBS cluster already")
+        || why.starts_with("this host is in no NBS cluster") || why.contains(" is no member")
+    {
+        Status::Conflict
+    } else if why.contains("is not a cluster's name") || why.contains("is not a host's name") {
+        Status::Invalid
+    } else {
+        Status::Failed
+    };
+    refuse(call, status, &why, field)
+}
+
+fn host_param<'a>(p: &mut Params<'a>, call: &mut Call) -> Result<&'a str, Status> {
+    let host = p.str("host", HOST_MAX).map_err(|e| invalid(call, e))?;
+    if !nbsmeta::valid_name(host) {
+        return Err(refuse(call, Status::Invalid, "a host's name: lowercase letters, digits and -", Some("host")));
+    }
+    Ok(host)
+}
+
+fn init(state: &Arc<ModState>, mut p: Params<'_>, call: &mut Call) -> Status {
+    let name = match p.str("name", HOST_MAX) {
+        Ok(n) => n,
+        Err(e) => return invalid(call, e),
+    };
+    if let Err(e) = p.finish() {
+        return invalid(call, e);
+    }
+    match crate::op_init(state, name) {
+        Ok(m) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("cluster", name);
+            w.field_str("id", &codec::hex(&m.cluster));
+            w.field_str("host", &m.host);
+            w.field_uint("member", m.member);
+            w.end_object();
+        }),
+        Err(why) => failed_text(call, why, Some("name")),
+    }
+}
+
+/// A job's stop: its provider going, a cancel, the halt.
+fn stopped(call: &Call) -> impl Fn() -> bool + '_ {
+    move || call.cancelled()
+}
+
+fn host_add(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status {
+    let host = match host_param(&mut p, call) {
+        Ok(h) => h,
+        Err(s) => return s,
+    };
+    if let Err(e) = p.finish() {
+        return invalid(call, e);
+    }
+    call.note(&alloc::format!("nbs: {} offered the NBS cluster", host));
+    let got = {
+        let stop = stopped(call);
+        crate::op_add(state, host, &stop)
+    };
+    match got {
+        Ok(id) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("host", host);
+            w.field_uint("member", id);
+            w.end_object();
+        }),
+        Err(why) => failed_text(call, why, Some("host")),
+    }
+}
+
+fn host_remove(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status {
+    let host = match host_param(&mut p, call) {
+        Ok(h) => h,
+        Err(s) => return s,
+    };
+    if let Err(e) = p.finish() {
+        return invalid(call, e);
+    }
+    match crate::op_remove(state, host) {
+        Ok(id) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("host", host);
+            w.field_uint("member", id);
+            w.end_object();
+        }),
+        Err(why) => failed_text(call, why, Some("host")),
+    }
+}
+
+fn host_replace(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status {
+    let host = match host_param(&mut p, call) {
+        Ok(h) => h,
+        Err(s) => return s,
+    };
+    if let Err(e) = p.finish() {
+        return invalid(call, e);
+    }
+    call.note(&alloc::format!("nbs: {}'s old member removed, the host offered the cluster anew", host));
+    let got = {
+        let stop = stopped(call);
+        crate::op_replace(state, host, &stop)
+    };
+    match got {
+        Ok((old, new)) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("host", host);
+            w.field_uint("removed", old);
+            w.field_uint("member", new);
+            w.end_object();
+        }),
+        Err(why) => failed_text(call, why, Some("host")),
+    }
+}
+
+fn devices(state: &ModState, p: Params<'_>, call: &mut Call) -> Status {
+    if let Err(e) = p.finish() {
+        return invalid(call, e);
+    }
+    let v = match member_view(state) {
+        Ok(v) => v,
+        Err(why) => return failed(call, Failure::Other(why)),
+    };
+    let slot = u64::from(nbsmeta::CHUNK_MIB) << 20;
+    answer(call, |w| {
+        w.begin_object();
+        w.key("devices");
+        w.begin_list();
+        for c in v.state.cs() {
+            for d in &c.devices {
+                w.begin_object();
+                w.field_str("host", &c.host);
+                w.field_uint("device", u64::from(d.id));
+                w.field_str("id", &d.ident);
+                w.field_uint("size", u64::from(d.slots) * slot);
+                w.field_str("state", match d.state {
+                    nbsmeta::DeviceState::Active => "active",
+                    nbsmeta::DeviceState::Draining => "draining",
+                    nbsmeta::DeviceState::Failed => "failed",
+                });
+                w.end_object();
+            }
+        }
+        w.end_list();
+        w.end_object();
+    })
+}
+
+fn device_add(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status {
+    let device = match p.str("device", DEVICE_MAX) {
+        Ok(d) => d,
+        Err(e) => return invalid(call, e),
+    };
+    let wipe = match p.opt_bool("wipe") {
+        Ok(w) => w.unwrap_or(false),
+        Err(e) => return invalid(call, e),
+    };
+    if let Err(e) = p.finish() {
+        return invalid(call, e);
+    }
+    match store::device_add(state, device, wipe) {
+        Ok((ident, slots, id, wiped)) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("id", &ident);
+            w.field_uint("device", u64::from(id));
+            w.field_uint("size", u64::from(slots) * (u64::from(nbsmeta::CHUNK_MIB) << 20));
+            w.field_bool("wiped", wiped);
+            w.end_object();
+        }),
+        Err(f) => failed(call, f),
+    }
+}
+
+fn device_drain(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Status {
+    let device = match p.str("device", DEVICE_MAX) {
+        Ok(d) => d,
+        Err(e) => return invalid(call, e),
+    };
+    let host = match p.opt_str("host", HOST_MAX) {
+        Ok(h) => h,
+        Err(e) => return invalid(call, e),
+    };
+    if let Err(e) = p.finish() {
+        return invalid(call, e);
+    }
+    match store::device_drain(state, host, device) {
+        Ok(id) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("id", device);
+            w.field_uint("device", u64::from(id));
+            w.end_object();
+        }),
+        Err(f) => failed(call, f),
     }
 }
 
