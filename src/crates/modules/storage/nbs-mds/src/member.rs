@@ -193,6 +193,10 @@ pub struct Mds {
     refused: bool,
     after: repair::After,
     repairing: u32,
+    /// The joins this member has seen as the leader, each by its set and
+    /// `since`, from when it first did: one standing past its time is given
+    /// up (`repair::Joining`, the review of 2026-11's question 2).
+    joins_seen: BTreeMap<(u32, u32), u64>,
     /// The leader's scrub (N9e) while this member leads, its pace
     /// (`scrub=`, none where 0), and what it found, for the shell.
     scrub: Option<Scrub>,
@@ -279,7 +283,7 @@ pub fn new(rsm: Rsm<raftmember::Log, State>, me: files::Member, lost: Lost, dir:
                                   verdicts: BTreeMap::new(), next_probe: 1, watch: BTreeMap::new(), watch_at: 0,
                                   planned: 0, planned_index: 0, plan_at: 0, refused: false,
                                   after: repair::After { down_ms: repair::DOWN_AFTER_MS, out_ms: out_after_ms },
-                                  repairing: 0, scrub: None, scrub_every_ns: scrub_ms * 1_000_000, scrubbed,
+                                  repairing: 0, joins_seen: BTreeMap::new(), scrub: None, scrub_every_ns: scrub_ms * 1_000_000, scrubbed,
                                   sessions: BTreeMap::new(), pausing: None, next_pause: 1, reads: BTreeMap::new(),
                                   next_read: 1, late: BTreeMap::new() },
                             rsm, id)
@@ -533,6 +537,7 @@ impl App for Mds {
             self.watch.clear();
             self.repairing = 0;
             self.refused = false;
+            self.joins_seen.clear();
             self.scrub = None;
             self.probes.clear();
             self.verdicts.clear();
@@ -649,8 +654,22 @@ impl Mds {
         self.planned_index = applied;
         self.refused = false;
         self.plan_at = now + PLAN_NS;
-        let plan = repair::plan(core.state(), &seen, self.after);
+        /* The joins as this leader has seen them stand: from its first look,
+           so that a new leader gives each its whole time again */
+        let joins: Vec<(u32, u32)> = core.state().sets().iter().enumerate()
+            .filter_map(|(id, s)| s.joiner.map(|j| (id as u32, j.since))).collect();
+        self.joins_seen.retain(|k, _| joins.contains(k));
+        let joining: Vec<repair::Joining> = joins.iter().map(|&(set, since)| {
+            let first = *self.joins_seen.entry((set, since)).or_insert(now);
+            repair::Joining { set, since, age_ms: now.saturating_sub(first) / 1_000_000 }
+        }).collect();
+        let plan = repair::plan(core.state(), &seen, &joining, self.after);
         for cmd in plan {
+            if let Command::Unjoin { set, cs, since } = cmd {
+                klog!(0, "nbs: the join of set {} by cs {} (since version {}) stood past its time, {} min: given up \
+                          -- its joiner answers, but its copy never ended", set, cs, since,
+                      core.state().sets().get(set as usize).map_or(0, |s| repair::join_limit_ms(s.chunks)) / 60_000);
+            }
             klog!(1, "nbs: the controller proposes {:?}", cmd);
             self.repairing += 1;
             core.ask(self, cmd, Pending::App(Waiter::Repair));

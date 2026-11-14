@@ -825,6 +825,9 @@ def main():
               out)
         out = b.run("nbs io read snapsrc 0 8192")
         check("the volume as written since", "0x41x4096 0x42x4096" in out, out)
+        out = b.run("nbs volume snapshot snapsrc snap1")
+        check("a snapshot asked again under its name refused, said as the snapshot it is -- not done of the volume "
+              "as it is now (the review of 2026-11, its question 3)", "snap1 is a snapshot already" in out, out)
         out = b.run("nbs io detach snapsrc")
         need("and let go", "snapsrc detached" in out, out)
         out = c.run("nbs io read snap1 0 8192")
@@ -839,6 +842,8 @@ def main():
         check("a volume cloned refused: a clone is of an image or a snapshot", "freeze or snapshot" in out, out)
         out = a.run("nbs volume clone snap1 sclone host=c")
         need("the snapshot cloned, for c", "a clone of snap1" in out, out)
+        out = a.run("nbs volume clone snap1 sclone host=c")
+        check("cloned again under its name refused, said as the volume it is", "sclone is a volume already" in out, out)
         out = a.run("nbs volumes")
         check("each said as what it is: a snapshot of its volume, a clone of its snapshot",
               re.search(r"^\s+snap1\s.*a snapshot of snapsrc", out, re.M) is not None

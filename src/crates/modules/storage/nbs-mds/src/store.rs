@@ -239,6 +239,23 @@ pub fn device_drain(state: &ModState, ident: &str) -> Result<u32, Failure> {
     }
 }
 
+/// `name` taken by no volume, snapshot or image yet: what a snapshot or a
+/// clone is asked by. The metadata answers one asked again of the same
+/// origin as done -- a proposal applied twice is one ask, and its answer is
+/// the first's -- but a person asking again, or a tool, would take that for
+/// a snapshot of what the volume holds now, which it is not: the name
+/// refused here, and said (the review of 2026-11, its question 3).
+fn name_free(v: &View, name: &str) -> Result<(), Failure> {
+    let Some(e) = v.state.volume(name) else { return Ok(()) };
+    let kind = match e.kind {
+        Kind::Volume => "a volume",
+        Kind::Image => "an image",
+        Kind::Snapshot => "a snapshot",
+    };
+    Err(Failure::Other(alloc::format!("{} is {} already, made before: a name is not taken again -- delete it first, \
+                                       or give another", name, kind)))
+}
+
 fn volume_id(a: Answer) -> Result<u32, Failure> {
     match a {
         Answer::Volume { id } => Ok(id),
@@ -274,7 +291,7 @@ pub fn volume_resize(state: &ModState, name: &str, size_mib: u64) -> Result<u32,
 pub fn volume_snapshot(state: &ModState, volume: &str, name: &str, turn: &mut dyn FnMut(u64))
     -> Result<u32, Failure>
 {
-    caught_up(state)?;
+    name_free(&caught_up(state)?, name)?;
     let cmd = Command::Snapshot { volume: String::from(volume), name: String::from(name),
                                   generation: crate::member::PAUSE_FIRST };
     volume_id(ask_turning(state, &cmd, turn)?)
@@ -292,6 +309,7 @@ pub fn volume_freeze(state: &ModState, name: &str) -> Result<u32, Failure> {
 /// `from` until it is written. Its number.
 pub fn volume_clone(state: &ModState, from: &str, name: &str, host: Option<&str>) -> Result<u32, Failure> {
     let v = caught_up(state)?;
+    name_free(&v, name)?;
     let host = match host {
         Some(h) => String::from(h),
         None => this_host(&v)?,

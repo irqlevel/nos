@@ -447,7 +447,7 @@ impl World {
             Msg::Answer(bytes) => {
                 let Some(a) = Answer::decode(&bytes) else { return Err(String::from("an answer that is none")) };
                 let summing = self.copy.as_ref().is_some_and(|c| c.summing().is_some() && c.sent(a.id));
-                if self.focus == Focus::Close && !self.injected && summing && matches!(a.reply, Reply::Sums(_)) {
+                if self.focus == Focus::Close && !self.injected && summing && matches!(a.reply, Reply::Sums { .. }) {
                     self.injected = true;
                     self.joiner_disk.borrow_mut().arm(2);
                 }
