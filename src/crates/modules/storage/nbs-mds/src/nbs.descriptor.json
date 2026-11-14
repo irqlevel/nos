@@ -130,9 +130,145 @@
           }
         }
       }
+    },
+    "init": {
+      "kind": "action",
+      "title": {"en": "Make an NBS cluster", "ru": "Создать кластер NBS"},
+      "help": {
+        "en": "An NBS cluster of this host alone, its first member; the other hosts of the cluster registry are added to it after.",
+        "ru": "Кластер NBS из одного этого хоста, его первый участник; остальные хосты реестра кластера добавляются в него после."
+      },
+      "params": {
+        "name": {
+          "type": "string", "required": true, "title": {"en": "Name", "ru": "Имя"},
+          "help": {"en": "Lowercase letters, digits and -.", "ru": "Строчные буквы, цифры и -."}
+        }
+      }
+    },
+    "host_add": {
+      "kind": "job",
+      "title": {"en": "Add a host", "ru": "Добавить хост"},
+      "help": {
+        "en": "A host of the cluster registry made a member: it learns the log, then votes while fewer than five do. Its own mds takes the offer.",
+        "ru": "Хост реестра кластера становится участником: сначала догоняет журнал, потом голосует, пока голосующих меньше пяти. Предложение принимает его собственный mds."
+      },
+      "params": {"host": {"type": "string", "required": true, "title": {"en": "Host", "ru": "Хост"}}}
+    },
+    "host_remove": {
+      "kind": "action",
+      "title": {"en": "Remove", "ru": "Удалить"},
+      "confirm": {
+        "en": "The host's member leaves the NBS cluster for good; added again, it is a new member.",
+        "ru": "Участник этого хоста покидает кластер NBS навсегда; добавленный снова, он будет новым участником."
+      },
+      "confirm_typed": "host",
+      "params": {"host": {"type": "string", "required": true, "title": {"en": "Host", "ru": "Хост"}}}
+    },
+    "host_replace": {
+      "kind": "job",
+      "title": {"en": "Replace", "ru": "Заменить"},
+      "help": {
+        "en": "A host that lost its state -- a new disk, its folder gone -- taken back: its old member removed for good, a new one added.",
+        "ru": "Хост, потерявший состояние (новый диск, папка удалена), принимается обратно: старый участник удаляется навсегда, добавляется новый."
+      },
+      "confirm": {
+        "en": "Only for a host that lost its state: its old member is removed for good.",
+        "ru": "Только для хоста, потерявшего состояние: его старый участник удаляется навсегда."
+      },
+      "confirm_typed": "host",
+      "params": {"host": {"type": "string", "required": true, "title": {"en": "Host", "ru": "Хост"}}}
+    },
+    "devices": {
+      "kind": "read",
+      "title": {"en": "Devices", "ru": "Устройства"},
+      "help": {
+        "en": "Every chunk server's devices, as the metadata has them.",
+        "ru": "Устройства каждого сервера чанков, как их знают метаданные."
+      }
+    },
+    "alerts": {
+      "kind": "read",
+      "title": {"en": "What to look at", "ru": "На что обратить внимание"},
+      "help": {
+        "en": "What a person should look at in the NBS cluster as this host's member has it, the worst first -- or that all is well.",
+        "ru": "На что стоит обратить внимание в кластере NBS по данным участника этого хоста, худшее первым -- или что всё в порядке."
+      }
+    },
+    "device_add": {
+      "kind": "action",
+      "title": {"en": "Add a device", "ru": "Добавить устройство"},
+      "help": {
+        "en": "A device of this host's given to its chunk server, by its id (part:... or disk:...) or its name; the Block page lists them.",
+        "ru": "Устройство этого хоста отдаётся его серверу чанков, по id (part:... или disk:...) или имени; их список на странице блочных устройств."
+      },
+      "confirm": {
+        "en": "With wipe, whatever is on the device is lost.",
+        "ru": "С очисткой всё, что лежит на устройстве, будет потеряно."
+      },
+      "params": {
+        "device": {"type": "string", "required": true, "title": {"en": "Device", "ru": "Устройство"}},
+        "wipe": {
+          "type": "bool", "title": {"en": "Wipe", "ru": "Очистить"},
+          "help": {
+            "en": "Take it even with something else on it, or found blank where it was formatted.",
+            "ru": "Взять, даже если на нём что-то есть или оно оказалось пустым там, где было размечено."
+          }
+        }
+      }
+    },
+    "device_drain": {
+      "kind": "action",
+      "title": {"en": "Drain", "ru": "Вывести"},
+      "confirm": {
+        "en": "The device takes no new chunks until it is added again; a host whose every device drains has its places in the sets taken by other hosts.",
+        "ru": "Устройство не получает новых чанков, пока его не добавят снова; места хоста, все устройства которого выводятся, в наборах занимают другие хосты."
+      },
+      "params": {
+        "device": {"type": "string", "required": true, "title": {"en": "Device", "ru": "Устройство"}},
+        "host": {
+          "type": "string", "title": {"en": "Its host", "ru": "Его хост"},
+          "help": {"en": "This one when none is given.", "ru": "Этот, если не указан."}
+        }
+      }
     }
   },
   "resources": {
+    "alerts": {
+      "title": {"en": "What to look at", "ru": "На что обратить внимание"},
+      "list": "alerts",
+      "items": "alerts",
+      "key": "id",
+      "fields": {
+        "id": {"type": "int", "title": {"en": "Number", "ru": "Номер"}},
+        "kind": {
+          "type": "enum",
+          "title": {"en": "What", "ru": "Что"},
+          "values": {
+            "ok": {"en": "all well: every chunk at three replicas, nothing failing", "ru": "всё в порядке: у каждого чанка три реплики, сбоев нет"},
+            "no_member": {"en": "this host is in no NBS cluster", "ru": "этот хост не в кластере NBS"},
+            "stopped": {"en": "this host's member stopped: its state's digest unlike the leader's", "ru": "участник этого хоста остановлен: дайджест его состояния разошёлся с лидерским"},
+            "no_leader": {"en": "no leader, no quorum: nothing changed or repaired; volumes attached go on", "ru": "нет лидера и кворума: ничего не меняется и не чинится; подключённые тома работают"},
+            "chunks_unreachable": {"en": "chunks with no replica active: their reads and writes fail", "ru": "чанки без активных реплик: их чтение и запись не проходят"},
+            "unlike": {"en": "replicas the scrub found unlike: a person decides (nbs replica bad)", "ru": "scrub нашёл реплики разными: решает человек (nbs replica bad)"},
+            "device_failed": {"en": "a device failed", "ru": "устройство отказало"},
+            "no_room": {"en": "fewer than three hosts with room: no new chunk, no repair", "ru": "место есть меньше чем на трёх хостах: ни новых чанков, ни ремонта"},
+            "chunks_at_one": {"en": "chunks with one replica left", "ru": "чанки с одной репликой"},
+            "cs_down": {"en": "a chunk server down: its replicas taken out of their sets", "ru": "сервер чанков недоступен: его реплики выведены из наборов"},
+            "cs_out": {"en": "a chunk server out: other hosts take its places", "ru": "сервер чанков выведен: его места занимают другие хосты"},
+            "chunks_at_two": {"en": "chunks at two replicas", "ru": "чанки на двух репликах"},
+            "copying": {"en": "chunks being copied onto a new replica", "ru": "чанки копируются на новую реплику"},
+            "cs_full": {"en": "a chunk server nearly full", "ru": "сервер чанков почти заполнен"},
+            "maintenance": {"en": "a host in maintenance holds replicas: NBS takes it out as any other", "ru": "хост на обслуживании держит реплики: NBS выведет его как любой другой"},
+            "device_draining": {"en": "a device draining: it takes no new chunks", "ru": "устройство выводится: новых чанков не получает"}
+          },
+          "tones": {"ok": "good", "no_member": "idle", "stopped": "bad", "no_leader": "bad", "chunks_unreachable": "bad", "unlike": "bad", "device_failed": "bad", "no_room": "bad", "chunks_at_one": "alarm", "cs_down": "warn", "cs_out": "warn", "chunks_at_two": "warn", "copying": "warn", "cs_full": "warn", "maintenance": "warn", "device_draining": "warn"}
+        },
+        "host": {"type": "string", "title": {"en": "Host", "ru": "Хост"}},
+        "detail": {"type": "string", "title": {"en": "Detail", "ru": "Подробности"}},
+        "count": {"type": "int", "title": {"en": "How many", "ru": "Сколько"}}
+      },
+      "columns": ["kind", "host", "detail", "count"]
+    },
     "volumes": {
       "title": {"en": "Volumes", "ru": "Тома"},
       "list": "volumes",
@@ -141,6 +277,26 @@
       "fields": {
         "name": {"type": "string", "title": {"en": "Name", "ru": "Имя"}},
         "volume": {"type": "int", "title": {"en": "Number", "ru": "Номер"}},
+        "health": {
+          "type": "enum",
+          "title": {"en": "Health", "ru": "Состояние"},
+          "help": {
+            "en": "The worst of what its chunks say: whole -- three replicas each, nothing copied; a replica down or a copy onto a new one under way; a replica alone; a chunk with none, or replicas the scrub found unlike.",
+            "ru": "Худшее, что говорят его чанки: в норме -- у каждого три реплики, ничего не копируется; реплика выпала или идёт копирование на новую; осталась одна реплика; у чанка нет ни одной, или scrub нашёл реплики разными."
+          },
+          "values": {
+            "ok": {"en": "whole", "ru": "в норме"},
+            "degraded": {"en": "a replica down or copying", "ru": "реплика выпала или копируется"},
+            "critical": {"en": "one replica left", "ru": "одна реплика"},
+            "failed": {"en": "unreachable or replicas unlike", "ru": "недоступен или реплики разные"}
+          },
+          "tones": {"ok": "good", "degraded": "warn", "critical": "alarm", "failed": "bad"}
+        },
+        "chunks_at_two": {"type": "int", "title": {"en": "Chunks at two replicas", "ru": "Чанков на двух репликах"}},
+        "chunks_at_one": {"type": "int", "title": {"en": "Chunks at one replica", "ru": "Чанков на одной реплике"}},
+        "chunks_unreachable": {"type": "int", "title": {"en": "Chunks unreachable", "ru": "Недоступных чанков"}},
+        "chunks_copying": {"type": "int", "title": {"en": "Chunks being copied", "ru": "Чанков копируется"}},
+        "chunks_unlike": {"type": "int", "title": {"en": "Chunks with replicas unlike", "ru": "Чанков с разными репликами"}},
         "kind": {
           "type": "enum",
           "title": {"en": "Kind", "ru": "Вид"},
@@ -157,7 +313,7 @@
         "writer": {"type": "string", "title": {"en": "Attached on", "ru": "Подключён на"}},
         "generation": {"type": "int", "title": {"en": "Generation", "ru": "Поколение"}}
       },
-      "columns": ["name", "kind", "origin", "size", "chunks", "host", "writer"],
+      "columns": ["name", "health", "kind", "origin", "size", "chunks", "host", "writer"],
       "actions": [
         {"method": "volume_resize", "params": {"name": "$name"}},
         {"method": "volume_snapshot", "params": {"volume": "$name"}},
@@ -199,7 +355,36 @@
         },
         "leader": {"type": "bool", "title": {"en": "Leads", "ru": "Лидер"}}
       },
-      "columns": ["host", "member", "vote", "leader"]
+      "columns": ["host", "member", "vote", "leader"],
+      "actions": [
+        {"method": "host_replace", "params": {"host": "$host"}},
+        {"method": "host_remove", "params": {"host": "$host"}}
+      ]
+    },
+    "devices": {
+      "title": {"en": "Devices", "ru": "Устройства"},
+      "list": "devices",
+      "items": "devices",
+      "key": "id",
+      "fields": {
+        "host": {"type": "string", "title": {"en": "Host", "ru": "Хост"}},
+        "device": {"type": "int", "title": {"en": "Number", "ru": "Номер"}},
+        "id": {"type": "string", "title": {"en": "Id", "ru": "Id"}},
+        "size": {"type": "bytes", "title": {"en": "Size", "ru": "Размер"}},
+        "state": {
+          "type": "enum",
+          "title": {"en": "State", "ru": "Состояние"},
+          "values": {
+            "active": {"en": "active", "ru": "работает"},
+            "draining": {"en": "draining", "ru": "выводится"},
+            "failed": {"en": "failed", "ru": "отказало"}
+          }
+        }
+      },
+      "columns": ["host", "id", "size", "state"],
+      "actions": [
+        {"method": "device_drain", "params": {"device": "$id", "host": "$host"}}
+      ]
     }
   }
 }

@@ -29,3 +29,7 @@ mgmtwire = { path = "../../../common/ipc/mgmtwire" }
 # A guest's disk that is a volume of NBS's (`nbs:<volume>`): NBS's client,
 # driven over ipc.
 nbsdrive = { path = "../../storage/nbsdrive" }
+# A volume's name as NBS's metadata takes one: an image's, a snapshot's and
+# a clone's checked before anything is downloaded or asked -- linked already,
+# through nbsdrive.
+nbsmeta = { path = "../../../common/storage/nbsmeta" }

@@ -2,9 +2,10 @@ import { defineConfig, devices } from '@playwright/test';
 
 /* The panel against the mock host API (mock/server.mjs): the mock first,
  * then a seed made from its keys, then the panel built for production
- * (`npm run build` before). A second host, for the cluster's test, lets the
+ * (`npm run build` before). A second host, for the cluster's tests, lets the
  * panel's key in -- the first mock's admin's, which the seed hands it -- as
- * `api client add` lets it in on a second nos. */
+ * `api client add` lets it in on a second nos; it is a host of no cluster
+ * yet (--fresh), for the panel to make its registry and its NBS. */
 const MOCK = 39298;
 export const MOCK_B = 39299;
 const PANEL = 3101;
@@ -28,7 +29,7 @@ export default defineConfig({
     },
     {
       command: `until [ -f ${STATE}/admin.crt ]; do sleep 0.2; done; `
-        + `node mock/server.mjs --port ${MOCK_B} --state ${STATE_B} --name nos-b --trust ${STATE}/admin.crt`,
+        + `node mock/server.mjs --port ${MOCK_B} --state ${STATE_B} --name nos-b --trust ${STATE}/admin.crt --fresh`,
       port: MOCK_B,
       reuseExistingServer: false,
     },

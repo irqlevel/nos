@@ -28,6 +28,7 @@ export default async function HostLayout({ children, params }: { children: React
         <nav className="sticky top-20 space-y-1 text-sm">
           <NavLink href={base} exact>{w.dashboard}</NavLink>
           {all.some((d) => d.provider === 'vm') && <NavLink href={`${base}/vms`}>{w.vms}</NavLink>}
+          {all.some((d) => d.provider === 'vm' && d.methods.image) && <NavLink href={`${base}/images`}>{w.images}</NavLink>}
           {all.filter((d) => d.provider !== 'vm').map((d) => (
             <NavLink key={d.provider} href={`${base}/p/${d.provider}`}>{text(d.title, locale)}</NavLink>
           ))}

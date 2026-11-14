@@ -147,6 +147,35 @@ body {
     --color-bad: var(--bad);
 }
 
+/* A value's tone, as its descriptor's `tones` says it: the dot beside it,
+ * and the edge of what it is the state of -- green, yellow, orange, red,
+ * grey. The word beside the dot says it too: the colour is never alone. */
+:root {
+    --tone-good: #16a34a;
+    --tone-warn: #eab308;
+    --tone-alarm: #ea580c;
+    --tone-bad: #dc2626;
+    --tone-idle: #9ca3af;
+}
+
+:root.dark {
+    --tone-good: #4ade80;
+    --tone-warn: #facc15;
+    --tone-alarm: #fb923c;
+    --tone-bad: #f87171;
+    --tone-idle: #6b7280;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root:not(.light) {
+        --tone-good: #4ade80;
+        --tone-warn: #facc15;
+        --tone-alarm: #fb923c;
+        --tone-bad: #f87171;
+        --tone-idle: #6b7280;
+    }
+}
+
 /* A VM's console: dark in both themes, as a serial console is. */
 .terminal {
     background: #0b0c0f;

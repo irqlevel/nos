@@ -8,16 +8,22 @@
 //!
 //! - reads: `list` (every VM: its folder's, and those on the list without
 //!   one), `get`, `host`, `networks`, `config_get`, `console_read` (a page of
-//!   the console, its control sequences taken out), `disks`, `forwards`;
+//!   the console, its control sequences taken out), `disks`, `disk_io` (each
+//!   disk's counters since the guest's boot, and when they were read: a
+//!   client makes its rates of two), `forwards`;
 //! - actions: `config_set` (a vm.toml checked as a start checks it, the old
 //!   one kept as vm.toml.prev), `forward_add` and `forward_del` (kept in its
 //!   vm.toml, and made or taken away now if it runs), `console_write`,
-//!   `disk_add`, `disk_grow`;
-//! - jobs: `start`, `stop`, `restart`, `create` (a cloud's image by its URL:
-//!   the user-data of the caller's own if given -- a job, which only an
+//!   `disk_add`, `disk_grow`, `snapshot` (of a disk of the VM's that is a
+//!   volume of NBS's, as `nbs volume snapshot` takes one: a running guest's
+//!   session paused for it);
+//! - jobs: `start`, `stop`, `restart`, `create` (a cloud's image by its URL,
+//!   or an image of NBS's -- an image or a snapshot -- by its name: the
+//!   user-data of the caller's own if given -- a job, which only an
 //!   admin starts -- a port of the switch of its own, nos's ports forwarded,
 //!   `protected`, and started once made, as the call asks), `clone`,
-//!   `delete`. Each says as it goes what the command
+//!   `delete`, `image` (an image of NBS's made of a URL's or a file's, as
+//!   `hv image` makes one). Each says as it goes what the command
 //!   would, its progress and whether it is stopped; a cancel -- or the
 //!   module's going -- stops a download, a conversion and a copy where they
 //!   are, what they made taken away. A stop's cancel stops its wait for the
@@ -34,6 +40,7 @@ use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use kcore::consts::NS_PER_MS;
 use kcore::mgmt::{Call, Kind, Method, Provider, Status, Writer};
 use mgmtwire::{Invalid, Params, Value};
 
@@ -48,7 +55,7 @@ use crate::State;
 
 const DESCRIPTOR: &str = include_str!("vm.descriptor.json");
 
-const METHODS: [Method; 23] = [
+const METHODS: [Method; 26] = [
     Method { name: "list", kind: Kind::Read },
     Method { name: "get", kind: Kind::Read },
     Method { name: "host", kind: Kind::Read },
@@ -56,6 +63,7 @@ const METHODS: [Method; 23] = [
     Method { name: "config_get", kind: Kind::Read },
     Method { name: "console_read", kind: Kind::Read },
     Method { name: "disks", kind: Kind::Read },
+    Method { name: "disk_io", kind: Kind::Read },
     Method { name: "devices", kind: Kind::Read },
     Method { name: "forwards", kind: Kind::Read },
     Method { name: "config_set", kind: Kind::Action },
@@ -66,12 +74,14 @@ const METHODS: [Method; 23] = [
     Method { name: "disk_grow", kind: Kind::Action },
     Method { name: "disk_attach", kind: Kind::Action },
     Method { name: "disk_detach", kind: Kind::Action },
+    Method { name: "snapshot", kind: Kind::Action },
     Method { name: "start", kind: Kind::Job },
     Method { name: "stop", kind: Kind::Job },
     Method { name: "restart", kind: Kind::Job },
     Method { name: "create", kind: Kind::Job },
     Method { name: "clone", kind: Kind::Job },
     Method { name: "delete", kind: Kind::Job },
+    Method { name: "image", kind: Kind::Job },
 ];
 
 /// What a page of the console is, by default and at most.
@@ -81,6 +91,9 @@ const CONSOLE_PAGE_MAX: u64 = 64 * 1024;
 const TYPE_MAX: usize = 4096;
 /// The longest URL an image is fetched by, and a disk's file's name.
 const URL_MAX: usize = 2047;
+/// The longest name of an image of NBS's: a volume's (nbsmeta's
+/// `VOLUME_NAME_MAX`).
+const IMAGE_MAX: usize = 63;
 const FILE_MAX: usize = 64;
 /// The longest line of a job's log: what the bus keeps of one.
 const LINE_MAX: usize = 240;
@@ -218,6 +231,7 @@ fn provide(state: &State, method: &str, params: &[u8], call: &mut Call) -> Statu
         "config_get" => config_get(state, p, call),
         "console_read" => console_read(state, p, call),
         "disks" => disks(state, p, call),
+        "disk_io" => disk_io(state, p, call),
         "devices" => devices(state, p, call),
         "forwards" => forwards(state, p, call),
         "config_set" => config_set(state, p, call),
@@ -228,12 +242,14 @@ fn provide(state: &State, method: &str, params: &[u8], call: &mut Call) -> Statu
         "disk_grow" => disk_grow(state, p, call),
         "disk_attach" => disk_attach(state, p, call),
         "disk_detach" => disk_detach(state, p, call),
+        "snapshot" => snapshot(state, p, call),
         "start" => start(state, p, call),
         "stop" => stop(state, p, call),
         "restart" => restart(state, p, call),
         "create" => create(state, p, call),
         "clone" => clone(state, p, call),
         "delete" => delete(state, p, call),
+        "image" => image(state, p, call),
         _ => Status::NoMethod,
     }
 }
@@ -845,6 +861,53 @@ fn disks(state: &State, mut p: Params, call: &mut Call) -> Status {
     }
 }
 
+/// `disk_io`: what each disk of a VM on the list has done since its
+/// guest's boot -- reads, writes and their bytes, flushes, errors, discards
+/// and writes of zeros, and the time its backend took over them, its
+/// latency of two looks -- each by the word it was started with, and when
+/// that was read: a client makes its rates -- IOPS, bandwidth -- of two.
+/// No disks while the guest does not run; how many times it was booted
+/// again says where the counters began anew.
+fn disk_io(state: &State, mut p: Params, call: &mut Call) -> Status {
+    let name = match name_param(&mut p, "name", call) {
+        Ok(n) => n,
+        Err(s) => return s,
+    };
+    if let Err(s) = finish(p, call) {
+        return s;
+    }
+    match state.vms.disk_io(name) {
+        Ok(io) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("vm", name);
+            w.field_bool("running", io.running);
+            w.field_uint("restarts", u64::from(io.restarts));
+            w.field_uint("at_ms", io.at_ns / NS_PER_MS);
+            w.key("disks");
+            w.begin_list();
+            for (word, c) in &io.disks {
+                w.begin_object();
+                w.field_str("file", word);
+                w.field_uint("reads", c.reads);
+                w.field_uint("writes", c.writes);
+                w.field_uint("read_bytes", c.read_bytes);
+                w.field_uint("written_bytes", c.written_bytes);
+                w.field_uint("flushes", c.flushes);
+                w.field_uint("errors", c.errors);
+                w.field_uint("discards", c.discards);
+                w.field_uint("zeroings", c.zeroings);
+                w.field_uint("wait_ns", c.wait_ns);
+                w.end_object();
+            }
+            w.end_list();
+            w.end_object();
+        }),
+        Err(e) if e.starts_with("no vm ") => refuse(call, Status::NotFound, &alloc::format!("{} on the list -- it is \
+                                                                                          off", e), Some("name")),
+        Err(e) => refuse(call, Status::Busy, &e, None),
+    }
+}
+
 fn forwards(state: &State, p: Params, call: &mut Call) -> Status {
     if let Err(s) = finish(p, call) {
         return s;
@@ -1269,10 +1332,24 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
         Ok(n) => n,
         Err(s) => return s,
     };
-    let url = match p.str("url", URL_MAX) {
-        Ok(u) if cloud::is_url(u) => u,
-        Ok(_) => return refuse(call, Status::Invalid, "is an http:// or https:// URL", Some("url")),
-        Err(e) => return invalid(call, e),
+    /* What its disk is made of: a cloud's image by its URL, or an image of
+     * NBS's by its name (`hv create <name> image=nbs:<image>`) -- one of
+     * the two. */
+    let source = match (p.opt_str("url", URL_MAX), p.opt_str("image", IMAGE_MAX)) {
+        (Err(e), _) | (_, Err(e)) => return invalid(call, e),
+        (Ok(Some(_)), Ok(Some(_))) => {
+            return refuse(call, Status::Invalid, "is given with a URL: a VM is made of one image, a URL's or NBS's",
+                          Some("image"));
+        }
+        (Ok(None), Ok(None)) => {
+            return refuse(call, Status::Invalid, "is wanted -- or an image of NBS's, `image`", Some("url"));
+        }
+        (Ok(Some(u)), Ok(None)) if cloud::is_url(u) => cloud::Source::Url(u),
+        (Ok(Some(_)), Ok(None)) => return refuse(call, Status::Invalid, "is an http:// or https:// URL", Some("url")),
+        (Ok(None), Ok(Some(i))) => match i.strip_prefix("nbs:").unwrap_or(i) {
+            "" => return refuse(call, Status::Invalid, "is an image's name", Some("image")),
+            i => cloud::Source::Image(i),
+        },
     };
     let fields = (|| -> Result<_, Invalid> {
         let size = p.opt_uint("size_bytes", 1, u64::MAX)?;
@@ -1331,8 +1408,7 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
         forwards,
         ..Options::default()
     };
-    let recipe = cloud::Recipe { source: cloud::Source::Url(url), size, onto, force, password, hvboot: cloud::HVBOOT,
-                                 user_data, protected };
+    let recipe = cloud::Recipe { source, size, onto, force, password, hvboot: cloud::HVBOOT, user_data, protected };
     let mut job = Job::new(call, &state.unloading);
     let created = cloud::create(&state.vms_root, &state.vms, name, &recipe, o, &mut job);
     /* Started once it is made, when asked: by the same job, its reservation
@@ -1365,6 +1441,102 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
             w.end_object();
         }),
         (Err(e), _) => failed(call, &e),
+    }
+}
+
+/// What a volume's name may be, said where one is refused.
+const VOLUME_NAME: &str = "is a volume's name: lowercase letters, digits, . _ and -, a letter or a digit first, up to 63";
+
+/// `snapshot`: a snapshot named `snapshot` of a disk of VM `name`'s that is
+/// a volume of NBS's -- its first disk, or `disk`, one of its `nbs:` disks
+/// -- taken as `nbs volume snapshot` takes one: where the VM runs here, its
+/// guest's session paused for it, the disk as a power cut would leave it;
+/// of one that runs on another host, refused, naming that host. A VM of a
+/// file or a device has no snapshot: a clone copies it whole.
+fn snapshot(state: &State, mut p: Params, call: &mut Call) -> Status {
+    let name = match name_param(&mut p, "name", call) {
+        Ok(n) => n,
+        Err(s) => return s,
+    };
+    let (snap, disk) = match (p.str("snapshot", IMAGE_MAX), p.opt_str("disk", DEVICE_MAX)) {
+        (Ok(s), Ok(d)) => (s, d),
+        (Err(e), _) | (_, Err(e)) => return invalid(call, e),
+    };
+    if let Err(s) = finish(p, call) {
+        return s;
+    }
+    if !nbsmeta::valid_volume(snap) {
+        return refuse(call, Status::Invalid, VOLUME_NAME, Some("snapshot"));
+    }
+    let folder = match folder(state, name, call) {
+        Ok(f) => f,
+        Err(s) => return s,
+    };
+    let options = match store::load(&folder).and_then(|c| store::options(&folder, &c)) {
+        Ok(o) => o,
+        Err(e) => return refuse(call, Status::Failed, &e, None),
+    };
+    let (word, field) = match disk {
+        Some(d) => match options.disks.iter().find(|(w, _)| w.as_str() == d) {
+            Some((w, _)) => (w.as_str(), "disk"),
+            None => return refuse(call, Status::NotFound, &alloc::format!("is none of {}'s disks", name), Some("disk")),
+        },
+        None => match options.disks.first() {
+            Some((w, _)) => (w.as_str(), "name"),
+            None => return refuse(call, Status::NotFound, &alloc::format!("{} has no disk", name), Some("name")),
+        },
+    };
+    let crate::devices::Source::Volume(volume) = crate::devices::source(word) else {
+        return refuse(call, Status::Conflict, &alloc::format!("{}'s disk {} is no volume of NBS's, and a snapshot is of \
+                                                              one -- a clone of the vm copies it whole", name, word),
+                      Some(field));
+    };
+    match crate::nbs::snapshot(volume, snap) {
+        Ok(id) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("vm", name);
+            w.field_str("volume", volume);
+            w.field_str("snapshot", snap);
+            w.field_uint("number", u64::from(id));
+            w.end_object();
+        }),
+        Err(e) => failed(call, &e),
+    }
+}
+
+/// `image`: an image of NBS's named `name` made of `from` -- a cloud's
+/// image, qcow2 or raw, by its http(s):// URL, downloaded first, or a file
+/// of nos's by its path -- as `hv image` makes one: a volume of its disk's
+/// size, the image poured onto it, frozen; what fails leaves nothing. VMs
+/// are made of clones of it (`create`'s `image`).
+fn image(state: &State, mut p: Params, call: &mut Call) -> Status {
+    let (name, from) = match (p.str("name", IMAGE_MAX), p.str("from", URL_MAX)) {
+        (Ok(n), Ok(f)) => (n, f),
+        (Err(e), _) | (_, Err(e)) => return invalid(call, e),
+    };
+    if let Err(s) = finish(p, call) {
+        return s;
+    }
+    let name = name.strip_prefix("nbs:").unwrap_or(name);
+    if !nbsmeta::valid_volume(name) {
+        return refuse(call, Status::Invalid, VOLUME_NAME, Some("name"));
+    }
+    if !cloud::is_url(from) && !from.starts_with('/') {
+        return refuse(call, Status::Invalid, "is an http:// or https:// URL, or a file of nos's by its path",
+                      Some("from"));
+    }
+    let made = {
+        let mut job = Job::new(call, &state.unloading);
+        crate::image::make_image(&state.vms_root, &state.vms, name, from, &mut job)
+    };
+    match made {
+        Ok(size) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("image", name);
+            w.field_uint("size_bytes", size);
+            w.end_object();
+        }),
+        Err(e) => failed(call, &e),
     }
 }
 
