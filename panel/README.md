@@ -29,7 +29,9 @@ sessions, the pages -- is here, in Linux; nos keeps its API alone.
   create from a cloud image or an image of NBS's, onto a file, a device or
   a volume of NBS's, a VM's overview -- a snapshot of its volume taken there
   and its snapshots listed, each a click from a VM of it -- its console in
-  xterm.js, its vm.toml, disks and forwards); the images (NBS's images and
+  xterm.js, its vm.toml, its disks -- each one's IOPS and bandwidth, read and
+  written, charted as the vm provider's `disk_io` is asked every two seconds,
+  a volume of NBS's as any disk -- and forwards); the images (NBS's images and
   snapshots, a new image of a URL); the jobs; the hosts; the settings.
   English and Russian.
 
@@ -97,7 +99,9 @@ and a cluster and an NBS cluster made there, a device given to its chunk
 server and drained; NBS's members removed, added and replaced as jobs; VMs
 made of an image of NBS's and poured onto a volume of it; an image of a URL,
 a VM of it, its snapshot from its page and a VM of that, a VM of a file's
-refused -- said, though its name is no field of the form;
+refused -- said, though its name is no field of the form; a VM's disks'
+IOPS and bandwidth charted as it runs, a volume of NBS's among them, and one
+that is off saying so;
 the theme and the language -- the charts drawn in the theme the page is in,
 switched on an open page too, and a table's values each on one line in a
 narrow window -- and that through all of it, and a dozen requests at once,

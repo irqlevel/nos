@@ -489,6 +489,40 @@ const reads = {
     return { from, next: from + page.length, total, text: p.terminal ? page : page.replace(/\x1b\[[0-9;]*m/g, '') };
   },
   'vm.devices': () => ({ devices: DEVICES }),
+  /* Each disk's counters since its guest's boot, moving as a guest's would:
+   * its first disk busy, a wave on it, its others near idle. */
+  'vm.disk_io': (p) => {
+    const v = vmNamed(p);
+    const now = uptimeMs();
+    if (v.state !== 'running') {
+      return { vm: v.name, running: false, restarts: v.restarts, at_ms: now, disks: [] };
+    }
+    const zero = () => ({ reads: 0, writes: 0, read_bytes: 0, written_bytes: 0, flushes: 0, errors: 0, discards: 0,
+      zeroings: 0 });
+    if (!v.io || v.ioBoot !== v.bootMs) {
+      v.io = [];
+      v.ioBoot = v.bootMs;
+      v.ioAt = v.bootMs;
+    }
+    while (v.io.length < v.disks.length) {
+      v.io.push(zero());
+    }
+    const secs = (now - v.ioAt) / 1000;
+    v.ioAt = now;
+    v.disks.forEach((d, i) => {
+      const c = v.io[i];
+      const wave = 1 + 0.6 * Math.sin(now / 9000 + i);
+      const reads = Math.round((i === 0 ? 220 : 1) * wave * secs);
+      const writes = d.read_only ? 0 : Math.round((i === 0 ? 70 : 0) * wave * secs);
+      c.reads += reads;
+      c.read_bytes += reads * 16384;
+      c.writes += writes;
+      c.written_bytes += writes * 65536;
+      c.flushes += Math.round(writes / 8);
+    });
+    return { vm: v.name, running: true, restarts: v.restarts, at_ms: now,
+      disks: v.disks.map((d, i) => ({ file: d.file, ...v.io[i] })) };
+  },
   'vm.disks': (p) => {
     const v = vmNamed(p);
     return { disks: v.disks.map((d) => ({ device: false, device_name: null, ...d, path: diskPath(v, d), vm: v.name })) };
