@@ -1,0 +1,16 @@
+[package]
+name = "nbstrace"
+version = "0.1.0"
+edition = "2021"
+
+# NBS's records (`trace on nbs`, docs/tracing.md): a request as a volume's
+# client and a chunk server see it, made of nbswire's own requests and
+# answers -- the one place their kinds and refusals are said as the kernel's
+# events' values. No module of its own -- a library the client's driver
+# (nbsdrive) and the chunk server (nbs-cs) link.
+[lib]
+name = "nbstrace"
+
+[dependencies]
+kcore = { path = "../../../base/kcore" }
+nbswire = { path = "../../../common/storage/nbswire" }

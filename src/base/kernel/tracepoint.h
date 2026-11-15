@@ -107,6 +107,32 @@ enum class Id : u16
     SoftirqEntry,
     SoftirqExit,
 
+    /* NBS's (group "nbs"), recorded by its modules' Rust: a volume's
+       request from its session's client to a chunk server -- sent, answered,
+       or bounced by the channel -- and the chunk server's side of it, taken
+       and answered. The client's and the server's records name a request by
+       its session's id, and ipcnet's records of its message by the same
+       number, its reference. */
+    NbsReq,
+    NbsAns,
+    NbsBounce,
+    NbsCsReq,
+    NbsCsDone,
+    /* Raft's (group "raft"), recorded by raftmember for the cluster's
+       registry and NBS's metadata service alike: a member's role, term or
+       leader changed; a message sent and one taken in; its commit and its
+       apply moving on. */
+    RaftRole,
+    RaftSend,
+    RaftRecv,
+    RaftCommit,
+    /* The channel between hosts (group "ipcnet"): a peer's session up or
+       lost, a message queued for a peer, and one bounced back to its
+       sender. */
+    IpcnetLink,
+    IpcnetQueue,
+    IpcnetBounce,
+
     Count
 };
 
@@ -851,6 +877,165 @@ struct SoftirqExit
        budget: the loop runs it again */
     u8 again;
     u8 pad[2];
+};
+
+/* nbs_req: a request a volume's client sent a chunk server -- its session's
+   id, the volume, the chunk and where in it, how many bytes (a write's data,
+   a read's asked), the cs it went to, and what it asks (NbsOp, nbswire's
+   `Op`) */
+struct NbsReq
+{
+    u64 id;
+    u32 volume;
+    u32 chunk;
+    u32 offset;
+    u32 len;
+    u32 pid;
+    u16 cs;
+    u8 op;
+    u8 pad[1];
+};
+
+/* nbs_ans: a chunk server's answer to it, at the client -- the host it came
+   from, its bytes, and what it says (NbsStatus: ok, or why refused) */
+struct NbsAns
+{
+    u64 id;
+    u32 bytes;
+    u32 pid;
+    u16 from;
+    u8 status;
+    u8 pad[5];
+};
+
+/* nbs_bounce: a request that never reached its chunk server, back at the
+   client: refused at the send, or bounced by the channel (BounceWhy) */
+struct NbsBounce
+{
+    u64 id;
+    u32 pid;
+    u8 why;
+    u8 pad[3];
+};
+
+/* nbs_cs_req: a request a chunk server took, from the host it came from, as
+   nbs_req says one */
+struct NbsCsReq
+{
+    u64 id;
+    u32 volume;
+    u32 chunk;
+    u32 offset;
+    u32 len;
+    u32 pid;
+    u16 from;
+    u8 op;
+    u8 pad[1];
+};
+
+/* nbs_cs_done: the chunk server's answer to it, and how long it took from
+   the request's taking */
+struct NbsCsDone
+{
+    u64 id;
+    u32 ns;
+    u32 pid;
+    u16 from;
+    u8 op;
+    u8 status;
+    u8 pad[4];
+};
+
+/* raft_role: a member's role, term or leader changed -- which raft it is
+   (RaftOf: the cluster's registry, NBS's metadata) */
+struct RaftRole
+{
+    u64 term;
+    u64 leader;
+    u32 pid;
+    u8 of;
+    u8 role;
+    u8 pad[2];
+};
+
+/* raft_send, raft_recv: a raft message, to or from member `peer`: its kind
+   (RaftKind), its term, the index it is about -- an append's previous one,
+   a vote's last, a response's, a heartbeat's commit, a snapshot's -- the
+   entries it carries (a snapshot piece's bytes), and for a response whether
+   it granted or took it */
+struct RaftSend
+{
+    u64 peer;
+    u64 term;
+    u64 index;
+    u32 count;
+    u32 pid;
+    u8 of;
+    u8 kind;
+    u8 ok;
+    u8 pad[5];
+};
+
+struct RaftRecv
+{
+    u64 peer;
+    u64 term;
+    u64 index;
+    u32 count;
+    u32 pid;
+    u8 of;
+    u8 kind;
+    u8 ok;
+    u8 pad[5];
+};
+
+/* raft_commit: what the member has committed and applied, as either moved */
+struct RaftCommit
+{
+    u64 committed;
+    u64 applied;
+    u32 pid;
+    u8 of;
+    u8 pad[3];
+};
+
+/* ipcnet_link: a peer's session up, or lost -- the peer's host number and
+   its sessions up and lost so far */
+struct IpcnetLink
+{
+    u32 ups;
+    u32 losses;
+    u32 pid;
+    u16 peer;
+    u8 up;
+    u8 pad[1];
+};
+
+/* ipcnet_queue: a message queued for a peer -- its reference, its bytes, and
+   the bytes of its class's queue with it; `bulk` 1 for the bulk class's
+   queue, 0 for the control one's */
+struct IpcnetQueue
+{
+    u64 reference;
+    u32 bytes;
+    u32 queued;
+    u32 pid;
+    u16 peer;
+    u8 bulk;
+    u8 pad[1];
+};
+
+/* ipcnet_bounce: a message for a peer bounced back to its sender, and why
+   (IpcnetWhy: its queue full, the peer not up, its session lost) */
+struct IpcnetBounce
+{
+    u64 reference;
+    u32 bytes;
+    u32 queued;
+    u32 pid;
+    u16 peer;
+    u8 bulk;
+    u8 why;
 };
 
 /* ---- the sites ----

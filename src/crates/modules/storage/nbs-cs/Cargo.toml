@@ -17,4 +17,6 @@ kmod = { path = "../../../base/kmod" }
 kcore = { path = "../../../base/kcore" }
 nbscs = { path = "../../../common/storage/nbscs" }
 nbswire = { path = "../../../common/storage/nbswire" }
+# Its requests' records (`trace on nbs`).
+nbstrace = { path = "../nbstrace" }
 codec = { path = "../../../common/codec" }

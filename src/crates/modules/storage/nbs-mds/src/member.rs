@@ -297,6 +297,7 @@ impl App for Mds {
 
     const NAME: &'static str = NAME;
     const LOG: &'static str = "nbs";
+    const TRACED_AS: kcore::trace::RaftOf = kcore::trace::RaftOf::Nbs;
 
     fn encode_command(cmd: &Command) -> Vec<u8> {
         cmd.encode()
