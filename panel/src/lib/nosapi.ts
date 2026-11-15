@@ -52,9 +52,12 @@ export class HostError extends Error {
  * handshake: a host under TCG is slow, a dead one is not waited on. */
 const ANSWER_MS = 30_000;
 const CONNECT_MS = 10_000;
-/** Connections a host for requests, at most: the API lets a key have four,
- * the stream is one, and one is left for a stream being made again while the
- * host still holds the last. */
+/** Connections a host for requests, at most: the API lets a key have eight
+ * (api.ko's `max_per_key`), the stream is one, a VM's console open is one
+ * more -- one however many tabs show it (`/api/console`) -- and one is left
+ * for a stream being made again while the host still holds the last. At
+ * four a key, the budget had no room for a console at all, and a second
+ * one was reset past it. */
 const POOL = 2;
 /** A connection reset before its handshake is done is tried this many times
  * in all, waiting this long before the second and twice as long each time
@@ -63,6 +66,22 @@ const CONNECT_TRIES = 4;
 const CONNECT_BACKOFF_MS = 100;
 /** The most of an answer: the API's own. */
 const ANSWER_MAX = 512 * 1024;
+
+/** What a connection reset just after its handshake -- the host's key
+ * checked, nothing answered yet -- is said to be: past the host's limit of
+ * connections of one key, as api.ko resets one more than `max_per_key`, where
+ * Node says only `read ECONNRESET`. Null for any other failure, and for a
+ * reset of a connection that had answered before. */
+export function pastLimitWhy(e: unknown, fresh: boolean): string | null {
+  const code = (e as { code?: unknown } | null)?.code;
+  const said = e instanceof Error ? e.message : String(e);
+  if (!fresh || !(code === 'ECONNRESET' || /\bECONNRESET\b/.test(said))) {
+    return null;
+  }
+  return 'the host let the panel\'s connection go as it was made: past its limit of connections of the panel\'s '
+    + 'key, most likely (max_per_key in the host\'s /etc/api/api.toml) -- close a console open in another tab, '
+    + 'or raise the limit';
+}
 
 /** The SHA-256 of a certificate's SubjectPublicKeyInfo, hex. */
 export function spkiPin(der: Buffer): string {
@@ -259,6 +278,8 @@ class Pool {
         return a;
       } catch (e) {
         this.give(s, false);
+        const why = pastLimitWhy(e, fresh);
+        if (why) throw new HostError(why, 'connect');
         if (fresh || attempt > 0 || !(e instanceof HostError) || e.kind === 'pin') throw e;
       }
     }
@@ -408,7 +429,8 @@ export async function stream(link: HostLink, query: string, onMessage: (m: unkno
     }
   });
   socket.on('close', () => end('the connection closed'));
-  socket.on('error', (e) => end(e.message));
+  /* Reset before its upgrade is answered: past the host's limit, said so */
+  socket.on('error', (e) => end(pastLimitWhy(e, !open) ?? e.message));
   return {
     send: (text: string) => {
       if (!ended) socket.write(clientFrame(0x1, Buffer.from(text, 'utf8')));
