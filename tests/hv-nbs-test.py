@@ -27,7 +27,9 @@ device. Then:
   its requests waited -- twice, the counters only growing;
 - a guest on a with `disk=nbs:gdisk`: its disk the volume's size, its serial
   `nbs-<number>`; written with dd, synced, read back past the page cache the
-  same; stopped -- the volume let go of, detached;
+  same; a hundred writes of 4 KiB each flushed, one after another, none of
+  their requests left for the disk task's idle second; stopped -- the volume
+  let go of, detached;
 - a guest on b with it: what a's wrote is there;
 - a's start refused while b's guest has the volume, and with `force` taken:
   b's guest's next write fails, fenced, and a's guest reads what was there;
@@ -86,6 +88,11 @@ VOLUME_MIB = 64
 WRITE_MIB = 8
 # The write a host is killed under: 16 MiB, after the first
 LONG_MIB = 16
+# The writes of 4 KiB, each flushed, made one after another at QD1, and the
+# average a request of theirs may wait: a request left for the disk task's
+# idle second, every other one, is 500 ms
+QD1_WRITES = 100
+QD1_WAIT_NS = 100_000_000
 # N10d3: the disk hvboot boots, made an image; a's clone of it grown to
 # CLONE_MIB, and written at COPY_AT MiB -- inside the image, so over a
 # chunk the image shares -- with the image's first MiB
@@ -452,6 +459,27 @@ def main():
         check("written to its disk, synced", "nos-rc=0" in out, out)
         got, out = volume_sum(a, va, 0, WRITE_MIB)
         check("read back past the page cache, the same", got == written, out)
+        # Requests one after another at QD1, each handed over while the
+        # disk's task spins for the next: none left in its pipe for the
+        # task's idle second (the volume's `wake` said by its `poll`). Found
+        # on the demo stand, 2026-11-15: every other request waited 1 s, the
+        # write and the flush of each file dpkg unpacks among them. A write
+        # of 4 KiB and its flush a hundred times, in the volume's last MiB,
+        # which nothing else here writes: their average wait under 100 ms,
+        # where a second each other one is 500.
+        before = json_of(a.run('mgmt call vm disk_io {"name":"%d"}' % va))
+        out = a.run(x(va, "i=0; while [ $i -lt %d ]; do dd if=/dev/zero of=/dev/vda bs=4k count=1 seek=$((%d+i)) "
+                          "conv=fsync 2>/dev/null || break; i=$((i+1)); done; echo nos-qd1=$i"
+                      % (QD1_WRITES, (VOLUME_MIB - 1) * 256), 300))
+        after = json_of(a.run('mgmt call vm disk_io {"name":"%d"}' % va))
+        d0 = ((before or {}).get("disks") or [{}])[0]
+        d1 = ((after or {}).get("disks") or [{}])[0]
+        asked = (d1.get("writes", 0) - d0.get("writes", 0)) + (d1.get("flushes", 0) - d0.get("flushes", 0))
+        waited = d1.get("wait_ns", 0) - d0.get("wait_ns", 0)
+        check("%d writes of 4 KiB, each flushed, one after another: none left for the disk task's idle second "
+              "(%d requests, %.1f ms each on average)" % (QD1_WRITES, asked, waited / max(asked, 1) / 1e6),
+              ("nos-qd1=%d" % QD1_WRITES) in out and asked >= 2 * QD1_WRITES and waited < asked * QD1_WAIT_NS,
+              (before, after, out))
         a.run("hv stop %d" % va)
         check("stopped, the volume let go of",
               ipct.wait_for(lambda: "detached" in a.run("nbs volume gdisk"), 60, 1), a.run("nbs volume gdisk"))
