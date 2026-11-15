@@ -230,7 +230,12 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
             <input value={cpus} onChange={(e) => setCpus(e.target.value)} inputMode="numeric" name="cpus" className={input} />
           </label>
         </div>
-        <label className="block text-sm text-fg-soft">{ru ? 'Пароль консоли (необязательно)' : 'Console password (optional)'}
+        <label className="block text-sm text-fg-soft">
+          {ru ? 'Пароль пользователя образа (необязательно)' : "Password of the image's user (optional)"}
+          <span className="block text-xs text-muted">
+            {ru ? 'cloud-init задаёт его пользователю образа по умолчанию: ubuntu, debian, alpine…; root остаётся закрыт.'
+              : "cloud-init gives it to the image's default user: ubuntu, debian, alpine…; root stays locked."}
+          </span>
           <input value={password} onChange={(e) => setPassword(e.target.value)} type="password" name="password" className={input} />
         </label>
         {error && <p role="alert" className="text-sm text-bad">{error}</p>}

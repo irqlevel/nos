@@ -446,7 +446,7 @@ const nbsShare = (from, name, kind, host) => {
 
 const reads = {
   'system.info': () => ({
-    version: '0.0.28-mock', revision: 'mock', arch: 'x86_64', cpu_model: 'AMD Ryzen 5 3600 6-Core Processor',
+    version: '0.0.28-mock', revision: 'rev-' + me.name, arch: 'x86_64', cpu_model: 'AMD Ryzen 5 3600 6-Core Processor',
     cpus: CPUS, uptime_ms: uptimeMs(), time_s: Math.floor(Date.now() / 1000), log_level: 0,
     cmdline: 'root=UUID=0000 console=ttyS0',
   }),

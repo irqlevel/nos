@@ -347,8 +347,17 @@ def main():
               r is not None and r["down"] and r["wrong"] == 0, r)
         hub.heal(0, 1)
         check("healed, the two are up again", wait_for(lambda: peer_up(a, "b") and peer_up(b, "a"), 30, 1))
+        healed_at = time.time()
         r = ping(a, "kernel.echo@b", "count=50")
         check("and talk again", r is not None and r["answered"] == 50, r)
+        # A session up past the ten seconds the kernel reports a join at: its
+        # dialer waits it out without joining its links, so nothing says a
+        # wait that may never end -- every session up said one every five
+        # minutes on the demo stand
+        time.sleep(max(0.0, 12 - (time.time() - healed_at)))
+        joins = [h.run("dmesg 2000 ipcnet/dial") for h in (a, b)]
+        check("a session up past ten seconds is no join the kernel reports",
+              all("join: ipcnet/dial" not in out for out in joins), joins)
 
         # -- strangers --
         line = ipcnet_line(a, "c")

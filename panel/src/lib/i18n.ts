@@ -102,6 +102,18 @@ const en = {
   kind_read: 'read',
   kind_action: 'action',
   kind_job: 'job',
+  fillFrom: 'Fill in from another host of the panel\'s',
+  filledFrom: 'Filled in from',
+  addressReached: 'The address is the one the panel reaches it at',
+  ownPrivate: 'its own is a private one:',
+  natPort: 'behind a NAT, the port is the one the NAT forwards to it.',
+  noAddress: 'It says no address of its own: type the one the other hosts reach it at.',
+  fillNothing: 'its answer has nothing to fill in with.',
+  copy: 'Copy',
+  copied: 'Copied',
+  copyFailed: 'Not copied: select it and copy',
+  nosVersion: 'The nos this host runs: its version, the commit it was built of, the architecture',
+  panelVersion: 'The panel\'s version',
 } as const;
 
 export type Words = { [K in keyof typeof en]: string };
@@ -198,6 +210,18 @@ const ru: Words = {
   kind_read: 'чтение',
   kind_action: 'действие',
   kind_job: 'задача',
+  fillFrom: 'Заполнить по другому хосту панели',
+  filledFrom: 'Заполнено по',
+  addressReached: 'Адрес — тот, по которому его достигает панель',
+  ownPrivate: 'свой у него частный:',
+  natPort: 'за NAT порт — тот, который NAT к нему пробрасывает.',
+  noAddress: 'Своего адреса он не называет: введите тот, по которому его достигают другие хосты.',
+  fillNothing: 'в его ответе нечем заполнить.',
+  copy: 'Копировать',
+  copied: 'Скопировано',
+  copyFailed: 'Не скопировалось: выделите и скопируйте',
+  nosVersion: 'nos на этом хосте: версия, коммит сборки, архитектура',
+  panelVersion: 'Версия панели',
 };
 
 const dictionaries: Record<Locale, Words> = { en, ru };

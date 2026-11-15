@@ -1074,6 +1074,18 @@ What it holds to (plans/nbs.md, "Replication: the rules"):
 - **Two writes that overlap are never out at once.** A read goes to one
   active replica, this host's where it has one, and to another when it does
   not answer.
+- **Reads and writes out at once are held to a window.** Their bytes are
+  `WINDOW_BYTES` at most -- 2 MiB, half what ipcnet holds waiting for a
+  peer (4 MiB a class) -- or one alone, whatever its size; the rest wait
+  their turn in the session, nothing of them sent, and go as those out are
+  done. A guest keeps up to 64 requests of 248 KiB in flight, and before
+  the window all of it went at once: past the link's queue the rest
+  bounced, went again 200 ms on (`AGAIN_NS`), bounced again, the link idle
+  between -- on the demo stand, whose links carry 69 MB/s and answer in a
+  millisecond, writes took 1.5 s at 10 MiB/s, while `ioping` at depth 1 had
+  1.4 ms. A request waiting its turn has not gone, so no replica is silent
+  for it. The window is a session's: volumes written at once from one host
+  share the link's queue, two of them fitting it.
 - **Its view of a set is whole, or held as behind.** Each change raises a
   set's version by one, so a take-out's answer one past the view is that
   take-out alone; one further is changes the view lacks -- a join begun --
@@ -1250,8 +1262,9 @@ hold its last write is said, with where.
 ### A guest's disk: `nbs:<volume>`
 
 hv's guests take a volume as a disk: `disk=nbs:<volume>` on `hv start`, or
-in a vm.toml's `disk`. The disk is a virtio block device of 4 KiB blocks,
-the volume's size, its serial `nbs-<number>`; its task drives the session --
+in a vm.toml's `disk`. The disk is a virtio block device of 512-byte
+sectors over the volume's 4 KiB blocks -- its physical block, so that a
+distribution's image boots off it as off any disk -- the volume's size, its serial `nbs-<number>`; its task drives the session --
 attached as the guest starts, every cs fenced, the open chunks reconciled --
 and the guest stopped lets the volume go: flushed, closed, detached. `hv
 start <name> force` takes the VM's volumes from a writer elsewhere: a VM
@@ -1478,10 +1491,10 @@ only its metadata.
   its generation, not attaching anew, and writes the block once its memory
   is back (the `starved_past_deadline` end, a quarter of the seeds).
 
-  `--mutants` takes two hundred and seventy-one rules out one at a time --
+  `--mutants` takes two hundred and seventy-five rules out one at a time --
   eighty-five of the metadata's, six of them the controller's; sixty of the
   cs's engine; sixty-two of the wire's, its `serve`'s, the mds's, the
-  copy's and the scrub's; sixty-four of the client's -- each caught but
+  copy's and the scrub's; sixty-eight of the client's -- each caught but
   three: some only at the cluster seeds the gate runs past its range
   (`GATE_CLUSTER_ALSO`), their races moved past the range's by a change of
   the target's course. The three are known gaps (`tests/fuzz/nbs/mutants.py`'s

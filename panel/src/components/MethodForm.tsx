@@ -1,11 +1,16 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
+import { CopyButton } from './CopyButton';
 import { JobWatch } from './JobWatch';
 import { call, Refusal, startJob } from '@/lib/client';
 import { Field, Method } from '@/lib/descriptor';
+import { addressFor, at, copyable, fillOf, ipOfUrl } from '@/lib/fills';
 import { Locale, text, Words } from '@/lib/i18n';
+
+/** Another host of the panel's, as a form is filled in from it. */
+interface Other { id: string; name: string; url: string }
 
 
 /** A size typed with its unit, as the descriptor's bytes are. */
@@ -41,7 +46,11 @@ function valueOf(f: Field, raw: string, unit: number): { ok: true; v: unknown } 
 /** A method's form: its parameters from its descriptor, those the caller
  * fixed (`fixed`, a row's key) given and not asked; its confirm asked
  * before it runs -- with the value of `confirm_typed`'s parameter typed
- * again, where it has one; a job followed to its end. */
+ * again, where it has one; a job followed to its end. A form the panel can
+ * fill in from another host of its own (`fills.ts`: an invitation, from the
+ * host invited) has those hosts to choose from; what is too long to select
+ * by eye in an answer -- an invitation's token -- has a button that copies
+ * it. */
 export function MethodForm({ host, provider, name, method, fixed = {}, locale, w, onDone }: {
   host: string; provider: string; name: string; method: Method; fixed?: Record<string, unknown>;
   locale: Locale; w: Words; onDone?: () => void;
@@ -57,6 +66,11 @@ export function MethodForm({ host, provider, name, method, fixed = {}, locale, w
   const [asking, setAsking] = useState(false);
   const [typed, setTyped] = useState('');
   const [busy, setBusy] = useState(false);
+  const fill = fillOf(provider, name);
+  const [others, setOthers] = useState<Other[]>([]);
+  const [filledFrom, setFilledFrom] = useState('');
+  const [fillNote, setFillNote] = useState('');
+  const [fillError, setFillError] = useState('');
   /* What the user types to go on, when the method asks: the parameter's
    * value, as given or fixed */
   const mustType = method.confirm_typed
@@ -66,6 +80,57 @@ export function MethodForm({ host, provider, name, method, fixed = {}, locale, w
    * parameter fixed -- a row's key, a VM's name -- below the form, or it
    * was said nowhere */
   const byField = error?.field !== undefined && params.some(([k]) => k === error.field);
+
+  /* The panel's other hosts, where the form can be filled in from one */
+  useEffect(() => {
+    if (!fill) return;
+    let stop = false;
+    void fetch('/api/hosts').then((r) => (r.ok ? r.json() : null)).then((b: { hosts?: Other[] } | null) => {
+      if (!stop && b?.hosts) setOthers(b.hosts.filter((h) => h.id !== host));
+    }).catch(() => {});
+    return () => {
+      stop = true;
+    };
+  }, [fill, host]);
+
+  /** The form filled in from another host: its answer to the fill's read,
+   * each parameter from its place there -- an address the one every host is
+   * to reach it at (`addressFor`), said where it is not the host's own. */
+  async function fillIn(id: string) {
+    setFilledFrom(id);
+    setFillNote('');
+    setFillError('');
+    const other = others.find((h) => h.id === id);
+    if (!fill || !other) return;
+    const r = await call(other.id, provider, fill.read, {});
+    if (!r.ok) {
+      setFillError(other.name + ': ' + r.error.message);
+      return;
+    }
+    const got: Record<string, string> = {};
+    let note = `${w.filledFrom} ${other.name}.`;
+    for (const [k, path] of Object.entries(fill.params)) {
+      const f = method.params?.[k];
+      if (!f || k in fixed) continue;
+      const v = at(r.data, path);
+      if (f.type === 'ipv4') {
+        const own = typeof v === 'string' ? v : null;
+        const a = addressFor(own, ipOfUrl(other.url));
+        got[k] = a.ip;
+        if (a.from === 'reached') note += ` ${w.addressReached}${own ? ` (${w.ownPrivate} ${own})` : ''}; ${w.natPort}`;
+        else if (a.from === 'none') note += ' ' + w.noAddress;
+      } else {
+        got[k] = v === null || v === undefined ? '' : String(v);
+      }
+    }
+    if (Object.values(got).every((v) => v === '')) {
+      setFillError(other.name + ': ' + w.fillNothing);
+      return;
+    }
+    setRaw((cur) => ({ ...cur, ...got }));
+    setError(null);
+    setFillNote(note);
+  }
 
   async function run() {
     const body: Record<string, unknown> = { ...fixed };
@@ -114,6 +179,18 @@ export function MethodForm({ host, provider, name, method, fixed = {}, locale, w
 
   return (
     <form onSubmit={submit} className="space-y-3" data-testid={`form-${provider}-${name}`}>
+      {fill && others.length > 0 && (
+        <label className="block text-sm text-fg-soft">
+          <span>{w.fillFrom}</span>
+          <select value={filledFrom} onChange={(e) => void fillIn(e.target.value)} name="fill_from"
+            className="mt-1 block rounded-lg border border-line bg-bg px-2 py-1.5 text-fg">
+            <option value="">—</option>
+            {others.map((h) => <option key={h.id} value={h.id}>{h.name}</option>)}
+          </select>
+          {fillNote && <span className="mt-1 block text-xs text-muted" data-testid="fill-note">{fillNote}</span>}
+          {fillError && <span className="mt-1 block text-xs text-bad" role="alert">{fillError}</span>}
+        </label>
+      )}
       {params.map(([k, f]) => (
         <label key={k} className="block text-sm text-fg-soft">
           <span>{text(f.title, locale)}{f.required ? ' *' : ''}</span>
@@ -175,6 +252,11 @@ export function MethodForm({ host, provider, name, method, fixed = {}, locale, w
         <pre className="max-h-64 overflow-auto rounded-lg bg-bg-soft p-2 font-mono text-xs text-fg-soft" data-testid="answer">
           {JSON.stringify(answer, null, 2)}
         </pre>
+      )}
+      {answer !== null && copyable(answer).length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {copyable(answer).map(([k, v]) => <CopyButton key={k} value={v} label={`${w.copy} ${k}`} w={w} />)}
+        </div>
       )}
       {job !== null && <JobWatch host={host} id={job} w={w} onDone={() => onDone?.()} />}
     </form>

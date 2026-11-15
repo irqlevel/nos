@@ -27,6 +27,7 @@ export async function GET(req: Request, ctx: Ctx) {
     start(ctrl) {
       const send = (e: HubEvent) => ctrl.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
       send({ type: 'state', online: h.online, why: h.why || undefined });
+      if (h.nos) send({ type: 'nos', ...h.nos });
       if (h.last) send(h.last);
       if (h.lastLog.length) send({ type: 'log', lines: h.lastLog });
       send({ type: 'jobs', jobs: h.lastJobs });

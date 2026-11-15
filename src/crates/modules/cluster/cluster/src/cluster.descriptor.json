@@ -49,18 +49,19 @@
       "kind": "action",
       "title": {"en": "Invite a host", "ru": "Пригласить хост"},
       "help": {
-        "en": "A token for the host to join with, shown this once: `cluster join` takes it there, within 15 minutes.",
-        "ru": "Токен, с которым хост войдёт в кластер; показывается один раз: его принимает `cluster join` на том хосте, в течение 15 минут."
+        "en": "A token for the host to join with, shown this once: on the host invited, its cluster's page joins with it -- `cluster join` there -- within 15 minutes. The invitation is this cluster's: the host invited sees none.",
+        "ru": "Токен, с которым хост войдёт в кластер; показывается один раз: на приглашённом хосте его принимает «Войти в кластер» -- или `cluster join` там -- в течение 15 минут. Приглашение хранит этот кластер: на приглашённом хосте его не видно."
       },
       "params": {
         "host": {"type": "string", "required": true, "title": {"en": "Host", "ru": "Хост"}},
-        "ip": {"type": "ipv4", "required": true, "title": {"en": "Its address", "ru": "Его адрес"}},
+        "ip": {"type": "ipv4", "required": true, "title": {"en": "Its address", "ru": "Его адрес"},
+          "help": {"en": "Where every host reaches its ipcnet: its own address -- or, behind a NAT, the NAT's, which its own page cannot know.", "ru": "Где его ipcnet достижим для всех хостов: его собственный адрес -- или, за NAT, адрес NAT, которого его собственная страница знать не может."}},
         "port": {
           "type": "port",
           "title": {"en": "Its port", "ru": "Его порт"},
           "help": {
-            "en": "Where its ipcnet listens, if not where this host's does: one of two hosts behind a NAT's address.",
-            "ru": "Где слушает его ipcnet, если не там же, где у этого хоста: один из двух хостов за адресом NAT."
+            "en": "Where its ipcnet listens, if not where this host's does -- one of two hosts behind a NAT's address, the port the NAT forwards to it. Not its API's port.",
+            "ru": "Где слушает его ipcnet, если не там же, где у этого хоста, -- для хоста за NAT порт, который NAT пробрасывает к нему. Не порт его API."
           }
         },
         "key": {
@@ -68,8 +69,8 @@
           "required": true,
           "title": {"en": "Its key", "ru": "Его ключ"},
           "help": {
-            "en": "64 hex digits, as `ipcnet id` says them on the host invited.",
-            "ru": "64 шестнадцатеричные цифры, как их выводит `ipcnet id` на приглашаемом хосте."
+            "en": "Its ipcnet key, 64 hex digits: its cluster's page says it under Member (this host), `ipcnet id` there too. Not its API's key.",
+            "ru": "Его ключ ipcnet, 64 шестнадцатеричные цифры: его показывает страница кластера на приглашаемом хосте в «Участник» (этот хост), и `ipcnet id` там. Не ключ его API."
           }
         }
       }

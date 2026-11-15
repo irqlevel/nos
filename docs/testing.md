@@ -665,7 +665,10 @@ on each, a `Cluster` name, and `ipc ping` is what goes between them:
   answered whole and in order, the retransmissions counted;
 - the link cut: both hosts lose each other within 3 s and a margin, and a
   ping running across it ends with its monitor's Down; healed, up and
-  talking again;
+  talking again -- and its session, up past the ten seconds the kernel
+  reports a join at, said by neither host as a dialer's join that may never
+  end: a dialer waits its session out without joining its links (every
+  session up said one every five minutes on the demo stand);
 - `c`, whose key is not the one pinned for it, never up -- its handshake
   refused by `a`, which dials it -- and its SYNs to `b`'s port, where it is a
   stranger, dropped and counted with no slot taken;
@@ -3520,7 +3523,12 @@ the writer writes the chunk past its deadline, and that a write starved of
 memory past its deadline, reaching no replica, has none (the
 `starved_past_deadline` end); never more of a session's
 places closing at once than its window -- two, as the fuzzer builds
-nbsclient (`small_windows`) -- and a close asked alone of a few places done
+nbsclient (`small_windows`) -- nor more bytes of its reads and writes out,
+more than one out, than its window of them -- eight blocks there, two
+on a quarter of the seeds, where an operation larger than it goes alone,
+and none on the gate's seeds kept for a race found before the window,
+which run as they ran then (`RACES_BEFORE_WINDOW`): past it is what
+ipcnet's queue bounces -- and a close asked alone of a few places done
 in a moment, every place closed on every active replica (the
 `close_all_written` end); the leader's look at a cs before it is taken out
 the fuzzer's, mostly that it answers -- always once a host is lost for good
@@ -3726,7 +3734,7 @@ little and now and then past a silence.
     longer.
 
 `--mutants` runs `tests/fuzz/nbs/mutants.py`, which takes out one rule at a time.
-Each of its two hundred and seventy-one must fail the gate -- but the three
+Each of its two hundred and seventy-five must fail the gate -- but the three
 `KNOWN_GAPS` names, said as known gaps (below) -- run as
 `nbs-fuzz gate --first`, stopped at the first target that fails: the gate's
 verdict, sooner.
