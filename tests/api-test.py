@@ -220,6 +220,12 @@ def common(k, pin, arch, sh=None):
     s, _, host = a.request("GET", "/v1/host")
     pt.check("GET /v1/host: the host, and who asks", s == 200 and host.get("arch") == arch and
              host.get("client") == {"name": "admin", "role": "admin"} and host.get("key") == pin, (s, host))
+    # The host's order, not its client's: OpenSSL asks for AES-256-GCM first
+    # in TLS 1.3, which the kernel runs at half ChaCha20-Poly1305's speed
+    # (docs/tls.md)
+    suite = a.sock.cipher()[0] if a.sock is not None else None
+    pt.check("the host holds a client that asks for AES-GCM first to ChaCha20-Poly1305, its own first",
+             suite == "TLS_CHACHA20_POLY1305_SHA256", suite)
     a.close()
 
     # Refused before HTTP: the request count moves by the status calls alone

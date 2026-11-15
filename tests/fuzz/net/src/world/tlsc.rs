@@ -184,7 +184,11 @@ impl rustls::time_provider::TimeProvider for Clock {
 
 fn config(plan: &Plan) -> Arc<ClientConfig> {
     let keys = keys();
-    let provider = Arc::new(rustls_rustcrypto::provider());
+    /* AES-GCM first, as a client with AES-NI asks -- the panel's Node,
+     * nosctl's OpenSSL: the kernel's server takes its own order instead */
+    let mut provider = rustls_rustcrypto::provider();
+    provider.cipher_suites.sort_by_key(|s| tls::is_chacha20_poly1305(s.suite()));
+    let provider = Arc::new(provider);
     let algs = provider.signature_verification_algorithms;
     let versions: &[&'static rustls::SupportedProtocolVersion] =
         if plan.brk == Break::Tls12 { &[&rustls::version::TLS12] } else { &[&rustls::version::TLS13] };
@@ -245,6 +249,8 @@ pub struct Client {
     pub said_bye: bool,
     pub ending: Option<Ending>,
     tampered: bool,
+    /// Whether the suite it agreed on was held to the server's order.
+    suite_held: bool,
     /// When it connected.
     pub at: u64,
 }
@@ -257,7 +263,8 @@ impl Client {
                                                          .to_owned()).expect("a client connection")),
         };
         Client { ep, plan, talk: None, conn, fed: 0, incoming: Vec::new(), started: false, up: false, lines_sent: 0,
-                 got: Vec::new(), said_bye: false, ending: None, tampered: false, at: sched::now() }
+                 got: Vec::new(), said_bye: false, ending: None, tampered: false, suite_held: false,
+                 at: sched::now() }
     }
 
     /// A client that says what `talk` says.
@@ -432,6 +439,16 @@ impl Client {
             }
             if discard != 0 {
                 self.incoming.drain(..discard);
+            }
+            /* The kernel's server holds a client to its own order, whatever
+             * the client's -- this one's puts AES-GCM first */
+            if self.up && !self.suite_held {
+                self.suite_held = true;
+                let suite = conn.negotiated_cipher_suite().map(|s| s.suite());
+                if suite != Some(rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256) {
+                    panic!("invariant: the kernel's server agreed on {:?} with a client that puts AES-GCM first, \
+                            not its own first, ChaCha20-Poly1305", suite);
+                }
             }
             if stop {
                 break;
