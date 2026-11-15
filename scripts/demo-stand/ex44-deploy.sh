@@ -18,6 +18,11 @@
 #
 #   DEMO_SSH_CONFIG=<ssh config> scripts/demo-stand/ex44-deploy.sh <image>
 #
+# With DEMO_KEEP=1 the stand's state is kept, the image alone changed: the
+# panel's VM stopped, not deleted -- /etc/rc's `api panel create` starts it
+# again, panel-update.sh installs a bundle in it -- and nos's root not made
+# ready: the cluster, NBS and hosts.toml as they are. e2fsck -fn still.
+#
 # The ssh config names hosts ex44-nos and ex44-ubuntu (ssh_config.example).
 # A step that fails stops it where it is, said; one in Ubuntu leaves Ubuntu
 # running.
@@ -27,6 +32,7 @@ ROOT=$(cd "$HERE/../.." && pwd)
 CFG=${DEMO_SSH_CONFIG:?an ssh config with hosts ex44-nos and ex44-ubuntu: ssh_config.example}
 ROOT_UUID=${EX44_ROOT_UUID:-83e77975-48f2-4356-819b-7b01d482c5de}
 NAME=${EX44_NAME:-ex44}
+KEEP=${DEMO_KEEP:-0}
 LOCAL=${1:?the system image: build.sh makes nos-x86_64.squashfs}
 LOG=$ROOT/out/demo
 mkdir -p "$LOG"
@@ -75,14 +81,18 @@ VMS=$(running) || exit 1
 echo "$VMS" > "$LOG/ex44-vms-before"
 echo "   running: $(echo $VMS)"
 
-step "the panel's VM stopped and deleted: the next boot makes it anew, of the image's bundle"
+if [ "$KEEP" = 1 ]; then
+    step "the panel's VM stopped, kept: the next boot starts it again"
+else
+    step "the panel's VM stopped and deleted: the next boot makes it anew, of the image's bundle"
+fi
 if on_nos "hv vms" | grep -qw panel; then
     if running | grep -qx panel; then
         on_nos "hv stop panel secs=60" | head -3
     fi
     for t in $(seq 0 5 90); do running | grep -qx panel || break; sleep 5; done
     if running | grep -qx panel; then echo "   the panel runs still -- not going on"; exit 1; fi
-    on_nos "hv delete panel force" | head -5
+    [ "$KEEP" = 1 ] || on_nos "hv delete panel force" | head -5
 fi
 
 step "every other VM stopped by its power button, up to 180 s"
@@ -106,6 +116,7 @@ wait_for ex44-ubuntu "uname -r" "Ubuntu" 900 || exit 1
 step "nos's root held to e2fsck -fn"
 fsck_nos || exit 1
 
+if [ "$KEEP" != 1 ]; then
 step "nos's root made ready for the demo"
 cat > "$LOG/ex44-prepare.sh" <<'PREP'
 #!/bin/bash
@@ -145,6 +156,7 @@ PREP
 scp -F "$CFG" "$LOG/ex44-prepare.sh" ex44-ubuntu:/root/ex44-prepare.sh || exit 1
 on_ubuntu "bash /root/ex44-prepare.sh $DEV $NAME" || { echo "   not made ready -- stopping here, Ubuntu left running"; exit 1; }
 fsck_nos || exit 1
+fi
 
 step "the image copied"
 scp -F "$CFG" "$LOCAL" ex44-ubuntu:$IMG || exit 1
@@ -172,7 +184,7 @@ on_ubuntu "setsid -f reboot > /dev/null 2>&1 < /dev/null"
 sleep 30
 wait_for ex44-nos "version" "nos" 900 || exit 1
 
-step "the panel made anew by /etc/rc, followed until it runs -- up to 20 minutes"
+step "the panel made anew -- or started, DEMO_KEEP -- by /etc/rc, followed until it runs -- up to 20 minutes"
 out=
 for t in $(seq 0 20 1200); do
     out=$(on_nos "api panel" 2>/dev/null) || out=
