@@ -276,8 +276,8 @@ trait Media: Send + Sync {
     fn reap(&self, done: &mut dyn FnMut(usize, bool)) -> usize;
     /// Spun for up to `d`: whether anything came meanwhile -- a command done
     /// or a request handed over (`wake`) -- for the task to look again
-    /// rather than sleep. A wake the media takes and does not say is a
-    /// request left in the pipe until the task's next look, `IDLE_SECS` on.
+    /// rather than sleep. The task looks at its pipe before it sleeps all
+    /// the same (`serve`), so that a wake taken and not said costs nothing.
     fn poll(&self, d: Duration) -> bool;
     fn wait(&self, d: Duration) -> bool;
     fn wake(&self);
@@ -915,6 +915,15 @@ fn serve(start: Serve) {
              * likely to come (POLL_MAX_NS). */
             let looked = kcore::time::boot_time_ns();
             if poll_ns != 0 && queue.poll(Duration::from_nanos(poll_ns)) {
+                continue;
+            }
+            /* The pipe looked at before the sleep, whatever the poll said: a
+             * wake a media takes in its poll and does not say leaves the
+             * request it was for in the pipe for the whole IDLE_SECS -- a
+             * volume's said only what its session had done, and every other
+             * request of a guest's at QD1 waited a second (52c681db). A
+             * request handed over after this look signals the sleep. */
+            if poll_ns != 0 && !pipe.requests.lock().todo.is_empty() {
                 continue;
             }
             queue.wait(Duration::from_secs(IDLE_SECS));
