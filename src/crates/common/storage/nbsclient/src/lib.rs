@@ -127,9 +127,14 @@ pub const CHAIN_WAIT_NS: u64 = 250_000_000;
 /// bandwidth times a chain's round trip.
 #[cfg(not(feature = "small_windows"))]
 pub const WINDOW_BYTES: u64 = 2 << 20;
-/// The fuzzer's: two blocks, its operations a few blocks each.
+/// The fuzzer's, unless its target sets another (`set_window`): eight
+/// blocks, its operations one to four blocks each, six out at most -- full
+/// often, yet with room for a few at once. At two blocks a client had one
+/// out nearly always, and the cluster target's chains, which need a second
+/// write out, fell to a seventh; the target gives a session two on some
+/// seeds, where an operation larger than the window has to go alone.
 #[cfg(feature = "small_windows")]
-pub const WINDOW_BYTES: u64 = 2 * BLOCK;
+pub const WINDOW_BYTES: u64 = 8 * BLOCK;
 /// How long an operation may take before it fails.
 pub const DEADLINE_NS: u64 = 60_000_000_000;
 /// How long the attach is asked for before the session fails: a session
@@ -580,6 +585,9 @@ pub struct Session {
     /// memory.
     #[cfg(feature = "starve")]
     starve_until: u64,
+    /// The fuzzer's: its window, `WINDOW_BYTES` unless set (`set_window`).
+    #[cfg(feature = "small_windows")]
+    window: u64,
 }
 
 impl Session {
@@ -603,6 +611,8 @@ impl Session {
             said_attach: 0, here_at: 0, fresh: false, mended: 0,
             #[cfg(feature = "starve")]
             starve_until: 0,
+            #[cfg(feature = "small_windows")]
+            window: WINDOW_BYTES,
         }
     }
 
@@ -629,6 +639,24 @@ impl Session {
     #[cfg(feature = "starve")]
     pub fn starve_until(&mut self, until: u64) {
         self.starve_until = until;
+    }
+
+    /// The fuzzer's: the session's window of reads and writes out, in bytes
+    /// -- one smaller than its operations on some seeds, where one has to go
+    /// alone (`pump`).
+    #[cfg(feature = "small_windows")]
+    pub fn set_window(&mut self, bytes: u64) {
+        self.window = bytes;
+    }
+
+    /// The bytes of reads and writes the session lets out at once:
+    /// `WINDOW_BYTES`, or the fuzzer's own.
+    fn window(&self) -> u64 {
+        #[cfg(feature = "small_windows")]
+        let window = self.window;
+        #[cfg(not(feature = "small_windows"))]
+        let window = WINDOW_BYTES;
+        window
     }
 
     /// Whether a request of `what` finds no memory now: the fuzzer's write
@@ -754,7 +782,7 @@ impl Session {
         let (flying, many) = self.in_flight();
         let mut s = alloc::format!("{:?}, generation {}: {} operations, {} reads and writes out of {} bytes, the \
                                     window {}", self.phase, self.generation, self.ops.len(), many, flying,
-                                   WINDOW_BYTES);
+                                   self.window());
         for (id, o) in self.ops.iter().take(REPORT_NAMED) {
             s += &alloc::format!(" [#{} {:?} {}+{} pieces {} waiting {:?} out {}]", id, o.kind, o.offset, o.len,
                                  o.pieces, o.waiting, o.out);
@@ -2286,7 +2314,7 @@ impl Session {
                start others, before it comes back here */
             if matches!(o.kind, Kind::Read | Kind::Write) && o.tag & INTERNAL == 0 {
                 let (flying, _) = self.in_flight();
-                if flying != 0 && flying + u64::from(o.len) > WINDOW_BYTES {
+                if flying != 0 && flying + u64::from(o.len) > self.window() {
                     break;
                 }
             }
