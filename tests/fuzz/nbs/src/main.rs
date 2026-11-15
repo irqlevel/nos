@@ -103,10 +103,23 @@ const CLUSTER_STEPS: u64 = 2000;
 /// 60065, 61530), and a write of a chain applied before a join of its set
 /// began written again as it comes again (`relayed_joins`, 60834, 70881). A
 /// stopgap: a race moved on by the next change is lost again, which the
-/// mutants say.
-const GATE_CLUSTER_ALSO: [u64; 34] = [1232, 2759, 5241, 6647, 7786, 1219, 1960, 2149, 3663, 5316, 7225, 2758, 4206,
+/// mutants say. The client's window of reads and writes out moved all of
+/// these on at once -- four of the client's mutants past the gate -- so
+/// the races found before it run as they ran then, with no window
+/// (`RACES_BEFORE_WINDOW`, `cluster::window_for`), the window held to the
+/// range's seeds; and two of them found again with the window, by a
+/// campaign of each mutant: a copy-up by a view behind its set asked again
+/// from its start (`client_copy_stale_view`, 104847) and a close of the
+/// driver's waiting on a place a write took as it began
+/// (`client_close_after_write`, 301241).
+const GATE_CLUSTER_ALSO: [u64; 36] = [1232, 2759, 5241, 6647, 7786, 1219, 1960, 2149, 3663, 5316, 7225, 2758, 4206,
                                       5375, 2962, 9122, 8918, 4710, 10774, 11883, 16293, 16662, 20346,
-                                      17081, 17235, 18153, 18466, 25047, 25064, 61339, 60065, 61530, 60834, 70881];
+                                      17081, 17235, 18153, 18466, 25047, 25064, 61339, 60065, 61530, 60834, 70881,
+                                      104847, 301241];
+/// The first of `GATE_CLUSTER_ALSO`, found before the client had a window:
+/// each run with none, its course the one its race was found in. A seed
+/// found since goes after them, and runs with the window its run draws.
+const RACES_BEFORE_WINDOW: usize = 34;
 const GATE_JOIN_SEEDS: u64 = 800;
 /// The `tail` target's: the cluster target's over a volume no whole number of
 /// chunks (the review of 2026-11).
