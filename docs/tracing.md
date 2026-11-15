@@ -765,6 +765,95 @@ before its handler. On, an interrupt is two records (`trace bench`'s cost
 of one, above), the task's lookup and a read of the counter; `irq_exit`
 alone is one record.
 
+## NBS's events
+
+A volume's request from its client to a chunk server and back, group `nbs`
+([NBS](nbs.md)). The client is a volume's session, driven by `nbsdrive` --
+a VM's `nbs:` disk in hv, `nbs io`, nbsload -- and the chunk server
+`nbs-cs`; both make their records through `modules/storage/nbstrace`, the
+one place nbswire's requests and answers are said as these events' values.
+Every record names a request by its session's `id`, which ipcnet's records
+of its message carry too (`reference`):
+
+| event | where, and what it records |
+|---|---|
+| `nbs_req` | a request the client sent a chunk server (`nbsdrive`'s `handle`): what it asks (`op`: `fence`, `write`, `read`, `flush`, `close`, `held`, `ping`, a joiner's `holdings`, `pull` and `sums`, the leader's `scrub`, a `copy_up`), the `volume`, the `chunk` and where in it (`offset`), its bytes (`len`: a write's data, a read's asked), and the `cs` it went to |
+| `nbs_ans` | the chunk server's answer, back at the client (`feed`): `ok`, or why refused -- nbswire's refusals by name, `fenced`, `epoch`, `no_room`, `behind`, `not_ready` and the rest -- the host it came `from` (0 this one) and its `bytes` |
+| `nbs_bounce` | a request that never reached its chunk server: refused at the send -- no such mailbox or way, `gone`; the way `full` -- or bounced back by the channel (`unsent`) |
+| `nbs_cs_req` | a request a chunk server took (`serve.rs`'s `request`), as `nbs_req` says one, and the host it came `from` |
+| `nbs_cs_done` | its answer there: what it says, and how long it took from the taking (`ns`) -- the engine's turns, its device's commands, its mds's checks |
+
+So where a request's time goes is in its records: from `nbs_req` to
+`nbs_cs_req` the client's host and the channel -- `ipcnet_queue` of the
+same number, and the queue's bytes before it -- the chunk server's own in
+`nbs_cs_done`'s `ns`, its device's in the block layer's `bio_submit` and
+`bio_done` (`trace on disk`), and the way back to `nbs_ans`; a guest's own
+request before and after it is its disk's (`blk_submit` to `disk_start`,
+`disk_done` to `blk_complete`). The fields filter as everywhere:
+
+```
+> trace on nbs ipcnet disk
+> trace show 50 nbs_cs_done status=epoch        # what chunk servers refused, and why
+> trace show nbs_req op=flush                   # a guest's fsyncs, as they went out
+> trace show nbs_bounce                         # what never got there
+```
+
+Off, a site is the flag's load and a branch where it is called: nbstrace's
+tests and ipcnet's (`records.rs`) are `#[inline]` and what a record takes is
+`#[cold]`, out of line, so in a module a site is the flags' address through
+its GOT, the flag's byte and a branch, with no call. A request's bytes are
+read again for its record, and the chunk server's clock read for its time,
+only while the event is on. Measured on the AX41 (x86-64 under KVM, three
+hosts, nbsload on a; nine rounds of each, three boots alternated with the
+tree before these events): writes at depth 1 1323 IOPS before and 1333
+after, at depth 16 3545 and 3563, random reads at depth 16 35533 and 35224
+-- each difference inside the runs' own spread (the reads' 32916-37865).
+With `trace on nbs raft ipcnet` on every host, every request recorded at
+its client and its chunk servers: 1330, 3539 and 35075, inside it too.
+
+## Raft's events
+
+A raft member's life, group `raft`: recorded by raftmember, the engine
+cluster.ko's registry and nbs-mds.ko's metadata both run, so every record
+says which (`of`: `registry`, `nbs`):
+
+| event | where, and what it records |
+|---|---|
+| `raft_role` | the member's role, term or leader changed, as raft's processing left it (`process`): the `role` -- `follower`, `pre_candidate`, `candidate`, `leader` -- the `term`, and the `leader`'s node id (0 none) |
+| `raft_send` | a message the member sent (`send_raft`): its `kind` -- a vote and a pre-vote and their answers, `append`, `append_resp`, `heartbeat` and its answer, a `snapshot` piece and its answer, `timeout_now`, `read_index` and its answer -- the `peer`'s node id, the `term`, the `index` it is about (an append's previous one, a vote's last, a response's, a heartbeat's commit, a snapshot's), the entries it carries (`count`; a snapshot piece's bytes), and for a response whether it granted or took it (`ok`) |
+| `raft_recv` | a message the member took in (`on_raft`), as `raft_send` says one -- only one from the node its host is: one refused for its host is counted, not recorded |
+| `raft_commit` | what the member has `committed` and `applied`, as either moved on |
+
+So an election is in its records -- the pre-votes and votes out and back,
+the role through `pre_candidate` and `candidate` to `leader` or back to
+`follower` -- and a follower behind is its `append_resp`s with `ok` 0 and
+the indexes the leader steps back through; how long a command takes to
+commit is its index from the leader's `append` to its `raft_commit`.
+
+```
+> trace on raft
+> trace show raft_role                          # every election, both rafts
+> trace show raft_recv kind=append_resp ok=0    # a follower's refusals
+> trace show raft_commit of=nbs                 # NBS's metadata moving on
+```
+
+## ipcnet's events
+
+The channel between hosts, group `ipcnet` ([The channel between
+hosts](cluster.md)), recorded by the module's router and its peers
+(`modules/cluster/ipcnet/src/records.rs`):
+
+| event | where, and what it records |
+|---|---|
+| `ipcnet_link` | a peer's session `up` (1), or lost (0): the peer's host number in the channel, its sessions up and lost so far (`ups`, `losses`) |
+| `ipcnet_queue` | a message the router queued for a peer: its `reference` -- an NBS request's id -- its `bytes`, which class's queue (`bulk` 1, control 0) and that queue's bytes with it (`queued`) |
+| `ipcnet_bounce` | a message for a peer bounced back to its sender, and `why`: its class's queue `full` (1 MiB control, 4 MiB bulk), the peer `down` -- not up, or up in another session than the message's -- or its session `lost` before it went |
+
+So how full a peer's queues run is the `queued` of its `ipcnet_queue`s, and
+what went back to its senders, and why, is its `ipcnet_bounce`s -- the
+writes NBS's client once had bounced, before its window, were the bulk
+queue `full`.
+
 ## An event of its own
 
 An event is four things in `kernel/tracepoint.{h,cpp}`: its number in

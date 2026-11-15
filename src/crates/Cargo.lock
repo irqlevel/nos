@@ -697,6 +697,7 @@ dependencies = [
  "kcore",
  "kmod",
  "nbscs",
+ "nbstrace",
  "nbswire",
 ]
 
@@ -797,6 +798,7 @@ dependencies = [
  "ipcctl",
  "kcore",
  "nbsclient",
+ "nbstrace",
  "nbswire",
 ]
 
@@ -808,6 +810,14 @@ dependencies = [
  "ipcwire",
  "raft",
  "sha2",
+]
+
+[[package]]
+name = "nbstrace"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "nbswire",
 ]
 
 [[package]]
