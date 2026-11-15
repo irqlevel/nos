@@ -475,7 +475,7 @@ const reads = {
   'fs.mounts': () => ({ mounts: [{ path: '/', fs: 'ext2', device: 'nvme0n1p5', read_only: false,
     total_bytes: 400 * 1024 * MIB, free_bytes: 310 * 1024 * MIB }] }),
   'api.status': () => ({ serving: true, port: 39234, connections: [], key: hostPin, accepted: limits.accepted,
-    busy: limits.busy }),
+    busy: limits.busy, consoles: Object.fromEntries(consoleStreams) }),
   'api.clients': () => ({ clients: [{ name: 'panel', role: 'admin', key: adminPin }, { name: 'reader', role: 'read', key: readerPin }] }),
   'vm.list': () => ({ vms: [...vms.values()].map(vmJson) }),
   'vm.get': (p) => {
@@ -1435,7 +1435,10 @@ function stream(req, socket, who) {
       }
     });
   }
+  let counted = false;
   if (has('console') && vms.has(vmName)) {
+    counted = true;
+    consoleStreams.set(vmName, (consoleStreams.get(vmName) || 0) + 1);
     every(30, () => {
       try {
         const data = reads['vm.console_read']({ name: vmName, from: consoleFrom, max_bytes: 16384, terminal: true });
@@ -1472,7 +1475,15 @@ function stream(req, socket, who) {
       }
     }
   });
-  const stop = () => timers.forEach(clearInterval);
+  const stop = () => {
+    timers.forEach(clearInterval);
+    if (counted) {
+      counted = false;
+      const n = (consoleStreams.get(vmName) || 1) - 1;
+      if (n > 0) consoleStreams.set(vmName, n);
+      else consoleStreams.delete(vmName);
+    }
+  };
   socket.on('close', stop);
   socket.on('error', stop);
 }
@@ -1502,10 +1513,14 @@ const all = descriptors();
  * in all, of one client's key, and in their handshake. One past them is
  * reset as nos resets it -- at the door, or right after its handshake when it
  * is its key's -- and counted as api.status counts it on nos, `busy`. */
-const MAX_CONNECTIONS = 8;
-const MAX_PER_KEY = 4;
+const MAX_CONNECTIONS = 12;
+const MAX_PER_KEY = 8;
 const MAX_HANDSHAKES = 2;
 const limits = { accepted: 0, busy: 0, open: new Set(), handshaking: 0 };
+/** The streams open on a VM's console, by its name: what the panel's tests
+ * hold to one however many tabs show it (`api.status`'s `consoles`, the
+ * mock's own). */
+const consoleStreams = new Map();
 
 /** The SHA-256 of the key a TLS connection's certificate has, or null. */
 function keyOf(socket) {

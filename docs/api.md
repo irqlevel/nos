@@ -75,8 +75,8 @@ have or one given twice refused with its line:
 port = 39234                 # the API's port; the panel's relay is the host's 39233
 listen = ["hv0"]             # the interfaces: the guests' switch alone unless told
 allow_eth0 = ["203.0.113.0/24", "198.51.100.7"]   # whom an interface takes; none said, any
-max_connections = 8          # at once, in all
-max_per_key = 4              # of one client's key
+max_connections = 12         # at once, in all
+max_per_key = 8              # of one client's key
 max_handshakes = 2           # in their handshake
 idle_secs = 60               # a connection that says nothing this long is let go
 ```
@@ -85,10 +85,15 @@ Past a limit a connection is reset: at the door for the connections in all
 and those in their handshake, just after its handshake for its key's -- what
 a client reads as ECONNRESET, `busy` in `api status`. A client keeps within
 them: the panel makes one connection to a host at a time, keeps two for its
-requests and one for its stream, and tries a connection reset at the door
-again a little later (`panel/src/lib/nosapi.ts`). One that opened them as it
-pleased -- the panel's own, at first -- has its pages fail on a real host
-while a mock with no limits lets everything in; the mock has them now.
+requests and one for its stream, one more a VM's console open -- one
+however many of its tabs show it -- and tries a connection reset at the
+door again a little later (`panel/src/lib/nosapi.ts`); one reset just after
+its handshake it says is past the limit of its key, not `ECONNRESET`. One
+that opened them as it pleased -- the panel's own, at first -- has its pages
+fail on a real host while a mock with no limits lets everything in; the mock
+has them now. At four a key there was no room for a console beside the
+panel's own three: a second one, or a tab reloaded while the host still
+held the last, was reset.
 
 `hv0` is made the first time hv loads, so its listener looks for it once a
 second; a net device is never taken back, so the listener stays good through
