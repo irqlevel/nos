@@ -38,9 +38,10 @@
 //! of a name on the list at a time. Its console goes to `console.log` in the
 //! folder (`vmlog`), with a line for what became of it at every start, boot
 //! and stop (`Shared::note`); its port on the switch is the one it asks for
-//! (`port=`), and nos's ports it asks for are relayed to it once it runs
-//! (`forward=`) -- as for a guest started by its kernel's path with those
-//! words.
+//! (`port=`) -- or, asking for none, the one it was given at its first
+//! start and kept there (`store::keep_port`) -- and nos's ports it asks for
+//! are relayed to it once it runs (`forward=`) -- as for a guest started by
+//! its kernel's path with those words.
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -1637,6 +1638,22 @@ impl Vms {
             .map(Arc::new)
             .ok_or_else(|| alloc::format!("vm {} not started -- out of memory for its console", id))?;
         let not_started = |why: &dyn core::fmt::Display| alloc::format!("vm {} not started -- {}", id, why);
+
+        /* A VM from a folder whose vm.toml names no port is given one now,
+         * kept there as its UUID is: its MAC and its address the same at
+         * every start after, whatever order the VMs start in -- a guest's
+         * own network configuration names them (`store::keep_port`). */
+        if spec.net && spec.port.is_none() {
+            if let Some((folder, _)) = &stored {
+                match store::keep_port(self, folder) {
+                    Ok(p) => spec.port = Some(p as usize),
+                    Err(e) => {
+                        let _ = writeln!(out, "hv: its port of the switch is not kept -- {}: a free one now, maybe \
+                                               another at its next start", e);
+                    }
+                }
+            }
+        }
 
         /* With `net`, a port on the switch -- made by the first such guest --
          * and the address that goes with it on the guest's command line;
