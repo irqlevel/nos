@@ -12,6 +12,8 @@ const PANEL = 3101;
 const STATE = 'test-results/mock-state';
 export const STATE_B = 'test-results/mock-state-b';
 export const PASSWORD = 'playwright-only-password';
+/** The panel's version, as the environment says it to the panel run here. */
+export const PANEL_VERSION = 'pw-panel-1';
 
 export default defineConfig({
   testDir: 'tests',
@@ -35,7 +37,8 @@ export default defineConfig({
     },
     {
       command: `rm -rf test-results/panel-data && node mock/seed.mjs ${STATE} ${MOCK} ${PASSWORD} > test-results/seed.json`
-        + ` && PANEL_SEED=test-results/seed.json PANEL_DATA=test-results/panel-data npx next start -p ${PANEL}`,
+        + ` && PANEL_SEED=test-results/seed.json PANEL_DATA=test-results/panel-data PANEL_VERSION=${PANEL_VERSION}`
+        + ` npx next start -p ${PANEL}`,
       port: PANEL,
       reuseExistingServer: false,
       timeout: 120_000,

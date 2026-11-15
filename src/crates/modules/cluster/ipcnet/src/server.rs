@@ -391,8 +391,8 @@ fn listener_main(shared: Arc<Shared>) {
 }
 
 /// A dialer: a session at a time -- the control connection, and once it
-/// has said its Hello the bulk one -- each waited out as it ends, and the
-/// next after a wait that doubles while none comes up.
+/// has said its Hello the bulk one -- waited out as it ends, its links let
+/// go of then, and the next after a wait that doubles while none comes up.
 fn dialer_main((shared, peer): (Arc<Shared>, Arc<Peer>)) {
     let mut backoff = BACKOFF_MIN_MS;
     while !shared.stop.load(Ordering::Acquire) && !peer.removed.load(Ordering::Acquire) {
@@ -424,7 +424,18 @@ fn dialer_main((shared, peer): (Arc<Shared>, Arc<Peer>)) {
         if bulk.is_none() {
             peer.lose(&shared.router, session, "its bulk connection never began");
         }
-        /* Both end when the session does */
+        /* The session waited out here, its links let go of once it is over
+         * -- each at its end by then, or within a poll or a handshake's wait.
+         * Joined for the session's life instead, each dialer was a wait the
+         * kernel reports past ten seconds as one that may never end: every
+         * session up said "has waited" every five minutes for as long as it
+         * was up (the demo stand's ax41a and ax41b, sessions of 80 minutes).
+         * A link that ends ends its session first (`serve`, `dial`), and a
+         * peer taken off hosts.toml has its session ended, so this ends
+         * with them */
+        while peer.current(session) && !shared.stop.load(Ordering::Acquire) {
+            kcore::task::sleep_ms(POLL_MS);
+        }
         drop(bulk);
         drop(control);
         backoff = if peer.counts.ups.load(Ordering::Relaxed) != ups {

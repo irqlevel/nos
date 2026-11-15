@@ -5,12 +5,13 @@
 //! hv hands back what the disk has done. A request that is never answered
 //! is a timeout said on the console, not a loader spinning for good.
 //!
-//! A device whose blocks are larger than a sector says so (`F_BLK_SIZE`) --
-//! hv's for a volume of NBS's, of 4 KiB -- and hv holds every request to
-//! whole blocks of it: such a disk is read and written in whole blocks, the
-//! part of one a read or a write takes at either end through a block's
-//! buffer of the disk's own -- a write's read first, changed, and written
-//! whole (grubenv's, a kilobyte at its block's start).
+//! A device whose blocks are larger than a sector and that says so
+//! (`F_BLK_SIZE`, holding every request to whole ones -- QEMU's of a 4Kn
+//! disk; hv's show 512-byte sectors whatever their backend's block) is read
+//! and written in whole blocks, the part of one a read or a write takes at
+//! either end through a block's buffer of the disk's own -- a write's read
+//! first, changed, and written whole (grubenv's, a kilobyte at its block's
+//! start).
 
 use alloc::string::String;
 use alloc::vec::Vec;
