@@ -720,6 +720,10 @@ def main():
         # write under way meanwhile reaches it as a joiner
         need("every chunk at three replicas, none being copied, no cs down: the cluster settled",
              ipct.wait_for(lambda: whole(a), 60, 1), a.run("nbs status"))
+        # Its records (`trace on nbs raft ipcnet`, docs/tracing.md), on every
+        # host, for the writes and the flush below
+        for x in sh:
+            x.run("trace on nbs raft ipcnet")
         out = a.run("nbs io write disk1 0 65536 0x5a")
         m = re.search(r"65536 bytes of 0x5a written at 0 of disk1, generation (\d+): 1 chunks, to every replica in",
                       out)
@@ -742,6 +746,37 @@ def main():
               "attached for writing" in out, out)
         out = a.run("nbs io flush disk1")
         check("flushed", "nbs: disk1 flushed" in out, out)
+        # What the records say of them: a's requests by their session's ids,
+        # each answered; the same ids taken and answered at the other hosts'
+        # chunk servers -- relayed along a write's chain, or asked of each --
+        # and queued for a peer by ipcnet under that number; both rafts'
+        # messages
+        reqs = a.run("trace show 200 nbs_req")
+        writes = set(re.findall(r"nbs_req: id=(\d+) op=write ", reqs))
+        flushes = set(re.findall(r"nbs_req: id=(\d+) op=flush ", reqs))
+        check("a's writes and its flush recorded as they went to the chunk servers (nbs_req)",
+              len(writes) > 0 and len(flushes) > 0, reqs[-2000:])
+        answers = a.run("trace show 200 nbs_ans")
+        ok_ids = set(re.findall(r"nbs_ans: id=(\d+) status=ok ", answers))
+        check("each answered ok at a (nbs_ans)", (writes | flushes) <= ok_ids, (sorted(writes | flushes),
+                                                                              answers[-2000:]))
+        taken = b.run("trace show 200 nbs_cs_req") + c.run("trace show 200 nbs_cs_req")
+        done = b.run("trace show 200 nbs_cs_done") + c.run("trace show 200 nbs_cs_done")
+        remote = set(re.findall(r"nbs_cs_req: id=(\d+) op=\w+ from=([1-9]\d*) ", taken))
+        check("the same requests taken by b's and c's chunk servers, from another host (nbs_cs_req)",
+              any(i in writes for i, _ in remote) and any(i in flushes for i, _ in remote), taken[-2000:])
+        check("and answered there ok, with their time (nbs_cs_done)",
+              any(re.search(r"nbs_cs_done: id=%s op=\w+ from=\d+ status=ok ns=" % i, done) for i in writes),
+              done[-2000:])
+        queued = a.run("trace show 400 ipcnet_queue")
+        check("a's requests queued for a peer by ipcnet under their ids (ipcnet_queue's reference)",
+              any(re.search(r"ipcnet_queue: peer=\d+ bulk=\d reference=%s " % i, queued) for i in writes | flushes),
+              queued[-2000:])
+        rafts = a.run("trace show 200 raft_send") + a.run("trace show 200 raft_recv")
+        check("both rafts' messages, the registry's and NBS's (raft_send, raft_recv)",
+              "of=registry" in rafts and "of=nbs" in rafts, rafts[-2000:])
+        for x in sh:
+            x.run("trace off nbs raft ipcnet")
         out = a.run("nbs io held disk1")
         check("its two chunks open on every cs, at a's generation",
               all(re.search(r"^\s+%s\s+2 chunks of disk1 open:.*@%d" % (h, gen1), out, re.M) for h in HOSTS), out)

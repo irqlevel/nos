@@ -354,6 +354,101 @@ names! {
         /// Data, for a receive
         Data = "data",
     }
+
+    /// What an NBS request asks (`nbs_req`'s and the chunk server's `op`):
+    /// nbswire's `Op`, in its order
+    NbsOp {
+        Fence = "fence",
+        Write = "write",
+        Read = "read",
+        Flush = "flush",
+        Close = "close",
+        Held = "held",
+        Ping = "ping",
+        Holdings = "holdings",
+        Pull = "pull",
+        Sums = "sums",
+        Scrub = "scrub",
+        CopyUp = "copy_up",
+    }
+
+    /// What a chunk server's answer says (`nbs_ans`'s, `nbs_cs_done`'s
+    /// `status`): done, or nbswire's `Refusal`, in its order
+    NbsStatus {
+        Ok = "ok",
+        Fenced = "fenced",
+        NotFenced = "not_fenced",
+        StaleChunk = "stale_chunk",
+        Epoch = "epoch",
+        NoRoom = "no_room",
+        Bad = "bad",
+        Failed = "failed",
+        Io = "io",
+        TooManyFences = "too_many_fences",
+        NotTheMap = "not_the_map",
+        NotHere = "not_here",
+        NotAttached = "not_attached",
+        Behind = "behind",
+        NoMds = "no_mds",
+        NotReady = "not_ready",
+        NotHeld = "not_held",
+        NotTheJoiner = "not_the_joiner",
+    }
+
+    /// Why a message came back to its sender (`nbs_bounce`'s `why`): ipc's
+    /// `Bounce`
+    BounceWhy {
+        /// The mailbox it was for full
+        Full = "full",
+        /// Its owner gone, or no way to it
+        Gone = "gone",
+        /// Never sent by the channel
+        Unsent = "unsent",
+    }
+
+    /// Which raft a member is of (`raft_*`'s `of`)
+    RaftOf {
+        /// The cluster's registry (cluster.ko)
+        Registry = "registry",
+        /// NBS's metadata (nbs-mds.ko)
+        Nbs = "nbs",
+    }
+
+    /// A raft member's role (`raft_role`'s `role`): raft's `Role`
+    MemberRole {
+        Follower = "follower",
+        PreCandidate = "pre_candidate",
+        Candidate = "candidate",
+        Leader = "leader",
+    }
+
+    /// A raft message's kind (`raft_send`'s and `raft_recv`'s `kind`):
+    /// raft's `Body`, a vote's and its answer's pre-vote apart
+    RaftKind {
+        Vote = "vote",
+        PreVote = "pre_vote",
+        VoteResp = "vote_resp",
+        PreVoteResp = "pre_vote_resp",
+        Append = "append",
+        AppendResp = "append_resp",
+        Heartbeat = "heartbeat",
+        HeartbeatResp = "heartbeat_resp",
+        Snapshot = "snapshot",
+        SnapshotResp = "snapshot_resp",
+        TimeoutNow = "timeout_now",
+        ReadIndex = "read_index",
+        ReadIndexResp = "read_index_resp",
+    }
+
+    /// Why ipcnet bounced a message (`ipcnet_bounce`'s `why`)
+    IpcnetWhy {
+        /// Its class's queue past its bytes, or no room for its entry
+        Full = "full",
+        /// The peer not up, or up in another session than the message's
+        Down = "down",
+        /// Queued, and its session lost before it went
+        Lost = "lost",
+    }
 }
 
 events! {
@@ -630,5 +725,156 @@ events! {
         slot: u8,
         what: u8 as TcpWaitFor,
         _pad: [u8; 2],
+    }
+
+    /// `nbs_req`: a request a volume's client sent a chunk server
+    NbsReq = 39, "nbs_req" {
+        /// Its session's id: what the answer, the chunk server's records
+        /// and ipcnet's `reference` name it by
+        id: u64,
+        volume: u32,
+        /// The chunk's number; 0 for a request of no chunk
+        chunk: u32,
+        /// Where in the chunk
+        offset: u32,
+        /// A write's bytes, a read's asked
+        len: u32,
+        pid: u32,
+        /// The chunk server, by its number in NBS's metadata
+        cs: u16,
+        op: u8 as NbsOp,
+        _pad: u8,
+    }
+
+    /// `nbs_ans`: a chunk server's answer to it, at the client
+    NbsAns = 40, "nbs_ans" {
+        id: u64,
+        bytes: u32,
+        pid: u32,
+        /// The host it came from, by its number in the channel; 0 this one
+        from: u16,
+        status: u8 as NbsStatus,
+        _pad: [u8; 5],
+    }
+
+    /// `nbs_bounce`: a request that never reached its chunk server
+    NbsBounce = 41, "nbs_bounce" {
+        id: u64,
+        pid: u32,
+        why: u8 as BounceWhy,
+        _pad: [u8; 3],
+    }
+
+    /// `nbs_cs_req`: a request a chunk server took
+    NbsCsReq = 42, "nbs_cs_req" {
+        id: u64,
+        volume: u32,
+        chunk: u32,
+        offset: u32,
+        len: u32,
+        pid: u32,
+        from: u16,
+        op: u8 as NbsOp,
+        _pad: u8,
+    }
+
+    /// `nbs_cs_done`: the chunk server's answer to it
+    NbsCsDone = 43, "nbs_cs_done" {
+        id: u64,
+        /// From its taking to its answer
+        ns: u32,
+        pid: u32,
+        from: u16,
+        op: u8 as NbsOp,
+        status: u8 as NbsStatus,
+        _pad: [u8; 4],
+    }
+
+    /// `raft_role`: a raft member's role, term or leader changed
+    RaftRole = 44, "raft_role" {
+        term: u64,
+        /// Its member's node id; 0 none
+        leader: u64,
+        pid: u32,
+        of: u8 as RaftOf,
+        role: u8 as MemberRole,
+        _pad: [u8; 2],
+    }
+
+    /// `raft_send`: a raft message a member sent
+    RaftSend = 45, "raft_send" {
+        peer: u64,
+        term: u64,
+        /// What it is about: an append's previous index, a vote's last, a
+        /// response's, a heartbeat's commit, a snapshot's
+        index: u64,
+        /// The entries it carries; a snapshot piece's bytes
+        count: u32,
+        pid: u32,
+        of: u8 as RaftOf,
+        kind: u8 as RaftKind,
+        /// A response's: granted, or taken; 1 for any other message
+        ok: u8,
+        _pad: [u8; 5],
+    }
+
+    /// `raft_recv`: a raft message a member took in
+    RaftRecv = 46, "raft_recv" {
+        peer: u64,
+        term: u64,
+        index: u64,
+        count: u32,
+        pid: u32,
+        of: u8 as RaftOf,
+        kind: u8 as RaftKind,
+        ok: u8,
+        _pad: [u8; 5],
+    }
+
+    /// `raft_commit`: what a member has committed and applied, as either
+    /// moved on
+    RaftCommit = 47, "raft_commit" {
+        committed: u64,
+        applied: u64,
+        pid: u32,
+        of: u8 as RaftOf,
+        _pad: [u8; 3],
+    }
+
+    /// `ipcnet_link`: a peer's session up, or lost
+    IpcnetLink = 48, "ipcnet_link" {
+        ups: u32,
+        losses: u32,
+        pid: u32,
+        /// Its host number in the channel
+        peer: u16,
+        /// 1 up, 0 lost
+        up: u8,
+        _pad: u8,
+    }
+
+    /// `ipcnet_queue`: a message queued for a peer
+    IpcnetQueue = 49, "ipcnet_queue" {
+        /// The message's reference: an NBS request's id
+        reference: u64,
+        bytes: u32,
+        /// Its class's queue's bytes, with it
+        queued: u32,
+        pid: u32,
+        peer: u16,
+        /// 1 the bulk class's queue, 0 the control one's
+        bulk: u8,
+        _pad: u8,
+    }
+
+    /// `ipcnet_bounce`: a message for a peer bounced back to its sender
+    IpcnetBounce = 50, "ipcnet_bounce" {
+        reference: u64,
+        bytes: u32,
+        queued: u32,
+        pid: u32,
+        peer: u16,
+        bulk: u8,
+        why: u8 as IpcnetWhy,
     }
 }

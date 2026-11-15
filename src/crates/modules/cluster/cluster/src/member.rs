@@ -178,6 +178,7 @@ impl App for Registry {
 
     const NAME: &'static str = NAME;
     const LOG: &'static str = "cluster";
+    const TRACED_AS: kcore::trace::RaftOf = kcore::trace::RaftOf::Registry;
 
     fn encode_command(cmd: &Command) -> Vec<u8> {
         cmd.encode()

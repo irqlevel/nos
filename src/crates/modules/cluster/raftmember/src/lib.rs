@@ -64,6 +64,7 @@ use kcore::ipc::{Addr, Limits, Mailbox, Message, Scope, TAG_BULK};
 use kcore::klog;
 use kcore::sync::Mutex;
 use kcore::time::{boot_time_ns, Duration};
+use kcore::trace::{self, MemberRole, RaftCommit, RaftKind, RaftOf, RaftRecv, RaftRole, RaftSend};
 use raft::asks::{self, Asks, Done, Outcome as AskOutcome, Send, Tell, Timing, Told};
 use raft::keep::Next;
 use raft::log::DiskLog;
@@ -187,6 +188,8 @@ pub trait App: Sized {
     const LOG: &'static str;
     /// What may wait in the mailbox.
     const LIMITS: Limits = Limits { messages: 1024, bytes: 8 << 20 };
+    /// Which raft its records say it is (`trace on raft`).
+    const TRACED_AS: RaftOf;
 
     fn encode_command(cmd: &Self::Command) -> Vec<u8>;
     fn decode_command(bytes: &[u8]) -> Option<Self::Command>;
@@ -360,6 +363,10 @@ pub struct Core<A: App> {
     asks: Asks<Slot<A>>,
     /// As the leader, the members owed word of what it did for their asks.
     tell: Tell<Addr>,
+    /// What `raft_role` and `raft_commit` last went by: the role, the term
+    /// and the leader; what was committed and applied.
+    traced_role: (Role, u64, NodeId),
+    traced_commit: (u64, u64),
 }
 
 /// Who waits for a command submitted here.
@@ -412,7 +419,11 @@ impl<A: App> Core<A> {
         let asks_first = kcore::random::random_u64().ok_or_else(|| String::from("no randomness for the member's start"))?;
         let mb = Mailbox::new(A::LIMITS).map_err(|e| alloc::format!("no mailbox: {}", e.name()))?;
         mb.register(A::NAME, Scope::Cluster).map_err(|e| alloc::format!("{} not named: {}", A::NAME, e.name()))?;
+        let traced_role = (rsm.role(), rsm.node().term(), rsm.leader());
+        let traced_commit = (rsm.node().committed(), rsm.applied());
         Ok(Core {
+            traced_role,
+            traced_commit,
             rsm,
             mb,
             node,
@@ -680,6 +691,20 @@ impl<A: App> Core<A> {
         let bytes = self.framed(app, &bytes);
         let tag = if ordered || bytes.len() > BULK_BYTES { TAG_RAFT | TAG_BULK } else { TAG_RAFT };
         let _ = self.mb.send_to(&alloc::format!("{}@{}", A::NAME, host), tag, 0, &bytes);
+        if trace::on::<RaftSend>() {
+            let (kind, index, count, ok) = traced(&m.body);
+            trace::emit(&RaftSend {
+                peer: m.to,
+                term: m.term,
+                index,
+                count,
+                pid: trace::pid(),
+                of: A::TRACED_AS as u8,
+                kind: kind as u8,
+                ok,
+                _pad: [0; 5],
+            });
+        }
     }
 
     /* ---- what comes in ---- */
@@ -712,7 +737,54 @@ impl<A: App> Core<A> {
             self.say_refused(m, rm.from, sender);
             return;
         }
+        if trace::on::<RaftRecv>() {
+            let (kind, index, count, ok) = traced(&rm.body);
+            trace::emit(&RaftRecv {
+                peer: rm.from,
+                term: rm.term,
+                index,
+                count,
+                pid: trace::pid(),
+                of: A::TRACED_AS as u8,
+                kind: kind as u8,
+                ok,
+                _pad: [0; 5],
+            });
+        }
         let _ = self.rsm.step(rm);
+    }
+
+    /// `raft_role` and `raft_commit` (`trace on raft`), where what each says
+    /// has moved on since it last did -- or since the member was made.
+    fn trace_state(&mut self) {
+        let node = self.rsm.node();
+        let role = (node.role(), node.term(), node.leader());
+        let commit = (node.committed(), self.rsm.applied());
+        if role != self.traced_role {
+            self.traced_role = role;
+            if trace::on::<RaftRole>() {
+                trace::emit(&RaftRole {
+                    term: role.1,
+                    leader: role.2,
+                    pid: trace::pid(),
+                    of: A::TRACED_AS as u8,
+                    role: role_of(role.0) as u8,
+                    _pad: [0; 2],
+                });
+            }
+        }
+        if commit != self.traced_commit {
+            self.traced_commit = commit;
+            if trace::on::<RaftCommit>() {
+                trace::emit(&RaftCommit {
+                    committed: commit.0,
+                    applied: commit.1,
+                    pid: trace::pid(),
+                    of: A::TRACED_AS as u8,
+                    _pad: [0; 3],
+                });
+            }
+        }
     }
 
     /// A raft message refused for the host it came from, said -- once in
@@ -1093,6 +1165,7 @@ impl<A: App> Core<A> {
                 break;
             }
         }
+        self.trace_state();
         Ok(())
     }
 
@@ -1399,5 +1472,44 @@ pub fn ask_turning<A: App>(shared: &Shared<A>, cmd: &A::Command, no_member: &str
                                      again"));
         }
         turn(ANSWER_POLL_MS);
+    }
+}
+
+/* ---- its records (`trace on raft`, docs/tracing.md) ---- */
+
+/// A raft message as `raft_send` and `raft_recv` say it: its kind, the index
+/// it is about -- an append's previous one, a vote's last, a response's, a
+/// heartbeat's commit, a snapshot's -- the entries it carries (a snapshot
+/// piece's bytes), and for a response whether it granted or took it (1 for
+/// any other message). Whole, so that a kind raft gains is a build that
+/// fails here until it has its name.
+fn traced(body: &Body) -> (RaftKind, u64, u32, u8) {
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    match body {
+        Body::Vote { pre, last_index, .. } => {
+            (if *pre { RaftKind::PreVote } else { RaftKind::Vote }, *last_index, 0, 1)
+        }
+        Body::VoteResp { pre, granted } => {
+            (if *pre { RaftKind::PreVoteResp } else { RaftKind::VoteResp }, 0, 0, u8::from(*granted))
+        }
+        Body::Append { prev_index, entries, .. } => (RaftKind::Append, *prev_index, count(entries.len()), 1),
+        Body::AppendResp { reject, index, .. } => (RaftKind::AppendResp, *index, 0, u8::from(!*reject)),
+        Body::Heartbeat { commit, .. } => (RaftKind::Heartbeat, *commit, 0, 1),
+        Body::HeartbeatResp { .. } => (RaftKind::HeartbeatResp, 0, 0, 1),
+        Body::Snapshot { meta, data, .. } => (RaftKind::Snapshot, meta.index, count(data.len()), 1),
+        Body::SnapshotResp { index, reject, .. } => (RaftKind::SnapshotResp, *index, 0, u8::from(!*reject)),
+        Body::TimeoutNow => (RaftKind::TimeoutNow, 0, 0, 1),
+        Body::ReadIndex { .. } => (RaftKind::ReadIndex, 0, 0, 1),
+        Body::ReadIndexResp { index, ok, .. } => (RaftKind::ReadIndexResp, *index, 0, u8::from(*ok)),
+    }
+}
+
+/// raft's role, as `raft_role` says it.
+fn role_of(role: Role) -> MemberRole {
+    match role {
+        Role::Follower => MemberRole::Follower,
+        Role::PreCandidate => MemberRole::PreCandidate,
+        Role::Candidate => MemberRole::Candidate,
+        Role::Leader => MemberRole::Leader,
     }
 }
