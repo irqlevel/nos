@@ -44,8 +44,10 @@ sessions, the pages -- is here, in Linux; nos keeps its API alone.
 
 `mock/server.mjs` is the host API as the panel sees it, with the providers'
 own descriptors read from the tree and numbers that move, and what api.ko
-lets in at once with no api.toml -- two connections in their handshake, four
-of one key -- one past them reset as nos resets it. To run the panel against
+lets in at once with no api.toml -- two connections in their handshake, eight
+of one key, twelve in all -- one past them reset as nos resets it; and how many streams each
+VM's console has open (`api.status`'s `consoles`, the mock's own: one,
+however many tabs show it). To run the panel against
 it:
 
 ```
