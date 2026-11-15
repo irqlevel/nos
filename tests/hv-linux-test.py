@@ -1525,7 +1525,26 @@ def network(args):
               # frame for vm 1's MAC, which the switch drops and counts.
               xn("w0", "ping -c 2 -W 5 10.0.100.1"),
               xn("w0", "arp -s 10.0.100.3 02:00:00:00:64:03; ping -c 3 -W 2 10.0.100.3; echo alone-done", 60),
-              "hv list"]
+              "hv list",
+              # Two VMs from folders that name no port (`store::keep_port`):
+              # w1 given one at its first start -- the lowest no vm.toml names
+              # and none running holds -- and it written in; w2, started
+              # while w1 is stopped, not given w1's, the lowest free one then;
+              # w1 given its own again.
+              # Taken afresh at each start, two VMs started the other way
+              # round swapped their ports, and with them their MACs. The
+              # guests share cores from here: vms 0 and 1 and w0 hold every
+              # one nos has, and keep their ports.
+              "hv cores shared",
+              "hv create w1 /bzImage mem=64%s initrd=/initrd net cmdline=%s" % (cpus_opt(args), args.cmdline),
+              "hv create w2 /bzImage mem=64%s initrd=/initrd net cmdline=%s" % (cpus_opt(args), args.cmdline),
+              "hv start w1",
+              "cat /vms/w1/vm.toml",
+              "hv stop w1 secs=0",
+              "hv start w2",
+              "hv start w1",
+              "hv stop w2 secs=0",
+              "hv stop w1 secs=0"]
     rc = ["insmod /hv.ko", "hv on", start, start,
           x(0, "id", args.vm_secs), x(1, "id", args.vm_secs),
           "hv list",
@@ -1773,6 +1792,27 @@ def network(args):
                 time.sleep(3)
         pt.check("a page from its httpd, fetched from outside through that forward", b"nos-folder-hello" in body,
                  body[-300:])
+        w1 = folder.index("hv start w1")
+        w1_toml, w2 = folder.index("cat /vms/w1/vm.toml"), folder.index("hv start w2")
+        w1_again = folder.index("hv start w1", w1 + 1)
+
+        def host_of(text):
+            """The last byte of the address a start put on its command line."""
+            m = re.search(r"\bip=10\.0\.100\.(\d+):", text)
+            return int(m.group(1)) if m else None
+
+        first, other, again = host_of(fo(w1)), host_of(fo(w2)), host_of(fo(w1_again))
+        pt.check("w1, whose vm.toml names no port, given one at its first start",
+                 re.search(r"hv: vm \d+ \(w1\) started", fo(w1)) is not None and first is not None, fo(w1))
+        pt.check("and it kept in its vm.toml: the port of the address it was given",
+                 first is not None and re.search(r"(?m)^port = %d$" % (first - 2), fo(w1_toml)) is not None,
+                 fo(w1_toml))
+        # The lowest free port, w1 stopped, is w1's: taken afresh it was w2's
+        pt.check("w2, started while w1 is stopped, not given w1's port",
+                 re.search(r"hv: vm \d+ \(w2\) started", fo(w2)) is not None and other is not None
+                 and other != first, fo(w2))
+        pt.check("and w1 started again at its own, whatever started meanwhile",
+                 re.search(r"hv: vm \d+ \(w1\) started", fo(w1_again)) is not None and again == first, fo(w1_again))
     finally:
         server.shutdown()
         pt.kill(p)

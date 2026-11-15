@@ -3254,7 +3254,7 @@ console_log = true
 | `cpus`, `cpu` | how many CPUs, and the host CPU its first runs on | 1, and where it is placed |
 | `disks` | its disks, `vda` first, `:ro` after one it only reads | none |
 | `net` | a NIC on the guests' switch | `false` |
-| `port` | its port of the switch, 0..15: its address `10.0.100.(port+2)` and its MAC the same at every start | the first free one |
+| `port` | its port of the switch, 0..15: its address `10.0.100.(port+2)` and its MAC the same at every start | at its first start, the lowest no other VM's vm.toml names and none running holds -- written in, as its `uuid` is |
 | `forward` | `"<nos's port>:<the guest's>"`s, relayed once it runs and taken away with it | none |
 | `restart` | booted again when it resets itself | `false` |
 | `protected` | stopped and deleted through the host API, and deleted by `hv delete`, only when told `force` | `false` |
@@ -3549,6 +3549,14 @@ is nos's, `dev` and the commit, which such a build does not know.)
   the file -- the lines the operator wrote left as they were -- and the same
   at every start after. One started from its kernel's path takes `uuid=`,
   or a random one, kept across its restarts; its serial is its number.
+- **So is its port of the switch**, and with it its MAC and its address: a
+  VM on the switch whose `vm.toml` names no `port` is given one at its first
+  start -- the lowest no other VM's file names and no VM running holds --
+  and it is written in, as the UUID is (`store::keep_port`). Taken afresh
+  at each start, a port went by the order the VMs started in: two started
+  the other way round after their host's reboot swapped theirs, and the
+  Ubuntu one's network, its netplan matching its NIC by the MAC cloud-init
+  saw at its first boot, came up with no DNS server.
 
 The gate is `tests/hv-linux-test.py --smbios` with a kernel built with
 `DMI` and `DMIID`: what `/sys/class/dmi/id` says, a VM whose `vm.toml` had
