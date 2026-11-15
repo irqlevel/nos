@@ -21,7 +21,11 @@
 # With DEMO_KEEP=1 the stand's state is kept, the image alone changed: the
 # panel's VM stopped, not deleted -- /etc/rc's `api panel create` starts it
 # again, panel-update.sh installs a bundle in it -- and nos's root not made
-# ready: the cluster, NBS and hosts.toml as they are. e2fsck -fn still.
+# ready: the cluster, NBS and hosts.toml as they are. e2fsck -fn still. And
+# nothing stopped before NBS's chunks are all at three replicas -- a
+# neighbour just updated may be copying its sets back still, and this host's
+# replicas the only ones active -- nor said done before they are again,
+# this host's copied back.
 #
 # The ssh config names hosts ex44-nos and ex44-ubuntu (ssh_config.example).
 # A step that fails stops it where it is, said; one in Ubuntu leaves Ubuntu
@@ -60,6 +64,28 @@ on_nos() { ssh -F "$CFG" ex44-nos "$1"; }
 on_ubuntu() { ssh -F "$CFG" ex44-ubuntu "$1"; }
 running() { on_nos "hv list" | awk '$1 == "vm" && $4 == "running" { print $3 }'; }
 
+# NBS's chunks all at three replicas, no copy going on and no cs down, as
+# nos here sees them, waited for up to $1 seconds: 0 once they are, or where
+# this host has no NBS -- an answer without that line --, 1 if not in time.
+# Each line it says that differs from the one before it is said.
+nbs_whole() {
+    local secs=$1 t=0 out line last=
+    while [ $t -le $secs ]; do
+        if out=$(on_nos "nbs status" 2>/dev/null) && [ -n "$out" ]; then
+            line=$(echo "$out" | grep '^nbs: chunks at')
+            [ -n "$line" ] || return 0
+            if echo "$line" | grep -q "at two 0, at one 0 -- 0 being copied, by 0 joins; cs.s down 0,"; then
+                return 0
+            fi
+            [ "$line" = "$last" ] || echo "   $(echo "$line" | cut -c1-120)"
+            last=$line
+        fi
+        sleep 10
+        t=$((t + 10))
+    done
+    return 1
+}
+
 # nos's root held to e2fsck -fn in Ubuntu, detached: its ssh may drop
 fsck_nos() {
     local st=
@@ -80,6 +106,11 @@ on_nos "hv list" | cut -c1-110
 VMS=$(running) || exit 1
 echo "$VMS" > "$LOG/ex44-vms-before"
 echo "   running: $(echo $VMS)"
+
+if [ "$KEEP" = 1 ]; then
+    step "NBS's chunks all at three replicas before this host goes down -- up to 30 minutes"
+    nbs_whole 1800 || { echo "   not in time -- nothing stopped: this host's replicas may be the only ones active"; exit 1; }
+fi
 
 if [ "$KEEP" = 1 ]; then
     step "the panel's VM stopped, kept: the next boot starts it again"
@@ -200,4 +231,8 @@ for vm in $VMS; do
 done
 on_nos "hv list" | cut -c1-110
 on_nos "ipcnet" | head -3
+if [ "$KEEP" = 1 ]; then
+    step "NBS's chunks back at three replicas, this host's copied back -- up to 30 minutes"
+    nbs_whole 1800 || { echo "   not in time"; exit 1; }
+fi
 step "done"
