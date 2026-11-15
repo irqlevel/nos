@@ -552,7 +552,8 @@ What the VMX backend does not do yet, and says so rather than pretends:
                                 stops
     hv restart <id>             boot it again from its files, running or stopped
     hv stop <id|all> [secs=N]   press its power button and give it secs (30)
-                                to turn itself off, then stop it; say how it
+                                to turn itself off, pressed again every 15 s
+                                while it runs, then stop it; say how it
                                 ended, take it off the list -- as rmmod and
                                 nos's poweroff and reboot stop all of them,
                                 given insmod's stop_secs= (120)
@@ -3452,7 +3453,17 @@ event -- and gives the guest `secs` (30 unless told) to turn itself off; one
 that does ends `the guest powered itself off, S5 by its ACPI PM1 control
 register`. A kernel hears the button as a key, KEY_POWER on its input
 device, and what answers it is userspace's: systemd-logind shuts a
-distribution down, BusyBox's `acpid` runs `/etc/acpi/PWRF/00000080`. A guest
+distribution down, BusyBox's `acpid` runs `/etc/acpi/PWRF/00000080`. What
+answers it may decline a press, and forget it: logind refuses one while a
+shutdown is inhibited -- `Refusing poweroff operation, shutdown is inhibited
+by UID 0/root, PID .../unattended-upgr`, as Ubuntu's unattended-upgrades
+inhibits one while it installs -- and the press after that ends is the one
+it acts on. So a guest that heard the button and runs still has it pressed
+again every 15 s while its time lasts (`REPRESS_S`, `Shared::press_again`),
+`hv stop`'s and an unload's waits pressing it once between them, and the
+report's `acpi` line counts the presses; a press it does not hear after one
+it heard is of a guest on its way down, its kernel turning the event off as
+it powers off, and the wait goes on. A guest
 that hears it and does nothing is stopped when its time is up, `its power
 button went unanswered for 30 s`. One whose OS never enabled the event -- no
 ACPI, `acpi=off`, not booted that far -- cannot hear it, and the first CPU's
