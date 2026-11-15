@@ -26,6 +26,10 @@
 //!   the write is done when the mds says it is out -- never on a set the mds
 //!   would not vouch for. Meanwhile the request is sent again every second.
 //! - Two writes that overlap are never out at once: the second waits.
+//! - The bytes of the reads and writes out at once are `WINDOW_BYTES` at
+//!   most -- half what a link holds waiting for a peer -- or those of one
+//!   alone: the rest wait their turn here, sent as those out are done, and
+//!   nothing goes past the link's queue to bounce and go again in a moment.
 //! - A flush waits for every write before it, then asks every cs that has
 //!   acknowledged a write since the last flush began to make its writes
 //!   durable; it is done once they have, and once every flush before it is
@@ -111,6 +115,26 @@ const CLOSING_MAX: usize = 2;
 /// twice -- what the chain is there to spare. One whose replica before it
 /// is taken out of the piece unanswered is sent it at once.
 pub const CHAIN_WAIT_NS: u64 = 250_000_000;
+/// The bytes of the driver's reads and writes a session has out at once, at
+/// most: the rest wait their turn in it (`pump`), sent as those out are done
+/// -- one alone goes whatever its size. A guest keeps up to 64 requests of
+/// 248 KiB in flight, 16 MiB, and all of it went at once, past what ipcnet
+/// holds waiting for a peer (4 MiB a class, its `QUEUE_BYTES`): the rest
+/// bounced, went again AGAIN_NS on, bounced again, the link idle between --
+/// writes of 1.5 s at 10 MiB/s on the demo stand, whose links carry 69 MB/s
+/// and answer in a millisecond. Half that queue, so that two volumes written
+/// from one host at once fit it; and well above what keeps a link busy, its
+/// bandwidth times a chain's round trip.
+#[cfg(not(feature = "small_windows"))]
+pub const WINDOW_BYTES: u64 = 2 << 20;
+/// The fuzzer's, unless its target sets another (`set_window`): eight
+/// blocks, its operations one to four blocks each, six out at most -- full
+/// often, yet with room for a few at once. At two blocks a client had one
+/// out nearly always, and the cluster target's chains, which need a second
+/// write out, fell to a seventh; the target gives a session two on some
+/// seeds, where an operation larger than the window has to go alone.
+#[cfg(feature = "small_windows")]
+pub const WINDOW_BYTES: u64 = 8 * BLOCK;
 /// How long an operation may take before it fails.
 pub const DEADLINE_NS: u64 = 60_000_000_000;
 /// How long the attach is asked for before the session fails: a session
@@ -561,6 +585,9 @@ pub struct Session {
     /// memory.
     #[cfg(feature = "starve")]
     starve_until: u64,
+    /// The fuzzer's: its window, `WINDOW_BYTES` unless set (`set_window`).
+    #[cfg(feature = "small_windows")]
+    window: u64,
 }
 
 impl Session {
@@ -584,6 +611,8 @@ impl Session {
             said_attach: 0, here_at: 0, fresh: false, mended: 0,
             #[cfg(feature = "starve")]
             starve_until: 0,
+            #[cfg(feature = "small_windows")]
+            window: WINDOW_BYTES,
         }
     }
 
@@ -610,6 +639,24 @@ impl Session {
     #[cfg(feature = "starve")]
     pub fn starve_until(&mut self, until: u64) {
         self.starve_until = until;
+    }
+
+    /// The fuzzer's: the session's window of reads and writes out, in bytes
+    /// -- one smaller than its operations on some seeds, where one has to go
+    /// alone (`pump`).
+    #[cfg(feature = "small_windows")]
+    pub fn set_window(&mut self, bytes: u64) {
+        self.window = bytes;
+    }
+
+    /// The bytes of reads and writes the session lets out at once:
+    /// `WINDOW_BYTES`, or the fuzzer's own.
+    fn window(&self) -> u64 {
+        #[cfg(feature = "small_windows")]
+        let window = self.window;
+        #[cfg(not(feature = "small_windows"))]
+        let window = WINDOW_BYTES;
+        window
     }
 
     /// Whether a request of `what` finds no memory now: the fuzzer's write
@@ -681,6 +728,13 @@ impl Session {
         self.ops.values().filter(|o| o.tag & INTERNAL == 0).count()
     }
 
+    /// The driver's reads and writes out -- their bytes, and how many --
+    /// which the window holds to `WINDOW_BYTES`, or to one alone (`pump`).
+    pub fn in_flight(&self) -> (u64, usize) {
+        self.ops.values().filter(|o| o.out && matches!(o.kind, Kind::Read | Kind::Write) && o.tag & INTERNAL == 0)
+            .fold((0, 0), |(bytes, n), o| (bytes + u64::from(o.len), n + 1))
+    }
+
     /// Whether it is paused for a snapshot (N10c2).
     pub fn paused(&self) -> bool {
         self.pausing.is_some()
@@ -725,7 +779,10 @@ impl Session {
                 *s += &alloc::format!(" ... and {} more", n - REPORT_NAMED);
             }
         }
-        let mut s = alloc::format!("{:?}, generation {}: {} operations", self.phase, self.generation, self.ops.len());
+        let (flying, many) = self.in_flight();
+        let mut s = alloc::format!("{:?}, generation {}: {} operations, {} reads and writes out of {} bytes, the \
+                                    window {}", self.phase, self.generation, self.ops.len(), many, flying,
+                                   self.window());
         for (id, o) in self.ops.iter().take(REPORT_NAMED) {
             s += &alloc::format!(" [#{} {:?} {}+{} pieces {} waiting {:?} out {}]", id, o.kind, o.offset, o.len,
                                  o.pieces, o.waiting, o.out);
@@ -2250,6 +2307,17 @@ impl Session {
                 k += 1;
                 continue;
             }
+            /* The window (`WINDOW_BYTES`): a read or a write of the driver's
+               goes with room for it among those out, or alone -- the rest,
+               those behind it too, wait their turn, nothing of them sent.
+               Counted anew each time: a launch can end an operation, and
+               start others, before it comes back here */
+            if matches!(o.kind, Kind::Read | Kind::Write) && o.tag & INTERNAL == 0 {
+                let (flying, _) = self.in_flight();
+                if flying != 0 && flying + u64::from(o.len) > self.window() {
+                    break;
+                }
+            }
             self.queue.remove(k);
             self.launch(id, now, bufs, out);
         }
@@ -2822,6 +2890,17 @@ impl Session {
             self.close_idle(now, bufs, out, true);
         }
         if !self.closing.is_empty() || (self.writable && !self.open.is_empty()) {
+            return;
+        }
+        /* Every request to a cs answered first. A fence sent again behind a
+           close a joiner of the set refused as NotFenced was answered after
+           that close, and after the detach the close's answer let go: the
+           fence's check at the mds found the volume let go, NotAttached, and
+           the session failed a moment before it would have detached --
+           taken for attached elsewhere (found by tests/fuzz/nbs's cluster
+           target, seed 104245). A cs that never answers is asked out, and its
+           requests dropped with it; each tick looks again */
+        if !self.subs.is_empty() {
             return;
         }
         self.detach(now, out);

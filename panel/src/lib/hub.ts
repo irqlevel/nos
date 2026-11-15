@@ -7,13 +7,19 @@
 // A host the stream cannot reach is offline, said so, and tried again a
 // little later each time.
 
-import { HostError, stream, Stream } from './nosapi';
+import { api, HostError, stream, Stream } from './nosapi';
 import { Host, hosts, link } from './hosts';
 import { store } from './store';
+
+/** The nos a host runs, as its system provider's `info` says it: asked
+ * each time the hub reaches the host -- a host that rebooted into another
+ * build is reached anew. */
+export interface NosInfo { version: string; revision: string; arch: string }
 
 /** What the hub says of a host, and hands its watchers. */
 export type HubEvent =
   | { type: 'state'; online: boolean; why?: string }
+  | ({ type: 'nos' } & NosInfo)
   | { type: 'metrics'; ms: number; cpu_busy_permille: number | null; mem_used_bytes: number | null;
       mem_total_bytes: number | null; rx_bytes_per_s: number | null; tx_bytes_per_s: number | null; cpus: number[] }
   | { type: 'log'; lines: Array<{ seq: number; level: number; text: string; ms: number }> }
@@ -42,6 +48,8 @@ class HostHub {
   lastJobs: unknown[] = [];
   /** The log's last lines, for a page that opens now. */
   lastLog: Array<{ seq: number; level: number; text: string; ms: number }> = [];
+  /** The nos it runs, as it last said: kept while it is out of reach. */
+  nos: NosInfo | null = null;
   watchers = new Set<Watcher>();
   private s: Stream | null = null;
   private prev: Prev | null = null;
@@ -75,8 +83,23 @@ class HostHub {
       this.why = '';
       this.retry = RETRY_MIN_MS;
       this.emit({ type: 'state', online: true });
+      void this.askNos();
     } catch (e) {
       this.lost(e instanceof HostError ? e.message : String(e));
+    }
+  }
+
+  /** The nos it runs, asked once it is reached: said to its watchers. A
+   * host that does not answer is left as it was last said -- or unsaid. */
+  private async askNos() {
+    try {
+      const a = await api(link(this.host), 'POST', '/v1/call/system/info', {});
+      const j = a.json as Partial<NosInfo> | null;
+      if (a.status !== 200 || !j || typeof j.version !== 'string') return;
+      this.nos = { version: j.version, revision: String(j.revision ?? ''), arch: String(j.arch ?? '') };
+      this.emit({ type: 'nos', ...this.nos });
+    } catch {
+      /* Said again at the next connection */
     }
   }
 

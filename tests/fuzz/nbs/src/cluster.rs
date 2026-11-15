@@ -136,6 +136,16 @@ const CLOSE_MAP_READ_NS: u64 = 3_000 * MS;
 /// The places a session closes at once, at most: nbsclient's `CLOSING_MAX`
 /// as the fuzzer builds it (`small_windows`).
 const CLOSING_FUZZ: usize = 2;
+/// The bytes of a session's reads and writes out at once, at most, more
+/// than one out -- nbsclient's window, which the target sets each session's
+/// to: eight blocks mostly, full often yet a few operations out at once --
+/// at two a client had one out nearly always, and the chains a second write
+/// out begins fell to a seventh of the 6,849 the first 200 seeds begin with
+/// no window (6,340 at eight, the window full 40,411 times) -- and two on a
+/// quarter of the seeds, smaller than an operation of three or four blocks,
+/// which then goes alone.
+const WINDOW_WIDE: u64 = 8 * 4096;
+const WINDOW_NARROW: u64 = 2 * 4096;
 /// How long a cs waits for its mds's answer, as nbs-cs does.
 const MDS_WAIT: u64 = 5_000 * MS;
 /// How long a run lasts at most, in the network's time: well under an
@@ -635,6 +645,9 @@ struct World {
     clones: Vec<CloneW>,
     cmodel: Blocks,
     clone_r: Rng,
+    /// The sessions' window of reads and writes out, in bytes, this run's
+    /// (`WINDOW_WIDE`, `WINDOW_NARROW`).
+    window: u64,
     /// A flush asked as the writer attaches anew, nothing of its own before
     /// it: of a randomness of its own, so that a run without one goes as it
     /// did.
@@ -664,6 +677,26 @@ impl World {
         self.links.entry((from, to)).or_default().push_back(Msg { bytes, id });
     }
 
+    /// A session's reads and writes out held to the window: their bytes at
+    /// most `WINDOW_FUZZ` where more than one is out -- what goes past it is
+    /// what a link's queue bounces, sent again in a moment, its link idle
+    /// meanwhile (the demo stand's 1.5 s writes). Counted where some wait
+    /// their turn with the window full.
+    fn window_held(&mut self, who: &str, s: (u64, usize, usize)) -> Result<(), String> {
+        let (bytes, out, busy) = s;
+        if out > 1 && bytes > self.window {
+            return Err(format!("{} has {} reads and writes out, {} bytes, past the window of {}", who, out, bytes,
+                               self.window));
+        }
+        if busy > out && bytes + 4096 > self.window {
+            self.count("operations waiting with the window full");
+        }
+        if out == 1 && bytes > self.window {
+            self.count("operations out alone past the window");
+        }
+        Ok(())
+    }
+
     /// A client's outputs: its messages queued, its operations checked.
     fn outs(&mut self, c: usize, out: Vec<Out>) -> Result<(), String> {
         /* Closes let out a window at a time (N13b): never more places
@@ -672,6 +705,9 @@ impl World {
             return Err(format!("client {} closing {} places at once, past the window of {}", c,
                                self.clients[c].s.closing(), CLOSING_FUZZ));
         }
+        let (bytes, many) = self.clients[c].s.in_flight();
+        let busy = self.clients[c].s.busy();
+        self.window_held(&format!("client {}", c), (bytes, many, busy))?;
         for o in out {
             match o {
                 Out::Send { to: To::Mds, id, bytes } => {
@@ -2589,6 +2625,7 @@ impl World {
         }
         let token = 1 + self.clone_r.below(u64::MAX - 1);
         let mut s = Session::new(CLONE, HOSTS[h], true, false, token);
+        s.set_window(self.window);
         let k = self.clones.len();
         /* Its writes passed along their replicas (N13), now and then */
         if self.clone_r.chance(70) {
@@ -2652,6 +2689,9 @@ impl World {
     /// The clone's writer's outputs: its messages queued, its operations
     /// checked.
     fn clone_outs(&mut self, k: usize, out: Vec<Out>) -> Result<(), String> {
+        let (bytes, many) = self.clones[k].s.in_flight();
+        let busy = self.clones[k].s.busy();
+        self.window_held(&format!("the clone's writer {}", k), (bytes, many, busy))?;
         for o in out {
             match o {
                 Out::Send { to: To::Mds, id, bytes } => {
@@ -3210,6 +3250,7 @@ impl World {
         let c = self.clients.len();
         let token = 1 + self.r.below(u64::MAX - 1);
         let mut s = Session::new(VOLUME, HOSTS[h], true, true, token);
+        s.set_window(self.window);
         /* Its writes passed along their replicas (N13), now and then: the
            rest to each replica directly, as `nbs io`'s go */
         if Rng::new(mix(token, 0x6368_6169_6e)).chance(70) {
@@ -3964,7 +4005,7 @@ fn setup(r: &mut Rng, mib: u64) -> Result<World, String> {
                         scrub: Scrub::new(SCRUB_EVERY), scrub_q: Vec::new(), scrub_r: Rng::new(0), scrub_id: 1,
                         rotted: Vec::new(), snaps: Vec::new(), snap_r: Rng::new(0), snap_next: 1, garbage_at: 0, lost_for_good: None,
                         pausing: None, late: None, pause_next: 1, given_up: None, cut: None, pause_word: None,
-                        clones: Vec::new(), cmodel: Blocks::default(), clone_r: Rng::new(0), anew_r: Rng::new(0),
+                        clones: Vec::new(), cmodel: Blocks::default(), clone_r: Rng::new(0), window: WINDOW_WIDE, anew_r: Rng::new(0),
                         no_room: BTreeSet::new(), joins_seen: BTreeMap::new(),
                         stats: BTreeMap::new() };
     w.apply(Command::Init { cluster: CLUSTER, name: String::from("nbs"), host: String::from(HOSTS[0]), member: 1 });
@@ -4016,6 +4057,19 @@ pub fn run_tail(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     run_sized(seed, steps, trace, TAIL_MIB)
 }
 
+/// The sessions' window this run: none for a race the gate keeps from
+/// before the client had one (the first `RACES_BEFORE_WINDOW` of
+/// `GATE_CLUSTER_ALSO`), which runs as it ran then -- the window draws
+/// nothing of the run's randomness, and with none nothing waits for it;
+/// narrower than an operation on a quarter of the others, by a randomness
+/// of its own, and eight blocks on the rest.
+fn window_for(seed: u64) -> u64 {
+    if crate::GATE_CLUSTER_ALSO[..crate::RACES_BEFORE_WINDOW].contains(&seed) {
+        return u64::MAX;
+    }
+    if Rng::new(mix(seed, 0x7769_6e64)).chance(25) { WINDOW_NARROW } else { WINDOW_WIDE }
+}
+
 fn run_sized(seed: u64, steps: u64, trace: bool, mib: u64) -> Result<(), String> {
     let mut r = Rng::new(mix(seed, 0x636c_7573));
     let mut w = setup(&mut r, mib)?;
@@ -4027,6 +4081,7 @@ fn run_sized(seed: u64, steps: u64, trace: bool, mib: u64) -> Result<(), String>
     w.snap_r = Rng::new(mix(seed, 0x736e_6170));
     w.clone_r = Rng::new(mix(seed, 0x636c_6f6e));
     w.anew_r = Rng::new(mix(seed, 0x616e_6577));
+    w.window = window_for(seed);
     let first = w.r.below(HOSTS.len() as u64) as usize;
     w.writer(first)?;
     let mut back_at = 0u64;
