@@ -46,7 +46,11 @@ No host goes down before NBS's chunks are all at three replicas again
 ends once they are: a host back rejoins its sets by a copy, and the next
 one taken down before that copy is done would leave the chunks at one
 replica for as long as it takes -- the first update of the stand did, for
-some minutes.
+some minutes. A host back is asked only once its NBS member has applied an
+entry past the last one it had as it went: until it has caught up with the
+leader it says what NBS was before -- every chunk at three replicas -- and
+the EX44's VMs on volumes are started only then, a start whose attach went
+unanswered tried again.
 
 `ssh_config.example` is the ssh config the EX44's scripts take: nos's
 sshd and Ubuntu's at one address, Ubuntu's host key in a known_hosts of its
