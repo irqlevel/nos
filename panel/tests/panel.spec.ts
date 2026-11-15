@@ -6,6 +6,7 @@ import { expect, Page, test } from '@playwright/test';
 
 import { MOCK_B, PANEL_VERSION, PASSWORD, STATE_B } from '../playwright.config';
 import { addressFor, copyable, ipOfUrl, isPublic } from '../src/lib/fills';
+import { pastLimitWhy } from '../src/lib/nosapi';
 
 async function login(page: Page, locale = 'en') {
   await page.goto(`/${locale}/login`);
@@ -321,6 +322,54 @@ test('a VM\'s console: what it printed, and what is typed goes to it', async ({ 
   await page.keyboard.type('root');
   await page.keyboard.press('Enter');
   await expect(term).toContainText('root', { timeout: 10_000 });
+});
+
+/** The streams a host has open on each VM's console, as the mock's
+ * api.status says (`consoles`, the mock's own): asked through the panel. */
+async function consoleStreams(page: Page, host: string): Promise<Record<string, number>> {
+  const res = await page.request.post(`/api/h/${host}/call/api/status`, {
+    headers: { Origin: new URL(page.url()).origin }, data: {},
+  });
+  expect(res.status()).toBe(200);
+  return (await res.json()).consoles ?? {};
+}
+
+test('a VM\'s console in two tabs: one stream of the host\'s between them, both shown what it prints', async ({ page, context }) => {
+  /* A stream a tab was a connection of the panel's key a tab: a second tab,
+   * or a reload while the host held the last, went past api.ko's limit of
+   * one key's, and the terminal said `read ECONNRESET` (2026-11-15). */
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/vms/web`);
+  await page.getByRole('tab', { name: 'Console' }).click();
+  const one = page.getByTestId('terminal');
+  await expect(one).toContainText('hvboot', { timeout: 15_000 });
+  const second = await context.newPage();
+  await second.goto(`/en/h/${host}/vms/web`);
+  await second.getByRole('tab', { name: 'Console' }).click();
+  const two = second.getByTestId('terminal');
+  /* What it printed before the second tab came, given to it too */
+  await expect(two).toContainText('hvboot', { timeout: 15_000 });
+  expect((await consoleStreams(page, host)).web).toBe(1);
+  await two.click();
+  await second.keyboard.type('nos-two-tabs');
+  await second.keyboard.press('Enter');
+  await expect(two).toContainText('nos-two-tabs', { timeout: 10_000 });
+  await expect(one).toContainText('nos-two-tabs', { timeout: 10_000 });
+  /* Both gone: the stream closed a few seconds after */
+  await second.close();
+  await page.goto(`/en/h/${host}`);
+  await expect.poll(async () => (await consoleStreams(page, host)).web ?? 0, { timeout: 20_000 }).toBe(0);
+  expect(await pastLimits(page, host)).toBe(0);
+});
+
+test('a connection reset as it is made is said to be past the host\'s limit, not ECONNRESET', () => {
+  const reset = Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
+  expect(pastLimitWhy(reset, true)).toContain('max_per_key');
+  /* Said as Node says it, the code lost on the way */
+  expect(pastLimitWhy(new Error('10.0.100.1:39234: read ECONNRESET'), true)).toContain('limit');
+  /* One that had answered before, or another failure, is not */
+  expect(pastLimitWhy(reset, false)).toBeNull();
+  expect(pastLimitWhy(new Error('connect ETIMEDOUT'), true)).toBeNull();
 });
 
 /** A mock host's key, as nos pins one: what `api status` prints there. */
