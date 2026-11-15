@@ -18,9 +18,11 @@ use core::sync::atomic::Ordering;
 use ipcwire::{route, Dest, Frame, To};
 use kcore::ipc::{Addr, Bounce, Pieces, Reason, RemoteTo, PIECE_MAX, TAG_BULK, TAG_DOWN, TAG_ROUTE};
 use kcore::time::Duration;
+use kcore::trace::IpcnetWhy;
 
 use super::link::{byte, push_frame};
 use super::peer::{add, OutMsg, Peer, BULK, CONTROL, QUEUE_BYTES};
+use super::records;
 use super::server::Shared;
 
 /// How long a receive waits at a time: how soon a stop is seen when the
@@ -74,23 +76,30 @@ fn route(shared: &Shared, m: Pieces) {
             let msg = OutMsg { from: m.from.0, to, tag, reference, pieces: m.pieces, skip: route::HEAD, len };
             let left = match &peer {
                 Some(p) => p.out[class].with(|o| {
-                    if o.number != peer_number || o.bytes + len > QUEUE_BYTES[class] || o.msgs.try_reserve(1).is_err() {
-                        return Err(msg);
+                    if o.number != peer_number {
+                        return Err((msg, IpcnetWhy::Down, o.bytes));
+                    }
+                    if o.bytes + len > QUEUE_BYTES[class] || o.msgs.try_reserve(1).is_err() {
+                        return Err((msg, IpcnetWhy::Full, o.bytes));
                     }
                     o.bytes += len;
                     o.msgs.push_back(msg);
-                    Ok(o.waker)
+                    Ok((o.waker, o.bytes))
                 }),
-                None => Err(msg),
+                None => Err((msg, IpcnetWhy::Down, 0)),
             };
             match left {
                 /* Its connection's task told, out of the lock */
-                Ok(waker) => {
+                Ok((waker, queue)) => {
+                    records::queued(peer_number, class == BULK, reference, len, queue);
                     if let Some(w) = waker {
                         w.wake();
                     }
                 }
-                Err(msg) => unsent(shared, peer.as_deref(), peer_number, &msg),
+                Err((msg, why, queue)) => {
+                    records::bounced(peer_number, class == BULK, reference, len, queue, why);
+                    unsent(shared, peer.as_deref(), peer_number, &msg)
+                }
             }
         }
         route::MONITOR => {

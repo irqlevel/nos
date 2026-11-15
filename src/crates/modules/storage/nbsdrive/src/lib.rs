@@ -33,6 +33,7 @@ use kcore::events::SharedEvent;
 use kcore::ipc::{Bounce, Error, Limits, Mailbox, Scope, TAG_BULK};
 use kcore::klog;
 use kcore::time::{boot_time_ns, Duration};
+use kcore::trace::BounceWhy;
 use nbsclient::{Buffers, Out, Phase, Session, To, UserOp};
 use nbswire::{CS_NAME, MDS_NAME, TAG_ANSWER, TAG_ASK, TAG_REQUEST, TAG_SAID};
 
@@ -291,12 +292,16 @@ impl Drive {
         let now = boot_time_ns();
         if let Some(b) = m.bounced() {
             if b.tag & !TAG_BULK == TAG_REQUEST {
+                nbstrace::bounced(m.reference, nbstrace::bounce_why(b.why));
                 self.s.on_bounce(m.reference, b.why == Bounce::Gone, now, &mut self.bufs, out);
             }
             return;
         }
         match m.tag & !TAG_BULK {
-            TAG_ANSWER if self.from_a_cs(m) => self.s.on_cs(&m.data, now, &mut self.bufs, out),
+            TAG_ANSWER if self.from_a_cs(m) => {
+                nbstrace::answered(m.from.host(), &m.data);
+                self.s.on_cs(&m.data, now, &mut self.bufs, out)
+            }
             TAG_SAID if m.from.host() == 0 => self.s.on_mds(&m.data, now, &mut self.bufs, out),
             _ => {}
         }
@@ -338,10 +343,12 @@ impl Drive {
                         } else {
                             alloc::format!("{}@{}", CS_NAME, host)
                         };
+                        nbstrace::sent(cs, &bytes);
                         if let Err(e) = self.mb.send_to(&to, REQUEST, id, &bytes) {
                             /* No such name or way: the cs is not there; the
                                way full: sent again in a moment */
                             let gone = matches!(e, Error::Gone | Error::NoRoute);
+                            nbstrace::bounced(id, if gone { BounceWhy::Gone } else { BounceWhy::Full });
                             self.s.on_bounce(id, gone, boot_time_ns(), &mut self.bufs, &mut more);
                         }
                     }

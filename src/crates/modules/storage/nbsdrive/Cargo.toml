@@ -15,5 +15,7 @@ name = "nbsdrive"
 kcore = { path = "../../../base/kcore" }
 nbsclient = { path = "../../../common/storage/nbsclient" }
 nbswire = { path = "../../../common/storage/nbswire" }
+# Its requests' records (`trace on nbs`).
+nbstrace = { path = "../nbstrace" }
 # Who this host is: ipcnet's control mailbox.
 ipcctl = { path = "../../cluster/ipcctl" }

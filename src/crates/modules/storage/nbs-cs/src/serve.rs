@@ -266,22 +266,34 @@ async fn request(cs: Rc<Cs>, m: Message) {
         cs.answer(&m, None, Answer { id: request_id(&m), reply: Reply::Refused(Refusal::Bad) });
         return;
     };
+    /* Its records (`trace on nbs`): taken, and answered after so long */
+    let from = m.from.host();
+    let taken = nbstrace::taking();
+    nbstrace::taken(from, &req);
     /* A write passed along its chain answers its client by name (N13) */
     let to = relay.as_ref().map(|r| r.answer);
     if !cs.serving.get() {
-        cs.answer(&m, to, Answer { id: req.id, reply: Reply::Refused(Refusal::NotReady) });
+        let reply = Reply::Refused(Refusal::NotReady);
+        nbstrace::done(from, &req, &reply, taken);
+        cs.answer(&m, to, Answer { id: req.id, reply });
         return;
     }
     if matches!(req.op, Op::Fence { .. } | Op::Close { .. } | Op::CopyUp { .. }) {
         cs.changed.set(true);
     }
     match serve_relayed(&cs.store, &cs.requests, &req, relay.as_ref(), &*cs).await {
-        Ok(done) => cs.answer(&m, to, Answer { id: req.id, reply: done.reply() }),
+        Ok(done) => {
+            let reply = done.reply();
+            nbstrace::done(from, &req, &reply, taken);
+            cs.answer(&m, to, Answer { id: req.id, reply })
+        }
         Err(why) => {
             if why == Refusal::NoRoom {
                 cs.no_room.set(true);
             }
-            cs.answer(&m, to, Answer { id: req.id, reply: Reply::Refused(why) })
+            let reply = Reply::Refused(why);
+            nbstrace::done(from, &req, &reply, taken);
+            cs.answer(&m, to, Answer { id: req.id, reply })
         }
     }
 }

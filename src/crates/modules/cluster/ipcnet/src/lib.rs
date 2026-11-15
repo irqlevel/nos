@@ -31,6 +31,7 @@ mod control;
 mod files;
 mod link;
 mod peer;
+mod records;
 mod router;
 mod server;
 

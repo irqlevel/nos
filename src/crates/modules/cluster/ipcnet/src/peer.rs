@@ -19,8 +19,9 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
 use ipcwire::Dest;
-use kcore::ipc::{Addr, Bounce, Mailbox, RemoteTo};
+use kcore::ipc::{Addr, Bounce, Mailbox, RemoteTo, TAG_BULK};
 use kcore::sync::Mutex;
+use kcore::trace::IpcnetWhy;
 
 use super::files::PeerConf;
 use tls::pinned::Fingerprint;
@@ -293,6 +294,8 @@ impl Peer {
         if up == Ok(true) {
             add(&self.counts.ups, 1);
             kcore::klog!(0, "ipcnet: {} ({}) up", self.conf.name, super::files::Ip(self.conf.ip));
+            super::records::link(self.number_now.load(Ordering::Acquire), true, self.counts.ups.load(Ordering::Relaxed),
+                                 self.counts.losses.load(Ordering::Relaxed));
         }
         up.map(|_| ())
     }
@@ -347,6 +350,7 @@ impl Lost {
     fn finish(self, router: &Mailbox, peer: &Peer) {
         if self.number != 0 {
             for m in &self.unsent {
+                super::records::bounced(self.number, m.tag & TAG_BULK != 0, m.reference, m.len, 0, IpcnetWhy::Lost);
                 let to = match &m.to {
                     Dest::Addr(a) => RemoteTo::Addr(Addr(*a)),
                     Dest::Name(n) => match core::str::from_utf8(n) {
@@ -360,6 +364,8 @@ impl Lost {
             }
             let _ = router.peer_lost(self.number);
             kcore::klog!(0, "ipcnet: {} lost: {}", peer.conf.name, self.why);
+            super::records::link(self.number, false, peer.counts.ups.load(Ordering::Relaxed),
+                                 peer.counts.losses.load(Ordering::Relaxed));
         }
         for (_, local) in self.monitors {
             router.demonitor(local);
