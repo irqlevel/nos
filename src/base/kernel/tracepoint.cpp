@@ -626,6 +626,182 @@ const Field SOFTIRQ_EXIT_FIELDS[] = {
     { "again", __builtin_offsetof(SoftirqExit, again), sizeof(u8), Kind::Unsigned, nullptr, 0 },
 };
 
+/* ---- NBS's events ----
+   A volume's request, by its session's id: sent by the client (nbs_req) --
+   or bounced back to it (nbs_bounce) -- taken by a chunk server
+   (nbs_cs_req), answered there (nbs_cs_done) and back at the client
+   (nbs_ans). What a chunk server's device does for it is the block layer's
+   (bio_submit, bio_done), what the channel does with its message ipcnet's
+   (ipcnet_queue, its reference the request's id). */
+
+static_assert(sizeof(NbsReq) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(NbsAns) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(NbsBounce) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(NbsCsReq) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(NbsCsDone) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+
+/* What a request asks: nbswire's `Op`, in its order */
+const char* const NBS_OPS[] = { "fence", "write", "read", "flush", "close", "held", "ping", "holdings", "pull",
+                                "sums", "scrub", "copy_up" };
+/* What an answer says: done, or nbswire's `Refusal`, in its order */
+const char* const NBS_STATUS[] = { "ok", "fenced", "not_fenced", "stale_chunk", "epoch", "no_room", "bad",
+                                   "failed", "io", "too_many_fences", "not_the_map", "not_here", "not_attached",
+                                   "behind", "no_mds", "not_ready", "not_held", "not_the_joiner" };
+/* Why a message came back: ipc's `Bounce` -- its mailbox full, its owner
+   gone, never sent by the channel */
+const char* const BOUNCE_WHY[] = { "full", "gone", "unsent" };
+
+const Field NBS_REQ_FIELDS[] = {
+    { "id", __builtin_offsetof(NbsReq, id), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "op", __builtin_offsetof(NbsReq, op), sizeof(u8), Kind::Enum, NBS_OPS, sizeof(NBS_OPS) / sizeof(NBS_OPS[0]) },
+    { "volume", __builtin_offsetof(NbsReq, volume), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "chunk", __builtin_offsetof(NbsReq, chunk), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "offset", __builtin_offsetof(NbsReq, offset), sizeof(u32), Kind::Hex, nullptr, 0 },
+    { "len", __builtin_offsetof(NbsReq, len), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "cs", __builtin_offsetof(NbsReq, cs), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "pid", __builtin_offsetof(NbsReq, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field NBS_ANS_FIELDS[] = {
+    { "id", __builtin_offsetof(NbsAns, id), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "status", __builtin_offsetof(NbsAns, status), sizeof(u8), Kind::Enum, NBS_STATUS,
+      sizeof(NBS_STATUS) / sizeof(NBS_STATUS[0]) },
+    /* The host it came from, by its number in the channel; 0 this one */
+    { "from", __builtin_offsetof(NbsAns, from), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "bytes", __builtin_offsetof(NbsAns, bytes), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "pid", __builtin_offsetof(NbsAns, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field NBS_BOUNCE_FIELDS[] = {
+    { "id", __builtin_offsetof(NbsBounce, id), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "why", __builtin_offsetof(NbsBounce, why), sizeof(u8), Kind::Enum, BOUNCE_WHY,
+      sizeof(BOUNCE_WHY) / sizeof(BOUNCE_WHY[0]) },
+    { "pid", __builtin_offsetof(NbsBounce, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field NBS_CS_REQ_FIELDS[] = {
+    { "id", __builtin_offsetof(NbsCsReq, id), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "op", __builtin_offsetof(NbsCsReq, op), sizeof(u8), Kind::Enum, NBS_OPS,
+      sizeof(NBS_OPS) / sizeof(NBS_OPS[0]) },
+    { "from", __builtin_offsetof(NbsCsReq, from), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "volume", __builtin_offsetof(NbsCsReq, volume), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "chunk", __builtin_offsetof(NbsCsReq, chunk), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "offset", __builtin_offsetof(NbsCsReq, offset), sizeof(u32), Kind::Hex, nullptr, 0 },
+    { "len", __builtin_offsetof(NbsCsReq, len), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "pid", __builtin_offsetof(NbsCsReq, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field NBS_CS_DONE_FIELDS[] = {
+    { "id", __builtin_offsetof(NbsCsDone, id), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "op", __builtin_offsetof(NbsCsDone, op), sizeof(u8), Kind::Enum, NBS_OPS,
+      sizeof(NBS_OPS) / sizeof(NBS_OPS[0]) },
+    { "from", __builtin_offsetof(NbsCsDone, from), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "status", __builtin_offsetof(NbsCsDone, status), sizeof(u8), Kind::Enum, NBS_STATUS,
+      sizeof(NBS_STATUS) / sizeof(NBS_STATUS[0]) },
+    /* From its taking to its answer: the engine's, its device's, its mds's */
+    { "ns", __builtin_offsetof(NbsCsDone, ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    { "pid", __builtin_offsetof(NbsCsDone, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+/* ---- raft's events ---- */
+
+static_assert(sizeof(RaftRole) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(RaftSend) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(RaftRecv) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(RaftCommit) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+
+/* Which raft a member is of: the cluster's registry, NBS's metadata */
+const char* const RAFT_OF[] = { "registry", "nbs" };
+const char* const RAFT_ROLES[] = { "follower", "pre_candidate", "candidate", "leader" };
+/* A message's kind: raft's `Body`, a vote's and its answer's pre-vote apart */
+const char* const RAFT_KINDS[] = { "vote", "pre_vote", "vote_resp", "pre_vote_resp", "append", "append_resp",
+                                   "heartbeat", "heartbeat_resp", "snapshot", "snapshot_resp", "timeout_now",
+                                   "read_index", "read_index_resp" };
+
+const Field RAFT_ROLE_FIELDS[] = {
+    { "of", __builtin_offsetof(RaftRole, of), sizeof(u8), Kind::Enum, RAFT_OF, sizeof(RAFT_OF) / sizeof(RAFT_OF[0]) },
+    { "role", __builtin_offsetof(RaftRole, role), sizeof(u8), Kind::Enum, RAFT_ROLES,
+      sizeof(RAFT_ROLES) / sizeof(RAFT_ROLES[0]) },
+    { "term", __builtin_offsetof(RaftRole, term), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    /* Its member's node id; 0 none */
+    { "leader", __builtin_offsetof(RaftRole, leader), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "pid", __builtin_offsetof(RaftRole, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field RAFT_SEND_FIELDS[] = {
+    { "of", __builtin_offsetof(RaftSend, of), sizeof(u8), Kind::Enum, RAFT_OF, sizeof(RAFT_OF) / sizeof(RAFT_OF[0]) },
+    { "kind", __builtin_offsetof(RaftSend, kind), sizeof(u8), Kind::Enum, RAFT_KINDS,
+      sizeof(RAFT_KINDS) / sizeof(RAFT_KINDS[0]) },
+    { "peer", __builtin_offsetof(RaftSend, peer), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "term", __builtin_offsetof(RaftSend, term), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "index", __builtin_offsetof(RaftSend, index), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "count", __builtin_offsetof(RaftSend, count), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    /* A response's: granted, or taken; 1 for any other message */
+    { "ok", __builtin_offsetof(RaftSend, ok), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "pid", __builtin_offsetof(RaftSend, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field RAFT_RECV_FIELDS[] = {
+    { "of", __builtin_offsetof(RaftRecv, of), sizeof(u8), Kind::Enum, RAFT_OF, sizeof(RAFT_OF) / sizeof(RAFT_OF[0]) },
+    { "kind", __builtin_offsetof(RaftRecv, kind), sizeof(u8), Kind::Enum, RAFT_KINDS,
+      sizeof(RAFT_KINDS) / sizeof(RAFT_KINDS[0]) },
+    { "peer", __builtin_offsetof(RaftRecv, peer), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "term", __builtin_offsetof(RaftRecv, term), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "index", __builtin_offsetof(RaftRecv, index), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "count", __builtin_offsetof(RaftRecv, count), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "ok", __builtin_offsetof(RaftRecv, ok), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "pid", __builtin_offsetof(RaftRecv, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field RAFT_COMMIT_FIELDS[] = {
+    { "of", __builtin_offsetof(RaftCommit, of), sizeof(u8), Kind::Enum, RAFT_OF,
+      sizeof(RAFT_OF) / sizeof(RAFT_OF[0]) },
+    { "committed", __builtin_offsetof(RaftCommit, committed), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "applied", __builtin_offsetof(RaftCommit, applied), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "pid", __builtin_offsetof(RaftCommit, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+/* ---- ipcnet's events ---- */
+
+static_assert(sizeof(IpcnetLink) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(IpcnetQueue) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(IpcnetBounce) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+
+/* Why ipcnet bounced a message: its class's queue full, the peer not up --
+   or another session of it -- or its session lost before it went */
+const char* const IPCNET_WHY[] = { "full", "down", "lost" };
+
+const Field IPCNET_LINK_FIELDS[] = {
+    /* The peer's host number in the channel: given at its session's up */
+    { "peer", __builtin_offsetof(IpcnetLink, peer), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    /* 1 up, 0 lost */
+    { "up", __builtin_offsetof(IpcnetLink, up), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "ups", __builtin_offsetof(IpcnetLink, ups), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "losses", __builtin_offsetof(IpcnetLink, losses), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "pid", __builtin_offsetof(IpcnetLink, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field IPCNET_QUEUE_FIELDS[] = {
+    { "peer", __builtin_offsetof(IpcnetQueue, peer), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "bulk", __builtin_offsetof(IpcnetQueue, bulk), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    /* The message's reference: an NBS request's id */
+    { "reference", __builtin_offsetof(IpcnetQueue, reference), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "bytes", __builtin_offsetof(IpcnetQueue, bytes), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "queued", __builtin_offsetof(IpcnetQueue, queued), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "pid", __builtin_offsetof(IpcnetQueue, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field IPCNET_BOUNCE_FIELDS[] = {
+    { "peer", __builtin_offsetof(IpcnetBounce, peer), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "bulk", __builtin_offsetof(IpcnetBounce, bulk), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "why", __builtin_offsetof(IpcnetBounce, why), sizeof(u8), Kind::Enum, IPCNET_WHY,
+      sizeof(IPCNET_WHY) / sizeof(IPCNET_WHY[0]) },
+    { "reference", __builtin_offsetof(IpcnetBounce, reference), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "bytes", __builtin_offsetof(IpcnetBounce, bytes), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "queued", __builtin_offsetof(IpcnetBounce, queued), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "pid", __builtin_offsetof(IpcnetBounce, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
 /* Sized by its lines, not by COUNT: an event added to tp::Id without its line
    here would be a description of zeroes -- a null name printed -- where now it
    is a build that fails. */
@@ -731,6 +907,32 @@ const Event EVENTS[] = {
       sizeof(SoftirqEntry), sizeof(SOFTIRQ_ENTRY_FIELDS) / sizeof(SOFTIRQ_ENTRY_FIELDS[0]), SOFTIRQ_ENTRY_FIELDS },
     { "softirq_exit", "softirq", "that handler done: how long it ran, and whether it was raised again meanwhile",
       sizeof(SoftirqExit), sizeof(SOFTIRQ_EXIT_FIELDS) / sizeof(SOFTIRQ_EXIT_FIELDS[0]), SOFTIRQ_EXIT_FIELDS },
+    { "nbs_req", "nbs", "a request a volume's client sent a chunk server: what it asks, of which chunk, how many "
+      "bytes",
+      sizeof(NbsReq), sizeof(NBS_REQ_FIELDS) / sizeof(NBS_REQ_FIELDS[0]), NBS_REQ_FIELDS },
+    { "nbs_ans", "nbs", "a chunk server's answer to it, back at the client: done, or why refused",
+      sizeof(NbsAns), sizeof(NBS_ANS_FIELDS) / sizeof(NBS_ANS_FIELDS[0]), NBS_ANS_FIELDS },
+    { "nbs_bounce", "nbs", "a request that never reached its chunk server, back at the client, and why",
+      sizeof(NbsBounce), sizeof(NBS_BOUNCE_FIELDS) / sizeof(NBS_BOUNCE_FIELDS[0]), NBS_BOUNCE_FIELDS },
+    { "nbs_cs_req", "nbs", "a request a chunk server took, and the host it came from",
+      sizeof(NbsCsReq), sizeof(NBS_CS_REQ_FIELDS) / sizeof(NBS_CS_REQ_FIELDS[0]), NBS_CS_REQ_FIELDS },
+    { "nbs_cs_done", "nbs", "the chunk server's answer to it, and how long it took from its taking",
+      sizeof(NbsCsDone), sizeof(NBS_CS_DONE_FIELDS) / sizeof(NBS_CS_DONE_FIELDS[0]), NBS_CS_DONE_FIELDS },
+    { "raft_role", "raft", "a raft member's role, term or leader changed: the registry's or NBS's",
+      sizeof(RaftRole), sizeof(RAFT_ROLE_FIELDS) / sizeof(RAFT_ROLE_FIELDS[0]), RAFT_ROLE_FIELDS },
+    { "raft_send", "raft", "a raft message a member sent: its kind, the index it is about, the entries it carries",
+      sizeof(RaftSend), sizeof(RAFT_SEND_FIELDS) / sizeof(RAFT_SEND_FIELDS[0]), RAFT_SEND_FIELDS },
+    { "raft_recv", "raft", "a raft message a member took in, from the node its host is",
+      sizeof(RaftRecv), sizeof(RAFT_RECV_FIELDS) / sizeof(RAFT_RECV_FIELDS[0]), RAFT_RECV_FIELDS },
+    { "raft_commit", "raft", "what a raft member has committed and applied, as either moved on",
+      sizeof(RaftCommit), sizeof(RAFT_COMMIT_FIELDS) / sizeof(RAFT_COMMIT_FIELDS[0]), RAFT_COMMIT_FIELDS },
+    { "ipcnet_link", "ipcnet", "a peer's session up, or lost: its sessions up and lost so far",
+      sizeof(IpcnetLink), sizeof(IPCNET_LINK_FIELDS) / sizeof(IPCNET_LINK_FIELDS[0]), IPCNET_LINK_FIELDS },
+    { "ipcnet_queue", "ipcnet", "a message queued for a peer, and the bytes of its class's queue with it",
+      sizeof(IpcnetQueue), sizeof(IPCNET_QUEUE_FIELDS) / sizeof(IPCNET_QUEUE_FIELDS[0]), IPCNET_QUEUE_FIELDS },
+    { "ipcnet_bounce", "ipcnet", "a message for a peer bounced back to its sender: its queue full, the peer not up, "
+      "its session lost",
+      sizeof(IpcnetBounce), sizeof(IPCNET_BOUNCE_FIELDS) / sizeof(IPCNET_BOUNCE_FIELDS[0]), IPCNET_BOUNCE_FIELDS },
 };
 static_assert(sizeof(EVENTS) / sizeof(EVENTS[0]) == COUNT, "every event has its description, in tp::Id's order");
 
