@@ -186,10 +186,10 @@ impl Suite {
     }
 }
 
-/// The kernel's provider, held to `suites` in that order -- all of its
-/// own for none.
+/// The kernel's provider ([`crate::provider`]), held to `suites` in that
+/// order -- all of its own, in its own order, for none.
 fn provider(suites: &[Suite]) -> rustls::crypto::CryptoProvider {
-    let mut provider = rustls_rustcrypto::provider();
+    let mut provider = crate::provider();
     if !suites.is_empty() {
         let all = core::mem::take(&mut provider.cipher_suites);
         provider.cipher_suites =
@@ -348,6 +348,10 @@ impl Server {
                               PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.to_vec())))
             .map_err(|_| SetupError::Key)?;
         config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        /* The server's order, not the client's: a client with AES-NI -- the
+         * panel's Node, nosctl's OpenSSL -- puts AES-GCM first, the suite
+         * this kernel runs slowest (crate::provider) */
+        config.ignore_client_order = true;
         /* No resumption: a client is a program that connects for long, and
          * every connection shows its key afresh */
         config.session_storage = Arc::new(NoServerSessionStorage {});

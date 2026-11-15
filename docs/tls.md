@@ -234,8 +234,17 @@ pool -- `entropy` in the shell says which sources exist.
   | ChaCha20-Poly1305 | 203 MB/s | 119 MB/s | 1.2 ms |
 
   Only ChaCha20-Poly1305 carries a 1 GbE link (117 MB/s) with room to
-  spare, so a link between hosts (ipcnet) asks for it first. On an Apple
-  M-series core under HVF, arm64's: AES-GCM 160–195 MB/s, ChaCha20 440.
+  spare, so every configuration the crate makes asks for it first
+  (`tls::provider`): the HTTP client offers it before AES-GCM -- in TLS
+  1.3 and 1.2 alike -- and a server that follows its client's order, as
+  most do, agrees on it; the kernel's own server (`pinned`: the host
+  API's, ipcnet's) holds its clients to its order rather than theirs, so
+  a client with AES-NI, which puts AES-GCM first -- the panel's Node,
+  nosctl's OpenSSL -- gets ChaCha20-Poly1305 too. The net fuzzer holds
+  both: the world's server, following its client, agrees on
+  ChaCha20-Poly1305 with the kernel's HTTP client, and the kernel's server
+  on it with a client that asks for AES-GCM first. On an Apple M-series
+  core under HVF, arm64's: AES-GCM 160–195 MB/s, ChaCha20 440.
   `tests/tlsbench.py` boots nos with the module and runs it: under KVM
   on a server -- nos a guest, nothing rebooted -- it says what the cores
   give; under TCG, nothing worth quoting.
