@@ -27,7 +27,9 @@ device. Then:
   its requests waited -- twice, the counters only growing;
 - a guest on a with `disk=nbs:gdisk`: its disk the volume's size, its serial
   `nbs-<number>`; written with dd, synced, read back past the page cache the
-  same; stopped -- the volume let go of, detached;
+  same; a hundred writes of 4 KiB each flushed, one after another, none of
+  their requests left for the disk task's idle second; stopped -- the volume
+  let go of, detached;
 - a guest on b with it: what a's wrote is there;
 - a's start refused while b's guest has the volume, and with `force` taken:
   b's guest's next write fails, fenced, and a's guest reads what was there;
@@ -86,6 +88,13 @@ VOLUME_MIB = 64
 WRITE_MIB = 8
 # The write a host is killed under: 16 MiB, after the first
 LONG_MIB = 16
+# The writes of 4 KiB, each flushed, made one after another at QD1, and how
+# long they may take in all: a request left for the disk task's idle second,
+# every other one, is a second a pair -- 100 s; under KVM they take one,
+# under TCG some tens
+QD1_WRITES = 100
+QD1_FLUSHES = 300
+QD1_SECS = 60
 # N10d3: the disk hvboot boots, made an image; a's clone of it grown to
 # CLONE_MIB, and written at COPY_AT MiB -- inside the image, so over a
 # chunk the image shares -- with the image's first MiB
@@ -452,6 +461,44 @@ def main():
         check("written to its disk, synced", "nos-rc=0" in out, out)
         got, out = volume_sum(a, va, 0, WRITE_MIB)
         check("read back past the page cache, the same", got == written, out)
+        # Requests one after another at QD1, each handed over while the
+        # disk's task spins for the next: none left in its pipe for the
+        # task's idle second (the volume's `wake` said by its `poll`). Found
+        # on the demo stand, 2026-11-15: every other request waited 1 s, the
+        # write and the flush of each file dpkg unpacks among them. A write
+        # of 4 KiB and its flush a hundred times, in the volume's last MiB,
+        # which nothing else here writes, timed by the guest's own clock: a
+        # second each pair is 100 s; a dd a pair, its next write
+        # milliseconds after. (The vm provider's `disk_io` would say their
+        # wait, but takes a VM by its name, and this one has none.)
+        out = a.run(x(va, "s=$(cut -d' ' -f1 /proc/uptime); i=0; while [ $i -lt %d ]; do dd if=/dev/zero "
+                          "of=/dev/vda bs=4k count=1 seek=$((%d+i)) conv=fsync 2>/dev/null || break; i=$((i+1)); done; "
+                          "echo nos-qd1=$i $s $(cut -d' ' -f1 /proc/uptime)"
+                      % (QD1_WRITES, (VOLUME_MIB - 1) * 256), 300))
+        m = re.search(r"nos-qd1=(\d+) ([\d.]+) ([\d.]+)", out)
+        took = float(m.group(3)) - float(m.group(2)) if m else None
+        check("%d writes of 4 KiB, each flushed, one after another, in %s s: none left for the disk task's idle "
+              "second" % (QD1_WRITES, "?" if took is None else "%.1f" % took),
+              m is not None and int(m.group(1)) == QD1_WRITES and took < QD1_SECS, out)
+        # And flushes alone, one on the heels of the last from one process --
+        # the stand's pattern, a filesystem's fsync of a file with nothing
+        # more to write, dpkg's. `sync -d` of the disk a few hundred times
+        # over, its arguments made in the guest -- its line editor keeps a
+        # line of 1 KiB. What neither check sees here: on the EX44's silicon
+        # the guest's next request came 33 to 54 us after the last one's
+        # answer, inside the task's spin, and was lost there; nested under
+        # KVM it comes past 100 us, the spin is off by then, and the code
+        # from before the fix passes both (the mutant runs of 2026-11-15).
+        # They hold a QD1 stream's pace; the loss itself is closed in
+        # `serve`, which looks at its pipe before every sleep.
+        out = a.run(x(va, "set --; i=0; while [ $i -lt %d ]; do set -- \"$@\" /dev/vda; i=$((i+1)); done; "
+                          "s=$(cut -d' ' -f1 /proc/uptime); sync -d \"$@\"; "
+                          "echo nos-flushes=$? $# $s $(cut -d' ' -f1 /proc/uptime)" % QD1_FLUSHES, 300))
+        m = re.search(r"nos-flushes=(\d+) (\d+) ([\d.]+) ([\d.]+)", out)
+        took = float(m.group(4)) - float(m.group(3)) if m else None
+        check("%d flushes of its disk from one process, one on the heels of the last, in %s s: none left for the "
+              "disk task's idle second" % (QD1_FLUSHES, "?" if took is None else "%.1f" % took),
+              m is not None and m.group(1) == "0" and int(m.group(2)) == QD1_FLUSHES and took < QD1_SECS, out)
         a.run("hv stop %d" % va)
         check("stopped, the volume let go of",
               ipct.wait_for(lambda: "detached" in a.run("nbs volume gdisk"), 60, 1), a.run("nbs volume gdisk"))

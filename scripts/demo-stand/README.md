@@ -18,7 +18,7 @@ each a variable at its top.
 | `neighbours.sh` | here | the EX44's panel's key let in on each neighbour, and each one's address and key said, for the Hosts page |
 | `ax41/demo-net.sh up\|down\|show` | the AX41 | the bridge `nosbr0` (10.77.0.0/24), NAT out; from the EX44 alone each neighbour's ipcnet (39241, 39242) and API (39251, 39252 to their 39234), and the bundle's port (39299); every rule tagged `nos-demo` |
 | `ax41/demo-make.sh <name>...` | the AX41 | a neighbour's root -- ipcnet, cluster, nbs-mds, nbs-cs and api, its `hosts.toml`, an `api.toml` taking the EX44 alone, `/etc/rc` -- and a 40 GiB pool, its partition's GUID fixed |
-| `ax41/demo-update.sh <name>...` | the AX41 | a neighbour powered off, the modules its `/etc/rc` loads put into its root and nothing else of it touched, the root held to `e2fsck -fn`, the VM started again on `nos-test.iso`, waited for until its peers are up -- one at a time, the cluster keeping its majority |
+| `ax41/demo-update.sh <name>...` | the AX41 | a neighbour powered off, the modules its `/etc/rc` loads put into its root and nothing else of it touched, the root held to `e2fsck -fn`, the VM started again on `nos-test.iso`, waited for until its peers are up -- one at a time, the cluster keeping its majority, none taken down before NBS's chunks are at three replicas again |
 | `ax41/demo-vm.sh start\|stop\|status <name>` | the AX41 | a neighbour under KVM, its tap on the bridge; `stop` powers it off through its UDP shell |
 | `ax41/dhcp.py`, `ax41/nsh.py` | the AX41 | DHCP on the bridge, each neighbour's MAC its address; one command to a neighbour's UDP shell |
 
@@ -40,6 +40,17 @@ scripts/demo-stand/ax41-update.sh
 DEMO_KEEP=1 DEMO_SSH_CONFIG=<ssh config> scripts/demo-stand/ex44-deploy.sh nos-x86_64.squashfs
 DEMO_SSH_CONFIG=<ssh config> scripts/demo-stand/panel-update.sh out/demo/nos-panel-<version>.tar.gz
 ```
+
+No host goes down before NBS's chunks are all at three replicas again
+(`nbs status`: none at two or one, no join, no cs down), and each script
+ends once they are: a host back rejoins its sets by a copy, and the next
+one taken down before that copy is done would leave the chunks at one
+replica for as long as it takes -- the first update of the stand did, for
+some minutes. A host back is asked only once its NBS member has applied an
+entry past the last one it had as it went: until it has caught up with the
+leader it says what NBS was before -- every chunk at three replicas -- and
+the EX44's VMs on volumes are started only then, a start whose attach went
+unanswered tried again.
 
 `ssh_config.example` is the ssh config the EX44's scripts take: nos's
 sshd and Ubuntu's at one address, Ubuntu's host key in a known_hosts of its
