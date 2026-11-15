@@ -552,7 +552,8 @@ What the VMX backend does not do yet, and says so rather than pretends:
                                 stops
     hv restart <id>             boot it again from its files, running or stopped
     hv stop <id|all> [secs=N]   press its power button and give it secs (30)
-                                to turn itself off, then stop it; say how it
+                                to turn itself off, pressed again every 15 s
+                                while it runs, then stop it; say how it
                                 ended, take it off the list -- as rmmod and
                                 nos's poweroff and reboot stop all of them,
                                 given insmod's stop_secs= (120)
@@ -3253,7 +3254,7 @@ console_log = true
 | `cpus`, `cpu` | how many CPUs, and the host CPU its first runs on | 1, and where it is placed |
 | `disks` | its disks, `vda` first, `:ro` after one it only reads | none |
 | `net` | a NIC on the guests' switch | `false` |
-| `port` | its port of the switch, 0..15: its address `10.0.100.(port+2)` and its MAC the same at every start | the first free one |
+| `port` | its port of the switch, 0..15: its address `10.0.100.(port+2)` and its MAC the same at every start | at its first start, the lowest no other VM's vm.toml names and none running holds -- written in, as its `uuid` is |
 | `forward` | `"<nos's port>:<the guest's>"`s, relayed once it runs and taken away with it | none |
 | `restart` | booted again when it resets itself | `false` |
 | `protected` | stopped and deleted through the host API, and deleted by `hv delete`, only when told `force` | `false` |
@@ -3452,7 +3453,17 @@ event -- and gives the guest `secs` (30 unless told) to turn itself off; one
 that does ends `the guest powered itself off, S5 by its ACPI PM1 control
 register`. A kernel hears the button as a key, KEY_POWER on its input
 device, and what answers it is userspace's: systemd-logind shuts a
-distribution down, BusyBox's `acpid` runs `/etc/acpi/PWRF/00000080`. A guest
+distribution down, BusyBox's `acpid` runs `/etc/acpi/PWRF/00000080`. What
+answers it may decline a press, and forget it: logind refuses one while a
+shutdown is inhibited -- `Refusing poweroff operation, shutdown is inhibited
+by UID 0/root, PID .../unattended-upgr`, as Ubuntu's unattended-upgrades
+inhibits one while it installs -- and the press after that ends is the one
+it acts on. So a guest that heard the button and runs still has it pressed
+again every 15 s while its time lasts (`REPRESS_S`, `Shared::press_again`),
+`hv stop`'s and an unload's waits pressing it once between them, and the
+report's `acpi` line counts the presses; a press it does not hear after one
+it heard is of a guest on its way down, its kernel turning the event off as
+it powers off, and the wait goes on. A guest
 that hears it and does nothing is stopped when its time is up, `its power
 button went unanswered for 30 s`. One whose OS never enabled the event -- no
 ACPI, `acpi=off`, not booted that far -- cannot hear it, and the first CPU's
@@ -3538,6 +3549,14 @@ is nos's, `dev` and the commit, which such a build does not know.)
   the file -- the lines the operator wrote left as they were -- and the same
   at every start after. One started from its kernel's path takes `uuid=`,
   or a random one, kept across its restarts; its serial is its number.
+- **So is its port of the switch**, and with it its MAC and its address: a
+  VM on the switch whose `vm.toml` names no `port` is given one at its first
+  start -- the lowest no other VM's file names and no VM running holds --
+  and it is written in, as the UUID is (`store::keep_port`). Taken afresh
+  at each start, a port went by the order the VMs started in: two started
+  the other way round after their host's reboot swapped theirs, and the
+  Ubuntu one's network, its netplan matching its NIC by the MAC cloud-init
+  saw at its first boot, came up with no DNS server.
 
 The gate is `tests/hv-linux-test.py --smbios` with a kernel built with
 `DMI` and `DMIID`: what `/sys/class/dmi/id` says, a VM whose `vm.toml` had

@@ -64,7 +64,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use hv::disk::{self as blk, Op, Request};
 use kcore::block::{DiskQueue, QueueError};
@@ -274,6 +274,10 @@ trait Media: Send + Sync {
     fn start(&self, k: usize, write: bool, offset: u64, len: usize) -> kcore::error::Result<Started>;
     fn kick(&self);
     fn reap(&self, done: &mut dyn FnMut(usize, bool)) -> usize;
+    /// Spun for up to `d`: whether anything came meanwhile -- a command done
+    /// or a request handed over (`wake`) -- for the task to look again
+    /// rather than sleep. The task looks at its pipe before it sleeps all
+    /// the same (`serve`), so that a wake taken and not said costs nothing.
     fn poll(&self, d: Duration) -> bool;
     fn wait(&self, d: Duration) -> bool;
     fn wake(&self);
@@ -391,6 +395,10 @@ struct Volume {
     slots: Vec<Mutex<Vec<u8>>>,
     tags: Mutex<[Option<u64>; blk::IN_FLIGHT]>,
     event: SharedEvent,
+    /// A request handed over (`wake`) since the task last turned the
+    /// session: what a signal of `event` was for when the turn finds no
+    /// message for it -- the turn takes the signal, and only this says it.
+    handed: AtomicBool,
 }
 
 impl Volume {
@@ -422,6 +430,7 @@ impl Volume {
             slots,
             tags: Mutex::new([None; blk::IN_FLIGHT]).ok_or_else(|| String::from("out of memory"))?,
             event,
+            handed: AtomicBool::new(false),
         };
         /* Its session named under hv's namespace, for its writes' chains
            to answer at (N13) */
@@ -534,14 +543,24 @@ impl Media for Volume {
         self.wait(wait)
     }
 
+    /// The session turned for up to `wait`: whether something came for the
+    /// task -- an operation done, or a request handed over, whose signal the
+    /// turn took and found no message for. Said with `has_done` alone, a
+    /// request handed over while the task spun (`poll`) was waited for by
+    /// none: the task slept its `IDLE_SECS` with it in its pipe -- a second
+    /// every other request of a guest's at QD1, the flushes of dpkg's fsync
+    /// of every file it unpacks among them (found on the demo stand,
+    /// 2026-11-15: `blk_submit` to `disk_start` 1.000 s, the flush 75 us).
     fn wait(&self, wait: Duration) -> bool {
         let mut d = self.drive.lock();
         let Some(d) = d.as_mut() else { return false };
         d.turn(wait.as_nanos());
-        d.has_done()
+        self.handed.swap(false, Ordering::AcqRel) | d.has_done()
     }
 
     fn wake(&self) {
+        /* Before the signal: the turn it ends finds the flag set */
+        self.handed.store(true, Ordering::Release);
         self.event.signal();
     }
 
@@ -896,6 +915,15 @@ fn serve(start: Serve) {
              * likely to come (POLL_MAX_NS). */
             let looked = kcore::time::boot_time_ns();
             if poll_ns != 0 && queue.poll(Duration::from_nanos(poll_ns)) {
+                continue;
+            }
+            /* The pipe looked at before the sleep, whatever the poll said: a
+             * wake a media takes in its poll and does not say leaves the
+             * request it was for in the pipe for the whole IDLE_SECS -- a
+             * volume's said only what its session had done, and every other
+             * request of a guest's at QD1 waited a second (52c681db). A
+             * request handed over after this look signals the sleep. */
+            if poll_ns != 0 && !pipe.requests.lock().todo.is_empty() {
                 continue;
             }
             queue.wait(Duration::from_secs(IDLE_SECS));

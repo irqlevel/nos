@@ -4,7 +4,11 @@
 #
 # - the panel's VM stopped and deleted, so that /etc/rc's `api panel create`
 #   at the next boot makes it anew of the image's bundle; every other VM
-#   running stopped by its power button, its name kept to start it again;
+#   running stopped by its power button, its name kept to start it again --
+#   each given DEMO_STOP_SECS (600, hv's most) to turn itself off: a guest
+#   installing updates declines the button until they are in (Ubuntu's
+#   logind, inhibited by unattended-upgrades), hv pressing it again every
+#   15 s, and one cut off midway is left with its packages half installed;
 # - nos rebooted into Ubuntu; nos's root held to e2fsck -fn, then made ready
 #   for the demo: /etc/rc loading ipcnet, the registry and NBS before the
 #   API (once), a fresh hosts.toml -- this host alone, in a cluster of its
@@ -21,7 +25,11 @@
 # With DEMO_KEEP=1 the stand's state is kept, the image alone changed: the
 # panel's VM stopped, not deleted -- /etc/rc's `api panel create` starts it
 # again, panel-update.sh installs a bundle in it -- and nos's root not made
-# ready: the cluster, NBS and hosts.toml as they are. e2fsck -fn still.
+# ready: the cluster, NBS and hosts.toml as they are. e2fsck -fn still. And
+# nothing stopped before NBS's chunks are all at three replicas -- a
+# neighbour just updated may be copying its sets back still, and this host's
+# replicas the only ones active -- nor said done before they are again,
+# this host's copied back.
 #
 # The ssh config names hosts ex44-nos and ex44-ubuntu (ssh_config.example).
 # A step that fails stops it where it is, said; one in Ubuntu leaves Ubuntu
@@ -33,6 +41,7 @@ CFG=${DEMO_SSH_CONFIG:?an ssh config with hosts ex44-nos and ex44-ubuntu: ssh_co
 ROOT_UUID=${EX44_ROOT_UUID:-83e77975-48f2-4356-819b-7b01d482c5de}
 NAME=${EX44_NAME:-ex44}
 KEEP=${DEMO_KEEP:-0}
+STOP_SECS=${DEMO_STOP_SECS:-600}
 LOCAL=${1:?the system image: build.sh makes nos-x86_64.squashfs}
 LOG=$ROOT/out/demo
 mkdir -p "$LOG"
@@ -60,6 +69,60 @@ on_nos() { ssh -F "$CFG" ex44-nos "$1"; }
 on_ubuntu() { ssh -F "$CFG" ex44-ubuntu "$1"; }
 running() { on_nos "hv list" | awk '$1 == "vm" && $4 == "running" { print $3 }'; }
 
+# What `nbs status` says now: its chunks' line, empty where it has none --
+# a host with no NBS, or one whose member is not up yet, which only the
+# caller can tell apart -- and "?" where nos does not answer.
+nbs_line() {
+    local out
+    out=$(on_nos "nbs status" 2>/dev/null) && [ -n "$out" ] || { echo "?"; return; }
+    echo "$out" | grep '^nbs: chunks at' || true
+}
+
+# NBS's chunks all at three replicas, no copy going on and no cs down, as
+# nos here sees them, waited for up to $1 seconds: 0 once they are -- or,
+# unless $2 is 1, this host having NBS, at an answer without that line, a
+# host with none -- 1 if not in time. Each line it says that differs from
+# the one before it is said.
+nbs_whole() {
+    local secs=$1 need=${2:-0} t=0 line last=
+    while [ $t -le $secs ]; do
+        line=$(nbs_line)
+        if [ -z "$line" ]; then
+            [ "$need" = 1 ] || return 0
+        elif [ "$line" != "?" ]; then
+            echo "$line" | grep -q "at two 0, at one 0 -- 0 being copied, by 0 joins; cs.s down 0," && return 0
+            [ "$line" = "$last" ] || echo "   $(echo "$line" | cut -c1-120)"
+            last=$line
+        fi
+        sleep 10
+        t=$((t + 10))
+    done
+    return 1
+}
+
+# The entry this host's NBS member has applied, as `nbs status` says; empty
+# where it says none.
+nbs_applied() {
+    on_nos "nbs status" 2>/dev/null | sed -n 's/.* applied \([0-9][0-9]*\),.*/\1/p' | head -1
+}
+
+# This host's NBS member up again after a boot and caught up past entry $2,
+# the last it applied before it went down -- what a VM's volume is attached
+# through, and what says the state as it is now: up to there, its own log
+# says the state as it was, every chunk at three replicas, and the leader's
+# taking its cs down and joining it back not yet heard of -- waited for up
+# to $1 seconds.
+nbs_up() {
+    local secs=$1 before=$2 t=0 now
+    while [ $t -le $secs ]; do
+        now=$(nbs_applied)
+        [ -n "$now" ] && [ "$now" -gt "$before" ] && return 0
+        sleep 5
+        t=$((t + 5))
+    done
+    return 1
+}
+
 # nos's root held to e2fsck -fn in Ubuntu, detached: its ssh may drop
 fsck_nos() {
     local st=
@@ -81,6 +144,16 @@ VMS=$(running) || exit 1
 echo "$VMS" > "$LOG/ex44-vms-before"
 echo "   running: $(echo $VMS)"
 
+HAS_NBS=0
+if [ "$KEEP" = 1 ]; then
+    step "NBS's chunks all at three replicas before this host goes down -- up to 30 minutes"
+    nbs_whole 1800 || { echo "   not in time -- nothing stopped: this host's replicas may be the only ones active"; exit 1; }
+    # Whether it has NBS: after the boot an answer without the line is
+    # its member not up yet, and waited for
+    line=$(nbs_line)
+    [ -n "$line" ] && [ "$line" != "?" ] && HAS_NBS=1
+fi
+
 if [ "$KEEP" = 1 ]; then
     step "the panel's VM stopped, kept: the next boot starts it again"
 else
@@ -88,25 +161,31 @@ else
 fi
 if on_nos "hv vms" | grep -qw panel; then
     if running | grep -qx panel; then
-        on_nos "hv stop panel secs=60" | head -3
+        on_nos "hv stop panel secs=$STOP_SECS" | head -3
     fi
-    for t in $(seq 0 5 90); do running | grep -qx panel || break; sleep 5; done
+    for t in $(seq 0 5 $((STOP_SECS + 60))); do running | grep -qx panel || break; sleep 5; done
     if running | grep -qx panel; then echo "   the panel runs still -- not going on"; exit 1; fi
     [ "$KEEP" = 1 ] || on_nos "hv delete panel force" | head -5
 fi
 
-step "every other VM stopped by its power button, up to 180 s"
-for vm in $VMS; do
-    [ "$vm" = panel ] && continue
-    on_nos "hv stop $vm secs=180" | head -3
-done
+step "every other VM stopped by its power button, up to $STOP_SECS s -- together, not one after another"
+on_nos "hv stop all secs=$STOP_SECS" | grep '^hv: '
 left=x
-for t in $(seq 0 10 200); do
+for t in $(seq 0 10 $((STOP_SECS + 60))); do
     left=$(running) || left=x
     [ -z "$left" ] && break
     sleep 10
 done
 [ -z "$left" ] || { echo "   still running: $(echo $left) -- not rebooting"; exit 1; }
+
+# The last entry its NBS member applied before it goes, the VMs' detaches
+# among them: after the boot, one past it is the leader's news
+APPLIED=0
+if [ "$HAS_NBS" = 1 ]; then
+    APPLIED=$(nbs_applied)
+    APPLIED=${APPLIED:-0}
+    echo "   NBS's member here has applied entry $APPLIED"
+fi
 
 step "nos rebooted into Ubuntu"
 on_nos reboot
@@ -193,11 +272,27 @@ for t in $(seq 0 20 1200); do
 done
 echo "$out"
 
+if [ "$HAS_NBS" = 1 ]; then
+    # A VM on a volume started before the member is up and has its peers
+    # was refused, "the volume's attach not answered in time"
+    step "this host's NBS member up again and past entry $APPLIED, before the VMs on its volumes start -- up to 5 minutes"
+    nbs_up 300 "$APPLIED" || echo "   not in 300 s -- the VMs started all the same, a refused one tried again"
+fi
+
 step "the VMs that ran before started again"
 for vm in $VMS; do
     [ "$vm" = panel ] && continue
-    on_nos "hv start $vm" | head -3
+    for try in 1 2 3; do
+        out=$(on_nos "hv start $vm" 2>&1)
+        echo "$out" | head -3
+        echo "$out" | grep -q "not started" || break
+        sleep 15
+    done
 done
 on_nos "hv list" | cut -c1-110
 on_nos "ipcnet" | head -3
+if [ "$HAS_NBS" = 1 ]; then
+    step "NBS's chunks back at three replicas, this host's copied back -- up to 30 minutes"
+    nbs_whole 1800 1 || { echo "   not in time"; exit 1; }
+fi
 step "done"

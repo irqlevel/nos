@@ -20,8 +20,10 @@
 //! `stop` asks first: it presses the guest's power button, which a kernel
 //! with ACPI hears and a distribution's init answers by shutting down -- its
 //! services stopped, its disks unmounted -- and turning the machine off, and
-//! waits for that a while before it stops the guest where it is. A guest that
-//! does not listen to the button is stopped at once. So does the module's
+//! waits for that a while before it stops the guest where it is, pressing the
+//! button again every `REPRESS_S` meanwhile: an OS may decline a press and
+//! forget it, and answer only one after. A guest that does not listen to the
+//! button is stopped at once. So does the module's
 //! going -- `rmmod`, and nos's own poweroff and reboot, which unload every
 //! module: every guest's button pressed at once, and the guests given
 //! `stop_secs=` together (`UNLOAD_STOP_DEFAULT_S` unless `insmod` said) to
@@ -36,9 +38,10 @@
 //! of a name on the list at a time. Its console goes to `console.log` in the
 //! folder (`vmlog`), with a line for what became of it at every start, boot
 //! and stop (`Shared::note`); its port on the switch is the one it asks for
-//! (`port=`), and nos's ports it asks for are relayed to it once it runs
-//! (`forward=`) -- as for a guest started by its kernel's path with those
-//! words.
+//! (`port=`) -- or, asking for none, the one it was given at its first
+//! start and kept there (`store::keep_port`) -- and nos's ports it asks for
+//! are relayed to it once it runs (`forward=`) -- as for a guest started by
+//! its kernel's path with those words.
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -106,6 +109,13 @@ pub(crate) const STOP_DEFAULT_S: u64 = 30;
 /// and longer than the 90 s systemd gives a service that will not stop
 /// before it goes on to unmount the disks anyway.
 pub(crate) const UNLOAD_STOP_DEFAULT_S: u64 = 120;
+/// How often a guest that heard its power button and runs still has it
+/// pressed again while its time lasts: an OS may decline a press and forget
+/// it -- systemd's logind refuses one while a shutdown is inhibited, as
+/// unattended-upgrades inhibits it while it installs -- so that only a press
+/// after that ends is answered. A press of a guest already on its way down
+/// is one it does not act on twice.
+const REPRESS_S: u64 = 15;
 /* The power button, as `hv stop` presses it and the first CPU's loop takes
  * it: pressed, taken by the loop, and then whether the guest's OS heard it
  * -- had the button's event enabled -- or not. */
@@ -162,18 +172,27 @@ pub struct Shared {
     /// `hv stop` has it, or `hv stop all` or the unload: the VM stays on the
     /// list -- its CPUs counted where a new VM is placed, `hv off` and an
     /// unload seeing it -- while its power button is given its time; a
-    /// second stop and a restart are refused meanwhile, and a second press
-    /// is not made.
+    /// second stop and a restart are refused meanwhile, and a second stop's
+    /// press is not made: the button is pressed again every `REPRESS_S`,
+    /// whoever waits (`press_again`).
     stopping: AtomicBool,
     /// `hv restart`: boot the guest again -- the one running, or the one
     /// parked after it stopped.
     reset: AtomicBool,
     /// Its power button: `BUTTON_UP` until `hv stop` presses it.
     button: AtomicU8,
-    /// When it was pressed: how long it then went unanswered is the time
-    /// since, whoever's press it was -- an `hv stop`'s own `secs`, or the
-    /// unload's.
+    /// When it was pressed, the first time a stop pressed it: how long it
+    /// then went unanswered is the time since, whoever's press it was -- an
+    /// `hv stop`'s own `secs`, or the unload's.
     pressed_at: AtomicU64,
+    /// When it was last pressed, again or not: the next press again is
+    /// `REPRESS_S` after it.
+    last_press: AtomicU64,
+    /// Its OS has heard a press of this stop's: a press it does not hear
+    /// after that is of a guest on its way down -- a kernel turns the event
+    /// off as it powers off -- and not one deaf to the button, to be stopped
+    /// at once.
+    heard: AtomicBool,
     /// Each of its CPUs' doorbell: what that CPU's task waits on while the
     /// CPU is halted, and what has it leave its guest when something comes
     /// for it while it runs, rather than at the host's next interrupt. The
@@ -242,6 +261,8 @@ impl Shared {
             reset: AtomicBool::new(false),
             button: AtomicU8::new(BUTTON_UP),
             pressed_at: AtomicU64::new(0),
+            last_press: AtomicU64::new(0),
+            heard: AtomicBool::new(false),
             doorbells: Arc::new(Doorbells::new(cpus as usize)?),
             running: AtomicBool::new(true),
             restarts: AtomicU32::new(0),
@@ -361,10 +382,39 @@ impl Shared {
         if !self.running() {
             return false;
         }
-        self.pressed_at.store(kcore::time::boot_time_ns(), Ordering::Relaxed);
+        let now = kcore::time::boot_time_ns();
+        self.pressed_at.store(now, Ordering::Relaxed);
+        self.last_press.store(now, Ordering::Relaxed);
+        /* Each stop's first press says afresh whether the guest hears: a
+         * stop left before, and the guest booted again since, says nothing
+         * of it now. */
+        self.heard.store(false, Ordering::Relaxed);
         self.button.store(BUTTON_PRESSED, Ordering::Release);
         self.wake_up();
         true
+    }
+
+    /// Press its button again, `REPRESS_S` after the last press, when its OS
+    /// heard that one and it runs still -- asked by whoever waits for it at
+    /// every look. Two waiters, an `hv stop` and an unload's, press once
+    /// between them: the one that moves `last_press` on presses.
+    fn press_again(&self) {
+        let now = kcore::time::boot_time_ns();
+        let last = self.last_press.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < REPRESS_S * NS_PER_SEC
+            || self.button.load(Ordering::Acquire) != BUTTON_HEARD
+            || !self.running()
+        {
+            return;
+        }
+        if self.last_press.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        /* From heard alone: a press the loop has not yet taken, or one it
+         * found unheard, is not made again. */
+        if self.button.compare_exchange(BUTTON_HEARD, BUTTON_PRESSED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            self.wake_up();
+        }
     }
 
     /// Whether it is still to be waited for after a press: running, and
@@ -673,6 +723,12 @@ impl Host for VmHost {
     }
 
     fn power_button_heard(&self, heard: bool) {
+        /* A press again that finds the event off is of a guest that heard
+         * one before and is on its way down: waited for still. */
+        let heard = heard || self.shared.heard.load(Ordering::Relaxed);
+        if heard {
+            self.shared.heard.store(true, Ordering::Relaxed);
+        }
         self.shared.button.store(if heard { BUTTON_HEARD } else { BUTTON_UNHEARD }, Ordering::Release);
     }
 }
@@ -1152,7 +1208,9 @@ fn stop_secs(rest: &str) -> Result<u64, String> {
 }
 
 /// Wait until none of the guests `waiting` finds is still shutting down
-/// after its power button was pressed, or `secs` have gone by.
+/// after its power button was pressed, or `secs` have gone by: `waiting`
+/// asked at every look, and pressing the button again of each it finds
+/// (`Shared::press_again`).
 fn wait_shut_down(secs: u64, mut waiting: impl FnMut() -> bool) {
     let deadline = kcore::time::boot_time_ns().saturating_add(secs.saturating_mul(NS_PER_SEC));
     while waiting() && kcore::time::boot_time_ns() < deadline {
@@ -1580,6 +1638,22 @@ impl Vms {
             .map(Arc::new)
             .ok_or_else(|| alloc::format!("vm {} not started -- out of memory for its console", id))?;
         let not_started = |why: &dyn core::fmt::Display| alloc::format!("vm {} not started -- {}", id, why);
+
+        /* A VM from a folder whose vm.toml names no port is given one now,
+         * kept there as its UUID is: its MAC and its address the same at
+         * every start after, whatever order the VMs start in -- a guest's
+         * own network configuration names them (`store::keep_port`). */
+        if spec.net && spec.port.is_none() {
+            if let Some((folder, _)) = &stored {
+                match store::keep_port(self, folder) {
+                    Ok(p) => spec.port = Some(p as usize),
+                    Err(e) => {
+                        let _ = writeln!(out, "hv: its port of the switch is not kept -- {}: a free one now, maybe \
+                                               another at its next start", e);
+                    }
+                }
+            }
+        }
 
         /* With `net`, a port on the switch -- made by the first such guest --
          * and the address that goes with it on the guest's command line;
@@ -2303,7 +2377,13 @@ impl Vms {
             /* An unload meanwhile gives it its own time, and whichever of
              * the two runs out first takes it off the list: this wait ends
              * there too, the guest no longer running. */
-            wait_shut_down(secs, || shared.shutting_down() && !give_up() && !left());
+            wait_shut_down(secs, || {
+                let waiting = shared.shutting_down() && !give_up() && !left();
+                if waiting {
+                    shared.press_again();
+                }
+                waiting
+            });
             if left() && !give_up() && shared.running() {
                 shared.stopping.store(false, Ordering::Release);
                 return Err(crate::work::stopped_leaving(&alloc::format!("vm {} is left running, its power button \
@@ -2332,10 +2412,11 @@ impl Vms {
     /// Stop every VM and take it off the list, saying how each ended -- to
     /// `out`, or, with no one to say it to, to the kernel log: every power
     /// button pressed at once and the guests given `secs` together to turn
-    /// themselves off, as `stop` gives one. A VM an `hv stop` of its own is
-    /// giving its time already is not pressed again, only waited for. Each
-    /// one's forwards go with it, when there are `forwards` still to take
-    /// them from.
+    /// themselves off, as `stop` gives one, each pressed again meanwhile as
+    /// it gives one. A VM an `hv stop` of its own is giving its time already
+    /// is not pressed now, only waited for -- and pressed again as every
+    /// other is, once between the two waiters. Each one's forwards go with
+    /// it, when there are `forwards` still to take them from.
     pub fn stop_all(&self, mut out: Option<&mut dyn Write>, secs: u64, forwards: Option<&Forwards>) {
         let mut pressed = 0usize;
         for vm in &self.table.lock().vms {
@@ -2349,7 +2430,14 @@ impl Vms {
             if pressed != 0 && out.is_none() {
                 kcore::klog!(0, "hv: unloading -- {} vm(s) asked to turn themselves off, given {} s", pressed, secs);
             }
-            wait_shut_down(secs, || self.table.lock().vms.iter().any(|vm| vm.shared.shutting_down()));
+            wait_shut_down(secs, || {
+                let mut waiting = false;
+                for vm in self.table.lock().vms.iter().filter(|vm| vm.shared.shutting_down()) {
+                    vm.shared.press_again();
+                    waiting = true;
+                }
+                waiting
+            });
         }
         /* Then every stop flag, so that those left stop together rather than
          * one join at a time -- and what became of each press noted first: a
