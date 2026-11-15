@@ -4,7 +4,7 @@
 //!     port = 39234
 //!     listen = ["hv0", "eth0"]
 //!     allow_eth0 = ["203.0.113.0/24", "198.51.100.7"]
-//!     max_connections = 8
+//!     max_connections = 12
 //!
 //! `listen` names the interfaces -- hv0, the guests' switch, alone unless
 //! told -- and `allow_<interface>` the networks a connection on it may come
@@ -28,9 +28,14 @@ pub const DEFAULT_LISTEN: &str = "hv0";
 
 /// Connections at once, in all; of one client's key; and in their
 /// handshake. Each is a task and two of the kernel's 64 TCP slots, and a
-/// handshake costs a signature and two checks of one.
-pub const DEFAULT_MAX_CONNECTIONS: u64 = 8;
-pub const DEFAULT_MAX_PER_KEY: u64 = 4;
+/// handshake costs a signature and two checks of one. A key's eight are
+/// the panel's: its stream, two for its requests, a stream a VM's console
+/// open -- one however many of its tabs show it -- and one for a stream
+/// being made again; at four, a second console was reset past them, the
+/// panel's terminal saying `read ECONNRESET` (2026-11-15). Twelve in all
+/// leave four for another client beside the panel at its most, 24 slots.
+pub const DEFAULT_MAX_CONNECTIONS: u64 = 12;
+pub const DEFAULT_MAX_PER_KEY: u64 = 8;
 pub const DEFAULT_MAX_HANDSHAKES: u64 = 2;
 /// What the file may raise them to.
 pub const LIMIT_MAX: u64 = 32;
