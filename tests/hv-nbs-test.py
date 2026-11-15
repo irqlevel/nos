@@ -88,11 +88,12 @@ VOLUME_MIB = 64
 WRITE_MIB = 8
 # The write a host is killed under: 16 MiB, after the first
 LONG_MIB = 16
-# The writes of 4 KiB, each flushed, made one after another at QD1, and the
-# average a request of theirs may wait: a request left for the disk task's
-# idle second, every other one, is 500 ms
+# The writes of 4 KiB, each flushed, made one after another at QD1, and how
+# long they may take in all: a request left for the disk task's idle second,
+# every other one, is a second a pair -- 100 s; under KVM they take one,
+# under TCG some tens
 QD1_WRITES = 100
-QD1_WAIT_NS = 100_000_000
+QD1_SECS = 60
 # N10d3: the disk hvboot boots, made an image; a's clone of it grown to
 # CLONE_MIB, and written at COPY_AT MiB -- inside the image, so over a
 # chunk the image shares -- with the image's first MiB
@@ -465,21 +466,18 @@ def main():
         # on the demo stand, 2026-11-15: every other request waited 1 s, the
         # write and the flush of each file dpkg unpacks among them. A write
         # of 4 KiB and its flush a hundred times, in the volume's last MiB,
-        # which nothing else here writes: their average wait under 100 ms,
-        # where a second each other one is 500.
-        before = json_of(a.run('mgmt call vm disk_io {"name":"%d"}' % va))
-        out = a.run(x(va, "i=0; while [ $i -lt %d ]; do dd if=/dev/zero of=/dev/vda bs=4k count=1 seek=$((%d+i)) "
-                          "conv=fsync 2>/dev/null || break; i=$((i+1)); done; echo nos-qd1=$i"
+        # which nothing else here writes, timed by the guest's own clock: a
+        # second each pair is 100 s. (The vm provider's `disk_io` would say
+        # their wait, but takes a VM by its name, and this one has none.)
+        out = a.run(x(va, "s=$(cut -d' ' -f1 /proc/uptime); i=0; while [ $i -lt %d ]; do dd if=/dev/zero "
+                          "of=/dev/vda bs=4k count=1 seek=$((%d+i)) conv=fsync 2>/dev/null || break; i=$((i+1)); done; "
+                          "echo nos-qd1=$i $s $(cut -d' ' -f1 /proc/uptime)"
                       % (QD1_WRITES, (VOLUME_MIB - 1) * 256), 300))
-        after = json_of(a.run('mgmt call vm disk_io {"name":"%d"}' % va))
-        d0 = ((before or {}).get("disks") or [{}])[0]
-        d1 = ((after or {}).get("disks") or [{}])[0]
-        asked = (d1.get("writes", 0) - d0.get("writes", 0)) + (d1.get("flushes", 0) - d0.get("flushes", 0))
-        waited = d1.get("wait_ns", 0) - d0.get("wait_ns", 0)
-        check("%d writes of 4 KiB, each flushed, one after another: none left for the disk task's idle second "
-              "(%d requests, %.1f ms each on average)" % (QD1_WRITES, asked, waited / max(asked, 1) / 1e6),
-              ("nos-qd1=%d" % QD1_WRITES) in out and asked >= 2 * QD1_WRITES and waited < asked * QD1_WAIT_NS,
-              (before, after, out))
+        m = re.search(r"nos-qd1=(\d+) ([\d.]+) ([\d.]+)", out)
+        took = float(m.group(3)) - float(m.group(2)) if m else None
+        check("%d writes of 4 KiB, each flushed, one after another, in %s s: none left for the disk task's idle "
+              "second" % (QD1_WRITES, "?" if took is None else "%.1f" % took),
+              m is not None and int(m.group(1)) == QD1_WRITES and took < QD1_SECS, out)
         a.run("hv stop %d" % va)
         check("stopped, the volume let go of",
               ipct.wait_for(lambda: "detached" in a.run("nbs volume gdisk"), 60, 1), a.run("nbs volume gdisk"))
