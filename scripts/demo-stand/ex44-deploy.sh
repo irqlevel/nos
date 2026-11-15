@@ -4,7 +4,11 @@
 #
 # - the panel's VM stopped and deleted, so that /etc/rc's `api panel create`
 #   at the next boot makes it anew of the image's bundle; every other VM
-#   running stopped by its power button, its name kept to start it again;
+#   running stopped by its power button, its name kept to start it again --
+#   each given DEMO_STOP_SECS (600, hv's most) to turn itself off: a guest
+#   installing updates declines the button until they are in (Ubuntu's
+#   logind, inhibited by unattended-upgrades), hv pressing it again every
+#   15 s, and one cut off midway is left with its packages half installed;
 # - nos rebooted into Ubuntu; nos's root held to e2fsck -fn, then made ready
 #   for the demo: /etc/rc loading ipcnet, the registry and NBS before the
 #   API (once), a fresh hosts.toml -- this host alone, in a cluster of its
@@ -37,6 +41,7 @@ CFG=${DEMO_SSH_CONFIG:?an ssh config with hosts ex44-nos and ex44-ubuntu: ssh_co
 ROOT_UUID=${EX44_ROOT_UUID:-83e77975-48f2-4356-819b-7b01d482c5de}
 NAME=${EX44_NAME:-ex44}
 KEEP=${DEMO_KEEP:-0}
+STOP_SECS=${DEMO_STOP_SECS:-600}
 LOCAL=${1:?the system image: build.sh makes nos-x86_64.squashfs}
 LOG=$ROOT/out/demo
 mkdir -p "$LOG"
@@ -119,20 +124,17 @@ else
 fi
 if on_nos "hv vms" | grep -qw panel; then
     if running | grep -qx panel; then
-        on_nos "hv stop panel secs=60" | head -3
+        on_nos "hv stop panel secs=$STOP_SECS" | head -3
     fi
-    for t in $(seq 0 5 90); do running | grep -qx panel || break; sleep 5; done
+    for t in $(seq 0 5 $((STOP_SECS + 60))); do running | grep -qx panel || break; sleep 5; done
     if running | grep -qx panel; then echo "   the panel runs still -- not going on"; exit 1; fi
     [ "$KEEP" = 1 ] || on_nos "hv delete panel force" | head -5
 fi
 
-step "every other VM stopped by its power button, up to 180 s"
-for vm in $VMS; do
-    [ "$vm" = panel ] && continue
-    on_nos "hv stop $vm secs=180" | head -3
-done
+step "every other VM stopped by its power button, up to $STOP_SECS s -- together, not one after another"
+on_nos "hv stop all secs=$STOP_SECS" | grep '^hv: '
 left=x
-for t in $(seq 0 10 200); do
+for t in $(seq 0 10 $((STOP_SECS + 60))); do
     left=$(running) || left=x
     [ -z "$left" ] && break
     sleep 10
