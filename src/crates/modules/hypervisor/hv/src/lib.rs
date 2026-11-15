@@ -165,7 +165,8 @@ hv wait <vm> [secs=N] [boot=N] <text>
                                    or it stops
 hv restart <vm>                    boot it again from its files, running or stopped
 hv stop <vm|all> [secs=N]          press its power button and give it secs (30) to turn
-                                   itself off, then stop it; say how it ended, take it off
+                                   itself off, pressed again every 15 s while it runs,
+                                   then stop it; say how it ended, take it off
                                    the list -- secs=0 stops it without asking. rmmod hv,
                                    and nos's poweroff and reboot, stop all of them so,
                                    given what insmod hv.ko was as stop_secs=N (120)

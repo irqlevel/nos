@@ -36,8 +36,10 @@ that it takes the machine's ACPI tables: the boot finds the RSDP, the PM
 timer, the PCI host bridge and the power button, and says nothing of a
 firmware bug; its reboots go through the FADT's reset register; its SCI is
 the 8259's IRQ 9; and `hv stop` presses its power button, which busybox's
-acpid answers with a poweroff -- S5 -- while `rmmod` waits out a guest that
-hears the button and does nothing. With --disk too, the guest's disk is
+acpid declines the first time -- as systemd's logind declines one while a
+shutdown is inhibited -- and answers with a poweroff -- S5 -- when `hv stop`
+presses it again, while `rmmod` waits out a guest that hears the button
+and does nothing. With --disk too, the guest's disk is
 left mounted and nos itself powered off: the unload presses the guest's
 button, acpid unmounts the disk and turns the guest off, and the guest's
 ext4 must come back out of nos's root clean, holding what it wrote last.
@@ -369,8 +371,9 @@ def vm_commands(args):
                  r"(?m)^\s*4:%s\s+IO-APIC\s+4-edge\s+ttyS0" % taken, True),
             ]
     # With ACPI, a guest whose power button busybox's acpid answers with a
-    # poweroff: its SCI and PM timer looked at, then stopped by hv stop,
-    # which presses the button and has it turn itself off.
+    # poweroff -- the second time it is pressed: its SCI and PM timer looked
+    # at, then stopped by hv stop, which presses the button, and again
+    # REPRESS_S (15 s) later, and has it turn itself off.
     acpi_lines = []
     acpi_checks = []
     if args.acpi:
@@ -385,12 +388,17 @@ def vm_commands(args):
         # the disk phase knows too: without it, /dev/input is not there and
         # the button goes unanswered.
         inputs = "hv exec 4 ls /dev/input"
+        # The first press declined and forgotten but for a mark, as logind
+        # refuses one while a shutdown is inhibited: only the press again
+        # turns it off. Given more than the one interval it needs.
+        stop4 = "hv stop 4 secs=60"
         acpi_lines = [start4, "hv exec 4 secs=%d mkdir -p /etc/acpi/PWRF" % args.vm_secs,
                       "hv exec 4 mount -t devtmpfs devtmpfs /dev", inputs,
                       "hv exec 4 echo '#!/bin/sh' > %s" % handler,
-                      "hv exec 4 echo 'poweroff -f' >> %s" % handler,
+                      "hv exec 4 echo 'test -e /pressed && poweroff -f' >> %s" % handler,
+                      "hv exec 4 echo 'touch /pressed' >> %s" % handler,
                       "hv exec 4 chmod +x %s" % handler,
-                      "hv exec 4 acpid -l /acpid.log -p /acpid.pid", irq9, clocks, "hv stop 4"]
+                      "hv exec 4 acpid -l /acpid.log -p /acpid.pid", irq9, clocks, stop4]
         # And one that hears the button and has nothing to answer it: at its
         # shell, so its kernel has the event enabled; stopped when its time
         # is up, and saying so.
@@ -403,10 +411,10 @@ def vm_commands(args):
              else "its SCI comes through the 8259, as IRQ 9",
              r"(?m)^\s*9:(\s+\d+)+\s+%s\s+acpi" % (r"IO-APIC\s+9-fasteoi" if args.ioapic else "XT-PIC"), True),
             (clocks, 0, "the PM timer is one of its clocksources", r"acpi_pm", True),
-            ("hv stop 4", 0, "hv stop presses its power button, and acpid has it turn itself off",
+            (stop4, 0, "hv stop presses its power button again, and acpid has it turn itself off",
              r"hv: vm 4 stopped -- the guest powered itself off, S5 by its ACPI PM1 control register", True),
-            ("hv stop 4", 0, "the report: ACPI taken, the SCI raised, the power button pressed once",
-             r"acpi\s+taken by the guest's OS; [1-9]\d* SCIs, the power button pressed 1 times", True),
+            (stop4, 0, "the report: ACPI taken, the SCI raised, the power button pressed twice -- declined, "
+             "then answered", r"acpi\s+taken by the guest's OS; [1-9]\d* SCIs, the power button pressed 2 times", True),
             ("hv stop 5 secs=5", 0, "a guest that hears its power button and does nothing is stopped when its time is up",
              r"hv: vm 5 stopped -- on request -- its power button went unanswered for 5 s", True),
         ]
