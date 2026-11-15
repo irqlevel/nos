@@ -236,6 +236,39 @@ pub fn keep_uuid(vms: &Vms, folder: &Folder, uuid: [u8; 16]) -> Result<[u8; 16],
     Ok(uuid)
 }
 
+/// The port of the switch of the VM in `folder`, from its vm.toml -- or,
+/// one whose vm.toml names none, the lowest no other VM's vm.toml names
+/// and no VM holds (`port_for`), written into it key by key as every change
+/// is, for every start after to be given the same: the one the file has.
+/// A guest's MAC and address are its port's, and its own network
+/// configuration names them -- cloud-init's netplan matches the NIC by its
+/// MAC -- where a port taken afresh at each start went by the order the VMs
+/// started in: two started the other way round after a deploy swapped
+/// theirs, and the Ubuntu one's DNS was gone (2026-11-15). Ports other VMs'
+/// vm.toml name are passed over, so that one does not take another's.
+pub fn keep_port(vms: &Vms, folder: &Folder) -> Result<u32, String> {
+    let _one = changing(vms, folder)?;
+    let (text, was) = load_text(folder)?;
+    if let Some(had) = was.options.port {
+        return Ok(had);
+    }
+    let root = root_of(folder).ok_or_else(|| alloc::format!("{}: not a folder of the VMs' own", folder.path))?;
+    let port = port_for(root, vms, None)?;
+    let mut c = was.clone();
+    c.options.port = Some(port);
+    let file = join(&folder.path, CONFIG).ok_or_else(|| String::from("out of memory"))?;
+    let new = config::rewrite(&text, &c).map_err(|e| alloc::format!("{}: {}", file, e))?;
+    write_config(folder, text.as_bytes(), &new)?;
+    Ok(port)
+}
+
+/// The VMs' folder `folder` is in: its path but its name, as `folder_of`
+/// joined them.
+fn root_of(folder: &Folder) -> Option<&str> {
+    let root = folder.path.strip_suffix(folder.name.as_str())?.strip_suffix('/')?;
+    Some(if root.is_empty() { "/" } else { root })
+}
+
 /// The folder's configuration, read and parsed; what is wrong with it
 /// otherwise, said with its path.
 pub fn load(folder: &Folder) -> Result<Config, String> {
