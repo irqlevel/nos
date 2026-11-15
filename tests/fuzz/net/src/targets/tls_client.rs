@@ -471,6 +471,11 @@ fn hold_always(p: &Plan, o: &Outcome, server: &Fingerprint, offered: &[Suite]) {
     if let Outcome::Session { key, got, ended, suite, .. } = o {
         invariant!(suite.is_some_and(|s| offered.is_empty() || offered.contains(&s)),
                    "a session in {:?} where the client offered {:?}", suite, offered);
+        /* The world's server follows its client's order: the client's
+         * first, ChaCha20-Poly1305 of the kernel's own order where it was
+         * given none (tls::provider) */
+        let first = offered.first().copied().unwrap_or(Suite::ChaCha20Poly1305);
+        invariant!(*suite == Some(first), "a session in {:?} where the client's first is {:?}", suite, first);
         invariant!(key == server, "a session with a key the client was not given: {:?}", p);
         invariant!(p.show == Show::Own, "a session with a server showing {:?}: {:?}", p.show, p.brk);
         let said = p.said();

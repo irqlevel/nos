@@ -86,12 +86,25 @@ pub struct Session {
     pub plain: Vec<u8>,
     /// The session is over: the client broke it, or it broke the client.
     pub failed: bool,
+    /// Whether its client is the kernel's HTTP client, whose first suite
+    /// is ChaCha20-Poly1305's -- and whether the suite agreed on was held
+    /// to that yet.
+    of_http_client: bool,
+    suite_held: bool,
 }
 
 impl Session {
     pub fn new(config: Arc<ServerConfig>) -> Session {
         Session { conn: UnbufferedServerConnection::new(config).expect("a server connection"), incoming: Vec::new(),
-                  fed: 0, plain: Vec::new(), failed: false }
+                  fed: 0, plain: Vec::new(), failed: false, of_http_client: false, suite_held: false }
+    }
+
+    /// A session with the kernel's HTTP client (`tls::TlsStream`): what it
+    /// agrees on held to the client's first suite, ChaCha20-Poly1305's.
+    /// Another client of this server -- a module's pinned one, offering
+    /// what its input says -- is held to its own order by its target.
+    pub fn of_http_client(config: Arc<ServerConfig>) -> Session {
+        Session { of_http_client: true, ..Session::new(config) }
     }
 
     /// What the connection received past what was handed in, into the
@@ -107,7 +120,7 @@ impl Session {
             if self.failed {
                 break;
             }
-            let Session { conn, incoming, plain, failed, .. } = self;
+            let Session { conn, incoming, plain, failed, of_http_client, suite_held, .. } = self;
             let UnbufferedStatus { mut discard, state } = conn.process_tls_records(incoming);
             let mut stop = false;
             match state {
@@ -162,6 +175,17 @@ impl Session {
             }
             if discard != 0 {
                 incoming.drain(..discard);
+            }
+            /* This server follows its client's order, as most do: the
+             * kernel's puts ChaCha20-Poly1305 first while its AES is
+             * software (tls::provider), in TLS 1.3 and 1.2 alike */
+            if *of_http_client && !*suite_held && !conn.is_handshaking() {
+                *suite_held = true;
+                let suite = conn.negotiated_cipher_suite().map(|s| s.suite());
+                if !suite.is_some_and(tls::is_chacha20_poly1305) {
+                    panic!("invariant: the kernel's client and a server that follows its order agreed on {:?}, not \
+                            ChaCha20-Poly1305 -- its first while its AES is software", suite);
+                }
             }
             if stop {
                 break;
