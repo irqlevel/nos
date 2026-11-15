@@ -3734,7 +3734,7 @@ little and now and then past a silence.
     longer.
 
 `--mutants` runs `tests/fuzz/nbs/mutants.py`, which takes out one rule at a time.
-Each of its two hundred and seventy-four must fail the gate -- but the three
+Each of its two hundred and seventy-five must fail the gate -- but the three
 `KNOWN_GAPS` names, said as known gaps (below) -- run as
 `nbs-fuzz gate --first`, stopped at the first target that fails: the gate's
 verdict, sooner.

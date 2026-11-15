@@ -2892,6 +2892,17 @@ impl Session {
         if !self.closing.is_empty() || (self.writable && !self.open.is_empty()) {
             return;
         }
+        /* Every request to a cs answered first. A fence sent again behind a
+           close a joiner of the set refused as NotFenced was answered after
+           that close, and after the detach the close's answer let go: the
+           fence's check at the mds found the volume let go, NotAttached, and
+           the session failed a moment before it would have detached --
+           taken for attached elsewhere (found by tests/fuzz/nbs's cluster
+           target, seed 104245). A cs that never answers is asked out, and its
+           requests dropped with it; each tick looks again */
+        if !self.subs.is_empty() {
+            return;
+        }
         self.detach(now, out);
     }
 

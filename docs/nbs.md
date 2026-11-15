@@ -1491,10 +1491,10 @@ only its metadata.
   its generation, not attaching anew, and writes the block once its memory
   is back (the `starved_past_deadline` end, a quarter of the seeds).
 
-  `--mutants` takes two hundred and seventy-four rules out one at a time --
+  `--mutants` takes two hundred and seventy-five rules out one at a time --
   eighty-five of the metadata's, six of them the controller's; sixty of the
   cs's engine; sixty-two of the wire's, its `serve`'s, the mds's, the
-  copy's and the scrub's; sixty-seven of the client's -- each caught but
+  copy's and the scrub's; sixty-eight of the client's -- each caught but
   three: some only at the cluster seeds the gate runs past its range
   (`GATE_CLUSTER_ALSO`), their races moved past the range's by a change of
   the target's course. The three are known gaps (`tests/fuzz/nbs/mutants.py`'s
