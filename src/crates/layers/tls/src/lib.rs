@@ -16,10 +16,11 @@ use core::time::Duration;
 
 use kcore::klog;
 use rustls::client::UnbufferedClientConnection;
+use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{ServerName, UnixTime};
 use rustls::time_provider::TimeProvider;
 use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
-use rustls::{ClientConfig, RootCertStore};
+use rustls::{CipherSuite, ClientConfig, RootCertStore};
 
 /* Every RustCrypto crate that needs randomness goes through getrandom, which
    has no backend for a freestanding target. Point it at the kernel's pool:
@@ -33,6 +34,29 @@ fn kernel_getrandom(buf: &mut [u8]) -> Result<(), getrandom::Error> {
 }
 
 getrandom::register_custom_getrandom!(kernel_getrandom);
+
+/// The kernel's crypto provider, rustls-rustcrypto's, with its cipher suites
+/// in the order this kernel wants them: ChaCha20-Poly1305's first -- TLS
+/// 1.3's and both of 1.2's -- the rest as the provider has them. The kernel
+/// has no SSE, so AES and GHASH run on their portable backends, where
+/// ChaCha20-Poly1305 is more than twice as fast as AES-GCM (`tlsbench`, the
+/// AX41's Zen 2: 203 MB/s against 92; an M-series core: 440 against
+/// 160-195) -- what a peer that follows its client's order agrees on with
+/// this kernel's client, and what this kernel's server holds its clients to
+/// (`pinned`). Every configuration the crate makes starts from it.
+pub fn provider() -> CryptoProvider {
+    let mut provider = rustls_rustcrypto::provider();
+    /* A stable sort: the order within each kind is the provider's */
+    provider.cipher_suites.sort_by_key(|s| !is_chacha20_poly1305(s.suite()));
+    provider
+}
+
+/// Whether `suite` is one of ChaCha20-Poly1305's.
+pub fn is_chacha20_poly1305(suite: CipherSuite) -> bool {
+    matches!(suite, CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+        | CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+        | CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256)
+}
 
 /* Enough for a TLS record (16 KB payload plus header and tag) so a record
    never straddles two reads more than once. */
@@ -126,7 +150,7 @@ impl<T: Transport> TlsStream<T> {
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let provider = Arc::new(rustls_rustcrypto::provider());
+        let provider = Arc::new(provider());
         let builder = match ClientConfig::builder_with_details(provider, Arc::new(KernelTime))
             .with_safe_default_protocol_versions()
         {
