@@ -3524,8 +3524,11 @@ memory past its deadline, reaching no replica, has none (the
 `starved_past_deadline` end); never more of a session's
 places closing at once than its window -- two, as the fuzzer builds
 nbsclient (`small_windows`) -- nor more bytes of its reads and writes out,
-more than one out, than its window of them -- two blocks there
-(`WINDOW_BYTES`): past it is what ipcnet's queue bounces -- and a close asked alone of a few places done
+more than one out, than its window of them -- eight blocks there, two
+on a quarter of the seeds, where an operation larger than it goes alone,
+and none on the gate's seeds kept for a race found before the window,
+which run as they ran then (`RACES_BEFORE_WINDOW`): past it is what
+ipcnet's queue bounces -- and a close asked alone of a few places done
 in a moment, every place closed on every active replica (the
 `close_all_written` end); the leader's look at a cs before it is taken out
 the fuzzer's, mostly that it answers -- always once a host is lost for good
