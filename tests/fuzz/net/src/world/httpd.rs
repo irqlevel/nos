@@ -125,7 +125,7 @@ impl Httpd {
             if ep.data.is_some() && !self.exchanges.iter().any(|x| x.ep == e) {
                 let answer = self.exchanges.len();
                 let tls = self.tls.as_ref().filter(|t| t.ports.contains(&ep.port))
-                    .map(|t| Session::new(t.config.clone()));
+                    .map(|t| Session::of_http_client(t.config.clone()));
                 self.exchanges.push(Exchange { ep: e, answer, request: None, sent: 0, piece: 0, next_at: 0,
                                                ended: false, tls, sent_tls: 0 });
             }
