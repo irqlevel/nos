@@ -130,6 +130,8 @@ pub mod switch;
 /// ipc, datagrams sealed and opened, the table's ports elsewhere.
 #[path = "../../../../src/crates/modules/hypervisor/hv/src/tunnel.rs"]
 pub mod tunnel;
+/// What the tunnel seals and opens by here, in the place of hv.ko's.
+mod aead;
 /// A VM's vm.toml, from the module: what an operator writes, read and
 /// written back.
 #[path = "../../../../src/crates/modules/hypervisor/hv/src/config.rs"]

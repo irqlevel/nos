@@ -37,7 +37,8 @@ or the switch's use of it -- out at a time, and the targets that hold it must
 find each: a rule no target notices the loss of is one the gate does not hold.
 
 Needs cargo on the host; it builds offline, its one crate from outside the
-tree -- vnetwire's cipher -- the vendored copy the kernel builds.
+tree -- RustCrypto's ChaCha20-Poly1305, the tunnel's AEAD here in the place
+of hv.ko's (tests/fuzz/hv/src/aead.rs) -- the vendored copy.
 Exit code 0 = no finding; 1 = a finding; 3 = a hang.
 """
 
@@ -50,9 +51,9 @@ ROOT = os.path.dirname(HERE)
 OUT = os.path.join(ROOT, 'out', 'hv-fuzz')
 VENDOR = os.path.join(ROOT, 'src', 'crates', 'vendor')
 
-# The RustCrypto crates on the software backends the kernel builds them with
-# (src/crates/.cargo/config.toml): the tunnel's seal fuzzed is the one hv.ko
-# runs.
+# The RustCrypto crates on the software backends the kernel would build them
+# with (src/crates/.cargo/config.toml). hv.ko seals with the crypto crate's
+# assembly, which net-fuzz's aead target holds to this same code.
 RUSTFLAGS = ['--cfg', 'chacha20_force_soft', '--cfg', 'poly1305_force_soft']
 
 # The gate: enough inputs that every target's deep states are reached --
@@ -75,7 +76,7 @@ def main():
 
 def gate(args):
     # The kernel's vendored crates, as the kernel's own build takes them --
-    # vnetwire's cipher -- said here, as the fuzzer's manifest is outside
+    # the tunnel's cipher here -- said here, as the fuzzer's manifest is outside
     # src/crates, and cargo run from the root.
     build = subprocess.run(['cargo', 'build', '--release', '--offline', '--quiet',
                             '--manifest-path', os.path.join(HERE, 'fuzz', 'hv', 'Cargo.toml'),

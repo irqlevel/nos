@@ -223,7 +223,14 @@ CRYPTOGAMS' assembly: the ChaCha20 and Poly1305 Andy Polyakov wrote for
 OpenSSL, from his own distribution of them (`src/crates/base/crypto`).
 `tls::provider` keeps everything else of rustls-rustcrypto's suites -- the
 hash, HKDF and PRF, the key exchange, the signatures -- and AES-GCM stays
-on RustCrypto's portable code.
+on RustCrypto's portable code. vnet's tunnel between hosts seals and opens
+its datagrams with the same AEAD, which hv.ko hands vnetwire
+(`modules/hypervisor/hv/src/aead.rs`); and sshd's
+`chacha20-poly1305@openssh.com` -- not RFC 8439's AEAD but its two halves
+put together otherwise, the original ChaCha20's 64-bit nonce and the length
+under a key of its own -- takes them on their own, ChaCha20 from any
+counter block (`crypto::chacha20`) and Poly1305 (`crypto::poly1305`), as
+the sshd module hands them the ssh crate (its `Primitives`).
 
 **Where it comes from, and under what license.**
 `src/crates/base/crypto/cryptogams/` holds the perlasm as it came -- the
@@ -278,10 +285,15 @@ on every path the CPU has, each path against the integer code over the
 lengths where the assembly changes how it works -- a block, the 128, 192,
 256 and 512 bytes its wider paths start at, a 16 KiB piece -- at three
 alignments, in place, and a forged tag refused with the message left as it
-was; and `test_simd_section`. `tests/net-fuzz.py`: its `aead` target holds
-the crypto crate to RustCrypto's portable code on every path the host has,
-and its TLS targets the kernel's suites to RustCrypto's at the world's end
-of the connection. `tests/hv-test.py`'s `avx` guest: a section of the
+was; the halves on their own the same way, ChaCha20 from any counter block
+up to the last before its 32-bit count would wrap, Poly1305 to RFC 8439
+2.5.2's answer; and `test_simd_section`. `tests/net-fuzz.py`: its `aead`
+target holds the crypto crate -- the AEAD and the halves -- to RustCrypto's
+portable code on every path the host has, its TLS targets the kernel's
+suites to RustCrypto's at the world's end of the connection, and its `ssh`
+target sshd's cipher to the world's client's; `tests/hv-fuzz.py`'s
+`vnetwire` target the tunnel's datagram to the wire built without
+vnetwire. `tests/hv-test.py`'s `avx` guest: a section of the
 host's before each of its CPUs' entries, and its registers its own at
 every one of its turns. And every link (`scripts/check-simd.py`).
 
@@ -331,7 +343,13 @@ every one of its turns. And every link (`scripts/check-simd.py`).
 
   The session two and a half times as fast, the cipher alone 3.7 times:
   what is left is the session's own work -- its records copied in and out,
-  the two ends' tasks -- which the last line of `tlsbench` shows. AES-GCM's,
+  the two ends' tasks -- which the last line of `tlsbench` shows. In
+  1400-byte datagrams, as vnet's tunnel seals a guest's full-size packet
+  (`tlsbench`'s last line, the same machine, two boots): CRYPTOGAMS' NEON
+  seals 1214 and 1214 MB/s and opens 1164 and 1198, RustCrypto's portable
+  code seals 517 and 517 -- 1.2 µs a datagram rather than 2.7. What a
+  message costs besides its bytes -- a section, the block its one-time key
+  is, Poly1305's start and end -- is the gap to the 16 KB records' 2040. AES-GCM's,
   on code that did not change, came out a tenth lower client->server and the
   same server->client in both rounds. x86-64's under KVM on the servers is
   still to be measured.
