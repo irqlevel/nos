@@ -190,6 +190,15 @@ by itself; HTTP is redirected to HTTPS and `www` to the bare domain. Watch it wi
 `docker compose logs -f caddy`. Keep the `caddy_data` volume -- it holds the
 certificates and the ACME account.
 
+The demo videos (`public/video/`, with their posters and cards) are served by
+Caddy itself, not passed byte by byte through Node: at every `up`, the
+one-shot `media` service runs the web image's `scripts/media-sync.sh`, which
+copies them into the `media` volume Caddy reads, and `web` starts only once
+it is done. Caddy answers Range requests from there; a file the volume lacks
+goes to Next, which has them all too. The demo page names each file by its
+content (`?v=`, the start of its SHA-256, read at build), and Caddy has
+browsers keep such a URL for a year, so a new cut of a video is a new URL.
+
 Then check the live site end to end -- every page of the sitemap, its language,
 canonical and hreflang links, the redirects, robots.txt, the feeds, the 404s;
 the exit status is the verdict:
