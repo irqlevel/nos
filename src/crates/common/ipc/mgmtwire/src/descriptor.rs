@@ -11,8 +11,10 @@
 //! each once and of its kind; every text a person reads is there in each of
 //! `LANGUAGES`; every field has a type a client knows, and an enum its
 //! values -- and, where it says how a thing is, each value's tone, which a
-//! client colours it by; a resource is listed by a read and acted on by
-//! what is not one,
+//! client colours it by; a method's parameter whose values a read gives
+//! (`choices`) names a provider, a method and the answer's list and key --
+//! the provider's own a read it has; a resource is listed by a read and
+//! acted on by what is not one,
 //! its columns among its fields; a metric is read by a read. Nothing is
 //! there that the format does not have: a misspelt member is refused rather
 //! than left for a client to ignore.
@@ -79,11 +81,12 @@ pub fn check(text: &[u8], provider: &str, methods: &[(&str, &str)]) -> Result<()
     if described.len() != methods.len() {
         return refuse("methods", "are the methods the provider registers");
     }
+    let own = Own { provider, methods };
     for (name, kind) in methods {
         let Some(m) = top.get("methods").and_then(|v| v.get(name)) else {
             return refuse("methods", "describe every method the provider registers")
         };
-        check_method(m, kind)?;
+        check_method(m, kind, &own)?;
     }
 
     if let Some(resources) = top.get("resources") {
@@ -176,7 +179,14 @@ fn check_ui(ui: &Value) -> Result<(), DescriptorError> {
     Ok(())
 }
 
-fn check_method(m: &Value, kind: &str) -> Result<(), DescriptorError> {
+/// The provider a descriptor is of, and the methods it registers: what a
+/// parameter's `choices` of its own are held to.
+struct Own<'a> {
+    provider: &'a str,
+    methods: &'a [(&'a str, &'a str)],
+}
+
+fn check_method(m: &Value, kind: &str, own: &Own) -> Result<(), DescriptorError> {
     let Some(members) = m.as_object() else { return refuse("methods", "are objects") };
     only(members, &["kind", "title", "help", "confirm", "confirm_typed", "params", "result"], "methods")?;
     if m.get("kind").and_then(Value::as_str) != Some(kind) {
@@ -211,6 +221,9 @@ fn check_method(m: &Value, kind: &str) -> Result<(), DescriptorError> {
         for (name, field) in params {
             name_ok(name, "methods.params")?;
             check_field(field, "methods.params")?;
+            if let Some(choices) = field.get("choices") {
+                check_choices(field, choices, own)?;
+            }
         }
     }
     if let Some(result) = m.get("result") {
@@ -219,10 +232,17 @@ fn check_method(m: &Value, kind: &str) -> Result<(), DescriptorError> {
     Ok(())
 }
 
+/// A field: a method's parameter (`methods.params`) or a resource's
+/// (`resources.fields`). `choices` is a parameter's alone, and checked by
+/// `check_choices`: a resource's field shows a value, it offers none.
 fn check_field(f: &Value, at: &'static str) -> Result<(), DescriptorError> {
     let Some(members) = f.as_object() else { return refuse(at, "are fields: objects") };
-    only(members, &["type", "title", "help", "unit", "min", "max", "values", "tones", "required", "default", "of"],
-         at)?;
+    let param = at == "methods.params";
+    only(members, &["type", "title", "help", "unit", "min", "max", "values", "tones", "required", "default", "of",
+                    "choices"], at)?;
+    if !param && f.get("choices").is_some() {
+        return refuse(at, "have choices only as a method's parameters");
+    }
     let Some(ty) = f.get("type").and_then(Value::as_str) else { return refuse(at, "have a type") };
     if !TYPES.contains(&ty) {
         return refuse(at, "have a type the format has");
@@ -289,6 +309,30 @@ fn check_field(f: &Value, at: &'static str) -> Result<(), DescriptorError> {
         ("list", None) => return refuse(at, "say what a list is of"),
         (_, Some(_)) => return refuse(at, "say what they are of only for a list"),
         _ => {}
+    }
+    Ok(())
+}
+
+/// A parameter's `choices`: the values a client offers it, each item's `key`
+/// in the list `items` of the answer of `provider`'s read `method` on the
+/// same host -- of a string or a count, what an item's key is. Another
+/// provider may not be there, and a client takes the value typed then; the
+/// descriptor's own provider is, and its method is a read it registers.
+fn check_choices(field: &Value, choices: &Value, own: &Own) -> Result<(), DescriptorError> {
+    const AT: &str = "methods.params.choices";
+    let Some(members) = choices.as_object() else { return refuse(AT, "is an object") };
+    only(members, &["provider", "method", "items", "key"], AT)?;
+    if !matches!(field.get("type").and_then(Value::as_str), Some("string" | "int")) {
+        return refuse(AT, "is for a string or an int: what an item's key is");
+    }
+    let Some(provider) = choices.get("provider").and_then(Value::as_str).filter(|p| crate::valid_provider(p)) else {
+        return refuse(AT, "names a provider: a lowercase letter, then lowercase letters, digits and _")
+    };
+    name_str(choices.get("method"), AT)?;
+    name_str(choices.get("items"), AT)?;
+    name_str(choices.get("key"), AT)?;
+    if provider == own.provider && kind_of(own.methods, choices.get("method")) != Some("read") {
+        return refuse(AT, "of the provider's own is a read it has");
     }
     Ok(())
 }

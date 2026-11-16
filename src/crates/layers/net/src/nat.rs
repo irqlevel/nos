@@ -38,6 +38,33 @@
 //! with an ICMP error, so that it fails at once rather than waiting out its
 //! retries. `nat allow` lets a network through; the DNS server the guests
 //! are given is theirs to ask at port 53, wherever it is.
+//!
+//! Two things more, each made by the one that turned NAT on and living with
+//! it (plans/vnet.md, "NAT"):
+//!
+//! - **One to one** (`map`): a public address of the world's -- one rented
+//!   for a guest, routed to this machine -- mapped to a guest's own address,
+//!   with no table of flows: a packet from the world for the public address
+//!   has its destination made the guest's and goes in through the inner
+//!   device, its source as it was, for the guest's firewall to judge; a
+//!   packet from the guest has its source made the public address and goes
+//!   out. Looked at before the masquerade, both ways. What comes in has to
+//!   come from the world -- not an address the deny list has, nor this
+//!   machine's -- or any neighbour on the link could hand a guest a packet
+//!   "from" its private neighbour; what goes out is held to the deny list,
+//!   but not to the uplink's own subnet, a neighbour there being the world
+//!   to a public address. ICMP errors are translated both ways, the packet
+//!   they quote with them; a packet in past the guest's MTU is answered
+//!   "too big", from the public address. The outer device answers ARP for a
+//!   public address mapped there, as that address, and says so as it is
+//!   mapped.
+//! - **The networks behind the inner device** besides its own subnet
+//!   (`inside`): a guest on one is masqueraded as one on the subnet is, and
+//!   answered from its network's gateway; a packet for one is not NAT's.
+//!
+//! What NAT makes up itself -- its rejects, its "too big" -- is held to a
+//! rate: a guest, or the world, that provokes it as fast as it can is not a
+//! flood of NAT's own packets.
 
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -51,9 +78,76 @@ use kcore::klog;
 
 use crate::device::{Device, DEVICES};
 use crate::frame::Frame;
-use crate::wire::{self, eth, icmp, ip, tcp, udp, Ipv4, Mac, ETH_HDR_LEN, ETH_TYPE_IP,
+use crate::wire::{self, eth, flow, icmp, ip, tcp, udp, Ipv4, Mac, ETH_HDR_LEN, ETH_TYPE_IP,
                   ICMP_HDR_LEN, IP_HDR_LEN, IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP,
                   UDP_HDR_LEN};
+
+/// Public addresses mapped one to one at once, and networks behind the
+/// inner device besides its own subnet.
+pub const ONES_MAX: usize = 64;
+pub const INSIDES_MAX: usize = 16;
+
+/// What NAT makes up itself, held to a rate: a burst of this many, and
+/// this many a second after it.
+const MADE_BURST: u64 = 32;
+const MADE_PER_SEC: u64 = 200;
+
+/// ICMP's codes NAT answers with: destination unreachable's "fragmentation
+/// needed and DF set" (RFC 1191), and the parameter problem it translates.
+const FRAG_NEEDED: u8 = 4;
+const PARAMETER_PROBLEM: u8 = 12;
+
+/// A public address mapped one to one to a guest's (`Nat::map`): what
+/// comes for it goes to `inner`, at `mac` behind the inner device, which
+/// takes a packet of `mtu` bytes at most.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct One {
+    pub public: u32,
+    pub inner: u32,
+    pub mac: Mac,
+    pub mtu: u16,
+}
+
+const NO_ONE: One = One { public: 0, inner: 0, mac: [0; 6], mtu: 0 };
+
+/// A network behind the inner device besides its own subnet (`Nat::inside`),
+/// and its gateway there: what its guests are answered from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Inside {
+    pub net: u32,
+    pub mask: u32,
+    pub gw: u32,
+}
+
+const NO_INSIDE: Inside = Inside { net: 0, mask: 0, gw: 0 };
+
+impl Inside {
+    fn has(&self, addr: u32) -> bool {
+        addr & self.mask == self.net
+    }
+}
+
+/// Why a mapping or a network was not made.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MapError {
+    /// NAT is not on for that inner device.
+    Off,
+    /// The public address is mapped already, or the guest's is, or the
+    /// network overlaps one there is.
+    Taken,
+    /// An address that will not do: this machine's own, none a host may
+    /// have, or a guest's off every network behind the inner device -- or a
+    /// network with its gateway off it.
+    Bad,
+    /// `ONES_MAX` mappings, or `INSIDES_MAX` networks, there are already.
+    Full,
+}
+
+/* How many mappings and networks there are while NAT is on: the receive
+ * path's look before it takes the lock for one -- none, the common case,
+ * and it does not. Stored under the lock. */
+static ONES: AtomicUsize = AtomicUsize::new(0);
+static INSIDES: AtomicUsize = AtomicUsize::new(0);
 
 /// Mappings at once, and the external ports they take: one each, the same
 /// numbers for TCP, UDP and ICMP echo identifiers. Below the TCP stack's own
@@ -76,17 +170,6 @@ const _: () = assert!(PORT_LAST < crate::tcp::EPHEMERAL_BASE);
 /* One offset for the ports of both transports. */
 const _: () = assert!(tcp::SRC_PORT == udp::SRC_PORT && tcp::DST_PORT == udp::DST_PORT);
 
-/// How long a mapping outlives the last packet of its flow.
-const TCP_ESTABLISHED_NS: u64 = 7440 * NS_PER_SEC;
-const TCP_TRANSITORY_NS: u64 = 240 * NS_PER_SEC;
-const TCP_RESET_NS: u64 = 10 * NS_PER_SEC;
-const UDP_NS: u64 = 300 * NS_PER_SEC;
-const ICMP_NS: u64 = 60 * NS_PER_SEC;
-
-/* What a TCP mapping has seen of its connection. */
-const SEEN_ANSWER: u8 = 1 << 0;
-const SEEN_FIN: u8 = 1 << 1;
-const SEEN_RST: u8 = 1 << 2;
 
 /// The start of a transport header an ICMP error quotes at the least --
 /// both ports, or an echo's identifier -- and all NAT reads of it.
@@ -99,7 +182,7 @@ const SHOWN: usize = 32;
 struct Entry {
     /// The protocol; 0 for a free entry.
     proto: u8,
-    /// What a TCP entry has seen: `SEEN_*`.
+    /// What a TCP entry has seen of its connection: `flow::SEEN_*`.
     seen: u8,
     inner_ip: u32,
     /// The guest's port, or its echo identifier.
@@ -139,15 +222,10 @@ struct Host {
 const NO_HOST: Host = Host { ip: 0, count: 0, lru: NONE, mru: NONE };
 
 impl Entry {
+    /// How long it outlives its flow's last packet: RFC 5382's and 4787's
+    /// times (`flow::NAT`).
     fn lifetime(&self) -> u64 {
-        match self.proto {
-            IP_PROTO_TCP if self.seen & SEEN_RST != 0 => TCP_RESET_NS,
-            IP_PROTO_TCP if self.seen & SEEN_FIN != 0 => TCP_TRANSITORY_NS,
-            IP_PROTO_TCP if self.seen & SEEN_ANSWER != 0 => TCP_ESTABLISHED_NS,
-            IP_PROTO_TCP => TCP_TRANSITORY_NS,
-            IP_PROTO_UDP => UDP_NS,
-            _ => ICMP_NS,
-        }
+        flow::lifetime(self.proto, self.seen, &flow::NAT)
     }
 }
 
@@ -397,11 +475,41 @@ impl Table {
     }
 }
 
-/// NAT while it is on: the two devices, and the table.
+/// NAT while it is on: the two devices, the table, the public addresses
+/// mapped one to one and the networks behind the inner device.
 struct On {
     inner: &'static Device,
     outer: &'static Device,
     table: Table,
+    ones: [One; ONES_MAX],
+    ones_n: usize,
+    insides: [Inside; INSIDES_MAX],
+    insides_n: usize,
+}
+
+impl On {
+    fn one_by_public(&self, addr: u32) -> Option<One> {
+        self.ones[..self.ones_n].iter().find(|o| o.public == addr).copied()
+    }
+
+    fn one_by_inner(&self, addr: u32) -> Option<One> {
+        self.ones[..self.ones_n].iter().find(|o| o.inner == addr).copied()
+    }
+
+    fn inside_of(&self, addr: u32) -> Option<Inside> {
+        self.insides[..self.insides_n].iter().find(|n| n.has(addr)).copied()
+    }
+}
+
+/// What the receive path needs to know of a guest's packet before the
+/// masquerade, read under the lock at once: its source's mapping one to
+/// one, the gateway of the network behind the inner device it is from, and
+/// whether its destination is on one of them.
+#[derive(Clone, Copy, Default)]
+struct Behind {
+    one: Option<One>,
+    src_gw: Option<u32>,
+    dst_inside: bool,
 }
 
 /// NAT's one instance (`abi::nat`).
@@ -443,6 +551,17 @@ pub struct Counters {
     /// Packets for where the guests are kept from (`kept`), each answered
     /// with an ICMP error.
     pub denied: AtomicUsize,
+    /// Packets one to one: a guest's out from its public address, and the
+    /// world's in to it.
+    pub one_out: AtomicUsize,
+    pub one_in: AtomicUsize,
+    /// Packets for a public address from what is not the world's: an
+    /// address the deny list has, or this machine's.
+    pub not_world: AtomicUsize,
+    /// Packets for a public address past its guest's MTU.
+    pub too_big: AtomicUsize,
+    /// What NAT would have made up itself past its rate, and did not.
+    pub held: AtomicUsize,
 }
 
 pub static COUNTERS: Counters = Counters {
@@ -455,7 +574,36 @@ pub static COUNTERS: Counters = Counters {
     no_frame: AtomicUsize::new(0),
     refused: AtomicUsize::new(0),
     denied: AtomicUsize::new(0),
+    one_out: AtomicUsize::new(0),
+    one_in: AtomicUsize::new(0),
+    not_world: AtomicUsize::new(0),
+    too_big: AtomicUsize::new(0),
+    held: AtomicUsize::new(0),
 };
+
+/// What NAT has left of its rate for what it makes up itself: tokens, and
+/// when they were last counted.
+static MADE: kcore::sync::IrqSpinLock<(u64, u64)> = kcore::sync::IrqSpinLock::new((MADE_BURST, 0));
+
+/// Whether NAT may make up a packet now -- one token less if so -- and
+/// counted where it may not.
+fn may_make() -> bool {
+    let now = time::boot_time_ns();
+    let mut m = MADE.lock();
+    let (tokens, at) = *m;
+    let earned = now.saturating_sub(at).saturating_mul(MADE_PER_SEC) / NS_PER_SEC;
+    let (mut tokens, at) = if earned != 0 { ((tokens + earned).min(MADE_BURST), now) } else { (tokens, at) };
+    let ok = tokens != 0;
+    if ok {
+        tokens -= 1;
+    }
+    *m = (tokens, at);
+    drop(m);
+    if !ok {
+        count(&COUNTERS.held);
+    }
+    ok
+}
 
 fn count(counter: &AtomicUsize) {
     counter.fetch_add(1, Ordering::Relaxed);
@@ -540,6 +688,26 @@ impl Nat {
         kept(proto, dst, port, (outer.ip(), outer.mask()), &a.nets[..a.count], crate::dns::upstream())
     }
 
+    /// Whether a packet from a public address, of `proto` for `dst` at
+    /// `port`, is kept from the world: by the deny list as a guest's is,
+    /// less what `nat allow` let through -- but not the uplink's own
+    /// subnet, a neighbour there being the world to a public address.
+    fn keeps_one(&self, proto: u8, dst: u32, port: u16) -> bool {
+        let a = self.allowed.lock();
+        kept(proto, dst, port, (0, 0), &a.nets[..a.count], crate::dns::upstream())
+    }
+
+    /// Whether `src` is an address of the world's, which may reach a
+    /// public address: a host's, not this machine's, and none the deny list
+    /// has but what `nat allow` let through.
+    fn from_world(&self, src: u32) -> bool {
+        if !wire::host_address(src, 0) || DEVICES.is_local(src) {
+            return false;
+        }
+        let a = self.allowed.lock();
+        !kept(0, src, 0, (0, 0), &a.nets[..a.count], 0)
+    }
+
     /// NAT on, from `inner` out through `outer` -- or, with none named,
     /// through the device the default route is on: that device.
     pub fn enable(&self, inner: &'static Device, outer: Option<&'static Device>)
@@ -563,7 +731,10 @@ impl Nat {
             drop(table);
             return Err(NatError::Busy);
         }
-        *on = Some(On { inner, outer, table });
+        *on = Some(On { inner, outer, table, ones: [NO_ONE; ONES_MAX], ones_n: 0, insides: [NO_INSIDE; INSIDES_MAX],
+                        insides_n: 0 });
+        ONES.store(0, Ordering::Release);
+        INSIDES.store(0, Ordering::Release);
         OUTER.store(outer.handle(), Ordering::Release);
         INNER.store(inner.handle(), Ordering::Release);
         drop(on);
@@ -593,6 +764,8 @@ impl Nat {
                 Some(o) if core::ptr::eq(o.inner, inner) => {
                     INNER.store(0, Ordering::Release);
                     OUTER.store(0, Ordering::Release);
+                    ONES.store(0, Ordering::Release);
+                    INSIDES.store(0, Ordering::Release);
                     on.take()
                 }
                 _ => None,
@@ -616,6 +789,144 @@ impl Nat {
             return None;
         }
         Some(o.table.forget(inner_ip))
+    }
+
+    /// Public address `one.public` mapped one to one to the guest at
+    /// `one.inner` behind `inner`, if NAT is on for it: the outer device's
+    /// cache told of it (`arp::announce`) and the guest's mappings of the
+    /// masquerade forgotten -- their answers are the guest's own address's
+    /// from now on.
+    pub fn map(&self, inner: &'static Device, one: One) -> Result<(), MapError> {
+        if !wire::host_address(one.public, 0) || DEVICES.is_local(one.public) || one.mtu < MIN_MTU {
+            return Err(MapError::Bad);
+        }
+        let outer = {
+            let mut on = self.on.lock();
+            let o = on.as_mut().filter(|o| core::ptr::eq(o.inner, inner)).ok_or(MapError::Off)?;
+            let behind = on_subnet(o.inner, one.inner) || o.inside_of(one.inner).is_some();
+            if !behind || one.inner == o.inner.ip() || one.public == o.outer.ip() {
+                return Err(MapError::Bad);
+            }
+            if o.one_by_public(one.public).is_some() || o.one_by_inner(one.inner).is_some() {
+                return Err(MapError::Taken);
+            }
+            if o.ones_n == ONES_MAX {
+                return Err(MapError::Full);
+            }
+            o.ones[o.ones_n] = one;
+            o.ones_n += 1;
+            ONES.store(o.ones_n, Ordering::Release);
+            o.table.forget(one.inner);
+            o.outer
+        };
+        if let Some(arp) = crate::abi::arp_table() {
+            arp.announce(&outer.as_nic(), one.public);
+        }
+        klog!(0, "nat: {} one to one to {}", Ipv4(one.public), Ipv4(one.inner));
+        Ok(())
+    }
+
+    /// Public address `public` mapped no longer, if it was behind `inner`:
+    /// whether it was.
+    pub fn unmap(&self, inner: &'static Device, public: u32) -> bool {
+        let mut on = self.on.lock();
+        let Some(o) = on.as_mut().filter(|o| core::ptr::eq(o.inner, inner)) else { return false };
+        let Some(i) = o.ones[..o.ones_n].iter().position(|x| x.public == public) else { return false };
+        o.ones_n -= 1;
+        o.ones[i] = o.ones[o.ones_n];
+        o.ones[o.ones_n] = NO_ONE;
+        ONES.store(o.ones_n, Ordering::Release);
+        drop(on);
+        klog!(0, "nat: {} one to one no longer", Ipv4(public));
+        true
+    }
+
+    /// The network `net`/`mask` behind `inner` besides its own subnet, its
+    /// gateway `gw` on it, if NAT is on for `inner`.
+    pub fn inside(&self, inner: &'static Device, net: Inside) -> Result<(), MapError> {
+        let net = Inside { net: net.net & net.mask, ..net };
+        if net.mask == 0 || !net.has(net.gw) || !wire::host_address(net.gw, net.mask) {
+            return Err(MapError::Bad);
+        }
+        let mut on = self.on.lock();
+        let o = on.as_mut().filter(|o| core::ptr::eq(o.inner, inner)).ok_or(MapError::Off)?;
+        let wider = |a: &Inside, b: &Inside| a.mask & b.mask;
+        let overlaps = |n: &Inside| n.net & wider(n, &net) == net.net & wider(n, &net);
+        let own = Inside { net: o.inner.ip() & o.inner.mask(), mask: o.inner.mask(), gw: o.inner.ip() };
+        if (own.mask != 0 && overlaps(&own)) || o.insides[..o.insides_n].iter().any(overlaps) {
+            return Err(MapError::Taken);
+        }
+        if o.insides_n == INSIDES_MAX {
+            return Err(MapError::Full);
+        }
+        o.insides[o.insides_n] = net;
+        o.insides_n += 1;
+        INSIDES.store(o.insides_n, Ordering::Release);
+        Ok(())
+    }
+
+    /// The network `net`/`mask` behind `inner` no longer: whether it was --
+    /// and the mappings of its guests, the masquerade's and one to one's,
+    /// with it.
+    pub fn outside(&self, inner: &'static Device, net: u32, mask: u32) -> bool {
+        let mut on = self.on.lock();
+        let Some(o) = on.as_mut().filter(|o| core::ptr::eq(o.inner, inner)) else { return false };
+        let Some(i) = o.insides[..o.insides_n].iter().position(|n| n.net == net & mask && n.mask == mask) else {
+            return false;
+        };
+        let gone = o.insides[i];
+        o.insides_n -= 1;
+        o.insides[i] = o.insides[o.insides_n];
+        o.insides[o.insides_n] = NO_INSIDE;
+        INSIDES.store(o.insides_n, Ordering::Release);
+        let mut j = 0;
+        while j < o.ones_n {
+            if gone.has(o.ones[j].inner) {
+                o.ones_n -= 1;
+                o.ones[j] = o.ones[o.ones_n];
+                o.ones[o.ones_n] = NO_ONE;
+            } else {
+                j += 1;
+            }
+        }
+        ONES.store(o.ones_n, Ordering::Release);
+        true
+    }
+
+    /// The public addresses mapped one to one and the networks behind the
+    /// inner device, into `ones` and `insides`: how many of each.
+    pub fn lists(&self, ones: &mut [One; ONES_MAX], insides: &mut [Inside; INSIDES_MAX]) -> (usize, usize) {
+        let on = self.on.lock();
+        let Some(o) = on.as_ref() else { return (0, 0) };
+        ones[..o.ones_n].copy_from_slice(&o.ones[..o.ones_n]);
+        insides[..o.insides_n].copy_from_slice(&o.insides[..o.insides_n]);
+        (o.ones_n, o.insides_n)
+    }
+
+    /// What a guest's packet from `src` for `dst` is to the lists, read at
+    /// once (`Behind`): nothing to read where there are none.
+    fn behind(&self, src: u32, dst: u32) -> Behind {
+        if ONES.load(Ordering::Acquire) == 0 && INSIDES.load(Ordering::Acquire) == 0 {
+            return Behind::default();
+        }
+        let on = self.on.lock();
+        let Some(o) = on.as_ref() else { return Behind::default() };
+        Behind {
+            one: o.one_by_inner(src),
+            src_gw: o.inside_of(src).map(|n| n.gw),
+            dst_inside: o.inside_of(dst).is_some() || o.one_by_inner(dst).is_some(),
+        }
+    }
+
+    /// The mapping a packet the outer device took for `dst` is for, and the
+    /// inner device it goes in through: none where there is none.
+    fn one_for(&self, dst: u32) -> Option<(One, &'static Device)> {
+        if ONES.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let on = self.on.lock();
+        let o = on.as_ref()?;
+        o.one_by_public(dst).map(|one| (one, o.inner))
     }
 
     /// While it is on: the two devices and how many mappings there are; and
@@ -643,6 +954,19 @@ impl Nat {
         }
         Some((o.inner, o.outer, o.table.active, shown))
     }
+}
+
+/// The least MTU a guest's mapping says it takes: IPv4's own (RFC 791).
+const MIN_MTU: u16 = 68;
+
+/// Whether the outer device `dev` answers ARP for `addr` as its own: a
+/// public address mapped one to one there. The receive path's question, so
+/// cheap where nothing is mapped.
+pub(crate) fn answers_for(dev: &Device, addr: u32) -> bool {
+    if ONES.load(Ordering::Acquire) == 0 || dev.handle() != OUTER.load(Ordering::Acquire) {
+        return false;
+    }
+    crate::abi::nat().is_some_and(|nat| nat.one_for(addr).is_some())
 }
 
 fn name(dev: &Device) -> &str {
@@ -787,8 +1111,17 @@ fn routable(outer: &Device, dst: u32) -> bool {
 fn outbound(inner: &'static Device, frame: &[u8]) -> bool {
     let Some(p) = parse(frame) else { return false };
     let Some(outer) = DEVICES.by_handle(OUTER.load(Ordering::Acquire)) else { return false };
-    if !on_subnet(inner, p.src) || p.src == inner.ip() || on_subnet(inner, p.dst)
-        || DEVICES.is_local(p.dst) || !routable(outer, p.dst)
+    let Some(nat) = crate::abi::nat() else { return false };
+    /* One to one first, and the networks behind the inner device: what a
+     * guest on one is answered from is its gateway there. */
+    let behind = nat.behind(p.src, p.dst);
+    let gw = behind.src_gw.unwrap_or(inner.ip());
+    if let Some(one) = behind.one {
+        return one_out(nat, inner, outer, frame, &p, &one, behind.dst_inside, gw);
+    }
+    let from_behind = (on_subnet(inner, p.src) && p.src != inner.ip()) || behind.src_gw.is_some_and(|g| p.src != g);
+    if !from_behind || on_subnet(inner, p.dst) || behind.dst_inside || DEVICES.is_local(p.dst)
+        || !routable(outer, p.dst)
     {
         return false;
     }
@@ -810,11 +1143,10 @@ fn outbound(inner: &'static Device, frame: &[u8]) -> bool {
             return true;
         }
     };
-    let Some(nat) = crate::abi::nat() else { return false };
     /* Where the guests are kept from: answered, so that it fails now. */
     if nat.keeps(outer, p.proto, p.dst, remote_port) {
         count(&COUNTERS.denied);
-        reject(inner, frame, &p);
+        reject(inner, frame, &p, gw);
         return true;
     }
     if p.ttl <= 1 {
@@ -854,17 +1186,9 @@ fn outbound(inner: &'static Device, frame: &[u8]) -> bool {
         o.table.touch(i);
         let e = &mut o.table.entries[i];
         if p.proto == IP_PROTO_TCP {
-            /* A connection starting again on the mapping the last one left:
-             * its times are a new connection's. */
-            if starts {
-                e.seen = 0;
-            }
-            if flags & tcp::FIN != 0 {
-                e.seen |= SEEN_FIN;
-            }
-            if flags & tcp::RST != 0 {
-                e.seen |= SEEN_RST;
-            }
+            /* A connection starting again on the mapping the last one left
+             * has a new connection's times (`flow::tcp`). */
+            e.seen = flow::tcp(e.seen, flags, false);
         }
         e.inner_mac = mac;
         let when = now.saturating_add(e.lifetime());
@@ -933,7 +1257,15 @@ fn quoted(outer: &Device, message: &[u8]) -> Option<Answer> {
 /// its guest. False for anything else, which is the stack's.
 fn inbound(outer: &'static Device, frame: &[u8]) -> bool {
     let Some(p) = parse(frame) else { return false };
-    if p.dst != outer.ip() || !p.whole {
+    if p.dst != outer.ip() {
+        /* For a public address mapped one to one, or not NAT's */
+        let Some(nat) = crate::abi::nat() else { return false };
+        return match nat.one_for(p.dst) {
+            Some((one, inner)) => one_in(nat, outer, inner, frame, &p, &one),
+            None => false,
+        };
+    }
+    if !p.whole {
         return false;
     }
     let l4 = &frame[ETH_HDR_LEN + p.ihl..ETH_HDR_LEN + p.len];
@@ -978,17 +1310,8 @@ fn inbound(outer: &'static Device, frame: &[u8]) -> bool {
         /* An error says nothing of the flow being alive, and a packet that
          * is dropped here no more. */
         let alive = answer.quoted_ihl.is_none() && p.ttl > 1;
-        if alive {
-            if e.proto == IP_PROTO_TCP {
-                let flags = tcp::flags(l4);
-                e.seen |= SEEN_ANSWER;
-                if flags & tcp::FIN != 0 {
-                    e.seen |= SEEN_FIN;
-                }
-                if flags & tcp::RST != 0 {
-                    e.seen |= SEEN_RST;
-                }
-            }
+        if alive && e.proto == IP_PROTO_TCP {
+            e.seen = flow::tcp(e.seen, tcp::flags(l4), true);
         }
         let to = (o.inner, e.inner_ip, e.inner_port, e.inner_mac);
         if alive {
@@ -1028,26 +1351,193 @@ fn copy(bytes: &[u8]) -> Option<Frame> {
 
 /// What a guest is answered with for a packet to where it is kept from: a
 /// destination unreachable, communication administratively prohibited
-/// (RFC 1812 5.2.7.1), from the inner device's address -- its gateway's --
-/// to its MAC, quoting the packet's header and the eight bytes after it
-/// (RFC 792). Its connect then fails at once, "no route to host", rather
-/// than wait out its retries. Nothing is sent when there is no frame for it;
-/// and it never answers an ICMP error, NAT taking none of a guest's.
-fn reject(inner: &'static Device, frame: &[u8], p: &Packet) {
+/// (RFC 1812 5.2.7.1), from `from` -- its gateway's address -- to its MAC,
+/// quoting the packet's header and the eight bytes after it (RFC 792). Its
+/// connect then fails at once, "no route to host", rather than wait out its
+/// retries. Nothing is sent when there is no frame for it, or past NAT's
+/// rate for what it makes up; and it never answers an ICMP error, NAT
+/// taking none of a guest's.
+fn reject(inner: &'static Device, frame: &[u8], p: &Packet, from: u32) {
     const ADMIN_PROHIBITED: u8 = 13;
     const MAX_IHL: usize = 60;
+    if !may_make() {
+        return;
+    }
     let quoted = (p.ihl + QUOTED_L4).min(p.len);
     let icmp_len = ICMP_HDR_LEN + quoted;
     let total = ETH_HDR_LEN + IP_HDR_LEN + icmp_len;
     let mut buf = [0u8; ETH_HDR_LEN + IP_HDR_LEN + ICMP_HDR_LEN + MAX_IHL + QUOTED_L4];
     eth::write(&mut buf, &eth::src(frame), &inner.mac(), ETH_TYPE_IP);
-    ip::write(&mut buf[ETH_HDR_LEN..], IP_PROTO_ICMP, inner.ip(), p.src, icmp_len, 0);
+    ip::write(&mut buf[ETH_HDR_LEN..], IP_PROTO_ICMP, from, p.src, icmp_len, 0);
     let at = ETH_HDR_LEN + IP_HDR_LEN;
     buf[at + ICMP_HDR_LEN..total].copy_from_slice(&frame[ETH_HDR_LEN..ETH_HDR_LEN + quoted]);
     icmp::write(&mut buf[at..], icmp::DEST_UNREACH, ADMIN_PROHIBITED, 0, 0, icmp_len);
     if let Some(f) = copy(&buf[..total]) {
         let _ = inner.as_nic().transmit(f);
     }
+}
+
+/* ---- one to one ---- */
+
+/// A packet from a guest mapped one to one: its source made its public
+/// address and sent out of the outer device to the next hop -- or dropped,
+/// or answered from `gw`, where it may not go. False for what is the
+/// stack's: for this machine, or for what is behind the inner device
+/// (`dst_behind`).
+#[allow(clippy::too_many_arguments)]
+fn one_out(nat: &Nat, inner: &'static Device, outer: &'static Device, frame: &[u8], p: &Packet, one: &One,
+           dst_behind: bool, gw: u32) -> bool {
+    if DEVICES.is_local(p.dst) || on_subnet(inner, p.dst) || dst_behind || !routable(outer, p.dst) {
+        return false;
+    }
+    if !p.whole {
+        count(&COUNTERS.refused);
+        return true;
+    }
+    let l4 = &frame[ETH_HDR_LEN + p.ihl..ETH_HDR_LEN + p.len];
+    let port = match p.proto {
+        IP_PROTO_TCP if l4.len() >= tcp::HDR_LEN => tcp::dst_port(l4),
+        IP_PROTO_UDP if l4.len() >= UDP_HDR_LEN => udp::dst_port(l4),
+        _ => 0,
+    };
+    if nat.keeps_one(p.proto, p.dst, port) {
+        count(&COUNTERS.denied);
+        reject(inner, frame, p, gw);
+        return true;
+    }
+    if p.ttl <= 1 {
+        count(&COUNTERS.refused);
+        return true;
+    }
+    let Some(arp) = crate::abi::arp_table() else { return true };
+    let Some(hop_mac) = arp.lookup_or_ask(&outer.as_nic(), outer.route_ip(p.dst)) else {
+        count(&COUNTERS.no_hop);
+        return true;
+    };
+    /* An error the guest sends about a packet that came to it quotes it to
+     * the guest's own address: made the public one, as it came */
+    let quoted = quoting(l4, p.proto, ip::DST, one.inner);
+    let Some(mut out) = copy(&frame[..ETH_HDR_LEN + p.len]) else {
+        count(&COUNTERS.no_frame);
+        return true;
+    };
+    {
+        let buf = out.data_mut();
+        eth::write(buf, &hop_mac, &outer.mac(), ETH_TYPE_IP);
+        let packet = &mut buf[ETH_HDR_LEN..];
+        rewrite_addr(packet, ip::SRC, one.public, p.proto, p.ihl);
+        if let Some(qihl) = quoted {
+            translate_quoted(packet, p.ihl, qihl, ip::DST, one.public);
+        }
+        hop(packet, p.ihl);
+    }
+    count(if outer.as_nic().transmit(out) { &COUNTERS.one_out } else { &COUNTERS.no_frame });
+    true
+}
+
+/// A packet from the world for a public address mapped one to one: its
+/// destination made the guest's, and sent in through the inner device to
+/// the guest's MAC, its source as it was -- the guest's firewall's to judge
+/// -- or dropped, or answered "too big". True: it is NAT's either way.
+fn one_in(nat: &Nat, outer: &'static Device, inner: &'static Device, frame: &[u8], p: &Packet, one: &One) -> bool {
+    if !p.whole {
+        count(&COUNTERS.refused);
+        return true;
+    }
+    if !nat.from_world(p.src) {
+        count(&COUNTERS.not_world);
+        return true;
+    }
+    if p.ttl <= 1 {
+        count(&COUNTERS.refused);
+        return true;
+    }
+    if p.len > usize::from(one.mtu) {
+        count(&COUNTERS.too_big);
+        too_big(outer, frame, p, one);
+        return true;
+    }
+    let l4 = &frame[ETH_HDR_LEN + p.ihl..ETH_HDR_LEN + p.len];
+    /* An error about a packet the guest sent quotes it from the public
+     * address: made the guest's own, as it sent it */
+    let quoted = quoting(l4, p.proto, ip::SRC, one.public);
+    let Some(mut out) = copy(&frame[..ETH_HDR_LEN + p.len]) else {
+        count(&COUNTERS.no_frame);
+        return true;
+    };
+    {
+        let buf = out.data_mut();
+        eth::write(buf, &one.mac, &inner.mac(), ETH_TYPE_IP);
+        let packet = &mut buf[ETH_HDR_LEN..];
+        rewrite_addr(packet, ip::DST, one.inner, p.proto, p.ihl);
+        if let Some(qihl) = quoted {
+            translate_quoted(packet, p.ihl, qihl, ip::SRC, one.inner);
+        }
+        hop(packet, p.ihl);
+    }
+    count(if inner.as_nic().transmit(out) { &COUNTERS.one_in } else { &COUNTERS.no_frame });
+    true
+}
+
+/// A packet for a public address past its guest's MTU, answered -- where it
+/// may not be cut, DF set -- with "fragmentation needed" and the MTU (RFC
+/// 1191), from the public address, quoting its header and the eight bytes
+/// after it; held to NAT's rate. One that may be cut is dropped: NAT cuts
+/// nothing.
+fn too_big(outer: &'static Device, frame: &[u8], p: &Packet, one: &One) {
+    const MAX_IHL: usize = 60;
+    let df = wire::be16(&frame[ETH_HDR_LEN..], ip::FRAG_OFF) & ip::DONT_FRAGMENT != 0;
+    if !df || !may_make() {
+        return;
+    }
+    let Some(arp) = crate::abi::arp_table() else { return };
+    let Some(hop_mac) = arp.lookup_or_ask(&outer.as_nic(), outer.route_ip(p.src)) else { return };
+    let quoted = (p.ihl + QUOTED_L4).min(p.len);
+    let icmp_len = ICMP_HDR_LEN + quoted;
+    let total = ETH_HDR_LEN + IP_HDR_LEN + icmp_len;
+    let mut buf = [0u8; ETH_HDR_LEN + IP_HDR_LEN + ICMP_HDR_LEN + MAX_IHL + QUOTED_L4];
+    eth::write(&mut buf, &hop_mac, &outer.mac(), ETH_TYPE_IP);
+    ip::write(&mut buf[ETH_HDR_LEN..], IP_PROTO_ICMP, one.public, p.src, icmp_len, 0);
+    let at = ETH_HDR_LEN + IP_HDR_LEN;
+    buf[at + ICMP_HDR_LEN..total].copy_from_slice(&frame[ETH_HDR_LEN..ETH_HDR_LEN + quoted]);
+    /* The identifier's word unused, the sequence's the next hop's MTU */
+    icmp::write(&mut buf[at..], icmp::DEST_UNREACH, FRAG_NEEDED, 0, one.mtu, icmp_len);
+    if let Some(f) = copy(&buf[..total]) {
+        let _ = outer.as_nic().transmit(f);
+    }
+}
+
+/// The length of the header of the packet an ICMP error quotes -- `l4` a
+/// destination unreachable, a time exceeded or a parameter problem whose
+/// checksum holds -- where that packet's `field` (its source, or its
+/// destination) is `addr`: an error about a packet that went one to one.
+fn quoting(l4: &[u8], proto: u8, field: usize, addr: u32) -> Option<usize> {
+    if proto != IP_PROTO_ICMP || l4.len() < ICMP_HDR_LEN + IP_HDR_LEN
+        || !matches!(icmp::kind(l4), icmp::DEST_UNREACH | icmp::TIME_EXCEEDED | PARAMETER_PROBLEM)
+        || wire::checksum(l4) != 0
+    {
+        return None;
+    }
+    let q = &l4[ICMP_HDR_LEN..];
+    let qihl = ip::header_len(q);
+    (ip::version(q) == 4 && qihl != 0 && q.len() >= qihl && wire::be32(q, field) == addr).then_some(qihl)
+}
+
+/// The packet an ICMP error quotes made to say `new` at `field` -- its
+/// source or its destination -- its header's checksum and its transport's,
+/// where the quote reaches it, kept up; and the message's own checksum
+/// summed again over all of it.
+fn translate_quoted(packet: &mut [u8], ihl: usize, qihl: usize, field: usize, new: u32) {
+    let message = &mut packet[ihl..];
+    {
+        let quoted = &mut message[ICMP_HDR_LEN..];
+        let qproto = ip::protocol(quoted);
+        rewrite_addr(quoted, field, new, qproto, qihl);
+        header_checksum(quoted, qihl);
+    }
+    wire::set_be16(message, icmp::CHECKSUM, 0);
+    let sum = wire::checksum(message);
+    wire::set_be16(message, icmp::CHECKSUM, sum);
 }
 
 /* ---- the rewriting: an IPv4 packet in place, its header first ---- */
@@ -1233,6 +1723,60 @@ pub extern "C" fn kernel_net_nat_forget(inner: usize, ip: u32) -> u32 {
     }
 }
 
+/// What `kernel_net_nat_map` and `kernel_net_nat_inside` answer.
+use ffi::net::{NAT_MAPPED, NAT_MAP_BAD, NAT_MAP_FULL, NAT_MAP_OFF, NAT_MAP_TAKEN};
+
+fn map_code(done: Result<(), MapError>) -> i32 {
+    match done {
+        Ok(()) => NAT_MAPPED,
+        Err(MapError::Off) => NAT_MAP_OFF,
+        Err(MapError::Taken) => NAT_MAP_TAKEN,
+        Err(MapError::Bad) => NAT_MAP_BAD,
+        Err(MapError::Full) => NAT_MAP_FULL,
+    }
+}
+
+/// A MAC as the ABI carries it: six bytes in the low 48 bits, the first the
+/// highest.
+fn mac_of(word: u64) -> Mac {
+    let b = word.to_be_bytes();
+    [b[2], b[3], b[4], b[5], b[6], b[7]]
+}
+
+/// `public` mapped one to one to the guest at `inner_ip` behind the device
+/// `inner` names (`Nat::map`).
+#[no_mangle]
+pub extern "C" fn kernel_net_nat_map(inner: usize, public: u32, inner_ip: u32, mac: u64, mtu: u32) -> i32 {
+    let (Some(dev), Some(nat)) = (DEVICES.by_handle(inner), crate::abi::nat()) else { return NAT_MAP_OFF };
+    let Ok(mtu) = u16::try_from(mtu) else { return NAT_MAP_BAD };
+    map_code(nat.map(dev, One { public, inner: inner_ip, mac: mac_of(mac), mtu }))
+}
+
+/// `public` mapped no longer (`Nat::unmap`): 1 when it was.
+#[no_mangle]
+pub extern "C" fn kernel_net_nat_unmap(inner: usize, public: u32) -> i32 {
+    match (DEVICES.by_handle(inner), crate::abi::nat()) {
+        (Some(dev), Some(nat)) => i32::from(nat.unmap(dev, public)),
+        _ => 0,
+    }
+}
+
+/// The network `net`/`mask` behind the device `inner` names (`Nat::inside`).
+#[no_mangle]
+pub extern "C" fn kernel_net_nat_inside(inner: usize, net: u32, mask: u32, gw: u32) -> i32 {
+    let (Some(dev), Some(nat)) = (DEVICES.by_handle(inner), crate::abi::nat()) else { return NAT_MAP_OFF };
+    map_code(nat.inside(dev, Inside { net, mask, gw }))
+}
+
+/// That network behind it no longer (`Nat::outside`): 1 when it was.
+#[no_mangle]
+pub extern "C" fn kernel_net_nat_outside(inner: usize, net: u32, mask: u32) -> i32 {
+    match (DEVICES.by_handle(inner), crate::abi::nat()) {
+        (Some(dev), Some(nat)) => i32::from(nat.outside(dev, net, mask)),
+        _ => 0,
+    }
+}
+
 /* ---- the shell ---- */
 
 /// `nat`: whether it is on and between which devices, where the guests are
@@ -1295,6 +1839,19 @@ pub fn shell(args: &str, out: &mut Output) {
             if active > listed {
                 let _ = writeln!(out, "  ...");
             }
+            if let Some(nat) = crate::abi::nat() {
+                let mut ones = [NO_ONE; ONES_MAX];
+                let mut insides = [NO_INSIDE; INSIDES_MAX];
+                let (n1, n2) = nat.lists(&mut ones, &mut insides);
+                for o in &ones[..n1] {
+                    let _ = writeln!(out, "  {} one to one to {} ({}), MTU {}", Ipv4(o.public), Ipv4(o.inner),
+                                     wire::MacHex(o.mac), o.mtu);
+                }
+                for n in &insides[..n2] {
+                    let _ = writeln!(out, "  {} behind {}, its gateway {}", Net((n.net, n.mask)), name(inner),
+                                     Ipv4(n.gw));
+                }
+            }
         }
     }
     /* Where the guests are kept from, and what is let through of it. */
@@ -1326,6 +1883,8 @@ pub fn shell(args: &str, out: &mut Output) {
                            no frame {}  refused {}  denied {}",
         load(&c.out), load(&c.back), load(&c.mapped), load(&c.taken), load(&c.full), load(&c.no_hop),
         load(&c.no_frame), load(&c.refused), load(&c.denied));
+    let _ = writeln!(out, "one to one: out {}  in {}  not from the world {}  too big {}; made up and held to the rate {}",
+        load(&c.one_out), load(&c.one_in), load(&c.not_world), load(&c.too_big), load(&c.held));
 }
 
 /* ---- what the boot self-test checks ---- */

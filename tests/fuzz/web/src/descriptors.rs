@@ -9,7 +9,8 @@ use mgmtwire::descriptor::{self, LIMITS};
 use mgmtwire::{json, Value};
 
 /// Every member the format has: a method of each kind, parameters of every
-/// shape, a resource and a resource of it, a metric.
+/// shape -- two whose values a read gives, the provider's own and
+/// another's --, a resource and a resource of it, a metric.
 const BASE: &str = r#"{"schema": 1, "provider": "demo",
  "title": {"en": "Demo", "ru": "Демо"},
  "help": {"en": "A provider for the test.", "ru": "Провайдер для проверки."},
@@ -22,7 +23,9 @@ const BASE: &str = r#"{"schema": 1, "provider": "demo",
     "params": {"label": {"type": "string", "required": true, "title": {"en": "Label", "ru": "Метка"}},
                "size": {"type": "bytes", "min": 1, "max": 100, "unit": "B", "default": 10, "title": {"en": "Size", "ru": "Размер"}},
                "mode": {"type": "enum", "title": {"en": "Mode", "ru": "Режим"}, "values": {"a": {"en": "A", "ru": "А"}, "b": {"en": "B", "ru": "Б"}}, "tones": {"a": "good", "b": "bad"}},
-               "tags": {"type": "list", "of": "string", "title": {"en": "Tags", "ru": "Метки"}}}},
+               "tags": {"type": "list", "of": "string", "title": {"en": "Tags", "ru": "Метки"}},
+               "like": {"type": "string", "title": {"en": "Like", "ru": "Как"}, "choices": {"provider": "demo", "method": "list", "items": "things", "key": "label"}},
+               "host": {"type": "int", "title": {"en": "Host", "ru": "Хост"}, "choices": {"provider": "other", "method": "hosts", "items": "hosts", "key": "node"}}}},
   "drop": {"kind": "job", "title": {"en": "Drop", "ru": "Удалить"}}
  },
  "resources": {
@@ -40,7 +43,7 @@ const METHODS: [(&str, &str); 4] = [("list", "read"), ("get", "read"), ("make", 
 
 /// Each defect, as what in BASE becomes what: the descriptor it makes must
 /// be refused.
-const DEFECTS: [(&str, &str, &str); 39] = [
+const DEFECTS: [(&str, &str, &str); 47] = [
     ("another schema", r#""schema": 1"#, r#""schema": 2"#),
     ("a text without a language", r#""title": {"en": "Demo", "ru": "Демо"}"#, r#""title": {"en": "Demo"}"#),
     ("a text in a language more", r#""title": {"en": "Demo", "ru": "Демо"}"#, r#""title": {"en": "Demo", "ru": "Демо", "de": "Demo"}"#),
@@ -83,6 +86,18 @@ const DEFECTS: [(&str, &str, &str); 39] = [
     ("a typed confirm of a parameter not always given", r#""label": {"type": "string", "required": true"#,
      r#""label": {"type": "string""#),
     ("a typed confirm of what is no string", r#""label": {"type": "string""#, r#""label": {"type": "int""#),
+    ("choices of the provider's own that are no read", r#""provider": "demo", "method": "list""#,
+     r#""provider": "demo", "method": "make""#),
+    ("choices of a method of its own it does not have", r#""provider": "demo", "method": "list""#,
+     r#""provider": "demo", "method": "fetch""#),
+    ("choices of what is neither a string nor an int", r#""like": {"type": "string""#, r#""like": {"type": "bool""#),
+    ("choices with no key", r#""items": "hosts", "key": "node""#, r#""items": "hosts""#),
+    ("choices with a member the format does not have", r#"{"provider": "other","#, r#"{"provider": "other", "where": "x","#),
+    ("choices of a provider that is no name", r#""provider": "other""#, r#""provider": "Other""#),
+    ("choices that are no object", r#""choices": {"provider": "other", "method": "hosts", "items": "hosts", "key": "node"}"#,
+     r#""choices": "other""#),
+    ("choices on a resource's field", r#""size": {"type": "bytes", "title""#,
+     r#""size": {"type": "bytes", "choices": {"provider": "demo", "method": "list", "items": "things", "key": "size"}, "title""#),
 ];
 
 pub fn vectors(f: &mut Fails) {

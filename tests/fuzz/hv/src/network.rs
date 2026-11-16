@@ -187,9 +187,15 @@ pub mod abi {
     pub struct Arp {
         pub(crate) known: Mutex<HashMap<u32, Mac>>,
         pub(crate) asked: Mutex<Vec<u32>>,
+        /// The public addresses NAT said were at the outer device, as it
+        /// mapped them (`announce`).
+        pub(crate) announced: Mutex<Vec<u32>>,
     }
 
     impl Arp {
+        pub fn announce(&self, _nic: &crate::nic::Nic, ip: u32) {
+            super::locked(&self.announced).push(ip);
+        }
         pub fn lookup(&self, ip: u32) -> Option<Mac> {
             super::locked(&self.known).get(&ip).copied()
         }
@@ -209,7 +215,8 @@ pub mod abi {
     static NAT: OnceLock<crate::nat::Nat> = OnceLock::new();
 
     pub fn arp_table() -> Option<&'static Arp> {
-        Some(ARP.get_or_init(|| Arp { known: Mutex::new(HashMap::new()), asked: Mutex::new(Vec::new()) }))
+        Some(ARP.get_or_init(|| Arp { known: Mutex::new(HashMap::new()), asked: Mutex::new(Vec::new()),
+                                      announced: Mutex::new(Vec::new()) }))
     }
 
     pub fn nat() -> Option<&'static crate::nat::Nat> {
@@ -235,8 +242,17 @@ pub mod tcp {
 
 /// `kcore::net` as a module sees it -- and `ffi::net`, whose `NatOn` the
 /// net crate's export answers with: a device by handle, NAT turned on and
-/// off through the net crate's own exports, as the kernel's does it.
+/// off through the net crate's own exports, as the kernel's does it; and
+/// what the tunnel takes of it -- a host's uplink (`crate::underlay`), a
+/// frame of the pool, a listener and the frames it is lent.
 pub mod net {
+    use std::sync::Arc;
+
+    /// hv's switch, and what it carries by, as `tunnel.rs` names them:
+    /// `crate::net` is the switch in the module, and `kcore::net` here --
+    /// one path for the two.
+    pub use crate::switch::{Carrier, Switch};
+
     #[repr(C)]
     #[derive(Clone, Copy, Debug)]
     pub struct NatOn {
@@ -251,6 +267,72 @@ pub mod net {
     pub const NAT_DEVICES: i32 = 2;
     pub const NAT_BUSY: i32 = 3;
     pub const NAT_NO_MEMORY: i32 = 4;
+
+    /// What `kernel_net_nat_map` and `kernel_net_nat_inside` answer: ffi's.
+    pub const NAT_MAPPED: i32 = 0;
+    pub const NAT_MAP_OFF: i32 = 1;
+    pub const NAT_MAP_TAKEN: i32 = 2;
+    pub const NAT_MAP_BAD: i32 = 3;
+    pub const NAT_MAP_FULL: i32 = 4;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum MapError {
+        Off,
+        Taken,
+        Bad,
+        Full,
+    }
+
+    impl MapError {
+        fn of(code: i32) -> MapError {
+            match code {
+                NAT_MAP_OFF => MapError::Off,
+                NAT_MAP_TAKEN => MapError::Taken,
+                NAT_MAP_FULL => MapError::Full,
+                _ => MapError::Bad,
+            }
+        }
+
+        pub fn name(self) -> &'static str {
+            match self {
+                MapError::Off => "NAT is off",
+                MapError::Taken => "the address is mapped already",
+                MapError::Bad => "not an address that may be mapped",
+                MapError::Full => "as many are mapped as may be",
+            }
+        }
+    }
+
+    /// `kcore::net::OneToOne`: unmapped when dropped.
+    pub struct OneToOne {
+        inner: usize,
+        public: u32,
+    }
+
+    impl OneToOne {
+        pub fn public(&self) -> u32 {
+            self.public
+        }
+    }
+
+    impl Drop for OneToOne {
+        fn drop(&mut self) {
+            crate::nat::kernel_net_nat_unmap(self.inner, self.public);
+        }
+    }
+
+    /// `kcore::net::Inside`: behind the inner device no longer when dropped.
+    pub struct Inside {
+        inner: usize,
+        net: u32,
+        mask: u32,
+    }
+
+    impl Drop for Inside {
+        fn drop(&mut self) {
+            crate::nat::kernel_net_nat_outside(self.inner, self.net, self.mask);
+        }
+    }
 
     #[derive(Clone, Copy)]
     pub struct Nic {
@@ -275,7 +357,53 @@ pub mod net {
             if handle == 0 { None } else { Some(Nic { handle }) }
         }
         pub fn ip(&self) -> u32 {
+            if let Some(u) = crate::underlay::get(self.handle) {
+                return u.ip;
+            }
             crate::device::DEVICES.by_handle(self.handle).map_or(0, |d| d.ip())
+        }
+        pub fn mac(&self) -> [u8; 6] {
+            if let Some(u) = crate::underlay::get(self.handle) {
+                return u.mac;
+            }
+            crate::device::DEVICES.by_handle(self.handle).map_or([0; 6], |d| d.mac())
+        }
+
+        /// The room its transmit queue has.
+        pub fn tx_room(&self) -> usize {
+            crate::underlay::get(self.handle).map_or(0, |u| u.room.load(std::sync::atomic::Ordering::Relaxed))
+        }
+
+        /// ARP's answer for `ip`: a look that waits, so never with a lock.
+        pub fn resolve(&self, ip: u32) -> Option<[u8; 6]> {
+            invariant!(crate::sync::held() == 0, "an ARP look, which waits, with {} of the kernel's locks held",
+                       crate::sync::held());
+            crate::underlay::hop(ip)
+        }
+
+        /// A listener on `port`, which the target lends the datagrams to.
+        pub fn listen<H: UdpHandler>(&self, port: u16, handler: Arc<H>) -> Result<UdpListener, ListenError> {
+            let Some(u) = crate::underlay::get(self.handle) else { return Err(ListenError::Invalid) };
+            let mut l = u.listener.lock().unwrap_or_else(|e| e.into_inner());
+            if l.is_some() {
+                return Err(ListenError::PortTaken);
+            }
+            let id = crate::underlay::next_listener();
+            *l = Some((port, id, handler));
+            Ok(UdpListener { handle: self.handle, id })
+        }
+
+        /// A frame out of the uplink: refused where it has no room. The
+        /// tunnel transmits with no lock of its own held.
+        pub fn transmit(&self, frame: NetFrame) -> bool {
+            invariant!(crate::sync::held() == 0, "a transmit with {} of the kernel's locks held",
+                       crate::sync::held());
+            let Some(u) = crate::underlay::get(self.handle) else { return false };
+            if u.room.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                return false;
+            }
+            u.sent.lock().unwrap_or_else(|e| e.into_inner()).push(frame.data().to_vec());
+            true
         }
         pub fn nat(&self) -> core::result::Result<Nat, NatError> {
             let on = crate::nat::kernel_net_nat_enable(0, self.handle);
@@ -296,11 +424,123 @@ pub mod net {
         pub fn forget(&self, ip: u32) -> usize {
             crate::nat::kernel_net_nat_forget(self.inner, ip) as usize
         }
+        pub fn map(&self, public: u32, inner_ip: u32, mac: [u8; 6], mtu: u16) -> Result<OneToOne, MapError> {
+            let word = u64::from_be_bytes([0, 0, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]]);
+            match crate::nat::kernel_net_nat_map(self.inner, public, inner_ip, word, u32::from(mtu)) {
+                NAT_MAPPED => Ok(OneToOne { inner: self.inner, public }),
+                code => Err(MapError::of(code)),
+            }
+        }
+        pub fn inside(&self, net: u32, mask: u32, gw: u32) -> Result<Inside, MapError> {
+            match crate::nat::kernel_net_nat_inside(self.inner, net, mask, gw) {
+                NAT_MAPPED => Ok(Inside { inner: self.inner, net: net & mask, mask }),
+                code => Err(MapError::of(code)),
+            }
+        }
     }
 
     impl Drop for Nat {
         fn drop(&mut self) {
             crate::nat::kernel_net_nat_disable(self.inner);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ListenError {
+        PortTaken,
+        TableFull,
+        Invalid,
+    }
+
+    /// What a listener is lent a datagram's frame by.
+    pub trait UdpHandler: Send + Sync + 'static {
+        fn on_frame(&self, frame: Lent<'_>, rx: &mut RxContext);
+        fn on_batch_end(&self, _rx: &mut RxContext) {}
+    }
+
+    /// A frame lent for one call.
+    pub struct Lent<'a> {
+        bytes: &'a [u8],
+    }
+
+    impl<'a> Lent<'a> {
+        /// The target's: `bytes` lent, as the receive path lends a frame.
+        pub fn lend(bytes: &'a [u8]) -> Lent<'a> {
+            Lent { bytes }
+        }
+        pub fn bytes(&self) -> &[u8] {
+            self.bytes
+        }
+        /// The frame kept past the call: its bytes, to open where they lie.
+        pub fn retain(self) -> NetFrame {
+            NetFrame { buf: self.bytes.to_vec(), len: self.bytes.len() }
+        }
+    }
+
+    pub struct RxContext {
+        _only_the_receive_pass: (),
+    }
+
+    impl RxContext {
+        /// The target's: the receive pass's own, for one call.
+        pub fn for_the_target() -> RxContext {
+            RxContext { _only_the_receive_pass: () }
+        }
+    }
+
+    /// A port listened on: given back when dropped -- which waits out a
+    /// receive still running, so never with a lock.
+    pub struct UdpListener {
+        handle: usize,
+        id: u64,
+    }
+
+    impl Drop for UdpListener {
+        fn drop(&mut self) {
+            invariant!(crate::sync::held() == 0, "a listener dropped -- which waits -- with {} of the kernel's locks \
+                       held", crate::sync::held());
+            if let Some(u) = crate::underlay::get(self.handle) {
+                let mut l = u.listener.lock().unwrap_or_else(|e| e.into_inner());
+                if l.as_ref().is_some_and(|(_, id, _)| *id == self.id) {
+                    let gone = l.take();
+                    drop(l);
+                    drop(gone);
+                }
+            }
+        }
+    }
+
+    /// A frame of the pool: room for what was asked, 2048 bytes at most,
+    /// none while the pool is dry -- and never taken with a lock held.
+    pub struct NetFrame {
+        buf: Vec<u8>,
+        len: usize,
+    }
+
+    impl NetFrame {
+        pub fn alloc_tx(data_len: usize) -> Option<NetFrame> {
+            invariant!(crate::sync::held() == 0, "a frame taken from the pool with {} of the kernel's locks held",
+                       crate::sync::held());
+            if crate::underlay::dry() || data_len > 2048 {
+                return None;
+            }
+            Some(NetFrame { buf: vec![0; data_len], len: 0 })
+        }
+        pub fn data(&self) -> &[u8] {
+            &self.buf[..self.len]
+        }
+        pub fn data_mut(&mut self) -> &mut [u8] {
+            &mut self.buf[..self.len]
+        }
+        pub fn data_raw_mut(&mut self, capacity: usize) -> &mut [u8] {
+            let n = capacity.min(self.buf.len());
+            &mut self.buf[..n]
+        }
+        pub fn len(&self) -> usize {
+            self.len
+        }
+        pub fn set_len(&mut self, len: usize) {
+            self.len = len.min(self.buf.len());
         }
     }
 
@@ -370,6 +610,9 @@ pub mod vnic {
                 return false;
             }
             super::locked(&super::HV0_IN).push(frame.to_vec());
+            if super::HANDED_KEEP.load(std::sync::atomic::Ordering::Relaxed) {
+                super::locked(&super::HANDED).push((crate::ipc::current(), frame.to_vec()));
+            }
             let ipv4 = eth::ether_type(frame) == ETH_TYPE_IP && frame.len() >= ETH_HDR_LEN + IP_HDR_LEN;
             if !(ipv4 && crate::nat::intercept(&crate::device::HV0, frame)) {
                 super::locked(&super::STACK).push(frame.to_vec());
@@ -418,12 +661,33 @@ pub mod vms {
             self.woken.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    impl crate::switch::Wake for Shared {
+        fn wake_up(&self) {
+            Shared::wake_up(self);
+        }
+    }
 }
 
 /// What reached the stack's own protocols through `hv0` -- not NAT's.
 static STACK: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// Everything `hv0` took in: the stack's and NAT's.
 static HV0_IN: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// What was handed in to `hv0`, by the host whose code handed it
+/// (`crate::ipc::current`), while a target keeps it: one `hv0` stands for
+/// every host's here, and who handed a frame in is what tells which host's
+/// way out it took.
+static HANDED: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::new());
+static HANDED_KEEP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn keep_handed(on: bool) {
+    HANDED_KEEP.store(on, std::sync::atomic::Ordering::Relaxed);
+    locked(&HANDED).clear();
+}
+
+pub fn take_handed() -> Vec<(usize, Vec<u8>)> {
+    core::mem::take(&mut *locked(&HANDED))
+}
 
 /// Frames that reached the stack's own protocols since last asked.
 pub fn take_stack() -> Vec<Vec<u8>> {
@@ -456,6 +720,7 @@ pub fn reset() {
         d.set([0; 6], 0, 0, 0);
     }
     locked(&STACK).clear();
+    keep_handed(false);
     locked(&HV0_IN).clear();
     if let Some(arp) = abi::arp_table() {
         locked(&arp.known).clear();

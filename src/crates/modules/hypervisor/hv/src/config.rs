@@ -61,10 +61,22 @@ pub struct Options {
     /// The network on the guests' switch it is on, whose other guests it
     /// reaches; alone, reaching none, when not said.
     pub network: Option<String>,
+    /// The firewall it is judged by (`crate::firewalls`); `default` when not
+    /// said -- and a VM's from a folder written into its vm.toml at its
+    /// first start since VMs had them.
+    pub firewall: Option<String>,
+    /// The public address mapped one to one to it (`Switch::map_public`):
+    /// the world reaches it there, at the ports its firewall opens, and it
+    /// goes out from it. A net guest's.
+    pub public: Option<u32>,
     /// The UUID its SMBIOS gives it, as RFC 4122 writes one: what its OS
     /// knows the machine by, the same at every start. A VM with a folder is
     /// given one at its first start, written into its vm.toml.
     pub uuid: Option<[u8; 16]>,
+    /// `address=`, `hv create`'s on a network of the cluster's: the address
+    /// its port is made at, carried out once -- vnet's state holds it from
+    /// then on, and no vm.toml has a key for it.
+    pub address: Option<u32>,
 }
 
 /// A vm.toml: the options, and what only a VM with a folder has.
@@ -110,10 +122,12 @@ enum Key {
     Uuid,
     Network,
     Protected,
+    Firewall,
+    Public,
 }
 
 /// The keys there are, in the order `render` writes them.
-const KEYS: [(&str, Key); 22] = [
+const KEYS: [(&str, Key); 24] = [
     ("kernel", Key::Kernel),
     ("initrd", Key::Initrd),
     ("cmdline", Key::Cmdline),
@@ -123,6 +137,8 @@ const KEYS: [(&str, Key); 22] = [
     ("disks", Key::Disks),
     ("net", Key::Net),
     ("network", Key::Network),
+    ("firewall", Key::Firewall),
+    ("public", Key::Public),
     ("port", Key::Port),
     ("forward", Key::Forward),
     ("restart", Key::Restart),
@@ -141,12 +157,23 @@ const KEYS: [(&str, Key); 22] = [
 /// The longest a network's name is.
 pub const NETWORK_NAME_MAX: usize = 31;
 
+/// What a network is called on a VM's `network=` when it is the cluster's
+/// (plans/vnet.md): `vnet:lan`.
+pub const CLUSTER_PREFIX: &str = "vnet:";
+
+/// The cluster network `network=` names, if it names one: its name there.
+pub fn cluster_network(network: &str) -> Option<&str> {
+    network.strip_prefix(CLUSTER_PREFIX)
+}
+
 /// Whether `name` may be a network's on the guests' switch: a letter or a
 /// digit, then letters, digits, `.`, `_` and `-`, at most
-/// `NETWORK_NAME_MAX` in all -- as a VM's name is.
+/// `NETWORK_NAME_MAX` in all -- as a VM's name is; or a network of the
+/// cluster's, `vnet:` and such a name, which vnet holds to its own rules.
 pub fn valid_network(name: &str) -> bool {
-    let b = name.as_bytes();
-    !b.is_empty() && b.len() <= NETWORK_NAME_MAX && b[0].is_ascii_alphanumeric()
+    let local = cluster_network(name).unwrap_or(name);
+    let b = local.as_bytes();
+    !b.is_empty() && name.len() <= NETWORK_NAME_MAX && b[0].is_ascii_alphanumeric()
         && b.iter().all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
 }
 
@@ -202,6 +229,18 @@ fn assign(c: &mut Config, key: Key, name: &str, value: Value, line: usize) -> Re
             }
             o.network = Some(s);
         }
+        (Key::Firewall, Value::Str(s)) => {
+            if !firewall::valid_name(&s) {
+                return Err(error(line, &alloc::format!("\"{}\" is not a firewall's name -- a letter or a digit, \
+                                                        then letters, digits, . _ and -, at most {}", s,
+                                                       firewall::NAME_MAX)));
+            }
+            o.firewall = Some(s);
+        }
+        (Key::Public, Value::Str(s)) => {
+            o.public = Some(public(&s).ok_or_else(|| error(line, &alloc::format!("\"{}\" is not an address a host \
+                                                                                 may have -- a.b.c.d", s)))?);
+        }
         (Key::Uuid, Value::Str(s)) => {
             o.uuid = Some(uuid(&s).ok_or_else(|| error(line, &alloc::format!("\"{}\" is not a UUID -- \
                                                                               8-4-4-4-12 hex digits", s)))?);
@@ -242,7 +281,8 @@ fn assign(c: &mut Config, key: Key, name: &str, value: Value, line: usize) -> Re
                 o.forwards.push(pair);
             }
         }
-        (Key::Kernel | Key::Initrd | Key::Cmdline | Key::Input | Key::Uuid | Key::Network, v) => {
+        (Key::Kernel | Key::Initrd | Key::Cmdline | Key::Input | Key::Uuid | Key::Network | Key::Firewall
+         | Key::Public, v) => {
             return Err(wrong("a string", &v));
         }
         (Key::Memory | Key::Rxmod | Key::Cpus | Key::Cpu | Key::Port, v) => return Err(wrong("a number", &v)),
@@ -367,6 +407,11 @@ pub fn forward(word: &str) -> Option<(u16, u16)> {
     Some((port(host)?, port(guest)?))
 }
 
+/// A public address as a person writes it, `a.b.c.d`: one a host may have.
+pub fn public(text: &str) -> Option<u32> {
+    netwire::parse_ipv4(text.as_bytes()).filter(|&a| netwire::host_address(a, 0))
+}
+
 /* ---- the writer ---- */
 
 /// What every vm.toml `render` writes begins with.
@@ -386,6 +431,7 @@ fn line(c: &Config, key: Key, name: &str) -> Result<Option<String>, String> {
         Key::Cmdline => o.cmdline.as_deref().map_or(0, text),
         Key::Input => text(&o.input),
         Key::Network => o.network.as_deref().map_or(0, text),
+        Key::Firewall => o.firewall.as_deref().map_or(0, text),
         Key::Disks => o.disks.iter().map(|(d, _)| text(d) + 5).sum::<usize>() + 2,
         Key::Forward => o.forwards.len() * 16 + 2,
         _ => 48,
@@ -440,6 +486,19 @@ fn line(c: &Config, key: Key, name: &str) -> Result<Option<String>, String> {
         Key::Net if o.net => said(&mut s, &true),
         Key::Network => match &o.network {
             Some(v) => put(&mut s, name, v),
+            None => return Ok(None),
+        },
+        Key::Firewall => match &o.firewall {
+            Some(v) => put(&mut s, name, v),
+            None => return Ok(None),
+        },
+        Key::Public => match o.public {
+            Some(a) => {
+                let mut text = String::new();
+                text.try_reserve(16).map_err(|_| String::from("out of memory"))?;
+                let _ = write!(text, "{}", netwire::Ipv4(a));
+                put(&mut s, name, &text);
+            }
             None => return Ok(None),
         },
         Key::Port => match o.port {

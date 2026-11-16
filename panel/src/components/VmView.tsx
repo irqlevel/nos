@@ -15,10 +15,14 @@ import { NbsVolume } from '@/lib/images';
 const TABS = ['overview', 'console', 'config', 'disks', 'forwards'] as const;
 type Tab = (typeof TABS)[number];
 
-/** A VM's page: what it is and how it runs, its actions; its console; its
- * vm.toml; its disks; its forwards. */
-export function VmView({ host, name, d, nbs = null, locale, w }: {
-  host: string; name: string; d: Descriptor; nbs?: Descriptor | null; locale: Locale; w: Words;
+/** The fw provider's method that puts a VM on another firewall. */
+const ASSIGN = 'assign';
+
+/** A VM's page: what it is and how it runs -- the firewall its network is
+ * judged by among it -- its actions; its console; its vm.toml; its disks;
+ * its forwards. */
+export function VmView({ host, name, d, nbs = null, fw = null, locale, w }: {
+  host: string; name: string; d: Descriptor; nbs?: Descriptor | null; fw?: Descriptor | null; locale: Locale; w: Words;
 }) {
   const [tab, setTab] = useState<Tab>('overview');
   const [got, setGot] = useState<Record<string, unknown> | null>(null);
@@ -69,7 +73,7 @@ export function VmView({ host, name, d, nbs = null, locale, w }: {
       {tab === 'overview' && (
         <div className="space-y-4">
           <dl className="grid gap-x-6 gap-y-2 rounded-xl border border-line bg-card p-4 text-sm md:grid-cols-2">
-            {['state', 'cpus', 'memory_mib', 'ip', 'uptime_ms', 'restarts', 'exits'].map((k) => (
+            {['state', 'cpus', 'memory_mib', 'ip', 'public', 'firewall', 'uptime_ms', 'restarts', 'exits'].filter((k) => fields[k]).map((k) => (
               <div key={k} className="flex justify-between gap-4">
                 <dt className="text-muted">{text(fields[k]?.title, locale) || k}</dt>
                 <dd className="font-mono text-fg-soft">{show(fields[k], vm[k], locale)}</dd>
@@ -84,8 +88,20 @@ export function VmView({ host, name, d, nbs = null, locale, w }: {
                 {text(d.methods[m]!.title, locale)}
               </button>
             ))}
+            {fw?.methods[ASSIGN] && (
+              <button type="button" onClick={() => setAction(action === ASSIGN ? null : ASSIGN)} data-testid="vm-firewall"
+                className={`rounded-lg border px-3 py-1.5 text-sm ${action === ASSIGN ? 'border-accent text-fg' : 'border-line text-fg-soft hover:border-accent'}`}>
+                {text(fw.methods[ASSIGN].title, locale)}
+              </button>
+            )}
           </div>
-          {action && d.methods[action] && (
+          {action === ASSIGN && fw?.methods[ASSIGN] && (
+            <div className="rounded-xl border border-line bg-card p-4">
+              <MethodForm key={ASSIGN} host={host} provider="fw" name={ASSIGN} method={fw.methods[ASSIGN]} fixed={{ vm: name }}
+                locale={locale} w={w} onDone={() => void load()} />
+            </div>
+          )}
+          {action && action !== ASSIGN && d.methods[action] && (
             <div className="rounded-xl border border-line bg-card p-4">
               <MethodForm key={action} host={host} provider="vm" name={action} method={d.methods[action]!} fixed={{ name }}
                 locale={locale} w={w} onDone={() => {

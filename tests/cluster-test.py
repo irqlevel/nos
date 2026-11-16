@@ -30,6 +30,8 @@ every host's ipcnet pinning every other's key from the registry alone.
   invited again;
 - all three VMs killed and booted again at once: back from their folders,
   a leader agreed on, three voters, every host up to every other;
+- c's log gone, its member file and its `begun` mark kept: its member not
+  started as the one it was, and saying so at the load and in `cluster`;
 - recover: refused while the majority answers; b and c killed for good, and
   on a -- once it follows no leader -- what it does said, a name not the
   cluster's refused, then a made the one voter and b and c removed; c's old
@@ -384,6 +386,19 @@ def main():
              ipct.wait_for(lambda: leader_of(a) is not None and leader_of(a) == leader_of(b) == leader_of(c)
                            and voters(a) == ["a", "b", "c"], 90, 1))
         need("and every host up to every other", ipct.wait_for(lambda: all_up(everyone), 60, 1))
+
+        # -- c's log gone beside its member file and its begun mark (V1a):
+        # never started as the member it was, and saying so --
+        c.run("rmmod cluster")
+        c.run("rm /etc/cluster/raft")
+        out = c.run("insmod /cluster.ko")
+        check("c's member, its log gone beside its begun mark, not started as the one it was",
+              "holds no log, and this host's member had begun one" in out, out)
+        out = c.run("cluster")
+        check("and c says so", "did not start" in out and "holds no log" in out, out)
+        js = json_of(c.run("mgmt call cluster status"))
+        check("and through the bus: no member, and why", js is not None and js.get("member") is False
+              and "holds no log" in (js.get("stopped") or ""), js)
 
         # -- recover: refused while the majority answers; then b and c lost for good --
         out = a.run("cluster recover")

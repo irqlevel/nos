@@ -964,7 +964,43 @@ pub const SCENARIOS: &[(&str, fn() -> Result<(), String>)] = &[
     ("log_snapshot_pieces", snapshot_pieces),
     ("log_snapshot_given_up", snapshot_given_up),
     ("log_snapshot_short_piece", snapshot_short_piece),
+    ("log_holds_log", holds_log_said),
 ];
+
+/// `holds_log`: a folder with nothing, or a segment shorter than its head
+/// -- a crash's as it was begun -- holds no log; one with a segment begun
+/// whole, or a snapshot, does; and nothing is written by asking.
+fn holds_log_said() -> Result<(), String> {
+    let disk = SimFiles(Rc::new(RefCell::new(Disk::new(5))));
+    let mut files = disk.clone();
+    if raft::log::holds_log(&mut files) != Ok(false) {
+        return Err(String::from("an empty folder said to hold a log"));
+    }
+    files.append("wal.0000000000000001", &[1, 2, 3]).map_err(|e| format!("{:?}", e))?;
+    if raft::log::holds_log(&mut files) != Ok(false) {
+        return Err(String::from("a segment shorter than its head said to be a log"));
+    }
+    let mut names = Vec::new();
+    files.list(&mut names).map_err(|e| format!("{:?}", e))?;
+    if names.len() != 1 {
+        return Err(format!("asking changed the folder: {:?}", names));
+    }
+    let disk2 = SimFiles(Rc::new(RefCell::new(Disk::new(6))));
+    let log = DiskLog::open(disk2.clone(), LogConfig::default()).map_err(|e| format!("{:?}", e))?;
+    drop(log);
+    let mut files2 = disk2;
+    if raft::log::holds_log(&mut files2) != Ok(true) {
+        return Err(String::from("a log opened, its segment begun whole, said to hold none"));
+    }
+    let disk3 = SimFiles(Rc::new(RefCell::new(Disk::new(7))));
+    let mut files3 = disk3;
+    files3.append("snap.0000000000000009", &[0; 8]).map_err(|e| format!("{:?}", e))?;
+    files3.append("snap.0000000000000010.tmp", &[0; 8]).map_err(|e| format!("{:?}", e))?;
+    if raft::log::holds_log(&mut files3) != Ok(true) {
+        return Err(String::from("a snapshot said to be no log"));
+    }
+    Ok(())
+}
 
 fn entry(index: u64, term: u64, len: usize) -> Entry {
     Entry { term, index, kind: EntryKind::Normal, data: (0..len).map(|k| (index as usize * 31 + k) as u8).collect() }

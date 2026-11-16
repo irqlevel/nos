@@ -43,11 +43,17 @@ console read and streamed, a reader's typing at it refused, an admin's
 refused for a VM that does not run, and stopped; a VM made of an image the
 test serves, cloned, the clone deleted; a protected VM's delete refused
 without force; and a create of an image served slowly cancelled midway,
-nothing of it left behind. And the management panel (panel_checks): /etc/rc's
+nothing of it left behind. Its fw provider, the host's firewalls (fw_checks):
+listed to a reader, default among them, a change refused it; one made, a rule
+added and one hv would not take refused by its field, a VM put on it -- its
+vm.toml, its row -- the firewall then refused its delete for the VM naming
+it, and deleted once the VM is put back; default never deleted. And the
+management panel (panel_checks): /etc/rc's
 `api panel create`, given a password's hash, the test's image and a bundle
 the test serves, has the vm provider make the panel's VM and start it -- the
 highest port of the switch its own, nos's 39233 forwarded to its 443,
-protected -- and lets its key in as an admin and its address in on hv0. Once
+protected, judged by its firewall `panel`, which lets in nothing but its 443
+-- and lets its key in as an admin and its address in on hv0. Once
 nos is powered off, its root read: the VM's user-data is cloud-config whose
 seed names the API on hv0 and its key, the password's hash and a key and
 certificate that pair -- the certificate's key the one let in -- and whose
@@ -733,6 +739,63 @@ def vm_checks(k, pin, port):
     a.close()
 
 
+def fw_checks(k, pin):
+    """The fw provider through the API (x86-64): the host's firewalls, as
+    the module's docstring says them."""
+    a = client(k, "admin", pin)
+    r = client(k, "reader", pin)
+    s, _, d = a.request("GET", "/v1/providers/fw")
+    pt.check("the fw provider is on the bus, its descriptor served", s == 200 and d.get("provider") == "fw", (s, d))
+    s, _, listed = r.request("POST", "/v1/call/fw/list")
+    names = [f.get("name") for f in listed.get("firewalls", [])] if s == 200 else []
+    pt.check("a reader lists the host's firewalls: default among them, in denied, out allowed",
+             "default" in names and any(f.get("name") == "default" and f.get("in") == "deny" and f.get("out") == "allow"
+                                        for f in listed.get("firewalls", [])), (s, listed))
+    s, _, body = r.request("POST", "/v1/call/fw/create", {"name": "t-fw"})
+    pt.check("a reader may not make one: 403", s == 403, (s, body))
+
+    s, _, body = a.request("POST", "/v1/call/fw/create", {"name": "t-fw", "in": "deny"})
+    pt.check("an admin makes t-fw", s == 200 and body.get("name") == "t-fw" and body.get("in") == "deny", (s, body))
+    s, _, body = a.request("POST", "/v1/call/fw/create", {"name": "t-fw"})
+    pt.check("and not twice: a conflict", s == 409, (s, body))
+    s, _, body = a.request("POST", "/v1/call/fw/add", {"name": "t-fw", "rule": "allow in tcp 22 from 10.0.100.0/24"})
+    pt.check("a rule added: the first", s == 200 and body.get("n") == 1 and body.get("cut") == 0, (s, body))
+    s, _, body = a.request("POST", "/v1/call/fw/add", {"name": "t-fw", "rule": "allow sideways"})
+    pt.check("one hv would not take, refused by its field", s == 400 and body.get("error", {}).get("field") == "rule",
+             (s, body))
+    s, _, got = r.request("POST", "/v1/call/fw/get", {"name": "t-fw"})
+    pt.check("t-fw read back: its rule as hv writes it, no VM on it", s == 200
+             and [x.get("rule") for x in got.get("rules", [])] == ["allow in tcp 22 from 10.0.100.0/24"]
+             and got.get("firewall", {}).get("vms") == [], (s, got))
+
+    s, _, body = a.request("POST", "/v1/call/fw/assign", {"vm": "t1", "firewall": "t-fw"})
+    pt.check("t1, with no NIC, put on no firewall: a conflict, saying why", s == 409
+             and "no NIC" in body.get("error", {}).get("message", ""), (s, body))
+    s, _, body = a.request("POST", "/v1/call/vm/config_set",
+                           {"name": "t1", "text": 'kernel = "/lib/hvboot"\nmemory = 64\nnet = true\n'})
+    pt.check("t1 given a NIC through its vm.toml", s == 200, (s, body))
+    s, _, body = a.request("POST", "/v1/call/fw/assign", {"vm": "t1", "firewall": "t-fw"})
+    pt.check("t1 put on it: its vm.toml says so", s == 200 and body.get("kept") is True, (s, body))
+    s, got = vm_get(a, "t1")
+    pt.check("t1's row says its firewall", s == 200 and got.get("vm", {}).get("firewall") == "t-fw", got)
+    s, _, conf = a.request("POST", "/v1/call/vm/config_get", {"name": "t1"})
+    pt.check("and its vm.toml", s == 200 and 'firewall = "t-fw"' in conf.get("text", ""), (s, conf))
+    s, _, body = a.request("POST", "/v1/call/fw/assign", {"vm": "no-such-vm", "firewall": "t-fw"})
+    pt.check("a VM there is not, refused by its field", s == 404 and body.get("error", {}).get("field") == "vm",
+             (s, body))
+    s, _, body = a.request("POST", "/v1/call/fw/delete", {"name": "t-fw"})
+    pt.check("t-fw's delete refused while t1 names it", s == 409 and "t1" in body.get("error", {}).get("message", ""),
+             (s, body))
+    s, _, body = a.request("POST", "/v1/call/fw/assign", {"vm": "t1", "firewall": "default"})
+    pt.check("t1 put back on default", s == 200, (s, body))
+    s, _, body = a.request("POST", "/v1/call/fw/delete", {"name": "t-fw"})
+    pt.check("and t-fw deleted", s == 200 and body.get("deleted") == "t-fw", (s, body))
+    s, _, body = a.request("POST", "/v1/call/fw/delete", {"name": "default"})
+    pt.check("default is never deleted", s == 409, (s, body))
+    a.close()
+    r.close()
+
+
 def scrypt_hash(password):
     """A password hashed as nos-install hashes it."""
     import base64
@@ -773,9 +836,14 @@ def panel_checks(k, pin, log):
              and vm.get("port") == PANEL_PORT and vm.get("ip") == PANEL_IP and vm.get("memory_mib") == 64, (s, got))
     s, _, conf = a.request("POST", "/v1/call/vm/config_get", {"name": "panel"})
     text = conf.get("text", "") if s == 200 else ""
-    pt.check("its vm.toml: nos's 39233 forwarded to its 443, its port, protected, booted again when it resets",
-             'forward = ["39233:443"]' in text and "port = %d" % PANEL_PORT in text and "protected = true" in text
-             and "restart = true" in text, text)
+    pt.check("its vm.toml: nos's 39233 forwarded to its 443, its port, protected, booted again when it resets, "
+             "judged by its firewall", 'forward = ["39233:443"]' in text and "port = %d" % PANEL_PORT in text
+             and "protected = true" in text and "restart = true" in text and 'firewall = "panel"' in text, text)
+    s, _, fw = a.request("POST", "/v1/call/fw/get", {"name": "panel"})
+    pt.check("its firewall, panel: nothing comes in but at its 443; the VM running on it",
+             s == 200 and [x.get("rule") for x in fw.get("rules", [])] == ["allow in tcp 443"]
+             and fw.get("firewall", {}).get("in") == "deny" and fw.get("firewall", {}).get("vms") == ["panel"],
+             (s, fw))
     s, _, body = a.request("POST", "/v1/call/api/clients")
     panel = [c for c in body.get("clients", []) if c.get("name") == "panel"] if s == 200 else []
     pt.check("its key is let in as panel, an admin", len(panel) == 1 and panel[0].get("role") == "admin", (s, body))
@@ -952,6 +1020,7 @@ def x86(args, tmp, k):
         common(k, pin, "x86_64")
         panel_key = panel_checks(k, pin, log)
         vm_checks(k, pin, port)
+        fw_checks(k, pin)
         pt.check("nothing panicked", "PANIC" not in open(log, errors="replace").read())
         a = client(k, "admin", pin)
         a.request("POST", "/v1/call/system/power_off")

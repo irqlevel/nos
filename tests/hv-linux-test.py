@@ -1383,8 +1383,13 @@ def web_server(root):
 
 def network(args):
     """The guests' network: two guests on the switch, each with its address
-    from its port; each pings nos at 10.0.100.1 and the other guest, and
-    nos pings a guest back through hv0. IPv6 between them: each has an
+    from its port, both on the network lab and judged by the firewall lab;
+    each pings nos at 10.0.100.1 -- the host's own address, which no
+    firewall judges -- and the other guest not at all until the firewall
+    lets the network in, then the other guest, and nos pings a guest back
+    through hv0; `hv forward add` says the firewall lets nobody in at the
+    port until a rule does, and `hv fw lab` shows each rule's flows and both
+    guests on it. IPv6 between them: each has an
     address in the prefix the switch's router advertisement gives, and its
     link-local one, and reaches the other at both; one that asks for the
     other's is told it is taken, and one that takes it anyway gets nothing
@@ -1408,8 +1413,13 @@ def network(args):
     x = lambda vm, line, secs=60: "hv exec %d secs=%d %s" % (vm, secs, line)
     # The two guests on one network, which the switch's guests are not
     # unless their network= puts them on one: the folder's VM below is not.
-    start = "hv start /bzImage mem=%d%s initrd=/initrd net network=lab cmdline=%s" % (args.mem, cpus_opt(args),
-                                                                                       args.cmdline)
+    # Each judged by the firewall lab, which lets nothing in until its rules
+    # say: the network first, then the web server's port.
+    start = "hv start /bzImage mem=%d%s initrd=/initrd net network=lab firewall=lab cmdline=%s" % (
+        args.mem, cpus_opt(args), args.cmdline)
+    closed = x(0, "ping -c 2 -W 2 10.0.100.3; echo closed-done", 60)
+    let_net = "hv fw lab add allow in from net"
+    let_web = "hv fw lab add allow in tcp 80"
     way_out = [x(0, "cat /proc/net/pnp"),
                x(0, "wget -q -O - http://10.0.2.2:%d/nat.txt" % web),
                x(0, "ping -c 3 10.0.2.2"),
@@ -1545,11 +1555,12 @@ def network(args):
               "hv start w1",
               "hv stop w2 secs=0",
               "hv stop w1 secs=0"]
-    rc = ["insmod /hv.ko", "hv on", start, start,
+    rc = ["insmod /hv.ko", "hv on", "hv fw create lab", start, start,
           x(0, "id", args.vm_secs), x(1, "id", args.vm_secs),
           "hv list",
           x(0, "ifconfig eth0"),
           x(0, "ping -c 3 10.0.100.1", 60),
+          closed, let_net,
           x(0, "ping -c 3 10.0.100.3", 60),
           x(1, "ping -c 3 10.0.100.2", 60),
           "ping 10.0.100.2",
@@ -1558,6 +1569,7 @@ def network(args):
           x(1, "seq 1 %d > /www/seq" % SEQ_LINES),
           x(1, "httpd -p 80 -h /www"),
           "hv forward add 8080 1 80",
+          let_web, "hv fw lab",
           "hv forward", "insmod /sshd.ko", "sshd start"] + six + kept + way_out + folder + [RC_LAST]
     port = free_port()
     ssh_port = free_port()
@@ -1574,17 +1586,36 @@ def network(args):
         out = lambda i: output_of(secs, rc[i], 0) or ""
         ok_ping = lambda t: re.search(r"3 packets transmitted, 3 packets received", t) is not None
         ok_ping2 = lambda t: re.search(r"2 packets transmitted, 2 packets received", t) is not None
-        pt.check("both guests reach their shells", "uid=0 gid=0" in out(4) and "uid=0 gid=0" in out(5),
-                 out(4)[-300:] + out(5)[-300:])
-        pt.check("hv list gives each its address", "10.0.100.2" in out(6) and "10.0.100.3" in out(6), out(6))
+        at = rc.index
+        pt.check("both guests reach their shells",
+                 "uid=0 gid=0" in out(at(x(0, "id", args.vm_secs))) and "uid=0 gid=0" in out(at(x(1, "id", args.vm_secs))),
+                 out(at(x(0, "id", args.vm_secs)))[-300:] + out(at(x(1, "id", args.vm_secs)))[-300:])
+        listed = out(at("hv list"))
+        pt.check("hv list gives each its address", "10.0.100.2" in listed and "10.0.100.3" in listed, listed)
+        eth0 = out(at(x(0, "ifconfig eth0")))
         pt.check("the guest's eth0 has its port's address and MAC",
-                 "10.0.100.2" in out(7) and re.search(r"(?i)02:00:00:00:64:02", out(7)) is not None, out(7))
-        pt.check("a guest pings nos, at 10.0.100.1 on hv0", ok_ping(out(8)), out(8)[-600:])
-        pt.check("a guest pings the other", ok_ping(out(9)), out(9)[-600:])
-        pt.check("and the other pings it back", ok_ping(out(10)), out(10)[-600:])
-        pt.check("nos pings a guest, out of hv0", "reply from 10.0.100.2" in out(11), out(11)[-600:])
-        added = out(rc.index("hv forward add 8080 1 80"))
-        pt.check("hv forward add", "port 8080 forwarded to vm 1, 10.0.100.3:80" in added, added)
+                 "10.0.100.2" in eth0 and re.search(r"(?i)02:00:00:00:64:02", eth0) is not None, eth0)
+        to_nos = out(at(x(0, "ping -c 3 10.0.100.1", 60)))
+        pt.check("a guest pings nos, at 10.0.100.1 on hv0 -- the host's own address, which no firewall judges",
+                 ok_ping(to_nos), to_nos[-600:])
+        shut = out(at(closed))
+        pt.check("the other guest of its network is closed to it until its firewall says otherwise",
+                 "closed-done" in shut and "2 packets transmitted, 0 packets received" in shut, shut[-600:])
+        opened = out(at(let_net))
+        pt.check("hv fw lab add allow in from net", "rule 1: allow in from net" in opened, opened)
+        there = out(at(x(0, "ping -c 3 10.0.100.3", 60)))
+        back = out(at(x(1, "ping -c 3 10.0.100.2", 60)))
+        pt.check("then a guest pings the other", ok_ping(there), there[-600:])
+        pt.check("and the other pings it back", ok_ping(back), back[-600:])
+        from_nos = out(at("ping 10.0.100.2"))
+        pt.check("nos pings a guest, out of hv0", "reply from 10.0.100.2" in from_nos, from_nos[-600:])
+        added = out(at("hv forward add 8080 1 80"))
+        pt.check("hv forward add, saying its firewall lets nobody in at tcp 80 yet",
+                 "port 8080 forwarded to vm 1, 10.0.100.3:80" in added and "lets nobody in at tcp 80" in added, added)
+        shown = out(at("hv fw lab"))
+        pt.check("hv fw lab: its two rules, the network's having let flows through, and both guests on it",
+                 re.search(r"1\s+allow in from net\s+[1-9]\d* flows?", shown) is not None
+                 and "allow in tcp 80" in shown and "vm 0" in shown and "vm 1" in shown, shown)
         # From outside: the host's port, QEMU's forward into nos's 8080, and
         # nos's into the guest's httpd.
         import urllib.request

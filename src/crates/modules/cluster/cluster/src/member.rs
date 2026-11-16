@@ -32,7 +32,7 @@ use ipcwire::control;
 use kcore::ipc::{Addr, Message, TAG_BULK};
 use kcore::klog;
 use kcore::time::boot_time_ns;
-use raft::{Role, Rsm};
+use raft::Rsm;
 use raftmember::{App, Core, Handing, Outcome, Pending};
 use registry::{Answer, Command, State};
 
@@ -66,7 +66,6 @@ pub const TAG_PROBED: u32 = raftmember::TAG_APP + 3;
 
 pub type Log = raftmember::Log;
 pub type Member = raftmember::Member<Registry>;
-pub type Shared = raftmember::Shared<Registry>;
 pub type View = raftmember::View<Registry>;
 
 /// A host joining by an invitation: answered with its node and the hosts.
@@ -307,21 +306,9 @@ impl Registry {
     }
 
     /// A member asking whether this one is there: answered for a host of
-    /// the cluster alone.
+    /// the cluster alone (raftmember's probe).
     fn on_probe(&mut self, core: &mut Core<Registry>, m: &Message) {
-        if core.sender_node(self, m).is_none() {
-            core.note_refused();
-            return;
-        }
-        let mut data = Vec::with_capacity(17);
-        data.extend_from_slice(&core.node().to_le_bytes());
-        data.extend_from_slice(&core.rsm().node().term().to_le_bytes());
-        data.push(match core.role() {
-            Role::Leader => 2,
-            Role::Follower => 1,
-            Role::Candidate | Role::PreCandidate => 0,
-        });
-        let _ = core.mailbox().send(m.from, TAG_PROBED, m.reference, &data);
+        core.answer_probe(self, m, TAG_PROBED);
     }
 
     /// A host's join: taken from the host its invitation names, with the

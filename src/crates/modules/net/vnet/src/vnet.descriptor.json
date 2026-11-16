@@ -1,0 +1,1211 @@
+{
+ "schema": 1,
+ "provider": "vnet",
+ "title": {
+  "en": "VM networks",
+  "ru": "Сети машин"
+ },
+ "help": {
+  "en": "The cluster's networks for VMs, as this host's member of vnet has them: each network's subnet and its gateway on every host, the VMs' ports on them, the public addresses routed to the hosts, and the cluster's firewalls.",
+  "ru": "Сети кластера для машин, какими их видит участник vnet на этом хосте: подсеть каждой сети и её шлюз на каждом хосте, порты машин в них, публичные адреса, направленные на хосты, и фаерволы кластера."
+ },
+ "ui": {
+  "section": "network",
+  "order": 22,
+  "icon": "network"
+ },
+ "methods": {
+  "status": {
+   "kind": "read",
+   "title": {
+    "en": "Member",
+    "ru": "Участник"
+   },
+   "help": {
+    "en": "This host's member of vnet: its role, the leader, how far it has applied; why it did not start where it did not.",
+    "ru": "Участник vnet на этом хосте: его роль, лидер, докуда применён журнал; почему он не запустился, если не запустился."
+   }
+  },
+  "hosts": {
+   "kind": "read",
+   "title": {
+    "en": "Members",
+    "ru": "Участники"
+   }
+  },
+  "networks": {
+   "kind": "read",
+   "title": {
+    "en": "Networks",
+    "ru": "Сети"
+   }
+  },
+  "ports": {
+   "kind": "read",
+   "title": {
+    "en": "Ports",
+    "ru": "Порты"
+   }
+  },
+  "public": {
+   "kind": "read",
+   "title": {
+    "en": "Public addresses",
+    "ru": "Публичные адреса"
+   }
+  },
+  "firewalls": {
+   "kind": "read",
+   "title": {
+    "en": "Firewalls",
+    "ru": "Фаерволы"
+   }
+  },
+  "firewall": {
+   "kind": "read",
+   "title": {
+    "en": "Firewall",
+    "ru": "Фаервол"
+   },
+   "result": "firewall",
+   "params": {
+    "name": {
+     "type": "string",
+     "title": {
+      "en": "Name",
+      "ru": "Имя"
+     },
+     "required": true
+    }
+   }
+  },
+  "alerts": {
+   "kind": "read",
+   "title": {
+    "en": "What to look at",
+    "ru": "На что обратить внимание"
+   },
+   "help": {
+    "en": "What a person should look at in vnet as this host's member has it, the worst first.",
+    "ru": "На что стоит обратить внимание в vnet по данным участника этого хоста, худшее первым."
+   }
+  },
+  "init": {
+   "kind": "action",
+   "title": {
+    "en": "Make a vnet",
+    "ru": "Создать vnet"
+   },
+   "help": {
+    "en": "A vnet of this host alone, its first member; the other hosts of the cluster registry are added to it after.",
+    "ru": "vnet из одного этого хоста, его первый участник; остальные хосты реестра кластера добавляются после."
+   },
+   "params": {
+    "name": {
+     "type": "string",
+     "title": {
+      "en": "Name",
+      "ru": "Имя"
+     },
+     "required": true,
+     "help": {
+      "en": "Lowercase letters, digits and -.",
+      "ru": "Строчные буквы, цифры и -."
+     }
+    }
+   }
+  },
+  "host_add": {
+   "kind": "job",
+   "title": {
+    "en": "Add a host",
+    "ru": "Добавить хост"
+   },
+   "help": {
+    "en": "A host of the cluster registry made a member: it learns the log, then votes while fewer than five do.",
+    "ru": "Хост реестра кластера становится участником: сначала догоняет журнал, потом голосует, пока голосующих меньше пяти."
+   },
+   "params": {
+    "host": {
+     "type": "string",
+     "title": {
+      "en": "Host",
+      "ru": "Хост"
+     },
+     "required": true,
+     "choices": {
+      "provider": "cluster",
+      "method": "hosts",
+      "items": "hosts",
+      "key": "name"
+     }
+    }
+   }
+  },
+  "host_remove": {
+   "kind": "action",
+   "title": {
+    "en": "Remove a host",
+    "ru": "Убрать хост"
+   },
+   "confirm": {
+    "en": "Remove this host's member for good? It comes back only as a new member.",
+    "ru": "Убрать участника этого хоста навсегда? Вернуть его можно только новым участником."
+   },
+   "params": {
+    "host": {
+     "type": "string",
+     "title": {
+      "en": "Host",
+      "ru": "Хост"
+     },
+     "required": true
+    }
+   }
+  },
+  "host_replace": {
+   "kind": "job",
+   "title": {
+    "en": "Take a host back",
+    "ru": "Вернуть хост"
+   },
+   "help": {
+    "en": "A host that lost its state: its old member removed, and the host offered the vnet as a new one.",
+    "ru": "Хост, потерявший состояние: старый участник убирается, хосту предлагается vnet как новому."
+   },
+   "params": {
+    "host": {
+     "type": "string",
+     "title": {
+      "en": "Host",
+      "ru": "Хост"
+     },
+     "required": true
+    }
+   }
+  },
+  "network_create": {
+   "kind": "action",
+   "title": {
+    "en": "New network",
+    "ru": "Новая сеть"
+   },
+   "help": {
+    "en": "A network of the cluster's: its subnet -- a private range's, /16 to /28, apart from every other network's -- its first address the VMs' gateway on every host.",
+    "ru": "Сеть кластера: её подсеть -- из частного диапазона, от /16 до /28, не пересекающаяся с другими сетями -- первый адрес служит машинам шлюзом на каждом хосте."
+   },
+   "params": {
+    "name": {
+     "type": "string",
+     "title": {
+      "en": "Name",
+      "ru": "Имя"
+     },
+     "required": true,
+     "help": {
+      "en": "Lowercase letters, digits and -, at most 26.",
+      "ru": "Строчные буквы, цифры и -, не длиннее 26."
+     }
+    },
+    "subnet": {
+     "type": "string",
+     "title": {
+      "en": "Subnet",
+      "ru": "Подсеть"
+     },
+     "required": true,
+     "help": {
+      "en": "a.b.c.d/prefix: 10.10.0.0/24.",
+      "ru": "a.b.c.d/префикс: 10.10.0.0/24."
+     }
+    },
+    "mtu": {
+     "type": "int",
+     "title": {
+      "en": "MTU",
+      "ru": "MTU"
+     },
+     "min": 576,
+     "max": 1440,
+     "default": 1420
+    },
+    "out": {
+     "type": "bool",
+     "title": {
+      "en": "Out to the world",
+      "ru": "Выход в мир"
+     },
+     "default": true,
+     "help": {
+      "en": "Its VMs masqueraded by their own host.",
+      "ru": "Машины выходят через NAT своего хоста."
+     }
+    }
+   }
+  },
+  "network_delete": {
+   "kind": "action",
+   "title": {
+    "en": "Delete",
+    "ru": "Удалить"
+   },
+   "confirm": {
+    "en": "Delete this network? Only one no port is on can be.",
+    "ru": "Удалить сеть? Удаляется только сеть без портов."
+   },
+   "params": {
+    "name": {
+     "type": "string",
+     "title": {
+      "en": "Network",
+      "ru": "Сеть"
+     },
+     "required": true
+    }
+   }
+  },
+  "port_move": {
+   "kind": "action",
+   "title": {
+    "en": "Move",
+    "ru": "Перенести"
+   },
+   "help": {
+    "en": "The port bound to another host from now on, its generation new: the old host revokes it once it has caught up.",
+    "ru": "Порт отныне за другим хостом, с новым поколением: старый хост отзывает его, догнав журнал."
+   },
+   "params": {
+    "port": {
+     "type": "int",
+     "title": {
+      "en": "Port",
+      "ru": "Порт"
+     },
+     "min": 1,
+     "required": true
+    },
+    "host": {
+     "type": "string",
+     "title": {
+      "en": "Host",
+      "ru": "Хост"
+     },
+     "required": true,
+     "choices": {
+      "provider": "cluster",
+      "method": "hosts",
+      "items": "hosts",
+      "key": "name"
+     }
+    }
+   }
+  },
+  "port_delete": {
+   "kind": "action",
+   "title": {
+    "en": "Delete",
+    "ru": "Удалить"
+   },
+   "confirm": {
+    "en": "Delete this port? Its public address, if any, is let go of.",
+    "ru": "Удалить порт? Его публичный адрес, если есть, освобождается."
+   },
+   "params": {
+    "port": {
+     "type": "int",
+     "title": {
+      "en": "Port",
+      "ru": "Порт"
+     },
+     "min": 1,
+     "required": true
+    }
+   }
+  },
+  "port_firewall": {
+   "kind": "action",
+   "title": {
+    "en": "Change its firewall",
+    "ru": "Сменить фаервол"
+   },
+   "params": {
+    "port": {
+     "type": "int",
+     "title": {
+      "en": "Port",
+      "ru": "Порт"
+     },
+     "min": 1,
+     "required": true
+    },
+    "firewall": {
+     "type": "string",
+     "title": {
+      "en": "Firewall",
+      "ru": "Фаервол"
+     },
+     "required": true,
+     "choices": {
+      "provider": "vnet",
+      "method": "firewalls",
+      "items": "firewalls",
+      "key": "name"
+     }
+    }
+   }
+  },
+  "public_add": {
+   "kind": "action",
+   "title": {
+    "en": "New public address",
+    "ru": "Новый публичный адрес"
+   },
+   "help": {
+    "en": "An address its provider routes to a host of the cluster: one to one to the port it is put on.",
+    "ru": "Адрес, который провайдер направляет на хост кластера: один к одному на порт, на который его поставят."
+   },
+   "params": {
+    "address": {
+     "type": "string",
+     "title": {
+      "en": "Address",
+      "ru": "Адрес"
+     },
+     "required": true
+    },
+    "host": {
+     "type": "string",
+     "title": {
+      "en": "Routed to",
+      "ru": "Направлен на"
+     },
+     "required": true,
+     "choices": {
+      "provider": "cluster",
+      "method": "hosts",
+      "items": "hosts",
+      "key": "name"
+     }
+    }
+   }
+  },
+  "public_set": {
+   "kind": "action",
+   "title": {
+    "en": "Put on a port",
+    "ru": "Поставить на порт"
+   },
+   "help": {
+    "en": "On the port given, or on none where none is.",
+    "ru": "На указанный порт, или ни на какой, если порт не указан."
+   },
+   "params": {
+    "address": {
+     "type": "string",
+     "title": {
+      "en": "Address",
+      "ru": "Адрес"
+     },
+     "required": true
+    },
+    "port": {
+     "type": "int",
+     "title": {
+      "en": "Port",
+      "ru": "Порт"
+     },
+     "min": 1,
+     "choices": {
+      "provider": "vnet",
+      "method": "ports",
+      "items": "ports",
+      "key": "id"
+     }
+    }
+   }
+  },
+  "public_move": {
+   "kind": "action",
+   "title": {
+    "en": "Routed elsewhere",
+    "ru": "Направить на другой хост"
+   },
+   "help": {
+    "en": "Its provider routes it to another host now.",
+    "ru": "Провайдер теперь направляет его на другой хост."
+   },
+   "params": {
+    "address": {
+     "type": "string",
+     "title": {
+      "en": "Address",
+      "ru": "Адрес"
+     },
+     "required": true
+    },
+    "host": {
+     "type": "string",
+     "title": {
+      "en": "Routed to",
+      "ru": "Направлен на"
+     },
+     "required": true,
+     "choices": {
+      "provider": "cluster",
+      "method": "hosts",
+      "items": "hosts",
+      "key": "name"
+     }
+    }
+   }
+  },
+  "public_remove": {
+   "kind": "action",
+   "title": {
+    "en": "Remove",
+    "ru": "Убрать"
+   },
+   "confirm": {
+    "en": "Remove this public address? Only one on no port can be.",
+    "ru": "Убрать публичный адрес? Убирается только адрес не на порту."
+   },
+   "params": {
+    "address": {
+     "type": "string",
+     "title": {
+      "en": "Address",
+      "ru": "Адрес"
+     },
+     "required": true
+    }
+   }
+  },
+  "firewall_create": {
+   "kind": "action",
+   "title": {
+    "en": "New firewall",
+    "ru": "Новый фаервол"
+   },
+   "help": {
+    "en": "A firewall of the cluster's with no rule: its VMs reached by nothing and reaching everything, unless its policies say otherwise.",
+    "ru": "Фаервол кластера без правил: к его машинам не попасть ни откуда, сами они ходят куда угодно, если политики не говорят иного."
+   },
+   "params": {
+    "name": {
+     "type": "string",
+     "title": {
+      "en": "Name",
+      "ru": "Имя"
+     },
+     "required": true
+    },
+    "in": {
+     "type": "enum",
+     "default": "deny",
+     "title": {
+      "en": "What comes in",
+      "ru": "Входящее"
+     },
+     "values": {
+      "allow": {
+       "en": "allowed",
+       "ru": "разрешено"
+      },
+      "deny": {
+       "en": "denied",
+       "ru": "запрещено"
+      }
+     }
+    },
+    "out": {
+     "type": "enum",
+     "default": "allow",
+     "title": {
+      "en": "What goes out",
+      "ru": "Исходящее"
+     },
+     "values": {
+      "allow": {
+       "en": "allowed",
+       "ru": "разрешено"
+      },
+      "deny": {
+       "en": "denied",
+       "ru": "запрещено"
+      }
+     }
+    }
+   }
+  },
+  "firewall_delete": {
+   "kind": "action",
+   "title": {
+    "en": "Delete",
+    "ru": "Удалить"
+   },
+   "confirm": {
+    "en": "Delete this firewall? Only one no port has can be; default never.",
+    "ru": "Удалить фаервол? Удаляется только тот, что не стоит ни на одном порту; default -- никогда."
+   },
+   "params": {
+    "name": {
+     "type": "string",
+     "title": {
+      "en": "Name",
+      "ru": "Имя"
+     },
+     "required": true
+    }
+   }
+  },
+  "firewall_policy": {
+   "kind": "action",
+   "title": {
+    "en": "Policies",
+    "ru": "Политики"
+   },
+   "params": {
+    "name": {
+     "type": "string",
+     "title": {
+      "en": "Name",
+      "ru": "Имя"
+     },
+     "required": true
+    },
+    "in": {
+     "type": "enum",
+     "title": {
+      "en": "What comes in",
+      "ru": "Входящее"
+     },
+     "values": {
+      "allow": {
+       "en": "allowed",
+       "ru": "разрешено"
+      },
+      "deny": {
+       "en": "denied",
+       "ru": "запрещено"
+      }
+     }
+    },
+    "out": {
+     "type": "enum",
+     "title": {
+      "en": "What goes out",
+      "ru": "Исходящее"
+     },
+     "values": {
+      "allow": {
+       "en": "allowed",
+       "ru": "разрешено"
+      },
+      "deny": {
+       "en": "denied",
+       "ru": "запрещено"
+      }
+     }
+    }
+   }
+  },
+  "firewall_add": {
+   "kind": "action",
+   "title": {
+    "en": "Add a rule",
+    "ru": "Добавить правило"
+   },
+   "help": {
+    "en": "As hv's firewalls have them: allow in tcp 22 from 203.0.113.0/24; allow in from net.",
+    "ru": "Как у фаерволов hv: allow in tcp 22 from 203.0.113.0/24; allow in from net."
+   },
+   "params": {
+    "name": {
+     "type": "string",
+     "title": {
+      "en": "Firewall",
+      "ru": "Фаервол"
+     },
+     "required": true
+    },
+    "rule": {
+     "type": "string",
+     "title": {
+      "en": "Rule",
+      "ru": "Правило"
+     },
+     "required": true
+    },
+    "at": {
+     "type": "int",
+     "title": {
+      "en": "At place",
+      "ru": "На место"
+     },
+     "min": 1,
+     "max": 64
+    }
+   }
+  },
+  "firewall_remove": {
+   "kind": "action",
+   "title": {
+    "en": "Take out",
+    "ru": "Убрать"
+   },
+   "confirm": {
+    "en": "Take this rule out?",
+    "ru": "Убрать правило?"
+   },
+   "params": {
+    "name": {
+     "type": "string",
+     "title": {
+      "en": "Firewall",
+      "ru": "Фаервол"
+     },
+     "required": true
+    },
+    "n": {
+     "type": "int",
+     "title": {
+      "en": "Rule",
+      "ru": "Правило"
+     },
+     "min": 1,
+     "max": 64,
+     "required": true
+    }
+   }
+  },
+  "firewall_move": {
+   "kind": "action",
+   "title": {
+    "en": "Move",
+    "ru": "Переместить"
+   },
+   "params": {
+    "name": {
+     "type": "string",
+     "title": {
+      "en": "Firewall",
+      "ru": "Фаервол"
+     },
+     "required": true
+    },
+    "n": {
+     "type": "int",
+     "title": {
+      "en": "Rule",
+      "ru": "Правило"
+     },
+     "min": 1,
+     "max": 64,
+     "required": true
+    },
+    "to": {
+     "type": "int",
+     "title": {
+      "en": "To place",
+      "ru": "На место"
+     },
+     "min": 1,
+     "max": 64,
+     "required": true
+    }
+   }
+  },
+  "attach": {
+   "kind": "action",
+   "title": {"en": "Attach a VM's NIC", "ru": "Подключить сетевую карту машины"},
+   "help": {"en": "What hv asks as a VM on a network of the cluster's is made or started on this host: its port, read from the state the leader vouches for, made where there is none.", "ru": "Что спрашивает hv, когда машина в сети кластера создаётся или запускается на этом хосте: её порт по состоянию, за которое ручается лидер, созданный, если его нет."},
+   "params": {
+    "uuid": {"type": "string", "title": {"en": "VM's UUID", "ru": "UUID машины"}, "required": true},
+    "nic": {"type": "int", "title": {"en": "NIC", "ru": "Сетевая карта"}, "min": 0, "max": 7},
+    "network": {"type": "string", "title": {"en": "Network", "ru": "Сеть"}, "required": true},
+    "address": {"type": "ipv4", "title": {"en": "Address", "ru": "Адрес"}},
+    "firewall": {"type": "string", "title": {"en": "Firewall", "ru": "Фаервол"}},
+    "make": {"type": "bool", "title": {"en": "Make one where there is none", "ru": "Создать, если нет"}, "default": true}
+   }
+  },
+  "detach": {
+   "kind": "action",
+   "title": {"en": "Detach a VM's NIC", "ru": "Отключить сетевую карту машины"},
+   "help": {"en": "What hv asks as a VM is deleted: its port deleted, wherever it is.", "ru": "Что спрашивает hv, когда машина удаляется: её порт удаляется, где бы он ни был."},
+   "params": {
+    "uuid": {"type": "string", "title": {"en": "VM's UUID", "ru": "UUID машины"}, "required": true},
+    "nic": {"type": "int", "title": {"en": "NIC", "ru": "Сетевая карта"}, "min": 0, "max": 7}
+   }
+  },
+  "table": {
+   "kind": "read",
+   "title": {"en": "This host's table", "ru": "Таблица этого хоста"},
+   "help": {"en": "What hv keeps of the state: the hosts and where the tunnel reaches each, the networks, this host's ports and the firewalls they are judged by, the other hosts' ports, and the public addresses on ports -- or, given the instance, revision and hosts' digest of the table had, that it is the same.", "ru": "Что hv держит из состояния: хосты и где туннель достаёт каждый, сети, порты этого хоста и их фаерволы, порты других хостов и публичные адреса на портах -- или, по экземпляру, ревизии и сводке хостов имеющейся таблицы, что она та же."},
+   "params": {
+    "instance": {"type": "int", "title": {"en": "Instance", "ru": "Экземпляр"}},
+    "revision": {"type": "int", "title": {"en": "Revision", "ru": "Ревизия"}},
+    "hosts_digest": {"type": "int", "title": {"en": "Hosts' digest", "ru": "Сводка хостов"}}
+   }
+  }
+ },
+ "resources": {
+  "alerts": {
+   "title": {
+    "en": "What to look at",
+    "ru": "На что обратить внимание"
+   },
+   "list": "alerts",
+   "items": "alerts",
+   "key": "says",
+   "fields": {
+    "kind": {
+     "type": "string",
+     "title": {
+      "en": "What",
+      "ru": "Что"
+     }
+    },
+    "says": {
+     "type": "string",
+     "title": {
+      "en": "Said",
+      "ru": "Сказано"
+     }
+    }
+   },
+   "columns": [
+    "kind",
+    "says"
+   ]
+  },
+  "networks": {
+   "title": {
+    "en": "Networks",
+    "ru": "Сети"
+   },
+   "list": "networks",
+   "items": "networks",
+   "key": "name",
+   "fields": {
+    "name": {
+     "type": "string",
+     "title": {
+      "en": "Name",
+      "ru": "Имя"
+     }
+    },
+    "vni": {
+     "type": "int",
+     "title": {
+      "en": "Number",
+      "ru": "Номер"
+     }
+    },
+    "subnet": {
+     "type": "string",
+     "title": {
+      "en": "Subnet",
+      "ru": "Подсеть"
+     }
+    },
+    "gateway": {
+     "type": "ipv4",
+     "title": {
+      "en": "Gateway",
+      "ru": "Шлюз"
+     }
+    },
+    "mtu": {
+     "type": "int",
+     "title": {
+      "en": "MTU",
+      "ru": "MTU"
+     }
+    },
+    "out": {
+     "type": "bool",
+     "title": {
+      "en": "Out to the world",
+      "ru": "Выход в мир"
+     }
+    },
+    "ports": {
+     "type": "int",
+     "title": {
+      "en": "Ports",
+      "ru": "Порты"
+     }
+    },
+    "free": {
+     "type": "int",
+     "title": {
+      "en": "Addresses free",
+      "ru": "Свободных адресов"
+     }
+    }
+   },
+   "columns": [
+    "name",
+    "subnet",
+    "gateway",
+    "mtu",
+    "out",
+    "ports",
+    "free"
+   ],
+   "actions": [
+    {
+     "method": "network_delete",
+     "params": {
+      "name": "$name"
+     }
+    }
+   ]
+  },
+  "ports": {
+   "title": {
+    "en": "Ports",
+    "ru": "Порты"
+   },
+   "list": "ports",
+   "items": "ports",
+   "key": "id",
+   "fields": {
+    "id": {
+     "type": "int",
+     "title": {
+      "en": "Port",
+      "ru": "Порт"
+     }
+    },
+    "network": {
+     "type": "string",
+     "title": {
+      "en": "Network",
+      "ru": "Сеть"
+     }
+    },
+    "address": {
+     "type": "ipv4",
+     "title": {
+      "en": "Address",
+      "ru": "Адрес"
+     }
+    },
+    "host": {
+     "type": "string",
+     "title": {
+      "en": "Host",
+      "ru": "Хост"
+     }
+    },
+    "generation": {
+     "type": "int",
+     "title": {
+      "en": "Generation",
+      "ru": "Поколение"
+     }
+    },
+    "firewall": {
+     "type": "string",
+     "title": {
+      "en": "Firewall",
+      "ru": "Фаервол"
+     }
+    },
+    "vm": {
+     "type": "string",
+     "title": {
+      "en": "VM",
+      "ru": "Машина"
+     }
+    },
+    "nic": {
+     "type": "int",
+     "title": {
+      "en": "NIC",
+      "ru": "Сетевая карта"
+     }
+    },
+    "public": {
+     "type": "ipv4",
+     "title": {
+      "en": "Public address",
+      "ru": "Публичный адрес"
+     }
+    }
+   },
+   "columns": [
+    "id",
+    "network",
+    "address",
+    "host",
+    "firewall",
+    "public",
+    "vm"
+   ],
+   "actions": [
+    {
+     "method": "port_move",
+     "params": {
+      "port": "$id"
+     }
+    },
+    {
+     "method": "port_firewall",
+     "params": {
+      "port": "$id"
+     }
+    },
+    {
+     "method": "port_delete",
+     "params": {
+      "port": "$id"
+     }
+    }
+   ]
+  },
+  "public": {
+   "title": {
+    "en": "Public addresses",
+    "ru": "Публичные адреса"
+   },
+   "list": "public",
+   "items": "public",
+   "key": "address",
+   "fields": {
+    "address": {
+     "type": "ipv4",
+     "title": {
+      "en": "Address",
+      "ru": "Адрес"
+     }
+    },
+    "host": {
+     "type": "string",
+     "title": {
+      "en": "Routed to",
+      "ru": "Направлен на"
+     }
+    },
+    "port": {
+     "type": "int",
+     "title": {
+      "en": "Port",
+      "ru": "Порт"
+     }
+    }
+   },
+   "columns": [
+    "address",
+    "host",
+    "port"
+   ],
+   "actions": [
+    {
+     "method": "public_set",
+     "params": {
+      "address": "$address"
+     }
+    },
+    {
+     "method": "public_move",
+     "params": {
+      "address": "$address"
+     }
+    },
+    {
+     "method": "public_remove",
+     "params": {
+      "address": "$address"
+     }
+    }
+   ]
+  },
+  "firewalls": {
+   "title": {
+    "en": "Firewalls",
+    "ru": "Фаерволы"
+   },
+   "list": "firewalls",
+   "get": "firewall",
+   "items": "firewalls",
+   "key": "name",
+   "fields": {
+    "name": {
+     "type": "string",
+     "title": {
+      "en": "Name",
+      "ru": "Имя"
+     }
+    },
+    "in": {
+     "type": "enum",
+     "title": {
+      "en": "In",
+      "ru": "Входящее"
+     },
+     "values": {
+      "allow": {
+       "en": "allowed",
+       "ru": "разрешено"
+      },
+      "deny": {
+       "en": "denied",
+       "ru": "запрещено"
+      }
+     },
+     "tones": {
+      "allow": "warn",
+      "deny": "good"
+     }
+    },
+    "out": {
+     "type": "enum",
+     "title": {
+      "en": "Out",
+      "ru": "Исходящее"
+     },
+     "values": {
+      "allow": {
+       "en": "allowed",
+       "ru": "разрешено"
+      },
+      "deny": {
+       "en": "denied",
+       "ru": "запрещено"
+      }
+     }
+    },
+    "rules": {
+     "type": "int",
+     "title": {
+      "en": "Rules",
+      "ru": "Правила"
+     }
+    },
+    "revision": {
+     "type": "int",
+     "title": {
+      "en": "Revision",
+      "ru": "Ревизия"
+     }
+    },
+    "ports": {
+     "type": "int",
+     "title": {
+      "en": "Ports on it",
+      "ru": "Портов на нём"
+     }
+    }
+   },
+   "columns": [
+    "name",
+    "in",
+    "out",
+    "rules",
+    "ports"
+   ],
+   "actions": [
+    {
+     "method": "firewall_add",
+     "params": {
+      "name": "$name"
+     }
+    },
+    {
+     "method": "firewall_policy",
+     "params": {
+      "name": "$name"
+     }
+    },
+    {
+     "method": "firewall_delete",
+     "params": {
+      "name": "$name"
+     }
+    }
+   ]
+  },
+  "hosts": {
+   "title": {
+    "en": "Members",
+    "ru": "Участники"
+   },
+   "list": "hosts",
+   "items": "hosts",
+   "key": "host",
+   "fields": {
+    "host": {
+     "type": "string",
+     "title": {
+      "en": "Host",
+      "ru": "Хост"
+     }
+    },
+    "member": {
+     "type": "int",
+     "title": {
+      "en": "Incarnation",
+      "ru": "Воплощение"
+     }
+    },
+    "vote": {
+     "type": "enum",
+     "title": {
+      "en": "Vote",
+      "ru": "Голос"
+     },
+     "values": {
+      "voter": {
+       "en": "voter",
+       "ru": "голосует"
+      },
+      "learner": {
+       "en": "learner",
+       "ru": "учится"
+      },
+      "joining": {
+       "en": "joining",
+       "ru": "входит"
+      }
+     }
+    },
+    "leader": {
+     "type": "bool",
+     "title": {
+      "en": "Leads",
+      "ru": "Лидер"
+     }
+    },
+    "lost": {
+     "type": "bool",
+     "title": {
+      "en": "Lost its state",
+      "ru": "Потерял состояние"
+     }
+    }
+   },
+   "columns": [
+    "host",
+    "vote",
+    "leader",
+    "lost"
+   ],
+   "actions": [
+    {
+     "method": "host_replace",
+     "params": {
+      "host": "$host"
+     }
+    },
+    {
+     "method": "host_remove",
+     "params": {
+      "host": "$host"
+     }
+    }
+   ]
+  }
+ }
+}

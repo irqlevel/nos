@@ -13,6 +13,8 @@
 //!     nbs host remove <host>     on a member: <host>'s member out, for good
 //!     nbs host replace <host>    on a member: a host that lost its state, back as a new member
 //!     nbs hosts                  every member: its incarnation, its vote, the leader
+//!     nbs recover [<name>]       on the last member standing: what it does, then -- the NBS
+//!                                cluster's name given -- this host's member the one voter
 //!     nbs                        this host's member: role, term, leader, what it applied
 //!     nbs devices add <id|name> [wipe]   a device of this host's for its chunk server; wipe: whatever is
 //!                                on it -- or a device its cs found blank where it had formatted it
@@ -55,8 +57,12 @@
 //! an offer -- making the incarnation, the member file and an empty log, and
 //! starting the member, which raft then brings the log -- and answers a raft
 //! message for a member it does not have with `TAG_NO_MEMBER`, which is how a
-//! leader learns that a host's state is gone. The member is raftmember's with
-//! NBS's hooks (member.rs), a task of its own the shell hands its commands to.
+//! leader learns that a host's state is gone. The listener, the offers, the
+//! members' commands, the member's start and stop -- with the `begun` mark
+//! that keeps a member whose log is gone from starting as the one it was --
+//! and `recover` are raftmember's, as every group whose hosts are offered it
+//! has them (`offered`); the member is raftmember's with NBS's hooks
+//! (member.rs), a task of its own the shell hands its commands to.
 
 extern crate alloc;
 
@@ -72,23 +78,18 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use kcore::cmd::{Command as ShellCommand, Output};
 use kcore::error::Error;
 use kcore::mgmt::Provider;
-use kcore::ipc::{Limits, Mailbox, Message, Scope, TAG_BULK};
-use kcore::klog;
-use kcore::task::TaskHandle;
-use kcore::time::{boot_time_ns, Duration};
-use nbsmeta::{Answer, Command, State};
-use raft::{Config, LogConfig, Role, Rsm};
-use raftmember::{KFiles, Locked};
+use nbsmeta::State;
+use raft::Role;
+use raftmember::offered::{self, MemberFile, Offered, Starter};
+use raftmember::{Locked, Log, Recovered};
 
-use files::Known;
-use member::{Lost, Offer, Shared, View};
+use member::{Mds, View};
 
-const HELP: &str = "nbs [init | host | hosts | devices | cs | volume | volumes | io] - NBS's metadata service";
+const HELP: &str = "nbs [init | host | hosts | recover | devices | cs | volume | volumes | io] - NBS's metadata";
 const _: () = assert!(HELP.len() <= kcore::cmd::HELP_MAX, "`help` would cut it short");
 
 const USAGE: &str = "usage: nbs                          this host's member: incarnation, role, leader, what it applied\n\
@@ -98,6 +99,8 @@ const USAGE: &str = "usage: nbs                          this host's member: inc
                      \x20                                 until it holds the log, then a voter while fewer than five vote\n\
                      \x20      nbs host remove <host>     <host>'s member out, for good\n\
                      \x20      nbs host replace <host>    <host>, which lost its state, back as a new member\n\
+                     \x20      nbs recover [<name>]       on the last member standing: what it does, then -- the\n\
+                     \x20                                 NBS cluster's name given -- this host's member the one voter\n\
                      \x20      nbs devices add <id|name> [wipe]   a device of this host's for its chunk server: \
                      with wipe,\n\
                      \x20                                 even one with something else on it, or one its cs\n\
@@ -122,25 +125,14 @@ const USAGE: &str = "usage: nbs                          this host's member: inc
 pub(crate) const NO_MEMBER: &str = "this host is in no NBS cluster -- `nbs init <name>`, or `nbs host add <this host>` \
                                     on a member";
 
-/// How long an offer is tried for -- the connection to the host coming up
-/// first -- and how long each try waits for its answer.
-const OFFER_TOTAL_MS: u64 = 30_000;
-const OFFER_TRY_MS: u64 = 3000;
-/// How often the listener looks for the module's unload.
-const IDLE_POLL_MS: u64 = 100;
-/// How often a host is told it named a member this host's mds does not have.
-const NO_MEMBER_EVERY_NS: u64 = 5_000_000_000;
-/// How long a change applied is waited for in the member's view.
-const VIEW_WAIT_MS: u64 = 5000;
-const NS_PER_MS: u64 = 1_000_000;
 /// The leader's scrub's pace unless `scrub=` is given: a chunk every ten
 /// seconds, which reads it whole on each of its set's members (N9e).
 const SCRUB_MS: u64 = 10_000;
 
 /// The module's: its folder, the member while there is one, the listener
-/// while there is not.
+/// while there is not (raftmember's `Offered`).
 struct ModState {
-    dir: String,
+    group: Offered<Mds>,
     /// The log's bytes past its snapshot before it is compacted: `compact=`.
     compact: u64,
     /// How long a cs is silent before the leader's controller has it out
@@ -151,32 +143,38 @@ struct ModState {
     /// seconds unless given, 0 for none (N9e); and what it found.
     scrub_ms: u64,
     scrubbed: member::Scrubbed,
-    shared: Arc<Shared>,
-    lost: Lost,
-    task: Locked<Option<TaskHandle>>,
-    idle: Locked<Option<TaskHandle>>,
-    idle_stop: AtomicBool,
-    /// An `init` or an offer under way: the one at a time that may start a
-    /// member.
-    starting: AtomicBool,
     /// The volumes `nbs io` attached here for writing.
     io: Locked<io::Attachments>,
 }
 
-/// The right to start a member, held for an `init` or an offer.
-struct Starting<'a>(&'a AtomicBool);
-
-impl<'a> Starting<'a> {
-    fn take(state: &'a ModState) -> Result<Starting<'a>, String> {
-        state.starting.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| Starting(&state.starting))
-            .map_err(|_| String::from("an `nbs init` or an offer is under way"))
-    }
+/// What to do where this host's member's log is gone beside its `begun`
+/// mark: it is never that member again.
+fn lost_remedy(state: &ModState, host: &str) -> String {
+    alloc::format!("on another member, `nbs host replace {}` once here `rmmod nbs-mds`, `rm {}` and `insmod` it", host,
+                   state.group.dir)
 }
 
-impl Drop for Starting<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+impl Starter<Mds> for ModState {
+    fn offered(&self) -> &Offered<Mds> {
+        &self.group
+    }
+
+    /// The member started over its log -- `log`, where one is given, or the
+    /// folder's: made new, with this host its one voter, when `fresh` --
+    /// standing for election at once when `campaign`. The shell sees it
+    /// before this returns.
+    fn start(&self, me: MemberFile, log: Option<Log>, fresh: bool, campaign: bool) -> Result<(), String> {
+        if self.group.runner.running() {
+            return Err(String::from("the member is running already"));
+        }
+        let log = match log {
+            Some(log) => log,
+            None => raftmember::open_log(&self.group.dir, me.id, fresh, &lost_remedy(self, &me.host))?,
+        };
+        let rsm = raftmember::member_rsm::<State>(log, me.id, fresh || campaign, Some(self.compact))?;
+        let member = member::new(rsm, me, self.group.lost.clone(), &self.group.dir, self.out_after_ms, self.scrub_ms,
+                                 self.scrubbed.clone())?;
+        self.group.runner.spawn(<Mds as offered::Group>::TASK, member)
     }
 }
 
@@ -197,25 +195,8 @@ impl Drop for Nbs {
     fn drop(&mut self) {
         drop(self.provider.take());
         drop(self.cmd.take());
-        stop_idle(&self.state);
-        stop(&self.state);
+        self.state.group.shut();
     }
-}
-
-/// The member's task stopped and waited out -- taken from its lock first,
-/// and dropped off it -- and the shell shown no member.
-fn stop(state: &ModState) {
-    state.shared.stop.store(true, Ordering::Release);
-    let task = state.task.with(|t| t.take());
-    drop(task);
-    state.shared.view.with(|v| *v = None);
-}
-
-/// The listener stopped and waited out: `nbs.mds` let go of.
-fn stop_idle(state: &ModState) {
-    state.idle_stop.store(true, Ordering::Release);
-    let task = state.idle.with(|t| t.take());
-    drop(task);
 }
 
 fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn kmod::Module>> {
@@ -244,36 +225,19 @@ fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn
         }
     }
     let state = Arc::new(ModState {
-        dir: String::from(dir.unwrap_or(files::DEFAULT_DIR).trim_end_matches('/')),
+        group: Offered::new(dir.unwrap_or(files::DEFAULT_DIR)).ok_or(Error::NoMemory)?,
         compact: compact.unwrap_or(raft::rsm::SNAPSHOT_FLOOR),
         out_after_ms: out_after.map_or(nbsmeta::repair::OUT_AFTER_MS, |s| s * 1000),
         scrub_ms: scrub.map_or(SCRUB_MS, |s| s * 1000),
         scrubbed: Arc::new(Locked::new(member::Scrubs::default()).ok_or(Error::NoMemory)?),
-        shared: Arc::new(Shared::new().ok_or(Error::NoMemory)?),
-        lost: Arc::new(Locked::new(BTreeMap::new()).ok_or(Error::NoMemory)?),
-        task: Locked::new(None).ok_or(Error::NoMemory)?,
-        idle: Locked::new(None).ok_or(Error::NoMemory)?,
-        idle_stop: AtomicBool::new(false),
-        starting: AtomicBool::new(false),
         io: Locked::new(BTreeMap::new()).ok_or(Error::NoMemory)?,
     });
     /* A member already: started over its log. None: the listener, for an
-       offer. A member file that cannot be read: neither -- the host is said
-       to be broken rather than offered the cluster as somebody new */
-    match files::read_member(&state.dir) {
-        Ok(Some(m)) => {
-            if let Err(why) = start(&state, m, false) {
-                let _ = writeln!(out, "nbs: {}", why);
-            }
-        }
-        Ok(None) => {
-            if let Err(why) = start_idle(&state) {
-                let _ = writeln!(out, "nbs: {}", why);
-            }
-        }
-        Err(why) => {
-            let _ = writeln!(out, "nbs: {} -- this host takes no offer until it is put right", why);
-        }
+       offer. A member file that cannot be read, or a member that does not
+       start: neither -- the host is said to be broken rather than offered
+       the cluster as somebody new */
+    if let Err(why) = offered::load(&state) {
+        let _ = writeln!(out, "nbs: {}", why);
     }
     let st = state.clone();
     let cmd = ShellCommand::register("nbs", HELP, move |args, out| {
@@ -287,296 +251,70 @@ fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn
 
 kmod::module!(name: "nbs-mds", init_with_params: init);
 
-/// The member started over its log: made new, with this host its one
-/// voter, when `fresh`. The shell sees it before this returns.
-fn start(state: &ModState, me: files::Member, fresh: bool) -> Result<(), String> {
-    if state.task.with(|t| t.is_some()) {
-        return Err(String::from("the member is running already"));
-    }
-    let files = KFiles::new(&state.dir, "raft")?;
-    let log = if fresh {
-        raft::DiskLog::bootstrap(files, LogConfig::default(), &[me.id], &[])
-    } else {
-        raft::DiskLog::open(files, LogConfig::default())
-    }
-    .map_err(|e| alloc::format!("the log in {}/raft: {:?}", state.dir, e))?;
-    let mut cfg = Config::new(me.id);
-    cfg.seed = kcore::random::random_u64().unwrap_or(me.id);
-    cfg.max_snapshot_bytes = raftmember::snapshot_limit();
-    let nonce = kcore::random::random_u64().ok_or_else(|| String::from("no randomness for the member's start"))?;
-    let mut rsm = Rsm::new(cfg, log, State::new(), nonce).map_err(|e| alloc::format!("the member: {:?}", e))?;
-    rsm.set_snapshot_floor(state.compact);
-    raftmember::catch_up(&mut rsm).map_err(|e| alloc::format!("the member: {}", e))?;
-    if fresh {
-        /* Its group's one voter: leading at once rather than at a timeout */
-        let _ = rsm.campaign();
-    }
-    let member = member::new(rsm, me, state.lost.clone(), &state.dir, state.out_after_ms, state.scrub_ms,
-                             state.scrubbed.clone())?;
-    state.shared.stop.store(false, Ordering::Release);
-    /* Shown before the task's first turn, so that a command right after
-       this one finds the member */
-    state.shared.view.with(|v| *v = Some(member.view(None)));
-    let Some(task) = kcore::task::spawn_with("nbs/mds", (state.shared.clone(), member),
-                                             raftmember::run::<member::Mds>) else {
-        state.shared.view.with(|v| *v = None);
-        return Err(String::from("could not start the member's task"));
-    };
-    state.task.with(|t| *t = Some(task));
-    Ok(())
-}
-
-/* ---- while this host is in no cluster: the listener ---- */
-
-fn start_idle(state: &Arc<ModState>) -> Result<(), String> {
-    state.idle_stop.store(false, Ordering::Release);
-    let mb = Mailbox::new(Limits { messages: 256, bytes: 1 << 20 }).map_err(|e| alloc::format!("no mailbox: {}", e.name()))?;
-    mb.register(member::NAME, Scope::Cluster).map_err(|e| alloc::format!("{} not named: {}", member::NAME, e.name()))?;
-    let Some(task) = kcore::task::spawn_with("nbs/idle", (state.clone(), mb), idle_run) else {
-        return Err(String::from("could not start the listener's task"));
-    };
-    state.idle.with(|t| *t = Some(task));
-    Ok(())
-}
-
-/// The listener: an offer taken, and the member started -- or until the
-/// module goes.
-fn idle_run((state, mb): (Arc<ModState>, Mailbox)) {
-    let mut told: BTreeMap<String, u64> = BTreeMap::new();
-    while !state.idle_stop.load(Ordering::Acquire) {
-        let Some(m) = mb.recv(Duration::from_millis(IDLE_POLL_MS)) else { continue };
-        match m.tag & !TAG_BULK {
-            member::TAG_OFFER => {
-                if let Some(me) = take_offer(&state, &mb, &m) {
-                    /* `nbs.mds` let go of, for the member to take */
-                    drop(mb);
-                    if let Err(why) = start(&state, me, false) {
-                        klog!(0, "nbs: the offer was taken and the member did not start: {} -- `rmmod nbs-mds` and \
-                                  `insmod` start it again", why);
-                    }
-                    return;
-                }
-            }
-            raftmember::TAG_RAFT => no_member(&mb, &m, &mut told),
-            nbswire::TAG_QUERY => no_mds(&mb, &m),
-            _ => {}
-        }
-    }
-}
-
-/// A raft message to a member this host does not have -- it lost its state,
-/// or never was it -- answered so, at most every few seconds a host.
-fn no_member(mb: &Mailbox, m: &Message, told: &mut BTreeMap<String, u64>) {
-    let Some(host) = kcore::ipc::peer_name(m.from) else { return };
-    if m.data.len() < raftmember::GROUP_BYTES {
-        return;
-    }
-    let mut cluster = [0u8; 16];
-    cluster.copy_from_slice(&m.data[..raftmember::GROUP_BYTES]);
-    let Ok(rm) = raft::wire::decode(&m.data[raftmember::GROUP_BYTES..]) else { return };
-    let now = boot_time_ns();
-    if told.get(&host).is_some_and(|&at| now < at + NO_MEMBER_EVERY_NS) {
-        return;
-    }
-    if told.len() >= nbsmeta::MEMBERS_MAX && !told.contains_key(&host) {
-        told.clear();
-    }
-    told.insert(host, now);
-    let _ = mb.send(m.from, member::TAG_NO_MEMBER, 0, &member::encode_id(&cluster, rm.to));
-}
-
-/// A question of this host's cs, while there is no member to answer it:
-/// answered so, rather than left to time out.
-fn no_mds(mb: &Mailbox, m: &Message) {
-    if m.from.host() != 0 {
-        return;
-    }
-    let Some(q) = nbswire::Query::decode(&m.data) else { return };
-    let told = nbswire::Told::Refused(nbswire::Refusal::NoMds);
-    let _ = mb.send(m.from, nbswire::TAG_TOLD, 0, &nbswire::Answered { id: q.id, told }.encode());
-}
-
-/// An offer taken, where it can be: this host's incarnation made, its
-/// member file written, its folder's log cleared -- the member to start.
-/// Answered either way.
-fn take_offer(state: &ModState, mb: &Mailbox, m: &Message) -> Option<files::Member> {
-    let decline = |why: &str| {
-        let _ = mb.send(m.from, member::TAG_DECLINED, m.reference, why.as_bytes());
-    };
-    let Some(o) = Offer::decode(&m.data) else { return None };
-    let Ok(_one) = Starting::take(state) else {
-        decline("an `nbs init` is under way on this host");
-        return None;
-    };
-    let id = match raftmember::ipcnet::identity() {
-        Ok(id) => id,
-        Err(why) => {
-            decline(&alloc::format!("this host does not know who it is: {}", why));
-            return None;
-        }
-    };
-    /* The cluster has this host as a member already: it lost its state, and
-       is taken back as a new member alone -- the old one removed first */
-    if let Some(old) = o.members.iter().find(|k| k.host == id.name) {
-        decline(&alloc::format!("{}'s mds has no state, and the NBS cluster has it as member {} -- `nbs host replace \
-                                 {}` takes it back as a new member", id.name, old.id, id.name));
-        return None;
-    }
-    let mut me = files::Member { id: 0, cluster: o.cluster, host: id.name.clone(), name: o.name.clone(),
-                                 known: o.members.clone() };
-    /* An incarnation no member of the offer has */
-    while me.id == 0 || o.members.iter().any(|k| k.id == me.id) {
-        match kcore::random::random_u64() {
-            Some(r) => me.id = r,
-            None => {
-                decline("no randomness for an incarnation");
-                return None;
-            }
-        }
-    }
-    let made = files::clear_log(&state.dir).and_then(|()| files::create_member(&state.dir, &me));
-    if let Err(why) = made {
-        decline(&alloc::format!("{} could not take the offer: {}", id.name, why));
-        return None;
-    }
-    klog!(0, "nbs: {} offered NBS cluster {}: member {} -- the log follows from the leader", id.name, o.name, me.id);
-    let _ = mb.send(m.from, member::TAG_ACCEPTED, m.reference, &member::encode_id(&me.cluster, me.id));
-    Some(me)
-}
-
 /* ---- the shell ---- */
 
 pub(crate) fn view(state: &ModState) -> Option<View> {
-    state.shared.view()
+    state.group.view()
 }
 
 pub(crate) fn member_view(state: &ModState) -> Result<View, String> {
-    view(state).filter(|v| v.stopped.is_none()).ok_or_else(|| String::from(NO_MEMBER))
-}
-
-/// `cmd`, as the metadata answers it -- asked again while the member cannot
-/// take it yet.
-fn ask(state: &ModState, cmd: &Command) -> Result<u64, String> {
-    match raftmember::ask(&state.shared, cmd, NO_MEMBER)? {
-        Answer::Done { member } => Ok(member),
-        Answer::Refused(why) => Err(String::from(why.says())),
-        other => Err(alloc::format!("answered {:?}", other)),
-    }
+    state.group.member_view(NO_MEMBER)
 }
 
 /// This member's view once its log has the cluster: a member just added
 /// holds none until raft has brought it the log, which it is given a few
 /// seconds for.
 pub(crate) fn caught_up(state: &ModState) -> Result<View, String> {
-    let end = boot_time_ns() + VIEW_WAIT_MS * NS_PER_MS;
-    loop {
-        let v = member_view(state)?;
-        if v.state.cluster().is_some() {
-            return Ok(v);
-        }
-        if boot_time_ns() >= end {
-            return Err(String::from("no NBS cluster yet -- this member's log is behind: ask again in a moment"));
-        }
-        kcore::task::sleep_ms(50);
-    }
-}
-
-/// `host` offered the cluster: the incarnation its mds is -- made now, or
-/// the one it was already -- asked again until its connection is up and it
-/// answers, or `stop` says to give up (a provider's job told to: its
-/// module going, a cancel).
-fn offer(v: &View, host: &str, stop: &dyn Fn() -> bool) -> Result<u64, String> {
-    let c = v.state.cluster().ok_or_else(|| String::from("no NBS cluster yet -- this member's log is behind"))?;
-    let o = Offer {
-        cluster: c.id,
-        name: c.name.clone(),
-        members: v.state.members().iter().map(|m| Known { host: m.host.clone(), id: m.id }).collect(),
-    };
-    let mb = Mailbox::new(Limits { messages: 8, bytes: 16 * 1024 }).map_err(|e| alloc::format!("no mailbox: {}", e.name()))?;
-    let to = alloc::format!("{}@{}", member::NAME, host);
-    let data = o.encode();
-    let end = boot_time_ns() + OFFER_TOTAL_MS * NS_PER_MS;
-    let mut last = alloc::format!("no answer from {}", host);
-    while boot_time_ns() < end {
-        if stop() {
-            return Err(alloc::format!("the offer to {} stopped: {}", host, last));
-        }
-        if let Err(e) = mb.send_to(&to, member::TAG_OFFER, 0, &data) {
-            last = alloc::format!("{} out of reach: {} -- is it a host of the cluster registry, with nbs-mds loaded?",
-                                  host, e.name());
-            kcore::task::sleep_ms(1000);
-            continue;
-        }
-        let until = boot_time_ns() + OFFER_TRY_MS * NS_PER_MS;
-        while boot_time_ns() < until {
-            let Some(m) = mb.recv(Duration::from_millis(250)) else { continue };
-            /* From the host offered, and no other */
-            if kcore::ipc::peer_name(m.from).as_deref() != Some(host) {
-                continue;
-            }
-            match m.tag {
-                member::TAG_ACCEPTED => {
-                    let (cluster, id) = member::decode_id(&m.data)
-                        .ok_or_else(|| alloc::format!("{} accepted in no form an acceptance has", host))?;
-                    if cluster != c.id {
-                        return Err(alloc::format!("{} accepted as a member of another cluster", host));
-                    }
-                    return Ok(id);
-                }
-                member::TAG_DECLINED => return Err(String::from_utf8_lossy(&m.data).into_owned()),
-                _ => {}
-            }
-        }
-        last = alloc::format!("no answer from {} yet", host);
-    }
-    Err(last)
+    state.group.caught_up(NO_MEMBER)
 }
 
 /// `host` made a member: offered the cluster, then added -- `nbs host add`
 /// and the provider's `host_add`. Its incarnation.
 pub(crate) fn op_add(state: &ModState, host: &str, stop: &dyn Fn() -> bool) -> Result<u64, String> {
-    let v = caught_up(state)?;
-    if !nbsmeta::valid_name(host) {
-        return Err(alloc::format!("\"{}\" is not a host's name", host));
-    }
-    let id = offer(&v, host, stop)?;
-    ask(state, &Command::Add { host: String::from(host), member: id })
+    state.group.add(host, stop, NO_MEMBER)
 }
 
 pub(crate) fn op_remove(state: &ModState, host: &str) -> Result<u64, String> {
-    member_view(state)?;
-    ask(state, &Command::Remove { host: String::from(host) })
+    state.group.remove(host, NO_MEMBER)
 }
 
 /// A host that lost its state taken back: its old member removed -- for
 /// good, its incarnation never taken again -- and the host offered the
 /// cluster as a new one.
 pub(crate) fn op_replace(state: &ModState, host: &str, stop: &dyn Fn() -> bool) -> Result<(u64, u64), String> {
-    let v = caught_up(state)?;
-    let old = v.state.member(host).map(|m| m.id);
-    let removed = match old {
-        Some(_) => op_remove(state, host)?,
-        None => return Err(alloc::format!("{} is no member -- `nbs host add {}`", host, host)),
-    };
-    /* The removal in the member's view before the offer is made of it: an
-       offer that named the host a member still would be declined there */
-    let end = boot_time_ns() + VIEW_WAIT_MS * NS_PER_MS;
-    let mut v = member_view(state)?;
-    while v.state.member(host).is_some() && boot_time_ns() < end {
-        kcore::task::sleep_ms(20);
-        v = member_view(state)?;
+    state.group.replace(host, stop, NO_MEMBER)
+}
+
+/// The last member standing made the NBS cluster's one voter: refused while
+/// it follows a leader or any other voter answers; said first, done once
+/// the cluster's name is given (raftmember's `recover`, as every group's).
+/// Unsafe by design -- what the lost members had committed and this one had
+/// not is gone: a volume made, an attach, a snapshot -- so they are removed
+/// for good, each back only as a new member once its folder is gone.
+fn recover(state: &Arc<ModState>, confirm: Option<&str>, out: &mut Output) -> Result<(), String> {
+    let host = raftmember::ipcnet::identity().map(|id| id.name).unwrap_or_else(|_| String::from("<this host>"));
+    let (r, done) = offered::recover(state, confirm, NO_MEMBER, &lost_remedy(state, &host))?;
+    let names: Vec<&str> = r.others.iter().map(|(n, _)| n.as_str()).collect();
+    let none_or = |list: &[&str]| if list.is_empty() { String::from("none") } else { list.join(", ") };
+    match done {
+        Recovered::Asked => {
+            let _ = writeln!(out, "nbs: recover makes {}'s member ({}) the one voter of NBS cluster {}, and removes \
+                                   every other member for good -- each back only as a new member, by `nbs host add` \
+                                   once its folder is gone; whatever they had committed that {} had not is gone: a \
+                                   volume made, an attach, a snapshot. No other voter answers. To go ahead: nbs \
+                                   recover {}", r.me.0, r.me.1, r.group, r.me.0, r.group);
+            let _ = writeln!(out, "nbs: the members removed: {}", none_or(&names));
+        }
+        Recovered::Done { removed, kept } => {
+            for (host, why) in &kept {
+                let _ = writeln!(out, "nbs: {}'s member not removed: {} -- `nbs host remove {}` again", host, why, host);
+            }
+            let removed: Vec<&str> = removed.iter().map(|n| n.as_str()).collect();
+            let _ = writeln!(out, "nbs: {}'s member is NBS cluster {}'s one voter now; removed for good: {}", r.me.0,
+                             r.group, none_or(&removed));
+        }
     }
-    let id = offer(&v, host, stop).map_err(|why| {
-        alloc::format!("{}'s old member {} is removed, and the offer of a new one failed: {} -- `nbs host add {}` \
-                        once it answers", host, removed, why, host)
-    })?;
-    if id == removed {
-        return Err(alloc::format!("{}'s mds is still member {}, the one removed: it did not lose its state -- \
-                                   `rmmod nbs-mds`, `rm {}` and `insmod` it there, then `nbs host add {}`", host, id,
-                                  files::DEFAULT_DIR, host));
-    }
-    let id = ask(state, &Command::Add { host: String::from(host), member: id })?;
-    Ok((removed, id))
+    Ok(())
 }
 
 fn run(state: &Arc<ModState>, args: &str, out: &mut Output) -> Result<(), String> {
@@ -601,6 +339,8 @@ fn run(state: &Arc<ModState>, args: &str, out: &mut Output) -> Result<(), String
             let _ = writeln!(out, "nbs: {}'s member {} removed, and {} is member {} now", host, old, host, new);
             Ok(())
         }
+        ["recover"] => recover(state, None, out),
+        ["recover", name] => recover(state, Some(name), out),
         ["devices", "add", word, rest @ ..] => {
             let wipe = match rest {
                 [] => false,
@@ -706,46 +446,8 @@ pub(crate) struct Made {
 /// An NBS cluster named `name` made of this host alone -- `nbs init` and the
 /// provider's `init`: undone where it does not finish, for an init again.
 pub(crate) fn op_init(state: &Arc<ModState>, name: &str) -> Result<Made, String> {
-    if !nbsmeta::valid_name(name) {
-        return Err(alloc::format!("\"{}\" is not a cluster's name: lowercase letters, digits and -", name));
-    }
-    let _starting = Starting::take(state)?;
-    if files::read_member(&state.dir)?.is_some() || view(state).is_some() {
-        return Err(String::from("this host is a member of an NBS cluster already"));
-    }
-    let id = raftmember::ipcnet::identity()?;
-    let mut cluster = [0u8; 16];
-    let member = kcore::random::random_u64().filter(|&m| m != 0);
-    let (Some(member), true) = (member, kcore::random::fill_random(&mut cluster)) else {
-        return Err(String::from("no randomness for the cluster's id"));
-    };
-    /* `nbs.mds` taken from the listener, for the member */
-    stop_idle(state);
-    let undo = |why: String| -> String {
-        stop(state);
-        let left = files::remove_member(&state.dir).and_then(|()| files::clear_log(&state.dir)).err();
-        let back = start_idle(state).err();
-        match (left, back) {
-            (None, None) => why,
-            (left, back) => alloc::format!("{} -- and undoing it: {}", why,
-                                           [left, back].into_iter().flatten().collect::<Vec<_>>().join("; ")),
-        }
-    };
-    /* What an init or an offer that did not finish left */
-    if let Err(why) = files::clear_log(&state.dir) {
-        return Err(undo(why));
-    }
-    let me = files::Member { id: member, cluster, host: id.name.clone(), name: String::from(name), known: Vec::new() };
-    if let Err(why) = start(state, me.clone(), true) {
-        return Err(undo(why));
-    }
-    /* The member file last: the mark that this host is a member */
-    let made = ask(state, &Command::Init { cluster, name: String::from(name), host: id.name.clone(), member })
-        .and_then(|_| files::create_member(&state.dir, &me));
-    match made {
-        Ok(()) => Ok(Made { cluster, host: id.name, member }),
-        Err(why) => Err(undo(why)),
-    }
+    let made = offered::init(state, name, NO_MEMBER)?;
+    Ok(Made { cluster: made.group, host: made.host, member: made.member })
 }
 
 fn role_name(r: Role) -> &'static str {
@@ -758,7 +460,7 @@ fn role_name(r: Role) -> &'static str {
 
 fn status(state: &ModState, out: &mut Output) -> Result<(), String> {
     let Some(v) = view(state) else {
-        let _ = writeln!(out, "nbs: {}", NO_MEMBER);
+        let _ = writeln!(out, "nbs: {}", state.group.runner.no_member(NO_MEMBER));
         return Ok(());
     };
     if let Some(why) = &v.stopped {
@@ -766,7 +468,7 @@ fn status(state: &ModState, out: &mut Output) -> Result<(), String> {
     }
     if v.state.cluster().is_some() && v.state.member_of_id(v.node).is_none() {
         let _ = writeln!(out, "nbs: this host's member ({}) is removed from the NBS cluster -- `rmmod nbs-mds`, \
-                               `rm {}` and `insmod` it, then `nbs host add` it again", v.node, state.dir);
+                               `rm {}` and `insmod` it, then `nbs host add` it again", v.node, state.group.dir);
     }
     let (name, id) = v.state.cluster().map_or((String::from("(no state yet)"), String::new()),
                                               |c| (c.name.clone(), alloc::format!(" ({})", codec::hex(&c.id))));
@@ -825,7 +527,7 @@ fn status(state: &ModState, out: &mut Output) -> Result<(), String> {
             let _ = writeln!(out, "nbs: no digest of the state yet -- one every {} entries", nbsmeta::CHECK_EVERY);
         }
     }
-    let lost: Vec<(String, u64)> = state.lost.with(|l| l.iter().map(|(h, &(i, _))| (h.clone(), i)).collect());
+    let lost: Vec<(String, u64)> = state.group.lost.with(|l| l.iter().map(|(h, &(i, _))| (h.clone(), i)).collect());
     for (host, id) in lost {
         let _ = writeln!(out, "nbs: {} says its mds has no member {}: its state is gone -- `nbs host replace {}`",
                          host, id, host);
@@ -835,7 +537,7 @@ fn status(state: &ModState, out: &mut Output) -> Result<(), String> {
 
 fn hosts(state: &ModState, out: &mut Output) -> Result<(), String> {
     let v = member_view(state)?;
-    let lost: Vec<String> = state.lost.with(|l| l.keys().cloned().collect());
+    let lost: Vec<String> = state.group.lost.with(|l| l.keys().cloned().collect());
     for m in v.state.members() {
         let vote = if v.membership.voters.contains(&m.id) {
             "voter"

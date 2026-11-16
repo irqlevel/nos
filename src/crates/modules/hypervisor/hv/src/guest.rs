@@ -107,6 +107,12 @@ pub struct Spec {
     pub network: Option<String>,
     /// `forward=`: nos's ports relayed to the guest's, once it runs.
     pub forwards: Vec<(u16, u16)>,
+    /// `firewall=`: the firewall its NIC is judged by (`crate::firewalls`);
+    /// `default` without.
+    pub firewall: Option<String>,
+    /// `public=`: the public address mapped one to one to it, once it has a
+    /// port (`Switch::map_public`).
+    pub public: Option<u32>,
     pub nic: Option<NicSpec>,
     /// Where its CPUs sit, as their CPUID tells them: what its placement
     /// made of them (`hv::place::Placement::shape`), once it has one --
@@ -124,6 +130,8 @@ pub struct Spec {
 pub struct NicSpec {
     pub port: usize,
     pub switch: Arc<crate::net::Switch>,
+    /// The MTU its NIC tells the guest: a cluster network's; 0 on a host's.
+    pub mtu: u16,
 }
 
 /// `\n` in a word for a newline, so that a line to type fits one word.
@@ -184,6 +192,18 @@ pub fn words(args: &str, usage: &str) -> Result<Options, String> {
                                            and -, at most {}", crate::config::NETWORK_NAME_MAX));
             }
             o.network = Some(String::from(v));
+        } else if let Some(v) = word.strip_prefix("firewall=") {
+            if !firewall::valid_name(v) {
+                return Err(alloc::format!("firewall= wants a name -- a letter or a digit, then letters, digits, . _ \
+                                           and -, at most {}", firewall::NAME_MAX));
+            }
+            o.firewall = Some(String::from(v));
+        } else if let Some(v) = word.strip_prefix("address=") {
+            o.address = Some(crate::config::public(v)
+                .ok_or_else(|| String::from("address= wants an address a host may have -- a.b.c.d"))?);
+        } else if let Some(v) = word.strip_prefix("public=") {
+            o.public = Some(crate::config::public(v)
+                .ok_or_else(|| String::from("public= wants an address a host may have -- a.b.c.d"))?);
         } else if let Some(v) = word.strip_prefix("port=") {
             o.port = Some(v.parse().map_err(|_| String::from("port= wants the number of a port of the switch"))?);
         } else if let Some(v) = word.strip_prefix("secs=") {
@@ -233,6 +253,10 @@ pub fn words(args: &str, usage: &str) -> Result<Options, String> {
 /// The guest `o` describes: what it leaves out given its default, and the
 /// whole of it checked -- for words and for a vm.toml alike.
 pub fn spec(o: Options) -> Result<Spec, String> {
+    if o.address.is_some() {
+        return Err(String::from("address= is hv create's, on a network of the cluster's: its port keeps the address \
+                                 it was made at"));
+    }
     let mem_mib = o.mem_mib.unwrap_or(DEFAULT_MEM_MIB);
     if !(MIN_MEM_MIB..=MAX_MEM_MIB).contains(&mem_mib) {
         return Err(alloc::format!("mem= must be {}..{} MiB", MIN_MEM_MIB, MAX_MEM_MIB));
@@ -268,6 +292,12 @@ pub fn spec(o: Options) -> Result<Spec, String> {
     if o.network.is_some() && !o.net {
         return Err(String::from("network= is a net guest's -- net too"));
     }
+    if o.firewall.is_some() && !o.net {
+        return Err(String::from("firewall= is a net guest's -- net too"));
+    }
+    if o.public.is_some() && !o.net {
+        return Err(String::from("public= is a net guest's -- net too"));
+    }
     if o.forwards.len() > crate::forward::MAX_FORWARDS {
         return Err(alloc::format!("at most {} forwards", crate::forward::MAX_FORWARDS));
     }
@@ -299,6 +329,8 @@ pub fn spec(o: Options) -> Result<Spec, String> {
         port,
         network: o.network,
         forwards: o.forwards,
+        firewall: o.firewall,
+        public: o.public,
         nic: None,
         shape: Shape::cores(cpus),
         uuid: o.uuid,
@@ -561,7 +593,7 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
     /* Its devices before its furniture: the ACPI tables `load` lays out
      * describe the bus as it is then. */
     if let Some(nic) = &spec.nic {
-        guest.add_nic(Box::new(nic.switch.backend(nic.port)), crate::net::port_mac(nic.port))
+        guest.add_nic_with(Box::new(nic.switch.backend(nic.port)), nic.switch.mac_of(nic.port), nic.mtu)
             .map_err(|e| alloc::format!("the NIC: {}", e))?;
     }
     for (i, ((path, ro), opened)) in spec.disks.iter().zip(disks).enumerate() {
