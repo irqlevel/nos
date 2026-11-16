@@ -803,6 +803,85 @@ pub mod tcp {
 /// IPv6's header, and the chain of extension headers after it (RFC 8200).
 /// Nothing of nos's speaks it; the guests' switch reads it to tell whose a
 /// packet is, and answers one kind of it (`icmpv6`).
+/* ---- a flow, as a box in the middle keeps it ---- */
+
+/// What NAT and a VM's firewall keep of a flow between its packets: what its
+/// TCP connection has shown of itself -- answered, closing, reset -- and
+/// from that, how long the flow outlives its last packet. One copy, which
+/// both read: the two once had a constant each of every time.
+pub mod flow {
+    use super::{tcp, IP_PROTO_TCP, IP_PROTO_UDP};
+
+    /// The end that did not begin the connection has sent something.
+    pub const SEEN_ANSWER: u8 = 1 << 0;
+    /// Either end has sent a FIN.
+    pub const SEEN_FIN: u8 = 1 << 1;
+    /// Either end has sent a reset.
+    pub const SEEN_RST: u8 = 1 << 2;
+
+    const NS_PER_SEC: u64 = 1_000_000_000;
+
+    /// How long a flow outlives its last packet, by what it is.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Lifetimes {
+        /// A TCP connection that has been answered and is not closing.
+        pub tcp_established_ns: u64,
+        /// One not answered yet, or closing.
+        pub tcp_transitory_ns: u64,
+        /// One reset.
+        pub tcp_reset_ns: u64,
+        pub udp_ns: u64,
+        /// ICMP's, and any other protocol's.
+        pub other_ns: u64,
+    }
+
+    /// NAT's: RFC 5382's and 4787's least -- two hours and four minutes for a
+    /// connection that has been answered, four minutes before that and after
+    /// a FIN, ten seconds after a reset; five minutes for UDP, one for an
+    /// echo. Its mappings are its ports, of which it has 4096.
+    pub const NAT: Lifetimes = Lifetimes {
+        tcp_established_ns: 7440 * NS_PER_SEC,
+        tcp_transitory_ns: 240 * NS_PER_SEC,
+        tcp_reset_ns: 10 * NS_PER_SEC,
+        udp_ns: 300 * NS_PER_SEC,
+        other_ns: 60 * NS_PER_SEC,
+    };
+
+    /// What `seen` becomes with a TCP segment of `flags`, from the end that
+    /// answers (`answer`) or the one that began. A SYN from the end that
+    /// began starts the connection again -- on the flow the last one left --
+    /// and its times are a new connection's.
+    #[inline]
+    pub fn tcp(seen: u8, flags: u8, answer: bool) -> u8 {
+        let starts = flags & (tcp::SYN | tcp::ACK_FLAG) == tcp::SYN;
+        let mut seen = if starts && !answer { 0 } else { seen };
+        if answer {
+            seen |= SEEN_ANSWER;
+        }
+        if flags & tcp::FIN != 0 {
+            seen |= SEEN_FIN;
+        }
+        if flags & tcp::RST != 0 {
+            seen |= SEEN_RST;
+        }
+        seen
+    }
+
+    /// How long a flow of `proto` that has shown `seen` outlives its last
+    /// packet.
+    #[inline]
+    pub fn lifetime(proto: u8, seen: u8, times: &Lifetimes) -> u64 {
+        match proto {
+            IP_PROTO_TCP if seen & SEEN_RST != 0 => times.tcp_reset_ns,
+            IP_PROTO_TCP if seen & SEEN_FIN != 0 => times.tcp_transitory_ns,
+            IP_PROTO_TCP if seen & SEEN_ANSWER != 0 => times.tcp_established_ns,
+            IP_PROTO_TCP => times.tcp_transitory_ns,
+            IP_PROTO_UDP => times.udp_ns,
+            _ => times.other_ns,
+        }
+    }
+}
+
 pub mod ipv6 {
     use super::{be16, IPV6_HDR_LEN};
 

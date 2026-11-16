@@ -16,6 +16,9 @@ edition = "2021"
 raft = { path = "../../cluster/raft" }
 ipcwire = { path = "../../ipc/ipcwire" }
 codec = { path = "../../codec" }
-# The state's digest, which every member holds its own to: on the software
-# backend the kernel builds the RustCrypto crates with.
-sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+# The cluster, its members and those removed: the rules every group of
+# hosts offered it keeps them by.
+members = { path = "../../cluster/members" }
+# The state's digest, which every member holds its own to, and the
+# snapshot read as a stream: what every group's state machine has.
+rsmkit = { path = "../../cluster/rsmkit" }

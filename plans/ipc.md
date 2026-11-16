@@ -611,8 +611,11 @@ the user's word.
 ## Later: VM networks across hosts
 
 Asked 2026-11-05: VMs on different hosts on one private network, some of
-them with a public address. That is a task of its own, after these plans.
-What it will stand on, and what is kept ready for it now:
+them with a public address. That is a task of its own, after these plans --
+designed since, in [vnet.md](vnet.md) (2026-11-15), which says where it
+leaves what is sketched here: the packet and not the frame in a datagram,
+each host giving the key to seal to it by, VLANs and a device's MTU not
+first. What it will stand on, and what is kept ready for it now:
 
 - **Its packets do not go over ipc.** A guest's packets inside ipc's TCP
   would be TCP inside TCP: a loss on the link between hosts stalls every

@@ -67,8 +67,9 @@ pub const LABELS_MAX: usize = 8;
 pub const LABEL_MAX: usize = 32;
 /// The cluster's name: a host's name's rule.
 pub const CLUSTER_NAME_MAX: usize = ipcwire::HOST_MAX;
-/// Hosts that vote in the registry's group: the rest are learners.
-pub const VOTERS_MAX: usize = 5;
+/// Hosts that vote in the registry's group: the rest are learners --
+/// the rule every group of hosts votes by (`members`).
+pub use members::VOTERS_MAX;
 /// The most a snapshot of the state may be: a state at its limits is a
 /// fraction of it.
 pub const SNAPSHOT_MAX: u64 = 256 * 1024;
@@ -295,12 +296,12 @@ impl State {
     /// The nodes that vote in the registry's group: the first `VOTERS_MAX`
     /// hosts to join.
     pub fn voters(&self) -> Vec<u64> {
-        self.hosts.iter().take(VOTERS_MAX).map(|h| h.node).collect()
+        members::voters(self.hosts.iter().map(|h| h.node))
     }
 
     /// The nodes that learn: every host past the voters.
     pub fn learners(&self) -> Vec<u64> {
-        self.hosts.iter().skip(VOTERS_MAX).map(|h| h.node).collect()
+        members::learners(self.hosts.iter().map(|h| h.node))
     }
 
     /// Host `me`'s peers: every other host, by its `Ipc` address and keys,

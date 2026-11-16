@@ -439,6 +439,23 @@ pub fn create(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
     };
     let folder = Folder { name: String::from(name), path };
     let mut given = given;
+    /* `address=` is the port's on a network of the cluster's, made below:
+     * carried out once, never in the vm.toml. */
+    let address = given.address.take();
+    let cluster = given.network.as_deref().and_then(config::cluster_network).map(String::from);
+    if cluster.is_none() && address.is_some() {
+        let _ = writeln!(out, "hv: address= is for a network of the cluster's (network=vnet:<name>): a host's \
+                               network's port has its address -- port= for one of its own");
+        return;
+    }
+    if cluster.is_some() && (given.port.is_some() || given.public.is_some()) {
+        let _ = writeln!(out, "hv: port= and public= are the host's networks': on a network of the cluster's its \
+                               port is vnet's, and its public address (`vnet ip`)");
+        return;
+    }
+    /* Its firewall too, on a network of the cluster's: the cluster's, its
+     * port judged by it in vnet's state -- `vnet port firewall` changes it. */
+    let cluster_firewall = if cluster.is_some() { given.firewall.take() } else { None };
     /* There already: said as such, before the name is asked for -- which a
      * VM of it running would refuse. */
     if kcore::fs::size(&file).is_ok() {
@@ -479,16 +496,36 @@ pub fn create(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
         let _ = writeln!(out, "hv: {} could not be made", folder.path);
         return;
     }
-    match kcore::fs::create(&file, text.as_bytes()) {
-        Ok(()) => {}
-        Err(kcore::error::Error::Busy) => {
-            let _ = writeln!(out, "hv: {} is there already -- not written over", file);
-            return;
+    /* On a network of the cluster's: its port made now, where a conflict
+     * shows at once -- at `address=`, judged by `firewall=` -- and deleted
+     * again where its vm.toml is not written. */
+    let mut port = None;
+    if let (Some(network), Some(uuid)) = (cluster.as_deref(), config.options.uuid) {
+        match crate::vnet::attach(&uuid, network, address, cluster_firewall.as_deref(), true) {
+            Ok(a) => {
+                let _ = writeln!(out, "hv: {} given port {} on {}{} at {}, judged by its firewall {}", name, a.port,
+                                 crate::vnet::PREFIX, network, netwire::Ipv4(a.identity.ip), a.firewall.name);
+                port = Some(uuid);
+            }
+            Err(e) => {
+                let _ = writeln!(out, "hv: {}", e);
+                return;
+            }
         }
-        Err(e) => {
-            let _ = writeln!(out, "hv: {} could not be written -- {}", file, e);
-            return;
+    }
+    let written = match kcore::fs::create(&file, text.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(kcore::error::Error::Busy) => Err(alloc::format!("{} is there already -- not written over", file)),
+        Err(e) => Err(alloc::format!("{} could not be written -- {}", file, e)),
+    };
+    if let Err(why) = written {
+        let _ = writeln!(out, "hv: {}", why);
+        if let Some(uuid) = port {
+            if let Err(e) = crate::vnet::detach(&uuid) {
+                let _ = writeln!(out, "hv: its port of vnet's left -- {}: `vnet port delete` it", e);
+            }
         }
+        return;
     }
     let _ = writeln!(out, "hv: {} written -- hv start {} boots it", file, name);
     /* What it names that is not there yet: a disk is often made after. */
@@ -639,6 +676,9 @@ pub struct Deleted {
     pub removed: usize,
     /// The disks kept, by the paths the folder has them at.
     pub kept: Vec<String>,
+    /// On a network of the cluster's: its port deleted -- its id, 0 for
+    /// none -- or why not, the port left for `vnet port delete`.
+    pub port: Option<Result<u64, String>>,
 }
 
 pub const DELETE_USAGE: &str = "hv delete <name> [keep-disks] [force]";
@@ -666,6 +706,15 @@ pub fn delete_command(root: &str, vms: &Vms, args: &str, out: &mut dyn Write) {
             let _ = writeln!(out, "hv: {} deleted -- {} files and folders taken away", name, d.removed);
             for disk in &d.kept {
                 let _ = writeln!(out, "hv: {} kept", disk);
+            }
+            match &d.port {
+                Some(Ok(0)) | None => {}
+                Some(Ok(port)) => {
+                    let _ = writeln!(out, "hv: its port {} of vnet's deleted", port);
+                }
+                Some(Err(why)) => {
+                    let _ = writeln!(out, "hv: its port of vnet's left -- {}: `vnet port delete` it", why);
+                }
             }
             for device in &d.devices {
                 let what = match crate::devices::source(device) {
@@ -699,8 +748,17 @@ pub fn delete(root: &str, vms: &Vms, name: &str, keep: bool, force: bool) -> Res
         vms.reserve(name, crate::vms::DELETED)?
     };
     let oom = || String::from("out of memory");
+    let mut cluster = None;
     let (protected, disks) = match load(&folder) {
-        Ok(c) => (c.protected, options(&folder, &c)?.disks),
+        Ok(c) => {
+            /* Its port on a network of the cluster's, deleted once its
+             * vm.toml is: by its UUID, which is vnet's key for it */
+            let network = c.options.network.as_deref().and_then(config::cluster_network);
+            if let (Some(_), Some(uuid)) = (network, c.options.uuid) {
+                cluster = Some(uuid);
+            }
+            (c.protected, options(&folder, &c)?.disks)
+        }
         Err(e) if force && !keep => {
             let _ = e;
             (false, Vec::new())
@@ -784,11 +842,12 @@ pub fn delete(root: &str, vms: &Vms, name: &str, keep: bool, force: bool) -> Res
     }
     kcore::fs::remove(&config).map_err(|_| alloc::format!("{} could not be taken away", config))?;
     removed += 1;
+    let port = cluster.map(|uuid| crate::vnet::detach(&uuid));
     if kept.is_empty() {
         kcore::fs::remove(&folder.path).map_err(|_| alloc::format!("{} could not be taken away", folder.path))?;
         removed += 1;
     }
-    Ok(Deleted { devices, removed, kept })
+    Ok(Deleted { devices, removed, kept, port })
 }
 
 /// `hv vms`: the folders under `root`, and of each what its vm.toml says

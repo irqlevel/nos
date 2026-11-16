@@ -591,8 +591,12 @@ pub struct Listed {
     /// The host CPUs its CPUs run on.
     pub cpus: Vec<u32>,
     pub mem_mib: u64,
-    /// Its port of the switch.
+    /// Its port of the switch, and its address there: the port's own on a
+    /// host's network, the one vnet gave it on a cluster's.
     pub port: Option<usize>,
+    pub ip: Option<u32>,
+    /// The public address mapped one to one to it, while it has one.
+    pub public: Option<u32>,
     /// How long its boot has run, or ran.
     pub uptime_ms: u64,
     pub restarts: u32,
@@ -602,6 +606,13 @@ pub struct Listed {
     pub kernel: String,
     /// What it has written to its console in all.
     pub console_bytes: u64,
+}
+
+/// What the switch wakes as a frame is put in the VM's port's inbox.
+impl crate::net::Wake for Shared {
+    fn wake_up(&self) {
+        Shared::wake_up(self);
+    }
 }
 
 /// How a VM `stop_vm` stopped ended.
@@ -1172,6 +1183,19 @@ pub struct Vms {
     claims: Arc<Claims>,
     /// The vm.toml changes, one at a time (`store::Changes`).
     pub changes: store::Changes,
+    /// The host's firewalls, and their places in the switch -- the
+    /// cluster's too, which the keeper changes as vnet does.
+    pub firewalls: Arc<crate::firewalls::Firewalls>,
+    /// What hv keeps of vnet, made with the switch, and its task: stopped
+    /// and waited out before the switch goes (`close`).
+    keeper: Mutex<Option<(Arc<crate::vnet::Keeper>, TaskHandle)>>,
+    /// The cluster networks' tunnel to the other hosts, made with the
+    /// switch, and its task: stopped first of all (`close`).
+    tunnel: Mutex<Option<(Arc<crate::tunnel::Tunnel>, TaskHandle)>>,
+    /// The tunnel's keys given anew every this many seconds, and the one
+    /// before kept for this many (`insmod hv.ko rekey= keylife=`).
+    rekey_s: u64,
+    keylife_s: u64,
 }
 
 /// The first word of `args`, and the rest after it -- the text of `send`,
@@ -1252,7 +1276,7 @@ fn at_prompt(text: &[u8]) -> bool {
 }
 
 impl Vms {
-    pub fn new() -> Option<Vms> {
+    pub fn new(rekey_s: u64, keylife_s: u64) -> Option<Vms> {
         let mut vms = Vec::new();
         vms.try_reserve_exact(MAX_VMS).ok()?;
         let mut reserved = Vec::new();
@@ -1262,6 +1286,11 @@ impl Vms {
             switch: Mutex::new(None)?,
             claims: Arc::new(Claims::new()?),
             changes: store::Changes::new()?,
+            firewalls: Arc::new(crate::firewalls::Firewalls::new()?),
+            keeper: Mutex::new(None)?,
+            tunnel: Mutex::new(None)?,
+            rekey_s,
+            keylife_s,
         })
     }
 
@@ -1642,8 +1671,12 @@ impl Vms {
         /* A VM from a folder whose vm.toml names no port is given one now,
          * kept there as its UUID is: its MAC and its address the same at
          * every start after, whatever order the VMs start in -- a guest's
-         * own network configuration names them (`store::keep_port`). */
-        if spec.net && spec.port.is_none() {
+         * own network configuration names them (`store::keep_port`). Not on
+         * a network of the cluster's: there its address and MAC are its
+         * port of vnet's, the same at every start already, and a vm.toml
+         * of one names no port -- `port=` is refused there, below. */
+        let on_cluster = spec.network.as_deref().and_then(crate::vnet::cluster_network).is_some();
+        if spec.net && spec.port.is_none() && !on_cluster {
             if let Some((folder, _)) = &stored {
                 match store::keep_port(self, folder) {
                     Ok(p) => spec.port = Some(p as usize),
@@ -1657,24 +1690,92 @@ impl Vms {
 
         /* With `net`, a port on the switch -- made by the first such guest --
          * and the address that goes with it on the guest's command line;
-         * given back if the start goes no further. */
+         * given back if the start goes no further. Judged by its firewall:
+         * the one it names; a VM from a folder that names none given one at
+         * this, its first start since VMs had them (`Firewalls::adopt`);
+         * `default` for one with no folder. */
         let mut hold = None;
+        let mut attached = None;
         if spec.net {
             let switch = self.switch().map_err(|why| not_started(&why))?;
-            let claimed = match spec.port {
-                Some(p) => switch.claim_at(p, &shared, spec.network.as_deref()),
-                None => switch.claim(&shared, spec.network.as_deref()),
+            let cluster = spec.network.as_deref().and_then(crate::vnet::cluster_network);
+            let (port, mtu) = match cluster {
+                /* A network of the cluster's: its port vnet's, as its address,
+                 * its firewall and its public address are -- read from the
+                 * state the leader vouches for, made at its first start where
+                 * `hv create` did not make it. */
+                Some(network) => {
+                    if spec.port.is_some() || spec.public.is_some() {
+                        return Err(not_started(&"port= and public= are the host's networks': on a network of the \
+                                                  cluster's its port is vnet's, and its public address (`vnet ip`)"));
+                    }
+                    let uuid = match (&stored, spec.uuid) {
+                        (Some(_), Some(uuid)) => uuid,
+                        _ => return Err(not_started(&"a VM with no folder is on no network of the cluster's: its \
+                                                       UUID, which its port is vnet's by, is new at each start")),
+                    };
+                    let a = crate::vnet::attach(&uuid, network, None, None, true).map_err(|why| not_started(&why))?;
+                    let place = self.firewalls.place_cluster(&switch, &a.firewall)
+                        .map_err(|why| not_started(&alloc::format!("its firewall: {}", why)))?;
+                    let port = switch.claim_vnet(&shared, &a.identity, place).map_err(|why| not_started(&why))?;
+                    if a.made {
+                        let _ = writeln!(out, "hv: vm {} given port {} on {}{} at {}", id, a.port, crate::vnet::PREFIX,
+                                         network, netwire::Ipv4(a.identity.ip));
+                    }
+                    if !a.confirmed {
+                        let _ = writeln!(out, "hv: vm {}'s port on {}{} is unconfirmed -- vnet has no leader to \
+                                               vouch for it, and is asked again until it has", id,
+                                         crate::vnet::PREFIX, network);
+                    }
+                    if let Some(public) = a.public {
+                        let _ = writeln!(out, "hv: vm {}'s public address {} is vnet's, its gateway's to carry -- not \
+                                               on this host's NAT yet", id, netwire::Ipv4(public));
+                    }
+                    spec.cmdline.push(' ');
+                    spec.cmdline.push_str(&net::ip_param_at(a.identity.ip, a.identity.gateway(), a.identity.mask(),
+                                                            switch.dns()));
+                    let mtu = a.identity.mtu;
+                    attached = Some((uuid, a));
+                    (port, mtu)
+                }
+                None => {
+                    if spec.firewall.is_none() {
+                        if let Some((folder, _)) = &stored {
+                            let (named, said) = self.firewalls.adopt(self, folder, &spec.forwards);
+                            let _ = writeln!(out, "hv: {}", said);
+                            spec.firewall = Some(named);
+                        }
+                    }
+                    let firewall = spec.firewall.as_deref().unwrap_or(crate::firewalls::DEFAULT);
+                    let place = self.firewalls.place(&switch, firewall)
+                        .map_err(|why| not_started(&alloc::format!("its firewall: {}", why)))?;
+                    let claimed = match spec.port {
+                        Some(p) => switch.claim_at(p, &shared, spec.network.as_deref(), place),
+                        None => switch.claim(&shared, spec.network.as_deref(), place),
+                    };
+                    let port = claimed.map_err(|why| not_started(&why))?;
+                    spec.cmdline.push(' ');
+                    spec.cmdline.push_str(&net::ip_param(port, switch.dns()));
+                    (port, 0)
+                }
             };
-            let port = claimed.map_err(|why| not_started(&why))?;
             /* Its way out, and the DNS server it is told of: a guest with no
              * way out still reaches nos and the other guests. */
             if let Err(why) = switch.way_out() {
                 let _ = writeln!(out, "hv: vm {} has no way out of the switch -- {}", id, net::nat_why(why));
             }
-            spec.cmdline.push(' ');
-            spec.cmdline.push_str(&net::ip_param(port, switch.dns()));
-            spec.nic = Some(NicSpec { port, switch: switch.clone() });
-            hold = Some(PortHold { switch, port, kept: false });
+            spec.nic = Some(NicSpec { port, switch: switch.clone(), mtu });
+            hold = Some(PortHold { switch: switch.clone(), port, kept: false });
+            /* Its public address, one to one: a start asked for one that
+             * cannot have it does not go on without it -- the port given back
+             * with the hold. */
+            if let Some(public) = spec.public {
+                switch.map_public(port, public).map_err(|why| {
+                    not_started(&alloc::format!("its public address {}: {}", netwire::Ipv4(public), why))
+                })?;
+                let _ = writeln!(out, "hv: vm {} is reached at {}, one to one -- what its firewall lets in", id,
+                                 netwire::Ipv4(public));
+            }
         }
 
         /* Its disks are served off the vCPU's CPU, and wake it. */
@@ -1800,9 +1901,16 @@ impl Vms {
             return Err(alloc::format!("vm {} stopped again at once -- no room for it, its name taken meanwhile, or \
                                        the module is going", id));
         }
-        /* On the list: its port is given back when it comes off. */
+        /* On the list: its port is given back when it comes off -- and one
+         * of a cluster network's kept by the keeper till then. */
         if let Some(h) = hold.as_mut() {
             h.kept = true;
+            if let (Some((uuid, a)), Some(keeper)) = (attached.as_ref(), self.keeper()) {
+                if let Err(why) = keeper.attached(h.port, uuid, a) {
+                    let _ = writeln!(out, "hv: vm {}'s port on {}{} not kept -- {}: what vnet changes of it is not \
+                                           seen here", id, crate::vnet::PREFIX, a.network, why);
+                }
+            }
         }
         match name {
             Some(n) => {
@@ -1814,11 +1922,11 @@ impl Vms {
         }
         /* nos's ports it asks for, relayed to its own: each said as it is
          * added, or why not -- the guest runs either way. */
-        if let (Some(port), Some(host)) = (port, self.host_nic()) {
+        if let (Some(port), Some(host), Some(switch)) = (port, self.host_nic(), self.switch_now()) {
             let outer = self.outer_nic();
             for (host_port, guest_port) in wanted {
                 let listed = || self.on_list(id);
-                let to = forward::To { guest_ip: net::port_ip(port), guest_port, host, outer };
+                let to = forward::To { guest_ip: switch.ip_of(port), guest_port, host, outer, switch: switch.clone(), port };
                 if let Err(e) = forwards.add(host_port, id, to, &listed, out) {
                     let _ = writeln!(out, "hv: {}", e);
                 }
@@ -1854,9 +1962,9 @@ impl Vms {
             let _ = writeln!(out, "hv: out of memory");
             return;
         };
+        /* No VM, and the switch said all the same: probes may be on it */
         if views.is_empty() {
             let _ = writeln!(out, "hv: no vms");
-            return;
         }
         /* The switch out of its lock too: its counters are atomics, its
          * networks under a lock of its own. */
@@ -1884,14 +1992,33 @@ impl Vms {
             let _ = write!(out, "  {} MiB  {} s", vm.mem_mib,
                 until.saturating_sub(s.boot_ns.load(Ordering::Relaxed)) / NS_PER_SEC);
             if let Some(port) = vm.port {
-                let _ = write!(out, "  {}", net::dotted(net::port_ip(port)));
-                match switch.as_ref().and_then(|s| s.network_of(port)) {
-                    Some(network) => {
+                let ip = switch.as_ref().map_or(net::port_ip(port), |s| s.ip_of(port));
+                let _ = write!(out, "  {}", net::dotted(ip));
+                let cluster = self.keeper().and_then(|k| k.said(port));
+                match (cluster, switch.as_ref().and_then(|s| s.network_of(port))) {
+                    (Some((network, confirmed, shut)), _) => {
+                        let _ = write!(out, " on {}{}", crate::vnet::PREFIX, network);
+                        if let Some(why) = shut {
+                            let _ = write!(out, " (shut: {})", why);
+                        } else if !confirmed {
+                            let _ = write!(out, " (unconfirmed)");
+                        }
+                    }
+                    (None, Some(network)) => {
                         let _ = write!(out, " on {}", network);
                     }
-                    None => {
+                    (None, None) if switch.as_ref().is_some_and(|s| s.vnet_of(port).is_some()) => {
+                        let _ = write!(out, " on a network of the cluster's");
+                        if switch.as_ref().is_some_and(|s| s.is_shut(port)) {
+                            let _ = write!(out, " (shut)");
+                        }
+                    }
+                    (None, None) => {
                         let _ = write!(out, " alone");
                     }
+                }
+                if let Some(public) = switch.as_ref().and_then(|s| s.public_of(port)) {
+                    let _ = write!(out, ", public {}", netwire::Ipv4(public));
                 }
             }
             let lost = vm.port.and_then(|p| switch.as_ref().map(|s| s.counts(p))).unwrap_or_default();
@@ -1909,6 +2036,15 @@ impl Vms {
             }
             if lost.isolated != 0 {
                 let _ = write!(out, "  {} frames for another network's guests, dropped", lost.isolated);
+            }
+            if vm.port.is_some() {
+                let _ = write!(out, "  firewall: {} flows", lost.flows);
+                if lost.denied_in != 0 || lost.denied_out != 0 {
+                    let _ = write!(out, ", {} packets kept out, {} kept in", lost.denied_in, lost.denied_out);
+                }
+                if lost.evicted != 0 {
+                    let _ = write!(out, ", {} flows given up for room", lost.evicted);
+                }
             }
             let restarts = s.restarts.load(Ordering::Relaxed);
             if restarts != 0 {
@@ -1932,6 +2068,11 @@ impl Vms {
             let _ = writeln!(out, "IPv6 between the guests, in {:x}:{:x}:{:x}::/64: {} router advertisements, {} \
                                    addresses bound -- none to nos, which speaks none",
                              g(0), g(2), g(4), advertised, bound);
+            let (arps, echoes) = s.vnet_counts();
+            if arps + echoes != 0 {
+                let _ = writeln!(out, "the cluster's networks: {} ARP questions answered by the switch, {} echoes from \
+                                       their gateways", arps, echoes);
+            }
             match s.nat_address() {
                 Some(ip) => {
                     let _ = writeln!(out, "the guests go out through NAT, from {} (nos's nat command)", net::dotted(ip));
@@ -2494,8 +2635,33 @@ impl Vms {
     pub fn close(&self, secs: u64) {
         self.table.lock().closing = true;
         self.stop_all(None, secs, None);
+        /* The tunnel's task stopped and waited out -- it tells the other
+         * hosts this one goes -- the switch carrying into it no more, then
+         * the keeper's: both are this module's code, and held the switch.
+         * Then the switch -- and the tunnel last of all: `hv0`'s sink, which
+         * the switch's going waits out, may hold a carrier of it it took a
+         * moment before, whose drop must not be the last, there. */
+        let tunnel = match self.tunnel.lock().take() {
+            Some((tunnel, task)) => {
+                task.request_stop();
+                drop(task);
+                Some(tunnel)
+            }
+            None => None,
+        };
+        let switch_now = self.switch.lock().clone();
+        if let Some(s) = switch_now {
+            drop(s.carrier(None));
+        }
+        let kept = self.keeper.lock().take();
+        if let Some((keeper, task)) = kept {
+            task.request_stop();
+            keeper.quiet();
+            drop(task);
+        }
         let switch = self.switch.lock().take();
         drop(switch);
+        drop(tunnel);
     }
 
     /// Every VM on the list as the host API reads it, copied out under the
@@ -2503,6 +2669,7 @@ impl Vms {
     pub fn listed(&self) -> Option<Vec<Listed>> {
         let now = kcore::time::boot_time_ns();
         let views = self.snapshot()?;
+        let switch = self.switch_now();
         let mut all = Vec::new();
         all.try_reserve_exact(views.len()).ok()?;
         for v in views {
@@ -2522,6 +2689,8 @@ impl Vms {
                 cpus: v.cpus,
                 mem_mib: v.mem_mib,
                 port: v.port,
+                ip: v.port.zip(switch.as_ref()).map(|(p, s)| s.ip_of(p)),
+                public: v.port.zip(switch.as_ref()).and_then(|(p, s)| s.public_of(p)),
                 uptime_ms: until.saturating_sub(s.boot_ns.load(Ordering::Relaxed)) / NS_PER_MS,
                 restarts: s.restarts.load(Ordering::Relaxed),
                 reason: if running { String::new() } else { s.reason_copy() },
@@ -2577,20 +2746,60 @@ impl Vms {
         self.switch.lock().clone()
     }
 
-    /// The guests' switch, made the first time it is asked for.
+    /// The guests' switch, made the first time it is asked for: what a
+    /// probe's port is claimed of too (`crate::probe`).
+    pub(crate) fn switch_made(&self) -> Result<Arc<Switch>, String> {
+        self.switch()
+    }
+
+    /// The guests' switch, made the first time it is asked for -- and with
+    /// it the keeper of what hv has of vnet, and its task (`vnet::Keeper`).
     fn switch(&self) -> Result<Arc<Switch>, String> {
         let mut switch = self.switch.lock();
         if let Some(s) = switch.as_ref() {
             return Ok(s.clone());
         }
         let made = Arc::new(Switch::new()?);
+        /* The tunnel first: the switch carries into it, and the keeper gives
+         * it the table */
+        let tunnel = crate::tunnel::Tunnel::new(made.clone(), self.rekey_s, self.keylife_s)
+            .ok_or_else(|| String::from("out of memory for the switch's tunnel"))?;
+        let Some(tunnel_task) = kcore::task::spawn_with("hv/tunnel", tunnel.clone(), crate::tunnel::Tunnel::run) else {
+            return Err(String::from("no task for the switch's tunnel"));
+        };
+        let carrier: Arc<dyn crate::net::Carrier> = tunnel.clone();
+        drop(made.carrier(Some(carrier)));
+        let keeper = crate::vnet::Keeper::new(made.clone(), self.firewalls.clone(), tunnel.clone());
+        let task = keeper.as_ref().and_then(|k| kcore::task::spawn_with("hv/vnet", k.clone(), crate::vnet::Keeper::run));
+        let (Some(keeper), Some(task)) = (keeper, task) else {
+            /* Nothing kept: the tunnel's task stopped, the switch let go */
+            tunnel_task.request_stop();
+            drop(tunnel_task);
+            drop(made.carrier(None));
+            return Err(String::from("no task for the switch's keeper"));
+        };
+        *self.tunnel.lock() = Some((tunnel, tunnel_task));
+        *self.keeper.lock() = Some((keeper, task));
         *switch = Some(made.clone());
         Ok(made)
+    }
+
+    /// The cluster networks' tunnel, while there is a switch.
+    pub fn tunnel(&self) -> Option<Arc<crate::tunnel::Tunnel>> {
+        self.tunnel.lock().as_ref().map(|(t, _)| t.clone())
+    }
+
+    /// What hv keeps of vnet, while there is a switch.
+    pub fn keeper(&self) -> Option<Arc<crate::vnet::Keeper>> {
+        self.keeper.lock().as_ref().map(|(k, _)| k.clone())
     }
 
     /// A VM's port given back, once its vCPU task is gone.
     fn release(&self, port: Option<usize>) {
         let Some(port) = port else { return };
+        if let Some(k) = self.keeper() {
+            k.released(port);
+        }
         let switch = self.switch.lock().clone();
         if let Some(s) = switch {
             s.release(port);
@@ -2638,10 +2847,43 @@ impl Vms {
         self.table.lock().vms.iter().any(|vm| vm.shared.id == id)
     }
 
-    /// The address of the running VM `id`, when it has a NIC.
-    pub fn address_of(&self, id: u32) -> Option<u32> {
+    /// The port of the switch the running VM `id` has, when it has a NIC.
+    pub fn port_of(&self, id: u32) -> Option<usize> {
         let table = self.table.lock();
-        table.vms.iter().find(|vm| vm.shared.id == id && vm.shared.running())
-            .and_then(|vm| vm.port).map(net::port_ip)
+        table.vms.iter().find(|vm| vm.shared.id == id && vm.shared.running()).and_then(|vm| vm.port)
+    }
+
+    /// The VM on the list on port `port` of the switch, as a listing names
+    /// it: its folder's name, or `vm N` where it has none.
+    pub fn named_on_port(&self, port: usize) -> Option<String> {
+        let table = self.table.lock();
+        let vm = table.vms.iter().find(|vm| vm.port == Some(port))?;
+        let mut said = String::new();
+        said.try_reserve(vm.name.as_ref().map_or(0, |n| n.len()) + 16).ok()?;
+        match &vm.name {
+            Some(n) => said.push_str(n),
+            None => {
+                let _ = write!(said, "vm {}", vm.shared.id);
+            }
+        }
+        Some(said)
+    }
+
+    /// The VM on the list on port `port` of the switch, as a person knows
+    /// it: its name and number, or its number.
+    pub fn on_port(&self, port: usize) -> Option<String> {
+        let table = self.table.lock();
+        let vm = table.vms.iter().find(|vm| vm.port == Some(port))?;
+        let mut said = String::new();
+        said.try_reserve(vm.name.as_ref().map_or(0, |n| n.len()) + 16).ok()?;
+        match &vm.name {
+            Some(n) => {
+                let _ = write!(said, "{} (vm {})", n, vm.shared.id);
+            }
+            None => {
+                let _ = write!(said, "vm {}", vm.shared.id);
+            }
+        }
+        Some(said)
     }
 }

@@ -10,5 +10,6 @@ export default async function VmPage({ params }: { params: Promise<{ locale: str
   const d = await descriptor(host, 'vm');
   if (!d) notFound();
   const nbs = await descriptor(host, 'nbs');
-  return <VmView host={host} name={name} d={d} nbs={nbs} locale={locale} w={words(locale)} />;
+  const fw = await descriptor(host, 'fw');
+  return <VmView host={host} name={name} d={d} nbs={nbs} fw={fw} locale={locale} w={words(locale)} />;
 }

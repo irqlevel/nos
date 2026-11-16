@@ -24,7 +24,11 @@
 //!   told, so that its address is the same at every start -- `allow_hv0` in
 //!   api.toml lets that address in, and nothing else where nothing was let
 //!   in before -- nos's port 39233 relayed to its 443, `protected`, booted
-//!   again when it resets itself.
+//!   again when it resets itself;
+//! - its firewall, `panel` (hv's `fw` provider): what comes in denied but at
+//!   its 443, what goes out allowed -- made unless there is one of that
+//!   name, which is then the host's to have as it is. The API on hv0 is the
+//!   host's own address, which no firewall judges.
 //!
 //! A panel there already is started where it is not running: /etc/rc runs
 //! `api panel create` at every boot.
@@ -425,6 +429,39 @@ fn pem(label: &str, der: &[u8]) -> Result<String, String> {
     web::x509::pem(label, der).map_err(|_| String::from("out of memory"))
 }
 
+/// The panel's firewall, `panel`: what comes in denied but at its HTTPS,
+/// which nos's `PUBLIC_PORT` is relayed to -- the relay holds each browser to
+/// it -- and what goes out allowed. Made, unless there is one of its name,
+/// which is the host's to have as it is.
+fn firewall(out: &mut Output) -> Result<(), String> {
+    let made = to_json(|w| {
+        w.begin_object();
+        w.field_str("name", NAME);
+        w.end_object();
+    })?;
+    match ask("fw", "create", &made) {
+        Ok(_) => {}
+        Err((Status::Conflict, _)) => {
+            let _ = writeln!(out, "api: the panel's VM is judged by the firewall {}, which there was already -- hv fw {}",
+                             NAME, NAME);
+            return Ok(());
+        }
+        Err((s, said)) => return Err(alloc::format!("the panel's firewall could not be made -- {}: {}", s.name(), said)),
+    }
+    let rule = alloc::format!("allow in tcp {}", GUEST_PORT);
+    let add = to_json(|w| {
+        w.begin_object();
+        w.field_str("name", NAME);
+        w.field_str("rule", &rule);
+        w.end_object();
+    })?;
+    ask("fw", "add", &add).map_err(|(s, said)| alloc::format!("the panel's firewall's rule could not be added -- {}: {}",
+                                                              s.name(), said))?;
+    let _ = writeln!(out, "api: the panel's VM is judged by the firewall {}: nothing comes in but at its port {}", NAME,
+                     GUEST_PORT);
+    Ok(())
+}
+
 /// The panel's VM made: what of the host it needs, then the VM, by a job of
 /// hv's provider -- or the panel there already started, if it is not
 /// running.
@@ -447,6 +484,7 @@ fn create<'a>(state: &State, words: impl Iterator<Item = &'a str>, out: &mut Out
     }
     let (host, _) = state.files.with(|_| files::identity(&state.dir, &super::cert_ips()))?;
     let Place { port, vm_ip, host_ip } = place(asked.port)?;
+    firewall(out)?;
     let public = nic_ip(PUBLIC_IF);
 
     /* The panel's two identities: a client of the API's, a server to the
@@ -488,6 +526,7 @@ fn create<'a>(state: &State, words: impl Iterator<Item = &'a str>, out: &mut Out
         w.str(&forward);
         w.end_list();
         w.field_bool("protected", true);
+        w.field_str("firewall", NAME);
         w.field_bool("start", true);
         w.field_str("user_data", &user);
         w.end_object();

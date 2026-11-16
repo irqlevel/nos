@@ -312,6 +312,152 @@ test('a protected VM is not deleted without force', async ({ page }) => {
   await expect(page.getByTestId('job')).toContainText('protected');
 });
 
+test('firewalls: listed with their rules, one made, a rule refused and added, moved, taken out with a confirm, the firewall deleted', async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/p/fw`);
+  await expect(page.getByRole('heading', { name: 'Firewalls', level: 1 })).toBeVisible();
+  const list = page.getByTestId('resource-firewalls');
+  await expect(list).toContainText('default');
+  await expect(list.locator('tr', { hasText: 'web' })).toContainText('denied');
+  await expect(page.getByTestId('resource-rules')).toContainText('allow in tcp 22');
+
+  await page.getByRole('button', { name: /New firewall/ }).click();
+  const create = page.getByTestId('form-fw-create');
+  await create.locator('input[name=name]').fill('pw-fw');
+  await create.getByRole('button', { name: /New firewall/ }).click();
+  await expect(create.getByTestId('answer')).toContainText('"name": "pw-fw"');
+
+  /* A rule from its row: one hv would not take said by its field, then two */
+  await page.goto(`/en/h/${host}/p/fw`);
+  await list.locator('tr', { hasText: 'pw-fw' }).getByRole('button', { name: 'Add a rule' }).click();
+  const add = page.getByTestId('form-fw-add');
+  await add.locator('input[name=rule]').fill('allow sideways');
+  await add.getByRole('button', { name: 'Add a rule' }).click();
+  await expect(add).toContainText('allow or deny, in or out');
+  await add.locator('input[name=rule]').fill('allow in tcp 8080 from net');
+  await add.getByRole('button', { name: 'Add a rule' }).click();
+  await expect(add.getByTestId('answer')).toContainText('"n": 1');
+  await add.locator('input[name=rule]').fill('deny out udp 53');
+  await add.getByRole('button', { name: 'Add a rule' }).click();
+  await expect(add.getByTestId('answer')).toContainText('"n": 2');
+
+  /* Moved: the second first */
+  await page.goto(`/en/h/${host}/p/fw`);
+  const rules = page.getByTestId('resource-rules');
+  await rules.locator('tr', { hasText: 'deny out udp 53' }).getByRole('button', { name: 'Move' }).click();
+  const move = page.getByTestId('form-fw-move');
+  await move.locator('input[name=to]').fill('1');
+  await move.getByRole('button', { name: 'Move' }).click();
+  await expect(move.getByTestId('answer')).toContainText('"n": 1');
+  await page.goto(`/en/h/${host}/p/fw`);
+  await expect(rules.locator('tr', { hasText: 'pw-fw' }).first()).toContainText('deny out udp 53');
+
+  /* Taken out, with the confirm its descriptor says */
+  await rules.locator('tr', { hasText: 'allow in tcp 8080' }).getByRole('button', { name: 'Take out' }).click();
+  const remove = page.getByTestId('form-fw-remove');
+  await remove.getByRole('button', { name: 'Take out' }).click();
+  await expect(remove).toContainText('nothing else lets are cut');
+  await remove.getByRole('button', { name: 'Confirm' }).click();
+  /* Its row gone with it, the table read again */
+  await expect(rules).not.toContainText('allow in tcp 8080');
+  await expect(rules).toContainText('deny out udp 53');
+
+  /* default is never deleted; pw-fw is */
+  await page.goto(`/en/h/${host}/p/fw`);
+  await list.locator('tr', { hasText: 'default' }).getByRole('button', { name: 'Delete' }).click();
+  const del = page.getByTestId('form-fw-delete');
+  await del.getByRole('button', { name: 'Delete' }).click();
+  await del.getByRole('button', { name: 'Confirm' }).click();
+  await expect(del.getByRole('alert')).toContainText('never deleted');
+  await page.goto(`/en/h/${host}/p/fw`);
+  await list.locator('tr', { hasText: 'pw-fw' }).getByRole('button', { name: 'Delete' }).click();
+  await del.getByRole('button', { name: 'Delete' }).click();
+  await del.getByRole('button', { name: 'Confirm' }).click();
+  await expect(list).not.toContainText('pw-fw');
+  await page.goto(`/ru/h/${host}/p/fw`);
+  await expect(page.getByRole('heading', { name: 'Фаерволы', level: 1 })).toBeVisible();
+  await expect(page.getByTestId('resource-firewalls')).not.toContainText('pw-fw');
+});
+
+test('the cluster\'s VM networks: listed, one made, one overlapping refused, a firewall of the cluster\'s given a rule', async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/p/vnet`);
+  await expect(page.getByRole('heading', { name: 'VM networks', level: 1 })).toBeVisible();
+  const networks = page.getByTestId('resource-networks');
+  await expect(networks).toContainText('10.10.0.0/24');
+  await expect(page.getByTestId('resource-ports')).toContainText('10.10.0.2');
+
+  await page.getByRole('button', { name: /New network/ }).click();
+  const create = page.getByTestId('form-vnet-network_create');
+  await create.locator('input[name=name]').fill('pw-net');
+  await create.locator('input[name=subnet]').fill('10.20.0.0/24');
+  await create.getByRole('button', { name: /New network/ }).click();
+  await expect(create.getByTestId('answer')).toContainText('"vni": 2');
+  await create.locator('input[name=name]').fill('pw-over');
+  await create.locator('input[name=subnet]').fill('10.20.0.128/25');
+  await create.getByRole('button', { name: /New network/ }).click();
+  await expect(create.getByRole('alert')).toContainText('overlaps');
+  await page.goto(`/en/h/${host}/p/vnet`);
+  await expect(networks).toContainText('pw-net');
+
+  const firewalls = page.getByTestId('resource-firewalls');
+  await expect(firewalls).toContainText('default');
+  await firewalls.locator('tr', { hasText: 'default' }).getByRole('button', { name: 'Add a rule' }).click();
+  const add = page.getByTestId('form-vnet-firewall_add');
+  await add.locator('input[name=rule]').fill('allow in tcp 22');
+  await add.getByRole('button', { name: 'Add a rule' }).click();
+  await expect(add.getByTestId('answer')).toContainText('rule 1: allow in tcp 22');
+  await page.goto(`/ru/h/${host}/p/vnet`);
+  await expect(page.getByRole('heading', { name: 'Сети машин', level: 1 })).toBeVisible();
+});
+
+test('a VM\'s firewall and public address: chosen as it is made, on its page, the firewall changed from a list a read gives (choices)', async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/vms/new`);
+  const chosen = page.locator('select[name=firewall]');
+  await expect(chosen.locator('option')).toContainText(['default', 'panel', 'web']);
+  await page.fill('input[name=name]', 'fw1');
+  await chosen.selectOption('web');
+  /* A public address, one to one: refused as no address first, then taken */
+  await page.fill('input[name=public]', '203.0.113');
+  await page.getByRole('button', { name: 'Create' }).click();
+  await expect(page.getByRole('alert').filter({ hasText: 'public address' })).toContainText('a.b.c.d');
+  await page.fill('input[name=public]', '203.0.113.9');
+  await page.getByRole('button', { name: 'Create' }).click();
+  await expect(page.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+
+  await page.goto(`/en/h/${host}/vms/fw1`);
+  await expect(page.locator('dl div', { hasText: 'Public address' })).toContainText('203.0.113.9');
+  const firewallRow = page.locator('dl div', { hasText: 'Firewall' });
+  await expect(firewallRow).toContainText('web');
+  await page.getByTestId('vm-firewall').click();
+  const form = page.getByTestId('form-fw-assign');
+  /* The VM is the page's; the firewall a list of the host's, from fw.list */
+  await expect(form.locator('[name=vm]')).toHaveCount(0);
+  const select = form.locator('select[name=firewall]');
+  await expect(select.locator('option')).toContainText(['—', 'default', 'panel', 'web']);
+  await select.selectOption('panel');
+  await form.getByRole('button', { name: 'Change its firewall' }).click();
+  await expect(form.getByTestId('answer')).toContainText('"firewall": "panel"');
+  await expect(firewallRow).toContainText('panel');
+});
+
+test('a VM on a network of the cluster\'s: chosen as it is made, judged by one of the cluster\'s firewalls, its port made in vnet', async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/vms/new`);
+  const network = page.locator('select[name=network]');
+  await expect(network.locator('option')).toContainText(['vnet:lan']);
+  await page.fill('input[name=name]', 'net1');
+  await network.selectOption('vnet:lan');
+  /* The cluster's firewalls offered, and no public address asked: vnet's */
+  await expect(page.locator('select[name=firewall] option')).toContainText(['default']);
+  await expect(page.locator('input[name=public]')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Create' }).click();
+  await expect(page.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+  await page.goto(`/en/h/${host}/p/vnet`);
+  await expect(page.getByTestId('resource-ports')).toContainText('10.10.0.3');
+});
+
 test('a VM\'s console: what it printed, and what is typed goes to it', async ({ page }) => {
   const host = await login(page);
   await page.goto(`/en/h/${host}/vms/web`);

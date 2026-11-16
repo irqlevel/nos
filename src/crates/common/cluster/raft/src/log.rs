@@ -192,6 +192,26 @@ fn tmp_name(index: u64) -> String {
     format!("snap.{:016x}.tmp", index)
 }
 
+/// Whether `files` hold anything of a log, as opening it would find one: a
+/// segment begun whole -- no shorter than the head every segment is begun
+/// with, which a crash may leave half written and opening removes -- or a
+/// snapshot, not one half written. Read only: nothing is changed, so that a
+/// folder whose log is gone is told from one that has a log before opening
+/// begins one there (raftmember's `begun` mark).
+pub fn holds_log<F: Files>(files: &mut F) -> Result<bool, FileError> {
+    let mut names = Vec::new();
+    files.list(&mut names)?;
+    for n in names.iter() {
+        if parse_name(n, "snap.", "").is_some() {
+            return Ok(true);
+        }
+        if parse_name(n, "wal.", "").is_some() && files.len(n)? >= HEAD {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// The number in a name of the log's own: `prefix`, sixteen hex digits,
 /// `suffix`, and nothing else.
 fn parse_name(name: &str, prefix: &str, suffix: &str) -> Option<u64> {

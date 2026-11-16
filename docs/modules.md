@@ -806,8 +806,11 @@ as `add` and `remove` do -- one writer of the file.
 (docs/cluster.md): every host of the cluster, its key and its address,
 kept through Raft by a member on each host, which gives ipcnet its peers.
 It needs ipcnet loaded first. Its folder is /etc/cluster (`insmod
-/lib/modules/cluster.ko conf=` names another): `member` and the log in
-`raft/`.
+/lib/modules/cluster.ko conf=` names another): `member`, the log in
+`raft/`, and `begun`, the mark that keeps a member whose log is gone from
+starting as the one it was (docs/cluster.md). What it does with its member
+-- starts it, stops it, recovers the last one standing -- is raftmember's,
+as every group's module has it.
 
 ```
 $ insmod /cluster.ko
@@ -829,6 +832,33 @@ descriptor the panel builds the cluster's page of.
 `tests/cluster-test.py` makes a cluster of three on `tests/hub.py`'s
 LAN.
 
+## vnet
+
+`vnet` (`src/crates/modules/net/vnet`) is the cluster's networks for VMs
+(plans/vnet.md): a raft group of its own -- `vnet.raft` on every member,
+raftmember's offered group, as nbs-mds's is -- of the networks, their ports,
+the public addresses and the cluster's firewalls (`common/net/vnetmeta`).
+It needs ipcnet and cluster loaded first: its members are hosts of the
+registry, a port's host the registry's node, and what no network or public
+address may cover the registry's hosts' own addresses, which it asks the
+`cluster` provider for. Its folder is /etc/vnet (`dir=` names another);
+`compact=` is its snapshot's floor, as nbs-mds's.
+
+```
+$ insmod /vnet.ko
+$ vnet init lab                                   # the first host
+$ vnet host add b                                 # a host of the registry, offered the vnet
+$ vnet create lan 10.10.0.0/24                    # .1 the gateway on every host
+$ vnet port create lan <uuid>                     # as hv makes a VM's port (V2)
+$ vnet fw create edge && vnet fw edge add allow in tcp 22
+```
+
+It is on the management bus as the `vnet` provider too, whose descriptor
+the panel builds its page of networks, ports, public addresses and
+firewalls of. hv takes its ports and its table from the member on its host
+from V2 on; `tests/vnet-test.py --phase v1b` makes a vnet of three on
+`tests/hub.py`'s LAN.
+
 ## nbs-mds and nbs-cs
 
 NBS, the replicated block storage (docs/nbs.md), is two modules on every
@@ -836,7 +866,10 @@ host of the cluster registry. `nbs-mds` (`src/crates/modules/storage/nbs-mds`)
 is its metadata service: a member on each host, through Raft over ipc --
 raftmember's, as cluster.ko's is -- of the NBS cluster's members, each host's
 chunk server and its devices, and the volumes. Its folder is /nbs/mds
-(`dir=` names another). `nbs-cs` (`src/crates/modules/storage/nbs-cs`) is the
+(`dir=` names another). Its offers, the listener of a host in no NBS
+cluster and the members' commands are raftmember's `offered`, which vnet's
+module will run too; `nbs recover` makes the last member standing the one
+voter. `nbs-cs` (`src/crates/modules/storage/nbs-cs`) is the
 host's chunk server: it asks the host's mds which devices are its, takes them
 in with queues of its own, and serves the chunks on them. It takes no
 parameters, and is loaded after nbs-mds.

@@ -23,7 +23,10 @@
 //!
 //! The policy the module keeps raft's configuration to (`voters`): the
 //! first five members to join vote, the rest learn -- they hold everything
-//! and do not vote.
+//! and do not vote. The cluster, its members and those removed, and the
+//! rules of each, are `common/cluster/members`'s -- vnet's state keeps its
+//! own by them too -- and the commands that change them nbsmeta's, on its
+//! wire as they always were.
 //!
 //! Applying is the same on every member: it reads the entry's index and
 //! nothing else of the world -- no clock, no member's id, no randomness of
@@ -58,26 +61,21 @@ mod storage;
 
 pub use command::{Answer, Command, Refusal};
 pub use pieces::{Pieces, PIECE};
-pub use snapshot::{Checks, Diverged, FrozenState};
+pub use rsmkit::{Checks, Diverged};
+pub use snapshot::FrozenState;
 pub use storage::*;
 
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::string::String;
 use alloc::vec::Vec;
 
 use codec::{Reader, Stream};
 use raft::rsm::{Frozen, RestoreError, SnapshotReader, StateMachine};
 
-/// Members a cluster takes at once: each is a host of the registry, every
-/// one a peer of every other's ipcnet, which takes 16.
-pub const MEMBERS_MAX: usize = 16;
-/// Members that vote: the first to join.
-pub const VOTERS_MAX: usize = 5;
-/// Members removed the state keeps: past this, a remove is refused rather
-/// than a removed incarnation forgotten.
-pub const REMOVED_MAX: usize = 1024;
-/// A cluster's name at most.
-pub const NAME_MAX: usize = 63;
+/// Members a cluster takes at once, those that vote -- the first to join --
+/// those removed it keeps, and a cluster's name at most: `members`'s.
+pub use members::{MEMBERS_MAX, NAME_MAX, REMOVED_MAX, VOTERS_MAX};
+/// The NBS cluster: its id and name. A member, and a member removed.
+pub use members::{Group as Cluster, Member, Removed};
 /// How many entries apart a member takes its state's digest, which the
 /// leader proposes for every member to hold its own to -- at the least:
 /// a state bigger than `CHECK_EVERY` times `CHECK_BYTES` takes it once every
@@ -94,35 +92,10 @@ pub fn valid_name(name: &str) -> bool {
     ipcwire::valid_host(name)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Cluster {
-    pub id: [u8; 16],
-    pub name: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Member {
-    /// The host's ipc name.
-    pub host: String,
-    /// Its incarnation: the member's raft node.
-    pub id: u64,
-    /// The entry it joined at.
-    pub since: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Removed {
-    pub host: String,
-    pub id: u64,
-    /// The entry it was removed at.
-    pub at: u64,
-}
-
 #[derive(Clone, Debug)]
 pub struct State {
-    cluster: Option<Cluster>,
-    members: Vec<Member>,
-    removed: Vec<Removed>,
+    /// The cluster, its members and those removed.
+    members: members::Members,
     /* What is stored (storage.rs) */
     cs: Vec<Cs>,
     sets: Pieces<Set>,
@@ -163,9 +136,7 @@ pub struct State {
 impl Default for State {
     fn default() -> State {
         State {
-            cluster: None,
-            members: Vec::new(),
-            removed: Vec::new(),
+            members: members::Members::new(),
             cs: Vec::new(),
             sets: Pieces::new(),
             chunks: Pieces::new(),
@@ -188,7 +159,7 @@ impl Default for State {
 /// member keeps of its own -- its digests -- is not compared.
 impl PartialEq for State {
     fn eq(&self, o: &State) -> bool {
-        self.cluster == o.cluster && self.members == o.members && self.removed == o.removed && self.cs == o.cs
+        self.members == o.members && self.cs == o.cs
             && self.sets == o.sets && self.chunks == o.chunks && self.volumes == o.volumes
             && self.next_device == o.next_device && self.next_volume == o.next_volume
             && self.next_generation == o.next_generation
@@ -244,40 +215,46 @@ impl State {
     }
 
     pub fn cluster(&self) -> Option<&Cluster> {
-        self.cluster.as_ref()
+        self.members.group()
     }
 
-    pub fn members(&self) -> &[Member] {
+    /// The cluster, its members and those removed, as a whole: what a group
+    /// whose hosts are offered it keeps of them (raftmember's `offered`).
+    pub fn roll(&self) -> &members::Members {
         &self.members
     }
 
+    pub fn members(&self) -> &[Member] {
+        self.members.members()
+    }
+
     pub fn removed(&self) -> &[Removed] {
-        &self.removed
+        self.members.removed()
     }
 
     /// Host `host`'s member.
     pub fn member(&self, host: &str) -> Option<&Member> {
-        self.members.iter().find(|m| m.host == host)
+        self.members.member(host)
     }
 
     /// The member incarnation `id` is.
     pub fn member_of_id(&self, id: u64) -> Option<&Member> {
-        self.members.iter().find(|m| m.id == id)
+        self.members.member_of_id(id)
     }
 
     /// Whether incarnation `id` was removed: never taken again.
     pub fn id_removed(&self, id: u64) -> bool {
-        self.removed.iter().any(|r| r.id == id)
+        self.members.id_removed(id)
     }
 
     /// The members that vote: the first `VOTERS_MAX` to join.
     pub fn voters(&self) -> Vec<u64> {
-        self.members.iter().take(VOTERS_MAX).map(|m| m.id).collect()
+        self.members.voters()
     }
 
     /// The members that learn: every one past the voters.
     pub fn learners(&self) -> Vec<u64> {
-        self.members.iter().skip(VOTERS_MAX).map(|m| m.id).collect()
+        self.members.learners()
     }
 
     /// `command`, applied at entry `index`: what its proposer is answered.
@@ -291,71 +268,16 @@ impl State {
         }
     }
 
+    /// The members' commands, applied by `members`' rules.
     fn change(&mut self, index: u64, command: &Command) -> Result<u64, Refusal> {
-        match command {
-            Command::Init { cluster, name, host, member } => {
-                if self.cluster.is_some() {
-                    return Err(Refusal::Initialized);
-                }
-                if !valid_name(name) || !valid_name(host) {
-                    return Err(Refusal::BadName);
-                }
-                if *member == 0 {
-                    return Err(Refusal::BadMember);
-                }
-                self.cluster = Some(Cluster { id: *cluster, name: name.clone() });
-                self.members.push(Member { host: host.clone(), id: *member, since: index });
-                Ok(*member)
-            }
-            Command::Add { host, member } => {
-                if self.cluster.is_none() {
-                    return Err(Refusal::NotInitialized);
-                }
-                if !valid_name(host) {
-                    return Err(Refusal::BadName);
-                }
-                if *member == 0 {
-                    return Err(Refusal::BadMember);
-                }
-                if let Some(m) = self.member(host) {
-                    /* Asked again: the same incarnation is done; another one
-                       is a host that lost its state, or an older offer's */
-                    return if m.id == *member { Ok(m.id) } else { Err(Refusal::HostIsMember) };
-                }
-                if self.member_of_id(*member).is_some() {
-                    return Err(Refusal::MemberInUse);
-                }
-                if self.id_removed(*member) {
-                    return Err(Refusal::MemberRemoved);
-                }
-                if self.members.len() >= MEMBERS_MAX {
-                    return Err(Refusal::Full);
-                }
-                self.members.push(Member { host: host.clone(), id: *member, since: index });
-                Ok(*member)
-            }
-            Command::Remove { host } => {
-                if self.cluster.is_none() {
-                    return Err(Refusal::NotInitialized);
-                }
-                let Some(at) = self.members.iter().position(|m| m.host == *host) else {
-                    /* Asked again once done: the incarnation it took out */
-                    return self.removed.iter().rev().find(|r| r.host == *host).map(|r| r.id)
-                        .ok_or(Refusal::NoSuchHost);
-                };
-                if self.members.len() == 1 {
-                    return Err(Refusal::LastMember);
-                }
-                if self.removed.len() >= REMOVED_MAX {
-                    return Err(Refusal::Full);
-                }
-                let m = self.members.remove(at);
-                self.removed.push(Removed { host: m.host, id: m.id, at: index });
-                Ok(m.id)
-            }
+        let changed = match command {
+            Command::Init { cluster, name, host, member } => self.members.init(index, *cluster, name, host, *member),
+            Command::Add { host, member } => self.members.add(index, host, *member),
+            Command::Remove { host } => self.members.remove(index, host),
             /* What is stored: storage.rs's */
-            _ => Err(Refusal::Malformed),
-        }
+            _ => return Err(Refusal::Malformed),
+        };
+        changed.map_err(Refusal::from)
     }
 
     /// The state as a snapshot holds it, in one buffer: for a host's tests --
@@ -399,31 +321,7 @@ impl State {
     /// The rules a state read back is held to: what applying never makes,
     /// refused.
     fn check(&self) -> Result<(), RestoreError> {
-        match &self.cluster {
-            None if !self.members.is_empty() || !self.removed.is_empty() => {
-                return Err(RestoreError("members of no cluster"));
-            }
-            None => return self.check_storage(),
-            Some(c) if !valid_name(&c.name) => return Err(RestoreError("a cluster's name is none")),
-            Some(_) if self.members.is_empty() => return Err(RestoreError("a cluster of no member")),
-            Some(_) => {}
-        }
-        for (i, m) in self.members.iter().enumerate() {
-            if !valid_name(&m.host) || m.id == 0 {
-                return Err(RestoreError("a member of no name or of incarnation 0"));
-            }
-            if self.members[..i].iter().any(|o| o.host == m.host || o.id == m.id) {
-                return Err(RestoreError("a host or an incarnation a member twice"));
-            }
-            if self.id_removed(m.id) {
-                return Err(RestoreError("a member removed"));
-            }
-        }
-        for r in &self.removed {
-            if !valid_name(&r.host) || r.id == 0 {
-                return Err(RestoreError("a member removed of no name or of incarnation 0"));
-            }
-        }
+        self.members.check().map_err(RestoreError)?;
         self.check_storage()
     }
 }
@@ -457,7 +355,7 @@ impl StateMachine for State {
     fn size(&self) -> u64 {
         let maps: u64 = self.volumes.iter().map(|v| v.map.len() as u64 * 4 + 160).sum();
         let cs: u64 = self.cs.iter().map(|c| 80 + c.devices.len() as u64 * 80).sum();
-        128 + (self.members.len() + self.removed.len()) as u64 * 96 + cs + self.sets.len() as u64 * 45
+        128 + self.members.size() + cs + self.sets.len() as u64 * 45
             + self.chunks.len() as u64 * 11 + maps
     }
 
@@ -466,7 +364,7 @@ impl StateMachine for State {
     }
 
     fn restore(&mut self, r: &mut SnapshotReader<'_>) -> Result<(), RestoreError> {
-        let mut stream = Stream::new(snapshot::FromSnapshot(r));
+        let mut stream = Stream::new(rsmkit::FromSnapshot(r));
         let s = State::read(&mut stream)?;
         if stream.into_inner().0.remaining() != 0 {
             return Err(RestoreError("a snapshot longer than its state"));

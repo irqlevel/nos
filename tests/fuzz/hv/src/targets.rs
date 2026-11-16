@@ -49,7 +49,13 @@ pub static ALL: &[Target] = &[
     Target { name: "dhcp", run: dhcp, max_len: 1024 },
     Target { name: "switch", run: crate::guestnet::switch_target, max_len: 8192 },
     Target { name: "nat", run: crate::guestnet::nat_target, max_len: 8192 },
+    Target { name: "onetoone", run: crate::guestnet::one_target, max_len: 4096 },
     Target { name: "guestnet", run: crate::guestnet::guestnet_target, max_len: 4096 },
+    Target { name: "firewall", run: crate::fwmodel::firewall_target, max_len: 4096 },
+    Target { name: "fwswitch", run: crate::fwmodel::fwswitch_target, max_len: 2048 },
+    Target { name: "vnetswitch", run: crate::vnetmodel::vnetswitch_target, max_len: 4096 },
+    Target { name: "vnetwire", run: crate::vnetwiremodel::vnetwire_target, max_len: 4096 },
+    Target { name: "tunnel", run: crate::tunnelmodel::tunnel_target, max_len: 4096 },
     Target { name: "platform", run: crate::platform::platform, max_len: 16384 },
     Target { name: "policy", run: crate::policymodel::policy_target, max_len: 1024 },
     Target { name: "place", run: crate::placemodel::place_target, max_len: 2048 },
@@ -1837,6 +1843,15 @@ fn net_target(r: &mut Input) {
     if r.u8() < 48 {
         mem.refuse_maps(true);
     }
+    /* A cluster network's MTU told the driver, on some (F_MTU, bit 3; the
+     * configuration's MTU after the MAC, the status and the pairs): offered
+     * and read where it is one, neither where none. */
+    let mtu = if r.u8() < 64 { r.pick(&[576u16, 1400, 1440]) } else { 0 };
+    nic.set_mtu(mtu);
+    let offered = nic.io_read(0, 4) & (1 << 3) != 0;
+    let told = nic.io_read(crate::devices::virtio::DEVICE_CONFIG + 10, 2);
+    invariant!(offered == (mtu != 0) && told == u32::from(mtu),
+               "a NIC of MTU {} offers F_MTU {} and says {}", mtu, offered, told);
     let count = 2 * usize::from(pairs) + usize::from(pairs > 1);
     let mut queues = vec![DriverQueue::default(); count];
     while let Some(op) = r.op(17) {
@@ -2477,8 +2492,11 @@ const DHCP_CODES: [u8; 8] = [53, 50, 54, 0, 255, 12, 55, 61];
 fn dhcp(r: &mut Input) {
     use crate::dhcp::{answer, is_request, Network, REPLY_MAX};
     use netwire::udp;
+    /* A host network's server, or a cluster network's, which gives the
+     * network's MTU too (option 26). */
     let net = Network { server_ip: 0x0A00_6401, server_mac: [2, 0, 0, 0, 0x64, 1], mask: 0xFFFF_FF00,
-                        dns: if r.bool() { 0x0808_0808 } else { 0 } };
+                        dns: if r.bool() { 0x0808_0808 } else { 0 },
+                        mtu: if r.bool() { 0 } else { r.pick(&[576u16, 1400, 1440]) } };
     let yours = if r.u8() < 200 { 0x0A00_6402 } else { r.u32() };
     let mut frame = vec![0u8; netwire::MAX_FRAME];
     let len = if r.u8() < 224 {
@@ -2557,4 +2575,28 @@ fn dhcp(r: &mut Input) {
     let sent = u16::from_be_bytes([datagram[udp::CHECKSUM], datagram[udp::CHECKSUM + 1]]);
     datagram[udp::CHECKSUM..udp::CHECKSUM + 2].fill(0);
     invariant!(udp::checksum(d.src_ip, d.dst_ip, &datagram) == sent, "an answer whose checksum is not its own");
+    /* The MTU in every answer that is no NAK, where the network has one;
+     * nowhere else. Read here as RFC 2132 has the options, sharing nothing
+     * with the server's writing of them. */
+    let msg = d.payload;
+    let mut kind = None;
+    let mut mtu = None;
+    let mut at = DHCP_OPTIONS;
+    while at < msg.len() && msg[at] != 255 {
+        if msg[at] == 0 {
+            at += 1;
+            continue;
+        }
+        let Some(&len) = msg.get(at + 1) else { break };
+        let Some(data) = msg.get(at + 2..at + 2 + usize::from(len)) else { break };
+        match msg[at] {
+            53 => kind = data.first().copied(),
+            26 => mtu = Some(data.to_vec()),
+            _ => {}
+        }
+        at += 2 + usize::from(len);
+    }
+    const NAK: u8 = 6;
+    let want = (net.mtu != 0 && kind != Some(NAK)).then(|| net.mtu.to_be_bytes().to_vec());
+    invariant!(mtu == want, "an answer of type {:?} gives MTU {:?}, the network's being {}", kind, mtu, net.mtu);
 }

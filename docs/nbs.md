@@ -319,6 +319,11 @@ On the host, in `/nbs/mds`:
   and never written over: the mark that this host is a member.
 - `raft/` -- the member's log (`raft::log::DiskLog`): its segments, its
   hard state, and its newest snapshot, `snap.<index>`.
+- `begun` -- the mark that the member began its log, written and synced
+  once its first segment is on the medium, before the member runs: a
+  `member` and `begun` beside a `raft/` that holds no log is a log gone, and
+  the member is not started as the one it was ("A host that lost its
+  state", below).
 
 ## Where replicas go
 
@@ -658,6 +663,34 @@ was. Added again, it is refused (`that incarnation was removed: never taken
 again`). To take it back, `rmmod nbs-mds` there, `rm /nbs/mds`, `insmod`,
 and `nbs host add` it.
 
+A host whose log alone was lost -- `raft/` holding none, its `member` and
+`begun` there -- is the same loss, and is never started as the member it
+was, nor recovered from: the module says so at its load, in `nbs` and in
+the provider's `status` (`stopped`), with what to do --
+`rmmod nbs-mds`, `rm /nbs/mds` and `insmod` there, then `nbs host replace`
+on a member (plans/vnet.md, V1a: before it, such a member started as the
+incarnation it was, its votes forgotten). A host that took an offer and
+never wrote a word -- a `member`, no `begun`, an empty `raft/` -- starts, as
+it always did.
+
+## When the majority is gone
+
+`nbs recover` on the last member standing makes it the NBS cluster's one
+voter, as `cluster recover` does the registry's ([cluster.md](cluster.md),
+"When the majority is gone") -- the same code, raftmember's `recover`:
+refused while the member follows a leader or any other voter's mds answers
+a probe within 3 s (`TAG_PROBE`); without the cluster's name it says what it
+is about to do, and with it, its log is made the log of a group of itself
+alone, the member started again over it, and every other member removed
+for good -- each back only as a new member, by `nbs host add` once its
+folder is gone. What the lost members had committed and this one had not is
+gone: a volume made, an attach, a snapshot. A writer on a lost host must
+never come back -- its host's folder goes, as any removed member's -- for an
+attach generation it was given may be given again. Typed at a host's own
+shell alone, as `cluster recover` is: no provider's call makes it. Every
+member is to run a build with it first: a member of an older build does not
+answer the probe, and would be taken for gone.
+
 ## How a member runs
 
 raftmember's, as the registry's member runs ([cluster.md](cluster.md), "How a
@@ -673,10 +706,20 @@ member runs"):
 
 What is NBS's own:
 - the cluster's id on every message;
-- the offer;
+- its state's digest, held to the leader's; its cs's questions, its
+  clients' asks, the controller and the scrub.
+
+What every group whose hosts are offered it has, NBS's and vnet's alike, is
+raftmember's (`offered.rs`, plans/vnet.md, V1a), and its members' rules
+`members`' (`src/crates/common/cluster/members`):
+- the offer, and its answer from a member already;
 - the listener that holds `nbs.mds` while this host is in no cluster, taking
   an offer and answering raft messages for members it does not have;
-- the lost members kept for `nbs` to say.
+- the lost members kept for `nbs` to say;
+- `init`, `host add`, `remove`, `replace` and `recover`; the member's start
+  over its log, with the `begun` mark, and its stop;
+- `Init`, `Add` and `Remove` as applied, who votes -- the first five -- and
+  the rules a snapshot read back is held to.
 
 `nbs init` starts the member over a new log with this host its one voter,
 commits `Init`, and only then writes `member`. Should any of it fail, the

@@ -14,6 +14,9 @@ raft = { path = "../../../src/crates/common/cluster/raft" }
 registry = { path = "../../../src/crates/common/cluster/registry" }
 # NBS's metadata, its second (plans/nbs.md).
 nbsmeta = { path = "../../../src/crates/common/storage/nbsmeta" }
+# vnet's state, its third (plans/vnet.md), and the firewall rules it keeps.
+vnetmeta = { path = "../../../src/crates/common/net/vnetmeta" }
+firewall = { path = "../../../src/crates/common/net/firewall" }
 # The CRC32C the log's records are checked by, for the known answers and
 # for records made by hand.
 crc = { path = "../../../src/crates/common/crc" }

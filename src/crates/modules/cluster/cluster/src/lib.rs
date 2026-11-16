@@ -19,7 +19,9 @@
 //! `<conf>/raft`, and `<conf>/member` says which member of which cluster
 //! this host is (files.rs). The member is raftmember's, a task of its own
 //! with the registry's hooks (member.rs), which the shell hands its
-//! commands to.
+//! commands to; raftmember starts it -- over a log whose `begun` mark keeps
+//! a member whose log is gone from starting as the one it was -- stops it,
+//! and recovers the last one standing.
 
 extern crate alloc;
 
@@ -32,22 +34,19 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use ipcwire::control;
 use kcore::cmd::{Command as ShellCommand, Output};
 use kcore::error::Error;
 use kcore::ipc::{Limits, Mailbox};
-use kcore::klog;
-use kcore::task::TaskHandle;
 use kcore::time::Duration;
-use raft::{Config, LogConfig, Role, Rsm};
+use raft::Role;
 use raftmember::ipcnet::{call as ctl, identity};
-use raftmember::{KFiles, Locked};
+use raftmember::{Recovered, Recovery, Runner};
 use registry::{Answer, Command, Role as AddrRole, State};
 
 use files::Dir;
-use member::{Shared, View};
+use member::View;
 use token::Token;
 
 const HELP: &str = "cluster [init | invite | join | hosts | remove | ...] - this host in its cluster's registry";
@@ -76,37 +75,17 @@ const JOIN_TRY_MS: u64 = 3000;
 /// How often a join is asked again while the member could not take it yet
 /// -- a leader being chosen, a session being made.
 const ASK_RETRY_MS: u64 = 250;
-/// How long `recover` waits for any other voter to answer its probe.
-const PROBE_MS: u64 = 3000;
-const ANSWER_POLL_MS: u64 = 20;
 /// What a command asked of a host that is no member is told.
 const NO_MEMBER: &str = "this host is no member -- `cluster init`, or a join";
+/// What an `init`, a join, a rekey or a recover is told while another holds
+/// the right to start the member.
+const BUSY: &str = "another `cluster init` or `cluster join` is under way";
 
-/// The module's: its folder, and the member while there is one.
+/// The module's: its folder, and the member while there is one -- an
+/// `init`, a join or a recover the one at a time that may start it.
 struct ModState {
     dir: Dir,
-    shared: Arc<Shared>,
-    task: Locked<Option<TaskHandle>>,
-    /// An `init` or a `join` under way: the one at a time that may start a
-    /// member.
-    starting: AtomicBool,
-}
-
-/// The right to start a member, held for an `init` or a `join`.
-struct Starting<'a>(&'a AtomicBool);
-
-impl<'a> Starting<'a> {
-    fn take(state: &'a ModState) -> Result<Starting<'a>, String> {
-        state.starting.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| Starting(&state.starting))
-            .map_err(|_| String::from("another `cluster init` or `cluster join` is under way"))
-    }
-}
-
-impl Drop for Starting<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
+    runner: Runner<member::Registry>,
 }
 
 /* Dropped in this order: the provider and the command, each waiting out a
@@ -126,17 +105,8 @@ impl Drop for Cluster {
     fn drop(&mut self) {
         drop(self.provider.take());
         drop(self.cmd.take());
-        stop(&self.state);
+        self.state.runner.stop();
     }
-}
-
-/// The member's task stopped and waited out -- taken from its lock first,
-/// and dropped off it -- and the shell shown no member.
-fn stop(state: &ModState) {
-    state.shared.stop.store(true, Ordering::Release);
-    let task = state.task.with(|t| t.take());
-    drop(task);
-    state.shared.view.with(|v| *v = None);
 }
 
 fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn kmod::Module>> {
@@ -153,21 +123,18 @@ fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn
     }
     let state = Arc::new(ModState {
         dir: Dir::new(root.unwrap_or(files::DEFAULT_DIR)),
-        shared: Arc::new(Shared::new().ok_or(Error::NoMemory)?),
-        task: Locked::new(None).ok_or(Error::NoMemory)?,
-        starting: AtomicBool::new(false),
+        runner: Runner::new().ok_or(Error::NoMemory)?,
     });
-    /* A member already: started over its log */
-    match files::read_member(&state.dir) {
-        Ok(Some(m)) => {
-            if let Err(why) = start(&state, m, false) {
-                let _ = writeln!(out, "cluster: {}", why);
-            }
-        }
-        Ok(None) => {}
-        Err(why) => {
-            let _ = writeln!(out, "cluster: {}", why);
-        }
+    /* A member already: started over its log -- or, where it does not
+       start, why kept for `cluster` to say */
+    let not_started = match files::read_member(&state.dir) {
+        Ok(Some(m)) => start(&state, m, false).err(),
+        Ok(None) => None,
+        Err(why) => Some(why),
+    };
+    if let Some(why) = not_started {
+        state.runner.hold(&why);
+        let _ = writeln!(out, "cluster: {}", why);
     }
     let st = state.clone();
     let cmd = ShellCommand::register("cluster", HELP, move |args, out| {
@@ -188,59 +155,41 @@ fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn
 kmod::module!(name: "cluster", init_with_params: init);
 
 /// The member started over its log: made new, with this host its one
-/// voter, when `fresh`. The shell sees it before this returns.
+/// voter, when `fresh`. The shell sees it before this returns. A log gone
+/// beside the `begun` mark is refused, saying what to do (raftmember).
 fn start(state: &ModState, me: files::Member, fresh: bool) -> Result<(), String> {
-    if state.task.with(|t| t.is_some()) {
+    if state.runner.running() {
         return Err(String::from("the member is running already"));
     }
-    let files = KFiles::new(&state.dir.root, "raft")?;
-    let log = if fresh {
-        raft::DiskLog::bootstrap(files, LogConfig::default(), &[me.node], &[])
-    } else {
-        raft::DiskLog::open(files, LogConfig::default())
-    }
-    .map_err(|e| alloc::format!("the log in {}: {:?}", state.dir.path("raft"), e))?;
+    let log = raftmember::open_log(&state.dir.root, me.node, fresh, &lost_remedy(state, &me.name))?;
     run_member(state, me, log, fresh)
+}
+
+/// What to do where this host's member's log is gone beside its `begun`
+/// mark: it is never that member again.
+fn lost_remedy(state: &ModState, name: &str) -> String {
+    alloc::format!("on a member, `cluster remove {}`; then here `rmmod cluster`, `rm {}` and `insmod` it, and a join \
+                    by a new invitation", name, state.dir.root)
 }
 
 /// The member started over `log`, standing for election at once when
 /// `campaign` -- its group's one voter.
 fn run_member(state: &ModState, me: files::Member, log: member::Log, campaign: bool) -> Result<(), String> {
-    if state.task.with(|t| t.is_some()) {
+    if state.runner.running() {
         return Err(String::from("the member is running already"));
     }
-    let mut cfg = Config::new(me.node);
-    cfg.seed = kcore::random::random_u64().unwrap_or(me.node);
-    cfg.max_snapshot_bytes = raftmember::snapshot_limit();
-    let nonce = kcore::random::random_u64().ok_or_else(|| String::from("no randomness for the member's start"))?;
-    let mut rsm = Rsm::new(cfg, log, State::new(), nonce).map_err(|e| alloc::format!("the member: {:?}", e))?;
-    raftmember::catch_up(&mut rsm).map_err(|e| alloc::format!("the member: {}", e))?;
-    if campaign {
-        /* Its group's one voter: leading at once rather than at a timeout */
-        let _ = rsm.campaign();
-    }
-    let member = member::new(rsm, me)?;
-    state.shared.stop.store(false, Ordering::Release);
-    /* Shown before the task's first turn, so that a command right after
-       this one finds the member */
-    state.shared.view.with(|v| *v = Some(member.view(None)));
-    let Some(task) = kcore::task::spawn_with("cluster/raft", (state.shared.clone(), member),
-                                             raftmember::run::<member::Registry>) else {
-        state.shared.view.with(|v| *v = None);
-        return Err(String::from("could not start the member's task"));
-    };
-    state.task.with(|t| *t = Some(task));
-    Ok(())
+    let rsm = raftmember::member_rsm::<State>(log, me.node, campaign, None)?;
+    state.runner.spawn("cluster/raft", member::new(rsm, me)?)
 }
 
 fn view(state: &ModState) -> Option<View> {
-    state.shared.view()
+    state.runner.view()
 }
 
 /// `cmd`, as the member's registry answers it -- asked again while the
 /// member cannot take it yet.
 fn ask(state: &ModState, cmd: &Command) -> Result<Answer, String> {
-    raftmember::ask(&state.shared, cmd, NO_MEMBER)
+    raftmember::ask(&state.runner.shared, cmd, &state.runner.no_member(NO_MEMBER))
 }
 
 /// A command's answer as a result: the node it names, or why it was refused.
@@ -256,7 +205,7 @@ fn now() -> u64 {
 }
 
 fn member_view(state: &ModState) -> Result<View, String> {
-    view(state).ok_or_else(|| String::from(NO_MEMBER))
+    view(state).ok_or_else(|| state.runner.no_member(NO_MEMBER))
 }
 
 /* ---- what the shell and the bus both ask: the commands, each a value ---- */
@@ -311,7 +260,7 @@ fn op_invite(state: &ModState, host: &str, ip: u32, port: u16, key: [u8; 32]) ->
 /// and retired. No connection is lost: one made with the old key goes on
 /// until it ends. The old key and the new.
 fn op_rekey(state: &ModState) -> Result<([u8; 32], [u8; 32]), String> {
-    let _one = Starting::take(state)?;
+    let _one = state.runner.starting(BUSY)?;
     let v = member_view(state)?;
     let id = identity()?;
     let me = v.state.host(&id.name).ok_or_else(|| String::from("this host is not in the registry yet"))?;
@@ -360,103 +309,52 @@ fn key_of(data: &[u8]) -> Result<[u8; 32], String> {
     data.try_into().map_err(|_| String::from("ipcnet answered with no key"))
 }
 
-/// The other voters of `hosts` that answer a probe within PROBE_MS, by
-/// name -- each answer from the host it names, as ipcnet has it.
-fn probe(hosts: &[(String, u64)]) -> Result<alloc::vec::Vec<String>, String> {
-    let mb = Mailbox::new(Limits { messages: 32, bytes: 8192 }).map_err(|e| alloc::format!("no mailbox: {}", e.name()))?;
-    for (name, _) in hosts {
-        let _ = mb.send_to(&alloc::format!("{}@{}", member::NAME, name), member::TAG_PROBE, 0, &[]);
-    }
-    let end = kcore::time::boot_time_ns() + PROBE_MS * 1_000_000;
-    let mut answered: alloc::vec::Vec<String> = alloc::vec::Vec::new();
-    while kcore::time::boot_time_ns() < end && answered.len() < hosts.len() {
-        let Some(m) = mb.recv(Duration::from_millis(ANSWER_POLL_MS)) else { continue };
-        if m.tag != member::TAG_PROBED || m.data.len() != 17 {
-            continue;
-        }
-        let mut b = [0u8; 8];
-        b.copy_from_slice(&m.data[..8]);
-        let node = u64::from_le_bytes(b);
-        let from = kcore::ipc::peer_name(m.from);
-        if let Some((name, _)) = hosts.iter().find(|(n, nd)| *nd == node && from.as_deref() == Some(n.as_str())) {
-            if !answered.contains(name) {
-                answered.push(name.clone());
-            }
-        }
-    }
-    Ok(answered)
-}
-
 /// The last host standing made its cluster's one voter (plans/cluster.md,
 /// "When the majority is gone"): refused while it follows a leader or any
 /// other voter answers; said first, done once the cluster's name is given.
 /// Unsafe by design -- what the lost hosts had committed and this one had
 /// not is gone -- so the lost hosts are removed for good, their keys with
 /// them: none of them comes back with a history that went another way.
+/// raftmember's `recover`, as every group's.
 fn recover(state: &ModState, confirm: Option<&str>, out: &mut Output) -> Result<(), String> {
-    let _one = Starting::take(state)?;
+    let held = state.runner.starting(BUSY)?;
     let v = member_view(state)?;
     let cluster = v.state.cluster().ok_or_else(|| String::from("no cluster yet"))?.clone();
     let me = v.state.host_of_node(v.node).map(|h| h.name.clone())
         .ok_or_else(|| String::from("this host is not in the registry"))?;
-    if v.leader != raft::NONE {
-        let leader = v.state.host_of_node(v.leader).map_or("a member", |h| h.name.as_str());
-        return Err(alloc::format!("this member follows a leader, {}: the majority answers -- recover is for a \
-                                   cluster whose majority is gone for good", leader));
-    }
+    let leader = (v.leader != raft::NONE)
+        .then(|| v.state.host_of_node(v.leader).map_or(String::from("a member"), |h| h.name.clone()));
     let others: alloc::vec::Vec<(String, u64)> = v.state.hosts().iter().filter(|h| h.node != v.node)
         .map(|h| (h.name.clone(), h.node)).collect();
-    let voters: alloc::vec::Vec<(String, u64)> = others.iter().filter(|(_, n)| v.membership.voters.contains(n))
-        .cloned().collect();
-    let answering = probe(&voters)?;
-    if !answering.is_empty() {
-        return Err(alloc::format!("{} answers: the majority may not be gone -- recover refused",
-                                  answering.join(", ")));
-    }
     let names: alloc::vec::Vec<&str> = others.iter().map(|(n, _)| n.as_str()).collect();
-    let Some(given) = confirm else {
-        let _ = writeln!(out, "cluster: recover makes {} (node {}) the one voter of cluster {}, and removes every \
-                               other host for good -- their keys refused from then on; whatever they had committed \
-                               that {} had not is gone. No other voter answers. To go ahead: cluster recover {}", me,
-                         v.node, cluster.name, me, cluster.name);
-        let _ = writeln!(out, "cluster: the hosts removed: {}",
-                         if names.is_empty() { String::from("none") } else { names.join(", ") });
-        return Ok(());
+    let none_or = |list: &[&str]| if list.is_empty() { String::from("none") } else { list.join(", ") };
+    let r = Recovery { remedy: lost_remedy(state, &me), module: "cluster", what: "cluster", an: "a cluster",
+                       group: cluster.name.clone(), me: (me.clone(), v.node), others: others.clone(),
+                       voters: v.membership.voters.clone(), leader, name: member::NAME,
+                       tags: (member::TAG_PROBE, member::TAG_PROBED) };
+    let prepare = || files::read_member(&state.dir)?.ok_or_else(|| String::from("this host has no member file"));
+    let restart = |member: &files::Member, log: Option<member::Log>| match log {
+        Some(log) => run_member(state, member.clone(), log, true),
+        None => start(state, member.clone(), false),
     };
-    if given != cluster.name {
-        return Err(alloc::format!("\"{}\" is not this cluster's name -- it is {}", given, cluster.name));
-    }
-    let member = files::read_member(&state.dir)?.ok_or_else(|| String::from("this host has no member file"))?;
-    stop(state);
-    let stopped = |why: String| alloc::format!("{} -- the member is stopped: `rmmod cluster` and `insmod` start it \
-                                               again", why);
-    let files = KFiles::new(&state.dir.root, "raft").map_err(stopped)?;
-    let log = raft::DiskLog::open(files, LogConfig::default())
-        .map_err(|e| stopped(alloc::format!("the log in {}: {:?}", state.dir.path("raft"), e)))?;
-    let (log, forced) = match raft::recover::force_alone(log, member.node) {
-        Ok(f) => f,
-        Err(e) => {
-            /* Refused before writing, or a write that failed: the member
-               started again over what the folder holds */
-            let again = start(state, member, false).err().map(|w| alloc::format!(", and the member not started \
-                                                                                 again: {}", w)).unwrap_or_default();
-            return Err(alloc::format!("recover refused: {:?}{}", e, again));
+    let remove = |host: &str| op_remove(state, host);
+    match raftmember::recover(&state.runner, &held, &state.dir.root, r, confirm, &prepare, &restart, &remove)? {
+        Recovered::Asked => {
+            let _ = writeln!(out, "cluster: recover makes {} (node {}) the one voter of cluster {}, and removes every \
+                                   other host for good -- their keys refused from then on; whatever they had committed \
+                                   that {} had not is gone. No other voter answers. To go ahead: cluster recover {}", me,
+                             v.node, cluster.name, me, cluster.name);
+            let _ = writeln!(out, "cluster: the hosts removed: {}", none_or(&names));
         }
-    };
-    klog!(0, "cluster: recover: {} (node {}) alone, {:?} taken out, the log committed from {} to {}", me,
-          member.node, forced.removed, forced.committed_before, forced.last);
-    run_member(state, member, log, true)?;
-    let mut removed = alloc::vec::Vec::new();
-    for (name, _) in &others {
-        match op_remove(state, name) {
-            Ok(_) => removed.push(name.as_str()),
-            Err(why) => {
+        Recovered::Done { removed, kept } => {
+            for (name, why) in &kept {
                 let _ = writeln!(out, "cluster: {} not removed: {} -- `cluster remove {}` again", name, why, name);
             }
+            let removed: alloc::vec::Vec<&str> = removed.iter().map(|n| n.as_str()).collect();
+            let _ = writeln!(out, "cluster: {} is cluster {}'s one voter now; removed for good: {}", me, cluster.name,
+                             none_or(&removed));
         }
     }
-    let _ = writeln!(out, "cluster: {} is cluster {}'s one voter now; removed for good: {}", me, cluster.name,
-                     if removed.is_empty() { String::from("none") } else { removed.join(", ") });
     Ok(())
 }
 
@@ -526,7 +424,7 @@ pub(crate) fn op_init(state: &ModState, name: &str) -> Result<(String, u64), Str
     if !registry::valid_name(name) {
         return Err(alloc::format!("\"{}\" is not a cluster's name: lowercase letters, digits and -", name));
     }
-    let _starting = Starting::take(state)?;
+    let _starting = state.runner.starting(BUSY)?;
     if files::read_member(&state.dir)?.is_some() || view(state).is_some() {
         return Err(String::from("this host is a member of a cluster already"));
     }
@@ -551,7 +449,7 @@ pub(crate) fn op_init(state: &ModState, name: &str) -> Result<(String, u64), Str
         Ok(node) => Ok((id.name, node)),
         Err(why) => {
             /* Nobody else knows of the cluster yet: undone, for an init again */
-            stop(state);
+            state.runner.stop();
             match files::remove_member(&state.dir).and_then(|()| files::clear_log(&state.dir)) {
                 Ok(()) => Err(why),
                 Err(left) => Err(alloc::format!("{} -- and undoing it: {}", why, left)),
@@ -588,7 +486,7 @@ fn join_cluster(state: &ModState, text: &str, out: &mut Output) -> Result<(), St
 /// answers, or `stop` says to give up (a provider's job told to).
 pub(crate) fn op_join(state: &ModState, text: &str, stop: &dyn Fn() -> bool) -> Result<(String, u64, usize), String> {
     let t = Token::decode(text).ok_or_else(|| String::from("not a token: `cluster invite` prints one"))?;
-    let _starting = Starting::take(state)?;
+    let _starting = state.runner.starting(BUSY)?;
     if files::read_member(&state.dir)?.is_some() || view(state).is_some() {
         return Err(String::from("this host is a member of a cluster already"));
     }
@@ -618,6 +516,7 @@ pub(crate) fn op_join(state: &ModState, text: &str, stop: &dyn Fn() -> bool) -> 
                                    invite it again", id.name, node, why, id.name));
     }
     if let Err(why) = start(state, me, false) {
+        state.runner.hold(&why);
         return Err(alloc::format!("{} joined the cluster as node {}, but its member did not start: {} -- `rmmod \
                                    cluster` and `insmod` start it again", id.name, node, why));
     }
@@ -684,7 +583,14 @@ fn role_name(r: Role) -> &'static str {
 
 fn status(state: &ModState, out: &mut Output) -> Result<(), String> {
     let Some(v) = view(state) else {
-        let _ = writeln!(out, "cluster: this host is no member -- `cluster init <name>`, or a join");
+        match state.runner.held() {
+            Some(why) => {
+                let _ = writeln!(out, "cluster: this host's member did not start: {}", why);
+            }
+            None => {
+                let _ = writeln!(out, "cluster: this host is no member -- `cluster init <name>`, or a join");
+            }
+        }
         return Ok(());
     };
     if let Some(why) = &v.stopped {
