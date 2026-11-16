@@ -46,6 +46,7 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
         ...page("", locales, { priority: 1 }),
         ...page("/about", locales, { priority: 0.9 }),
         ...page("/hypervisor", locales, { priority: 0.9 }),
+        ...page("/demo", locales, { priority: 0.9 }),
         ...page("/docs", locales, { priority: 0.8 }),
         ...page("/howto", locales, { priority: 0.8 }),
         ...page("/blog", locales, { priority: 0.8 }),
