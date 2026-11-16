@@ -11,7 +11,9 @@
 //! sender's to write (`netwire::udp`), and what a kind may carry is the
 //! receiver's to hold to its table.
 //!
-//! - **Sealed** with ChaCha20-Poly1305 (RFC 8439) under a key of 32 bytes:
+//! - **Sealed** with ChaCha20-Poly1305 (RFC 8439) under a key of 32 bytes
+//!   -- the machine's, which the caller hands in (`Aead`): hv.ko's is the
+//!   kernel's crypto crate, CRYPTOGAMS' assembly in its SIMD sections --
 //!   the counter is the nonce -- four zero bytes and its eight, big-endian
 //!   -- and the header is the associated data, so a datagram whose kind,
 //!   network, key or counter was changed on the way does not open. A key
@@ -37,9 +39,6 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-use chacha20poly1305::aead::AeadInPlace;
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, Tag};
-
 /// The tunnel's UDP port, from and to: one NAT never gives a guest's flow.
 pub const PORT: u16 = 39241;
 /// The header's bytes: kind, network, key, counter.
@@ -52,6 +51,8 @@ pub const TAG: usize = 16;
 pub const OVERHEAD: usize = 20 + 8 + HEADER + TAG;
 /// A key's bytes.
 pub const KEY: usize = 32;
+/// A nonce's bytes.
+pub const NONCE: usize = 12;
 /// The counters a window remembers back from the newest it took.
 pub const WINDOW: u64 = 2048;
 const WORDS: usize = (WINDOW / 64) as usize;
@@ -129,11 +130,24 @@ impl Header {
     }
 }
 
+/// RFC 8439's ChaCha20-Poly1305, which a datagram is sealed and opened
+/// with. There is no kernel here, so the caller hands it in: hv.ko the
+/// kernel's crypto crate's, CRYPTOGAMS' assembly in the kernel's SIMD
+/// sections; the hv fuzzer RustCrypto's.
+pub trait Aead: Sync {
+    /// `data` encrypted in place under `key` and `nonce`, and the tag over
+    /// `aad` and the ciphertext.
+    fn seal(&self, key: &[u8; KEY], nonce: &[u8; NONCE], aad: &[u8], data: &mut [u8]) -> [u8; TAG];
+    /// `data`, the ciphertext, decrypted in place under `key` and `nonce` if
+    /// `tag` is its tag over `aad` and it -- true; left as it is if not.
+    fn open(&self, key: &[u8; KEY], nonce: &[u8; NONCE], aad: &[u8], data: &mut [u8], tag: &[u8; TAG]) -> bool;
+}
+
 /// The nonce a counter is: four zero bytes and the counter's eight.
-fn nonce(counter: u64) -> Nonce {
-    let mut n = [0u8; 12];
+fn nonce(counter: u64) -> [u8; NONCE] {
+    let mut n = [0u8; NONCE];
     n[4..].copy_from_slice(&counter.to_be_bytes());
-    Nonce::from(n)
+    n
 }
 
 /// What a datagram's tag holds besides the packet: all of its header, so a
@@ -153,11 +167,11 @@ pub enum SealError {
 }
 
 /// `packet`, under the header `header` -- its key's number and counter the
-/// caller's to keep unique: a counter is used once under a key -- sealed
-/// with key `key` into `out` as a datagram: its length, or why not. What a
-/// sender that reserves a counter under its lock and seals outside it
-/// calls.
-pub fn seal(key: &[u8; KEY], header: &Header, packet: &[u8], out: &mut [u8]) -> Result<usize, SealError> {
+/// caller's to keep unique: a counter is used once under a key -- sealed by
+/// `aead` with key `key` into `out` as a datagram: its length, or why not.
+/// What a sender that reserves a counter under its lock and seals outside
+/// it calls.
+pub fn seal(aead: &dyn Aead, key: &[u8; KEY], header: &Header, packet: &[u8], out: &mut [u8]) -> Result<usize, SealError> {
     let len = HEADER + packet.len() + TAG;
     if out.len() < len {
         return Err(SealError::Room);
@@ -165,28 +179,27 @@ pub fn seal(key: &[u8; KEY], header: &Header, packet: &[u8], out: &mut [u8]) -> 
     let head = header.bytes().ok_or(SealError::Network)?;
     out[..HEADER].copy_from_slice(&head);
     out[HEADER..HEADER + packet.len()].copy_from_slice(packet);
-    let cipher = ChaCha20Poly1305::new(key.into());
-    let tag = cipher
-        .encrypt_in_place_detached(&nonce(header.counter), associated(&head), &mut out[HEADER..HEADER + packet.len()])
-        .map_err(|_| SealError::Room)?;
+    let tag = aead.seal(key, &nonce(header.counter), associated(&head), &mut out[HEADER..HEADER + packet.len()]);
     out[HEADER + packet.len()..len].copy_from_slice(&tag);
     Ok(len)
 }
 
-/// `datagram` opened where it lies with key `key`, its counter held to no
-/// window: its header and the packet it carried, deciphered in place, or
-/// why not -- the tag checked before a byte is deciphered. What a receiver
-/// that holds the window under its lock and opens outside it calls, the
-/// window asked before (`Window::fresh`) and moved after (`Window::take`).
-pub fn open<'a>(key: &[u8; KEY], datagram: &'a mut [u8]) -> Result<(Header, &'a [u8]), OpenError> {
+/// `datagram` opened where it lies by `aead` with key `key`, its counter
+/// held to no window: its header and the packet it carried, deciphered in
+/// place, or why not -- the tag checked before a byte is deciphered. What a
+/// receiver that holds the window under its lock and opens outside it
+/// calls, the window asked before (`Window::fresh`) and moved after
+/// (`Window::take`).
+pub fn open<'a>(aead: &dyn Aead, key: &[u8; KEY], datagram: &'a mut [u8]) -> Result<(Header, &'a [u8]), OpenError> {
     let header = Header::read(datagram).ok_or(OpenError::Malformed)?;
     let end = datagram.len() - TAG;
     let mut head = [0u8; HEADER];
     head.copy_from_slice(&datagram[..HEADER]);
-    let tag = Tag::clone_from_slice(&datagram[end..]);
-    let cipher = ChaCha20Poly1305::new(key.into());
-    cipher.decrypt_in_place_detached(&nonce(header.counter), associated(&head), &mut datagram[HEADER..end], &tag)
-        .map_err(|_| OpenError::Forged)?;
+    let mut tag = [0u8; TAG];
+    tag.copy_from_slice(&datagram[end..]);
+    if !aead.open(key, &nonce(header.counter), associated(&head), &mut datagram[HEADER..end], &tag) {
+        return Err(OpenError::Forged);
+    }
     Ok((header, &datagram[HEADER..end]))
 }
 

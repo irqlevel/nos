@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::{x25519, X25519_BASEPOINT_BYTES};
 use zeroize::Zeroize;
 
-use crate::cipher::{ChaChaPoly, Rng, KEY_LEN, TAG_LEN};
+use crate::cipher::{ChaChaPoly, Primitives, Rng, KEY_LEN, TAG_LEN};
 use crate::keys::{HostKey, ED25519};
 use crate::wire::{self, put_name_list, put_string, put_u32, Reader};
 use crate::{Error, Link, Recv, Result};
@@ -70,20 +70,21 @@ const OUT_OF_ORDER: Error = Error::Protocol("an unexpected message in the key ex
 pub struct Transport<'a> {
     link: &'a mut dyn Link,
     host: &'a HostKey,
-    rng: Rng,
+    primitives: &'a dyn Primitives,
+    rng: Rng<'a>,
 
     /* What the client sent, from start to end, not yet taken as packets */
     input: Vec<u8>,
     start: usize,
     end: usize,
     recv_seq: u32,
-    recv_key: Option<ChaChaPoly>,
+    recv_key: Option<ChaChaPoly<'a>>,
     /* The packet_length of a packet only part here, decrypted once */
     pending: Option<usize>,
 
     output: Vec<u8>,
     send_seq: u32,
-    send_key: Option<ChaChaPoly>,
+    send_key: Option<ChaChaPoly<'a>>,
 
     /* The exchange hash's inputs that outlive one message */
     v_c: Vec<u8>,
@@ -101,16 +102,24 @@ pub struct Transport<'a> {
 }
 
 impl<'a> Transport<'a> {
+    /// `primitives` are what the cipher and the random stream are made of;
     /// `seed` keys the session's random stream; `software` is what follows
     /// "SSH-2.0-" in the server's version line.
-    pub fn new(link: &'a mut dyn Link, host: &'a HostKey, seed: &[u8; 32], software: &str) -> Self {
+    pub fn new(
+        link: &'a mut dyn Link,
+        host: &'a HostKey,
+        primitives: &'a dyn Primitives,
+        seed: &[u8; 32],
+        software: &str,
+    ) -> Self {
         let mut v_s = Vec::with_capacity(8 + software.len());
         v_s.extend_from_slice(b"SSH-2.0-");
         v_s.extend_from_slice(software.as_bytes());
         Self {
             link,
             host,
-            rng: Rng::new(seed),
+            primitives,
+            rng: Rng::new(primitives, seed),
             input: vec![0u8; INPUT_SIZE],
             start: 0,
             end: 0,
@@ -529,8 +538,8 @@ impl<'a> Transport<'a> {
         let mut key_out = derive(&shared, &exchange_hash, b'D', &session_id);
         let mut key_in = derive(&shared, &exchange_hash, b'C', &session_id);
         shared.zeroize();
-        let send_next = ChaChaPoly::new(&key_out);
-        let recv_next = ChaChaPoly::new(&key_in);
+        let send_next = ChaChaPoly::new(self.primitives, &key_out);
+        let recv_next = ChaChaPoly::new(self.primitives, &key_in);
         key_out.zeroize();
         key_in.zeroize();
 

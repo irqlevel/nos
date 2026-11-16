@@ -682,6 +682,7 @@ version = "0.1.0"
 dependencies = [
  "codec",
  "conf",
+ "crypto",
  "diskimage",
  "firewall",
  "hv",
@@ -787,6 +788,7 @@ dependencies = [
 name = "mod-sshd"
 version = "0.1.0"
 dependencies = [
+ "crypto",
  "kcore",
  "kmod",
  "ssh",
@@ -1038,7 +1040,6 @@ dependencies = [
  "cpufeatures",
  "opaque-debug",
  "universal-hash",
- "zeroize",
 ]
 
 [[package]]
@@ -1409,9 +1410,7 @@ dependencies = [
 name = "ssh"
 version = "0.1.0"
 dependencies = [
- "chacha20",
  "ed25519-dalek",
- "poly1305",
  "sha2",
  "subtle",
  "x25519-dalek",
@@ -1559,9 +1558,6 @@ dependencies = [
 [[package]]
 name = "vnetwire"
 version = "0.1.0"
-dependencies = [
- "chacha20poly1305",
-]
 
 [[package]]
 name = "wasi"

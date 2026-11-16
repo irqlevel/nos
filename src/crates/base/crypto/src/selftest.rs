@@ -55,6 +55,17 @@ const STREAM_CIPHERTEXT: [u8; 114] = [
     0x87, 0x4d,
 ];
 
+/// RFC 8439 2.5.2: Poly1305 alone, a message of 34 bytes, its last block
+/// cut short and padded as Poly1305 pads it.
+const POLY_KEY: [u8; 32] = [
+    0x85, 0xd6, 0xbe, 0x78, 0x57, 0x55, 0x6d, 0x33, 0x7f, 0x44, 0x52, 0xfe, 0x42, 0xd5, 0x06, 0xa8,
+    0x01, 0x03, 0x80, 0x8a, 0xfb, 0x0d, 0xb2, 0xfd, 0x4a, 0xbf, 0xf6, 0xaf, 0x41, 0x49, 0xf5, 0x1b,
+];
+const POLY_MESSAGE: &[u8] = b"Cryptographic Forum Research Group";
+const POLY_TAG: [u8; TAG_LEN] = [
+    0xa8, 0x06, 0x1d, 0xc1, 0x30, 0x51, 0x36, 0xc6, 0xc2, 0x2b, 0x8b, 0xaf, 0x0c, 0x01, 0x27, 0xa9,
+];
+
 /// The paths to drive, as masks of what a section may use: the integer
 /// code; then, where the CPU has them, x86-64's SSSE3 ChaCha20 with integer
 /// Poly1305, the same with AVX Poly1305, and AVX2's both -- arm64's NEON.
@@ -129,6 +140,17 @@ fn known_answers(mask: u32) {
     data.copy_from_slice(SUNSCREEN);
     let _ = stream.seal(paths, &STREAM_NONCE, &[], &mut data);
     assert!(data == STREAM_CIPHERTEXT, "crypto selftest: RFC 8439 2.4.2's key stream wrong, paths {:#x}", mask);
+
+    /* The two halves on their own: ChaCha20 from 2.4.2's counter block --
+     * block 1, then the nonce's words -- and Poly1305 as 2.5.2 has it */
+    let word = |i: usize| {
+        u32::from_le_bytes([STREAM_NONCE[4 * i], STREAM_NONCE[4 * i + 1], STREAM_NONCE[4 * i + 2], STREAM_NONCE[4 * i + 3]])
+    };
+    data.copy_from_slice(SUNSCREEN);
+    crate::chacha20_with(paths, &STREAM_KEY, &[1, word(0), word(1), word(2)], &mut data);
+    assert!(data == STREAM_CIPHERTEXT, "crypto selftest: chacha20 from 2.4.2's counter block wrong, paths {:#x}", mask);
+    assert!(crate::poly1305_with(paths, &POLY_KEY, POLY_MESSAGE) == POLY_TAG,
+        "crypto selftest: RFC 8439 2.5.2's Poly1305 wrong, paths {:#x}", mask);
 }
 
 fn paths_agree(inputs: &mut Inputs, seed: u64, len: usize, misalign: usize) {
@@ -159,6 +181,28 @@ fn paths_agree(inputs: &mut Inputs, seed: u64, len: usize, misalign: usize) {
         let other = MASKS[(MASKS.iter().position(|&m| m == mask).unwrap_or(0) + 1) % MASKS.len()];
         assert!(aead.open(Paths::Only(other), &nonce, aad, data, &tag).is_ok() && *data == plaintext[..],
             "crypto selftest: paths {:#x} open {} bytes (at +{}) wrong, seed {:#x}", other, len, misalign, seed);
+    }
+
+    /* The halves on their own, each path held to the integer code over
+     * the message where it lies: Poly1305, its last block as Poly1305 pads
+     * it, and ChaCha20 from a counter block of any nonce -- one low, or the
+     * last that leaves the message's blocks below 2^32 */
+    let blocks = (len as u64).div_ceil(64);
+    let start = if inputs.next() & 1 == 0 { (inputs.next() as u32) >> 8 } else { ((1u64 << 32) - blocks) as u32 };
+    let counter = [start, inputs.next() as u32, inputs.next() as u32, inputs.next() as u32];
+    let reference_mac = crate::poly1305_with(Paths::Only(0), &key, &plaintext);
+    let mut reference_stream = plaintext.clone();
+    crate::chacha20_with(Paths::Only(0), &key, &counter, &mut reference_stream);
+    for &mask in MASKS.iter() {
+        let data = &mut storage[misalign..];
+        data.copy_from_slice(&plaintext);
+        assert!(crate::poly1305_with(Paths::Only(mask), &key, data) == reference_mac,
+            "crypto selftest: paths {:#x} Poly1305 over {} bytes (at +{}) unlike the integer code's, seed {:#x}",
+            mask, len, misalign, seed);
+        crate::chacha20_with(Paths::Only(mask), &key, &counter, data);
+        assert!(*data == reference_stream[..],
+            "crypto selftest: paths {:#x} ChaCha20 from block {:#x} over {} bytes (at +{}) unlike the integer code's, seed {:#x}",
+            mask, start, len, misalign, seed);
     }
 
     /* A tag that is not the message's: refused, the message untouched */

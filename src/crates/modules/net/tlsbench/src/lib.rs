@@ -9,7 +9,9 @@
 //! crate), the AES-GCM suites on RustCrypto's portable code; which is
 //! cheapest here is this command's to say -- and, last, what the cipher
 //! alone gives, the crypto crate's against RustCrypto's portable one, so
-//! that what the session costs on top of it shows.
+//! that what the session costs on top of it shows: in TLS's 16 KB records,
+//! and in the 1400-byte datagrams vnet's tunnel seals a guest's full-size
+//! packet in, where what a message costs besides its bytes shows.
 //!
 //!     insmod /tlsbench.ko
 //!     tlsbench                    every suite, 16 MB each way
@@ -47,6 +49,10 @@ const MAX_MB: u64 = 1024;
 const PIPE_CAP: usize = 128 * 1024;
 /// What a write hands the session at a time: a record's worth.
 const CHUNK: usize = 16 * 1024;
+/// A guest's full-size packet as vnet's tunnel seals it, its header the
+/// associated data.
+const DATAGRAM: usize = 1400;
+const DATAGRAM_AAD: usize = 16;
 /// What waits encrypted, at most, before the writer flushes.
 const MAX_PENDING: usize = 64 * 1024;
 /// How long any one wait of the run may take before it is called stuck.
@@ -306,27 +312,28 @@ fn one(suite: Suite, mb: u64, ids: &Ids, out: &mut Output) -> Result<(), String>
 /// kernel's SIMD sections, which the suites run on, and by RustCrypto's
 /// portable code, which they ran on before it. What the session costs on
 /// top of its cipher is the difference between this line and a suite's.
-fn aead_alone(mb: u64, out: &mut Output) -> Result<(), String> {
+/// The cipher alone, `mb` megabytes in messages of `size` bytes, each with
+/// `aad` for associated data.
+fn aead_alone(mb: u64, size: usize, aad: &[u8], what: &str, out: &mut Output) -> Result<(), String> {
     use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 
-    let records = (mb * MB / CHUNK as u64).max(1);
+    let records = (mb * MB / size as u64).max(1);
     let key = [0x5Au8; crypto::KEY_LEN];
-    let aad = [0x17u8, 0x03, 0x03, 0x40, 0x11];
     let mut nonce = [0u8; crypto::NONCE_LEN];
-    let mut buf = vec![0u8; CHUNK];
+    let mut buf = vec![0u8; size];
 
     let ours = crypto::ChaCha20Poly1305::new(&key);
     let t0 = boot_time_ns();
     for i in 0..records {
         nonce[..8].copy_from_slice(&i.to_le_bytes());
-        let _ = ours.seal_in_place(&nonce, &aad, &mut buf);
+        let _ = ours.seal_in_place(&nonce, aad, &mut buf);
     }
     let t1 = boot_time_ns();
     let mut tag = [0u8; crypto::TAG_LEN];
     for i in 0..records {
         nonce[..8].copy_from_slice(&i.to_le_bytes());
-        tag = ours.seal_in_place(&nonce, &aad, &mut buf);
-        ours.open_in_place(&nonce, &aad, &mut buf, &tag).map_err(|_| "the crypto crate refused its own record")?;
+        tag = ours.seal_in_place(&nonce, aad, &mut buf);
+        ours.open_in_place(&nonce, aad, &mut buf, &tag).map_err(|_| "the crypto crate refused its own record")?;
     }
     let t2 = boot_time_ns();
     let _ = tag;
@@ -335,19 +342,19 @@ fn aead_alone(mb: u64, out: &mut Output) -> Result<(), String> {
     let t3 = boot_time_ns();
     for i in 0..records {
         nonce[..8].copy_from_slice(&i.to_le_bytes());
-        theirs.encrypt_in_place_detached(&nonce.into(), &aad, &mut buf).map_err(|_| "RustCrypto sealed nothing")?;
+        theirs.encrypt_in_place_detached(&nonce.into(), aad, &mut buf).map_err(|_| "RustCrypto sealed nothing")?;
     }
     let t4 = boot_time_ns();
 
-    let bytes = records * CHUNK as u64;
+    let bytes = records * size as u64;
     let seal = rate(bytes, t1 - t0);
     /* A record sealed and opened in the second loop: what it took a byte,
      * less the seal's, is the open's */
     let open = rate(bytes, (t2 - t1).saturating_sub(t1 - t0).max(1));
     let portable = rate(bytes, t4 - t3);
-    let _ = writeln!(out, "{:<18} {} MB in 16 KB records, one CPU: CRYPTOGAMS' {} code seal {}.{} MB/s, open {}.{} \
-                           MB/s; RustCrypto's portable seal {}.{} MB/s", "chacha20-poly1305", records * CHUNK as u64 / MB,
-                     crypto::code(), seal.0, seal.1, open.0, open.1, portable.0, portable.1);
+    let _ = writeln!(out, "{:<18} {} MB in {}, one CPU: CRYPTOGAMS' {} code seal {}.{} MB/s, open {}.{} MB/s; \
+                           RustCrypto's portable seal {}.{} MB/s", "chacha20-poly1305", bytes / MB, what, crypto::code(),
+                     seal.0, seal.1, open.0, open.1, portable.0, portable.1);
     Ok(())
 }
 
@@ -375,7 +382,8 @@ fn run(args: &str, out: &mut Output) -> Result<(), String> {
         one(suite, mb, &ids, out)?;
     }
     let _ = writeln!(out, "tlsbench: the cipher alone");
-    aead_alone(mb, out)?;
+    aead_alone(mb, CHUNK, &[0x17, 0x03, 0x03, 0x40, 0x11], "16 KB records", out)?;
+    aead_alone(mb, DATAGRAM, &[0x01; DATAGRAM_AAD], "1400-byte datagrams", out)?;
     Ok(())
 }
 

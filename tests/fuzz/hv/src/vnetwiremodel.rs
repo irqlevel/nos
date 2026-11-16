@@ -9,8 +9,12 @@
 
 use std::collections::BTreeSet;
 
+use chacha20poly1305::aead::AeadInPlace;
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
+
 use vnetwire::{Header, Kind, Message, OpenError, Window, HEADER, KEY, MESSAGE_MAX, TAG, WINDOW};
 
+use crate::aead::RustCrypto;
 use crate::targets::Input;
 
 /// The window as the model has it: every counter taken, the newest.
@@ -67,16 +71,35 @@ pub fn vnetwire_target(r: &mut Input) {
                 let packet: Vec<u8> = (0..r.below(200)).map(|_| r.u8()).collect();
                 let header = Header { kind: r.pick(&KINDS), network: r.u32() & 0xFF_FFFF, key: r.u32(), counter };
                 let mut out = vec![0u8; HEADER + packet.len() + TAG + r.below(4) as usize];
-                let n = vnetwire::seal(&key, &header, &packet, &mut out).expect("room for it");
+                let n = vnetwire::seal(&RustCrypto, &key, &header, &packet, &mut out).expect("room for it");
                 invariant!(n == HEADER + packet.len() + TAG, "a datagram of {} bytes for a packet of {}", n, packet.len());
                 invariant!(Header::read(&out[..n]) == Some(header), "a header not read back as written");
+                /* The wire as plans/vnet.md has it, made here without vnetwire:
+                 * the header's bytes, then the packet sealed under the nonce
+                 * of four zero bytes and the counter's eight, big-endian, the
+                 * header the associated data, then the tag -- what hosts of
+                 * any build of hv seal and open alike */
+                let mut nonce = [0u8; 12];
+                nonce[4..].copy_from_slice(&counter.to_be_bytes());
+                let mut head = [0u8; HEADER];
+                head[0] = header.kind as u8;
+                head[1..4].copy_from_slice(&header.network.to_be_bytes()[1..]);
+                head[4..8].copy_from_slice(&header.key.to_be_bytes());
+                head[8..].copy_from_slice(&counter.to_be_bytes());
+                let mut body = packet.clone();
+                let tag = ChaCha20Poly1305::new(&key.into())
+                    .encrypt_in_place_detached(&nonce.into(), &head, &mut body)
+                    .expect("a packet RustCrypto seals");
+                invariant!(out[..HEADER] == head && out[HEADER..HEADER + packet.len()] == body[..]
+                           && out[HEADER + packet.len()..n] == tag[..],
+                           "a datagram at counter {} unlike the wire's: {:02x?}", counter, &out[..n]);
                 /* No nonce twice under a key: the same packet at another
                  * counter enciphered to other bytes -- the tag differs
                  * anyway, the header being in it; of 16 bytes or more, two
                  * keystreams alike by chance are no matter */
                 let mut again = vec![0u8; n];
                 let next = Header { counter: counter.wrapping_add(1 + r.below(4)), ..header };
-                let m = vnetwire::seal(&key, &next, &packet, &mut again).expect("room for it");
+                let m = vnetwire::seal(&RustCrypto, &key, &next, &packet, &mut again).expect("room for it");
                 let body = HEADER..HEADER + packet.len();
                 invariant!(m == n && (packet.len() < 16 || again[body.clone()] != out[body]),
                            "a packet of {} bytes enciphered alike at counters {} and {}", packet.len(), counter,
@@ -94,7 +117,7 @@ pub fn vnetwire_target(r: &mut Input) {
                 invariant!(fresh == seen.fresh(header.counter), "counter {} fresh {}, the model's {}", header.counter,
                            fresh, seen.fresh(header.counter));
                 let mut buf = d.clone();
-                match vnetwire::open(&key, &mut buf) {
+                match vnetwire::open(&RustCrypto, &key, &mut buf) {
                     Ok((h, p)) => {
                         invariant!(h == header && p == packet.as_slice(), "a datagram opened to another packet");
                     }
@@ -117,18 +140,18 @@ pub fn vnetwire_target(r: &mut Input) {
                 if r.bool() {
                     let at = r.below(buf.len() as u64) as usize;
                     buf[at] ^= 1 << r.below(8);
-                    let res = vnetwire::open(&key, &mut buf);
+                    let res = vnetwire::open(&RustCrypto, &key, &mut buf);
                     /* A kind changed to none there is reads as no header */
                     invariant!(matches!(res, Err(OpenError::Forged) | Err(OpenError::Malformed)),
                                "a datagram changed at byte {} opened: {:?}", at, res.map(|(h, _)| h));
                 } else {
-                    invariant!(vnetwire::open(&other, &mut buf) == Err(OpenError::Forged), "opened with another key");
+                    invariant!(vnetwire::open(&RustCrypto, &other, &mut buf) == Err(OpenError::Forged), "opened with another key");
                 }
             }
             4 => {
                 /* Too short for a header and a tag */
                 let mut buf: Vec<u8> = (0..r.below((HEADER + TAG) as u64)).map(|_| r.u8()).collect();
-                invariant!(vnetwire::open(&key, &mut buf) == Err(OpenError::Malformed), "a scrap opened");
+                invariant!(vnetwire::open(&RustCrypto, &key, &mut buf) == Err(OpenError::Malformed), "a scrap opened");
             }
             5 => {
                 /* Counters around the window's edges, taken by the window
