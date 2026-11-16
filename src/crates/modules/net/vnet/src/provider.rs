@@ -5,7 +5,8 @@
 //!
 //! - reads: `status` (this host's member, and why it did not start where it
 //!   did not), `hosts` (the members), `networks`, `ports`, `public`,
-//!   `firewalls`, `firewall` (one, its rules among it), `alerts`;
+//!   `firewalls`, `firewall` (one, its rules among it), `rules` (every
+//!   firewall's, a row each: the panel's table of them), `alerts`;
 //! - actions: `init`, `host_remove`, `network_create`, `network_delete`,
 //!   `port_move`, `port_delete`, `port_firewall`, `public_add`, `public_set`,
 //!   `public_move`, `public_remove`, `firewall_create`, `firewall_delete`,
@@ -41,7 +42,7 @@ use crate::{ModState, NO_MEMBER};
 
 const DESCRIPTOR: &str = include_str!("vnet.descriptor.json");
 
-const METHODS: [Method; 30] = [
+const METHODS: [Method; 31] = [
     Method { name: "status", kind: Kind::Read },
     Method { name: "hosts", kind: Kind::Read },
     Method { name: "networks", kind: Kind::Read },
@@ -49,6 +50,7 @@ const METHODS: [Method; 30] = [
     Method { name: "public", kind: Kind::Read },
     Method { name: "firewalls", kind: Kind::Read },
     Method { name: "firewall", kind: Kind::Read },
+    Method { name: "rules", kind: Kind::Read },
     Method { name: "alerts", kind: Kind::Read },
     Method { name: "init", kind: Kind::Action },
     Method { name: "host_add", kind: Kind::Job },
@@ -144,6 +146,7 @@ fn provide(state: &Arc<ModState>, method: &str, params: &[u8], call: &mut Call) 
         "public" => public(state, p, call),
         "firewalls" => firewalls(state, p, call),
         "firewall" => firewall(state, p, call),
+        "rules" => rules(state, p, call),
         "alerts" => alerts(state, p, call),
         "init" => init(state, p, call),
         "host_add" => host_job(state, p, call, false),
@@ -413,6 +416,31 @@ fn firewall(state: &ModState, mut p: Params<'_>, call: &mut Call) -> Result<Stat
             w.field_uint("n", j as u64 + 1);
             w.field_str("rule", &alloc::format!("{}", r));
             w.end_object();
+        }
+        w.end_list();
+        w.end_object();
+    }))
+}
+
+/// Every firewall's rules, a row each, in their order -- what the panel's
+/// table of them lists, each row's `id` its firewall and number, as hv's
+/// `fw` provider has its own.
+fn rules(state: &ModState, p: Params<'_>, call: &mut Call) -> Result<Status, Refused> {
+    finish(p)?;
+    let v = ops::member_view(state)?;
+    Ok(answer(call, |w| {
+        w.begin_object();
+        w.key("rules");
+        w.begin_list();
+        for f in v.state.firewalls() {
+            for (j, r) in f.rules.iter().enumerate() {
+                w.begin_object();
+                w.field_str("id", &alloc::format!("{}/{}", f.name, j + 1));
+                w.field_str("firewall", &f.name);
+                w.field_uint("n", j as u64 + 1);
+                w.field_str("rule", &alloc::format!("{}", r));
+                w.end_object();
+            }
         }
         w.end_list();
         w.end_object();
