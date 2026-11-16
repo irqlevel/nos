@@ -84,9 +84,11 @@ EXT4_FEATURES_OK=" has_journal ext_attr resize_inode dir_index filetype extent 6
 # replaced, /etc/rc goes in the first time only, and nos-install stays in
 # the image. An image holding anything else is refused: poured, that part
 # would be left out without a word, as /lib/hvboot was by v0.0.26's own
-# nos-install, so a file the image gains is added here too
-SYSTEM="boot/kernel64.elf lib/modules lib/hvboot lib/panel VERSION"
-LAYOUT=" $SYSTEM lib/panel/bundle boot/grub/nos.cfg etc/rc nos-install boot boot/grub etc lib "
+# nos-install, so a file the image gains is added here too. /lib/licenses
+# holds the notices of the code the kernel and its modules carry, and goes
+# with them
+SYSTEM="boot/kernel64.elf lib/modules lib/hvboot lib/panel lib/licenses VERSION"
+LAYOUT=" $SYSTEM lib/panel/bundle lib/licenses/CRYPTOGAMS boot/grub/nos.cfg etc/rc nos-install boot boot/grub etc lib "
 # The management panel's lines of /etc/rc (--panel): hv and the host API,
 # then the panel's VM -- made at the first boot, started at every one after
 PANEL_RC=(

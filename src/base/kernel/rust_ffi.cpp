@@ -13,6 +13,7 @@
 #include "sched.h"
 #include "preempt.h"
 #include "cpu.h"
+#include "simd.h"
 #include "interrupt.h"
 #include <hal/cpu.h>
 #include <hal/random.h>
@@ -2638,6 +2639,46 @@ int kernel_preempt_can_block()
 int kernel_interrupts_enabled()
 {
     return hal::is_interrupt_enabled() ? 1 : 0;
+}
+
+/* The kernel's SIMD sections (kernel/simd.h), for the crypto crate through
+   kcore::simd: what a section may use on every CPU, as hal/simd.h's bits;
+   one opened on the CPU the caller runs on -- 1, the vector registers its
+   until kernel_simd_end, or 0, nothing changed, where none can be had; and
+   that one closed. */
+unsigned int kernel_simd_features()
+{
+    return kernel::simd::features();
+}
+
+int kernel_simd_begin()
+{
+    return kernel::simd::begin() ? 1 : 0;
+}
+
+void kernel_simd_end()
+{
+    kernel::simd::end();
+}
+
+/* Whose x87, SSE and AVX registers a CPU holds, for hv's guests (hvarch's
+   fp.rs through kcore::simd): whether guest `id`'s, as its last exit there
+   left them; that its entry there has just put them in; that the CPU's are
+   nobody's. A section marks its CPU's nobody's, so that the next entry puts
+   the guest's back. A cpu out of range holds nobody's. */
+int kernel_simd_guest_is(unsigned int cpu, unsigned long long id)
+{
+    return kernel::simd::guest_registers_are(cpu, id) ? 1 : 0;
+}
+
+void kernel_simd_guest_loaded(unsigned int cpu, unsigned long long id)
+{
+    kernel::simd::guest_registers_loaded(cpu, id);
+}
+
+void kernel_simd_guest_lost(unsigned int cpu)
+{
+    kernel::simd::guest_registers_lost(cpu);
 }
 
 /* Whether a panic has started: what tells code to write without taking a

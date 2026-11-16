@@ -144,6 +144,9 @@ pub extern "C" fn rust_test() {
        answered, as JSON */
     system::selftest();
     random::selftest();
+    /* CRYPTOGAMS' ChaCha20-Poly1305: its known answers on every code path
+       this CPU has, and each path against the integer one */
+    crypto::selftest();
     sha256::selftest();
     crc32::selftest();
     frames::selftest();

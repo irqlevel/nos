@@ -24,6 +24,7 @@
 #include "console.h"
 #include "input.h"
 #include "softirq.h"
+#include "simd.h"
 #include "irq_balance.h"
 #include "time.h"
 #include <arch/x86_64/tsc.h>
@@ -287,6 +288,9 @@ __attribute__((noinline)) void ap_main2()
     /* As the BSP did: every CPU the same, or an lfence; rdtsc on this one
        would not be ordered as it is on the others. */
     hal::setup_serializing_lfence();
+    /* Its vector unit for SIMD sections, as the BSP's, before it runs a
+       task that could open one */
+    simd::setup_cpu(false);
 
     if (Parameters::get_instance().is_smp_off())
         PANIC("AP cpu started while smp is off");
@@ -1068,6 +1072,10 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
            (ap_main2). */
         if (hal::setup_serializing_lfence())
             klog(0, "cpu: LFENCE made dispatch-serializing (DE_CFG bit 1 was clear)");
+        /* The vector unit for SIMD sections, before anything can open one:
+           the self-tests' and rust_init's crypto. The APs do the same
+           (ap_main2). */
+        simd::setup_cpu(true);
         /* The clock the CPU's own to pick, up to its turbo, rather than
            firmware's base: the APs do the same (ap_main2). */
         hal::CpuPerformance perf;

@@ -13,9 +13,11 @@ target = "x86_64-unknown-none"
 # The RustCrypto crates dispatch to SSE2/AVX2 intrinsics at runtime, and
 # compile those paths unconditionally -- which LLVM cannot legalize for a
 # target with SSE turned off ("Do not know how to split the result of this
-# operator"). The kernel keeps SSE off on purpose: it saves no XMM state on a
-# context switch. These cfgs are the crates' own documented switch to the
-# portable, constant-time software backends.
+# operator"). The kernel keeps the compilers off SSE on purpose: it saves no
+# XMM state on a context switch, and lends the vector registers only to a
+# SIMD section (kernel/simd.h) -- the crypto crate's CRYPTOGAMS assembly.
+# These cfgs are the crates' own documented switch to the portable,
+# constant-time software backends.
 [target.x86_64-unknown-none]
 rustflags = ["-Ccode-model=large", "-Cforce-frame-pointers=yes", "--cfg", "aes_force_soft", "--cfg", "polyval_force_soft", "--cfg", "poly1305_force_soft", "--cfg", "chacha20_force_soft", "--cfg", "curve25519_dalek_backend=\"serial\""]
 

@@ -16,6 +16,7 @@
 #include "tracepoint.h"
 #include "trace_ring.h"
 #include "interrupt.h"
+#include "simd.h"
 #include <hal/cpu.h>
 #include <hal/irqchip.h>
 
@@ -926,6 +927,51 @@ stdlib::Error test_contiguous_pages()
    byte of what was written; and the counts where they began. With a pool,
    a block zeroed page by page into the known-zero ones, handed out as it
    is and read, and back. */
+/* The SIMD section (kernel/simd.h): one opened where there is a vector
+   unit, a second refused on the CPU while it is open, and a guest's
+   registers on that CPU marked nobody's by it -- the mark that makes hv put
+   them back at the guest's next entry, without which a guest would resume
+   with what the section left. And with no vector unit, none opened. */
+stdlib::Error test_simd_section()
+{
+    /* A number hvarch never gives a guest -- it counts them from 1 -- and no
+       guest runs this early anyway */
+    static const u64 GUEST = ~0ULL - 0x51D;
+
+    if (simd::features() == 0)
+    {
+        if (simd::begin())
+        {
+            simd::end();
+            klog(0, "test_simd_section: a section opened with no vector unit");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
+        }
+        return make_success();
+    }
+
+    preempt_disable();
+    ulong cpu = CpuTable::get_instance().get_current_cpu_id();
+    simd::guest_registers_loaded(cpu, GUEST);
+    bool marked = simd::guest_registers_are(cpu, GUEST);
+    bool opened = simd::begin();
+    bool second = opened && simd::begin();
+    if (second)
+        simd::end();
+    if (opened)
+        simd::end();
+    bool unmarked = !simd::guest_registers_are(cpu, GUEST);
+    simd::guest_registers_lost(cpu);
+    preempt_enable();
+
+    if (!marked || !opened || second || !unmarked)
+    {
+        klog(0, "test_simd_section: guest marked %d, section opened %d, a second opened %d, mark gone after %d",
+            marked, opened, second, unmarked);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+    }
+    return make_success();
+}
+
 stdlib::Error test_zero_free()
 {
     auto& pt = mm::PageTable::get_instance();
@@ -3779,6 +3825,10 @@ stdlib::Error test()
         return err;
 
     err = test_modules();
+    if (!err.ok())
+        return err;
+
+    err = test_simd_section();
     if (!err.ok())
         return err;
 
