@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import type { Metadata } from "next";
 import { ArticleView } from "@/components/ArticleView";
 import { JsonLd } from "@/components/JsonLd";
@@ -14,11 +17,27 @@ interface Props {
 
 // Each language's video: its voice and its subtitles are that language's, and so is the panel in it.
 const video = (locale: Locale) => ({
-    src: `/video/nos-demo-${locale}.mp4`,
-    poster: `/video/nos-demo-${locale}.jpg`,
-    card: `/video/nos-demo-${locale}-card.png`,
+    src: versioned(`/video/nos-demo-${locale}.mp4`),
+    poster: versioned(`/video/nos-demo-${locale}.jpg`),
+    card: versioned(`/video/nos-demo-${locale}-card.png`),
     seconds: SECONDS[locale],
 });
+
+/*
+ * A file of public/ by a URL that names its content (?v=, the start of its
+ * SHA-256), read when the page is built: Caddy has browsers keep such a URL
+ * for a year (the Caddyfile), so a new cut of a video is a new URL and no
+ * one is left with the old one.
+ */
+const hashes = new Map<string, string>();
+function versioned(file: string): string {
+    let hash = hashes.get(file);
+    if (hash === undefined) {
+        hash = createHash("sha256").update(readFileSync(path.join(process.cwd(), "public", file))).digest("hex").slice(0, 12);
+        hashes.set(file, hash);
+    }
+    return `${file}?v=${hash}`;
+}
 // The videos' lengths, for the structured data: ffprobe's, rounded.
 const SECONDS: Record<Locale, number> = { en: 264, ru: 265 };
 const PUBLISHED = "2026-11-16";
