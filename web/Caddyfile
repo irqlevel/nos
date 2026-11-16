@@ -16,10 +16,32 @@ www.{$DOMAIN} {
 		Strict-Transport-Security "max-age=31536000"
 		-Server
 	}
-	reverse_proxy web:3000 {
-		# A release replaces the web container: hold a request for up to
-		# 15 s until the new one answers, rather than answer it with a 502.
-		lb_try_duration 15s
-		lb_try_interval 250ms
+	# The demo videos, their posters and cards, served by Caddy itself from
+	# the volume docker-compose.yml's `media` service fills, rather than
+	# passed byte by byte through Next. A file the volume does not hold yet
+	# goes to Next, which has them all too. A URL that names its file's
+	# content (?v=, as the pages give them) is the same bytes for good, and
+	# browsers keep it for a year; one without is checked again each time.
+	@media {
+		path /video/*
+		file {
+			root /srv/media
+		}
+	}
+	handle @media {
+		root * /srv/media
+		@versioned query v=*
+		header @versioned Cache-Control "public, max-age=31536000, immutable"
+		@unversioned not query v=*
+		header @unversioned Cache-Control "public, max-age=0"
+		file_server
+	}
+	handle {
+		reverse_proxy web:3000 {
+			# A release replaces the web container: hold a request for up to
+			# 15 s until the new one answers, rather than answer it with a 502.
+			lb_try_duration 15s
+			lb_try_interval 250ms
+		}
 	}
 }

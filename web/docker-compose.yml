@@ -30,6 +30,12 @@ services:
     # A release pins IMAGE_VERSION; a plain `docker compose up --build` makes :latest.
     image: ${IMAGE_NAME:-nos-web}:${IMAGE_VERSION:-latest}
     restart: unless-stopped
+    # Its pages name each video by its content (?v=, which Caddy has browsers
+    # keep for a year): started only once `media` has put that content where
+    # Caddy serves it from, so no browser keeps an old file under a new name.
+    depends_on:
+      media:
+        condition: service_completed_successfully
     # Reached only through Caddy, on the compose network.
     expose:
       - "3000"
@@ -41,6 +47,24 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+
+  # The videos, copied out of the web image into the volume Caddy serves
+  # /video/ from by itself (Range requests and all, on every core) rather than
+  # pass each byte through Next: runs at every release, then exits.
+  media:
+    image: ${IMAGE_NAME:-nos-web}:${IMAGE_VERSION:-latest}
+    pull_policy: never
+    restart: "no"
+    command: ["media-sync"]
+    # The volume is root's; nothing else here is anyone's to write.
+    user: "0:0"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - media:/media
 
   caddy:
     image: caddy:2.11-alpine
@@ -63,7 +87,10 @@ services:
       # The certificates and the ACME account: keep them, or every restart asks Let's Encrypt again.
       - caddy_data:/data
       - caddy_config:/config
+      # The videos `media` copies out of the web image.
+      - media:/srv/media:ro
 
 volumes:
   caddy_data:
   caddy_config:
+  media:
