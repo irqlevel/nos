@@ -345,6 +345,11 @@ body {
     border-radius: 8px;
     /* A screenshot's own background is the page's: its edge would not show */
     border: 1px solid var(--line);
+    /* Nothing to select in a screenshot, so no Live Text over it either:
+       Safari laid a screenshot's recognised words over the page, out of
+       place, once it had been opened full size */
+    -webkit-user-select: none;
+    user-select: none;
 }
 
 /*
