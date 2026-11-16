@@ -16,3 +16,5 @@ raft = { path = "../raft" }
 ipcwire = { path = "../../ipc/ipcwire" }
 # Its commands', answers' and snapshots' bytes.
 codec = { path = "../../codec" }
+# Who votes: the first five hosts to join, as in every group of hosts.
+members = { path = "../members" }

@@ -117,6 +117,38 @@ fn noise(seed: u32, n: usize) -> Vec<u8> {
     v
 }
 
+/// What the firewall makes of a frame, as the model reads it
+/// (`Model::fw_seen`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FwSeen {
+    NotIp,
+    V6,
+    /// An IPv4 fragment, or IPv4 that does not hold together.
+    Bad,
+    V4 { src: u32, dst: u32 },
+}
+
+/// The place of the firewall every port here is judged by: one that allows
+/// everything either way, so that what the switch did before firewalls --
+/// which this target's model knows -- it does still, but for what a
+/// firewall cannot judge (`Model::fw_seen`).
+const ALLOW_ALL: usize = 0;
+
+/// `ALLOW_ALL`'s firewall, put in its place: its rules read as the module
+/// reads a file's.
+fn allow_all(sw: &Switch) {
+    let mut rules = firewall::Rules::DEFAULT;
+    rules.inbound = firewall::Action::Allow;
+    rules.outbound = firewall::Action::Allow;
+    sw.install(ALLOW_ALL, &rules).expect("a place for a firewall");
+}
+
+/// A port's counts as the model keeps them: the flows its firewall holds
+/// and gave up for room are the `firewall` target's.
+fn counted(c: switch::PortCounts) -> switch::PortCounts {
+    switch::PortCounts { evicted: 0, flows: 0, ..c }
+}
+
 fn port_of(mac: &[u8]) -> Option<usize> {
     if mac[..5] != PORT_MAC_PREFIX {
         return None;
@@ -235,6 +267,14 @@ struct Model {
     /// is lost instead: what one sent as the port changes hands may come
     /// to, for the VM going or the VM coming (`hand_over`).
     lose: Option<usize>,
+    /// Packets each port's firewall kept from its VM, and from going out of
+    /// it. Every port here is on a firewall that allows everything either
+    /// way (`ALLOW_ALL`): what it keeps out is what it cannot judge -- an
+    /// IPv4 fragment, IPv4 that does not hold together -- and what is not
+    /// its VM's, IPv4 to it for another address (the `firewall` target holds
+    /// the rules and the flows to a model of their own).
+    denied_in: [u64; MAX_PORTS],
+    denied_out: [u64; MAX_PORTS],
 }
 
 /// A send to every port's worth of a port's flood bucket, as time: what the
@@ -271,6 +311,8 @@ impl Model {
             stack: Vec::new(),
             refuse: false,
             lose: None,
+            denied_in: [0; MAX_PORTS],
+            denied_out: [0; MAX_PORTS],
         }
     }
 
@@ -291,6 +333,8 @@ impl Model {
         self.over_share[p] = 0;
         self.flooded[p] = 0;
         self.flood[p] = (FLOOD_FULL_NS, time::peek());
+        self.denied_in[p] = 0;
+        self.denied_out[p] = 0;
     }
 
     /// Port `p` given up, with what waited for its VM and the IPv6 addresses
@@ -311,10 +355,99 @@ impl Model {
         woken
     }
 
-    /// What port `p`'s guest lost, as the switch counts it.
+    /// What port `p`'s guest lost, as the switch counts it -- but for the
+    /// flows its firewall holds and gave up, which `counted` leaves out of
+    /// both.
     fn counts(&self, p: usize) -> switch::PortCounts {
         switch::PortCounts { dropped: self.dropped[p], spoofed: self.spoofed[p], over_share: self.over_share[p],
-                             flooded: self.flooded[p], isolated: self.isolated[p] }
+                             flooded: self.flooded[p], isolated: self.isolated[p], misdirected: 0, oversize: 0,
+                             denied_in: self.denied_in[p], denied_out: self.denied_out[p], evicted: 0, flows: 0 }
+    }
+
+    /// What the firewall makes of `frame` -- read as a send of TCP whole
+    /// where `whole`, its IP length then the whole send's -- read here as
+    /// the module's documents say, sharing nothing with `firewall::read`.
+    fn fw_seen(frame: &[u8], whole: bool) -> FwSeen {
+        if frame.len() < ETH_HDR_LEN {
+            return FwSeen::NotIp;
+        }
+        match wire::be16(frame, 12) {
+            0x0800 => {}
+            0x86DD => return FwSeen::V6,
+            _ => return if whole { FwSeen::Bad } else { FwSeen::NotIp },
+        }
+        let p = &frame[ETH_HDR_LEN..];
+        if p.len() < 20 || p[0] >> 4 != 4 || (p[0] & 0xF) < 5 {
+            return FwSeen::Bad;
+        }
+        let ihl = usize::from(p[0] & 0xF) * 4;
+        let proto = p[9];
+        let end = if whole {
+            if proto != 6 {
+                return FwSeen::Bad;
+            }
+            p.len()
+        } else {
+            let total = usize::from(u16::from_be_bytes([p[2], p[3]]));
+            if total < ihl || total > p.len() {
+                return FwSeen::Bad;
+            }
+            total
+        };
+        if ihl > end {
+            return FwSeen::Bad;
+        }
+        let frag = u16::from_be_bytes([p[6], p[7]]);
+        if frag & 0x3FFF != 0 {
+            return FwSeen::Bad;
+        }
+        let least = match proto {
+            6 => 20,
+            17 | 1 => 8,
+            _ => 0,
+        };
+        if end - ihl < least {
+            return FwSeen::Bad;
+        }
+        let src = u32::from_be_bytes([p[12], p[13], p[14], p[15]]);
+        let dst = u32::from_be_bytes([p[16], p[17], p[18], p[19]]);
+        FwSeen::V4 { src, dst }
+    }
+
+    /// Whether port `p`'s firewall lets `frame` out of its VM: not a free
+    /// port's, nothing it cannot judge.
+    fn fw_out(&mut self, p: usize, frame: &[u8], whole: bool) -> bool {
+        if !self.owned[p] {
+            return false;
+        }
+        let pass = !matches!(Self::fw_seen(frame, whole), FwSeen::Bad);
+        if !pass {
+            self.denied_out[p] += 1;
+        }
+        pass
+    }
+
+    /// Whether port `q`'s firewall lets `frame` in to its VM: a free port
+    /// lets nothing in, and counts nothing; IPv4 from the host goes by
+    /// unjudged; anything else of IPv4 it cannot judge, or for another
+    /// address than the VM's and no group's, is kept out.
+    fn fw_in(&mut self, q: usize, frame: &[u8], whole: bool) -> bool {
+        if !self.owned[q] {
+            return false;
+        }
+        let pass = match Self::fw_seen(frame, whole) {
+            FwSeen::NotIp | FwSeen::V6 => true,
+            FwSeen::Bad => false,
+            FwSeen::V4 { src, .. } if src == HOST_IP => true,
+            FwSeen::V4 { dst, .. } => {
+                let group = dst == u32::MAX || dst == (HOST_IP & MASK) | !MASK || dst >> 28 == 0xE;
+                group || dst == switch::port_ip(q)
+            }
+        };
+        if !pass {
+            self.denied_in[q] += 1;
+        }
+        pass
     }
 
     /// Whether the frame at hand is lost for port `p` (`lose`): once.
@@ -561,8 +694,14 @@ impl Model {
         }
         if matches!(self.admit(from, frame), Admit::Own) && frame[0] & 1 == 0 {
             if let Some(q) = port_of(&frame[..6]) {
-                if q != from && self.same(from, q) && self.deliver_whole(q, frame) {
-                    return;
+                if q != from && self.same(from, q) {
+                    /* Judged once, whole, by both firewalls. */
+                    if !self.fw_out(from, frame, true) || !self.fw_in(q, frame, true) {
+                        return;
+                    }
+                    if self.deliver_whole(q, frame) {
+                        return;
+                    }
                 }
             }
         }
@@ -584,10 +723,12 @@ impl Model {
         {
             if let Some(q) = port_of(&frame[..6]) {
                 if q != from && self.same(from, q) {
-                    if self.takes_partial[q] {
-                        self.deliver_kind(q, frame, Kind::Partial(start, offset));
-                    } else {
-                        self.deliver(q, &f);
+                    if self.fw_out(from, frame, false) && self.fw_in(q, frame, false) {
+                        if self.takes_partial[q] {
+                            self.deliver_kind(q, frame, Kind::Partial(start, offset));
+                        } else {
+                            self.deliver(q, &f);
+                        }
                     }
                     return;
                 }
@@ -677,7 +818,7 @@ impl Model {
                     /* The DNS server the kernel has as the message is answered,
                      * not as some guest last started. */
                     let net = dhcp::Network { server_ip: HOST_IP, server_mac: HOST_MAC, mask: MASK,
-                                              dns: network::dns::upstream() };
+                                              dns: network::dns::upstream(), mtu: 0 };
                     let mut reply = [0u8; dhcp::REPLY_MAX];
                     match dhcp::answer(frame, switch::port_ip(p), &net, &mut reply) {
                         Some(len) => {
@@ -700,6 +841,9 @@ impl Model {
                     return;
                 }
             }
+            if !self.fw_out(p, frame, false) {
+                return;
+            }
         }
         let dst = &frame[..6];
         /* IPv6 is the guests' alone: nos speaks none. */
@@ -719,7 +863,11 @@ impl Model {
                      * port takes nothing anyway. */
                     match from {
                         Some(p) if self.owned[q] && !self.same(p, q) => self.isolated[p] += 1,
-                        _ => self.deliver(q, frame),
+                        _ => {
+                            if self.fw_in(q, frame, false) {
+                                self.deliver(q, frame);
+                            }
+                        }
                     }
                 }
                 return;
@@ -733,7 +881,7 @@ impl Model {
         }
         /* Every port of its network's, or -- from `hv0` -- every port. */
         for q in 0..MAX_PORTS {
-            if Some(q) != from && from.map_or(true, |p| self.same(p, q)) {
+            if Some(q) != from && from.map_or(true, |p| self.same(p, q)) && self.fw_in(q, frame, false) {
                 self.deliver(q, frame);
             }
         }
@@ -1123,7 +1271,7 @@ fn hand_over(r: &mut Input, sw: &Arc<Switch>, m: &mut Model, s: usize, q: usize,
         Box::new(move || {
             sw.release(q);
             let vm = Arc::new(Shared::default());
-            let got = sw.claim_at(q, &vm, name);
+            let got = sw.claim_at(q, &vm, name, ALLOW_ALL);
             if let Some(t) = takes {
                 sw.backend(q).takes(t);
             }
@@ -1171,7 +1319,7 @@ fn hand_over(r: &mut Input, sw: &Arc<Switch>, m: &mut Model, s: usize, q: usize,
     }
     backends[q] = Some(came);
     let is = |v: &Model, left: u64| {
-        (0..MAX_PORTS).all(|p| sw.counts(p) == v.counts(p))
+        (0..MAX_PORTS).all(|p| counted(sw.counts(p)) == v.counts(p))
             && sw.host_counts() == (v.to_host, v.refused, v.dhcp, v.foreign)
             && sw.ipv6_counts() == (v.advertised, v.bound.len())
             && stack == v.stack && hv0_in == v.stack
@@ -1285,6 +1433,7 @@ pub fn switch_target(r: &mut Input) {
     let dns = r.pick(&[0u32, 0x0808_0808, 0x0A00_0203]);
     network::dns::UPSTREAM.store(dns, std::sync::atomic::Ordering::Relaxed);
     let sw = Arc::new(Switch::new().expect("a switch"));
+    allow_all(&sw);
     let mut m = Model::new();
     let mut vms: Vec<Option<Arc<Shared>>> = vec![None; MAX_PORTS];
     let mut backends: Vec<Option<switch::PortBackend>> = (0..MAX_PORTS).map(|_| None).collect();
@@ -1312,9 +1461,9 @@ pub fn switch_target(r: &mut Input) {
                  * one past the last among those asked for. */
                 let (got, want) = if r.u8() < 64 {
                     let q = r.below(MAX_PORTS as u64 + 1) as usize;
-                    (sw.claim_at(q, &vm, name), (q < MAX_PORTS && !m.owned[q]).then_some(q))
+                    (sw.claim_at(q, &vm, name, ALLOW_ALL), (q < MAX_PORTS && !m.owned[q]).then_some(q))
                 } else {
-                    (sw.claim(&vm, name), (0..MAX_PORTS).find(|&p| !m.owned[p]))
+                    (sw.claim(&vm, name, ALLOW_ALL), (0..MAX_PORTS).find(|&p| !m.owned[p]))
                 };
                 match (got, want) {
                     (Ok(p), Some(q)) => {
@@ -1522,7 +1671,7 @@ pub fn switch_target(r: &mut Input) {
         }
         /* The counts, and what the stack was handed, as the model has them. */
         for p in 0..MAX_PORTS {
-            invariant!(sw.counts(p) == m.counts(p), "port {} lost {:?}, the model {:?}", p, sw.counts(p),
+            invariant!(counted(sw.counts(p)) == m.counts(p), "port {} lost {:?}, the model {:?}", p, sw.counts(p),
                        m.counts(p));
         }
         let counts = sw.host_counts();
@@ -2642,6 +2791,403 @@ pub fn nat_target(r: &mut Input) {
     }
 }
 
+/* ---- one to one, and the networks behind hv0 ---- */
+
+/// The world's addresses: where a guest's packets go, and what reaches a
+/// public address.
+const WORLD: [u32; 4] = [0x5DB8_D822, 0x0808_0808, 0xC633_6407, 0x2E04_0102];
+/// What is not the world's, to a public address: the deny list's -- a
+/// private network, link-local, the shared space -- and no host's at all.
+const NOT_WORLD: [u32; 6] = [0x0A00_6405, 0xC0A8_0105, 0xA9FE_A9FE, 0x6440_0001, 0xE000_0001, 0];
+/// Public addresses a host rents: in test networks, and one on the uplink's
+/// own subnet, as a cloud's additional address is.
+const PUBLICS: [u32; 4] = [0xCB00_7109, 0xCB00_710A, 0xC633_640B, 0x5F10_2099];
+/// The uplink: its address, the subnet's neighbour, and its gateway.
+const UPLINK_IP: u32 = 0x5F10_2030;
+const UPLINK_MASK: u32 = 0xFFFF_FF00;
+const NEIGHBOUR: u32 = 0x5F10_2007;
+const NEIGHBOUR_MAC: [u8; 6] = [0x52, 0x55, 0x0A, 0, 2, 7];
+/// A network behind hv0 besides its own, and one that overlaps its subnet.
+const INSIDE_NET: u32 = 0x0A0A_0000;
+const INSIDE_MASK: u32 = 0xFFFF_FF00;
+const INSIDE_GW: u32 = 0x0A0A_0001;
+/// The deny list NAT holds a guest's packets to, as the model has it.
+const DENIED_NETS: [(u32, u32); 5] = [(0xA9FE_0000, 0xFFFF_0000), (0x0A00_0000, 0xFF00_0000),
+                                      (0xAC10_0000, 0xFFF0_0000), (0xC0A8_0000, 0xFFFF_0000),
+                                      (0x6440_0000, 0xFFC0_0000)];
+
+/// What the model knows of a public address mapped one to one.
+#[derive(Clone, Copy, Debug)]
+struct OneMap {
+    inner: u32,
+    mac: [u8; 6],
+    mtu: u16,
+}
+
+#[derive(Default)]
+struct OneModel {
+    maps: BTreeMap<u32, OneMap>,
+    inside: bool,
+    /// What `nat allow` let through, read as the input begins: kept across
+    /// inputs, by the nat target's ops.
+    allowed: Vec<(u32, u32)>,
+}
+
+impl OneModel {
+    fn kept(&self, addr: u32) -> bool {
+        DENIED_NETS.iter().any(|&(n, m)| addr & m == n) && !self.allowed.iter().any(|&(n, m)| addr & m == n)
+    }
+
+    fn host(addr: u32) -> bool {
+        let first = addr >> 24;
+        first != 0 && first != 127 && addr < 0xE000_0000
+    }
+
+    fn world(&self, addr: u32) -> bool {
+        Self::host(addr) && addr != ETH0.ip() && addr != HOST_IP && !self.kept(addr)
+    }
+
+    fn behind(&self, addr: u32) -> bool {
+        addr & MASK == SUBNET || (self.inside && addr & INSIDE_MASK == INSIDE_NET)
+    }
+
+    fn by_inner(&self, addr: u32) -> Option<(u32, OneMap)> {
+        self.maps.iter().find(|(_, m)| m.inner == addr).map(|(&p, &m)| (p, m))
+    }
+}
+
+/// What NAT counts a packet one to one -- or one it drops either way -- as.
+fn one_fates() -> [usize; 8] {
+    let c = &COUNTERS;
+    let l = |a: &std::sync::atomic::AtomicUsize| a.load(std::sync::atomic::Ordering::Relaxed);
+    [l(&c.one_out), l(&c.one_in), l(&c.not_world), l(&c.too_big), l(&c.refused), l(&c.denied), l(&c.no_hop),
+     l(&c.no_frame)]
+}
+
+/// A packet NAT took for one to one counted once, as what became of it;
+/// one it did not take not at all.
+fn one_counted(taken: bool, before: [usize; 8], after: [usize; 8], what: &str) {
+    let fates: usize = before.iter().zip(after.iter()).map(|(b, a)| a - b).sum();
+    invariant!(fates == usize::from(taken), "{}: {} taken, counted {} times", what, taken, fates);
+}
+
+/// Every byte of a packet NAT passed on one to one as it came, but the
+/// address it rewrote, the TTL, and the checksums over them: `addr_at` the
+/// address's offset in the IP header. A transport's checksum holds after as
+/// it held before -- right stays right, wrong stays wrong.
+fn one_same(inp: &[u8], out: &[u8], addr_at: usize, what: &str) {
+    invariant!(inp.len() == out.len(), "{}: {} bytes became {}", what, inp.len(), out.len());
+    let (pi, po) = (&inp[ETH_HDR_LEN..], &out[ETH_HDR_LEN..]);
+    let ihl = ip::header_len(pi);
+    let proto = ip::protocol(pi);
+    invariant!(wire::checksum(&po[..ihl]) == 0, "{}: the header's checksum is wrong", what);
+    invariant!(po[ip::TTL] == pi[ip::TTL] - 1, "{}: TTL {} -> {}", what, pi[ip::TTL], po[ip::TTL]);
+    let l4_sum = match proto {
+        IP_PROTO_TCP => ihl + tcp::CHECKSUM..ihl + tcp::CHECKSUM + 2,
+        IP_PROTO_UDP => ihl + udp::CHECKSUM..ihl + udp::CHECKSUM + 2,
+        _ => ihl + icmp::CHECKSUM..ihl + icmp::CHECKSUM + 2,
+    };
+    let quoted = if proto == IP_PROTO_ICMP { ihl + ICMP_HDR_LEN..po.len() } else { 0..0 };
+    same_but(pi, po, &[ip::TTL..ip::TTL + 1, ip::CHECKSUM..ip::CHECKSUM + 2, addr_at..addr_at + 4, l4_sum, quoted],
+             what);
+    let total = usize::from(ip::total_len(pi));
+    let (li, lo) = (&pi[ihl..total], &po[ihl..total]);
+    let before = l4_sum_holds(proto, ip::src(pi), ip::dst(pi), li);
+    let after = l4_sum_holds(proto, ip::src(po), ip::dst(po), lo);
+    invariant!(before == after, "{}: the transport's checksum held {:?}, now {:?}", what, before, after);
+}
+
+/// An ICMP error's quoted packet, made to say `want` at `field` and its
+/// header's checksum right, the message's own checksum right: what NAT does
+/// to an error about a packet that went one to one.
+fn one_quoted(out: &[u8], field: usize, want: u32, what: &str) {
+    let po = &out[ETH_HDR_LEN..];
+    let ihl = ip::header_len(po);
+    let total = usize::from(ip::total_len(po));
+    let msg = &po[ihl..total];
+    invariant!(wire::checksum(msg) == 0, "{}: the error's checksum is wrong", what);
+    let q = &msg[ICMP_HDR_LEN..];
+    let qihl = ip::header_len(q);
+    invariant!(wire::be32(q, field) == want, "{}: it quotes {:#x}, not {:#x}", what, wire::be32(q, field), want);
+    invariant!(wire::checksum(&q[..qihl]) == 0, "{}: the quoted header's checksum is wrong", what);
+}
+
+/// A packet, its transport `proto` -- or an ICMP error quoting `quoting`
+/// -- from `src` to `dst`, `len` of payload, DF or not.
+#[allow(clippy::too_many_arguments)]
+fn one_packet(r: &mut Input, proto: u8, src: u32, dst: u32, payload: usize, ttl: u8, df: bool,
+              quoting: Option<(u32, u32)>) -> Vec<u8> {
+    let l4 = match quoting {
+        Some((qsrc, qdst)) => {
+            let (sport, dport) = (r.u16(), r.u16());
+            let inner = transport(r, IP_PROTO_UDP, qsrc, qdst, sport, dport, 4, Sum::Right, 0, 0);
+            let q = ipv4(IP_HDR_LEN, r.u16(), 0, 64, IP_PROTO_UDP, qsrc, qdst, &inner, IP_HDR_LEN + inner.len(), false);
+            let mut msg = vec![0u8; ICMP_HDR_LEN];
+            msg.extend_from_slice(&q[..IP_HDR_LEN + 8]);
+            let n = msg.len();
+            icmp::write(&mut msg, r.pick(&[icmp::DEST_UNREACH, icmp::TIME_EXCEEDED]), 3, 0, 0, n);
+            msg
+        }
+        None => {
+            let sum = sum_kind(r, proto);
+            let kind = r.pick(&[icmp::ECHO_REQUEST, icmp::ECHO_REPLY]);
+            let (sport, dport) = (r.u16(), r.pick(&[22u16, 53, 80, 443]));
+            transport(r, proto, src, dst, sport, dport, payload, sum, tcp::ACK_FLAG, kind)
+        }
+    };
+    let frag = if df { ip::DONT_FRAGMENT } else { 0 } | if r.u8() < 4 { ip::MORE_FRAGMENTS } else { 0 };
+    let p = quoting.map_or(proto, |_| IP_PROTO_ICMP);
+    ipv4(IP_HDR_LEN, r.u16(), frag, ttl, p, src, dst, &l4, IP_HDR_LEN + l4.len(), r.u8() < 3)
+}
+
+/// The world to a public address, through the uplink.
+fn one_in_op(r: &mut Input, m: &OneModel) {
+    let dst = r.pick(&PUBLICS);
+    let src = if r.u8() < 200 { r.pick(&WORLD) } else { r.pick(&NOT_WORLD) };
+    let mapped = m.maps.get(&dst).copied();
+    let proto = r.pick(&[IP_PROTO_TCP, IP_PROTO_UDP, IP_PROTO_ICMP]);
+    let quoting = (r.u8() < 40).then(|| (dst, r.pick(&WORLD)));
+    let payload = if r.u8() < 30 { 1400 + r.below(200) as usize } else { r.below(300) as usize };
+    let ttl = r.pick(&[64u8, 64, 1, 2]);
+    let df = r.u8() < 160;
+    let packet = one_packet(r, proto, src, dst, payload, ttl, df, quoting);
+    let frame = ethernet(ETH0_MAC, GW_MAC, &packet);
+    let whole = ip::header_len(&packet) != 0 && wire::checksum(&packet[..IP_HDR_LEN]) == 0
+        && !ip::is_fragment(&packet);
+
+    let before = one_fates();
+    let taken = nat::intercept(&ETH0, &frame);
+    one_counted(taken, before, one_fates(), "the world's packet to a public address");
+    let back = HV0.take_sent();
+    let out = ETH0.take_sent();
+    let Some(one) = mapped else {
+        invariant!(!taken && back.is_empty() && out.is_empty(), "a packet for {:#x}, mapped to nobody, taken", dst);
+        return;
+    };
+    invariant!(taken, "a packet for {:#x}, mapped to {:#x}, left to the stack", dst, one.inner);
+    let fits = packet.len() <= usize::from(one.mtu);
+    let goes = whole && m.world(src) && ttl > 1 && fits;
+    if !goes {
+        invariant!(back.is_empty(), "a packet for {:#x} from {:#x} (whole {}, ttl {}, {} bytes, MTU {}) let in",
+                   dst, src, whole, ttl, packet.len(), one.mtu);
+        /* "Too big" at most, from the public address, to the sender */
+        invariant!(out.len() <= usize::from(whole && m.world(src) && ttl > 1 && !fits && df),
+                   "{} packets out for one the guest could not take", out.len());
+        if let Some(o) = out.first() {
+            let po = &o[ETH_HDR_LEN..];
+            let l4 = &po[ip::header_len(po)..];
+            invariant!(ip::src(po) == dst && ip::dst(po) == src && icmp::kind(l4) == icmp::DEST_UNREACH
+                       && icmp::code(l4) == 4 && wire::be16(l4, 6) == one.mtu && wire::checksum(l4) == 0,
+                       "\"too big\" not as RFC 1191 has it: {:02x?}", &o[..o.len().min(64)]);
+        }
+        return;
+    }
+    invariant!(out.is_empty(), "the world's packet sent back out to the world");
+    if HV0.refuse.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    invariant!(back.len() == 1, "{} packets in for one to {:#x}", back.len(), dst);
+    let b = &back[0];
+    invariant!(b[..6] == one.mac && b[6..12] == HOST_MAC, "in to {:02x?} from {:02x?}", &b[..6], &b[6..12]);
+    let pb = &b[ETH_HDR_LEN..];
+    invariant!(ip::dst(pb) == one.inner && ip::src(pb) == src, "in as {:#x} -> {:#x}", ip::src(pb), ip::dst(pb));
+    one_same(&frame, b, ip::DST, "in one to one");
+    if quoting.is_some() {
+        one_quoted(b, ip::SRC, one.inner, "an error in about the guest's packet");
+    }
+}
+
+/// A guest to the world, through hv0.
+fn one_out_op(r: &mut Input, m: &OneModel) {
+    let mapped: Vec<(u32, OneMap)> = m.maps.iter().map(|(&p, &o)| (p, o)).collect();
+    let (src, one) = if !mapped.is_empty() && r.u8() < 220 {
+        let (p, o) = mapped[r.below(mapped.len() as u64) as usize];
+        (o.inner, Some((p, o)))
+    } else {
+        let s = if m.inside && r.bool() { INSIDE_NET | 9 } else { SUBNET | (2 + r.below(16) as u32) };
+        (s, m.by_inner(s))
+    };
+    let dst = match r.u8() % 8 {
+        0 => r.pick(&NOT_WORLD),
+        1 => NEIGHBOUR,
+        2 => r.pick(&[ETH0.ip(), HOST_IP]),
+        3 => r.pick(&[SUBNET | 5, INSIDE_NET | 5]),
+        _ => r.pick(&WORLD),
+    };
+    let proto = r.pick(&[IP_PROTO_TCP, IP_PROTO_UDP, IP_PROTO_ICMP]);
+    let quoting = (one.is_some() && r.u8() < 40).then(|| (r.pick(&WORLD), src));
+    let ttl = r.pick(&[64u8, 64, 1, 2]);
+    let (payload, df) = (r.below(300) as usize, r.bool());
+    let packet = one_packet(r, proto, src, dst, payload, ttl, df, quoting);
+    let frame = ethernet(HOST_MAC, guest_mac(src), &packet);
+    let whole = wire::checksum(&packet[..IP_HDR_LEN]) == 0 && !ip::is_fragment(&packet);
+
+    let before = one_fates();
+    let masq = counters();
+    let taken = nat::intercept(&HV0, &frame);
+    let sent = ETH0.take_sent();
+    let back = HV0.take_sent();
+    let Some((public, o)) = one else {
+        /* The masquerade's, as the nat target holds it: never out as a
+         * public address */
+        invariant!(sent.iter().all(|s| !PUBLICS.contains(&ip::src(&s[ETH_HDR_LEN..]))),
+                   "a guest mapped to no public address went out as one");
+        invariant!(sent.iter().all(|s| ip::src(&s[ETH_HDR_LEN..]) == ETH0.ip()),
+                   "a masqueraded packet out from another address");
+        let _ = masq;
+        return;
+    };
+    one_counted(taken, before, one_fates(), "a mapped guest's packet out");
+    let stacks = dst == ETH0.ip() || dst == HOST_IP || m.behind(dst) || !OneModel::host(dst);
+    if stacks {
+        invariant!(!taken && sent.is_empty() && back.is_empty(), "a mapped guest's packet for {:#x} taken", dst);
+        return;
+    }
+    invariant!(taken, "a mapped guest's packet for {:#x} left to the stack", dst);
+    let goes = whole && !m.kept(dst) && ttl > 1;
+    if !goes {
+        invariant!(sent.is_empty(), "a mapped guest's packet out for {:#x} (whole {}, kept {}, ttl {})", dst, whole,
+                   m.kept(dst), ttl);
+        /* A rejection at most, from its gateway, for a kept address */
+        invariant!(back.len() <= usize::from(whole && m.kept(dst)), "{} packets back for one", back.len());
+        if let Some(b) = back.first() {
+            let gw = if src & INSIDE_MASK == INSIDE_NET { INSIDE_GW } else { HOST_IP };
+            let pb = &b[ETH_HDR_LEN..];
+            invariant!(ip::src(pb) == gw && ip::dst(pb) == src, "rejected from {:#x} to {:#x}", ip::src(pb), ip::dst(pb));
+        }
+        return;
+    }
+    invariant!(back.is_empty(), "a mapped guest's packet out sent back too");
+    let hop_known = crate::abi::arp_table().and_then(|a| a.lookup(ETH0.route_ip(dst))).is_some();
+    if !hop_known || ETH0.refuse.load(std::sync::atomic::Ordering::Relaxed) {
+        invariant!(sent.is_empty(), "out with no next hop known");
+        return;
+    }
+    invariant!(sent.len() == 1, "{} packets out for one from {:#x}", sent.len(), src);
+    let s = &sent[0];
+    let ps = &s[ETH_HDR_LEN..];
+    invariant!(ip::src(ps) == public && ip::dst(ps) == dst, "out as {:#x} -> {:#x}, not from {:#x}", ip::src(ps),
+               ip::dst(ps), public);
+    invariant!(s[6..12] == ETH0_MAC, "out from {:02x?}", &s[6..12]);
+    one_same(&frame, s, ip::SRC, "out one to one");
+    if quoting.is_some() {
+        one_quoted(s, ip::DST, public, "an error out about a packet to the guest");
+    }
+    let _ = o;
+}
+
+/// Public addresses mapped one to one and unmapped, a network behind hv0
+/// put there and taken away, packets both ways -- the world's to a public
+/// address, a mapped guest's out -- each held byte by byte to the model;
+/// NAT off and on with them; and ARP answered for what is mapped alone.
+pub fn one_target(r: &mut Input) {
+    network::reset();
+    HV0.set(HOST_MAC, HOST_IP, MASK, 0);
+    ETH0.set(ETH0_MAC, UPLINK_IP, UPLINK_MASK, UPLINK_IP & UPLINK_MASK | 1);
+    network::dns::UPSTREAM.store(0, std::sync::atomic::Ordering::Relaxed);
+    network::arp_learn(ETH0.gw(), GW_MAC);
+    if r.bool() {
+        network::arp_learn(NEIGHBOUR, NEIGHBOUR_MAC);
+    }
+    let nat = crate::abi::nat().expect("NAT");
+    if nat.enable(&HV0, None).is_err() {
+        /* On already from an input before: off and on again, empty */
+        nat::kernel_net_nat_disable(HV0.handle());
+        invariant!(nat.enable(&HV0, None).is_ok(), "NAT would not go on");
+    }
+    let mut m = OneModel::default();
+    let mut allowed = [(0, 0); nat::ALLOWED_MAX];
+    let n = nat.allowed(&mut allowed);
+    m.allowed = allowed[..n].to_vec();
+    let handle = HV0.handle();
+
+    while let Some(op) = r.op(8) {
+        match op {
+            0 => {
+                /* A mapping, refused as the rules say */
+                let public = if r.u8() < 230 { r.pick(&PUBLICS) } else { r.pick(&[ETH0.ip(), HOST_IP, 0, 0xE000_0001]) };
+                let inner = match r.u8() % 6 {
+                    0 => HOST_IP,
+                    1 => INSIDE_NET | 9,
+                    2 => r.pick(&WORLD),
+                    _ => SUBNET | (2 + r.below(16) as u32),
+                };
+                let mtu = r.pick(&[1500u16, 1500, 1420, 576, 60]);
+                let mac = guest_mac(inner);
+                let word = u64::from_be_bytes([0, 0, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]]);
+                let announced_before = crate::abi::arp_table().map_or(0, |a| a.announced.lock().unwrap().len());
+                let code = nat::kernel_net_nat_map(handle, public, inner, word, u32::from(mtu));
+                let bad = !OneModel::host(public) || public == ETH0.ip() || public == HOST_IP || mtu < 68
+                    || !m.behind(inner) || inner == HOST_IP || inner == INSIDE_GW;
+                let want = if bad {
+                    3
+                } else if m.maps.contains_key(&public) || m.by_inner(inner).is_some() {
+                    2
+                } else {
+                    0
+                };
+                invariant!(code == want, "map {:#x} -> {:#x} MTU {}: {}, not {}", public, inner, mtu, code, want);
+                if code == 0 {
+                    m.maps.insert(public, OneMap { inner, mac, mtu });
+                    let announced = crate::abi::arp_table().map_or(0, |a| a.announced.lock().unwrap().len());
+                    invariant!(announced == announced_before + 1, "{:#x} mapped and not announced", public);
+                }
+            }
+            1 => {
+                let public = r.pick(&PUBLICS);
+                let was = nat::kernel_net_nat_unmap(handle, public);
+                invariant!(was == i32::from(m.maps.remove(&public).is_some()), "unmap {:#x}: {}", public, was);
+            }
+            2 => {
+                /* The network behind hv0: put there, taken away -- its
+                 * guests' mappings with it -- or refused */
+                if m.inside && r.bool() {
+                    invariant!(nat::kernel_net_nat_outside(handle, INSIDE_NET, INSIDE_MASK) == 1, "outside");
+                    m.inside = false;
+                    m.maps.retain(|_, o| o.inner & INSIDE_MASK != INSIDE_NET);
+                } else {
+                    let (net, mask, gw) = r.pick(&[(INSIDE_NET, INSIDE_MASK, INSIDE_GW), (SUBNET, MASK, HOST_IP),
+                                                   (INSIDE_NET, 0, INSIDE_GW), (INSIDE_NET, INSIDE_MASK, SUBNET | 1)]);
+                    let code = nat::kernel_net_nat_inside(handle, net, mask, gw);
+                    let want = if mask == 0 || gw & mask != net & mask {
+                        3
+                    } else if net == SUBNET || m.inside {
+                        2
+                    } else {
+                        0
+                    };
+                    invariant!(code == want, "inside {:#x}/{:#x} gw {:#x}: {}, not {}", net, mask, gw, code, want);
+                    m.inside |= code == 0;
+                }
+            }
+            3 | 4 => one_in_op(r, &m),
+            5 | 6 => one_out_op(r, &m),
+            _ => {
+                if r.u8() < 64 {
+                    /* Off and on: everything mapped goes with it */
+                    invariant!(nat::kernel_net_nat_disable(handle) == 1, "NAT was not on");
+                    invariant!(nat::kernel_net_nat_enable(0, handle).code == 0, "NAT back on");
+                    m.maps.clear();
+                    m.inside = false;
+                } else {
+                    HV0.refuse.store(r.u8() < 32, std::sync::atomic::Ordering::Relaxed);
+                    ETH0.refuse.store(r.u8() < 32, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        /* ARP answered for a public address on the uplink while it is
+         * mapped, and nowhere else */
+        for &p in &PUBLICS {
+            invariant!(nat::answers_for(&ETH0, p) == m.maps.contains_key(&p), "ARP for {:#x}: mapped {}", p,
+                       m.maps.contains_key(&p));
+            invariant!(!nat::answers_for(&HV0, p), "ARP for {:#x} on hv0", p);
+        }
+    }
+    HV0.refuse.store(false, std::sync::atomic::Ordering::Relaxed);
+    ETH0.refuse.store(false, std::sync::atomic::Ordering::Relaxed);
+    nat::kernel_net_nat_disable(handle);
+}
+
 /* ---- the whole of it: guests on the switch, NAT on through it ---- */
 
 /// Whether `f` is sent as the guest on port `q`, which is all the switch may
@@ -2690,6 +3236,7 @@ pub fn guestnet_target(r: &mut Input) {
     ETH0.set(ETH0_MAC, outer_ip, 0xFFFF_FF00, gw);
     network::arp_learn(gw, GW_MAC);
     let sw = Switch::new().expect("a switch");
+    allow_all(&sw);
     invariant!(sw.way_out() == Ok(outer_ip), "no way out through an uplink with a gateway");
     invariant!(sw.nat_address() == Some(outer_ip), "NAT not on after the way out");
     let n = 2 + r.below(3) as usize;
@@ -2697,7 +3244,7 @@ pub fn guestnet_target(r: &mut Input) {
     let mut vms = Vec::new();
     for _ in 0..n {
         let vm = Arc::new(Shared::default());
-        let p = sw.claim(&vm, None).expect("a port");
+        let p = sw.claim(&vm, None, ALLOW_ALL).expect("a port");
         backends.push(sw.backend(p));
         vms.push(vm);
     }

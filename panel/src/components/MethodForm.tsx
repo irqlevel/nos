@@ -5,7 +5,7 @@ import { useEffect, useState } from 'react';
 import { CopyButton } from './CopyButton';
 import { JobWatch } from './JobWatch';
 import { call, Refusal, startJob } from '@/lib/client';
-import { Field, Method } from '@/lib/descriptor';
+import { Choices, Field, Method } from '@/lib/descriptor';
 import { addressFor, at, copyable, fillOf, ipOfUrl } from '@/lib/fills';
 import { Locale, text, Words } from '@/lib/i18n';
 
@@ -48,9 +48,10 @@ function valueOf(f: Field, raw: string, unit: number): { ok: true; v: unknown } 
  * before it runs -- with the value of `confirm_typed`'s parameter typed
  * again, where it has one; a job followed to its end. A form the panel can
  * fill in from another host of its own (`fills.ts`: an invitation, from the
- * host invited) has those hosts to choose from; what is too long to select
- * by eye in an answer -- an invitation's token -- has a button that copies
- * it. */
+ * host invited) has those hosts to choose from; a parameter whose values a
+ * read of the host's gives (`choices`: a VM's firewall) is a list of them;
+ * what is too long to select by eye in an answer -- an invitation's token --
+ * has a button that copies it. */
 export function MethodForm({ host, provider, name, method, fixed = {}, locale, w, onDone }: {
   host: string; provider: string; name: string; method: Method; fixed?: Record<string, unknown>;
   locale: Locale; w: Words; onDone?: () => void;
@@ -67,6 +68,11 @@ export function MethodForm({ host, provider, name, method, fixed = {}, locale, w
   const [typed, setTyped] = useState('');
   const [busy, setBusy] = useState(false);
   const fill = fillOf(provider, name);
+  /* What a parameter with `choices` is offered: each item's key in its
+   * read's answer -- none until it answers, nor where it fails, and the
+   * field is typed then. */
+  const [offered, setOffered] = useState<Record<string, string[]>>({});
+  const wanted = JSON.stringify(params.filter(([, f]) => f.choices).map(([k, f]) => [k, f.choices]));
   const [others, setOthers] = useState<Other[]>([]);
   const [filledFrom, setFilledFrom] = useState('');
   const [fillNote, setFillNote] = useState('');
@@ -80,6 +86,23 @@ export function MethodForm({ host, provider, name, method, fixed = {}, locale, w
    * parameter fixed -- a row's key, a VM's name -- below the form, or it
    * was said nowhere */
   const byField = error?.field !== undefined && params.some(([k]) => k === error.field);
+
+  /* The values each parameter with `choices` may take, read from the host */
+  useEffect(() => {
+    let live = true;
+    for (const [k, c] of JSON.parse(wanted) as Array<[string, Choices]>) {
+      void call(host, c.provider, c.method).then((r) => {
+        const items = r.ok ? (r.data as Record<string, unknown>)[c.items] : null;
+        if (!live || !Array.isArray(items)) return;
+        const keys = items.map((it) => (it as Record<string, unknown> | null)?.[c.key])
+          .filter((v) => typeof v === 'string' || typeof v === 'number').map(String);
+        setOffered((cur) => ({ ...cur, [k]: keys }));
+      });
+    }
+    return () => {
+      live = false;
+    };
+  }, [host, wanted]);
 
   /* The panel's other hosts, where the form can be filled in from one */
   useEffect(() => {
@@ -208,6 +231,14 @@ export function MethodForm({ host, provider, name, method, fixed = {}, locale, w
                 className="rounded-lg border border-line bg-bg px-2 py-1.5 text-fg">
                 <option value="">—</option>
                 {Object.entries(f.values ?? {}).map(([v, t]) => <option key={v} value={v}>{text(t, locale)}</option>)}
+              </select>
+            ) : offered[k] ? (
+              <select value={raw[k]} onChange={(e) => setRaw({ ...raw, [k]: e.target.value })} name={k}
+                className="rounded-lg border border-line bg-bg px-2 py-1.5 text-fg">
+                <option value="">—</option>
+                {(raw[k] && !offered[k].includes(raw[k]!) ? [raw[k]!, ...offered[k]] : offered[k]).map((v) => (
+                  <option key={v} value={v}>{v}</option>
+                ))}
               </select>
             ) : f.type === 'text' ? (
               <textarea value={raw[k]} onChange={(e) => setRaw({ ...raw, [k]: e.target.value })} name={k} rows={8}

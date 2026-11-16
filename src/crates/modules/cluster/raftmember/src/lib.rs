@@ -45,14 +45,27 @@
 //!   there is none to hand it to.
 //! - **Its stop**: the view says why, and whoever waits is told -- the
 //!   shell's requests not yet taken, its asks, the commands submitted.
+//!
+//! What every group's module does with its member -- starts it over its
+//! log, with the `begun` mark that keeps a member whose log is gone from
+//! starting as the one it was; stops it; probes the others' and recovers
+//! the last one standing -- is `host`'s; and a group whose hosts are
+//! offered it, NBS's and vnet's, has its offers, its listener and its
+//! members' commands in `offered` (plans/vnet.md, V1a).
 
 extern crate alloc;
 
 mod files;
+mod host;
+pub mod offered;
 /// ipcnet's control mailbox: ipcctl's, by the name the groups' modules know it.
 pub use ipcctl as ipcnet;
 
 pub use files::{create_dirs, KFiles};
+pub use host::{
+    clear_log, create_member_file, member_rsm, open_log, probe, read_member_file, recover, remove_member_file, Recovered,
+    Recovery, Runner, Starting, BEGUN_FILE, LOG_DIR, MEMBER_FILE,
+};
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
@@ -136,6 +149,8 @@ const ASK_GRACE_MS: u64 = 5000;
 /// How long a change the leader answered is waited for in this member's
 /// view: applied here too, what the shell reads next holds it.
 const VIEW_WAIT_MS: u64 = 5000;
+/// Between two reads asked of a member with no leader known (`read`).
+const READ_RETRY_MS: u64 = 100;
 /// How often a message of another group is said in the log at most.
 const OTHER_GROUP_SAY_MS: u64 = 10_000;
 /// How often a raft message refused for the host it came from, and a stall
@@ -262,6 +277,10 @@ pub type Outcome<A> = Result<<A as App>::Answer, String>;
 /// command was applied at -- 0 where it was not.
 pub type Slot<A> = Arc<Locked<Option<(Outcome<A>, u64)>>>;
 
+/// Where a read the shell asked for is answered (`read`): the entry the
+/// member had applied as the leader confirmed it, or why not.
+pub type ReadSlot = Arc<Locked<Option<Result<u64, String>>>>;
+
 /// A command the shell asks for.
 pub struct Request<A: App> {
     pub cmd: A::Command,
@@ -304,13 +323,15 @@ impl<A: App> Clone for View<A> {
 pub struct Shared<A: App> {
     pub stop: AtomicBool,
     pub requests: Locked<VecDeque<Request<A>>>,
+    /// Reads the shell asked for, not yet taken (`read`).
+    pub reads: Locked<VecDeque<ReadSlot>>,
     pub view: Locked<Option<View<A>>>,
 }
 
 impl<A: App> Shared<A> {
     pub fn new() -> Option<Shared<A>> {
         Some(Shared { stop: AtomicBool::new(false), requests: Locked::new(VecDeque::new())?,
-                      view: Locked::new(None)? })
+                      reads: Locked::new(VecDeque::new())?, view: Locked::new(None)? })
     }
 
     pub fn view(&self) -> Option<View<A>> {
@@ -361,6 +382,8 @@ pub struct Core<A: App> {
     said_refused: u64,
     /// The shell's asks in flight, each under a session of its own.
     asks: Asks<Slot<A>>,
+    /// The shell's reads asked of raft, by their request's number.
+    reading: BTreeMap<u64, ReadSlot>,
     /// As the leader, the members owed word of what it did for their asks.
     tell: Tell<Addr>,
     /// What `raft_role` and `raft_commit` last went by: the role, the term
@@ -452,6 +475,7 @@ impl<A: App> Core<A> {
                 retry: ASK_RETRY_MS * NS_PER_MS,
             }),
             tell: Tell::new(),
+            reading: BTreeMap::new(),
         })
     }
 
@@ -1066,9 +1090,33 @@ impl<A: App> Core<A> {
                     self.finish(app, w, Err(String::from("not applied: its number was gone by -- ask again")), 0);
                 }
             }
-            Event::Read { request, .. } => app.on_read(self, request, true),
-            Event::ReadFailed { request } => app.on_read(self, request, false),
+            Event::Read { request, .. } => match self.reading.remove(&request) {
+                Some(slot) => {
+                    let applied = self.rsm.applied();
+                    slot.with(|s| *s = Some(Ok(applied)));
+                }
+                None => app.on_read(self, request, true),
+            },
+            Event::ReadFailed { request } => match self.reading.remove(&request) {
+                Some(slot) => slot.with(|s| *s = Some(Err(String::from("not confirmed: the lead changed, or no \
+                                                                         answer came")))),
+                None => app.on_read(self, request, false),
+            },
             _ => {}
+        }
+    }
+
+    /// The shell's read asked of raft: answered in `slot` once the leader
+    /// confirms it and this member has applied as far, or at once where it
+    /// cannot be asked -- no leader known, as many reads waiting as raft
+    /// keeps.
+    fn ask_read(&mut self, slot: ReadSlot) {
+        let request = self.take_request();
+        match self.rsm.read(request, Vec::new()) {
+            Ok(()) => {
+                self.reading.insert(request, slot);
+            }
+            Err(e) => slot.with(|s| *s = Some(Err(alloc::format!("not asked: {:?}", e)))),
         }
     }
 
@@ -1275,6 +1323,10 @@ impl<A: App> Core<A> {
         for r in requests {
             r.done.with(|s| *s = Some((Err(alloc::format!("not asked: the member stopped -- {}", why)), 0)));
         }
+        let reads: Vec<ReadSlot> = shared.reads.with(|q| q.drain(..).collect());
+        for slot in reads.into_iter().chain(core::mem::take(&mut self.reading).into_values()) {
+            slot.with(|s| *s = Some(Err(alloc::format!("the member stopped -- {}", why))));
+        }
         let may = alloc::format!("the member stopped -- {}: it may yet be applied, look before asking again", why);
         for slot in self.asks.drain() {
             slot.with(|s| *s = Some((Err(may.clone()), 0)));
@@ -1386,6 +1438,10 @@ fn turns<A: App>(shared: &Shared<A>, app: &mut A, core: &mut Core<A>) -> Result<
                 core.stalled(missed);
             }
         }
+        let reads: Vec<ReadSlot> = shared.reads.with(|q| q.drain(..).collect());
+        for slot in reads {
+            core.ask_read(slot);
+        }
         let requests: Vec<Request<A>> = shared.requests.with(|q| q.drain(..).collect());
         for r in requests {
             if let Some(r) = app.take(core, r) {
@@ -1421,6 +1477,46 @@ fn stopped<A: App>(shared: &Shared<A>, no_member: &str) -> Option<String> {
         None => Some(String::from(no_member)),
         Some(v) => v.stopped.as_ref().map(|why| alloc::format!("the member stopped: {}", why)),
     })
+}
+
+/// A read of this member's state the leader confirms (raft's ReadIndex),
+/// asked again until it is or `wait_ms` has gone -- with no leader known, a
+/// read cannot be asked at all: the entry this member's view had applied
+/// by then, everything committed before the read was asked among it, or why
+/// not. Nothing is written to the log. `no_member` where there is none.
+pub fn read<A: App>(shared: &Shared<A>, no_member: &str, wait_ms: u64) -> Result<u64, String> {
+    let end = boot_time_ns() + wait_ms * NS_PER_MS;
+    loop {
+        if let Some(why) = stopped(shared, no_member) {
+            return Err(why);
+        }
+        let slot: ReadSlot = Arc::new(Locked::new(None).ok_or_else(|| String::from("out of memory"))?);
+        shared.reads.with(|q| q.push_back(slot.clone()));
+        /* Raft fails a read it cannot confirm within two of its longest
+           elections; past that and a grace, the member's task is not
+           turning */
+        let late = boot_time_ns() + (wait_ms + ASK_GRACE_MS) * NS_PER_MS;
+        let got = loop {
+            if let Some(got) = slot.with(|s| s.take()) {
+                break got;
+            }
+            if let Some(why) = stopped(shared, no_member) {
+                return Err(why);
+            }
+            if boot_time_ns() >= late {
+                return Err(String::from("no answer from this host's member"));
+            }
+            kcore::task::sleep_ms(ANSWER_POLL_MS);
+        };
+        match got {
+            Ok(index) => {
+                seen(shared, index);
+                return Ok(index);
+            }
+            Err(why) if boot_time_ns() >= end => return Err(why),
+            Err(_) => kcore::task::sleep_ms(READ_RETRY_MS),
+        }
+    }
 }
 
 /// Until this member's view has applied entry `index`, or VIEW_WAIT_MS has

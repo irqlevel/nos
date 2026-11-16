@@ -70,6 +70,9 @@ what it stores, then a volume's bytes through the chunk servers.
 - the leader cut off from the other two by the hub: they elect one of
   themselves and commit, while the one cut off commits nothing; healed, it
   follows the new leader;
+- a host's log lost -- its mds unloaded, `raft/` removed, its member file
+  and `begun` mark kept, loaded again: its member not started as the one it
+  was, and saying so (V1a);
 - a host's state lost -- its mds unloaded, its folder removed, loaded again:
   the leader says that host's mds has no member of its incarnation; an add
   of it refused, its old member being the cluster's; a replace -- a job
@@ -81,6 +84,10 @@ what it stores, then a volume's bytes through the chunk servers.
 - a member removed: two members left; its old incarnation refused when it is
   added again, since it never lost its state; its chunk server kept, taking
   no new chunks, and so a volume refused;
+- recover (V1a): refused while the majority answers; one of the two
+  members left killed for good, and the other -- once it follows no leader
+  -- told what it does, a name not the cluster's refused, then made the one
+  voter, the lost one removed: leading alone, committing;
 - nothing panicked.
 
     tests/nbs-test.py                  arm64: HVF on an Apple Silicon Mac, TCG otherwise
@@ -519,7 +526,7 @@ def main():
         out = a.run("nbs")
         check("a, in no NBS cluster yet, says so", "in no NBS cluster" in out, out)
         js = json_of(a.run("mgmt call nbs status"))
-        check("and through the bus", js == {"member": False}, js)
+        check("and through the bus: no member, and none stopped", js == {"member": False, "stopped": None}, js)
         # Made through the bus, as the panel makes it
         out = a.run('mgmt call nbs init {"name":"store"}')
         js = json_of(out)
@@ -1133,6 +1140,18 @@ def main():
         need("%s's incarnation known" % lost, len(old) == 1, old)
         old = old[0]
         sh[fi].run("rmmod nbs-mds")
+        # its log alone gone first, its member file and its begun mark kept
+        # (V1a): never started as the member it was, and saying so
+        sh[fi].run("rm /nbs/mds/raft")
+        out = sh[fi].run("insmod /nbs-mds.ko compact=%d scrub=%d out_after=%d" % (COMPACT, SCRUB_S, OUT_S))
+        check("%s's mds, its log gone beside its begun mark, not started as the member it was" % lost,
+              "holds no log, and this host's member had begun one" in out, out)
+        out = sh[fi].run("nbs")
+        check("and says so", "did not start" in out and "holds no log" in out, out)
+        js = json_of(sh[fi].run("mgmt call nbs status"))
+        check("and through the bus: no member, and why", js is not None and js.get("member") is False
+              and "holds no log" in (js.get("stopped") or ""), js)
+        sh[fi].run("rmmod nbs-mds")
         sh[fi].run("rm /nbs/mds")
         out = sh[fi].run("insmod /nbs-mds.ko compact=%d scrub=%d out_after=%d" % (COMPACT, SCRUB_S, OUT_S))
         out = sh[fi].run("nbs")
@@ -1307,6 +1326,27 @@ def main():
         check("the leader's scrub found the chunk written alike on its members, the others held by none, and no "
               "finding of now -- the rot's, shown as history, its one",
               m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0 and finding.search(out) is None, out)
+
+        # -- recover (V1a): one of the two members left lost for good, and
+        # the other made the NBS cluster's one voter --
+        pair = [i for i in live if i != gi]
+        si, xi = pair
+        out = sh[si].run("nbs recover")
+        check("recover refused while the majority answers", "recover is for an NBS cluster whose majority" in out
+              or "answers" in out, out)
+        kill(xi)
+        s = sh[si]
+        check("%s, its majority gone, follows no leader" % ALL[si], ipct.wait_for(lambda: leader_of(s) is None, 30, 1))
+        out = s.run("nbs recover")
+        check("recover says what it does first", "To go ahead: nbs recover store" in out
+              and ("the members removed: %s" % ALL[xi]) in out, out)
+        out = s.run("nbs recover erots")
+        check("a name not the NBS cluster's refused", "not this cluster's name" in out, out)
+        out = s.run("nbs recover store")
+        need("recover: %s's member the one voter, %s's removed" % (ALL[si], ALL[xi]),
+             ("one voter now; removed for good: %s" % ALL[xi]) in out, out)
+        need("%s leads alone, one member and one voter" % ALL[si], ipct.wait_for(lambda: agreed([s], 1), 30, 1))
+        check("and commits", commits(s))
     except Stop as e:
         print("nbs-test: stopped at \"%s\": the rest stands on it" % e, flush=True)
     finally:

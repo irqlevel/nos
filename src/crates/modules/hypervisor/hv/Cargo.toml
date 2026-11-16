@@ -18,6 +18,9 @@ hv = { path = "../../../hypervisor/hv" }
 # The frame formats: the guests' switch answers DHCP itself, and a module
 # cannot link the network layer to borrow them.
 netwire = { path = "../../../common/net/netwire" }
+# Each guest's firewall: its rules, what of a frame they judge, the flows a
+# port keeps -- no kernel in it, so tests/fuzz/hv holds it to a model.
+firewall = { path = "../../../common/net/firewall" }
 # A cloud's qcow2 image made a raw disk (`hv convert`): no kernel in it, so
 # tests/fuzz/diskimage runs the same code on the host.
 diskimage = { path = "../../../common/storage/diskimage" }
@@ -26,6 +29,12 @@ conf = { path = "../../../common/text/conf" }
 # The vm provider's side of the management bus: the parameters a call is
 # handed, read strictly.
 mgmtwire = { path = "../../../common/ipc/mgmtwire" }
+# A VM's UUID in hex, as vnet takes it and its table says it.
+codec = { path = "../../../common/codec" }
+# The cluster networks' tunnel between hosts (`tunnel.rs`): its datagram
+# sealed and opened, the window of counters a key has seen, the messages keys
+# go in -- no kernel in it, so tests/fuzz/hv holds it to a model.
+vnetwire = { path = "../../../common/net/vnetwire" }
 # A guest's disk that is a volume of NBS's (`nbs:<volume>`): NBS's client,
 # driven over ipc.
 nbsdrive = { path = "../../storage/nbsdrive" }

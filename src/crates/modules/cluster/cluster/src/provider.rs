@@ -184,10 +184,19 @@ fn status(state: &ModState, p: Params<'_>, call: &mut Call) -> Status {
         return invalid(call, e);
     }
     let Some(v) = view(state) else {
+        /* No member: and why, where this host's did not start -- its log
+           gone beside its `begun` mark, a member file that cannot be read --
+           not taken for a host in no cluster */
+        let held = state.runner.held();
         return answer(call, |w| {
             w.begin_object();
             w.field_bool("member", false);
             this_host(w);
+            w.key("stopped");
+            match &held {
+                Some(why) => w.str(why),
+                None => w.null(),
+            }
             w.end_object();
         });
     };
@@ -242,6 +251,7 @@ fn hosts(state: &ModState, p: Params<'_>, call: &mut Call) -> Status {
                 "joining"
             };
             let of_role = |role: AddrRole| h.addrs.iter().find(|a| a.role == role).map(|a| a.ip);
+            let port_of_role = |role: AddrRole| h.addrs.iter().find(|a| a.role == role).map_or(0, |a| a.port);
             w.begin_object();
             w.field_str("name", &h.name);
             w.field_uint("node", h.node);
@@ -253,6 +263,8 @@ fn hosts(state: &ModState, p: Params<'_>, call: &mut Call) -> Status {
             port_or_null(w, h.ipc_port());
             w.key("underlay");
             ip_or_null(w, of_role(AddrRole::Underlay));
+            w.key("underlay_port");
+            port_or_null(w, port_of_role(AddrRole::Underlay));
             w.key("public");
             ip_or_null(w, of_role(AddrRole::Public));
             w.field_bool("maintenance", h.maintenance);

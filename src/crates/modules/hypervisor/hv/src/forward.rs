@@ -38,6 +38,13 @@
 //! `reclaim`), so a client that opens and closes through a forward as fast
 //! as it likes no longer holds every slot the machine has.
 //! Taking a forward away closes its port, and waits out its relays.
+//!
+//! The relay reaches the guest as the host, whose traffic the guest's
+//! firewall does not judge (plans/vnet.md, "The firewall"): so each client
+//! is held to the firewall's rules here, by its own address, as it is
+//! accepted (`Switch::lets_in`), and one they do not let in is closed on and
+//! counted (`denied`). A forward the firewall lets nobody through is made
+//! all the same, and said to be.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -51,7 +58,7 @@ use kcore::sync::Mutex;
 use kcore::task::TaskHandle;
 use kcore::tcp::{TcpListener, TcpStream, RECV_TIMEOUT};
 
-use crate::net;
+use crate::net::{self, Switch};
 use crate::relay::{self, Ended, Read};
 
 pub const MAX_FORWARDS: usize = 8;
@@ -98,12 +105,15 @@ const PUBLIC_IF: &str = "eth0";
 /// Where a forward goes: the guest's address and port, the device it is
 /// behind (`hv0`), and the device the guests go out through by NAT -- the
 /// one it listens on, as the world reaches the guests through it -- when
-/// NAT is on (`Switch::outer_nic`).
+/// NAT is on (`Switch::outer_nic`); and the switch and the guest's port of
+/// it, whose firewall each client is held to.
 pub struct To {
     pub guest_ip: u32,
     pub guest_port: u16,
     pub host: Nic,
     pub outer: Option<Nic>,
+    pub switch: Arc<Switch>,
+    pub port: usize,
 }
 
 /// What a forward's tasks share.
@@ -116,10 +126,16 @@ struct Shared {
     refused: AtomicU64,
     failed: AtomicU64,
     stalled: AtomicU64,
-    /// Where to: the guest's address and port, and the device it is behind.
+    /// Clients its guest's firewall did not let in.
+    denied: AtomicU64,
+    /// Where to: the guest's address and port, and the device it is behind;
+    /// and the guest's port of the switch, whose firewall a client is held
+    /// to.
     guest_ip: u32,
     guest_port: u16,
     host: Nic,
+    switch: Arc<Switch>,
+    port: usize,
     /// The relays' tasks, joined when the forward goes -- and the finished
     /// ones as new ones start.
     relays: Mutex<Vec<(Arc<AtomicBool>, TaskHandle)>>,
@@ -134,6 +150,7 @@ pub struct Row {
     pub active: usize,
     pub accepted: u64,
     pub refused: u64,
+    pub denied: u64,
     pub failed: u64,
     pub stalled: u64,
 }
@@ -163,6 +180,14 @@ fn listen(start: Listen) {
     while !shared.stop.load(Ordering::Acquire) {
         let Some(client) = listener.accept(ACCEPT_WAIT_MS) else { continue };
         reap(&shared);
+        /* Its guest's firewall, by the client's own address: what the relay
+         * would otherwise carry past it as the host. */
+        let (from, _) = client.peer();
+        if !shared.switch.lets_in(shared.port, shared.guest_port, from) {
+            shared.denied.fetch_add(1, Ordering::Relaxed);
+            client.abort();
+            continue;
+        }
         if shared.active.load(Ordering::Acquire) >= MAX_CONNS || !take_relay() {
             shared.refused.fetch_add(1, Ordering::Relaxed);
             client.abort();
@@ -193,6 +218,14 @@ fn listen(start: Listen) {
         }
     }
     /* The listener closes with this task: its port answers no more. */
+}
+
+/// Whether the forward of nos's `port` -- in `forwards` -- may let anybody
+/// in: whether its guest's firewall lets some address off the guest's
+/// network in at its port (`Switch::may_let_in`).
+fn shared_lets_in(forwards: &Forwards, port: u16) -> bool {
+    let shared = forwards.table.lock().iter().find(|f| f.port == port).map(|f| f.shared.clone());
+    shared.is_none_or(|s| s.switch.may_let_in(s.port, s.guest_port))
 }
 
 /// Join the relays that have finished, out of the lock.
@@ -286,7 +319,7 @@ impl Forwards {
     /// NIC, a forward on `eth0` said it was made and was reached by nobody.
     pub fn add(&self, port: u16, vm: u32, to: To, listed: &dyn Fn() -> bool, out: &mut dyn Write)
                -> Result<(), String> {
-        let To { guest_ip, guest_port, host, outer } = to;
+        let To { guest_ip, guest_port, host, outer, switch, port: guest_switch_port } = to;
         let public = match outer {
             Some(nic) => nic,
             None => Nic::find(PUBLIC_IF).ok_or_else(|| alloc::format!("no {} to listen through, and no way out for \
@@ -317,9 +350,12 @@ impl Forwards {
             refused: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             stalled: AtomicU64::new(0),
+            denied: AtomicU64::new(0),
             guest_ip,
             guest_port,
             host,
+            switch,
+            port: guest_switch_port,
             relays,
         });
         let task = kcore::task::spawn_with("hv/forward", Listen { shared: shared.clone(), listener }, listen)
@@ -351,6 +387,10 @@ impl Forwards {
         }
         let _ = writeln!(out, "hv: port {} forwarded to vm {}, {}:{} -- listened on at {}", port, vm,
                          net::dotted(guest_ip), guest_port, net::dotted(public.ip()));
+        if !shared_lets_in(self, port) {
+            let _ = writeln!(out, "hv: its firewall lets nobody in at tcp {} -- hv fw <its firewall> add allow in tcp {}",
+                             guest_port, guest_port);
+        }
         Ok(())
     }
 
@@ -396,6 +436,7 @@ impl Forwards {
                 active: s.active.load(Ordering::Relaxed),
                 accepted: s.accepted.load(Ordering::Relaxed),
                 refused: s.refused.load(Ordering::Relaxed),
+                denied: s.denied.load(Ordering::Relaxed),
                 failed: s.failed.load(Ordering::Relaxed),
                 stalled: s.stalled.load(Ordering::Relaxed),
             });
@@ -419,11 +460,11 @@ impl Forwards {
             return;
         }
         for (port, vm, s) in rows.iter().filter_map(Option::as_ref) {
-            let _ = writeln!(out, "port {} -> vm {} {}:{}  {} active, {} accepted, {} refused, {} failed, \
-                                   {} given up stalled",
+            let _ = writeln!(out, "port {} -> vm {} {}:{}  {} active, {} accepted, {} refused, {} its firewall \
+                                   denied, {} failed, {} given up stalled",
                 port, vm, net::dotted(s.guest_ip), s.guest_port, s.active.load(Ordering::Relaxed),
                 s.accepted.load(Ordering::Relaxed), s.refused.load(Ordering::Relaxed),
-                s.failed.load(Ordering::Relaxed), s.stalled.load(Ordering::Relaxed));
+                s.denied.load(Ordering::Relaxed), s.failed.load(Ordering::Relaxed), s.stalled.load(Ordering::Relaxed));
         }
     }
 

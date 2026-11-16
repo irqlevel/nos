@@ -211,15 +211,31 @@ impl ArpTable {
             return;
         }
 
-        let for_us = own != 0 && arp::target_ip(packet) == own;
+        let target = arp::target_ip(packet);
+        /* For this machine's address, or -- the outer device of NAT -- a
+         * public address mapped one to one there, answered as that address */
+        let for_us = own != 0 && target == own;
+        let as_public = !for_us && target != 0 && crate::nat::answers_for(nic, target);
         if sender_ip != 0 {
-            self.learn(sender_ip, &sender_mac, for_us);
+            self.learn(sender_ip, &sender_mac, for_us || as_public);
         }
 
         /* The reply goes out with no lock held */
-        if for_us && opcode == ARP_OP_REQUEST {
-            send(nic, ARP_OP_REPLY, &sender_mac, &sender_mac, sender_ip);
+        if opcode == ARP_OP_REQUEST {
+            if for_us {
+                send(nic, ARP_OP_REPLY, &sender_mac, &sender_mac, sender_ip);
+            } else if as_public {
+                send_as(nic, target, ARP_OP_REPLY, &sender_mac, &sender_mac, sender_ip);
+            }
         }
+    }
+
+    /// `ip` said to be at `nic`'s MAC to everyone on its link, unasked: a
+    /// gratuitous request (RFC 5227's announcement), sender and target both
+    /// `ip` -- what a public address mapped there is announced with, so
+    /// that a router that had it elsewhere hears of it now.
+    pub fn announce(&self, nic: &Nic, ip: u32) {
+        send_as(nic, ip, ARP_OP_REQUEST, &MAC_BROADCAST, &[0; 6], ip);
     }
 
     /// Another host says it has this machine's address: said, at most once
@@ -325,6 +341,12 @@ pub fn link_mac(nic: &Nic, dst: u32) -> Option<Mac> {
 /// One ARP packet out of the device: a request broadcast, or a reply to the
 /// host that asked.
 fn send(nic: &Nic, opcode: u16, eth_dst: &Mac, target_mac: &Mac, target_ip: u32) {
+    send_as(nic, nic.ip(), opcode, eth_dst, target_mac, target_ip);
+}
+
+/// One ARP packet out of the device as `sender_ip` -- the device's own, or
+/// a public address NAT maps there.
+fn send_as(nic: &Nic, sender_ip: u32, opcode: u16, eth_dst: &Mac, target_mac: &Mac, target_ip: u32) {
     let len = ETH_HDR_LEN + ARP_LEN;
     let mut frame = match Frame::alloc_tx(len) {
         Some(frame) => frame,
@@ -336,12 +358,11 @@ fn send(nic: &Nic, opcode: u16, eth_dst: &Mac, target_mac: &Mac, target_ip: u32)
 
     frame.set_len(len);
     let mac = nic.mac();
-    let ip = nic.ip();
     {
         let buf = frame.data_mut();
         buf[..len].fill(0);
         eth::write(buf, eth_dst, &mac, ETH_TYPE_ARP);
-        arp::write(&mut buf[ETH_HDR_LEN..], opcode, &mac, ip, target_mac, target_ip);
+        arp::write(&mut buf[ETH_HDR_LEN..], opcode, &mac, sender_ip, target_mac, target_ip);
     }
 
     if !nic.transmit(frame) {

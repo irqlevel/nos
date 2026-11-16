@@ -220,12 +220,13 @@ swallowing panic messages whole.
 | `usb-test.py` | x86-64 | `drivers/usb/`; what a keyboard sends the shell's line editor |
 | `hv-device-test.py [--tcg] [--keep]` | x86-64 | a guest's disk on a device of nos's: the devices' ids (`layers/block/src/table.rs`, the NVMe's identity), the claims and their holders, `layers/block/src/devq.rs` and `kcore::block::DiskQueue`, `diskimage::contents`, `modules/hypervisor/hv/src/devices.rs`, a device disk in `modules/hypervisor/hv/src/disk.rs`, the pour onto a device |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hypervisor/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry, `hv create` of VMs from a web server's images, `hv clone` and `hv delete`, and the `vm` provider's actions through `mgmt`; on both, `hv convert` |
+| `vnet-test.py [--phase v0a\|v0b\|v1b\|v2\|v3\|v4\|all] [--arch aarch64\|x86_64] [--tcg]` | x86-64 (V0a, V0b, V2, V3, V4), both (V1b), by hand | the guests' networks and their firewalls on a running nos, with probes -- ports of the switch with no VM (`hv probe`) -- where guests would be: V0a's phase, the firewall on one host's networks: closed by default, a rule opening it, a deny outwards answered, a change cutting a flow, each denial a `fw_deny`, `rmmod hv` with probes up; V0b's, one to one past the hub's router; V1b's, vnet's group and its state on three hosts of a registry -- networks, ports, public addresses and firewalls through reboots, a leader killed, a host cut off, a module reloaded, a host removed from the registry; V2's, the cluster's networks on one host -- probes on two networks, their gateways, the world, a cluster firewall's rule from the keeper, a port revoked and shut, a VM's port made and deleted with its folder, vnet unloaded under them; V3's, the tunnel -- three nos with probes on each, reaching each other across hosts and not across networks, keys changed under traffic, a narrow link said, a host killed and back, hv reloaded, a port moved; V4's, a public address routed to one host and on a port of another's -- the world reaching the VM at it and it the world from it, moved onto a third host's port, routed elsewhere, taken off |
 | `edit-test.py [--seed N] [--sessions N] [--seconds S] [--session N]` | host (CI) | the editor (`src/crates/common/text/edit`), from its own sources: key sessions held to what they leave in the file and on the screen, files read and saved back byte for byte, random sessions on a terminal of the test's own |
 | `diskimage-test.py [--image <qcow2>] [--iterations N]` | host (CI) | the disk image converter (`src/crates/common/storage/diskimage`, `hv convert`), from its own sources: qcow2 images qemu-img and qemu-io write -- versions 2 and 3, clusters of 512 bytes to 2 MiB, stored, compressed, extended, zero, discarded, preallocated, snapshotted, dirty -- converted and held byte for byte to what qemu-img reads, its holes kept; what it must refuse; its DEFLATE decoder against zlib; each image's metadata fuzzed; and the cloud-init seed's ISO 9660, read back by xorriso or bsdtar, blkid and Linux's isofs |
 | `hvboot-test.py [--image <disk.raw>] [--iterations N]` | host (CI) | hvboot's own `plan` -- over its partition, ext2/3/4 and GRUB readers and its bzImage header, from their own sources -- under its own heap's arithmetic and size: on disks it makes -- GPT, MBR and none, ext4, ext3 and 1 KiB-block ext2, a grub-mkconfig grub.cfg and grubenv -- the entry GRUB would boot and its files byte for byte; grub.cfg read as GRUB 2.06 read each case when it was booted with it; what is said when nothing boots; a grub.cfg as long as is read, of each costliest shape, and a two-level extent tree, inside the heap; then each disk's metadata fuzzed, every run giving the heap back whole |
 | `extfmt-test.py [--iterations N] [--trials N]` | host (CI) | the ext2/3/4 format crate (`src/crates/common/storage/extfmt`) hvboot reads through and the kernel's ext4 driver is to: every checksum of filesystems mke2fs makes -- ext4 by default, with metadata_csum_seed, with 1 KiB blocks and 128-byte inodes and no 64bit, with gdt_csum, ext3, ext2 -- held to extfmt's, bytes they cover changed one at a time with extfmt and `e2fsck -fn` held to both saying so, and each image fuzzed; then journals debugfs leaves unreplayed, replayed by extfmt's planner and by `e2fsck -E journal_only` to the same image byte for byte, their ring turned so the log wraps, damaged and refused, and fuzzed; and the filesystems `extfmt::mkfs` makes for the shell's `format` -- ext4 and ext2, every block size, up to 3 GiB and 128 groups, the small ones made over noise -- clean to `e2fsck -fn`, their features and label dumpe2fs's, their lost+found debugfs's, and the devices it refuses refused |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hypervisor/hv/src/{insn,walk}.rs`), against the encodings clang gives |
-| `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and its ACPI and SMBIOS tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on; and the virtio notifications, kicks and interrupts with EVENT_IDX and without, held to a Linux driver's every request served (`virtq`) |
+| `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and its ACPI and SMBIOS tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on; and the virtio notifications, kicks and interrupts with EVENT_IDX and without, held to a Linux driver's every request served (`virtq`); and the guests' firewall, its crate to a model of its own (`firewall`) and the switch's use of it (`fwswitch`); and NAT's one to one (`onetoone`); and the cluster's networks on the switch (`vnetswitch`), the tunnel's datagram (`vnetwire`) and three hosts' tunnels over a hostile wire, public addresses across them through the real NAT among it (`tunnel`); `--mutants` (by hand) then takes ninety-nine of the firewall's, one to one's, the cluster networks', the tunnel's and the public addresses' rules out, each to be found |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate, and the session's line editor -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and ext4 images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands and its `format`, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
 | `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by, and what a terminal types at the console's line editor, and the tracepoints' ring against a model and a writer thread, and the window `trace latency` reads of the rings against the truth of a schedule played out on them -- and the memory management under everything: the page tables and the physical page allocator past `setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
@@ -288,8 +289,8 @@ how it works and what it found.
 | the ext2/3/4 format: `src/crates/common/storage/extfmt` -- its views of the superblock, descriptors, inodes, extent trees, block maps, directory and attribute blocks, every checksum metadata_csum and gdt_csum put on them, `features::classify`, the journal's format (`jbd2`) and the plan of its replay (`recovery`) -- and hvboot's reader over it | `extfmt-test.py` (host, in CI): filesystems mke2fs makes -- ext4 as it makes one by default, with metadata_csum_seed and the UUID changed after, with 1 KiB blocks, 128-byte inodes and 32-byte descriptors, with gdt_csum, ext3, ext2 -- holding a two-level extent tree, directories indexed by `e2fsck -D` and attributes in a block of their own, every checksum of every metadata block held to extfmt's; then bytes the checksums cover changed one at a time, each kind in turn, and extfmt and `e2fsck -fn` held to both saying so; then each image fuzzed. Then journals debugfs writes and leaves unreplayed (`jo -c`, `jw -b`/`-r`/`-c`) -- v3 checksums and none, 64-bit tags and 32-bit, an escaped block, revokes before and after a write, a transaction of more blocks than a descriptor holds, one uncommitted -- replayed by the planner and by `e2fsck -E journal_only` to the same image byte for byte (but for the superblock fields e2fsck keeps for itself), and again with the ring turned so the log wraps; a torn commit ending the log where e2fsck ends it, a descriptor damaged under a sound commit and a copy failing its checksum refused; the planner fuzzed, and a log of 9000 transactions planned without asking the heap for more than the 512 KiB the kernel's gives at once. Then `hvboot-test.py`, hvboot's ext reader being extfmt's. The kernel's ext4 driver's judge in the fuzzer is not to share a line with extfmt |
 | the shell's `format` (`src/crates/layers/fs/src/format.rs`: the table of `Maker`s, the claim, the refusals, the batched writes through the device's queue) and what lays a filesystem out for it (`src/crates/common/storage/extfmt/src/mkfs.rs`: the geometry, the order of the writes -- the old superblock's place zeroed and flushed first, the new one written last) | `extfmt-test.py` (host, in CI): mkfs's filesystems -- ext4 and ext2, 1, 2 and 4 KiB blocks, from the smallest it makes to 3 GiB and 128 groups, those to 64 MiB made over noise -- clean to `e2fsck -fn`, dumpe2fs naming their features and label, debugfs their lost+found, and what it refuses refused. Then `fs-fuzz.py`'s `format` target (host, in CI): the command on the fuzzer's disks holding nothing, noise, an ext2 or ext4 of the fuzzer's own or a partition table, with options right and wrong, `force` or not, mounted or not, requests failing and the power going at any of them -- a refusal writing nothing; what it says it made the fuzzer's own judges' clean, of the geometry, label and UUID it said, mounted by the kernel's drivers, `fstest` passing and the unmount clean; a partition's making nothing outside it; any power cut's picture holding the old superblock, none, or the whole new filesystem -- and `fs-fuzz.py --e2fsck` holding its images, made and used, to e2fsck. Then `ext4-test.py` (arm64, in CI): two disks of noise formatted in a boot, written, and read by e2fsck, dumpe2fs, debugfs and Linux after. A new filesystem `format` makes is a `Maker`, and a target of the fuzzer's that judges it by a reader of its own |
 | the CRCs: `src/crates/common/crc` (CRC-32, CRC-32C and CRC-16, each as a message has it and as the bare register, slicing by eight) and what is checked by them -- GPT, the disk log, ext4's metadata_csum, gdt_csum and journal, raft's log -- and the `crc32` command (`kernel/src/crc32.rs`) | `crc-test.py` (host, in CI): each CRC's known answers, random messages of every length and alignment held to the CRC computed from its definition a bit at a time -- every form, from any register, whole and across a split, a checksum with a hole -- and CRC-32 to zlib's over messages past 64 KiB, whole and in pieces; every boot's `rust_test` holds the kernel's own build to the check values (`crc32::selftest`). Then the gates of the formats checked by what changed: `parttest.py` and `fs-fuzz.py` (GPT, the disk log), `extfmt-test.py` and `hvboot-test.py` (ext4's checksums and journal, hvboot's GPT), `raft-test.py` (the log), and `ext4-test.py`, whose files the `crc32` command sums against the host's |
-| NBS's metadata service: `src/crates/modules/storage/nbs-mds` -- the member over raftmember with NBS's hooks (the cluster's id before every message and held to, the offer a host is made a member by and the listener that takes it while the host is in no cluster, raft's messages for a member a host does not have answered so, a host's lost state said by the leader, the state's digest proposed as leader and a member whose own differs stopped -- raftmember's `App::halt`), its commands (`nbs init`, `nbs host add`, `remove` and `replace`, `nbs`, `nbs hosts`; `nbs devices add` and `drain`, `nbs cs`, `nbs volume create`, `delete` and `resize`, `nbs volume snapshot` -- of a volume attached, its writer paused on its host by the member (`member.rs`'s `take`, raftmember's `App::take`) -- `nbs volumes`, `nbs volume`, in `store.rs`; `nbs io`, below), the `nbs` provider (`provider.rs`, `nbs.descriptor.json`: the cluster made, its hosts added, replaced and removed, devices added and drained, as the panel asks them), `compact=`, and its folder; `src/crates/modules/cluster/raftmember`, the member it and cluster.ko run | `nbs-test.py` (arm64, and `--arch x86_64`): three nos on hub.py, the registry made among them first, each with a pool disk of three partitions -- an NBS cluster made through the bus as the panel makes it, and two hosts added, one through a member that does not lead as a job through the bus; an add asked again answered with the same incarnation, a second init refused at the shell and through the bus; a commit through the majority; a volume's health through the bus -- degraded, each chunk at two, while c's replicas are down, whole once c is back -- and NBS's alerts saying, the worst first, fewer than three hosts with room, c's chunk server out and chunks at two, and none of them once c is back; what is stored: no volume before three hosts have a device, the pools' partitions found by their GUIDs, devices added by id and by name, the pool's disk refused for having no id, a device added again the same, c's copy of a's partition refused as a disk moved between servers, every host saying the same of the chunk servers; volumes made, made again the same, refused for another size, grown, refused smaller, past the room and for a name that is none, made for another host; a change read at once on the host it was typed at, and on the others once they have applied it; the room filled to its last slot and given back by a delete; a device added through the bus, and one drained and what it holds counted against its host's room -- drained again from another host through the bus naming its host, and refused naming one it is not on -- the provider's devices saying each host's; the provider answering through `mgmt call` as the command does; every host's digest at the same entry, the same, the leader's held to it; every log compacted into a snapshot (`compact=4096`); the leader killed, the other two electing one of themselves and committing, the killed host back from its snapshot and log with the others' state; the leader cut off by the hub, the other two electing and committing while it commits nothing, and following once healed; a host's folder removed, the leader saying its state is gone, an add of it refused, and a replace -- a job through the bus -- taking it back as a new member, sent the snapshot; a member removed, its old incarnation refused added again, its chunk server kept taking no new chunks; nothing panicked. After touching raftmember, `cluster-test.py` too; the descriptor, `web-test.py` and the panel's tests |
-| NBS's metadata: `src/crates/common/storage/nbsmeta` -- the NBS cluster's id and name, its members (a host and the incarnation its mds made) in the order they joined, the members removed and never taken again, the voters' policy (the first five); what is stored (`storage.rs`: each host's cs and its devices in slots, the volumes, their chunks, the replica sets the chunks share, the free list); placement (`place.rs`); the tables in copy-on-write pieces (`pieces.rs`); the snapshot written and read as a stream, the rules one read back is held to, and the digest every 64 entries (`snapshot.rs`); the commands and their answers; and `codec::Stream`, what the snapshot is read through | `nbs-fuzz.py` (host, in CI), whose `meta` target holds it to a model of its own (below), then `nbs-fuzz.py --mutants`, eighty-four of them the metadata's (five the repair controller's), each caught; `raft-test.py` (host, in CI), whose `nbsmeta` target holds the members' part to a model of its own -- alone, under commands from pools that meet and from wide ones that fill the cluster, every answer and everything it shows; its snapshot read back, changed and refused, and a replica from a snapshot part way -- and its `nbsmeta_*` scenarios; `tests/fuzz/raft/mutants.py`'s six `nbsmeta_*` mutants, each failing the gate and its own scenario |
+| NBS's metadata service: `src/crates/modules/storage/nbs-mds` -- the member over raftmember with NBS's hooks (the cluster's id before every message and held to, the offer a host is made a member by and the listener that takes it while the host is in no cluster, raft's messages for a member a host does not have answered so, a host's lost state said by the leader, the state's digest proposed as leader and a member whose own differs stopped -- raftmember's `App::halt`), its commands (`nbs init`, `nbs host add`, `remove` and `replace`, `nbs recover`, `nbs`, `nbs hosts`; `nbs devices add` and `drain`, `nbs cs`, `nbs volume create`, `delete` and `resize`, `nbs volume snapshot` -- of a volume attached, its writer paused on its host by the member (`member.rs`'s `take`, raftmember's `App::take`) -- `nbs volumes`, `nbs volume`, in `store.rs`; `nbs io`, below), the `nbs` provider (`provider.rs`, `nbs.descriptor.json`: the cluster made, its hosts added, replaced and removed, devices added and drained, as the panel asks them), `compact=`, and its folder; `src/crates/modules/cluster/raftmember`, the member it and cluster.ko run -- its start over the log with the `begun` mark, its stop, the probe and `recover` (`host.rs`), and the offers, the listener and the members' commands of a group whose hosts are offered it (`offered.rs`) | `nbs-test.py` (arm64, and `--arch x86_64`): three nos on hub.py, the registry made among them first, each with a pool disk of three partitions -- an NBS cluster made through the bus as the panel makes it, and two hosts added, one through a member that does not lead as a job through the bus; an add asked again answered with the same incarnation, a second init refused at the shell and through the bus; a commit through the majority; a volume's health through the bus -- degraded, each chunk at two, while c's replicas are down, whole once c is back -- and NBS's alerts saying, the worst first, fewer than three hosts with room, c's chunk server out and chunks at two, and none of them once c is back; what is stored: no volume before three hosts have a device, the pools' partitions found by their GUIDs, devices added by id and by name, the pool's disk refused for having no id, a device added again the same, c's copy of a's partition refused as a disk moved between servers, every host saying the same of the chunk servers; volumes made, made again the same, refused for another size, grown, refused smaller, past the room and for a name that is none, made for another host; a change read at once on the host it was typed at, and on the others once they have applied it; the room filled to its last slot and given back by a delete; a device added through the bus, and one drained and what it holds counted against its host's room -- drained again from another host through the bus naming its host, and refused naming one it is not on -- the provider's devices saying each host's; the provider answering through `mgmt call` as the command does; every host's digest at the same entry, the same, the leader's held to it; every log compacted into a snapshot (`compact=4096`); the leader killed, the other two electing one of themselves and committing, the killed host back from its snapshot and log with the others' state; the leader cut off by the hub, the other two electing and committing while it commits nothing, and following once healed; a host's log removed beside its member file and its `begun` mark, its member not started as the one it was and saying so; a host's folder removed, the leader saying its state is gone, an add of it refused, and a replace -- a job through the bus -- taking it back as a new member, sent the snapshot; a member removed, its old incarnation refused added again, its chunk server kept taking no new chunks; `nbs recover` refused while the majority answers, then -- one of the two members left killed -- said first, a name not the cluster's refused, and the last one made the one voter, leading alone and committing; nothing panicked. After touching raftmember, `cluster-test.py` too; the descriptor, `web-test.py` and the panel's tests |
+| NBS's metadata: `src/crates/common/storage/nbsmeta` -- the NBS cluster's id and name, its members (a host and the incarnation its mds made) in the order they joined, the members removed and never taken again, the voters' policy (the first five); what is stored (`storage.rs`: each host's cs and its devices in slots, the volumes, their chunks, the replica sets the chunks share, the free list); placement (`place.rs`); the tables in copy-on-write pieces (`pieces.rs`); the snapshot written and read as a stream, the rules one read back is held to, and the digest every 64 entries (`snapshot.rs`); the commands and their answers; and `codec::Stream`, what the snapshot is read through | `nbs-fuzz.py` (host, in CI), whose `meta` target holds it to a model of its own (below), then `nbs-fuzz.py --mutants`, eighty-four of them the metadata's (five the repair controller's), each caught; `raft-test.py` (host, in CI), whose `nbsmeta` target holds the members' part to a model of its own -- alone, under commands from pools that meet and from wide ones that fill the cluster, every answer and everything it shows; its snapshot read back, changed and refused, and a replica from a snapshot part way -- and its `nbsmeta_*` scenarios; `tests/fuzz/raft/mutants.py`'s six `members_*` mutants -- the members' rules, `src/crates/common/cluster/members`' -- each failing the gate and its own scenario |
 | NBS's chunk server, its format and engine: `src/crates/common/storage/nbscs` -- the device's layout (`format.rs`: the superblock twice, the fences and the table of slots in two copies, every record's sequence number and CRC seeded with the format's id, the good copy chosen, a device's first pages told apart -- blank, NBS's, something else's -- by `holds`), the engine (`store.rs`: format and open, a torn copy written again, fences durable on every device before they are answered, open marks before a generation's first write, a chunk held by number and incarnation, a slot zeroed and flushed before its record, a close after its data, the volume a request names held to the chunk's, a free; and, its operations `async fn`s with many in flight on one task (N12b), a chunk's requests one at a time in the order they came, a volume's fence alone, records and fences written by commit rounds, a flush covering the writes done before it began); and NBS's messages, `src/crates/common/storage/nbswire` -- a client's requests and a cs's answers, a cs's questions and its mds's | `nbs-fuzz.py` (host, in CI), whose `cs` target runs the engine over disks with a write cache through power cuts and holds it to what each fence, open mark, close and sector may be (below), whose `inflight` target runs it with many requests in flight over disks that do theirs in any order and cut with requests out, and whose `wire` target reads every message back and noise as none; then `nbs-fuzz.py --mutants`, fifty-four of the cs's engine and sixty-one of the wire's, its `serve`'s, the mds's, the copy's and the scrub's, each caught; then `nbs-test.py` (arm64, and `--arch x86_64`) for the cs over a real device |
 | NBS's chunk server on a host: `src/crates/modules/storage/nbs-cs` (the devices the host's mds gives it taken in -- held with a `DiskQueue` and claimed, opened, formatted where blank, refused and said otherwise, and tried again -- served only with every one taken in; `nbs.cs` served by one task on one event, many requests in flight as futures, a chunk's in the order they came (N12c), a request the engine has not checked asked of the host's mds first, what it vouched for kept; chunks and fences the metadata no longer has given back; `nbscs`, `nbscs chunks`, `nbscs fences`; `disk.rs`, the engine's device over a queue); what nbs-mds tells a cs (`member.rs`'s `on_cs_query`, and the listener's `NoMds`); `nbs io` (`nbs-mds/src/io.rs`); `nbs devices add`'s look at a device's first pages and `wipe` (`store.rs`); kcore's `DiskQueue::read_wait` and `write_wait` | `nbs-test.py` (arm64, and `--arch x86_64`), its N7 phase: every host's cs taking its devices in and formatting them; a device with a filesystem's magic on it refused, and taken with `wipe`; a device its cs holds added again, the same; a volume written to its three replicas and read back across a chunk's end, from the writer's host and read-only from the others; flushed, its two chunks open on every cs at the writer's generation, then closed; a writer on another host refused, then forced, and its fences refusing the old writer's write and read; a host booted again, its cs back with its fence, its open mark and closed chunk, and their data; a cs slow, not silent (N11, N12c) -- c's pool throttled by QEMU's monitor to 20 operations a second from a writer's first write, its fence, 16 chunks' open marks and their closes queued at c's device, each write slower there than the client's 0.5 s of silence -- left in its sets, the leader's look answered whatever the device is doing, the closes' records written together; a snapshot of a volume `nbs io` writes (N10c2) -- asked on another host refused, naming the writer's; asked on the writer's, a member that need not lead, its session paused and the snapshot taken, the writer copying its chunk up as it writes on, the snapshot read on a third host as the volume was, both deleted; the volume deleted, refused first while attached, and every cs giving its chunks -- the one a snapshot shared and the one copied up among them -- and its fence back; a host's nbs-cs unloaded, a request to it bounced and said at once while the others answer, and loaded again, serving. Then `nbs-fuzz.py` |
 | the cluster's registry: `src/crates/common/cluster/registry` -- its state (the cluster, its hosts by node with their keys, addresses, labels and maintenance, the hosts removed, the keys retired, the invitations open), its commands and their answers (maintenance, an address by role, a key added and dropped among them), applying them under the proposer's clock, its snapshot and the rules a snapshot read back is held to, the voters' policy, a host's peers | `raft-test.py` (host, in CI), whose `registry` target holds it to a model of its own -- alone, under commands from pools that meet and from wide ones that fill the cluster, every answer and everything it shows; its snapshot read back, changed and refused, and a replica from a snapshot part way; and as a group through `raft::rsm` over a lossy network, every member the same and the model's in the log's order -- and its `registry_*` scenarios; `tests/fuzz/raft/mutants.py`'s ten `registry_*` mutants, each failing the gate and its own scenario; a kernel's build compiles the crate for its target, through cluster.ko |
@@ -719,6 +720,9 @@ which makes the host's key, and everything else is the registry's
   again;
 - all three VMs killed and booted again at once: back from their folders,
   a leader agreed on, three voters, every host up to every other;
+- `c`'s log gone (`rm /etc/cluster/raft`), its `member` and `begun` kept:
+  `insmod cluster.ko` does not start it as the member it was, and says so,
+  and `cluster` says why (V1a of plans/vnet.md);
 - `cluster recover` on `a` refused while the majority answers; `b` and `c`
   killed for good, `a` following no leader once CheckQuorum has it step
   down; the plan said first, a name not the cluster's refused, then `a` the
@@ -1178,6 +1182,82 @@ advertisement's checksum without its pseudo-header, duplicate detection
 binding nothing, neighbour discovery in fragments, an advertisement's
 target taken unchecked, and UDP over IPv6's checksum of 0 left 0 -- each
 failed the gate.
+
+The guests' firewall ([The firewall](hypervisor.md#the-firewall)) has two
+targets of its own, and the switch's are run under it. `firewall` holds the
+crate -- `common/net/firewall`'s rules, packets, flows and judge -- to a
+model of its own that shares nothing with it: rules made up and parsed
+from their text and back, packets of every kind, both ways, a clock that
+moves, tables filled past full, rules changed under open flows, each verdict
+and each flow kept or let go held to the model's. `fwswitch` holds the
+switch's use of it: a network's ports, some on a closed firewall and some on
+an open one, guests sending each other TCP, UDP and echoes -- whole sends
+among them -- and the host's own frames, which no firewall judges; the
+clients of a forward (`Switch::lets_in`, the relay's check), let in by the
+open firewall and kept out by the closed one, each refusal counted; a port
+handed to another VM between a frame's judgement and its delivery (the
+same `sync::before_lock` hook), the frames the VM going was let in never
+reaching the VM coming. `switch` and `guestnet` put every port on a firewall
+that allows everything, their models as they were. `tests/fuzz/hv/mutants.py`
+(`hv-fuzz.py --mutants`, by hand) takes thirty of the rules out one at a
+time -- twelve of the crate's (the first match deciding, an echo's
+direction, the stray check, the oldest flow evicted, a flow running out,
+an ICMP error related by the quoted ports, an echo reply making no flow, a
+change cutting the flows it denies, a rule's ports, fragments, `net` the
+VM's own network, a connection picked up mid-way) and nine of the
+switch's (a delivery and a whole send held to the claim, what comes in and
+what goes out judged, a free port's frames, the host exempt, a port's
+flows let go as it changes hands, a forward's client held to the
+firewall, a broadcast judged at each port) and nine of NAT's one to one
+(below) -- and
+each must be found by the targets that hold it; each file is restored and
+held to its digest after.
+
+The cluster's networks on the switch ([The cluster's
+networks](hypervisor.md#the-clusters-networks), plans/vnet.md V2) have a
+target of their own, `vnetswitch`, held to a model of its own
+(`vnetmodel.rs`) that shares nothing with the switch: ports claimed as
+vnet makes them -- on two networks that go out or do not, at addresses of
+their own, refused where an address, a subnet or an MTU will not do --
+beside a host's network's, on a firewall that lets everything through or
+none; their guests sending ARP, DHCP, echoes and datagrams to their
+gateways, to each other, to another network's ports, to the host's
+networks and the world, some past the MTU, some as another; sends left to
+finish and sends of TCP whole; `hv0`'s ARP and packets for them; vnet's
+table of the cluster's networks; a port shut. What each inbox gets is held
+byte by byte -- the switch's ARP answers, its gateway's echoes and its
+"fragmentation needed" built by the model -- with what `hv0` is handed and
+every count. Its twenty-eight mutants are among `hv-fuzz.py --mutants`:
+ARP answered for the asker's network alone and never its own address, the
+cluster's other networks, the host's and a network that does not go out
+isolated through the gateway, the MTU to the byte and its answer only
+where a packet may not be cut, a send whole held to it, a port's MAC with
+another address, another network's port, a broadcast, `hv0`'s ARP and
+packets for a port, a host network's MAC of a cluster port's slot, an
+address and a subnet one port's and one network's here, DHCP's MTU and its
+option, the echo from the gateway, a port's address given back, the
+firewall both ways, a shut port both ways and opened by its next claim,
+and the NIC's `F_MTU` and its configuration (the `net` target's).
+
+NAT's one to one ([A public address](hypervisor.md#a-public-address-one-to-one))
+has `onetoone`: public addresses mapped to guests and unmapped through the C
+ABI a module has, each refusal the one the rules give -- an address mapped
+already, a guest mapped already, this machine's address, a guest behind none
+of `hv0`'s networks; a network behind `hv0` put there, refused where it
+overlaps the subnet or another, and taken away with its guests' mappings;
+packets from the world to a public address -- from the world, from what the
+deny list has, past the guest's MTU with DF and without, ICMP errors quoting
+the guest's packet -- and a mapped guest's out -- to the world, to a kept
+network, to the uplink's own subnet, to `hv0`'s networks -- each held byte by
+byte to the model: the address rewritten, the TTL one less, every checksum
+right where it was right and wrong where it was wrong, an error's quoted
+packet translated with it, "too big" as RFC 1191 has it; NAT off and on,
+every mapping gone with it; and ARP answered on the uplink for what is
+mapped, and nowhere else. Its nine mutants -- the world's source unchecked,
+either address not rewritten, an error's quote not translated, the MTU not
+held, the uplink's subnet kept from a public address, a guest's packet for
+`hv0`'s networks taken out, ARP answered on every device, a guest mapped
+twice -- are among `--mutants`'.
 
 What it cannot see: the CPU is a stand-in, so nothing of hvarch -- its
 `unsafe`, the VMCB and VMCS, the entry and the exit -- is fuzzed, only what
@@ -2242,6 +2322,125 @@ search finds an RSDP only whole within a page -- the kernel maps the BIOS
 area a page at a time --, which the reader holds it to: the Multiboot tag,
 GRUB's copy, is the path every machine this kernel boots on takes.
 
+### `vnet-test.py` -- the guests' networks and firewalls, with probes
+
+`tests/vnet-test.py` checks the guests' networks on a running nos with
+probes where guests would be: a probe (`hv probe`, `modules/hypervisor/hv/src/probe.rs`)
+is a port of the switch with no VM behind it -- its address and MAC the
+port's, on a network or alone, judged by a firewall as a VM's NIC is -- whose
+task answers ARP, echo and UDP to port 7, and which pings and sends UDP the
+way a guest's NIC does, through the switch's way in for a port and its
+firewall's judgement both ways. A run says how many of its sends were
+answered, refused (ICMP communication administratively prohibited) or
+otherwise unreachable. No guest boots, so the test takes a TCG boot and a
+few seconds of commands, where `hv-linux-test.py --net` takes a Linux guest
+twice emulated.
+
+Its phase for V0a (plans/vnet.md), the firewall on one host's networks: one
+x86-64 nos, hv.ko and three probes -- a and b on the network `lab`, judged by
+the firewall `lab`, c alone on `default`:
+
+- closed by default: a reaches nos, the host's own address, and not b;
+- a rule opens it: `allow in from net`, and a and b reach each other both
+  ways, echo and UDP; c, alone, reaches neither -- the switch's isolation --
+  and does reach nos;
+- a deny outwards answered: `deny out udp 9`, a's datagrams refused at once;
+- a change cuts a flow: two runs from one source port (`sport=`), the first
+  through `allow in udp 7`, the rule taken out between them, the second
+  unanswered -- and `hv fw` saying a flow was cut;
+- `trace show fw_deny`: the inbound denials by the policy, the outbound by
+  the rule, with the peer, the ports and the protocol;
+- `hv probe del` gives its port back, and `rmmod hv` with probes up stops
+  their tasks and unloads.
+
+Its phase for V0b, NAT one to one: one nos on `tests/hub.py`'s LAN -- the
+hub its router, answering its DHCP -- and past the router a host of the
+world's (198.51.100.7, `Hub.world`): it answers echo and UDP to port 7,
+remembers each source it saw, and calls an address itself, asking for it
+by ARP on the LAN as a router asks for an address routed to a machine there
+(`Hub.world_call`). A probe with a public address and a firewall letting in
+UDP to 7, and one with none: the first pings the world and the world sees
+its public address, the second and the world sees nos's own -- the
+masquerade's; the world's datagram to the public address reaches the probe
+and comes back from that address, nos having answered ARP for it; an echo
+does not get through until the firewall lets ICMP in; `nat` lists the
+mapping and counts both ways; with the probe gone, nothing answers for the
+address, nor ARP. It needs an ISO with the UDP shell (`make nos-test.iso
+TEST_ISO_ARGS=udpshell=9100`, `--iso`); `--phase v0a|v0b` runs one.
+
+Its phase for V1b, vnet's group and its state (`modules/net/vnet`,
+`common/net/vnetmeta`), on either architecture (`--arch`, arm64 unless
+said) and with no hv: three nos on the hub, each with ipcnet.ko, cluster.ko
+and vnet.ko, the registry made among them first. vnet made on a, b added
+from a and c from b -- a member that does not lead -- three members, three
+voters, one leader as every host says; networks made, one refused for
+holding a host's own address (the proposer's look at the registry, which
+the state cannot make), one of an MTU and no way out, one through the bus,
+every host listing the same and the provider saying them as the command
+does; a VM's NIC's port made by `vnet port create`, as hv will make it,
+asked again from another host for another network -- the one there is, what
+differs said -- and an attach answered on its host and refused on another;
+a public address put on the port and refused removed while on it, a host's
+own address refused as a public one; a firewall of the cluster's made, a
+rule added, a port given it, its deletion refused while the port has it;
+all three killed and booted at once, the state back on each; the leader
+killed, the other two committing, and the killed host back with what they
+made; a cut off by the hub, its port moved to b, an attach on a refused once
+healed; c's vnet.ko unloaded and loaded again; a port on c, c removed from
+the registry and `vnet alerts` saying the port is on a node the registry
+has not; nothing panicked. On x86-64 it boots from `nos-test.iso`.
+
+Its phase for V2, the cluster's networks on one host: one x86-64 nos on the
+hub, the world past its router, with ipcnet.ko, cluster.ko, vnet.ko and
+hv.ko -- a registry and a vnet of it alone -- and networks `lan` (MTU
+1400) and `dev` (no way out). Probes a and b on lan, b at the address asked
+for, and c on dev, each a port of vnet's as a VM's NIC is (`hv probe add
+<name> network=vnet:<name>`), the three listed by `vnet ports`; a pings its
+gateway, answered by the switch, `hv0`, and the world through NAT, which
+sees nos's address; c's echoes to the world go nowhere, its gateway
+answers; a and b do not reach each other under the cluster's `default` until
+`vnet fw default add allow in from net`, which the keeper puts in its place
+from vnet's table, and neither reaches c; `hv list` counts the gateways'
+echoes; b's port deleted in vnet, the keeper shuts its switch port, says
+so in the log, and nothing reaches it; `hv create` on lan at an address
+makes its port there, its vm.toml saying its network alone, another VM at
+that address refused, `hv delete` deleting the port with the folder, and
+`vm.networks` offering the cluster's networks; vnet unloaded under the
+probes -- they go on, a new one is refused -- and loaded again; the probes
+deleted with their ports; `rmmod hv`; nothing panicked. It needs
+`nos-test.iso` with the UDP shell, as V0b does.
+
+Its phase for V3, the tunnel: three x86-64 nos on the hub, each with
+ipcnet.ko, cluster.ko, vnet.ko and hv.ko loaded `rekey=8 keylife=4` -- its
+keys given anew every eight seconds, the one before kept four -- the
+registry and vnet among them, networks `lan` and `dev`, and probes pa, pb,
+pc on lan, one on each host, qa and qc on dev on a and c. Every host's
+tunnel has a key to each other and the hop to it (`hv tunnel`); pa reaches
+pb, pb pc, pc pa and qa qc across hosts, and pa none of dev's; `hv tunnel`
+counts what went and came and nothing forged; a ping every two seconds for
+half a minute, across four changes of keys, every one answered; the hub
+narrows the link between a and b to 1450 bytes (`impair(max_frame=)`) --
+small echoes go on and a says the way to b does not carry a packet of 1400
+bytes; c killed, a's pings to it go unanswered and a says c answers no
+echo; c booted again and a new probe there reached, the keys of c's new hv
+had; hv unloaded and loaded again on b and a new probe there reached; that
+probe's port moved to c in vnet, b's keeper shuts it and nothing reaches
+its address; `rmmod hv` on all three; nothing panicked.
+
+Its phase for V4, public addresses across hosts: the three again, hv as
+it ships, probes pa, pb and pc on lan, one on each host, pb's and pc's ports
+judged by a firewall of the cluster's that lets everything in. A public
+address routed to a and put on pb's port, on b: a serves it (`hv tunnel`),
+the hub's world reaches it by echo and by a datagram to port 7 -- a's NAT
+one to one, `hv0`, the tunnel to b -- and pb's pings to the world are seen
+from the address, out through a, while pc's, with none, are seen from c's
+own; the address moved onto pc's port, on c, a serving it for pc, and pb
+going out from b's own address again; routed to b (`vnet ip move`), b
+serving it and a no longer, the world asking ARP again and reaching pc
+through b, pc going out from it; taken off, b serving nothing, pc out from
+c's own address and nothing answering for the address; `rmmod hv` on all
+three; nothing panicked.
+
 ### `hv-test.py` -- the extension turned on and off again, and guests under it
 
 The [hypervisor](hypervisor.md) is a module, and the one piece of state it
@@ -3130,11 +3329,36 @@ seconds, to:
   and a replica from a snapshot part way ending as it does. The scenarios
   `nbsmeta_replace`, `nbsmeta_voters`, `nbsmeta_bounds` and
   `nbsmeta_snapshot_rules` play each rule out, and `mutants.py`'s six
-  `nbsmeta_*` mutants take out: the refusal of an incarnation removed, of a
+  `members_*` mutants -- the rules are `common/cluster/members`' since V1a
+  of plans/vnet.md, which NBS's metadata keeps its members by, and vnet's
+  state will -- take out: the refusal of an incarnation removed, of a
   host's new incarnation for its old one, a remove asked again answered as
   done, the refusal of the last member's removal, the voters' cut at five,
   and the snapshot's check of members removed -- each failing the gate and
-  its own scenario. `RAFT_NBSMETA_STATS=1` prints each run's answers by
+  its own scenario. The registry votes by the same cut, and its
+  `registry_all_vote` mutant -- the registry not voting by it -- fails
+  `registry_voters`.
+- **The vnetmeta target** (`vnetmetafuzz.rs`), 200 runs of 600 steps: vnet's
+  state (`src/crates/common/net/vnetmeta`, plans/vnet.md) held to a model of
+  its own that shares nothing with it -- subnets as ranges of numbers,
+  addresses counted round from a cursor of its own -- under commands from
+  pools that meet and, as often as not, of what the state has now, as a
+  client that read it asks: networks made again as themselves and as
+  others, subnets that overlap and that are no network's, a port asked again
+  for its VM and NIC, a move from a node it is not on, a /28 filled, an
+  address let go of, a public address on two ports, a firewall's revision
+  gone by. After each command its answer and everything the state shows --
+  the group and its members, networks, ports, public addresses, firewalls,
+  the revision, what an attach on a node is answered -- must be the
+  model's; its snapshot read back, in pieces as one, changed and refused or
+  held to every rule, and a replica from a snapshot part way ending as it
+  does. Its first run found a rule the state did not keep: a network made
+  around an address made public before, which the snapshot's own check then
+  refused. The scenarios `vnetmeta_*` -- a port asked again, a move's compare
+  and set, numbers never given again, subnets, addresses, public addresses,
+  firewalls, attaches, a snapshot's rules, the bounds -- play each rule out,
+  and `mutants.py`'s eighteen `vnetmeta_*` mutants each fail the gate and
+  their own scenario. `RAFT_VNETMETA_STATS=1` prints each run's answers. `RAFT_NBSMETA_STATS=1` prints each run's answers by
   kind. What raft's rsm does with a state machine is the rsm and registry
   targets' to hold: this one is the state's own rules.
 - **The asks target** (`asksfuzz.rs`), 300 runs of 3000 steps and a calm

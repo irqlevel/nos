@@ -10,6 +10,53 @@ pub mod consts {
     pub const MAX_CPUS: usize = 64;
 }
 
+/// The kernel's pool, as the switch asks it for a table of flows' seed and
+/// the tunnel for its keys and its instance: a stream begun anew for every
+/// input (`reset`), so that a seed makes the same run again -- bytes that
+/// the guests' frames, which the fuzzer writes, know nothing of all the
+/// same, and no two of the tunnel's keys alike.
+pub mod random {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const START: u64 = 0x5A5A_1357_9BDF_2468;
+    static STATE: AtomicU64 = AtomicU64::new(START);
+
+    /// SplitMix64's next word.
+    fn next() -> u64 {
+        let s = STATE.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    pub fn fill_random(buf: &mut [u8]) -> bool {
+        for chunk in buf.chunks_mut(8) {
+            let w = next().to_le_bytes();
+            chunk.copy_from_slice(&w[..chunk.len()]);
+        }
+        true
+    }
+
+    pub fn random_u64() -> Option<u64> {
+        Some(next())
+    }
+
+    /// The stream begun again: every input's.
+    pub fn reset() {
+        STATE.store(START, Ordering::Relaxed);
+    }
+}
+
+/// A kernel task as the tunnel's body reaches it: never run here -- the
+/// target drives its steps itself -- so asked to stop at once.
+pub mod task {
+    pub fn stopping() -> bool {
+        true
+    }
+    pub fn sleep_ms(_ms: u64) {}
+}
+
 /// The host's clock, as the devices read it: the fuzzer's to move, forward
 /// only and by as much as it likes -- but no further than a host's clock
 /// can go, nanoseconds since boot: a clock near 2^64 would make findings of
@@ -101,6 +148,9 @@ pub mod time {
     impl Duration {
         pub fn from_nanos(ns: u64) -> Duration {
             Duration(ns)
+        }
+        pub fn from_millis(ms: u64) -> Duration {
+            Duration(ms.saturating_mul(1_000_000))
         }
         pub fn as_nanos(&self) -> u64 {
             self.0
@@ -318,6 +368,23 @@ pub mod trace {
 
     static ON: AtomicBool = AtomicBool::new(false);
     static EMITTED: AtomicU64 = AtomicU64::new(0);
+    /// What was emitted, while a target keeps it: the host whose code ran
+    /// (`crate::ipc::current`), the event, its payload.
+    static KEEP: AtomicBool = AtomicBool::new(false);
+    static KEPT: std::sync::Mutex<Vec<(usize, &'static str, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+    /// The most kept at once.
+    const KEPT_MAX: usize = 1 << 16;
+
+    /// The records emitted from now on kept, or not; what was kept dropped.
+    pub fn keep(on: bool) {
+        KEEP.store(on, Ordering::Relaxed);
+        KEPT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// What was kept since `keep`.
+    pub fn take_kept() -> Vec<(usize, &'static str, Vec<u8>)> {
+        core::mem::take(&mut *KEPT.lock().unwrap_or_else(|e| e.into_inner()))
+    }
 
     /// The most a payload is: a ring's slot's (kernel/trace_ring.h).
     const PAYLOAD_BYTES: usize = 40;
@@ -348,6 +415,12 @@ pub mod trace {
             }
         }
         EMITTED.fetch_add(1, Ordering::Relaxed);
+        if KEEP.load(Ordering::Relaxed) {
+            let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+            if kept.len() < KEPT_MAX {
+                kept.push((crate::ipc::current(), E::NAME, bytes.to_vec()));
+            }
+        }
     }
 
     /// The running task's pid: a vCPU's thread's, as far as a record cares.

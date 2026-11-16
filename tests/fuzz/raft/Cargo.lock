@@ -50,6 +50,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "firewall"
+version = "0.1.0"
+dependencies = [
+ "netwire",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -64,14 +71,26 @@ name = "ipcwire"
 version = "0.1.0"
 
 [[package]]
+name = "members"
+version = "0.1.0"
+dependencies = [
+ "ipcwire",
+]
+
+[[package]]
 name = "nbsmeta"
 version = "0.1.0"
 dependencies = [
  "codec",
  "ipcwire",
+ "members",
  "raft",
- "sha2",
+ "rsmkit",
 ]
+
+[[package]]
+name = "netwire"
+version = "0.1.0"
 
 [[package]]
 name = "raft"
@@ -85,9 +104,11 @@ name = "raft-fuzz"
 version = "0.1.0"
 dependencies = [
  "crc",
+ "firewall",
  "nbsmeta",
  "raft",
  "registry",
+ "vnetmeta",
 ]
 
 [[package]]
@@ -96,7 +117,17 @@ version = "0.1.0"
 dependencies = [
  "codec",
  "ipcwire",
+ "members",
  "raft",
+]
+
+[[package]]
+name = "rsmkit"
+version = "0.1.0"
+dependencies = [
+ "codec",
+ "raft",
+ "sha2",
 ]
 
 [[package]]
@@ -121,3 +152,14 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vnetmeta"
+version = "0.1.0"
+dependencies = [
+ "codec",
+ "firewall",
+ "members",
+ "raft",
+ "rsmkit",
+]

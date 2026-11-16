@@ -7,7 +7,9 @@ edition = "2021"
 # state in: raft's rsm over a log in a folder of the root, its messages to
 # the same name on every host of the group, commands handed to the leader.
 # No module of its own -- a library the modules that keep a group link:
-# cluster.ko, the registry's, and nbs-mds.ko, NBS's metadata (plans/nbs.md).
+# cluster.ko, the registry's, and nbs-mds.ko, NBS's metadata (plans/nbs.md);
+# the start, stop and recover of a member, and the offers of a group whose
+# hosts are offered it, written once (plans/vnet.md, V1a).
 [lib]
 name = "raftmember"
 
@@ -16,3 +18,7 @@ kcore = { path = "../../../base/kcore" }
 raft = { path = "../../../common/cluster/raft" }
 # ipcnet's control mailbox: who this host is (raftmember::ipcnet).
 ipcctl = { path = "../ipcctl" }
+# A group whose hosts are offered it: its members' rules, and the bytes of
+# its offers (raftmember::offered).
+members = { path = "../../../common/cluster/members" }
+codec = { path = "../../../common/codec" }

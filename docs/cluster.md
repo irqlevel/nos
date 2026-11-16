@@ -47,6 +47,12 @@ cluster rekey                   this host moved to a new key, no connection lost
 cluster recover [<cluster>]     on the last host standing: what it does, then -- the cluster's name given -- does it
 ```
 
+A host's `underlay` address is where vnet's tunnel reaches it, UDP -- its
+`ipc` address where it has none -- at that address's port where it has one
+of its own, else 39241: two hosts behind one NAT's address have ports of
+their own for both, and the NAT forwards each host's, TCP and UDP
+([vnet.md](vnet.md#across-hosts)).
+
 The same are the `cluster` provider's on the management bus -- reads
 `status` (this member, and this host as ipcnet has it: its name, its key
 and its address, what an invitation on another host asks for) and `hosts`;
@@ -90,6 +96,21 @@ insmod /lib/modules/cluster.ko
     `join` that did not finish left, and the next one clears it.
   - `raft/` -- the member's log, `raft::log::DiskLog`: segments of records
     each with a CRC32C, snapshots by rename ([raft.md](raft.md)).
+  - `begun` -- an empty file, the mark that the member began its log:
+    written and synced once the log's first segment is on the medium and
+    before the member's task starts (raftmember's `open_log`), so that the
+    member never says a word -- a vote, an acknowledgement -- without it. A
+    `member` beside a `raft/` that holds no log -- no segment begun whole, no
+    snapshot -- is either a host that joined and never ran -- no `begun`:
+    started, over an empty log -- or a member whose log is gone, what it
+    voted for and acknowledged with it, which is never started as the member
+    it was: raft never counts the vote of a member that forgot its log. The
+    module says so at its load, in `cluster` and in the provider's
+    `status` (`stopped`), with what to do -- `cluster remove` of the host on
+    a member, its folder removed, and a join by a new invitation; and
+    `cluster recover` refuses such a log before it stops anything. (Before
+    V1a of plans/vnet.md, both were started, the second as its old node.) A
+    log made before the mark is marked at its first start.
   - `.sync`, an empty file: a sync of the directory is a sync of it, nos's
     filesystem making everything durable at any file's sync.
 
@@ -177,9 +198,11 @@ a reboot between two of them -- goes on from where it stopped at the next
 ## When the majority is gone
 
 `cluster recover` on the last host standing makes it its cluster's one
-voter. It is refused while the member follows a leader, or while any other
-voter's member answers a probe within 3 s; without the cluster's name it
-says what it is about to do, and with it, it does it:
+voter -- raftmember's `recover`, which every group's module has (NBS's is
+`nbs recover`, [nbs.md](nbs.md)). It is refused while the member follows a
+leader, or while any other voter's member answers a probe within 3 s;
+without the cluster's name it says what it is about to do, and with it, it
+does it:
 
 1. the member stopped, and its log made the log of a group of itself alone
    (`raft::recover::force_alone`, docs/raft.md): every other member taken

@@ -4,7 +4,8 @@
 # the run loop that dispatches a guest's exits (hypervisor/hv/src/run.rs), and the
 # guests' DHCP server -- compiled from their own sources over stand-ins for
 # the kernel and the CPU (tests/hv-fuzz.py builds and runs it). Nothing
-# but netwire, conf and bzimage, paths of their own, so it builds offline.
+# but netwire, conf, bzimage and firewall, paths of their own, so it builds
+# offline.
 [package]
 name = "hv-fuzz"
 version = "0.1.0"
@@ -20,6 +21,12 @@ conf = { path = "../../../src/crates/common/text/conf" }
 # A bzImage's header and the zero page the Linux loader makes a guest's by
 # (the linux and platform targets). No dependencies of its own either.
 bzimage = { path = "../../../src/crates/common/boot/bzimage" }
+# Each guest's firewall, which the switch judges its frames by (the switch,
+# guestnet and firewall targets). Nothing but netwire under it.
+firewall = { path = "../../../src/crates/common/net/firewall" }
+# The cluster networks' tunnel's datagram (`vnetwire` target): sealed with
+# the vendored RustCrypto ChaCha20-Poly1305, which hv-fuzz.py builds with.
+vnetwire = { path = "../../../src/crates/common/net/vnetwire" }
 
 # What a RUSTUB=1 kernel has on: an overflow is a panic, not a wrap -- and a
 # guest that can cause one can bring down the host that runs it.

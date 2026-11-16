@@ -127,7 +127,7 @@ let nextVmId = 0;
 function vm(name, fields) {
   vms.set(name, {
     name, id: null, state: 'off', protected: false, cpus: 1, memory_mib: 1024, net: true, port: null,
-    network: null, kernel: '/lib/hvboot', console: '', bootMs: 0, restarts: 0, reason: null,
+    network: null, firewall: 'default', public: null, kernel: '/lib/hvboot', console: '', bootMs: 0, restarts: 0, reason: null,
     forwards: [], disks: [{ file: 'disk.raw', size_bytes: 20 * 1024 * MIB, read_only: false },
       { file: 'seed.iso', size_bytes: 65536, read_only: true }],
     ...fields,
@@ -180,14 +180,62 @@ function deviceGiven(word, force) {
   return d;
 }
 
-vm('panel', { protected: true, port: 0, forwards: [{ port: 39233, guest_port: 443 }] });
-vm('web', { cpus: 2, memory_mib: 2048, port: 3, forwards: [{ port: 2201, guest_port: 22 }] });
+vm('panel', { protected: true, port: 0, firewall: 'panel', forwards: [{ port: 39233, guest_port: 443 }] });
+vm('web', { cpus: 2, memory_mib: 2048, port: 3, firewall: 'web', forwards: [{ port: 2201, guest_port: 22 }] });
 vm('db', { memory_mib: 4096, network: 'back' });
 if (!FRESH) {
   /* On volumes of NBS's: one with a replica down, one with a chunk unreachable */
   const seed = { file: 'seed.iso', size_bytes: 65536, read_only: true };
   vm('store', { disks: [{ file: 'nbs:deg-vol', size_bytes: null, read_only: false }, seed] });
   vm('broken', { disks: [{ file: 'nbs:lost-vol', size_bytes: null, read_only: false }, seed] });
+}
+
+/* ---- the host's firewalls (the fw provider) ---- */
+
+/** Each firewall of the host's by name: its policies and rules, as a person
+ * writes them, and the flows each rule and policy judged. `default` judges a
+ * VM that names none; the panel's VM and web have their own, letting in at
+ * their forwarded ports, as hv's first start under firewalls makes them. */
+const firewalls = new Map();
+function firewallMade(name, inbound = 'deny', outbound = 'allow', rules = []) {
+  firewalls.set(name, { in: inbound, out: outbound, rules, hits: rules.map(() => 3), policyIn: 12, policyOut: 40 });
+}
+firewallMade('default');
+firewallMade('panel', 'deny', 'allow', ['allow in tcp 443']);
+firewallMade('web', 'deny', 'allow', ['allow in tcp 22', 'allow in tcp 80,443 from any']);
+
+const FIREWALL_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
+/** A rule as hv's `Rule::parse` takes one, roughly: its action and direction
+ * first, then what it is about. */
+const RULE = /^(allow|deny) (in|out)( (tcp|udp|icmp))?( [0-9][0-9,-]*)?( (from|to) (any|net|[0-9./,]+))?$/;
+
+const firewallNamed = (p, key = 'name') => {
+  const name = need(p, key);
+  const f = firewalls.get(name);
+  if (!f) {
+    throw new Refused('not_found', 'no firewall ' + name + ' on this host -- hv fw create ' + name, key);
+  }
+  return [name, f];
+};
+function firewallRow(name, f) {
+  return { name, in: f.in, out: f.out, rules: f.rules.length,
+    vms: [...vms.values()].filter((v) => v.state === 'running' && v.firewall === name).map((v) => v.name),
+    policy_in_flows: f.policyIn, policy_out_flows: f.policyOut, made: true };
+}
+/** A rule's number from the call, 1 to `count`. */
+function ruleNumber(p, key, count) {
+  const n = Number(need(p, key));
+  if (!Number.isInteger(n) || n < 1 || n > count) {
+    throw new Refused('invalid', count ? n + ' is not a rule\'s number -- 1 to ' + count : 'the firewall has no rule', key);
+  }
+  return n;
+}
+function policyOf(p, key) {
+  if (p[key] === undefined) return undefined;
+  if (p[key] !== 'allow' && p[key] !== 'deny') {
+    throw new Refused('invalid', 'is allow or deny', key);
+  }
+  return p[key];
 }
 
 /** A VM started: on the list, its console printing a boot. */
@@ -229,7 +277,7 @@ function vmJson(v) {
   return {
     name: v.name, id: v.id, state: v.state, folder: true, protected: v.protected, cpus: v.cpus,
     memory_mib: v.memory_mib, net: v.net, port, ip: port === null ? null : '10.0.100.' + (port + 2),
-    network: v.network, kernel: v.kernel,
+    network: v.network, firewall: v.firewall, public: v.public, kernel: v.kernel,
     ...(v.id !== null ? {
       uptime_ms: v.state === 'running' ? uptimeMs() - v.bootMs : 0, restarts: v.restarts,
       exits: Math.floor((uptimeMs() - v.bootMs) * 37), console_bytes: consoleOf(v).total,
@@ -277,6 +325,42 @@ function job(provider, method, steps, say, finish) {
   };
   setTimeout(tick, 200).unref();
   return j;
+}
+
+/* ---- vnet: the cluster's networks for VMs, as vnet.ko's provider answers ---- */
+
+const vnet = {
+  member: true, name: 'lab',
+  hosts: [{ host: 'mock-a', member: 4011, vote: 'voter', leader: true, lost: false }],
+  networks: [{ name: 'lan', vni: 1, net: [10, 10, 0, 0], prefix: 24, mtu: 1420, out: true }],
+  ports: [{ id: 1, network: 'lan', address: '10.10.0.2', host: 'mock-a', generation: 1, firewall: 'default',
+    vm: '11111111-2222-3333-4444-555555555555', nic: 0 }],
+  public: [],
+  firewalls: [{ name: 'default', in: 'deny', out: 'allow', rules: [], revision: 1 }],
+  nextVni: 2,
+};
+const VNET_NAME = /^[a-z0-9-]{1,26}$/;
+const quad = (a) => a.join('.');
+function vnetSubnet(text) {
+  const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)$/.exec(text || '');
+  if (!m) throw new Refused('invalid', 'is a subnet: a.b.c.d/prefix', 'subnet');
+  return { net: m.slice(1, 5).map(Number), prefix: Number(m[5]) };
+}
+const vnetSpan = (n) => {
+  const start = ((n.net[0] << 24) | (n.net[1] << 16) | (n.net[2] << 8) | n.net[3]) >>> 0;
+  return [start, start + 2 ** (32 - n.prefix) - 1];
+};
+const vnetFirewall = (p, key = 'name') => {
+  const name = need(p, key);
+  const f = vnet.firewalls.find((x) => x.name === name);
+  if (!f) throw new Refused('not_found', 'no firewall ' + name);
+  return f;
+};
+function vnetSetRules(f, rules, inbound = f.in, outbound = f.out) {
+  f.rules = rules;
+  f.in = inbound;
+  f.out = outbound;
+  f.revision += 1;
 }
 
 function jobInfo(j) {
@@ -478,6 +562,13 @@ const reads = {
     busy: limits.busy, consoles: Object.fromEntries(consoleStreams) }),
   'api.clients': () => ({ clients: [{ name: 'panel', role: 'admin', key: adminPin }, { name: 'reader', role: 'read', key: readerPin }] }),
   'vm.list': () => ({ vms: [...vms.values()].map(vmJson) }),
+  'fw.list': () => ({ firewalls: [...firewalls].map(([name, f]) => firewallRow(name, f)) }),
+  'fw.rules': () => ({ rules: [...firewalls].flatMap(([name, f]) => f.rules.map((rule, i) => ({
+    id: name + '/' + (i + 1), firewall: name, n: i + 1, rule, flows: f.hits[i] }))) }),
+  'fw.get': (p) => {
+    const [name, f] = firewallNamed(p);
+    return { firewall: firewallRow(name, f), rules: f.rules.map((rule, i) => ({ n: i + 1, rule, flows: f.hits[i] })) };
+  },
   'vm.get': (p) => {
     const v = vmNamed(p);
     return {
@@ -495,9 +586,14 @@ const reads = {
       dhcp_answers: 4, frames_foreign: 0 } }),
   'vm.networks': () => {
     const on = [...vms.values()].filter((v) => v.state === 'running');
-    const names = [...new Set(on.map((v) => v.network).filter(Boolean))];
-    return { networks: names.map((n) => ({ name: n, vms: on.filter((v) => v.network === n).map((v) => v.name) })),
-      alone: on.filter((v) => !v.network).map((v) => v.name) };
+    /* The host's in use, and every one of the cluster's, as vnet:<name> */
+    const cluster = vnet.networks.map((n) => 'vnet:' + n.name);
+    const names = [...new Set([...on.map((v) => v.network).filter(Boolean), ...cluster])].sort();
+    return { networks: names.map((n) => {
+      const c = vnet.networks.find((x) => 'vnet:' + x.name === n);
+      return { name: n, cluster: c !== undefined, ...(c ? { subnet: quad(c.net) + '/' + c.prefix, free: 250 } : {}),
+               vms: on.filter((v) => v.network === n).map((v) => v.name) };
+    }), alone: on.filter((v) => !v.network).map((v) => v.name) };
   },
   'vm.config_get': (p) => {
     const v = vmNamed(p);
@@ -629,6 +725,28 @@ const reads = {
     nbsMember();
     return { volumes: nbs.volumes.map((v) => nbsJson(v, false)) };
   },
+  'vnet.status': () => (!vnet.member ? { member: false, stopped: null } : {
+    member: true, vnet: vnet.name, node: 4011, role: 'leader', term: 2, leader: 'mock-a', applied: 30, members: 1,
+    voters: 1, learners: 0, networks: vnet.networks.length, ports: vnet.ports.length, public: vnet.public.length,
+    firewalls: vnet.firewalls.length, revision: 7, refused: 0, stopped: null }),
+  'vnet.hosts': () => ({ hosts: vnet.hosts }),
+  'vnet.networks': () => ({ networks: vnet.networks.map((n) => {
+    const ports = vnet.ports.filter((x) => x.network === n.name).length;
+    const gw = [...n.net];
+    gw[3] += 1;
+    return { name: n.name, vni: n.vni, subnet: quad(n.net) + '/' + n.prefix, gateway: quad(gw), mtu: n.mtu, out: n.out,
+      ports, free: 2 ** (32 - n.prefix) - 3 - ports };
+  }) }),
+  'vnet.ports': () => ({ ports: vnet.ports.map((x) => ({ ...x,
+    public: (vnet.public.find((a) => a.port === x.id) || {}).address || null })) }),
+  'vnet.public': () => ({ public: vnet.public }),
+  'vnet.firewalls': () => ({ firewalls: vnet.firewalls.map((f) => ({ name: f.name, in: f.in, out: f.out,
+    rules: f.rules.length, revision: f.revision, ports: vnet.ports.filter((x) => x.firewall === f.name).length })) }),
+  'vnet.firewall': (p) => {
+    const f = vnetFirewall(p);
+    return { name: f.name, in: f.in, out: f.out, revision: f.revision, rules: f.rules.map((rule, i) => ({ n: i + 1, rule })) };
+  },
+  'vnet.alerts': () => ({ alerts: [] }),
   'nbs.volume': (p) => {
     nbsMember();
     return nbsJson(nbsVolume(p), true);
@@ -636,6 +754,144 @@ const reads = {
 };
 
 const actions = {
+  'vnet.network_create': (p) => {
+    const name = need(p, 'name');
+    if (!VNET_NAME.test(name)) throw new Refused('invalid', 'not a name: lowercase letters, digits and -, a network\'s up to 26', 'subnet');
+    const { net, prefix } = vnetSubnet(need(p, 'subnet'));
+    const mtu = p.mtu === undefined ? 1420 : Number(p.mtu);
+    const had = vnet.networks.find((n) => n.name === name);
+    if (had) throw new Refused('conflict', 'a network of that name is there already, another');
+    const [a0, a1] = vnetSpan({ net, prefix });
+    if (vnet.networks.some((n) => { const [b0, b1] = vnetSpan(n); return a0 <= b1 && b0 <= a1; })) {
+      throw new Refused('conflict', 'the subnet overlaps another network\'s, or holds a public address');
+    }
+    const n = { name, vni: vnet.nextVni, net, prefix, mtu, out: p.out !== false };
+    vnet.nextVni += 1;
+    vnet.networks.push(n);
+    return { name, vni: n.vni };
+  },
+  'vnet.network_delete': (p) => {
+    const name = need(p, 'name');
+    if (vnet.ports.some((x) => x.network === name)) {
+      throw new Refused('conflict', 'ports are on the network -- their VMs deleted first, or their ports');
+    }
+    const had = vnet.networks.length;
+    vnet.networks = vnet.networks.filter((n) => n.name !== name);
+    return { name, deleted: vnet.networks.length !== had };
+  },
+  'vnet.port_delete': (p) => {
+    const id = Number(need(p, 'port'));
+    vnet.ports = vnet.ports.filter((x) => x.id !== id);
+    const a = vnet.public.find((x) => x.port === id);
+    if (a) a.port = null;
+    return { port: id, public: a ? a.address : null };
+  },
+  'vnet.firewall_create': (p) => {
+    const name = need(p, 'name');
+    if (!vnet.firewalls.some((f) => f.name === name)) {
+      vnet.firewalls.push({ name, in: p.in || 'deny', out: p.out || 'allow', rules: [], revision: 1 });
+    }
+    return { name };
+  },
+  'vnet.firewall_delete': (p) => {
+    const f = vnetFirewall(p);
+    if (f.name === 'default') throw new Refused('conflict', '`default` is never deleted');
+    if (vnet.ports.some((x) => x.firewall === f.name)) throw new Refused('conflict', 'ports have the firewall -- each given another first');
+    vnet.firewalls = vnet.firewalls.filter((x) => x !== f);
+    return { name: f.name, deleted: true };
+  },
+  'vnet.firewall_add': (p) => {
+    const f = vnetFirewall(p);
+    const rule = need(p, 'rule');
+    if (!RULE.test(rule)) throw new Refused('invalid', '"' + rule + '": a rule begins with allow or deny', 'rule');
+    const at = p.at === undefined ? f.rules.length : Number(p.at) - 1;
+    const rules = [...f.rules];
+    rules.splice(at, 0, rule);
+    vnetSetRules(f, rules);
+    return { done: 'rule ' + (at + 1) + ': ' + rule };
+  },
+  'vnet.firewall_policy': (p) => {
+    const f = vnetFirewall(p);
+    vnetSetRules(f, f.rules, policyOf(p, 'in') || f.in, policyOf(p, 'out') || f.out);
+    return { done: 'in ' + f.in + ', out ' + f.out };
+  },
+  'fw.create': (p) => {
+    const name = need(p, 'name');
+    if (!FIREWALL_NAME.test(name) || ['create', 'delete', 'set', 'help'].includes(name)) {
+      throw new Refused('invalid', '"' + name + '" is not a firewall\'s name -- a letter or a digit, then letters, digits, . _ and -, at most 32', 'name');
+    }
+    if (firewalls.has(name)) {
+      throw new Refused('conflict', 'there is a firewall ' + name + ' already');
+    }
+    firewallMade(name, policyOf(p, 'in') ?? 'deny', policyOf(p, 'out') ?? 'allow');
+    const f = firewalls.get(name);
+    return { name, in: f.in, out: f.out };
+  },
+  'fw.delete': (p) => {
+    const [name] = firewallNamed(p);
+    if (name === 'default') {
+      throw new Refused('conflict', 'default is what a VM that names no firewall is judged by: it is changed, never deleted');
+    }
+    const naming = [...vms.values()].filter((v) => v.firewall === name).map((v) => v.name);
+    if (naming.length) {
+      throw new Refused('conflict', naming.join(', ') + ' name' + (naming.length === 1 ? 's ' : ' ') + name
+        + ' in their vm.toml -- hv fw set <vm> <another> first');
+    }
+    firewalls.delete(name);
+    return { deleted: name };
+  },
+  'fw.policy': (p) => {
+    const [, f] = firewallNamed(p);
+    const inbound = policyOf(p, 'in');
+    const outbound = policyOf(p, 'out');
+    if (inbound === undefined && outbound === undefined) {
+      throw new Refused('invalid', 'is allow or deny: in, out or both are given', 'in');
+    }
+    f.in = inbound ?? f.in;
+    f.out = outbound ?? f.out;
+    f.policyIn = 0;
+    f.policyOut = 0;
+    return { in: f.in, out: f.out, cut: 0 };
+  },
+  'fw.add': (p) => {
+    const [, f] = firewallNamed(p);
+    const rule = String(need(p, 'rule')).trim().replace(/\s+/g, ' ');
+    if (!RULE.test(rule)) {
+      throw new Refused('invalid', 'allow or deny, in or out, then [tcp|udp|icmp] [ports] [from|to any|net|<a.b.c.d/n,...>]', 'rule');
+    }
+    if (f.rules.length >= 64) {
+      throw new Refused('invalid', 'a firewall has 64 rules at most', 'rule');
+    }
+    const at = p.at === undefined ? f.rules.length + 1 : ruleNumber(p, 'at', f.rules.length + 1);
+    f.rules.splice(at - 1, 0, rule);
+    f.hits = f.rules.map(() => 0);
+    return { n: at, rule, cut: 0 };
+  },
+  'fw.remove': (p) => {
+    const [, f] = firewallNamed(p);
+    const n = ruleNumber(p, 'n', f.rules.length);
+    const [rule] = f.rules.splice(n - 1, 1);
+    f.hits = f.rules.map(() => 0);
+    return { rule, cut: 0 };
+  },
+  'fw.move': (p) => {
+    const [, f] = firewallNamed(p);
+    const n = ruleNumber(p, 'n', f.rules.length);
+    const to = ruleNumber(p, 'to', f.rules.length);
+    const [rule] = f.rules.splice(n - 1, 1);
+    f.rules.splice(to - 1, 0, rule);
+    f.hits = f.rules.map(() => 0);
+    return { n: to, cut: 0 };
+  },
+  'fw.assign': (p) => {
+    const [name] = firewallNamed(p, 'firewall');
+    const v = vms.get(need(p, 'vm'));
+    if (!v) {
+      throw new Refused('not_found', 'no vm ' + p.vm + ', running or in the VMs\' folder', 'vm');
+    }
+    v.firewall = name;
+    return { vm: v.name, firewall: name, id: v.id, live: v.state === 'running', kept: true, cut: 0 };
+  },
   'nbs.volume_create': (p) => {
     const name = need(p, 'name');
     if (!NBS_NAME.test(name)) {
@@ -988,6 +1244,7 @@ function createOfImage(name, p) {
     nbsShare(image, clone, 'volume', nbs.hosts[0].host);
     nbs.volumes.find((v) => v.name === clone).size_mib = sizeMib;
     vm(name, { memory_mib: p.memory_mib ?? 1024, cpus: p.cpus ?? 1, network: p.network ?? null,
+               firewall: p.firewall ?? 'default', public: p.public ?? null,
       disks: [{ file: 'nbs:' + clone, size_bytes: null, read_only: false }, SEED_DISK] });
     return { name, file: '/vms/' + name + '/vm.toml', disk_bytes: sizeMib * MIB, keys: 1, port: null, id: null };
   });
@@ -1015,6 +1272,7 @@ function createOntoVolume(name, p) {
   return job('vm', 'create', 4, (i) => ['download: 120 MiB of 590 MiB, 20%', 'download: 590 MiB of 590 MiB, 100%',
     'nbs:' + word + ': 3584 MiB poured, the rest of the volume zeroes', '/vms/' + name + '/vm.toml written'][i], () => {
     vm(name, { memory_mib: p.memory_mib ?? 1024, cpus: p.cpus ?? 1, network: p.network ?? null,
+               firewall: p.firewall ?? 'default', public: p.public ?? null,
       disks: [{ file: 'nbs:' + word, size_bytes: null, read_only: false }, SEED_DISK] });
     return { name, file: '/vms/' + name + '/vm.toml', disk_bytes: v.size_mib * MIB, keys: 1, port: null, id: null };
   });
@@ -1146,6 +1404,29 @@ const jobMethods = {
     if (vms.has(name)) {
       throw new Refused('conflict', name + ' is there already', 'name');
     }
+    /* On a network of the cluster's: its port made as hv makes it, of
+     * vnet's, judged by one of the cluster's firewalls */
+    const cluster = typeof p.network === 'string' && p.network.startsWith('vnet:') ? p.network.slice(5) : null;
+    if (cluster !== null) {
+      if (!vnet.networks.some((n) => n.name === cluster)) {
+        throw new Refused('failed', 'vnet:' + cluster + ': no network ' + cluster);
+      }
+      if (p.public !== undefined) {
+        throw new Refused('invalid', "port= and public= are the host's networks'", 'public');
+      }
+      const fw = p.firewall ?? 'default';
+      if (!vnet.firewalls.some((f) => f.name === fw)) {
+        throw new Refused('failed', 'vnet:' + cluster + ': no firewall ' + fw);
+      }
+      const id = Math.max(0, ...vnet.ports.map((x) => x.id)) + 1;
+      const taken = new Set(vnet.ports.filter((x) => x.network === cluster).map((x) => x.address));
+      let host = 2;
+      while (taken.has('10.10.0.' + host)) host += 1;
+      vnet.ports.push({ id, network: cluster, address: '10.10.0.' + host, host: 'mock-a', generation: id, firewall: fw,
+                        vm: '00000000-0000-4000-8000-' + String(id).padStart(12, '0'), nic: 0 });
+    } else if (p.firewall !== undefined && !firewalls.has(p.firewall)) {
+      throw new Refused('invalid', 'no firewall ' + p.firewall + ' on this host -- hv fw create ' + p.firewall, 'firewall');
+    }
     if (p.image !== undefined) {
       return createOfImage(name, p);
     }
@@ -1164,6 +1445,7 @@ const jobMethods = {
         : 'disk.raw: 1785 MiB written of 3584 MiB, the rest holes',
       '/vms/' + name + '/vm.toml written'][i], () => {
       vm(name, { memory_mib: p.memory_mib ?? 1024, cpus: p.cpus ?? 1, network: p.network ?? null,
+                 firewall: p.firewall ?? 'default', public: p.public ?? null,
                  ...(onto ? { disks: [deviceDisk(onto, false), { file: 'seed.iso', size_bytes: 65536, read_only: true }] }
                    : {}) });
       return { name, file: '/vms/' + name + '/vm.toml', disk_bytes: onto ? onto.size_bytes : p.size_bytes ?? 3584 * MIB,
