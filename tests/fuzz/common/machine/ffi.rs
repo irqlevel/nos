@@ -10,6 +10,8 @@
 //! allocates is not the kernel's.
 
 use core::ffi::c_void;
+use std::cell::Cell;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::{cmd, sched};
 
@@ -113,6 +115,78 @@ pub extern "C" fn kernel_preempt_can_block() -> i32 {
 #[no_mangle]
 pub extern "C" fn kernel_interrupts_enabled() -> i32 {
     sched::harness(|| (sched::ctx() != sched::Ctx::Irq && sched::irq_off() == 0) as i32)
+}
+
+/* ---- SIMD sections ---- */
+
+/// What an input lets a section use of what the host's CPU has: a target
+/// holds it to one of the assembly's paths at a time (`simd_allow`), so
+/// that one host drives each. All of it until then.
+static SIMD_ALLOWED: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// What a section may use from here on, of what the host has:
+/// `kcore::simd`'s bits.
+pub fn simd_allow(mask: u32) {
+    SIMD_ALLOWED.store(mask, Ordering::Relaxed);
+}
+
+/// What the host's CPU has of what a section may use. The host's own
+/// kernel saves the vector registers across its switches, so a section
+/// here needs nothing of the CPU: only the rules below.
+fn host_simd() -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut has = kcore::simd::SSE2;
+        if std::is_x86_feature_detected!("ssse3") {
+            has |= kcore::simd::SSSE3;
+        }
+        if std::is_x86_feature_detected!("avx") {
+            has |= kcore::simd::AVX;
+        }
+        if std::is_x86_feature_detected!("avx2") {
+            has |= kcore::simd::AVX2;
+        }
+        has
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        kcore::simd::NEON
+    }
+}
+
+thread_local! {
+    /* The task's section. In the machine each task runs on a thread of its
+       own, so a task's section is its CPU's, and an interrupt run on that
+       thread finds it open. */
+    static SECTION_OPEN: Cell<bool> = const { Cell::new(false) };
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_simd_features() -> u32 {
+    host_simd() & SIMD_ALLOWED.load(Ordering::Relaxed)
+}
+
+/// A section as the kernel's: one at a time, and preemption off while it
+/// is open -- so that a wait inside one breaks the machine's lock rules.
+#[no_mangle]
+pub extern "C" fn kernel_simd_begin() -> i32 {
+    sched::harness(|| {
+        if kernel_simd_features() == 0 || SECTION_OPEN.with(|open| open.get()) {
+            return 0;
+        }
+        sched::preempt_disable();
+        SECTION_OPEN.with(|open| open.set(true));
+        1
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_simd_end() {
+    sched::harness(|| {
+        invariant!(SECTION_OPEN.with(|open| open.get()), "a SIMD section closed that was not open");
+        SECTION_OPEN.with(|open| open.set(false));
+        sched::preempt_enable();
+    })
 }
 
 /* ---- locks and events ---- */

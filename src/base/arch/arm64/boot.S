@@ -19,6 +19,13 @@
  */
 
 #define SCTLR_EL1_RES1   0x30D00800
+
+/* CPTR_EL2 for an EL1 that uses FP/SIMD: its RES1 bits (13:12, 9:0) and
+   nothing else -- TFP (bit 10) clear, so that the kernel's SIMD sections
+   (hal/simd.h) do not trap to an EL2 with nothing there to take it; TCPAC
+   (bit 31) clear, so that EL1's own CPACR_EL1 is its to write. Bits 8 and
+   12 trap SVE and SME where a CPU has them: nothing here uses either. */
+#define CPTR_EL2_EL1_FP  0x33FF
 #define SCTLR_M          (1 << 0)
 #define SCTLR_C          (1 << 2)
 #define SCTLR_I          (1 << 12)
@@ -78,6 +85,9 @@ Start64:
     orr     x2, x2, #(1 << 3)       /* Enable */
     orr     x2, x2, #1              /* SRE */
     msr     icc_sre_el2, x2
+    /* FP/SIMD at EL1 not trapped here, whatever firmware left */
+    mov     x2, #CPTR_EL2_EL1_FP
+    msr     cptr_el2, x2
     ldr     x2, =SCTLR_EL1_RES1
     msr     sctlr_el1, x2
     adr     x2, el1_entry
@@ -244,6 +254,8 @@ secondary_entry:
     orr     x2, x2, #(1 << 3)       /* Enable (see BSP path) */
     orr     x2, x2, #1              /* SRE */
     msr     icc_sre_el2, x2
+    mov     x2, #CPTR_EL2_EL1_FP    /* FP/SIMD at EL1 (see BSP path) */
+    msr     cptr_el2, x2
     ldr     x2, =SCTLR_EL1_RES1
     msr     sctlr_el1, x2
     adr     x2, ap_el1

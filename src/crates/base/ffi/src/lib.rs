@@ -7,6 +7,7 @@ pub mod time;
 pub mod sync;
 pub mod task;
 pub mod cpu;
+pub mod simd;
 #[cfg(target_arch = "x86_64")]
 pub mod io;
 pub mod dma;
