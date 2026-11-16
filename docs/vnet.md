@@ -191,7 +191,8 @@ refused while its VM runs, the alerts of a public address's host -- is in
 
 - `tests/hv-fuzz.py` (host, in CI): `vnetswitch` (the switch's rules for
   the cluster's networks, held to a model of its own), `vnetwire` (the
-  datagram, its window, the keys' messages), `tunnel` (three hosts' real
+  datagram -- every one held to the wire built without vnetwire -- its
+  window, the keys' messages), `tunnel` (three hosts' real
   switches and tunnels over a wire that loses, repeats, damages, reorders
   and forges, public addresses through the real NAT); `--mutants`: ninety-nine
   rules taken out, each to be found.

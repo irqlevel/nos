@@ -14,7 +14,16 @@
 //! the plaintext; and opened once more with one bit changed -- of the
 //! ciphertext, the associated data, the tag or the nonce -- refused by both,
 //! and the buffer left as it was.
+//!
+//! Or, as sshd's cipher takes them, the two halves on their own: ChaCha20
+//! from a counter block of four words of any value -- the block count low,
+//! or as high as the judge goes, its last block 2^32 - 2 (RustCrypto's
+//! ChaCha20 makes no block 2^32 - 1; every boot's `crypto::selftest` holds
+//! the paths to each other up to it) -- held to RustCrypto's chacha20, and
+//! Poly1305 over what that gave, its last block padded as RFC 8439 2.5 pads
+//! it, held to RustCrypto's poly1305.
 
+use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use crypto::{ChaCha20Poly1305, KEY_LEN, NONCE_LEN, PIECE, TAG_LEN};
 
@@ -53,7 +62,22 @@ fn fill(seed: u64, buf: &mut [u8]) {
 
 pub fn aead(r: &mut Input) {
     while r.more() {
-        message(r);
+        /* A third of them the halves on their own */
+        if r.below(3) == 0 {
+            halves(r);
+        } else {
+            message(r);
+        }
+    }
+}
+
+/// A message's length: one where the assembly changes its way -- half of
+/// them -- or any.
+fn length(r: &mut Input) -> usize {
+    if r.bool() {
+        r.pick(&EDGES) + r.below(3) as usize
+    } else {
+        r.below(LONGEST) as usize
     }
 }
 
@@ -64,7 +88,7 @@ fn message(r: &mut Input) {
     fill(r.u64(), &mut nonce);
     let mut aad = vec![0u8; r.below(64) as usize];
     fill(r.u64(), &mut aad);
-    let len = if r.chance(2) { r.pick(&EDGES) + r.below(3) as usize } else { r.below(LONGEST) as usize };
+    let len = length(r);
     let mut plaintext = vec![0u8; len];
     fill(r.u64(), &mut plaintext);
     let offset = r.below(16) as usize;
@@ -132,4 +156,42 @@ fn message(r: &mut Input) {
         .decrypt_in_place_detached(&bad_nonce.into(), &bad_aad, &mut judged, &bad_tag.into())
         .is_err(), "RustCrypto took {} bytes with a bit changed: the change was no change", len);
     crate::common::runner::reached("aead: a message sealed, opened and refused");
+}
+
+fn halves(r: &mut Input) {
+    let mut key = [0u8; KEY_LEN];
+    fill(r.u64(), &mut key);
+    let len = length(r);
+    let mut data = vec![0u8; len];
+    fill(r.u64(), &mut data);
+    let offset = r.below(16) as usize;
+    let blocks = (len as u64).div_ceil(64);
+    let first = if r.bool() { (u64::from(u32::MAX) - blocks) as u32 } else { r.u32() >> 8 };
+    let counter = [first, r.u32(), r.u32(), r.u32()];
+    let path = r.pick(&PATHS);
+
+    /* The judge's: RFC 8439's ChaCha20 -- the counter block's first word
+     * the block, the other three the nonce -- at that block */
+    let mut nonce = [0u8; NONCE_LEN];
+    for (i, word) in counter[1..].iter().enumerate() {
+        nonce[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    let mut want = data.clone();
+    let mut stream = chacha20::ChaCha20::new(&key.into(), &nonce.into());
+    stream.seek(u64::from(first) * 64);
+    stream.apply_keystream(&mut want);
+
+    let mut buf = vec![0u8; offset + len];
+    buf[offset..].copy_from_slice(&data);
+    crate::machine::ffi::simd_allow(path);
+    crypto::chacha20(&key, &counter, &mut buf[offset..]);
+    invariant!(buf[offset..] == want[..], "{} bytes (at +{}) from block {:#x} on paths {:#x} unlike RustCrypto's \
+               ChaCha20: first difference at byte {}", len, offset, first, path,
+               buf[offset..].iter().zip(want.iter()).position(|(a, b)| a != b).unwrap_or(len));
+
+    let tag = crypto::poly1305(&key, &buf[offset..]);
+    let want_tag = poly1305::Poly1305::new(&key.into()).compute_unpadded(&want);
+    invariant!(tag[..] == want_tag[..], "Poly1305 over {} bytes (at +{}) on paths {:#x}: {:02x?}, RustCrypto's \
+               {:02x?}", len, offset, path, tag, &want_tag[..]);
+    crate::common::runner::reached("aead: ChaCha20 and Poly1305 on their own");
 }

@@ -4,9 +4,10 @@
 //! An SSH server: the protocol, and nothing of the machine it runs on.
 //!
 //! What the machine gives -- the TCP connection, the random pool, the
-//! clock, the shell, which keys may log in -- comes in through two traits,
-//! `Link` and `Shell`, and the sshd module (src/crates/modules/net/sshd) is what
-//! implements them. What is here is RFC 4253, 4252 and 4254 cut down to one
+//! clock, the shell, which keys may log in, and the ChaCha20 and Poly1305
+//! the cipher is made of -- comes in through three traits, `Link`, `Shell`
+//! and `Primitives`, and the sshd module (src/crates/modules/net/sshd) is
+//! what implements them. What is here is RFC 4253, 4252 and 4254 cut down to one
 //! algorithm of each kind, the ones every OpenSSH of the last ten years
 //! offers first or nearly:
 //!
@@ -34,6 +35,7 @@ mod wire;
 
 use core::fmt;
 
+pub use cipher::Primitives;
 pub use connection::serve;
 pub use keys::{AuthorizedKey, HostKey, PublicKey};
 
@@ -137,6 +139,8 @@ pub struct Config<'a> {
     pub keepalive_ms: u64,
     /// this many questions unanswered, and it is dropped.
     pub keepalive_max: u32,
+    /// ChaCha20 and Poly1305, as the machine has them.
+    pub primitives: &'a dyn Primitives,
 }
 
 /// Why a session ended, other than by its channel closing.

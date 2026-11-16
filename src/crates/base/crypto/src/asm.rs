@@ -141,8 +141,10 @@ impl Drop for Key {
     }
 }
 
-/// The counter block: the 32-bit block counter, then the nonce's three
-/// words.
+/// The counter block, the state's last four words: RFC 8439's 32-bit block
+/// counter and the nonce's three words, or the original ChaCha20's 64-bit
+/// counter and 64-bit nonce, two words each. The code counts in the first
+/// word alone.
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
 pub struct Counter(pub [u32; 4]);
@@ -232,6 +234,24 @@ impl Poly1305 {
             return;
         }
         unsafe { poly1305_blocks(st, p, len, 1) };
+    }
+
+    /// A message's last bytes, fewer than a block, as RFC 8439 2.5 pads
+    /// them: a 1 after them, zeros to the block's end, and no 2^128 bit --
+    /// Poly1305's own padding, which the AEAD's ([`Poly1305::padded`]) is
+    /// not. Integer code: one block, which takes the state from whichever
+    /// radix the blocks before it left it in.
+    pub fn last(&mut self, tail: &[u8]) {
+        assert!(tail.len() < 16, "poly1305: a tail of a block or more");
+        if tail.is_empty() {
+            return;
+        }
+        let mut block = [0u8; 16];
+        block[..tail.len()].copy_from_slice(tail);
+        block[tail.len()] = 1;
+        /* The state is this MAC's, the block 16 bytes, its pad bit 0. */
+        unsafe { poly1305_blocks(self.state.0.as_mut_ptr(), block.as_ptr(), 16, 0) };
+        zeroize::Zeroize::zeroize(&mut block);
     }
 
     /// `data` in, its last block filled out with zeros to 16 bytes -- the

@@ -306,8 +306,9 @@ Ethernet | IPv4, DF | UDP 39241 to 39241, checksum 0 | kind 1, network 3, key 4,
 
 - **`vnetwire`**: the datagram read and written, sealed and opened
   (ChaCha20-Poly1305, the counter its nonce, the header its associated
-  data), the window of counters seen (2048), the messages keys go in. hv.ko
-  and the fuzzer link it.
+  data -- by the AEAD its caller hands it: hv.ko's the crypto crate's
+  CRYPTOGAMS assembly, the fuzzer's RustCrypto's), the window of counters
+  seen (2048), the messages keys go in. hv.ko and the fuzzer link it.
 - **The kinds**, and what the receiver holds each to against its table
   before it makes the Ethernet header:
   1. port to port: from a port of that network which is on the host that

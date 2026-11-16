@@ -122,7 +122,7 @@ One of each, what every OpenSSH of the last ten years offers first or nearly:
 | key exchange | `curve25519-sha256` (RFC 8731), with OpenSSH's strict key exchange (`kex-strict-s-v00@openssh.com`) -- the fix for Terrapin |
 | host key | `ssh-ed25519` (RFC 8709) |
 | user authentication | `publickey` with `ssh-ed25519` keys; no passwords |
-| cipher | `chacha20-poly1305@openssh.com`, an AEAD, so no MAC |
+| cipher | `chacha20-poly1305@openssh.com`, an AEAD, so no MAC -- its ChaCha20 and Poly1305 CRYPTOGAMS' assembly in the kernel's SIMD sections ([tls.md](tls.md#the-assembly)) |
 | compression | none |
 
 Rekeying is the client's to start and is followed wherever it comes, in the
@@ -195,18 +195,34 @@ can.
 - A command still running holds up `sshd stop`, `rmmod sshd` and `poweroff`
   until it returns, as a module's command does. `sshd stop` from a session --
   its own task, or its command's -- is refused: it would wait for itself.
+- **What a transfer runs at, and what holds it.** `ssh nos cat` of 48 MiB
+  over QEMU's user network, arm64 under HVF (2026-11-16): 27 MB/s, on
+  RustCrypto's cipher and on CRYPTOGAMS' alike -- the cipher is a few per
+  cent of one CPU at that rate. What holds it is a connection's TCP buffers,
+  the slot's own 8 KiB each way (`TcpListener::bind`), which a round trip
+  can carry no more of -- so over a WAN a fraction of that -- and the
+  command's output moved to the session, and sent, 2 KiB at a time
+  (`OUT_CHUNK`). As an experiment, not as built: bulk buffers
+  (`bind_bulk`) 32 MB/s; those and 8 KiB a packet 40 MB/s, CRYPTOGAMS'
+  cipher 2% ahead of RustCrypto's there. Bulk buffers are not given at
+  accept because a knock on port 22 would hold them: they come from the
+  kernel's 32 (`MAX_BULK`), which ipcnet's links and `hv forward` draw on.
 
 ## How it is put together
 
 - `src/crates/common/net/ssh` -- the protocol, and nothing of the kernel: the transport
   (version exchange, packets, key exchange), authentication, the session
   channel and the line editor. What it needs of the machine comes in through
-  two traits: `Link` (the connection, the clock, the random pool, whether the
-  server is stopping) and `Shell` (whose keys may log in, and running a line).
-  The cryptography is the vendored RustCrypto and dalek crates the TLS client
+  three traits: `Link` (the connection, the clock, the random pool, whether
+  the server is stopping), `Shell` (whose keys may log in, and running a
+  line) and `Primitives` (ChaCha20 from any counter block, and Poly1305: what
+  the cipher and a session's random stream are made of). The key exchange
+  and the signatures are the vendored dalek crates and `sha2` the TLS client
   already uses; a module being a build of its own, `sha2` is asked for its
   software backend here as well as in the kernel crate.
 - `src/crates/modules/net/sshd` -- the kernel's side: the `sshd` command, the files,
+  the ssh crate's `Primitives` -- the crypto crate's, CRYPTOGAMS' assembly in
+  the kernel's SIMD sections, its integer code where none can be had --
   a listener task, a task for each connection, and one for each command a
   connection runs, with 16 KiB of its output and 4 KiB of typing between the
   two (`run_beside`); with no memory for those, the command runs on the

@@ -2879,6 +2879,15 @@ Ethernet | IPv4, DF | UDP 39241 -> 39241 | kind 1, network 3, key 4, counter 8 |
   ChaCha20-Poly1305 -- carrying a packet from a port the table has on that
   very host. Anything else is counted (`hv tunnel`) and, with `trace on
   tunnel`, a `tunnel_drop` saying why.
+- **The cipher** is the crypto crate's ChaCha20-Poly1305, CRYPTOGAMS'
+  assembly in the kernel's SIMD sections ([tls.md](tls.md#the-assembly)),
+  which hv.ko hands vnetwire (`aead.rs`, its `Aead`): a datagram sealed on
+  the guest's CPU and opened in the receive soft IRQ each in a section of
+  its own -- in the integer code where one is open there already. A
+  section marks its CPU's registers nobody's, so the guest whose packet was
+  sealed between two of its entries has its own put back at the next, an
+  XRSTOR it would not have had ([What the extension costs while it is
+  on](#what-the-extension-costs-while-it-is-on), its x87, SSE and AVX state).
 - **Keys** go between the hosts' hv over ipc (`hv.tunnel`, a name the
   cluster reaches): each host gives every other the key to seal to it with,
   made anew for every message, its number random, installed to open by
@@ -2922,7 +2931,10 @@ every port reaching its network's others once the wire is kind -- its
 `vnetwire` target, and thirty-three mutants of the tunnel's and the
 datagram's rules among `hv-fuzz.py --mutants`; and `tests/vnet-test.py
 --phase v3`, three nos with probes on each, keys changed under traffic, a
-narrow link, a host killed, hv reloaded, a port moved.
+narrow link, a host killed, hv reloaded, a port moved. The fuzzer seals
+with RustCrypto's ChaCha20-Poly1305 in hv.ko's place, its `vnetwire` target
+holding every datagram to the wire built without vnetwire; net-fuzz's
+`aead` target holds the crypto crate to the same RustCrypto code.
 
 #### A public address across hosts
 

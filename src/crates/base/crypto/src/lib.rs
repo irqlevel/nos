@@ -4,7 +4,10 @@
 //! SSSE3 and AVX2 code and arm64's Advanced SIMD code in the kernel's SIMD
 //! sections, and each architecture's integer code where no section can be
 //! had -- the same bytes either way (`asm`). What TLS's ChaCha20-Poly1305
-//! suites run on in the kernel (the tls crate).
+//! suites run on in the kernel (the tls crate), and vnet's tunnel between
+//! hosts (hv.ko); and its two halves on their own, [`chacha20`] from any
+//! counter block and [`poly1305`], for what puts them together otherwise --
+//! OpenSSH's chacha20-poly1305, which sshd speaks.
 //!
 //! A message is worked through in pieces of [`PIECE`] bytes, a section a
 //! piece, so that preemption is never off for longer than one piece takes:
@@ -15,7 +18,7 @@ mod selftest;
 
 pub use selftest::selftest;
 
-use asm::{chacha20, Counter, Key, Poly1305, Unit};
+use asm::{Counter, Key, Poly1305, Unit};
 use kcore::simd::Section;
 use zeroize::Zeroize;
 
@@ -95,15 +98,63 @@ impl Paths {
     }
 }
 
+/// A key as the assembly reads it: eight little-endian words.
+fn key_words(key: &[u8; KEY_LEN]) -> Key {
+    let mut words = [0u32; 8];
+    for (i, word) in words.iter_mut().enumerate() {
+        *word = u32::from_le_bytes([key[4 * i], key[4 * i + 1], key[4 * i + 2], key[4 * i + 3]]);
+    }
+    let key = Key(words);
+    words.zeroize();
+    key
+}
+
+/// `data` XORed in place with ChaCha20's key stream under `key`, from the
+/// counter block `counter` on: the state's last four words -- RFC 8439's 32-bit
+/// block counter and the nonce's three words, or the original layout's
+/// 64-bit counter and 64-bit nonce, two words each, which OpenSSH's
+/// chacha20-poly1305 keeps. The first word counts the blocks; it is not to
+/// run past 2^32 within `data` -- a panic before a byte is touched where it
+/// would, since the key stream would repeat. Worked through a section a
+/// [`PIECE`].
+pub fn chacha20(key: &[u8; KEY_LEN], counter: &[u32; 4], data: &mut [u8]) {
+    chacha20_with(Paths::Best, key, counter, data)
+}
+
+fn chacha20_with(paths: Paths, key: &[u8; KEY_LEN], counter: &[u32; 4], data: &mut [u8]) {
+    let blocks = (data.len() as u64).div_ceil(64);
+    assert!(u64::from(counter[0]) + blocks <= 1u64 << 32, "chacha20: a block counter past 2^32");
+    let key = key_words(key);
+    let mut done = 0;
+    while done < data.len() {
+        let end = data.len().min(done + PIECE);
+        let at = Counter([counter[0] + (done / 64) as u32, counter[1], counter[2], counter[3]]);
+        let piece = &mut data[done..end];
+        paths.run(|unit| asm::chacha20(unit, piece, &key, &at));
+        done = end;
+    }
+}
+
+/// Poly1305 of `data` under the one-time key `key`, RFC 8439 2.5's: its
+/// whole blocks each with its 2^128 bit, its last bytes padded with a 1 and
+/// zeros. Worked through a section a [`PIECE`].
+pub fn poly1305(key: &[u8; KEY_LEN], data: &[u8]) -> [u8; TAG_LEN] {
+    poly1305_with(Paths::Best, key, data)
+}
+
+fn poly1305_with(paths: Paths, key: &[u8; KEY_LEN], data: &[u8]) -> [u8; TAG_LEN] {
+    let mut mac = Poly1305::new(key);
+    let whole = data.len() & !15;
+    for piece in data[..whole].chunks(PIECE) {
+        paths.run(|unit| mac.blocks(unit, piece));
+    }
+    mac.last(&data[whole..]);
+    mac.finish()
+}
+
 impl ChaCha20Poly1305 {
     pub fn new(key: &[u8; KEY_LEN]) -> Self {
-        let mut words = [0u32; 8];
-        for (i, word) in words.iter_mut().enumerate() {
-            *word = u32::from_le_bytes([key[4 * i], key[4 * i + 1], key[4 * i + 2], key[4 * i + 3]]);
-        }
-        let key = Key(words);
-        words.zeroize();
-        Self { key }
+        Self { key: key_words(key) }
     }
 
     /// `data` encrypted in place under `nonce`, and the tag over `aad` and
@@ -133,7 +184,7 @@ impl ChaCha20Poly1305 {
             let piece = &mut data[done..end];
             let counter = data_counter(nonce, done);
             paths.run(|unit| {
-                chacha20(unit, piece, &self.key, &counter);
+                asm::chacha20(unit, piece, &self.key, &counter);
                 mac.padded(unit, piece);
             });
             done = end;
@@ -167,7 +218,7 @@ impl ChaCha20Poly1305 {
             let end = data.len().min(done + PIECE);
             let counter = data_counter(nonce, done);
             let piece = &mut data[done..end];
-            paths.run(|unit| chacha20(unit, piece, &self.key, &counter));
+            paths.run(|unit| asm::chacha20(unit, piece, &self.key, &counter));
             done = end;
         }
         Ok(())
@@ -178,7 +229,7 @@ impl ChaCha20Poly1305 {
     fn start(&self, paths: Paths, nonce: &[u8; NONCE_LEN], aad: &[u8]) -> Poly1305 {
         paths.run(|unit| {
             let mut block = [0u8; 64];
-            chacha20(unit, &mut block, &self.key, &counter(nonce, 0));
+            asm::chacha20(unit, &mut block, &self.key, &counter(nonce, 0));
             let mut one_time = [0u8; 32];
             one_time.copy_from_slice(&block[..32]);
             block.zeroize();
