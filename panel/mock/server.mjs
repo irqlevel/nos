@@ -746,6 +746,8 @@ const reads = {
     const f = vnetFirewall(p);
     return { name: f.name, in: f.in, out: f.out, revision: f.revision, rules: f.rules.map((rule, i) => ({ n: i + 1, rule })) };
   },
+  'vnet.rules': () => ({ rules: vnet.firewalls.flatMap((f) => f.rules.map((rule, i) => ({
+    id: f.name + '/' + (i + 1), firewall: f.name, n: i + 1, rule }))) }),
   'vnet.alerts': () => ({ alerts: [] }),
   'nbs.volume': (p) => {
     nbsMember();
@@ -814,6 +816,24 @@ const actions = {
     const f = vnetFirewall(p);
     vnetSetRules(f, f.rules, policyOf(p, 'in') || f.in, policyOf(p, 'out') || f.out);
     return { done: 'in ' + f.in + ', out ' + f.out };
+  },
+  'vnet.firewall_remove': (p) => {
+    const f = vnetFirewall(p);
+    const n = ruleNumber(p, 'n', f.rules.length);
+    const rules = [...f.rules];
+    const [rule] = rules.splice(n - 1, 1);
+    vnetSetRules(f, rules);
+    return { done: 'rule ' + n + ' taken out: ' + rule };
+  },
+  'vnet.firewall_move': (p) => {
+    const f = vnetFirewall(p);
+    const n = ruleNumber(p, 'n', f.rules.length);
+    const to = ruleNumber(p, 'to', f.rules.length);
+    const rules = [...f.rules];
+    const [rule] = rules.splice(n - 1, 1);
+    rules.splice(to - 1, 0, rule);
+    vnetSetRules(f, rules);
+    return { done: 'rule ' + n + ' is rule ' + to + ' now' };
   },
   'fw.create': (p) => {
     const name = need(p, 'name');

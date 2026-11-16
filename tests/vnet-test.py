@@ -613,6 +613,10 @@ def phase_v1b(args, tmp):
         out = a.run("vnet fw delete edge")
         pt.check("edge's deletion refused while port 1 has it", "ports have the firewall" in out, out)
         pt.check("edge's rule as c says it", ipct.wait_for(lambda: "1  allow in tcp 22" in c.run("vnet fw edge"), 20, 1))
+        js = json_of(c.run("mgmt call vnet rules"))
+        pt.check("the provider's rules: a row a rule, its firewall and number its id -- the panel's table",
+                 js is not None and {"id": "edge/1", "firewall": "edge", "n": 1, "rule": "allow in tcp 22"}
+                 in js.get("rules", []), js)
 
         # -- all three killed and booted again at once --
         for i in range(n):
