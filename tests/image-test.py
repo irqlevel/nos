@@ -152,6 +152,7 @@ same_as_image() {
 mount_at "$IMAGE" img loop,ro
 cp img/VERSION img-version.out
 cat img/lib/panel/bundle > img-bundle.out 2>/dev/null || echo none > img-bundle.out
+cat img/lib/licenses/CRYPTOGAMS > img-license.out 2>/dev/null || echo none > img-license.out
 """
 
 PREPARE = r"""
@@ -518,8 +519,13 @@ def run(tmp, image):
     check("so does update", "update: every file of the image" in out,
           [line for line in out.splitlines() if line.startswith("update: ")])
     layout = linux.read("layout2.out").split()
-    check("update keeps the old kernel, modules, hvboot and VERSION for a rollback",
-          all(p in layout for p in ("kernel64.elf.prev", "modules.prev", "hvboot.prev", "VERSION.prev")), layout)
+    check("update keeps the old kernel, modules, hvboot, licenses and VERSION for a rollback",
+          all(p in layout for p in ("kernel64.elf.prev", "modules.prev", "hvboot.prev", "licenses.prev",
+                                    "VERSION.prev")), layout)
+    notice = linux.read("img-license.out")
+    check("the image carries the notice of the CRYPTOGAMS assembly its kernel and modules run, as its "
+          "license asks of a binary", "CRYPTOGAMS by <appro@openssl.org>" in notice and
+          "Redistributions in binary form" in notice, notice[:200])
     env2 = linux.read("grubenv2.out")
     check("update takes the UDP shell it was given, and arms a boot",
           "nos_cmdline=udpshell=9000" in env2 and "nos_next=nos" in env2, env2)

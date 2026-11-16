@@ -158,6 +158,14 @@ name = "crc"
 version = "0.1.0"
 
 [[package]]
+name = "crypto"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "zeroize",
+]
+
+[[package]]
 name = "crypto-bigint"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -454,6 +462,7 @@ name = "hv"
 version = "0.1.0"
 dependencies = [
  "bzimage",
+ "crypto",
  "hvarch",
  "kcore",
  "netwire",
@@ -528,6 +537,7 @@ version = "0.1.0"
 dependencies = [
  "block",
  "crc",
+ "crypto",
  "events",
  "ffi",
  "fs",
@@ -786,6 +796,8 @@ dependencies = [
 name = "mod-tlsbench"
 version = "0.1.0"
 dependencies = [
+ "chacha20poly1305",
+ "crypto",
  "kcore",
  "kmod",
  "tls",
@@ -1438,6 +1450,7 @@ dependencies = [
 name = "tls"
 version = "0.1.0"
 dependencies = [
+ "crypto",
  "ffi",
  "getrandom",
  "kcore",

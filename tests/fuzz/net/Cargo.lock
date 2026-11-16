@@ -145,6 +145,14 @@ name = "crc"
 version = "0.1.0"
 
 [[package]]
+name = "crypto"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "zeroize",
+]
+
+[[package]]
 name = "crypto-bigint"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -500,7 +508,9 @@ name = "net-fuzz"
 version = "0.1.0"
 dependencies = [
  "chacha20",
+ "chacha20poly1305",
  "conf",
+ "crypto",
  "ed25519-dalek",
  "ffi",
  "fs",
@@ -1016,6 +1026,7 @@ dependencies = [
 name = "tls"
 version = "0.1.0"
 dependencies = [
+ "crypto",
  "ffi",
  "getrandom",
  "kcore",

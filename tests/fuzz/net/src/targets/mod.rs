@@ -2,6 +2,7 @@
 //! machine and what the machine's programs ask of it, and holds what comes
 //! of it to what the protocol -- and this stack, of itself -- says.
 
+mod aead;
 mod api;
 mod dhcp;
 mod dns;
@@ -35,6 +36,7 @@ pub static ALL: &[Target] = &[
     Target { name: "terminal", run: terminal::terminal, max_len: 4096, gate: 20000 },
     Target { name: "api", run: api::api, max_len: 1024, gate: 500 },
     Target { name: "ipcnet", run: ipcnet::ipcnet, max_len: 1024, gate: 2000 },
+    Target { name: "aead", run: aead::aead, max_len: 512, gate: 3000 },
 ];
 
 /// Everything the machine still holds of what an input did, once it has

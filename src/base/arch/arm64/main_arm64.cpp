@@ -28,6 +28,7 @@
 #include <kernel/preempt.h>
 #include <kernel/cmd.h>
 #include <kernel/softirq.h>
+#include <kernel/simd.h>
 #include <kernel/stack_probe.h>
 #include <hal/power.h>
 
@@ -510,6 +511,9 @@ extern "C" void ap_main_arm64(ulong index)
     using namespace kernel;
 
     setup_vectors();
+    /* Its vector unit for SIMD sections, as the BSP's, before it runs a
+       task that could open one */
+    simd::setup_cpu(false);
 
     if (!Gic::get_instance().cpu_init())
         PANIC("Can't init gic on cpu %lu", index);
@@ -701,6 +705,11 @@ extern "C" void main_arm64(void* dtb)
         wx_probe_heap();
 
     time_init();
+
+    /* The vector unit for SIMD sections, before anything can open one: the
+       self-tests' and rust_init's crypto. The APs do the same
+       (ap_main_arm64). */
+    simd::setup_cpu(true);
 
     /* Before anything can ask the pool for bytes: seeding needs no heap and
        no device, only the probe of the cpu's instruction first. The

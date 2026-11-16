@@ -9,6 +9,8 @@
 
 extern crate alloc;
 
+mod aead;
+
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -35,17 +37,23 @@ fn kernel_getrandom(buf: &mut [u8]) -> Result<(), getrandom::Error> {
 
 getrandom::register_custom_getrandom!(kernel_getrandom);
 
-/// The kernel's crypto provider, rustls-rustcrypto's, with its cipher suites
-/// in the order this kernel wants them: ChaCha20-Poly1305's first -- TLS
-/// 1.3's and both of 1.2's -- the rest as the provider has them. The kernel
-/// has no SSE, so AES and GHASH run on their portable backends, where
-/// ChaCha20-Poly1305 is more than twice as fast as AES-GCM (`tlsbench`, the
-/// AX41's Zen 2: 203 MB/s against 92; an M-series core: 440 against
-/// 160-195) -- what a peer that follows its client's order agrees on with
-/// this kernel's client, and what this kernel's server holds its clients to
-/// (`pinned`). Every configuration the crate makes starts from it.
+/// The kernel's crypto provider: rustls-rustcrypto's, its ChaCha20-Poly1305
+/// suites -- TLS 1.3's and both of 1.2's -- on the crypto crate's AEAD,
+/// CRYPTOGAMS' assembly in the kernel's SIMD sections ([`aead`]), and
+/// first, the rest as the provider has them. AES and GHASH stay on their
+/// portable backends, where ChaCha20-Poly1305 was twice as fast as AES-GCM
+/// even on RustCrypto's portable code (`tlsbench`, the AX41's Zen 2: 203
+/// MB/s against 92; an M-series core: 440 against 160-195) -- what a peer
+/// that follows its client's order agrees on with this kernel's client, and
+/// what this kernel's server holds its clients to (`pinned`). Every
+/// configuration the crate makes starts from it.
 pub fn provider() -> CryptoProvider {
     let mut provider = rustls_rustcrypto::provider();
+    for suite in provider.cipher_suites.iter_mut() {
+        if let Some(ours) = aead::suite_for(suite.suite()) {
+            *suite = ours;
+        }
+    }
     /* A stable sort: the order within each kind is the provider's */
     provider.cipher_suites.sort_by_key(|s| !is_chacha20_poly1305(s.suite()));
     provider
