@@ -1,7 +1,8 @@
 //! vnet's tunnel in hv (plans/vnet.md, "The tunnel"): a cluster network's
 //! packet from a port here to a port of the same network on another host,
 //! sealed into a UDP datagram on the underlay (`vnetwire`), and opened on
-//! the other side into that port's inbox.
+//! the other side into that port's inbox -- by the AEAD the tunnel is made
+//! with: in hv.ko the kernel's crypto crate's (`aead.rs`).
 //!
 //! - **What it knows** comes from vnet's table, by the keeper
 //!   (`vnet::Keeper`): this host's node, every other host's underlay
@@ -264,6 +265,8 @@ pub struct Tunnel {
     /// The device the tunnel goes out of, and is listened on.
     nic: IrqSpinLock<Option<Nic>>,
     switch: Arc<Switch>,
+    /// What a datagram is sealed and opened by: ChaCha20-Poly1305.
+    aead: &'static dyn vnetwire::Aead,
     counts: Counts,
     rekey_ns: u64,
     keylife_ns: u64,
@@ -317,9 +320,15 @@ pub enum Sent {
 }
 
 impl Tunnel {
-    /// The tunnel of `switch`, with no host yet: keys given anew every
-    /// `rekey_s` seconds, the one before kept for `keylife_s`.
-    pub fn new(switch: Arc<Switch>, rekey_s: u64, keylife_s: u64) -> Option<Arc<Tunnel>> {
+    /// The tunnel of `switch`, with no host yet, sealing and opening by
+    /// `aead`: keys given anew every `rekey_s` seconds, the one before kept
+    /// for `keylife_s`.
+    pub fn new(
+        switch: Arc<Switch>,
+        aead: &'static dyn vnetwire::Aead,
+        rekey_s: u64,
+        keylife_s: u64,
+    ) -> Option<Arc<Tunnel>> {
         let mut peers = Vec::new();
         peers.try_reserve_exact(HOSTS).ok()?;
         let mut packets = Vec::new();
@@ -329,7 +338,7 @@ impl Tunnel {
         Some(Arc::new(Tunnel {
             instance, peers: IrqSpinLock::new(peers), remote: IrqSpinLock::new(Vec::new()),
             node: AtomicU64::new(0), me: AtomicU32::new(0), port: AtomicU16::new(PORT), nic: IrqSpinLock::new(None),
-            switch,
+            switch, aead,
             counts: Counts::default(), rekey_ns: rekey_s.saturating_mul(NS_PER_SEC),
             keylife_ns: keylife_s.saturating_mul(NS_PER_SEC), mailbox: Mutex::new(None)?, listener: Mutex::new(None)?,
             wake: IrqSpinLock::new(None),
@@ -484,7 +493,7 @@ impl Tunnel {
             return false;
         }
         let header = Header { kind, network: vni, key: number, counter };
-        if vnetwire::seal(&key, &header, packet, &mut buf[at..len]).is_err() {
+        if vnetwire::seal(self.aead, &key, &header, packet, &mut buf[at..len]).is_err() {
             self.counts.no_room.fetch_add(1, Ordering::Relaxed);
             return false;
         }
@@ -561,7 +570,7 @@ impl Tunnel {
         let mut kept = frame.retain();
         let data = kept.data_mut();
         let Some(datagram) = data.get_mut(payload_at..payload_at + len) else { return };
-        let Ok((header, packet)) = vnetwire::open(&key, datagram) else {
+        let Ok((header, packet)) = vnetwire::open(self.aead, &key, datagram) else {
             self.counts.forged.fetch_add(1, Ordering::Relaxed);
             dropped(addr, port, Some(&header), TunnelWhy::Forged);
             return;

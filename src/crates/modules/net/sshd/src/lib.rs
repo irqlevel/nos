@@ -10,7 +10,8 @@
 //!
 //! The protocol is the ssh crate's (src/crates/common/net/ssh); this is the kernel's side
 //! of it: the port listened on, a task for each connection, the shell behind
-//! a login, and the two files a server keeps -- its host key,
+//! a login, the cipher's ChaCha20 and Poly1305 -- the crypto crate's
+//! assembly -- and the two files a server keeps -- its host key,
 //! /etc/ssh/ssh_host_ed25519_key, made on the first start, and the keys
 //! allowed to log in, /etc/ssh/authorized_keys. docs/sshd.md has the rest.
 
@@ -33,7 +34,7 @@ use kcore::sync::{Event, Mutex};
 use kcore::task::TaskHandle;
 use kcore::tcp::{TcpListener, TcpStream, RECV_TIMEOUT};
 use kcore::time::{boot_time_ns, Duration};
-use ssh::{AuthorizedKey, Config, HostKey, PublicKey};
+use ssh::{AuthorizedKey, Config, HostKey, Primitives, PublicKey};
 
 const HELP: &str = "sshd [start [port] [nic=] | stop | allow <key> | deny <fp> | keys [reload]] - SSH server";
 const _: () = assert!(HELP.len() <= kcore::cmd::HELP_MAX, "`help` would cut it short");
@@ -90,7 +91,23 @@ static CONFIG: Config<'static> = Config {
     max_auth_tries: 6,
     keepalive_ms: 60_000,
     keepalive_max: 3,
+    primitives: &Cryptogams,
 };
+
+/// The ssh crate's ChaCha20 and Poly1305: the crypto crate's, CRYPTOGAMS'
+/// assembly in the kernel's SIMD sections -- its integer code where a
+/// section cannot be had.
+struct Cryptogams;
+
+impl Primitives for Cryptogams {
+    fn chacha20(&self, key: &[u8; 32], counter: &[u32; 4], data: &mut [u8]) {
+        crypto::chacha20(key, counter, data);
+    }
+
+    fn poly1305(&self, key: &[u8; 32], data: &[u8]) -> [u8; 16] {
+        crypto::poly1305(key, data)
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* The module and its command                                          */

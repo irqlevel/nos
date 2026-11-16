@@ -35,6 +35,9 @@ codec = { path = "../../../common/codec" }
 # sealed and opened, the window of counters a key has seen, the messages keys
 # go in -- no kernel in it, so tests/fuzz/hv holds it to a model.
 vnetwire = { path = "../../../common/net/vnetwire" }
+# The tunnel's ChaCha20-Poly1305 (`aead.rs`): CRYPTOGAMS' assembly in the
+# kernel's SIMD sections, what vnetwire seals and opens by in hv.ko.
+crypto = { path = "../../../base/crypto" }
 # A guest's disk that is a volume of NBS's (`nbs:<volume>`): NBS's client,
 # driven over ipc.
 nbsdrive = { path = "../../storage/nbsdrive" }

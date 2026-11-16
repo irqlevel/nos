@@ -674,7 +674,6 @@ dependencies = [
  "cpufeatures",
  "opaque-debug",
  "universal-hash",
- "zeroize",
 ]
 
 [[package]]
@@ -985,9 +984,7 @@ dependencies = [
 name = "ssh"
 version = "0.1.0"
 dependencies = [
- "chacha20",
  "ed25519-dalek",
- "poly1305",
  "sha2",
  "subtle",
  "x25519-dalek",
