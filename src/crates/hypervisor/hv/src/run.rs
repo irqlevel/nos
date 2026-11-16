@@ -1295,6 +1295,12 @@ impl LinuxGuest {
     /// for each of its CPUs, up to `net::MAX_PAIRS`, where it has MSI-X to
     /// give each queue an interrupt of its own.
     pub fn add_nic(&mut self, backend: Box<dyn net::Backend>, mac: [u8; 6]) -> Result<()> {
+        self.add_nic_with(backend, mac, 0)
+    }
+
+    /// `add_nic`, the NIC telling its driver the MTU `mtu` -- a cluster
+    /// network's (`net::Net::set_mtu`) -- or none, 0.
+    pub fn add_nic_with(&mut self, backend: Box<dyn net::Backend>, mac: [u8; 6], mtu: u16) -> Result<()> {
         if self.loaded {
             return Err(Error::BadAddress);
         }
@@ -1308,6 +1314,7 @@ impl LinuxGuest {
         let mut nic = Net::new(backend, mac, pairs)?;
         nic.set_rx_moderation(self.rx_moderation_ns);
         nic.set_offloads(self.offloads);
+        nic.set_mtu(mtu);
         let io_base = NIC_IO_BASE + (p.nics as u16) * (net::BAR_SIZE as u16);
         let mut f = Function::device(&Net::identity(), io_base, net::BAR_SIZE, NIC_IRQ);
         if let Some(page) = page {

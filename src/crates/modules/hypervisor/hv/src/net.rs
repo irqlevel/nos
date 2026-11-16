@@ -84,28 +84,51 @@
 //! at once as `FLOOD_BURST`, and `FLOOD_PER_SEC` after. What either keeps
 //! out is dropped, counted against the port.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use firewall::{self as fw, Dir, Flows, Rules, Why, RULES_MAX};
 use hv::offload::{self, Partial, Rx, Takes, Tcp4};
 
 use kcore::consts::NS_PER_SEC;
-use kcore::net::{Nat, NatError};
+use kcore::net::{Inside, Nat, NatError, OneToOne};
 use kcore::sync::{IrqSpinLock, Mutex};
+use kcore::trace::{self, FwDeny, FwDir, FwWhy};
 use kcore::vnic::{Attached, Vnic, VnicSink, BACKLOG};
 
 use netwire::{icmpv6, ipv6};
 
 use crate::dhcp;
-use crate::vms::Shared;
 
 /// The most ports: a VM each.
 pub const MAX_PORTS: usize = 16;
 /// A port alone on the switch: its group (`Port::group`) is this and its
 /// number, apart from every network's, which are 1 to `MAX_PORTS`.
 const ALONE: u32 = 1 << 31;
+/// A port on a network of the cluster's (`claim_vnet`): its group is this
+/// and the network's number, its VNI -- 24 bits, never 0 -- apart from a
+/// host's networks' and a port alone's.
+const VNET: u32 = 1 << 30;
+const VNI_MASK: u32 = (1 << 24) - 1;
+/// A cluster network's port's MAC: these two bytes and its address -- the
+/// same on whichever host its VM runs, and no host network's port's, whose
+/// addresses (`SUBNET`) no cluster network has.
+const VNET_MAC_PREFIX: [u8; 2] = [0x02, 0x00];
+/// A cluster network's MTU, at least and at most: what vnet makes one with.
+pub const VNET_MTU_MIN: u16 = 576;
+pub const VNET_MTU_MAX: u16 = 1440;
+/// What the switch answers `hv0` with and cannot hand in where it makes the
+/// answer (`ToHost`): ARP replies, for as many ports as there are, twice.
+const TO_HOST: usize = 2 * MAX_PORTS;
+const ARP_FRAME: usize = netwire::ETH_HDR_LEN + netwire::ARP_LEN;
+/// What a port's VM is told of a packet past its network's MTU -- ICMP's
+/// "fragmentation needed" -- as many at once as this, and so many a second
+/// after.
+pub const TOO_BIG_BURST: u64 = 16;
+pub const TOO_BIG_PER_SEC: u64 = 16;
 /// Frames an inbox holds: the guest's receive ring's worth (a virtio NIC's
 /// queue has 256 entries). At 64, a guest fetching over several connections
 /// at once lost frames on every burst, kicked or not.
@@ -124,10 +147,26 @@ const ALL_SENDS: u8 = ((1u16 << WHOLE_SENDS) - 1) as u8;
 /// ARP and DHCP's few, with room to spare.
 pub const FLOOD_BURST: u64 = 64;
 pub const FLOOD_PER_SEC: u64 = 256;
+/// The flows a port keeps for its VM's firewall (`firewall::Flows`): room
+/// taken when the port is first claimed, as its inbox's is, and kept for the
+/// next VM on it.
+pub const FLOWS: usize = 2048;
+/// The most firewalls the switch holds at once, a place each
+/// (`Switch::install`).
+pub const FIREWALLS_MAX: usize = 64;
+/// What a VM is told of what its firewall keeps it from sending -- an ICMP
+/// error, so that its connect fails at once rather than waiting out its
+/// retries: as many at once as this, and so many a second after.
+pub const REFUSALS_BURST: u64 = 16;
+pub const REFUSALS_PER_SEC: u64 = 16;
+
+/// What a VM on a host's network takes of a packet at most: what a public
+/// address mapped to one lets in (`map_public`).
+const PUBLIC_MTU: u16 = 1500;
 
 /// The host's end: its name, MAC and address, and the subnet's mask.
 const HOST_IF: &str = "hv0";
-const HOST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0x64, 0x01];
+pub const HOST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0x64, 0x01];
 const SUBNET: u32 = 0x0A00_6400;
 pub const HOST_IP: u32 = SUBNET | 1;
 const MASK: u32 = 0xFFFF_FF00;
@@ -184,6 +223,117 @@ fn port_of(mac: &[u8]) -> Option<usize> {
     usize::from(mac[5]).checked_sub(PORT_BASE).filter(|p| *p < MAX_PORTS)
 }
 
+/// The port whose address `addr` is, if it is a port's.
+pub fn port_at(addr: u32) -> Option<usize> {
+    if addr & MASK != SUBNET {
+        return None;
+    }
+    usize::from((addr & !MASK) as u8).checked_sub(PORT_BASE).filter(|p| *p < MAX_PORTS)
+}
+
+/// Whether `addr` is a group's: everyone's, the subnet's everyone, a
+/// multicast group.
+fn to_group(addr: u32) -> bool {
+    const MULTICAST: u32 = 0xE;
+    addr == u32::MAX || addr == SUBNET | !MASK || addr >> 28 == MULTICAST
+}
+
+/// A cluster network's port's MAC: its address behind `VNET_MAC_PREFIX`.
+pub fn vnet_mac(ip: u32) -> [u8; 6] {
+    let mut m = [0u8; 6];
+    m[..2].copy_from_slice(&VNET_MAC_PREFIX);
+    m[2..].copy_from_slice(&ip.to_be_bytes());
+    m
+}
+
+/// The address a cluster network's port's MAC says, if it is one.
+fn vnet_ip(mac: &[u8]) -> Option<u32> {
+    (mac.len() >= 6 && mac[..2] == VNET_MAC_PREFIX).then(|| netwire::be32(mac, 2))
+}
+
+/// Whether group `group` (`Port::group`) is a cluster network's.
+fn is_vnet(group: u32) -> bool {
+    group & (VNET | ALONE) == VNET
+}
+
+/// The mask of a prefix of `prefix` bits, 1 to 32.
+fn prefix_mask(prefix: u8) -> u32 {
+    u32::MAX.checked_shl(32 - u32::from(prefix.clamp(1, 32))).unwrap_or(0)
+}
+
+/// Whether `addr` is a private one (RFC 1918), as every address of a
+/// cluster network's is.
+fn private(addr: u32) -> bool {
+    addr >> 24 == 10 || addr >> 20 == 0xAC1 || addr >> 16 == 0xC0A8
+}
+
+/// Who a VM is on a network of the cluster's (`Switch::claim_vnet`): its
+/// address; the network's number (VNI), subnet and MTU; and whether the
+/// network goes out to the world -- masqueraded by NAT, from this host.
+/// What vnet's state says of its port, and of the network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Identity {
+    pub ip: u32,
+    pub vni: u32,
+    pub net: u32,
+    pub prefix: u8,
+    pub mtu: u16,
+    pub out: bool,
+}
+
+impl Identity {
+    pub fn mask(&self) -> u32 {
+        prefix_mask(self.prefix)
+    }
+
+    /// The network's gateway, the same on every host: its first address.
+    pub fn gateway(&self) -> u32 {
+        self.net.wrapping_add(1)
+    }
+
+    /// Why the switch will not have it, if it will not: what vnet's state
+    /// holds to already, held to here again -- an address no port of a host
+    /// network's may have, and no other port of its network's is given.
+    fn check(&self) -> Result<(), &'static str> {
+        let mask = self.mask();
+        if self.vni == 0 || self.vni > VNI_MASK {
+            return Err("a cluster network's number is 1 to 16777215");
+        }
+        if !(16..=28).contains(&self.prefix) || self.net & !mask != 0 {
+            return Err("a cluster network is a subnet of /16 to /28");
+        }
+        if !private(self.net) || !private(self.net | !mask) {
+            return Err("a cluster network's addresses are private ones");
+        }
+        /* The host networks' subnet -- their ports' addresses, and hv0's --
+         * met by the shorter of the two prefixes */
+        let wider = MASK & mask;
+        if SUBNET & wider == self.net & wider {
+            return Err("a cluster network is apart from the host's networks, 10.0.100.0/24");
+        }
+        if self.ip & mask != self.net || self.ip == self.net || self.ip == self.gateway()
+            || self.ip == self.net | !mask
+        {
+            return Err("the port's address is no host's of its network");
+        }
+        if !(VNET_MTU_MIN..=VNET_MTU_MAX).contains(&self.mtu) {
+            return Err("a cluster network's MTU is 576 to 1440");
+        }
+        Ok(())
+    }
+}
+
+/// A seed for a port's table of flows (`firewall::Flows::new`), from the
+/// kernel's pool -- the clock's, should the pool have nothing yet: what the
+/// far end of a flow does not know, so cannot make collide.
+fn flow_seed() -> u64 {
+    let mut b = [0u8; 8];
+    if !kcore::random::fill_random(&mut b) {
+        return kcore::time::boot_time_ns().wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    u64::from_le_bytes(b)
+}
+
 /// An address, dotted, for a command line.
 pub fn dotted(ip: u32) -> String {
     alloc::format!("{}.{}.{}.{}", ip >> 24, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF)
@@ -198,7 +348,13 @@ pub fn dotted(ip: u32) -> String {
 /// one to give: `dns0`, which the kernel shows in /proc/net/pnp and an
 /// initramfs (Alpine's) writes to resolv.conf.
 pub fn ip_param(port: usize, dns: Option<u32>) -> String {
-    let ip = alloc::format!("ip={}::{}:{}:::off", dotted(port_ip(port)), dotted(HOST_IP), dotted(MASK));
+    ip_param_at(port_ip(port), HOST_IP, MASK, dns)
+}
+
+/// `ip_param`'s, for a guest at `ip` behind `gateway` on a subnet of
+/// `mask`: a cluster network's port's (`Identity`).
+pub fn ip_param_at(ip: u32, gateway: u32, mask: u32, dns: Option<u32>) -> String {
+    let ip = alloc::format!("ip={}::{}:{}:::off", dotted(ip), dotted(gateway), dotted(mask));
     match dns {
         Some(dns) => alloc::format!("{}:{}", ip, dotted(dns)),
         None => ip,
@@ -288,10 +444,66 @@ impl Bindings {
     }
 }
 
+/// What carries a cluster network's packet to a port on another host: the
+/// tunnel (`crate::tunnel`), which the switch is given (`Switch::carrier`).
+pub trait Carrier: Send + Sync {
+    /// Whether `addr`, of network `vni`, is a port on another host.
+    fn elsewhere(&self, vni: u32, addr: u32) -> bool;
+    /// The IPv4 `packet` of network `vni` carried to the port at `to` on its
+    /// host: whether it went. A guest's CPU's context: nothing may wait.
+    fn carry(&self, vni: u32, to: u32, packet: &[u8]) -> bool;
+    /// The IPv4 `packet` a port here of network `vni` sent the world,
+    /// carried to host `node` -- its public address's -- to go out there.
+    /// A guest's CPU's context.
+    fn carry_out(&self, node: u64, vni: u32, packet: &[u8]) -> bool;
+    /// The world's IPv4 `packet` for the port of network `vni` on host
+    /// `node`, whose public address this host serves: queued for the
+    /// tunnel's task to carry. `hv0`'s sink's context: nothing may wait or
+    /// take the heap.
+    fn carry_in(&self, node: u64, vni: u32, packet: &[u8]) -> bool;
+}
+
+/// Whether two routes are the one mapping in NAT: the public address, to the
+/// same address of the same network, at the same MTU -- wherever its port is.
+fn same_mapping(a: &Route, b: &Route) -> bool {
+    a.public == b.public && a.vni == b.vni && a.inner == b.inner && a.mtu == b.mtu && a.out == b.out
+        && a.net == b.net && a.prefix == b.prefix
+}
+
+/// A public address routed to this host, on a port of a cluster network --
+/// here or on another host -- as vnet's table has it (`Switch::serve`): the
+/// address; the port's network, its subnet and MTU and whether it goes out;
+/// the port's address, and its host's node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Route {
+    pub public: u32,
+    pub vni: u32,
+    pub net: u32,
+    pub prefix: u8,
+    pub mtu: u16,
+    pub out: bool,
+    pub inner: u32,
+    pub node: u64,
+}
+
+/// What a port's frames wake as they are put in its inbox: the VM on it --
+/// its first CPU's halted task, or the CPU kicked out of its guest -- or a
+/// probe's task (`crate::probe`).
+pub trait Wake: Send + Sync {
+    /// Called under the inbox's spin lock, interrupts off, on any CPU: it
+    /// may not sleep, allocate, or take a lock that is not IRQ-safe.
+    fn wake_up(&self);
+}
+
 /// What waits for one guest's NIC.
 struct Inbox {
-    /// The VM on the port; None while it is free.
-    owner: Option<Arc<Shared>>,
+    /// The VM on the port, or a probe; None while it is free.
+    owner: Option<Arc<dyn Wake>>,
+    /// Which claim of the port this is, one more at each (`Switch::take`):
+    /// what a firewall judged for one owner -- by its flows, and its rules --
+    /// is held to it as it is delivered, and never put in the next one's
+    /// inbox (`deliver_rx`).
+    claim: u64,
     /// Room for `INBOX_FRAMES` while a VM owns the port -- taken when the
     /// port is first claimed, and kept for the next -- and none before.
     frames: Vec<[u8; FRAME]>,
@@ -338,33 +550,39 @@ impl Inbox {
     }
 }
 
-/// A port's sends to every port: how many it may make now, and from when
-/// the part of one being earned counts -- a token bucket of `FLOOD_BURST`,
-/// filled at `FLOOD_PER_SEC`.
-struct Flood {
+/// What a port may do of something held to a rate: how many it may do now,
+/// and from when the part of one being earned counts -- a token bucket of
+/// `BURST`, filled at `PER_SEC`.
+struct Bucket<const BURST: u64, const PER_SEC: u64> {
     tokens: u64,
     at: u64,
 }
 
-impl Flood {
-    const FULL: Flood = Flood { tokens: FLOOD_BURST, at: 0 };
+/// A port's sends to every port.
+type Flood = Bucket<FLOOD_BURST, FLOOD_PER_SEC>;
+/// What a port's VM is told its firewall kept from going out.
+type Refusals = Bucket<REFUSALS_BURST, REFUSALS_PER_SEC>;
+/// What a port's VM is told of packets past its cluster network's MTU.
+type TooBig = Bucket<TOO_BIG_BURST, TOO_BIG_PER_SEC>;
 
-    /// Whether one more may go at `now`: `FLOOD_BURST` at once, and
-    /// `FLOOD_PER_SEC` after. The whole tokens earned since `at` are added
-    /// and `at` moved on by the time they stand for, the part of the next
-    /// one kept: moved to `now` at each one, the part was thrown away, and a
-    /// sender just over the rate was held to half of it. A full bucket earns
-    /// nothing while it is full: `at` is then `now`.
+impl<const BURST: u64, const PER_SEC: u64> Bucket<BURST, PER_SEC> {
+    const FULL: Self = Bucket { tokens: BURST, at: 0 };
+
+    /// Whether one more may go at `now`: `BURST` at once, and `PER_SEC`
+    /// after. The whole tokens earned since `at` are added and `at` moved on
+    /// by the time they stand for, the part of the next one kept: moved to
+    /// `now` at each one, the part was thrown away, and a sender just over
+    /// the rate was held to half of it. A full bucket earns nothing while it
+    /// is full: `at` is then `now`.
     fn take(&mut self, now: u64) -> bool {
-        let earned = now.saturating_sub(self.at).saturating_mul(FLOOD_PER_SEC) / NS_PER_SEC;
-        if self.tokens.saturating_add(earned) >= FLOOD_BURST {
-            self.tokens = FLOOD_BURST;
+        let earned = now.saturating_sub(self.at).saturating_mul(PER_SEC) / NS_PER_SEC;
+        if self.tokens.saturating_add(earned) >= BURST {
+            self.tokens = BURST;
             self.at = now;
         } else if earned != 0 {
-            /* Under FLOOD_BURST tokens' time: no overflow, and never past
-             * `now` */
+            /* Under BURST tokens' time: no overflow, and never past `now` */
             self.tokens += earned;
-            self.at += earned * NS_PER_SEC / FLOOD_PER_SEC;
+            self.at += earned * NS_PER_SEC / PER_SEC;
         }
         if self.tokens == 0 {
             return false;
@@ -403,18 +621,83 @@ struct Port {
     takes_partial: AtomicBool,
     takes_whole: AtomicBool,
     /// Which guests it reaches, while a VM has it: a network's number -- the
-    /// ports on one share it -- or `ALONE` and its own; 0 while it is free.
-    /// Written under `inbox`'s lock with its `owner`, so that read there it
-    /// is the owner's (`deliver_rx`); read without, it was a moment ago.
+    /// ports on one share it -- or `ALONE` and its own, or `VNET` and a
+    /// cluster network's VNI; 0 while it is free. Written under `inbox`'s
+    /// lock with its `owner`, so that read there it is the owner's
+    /// (`deliver_rx`); read without, it was a moment ago.
     group: AtomicU32,
-    /// Frames its guest sent to another network's guest, dropped.
+    /// Who its VM is: its address -- on a host's network the port's own
+    /// (`port_ip`), on a cluster network the one vnet gave it -- and on a
+    /// cluster network the subnet, the MTU and whether the network goes out
+    /// to the world. Written under `inbox`'s lock before `group`, which is
+    /// stored after them with release: read after an acquiring load of
+    /// `group`, they are its owner's or a later one's -- which a delivery
+    /// holds to its owner under the lock (`deliver_rx`). A free port's
+    /// address is its own again.
+    ip: AtomicU32,
+    net: AtomicU32,
+    mask: AtomicU32,
+    mtu: AtomicU32,
+    out: AtomicBool,
+    /// Shut by hv (`Switch::shut`): its cluster network's port revoked --
+    /// moved to another host, or deleted, its generation gone by -- while
+    /// its VM runs. Nothing from it or to it goes on, counted against it
+    /// as `isolated`; its next claim opens it again.
+    shut: AtomicBool,
+    /// The host -- its node -- its public address is routed to, where that
+    /// is another host (`Switch::public_way`): what it sends the world goes
+    /// there through the tunnel, and only from there does the world's come
+    /// in for it. 0: none, or this host's own NAT. Its claim and its
+    /// release clear it.
+    gateway: AtomicU64,
+    /// Frames its guest sent where its network does not go -- to another
+    /// network's guest; on a cluster network, also a broadcast, the host's
+    /// networks, another cluster network, an address its gateway does not
+    /// answer, the world from a network that does not go out -- dropped.
     isolated: AtomicU64,
+    /// On a cluster network: frames its guest sent to a MAC that is no
+    /// port's of its network's here, or to one port's MAC and another's
+    /// address; and packets past its network's MTU, and what it is told of
+    /// them, at a rate (`too_big`).
+    misdirected: AtomicU64,
+    oversize: AtomicU64,
+    too_big: IrqSpinLock<TooBig>,
+    /// Its VM's firewall: the flows it keeps, the firewall it is judged by,
+    /// and the claim they are for. A spin lock with interrupts off, as the
+    /// inbox's: a frame is judged on any CPU's path, `hv0`'s sink's among
+    /// them. Taken before the firewalls' (`Ports::firewalls`) and never with
+    /// the inbox's.
+    fw: IrqSpinLock<PortFw>,
+    /// Packets its firewall kept from its VM, and from going out of it; and
+    /// live flows given up for new ones' room, its table being full.
+    denied_in: AtomicU64,
+    denied_out: AtomicU64,
+    evicted: AtomicU64,
+}
+
+/// A port's firewall (`Port::fw`).
+struct PortFw {
+    /// Whether a VM has the port: a free one lets nothing through.
+    owned: bool,
+    /// The claim it is kept for (`Inbox::claim`).
+    claim: u64,
+    /// The firewall it is judged by: its place in `Ports::firewalls`.
+    place: usize,
+    /// Its flows: none until the port is first claimed, and kept, emptied,
+    /// for the next VM on it.
+    flows: Option<Flows>,
+    /// What its VM is told of what is kept from going out.
+    refusals: Refusals,
 }
 
 /// What a port's guest lost, since it claimed the port: frames for it its
 /// inbox had no room for, frames it sent as another guest, frames for `hv0`
-/// past its share of the backlog, sends to every port past their rate, and
-/// frames for another network's guest.
+/// past its share of the backlog, sends to every port past their rate,
+/// frames for where its network does not go; on a cluster network, frames
+/// for a MAC or an address that is no port's there, and packets past its
+/// MTU; packets its firewall kept from it and from going out of it, and
+/// flows given up for new ones' room -- and the flows its firewall holds
+/// now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct PortCounts {
     pub dropped: u64,
@@ -422,6 +705,108 @@ pub struct PortCounts {
     pub over_share: u64,
     pub flooded: u64,
     pub isolated: u64,
+    pub misdirected: u64,
+    pub oversize: u64,
+    pub denied_in: u64,
+    pub denied_out: u64,
+    pub evicted: u64,
+    pub flows: usize,
+}
+
+/// The firewalls ports are judged by, each in a place of its own: its
+/// rules, and what each rule and each policy has let through and kept out.
+/// The places are hv's to fill (`Switch::install`), and a port names its own
+/// by its place, so that nothing is looked up by name on the way. A place's
+/// room is taken the first time a firewall is put in it, with no lock held,
+/// and kept: a change copies the rules in under the lock, which allocates
+/// and frees nothing.
+struct Firewalls {
+    places: Vec<Option<Box<[Firewall]>>>,
+}
+
+/// A place for a firewall: its rules, and what they have judged, while it
+/// is in use.
+struct Firewall {
+    used: bool,
+    rules: Rules,
+    hits: Hits,
+}
+
+impl Firewalls {
+    /// The places, all of them empty and none with room yet.
+    fn new() -> Option<Firewalls> {
+        let mut places = Vec::new();
+        places.try_reserve_exact(FIREWALLS_MAX).ok()?;
+        places.resize_with(FIREWALLS_MAX, || None);
+        Some(Firewalls { places })
+    }
+
+    fn get(&self, place: usize) -> Option<&Firewall> {
+        self.places.get(place)?.as_ref()?.first().filter(|f| f.used)
+    }
+
+    fn get_mut(&mut self, place: usize) -> Option<&mut Firewall> {
+        self.places.get_mut(place)?.as_mut()?.first_mut().filter(|f| f.used)
+    }
+}
+
+/// Room for a place's firewall, one, or None out of memory: the heap's
+/// room for a firewall's rules asked for as a vector's, which says when there
+/// is none, rather than a box's, which would not.
+fn firewall_room() -> Option<Box<[Firewall]>> {
+    let mut room = Vec::new();
+    room.try_reserve_exact(1).ok()?;
+    room.push(Firewall { used: false, rules: Rules::DEFAULT, hits: Hits::NONE });
+    Some(room.into_boxed_slice())
+}
+
+/// `fw_deny`'s record of a packet port `port`'s VM's firewall, in place
+/// `place`, kept out going `dir`: what kept it out -- `rule` its number
+/// from 1, 0 for none -- and the other end, the VM's port and the other's,
+/// and the protocol, as the packet has them. Its caller has asked
+/// `trace::on`; nothing here can fail on what a guest sent.
+#[allow(clippy::too_many_arguments)]
+fn denied_record(port: usize, place: usize, dir: Dir, why: FwWhy, rule: u8, peer: u32, ports: Option<(u16, u16)>,
+                 proto: u8) {
+    let (lport, rport) = ports.unwrap_or((0, 0));
+    trace::emit(&FwDeny {
+        peer,
+        lport,
+        rport,
+        port: u8::try_from(port).unwrap_or(u8::MAX),
+        place: u8::try_from(place).unwrap_or(u8::MAX),
+        dir: if dir == Dir::In { FwDir::In } else { FwDir::Out } as u8,
+        why: why as u8,
+        rule,
+        proto,
+        _pad: [0; 2],
+    });
+}
+
+/// What a firewall has judged since its rules were last set: the flows --
+/// first packets -- each rule decided, and each policy, either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hits {
+    pub rules: [u64; RULES_MAX],
+    pub policy_in: u64,
+    pub policy_out: u64,
+}
+
+impl Hits {
+    pub const NONE: Hits = Hits { rules: [0; RULES_MAX], policy_in: 0, policy_out: 0 };
+
+    fn count(&mut self, dir: Dir, why: Why) {
+        match why {
+            Why::Rule(i) => {
+                if let Some(n) = self.rules.get_mut(usize::from(i)) {
+                    *n += 1;
+                }
+            }
+            Why::Policy if dir == Dir::In => self.policy_in += 1,
+            Why::Policy => self.policy_out += 1,
+            Why::Flow | Why::Related | Why::Stray => {}
+        }
+    }
 }
 
 /// The ports, shared by the switch, every guest's NIC and `hv0`'s sink.
@@ -444,6 +829,92 @@ pub struct Ports {
     bindings: IrqSpinLock<Bindings>,
     /// Router solicitations answered.
     advertised: AtomicU64,
+    /// The firewalls the ports are judged by (`Firewalls`): taken, when a
+    /// frame is judged, with its port's firewall lock held (`Port::fw`).
+    firewalls: IrqSpinLock<Firewalls>,
+    /// ARP requests the switch answered for the cluster networks' guests and
+    /// for `hv0`, and echoes it answered from a cluster network's gateway.
+    arps: AtomicU64,
+    echoes: AtomicU64,
+    /// The subnets of the cluster's networks, address and mask, as vnet's
+    /// table has them (`Switch::cluster_networks`): where a cluster
+    /// network's guest is not let go through its gateway. Sorted by address,
+    /// and apart; replaced whole, the old one freed with the lock down.
+    clusters: IrqSpinLock<Vec<(u32, u32)>>,
+    /// The switch's answers to `hv0` waiting to be handed in (`ToHost`).
+    answers: IrqSpinLock<ToHost>,
+    /// What carries a cluster network's packets to its ports on other hosts
+    /// (`Carrier`): copied out under the lock, used outside it.
+    carrier: IrqSpinLock<Option<Arc<dyn Carrier>>>,
+    /// The public addresses this host serves for ports on other hosts, by
+    /// the port's address: its network and its host (`Switch::serve`) --
+    /// what `hv0`'s frames for such a port are carried by, and what such a
+    /// port's packet for the world is held to. Replaced whole, the old freed
+    /// with the lock down.
+    served: IrqSpinLock<Vec<(u32, u32, u64)>>,
+    /// The other hosts' ports' packets for the world, as one more port's
+    /// share of `hv0`'s backlog (`to_host_served`): spent since the pass
+    /// `served_drain`, and those it kept out; and the world's packets for
+    /// them carried and handed to `hv0`.
+    served_drain: AtomicU64,
+    served_on_backlog: AtomicUsize,
+    served_over_share: AtomicU64,
+    served_in: AtomicU64,
+    served_out: AtomicU64,
+}
+
+/// The switch's answers to `hv0` that cannot be handed in where they are
+/// made: `hv0`'s sink is called under the device's transmit lock, interrupts
+/// off, and a frame handed in may take the heap. ARP replies for a cluster
+/// network's ports here -- what the stack asks as it reaches one, as `hv
+/// forward`'s relay does -- in room taken with the switch, handed in by a
+/// task (`Switch::hand_in`) woken as one is put in (`Switch::on_answers`).
+/// A full ring drops, counted with what `hv0` would not take.
+struct ToHost {
+    frames: [[u8; ARP_FRAME]; TO_HOST],
+    head: usize,
+    count: usize,
+    /// What is woken as one is put in: called under this lock, interrupts
+    /// off (`Wake`).
+    wake: Option<Arc<dyn Wake>>,
+}
+
+/// Whom a frame put in a port's inbox is for, asked again under the inbox's
+/// lock (`deliver_rx`), where the port is its owner's: it may have changed
+/// hands since the switch looked, and what was for the guest on it then is
+/// for nobody now.
+#[derive(Clone, Copy)]
+struct For {
+    /// From a guest of this group: for a port of it alone. None from `hv0`,
+    /// and for the switch's own answer.
+    group: Option<u32>,
+    /// The address the port was found by, where it was by one: a cluster
+    /// network's port's goes with its owner.
+    ip: Option<u32>,
+    /// The claim of the port its firewall judged it for: what the old
+    /// owner's flows let in is not the new one's. None for the switch's own
+    /// answer.
+    claim: Option<u64>,
+}
+
+impl For {
+    /// The switch's own answer, to the guest that asked: it is sending, so
+    /// the port is its.
+    const ASKER: For = For { group: None, ip: None, claim: None };
+
+    /// From a guest of `group`, judged for `claim` of the port.
+    fn guest(group: u32, claim: u64) -> For {
+        For { group: Some(group), ip: None, claim: Some(claim) }
+    }
+
+    /// Whether port `p`, whose inbox is `inbox`, is still that owner's --
+    /// and open.
+    fn holds(&self, p: &Port, inbox: &Inbox) -> bool {
+        !p.shut.load(Ordering::Relaxed)
+            && self.group.is_none_or(|g| p.group.load(Ordering::Relaxed) == g)
+            && self.ip.is_none_or(|ip| p.ip.load(Ordering::Relaxed) == ip)
+            && self.claim.is_none_or(|c| c == inbox.claim)
+    }
 }
 
 /// What a frame a guest sent is, where it comes into the switch.
@@ -463,6 +934,8 @@ enum Ingress {
     /// IPv6 from or advertising an address bound to another port -- or as a
     /// router, or a DHCPv6 server.
     Spoofed,
+    /// From a port hv shut (`Switch::shut`): nothing of it goes on.
+    Shut,
     /// Neither IPv4, ARP nor IPv6, too short to be any, or IPv6 hiding what
     /// it carries.
     Foreign,
@@ -498,13 +971,12 @@ fn router_advert(mac: &netwire::Mac, to: &ipv6::Addr, frame: &mut [u8; RA_BYTES]
     msg[2..4].copy_from_slice(&sum.to_be_bytes());
 }
 
-/// What `frame`, from the guest on `port`, is: IPv4 or ARP. The ARP fields
-/// are read where the kernel's ARP table reads them, whatever the header
-/// says of their sizes.
-fn ingress(port: usize, frame: &[u8]) -> Ingress {
+/// What `frame`, from a guest whose MAC is `mac` and address `addr`, is:
+/// IPv4 or ARP. The ARP fields are read where the kernel's ARP table reads
+/// them, whatever the header says of their sizes.
+fn ingress(mac: [u8; 6], addr: u32, frame: &[u8]) -> Ingress {
     use netwire::{arp, eth, ip, ARP_LEN, ETH_HDR_LEN, ETH_TYPE_ARP, ETH_TYPE_IP, IP_HDR_LEN};
     let Some(body) = frame.get(ETH_HDR_LEN..) else { return Ingress::Foreign };
-    let (mac, addr) = (port_mac(port), port_ip(port));
     let own = match eth::ether_type(frame) {
         ETH_TYPE_IP if body.len() >= IP_HDR_LEN => {
             let src = ip::src(body);
@@ -524,12 +996,78 @@ fn ingress(port: usize, frame: &[u8]) -> Ingress {
 
 impl Ports {
     /// What `frame`, from the guest on `port`, is (`ingress`, and for IPv6
-    /// `ingress6`).
+    /// `ingress6`): on a cluster network, IPv4 and ARP alone are carried.
     fn ingress(&self, port: usize, frame: &[u8]) -> Ingress {
-        if frame.len() >= netwire::ETH_HDR_LEN && netwire::eth::ether_type(frame) == netwire::ETH_TYPE_IPV6 {
+        if self.ports.get(port).is_some_and(|p| p.shut.load(Ordering::Acquire)) {
+            return Ingress::Shut;
+        }
+        let v6 = frame.len() >= netwire::ETH_HDR_LEN && netwire::eth::ether_type(frame) == netwire::ETH_TYPE_IPV6;
+        if is_vnet(self.group(port)) {
+            if v6 {
+                return Ingress::Foreign;
+            }
+            return ingress(self.mac_of(port), self.ip_of(port), frame);
+        }
+        if v6 {
             return self.ingress6(port, frame);
         }
-        ingress(port, frame)
+        ingress(port_mac(port), port_ip(port), frame)
+    }
+
+    /// Port `port`'s address (`Port::ip`): its VM's while one has it, the
+    /// port's own while it is free.
+    fn ip_of(&self, port: usize) -> u32 {
+        self.ports.get(port).map_or(0, |p| p.ip.load(Ordering::Acquire))
+    }
+
+    /// Port `port`'s MAC: on a cluster network its address's
+    /// (`vnet_mac`), otherwise the port's own (`port_mac`).
+    fn mac_of(&self, port: usize) -> [u8; 6] {
+        if is_vnet(self.group(port)) { vnet_mac(self.ip_of(port)) } else { port_mac(port) }
+    }
+
+    /// The gateway port `port`'s guest is told and answered from: its
+    /// cluster network's first address, or `hv0`'s.
+    fn gateway_of(&self, port: usize) -> u32 {
+        match self.ports.get(port) {
+            Some(p) if is_vnet(p.group.load(Ordering::Acquire)) => p.net.load(Ordering::Relaxed).wrapping_add(1),
+            _ => HOST_IP,
+        }
+    }
+
+    /// The port whose MAC `mac` is, if it is one's: a host network's port
+    /// -- or a free one -- by its number, a cluster network's by its
+    /// address. A host network's MAC whose port is a cluster network's now
+    /// is nobody's.
+    fn port_by_mac(&self, mac: &[u8]) -> Option<usize> {
+        if let Some(p) = port_of(mac) {
+            return (!is_vnet(self.group(p))).then_some(p);
+        }
+        self.port_by_ip(vnet_ip(mac)?)
+    }
+
+    /// The cluster network's port here whose address `addr` is: one of a
+    /// cluster network's, every one of which has an address of its own.
+    fn port_by_ip(&self, addr: u32) -> Option<usize> {
+        self.ports.iter().position(|p| is_vnet(p.group.load(Ordering::Acquire)) && p.ip.load(Ordering::Relaxed) == addr)
+    }
+
+    /// Whether `addr` is on one of the cluster's networks -- by vnet's
+    /// table, or of a port here.
+    fn in_cluster(&self, addr: u32) -> bool {
+        {
+            let clusters = self.clusters.lock();
+            /* The last subnet at or below the address: the one it can be in,
+             * the subnets being apart. */
+            let at = clusters.partition_point(|&(net, _)| net <= addr);
+            if at > 0 && addr & clusters[at - 1].1 == clusters[at - 1].0 {
+                return true;
+            }
+        }
+        self.ports.iter().any(|p| {
+            is_vnet(p.group.load(Ordering::Acquire))
+                && addr & p.mask.load(Ordering::Relaxed) == p.net.load(Ordering::Relaxed)
+        })
     }
 
     /// What an IPv6 frame from the guest on `port` is: its own -- from its
@@ -647,24 +1185,525 @@ impl Ports {
         false
     }
 
-    /// A frame into a port's inbox, and its VM woken: from a guest of
-    /// `group`, or from `hv0` or the switch itself (None).
-    fn deliver(&self, port: usize, frame: &[u8], group: Option<u32>) {
-        self.deliver_rx(port, frame, None, group);
+    /// Whether the guest at `addr` is on port `q`'s network: a port of its
+    /// group, which a port alone has none of -- or, on a cluster network,
+    /// any host's address of its subnet but its own and its gateway's,
+    /// wherever that host's port is.
+    fn same_net(&self, q: usize, addr: u32) -> bool {
+        let g = self.group(q);
+        if is_vnet(g) {
+            let Some(p) = self.ports.get(q) else { return false };
+            let (net, mask) = (p.net.load(Ordering::Relaxed), p.mask.load(Ordering::Relaxed));
+            return addr & mask == net && addr != net && addr != net | !mask && addr != net.wrapping_add(1)
+                && addr != p.ip.load(Ordering::Relaxed);
+        }
+        g != 0 && g & ALONE == 0 && port_at(addr).is_some_and(|p| p != q && self.group(p) == g)
+    }
+
+    /// What port `q`'s firewall says of `frame`, going `dir` from its VM's
+    /// side -- its headers read as a whole send's (`firewall::read_send`)
+    /// where `whole`: the claim of the port it was judged for, to be held to
+    /// as it is delivered (`deliver_rx`), or None for a frame that goes no
+    /// further, counted against the port. A packet the firewall keeps from
+    /// going out is answered to the VM itself, at a rate (`refuse`).
+    ///
+    /// Not judged: what is not IP -- ARP -- and neighbour discovery, which
+    /// find the way and carry nothing; and the host's own traffic, to or
+    /// from its address on `hv0`, the host being the VM's hypervisor. A free
+    /// port lets nothing through.
+    fn judged(&self, q: usize, dir: Dir, frame: &[u8], whole: bool) -> Option<u64> {
+        let p = self.ports.get(q)?;
+        let seen = if whole { fw::read_send(frame) } else { fw::read(frame) };
+        let now = kcore::time::boot_time_ns();
+        let mut refuse = false;
+        /* What kept it out, where something did: for `fw_deny`. */
+        let mut why = FwWhy::Unready;
+        let mut rule = 0u8;
+        let at;
+        let claim = {
+            let mut guard = p.fw.lock();
+            let PortFw { owned, claim, place, flows, refusals } = &mut *guard;
+            /* A free port's: nobody's to keep anything from, nothing counted
+             * -- what was for the VM gone, or sent by its NIC as it went. */
+            if !*owned {
+                return None;
+            }
+            at = *place;
+            let pass = match seen {
+                fw::Read::NotIp | fw::Read::V6 { neighbour: true } => true,
+                /* Only between a network's guests: the switch carries IPv6
+                 * nowhere else. */
+                fw::Read::V6 { neighbour: false } => {
+                    why = FwWhy::V6;
+                    self.firewalls.lock().get(*place)
+                        .is_some_and(|f| f.rules.judge6(dir, true).action == fw::Action::Allow)
+                }
+                fw::Read::Fragment => {
+                    why = FwWhy::Fragment;
+                    false
+                }
+                fw::Read::Broken => {
+                    why = FwWhy::Broken;
+                    false
+                }
+                fw::Read::V4(v4) => {
+                    let peer = if dir == Dir::In { v4.src } else { v4.dst };
+                    if peer == HOST_IP {
+                        true
+                    } else {
+                        let ctx = fw::Context {
+                            vm: self.ip_of(q), same_net: self.same_net(q, peer), group: to_group(v4.dst), now,
+                        };
+                        let mut firewalls = self.firewalls.lock();
+                        match (flows.as_mut(), firewalls.get_mut(*place)) {
+                            (Some(flows), Some(f)) => {
+                                let v = fw::judge(flows, &f.rules, dir, &v4, &ctx);
+                                f.hits.count(dir, v.why);
+                                (why, rule) = match v.why {
+                                    Why::Rule(i) => (FwWhy::Rule, i.saturating_add(1)),
+                                    Why::Policy => (FwWhy::Policy, 0),
+                                    Why::Stray => (FwWhy::Stray, 0),
+                                    Why::Flow | Why::Related => (FwWhy::Unready, 0),
+                                };
+                                if v.evicted {
+                                    p.evicted.fetch_add(1, Ordering::Relaxed);
+                                }
+                                /* Told, where what it sent was kept in by a
+                                 * rule or the policy: never of an error, nor
+                                 * of a packet to a group. */
+                                refuse = !v.pass && dir == Dir::Out && matches!(v.why, Why::Rule(_) | Why::Policy)
+                                    && !ctx.group && !matches!(v4.icmp, Some(fw::Icmp::Error(_)))
+                                    && refusals.take(now);
+                                v.pass
+                            }
+                            _ => false,
+                        }
+                    }
+                }
+            };
+            pass.then_some(*claim)
+        };
+        if claim.is_none() {
+            let denied = if dir == Dir::In { &p.denied_in } else { &p.denied_out };
+            denied.fetch_add(1, Ordering::Relaxed);
+            if trace::on::<FwDeny>() {
+                let (peer, ports, proto) = match seen {
+                    fw::Read::V4(v4) if dir == Dir::In => (v4.src, v4.ports.map(|(src, dst)| (dst, src)), v4.proto),
+                    fw::Read::V4(v4) => (v4.dst, v4.ports, v4.proto),
+                    _ => (0, None, 0),
+                };
+                denied_record(q, at, dir, why, rule, peer, ports, proto);
+            }
+            if refuse {
+                self.refuse(q, frame);
+            }
+        }
+        claim
+    }
+
+    /// The VM on port `q` told that `frame`, which it sent, was kept in by
+    /// its firewall: destination unreachable, communication administratively
+    /// prohibited (RFC 1812 5.2.7.1), from its gateway, quoting the packet's
+    /// header and the eight bytes after it (RFC 792) -- its connect fails at
+    /// once, "no route to host", where it would wait out its retries.
+    fn refuse(&self, q: usize, frame: &[u8]) {
+        const ADMIN_PROHIBITED: u8 = 13;
+        self.unreachable(q, frame, ADMIN_PROHIBITED, 0);
+    }
+
+    /// The VM on port `q` told that `frame`, which it sent, went nowhere:
+    /// destination unreachable, of `code`, from its gateway, quoting the
+    /// packet's header and the eight bytes after it (RFC 792) -- and for
+    /// "fragmentation needed", the MTU it can have, `next_mtu` (RFC 1191).
+    fn unreachable(&self, q: usize, frame: &[u8], code: u8, next_mtu: u16) {
+        use netwire::{eth, icmp, ip, ETH_HDR_LEN, ETH_TYPE_IP, ICMP_HDR_LEN, IP_HDR_LEN, IP_PROTO_ICMP};
+        const MAX_IHL: usize = 60;
+        const QUOTED_L4: usize = 8;
+        let Some(packet) = frame.get(ETH_HDR_LEN..).filter(|p| p.len() >= IP_HDR_LEN) else { return };
+        let ihl = ip::header_len(packet);
+        if ihl == 0 {
+            return;
+        }
+        let quoted = (ihl + QUOTED_L4).min(packet.len());
+        let icmp_len = ICMP_HDR_LEN + quoted;
+        let total = ETH_HDR_LEN + IP_HDR_LEN + icmp_len;
+        let mut buf = [0u8; ETH_HDR_LEN + IP_HDR_LEN + ICMP_HDR_LEN + MAX_IHL + QUOTED_L4];
+        eth::write(&mut buf, &self.mac_of(q), &HOST_MAC, ETH_TYPE_IP);
+        ip::write(&mut buf[ETH_HDR_LEN..], IP_PROTO_ICMP, self.gateway_of(q), self.ip_of(q), icmp_len, 0);
+        let at = ETH_HDR_LEN + IP_HDR_LEN;
+        buf[at + ICMP_HDR_LEN..total].copy_from_slice(&packet[..quoted]);
+        /* "Unused" but for the next hop's MTU, in its second half */
+        icmp::write(&mut buf[at..], icmp::DEST_UNREACH, code, 0, next_mtu, icmp_len);
+        self.deliver(q, &buf[..total], For::ASKER);
+    }
+
+    /// Whether `frame`, an IPv4 packet from port `from`'s guest on a cluster
+    /// network, is within its network's MTU -- its header's length and its
+    /// own both. One past it goes nowhere, counted, its sender told so --
+    /// for a packet that says not to cut it, at a rate (`too_big`).
+    fn within_mtu(&self, from: usize, frame: &[u8]) -> bool {
+        let Some(p) = self.ports.get(from) else { return false };
+        let packet = &frame[netwire::ETH_HDR_LEN..];
+        let mtu = p.mtu.load(Ordering::Relaxed) as usize;
+        if packet.len() <= mtu && usize::from(netwire::ip::total_len(packet)) <= mtu {
+            return true;
+        }
+        self.too_big(from, frame);
+        false
+    }
+
+    /// A packet from port `from`'s guest past its cluster network's MTU, or
+    /// a send of TCP whole whose frames would be, kept in: counted, and its
+    /// sender told "fragmentation needed" from its gateway, with the MTU,
+    /// where the packet says not to cut it -- as many at once as
+    /// `TOO_BIG_BURST`, and `TOO_BIG_PER_SEC` after.
+    fn too_big(&self, from: usize, frame: &[u8]) {
+        use netwire::{be16, ip, ETH_HDR_LEN, IP_HDR_LEN};
+        const FRAGMENTATION_NEEDED: u8 = 4;
+        let Some(p) = self.ports.get(from) else { return };
+        p.oversize.fetch_add(1, Ordering::Relaxed);
+        let Some(packet) = frame.get(ETH_HDR_LEN..).filter(|p| p.len() >= IP_HDR_LEN) else { return };
+        if be16(packet, ip::FRAG_OFF) & ip::DONT_FRAGMENT == 0
+            || !p.too_big.lock().take(kcore::time::boot_time_ns())
+        {
+            return;
+        }
+        let mtu = u16::try_from(p.mtu.load(Ordering::Relaxed)).unwrap_or(VNET_MTU_MIN);
+        self.unreachable(from, frame, FRAGMENTATION_NEEDED, mtu);
+    }
+
+    /// An echo request in `frame`, from port `from`'s guest to its gateway,
+    /// answered from there: whether it was one. The echo's data comes back
+    /// as it went, and the IP header's options do not.
+    fn echo(&self, from: usize, frame: &[u8]) -> bool {
+        use netwire::{eth, icmp, ip, ETH_HDR_LEN, ETH_TYPE_IP, ICMP_HDR_LEN, IP_HDR_LEN, IP_PROTO_ICMP};
+        let packet = &frame[ETH_HDR_LEN..];
+        let ihl = ip::header_len(packet);
+        let total = usize::from(ip::total_len(packet));
+        if ihl == 0 || ip::protocol(packet) != IP_PROTO_ICMP || ip::is_fragment(packet)
+            || total < ihl + ICMP_HDR_LEN || total > packet.len()
+        {
+            return false;
+        }
+        let msg = &packet[ihl..total];
+        if icmp::kind(msg) != icmp::ECHO_REQUEST || icmp::code(msg) != 0 {
+            return false;
+        }
+        let at = ETH_HDR_LEN + IP_HDR_LEN;
+        let mut reply = [0u8; FRAME];
+        let Some(room) = reply.get_mut(at..at + msg.len()) else { return false };
+        room.copy_from_slice(msg);
+        eth::write(&mut reply, &self.mac_of(from), &HOST_MAC, ETH_TYPE_IP);
+        ip::write(&mut reply[ETH_HDR_LEN..], IP_PROTO_ICMP, self.gateway_of(from), self.ip_of(from), msg.len(), 0);
+        icmp::write(&mut reply[at..], icmp::ECHO_REPLY, 0, icmp::id(msg), icmp::seq(msg), msg.len());
+        self.echoes.fetch_add(1, Ordering::Relaxed);
+        self.deliver(from, &reply[..at + msg.len()], For::ASKER);
+        true
+    }
+
+    /// An ARP request in `frame`, from port `from`'s guest on cluster
+    /// network `group`, answered here: for its gateway, `HOST_MAC`; for a
+    /// port of its network here, that port's MAC; for anything else -- its
+    /// own address, which it asks after to find a duplicate, among them --
+    /// nothing. ARP goes no further on a cluster network.
+    fn answer_arp(&self, from: usize, group: u32, frame: &[u8]) {
+        use netwire::{arp, eth, ARP_OP_REPLY, ARP_OP_REQUEST, ETH_HDR_LEN, ETH_TYPE_ARP};
+        let request = &frame[ETH_HDR_LEN..];
+        if arp::opcode(request) != ARP_OP_REQUEST {
+            return;
+        }
+        let target = arp::target_ip(request);
+        let mac = if target == self.gateway_of(from) {
+            HOST_MAC
+        } else if target != self.ip_of(from)
+            && (self.port_by_ip(target).is_some_and(|q| self.group(q) == group)
+                || self.carrier_now().is_some_and(|c| c.elsewhere(group & VNI_MASK, target)))
+        {
+            vnet_mac(target)
+        } else {
+            return;
+        };
+        let asker = self.mac_of(from);
+        let mut reply = [0u8; ARP_FRAME];
+        eth::write(&mut reply, &asker, &mac, ETH_TYPE_ARP);
+        arp::write(&mut reply[ETH_HDR_LEN..], ARP_OP_REPLY, &mac, target, &asker, arp::sender_ip(request));
+        self.arps.fetch_add(1, Ordering::Relaxed);
+        self.deliver(from, &reply, For::ASKER);
+    }
+
+    /// The port of cluster network `group` here that `frame`, from port
+    /// `from`'s guest, is for -- with the address it is for -- where it is a
+    /// packet of its own, IPv4, to that port's MAC and address: what may go
+    /// to it as it is, a send of TCP whole or a checksum left to finish.
+    /// None for anything else, which goes the way every frame goes
+    /// (`forward_vnet`) to be carried, answered or counted there.
+    fn vnet_unicast(&self, from: usize, group: u32, frame: &[u8]) -> Option<(usize, u32)> {
+        if frame.len() < netwire::ETH_HDR_LEN + netwire::IP_HDR_LEN
+            || netwire::eth::ether_type(frame) != netwire::ETH_TYPE_IP
+            || !matches!(self.ingress(from, frame), Ingress::Own)
+        {
+            return None;
+        }
+        let q = self.port_by_ip(vnet_ip(&frame[..6])?)?;
+        let to = netwire::ip::dst(&frame[netwire::ETH_HDR_LEN..]);
+        (q != from && self.group(q) == group && self.ip_of(q) == to).then_some((q, to))
+    }
+
+    /// A frame from port `from`'s guest on cluster network `group`, which
+    /// carries IPv4 and ARP alone: its own (`ingress`); its DHCP and its ARP
+    /// answered here; within its network's MTU (`within_mtu`); then by where
+    /// it is for -- its gateway's MAC by the address (`via_gateway`), a
+    /// port's MAC to that port, if it is of its network and has that
+    /// address -- and nowhere else: no broadcast or multicast is carried.
+    fn forward_vnet(&self, from: usize, group: u32, frame: &[u8]) {
+        use netwire::{eth, ip, ETH_HDR_LEN, ETH_TYPE_ARP};
+        let Some(p) = self.ports.get(from) else { return };
+        match self.ingress(from, frame) {
+            Ingress::Own => {}
+            Ingress::Dhcp => {
+                self.answer_dhcp(from, frame);
+                return;
+            }
+            Ingress::Spoofed => {
+                p.spoofed.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Ingress::Shut => {
+                p.isolated.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Ingress::Own6 | Ingress::Solicit | Ingress::Foreign => {
+                self.foreign.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        if eth::ether_type(frame) == ETH_TYPE_ARP {
+            self.answer_arp(from, group, frame);
+            return;
+        }
+        /* IPv4, its header there (`ingress`) */
+        if !self.within_mtu(from, frame) {
+            return;
+        }
+        let to = ip::dst(&frame[ETH_HDR_LEN..]);
+        let dst = &frame[..6];
+        if dst[0] & 1 != 0 {
+            p.isolated.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if dst == HOST_MAC {
+            self.via_gateway(from, frame, to);
+            return;
+        }
+        let Some(q) = vnet_ip(dst).and_then(|ip| self.port_by_ip(ip)) else {
+            /* A port of its network on another host -- its MAC its
+             * address's: into the tunnel, judged going out as any packet
+             * of its */
+            let vni = group & VNI_MASK;
+            match self.carrier_now() {
+                Some(c) if vnet_ip(dst) == Some(to) && c.elsewhere(vni, to) => {
+                    if self.judged(from, Dir::Out, frame, false).is_some() {
+                        let end = (ETH_HDR_LEN + usize::from(ip::total_len(&frame[ETH_HDR_LEN..]))).min(frame.len());
+                        c.carry(vni, to, &frame[ETH_HDR_LEN..end]);
+                    }
+                }
+                _ => {
+                    p.misdirected.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return;
+        };
+        if q == from {
+            return;
+        }
+        if self.group(q) != group {
+            p.isolated.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if self.ip_of(q) != to {
+            p.misdirected.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if self.judged(from, Dir::Out, frame, false).is_none() {
+            return;
+        }
+        if let Some(claim) = self.judged(q, Dir::In, frame, false) {
+            self.deliver(q, frame, For { group: Some(group), ip: Some(to), claim: Some(claim) });
+        }
+    }
+
+    /// What carries to other hosts, while there is one.
+    fn carrier_now(&self) -> Option<Arc<dyn Carrier>> {
+        self.carrier.lock().clone()
+    }
+
+    /// An IPv4 packet from port `from`'s guest on a cluster network to its
+    /// gateway's MAC, by the address it is for: the gateway's own, whose
+    /// echo is answered here and nothing else; `hv0`'s, the host's; then
+    /// nowhere for the host's networks, the cluster's, or a group -- and the
+    /// world through NAT, for a network that goes out, judged by its
+    /// firewall on the way.
+    fn via_gateway(&self, from: usize, frame: &[u8], to: u32) {
+        let Some(p) = self.ports.get(from) else { return };
+        if to == self.gateway_of(from) {
+            if !self.echo(from, frame) {
+                p.isolated.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+        if to != HOST_IP
+            && (to & MASK == SUBNET || to_group(to) || self.in_cluster(to) || !p.out.load(Ordering::Relaxed))
+        {
+            p.isolated.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if self.judged(from, Dir::Out, frame, false).is_none() {
+            return;
+        }
+        /* The world, by the host its public address is routed to, where
+         * that is another: through the tunnel, to go out there */
+        let gateway = p.gateway.load(Ordering::Acquire);
+        if gateway != 0 && to != HOST_IP {
+            use netwire::{ip, ETH_HDR_LEN};
+            let end = (ETH_HDR_LEN + usize::from(ip::total_len(&frame[ETH_HDR_LEN..]))).min(frame.len());
+            let vni = self.group(from) & VNI_MASK;
+            if let Some(c) = self.carrier_now() {
+                c.carry_out(gateway, vni, &frame[ETH_HDR_LEN..end]);
+            }
+            return;
+        }
+        self.to_host(Some(from), frame);
+    }
+
+    /// A frame from `hv0` for a cluster network's port here, carried here --
+    /// whether it was one of those: an ARP request after one's address,
+    /// answered by the switch (`answer_host`) and sent to no port; an IPv4
+    /// packet to one's MAC, into its inbox if it is for its address, judged
+    /// by its firewall; anything else to one's MAC, nowhere. What is for no
+    /// such port goes the host networks' way -- which a broadcast does, to
+    /// their ports alone (`forward`): no IPv6 and no broadcast of `hv0`'s
+    /// reaches a cluster network.
+    fn from_host_vnet(&self, frame: &[u8]) -> bool {
+        use netwire::{arp, eth, ip, ARP_LEN, ARP_OP_REQUEST, ETH_HDR_LEN, ETH_TYPE_ARP, ETH_TYPE_IP, IP_HDR_LEN};
+        let dst = &frame[..6];
+        /* A cluster network's port's MAC, of a port here: a host network's
+         * port's, and `hv0`'s own, share its first two bytes. */
+        let port = if port_of(dst).is_none() && dst != HOST_MAC {
+            vnet_ip(dst).and_then(|addr| Some((self.port_by_ip(addr)?, addr)))
+        } else {
+            None
+        };
+        match eth::ether_type(frame) {
+            ETH_TYPE_ARP if frame.len() >= ETH_HDR_LEN + ARP_LEN => {
+                let request = &frame[ETH_HDR_LEN..];
+                let target = arp::target_ip(request);
+                if self.port_by_ip(target).is_none() {
+                    return port.is_some();
+                }
+                if arp::opcode(request) == ARP_OP_REQUEST {
+                    self.answer_host(request, target);
+                }
+                true
+            }
+            ETH_TYPE_IP if frame.len() >= ETH_HDR_LEN + IP_HDR_LEN => {
+                let Some((q, addr)) = port else { return self.to_served(dst, frame) };
+                if ip::dst(&frame[ETH_HDR_LEN..]) != addr {
+                    return true;
+                }
+                if let Some(claim) = self.judged(q, Dir::In, frame, false) {
+                    self.deliver(q, frame, For { group: None, ip: Some(addr), claim: Some(claim) });
+                }
+                true
+            }
+            _ => port.is_some(),
+        }
+    }
+
+    /// An IPv4 frame from `hv0` to the MAC of a port on another host whose
+    /// public address this host serves -- the world's packet NAT made the
+    /// port's -- carried there by the tunnel's task: whether it was for one
+    /// (`from_host_vnet`). `hv0`'s sink's context.
+    fn to_served(&self, dst: &[u8], frame: &[u8]) -> bool {
+        use netwire::{ip, ETH_HDR_LEN};
+        let Some(addr) = vnet_ip(dst).filter(|_| port_of(dst).is_none() && dst != HOST_MAC) else { return false };
+        let found = self.served.lock().iter().find(|s| s.0 == addr).map(|s| (s.1, s.2));
+        let Some((vni, node)) = found else { return false };
+        let packet = &frame[ETH_HDR_LEN..];
+        if ip::dst(packet) != addr {
+            return true;
+        }
+        let end = (ETH_HDR_LEN + usize::from(ip::total_len(packet))).min(frame.len());
+        match self.carrier_now() {
+            Some(c) if c.carry_in(node, vni, &frame[ETH_HDR_LEN..end]) => {
+                self.served_in.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                self.refused.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        true
+    }
+
+    /// A frame of the other hosts' ports' for the world into `hv0`, as one
+    /// more port's share of its backlog (`to_host`): whether it went.
+    fn to_host_served(&self, frame: &[u8]) -> bool {
+        let drains = self.vnic.drains();
+        if self.served_drain.swap(drains, Ordering::Relaxed) != drains {
+            self.served_on_backlog.store(0, Ordering::Relaxed);
+        }
+        if self.served_on_backlog.load(Ordering::Relaxed) >= BACKLOG / (self.in_use.load(Ordering::Relaxed) + 1) {
+            self.served_over_share.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        if self.vnic.receive(frame) {
+            self.served_on_backlog.fetch_add(1, Ordering::Relaxed);
+            self.served_out.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+
+    /// `hv0`'s ARP request `request` after the address of a cluster
+    /// network's port here, `target`, answered with that port's MAC: put on
+    /// `answers` for a task to hand in -- `hv0`'s sink, where this is, may
+    /// not -- and the task woken.
+    fn answer_host(&self, request: &[u8], target: u32) {
+        use netwire::{arp, eth, ARP_OP_REPLY, ETH_HDR_LEN, ETH_TYPE_ARP};
+        let mac = vnet_mac(target);
+        let (asker_mac, asker) = (arp::sender_mac(request), arp::sender_ip(request));
+        let mut reply = [0u8; ARP_FRAME];
+        eth::write(&mut reply, &asker_mac, &mac, ETH_TYPE_ARP);
+        arp::write(&mut reply[ETH_HDR_LEN..], ARP_OP_REPLY, &mac, target, &asker_mac, asker);
+        let mut answers = self.answers.lock();
+        if answers.count == TO_HOST {
+            drop(answers);
+            self.refused.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let at = (answers.head + answers.count) % TO_HOST;
+        answers.frames[at] = reply;
+        answers.count += 1;
+        self.arps.fetch_add(1, Ordering::Relaxed);
+        if let Some(wake) = &answers.wake {
+            wake.wake_up();
+        }
+    }
+
+    /// A frame into a port's inbox, and its VM woken, if it is still for
+    /// the port's owner (`For`).
+    fn deliver(&self, port: usize, frame: &[u8], to: For) {
+        self.deliver_rx(port, frame, None, to);
     }
 
     /// A frame into a port's inbox -- its checksum left to finish, for a NIC
-    /// that takes them so -- and its VM woken: from a guest of `group`, for
-    /// the port's only if it is of that group, or from `hv0` or the switch
-    /// itself (None), for anyone's.
-    fn deliver_rx(&self, port: usize, frame: &[u8], partial: Option<Partial>, group: Option<u32>) {
+    /// that takes them so -- and its VM woken, if it is still for the port's
+    /// owner (`For`).
+    fn deliver_rx(&self, port: usize, frame: &[u8], partial: Option<Partial>, to: For) {
         let Some(p) = self.ports.get(port) else { return };
         let mut inbox = p.inbox.lock();
-        /* Nobody's, or another network's: the group asked here, where it
-         * is the owner's -- the port may have changed hands since the
-         * switch looked, and what was for the guest on it then is for
-         * nobody now. */
-        if inbox.owner.is_none() || group.is_some_and(|g| p.group.load(Ordering::Relaxed) != g) {
+        if inbox.owner.is_none() || !to.holds(p, &inbox) {
             return;
         }
         if inbox.count == INBOX_FRAMES || frame.len() > FRAME {
@@ -689,11 +1728,11 @@ impl Ports {
         Self::wake(p, &inbox);
     }
 
-    /// A send of TCP up to 64 KiB from a guest of `group` into a port's
-    /// inbox whole, for a VM of that group whose NIC takes it so, and its VM
-    /// woken: false where it does not, or there is no room for it whole --
-    /// the caller cuts it then.
-    fn deliver_whole(&self, port: usize, frame: &[u8], layout: Tcp4, group: u32) -> bool {
+    /// A send of TCP up to 64 KiB from a guest into a port's inbox whole,
+    /// for the port's owner it is still for (`For`) whose NIC takes it so,
+    /// and its VM woken: false where it does not, or there is no room for it
+    /// whole -- the caller cuts it then.
+    fn deliver_whole(&self, port: usize, frame: &[u8], layout: Tcp4, to: For) -> bool {
         let Some(p) = self.ports.get(port) else { return true };
         if frame.len() > SEND {
             return false;
@@ -701,7 +1740,7 @@ impl Ports {
         let mut inbox = p.inbox.lock();
         /* As `deliver_rx` asks, and whether its NIC takes the send whole --
          * here, for the same reason. */
-        if inbox.owner.is_none() || p.group.load(Ordering::Relaxed) != group {
+        if inbox.owner.is_none() || !to.holds(p, &inbox) {
             return true;
         }
         if !p.takes_whole.load(Ordering::Relaxed) || inbox.count == INBOX_FRAMES || inbox.free_sends == 0
@@ -749,13 +1788,33 @@ impl Ports {
     /// so (`deliver_rx`), and finished for anyone else -- `hv0` and NAT,
     /// everyone -- going on as a frame sent would.
     fn forward_partial(&self, from: usize, frame: &mut [u8], partial: Partial) {
+        let group = self.group(from);
+        if is_vnet(group) {
+            /* As it is only to a port of its network here, within the MTU */
+            if let Some((q, to)) = self.vnet_unicast(from, group, frame) {
+                if self.within_mtu(from, frame) && self.judged(from, Dir::Out, frame, false).is_some() {
+                    if let Some(claim) = self.judged(q, Dir::In, frame, false) {
+                        self.deliver_rx(q, frame, Some(partial), For { group: Some(group), ip: Some(to), claim: Some(claim) });
+                    }
+                }
+                return;
+            }
+            partial.complete(frame);
+            self.forward(Some(from), frame);
+            return;
+        }
         if frame.len() >= netwire::ETH_HDR_LEN && matches!(self.ingress(from, frame), Ingress::Own | Ingress::Own6)
             && frame[0] & 1 == 0
         {
             if let Some(q) = port_of(&frame[..6]) {
-                let group = self.group(from);
                 if q != from && self.group(q) == group {
-                    self.deliver_rx(q, frame, Some(partial), Some(group));
+                    /* Judged by the sender's firewall and the receiver's, as
+                     * any frame between two guests is (`forward`). */
+                    if self.judged(from, Dir::Out, frame, false).is_some() {
+                        if let Some(claim) = self.judged(q, Dir::In, frame, false) {
+                            self.deliver_rx(q, frame, Some(partial), For::guest(group, claim));
+                        }
+                    }
                     return;
                 }
             }
@@ -780,12 +1839,42 @@ impl Ports {
             offload::segment_tcp4(frame, layout, &mut seg, &mut |f| self.forward(Some(from), f));
             return;
         }
+        let group = self.group(from);
+        if is_vnet(group) {
+            /* Its frames past its network's MTU: kept in whole, and told
+             * once for all of them. */
+            let mtu = self.ports.get(from).map_or(0, |p| p.mtu.load(Ordering::Relaxed) as usize);
+            if layout.headers() - netwire::ETH_HDR_LEN + layout.mss() > mtu {
+                self.too_big(from, frame);
+                return;
+            }
+            if let Some((q, to)) = self.vnet_unicast(from, group, frame) {
+                if self.judged(from, Dir::Out, frame, true).is_none() {
+                    return;
+                }
+                let Some(claim) = self.judged(q, Dir::In, frame, true) else { return };
+                if self.deliver_whole(q, frame, layout, For { group: Some(group), ip: Some(to), claim: Some(claim) }) {
+                    return;
+                }
+            }
+            let mut seg = [0u8; FRAME];
+            offload::segment_tcp4(frame, layout, &mut seg, &mut |f| self.forward(Some(from), f));
+            return;
+        }
         let dst = &frame[..6];
         if dst[0] & 1 == 0 {
             if let Some(p) = port_of(dst) {
-                let group = self.group(from);
-                if p != from && self.group(p) == group && self.deliver_whole(p, frame, layout, group) {
-                    return;
+                if p != from && self.group(p) == group {
+                    /* Judged once for the whole of it, by its headers: each
+                     * frame cut from it, should it be, is of the flow this
+                     * makes or finds. */
+                    if self.judged(from, Dir::Out, frame, true).is_none() {
+                        return;
+                    }
+                    let Some(claim) = self.judged(p, Dir::In, frame, true) else { return };
+                    if self.deliver_whole(p, frame, layout, For::guest(group, claim)) {
+                        return;
+                    }
                 }
             }
         }
@@ -801,6 +1890,20 @@ impl Ports {
     fn forward(&self, from: Option<usize>, frame: &[u8]) {
         if frame.len() < netwire::ETH_HDR_LEN {
             return;
+        }
+        match from {
+            Some(port) => {
+                let group = self.group(port);
+                if is_vnet(group) {
+                    self.forward_vnet(port, group, frame);
+                    return;
+                }
+            }
+            None => {
+                if self.from_host_vnet(frame) {
+                    return;
+                }
+            }
         }
         if let Some(port) = from {
             match self.ingress(port, frame) {
@@ -819,10 +1922,21 @@ impl Ports {
                     }
                     return;
                 }
+                Ingress::Shut => {
+                    if let Some(p) = self.ports.get(port) {
+                        p.isolated.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return;
+                }
                 Ingress::Foreign => {
                     self.foreign.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
+            }
+            /* What the guest's firewall keeps in goes nowhere: to `hv0` and
+             * NAT as to another guest. */
+            if self.judged(port, Dir::Out, frame, false).is_none() {
+                return;
             }
         }
         let dst = &frame[..6];
@@ -837,9 +1951,11 @@ impl Ports {
                 }
                 return;
             }
-            if let Some(p) = port_of(dst) {
-                if Some(p) != from && from.map_or(true, |f| self.may_reach(f, p)) {
-                    self.deliver(p, frame, from.map(|f| self.group(f)));
+            if let Some(p) = self.port_by_mac(dst) {
+                if Some(p) != from && self.group(p) != 0 && from.map_or(true, |f| self.may_reach(f, p)) {
+                    if let Some(claim) = self.judged(p, Dir::In, frame, false) {
+                        self.deliver(p, frame, For { group: from.map(|f| self.group(f)), ip: None, claim: Some(claim) });
+                    }
                 }
                 return;
             }
@@ -853,12 +1969,17 @@ impl Ports {
                 return;
             }
         }
-        /* To its own network's ports -- which `deliver` picks out -- or,
-         * from `hv0`, every port. */
+        /* To its own network's ports -- which `deliver` asks again under the
+         * inbox's lock -- or, from `hv0`, every host network's port; each
+         * judged by its own firewall. A cluster network's has none of it. */
         let group = from.map(|f| self.group(f));
         for p in 0..self.ports.len() {
-            if Some(p) != from {
-                self.deliver(p, frame, group);
+            let theirs = self.group(p);
+            if Some(p) == from || theirs == 0 || is_vnet(theirs) || group.is_some_and(|g| g != theirs) {
+                continue;
+            }
+            if let Some(claim) = self.judged(p, Dir::In, frame, false) {
+                self.deliver(p, frame, For { group, ip: None, claim: Some(claim) });
             }
         }
         if !v6 {
@@ -875,24 +1996,31 @@ impl Ports {
         let mut frame = [0u8; RA_BYTES];
         router_advert(&port_mac(port), &to, &mut frame);
         self.advertised.fetch_add(1, Ordering::Relaxed);
-        self.deliver(port, &frame, None);
+        self.deliver(port, &frame, For::ASKER);
     }
 
     /// A guest's DHCP message answered into its port -- with the DNS server
     /// nos has now, asked of the kernel as each is answered: the one it had
     /// when a guest was last started was handed out until the next start,
-    /// whatever nos's own lease said since. One it does not answer is
-    /// counted with what the switch does not carry.
+    /// whatever nos's own lease said since. On a cluster network, from its
+    /// gateway, with its mask and MTU. One it does not answer is counted
+    /// with what the switch does not carry.
     fn answer_dhcp(&self, port: usize, frame: &[u8]) {
+        let (server_ip, mask, mtu) = match self.ports.get(port) {
+            Some(p) if is_vnet(p.group.load(Ordering::Acquire)) => (
+                p.net.load(Ordering::Relaxed).wrapping_add(1), p.mask.load(Ordering::Relaxed),
+                u16::try_from(p.mtu.load(Ordering::Relaxed)).unwrap_or(VNET_MTU_MIN),
+            ),
+            _ => (HOST_IP, MASK, 0),
+        };
         let network = dhcp::Network {
-            server_ip: HOST_IP, server_mac: HOST_MAC, mask: MASK,
-            dns: kcore::net::dns_server().unwrap_or(0),
+            server_ip, server_mac: HOST_MAC, mask, dns: kcore::net::dns_server().unwrap_or(0), mtu,
         };
         let mut reply = [0u8; dhcp::REPLY_MAX];
-        match dhcp::answer(frame, port_ip(port), &network, &mut reply) {
+        match dhcp::answer(frame, self.ip_of(port), &network, &mut reply) {
             Some(len) => {
                 self.dhcp.fetch_add(1, Ordering::Relaxed);
-                self.deliver(port, &reply[..len], None);
+                self.deliver(port, &reply[..len], For::ASKER);
             }
             None => {
                 self.foreign.fetch_add(1, Ordering::Relaxed);
@@ -1027,8 +2155,19 @@ impl hv::nic::Backend for PortBackend {
 /// The switch: the ports, `hv0`'s sink attached for as long as it lives, and
 /// NAT for the guests while there is a way out.
 pub struct Switch {
-    /// Fields go in the order they are declared. NAT first: no guest's packet
-    /// is sent on once the switch starts to go.
+    /// Fields go in the order they are declared. The public addresses mapped
+    /// one to one to its ports' VMs first (`map_public`), by port, while NAT
+    /// is still on to take them back; then NAT: no guest's packet is sent on
+    /// once the switch starts to go.
+    ones: Mutex<Vec<(usize, OneToOne)>>,
+    /// The public addresses this host serves for the cluster's ports, here
+    /// and on other hosts, one to one in NAT (`serve`): before NAT too.
+    /// Taken before `vnets`.
+    served: Mutex<Vec<(Route, OneToOne)>>,
+    /// The cluster networks with ports here, or public addresses this host
+    /// serves for ports on them elsewhere, and NAT's networks behind `hv0`
+    /// for those that go out: before NAT too. Taken before `nat`.
+    vnets: Mutex<Vec<VnetHere>>,
     nat: Mutex<Option<Nat>>,
     /// Then `hv0`'s sink detached, and any call of it waited out, before
     /// the ports go.
@@ -1039,6 +2178,21 @@ pub struct Switch {
     /// for the next name. A claim holds it throughout, so that a name has
     /// one number for as long as a port is on it.
     networks: Mutex<Vec<Network>>,
+}
+
+/// A cluster network with ports here (`Switch::vnets`): its number, its
+/// subnet and how it goes out, as its ports were given them, and how many
+/// there are; and while it goes out and NAT is on, its place behind `hv0`.
+struct VnetHere {
+    vni: u32,
+    net: u32,
+    mask: u32,
+    out: bool,
+    ports: usize,
+    /// The public addresses this host serves for ports on it, here or
+    /// elsewhere (`Switch::serve`): it stays while it has either.
+    served: usize,
+    inside: Option<Inside>,
 }
 
 /// A network ports are on (`Switch::networks`).
@@ -1092,10 +2246,11 @@ impl Switch {
         let mut ports = Vec::new();
         ports.try_reserve_exact(MAX_PORTS).map_err(|_| String::from("out of memory for the switch"))?;
         let bindings = Bindings::new().ok_or_else(|| String::from("out of memory for the switch"))?;
+        let firewalls = Firewalls::new().ok_or_else(|| String::from("out of memory for the switch"))?;
         for _ in 0..MAX_PORTS {
             ports.push(Port {
                 inbox: IrqSpinLock::new(Inbox {
-                    owner: None, frames: Vec::new(), lens: [0; INBOX_FRAMES], head: 0, count: 0,
+                    owner: None, claim: 0, frames: Vec::new(), lens: [0; INBOX_FRAMES], head: 0, count: 0,
                     whole: [NOT_WHOLE; INBOX_FRAMES], partial: [None; INBOX_FRAMES], sends: Vec::new(),
                     send_lens: [0; WHOLE_SENDS],
                     layouts: [None; WHOLE_SENDS], free_sends: ALL_SENDS,
@@ -1112,21 +2267,51 @@ impl Switch {
                 takes_partial: AtomicBool::new(false),
                 takes_whole: AtomicBool::new(false),
                 group: AtomicU32::new(0),
+                ip: AtomicU32::new(port_ip(ports.len())),
+                net: AtomicU32::new(0),
+                mask: AtomicU32::new(0),
+                mtu: AtomicU32::new(0),
+                out: AtomicBool::new(false),
+                shut: AtomicBool::new(false),
+                gateway: AtomicU64::new(0),
                 isolated: AtomicU64::new(0),
+                misdirected: AtomicU64::new(0),
+                oversize: AtomicU64::new(0),
+                too_big: IrqSpinLock::new(TooBig::FULL),
+                fw: IrqSpinLock::new(PortFw { owned: false, claim: 0, place: 0, flows: None, refusals: Refusals::FULL }),
+                denied_in: AtomicU64::new(0),
+                denied_out: AtomicU64::new(0),
+                evicted: AtomicU64::new(0),
             });
         }
         let ports = Arc::new(Ports {
             ports, in_use: AtomicUsize::new(0), vnic, to_host: AtomicU64::new(0), refused: AtomicU64::new(0),
             dhcp: AtomicU64::new(0), foreign: AtomicU64::new(0),
             bindings: IrqSpinLock::new(bindings), advertised: AtomicU64::new(0),
+            firewalls: IrqSpinLock::new(firewalls),
+            arps: AtomicU64::new(0), echoes: AtomicU64::new(0),
+            clusters: IrqSpinLock::new(Vec::new()),
+            answers: IrqSpinLock::new(ToHost { frames: [[0; ARP_FRAME]; TO_HOST], head: 0, count: 0, wake: None }),
+            carrier: IrqSpinLock::new(None),
+            served: IrqSpinLock::new(Vec::new()),
+            served_drain: AtomicU64::new(0),
+            served_on_backlog: AtomicUsize::new(0),
+            served_over_share: AtomicU64::new(0),
+            served_in: AtomicU64::new(0),
+            served_out: AtomicU64::new(0),
         });
         let nat = Mutex::new(None).ok_or_else(|| String::from("out of memory for the switch"))?;
+        let ones = Mutex::new(Vec::new()).ok_or_else(|| String::from("out of memory for the switch"))?;
+        let mut here = Vec::new();
+        here.try_reserve_exact(MAX_PORTS).map_err(|_| String::from("out of memory for the switch"))?;
+        let vnets = Mutex::new(here).ok_or_else(|| String::from("out of memory for the switch"))?;
         let mut table = Vec::new();
         table.try_reserve_exact(MAX_PORTS).map_err(|_| String::from("out of memory for the switch"))?;
         let networks = Mutex::new(table).ok_or_else(|| String::from("out of memory for the switch"))?;
         let uplink = vnic.attach(Arc::new(Uplink(ports.clone())))
             .ok_or_else(|| String::from("hv0 has a sink attached already -- another load of hv?"))?;
-        Ok(Switch { nat, _uplink: uplink, ports, networks })
+        let served = Mutex::new(Vec::new()).ok_or_else(|| String::from("out of memory for the switch"))?;
+        Ok(Switch { ones, served, vnets, nat, _uplink: uplink, ports, networks })
     }
 
     /// The guests' way out: NAT on, if it is not yet, through the device
@@ -1135,14 +2320,70 @@ impl Switch {
     /// that finds no way out does not keep the next from having one once
     /// nos has a lease. Task context.
     pub fn way_out(&self) -> Result<u32, NatError> {
-        let mut nat = self.nat.lock();
-        if let Some(n) = nat.as_ref() {
-            return Ok(n.outer().ip());
+        let ip = {
+            let mut nat = self.nat.lock();
+            match nat.as_ref() {
+                Some(n) => n.outer().ip(),
+                None => {
+                    let n = self.ports.vnic.nic().ok_or(NatError::Device)?.nat()?;
+                    let ip = n.outer().ip();
+                    *nat = Some(n);
+                    ip
+                }
+            }
+        };
+        /* The cluster networks here that go out, behind `hv0` once NAT is
+         * on: those whose ports came before it, and any NAT refused then. */
+        let mut vnets = self.vnets.lock();
+        for v in vnets.iter_mut() {
+            if let Err(why) = self.behind_hv0(v) {
+                kcore::klog!(0, "hv: cluster network {} is not behind hv0 for NAT: {}", v.vni, why);
+            }
         }
-        let n = self.ports.vnic.nic().ok_or(NatError::Device)?.nat()?;
-        let ip = n.outer().ip();
-        *nat = Some(n);
         Ok(ip)
+    }
+
+    /// Cluster network `v` put behind `hv0` for NAT, where it goes out, NAT
+    /// is on and it is not there yet: why not, where NAT refuses it.
+    fn behind_hv0(&self, v: &mut VnetHere) -> Result<(), &'static str> {
+        if !v.out || v.inside.is_some() {
+            return Ok(());
+        }
+        let nat = self.nat.lock();
+        let Some(n) = nat.as_ref() else { return Ok(()) };
+        v.inside = Some(n.inside(v.net, v.mask, v.net.wrapping_add(1)).map_err(|e| e.name())?);
+        Ok(())
+    }
+
+    /// Public address `public` mapped one to one to the VM on `port` (NAT's
+    /// `map`): the world reaches the VM there -- its firewall judging what
+    /// comes, the source as it was -- and the VM goes out from it, until its
+    /// port is given up (`release`). Why not: no way out, NAT being off, or
+    /// NAT's refusal -- an address mapped already, or one that will not do.
+    pub fn map_public(&self, port: usize, public: u32) -> Result<(), String> {
+        let mut ones = self.ones.lock();
+        ones.try_reserve(1).map_err(|_| String::from("out of memory"))?;
+        let one = {
+            let nat = self.nat.lock();
+            let n = nat.as_ref().ok_or_else(|| String::from("the guests have no way out to map it on"))?;
+            /* What a public address lets in is held to what the VM takes:
+             * Ethernet's on a host's network, its own network's MTU on a
+             * cluster's. */
+            let mtu = match self.ports.ports.get(port) {
+                Some(p) if is_vnet(p.group.load(Ordering::Acquire)) => {
+                    u16::try_from(p.mtu.load(Ordering::Relaxed)).unwrap_or(VNET_MTU_MIN)
+                }
+                _ => PUBLIC_MTU,
+            };
+            n.map(public, self.ports.ip_of(port), self.ports.mac_of(port), mtu).map_err(|e| String::from(e.name()))?
+        };
+        ones.push((port, one));
+        Ok(())
+    }
+
+    /// The public address mapped one to one to the VM on `port`, if one is.
+    pub fn public_of(&self, port: usize) -> Option<u32> {
+        self.ones.lock().iter().find(|(p, _)| *p == port).map(|(_, o)| o.public())
     }
 
     /// The address the guests go out from, while NAT is on.
@@ -1162,14 +2403,19 @@ impl Switch {
         kcore::net::dns_server()
     }
 
-    /// A free port for `vm`, on `network` or alone: its number, or why there
-    /// is none. The first VM on a port gives it its inbox's room, taken here
-    /// with no spin lock held.
-    pub fn claim(&self, vm: &Arc<Shared>, network: Option<&str>) -> Result<usize, &'static str> {
+    /// A free port for `vm` -- a VM, or a probe -- on `network` or alone,
+    /// judged by the firewall in place `place` (`install`): its number, or
+    /// why there is none. The first owner of a port gives it its inbox's
+    /// room and its table of flows, taken here with no spin lock held.
+    pub fn claim<W: Wake + 'static>(&self, vm: &Arc<W>, network: Option<&str>, place: usize)
+        -> Result<usize, &'static str>
+    {
+        let vm: Arc<dyn Wake> = vm.clone();
+        self.placed(place)?;
         let mut networks = self.networks.lock();
         let at = find_network(&mut networks, network)?;
         for i in 0..self.ports.ports.len() {
-            if self.take(i, vm, group(at, i))? {
+            if self.take(i, &vm, group(at, i), place, None)? {
                 if let Some(n) = at.and_then(|n| networks.get_mut(n)) {
                     n.ports += 1;
                 }
@@ -1179,16 +2425,93 @@ impl Switch {
         Err("every port of the switch is taken")
     }
 
-    /// Port `port` for `vm`, and no other, on `network` or alone: what a VM
-    /// with its own address asks for (`port=`), the address and the MAC
-    /// being the port's. Why not, when it is taken or there is no such port.
-    pub fn claim_at(&self, port: usize, vm: &Arc<Shared>, network: Option<&str>) -> Result<usize, &'static str> {
+    /// A free port for `vm` -- a VM, or a probe -- on cluster network
+    /// `who.vni`, as `who` (`Identity`) -- its MAC its address's
+    /// (`vnet_mac`) -- judged by the firewall in place `place`: its number,
+    /// or why there is none. The network's first port here puts it behind
+    /// `hv0` for NAT, where it goes out and NAT is on. Refused: an address
+    /// another port here has; a network whose other ports here were given
+    /// another subnet; a subnet that meets another network's here.
+    pub fn claim_vnet<W: Wake + 'static>(&self, vm: &Arc<W>, who: &Identity, place: usize)
+        -> Result<usize, &'static str>
+    {
+        who.check()?;
+        let vm: Arc<dyn Wake> = vm.clone();
+        self.placed(place)?;
+        let mask = who.mask();
+        let mut vnets = self.vnets.lock();
+        if self.ports.port_by_ip(who.ip).is_some() {
+            return Err("another port of the switch has that address");
+        }
+        let at = match vnets.iter().position(|v| v.vni == who.vni) {
+            Some(at) => {
+                let v = &vnets[at];
+                if v.net != who.net || v.mask != mask || v.out != who.out {
+                    return Err("the network's other ports here were given another subnet");
+                }
+                at
+            }
+            None => {
+                if vnets.iter().any(|v| v.net & v.mask & mask == who.net & v.mask & mask) {
+                    return Err("another cluster network here has that subnet");
+                }
+                /* Room for a network a port, taken with the switch */
+                if vnets.len() == vnets.capacity() {
+                    return Err("as many cluster networks as there are ports are here");
+                }
+                vnets.push(VnetHere { vni: who.vni, net: who.net, mask, out: who.out, ports: 0, served: 0,
+                                      inside: None });
+                vnets.len() - 1
+            }
+        };
+        let mut got = self.behind_hv0(&mut vnets[at]).map(|_| None);
+        if got.is_ok() {
+            got = Err("every port of the switch is taken");
+            for i in 0..self.ports.ports.len() {
+                match self.take(i, &vm, VNET | who.vni, place, Some(who)) {
+                    Ok(true) => {
+                        got = Ok(Some(i));
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(why) => {
+                        got = Err(why);
+                        break;
+                    }
+                }
+            }
+        }
+        match got {
+            Ok(Some(i)) => {
+                vnets[at].ports += 1;
+                Ok(i)
+            }
+            Ok(None) | Err(_) => {
+                /* A network made for no port: gone, and from behind `hv0`,
+                 * with the lock down. */
+                let gone = (vnets[at].ports == 0 && vnets[at].served == 0).then(|| vnets.swap_remove(at));
+                drop(vnets);
+                drop(gone);
+                Err(got.err().unwrap_or("every port of the switch is taken"))
+            }
+        }
+    }
+
+    /// Port `port` for `vm`, and no other, on `network` or alone, judged by
+    /// the firewall in place `place`: what a VM with its own address asks
+    /// for (`port=`), the address and the MAC being the port's. Why not,
+    /// when it is taken or there is no such port.
+    pub fn claim_at<W: Wake + 'static>(&self, port: usize, vm: &Arc<W>, network: Option<&str>, place: usize)
+        -> Result<usize, &'static str>
+    {
         if port >= self.ports.ports.len() {
             return Err("there is no such port on the switch");
         }
+        let vm: Arc<dyn Wake> = vm.clone();
+        self.placed(place)?;
         let mut networks = self.networks.lock();
         let at = find_network(&mut networks, network)?;
-        if self.take(port, vm, group(at, port))? {
+        if self.take(port, &vm, group(at, port), place, None)? {
             if let Some(n) = at.and_then(|n| networks.get_mut(n)) {
                 n.ports += 1;
             }
@@ -1198,18 +2521,338 @@ impl Switch {
         }
     }
 
-    /// The network port `port` is on, by name: None for one alone, or free.
+    /// Whether place `place` holds a firewall: a port judged by an empty one
+    /// would let nothing through, and say nothing of why.
+    fn placed(&self, place: usize) -> Result<(), &'static str> {
+        match self.ports.firewalls.lock().get(place) {
+            Some(_) => Ok(()),
+            None => Err("no firewall is in that place of the switch's"),
+        }
+    }
+
+    /// Port `port` shut while its VM keeps it: nothing from it or to it goes
+    /// on from now (`Port::shut`) -- what hv does to a port vnet revoked.
+    /// What is in its inbox stays for its VM to take.
+    pub fn shut(&self, port: usize) {
+        if let Some(p) = self.ports.ports.get(port) {
+            let _inbox = p.inbox.lock();
+            p.shut.store(true, Ordering::Release);
+        }
+    }
+
+    /// Whether port `port` is shut (`shut`).
+    pub fn is_shut(&self, port: usize) -> bool {
+        self.ports.ports.get(port).is_some_and(|p| p.shut.load(Ordering::Acquire))
+    }
+
+    /// The public addresses this host serves from now on, `routes` -- for
+    /// the cluster's ports here and on other hosts, this host's node `me`:
+    /// each one to one in NAT to its port's address and MAC, its network
+    /// behind `hv0`; those no longer among them unmapped, a network with no
+    /// port and nothing served gone from behind `hv0`. What could not be
+    /// served, said: a network that does not go out, no way out, NAT's
+    /// refusal. Task context.
+    pub fn serve(&self, me: u64, routes: &[Route]) -> Vec<String> {
+        let mut said = Vec::new();
+        if !routes.is_empty() && self.nat.lock().is_none() {
+            if let Err(e) = self.way_out() {
+                said.push(alloc::format!("no way out to serve public addresses on: {:?}", e));
+                return said;
+            }
+        }
+        let mut served = self.served.lock();
+        let mut emptied = Vec::new();
+        {
+            let mut vnets = self.vnets.lock();
+            /* Those kept: the same mapping -- the port's host is the
+             * datapath's to know, and may change under it -- and those gone
+             * unmapped now, before another takes their address */
+            let mut i = 0;
+            while i < served.len() {
+                if let Some(r) = routes.iter().find(|r| same_mapping(r, &served[i].0)) {
+                    served[i].0.node = r.node;
+                    i += 1;
+                    continue;
+                }
+                let (r, one) = served.swap_remove(i);
+                drop(one);
+                if let Some(at) = vnets.iter().position(|v| v.vni == r.vni) {
+                    vnets[at].served = vnets[at].served.saturating_sub(1);
+                    if vnets[at].ports == 0 && vnets[at].served == 0 {
+                        emptied.push(vnets.swap_remove(at));
+                    }
+                }
+            }
+            for r in routes.iter() {
+                if served.iter().any(|(s, _)| same_mapping(s, r)) {
+                    continue;
+                }
+                if !r.out {
+                    said.push(alloc::format!("{} is on network {}, which does not go out: not served",
+                                             netwire::Ipv4(r.public), r.vni));
+                    continue;
+                }
+                if served.try_reserve(1).is_err() {
+                    said.push(String::from("out of memory for a public address"));
+                    break;
+                }
+                let mask = prefix_mask(r.prefix);
+                let at = match vnets.iter().position(|v| v.vni == r.vni) {
+                    Some(at) => at,
+                    None if vnets.len() < vnets.capacity() => {
+                        vnets.push(VnetHere { vni: r.vni, net: r.net, mask, out: r.out, ports: 0, served: 0,
+                                              inside: None });
+                        vnets.len() - 1
+                    }
+                    None => {
+                        said.push(String::from("as many cluster networks as there are ports are here"));
+                        continue;
+                    }
+                };
+                vnets[at].served += 1;
+                let mapped = self.behind_hv0(&mut vnets[at]).map_err(String::from).and_then(|_| {
+                    let nat = self.nat.lock();
+                    let n = nat.as_ref().ok_or_else(|| String::from("NAT is off"))?;
+                    n.map(r.public, r.inner, vnet_mac(r.inner), r.mtu).map_err(|e| String::from(e.name()))
+                });
+                match mapped {
+                    Ok(one) => served.push((*r, one)),
+                    Err(why) => {
+                        said.push(alloc::format!("{} not served: {}", netwire::Ipv4(r.public), why));
+                        vnets[at].served -= 1;
+                        if vnets[at].ports == 0 && vnets[at].served == 0 {
+                            emptied.push(vnets.swap_remove(at));
+                        }
+                    }
+                }
+            }
+        }
+        /* The datapath's view: the ports on other hosts served here, made
+         * here and swapped in, the old one freed with the lock down */
+        let mut view = Vec::new();
+        if view.try_reserve_exact(served.len()).is_ok() {
+            view.extend(served.iter().filter(|(r, _)| r.node != me).map(|(r, _)| (r.inner, r.vni, r.node)));
+            let old = core::mem::replace(&mut *self.ports.served.lock(), view);
+            drop(old);
+        }
+        drop(served);
+        drop(emptied);
+        said
+    }
+
+    /// The world's packets for ports elsewhere carried to the tunnel, the
+    /// other hosts' ports' packets for the world handed to `hv0`, and those
+    /// their share of its backlog kept out.
+    pub fn served_counts(&self) -> (u64, u64, u64) {
+        let p = &self.ports;
+        (p.served_in.load(Ordering::Relaxed), p.served_out.load(Ordering::Relaxed),
+         p.served_over_share.load(Ordering::Relaxed))
+    }
+
+    /// The public addresses served here: each address, its port's address
+    /// and its host's node.
+    pub fn served(&self) -> Vec<(u32, u32, u64)> {
+        self.served.lock().iter().map(|(r, _)| (r.public, r.inner, r.node)).collect()
+    }
+
+    /// Port `port`'s public address routed to host `node` -- another host
+    /// -- or, 0, to none or to this host's own NAT: where what its guest
+    /// sends the world goes, and whose of the world's packets for it are
+    /// let in (`from_tunnel_in`).
+    pub fn public_way(&self, port: usize, node: u64) {
+        if let Some(p) = self.ports.ports.get(port) {
+            p.gateway.store(node, Ordering::Release);
+        }
+    }
+
+    /// A packet of network `vni` for the world, out of the tunnel from host
+    /// `node`'s port whose public address this host serves: into `hv0` from
+    /// that port's MAC, as its own guests' are, for NAT to send out from the
+    /// public address -- within the other hosts' share of `hv0`. Not for
+    /// `hv0`'s own address, the host's networks, a group or the cluster's.
+    /// Whether it was such a packet. The receive soft IRQ's.
+    pub fn from_tunnel_out(&self, node: u64, vni: u32, packet: &[u8]) -> bool {
+        use netwire::{eth, ip, ETH_HDR_LEN, ETH_TYPE_IP, IP_HDR_LEN};
+        if packet.len() < IP_HDR_LEN || node == 0 {
+            return false;
+        }
+        let (src, dst) = (ip::src(packet), ip::dst(packet));
+        let ports = &self.ports;
+        if !ports.served.lock().iter().any(|&(inner, v, n)| inner == src && v == vni && n == node) {
+            return false;
+        }
+        if dst == HOST_IP || dst & MASK == SUBNET || to_group(dst) || ports.in_cluster(dst) {
+            return false;
+        }
+        let len = ETH_HDR_LEN + packet.len();
+        if len > FRAME {
+            return false;
+        }
+        let mut frame = [0u8; FRAME];
+        eth::write(&mut frame, &HOST_MAC, &vnet_mac(src), ETH_TYPE_IP);
+        frame[ETH_HDR_LEN..len].copy_from_slice(packet);
+        ports.to_host_served(&frame[..len]);
+        true
+    }
+
+    /// The world's packet for the port of network `vni` here at its
+    /// destination, out of the tunnel from host `node` -- the one that
+    /// port's public address is routed to: from an address outside every
+    /// network of the cluster and the host's, or from the network's gateway,
+    /// which NAT's refusals come from. Into its inbox as a frame from the
+    /// gateway's MAC, judged by its firewall, held to its owner and
+    /// address. Whether it was for such a port. The receive soft IRQ's.
+    pub fn from_tunnel_in(&self, node: u64, vni: u32, packet: &[u8]) -> bool {
+        use netwire::{eth, ip, ETH_HDR_LEN, ETH_TYPE_IP, IP_HDR_LEN};
+        if packet.len() < IP_HDR_LEN || vni == 0 || vni > VNI_MASK || node == 0 {
+            return false;
+        }
+        let (src, dst) = (ip::src(packet), ip::dst(packet));
+        let ports = &self.ports;
+        let group = VNET | vni;
+        let Some(q) = ports.port_by_ip(dst).filter(|&q| {
+            ports.group(q) == group && ports.ports[q].gateway.load(Ordering::Acquire) == node
+        }) else {
+            return false;
+        };
+        let from_gateway = src == ports.gateway_of(q);
+        if !from_gateway && (ports.in_cluster(src) || src & MASK == SUBNET || to_group(src)) {
+            return false;
+        }
+        let len = ETH_HDR_LEN + packet.len();
+        if len > FRAME {
+            return false;
+        }
+        let mut frame = [0u8; FRAME];
+        eth::write(&mut frame, &vnet_mac(dst), &HOST_MAC, ETH_TYPE_IP);
+        frame[ETH_HDR_LEN..len].copy_from_slice(packet);
+        if let Some(claim) = ports.judged(q, Dir::In, &frame[..len], false) {
+            ports.deliver(q, &frame[..len], For { group: Some(group), ip: Some(dst), claim: Some(claim) });
+        }
+        true
+    }
+
+    /// What carries a cluster network's packets to its ports on other hosts
+    /// from now on -- or nothing: the one before given back, to be let go of
+    /// with no lock held.
+    pub fn carrier(&self, c: Option<Arc<dyn Carrier>>) -> Option<Arc<dyn Carrier>> {
+        core::mem::replace(&mut *self.ports.carrier.lock(), c)
+    }
+
+    /// An IPv4 packet of cluster network `vni` out of the tunnel -- its
+    /// sender a port on another host, which the tunnel held to the table --
+    /// for the port here at its destination: into its inbox as a frame from
+    /// the sender's MAC, judged by its firewall, held to its owner and
+    /// address. Whether it was for a port here at all. The receive soft
+    /// IRQ's: nothing waits, nothing allocates.
+    pub fn from_tunnel(&self, vni: u32, packet: &[u8]) -> bool {
+        use netwire::{eth, ip, ETH_HDR_LEN, ETH_TYPE_IP, IP_HDR_LEN};
+        if packet.len() < IP_HDR_LEN || vni == 0 || vni > VNI_MASK {
+            return false;
+        }
+        let (from, to) = (ip::src(packet), ip::dst(packet));
+        let ports = &self.ports;
+        let group = VNET | vni;
+        let Some(q) = ports.port_by_ip(to).filter(|&q| ports.group(q) == group) else { return false };
+        let len = ETH_HDR_LEN + packet.len();
+        if len > FRAME {
+            return false;
+        }
+        let mut frame = [0u8; FRAME];
+        eth::write(&mut frame, &vnet_mac(to), &vnet_mac(from), ETH_TYPE_IP);
+        frame[ETH_HDR_LEN..len].copy_from_slice(packet);
+        if let Some(claim) = ports.judged(q, Dir::In, &frame[..len], false) {
+            ports.deliver(q, &frame[..len], For { group: Some(group), ip: Some(to), claim: Some(claim) });
+        }
+        true
+    }
+
+    /// The cluster network port `port` is on, by its number, if it is on
+    /// one.
+    pub fn vnet_of(&self, port: usize) -> Option<u32> {
+        let g = self.ports.group(port);
+        is_vnet(g).then_some(g & VNI_MASK)
+    }
+
+    /// Port `port`'s address: its VM's -- the one its cluster network gave
+    /// it, or the port's own on a host's -- and the port's own while free.
+    pub fn ip_of(&self, port: usize) -> u32 {
+        self.ports.ip_of(port)
+    }
+
+    /// Port `port`'s MAC: its address's on a cluster network, the port's own
+    /// on a host's.
+    pub fn mac_of(&self, port: usize) -> [u8; 6] {
+        self.ports.mac_of(port)
+    }
+
+    /// The cluster's networks, by vnet's table -- each its subnet's address
+    /// and prefix, the subnets apart: what a cluster network's guest is
+    /// kept from through its gateway. Taken whole, the old ones let go of
+    /// with the lock down; false out of memory, the old ones kept.
+    pub fn cluster_networks(&self, subnets: &[(u32, u8)]) -> bool {
+        let mut new = Vec::new();
+        if new.try_reserve_exact(subnets.len()).is_err() {
+            return false;
+        }
+        for &(net, prefix) in subnets {
+            let mask = prefix_mask(prefix);
+            new.push((net & mask, mask));
+        }
+        new.sort_unstable_by_key(|&(net, _)| net);
+        let old = core::mem::replace(&mut *self.ports.clusters.lock(), new);
+        drop(old);
+        true
+    }
+
+    /// What is woken as the switch puts an answer to `hv0` on its ring
+    /// (`hand_in`): the task that hands them in, or nobody. The one there
+    /// before is given back, to be let go of with no lock held.
+    pub fn on_answers(&self, wake: Option<Arc<dyn Wake>>) -> Option<Arc<dyn Wake>> {
+        core::mem::replace(&mut self.ports.answers.lock().wake, wake)
+    }
+
+    /// The switch's answers to `hv0` handed in, the ring emptied: how many
+    /// it took. Task context: a frame handed in may take the heap.
+    pub fn hand_in(&self) -> usize {
+        let mut taken = 0;
+        loop {
+            let frame = {
+                let mut answers = self.ports.answers.lock();
+                if answers.count == 0 {
+                    break;
+                }
+                let frame = answers.frames[answers.head];
+                answers.head = (answers.head + 1) % TO_HOST;
+                answers.count -= 1;
+                frame
+            };
+            if self.ports.vnic.receive(&frame) {
+                taken += 1;
+            } else {
+                self.ports.refused.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        taken
+    }
+
+    /// The network port `port` is on, by name: None for one alone, on a
+    /// cluster network, or free.
     pub fn network_of(&self, port: usize) -> Option<String> {
         let g = self.ports.group(port);
-        if g == 0 || g & ALONE != 0 {
+        if g == 0 || g & ALONE != 0 || is_vnet(g) {
             return None;
         }
         self.networks.lock().get(g as usize - 1).map(|n| n.name.clone())
     }
 
-    /// Port `i` for `vm`, of `group`, if it is free: whether it was, or that
-    /// its room could not be had.
-    fn take(&self, i: usize, vm: &Arc<Shared>, group: u32) -> Result<bool, &'static str> {
+    /// Port `i` for `vm`, of `group`, judged by the firewall in place
+    /// `place` -- as `who` on a cluster network, as the port's own on a
+    /// host's -- if it is free: whether it was, or that its room could not
+    /// be had.
+    fn take(&self, i: usize, vm: &Arc<dyn Wake>, group: u32, place: usize, who: Option<&Identity>)
+        -> Result<bool, &'static str>
+    {
         let Some(p) = self.ports.ports.get(i) else { return Ok(false) };
         let roomless = {
             let inbox = p.inbox.lock();
@@ -1218,6 +2861,7 @@ impl Switch {
             }
             inbox.frames.is_empty()
         };
+        let flowless = p.fw.lock().flows.is_none();
         let mut room = Vec::new();
         let mut sends = Vec::new();
         if roomless {
@@ -1231,6 +2875,11 @@ impl Switch {
                 sends.push(send);
             }
         }
+        let seed = flow_seed();
+        let mut flows = None;
+        if flowless {
+            flows = Some(Flows::new(FLOWS, seed).ok_or("out of memory for its port's firewall")?);
+        }
         let mut inbox = p.inbox.lock();
         /* Taken, or given its room, by another start meanwhile: the room
          * taken here goes after the lock, and the port is not this VM's. */
@@ -1242,6 +2891,8 @@ impl Switch {
             /* An Arc clone under the lock: a count going up, nothing
              * allocated. */
             inbox.owner = Some(vm.clone());
+            inbox.claim += 1;
+            let claim = inbox.claim;
             inbox.clear();
             p.waiting.store(0, Ordering::Release);
             p.dropped.store(0, Ordering::Relaxed);
@@ -1253,14 +2904,49 @@ impl Switch {
             p.takes_partial.store(false, Ordering::Release);
             p.takes_whole.store(false, Ordering::Release);
             p.isolated.store(0, Ordering::Relaxed);
+            p.denied_in.store(0, Ordering::Relaxed);
+            p.denied_out.store(0, Ordering::Relaxed);
+            p.evicted.store(0, Ordering::Relaxed);
+            p.misdirected.store(0, Ordering::Relaxed);
+            p.oversize.store(0, Ordering::Relaxed);
+            *p.too_big.lock() = TooBig::FULL;
+            /* Who the VM is, before the group that says it is there */
+            let (ip, net, mask, mtu, out) = match who {
+                Some(w) => (w.ip, w.net, w.mask(), u32::from(w.mtu), w.out),
+                None => (port_ip(i), 0, 0, 0, false),
+            };
+            p.ip.store(ip, Ordering::Relaxed);
+            p.net.store(net, Ordering::Relaxed);
+            p.mask.store(mask, Ordering::Relaxed);
+            p.mtu.store(mtu, Ordering::Relaxed);
+            p.out.store(out, Ordering::Relaxed);
+            p.shut.store(false, Ordering::Relaxed);
+            p.gateway.store(0, Ordering::Relaxed);
             p.group.store(group, Ordering::Release);
             *p.flood.lock() = Flood { tokens: FLOOD_BURST, at: kcore::time::boot_time_ns() };
             self.ports.in_use.fetch_add(1, Ordering::Relaxed);
+            drop(inbox);
+            /* Its firewall the new owner's, the inbox's lock down first --
+             * never one inside the other. A frame judged meanwhile by the
+             * old owner's flows carries the old claim, which its delivery
+             * is refused for (`deliver_rx`). */
+            let mut f = p.fw.lock();
+            match f.flows.as_mut() {
+                Some(had) => had.clear(seed),
+                None => f.flows = flows.take(),
+            }
+            f.owned = true;
+            f.claim = claim;
+            f.place = place;
+            f.refusals = Refusals::FULL;
+            drop(f);
+            drop(flows);
             return Ok(true);
         }
         drop(inbox);
         drop(room);
         drop(sends);
+        drop(flows);
         Ok(false)
     }
 
@@ -1275,29 +2961,231 @@ impl Switch {
         /* Its IPv6 addresses go with its VM: the next to claim the port, or
          * any port, may have them. */
         self.ports.bindings.lock().release(port);
+        /* Its public address first, mapped to the port's address no longer:
+         * the next VM to claim the port has that address -- dropped with the
+         * list's lock down. */
+        let public = {
+            let mut ones = self.ones.lock();
+            ones.iter().position(|(p, _)| *p == port).map(|i| ones.swap_remove(i))
+        };
+        drop(public);
         /* The port's address goes with it to the next VM to claim it: what
          * NAT has mapped for this one's flows goes now, or the next would be
          * answered for them -- a TCP connection's sequence numbers too. */
         if let Some(n) = self.nat.lock().as_ref() {
-            n.forget(port_ip(port));
+            n.forget(self.ports.ip_of(port));
         }
+        p.gateway.store(0, Ordering::Relaxed);
         let (owner, group) = {
             let mut inbox = p.inbox.lock();
             inbox.clear();
             p.waiting.store(0, Ordering::Release);
-            (inbox.owner.take(), p.group.swap(0, Ordering::AcqRel))
+            let group = p.group.swap(0, Ordering::AcqRel);
+            p.ip.store(port_ip(port), Ordering::Relaxed);
+            (inbox.owner.take(), group)
         };
+        /* Nothing through a free port's firewall; its flows are emptied for
+         * the next claim, which keys them anew. */
+        p.fw.lock().owned = false;
         if owner.is_some() {
             self.ports.in_use.fetch_sub(1, Ordering::Relaxed);
         }
         drop(owner);
         /* One port fewer on its network, whose name is the next's once it
-         * has none. */
-        if group != 0 && group & ALONE == 0 {
+         * has none -- and a cluster network with none here gone from behind
+         * `hv0`, with the lock down. */
+        if is_vnet(group) {
+            let mut vnets = self.vnets.lock();
+            let gone = match vnets.iter_mut().position(|v| v.vni == group & VNI_MASK) {
+                Some(at) => {
+                    vnets[at].ports = vnets[at].ports.saturating_sub(1);
+                    (vnets[at].ports == 0 && vnets[at].served == 0).then(|| vnets.swap_remove(at))
+                }
+                None => None,
+            };
+            drop(vnets);
+            drop(gone);
+        } else if group != 0 && group & ALONE == 0 {
             if let Some(n) = self.networks.lock().get_mut(group as usize - 1) {
                 n.ports = n.ports.saturating_sub(1);
             }
         }
+    }
+
+    /// The firewall in place `place` made `rules`, its counts begun again:
+    /// what every port judged by it is judged by from the next frame on --
+    /// and their flows judged again by it, those it no longer lets through
+    /// let go (`recheck`): how many went. Copied in under the lock, which
+    /// allocates nothing. Task context.
+    pub fn install(&self, place: usize, rules: &Rules) -> Result<usize, &'static str> {
+        let roomless = {
+            let firewalls = self.ports.firewalls.lock();
+            firewalls.places.get(place).ok_or("there is no such place for a firewall")?.is_none()
+        };
+        let mut room = None;
+        if roomless {
+            room = Some(firewall_room().ok_or("out of memory for a firewall")?);
+        }
+        {
+            let mut firewalls = self.ports.firewalls.lock();
+            let at = firewalls.places.get_mut(place).ok_or("there is no such place for a firewall")?;
+            if at.is_none() {
+                *at = room.take();
+            }
+            let f = at.as_mut().and_then(|b| b.first_mut()).ok_or("out of memory for a firewall")?;
+            f.used = true;
+            f.rules.copy_from(rules);
+            f.hits = Hits::NONE;
+        }
+        /* Room taken for a place another install gave room meanwhile: freed
+         * here, the lock down. */
+        drop(room);
+        Ok(self.recheck(place))
+    }
+
+    /// Place `place` emptied, if no port is judged by it: whether it was.
+    pub fn uninstall(&self, place: usize) -> bool {
+        if self.in_use(place) {
+            return false;
+        }
+        let mut firewalls = self.ports.firewalls.lock();
+        match firewalls.places.get_mut(place).and_then(|at| at.as_mut()).and_then(|b| b.first_mut()) {
+            Some(f) => {
+                f.used = false;
+                f.hits = Hits::NONE;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether a VM's port is judged by the firewall in place `place`.
+    pub fn in_use(&self, place: usize) -> bool {
+        self.ports.ports.iter().any(|p| {
+            let f = p.fw.lock();
+            f.owned && f.place == place
+        })
+    }
+
+    /// The ports judged by the firewall in place `place`.
+    pub fn ports_on(&self, place: usize) -> Vec<usize> {
+        let mut on = Vec::new();
+        if on.try_reserve_exact(MAX_PORTS).is_ok() {
+            for (i, p) in self.ports.ports.iter().enumerate() {
+                let f = p.fw.lock();
+                if f.owned && f.place == place {
+                    on.push(i);
+                }
+            }
+        }
+        on
+    }
+
+    /// What the firewall in place `place` has judged since its rules were
+    /// set (`Hits`).
+    pub fn hits(&self, place: usize) -> Option<Hits> {
+        self.ports.firewalls.lock().get(place).map(|f| f.hits)
+    }
+
+    /// Whether port `port`'s firewall lets in a connection of TCP to its
+    /// port `service` from `peer`: what `hv forward` asks of each client it
+    /// accepts, its relay reaching the VM as the host, whom the firewall
+    /// does not judge. By the rules: the relay's own connection is the flow,
+    /// and counted with them.
+    pub fn lets_in(&self, port: usize, service: u16, peer: u32) -> bool {
+        let Some(p) = self.ports.ports.get(port) else { return false };
+        let f = p.fw.lock();
+        if !f.owned {
+            return false;
+        }
+        let first = fw::First {
+            dir: Dir::In, proto: netwire::IP_PROTO_TCP, port: Some(service), peer,
+            same_net: self.ports.same_net(port, peer),
+        };
+        let mut firewalls = self.ports.firewalls.lock();
+        let Some(fwl) = firewalls.get_mut(f.place) else { return false };
+        let judged = fwl.rules.judge(&first);
+        fwl.hits.count(Dir::In, match judged.by {
+            fw::By::Rule(i) => Why::Rule(i),
+            fw::By::Policy => Why::Policy,
+        });
+        let at = f.place;
+        drop(firewalls);
+        drop(f);
+        let allowed = judged.action == fw::Action::Allow;
+        if !allowed {
+            p.denied_in.fetch_add(1, Ordering::Relaxed);
+            if trace::on::<FwDeny>() {
+                let (why, rule) = match judged.by {
+                    fw::By::Rule(i) => (FwWhy::Rule, i.saturating_add(1)),
+                    fw::By::Policy => (FwWhy::Policy, 0),
+                };
+                /* The client's own port is the relay's to know, not the
+                 * switch's: 0. */
+                denied_record(port, at, Dir::In, why, rule, peer, Some((service, 0)), netwire::IP_PROTO_TCP);
+            }
+        }
+        allowed
+    }
+
+    /// Whether port `port`'s firewall may let in a connection of TCP to its
+    /// port `service` from some address off its network
+    /// (`Rules::may_let_in`): what `hv forward` says a forward is for
+    /// nothing by.
+    pub fn may_let_in(&self, port: usize, service: u16) -> bool {
+        let Some(p) = self.ports.ports.get(port) else { return false };
+        let f = p.fw.lock();
+        f.owned && self.ports.firewalls.lock().get(f.place)
+            .is_some_and(|fwl| fwl.rules.may_let_in(netwire::IP_PROTO_TCP, service))
+    }
+
+    /// Port `port`'s VM judged by the firewall in place `place` from now
+    /// on, its open flows judged again by it -- those it does not let
+    /// through let go: how many went, or why not.
+    pub fn assign(&self, port: usize, place: usize) -> Result<usize, &'static str> {
+        self.placed(place)?;
+        let p = self.ports.ports.get(port).ok_or("there is no such port on the switch")?;
+        let was = {
+            let mut f = p.fw.lock();
+            if !f.owned {
+                return Err("no VM has that port of the switch");
+            }
+            core::mem::replace(&mut f.place, place)
+        };
+        Ok(if was == place { 0 } else { self.recheck_port(port, place) })
+    }
+
+    /// The flows of every port judged by the firewall in place `place`
+    /// judged again by its rules (`recheck_port`): how many went.
+    fn recheck(&self, place: usize) -> usize {
+        (0..self.ports.ports.len()).map(|q| self.recheck_port(q, place)).sum()
+    }
+
+    /// Port `q`'s flows, if it is judged by the firewall in place `place`,
+    /// judged again by its rules -- a part of its table at a time, its lock
+    /// let go between -- and those they no longer let through let go: how
+    /// many.
+    fn recheck_port(&self, q: usize, place: usize) -> usize {
+        const PART: usize = 256;
+        let Some(p) = self.ports.ports.get(q) else { return 0 };
+        let mut gone = 0;
+        let mut from = 0;
+        loop {
+            let mut guard = p.fw.lock();
+            let PortFw { owned, place: at, flows, .. } = &mut *guard;
+            let Some(flows) = flows.as_mut().filter(|f| *owned && *at == place && from < f.capacity()) else {
+                break;
+            };
+            let firewalls = self.ports.firewalls.lock();
+            let Some(f) = firewalls.get(place) else { break };
+            let ports = &self.ports;
+            let (next, went) = flows.sweep(from, PART, kcore::time::boot_time_ns(), &mut |key, initiated| {
+                fw::still_allowed(&f.rules, key, initiated, ports.same_net(q, key.peer))
+            });
+            gone += went;
+            from = next;
+        }
+        gone
     }
 
     /// The backend a guest's NIC on `port` is built with.
@@ -1318,6 +3206,12 @@ impl Switch {
             over_share: p.over_share.load(Ordering::Relaxed),
             flooded: p.flooded.load(Ordering::Relaxed),
             isolated: p.isolated.load(Ordering::Relaxed),
+            misdirected: p.misdirected.load(Ordering::Relaxed),
+            oversize: p.oversize.load(Ordering::Relaxed),
+            denied_in: p.denied_in.load(Ordering::Relaxed),
+            denied_out: p.denied_out.load(Ordering::Relaxed),
+            evicted: p.evicted.load(Ordering::Relaxed),
+            flows: p.fw.lock().flows.as_ref().map_or(0, |f| f.len()),
         })
     }
 
@@ -1331,5 +3225,11 @@ impl Switch {
     /// The router solicitations answered, and the IPv6 addresses bound.
     pub fn ipv6_counts(&self) -> (u64, usize) {
         (self.ports.advertised.load(Ordering::Relaxed), self.ports.bindings.lock().count())
+    }
+
+    /// The ARP requests answered for the cluster networks' guests and for
+    /// `hv0`, and the echoes answered from a cluster network's gateway.
+    pub fn vnet_counts(&self) -> (u64, u64) {
+        (self.ports.arps.load(Ordering::Relaxed), self.ports.echoes.load(Ordering::Relaxed))
     }
 }

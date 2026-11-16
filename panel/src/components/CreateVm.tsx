@@ -13,6 +13,13 @@ const GIB = 1024 ** 3;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
 /** What `onto` names a volume of NBS's by. */
 const NBS = 'nbs:';
+/** The firewall a VM that names none is judged by (hv's `firewalls::DEFAULT`). */
+const DEFAULT_FIREWALL = 'default';
+/** What a network of the cluster's is called on a VM's `network` (hv's
+ * `config::CLUSTER_PREFIX`): its port, address and firewall vnet's. */
+const CLUSTER = 'vnet:';
+/** An IPv4 address as a person writes it. */
+const IPV4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
 
 /** A device of the host's a VM's disk may be (the vm provider's `devices`):
  * the image poured onto it in place of a file. `refused` says why it is not
@@ -45,6 +52,19 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
   const [volumes, setVolumes] = useState<Volume[] | null>(null);
   const [onto, setOnto] = useState('');
   const [force, setForce] = useState(false);
+  /* The host's firewalls (the fw provider's `list`): null where it has
+   * none to say, and the VM is judged by `default` */
+  const [firewalls, setFirewalls] = useState<string[] | null>(null);
+  const [firewall, setFirewall] = useState(DEFAULT_FIREWALL);
+  /* The networks it may be on (the vm provider's `networks`): the host's in
+   * use and the cluster's; '' alone. On one of the cluster's its firewall
+   * is one of the cluster's (vnet's `firewalls`). */
+  const [networks, setNetworks] = useState<string[]>([]);
+  const [network, setNetwork] = useState('');
+  const [clusterFirewalls, setClusterFirewalls] = useState<string[] | null>(null);
+  const cluster = network.startsWith(CLUSTER);
+  /* A public address of the world's routed to the host, mapped one to one */
+  const [publicIp, setPublicIp] = useState('');
   const [error, setError] = useState('');
   const [job, setJob] = useState<number | null>(null);
 
@@ -55,6 +75,22 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
     });
     call(host, 'nbs', 'volumes').then((r) => {
       if (live && r.ok) setVolumes((r.data as { volumes?: Volume[] }).volumes ?? []);
+    });
+    call(host, 'fw', 'list').then((r) => {
+      if (!live || !r.ok) return;
+      const names = ((r.data as { firewalls?: Array<{ name?: unknown }> }).firewalls ?? [])
+        .map((f) => f.name).filter((n): n is string => typeof n === 'string');
+      setFirewalls(names.includes(DEFAULT_FIREWALL) ? names : [DEFAULT_FIREWALL, ...names]);
+    });
+    call(host, 'vm', 'networks').then((r) => {
+      if (!live || !r.ok) return;
+      setNetworks(((r.data as { networks?: Array<{ name?: unknown }> }).networks ?? [])
+        .map((n) => n.name).filter((n): n is string => typeof n === 'string'));
+    });
+    call(host, 'vnet', 'firewalls').then((r) => {
+      if (!live || !r.ok) return;
+      setClusterFirewalls(((r.data as { firewalls?: Array<{ name?: unknown }> }).firewalls ?? [])
+        .map((f) => f.name).filter((n): n is string => typeof n === 'string'));
     });
     return () => { live = false; };
   }, [host]);
@@ -107,6 +143,15 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
       }
     }
     if (password) params.password = password;
+    if (network) params.network = network;
+    if (cluster ? clusterFirewalls !== null : firewalls !== null) params.firewall = firewall;
+    if (publicIp && !cluster) {
+      if (!IPV4.test(publicIp)) {
+        setError(ru ? 'Публичный адрес: a.b.c.d.' : 'A public address: a.b.c.d.');
+        return;
+      }
+      params.public = publicIp;
+    }
     setError('');
     const r = await startJob(host, 'vm', 'create', params);
     if (r.ok) setJob(r.id);
@@ -238,6 +283,41 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
           </span>
           <input value={password} onChange={(e) => setPassword(e.target.value)} type="password" name="password" className={input} />
         </label>
+        {networks.length > 0 && (
+          <label className="block text-sm text-fg-soft">{ru ? 'Сеть' : 'Network'}
+            <span className="block text-xs text-muted">
+              {ru ? 'Сеть хоста, общая для её машин, или сеть кластера (vnet:): порт, адрес и фаервол машины тогда держит vnet.'
+                : "A host's network its VMs share, or one of the cluster's (vnet:): its port, address and firewall vnet's."}
+            </span>
+            <select value={network} name="network" className={input} onChange={(e) => {
+              setNetwork(e.target.value);
+              setFirewall(DEFAULT_FIREWALL);
+            }}>
+              <option value="">{ru ? '— одна, без сети' : '— alone, on no network'}</option>
+              {networks.map((n) => <option key={n} value={n}>{n}</option>)}
+            </select>
+          </label>
+        )}
+        {(cluster ? clusterFirewalls : firewalls) !== null && (
+          <label className="block text-sm text-fg-soft">{ru ? 'Фаервол' : 'Firewall'}
+            <span className="block text-xs text-muted">
+              {ru ? 'Чем судится её сеть. default: входящее закрыто, исходящее открыто; порт открывает правило.'
+                : "What its network is judged by. default: what comes in denied, what goes out allowed; a rule opens a port."}
+              {cluster && (ru ? ' Фаервол кластера.' : " One of the cluster's.")}
+            </span>
+            <select value={firewall} onChange={(e) => setFirewall(e.target.value)} name="firewall" className={input}>
+              {((cluster ? clusterFirewalls : firewalls) ?? []).map((n) => <option key={n} value={n}>{n}</option>)}
+            </select>
+          </label>
+        )}
+        {!cluster && <label className="block text-sm text-fg-soft">{ru ? 'Публичный адрес (необязательно)' : 'Public address (optional)'}
+          <span className="block text-xs text-muted">
+            {ru ? 'Адрес, направленный на этот хост (арендованный): машина отвечает по нему один к одному, на портах, которые открывает её фаервол.'
+              : 'An address routed to this host -- a rented one: the VM is reached at it one to one, at the ports its firewall opens.'}
+          </span>
+          <input value={publicIp} onChange={(e) => setPublicIp(e.target.value.trim())} name="public" inputMode="decimal"
+            placeholder="203.0.113.9" className={input + ' font-mono text-xs'} />
+        </label>}
         {error && <p role="alert" className="text-sm text-bad">{error}</p>}
         <button type="submit" disabled={job !== null || (source === 'image' && !picked)}
           className="rounded-lg bg-accent px-3 py-2 text-sm font-medium text-bg hover:bg-accent-strong disabled:opacity-60">

@@ -16,7 +16,9 @@
 //! registering new ones.
 //!
 //!     insmod /hv.ko    -- vms=<folder>: where the VMs' folders are, /vms if not;
-//!                         stop_secs=N: what rmmod gives the guests (120 s)
+//!                         stop_secs=N: what rmmod gives the guests (120 s);
+//!                         rekey=S, keylife=S: the tunnel's keys given anew
+//!                         every S seconds (3600), the one before kept S (120)
 //!     hv info          -- what this machine has
 //!     hv on            -- turn the extension on
 //!     hv run all       -- run the built-in guests, each in a VM of its own
@@ -52,6 +54,10 @@ mod dhcp;
 #[cfg(target_arch = "x86_64")]
 mod disk;
 #[cfg(target_arch = "x86_64")]
+mod firewalls;
+#[cfg(target_arch = "x86_64")]
+mod fw_provider;
+#[cfg(target_arch = "x86_64")]
 mod guest;
 #[cfg(target_arch = "x86_64")]
 mod forward;
@@ -60,6 +66,8 @@ mod image;
 mod nbs;
 #[cfg(target_arch = "x86_64")]
 mod net;
+#[cfg(target_arch = "x86_64")]
+mod probe;
 #[cfg(target_arch = "x86_64")]
 mod provider;
 #[cfg(target_arch = "x86_64")]
@@ -70,6 +78,10 @@ mod store;
 mod vmlog;
 #[cfg(target_arch = "x86_64")]
 mod vms;
+#[cfg(target_arch = "x86_64")]
+mod tunnel;
+#[cfg(target_arch = "x86_64")]
+mod vnet;
 mod work;
 
 use alloc::boxed::Box;
@@ -108,12 +120,13 @@ hv boot <kernel> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noa
                                    cpus gives it N CPUs, each on a host CPU of its own, the
                                    first on cpu. The kernel is a bzImage, or a PVH ELF:
                                    /lib/hvboot boots the one its disk's grub.cfg names
-hv start <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [input=...] [log] [restart] [force] [uuid=U] [net] [network=name] [port=N] [forward=nos:guest]... [cmdline=...]
+hv start <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [input=...] [log] [restart] [force] [uuid=U] [net] [network=name] [firewall=name] [port=N] [forward=nos:guest]... [cmdline=...]
                                    a Linux guest that runs until hv stop; restart boots it
                                    again when it resets itself or panics; uuid= what its
                                    SMBIOS says it is; network= the guests it reaches on the
-                                   switch, none without; port= its own port of the switch,
-                                   forward= nos's ports relayed to its own
+                                   switch, none without; firewall= the firewall its NIC is
+                                   judged by, default without (hv fw); port= its own port of
+                                   the switch, forward= nos's ports relayed to its own
 hv start <name|folder>             the vm in the vms' folder of that name, or in that
                                    folder, as its vm.toml says: its console to console.log
                                    there. The vms' folder is /vms, or what insmod hv.ko
@@ -172,7 +185,18 @@ hv stop <vm|all> [secs=N]          press its power button and give it secs (30) 
                                    given what insmod hv.ko was as stop_secs=N (120)
 hv forward [add <port> <vm> <guest-port> | del <port>]
                                    a port of nos's relayed to a guest's (net guests) -- and
-                                   kept in, or taken out of, a vm's vm.toml when it has one
+                                   kept in, or taken out of, a vm's vm.toml when it has one;
+                                   each client held to the guest's firewall by its address
+hv fw [<name> [add <rule> | del N | move N M | policy ...] | create | delete | set <vm> <name>]
+                                   the guests' firewalls: what comes in denied unless a rule
+                                   lets it, what goes out allowed unless one denies it -- hv
+                                   fw help for the whole of it
+hv probe [add <name> [port=N] [network=..] [firewall=..] | ping <name> <ip> | udp <name> <ip> <port> | del <name>]
+                                   a port of the switch with no VM: it answers ARP, echo and
+                                   UDP 7, and pings and sends from it as a guest's NIC does,
+                                   its firewall on the way -- hv probe help for the whole of it
+hv tunnel                          the cluster networks' tunnel to the other hosts: each
+                                   one's address, its keys and echoes, and what was counted
 hv convert <image> <disk>          a qcow2 image -- a cloud's, as QEMU writes them -- made
                                    the raw disk a guest is given: a new file, its holes
                                    kept, and removed again if the conversion fails
@@ -189,6 +213,9 @@ struct State {
     cores: cores::Cores,
     #[cfg(target_arch = "x86_64")]
     forwards: forward::Forwards,
+    /// Ports of the switch with no VM behind them (`hv probe`).
+    #[cfg(target_arch = "x86_64")]
+    probes: probe::Probes,
     /// Where the VMs' folders are: `vms=` of `insmod`'s, or `/vms`.
     #[cfg(target_arch = "x86_64")]
     vms_root: String,
@@ -209,6 +236,9 @@ struct Hv {
     /// use goes.
     #[cfg(target_arch = "x86_64")]
     provider: Option<kcore::mgmt::Provider>,
+    /// The `fw` provider, the host's firewalls: unregistered with it.
+    #[cfg(target_arch = "x86_64")]
+    fw_provider: Option<kcore::mgmt::Provider>,
     /// In an `Option` so that it is unregistered before the machine is let
     /// go of, and not in whatever order the fields happen to be in. No call
     /// of it is running by then: the loader waits those out before the drop.
@@ -235,11 +265,15 @@ impl Hv {
         self.state.unloading.store(true, core::sync::atomic::Ordering::Release);
         #[cfg(target_arch = "x86_64")]
         {
-            /* The provider before them: its jobs -- a start, a clone, a
-             * create -- stop where they are, and its unregister waits for
-             * them, so none starts a guest or a forward behind the close. */
+            /* The providers before them: the vm provider's jobs -- a start,
+             * a clone, a create -- stop where they are, and its unregister
+             * waits for them, so none starts a guest or a forward behind the
+             * close; the fw provider's calls change what the switch judges
+             * the guests by. */
+            drop(self.fw_provider.take());
             drop(self.provider.take());
             self.state.forwards.close();
+            self.state.probes.close();
             self.state.vms.close(self.state.stop_secs);
         }
     }
@@ -287,6 +321,10 @@ impl Drop for Hv {
 struct Params {
     vms_root: String,
     stop_secs: u64,
+    /// The tunnel's keys given anew every this many seconds, and the one
+    /// before kept to open by for this many (`rekey=`, `keylife=`).
+    rekey_s: u64,
+    keylife_s: u64,
 }
 
 /// `insmod /hv.ko [vms=<folder>] [stop_secs=N]`: where the VMs' folders are
@@ -296,8 +334,20 @@ struct Params {
 fn params(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Params> {
     let mut root = None;
     let mut stop_secs = None;
+    let mut rekey_s = None;
+    let mut keylife_s = None;
     for (key, value) in params.words() {
         match (key, value) {
+            ("rekey" | "keylife", Some(v)) => {
+                let slot = if key == "rekey" { &mut rekey_s } else { &mut keylife_s };
+                match v.parse::<u64>() {
+                    Ok(secs) if slot.is_none() && (1..=MAX_KEY_S).contains(&secs) => *slot = Some(secs),
+                    _ => {
+                        let _ = writeln!(out, "hv: {}= takes a number of seconds 1..{}, given once", key, MAX_KEY_S);
+                        return Err(kcore::error::Error::InvalidValue);
+                    }
+                }
+            }
             ("vms", Some(path)) if root.is_none() => match store::root(path) {
                 Ok(r) => root = Some(r),
                 Err(e) => {
@@ -321,8 +371,8 @@ fn params(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Param
                 return Err(kcore::error::Error::InvalidValue);
             }
             _ => {
-                let _ = writeln!(out, "hv: \"{}\" is not a parameter of hv's -- vms=<folder> and stop_secs=N are",
-                                 key);
+                let _ = writeln!(out, "hv: \"{}\" is not a parameter of hv's -- vms=<folder>, stop_secs=N, rekey=S \
+                                       and keylife=S are", key);
                 return Err(kcore::error::Error::InvalidValue);
             }
         }
@@ -330,8 +380,14 @@ fn params(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Param
     Ok(Params {
         vms_root: root.unwrap_or_else(|| String::from(store::DEFAULT_ROOT)),
         stop_secs: stop_secs.unwrap_or(vms::UNLOAD_STOP_DEFAULT_S),
+        rekey_s: rekey_s.unwrap_or(tunnel::REKEY_S_DEFAULT),
+        keylife_s: keylife_s.unwrap_or(tunnel::KEYLIFE_S_DEFAULT),
     })
 }
+
+/// The longest a tunnel's key is given for, or kept: a day.
+#[cfg(target_arch = "x86_64")]
+const MAX_KEY_S: u64 = 86_400;
 
 /// No Linux guest runs here yet, so there is nothing for a parameter to say:
 /// one given is refused rather than kept and never used.
@@ -347,7 +403,7 @@ fn params(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<()> {
 
 fn init(given: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn kmod::Module>> {
     #[cfg(target_arch = "x86_64")]
-    let Params { vms_root, stop_secs } = params(given, out)?;
+    let Params { vms_root, stop_secs, rekey_s, keylife_s } = params(given, out)?;
     #[cfg(not(target_arch = "x86_64"))]
     params(given, out)?;
 
@@ -358,11 +414,13 @@ fn init(given: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn 
     let state = Arc::new(State {
         machine: machine.clone(),
         #[cfg(target_arch = "x86_64")]
-        vms: vms::Vms::new().ok_or(kcore::error::Error::NoMemory)?,
+        vms: vms::Vms::new(rekey_s, keylife_s).ok_or(kcore::error::Error::NoMemory)?,
         #[cfg(target_arch = "x86_64")]
         cores: cores::Cores::new().ok_or(kcore::error::Error::NoMemory)?,
         #[cfg(target_arch = "x86_64")]
         forwards: forward::Forwards::new().ok_or(kcore::error::Error::NoMemory)?,
+        #[cfg(target_arch = "x86_64")]
+        probes: probe::Probes::new().ok_or(kcore::error::Error::NoMemory)?,
         #[cfg(target_arch = "x86_64")]
         vms_root,
         #[cfg(target_arch = "x86_64")]
@@ -379,6 +437,14 @@ fn init(given: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn 
         Ok(p) => Some(p),
         Err(status) => {
             kcore::klog!(0, "hv: the vm provider is not on the management bus -- {}", status.name());
+            None
+        }
+    };
+    #[cfg(target_arch = "x86_64")]
+    let fw_provider = match fw_provider::register(state.clone()) {
+        Ok(p) => Some(p),
+        Err(status) => {
+            kcore::klog!(0, "hv: the fw provider is not on the management bus -- {}", status.name());
             None
         }
     };
@@ -401,6 +467,8 @@ fn init(given: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn 
     Ok(Box::new(Hv {
         #[cfg(target_arch = "x86_64")]
         provider,
+        #[cfg(target_arch = "x86_64")]
+        fw_provider,
         cmd: Some(cmd),
         state,
     }))
@@ -507,9 +575,20 @@ fn command(state: &State, args: &str, out: &mut Output) {
         "stop" => state.vms.stop(rest, out, &state.forwards),
         #[cfg(target_arch = "x86_64")]
         "forward" => forward_command(state, rest, out),
+        #[cfg(target_arch = "x86_64")]
+        "fw" => state.vms.firewalls.command(&state.vms_root, &state.vms, rest, out),
+        #[cfg(target_arch = "x86_64")]
+        "probe" => state.probes.command(&state.vms, rest, out),
+        #[cfg(target_arch = "x86_64")]
+        "tunnel" => match state.vms.tunnel() {
+            Some(t) => t.report(out),
+            None => {
+                let _ = writeln!(out, "hv tunnel: no switch yet -- a VM or a probe with a NIC makes it");
+            }
+        },
         #[cfg(not(target_arch = "x86_64"))]
         "boot" | "start" | "create" | "image" | "clone" | "delete" | "vms" | "list" | "console" | "attach" | "send"
-        | "exec" | "wait" | "restart" | "stop" | "forward" | "bench" | "cores" => {
+        | "exec" | "wait" | "restart" | "stop" | "forward" | "bench" | "cores" | "fw" | "probe" | "tunnel" => {
             let _ = writeln!(out, "hv: no Linux guest on this architecture yet");
         }
         other => {
@@ -556,15 +635,17 @@ fn forward_command(state: &State, args: &str, out: &mut Output) {
                 let _ = writeln!(out, "hv: ports are 1..65535");
                 return;
             }
-            let Some(ip) = state.vms.address_of(vm) else {
+            let Some(vm_port) = state.vms.port_of(vm) else {
                 let _ = writeln!(out, "hv: vm {} is not a running guest with a NIC (hv start ... net)", vm);
                 return;
             };
-            let Some(host) = state.vms.host_nic() else {
+            let (Some(host), Some(switch)) = (state.vms.host_nic(), state.vms.switch_now()) else {
                 let _ = writeln!(out, "hv: the guests' switch is not up");
                 return;
             };
-            let to = forward::To { guest_ip: ip, guest_port, host, outer: state.vms.outer_nic() };
+            let to = forward::To {
+                guest_ip: switch.ip_of(vm_port), guest_port, host, outer: state.vms.outer_nic(), switch, port: vm_port,
+            };
             match state.forwards.add(port, vm, to, &|| state.vms.on_list(vm), out) {
                 Ok(()) => keep_forward(state, vm, port, Some(guest_port), out),
                 Err(e) => {

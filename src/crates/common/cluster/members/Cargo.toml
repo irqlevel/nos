@@ -1,0 +1,14 @@
+[package]
+name = "members"
+version = "0.1.0"
+edition = "2021"
+
+# A group's members, as a group whose hosts are offered it keeps them --
+# NBS's metadata (plans/nbs.md) and vnet's state (plans/vnet.md): the group,
+# its members by incarnation, those removed, and who votes. No kernel in it
+# and no unsafe: nbsmeta embeds it, the registry votes by its rule, and
+# tests/fuzz/raft holds it through both.
+[lib]
+
+[dependencies]
+ipcwire = { path = "../../ipc/ipcwire" }

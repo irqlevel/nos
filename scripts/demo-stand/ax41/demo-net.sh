@@ -2,13 +2,17 @@
 # The panel demo's network on the AX41: the bridge nosbr0, 10.77.0.1/24, two
 # nos VMs' taps on it, out through the AX41's address. The EX44 -- and
 # nothing else from outside -- let in to each VM's ipcnet port, the same
-# port inside (39241 -> ax41a, 39242 -> ax41b), and to each one's API
-# (39251 -> ax41a:39234, 39252 -> ax41b:39234), the panel on the EX44
-# reaching them so; and to the panel's bundle served here (39299). The VMs
-# reach each other's ipcnet at the AX41's address, as the registry has them,
-# their source made the AX41's address. Every rule carries the comment
-# nos-demo; `down` takes off exactly those, then the taps and the bridge.
-# usage: demo-net.sh up|down|show
+# port inside (39241 -> ax41a, 39242 -> ax41b), TCP, and to its vnet
+# tunnel's, the same number in UDP (docs/vnet.md: a host's tunnel is at its
+# registry address's port); to each one's API (39251 -> ax41a:39234,
+# 39252 -> ax41b:39234), the panel on the EX44 reaching them so; and to the
+# panel's bundle served here (39299). The VMs reach each other's ipcnet and
+# tunnel at the AX41's address, as the registry has them, their source made
+# the AX41's address. Every rule carries the comment nos-demo; `down` takes
+# off exactly those, then the taps and the bridge. `tunnel` adds the
+# tunnel's rules alone, where they are not there yet: a network brought up
+# before they were.
+# usage: demo-net.sh up|down|show|tunnel
 set -u
 PUB=65.109.93.213
 EX44=65.108.38.184
@@ -28,6 +32,25 @@ show() {
     for t in "${TAPS[@]}"; do ip -br link show $t 2>/dev/null; done
     iptables -S | grep -- "$TAG"
     iptables -t nat -S | grep -- "$TAG"
+}
+
+# vnet's tunnel, UDP at each neighbour's ipcnet port: from the EX44, and
+# from the other neighbour by the AX41's address -- each rule added where it
+# is not there already.
+tunnel() {
+    local i a p
+    for i in 0 1; do
+        a=${ADDRS[$i]}
+        p=${IPC[$i]}
+        iptables -t nat -C PREROUTING -i $UP -s $EX44 -d $PUB -p udp --dport $p "${C[@]}" \
+            -j DNAT --to-destination $a:$p 2> /dev/null ||
+            iptables -t nat -I PREROUTING 1 -i $UP -s $EX44 -d $PUB -p udp --dport $p "${C[@]}" \
+                -j DNAT --to-destination $a:$p || return 1
+        iptables -t nat -C PREROUTING -i $BR -s $NET -d $PUB -p udp --dport $p "${C[@]}" \
+            -j DNAT --to-destination $a:$p 2> /dev/null ||
+            iptables -t nat -I PREROUTING 1 -i $BR -s $NET -d $PUB -p udp --dport $p "${C[@]}" \
+                -j DNAT --to-destination $a:$p || return 1
+    done
 }
 
 up() {
@@ -58,6 +81,7 @@ up() {
         iptables -t nat -I PREROUTING 1 -i $UP -s $EX44 -d $PUB -p tcp --dport $q "${C[@]}" \
             -j DNAT --to-destination $a:39234 || return 1
     done
+    tunnel || return 1
     iptables -t nat -I POSTROUTING 1 -o $BR -s $NET -d $NET -m conntrack --ctstate DNAT "${C[@]}" \
         -j SNAT --to-source $PUB || return 1
     # The panel's bundle: the EX44 alone
@@ -83,5 +107,6 @@ case "${1:-}" in
     up) up ;;
     down) down ;;
     show) show ;;
-    *) echo "usage: $0 up|down|show"; exit 2 ;;
+    tunnel) tunnel && show ;;
+    *) echo "usage: $0 up|down|show|tunnel"; exit 2 ;;
 esac

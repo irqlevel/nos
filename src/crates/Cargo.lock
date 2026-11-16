@@ -347,6 +347,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
 
 [[package]]
+name = "firewall"
+version = "0.1.0"
+dependencies = [
+ "netwire",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -577,6 +584,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "members"
+version = "0.1.0"
+dependencies = [
+ "ipcwire",
+]
+
+[[package]]
 name = "mgmt"
 version = "0.1.0"
 dependencies = [
@@ -656,8 +670,10 @@ dependencies = [
 name = "mod-hv"
 version = "0.1.0"
 dependencies = [
+ "codec",
  "conf",
  "diskimage",
+ "firewall",
  "hv",
  "kcore",
  "kmod",
@@ -665,6 +681,7 @@ dependencies = [
  "nbsdrive",
  "nbsmeta",
  "netwire",
+ "vnetwire",
 ]
 
 [[package]]
@@ -708,6 +725,7 @@ dependencies = [
  "codec",
  "kcore",
  "kmod",
+ "members",
  "mgmtwire",
  "nbsclient",
  "nbscs",
@@ -775,6 +793,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mod-vnet"
+version = "0.1.0"
+dependencies = [
+ "codec",
+ "crc",
+ "firewall",
+ "kcore",
+ "kmod",
+ "members",
+ "mgmtwire",
+ "netwire",
+ "raft",
+ "raftmember",
+ "vnetmeta",
+]
+
+[[package]]
 name = "nbsclient"
 version = "0.1.0"
 dependencies = [
@@ -808,8 +843,9 @@ version = "0.1.0"
 dependencies = [
  "codec",
  "ipcwire",
+ "members",
  "raft",
- "sha2",
+ "rsmkit",
 ]
 
 [[package]]
@@ -1068,8 +1104,10 @@ dependencies = [
 name = "raftmember"
 version = "0.1.0"
 dependencies = [
+ "codec",
  "ipcctl",
  "kcore",
+ "members",
  "raft",
 ]
 
@@ -1115,6 +1153,7 @@ version = "0.1.0"
 dependencies = [
  "codec",
  "ipcwire",
+ "members",
  "raft",
 ]
 
@@ -1161,6 +1200,15 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rsmkit"
+version = "0.1.0"
+dependencies = [
+ "codec",
+ "raft",
+ "sha2",
 ]
 
 [[package]]
@@ -1482,6 +1530,24 @@ dependencies = [
  "block",
  "kcore",
  "virtio",
+]
+
+[[package]]
+name = "vnetmeta"
+version = "0.1.0"
+dependencies = [
+ "codec",
+ "firewall",
+ "members",
+ "raft",
+ "rsmkit",
+]
+
+[[package]]
+name = "vnetwire"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
 ]
 
 [[package]]

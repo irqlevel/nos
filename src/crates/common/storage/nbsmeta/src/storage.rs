@@ -353,7 +353,7 @@ impl State {
     }
 
     fn ready(&self) -> Result<(), Refusal> {
-        if self.cluster.is_none() {
+        if self.cluster().is_none() {
             return Err(Refusal::NotInitialized);
         }
         Ok(())

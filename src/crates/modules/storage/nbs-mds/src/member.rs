@@ -4,18 +4,19 @@
 //!
 //! - **The NBS cluster's id** before every message of the engine's, held to
 //!   on each that comes in: an mds takes nothing of another cluster's.
-//! - **The hosts its nodes are**: the metadata's members, each a host and
-//!   its incarnation; before this host's log has caught up, the members it
-//!   was offered the cluster by.
-//! - **An offer** (`TAG_OFFER`) to a host that is a member already --
-//!   `nbs host add` asked again -- is answered with its incarnation where it
-//!   is this cluster's, and declined where it is another's.
-//! - **A host that lost its state** answers raft's messages to the member it
-//!   was with `TAG_NO_MEMBER` (lib.rs's listener, which runs while this host
-//!   is in no cluster). Its claim is taken from that host alone, and kept to
-//!   be said -- in the log once a minute, and by `nbs status` -- until the
-//!   member is replaced: Raft must never count the vote of a member that
-//!   forgot its log, and it does not, the host being no longer that member.
+//! - **Its members**, as every group whose hosts are offered it keeps them
+//!   (raftmember's `offered::Half`): the hosts its nodes are -- the
+//!   metadata's members, each a host and its incarnation; before this host's
+//!   log has caught up, the members it was offered the cluster by. An offer
+//!   (`TAG_OFFER`) to a host that is a member already -- `nbs host add` asked
+//!   again -- is answered with its incarnation where it is this cluster's,
+//!   and declined where it is another's. A host that lost its state answers
+//!   raft's messages to the member it was with `TAG_NO_MEMBER` (raftmember's
+//!   listener, which runs while this host is in no cluster): its claim is
+//!   taken from that host alone, and kept to be said -- in the log once a
+//!   minute, and by `nbs status` -- until the member is replaced. A probe
+//!   (`TAG_PROBE`), what `nbs recover` asks every other voter first, is
+//!   answered.
 //! - **The state's digest held to the leader's**: every member takes its
 //!   state's digest every `nbsmeta::CHECK_EVERY` entries; the leader proposes
 //!   its own (`Command::Digest`) as it takes it, and a member whose own
@@ -43,8 +44,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use codec::{Reader, Writer};
-use kcore::ipc::{Addr, Message, TAG_BOUNCED, TAG_BULK};
+use kcore::ipc::{Addr, Mailbox, Message, TAG_BOUNCED, TAG_BULK};
 use kcore::klog;
 use kcore::time::boot_time_ns;
 use nbsmeta::repair::{self, Seen};
@@ -52,25 +52,13 @@ use nbsmeta::{Answer, Command, Refusal, Replica, State};
 use nbswire::scrub::{self, Scrub};
 use nbswire::{Answered, Ask, Asking, Op, Query, Question, Request, Said, Saying, Told};
 use raft::{Role, Rsm};
+use raftmember::offered::{self, Group, Half, Lost, MemberFile};
 use raftmember::{App, Core, Locked, Outcome, Pending, Request as Asked};
-
-use crate::files::{self, Known};
 
 /// The member's mailbox, the same on every host of the cluster.
 pub const NAME: &str = nbswire::MDS_NAME;
-/// An offer of the cluster: its id and name, then its members (a host and
-/// its incarnation each) -- what the host offered knows them by until its
-/// log has caught up.
-pub const TAG_OFFER: u32 = raftmember::TAG_APP;
-/// Its answer: the cluster's id, then the incarnation the host's mds is.
-pub const TAG_ACCEPTED: u32 = raftmember::TAG_APP + 1;
-/// An offer declined: why, in words.
-pub const TAG_DECLINED: u32 = raftmember::TAG_APP + 2;
-/// From a host whose mds has no member of the incarnation a raft message
-/// was for: the cluster's id, then that incarnation.
-pub const TAG_NO_MEMBER: u32 = raftmember::TAG_APP + 3;
-/// How often a host's lost member is said in the log at most.
-const LOST_SAY_NS: u64 = 60_000_000_000;
+/* NBS's own tags -- nbswire's -- are past the offered group's */
+const _: () = assert!(nbswire::TAG_QUERY >= offered::TAG_OWN && nbswire::TAG_ASK >= offered::TAG_OWN);
 /// How long the leader waits for a cs it looks at, and how long what it
 /// found stands before a replica's taking out looks again.
 const PROBE_NS: u64 = 250_000_000;
@@ -87,12 +75,7 @@ const PROBE: u32 = nbswire::TAG_REQUEST | TAG_BULK;
 const READS_MAX: usize = 64;
 
 pub type Member = raftmember::Member<Mds>;
-pub type Shared = raftmember::Shared<Mds>;
 pub type View = raftmember::View<Mds>;
-/// The hosts that said their mds has no member of the incarnation the
-/// metadata has for them: the host, that incarnation, and when it was last
-/// said in the log. Kept by the member, read by the shell.
-pub type Lost = Arc<Locked<BTreeMap<String, (u64, u64)>>>;
 
 /// What the leader's scrub has done and found (N9e), kept by the member for
 /// the shell: its counts, and the newest of its findings -- chunk, set, the
@@ -106,69 +89,10 @@ pub type Scrubbed = Arc<Locked<Scrubs>>;
 /// How many of the scrub's findings the shell is shown.
 const FOUND_KEPT: usize = 16;
 
-/// An offer of the cluster, as it goes between hosts.
-pub struct Offer {
-    pub cluster: [u8; 16],
-    pub name: String,
-    pub members: Vec<Known>,
-}
-
-impl Offer {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::new();
-        w.fixed(&self.cluster);
-        w.str(&self.name);
-        w.u8(self.members.len().min(nbsmeta::MEMBERS_MAX) as u8);
-        for m in self.members.iter().take(nbsmeta::MEMBERS_MAX) {
-            w.str(&m.host);
-            w.u64(m.id);
-        }
-        w.buf
-    }
-
-    /// What a member offered, read: every count bounded, every name a
-    /// host's, no member twice.
-    pub fn decode(bytes: &[u8]) -> Option<Offer> {
-        let mut r = Reader::new(bytes);
-        let cluster = r.fixed()?;
-        let name = String::from(r.str(nbsmeta::NAME_MAX)?);
-        let n = usize::from(r.u8()?);
-        if n == 0 || n > nbsmeta::MEMBERS_MAX || !nbsmeta::valid_name(&name) {
-            return None;
-        }
-        let mut members: Vec<Known> = Vec::with_capacity(n);
-        for _ in 0..n {
-            let host = String::from(r.str(nbsmeta::NAME_MAX)?);
-            let id = r.u64()?;
-            if id == 0 || !nbsmeta::valid_name(&host) || members.iter().any(|m| m.host == host || m.id == id) {
-                return None;
-            }
-            members.push(Known { host, id });
-        }
-        r.done().then_some(Offer { cluster, name, members })
-    }
-}
-
-/// The cluster's id and an incarnation: an acceptance's bytes, and a
-/// no-member answer's.
-pub fn encode_id(cluster: &[u8; 16], id: u64) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.fixed(cluster);
-    w.u64(id);
-    w.buf
-}
-
-pub fn decode_id(bytes: &[u8]) -> Option<([u8; 16], u64)> {
-    let mut r = Reader::new(bytes);
-    let cluster = r.fixed()?;
-    let id = r.u64()?;
-    r.done().then_some((cluster, id))
-}
-
 /// NBS's half of the member.
 pub struct Mds {
-    me: files::Member,
-    lost: Lost,
+    /// This host's member file, and the hosts said to have lost their state.
+    half: Half,
     /// The module's folder, for what a member that halts says to do.
     dir: String,
     /// The newest checkpoint whose digest this member proposed as leader.
@@ -276,10 +200,10 @@ pub enum Kind {
 
 /// The member over its log in `dir`, its mailbox named.
 #[allow(clippy::too_many_arguments)]
-pub fn new(rsm: Rsm<raftmember::Log, State>, me: files::Member, lost: Lost, dir: &str, out_after_ms: u64,
+pub fn new(rsm: Rsm<raftmember::Log, State>, me: MemberFile, lost: Lost, dir: &str, out_after_ms: u64,
            scrub_ms: u64, scrubbed: Scrubbed) -> Result<Member, String> {
     let id = me.id;
-    raftmember::Member::new(Mds { me, lost, dir: String::from(dir), proposed: 0, probes: Vec::new(),
+    raftmember::Member::new(Mds { half: Half { me, lost }, dir: String::from(dir), proposed: 0, probes: Vec::new(),
                                   verdicts: BTreeMap::new(), next_probe: 1, watch: BTreeMap::new(), watch_at: 0,
                                   planned: 0, planned_index: 0, plan_at: 0, refused: false,
                                   after: repair::After { down_ms: repair::DOWN_AFTER_MS, out_ms: out_after_ms },
@@ -316,7 +240,7 @@ impl App for Mds {
     }
 
     fn group(&self, _core: &Core<Mds>) -> Option<[u8; 16]> {
-        Some(self.me.cluster)
+        Some(self.half.me.group)
     }
 
     /// The incarnation host `name`'s member is: the metadata's -- or, where
@@ -327,27 +251,22 @@ impl App for Mds {
     /// member with no cluster at all did: one restored so refused all its
     /// leader sent, and stayed on that snapshot.)
     fn node_of(&self, core: &Core<Mds>, name: &str) -> Option<u64> {
-        if let Some(m) = core.state().member(name) {
-            return Some(m.id);
-        }
-        self.offered(core, |k| k.host == name).map(|k| k.id)
+        self.half.node_of(core, name)
     }
 
     fn host_of(&self, core: &Core<Mds>, node: u64) -> Option<String> {
-        if let Some(m) = core.state().member_of_id(node) {
-            return Some(m.host.clone());
-        }
-        self.offered(core, |k| k.id == node).map(|k| k.host.clone())
+        self.half.host_of(core, node)
     }
 
     fn wanted(&self, core: &Core<Mds>) -> (Vec<u64>, Vec<u64>) {
-        (core.state().voters(), core.state().learners())
+        self.half.wanted(core)
     }
 
     fn on_message(&mut self, core: &mut Core<Mds>, m: &Message) {
+        if self.half.on_message(&*self, core, m) {
+            return;
+        }
         match m.tag & !TAG_BULK {
-            TAG_OFFER => self.on_offer(core, m),
-            TAG_NO_MEMBER => self.on_no_member(core, m),
             nbswire::TAG_QUERY => self.on_cs_query(core, m),
             nbswire::TAG_ASK => self.on_client(core, m),
             nbswire::TAG_ANSWER => self.on_answer(core, m),
@@ -485,7 +404,7 @@ impl App for Mds {
         let Some((host, generation)) = writer else {
             return Some(Asked { cmd: Command::Snapshot { volume, name, generation: 0 }, done: r.done });
         };
-        if host != self.me.host {
+        if host != self.half.me.host {
             return refuse(r, alloc::format!("volume {} is attached on host {}: its snapshot is asked there, where its \
                                              writer is paused for it", volume, host));
         }
@@ -521,12 +440,12 @@ impl App for Mds {
                 p.request.done.with(|s| *s = Some((Err(why), 0)));
             }
         }
+        self.half.turn(core);
         let state = core.state();
-        self.lost.with(|l| l.retain(|host, &mut (id, _)| state.member(host).is_some_and(|m| m.id == id)));
         /* A session of a volume whose writer here it no longer is -- taken
            over elsewhere, let go of, deleted -- forgotten: kept, the table
            grew for the member's life (the review of 2026-11) */
-        let me = &self.me.host;
+        let me = &self.half.me.host;
         self.sessions.retain(|name, &mut (g, _)| {
             state.volume(name).and_then(|v| v.writer.as_ref()).is_some_and(|w| w.generation == g && w.host == *me)
         });
@@ -584,7 +503,7 @@ impl App for Mds {
     fn on_read(&mut self, core: &mut Core<Mds>, request: u64, served: bool) {
         let Some((to, id, question)) = self.reads.remove(&request) else { return };
         let told = if served {
-            nbswire::mds::told(core.state(), &self.me.host, core.rsm().applied(), &question, true)
+            nbswire::mds::told(core.state(), &self.half.me.host, core.rsm().applied(), &question, true)
         } else {
             Told::Refused(nbswire::Refusal::NoMds)
         };
@@ -598,21 +517,12 @@ impl App for Mds {
         Some(alloc::format!("this host's state at entry {} is not the leader's (digest {}..., the leader's {}..., seen \
                              at entry {}): a determinism bug, said rather than forked -- its member serves nothing; \
                              `rmmod nbs-mds`, `rm {}` and `insmod` it, then `nbs host replace {}` on another member",
-                            d.at, codec::hex(&d.mine[..6]), codec::hex(&d.theirs[..6]), d.seen, self.dir, self.me.host))
+                            d.at, codec::hex(&d.mine[..6]), codec::hex(&d.theirs[..6]), d.seen, self.dir,
+                            self.half.me.host))
     }
 }
 
 impl Mds {
-    /// A member the offer this host took named that `which` names, where
-    /// the metadata applied here has neither its host nor its incarnation
-    /// -- it is older than that member's coming -- and has not removed it.
-    fn offered(&self, core: &Core<Mds>, which: impl Fn(&Known) -> bool) -> Option<&Known> {
-        let state = core.state();
-        self.me.known.iter().find(|k| which(k)).filter(|k| {
-            state.member(&k.host).is_none() && state.member_of_id(k.id).is_none() && !state.id_removed(k.id)
-        })
-    }
-
     /// The controller's turn, as the leader: every cs looked at once a
     /// second, and a plan made every ten -- sooner where the state moved on
     /// or a cs went silent or came back -- and proposed, once what it
@@ -684,7 +594,7 @@ impl Mds {
         for o in out {
             match o {
                 scrub::Out::Send { host, bytes } => {
-                    let to = if host == self.me.host {
+                    let to = if host == self.half.me.host {
                         String::from(nbswire::CS_NAME)
                     } else {
                         alloc::format!("{}@{}", nbswire::CS_NAME, host)
@@ -718,7 +628,7 @@ impl Mds {
         }
         let now = boot_time_ns();
         let Some(host) = core.state().cs().get(cs as usize).map(|c| c.host.clone()) else { return };
-        let to = if host == self.me.host {
+        let to = if host == self.half.me.host {
             String::from(nbswire::CS_NAME)
         } else {
             alloc::format!("{}@{}", nbswire::CS_NAME, host)
@@ -790,7 +700,7 @@ impl Mds {
             return;
         }
         let Some(a) = Asking::decode(&m.data) else { return };
-        let host = self.me.host.clone();
+        let host = self.half.me.host.clone();
         /* The writer's session of a volume on this host, by the asks that
            name its generation: the one a snapshot pauses (N10c2). Only the
            volume's writer here as applied -- a session taken over on this
@@ -865,7 +775,7 @@ impl Mds {
         /* A join's end, or its giving up: proposed for this host's cs, and
            told once applied (N9) */
         if let Question::JoinDone { set, since } | Question::GiveUp { set, since } = q.question {
-            let Some(cs) = core.state().cs_of(&self.me.host).map(|c| c.id) else {
+            let Some(cs) = core.state().cs_of(&self.half.me.host).map(|c| c.id) else {
                 let told = Told::Refused(nbswire::Refusal::NotHere);
                 let _ = core.mailbox().send(m.from, nbswire::TAG_TOLD, 0, &Answered { id: q.id, told }.encode());
                 return;
@@ -882,7 +792,7 @@ impl Mds {
            device of this host's cs alone, and never a record's drop, which
            is a person's (`nbs devices add ... wipe`) */
         if let Question::Formatted { device, format } = q.question {
-            let mine = core.state().cs_of(&self.me.host).is_some_and(|c| c.devices.iter().any(|d| d.id == device));
+            let mine = core.state().cs_of(&self.half.me.host).is_some_and(|c| c.devices.iter().any(|d| d.id == device));
             if !mine || format == 0 {
                 let told = Told::Refused(nbswire::Refusal::NotHere);
                 let _ = core.mailbox().send(m.from, nbswire::TAG_TOLD, 0, &Answered { id: q.id, told }.encode());
@@ -913,51 +823,56 @@ impl Mds {
             self.reads.insert(request, (m.from, q.id, q.question));
             return;
         }
-        let told = nbswire::mds::told(core.state(), &self.me.host, core.rsm().applied(), &q.question, false);
+        let told = nbswire::mds::told(core.state(), &self.half.me.host, core.rsm().applied(), &q.question, false);
         let _ = core.mailbox().send(m.from, nbswire::TAG_TOLD, 0, &Answered { id: q.id, told }.encode());
-    }
-
-    /// An offer to this host, a member already: answered with its
-    /// incarnation where it is the cluster's -- an add asked again -- and
-    /// declined where it is another's.
-    fn on_offer(&mut self, core: &mut Core<Mds>, m: &Message) {
-        let Some(o) = Offer::decode(&m.data) else {
-            core.note_refused();
-            return;
-        };
-        if o.cluster == self.me.cluster {
-            let _ = core.mailbox().send(m.from, TAG_ACCEPTED, m.reference, &encode_id(&self.me.cluster, self.me.id));
-        } else {
-            let why = alloc::format!("{}'s mds is a member of another NBS cluster, {} ({}...), as {}", self.me.host,
-                                     self.me.name, codec::hex(&self.me.cluster[..4]), self.me.id);
-            let _ = core.mailbox().send(m.from, TAG_DECLINED, m.reference, why.as_bytes());
-        }
-    }
-
-    /// A host that says its mds has no member of the incarnation the
-    /// metadata has for it: its claim, about itself alone, kept and said.
-    fn on_no_member(&mut self, core: &mut Core<Mds>, m: &Message) {
-        let (Some((cluster, id)), Some(host)) = (decode_id(&m.data), kcore::ipc::peer_name(m.from)) else {
-            core.note_refused();
-            return;
-        };
-        if cluster != self.me.cluster || core.state().member(&host).map(|x| x.id) != Some(id) {
-            core.note_refused();
-            return;
-        }
-        let now = boot_time_ns();
-        let say = self.lost.with(|l| {
-            let e = l.entry(host.clone()).or_insert((id, 0));
-            let due = e.1 == 0 || now >= e.1 + LOST_SAY_NS;
-            if due {
-                e.1 = now;
-            }
-            due
-        });
-        if say {
-            klog!(0, "nbs: {} says its mds has no member {}: its state is gone -- `nbs host replace {}` takes it back as \
-                      a new member", host, id, host);
-        }
     }
 }
 
+/// NBS's metadata as a group whose hosts are offered it (raftmember's
+/// `offered`): its commands of its members, and what its listener answers.
+impl Group for Mds {
+    const MODULE: &'static str = "nbs-mds";
+    const WHAT: &'static str = "NBS cluster";
+    const AN: &'static str = "an NBS cluster";
+    const KIND: &'static str = "cluster";
+    const WORD: &'static str = "nbs";
+    const MEMBER: &'static str = "mds";
+    const DIR: &'static str = crate::files::DEFAULT_DIR;
+    const TASK: &'static str = "nbs/mds";
+    const IDLE_TASK: &'static str = "nbs/idle";
+
+    fn members(state: &State) -> &members::Members {
+        state.roll()
+    }
+
+    fn init(group: [u8; 16], name: &str, host: &str, member: u64) -> Command {
+        Command::Init { cluster: group, name: String::from(name), host: String::from(host), member }
+    }
+
+    fn add(host: &str, member: u64) -> Command {
+        Command::Add { host: String::from(host), member }
+    }
+
+    fn remove(host: &str) -> Command {
+        Command::Remove { host: String::from(host) }
+    }
+
+    fn done(answer: Answer) -> Result<u64, String> {
+        match answer {
+            Answer::Done { member } => Ok(member),
+            Answer::Refused(why) => Err(String::from(why.says())),
+            other => Err(alloc::format!("answered {:?}", other)),
+        }
+    }
+
+    /// A question of this host's cs, while there is no member to answer it:
+    /// answered so, rather than left to time out.
+    fn idle(mb: &Mailbox, m: &Message) {
+        if m.tag & !TAG_BULK != nbswire::TAG_QUERY || m.from.host() != 0 {
+            return;
+        }
+        let Some(q) = Query::decode(&m.data) else { return };
+        let told = Told::Refused(nbswire::Refusal::NoMds);
+        let _ = mb.send(m.from, nbswire::TAG_TOLD, 0, &Answered { id: q.id, told }.encode());
+    }
+}

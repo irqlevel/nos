@@ -1,8 +1,10 @@
 #!/bin/bash
 # The panel demo's nos VMs on the AX41 updated in place, one after another:
 # each powered off, the modules its /etc/rc loads put into its root from
-# modules/ -- nothing else of the root touched, its keys, hosts.toml, the
-# cluster's and NBS's state all kept -- the root held to e2fsck -fn, and the
+# modules/ and hvboot into its /lib -- vnet's and hv's added to /etc/rc
+# where it has not them, the rest of the root not touched, its keys,
+# hosts.toml, the cluster's and NBS's state all kept -- the root held to
+# e2fsck -fn, and the
 # VM started again on nos-test.iso as it is now, then waited for until its
 # UDP shell answers and its ipcnet has its peers up again. One at a time,
 # so that the cluster keeps its majority throughout -- and none taken down
@@ -19,7 +21,7 @@
 set -u
 D=/root/nos-demo
 cd $D || exit 1
-MODS="ipcnet cluster nbs-mds nbs-cs api"
+MODS="ipcnet cluster vnet nbs-mds nbs-cs hv api"
 M=$D/mnt-update
 WHOLE_SECS=${WHOLE_SECS:-1800}
 CAUGHT_UP_SECS=${CAUGHT_UP_SECS:-300}
@@ -70,6 +72,7 @@ for name in "$@"; do
     esac
     [ -e root-$name.img ] || { echo "no root-$name.img"; exit 1; }
     for m in $MODS; do [ -f modules/$m.ko ] || { echo "no modules/$m.ko"; exit 1; }; done
+    [ -f modules/hvboot ] || { echo "no modules/hvboot"; exit 1; }
     echo "== $name: $(NSH_TIMEOUT=10 python3 nsh.py $ip version 2>/dev/null | head -1)"
     if [ -z "$HAS_NBS" ]; then
         line=$(nbs_line $ip)
@@ -86,6 +89,18 @@ for name in "$@"; do
     mkdir -p $M
     mount -o loop root-$name.img $M || { echo "$name: its root not mounted"; exit 1; }
     for m in $MODS; do cp modules/$m.ko $M/$m.ko; done
+    mkdir -p $M/lib
+    cp modules/hvboot $M/lib/hvboot
+    # vnet after the registry, hv after N\'s and turned on -- once, the rc
+    # before kept
+    if ! grep -q '^insmod /vnet.ko' $M/etc/rc || ! grep -q '^insmod /hv.ko' $M/etc/rc || ! grep -q '^hv on' $M/etc/rc
+    then
+        [ -e $M/etc/rc.before-vnet ] || cp $M/etc/rc $M/etc/rc.before-vnet
+        grep -q '^insmod /vnet.ko' $M/etc/rc || sed -i '/^insmod \/cluster.ko/a insmod /vnet.ko' $M/etc/rc
+        grep -q '^insmod /hv.ko' $M/etc/rc || sed -i '/^insmod \/nbs-cs.ko/a insmod /hv.ko' $M/etc/rc
+        grep -q '^hv on' $M/etc/rc || sed -i '/^insmod \/hv.ko/a hv on' $M/etc/rc
+        echo "   its /etc/rc: $(grep -c '^insmod' $M/etc/rc) modules, vnet and hv among them, hv on"
+    fi
     sync
     umount $M
     e2fsck -fn root-$name.img > /dev/null 2>&1 || { echo "$name: e2fsck -fn says its root is not clean"; exit 1; }

@@ -164,6 +164,7 @@
         "ip": {"type": "ipv4", "title": {"en": "Address", "ru": "Адрес"}},
         "port": {"type": "port", "title": {"en": "Port", "ru": "Порт"}},
         "underlay": {"type": "ipv4", "title": {"en": "Underlay", "ru": "Подложка"}},
+        "underlay_port": {"type": "port", "title": {"en": "Underlay port", "ru": "Порт подложки"}},
         "public": {"type": "ipv4", "title": {"en": "Public address", "ru": "Внешний адрес"}},
         "maintenance": {"type": "bool", "title": {"en": "Maintenance", "ru": "Обслуживание"}},
         "key": {"type": "string", "title": {"en": "Key", "ru": "Ключ"}},

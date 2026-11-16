@@ -533,6 +533,10 @@ pub fn create(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options
     o.disks.push((onto.as_ref().map_or_else(|| String::from(DISK), |(_, id)| id.clone()), false));
     o.disks.push((String::from(SEED), true));
     o.disks.extend(theirs);
+    /* `address=` is the port's on a network of the cluster's, made below:
+     * carried out once and never in the vm.toml -- as `hv create <name>
+     * <kernel>` has it -- and so out of the options before they are checked */
+    let cluster_address = o.address.take();
     let mut config = Config::new(o);
     config.protected = recipe.protected;
     store::options_checked(&folder, &config)?;
@@ -541,11 +545,40 @@ pub fn create(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options
     if let Some(p) = config.options.port {
         store::take_port(root, vms, &held, Some(p))?;
     }
+    /* On a network of the cluster's its firewall is vnet's, kept with its
+     * port and not in its vm.toml. */
+    let cluster = config.options.network.as_deref().and_then(config::cluster_network).map(String::from);
+    if cluster.is_some() && (config.options.port.is_some() || config.options.public.is_some()) {
+        return Err(String::from("port= and public= are the host's networks': on a network of the cluster's its port \
+                                 is vnet's, and its public address (`vnet ip`)"));
+    }
+    let cluster_firewall = if cluster.is_some() { config.options.firewall.take() } else { None };
+    if cluster.is_none() && cluster_address.is_some() {
+        return Err(String::from("address= is for a network of the cluster's (network=vnet:<name>): a host's \
+                                 network's port has its address -- port= for one of its own"));
+    }
     let text = config::render(&config).ok_or_else(|| String::from("out of memory"))?;
+    /* Its port there made now, where a conflict shows at once -- and
+     * deleted again where the VM is not made. */
+    let mut port = None;
+    if let (Some(network), Some(uuid)) = (cluster.as_deref(), config.options.uuid) {
+        let a = crate::vnet::attach(&uuid, network, cluster_address, cluster_firewall.as_deref(), true)?;
+        let _ = writeln!(work, "{} given port {} on {}{} at {}, judged by its firewall {}", name, a.port,
+                         crate::vnet::PREFIX, network, netwire::Ipv4(a.identity.ip), a.firewall.name);
+        port = Some(uuid);
+    }
+    let detach = |e: String| -> String {
+        match port.map(|uuid| crate::vnet::detach(&uuid)) {
+            Some(Err(why)) => alloc::format!("{} -- and its port of vnet's left ({}): `vnet port delete` it", e, why),
+            _ => e,
+        }
+    };
 
     let mut made = Made::new();
     if kcore::fs::list(&folder.path).is_err() {
-        store::make_dirs(&folder.path).map_err(|_| alloc::format!("{} could not be made", folder.path))?;
+        if store::make_dirs(&folder.path).is_err() {
+            return Err(detach(alloc::format!("{} could not be made", folder.path)));
+        }
         made.folder = Some(folder.path.clone());
     }
     match fill(&folder, recipe, onto.map(|(disk, _)| disk), &text, &file, &mut made, work) {
@@ -553,7 +586,7 @@ pub fn create(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options
             made.keep();
             Ok(created)
         }
-        Err(e) => Err(made.undone(e)),
+        Err(e) => Err(detach(made.undone(e))),
     }
 }
 

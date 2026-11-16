@@ -10,11 +10,13 @@
 #   logind, inhibited by unattended-upgrades), hv pressing it again every
 #   15 s, and one cut off midway is left with its packages half installed;
 # - nos rebooted into Ubuntu; nos's root held to e2fsck -fn, then made ready
-#   for the demo: /etc/rc loading ipcnet, the registry and NBS before the
-#   API (once), a fresh hosts.toml -- this host alone, in a cluster of its
-#   own until it makes or joins one, through the panel -- and what a cluster
-#   before left there, the registry's folder (/etc/cluster) and NBS's mds
-#   (/nbs/mds), renamed *.before-demo-<time>, never removed; e2fsck -fn again;
+#   for the demo: /etc/rc loading ipcnet, the registry, vnet and NBS before
+#   the API (once), a fresh hosts.toml -- this host alone, in a cluster of
+#   its own until it makes or joins one, through the panel -- and what a
+#   cluster before left there, the registry's folder (/etc/cluster) and
+#   NBS's mds (/nbs/mds), renamed *.before-demo-<time>, never removed; an
+#   /etc/rc of a stand made before vnet given it after the registry, the rc
+#   before kept beside it; e2fsck -fn again;
 # - the image copied and installed by its own nos-install for one boot, the
 #   kernel's line kept; Ubuntu rebooted into it;
 # - the panel's VM followed until it runs, the VMs stopped before started
@@ -25,7 +27,8 @@
 # With DEMO_KEEP=1 the stand's state is kept, the image alone changed: the
 # panel's VM stopped, not deleted -- /etc/rc's `api panel create` starts it
 # again, panel-update.sh installs a bundle in it -- and nos's root not made
-# ready: the cluster, NBS and hosts.toml as they are. e2fsck -fn still. And
+# ready: the cluster, NBS and hosts.toml as they are, /etc/rc given vnet
+# alone where it has not it. e2fsck -fn still. And
 # nothing stopped before NBS's chunks are all at three replicas -- a
 # neighbour just updated may be copying its sets back still, and this host's
 # replicas the only ones active -- nor said done before they are again,
@@ -218,7 +221,7 @@ printf '# The demo stand: this host alone, in a cluster of its own until it make
     "$NAME" "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" > $M/etc/ipc/hosts.toml
 if ! grep -q '^insmod /lib/modules/ipcnet.ko' $M/etc/rc; then
     cp $M/etc/rc $M/etc/rc.before-demo-$STAMP
-    LINES='insmod /lib/modules/ipcnet.ko\nipcnet start\nipc echo start\ninsmod /lib/modules/cluster.ko\ninsmod /lib/modules/nbs-mds.ko\ninsmod /lib/modules/nbs-cs.ko'
+    LINES='insmod /lib/modules/ipcnet.ko\nipcnet start\nipc echo start\ninsmod /lib/modules/cluster.ko\ninsmod /lib/modules/vnet.ko\ninsmod /lib/modules/nbs-mds.ko\ninsmod /lib/modules/nbs-cs.ko'
     if grep -q '^insmod /lib/modules/api.ko' $M/etc/rc.before-demo-$STAMP; then
         awk -v l="$LINES" '/^insmod \/lib\/modules\/api.ko/ && !d { gsub(/\\n/, "\n", l); print l; d = 1 } { print }' \
             $M/etc/rc.before-demo-$STAMP > $M/etc/rc
@@ -234,8 +237,33 @@ sync
 PREP
 scp -F "$CFG" "$LOG/ex44-prepare.sh" ex44-ubuntu:/root/ex44-prepare.sh || exit 1
 on_ubuntu "bash /root/ex44-prepare.sh $DEV $NAME" || { echo "   not made ready -- stopping here, Ubuntu left running"; exit 1; }
-fsck_nos || exit 1
 fi
+
+step "nos's /etc/rc loading vnet after the registry, where it loads the registry and not vnet"
+cat > "$LOG/ex44-vnet.sh" <<'VNET'
+#!/bin/bash
+# On the EX44's Ubuntu: vnet loaded after the registry by nos's /etc/rc --
+# once, the rc before kept beside it.
+set -e
+DEV=$1
+M=/mnt/nosroot
+STAMP=$(date +%Y%m%d-%H%M%S)
+mkdir -p $M
+if mountpoint -q $M; then umount $M; fi
+mount $DEV $M
+trap 'umount $M' EXIT
+if grep -q '^insmod /lib/modules/cluster.ko' $M/etc/rc && ! grep -q '^insmod /lib/modules/vnet.ko' $M/etc/rc; then
+    cp $M/etc/rc $M/etc/rc.before-vnet-$STAMP
+    awk '{ print } /^insmod \/lib\/modules\/cluster.ko/ && !d { print "insmod /lib/modules/vnet.ko"; d = 1 }' \
+        $M/etc/rc.before-vnet-$STAMP > $M/etc/rc
+    echo "vnet added to /etc/rc, the rc before kept as /etc/rc.before-vnet-$STAMP"
+fi
+grep -n '^insmod' $M/etc/rc
+sync
+VNET
+scp -F "$CFG" "$LOG/ex44-vnet.sh" ex44-ubuntu:/root/ex44-vnet.sh || exit 1
+on_ubuntu "bash /root/ex44-vnet.sh $DEV" || { echo "   vnet not added -- stopping here, Ubuntu left running"; exit 1; }
+fsck_nos || exit 1
 
 step "the image copied"
 scp -F "$CFG" "$LOCAL" ex44-ubuntu:$IMG || exit 1
