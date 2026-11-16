@@ -103,6 +103,15 @@ export default async function Home({ params }: Props) {
                                 <ArrowRightIcon width={16} height={16} />
                             </Link>
                             <Link
+                                href={`/${locale}/demo`}
+                                className="inline-flex items-center gap-2 rounded-lg border border-line-strong bg-card px-4 py-2.5 text-fg transition-colors hover:border-fg"
+                            >
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                                    <path d="M7 4.5v15a1 1 0 0 0 1.53.85l12-7.5a1 1 0 0 0 0-1.7l-12-7.5A1 1 0 0 0 7 4.5z" />
+                                </svg>
+                                {home.ctaDemo}
+                            </Link>
+                            <Link
                                 href={`/${locale}/howto/run-in-qemu`}
                                 className="inline-flex items-center rounded-lg border border-line-strong bg-card px-4 py-2.5 text-fg transition-colors hover:border-fg"
                             >

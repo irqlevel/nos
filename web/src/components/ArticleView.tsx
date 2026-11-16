@@ -17,6 +17,7 @@ export function ArticleView({
     html,
     toc,
     footer,
+    media,
 }: {
     locale: Locale;
     dict: Dictionary;
@@ -27,12 +28,15 @@ export function ArticleView({
     html: string;
     toc: TocItem[];
     footer?: ReactNode;
+    // What the page is about when it is not text -- a video -- as wide as the page, above the text.
+    media?: ReactNode;
 }) {
     return (
         <article>
             <PageHeader eyebrow={eyebrow} title={title} description={description}>
                 {meta}
             </PageHeader>
+            {media && <div className="mx-auto max-w-7xl px-4 pt-10 sm:px-6">{media}</div>}
             <div className="mx-auto grid max-w-7xl gap-12 px-4 py-10 sm:px-6 xl:grid-cols-[minmax(0,1fr)_14rem]">
                 <div className="min-w-0 max-w-3xl">
                     <Prose html={html} locale={locale} />
