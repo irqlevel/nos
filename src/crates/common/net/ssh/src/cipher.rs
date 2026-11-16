@@ -1,10 +1,7 @@
 //! chacha20-poly1305@openssh.com, the one cipher the server speaks, and a
-//! session's own random stream.
+//! session's own random stream: both made of ChaCha20 and Poly1305 as the
+//! machine has them (`Primitives`).
 
-use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
-use chacha20::{ChaCha20, ChaCha20Legacy, Key, LegacyNonce, Nonce};
-use poly1305::universal_hash::KeyInit;
-use poly1305::Poly1305;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
@@ -15,7 +12,36 @@ pub const KEY_LEN: usize = 64;
 
 /// ChaCha20 block 1: where a packet's payload starts in its stream, block 0
 /// having given the Poly1305 key.
-const PAYLOAD_OFFSET: u64 = 64;
+const PAYLOAD_BLOCK: u32 = 1;
+
+/// ChaCha20 and Poly1305: what the cipher and a session's random stream are
+/// made of. There is no kernel here, so the server hands them in -- the
+/// sshd module the kernel's crypto crate's, CRYPTOGAMS' assembly in the
+/// kernel's SIMD sections; the net fuzzer the same, the client it holds
+/// them to having RustCrypto's.
+pub trait Primitives: Sync {
+    /// `data` XORed in place with ChaCha20's key stream under `key`, from
+    /// the counter block `counter` on: the state's last four words, the
+    /// first of which counts the blocks -- and is not to pass 2^32 within
+    /// `data`.
+    fn chacha20(&self, key: &[u8; 32], counter: &[u32; 4], data: &mut [u8]);
+    /// Poly1305 of `data` under the one-time key `key`, as RFC 8439 2.5 has
+    /// it: its last block padded with a 1 and zeros.
+    fn poly1305(&self, key: &[u8; 32], data: &[u8]) -> [u8; TAG_LEN];
+}
+
+/// Block `block` of a packet's stream: OpenSSH's ChaCha20 is the original
+/// one, a 64-bit block counter and a 64-bit nonce -- the packet's sequence
+/// number, big-endian -- each two little-endian words of the state.
+fn counter(seq: u32, block: u32) -> [u32; 4] {
+    let nonce = u64::from(seq).to_be_bytes();
+    [
+        block,
+        0,
+        u32::from_le_bytes([nonce[0], nonce[1], nonce[2], nonce[3]]),
+        u32::from_le_bytes([nonce[4], nonce[5], nonce[6], nonce[7]]),
+    ]
+}
 
 /// chacha20-poly1305@openssh.com (OpenSSH's PROTOCOL.chacha20poly1305):
 /// ChaCha20 with the packet's sequence number for the nonce, under two keys.
@@ -25,38 +51,40 @@ const PAYLOAD_OFFSET: u64 = 64;
 /// reader learns how long a packet is before it has the rest. The tag covers
 /// the encrypted length and payload. Not RFC 8439's AEAD: the original 64-bit
 /// nonce, and a length under a key of its own.
-pub struct ChaChaPoly {
+pub struct ChaChaPoly<'p> {
+    primitives: &'p dyn Primitives,
     main: [u8; 32],
     header: [u8; 32],
 }
 
-impl ChaChaPoly {
-    pub fn new(key: &[u8; KEY_LEN]) -> Self {
+impl<'p> ChaChaPoly<'p> {
+    pub fn new(primitives: &'p dyn Primitives, key: &[u8; KEY_LEN]) -> Self {
         let mut main = [0u8; 32];
         let mut header = [0u8; 32];
         main.copy_from_slice(&key[..32]);
         header.copy_from_slice(&key[32..]);
-        Self { main, header }
+        Self { primitives, main, header }
     }
 
-    fn stream(key: &[u8; 32], seq: u32) -> ChaCha20Legacy {
-        let nonce = u64::from(seq).to_be_bytes();
-        ChaCha20Legacy::new(Key::from_slice(key), LegacyNonce::from_slice(&nonce))
+    /// A packet's Poly1305 key: the first half of block 0 of its stream.
+    fn mac_key(&self, seq: u32) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        self.primitives.chacha20(&self.main, &counter(seq, 0), &mut key);
+        key
     }
 
-    /// The Poly1305 for a packet, and its stream where the payload starts.
-    fn payload_stream(&self, seq: u32) -> (Poly1305, ChaCha20Legacy) {
-        let mut stream = Self::stream(&self.main, seq);
-        let mut poly_key = [0u8; 32];
-        stream.apply_keystream(&mut poly_key);
-        stream.seek(PAYLOAD_OFFSET);
-        (Poly1305::new(poly1305::Key::from_slice(&poly_key)), stream)
+    /// The tag over `packet` -- the length and the payload, encrypted.
+    fn tag(&self, seq: u32, packet: &[u8]) -> [u8; TAG_LEN] {
+        let mut key = self.mac_key(seq);
+        let tag = self.primitives.poly1305(&key, packet);
+        key.zeroize();
+        tag
     }
 
     /// A packet's length field, from the 4 bytes it starts with on the wire.
     pub fn length(&self, seq: u32, wire: &[u8]) -> u32 {
         let mut len = [wire[0], wire[1], wire[2], wire[3]];
-        Self::stream(&self.header, seq).apply_keystream(&mut len);
+        self.primitives.chacha20(&self.header, &counter(seq, 0), &mut len);
         u32::from_be_bytes(len)
     }
 
@@ -64,28 +92,24 @@ impl ChaChaPoly {
     /// -- and decrypts the payload, all of it past the first 4 bytes, in
     /// place. False, with nothing decrypted, when the tag is wrong.
     pub fn open(&self, seq: u32, packet: &mut [u8], tag: &[u8]) -> bool {
-        let (mac, mut stream) = self.payload_stream(seq);
-        let expected = mac.compute_unpadded(packet);
+        let expected = self.tag(seq, packet);
         if !bool::from(expected.as_slice().ct_eq(tag)) {
             return false;
         }
-        stream.apply_keystream(&mut packet[4..]);
+        self.primitives.chacha20(&self.main, &counter(seq, PAYLOAD_BLOCK), &mut packet[4..]);
         true
     }
 
     /// Encrypts `packet` in place -- its plaintext length, then the rest --
     /// and gives back the tag that follows it on the wire.
     pub fn seal(&self, seq: u32, packet: &mut [u8]) -> [u8; TAG_LEN] {
-        Self::stream(&self.header, seq).apply_keystream(&mut packet[..4]);
-        let (mac, mut stream) = self.payload_stream(seq);
-        stream.apply_keystream(&mut packet[4..]);
-        let mut tag = [0u8; TAG_LEN];
-        tag.copy_from_slice(mac.compute_unpadded(packet).as_slice());
-        tag
+        self.primitives.chacha20(&self.header, &counter(seq, 0), &mut packet[..4]);
+        self.primitives.chacha20(&self.main, &counter(seq, PAYLOAD_BLOCK), &mut packet[4..]);
+        self.tag(seq, packet)
     }
 }
 
-impl Drop for ChaChaPoly {
+impl Drop for ChaChaPoly<'_> {
     fn drop(&mut self) {
         self.main.zeroize();
         self.header.zeroize();
@@ -93,20 +117,41 @@ impl Drop for ChaChaPoly {
 }
 
 /// A session's own random stream: ChaCha20 keyed from the machine's pool
-/// once, when the session starts. Padding and a rekey's ephemeral key come
-/// from it: no call into the kernel on the way out of a packet, and nothing
-/// that can fail half-way through one.
-pub struct Rng {
-    stream: ChaCha20,
+/// once, when the session starts, a fill a run of its blocks -- a 64-bit
+/// count of them, the nonce zero, so none comes twice. Padding and a
+/// rekey's ephemeral key come from it: no call into the kernel on the way
+/// out of a packet, and nothing that can fail half-way through one.
+pub struct Rng<'p> {
+    primitives: &'p dyn Primitives,
+    seed: [u8; 32],
+    /// The stream's next block: what the last fill left of its last block
+    /// is not used.
+    block: u64,
 }
 
-impl Rng {
-    pub fn new(seed: &[u8; 32]) -> Self {
-        Self { stream: ChaCha20::new(Key::from_slice(seed), Nonce::from_slice(&[0u8; 12])) }
+impl<'p> Rng<'p> {
+    pub fn new(primitives: &'p dyn Primitives, seed: &[u8; 32]) -> Self {
+        Self { primitives, seed: *seed, block: 0 }
     }
 
     pub fn fill(&mut self, buf: &mut [u8]) {
         buf.fill(0);
-        self.stream.apply_keystream(buf);
+        let mut at = 0;
+        while at < buf.len() {
+            /* A call takes the counter's low word to 2^32 at most: the
+             * high word moves on between two */
+            let room = ((1u64 << 32) - (self.block & 0xffff_ffff)).saturating_mul(64);
+            let end = buf.len().min(at.saturating_add(usize::try_from(room).unwrap_or(usize::MAX)));
+            let counter = [self.block as u32, (self.block >> 32) as u32, 0, 0];
+            self.primitives.chacha20(&self.seed, &counter, &mut buf[at..end]);
+            self.block += ((end - at) as u64).div_ceil(64);
+            at = end;
+        }
+    }
+}
+
+impl Drop for Rng<'_> {
+    fn drop(&mut self) {
+        self.seed.zeroize();
     }
 }
