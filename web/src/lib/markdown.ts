@@ -287,6 +287,14 @@ function rehypeLinks() {
         visit(tree, "element", (node: Element) => {
             if (node.tagName === "a" && typeof node.properties.href === "string") {
                 node.properties.href = rewriteHref(node.properties.href, ctx, errors);
+                /* An image's full size opens in a tab of its own, so the post
+                 * is never left and gone back to: Safari, back on a post whose
+                 * screenshot it had shown full size, drew the screenshot's
+                 * recognised text (Live Text) over the page, out of place */
+                if (node.children.some((child) => child.type === "element" && child.tagName === "img")) {
+                    node.properties.target = "_blank";
+                    node.properties.rel = ["noopener"];
+                }
             } else if (node.tagName === "img" && typeof node.properties.src === "string") {
                 const src = node.properties.src;
                 if (!schemeRe.test(src) && !src.startsWith("/") && ctx.repoDir !== null) {
