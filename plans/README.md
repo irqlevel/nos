@@ -56,6 +56,8 @@ networks across the hosts of a cluster: private addresses wherever a VM
 runs, NAT to the internet, a public address for a VM that wants one.
 [vmctl.md](vmctl.md) sketches what comes after them: the cluster's VMs,
 placed by a scheduler on hosts with room and restarted where their host died.
+[vm-migration.md](vm-migration.md) is a running VM moved to another host,
+its memory copied as it runs, its disk on NBS and its network vnet's.
 [review-2026-11-open.md](review-2026-11-open.md) is what the review of
 2026-11-12 -- the Rust ffi, base and hypervisor -- left open.
 
