@@ -11,6 +11,8 @@
 //!   or a `join` that did not finish left, and the next one clears it;
 //! - `raft/`, the member's log (`raft::log::DiskLog`), over raftmember's
 //!   `KFiles`;
+//! - `begun`, the mark that the member began its log, which raftmember
+//!   writes before the log's first segment and holds a log gone to;
 //! - `.sync`, an empty file a sync of the directory syncs: nos's file
 //!   system makes everything durable at any file's sync.
 
@@ -18,8 +20,6 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-use kcore::error::Error;
-use raftmember::KFiles;
 
 pub const DEFAULT_DIR: &str = "/etc/cluster";
 /// The member file's most bytes: its first line, and a line of each host
@@ -68,12 +68,8 @@ pub use codec::{hex, unhex};
 
 /// The member file, if there is one: None for a host in no cluster.
 pub fn read_member(dir: &Dir) -> Result<Option<Member>, String> {
-    let path = dir.path("member");
-    let bytes = match kcore::fs::read(&path, MEMBER_MAX) {
-        Ok(b) => b,
-        Err(Error::NotFound) => return Ok(None),
-        Err(_) => return Err(alloc::format!("cannot read {}", path)),
-    };
+    let path = dir.path(raftmember::MEMBER_FILE);
+    let Some(bytes) = raftmember::read_member_file(&dir.root, MEMBER_MAX)? else { return Ok(None) };
     let text = core::str::from_utf8(&bytes).map_err(|_| alloc::format!("{} is not text", path))?;
     let mut lines = text.lines();
     let first: Vec<&str> = lines.next().unwrap_or("").split_whitespace().collect();
@@ -107,7 +103,6 @@ pub fn read_member(dir: &Dir) -> Result<Option<Member>, String> {
 /// The member file written, once and synced: refused where there is one.
 /// A write that failed part way leaves none.
 pub fn create_member(dir: &Dir, m: &Member) -> Result<(), String> {
-    let _ = kcore::fs::create_dir(&dir.root);
     let mut text = alloc::format!("{} {} {}\n", m.node, hex(&m.cluster), m.name);
     for h in &m.hosts {
         let _ = write!(text, "{} {} {}", h.name, h.node, crate::IpPort(h.ip, h.port));
@@ -116,31 +111,17 @@ pub fn create_member(dir: &Dir, m: &Member) -> Result<(), String> {
         }
         text.push('\n');
     }
-    let path = dir.path("member");
-    match kcore::fs::create(&path, text.as_bytes()) {
-        Ok(()) => Ok(()),
-        Err(Error::Busy) => Err(alloc::format!("{} is there already", path)),
-        Err(_) => {
-            let _ = kcore::fs::remove(&path);
-            Err(alloc::format!("cannot write {}", path))
-        }
-    }
+    raftmember::create_member_file(&dir.root, text.as_bytes())
 }
 
 /// The member file taken away: an `init` undone.
 pub fn remove_member(dir: &Dir) -> Result<(), String> {
-    let path = dir.path("member");
-    match kcore::fs::remove(&path) {
-        Ok(()) | Err(Error::NotFound) => Ok(()),
-        Err(_) => Err(alloc::format!("cannot remove {}", path)),
-    }
+    raftmember::remove_member_file(&dir.root)
 }
 
-/// Every file of `raft/` removed: what an `init` or a `join` that did not
-/// finish left, which a member file does not name -- never a member's log.
+/// Every file of `raft/` removed, and `begun`: what an `init` or a `join`
+/// that did not finish left, which a member file does not name -- never a
+/// member's log.
 pub fn clear_log(dir: &Dir) -> Result<(), String> {
-    if read_member(dir)?.is_some() {
-        return Err(alloc::format!("{} names a member: its log is not cleared", dir.path("member")));
-    }
-    KFiles::new(&dir.root, "raft")?.clear()
+    raftmember::clear_log(&dir.root)
 }

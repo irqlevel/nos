@@ -22,6 +22,17 @@ export function worst(a: Tone, b: Tone): Tone {
   return TONE_RANK.indexOf(a) <= TONE_RANK.indexOf(b) ? a : b;
 }
 
+/** Where a parameter's values come from (the format's `choices`): a read of
+ * a provider's on the same host -- `items` the list in its answer, `key`
+ * each item's value. A form offers them as a list; a value not among them
+ * is the host's to refuse, and a read that fails leaves the field typed. */
+export interface Choices {
+  provider: string;
+  method: string;
+  items: string;
+  key: string;
+}
+
 export interface Field {
   type: string;
   title: Text;
@@ -34,6 +45,7 @@ export interface Field {
   required?: boolean;
   default?: string | number | boolean | null;
   of?: string;
+  choices?: Choices;
 }
 
 export interface Method {

@@ -119,9 +119,9 @@ enum class Id : u16
     NbsCsReq,
     NbsCsDone,
     /* Raft's (group "raft"), recorded by raftmember for the cluster's
-       registry and NBS's metadata service alike: a member's role, term or
-       leader changed; a message sent and one taken in; its commit and its
-       apply moving on. */
+       registry, NBS's metadata service and vnet's state alike: a member's
+       role, term or leader changed; a message sent and one taken in; its
+       commit and its apply moving on. */
     RaftRole,
     RaftSend,
     RaftRecv,
@@ -132,6 +132,19 @@ enum class Id : u16
     IpcnetLink,
     IpcnetQueue,
     IpcnetBounce,
+
+    /* The guests' firewalls' (group "fw"), recorded by the hv module's
+       switch: each packet to or from a VM its firewall kept out -- which
+       way, what kept it out, and what it was. */
+    FwDeny,
+
+    /* vnet's tunnel between hosts (group "tunnel"), recorded by the hv
+       module's tunnel: a datagram of its not taken, or a packet not sent
+       into it, and why; and its keys with another host -- given, taken,
+       dropped, asked for -- a host gone silent, a way narrower than the
+       networks' MTU. */
+    TunnelDrop,
+    TunnelKey,
 
     Count
 };
@@ -209,6 +222,9 @@ enum class Kind : u8
     /* A task's name: the field's bytes, up to the first zero, printed as a
        string -- what a task is called, not what it points at. */
     Comm,
+    /* An IPv4 address, the first octet in its most significant byte as
+       the network layer holds one: printed a.b.c.d. */
+    Ipv4,
 };
 
 struct Field
@@ -658,6 +674,54 @@ struct TcpWait
     u8 slot;
     u8 what;
     u8 pad[2];
+};
+
+/* fw_deny: a packet to or from a VM its firewall kept out (the hv module's
+   switch): the other end's address and the two ports where the packet has
+   them, the switch's port the VM is on and its firewall's place there,
+   which way it went (FW_DIR), what kept it out (FW_WHY) -- for a rule, its
+   number from 1 -- and the IP protocol. */
+struct FwDeny
+{
+    u32 peer;
+    u16 lport;
+    u16 rport;
+    u8 port;
+    u8 place;
+    u8 dir;
+    u8 why;
+    u8 rule;
+    u8 proto;
+    u8 pad[2];
+};
+
+/* tunnel_drop: a datagram of vnet's tunnel not taken, or a packet not sent
+   into it (the hv module's tunnel): the other host's underlay address and
+   port -- as the table has them, or as the datagram came where no host's
+   key opens it -- the network it was of, its key's number and its counter's
+   low word -- 0 for what it had not -- what it carried (TUNNEL_KIND) and
+   why (TUNNEL_WHY). */
+struct TunnelDrop
+{
+    u32 peer;
+    u32 network;
+    u32 key;
+    u32 counter;
+    u16 peer_port;
+    u8 kind;
+    u8 why;
+};
+
+/* tunnel_key: the tunnel's keys with another host (TUNNEL_KEY): its
+   underlay address and port, and the key's number where one is meant (0
+   else). */
+struct TunnelKey
+{
+    u32 peer;
+    u32 number;
+    u16 peer_port;
+    u8 what;
+    u8 pad;
 };
 
 /* mm_zero: a zeroing task's batch -- the free pages it zeroed, 4 KiB ones

@@ -46,6 +46,7 @@ use mgmtwire::{Invalid, Params, Value};
 
 use crate::cloud;
 use crate::config::{self, Options};
+use crate::firewalls::Refused;
 use crate::forward;
 use crate::net;
 use crate::store::{self, Folder};
@@ -84,6 +85,9 @@ const METHODS: [Method; 26] = [
     Method { name: "image", kind: Kind::Job },
 ];
 
+/// The longest public address as a person writes one, `a.b.c.d`.
+const PUBLIC_MAX: usize = 15;
+
 /// What a page of the console is, by default and at most.
 const CONSOLE_PAGE: u64 = 16 * 1024;
 const CONSOLE_PAGE_MAX: u64 = 64 * 1024;
@@ -107,17 +111,17 @@ pub fn register(state: alloc::sync::Arc<State>) -> Result<Provider, Status> {
 
 /* ---- answering ---- */
 
-fn refuse(call: &mut Call, status: Status, message: &str, field: Option<&str>) -> Status {
+pub(crate) fn refuse(call: &mut Call, status: Status, message: &str, field: Option<&str>) -> Status {
     call.json(|w| status.write_error(w, message, field));
     status
 }
 
-fn invalid(call: &mut Call, e: Invalid) -> Status {
+pub(crate) fn invalid(call: &mut Call, e: Invalid) -> Status {
     refuse(call, Status::Invalid, e.why, Some(e.field))
 }
 
 /// The answer `write` makes: Ok, or TooLarge where the caller took less.
-fn answer(call: &mut Call, write: impl FnOnce(&mut Writer)) -> Status {
+pub(crate) fn answer(call: &mut Call, write: impl FnOnce(&mut Writer)) -> Status {
     if call.json(write) { Status::Ok } else { Status::TooLarge }
 }
 
@@ -210,14 +214,20 @@ impl Drop for Job<'_> {
 
 /* ---- the calls ---- */
 
+/// A call's parameters as the bus reads JSON: null for none -- or the call
+/// refused.
+pub(crate) fn value_of(params: &[u8], call: &mut Call) -> Result<Value, Status> {
+    if params.is_empty() {
+        return Ok(Value::Null);
+    }
+    mgmtwire::json::parse(params, &mgmtwire::Limits::PARAMS)
+        .map_err(|_| refuse(call, Status::Invalid, "the parameters are not JSON as the bus reads it", None))
+}
+
 fn provide(state: &State, method: &str, params: &[u8], call: &mut Call) -> Status {
-    let value = if params.is_empty() {
-        Value::Null
-    } else {
-        match mgmtwire::json::parse(params, &mgmtwire::Limits::PARAMS) {
-            Ok(v) => v,
-            Err(_) => return refuse(call, Status::Invalid, "the parameters are not JSON as the bus reads it", None),
-        }
+    let value = match value_of(params, call) {
+        Ok(v) => v,
+        Err(s) => return s,
     };
     let p = match Params::new(&value) {
         Ok(p) => p,
@@ -255,7 +265,7 @@ fn provide(state: &State, method: &str, params: &[u8], call: &mut Call) -> Statu
 }
 
 /// `p` done with: refused if it was handed a parameter it does not take.
-fn finish(p: Params, call: &mut Call) -> Result<(), Status> {
+pub(crate) fn finish(p: Params, call: &mut Call) -> Result<(), Status> {
     p.finish().map_err(|e| invalid(call, e))
 }
 
@@ -286,7 +296,7 @@ fn ipv4(w: &mut Writer, key: &str, ip: u32) {
 /// A VM as `list` and `get` say it: its folder's configuration, when it has
 /// one, and what of it runs, when it is on the list.
 fn vm_json(w: &mut Writer, name: Option<&str>, c: Option<&Result<config::Config, String>>, l: Option<&Listed>,
-           doing: Option<&str>) {
+           doing: Option<&str>, judged: &[(usize, String)]) {
     w.begin_object();
     w.key("name");
     match name.or(l.and_then(|l| l.name.as_deref())) {
@@ -338,13 +348,31 @@ fn vm_json(w: &mut Writer, name: Option<&str>, c: Option<&Result<config::Config,
         None => w.null(),
     }
     w.key("ip");
-    match port.filter(|&p| p < net::MAX_PORTS) {
-        Some(p) => w.str(&net::dotted(net::port_ip(p))),
-        None => w.null(),
+    match (l.and_then(|l| l.ip), port.filter(|&p| p < net::MAX_PORTS)) {
+        (Some(ip), _) => w.str(&net::dotted(ip)),
+        /* Not running: the port its vm.toml names has the address it will */
+        (None, Some(p)) if l.is_none() => w.str(&net::dotted(net::port_ip(p))),
+        _ => w.null(),
     }
     w.key("network");
     match o.and_then(|o| o.network.as_deref()) {
         Some(n) => w.str(n),
+        None => w.null(),
+    }
+    /* The firewall it is judged by: the switch's, where it runs with a NIC;
+     * its vm.toml's otherwise -- none in one written before firewalls,
+     * which its first start gives one (`Firewalls::adopt`). */
+    w.key("firewall");
+    let running_on = l.and_then(|l| l.port).and_then(|p| judged.iter().find(|(q, _)| *q == p));
+    match running_on.map(|(_, n)| n.as_str()).or_else(|| o.and_then(|o| o.firewall.as_deref())) {
+        Some(n) => w.str(n),
+        None => w.null(),
+    }
+    /* Its public address: the switch's, where it runs and has one; its
+     * vm.toml's otherwise. */
+    w.key("public");
+    match l.and_then(|l| l.public).or_else(|| o.and_then(|o| o.public)) {
+        Some(a) => w.str(&net::dotted(a)),
         None => w.null(),
     }
     w.key("kernel");
@@ -363,6 +391,12 @@ fn vm_json(w: &mut Writer, name: Option<&str>, c: Option<&Result<config::Config,
         }
     }
     w.end_object();
+}
+
+/// The firewall each port of the switch with a VM on it is judged by: what
+/// a running VM's row says it is on.
+fn judged(state: &State) -> Vec<(usize, String)> {
+    state.vms.switch_now().map_or_else(Vec::new, |s| state.vms.firewalls.on_ports(&s))
 }
 
 /// The VMs' folders under the root, by name, and what each one's vm.toml
@@ -389,18 +423,19 @@ fn list(state: &State, p: Params, call: &mut Call) -> Status {
         return refuse(call, Status::Busy, "no memory for the list of vms", None);
     };
     let folders = folders(state);
+    let judged = judged(state);
     answer(call, |w| {
         w.begin_object();
         w.key("vms");
         w.begin_list();
         for (name, c) in &folders {
-            vm_json(w, Some(name), Some(c), on_list(&listed, name), state.vms.doing(name));
+            vm_json(w, Some(name), Some(c), on_list(&listed, name), state.vms.doing(name), &judged);
         }
         /* Being made, with no vm.toml yet; and on the list with no folder,
          * or with one gone meanwhile. */
         for l in &listed {
             if l.name.as_deref().is_none_or(|n| !folders.iter().any(|(f, _)| f == n)) {
-                vm_json(w, None, None, Some(l), None);
+                vm_json(w, None, None, Some(l), None, &judged);
             }
         }
         w.end_list();
@@ -428,10 +463,11 @@ fn get(state: &State, mut p: Params, call: &mut Call) -> Status {
     let doing = state.vms.doing(name);
     let rows = state.forwards.rows();
     let id = on_list(&listed, name).map(|l| l.id);
+    let judged = judged(state);
     answer(call, |w| {
         w.begin_object();
         w.key("vm");
-        vm_json(w, Some(name), Some(&c), on_list(&listed, name), doing);
+        vm_json(w, Some(name), Some(&c), on_list(&listed, name), doing, &judged);
         if let Ok(conf) = &c {
             w.key("config");
             config_json(w, conf);
@@ -667,6 +703,7 @@ fn forward_json(w: &mut Writer, r: &forward::Row, name: Option<&str>) {
     w.field_uint("active", r.active as u64);
     w.field_uint("accepted", r.accepted);
     w.field_uint("refused", r.refused);
+    w.field_uint("denied", r.denied);
     w.field_uint("failed", r.failed);
     w.field_uint("stalled", r.stalled);
     w.end_object();
@@ -738,7 +775,9 @@ fn networks(state: &State, p: Params, call: &mut Call) -> Status {
         return refuse(call, Status::Busy, "no memory for the list of vms", None);
     };
     let switch = state.vms.switch_now();
-    /* Each VM with a port, and the network it is on: None alone. */
+    let keeper = state.vms.keeper();
+    /* Each VM with a port, and the network it is on: None alone -- one of
+     * the cluster's by its name there. */
     let mut on: Vec<(String, Option<String>)> = Vec::new();
     for l in &listed {
         let Some(port) = l.port else { continue };
@@ -746,11 +785,19 @@ fn networks(state: &State, p: Params, call: &mut Call) -> Status {
             Some(n) => n.clone(),
             None => alloc::format!("vm{}", l.id),
         };
+        let network = match keeper.as_ref().and_then(|k| k.said(port)) {
+            Some((n, _, _)) => Some(alloc::format!("{}{}", crate::vnet::PREFIX, n)),
+            None => switch.as_ref().and_then(|s| s.network_of(port)),
+        };
         if on.try_reserve(1).is_ok() {
-            on.push((name, switch.as_ref().and_then(|s| s.network_of(port))));
+            on.push((name, network));
         }
     }
-    let mut names: Vec<&str> = on.iter().filter_map(|(_, n)| n.as_deref()).collect();
+    /* The host's networks VMs are on, and every one of the cluster's -- a
+     * VM is made on one, as on the host's */
+    let cluster = crate::vnet::networks();
+    let mut names: Vec<String> = on.iter().filter_map(|(_, n)| n.clone()).collect();
+    names.extend(cluster.iter().map(|n| alloc::format!("{}{}", crate::vnet::PREFIX, n.name)));
     names.sort_unstable();
     names.dedup();
     answer(call, |w| {
@@ -760,9 +807,15 @@ fn networks(state: &State, p: Params, call: &mut Call) -> Status {
         for n in &names {
             w.begin_object();
             w.field_str("name", n);
+            let of = crate::vnet::cluster_network(n).and_then(|c| cluster.iter().find(|x| x.name == c));
+            w.field_bool("cluster", of.is_some());
+            if let Some(c) = of {
+                w.field_str("subnet", &c.subnet);
+                w.field_uint("free", c.free);
+            }
             w.key("vms");
             w.begin_list();
-            for (vm, _) in on.iter().filter(|(_, net)| net.as_deref() == Some(*n)) {
+            for (vm, _) in on.iter().filter(|(_, net)| net.as_deref() == Some(n.as_str())) {
                 w.str(vm);
             }
             w.end_list();
@@ -1000,12 +1053,14 @@ fn forward_add(state: &State, mut p: Params, call: &mut Call) -> Status {
     /* Running: relayed from now on too -- a forward to it on that port
      * taken away first, for its guest port may be another. */
     let mut live = false;
-    if let (Some(id), Some(host)) = (id, state.vms.host_nic()) {
-        if let Some(ip) = state.vms.address_of(id) {
+    if let (Some(id), Some(host), Some(switch)) = (id, state.vms.host_nic(), state.vms.switch_now()) {
+        if let Some(vm_port) = state.vms.port_of(id) {
             if state.forwards.vm_of(port) == Some(id) {
                 let _ = state.forwards.del(port);
             }
-            let to = forward::To { guest_ip: ip, guest_port, host, outer: state.vms.outer_nic() };
+            let to = forward::To {
+                guest_ip: switch.ip_of(vm_port), guest_port, host, outer: state.vms.outer_nic(), switch, port: vm_port,
+            };
             match state.forwards.add(port, id, to, &|| state.vms.on_list(id), &mut Quiet) {
                 Ok(()) => live = true,
                 Err(e) => return refuse(call, Status::Failed, &alloc::format!("kept in its vm.toml, but not relayed now \
@@ -1356,6 +1411,8 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
         let mem = p.opt_uint("memory_mib", 64, u64::MAX)?;
         let cpus = p.opt_uint("cpus", 1, u64::from(u32::MAX))?;
         let network = p.opt_str("network", config::NETWORK_NAME_MAX)?;
+        let firewall = p.opt_str("firewall", firewall::NAME_MAX)?;
+        let public = p.opt_str("public", PUBLIC_MAX)?;
         let password = p.opt_str("password", cloud::MAX_PASSWORD)?;
         let user_data = p.opt_text("user_data", cloud::MAX_USER_DATA)?;
         let port = p.opt_uint("port", 0, net::MAX_PORTS as u64 - 1)?;
@@ -1363,9 +1420,10 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
         let start = p.opt_bool("start")?.unwrap_or(false);
         let onto = p.opt_str("onto", DEVICE_MAX)?;
         let force = p.opt_bool("force")?.unwrap_or(false);
-        Ok((size, mem, cpus, network, password, user_data, port, protected, start, onto, force))
+        Ok((size, mem, cpus, network, firewall, public, password, user_data, port, protected, start, onto, force))
     })();
-    let (size, mem, cpus, network, password, user_data, port, protected, start, onto, force) = match fields {
+    let (size, mem, cpus, network, firewall, public, password, user_data, port, protected, start, onto, force) =
+        match fields {
         Ok(f) => f,
         Err(e) => return invalid(call, e),
     };
@@ -1377,8 +1435,24 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
         return s;
     }
     if network.is_some_and(|n| !config::valid_network(n)) {
-        return refuse(call, Status::Invalid, "is a network's name: a letter or a digit, then letters, digits, . _ and -",
+        return refuse(call, Status::Invalid, "is a network's name -- a letter or a digit, then letters, digits, . _ \
+                                              and -; vnet: before it for one of the cluster's",
                       Some("network"));
+    }
+    let public = match public.map(config::public) {
+        Some(None) => return refuse(call, Status::Invalid, "is an address a host may have -- a.b.c.d", Some("public")),
+        Some(Some(a)) => Some(a),
+        None => None,
+    };
+    /* A firewall there is no file of would keep it from starting: said
+     * before an image is fetched for it. On a network of the cluster's it
+     * is the cluster's, which vnet says of as the port is made. */
+    let cluster = network.is_some_and(|n| config::cluster_network(n).is_some());
+    if let Some(f) = firewall.filter(|_| !cluster) {
+        if let Err(e) = state.vms.firewalls.rows(Some(f)) {
+            let status = if matches!(e, Refused::Failed(_)) { Status::Failed } else { Status::Invalid };
+            return refuse(call, status, e.text(), Some("firewall"));
+        }
     }
     /* The user-data is what cloud-init reads: a password beside it was
      * dropped without a word, the answer saying `keys: 0`. */
@@ -1404,6 +1478,8 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
         mem_mib: mem,
         cpus: cpus.map(|n| n as u32),
         network: network.map(String::from),
+        firewall: firewall.map(String::from),
+        public,
         port: port.map(|n| n as u32),
         forwards,
         ..Options::default()
@@ -1639,6 +1715,9 @@ fn delete(state: &State, mut p: Params, call: &mut Call) -> Status {
         let d = store::delete(&state.vms_root, &state.vms, name, keep, force);
         if let Ok(d) = &d {
             let _ = writeln!(job, "{} deleted -- {} files and folders taken away", name, d.removed);
+            if let Some(Err(why)) = &d.port {
+                let _ = writeln!(job, "its port of vnet's left -- {}: `vnet port delete` it", why);
+            }
         }
         d
     };

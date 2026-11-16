@@ -339,6 +339,80 @@ names! {
         Reneged = "reneged",
     }
 
+    /// Which way a packet a firewall kept out went (`fw_deny`'s `dir`)
+    FwDir {
+        /// To the VM
+        In = "in",
+        /// From it
+        Out = "out",
+    }
+
+    /// What kept it out (`fw_deny`'s `why`)
+    FwWhy {
+        /// A rule of its firewall's
+        Rule = "rule",
+        /// Its direction's policy
+        Policy = "policy",
+        /// An address not the VM's: to it for another, or from it as another
+        Stray = "stray",
+        /// An IPv4 fragment, which carries no ports
+        Fragment = "fragment",
+        /// IPv4 that does not hold together
+        Broken = "broken",
+        /// IPv6 its firewall does not let through
+        V6 = "ipv6",
+        /// A port with no table or no firewall to judge it by
+        Unready = "unready",
+    }
+
+    /// What a datagram of vnet's tunnel carried (`tunnel_drop`'s `kind`):
+    /// vnetwire's numbers, and none for one with no header
+    TunnelKind {
+        None = "none",
+        Port = "port",
+        ToGateway = "to_gateway",
+        FromGateway = "from_gateway",
+        Echo = "echo",
+        EchoAnswer = "echo_answer",
+    }
+
+    /// Why the tunnel took a datagram, or sent a packet, no further
+    /// (`tunnel_drop`'s `why`)
+    TunnelWhy {
+        /// From no host of the cluster's
+        Unknown = "unknown",
+        /// Under no key known -- or, sending, with none to send by
+        NoKey = "no_key",
+        /// A counter its key's window has seen
+        Replayed = "replayed",
+        /// A tag that does not hold
+        Forged = "forged",
+        /// What the table does not let through
+        Stale = "stale",
+        /// No header
+        Malformed = "malformed",
+        /// No room on the uplink, or in the pool
+        NoRoom = "no_room",
+        /// No next hop known
+        NoHop = "no_hop",
+    }
+
+    /// What happened to the tunnel's keys with a host (`tunnel_key`'s `what`)
+    TunnelKeyWhat {
+        /// A key given it, to seal to this host with
+        Given = "given",
+        /// One taken from it
+        Taken = "taken",
+        /// Its keys dropped: a new instance of its hv's, or its going
+        Dropped = "dropped",
+        /// A key asked of it
+        Asked = "asked",
+        /// Its echoes stopped: the key to it no longer trusted
+        Silent = "silent",
+        /// The way to it does not carry the networks' MTU
+        Narrow = "narrow",
+    }
+
     /// What a program's TCP call waited for (`tcp_wait`'s `what`)
     TcpWaitFor {
         /// Room in the send buffer
@@ -412,6 +486,8 @@ names! {
         Registry = "registry",
         /// NBS's metadata (nbs-mds.ko)
         Nbs = "nbs",
+        /// vnet's state: the cluster's networks for VMs (vnet.ko)
+        Vnet = "vnet",
     }
 
     /// A raft member's role (`raft_role`'s `role`): raft's `Role`
@@ -876,5 +952,52 @@ events! {
         peer: u16,
         bulk: u8,
         why: u8 as IpcnetWhy,
+    }
+
+    /// `fw_deny`: a packet to or from a VM its firewall kept out -- in the
+    /// hv module's switch, or a client the forward's relay held to it
+    FwDeny = 51, "fw_deny" {
+        /// The other end's IPv4 address; 0 where the packet has none
+        peer: u32,
+        /// The VM's port and the other end's, where the protocol has them
+        lport: u16,
+        rport: u16,
+        /// The switch's port the VM is on, and its firewall's place there
+        port: u8,
+        place: u8,
+        dir: u8 as FwDir,
+        why: u8 as FwWhy,
+        /// The rule that kept it out, from 1; 0 where none did
+        rule: u8,
+        proto: u8,
+        _pad: [u8; 2],
+    }
+
+    /// `tunnel_drop`: a datagram of vnet's tunnel not taken, or a packet
+    /// not sent into it -- in the hv module's tunnel
+    TunnelDrop = 52, "tunnel_drop" {
+        /// The other host's underlay address, and its port below: as the
+        /// table has them, or as the datagram came where no host's key
+        /// opens it
+        peer: u32,
+        /// The network it was of, its key's number and its counter's low
+        /// word: 0 for what it had not
+        network: u32,
+        key: u32,
+        counter: u32,
+        peer_port: u16,
+        kind: u8 as TunnelKind,
+        why: u8 as TunnelWhy,
+    }
+
+    /// `tunnel_key`: the tunnel's keys with another host
+    TunnelKey = 53, "tunnel_key" {
+        /// The other host's underlay address, and its port below
+        peer: u32,
+        /// The key's number where one is meant; 0 else
+        number: u32,
+        peer_port: u16,
+        what: u8 as TunnelKeyWhat,
+        _pad: u8,
     }
 }

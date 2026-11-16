@@ -20,6 +20,8 @@ kcore = { path = "../../../base/kcore" }
 raft = { path = "../../../common/cluster/raft" }
 raftmember = { path = "../../cluster/raftmember" }
 nbsmeta = { path = "../../../common/storage/nbsmeta" }
+# The cluster's members, as every group whose hosts are offered it keeps them.
+members = { path = "../../../common/cluster/members" }
 # A device's slots, as the cs's format lays it out; what the cs asks of the
 # mds, and what `nbs io held` says to the cs's.
 nbscs = { path = "../../../common/storage/nbscs" }

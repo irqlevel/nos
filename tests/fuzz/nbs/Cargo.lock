@@ -64,6 +64,13 @@ name = "ipcwire"
 version = "0.1.0"
 
 [[package]]
+name = "members"
+version = "0.1.0"
+dependencies = [
+ "ipcwire",
+]
+
+[[package]]
 name = "nbs-fuzz"
 version = "0.1.0"
 dependencies = [
@@ -97,8 +104,9 @@ version = "0.1.0"
 dependencies = [
  "codec",
  "ipcwire",
+ "members",
  "raft",
- "sha2",
+ "rsmkit",
 ]
 
 [[package]]
@@ -115,6 +123,15 @@ name = "raft"
 version = "0.1.0"
 dependencies = [
  "crc",
+]
+
+[[package]]
+name = "rsmkit"
+version = "0.1.0"
+dependencies = [
+ "codec",
+ "raft",
+ "sha2",
 ]
 
 [[package]]

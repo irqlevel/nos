@@ -1,0 +1,30 @@
+[package]
+name = "mod-vnet"
+version = "0.1.0"
+edition = "2021"
+
+# vnet (plans/vnet.md): the cluster's networks for VMs on its hosts -- a
+# raft group of its own, `vnet.raft` on every member, over raftmember's
+# engine and its offered group: the networks, their ports, the public
+# addresses and the cluster's firewalls (vnetmeta), the `vnet` command and
+# provider. hv takes its ports and its table from the member on its host
+# (V2); this module keeps them.
+[lib]
+name = "mod_vnet"
+crate-type = ["staticlib"]
+
+[dependencies]
+kmod = { path = "../../../base/kmod" }
+kcore = { path = "../../../base/kcore" }
+raft = { path = "../../../common/cluster/raft" }
+raftmember = { path = "../../cluster/raftmember" }
+members = { path = "../../../common/cluster/members" }
+vnetmeta = { path = "../../../common/net/vnetmeta" }
+firewall = { path = "../../../common/net/firewall" }
+netwire = { path = "../../../common/net/netwire" }
+codec = { path = "../../../common/codec" }
+# The table's digest of the registry's hosts.
+crc = { path = "../../../common/crc" }
+# The provider's parameters, and the cluster provider's answers, read as the
+# bus reads JSON.
+mgmtwire = { path = "../../../common/ipc/mgmtwire" }

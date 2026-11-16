@@ -30,8 +30,14 @@ its own, each seed a different set of inputs:
     python3 tests/hv-fuzz.py --seed 7 --seconds 300   # five minutes a target
     python3 tests/hv-fuzz.py --target platform --target blk
     python3 tests/hv-fuzz.py --replay platform out/hv-fuzz/findings/X.hex
+    python3 tests/hv-fuzz.py --mutants                # the gate, then tests/fuzz/hv/mutants.py
 
-Needs cargo on the host; the program has no dependencies and builds offline.
+tests/fuzz/hv/mutants.py takes one rule of the guests' firewall -- its crate's,
+or the switch's use of it -- out at a time, and the targets that hold it must
+find each: a rule no target notices the loss of is one the gate does not hold.
+
+Needs cargo on the host; it builds offline, its one crate from outside the
+tree -- vnetwire's cipher -- the vendored copy the kernel builds.
 Exit code 0 = no finding; 1 = a finding; 3 = a hang.
 """
 
@@ -42,6 +48,12 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 OUT = os.path.join(ROOT, 'out', 'hv-fuzz')
+VENDOR = os.path.join(ROOT, 'src', 'crates', 'vendor')
+
+# The RustCrypto crates on the software backends the kernel builds them with
+# (src/crates/.cargo/config.toml): the tunnel's seal fuzzed is the one hv.ko
+# runs.
+RUSTFLAGS = ['--cfg', 'chacha20_force_soft', '--cfg', 'poly1305_force_soft']
 
 # The gate: enough inputs that every target's deep states are reached --
 # the whole machine's included -- in well under a minute.
@@ -51,9 +63,27 @@ GATE_ITERATIONS = '50000'
 
 def main():
     args = sys.argv[1:]
+    mutants = '--mutants' in args
+    if mutants:
+        args.remove('--mutants')
+        code = gate(args)
+        if code != 0:
+            return code
+        return subprocess.run([sys.executable, os.path.join(HERE, 'fuzz', 'hv', 'mutants.py')], cwd=ROOT).returncode
+    return gate(args)
+
+
+def gate(args):
+    # The kernel's vendored crates, as the kernel's own build takes them --
+    # vnetwire's cipher -- said here, as the fuzzer's manifest is outside
+    # src/crates, and cargo run from the root.
     build = subprocess.run(['cargo', 'build', '--release', '--offline', '--quiet',
                             '--manifest-path', os.path.join(HERE, 'fuzz', 'hv', 'Cargo.toml'),
-                            '--target-dir', OUT])
+                            '--target-dir', OUT,
+                            '--config', 'source.crates-io.replace-with="vendored-sources"',
+                            '--config', 'source.vendored-sources.directory="%s"' % VENDOR,
+                            '--config', 'build.rustflags=[%s]' % ','.join('"%s"' % f for f in RUSTFLAGS)],
+                           cwd=ROOT)
     if build.returncode != 0:
         print('hv-fuzz: the build failed')
         return build.returncode

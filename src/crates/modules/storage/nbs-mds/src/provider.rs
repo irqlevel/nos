@@ -352,9 +352,18 @@ fn status(state: &ModState, p: Params<'_>, call: &mut Call) -> Status {
         return invalid(call, e);
     }
     let Some(v) = view(state) else {
+        /* No member: and why, where this host's did not start -- its log
+           gone beside its `begun` mark, a member file that cannot be read --
+           not taken for a host in no NBS cluster */
+        let held = state.group.runner.held();
         return answer(call, |w| {
             w.begin_object();
             w.field_bool("member", false);
+            w.key("stopped");
+            match &held {
+                Some(why) => w.str(why),
+                None => w.null(),
+            }
             w.end_object();
         });
     };

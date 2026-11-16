@@ -2,9 +2,11 @@
 # The panel's bundle installed anew in its VM on the EX44, its data kept --
 # /var/lib/nos-panel: the hosts it was given, its identity, its user: the
 # bundle onto the AX41's demo server (www/, which the EX44 alone may fetch
-# from), nos's port 2223 forwarded to the VM's ssh for the while, the VM's
-# own nos-panel-fetch run as root there, and the forward taken away
-# whatever happens. The VM is not stopped.
+# from), nos's port 2223 forwarded to the VM's ssh for the while -- and its
+# ssh let in by the VM's firewall, which denies what comes in unless a rule
+# lets it (docs/hypervisor.md, "The firewall"), where no rule does yet --
+# the VM's own nos-panel-fetch run as root there, and the forward and that
+# rule taken away whatever happens. The VM is not stopped.
 #
 #   DEMO_SSH_CONFIG=<ssh config> scripts/demo-stand/panel-update.sh <bundle>
 #
@@ -28,11 +30,28 @@ step() { echo "== $(date +%H:%M:%S) $*"; }
 step "the bundle ($NAME, sha256 ${SHA:0:16}...) onto the AX41's demo server"
 scp -q -o BatchMode=yes "$B" root@$AX41:$D/www/$NAME || exit 1
 
+# The number of the rule of firewall $1 that lets in tcp 22 from anywhere,
+# empty where none does
+ssh_rule() {
+    on_nos "hv fw $1" | awk '$2 == "allow" && $3 == "in" && $4 == "tcp" && $5 == "22" && NF == 7 { print $1; exit }'
+}
+
 step "nos's 2223 forwarded to the panel's ssh"
 on_nos "hv forward add 2223 panel 22" | tail -2
+FW=$(on_nos "hv fw" | sed -n 's/^\([A-Za-z0-9_.-]*\): .*running on it:.* panel (vm [0-9]*).*/\1/p' | head -1)
+ADDED=
+if [ -n "$FW" ] && [ -z "$(ssh_rule "$FW")" ]; then
+    step "its ssh let in by its firewall, $FW, for the while"
+    on_nos "hv fw $FW add allow in tcp 22" | tail -1
+    ADDED=1
+fi
 cleanup() {
     step "the forward taken away"
     on_nos "hv forward del 2223" | tail -2
+    if [ -n "$ADDED" ]; then
+        n=$(ssh_rule "$FW")
+        [ -n "$n" ] && on_nos "hv fw $FW del $n" | tail -1
+    fi
 }
 trap cleanup EXIT
 

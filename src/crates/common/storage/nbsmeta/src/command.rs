@@ -568,6 +568,24 @@ pub enum Refusal {
     OtherFormat,
 }
 
+/// A refusal of the members' rules, as NBS's answers carry it.
+impl From<members::Refusal> for Refusal {
+    fn from(r: members::Refusal) -> Refusal {
+        match r {
+            members::Refusal::Initialized => Refusal::Initialized,
+            members::Refusal::NotInitialized => Refusal::NotInitialized,
+            members::Refusal::BadName => Refusal::BadName,
+            members::Refusal::BadMember => Refusal::BadMember,
+            members::Refusal::HostIsMember => Refusal::HostIsMember,
+            members::Refusal::MemberInUse => Refusal::MemberInUse,
+            members::Refusal::MemberRemoved => Refusal::MemberRemoved,
+            members::Refusal::Full => Refusal::Full,
+            members::Refusal::NoSuchHost => Refusal::NoSuchHost,
+            members::Refusal::LastMember => Refusal::LastMember,
+        }
+    }
+}
+
 impl Refusal {
     pub fn says(self) -> &'static str {
         match self {

@@ -11,12 +11,12 @@
 use alloc::vec::Vec;
 
 use codec::{Source, Stream, Writer};
-use raft::rsm::{Frozen, RestoreError, SnapshotReader};
-use sha2::{Digest as _, Sha256};
+use raft::rsm::{Frozen, RestoreError};
 
 use crate::pieces::Pieces;
 use crate::storage::*;
 use crate::{Cluster, Member, Removed, State, MEMBERS_MAX, NAME_MAX, REMOVED_MAX};
+use members::Members;
 
 /* NBM3: chunks carry their incarnation; NBM4: a writer its client's token;
    NBM5: a cs its state, a set its joiner and its members' last active
@@ -26,11 +26,6 @@ use crate::{Cluster, Member, Removed, State, MEMBERS_MAX, NAME_MAX, REMOVED_MAX}
 const MAGIC: [u8; 4] = *b"NBM7";
 /// Chunks or map entries a record of the stream carries at most.
 const BATCH: usize = 256;
-/// How much a digest asks of the stream at a time.
-const DIGEST_STEP: usize = 64 * 1024;
-/// Checkpoints a member keeps the digest of: a leader's for an older one
-/// cannot be held to.
-const RECENT: usize = 4;
 
 /// Where the stream is.
 #[derive(Clone, Copy)]
@@ -72,7 +67,7 @@ impl FrozenState {
         self.at = match self.at {
             At::Header => {
                 w.fixed(&MAGIC);
-                match &s.cluster {
+                match s.cluster() {
                     Some(c) => {
                         w.u8(1);
                         w.fixed(&c.id);
@@ -85,10 +80,10 @@ impl FrozenState {
                 w.u64(s.next_generation);
                 w.u64(s.next_check);
                 w.u32(s.free_head);
-                w.u8(s.members.len() as u8);
+                w.u8(s.members().len() as u8);
                 At::Members(0)
             }
-            At::Members(i) => match s.members.get(i) {
+            At::Members(i) => match s.members().get(i) {
                 Some(m) => {
                     w.str(&m.host);
                     w.u64(m.id);
@@ -96,11 +91,11 @@ impl FrozenState {
                     At::Members(i + 1)
                 }
                 None => {
-                    w.u32(s.removed.len() as u32);
+                    w.u32(s.removed().len() as u32);
                     At::Removed(0)
                 }
             },
-            At::Removed(i) => match s.removed.get(i) {
+            At::Removed(i) => match s.removed().get(i) {
                 Some(r) => {
                     w.str(&r.host);
                     w.u64(r.id);
@@ -321,15 +316,6 @@ fn kind(c: u8) -> Option<Kind> {
     })
 }
 
-/// A snapshot's reader, as a stream reads it.
-pub(crate) struct FromSnapshot<'r, 'a>(pub(crate) &'r mut SnapshotReader<'a>);
-
-impl Source for FromSnapshot<'_, '_> {
-    fn fill(&mut self, buf: &mut [u8]) -> bool {
-        self.0.read_exact(buf)
-    }
-}
-
 const BAD: RestoreError = RestoreError("not NBS's metadata");
 
 /// A state read off `r`, as `FrozenState` writes it, every count bounded
@@ -339,7 +325,7 @@ pub(crate) fn read<S: Source>(r: &mut Stream<S>) -> Result<State, RestoreError> 
         return Err(BAD);
     }
     let mut s = State::new();
-    s.cluster = match r.u8().ok_or(BAD)? {
+    let cluster = match r.u8().ok_or(BAD)? {
         0 => None,
         1 => {
             let id = r.fixed().ok_or(BAD)?;
@@ -356,22 +342,25 @@ pub(crate) fn read<S: Source>(r: &mut Stream<S>) -> Result<State, RestoreError> 
     if n > MEMBERS_MAX {
         return Err(RestoreError("more members than a cluster takes"));
     }
+    let mut members = Vec::with_capacity(n);
     for _ in 0..n {
         let host = r.str(ipcwire::HOST_MAX).ok_or(BAD)?;
         let id = r.u64().ok_or(BAD)?;
         let since = r.u64().ok_or(BAD)?;
-        s.members.push(Member { host, id, since });
+        members.push(Member { host, id, since });
     }
     let n = r.u32().ok_or(BAD)? as usize;
     if n > REMOVED_MAX {
         return Err(RestoreError("more members removed than are kept"));
     }
+    let mut removed = Vec::with_capacity(n);
     for _ in 0..n {
         let host = r.str(ipcwire::HOST_MAX).ok_or(BAD)?;
         let id = r.u64().ok_or(BAD)?;
         let at = r.u64().ok_or(BAD)?;
-        s.removed.push(Removed { host, id, at });
+        removed.push(Removed { host, id, at });
     }
+    s.members = Members::from_parts(cluster, members, removed);
     let n = usize::from(r.u8().ok_or(BAD)?);
     if n > CS_MAX {
         return Err(RestoreError("more chunk servers than are kept"));
@@ -506,7 +495,7 @@ impl State {
     /// applying never makes, refused. Each count is made over the tables
     /// once, in pieces of their own -- no table of the state's size is made.
     pub(crate) fn check_storage(&self) -> Result<(), RestoreError> {
-        if self.cluster.is_none()
+        if self.cluster().is_none()
             && (!self.cs.is_empty() || !self.sets.is_empty() || !self.chunks.is_empty() || !self.volumes.is_empty())
         {
             return Err(RestoreError("what is stored of no cluster"));
@@ -711,80 +700,10 @@ impl State {
         Ok(())
     }
 
-    /// The state's digest: the SHA-256 of its snapshot's bytes.
+    /// The state's digest: the SHA-256 of its snapshot's bytes (`rsmkit`).
     pub fn digest(&self) -> [u8; 32] {
-        let mut f = FrozenState::new(self.clone());
-        let mut h = Sha256::new();
-        let mut buf = Vec::with_capacity(DIGEST_STEP);
-        loop {
-            buf.clear();
-            f.write(DIGEST_STEP, &mut buf);
-            if buf.is_empty() {
-                break;
-            }
-            h.update(&buf);
-        }
-        h.finalize().into()
+        rsmkit::digest(FrozenState::new(self.clone()))
     }
 }
 
-/// A member's own record of its state's digests, kept out of the state:
-/// the last few checkpoints', and the first leader's digest that differed.
-#[derive(Clone, Debug, Default)]
-pub struct Checks {
-    recent: Vec<(u64, [u8; 32])>,
-    diverged: Option<Diverged>,
-    /// The checkpoints held to the leader's, and how many it had no digest of
-    /// to hold to.
-    pub held: u64,
-    pub unheld: u64,
-}
-
-/// Where this member's state stopped being the leader's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Diverged {
-    /// The checkpoint's entry.
-    pub at: u64,
-    pub mine: [u8; 32],
-    pub theirs: [u8; 32],
-    /// The entry the leader's digest came in.
-    pub seen: u64,
-}
-
-impl Checks {
-    pub(crate) fn push(&mut self, at: u64, digest: [u8; 32]) {
-        if self.recent.len() >= RECENT {
-            self.recent.remove(0);
-        }
-        self.recent.push((at, digest));
-    }
-
-    /// The leader's digest of checkpoint `at`, which came in at entry
-    /// `seen`, held to this member's own where it has one.
-    pub(crate) fn compare(&mut self, at: u64, theirs: &[u8; 32], seen: u64) {
-        match self.recent.iter().find(|(i, _)| *i == at) {
-            Some((_, mine)) if mine == theirs => self.held += 1,
-            Some((_, mine)) => {
-                if self.diverged.is_none() {
-                    self.diverged = Some(Diverged { at, mine: *mine, theirs: *theirs, seen });
-                }
-            }
-            None => self.unheld += 1,
-        }
-    }
-
-    /// The newest checkpoint, and its digest.
-    pub fn latest(&self) -> Option<(u64, [u8; 32])> {
-        self.recent.last().copied()
-    }
-
-    /// This member's digest of checkpoint `at`, where it still has it.
-    pub fn digest_at(&self, at: u64) -> Option<[u8; 32]> {
-        self.recent.iter().find(|(i, _)| *i == at).map(|(_, d)| *d)
-    }
-
-    pub fn diverged(&self) -> Option<&Diverged> {
-        self.diverged.as_ref()
-    }
-}
 
