@@ -199,6 +199,30 @@ export const docsManifest: Record<string, DocInfo> = {
             ru: "Гипервизор первого типа на Rust в виде загружаемого модуля: AMD-V и Intel VT-x, гостевые Linux.",
         },
     },
+    cluster: {
+        group: "internals",
+        title: { en: "The cluster", ru: "Кластер" },
+        description: {
+            en: "One list of a cluster's hosts, their keys and addresses, kept by every host through Raft: making a cluster, inviting a host, removing one.",
+            ru: "Общий список хостов кластера, их ключей и адресов, который каждый хост хранит через Raft: как создать кластер, пригласить хост и убрать его.",
+        },
+    },
+    nbs: {
+        group: "internals",
+        title: { en: "NBS: replicated block storage", ru: "NBS: реплицируемое блочное хранилище" },
+        description: {
+            en: "Volumes whose every chunk lives on three hosts: the metadata service on Raft, the chunk servers, snapshots, images and clones, and what happens when a host fails.",
+            ru: "Тома, каждый чанк которых лежит на трёх хостах: сервис метаданных на Raft, чанк-серверы, снапшоты, образы и клоны, и что происходит, когда хост падает.",
+        },
+    },
+    vnet: {
+        group: "internals",
+        title: { en: "vnet: networks across hosts", ru: "vnet: сети между хостами" },
+        description: {
+            en: "Private networks a cluster's VMs share across its hosts: the state kept through Raft, the sealed tunnel between hosts, the cluster's firewalls, public addresses.",
+            ru: "Частные сети, общие для ВМ кластера на разных хостах: состояние, которое хранится через Raft, шифрованный туннель между хостами, фаерволы кластера, публичные адреса.",
+        },
+    },
     "udp-shell": {
         group: "tools",
         title: { en: "UDP remote shell", ru: "Удалённая оболочка по UDP" },
