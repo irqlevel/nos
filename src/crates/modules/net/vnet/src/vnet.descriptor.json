@@ -79,6 +79,7 @@
     }
    }
   },
+  "rules": {"kind": "read", "title": {"en": "Rules", "ru": "Правила"}},
   "alerts": {
    "kind": "read",
    "title": {
@@ -564,6 +565,7 @@
     "en": "Policies",
     "ru": "Политики"
    },
+   "help": {"en": "What a packet no rule matches meets, each way: a firewall's rules are its exceptions, these its defaults. Every host judges its ports by them within a second; their open flows the new ones deny are cut.", "ru": "Что ждёт пакет, не подошедший ни под одно правило, в каждую сторону: правила фаервола -- исключения, политики -- то, что по умолчанию. Каждый хост судит ими свои порты в течение секунды; открытые потоки, которые новые политики запрещают, обрываются."},
    "params": {
     "name": {
      "type": "string",
@@ -616,8 +618,8 @@
     "ru": "Добавить правило"
    },
    "help": {
-    "en": "As hv's firewalls have them: allow in tcp 22 from 203.0.113.0/24; allow in from net.",
-    "ru": "Как у фаерволов hv: allow in tcp 22 from 203.0.113.0/24; allow in from net."
+    "en": "An exception to the policies, the first rule that matches a packet deciding it: allow or deny, in or out, then what it is about -- tcp, udp or icmp, ports (22, 80,443, 8000-8100) -- and from or to whom: any, net (the VM's own network) or addresses (203.0.113.0/24,198.51.100.7). allow in tcp 22 from 203.0.113.0/24; allow in from net.",
+    "ru": "Исключение из политик; пакет решает первое подошедшее правило: allow или deny, in или out, затем о чём оно -- tcp, udp или icmp, порты (22, 80,443, 8000-8100) -- и откуда или куда: any, net (своя сеть машины) или адреса (203.0.113.0/24,198.51.100.7). allow in tcp 22 from 203.0.113.0/24; allow in from net."
    },
    "params": {
     "name": {
@@ -654,8 +656,8 @@
     "ru": "Убрать"
    },
    "confirm": {
-    "en": "Take this rule out?",
-    "ru": "Убрать правило?"
+    "en": "Take this rule out? The flows it let through and nothing else lets are cut, on every host.",
+    "ru": "Убрать правило? Потоки, пропущенные им и не пропускаемые ничем другим, оборвутся на каждом хосте."
    },
    "params": {
     "name": {
@@ -1126,6 +1128,20 @@
      }
     }
    ]
+  },
+  "rules": {
+   "title": {"en": "Rules", "ru": "Правила"},
+   "help": {"en": "Each firewall of the cluster's rules in their order, the first that matches a packet deciding it; one no rule matches meets its direction's policy.", "ru": "Правила каждого фаервола кластера по порядку: пакет решает первое подошедшее; не подошедший ни под одно -- политика его направления."},
+   "list": "rules", "items": "rules", "key": "id",
+   "fields": {
+    "id": {"type": "string", "title": {"en": "Id", "ru": "Идентификатор"}},
+    "firewall": {"type": "string", "title": {"en": "Firewall", "ru": "Фаервол"}},
+    "n": {"type": "int", "title": {"en": "No.", "ru": "№"}},
+    "rule": {"type": "string", "title": {"en": "Rule", "ru": "Правило"}}
+   },
+   "columns": ["firewall", "n", "rule"],
+   "actions": [{"method": "firewall_remove", "params": {"name": "$firewall", "n": "$n"}},
+    {"method": "firewall_move", "params": {"name": "$firewall", "n": "$n"}}]
   },
   "hosts": {
    "title": {

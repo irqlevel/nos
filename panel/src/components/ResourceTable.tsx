@@ -87,6 +87,10 @@ export function ResourceTable({ host, d, id, r, locale, w, every = 0, extra }: {
                   open && open.key === key && d.methods[open.method] ? (
                     <tr key={String(key) + '/form'} className="bg-bg-soft">
                       <td colSpan={r.columns.length + 1} className="px-4 py-3">
+                        {/* What the action is, as the page says it of the actions no row has */}
+                        {d.methods[open.method]!.help && (
+                          <p className="mb-2 text-xs text-muted">{text(d.methods[open.method]!.help, locale)}</p>
+                        )}
                         <MethodForm host={host} provider={d.provider} name={open.method} method={d.methods[open.method]!}
                           fixed={bind(r.actions!.find((a) => a.method === open?.method)?.params, row)} locale={locale} w={w}
                           onDone={() => void load()} />
