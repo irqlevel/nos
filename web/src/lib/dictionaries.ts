@@ -30,6 +30,7 @@ export interface Dictionary {
         home: string;
         about: string;
         hypervisor: string;
+        demo: string;
         docs: string;
         howto: string;
         blog: string;
@@ -45,6 +46,7 @@ export interface Dictionary {
         lead: string;
         ctaAbout: string;
         ctaRun: string;
+        ctaDemo: string;
         ctaGithub: string;
         terminalCaption: string;
         why: Why;
@@ -139,6 +141,7 @@ const en: Dictionary = {
         home: "Home",
         about: "What is nos",
         hypervisor: "Hypervisor",
+        demo: "Demo",
         docs: "Docs",
         howto: "How-to",
         blog: "Blog",
@@ -155,6 +158,7 @@ const en: Dictionary = {
             "nos is an operating system kernel for x86-64 and arm64, written in C++20, Rust and a little assembly. It runs in QEMU, in KVM-based clouds, on Apple Silicon and on real servers. Where we're going: a cloud host that runs Linux virtual machines under its own hypervisor, written in Rust.",
         ctaAbout: "What is nos",
         ctaRun: "Run it in QEMU",
+        ctaDemo: "Watch the demo",
         ctaGithub: "Source on GitHub",
         terminalCaption: "The last lines of a real arm64 boot in QEMU.",
         why: {
@@ -373,6 +377,7 @@ const ru: Dictionary = {
         home: "Главная",
         about: "Что такое nos",
         hypervisor: "Гипервизор",
+        demo: "Демо",
         docs: "Документация",
         howto: "Руководства",
         blog: "Блог",
@@ -389,6 +394,7 @@ const ru: Dictionary = {
             "nos — ядро операционной системы для x86-64 и arm64 на C++20, Rust и немного ассемблера. Оно работает в QEMU, в облаках на KVM, на Apple Silicon и на настоящих серверах. Наша цель — облачный хост, который запускает виртуальные машины с Linux под собственным гипервизором на Rust.",
         ctaAbout: "Что такое nos",
         ctaRun: "Запустить в QEMU",
+        ctaDemo: "Смотреть демо",
         ctaGithub: "Исходники на GitHub",
         terminalCaption: "Последние строки настоящей загрузки arm64 в QEMU.",
         why: {
