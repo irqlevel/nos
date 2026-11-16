@@ -72,6 +72,12 @@ OBJCOPY = llvm-objcopy
 # either way and demangle what is left with this, so that a backtrace, a
 # profile and memsites name them as the rest, on either architecture alike.
 CXXFILT = llvm-cxxfilt
+# The kernel and every module, as each is linked, held to using no vector,
+# x87 or MMX register outside the code the kernel lends them to -- the crypto
+# crate's CRYPTOGAMS assembly, in a SIMD section (src/base/kernel/simd.h):
+# what once made SSE fault at run time, before the vector unit was turned
+# on for the sections, fails the link now (scripts/check-simd.py).
+SIMD_CHECK = python3 scripts/check-simd.py
 
 TARGET = $(TARGET_$(ARCH))
 LD = $(LD_$(ARCH))
@@ -119,6 +125,7 @@ CXX_SRC_x86_64 =   \
     src/base/arch/x86_64/pci_x86.cpp \
     src/base/arch/x86_64/hal_x86.cpp \
     src/base/arch/x86_64/hal_random.cpp \
+    src/base/arch/x86_64/simd_x86.cpp \
     src/base/arch/x86_64/builtin_pt.cpp \
     src/base/drivers/serial.cpp  \
     src/base/arch/x86_64/pic.cpp \
@@ -164,6 +171,7 @@ CXX_SRC_x86_64 =   \
     src/base/kernel/wait_group.cpp \
     src/base/kernel/event.cpp \
     src/base/kernel/softirq.cpp \
+    src/base/kernel/simd.cpp \
     src/base/kernel/irq_balance.cpp \
     src/base/arch/x86_64/exception.cpp    \
     src/base/kernel/dmesg.cpp    \
@@ -215,6 +223,7 @@ CXX_SRC_aarch64 = \
     src/base/arch/arm64/cpu_start_arm64.cpp \
     src/base/arch/arm64/hal_arm64.cpp \
     src/base/arch/arm64/hal_random.cpp \
+    src/base/arch/arm64/simd_arm64.cpp \
     src/base/arch/arm64/time_arm64.cpp \
     src/base/arch/arm64/builtin_pt.cpp \
     src/base/arch/arm64/gicv3.cpp \
@@ -259,6 +268,7 @@ CXX_SRC_aarch64 = \
     src/base/kernel/rw_mutex.cpp \
     src/base/kernel/object_table.cpp \
     src/base/kernel/softirq.cpp \
+    src/base/kernel/simd.cpp \
     src/base/kernel/interrupt_stats.cpp \
     src/base/kernel/rust_ffi.cpp \
     src/base/kernel/module.cpp \
@@ -349,12 +359,15 @@ endif
 # (scripts/check-links.py); and every spelling of a function
 # that crosses a language or a crate -- its ffi declaration, its definition in
 # Rust or C++, a C++ declaration of a Rust export, a fuzzer's stand-in --
-# held to one signature (scripts/check-ffi.py).
+# held to one signature (scripts/check-ffi.py); and the crypto crate's
+# assembly what its CRYPTOGAMS sources make, nobody's edit
+# (scripts/cryptogams.sh --check).
 check: $(CXX_SRC)
 	cppcheck --error-exitcode=22 --inline-suppr -q src/base || exit 1
 	python3 scripts/check-crates.py
 	python3 scripts/check-links.py
 	python3 scripts/check-ffi.py
+	sh scripts/cryptogams.sh --check
 
 # The kernel the ISO and the system image carry has no debug info: GRUB loads
 # its segments alone, and the machine names its frames by its own symbol
@@ -504,6 +517,7 @@ $(OUT)/modules/%.ko: $(RUST_SRC) src/crates/base/kmod/module.ver $(FLAVOR_STAMP)
 	    --config 'target.$(RUST_TARGET).rustflags=$(MODULE_RUSTFLAGS_$(ARCH))' \
 	    --config 'unstable.build-std-features=["compiler-builtins-mem"]' $(RUST_UB_CFG)
 	ld.lld $(MODULE_LDFLAGS) -o $@.elf src/crates/target/modules/$(RUST_TARGET)/release/libmod_$(subst -,_,$*).a
+	@$(SIMD_CHECK) $@.elf || { rm -f $@.elf; exit 1; }
 	llvm-nm -n -C --defined-only $@.elf | awk '$$2 ~ /^[tTwW]$$/ { a = $$1; sub(/^[0-9a-fA-F]+ [tTwW] /, ""); sub(/ \(\.llvm\.[0-9]+\)$$/, ""); if ($$0 ~ /^_R/) sub(/\.llvm\.[0-9]+$$/, ""); print a " " $$0 }' | \
 	    $(CXXFILT) > $@.syms
 	$(OBJCOPY) --add-section .nos_syms=$@.syms $@.elf $@
@@ -630,6 +644,11 @@ nos-arm64.img: $(KERNEL)
 # has no /lib/panel, and `api panel create` is told bundle= and sha256=.
 IMAGE = nos-$(ARCH).squashfs
 IMAGE_STAGE = $(OUT)/image
+# The licenses whose notice the kernel and its modules carry, each in the
+# image's /lib/licenses: CRYPTOGAMS', whose assembly the crypto crate runs
+# (src/crates/base/crypto/cryptogams/README.md), asks a binary to reproduce
+# it in what is handed out with it.
+LICENSES = src/crates/base/crypto/cryptogams/LICENSE
 PANEL_BUNDLE ?=
 PANEL_BUNDLE_URL ?=
 
@@ -640,9 +659,10 @@ image:
 	@echo "image: x86-64 only -- a server's GRUB boots it, over Multiboot2" >&2; exit 1
 endif
 
-$(IMAGE): $(KERNEL) $(MODULE_KO) $(HVBOOT) build/image/nos.cfg build/image/rc scripts/nos-install
+$(IMAGE): $(KERNEL) $(MODULE_KO) $(HVBOOT) build/image/nos.cfg build/image/rc scripts/nos-install $(LICENSES)
 	rm -rf $(IMAGE_STAGE) $@.tmp
-	mkdir -p $(IMAGE_STAGE)/boot/grub $(IMAGE_STAGE)/lib/modules $(IMAGE_STAGE)/etc
+	mkdir -p $(IMAGE_STAGE)/boot/grub $(IMAGE_STAGE)/lib/modules $(IMAGE_STAGE)/lib/licenses $(IMAGE_STAGE)/etc
+	install -m 0644 src/crates/base/crypto/cryptogams/LICENSE $(IMAGE_STAGE)/lib/licenses/CRYPTOGAMS
 	$(OBJCOPY) --strip-debug $(KERNEL) $(IMAGE_STAGE)/boot/kernel64.elf
 	chmod 0644 $(IMAGE_STAGE)/boot/kernel64.elf
 	install -m 0644 $(MODULE_KO) $(IMAGE_STAGE)/lib/modules/
@@ -711,6 +731,7 @@ $(KERNEL): $(LDSCRIPT) $(OBJS) $(OUT)/modtest_blob.o $(OUT)/symtab_data.o $(OUT)
 	    echo "$@: its functions are not where its symbol table says, and every backtrace would name the wrong ones:"; \
 	    diff $(OUT)/symtab_data.cpp $(OUT)/symtab_final.cpp | head -5; \
 	    rm -f $@; exit 1; }
+	@$(SIMD_CHECK) $@ || { rm -f $@; exit 1; }
 
 clean:
 	rm -rf out kernel64.elf kernel-arm64.elf nos-arm64.img *.bin *.iso iso nos-*.squashfs

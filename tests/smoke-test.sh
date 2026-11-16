@@ -6,6 +6,9 @@
 # Usage: tests/smoke-test.sh [--skip-build]
 # Env:   SMOKE_TIMEOUT  seconds to wait for boot markers (default 300)
 #        SMOKE_QEMU     qemu binary (default qemu-system-x86_64)
+#        SMOKE_CPU      QEMU's -cpu (default QEMU's own, qemu64: SSE2 and no
+#                       SSSE3 or AVX, so the crypto crate runs its integer
+#                       code); `max` gives TCG's SSSE3, AVX and AVX2
 #        SMOKE_LOG      serial log path (default <tmpdir>/nos.log)
 #
 # Exit codes: 0 = all markers seen, 1 = panic/timeout/build failure.
@@ -17,6 +20,8 @@ SKIP_BUILD=0
 
 SMOKE_TIMEOUT="${SMOKE_TIMEOUT:-300}"
 SMOKE_QEMU="${SMOKE_QEMU:-qemu-system-x86_64}"
+CPU_OPTS=()
+[ -n "${SMOKE_CPU:-}" ] && CPU_OPTS=(-cpu "$SMOKE_CPU")
 
 TMPDIR_SMOKE="$(mktemp -d)"
 SMOKE_LOG="${SMOKE_LOG:-$TMPDIR_SMOKE/nos.log}"
@@ -59,6 +64,7 @@ qemu-img create -q -f qcow2 "$TMPDIR_SMOKE/nvme0.qcow2" 256M
 
 echo "smoke: booting (log: $SMOKE_LOG, timeout: ${SMOKE_TIMEOUT}s)..."
 "$SMOKE_QEMU" \
+    ${CPU_OPTS[@]+"${CPU_OPTS[@]}"} \
     -display none \
     -m 1G \
     -smp 4 \

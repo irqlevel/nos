@@ -12,9 +12,12 @@
 //! intercept, which `svm` sets on every entry; VT-x's, unconditional), and
 //! the run loop in `hv` writes the guest's through [`GuestFp::set_xcr0`].
 //!
-//! Registers are put back only when the CPU holds another guest's
-//! ([`OWNER`]): the host never touches them -- its C++ is built without SSE
-//! and its Rust is soft-float. And then all of what the CPU switches is put
+//! Registers are put back only when the CPU does not hold the guest's still
+//! (`kcore::simd::guest`, the kernel's table of whose registers each CPU
+//! holds): the host touches them nowhere but in the kernel's SIMD sections
+//! -- its C++ is built without SSE and its Rust is soft-float -- and a
+//! section marks its CPU's nobody's before it uses them (kernel/simd.h).
+//! And then all of what the CPU switches is put
 //! back, whatever the guest's XCR0 says ([`MASK`]): the upper halves of the
 //! YMM registers, which a guest whose XCR0 leaves out AVX cannot reach now
 //! but can as soon as it sets it, are never another guest's. They are saved
@@ -43,19 +46,19 @@
 //! to which protection keys do not apply. PKRU is in XCR0's components a
 //! guest is offered ([`offered`]), and its own XCR0 may have it or not.
 //!
-//! This kernel boots with CR4.OSFXSR and CR4.OSXSAVE clear and never sets
-//! them: its C++ is built without SSE and its Rust is soft-float, so an SSE
-//! or AVX instruction in it is a bug, and with the bits clear it faults.
-//! Setting OSFXSR around every entry and clearing it after, as both `run`s
-//! once did, cost two serializing writes of CR4 an entry, an XGETBV, and
-//! under a nested hypervisor an exit to the outer one for each -- a fifth of
-//! an exit on real silicon, more than the world switch itself under nested
-//! KVM. So both bits are set once, here, when the extension is turned on for
-//! a CPU, and cleared when it is turned off; and XCR0 is whatever the last
-//! guest's entry made it, until `off` puts back the one `on` found. While
-//! the hypervisor is loaded an SSE or AVX instruction in the kernel would
-//! run instead of faulting on those CPUs: the guard is given up for the time
-//! the module is on, and for nothing else.
+//! The kernel sets CR4.OSFXSR at boot, and CR4.OSXSAVE with XCR0 the x87,
+//! SSE and AVX where the CPU has AVX, for its SIMD sections (hal/simd.h);
+//! `on` sets what of OSFXSR and OSXSAVE it finds clear -- OSXSAVE on a CPU
+//! with XSAVE and no AVX -- and PKE, once, when the extension is turned on
+//! for a CPU, rather than around every entry: two serializing writes of CR4
+//! an entry and an XGETBV, under a nested hypervisor an exit to the outer one
+//! for each, were a fifth of an exit on real silicon and more than the world
+//! switch itself under nested KVM. XCR0 is whatever the last guest's entry
+//! made it, until `off` puts back the one `on` found -- a section that finds
+//! a guest's without AVX makes it the kernel's again for itself. That the
+//! kernel's code outside its sections uses none of these registers is held
+//! by the build, not by a fault: the compilers are told to use none, and
+//! nothing else in the image does.
 //!
 //! What was there is remembered per CPU, so `off` puts back exactly what
 //! `on` found: a CPU the extension goes off for is as it booted.
@@ -69,51 +72,25 @@ use kcore::consts::MAX_CPUS;
 use super::cpu;
 use crate::{Error, Result};
 
-/// Whose registers each CPU holds: the guest whose load was the last on it,
-/// by a number of its own ([`owner_id`]), or 0. What lets an entry skip the
-/// load: the host never touches those registers -- its C++ is built without
-/// them and its Rust is soft-float -- so between a guest's exit on a CPU and
-/// its next entry there they still hold what its save at the exit saved,
-/// unless another guest's entry loaded its own in between, which the number
-/// then says. A number is never given twice, so a guest dropped and another
-/// made in its memory cannot be taken for it; and it is on one CPU at most,
-/// the last its guest loaded on ([`registers_loaded`]), since a CPU it ran on
-/// before holds what its registers were then.
-static OWNER: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// The numbers guests' registers are known by, in the kernel's table of
+/// whose registers each CPU holds (`kcore::simd::guest`): the guest whose
+/// load was the last on a CPU, or 0 -- nobody's, as a SIMD section leaves
+/// them. What lets an entry skip the load: the host touches those registers
+/// only in a section, which marks the CPU's nobody's, so between a guest's
+/// exit on a CPU and its next entry there they still hold what its save at
+/// the exit saved, unless another guest's entry or a section came in
+/// between, which the table then says. A number is never given twice, so a
+/// guest dropped and another made in its memory cannot be taken for it; and
+/// it is on one CPU at most, the last its guest loaded on: a guest's task
+/// can move (`hv run` without a CPU is one the scheduler places), and marked
+/// on both, a guest that ran on A, then B, then A again would skip its load
+/// on A and go on with the registers of its first stay there -- the table
+/// takes the number off every other CPU as it puts it on this one.
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 
 /// A number no guest has had, for the guest being made.
 fn owner_id() -> u64 {
     NEXT_OWNER.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Whether the registers of `cpu` are guest `id`'s already -- asked with
-/// interrupts off on `cpu`, before its entry.
-#[inline]
-fn registers_are(cpu: u32, id: u64) -> bool {
-    OWNER.get(cpu as usize).map_or(false, |o| o.load(Ordering::Relaxed) == id)
-}
-
-/// Guest `id` has just loaded its registers on `cpu` -- and so they are its
-/// on no other: a CPU it loaded them on before holds what they were when it
-/// last left its guest there, older than what it brings back now. A guest's
-/// task can move (`hv run` without a CPU is one the scheduler places), and
-/// marked on both, a guest that ran on A, then B, then A again skipped its
-/// load on A and went on with the registers of its first stay there. Only
-/// an entry that loads comes here, so looking at every CPU's mark costs
-/// nothing an entry pays every time. The guest runs on one CPU at a time, so
-/// no entry of its own races this; another guest's entry on that CPU may
-/// put its own mark there meanwhile, which the compare-and-swap leaves.
-#[inline]
-fn registers_loaded(cpu: u32, id: u64) {
-    for (i, o) in OWNER.iter().enumerate() {
-        if i != cpu as usize && o.load(Ordering::Relaxed) == id {
-            let _ = o.compare_exchange(id, 0, Ordering::Relaxed, Ordering::Relaxed);
-        }
-    }
-    if let Some(o) = OWNER.get(cpu as usize) {
-        o.store(id, Ordering::Relaxed);
-    }
 }
 
 /// XCR0's components, as far as a guest is given them: the x87; SSE's XMM
@@ -343,9 +320,7 @@ pub unsafe fn off() {
     let added = saved.cr4_added.swap(0, Ordering::Relaxed);
     unsafe { cpu::write_cr4(cpu::read_cr4() & !added) };
     /* Whatever a guest left in the registers stays, and is nobody's. */
-    if let Some(o) = OWNER.get(cpu) {
-        o.store(0, Ordering::Relaxed);
-    }
+    kcore::simd::guest::registers_lost(cpu as u32);
 }
 
 /// Make XCR0 `value`, unless it is already: XSETBV serializes, and under a
@@ -371,7 +346,8 @@ pub struct GuestFp {
     /// The guest's XCR0: the x87 alone out of reset, and what its XSETBVs
     /// were let make it since ([`GuestFp::set_xcr0`]). INIT leaves it.
     xcr0: u64,
-    /// Which guest's registers a CPU holds, this one being this ([`OWNER`]).
+    /// The number its registers are known by in the kernel's table of
+    /// whose registers each CPU holds ([`owner_id`]).
     id: u64,
     /// How many entries put its registers back, the CPU holding another's.
     loads: u64,
@@ -434,7 +410,7 @@ impl GuestFp {
     /// [`GuestFp::save`] after the exit, and [`GuestFp::fits`] true of it.
     pub unsafe fn load(&mut self, cpu: u32) {
         let mask = mask(cpu);
-        if !registers_are(cpu, self.id) {
+        if !kcore::simd::guest::registers_are(cpu, self.id) {
             if mask == 0 {
                 let area: *const Area = &self.area[0];
                 unsafe { asm!("fxrstor64 [{}]", in(reg) area, options(nostack, preserves_flags)) };
@@ -459,7 +435,10 @@ impl GuestFp {
                     unsafe { asm!("wrpkru", in("eax") self.pkru, in("ecx") 0, in("edx") 0, options(nostack, nomem)) };
                 }
             }
-            registers_loaded(cpu, self.id);
+            /* The guest's registers are in `cpu` now -- put there just
+             * above, on `cpu`, interrupts off since this load began, as the
+             * caller holds them until the save after the exit. */
+            unsafe { kcore::simd::guest::registers_loaded(cpu, self.id) };
             self.loads += 1;
         }
         if mask != 0 {
