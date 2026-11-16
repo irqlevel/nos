@@ -99,6 +99,22 @@ The page shows the summary in a box, and the rest opens on a click. That is
 the only HTML a page may use: any other tag is shown as the text it is
 (`src/lib/markdown.ts`).
 
+A post's screenshots are files of `public/images/<slug>/`, one per language
+(`en-x.webp`, `ru-x.webp`), each written as a link to its own full size with its
+caption in italics under it:
+
+```markdown
+[![What it shows, for a screen reader](/images/<slug>/en-x.webp)](/images/<slug>/en-x.webp)
+
+*The caption.*
+```
+
+The build fails on an image `public/` lacks. The full size opens in a tab of its
+own (`target="_blank"`), so the post is never left and gone back to, and a
+screenshot cannot be selected: Safari, back on a post whose screenshot it had
+shown full size, drew the screenshot's recognised text (Live Text) over the page
+out of place.
+
 Links inside content are written **without** a language: `/docs/hypervisor#a-disk`,
 `/howto/build`, `/blog/<slug>`, `/about`, `/hypervisor` -- the site adds `/en` or
 `/ru`. Source files and commits link to GitHub with full URLs. A link to a
