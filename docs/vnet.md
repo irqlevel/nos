@@ -95,6 +95,13 @@ A change of a firewall's rules, and a port moved to another firewall, reach
 every host within a second of being made -- hv's keeper asks vnet's table
 every second -- and the flows the new rules deny are cut.
 
+A firewall's **policies** are what a packet no rule matches meets, one each
+way -- in denied, out allowed, unless changed; its **rules** are the
+exceptions, the first that matches deciding. In the panel, a host's page of
+VM networks has the cluster's firewalls -- a rule added, the policies set,
+from a firewall's row -- and their rules in a table of their own, each row
+taken out or moved from there (the `vnet` provider's `rules`).
+
 ## Across hosts
 
 A VM reaches a VM of its network on another host as it reaches one on its

@@ -379,7 +379,7 @@ test('firewalls: listed with their rules, one made, a rule refused and added, mo
   await expect(page.getByTestId('resource-firewalls')).not.toContainText('pw-fw');
 });
 
-test('the cluster\'s VM networks: listed, one made, one overlapping refused, a firewall of the cluster\'s given a rule', async ({ page }) => {
+test('the cluster\'s VM networks: listed, one made, one overlapping refused, a firewall of the cluster\'s given rules, moved and taken out from their table', async ({ page }) => {
   const host = await login(page);
   await page.goto(`/en/h/${host}/p/vnet`);
   await expect(page.getByRole('heading', { name: 'VM networks', level: 1 })).toBeVisible();
@@ -404,9 +404,38 @@ test('the cluster\'s VM networks: listed, one made, one overlapping refused, a f
   await expect(firewalls).toContainText('default');
   await firewalls.locator('tr', { hasText: 'default' }).getByRole('button', { name: 'Add a rule' }).click();
   const add = page.getByTestId('form-vnet-firewall_add');
+  /* What a rule is, said above the form its row opens */
+  await expect(page.getByText('An exception to the policies')).toBeVisible();
   await add.locator('input[name=rule]').fill('allow in tcp 22');
   await add.getByRole('button', { name: 'Add a rule' }).click();
   await expect(add.getByTestId('answer')).toContainText('rule 1: allow in tcp 22');
+  await add.locator('input[name=rule]').fill('deny in udp 53');
+  await add.getByRole('button', { name: 'Add a rule' }).click();
+  await expect(add.getByTestId('answer')).toContainText('rule 2: deny in udp 53');
+
+  /* The rules' table: each row a rule of a firewall's, in order -- moved,
+   * and taken out with the confirm its descriptor says */
+  await page.goto(`/en/h/${host}/p/vnet`);
+  const rules = page.getByTestId('resource-rules');
+  await expect(rules.locator('tr', { hasText: 'allow in tcp 22' })).toContainText('default');
+  await rules.locator('tr', { hasText: 'deny in udp 53' }).getByRole('button', { name: 'Move' }).click();
+  const move = page.getByTestId('form-vnet-firewall_move');
+  await move.locator('input[name=to]').fill('1');
+  await move.getByRole('button', { name: 'Move' }).click();
+  await expect(move.getByTestId('answer')).toContainText('rule 2 is rule 1 now');
+  await page.goto(`/en/h/${host}/p/vnet`);
+  await expect(rules.locator('tr', { hasText: 'default' }).first()).toContainText('deny in udp 53');
+  await rules.locator('tr', { hasText: 'allow in tcp 22' }).getByRole('button', { name: 'Take out' }).click();
+  const remove = page.getByTestId('form-vnet-firewall_remove');
+  await remove.getByRole('button', { name: 'Take out' }).click();
+  await expect(remove).toContainText('nothing else lets are cut');
+  await remove.getByRole('button', { name: 'Confirm' }).click();
+  await expect(rules).not.toContainText('allow in tcp 22');
+  await expect(rules).toContainText('deny in udp 53');
+  /* What a policy is, said where it is set */
+  await firewalls.locator('tr', { hasText: 'default' }).getByRole('button', { name: 'Policies' }).click();
+  await expect(page.getByTestId('form-vnet-firewall_policy')).toBeVisible();
+  await expect(page.getByText('these its defaults')).toBeVisible();
   await page.goto(`/ru/h/${host}/p/vnet`);
   await expect(page.getByRole('heading', { name: 'Сети машин', level: 1 })).toBeVisible();
 });
