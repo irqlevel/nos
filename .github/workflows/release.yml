@@ -53,6 +53,10 @@ jobs:
           cp nos.qcow2        dist/nos.qcow2
           cp nos-x86_64.squashfs dist/nos-x86_64.squashfs
           cp dist-panel/nos-panel-*.tar.gz dist/
+          # The notice of the CRYPTOGAMS assembly every kernel and module of
+          # the release runs (src/crates/base/crypto/cryptogams/README.md):
+          # its license asks a binary handed out to carry it
+          cp src/crates/base/crypto/cryptogams/LICENSE dist/LICENSE-CRYPTOGAMS
           # Every module the Makefile builds, named for the kernel it loads
           # into: blkload.ko goes up as blkload-x86_64.ko. No match leaves
           # the pattern itself, and cp fails the step on it.

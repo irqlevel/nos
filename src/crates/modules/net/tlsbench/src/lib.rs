@@ -4,9 +4,12 @@
 //! `tls::pinned` -- a server and a client, each with a key of its own made
 //! for the run -- in one kernel, over a pipe in memory: nothing measured but
 //! the handshake, the crypto and the session's own work. ipcnet's links
-//! between hosts are such sessions (plans/ipc.md, I4), and the kernel has no
-//! SSE: every suite runs on its portable backend, and which is cheapest here
-//! is this command's to say.
+//! between hosts are such sessions (plans/ipc.md, I4). ChaCha20-Poly1305
+//! runs on CRYPTOGAMS' assembly in the kernel's SIMD sections (the crypto
+//! crate), the AES-GCM suites on RustCrypto's portable code; which is
+//! cheapest here is this command's to say -- and, last, what the cipher
+//! alone gives, the crypto crate's against RustCrypto's portable one, so
+//! that what the session costs on top of it shows.
 //!
 //!     insmod /tlsbench.ko
 //!     tlsbench                    every suite, 16 MB each way
@@ -297,6 +300,57 @@ fn one(suite: Suite, mb: u64, ids: &Ids, out: &mut Output) -> Result<(), String>
     Ok(())
 }
 
+/// The AEAD alone, with no session around it: ChaCha20-Poly1305 over `mb`
+/// MB in records of [`CHUNK`] bytes, each sealed and opened again in place
+/// on this task's CPU -- by the crypto crate, CRYPTOGAMS' assembly in the
+/// kernel's SIMD sections, which the suites run on, and by RustCrypto's
+/// portable code, which they ran on before it. What the session costs on
+/// top of its cipher is the difference between this line and a suite's.
+fn aead_alone(mb: u64, out: &mut Output) -> Result<(), String> {
+    use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+
+    let records = (mb * MB / CHUNK as u64).max(1);
+    let key = [0x5Au8; crypto::KEY_LEN];
+    let aad = [0x17u8, 0x03, 0x03, 0x40, 0x11];
+    let mut nonce = [0u8; crypto::NONCE_LEN];
+    let mut buf = vec![0u8; CHUNK];
+
+    let ours = crypto::ChaCha20Poly1305::new(&key);
+    let t0 = boot_time_ns();
+    for i in 0..records {
+        nonce[..8].copy_from_slice(&i.to_le_bytes());
+        let _ = ours.seal_in_place(&nonce, &aad, &mut buf);
+    }
+    let t1 = boot_time_ns();
+    let mut tag = [0u8; crypto::TAG_LEN];
+    for i in 0..records {
+        nonce[..8].copy_from_slice(&i.to_le_bytes());
+        tag = ours.seal_in_place(&nonce, &aad, &mut buf);
+        ours.open_in_place(&nonce, &aad, &mut buf, &tag).map_err(|_| "the crypto crate refused its own record")?;
+    }
+    let t2 = boot_time_ns();
+    let _ = tag;
+
+    let theirs = chacha20poly1305::ChaCha20Poly1305::new(&key.into());
+    let t3 = boot_time_ns();
+    for i in 0..records {
+        nonce[..8].copy_from_slice(&i.to_le_bytes());
+        theirs.encrypt_in_place_detached(&nonce.into(), &aad, &mut buf).map_err(|_| "RustCrypto sealed nothing")?;
+    }
+    let t4 = boot_time_ns();
+
+    let bytes = records * CHUNK as u64;
+    let seal = rate(bytes, t1 - t0);
+    /* A record sealed and opened in the second loop: what it took a byte,
+     * less the seal's, is the open's */
+    let open = rate(bytes, (t2 - t1).saturating_sub(t1 - t0).max(1));
+    let portable = rate(bytes, t4 - t3);
+    let _ = writeln!(out, "{:<18} {} MB in 16 KB records, one CPU: CRYPTOGAMS' {} code seal {}.{} MB/s, open {}.{} \
+                           MB/s; RustCrypto's portable seal {}.{} MB/s", "chacha20-poly1305", records * CHUNK as u64 / MB,
+                     crypto::code(), seal.0, seal.1, open.0, open.1, portable.0, portable.1);
+    Ok(())
+}
+
 fn run(args: &str, out: &mut Output) -> Result<(), String> {
     let mut mb = DEFAULT_MB;
     let mut suites: Vec<Suite> = Suite::ALL.to_vec();
@@ -320,6 +374,8 @@ fn run(args: &str, out: &mut Output) -> Result<(), String> {
     for suite in suites {
         one(suite, mb, &ids, out)?;
     }
+    let _ = writeln!(out, "tlsbench: the cipher alone");
+    aead_alone(mb, out)?;
     Ok(())
 }
 

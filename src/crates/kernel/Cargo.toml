@@ -10,6 +10,8 @@ crate-type = ["staticlib"]
 ffi = { path = "../base/ffi" }
 kcore = { path = "../base/kcore" }
 random = { path = "../base/random" }
+# ChaCha20-Poly1305 in CRYPTOGAMS' assembly: its check at boot (rust_test).
+crypto = { path = "../base/crypto" }
 # The management bus: below every layer, so each can register its provider.
 mgmt = { path = "../layers/mgmt" }
 events = { path = "../base/events" }
@@ -33,8 +35,8 @@ igb = { path = "../drivers/net/igb" }
 # For the sha256 shell command; the same crate the TLS client hashes with.
 # force-soft for the same reason .cargo/config.toml forces the other
 # RustCrypto crates onto their software backends: sha2 would otherwise pick
-# SHA-NI by CPUID at runtime, and those are SSE instructions -- an
-# application processor here runs with CR4.OSFXSR clear, so the first
-# block hashed on one is an invalid opcode. Applies to the TLS client too,
-# since a crate is built once for the whole graph.
+# SHA-NI by CPUID at runtime, and those are SSE instructions run outside a
+# SIMD section (kernel/simd.h) -- in registers nothing saves, which a guest
+# may be holding there between its exit and its next entry. Applies to the
+# TLS client too, since a crate is built once for the whole graph.
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }

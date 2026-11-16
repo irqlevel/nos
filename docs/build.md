@@ -240,7 +240,8 @@ What its first boots found, all in code that had passed every gate:
 - On x86 `hal::run_on_stack` entered the boot and idle bodies with RSP 8 off the
   ABI's 16-byte boundary, and chasing that found the same in every exception
   stub under an error code, `#GP` and `#PF` among them. Nothing had faulted
-  because the kernel uses no SSE. The stubs pad now, and NASM refuses to
+  because the kernel's own code uses no SSE (the crypto crate's assembly,
+  which does, aligns its own stack). The stubs pad now, and NASM refuses to
   assemble them if the frame sizes stop adding up.
 - The empty weak tables pass 1 links against were defined in the files that
   index them, which made every index out of bounds of a `T[0]`.

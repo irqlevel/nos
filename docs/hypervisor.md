@@ -977,7 +977,7 @@ of the host after its run is the CPU's it ran on:
 | `cache` | on the machine of `ioapic`, its first CPU alone running: sets CR0.CD and CR0.NW, reads CR0 back and halts with both left set | what it wrote read back, and neither bit in any host CPU's own CR0 after it: a VM exit does not put the host's CD and NW back, so under VT-x a guest's write let through left the host's CPU with its caches not filling for good -- the two are in the CR0 guest/host mask now and never in the CR0 a guest runs with (`hvarch::x86::vmx::CR0_CACHE_BITS`). Under AMD-V the exit puts the host's CR0 back whole, but while the guest runs its CD is the CPU's: a guest can make its own core -- and the sibling thread, its own or its disks' -- slow at will. Not closed yet: it wants CR0's write intercepted and its reads while CD or NW is set, as KVM has it, and QEMU's TCG -- the AMD-V this is tested under -- takes every CR read for a CR0 read |
 | `instr` | one CPU, through the run loop a Linux guest's go through, with #UD and #DB handlers of its own: runs RSM, then INVD, then sets TF and runs a CPUID | RSM the #UD a CPU outside SMM gives -- under AMD-V, which stops the guest at it, the host's to give; it was an exit nothing answered, and a user process's `rsm` stopped its whole VM -- and INVD stepped past under both, the host's dirty lines kept; both named by the backends (`hv::exit::Instr`), not by one extension's number; and the single step's #DB after the CPUID, DR6.BS set, which the CPU never raises for an instruction that exited and the host now does after every one it steps past -- a debugger's `stepi` over a CPUID once landed an instruction late |
 | `debug` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: sets TF with POPFQ and single-steps a NOP, then runs an ICEBP (`int1`) | each a #DB of the guest's own -- intercepted for the delivery loops a guest could make of it -- given back to its handler, the single step's with DR6.BS -- under VT-x, which writes no DR6 at a #DB that exits, the DR6 its exit said, and every `mov` of DR6 the host's |
-| `avx` | on the machine of `smp`, both CPUs on the one host CPU the guests run on, taking turns by IPI: each turns its local APIC on, runs an XSETBV with CR4.OSXSAVE clear, sets OSFXSR, OSXMMEXCPT and OSXSAVE, runs five XSETBVs a CPU refuses and its own, of the x87, SSE and AVX, reads leaf 1, leaf 0xD's first three subleaves and leaf 7, stores YMM0-15, and loads an x87 control word, an MXCSR and a pattern of its own into YMM0-15; then 64 turns each, a turn its peer's IPI, every one checking all of them against what it left and loading the pattern one more | YMM0-15 zero as each CPU starts, though the other's pattern was in the CPU's registers; its YMM registers, MXCSR and control word as it left them at every turn, put back by the host each time the other had had the CPU -- 64 times each at least; XSAVE and AVX offered, OSXSAVE as CR4 has it, XCR0 1 out of reset and 7 after its own; the XSETBV with OSXSAVE clear a #UD -- the CPU's own under VT-x, the host's under QEMU's TCG, whose intercept comes first -- and the five a #GP each; leaf 0xD's sizes 576 and 832, AVX's component at 576, no XSAVES |
+| `avx` | on the machine of `smp`, both CPUs on the one host CPU the guests run on, taking turns by IPI, and before each of their entries a SIMD section of the host's on that CPU -- ChaCha20-Poly1305 over 1 KiB by the crypto crate, CRYPTOGAMS' AVX2 code where the CPU has it: each turns its local APIC on, runs an XSETBV with CR4.OSXSAVE clear, sets OSFXSR, OSXMMEXCPT and OSXSAVE, runs five XSETBVs a CPU refuses and its own, of the x87, SSE and AVX, reads leaf 1, leaf 0xD's first three subleaves and leaf 7, stores YMM0-15, and loads an x87 control word, an MXCSR and a pattern of its own into YMM0-15; then 64 turns each, a turn its peer's IPI, every one checking all of them against what it left and loading the pattern one more | YMM0-15 zero as each CPU starts, though the other's pattern was in the CPU's registers; its YMM registers, MXCSR and control word as it left them at every turn, put back by the host each time the other had had the CPU, or a section had -- 64 times each at least, and the sections run, one a turn at least, with the vector unit lent them; XSAVE and AVX offered, OSXSAVE as CR4 has it, XCR0 1 out of reset and 7 after its own; the XSETBV with OSXSAVE clear a #UD -- the CPU's own under VT-x, the host's under QEMU's TCG, whose intercept comes first -- and the five a #GP each; leaf 0xD's sizes 576 and 832, AVX's component at 576, no XSAVES |
 | `pkru` | on the machine of `smp`, both CPUs on the one host CPU the guests run on, taking turns by IPI, the second started by `avx`'s code: each turns its local APIC on, runs an RDPKRU with CR4.PKE clear, sets OSFXSR, OSXMMEXCPT and OSXSAVE, and where its CPUID offers PKU sets PKE, makes XCR0 its own -- PKRU in the first's, the x87 alone the second's -- reads leaf 7, leaf 0xD's subleaves 0 and 9 and PKRU, and loads its own into PKRU; then 64 turns each, a turn its peer's IPI, every one checking PKRU against what it left and loading it one key more | the RDPKRU a #UD; where PKU is offered -- QEMU's TCG, the EX44, not a Zen 2 -- OSPKE only once its CR4.PKE has it, leaf 0xD's components and sizes for its XCR0, PKRU's subleaf the host's; PKRU 0 as each CPU starts, though the other's was in the CPU's register, and its own at every turn, put back by the host each time the other had had the CPU -- 64 times each at least, whatever its XCR0 says of PKRU |
 | `dr` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own: each reads DR0-DR3, writes a pattern of its own into them through four registers and reads it back through a fifth, then points DR0 at a `ret` of its own -- each VM's elsewhere -- arms it in DR7 for execution and calls it, its #DB handler turning the breakpoint off | every `mov` of DR0-DR3 the host's: the second VM reads 0 where the first left its own, each reads back its pattern, and each one's breakpoint fires -- DR6.B0, at its `ret` -- which only its own DR0, made the CPU's before its entry, can do. An execution breakpoint and not a data one: QEMU 10.2's TCG never gets past a store a data breakpoint watches in a nested guest, retrying it for good with no interrupt taken, whoever's DR0-DR3 are the CPU's ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)); under VT-x, which stops a guest at every `mov` of a debug register, the same, its DR6 and DR7 the host's too |
 | `tscaux` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own whose #UD and #GP handlers note the vector -- a #GP's error code with it -- and go on: each reads what its CPUID offers, reads its TSC_AUX by RDTSCP, RDPID and RDMSR, writes a value of its own into it, reads the TSC, RDTSCP and the TSC, reads TSC_AUX by RDPID and RDMSR again, writes it with bit 32 set and reads it once more, and runs INVPCID of types 0 to 4 | RDTSCP, RDPID and INVPCID offered exactly where they run in a guest, each run where offered and a #UD where not; TSC_AUX 0 as each VM starts, the second where the first had left its own -- its own put into the CPU before its entries (`hvarch::x86::msrs`); the value each wrote read back by every way it has, RDTSCP's TSC between the two RDTSCs; bit 32 a #GP, the value kept; RDMSR and WRMSR of it a #GP where neither instruction is offered; INVPCID's four types run and type 4 a #GP; every #GP a #GP(0) -- its IDT ends at gate 13, and an exception past it comes in as a #GP whose error code names its gate; every RDMSR and WRMSR seen by the run loop, and no RDTSCP where it runs |
@@ -1065,11 +1065,14 @@ And while a guest runs:
   upper halves of the YMM registers -- or an FXSAVE where its XCR0 is the
   x87 alone, the SSE registers being the guest's to use whatever XCR0 says.
   Before an entry, an XRSTOR only when the CPU's registers are not this
-  guest's already -- each CPU remembers whose load was the last on it
-  (`fp::OWNER`, by a number no two guests ever share), and the host uses
-  none of the registers (its C++ is built without SSE and x87, its Rust is
-  soft-float), so between a guest's exit on a CPU and its next entry there
-  they hold what its save saved unless another guest's entry came between.
+  guest's already -- the kernel keeps, for each CPU, whose load was the last
+  on it (`kcore::simd::guest`, by a number no two guests ever share), and
+  the host uses the registers nowhere but in a SIMD section (its C++ is
+  built without SSE and x87, its Rust is soft-float; `kernel/simd.h`),
+  which marks its CPU's nobody's before it uses them -- so between a
+  guest's exit on a CPU and its next entry there they hold what its save
+  saved unless another guest's entry or a section came between, and the
+  entry after a section puts the guest's back.
   That load is of all the CPU switches, under an XCR0 of all of it,
   whatever the guest's says: the upper halves of the YMM registers, which a
   guest whose XCR0 leaves out AVX cannot reach now but can the moment it
@@ -1106,17 +1109,21 @@ And while a guest runs:
   is on, so that they move nothing of the host's (VT-x faults them, its
   control for them off).
 
-  CR4.OSFXSR and OSXSAVE, which the loads and saves need, are set for a CPU
-  when its extension is turned on and cleared when it is turned off, not
-  around each entry as OSFXSR once was: that was two serializing writes of
-  CR4 and an XGETBV an exit, and under a nested hypervisor an exit to it for
-  each. What is given up is that, while the module is loaded, an SSE or AVX
-  instruction in the kernel would run on those CPUs instead of faulting --
-  a guard against a toolchain slip, not a guest. Between a guest's exit and
-  the next entry XCR0 is whatever that guest had; the extension going off
-  puts back what it found, and IA32_XSS with it. The `avx` built-in guest
-  is the check: two CPUs taking turns on one host CPU, each finding its YMM
-  registers, MXCSR and control word as it left them at every turn.
+  CR4.OSFXSR, and OSXSAVE where the CPU has AVX, which the loads and saves
+  need, are the kernel's from boot, for its SIMD sections; the extension
+  sets what of them it finds clear when it is turned on for a CPU -- and
+  PKE -- and clears that when it is turned off, not around each entry as
+  OSFXSR once was: that was two serializing writes of CR4 and an XGETBV an
+  exit, and under a nested hypervisor an exit to it for each. That the
+  kernel's code outside a section uses none of these registers is held by
+  its build (`scripts/check-simd.py` at every link), no fault being left to
+  stop it. Between a guest's exit and the next entry XCR0 is whatever that
+  guest had -- a section that finds it without AVX makes it the kernel's
+  for itself; the extension going off puts back what it found, and
+  IA32_XSS with it. The `avx` built-in guest is the check: two CPUs taking
+  turns on one host CPU, a section of the host's before each entry, each
+  finding its YMM registers, MXCSR and control word as it left them at
+  every turn.
 - **TSC_AUX is the guest's**, the value RDTSCP and RDPID read beside the
   TSC -- the CPU number, as Linux keeps it there -- which neither `vmrun`
   nor `vmlaunch` switches either (`hvarch::x86::msrs`). Each guest CPU keeps

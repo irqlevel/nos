@@ -64,6 +64,7 @@ What is in it:
 | `/boot/grub/nos.cfg` | its GRUB entries, `nos` and `nos (next)`, with the command line the kernel was built to read |
 | `/lib/modules/*.ko` | every module built with that kernel, so every one of them loads into it ([Modules](modules.md)) |
 | `/lib/hvboot` | the loader `hv` boots a guest's own kernel with, of the same build as `hv.ko`: the kernel of every VM `hv create <name> <url>` makes ([The hypervisor](hypervisor.md#a-guests-own-kernel-pvh-and-hvboot)) |
+| `/lib/licenses/CRYPTOGAMS` | the license of the CRYPTOGAMS assembly the kernel and its modules run -- ChaCha20-Poly1305's ([HTTPS](tls.md#the-assembly)) -- which asks a binary handed out to carry it |
 | `/etc/rc` | the default boot script: `insmod /lib/modules/sshd.ko`, `sshd start` |
 | `/nos-install` | the installer, the one that knows this image |
 | `/VERSION` | `version=`, `revision=` (what `version` prints in nos), `arch=`, `module_abi=` |
@@ -108,8 +109,9 @@ What `install` does, in order, stopping at the first thing that is wrong:
    left it without unmounting; one with anything else is refused, unless
    `--format` says to make a new filesystem in its place -- which loses
    what was there.
-3. Mounts it and puts the kernel, the modules, hvboot, `nos.cfg` and
-   `/VERSION` there. On a partition that had them, the old ones but
+3. Mounts it and puts the kernel, the modules, hvboot, the licenses,
+   `nos.cfg` and `/VERSION` there. On a partition that had them, the old
+   ones but
    `nos.cfg` go to `.prev`, together, for `rollback`. `/etc` is the
    machine's: the image's `/etc/rc` goes in only where there is none, and
    the keys are added to `/etc/ssh/authorized_keys`. The machine's
@@ -225,8 +227,8 @@ mount -o loop,ro nos-x86_64.squashfs /mnt
 ```
 
 `update` finds the partition through `42_nos` and puts the new kernel,
-modules, hvboot and `nos.cfg` there; the old kernel, modules, hvboot and
-`/VERSION` go to `.prev` together, and the microcode is taken again from the server's
+modules, hvboot, licenses and `nos.cfg` there; the old kernel, modules,
+hvboot, licenses and `/VERSION` go to `.prev` together, and the microcode is taken again from the server's
 `/lib/firmware`. `/etc` -- `rc`, the keys, the host key -- and everything
 else on the partition stay. The kernel parameters stay too, unless
 `--udpshell`, `--netconsole` or `--cmdline` is given: then those replace them
@@ -235,9 +237,9 @@ replaced together, since a kernel refuses a module built against another
 kernel interface. `/lib/modules` is the image's: a module of your own goes
 somewhere else.
 
-`nos-install rollback` swaps the current kernel, modules, hvboot and
-`/VERSION` with the `.prev` ones -- back to an image older than hvboot,
-none. `nos-install status` says what is installed and what was,
+`nos-install rollback` swaps the current kernel, modules, hvboot,
+licenses and `/VERSION` with the `.prev` ones -- back to an image older
+than hvboot or the licenses, none of that. `nos-install status` says what is installed and what was,
 the kernel parameters, the microcode's revision and whether a boot is armed. `nos-install uninstall`
 takes `42_nos` out and nos out of the menu, and leaves the partition alone.
 
@@ -266,6 +268,7 @@ On the partition, which is nos's root:
 | `/boot/grub/nos.cfg` | the image | the entries `nos` and `nos-next` |
 | `/lib/modules/`, `/lib/modules.prev/` | the image | the kernel's modules, and the ones before them |
 | `/lib/hvboot`, `.prev` | the image | the loader of a guest's own kernel, and the one before it |
+| `/lib/licenses/`, `/lib/licenses.prev/` | the image | the licenses of the code the kernel and its modules carry, and the ones before them |
 | `/lib/panel/bundle`, `/lib/panel.prev` | the image, when released with a panel | the panel's bundle: its URL and SHA-256, which `api panel create` fetches it by |
 | `/VERSION`, `.prev` | the image | what is installed, and what was |
 | `/boot/ucode` | the server's `/lib/firmware/intel-ucode`, at every install and update | this CPU's microcode, which nos loads on every CPU as it boots ([Boot](boot.md#x86-64-the-application-processors)) |
