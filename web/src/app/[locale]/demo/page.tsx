@@ -20,7 +20,7 @@ const video = (locale: Locale) => ({
     seconds: SECONDS[locale],
 });
 // The videos' lengths, for the structured data: ffprobe's, rounded.
-const SECONDS: Record<Locale, number> = { en: 178, ru: 176 };
+const SECONDS: Record<Locale, number> = { en: 197, ru: 196 };
 const PUBLISHED = "2026-11-16";
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
