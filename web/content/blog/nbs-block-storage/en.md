@@ -98,7 +98,31 @@ Reads come from the local replica, so they run at close to the device's speed. W
 
 Each host's page in the [management panel](/blog/management-panel) has a Block storage section. On a new cluster it offers Make an NBS cluster. After that you add the other hosts with Add a host, once the cluster's registry knows them (the Cluster section does that with Make a cluster, Invite a host and Join a cluster), and each host gets its storage with Add a device, a partition or a whole disk picked by its id. From then on the page shows what to look at first (a chunk server down, chunks at two replicas, no leader), then the volumes with their health in green, yellow, orange or red, the chunk servers, the members and the devices. Each volume has Grow, Snapshot, Clone, Make an image and Delete. Delete and Make an image ask you to type the name again.
 
-The Images page lists NBS images and snapshots. New image takes a URL, with the Debian 13 and Ubuntu 24.04 cloud images one click away, downloads it on the host, writes it onto a new volume and freezes it. Create a VM on an image's row, or "An image of NBS's" as the source in the VM form, makes a VM whose disk is a thin clone of that image. A VM's own page has a Snapshot action and lists the VM's snapshots, each with its own Create a VM, and its Disks tab charts each disk's IOPS and bandwidth, turns a disk yellow when its latency climbs and red on errors, and shows the volume's health next to it.
+[![The Block storage page on the EX44: all well, every chunk at three replicas; six volumes, two images and four volumes cloned from them, each whole](/images/nbs-block-storage/en-nbs-volumes.webp)](/images/nbs-block-storage/en-nbs-volumes.webp)
+
+*The EX44's Block storage page. Every chunk is at three replicas. ubuntu and alpine are images, and the four volumes are clones of them; vn-e is attached on the EX44, where its VM runs.*
+
+[![The rest of the page: a chunk server on each of the three hosts, the members with ax41a leading, and each host's device by its partition id](/images/nbs-block-storage/en-nbs-servers.webp)](/images/nbs-block-storage/en-nbs-servers.webp)
+
+*Further down: a chunk server on each host, the EX44's on a 15 GiB partition and the two VMs' on 40 GiB each, the three members with ax41a leading, and the devices by their partition ids.*
+
+The Images page lists NBS images and snapshots. New image takes a URL, with the Debian 13 and Ubuntu 24.04 cloud images one click away, downloads it on the host, writes it onto a new volume and freezes it.
+
+[![The Images page: the images ubuntu and alpine, each with Create a VM and Delete, and the New image form with Debian 13 picked](/images/nbs-block-storage/en-images.webp)](/images/nbs-block-storage/en-images.webp)
+
+*The Images page: two images, and the form that makes a new one from a cloud image's URL.*
+
+Create a VM on an image's row, or "An image of NBS's" as the source in the VM form, makes a VM whose disk is a thin clone of that image.
+
+[![The top of the Create a VM form: the name web1, An image of NBS's chosen, the ubuntu image, the clone's name, disk, memory and CPU](/images/nbs-block-storage/en-create-image.webp)](/images/nbs-block-storage/en-create-image.webp)
+
+*The VM form with an NBS image as the source. The clone is named after the VM unless you give it a name of its own.*
+
+A VM's own page has a Snapshot action and lists the VM's snapshots, each with its own Create a VM, and its Disks tab charts each disk's IOPS and bandwidth, turns a disk yellow when its latency climbs and red on errors, and shows the volume's health next to it.
+
+[![The Disks tab of the VM vn-e: its disk nbs:vn-e marked NBS, no I/O errors, whole, with charts of IOPS and bandwidth](/images/nbs-block-storage/en-vm-disks.webp)](/images/nbs-block-storage/en-vm-disks.webp)
+
+*vn-e's Disks tab: its disk is the NBS volume vn-e, whole and with no I/O errors. The VM was idle, so the charts are flat.*
 
 ## Using it from the shell
 

@@ -90,7 +90,19 @@ That was still with the cipher in portable Rust. After moving it to CRYPTOGAMS t
 
 In the [management panel](/blog/management-panel) every host has a page called VM networks. It starts with Make a vnet and Add a host. After that, New network asks for a name, a subnet, an MTU between 576 and 1440 (1,420 by default) and whether the network has a way out to the internet. The page lists what needs attention, the networks, the ports, the public addresses, the firewalls with their rules, and vnet's members. A port can be moved, deleted or given another firewall. A public address can be put on a port or pointed at another host when the provider routes it elsewhere. A firewall gets rules with Add a rule, and its two policies, for packets no rule matches, are set with Policies. Each rule can be taken out or moved up and down from its own table.
 
+[![The VM networks page on the EX44: nothing to look at, the network lan with its subnet, gateway, MTU 1,400 and a way out, two ports on it, one on ax41a and one on ex44, and no public addresses](/images/vnet-networks-across-hosts/en-vnet-networks.webp)](/images/vnet-networks-across-hosts/en-vnet-networks.webp)
+
+*The VM networks page on the EX44. The network lan has two ports, one on ax41a and one on the EX44, both judged by the firewall bench. No public addresses yet.*
+
+[![Further down the page: the firewalls default and bench, inbound denied and outbound allowed, their rules, and vnet's three members with ax41a leading](/images/vnet-networks-across-hosts/en-vnet-firewalls.webp)](/images/vnet-networks-across-hosts/en-vnet-firewalls.webp)
+
+*Further down: the cluster's two firewalls, their rules, and vnet's three members, with ax41a leading.*
+
 When you create a VM, the network list offers the host's own networks and the cluster's, written `vnet:<name>`. On a cluster network the firewall list switches to the cluster's firewalls, and the public address field disappears, because public addresses belong to vnet and are put on ports from the VM networks page.
+
+[![The bottom of the Create a VM form: the network vnet:lan chosen, and the cluster's firewall default](/images/vnet-networks-across-hosts/en-create-network.webp)](/images/vnet-networks-across-hosts/en-create-network.webp)
+
+*The VM form with a cluster network chosen. The firewall list is the cluster's now, and the public address field is gone.*
 
 ## Using it from the shell
 
