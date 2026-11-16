@@ -286,13 +286,15 @@ jobs:
       # the whole boot path, in both languages. One boot rather than two: it
       # costs the Rust workspace a rebuild (the profile differs) and the boot
       # about half again as long (arm64 under TCG: 22 s against 14 s). Last,
-      # because its images replace the ones every step above tests.
+      # because its images replace the ones every step above tests. x86-64's
+      # under -cpu max, TCG's SSSE3, AVX and AVX2: the crypto crate's vector
+      # code under the checks, where the boot above ran its integer code.
       - name: UB checks build and smoke test (${{ matrix.arch }}, TCG)
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           make nocheck ARCH=${{ matrix.arch }} UBSAN=1 RUSTUB=1
           if [ "${{ matrix.arch }}" = "x86_64" ]; then
-            ./tests/smoke-test.sh --skip-build
+            SMOKE_CPU=max ./tests/smoke-test.sh --skip-build
           else
             ./tests/smoke-arm64.sh --skip-build
           fi

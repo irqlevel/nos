@@ -29,6 +29,7 @@ pub mod softirq;
 pub mod timer;
 pub mod trace;
 pub mod cpu;
+pub mod simd;
 pub mod block;
 pub mod net;
 pub mod bitmap;

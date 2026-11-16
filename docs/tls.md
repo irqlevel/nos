@@ -185,13 +185,16 @@ libraries, `wasi` and `libc` — and cargo needs their manifests to resolve but
 never their code, so the script empties them. Emptied, not deleted: cargo
 still looks for the source files the manifest names.
 
-**Software crypto only.** The RustCrypto crates dispatch to SSE2/AVX2 at
-runtime and compile those paths unconditionally, which LLVM cannot legalize
-for a target with SSE off — it fails with `Do not know how to split the result
-of this operator`. The kernel keeps SSE off on purpose: it saves no XMM state
-on a context switch, so SSE in kernel code would corrupt userland-visible
-state the moment there is any. `src/crates/.cargo/config.toml` therefore sets
-the crates' own switches to the portable backends:
+**RustCrypto's portable code, and CRYPTOGAMS' assembly in a SIMD
+section.** The RustCrypto crates dispatch to SSE2/AVX2 at runtime and
+compile those paths unconditionally, which LLVM cannot legalize for a target
+with SSE off — it fails with `Do not know how to split the result of this
+operator`. The kernel keeps its compilers off SSE on purpose: it saves no
+vector state on a context switch, and lends the registers only to a SIMD
+section, in which ChaCha20-Poly1305 runs on CRYPTOGAMS' assembly ([The
+assembly](#the-assembly)); SSE anywhere else would work on registers that
+may hold a guest's. `src/crates/.cargo/config.toml` therefore sets the
+crates' own switches to the portable backends:
 
 ```
 --cfg aes_force_soft --cfg polyval_force_soft --cfg poly1305_force_soft
@@ -199,8 +202,9 @@ the crates' own switches to the portable backends:
 ```
 
 `sha2` has no such `--cfg`: left alone it picks SHA-NI by CPUID at run time,
-and on an application processor, which runs with `CR4.OSFXSR` clear, the
-first block hashed is an invalid opcode. It takes a feature instead, so
+SSE instructions outside a section -- which no longer fault, `CR4.OSFXSR`
+being set at boot for the sections, and which the link refuses
+(`scripts/check-simd.py`). It takes a feature instead, so
 `kernel/Cargo.toml` asks for `force-soft` -- which reaches the TLS client
 too, since a crate is built once for the whole graph -- and so does
 `common/net/ssh/Cargo.toml`, because a module is a build of its own that the kernel's
@@ -211,6 +215,75 @@ registers the kernel's entropy pool as its custom one. That pool is what makes
 a handshake work on a machine with no virtio-rng: `FailedToGetRandomBytes` from
 rustls means `kernel_get_random` returned zero, i.e. nothing had seeded the
 pool -- `entropy` in the shell says which sources exist.
+
+## The assembly
+
+ChaCha20-Poly1305 -- TLS 1.3's suite and both of TLS 1.2's -- runs on
+CRYPTOGAMS' assembly: the ChaCha20 and Poly1305 Andy Polyakov wrote for
+OpenSSL, from his own distribution of them (`src/crates/base/crypto`).
+`tls::provider` keeps everything else of rustls-rustcrypto's suites -- the
+hash, HKDF and PRF, the key exchange, the signatures -- and AES-GCM stays
+on RustCrypto's portable code.
+
+**Where it comes from, and under what license.**
+`src/crates/base/crypto/cryptogams/` holds the perlasm as it came -- the
+two algorithms for x86-64 and ARMv8 and the two translators -- at the
+commit its README names, each file's SHA-256 beside it, and the
+repository's `LICENSE`: BSD-style, or the GPL at the taker's choice. This
+tree takes the BSD-style one, which an MIT kernel can carry, and keeps its
+three conditions: the notice with every copy of the source (the files
+themselves, and at the top of each one `scripts/cryptogams.sh` makes), the
+notice with every binary handed out (a release's `LICENSE-CRYPTOGAMS`, the
+system image's `/lib/licenses/CRYPTOGAMS`), and no endorsement. Not Linux's
+copies of the same code, which are GPL-2.0, nor OpenSSL's, which are its
+author's work under the project's license rather than his own.
+`scripts/cryptogams.sh` makes `src/asm/` of them -- x86-64 ELF, arm64 ELF
+and Mach-O (a Mac's fuzzers) -- in perlasm's kernel mode, AVX2 in and
+AVX-512 out; `make check` runs it with `--check`, so what is built is what
+the sources say.
+
+**The SIMD section.** The kernel saves no vector state on a context switch,
+and its code is built to touch none: its C++ with `-mno-sse -mno-80387` or
+`-mgeneral-regs-only`, its Rust soft-float. The unit is on all the same
+(`hal::simd_setup_cpu`, every CPU at its bring-up: x86-64's CR4.OSFXSR and
+OSXMMEXCPT, and OSXSAVE with XCR0 the x87, SSE and AVX where the CPU has
+AVX; arm64's CPACR_EL1.FPEN, and CPTR_EL2.TFP clear when booted at EL2),
+for one thing: a SIMD section (`kernel/simd.h`, `kcore::simd::Section`),
+in which the vector registers are the holder's -- preemption off while it
+is open, one at a time on a CPU, so an interrupt handler that asks for one
+then is refused and runs the integer code; every register zeroed as it
+closes; and a guest's registers on that CPU marked gone, so that hv puts
+them back at the guest's next entry rather than skip the load
+([The hypervisor](hypervisor.md)). The crypto crate opens one for each
+16 KiB of a message, so preemption is off for some microseconds at a time.
+
+**What keeps the rest of the kernel off the registers.** Nothing at run
+time any more -- `CR4.OSFXSR`, which once made an SSE instruction fault, is
+set at boot -- so the build: the compilers are told to use none, the
+RustCrypto crates are forced onto their portable code (above), and
+`scripts/check-simd.py` holds every kernel and module as it is linked --
+the link fails on a vector, x87, MMX or mask register named outside
+CRYPTOGAMS' functions and `hal::simd_leave`.
+
+**The paths.** x86-64: AVX2's ChaCha20 for more than 128 bytes and
+Poly1305; SSSE3's ChaCha20 and AVX's Poly1305; SSSE3's alone; arm64:
+NEON's ChaCha20 for 192 bytes and more and Poly1305 for 128; each
+architecture's integer code where no section can be had -- the same choice
+OpenSSL's own dispatch makes on the same CPU, from what every CPU's
+sections may use. A boot says which: `crypto: ChaCha20-Poly1305 on
+CRYPTOGAMS' AVX2 code`.
+
+**What holds it.** Every boot, `crypto::selftest`: RFC 8439's known answers
+on every path the CPU has, each path against the integer code over the
+lengths where the assembly changes how it works -- a block, the 128, 192,
+256 and 512 bytes its wider paths start at, a 16 KiB piece -- at three
+alignments, in place, and a forged tag refused with the message left as it
+was; and `test_simd_section`. `tests/net-fuzz.py`: its `aead` target holds
+the crypto crate to RustCrypto's portable code on every path the host has,
+and its TLS targets the kernel's suites to RustCrypto's at the world's end
+of the connection. `tests/hv-test.py`'s `avx` guest: a section of the
+host's before each of its CPUs' entries, and its registers its own at
+every one of its turns. And every link (`scripts/check-simd.py`).
 
 ## What it costs
 
@@ -224,8 +297,8 @@ pool -- `entropy` in the shell says which sources exist.
   bounded by the 8 KB TCP receive window long before the cipher.
 - **The cipher, measured** (`tlsbench`, below): both pinned ends in one
   kernel over memory, 64 MB each way, nos under KVM on the AX41's Zen 2
-  (2026-11-05). The kernel has no SSE, so every suite runs on its portable
-  backend, and AES has no AES-NI:
+  (2026-11-05, before the assembly below: every suite then ran on its
+  portable backend, as AES-GCM still does, with no AES-NI):
 
   | Suite | sender and receiver on two CPUs | both on one | handshake |
   |---|---|---|---|
@@ -245,6 +318,23 @@ pool -- `entropy` in the shell says which sources exist.
   ChaCha20-Poly1305 with the kernel's HTTP client, and the kernel's server
   on it with a client that asks for AES-GCM first. On an Apple M-series
   core under HVF, arm64's: AES-GCM 160–195 MB/s, ChaCha20 440.
+- **ChaCha20-Poly1305 on CRYPTOGAMS' assembly** ([The
+  assembly](#the-assembly)), measured against the tree before it on the
+  same machine, the two taking turns twice (`tlsbench mb=64`, arm64 on an
+  Apple M-series under HVF, 2 CPUs, 2026-11-16):
+
+  | | RustCrypto's portable code | CRYPTOGAMS' NEON |
+  |---|---|---|
+  | a TLS 1.3 session, client->server | 406, 399 MB/s | 1012, 967 MB/s |
+  | a TLS 1.3 session, server->client | 404, 398 MB/s | 1014, 965 MB/s |
+  | the cipher alone, one CPU, 16 KB records | seal 547, 542 MB/s | seal 2020, 1988; open 2036, 2045 MB/s |
+
+  The session two and a half times as fast, the cipher alone 3.7 times:
+  what is left is the session's own work -- its records copied in and out,
+  the two ends' tasks -- which the last line of `tlsbench` shows. AES-GCM's,
+  on code that did not change, came out a tenth lower client->server and the
+  same server->client in both rounds. x86-64's under KVM on the servers is
+  still to be measured.
   `tests/tlsbench.py` boots nos with the module and runs it: under KVM
   on a server -- nos a guest, nothing rebooted -- it says what the cores
   give; under TCG, nothing worth quoting.

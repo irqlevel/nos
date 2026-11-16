@@ -13,6 +13,9 @@ pinned = ["dep:webpki", "dep:sha2"]
 [dependencies]
 kcore = { path = "../../base/kcore" }
 ffi = { path = "../../base/ffi" }
+# ChaCha20-Poly1305 in CRYPTOGAMS' assembly: what the ChaCha20-Poly1305
+# suites run on (aead.rs).
+crypto = { path = "../../base/crypto" }
 rustls = { version = "0.23", default-features = false, features = ["custom-provider", "tls12", "hashbrown"] }
 rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["alloc", "tls12"] }
 webpki-roots = "1.0"

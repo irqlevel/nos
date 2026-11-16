@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "kernel",
-    "base/events", "base/ffi", "base/hello", "base/kcore", "base/kmod", "base/random",
+    "base/crypto", "base/events", "base/ffi", "base/hello", "base/kcore", "base/kmod", "base/random",
     "layers/block", "layers/fs", "layers/ipc", "layers/mgmt", "layers/net", "layers/tls",
     "drivers/block/nvme", "drivers/block/virtio_blk", "drivers/block/virtio_scsi", "drivers/net/igb", "drivers/net/r8125", "drivers/net/r8168", "drivers/net/virtio_net", "drivers/rng/virtio_rng", "drivers/usb", "drivers/virtio",
     "hypervisor/hv", "hypervisor/hvarch", "hypervisor/hvboot",
@@ -14,7 +14,7 @@ members = [
 # module rules), then linked into a shared object the kernel loads.
 default-members = [
     "kernel",
-    "base/events", "base/ffi", "base/hello", "base/kcore", "base/random",
+    "base/crypto", "base/events", "base/ffi", "base/hello", "base/kcore", "base/random",
     "layers/block", "layers/fs", "layers/ipc", "layers/mgmt", "layers/net", "layers/tls",
     "drivers/block/nvme", "drivers/block/virtio_blk", "drivers/block/virtio_scsi", "drivers/net/igb", "drivers/net/r8125", "drivers/net/r8168", "drivers/net/virtio_net", "drivers/rng/virtio_rng", "drivers/usb", "drivers/virtio",
     "common/net/netwire",

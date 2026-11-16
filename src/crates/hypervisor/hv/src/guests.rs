@@ -3100,10 +3100,41 @@ fn dr_four(r: &[u64; 4]) -> String {
 /* ---- avx: a guest's x87, SSE and AVX registers its own, XCR0 too ---- */
 
 const AVX_NAME: &str = "avx";
-const AVX_ABOUT: &str = "two CPUs taking turns on one host CPU, by IPI: each turns on CR4.OSXSAVE and AVX in XCR0 -- \
-                         its XSETBVs refused where a CPU refuses them -- reads the XSAVE leaves of its CPUID, finds \
-                         YMM0-15 its own as it starts, and at every one of 64 turns finds its YMM registers, MXCSR \
-                         and x87 control word as it left them";
+const AVX_ABOUT: &str = "two CPUs taking turns on one host CPU, by IPI, a SIMD section of the host's -- ChaCha20-Poly1305 \
+                         in the kernel's vector registers -- before every entry: each turns on CR4.OSXSAVE and AVX in \
+                         XCR0 -- its XSETBVs refused where a CPU refuses them -- reads the XSAVE leaves of its CPUID, \
+                         finds YMM0-15 its own as it starts, and at every one of 64 turns finds its YMM registers, \
+                         MXCSR and x87 control word as it left them";
+
+/// What each of the avx guest's host sections seals: past the 128 bytes
+/// from which the AVX2 code is taken where the CPU has AVX2.
+const AVX_SECTION_BYTES: usize = 1024;
+
+/// The avx guest's host: before each entry of either CPU -- the run loop
+/// asks it whether to stop then, on the CPU's own task, the guest's
+/// registers saved and not yet put back -- ChaCha20-Poly1305 over a buffer
+/// by the crypto crate, in a SIMD section of the kernel's on the host CPU
+/// both run on. A section marks that CPU's registers nobody's, so the entry
+/// after it puts the guest's back: one that went on with what the section
+/// left -- zeros, as it closes -- would be a turn whose check the guest
+/// fails.
+struct Sections {
+    key: crypto::ChaCha20Poly1305,
+    sealed: core::sync::atomic::AtomicU64,
+}
+
+impl Host for Sections {
+    fn output(&self, _byte: u8) {}
+    fn input(&self, _at_prompt: bool) -> Option<u8> {
+        None
+    }
+    fn stop_requested(&self) -> bool {
+        let mut data = [0u8; AVX_SECTION_BYTES];
+        let _ = self.key.seal_in_place(&[0; crypto::NONCE_LEN], &[], &mut data);
+        self.sealed.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        false
+    }
+}
 
 /* A Linux guest's machine of two CPUs (`smp_board`), both of whose tasks
  * run on the one host CPU the guest is run on -- so that each entry of one
@@ -3451,12 +3482,17 @@ struct AvxCpu {
     machine: Arc<Machine>,
     deadline: u64,
     ran: Arc<kcore::sync::Mutex<(Counts, u64)>>,
+    /// The host's SIMD section before every entry, for the avx guest.
+    sections: Option<Arc<Sections>>,
 }
 
 fn avx_cpu(run: AvxCpu) {
-    let AvxCpu { guest, mut cpus, machine, deadline, ran } = run;
+    let AvxCpu { guest, mut cpus, machine, deadline, ran, sections } = run;
     if let Some(cpu) = cpus.first_mut() {
-        let counts = guest.run(cpu, &machine, deadline, &Quiet);
+        let counts = match &sections {
+            Some(sections) => guest.run(cpu, &machine, deadline, &**sections),
+            None => guest.run(cpu, &machine, deadline, &Quiet),
+        };
         *ran.lock() = (counts, cpu.backend_mut().fp_loads());
     }
     /* Its CPU goes in this task, before the guest: under VT-x the VMCS is
@@ -3547,17 +3583,23 @@ fn run_avx(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
         return fail(out, "out of memory");
     };
     let ran = [Arc::new(ran0), Arc::new(ran1)];
+    let sections = Arc::new(Sections {
+        key: crypto::ChaCha20Poly1305::new(&[0x5A; crypto::KEY_LEN]),
+        sealed: core::sync::atomic::AtomicU64::new(0),
+    });
 
     /* Both on this CPU: the second first, waiting for its start-up IPI, so
      * that the first never starts a CPU that has no task. */
     let here = 1u64 << kcore::cpu::id();
     let start = time::boot_time_ns();
     let deadline = start.saturating_add(AVX_BUDGET_MS * kcore::consts::NS_PER_MS);
-    let second = AvxCpu { guest: guest.clone(), cpus: ap, machine: machine.clone(), deadline, ran: ran[1].clone() };
+    let second = AvxCpu { guest: guest.clone(), cpus: ap, machine: machine.clone(), deadline, ran: ran[1].clone(),
+                          sections: Some(sections.clone()) };
     let Some(second) = kcore::task::spawn_on_with("hv/avx/cpu1", here, second, avx_cpu) else {
         return fail(out, "no task for its second CPU");
     };
-    let first = AvxCpu { guest: guest.clone(), cpus, machine: machine.clone(), deadline, ran: ran[0].clone() };
+    let first = AvxCpu { guest: guest.clone(), cpus, machine: machine.clone(), deadline, ran: ran[0].clone(),
+                         sections: Some(sections.clone()) };
     let first = kcore::task::spawn_on_with("hv/avx/cpu0", here, first, avx_cpu);
     if first.is_none() {
         guest.stop(GuestStop::Requested);
@@ -3589,11 +3631,26 @@ fn run_avx(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
                      counts[0].exits, counts[0].xsetbv, counts[0].xsetbv_refused, counts[0].ipi_sent, counts[0].hlt,
                      counts[1].exits, counts[1].xsetbv, counts[1].xsetbv_refused, counts[1].ipi_sent, counts[1].hlt);
     let _ = writeln!(out, "  registers  put back into the CPU {} times for cpu 0, {} for cpu 1", loads[0], loads[1]);
+    let sealed = sections.sealed.load(core::sync::atomic::Ordering::Relaxed);
+    let lent = kcore::simd::features();
+    let _ = writeln!(out, "  sections   {} of the host's before the entries, ChaCha20-Poly1305 over {} bytes, the \
+                           vector unit lent them {:#x}", sealed, AVX_SECTION_BYTES, lent);
     let mut says = String::new();
     let _ = describe_stop(&stopped.stop, 2, AVX_BUDGET_MS, &mut says);
     let _ = writeln!(out, "  stopped    {}", says);
 
-    match check_avx(guest.memory(), &stopped, &counts, loads, &hosts) {
+    /* What the sections were there for: a section between a CPU's exit and
+     * its own next entry, at every one of its turns at least -- with the
+     * vector registers lent them, or they tested nothing. */
+    let sections_ran = if lent == 0 {
+        Err(String::from("the host lends its sections no vector unit: they used no register a guest has"))
+    } else if sealed < 2 * u64::from(AVX_TURNS_EACH) {
+        Err(alloc::format!("{} sections of the host's ran, fewer than the CPUs' {} turns", sealed,
+                           2 * AVX_TURNS_EACH))
+    } else {
+        Ok(())
+    };
+    match sections_ran.and_then(|()| check_avx(guest.memory(), &stopped, &counts, loads, &hosts)) {
         Ok(checked) => {
             let _ = writeln!(out, "  checked    {}", checked);
             let _ = writeln!(out, "hv: guest {} ok", AVX_NAME);
@@ -4911,11 +4968,13 @@ fn run_pkru(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let here = 1u64 << kcore::cpu::id();
     let start = time::boot_time_ns();
     let deadline = start.saturating_add(PKRU_BUDGET_MS * kcore::consts::NS_PER_MS);
-    let second = AvxCpu { guest: guest.clone(), cpus: ap, machine: machine.clone(), deadline, ran: ran[1].clone() };
+    let second = AvxCpu { guest: guest.clone(), cpus: ap, machine: machine.clone(), deadline, ran: ran[1].clone(),
+                          sections: None };
     let Some(second) = kcore::task::spawn_on_with("hv/pkru/cpu1", here, second, avx_cpu) else {
         return fail(out, "no task for its second CPU");
     };
-    let first = AvxCpu { guest: guest.clone(), cpus, machine: machine.clone(), deadline, ran: ran[0].clone() };
+    let first = AvxCpu { guest: guest.clone(), cpus, machine: machine.clone(), deadline, ran: ran[0].clone(),
+                         sections: None };
     let first = kcore::task::spawn_on_with("hv/pkru/cpu0", here, first, avx_cpu);
     if first.is_none() {
         guest.stop(GuestStop::Requested);
