@@ -2762,7 +2762,7 @@ impl Vms {
         let made = Arc::new(Switch::new()?);
         /* The tunnel first: the switch carries into it, and the keeper gives
          * it the table */
-        let tunnel = crate::tunnel::Tunnel::new(made.clone(), self.rekey_s, self.keylife_s)
+        let tunnel = crate::tunnel::Tunnel::new(made.clone(), &crate::aead::Cryptogams, self.rekey_s, self.keylife_s)
             .ok_or_else(|| String::from("out of memory for the switch's tunnel"))?;
         let Some(tunnel_task) = kcore::task::spawn_with("hv/tunnel", tunnel.clone(), crate::tunnel::Tunnel::run) else {
             return Err(String::from("no task for the switch's tunnel"));

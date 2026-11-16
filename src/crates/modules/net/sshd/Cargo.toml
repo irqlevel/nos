@@ -11,3 +11,6 @@ crate-type = ["staticlib"]
 kmod = { path = "../../../base/kmod" }
 kcore = { path = "../../../base/kcore" }
 ssh = { path = "../../../common/net/ssh" }
+# ChaCha20 and Poly1305 for the ssh crate's cipher: CRYPTOGAMS' assembly in
+# the kernel's SIMD sections
+crypto = { path = "../../../base/crypto" }

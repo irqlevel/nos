@@ -6,9 +6,7 @@ edition = "2021"
 # vnet's tunnel between hosts (plans/vnet.md, "The tunnel"): the datagram a
 # cluster network's packet crosses the underlay in, sealed and opened, the
 # window of counters a key has seen, and the messages keys are given in. No
-# kernel in it: hv.ko seals and opens by it, and tests/fuzz/hv holds it to a
-# model of its own.
+# kernel in it, and no cipher of its own: hv.ko seals and opens by it with
+# the kernel's crypto crate, which it hands in, and tests/fuzz/hv holds it to
+# a model of its own.
 [lib]
-
-[dependencies]
-chacha20poly1305 = { version = "0.10.1", default-features = false }

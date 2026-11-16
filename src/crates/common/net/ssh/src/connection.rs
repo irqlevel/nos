@@ -66,7 +66,7 @@ pub fn serve(link: &mut dyn Link, shell: &mut dyn Shell, host: &HostKey, cfg: &C
         return Err(Error::NoRandom);
     }
     let login_by = link.now_ms().saturating_add(cfg.login_grace_ms);
-    let mut t = Transport::new(link, host, &seed, cfg.software);
+    let mut t = Transport::new(link, host, cfg.primitives, &seed, cfg.software);
     seed.fill(0);
 
     let result = connect(&mut t, shell, cfg, login_by);

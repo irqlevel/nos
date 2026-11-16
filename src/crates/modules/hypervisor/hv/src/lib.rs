@@ -38,6 +38,8 @@
 extern crate alloc;
 
 #[cfg(target_arch = "x86_64")]
+mod aead;
+#[cfg(target_arch = "x86_64")]
 mod boot;
 #[cfg(target_arch = "x86_64")]
 mod clone;

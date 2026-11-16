@@ -55,6 +55,7 @@ use std::sync::Arc;
 
 use vnetwire::{Header, Kind, Message, HEADER, KEY, PORT, TAG};
 
+use crate::aead::RustCrypto;
 use crate::device::{ETH0, HV0};
 use crate::net::{Lent, Nic, RxContext};
 use crate::vnic::VnicSink;
@@ -563,7 +564,7 @@ impl World {
             for &(giver, taker, number, key) in self.keys.iter() {
                 if giver == to && taker == h && number == header.key {
                     let mut copy = f[at..].to_vec();
-                    if vnetwire::open(&key, &mut copy).is_ok() {
+                    if vnetwire::open(&RustCrypto, &key, &mut copy).is_ok() {
                         found = Some(key);
                         break;
                     }
@@ -811,7 +812,7 @@ impl World {
                 let packet = ipv4(src, dst, 17, 0, 0, &udp(GUEST_PORT, 7, &data));
                 let header = Header { kind: Kind::PortToPort, network: vni, key: number, counter: r.u64() };
                 let mut out = vec![0u8; HEADER + packet.len() + TAG];
-                vnetwire::seal(&key, &header, &packet, &mut out).expect("room for it");
+                vnetwire::seal(&RustCrypto, &key, &header, &packet, &mut out).expect("room for it");
                 out
             }
             _ => {
@@ -1141,7 +1142,7 @@ impl World {
 fn start(h: usize, nic: usize, sw: &Arc<Switch>, rekey_s: u64, keylife_s: u64, hosts: &[TableHost],
          table: &[RemotePort]) -> Arc<Tunnel> {
     ipc::set_current(h);
-    let t = Tunnel::new(sw.clone(), rekey_s, keylife_s).expect("a tunnel");
+    let t = Tunnel::new(sw.clone(), &RustCrypto, rekey_s, keylife_s).expect("a tunnel");
     t.open_mailbox();
     t.set_table(node(h), hosts, table, MTU);
     t.uplink(Nic::from_handle(nic));
