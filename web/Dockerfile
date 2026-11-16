@@ -62,6 +62,10 @@ ENV NODE_ENV=production \
 COPY --from=build --chown=node:node /src/web/.next/standalone ./
 COPY --from=build --chown=node:node /src/web/.next/static ./.next/static
 COPY --from=build --chown=node:node /src/web/public ./public
+# docker-compose.yml's `media` service runs the same image to copy the videos
+# into the volume Caddy serves them from: its script, and its mount point.
+COPY --chmod=755 scripts/media-sync.sh /usr/local/bin/media-sync
+RUN mkdir -p /media
 USER node
 EXPOSE 3000
 # Checked every second while it starts (an engine older than 25 ignores
