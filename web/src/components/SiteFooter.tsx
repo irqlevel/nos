@@ -37,6 +37,7 @@ export function SiteFooter({ locale, dict }: { locale: Locale; dict: Dictionary 
                     links={[
                         { href: `/${locale}/about`, label: dict.nav.about },
                         { href: `/${locale}/hypervisor`, label: dict.nav.hypervisor },
+                        { href: `/${locale}/demo`, label: dict.nav.demo },
                     ]}
                 />
                 <Column
