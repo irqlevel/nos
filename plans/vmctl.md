@@ -89,7 +89,8 @@ the agent says no, and the VM goes to the next host.
 
 A running VM moved to another host, its memory copied while it runs. Its
 disk on NBS and its network across hosts need not move. Live migration is
-what maintenance as evacuation and rebalancing are built from.
+what maintenance as evacuation and rebalancing are built from. Its plan:
+[vm-migration.md](vm-migration.md).
 
 ## Kept ready for it now
 
