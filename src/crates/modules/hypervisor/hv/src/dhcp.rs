@@ -12,6 +12,11 @@
 //! DHCPINFORM, and is told it in an ACK with no address and no lease (RFC
 //! 2131, 3.4). The DNS server is nos's as it is when the guest asks, not as
 //! it was when the guest started.
+//!
+//! On a cluster network the server is the network's gateway, its first
+//! address, and the guest is told the network's MTU too (option 26): what
+//! crosses a tunnel between hosts (plans/vnet.md) is smaller than a frame
+//! of Ethernet's.
 
 use netwire::{self as wire, eth, udp, Mac, ETH_TYPE_IP, MAC_BROADCAST};
 
@@ -45,6 +50,8 @@ const OPT_PAD: u8 = 0;
 const OPT_MASK: u8 = 1;
 const OPT_ROUTER: u8 = 3;
 const OPT_DNS: u8 = 6;
+/// The interface's MTU (RFC 2132, 5.1).
+const OPT_MTU: u8 = 26;
 const OPT_REQUESTED_IP: u8 = 50;
 const OPT_LEASE_TIME: u8 = 51;
 const OPT_MESSAGE_TYPE: u8 = 53;
@@ -64,20 +71,24 @@ const LEASE_SECS: u32 = 86_400;
 /// shorter ones are padded out to it.
 const MIN_MESSAGE: usize = 300;
 /// The options a reply carries at most: type, server, lease, mask, router,
-/// DNS server and the end.
-const REPLY_OPTIONS: usize = 3 + 6 + 6 + 6 + 6 + 6 + 1;
+/// DNS server, MTU and the end.
+const REPLY_OPTIONS: usize = 3 + 6 + 6 + 6 + 6 + 6 + 4 + 1;
 /// A reply's message, and the whole frame.
 const BODY_MAX: usize =
     if OPTIONS + REPLY_OPTIONS > MIN_MESSAGE { OPTIONS + REPLY_OPTIONS } else { MIN_MESSAGE };
 pub const REPLY_MAX: usize = udp::PAYLOAD_AT + BODY_MAX;
 
-/// What the server says of itself and of the network.
+/// What the server says of itself and of the network: the server is the
+/// guest's router too.
 pub struct Network {
     pub server_ip: u32,
     pub server_mac: Mac,
     pub mask: u32,
     /// The DNS server to hand out; 0 for none.
     pub dns: u32,
+    /// The MTU to hand out; 0 for none -- Ethernet's, which a host's
+    /// networks have.
+    pub mtu: u16,
 }
 
 /// Whether a frame is a DHCP client's message -- UDP from port 68 to 67 --
@@ -197,6 +208,9 @@ pub fn answer(frame: &[u8], yours: u32, net: &Network, reply: &mut [u8; REPLY_MA
         at = put(body, at, OPT_ROUTER, &net.server_ip.to_be_bytes());
         if net.dns != 0 {
             at = put(body, at, OPT_DNS, &net.dns.to_be_bytes());
+        }
+        if net.mtu != 0 {
+            at = put(body, at, OPT_MTU, &net.mtu.to_be_bytes());
         }
     }
     body[at] = OPT_END;

@@ -2130,11 +2130,15 @@ it an address: 10.0.100.2 for the first port, .3 for the next, handed to its
 kernel on the command line (`ip=`). nos is 10.0.100.1 on the same subnet, so
 the guests reach it, and it reaches them -- `ping 10.0.100.2` from nos's
 shell goes out of the device whose subnet the address is on -- and guests
-on one network (`network=`) reach each other:
+on one network (`network=`) reach each other once their firewall lets their
+network in ([The firewall](#the-firewall)):
 
 ```
-$ hv start /bzImage initrd=/initrd net network=lab cmdline=console=ttyS0 nolapic
-$ hv start /bzImage initrd=/initrd net network=lab cmdline=console=ttyS0 nolapic
+$ hv fw create lab
+$ hv fw lab add allow in from net       # the network's guests reach each other
+$ hv fw lab add allow in tcp 80         # and anyone its port 80
+$ hv start /bzImage initrd=/initrd net network=lab firewall=lab cmdline=console=ttyS0 nolapic
+$ hv start /bzImage initrd=/initrd net network=lab firewall=lab cmdline=console=ttyS0 nolapic
 $ hv exec 0 ping -c 3 10.0.100.1        # nos
 $ hv exec 0 ping -c 3 10.0.100.3        # the other guest, on lab too
 $ ping 10.0.100.2                       # from nos
@@ -2466,7 +2470,120 @@ would hold a client 62 ms away -- the EX44 from a desk in another country --
 to 120 KiB/s, whatever the line; and while bytes move, its relay waits a
 millisecond on the side that has nothing rather than five, which held a
 download to 4 KiB a round. The other way, the guests reach the world through
-NAT (next).
+NAT (next). A client is held to the guest's firewall as its connection is
+accepted: one its rules do not let in at the guest's port is closed on,
+counted (`denied` in `hv forward`), and `hv forward add` says so when the
+firewall lets nobody in there.
+
+### The firewall
+
+**Every VM's NIC is judged by a firewall, both ways, at its port of the
+switch** (plans/vnet.md, "The firewall"; `common/net/firewall`, the switch's
+`judged`). A firewall is a policy for each direction and up to 64 rules, the
+first that matches deciding; what no rule matches meets its direction's
+policy. A VM that names none is judged by `default` -- what comes in denied,
+what goes out allowed, no rule -- so a VM is closed until something opens
+it, its own network's guests included: two VMs of one network reach each
+other once their firewall says `allow in from net`.
+
+```
+$ hv fw                                     # the host's firewalls, and the VMs on each
+$ hv fw create web                          # in denied, out allowed, no rule
+$ hv fw web add allow in tcp 22 from 203.0.113.0/24
+$ hv fw web add allow in tcp 80,443         # from anyone
+$ hv fw web add deny out tcp 25 at=1        # first: no mail out
+$ hv fw web                                 # its rules, each with the flows it judged
+$ hv fw set vm1 web                         # vm1's vm.toml says it; a running vm1 judged by it at once
+$ hv fw web del 3 | move 2 1 | policy in=deny out=allow
+$ hv fw delete web                          # only one no VM names; default never
+```
+
+A rule is `allow|deny in|out [tcp|udp|icmp] [ports] [from|to any|net|<a.b.c.d/n,...>]`
+-- ports a list and ranges (`22`, `80,443`, `8000-8100`), `net` the VM's
+own network on the switch. A firewall is a file, `/etc/hv/firewalls/<name>.toml`
+(`in`, `out` and `rules`, as a person writes them), written whole on every
+change and then put in its place in the switch: every VM on it judged by it
+from the next frame on, and their open flows judged again -- those it no
+longer lets through cut, and said. A VM names its firewall in its vm.toml
+(`firewall = "web"`), on `hv start` (`firewall=web`), on `hv create`, and in
+the panel as it is made; one whose firewall's file cannot be read does not
+start, and says why -- neither open nor stood in for by `default`.
+
+What is judged, and what is not:
+
+- **Flows, not packets.** The first packet of a flow -- TCP's, UDP's, an
+  echo's -- is judged by the rules; a flow they let through is remembered
+  in the port's table, 2048 flows a port, and its packets and its answers
+  go by without the rules after that, and so do ICMP errors about it --
+  path MTU discovery is nothing without them. Its times and TCP's states
+  are NAT's (`netwire::flow`), but for a connection answered and not
+  closing, which lives five days. A full table gives up the flow its VM
+  used least lately, never another VM's. A TCP segment of no flow that
+  starts nothing -- of a connection whose flow ran out while it was quiet --
+  is judged as its connection's first would be, and picked up where it is.
+- **The host's own traffic is not judged**: what comes from or goes to
+  `hv0`'s address -- DHCP and DNS, the host API a panel's VM reaches, `ping`
+  from nos's shell. The host is the VM's hypervisor. Nor is ARP, nor IPv6's
+  neighbour discovery.
+- **A deny going in is dropped without a word; one going out is answered**
+  to the VM -- ICMP communication administratively prohibited, from its
+  gateway, no more often than a rate -- so that its connect fails at once.
+- **IPv4 fragments** to and from a VM are dropped: they carry no ports. IPv6,
+  which only a network's guests carry between themselves, reaches a VM whose
+  firewall lets its network in, or whose inbound policy allows.
+- **A port that changes hands** has its table emptied as it is claimed, and
+  a delivery is checked against the owner's claim under the inbox's lock: a
+  VM coming onto a port is never handed what the flows of the one before let
+  in.
+
+What it judged is counted: each rule's flows and each policy's in `hv fw
+<name>` (and the `fw` provider's `rules`), what each VM was denied each way
+in `hv list`, and each packet kept out as a tracepoint of the `fw` group
+(`fw_deny`, [docs/tracing.md](tracing.md#the-firewalls-events)) -- not a line
+of the log. A VM made before firewalls is given one at its first start under
+an hv that has them: `default`, or -- one with forwards -- a firewall of its
+own name letting in at each forwarded port, so that what `hv forward`
+reached stays reached; `hv start` says which. `api panel create` gives the
+panel's VM its own, `panel`, letting in at its 443 alone.
+
+A firewall is checked without a guest by a probe (`hv probe`): a port of
+the switch with no VM behind it, on a network or alone and judged by a
+firewall as a VM's NIC is, whose task answers ARP, echo and UDP to port 7,
+and which pings and sends UDP from the port as a guest's NIC does -- each run
+answered, refused (communication administratively prohibited) or nothing:
+
+```
+$ hv probe add a network=lab firewall=lab
+$ hv probe add b network=lab firewall=lab
+$ hv probe ping a 10.0.100.3               # b, from a: 3 echoes sent, 0 answered -- lab lets nothing in
+$ hv fw lab add allow in from net
+$ hv probe ping a 10.0.100.3               # 3 answered
+$ hv probe udp a 10.0.100.3 7 sport=40999  # one flow, run after run
+$ hv probe del a
+```
+
+On the management bus the host's firewalls are the `fw` provider's -- `list`,
+`rules`, `get`, `create`, `delete`, `policy`, `add`, `remove`, `move`,
+`assign` -- a page of the panel's of their own; the vm provider's `create`
+takes `firewall`, which the panel's form offers as a list of them (the
+descriptor's `choices`, [docs/mgmt.md](mgmt.md#descriptors)), and each VM's
+row says its firewall.
+
+The gates: `tests/vnet-test.py` boots nos with probes where guests would
+be -- closed by default, a rule opening it, a deny outwards answered, a
+change cutting a flow, each denial a `fw_deny`, `rmmod hv` with probes up;
+the hv fuzzer's `firewall` target holds the crate -- rules,
+flows, the judge -- to a model of its own that shares nothing with it;
+`fwswitch` holds the switch to it, a closed and an open firewall on a
+network's ports, a port handed over between a judgement and its delivery,
+whole sends, the host's frames, a forward's clients let in or kept out by
+the VM's firewall; `switch` and `guestnet` run with every
+port allowed, their models unchanged. `tests/fuzz/hv/mutants.py`
+(`hv-fuzz.py --mutants`) takes out twenty-one of the rules -- the first
+match, an echo's direction, the stray check, the oldest flow evicted, a
+change cutting the flows it denies, a delivery held to its claim, the host
+exempt, a forward's client held to the firewall -- and each must be
+found.
 
 ### The way out: NAT, DHCP and DNS
 
@@ -2583,6 +2700,274 @@ the machine through `hv forward`; then the way out -- `dns0` in the guest's
 test machine through NAT, a ping there, `udhcpc` given its port's address,
 nos as its router and nos's DNS server, and `nat` and `hv list` saying so.
 With `--internet`, a name looked up through the DNS server it was given.
+
+### A public address: one to one
+
+**A VM may have an address of the world's of its own** -- one rented for it
+and routed to the machine it runs on -- mapped one to one to its private
+one (`public=`; plans/vnet.md, "NAT"). The world reaches the VM at it, and
+the VM goes out from it: NAT rewrites the destination of what comes for the
+public address to the VM's own and hands it to the switch, where the VM's
+firewall judges it -- the source as the world sent it -- and the source of
+what the VM sends out to the public address; no table of flows, nothing to
+run out. The guest sees its private address alone. What is not opened by a
+rule of its firewall stays closed: a public address is an open door only
+where its firewall says so.
+
+```
+$ hv fw create web
+$ hv fw web add allow in tcp 22,80,443
+$ hv start web public=203.0.113.9 firewall=web    # or public = "203.0.113.9" in its vm.toml
+$ hv list                                          # ... 10.0.100.2 alone, public 203.0.113.9
+$ nat                                              # 203.0.113.9 one to one to 10.0.100.2 (...), MTU 1500
+```
+
+How an address reaches the machine: Hetzner's additional address is
+ordered for the server, with no virtual MAC -- that is for a guest whose
+own MAC is on the wire, and here none is -- and its router finds it by
+ARP on the server's link, or routes a subnet to the server's main address;
+either way it comes to the uplink, which **answers ARP for a public address
+mapped there, as that address**, and announces it as it is mapped, so a
+router that had it elsewhere hears of it at once. Nothing is configured on
+the uplink itself.
+
+What NAT holds a public address's packets to:
+
+- **What comes in has to come from the world**: not an address the deny
+  list has (the private networks, link-local, the shared space -- less what
+  `nat allow` let through), nor this machine's. Otherwise any neighbour on
+  the link could hand a VM a packet "from" its private neighbour.
+- **What goes out is held to the deny list**, as the masquerade's is -- but
+  not to the uplink's own subnet: a neighbour there is the world to a public
+  address.
+- **ICMP errors are translated both ways**, the packet they quote with them
+  -- a router's "time exceeded" about a packet the VM sent comes back
+  quoting it from the VM's own address -- and a packet in past the VM's MTU
+  is answered "fragmentation needed", from the public address, where it
+  may not be cut; NAT cuts nothing. What NAT makes up itself -- that, and
+  the masquerade's rejections -- is held to a rate.
+- **One address, one VM, one host**: a public address mapped already, or a
+  VM mapped already, is refused; an address of this machine's is never
+  mapped. The mapping goes with the VM's port -- when the VM stops, before
+  the port and its address go to the next VM -- and with NAT. A VM asked
+  for one it cannot have does not start: no way out yet (no lease), the
+  address taken, an address no host may have.
+
+Here a public address is the VM's own host's: one VM on one machine, as
+`public=` says. An address that moves with a VM across a cluster's hosts,
+and one reached on a host its VM is not on, is V4's (plans/vnet.md).
+
+The gates: the hv fuzzer's `onetoone` target -- addresses mapped and
+unmapped, refused as the rules say, a network behind `hv0` put there and
+taken away, packets both ways each held byte by byte (the address
+rewritten, the TTL, the checksums right where they were right), ICMP
+errors translated with what they quote, "too big", ARP answered for what is
+mapped alone -- and its nine mutants (`hv-fuzz.py --mutants`); and
+`tests/vnet-test.py`'s second phase, one nos on `tests/hub.py`'s LAN with
+the world past its router: a probe with a public address reached by the
+world -- a datagram, and an echo once its firewall lets ICMP in -- the world
+seeing that address and the masquerade's beside it, nothing answering for
+the address once the probe is gone.
+
+### The cluster's networks
+
+A VM may be on a network of the cluster's (plans/vnet.md, V2): one vnet.ko
+keeps in its state -- a private subnet, its MTU, whether it goes out --
+which VMs on every host of the cluster share. `network = "vnet:lan"` in
+its vm.toml says so, and nothing else about it: its port, its address and
+its firewall are vnet's, kept in vnet's state, which `vnet ports` and
+`vnet port <id>` show and `vnet port firewall` changes.
+
+```
+$ vnet create lan 10.10.0.0/24 mtu=1400
+$ hv create web /bzImage net network=vnet:lan address=10.10.0.50 firewall=web
+hv: web given port 4 on vnet:lan at 10.10.0.50, judged by its firewall web
+$ hv start web
+$ hv delete web                             # its port deleted with its folder
+```
+
+- **The port is made at `hv create`**, where a conflict -- an address
+  taken, a firewall there is none of -- shows at once, or at the first
+  start; `address=` and `firewall=` are carried out then and kept in vnet's
+  state alone, and `port=` and `public=` are the host's networks' words.
+  hv asks vnet through the management bus (`hv/src/vnet.rs`), as it asks
+  NBS: the `vnet` provider's `attach` answers from the state the leader
+  vouches for (raft's ReadIndex, `raftmember::read`, waiting up to five
+  seconds for a leader); with no leader, a port the host's own state binds
+  here is answered all the same, said unconfirmed in `hv list`, and asked
+  again until it is confirmed. A VM with no folder is on no such network:
+  its UUID, which its port is vnet's by, is new at each start.
+- **Its identity is its port's**: the switch's port is claimed as who vnet
+  made it (`Switch::claim_vnet`) -- its address, its MAC `02:00:` and the
+  address's four bytes, its subnet and MTU -- and every delivery is held to
+  that owner and address under the inbox's lock. The guest is told its
+  address and its gateway, the network's first address, on its command
+  line (`ip=`) and by DHCP, with the MTU (option 26); its NIC says the MTU
+  too (`VIRTIO_NET_F_MTU`), which a kernel set by `ip=` has no other way to
+  learn.
+- **The switch carries IPv4 and ARP alone there**: ARP answered by the
+  switch -- the gateway at `hv0`'s MAC, a port of the network here at its
+  own -- and never carried; the gateway's echo answered from the gateway;
+  nothing broadcast; another network's port, the host's networks, the
+  cluster's other networks through the gateway, and the world from a
+  network that does not go out, all isolated (counted, `hv list`); a packet
+  past the MTU kept in, and answered "fragmentation needed" from the
+  gateway where it may not be cut, at a rate. The world is NAT's: the
+  network put behind `hv0` (`Nat::inside`) while it has a port here and
+  goes out. `hv0`'s own ARP after a port of one is answered by the switch
+  through a ring a task hands in (`hv0`'s sink may not take the heap).
+- **The keeper** (`vnet::Keeper`, task `hv/vnet`) asks vnet's table every
+  second while a VM here is on such a network, by vnet's instance and its
+  state's revision: the cluster's networks given the switch, the cluster's
+  firewalls its ports are judged by put in their places again as their
+  rules change (`vnet:<name>` in `hv fw`'s list, which `hv fw` does not
+  change), and a port vnet moved, deleted or gave another generation shut
+  -- nothing from it or to it, its VM running on, `hv list` saying why.
+  With vnet gone hv goes on by what it had and says so once.
+
+`hv probe add <name> network=vnet:lan [address=...] [firewall=...]` makes a
+probe a port of vnet's under a UUID of its own, deleted with it. The gates:
+the hv fuzzer's `vnetswitch` target -- the switch's rules for the cluster's
+networks held to a model of its own, with twenty-eight mutants among
+`hv-fuzz.py --mutants` -- and `tests/vnet-test.py --phase v2`, one nos with
+probes on two networks, a VM's port made and deleted with its folder, vnet
+unloaded under them.
+
+#### Across hosts: the tunnel
+
+A port of the network on another host is reached through the tunnel
+(plans/vnet.md, V3; `modules/hypervisor/hv/src/tunnel.rs`, its datagram in
+`common/net/vnetwire`): the guest's packet, IPv4 as it sent it, sealed into
+a UDP datagram to the other host where the registry has it, and opened
+there into that port's inbox.
+
+```
+Ethernet | IPv4, DF | UDP 39241 -> 39241 | kind 1, network 3, key 4, counter 8 | the packet, sealed | tag 16
+```
+
+- **Where a host is**: its `underlay` address in the registry, its `ipc`
+  one where it has none, at that address's port where it has one of its
+  own, else 39241 ([cluster.md](cluster.md)) -- what it listens on, sends
+  from, and is sent to. A datagram leaves from the uplink's own address: a
+  host behind a NAT is reached at the NAT's address and the port the NAT
+  forwards to it, and two hosts behind one address each have a port of
+  their own -- the same number as their ipcnet's, which the registry has
+  already (`cluster invite <host> <ip>:<port>`), forwarded in UDP as well
+  as TCP. Two hosts the table has at one address and port are said in the
+  log. The registry's address for this host not the uplink's is said once:
+  reached through a NAT, if at all.
+- **The switch carries into it** (`Carrier`): a packet to a port's MAC that
+  is no port here, of the sender's network, at the address the table has on
+  another host -- judged going out by the sender's firewall, cut at its
+  length -- and ARP for such a port answered as for one here. Out of the
+  tunnel (`Switch::from_tunnel`) a packet goes only to the port of its
+  network at its destination, judged coming in by that port's firewall and
+  held to its owner and address as any delivery is. Nothing from the tunnel
+  goes back into it.
+- **What it lets through**: a datagram under a key this host gave another
+  and still has -- the key's number says which host, wherever a NAT made
+  it come from, each number this host gives one no other key it has given
+  has; with a counter its window has not seen (2048 back); whose tag holds
+  -- the header is the associated data, the counter the nonce of
+  ChaCha20-Poly1305 -- carrying a packet from a port the table has on that
+  very host. Anything else is counted (`hv tunnel`) and, with `trace on
+  tunnel`, a `tunnel_drop` saying why.
+- **Keys** go between the hosts' hv over ipc (`hv.tunnel`, a name the
+  cluster reaches): each host gives every other the key to seal to it with,
+  made anew for every message, its number random, installed to open by
+  before it is sent, for one instance of the other's hv and taken by that
+  instance alone, a number taken once -- the numbers taken kept as long as
+  the host is in the table, its address or port moved or not. A host's new
+  hv -- a reload, a reboot -- has every key to it and from it dropped, as
+  does its going, which it says. Keys are given anew every `rekey=` seconds
+  (3600), the one before kept `keylife=` (120): `insmod /hv.ko rekey=8
+  keylife=4`. Nothing of them is written anywhere.
+- **The echo**: every five seconds to each host with a key, every third one
+  as large as the largest packet a cluster network carries, answered as
+  large. A host whose answers stop for twenty seconds is said in the log
+  (`answered no echo`) and its key asked for anew, so a key's message lost
+  costs that long; a way that carries the small echoes and not the large is
+  an underlay short of the networks' MTU, said too (`does not carry a packet
+  of N bytes`). A network's MTU is its packets' bound: the tunnel adds 60
+  bytes to each, so 1440 fills a 1500-byte underlay.
+- **Its uplink** is NAT's -- the device the default route is on -- put on
+  as soon as there is another host to reach. Sends go only while the uplink
+  keeps room for the stack's own; the next hop's MAC is had beforehand, by
+  the tunnel's task (`hv/tunnel`).
+
+```
+$ hv tunnel
+hv tunnel: instance 5a1c..., node 1, at 10.9.0.1:39241
+  b                10.9.0.2:39241        hop known  key to it had  keys given it 2  echo answered 3 s ago, a full one 13 s ago
+  c                203.0.113.7:39242     hop known  key to it had  keys given it 1  echo answered 3 s ago, a full one never
+  sent 1873, received 1869; not sent: no key 2, no room 0, no hop 0; not taken: unknown 0, replayed 0, forged 0, stale 0; echoes answered 41
+```
+
+The gates: the hv fuzzer's `tunnel` target -- three hosts' switches and
+tunnels over a wire that loses, repeats, damages, reorders, misdelivers
+and forges, keys' messages lost and repeated, tunnels started anew, tables
+wrong and ports moved; on a third of its inputs two of the hosts behind a
+NAT, at its address and ports of their own, their datagrams given its
+address -- or another of its own -- and any port, and a host's port moved
+under traffic: no key and counter sealed twice, nothing delivered that was
+not sent, or twice, or from a port the receiver's table has elsewhere, and
+every port reaching its network's others once the wire is kind -- its
+`vnetwire` target, and thirty-three mutants of the tunnel's and the
+datagram's rules among `hv-fuzz.py --mutants`; and `tests/vnet-test.py
+--phase v3`, three nos with probes on each, keys changed under traffic, a
+narrow link, a host killed, hv reloaded, a port moved.
+
+#### A public address across hosts
+
+A public address is routed by the provider to one host -- vnet's word for
+it, `vnet ip add 203.0.113.9 ex44` -- and may be put on the port of a VM on
+any host (`vnet ip set 203.0.113.9 <port>`; plans/vnet.md V4). vnet's table
+says every public address on a port: the address, the host it is routed
+to, and the port's network, address and host.
+
+```
+the world -> ex44's uplink -> NAT one to one -> hv0 -> the switch -> the tunnel (kind 3) -> ax41 -> the port
+the port -> its gateway -> the tunnel (kind 2) -> ex44 -> hv0 -> NAT one to one -> the uplink -> the world
+```
+
+- **The host it is routed to serves it** (`Switch::serve`): one to one in
+  NAT to the port's address and MAC (`02:00` and the address), at its
+  network's MTU, the network put behind `hv0` -- wherever the port is, this
+  host or another. ARP on the uplink answers for it there. A port moving
+  keeps the mapping, its host the switch's to know; an address taken off,
+  moved or removed is unmapped before another takes its place. A public
+  address on a network that does not go out is not served, said once.
+- **The world's packet** NAT made the port's comes out of `hv0` into the
+  switch, in `hv0`'s sink -- where nothing may wait -- and is queued for the
+  tunnel's task, which the queue wakes, to carry to the port's host; there
+  it goes only to the port whose public address is routed to the host that
+  sent it, from the world or from the network's gateway (NAT's refusals),
+  judged by the port's firewall.
+- **The port's packet for the world** goes to the host its address is
+  routed to (`Switch::public_way`, told by the keeper), judged going out on
+  the way, and into that host's `hv0` -- for the world alone, from a port
+  whose address that host serves, on the host that sealed it -- as one
+  more port's share of `hv0`'s backlog, for NAT to send out from the
+  address. A port with no public address goes out masqueraded from its own
+  host, as before; one whose address is routed to its own host goes out
+  through that host's NAT as V0b's `public=` does.
+- **The keeper** asks vnet's table on every host whose hv is loaded,
+  whether or not a VM of its own is on a cluster network: a host may be the
+  way in for a VM on another. A host in no vnet is asked nothing it says no
+  to. `hv tunnel` lists what the host serves (`serves 203.0.113.9 for
+  10.10.0.12 on node 2`).
+
+The gates: the hv fuzzer's `tunnel` target, two public addresses routed to
+one host -- on a port of its own and on a port elsewhere -- through the
+real NAT one to one, the world's packets in at its uplink and the ports'
+out: a packet of the world's reaches only the port its address is on, and
+only from the host the address is routed to; a port's goes out of the
+right host's `hv0` -- its address's host, or its own where it has none --
+once, from its address; and every public address works both ways once the
+wire is kind; eight mutants more among `hv-fuzz.py --mutants`. And
+`tests/vnet-test.py --phase v4`: three nos, the world's echo and datagram to
+an address routed to one host and on a VM's port on another, the address
+moved onto a third host's port, routed elsewhere, taken off.
 
 ## Guests that stay up
 
@@ -3199,7 +3584,7 @@ and for the same reason:
 
 ```
 $ insmod /hv.ko vmz=/data/vms
-hv: "vmz" is not a parameter of hv's -- vms=<folder> and stop_secs=N are
+hv: "vmz" is not a parameter of hv's -- vms=<folder>, stop_secs=N, rekey=S and keylife=S are
 module: hv: init failed
 insmod: /hv.ko failed, error 502
 $ insmod /hv.ko vms=/data/vms
@@ -3210,9 +3595,12 @@ hv: vms kept in /data/vms, as insmod was told
 hv: an unload -- rmmod, nos's poweroff or reboot -- presses the guests' power buttons and gives them 120 s to turn themselves off
 ```
 
-Its other parameter is `stop_secs=N`, 0 to 600: what the module's going
+Its other parameters are `stop_secs=N`, 0 to 600: what the module's going
 gives the guests to turn themselves off
-([above](#acpi)), and `hv` says it.
+([above](#acpi)), and `hv` says it; and `rekey=S` and `keylife=S`, up to a
+day: how often the tunnel to the cluster's other hosts gives each a key
+anew, and how long the one before is kept to open by ([Across hosts: the
+tunnel](#across-hosts-the-tunnel)).
 
 `rc add insmod /hv.ko vms=/data/vms` loads it so at every boot. `vms=` is
 at most 205 bytes: the VFS takes paths of 255, and under the folder go a

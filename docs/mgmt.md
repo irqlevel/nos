@@ -84,6 +84,14 @@ line in the log saying where and why, if it does not hold:
   its own values one of `good`, `warn`, `alarm`, `bad` and `idle`
   (`mgmtwire::descriptor::TONES`) -- which a client colours it by, green,
   yellow, orange, red and grey: the nbs provider's volumes' `health`;
+  a method's parameter, a `string` or an `int`, may say where its values
+  come from, `choices`: a `provider` on the same host, its read `method`,
+  and the `items` of its answer whose `key` each is a value -- `vm.create`'s
+  `firewall`, `{"provider": "fw", "method": "list", "items": "firewalls",
+  "key": "name"}`. A client offers them as a list; another provider may not
+  be there, and the field is typed then; the descriptor's own provider is,
+  and its `method` is a read it registers. A resource's field shows a
+  value and offers none: `choices` there is refused;
 - **every text a person reads** -- each `title`, `help`, `confirm` and
   enum value -- an object of exactly `en` and `ru`, neither empty;
 - **nothing the format does not have**: a misspelt member is refused rather
@@ -173,12 +181,13 @@ and this one would be waiting for the halt.
 | `cluster` | `modules/cluster/cluster` | `status`, `hosts` | `init`, `invite`, `revoke`, `remove`, `maintenance`, `address`, `rekey` | `join` |
 | `nbs` | `modules/storage/nbs-mds` | `status`, `hosts`, `cs`, `devices`, `alerts`, `volumes`, `volume` | `init`, `host_remove`, `device_add`, `device_drain`, `volume_create`, `volume_delete`, `volume_resize`, `volume_snapshot`, `volume_freeze`, `volume_clone` | `host_add`, `host_replace` |
 | `vm` | `modules/hypervisor/hv` (x86-64) | `list`, `get`, `host`, `networks`, `config_get`, `console_read`, `disks`, `disk_io`, `forwards`, `devices` | `config_set`, `forward_add`, `forward_del`, `console_write`, `disk_add`, `disk_grow`, `disk_attach`, `disk_detach`, `snapshot` | `start`, `stop`, `restart`, `create`, `clone`, `delete`, `image` |
+| `fw` | `modules/hypervisor/hv` (x86-64): the host's firewalls | `list`, `rules`, `get` | `create`, `delete`, `policy`, `add`, `remove`, `move`, `assign` | |
 | `modtest` | `modules/test/modtest`, the loader's self-test | `echo` | | `wait`, `nap` |
 
 A module's provider is unregistered with the module, which waits out its
 calls and jobs -- told to stop -- before anything they use goes: hv drops
-its provider before its forwards and its VMs, so no job of it starts a guest
-behind the unload ([On the management bus](hypervisor.md#on-the-management-bus)).
+its providers before its forwards and its VMs, so no job of them starts a
+guest behind the unload ([On the management bus](hypervisor.md#on-the-management-bus)).
 A job that takes long looks at its cancel as it goes: the vm provider's
 create looks at it as each piece of a download arrives and after each
 cluster it converts, its clone after each quarter of a MiB it copies, and a

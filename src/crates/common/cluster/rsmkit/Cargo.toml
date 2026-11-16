@@ -1,0 +1,17 @@
+[package]
+name = "rsmkit"
+version = "0.1.0"
+edition = "2021"
+
+# What a group's state machine over raft::rsm is made with besides its own:
+# the digests its members hold one another's states to, and a snapshot read
+# as a stream -- NBS's metadata's (nbsmeta) and vnet's state's (vnetmeta),
+# written once. No kernel in it and no unsafe.
+[lib]
+
+[dependencies]
+raft = { path = "../raft" }
+codec = { path = "../../codec" }
+# A state's digest: on the software backend the kernel builds the
+# RustCrypto crates with.
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }

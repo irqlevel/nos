@@ -592,6 +592,46 @@ promised room it did not have. With a field filter, over the UDP shell's
 > trace show tcp_wait what=cwnd              # sends the congestion window held
 ```
 
+## The firewalls' events
+
+Group `fw`: the guests' firewalls ([The firewall](../plans/vnet.md#the-firewall)),
+a record for each packet to or from a VM its firewall kept out -- in the hv
+module's switch (`modules/hypervisor/hv/src/net.rs`, `Switch::judged`), and
+a client the forward's relay held to the VM's rules (`Switch::lets_in`). The
+counts say how many (`hv list`'s `denied in`/`out`, a rule's flows in `hv fw
+<name>`); a record says which, without a line in the log for each:
+
+| event | what it records |
+|---|---|
+| `fw_deny` | the switch's `port` the VM is on and its firewall's `place` there; the `dir` it went -- `in` to the VM, `out` from it; `why` it was kept out -- a `rule` (its number from 1 in `rule`), the `policy` of its direction, a `stray` address not the VM's, an IPv4 `fragment`, IPv4 `broken`, `ipv6` the firewall does not let through, or a port `unready` with no table; the IP `proto`, the other end (`peer`, printed a.b.c.d) and the VM's port and its (`lport`, `rport`; the relay's client's own port is the relay's, 0) |
+
+```
+> trace on fw
+> trace show 50 fw_deny dir=in              # what was kept from the VMs
+> trace show fw_deny why=rule rule=2        # what a deny rule caught
+> trace show fw_deny port=3 dir=out         # what one VM tried and was not let
+```
+
+## The tunnel's events
+
+Group `tunnel`: vnet's tunnel between hosts ([Across hosts: the
+tunnel](hypervisor.md#across-hosts-the-tunnel)), recorded by the hv module's
+tunnel (`modules/hypervisor/hv/src/tunnel.rs`) where a datagram is not taken
+or a packet not sent, and as the keys with another host change -- none on a
+packet's way through, so nothing on that path costs anything, on or off.
+`hv tunnel` counts the same; a record says which host and why:
+
+| event | what it records |
+|---|---|
+| `tunnel_drop` | the other host's underlay address and port (`peer`, `peer_port`) -- as the table has them, or as the datagram came where no host's key opens it -- the `network` the datagram was of, its `key`'s number and its `counter`'s low word -- 0 where it had none -- what it carried (`kind`: `port`, `to_gateway`, `from_gateway`, `echo`, `echo_answer`, or `none`), and `why` -- from a host `unknown`, under `no_key` known (or with none to send by), `replayed`, `forged`, `stale` (what the table does not let through), `malformed`, `no_room` on the uplink or in the pool, `no_hop` known |
+| `tunnel_key` | the other host (`peer`, `peer_port`: two behind one NAT share an address), a key's `number` where one is meant, and `what`: a key `given` it, one `taken` from it, its keys `dropped` (a new hv there, or its going), one `asked` of it, the host `silent` (its echoes stopped, its key asked anew), the way to it `narrow` (the full echoes lost) |
+
+```
+> trace on tunnel
+> trace show tunnel_drop why=forged          # what did not hold its tag
+> trace show tunnel_key                      # the keys going round
+```
+
 ## The memory's events
 
 Group `mm`: the zeroing of free pages ahead of their allocation
@@ -814,8 +854,8 @@ its client and its chunk servers: 1330, 3539 and 35075, inside it too.
 ## Raft's events
 
 A raft member's life, group `raft`: recorded by raftmember, the engine
-cluster.ko's registry and nbs-mds.ko's metadata both run, so every record
-says which (`of`: `registry`, `nbs`):
+cluster.ko's registry, nbs-mds.ko's metadata and vnet.ko's state all run,
+so every record says which (`of`: `registry`, `nbs`, `vnet`):
 
 | event | where, and what it records |
 |---|---|

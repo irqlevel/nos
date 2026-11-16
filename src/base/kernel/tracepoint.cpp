@@ -534,6 +534,80 @@ const Field TCP_WAIT_FIELDS[] = {
     { "pid", __builtin_offsetof(TcpWait, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
 };
 
+/* ---- the firewalls' events ----
+   A packet to or from a VM its firewall kept out, in the hv module's switch
+   (modules/hypervisor/hv/src/net.rs), and a client the forward's relay held
+   to it (Switch::lets_in). */
+
+static_assert(sizeof(FwDeny) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+
+/* Which way it went: to the VM, or from it */
+const char* const FW_DIR[] = { "in", "out" };
+/* What kept it out: a rule of its firewall's; the policy of its direction;
+   an address not the VM's -- to it for another, or from it as another; an
+   IPv4 fragment, which carries no ports; IPv4 that does not hold together;
+   IPv6 its firewall does not let through; a port with no table or no
+   firewall to judge it by */
+const char* const FW_WHY[] = { "rule", "policy", "stray", "fragment", "broken", "ipv6", "unready" };
+
+const Field FW_DENY_FIELDS[] = {
+    /* The switch's port the VM is on, and its firewall's place there */
+    { "port", __builtin_offsetof(FwDeny, port), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "place", __builtin_offsetof(FwDeny, place), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "dir", __builtin_offsetof(FwDeny, dir), sizeof(u8), Kind::Enum, FW_DIR, sizeof(FW_DIR) / sizeof(FW_DIR[0]) },
+    { "why", __builtin_offsetof(FwDeny, why), sizeof(u8), Kind::Enum, FW_WHY, sizeof(FW_WHY) / sizeof(FW_WHY[0]) },
+    /* The rule that kept it out, from 1; 0 where none did */
+    { "rule", __builtin_offsetof(FwDeny, rule), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "proto", __builtin_offsetof(FwDeny, proto), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    /* The other end, and the VM's port and its: 0 where the packet has none */
+    { "peer", __builtin_offsetof(FwDeny, peer), sizeof(u32), Kind::Ipv4, nullptr, 0 },
+    { "lport", __builtin_offsetof(FwDeny, lport), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "rport", __builtin_offsetof(FwDeny, rport), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+};
+
+/* ---- the tunnel's events ----
+   vnet's tunnel between hosts, in the hv module
+   (modules/hypervisor/hv/src/tunnel.rs): what it would not take or send,
+   and its keys. */
+
+static_assert(sizeof(TunnelDrop) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(TunnelKey) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+
+/* What a datagram carried, by vnetwire's numbers -- none, for one that
+   never had a header -- a port's packet to a port, to a gateway, from one,
+   an echo, its answer */
+const char* const TUNNEL_KIND[] = { "none", "port", "to_gateway", "from_gateway", "echo", "echo_answer" };
+/* Why: from no host of the cluster's; under no key known, or with none to
+   send by; a counter its window has seen; a tag that does not hold; what
+   the table does not let through; no header; no room on the uplink or in
+   the pool; no next hop known */
+const char* const TUNNEL_WHY[] = { "unknown", "no_key", "replayed", "forged", "stale", "malformed", "no_room",
+                                   "no_hop" };
+/* A key given the host, one taken from it, its keys dropped -- a new
+   instance of its hv's, or its going -- one asked of it, a host whose echoes
+   stopped, a way that does not carry the networks' MTU */
+const char* const TUNNEL_KEY[] = { "given", "taken", "dropped", "asked", "silent", "narrow" };
+
+const Field TUNNEL_DROP_FIELDS[] = {
+    { "peer", __builtin_offsetof(TunnelDrop, peer), sizeof(u32), Kind::Ipv4, nullptr, 0 },
+    { "network", __builtin_offsetof(TunnelDrop, network), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "key", __builtin_offsetof(TunnelDrop, key), sizeof(u32), Kind::Hex, nullptr, 0 },
+    { "counter", __builtin_offsetof(TunnelDrop, counter), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "peer_port", __builtin_offsetof(TunnelDrop, peer_port), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "kind", __builtin_offsetof(TunnelDrop, kind), sizeof(u8), Kind::Enum, TUNNEL_KIND,
+      sizeof(TUNNEL_KIND) / sizeof(TUNNEL_KIND[0]) },
+    { "why", __builtin_offsetof(TunnelDrop, why), sizeof(u8), Kind::Enum, TUNNEL_WHY,
+      sizeof(TUNNEL_WHY) / sizeof(TUNNEL_WHY[0]) },
+};
+
+const Field TUNNEL_KEY_FIELDS[] = {
+    { "peer", __builtin_offsetof(TunnelKey, peer), sizeof(u32), Kind::Ipv4, nullptr, 0 },
+    { "number", __builtin_offsetof(TunnelKey, number), sizeof(u32), Kind::Hex, nullptr, 0 },
+    { "peer_port", __builtin_offsetof(TunnelKey, peer_port), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "what", __builtin_offsetof(TunnelKey, what), sizeof(u8), Kind::Enum, TUNNEL_KEY,
+      sizeof(TUNNEL_KEY) / sizeof(TUNNEL_KEY[0]) },
+};
+
 /* ---- the memory's events ---- */
 
 static_assert(sizeof(MmZero) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
@@ -711,7 +785,7 @@ static_assert(sizeof(RaftRecv) <= TraceRing::PAYLOAD_BYTES, "a payload fits a sl
 static_assert(sizeof(RaftCommit) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
 
 /* Which raft a member is of: the cluster's registry, NBS's metadata */
-const char* const RAFT_OF[] = { "registry", "nbs" };
+const char* const RAFT_OF[] = { "registry", "nbs", "vnet" };
 const char* const RAFT_ROLES[] = { "follower", "pre_candidate", "candidate", "leader" };
 /* A message's kind: raft's `Body`, a vote's and its answer's pre-vote apart */
 const char* const RAFT_KINDS[] = { "vote", "pre_vote", "vote_resp", "pre_vote_resp", "append", "append_resp",
@@ -933,6 +1007,14 @@ const Event EVENTS[] = {
     { "ipcnet_bounce", "ipcnet", "a message for a peer bounced back to its sender: its queue full, the peer not up, "
       "its session lost",
       sizeof(IpcnetBounce), sizeof(IPCNET_BOUNCE_FIELDS) / sizeof(IPCNET_BOUNCE_FIELDS[0]), IPCNET_BOUNCE_FIELDS },
+    { "fw_deny", "fw", "a packet to or from a VM its firewall kept out: which way, what kept it out, and what it was",
+      sizeof(FwDeny), sizeof(FW_DENY_FIELDS) / sizeof(FW_DENY_FIELDS[0]), FW_DENY_FIELDS },
+    { "tunnel_drop", "tunnel", "a datagram of vnet's tunnel not taken, or a packet not sent into it: which host, "
+      "what it was, and why", sizeof(TunnelDrop), sizeof(TUNNEL_DROP_FIELDS) / sizeof(TUNNEL_DROP_FIELDS[0]),
+      TUNNEL_DROP_FIELDS },
+    { "tunnel_key", "tunnel", "the tunnel's keys with another host: given, taken, dropped, asked for -- a host "
+      "silent, a way narrower than the networks' MTU", sizeof(TunnelKey),
+      sizeof(TUNNEL_KEY_FIELDS) / sizeof(TUNNEL_KEY_FIELDS[0]), TUNNEL_KEY_FIELDS },
 };
 static_assert(sizeof(EVENTS) / sizeof(EVENTS[0]) == COUNT, "every event has its description, in tp::Id's order");
 
@@ -1208,6 +1290,17 @@ u64 field_value(const TraceRing::Record& r, const Field& f)
     return v;
 }
 
+/* An IPv4 address's octets as a field holds one (Kind::Ipv4): the first in
+   its most significant byte, as the network layer keeps an address. */
+static const ulong IPV4_OCTETS = 4;
+static const ulong OCTET_BITS = 8;
+static const ulong OCTET_MASK = 0xFF;
+
+static ulong octet(u64 v, ulong i)
+{
+    return (ulong)((v >> (OCTET_BITS * (IPV4_OCTETS - 1 - i))) & OCTET_MASK);
+}
+
 /* A Comm field's bytes, up to its first zero, as far as the field holds and
    `len` allows, terminated: what a record holds of a name. A record is
    copied out of the ring whole, so whatever follows the zero in the payload
@@ -1269,6 +1362,9 @@ void print_record(stdlib::Printer& con, const TraceRing::Record& r, ulong ns)
             con.printf(" %s=%s", f.name, name);
             break;
         }
+        case Kind::Ipv4:
+            con.printf(" %s=%lu.%lu.%lu.%lu", f.name, octet(v, 0), octet(v, 1), octet(v, 2), octet(v, 3));
+            break;
         case Kind::Unsigned:
         case Kind::Cpu:
         case Kind::Pid:
@@ -1508,6 +1604,9 @@ void dump_record(stdlib::Printer& con, const TraceRing::Record& r, ulong ns)
             json_string(con, name);
             break;
         }
+        case Kind::Ipv4:
+            con.printf("\"%lu.%lu.%lu.%lu\"", octet(v, 0), octet(v, 1), octet(v, 2), octet(v, 3));
+            break;
         case Kind::Hex:
         case Kind::Ns:
         case Kind::Since:

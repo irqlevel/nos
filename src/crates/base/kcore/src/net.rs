@@ -294,11 +294,102 @@ impl Nat {
     pub fn forget(&self, ip: u32) -> usize {
         net::kernel_net_nat_forget(self.inner, ip) as usize
     }
+
+    /// The public address `public` mapped one to one to the guest at
+    /// `inner_ip`, at `mac`, which takes packets of `mtu` bytes at most: the
+    /// world reaches the guest at it, and the guest goes out from it, until
+    /// the returned value is dropped -- or NAT goes off.
+    pub fn map(&self, public: u32, inner_ip: u32, mac: [u8; 6], mtu: u16) -> core::result::Result<OneToOne, MapError> {
+        let word = u64::from_be_bytes([0, 0, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]]);
+        match net::kernel_net_nat_map(self.inner, public, inner_ip, word, u32::from(mtu)) {
+            net::NAT_MAPPED => Ok(OneToOne { inner: self.inner, public }),
+            code => Err(MapError::of(code)),
+        }
+    }
+
+    /// The network `net`/`mask` behind the inner device besides its own
+    /// subnet, its gateway `gw` on it: masqueraded as the subnet is, until
+    /// the returned value is dropped -- or NAT goes off.
+    pub fn inside(&self, net: u32, mask: u32, gw: u32) -> core::result::Result<Inside, MapError> {
+        match net::kernel_net_nat_inside(self.inner, net, mask, gw) {
+            net::NAT_MAPPED => Ok(Inside { inner: self.inner, net: net & mask, mask }),
+            code => Err(MapError::of(code)),
+        }
+    }
 }
 
 impl Drop for Nat {
     fn drop(&mut self) {
         net::kernel_net_nat_disable(self.inner);
+    }
+}
+
+/// Why a public address was not mapped, or a network not put behind the
+/// inner device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapError {
+    /// NAT is not on for it.
+    Off,
+    /// The address, or the guest's, mapped already; a network overlapping
+    /// one there is.
+    Taken,
+    /// An address that will not do: this machine's own, none a host may
+    /// have, a guest's behind none of the inner device's networks.
+    Bad,
+    /// As many as there may be already.
+    Full,
+}
+
+impl MapError {
+    fn of(code: i32) -> MapError {
+        match code {
+            net::NAT_MAP_OFF => MapError::Off,
+            net::NAT_MAP_TAKEN => MapError::Taken,
+            net::NAT_MAP_FULL => MapError::Full,
+            _ => MapError::Bad,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            MapError::Off => "NAT is off",
+            MapError::Taken => "the address is mapped already",
+            MapError::Bad => "not an address that may be mapped",
+            MapError::Full => "as many are mapped as may be",
+        }
+    }
+}
+
+/// A public address mapped one to one (`Nat::map`): mapped no longer when
+/// dropped.
+pub struct OneToOne {
+    inner: usize,
+    public: u32,
+}
+
+impl OneToOne {
+    pub fn public(&self) -> u32 {
+        self.public
+    }
+}
+
+impl Drop for OneToOne {
+    fn drop(&mut self) {
+        net::kernel_net_nat_unmap(self.inner, self.public);
+    }
+}
+
+/// A network behind the inner device (`Nat::inside`): behind it no longer
+/// when dropped.
+pub struct Inside {
+    inner: usize,
+    net: u32,
+    mask: u32,
+}
+
+impl Drop for Inside {
+    fn drop(&mut self) {
+        net::kernel_net_nat_outside(self.inner, self.net, self.mask);
     }
 }
 

@@ -16,12 +16,13 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 AX41=${AX41:-65.109.93.213}
 D=${AX41_DIR:-/root/nos-demo}
-BUNDLE=${1:?the panel's bundle: build.sh makes it}
+BUNDLE=${1:?"the panel's bundle: build.sh makes it"}
 H=root@$AX41
 S="ssh -o ConnectTimeout=40 -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=8"
 R() { for i in 1 2 3 4 5; do rsync -rlpt --checksum --partial -z -e "$S" "$@" && return 0; echo "rsync again ($i)"; sleep 10; done; return 1; }
 M=$ROOT/out/x86_64/modules
-for f in "$ROOT/nos-test.iso" "$BUNDLE" $M/ipcnet.ko $M/cluster.ko $M/nbs-mds.ko $M/nbs-cs.ko $M/api.ko; do
+for f in "$ROOT/nos-test.iso" "$BUNDLE" $M/ipcnet.ko $M/cluster.ko $M/vnet.ko $M/nbs-mds.ko $M/nbs-cs.ko $M/hv.ko \
+         $M/api.ko "$ROOT/out/x86_64/hvboot"; do
     [ -f "$f" ] || { echo "no $f: build.sh first"; exit 1; }
 done
 
@@ -30,7 +31,8 @@ R "$ROOT/nos-test.iso" "$HERE"/ax41/demo-net.sh "$HERE"/ax41/demo-make.sh "$HERE
   "$HERE"/ax41/dhcp.py "$HERE"/ax41/nsh.py $H:$D/
 R "$ROOT/scripts/mkrootfs.sh" $H:$D/scripts/
 R "$ROOT/scripts/udpsh.py" $H:$D/
-R $M/ipcnet.ko $M/cluster.ko $M/nbs-mds.ko $M/nbs-cs.ko $M/api.ko $H:$D/modules/
+R $M/ipcnet.ko $M/cluster.ko $M/vnet.ko $M/nbs-mds.ko $M/nbs-cs.ko $M/hv.ko $M/api.ko "$ROOT/out/x86_64/hvboot" \
+    $H:$D/modules/
 R "$BUNDLE" $H:$D/www/
 
 # Each long-lived process its own session, every stream of it a file's: the

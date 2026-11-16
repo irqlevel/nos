@@ -55,13 +55,17 @@ macro_rules! klog {
 /* ---- what the sources reach of the kernel and of hvarch ---- */
 
 mod kernel;
-pub use kernel::{cmd, consts, dma, sync, time, trace};
+pub use kernel::{cmd, consts, dma, random, sync, task, time, trace};
 /// The kernel's events, as kcore declares them for its sites: the payloads
 /// hv's sites build, held by `trace`'s emit to their descriptions.
 #[path = "../../../../src/crates/base/kcore/src/trace/events.rs"]
 pub mod trace_events;
 mod network;
 pub use network::{abi, device, dns, frame, net, nic, tcp, vms, vnic};
+/// What the tunnel reaches of the kernel besides: each host's uplink, and
+/// `kcore::ipc` -- the hosts' mailboxes, which the target carries between.
+mod underlay;
+pub use underlay::{events, ipc};
 pub use devices::offload;
 pub use netwire as wire;
 #[path = "../../../../src/crates/base/kcore/src/pod.rs"]
@@ -122,6 +126,10 @@ pub mod relay;
 /// The guests' switch, from the module: the ports, `hv0`, DHCP, NAT on.
 #[path = "../../../../src/crates/modules/hypervisor/hv/src/net.rs"]
 pub mod switch;
+/// The cluster networks' tunnel between hosts, from the module: keys over
+/// ipc, datagrams sealed and opened, the table's ports elsewhere.
+#[path = "../../../../src/crates/modules/hypervisor/hv/src/tunnel.rs"]
+pub mod tunnel;
 /// A VM's vm.toml, from the module: what an operator writes, read and
 /// written back.
 #[path = "../../../../src/crates/modules/hypervisor/hv/src/config.rs"]
@@ -130,6 +138,7 @@ pub mod vmconfig;
 pub mod walk;
 
 mod configmodel;
+mod fwmodel;
 mod guestnet;
 mod netrx;
 mod offloadmodel;
@@ -140,7 +149,10 @@ mod recycle;
 mod relaymodel;
 mod smbiosmodel;
 mod targets;
+mod tunnelmodel;
 mod virtq;
+mod vnetmodel;
+mod vnetwiremodel;
 
 #[global_allocator]
 static ALLOCATOR: recycle::Recycling = recycle::Recycling;
@@ -212,6 +224,7 @@ fn trace_for(data: &[u8]) {
 /// Run `t` on `data`: None, or what went wrong.
 fn run_one(t: &Target, data: &[u8]) -> Option<String> {
     crate::time::reset();
+    crate::random::reset();
     trace_for(data);
     *LAST_PANIC.lock().unwrap() = None;
     let result = std::panic::catch_unwind(|| {
@@ -273,6 +286,7 @@ fn main() {
         let t = targets::ALL.iter().find(|t| t.name == name).unwrap_or_else(|| usage());
         let data = unhex(&std::fs::read_to_string(&file).expect("the input's file"));
         crate::time::reset();
+        crate::random::reset();
         trace_for(&data);
         let mut input = targets::Input::new(&data);
         (t.run)(&mut input);
@@ -354,6 +368,8 @@ fn main() {
     if std::env::var_os("HV_FUZZ_STATS").is_some() {
         platform::report();
         guestnet::report();
+        vnetmodel::report();
+        tunnelmodel::report();
         placemodel::report();
         offloadmodel::report();
         netrx::report();

@@ -61,7 +61,7 @@ pub fn ask(state: &ModState, cmd: &Command) -> Result<Answer, Failure> {
 /// `ask`, `turn` given the time between two looks at the answer: a
 /// command's that drives something of its own as it waits.
 fn ask_turning(state: &ModState, cmd: &Command, turn: &mut dyn FnMut(u64)) -> Result<Answer, Failure> {
-    match raftmember::ask_turning(&state.shared, cmd, crate::NO_MEMBER, turn) {
+    match raftmember::ask_turning(&state.group.runner.shared, cmd, &state.group.runner.no_member(crate::NO_MEMBER), turn) {
         Ok(Answer::Refused(why)) => Err(Failure::Refused(why)),
         Ok(a) => Ok(a),
         Err(why) => Err(Failure::Other(why)),

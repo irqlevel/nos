@@ -136,6 +136,9 @@ pub const TX_PASS_BYTES: usize = 1 << 20;
 /// or carried whole has them partial.
 const F_CSUM: u32 = 1 << 0;
 const F_GUEST_CSUM: u32 = 1 << 1;
+/// The MTU the device tells its driver (`set_mtu`): a cluster network's,
+/// smaller than Ethernet's, which Linux takes as its interface's.
+const F_MTU: u32 = 1 << 3;
 const F_MAC: u32 = 1 << 5;
 const F_GUEST_TSO4: u32 = 1 << 7;
 const F_HOST_TSO4: u32 = 1 << 11;
@@ -154,11 +157,13 @@ const BASE_FEATURES: u32 = F_MAC | F_STATUS | virtio::F_EVENT_IDX;
 const OFFLOADS: u32 = F_CSUM | F_GUEST_CSUM | F_GUEST_TSO4 | F_HOST_TSO4 | F_MRG_RXBUF;
 const LINK_UP: u16 = 1;
 
-/// The configuration: the MAC, the status, and the most queue pairs.
+/// The configuration: the MAC, the status, the most queue pairs, and the
+/// MTU.
 const CFG_MAC: usize = 0;
 const CFG_STATUS: usize = 6;
 const CFG_MAX_PAIRS: usize = 8;
-const CFG_BYTES: usize = 10;
+const CFG_MTU: usize = 10;
+const CFG_BYTES: usize = 12;
 
 /* The control queue's commands: a class and a command, what goes with it,
  * and a byte the device answers in. Of them only multiqueue's -- how many
@@ -237,6 +242,10 @@ pub struct Net {
     /// the first alone until it says otherwise (`CTRL_MQ_VQ_PAIRS_SET`).
     pairs: u16,
     active: u16,
+    /// Whether the offloads are offered (`set_offloads`), and the MTU told
+    /// the driver, 0 for none (`set_mtu`).
+    offloads: bool,
+    mtu: u16,
     /// Receive steering (`FLOWS`).
     flows: [u8; FLOWS],
     /// Transmit passes that ended at their bound, with chains perhaps still
@@ -283,6 +292,8 @@ impl Net {
             held: None,
             told: Takes::default(),
             pairs,
+            offloads: true,
+            mtu: 0,
             active: 1,
             flows: [0; FLOWS],
             tx_more: 0,
@@ -324,8 +335,29 @@ impl Net {
     /// before them, for a guest to be measured or run without. Before the
     /// driver reads the features: at the guest's next boot otherwise.
     pub fn set_offloads(&mut self, on: bool) {
-        let base = BASE_FEATURES | multiqueue(self.pairs);
-        self.transport.set_device_features(if on { base | OFFLOADS } else { base });
+        self.offloads = on;
+        self.offer();
+    }
+
+    /// The MTU the device tells its driver (`F_MTU`) -- a cluster network's,
+    /// which a guest whose address is set on its command line has no other
+    /// way to learn -- or 0, none: Ethernet's, as before it. Before the
+    /// driver reads the features: at the guest's next boot otherwise.
+    pub fn set_mtu(&mut self, mtu: u16) {
+        self.mtu = mtu;
+        self.offer();
+    }
+
+    /// The features offered, as the offloads and the MTU say.
+    fn offer(&mut self) {
+        let mut f = BASE_FEATURES | multiqueue(self.pairs);
+        if self.offloads {
+            f |= OFFLOADS;
+        }
+        if self.mtu != 0 {
+            f |= F_MTU;
+        }
+        self.transport.set_device_features(f);
     }
 
     /// Receive interrupts no closer than `ns` apart -- 0, as each frame
@@ -368,6 +400,7 @@ impl Net {
         c[CFG_MAC..CFG_MAC + 6].copy_from_slice(&self.mac);
         c[CFG_STATUS..CFG_STATUS + 2].copy_from_slice(&LINK_UP.to_le_bytes());
         c[CFG_MAX_PAIRS..CFG_MAX_PAIRS + 2].copy_from_slice(&self.pairs.to_le_bytes());
+        c[CFG_MTU..CFG_MTU + 2].copy_from_slice(&self.mtu.to_le_bytes());
         c
     }
 

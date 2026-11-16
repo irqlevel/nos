@@ -124,6 +124,22 @@ unsafe extern "C" {
     /// device `inner` names forgotten, if NAT is on for it: how many there
     /// were. Values only, the handle looked up in the device table.
     pub safe fn kernel_net_nat_forget(inner: usize, ip: u32) -> u32;
+    /// The public address `public` mapped one to one to the guest at
+    /// `inner_ip` behind the device `inner` names, at `mac` -- its six bytes
+    /// in the low 48 bits, the first the highest -- taking packets of `mtu`
+    /// bytes at most, while NAT is on for it: NAT_MAPPED, or why not.
+    /// Values only, the handle looked up in the device table.
+    pub safe fn kernel_net_nat_map(inner: usize, public: u32, inner_ip: u32, mac: u64, mtu: u32) -> i32;
+    /// `public` mapped no longer, if it was behind the device `inner`
+    /// names: 1 when it was. Values only.
+    pub safe fn kernel_net_nat_unmap(inner: usize, public: u32) -> i32;
+    /// The network `net`/`mask` behind the device `inner` names besides its
+    /// own subnet, its gateway `gw` on it, while NAT is on for it:
+    /// NAT_MAPPED, or why not. Values only.
+    pub safe fn kernel_net_nat_inside(inner: usize, net: u32, mask: u32, gw: u32) -> i32;
+    /// That network behind it no longer -- and its guests' mappings with
+    /// it: 1 when it was. Values only.
+    pub safe fn kernel_net_nat_outside(inner: usize, net: u32, mask: u32) -> i32;
     /// The DNS server this machine was given -- its resolver's, or the
     /// DHCP lease's -- host byte order; 0 for none.
     pub safe fn kernel_net_dns_server() -> u32;
@@ -201,6 +217,15 @@ pub const NAT_NO_UPLINK: i32 = 1;
 pub const NAT_DEVICES: i32 = 2;
 pub const NAT_BUSY: i32 = 3;
 pub const NAT_NO_MEMORY: i32 = 4;
+
+/// What `kernel_net_nat_map` and `kernel_net_nat_inside` answer: made; NAT
+/// not on for that device; the address or the network taken already; an
+/// address or a network that will not do; as many as there may be already.
+pub const NAT_MAPPED: i32 = 0;
+pub const NAT_MAP_OFF: i32 = 1;
+pub const NAT_MAP_TAKEN: i32 = 2;
+pub const NAT_MAP_BAD: i32 = 3;
+pub const NAT_MAP_FULL: i32 = 4;
 
 /// The frames a virtual NIC holds from its sink's senders before it drops.
 pub const VNIC_BACKLOG: usize = 256;

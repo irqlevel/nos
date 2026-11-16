@@ -20,12 +20,22 @@ sends to `Hub.shell(i)` on 127.0.0.1 goes to the VM's shell port from the
 hub's 10.9.0.253, and the VM's answers come back -- past every impairment,
 which is the VMs' between themselves.
 
+Past the router, a host of the world's: WORLD_IP, 198.51.100.7, which a
+VM reaches through its default route -- the hub's address -- as it reaches
+the internet. It answers echo and UDP to port 7, and remembers each source
+it saw (`world_seen`: what a VM's masquerade or one to one made of it).
+And it calls an address itself (`world_call(addr, "icmp" | "udp")`): asked
+for by ARP on the LAN, as a router asks for an address routed to a machine
+there -- a cloud's additional address -- and sent to whoever answers; what
+comes back from that address is its answer.
+
 Between any two ports, either way, while it runs: `cut(a, b)` drops every
 frame and `heal(a, b)` stops that; `impair(a, b, loss=, delay_ms=,
-jitter_ms=)` loses `loss` frames in 256 and delays each by the delay and up
-to the jitter more -- which reorders what goes close together. `drop_next
-(a, b, n)` loses the next n frames that carry data -- a TCP segment's tail,
-say -- and nothing else.
+jitter_ms=, max_frame=)` loses `loss` frames in 256 and delays each by the
+delay and up to the jitter more -- which reorders what goes close together
+-- and loses every frame longer than `max_frame` bytes, as a link narrower
+than Ethernet's does (0: none). `drop_next(a, b, n)` loses the next n frames
+that carry data -- a TCP segment's tail, say -- and nothing else.
 
     tests/hub.py --ports 3 --base 47000       run one, printing each port's netdev
 """
@@ -41,6 +51,10 @@ import time
 
 NET = "10.9.0."
 HUB_IP = NET + "254"
+WORLD_IP = "198.51.100.7"
+ICMP = 1
+ECHO_PORT = 7
+ECHO_REQUEST, ECHO_REPLY = 8, 0
 SHELL_IP = NET + "253"
 SHELL_SPORT = 40000
 HUB_MAC = bytes.fromhex("020000090000")
@@ -113,6 +127,7 @@ class Link:
         self.jitter = 0.0
         self.drop_data = 0
         self.dropped = 0
+        self.max_frame = 0
 
 
 class Hub:
@@ -137,6 +152,12 @@ class Hub:
         # The ports whose DHCP the hub has acknowledged: their VMs have
         # their addresses
         self.acked = set()
+        # The world's host: each source that reached it, as (address,
+        # protocol); the answers to its own calls, as (address, protocol,
+        # its call's tag); and who answered ARP for an address, (port, MAC)
+        self.world_seen = []
+        self.world_heard = []
+        self.arp_known = {}
         self.thread = threading.Thread(target=self.serve, daemon=True)
 
     # -- what a test asks of it --
@@ -183,10 +204,11 @@ class Hub:
             for l in self._links(a, b, both):
                 l.cut = False
 
-    def impair(self, a, b, loss=0, delay_ms=0.0, jitter_ms=0.0, both=True):
+    def impair(self, a, b, loss=0, delay_ms=0.0, jitter_ms=0.0, max_frame=0, both=True):
         with self.lock:
             for l in self._links(a, b, both):
                 l.loss, l.delay, l.jitter = loss, delay_ms / 1000.0, jitter_ms / 1000.0
+                l.max_frame = max_frame
 
     def drop_next(self, a, b, n, both=False):
         with self.lock:
@@ -196,6 +218,99 @@ class Hub:
     def dropped(self, a, b):
         with self.lock:
             return self.links[(a, b)].dropped
+
+    # -- the world's host --
+
+    def world_call(self, addr, kind, timeout=5.0):
+        """The world's host calls `addr` -- an echo ("icmp"), or a datagram to
+        its port 7 ("udp"): whether `addr` answered within `timeout`. The
+        address is asked for by ARP first, and the call sent again each
+        second until then."""
+        tag = self.rng.randrange(1, 65535)
+        want = (addr, kind, tag)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self.lock:
+                if want in self.world_heard:
+                    return True
+                known = self.arp_known.get(addr)
+            if known is None:
+                for q in self.ports:
+                    self.send_to(q.index, self._arp_request(addr))
+            else:
+                port, mac = known
+                self.send_to(port, mac + HUB_MAC + struct.pack("!H", ETH_IP) + self._world_packet(addr, kind, tag))
+            end = min(deadline, time.monotonic() + 1.0)
+            while time.monotonic() < end:
+                with self.lock:
+                    if want in self.world_heard:
+                        return True
+                time.sleep(0.05)
+        return False
+
+    def forget_arp(self, addr):
+        """Who had `addr` forgotten: the next call asks again."""
+        with self.lock:
+            self.arp_known.pop(addr, None)
+
+    def _arp_request(self, addr):
+        body = struct.pack("!HHBBH", 1, ETH_IP, 6, 4, 1) + HUB_MAC + ip_bytes(HUB_IP) + b"\0" * 6 + ip_bytes(addr)
+        return BROADCAST + HUB_MAC + struct.pack("!H", ETH_ARP) + body
+
+    def _world_packet(self, addr, kind, tag):
+        src, dst = ip_bytes(WORLD_IP), ip_bytes(addr)
+        if kind == "icmp":
+            msg = struct.pack("!BBHHH", ECHO_REQUEST, 0, 0, tag, 1) + b"nos-world"
+            msg = msg[:2] + struct.pack("!H", checksum(msg)) + msg[4:]
+            return ipv4(src, dst, ICMP, msg)
+        return ipv4(src, dst, UDP, udp(src, dst, tag, ECHO_PORT, b"nos-world"))
+
+    def world(self, src, frame):
+        """A frame for the world's host, from port `src`: answered, and its
+        source remembered -- True when it was one."""
+        if len(frame) < 14 + 20 or struct.unpack("!H", frame[12:14])[0] != ETH_IP or frame[0:6] != HUB_MAC:
+            return False
+        if frame[30:34] != ip_bytes(WORLD_IP):
+            return False
+        ihl = (frame[14] & 0x0F) * 4
+        total = struct.unpack("!H", frame[16:18])[0]
+        proto = frame[23]
+        sip = socket.inet_ntoa(frame[26:30])
+        l4 = frame[14 + ihl:14 + total]
+        kind = {ICMP: "icmp", UDP: "udp", TCP: "tcp"}.get(proto, str(proto))
+        with self.lock:
+            self.world_seen.append((sip, kind))
+        reply = None
+        if proto == ICMP and len(l4) >= 8 and l4[0] == ECHO_REQUEST:
+            msg = bytes([ECHO_REPLY, 0, 0, 0]) + l4[4:]
+            msg = msg[:2] + struct.pack("!H", checksum(msg)) + msg[4:]
+            reply = ipv4(ip_bytes(WORLD_IP), frame[26:30], ICMP, msg)
+        elif proto == ICMP and len(l4) >= 8 and l4[0] == ECHO_REPLY:
+            with self.lock:
+                self.world_heard.append((sip, "icmp", struct.unpack("!H", l4[4:6])[0]))
+        elif proto == UDP and len(l4) >= 8:
+            sport, dport = struct.unpack("!HH", l4[0:4])
+            if dport == ECHO_PORT:
+                reply = ipv4(ip_bytes(WORLD_IP), frame[26:30], UDP,
+                             udp(ip_bytes(WORLD_IP), frame[26:30], ECHO_PORT, sport, l4[8:]))
+            elif sport == ECHO_PORT:
+                with self.lock:
+                    self.world_heard.append((sip, "udp", dport))
+        if reply is not None:
+            self.send_to(src, frame[6:12] + HUB_MAC + struct.pack("!H", ETH_IP) + reply)
+        return True
+
+    def arp_answer(self, src, frame):
+        """An ARP reply to the hub's own question, learnt: True when it
+        was one."""
+        if len(frame) < 42 or struct.unpack("!H", frame[12:14])[0] != ETH_ARP:
+            return False
+        op = struct.unpack("!H", frame[20:22])[0]
+        if op != 2 or frame[32:38] != HUB_MAC:
+            return False
+        with self.lock:
+            self.arp_known[socket.inet_ntoa(frame[28:32])] = (src, frame[22:28])
+        return True
 
     # -- the switch --
 
@@ -226,7 +341,7 @@ class Hub:
     def forward(self, src, dst, frame, now):
         with self.lock:
             l = self.links[(src, dst)]
-            if l.cut:
+            if l.cut or (l.max_frame and len(frame) > l.max_frame):
                 l.dropped += 1
                 return
             if l.drop_data and self.carries_data(frame):
@@ -363,6 +478,7 @@ class Hub:
                     if n is not None:
                         p.segments["ack" if n == 0 else "tiny" if n < 100 else "mid" if n < 1400 else "full"] += 1
                     if (len(frame) < 14 or self.dhcp(p.index, frame) or self.arp(p.index, frame)
+                            or self.arp_answer(p.index, frame) or self.world(p.index, frame)
                             or self.to_shell(p.index, frame)):
                         continue
                     dst_mac, src_mac = frame[0:6], frame[6:12]

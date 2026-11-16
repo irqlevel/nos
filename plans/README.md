@@ -51,9 +51,11 @@ mailboxes for modules and tasks, on one host and between hosts --
 [raft.md](raft.md) consensus as a generic crate of its own,
 [cluster.md](cluster.md) the registry of a cluster's hosts that is its first
 user, and [nbs.md](nbs.md) the replicated block storage for VM disks, images
-and snapshots that is built on all of them. [vmctl.md](vmctl.md) sketches
-what comes after them: the cluster's VMs, placed by a scheduler on hosts
-with room and restarted where their host died.
+and snapshots that is built on all of them. [vnet.md](vnet.md) is the VMs'
+networks across the hosts of a cluster: private addresses wherever a VM
+runs, NAT to the internet, a public address for a VM that wants one.
+[vmctl.md](vmctl.md) sketches what comes after them: the cluster's VMs,
+placed by a scheduler on hosts with room and restarted where their host died.
 [review-2026-11-open.md](review-2026-11-open.md) is what the review of
 2026-11-12 -- the Rust ffi, base and hypervisor -- left open.
 
