@@ -47,7 +47,7 @@ use nbsdrive::NotTaken;
 use crate::disk::QueuedDisk;
 use crate::guest::Built;
 use crate::store::{self, Folder};
-use crate::vms::{Coming, StateHold};
+use crate::vms::{Coming, Held, StateHold};
 use crate::work::{self, Work};
 use crate::State;
 
@@ -681,7 +681,7 @@ pub fn migrate(state: &State, word: &str, host: &str, cold: bool, work: &mut dyn
     if host.is_empty() || host.contains('@') || host.len() > migwire::NAME_MAX {
         return Err(alloc::format!("\"{}\" names no host", host));
     }
-    let taken = state.vms.take_for_state(word)?;
+    let taken = state.vms.take_for_state(word, Held::Move)?;
     let p = match plan(state, &taken, &me) {
         Ok(p) => p,
         Err(e) => {
@@ -1188,7 +1188,7 @@ pub fn logcheck_command(state: &State, args: &str, out: &mut dyn Write) {
             return;
         }
     };
-    let taken = match state.vms.take_for_state(word) {
+    let taken = match state.vms.take_for_state(word, Held::Check) {
         Ok(t) => t,
         Err(e) => {
             let _ = writeln!(out, "hv: {}", e);
