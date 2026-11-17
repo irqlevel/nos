@@ -82,14 +82,16 @@ impl Out {
     }
 }
 
-/// Bytes read in order, each read named for the error it fails with.
+/// Bytes read in order, each read named for the error it fails with -- and
+/// the version of the format they are in, which says what fields there are.
 pub struct In<'a> {
     r: Reader<'a>,
+    pub version: u16,
 }
 
 impl<'a> In<'a> {
     pub fn new(buf: &'a [u8]) -> In<'a> {
-        In { r: Reader::new(buf) }
+        In { r: Reader::new(buf), version: crate::VERSION }
     }
 
     pub fn u8(&mut self, what: &'static str) -> Result<u8> {
@@ -140,7 +142,8 @@ impl<'a> In<'a> {
         if len > PART_MAX {
             return Err(Error(what));
         }
-        let mut inner = In::new(self.bytes(len, what)?);
+        let version = self.version;
+        let mut inner = In { r: Reader::new(self.bytes(len, what)?), version };
         let v = body(&mut inner)?;
         if !inner.done() {
             return Err(Error("a part longer than what it holds"));

@@ -181,12 +181,22 @@ impl<'a> Input<'a> {
 /// What a guest's console writes that the serial port follows as a terminal
 /// would: the cursor query a shell's line editor sends and waits on, other
 /// escape sequences, and what moves the column.
-const TERMINAL: [&[u8]; 9] = [b"\x1b[6n", b"\x1b[1;2H", b"\x1b[6", b"\x1b[", b"\x1b", b"\r\n", b"\t", b"\x08",
-                              b"\xc3\xa9"];
+const TERMINAL: [&[u8]; 16] = [b"\x1b[6n", b"\x1b[1;2H", b"\x1b[6", b"\x1b[", b"\x1b", b"\r\n", b"\t", b"\x08",
+                               b"\xc3\xa9", b"\x1b7", b"\x1b8", b"\x1b[32766;32766H", b"\x1b[?2004h", b"\x1b[5C",
+                               b"\x1b[3D", b"\x1b[12G"];
+
+/// What a terminal says to `ESC [ 6 n`: `ESC [ row ; column R`.
+fn cursor_reply(u: &mut Uart) -> Vec<u8> {
+    let mut got = Vec::new();
+    while let Some(b) = u.take_reply() {
+        got.push(b);
+    }
+    got
+}
 
 fn uart(r: &mut Input) {
     let mut u = Uart::new();
-    while let Some(op) = r.op(10) {
+    while let Some(op) = r.op(11) {
         let offset = r.below(8) as u16;
         match op {
             8 => {
@@ -217,6 +227,30 @@ fn uart(r: &mut Input) {
             }
             6 => {
                 u.take_pulse();
+            }
+            7 => {
+                /* systemd sizing a serial console as a getty starts: the
+                 * cursor saved, moved to a far corner, asked for, put back
+                 * -- told a VT100's 24 rows and 80 columns, whatever the
+                 * text before; and a shell's prompt, asked for after it, told
+                 * where the prompt ends */
+                u.write(3, 0x03);
+                u.write(4, 0x00);
+                let _ = cursor_reply(&mut u);
+                let text = r.below(120) as usize;
+                for _ in 0..text {
+                    u.write(0, b'x');
+                }
+                for &b in b"\x1b7\x1b[32766;32766H\x1b[6n" {
+                    u.write(0, b);
+                }
+                let got = cursor_reply(&mut u);
+                invariant!(got == b"\x1b[24;80R", "a far corner said to be at {:?}", String::from_utf8_lossy(&got));
+                for &b in b"\x1b8\r\ndebian@db:~$ \x1b[6n" {
+                    u.write(0, b);
+                }
+                let got = cursor_reply(&mut u);
+                invariant!(got == b"\x1b[24;14R", "a prompt's end said to be at {:?}", String::from_utf8_lossy(&got));
             }
             9 => {
                 /* A line typed in whole: the next held back until the shell

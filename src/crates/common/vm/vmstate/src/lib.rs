@@ -35,6 +35,9 @@
 //! state, naming what it was: a state comes from another host -- which is
 //! authenticated -- and from another build, which is not the same code. The
 //! version says which; one this does not know is refused, never guessed.
+//! This writes version 2 and reads 1 too, what 2 added given its default:
+//! 2 is 1 and the UART's escape sequence and saved cursor, which version 1
+//! did not follow.
 //! What only the host that restores it can say -- a ring inside the guest's
 //! RAM, a feature its devices offer, an XSAVE component its CPU has -- the
 //! restore checks in `hv` as each piece is put back.
@@ -54,14 +57,18 @@ use alloc::vec::Vec;
 pub use apic::{Lapic, Mail, LVT_MAX, WORDS};
 pub use cpu::{Activity, Cpu, Event, EventKind, Regs, Segment, Table, ERROR_CODE_VECTORS, XSAVE_MAX};
 pub use devices::{Blk, Device, Function, IoApic, Msix, Net, Pic, PicChip, Pit, PitChannel, Platform, Pm, PvPanic,
-                  Queue, Rtc, Takes, Transport, Uart, FLOWS, IOAPIC_PINS, QUEUES_MAX, REPLY_MAX};
+                  Queue, Rtc, Takes, Transport, Uart, CSI_PARAMS, ESC_CSI, ESC_CSI6_V1, ESC_CSI_OTHER, ESC_START,
+                  ESC_TEXT, FLOWS, IOAPIC_PINS, QUEUES_MAX, REPLY_MAX};
 
 use wire::{In, Out};
 
 /// The format's first eight bytes.
 pub const MAGIC: [u8; 8] = *b"nosvmst1";
-/// The format's version: the one this writes, and the only one it reads.
-pub const VERSION: u16 = 1;
+/// The format's version: the one this writes. It reads `OLDEST` on: a
+/// cluster updated a host at a time moves each one's VMs off before its
+/// turn, from hosts that write the version before.
+pub const VERSION: u16 = 2;
+pub const OLDEST: u16 = 1;
 /// The most CPUs a state holds.
 pub const CPUS_MAX: usize = 64;
 /// The most ranges of RAM.
@@ -181,9 +188,10 @@ impl VmState {
             return Err(Error("not a VM's state: its first bytes are another format's"));
         }
         let version = r.u16("version")?;
-        if version != VERSION {
+        if !(OLDEST..=VERSION).contains(&version) {
             return Err(Error("a VM's state of a version this does not read"));
         }
+        r.version = version;
         let vm = r.part(PART_VM, "the VM's part", Vm::get)?;
         let n = vm.shape.cpus as usize;
         let mut cpus = Vec::new();
