@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use hvarch::x86::svm::Run;
 use kcore::trace::{self, BlkComplete, BlkOp, BlkSubmit, DiskDone, DiskHow, DiskStart, ExitReason, HaltUntil, HvExit,
-    HvHalt, HvInject, HvRing, HvTimer, HvWake, InjectKind, RingHow, TimerHow, WakeHow};
+    HvHalt, HvInject, HvRing, HvTimer, HvWake, InjectKind, MigSync, MigSyncWhat, RingHow, TimerHow, WakeHow};
 
 use crate::devices::blk::Op;
 use crate::svm::Exit;
@@ -345,6 +345,25 @@ pub fn disk_done(disk: u8, slot: usize, op: Op, how: DiskHow, ok: bool) {
             how: how as u8,
             ok: u8::from(ok),
             _pad: [0; 2],
+        });
+    }
+}
+
+/// `mig_sync`: a guest's nested table narrowed by a migration's dirty log
+/// (`what`), `pages` of it, in `narrow_ns`, and every one of its `cpus`
+/// past it `wait_ns` after -- the table's new identity `table`. Times past
+/// a u32's held at its most.
+#[inline]
+pub fn mig_sync(table: u64, what: MigSyncWhat, narrow_ns: u64, wait_ns: u64, pages: u64, cpus: usize) {
+    if trace::on::<MigSync>() {
+        trace::emit(&MigSync {
+            table,
+            narrow_ns: u32::try_from(narrow_ns).unwrap_or(u32::MAX),
+            wait_ns: u32::try_from(wait_ns).unwrap_or(u32::MAX),
+            pages: u32::try_from(pages).unwrap_or(u32::MAX),
+            cpus: u16::try_from(cpus).unwrap_or(u16::MAX),
+            what: what as u8,
+            _pad: 0,
         });
     }
 }

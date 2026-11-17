@@ -352,7 +352,7 @@ impl FastMsr<'_> {
     /// once dropped here as no deadline at all -- refuses the entry after
     /// (`Kick::entering`), for the round to take.
     fn tsc_deadline(&mut self, value: u64) -> bool {
-        self.lapic.set_tsc_deadline(value, tsc_ns(value));
+        self.lapic.set_tsc_deadline(value, tsc_ns(value, self.guest.tsc_offset.load(Ordering::Relaxed)));
         *self.asked = sooner(self.lapic.next_timer_ns(), self.other_due);
         self.kick.arm_at(*self.asked);
         true
@@ -386,6 +386,13 @@ const ASLEEP_WAIT_NS: u64 = kcore::consts::NS_PER_SEC;
 
 /// Room for the register dump of the CPU that stopped a guest.
 const DUMP_BYTES: usize = 1024;
+/// A page of the guest's memory: what its dirty log marks (`crate::dirty`).
+const GUEST_PAGE: u64 = 4096;
+/// The most write faults in a row one CPU takes at one page with no round of
+/// the dirty log between (`LinuxGuest::dirty_write`): one is the log's, a
+/// few more a TLB's spurious ones, and past this many it is no fault the
+/// log made -- stopped and said, not run again for good.
+const DIRTY_REFAULTS: u32 = 64;
 
 /// Why a Linux guest stopped.
 #[derive(Clone, Copy, Debug)]
@@ -445,6 +452,9 @@ pub enum Stop {
     Budget,
     /// Whoever runs it asked it to stop (`Host::stop_requested`).
     Requested,
+    /// Its state was taken -- to another host, or into a file -- and it goes
+    /// on there, or from there: here it ends, its memory given back.
+    Migrated,
     /// An exit with no handler here.
     Unexpected { exit: Exit, rip: u64 },
 }
@@ -841,6 +851,12 @@ pub struct GuestCpu {
     /// it was sent, or one that reached nobody, would be taken now.
     published: (u64, bool),
     counts: Counts,
+    /// When a slowed guest's CPU next leaves it for its share of a slice
+    /// (`LinuxGuest::throttle`), host nanoseconds.
+    throttle_at: u64,
+    /// Its last dirty-log fault (`LinuxGuest::dirty_write`): the page, the
+    /// table's identity then, and how many in a row.
+    refault: (u64, u64, u32),
 }
 
 /* KVM's PV EOI (`policy::MSR_KVM_PV_EOI_EN`): the MSR's on bit, the bit of
@@ -902,6 +918,11 @@ struct CpuShared {
     /// before its first entry. Its mailbox takes them otherwise.
     posted: Option<Arc<PostedInterrupts>>,
     posted_on: AtomicBool,
+    /// The nested table's identity as the CPU last passed the top of its
+    /// loop, outside its guest: every entry after it is over that table or a
+    /// later one, which drops what the TLB kept of the table before. What a
+    /// migration's dirty log waits on (`sync_tlbs`).
+    epoch: AtomicU64,
 }
 
 impl CpuShared {
@@ -990,7 +1011,64 @@ pub struct LinuxGuest {
     shape: Shape,
     /// What its SMBIOS says it is (`set_identity`).
     identity: Identity,
+    /// The extension it runs under, and whether its local APICs came out of
+    /// reset in x2APIC mode: what a state of it says it was built with.
+    vendor: hvarch::Vendor,
+    x2apic: bool,
+    /// What its TSC is ahead of the host's: 0 for a guest that booted here,
+    /// and for one restored from a state what makes its TSC go on from the
+    /// one it had (`restore`, `rebase`) -- the same for every CPU. Set before
+    /// its CPUs run, and read by them.
+    tsc_offset: AtomicU64,
+    /// When a state was put into it, host nanoseconds: what `rebase` moves
+    /// its clocks on from, the time it took to start it left out. 0 for a
+    /// guest that booted.
+    restored_at: AtomicU64,
+    /// The TSC rate its guest was told, Hz: this host's for a guest that
+    /// booted here, the state's for one restored -- what it goes on
+    /// counting its time by, and what a state taken of it says
+    /// (`capture`): a guest moved twice is held to the rate it booted
+    /// with, not to the rate of the host before, so that the tolerance does
+    /// not add up along the way.
+    told_hz: AtomicU64,
+    /// How much of their time its CPUs are kept out of it, percent: a
+    /// migration's that the guest writes faster than it copies (`throttle`).
+    /// 0 for none.
+    throttle: AtomicU32,
+    /// A pause asked for (`pause`), by its number -- 0 for none: every CPU
+    /// parks at the top of its loop, its state read into its slot of
+    /// `parked`, until the pause is over -- resumed, or the guest ended.
+    pause: AtomicU64,
+    parked: Mutex<Vec<Option<Parked>>>,
 }
+
+/// What a CPU parked with (`LinuxGuest::park`): the pause's number, its
+/// state as it read it -- on the host CPU it ran on, where VT-x's VMCS is
+/// current -- and when.
+struct Parked {
+    pause: u64,
+    state: vmstate::Result<vmstate::Cpu>,
+    at: u64,
+}
+
+/// How long a pause waits for every CPU to park, and the disks to answer
+/// what they were asked: past it, the pause is given up and the guest goes
+/// on.
+const PARK_NS: u64 = 5 * kcore::consts::NS_PER_SEC;
+/// A slice of a slowed guest's CPU (`throttle`): in its guest for one, then
+/// out for its share of it.
+const THROTTLE_SLICE_NS: u64 = 10 * kcore::consts::NS_PER_MS;
+/// The most a guest is slowed: it never stops for good.
+pub const THROTTLE_MAX: u32 = 90;
+const DRAIN_NS: u64 = 30 * kcore::consts::NS_PER_SEC;
+/// How long a parked CPU waits for a ring before it looks again.
+const PARKED_WAIT_NS: u64 = 10 * kcore::consts::NS_PER_MS;
+/// The most two hosts' TSC rates may differ by for a guest to move between
+/// them, parts per million: KVM's `tsc_tolerance_ppm`. Past it a guest's
+/// clock, told one rate at its boot, would run off the other's.
+pub const TSC_TOLERANCE_PPM: u64 = 250;
+/// The next pause's number.
+static NEXT_PAUSE: AtomicU64 = AtomicU64::new(1);
 
 /* The SMBIOS tables after the ACPI ones in the BIOS area, laid out in the
  * same buffer. */
@@ -1102,6 +1180,8 @@ impl LinuxGuest {
                 asked: None,
                 published,
                 counts: Counts::default(),
+                throttle_at: 0,
+                refault: (0, 0, 0),
             });
             shared.push(CpuShared {
                 mail: Mailbox::new(),
@@ -1111,6 +1191,7 @@ impl LinuxGuest {
                 addressing: AtomicU64::new(addressing),
                 posted,
                 posted_on: AtomicBool::new(false),
+                epoch: AtomicU64::new(0),
             });
         }
 
@@ -1141,6 +1222,9 @@ impl LinuxGuest {
             msr_faults,
         };
         let all = if n == u64::BITS as usize { u64::MAX } else { (1u64 << n) - 1 };
+        let mut parked = Vec::new();
+        parked.try_reserve_exact(n).map_err(|_| Error::NoMemory)?;
+        parked.resize_with(n, || None);
         let guest = LinuxGuest {
             memory,
             platform: Mutex::new(platform).ok_or(Error::NoMemory)?,
@@ -1162,6 +1246,14 @@ impl LinuxGuest {
             offloads: true,
             shape: Shape::cores(cpus),
             identity: Identity { uuid: [0; 16], serial: String::new(), version: String::new() },
+            vendor: machine.caps().vendor(),
+            x2apic,
+            tsc_offset: AtomicU64::new(0),
+            restored_at: AtomicU64::new(0),
+            told_hz: AtomicU64::new(time::cycle_counter_hz().unwrap_or(0)),
+            throttle: AtomicU32::new(0),
+            pause: AtomicU64::new(0),
+            parked: Mutex::new(parked).ok_or(Error::NoMemory)?,
         };
         Ok((guest, vcpus))
     }
@@ -1561,6 +1653,635 @@ impl LinuxGuest {
         self.doorbells.ring_all();
     }
 
+    /// Pause the guest: every CPU parked at the top of its loop, outside
+    /// its guest, its state read there (`park`) -- for the VM's state to be
+    /// taken (`capture`), and the guest then ended (`stop(Stop::Migrated)`)
+    /// or let go on (`resume`). Waits for every CPU, `PARK_NS` at most: one
+    /// that has not parked by then, or the guest stopping meanwhile, and the
+    /// pause is given up, the guest going on as it was. Called from a task
+    /// of the host's, never a CPU's own.
+    pub fn pause(&self) -> core::result::Result<(), &'static str> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err("the guest is stopping");
+        }
+        let n = NEXT_PAUSE.fetch_add(1, Ordering::Relaxed);
+        if self.pause.compare_exchange(0, n, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return Err("the guest is paused already");
+        }
+        let from = time::boot_time_ns();
+        loop {
+            /* Rung again each time round: a ring is taken by whatever looks
+             * first, and a CPU that took one before it saw the pause waits
+             * for the next. */
+            self.doorbells.ring_all();
+            let parked = self.parked.lock().iter().filter(|p| p.as_ref().is_some_and(|p| p.pause == n)).count();
+            if parked == self.cpus.len() {
+                return Ok(());
+            }
+            if self.stopping.load(Ordering::Acquire) {
+                self.resume();
+                return Err("the guest stopped as it was being paused");
+            }
+            if time::boot_time_ns().saturating_sub(from) >= PARK_NS {
+                self.resume();
+                return Err("a CPU of the guest did not park in time");
+            }
+            kcore::task::sleep_ms(1);
+        }
+    }
+
+    /// Let a paused guest go on: its disks taking requests again, and every
+    /// CPU out of its park as it was -- its own state never changed by the
+    /// pause. What the disks answered meanwhile waits in the mailboxes.
+    pub fn resume(&self) {
+        {
+            let mut p = self.platform.lock();
+            for d in p.pci_devs.iter_mut() {
+                if let PciDev::Disk(b) = d {
+                    b.quiesce(false);
+                }
+            }
+        }
+        self.pause.store(0, Ordering::Release);
+        self.doorbells.ring_all();
+    }
+
+    /// Whether it is paused, or being.
+    pub fn paused(&self) -> bool {
+        self.pause.load(Ordering::Acquire) != 0
+    }
+
+    /// CPU `gc`'s write at `gpa` faulted on the nested table: the dirty log's
+    /// -- a page of its RAM the log made read-only, marked and made writable
+    /// again (`GuestMemory::write_fault`) -- so the write is to run again;
+    /// true. False for anything else, and for a write that faults on one
+    /// page `DIRTY_REFAULTS` times in a row with no round between, which
+    /// re-protects it and is the only way the log makes a CPU fault there
+    /// twice: run again, it would fault for good, a VM that hangs with
+    /// nothing said, where the MMIO path stops it and says where.
+    fn dirty_write(&self, gc: &mut GuestCpu, gpa: u64) -> bool {
+        let page = gpa & !(GUEST_PAGE - 1);
+        let table = self.memory.nested().id;
+        let (last, at, n) = gc.refault;
+        let n = if last == page && at == table { n.saturating_add(1) } else { 1 };
+        gc.refault = (page, table, n);
+        n <= DIRTY_REFAULTS && self.memory.write_fault(gpa)
+    }
+
+    /// Every CPU of the guest past the top of its loop -- outside its guest
+    /// -- since the nested table took identity `id`, rung until it is: each
+    /// entry from then on drops what its TLB kept of the table before, so a
+    /// page read after this is what the guest wrote, and its next write to
+    /// a page made read-only faults. A migration's dirty log's, after it
+    /// narrowed the table (`log_start`, `log_round`).
+    fn sync_tlbs(&self, id: u64) -> core::result::Result<(), &'static str> {
+        let from = time::boot_time_ns();
+        loop {
+            self.doorbells.ring_all();
+            if self.cpus.iter().all(|c| c.epoch.load(Ordering::Acquire) >= id) {
+                return Ok(());
+            }
+            if self.stopping.load(Ordering::Acquire) {
+                return Err("the guest stopped");
+            }
+            if time::boot_time_ns().saturating_sub(from) >= PARK_NS {
+                return Err("a CPU of the guest did not leave it in time");
+            }
+            kcore::task::sleep_ms(1);
+        }
+    }
+
+    /// A migration's dirty log begun (`crate::dirty`): every page of the
+    /// guest's RAM read-only to it, and every CPU over the narrowed table
+    /// before this returns -- a page read from here on is what the guest
+    /// wrote, and a write after it a mark. Refused, and nothing left
+    /// protected, where its 2 MiB pages could not be split.
+    pub fn log_start(&self) -> core::result::Result<(), &'static str> {
+        let from = time::boot_time_ns();
+        let id = self.memory.log_start().map_err(|_| "no memory to split its 2 MiB pages into 4 KiB ones")?;
+        let narrowed = time::boot_time_ns();
+        let synced = self.sync_tlbs(id);
+        let pages = self.memory.ranges().map(|(_, size)| size / GUEST_PAGE).sum();
+        tp::mig_sync(id, kcore::trace::MigSyncWhat::Start, narrowed - from, time::boot_time_ns() - narrowed, pages,
+                     self.cpus.len());
+        if let Err(e) = synced {
+            self.log_stop();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// A round of the dirty log, the guest running: each page written since
+    /// the round before handed to `out` -- which only notes it: it is read
+    /// once this returns -- each read-only again, and every CPU past that.
+    /// How many.
+    pub fn log_round(&self, out: &mut dyn FnMut(u64)) -> core::result::Result<u64, &'static str> {
+        let from = time::boot_time_ns();
+        let (n, id) = self.memory.log_take(out).map_err(|_| "no memory to protect a page again")?;
+        let narrowed = time::boot_time_ns();
+        let synced = self.sync_tlbs(id);
+        tp::mig_sync(id, kcore::trace::MigSyncWhat::Round, narrowed - from, time::boot_time_ns() - narrowed, n,
+                     self.cpus.len());
+        synced.map(|()| n)
+    }
+
+    /// The last round, the guest paused and drained (`pause`, `settle`):
+    /// each page written since the round before handed to `out`. How many.
+    pub fn log_last(&self, out: &mut dyn FnMut(u64)) -> u64 {
+        self.memory.log_last(out)
+    }
+
+    /// How many pages a round would take now.
+    pub fn log_marked(&self) -> u64 {
+        self.memory.log_marked()
+    }
+
+    /// The dirty log over -- the migration given up, the guest going on
+    /// here: every page writable to it again, and its CPUs no longer
+    /// slowed.
+    pub fn log_stop(&self) {
+        let from = time::boot_time_ns();
+        self.memory.log_stop();
+        self.throttle.store(0, Ordering::Relaxed);
+        let pages = self.memory.ranges().map(|(_, size)| size / GUEST_PAGE).sum();
+        tp::mig_sync(self.memory.nested().id, kcore::trace::MigSyncWhat::Stop, time::boot_time_ns() - from, 0, pages,
+                     self.cpus.len());
+    }
+
+    /// Its CPUs kept out of it `percent` of their time, `THROTTLE_MAX` at
+    /// most: a migration's, while the guest writes its memory faster than
+    /// it is copied (plans/vm-migration.md, D4). 0 for none.
+    pub fn throttle(&self, percent: u32) {
+        self.throttle.store(percent.min(THROTTLE_MAX), Ordering::Relaxed);
+    }
+
+    /// CPU `gc` parked for pause `pause`, on its own task: its state read on
+    /// the host CPU it ran on -- where VT-x's VMCS is current -- into its
+    /// slot, and then a wait until the pause is over, or the guest ends.
+    fn park(&self, gc: &mut GuestCpu, bell: &Doorbell, pause: u64) {
+        let at = time::boot_time_ns();
+        let state = self.cpu_state(gc, at);
+        let old = {
+            let mut parked = self.parked.lock();
+            match parked.get_mut(gc.index as usize) {
+                Some(slot) => slot.replace(Parked { pause, state, at }),
+                None => None,
+            }
+        };
+        /* What the slot held, freed off the lock. */
+        drop(old);
+        while self.pause.load(Ordering::Acquire) == pause && !self.stopping.load(Ordering::Acquire) {
+            /* Out of its guest, and over the table as it is now when it
+             * enters again: as the top of its loop says it (`sync_tlbs`) */
+            if let Some(s) = self.cpus.get(gc.index as usize) {
+                s.epoch.store(self.memory.nested().id, Ordering::Release);
+            }
+            bell.wait(PARKED_WAIT_NS);
+        }
+    }
+
+    /// CPU `gc`'s state, as of `at`: its registers -- read where they are,
+    /// on the host CPU it ran on -- its local APIC, and what its loop keeps
+    /// of it. Its mailbox is read after the devices are drained
+    /// (`capture`).
+    fn cpu_state(&self, gc: &mut GuestCpu, at: u64) -> vmstate::Result<vmstate::Cpu> {
+        let regs = gc.cpu.backend_mut().save_regs()?;
+        Ok(vmstate::Cpu {
+            regs,
+            nmi_pending: gc.nmi_pending,
+            exception: gc.exception,
+            activity: match gc.activity {
+                Activity::Running => vmstate::Activity::Running,
+                Activity::Halted => vmstate::Activity::Halted,
+                Activity::Asleep => vmstate::Activity::Asleep,
+                Activity::WaitForSipi => vmstate::Activity::WaitForSipi,
+            },
+            last_from_pic: gc.last_from_pic,
+            pv_eoi: gc.pv_eoi,
+            lapic: gc.lapic.save(at),
+            mail: vmstate::Mail::default(),
+        })
+    }
+
+    /// Its disks drained, the guest paused: each takes nothing more off its
+    /// ring, and what it has with its backend comes back -- served here as
+    /// well as by its task, so that none waits on a parked first CPU's
+    /// round -- `DRAIN_NS` at most.
+    fn drain(&self) -> vmstate::Result<()> {
+        let mut disks = [0u8; MAX_DISKS];
+        let mut n = 0;
+        {
+            let mut p = self.platform.lock();
+            for d in p.pci_devs.iter_mut() {
+                if let PciDev::Disk(b) = d {
+                    b.quiesce(true);
+                    if n < MAX_DISKS {
+                        disks[n] = b.index();
+                        n += 1;
+                    }
+                }
+            }
+        }
+        let from = time::boot_time_ns();
+        loop {
+            for &disk in &disks[..n] {
+                self.serve_disk(disk);
+            }
+            let drained = self.platform.lock().pci_devs.iter().all(|d| match d {
+                PciDev::Disk(b) => b.drained(),
+                PciDev::Nic(_) => true,
+            });
+            if drained {
+                return Ok(());
+            }
+            if time::boot_time_ns().saturating_sub(from) >= DRAIN_NS {
+                return Err(vmstate::Error("a disk did not answer what it was asked in time"));
+            }
+            kcore::task::sleep_ms(1);
+        }
+    }
+
+    /// A paused guest's disks drained (`pause`): what it asked of them done
+    /// and given back into its memory, nothing more taken until it ends or
+    /// goes on -- so that its memory is still from here on, and a page read
+    /// of it now is the page a state taken later finds. A migration's, before
+    /// it reads the pages: a read the disks answered after its page went
+    /// would be missing on the other host, and the used ring that says it
+    /// was answered with it.
+    pub fn settle(&self) -> vmstate::Result<()> {
+        if self.pause.load(Ordering::Acquire) == 0 {
+            return Err(vmstate::Error("a guest settled that is not paused"));
+        }
+        self.drain()
+    }
+
+    /// The VM's state, of a guest paused (`pause`): its disks drained first,
+    /// then every CPU's as it parked, each one's mailbox and what was posted
+    /// for it, and every device's -- all as of one moment, now: the guest's
+    /// TSC then, its timers' edges from then. Its CPUs' states are taken out
+    /// of their slots, once; its disks stay drained until the guest ends or
+    /// goes on (`resume`).
+    pub fn capture(&self) -> vmstate::Result<vmstate::VmState> {
+        let pause = self.pause.load(Ordering::Acquire);
+        if pause == 0 {
+            return Err(vmstate::Error("a state taken of a guest not paused"));
+        }
+        self.drain()?;
+        let ioapic = self.has_ioapic();
+        let at = time::boot_time_ns();
+        let tsc = time::cycle_counter().wrapping_add(self.tsc_offset.load(Ordering::Relaxed));
+        let tsc_hz = Some(self.told_hz.load(Ordering::Relaxed)).filter(|&hz| hz != 0)
+            .ok_or(vmstate::Error("this host's TSC rate is not known"))?;
+
+        let mut cpus = Vec::new();
+        cpus.try_reserve_exact(self.cpus.len()).map_err(|_| vmstate::Error("no memory for the CPUs' states"))?;
+        let mut taken = Vec::new();
+        taken.try_reserve_exact(self.cpus.len()).map_err(|_| vmstate::Error("no memory for the CPUs' states"))?;
+        {
+            let mut parked = self.parked.lock();
+            for slot in parked.iter_mut() {
+                match slot.take() {
+                    Some(p) if p.pause == pause => taken.push(p),
+                    other => {
+                        *slot = other;
+                        return Err(vmstate::Error("a CPU of the guest that did not park"));
+                    }
+                }
+            }
+        }
+        for (p, shared) in taken.into_iter().zip(&self.cpus) {
+            let mut cpu = p.state?;
+            /* Its timers, read as it parked, made times from now. */
+            let since = at.saturating_sub(p.at);
+            let l = &mut cpu.lapic;
+            l.timer_due_in_ns = l.timer_due_in_ns.map(|d| d.saturating_sub(since));
+            l.timer_loaded_ago_ns = l.timer_loaded_ago_ns.saturating_add(since);
+            /* What was posted for it and not taken is what its mailbox
+             * holds besides: put there, so that a guest that goes on has it
+             * still, and read with the rest. */
+            if let Some(words) = shared.posted.as_ref().and_then(|posted| posted.take()) {
+                for (w, &word) in words.iter().enumerate() {
+                    let mut bits = word;
+                    while bits != 0 {
+                        let bit = bits.trailing_zeros();
+                        bits &= bits - 1;
+                        shared.mail.post_fixed((w as u32 * 64 + bit) as u8);
+                    }
+                }
+            }
+            cpu.mail = shared.mail.save();
+            cpus.push(cpu);
+        }
+
+        let p = self.platform.lock();
+        let (pci_address, functions) = p.pci.save().ok_or(vmstate::Error("no memory for PCI's state"))?;
+        let mut devices = Vec::new();
+        devices.try_reserve_exact(p.pci_devs.len()).map_err(|_| vmstate::Error("no memory for the devices' states"))?;
+        for d in &p.pci_devs {
+            devices.push(match d {
+                PciDev::Disk(b) => vmstate::Device::Disk(b.save()?),
+                PciDev::Nic(n) => vmstate::Device::Nic(n.save()?),
+            });
+        }
+        let mut msix_pending = Vec::new();
+        msix_pending.try_reserve_exact(p.msix_pending.len()).map_err(|_| vmstate::Error("no memory"))?;
+        msix_pending.extend_from_slice(&p.msix_pending);
+        let platform = vmstate::Platform {
+            uart: p.uart.save(), pic: p.pic.save(), pit: p.pit.save(at), rtc: p.rtc.save(), pm: p.pm.save(at),
+            pvpanic: p.pvpanic.save(), ioapic: p.ioapic.as_ref().map(|io| io.save()), pci_address, functions,
+            devices, msix_pending,
+        };
+        drop(p);
+
+        let mut ranges = Vec::new();
+        ranges.try_reserve_exact(8).map_err(|_| vmstate::Error("no memory"))?;
+        for (base, size) in self.memory.ranges() {
+            if ranges.len() == vmstate::RANGES_MAX {
+                return Err(vmstate::Error("more ranges of RAM than a state holds"));
+            }
+            ranges.push(vmstate::Range { base, size });
+        }
+        ranges.sort_unstable_by_key(|r| r.base);
+        let (n, smt, llc) = self.shape.parts();
+        let vm = vmstate::Vm {
+            vendor: match self.vendor {
+                hvarch::Vendor::Vmx => vmstate::Vendor::Vmx,
+                _ => vmstate::Vendor::Svm,
+            },
+            uuid: self.identity.uuid, ranges, x2apic: self.x2apic, ioapic, apicv: self.apicv, offloads: self.offloads,
+            rx_moderation_ns: self.rx_moderation_ns, shape: vmstate::Shape { cpus: n, smt, llc },
+            model: crate::policy::model_digest(self.shape), tsc_hz, tsc,
+            started: self.started.load(Ordering::Relaxed),
+        };
+        Ok(vmstate::VmState { vm, cpus, platform })
+    }
+
+    /// This guest -- built as the one `s` was saved from was: as much
+    /// memory laid out alike, as many CPUs, x2APIC or not, an IO-APIC or
+    /// not, the same devices in the same order, and no kernel loaded --
+    /// made the guest `s` says, and `cpus` its CPUs: every device's state
+    /// and every CPU's put back, each checked as it is, the guest's TSC going
+    /// on from where it stood and its timers from now. Its memory is the
+    /// caller's to fill. Refused whole at the first thing that does not hold
+    /// -- the guest is no use then, and is dropped.
+    pub fn restore(&mut self, s: &vmstate::VmState, cpus: &mut [GuestCpu]) -> vmstate::Result<()> {
+        let bad = |what| Err(vmstate::Error(what));
+        if self.loaded {
+            return bad("a state restored over a guest that has booted");
+        }
+        let vendor = match s.vm.vendor {
+            vmstate::Vendor::Svm => hvarch::Vendor::Svm,
+            vmstate::Vendor::Vmx => hvarch::Vendor::Vmx,
+        };
+        if vendor != self.vendor {
+            return bad("a state of a guest of the other extension's");
+        }
+        if s.cpus.len() != cpus.len() || cpus.len() != self.cpus.len() {
+            return bad("a state of a guest of another number of CPUs");
+        }
+        if s.vm.x2apic != self.x2apic || s.vm.ioapic != self.has_ioapic() {
+            return bad("a state of a guest whose APICs were built otherwise");
+        }
+        let mut ranges = [(0u64, 0u64); vmstate::RANGES_MAX];
+        let mut n = 0;
+        for r in self.memory.ranges() {
+            if n == ranges.len() {
+                return bad("more ranges of RAM than a state holds");
+            }
+            ranges[n] = r;
+            n += 1;
+        }
+        ranges[..n].sort_unstable_by_key(|r| r.0);
+        if n != s.vm.ranges.len() || ranges[..n].iter().zip(&s.vm.ranges).any(|(a, b)| a.0 != b.base || a.1 != b.size) {
+            return bad("a state of a guest whose memory is laid out otherwise");
+        }
+        let hz = time::cycle_counter_hz().filter(|&hz| hz != 0).ok_or(vmstate::Error("this host's TSC rate is not known"))?;
+        if u128::from(hz.abs_diff(s.vm.tsc_hz)) * 1_000_000 > u128::from(TSC_TOLERANCE_PPM) * u128::from(s.vm.tsc_hz) {
+            return bad("a state of a guest whose TSC ran at another rate than this host's");
+        }
+        if s.vm.model != crate::policy::model_digest(Shape::from_parts(s.vm.shape.cpus, s.vm.shape.smt, s.vm.shape.llc)) {
+            return bad("a state of a guest whose CPU this host's is not: its CPUID would change under it");
+        }
+
+        self.apicv = s.vm.apicv;
+        self.set_offloads(s.vm.offloads);
+        self.set_rx_moderation(s.vm.rx_moderation_ns);
+        self.set_shape(Shape::from_parts(s.vm.shape.cpus, s.vm.shape.smt, s.vm.shape.llc));
+        let now = time::boot_time_ns();
+        let tsc_offset = s.vm.tsc.wrapping_sub(time::cycle_counter());
+        self.tsc_offset.store(tsc_offset, Ordering::Relaxed);
+        self.restored_at.store(now, Ordering::Relaxed);
+        self.told_hz.store(s.vm.tsc_hz, Ordering::Relaxed);
+        {
+            let p = &mut *self.platform.lock();
+            let f = &s.platform;
+            p.uart.restore(&f.uart)?;
+            p.pic.restore(&f.pic)?;
+            p.pit.restore(&f.pit, now)?;
+            p.rtc.restore(&f.rtc)?;
+            p.pm.restore(&f.pm, now)?;
+            p.pvpanic.restore(&f.pvpanic);
+            match (&mut p.ioapic, &f.ioapic) {
+                (Some(io), Some(from)) => io.restore(from)?,
+                (None, None) => {}
+                _ => return bad("an IO-APIC where the guest built here has none, or none where it has one"),
+            }
+            p.pci.restore(f.pci_address, &f.functions)?;
+            if p.pci_devs.len() != f.devices.len() || p.msix_pending.len() != f.msix_pending.len() {
+                return bad("a state of a guest of other devices");
+            }
+            for (d, from) in p.pci_devs.iter_mut().zip(&f.devices) {
+                match (d, from) {
+                    (PciDev::Disk(b), vmstate::Device::Disk(from)) => b.restore(from, &self.memory, now)?,
+                    (PciDev::Nic(n), vmstate::Device::Nic(from)) => n.restore(from, &self.memory, now)?,
+                    _ => return bad("a device of another kind in its slot"),
+                }
+            }
+            p.msix_pending.copy_from_slice(&f.msix_pending);
+            sync_msix(p);
+        }
+        for ((gc, c), shared) in cpus.iter_mut().zip(&s.cpus).zip(&self.cpus) {
+            let b = gc.cpu.backend_mut();
+            b.restore_regs(&c.regs)?;
+            b.set_tsc_offset(tsc_offset);
+            gc.lapic.restore(&c.lapic, now)?;
+            gc.activity = match c.activity {
+                vmstate::Activity::Running => Activity::Running,
+                vmstate::Activity::Halted => Activity::Halted,
+                vmstate::Activity::Asleep => Activity::Asleep,
+                vmstate::Activity::WaitForSipi => Activity::WaitForSipi,
+            };
+            gc.nmi_pending = c.nmi_pending;
+            gc.exception = c.exception;
+            gc.last_from_pic = c.last_from_pic;
+            gc.pv_eoi = c.pv_eoi;
+            gc.pv_eoi_armed = false;
+            shared.mail.restore(&c.mail);
+            let addressing = gc.lapic.addressing().pack();
+            gc.published = (addressing, gc.lapic.software_enabled());
+            shared.addressing.store(addressing, Ordering::Relaxed);
+            shared.activity.store(gc.activity.code(), Ordering::Relaxed);
+            shared.extint.store(gc.lapic.accepts_extint(), Ordering::Relaxed);
+        }
+        self.started.store(s.vm.started, Ordering::Relaxed);
+        self.loaded = true;
+        Ok(())
+    }
+
+    /// What another host is told of it before it takes it
+    /// (`migwire::Offer`): the extension it runs under, its CPU model's
+    /// digest, the TSC rate it was told and its shape's parts -- what a
+    /// state taken of it will say, and the other host refuses where it
+    /// cannot give the same.
+    pub fn facts(&self) -> (vmstate::Vendor, [u8; 32], u64, (u32, bool, bool)) {
+        let vendor = match self.vendor {
+            hvarch::Vendor::Vmx => vmstate::Vendor::Vmx,
+            _ => vmstate::Vendor::Svm,
+        };
+        (vendor, crate::policy::model_digest(self.shape), self.told_hz.load(Ordering::Relaxed), self.shape.parts())
+    }
+
+    /// The extension a guest built on `machine` runs under, as a state says
+    /// it.
+    pub fn vendor_of(machine: &Machine) -> vmstate::Vendor {
+        match machine.caps().vendor() {
+            hvarch::Vendor::Vmx => vmstate::Vendor::Vmx,
+            _ => vmstate::Vendor::Svm,
+        }
+    }
+
+    /// What its TSC is ahead of the host's (`restore`).
+    pub fn tsc_offset(&self) -> u64 {
+        self.tsc_offset.load(Ordering::Relaxed)
+    }
+
+    /// A guest of a state, its clocks moved on to now, just before its CPUs
+    /// -- `cpus` -- first run: its TSC, its local APICs' timers, the PIT, the
+    /// PM timer, its NICs' held interrupts all as they stood when the state
+    /// was put into it (`restore`), the time since -- its memory filled, a
+    /// migration's handover -- left out of the guest's, as the pause was.
+    /// Nothing for a guest that booted.
+    pub fn rebase(&self, cpus: &mut [GuestCpu]) {
+        let since = self.restored_at.swap(0, Ordering::AcqRel);
+        if since == 0 {
+            return;
+        }
+        let now = time::boot_time_ns();
+        let delta = now.saturating_sub(since);
+        let ticks = time::cycle_counter_hz().map_or(0, |hz| {
+            (u128::from(delta) * u128::from(hz) / u128::from(kcore::consts::NS_PER_SEC)) as u64
+        });
+        let offset = self.tsc_offset.load(Ordering::Relaxed).wrapping_sub(ticks);
+        self.tsc_offset.store(offset, Ordering::Relaxed);
+        {
+            let mut p = self.platform.lock();
+            p.pit.shift(delta);
+            p.pm.shift(delta);
+            for d in p.pci_devs.iter_mut() {
+                if let PciDev::Nic(n) = d {
+                    n.shift(delta);
+                }
+            }
+        }
+        for gc in cpus {
+            gc.lapic.shift(delta);
+            gc.cpu.backend_mut().set_tsc_offset(offset);
+        }
+    }
+
+    /// Each disk as its guest sees it, in the order it has them: what a
+    /// migration's new host makes stand-ins of.
+    pub fn disk_shapes(&self) -> Vec<blk::Shape> {
+        let p = self.platform.lock();
+        let mut out = Vec::new();
+        if out.try_reserve_exact(p.disks).is_ok() {
+            for d in &p.pci_devs {
+                if let PciDev::Disk(b) = d {
+                    out.push(b.shape());
+                }
+            }
+        }
+        out
+    }
+
+    /// Each NIC's MAC and MTU, in the order it has them.
+    pub fn nic_shapes(&self) -> Vec<([u8; 6], u16)> {
+        let p = self.platform.lock();
+        let mut out = Vec::new();
+        if out.try_reserve_exact(p.nics).is_ok() {
+            for d in &p.pci_devs {
+                if let PciDev::Nic(n) = d {
+                    out.push(n.shape());
+                }
+            }
+        }
+        out
+    }
+
+    /// Each disk's volume and writer's generation, in its order, for one
+    /// that is a volume of the cluster's (`blk::Backend::writer`).
+    pub fn disk_writers(&self, out: &mut dyn FnMut(usize, &str, u64)) {
+        let p = self.platform.lock();
+        let mut i = 0;
+        for d in &p.pci_devs {
+            if let PciDev::Disk(b) = d {
+                if let Some((name, generation)) = b.writer() {
+                    out(i, name, generation);
+                }
+                i += 1;
+            }
+        }
+    }
+
+    /// Disk `index`'s backend made `backend` -- the volume a handover took,
+    /// in place of the stand-in it was built over: the one it replaces
+    /// handed back; or `backend` itself, where the guest would not see the
+    /// disk alike through it (`Blk::set_backend`), or it has no such disk.
+    pub fn set_disk_backend(&self, index: usize, backend: Box<dyn blk::Backend>)
+        -> core::result::Result<Box<dyn blk::Backend>, Box<dyn blk::Backend>>
+    {
+        let mut p = self.platform.lock();
+        let disk = p.pci_devs.iter_mut().filter_map(|d| match d {
+            PciDev::Disk(b) => Some(b),
+            PciDev::Nic(_) => None,
+        }).nth(index);
+        match disk {
+            Some(b) => b.set_backend(backend),
+            None => Err(backend),
+        }
+    }
+
+    /// NIC `index`'s backend made `backend` -- the port a handover took: the
+    /// one it replaces handed back; or `backend` itself, where it has no
+    /// such NIC.
+    pub fn set_nic_backend(&self, index: usize, backend: Box<dyn net::Backend>)
+        -> core::result::Result<Box<dyn net::Backend>, Box<dyn net::Backend>>
+    {
+        let mut p = self.platform.lock();
+        let nic = p.pci_devs.iter_mut().filter_map(|d| match d {
+            PciDev::Nic(n) => Some(n),
+            PciDev::Disk(_) => None,
+        }).nth(index);
+        match nic {
+            Some(n) => Ok(n.set_backend(backend)),
+            None => Err(backend),
+        }
+    }
+
+    /// The guest-physical ranges its devices' queues have their rings in,
+    /// each up: what a device writes through a mapping no log of the
+    /// guest's writes sees, and what a migration's last round sends
+    /// whatever its log says.
+    pub fn ring_ranges(&self, out: &mut dyn FnMut(u64, u64)) {
+        let p = self.platform.lock();
+        for d in &p.pci_devs {
+            match d {
+                PciDev::Disk(b) => b.rings(out),
+                PciDev::Nic(n) => n.rings(out),
+            }
+        }
+    }
+
     /// Run guest CPU `gc` on the CPU this is called on until the guest
     /// stops -- for good, on `host`'s request, by one of its CPUs, or at
     /// `deadline` (host nanoseconds since boot; `u64::MAX` for none) -- its
@@ -1620,6 +2341,27 @@ impl LinuxGuest {
             if host.stop_requested() {
                 self.stop_with(Stop::Requested, gc);
                 break;
+            }
+            /* The nested table as this CPU enters next: a migration's dirty
+             * log narrowed it, and waits for every CPU to be past here before
+             * it reads a page (`sync_tlbs`) -- each entry from here on drops
+             * what the TLB kept of the table before. */
+            shared.epoch.store(self.memory.nested().id, Ordering::Release);
+            /* A pause: parked here, outside the guest, until it is over --
+             * and then round again, to see whether the guest goes on. */
+            let pause = self.pause.load(Ordering::Acquire);
+            if pause != 0 {
+                self.park(gc, bell, pause);
+                continue;
+            }
+            /* Slowed, for a migration the guest writes faster than it copies:
+             * out of its guest for its share of each slice. */
+            let slowed = self.throttle.load(Ordering::Relaxed);
+            if slowed != 0 && now >= gc.throttle_at {
+                gc.throttle_at = now + THROTTLE_SLICE_NS;
+                let off = THROTTLE_SLICE_NS * u64::from(slowed) / u64::from(100 - slowed);
+                kcore::task::sleep_ms(off / kcore::consts::NS_PER_MS);
+                continue;
             }
 
             /* From here a ring kicks this vCPU out of its guest, or turns its
@@ -2059,6 +2801,17 @@ impl LinuxGuest {
                         self.last_halt.store(rip, Ordering::Relaxed);
                         self.set_activity(gc, Activity::Asleep);
                     }
+                    None
+                }
+                /* A write to a page of its RAM a migration's dirty log made
+                 * read-only -- a permission's fault, no reserved bit's:
+                 * marked and writable again, and the write runs again
+                 * (`crate::dirty`, `dirty_write`). */
+                Exit::NestedFault { gpa, error }
+                    if error & (vmcb::npf::PRESENT | vmcb::npf::WRITE | vmcb::npf::RESERVED)
+                        == vmcb::npf::PRESENT | vmcb::npf::WRITE
+                        && self.dirty_write(gc, gpa) =>
+                {
                     None
                 }
                 Exit::NestedFault { gpa, error } => {
@@ -3199,7 +3952,7 @@ impl LinuxGuest {
          * names is turned into the host's time as it is written. */
         if self.has_apic() && msr == lapic::MSR_TSC_DEADLINE && crate::policy::tsc_deadline() {
             if write {
-                gc.lapic.set_tsc_deadline(value, tsc_ns(value));
+                gc.lapic.set_tsc_deadline(value, tsc_ns(value, self.tsc_offset.load(Ordering::Relaxed)));
                 gc.cpu.backend_mut().skip_msr();
                 gc.fast = true;
             } else {
@@ -3326,10 +4079,10 @@ impl LinuxGuest {
     }
 }
 
-/// When the TSC -- a guest's, which is the host's -- reaches `tsc`, in host
+/// When the guest's TSC -- the host's plus `offset` -- reaches `tsc`, in host
 /// nanoseconds: now, if it has already, or if the TSC's rate is not known.
-fn tsc_ns(tsc: u64) -> u64 {
-    let (now_tsc, now) = (time::cycle_counter(), time::boot_time_ns());
+fn tsc_ns(tsc: u64, offset: u64) -> u64 {
+    let (now_tsc, now) = (time::cycle_counter().wrapping_add(offset), time::boot_time_ns());
     let Some(hz) = time::cycle_counter_hz() else { return now };
     let ahead = u128::from(tsc.saturating_sub(now_tsc)) * u128::from(kcore::consts::NS_PER_SEC) / u128::from(hz);
     now.saturating_add(u64::try_from(ahead).unwrap_or(u64::MAX))

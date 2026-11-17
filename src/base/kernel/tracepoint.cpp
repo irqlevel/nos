@@ -608,6 +608,81 @@ const Field TUNNEL_KEY_FIELDS[] = {
       sizeof(TUNNEL_KEY) / sizeof(TUNNEL_KEY[0]) },
 };
 
+/* ---- a migration's events ----
+   A VM moved between hosts' hv (modules/hypervisor/hv/src/migrate.rs): the
+   old host's rounds, both sides' takes and ends, the new host's messages;
+   and the run loop's TLB waits (hypervisor/hv/src/run.rs). */
+
+static_assert(sizeof(MigRound) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(MigTake) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(MigEnd) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(MigRecv) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(MigSync) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+
+/* Which side of a migration: the host it leaves, the one it comes to */
+const char* const MIG_SIDE[] = { "old", "new" };
+/* What NBS answered a take of a volume */
+const char* const MIG_TOOK[] = { "took", "refused", "unknown" };
+/* How a side's migration ended: the VM runs on the new host; runs on the
+   old one; runs on neither, its volume's writer one that cannot run it;
+   was refused before anything was paused; was given up before its Done */
+const char* const MIG_HOW[] = { "there", "here", "stopped", "refused", "cancelled" };
+/* A message the new host takes */
+const char* const MIG_KIND[] = { "offer", "file", "pages", "state", "done", "cancel", "flows" };
+/* What narrowed the table: the log begun, a round, the log over */
+const char* const MIG_SYNC[] = { "start", "round", "stop" };
+
+const Field MIG_ROUND_FIELDS[] = {
+    { "id", __builtin_offsetof(MigRound, id), sizeof(u64), Kind::Hex, nullptr, 0 },
+    { "round", __builtin_offsetof(MigRound, round), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "pages", __builtin_offsetof(MigRound, pages), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "zeros", __builtin_offsetof(MigRound, zeros), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "ms", __builtin_offsetof(MigRound, ms), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "marked", __builtin_offsetof(MigRound, marked), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "throttle", __builtin_offsetof(MigRound, throttle), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "last", __builtin_offsetof(MigRound, last), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+};
+
+const Field MIG_TAKE_FIELDS[] = {
+    { "id", __builtin_offsetof(MigTake, id), sizeof(u64), Kind::Hex, nullptr, 0 },
+    { "generation", __builtin_offsetof(MigTake, generation), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "ms", __builtin_offsetof(MigTake, ms), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "side", __builtin_offsetof(MigTake, side), sizeof(u8), Kind::Enum, MIG_SIDE,
+      sizeof(MIG_SIDE) / sizeof(MIG_SIDE[0]) },
+    { "took", __builtin_offsetof(MigTake, took), sizeof(u8), Kind::Enum, MIG_TOOK,
+      sizeof(MIG_TOOK) / sizeof(MIG_TOOK[0]) },
+    { "disk", __builtin_offsetof(MigTake, disk), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+};
+
+const Field MIG_END_FIELDS[] = {
+    { "id", __builtin_offsetof(MigEnd, id), sizeof(u64), Kind::Hex, nullptr, 0 },
+    { "paused_ms", __builtin_offsetof(MigEnd, paused_ms), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "rounds", __builtin_offsetof(MigEnd, rounds), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "mib", __builtin_offsetof(MigEnd, mib), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "side", __builtin_offsetof(MigEnd, side), sizeof(u8), Kind::Enum, MIG_SIDE,
+      sizeof(MIG_SIDE) / sizeof(MIG_SIDE[0]) },
+    { "how", __builtin_offsetof(MigEnd, how), sizeof(u8), Kind::Enum, MIG_HOW, sizeof(MIG_HOW) / sizeof(MIG_HOW[0]) },
+};
+
+const Field MIG_RECV_FIELDS[] = {
+    { "id", __builtin_offsetof(MigRecv, id), sizeof(u64), Kind::Hex, nullptr, 0 },
+    { "seq", __builtin_offsetof(MigRecv, seq), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "bytes", __builtin_offsetof(MigRecv, bytes), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "ns", __builtin_offsetof(MigRecv, ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    { "kind", __builtin_offsetof(MigRecv, kind), sizeof(u8), Kind::Enum, MIG_KIND,
+      sizeof(MIG_KIND) / sizeof(MIG_KIND[0]) },
+};
+
+const Field MIG_SYNC_FIELDS[] = {
+    { "table", __builtin_offsetof(MigSync, table), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "narrow_ns", __builtin_offsetof(MigSync, narrow_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    { "wait_ns", __builtin_offsetof(MigSync, wait_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    { "pages", __builtin_offsetof(MigSync, pages), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "cpus", __builtin_offsetof(MigSync, cpus), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "what", __builtin_offsetof(MigSync, what), sizeof(u8), Kind::Enum, MIG_SYNC,
+      sizeof(MIG_SYNC) / sizeof(MIG_SYNC[0]) },
+};
+
 /* ---- the memory's events ---- */
 
 static_assert(sizeof(MmZero) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
@@ -1015,6 +1090,19 @@ const Event EVENTS[] = {
     { "tunnel_key", "tunnel", "the tunnel's keys with another host: given, taken, dropped, asked for -- a host "
       "silent, a way narrower than the networks' MTU", sizeof(TunnelKey),
       sizeof(TUNNEL_KEY_FIELDS) / sizeof(TUNNEL_KEY_FIELDS[0]), TUNNEL_KEY_FIELDS },
+    { "mig_round", "migrate", "a round of a migration's pages sent by the old host: its pages, zeros, time, what "
+      "its guest wrote meanwhile, how slowed it was", sizeof(MigRound),
+      sizeof(MIG_ROUND_FIELDS) / sizeof(MIG_ROUND_FIELDS[0]), MIG_ROUND_FIELDS },
+    { "mig_take", "migrate", "a side's take of a volume in a migration's handover, from the writer of a generation: "
+      "how long NBS took, and what it answered", sizeof(MigTake),
+      sizeof(MIG_TAKE_FIELDS) / sizeof(MIG_TAKE_FIELDS[0]), MIG_TAKE_FIELDS },
+    { "mig_end", "migrate", "a side's end of a migration: where the VM runs, how long it was paused, the rounds and "
+      "the MiB of memory", sizeof(MigEnd), sizeof(MIG_END_FIELDS) / sizeof(MIG_END_FIELDS[0]), MIG_END_FIELDS },
+    { "mig_recv", "migrate", "a message of a migration taken by the new host: its kind, bytes, and how long it took",
+      sizeof(MigRecv), sizeof(MIG_RECV_FIELDS) / sizeof(MIG_RECV_FIELDS[0]), MIG_RECV_FIELDS },
+    { "mig_sync", "migrate", "a guest's nested table narrowed by a migration's dirty log, and the wait for its CPUs "
+      "to drop what their TLBs kept of it", sizeof(MigSync),
+      sizeof(MIG_SYNC_FIELDS) / sizeof(MIG_SYNC_FIELDS[0]), MIG_SYNC_FIELDS },
 };
 static_assert(sizeof(EVENTS) / sizeof(EVENTS[0]) == COUNT, "every event has its description, in tp::Id's order");
 

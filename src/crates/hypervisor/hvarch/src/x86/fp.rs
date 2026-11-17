@@ -209,6 +209,33 @@ fn has_xsaves() -> bool {
     cpu::cpuid_count(LEAF_XSAVE, 1).map_or(false, |c| c.eax & EAX_XSAVES != 0)
 }
 
+/// What MXCSR may hold on this machine: its MXCSR_MASK, as FXSAVE writes
+/// it -- 0 there meaning the architecture's default, every bit but DAZ.
+/// Asked of the CPU once, as [`offered`] is.
+fn mxcsr_mask() -> u32 {
+    const DEFAULT: u32 = 0xFFBF;
+    const MASK_AT: usize = 28;
+    let known = MXCSR_MASK.load(Ordering::Relaxed);
+    if known != 0 {
+        return known as u32;
+    }
+    let mut scratch = Area([0u8; AREA_BYTES]);
+    let at: *mut Area = &mut scratch;
+    /* FXSAVE writes 512 bytes at a 16-byte aligned address the area is, and
+     * reads nothing; the kernel set CR4.OSFXSR at boot. */
+    unsafe { asm!("fxsave64 [{}]", in(reg) at, options(nostack, preserves_flags)) };
+    let b = &scratch.0[MASK_AT..MASK_AT + 4];
+    let mask = match u32::from_le_bytes([b[0], b[1], b[2], b[3]]) {
+        0 => DEFAULT,
+        m => m,
+    };
+    MXCSR_MASK.store(u64::from(mask), Ordering::Relaxed);
+    mask
+}
+
+/// What [`mxcsr_mask`] found, 0 until it is first asked.
+static MXCSR_MASK: AtomicU64 = AtomicU64::new(0);
+
 /// What [`offered`] answers: `UNASKED` until it is first asked.
 static OFFERED: AtomicU64 = AtomicU64::new(UNASKED);
 const UNASKED: u64 = u64::MAX;
@@ -385,6 +412,52 @@ impl GuestFp {
     /// another's: for a report, and for the guest that shows them kept.
     pub fn loads(&self) -> u64 {
         self.loads
+    }
+
+    /// Its registers as its last exit saved them -- the area in XSAVE's
+    /// standard form, its legacy region, header and AVX's component -- and
+    /// its PKRU: for a VM's state.
+    pub fn area(&self) -> (&[u8], u32) {
+        (&self.area[0].0, self.pkru)
+    }
+
+    /// Make `area`, `xcr0` and `pkru` the guest's -- a VM's state restored --
+    /// if they are what a save on a CPU like this one could have left: the
+    /// area as long as this one's, its header's XSTATE_BV naming nothing
+    /// past the x87, SSE and AVX and the rest of the header zero -- the
+    /// standard form, which XRSTOR takes -- its MXCSR no bit this CPU's
+    /// MXCSR_MASK keeps clear, and an XCR0 [`set_xcr0`] takes. False
+    /// otherwise, nothing changed: an XRSTOR or FXRSTOR of an area that is
+    /// not so faults, in the host, at the guest's next entry.
+    ///
+    /// The registers are this guest's under a number they were never known
+    /// by, so that no CPU that held its old ones is taken to hold these.
+    ///
+    /// [`set_xcr0`]: GuestFp::set_xcr0
+    pub fn import(&mut self, area: &[u8], xcr0: u64, pkru: u32) -> bool {
+        if area.len() != AREA_BYTES {
+            return false;
+        }
+        let word = |at: usize| u32::from_le_bytes([area[at], area[at + 1], area[at + 2], area[at + 3]]);
+        let mut bv = [0u8; 8];
+        bv.copy_from_slice(&area[XSTATE_BV_AT..XSTATE_BV_AT + 8]);
+        let xstate_bv = u64::from_le_bytes(bv);
+        let header_rest = &area[XSTATE_BV_AT + 8..LEGACY_BYTES + HEADER_BYTES];
+        if word(MXCSR_AT) & !mxcsr_mask() != 0 || xstate_bv & !AREA_COMPONENTS != 0
+            || header_rest.iter().any(|&b| b != 0)
+        {
+            return false;
+        }
+        let valid_xcr0 = xcr0 & XCR0_X87 != 0 && xcr0 & !offered() == 0
+            && (xcr0 & XCR0_AVX == 0 || xcr0 & XCR0_SSE != 0);
+        if !valid_xcr0 || (pkru != 0 && offered() & XCR0_PKRU == 0) {
+            return false;
+        }
+        self.area[0].0.copy_from_slice(area);
+        self.xcr0 = xcr0;
+        self.pkru = pkru;
+        self.id = owner_id();
+        true
     }
 
     /// Whether CPU `cpu` can run the guest under its XCR0: one the CPU

@@ -337,6 +337,42 @@ impl PciBus {
         }
     }
 
+    /// What the guest wrote of every function's configuration, and of the
+    /// address register, for a VM's state (`vmstate`); None when there was
+    /// no memory for the list.
+    pub fn save(&self) -> Option<(u32, Vec<vmstate::Function>)> {
+        let mut functions = Vec::new();
+        functions.try_reserve_exact(self.slots.len()).ok()?;
+        for f in &self.slots {
+            functions.push(vmstate::Function {
+                command: f.get16(COMMAND), bar0: f.get32(BAR0), bar1: f.get32(BAR1),
+                interrupt_line: f.config[INTERRUPT_LINE], msix_control: f.get16(MSIX_CONTROL),
+            });
+        }
+        Some((self.address, functions))
+    }
+
+    /// What `functions` say the guest wrote, written again through what each
+    /// function lets a guest write -- so that what a function is, its
+    /// identity, its BARs' sizes, its capabilities, stays this host's as it
+    /// built it -- and the address register as `address` has it.
+    pub fn restore(&mut self, address: u32, functions: &[vmstate::Function]) -> vmstate::Result<()> {
+        if functions.len() != self.slots.len() {
+            return Err(vmstate::Error("PCI functions for another bus"));
+        }
+        for (f, s) in self.slots.iter_mut().zip(functions) {
+            f.write(COMMAND, 2, u32::from(s.command));
+            f.write(BAR0, 4, s.bar0);
+            /* A BAR left sized reads back its size: written all ones again. */
+            let sized = f.msix_page != 0 && s.bar1 == !(MSIX_PAGE - 1);
+            f.write(BAR1, 4, if sized { u32::MAX } else { s.bar1 });
+            f.write(INTERRUPT_LINE, 1, u32::from(s.interrupt_line));
+            f.write(MSIX_CONTROL + 1, 1, u32::from(s.msix_control >> 8));
+        }
+        self.address = address;
+        Ok(())
+    }
+
     /// Slot `slot`'s MSI-X: the control word (enable, mask-all, the table's
     /// size) and the page its table is in; None for a function without.
     pub fn msix(&self, slot: usize) -> Option<(u16, u32)> {

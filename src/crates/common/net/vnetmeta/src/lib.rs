@@ -82,6 +82,13 @@ pub const PUBLIC_MAX: usize = 1024;
 /// given none.
 pub const FIREWALLS_MAX: usize = 256;
 pub const DEFAULT_FIREWALL: &str = "default";
+/// The mailbox on each host that vnet's member tells of each change of its
+/// state it applies -- hv's keeper's (hv's `vnet.rs`), which then asks for
+/// its table at once rather than at its next second, so that a port moved
+/// (a VM's migration) is reached at its new host sooner: a word, tagged
+/// `TAG_CHANGED`, with nothing in it.
+pub const KEEPER: &str = "hv.keeper";
+pub const TAG_CHANGED: u32 = 1;
 /// hv's own network, every host's: no network of the cluster's covers it.
 pub const HOST_NET: u32 = 0x0A00_6400;
 pub const HOST_PREFIX: u8 = 24;

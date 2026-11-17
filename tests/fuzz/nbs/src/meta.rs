@@ -820,7 +820,7 @@ impl Model {
                 self.vols.get_mut(name).expect("there").size_mib = *size_mib;
                 Ok(Answer::Volume { id: v.id })
             }
-            Command::Attach { name, host, writable, force, token } => {
+            Command::Attach { name, host, writable, force, token, expect } => {
                 if !self.init {
                     return Err(NotInitialized);
                 }
@@ -840,7 +840,14 @@ impl Model {
                     if let Some((_, g, _)) = v.writer.as_ref().filter(|(h, _, t)| *token != 0 && t == token && h == host) {
                         return Ok(Answer::Attached { generation: *g, first: false });
                     }
-                    if !*force {
+                    /* A handover's: only where the writer is of the generation
+                       it names, whichever host -- a compare and set */
+                    if *expect != 0 {
+                        let writes = matches!(v.writer.as_ref(), Some((_, g, _)) if g == expect);
+                        if !writes {
+                            return Err(NotTheWriter);
+                        }
+                    } else if !*force {
                         if v.writer.as_ref().is_some_and(|(h, _, _)| h != host) {
                             return Err(AttachedElsewhere);
                         }
@@ -1880,8 +1887,23 @@ fn command(r: &mut Rng, s: &State, m: &Model, fresh: &mut u64) -> Command {
             };
             Command::VolumeResize { name, size_mib }
         }
-        68..=79 => Command::Attach { name: volume(r), host: member(r), writable: r.chance(60), force: r.chance(15),
-                                     token: if r.chance(60) { r.below(4) } else { 1000 + r.below(1 << 20) } },
+        68..=79 => {
+            let name = volume(r);
+            let writable = r.chance(60);
+            /* A handover's, now and then: from the writer it has, mostly --
+               the commit that lands -- or one it no longer has */
+            let expect = if writable && r.chance(25) {
+                match m.vols.get(&name).and_then(|v| v.writer.as_ref().map(|w| w.1)) {
+                    Some(g) if r.chance(70) => g,
+                    Some(g) => g + 1 + r.below(3),
+                    None => 1 + r.below(8),
+                }
+            } else {
+                0
+            };
+            Command::Attach { name, host: member(r), writable, force: r.chance(15),
+                              token: if r.chance(60) { r.below(4) } else { 1000 + r.below(1 << 20) }, expect }
+        }
         80..=86 => {
             let name = match pending_volume(r, s, m) {
                 Some(n) if r.chance(30) => n,

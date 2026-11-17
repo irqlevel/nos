@@ -493,6 +493,12 @@ pub struct Session {
     piece_ids: BTreeMap<(u64, u32), u64>,
     writable: bool,
     force: bool,
+    /// A handover's attach (`expect_writer`): the writer's generation the
+    /// volume is taken from, 0 for none -- its first attach's alone.
+    expect: u64,
+    /// That attach refused: the writer was not of that generation -- the
+    /// other side of the handover took it first (`writer_was_another`).
+    not_the_writer: bool,
     /// The session's own, made by its driver: what its attach asked again is
     /// known by.
     token: u64,
@@ -596,7 +602,7 @@ impl Session {
     pub fn new(name: &str, me: &str, writable: bool, force: bool, token: u64) -> Session {
         Session {
             name: String::from(name), me: String::from(me), answer: None, piece_ids: BTreeMap::new(), writable, force,
-            token, attach_from: 0,
+            expect: 0, not_the_writer: false, token, attach_from: 0,
             phase: Phase::Attaching, generation: 0, as_of: 0,
             index: 0, map: Map::default(), reading: None, next_id: 1, mds: None, downs: BTreeMap::new(),
             subs: BTreeMap::new(), pieces: BTreeMap::new(), next_piece: 1, ops: BTreeMap::new(), next_op: 1,
@@ -688,6 +694,14 @@ impl Session {
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Whether its handover's attach (`expect_writer`) was refused because
+    /// the volume's writer was not of the generation it named -- final, as
+    /// a migration's decision needs it: asked again, it is refused again.
+    /// False for any other failure, which may be no answer at all.
+    pub fn writer_was_another(&self) -> bool {
+        self.not_the_writer
     }
 
     /// Whether this is the volume's first attach for writing, the volume
@@ -834,11 +848,21 @@ impl Session {
         self.mds = Some(MdsAsk { id, want, bytes, sent: now, again: None });
     }
 
+    /// Its attach, before `start`, a handover's (plans/vm-migration.md):
+    /// the volume taken for writing from the writer of `generation` alone,
+    /// and the session failed -- refused, `NotTheWriter` -- where the writer
+    /// is another by then.
+    pub fn expect_writer(&mut self, generation: u64) {
+        if self.writable {
+            self.expect = generation;
+        }
+    }
+
     /// The session started: the volume attached.
     pub fn start(&mut self, now: u64, out: &mut Vec<Out>) {
         self.attach_from = now;
         let ask = Ask::Attach { name: self.name.clone(), writable: self.writable, force: self.force,
-                                token: self.token };
+                                token: self.token, expect: self.expect };
         self.ask_mds(MdsWant::Attach, ask, now, out);
     }
 
@@ -939,8 +963,19 @@ impl Session {
                     m.again = Some(now + AGAIN_NS);
                 }
             }
+            /* A handover's attach refused: the writer is not of the
+               generation it named -- the other side's take landed first
+               (plans/vm-migration.md). Final, and said so: the driver tells
+               it from an attach that had no answer */
+            (MdsWant::Attach, Said::NotTheWriter) => {
+                self.mds = None;
+                self.not_the_writer = true;
+                self.fail("not the volume's writer: attached elsewhere since", out);
+            }
             (MdsWant::Attach, Said::Attached { generation, index, first }) => {
                 self.mds = None;
+                /* A handover's is its first attach's alone */
+                self.expect = 0;
                 if !self.reattaching {
                     self.fresh = first;
                 }

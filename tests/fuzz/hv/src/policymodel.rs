@@ -38,7 +38,7 @@
 //! nothing past 0x4000_0001.
 
 use crate::place::{Shape, Topology};
-use crate::policy::{self, Asker, Cpuid, Own};
+use crate::policy::{self, model_answers, model_differs, model_digest, Asker, Cpuid, Own, MSR_ANSWER};
 use crate::targets::Input;
 use crate::x86::{self, cpu, fp};
 use crate::x86::svm::vmcb::Save;
@@ -835,6 +835,45 @@ fn msr_value(r: &mut Input, k: Option<Kind>) -> u64 {
 /// The policy target: a host an input, the guest's every leaf, what each
 /// feature promises, and MSRs named and not, read and written by a guest
 /// in long mode with paging on, or before it.
+/// The CPU a guest of `shape` is shown, as a migration holds two hosts to it
+/// (plans/vm-migration.md, M4): this host's answers alike to themselves,
+/// none of them a core's caches; any one changed -- a register, its
+/// subleaf, one dropped or one more -- another digest, and named where it
+/// differs.
+fn check_model(shape: Shape, r: &mut Input) {
+    let mut mine = Vec::new();
+    model_answers(shape, &mut |a| mine.push(a));
+    invariant!(model_differs(shape, &mine).is_none(), "a host's own answers differ from themselves");
+    invariant!(mine.iter().all(|a| !matches!(a.leaf, 2 | 4 | 0x8000_0005 | 0x8000_0006 | 0x8000_001D)),
+               "a core's caches in the CPU a guest is held to");
+    invariant!(mine.windows(2).all(|w| (w[0].leaf, w[0].sub) < (w[1].leaf, w[1].sub) || w[1].sub == MSR_ANSWER),
+               "the answers out of their order");
+    let digest = model_digest(shape);
+    invariant!(model_digest(shape) == digest, "the digest of one host is two");
+    if mine.is_empty() {
+        return;
+    }
+    let mut theirs = mine.clone();
+    let at = r.below(theirs.len() as u64) as usize;
+    match r.below(4) {
+        0 => theirs[at].regs[r.below(4) as usize] ^= 1 << r.below(32),
+        1 => theirs[at].sub ^= 1,
+        2 => {
+            theirs.remove(at);
+        }
+        _ => theirs.push(theirs[at]),
+    }
+    let differs = model_differs(shape, &theirs);
+    invariant!(differs.is_some(), "an answer changed and the two said alike");
+    let (there, here) = differs.unwrap_or((None, None));
+    let named = match (there, here) {
+        (Some(t), Some(h)) => theirs.iter().position(|x| *x == t).is_some_and(|i| i == at || i + 1 == at || at + 1 == i)
+            || mine.iter().position(|x| *x == h) == Some(at),
+        _ => true,
+    };
+    invariant!(named, "the difference named is not where the answer changed: at {} said {:?}", at, (there, here));
+}
+
 pub fn policy_target(r: &mut Input) {
     cpu::set_host(r.u64());
     /* The asking CPU's CR4 -- OSXSAVE on or off, among anything -- and its
@@ -860,6 +899,7 @@ pub fn policy_target(r: &mut Input) {
         check_leaf(0xD, sub, &asker, told);
     }
     check_implied(&asker);
+    check_model(shape, r);
 
     let mut save = blank_save();
     if r.bool() {

@@ -33,6 +33,11 @@
 extern crate alloc;
 
 mod machine;
+/* The log's half that narrows the nested table, and its faults, are the
+ * x86-64 run loop's: arm64 runs no guest of its own yet, and keeps only its
+ * marks. */
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+mod dirty;
 mod memory;
 mod devices;
 #[cfg(target_arch = "x86_64")]
@@ -77,6 +82,8 @@ pub mod cr;
 pub mod dr;
 #[cfg(target_arch = "x86_64")]
 pub mod policy;
+#[cfg(target_arch = "x86_64")]
+mod state;
 #[cfg(target_arch = "x86_64")]
 pub mod run;
 #[cfg(target_arch = "x86_64")]

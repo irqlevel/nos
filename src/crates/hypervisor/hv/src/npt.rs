@@ -13,14 +13,16 @@
 //! bits in entries as it walks; they are set from the start, so that it has
 //! nothing to write.
 //!
-//! And it only grows. An entry is written once, where there was none, and
-//! stays until the table goes -- which is what lets the guest keep what its
-//! entries into the TLB made of it from one entry to the next: its ASID
-//! stays its own while the table keeps its `id` (`hvarch::x86::svm::Asids`),
-//! and a translation the TLB holds is one the table would still make. An
-//! entry taken away or narrowed would change that, and whatever does it
-//! gives the table a new id -- which moves the guest onto a fresh ASID, clear
-//! of the old translation.
+//! And it only grows -- but for a migration's dirty log (`crate::dirty`). An
+//! entry is written once, where there was none, and stays until the table
+//! goes -- which is what lets the guest keep what its entries into the TLB
+//! made of it from one entry to the next: its ASID stays its own while the
+//! table keeps its `id` (`hvarch::x86::svm::Asids`), and a translation the
+//! TLB holds is one the table would still make. The dirty log narrows
+//! entries -- a page made read-only, a 2 MiB leaf split into the 4 KiB ones
+//! of the same memory -- and gives the table a new id with each round of
+//! them (`renew`), which moves the guest onto a fresh ASID, clear of the old
+//! translations.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -234,6 +236,84 @@ impl Npt {
             return Err(Error::BadAddress);
         }
         self.tables[dir].next[i] = LEAF;
+        Ok(())
+    }
+
+    /// Its identity for the TLB now (`renew`).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// A new identity: what the table translated has narrowed -- a page
+    /// made read-only, a 2 MiB leaf split (`protect`) -- so the TLBs' old
+    /// translations are no longer ones it would make, and every CPU drops
+    /// them as it next enters (a fresh ASID, `hvarch::x86::svm::Asids`).
+    pub fn renew(&mut self) {
+        self.id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The 2 MiB leaf `gpa` is in, if it is in one, made a last-level table
+    /// of the same 512 pages, each as the leaf had it: what a page of it is
+    /// protected through (`protect`). The TLBs are the caller's (`renew`).
+    fn split(&mut self, gpa: u64) -> Result<()> {
+        let dir = self.table_at(gpa, DIRECTORY, false)?;
+        let i = index(gpa, DIRECTORY);
+        if self.tables[dir].next[i] != LEAF {
+            return Ok(());
+        }
+        let leaf = self.tables[dir].page.load::<u64>(i * ENTRY_BYTES).ok_or(Error::BadAddress)?;
+        let hpa = leaf & ADDRESS & !(HUGE_BYTES - 1);
+        let mut child = Table::new(true)?;
+        let phys = child.page.phys();
+        if phys & !ADDRESS != 0 {
+            return Err(Error::BadAddress);
+        }
+        for k in 0..ENTRIES {
+            if !child.page.store::<u64>(k * ENTRY_BYTES, (hpa + (k * PAGE_SIZE) as u64) | PAGE) {
+                return Err(Error::BadAddress);
+            }
+        }
+        let id = self.tables.try_push(child).map_err(|_| Error::NoMemory)?;
+        /* The table filled and in the arena before the entry that makes it
+         * reachable takes the leaf's place. */
+        if !self.tables[dir].page.store::<u64>(i * ENTRY_BYTES, phys | TABLE) {
+            return Err(Error::BadAddress);
+        }
+        self.tables[dir].next[i] = id as u32;
+        Ok(())
+    }
+
+    /// The page at `gpa`, mapped, made read-only to the guest -- its 2 MiB
+    /// leaf split first where it is in one (`split`): a write to it is a
+    /// nested fault from the TLBs' next flush on (`renew`).
+    pub fn protect(&mut self, gpa: u64) -> Result<()> {
+        self.split(gpa)?;
+        self.change(gpa, |e| e & !WRITE)
+    }
+
+    /// The page at `gpa`, mapped, writable to the guest again, as `set`
+    /// mapped it. Nothing to flush: a TLB keeps no translation wider than
+    /// the table's.
+    pub fn unprotect(&mut self, gpa: u64) -> Result<()> {
+        self.change(gpa, |e| e | WRITE | DIRTY)
+    }
+
+    /// The last-level entry of the page at `gpa` -- one there -- made what
+    /// `f` makes of it.
+    fn change(&mut self, gpa: u64, f: fn(u64) -> u64) -> Result<()> {
+        if gpa % PAGE_SIZE as u64 != 0 {
+            return Err(Error::BadAddress);
+        }
+        let table = self.last_level(gpa, false)?;
+        let offset = index(gpa, SHIFTS.len() - 1) * ENTRY_BYTES;
+        let page = &mut self.tables[table].page;
+        let e = page.load::<u64>(offset).ok_or(Error::BadAddress)?;
+        if e & PRESENT == 0 {
+            return Err(Error::Unmapped);
+        }
+        if !page.store::<u64>(offset, f(e)) {
+            return Err(Error::BadAddress);
+        }
         Ok(())
     }
 

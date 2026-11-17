@@ -54,6 +54,7 @@ pub static ALL: &[Target] = &[
     Target { name: "firewall", run: crate::fwmodel::firewall_target, max_len: 4096 },
     Target { name: "fwswitch", run: crate::fwmodel::fwswitch_target, max_len: 2048 },
     Target { name: "vnetswitch", run: crate::vnetmodel::vnetswitch_target, max_len: 4096 },
+    Target { name: "flowmove", run: crate::vnetmodel::flowmove_target, max_len: 2048 },
     Target { name: "vnetwire", run: crate::vnetwiremodel::vnetwire_target, max_len: 4096 },
     Target { name: "tunnel", run: crate::tunnelmodel::tunnel_target, max_len: 4096 },
     Target { name: "platform", run: crate::platform::platform, max_len: 16384 },
@@ -61,6 +62,10 @@ pub static ALL: &[Target] = &[
     Target { name: "place", run: crate::placemodel::place_target, max_len: 2048 },
     Target { name: "config", run: crate::configmodel::config_target, max_len: 4096 },
     Target { name: "relay", run: crate::relaymodel::relay_target, max_len: 4096 },
+    Target { name: "vmstate", run: crate::statemodel::vmstate_target, max_len: 8192 },
+    Target { name: "handover", run: crate::handovermodel::handover_target, max_len: 1024 },
+    Target { name: "migwire", run: crate::migwiremodel::migwire_target, max_len: 4096 },
+    Target { name: "dirtylog", run: crate::dirtymodel::dirtylog_target, max_len: 4096 },
 ];
 
 /// The input, read as a stream of choices: past its end every read is 0, and

@@ -23,7 +23,10 @@
 //!   admin starts -- a port of the switch of its own, nos's ports forwarded,
 //!   `protected`, and started once made, as the call asks), `clone`,
 //!   `delete`, `image` (an image of NBS's made of a URL's or a file's, as
-//!   `hv image` makes one). Each says as it goes what the command
+//!   `hv image` makes one), `migrate` (a running VM moved to another host of
+//!   the cluster's, as `hv migrate` moves it: its progress the memory sent, a
+//!   cancel before its last round's end leaving it running here as it was).
+//!   Each says as it goes what the command
 //!   would, its progress and whether it is stopped; a cancel -- or the
 //!   module's going -- stops a download, a conversion and a copy where they
 //!   are, what they made taken away. A stop's cancel stops its wait for the
@@ -56,7 +59,7 @@ use crate::State;
 
 const DESCRIPTOR: &str = include_str!("vm.descriptor.json");
 
-const METHODS: [Method; 26] = [
+const METHODS: [Method; 27] = [
     Method { name: "list", kind: Kind::Read },
     Method { name: "get", kind: Kind::Read },
     Method { name: "host", kind: Kind::Read },
@@ -83,6 +86,7 @@ const METHODS: [Method; 26] = [
     Method { name: "clone", kind: Kind::Job },
     Method { name: "delete", kind: Kind::Job },
     Method { name: "image", kind: Kind::Job },
+    Method { name: "migrate", kind: Kind::Job },
 ];
 
 /// The longest public address as a person writes one, `a.b.c.d`.
@@ -260,6 +264,7 @@ fn provide(state: &State, method: &str, params: &[u8], call: &mut Call) -> Statu
         "clone" => clone(state, p, call),
         "delete" => delete(state, p, call),
         "image" => image(state, p, call),
+        "migrate" => migrate(state, p, call),
         _ => Status::NoMethod,
     }
 }
@@ -1574,6 +1579,44 @@ fn snapshot(state: &State, mut p: Params, call: &mut Call) -> Status {
             w.field_str("volume", volume);
             w.field_str("snapshot", snap);
             w.field_uint("number", u64::from(id));
+            w.end_object();
+        }),
+        Err(e) => failed(call, &e),
+    }
+}
+
+/// `migrate`: running VM `name` moved to host `host` of the cluster's, as
+/// `hv migrate` moves it (plans/vm-migration.md) -- live, or `cold`: paused
+/// for the whole copy. Its log the command's lines, its progress the memory
+/// sent; a cancel, or the module's going, before its last round's end leaves
+/// it running here as it was, and after it is not heard: the VM is the
+/// other host's from there. Refused where it cannot go -- its disk not a
+/// volume, the other host's CPU or its folder there -- running on.
+fn migrate(state: &State, mut p: Params, call: &mut Call) -> Status {
+    let name = match name_param(&mut p, "name", call) {
+        Ok(n) => n,
+        Err(s) => return s,
+    };
+    let (host, cold) = match (p.str("host", migwire::NAME_MAX), p.opt_bool("cold")) {
+        (Ok(h), Ok(c)) => (h, c.unwrap_or(false)),
+        (Err(e), _) | (_, Err(e)) => return invalid(call, e),
+    };
+    if let Err(s) = finish(p, call) {
+        return s;
+    }
+    let moved = {
+        let mut job = Job::new(call, &state.unloading);
+        crate::migrate::migrate(state, name, host, cold, &mut job)
+    };
+    match moved {
+        Ok(m) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("vm", name);
+            w.field_str("host", host);
+            w.field_uint("rounds", u64::from(m.rounds));
+            w.field_uint("paused_ms", m.paused_ms);
+            w.field_uint("sent_bytes", m.sent_bytes);
+            w.field_uint("flows", m.flows as u64);
             w.end_object();
         }),
         Err(e) => failed(call, &e),
