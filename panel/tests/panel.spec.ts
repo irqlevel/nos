@@ -479,6 +479,7 @@ test('a VM moved to another host of the cluster\'s: the host from the cluster\'s
   /* The page says where it went, and not that this host has no such VM --
    * a read after the move, three seconds on, included */
   await expect(page.getByTestId('vm-moved')).toContainText('Moved to mock-b');
+  await expect(page.getByTestId('vm-state')).toHaveCount(0);
   await page.waitForTimeout(3500);
   await expect(page.getByText('no vm pw-mig')).toHaveCount(0);
   await expect(page.getByTestId('vm-moved')).toBeVisible();
