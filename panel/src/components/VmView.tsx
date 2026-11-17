@@ -70,7 +70,8 @@ export function VmView({ host, name, d, nbs = null, fw = null, hosts = [], local
     <div className="space-y-4">
       <div className="flex flex-wrap items-baseline gap-3">
         <h1 className="text-2xl font-semibold text-fg">{name}</h1>
-        <span className="text-sm text-muted" data-testid="vm-state">{show(fields.state, vm.state, locale)}</span>
+        {/* Its state here is gone with it once it has moved: the note below says where */}
+        {moved === null && <span className="text-sm text-muted" data-testid="vm-state">{show(fields.state, vm.state, locale)}</span>}
         {vm.protected === true && <span className="rounded bg-accent-soft px-2 py-0.5 text-xs text-fg">{text(fields.protected?.title, locale)}</span>}
       </div>
       {error && <p role="alert" className="text-sm text-bad">{error}</p>}
