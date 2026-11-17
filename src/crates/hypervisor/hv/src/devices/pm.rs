@@ -232,4 +232,34 @@ impl Pm {
             None => false,
         }
     }
+
+    /// Its registers, and its timer as how long it had counted at `now`, for
+    /// a VM's state (`vmstate`).
+    pub fn save(&self, now: u64) -> vmstate::Pm {
+        vmstate::Pm {
+            status: self.status, enable: self.enable, control: self.control,
+            elapsed_ns: now.saturating_sub(self.zero_ns), carries_seen: self.carries_seen, scis: self.scis,
+            presses: self.presses, used: self.used, other_sleep: self.other_sleep,
+        }
+    }
+
+    /// Its timer's zero moved on by `delta` (`LinuxGuest::rebase`).
+    pub fn shift(&mut self, delta: u64) {
+        self.zero_ns = self.zero_ns.saturating_add(delta);
+    }
+
+    /// Made what `s` says, its timer going on from `now` where it stood.
+    pub fn restore(&mut self, s: &vmstate::Pm, now: u64) -> vmstate::Result<()> {
+        if s.enable & !ENABLE_WRITABLE != 0 || s.control & !CONTROL_KEPT != 0 {
+            return Err(vmstate::Error("PM1's enables or control with a bit no write leaves"));
+        }
+        if s.other_sleep.is_some_and(|t| u16::from(t) > SLP_TYP_MASK) {
+            return Err(vmstate::Error("a sleep type past its field"));
+        }
+        *self = Pm {
+            status: s.status, enable: s.enable, control: s.control, zero_ns: now.saturating_sub(s.elapsed_ns),
+            carries_seen: s.carries_seen, scis: s.scis, presses: s.presses, used: s.used, other_sleep: s.other_sleep,
+        };
+        Ok(())
+    }
 }

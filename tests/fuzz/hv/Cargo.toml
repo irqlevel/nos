@@ -30,6 +30,12 @@ vnetwire = { path = "../../../src/crates/common/net/vnetwire" }
 # ... here the vendored RustCrypto one, which hv-fuzz.py builds with, in the
 # place of hv.ko's crypto crate (src/aead.rs).
 chacha20poly1305 = { version = "0.10.1", default-features = false }
+# A VM's state as bytes (`vmstate` target, and every device's and the
+# platform's round trips through it). Nothing but codec under it.
+vmstate = { path = "../../../src/crates/common/vm/vmstate" }
+# A migration's messages and the handover's decisions (`handover` and
+# `migwire` targets). Nothing but codec under it.
+migwire = { path = "../../../src/crates/common/vm/migwire" }
 
 # What a RUSTUB=1 kernel has on: an overflow is a panic, not a wrap -- and a
 # guest that can cause one can bring down the host that runs it.

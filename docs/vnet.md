@@ -194,8 +194,9 @@ refused while its VM runs, the alerts of a public address's host -- is in
   datagram -- every one held to the wire built without vnetwire -- its
   window, the keys' messages), `tunnel` (three hosts' real
   switches and tunnels over a wire that loses, repeats, damages, reorders
-  and forges, public addresses through the real NAT); `--mutants`: ninety-nine
-  rules taken out, each to be found.
+  and forges, public addresses through the real NAT, ports migrated between
+  them); `--mutants`: a hundred and four rules taken out -- five of them a
+  migration's network's -- each to be found.
 - `tests/raft-test.py` (host, in CI): vnet's state (`vnetmeta`).
 - `tests/vnet-test.py` (by hand, on `tests/hub.py`): `--phase v1b` the group
   and its state on three hosts, `v2` one host's networks with probes, `v3`

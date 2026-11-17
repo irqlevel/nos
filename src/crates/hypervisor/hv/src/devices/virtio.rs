@@ -175,6 +175,30 @@ pub enum Broken {
     Memory,
 }
 
+impl Broken {
+    /// Its code in a VM's state (`vmstate`).
+    pub fn code(self) -> u8 {
+        match self {
+            Broken::Index => 1,
+            Broken::Loop => 2,
+            Broken::Overrun => 3,
+            Broken::Indirect => 4,
+            Broken::Memory => 5,
+        }
+    }
+
+    pub fn from_code(code: u8) -> Option<Broken> {
+        Some(match code {
+            1 => Broken::Index,
+            2 => Broken::Loop,
+            3 => Broken::Overrun,
+            4 => Broken::Indirect,
+            5 => Broken::Memory,
+            _ => return None,
+        })
+    }
+}
+
 /// One split virtqueue, by what the device keeps of it.
 pub struct Queue {
     /// Its size: the device's, fixed, a power of two.
@@ -868,6 +892,96 @@ impl Transport {
             }
         }
         asked
+    }
+
+    /// What the driver made of the device's header and queues, for a VM's
+    /// state (`vmstate`); None when there was no memory for the lists.
+    pub fn save(&self) -> Option<vmstate::Transport> {
+        let mut queues = Vec::new();
+        queues.try_reserve_exact(self.queues.len()).ok()?;
+        for q in &self.queues {
+            queues.push(vmstate::Queue { size: q.size, pfn: q.pfn, next_avail: q.next_avail, next_used: q.next_used,
+                                         seen: q.seen, signalled_used: q.signalled_used });
+        }
+        let msix = match &self.msix {
+            None => None,
+            Some(m) => {
+                let mut vectors = Vec::new();
+                vectors.try_reserve_exact(m.queues.len()).ok()?;
+                vectors.extend_from_slice(&m.queues);
+                Some(vmstate::Msix { entries: m.entries, enabled: m.enabled, config: m.config, queues: vectors })
+            }
+        };
+        Some(vmstate::Transport { device_features: self.device_features, driver_features: self.driver_features,
+                                  status: self.status, isr: self.isr, select: self.select, queues, msix })
+    }
+
+    /// Made what `s` says, on a device built as the one it was saved from --
+    /// the same features offered, the same queues of the same sizes, MSI-X
+    /// with as many entries -- or refused: a state is no way to change what
+    /// a device is. A queue that was set up is set up again at its address
+    /// in `mem`, its rings mapped as the driver's setting it up would map
+    /// them at `now`, once they are found to be RAM of the guest's whole.
+    pub fn restore(&mut self, s: &vmstate::Transport, mem: &GuestMemory, now: u64) -> vmstate::Result<()> {
+        if s.device_features != self.device_features {
+            return Err(vmstate::Error("a device offering other features than the one built here"));
+        }
+        if s.driver_features & !self.device_features != 0 {
+            return Err(vmstate::Error("a driver taking features its device did not offer"));
+        }
+        if s.queues.len() != self.queues.len() || s.queues.iter().zip(&self.queues).any(|(a, b)| a.size != b.size) {
+            return Err(vmstate::Error("a device of other queues than the one built here"));
+        }
+        match (&s.msix, &self.msix) {
+            (None, None) => {}
+            (Some(a), Some(b)) if a.entries == b.entries && a.queues.len() == b.queues.len() => {
+                let valid = |v: u16| v == NO_VECTOR || v < a.entries;
+                if !valid(a.config) || !a.queues.iter().all(|&v| valid(v)) {
+                    return Err(vmstate::Error("a vector past MSI-X's table"));
+                }
+            }
+            _ => return Err(vmstate::Error("MSI-X where the device built here has none, or another table")),
+        }
+        for q in &s.queues {
+            if q.pfn != 0 {
+                let probe = Queue::new(q.size);
+                let base = u64::from(q.pfn) << PFN_SHIFT;
+                if !mem.is_ram(base, probe.ring_bytes() as u64) {
+                    return Err(vmstate::Error("a queue's rings outside the guest's RAM"));
+                }
+            }
+        }
+        /* Checked whole: from here nothing refuses. */
+        self.reset();
+        self.set_driver_features(s.driver_features);
+        self.status = s.status;
+        self.isr = s.isr;
+        self.select = s.select;
+        for (q, from) in self.queues.iter_mut().zip(&s.queues) {
+            if from.pfn != 0 {
+                let map = self.maps.take(now);
+                q.set_pfn(from.pfn, mem, map);
+            }
+            q.next_avail = from.next_avail;
+            q.next_used = from.next_used;
+            q.seen = from.seen;
+            q.signalled_used = from.signalled_used;
+        }
+        if let (Some(m), Some(from)) = (&mut self.msix, &s.msix) {
+            m.enabled = from.enabled;
+            m.config = from.config;
+            m.queues.copy_from_slice(&from.queues);
+        }
+        Ok(())
+    }
+
+    /// The guest-physical pages each queue that is up has its rings in: what
+    /// a device writes with no copy a migration's log could see, and which
+    /// every round sends whatever the log says.
+    pub fn rings(&self, out: &mut dyn FnMut(u64, u64)) {
+        for q in self.queues.iter().filter(|q| q.ready()) {
+            out(q.base(), q.ring_bytes() as u64);
+        }
     }
 
     /// Queue `queue` gave buffers back and the driver wants to hear of it:

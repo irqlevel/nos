@@ -589,6 +589,97 @@ impl Vcpu {
         self.guest.set_nmi_window(true);
     }
 
+    /// Its registers and what is on its way into it, for a VM's state
+    /// (`vmstate`): the shadow's (`crate::state`), read whole first off its
+    /// VMCS -- which is current on the host CPU it last ran on, the one this
+    /// is to be called on -- CR4 as it reads it, CR8, DR0-DR3, its x87, SSE
+    /// and AVX registers, its own MSRs, the event queued for its next entry,
+    /// its interrupt shadow, its NMI blocking and its debug exceptions
+    /// pending.
+    pub fn save_regs(&mut self) -> vmstate::Result<vmstate::Regs> {
+        if !self.guest.read_for_save() {
+            return Err(vmstate::Error("a CPU's state asked of a host CPU its VMCS is not current on"));
+        }
+        let mut r = vmstate::Regs::zeroed();
+        crate::state::save_common(self.guest.save(), self.guest.regs(), &mut r);
+        r.cr4 = self.guest.save().cr4;
+        r.cr8 = self.cr8();
+        r.dr = *self.guest.debug_addrs();
+        let m = self.guest.msrs();
+        r.tsc_aux = m.tsc_aux();
+        r.spec_ctrl = m.spec_ctrl();
+        r.xcr0 = self.guest.xcr0();
+        let (area, pkru) = self.guest.fp_area();
+        r.xsave.try_reserve_exact(area.len()).map_err(|_| vmstate::Error("no memory for a CPU's registers"))?;
+        r.xsave.extend_from_slice(area);
+        r.pkru = pkru;
+        let (info, error) = self.guest.injection();
+        r.event = crate::state::event_of(info, error);
+        let bits = self.guest.interruptibility();
+        r.shadow = bits & (vmcs::INTR_BLOCK_STI | vmcs::INTR_BLOCK_MOV_SS) != 0;
+        r.nmi_blocked = bits & vmcs::INTR_BLOCK_NMI != 0;
+        r.pending_debug = self.guest.pending_debug();
+        Ok(r)
+    }
+
+    /// Made what `r` says -- a guest CPU restored -- the whole of it written
+    /// into its VMCS at its next entry, with what its VPID had cached
+    /// dropped: every register checked first (`crate::state`), the XSAVE
+    /// area by what this CPU's XRSTOR takes, its own MSRs by what the CPU's
+    /// hold. What the CPU's own checks at that entry find is the rest: a
+    /// state they refuse stops the guest there, saying so.
+    pub fn restore_regs(&mut self, r: &vmstate::Regs) -> vmstate::Result<()> {
+        crate::state::check(r)?;
+        if !self.guest.import_fp(&r.xsave, r.xcr0, r.pkru) {
+            return Err(vmstate::Error("x87, SSE and AVX registers this CPU's XRSTOR would refuse"));
+        }
+        if !self.guest.msrs_mut().set(r.tsc_aux, r.spec_ctrl, false) {
+            return Err(vmstate::Error("a TSC_AUX or SPEC_CTRL this CPU's MSRs would refuse"));
+        }
+        if !self.guest.set_pending_debug(r.pending_debug) {
+            return Err(vmstate::Error("debug exceptions pending that VT-x has no bits for"));
+        }
+        {
+            let (s, g) = self.guest.save_and_regs_mut();
+            crate::state::restore_common(r, s, g)?;
+            s.cr4 = r.cr4;
+        }
+        self.set_cr8(r.cr8);
+        *self.guest.debug_addrs_mut() = r.dr;
+        match &r.event {
+            Some(e) => {
+                let (bits, error) = crate::state::event_bits(e);
+                self.guest.set_inject(bits, error.unwrap_or(0));
+            }
+            None => self.guest.clear_inject(),
+        }
+        /* An interrupt shadow is STI's where interrupts are on, MOV SS's
+         * where they are off -- the entry refuses STI's then -- and an NMI on
+         * its way in is not blocked by itself (`requeue_event`). */
+        let mut bits = 0;
+        if r.shadow {
+            bits |= if r.rflags & (1 << 9) != 0 { vmcs::INTR_BLOCK_STI } else { vmcs::INTR_BLOCK_MOV_SS };
+        }
+        let nmi_coming = r.event.is_some_and(|e| e.kind == vmstate::EventKind::Nmi);
+        if r.nmi_blocked && !nmi_coming {
+            bits |= vmcs::INTR_BLOCK_NMI;
+        }
+        self.guest.set_interruptibility(bits);
+        self.guest.set_irq_window(false);
+        self.guest.set_nmi_window(false);
+        self.guest.mark_full_sync();
+        Ok(())
+    }
+
+    /// The guest's TSC from its next entry on: the host's plus `offset`.
+    pub fn set_tsc_offset(&mut self, offset: u64) {
+        self.guest.set_tsc_offset(offset);
+    }
+
+    pub fn tsc_offset(&self) -> u64 {
+        self.guest.tsc_offset()
+    }
+
     /// Whether this CPU can run a guest in real mode: an application
     /// processor, which a start-up IPI starts there.
     pub fn unrestricted(&self) -> bool {

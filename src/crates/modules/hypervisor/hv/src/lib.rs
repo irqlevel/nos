@@ -75,6 +75,10 @@ mod provider;
 #[cfg(target_arch = "x86_64")]
 mod relay;
 #[cfg(target_arch = "x86_64")]
+mod migrate;
+#[cfg(target_arch = "x86_64")]
+mod save;
+#[cfg(target_arch = "x86_64")]
 mod store;
 #[cfg(target_arch = "x86_64")]
 mod vmlog;
@@ -185,6 +189,17 @@ hv stop <vm|all> [secs=N]          press its power button and give it secs (30) 
                                    the list -- secs=0 stops it without asking. rmmod hv,
                                    and nos's poweroff and reboot, stop all of them so,
                                    given what insmod hv.ko was as stop_secs=N (120)
+hv save <vm> <file>                a vm of a folder paused, its state and memory written
+                                   into a new file, and off the list
+hv restore <file>                  the vm the file names, its folder's machine running
+                                   again from the state -- the file taken away as it does
+hv migrate <vm> <host> [cold]      a running vm moved to another host of the cluster: its
+                                   written disks volumes of NBS's, its NIC on a network of
+                                   the cluster's; paused while its memory, state and folder
+                                   go, then run there -- or on here, and why
+hv logcheck <vm> [rounds=N]        the dirty log a migration copies by, held to a running vm
+                                   on this host's CPUs: its memory copied in rounds as it
+                                   runs, then paused, and the copy held to it page by page
 hv forward [add <port> <vm> <guest-port> | del <port>]
                                    a port of nos's relayed to a guest's (net guests) -- and
                                    kept in, or taken out of, a vm's vm.toml when it has one;
@@ -245,6 +260,10 @@ struct Hv {
     /// go of, and not in whatever order the fields happen to be in. No call
     /// of it is running by then: the loader waits those out before the drop.
     cmd: Option<Command>,
+    /// The task that takes VMs in from other hosts (`migrate`): stopped
+    /// before the guests are, so that none comes in as they go.
+    #[cfg(target_arch = "x86_64")]
+    migrate: Option<kcore::task::TaskHandle>,
     state: Arc<State>,
 }
 
@@ -274,6 +293,12 @@ impl Hv {
              * the guests by. */
             drop(self.fw_provider.take());
             drop(self.provider.take());
+            /* A VM coming in from another host given up -- or, past its
+             * handover, started -- and the task waited out */
+            if let Some(task) = self.migrate.take() {
+                task.request_stop();
+                drop(task);
+            }
             self.state.forwards.close();
             self.state.probes.close();
             self.state.vms.close(self.state.stop_secs);
@@ -466,12 +491,23 @@ fn init(given: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn 
         Err(e) => kcore::klog!(0, "hv: loaded -- no guest can run here: {}", e),
     }
 
+    /* VMs taken in from other hosts: refused only where there is no task to
+     * be had, which the module runs without, said */
+    #[cfg(target_arch = "x86_64")]
+    let migrate = migrate::start(state.clone());
+    #[cfg(target_arch = "x86_64")]
+    if migrate.is_none() {
+        kcore::klog!(0, "hv: no task to take VMs in from other hosts: none can move here");
+    }
+
     Ok(Box::new(Hv {
         #[cfg(target_arch = "x86_64")]
         provider,
         #[cfg(target_arch = "x86_64")]
         fw_provider,
         cmd: Some(cmd),
+        #[cfg(target_arch = "x86_64")]
+        migrate,
         state,
     }))
 }
@@ -521,6 +557,8 @@ fn command(state: &State, args: &str, out: &mut Output) {
         }
         "info" => {
             let _ = machine.caps().report(out);
+            #[cfg(target_arch = "x86_64")]
+            migrate::model_report(out);
             pool_report(out);
             status(machine, out);
             #[cfg(target_arch = "x86_64")]
@@ -576,6 +614,14 @@ fn command(state: &State, args: &str, out: &mut Output) {
         #[cfg(target_arch = "x86_64")]
         "stop" => state.vms.stop(rest, out, &state.forwards),
         #[cfg(target_arch = "x86_64")]
+        "save" => save::save_command(&state.vms, &state.forwards, rest, out),
+        #[cfg(target_arch = "x86_64")]
+        "restore" => save::restore_command(machine, &state.cores, &state.forwards, &state.vms, &state.vms_root, rest, out),
+        #[cfg(target_arch = "x86_64")]
+        "migrate" => migrate::command(state, rest, out),
+        #[cfg(target_arch = "x86_64")]
+        "logcheck" => migrate::logcheck_command(state, rest, out),
+        #[cfg(target_arch = "x86_64")]
         "forward" => forward_command(state, rest, out),
         #[cfg(target_arch = "x86_64")]
         "fw" => state.vms.firewalls.command(&state.vms_root, &state.vms, rest, out),
@@ -590,7 +636,8 @@ fn command(state: &State, args: &str, out: &mut Output) {
         },
         #[cfg(not(target_arch = "x86_64"))]
         "boot" | "start" | "create" | "image" | "clone" | "delete" | "vms" | "list" | "console" | "attach" | "send"
-        | "exec" | "wait" | "restart" | "stop" | "forward" | "bench" | "cores" | "fw" | "probe" | "tunnel" => {
+        | "exec" | "wait" | "restart" | "stop" | "forward" | "bench" | "cores" | "fw" | "probe" | "tunnel" | "save"
+        | "restore" | "migrate" | "logcheck" => {
             let _ = writeln!(out, "hv: no Linux guest on this architecture yet");
         }
         other => {

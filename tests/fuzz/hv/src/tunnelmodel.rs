@@ -222,15 +222,18 @@ enum Seen {
     Nat,
     NatOut,
     PortMoved,
+    Migrated,
+    CarriedOn,
 }
 
-const SEEN: [&str; 18] = ["datagrams sealed", "packets out of the tunnel", "delivered on their host", "replays",
+const SEEN: [&str; 20] = ["datagrams sealed", "packets out of the tunnel", "delivered on their host", "replays",
                           "forgeries", "damaged", "lost", "ports moved", "tunnels started anew", "inputs settled",
                           "sealed by a host for another's port", "keys' messages again", "narrow ways said",
                           "the world's packets in through the tunnel", "guests' packets out of the uplink",
-                          "inputs behind a NAT", "out of the NAT's other address", "hosts' tunnel ports moved"];
+                          "inputs behind a NAT", "out of the NAT's other address", "hosts' tunnel ports moved",
+                          "ports migrated", "packets carried on by a port's old host"];
 
-static COUNTS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+static COUNTS: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
 
 fn seen(what: Seen) {
     COUNTS[what as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -297,7 +300,21 @@ struct World {
     narrow_check: bool,
     /// The packets of guests' that went out of the uplink.
     out_seen: BTreeSet<u64>,
+    /// Each port's last migration, while its marks may last: the host it
+    /// went to, the host it came from, and the clock then
+    /// (`Switch::came_here`); and every host's marks of ports moved away
+    /// from it: host, network, address, the clock then (`moved_away`).
+    came: Vec<Option<(usize, usize, u64)>>,
+    away: Vec<(usize, u32, u32, u64)>,
+    /// Every host that ever had a port marked moved away, with the port:
+    /// what it may have carried on -- a datagram the wire holds arriving
+    /// long after the mark is gone.
+    carried_on_by: BTreeSet<(usize, u32, u32)>,
 }
+
+/// How long a migration's marks last, and what the clock may have read past
+/// the moment the model took for one (`switch::MOVED_NS`).
+const MARK_NS: u64 = crate::switch::MOVED_NS + NS_PER_SEC;
 
 /// What a narrow way carries at most: an echo of the networks' MTU does
 /// not get through it, a small one does.
@@ -328,6 +345,7 @@ impl World {
             wire: VecDeque::new(), history: Vec::new(), mail: BTreeMap::new(), keys: Vec::new(),
             sealed: BTreeSet::new(), sent: BTreeMap::new(), delivered: BTreeSet::new(), next_id: 1,
             narrowed: None, narrow_check: r.u8() < 64, out_seen: BTreeSet::new(),
+            came: vec![None; PORTS.len()], away: Vec::new(), carried_on_by: BTreeSet::new(),
         };
         /* The uplink NAT goes out by, and its gateway's MAC; and who
          * hands what in to `hv0` */
@@ -526,6 +544,12 @@ impl World {
 
     /// Port `i` taken on host `h`'s switch, a VM behind it.
     fn claim(&mut self, i: usize, h: usize) {
+        /* Its address here again: the host's marks of it gone (`claim_vnet`) */
+        let (vni, addr, _) = PORTS[i];
+        self.away.retain(|a| !(a.0 == h && a.1 == vni && a.2 == addr));
+        if self.came[i].is_some_and(|c| c.0 == h) {
+            self.came[i] = None;
+        }
         let vm = Arc::new(Shared::default());
         let p = self.hosts[h].sw.claim_vnet(&vm, &identity(i), PLACE).expect("a port of the cluster's");
         let b = self.hosts[h].sw.backend(p);
@@ -628,10 +652,14 @@ impl World {
         listener.on_frame(Lent::lend(&bytes), &mut RxContext::for_the_target());
         drop(listener);
         let after = underlay::take_sent(self.hosts[to].nic);
+        /* A port's packet carried on, by a host it moved away from a moment
+         * ago, is the one other datagram a host sends as it takes one */
+        let now = crate::time::peek();
+        let carrying_on = self.away.iter().any(|a| a.0 == to && now <= a.3 + MARK_NS);
         for f in after.iter() {
             let kind = f.get(ETH + IP + UDP).copied().and_then(Kind::of);
-            invariant!(kind == Some(Kind::EchoAnswer), "{} sent a datagram of kind {:?} as it took one: from the \
-                       tunnel into it", NAMES[to], kind);
+            invariant!(kind == Some(Kind::EchoAnswer) || carrying_on && kind == Some(Kind::PortToPort),
+                       "{} sent a datagram of kind {:?} as it took one: from the tunnel into it", NAMES[to], kind);
         }
         self.put_on_wire(to, after);
         self.drain(to, Some(sealer));
@@ -682,14 +710,23 @@ impl World {
                    NAMES[h]);
         };
         let src = be32(frame, ETH + 12);
-        invariant!(s.host == o, "packet {} sealed by {} reached {} out of a datagram of {}'s", id, NAMES[s.host],
-                   NAMES[h], NAMES[o]);
+        /* Or carried on by a host the port moved away from -- while its
+         * mark lasted, though the wire may hand it on long after -- and
+         * taken here as the port came from that host a moment ago, or by
+         * the table: its sender's port on that host now */
+        let now = crate::time::peek();
+        let came = self.came[i].is_some_and(|(to, from, at)| to == h && from == o && now <= at + MARK_NS);
+        let its = self.hosts[h].table.iter().any(|r| r.vni == vni && r.address == src && r.node == node(o));
+        let carried_on = s.kind == Kind::PortToPort && self.carried_on_by.contains(&(o, vni, addr));
+        invariant!(s.host == o || carried_on && (came || its),
+                   "packet {} sealed by {} reached {} out of a datagram of {}'s", id, NAMES[s.host], NAMES[h], NAMES[o]);
         match s.kind {
             Kind::PortToPort => {
-                invariant!(self.hosts[h].table.iter().any(|r| r.vni == vni && r.address == src && r.node == node(o)),
+                let elsewhere = self.hosts[h].table.iter().any(|r| r.vni == vni && r.address == src);
+                invariant!(its || came && elsewhere,
                            "packet {} from {:#x} reached {}, whose table has no port at {:#x} of {} on {}", id, src,
                            NAMES[h], src, vni, NAMES[o]);
-                seen(Seen::Delivered);
+                seen(if its && s.host == o { Seen::Delivered } else { Seen::CarriedOn });
             }
             Kind::GatewayToPort => {
                 invariant!(self.hosts[h].ways.get(&i) == Some(&node(o)),
@@ -853,6 +890,7 @@ impl World {
 
     fn hand(&mut self, from: usize, to: usize, data: &[u8]) {
         let msg = Message::decode(data).expect("a message");
+
         ipc::set_current(to);
         let now = crate::time::boot_time_ns();
         self.hosts[to].tunnel.on_message(NAMES[from], &msg, now);
@@ -941,6 +979,7 @@ impl World {
         if from == to {
             return;
         }
+
         if let Some((p, _, b)) = self.slots[i].take() {
             drop(b);
             self.hosts[from].sw.release(p);
@@ -950,6 +989,34 @@ impl World {
         self.generation[i] += 1;
         self.publics();
         seen(Seen::Moved);
+    }
+
+    /// Port `i`'s VM migrated to host `to`: its old host marks it moved
+    /// away before it gives its port up, the new one claims it and marks
+    /// where it came from (migrate.rs) -- and no host's table told, as
+    /// none is until vnet's keepers turn.
+    fn migrated(&mut self, i: usize, to: usize) {
+        let from = self.at[i];
+        if from == to {
+            return;
+        }
+        let (vni, addr, _) = PORTS[i];
+        self.hosts[from].sw.moved_away(vni, addr, node(to));
+        if let Some((p, _, b)) = self.slots[i].take() {
+            drop(b);
+            self.hosts[from].sw.release(p);
+        }
+        self.drain(from, None);
+        self.claim(i, to);
+        self.hosts[to].sw.came_here(vni, addr, node(from));
+        let now = crate::time::peek();
+        self.away.retain(|a| !(a.0 == from && a.1 == vni && a.2 == addr));
+        self.away.push((from, vni, addr, now));
+        self.carried_on_by.insert((from, vni, addr));
+        self.came[i] = Some((to, from, now));
+        self.generation[i] += 1;
+        self.publics();
+        seen(Seen::Migrated);
     }
 
     /// Host `h` seals a packet its guests did not send: from a port that is
@@ -1155,8 +1222,13 @@ pub fn tunnel_target(r: &mut Input) {
     crate::network::reset();
     underlay::reset();
     let mut w = World::new(r);
-    while let Some(op) = r.op(19) {
+    while let Some(op) = r.op(20) {
         match op {
+            19 => {
+                let i = r.below(PORTS.len() as u64) as usize;
+                let to = r.below(HOSTS as u64) as usize;
+                w.migrated(i, to);
+            }
             18 => w.port_moved(r),
             16 => {
                 let k = r.below(PUBLICS.len() as u64) as usize;

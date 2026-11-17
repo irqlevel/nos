@@ -74,6 +74,7 @@ use kcore::sync::{Mutex, MutexGuard};
 use kcore::task::TaskHandle;
 use kcore::time::Duration;
 use kcore::trace::DiskHow;
+use nbsdrive::NotTaken;
 
 /// Whoever runs a guest's vCPU, told that one of its disks has served
 /// something for it: from the disk's task, while the vCPU may be halted --
@@ -284,6 +285,12 @@ trait Media: Send + Sync {
     fn flush(&self) -> bool;
     fn discard(&self, offset: u64, len: u64) -> bool;
     fn write_zeroes(&self, offset: u64, len: u64, unmap: bool) -> bool;
+    /// The volume of NBS's this is, and its session's generation: a
+    /// migration's handover's (`blk::Backend::writer`). None for the host's
+    /// own media.
+    fn writer(&self) -> Option<(&str, u64)> {
+        None
+    }
 }
 
 /// A buffer of a disk's lent to its device between requests: a queue's of
@@ -403,38 +410,45 @@ struct Volume {
 
 impl Volume {
     /// Volume `name` attached on this host -- read-only, or for writing and
-    /// with `force` taken from a writer elsewhere -- its session serving.
-    fn open(name: &str, read_only: bool, force: bool) -> Result<Volume, String> {
-        let me = nbsdrive::this_host()?;
-        let event = SharedEvent::new().ok_or_else(|| String::from("no event for its session"))?;
+    /// with `force` taken from a writer elsewhere, or with `handover`'s
+    /// generation and token from the writer of that generation alone, a
+    /// migration's -- its session serving.
+    fn open(name: &str, read_only: bool, force: bool, handover: Option<(u64, u64)>) -> Result<Volume, NotTaken> {
+        let unknown = NotTaken::Unknown;
+        let me = nbsdrive::this_host().map_err(unknown)?;
+        let event = SharedEvent::new().ok_or_else(|| unknown(String::from("no event for its session")))?;
         /* Everything the disk needs first, its 16 MiB of buffers above all,
          * and the attach last: once attached for writing, a new generation
          * taken and every chunk server fenced, only the drop of a `Volume`
          * holding the drive lets go of it -- a failure after the attach
          * left the volume attached here, refused to readers and to another
          * host without `force`. */
+        let oom = |what: &str| unknown(alloc::format!("out of memory{}", what));
         let mut slots = Vec::new();
-        slots.try_reserve_exact(blk::IN_FLIGHT).map_err(|_| String::from("out of memory for its buffers"))?;
+        slots.try_reserve_exact(blk::IN_FLIGHT).map_err(|_| oom(" for its buffers"))?;
         for _ in 0..blk::IN_FLIGHT {
             let mut buf = Vec::new();
-            buf.try_reserve_exact(blk::REQUEST_BYTES).map_err(|_| String::from("out of memory for its buffers"))?;
+            buf.try_reserve_exact(blk::REQUEST_BYTES).map_err(|_| oom(" for its buffers"))?;
             buf.resize(blk::REQUEST_BYTES, 0);
-            slots.push(Mutex::new(buf).ok_or_else(|| String::from("out of memory for its buffers"))?);
+            slots.push(Mutex::new(buf).ok_or_else(|| oom(" for its buffers"))?);
         }
         let mut owned = String::new();
-        owned.try_reserve_exact(name.len()).map_err(|_| String::from("out of memory"))?;
+        owned.try_reserve_exact(name.len()).map_err(|_| oom(""))?;
         owned.push_str(name);
         let volume = Volume {
             name: owned,
-            drive: Mutex::new(None).ok_or_else(|| String::from("out of memory"))?,
+            drive: Mutex::new(None).ok_or_else(|| oom(""))?,
             slots,
-            tags: Mutex::new([None; blk::IN_FLIGHT]).ok_or_else(|| String::from("out of memory"))?,
+            tags: Mutex::new([None; blk::IN_FLIGHT]).ok_or_else(|| oom(""))?,
             event,
             handed: AtomicBool::new(false),
         };
         /* Its session named under hv's namespace, for its writes' chains
            to answer at (N13) */
-        let drive = nbsdrive::Drive::open_on(name, &me, !read_only, force, &volume.event, Some("hv"))?;
+        let drive = match handover {
+            Some((expect, token)) => nbsdrive::Drive::open_handover(name, &me, expect, token, &volume.event, Some("hv"))?,
+            None => nbsdrive::Drive::open_on(name, &me, !read_only, force, &volume.event, Some("hv")).map_err(unknown)?,
+        };
         *volume.drive.lock() = Some(drive);
         Ok(volume)
     }
@@ -491,6 +505,11 @@ impl Volume {
 }
 
 impl Media for Volume {
+    fn writer(&self) -> Option<(&str, u64)> {
+        let (_, _, generation) = self.shape();
+        (generation != 0).then_some((self.name.as_str(), generation))
+    }
+
     fn lend(&self, k: usize) -> Option<Buf<'_>> {
         self.slots.get(k).map(|s| Buf::Own(s.lock()))
     }
@@ -644,11 +663,35 @@ impl QueuedDisk {
     /// disk's letter.
     pub fn open(word: &str, read_only: bool, force: bool, runner: &Runner, index: u8)
         -> Result<QueuedDisk, String> {
+        Self::open_as(word, read_only, force, None, runner, index).map_err(NotTaken::said)
+    }
+
+    /// The volume of NBS's `word` names (`nbs:<volume>`), for writing, taken
+    /// from the writer of generation `expect` alone, the take's `token` the
+    /// same each time it is asked again -- a migration's handover
+    /// (plans/vm-migration.md): refused, nothing attached, where its writer
+    /// is another (`NotTaken::Refused`), and anything else not known to be
+    /// either (`NotTaken::Unknown`).
+    pub fn open_handover(word: &str, expect: u64, token: u64, runner: &Runner, index: u8)
+        -> Result<QueuedDisk, NotTaken> {
+        if !matches!(crate::devices::source(word), crate::devices::Source::Volume(_)) || expect == 0 || token == 0 {
+            return Err(NotTaken::Unknown(alloc::format!("{}: no volume of NBS's to take over", word)));
+        }
+        Self::open_as(word, false, false, Some((expect, token)), runner, index)
+    }
+
+    fn open_as(word: &str, read_only: bool, force: bool, handover: Option<(u64, u64)>, runner: &Runner, index: u8)
+        -> Result<QueuedDisk, NotTaken> {
         let served = match crate::devices::source(word) {
-            crate::devices::Source::File(path) => open_file(path, read_only, runner)?,
-            crate::devices::Source::Volume(name) => open_volume(name, read_only, force)?,
-            _ => open_device(word, read_only, runner)?,
+            crate::devices::Source::File(path) => open_file(path, read_only, runner).map_err(NotTaken::Unknown)?,
+            crate::devices::Source::Volume(name) => open_volume(name, read_only, force, handover)?,
+            _ => open_device(word, read_only, runner).map_err(NotTaken::Unknown)?,
         };
+        Self::serve_on(word, served, read_only, runner, index).map_err(NotTaken::Unknown)
+    }
+
+    /// `served`, `word`'s, served by a task of its own on `runner`'s CPU.
+    fn serve_on(word: &str, served: Served, read_only: bool, runner: &Runner, index: u8) -> Result<QueuedDisk, String> {
 
         let mut todo = VecDeque::new();
         let mut done = VecDeque::new();
@@ -689,11 +732,14 @@ impl QueuedDisk {
 /// cs's fenced, what its last writer left open reconciled -- its blocks
 /// the volume's 4 KiB, which every request it is handed is whole ones of,
 /// the guest shown 512-byte sectors (`blk::Pad`).
-fn open_volume(name: &str, read_only: bool, force: bool) -> Result<Served, String> {
-    let v = Volume::open(name, read_only, force).map_err(|e| alloc::format!("nbs:{}: {}", name, e))?;
+fn open_volume(name: &str, read_only: bool, force: bool, handover: Option<(u64, u64)>) -> Result<Served, NotTaken> {
+    let v = Volume::open(name, read_only, force, handover).map_err(|e| match e {
+        NotTaken::Refused => NotTaken::Refused,
+        NotTaken::Unknown(why) => NotTaken::Unknown(alloc::format!("nbs:{}: {}", name, why)),
+    })?;
     let (size, number, generation) = v.shape();
     if size == 0 {
-        return Err(alloc::format!("nbs:{}: no blocks", name));
+        return Err(NotTaken::Unknown(alloc::format!("nbs:{}: no blocks", name)));
     }
     kcore::klog!(1, "hv: nbs:{} (volume {}) attached, generation {}", name, number, generation);
     Ok(Served { queue: Arc::new(v), size, discard_sectors: blk::DISCARD_ALIGNMENT, discards: false,
@@ -810,6 +856,10 @@ impl blk::Backend for QueuedDisk {
         /* Into the room taken at `open`: the device never has more out. */
         self.pipe.requests.lock().todo.push_back(req);
         self.queue.wake();
+    }
+
+    fn writer(&self) -> Option<(&str, u64)> {
+        self.queue.writer()
     }
 
     fn take(&mut self) -> Option<Request> {
