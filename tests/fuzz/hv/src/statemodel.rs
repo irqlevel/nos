@@ -31,6 +31,7 @@ pub fn vmstate_target(r: &mut Input) {
             let bytes = s.encode().expect("a state encodes");
             let back = VmState::decode(&bytes);
             invariant!(back.as_ref() == Ok(&s), "a state read back is not the one written: {:?}", back.err());
+            as_version_1(&s, &bytes, r.bool());
             /* Its bytes changed, a byte at a time, cut short, grown. */
             while let Some(op) = r.op(3) {
                 let mut b = bytes.clone();
@@ -66,6 +67,50 @@ fn hostile(bytes: &[u8]) {
         let back = VmState::decode(&again);
         invariant!(back.as_ref() == Ok(&s), "a state read, written and read again is another");
     }
+}
+
+/// `s`, written as version 1 wrote it -- its bytes, `bytes`, version 2's,
+/// with the version 1 and the UART's last fields taken out, a "ESC [ 6" of
+/// version 1's in place of a sequence of the one parameter 6 where `csi6`
+/// -- read as `s` with what version 2 added at its default: a state of a
+/// host not yet updated, moved to one that is.
+fn as_version_1(s: &VmState, bytes: &[u8], csi6: bool) {
+    let u = &s.platform.uart;
+    let mut want = s.clone();
+    {
+        let w = &mut want.platform.uart;
+        w.saved_col = None;
+        if w.esc == ESC_CSI {
+            w.csi = if csi6 { [6, 0] } else { [0; CSI_PARAMS] };
+            w.csi_n = u8::from(csi6);
+        }
+    }
+    /* The parts after the magic and the version, to the platform's */
+    let le32 = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+    let mut at = 8 + 2;
+    while bytes[at] != 3 {
+        at += 5 + le32(&bytes[at + 1..]);
+    }
+    let len = le32(&bytes[at + 1..]);
+    let uart_v1 = 6 + 8 + 1 + usize::from(u.loopback.is_some()) + 1 + usize::from(u.rx.is_some()) + 1 + 2 + 1
+        + REPLY_MAX + 1 + 3;
+    let tail = 2 * CSI_PARAMS + 1 + 1 + if u.saved_col.is_some() { 2 } else { 0 };
+    let body = at + 5;
+    let mut v1 = Vec::with_capacity(bytes.len());
+    v1.extend_from_slice(&bytes[..8]);
+    v1.extend_from_slice(&1u16.to_le_bytes());
+    v1.extend_from_slice(&bytes[10..at + 1]);
+    v1.extend_from_slice(&((len - tail) as u32).to_le_bytes());
+    v1.extend_from_slice(&bytes[body..body + uart_v1]);
+    v1.extend_from_slice(&bytes[body + uart_v1 + tail..]);
+    /* The UART's escape byte, version 1's 3 for a sequence of 6 */
+    let esc_at = body + 6 + 8 + 1 + usize::from(u.loopback.is_some()) + 1 + usize::from(u.rx.is_some());
+    invariant!(v1[esc_at] == u.esc, "the UART's escape not where version 1 has it");
+    if u.esc == ESC_CSI && csi6 {
+        v1[esc_at] = ESC_CSI6_V1;
+    }
+    let back = VmState::decode(&v1);
+    invariant!(back.as_ref() == Ok(&want), "a state of version 1 not read as it was: {:?}", back.err());
 }
 
 /* ---- a state of the input's, every field inside its bounds ---- */
@@ -224,9 +269,14 @@ fn cpu(r: &mut Input, index: u32) -> Cpu {
 
 fn uart(r: &mut Input) -> Uart {
     let reply_len = r.below(REPLY_MAX as u64 + 1) as u8;
+    /* Version 1's "ESC [ 6" (3) is no state version 2 writes */
+    let esc = r.pick(&[ESC_TEXT, ESC_START, ESC_CSI, ESC_CSI_OTHER]);
+    let csi_n = if esc == ESC_CSI { r.below(CSI_PARAMS as u64 + 1) as u8 } else { 0 };
+    let csi = core::array::from_fn(|i| if i < usize::from(csi_n) { r.u16() } else { 0 });
     Uart {
         dll: r.u8(), dlm: r.u8(), ier: r.u8(), lcr: r.u8(), mcr: r.u8(), scr: r.u8(), written: r.u64(),
-        loopback: r.bool().then(|| r.u8()), rx: r.bool().then(|| r.u8()), esc: r.below(5) as u8, col: r.u16(),
+        loopback: r.bool().then(|| r.u8()), rx: r.bool().then(|| r.u8()), esc, col: r.u16(), csi, csi_n,
+        saved_col: r.bool().then(|| r.u16()),
         reply: core::array::from_fn(|_| r.u8()), reply_len, reply_pos: r.below(u64::from(reply_len) + 1) as u8,
         prompt_seen: r.bool(), thri: r.bool(), pulse: r.bool(),
     }
@@ -288,7 +338,7 @@ fn device(r: &mut Input) -> Device {
 
 /* ---- one field past its bound ---- */
 
-const BOUNDS: usize = 27;
+const BOUNDS: usize = 30;
 
 /// Field `which` of `s` put one past its bound: false where `s` has none of
 /// that field (no device, no event) to put there.
@@ -360,6 +410,28 @@ fn past_bound(s: &mut VmState, which: usize, r: &mut Input) -> bool {
                 s.vm.ranges.push(Range { base: first.base, size: first.size });
             }
         },
+        27 => {
+            /* Version 2 has no "ESC [ 6" of version 1's */
+            let u = &mut s.platform.uart;
+            (u.esc, u.csi, u.csi_n) = (ESC_CSI6_V1, [0; CSI_PARAMS], 0);
+        }
+        28 => {
+            let u = &mut s.platform.uart;
+            u.esc = ESC_CSI;
+            u.csi_n = CSI_PARAMS as u8 + 1 + r.below(8) as u8;
+        }
+        29 => {
+            /* Parameters where no sequence is followed, or past those begun */
+            let u = &mut s.platform.uart;
+            if r.bool() {
+                u.esc = r.pick(&[ESC_TEXT, ESC_START, ESC_CSI_OTHER]);
+                u.csi_n = 1;
+            } else {
+                u.esc = ESC_CSI;
+                u.csi_n = 0;
+                u.csi[r.below(CSI_PARAMS as u64) as usize] = 1 + r.below(u64::from(u16::MAX)) as u16;
+            }
+        }
         _ => match r.below(3) {
             0 => s.vm.rx_moderation_ns = 1_000_000_001 + r.below(1 << 40),
             1 => s.vm.tsc_hz = 0,

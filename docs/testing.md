@@ -1288,7 +1288,8 @@ concurrency is not.
 A migration's (plans/vm-migration.md) has four targets of its own.
 `vmstate`: a VM's state (`common/vm/vmstate`) from hostile bytes -- refused
 or read, never a panic, what reads writing back the same -- every state the
-input makes read back as written, its bytes then changed, cut and grown, and
+input makes read back as written, and as version 1 wrote it (what version 2
+added cut out of its bytes) read back as it with that at its default, its bytes then changed, cut and grown, and
 each field's bound one past refused (a CR8 bound taken out is caught); and
 a CPU's registers through `state.rs`'s `restore_common` and the backends'
 save into a fresh CPU and out again, the same (EFER left out of the restore
