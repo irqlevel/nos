@@ -101,6 +101,7 @@ const VERSION: u32 = 0x14 | (((LVT_ENTRIES - 1) as u32) << 16);
 
 /* The local vector table, in the order of its MSRs from 0x832. */
 const LVT_ENTRIES: usize = 6;
+const _: () = assert!(LVT_ENTRIES <= vmstate::LVT_MAX && WORDS as usize == vmstate::WORDS);
 const LVT_TIMER: usize = 0;
 const LVT_LINT0: usize = 3;
 const LVT_LINT1: usize = 4;
@@ -558,6 +559,71 @@ impl Lapic {
 
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    /// What it holds, for a VM's state at `now` (`vmstate`): its timer's
+    /// start and its next edge as times from then.
+    pub fn save(&self, now: u64) -> vmstate::Lapic {
+        let mut lvt = [0u32; vmstate::LVT_MAX];
+        lvt[..LVT_ENTRIES].copy_from_slice(&self.lvt);
+        let t = &self.timer;
+        vmstate::Lapic {
+            id: self.id, base: self.base, tpr: self.tpr, svr: self.svr, isr: self.isr, irr: self.irr, tmr: self.tmr,
+            esr: self.esr, esr_pending: self.esr_pending, icr: self.icr, lvt, lvt_len: LVT_ENTRIES as u8,
+            timer_initial: t.initial, timer_divide: t.divide, timer_counted: t.counted,
+            timer_loaded_ago_ns: now.saturating_sub(t.loaded_ns),
+            timer_due_in_ns: t.deadline.map(|d| d.saturating_sub(now)), tsc_deadline: self.tsc_deadline,
+            ldr: self.ldr, dfr: self.dfr,
+        }
+    }
+
+    /// Its timer moved on by `delta` (`LinuxGuest::rebase`): where it was
+    /// loaded and its next edge, host nanoseconds.
+    pub fn shift(&mut self, delta: u64) {
+        let t = &mut self.timer;
+        t.loaded_ns = t.loaded_ns.saturating_add(delta);
+        t.deadline = t.deadline.map(|d| d.saturating_add(delta));
+    }
+
+    /// Made what `s` says, its timer going on from `now` as it stood: every
+    /// register one a guest's writes could have left, on the APIC of the
+    /// same CPU -- or refused.
+    pub fn restore(&mut self, s: &vmstate::Lapic, now: u64) -> vmstate::Result<()> {
+        let bad = |what| Err(vmstate::Error(what));
+        if s.id != self.id {
+            return bad("a local APIC restored onto another CPU's");
+        }
+        let mode = s.base & (BASE_EN | BASE_EXTD);
+        if s.base & !(BASE_ADDRESS | BASE_BSP | BASE_EXTD | BASE_EN) != 0 || s.base & BASE_ADDRESS != DEFAULT_BASE
+            || mode == BASE_EXTD || s.base & BASE_BSP != self.base & BASE_BSP
+        {
+            return bad("an APIC base no write leaves");
+        }
+        if s.svr & !SVR_WRITABLE != 0 || usize::from(s.lvt_len) != LVT_ENTRIES
+            || s.lvt[..LVT_ENTRIES].iter().zip(LVT_WRITABLE).any(|(&e, w)| e & !w != 0)
+            || s.timer_divide & !DIVIDE_WRITABLE != 0 || s.ldr & !LDR_MASK != 0
+            || s.dfr | DFR_MODEL_MASK != DFR_RESET
+            || (s.esr | s.esr_pending) & !(ESR_SEND_ILLEGAL_VECTOR | ESR_RECEIVE_ILLEGAL_VECTOR) != 0
+        {
+            return bad("an APIC register with a bit no write leaves");
+        }
+        /* Vectors 0-15 are no interrupt's: none is ever requested or in
+         * service. */
+        if (s.irr[0] | s.isr[0] | s.tmr[0]) & 0xFFFF != 0 {
+            return bad("an APIC with a reserved vector requested or in service");
+        }
+        let mut lvt = [0u32; LVT_ENTRIES];
+        lvt.copy_from_slice(&s.lvt[..LVT_ENTRIES]);
+        *self = Lapic {
+            id: s.id, base: s.base, tpr: s.tpr, svr: s.svr, isr: s.isr, irr: s.irr, tmr: s.tmr, esr: s.esr,
+            esr_pending: s.esr_pending, icr: s.icr, lvt,
+            timer: Timer {
+                initial: s.timer_initial, divide: s.timer_divide, loaded_ns: now.saturating_sub(s.timer_loaded_ago_ns),
+                counted: s.timer_counted, deadline: s.timer_due_in_ns.map(|d| now.saturating_add(d)),
+            },
+            tsc_deadline: s.tsc_deadline, ldr: s.ldr, dfr: s.dfr,
+        };
+        Ok(())
     }
 
     /// On at all: IA32_APIC_BASE.EN. Off, the CPU takes the 8259's

@@ -374,7 +374,10 @@ impl App for Mds {
             (Ok(Answer::Attached { .. }), Kind::Detach) => Said::Detached { index },
             (Ok(Answer::Set { version }), Kind::Down) => Said::Down { version, index },
             (Ok(Answer::Refused(Refusal::LastReplica)), Kind::Down) => Said::LastReplica,
-            (Ok(Answer::Refused(Refusal::NotTheWriter)), Kind::Down | Kind::Copy) => Said::NotTheWriter,
+            /* An attach's, a handover's taken from a writer that is not the
+               one it named: said as itself, the one refusal its driver must
+               tell from no answer (plans/vm-migration.md) */
+            (Ok(Answer::Refused(Refusal::NotTheWriter)), Kind::Down | Kind::Copy | Kind::Attach) => Said::NotTheWriter,
             /* A copy-up's chunk (N10); a set being joined asked again */
             (Ok(Answer::Chunk { chunk, incarnation }), Kind::Copy) => Said::Chunk { chunk, incarnation, index },
             (Ok(Answer::Refused(why @ (Refusal::Joining | Refusal::Draining | Refusal::CopiesPending))), Kind::Copy) => {
@@ -741,8 +744,8 @@ impl Mds {
                 core.ask(self, cmd, Pending::App(Waiter::Snapshot));
                 return;
             }
-            Ask::Attach { name, writable, force, token } => {
-                (Command::Attach { name, host, writable, force, token }, Kind::Attach)
+            Ask::Attach { name, writable, force, token, expect } => {
+                (Command::Attach { name, host, writable, force, token, expect }, Kind::Attach)
             }
             Ask::Detach { name, generation, token } => (Command::Detach { name, host, generation, token }, Kind::Detach),
             Ask::Reattach { name, generation, token } => {

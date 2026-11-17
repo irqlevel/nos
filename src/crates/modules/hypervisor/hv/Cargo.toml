@@ -35,6 +35,8 @@ codec = { path = "../../../common/codec" }
 # sealed and opened, the window of counters a key has seen, the messages keys
 # go in -- no kernel in it, so tests/fuzz/hv holds it to a model.
 vnetwire = { path = "../../../common/net/vnetwire" }
+# The mailbox vnet tells of each change it applies (vnetmeta::KEEPER)
+vnetmeta = { path = "../../../common/net/vnetmeta" }
 # The tunnel's ChaCha20-Poly1305 (`aead.rs`): CRYPTOGAMS' assembly in the
 # kernel's SIMD sections, what vnetwire seals and opens by in hv.ko.
 crypto = { path = "../../../base/crypto" }
@@ -45,3 +47,9 @@ nbsdrive = { path = "../../storage/nbsdrive" }
 # a clone's checked before anything is downloaded or asked -- linked already,
 # through nbsdrive.
 nbsmeta = { path = "../../../common/storage/nbsmeta" }
+# A VM's state as bytes: what `hv save` writes and `hv restore` reads, and
+# what a migration carries to the other host (`save.rs`, `migrate.rs`).
+vmstate = { path = "../../../common/vm/vmstate" }
+# The messages of a VM's move between hosts, and its handover's decisions
+# (`migrate.rs`).
+migwire = { path = "../../../common/vm/migwire" }

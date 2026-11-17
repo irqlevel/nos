@@ -3,6 +3,8 @@
 //! way to read and write them.
 
 use alloc::vec::Vec;
+#[cfg(target_arch = "x86_64")]
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use hvarch::{Error, Result};
 use kcore::consts::PAGE_SIZE;
@@ -18,6 +20,8 @@ use crate::ept::Ept;
 use crate::npt::Npt;
 #[cfg(target_arch = "x86_64")]
 use hvarch::Vendor;
+
+use crate::dirty;
 
 /// The second-level translation, whichever the machine has: AMD's nested
 /// page table or Intel's extended one. Both are built the same way -- from
@@ -65,6 +69,35 @@ impl SecondLevel {
         match self {
             SecondLevel::Npt(t) => t.nested(),
             SecondLevel::Ept(t) => t.nested(),
+        }
+    }
+    fn renew(&mut self) -> u64 {
+        match self {
+            SecondLevel::Npt(t) => {
+                t.renew();
+                t.id()
+            }
+            SecondLevel::Ept(t) => {
+                t.renew();
+                t.id()
+            }
+        }
+    }
+}
+
+/// The dirty log's way to the table (`crate::dirty`).
+#[cfg(target_arch = "x86_64")]
+impl dirty::Table for SecondLevel {
+    fn protect(&mut self, gpa: u64) -> bool {
+        match self {
+            SecondLevel::Npt(t) => t.protect(gpa).is_ok(),
+            SecondLevel::Ept(t) => t.protect(gpa).is_ok(),
+        }
+    }
+    fn unprotect(&mut self, gpa: u64) -> bool {
+        match self {
+            SecondLevel::Npt(t) => t.unprotect(gpa).is_ok(),
+            SecondLevel::Ept(t) => t.unprotect(gpa).is_ok(),
         }
     }
 }
@@ -128,12 +161,21 @@ pub struct GuestMemory {
      * the table goes before the pages it maps are back on the free list. */
     #[cfg(target_arch = "x86_64")]
     table: Mutex<SecondLevel>,
-    /// The table's top level and identity, as an entry names them: neither
-    /// changes for as long as the table lives, so an entry reads them here
-    /// without the table's lock.
+    /// The table's top level, as an entry names it: it does not change for
+    /// as long as the table lives -- what a CPU knows its guest's memory by
+    /// (`vm::Cpu`) -- so an entry reads it here without the table's lock.
     #[cfg(target_arch = "x86_64")]
-    nested: hvarch::x86::svm::Nested,
+    root: u64,
+    /// The table's identity for the TLBs: new each time a migration's
+    /// dirty log narrows the table (`log_start`, `log_take`), and taken by
+    /// each entry, without the lock, as the one it enters over.
+    #[cfg(target_arch = "x86_64")]
+    id: AtomicU64,
     regions: Vec<Region>,
+    /// Which of its pages were written since the dirty log last looked
+    /// (`crate::dirty`): the host's writes marked here as they are made, the
+    /// guest's at its nested faults while the log looks after them.
+    log: dirty::Log,
     /// The page of all ones a guest's reads of an absent device find, and
     /// where it is mapped.
     absent: Mutex<Absent>,
@@ -187,8 +229,10 @@ impl GuestMemory {
         let nested = table.nested();
         Ok(Self {
             table: Mutex::new(table).ok_or(Error::NoMemory)?,
-            nested,
+            root: nested.root,
+            id: AtomicU64::new(nested.id),
             regions: Vec::new(),
+            log: dirty::Log::new(),
             absent: Mutex::new(Absent { frame: None, at: Vec::new() }).ok_or(Error::NoMemory)?,
         })
     }
@@ -199,6 +243,7 @@ impl GuestMemory {
     pub fn new() -> Result<Self> {
         Ok(Self {
             regions: Vec::new(),
+            log: dirty::Log::new(),
             absent: Mutex::new(Absent { at: Vec::new() }).ok_or(Error::NoMemory)?,
         })
     }
@@ -265,6 +310,9 @@ impl GuestMemory {
         let _ = leaves_2m;
 
         self.regions.try_reserve(1).map_err(|_| Error::NoMemory)?;
+        if !self.log.add(base, size) {
+            return Err(Error::NoMemory);
+        }
         self.regions.push(Region { base, size, frames, huge });
 
         /* Owned first, mapped after, so every page the table points at is
@@ -353,6 +401,16 @@ impl GuestMemory {
         pages
     }
 
+    /// Whether `[gpa, gpa + len)` is RAM of one region, whole.
+    pub fn is_ram(&self, gpa: u64, len: u64) -> bool {
+        len != 0 && self.regions.iter().any(|r| r.contains(gpa, len))
+    }
+
+    /// The RAM's regions, as base and size, in the order they were given.
+    pub fn ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.regions.iter().map(|r| (r.base, r.size))
+    }
+
     /// How much memory the guest has, over every region.
     pub fn size(&self) -> u64 {
         self.regions.iter().map(|r| r.size).sum()
@@ -398,6 +456,8 @@ impl GuestMemory {
             }
             done += n;
         }
+        /* After the bytes: a round that finds the mark finds them */
+        self.log.wrote(gpa, data.len() as u64);
         Ok(())
     }
 
@@ -424,7 +484,11 @@ impl GuestMemory {
         }
         let region = &self.regions[self.region(gpa, 2)?];
         let (page, off) = region.page(gpa).ok_or(Error::Unmapped)?;
-        if page.store_u16(off, value) { Ok(()) } else { Err(Error::Unmapped) }
+        if !page.store_u16(off, value) {
+            return Err(Error::Unmapped);
+        }
+        self.log.wrote(gpa, 2);
+        Ok(())
     }
 
     /// The guest's pages from `gpa`, as many as `len` bytes reach,
@@ -459,9 +523,87 @@ impl GuestMemory {
     }
 
     /// The nested table, for the VMCB: what `vmrun` translates every guest
-    /// physical address through, and what the TLB may keep of it.
+    /// physical address through, and what the TLB may keep of it -- its
+    /// identity as of now (`log_start`).
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn nested(&self) -> hvarch::x86::svm::Nested {
-        self.nested
+        hvarch::x86::svm::Nested { root: self.root, id: self.id.load(Ordering::Acquire) }
+    }
+
+    /// The nested table's top level: the same for as long as the memory
+    /// lives, whatever its identity for the TLBs.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn table_root(&self) -> u64 {
+        self.root
+    }
+
+    /// The table's new identity, after the log narrowed it: each CPU takes
+    /// it at its next entry, its TLB clear of what it cached through the
+    /// old one (`run.rs`'s `sync_tlbs` waits for that). Under the table's
+    /// lock, `table`.
+    #[cfg(target_arch = "x86_64")]
+    fn renew(&self, table: &mut SecondLevel) -> u64 {
+        let id = table.renew();
+        self.id.store(id, Ordering::Release);
+        id
+    }
+
+    /// The guest's write at `gpa` faulted on its nested table: a page of
+    /// its RAM the dirty log protected -- marked, and writable again, and
+    /// true: the write runs again. False for anything else.
+    #[cfg(target_arch = "x86_64")]
+    pub fn write_fault(&self, gpa: u64) -> bool {
+        if self.region(gpa & !(PAGE - 1), PAGE_SIZE).is_err() {
+            return false;
+        }
+        let mut table = self.table.lock();
+        self.log.fault(&mut *table, gpa)
+    }
+
+    /// The dirty log begun: every page of RAM read-only to the guest, the
+    /// table given a new identity -- its id, which every CPU is to take
+    /// before the pages are read (`run.rs`'s `sync_tlbs`). A page that could
+    /// not be protected -- no memory to split a 2 MiB leaf -- refuses it,
+    /// and what was protected is let go of.
+    #[cfg(target_arch = "x86_64")]
+    pub fn log_start(&self) -> Result<u64> {
+        let mut table = self.table.lock();
+        if !self.log.start(&mut *table) {
+            self.log.release(&mut *table);
+            self.renew(&mut table);
+            return Err(Error::NoMemory);
+        }
+        Ok(self.renew(&mut table))
+    }
+
+    /// A round of the dirty log: the pages written since the last, each to
+    /// `out`, read-only to the guest again -- the table given a new identity,
+    /// its id for `sync_tlbs` -- and how many. A page that could not be
+    /// protected again refuses the round.
+    #[cfg(target_arch = "x86_64")]
+    pub fn log_take(&self, out: &mut dyn FnMut(u64)) -> Result<(u64, u64)> {
+        let mut table = self.table.lock();
+        let n = self.log.take(Some(&mut *table), out);
+        let id = self.renew(&mut table);
+        n.map(|n| (n, id)).ok_or(Error::NoMemory)
+    }
+
+    /// The last round, the guest paused: the pages written since the round
+    /// before, each to `out`, nothing protected. How many.
+    pub fn log_last(&self, out: &mut dyn FnMut(u64)) -> u64 {
+        self.log.take(None, out).unwrap_or(0)
+    }
+
+    /// How many pages are marked now: what a round would send.
+    pub fn log_marked(&self) -> u64 {
+        self.log.marked()
+    }
+
+    /// The dirty log over: every page writable to the guest again. No new
+    /// identity: nothing a TLB keeps is wider than the table now.
+    #[cfg(target_arch = "x86_64")]
+    pub fn log_stop(&self) {
+        let mut table = self.table.lock();
+        self.log.release(&mut *table);
     }
 }

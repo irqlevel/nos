@@ -56,6 +56,7 @@ pub const BASE: u64 = 0xFEC0_0000;
 pub const PAGE_SIZE: u64 = 4096;
 /// Its pins.
 pub const PINS: usize = 24;
+const _: () = assert!(PINS == vmstate::IOAPIC_PINS);
 
 /// The pin an ISA interrupt is wired to, as on a PC: the one of its own
 /// number -- but the timer's, IRQ 0, which is on pin 2, pin 0 being the
@@ -178,6 +179,29 @@ impl IoApic {
             remote_irr: 0,
             stats: Stats::default(),
         }
+    }
+
+    /// What the guest made of it, and what its pins are, for a VM's state
+    /// (`vmstate`); its counters are a report's, and start again.
+    pub fn save(&self) -> vmstate::IoApic {
+        vmstate::IoApic { id: self.id, select: self.select, rte: self.rte, lines: self.lines,
+                          remote_irr: self.remote_irr }
+    }
+
+    /// Made what `s` says: every entry one a write could have left.
+    pub fn restore(&mut self, s: &vmstate::IoApic) -> vmstate::Result<()> {
+        const ALL_PINS: u32 = (1 << PINS) - 1;
+        if s.id & !ID_MASK != 0 || s.select & !SELECT_MASK != 0 || s.rte.iter().any(|&e| e & !RTE_WRITABLE != 0)
+            || s.lines & !ALL_PINS != 0 || s.remote_irr & !ALL_PINS != 0
+        {
+            return Err(vmstate::Error("an IO-APIC register with a bit no write leaves"));
+        }
+        self.id = s.id;
+        self.select = s.select;
+        self.rte = s.rte;
+        self.lines = s.lines;
+        self.remote_irr = s.remote_irr;
+        Ok(())
     }
 
     /// Whether `gpa` is in its page.

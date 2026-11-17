@@ -217,6 +217,8 @@ pub const PIN_POSTED_INTERRUPTS: u32 = 1 << 7;
 
 /* Primary processor-based controls. */
 pub const PROC_INTR_WINDOW_EXITING: u32 = 1 << 2;
+/// The guest's TSC is the host's plus the VMCS's TSC offset.
+pub const PROC_USE_TSC_OFFSETTING: u32 = 1 << 3;
 /// Exit as soon as the guest could take an NMI: nothing blocks one.
 pub const PROC_NMI_WINDOW_EXITING: u32 = 1 << 22;
 pub const PROC_HLT_EXITING: u32 = 1 << 7;

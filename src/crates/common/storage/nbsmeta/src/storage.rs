@@ -310,7 +310,8 @@ impl State {
             Command::VolumeResize { name, size_mib } => {
                 self.volume_resize(name, *size_mib).map(|id| Answer::Volume { id })
             }
-            Command::Attach { name, host, writable, force, token } => self.attach(name, host, *writable, *force, *token)
+            Command::Attach { name, host, writable, force, token, expect } => self
+                .attach(name, host, *writable, *force, *token, *expect)
                 .map(|(generation, first)| Answer::Attached { generation, first }),
             Command::Detach { name, host, generation, token } => self.detach(name, host, *generation, *token)
                 .map(|generation| Answer::Attached { generation, first: false }),
@@ -766,7 +767,8 @@ impl State {
 
     /// Volume `name` attached on `host`: its generation, and whether it is the
     /// first attach for writing of a volume made empty (`Answer::Attached`).
-    fn attach(&mut self, name: &str, host: &str, writable: bool, force: bool, token: u64)
+    /// With `expect`, a handover's: only from the writer of that generation.
+    fn attach(&mut self, name: &str, host: &str, writable: bool, force: bool, token: u64, expect: u64)
         -> Result<(u64, bool), Refusal> {
         self.ready()?;
         self.member_host(host)?;
@@ -785,7 +787,15 @@ impl State {
             if let Some(w) = v.writer.as_ref().filter(|w| token != 0 && w.token == token && w.host == host) {
                 return Ok((w.generation, false));
             }
-            if !force {
+            /* A handover: from the writer of the generation it names, and no
+               other -- taken from it as `force` takes one, refused where the
+               writer is another, which the one named took anew itself
+               (`Reattach`, a migration given up) or anyone took since */
+            if expect != 0 {
+                if !v.writer.as_ref().is_some_and(|w| w.generation == expect) {
+                    return Err(Refusal::NotTheWriter);
+                }
+            } else if !force {
                 if v.writer.as_ref().is_some_and(|w| w.host != host) {
                     return Err(Refusal::AttachedElsewhere);
                 }

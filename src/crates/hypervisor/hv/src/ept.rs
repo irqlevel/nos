@@ -11,10 +11,14 @@
 //! unmapped page finds.
 //!
 //! As the nested table on the AMD side, it is built from the host only,
-//! walked by software only through its own indices, and only grows: an entry
-//! is written once where there was none. So a translation the TLB holds is
-//! one the table would still make, and a guest's entries keep their meaning
-//! from one exit to the next.
+//! walked by software only through its own indices, and only grows -- but
+//! for a migration's dirty log: an entry is written once where there was
+//! none. So a translation the TLB holds is one the table would still make,
+//! and a guest's entries keep their meaning from one exit to the next. The
+//! dirty log narrows entries -- a page read-only, a 2 MiB leaf split -- and
+//! gives the table a new id with each round of them (`renew`), which every
+//! CPU flushes the table's translations for before the guest enters there
+//! again (INVEPT, `hvarch::x86::vmx`).
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -232,6 +236,84 @@ impl Ept {
             return Err(Error::BadAddress);
         }
         self.tables[dir].next[i] = LEAF;
+        Ok(())
+    }
+
+    /// Its identity for the TLB now (`renew`).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// A new identity: what the table translated has narrowed -- a page
+    /// made read-only, a 2 MiB leaf split (`protect`) -- so every CPU drops
+    /// what it cached through the table as the guest next enters there
+    /// (INVEPT, `hvarch::x86::vmx`).
+    pub fn renew(&mut self) {
+        self.id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The 2 MiB leaf `gpa` is in, if it is in one, made a last-level table
+    /// of the same 512 pages, each as the leaf had it: what a page of it is
+    /// protected through (`protect`). The TLBs are the caller's (`renew`).
+    fn split(&mut self, gpa: u64) -> Result<()> {
+        let dir = self.table_at(gpa, DIRECTORY, false)?;
+        let i = index(gpa, DIRECTORY);
+        if self.tables[dir].next[i] != LEAF {
+            return Ok(());
+        }
+        let leaf = self.tables[dir].page.load::<u64>(i * ENTRY_BYTES).ok_or(Error::BadAddress)?;
+        let hpa = leaf & ADDRESS & !(HUGE_BYTES - 1);
+        let mut child = Table::new(true)?;
+        let phys = child.page.phys();
+        if phys & !ADDRESS != 0 {
+            return Err(Error::BadAddress);
+        }
+        for k in 0..ENTRIES {
+            if !child.page.store::<u64>(k * ENTRY_BYTES, (hpa + (k * PAGE_SIZE) as u64) | PAGE) {
+                return Err(Error::BadAddress);
+            }
+        }
+        let id = self.tables.try_push(child).map_err(|_| Error::NoMemory)?;
+        /* The table filled and in the arena before the entry that makes it
+         * reachable takes the leaf's place. */
+        if !self.tables[dir].page.store::<u64>(i * ENTRY_BYTES, phys | TABLE) {
+            return Err(Error::BadAddress);
+        }
+        self.tables[dir].next[i] = id as u32;
+        Ok(())
+    }
+
+    /// The page at `gpa`, mapped, made read-only to the guest -- its 2 MiB
+    /// leaf split first where it is in one (`split`): a write to it is an
+    /// EPT violation from the TLBs' next flush on (`renew`).
+    pub fn protect(&mut self, gpa: u64) -> Result<()> {
+        self.split(gpa)?;
+        self.change(gpa, |e| e & !WRITE)
+    }
+
+    /// The page at `gpa`, mapped, writable to the guest again, as `set`
+    /// mapped it. Nothing to flush: a TLB keeps no translation wider than
+    /// the table's.
+    pub fn unprotect(&mut self, gpa: u64) -> Result<()> {
+        self.change(gpa, |e| e | WRITE)
+    }
+
+    /// The last-level entry of the page at `gpa` -- one there, readable --
+    /// made what `f` makes of it.
+    fn change(&mut self, gpa: u64, f: fn(u64) -> u64) -> Result<()> {
+        if gpa % PAGE_SIZE as u64 != 0 {
+            return Err(Error::BadAddress);
+        }
+        let table = self.last_level(gpa, false)?;
+        let offset = index(gpa, SHIFTS.len() - 1) * ENTRY_BYTES;
+        let page = &mut self.tables[table].page;
+        let e = page.load::<u64>(offset).ok_or(Error::BadAddress)?;
+        if e & READ == 0 {
+            return Err(Error::Unmapped);
+        }
+        if !page.store::<u64>(offset, f(e)) {
+            return Err(Error::BadAddress);
+        }
         Ok(())
     }
 

@@ -944,6 +944,136 @@ pub fn cr4_allowed() -> u64 {
     allowed
 }
 
+/// One answer of the policy's, as a guest of a shape is given it: a CPUID
+/// leaf's and subleaf's EAX, EBX, ECX and EDX -- or, `sub` `MSR_ANSWER`, an
+/// MSR the guest reads off the host's, its value in the first two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Answer {
+    pub leaf: u32,
+    pub sub: u32,
+    pub regs: [u32; 4],
+}
+
+/// An `Answer`'s `sub` that says it is an MSR's, its number its `leaf`.
+pub const MSR_ANSWER: u32 = u32::MAX;
+
+/// Whether `leaf` says what the CPU a guest runs on is like -- what may
+/// differ from one core of a host to the next, and means nothing to what
+/// the guest may run: the caches and TLBs described (leaves 2 and 4, and
+/// the extended range's 0x8000_0005, 0x8000_0006 and 0x8000_001D) and the
+/// clock (leaf 0x16, its base and top frequencies; the TSC's is leaf 0x15,
+/// the host's TSC whatever the core). A hybrid part's slower cores have
+/// other caches and clocks than its faster ones, and the policy answers a
+/// guest from the core it asks on: a digest of them would tell a host from
+/// itself (the EX44's P- and E-cores did, and a VM saved on one was refused
+/// its restore on the other).
+fn per_core(leaf: u32) -> bool {
+    matches!(leaf, LEAF_CACHE_DESCRIPTORS | LEAF_CACHE | LEAF_FREQUENCY | LEAF_L1 | LEAF_L2 | LEAF_EXT_CACHE)
+}
+
+/// The CPU a guest of `shape` is shown: the policy's answer to every CPUID
+/// leaf and subleaf it can ask -- the basic range, the hypervisor's, the
+/// extended one, the subleaves of the leaves that have them -- but those
+/// that describe the core it asks on (`per_core`), and the MSR it reads off
+/// the host's, IA32_ARCH_CAPABILITIES; in order, each to `out`. Two hosts
+/// that answer alike show a guest the same CPU, as far as anything it asks
+/// can tell -- what a VM moving between them is held to (`model_digest`):
+/// its kernel looked once, at its boot, and uses what it found. Not the
+/// microcode's revision, which a guest reads and nothing it does depends on.
+pub fn model_answers(shape: Shape, out: &mut dyn FnMut(Answer)) {
+    let asker = Asker { shape, ..Asker::RESET };
+    let range = |out: &mut dyn FnMut(Answer), first: u32, top: u32| {
+        for leaf in first..=top {
+            if per_core(leaf) {
+                continue;
+            }
+            let subs = match leaf {
+                LEAF_STRUCTURED => 2,
+                LEAF_TOPOLOGY => 4,
+                LEAF_XSAVE => 64,
+                _ => 1,
+            };
+            for sub in 0..subs {
+                let c = cpuid(leaf, sub, &asker);
+                out(Answer { leaf, sub, regs: [c.eax, c.ebx, c.ecx, c.edx] });
+            }
+        }
+    };
+    range(out, LEAF_BASIC, cpuid(LEAF_BASIC, 0, &asker).eax.min(LEAF_BASIC_TOP));
+    range(out, LEAF_HYPERVISOR, cpuid(LEAF_HYPERVISOR, 0, &asker).eax.clamp(LEAF_HYPERVISOR, LEAF_HYPERVISOR + 0xFF));
+    range(out, LEAF_EXT, cpuid(LEAF_EXT, 0, &asker).eax.clamp(LEAF_EXT, LEAF_EXT_TOP));
+    let arch = match constant(MSR_ARCH_CAPABILITIES) {
+        Some(Constant::ReadOnly(v)) => v,
+        _ => 0,
+    };
+    out(Answer { leaf: MSR_ARCH_CAPABILITIES, sub: MSR_ANSWER, regs: [arch as u32, (arch >> 32) as u32, 0, 0] });
+}
+
+/// `model_answers` as one digest: two hosts whose digests agree show a
+/// guest the same CPU. Not a cryptographic digest: it tells two CPUs apart,
+/// and holds off no forger.
+pub fn model_digest(shape: Shape) -> [u8; 32] {
+    let mut d = Digest::new();
+    model_answers(shape, &mut |a| {
+        for w in [a.leaf, a.sub, a.regs[0], a.regs[1], a.regs[2], a.regs[3]] {
+            d.add(u64::from(w));
+        }
+    });
+    d.finish()
+}
+
+/// Where `theirs` -- another host's `model_answers`, in their order --
+/// differs from this host's for `shape`: the first answer that is not this
+/// host's, by its leaf and subleaf, and the two; or its count. None where
+/// they are alike.
+pub fn model_differs(shape: Shape, theirs: &[Answer]) -> Option<(Option<Answer>, Option<Answer>)> {
+    let mut at = 0usize;
+    let mut first: Option<(Option<Answer>, Option<Answer>)> = None;
+    model_answers(shape, &mut |mine| {
+        if first.is_none() {
+            let other = theirs.get(at).copied();
+            if other != Some(mine) {
+                first = Some((other, Some(mine)));
+            }
+        }
+        at += 1;
+    });
+    if first.is_none() && at != theirs.len() {
+        first = Some((theirs.get(at).copied(), None));
+    }
+    first
+}
+
+/// Four lanes of FNV-1a over 64-bit words, each from its own start, each
+/// word mixed into each: 32 bytes that differ for any word changed.
+struct Digest {
+    lanes: [u64; 4],
+}
+
+impl Digest {
+    const PRIME: u64 = 0x0000_0100_0000_01B3;
+
+    fn new() -> Digest {
+        Digest { lanes: [0xCBF2_9CE4_8422_2325, 0x84222325_CBF29CE4, 0x9E37_79B9_7F4A_7C15, 0xC2B2_AE3D_27D4_EB4F] }
+    }
+
+    fn add(&mut self, word: u64) {
+        for (i, lane) in self.lanes.iter_mut().enumerate() {
+            for byte in word.rotate_left(i as u32 * 16).to_le_bytes() {
+                *lane = (*lane ^ u64::from(byte)).wrapping_mul(Self::PRIME);
+            }
+        }
+    }
+
+    fn finish(self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (chunk, lane) in out.chunks_exact_mut(8).zip(self.lanes) {
+            chunk.copy_from_slice(&lane.to_le_bytes());
+        }
+        out
+    }
+}
+
 /// Apply a CPUID answer to the guest's registers: EAX and the GPRs the run
 /// stub keeps for EBX, ECX, EDX.
 pub fn apply_cpuid(save: &mut Save, regs: &mut GuestRegs, r: &Cpuid) {
@@ -991,6 +1121,9 @@ pub struct Own {
     /// How many IBPBs it asked for by IA32_PRED_CMD: one more for each write
     /// of it that asks for one.
     pub ibpbs: u64,
+    /// What its TSC is ahead of the host's (`run::LinuxGuest::restore`):
+    /// what its read of IA32_TSC adds, as its RDTSC does.
+    pub tsc_offset: u64,
 }
 
 /* IA32_SPEC_CTRL and IA32_PRED_CMD, where the guest's CPUID offers a control
@@ -1213,7 +1346,7 @@ pub fn rdmsr(save: &Save, own: &Own, msr: u32) -> Option<u64> {
         MSR_SYSENTER_CS => save.sysenter_cs,
         MSR_SYSENTER_ESP => save.sysenter_esp,
         MSR_SYSENTER_EIP => save.sysenter_eip,
-        MSR_TSC => cpu::rdtsc(),
+        MSR_TSC => cpu::rdtsc().wrapping_add(own.tsc_offset),
         MSR_TSC_AUX if has_tsc_aux() => own.tsc_aux,
         MSR_SPEC_CTRL if spec::guest_controls().spec_ctrl != 0 => own.spec_ctrl,
         _ => match constant(msr)? {

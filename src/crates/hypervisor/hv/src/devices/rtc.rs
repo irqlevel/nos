@@ -145,4 +145,20 @@ impl Rtc {
             reg => self.ram[(reg & 0x7F) as usize] = value,
         }
     }
+
+    /// What the guest wrote of its CMOS, for a VM's state (`vmstate`): the
+    /// clock is the wall clock, the host's own wherever the guest is.
+    pub fn save(&self) -> vmstate::Rtc {
+        vmstate::Rtc { index: self.index, ram: self.ram }
+    }
+
+    /// The CMOS `s` says, the clock this host's.
+    pub fn restore(&mut self, s: &vmstate::Rtc) -> vmstate::Result<()> {
+        if s.index & !INDEX_MASK != 0 {
+            return Err(vmstate::Error("an RTC index past its CMOS"));
+        }
+        self.index = s.index;
+        self.ram = s.ram;
+        Ok(())
+    }
 }

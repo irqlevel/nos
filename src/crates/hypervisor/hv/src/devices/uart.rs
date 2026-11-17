@@ -428,4 +428,48 @@ impl Uart {
         self.ier
     }
 
+    /// What the guest has made of it, for a VM's state (`vmstate`).
+    pub fn save(&self) -> vmstate::Uart {
+        let mut reply = [0u8; vmstate::REPLY_MAX];
+        reply[..REPLY_MAX].copy_from_slice(&self.reply.buf);
+        vmstate::Uart {
+            dll: self.dll, dlm: self.dlm, ier: self.ier, lcr: self.lcr, mcr: self.mcr, scr: self.scr,
+            written: self.written, loopback: self.loopback, rx: self.rx,
+            esc: match self.esc {
+                Esc::Text => 0,
+                Esc::Start => 1,
+                Esc::Csi => 2,
+                Esc::Csi6 => 3,
+                Esc::CsiOther => 4,
+            },
+            col: self.col, reply, reply_len: self.reply.len as u8, reply_pos: self.reply.pos as u8,
+            prompt_seen: self.prompt_seen, thri: self.thri, pulse: self.pulse,
+        }
+    }
+
+    /// Made what `s` says -- every field of it one a UART could have had.
+    pub fn restore(&mut self, s: &vmstate::Uart) -> vmstate::Result<()> {
+        let esc = match s.esc {
+            0 => Esc::Text,
+            1 => Esc::Start,
+            2 => Esc::Csi,
+            3 => Esc::Csi6,
+            4 => Esc::CsiOther,
+            _ => return Err(vmstate::Error("the UART in no escape state it has")),
+        };
+        let (len, pos) = (usize::from(s.reply_len), usize::from(s.reply_pos));
+        if len > REPLY_MAX || pos > len || s.col > COL_MAX {
+            return Err(vmstate::Error("the UART's reply or column past what it keeps"));
+        }
+        let mut buf = [0u8; REPLY_MAX];
+        buf.copy_from_slice(&s.reply[..REPLY_MAX]);
+        *self = Uart {
+            dll: s.dll, dlm: s.dlm, ier: s.ier, lcr: s.lcr, mcr: s.mcr, scr: s.scr, written: s.written,
+            loopback: s.loopback, rx: s.rx, esc, col: s.col, reply: Reply { buf, len, pos },
+            prompt_seen: s.prompt_seen, thri: s.thri, pulse: s.pulse,
+        };
+        Ok(())
+    }
 }
+
+const _: () = assert!(REPLY_MAX == vmstate::REPLY_MAX, "the state keeps the UART's reply whole");

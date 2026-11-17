@@ -461,6 +461,78 @@ pub trait Carrier: Send + Sync {
     /// tunnel's task to carry. `hv0`'s sink's context: nothing may wait or
     /// take the heap.
     fn carry_in(&self, node: u64, vni: u32, packet: &[u8]) -> bool;
+    /// The IPv4 `packet` of network `vni` carried to host `node` for a port
+    /// there -- one that moved from this host a moment ago, which the other
+    /// hosts' tables, the tunnel's own among them, may not have yet
+    /// (`Ports::moved`). A guest's CPU's context, or the receive soft IRQ's:
+    /// nothing may wait.
+    fn carry_to(&self, node: u64, vni: u32, packet: &[u8]) -> bool;
+}
+
+/// A port of a cluster network that moved from this host a moment ago -- a
+/// migration's (plans/vm-migration.md, M3): its network, its address, the
+/// host it went to, and until when frames still sent here for it are carried
+/// on to that host (`MOVED_NS`).
+#[derive(Clone, Copy)]
+struct Moved {
+    vni: u32,
+    addr: u32,
+    node: u64,
+    until: u64,
+}
+
+const MOVED_NONE: Moved = Moved { vni: 0, addr: 0, node: 0, until: 0 };
+/// The ports moved away that are carried for at once: a few, kept in place.
+const MOVED_MAX: usize = 8;
+
+/// The host marked for the port of network `vni` at `addr` in `marks`, while
+/// its mark lasts: `until` the newest mark's end, so that a frame looks no
+/// further than one load while none lasts.
+#[inline]
+fn marked(marks: &IrqSpinLock<[Moved; MOVED_MAX]>, until: &AtomicU64, vni: u32, addr: u32) -> Option<u64> {
+    let last = until.load(Ordering::Acquire);
+    if last == 0 {
+        return None;
+    }
+    let now = kcore::time::boot_time_ns();
+    if now >= last {
+        return None;
+    }
+    marks.lock().iter().find(|m| m.until > now && m.vni == vni && m.addr == addr).map(|m| m.node)
+}
+
+/// Port `addr` of network `vni` marked in `marks` for host `node`, for
+/// `MOVED_NS`: its own place again, or one run out, or the oldest.
+fn mark(marks: &IrqSpinLock<[Moved; MOVED_MAX]>, until: &AtomicU64, vni: u32, addr: u32, node: u64) {
+    let now = kcore::time::boot_time_ns();
+    let end = now + MOVED_NS;
+    let mut m = marks.lock();
+    let at = m.iter().position(|x| x.vni == vni && x.addr == addr && x.until > now)
+        .or_else(|| m.iter().position(|x| x.until <= now))
+        .unwrap_or_else(|| m.iter().enumerate().min_by_key(|(_, x)| x.until).map_or(0, |(i, _)| i));
+    m[at] = Moved { vni, addr, node, until: end };
+    until.fetch_max(end, Ordering::AcqRel);
+}
+
+/// Port `addr` of network `vni`'s marks in `marks` taken away.
+fn unmark(marks: &IrqSpinLock<[Moved; MOVED_MAX]>, vni: u32, addr: u32) {
+    for m in marks.lock().iter_mut().filter(|m| m.vni == vni && m.addr == addr) {
+        *m = MOVED_NONE;
+    }
+}
+/// How long frames for a port moved away are carried on to its new host:
+/// past every other host's keeper's next turn, a second, with room.
+pub const MOVED_NS: u64 = 10 * kcore::consts::NS_PER_SEC;
+
+/// A flow of a port's firewall as it goes with its VM to another host
+/// (`Switch::flows_of`, `adopt_flows`): its key, whether it began coming
+/// in, what its TCP connection showed, and how long it has left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Carried {
+    pub key: fw::Key,
+    pub inbound: bool,
+    pub seen: u8,
+    pub left_ns: u64,
 }
 
 /// Whether two routes are the one mapping in NAT: the public address, to the
@@ -861,6 +933,21 @@ pub struct Ports {
     served_over_share: AtomicU64,
     served_in: AtomicU64,
     served_out: AtomicU64,
+    /// The cluster networks' ports that moved from here a moment ago, and
+    /// frames for them carried on to their new hosts (`Moved`): in place,
+    /// nothing allocated where a frame is carried.
+    moved: IrqSpinLock<[Moved; MOVED_MAX]>,
+    relayed: AtomicU64,
+    /// The newest of the marks' ends, 0 before any: a frame looks at the
+    /// marks only before it -- one load, on every frame's path, the rest
+    /// of the time.
+    moved_until: AtomicU64,
+    /// The cluster networks' ports that came here a moment ago, each from
+    /// the host that has it moved away (`Moved`, its `node` the host it
+    /// came from): what that host carries on to it, sent there by hosts
+    /// whose tables had it there still, is taken from it (`came_from`).
+    came: IrqSpinLock<[Moved; MOVED_MAX]>,
+    came_until: AtomicU64,
 }
 
 /// The switch's answers to `hv0` that cannot be handed in where they are
@@ -1044,6 +1131,20 @@ impl Ports {
             return (!is_vnet(self.group(p))).then_some(p);
         }
         self.port_by_ip(vnet_ip(mac)?)
+    }
+
+    /// The host the port of network `vni` at `addr` moved to a moment ago,
+    /// while its frames are still carried on there (`Moved`).
+    #[inline]
+    fn moved_to(&self, vni: u32, addr: u32) -> Option<u64> {
+        marked(&self.moved, &self.moved_until, vni, addr)
+    }
+
+    /// The host the port of network `vni` at `addr` came from a moment ago,
+    /// while that host still carries its frames on here.
+    #[inline]
+    fn came_from(&self, vni: u32, addr: u32) -> Option<u64> {
+        marked(&self.came, &self.came_until, vni, addr)
     }
 
     /// The cluster network's port here whose address `addr` is: one of a
@@ -1495,11 +1596,27 @@ impl Ports {
             self.via_gateway(from, frame, to);
             return;
         }
+        let vni = group & VNI_MASK;
+        /* A port that moved from here a moment ago -- its VM ending here
+         * still, or gone: to its new host, before this host's table has it
+         * there */
+        if vnet_ip(dst) == Some(to) {
+            if let Some(node) = self.moved_to(vni, to) {
+                if let Some(c) = self.carrier_now() {
+                    if self.judged(from, Dir::Out, frame, false).is_some() {
+                        let end = (ETH_HDR_LEN + usize::from(ip::total_len(&frame[ETH_HDR_LEN..]))).min(frame.len());
+                        if c.carry_to(node, vni, &frame[ETH_HDR_LEN..end]) {
+                            self.relayed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                return;
+            }
+        }
         let Some(q) = vnet_ip(dst).and_then(|ip| self.port_by_ip(ip)) else {
             /* A port of its network on another host -- its MAC its
              * address's: into the tunnel, judged going out as any packet
              * of its */
-            let vni = group & VNI_MASK;
             match self.carrier_now() {
                 Some(c) if vnet_ip(dst) == Some(to) && c.elsewhere(vni, to) => {
                     if self.judged(from, Dir::Out, frame, false).is_some() {
@@ -2298,6 +2415,11 @@ impl Switch {
             served_on_backlog: AtomicUsize::new(0),
             served_over_share: AtomicU64::new(0),
             served_in: AtomicU64::new(0),
+            moved: IrqSpinLock::new([MOVED_NONE; MOVED_MAX]),
+            relayed: AtomicU64::new(0),
+            moved_until: AtomicU64::new(0),
+            came: IrqSpinLock::new([MOVED_NONE; MOVED_MAX]),
+            came_until: AtomicU64::new(0),
             served_out: AtomicU64::new(0),
         });
         let nat = Mutex::new(None).ok_or_else(|| String::from("out of memory for the switch"))?;
@@ -2484,6 +2606,13 @@ impl Switch {
         match got {
             Ok(Some(i)) => {
                 vnets[at].ports += 1;
+                /* Its address here again: what was carried on for it to
+                 * another host it had moved to is carried no more -- else a
+                 * frame for it, the VM stopped here later, would go back and
+                 * forth between the two until their marks ran out -- and a
+                 * mark of where it came from before is another VM's past */
+                unmark(&self.ports.moved, who.vni, who.ip);
+                unmark(&self.ports.came, who.vni, who.ip);
                 Ok(i)
             }
             Ok(None) | Err(_) => {
@@ -2753,6 +2882,16 @@ impl Switch {
         let (from, to) = (ip::src(packet), ip::dst(packet));
         let ports = &self.ports;
         let group = VNET | vni;
+        /* A port that moved from here a moment ago -- its VM ending here
+         * still, or gone -- sent here by a host whose table is the old one
+         * still: carried on to where it is, once (its new host carries
+         * nothing on for it) */
+        if let Some(node) = ports.moved_to(vni, to) {
+            if ports.carrier_now().is_some_and(|c| c.carry_to(node, vni, packet)) {
+                ports.relayed.fetch_add(1, Ordering::Relaxed);
+            }
+            return true;
+        }
         let Some(q) = ports.port_by_ip(to).filter(|&q| ports.group(q) == group) else { return false };
         let len = ETH_HDR_LEN + packet.len();
         if len > FRAME {
@@ -3231,5 +3370,88 @@ impl Switch {
     /// `hv0`, and the echoes answered from a cluster network's gateway.
     pub fn vnet_counts(&self) -> (u64, u64) {
         (self.ports.arps.load(Ordering::Relaxed), self.ports.echoes.load(Ordering::Relaxed))
+    }
+
+    /// Port `port`'s cluster network and address, while it is on one: what
+    /// it is had by on another host once its VM moves there.
+    pub fn vnet_address(&self, port: usize) -> Option<(u32, u32)> {
+        let group = self.ports.group(port);
+        is_vnet(group).then(|| (group & VNI_MASK, self.ports.ip_of(port)))
+    }
+
+    /// The port of network `vni` at `addr` moved to host `node` (a VM's
+    /// migration, plans/vm-migration.md M3): what the other hosts still send
+    /// here for it -- their tables have it here until their keepers' next
+    /// turn -- and what this host's guests send it, carried on there for
+    /// `MOVED_NS`. Its oldest such place, or a run-out one, taken for it.
+    pub fn moved_away(&self, vni: u32, addr: u32, node: u64) {
+        mark(&self.ports.moved, &self.ports.moved_until, vni, addr, node);
+    }
+
+    /// The port of network `vni` at `addr` came here from host `node` (a
+    /// VM's migration, its port claimed here): what that host carries on
+    /// to it for `MOVED_NS` -- sent there by hosts whose tables had it
+    /// there still -- taken from it, though the packet's sender is a port
+    /// on a third host (`came_from`). That host had the VM's memory a
+    /// moment ago: trusted with what reaches it no less.
+    pub fn came_here(&self, vni: u32, addr: u32, node: u64) {
+        mark(&self.ports.came, &self.ports.came_until, vni, addr, node);
+    }
+
+    /// The host the port here of network `vni` at `addr` came from a
+    /// moment ago, while it carries the port's frames on here.
+    #[inline]
+    pub fn came_from(&self, vni: u32, addr: u32) -> Option<u64> {
+        self.ports.came_from(vni, addr)
+    }
+
+    /// Frames carried on to the hosts ports moved to (`moved_away`).
+    pub fn relayed(&self) -> u64 {
+        self.ports.relayed.load(Ordering::Relaxed)
+    }
+
+    /// Port `port`'s firewall's live flows, each with how long it has left,
+    /// into `out` -- as many as its room takes, which the caller made for the
+    /// port's most (`FLOWS`): nothing allocated under the port's lock. What
+    /// goes with its VM to another host, the VM paused: answers to the
+    /// connections it made let in there as here.
+    pub fn flows_of(&self, port: usize, out: &mut Vec<Carried>) {
+        let Some(p) = self.ports.ports.get(port) else { return };
+        let now = kcore::time::boot_time_ns();
+        let f = p.fw.lock();
+        if !f.owned {
+            return;
+        }
+        if let Some(flows) = f.flows.as_ref() {
+            flows.each(now, &mut |key, dir, seen, expires| {
+                if out.len() < out.capacity() {
+                    out.push(Carried { key: *key, inbound: dir == Dir::In, seen, left_ns: expires - now });
+                }
+            });
+        }
+    }
+
+    /// `flows` -- another host's port's, its VM's (`flows_of`) -- made port
+    /// `port`'s, each running out as long after now as it had left there:
+    /// how many. Those its table has no room for are let go, as a full
+    /// table lets its oldest go.
+    pub fn adopt_flows(&self, port: usize, flows: &[Carried]) -> usize {
+        let Some(p) = self.ports.ports.get(port) else { return 0 };
+        let now = kcore::time::boot_time_ns();
+        let mut f = p.fw.lock();
+        if !f.owned {
+            return 0;
+        }
+        let Some(table) = f.flows.as_mut() else { return 0 };
+        let mut n = 0;
+        for c in flows {
+            if c.left_ns == 0 || table.find(&c.key, now).is_some() {
+                continue;
+            }
+            let dir = if c.inbound { Dir::In } else { Dir::Out };
+            table.add(c.key, dir, c.seen, now.saturating_add(c.left_ns), now);
+            n += 1;
+        }
+        n
     }
 }

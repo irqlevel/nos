@@ -533,44 +533,8 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
         None => 0,
     };
     let image = plan(spec, initrd_len)?;
-
-    /* Its disks next, before its memory: the commonest refusal of a start
-     * -- an image another guest writes, a device in use -- once came only
-     * after gigabytes were taken and zeroed and the kernel read. All but a
-     * volume taken by force, which fences the writer elsewhere: that one is
-     * opened last of all, below, so that what can still refuse the guest
-     * has before another host's guest is cut off for it. */
-    let mut disks: Vec<Option<QueuedDisk>> = Vec::new();
-    disks.try_reserve_exact(spec.disks.len()).map_err(|_| String::from("out of memory"))?;
-    for (i, (path, ro)) in spec.disks.iter().enumerate() {
-        let index = u8::try_from(i).map_err(|_| String::from("more disks than a guest has"))?;
-        let forced = spec.force && matches!(crate::devices::source(path), crate::devices::Source::Volume(_));
-        disks.push(if forced { None } else { Some(QueuedDisk::open(path, *ro, false, runner, index)?) });
-    }
-
-    let huge = from_pool();
-    if huge {
-        pool_has(spec.mem_bytes)?;
-    }
-    let (mut guest, mut cpus) =
-        LinuxGuest::new(machine, spec.mem_bytes, huge, spec.cpus, doorbells, !spec.xapic, spec.ioapic)
-            .map_err(|e| match e {
-                /* Another guest took the blocks between the look and the
-                 * taking: said as the look would have said it. */
-                hv::Error::NoHugePages => pool_has(spec.mem_bytes).err().unwrap_or_else(|| alloc::format!("no guest: {}", e)),
-                e => alloc::format!("no guest: {}", e),
-            })?;
-    if let Some(on) = spec.apicv {
-        guest.set_apicv(on);
-    }
-    if let Some(us) = spec.rxmod_us {
-        guest.set_rx_moderation(us.saturating_mul(kcore::consts::NS_PER_US));
-    }
-    guest.set_identity(identity(spec));
-    if spec.nooffload {
-        guest.set_offloads(false);
-    }
-    guest.set_shape(spec.shape);
+    let disks = open_disks(spec, runner)?;
+    let (mut guest, mut cpus) = new_machine(machine, spec, doorbells)?;
 
     /* The 64-bit kernel at its load address -- or each of a PVH image's
      * segments at its own, the zeroes past its file bytes being the fresh
@@ -592,6 +556,125 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
 
     /* Its devices before its furniture: the ACPI tables `load` lays out
      * describe the bus as it is then. */
+    add_devices(&mut guest, spec, runner, disks)?;
+
+    let tsc_khz = kcore::time::cycle_counter_hz().map(|hz| hz / 1000).filter(|&khz| khz != 0);
+    let cmdline = guest_cmdline(&spec.cmdline, spec.cpus > 1 && !spec.ioapic, tsc_khz)?;
+    let bsp = cpus.first_mut().ok_or_else(|| String::from("no guest: no CPU"))?;
+    match &image {
+        Image::Linux { header, first, layout, .. } => guest
+            .load(bsp, header, first, *layout, cmdline.as_bytes())
+            .map_err(|e| alloc::format!("laying out the guest: {}", e))?,
+        Image::Pvh { image, layout } => guest.load_pvh(bsp, image, *layout, cmdline.as_bytes()).map_err(|e| match e {
+            hv::Error::NoUnrestrictedGuest => {
+                String::from("this CPU's VT-x has no unrestricted guest, and a PVH image starts with paging off")
+            }
+            e => alloc::format!("laying out the guest: {}", e),
+        })?,
+    }
+    Ok(Built { guest, cpus })
+}
+
+/// Build the guest of a state -- one that ran, saved (`hv restore`) or
+/// moved here: its machine as `spec` describes it, alike to the one the
+/// state was taken of, with no kernel loaded; the state put into it,
+/// every device's and every CPU's (`LinuxGuest::restore`), which refuses a
+/// state of another machine; and its memory filled by `fill` -- from a
+/// file, or left to whoever filled it already.
+pub fn build_restored(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doorbells>,
+                      state: &vmstate::VmState, fill: &mut dyn FnMut(&LinuxGuest) -> Result<(), String>)
+    -> Result<Built, String>
+{
+    let disks = open_disks(spec, runner)?;
+    let (mut guest, mut cpus) = new_machine(machine, spec, doorbells)?;
+    add_devices(&mut guest, spec, runner, disks)?;
+    /* Its memory first: the state set its clocks going, and `rebase` moves
+     * them on to its first run all the same. */
+    fill(&guest)?;
+    guest.restore(state, &mut cpus).map_err(|e| alloc::format!("its state: {}", e))?;
+    Ok(Built { guest, cpus })
+}
+
+/// The guest of a VM coming from another host (plans/vm-migration.md),
+/// built as `spec` describes it with nothing behind its devices yet: each
+/// disk a stand-in as `disks` say the old host's guest saw it -- its shape
+/// and its GET_ID -- and its NIC one of `nic`'s MAC and MTU, until the
+/// handover gives it its volumes and its port (`LinuxGuest::set_disk_backend`,
+/// `set_nic_backend`). Its memory fresh, for the pages to come into, and no
+/// kernel: the state is put into it once it is all here.
+pub fn build_coming(machine: &Machine, spec: &Spec, doorbells: Arc<Doorbells>, disks: &[hv::disk::Shape],
+                    nic: Option<([u8; 6], u16)>) -> Result<Built, String> {
+    if disks.len() != spec.disks.len() || nic.is_some() != spec.net {
+        return Err(String::from("its devices are not its vm.toml's"));
+    }
+    let (mut guest, cpus) = new_machine(machine, spec, doorbells)?;
+    if let Some((mac, mtu)) = nic {
+        guest.add_nic_with(Box::new(hv::nic::Standin), mac, mtu).map_err(|e| alloc::format!("the NIC: {}", e))?;
+    }
+    for (shape, (path, _)) in disks.iter().zip(&spec.disks) {
+        let standin = hv::disk::Standin::new(shape.bytes, shape.block, shape.read_only, shape.discards,
+                                             shape.writes_zeroes)
+            .ok_or_else(|| String::from("out of memory"))?;
+        let end = shape.id.iter().position(|&b| b == 0).unwrap_or(shape.id.len());
+        let id = core::str::from_utf8(&shape.id[..end]).map_err(|_| alloc::format!("{}: an id that is no text", path))?;
+        guest.add_disk(Box::new(standin), id).map_err(|e| alloc::format!("{}: {}", path, e))?;
+    }
+    Ok(Built { guest, cpus })
+}
+
+/// The guest's disks, opened -- before its memory: the commonest refusal of
+/// a start, an image another guest writes, a device in use, once came only
+/// after gigabytes were taken and zeroed and the kernel read. All but a
+/// volume taken by force, which fences the writer elsewhere: that one is
+/// opened last of all (`add_devices`), so that what can still refuse the
+/// guest has before another host's guest is cut off for it.
+fn open_disks(spec: &Spec, runner: &Runner) -> Result<Vec<Option<QueuedDisk>>, String> {
+    let mut disks: Vec<Option<QueuedDisk>> = Vec::new();
+    disks.try_reserve_exact(spec.disks.len()).map_err(|_| String::from("out of memory"))?;
+    for (i, (path, ro)) in spec.disks.iter().enumerate() {
+        let index = u8::try_from(i).map_err(|_| String::from("more disks than a guest has"))?;
+        let forced = spec.force && matches!(crate::devices::source(path), crate::devices::Source::Volume(_));
+        disks.push(if forced { None } else { Some(QueuedDisk::open(path, *ro, false, runner, index)?) });
+    }
+    Ok(disks)
+}
+
+/// The guest's machine as `spec` describes it, with nothing in it yet: its
+/// memory -- the huge pool's where there is one -- its CPUs, rung by
+/// `doorbells`, and its options.
+fn new_machine(machine: &Machine, spec: &Spec, doorbells: Arc<Doorbells>) -> Result<(LinuxGuest, Vec<GuestCpu>), String> {
+    let huge = from_pool();
+    if huge {
+        pool_has(spec.mem_bytes)?;
+    }
+    let (mut guest, cpus) =
+        LinuxGuest::new(machine, spec.mem_bytes, huge, spec.cpus, doorbells, !spec.xapic, spec.ioapic)
+            .map_err(|e| match e {
+                /* Another guest took the blocks between the look and the
+                 * taking: said as the look would have said it. */
+                hv::Error::NoHugePages => pool_has(spec.mem_bytes).err().unwrap_or_else(|| alloc::format!("no guest: {}", e)),
+                e => alloc::format!("no guest: {}", e),
+            })?;
+    if let Some(on) = spec.apicv {
+        guest.set_apicv(on);
+    }
+    if let Some(us) = spec.rxmod_us {
+        guest.set_rx_moderation(us.saturating_mul(kcore::consts::NS_PER_US));
+    }
+    guest.set_identity(identity(spec));
+    if spec.nooffload {
+        guest.set_offloads(false);
+    }
+    guest.set_shape(spec.shape);
+    Ok((guest, cpus))
+}
+
+/// The guest's devices, in the order its bus has them: its NIC, then its
+/// disks -- `disks` as `open_disks` opened them, a volume taken by force
+/// opened now.
+fn add_devices(guest: &mut LinuxGuest, spec: &Spec, runner: &Runner, disks: Vec<Option<QueuedDisk>>)
+    -> Result<(), String>
+{
     if let Some(nic) = &spec.nic {
         guest.add_nic_with(Box::new(nic.switch.backend(nic.port)), nic.switch.mac_of(nic.port), nic.mtu)
             .map_err(|e| alloc::format!("the NIC: {}", e))?;
@@ -612,22 +695,7 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
         }
         guest.add_disk(Box::new(disk), &id).map_err(|e| alloc::format!("{}: {}", path, e))?;
     }
-
-    let tsc_khz = kcore::time::cycle_counter_hz().map(|hz| hz / 1000).filter(|&khz| khz != 0);
-    let cmdline = guest_cmdline(&spec.cmdline, spec.cpus > 1 && !spec.ioapic, tsc_khz)?;
-    let bsp = cpus.first_mut().ok_or_else(|| String::from("no guest: no CPU"))?;
-    match &image {
-        Image::Linux { header, first, layout, .. } => guest
-            .load(bsp, header, first, *layout, cmdline.as_bytes())
-            .map_err(|e| alloc::format!("laying out the guest: {}", e))?,
-        Image::Pvh { image, layout } => guest.load_pvh(bsp, image, *layout, cmdline.as_bytes()).map_err(|e| match e {
-            hv::Error::NoUnrestrictedGuest => {
-                String::from("this CPU's VT-x has no unrestricted guest, and a PVH image starts with paging off")
-            }
-            e => alloc::format!("laying out the guest: {}", e),
-        })?,
-    }
-    Ok(Built { guest, cpus })
+    Ok(())
 }
 
 /// How a guest's run went: how it stopped, and what each of its CPUs
@@ -704,6 +772,9 @@ pub fn run_cpus<H: Host + Send + Sync + 'static>(
     let mut tasks = Vec::new();
     tasks.try_reserve_exact(n - 1).map_err(|_| String::from("out of memory"))?;
 
+    /* A guest of a state goes on from where its clocks stood when the state
+     * was put into it: the time it took to get here is not its. */
+    guest.rebase(&mut cpus);
     let aps = cpus.split_off(1);
     let mut bsp = cpus.pop().ok_or_else(|| String::from("no first CPU"))?;
     let mut failed = None;
@@ -806,6 +877,7 @@ pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
         Stop::Invalid => write!(out, "the CPU refused the entry (VMEXIT_INVALID on AMD-V, a VM-entry failure on VT-x)"),
         Stop::Budget => write!(out, "by the host, its time up"),
         Stop::Requested => write!(out, "on request"),
+        Stop::Migrated => write!(out, "its state taken -- to another host, or into a file -- to go on from there"),
         Stop::Unexpected { exit, rip } => write!(out, "an exit with no handler: {:?} at {:#x}", exit, rip),
     }
 }

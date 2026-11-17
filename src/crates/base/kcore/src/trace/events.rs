@@ -397,6 +397,60 @@ names! {
         NoHop = "no_hop",
     }
 
+    /// Which side of a migration a record is of (`mig_take`'s and
+    /// `mig_end`'s `side`)
+    MigSide {
+        /// The host it leaves
+        Old = "old",
+        /// The host it comes to
+        New = "new",
+    }
+
+    /// What NBS answered a take of a volume (`mig_take`'s `took`)
+    MigTook {
+        Took = "took",
+        /// Its writer is not of the generation named: the other side's take
+        /// landed first
+        Refused = "refused",
+        /// Nothing to go by: asked again
+        Unknown = "unknown",
+    }
+
+    /// How a side's migration ended (`mig_end`'s `how`)
+    MigHow {
+        /// The VM runs on the new host
+        There = "there",
+        /// It runs on the old one
+        Here = "here",
+        /// It runs on neither: its volume's writer one that cannot run it
+        Stopped = "stopped",
+        /// Refused before anything was paused
+        Refused = "refused",
+        /// Given up before its Done
+        Cancelled = "cancelled",
+    }
+
+    /// A message the new host takes (`mig_recv`'s `kind`)
+    MigKind {
+        Offer = "offer",
+        File = "file",
+        Pages = "pages",
+        State = "state",
+        Done = "done",
+        Cancel = "cancel",
+        Flows = "flows",
+    }
+
+    /// What narrowed a guest's nested table (`mig_sync`'s `what`)
+    MigSyncWhat {
+        /// The dirty log begun: every page read-only
+        Start = "start",
+        /// A round: the pages written since the last read-only again
+        Round = "round",
+        /// The log over
+        Stop = "stop",
+    }
+
     /// What happened to the tunnel's keys with a host (`tunnel_key`'s `what`)
     TunnelKeyWhat {
         /// A key given it, to seal to this host with
@@ -998,6 +1052,80 @@ events! {
         number: u32,
         peer_port: u16,
         what: u8 as TunnelKeyWhat,
+        _pad: u8,
+    }
+
+    /// `mig_round`: a round of a migration's pages sent by the old host --
+    /// in the hv module's `migrate.rs`
+    MigRound = 54, "mig_round" {
+        /// The migration
+        id: u64,
+        round: u32,
+        /// Its pages, and how many of them zeros: a mark and no data
+        pages: u32,
+        zeros: u32,
+        /// How long it took to send, and the pages marked written by its end
+        ms: u32,
+        marked: u32,
+        /// How slowed the guest was, percent; and 1 for the last round, the
+        /// guest paused
+        throttle: u8,
+        last: u8,
+        _pad: [u8; 2],
+    }
+
+    /// `mig_take`: a side's take of a volume in a migration's handover
+    MigTake = 55, "mig_take" {
+        id: u64,
+        /// The writer's generation it was taken from
+        generation: u64,
+        /// How long NBS took to answer
+        ms: u32,
+        side: u8 as MigSide,
+        took: u8 as MigTook,
+        /// The guest's disk the volume is
+        disk: u8,
+        _pad: u8,
+    }
+
+    /// `mig_end`: a side's end of a migration
+    MigEnd = 56, "mig_end" {
+        id: u64,
+        /// How long its guest was paused for it, its rounds, and the MiB of
+        /// memory sent or taken
+        paused_ms: u32,
+        rounds: u32,
+        mib: u32,
+        side: u8 as MigSide,
+        how: u8 as MigHow,
+        _pad: [u8; 2],
+    }
+
+    /// `mig_recv`: a message of a migration taken by the new host
+    MigRecv = 57, "mig_recv" {
+        id: u64,
+        /// Its sequence number's low word
+        seq: u32,
+        bytes: u32,
+        /// How long it took to handle: written, answered
+        ns: u32,
+        kind: u8 as MigKind,
+        _pad: [u8; 3],
+    }
+
+    /// `mig_sync`: a guest's nested table narrowed by a migration's dirty
+    /// log, and the wait for its CPUs to drop what their TLBs kept of it --
+    /// in hv's run loop
+    MigSync = 58, "mig_sync" {
+        /// The table's new identity
+        table: u64,
+        /// How long the narrowing took, and the wait after it
+        narrow_ns: u32,
+        wait_ns: u32,
+        /// The pages narrowed
+        pages: u32,
+        cpus: u16,
+        what: u8 as MigSyncWhat,
         _pad: u8,
     }
 }

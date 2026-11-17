@@ -1,0 +1,15 @@
+[package]
+name = "vmstate"
+version = "0.1.0"
+edition = "2021"
+
+# A running VM's state as bytes (plans/vm-migration.md, "The state"): its
+# CPUs, their local APICs and mailboxes, and every device of its platform,
+# in a form neither of the CPU's extensions has -- versioned, and every field
+# checked as it is read, since a state comes from another host and another
+# build. No kernel in it: hv.ko writes and reads it, and tests/fuzz/hv holds
+# it to its round trips and its refusals.
+[lib]
+
+[dependencies]
+codec = { path = "../../codec" }

@@ -1211,9 +1211,11 @@ pub struct Place {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ask {
     /// Volume `name` attached on this host: for writing, at a new generation
-    /// -- `force` takes it from whoever has it -- or read-only; `token` the
-    /// session's own, so that the attach asked again is answered as it was.
-    Attach { name: String, writable: bool, force: bool, token: u64 },
+    /// -- `force` takes it from whoever has it, `expect` from the writer of
+    /// that generation alone (a handover, `nbsmeta::Command::Attach`) -- or
+    /// read-only; `token` the session's own, so that the attach asked again
+    /// is answered as it was.
+    Attach { name: String, writable: bool, force: bool, token: u64, expect: u64 },
     /// Volume `name` let go of: the writer of `generation`, or with 0 a
     /// reader; `token` the session's, kept by the metadata so that an attach
     /// of its applied late attaches the volume to nobody.
@@ -1327,11 +1329,14 @@ impl Asking {
         let mut w = Writer::new();
         w.u64(self.id);
         match &self.ask {
-            Ask::Attach { name, writable, force, token } => {
+            Ask::Attach { name, writable, force, token, expect } => {
                 w.u8(1);
                 w.str(name);
-                w.u8(u8::from(*writable) | u8::from(*force) << 1);
+                w.u8(u8::from(*writable) | u8::from(*force) << 1 | u8::from(*expect != 0) << 2);
                 w.u64(*token);
+                if *expect != 0 {
+                    w.u64(*expect);
+                }
             }
             Ask::Detach { name, generation, token } => {
                 w.u8(2);
@@ -1397,10 +1402,12 @@ impl Asking {
             1 => {
                 let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);
                 let flags = r.u8()?;
-                if flags & !3 != 0 {
+                if flags & !7 != 0 || (flags & 4 != 0 && flags & 1 == 0) {
                     return None;
                 }
-                Ask::Attach { name, writable: flags & 1 != 0, force: flags & 2 != 0, token: r.u64()? }
+                let token = r.u64()?;
+                let expect = if flags & 4 != 0 { r.u64().filter(|&g| g != 0)? } else { 0 };
+                Ask::Attach { name, writable: flags & 1 != 0, force: flags & 2 != 0, token, expect }
             }
             2 => {
                 let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);

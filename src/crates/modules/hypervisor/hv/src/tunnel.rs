@@ -423,6 +423,12 @@ impl Tunnel {
         drop(gone);
     }
 
+    /// The node of host `name`, as the table has the hosts: where a port
+    /// that moved there is carried to (`Switch::moved_away`).
+    pub fn node_of(&self, name: &str) -> Option<u64> {
+        self.peers.lock().iter().find(|p| &*p.name == name).map(|p| p.node)
+    }
+
     /// The host port `addr` of network `vni` is on, if it is on another.
     pub fn elsewhere(&self, vni: u32, addr: u32) -> Option<u64> {
         let remote = self.remote.lock();
@@ -644,7 +650,14 @@ impl Tunnel {
             dropped(at.0, at.1, Some(header), TunnelWhy::Stale);
             return;
         }
-        if self.elsewhere(vni, ip::src(packet)) != Some(node) || !self.switch.from_tunnel(vni, packet) {
+        /* From a port on the host that sent it -- or carried on by the host
+         * a port here came from a moment ago, sent there by a third whose
+         * table had the port there still (`Switch::came_here`): from a port
+         * elsewhere, to that port alone */
+        let from = self.elsewhere(vni, ip::src(packet));
+        let sent = from == Some(node)
+            || (from.is_some() && self.switch.came_from(vni, ip::dst(packet)) == Some(node));
+        if !sent || !self.switch.from_tunnel(vni, packet) {
             self.counts.stale.fetch_add(1, Ordering::Relaxed);
             dropped(at.0, at.1, Some(header), TunnelWhy::Stale);
         }
@@ -803,9 +816,15 @@ impl Tunnel {
                     }
                 }
                 /* Full echoes unanswered for SILENT_S while the small ones
-                 * are: the way does not carry the networks' MTU */
+                 * are -- one answered since the first full one, and one
+                 * within the last two echoes: the way does not carry the
+                 * networks' MTU. Not while nothing comes back at all, a key
+                 * that no longer opens one's answers -- its message lost --
+                 * until the silence above asks for another: the way is not
+                 * what lost those */
                 if p.big_since != 0 && p.heard_at > p.big_since && !p.narrow_said
-                    && now.saturating_sub(p.big_since) >= SILENT_S * NS_PER_SEC && narrow.len() < narrow.capacity()
+                    && now.saturating_sub(p.big_since) >= SILENT_S * NS_PER_SEC
+                    && now.saturating_sub(p.heard_at) <= 2 * ECHO_S * NS_PER_SEC && narrow.len() < narrow.capacity()
                 {
                     p.narrow_said = true;
                     narrow.push((p.name.clone(), p.addr, p.port));
@@ -1073,6 +1092,10 @@ impl crate::net::Carrier for Tunnel {
 
     fn carry(&self, vni: u32, to: u32, packet: &[u8]) -> bool {
         self.send_packet(Kind::PortToPort, vni, to, packet) == Sent::Sent
+    }
+
+    fn carry_to(&self, node: u64, vni: u32, packet: &[u8]) -> bool {
+        self.send_to(node, Kind::PortToPort, vni, packet)
     }
 
     fn carry_out(&self, node: u64, vni: u32, packet: &[u8]) -> bool {

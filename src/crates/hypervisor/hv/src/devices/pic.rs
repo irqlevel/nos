@@ -298,4 +298,34 @@ impl Pic {
             _ => {}
         }
     }
+
+    /// What the guest has made of the pair, for a VM's state (`vmstate`).
+    pub fn save(&self) -> vmstate::Pic {
+        vmstate::Pic { master: self.master.save(), slave: self.slave.save(), elcr: self.elcr }
+    }
+
+    /// Made what `s` says -- each chip at a step of its initialisation there
+    /// is, its vectors whole eights, the ELCR's fixed bits as they are.
+    pub fn restore(&mut self, s: &vmstate::Pic) -> vmstate::Result<()> {
+        if s.elcr & !ELCR_WRITABLE != 0 {
+            return Err(vmstate::Error("an ELCR with a bit set the chipset keeps clear"));
+        }
+        *self = Pic { master: Chip::restore(&s.master)?, slave: Chip::restore(&s.slave)?, elcr: s.elcr };
+        Ok(())
+    }
+}
+
+impl Chip {
+    fn save(&self) -> vmstate::PicChip {
+        vmstate::PicChip { irr: self.irr, isr: self.isr, imr: self.imr, vector_base: self.vector_base,
+                           init_step: self.init_step, expect_icw4: self.expect_icw4, read_isr: self.read_isr }
+    }
+
+    fn restore(s: &vmstate::PicChip) -> vmstate::Result<Chip> {
+        if !matches!(s.init_step, 0 | 2 | 3 | 4) || s.vector_base & 0x7 != 0 {
+            return Err(vmstate::Error("an 8259 at no step of its initialisation, or a vector base not a whole eight"));
+        }
+        Ok(Chip { irr: s.irr, isr: s.isr, imr: s.imr, vector_base: s.vector_base, init_step: s.init_step,
+                  expect_icw4: s.expect_icw4, read_isr: s.read_isr })
+    }
 }

@@ -111,6 +111,79 @@ pub trait Backend: Send {
     /// A request served, if one is: in the order they were served, which
     /// need not be the order they were submitted in.
     fn take(&mut self) -> Option<Request>;
+    /// The volume of the cluster's this disk is, and its writer's generation
+    /// -- what a migration's handover takes it from (plans/vm-migration.md).
+    /// None for a disk of the host's own.
+    fn writer(&self) -> Option<(&str, u64)> {
+        None
+    }
+}
+
+/// A disk that stands in for one not had yet -- a migration's new host's,
+/// until the handover gives it the volume (`Blk::set_backend`): the guest
+/// sees its size, its block and what it takes, as it saw the disk on the old
+/// host, and nothing is ever asked of it -- the guest does not run until
+/// the disk is had. A request handed it all the same is an error the guest
+/// is told of, not a hang.
+pub struct Standin {
+    pub bytes: u64,
+    pub block: u32,
+    pub read_only: bool,
+    pub discards: bool,
+    pub writes_zeroes: bool,
+    done: alloc::collections::VecDeque<Request>,
+}
+
+impl Standin {
+    pub fn new(bytes: u64, block: u32, read_only: bool, discards: bool, writes_zeroes: bool) -> Option<Standin> {
+        let mut done = alloc::collections::VecDeque::new();
+        done.try_reserve_exact(IN_FLIGHT).ok()?;
+        Some(Standin { bytes, block, read_only, discards, writes_zeroes, done })
+    }
+}
+
+impl Backend for Standin {
+    fn size(&self) -> u64 {
+        self.bytes
+    }
+    fn read_only(&self) -> bool {
+        self.read_only
+    }
+    fn discards(&self) -> bool {
+        self.discards
+    }
+    fn writes_zeroes(&self) -> bool {
+        self.writes_zeroes
+    }
+    fn block_size(&self) -> u32 {
+        self.block
+    }
+    fn with_buffer(&mut self, _slot: usize, _use_it: &mut dyn FnMut(&mut [u8]) -> bool) -> bool {
+        false
+    }
+    fn submit(&mut self, mut req: Request) {
+        req.done(false);
+        /* Into the room taken at `new`: the device never has more out. */
+        if self.done.len() < IN_FLIGHT {
+            self.done.push_back(req);
+        }
+    }
+    fn take(&mut self) -> Option<Request> {
+        self.done.pop_front()
+    }
+}
+
+/// A disk as its guest sees it (`Blk::shape`): what a stand-in of it is
+/// made to be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shape {
+    pub bytes: u64,
+    pub block: u32,
+    pub read_only: bool,
+    pub discards: bool,
+    pub writes_zeroes: bool,
+    /// What its GET_ID says, NUL-padded.
+    pub id: [u8; ID_BYTES],
 }
 
 /// What a request asks of the disk.
@@ -460,6 +533,10 @@ pub struct Blk {
     /// A request that waits for the writes with the backend, nothing more
     /// taken off the ring behind it: started first as they come back.
     parked: Option<Parked>,
+    /// Nothing more taken off the ring (`quiesce`): what is with the backend
+    /// comes back and is given to the guest, and a request parked behind
+    /// writes is still started -- a VM paused for its state, being drained.
+    quiesced: bool,
     pub stats: Stats,
 }
 
@@ -484,17 +561,8 @@ impl Blk {
          * may be written, what its backend takes of the two -- a write of
          * zeros only where a block is a sector: of part of one it would be
          * a read, a merge and a write of its own. */
-        let bs = block_bytes(&*backend);
-        let ro = if backend.read_only() {
-            F_RO
-        } else {
-            (if backend.discards() { F_DISCARD } else { 0 })
-                | (if backend.writes_zeroes() && bs == SECTOR { F_WRITE_ZEROES } else { 0 })
-        };
-        let topology = if bs != SECTOR { F_TOPOLOGY } else { 0 };
         Ok(Blk {
-            transport: Transport::new(F_SIZE_MAX | F_SEG_MAX | F_FLUSH | virtio::F_EVENT_IDX | virtio::F_INDIRECT_DESC
-                                      | ro | topology, queues),
+            transport: Transport::new(Self::features_of(&*backend), queues),
             backend,
             slots,
             waiting: false,
@@ -506,8 +574,108 @@ impl Blk {
             broken: None,
             rmw: false,
             parked: None,
+            quiesced: false,
             stats: Stats::default(),
         })
+    }
+
+    /// The features a device over `backend` offers: what a backend that
+    /// takes its place must have the device offer alike (`set_backend`).
+    fn features_of(backend: &dyn Backend) -> u32 {
+        let bs = block_bytes(backend);
+        let ro = if backend.read_only() {
+            F_RO
+        } else {
+            (if backend.discards() { F_DISCARD } else { 0 })
+                | (if backend.writes_zeroes() && bs == SECTOR { F_WRITE_ZEROES } else { 0 })
+        };
+        let topology = if bs != SECTOR { F_TOPOLOGY } else { 0 };
+        F_SIZE_MAX | F_SEG_MAX | F_FLUSH | virtio::F_EVENT_IDX | virtio::F_INDIRECT_DESC | ro | topology
+    }
+
+    /// Stop taking chains off the ring, or take them again: a VM paused for
+    /// its state is drained by the first -- what is with the backend still
+    /// comes back and is given to the guest, a request parked behind writes
+    /// still started -- and one that goes on after all by the second, which
+    /// has the next round look at the ring.
+    pub fn quiesce(&mut self, on: bool) {
+        self.quiesced = on;
+        if !on {
+            self.more = true;
+        }
+    }
+
+    /// The ranges its queues' rings are in (`Transport::rings`).
+    pub fn rings(&self, out: &mut dyn FnMut(u64, u64)) {
+        self.transport.rings(out);
+    }
+
+    /// The disk as its guest sees it: what a stand-in for it is made to be.
+    pub fn shape(&self) -> Shape {
+        let b = &*self.backend;
+        Shape { bytes: self.disk_bytes(), block: self.block() as u32, read_only: b.read_only(),
+                discards: b.discards(), writes_zeroes: b.writes_zeroes(), id: self.id }
+    }
+
+    /// Its backend's volume and writer's generation (`Backend::writer`).
+    pub fn writer(&self) -> Option<(&str, u64)> {
+        self.backend.writer()
+    }
+
+    /// Whether nothing of the guest's is with the backend, or waits for it:
+    /// what its state may be read at.
+    pub fn drained(&self) -> bool {
+        self.parked.is_none() && !self.rmw && self.slots.iter().all(|s| !s.out && s.head.is_none())
+    }
+
+    /// What the driver made of it, for a VM's state (`vmstate`) -- drained
+    /// first: a disk with a request in flight has a state no other host
+    /// could go on from.
+    pub fn save(&self) -> vmstate::Result<vmstate::Blk> {
+        if !self.drained() {
+            return Err(vmstate::Error("a disk with requests in flight"));
+        }
+        let transport = self.transport.save().ok_or(vmstate::Error("no memory for a disk's state"))?;
+        Ok(vmstate::Blk { transport, broken: self.broken.map(Broken::code) })
+    }
+
+    /// Made what `s` says, on a device built over a disk the guest sees as
+    /// it saw the one it was saved over -- the same features, the same queue
+    /// -- its rings set up again in `mem` at `now`. Its first round looks at
+    /// the ring: what the driver made available and the device had not
+    /// taken is taken then.
+    pub fn restore(&mut self, s: &vmstate::Blk, mem: &GuestMemory, now: u64) -> vmstate::Result<()> {
+        if !self.drained() {
+            return Err(vmstate::Error("a disk restored with requests in flight"));
+        }
+        let broken = match s.broken {
+            None => None,
+            Some(c) => Some(Broken::from_code(c).ok_or(vmstate::Error("a ring broken in no way there is"))?),
+        };
+        self.transport.restore(&s.transport, mem, now)?;
+        self.broken = broken;
+        self.waiting = false;
+        self.kickless = false;
+        self.more = true;
+        self.moved = 0;
+        self.quiesced = false;
+        Ok(())
+    }
+
+    /// `backend` in place of the one it was built over -- one that stood in
+    /// for the disk until it could be had, a migration's handover -- with
+    /// nothing of the guest's with that one: given back. Refused, and
+    /// handed back, unless the guest sees the disk alike through it: the
+    /// same size, the same block, the same features.
+    pub fn set_backend(&mut self, backend: Box<dyn Backend>) -> core::result::Result<Box<dyn Backend>, Box<dyn Backend>> {
+        let same = self.drained()
+            && Self::features_of(&*backend) == Self::features_of(&*self.backend)
+            && block_bytes(&*backend) == self.block()
+            && backend.size() / self.block() * self.block() == self.disk_bytes();
+        if !same {
+            return Err(backend);
+        }
+        Ok(core::mem::replace(&mut self.backend, backend))
     }
 
     pub fn identity() -> Identity {
@@ -774,6 +942,11 @@ impl Blk {
                     return answered;
                 }
             }
+        }
+        if self.quiesced {
+            /* Drained: nothing more off the ring until it goes on, which
+             * looks again (`quiesce`). */
+            return answered;
         }
         let mut left = PASS;
         while self.broken.is_none() {

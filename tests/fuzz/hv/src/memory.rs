@@ -103,8 +103,46 @@ struct Shared {
     late: Mutex<Option<LatePost>>,
 }
 
+/// The real one's `hvarch::x86::svm::Nested`: what an entry names its
+/// table by.
+pub struct Nested {
+    pub root: u64,
+    pub id: u64,
+}
+
+/// The nested table as the dirty log sees it: which pages of RAM are
+/// read-only to the guest.
+#[derive(Default)]
+pub struct Protected {
+    ram: Vec<(u64, u64)>,
+    ro: std::collections::BTreeSet<u64>,
+}
+
+impl crate::dirty::Table for Protected {
+    fn protect(&mut self, gpa: u64) -> bool {
+        if !self.ram.iter().any(|&(b, s)| gpa >= b && gpa - b < s) {
+            return false;
+        }
+        self.ro.insert(gpa);
+        true
+    }
+    fn unprotect(&mut self, gpa: u64) -> bool {
+        if !self.ram.iter().any(|&(b, s)| gpa >= b && gpa - b < s) {
+            return false;
+        }
+        self.ro.remove(&gpa);
+        true
+    }
+}
+
 pub struct GuestMemory {
     regions: Vec<Region>,
+    /// The dirty log, as the real one keeps it (`crate::dirty`), over a
+    /// table of which pages are read-only to the guest; and the table's
+    /// identity for the TLBs, new with each narrowing.
+    log: crate::dirty::Log,
+    table: Mutex<Protected>,
+    id: AtomicU64,
     shared: Arc<Shared>,
     absent: Mutex<Vec<u64>>,
     /// `map` refuses, as the real one does with no address left.
@@ -122,6 +160,9 @@ impl GuestMemory {
     pub fn new(_vendor: Vendor) -> Result<GuestMemory> {
         Ok(GuestMemory {
             regions: Vec::new(),
+            log: crate::dirty::Log::new(),
+            table: Mutex::new(Protected::default()),
+            id: AtomicU64::new(1),
             shared: Arc::new(Shared { pages: Mutex::new(Pages::default()), racer: Mutex::new(None), late: Mutex::new(None) }),
             absent: Mutex::new(Vec::new()),
             refuse_maps: AtomicBool::new(false),
@@ -374,6 +415,10 @@ impl GuestMemory {
         if self.regions.iter().any(|r| base < r.base + r.size && r.base < base + size) {
             return Err(Error::BadAddress);
         }
+        if !self.log.add(base, size) {
+            return Err(Error::NoMemory);
+        }
+        self.table.lock().unwrap().ram.push((base, size));
         self.regions.push(Region { base, size, huge });
         Ok(())
     }
@@ -392,6 +437,17 @@ impl GuestMemory {
         self.regions.iter().any(|r| r.contains(gpa, len))
     }
 
+    /// The real one's: whether `[gpa, gpa + len)` is RAM of one region,
+    /// whole.
+    pub fn is_ram(&self, gpa: u64, len: u64) -> bool {
+        len != 0 && self.backs(gpa, len)
+    }
+
+    /// The real one's: the regions, base and size.
+    pub fn ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.regions.iter().map(|r| (r.base, r.size))
+    }
+
     fn inside(&self, gpa: u64, len: usize) -> Result<()> {
         if self.regions.iter().any(|r| r.contains(gpa, len as u64)) { Ok(()) } else { Err(Error::Unmapped) }
     }
@@ -407,7 +463,65 @@ impl GuestMemory {
         self.inside(gpa, data.len())?;
         self.shared.write(gpa, data);
         self.moved.fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.log.wrote(gpa, data.len() as u64);
         Ok(())
+    }
+
+    /// The real one's: the table's top level and its identity now.
+    pub fn nested(&self) -> Nested {
+        Nested { root: 1, id: self.id.load(Ordering::Acquire) }
+    }
+
+    pub fn table_root(&self) -> u64 {
+        1
+    }
+
+    /// The real one's steps, over the model table.
+    pub fn write_fault(&self, gpa: u64) -> bool {
+        if self.inside(gpa & !(PAGE - 1), PAGE as usize).is_err() {
+            return false;
+        }
+        let mut t = self.table.lock().unwrap();
+        self.log.fault(&mut *t, gpa)
+    }
+
+    fn renew(&self) -> u64 {
+        self.id.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub fn log_start(&self) -> Result<u64> {
+        let mut t = self.table.lock().unwrap();
+        if !self.log.start(&mut *t) {
+            self.log.release(&mut *t);
+            self.renew();
+            return Err(Error::NoMemory);
+        }
+        Ok(self.renew())
+    }
+
+    pub fn log_take(&self, out: &mut dyn FnMut(u64)) -> Result<(u64, u64)> {
+        let mut t = self.table.lock().unwrap();
+        let n = self.log.take(Some(&mut *t), out);
+        let id = self.renew();
+        n.map(|n| (n, id)).ok_or(Error::NoMemory)
+    }
+
+    pub fn log_last(&self, out: &mut dyn FnMut(u64)) -> u64 {
+        self.log.take(None, out).unwrap_or(0)
+    }
+
+    pub fn log_marked(&self) -> u64 {
+        self.log.marked()
+    }
+
+    pub fn log_stop(&self) {
+        let mut t = self.table.lock().unwrap();
+        self.log.release(&mut *t);
+    }
+
+    /// Whether the page at `gpa` is read-only to the guest now.
+    pub fn protected(&self, gpa: u64) -> bool {
+        self.table.lock().unwrap().ro.contains(&(gpa & !(PAGE - 1)))
     }
 
     /// The bytes `read` and `write` have moved so far.

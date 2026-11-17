@@ -115,6 +115,13 @@ pub mod run;
 pub mod smbios;
 #[path = "../../../../src/crates/hypervisor/hv/src/smp.rs"]
 pub mod smp;
+/// A CPU's registers in a VM's state, as both backends read and write them.
+#[path = "../../../../src/crates/hypervisor/hv/src/state.rs"]
+pub mod state;
+/// A migration's dirty log: the marks, the round's steps, the table behind
+/// a trait -- as hv has them (`memory.rs` here holds it as the real one does).
+#[path = "../../../../src/crates/hypervisor/hv/src/dirty.rs"]
+pub mod dirty;
 /// hv's records of what its guests' CPUs do (`kcore::trace`'s events, group
 /// `hv`): built from every exit the scripts make, and every halt, wake,
 /// injection and ring the run loop meets, when a target turns them on.
@@ -140,8 +147,11 @@ pub mod vmconfig;
 pub mod walk;
 
 mod configmodel;
+mod dirtymodel;
 mod fwmodel;
 mod guestnet;
+mod handovermodel;
+mod migwiremodel;
 mod netrx;
 mod offloadmodel;
 mod placemodel;
@@ -150,6 +160,7 @@ mod policymodel;
 mod recycle;
 mod relaymodel;
 mod smbiosmodel;
+mod statemodel;
 mod targets;
 mod tunnelmodel;
 mod virtq;
@@ -371,6 +382,8 @@ fn main() {
         platform::report();
         guestnet::report();
         vnetmodel::report();
+        println!("  flowmove: {} flows carried to another host's port",
+                 vnetmodel::FLOWS_CARRIED.load(std::sync::atomic::Ordering::Relaxed));
         tunnelmodel::report();
         placemodel::report();
         offloadmodel::report();
