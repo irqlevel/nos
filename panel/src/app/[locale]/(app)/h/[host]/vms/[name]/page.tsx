@@ -2,6 +2,7 @@ import { notFound } from 'next/navigation';
 
 import { VmView } from '@/components/VmView';
 import { descriptor } from '@/lib/catalog';
+import { hosts } from '@/lib/hosts';
 import { isLocale, words } from '@/lib/i18n';
 
 export default async function VmPage({ params }: { params: Promise<{ locale: string; host: string; name: string }> }) {
@@ -11,5 +12,6 @@ export default async function VmPage({ params }: { params: Promise<{ locale: str
   if (!d) notFound();
   const nbs = await descriptor(host, 'nbs');
   const fw = await descriptor(host, 'fw');
-  return <VmView host={host} name={name} d={d} nbs={nbs} fw={fw} locale={locale} w={words(locale)} />;
+  return <VmView host={host} name={name} d={d} nbs={nbs} fw={fw} hosts={hosts().map((h) => ({ id: h.id, name: h.name }))}
+    locale={locale} w={words(locale)} />;
 }

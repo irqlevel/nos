@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 
 import { CopyButton } from './CopyButton';
 import { JobWatch } from './JobWatch';
-import { call, Refusal, startJob } from '@/lib/client';
+import { call, JobRecord, Refusal, startJob } from '@/lib/client';
 import { Choices, Field, Method } from '@/lib/descriptor';
 import { addressFor, at, copyable, fillOf, ipOfUrl } from '@/lib/fills';
 import { Locale, text, Words } from '@/lib/i18n';
@@ -52,9 +52,9 @@ function valueOf(f: Field, raw: string, unit: number): { ok: true; v: unknown } 
  * read of the host's gives (`choices`: a VM's firewall) is a list of them;
  * what is too long to select by eye in an answer -- an invitation's token --
  * has a button that copies it. */
-export function MethodForm({ host, provider, name, method, fixed = {}, locale, w, onDone }: {
+export function MethodForm({ host, provider, name, method, fixed = {}, locale, w, onDone, onStart }: {
   host: string; provider: string; name: string; method: Method; fixed?: Record<string, unknown>;
-  locale: Locale; w: Words; onDone?: () => void;
+  locale: Locale; w: Words; onDone?: (job?: JobRecord) => void; onStart?: () => void;
 }) {
   const params = Object.entries(method.params ?? {}).filter(([k]) => !(k in fixed));
   const [raw, setRaw] = useState<Record<string, string>>(() =>
@@ -174,8 +174,10 @@ export function MethodForm({ host, provider, name, method, fixed = {}, locale, w
     setAnswer(null);
     if (method.kind === 'job') {
       const r = await startJob(host, provider, name, body);
-      if (r.ok) setJob(r.id);
-      else setError(r.error);
+      if (r.ok) {
+        setJob(r.id);
+        onStart?.();
+      } else setError(r.error);
     } else {
       const r = await call(host, provider, name, body);
       if (r.ok) {
@@ -289,7 +291,7 @@ export function MethodForm({ host, provider, name, method, fixed = {}, locale, w
           {copyable(answer).map(([k, v]) => <CopyButton key={k} value={v} label={`${w.copy} ${k}`} w={w} />)}
         </div>
       )}
-      {job !== null && <JobWatch host={host} id={job} w={w} onDone={() => onDone?.()} />}
+      {job !== null && <JobWatch host={host} id={job} w={w} onDone={(r) => onDone?.(r)} />}
     </form>
   );
 }
