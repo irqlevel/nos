@@ -13,6 +13,12 @@
 # done leaves the chunks at one replica, the EX44's, for as long as it
 # takes. The last waited for too, so that the stand is left whole.
 #
+# A neighbour that runs a VM is not taken down: its poweroff stops the VM
+# with it, a guest of the stand's -- move it to the other neighbour first
+# (`hv migrate <vm> <host>`, live), and back after, as a host is updated
+# with its VMs kept running. Its list read through its UDP shell, and a
+# list not read is a refusal too.
+#
 # A neighbour back says what NBS was before it went until its member has
 # caught up with the leader -- every chunk at three replicas, its own cs's
 # taking down not yet heard of -- so it is not asked before it has applied
@@ -74,6 +80,12 @@ for name in "$@"; do
     for m in $MODS; do [ -f modules/$m.ko ] || { echo "no modules/$m.ko"; exit 1; }; done
     [ -f modules/hvboot ] || { echo "no modules/hvboot"; exit 1; }
     echo "== $name: $(NSH_TIMEOUT=10 python3 nsh.py $ip version 2>/dev/null | head -1)"
+    vms=$(NSH_TIMEOUT=20 python3 nsh.py $ip "hv list" 2>/dev/null) || { echo "   $name's VMs not read -- not taken down"; exit 1; }
+    running=$(printf '%s\n' "$vms" | awk '$1 == "vm" && $4 != "stopped" { print $3 }' | tr '\n' ' ')
+    if [ -n "$running" ]; then
+        echo "   $name runs $running-- not taken down: move them to the other neighbour first (hv migrate <vm> <host>)"
+        exit 1
+    fi
     if [ -z "$HAS_NBS" ]; then
         line=$(nbs_line $ip)
         HAS_NBS=0
