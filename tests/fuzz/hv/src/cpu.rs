@@ -536,6 +536,16 @@ pub mod x86 {
 pub mod svm {
     pub use crate::exit::{Exit, Instr, Io};
 
+    /* svm.rs's, which state.rs reads a CPU's state by. */
+    pub const CR0_PE: u64 = 1 << 0;
+    pub const CR0_NW: u64 = 1 << 29;
+    pub const CR0_CD: u64 = 1 << 30;
+    pub const CR0_PG: u64 = 1 << 31;
+    pub const CR4_PAE: u64 = 1 << 5;
+    pub const EFER_LME: u64 = 1 << 8;
+    pub const EFER_LMA: u64 = 1 << 10;
+    pub const EFER_SVME: u64 = 1 << 12;
+
     #[derive(Clone, Copy, Debug, Default)]
     pub struct LongMode {
         pub entry: u64,
@@ -685,6 +695,11 @@ pub mod vm {
         /// delivery on, and exits for otherwise, as a notification does.
         pub pi_capable: bool,
         posted: Option<Arc<crate::x86::vmx::PostedInterrupts>>,
+        /// What its TSC is ahead of the host's, as both backends keep it.
+        tsc_offset: u64,
+        /// Its XSAVE area as a state carries it: nothing this model runs
+        /// uses, carried as it was given.
+        fp_area: Vec<u8>,
     }
 
     /// What the modelled virtual APIC did, for `HV_FUZZ_STATS`.
@@ -733,7 +748,73 @@ pub mod vm {
                 stored: None,
                 pi_capable: false,
                 posted: None,
+                tsc_offset: 0,
+                fp_area: vec![0; 832],
             }
+        }
+
+        /// As svm.rs's and vmx.rs's: its registers and what is on its way
+        /// in, for a VM's state -- the save area's read by state.rs, as the
+        /// backends' are, the rest from this model's own.
+        pub fn save_regs(&mut self) -> vmstate::Result<vmstate::Regs> {
+            let mut r = vmstate::Regs::zeroed();
+            crate::state::save_common(&self.save, &self.regs, &mut r);
+            r.cr4 = self.cr4;
+            r.cr8 = self.cr8();
+            r.dr = self.debug_addrs;
+            r.tsc_aux = self.tsc_aux;
+            r.spec_ctrl = self.spec_ctrl;
+            r.xcr0 = self.xcr0;
+            r.xsave = self.fp_area.clone();
+            r.event = self.event.map(|e| match e {
+                Event::Interrupt(v) => vmstate::Event { kind: vmstate::EventKind::External, vector: v, error: None },
+                Event::Nmi => vmstate::Event { kind: vmstate::EventKind::Nmi, vector: 2, error: None },
+                Event::Exception(v) => vmstate::Event {
+                    kind: vmstate::EventKind::Exception, vector: v,
+                    error: (vmstate::ERROR_CODE_VECTORS & (1 << (v % 32)) != 0).then_some(0),
+                },
+            });
+            r.shadow = self.shadow;
+            r.nmi_blocked = self.nmi_masked;
+            Ok(r)
+        }
+
+        /// As the backends': made what `r` says, checked by state.rs.
+        pub fn restore_regs(&mut self, r: &vmstate::Regs) -> vmstate::Result<()> {
+            if r.pending_debug != 0 {
+                return Err(vmstate::Error("debug exceptions pending"));
+            }
+            crate::state::restore_common(r, &mut self.save, &mut self.regs)?;
+            self.save.efer |= crate::svm::EFER_SVME;
+            self.save.cr4 = r.cr4 | CR4_MCE;
+            self.cr4 = r.cr4;
+            self.set_cr8(r.cr8);
+            self.debug_addrs = r.dr;
+            self.tsc_aux = r.tsc_aux;
+            self.spec_ctrl = r.spec_ctrl;
+            self.xcr0 = r.xcr0;
+            self.fp_area = r.xsave.clone();
+            self.event = r.event.map(|e| match e.kind {
+                vmstate::EventKind::Nmi => Event::Nmi,
+                vmstate::EventKind::Exception => Event::Exception(e.vector),
+                _ => Event::Interrupt(e.vector),
+            });
+            self.shadow = r.shadow;
+            self.nmi_masked = r.nmi_blocked;
+            self.irq_window = false;
+            self.nmi_window = false;
+            self.tpr_window = 0;
+            self.apicv_entered = false;
+            self.stored = None;
+            Ok(())
+        }
+
+        pub fn set_tsc_offset(&mut self, offset: u64) {
+            self.tsc_offset = offset;
+        }
+
+        pub fn tsc_offset(&self) -> u64 {
+            self.tsc_offset
         }
 
         pub fn save(&self) -> &Save {
@@ -958,7 +1039,8 @@ pub mod vm {
         }
         /// As vm.rs's: the guest's MSRs its save area does not hold.
         pub fn own_msrs(&self) -> crate::policy::Own {
-            crate::policy::Own { tsc_aux: self.tsc_aux, spec_ctrl: self.spec_ctrl, ibpbs: self.ibpbs }
+            crate::policy::Own { tsc_aux: self.tsc_aux, spec_ctrl: self.spec_ctrl, ibpbs: self.ibpbs,
+                                 tsc_offset: self.tsc_offset }
         }
         /// As vm.rs's, over hvarch's `GuestMsrs::set`: held to what the MSRs
         /// can hold -- a value the policy took that an entry's WRMSR of it

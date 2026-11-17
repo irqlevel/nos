@@ -148,7 +148,7 @@ impl Backend {
     /// make the CPU's, and the IBPBs it asked for (`hvarch::x86::msrs`).
     pub fn own_msrs(&self) -> crate::policy::Own {
         let m = match self { Backend::Svm(v) => v.msrs(), Backend::Vmx(v) => v.msrs() };
-        crate::policy::Own { tsc_aux: m.tsc_aux(), spec_ctrl: m.spec_ctrl(), ibpbs: m.ibpbs() }
+        crate::policy::Own { tsc_aux: m.tsc_aux(), spec_ctrl: m.spec_ctrl(), ibpbs: m.ibpbs(), tsc_offset: self.tsc_offset() }
     }
     /// Make `own` the guest's, for a WRMSR the policy performed -- an IBPB
     /// asked for where its count is one more: false, and nothing changed,
@@ -363,6 +363,23 @@ impl Backend {
     pub fn asid(&self) -> Option<u32> {
         match self { Backend::Svm(v) => v.asid(), Backend::Vmx(v) => v.asid() }
     }
+    /// Its registers and what is on its way into it, for a VM's state
+    /// (`vmstate`): on the host CPU it last ran on, where VT-x's VMCS is
+    /// still current.
+    pub fn save_regs(&mut self) -> vmstate::Result<vmstate::Regs> {
+        match self { Backend::Svm(v) => v.save_regs(), Backend::Vmx(v) => v.save_regs() }
+    }
+    /// Made what `r` says, checked whole first: a CPU restored.
+    pub fn restore_regs(&mut self, r: &vmstate::Regs) -> vmstate::Result<()> {
+        match self { Backend::Svm(v) => v.restore_regs(r), Backend::Vmx(v) => v.restore_regs(r) }
+    }
+    /// The guest's TSC from its next entry on: the host's plus `offset`.
+    pub fn set_tsc_offset(&mut self, offset: u64) {
+        match self { Backend::Svm(v) => v.set_tsc_offset(offset), Backend::Vmx(v) => v.set_tsc_offset(offset) }
+    }
+    pub fn tsc_offset(&self) -> u64 {
+        match self { Backend::Svm(v) => v.tsc_offset(), Backend::Vmx(v) => v.tsc_offset() }
+    }
 }
 
 /// One guest CPU: made for the memory of one guest, and entered with that
@@ -373,7 +390,9 @@ impl Backend {
 /// refuses that, so the pairing is kept by the type rather than by care.
 pub struct Cpu {
     backend: Backend,
-    /// The identity of the nested table it was made for.
+    /// The top level of the nested table it was made for: the same for the
+    /// table's life, whatever identity the TLBs know it by (a migration's
+    /// dirty log gives it new ones).
     table: u64,
     /// Its number in its guest, which its trace records say it by.
     index: u32,
@@ -393,7 +412,7 @@ impl Cpu {
             Ext::Svm => Backend::Svm(crate::svm::Vcpu::new(caps, exceptions)?),
             Ext::Vmx => Backend::Vmx(crate::vmx::Vcpu::new(caps, exceptions)?),
         };
-        Ok(Self { backend, table: memory.nested().id, index, pid: kcore::trace::pid() })
+        Ok(Self { backend, table: memory.table_root(), index, pid: kcore::trace::pid() })
     }
 
     /// Note that the task calling this runs the CPU from here on: the pid
@@ -428,7 +447,7 @@ impl Cpu {
                  fast: Option<&mut dyn FastExit>)
         -> core::result::Result<(Exit, u32), Refusal>
     {
-        if memory.nested().id != self.table {
+        if memory.table_root() != self.table {
             return Err(Refusal::NotItsMemory);
         }
         let entered = self.backend.enter(memory, machine.host_areas(), kick, fast);

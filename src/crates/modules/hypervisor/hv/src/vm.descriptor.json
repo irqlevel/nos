@@ -121,7 +121,14 @@
       "params": {"name": {"type": "string", "required": true, "title": {"en": "Name", "ru": "Имя"},
           "help": {"en": "Lowercase letters, digits, . _ and -.", "ru": "Строчные буквы, цифры, . _ и -."}},
         "from": {"type": "string", "required": true, "title": {"en": "URL or file", "ru": "URL или файл"},
-          "help": {"en": "An http:// or https:// URL, or a file of nos's by its path.", "ru": "URL http:// или https://, либо путь к файлу nos."}}}}
+          "help": {"en": "An http:// or https:// URL, or a file of nos's by its path.", "ru": "URL http:// или https://, либо путь к файлу nos."}}}},
+    "migrate": {"kind": "job", "title": {"en": "Move to another host", "ru": "Перенести на другой хост"},
+      "help": {"en": "A running VM moved to another host of the cluster's, its memory copied as it runs and paused for the last of it -- its disks volumes of NBS's, its network the cluster's. A cancel before the last round's end leaves it running here.", "ru": "Работающая машина переезжает на другой хост кластера: память копируется на ходу, на последнюю часть машина приостанавливается. Её диски -- тома NBS, сеть -- сеть кластера. Отмена до конца последнего раунда оставляет её работать здесь."},
+      "confirm": {"en": "Move this VM to the host chosen? It pauses for a moment at the end.", "ru": "Перенести машину на выбранный хост? В конце она на мгновение приостановится."},
+      "params": {"name": {"type": "string", "required": true, "title": {"en": "Name", "ru": "Имя"}},
+        "host": {"type": "string", "required": true, "title": {"en": "Host", "ru": "Хост"},
+          "choices": {"provider": "cluster", "method": "hosts", "items": "hosts", "key": "name"}},
+        "cold": {"type": "bool", "title": {"en": "Paused for the whole copy", "ru": "Остановить на всё копирование"}}}}
   },
   "resources": {
     "vms": {
@@ -148,7 +155,7 @@
       "columns": ["name", "state", "cpus", "memory_mib", "ip", "uptime_ms"],
       "actions": [{"method": "start", "params": {"name": "$name"}}, {"method": "stop", "params": {"name": "$name"}},
         {"method": "restart", "params": {"name": "$name"}}, {"method": "clone", "params": {"name": "$name"}},
-        {"method": "delete", "params": {"name": "$name"}}]
+        {"method": "migrate", "params": {"name": "$name"}}, {"method": "delete", "params": {"name": "$name"}}]
     },
     "disks": {
       "title": {"en": "Disks", "ru": "Диски"},

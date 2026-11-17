@@ -48,7 +48,7 @@ export function VmView({ host, name, d, nbs = null, fw = null, locale, w }: {
   const vm = (got?.vm ?? {}) as Record<string, unknown>;
   const fields = d.resources?.vms?.fields ?? {};
   const label: Record<Tab, string> = { overview: w.overview, console: w.console, config: w.config, disks: w.disks, forwards: w.forwards };
-  const actions = ['start', 'stop', 'restart', 'snapshot', 'clone', 'delete'].filter((m) => d.methods[m]);
+  const actions = ['start', 'stop', 'restart', 'snapshot', 'clone', 'migrate', 'delete'].filter((m) => d.methods[m]);
   /* Its disks that are volumes of NBS's: what has snapshots */
   const volumes = ((got?.disks ?? []) as Array<{ file?: unknown }>).map((x) => String(x.file ?? ''))
     .filter((f) => f.startsWith('nbs:')).map((f) => f.slice('nbs:'.length));

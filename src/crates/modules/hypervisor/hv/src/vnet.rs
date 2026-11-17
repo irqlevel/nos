@@ -13,8 +13,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use firewall::Action;
+use kcore::events::SharedEvent;
+use kcore::ipc::{Mailbox, Scope};
 use kcore::mgmt::{Status, Writer};
-use kcore::sync::{Event, Mutex};
+use kcore::sync::Mutex;
 use kcore::time::Duration;
 use mgmtwire::{Limits, Value};
 
@@ -252,6 +254,20 @@ pub fn networks() -> Vec<Network> {
     all
 }
 
+/// Port `id` of vnet's moved to host `to` -- from wherever it is: a
+/// migration's handover (plans/vm-migration.md) -- its new generation; the
+/// keepers of both hosts shut it there and attach it here as their tables
+/// say.
+pub fn port_move(id: u64, to: &str) -> Result<u64, String> {
+    let v = call("port_move", &|w| {
+        w.begin_object();
+        w.field_uint("port", id);
+        w.field_str("host", to);
+        w.end_object();
+    }).map_err(|(_, why)| why)?;
+    uint(&v, "generation").ok_or_else(|| String::from("vnet's answer to a move is not one"))
+}
+
 /// VM `uuid`'s NIC's port deleted, wherever it is: its id, 0 for none.
 pub fn detach(uuid: &[u8; 16]) -> Result<u64, String> {
     let v = call("detach", &|w| {
@@ -365,8 +381,10 @@ struct Here {
     shut: Option<String>,
 }
 
-/// What wakes the keeper: an answer the switch put on its ring for `hv0`.
-struct Bell(Event);
+/// What wakes the keeper: an answer the switch put on its ring for `hv0`, a
+/// turn asked for now (`turn_now`), and vnet's word of a change -- its
+/// mailbox made on it.
+struct Bell(SharedEvent);
 
 impl Wake for Bell {
     fn wake_up(&self) {
@@ -404,16 +422,18 @@ pub struct Keeper {
     serving: Mutex<Vec<String>>,
     /// Why a port here was last not moved to its firewall, said once.
     judging: Mutex<Option<String>>,
+    /// A turn asked for now, not at the next second (`turn_now`).
+    asked: AtomicBool,
 }
 
 impl Keeper {
     /// The keeper of `switch`, woken as it puts an answer on its ring.
     pub fn new(switch: Arc<Switch>, firewalls: Arc<Firewalls>, tunnel: Arc<Tunnel>) -> Option<Arc<Keeper>> {
-        let bell = Arc::new(Bell(Event::new()?));
+        let bell = Arc::new(Bell(SharedEvent::new()?));
         let keeper = Arc::new(Keeper {
             switch, firewalls, tunnel, bell, here: Mutex::new(Vec::new())?, known: Mutex::new(None)?,
             gone: AtomicBool::new(false), failed: Mutex::new(None)?, confirm_due: AtomicU64::new(0),
-            serving: Mutex::new(Vec::new())?, judging: Mutex::new(None)?,
+            serving: Mutex::new(Vec::new())?, judging: Mutex::new(None)?, asked: AtomicBool::new(false),
         });
         let woken: Arc<dyn Wake> = keeper.bell.clone();
         drop(keeper.switch.on_answers(Some(woken)));
@@ -428,16 +448,46 @@ impl Keeper {
 
     /// The task's body, until it is asked to stop.
     pub fn run(keeper: Arc<Keeper>) {
+        /* vnet's word of each change of its state it applies, on the bell's
+         * event: the table asked for at once (vnetmeta::KEEPER). Without
+         * it, at the next second */
+        let told = match Mailbox::new_on(kcore::ipc::Limits { messages: 4, bytes: 256 }, &keeper.bell.0) {
+            Ok(mb) => {
+                if let Err(e) = mb.register(vnetmeta::KEEPER, Scope::Host) {
+                    kcore::klog!(0, "hv: {} not named -- {}: vnet's changes seen here within a second, not at once",
+                                 vnetmeta::KEEPER, e.name());
+                }
+                Some(mb)
+            }
+            Err(e) => {
+                kcore::klog!(0, "hv: no mailbox for vnet's word of a change -- {}: its changes seen here within a \
+                                 second, not at once", e.name());
+                None
+            }
+        };
         let mut due = 0;
         while !kcore::task::stopping() {
             keeper.bell.0.wait_for(Duration::from_millis(TURN_MS));
+            let mut word = false;
+            if let Some(mb) = told.as_ref() {
+                while mb.try_recv().is_some() {
+                    word = true;
+                }
+            }
             keeper.switch.hand_in();
             let now = kcore::time::boot_time_ns();
-            if now >= due {
+            if now >= due || word || keeper.asked.swap(false, Ordering::AcqRel) {
                 due = now + TURN_MS * NS_PER_MS;
                 keeper.turn();
             }
         }
+    }
+
+    /// vnet's table asked for at once, not at the next turn: a port moved
+    /// here or away -- a migration's -- which the table says where it is.
+    pub fn turn_now(&self) {
+        self.asked.store(true, Ordering::Release);
+        self.bell.0.signal();
     }
 
     /// A VM's port on slot `slot` attached as `a`.

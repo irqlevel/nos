@@ -1405,6 +1405,43 @@ const jobMethods = {
       return { id, reason: 'it turned itself off (ACPI S5)', asked: 'answered', forwards_taken: 0 };
     });
   },
+  /* A running VM moved to another host of the cluster's, as `hv migrate`
+   * moves it: refused for this host, for a host the cluster has not and for
+   * a VM that is not running; its rounds said as they go, and then it is
+   * gone from this host's list -- the other host's now. */
+  'vm.migrate': (p) => {
+    const v = vmNamed(p);
+    const host = need(p, 'host');
+    if (host === me.name) {
+      throw new Refused('failed', host + ' is this host');
+    }
+    if (!clusterHost(host)) {
+      throw new Refused('failed', v.name + ' not moved -- hv.migrate@' + host + ' not reached: no_route');
+    }
+    if (v.state !== 'running') {
+      throw new Refused('failed', 'vm ' + v.name + ' is not running');
+    }
+    const cold = p.cold === true;
+    const mib = v.memory_mib;
+    const lines = cold
+      ? [v.name + ' offered to ' + host + ': ' + mib + ' MiB, ' + v.cpus + ' cpu, 1 file of its folder',
+        v.name + ' round 0: 212 MiB of its memory (190000 pages of zeros) and 14 KiB of files in 2210 ms',
+        v.name + ' sent in 1 round: 212 MiB of its memory, 14 KiB of files, its state 2 KiB, 4 flows of its firewall'
+          + ' -- paused 2230 ms so far',
+        v.name + ' runs on ' + host + ' -- paused 2260 ms; its folder here taken away']
+      : [v.name + ' offered to ' + host + ': ' + mib + ' MiB, ' + v.cpus + ' cpu, 1 file of its folder',
+        v.name + ' round 0: 212 MiB of its memory (190000 pages of zeros) and 14 KiB of files in 2210 ms, the pages it'
+          + ' wrote meanwhile marked',
+        v.name + ' round 1: 1840 pages (12 of zeros) in 74 ms; 210 written meanwhile',
+        v.name + ' sent in 3 rounds: 220 MiB of its memory, 14 KiB of files, its state 2 KiB, 4 flows of its firewall'
+          + ' -- paused 190 ms so far',
+        v.name + ' runs on ' + host + ' -- paused 212 ms; its folder here taken away'];
+    return job('vm', 'migrate', lines.length, (i) => lines[i], () => {
+      vms.delete(v.name);
+      return { vm: v.name, host, rounds: cold ? 1 : 3, paused_ms: cold ? 2260 : 212, sent_bytes: (cold ? 212 : 220) * MIB,
+               flows: 4 };
+    });
+  },
   'vm.restart': (p) => {
     const v = vmNamed(p);
     return job('vm', 'restart', 1, () => 'booting again -- on request', () => {

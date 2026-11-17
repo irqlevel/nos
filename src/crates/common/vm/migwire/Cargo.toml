@@ -1,0 +1,15 @@
+[package]
+name = "migwire"
+version = "0.1.0"
+edition = "2021"
+
+# A VM's migration between two hosts' hv (plans/vm-migration.md, "The
+# handover"): the messages the old host and the new one send each other over
+# ipcnet -- the offer, the folder's files, the pages, the state, the
+# handover's word -- and what each side decides on what it hears. No kernel
+# in it: hv.ko speaks it, and tests/fuzz/hv runs both sides against models of
+# NBS's writer and of each other, every message lost or late.
+[lib]
+
+[dependencies]
+codec = { path = "../../codec" }

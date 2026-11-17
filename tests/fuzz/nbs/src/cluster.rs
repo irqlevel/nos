@@ -2048,9 +2048,13 @@ impl World {
         let Some(at) = self.session_of(from).map(|(_, _, h)| h) else { return Ok(()) };
         let host = HOSTS[at].to_string();
         let said = match a.ask {
-            Ask::Attach { name, writable, force, token } => match self.apply(Command::Attach { name, host, writable,
-                                                                                              force, token }) {
+            Ask::Attach { name, writable, force, token, expect } => match self.apply(Command::Attach {
+                name, host, writable, force, token, expect,
+            }) {
                 Answer::Attached { generation, first } => Said::Attached { generation, index: self.index, first },
+                /* As nbs-mds says it: the one refusal a handover's driver
+                   must tell from no answer */
+                Answer::Refused(nbsmeta::Refusal::NotTheWriter) => Said::NotTheWriter,
                 Answer::Refused(why) => Said::Refused(why.says().to_string()),
                 other => Said::Refused(format!("{:?}", other)),
             },
@@ -2914,7 +2918,7 @@ impl World {
             let host = HOSTS[h].to_string();
             let token = 1 + self.clone_r.below(u64::MAX - 1);
             let attached = self.apply(Command::Attach { name: String::from(CLONE), host: host.clone(), writable: true,
-                                                        force: true, token });
+                                                        force: true, token, expect: 0 });
             let Answer::Attached { generation, .. } = attached else {
                 return Err(format!("the clone, its writer lost, not taken by force: {:?}", attached));
             };

@@ -36,6 +36,9 @@ pub struct Vnet {
     dir: String,
     /// The newest checkpoint whose digest this member proposed as leader.
     proposed: u64,
+    /// The state's revision hv's keeper here was last told of
+    /// (`vnetmeta::KEEPER`).
+    told: u64,
 }
 
 /// What a command of vnet's own is waited for by.
@@ -47,7 +50,7 @@ pub enum Waiter {
 /// The member over its log in `dir`, its mailbox named.
 pub fn new(rsm: Rsm<raftmember::Log, State>, me: MemberFile, lost: Lost, dir: &str) -> Result<Member, String> {
     let id = me.id;
-    raftmember::Member::new(Vnet { half: Half { me, lost }, dir: String::from(dir), proposed: 0 }, rsm, id)
+    raftmember::Member::new(Vnet { half: Half { me, lost }, dir: String::from(dir), proposed: 0, told: 0 }, rsm, id)
 }
 
 impl App for Vnet {
@@ -113,6 +116,15 @@ impl App for Vnet {
     /// proposed, for every member to hold its own to.
     fn turn(&mut self, core: &mut Core<Vnet>) {
         self.half.turn(core);
+        /* hv's keeper on this host told of each change applied, so that it
+         * asks for its table at once and not at its next second: a port
+         * moved -- a VM's migration -- reached at its new host sooner. No
+         * keeper here -- no hv, or no VM on a network -- is no matter */
+        let revision = core.state().revision();
+        if revision != self.told {
+            self.told = revision;
+            let _ = core.mailbox().send_to(vnetmeta::KEEPER, vnetmeta::TAG_CHANGED, 0, &[]);
+        }
         if core.role() != Role::Leader {
             return;
         }
