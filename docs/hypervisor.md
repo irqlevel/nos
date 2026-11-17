@@ -3773,7 +3773,12 @@ hv logcheck <vm> [rounds=N]        the dirty log held to it: its memory copied i
 The `vm` provider's `migrate` job is the same move on the bus (its log the
 command's lines, its progress the memory sent, a cancel before the last
 round's end leaving the VM running where it was), and the panel's VM page
-has it as **Move to another host**, the hosts the cluster's (`cluster.hosts`).
+has it as **Move to another host**, the hosts the cluster's (`cluster.hosts`);
+once it is done, the page on the host it left says where it went, with a
+link to its page there. While it moves, `hv list` and the host API say it
+is `moving` -- a stop is refused meanwhile, as a second stop is, but the VM
+runs on -- and `saving` while `hv save` writes it; `hv logcheck`'s VM is
+`running` all along.
 
 A move from `vm-migration-test.py`, three nos under TCG on a Mac, the
 guest writing files of random bytes all the while and a probe on a third

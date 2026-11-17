@@ -30,7 +30,7 @@ use hv::Machine;
 
 use crate::cores::Cores;
 use crate::forward::Forwards;
-use crate::vms::Vms;
+use crate::vms::{Held, Vms};
 
 const MAGIC: [u8; 8] = *b"nosvmsv1";
 const VERSION: u32 = 1;
@@ -67,7 +67,7 @@ pub fn save_command(vms: &Vms, forwards: &Forwards, args: &str, out: &mut dyn Wr
 /// long it was paused before it ended. Anything that fails before it ends
 /// leaves it running, and no file.
 fn save(vms: &Vms, forwards: &Forwards, word: &str, path: &str) -> Result<(String, u64, u64), String> {
-    let taken = vms.take_for_state(word)?;
+    let taken = vms.take_for_state(word, Held::Save)?;
     let paused_at = kcore::time::boot_time_ns();
     let written = match write_file(&taken.guest, &taken.name, path) {
         Ok(written) => written,
