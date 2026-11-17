@@ -39,7 +39,7 @@ function versioned(file: string): string {
     return `${file}?v=${hash}`;
 }
 // The videos' lengths, for the structured data: ffprobe's, rounded.
-const SECONDS: Record<Locale, number> = { en: 264, ru: 265 };
+const SECONDS: Record<Locale, number> = { en: 363, ru: 364 };
 const PUBLISHED = "2026-11-16";
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
