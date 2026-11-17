@@ -176,6 +176,11 @@ pub struct Shared {
     /// press is not made: the button is pressed again every `REPRESS_S`,
     /// whoever waits (`press_again`).
     stopping: AtomicBool,
+    /// What holds it for its state to be taken (`Held`, as a `u8`; 0 for
+    /// nothing): the hold takes `stopping` too, which keeps a stop off it
+    /// meanwhile, but the VM is not going -- a move's rounds copy it as it
+    /// runs -- and the list says what it is doing (`held_state`).
+    held: AtomicU8,
     /// `hv restart`: boot the guest again -- the one running, or the one
     /// parked after it stopped.
     reset: AtomicBool,
@@ -258,6 +263,7 @@ impl Shared {
             id,
             stop: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
+            held: AtomicU8::new(0),
             reset: AtomicBool::new(false),
             button: AtomicU8::new(BUTTON_UP),
             pressed_at: AtomicU64::new(0),
@@ -368,6 +374,20 @@ impl Shared {
 
     fn running(&self) -> bool {
         self.running.load(Ordering::Acquire)
+    }
+
+    /// Its state on the list while it runs: what a hold of it is doing
+    /// (`Held`), "stopping" where a stop has it, else "running".
+    fn running_state(&self) -> &'static str {
+        if !self.stopping.load(Ordering::Acquire) {
+            return "running";
+        }
+        match self.held.load(Ordering::Acquire) {
+            h if h == Held::Save as u8 => "saving",
+            h if h == Held::Move as u8 => "moving",
+            h if h == Held::Check as u8 => "running",
+            _ => "stopping",
+        }
     }
 
     /// How it ended last, copied out: printed after, with the lock free for
@@ -586,7 +606,7 @@ pub struct Listed {
     pub id: u32,
     /// Its folder's, when it was started from one.
     pub name: Option<String>,
-    /// "running", "stopping" or "stopped".
+    /// "running", "stopping", "moving", "saving" or "stopped" (`Shared::running_state`).
     pub state: &'static str,
     /// The host CPUs its CPUs run on.
     pub cpus: Vec<u32>,
@@ -1245,6 +1265,7 @@ impl StateHold<'_> {
     /// is the caller's), and stoppable again.
     pub fn give_back(mut self) {
         self.done = true;
+        self.shared.held.store(0, Ordering::Release);
         self.shared.stopping.store(false, Ordering::Release);
     }
 
@@ -1276,9 +1297,24 @@ impl StateHold<'_> {
 impl Drop for StateHold<'_> {
     fn drop(&mut self) {
         if !self.done {
+            self.shared.held.store(0, Ordering::Release);
             self.shared.stopping.store(false, Ordering::Release);
         }
     }
+}
+
+/// What holds a running VM for its state to be taken (`Vms::take_for_state`),
+/// said as its state on the list -- `hv list`'s, the host API's -- while the
+/// hold has it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Held {
+    /// `hv save`: paused, written into a file and ended -- "saving".
+    Save = 1,
+    /// `hv migrate`, the `migrate` job: copied as it runs, then paused and
+    /// gone on on another host -- "moving".
+    Move = 2,
+    /// `hv logcheck`: its dirty log checked as it runs -- "running".
+    Check = 3,
 }
 
 /// Every VM this module has started and not yet taken off the list.
@@ -1721,9 +1757,10 @@ impl Vms {
 
     /// The running VM `word` names held for its state to be taken: its guest,
     /// name and number, its stop held until the hold is given back or the VM
-    /// ended (`StateHold`). A VM of a folder alone -- that is what it is
-    /// started from again -- running, and being stopped by nothing else.
-    pub fn take_for_state(&self, word: &str) -> Result<StateHold<'_>, String> {
+    /// ended (`StateHold`), the list saying what holds it (`why`). A VM of a
+    /// folder alone -- that is what it is started from again -- running, and
+    /// being stopped by nothing else.
+    pub fn take_for_state(&self, word: &str, why: Held) -> Result<StateHold<'_>, String> {
         let id = self.id_of(word)?;
         let (shared, name, folder, disks, disk_cpu, port) = {
             let table = self.table.lock();
@@ -1745,6 +1782,7 @@ impl Vms {
             shared.stopping.store(false, Ordering::Release);
             return Err(alloc::format!("vm {} is not running", id));
         };
+        shared.held.store(why as u8, Ordering::Release);
         Ok(StateHold { vms: self, shared, guest, name, id, folder, disks, disk_cpu, port, done: false })
     }
 
@@ -2268,11 +2306,7 @@ impl Vms {
             let s = &vm.shared;
             let running = s.running();
             let until = if running { now } else { s.ended_ns.load(Ordering::Relaxed) };
-            let state = match (running, s.stopping.load(Ordering::Acquire)) {
-                (true, true) => "stopping",
-                (true, false) => "running",
-                (false, _) => "stopped",
-            };
+            let state = if running { s.running_state() } else { "stopped" };
             let _ = write!(out, "vm {}", s.id);
             if let Some(name) = &vm.name {
                 let _ = write!(out, " {}", name);
@@ -2976,11 +3010,7 @@ impl Vms {
             let s = &v.shared;
             let running = s.running();
             let until = if running { now } else { s.ended_ns.load(Ordering::Relaxed) };
-            let state = match (running, s.stopping.load(Ordering::Acquire)) {
-                (true, true) => "stopping",
-                (true, false) => "running",
-                (false, _) => "stopped",
-            };
+            let state = if running { s.running_state() } else { "stopped" };
             let (exits, _, _) = s.totals();
             all.push(Listed {
                 id: s.id,
