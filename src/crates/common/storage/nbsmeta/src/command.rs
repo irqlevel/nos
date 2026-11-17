@@ -47,7 +47,12 @@ pub enum Command {
     /// has it. `token` is the client's own, made for its session: an attach
     /// for writing asked again by the writer it made -- its answer late or
     /// lost -- is answered with the generation it gave, not another.
-    Attach { name: String, host: String, writable: bool, force: bool, token: u64 },
+    /// `expect`, not 0, is a handover's (plans/vm-migration.md): taken from
+    /// the writer of that generation, whatever host it is on, and refused
+    /// (`NotTheWriter`) where the volume's writer is another -- one compare
+    /// and set, which a migration's commit and its giving up race for, the
+    /// writer's own `Reattach` the other side of it. For writing only.
+    Attach { name: String, host: String, writable: bool, force: bool, token: u64, expect: u64 },
     /// Volume `name` let go by `host`: the writer of `generation`, or -- with
     /// generation 0 -- a reader. Done where it is not so attached. `token`:
     /// the session's that let go, kept with the volume so that an attach of
@@ -175,6 +180,8 @@ const DEVICE_FORMATTED: u8 = 28;
 
 const WRITABLE: u8 = 1;
 const FORCE: u8 = 2;
+/// A handover's: the writer's generation it is taken from follows the token.
+const EXPECT: u8 = 4;
 
 impl Command {
     pub fn encode(&self) -> Vec<u8> {
@@ -227,12 +234,16 @@ impl Command {
                 w.str(name);
                 w.u64(*size_mib);
             }
-            Command::Attach { name, host, writable, force, token } => {
+            Command::Attach { name, host, writable, force, token, expect } => {
                 w.u8(ATTACH);
                 w.str(name);
                 w.str(host);
-                w.u8(if *writable { WRITABLE } else { 0 } | if *force { FORCE } else { 0 });
+                w.u8(if *writable { WRITABLE } else { 0 } | if *force { FORCE } else { 0 }
+                     | if *expect != 0 { EXPECT } else { 0 });
                 w.u64(*token);
+                if *expect != 0 {
+                    w.u64(*expect);
+                }
             }
             Command::Detach { name, host, generation, token } => {
                 w.u8(if *token != 0 { DETACH_TOKEN } else { DETACH });
@@ -383,11 +394,14 @@ impl Command {
                 let name = volume(&mut r)?;
                 let host = host(&mut r)?;
                 let flags = r.u8()?;
-                if flags & !(WRITABLE | FORCE) != 0 {
+                if flags & !(WRITABLE | FORCE | EXPECT) != 0 || (flags & EXPECT != 0 && flags & WRITABLE == 0) {
                     return None;
                 }
-                Command::Attach { name, host, writable: flags & WRITABLE != 0, force: flags & FORCE != 0,
-                                  token: r.u64()? }
+                let token = r.u64()?;
+                /* An entry of before handovers has no generation to expect */
+                let expect = if flags & EXPECT != 0 { r.u64().filter(|&g| g != 0)? } else { 0 };
+                Command::Attach { name, host, writable: flags & WRITABLE != 0, force: flags & FORCE != 0, token,
+                                  expect }
             }
             code @ (DETACH | DETACH_TOKEN) => {
                 let name = volume(&mut r)?;

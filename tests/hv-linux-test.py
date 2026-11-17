@@ -1282,6 +1282,95 @@ def smbios(args):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# How many times --save saves a guest and restores it.
+SAVE_ROUNDS = 4
+# A guest's background counter: a busy shell loop -- the CPU at work when it
+# is paused -- that keeps its count in a file of its RAM-backed root, put
+# there whole by a rename, so that a read never finds it half written.
+COUNTER = "(i=0; while true; do i=$((i+1)); echo $i > /tmp/c; mv /tmp/c /tmp/count; done) &"
+# What a guest's kernel says when its clock went wrong under it, a CPU stuck,
+# or it oopsed: counted in what it logged since the first save.
+BAD_DMESG = "went backwards|unstable|stuck|lockup|oops|BUG:|watchdog"
+
+
+def save_restore(args):
+    """A guest saved and restored, over and over (`hv save`, `hv restore`,
+    plans/vm-migration.md's M0): a VM of a folder, its CPU busy counting in a
+    shell loop, paused into a file and taken off the list, then running
+    again from the file -- its count going on from where it stood, its
+    uptime too, the shell answering, the file taken away -- `SAVE_ROUNDS`
+    times; and at the end, nothing in its kernel's log of a clock that went
+    back or stalled, a CPU stuck, or an oops."""
+    tmp = tempfile.mkdtemp(prefix="nos-hvsave-")
+    toml = os.path.join(tmp, "vm.toml")
+    with open(toml, "w") as f:
+        f.write('kernel = "/bzImage"\ninitrd = "/initrd"\nmemory = %d\n' % args.mem
+                + ("cpus = %d\n" % args.cpus if args.cpus > 1 else "")
+                + 'cmdline = "%s"\n' % args.cmdline)
+    x = lambda line, secs=60: "hv exec sv secs=%d %s" % (secs, line)
+    rc = ["insmod /hv.ko", "hv on", "hv start sv",
+          x("id", args.vm_secs),
+          x(COUNTER),
+          x("cat /proc/uptime /tmp/count ; dmesg -c > /dev/null")]
+    rounds = []
+    for i in range(SAVE_ROUNDS):
+        save = "hv save sv /sv%d.state" % i
+        restore = "hv restore /sv%d.state" % i
+        rounds.append((save, restore))
+        rc += [x("cat /proc/uptime /tmp/count"), save, "hv list", restore, "ls /", x("cat /proc/uptime /tmp/count")]
+    rc += [x("dmesg | grep -ciE '%s'" % BAD_DMESG),
+           x("dmesg"),
+           x("id"),
+           "hv stop sv secs=0",
+           RC_LAST]
+    for line in rc:
+        if len(line) > 255:
+            sys.exit("an /etc/rc line is longer than rc takes (255): " + line)
+    p, log, image = boot_rc(args, tmp, rc, extra={"vms/sv/vm.toml": toml})
+    try:
+        if p.poll() is not None or not RC_DONE.search(open(log, errors="replace").read()):
+            return
+        secs = sections(open(log, errors="replace").read())
+        out = lambda line, n=0: output_of(secs, line, n) or ""
+        pt.check("the guest reached its shell", "uid=0 gid=0" in out(rc[3]), out(rc[3])[-500:])
+
+        def reading(text):
+            """The uptime and the count a `cat /proc/uptime /tmp/count` said."""
+            m = re.search(r"(?m)^(\d+\.\d+) \d+\.\d+\s*\n\s*(\d+)\s*$", text)
+            return (float(m.group(1)), int(m.group(2))) if m else None
+
+        read_line = x("cat /proc/uptime /tmp/count")
+        first = x("cat /proc/uptime /tmp/count ; dmesg -c > /dev/null")
+        pt.check("the guest counts", reading(out(first)) is not None, out(first)[-500:])
+        for i, (save, restore) in enumerate(rounds):
+            before = reading(out(read_line, 2 * i))
+            saved, restored = out(save), out(restore)
+            after = reading(out(read_line, 2 * i + 1))
+            pt.check("round %d: the VM saved into its file, paused and off the list" % i,
+                     re.search(r"hv: vm sv saved into /sv%d\.state -- \d+ MiB of its memory written, paused \d+ ms"
+                               % i, saved) is not None, saved[-800:])
+            pt.check("round %d: the VM not listed once saved" % i,
+                     re.search(r"(?m)^\s*\d+\s.*\bsv\b", out("hv list", i)) is None, out("hv list", i)[-800:])
+            pt.check("round %d: the VM restored from its file, and running" % i,
+                     re.search(r"hv: vm \d+ \(sv\) restored from /sv%d\.state, and runs" % i, restored) is not None,
+                     restored[-1500:])
+            pt.check("round %d: the file taken away once it runs" % i,
+                     "sv%d.state" % i not in out("ls /", i), out("ls /", i)[-500:])
+            ok = before is not None and after is not None and after[0] > before[0] and after[1] > before[1]
+            pt.check("round %d: its uptime and its count went on from where they stood" % i, ok,
+                     "before %r after %r\n%s" % (before, after, out(read_line, 2 * i + 1)[-500:]))
+        bad = re.findall(r"(?m)^(\d+)\s*$", out(rc[-5]))
+        pt.check("its kernel said nothing since the first save of a clock gone back or unstable, a CPU stuck, or an "
+                 "oops", bad == ["0"], out(rc[-5])[-500:] + "\n" + out(rc[-4])[-3000:])
+        pt.check("and its shell still answers", "uid=0 gid=0" in out(rc[-3]), out(rc[-3])[-500:])
+    finally:
+        pt.kill(p)
+    if args.keep or pt.failures:
+        print("log at " + log)
+    else:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def pvpanic(args):
     """A guest's kernel that panics, and says so to its panic device -- which
     it finds by its ACPI, `QEMU0001` on port 0x505 -- is stopped there, the
@@ -1943,6 +2032,8 @@ def main():
     ap.add_argument("--pvpanic", action="store_true",
                     help="the guest kernel has ACPI and PVPANIC_MMIO: check that a panic stops it, saying so, "
                          "and that a guest with restart is booted again after one")
+    ap.add_argument("--save", action="store_true",
+                    help="a guest saved and restored over and over, busy counting (hv save, hv restore)")
     ap.add_argument("--smbios", action="store_true",
                     help="the guest kernel has DMI (DMI, DMIID): check what its SMBIOS tables say it is, and that "
                          "a VM keeps its UUID from start to start")
@@ -2021,11 +2112,13 @@ def main():
     if not os.path.exists(nos_iso(args)):
         sys.exit("build %s first (make%s)" % (nos_iso(args), " nos-test.iso" if args.nos_iso else ""))
 
-    if args.attach or args.disk or args.net or args.smbios or args.pvpanic:
+    if args.attach or args.disk or args.net or args.smbios or args.pvpanic or args.save:
         if not args.initrd:
-            sys.exit("--attach, --disk, --net, --smbios and --pvpanic need --initrd: the guest's shell is what is "
-                     "typed at")
-        if args.smbios:
+            sys.exit("--attach, --disk, --net, --smbios, --pvpanic and --save need --initrd: the guest's shell is "
+                     "what is typed at")
+        if args.save:
+            save_restore(args)
+        elif args.smbios:
             smbios(args)
         elif args.pvpanic:
             pvpanic(args)

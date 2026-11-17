@@ -144,6 +144,35 @@ pub fn this_host() -> Result<String, String> {
     ipcctl::identity().map(|id| id.name)
 }
 
+/// Why a handover's attach does not serve (`Drive::open_handover`).
+#[derive(Debug)]
+pub enum NotTaken {
+    /// Refused: the volume's writer is not of the generation named -- the
+    /// other side's take landed first. Final: asked again, it is refused
+    /// again.
+    Refused,
+    /// No answer to go by, or the session failed after its attach: asked
+    /// again with the same token, it is answered as it was.
+    Unknown(String),
+}
+
+impl NotTaken {
+    /// What it says, for a line.
+    pub fn said(self) -> String {
+        match self {
+            NotTaken::Refused => String::from("not the volume's writer: attached elsewhere since"),
+            NotTaken::Unknown(why) => why,
+        }
+    }
+}
+
+/// A session's start that did not serve: why, and whether it was a
+/// handover's attach refused (`NotTaken::Refused`).
+struct Failed {
+    why: String,
+    refused: bool,
+}
+
 impl Drive {
     /// Volume `name` attached on this host, `me` -- for writing, `force`
     /// taking it from a writer elsewhere, or read-only -- and its session
@@ -167,11 +196,41 @@ impl Drive {
         Self::start_with(mb, name, me, writable, force, chains)
     }
 
+    /// As `open_on`, for writing, a handover's (plans/vm-migration.md): the
+    /// volume taken from the writer of generation `expect` alone -- refused,
+    /// and nothing attached, where its writer is another by then. `token`
+    /// is the take's, not 0, the same each time it is asked again: an
+    /// attach that landed and whose answer was lost is answered as it was,
+    /// where a new token would be refused by the generation it moved on.
+    pub fn open_handover(name: &str, me: &str, expect: u64, token: u64, event: &SharedEvent, chains: Option<&str>)
+        -> Result<Drive, NotTaken> {
+        if expect == 0 || token == 0 {
+            return Err(NotTaken::Unknown(String::from("a handover names its writer's generation and its token")));
+        }
+        let mb = Mailbox::new_on(LIMITS, event)
+            .map_err(|e| NotTaken::Unknown(alloc::format!("no mailbox: {}", e.name())))?;
+        Self::start_expecting(mb, name, me, true, false, expect, Some(token), chains)
+            .map_err(|f| if f.refused { NotTaken::Refused } else { NotTaken::Unknown(f.why) })
+    }
+
     fn start_with(mb: Mailbox, name: &str, me: &str, writable: bool, force: bool, chains: Option<&str>)
         -> Result<Drive, String> {
-        let token = kcore::random::random_u64().filter(|&t| t != 0)
-            .ok_or_else(|| String::from("no randomness for the session's token"))?;
+        Self::start_expecting(mb, name, me, writable, force, 0, None, chains).map_err(|f| f.why)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_expecting(mb: Mailbox, name: &str, me: &str, writable: bool, force: bool, expect: u64,
+                       token: Option<u64>, chains: Option<&str>) -> Result<Drive, Failed> {
+        let failed = |why: String| Failed { why, refused: false };
+        let token = match token {
+            Some(t) => t,
+            None => kcore::random::random_u64().filter(|&t| t != 0)
+                .ok_or_else(|| failed(String::from("no randomness for the session's token")))?,
+        };
         let mut s = Session::new(name, me, writable, force, token);
+        if expect != 0 {
+            s.expect_writer(expect);
+        }
         /* A writer's mailbox named for the cluster, its token in the name,
            under its module's namespace -- a module names mailboxes under
            its own alone (docs/ipc.md), and each part of a name begins with
@@ -199,8 +258,8 @@ impl Drive {
         loop {
             match d.s.phase() {
                 Phase::Serving => return Ok(d),
-                Phase::Failed(why) => return Err(why.clone()),
-                Phase::Detached => return Err(String::from("detached before it served")),
+                Phase::Failed(why) => return Err(Failed { why: why.clone(), refused: d.s.writer_was_another() }),
+                Phase::Detached => return Err(failed(String::from("detached before it served"))),
                 _ => {}
             }
             if d.s.progress() != moved {
@@ -208,8 +267,8 @@ impl Drive {
                 end = boot_time_ns() + START_NS;
             }
             if boot_time_ns() >= end {
-                return Err(alloc::format!("{} not serving, nothing moving in {} s: {}", name, START_NS / 1_000_000_000,
-                                          d.s.report()));
+                return Err(failed(alloc::format!("{} not serving, nothing moving in {} s: {}", name,
+                                                 START_NS / 1_000_000_000, d.s.report())));
             }
             d.turn(TURN_NS);
         }

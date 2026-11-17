@@ -79,28 +79,38 @@ const BACKSPACE: u8 = 0x08;
 /// The answer to a cursor-position query, `ESC [ row ; col R`, is at most
 /// this long: `ESC [ 24 ; 1000 R`.
 const REPLY_MAX: usize = 12;
-/// The row a query is told the cursor is on. Nothing here keeps rows, and a
-/// line editor uses only the column.
+/// The row a query is told the cursor is on: a terminal's last, a VT100's
+/// 24th -- and so the rows a guest that measures its terminal is told it
+/// has (below). Nothing here keeps rows, and a line editor uses only the
+/// column.
 const REPLY_ROW: u16 = 24;
+/// The columns a cursor moved to the right stops at: what a guest that
+/// measures its terminal by moving the cursor to a far corner and asking
+/// where it went is told it has -- a VT100's 80. systemd does so to size a
+/// serial console as a getty starts, and told the column its text had got
+/// to, it once sized one 7 columns wide: every line typed wrapped and was
+/// drawn over itself. A line of text is followed past it, as before: a line
+/// editor's prompt is told where it ends, however long.
+const COLS: u16 = 80;
 /// The furthest column counted: a longer line is told it is here.
 const COL_MAX: u16 = 999;
 /// Where the tab stops are.
 const TAB: u16 = 8;
 
 /// Where the guest's output is in an ANSI escape sequence: what tells the
-/// cursor-position query apart from text, and text from the bytes of a
-/// sequence, which move no cursor.
+/// cursor-position query and the cursor's moves apart from text, and text
+/// from the bytes of a sequence.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Esc {
     /// Text.
     Text,
     /// ESC.
     Start,
-    /// ESC [, no parameter yet.
+    /// ESC [ and the parameters so far (`Uart::csi`) of a sequence this
+    /// follows: the query, the cursor's moves, its save and restore.
     Csi,
-    /// ESC [ 6: the query, if `n` is next.
-    Csi6,
-    /// ESC [ and anything else, to its final byte.
+    /// ESC [ and anything else -- a private sequence's `?`, a third
+    /// parameter, an intermediate byte -- to its final byte.
     CsiOther,
 }
 
@@ -145,6 +155,13 @@ pub struct Uart {
     /// with, and the answer.
     esc: Esc,
     col: u16,
+    /// In `Esc::Csi`, its parameters so far and how many it has begun; 0
+    /// elsewhere.
+    csi: [u16; vmstate::CSI_PARAMS],
+    csi_n: u8,
+    /// The column the guest saved the cursor at (ESC 7, CSI s), for it to
+    /// be put back (ESC 8, CSI u).
+    saved_col: Option<u16>,
     reply: Reply,
     /// Set when the guest sends a cursor-position query, which a shell's
     /// line editor does at each prompt, ready to read; cleared as a line of
@@ -177,6 +194,9 @@ impl Uart {
             rx: None,
             esc: Esc::Text,
             col: 0,
+            csi: [0; vmstate::CSI_PARAMS],
+            csi_n: 0,
+            saved_col: None,
             reply: Reply { buf: [0; REPLY_MAX], len: 0, pos: 0 },
             prompt_seen: false,
             thri: false,
@@ -343,20 +363,67 @@ impl Uart {
     /// wraps what is typed early (it was once told 80, and `id` came back as
     /// `i`, a newline, `d`). Without an answer, the shell swallows what is
     /// typed as the reply it was waiting for.
+    ///
+    /// The cursor's moves are followed too -- to a column (CUP, HVP, CHA),
+    /// right and left (CUF, CUB), saved and put back (ESC 7 and 8, CSI s
+    /// and u) -- a move to the right held to `COLS`: what makes the answer
+    /// to a guest that asks where a move to a far corner went the size of a
+    /// terminal, and not the column its text had got to.
     fn track(&mut self, byte: u8) {
-        let in_csi = matches!(self.esc, Esc::Csi | Esc::Csi6 | Esc::CsiOther);
         self.esc = match (self.esc, byte) {
-            (_, ESC) => Esc::Start,
+            (_, ESC) => {
+                self.forget_csi();
+                Esc::Start
+            }
             (Esc::Start, b'[') => Esc::Csi,
-            (Esc::Start, _) => Esc::Text,
-            (Esc::Csi, b'6') => Esc::Csi6,
-            (Esc::Csi6, b'n') => {
-                self.answer();
+            /* DECSC and DECRC: the cursor saved, and put back */
+            (Esc::Start, b'7') => {
+                self.saved_col = Some(self.col);
                 Esc::Text
             }
-            /* Parameters and intermediates, then a final byte. */
-            (_, 0x20..=0x3F) if in_csi => Esc::CsiOther,
-            (_, _) if in_csi => Esc::Text,
+            (Esc::Start, b'8') => {
+                if let Some(c) = self.saved_col {
+                    self.col = c;
+                }
+                Esc::Text
+            }
+            (Esc::Start, _) => Esc::Text,
+            /* A parameter's digit, and the next parameter */
+            (Esc::Csi, b'0'..=b'9') => {
+                let at = usize::from(self.csi_n.max(1)) - 1;
+                if let Some(p) = self.csi.get_mut(at) {
+                    *p = p.saturating_mul(10).saturating_add(u16::from(byte - b'0'));
+                    self.csi_n = self.csi_n.max(1);
+                }
+                Esc::Csi
+            }
+            (Esc::Csi, b';') => {
+                let begun = self.csi_n.max(1);
+                if usize::from(begun) < vmstate::CSI_PARAMS {
+                    self.csi_n = begun + 1;
+                    Esc::Csi
+                } else {
+                    self.forget_csi();
+                    Esc::CsiOther
+                }
+            }
+            /* Any other parameter or intermediate byte: a sequence this
+             * does not follow */
+            (Esc::Csi | Esc::CsiOther, 0x20..=0x3F) => {
+                self.forget_csi();
+                Esc::CsiOther
+            }
+            /* A final byte -- or, as before, any other byte, which ends the
+             * sequence and moves nothing */
+            (Esc::Csi, 0x40..=0x7E) => {
+                self.csi_final(byte);
+                self.forget_csi();
+                Esc::Text
+            }
+            (Esc::Csi | Esc::CsiOther, _) => {
+                self.forget_csi();
+                Esc::Text
+            }
             (_, b'\r' | b'\n') => {
                 self.col = 0;
                 Esc::Text
@@ -376,6 +443,38 @@ impl Uart {
             }
             (_, _) => Esc::Text,
         };
+    }
+
+    /// What a sequence this follows does, at its final byte `fin`.
+    fn csi_final(&mut self, fin: u8) {
+        let begun = usize::from(self.csi_n);
+        /* A parameter not given, or 0, is 1 to a move */
+        let arg = |i: usize| if i < begun { self.csi.get(i).map_or(1, |&p| p.max(1)) } else { 1 };
+        let (first, second) = (arg(0), arg(1));
+        match fin {
+            /* DSR: where the cursor is */
+            b'n' if begun == 1 && self.csi[0] == 6 => self.answer(),
+            /* CUP and HVP, to a row and a column; CHA, to a column */
+            b'H' | b'f' => self.col = second.min(COLS) - 1,
+            b'G' => self.col = first.min(COLS) - 1,
+            /* CUF and CUB: right and left */
+            b'C' => self.col = self.col.saturating_add(first).min(COL_MAX),
+            b'D' => self.col = self.col.saturating_sub(first),
+            /* SCOSC and SCORC, as ESC 7 and ESC 8 */
+            b's' if begun == 0 => self.saved_col = Some(self.col),
+            b'u' if begun == 0 => {
+                if let Some(c) = self.saved_col {
+                    self.col = c;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The parameters of the sequence there was, gone with it.
+    fn forget_csi(&mut self) {
+        self.csi = [0; vmstate::CSI_PARAMS];
+        self.csi_n = 0;
     }
 
     /// The answer to a cursor-position query, in place of one the guest has
@@ -428,4 +527,52 @@ impl Uart {
         self.ier
     }
 
+    /// What the guest has made of it, for a VM's state (`vmstate`).
+    pub fn save(&self) -> vmstate::Uart {
+        let mut reply = [0u8; vmstate::REPLY_MAX];
+        reply[..REPLY_MAX].copy_from_slice(&self.reply.buf);
+        vmstate::Uart {
+            dll: self.dll, dlm: self.dlm, ier: self.ier, lcr: self.lcr, mcr: self.mcr, scr: self.scr,
+            written: self.written, loopback: self.loopback, rx: self.rx,
+            esc: match self.esc {
+                Esc::Text => vmstate::ESC_TEXT,
+                Esc::Start => vmstate::ESC_START,
+                Esc::Csi => vmstate::ESC_CSI,
+                Esc::CsiOther => vmstate::ESC_CSI_OTHER,
+            },
+            col: self.col, csi: self.csi, csi_n: self.csi_n, saved_col: self.saved_col,
+            reply, reply_len: self.reply.len as u8, reply_pos: self.reply.pos as u8,
+            prompt_seen: self.prompt_seen, thri: self.thri, pulse: self.pulse,
+        }
+    }
+
+    /// Made what `s` says -- every field of it one a UART could have had.
+    pub fn restore(&mut self, s: &vmstate::Uart) -> vmstate::Result<()> {
+        /* A version 1 state's "ESC [ 6" comes as a sequence of the one
+         * parameter 6 (vmstate) */
+        let esc = match s.esc {
+            vmstate::ESC_TEXT => Esc::Text,
+            vmstate::ESC_START => Esc::Start,
+            vmstate::ESC_CSI => Esc::Csi,
+            vmstate::ESC_CSI_OTHER => Esc::CsiOther,
+            _ => return Err(vmstate::Error("the UART in no escape state it has")),
+        };
+        let (len, pos) = (usize::from(s.reply_len), usize::from(s.reply_pos));
+        if len > REPLY_MAX || pos > len || s.col > COL_MAX || s.saved_col.is_some_and(|c| c > COL_MAX)
+            || usize::from(s.csi_n) > vmstate::CSI_PARAMS
+        {
+            return Err(vmstate::Error("the UART's reply, column or sequence past what it keeps"));
+        }
+        let mut buf = [0u8; REPLY_MAX];
+        buf.copy_from_slice(&s.reply[..REPLY_MAX]);
+        *self = Uart {
+            dll: s.dll, dlm: s.dlm, ier: s.ier, lcr: s.lcr, mcr: s.mcr, scr: s.scr, written: s.written,
+            loopback: s.loopback, rx: s.rx, esc, col: s.col, csi: s.csi, csi_n: s.csi_n, saved_col: s.saved_col,
+            reply: Reply { buf, len, pos },
+            prompt_seen: s.prompt_seen, thri: s.thri, pulse: s.pulse,
+        };
+        Ok(())
+    }
 }
+
+const _: () = assert!(REPLY_MAX == vmstate::REPLY_MAX, "the state keeps the UART's reply whole");

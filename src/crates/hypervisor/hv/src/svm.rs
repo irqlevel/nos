@@ -457,6 +457,94 @@ impl Vcpu {
         self.cr4
     }
 
+    /// Its registers and what is on its way into it, for a VM's state
+    /// (`vmstate`): the save area's and the stub's (`crate::state`), CR4 as
+    /// it believes it, CR8, DR0-DR3, its x87, SSE and AVX registers, its own
+    /// MSRs, the event queued for its next entry, its interrupt shadow and
+    /// its NMI blocking. Read after an exit, with the guest out of the CPU.
+    pub fn save_regs(&self) -> vmstate::Result<vmstate::Regs> {
+        let mut r = vmstate::Regs::zeroed();
+        crate::state::save_common(self.save(), self.regs(), &mut r);
+        r.cr4 = self.cr4;
+        r.cr8 = self.cr8();
+        r.dr = *self.guest.debug_addrs();
+        let m = self.guest.msrs();
+        r.tsc_aux = m.tsc_aux();
+        r.spec_ctrl = m.spec_ctrl();
+        r.xcr0 = self.guest.xcr0();
+        let (area, pkru) = self.guest.fp_area();
+        r.xsave.try_reserve_exact(area.len()).map_err(|_| vmstate::Error("no memory for a CPU's registers"))?;
+        r.xsave.extend_from_slice(area);
+        r.pkru = pkru;
+        let c = self.control();
+        r.event = crate::state::event_of(c.event_inj as u32, (c.event_inj >> 32) as u32);
+        r.shadow = c.int_state & vmcb::int_state::SHADOW != 0;
+        r.nmi_blocked = self.nmi_masked;
+        Ok(r)
+    }
+
+    /// Made what `r` says -- a guest CPU restored -- under a fresh ASID, with
+    /// no window asked for: every register checked first (`crate::state`),
+    /// the XSAVE area by what this CPU's XRSTOR takes, its own MSRs by what
+    /// the CPU's hold, and the VMCB then by the rules `vmrun` checks
+    /// (`check`). Refused whole otherwise -- on a CPU made for it, which is
+    /// dropped then.
+    pub fn restore_regs(&mut self, r: &vmstate::Regs) -> vmstate::Result<()> {
+        if r.pending_debug != 0 {
+            return Err(vmstate::Error("debug exceptions pending, which AMD-V never leaves a CPU with"));
+        }
+        crate::state::check(r)?;
+        if !self.guest.import_fp(&r.xsave, r.xcr0, r.pkru) {
+            return Err(vmstate::Error("x87, SSE and AVX registers this CPU's XRSTOR would refuse"));
+        }
+        if !self.guest.msrs_mut().set(r.tsc_aux, r.spec_ctrl, false) {
+            return Err(vmstate::Error("a TSC_AUX or SPEC_CTRL this CPU's MSRs would refuse"));
+        }
+        {
+            let (s, g) = self.guest.save_and_regs_mut();
+            crate::state::restore_common(r, s, g)?;
+            s.efer |= EFER_SVME;
+            s.cr4 = r.cr4 | CR4_MCE;
+        }
+        self.cr4 = r.cr4;
+        self.set_cr8(r.cr8);
+        *self.guest.debug_addrs_mut() = r.dr;
+        {
+            use vmcb::{event, int_ctl, intercept};
+            let c = &mut self.guest.vmcb_mut().control;
+            c.event_inj = match &r.event {
+                Some(e) => {
+                    let (bits, error) = crate::state::event_bits(e);
+                    u64::from(bits) | (u64::from(error.unwrap_or(0)) << event::ERROR_SHIFT)
+                }
+                None => 0,
+            };
+            c.int_state = if r.shadow { vmcb::int_state::SHADOW } else { 0 };
+            c.int_ctl &= !int_ctl::V_IRQ;
+            c.intercept_misc1 &= !intercept::misc1::VINTR;
+            /* In its NMI handler: the IRET that ends it is stopped at to be
+             * seen, as after an NMI injected here. */
+            if r.nmi_blocked {
+                c.intercept_misc1 |= intercept::misc1::IRET;
+            } else {
+                c.intercept_misc1 &= !intercept::misc1::IRET;
+            }
+        }
+        self.nmi_masked = r.nmi_blocked;
+        self.iret_at = None;
+        self.guest.forget_asid();
+        self.check().map_err(vmstate::Error)
+    }
+
+    /// The guest's TSC from its next entry on: the host's plus `offset`.
+    pub fn set_tsc_offset(&mut self, offset: u64) {
+        self.guest.vmcb_mut().control.tsc_offset = offset;
+    }
+
+    pub fn tsc_offset(&self) -> u64 {
+        self.control().tsc_offset
+    }
+
     /// Whether the guest is in 64-bit code: long mode active, and CS's L
     /// bit -- the VMCB's, as of the exit.
     pub fn in_64bit_code(&self) -> bool {

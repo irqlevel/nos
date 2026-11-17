@@ -440,6 +440,47 @@ test('the cluster\'s VM networks: listed, one made, one overlapping refused, a f
   await expect(page.getByRole('heading', { name: 'Сети машин', level: 1 })).toBeVisible();
 });
 
+test('a VM moved to another host of the cluster\'s: the host from the cluster\'s list, this one refused, its rounds a job, gone from here once moved', async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/vms/new`);
+  await page.fill('input[name=name]', 'pw-mig');
+  await page.getByRole('button', { name: 'Create' }).click();
+  await expect(page.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+  await page.goto(`/en/h/${host}/vms/pw-mig`);
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await page.getByTestId('form-vm-start').getByRole('button', { name: 'Start', exact: true }).click();
+  await expect(page.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+
+  await page.getByRole('button', { name: 'Move to another host' }).click();
+  const form = page.getByTestId('form-vm-migrate');
+  /* The hosts a read of the cluster's gives (choices), the VM the page's */
+  await expect(form.locator('[name=name]')).toHaveCount(0);
+  const to = form.locator('select[name=host]');
+  await expect(to.locator('option')).toContainText(['mock-a', 'mock-b', 'mock-d']);
+  /* This host: the job fails, saying so, and it runs on here */
+  await to.selectOption('mock-a');
+  await form.getByRole('button', { name: 'Move to another host' }).click();
+  await expect(form).toContainText('pauses for a moment');
+  await form.getByRole('button', { name: 'Confirm' }).click();
+  await expect(page.getByTestId('job-status')).toHaveText('failed', { timeout: 20_000 });
+  await expect(form).toContainText('mock-a is this host');
+  await expect(page.getByTestId('vm-state')).toHaveText('running');
+  /* Another, the form opened anew: its rounds said as a job, then it is
+   * that host's */
+  const action = page.getByRole('button', { name: 'Move to another host' }).first();
+  await action.click();
+  await action.click();
+  await form.locator('select[name=host]').selectOption('mock-b');
+  await form.getByRole('button', { name: 'Move to another host' }).click();
+  await form.getByRole('button', { name: 'Confirm' }).click();
+  await expect(page.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+  await expect(page.getByTestId('job')).toContainText('sent in 3 rounds');
+  await expect(page.getByTestId('job')).toContainText('runs on mock-b -- paused 212 ms');
+  await page.goto(`/en/h/${host}/vms`);
+  await expect(page.getByTestId('resource-vms')).toContainText('panel');
+  await expect(page.getByTestId('resource-vms')).not.toContainText('pw-mig');
+});
+
 test('a VM\'s firewall and public address: chosen as it is made, on its page, the firewall changed from a list a read gives (choices)', async ({ page }) => {
   const host = await login(page);
   await page.goto(`/en/h/${host}/vms/new`);

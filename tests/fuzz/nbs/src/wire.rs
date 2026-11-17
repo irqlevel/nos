@@ -284,8 +284,12 @@ fn message(r: &mut Rng, data: &[u8]) -> (u8, Vec<u8>, bool) {
         }
         4 => {
             let ask = match r.below(9) {
-                0 => Ask::Attach { name: name(r, nbsmeta::VOLUME_NAME_MAX), writable: r.chance(50),
-                                   force: r.chance(50), token: r.below(u64::MAX) },
+                0 => {
+                    let writable = r.chance(50);
+                    let expect = if writable && r.chance(30) { 1 + r.below(u64::MAX - 1) } else { 0 };
+                    Ask::Attach { name: name(r, nbsmeta::VOLUME_NAME_MAX), writable, force: r.chance(50),
+                                  token: r.below(u64::MAX), expect }
+                }
                 1 => Ask::Detach { name: name(r, nbsmeta::VOLUME_NAME_MAX), generation: r.below(u64::MAX),
                                    token: r.below(u64::MAX) },
                 2 => {

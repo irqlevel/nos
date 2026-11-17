@@ -149,6 +149,17 @@ impl Shape {
         self.cpus
     }
 
+    /// What it is, as a VM's state has it (`vmstate::Shape`): its CPUs, and
+    /// whether they are threads of cores in twos and share one cache.
+    pub fn parts(&self) -> (u32, bool, bool) {
+        (self.cpus, self.smt, self.llc)
+    }
+
+    /// The shape a VM's state says: as many CPUs as a guest has at most.
+    pub fn from_parts(cpus: u32, smt: bool, llc: bool) -> Shape {
+        Shape { cpus: cpus.min(MAX_CPUS as u32), smt, llc }
+    }
+
     /// An APIC ID's bits below its core's: 1 where a core is two threads.
     #[inline]
     pub fn smt_shift(&self) -> u32 {

@@ -50,7 +50,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
-use hv::run::{Counts, Host};
+use hv::run::{Counts, Host, LinuxGuest, Stop};
 use hv::{Doorbells, Machine};
 use kcore::cmd::Output;
 use kcore::consts::{NS_PER_MS, NS_PER_SEC};
@@ -1172,6 +1172,115 @@ impl Drop for Reserved<'_> {
     }
 }
 
+/// What a VM's guest is made of at its start: a kernel booted, as `hv start`
+/// boots one -- or the state of a guest that ran (`hv restore`, a
+/// migration's), put into a machine built alike and its memory filled by
+/// `fill`; `what` says where it came from, for the note.
+pub enum Origin<'a> {
+    Boot,
+    State { state: &'a vmstate::VmState, fill: &'a mut dyn FnMut(&LinuxGuest) -> Result<(), String>, what: &'a str },
+}
+
+/// A VM coming from another host, from its offer here to its run
+/// (plans/vm-migration.md): its name held, its CPUs taken, its number, what
+/// its tasks share and what its disks are served for -- everything a start
+/// takes but the guest, which the migration builds over stand-ins, fills,
+/// and gives its volumes and its port at the handover (`Vms::arrived`).
+/// Dropped, all of it goes back.
+pub struct Coming<'a> {
+    held: Reserved<'a>,
+    core_hold: Hold,
+    pub id: u32,
+    shared: Arc<Shared>,
+    pub runner: Runner,
+    placement: Vec<u32>,
+    disk_cpu: u32,
+    pub spec: Spec,
+}
+
+impl Coming<'_> {
+    /// Its guest, built over stand-ins as `disks` and `nic` say the old
+    /// host's was (`guest::build_coming`).
+    pub fn build(&self, machine: &Machine, disks: &[hv::disk::Shape], nic: Option<([u8; 6], u16)>)
+        -> Result<Built, String> {
+        guest::build_coming(machine, &self.spec, self.shared.doorbells.clone(), disks, nic)
+    }
+}
+
+/// A running VM held for its state to be taken (`Vms::take_for_state`): its
+/// guest, its name and number -- and, until it is given back or ended, its
+/// stop held, so that nothing else stops or restarts it meanwhile.
+pub struct StateHold<'a> {
+    vms: &'a Vms,
+    shared: Arc<Shared>,
+    pub guest: Arc<LinuxGuest>,
+    pub name: String,
+    pub id: u32,
+    /// Its folder's path, and its disks' words as it was started with.
+    pub folder: String,
+    pub disks: Vec<String>,
+    /// Its port of the switch, with `net`.
+    pub port: Option<usize>,
+    /// The host CPU its disks are served on.
+    disk_cpu: Option<u32>,
+    done: bool,
+}
+
+impl StateHold<'_> {
+    /// What a disk opened for it now is served by, as its others are: its
+    /// task on the VM's disks' CPU, waking its vCPUs -- a migration's
+    /// volume taken back (`QueuedDisk::open_handover`).
+    pub fn runner(&self) -> Option<Runner> {
+        Some(Runner {
+            wake: self.shared.clone(),
+            name: alloc::format!("vm{}", self.id),
+            cpu: self.disk_cpu?,
+            claims: self.vms.claims.clone(),
+            holder: Holder::Vm(self.id),
+            owner: alloc::format!("vm {}'s disk", self.name),
+        })
+    }
+
+    /// Given back as it was: running, its guest gone on (`LinuxGuest::resume`
+    /// is the caller's), and stoppable again.
+    pub fn give_back(mut self) {
+        self.done = true;
+        self.shared.stopping.store(false, Ordering::Release);
+    }
+
+    /// Ended -- its state taken -- as `hv stop` ends one: the guest stopped
+    /// with `stop` where it is, paused or not, and the VM off the list, its
+    /// task joined, its port, forwards and CPUs given back. Its folder is
+    /// the caller's.
+    pub fn end(mut self, stop: Stop, forwards: &Forwards) -> Result<(), String> {
+        self.done = true;
+        let id = self.id;
+        self.shared.stop.store(true, Ordering::Release);
+        self.guest.stop(stop);
+        self.shared.ring_all();
+        let vm = {
+            let mut table = self.vms.table.lock();
+            table.vms.iter().position(|vm| vm.shared.id == id).map(|i| table.vms.remove(i))
+        };
+        let vm = vm.ok_or_else(|| alloc::format!("vm {} was taken off the list meanwhile", id))?;
+        let port = vm.port;
+        /* The task joined: the guest's memory goes back with this hold's
+         * share of it, the last. */
+        finish(vm);
+        forwards.drop_vm(id);
+        self.vms.release(port);
+        Ok(())
+    }
+}
+
+impl Drop for StateHold<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.shared.stopping.store(false, Ordering::Release);
+        }
+    }
+}
+
 /// Every VM this module has started and not yet taken off the list.
 pub struct Vms {
     table: Mutex<Table>,
@@ -1256,6 +1365,33 @@ impl Drop for PortHold {
             self.switch.release(self.port);
         }
     }
+}
+
+/// What a start has made by the time its guest is built, for the rest of it
+/// (`Vms::run_listed`): its number and name, its folder, what its tasks
+/// share, the guest, the spec it boots again from, where its CPUs and disks
+/// run and its hold on them, its name's hold, its port of the switch and the
+/// port of vnet's it is, and the state it was restored from, if it was.
+struct Listing<'a, 'o> {
+    machine: &'a Arc<Machine>,
+    forwards: &'a Forwards,
+    id: u32,
+    name: Option<&'a str>,
+    stored: &'a Option<(Folder, bool)>,
+    logged: bool,
+    shared: Arc<Shared>,
+    built: Built,
+    spec: Spec,
+    runner: Runner,
+    placement: Vec<u32>,
+    disk_cpu: u32,
+    has_disks: bool,
+    core_hold: Hold,
+    held: Option<Reserved<'a>>,
+    hold: Option<PortHold>,
+    attached: Option<([u8; 16], crate::vnet::Attached)>,
+    restored: Option<&'a str>,
+    out: &'o mut dyn Write,
 }
 
 /// Stop a VM taken off the table and wait for its task: the flag, then the
@@ -1535,7 +1671,7 @@ impl Vms {
                 self.start_forced(machine, cores, forwards, folder, force, out)
             }
             Ok(None) => match guest::parse(args, START_USAGE) {
-                Ok(spec) if spec.secs.is_none() => self.launch(machine, cores, forwards, spec, None, out),
+                Ok(spec) if spec.secs.is_none() => self.launch(machine, cores, forwards, spec, None, Origin::Boot, out),
                 Ok(_) => Err(String::from("secs= is hv boot's -- a started vm runs until hv stop")),
                 Err(usage) => {
                     let _ = writeln!(out, "{}", usage);
@@ -1567,7 +1703,49 @@ impl Vms {
             .map_err(|e| alloc::format!("{}/{}: {}", folder.path, store::CONFIG, e))?;
         spec.force = force;
         let log = config.console_log;
-        self.launch(machine, cores, forwards, spec, Some((folder, log)), out)
+        self.launch(machine, cores, forwards, spec, Some((folder, log)), Origin::Boot, out)
+    }
+
+    /// The VM of `folder` started from a state (`origin`): its machine as its
+    /// vm.toml describes it, the state put into it -- `hv restore`'s, a
+    /// migration's.
+    pub fn start_restored(&self, machine: &Arc<Machine>, cores: &Cores, forwards: &Forwards, folder: Folder,
+                          origin: Origin<'_>, out: &mut dyn Write) -> Result<u32, String> {
+        hv::run::ensure_runnable(machine).map_err(|e| alloc::format!("no guest can run here -- {}", e))?;
+        let config = store::load(&folder)?;
+        let spec = store::options_checked(&folder, &config)
+            .map_err(|e| alloc::format!("{}/{}: {}", folder.path, store::CONFIG, e))?;
+        let log = config.console_log;
+        self.launch(machine, cores, forwards, spec, Some((folder, log)), origin, out)
+    }
+
+    /// The running VM `word` names held for its state to be taken: its guest,
+    /// name and number, its stop held until the hold is given back or the VM
+    /// ended (`StateHold`). A VM of a folder alone -- that is what it is
+    /// started from again -- running, and being stopped by nothing else.
+    pub fn take_for_state(&self, word: &str) -> Result<StateHold<'_>, String> {
+        let id = self.id_of(word)?;
+        let (shared, name, folder, disks, disk_cpu, port) = {
+            let table = self.table.lock();
+            let vm = table.vms.iter().find(|vm| vm.shared.id == id).ok_or_else(|| alloc::format!("no vm {}", id))?;
+            let mut disks = Vec::new();
+            disks.try_reserve_exact(vm.disks.len()).map_err(|_| String::from("out of memory"))?;
+            disks.extend(vm.disks.iter().cloned());
+            (vm.shared.clone(), vm.name.clone(), vm.folder.clone(), disks, vm.disk_cpu, vm.port)
+        };
+        let (Some(name), Some(folder)) = (name, folder) else {
+            return Err(alloc::format!("vm {} has no folder: only a VM of one -- what it is started from again -- has \
+                                       its state taken", id));
+        };
+        if shared.stopping.swap(true, Ordering::AcqRel) {
+            return Err(alloc::format!("vm {} is being stopped", id));
+        }
+        let guest = shared.serving.lock().clone();
+        let Some(guest) = guest else {
+            shared.stopping.store(false, Ordering::Release);
+            return Err(alloc::format!("vm {} is not running", id));
+        };
+        Ok(StateHold { vms: self, shared, guest, name, id, folder, disks, disk_cpu, port, done: false })
     }
 
     /// Why a VM of `name` may not start now -- one on the list already, the
@@ -1580,32 +1758,86 @@ impl Vms {
         table.reserved.iter().find(|r| r.name == n).map(|r| Taken::Doing(r.doing))
     }
 
-    /// Start the guest `spec` describes -- from its folder, given one, and
-    /// whether to keep its console.log there: its number, or why not.
-    fn launch(&self, machine: &Arc<Machine>, cores: &Cores, forwards: &Forwards, mut spec: Spec,
-              stored: Option<(Folder, bool)>, out: &mut dyn Write) -> Result<u32, String> {
-        let name = stored.as_ref().map(|(f, _)| f.name.as_str());
-        /* A name on the list already -- or held while its folder is made,
-         * cloned, deleted or started -- is said first, and before anything
-         * is taken for it: not a want of cores. And from here it is held,
-         * until the VM is on the list or the start has failed. */
-        let mut held = match name {
-            Some(n) => Some(self.reserve_start(n)?),
-            None => None,
-        };
-        /* Its place, and its hold on it, before anything is made: two
-         * starts at once are given cores apart. The hold is named once the
-         * VM has a number, and given back with the task -- or here, on the
-         * way out of a start that goes no further. */
+    /// A VM of `name` coming from another host (`Coming`), as `spec` -- its
+    /// vm.toml's -- describes it: its name held, its CPUs taken, its number
+    /// and what its tasks share made, before its guest is built.
+    pub fn coming(&self, machine: &Arc<Machine>, cores: &Cores, name: &str, mut spec: Spec, logged: bool)
+        -> Result<Coming<'_>, String> {
+        hv::run::ensure_runnable(machine).map_err(|e| alloc::format!("no guest can run here -- {}", e))?;
+        let held = self.reserve_start(name)?;
         let has_disks = !spec.disks.is_empty();
         let (place, core_hold) = cores.take(machine, spec.cpu, spec.cpus, has_disks, None)?;
         spec.shape = place.shape;
-        let placement = place.vcpus;
-        let disk_cpu = place.disk;
-        let cpu = placement[0];
-        if spec.input.len() > INPUT_MAX {
-            return Err(alloc::format!("input= is {} bytes, more than the {} a vm queues", spec.input.len(), INPUT_MAX));
-        }
+        let id = self.number(Some(name))?;
+        core_hold.held_by(Holder::Vm(id));
+        spec.name = String::from(name);
+        spec.input.clear();
+        let shared = Shared::new(id, spec.log, &[], spec.cpus, logged)
+            .map(Arc::new)
+            .ok_or_else(|| alloc::format!("vm {} not made -- out of memory for its console", id))?;
+        let runner = Runner {
+            wake: shared.clone(),
+            name: alloc::format!("vm{}", id),
+            cpu: place.disk,
+            claims: self.claims.clone(),
+            holder: Holder::Vm(id),
+            owner: alloc::format!("vm {}'s disk", name),
+        };
+        Ok(Coming { held, core_hold, id, shared, runner, placement: place.vcpus, disk_cpu: place.disk, spec })
+    }
+
+    /// The port of vnet's that VM `uuid`'s NIC is, moved here, had on the
+    /// switch for the VM `coming` is: attached as vnet's state now has it,
+    /// judged by its firewall of the cluster's. The port of the switch, and
+    /// the attach, for the keeper.
+    pub fn claim_cluster_port(&self, coming: &Coming<'_>, uuid: &[u8; 16], network: &str)
+        -> Result<(usize, Arc<Switch>, crate::vnet::Attached), String> {
+        let shared = &coming.shared;
+        let switch = self.switch()?;
+        let cluster = crate::vnet::cluster_network(network)
+            .ok_or_else(|| alloc::format!("{} is no network of the cluster's", network))?;
+        let a = crate::vnet::attach(uuid, cluster, None, None, false)?;
+        let place = self.firewalls.place_cluster(&switch, &a.firewall)
+            .map_err(|why| alloc::format!("its firewall: {}", why))?;
+        let port = switch.claim_vnet(shared, &a.identity, place)?;
+        Ok((port, switch, a))
+    }
+
+    /// A VM come from another host (`coming`), its guest `built` and its
+    /// state in, its volumes and its port had -- `nic`, the port of the
+    /// switch, the switch, its UUID and vnet's attach of it -- started here:
+    /// listed as `launch` lists one, its task running the guest from where
+    /// it stood, its folder `folder`. Its number, or why not.
+    #[allow(clippy::too_many_arguments)]
+    pub fn arrived(&self, machine: &Arc<Machine>, forwards: &Forwards, coming: Coming<'_>, built: Built,
+                   folder: Folder, logged: bool, nic: Option<(usize, Arc<Switch>, [u8; 16], crate::vnet::Attached)>,
+                   what: &str, out: &mut dyn Write) -> Result<u32, String> {
+        let Coming { held, core_hold, id, shared, runner, placement, disk_cpu, mut spec } = coming;
+        let has_disks = !spec.disks.is_empty();
+        let (hold, attached) = match nic {
+            Some((port, switch, uuid, a)) => {
+                /* What its next boot here is told, a reset's under `restart`:
+                 * its address, as `launch` tells a VM it starts */
+                spec.cmdline.push(' ');
+                spec.cmdline.push_str(&net::ip_param_at(a.identity.ip, a.identity.gateway(), a.identity.mask(),
+                                                        switch.dns()));
+                spec.nic = Some(NicSpec { port, switch: switch.clone(), mtu: a.identity.mtu });
+                (Some(PortHold { switch, port, kept: false }), Some((uuid, a)))
+            }
+            None => (None, None),
+        };
+        let stored = Some((folder, logged));
+        let name = stored.as_ref().map(|(f, _)| f.name.as_str());
+        self.run_listed(Listing {
+            machine, forwards, id, name, stored: &stored, logged, shared, built, spec, runner, placement, disk_cpu,
+            has_disks, core_hold, held: Some(held), hold, attached, restored: Some(what), out,
+        })
+    }
+
+    /// A number for a VM about to start, `name` its name if it has one: none
+    /// while the module goes, the list is full, or a VM of that name is on
+    /// it.
+    fn number(&self, name: Option<&str>) -> Result<u32, String> {
         enum No {
             Closing,
             Full,
@@ -1631,12 +1863,45 @@ impl Vms {
                 },
             }
         };
-        let id = id.map_err(|no| match no {
+        id.map_err(|no| match no {
             No::Closing => String::from("the module is being unloaded"),
             No::Full => alloc::format!("{} vms already -- hv stop one first", MAX_VMS),
             No::Taken(taken) => taken.said(name.unwrap_or("")),
             No::Numbers => String::from("out of vm numbers -- reload the module"),
-        })?;
+        })
+    }
+
+    /// Start the guest `spec` describes -- from its folder, given one, and
+    /// whether to keep its console.log there: its number, or why not.
+    fn launch(&self, machine: &Arc<Machine>, cores: &Cores, forwards: &Forwards, mut spec: Spec,
+              stored: Option<(Folder, bool)>, origin: Origin<'_>, out: &mut dyn Write) -> Result<u32, String> {
+        /* A guest of a state is typed nothing at: what its vm.toml queues is
+         * for its boot, long past. */
+        if matches!(origin, Origin::State { .. }) {
+            spec.input.clear();
+        }
+        let name = stored.as_ref().map(|(f, _)| f.name.as_str());
+        /* A name on the list already -- or held while its folder is made,
+         * cloned, deleted or started -- is said first, and before anything
+         * is taken for it: not a want of cores. And from here it is held,
+         * until the VM is on the list or the start has failed. */
+        let held = match name {
+            Some(n) => Some(self.reserve_start(n)?),
+            None => None,
+        };
+        /* Its place, and its hold on it, before anything is made: two
+         * starts at once are given cores apart. The hold is named once the
+         * VM has a number, and given back with the task -- or here, on the
+         * way out of a start that goes no further. */
+        let has_disks = !spec.disks.is_empty();
+        let (place, core_hold) = cores.take(machine, spec.cpu, spec.cpus, has_disks, None)?;
+        spec.shape = place.shape;
+        let placement = place.vcpus;
+        let disk_cpu = place.disk;
+        if spec.input.len() > INPUT_MAX {
+            return Err(alloc::format!("input= is {} bytes, more than the {} a vm queues", spec.input.len(), INPUT_MAX));
+        }
+        let id = self.number(name)?;
         core_hold.held_by(Holder::Vm(id));
 
         /* What its SMBIOS calls it, and the UUID it gives it: its vm.toml's
@@ -1797,7 +2062,13 @@ impl Vms {
 
         /* The files are read and the guest's memory filled here, with no lock
          * held: it takes as long as the kernel and the initrd take to read. */
-        let built = guest::build(machine, &spec, &runner, shared.doorbells.clone()).map_err(|why| not_started(&why))?;
+        let (built, restored) = match origin {
+            Origin::Boot => (guest::build(machine, &spec, &runner, shared.doorbells.clone()), None),
+            Origin::State { state, fill, what } => {
+                (guest::build_restored(machine, &spec, &runner, shared.doorbells.clone(), state, fill), Some(what))
+            }
+        };
+        let built = built.map_err(|why| not_started(&why))?;
         /* `force` was this attach's -- an operator's word for a volume whose
          * writer's host is gone -- and is no boot's after it: kept in the
          * spec the task boots again from, a reset under `restart` or an `hv
@@ -1806,6 +2077,23 @@ impl Vms {
          * boot attaches plainly, and where another host writes, it fails and
          * says so. */
         spec.force = false;
+        self.run_listed(Listing {
+            machine, forwards, id, name, stored: &stored, logged, shared, built, spec, runner, placement, disk_cpu,
+            has_disks, core_hold, held, hold, attached, restored, out,
+        })
+    }
+
+    /// A VM's start from where its guest is built: its task started on its
+    /// first CPU's host CPU, running the guest, and the VM put on the list --
+    /// its name the listed VM's from then, its port kept by the keeper, its
+    /// log begun, nos's ports it asks for relayed. Its number, or why not.
+    fn run_listed(&self, l: Listing<'_, '_>) -> Result<u32, String> {
+        let Listing {
+            machine, forwards, id, name, stored, logged, shared, built, spec, runner, placement, disk_cpu,
+            has_disks, core_hold, mut held, mut hold, attached, restored, out,
+        } = l;
+        let not_started = |why: &dyn core::fmt::Display| alloc::format!("vm {} not started -- {}", id, why);
+        let cpu = placement[0];
         let mut cpus = Vec::new();
         cpus.try_reserve_exact(placement.len()).map_err(|_| not_started(&"out of memory"))?;
         cpus.extend_from_slice(&placement);
@@ -1848,8 +2136,15 @@ impl Vms {
         }
         /* For the log, before the guest has printed a byte: first in it. */
         let mut note = String::new();
-        if note.try_reserve(host_cpus.len() + said.len() + 24).is_ok() {
-            let _ = write!(note, "started on {} -- {}", host_cpus, said);
+        if note.try_reserve(host_cpus.len() + said.len() + 64).is_ok() {
+            match restored {
+                Some(what) => {
+                    let _ = write!(note, "restored on {} from {} -- {}", host_cpus, what, said);
+                }
+                None => {
+                    let _ = write!(note, "started on {} -- {}", host_cpus, said);
+                }
+            }
             shared.note(note);
         }
         /* Its disks' words, for `disk_io`: the spec goes into its task */
@@ -2072,6 +2367,11 @@ impl Vms {
             if arps + echoes != 0 {
                 let _ = writeln!(out, "the cluster's networks: {} ARP questions answered by the switch, {} echoes from \
                                        their gateways", arps, echoes);
+            }
+            let relayed = s.relayed();
+            if relayed != 0 {
+                let _ = writeln!(out, "the cluster's networks: {} frames for ports moved to other hosts carried on to \
+                                       them", relayed);
             }
             match s.nat_address() {
                 Some(ip) => {
@@ -2803,6 +3103,50 @@ impl Vms {
         let switch = self.switch.lock().clone();
         if let Some(s) = switch {
             s.release(port);
+        }
+    }
+
+    /// Port `port`'s firewall's flows, each with how long it has left (a
+    /// VM's, paused for its move): none where there is no switch.
+    pub fn port_flows(&self, port: usize) -> Vec<net::Carried> {
+        let mut flows = Vec::new();
+        let switch = self.switch.lock().clone();
+        if let Some(s) = switch {
+            if flows.try_reserve_exact(net::FLOWS).is_ok() {
+                s.flows_of(port, &mut flows);
+            }
+        }
+        flows
+    }
+
+    /// Port `port`'s cluster network and address, while it is on one.
+    pub fn port_vnet(&self, port: usize) -> Option<(u32, u32)> {
+        let switch = self.switch.lock().clone();
+        switch.and_then(|s| s.vnet_address(port))
+    }
+
+    /// The port of network `vni` at `addr` moved to host `to`, its frames
+    /// still sent here carried on there a while (`Switch::moved_away`):
+    /// whether the host was known.
+    pub fn moved_away(&self, vni: u32, addr: u32, to: &str) -> bool {
+        let switch = self.switch.lock().clone();
+        let node = self.tunnel().and_then(|t| t.node_of(to));
+        if let (Some(s), Some(node)) = (switch, node) {
+            s.moved_away(vni, addr, node);
+        }
+        node.is_some()
+    }
+
+    /// The node of host `name`, as the tunnel has the hosts.
+    pub fn node_of(&self, name: &str) -> Option<u64> {
+        self.tunnel().and_then(|t| t.node_of(name))
+    }
+
+    /// The keeper's table asked for now, where there is one: a port moved
+    /// here or away.
+    pub fn keeper_now(&self) {
+        if let Some(k) = self.keeper() {
+            k.turn_now();
         }
     }
 

@@ -279,6 +279,31 @@ impl Mailbox {
             || self.level.iter().any(|w| w.load(Ordering::Acquire) != 0)
     }
 
+    /// What waits in it, left there, for a VM's state (`vmstate`): read with
+    /// the CPU parked and nothing else posting.
+    pub fn save(&self) -> vmstate::Mail {
+        let start = self.start.load(Ordering::Acquire);
+        vmstate::Mail {
+            edge: core::array::from_fn(|w| self.edge[w].load(Ordering::Acquire)),
+            level: core::array::from_fn(|w| self.level[w].load(Ordering::Acquire)),
+            nmi: self.nmi.load(Ordering::Acquire),
+            init: start & INIT_PENDING != 0,
+            sipi: (start & SIPI_PENDING != 0).then_some((start & SIPI_VECTOR) as u8),
+        }
+    }
+
+    /// What `s` says waited, posted again -- into a mailbox nothing has
+    /// posted to yet.
+    pub fn restore(&self, s: &vmstate::Mail) {
+        for w in 0..4 {
+            self.edge[w].store(s.edge[w], Ordering::Release);
+            self.level[w].store(s.level[w], Ordering::Release);
+        }
+        self.nmi.store(s.nmi, Ordering::Release);
+        let start = if s.init { INIT_PENDING } else { 0 } | s.sipi.map_or(0, |v| SIPI_PENDING | u32::from(v));
+        self.start.store(start, Ordering::Release);
+    }
+
     /// Everything posted so far, taken out. What a CPU does with it is in
     /// the order a real one would: the INIT first -- it resets the CPU --
     /// and then the start-up IPI it waits for; a start-up IPI posted before
