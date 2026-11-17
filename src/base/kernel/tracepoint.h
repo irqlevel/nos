@@ -146,6 +146,17 @@ enum class Id : u16
     TunnelDrop,
     TunnelKey,
 
+    /* A VM moved between hosts' hv (group "migrate", plans/vm-migration.md):
+       the old host's rounds of its memory, each side's takes of its first
+       volume in the handover and each side's end of a move, the messages the
+       new host takes, and -- in the run loop -- the waits for every CPU of a
+       guest to drop what its TLB kept of a table the dirty log narrowed. */
+    MigRound,
+    MigTake,
+    MigEnd,
+    MigRecv,
+    MigSync,
+
     Count
 };
 
@@ -720,6 +731,82 @@ struct TunnelKey
     u32 peer;
     u32 number;
     u16 peer_port;
+    u8 what;
+    u8 pad;
+};
+
+/* mig_round: a round of a migration's pages sent by the old host -- the
+   first every page, each after it the pages its guest wrote meanwhile, the
+   last (`last`) with the guest paused: the migration (`id`), the round, its
+   pages and how many of them zeros, how long it took to send (`ms`), the
+   pages marked written by its end (what the next round will be), and how
+   slowed the guest was, percent. */
+struct MigRound
+{
+    u64 id;
+    u32 round;
+    u32 pages;
+    u32 zeros;
+    u32 ms;
+    u32 marked;
+    u8 throttle;
+    u8 last;
+    u8 pad[2];
+};
+
+/* mig_take: a side's take of a volume in a migration's handover (MIG_SIDE)
+   -- the new host's commit, the old one's taking back -- from the writer of
+   `generation`: the disk's index, how long NBS took to answer, and what it
+   came to (MIG_TOOK). */
+struct MigTake
+{
+    u64 id;
+    u64 generation;
+    u32 ms;
+    u8 side;
+    u8 took;
+    u8 disk;
+    u8 pad;
+};
+
+/* mig_end: a side's end of a migration (MIG_SIDE, MIG_HOW): how long the
+   guest was paused for it, the rounds, and the MiB of memory sent or
+   taken. */
+struct MigEnd
+{
+    u64 id;
+    u32 paused_ms;
+    u32 rounds;
+    u32 mib;
+    u8 side;
+    u8 how;
+    u8 pad[2];
+};
+
+/* mig_recv: a message of a migration taken by the new host (MIG_KIND):
+   its sequence number's low word, its bytes and how long it took to
+   handle -- written into the guest's memory or its folder, answered. */
+struct MigRecv
+{
+    u64 id;
+    u32 seq;
+    u32 bytes;
+    u32 ns;
+    u8 kind;
+    u8 pad[3];
+};
+
+/* mig_sync: every CPU of a guest made to drop what its TLB kept of its
+   nested table, narrowed by a migration's dirty log (MIG_SYNC): the
+   table's new identity, how long the narrowing took and the wait for the
+   CPUs after it, the pages narrowed, the guest's CPUs. */
+struct MigSync
+{
+    u64 table;
+    u32 narrow_ns;
+    u32 wait_ns;
+    u32 pages;
+    u16 cpus;
     u8 what;
     u8 pad;
 };

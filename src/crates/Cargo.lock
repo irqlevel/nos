@@ -466,6 +466,7 @@ dependencies = [
  "hvarch",
  "kcore",
  "netwire",
+ "vmstate",
 ]
 
 [[package]]
@@ -614,6 +615,13 @@ name = "mgmtwire"
 version = "0.1.0"
 
 [[package]]
+name = "migwire"
+version = "0.1.0"
+dependencies = [
+ "codec",
+]
+
+[[package]]
 name = "mod-api"
 version = "0.1.0"
 dependencies = [
@@ -689,9 +697,12 @@ dependencies = [
  "kcore",
  "kmod",
  "mgmtwire",
+ "migwire",
  "nbsdrive",
  "nbsmeta",
  "netwire",
+ "vmstate",
+ "vnetmeta",
  "vnetwire",
 ]
 
@@ -1542,6 +1553,13 @@ dependencies = [
  "block",
  "kcore",
  "virtio",
+]
+
+[[package]]
+name = "vmstate"
+version = "0.1.0"
+dependencies = [
+ "codec",
 ]
 
 [[package]]

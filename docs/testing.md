@@ -239,7 +239,7 @@ swallowing panic messages whole.
 | `hvboot-test.py [--image <disk.raw>] [--iterations N]` | host (CI) | hvboot's own `plan` -- over its partition, ext2/3/4 and GRUB readers and its bzImage header, from their own sources -- under its own heap's arithmetic and size: on disks it makes -- GPT, MBR and none, ext4, ext3 and 1 KiB-block ext2, a grub-mkconfig grub.cfg and grubenv -- the entry GRUB would boot and its files byte for byte; grub.cfg read as GRUB 2.06 read each case when it was booted with it; what is said when nothing boots; a grub.cfg as long as is read, of each costliest shape, and a two-level extent tree, inside the heap; then each disk's metadata fuzzed, every run giving the heap back whole |
 | `extfmt-test.py [--iterations N] [--trials N]` | host (CI) | the ext2/3/4 format crate (`src/crates/common/storage/extfmt`) hvboot reads through and the kernel's ext4 driver is to: every checksum of filesystems mke2fs makes -- ext4 by default, with metadata_csum_seed, with 1 KiB blocks and 128-byte inodes and no 64bit, with gdt_csum, ext3, ext2 -- held to extfmt's, bytes they cover changed one at a time with extfmt and `e2fsck -fn` held to both saying so, and each image fuzzed; then journals debugfs leaves unreplayed, replayed by extfmt's planner and by `e2fsck -E journal_only` to the same image byte for byte, their ring turned so the log wraps, damaged and refused, and fuzzed; and the filesystems `extfmt::mkfs` makes for the shell's `format` -- ext4 and ext2, every block size, up to 3 GiB and 128 groups, the small ones made over noise -- clean to `e2fsck -fn`, their features and label dumpe2fs's, their lost+found debugfs's, and the devices it refuses refused |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hypervisor/hv/src/{insn,walk}.rs`), against the encodings clang gives |
-| `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and its ACPI and SMBIOS tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on; and the virtio notifications, kicks and interrupts with EVENT_IDX and without, held to a Linux driver's every request served (`virtq`); and the guests' firewall, its crate to a model of its own (`firewall`) and the switch's use of it (`fwswitch`); and NAT's one to one (`onetoone`); and the cluster's networks on the switch (`vnetswitch`), the tunnel's datagram, each held to the wire built without vnetwire (`vnetwire`), and three hosts' tunnels over a hostile wire, public addresses across them through the real NAT among it (`tunnel`); `--mutants` (by hand) then takes ninety-nine of the firewall's, one to one's, the cluster networks', the tunnel's and the public addresses' rules out, each to be found |
+| `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and its ACPI and SMBIOS tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on; and the virtio notifications, kicks and interrupts with EVENT_IDX and without, held to a Linux driver's every request served (`virtq`); and the guests' firewall, its crate to a model of its own (`firewall`) and the switch's use of it (`fwswitch`); and NAT's one to one (`onetoone`); and the cluster's networks on the switch (`vnetswitch`), the tunnel's datagram, each held to the wire built without vnetwire (`vnetwire`), and three hosts' tunnels over a hostile wire, public addresses across them through the real NAT among it, ports migrated between them (`tunnel`); a migrated port's flows on its new host's switch (`flowmove`); `--mutants` (by hand) then takes a hundred and four of the firewall's, one to one's, the cluster networks', the tunnel's, the public addresses' and a migration's network's rules out, each to be found |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate, and the session's line editor -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and ext4 images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands and its `format`, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
 | `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by, and what a terminal types at the console's line editor, and the tracepoints' ring against a model and a writer thread, and the window `trace latency` reads of the rings against the truth of a schedule played out on them -- and the memory management under everything: the page tables and the physical page allocator past `setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
@@ -254,6 +254,7 @@ swallowing panic messages whole.
 | `nbs-fuzz.py [--seed N --seconds S] [--target meta\|cs\|inflight\|wire\|scrub\|cluster\|join\|tail] [--mutants]` | host (CI) | NBS's metadata (`src/crates/common/storage/nbsmeta`): what is stored, placement, the snapshot and the digest; the chunk server's engine (`nbscs`) through power cuts, and with many requests in flight over disks that do theirs in any order; NBS's messages (`nbswire`); the client (`nbsclient`) end to end through six hosts' cs's and mds, crashes and takeovers; and a join's copy (`nbswire::copy`) from a source onto its joiner, under writes, rejoins, rot and power cuts; and the client end to end over a volume no whole number of chunks (`tail`) -- each held to a model of its own -- [`nbs-fuzz.py`](#nbs-fuzzpy----nbss-metadata-decided-on-the-host) |
 | `nbs-test.py [--arch aarch64\|x86_64] [--keep]` | both | NBS between kernels: `modules/storage/nbs-mds` (the member, its commands, the `nbs` provider, `nbs io`'s sessions, the controller, the scrub) and `modules/storage/nbs-cs` (the chunk server, a join's copy), raftmember as it runs them, nbsload -- three nos on `tests/hub.py`'s LAN, as `cluster-test.py` runs them, each with a pool disk, and a fourth booted late: a host back copying only what it missed, one of four lost for good and replaced, rot spoiled under a running cs through QEMU's monitor and mended by `nbs replica bad` |
 | `hv-nbs-test.py --bzimage <bzImage> --initrd <cpio> [--keep] [--mem]` | x86-64, **manual** | hv's guests on volumes of NBS's (`disk=nbs:<volume>`): a pour read by a guest elsewhere; a disk hvboot boots made an image by `hv image`, and two VMs made of it on two hosts -- by `hv create ... image=nbs:`, and by the vm provider's create through the bus as the panel makes one -- each booted by its name -- by hvboot, through the 4 KiB blocks of a volume -- off a clone of its own, one written over a chunk the image shares and the other still the image's, and the refusals; an image made by the vm provider's `image`; the written one's disk activity through the vm provider's `disk_io` -- its volume's reads and writes counted, and the time they waited, growing between two asks -- and its disk snapshotted by the vm provider's `snapshot` as it runs, and a VM of the snapshot booted on the other host, its disk the written one's then; a guest's writes read back and moved with the volume, a forced start fencing the old guest, a host killed under a write -- three nos under KVM where the host has it, the guests nested; `--mem` says the hosts' `memusage` at each step |
+| `vm-migration-test.py --bzimage <bzImage> --initrd <cpio> [--keep]` | x86-64, **manual** | a running VM moved between hosts (`hv migrate`, plans/vm-migration.md): three nos with ipcnet, the registry, NBS and vnet; the refusals -- no such VM, this host, a disk that is a file it writes, a name the other host has a folder of -- each leaving it running; a guest on a volume of NBS's, counting in its memory and writing files of random bytes and their sums all the while, moved a to b live, b to a cold, a to b live again: each time on the other host's list and not the first's, its folder moved, its counter and uptime gone on, its kernel saying nothing of a clock or a CPU gone wrong, every file its writer made whole there with its own sum, the volume's writer the new host's, what it wrote on each host read back on the others; on vnet's network, a probe on the third host pinging it through each move, answered again once it runs there, it reaching the probe from there, its port and its firewall's flows on the new host; then stopped and booted cold from the moved folder |
 | `api-test.py [--arch aarch64\|x86_64]` | both (arm64 in CI) | the host API module, `nosctl`, the bus's caller side for modules; on x86-64 the `vm` provider through it and `api panel create` |
 | `panel/`: `npx playwright test` | host (CI) | the management panel against the mock API, both themes and both languages: a host's cluster and NBS made from it, VMs of an image of NBS's, an image of a URL, a VM's snapshot and a VM of it, a VM's disks' IOPS and bandwidth charted, NBS's volumes and a VM's disks coloured by their health, I/O errors and latency, NBS's alerts the worst first, a job's polling ended with it |
 | `panel-appliance-test.py <bundle>` | host (CI), Docker | the panel's bundle (`scripts/panel-bundle.py`, `panel/appliance/`) run as its VM runs it |
@@ -1283,6 +1284,54 @@ under the switch and NAT the net layer is a stand-in too -- its devices,
 frames and ARP table, `hv0`'s receive path run on the caller's thread --
 so what they do is fuzzed, one frame at a time, and the receive path's own
 concurrency is not.
+
+A migration's (plans/vm-migration.md) has four targets of its own.
+`vmstate`: a VM's state (`common/vm/vmstate`) from hostile bytes -- refused
+or read, never a panic, what reads writing back the same -- every state the
+input makes read back as written, and as version 1 wrote it (what version 2
+added cut out of its bytes) read back as it with that at its default, its bytes then changed, cut and grown, and
+each field's bound one past refused (a CR8 bound taken out is caught); and
+a CPU's registers through `state.rs`'s `restore_common` and the backends'
+save into a fresh CPU and out again, the same (EFER left out of the restore
+once made a guest in long mode run on in legacy mode: now a field left out
+is a build that fails). `handover`: both sides of `migwire::handover` over
+a model of NBS's writer -- a compare and set by the generation expected,
+each take asked again by its token -- and of the way between, `Done`,
+`Running` and `Aborted` lost, late and twice, NBS's answers lost, either
+host dying at any step: never both run the VM, each only holding the
+volume, and once all is said exactly one does unless the new host died past
+its commit (an old host that resumes on its wait's end, and a new one that
+runs after a take refused, are each caught). `migwire`: the messages from
+hostile bytes and as made -- read or refused, never a panic, one reading of
+each; every message inside its bounds written, read back the same and no
+bigger than a mailbox's block; each bound one past refused by `encode`,
+which writes nothing `decode` would not read back (a page run's data left
+unchecked against its pages is caught at the 118th input). `dirtylog`:
+the real dirty log (`hypervisor/hv/src/dirty.rs`) over a nested table and
+the guest's CPUs' TLBs of the model's own -- a CPU writing through what its
+TLB holds, or walking the table and faulting on a page read-only, dropping
+its TLB as it takes the table's new identity -- the host's writes beside
+them, and the rounds' copies read a page at a time as the writes go on: once
+paused and the last round copied, the copy is the memory, page for page;
+the log over, no page read-only (a fault that does not mark, a round that
+does not protect again, a host's write unmarked: each caught within three
+inputs). And the network that goes with it (M3), in the network's targets:
+`tunnel` migrates ports between its three hosts' real tunnels -- the old
+host marking the port moved away before it gives it up, the new one marking
+where it came from, no host's table told -- and holds what then arrives to
+the rules: a packet another host sealed taken only for the port that came,
+from the host it came from, while its mark lasts (or, the wire having held
+it past that, as the table has its sender now), and a host sending a port's
+datagram as it takes one only while it carries one on (the false `narrow`
+it found -- a way said not to carry the MTU while a lost key's message kept
+every echo's answer out -- is fixed: the small echoes have to be answered
+now); `vnetswitch` moves ports away, its model carrying on what comes for
+them to the host marked and nothing once the address is claimed here again;
+`flowmove` makes a port's flows another switch's port's, as a VM's pause
+takes them, then judges every packet that comes by both: the new port
+refuses nothing the old one lets in (a flow's TCP state left behind is
+caught at the third input), and each flow reads back with no more time left
+than it had.
 
 ### `net-fuzz.py` -- everything the network hands the kernel, fuzzed
 
@@ -4245,6 +4294,48 @@ joins, drains -- and `--trace` every operation, request and answer, a copy's
 among them. `NBS_DEBUG_REPORT=<client>:<from>:<to>` prints a client's report
 and its view of the sets (`Session::view`) at each step of a span. `NBS_META_STATS=1` and
 `NBS_CS_STATS=1` print each run's answers and steps by kind.
+
+### `vm-migration-test.py` -- a VM moved between hosts, live
+
+Three x86-64 nos on `tests/hub.py`'s network, each with ipcnet, cluster,
+nbs-mds, nbs-cs, vnet and hv, a registry and an NBS cluster of the three with
+a partition each, as `hv-nbs-test.py` has them, and vnet of the three with a
+network `lan` its default firewall lets in, a probe of hv's on c at
+10.10.0.13. A guest made by `hv create` on a volume and on `vnet:lan` at
+10.10.0.50, started on a, reaching the probe and reached by it, counting in
+its memory (`/tmp/count`, written whole
+and renamed) and writing files of a MiB of random bytes with their sum after
+them, each made whole in tmpfs and renamed over one of four, from before its
+first move to its last -- its memory, the page cache, written all the time.
+
+- **The refusals**, each leaving the VM running where it was: `hv migrate`
+  of no VM; to the host it is on; of a VM whose disk is a file it writes;
+  to a host with a folder of its name (`b refused it: ... is here already`).
+- **Its network, each move**: the probe on c pings it every 0.3 s from just
+  before the move to three seconds after it -- the last three answered,
+  the count printed (what is lost is what came as it was paused); it
+  reaches the probe from its new host; the move carried its firewall's flows
+  (`N flows of its firewall`), each had there, and its port is there -- on
+  `hv list`, and no `without its network` in that host's log.
+- **a to b, live**: `hv migrate mig b` says it runs on b, in two rounds or
+  more (the first as it ran, the last paused); on b's `hv list` and not
+  a's, its folder on b and not on a; its count and uptime where they were
+  and going on; no `went backwards`, `unstable`, `stuck`, `lockup`, `BUG:` or
+  stall in its kernel's log; every file its writer made, read on b, whole
+  and its sum its own -- a page written after its copy and not sent again
+  would show here; the volume `attached on b`; what it wrote on a there, and
+  a write on b read back.
+- **b to a, cold** (`cold`: paused first, one round), the same checks, the
+  two writes read back on a.
+- **a to b again, live**, then stopped on b and started there cold from the
+  folder the move gave it: booted, both writes there.
+- Nothing panicked on any host.
+
+Manual, as `hv-nbs-test.py` is: a guest kernel and an initrd by hand
+([`hv-linux-test.py`](#hv-linux-testpy----a-real-linux-bzimage-for-a-while-and-for-good)
+has the recipe), `make nos-test.iso TEST_ISO_ARGS=udpshell=9100` first. On a
+Mac under TCG a run is a few minutes, each move a few seconds of pause for a
+guest of 256 MiB -- the hub's Python carries every page.
 
 ### `hv-linux-test.py` -- a real Linux bzImage, for a while and for good
 

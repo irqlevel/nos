@@ -57,4 +57,13 @@ impl PvPanic {
         }
         None
     }
+
+    /// For a VM's state (`vmstate`).
+    pub fn save(&self) -> vmstate::PvPanic {
+        vmstate::PvPanic { crash_loaded: self.crash_loaded }
+    }
+
+    pub fn restore(&mut self, s: &vmstate::PvPanic) {
+        self.crash_loaded = s.crash_loaded;
+    }
 }

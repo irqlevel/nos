@@ -19,3 +19,7 @@ bzimage = { path = "../../common/boot/bzimage" }
 # ChaCha20-Poly1305 in the kernel's SIMD sections: the avx built-in guest
 # has one run on its host CPU before every entry of its own.
 crypto = { path = "../../base/crypto" }
+# A VM's state as bytes: what each device, each CPU and the whole guest
+# are saved into and restored from (`hv save`, a migration) -- no kernel in
+# it, so tests/fuzz/hv holds its round trips.
+vmstate = { path = "../../common/vm/vmstate" }

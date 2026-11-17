@@ -77,6 +77,18 @@ pub trait Backend: Send {
     fn quiet_until(&mut self, _until_ns: u64) {}
 }
 
+/// A NIC's backend that stands in for its port, not had yet -- a
+/// migration's new host's, until the handover gives it the port
+/// (`Net::set_backend`): what is sent goes nowhere, and nothing comes.
+pub struct Standin;
+
+impl Backend for Standin {
+    fn send(&mut self, _frame: &[u8]) {}
+    fn recv(&mut self, _buf: &mut [u8]) -> Option<usize> {
+        None
+    }
+}
+
 /// Virtio's type for a network device.
 const VIRTIO_TYPE: u16 = 1;
 /// Network, Ethernet.
@@ -350,14 +362,100 @@ impl Net {
 
     /// The features offered, as the offloads and the MTU say.
     fn offer(&mut self) {
-        let mut f = BASE_FEATURES | multiqueue(self.pairs);
-        if self.offloads {
+        self.transport.set_device_features(Self::features(self.pairs, self.offloads, self.mtu));
+    }
+
+    /// What a NIC of `pairs` offers, with its offloads or not, and an MTU
+    /// told or not.
+    fn features(pairs: u16, offloads: bool, mtu: u16) -> u32 {
+        let mut f = BASE_FEATURES | multiqueue(pairs);
+        if offloads {
             f |= OFFLOADS;
         }
-        if self.mtu != 0 {
+        if mtu != 0 {
             f |= F_MTU;
         }
-        self.transport.set_device_features(f);
+        f
+    }
+
+    /// The ranges its queues' rings are in (`Transport::rings`).
+    pub fn rings(&self, out: &mut dyn FnMut(u64, u64)) {
+        self.transport.rings(out);
+    }
+
+    /// What the driver made of it, for a VM's state (`vmstate`). Not a
+    /// frame held for want of a buffer -- one lost, as on a wire -- nor the
+    /// interrupts owed, which a restore gives anyway.
+    pub fn save(&self) -> vmstate::Result<vmstate::Net> {
+        let transport = self.transport.save().ok_or(vmstate::Error("no memory for a NIC's state"))?;
+        Ok(vmstate::Net {
+            transport, mac: self.mac, pairs: self.pairs, active: self.active, offloads: self.offloads, mtu: self.mtu,
+            flows: self.flows, told: vmstate::Takes { partial: self.told.partial, whole: self.told.whole },
+            broken: self.broken.map(Broken::code),
+        })
+    }
+
+    /// Made what `s` says, on a NIC built with the same MAC and as many
+    /// pairs -- its offloads and MTU as `s` has them -- its rings set up
+    /// again in `mem` at `now`. Its first round sends what the driver had
+    /// queued and the device not taken, and raises a receive interrupt for
+    /// each pair it uses: one owed at the pause is not lost, and one more is
+    /// nothing a driver minds.
+    pub fn restore(&mut self, s: &vmstate::Net, mem: &GuestMemory, now: u64) -> vmstate::Result<()> {
+        if s.mac != self.mac || s.pairs != self.pairs {
+            return Err(vmstate::Error("a NIC of another MAC, or other queue pairs, than the one built here"));
+        }
+        if s.active == 0 || s.active > self.pairs || s.flows.iter().any(|&p| u16::from(p) > self.pairs) {
+            return Err(vmstate::Error("a NIC using, or steering to, pairs it has not"));
+        }
+        if s.transport.device_features != Self::features(self.pairs, s.offloads, s.mtu) {
+            return Err(vmstate::Error("a NIC offering other features than its offloads and MTU say"));
+        }
+        let broken = match s.broken {
+            None => None,
+            Some(c) => Some(Broken::from_code(c).ok_or(vmstate::Error("a ring broken in no way there is"))?),
+        };
+        self.offloads = s.offloads;
+        self.mtu = s.mtu;
+        self.offer();
+        self.transport.restore(&s.transport, mem, now)?;
+        self.active = s.active;
+        self.flows = s.flows;
+        self.broken = broken;
+        self.held = None;
+        let pairs = (1u32 << self.pairs) - 1;
+        self.tx_more = pairs;
+        self.rx_owed = (1u32 << self.active) - 1;
+        self.rx_quiet_until = 0;
+        self.told = Takes::default();
+        self.tell(Takes { partial: s.told.partial, whole: s.told.whole });
+        Ok(())
+    }
+
+    /// Its MAC, and the MTU it tells its driver.
+    pub fn shape(&self) -> ([u8; 6], u16) {
+        (self.mac, self.mtu)
+    }
+
+    /// Its held interrupts' time moved on by `delta` (`LinuxGuest::rebase`).
+    pub fn shift(&mut self, delta: u64) {
+        if self.rx_quiet_until != 0 {
+            self.rx_quiet_until = self.rx_quiet_until.saturating_add(delta);
+        }
+    }
+
+    /// `backend` in place of the one it was built over -- one that stood in
+    /// until the NIC's port could be had, a migration's handover -- told
+    /// what the guest takes, and how long its interrupts are held: the one
+    /// it replaces, given back.
+    pub fn set_backend(&mut self, backend: Box<dyn Backend>) -> Box<dyn Backend> {
+        let old = core::mem::replace(&mut self.backend, backend);
+        let told = core::mem::take(&mut self.told);
+        self.tell(told);
+        if self.rx_quiet_until != 0 {
+            self.backend.quiet_until(self.rx_quiet_until);
+        }
+        old
     }
 
     /// Receive interrupts no closer than `ns` apart -- 0, as each frame

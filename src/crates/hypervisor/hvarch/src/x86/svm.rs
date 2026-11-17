@@ -768,6 +768,17 @@ impl Guest {
         self.fp.loads()
     }
 
+    /// Its registers' area and PKRU, as its last exit saved them
+    /// (`GuestFp::area`).
+    pub fn fp_area(&self) -> (&[u8], u32) {
+        self.fp.area()
+    }
+
+    /// `GuestFp::import`: a restored guest's registers, checked.
+    pub fn import_fp(&mut self, area: &[u8], xcr0: u64, pkru: u32) -> bool {
+        self.fp.import(area, xcr0, pkru)
+    }
+
     /// The guest's MSRs the extension does not switch (`super::msrs`): its
     /// TSC_AUX and IA32_SPEC_CTRL, and the IBPBs it asked for.
     pub fn msrs(&self) -> &GuestMsrs {

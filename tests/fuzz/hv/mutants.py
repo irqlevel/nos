@@ -5,7 +5,8 @@ it, of the switch's cluster networks and its tunnel to the other hosts
 (src/crates/modules/hypervisor/hv/src/net.rs, plans/vnet.md), or of the
 tunnel's datagram (src/crates/common/net/vnetwire) taken out at a time, and
 the hv fuzzer's targets that hold it (`firewall`, `fwswitch`, `switch`,
-`guestnet`, `vnetswitch`, `vnetwire`) must find it -- a rule whose loss no
+`guestnet`, `vnetswitch`, `vnetwire`, `tunnel`, and for a migration's
+network `flowmove`) must find it -- a rule whose loss no
 target notices is one the gate does not hold the code to.
 
     python3 tests/fuzz/hv/mutants.py [name...]
@@ -539,6 +540,32 @@ MUTANTS = [
      '(Some((had, at, _)), Some(n)) => had.ip() == n.ip() && had.mac() == n.mac() && *at == port,',
      '(Some((had, _, _)), Some(n)) => had.ip() == n.ip() && had.mac() == n.mac(),',
      ['tunnel']),
+    # A VM's migration's network (plans/vm-migration.md, M3)
+    ('moved_unmarked', "a port's address claimed here again carried on no more",
+     NET,
+     '                unmark(&self.ports.moved, who.vni, who.ip);\n',
+     '',
+     ['vnetswitch', 'tunnel']),
+    ('came_from_its_host', "what a port's old host carries on taken from that host alone",
+     TUN,
+     '|| (from.is_some() && self.switch.came_from(vni, ip::dst(packet)) == Some(node));',
+     '|| (from.is_some() && self.switch.came_from(vni, ip::dst(packet)).is_some());',
+     ['tunnel']),
+    ('narrow_while_answered', "a way said narrow only while its small echoes are answered now",
+     TUN,
+     '                    && now.saturating_sub(p.heard_at) <= 2 * ECHO_S * NS_PER_SEC && narrow.len() < narrow.capacity()',
+     '                    && narrow.len() < narrow.capacity()',
+     ['tunnel']),
+    ('flow_state_carried', "a carried flow's TCP state made the new port's",
+     NET,
+     '            table.add(c.key, dir, c.seen, now.saturating_add(c.left_ns), now);',
+     '            table.add(c.key, dir, 0, now.saturating_add(c.left_ns), now);',
+     ['flowmove']),
+    ('flow_time_carried', "a carried flow runs out as long after as it had left",
+     NET,
+     '            table.add(c.key, dir, c.seen, now.saturating_add(c.left_ns), now);',
+     '            table.add(c.key, dir, c.seen, now.saturating_add(c.left_ns / 1000), now);',
+     ['flowmove']),
 ]
 
 

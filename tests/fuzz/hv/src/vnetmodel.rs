@@ -67,15 +67,17 @@ enum Seen {
     HostPortFrame,
     Carried,
     FromTunnel,
+    CarriedOn,
 }
 
-const SEEN: [&str; 24] = ["claims", "claims refused", "frames delivered", "with a checksum left to finish",
+const SEEN: [&str; 25] = ["claims", "claims refused", "frames delivered", "with a checksum left to finish",
                           "sends whole", "ARP answered", "hv0's ARP answered", "echoes", "to hv0", "too big, told",
                           "too big", "isolated", "misdirected", "spoofed", "foreign", "DHCP answered",
                           "denied in", "denied out", "told of a denial", "an inbox full", "past a share",
-                          "to a host network's port", "carried to another host", "out of the tunnel"];
+                          "to a host network's port", "carried to another host", "out of the tunnel",
+                          "carried on for a port moved away"];
 
-static COUNTS: [std::sync::atomic::AtomicU64; 24] = [const { std::sync::atomic::AtomicU64::new(0) }; 24];
+static COUNTS: [std::sync::atomic::AtomicU64; 25] = [const { std::sync::atomic::AtomicU64::new(0) }; 25];
 
 fn seen(what: Seen) {
     COUNTS[what as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -125,6 +127,9 @@ const REMOTE: [(u32, u32); 4] = [(1, 0x0A0A_0064), (1, 0x0A0A_0065), (3, 0xC0A8_
 /// hosts, and what it was handed to carry.
 struct Tunnel {
     carried: std::sync::Mutex<Vec<(u32, u32, Vec<u8>)>>,
+    /// What it was handed for a port moved away: the host, the network, the
+    /// packet.
+    carried_on: std::sync::Mutex<Vec<(u64, u32, Vec<u8>)>>,
 }
 
 impl switch::Carrier for Tunnel {
@@ -145,6 +150,11 @@ impl switch::Carrier for Tunnel {
 
     fn carry_in(&self, _node: u64, _vni: u32, _packet: &[u8]) -> bool {
         panic!("invariant: a packet carried in for a public address, with none served");
+    }
+
+    fn carry_to(&self, node: u64, vni: u32, packet: &[u8]) -> bool {
+        self.carried_on.lock().unwrap_or_else(|e| e.into_inner()).push((node, vni, packet.to_vec()));
+        true
     }
 }
 
@@ -316,7 +326,15 @@ struct Model {
     /// switch has one (`carrying`).
     carried: Vec<(u32, u32, Vec<u8>)>,
     carrying: bool,
+    /// The ports moved away -- network, address, the host they went to --
+    /// the oldest first, at most `MOVED_MAX`; and what was carried on to
+    /// them, as `carried`.
+    moved: Vec<(u32, u32, u64)>,
+    carried_on: Vec<(u64, u32, Vec<u8>)>,
 }
+
+/// The switch's marks of ports moved away (`net::MOVED_MAX`).
+const MOVED_MAX: usize = 8;
 
 impl Model {
     fn new() -> Model {
@@ -327,7 +345,23 @@ impl Model {
         }).collect();
         Model { ports, hv0_in: Vec::new(), ring: VecDeque::new(), to_host: 0, refused: 0, dhcp: 0, foreign: 0,
                 arps: 0, echoes: 0, here: Vec::new(), table: Vec::new(), carried: Vec::new(),
-                carrying: false }
+                carrying: false, moved: Vec::new(), carried_on: Vec::new() }
+    }
+
+    /// The host port `addr` of network `vni` moved to, while marked.
+    fn moved_to(&self, vni: u32, addr: u32) -> Option<u64> {
+        self.moved.iter().find(|m| m.0 == vni && m.1 == addr).map(|m| m.2)
+    }
+
+    /// Port `addr` of network `vni` moved to host `node`: its mark anew, the
+    /// oldest let go past the switch's room for them. No mark runs out in
+    /// an input: ten seconds of the clock are more reads than one makes.
+    fn mark(&mut self, vni: u32, addr: u32, node: u64) {
+        self.moved.retain(|m| !(m.0 == vni && m.1 == addr));
+        self.moved.push((vni, addr, node));
+        if self.moved.len() > MOVED_MAX {
+            self.moved.remove(0);
+        }
     }
 
     fn in_use(&self) -> usize {
@@ -625,6 +659,18 @@ impl Model {
             }
             return;
         }
+        /* A port moved away, at its MAC: carried on to its host, judged
+         * going out -- with no tunnel, dropped */
+        if frame[0] == 0x02 && frame[1] == 0x00 && be32(frame, 2) == to {
+            if let Some(node) = self.moved_to(i.vni, to) {
+                if self.carrying && self.judged(p, true, frame) {
+                    let end = (ETH + total).min(frame.len());
+                    self.carried_on.push((node, i.vni, frame[ETH..end].to_vec()));
+                    seen(Seen::CarriedOn);
+                }
+                return;
+            }
+        }
         let q = if frame[0] == 0x02 && frame[1] == 0x00 { self.port_at(be32(frame, 2)) } else { None };
         let Some(q) = q else {
             /* A port of its network on another host, at its MAC: carried,
@@ -818,6 +864,10 @@ fn frame(r: &mut Input, m: &Model, p: usize) -> Vec<u8> {
                 6 => r.pick(&[0x0A00_6407, 0xAC10_0304, 0xE000_00FB, u32::MAX]),
                 7 => i.net + 3 + r.below(8) as u32,
                 8 => i.ip,
+                9 if r.bool() => match m.moved.iter().filter(|x| x.0 == i.vni).map(|x| x.1).collect::<Vec<_>>() {
+                    away if !away.is_empty() => r.pick(&away),
+                    _ => other,
+                },
                 _ => match REMOTE.iter().filter(|(v, _)| *v == i.vni).map(|(_, a)| *a).collect::<Vec<_>>() {
                     mine if !mine.is_empty() && r.bool() => r.pick(&mine),
                     _ => r.pick(&[0x0A0A_0005, 0x0A14_0006, 0xC0A8_0507, REMOTE[0].1, REMOTE[2].1, REMOTE[3].1]),
@@ -923,15 +973,17 @@ pub fn vnetswitch_target(r: &mut Input) {
     let mut m = Model::new();
     let mut vms: Vec<Option<Arc<Shared>>> = vec![None; MAX_PORTS];
     let mut backends: Vec<Option<switch::PortBackend>> = (0..MAX_PORTS).map(|_| None).collect();
-    let tunnel = Arc::new(Tunnel { carried: std::sync::Mutex::new(Vec::new()) });
+    let tunnel = Arc::new(Tunnel { carried: std::sync::Mutex::new(Vec::new()),
+                                   carried_on: std::sync::Mutex::new(Vec::new()) });
     let carrier: Arc<dyn switch::Carrier> = tunnel.clone();
     let carrying = r.u8() < 200;
     if carrying {
         invariant!(sw.carrier(Some(carrier)).is_none(), "a carrier there already");
     }
     m.carrying = carrying;
+    let mut relayed = 0u64;
 
-    while let Some(op) = r.op(14) {
+    while let Some(op) = r.op(15) {
         if !carrying && op == 13 {
             continue;
         }
@@ -945,6 +997,10 @@ pub fn vnetswitch_target(r: &mut Input) {
                 let vm = Arc::new(Shared::default());
                 let got = sw.claim_vnet(&vm, &who, place).ok();
                 let want = m.claim_vnet(&who, place);
+                if want.is_some() {
+                    /* Its address here again: carried on no more */
+                    m.moved.retain(|x| !(x.0 == who.vni && x.1 == who.ip));
+                }
                 seen(if want.is_some() { Seen::Claimed } else { Seen::Refused });
                 invariant!(got == want, "a claim as {:?} came to port {:?}, the model's {:?}", who, got, want);
                 if let Some(p) = got {
@@ -1049,20 +1105,50 @@ pub fn vnetswitch_target(r: &mut Input) {
                 let i = m.vnet(q).expect("a port");
                 let (vni, from) = *REMOTE.iter().find(|(v, _)| *v == i.vni).unwrap_or(&REMOTE[0]);
                 let vni = if r.u8() < 32 { r.pick(&[1u32, 2, 3, 9]) } else { vni };
-                let to = if r.u8() < 32 { r.pick(&[0x0A0A_00EE, i.ip ^ 1]) } else { i.ip };
+                let away: Vec<u32> = m.moved.iter().filter(|x| x.0 == vni).map(|x| x.1).collect();
+                let to = if !away.is_empty() && r.u8() < 64 {
+                    r.pick(&away)
+                } else if r.u8() < 32 {
+                    r.pick(&[0x0A0A_00EE, i.ip ^ 1])
+                } else {
+                    i.ip
+                };
                 let data: Vec<u8> = (0..r.below(80)).map(|k| k as u8).collect();
                 let packet = ipv4(from, to, 17, r.u16(), 0, &udp(5000, 7, &data));
+                /* A port moved away first -- carried on to its host -- then
+                 * one here */
+                let moved = m.moved_to(vni, to);
                 let here = m.port_at(to).filter(|&k| m.vnet(k).is_some_and(|o| o.vni == vni));
                 let got = sw.from_tunnel(vni, &packet);
-                invariant!(got == here.is_some(), "a packet out of the tunnel for {:#x} of network {} taken {}, the \
-                           model's {:?}", to, vni, got, here);
-                if let Some(k) = here {
+                invariant!(got == (moved.is_some() || here.is_some()), "a packet out of the tunnel for {:#x} of \
+                           network {} taken {}, the model's {:?} here, {:?} moved", to, vni, got, here, moved);
+                if let Some(node) = moved {
+                    m.carried_on.push((node, vni, packet.clone()));
+                    seen(Seen::CarriedOn);
+                } else if let Some(k) = here {
                     let frame = eth(mac_for(to), mac_for(from), 0x0800, &packet);
                     if m.judged(k, false, &frame) {
                         seen(Seen::FromTunnel);
                         m.deliver(k, frame, Kind::Done);
                     }
                 }
+            }
+            14 => {
+                /* A cluster port's VM moved to another host: its port given
+                 * back here, and what comes for its address carried on to
+                 * that host a while (`moved_away`) */
+                let p = r.below(MAX_PORTS as u64) as usize;
+                let Some(i) = m.vnet(p) else { continue };
+                sw.release(p);
+                backends[p] = None;
+                let woken = m.release(p);
+                if let Some(vm) = vms[p].take() {
+                    invariant!(vm.woken.load(Relaxed) == woken, "port {}'s VM woken {} times, the model {}", p,
+                               vm.woken.load(Relaxed), woken);
+                }
+                let node = r.pick(&[7u64, 8, 9]);
+                sw.moved_away(i.vni, i.ip, node);
+                m.mark(i.vni, i.ip, node);
             }
             12 => {
                 /* A port hv shuts: its cluster network's port revoked */
@@ -1141,6 +1227,13 @@ pub fn vnetswitch_target(r: &mut Input) {
                    carried.iter().map(|(v, t, p)| (v, t, p.len())).collect::<Vec<_>>(),
                    m.carried.iter().map(|(v, t, p)| (v, t, p.len())).collect::<Vec<_>>());
         m.carried.clear();
+        let on = std::mem::take(&mut *tunnel.carried_on.lock().unwrap_or_else(|e| e.into_inner()));
+        invariant!(on == m.carried_on, "carried on {:?}, the model {:?}",
+                   on.iter().map(|(n, v, p)| (n, v, p.len())).collect::<Vec<_>>(),
+                   m.carried_on.iter().map(|(n, v, p)| (n, v, p.len())).collect::<Vec<_>>());
+        relayed += on.len() as u64;
+        invariant!(sw.relayed() == relayed, "{} carried on, the switch says {}", relayed, sw.relayed());
+        m.carried_on.clear();
         let (arps, echoes) = sw.vnet_counts();
         invariant!((arps, echoes) == (m.arps, m.echoes), "ARPs {} and echoes {} answered, the model {} and {}", arps,
                    echoes, m.arps, m.echoes);
@@ -1217,3 +1310,150 @@ fn send_offloaded(r: &mut Input, m: &mut Model, backends: &mut [Option<switch::P
         b.send_tcp4(&f, layout);
     }
 }
+
+/// A TCP segment with no options: ports, flags, and a few bytes.
+fn tcp(sport: u16, dport: u16, flags: u8, data: &[u8]) -> Vec<u8> {
+    let mut t = vec![0u8; 20];
+    t[0..2].copy_from_slice(&sport.to_be_bytes());
+    t[2..4].copy_from_slice(&dport.to_be_bytes());
+    t[4..8].copy_from_slice(&1000u32.to_be_bytes());
+    t[8..12].copy_from_slice(&2000u32.to_be_bytes());
+    t[12] = 5 << 4;
+    t[13] = flags;
+    t[14..16].copy_from_slice(&8192u16.to_be_bytes());
+    t.extend_from_slice(data);
+    t
+}
+
+/// The flows a migration carries (plans/vm-migration.md, M3): a port's
+/// stateful firewall's flows taken as its VM pauses (`flows_of`), made the
+/// flows of its port on another host's switch (`adopt_flows`). From then on
+/// the guest's packets go to both -- the old port the oracle -- and every
+/// packet that comes is judged by both: the new port refuses nothing the
+/// old one lets in. Its flows run out no sooner than they did there.
+pub fn flowmove_target(r: &mut Input) {
+    use std::sync::atomic::Ordering::Relaxed;
+    network::reset();
+    let old = Arc::new(Switch::new().expect("a switch"));
+    /* One `hv0` stands for both hosts' and takes one sink: the old host's
+     * let go of before the new host's switch is made */
+    vnic::reset();
+    let new = Arc::new(Switch::new().expect("a switch"));
+    vnic::reset();
+    /* What comes in denied but for flows -- or, now and then, let in from
+     * the network too, so that flows begun coming in are carried as well */
+    let mut rules = firewall::Rules::DEFAULT;
+    if r.u8() < 64 {
+        let rule = firewall::Rule::parse(r.pick(&["allow in udp from net", "allow in tcp 22 from net",
+                                                   "allow in icmp from net"])).expect("a rule");
+        rules.insert(None, rule).expect("room for a rule");
+    }
+    for sw in [&old, &new] {
+        sw.install(ALLOW_ALL, &rules).expect("a place");
+        let tunnel = Arc::new(Tunnel { carried: std::sync::Mutex::new(Vec::new()),
+                                       carried_on: std::sync::Mutex::new(Vec::new()) });
+        let carrier: Arc<dyn switch::Carrier> = tunnel;
+        invariant!(sw.carrier(Some(carrier)).is_none(), "a carrier there already");
+    }
+    let who = Identity { ip: 0x0A0A_0005, vni: 1, net: 0x0A0A_0000, prefix: 24, mtu: 1400, out: true };
+    let me = mac_for(who.ip);
+    let vm = Arc::new(Shared::default());
+    let p = old.claim_vnet(&vm, &who, ALLOW_ALL).expect("a port");
+    let mut on_old = old.backend(p);
+    let mut moved: Option<(usize, switch::PortBackend, Arc<Shared>)> = None;
+    /* The other ends: ports elsewhere of its network, a few ports each --
+     * few enough that no table is ever full, and its least used let go */
+    let peers: Vec<u32> = REMOTE.iter().filter(|(v, _)| *v == who.vni).map(|(_, a)| *a).collect();
+    const LOCAL: [u16; 4] = [22, 4000, 4001, 50000];
+    const REMOTE_PORTS: [u16; 4] = [22, 53, 443, 6000];
+    let mut carried = 0;
+    while let Some(op) = r.op(5) {
+        match op {
+            0 | 1 => {
+                /* The guest sends to a port elsewhere: a segment, a datagram
+                 * or an echo -- to both once it has moved */
+                let peer = r.pick(&peers);
+                let (lp, pp) = (r.pick(&LOCAL), r.pick(&REMOTE_PORTS));
+                let (proto, l4) = match r.u8() % 3 {
+                    0 => (6, tcp(lp, pp, r.pick(&[0x02u8, 0x10, 0x18, 0x11, 0x04, 0x12]), &[])),
+                    1 => (17, udp(lp, pp, &[1, 2, 3])),
+                    _ => (1, icmp(8, 0, [(lp >> 8) as u8, lp as u8, 0, 1], &[0; 8])),
+                };
+                let f = eth(mac_for(peer), me, 0x0800, &ipv4(who.ip, peer, proto, r.u16(), 0, &l4));
+                on_old.send(&f);
+                if let Some((_, b, _)) = moved.as_mut() {
+                    b.send(&f);
+                }
+            }
+            2 => {
+                /* What comes for it out of the tunnel: answers to its
+                 * flows, mostly, and what begins one */
+                let peer = r.pick(&peers);
+                let (lp, pp) = (r.pick(&LOCAL), r.pick(&REMOTE_PORTS));
+                let (proto, l4) = match r.u8() % 3 {
+                    0 => (6, tcp(pp, lp, r.pick(&[0x12u8, 0x10, 0x18, 0x11, 0x04, 0x02]), &[])),
+                    1 => (17, udp(pp, lp, &[4, 5, 6])),
+                    _ => (1, icmp(r.pick(&[0u8, 8]), 0, [(lp >> 8) as u8, lp as u8, 0, 1], &[0; 8])),
+                };
+                let packet = ipv4(peer, who.ip, proto, r.u16(), 0, &l4);
+                let before = old.counts(p).denied_in;
+                invariant!(old.from_tunnel(who.vni, &packet), "a packet for its port not taken by the old host");
+                let refused_old = old.counts(p).denied_in > before;
+                if let Some((q, _, _)) = moved.as_ref() {
+                    let before = new.counts(*q).denied_in;
+                    invariant!(new.from_tunnel(who.vni, &packet), "a packet for its port not taken by the new host");
+                    let refused_new = new.counts(*q).denied_in > before;
+                    invariant!(!refused_new || refused_old, "the new host refused what the old one let in -- a \
+                               flow not carried: {:02x?}", &packet[..packet.len().min(48)]);
+                }
+            }
+            3 => {
+                /* The VM paused and moved: its flows taken and made the new
+                 * port's, as migrate.rs does -- once */
+                if moved.is_some() {
+                    continue;
+                }
+                let mut flows = Vec::with_capacity(switch::FLOWS);
+                old.flows_of(p, &mut flows);
+                let live = old.counts(p).flows;
+                invariant!(flows.len() <= live && flows.iter().all(|c| c.left_ns > 0),
+                           "{} flows taken of {} live, some with none left: {:?}", flows.len(), live, flows);
+                flows.sort_unstable_by_key(|c| c.left_ns);
+                let vm2 = Arc::new(Shared::default());
+                let q = new.claim_vnet(&vm2, &who, ALLOW_ALL).expect("its port on the new host");
+                let n = new.adopt_flows(q, &flows);
+                invariant!(n == flows.len() && new.counts(q).flows == n, "{} of {} flows had, the port says {}", n,
+                           flows.len(), new.counts(q).flows);
+                /* Taken again, each has no more left than it had -- and no
+                 * less than it had less the time between */
+                let mut again = Vec::with_capacity(switch::FLOWS);
+                new.flows_of(q, &mut again);
+                invariant!(again.len() == flows.len(), "{} flows read back of {}", again.len(), flows.len());
+                for c in &again {
+                    let had = flows.iter().find(|f| f.key == c.key).expect("a flow it had");
+                    invariant!(c.inbound == had.inbound && c.seen == had.seen && c.left_ns <= had.left_ns,
+                               "flow {:?} read back as {:?}", had, c);
+                }
+                carried += n;
+                let b = new.backend(q);
+                moved = Some((q, b, vm2));
+            }
+            _ => {
+                /* Time: a flow's life, or less */
+                crate::time::advance(r.pick(&[1u64, 100, 1_000, 30_000, 120_000, 600_000]) * 1_000_000);
+                crate::time::progressed();
+            }
+        }
+        /* What the inboxes hold, taken */
+        let mut buf = vec![0u8; SEND_MAX];
+        while on_old.recv_with(&mut buf).is_some() {}
+        if let Some((_, b, _)) = moved.as_mut() {
+            while b.recv_with(&mut buf).is_some() {}
+        }
+    }
+    FLOWS_CARRIED.fetch_add(carried as u64, Relaxed);
+    drop(vm);
+}
+
+/// The flows the `flowmove` target carried, for `HV_FUZZ_STATS`.
+pub static FLOWS_CARRIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

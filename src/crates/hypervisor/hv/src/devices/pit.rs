@@ -454,6 +454,51 @@ impl Pit {
         }
     }
 
+    /// What the guest has made of it, for a VM's state at `now`: each
+    /// count's start as how long before it (`vmstate`).
+    pub fn save(&self, now: u64) -> vmstate::Pit {
+        let mut ch = [vmstate::PitChannel::default(); 3];
+        for (out, c) in ch.iter_mut().zip(&self.ch) {
+            *out = vmstate::PitChannel {
+                reload: c.reload, access: c.access, mode: c.mode, write_high: c.write_half == Half::Hi,
+                read_high: c.read_half == Half::Hi, low: c.low, latched: c.latched, loaded: c.loaded,
+                counted: c.counted, counting_for_ns: c.since_ns.map(|since| now.saturating_sub(since)),
+            };
+        }
+        vmstate::Pit { ch, port61: self.port61, ch0_edges_given: self.ch0_edges_given, ch0_armed: self.ch0_armed }
+    }
+
+    /// Its counts' starts moved on by `delta`: time that passed for the host
+    /// and is not to have for the guest (`LinuxGuest::rebase`).
+    pub fn shift(&mut self, delta: u64) {
+        for c in &mut self.ch {
+            c.since_ns = c.since_ns.map(|since| since.saturating_add(delta));
+        }
+    }
+
+    /// Made what `s` says, its counts going on from `now` as they stood at
+    /// the pause.
+    pub fn restore(&mut self, s: &vmstate::Pit, now: u64) -> vmstate::Result<()> {
+        if s.port61 & !(P61_CH2_GATE | P61_SPEAKER) != 0 {
+            return Err(vmstate::Error("port 0x61 with a bit no write leaves"));
+        }
+        let half = |high: bool| if high { Half::Hi } else { Half::Lo };
+        for (c, from) in self.ch.iter_mut().zip(&s.ch) {
+            if !(ACCESS_LO..=ACCESS_LOHI).contains(&from.access) || from.mode > 7 {
+                return Err(vmstate::Error("a PIT channel in an access or mode the 8254 has not"));
+            }
+            *c = Channel {
+                reload: from.reload, access: from.access, mode: from.mode, write_half: half(from.write_high),
+                read_half: half(from.read_high), low: from.low, latched: from.latched, loaded: from.loaded,
+                counted: from.counted, since_ns: from.counting_for_ns.map(|ago| now.saturating_sub(ago)),
+            };
+        }
+        self.port61 = s.port61;
+        self.ch0_edges_given = s.ch0_edges_given;
+        self.ch0_armed = s.ch0_armed;
+        Ok(())
+    }
+
     /// A byte of a count: true once a whole count has been loaded.
     fn write_counter(&mut self, index: usize, value: u8) -> bool {
         let ch = &mut self.ch[index];

@@ -948,6 +948,15 @@ pub struct Guest {
     /// VPID: its CR0 was written by the policy, not by an instruction the
     /// CPU ran -- which would have flushed as it went -- or it was reset.
     flush_vpid: bool,
+    /// What the guest's TSC is ahead of the host's, as the VMCS's TSC offset
+    /// has it -- 0 but for a guest restored from a state, whose TSC goes on
+    /// from the one it had -- and whether the next entry is to write it.
+    tsc_offset: u64,
+    tsc_offset_dirty: bool,
+    /// Its debug exceptions pending, as `read_for_save` read them or a
+    /// restore set them: written whole at the next full sync, over the BS
+    /// alone the policy may owe (`set_pending_single_step`).
+    pending_dbg: u64,
 
     /// The CPU this guest's VMCS was last made current on with `vmptrld`, or
     /// -1. It is left current there after an exit -- no per-exit `vmclear` --
@@ -986,6 +995,11 @@ pub struct Guest {
     /// The CPU whose host state is in the VMCS, or -1: rewritten when the
     /// guest's task has moved.
     host_cpu: i32,
+    /// The identity of the nested table this CPU last dropped what it
+    /// cached through (INVEPT): a table narrowed since -- a migration's
+    /// dirty log, which gives it a new one -- is flushed again before the
+    /// next entry, as a first entry on a CPU is.
+    ept_table: u64,
     /// An event to inject on the next entry, in VMENTRY_INTR_INFO's format,
     /// with its error code; consumed by the entry.
     inject: u64,
@@ -1105,6 +1119,9 @@ impl Guest {
             dr7_dirty: false,
             pending_bs: false,
             flush_vpid: false,
+            tsc_offset: 0,
+            tsc_offset_dirty: false,
+            pending_dbg: 0,
             loaded_cpu: AtomicI32::new(-1),
             launched: AtomicBool::new(false),
             answered: 0,
@@ -1114,6 +1131,7 @@ impl Guest {
             rsp_dirty: false,
             configured: false,
             host_cpu: -1,
+            ept_table: 0,
             inject: 0,
             inject_errcode: 0,
             irq_window: false,
@@ -1408,6 +1426,51 @@ impl Guest {
     pub fn inject_valid(&self) -> bool {
         self.inject as u32 & vmcs::intr::VALID != 0
     }
+    /// The event queued for the next entry, in VMENTRY_INTR_INFO's format,
+    /// and its error code.
+    pub fn injection(&self) -> (u32, u32) {
+        (self.inject as u32, self.inject_errcode)
+    }
+
+    /// Its debug exceptions pending, as [`read_for_save`] read them.
+    ///
+    /// [`read_for_save`]: Guest::read_for_save
+    pub fn pending_debug(&self) -> u64 {
+        self.pending_dbg
+    }
+
+    /// Have the guest's next full sync make `bits` its pending debug
+    /// exceptions: a restored guest's -- B0-B3, BS, enabled breakpoint, RTM,
+    /// as GUEST_PENDING_DBG takes them, and no others.
+    pub fn set_pending_debug(&mut self, bits: u64) -> bool {
+        const PENDING_BITS: u64 = 0xF | (1 << 12) | (1 << 14) | (1 << 16);
+        if bits & !PENDING_BITS != 0 {
+            return false;
+        }
+        self.pending_dbg = bits;
+        true
+    }
+
+    /// The guest's TSC from its next entry on the host's plus `offset`.
+    pub fn set_tsc_offset(&mut self, offset: u64) {
+        self.tsc_offset = offset;
+        self.tsc_offset_dirty = true;
+    }
+
+    pub fn tsc_offset(&self) -> u64 {
+        self.tsc_offset
+    }
+
+    /// Its registers' area and PKRU, as its last exit saved them
+    /// (`GuestFp::area`).
+    pub fn fp_area(&self) -> (&[u8], u32) {
+        self.fp.area()
+    }
+
+    /// `GuestFp::import`: a restored guest's registers, checked.
+    pub fn import_fp(&mut self, area: &[u8], xcr0: u64, pkru: u32) -> bool {
+        self.fp.import(area, xcr0, pkru)
+    }
     pub fn set_interruptibility(&mut self, bits: u32) {
         self.interruptibility = bits;
     }
@@ -1595,7 +1658,8 @@ impl Guest {
         self.proc1 = adjust(
             PROC_HLT_EXITING | PROC_UNCOND_IO_EXITING | cr8
                 | PROC_MWAIT_EXITING | PROC_MONITOR_EXITING | PROC_RDPMC_EXITING | PROC_MOV_DR_EXITING
-                | PROC_USE_MSR_BITMAPS | if ple { 0 } else { PROC_PAUSE_EXITING } | PROC_SECONDARY_CTLS,
+                | PROC_USE_MSR_BITMAPS | if ple { 0 } else { PROC_PAUSE_EXITING } | PROC_SECONDARY_CTLS
+                | PROC_USE_TSC_OFFSETTING,
             ctls_msr(basic, MSR_VMX_PROCBASED_CTLS, MSR_VMX_TRUE_PROCBASED_CTLS),
         );
         /* Without the bitmap control every MSR exits, which is the safe way
@@ -1665,8 +1729,13 @@ impl Guest {
         } else {
             (0, 0, 0)
         };
-        let checks: [(&'static str, u32, u32); 9] = [
+        /* A guest whose TSC is not the host's -- one restored from a state --
+         * runs only where the offset is applied: without it its clock would
+         * jump to the host's uptime. */
+        let tsc_needed = if self.tsc_offset != 0 { PROC_USE_TSC_OFFSETTING } else { 0 };
+        let checks: [(&'static str, u32, u32); 10] = [
             ("pin-based", self.pin, PIN_REQUIRED),
+            ("processor-based (TSC offsetting)", self.proc1, tsc_needed),
             ("pin-based (posted interrupts)", posted_got, posted_needed),
             ("VM-exit (posted interrupts)", self.exit_ctls, ack_needed),
             ("processor-based", self.proc1, PROC_REQUIRED),
@@ -1731,7 +1800,7 @@ impl Guest {
             vmwrite(VMEXIT_MSR_LOAD_COUNT, SWAP_MSRS.len() as u64);
             vmwrite(VMEXIT_MSR_STORE_ADDR, msr_phys + MSR_KERNEL_GS_BASE_ENTRY as u64);
             vmwrite(VMEXIT_MSR_STORE_COUNT, 1);
-            vmwrite(TSC_OFFSET, 0);
+            vmwrite(TSC_OFFSET, self.tsc_offset);
             /* The guest owns CR0 but for the bits of `cr0_mask`, and CR4
              * but for those of `cr4_mask` -- MCE, kept set in the register,
              * and VMXE, forced set in hardware and read as 0 by a guest told
@@ -1764,6 +1833,7 @@ impl Guest {
         self.synced.proc2 = self.proc2;
         self.synced.eoi_exit = self.eoi_exit;
         self.configured = true;
+        self.tsc_offset_dirty = false;
         Ok(())
     }
 
@@ -1822,9 +1892,10 @@ impl Guest {
                 vmwrite(GUEST_RFLAGS, s.rflags);
                 vmwrite(GUEST_DR7, s.dr7);
                 vmwrite(GUEST_ACTIVITY_STATE, 0);
-                /* A single step owed past what the policy stepped over
-                 * (`set_pending_single_step`), or nothing pending */
-                vmwrite(vmcs::GUEST_PENDING_DBG, if self.pending_bs { debug::BS } else { 0 });
+                /* What a restore said was pending, and a single step owed
+                 * past what the policy stepped over
+                 * (`set_pending_single_step`) -- or nothing pending */
+                vmwrite(vmcs::GUEST_PENDING_DBG, self.pending_dbg | if self.pending_bs { debug::BS } else { 0 });
             }
             unsafe {
                 vmwrite(GUEST_RIP, s.rip);
@@ -1861,7 +1932,16 @@ impl Guest {
             self.cr4_dirty = false;
             self.dr7_dirty = false;
             self.pending_bs = false;
+            self.pending_dbg = 0;
+            if self.tsc_offset_dirty {
+                unsafe { vmwrite(TSC_OFFSET, self.tsc_offset) };
+                self.tsc_offset_dirty = false;
+            }
             return;
+        }
+        if self.tsc_offset_dirty {
+            unsafe { vmwrite(TSC_OFFSET, self.tsc_offset) };
+            self.tsc_offset_dirty = false;
         }
         if self.cr0_dirty {
             let guest_cr0 = self.hw_cr0(s.cr0);
@@ -2127,6 +2207,32 @@ impl Guest {
             && CURRENT_VMCS.get(cpu).is_some_and(|c| c.load(Ordering::Acquire) == phys);
         if current {
             unsafe { self.read_guest_heavy() };
+        }
+        unsafe { kcore::cpu::irq_restore(flags) };
+        current
+    }
+
+    /// The whole of the guest's state into the shadow, for a VM's state: what
+    /// [`read_whole_state`] reads, and what no exit does -- its debug
+    /// exceptions pending, DR7 as the exit saved it, the KERNEL_GS_BASE the
+    /// exit stored -- if its VMCS is still current on this CPU, which it is
+    /// for a CPU parked on the host CPU it ran on. False, and nothing read,
+    /// where it is not.
+    pub fn read_for_save(&mut self) -> bool {
+        let flags = kcore::cpu::irq_save();
+        let cpu = kcore::cpu::id() as usize;
+        let phys = self.vmcs.phys();
+        let current = enabled()
+            && CURRENT_VMCS.get(cpu).is_some_and(|c| c.load(Ordering::Acquire) == phys);
+        if current {
+            if !self.whole_state {
+                unsafe { self.read_guest_heavy() };
+            }
+            unsafe {
+                self.pending_dbg = vmcs::vmread(vmcs::GUEST_PENDING_DBG);
+                self.save.dr7 = vmcs::vmread(vmcs::GUEST_DR7);
+            }
+            self.read_stored_kernel_gs_base();
         }
         unsafe { kcore::cpu::irq_restore(flags) };
         current
@@ -2461,6 +2567,22 @@ impl Guest {
                 }
             }
             self.host_cpu = cpu as i32;
+            self.ept_table = nested.id;
+        }
+        /* The table narrowed since this CPU last flushed it -- a page made
+         * read-only, a 2 MiB leaf split -- and its translations here may be
+         * wider than it is now: dropped before the guest enters again. */
+        if self.ept_table != nested.id {
+            let (kind, eptp) = if self.invept_single {
+                (vmcs::INVEPT_SINGLE_CONTEXT, nested.root)
+            } else {
+                (vmcs::INVEPT_ALL_CONTEXT, 0)
+            };
+            if !unsafe { vmcs::invept(kind, eptp) } {
+                if let Some(k) = kick { k.left(); }
+                return Err(NotRun::Flush { cpu });
+            }
+            self.ept_table = nested.id;
         }
         /* The policy wrote CR0, or reset the guest: what the CPU cached
          * under its VPID goes, as a `mov` to CR0 or an INIT would have

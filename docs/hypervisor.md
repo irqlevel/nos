@@ -3063,10 +3063,23 @@ where the cursor is after it prints its prompt, and takes the column it is
 told as the prompt's end. It was once told column 80 whatever the prompt, and
 wrapped what was typed at the edge it thought it had reached -- `id` came back
 as `i`, a newline, `d`. The UART now follows the guest's output as a terminal
-would -- the column each byte leaves the cursor at, escape sequences moving
-it nowhere -- and answers with that, from a buffer of its own: a guest that
-asks and never reads the answer costs the host no more than one that asks
-once, where the answer used to be appended to a queue without bound.
+would -- the column each byte leaves the cursor at -- and answers with that,
+from a buffer of its own: a guest that asks and never reads the answer costs
+the host no more than one that asks once, where the answer used to be
+appended to a queue without bound.
+
+**And a move of the cursor is followed too.** systemd 257 sizes a serial
+console as a getty starts by moving the cursor to a far corner (`ESC 7`,
+`ESC [ 32766 ; 32766 H`), asking where it went and putting it back
+(`ESC 8`). Told the column its text had got to, it once sized a Debian 13
+guest's console 7 columns wide, and every line typed at it in the panel
+wrapped and was drawn over itself. The UART now follows the cursor's moves
+-- to a column (CUP, HVP, CHA), right and left (CUF, CUB), saved and put
+back (`ESC 7`/`8`, `CSI s`/`u`) -- a move to the right stopping at column
+80, so the corner is a VT100's 24 rows by 80 columns: `stty size` in such a
+guest says `24 80`. A line of text is followed past 80 as before, so a
+prompt is still told where it ends. A guest whose console has the old size
+gets the new one at its next login, or at `stty cols 80 rows 24`.
 
 **Stopping is a question, then a flag and a join.** `hv stop` presses the
 VM's power button, and a guest that shuts down when it is pressed is given
@@ -3740,6 +3753,151 @@ and streamed, a reader's typing refused; a VM made of an image, cloned, the
 clone deleted; a protected VM's delete refused without `force`; a create of
 an image served slowly cancelled midway, nothing of it left -- and
 `fs-fuzz.py` holds the extents a clone copies by to the model's data.
+
+## Moving a VM to another host
+
+A running VM of a folder moves to another host of the cluster while it runs
+(plans/vm-migration.md, M0-M5): its memory is copied as it goes on writing
+it, round after round, then it is paused for the last of it and its state,
+and one of the two hosts runs it from there -- never both, and never on a
+guess. Its network goes with it: its address, its firewall's flows, and the
+frames the other hosts still send to where it was.
+
+```
+hv migrate <vm> <host> [cold]      live: rounds as it runs, then paused for the last
+hv save <vm> <file>                paused, its state and memory written, and off the list
+hv restore <file>                  the VM the file names, running again from it
+hv logcheck <vm> [rounds=N]        the dirty log held to it: its memory copied in rounds, then compared paused
+```
+
+The `vm` provider's `migrate` job is the same move on the bus (its log the
+command's lines, its progress the memory sent, a cancel before the last
+round's end leaving the VM running where it was), and the panel's VM page
+has it as **Move to another host**, the hosts the cluster's (`cluster.hosts`).
+
+A move from `vm-migration-test.py`, three nos under TCG on a Mac, the
+guest writing files of random bytes all the while and a probe on a third
+host pinging it -- every page through the test's hub in Python, so its
+times are the emulator's, not a host's:
+
+```
+> hv migrate mig b
+hv: mig offered to b: 256 MiB, 1 cpu, 1 file of its folder
+hv: mig round 0: 42 MiB of its memory (54723 pages of zeros) and 16 KiB of files in 4081 ms, the pages it wrote meanwhile marked
+hv: mig round 1: 2148 pages (41 of zeros) in 569 ms; 695 written meanwhile
+hv: mig sent in 3 rounds: 53 MiB of its memory, 16 KiB of files, its state 2 KiB, 53 flows of its firewall -- paused 760 ms so far
+hv: mig runs on b -- paused 857 ms; its folder here taken away
+```
+
+The probe's pings, one each 0.3 s, through the moves: 23 of 24 answered
+across this one, 23 of 25 across the first (paused 1.9 s), 8 of 12 across a
+cold one (paused 4.6 s) -- what is lost is what came while it was paused.
+
+**What moves**: a VM of a folder whose written disks are volumes of NBS's
+-- one at least: its first decides the handover -- whose read-only disks are
+volumes or files of its folder (a cloud VM's seed), and whose NIC, if it
+has one, is on a network of the cluster's. **What is refused**, said, the VM
+left running as it was: a disk of the host's own that it writes (a file, a
+device), a NIC on the host's network, `forward=` or an `hv forward` to it,
+`public=`, a folder with a folder in it or a file over 64 MiB, a vm.toml
+that names other disks than the VM runs with; on the other host a folder of
+its name, another CPU model or extension (below), a TSC rate more than 250
+ppm off, a network vnet does not have there, no room. One VM comes in at a
+time.
+
+**The CPU** a guest is shown has to be the same on the other host: the
+offer carries the policy's answer to every CPUID leaf and subleaf a guest
+of its shape can ask (`policy::model_answers`) and ARCH_CAPABILITIES, and
+the other host refuses one whose answers are not its own, naming the first
+leaf that differs. The cache leaves (2, 4, 0x80000005, 0x80000006,
+0x8000001D) and the clock's (0x16) are left out: a hybrid CPU's cores answer
+them each its own way (the EX44's P and E cores), and a guest reads them
+once, at boot, for what they describe -- its TSC is leaf 0x15's, the host's
+whatever the core. `hv info` says the digest of those answers
+as each of this host's CPUs makes it -- the EX44's, its six P-cores' twelve
+threads and eight E-cores alike: `cpu model c99c33c85afad94a -- what a guest moving here
+is held to, alike on the 20 CPUs` -- or which two differ, and at which leaf.
+
+**The state** (`common/vm/vmstate`, version 2, which reads version 1's
+too: a host updated before the others takes their VMs) is every CPU's
+registers in the shape
+both backends share -- the general and control registers, the segments,
+the system MSRs, the debug registers, the XSAVE area checked as it is read
+back in, a pending event, the interrupt shadow -- each local APIC, the
+mailboxes, every device's; times stored relative to the pause, the TSC
+carried by its offset, so the guest's clocks go on from where they stood,
+the pause left out (`LinuxGuest::rebase`). Every field is checked as it is
+read: a state is another host's word. `hv save` writes it and the memory
+into a file on the one host (`save.rs`).
+
+**The dirty log** (`hypervisor/hv/src/dirty.rs`) finds what the guest
+writes while its memory is copied: every page of its RAM is made read-only
+in the nested table (`npt.rs`'s and `ept.rs`'s `protect`, a 2 MiB leaf split
+into the 4 KiB ones of the same memory first), so the guest's first write
+to a page is a nested fault, where the page is marked and made writable
+again; the host's own writes into it -- a disk's read, a frame received --
+are marked as they are made. A round takes the marks and protects their
+pages again as one step under the table's lock, gives the table a new
+identity, and waits until every CPU of the guest has passed the top of its
+loop since (`sync_tlbs`): each entry from then on drops what the TLB kept of
+the table -- a fresh ASID under AMD-V, an INVEPT under VT-x -- so a page
+read after that is the guest's latest, and its next write faults. The
+rounds go on until what is left fits a 300 ms pause at the last round's
+rate; past five rounds the guest is slowed, 30% of its CPUs' time and 10%
+more a round up to 90%; past thirty the move is given up. The last round
+is paused and drained, its state taken as it paused, and the rings its
+devices write through mappings of their own sent with the marked pages.
+`hv migrate ... cold` pauses first and sends everything once.
+
+**The handover** (`common/vm/migwire`'s `handover`) is one compare and set
+in NBS's raft, on the writer of the VM's first written volume: the new host
+commits by attaching it for writing *only from the writer of the generation
+the old host named* (NBS's attach with `expect`); the old host, hearing
+nothing in a minute, takes it anew from that same generation itself.
+Whichever lands first decides, and the other is refused -- `NotTheWriter`,
+told apart from no answer, which is asked again with the same token and
+answered as it was. A side that never hears runs nothing: the VM is left
+stopped, its volume's writer the side that took it, `hv start <vm> force`
+where it is to run. The new host builds the guest with stand-ins behind
+its disks and NIC when it accepts, puts the state in once its memory is
+all there, and swaps the volumes it takes and the port vnet moves to it
+(`vnet::port_move`) in before the guest's first instruction there. The
+folder goes with it: written on the new host as it comes, its vm.toml last,
+at the commit; taken away on the old one once the guest runs there.
+
+**The network** goes with it (M3). Its port is vnet's, and its address and
+MAC with it, so the guest's ARP cache stays right; the move tells vnet the
+port is the new host's (`vnet::port_move`), and vnet tells hv's keeper on
+every host of each change it applies (`vnetmeta::KEEPER`, the mailbox
+`hv.keeper`), which asks for its table at once rather than at its next
+second. Until a host has it, what it sends the port goes to the old host,
+which carries it on to the new one for ten seconds (`Switch::moved_away`,
+`MOVED_NS`) -- from the moment it hands the VM over, its end there still
+going; the new host takes those from that host alone, for that port alone,
+for those seconds, though their sender is a port on a third host
+(`Switch::came_here`, the tunnel's `arrived`) -- the host that had the VM's
+memory a moment ago is trusted with no more than it was. The port's
+stateful firewall's flows -- what lets the answers to the VM's own
+connections in -- are taken as it pauses and made the new port's, each
+running out as long after as it had left (`flows_of`, `adopt_flows`, the
+message `Flows`, at most 4096); `hv list` there counts them. Connections
+masqueraded through `hv0` are lost: NAT's state is the old host's (D1).
+
+VT-x's half -- its TSC offset, its INVEPT on a renewed table, its pending
+debug exceptions -- runs only where VT-x is (the EX44).
+
+`trace on migrate` records the rounds, the takes, both sides' ends, the new
+host's messages and the dirty log's TLB waits ([A migration's
+events](tracing.md#a-migrations-events)). Its gates: `hv-fuzz.py`'s
+`vmstate`, `handover`, `migwire`, `dirtylog` and `policy` targets, its
+`tunnel` target (ports migrated between three hosts' real tunnels, the
+others' tables old, what the old host carries on held to the rules above),
+`vnetswitch` (ports moved away) and `flowmove` (a port's flows made another
+switch's port's: it refuses nothing the old one lets in); `nbs-fuzz.py` for
+the attach's `expect`; `vm-migration-test.py` (three nos, a guest on a
+volume and on vnet's network moved live and cold, back and forth, writing
+all the while, a probe on the third pinging it); `hv-linux-test.py --save`;
+the panel's test of its button; `web-test.py` for the descriptor.
 
 ## ACPI
 

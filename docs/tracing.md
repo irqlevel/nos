@@ -632,6 +632,36 @@ packet's way through, so nothing on that path costs anything, on or off.
 > trace show tunnel_key                      # the keys going round
 ```
 
+## A migration's events
+
+Group `migrate`: a VM moved between hosts' hv ([Moving a VM to another
+host](hypervisor.md#moving-a-vm-to-another-host), plans/vm-migration.md),
+recorded by the hv module's `modules/hypervisor/hv/src/migrate.rs` on both
+sides -- the host the VM leaves (`old`) and the one it comes to (`new`) --
+and, for the dirty log, by hv's run loop (`hypervisor/hv/src/run.rs`). None
+sits on a guest's exits: a migration's rounds and messages are its own
+task's, and the guest's write faults on the pages the log protects are
+`hv_exit`s already (`npf`, a write's error code).
+
+| event | what it records |
+|---|---|
+| `mig_round` | a round of pages the old host sent: the migration's `id`, the `round` (0 every page, each after it the pages its guest wrote meanwhile), its `pages` and how many were `zeros` -- a mark and no data -- the `ms` it took, the pages `marked` written by its end -- what the next round will be, and what decides whether it is the last -- how slowed the guest was (`throttle`, percent), and `last`: 1 for the round with the guest paused |
+| `mig_take` | a side's take of a volume in the handover (`side`), from the writer of `generation` -- the new host's commit, the old one's taking back -- the guest's `disk` it is, the `ms` NBS took to answer, and what it answered (`took`: `took`, `refused` -- the other side's landed first -- or `unknown`, asked again with the same token) |
+| `mig_end` | a side's end of a migration (`side`): `how` -- the VM runs on the new host (`there`), on the old one (`here`), on neither (`stopped`: its first volume's writer one that cannot run it), the offer `refused`, the move `cancelled` before its `Done` -- the `paused_ms` its guest was paused for it (the old host's), the `rounds` and the `mib` of its memory |
+| `mig_recv` | a message the new host took: its `kind` (`file`, `pages`, `state`, `flows`, `done`, `cancel`), its `seq`'s low word, its `bytes`, and the `ns` it took to handle -- written into the guest's memory or its folder, and answered; 0 for `done` and `cancel`, which begin what `mig_take` and `mig_end` record |
+| `mig_sync` | a guest's nested table narrowed by the dirty log (`what`: `start` -- every page read-only -- `round`, or `stop`), `pages` of it in `narrow_ns`, and the `wait_ns` for each of its `cpus` to pass the top of its loop since, dropping what its TLB kept of the table: the table's new identity (`table`) |
+
+```
+> trace on migrate
+> hv migrate web b
+> trace show mig_round                       # the rounds: do they shrink?
+> trace show mig_sync what=round             # what a round's TLB flush cost
+```
+
+On the new host `trace show mig_recv kind=pages` says how long its writes of
+the pages take, the old host's `mig_round` how long the same rounds took to
+send: where the two differ, the way between is what holds the move back.
+
 ## The memory's events
 
 Group `mm`: the zeroing of free pages ahead of their allocation
