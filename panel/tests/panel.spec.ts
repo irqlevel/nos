@@ -476,6 +476,12 @@ test('a VM moved to another host of the cluster\'s: the host from the cluster\'s
   await expect(page.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
   await expect(page.getByTestId('job')).toContainText('sent in 3 rounds');
   await expect(page.getByTestId('job')).toContainText('runs on mock-b -- paused 212 ms');
+  /* The page says where it went, and not that this host has no such VM --
+   * a read after the move, three seconds on, included */
+  await expect(page.getByTestId('vm-moved')).toContainText('Moved to mock-b');
+  await page.waitForTimeout(3500);
+  await expect(page.getByText('no vm pw-mig')).toHaveCount(0);
+  await expect(page.getByTestId('vm-moved')).toBeVisible();
   await page.goto(`/en/h/${host}/vms`);
   await expect(page.getByTestId('resource-vms')).toContainText('panel');
   await expect(page.getByTestId('resource-vms')).not.toContainText('pw-mig');
