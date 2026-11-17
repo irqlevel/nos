@@ -19,6 +19,17 @@ pub const FUNCTIONS_MAX: usize = 16;
 pub const DEVICES_MAX: usize = FUNCTIONS_MAX - 1;
 /// The longest answer the UART keeps to a cursor-position query.
 pub const REPLY_MAX: usize = 12;
+/// The parameters of an escape sequence the UART follows, at most: a cursor
+/// move's row and column.
+pub const CSI_PARAMS: usize = 2;
+/// `Uart::esc`'s values: text, after ESC, in a control sequence the UART
+/// follows, version 1's "ESC [ 6" (read as a sequence of parameter 6), in
+/// one it does not.
+pub const ESC_TEXT: u8 = 0;
+pub const ESC_START: u8 = 1;
+pub const ESC_CSI: u8 = 2;
+pub const ESC_CSI6_V1: u8 = 3;
+pub const ESC_CSI_OTHER: u8 = 4;
 
 /// The 16550A.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,10 +43,17 @@ pub struct Uart {
     pub written: u64,
     pub loopback: Option<u8>,
     pub rx: Option<u8>,
-    /// Where the guest's output is in an escape sequence (0-4), and the
+    /// Where the guest's output is in an escape sequence (`ESC_*`), and the
     /// column it left the cursor at.
     pub esc: u8,
     pub col: u16,
+    /// In a control sequence the UART follows (`ESC_CSI`): its parameters
+    /// so far, and how many it has begun; 0 elsewhere. Version 2's.
+    pub csi: [u16; CSI_PARAMS],
+    pub csi_n: u8,
+    /// The column the guest saved the cursor at (ESC 7, CSI s), to put it
+    /// back at (ESC 8, CSI u). Version 2's.
+    pub saved_col: Option<u16>,
     /// The answer to the last cursor-position query -- its first
     /// `reply_len` bytes -- and how much of it the guest has read.
     pub reply: [u8; REPLY_MAX],
@@ -251,6 +269,11 @@ impl Uart {
         o.bool(self.prompt_seen);
         o.bool(self.thri);
         o.bool(self.pulse);
+        for p in self.csi {
+            o.u16(p);
+        }
+        o.u8(self.csi_n);
+        o.opt(self.saved_col, |o, c| o.u16(c));
     }
 
     fn get(r: &mut In) -> Result<Uart> {
@@ -259,7 +282,7 @@ impl Uart {
         let loopback = r.opt("the UART's loopback", |r| r.u8("the UART's loopback"))?;
         let rx = r.opt("the UART's receiver", |r| r.u8("the UART's receiver"))?;
         let esc = r.u8("the UART's escape")?;
-        if esc > 4 {
+        if esc > ESC_CSI_OTHER || (esc == ESC_CSI6_V1 && r.version >= 2) {
             return Err(Error("the UART in no escape state it has"));
         }
         let col = r.u16("the UART's column")?;
@@ -269,10 +292,34 @@ impl Uart {
         if usize::from(reply_len) > REPLY_MAX || reply_pos > reply_len {
             return Err(Error("a reply longer than the UART keeps, or read past its end"));
         }
-        Ok(Uart {
+        let (prompt_seen, thri, pulse) = (r.bool("prompt")?, r.bool("THRI")?, r.bool("pulse")?);
+        let mut u = Uart {
             dll: regs[0], dlm: regs[1], ier: regs[2], lcr: regs[3], mcr: regs[4], scr: regs[5], written, loopback, rx,
-            esc, col, reply, reply_len, reply_pos, prompt_seen: r.bool("prompt")?, thri: r.bool("THRI")?, pulse: r.bool("pulse")?,
-        })
+            esc, col, csi: [0; CSI_PARAMS], csi_n: 0, saved_col: None, reply, reply_len, reply_pos, prompt_seen,
+            thri, pulse,
+        };
+        if r.version < 2 {
+            /* Version 1 followed no sequence but ESC [ 6 n, and saved no
+             * cursor: its "ESC [ 6" is a sequence of one parameter, 6 */
+            if esc == ESC_CSI6_V1 {
+                u.esc = ESC_CSI;
+                u.csi = [6, 0];
+                u.csi_n = 1;
+            }
+            return Ok(u);
+        }
+        for p in &mut u.csi {
+            *p = r.u16("the UART's sequence")?;
+        }
+        u.csi_n = r.u8("the UART's sequence")?;
+        u.saved_col = r.opt("the UART's saved cursor", |r| r.u16("the UART's saved cursor"))?;
+        /* One way to write each: parameters only in a sequence followed,
+         * none past those begun */
+        let begun = usize::from(u.csi_n);
+        if begun > CSI_PARAMS || (esc != ESC_CSI && begun != 0) || u.csi[begun.min(CSI_PARAMS)..].iter().any(|&p| p != 0) {
+            return Err(Error("the UART's sequence with parameters it cannot have"));
+        }
+        Ok(u)
     }
 }
 

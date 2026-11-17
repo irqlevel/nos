@@ -3063,10 +3063,23 @@ where the cursor is after it prints its prompt, and takes the column it is
 told as the prompt's end. It was once told column 80 whatever the prompt, and
 wrapped what was typed at the edge it thought it had reached -- `id` came back
 as `i`, a newline, `d`. The UART now follows the guest's output as a terminal
-would -- the column each byte leaves the cursor at, escape sequences moving
-it nowhere -- and answers with that, from a buffer of its own: a guest that
-asks and never reads the answer costs the host no more than one that asks
-once, where the answer used to be appended to a queue without bound.
+would -- the column each byte leaves the cursor at -- and answers with that,
+from a buffer of its own: a guest that asks and never reads the answer costs
+the host no more than one that asks once, where the answer used to be
+appended to a queue without bound.
+
+**And a move of the cursor is followed too.** systemd 257 sizes a serial
+console as a getty starts by moving the cursor to a far corner (`ESC 7`,
+`ESC [ 32766 ; 32766 H`), asking where it went and putting it back
+(`ESC 8`). Told the column its text had got to, it once sized a Debian 13
+guest's console 7 columns wide, and every line typed at it in the panel
+wrapped and was drawn over itself. The UART now follows the cursor's moves
+-- to a column (CUP, HVP, CHA), right and left (CUF, CUB), saved and put
+back (`ESC 7`/`8`, `CSI s`/`u`) -- a move to the right stopping at column
+80, so the corner is a VT100's 24 rows by 80 columns: `stty size` in such a
+guest says `24 80`. A line of text is followed past 80 as before, so a
+prompt is still told where it ends. A guest whose console has the old size
+gets the new one at its next login, or at `stty cols 80 rows 24`.
 
 **Stopping is a question, then a flag and a join.** `hv stop` presses the
 VM's power button, and a guest that shuts down when it is pressed is given
@@ -3805,7 +3818,9 @@ as each of this host's CPUs makes it -- the EX44's, its six P-cores' twelve
 threads and eight E-cores alike: `cpu model c99c33c85afad94a -- what a guest moving here
 is held to, alike on the 20 CPUs` -- or which two differ, and at which leaf.
 
-**The state** (`common/vm/vmstate`) is every CPU's registers in the shape
+**The state** (`common/vm/vmstate`, version 2, which reads version 1's
+too: a host updated before the others takes their VMs) is every CPU's
+registers in the shape
 both backends share -- the general and control registers, the segments,
 the system MSRs, the debug registers, the XSAVE area checked as it is read
 back in, a pending event, the interrupt shadow -- each local APIC, the
