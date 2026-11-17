@@ -139,6 +139,8 @@
         "state": {"type": "enum", "title": {"en": "State", "ru": "Состояние"}, "values": {
           "running": {"en": "running", "ru": "работает"},
           "stopping": {"en": "stopping", "ru": "останавливается"},
+          "moving": {"en": "moving", "ru": "переносится"},
+          "saving": {"en": "saving", "ru": "сохраняется"},
           "stopped": {"en": "stopped", "ru": "остановлена"},
           "off": {"en": "off", "ru": "выключена"},
           "busy": {"en": "busy", "ru": "занята"}}},
