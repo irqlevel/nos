@@ -55,8 +55,16 @@ pub fn net(_args: &str, out: &mut Output) {
             };
             let name = core::str::from_utf8(dev.name()).unwrap_or("?");
             let st = dev.stats();
-            let _ = writeln!(out, "{}  {}  ip:{}  tx:{} rx:{} drop:{} rxfull:{} txfull:{}  bytes tx:{} rx:{}",
-                name, MacHex(dev.mac()), Ip(dev.ip()),
+            let _ = write!(out, "{}  {}  ip:{}", name, MacHex(dev.mac()), Ip(dev.ip()));
+            /* The subnet and the way off it: what a static address was given,
+             * or a lease brought */
+            if dev.mask() != 0 {
+                let _ = write!(out, "/{}", dev.mask().count_ones());
+            }
+            if dev.gw() != 0 {
+                let _ = write!(out, " gw:{}", Ip(dev.gw()));
+            }
+            let _ = writeln!(out, "  tx:{} rx:{} drop:{} rxfull:{} txfull:{}  bytes tx:{} rx:{}",
                 st.tx_total, st.rx_total, st.rx_drop, st.rx_full, st.tx_full, st.tx_bytes, st.rx_bytes);
             let _ = writeln!(out, "  rx  icmp:{} udp:{} tcp:{} arp:{} other:{} nat:{}",
                 st.rx_icmp, st.rx_udp, st.rx_tcp, st.rx_arp, st.rx_other, st.rx_nat);
@@ -446,6 +454,13 @@ pub fn register_all() {
 pub unsafe extern "C" fn rust_net_dhcp_auto(printer: *mut core::ffi::c_void) {
     let mut out = unsafe { Output::from_raw(printer) };
 
+    /* A static address is the whole of eth0's configuration: a lease would
+     * take its place, and on the network it was given for nobody answers. */
+    if let Some(given) = kcore::net::static_ip() {
+        let _ = writeln!(out, "DHCP auto: {} has a static address, {}", DEFAULT_DEVICE, Ip(given.ip));
+        return;
+    }
+
     let dev = match DEVICES.find(DEFAULT_DEVICE.as_bytes()) {
         Some(dev) => dev,
         /* No device: nothing to say, as the C++ said nothing either. */
@@ -490,11 +505,53 @@ pub extern "C" fn rust_net_dhcp_stop() {
     }
 }
 
+/// `ip=` and `gw=`: eth0's address, put on it before anything that sends --
+/// the netconsole first, which waits for an address and has none on a
+/// network with no DHCP server. The mask and the gateway go first and the
+/// address last: an address is what everything here takes for a device
+/// ready to send from, and each is read with the order its store made.
+fn configure_static() {
+    let Some(given) = kcore::net::static_ip() else { return };
+    let Some(dev) = DEVICES.find(DEFAULT_DEVICE.as_bytes()) else {
+        kcore::klog!(0, "net: ip= was given, but there is no {} to put it on", DEFAULT_DEVICE);
+        return;
+    };
+    let nic = dev.as_nic();
+    nic.set_mask(given.mask);
+    nic.set_gw(given.gw);
+    nic.set_ip(given.ip);
+    kcore::klog!(0, "net: {} static ip {} mask {} gw {}", DEFAULT_DEVICE, Ip(given.ip), Ip(given.mask),
+        Ip(given.gw));
+}
+
+/// `dns=A.B.C.D`: the resolver on that server from the start, on eth0 --
+/// with a static address or a lease to come, whose own server then does not
+/// replace it.
+fn start_given_resolver() {
+    let Some(server) = kcore::net::dns_server_given() else { return };
+    let Some(dev) = DEVICES.find(DEFAULT_DEVICE.as_bytes()) else {
+        kcore::klog!(0, "dns: dns= was given, but there is no {} to resolve on", DEFAULT_DEVICE);
+        return;
+    };
+    match abi::dns() {
+        Some(dns) if !dns.is_ready() => {
+            if !dns.start(dev.as_nic(), server) {
+                kcore::klog!(0, "dns: the resolver on {} did not start", Ip(server));
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The services boot starts once the devices are up and the shell exists:
+/// eth0's static address where the command line gave one, and its resolver;
 /// the netconsole, if the command line asked for one, and the shell over
 /// UDP. Both go on eth0, which is what the C++ looked for.
 #[no_mangle]
 pub extern "C" fn rust_net_start_services(udp_shell_port: u16) {
+    configure_static();
+    start_given_resolver();
+
     if NETCONSOLE.is_enabled() {
         match DEVICES.find(DEFAULT_DEVICE.as_bytes()) {
             None => kcore::klog!(0, "Netconsole: eth0 not found"),

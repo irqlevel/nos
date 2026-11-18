@@ -13,7 +13,10 @@ and the halt's own lines must arrive: the netconsole stops after the modules
 and the filesystems have gone -- a module's exit may wait minutes for
 guests to turn themselves off, which on such a machine nothing else would
 show -- and sends what it still holds as it stops, down to its own last
-line.
+line. A third boot is on a network that hands out no address: eth0's
+address, gateway and resolver come off the command line (ip=, gw=, dns=),
+dhcp=auto leaves them alone, and the log arrives with no lease ever asked
+for.
 
     tests/netconsole-test.py [--tcg] [--keep]
 
@@ -110,7 +113,7 @@ def wait_until(predicate, timeout):
     return False
 
 
-def boot(args, tmp, name):
+def boot(args, tmp, name, network="dhcp=auto"):
     """nos with its log streaming to the collector, and its serial log."""
     image = os.path.join(tmp, name + ".img")
     log = os.path.join(tmp, name + ".log")
@@ -121,8 +124,8 @@ def boot(args, tmp, name):
     accel = ["-accel", "hvf", "-cpu", "host"] if hvf else ["-accel", "tcg", "-cpu", "cortex-a72"]
     argv = ["qemu-system-aarch64", "-M", "virt,gic-version=3", "-smp", "4", "-m", "1024"] + accel + [
         "-kernel", os.path.join(ROOT, "nos-arm64.img"),
-        "-append", "root=auto dhcp=auto udpshell=%d netconsole=10.0.2.2:%d"
-                   % (SHELL_PORT, COLLECT_PORT),
+        "-append", "root=auto %s udpshell=%d netconsole=10.0.2.2:%d"
+                   % (network, SHELL_PORT, COLLECT_PORT),
         "-global", "virtio-mmio.force-legacy=false",
         "-drive", "file=%s,format=raw,id=hd0,if=none" % image,
         "-device", "virtio-blk-device,drive=hd0",
@@ -165,6 +168,41 @@ def halt(args, tmp):
                  wait_until(lambda: "vfs: unmounting /" in collector.text(), 10), tail())
         pt.check("down to the netconsole's own last line, sent as it stops",
                  wait_until(lambda: "netconsole: stopping -- the last line sent" in collector.text(), 10), tail())
+        pt.check("with no gap in the numbers", collector.gaps() == [], str(collector.gaps()[:10]))
+    finally:
+        collector.stop()
+        end(p)
+    return collector.text()
+
+
+STATIC = "dhcp=auto ip=10.0.2.15/24 gw=10.0.2.2 dns=10.0.2.3"
+
+
+def static(args, tmp):
+    """A boot on a network that hands out no address, as the ASUS box's:
+    eth0's address, gateway and resolver from the command line. dhcp=auto
+    stays on the line, as the system image's GRUB entries carry it, and is
+    to leave eth0 alone; the log has to reach the collector with no lease
+    ever asked for, from the first line on."""
+    collector = Collector(COLLECT_PORT)
+    p, log = boot(args, tmp, "static", STATIC)
+    try:
+        if not pt.check("boots with a static address", pt.wait_log(log, "boot: complete", 300)):
+            return collector.text()
+        pt.check("its log arrives with no lease", wait_until(lambda: len(collector.lines) > 50, 60),
+                 "%d lines" % len(collector.lines))
+        pt.check("eth0 is given the address before the netconsole sends",
+                 wait_until(lambda: "net: eth0 static ip 10.0.2.15 mask 255.255.255.0 gw 10.0.2.2"
+                            in collector.text(), 10), "\n".join(collector.lines[-10:]))
+        pt.check("the resolver starts on the server given",
+                 wait_until(lambda: "dns: resolver started, server 10.0.2.3" in collector.text(), 10))
+        pt.check("dhcp=auto leaves the static address alone",
+                 pt.wait_log(log, "DHCP auto: eth0 has a static address, 10.0.2.15", 30))
+        pt.check("no DHCP client ran", "dhcp: " not in collector.text())
+        sh = pt.Shell()
+        out = sh.run("net")
+        pt.check("the shell over UDP answers on it, and net shows it",
+                 "ip:10.0.2.15/24 gw:10.0.2.2" in out, out[-300:])
         pt.check("with no gap in the numbers", collector.gaps() == [], str(collector.gaps()[:10]))
     finally:
         collector.stop()
@@ -228,12 +266,14 @@ def main():
         end(p)
 
     halted = halt(args, tmp)
+    fixed = static(args, tmp)
 
     if args.keep:
         out = os.path.join(tmp, "netconsole.log")
         open(out, "w").write(collector.text())
         open(os.path.join(tmp, "netconsole-halt.log"), "w").write(halted)
-        print("collected logs at " + out + " and netconsole-halt.log beside it")
+        open(os.path.join(tmp, "netconsole-static.log"), "w").write(fixed)
+        print("collected logs at " + out + ", netconsole-halt.log and netconsole-static.log beside it")
     else:
         subprocess.run(["rm", "-rf", tmp])
 

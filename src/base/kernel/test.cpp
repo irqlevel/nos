@@ -568,6 +568,57 @@ stdlib::Error test_parameters()
         !long_line.is_dhcp_auto() || !long_line.is_dns_enabled())
         return make_error(stdlib::Error::UNSUCCESSFUL);
 
+    /* A static address, its gateway and a resolver given -- a network with
+       no DHCP server, as the ASUS box's -- in host byte order, the gateway
+       given before the address it is checked against */
+    Parameters fixed;
+    fixed.parse("dhcp=auto gw=213.232.225.1 ip=213.232.225.136/24 dns=213.148.0.221");
+    if (fixed.get_static_ip() != 0xD5E8E188 || fixed.get_static_mask() != 0xFFFFFF00 ||
+        fixed.get_static_gateway() != 0xD5E8E101 || fixed.get_dns_server() != 0xD59400DD ||
+        !fixed.is_dns_enabled() || !fixed.is_dhcp_auto())
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+
+    /* /32 and /31 have no network or broadcast address of their own */
+    Parameters host_route;
+    host_route.parse("ip=10.0.0.0/31");
+    if (host_route.get_static_ip() != 0x0A000000 || host_route.get_static_mask() != 0xFFFFFFFE)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+
+    /* Refused, and nothing of them kept: no prefix, a prefix out of range,
+       the subnet's own network and broadcast addresses, addresses no host
+       has; a gateway off the subnet, or given with no address at all */
+    const char* const no_address[] = {
+        "ip=10.0.0.5",
+        "ip=10.0.0.5/0",
+        "ip=10.0.0.5/33",
+        "ip=10.0.0.5/",
+        "ip=10.0.0.0/24",
+        "ip=10.0.0.255/24",
+        "ip=127.0.0.1/8",
+        "ip=224.0.0.1/4",
+        "ip=0.0.0.0/8",
+        "ip=10.0.0.5/24x",
+        "ip=10.0.0.256/24",
+    };
+    for (ulong i = 0; i < stdlib::array_size(no_address); i++)
+    {
+        Parameters one;
+        one.parse(no_address[i]);
+        if (one.get_static_ip() != 0 || one.get_static_mask() != 0)
+            return make_error(stdlib::Error::UNSUCCESSFUL);
+    }
+
+    Parameters far_gw;
+    far_gw.parse("ip=10.0.0.5/24 gw=10.0.1.1");
+    Parameters own_gw;
+    own_gw.parse("ip=10.0.0.5/24 gw=10.0.0.5");
+    Parameters lone_gw;
+    lone_gw.parse("gw=10.0.0.1 dns=255.255.255.255");
+    if (far_gw.get_static_ip() != 0x0A000005 || far_gw.get_static_gateway() != 0 ||
+        own_gw.get_static_gateway() != 0 || lone_gw.get_static_gateway() != 0 ||
+        lone_gw.get_dns_server() != 0 || lone_gw.is_dns_enabled())
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+
     klog(0, "test_parameters: complete");
     return make_success();
 }

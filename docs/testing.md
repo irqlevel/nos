@@ -450,8 +450,13 @@ with no gap in the numbers: the unmount, which comes after every module has
 gone -- a module's exit may wait minutes for guests to turn themselves off,
 which on a machine with no other console nothing else would show -- and the
 netconsole's own last line, traced as it stops and sent by the flush its
-drain does on the way out. On the two Hetzner machines netconsole is the
-only console there is. See [Netconsole](netconsole.md).
+drain does on the way out. A third boot is on a network that hands out no
+address -- the ASUS box's, whose Linux is configured by hand: eth0's
+address, gateway and resolver come off the command line (`ip=`, `gw=`,
+`dns=`), `dhcp=auto` on the same line has to leave them alone, and the log
+has to reach the collector with no lease ever asked for, `net` showing the
+address and the way off the subnet. On the Hetzner machines netconsole is
+the only console there is. See [Netconsole](netconsole.md).
 
 ### `tcp-test.py` -- the connecting side of TCP
 

@@ -26,8 +26,9 @@ but cannot fix any of them:
   finds no root there: no modules, no `/etc/rc`, no sshd.
 - **A network card nos drives**: Realtek RTL8168 or RTL8125, Intel 82576,
   I210 or I211 (the `igb` driver), or virtio-net. With any other, nos boots and
-  nobody can reach it. The network has to hand out addresses by DHCP: nos has
-  no static configuration.
+  nobody can reach it. A network that hands out no address by DHCP is given
+  one with `--cmdline "ip=A.B.C.D/N gw=A.B.C.D dns=A.B.C.D"` -- what its
+  Linux has statically ([Kernel parameters](kernel-parameters.md#networking)).
 - **A plain partition** of at least 64 MiB (256 MiB is comfortable; a guest's
   disk images need more): not a member of an md RAID, not an LVM volume, not
   encrypted -- nos reads none of those. A server installed with its disks
