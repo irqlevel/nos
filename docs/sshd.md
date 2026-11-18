@@ -3,7 +3,8 @@
 `sshd` is a loadable module that serves the kernel's shell over SSH: an
 OpenSSH client logs in with an Ed25519 key and gets the same commands the
 console and the [UDP shell](udp-shell.md) have -- encrypted, and only for the
-keys it was told to let in.
+keys it was told to let in -- and copies files in and out with `sftp` and
+`scp`, over SFTP ([Copying files](#copying-files-sftp)).
 
 ```
 $ insmod /sshd.ko
@@ -127,9 +128,11 @@ One of each, what every OpenSSH of the last ten years offers first or nearly:
 
 Rekeying is the client's to start and is followed wherever it comes, in the
 middle of a command's output included. A connection gets one session channel:
-a shell, with or without a terminal, or one command (`ssh host dmesg`). The
-rest is refused -- `sftp` and so modern `scp`, port forwarding, agent and X11
-forwarding, `env`.
+a shell, with or without a terminal, one command (`ssh host dmesg`), or the
+`sftp` subsystem -- SFTP version 3, as OpenSSH speaks it, which is what
+`sftp` and, since OpenSSH 9.0, `scp` copy files with. The rest is refused:
+port forwarding, agent and X11 forwarding, `env`, and the old `scp -O`, rcp's
+protocol run through a command on the server.
 
 ## The shell behind it
 
@@ -174,6 +177,88 @@ looks has the size it had, and not the screen. `edit` is that command
 there is none to ask for. And there is one user: whatever name the client
 gives, a key in the list logs in, and what it can do is what the console
 can.
+
+## Copying files: SFTP
+
+`sftp` and `scp` copy files into the machine and out of it -- any client of
+SFTP does: `sshfs`, `rclone`, FileZilla, Cyberduck, WinSCP, paramiko:
+
+```
+$ scp -P 2222 bzImage root@127.0.0.1:/vms/
+$ scp -P 2222 -r root@127.0.0.1:/var/log ./nos-logs
+$ sftp -P 2222 root@127.0.0.1
+sftp> put guest.qcow2 /images/guest.qcow2
+sftp> ls -l /images
+-rw-r--r--   1 root     root     2147549184 Jan  1  1970 guest.qcow2
+sftp> df -h /images
+sftp> rename /images/guest.qcow2 /images/debian.qcow2
+```
+
+The server is the sftp crate's (`src/crates/common/net/sftp`): the
+protocol, and nothing of the kernel, run on the session's task a request at
+a time, each answered on the channel before the next is looked at. What it
+serves is the kernel's files through `kcore::fs`, as a module reaches them,
+and every path is the one the client names -- made absolute against `/`,
+which is every client's home (there being one user), its `.` and `..` taken
+out, and nothing else looked for: a module's configuration file may have its
+next content in `<path>.new` while it is replaced ([Files](#files)), and the
+calls that read those look there too, but a client's `a.new` is a file of its
+own, never taken for `a` or taken away with it.
+
+What nos's filesystems keep is names and sizes, files and directories, and
+that is what a client is told:
+
+- **No owners, no permissions, no times.** Every file is said to be
+  `-rw-r--r--` and every directory `drwxr-xr-x`, owned by `root`, of the
+  epoch -- the time OpenSSH shows for one it is not told. What a client asks
+  to set of them -- `chmod`, `chown`, `put -p`, `scp -p`, a time after a copy
+  -- is refused, `SSH_FX_OP_UNSUPPORTED`, and nothing is done, rather than
+  taken and dropped: the data of `scp -p` is copied, and scp says what it
+  could not keep (`remote fsetstat: Operation unsupported`) -- and, OpenSSH
+  9.9's, still ends with 0. A mode in an OPEN or a MKDIR, which every
+  client sends, is read past. `rclone` sets a file's time after a copy:
+  `--sftp-set-modtime=false`, and compare by size (`--size-only`).
+- **No symbolic links**: SYMLINK is refused, READLINK says a path is no
+  link.
+- **A name is at most 63 bytes, a path 255** -- what the VFS takes; a longer
+  one is refused by the server before the VFS is asked, as a failure where
+  the request would make something there and as no such file elsewhere. A
+  name must be UTF-8 and have no NUL in it.
+- **A remove takes one file, an rmdir one empty directory** -- never a tree,
+  as the shell's `rm` takes one; `rm -r` is the client's, a file and a
+  directory at a time. A file open, here or anywhere -- a disk's image held
+  by a running guest -- is not removed or renamed, and a rename does not go
+  over a name that is taken (SFTP version 3's RENAME), nor across mounts.
+- **A directory is read a few entries at a time** -- a hundred to a READDIR,
+  fewer where the answer would pass 63 KiB -- with nothing of it held between
+  them: one that changes while it is listed may show an entry twice or not
+  at all, and each READDIR walks the directory to its place, which a
+  directory of tens of thousands of entries makes slow.
+- **Requests**: 64 KiB the longest (a longer one ends the session -- what
+  follows it cannot be found), 63 KiB the most a READ answers and a WRITE
+  carries, 32 handles open at once, files and directories, as
+  `limits@openssh.com` says, which OpenSSH's client sizes its requests and
+  keeps its requests in flight by. The session's window is 256 KiB, four
+  requests' worth, from the subsystem's start.
+- **Extensions**: `limits@openssh.com`, `statvfs@openssh.com` (`df`: the
+  filesystem's bytes, in 4 KiB blocks, and no inodes), `fsync@openssh.com`
+  (`put -f`: the file on its disk's medium before the copy is said done) and
+  `expand-path@openssh.com` (`~`, the home: `/`). Not
+  `posix-rename@openssh.com`, as no filesystem here replaces a name
+  atomically, nor `copy-data`, `hardlink@openssh.com` or
+  `home-directory`.
+- **What it runs at** is what the session's TCP connection carries: its
+  slot's 8 KiB each way, below.
+
+A file a client writes is written where each WRITE says, the file grown to
+reach past it (`kernel_file_pwrite_grow`) -- a hole between its end and a
+write past it -- and is not synced unless the client asks (`fsync@`, `put
+-f`): a copy is on the filesystem, in its journal's next commit, once it is
+said done. As a session ends the log says what it did:
+
+```
+sshd: root from 10.0.2.2:51544: sftp, 3 files opened (1 to be written), 8400953 bytes read and 8400953 written, 0 of 61 requests refused
+```
 
 ## Limits
 
@@ -220,7 +305,15 @@ can.
   and the signatures are the vendored dalek crates and `sha2` the TLS client
   already uses; a module being a build of its own, `sha2` is asked for its
   software backend here as well as in the kernel crate.
+- `src/crates/common/net/sftp` -- the SFTP server, and nothing of the kernel:
+  the requests read with the ssh crate's wire module, the answers made, the
+  handles, the paths made absolute; what it serves comes in through its
+  `Files` trait, and it is an `ssh::Subsystem` -- what a session's channel is
+  given over to by the `subsystem` request, the client's bytes handed to it
+  as they come and its answers sent back, with no line editor and no CR LF,
+  in a window of its own.
 - `src/crates/modules/net/sshd` -- the kernel's side: the `sshd` command, the files,
+  the sftp crate's `Files` over `kcore::fs` (`KernelFiles`),
   the ssh crate's `Primitives` -- the crypto crate's, CRYPTOGAMS' assembly in
   the kernel's SIMD sections, its integer code where none can be had --
   a listener task, a task for each connection, and one for each command a
@@ -235,7 +328,15 @@ can.
   be), `kernel_file_size/read/write/create` and `kernel_dir_create`, and
   `kernel_task_current` -- wrapped by `kcore::tcp` (`TcpListener`,
   `TcpStream`), `kcore::cmd::dispatch`, `kcore::fs` and
-  `kcore::task::current_id`.
+  `kcore::task::current_id`; and for SFTP the file ABI at exactly the path
+  given (`layers/fs/src/files.rs`): `kernel_file_stat`,
+  `kernel_file_open_flags` (made, cut, made by this open or refused, under
+  the lock it is made under), `kernel_file_pwrite_grow`, `kernel_dir_make`,
+  `kernel_file_unlink` and `kernel_dir_remove` (one file, one empty
+  directory, never a tree: `Vfs::remove_one`), with `kernel_file_pread`,
+  `kernel_dir_entry`, `kernel_file_rename` and `kernel_fs_space` -- wrapped
+  by `kcore::fs::stat`, `File::open_with`, `File::write_growing`,
+  `make_dir`, `remove_file`, `remove_dir` and `dir_entry`.
 
 The server is the first user the TCP stack's passive side has had, and it
 changed on the way. `Accept` takes a timeout and notices its listener being
@@ -260,10 +361,18 @@ and one without, 3 MiB of output through the client's window with rekeys in
 the middle of it, a command that prints nothing for five seconds under a
 client that asks every second whether the server is there and gives up after
 two unanswered, a key it has to refuse, sessions at once, `sshd stop` with a
-session open and `rmmod sshd` from inside one; then it puts the module in
-`/etc/rc`, reboots, and checks it came back by itself with the same host key.
-On x86-64 (`--arch x86_64`) the root image carries the module, a key and the
-`/etc/rc` from the start, and no shell is touched.
+session open and `rmmod sshd` from inside one; files copied in and out by
+OpenSSH's `sftp` and `scp` -- 8 MiB and some both ways, a tree with `scp -r`,
+a listing, a rename, `a.new` kept beside the `a` removed -- and each refusal
+said: a remove of nothing, an rmdir of a directory with something in it, a
+mkdir where there is one, `chmod`, a name of 64 bytes, `scp -p`; then it puts
+the module in `/etc/rc`, reboots, and checks it came back by itself with the
+same host key. On x86-64 (`--arch x86_64`) the root image carries the
+module, a key and the `/etc/rc` from the start, no shell is touched, and a
+file goes in over SFTP and back out the same. `tests/net-fuzz.py`'s `sftp`
+target holds the server to SFTP request by request over a model of the
+files, and its `ssh` target copies files in and back out through the module
+itself.
 
 ## Security
 
@@ -274,6 +383,8 @@ key, no second form of a signature), a packet's tag in constant time, and the
 client's X25519 share for a point of small order.
 
 What it guards is the shell, and whoever has the shell has the kernel -- they
-can `insmod` anything. The host key file is readable from that shell too; on
+can `insmod` anything. SFTP reaches no further: every file the shell can
+`cat` or `rm`, a key in the list can copy out or remove over SFTP, and
+nothing more. The host key file is readable from that shell too; on
 nos that is nobody who does not already have everything. Release images carry
 `sshd.ko` but never a host key: one is made on the machine the first time.

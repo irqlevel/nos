@@ -1,0 +1,13 @@
+[package]
+name = "sftp"
+version = "0.1.0"
+edition = "2021"
+
+# An SFTP server, and nothing of the machine it runs on: the files come in
+# through the Files trait, which the sshd module (modules/net/sshd) implements
+# over kcore::fs and the net fuzzer over a model. Its messages are SSH's data
+# types, read and written with the ssh crate's wire module, and the server is
+# an ssh::Subsystem.
+
+[dependencies]
+ssh = { path = "../ssh" }
