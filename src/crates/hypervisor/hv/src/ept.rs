@@ -54,6 +54,11 @@ const PAGE_RO: u64 = READ | MEMTYPE_WB;
 /// `hvarch::x86::Caps::nested_2m`).
 const PAGE_SIZE_BIT: u64 = 1 << 7;
 const HUGE_PAGE: u64 = PAGE | PAGE_SIZE_BIT;
+/// A page of a device's: read and write, uncacheable (type 0 in bits 5:3),
+/// IPAT clear -- the guest's PAT then decides with it, and UC wins over
+/// every type it may give -- and never executed.
+const MEMTYPE_UC: u64 = 0 << 3;
+const DEVICE_PAGE: u64 = READ | WRITE | MEMTYPE_UC;
 
 /// The EPT pointer's own bits, below the PML4 address: write-back (2:0 = 6),
 /// a page-walk length of four (5:3 = 3), and nothing else -- no accessed or
@@ -219,6 +224,51 @@ impl Ept {
     /// entry already there -- a page, or a table of 4 KiB ones -- is refused
     /// rather than replaced, as [`set`](Self::set) refuses.
     pub fn set_huge(&mut self, gpa: u64, hpa: u64) -> Result<()> {
+        self.set_huge_with(gpa, hpa, HUGE_PAGE)
+    }
+
+    /// A page of a device's BAR at `gpa`, the host's `hpa` -- not RAM, not
+    /// cached: uncacheable whatever the guest's PAT says, as a device's
+    /// registers are to be reached, and no instruction fetched from it.
+    pub fn set_device(&mut self, gpa: u64, hpa: u64) -> Result<()> {
+        self.set_entry(gpa, hpa, DEVICE_PAGE)
+    }
+
+    /// As [`set_device`](Self::set_device), 2 MiB at a time, prepared as
+    /// [`set_huge`](Self::set_huge)'s are.
+    pub fn set_huge_device(&mut self, gpa: u64, hpa: u64) -> Result<()> {
+        self.set_huge_with(gpa, hpa, DEVICE_PAGE | PAGE_SIZE_BIT)
+    }
+
+    /// What maps `gpa` taken out -- a 2 MiB leaf whole, or one page: a BAR
+    /// the guest moved. The TLBs are the caller's (`renew`).
+    pub fn clear(&mut self, gpa: u64) -> Result<()> {
+        let dir = match self.table_at(gpa, DIRECTORY, false) {
+            Ok(dir) => dir,
+            /* No table on the way: nothing is mapped there */
+            Err(Error::Unmapped) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let i = index(gpa, DIRECTORY);
+        if self.tables[dir].next[i] == LEAF {
+            if !self.tables[dir].page.store::<u64>(i * ENTRY_BYTES, 0) {
+                return Err(Error::BadAddress);
+            }
+            self.tables[dir].next[i] = NONE;
+            return Ok(());
+        }
+        if self.tables[dir].next[i] == NONE {
+            return Ok(());
+        }
+        let table = self.last_level(gpa, false)?;
+        let offset = index(gpa, SHIFTS.len() - 1) * ENTRY_BYTES;
+        if !self.tables[table].page.store::<u64>(offset, 0) {
+            return Err(Error::BadAddress);
+        }
+        Ok(())
+    }
+
+    fn set_huge_with(&mut self, gpa: u64, hpa: u64, bits: u64) -> Result<()> {
         if gpa % HUGE_BYTES != 0 || hpa % HUGE_BYTES != 0 || hpa & !ADDRESS != 0 {
             return Err(Error::BadAddress);
         }
@@ -232,7 +282,7 @@ impl Ept {
             Some(0) => {}
             _ => return Err(Error::BadAddress),
         }
-        if !page.store::<u64>(i * ENTRY_BYTES, hpa | HUGE_PAGE) {
+        if !page.store::<u64>(i * ENTRY_BYTES, hpa | bits) {
             return Err(Error::BadAddress);
         }
         self.tables[dir].next[i] = LEAF;

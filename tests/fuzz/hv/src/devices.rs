@@ -3,6 +3,8 @@
 
 #[path = "../../../../src/crates/hypervisor/hv/src/devices/blk.rs"]
 pub mod blk;
+#[path = "../../../../src/crates/hypervisor/hv/src/devices/host.rs"]
+pub mod host;
 #[path = "../../../../src/crates/hypervisor/hv/src/devices/ioapic.rs"]
 pub mod ioapic;
 #[path = "../../../../src/crates/hypervisor/hv/src/devices/net.rs"]
