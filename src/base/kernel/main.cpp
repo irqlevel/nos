@@ -487,6 +487,10 @@ extern "C" void rust_ipc_stop();
 /* The disk log is Rust (src/crates/layers/block/src/disklog.rs). */
 extern "C" int rust_disklog_setup();
 extern "C" void rust_disklog_stop();
+/* The AHCI HBAs' error-handling tasks (src/crates/drivers/block/ahci): started
+   once tasks run, stopped once nothing but the halt's flush writes a disk */
+extern "C" void rust_ahci_start();
+extern "C" void rust_ahci_stop();
 extern "C" void rust_test();
 
 /* The random pool is Rust (src/crates/base/random): seeded at boot from what the
@@ -759,6 +763,7 @@ void bp_startup(void* ctx)
            the same reason the log area is: until the soft IRQ layer exists a
            block read returns without having read anything, so a probe there
            would find no partitions and cache that as the answer. */
+        rust_ahci_start();
         rust_partitions_probe();
 
         /* The root filesystem may well be on one of those disks */
@@ -875,6 +880,10 @@ void bp_startup(void* ctx)
            the log switches off -- after SoftIrq::stop() a write through a
            virtio disk would wait for ever. */
         rust_disklog_stop();
+
+        /* The AHCI disks' error handling with it: the halt's flush and
+           standby wait by polling, interrupts off */
+        rust_ahci_stop();
 
         /* The netconsole after all of them: on a machine whose only console
            is the network it carries the halt's own lines -- a module's exit
