@@ -336,6 +336,8 @@ fn find_entry(file: &mut dyn ReadAt, offset: u64, len: u64, align: u64) -> Resul
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
     pub mem_bytes: u64,
+    /// Where its RAM below 4 GiB ends, as `linux::Layout`'s.
+    pub low_end: u64,
     /// Where the initrd goes, and how long it is; 0 when there is none.
     pub initrd_addr: u64,
     pub initrd_len: u64,
@@ -347,7 +349,13 @@ pub struct Layout {
 /// all of it in the RAM below 4 GiB ([`linux::Ram`]), which is all a PVH
 /// entry's 32 bits with paging off reach.
 pub fn plan(image: &Image, mem_bytes: u64, initrd_len: u64) -> Result<Layout> {
-    let low = linux::Ram::of(mem_bytes).low;
+    plan_below(image, mem_bytes, linux::LOW_RAM_END, initrd_len)
+}
+
+/// [`plan`] for a guest whose RAM below 4 GiB ends at `low_end`
+/// (`linux::Ram::of_below`).
+pub fn plan_below(image: &Image, mem_bytes: u64, low_end: u64, initrd_len: u64) -> Result<Layout> {
+    let low = linux::Ram::of_below(mem_bytes, low_end).low;
     for s in image.segments() {
         /* Below 1 MiB are the start info, the command line, the MP table
          * and the ACPI tables this writes; past the end, nothing at all. */
@@ -364,7 +372,7 @@ pub fn plan(image: &Image, mem_bytes: u64, initrd_len: u64) -> Result<Layout> {
         }
         (addr, initrd_len)
     };
-    Ok(Layout { mem_bytes, initrd_addr, initrd_len })
+    Ok(Layout { mem_bytes, low_end, initrd_addr, initrd_len })
 }
 
 fn round_up(v: u64, to: u64) -> Option<u64> {
@@ -404,7 +412,7 @@ pub fn build(
     }
 
     let mut map = [linux::E820Entry::default(); linux::E820_ENTRIES];
-    let n = linux::e820_entries(layout.mem_bytes, firmware, &mut map)?;
+    let n = linux::e820_entries(layout.mem_bytes, layout.low_end, firmware, &mut map)?;
     for (i, e) in map[..n].iter().enumerate() {
         let mut entry = [0u8; MEMMAP_ENTRY_BYTES];
         entry[0..8].copy_from_slice(&e.addr.to_le_bytes());

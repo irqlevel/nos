@@ -151,6 +151,7 @@ mod dirtymodel;
 mod fwmodel;
 mod guestnet;
 mod handovermodel;
+mod hostmodel;
 mod migwiremodel;
 mod netrx;
 mod offloadmodel;
