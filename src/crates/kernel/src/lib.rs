@@ -52,6 +52,7 @@ pub extern "C" fn rust_init() {
     crc32::init();
     nvme::init();
     ata::init();
+    ahci::init();
     usb::init();
     virtio_rng::init();
     virtio_blk::init();
@@ -169,6 +170,7 @@ pub extern "C" fn rust_test() {
 pub extern "C" fn rust_fini() {
     nvme::shutdown();
     ata::shutdown();
+    ahci::shutdown();
     r8168::shutdown();
     r8125::shutdown();
     igb::shutdown();
