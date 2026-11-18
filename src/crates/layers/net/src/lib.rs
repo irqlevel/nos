@@ -56,6 +56,12 @@ pub fn register<D: NetDriver>(
     device::DEVICES.register(name, mac, driver, tx, rx).map(Nic::of)
 }
 
+/// The name the next NIC registers by: the lowest `ethN` no device has yet
+/// (`DeviceTable::free_eth_name`).
+pub fn free_eth_name(buf: &mut [u8; device::ETH_NAME_MAX]) -> Option<&str> {
+    device::DEVICES.free_eth_name(buf)
+}
+
 /// Put the layer's commands in front of whoever runs one. Called from
 /// `rust_init`, before the shell starts.
 pub fn init() {

@@ -36,6 +36,10 @@ use crate::wire::{eth, ip, udp, Mac, ETH_HDR_LEN, ETH_TYPE_ARP, ETH_TYPE_IP,
 
 pub const MAX_DEVICES: usize = 16;
 const NAME_MAX: usize = 32;
+/// The longest name `DeviceTable::free_eth_name` hands out: `eth` and the
+/// two digits a table of MAX_DEVICES needs.
+pub const ETH_NAME_MAX: usize = 5;
+const _: () = assert!(MAX_DEVICES <= 100 && ETH_NAME_MAX < NAME_MAX);
 
 const TX_CAPACITY: usize = 256;
 const RX_CAPACITY: usize = 256;
@@ -1332,6 +1336,40 @@ impl DeviceTable {
     /// Whether a device is called `name`.
     fn named(&'static self, name: &str) -> bool {
         self.devices[..self.count()].iter().any(|dev| dev.name() == name.as_bytes())
+    }
+
+    /// The lowest `ethN` no device in the table is called yet, written into
+    /// `buf`: the name a NIC driver registers under. Asked of the table, not
+    /// of a count of the driver's own, which is what keeps a machine with
+    /// two kinds of NIC from having both claim `eth0` -- the second refused
+    /// by `register` and the card missing. Boot registers one driver at a
+    /// time, so the name is still free when the driver registers with it.
+    /// None when every `ethN` the table could hold is taken.
+    pub fn free_eth_name<'b>(&'static self, buf: &'b mut [u8; ETH_NAME_MAX]) -> Option<&'b str> {
+        let mut found = None;
+        for n in 0..MAX_DEVICES {
+            let len = Self::eth_name(buf, n);
+            let taken = self.devices[..self.count()].iter().any(|dev| dev.name() == &buf[..len]);
+            if !taken {
+                found = Some(len);
+                break;
+            }
+        }
+        core::str::from_utf8(&buf[..found?]).ok()
+    }
+
+    /// `ethN` into `buf`, N in decimal; its length.
+    fn eth_name(buf: &mut [u8; ETH_NAME_MAX], n: usize) -> usize {
+        const PREFIX: &[u8] = b"eth";
+        const DECIMAL: usize = 10;
+        buf[..PREFIX.len()].copy_from_slice(PREFIX);
+        let mut len = PREFIX.len();
+        if n >= DECIMAL {
+            buf[len] = b'0' + (n / DECIMAL % DECIMAL) as u8;
+            len += 1;
+        }
+        buf[len] = b'0' + (n % DECIMAL) as u8;
+        len + 1
     }
 
     /// Whether `register` would take a device called `name` now: a name

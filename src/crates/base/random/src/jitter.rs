@@ -10,7 +10,7 @@
 //! number on -- see docs/random.md. It fails rather than returning biased
 //! bytes when the counter is too coarse to show any variance at all.
 
-use kcore::time::cycle_counter;
+use kcore::time::{cycle_counter, cycle_counter_serialized};
 use kcore::klog;
 
 use crate::Source;
@@ -95,7 +95,9 @@ impl Walk {
 
     /// The low bit of how long one walk took
     fn sample(&mut self) -> u32 {
-        let t0 = cycle_counter();
+        /* Serialized reads: a plain RDTSC waits on nothing the walk does,
+         * and may be taken before the walk has run. */
+        let t0 = cycle_counter_serialized();
 
         /* A dependent read-modify-write walk, one cache line per step, with
          * a trip count that depends on the state the previous measurement
@@ -108,7 +110,7 @@ impl Walk {
             idx = (idx + STRIDE_WORDS) & SCRATCH_MASK;
         }
 
-        let t1 = cycle_counter();
+        let t1 = cycle_counter_serialized();
         let delta = t1.wrapping_sub(t0);
 
         /* Fold the measurement back in, so the next walk takes a different

@@ -9,4 +9,7 @@ unsafe extern "C" {
     /// The cycle counter as it stands -- the TSC, the generic timer's
     /// virtual count
     pub safe fn kernel_read_cycle_counter() -> u64;
+    /// The same, read once every instruction before it has finished and
+    /// before any after it starts
+    pub safe fn kernel_read_cycle_counter_serialized() -> u64;
 }

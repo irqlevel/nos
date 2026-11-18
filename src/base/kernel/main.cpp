@@ -475,6 +475,8 @@ extern "C" void kernel_blockdev_set_interrupts_started();
 /* The filesystem layer is Rust (src/crates/layers/fs): what boot mounts where, and
    taking it all down again on the way out. */
 extern "C" void rust_mount_root_fs();
+/* The random pool's seed kept on the root filesystem (src/crates/kernel/src/seed.rs) */
+extern "C" void rust_random_seed_from_root();
 extern "C" void kernel_vfs_unmount_all();
 extern "C" void rust_mgmt_stop();
 /* The message channel is Rust (src/crates/layers/ipc): at the halt, after the
@@ -760,6 +762,11 @@ void bp_startup(void* ctx)
 
         /* The root filesystem may well be on one of those disks */
         rust_mount_root_fs();
+
+        /* The pool's sources asked again, every CPU up and interrupts
+           coming, and the seed the last boot kept on the root: before
+           /etc/rc starts anything that wants keys */
+        rust_random_seed_from_root();
 
         /* Here, and not earlier: a block request is completed through the
            BLK_IO soft IRQ, so until the line above a read returns without

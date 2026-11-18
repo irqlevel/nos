@@ -218,6 +218,8 @@ swallowing panic messages whole.
 | `wx-test.sh [--arch x86_64\|aarch64]` | both | a mapping path |
 | `panic-test.sh [--arch x86_64\|aarch64]` | both | the panic path, `panic=N`, a reset; a panic off a task's stack (x86's double fault), its report through the netconsole; a task's stack run out |
 | `parttest.py [--arch aarch64\|x86_64]` | both | the block layer, the partition tables |
+| `random-seed-test.py [--iso nos-test.iso]` | x86-64, from `nos-test.iso` | the random pool's seed kept on the root (`src/crates/kernel/src/seed.rs`, `random::restore_seed`), the jitter collector asked again after the root is mounted, `nos-install`'s `put_seed`: a Westmere under TCG -- no RDRAND, no jitter -- seeded by its kept seed, which is 64 new bytes when it is off; with none and nothing else, unseeded and nothing made up; with a virtio-rng, a seed kept; a file of the wrong size not taken |
+| `ata-test.py [--iso nos-test.iso]` | x86-64, from `nos-test.iso` | `drivers/block/ata`: SATA in IDE mode and parallel ATA behind a PCI IDE controller -- four positions on two channels, a 3 TiB disk's sectors past 2^32 read and written where they were meant and nowhere else, an ext4 made, written and held to e2fsck, a CD passed over, a GPT disk beside them found and left alone |
 | `ext2-test.py` | arm64 | ext2, the halt |
 | `poweroff-test.py` | x86-64, by hand | the halt on x86-64: the sleep type `poweroff` asks for (`Acpi::parse_dsdt`, `hal::power_off`) |
 | `halt-test.py [--arch aarch64\|x86_64]` | both; x86-64 from `nos-test.iso` | the halt's order: the modules unloaded before the shells are stopped (`ModuleTable::unload_all`, the two `main`s) |
@@ -282,6 +284,7 @@ how it works and what it found.
 | the editor: `src/crates/common/text/edit`, `modules/tools/edit`; the terminal a session lends the command it runs -- the pty-req's and window-changes' size in `ssh`, `Output::terminal`, `kernel_printer_terminal` | `edit-test.py` (host, in CI): the crate run as the module runs it, on a terminal of the test's own that does what xterm does -- key sessions held to what they leave in the file, at the cursor and on the screen; files read and saved back byte for byte; random sessions after every key of which the editor keeps its promises and the terminal has had nothing it would wrap, scroll or not know, the screen drawn a row at a time what a full redraw draws, and undoing everything the file as it was read. Then `sshd-test.py` (arm64), whose editor phase types at `edit` through `ssh -t` on a pty of its own: drawn at the pty's size, saved, a file changed meanwhile asked about, a resize drawn again whole, `<file>.save` when the connection goes; and `net-fuzz.py`, whose `term` command is told the size its client gave and changed |
 | the receive path, the frame pool, `modules/net/netload`, a module's UDP listener in `kcore::net`, the tick's receive poll (`rxpoll`) | `netload-test.py` (arm64; about seven minutes, by design), and `--arch x86_64`, its short form, after touching the module ABI |
 | `drivers/net/igb`, the driver seam in `layers/net/src/device.rs` | `tcp-test.py --nic igb` and `netload-test.py --nic igb`: QEMU's 82576, the only way a hardware NIC driver runs anywhere but on a Hetzner box (QEMU 8.0 or later; CI's does not have it, so by hand) |
+| `drivers/net/e1000e` (the 82574L), the net layer's `free_eth_name` | `sshd-test.py --arch x86_64 --nic e1000e` (a login and SFTP both ways over the card), `tcp-test.py --nic e1000e` and `netload-test.py --nic e1000e`: QEMU's 82574L model, by hand; two of them as a server board has them (`-machine q35`, each behind a `pcie-root-port`, the second's link off) for the names, by hand -- see [The hardware NIC drivers](#the-hardware-nic-drivers) |
 | `drivers/usb/` | `usb-test.py` (x86-64): types at the kernel through QEMU's monitor |
 | PCI config space and the scan (`drivers/pci.cpp`: a word or a byte written by itself -- `hal::pci_config_write16/8`, the port's own byte on x86-64, the field's address in the ECAM on arm64 -- functions past the first only where function 0 says there are any, the table of devices), an MSI-X table (`drivers/msix.cpp`, `arch/arm64/msix_its.cpp`: where the table is in a BAR somebody mapped, held to the mapping's length by `PageTable::mmio_mapped_span`; an entry enabled again given its new handler; x86-64's vectors taken and given back), `Its::map_event` and `rebind_event`, `Idt::set_descriptor` (a live entry is written whole in one store, its upper half the same for every handler -- a BUG_ON otherwise) | the smoke boots: on x86-64 every disk and the NIC are PCI devices found by the scan, bus mastering and MSI-X turned on by word writes, the NVMe and the modern virtio devices on MSI-X vectors -- and by hand under `-machine q35`, and with a device of two functions (`-device virtio-rng-pci,addr=6.0,multifunction=on -device virtio-rng-pci,addr=6.1`), `pci` listing both. arm64 has no PCI device in any gate: by hand, a boot with `-device nvme` under HVF and under TCG -- the two take a word's store to the ECAM by different paths -- with the ITS -- the controller found, bus mastering and MSI-X turned on by word writes, its vector registered and its namespace a block device -- and with `its=off`, where the table is refused, the driver says it has no MSI-X and leaves the device, and the boot goes on. `cpp-fuzz.py --target pagetable` holds `mmio_mapped_span` to its mappings. A table's destructor and an entry enabled twice are run by no gate: the drivers never let go of a table |
 | a device's line interrupt: `Interrupt::register_level` and `unregister_level` (`kernel/interrupt.cpp`, `arch/arm64/interrupt_arm64.cpp`), the IO-APIC's pins (`arch/x86_64/ioapic.cpp`), `Gic::disable_irq`, the drivers' slots (`kernel_interrupt_register_level`, `kernel_interrupt_unregister`) | the smoke boots, both arches (`test_irq_line_unregister`: two handlers share a spare line, the first leaves, a third joins, all leave and the vector is free, four times over -- on x86 under QEMU alone, told by the firmware's OEM id, since a real IO-APIC's pin that nothing drives may be held asserted; the x86 boot's legacy virtio-scsi is on a line of its own) |
@@ -390,6 +393,43 @@ the id a VM's vm.toml names it by: a GPT partition its unique GUID as Linux
 writes a PARTUUID, an MBR one its disk signature and number. The smoke
 disks carry no partition table at all, so nothing else reaches this code.
 
+### `random-seed-test.py` -- the pool's seed, kept on the root
+
+`make nos-test.iso TEST_ISO_ARGS=udpshell=9100`, then `tests/random-seed-test.py`. TCG's
+`-cpu Westmere` is the ASUS RS500 as far as randomness goes: no RDRAND, and a
+cycle counter that gives the jitter collector nothing. Four boots, each with
+a root on an IDE disk of its own: a seed kept on it has to seed the pool --
+`entropy` seeded, `random` answering -- and the file has to hold 64 new bytes
+when the machine is off, never the ones it booted with; with no seed and
+nothing else the pool has to stay unseeded, say why, `random` refuse, and no
+seed be made up for the next boot; with a virtio-rng a seed has to be kept;
+and a file of the wrong size is not taken, and left as it was. A host whose
+TCG does give the jitter collector variance has the two unseeded cases
+skipped, and says so ([Randomness](random.md)).
+
+### `ata-test.py` -- SATA in IDE mode, every sector where it was meant
+
+`make nos-test.iso TEST_ISO_ARGS=udpshell=9100`, then `tests/ata-test.py`.
+QEMU's `pc` machine gives the kernel a PIIX3: an IDE controller in
+compatibility mode, four positions on two channels, laid out as the ASUS
+RS500's ICH10R has its disks in IDE mode ([Real hardware](real-hardware.md)):
+a 3 TiB disk at the primary master that says it spins at 7200 rpm with 4 KiB
+physical sectors behind 512-byte ones, an SSD at the primary slave, the CD
+the test boots from at the secondary master, and a GPT disk at the
+secondary slave. A driver that sets the wrong device bit writes the disk
+beside the one asked for, and one that drops an address's high byte writes
+2 TiB lower; both read back what they wrote and look like a working disk.
+So the host marks sectors of the big disk on both sides of 2^28 and 2^32
+and its last; the kernel has to read every one back as marked, and writes
+three more, which the host then finds changed with their neighbours and the
+marks not, and -- by the image's data extents -- nothing else of the 3 TiB
+written at all. The SSD is formatted ext4 by the shell's `format`, written
+and unmounted, and has to be clean to `e2fsck -fn` with its files in it; the
+CD has to be passed over as a packet device; the GPT disk's partitions have
+to be found and not one byte of it changed; and the machine has to power
+itself off, its disks' caches flushed. The pool is seeded by a virtio-rng:
+under TCG nothing else seeds it, and `format` will not make a UUID without.
+
 ### `ext2-test.py` -- ext2, judged by `e2fsck`
 
 Works the ext2 root filesystem from the shell -- files made, grown past
@@ -450,8 +490,13 @@ with no gap in the numbers: the unmount, which comes after every module has
 gone -- a module's exit may wait minutes for guests to turn themselves off,
 which on a machine with no other console nothing else would show -- and the
 netconsole's own last line, traced as it stops and sent by the flush its
-drain does on the way out. On the two Hetzner machines netconsole is the
-only console there is. See [Netconsole](netconsole.md).
+drain does on the way out. A third boot is on a network that hands out no
+address -- the ASUS box's, whose Linux is configured by hand: eth0's
+address, gateway and resolver come off the command line (`ip=`, `gw=`,
+`dns=`), `dhcp=auto` on the same line has to leave them alone, and the log
+has to reach the collector with no lease ever asked for, `net` showing the
+address and the way off the subnet. On the Hetzner machines netconsole is
+the only console there is. See [Netconsole](netconsole.md).
 
 ### `tcp-test.py` -- the connecting side of TCP
 
@@ -821,7 +866,7 @@ UDP. It checks what differs between the architectures rather than what does
 not: that the module loads and binds there, that its calls across the C ABI
 come back right where the ABI is the other one -- two of them return a
 structure by value -- and that the target echoes and the source's run
-arrives whole. Both forms take `--nic igb`.
+arrives whole. Both forms take `--nic igb` and `--nic e1000e`.
 
 ### `idle-wait-test.py` -- a wait that costs a tick
 
@@ -4862,6 +4907,21 @@ three hardware NIC drivers runs anywhere but on a Hetzner box -- MSI-X with
 two vectors, the descriptor rings, the receive poll and its interrupt
 throttle -- so run `tcp-test.py --nic igb` and `netload-test.py --nic igb`
 after touching `drivers/net/igb` or the driver seam in `layers/net/src/device.rs`.
+
+`--nic e1000e` does the same with QEMU's 82574L, which the `e1000e` driver
+claims -- the part a server board of its age has two of -- and
+`sshd-test.py --arch x86_64` takes it too, which is a login and SFTP both
+ways over the card. Run them after touching `drivers/net/e1000e`. One thing
+the model does not show as the silicon would: IAM, which the driver writes so
+that the queue causes are masked as their message goes, reads back 0 from it
+(`e1000edump`), so that masking is not something a QEMU run can say it saw --
+the re-arming at the poll's end runs either way. What it does model -- MSI-X
+by IVAR and EIAC, the legacy rings, the PHY behind MDIC and the 82574's MDIO
+semaphore -- is the rest of what the driver uses. The
+names a box with two of them gets are checked by hand: `-machine q35`, each
+card behind its own `pcie-root-port`, the second's link off by the monitor's
+`set_link` before the guest runs -- the card at the lower address is `eth0`,
+whatever its link, as on the server the driver was written for.
 
 `r8168` and `r8125` have no emulation at all. A change to either is checked
 by the compiler and then on the EX44, whose only console is that NIC: a

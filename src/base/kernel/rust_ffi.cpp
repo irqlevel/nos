@@ -379,6 +379,13 @@ unsigned long long kernel_read_cycle_counter()
     return hal::read_cycle_counter();
 }
 
+/* The same, read after every instruction before it and before any after it:
+   what the jitter collector times its walk by */
+unsigned long long kernel_read_cycle_counter_serialized()
+{
+    return hal::read_cycle_counter_serialized();
+}
+
 unsigned long kernel_get_wall_time_secs()
 {
     return kernel::get_wall_time_secs();
@@ -2709,6 +2716,29 @@ int kernel_param_dhcp_off()
 int kernel_param_dns_on()
 {
     return kernel::Parameters::get_instance().is_dns_enabled() ? 1 : 0;
+}
+
+/* dns=A.B.C.D: the resolver's server, given; 0 when none was. */
+unsigned int kernel_param_dns_server()
+{
+    return kernel::Parameters::get_instance().get_dns_server();
+}
+
+/* ip=A.B.C.D/N and gw=A.B.C.D: eth0's static address, its mask and its
+   gateway, host byte order; 0 for each that was not given. */
+unsigned int kernel_param_static_ip()
+{
+    return kernel::Parameters::get_instance().get_static_ip();
+}
+
+unsigned int kernel_param_static_mask()
+{
+    return kernel::Parameters::get_instance().get_static_mask();
+}
+
+unsigned int kernel_param_static_gateway()
+{
+    return kernel::Parameters::get_instance().get_static_gateway();
 }
 
 /* rxpoll=on: the tick's receive poll, which the network layer's

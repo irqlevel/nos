@@ -171,6 +171,22 @@ public:
 
     bool is_dns_enabled();
 
+    /* dns=A.B.C.D -- the resolver's server, given rather than taken from a
+       DHCP lease, and dns=on with it. Host byte order; 0 when none was
+       given, and then a lease's is used (dns=on). */
+    u32 get_dns_server();
+
+    /* ip=A.B.C.D/N -- a static address on eth0 and its prefix length, for
+       a network that hands out none by DHCP: put on the device as the
+       network's services start, before the netconsole sends a line, and
+       dhcp=auto then leaves eth0 alone. gw=A.B.C.D -- the default gateway,
+       which has to be on that subnet: one that is not, or one given without
+       an address, is named in the log and dropped. Host byte order; 0 when
+       not given. */
+    u32 get_static_ip();
+    u32 get_static_mask();
+    u32 get_static_gateway();
+
     /* root=auto | <device> | LABEL=<label> | UUID=<uuid>: what to mount on /
        (see fs/rootfs.cpp). Value holds the device name or label; Uuid the
        parsed UUID. */
@@ -274,6 +290,10 @@ private:
     bool rx_poll_;
     int log_level_;
     bool dns_enabled_;
+    u32 dns_server_;
+    u32 static_ip_;
+    u32 static_mask_;
+    u32 static_gw_;
     RootSpec root_;
     bool root_read_only_;
     bool fs_test_;
@@ -283,5 +303,7 @@ private:
 
     static bool parse_uuid(const char* text, u8* out);
     bool parse_huge_pool(const char* value);
+    bool parse_static_ip(const char* value);
+    void check_static_gateway();
 };
 }

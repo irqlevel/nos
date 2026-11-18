@@ -337,7 +337,7 @@ its rings as `type Tx` / `type Rx`.
   `virtio::Queue::take_used`, whose comment spells it out, nvme `read_cqe`
   and r8168 `harvest`.
 
-`igb` is the only one of the three hardware NIC drivers that runs in QEMU
-(`--nic igb`, see [Tests and gates](testing.md#the-hardware-nic-drivers));
+`igb` and `e1000e` are the two of the four hardware NIC drivers that run in
+QEMU (`--nic igb`, `--nic e1000e`, see [Tests and gates](testing.md#the-hardware-nic-drivers));
 `r8168` and `r8125` have no emulation at all, so keep their register
 sequences as they are.
