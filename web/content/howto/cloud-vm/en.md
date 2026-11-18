@@ -90,9 +90,9 @@ See what it made:
 $ hv vms
 debian  not running  hvboot  1024 MiB  1 cpu  disks disk.raw, seed.iso:ro  net  forward 2201:22  restart
 $ ls /vms/debian
-f 8589934592 disk.raw
-f 65536 seed.iso
-f 228 vm.toml
+f  8589934592  disk.raw
+f       65536  seed.iso
+f         228  vm.toml
 $ cat /vms/debian/vm.toml
 # A VM of nos's hypervisor: hv start <this folder's name> boots it (docs/hypervisor.md)
 kernel = "/lib/hvboot"

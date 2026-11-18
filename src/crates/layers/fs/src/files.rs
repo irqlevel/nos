@@ -60,19 +60,42 @@ pub fn list_dir(path: &str, out: &mut Output) -> bool {
         return false;
     }
 
+    /* A file's size right-aligned to the widest, every name in one column:
+     * the directory looked through for the width first, then listed -- a
+     * walk each, nothing of it kept between them, so one that changes
+     * meanwhile is listed as it is then, its sizes perhaps a digit off */
+    let mut width = 0;
+    let mut index = 0;
+    while let Some(entry) = vfs.read_dir(path.as_bytes(), index) {
+        index += 1;
+        if entry.kind == Kind::File {
+            width = width.max(digits(entry.size as u64));
+        }
+    }
+
     let mut index = 0;
     while let Some(entry) = vfs.read_dir(path.as_bytes(), index) {
         index += 1;
 
         let name = core::str::from_utf8(entry.name()).unwrap_or("?");
         if entry.kind == Kind::File {
-            let _ = writeln!(out, "f {} {}", entry.size, name);
+            let _ = writeln!(out, "f  {:>w$}  {}", entry.size, name, w = width);
         } else {
-            let _ = writeln!(out, "d   {}", name);
+            let _ = writeln!(out, "d  {:w$}  {}", "", name, w = width);
         }
     }
 
     true
+}
+
+/// How many decimal digits `n` is written in.
+fn digits(mut n: u64) -> usize {
+    let mut count = 1;
+    while n >= 10 {
+        n /= 10;
+        count += 1;
+    }
+    count
 }
 
 pub fn read_file(path: &str, out: &mut Output) -> bool {
@@ -122,19 +145,28 @@ pub fn dump_mounts(out: &mut Output) {
         None => return,
     };
 
-    for index in 0..vfs.mount_count() {
-        let mount = match vfs.mount_info(index) {
-            Some(mount) => mount,
-            None => continue,
-        };
+    /* Every mount copied at once, then printed with each column as wide as
+     * its widest: the filesystem, its mount point, what the filesystem
+     * says of itself (none of that for a filesystem that says nothing), and
+     * whether it is read-only */
+    let mounts = vfs.mount_infos();
+    let text = |bytes: &[u8]| core::str::from_utf8(bytes).unwrap_or("?").len();
+    let (mut fs_width, mut path_width, mut info_width) = (0, 0, 0);
+    for mount in mounts.iter().flatten() {
+        fs_width = fs_width.max(mount.fs_name.len());
+        path_width = path_width.max(text(mount.path()));
+        info_width = info_width.max(text(mount.info()));
+    }
 
+    for mount in mounts.iter().flatten() {
         let rw = if mount.read_only { "ro" } else { "rw" };
         let path = core::str::from_utf8(mount.path()).unwrap_or("?");
         let info = core::str::from_utf8(mount.info()).unwrap_or("?");
-        if info.is_empty() {
-            let _ = writeln!(out, "{} on {}  {}", mount.fs_name, path, rw);
+        if info_width == 0 {
+            let _ = writeln!(out, "{:<fw$} on {:<pw$}  {}", mount.fs_name, path, rw, fw = fs_width, pw = path_width);
         } else {
-            let _ = writeln!(out, "{} on {}  {}  {}", mount.fs_name, path, info, rw);
+            let _ = writeln!(out, "{:<fw$} on {:<pw$}  {:<iw$}  {}", mount.fs_name, path, info, rw, fw = fs_width,
+                             pw = path_width, iw = info_width);
         }
     }
 }
