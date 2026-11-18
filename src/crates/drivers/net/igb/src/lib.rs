@@ -53,6 +53,7 @@ use kcore::once::Once;
 use kcore::sync::IrqSpinLock;
 use kcore::time::boot_time_ns;
 use kcore::{dma, interrupt, io, msix, pci, softirq, klog};
+use net::device::ETH_NAME_MAX;
 use net::{Frame, FrameQueue, NetDriver, RxQueue, TxQueue};
 
 mod desc;
@@ -173,6 +174,9 @@ struct IgbDevice {
     two_vector: AtomicBool,
     generation: Generation,
     phy_addr: u32,
+    /// What the net layer named it (net::free_eth_name), for the log.
+    name: [u8; ETH_NAME_MAX],
+    name_len: usize,
     /* Set by the interrupt when the link changes, acted on by the poll: the
        work it asks for is a PHY read, which means polling MDIC for
        milliseconds, and that has no business in an interrupt handler. */
@@ -221,6 +225,10 @@ struct IgbDevice {
 impl IgbDevice {
     fn is_msix(&self) -> bool {
         self.msix.load(Ordering::Relaxed)
+    }
+
+    fn name(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("eth?")
     }
 
     /// Go quiet on receive for the duration of a poll.
@@ -857,20 +865,6 @@ fn find_mmio_bar(pci_dev: &pci::PciDevice) -> u64 {
     }
 }
 
-/* "ethN", which is the name every NIC driver here uses and the one the
- * shell's DHCP autostart looks for by name. */
-fn write_device_name(buf: &mut [u8; 16], idx: u32) -> &str {
-    let name = b"eth";
-    let mut i = 0;
-    while i < name.len() {
-        buf[i] = name[i];
-        i += 1;
-    }
-    /* Single digit is enough: MAX_DEVICES is 4. */
-    buf[i] = b'0' + (idx as u8 % 10);
-    core::str::from_utf8(&buf[..i + 1]).unwrap_or("eth?")
-}
-
 /* ================================================================== */
 /* Device initialisation */
 
@@ -1089,8 +1083,17 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     regs.write32(IMC, u32::MAX);
     let _ = regs.read32(ICR);
 
-    let mut name_buf = [0u8; 16];
-    let name = write_device_name(&mut name_buf, idx);
+    /* The lowest ethN nobody has: the net layer's to say, whichever driver
+     * registered before this one */
+    let mut name_buf = [0u8; ETH_NAME_MAX];
+    let name_len = match net::free_eth_name(&mut name_buf) {
+        Some(name) => name.len(),
+        None => {
+            klog!(0, "igb: no ethN name left in the device table");
+            stop_engines(&regs);
+            return;
+        }
+    };
 
     /* For good from here: the interrupt handlers are pointed at the device,
      * and then the net stack is -- with each ring handed over to it, for the
@@ -1103,6 +1106,8 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
             two_vector: AtomicBool::new(false),
             generation,
             phy_addr,
+            name: name_buf,
+            name_len,
             link_event: AtomicU32::new(0),
             rx_view: rx_ring.view(),
             rx_next_to_clean: AtomicU32::new(next_to_clean),
@@ -1140,7 +1145,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
 
     trace_link(&dev.regs);
 
-    if net::register(name, mac, dev, tx_ring, rx_ring).is_none() {
+    if net::register(dev.name(), mac, dev, tx_ring, rx_ring).is_none() {
         klog!(0, "igb: NetDevice registration failed");
         dev.quiesce();
         return;
@@ -1149,7 +1154,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     let _ = DEVICES[idx as usize].set(dev);
     DEVICE_COUNT.store(idx + 1, Ordering::Release);
 
-    klog!(0, "igb: device {} ready ({})", idx, generation.as_str());
+    klog!(0, "igb: device {} ready ({}), {}", idx, generation.as_str(), dev.name());
 }
 
 fn attach_interrupt(pci_dev: &pci::PciDevice, dev: &'static IgbDevice) -> bool {
