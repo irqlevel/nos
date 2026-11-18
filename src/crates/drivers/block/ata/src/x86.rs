@@ -15,9 +15,10 @@ use kcore::sync::Mutex;
 use kcore::time::Deadline;
 
 use ataproto::cmd::{FLUSH_CACHE as CMD_FLUSH, FLUSH_CACHE_EXT as CMD_FLUSH_EXT, IDENTIFY as CMD_IDENTIFY,
-    READ_SECTORS as CMD_READ, READ_SECTORS_EXT as CMD_READ_EXT, WRITE_SECTORS as CMD_WRITE,
-    WRITE_SECTORS_EXT as CMD_WRITE_EXT};
+    READ_SECTORS as CMD_READ, READ_SECTORS_EXT as CMD_READ_EXT, STANDBY_IMMEDIATE as CMD_STANDBY,
+    WRITE_SECTORS as CMD_WRITE, WRITE_SECTORS_EXT as CMD_WRITE_EXT};
 use ataproto::identify::{self, Flush, Identify, Rotation, WORDS};
+use ataproto::MAX_UNFINISHED;
 
 /* ---- PCI ---- */
 
@@ -104,6 +105,8 @@ const COMMAND_MS: u64 = 31_000;
 /// places, seek after seek.
 const FLUSH_MS: u64 = 60_000;
 const RESET_MS: u64 = 31_000;
+/// An HDD spinning down takes seconds.
+const STANDBY_MS: u64 = 31_000;
 /// SRST held this long (at least 5 us), and BSY not believed for this long
 /// after (2 ms).
 const SRST_HOLD_US: u64 = 10;
@@ -285,18 +288,20 @@ impl Regs {
         self.read(REG_COUNT) == TEST_COUNT && self.read(REG_LBA0) == TEST_LBA0
     }
 
-    /// Both devices on the channel reset, and each found before waited for:
-    /// a position with nothing at it would hold BSY up for good.
-    fn reset(&self, present: [bool; POSITIONS_PER_CHANNEL]) -> Result<(), Fault> {
+    /// Both devices on the channel reset -- SRST is the channel's -- and each
+    /// of `waited` waited for: a position with nothing at it, or with a
+    /// device given up on, would hold BSY up for the whole of a reset's time.
+    /// Which position did not come back, and how, where one did not.
+    fn reset(&self, waited: [bool; POSITIONS_PER_CHANNEL]) -> Result<(), (usize, Fault)> {
         self.control(CTL_NIEN | CTL_SRST);
         self.delay_us(SRST_HOLD_US);
         self.control(CTL_NIEN);
         self.delay_us(AFTER_RESET_US);
-        for (slave, &there) in [false, true].iter().zip(present.iter()) {
+        for (position, (slave, &there)) in [false, true].iter().zip(waited.iter()).enumerate() {
             if there {
                 self.write(REG_DEVICE, DEV_BASE | if *slave { DEV_SLAVE } else { 0 });
                 self.settle();
-                self.wait_idle(RESET_MS)?;
+                self.wait_idle(RESET_MS).map_err(|fault| (position, fault))?;
             }
         }
         Ok(())
@@ -335,13 +340,39 @@ struct Where {
     channel: u8,
 }
 
+/// What a channel's lock owns: its registers, and how each of its two
+/// devices is doing -- a reset is the channel's, so whether one of them has
+/// been given up on is what a reset for the other one asks.
+struct ChannelState {
+    regs: Regs,
+    /// Per position: commands in a row that did not finish.
+    unfinished: [u32; POSITIONS_PER_CHANNEL],
+    /// Per position: given up on, every request refused.
+    failed: [bool; POSITIONS_PER_CHANNEL],
+}
+
 struct Channel {
-    regs: Mutex<Regs>,
+    state: Mutex<ChannelState>,
     at: Where,
     /// The positions that answered at bring-up: what a reset waits for --
     /// one with nothing at it would hold BSY up for the whole of a reset's
     /// time.
     present: [bool; POSITIONS_PER_CHANNEL],
+}
+
+impl Channel {
+    /// The device at `position` failed for good: said once, and refused from
+    /// here on -- by its disk, and by the channel's resets, which wait for it
+    /// no more.
+    fn give_up(&self, state: &mut ChannelState, position: usize, why: &str) {
+        if state.failed[position] {
+            return;
+        }
+        state.failed[position] = true;
+        let at = self.at;
+        klog!(0, "ata: {:02x}:{:02x}.{} channel {} {}: {}: the disk is failed, and every request of it refused from \
+                  here on", at.bus, at.slot, at.func, at.channel, if position == 0 { "master" } else { "slave" }, why);
+    }
 }
 
 struct AtaDisk {
@@ -425,22 +456,62 @@ impl AtaDisk {
         regs.finish(COMMAND_MS)
     }
 
-    /// A command that failed, said with all there is to say of it, and the
-    /// channel reset so that the next one starts from a device that is not
-    /// halfway through this one.
-    fn failed(&self, regs: &Regs, what: &str, lba: u64, count: u64, fault: Fault) {
+    /// Its place on the channel: 0 the master, 1 the slave.
+    fn position(&self) -> usize {
+        usize::from(self.slave)
+    }
+
+    /// What a command came to, taken in: done, the device's run of commands
+    /// that did not finish ends; failed, it is said with all there is to say
+    /// of it and the channel reset, so that the next command starts from a
+    /// device that is not halfway through this one -- and a device that does
+    /// not come back from the reset, or that has not finished MAX_UNFINISHED
+    /// commands running, is given up on. Whether the command went through.
+    fn outcome(&self, state: &mut ChannelState, what: &str, lba: u64, count: u64, result: Result<(), Fault>)
+        -> bool
+    {
+        let me = self.position();
+        let fault = match result {
+            Ok(()) => {
+                state.unfinished[me] = 0;
+                return true;
+            }
+            Err(fault) => fault,
+        };
         let at = self.channel.at;
         match fault {
-            Fault::Timeout { status } => klog!(0,
-                "ata: {} ({:02x}:{:02x}.{} channel {}): {} of {} sectors at {} timed out, status {:#04x}",
-                self.name(), at.bus, at.slot, at.func, at.channel, what, count, lba, status),
-            Fault::Device { status, error } => klog!(0,
-                "ata: {} ({:02x}:{:02x}.{} channel {}): {} of {} sectors at {} failed, status {:#04x} error {:#04x}",
-                self.name(), at.bus, at.slot, at.func, at.channel, what, count, lba, status, error),
+            Fault::Timeout { status } => {
+                klog!(0, "ata: {} ({:02x}:{:02x}.{} channel {}): {} of {} sectors at {} timed out, status {:#04x}",
+                    self.name(), at.bus, at.slot, at.func, at.channel, what, count, lba, status);
+                state.unfinished[me] += 1;
+            }
+            Fault::Device { status, error } => {
+                klog!(0, "ata: {} ({:02x}:{:02x}.{} channel {}): {} of {} sectors at {} failed, status {:#04x} \
+                          error {:#04x}", self.name(), at.bus, at.slot, at.func, at.channel, what, count, lba, status,
+                    error);
+                /* The device answered: it is there */
+                state.unfinished[me] = 0;
+            }
         }
-        if let Err(fault) = regs.reset(self.channel.present) {
-            klog!(0, "ata: {}: the channel did not come back from a reset: {:?}", self.name(), fault);
+        let present = self.channel.present;
+        let waited = [present[0] && !state.failed[0], present[1] && !state.failed[1]];
+        match state.regs.reset(waited) {
+            Ok(()) => {
+                if state.unfinished[me] >= MAX_UNFINISHED {
+                    self.channel.give_up(state, me, "commands in a row did not finish");
+                }
+            }
+            Err((position, fault)) => {
+                let why = match fault {
+                    Fault::Timeout { status } => alloc::format!("busy after a reset, status {:#04x}", status),
+                    Fault::Device { status, error } => {
+                        alloc::format!("came back from a reset failed, status {:#04x} error {:#04x}", status, error)
+                    }
+                };
+                self.channel.give_up(state, position, &why);
+            }
         }
+        false
     }
 
     fn read_sectors(&self, lba: u64, buf: &mut [u8]) -> bool {
@@ -449,12 +520,15 @@ impl AtaDisk {
             klog!(0, "ata: {}: a read of {} bytes at {} is none this disk takes", self.name(), buf.len(), lba);
             return false;
         }
-        let regs = self.channel.regs.lock();
+        let mut state = self.channel.state.lock();
+        if state.failed[self.position()] {
+            return false;
+        }
         let mut at = lba;
         for chunk in buf.chunks_mut(MAX_SECTORS_PER_COMMAND as usize * size) {
             let count = (chunk.len() / size) as u64;
-            if let Err(fault) = self.pio_in(&regs, at, count, chunk) {
-                self.failed(&regs, "read", at, count, fault);
+            let result = self.pio_in(&state.regs, at, count, chunk);
+            if !self.outcome(&mut state, "read", at, count, result) {
                 return false;
             }
             at += count;
@@ -468,12 +542,15 @@ impl AtaDisk {
             klog!(0, "ata: {}: a write of {} bytes at {} is none this disk takes", self.name(), data.len(), lba);
             return false;
         }
-        let regs = self.channel.regs.lock();
+        let mut state = self.channel.state.lock();
+        if state.failed[self.position()] {
+            return false;
+        }
         let mut at = lba;
         for chunk in data.chunks(MAX_SECTORS_PER_COMMAND as usize * size) {
             let count = (chunk.len() / size) as u64;
-            if let Err(fault) = self.pio_out(&regs, at, count, chunk) {
-                self.failed(&regs, "write", at, count, fault);
+            let result = self.pio_out(&state.regs, at, count, chunk);
+            if !self.outcome(&mut state, "write", at, count, result) {
                 return false;
             }
             at += count;
@@ -481,25 +558,37 @@ impl AtaDisk {
         true
     }
 
+    /// A command that moves nothing -- a flush, a standby -- issued and
+    /// taken in as every command is.
+    fn non_data(&self, command: u8, what: &str, ms: u64) -> bool {
+        let mut state = self.channel.state.lock();
+        if state.failed[self.position()] {
+            return false;
+        }
+        let regs = &state.regs;
+        let result = regs.select(self.slave).and_then(|()| {
+            regs.write(REG_COMMAND, command);
+            regs.finish(ms)
+        });
+        self.outcome(&mut state, what, 0, 0, result)
+    }
+
     /// The write cache pushed out, where the disk has a command for it.
     fn flush_cache(&self) -> bool {
-        let command = match self.id.flush {
-            Flush::None => return true,
-            Flush::Flush => CMD_FLUSH,
-            Flush::FlushExt => CMD_FLUSH_EXT,
-        };
-        let regs = self.channel.regs.lock();
-        let done = regs.select(self.slave).and_then(|()| {
-            regs.write(REG_COMMAND, command);
-            regs.finish(FLUSH_MS)
-        });
-        match done {
-            Ok(()) => true,
-            Err(fault) => {
-                self.failed(&regs, "flush", 0, 0, fault);
-                false
-            }
+        match self.id.flush {
+            Flush::None => true,
+            Flush::Flush => self.non_data(CMD_FLUSH, "flush", FLUSH_MS),
+            Flush::FlushExt => self.non_data(CMD_FLUSH_EXT, "flush", FLUSH_MS),
         }
+    }
+
+    /// The disk told the power is about to go: STANDBY IMMEDIATE.
+    fn standby(&self) -> bool {
+        self.non_data(CMD_STANDBY, "standby", STANDBY_MS)
+    }
+
+    fn is_failed(&self) -> bool {
+        self.channel.state.lock().failed[self.position()]
     }
 }
 
@@ -602,9 +691,9 @@ fn take_channel(regs: Regs, at: Where, first_position: usize) {
     /* The device's interrupt off before anything is asked of it: this driver
      * polls, and the line is nobody's (see the crate's comment) */
     regs.control(CTL_NIEN);
-    if let Err(fault) = regs.reset(present) {
-        klog!(0, "ata: {:02x}:{:02x}.{} channel {}: no device came back from the reset: {:?}",
-            at.bus, at.slot, at.func, at.channel, fault);
+    if let Err((position, fault)) = regs.reset(present) {
+        klog!(0, "ata: {:02x}:{:02x}.{} channel {}: the {} did not come back from the reset: {:?}",
+            at.bus, at.slot, at.func, at.channel, if position == 0 { "master" } else { "slave" }, fault);
         return;
     }
 
@@ -628,13 +717,14 @@ fn take_channel(regs: Regs, at: Where, first_position: usize) {
         return;
     }
 
-    let Some(regs) = Mutex::new(regs) else {
+    let state = ChannelState { regs, unfinished: [0; POSITIONS_PER_CHANNEL], failed: [false; POSITIONS_PER_CHANNEL] };
+    let Some(state) = Mutex::new(state) else {
         klog!(0, "ata: no memory for a channel's lock");
         return;
     };
     /* For good: its disks point at it, and the block table never gives a
      * disk back. */
-    let channel: &'static Channel = Box::leak(Box::new(Channel { regs, at, present }));
+    let channel: &'static Channel = Box::leak(Box::new(Channel { state, at, present }));
 
     for (i, entry) in found.into_iter().enumerate() {
         if let Some((slave, id)) = entry {
@@ -709,13 +799,25 @@ pub fn init() {
 
 /// On the way down: every disk's write cache pushed out, so that what the
 /// filesystems wrote before they were unmounted is on the medium when the
-/// power goes.
-pub fn shutdown() {
+/// power goes -- and with `power_off` the disk put in standby, as the power
+/// is about to go: not for a reboot, which leaves an HDD spinning to come
+/// back up the sooner. A disk given up on is skipped.
+pub fn shutdown(power_off: bool) {
     let count = DISK_COUNT.load(Ordering::Acquire).min(MAX_DISKS);
     for slot in DISKS[..count].iter() {
-        if let Some(disk) = slot.get() {
-            if !disk.flush_cache() {
-                klog!(0, "ata: {}: the write cache was not flushed on the way down", disk.name());
+        let Some(disk) = slot.get() else { continue };
+        if disk.is_failed() {
+            klog!(0, "ata: {}: failed, so neither flushed nor put in standby", disk.name());
+            continue;
+        }
+        if !disk.flush_cache() {
+            klog!(0, "ata: {}: the write cache was not flushed on the way down", disk.name());
+        }
+        if power_off {
+            if disk.standby() {
+                klog!(0, "ata: {}: in standby for the power-off", disk.name());
+            } else {
+                klog!(0, "ata: {}: did not go to standby for the power-off", disk.name());
             }
         }
     }

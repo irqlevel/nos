@@ -168,12 +168,15 @@ pub extern "C" fn rust_test() {
 
 /* Contract: rust_fini must be the last thing before halt.  Block/net
    registrations are permanent, so the C++ ops tables keep pointing at the
-   devices freed here -- any I/O issued after this call is a use-after-free. */
+   devices freed here -- any I/O issued after this call is a use-after-free.
+   `power_off` is 1 when the halt cuts the power and 0 for a reset: a SATA
+   disk is put in standby for the one, as Linux does, and left spinning for
+   the other. */
 #[no_mangle]
-pub extern "C" fn rust_fini() {
+pub extern "C" fn rust_fini(power_off: i32) {
     nvme::shutdown();
-    ata::shutdown();
-    ahci::shutdown();
+    ata::shutdown(power_off != 0);
+    ahci::shutdown(power_off != 0);
     r8168::shutdown();
     r8125::shutdown();
     igb::shutdown();
