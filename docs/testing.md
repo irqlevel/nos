@@ -219,7 +219,7 @@ swallowing panic messages whole.
 | `panic-test.sh [--arch x86_64\|aarch64]` | both | the panic path, `panic=N`, a reset; a panic off a task's stack (x86's double fault), its report through the netconsole; a task's stack run out |
 | `parttest.py [--arch aarch64\|x86_64]` | both | the block layer, the partition tables |
 | `random-seed-test.py [--iso nos-test.iso]` | x86-64, from `nos-test.iso` | the random pool's seed kept on the root (`src/crates/kernel/src/seed.rs`, `random::restore_seed`), the jitter collector asked again after the root is mounted, `nos-install`'s `put_seed`: a Westmere under TCG -- no RDRAND, no jitter -- seeded by its kept seed, which is 64 new bytes when it is off; with none and nothing else, unseeded and nothing made up; with a virtio-rng, a seed kept; a file of the wrong size not taken |
-| `ata-test.py [--iso nos-test.iso]` | x86-64, from `nos-test.iso` | `drivers/block/ata`: SATA in IDE mode and parallel ATA behind a PCI IDE controller -- four positions on two channels, a 3 TiB disk's sectors past 2^32 read and written where they were meant and nowhere else, an ext4 made, written and held to e2fsck, a CD passed over, a GPT disk beside them found and left alone |
+| `ata-test.py [--controller ide\|ahci] [--iso nos-test.iso]` | x86-64, from `nos-test.iso` | `drivers/block/ata` (`ide`: SATA in IDE mode and parallel ATA behind a PCI IDE controller, four positions on two channels) and `drivers/block/ahci` (`ahci`: QEMU q35's AHCI, a disk to a port), what they share in `common/storage/ataproto` -- a 3 TiB disk's sectors past 2^32 read and written where they were meant and nowhere else, an ext4 made, written and held to e2fsck, a CD passed over, a GPT disk beside them found and left alone |
 | `ext2-test.py` | arm64 | ext2, the halt |
 | `poweroff-test.py` | x86-64, by hand | the halt on x86-64: the sleep type `poweroff` asks for (`Acpi::parse_dsdt`, `hal::power_off`) |
 | `halt-test.py [--arch aarch64\|x86_64]` | both; x86-64 from `nos-test.iso` | the halt's order: the modules unloaded before the shells are stopped (`ModuleTable::unload_all`, the two `main`s) |
@@ -407,9 +407,13 @@ and a file of the wrong size is not taken, and left as it was. A host whose
 TCG does give the jitter collector variance has the two unseeded cases
 skipped, and says so ([Randomness](random.md)).
 
-### `ata-test.py` -- SATA in IDE mode, every sector where it was meant
+### `ata-test.py` -- SATA, every sector where it was meant
 
-`make nos-test.iso TEST_ISO_ARGS=udpshell=9100`, then `tests/ata-test.py`.
+`make nos-test.iso TEST_ISO_ARGS=udpshell=9100`, then `tests/ata-test.py` for the
+IDE driver and `tests/ata-test.py --controller ahci` for the AHCI one: the
+same disks and checks, on q35's ICH9 AHCI a disk to a port (`ada`..`add`)
+instead of the PIIX3's master and slave (`hda`..`hdd`), the Supermicro's
+C236 as the second is the ASUS's ICH10R. For `ide`:
 QEMU's `pc` machine gives the kernel a PIIX3: an IDE controller in
 compatibility mode, four positions on two channels, laid out as the ASUS
 RS500's ICH10R has its disks in IDE mode ([Real hardware](real-hardware.md)):

@@ -38,12 +38,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "ata"
+name = "ahci"
 version = "0.1.0"
 dependencies = [
+ "ataproto",
  "block",
  "kcore",
 ]
+
+[[package]]
+name = "ata"
+version = "0.1.0"
+dependencies = [
+ "ataproto",
+ "block",
+ "kcore",
+]
+
+[[package]]
+name = "ataproto"
+version = "0.1.0"
 
 [[package]]
 name = "autocfg"
@@ -552,6 +566,7 @@ dependencies = [
 name = "kernel"
 version = "0.1.0"
 dependencies = [
+ "ahci",
  "ata",
  "block",
  "crc",

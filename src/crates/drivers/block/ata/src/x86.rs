@@ -12,8 +12,12 @@ use kcore::klog;
 use kcore::once::Once;
 use kcore::pci::{self, PciDevice};
 use kcore::sync::Mutex;
+use kcore::time::Deadline;
 
-use crate::identify::{self, Flush, Identify, Rotation, WORDS};
+use ataproto::cmd::{FLUSH_CACHE as CMD_FLUSH, FLUSH_CACHE_EXT as CMD_FLUSH_EXT, IDENTIFY as CMD_IDENTIFY,
+    READ_SECTORS as CMD_READ, READ_SECTORS_EXT as CMD_READ_EXT, WRITE_SECTORS as CMD_WRITE,
+    WRITE_SECTORS_EXT as CMD_WRITE_EXT};
+use ataproto::identify::{self, Flush, Identify, Rotation, WORDS};
 
 /* ---- PCI ---- */
 
@@ -75,14 +79,6 @@ const DEV_SLAVE: u8 = 1 << 4;
 /// A 28-bit address's top four bits go in the device register.
 const DEV_LBA28_HIGH: u64 = 0x0F;
 
-const CMD_IDENTIFY: u8 = 0xEC;
-const CMD_READ: u8 = 0x20;
-const CMD_READ_EXT: u8 = 0x24;
-const CMD_WRITE: u8 = 0x30;
-const CMD_WRITE_EXT: u8 = 0x34;
-const CMD_FLUSH: u8 = 0xE7;
-const CMD_FLUSH_EXT: u8 = 0xEA;
-
 /// What LBA1 and LBA2 hold after a reset when the device is a packet
 /// (ATAPI) one -- a CD drive, QEMU's `-cdrom` among them.
 const SIG_ATAPI: (u8, u8) = (0x14, 0xEB);
@@ -112,14 +108,6 @@ const RESET_MS: u64 = 31_000;
 /// after (2 ms).
 const SRST_HOLD_US: u64 = 10;
 const AFTER_RESET_US: u64 = 2_000;
-/// Polls of a status register to a millisecond, at most: what bounds a wait
-/// where the clock does not move yet -- this runs from `rust_init`, with
-/// interrupts off. A port read is a few hundred nanoseconds on real
-/// hardware and longer under a hypervisor, so this is a millisecond or more.
-const POLLS_PER_MS: u64 = 5_000;
-const NS_PER_US: u64 = 1_000;
-const NS_PER_MS: u64 = 1_000_000;
-const US_PER_MS: u64 = 1_000;
 
 /* ---- what is taken ---- */
 
@@ -142,35 +130,6 @@ static DISKS: [Once<&'static AtaDisk>; MAX_DISKS] = [const { Once::new() }; MAX_
 static DISK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /* ---- waiting ---- */
-
-/// The end of a wait: the boot clock's time, and a count of polls besides,
-/// so that a clock that does not move yet cannot make the wait endless.
-struct Deadline {
-    end_ns: u64,
-    polls_left: u64,
-}
-
-impl Deadline {
-    fn after_ms(ms: u64) -> Deadline {
-        Deadline {
-            end_ns: kcore::time::boot_time_ns().saturating_add(ms.saturating_mul(NS_PER_MS)),
-            polls_left: ms.saturating_mul(POLLS_PER_MS).max(1),
-        }
-    }
-
-    fn after_us(us: u64) -> Deadline {
-        Deadline {
-            end_ns: kcore::time::boot_time_ns().saturating_add(us.saturating_mul(NS_PER_US)),
-            polls_left: (us.saturating_mul(POLLS_PER_MS) / US_PER_MS).max(1),
-        }
-    }
-
-    /// One more poll: whether the wait is over.
-    fn passed(&mut self) -> bool {
-        self.polls_left = self.polls_left.saturating_sub(1);
-        self.polls_left == 0 || kcore::time::boot_time_ns() >= self.end_ns
-    }
-}
 
 /// Between two polls: the CPU to whatever else can run here once the boot
 /// has a scheduler to give it to (`block::interrupts_started`), a pause of
