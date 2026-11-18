@@ -1,0 +1,40 @@
+#!/bin/sh
+# The installer's devices, before the dialog starts: udev loads the module
+# every device asks for -- a USB keyboard's once its controller's is in --
+# and names the disks as /dev/disk/by-id does everywhere, which answers can
+# name a disk by. Then what nos-install takes besides: loop devices and
+# squashfs for the image, ext4 and FAT for the disk, the EFI variables for
+# its look at Secure Boot; the clock from the RTC, for HTTPS; every network
+# card's link up, for its carrier.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+hostname -F /etc/hostname 2>/dev/null || hostname nos-installer
+# The kernel's own messages stay off the dialog's screen; dmesg keeps them
+dmesg -n 3 2>/dev/null || true
+
+if command -v udevd >/dev/null 2>&1; then
+    udevd --daemon
+    udevadm trigger --type=subsystems --action=add
+    udevadm trigger --type=devices --action=add
+    udevadm settle --timeout=30 || true
+else
+    for round in 1 2 3; do
+        find /sys/devices -name modalias -type f 2>/dev/null | xargs cat 2>/dev/null | sort -u |
+            xargs modprobe -qab 2>/dev/null
+        sleep 1
+    done
+fi
+for m in loop squashfs ext4 vfat nls_cp437 nls_iso8859_1 nls_utf8 efivarfs; do
+    modprobe -q "$m" 2>/dev/null || true
+done
+if [ -d /sys/firmware/efi/efivars ]; then
+    mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null || true
+fi
+hwclock -s -u 2>/dev/null || true
+
+ip link set lo up
+for link in /sys/class/net/*; do
+    name=${link##*/}
+    [ "$name" = lo ] || ip link set "$name" up 2>/dev/null || true
+done
+exit 0
