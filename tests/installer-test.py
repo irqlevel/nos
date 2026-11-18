@@ -231,7 +231,146 @@ def said_version(text):
     return m.group(1) if m else None
 
 
+# Roots of the systems a server may come with, each with its network as its
+# own tools keep it, and what the installer is to read off each: "address
+# gateway dns kind:file", or NONE. The first is the Supermicro X11SSD-F's
+# Ubuntu's, as Selectel set it up: an address on a network with no DHCP
+NETWORK_ROOTS = {
+    "supermicro": ({"etc/netplan/50-cloud-init.yaml": """network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    id0:
+      match:
+        macaddress: "ac:1f:6b:20:53:52"
+      optional: true
+      addresses:
+      - "46.148.233.123/24"
+      nameservers:
+        addresses:
+        - 188.93.17.19
+        - 188.93.16.19
+      routes:
+      - to: "0.0.0.0/0"
+        via: "46.148.233.1"
+      - scope: "link"
+        to: "46.148.233.1"
+    id1:
+      match:
+        macaddress: "ac:1f:6b:20:53:53"
+      optional: true
+"""}, "46.148.233.123/24 46.148.233.1 188.93.17.19 netplan:/etc/netplan/50-cloud-init.yaml"),
+    # A route elsewhere before the addresses, and before the default one
+    "netplan-routes": ({"etc/netplan/00-installer-config.yaml": """network:
+  ethernets:
+    eno1:
+      routes:
+        - to: 10.0.0.0/8
+          via: 192.168.5.254
+        - to: default
+          via: 192.168.5.1
+      addresses:
+        - 192.168.5.20/24
+      nameservers:
+        addresses: [192.168.5.53, 8.8.8.8]
+"""}, "192.168.5.20/24 192.168.5.1 192.168.5.53 netplan:/etc/netplan/00-installer-config.yaml"),
+    "netplan-gateway4": ({"etc/netplan/01-netcfg.yaml": """network:
+  ethernets:
+    eth0:
+      addresses: [172.16.0.9/20]
+      gateway4: 172.16.0.1
+      nameservers:
+        addresses: [1.1.1.1]
+"""}, "172.16.0.9/20 172.16.0.1 1.1.1.1 netplan:/etc/netplan/01-netcfg.yaml"),
+    "netplan-dhcp": ({"etc/netplan/50-cloud-init.yaml": """network:
+  ethernets:
+    eth0:
+      dhcp4: true
+"""}, "NONE"),
+    "ifupdown": ({"etc/network/interfaces": """auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet static
+    address 203.0.113.5
+    netmask 255.255.255.0
+    gateway 203.0.113.1
+    dns-nameservers 203.0.113.53 8.8.8.8
+"""}, "203.0.113.5/24 203.0.113.1 203.0.113.53 ifupdown:/etc/network/interfaces"),
+    "networkmanager": ({"etc/NetworkManager/system-connections/eth0.nmconnection": """[connection]
+id=eth0
+[ipv4]
+address1=198.51.100.7/25,198.51.100.1
+dns=198.51.100.53;9.9.9.9;
+method=manual
+"""}, "198.51.100.7/25 198.51.100.1 198.51.100.53 "
+          "NetworkManager:/etc/NetworkManager/system-connections/eth0.nmconnection"),
+    "networkd": ({"etc/systemd/network/10-eth0.network": """[Match]
+Name=eth0
+[Network]
+Address=192.0.2.10/26
+Gateway=192.0.2.1
+DNS=192.0.2.53
+"""}, "192.0.2.10/26 192.0.2.1 192.0.2.53 systemd-networkd:/etc/systemd/network/10-eth0.network"),
+    "ifcfg": ({"etc/sysconfig/network-scripts/ifcfg-eth0": """DEVICE=eth0
+BOOTPROTO=none
+IPADDR="10.1.2.3"
+NETMASK='255.255.0.0'
+GATEWAY=10.1.0.1
+DNS1=10.1.0.53
+"""}, "10.1.2.3/16 10.1.0.1 10.1.0.53 ifcfg:/etc/sysconfig/network-scripts/ifcfg-eth0"),
+}
+NETWORK_FUNCTIONS = ("valid_cidr", "valid_ip", "mask_bits", "first_host", "root_network")
+# Alpine's, as the installer's: its awk is busybox's
+INSTALLER_ALPINE = "alpine:3.24"
+
+
+def shell_functions(path, names):
+    text = open(path).read()
+    found = []
+    for name in names:
+        m = re.search(r"^%s\(\) \{\n.*?^\}\n" % re.escape(name), text, re.S | re.M)
+        if m is None:
+            return None
+        found.append(m.group(0))
+    return "".join(found)
+
+
+def network_found(tmp):
+    """nos-setup's reading of the network a Linux on the server's disks has,
+    run as the installer runs it: its own functions, in its Alpine."""
+    print("--- the network a Linux on the disks has", flush=True)
+    where = os.path.join(tmp, "network")
+    fns = shell_functions(os.path.join(ROOT, "scripts", "installer", "nos-setup"), NETWORK_FUNCTIONS)
+    if not check("nos-setup has " + ", ".join(NETWORK_FUNCTIONS), fns is not None):
+        return
+    for name, (files, _) in NETWORK_ROOTS.items():
+        for rel, text in files.items():
+            path = os.path.join(where, "roots", name, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(text)
+    with open(os.path.join(where, "fns.sh"), "w") as f:
+        f.write(fns)
+    with open(os.path.join(where, "run.sh"), "w") as f:
+        f.write("set -u\n. /n/fns.sh\n"
+                "for r in /n/roots/*; do echo \"${r##*/}=$(root_network \"$r\" || echo NONE)\"; done\n"
+                "echo \"first_host=$(first_host 46.148.233.123/24) $(first_host 10.1.2.3/16) "
+                "$(first_host 198.51.100.7/25) [$(first_host 192.0.2.1/32)]\"\n"
+                "echo \"mask_bits=$(mask_bits 255.255.255.192) $(mask_bits 255.255.0.0)\"\n")
+    p = subprocess.run(["docker", "run", "--rm", "--platform", "linux/amd64", "-v", where + ":/n",
+                        INSTALLER_ALPINE, "sh", "-c", "apk add -q bash >/dev/null && bash /n/run.sh"],
+                       capture_output=True, text=True, timeout=600)
+    got = dict(line.split("=", 1) for line in p.stdout.splitlines() if "=" in line)
+    for name, (files, want) in NETWORK_ROOTS.items():
+        check("%s: %s" % (name, want), got.get(name) == want, "read %r%s" % (got.get(name), p.stderr[-500:]))
+    check("a gateway offered is the network's first address, none for a /32",
+          got.get("first_host") == "46.148.233.1 10.1.0.1 198.51.100.1 []", got.get("first_host"))
+    check("a netmask is its prefix's length", got.get("mask_bits") == "26 16", got.get("mask_bits"))
+
+
 def run(tmp, image):
+    network_found(tmp)
     key = os.path.join(tmp, "id_test")
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "installer-test", "-f", key], check=True)
     answers = os.path.join(tmp, "answers")
