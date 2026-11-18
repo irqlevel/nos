@@ -22,6 +22,15 @@ impl MsixTable {
         if h == 0 { None } else { Some(Self { handle: h }) }
     }
 
+    /// The device's MSI capability as a table of one entry, for a device
+    /// that has MSI and no MSI-X -- an Intel AHCI HBA: entry 0 its vector,
+    /// registered and dropped as an MSI-X entry is. None where it has no
+    /// MSI, or (arm64) no ITS to take it.
+    pub fn new_msi(dev: &PciDevice) -> Option<Self> {
+        let h = unsafe { msix::kernel_msi_create(dev.bus, dev.slot, dev.func) };
+        if h == 0 { None } else { Some(Self { handle: h }) }
+    }
+
     pub fn mask(&self, index: u16) {
         unsafe { msix::kernel_msix_mask(self.handle, index) }
     }
