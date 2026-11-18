@@ -18,6 +18,7 @@ dosfstools
 grub
 grub-bios
 grub-efi
+efibootmgr
 squashfs-tools
 newt
 curl
