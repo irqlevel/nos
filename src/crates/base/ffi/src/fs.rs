@@ -66,12 +66,41 @@ unsafe extern "C" {
     /// Writes `len` bytes at `offset`, within the file's size -- never
     /// growing it: `len`, or -1. Not synced.
     pub fn kernel_file_pwrite(file: usize, offset: u64, data: *const u8, len: usize) -> isize;
+    /// Writes `len` bytes at `offset`, the file grown to reach past them
+    /// where it must -- a hole between its end and `offset`: `len`, or -1,
+    /// also for a disk's image held, which never grows. Not synced.
+    pub fn kernel_file_pwrite_grow(file: usize, offset: u64, data: *const u8, len: usize) -> isize;
     /// Cuts the file, open for writing, to `size` bytes or grows it there --
     /// with a hole, where the filesystem has them: 0, or -1.
     pub safe fn kernel_file_set_length(file: usize, size: u64) -> i32;
     /// Everything written to the file's filesystem on its disk's medium: 0,
     /// or -1.
     pub safe fn kernel_file_fsync(file: usize) -> i32;
+}
+
+/* Files as a person names them, copied in and out (sshd's SFTP): each path
+   exactly the one given -- no `<path>.new` a cut short replace of a
+   configuration file left is looked for, or taken away with the file, as
+   the calls above do. A file opened here is a handle the calls above take. */
+unsafe extern "C" {
+    /// What is at `path`: its kind (FILE_ENTRY_FILE, FILE_ENTRY_DIR) into
+    /// `kind` and a file's size into `size` -- 0; or -1 when nothing is
+    /// there.
+    pub fn kernel_file_stat(path: *const u8, path_len: usize, kind: *mut u32, size: *mut u64) -> i32;
+    /// Opens the regular file at `path` for reading, and as `flags` say
+    /// (FILE_OPEN_*): its handle, or 0 -- also for a flag not among them.
+    /// `owner`, as kernel_file_open's.
+    pub fn kernel_file_open_flags(owner: usize, path: *const u8, path_len: usize, flags: u32) -> usize;
+    /// Makes a directory at `path`, where nothing is: FILE_CREATED;
+    /// FILE_THERE, nothing made, when something is there already;
+    /// FILE_REFUSED for the rest -- no directory to make it in, say.
+    pub fn kernel_dir_make(path: *const u8, path_len: usize) -> i32;
+    /// Removes the regular file at `path`: 0, or -1 -- nothing there, a
+    /// directory there, or a refusal.
+    pub fn kernel_file_unlink(path: *const u8, path_len: usize) -> i32;
+    /// Removes the empty directory at `path`: 0, or -1 -- nothing there, a
+    /// file there, anything in it, or a refusal.
+    pub fn kernel_dir_remove(path: *const u8, path_len: usize) -> i32;
 }
 
 /* A file held as a guest's disk image -- nothing else may write it, cut it
@@ -205,8 +234,25 @@ pub const FILE_ENTRY_DIR: u32 = 2;
 pub const FILE_ENTRY_END: isize = -1;
 pub const FILE_ENTRY_NO_DIR: isize = -2;
 
-/// What `kernel_file_create` answers: made, one there already (nothing
-/// written), and refused (no file left).
+/// What `kernel_file_create` and `kernel_dir_make` answer: made, something
+/// there already (nothing written, nothing made), and refused (nothing
+/// left).
 pub const FILE_CREATED: i32 = 0;
 pub const FILE_THERE: i32 = 1;
 pub const FILE_REFUSED: i32 = -1;
+
+/// The longest name a directory's entry may have, and the longest path, in
+/// bytes: what the VFS takes -- a longer one it refuses, never cuts -- and
+/// what a module handed paths by someone else (sshd's SFTP) refuses past
+/// before it asks. The fs layer holds its own limits to these.
+pub const FILE_NAME_MAX: usize = 63;
+pub const FILE_PATH_MAX: usize = 255;
+
+/// How `kernel_file_open_flags` opens a file, which it reads in any case:
+/// written too; made when it is not there; cut to nothing; made by this
+/// open or refused -- under the lock it is made under, so two opens of one
+/// new name cannot both have made it (with FILE_OPEN_CREATE or without).
+pub const FILE_OPEN_WRITE: u32 = 1;
+pub const FILE_OPEN_CREATE: u32 = 2;
+pub const FILE_OPEN_TRUNCATE: u32 = 4;
+pub const FILE_OPEN_EXCLUSIVE: u32 = 8;

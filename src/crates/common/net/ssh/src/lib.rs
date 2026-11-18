@@ -19,11 +19,15 @@
 //!
 //! A connection runs from end to end in one call to `serve`, on the caller's
 //! task: the version exchange, the key exchange, public key authentication,
-//! then one session channel -- a shell behind a line editor, or a single
-//! command -- until either side closes it. Rekeying is the client's to
+//! then one session channel -- a shell behind a line editor, a single
+//! command, or a subsystem the shell has (`Subsystem`: SFTP, the sftp
+//! crate's) -- until either side closes it. Rekeying is the client's to
 //! start, and is followed wherever it comes, command output included.
 
 extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 mod cipher;
 mod connection;
@@ -31,7 +35,7 @@ pub mod keys;
 /// Public for the net fuzzer, which holds the editor to a model of its own
 pub mod terminal;
 mod transport;
-mod wire;
+pub mod wire;
 
 use core::fmt;
 
@@ -77,6 +81,32 @@ pub trait Shell {
     /// and what the client types while it runs there for it to read. `exit`
     /// and `logout` never get here: the session ends on those.
     fn run(&mut self, line: &str, io: &mut dyn Io);
+    /// The subsystem called `name` -- "sftp" -- for the session's channel
+    /// to be given over to; None for one the server does not have, which
+    /// the client is told it is refused. The default has none.
+    fn subsystem(&mut self, _name: &str) -> Option<Box<dyn Subsystem>> {
+        None
+    }
+}
+
+/// A subsystem a session's channel is given over to (RFC 4254 6.5): what
+/// the client sends goes to it as it comes, and what it answers goes back,
+/// bytes the session does not look into -- no line editor, no CR LF. It runs
+/// on the session's task, a message at a time, its answer out on the channel
+/// before the next is looked at.
+pub trait Subsystem {
+    /// Takes the first whole message at the front of `input`, its answer
+    /// appended to `out`: how many bytes of `input` it took -- 0 while what
+    /// is there is no whole message yet. Err ends the connection, the
+    /// client told it broke the subsystem's protocol and how: a stream that
+    /// cannot be read on from.
+    fn input(&mut self, input: &[u8], out: &mut Vec<u8>) -> core::result::Result<usize, &'static str>;
+    /// What the client may send that the session has not taken in yet --
+    /// the channel's window from the subsystem's start: at least twice the
+    /// longest message the subsystem takes, so that a whole one always has
+    /// room beside what is waiting, and at most what may be held in one
+    /// allocation.
+    fn window(&self) -> u32;
 }
 
 /// What a command a session runs has of the session, for as long as it runs.
