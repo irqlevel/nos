@@ -21,6 +21,19 @@ export interface Why {
     sources: { label: string; href: string }[];
 }
 
+// How to put nos on a server, or try it, on the home page: the commands themselves are the page's.
+export interface Try {
+    title: string;
+    lead: string;
+    copy: string;
+    copied: string;
+    rescue: { kicker: string; title: string; text: string; dialog: string; quiet: string; then: string };
+    iso: { kicker: string; title: string; text: string; link: string; tryNos: string };
+    local: { kicker: string; title: string; text: string };
+    more: string;
+    moreLink: string;
+}
+
 export interface Dictionary {
     meta: {
         title: string;
@@ -48,7 +61,9 @@ export interface Dictionary {
         ctaRun: string;
         ctaDemo: string;
         ctaGithub: string;
+        ctaInstall: string;
         terminalCaption: string;
+        try: Try;
         why: Why;
         highlightsTitle: string;
         highlightsLead: string;
@@ -160,7 +175,36 @@ const en: Dictionary = {
         ctaRun: "Run it in QEMU",
         ctaDemo: "Watch the demo",
         ctaGithub: "Source on GitHub",
+        ctaInstall: "Install on a server",
         terminalCaption: "The last lines of a real arm64 boot in QEMU.",
+        try: {
+            title: "Install it on a server",
+            lead: "nos takes a whole disk of an x86-64 server: a 10 GiB root for the system, and the rest of the disk left empty for virtual machines and storage. Pick the way your hosting provider gives you.",
+            copy: "Copy",
+            copied: "Copied",
+            rescue: {
+                kicker: "Rescue system",
+                title: "One command",
+                text: "Boot the server into your provider's rescue system, log in over SSH as root and run:",
+                dialog: "A dialog asks which disk to use, how big the root should be and which SSH keys may log in. It offers the server's own network, as the rescue system has it, and the keys root logs in with there. Then it downloads the newest release, checks it against the release's checksums, makes the disk bootable under BIOS and UEFI, and puts nos first in the UEFI boot order, right after network boot. nos's SSH server takes ed25519 keys only.",
+                quiet: "The same without questions:",
+                then: "If the provider's panel still has the server booting into rescue, switch that back. Then reboot, and about a minute later ssh root@your-server gets you into nos.",
+            },
+            iso: {
+                kicker: "ISO",
+                title: "The installer ISO",
+                text: "For servers installed from an ISO: mount it as virtual media through IPMI, iDRAC or iLO, or give its link to your provider's install-from-ISO. The same dialog runs on the server's console.",
+                link: "Download the ISO",
+                tryNos: "Not sure the server suits nos? The menu entry Try nos boots nos straight from the ISO and writes nothing. The screen then shows which disks and network cards nos found.",
+            },
+            local: {
+                kicker: "Your computer",
+                title: "Try it without a server",
+                text: "Run nos in QEMU on a laptop in a few minutes, or watch the demo first.",
+            },
+            more: "Step by step, with the commands for doing it by hand and for installing nos next to Linux on a spare partition:",
+            moreLink: "Install nos on a server",
+        },
         why: {
             title: "Why another kernel",
             lead: "Linux is written in C. It's a great language, but it trusts the programmer with every bounds check, every object lifetime and every lock, across tens of millions of lines of code. Mistakes are inevitable, and the vulnerabilities now come by the thousand.",
@@ -396,7 +440,36 @@ const ru: Dictionary = {
         ctaRun: "Запустить в QEMU",
         ctaDemo: "Смотреть демо",
         ctaGithub: "Исходники на GitHub",
+        ctaInstall: "Поставить на сервер",
         terminalCaption: "Последние строки настоящей загрузки arm64 в QEMU.",
+        try: {
+            title: "Поставить на сервер",
+            lead: "nos занимает целый диск сервера x86-64: корень на 10 ГиБ под систему, а остальное место остаётся пустым под виртуальные машины и хранилище. Выберите способ, который даёт ваш хостинг-провайдер.",
+            copy: "Копировать",
+            copied: "Скопировано",
+            rescue: {
+                kicker: "Rescue-система",
+                title: "Одна команда",
+                text: "Загрузите сервер в rescue-систему провайдера, зайдите по SSH под root и выполните:",
+                dialog: "Диалог спросит, какой диск занять, какого размера сделать корень и с какими SSH-ключами пускать. Сеть он предложит ту, что у rescue-системы, то есть настоящий адрес сервера, а ключи те, с которыми туда заходит root. Потом скачает свежий релиз, сверит его с контрольными суммами релиза, сделает диск загрузочным для BIOS и UEFI и поставит nos первым в порядке загрузки UEFI, сразу после сетевой загрузки. SSH-сервер nos принимает только ключи ed25519.",
+                quiet: "То же без вопросов:",
+                then: "Если в панели провайдера сервер всё ещё загружается в rescue, верните загрузку как было. Потом перезагрузите сервер, и примерно через минуту ssh root@ваш-сервер пустит вас в nos.",
+            },
+            iso: {
+                kicker: "ISO",
+                title: "ISO-установщик",
+                text: "Для серверов, которые ставят с ISO: подключите его как виртуальный носитель через IPMI, iDRAC или iLO либо дайте ссылку на него в установке с ISO у провайдера. На консоли сервера запустится тот же диалог.",
+                link: "Скачать ISO",
+                tryNos: "Не уверены, что сервер подойдёт? Пункт меню Try nos загружает nos прямо с ISO и ничего не пишет на диски. На экране будет видно, какие диски и сетевые карты nos нашёл.",
+            },
+            local: {
+                kicker: "Свой компьютер",
+                title: "Попробовать без сервера",
+                text: "Запустите nos в QEMU на ноутбуке за несколько минут или сначала посмотрите демо.",
+            },
+            more: "По шагам, с командами для установки вручную и для установки nos рядом с Linux на свободный раздел:",
+            moreLink: "Как поставить nos на сервер",
+        },
         why: {
             title: "Зачем ещё одно ядро",
             lead: "Linux написан на C. Это отличный язык, но каждую проверку границ, время жизни каждого объекта и каждую блокировку он доверяет программисту, и так на десятках миллионов строк кода. Ошибки неизбежны, и уязвимости теперь находят тысячами.",

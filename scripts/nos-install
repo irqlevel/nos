@@ -6,6 +6,8 @@
 #   nos-install install <partition> [options]    put the image on <partition>
 #   nos-install disk <disk> [options]            make <disk> nos's own
 #   nos-install disks                            the disks here, for disk
+#   nos-install network                          this Linux's network, as
+#                                                --network-here gives it nos
 #   nos-install update [<partition>] [options]   a new image over the one there
 #   nos-install rollback [<partition>]           back to the image before it
 #   nos-install boot [<partition>] [--reboot]    boot nos once, the next time
@@ -116,14 +118,16 @@ EXT4_FEATURES_OK=" has_journal ext_attr resize_inode dir_index filetype extent 6
 # the kernel, the modules built with it, hvboot -- the loader hv boots a
 # guest's own kernel with (docs/hypervisor.md), which an image older than it
 # does not have -- and the VERSION that names them, last. GRUB's entries are
-# replaced, /etc/rc goes in the first time only, and nos-install stays in
-# the image. An image holding anything else is refused: poured, that part
-# would be left out without a word, as /lib/hvboot was by v0.0.26's own
-# nos-install, so a file the image gains is added here too. /lib/licenses
+# replaced, /etc/rc goes in the first time only, and nos-install and
+# nos-setup (the installer's dialog, run from the image in a provider's
+# rescue system) stay in the image. An image holding anything else is
+# refused: poured, that part would be left out without a word, as
+# /lib/hvboot was by v0.0.26's own nos-install, so a file the image gains
+# is added here too. /lib/licenses
 # holds the notices of the code the kernel and its modules carry, and goes
 # with them
 SYSTEM="boot/kernel64.elf lib/modules lib/hvboot lib/panel lib/licenses VERSION"
-LAYOUT=" $SYSTEM lib/panel/bundle lib/licenses/CRYPTOGAMS boot/grub/nos.cfg etc/rc nos-install boot boot/grub etc lib "
+LAYOUT=" $SYSTEM lib/panel/bundle lib/licenses/CRYPTOGAMS boot/grub/nos.cfg etc/rc nos-install nos-setup boot boot/grub etc lib "
 # The management panel's lines of /etc/rc (--panel): hv and the host API,
 # then the panel's VM -- made at the first boot, started at every one after
 PANEL_RC=(
@@ -1830,6 +1834,10 @@ case "$COMMAND" in
         only_options
         [ -z "$PART" ] || die "disks takes no device: it lists them"
         cmd_disks ;;
+    network)
+        only_options
+        [ -z "$PART" ] || die "network takes no device: it says this Linux's"
+        network_here ;;
     boot) only_options --reboot --boot-once --default; cmd_boot ;;
     rollback|status|uninstall) only_options; "cmd_$COMMAND" ;;
     *) die "no command $COMMAND (--help)" ;;
