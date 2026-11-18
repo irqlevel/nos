@@ -238,8 +238,9 @@ that is what a client is told:
   follows it cannot be found), 63 KiB the most a READ answers and a WRITE
   carries, 32 handles open at once, files and directories, as
   `limits@openssh.com` says, which OpenSSH's client sizes its requests and
-  keeps its requests in flight by. The session's window is 256 KiB, four
-  requests' worth, from the subsystem's start.
+  keeps its requests in flight by. The session's window is 512 KiB, eight
+  requests' worth, from the subsystem's start -- 256 KiB where the heap has
+  no block of 512 to hold what the client may send.
 - **Extensions**: `limits@openssh.com`, `statvfs@openssh.com` (`df`: the
   filesystem's bytes, in 4 KiB blocks, and no inodes), `fsync@openssh.com`
   (`put -f`: the file on its disk's medium before the copy is said done) and
@@ -247,8 +248,22 @@ that is what a client is told:
   `posix-rename@openssh.com`, as no filesystem here replaces a name
   atomically, nor `copy-data`, `hardlink@openssh.com` or
   `home-directory`.
-- **What it runs at** is what the session's TCP connection carries: its
-  slot's 8 KiB each way, below.
+- **What it runs at** is what the session's TCP connection carries. Every
+  connection to the port starts on its slot's own 8 KiB each way -- what
+  knocks on port 22 all day holds no more -- its window scaled at the
+  handshake for more (`TcpListener::bind_growable`); a session that starts
+  SFTP is given bulk buffers both ways, up to 512 KiB each, as the
+  subsystem starts (`Link::bulk`, `TcpStream::grow`: what the connection
+  holds and has in flight moved across). They come from the kernel's 32
+  (`MAX_BULK`), which ipcnet's links and `hv forward` draw on too: a shell's
+  session keeps the slot's own, and a copy with none to be had goes on on
+  them, the log saying so. `tests/sftp-bench.py`, 64 MiB over QEMU's user
+  network, arm64 under HVF (2026-11-18), before and after: 61 to 107 MB/s
+  in, 63 to 91 out; with a round trip of some 5 ms added, 0.6 to 7.3 in,
+  1.1 to 9.4 out, and of some 15 ms, 0.2 to 2.7 and 0.4 to 3.5 -- where
+  QEMU's user network is what holds it now, its own TCP keeping some 64 KiB
+  in flight, under the 512 KiB a round trip nos's buffers and the session's
+  window carry.
 
 A file a client writes is written where each WRITE says, the file grown to
 reach past it (`kernel_file_pwrite_grow`) -- a hole between its end and a
@@ -284,14 +299,15 @@ sshd: root from 10.0.2.2:51544: sftp, 3 files opened (1 to be written), 8400953 
   over QEMU's user network, arm64 under HVF (2026-11-16): 27 MB/s, on
   RustCrypto's cipher and on CRYPTOGAMS' alike -- the cipher is a few per
   cent of one CPU at that rate. What holds it is a connection's TCP buffers,
-  the slot's own 8 KiB each way (`TcpListener::bind`), which a round trip
-  can carry no more of -- so over a WAN a fraction of that -- and the
-  command's output moved to the session, and sent, 2 KiB at a time
-  (`OUT_CHUNK`). As an experiment, not as built: bulk buffers
-  (`bind_bulk`) 32 MB/s; those and 8 KiB a packet 40 MB/s, CRYPTOGAMS'
-  cipher 2% ahead of RustCrypto's there. Bulk buffers are not given at
-  accept because a knock on port 22 would hold them: they come from the
-  kernel's 32 (`MAX_BULK`), which ipcnet's links and `hv forward` draw on.
+  the slot's own 8 KiB each way, which a round trip can carry no more of --
+  so over a WAN a fraction of that -- and the command's output moved to the
+  session, and sent, 2 KiB at a time (`OUT_CHUNK`). As an experiment, not as
+  built: bulk buffers 32 MB/s; those and 8 KiB a packet 40 MB/s, CRYPTOGAMS'
+  cipher 2% ahead of RustCrypto's there. A shell's session or a command's
+  is not given bulk buffers -- they come from the kernel's 32 (`MAX_BULK`),
+  which ipcnet's links and `hv forward` draw on -- a session copying files
+  over SFTP is ([Copying files](#copying-files-sftp)): `scp` is what to copy
+  a file out with, not `ssh cat`.
 
 ## How it is put together
 
@@ -313,7 +329,8 @@ sshd: root from 10.0.2.2:51544: sftp, 3 files opened (1 to be written), 8400953 
   as they come and its answers sent back, with no line editor and no CR LF,
   in a window of its own.
 - `src/crates/modules/net/sshd` -- the kernel's side: the `sshd` command, the files,
-  the sftp crate's `Files` over `kcore::fs` (`KernelFiles`),
+  the sftp crate's `Files` over `kcore::fs` (`KernelFiles`), a growable
+  listener and a session's connection grown as a copy starts (`Link::bulk`),
   the ssh crate's `Primitives` -- the crypto crate's, CRYPTOGAMS' assembly in
   the kernel's SIMD sections, its integer code where none can be had --
   a listener task, a task for each connection, and one for each command a

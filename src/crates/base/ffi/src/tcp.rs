@@ -20,12 +20,21 @@ unsafe extern "C" {
 /* A server of Rust's owns its connections: it listens on a port of a
    device -- a kernel_net_find handle -- accepts what arrives, and closes
    both what it accepted and the listener. The listener holds `backlog`
-   connections nobody has accepted at most (taken into 1..=16), and with
-   `bulk` gives each it accepts bulk buffers both ways -- a relay's. Accepting
-   returns null once timeout_ms (0: forever) passes with nobody, or once the
-   listener is closed. */
+   connections nobody has accepted at most (taken into 1..=16), and gives
+   each it accepts the buffers `buffers` says (TCP_BUFFERS_*): the slot's
+   own 8 KiB each way, bulk ones both ways -- a relay's -- or the slot's own
+   with the window scaled for bulk ones `kernel_tcp_grow` may give later --
+   a login server's. Accepting returns null once timeout_ms (0: forever)
+   passes with nobody, or once the listener is closed. */
 unsafe extern "C" {
-    pub safe fn kernel_tcp_listen(owner: usize, dev: usize, port: u16, backlog: usize, bulk: bool) -> usize;
+    /// Null also for a `buffers` that is none of the TCP_BUFFERS_*.
+    pub safe fn kernel_tcp_listen(owner: usize, dev: usize, port: u16, backlog: usize, buffers: u32) -> usize;
+    /// The connection given bulk buffers both ways, under way -- what it
+    /// holds and has in flight moved across -- and the room offered at
+    /// once: 0 when it has a bulk buffer either way it did not have, -1 when
+    /// not -- both there already, the connection not open, or the heap or
+    /// the kernel's count of them (32) has none to give.
+    pub safe fn kernel_tcp_grow(conn: usize) -> i32;
     /// An active open to ip:port (host byte order) through the device, from
     /// an ephemeral port: null when nothing answered in time. Sleeps.
     pub safe fn kernel_tcp_connect(owner: usize, dev: usize, ip: u32, port: u16) -> usize;
@@ -55,8 +64,8 @@ unsafe extern "C" {
     /// backlog and before a slot, with no SYN-ACK and no reset. Null for more
     /// than 64 networks or a prefix past 32, and for what kernel_tcp_listen
     /// refuses.
-    pub fn kernel_tcp_listen_allowed(owner: usize, dev: usize, port: u16, backlog: usize, bulk: bool, nets: *const TcpNet,
-                                     count: usize) -> usize;
+    pub fn kernel_tcp_listen_allowed(owner: usize, dev: usize, port: u16, backlog: usize, buffers: u32,
+                                     nets: *const TcpNet, count: usize) -> usize;
     /// A listener's allowlist changed: the `count` networks at `nets` from
     /// now on -- anyone, with `any`. What it holds already stays. 0 done,
     /// -1 refused: no listener, more than 64 networks, a prefix past 32.
@@ -99,3 +108,12 @@ pub struct TcpNet {
 pub const TCP_RECV_TIMEOUT: isize = -2;
 /// The most networks a listener's allowlist holds.
 pub const TCP_ALLOW_MAX: usize = 64;
+
+/// What a listener's connections buffer (`kernel_tcp_listen`): the slot's
+/// own 8 KiB each way; bulk buffers both ways, up to 512 KiB each, as each
+/// is accepted, the window scaled when the peer offers to; and the slot's
+/// own, the window scaled as a bulk one's, for `kernel_tcp_grow` to give
+/// bulk buffers once the connection has earned them.
+pub const TCP_BUFFERS_SMALL: u32 = 0;
+pub const TCP_BUFFERS_BULK: u32 = 1;
+pub const TCP_BUFFERS_GROWABLE: u32 = 2;
