@@ -143,6 +143,7 @@ CXX_SRC_x86_64 =   \
     src/base/drivers/screen.cpp \
     src/base/drivers/pci.cpp \
     src/base/drivers/msix.cpp \
+    src/base/drivers/msi.cpp \
     src/base/drivers/rtc.cpp \
     src/base/kernel/icxxabi.cpp    \
     src/base/kernel/interrupt.cpp   \
@@ -233,6 +234,7 @@ CXX_SRC_aarch64 = \
     src/base/arch/arm64/pci_ecam.cpp \
     src/base/arch/arm64/its.cpp \
     src/base/arch/arm64/msix_its.cpp \
+    src/base/drivers/msi.cpp \
     src/base/arch/arm64/x86_driver_stubs.cpp \
     src/base/drivers/pci.cpp \
     src/base/kernel/icxxabi.cpp \
