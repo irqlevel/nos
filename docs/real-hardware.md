@@ -1,9 +1,9 @@
 # Real hardware
 
-`nos` boots on bare metal. Four machines so far, and they pull in opposite
-directions: a laptop whose only console is its own screen, and three
-dedicated servers — two Intel, one AMD — whose only console is the network,
-one of them fifteen years old.
+`nos` boots on bare metal. Five machines so far, and they pull in opposite
+directions: a laptop whose only console is its own screen, and four
+dedicated servers — three Intel, one AMD — whose only console is the
+network, one of them fifteen years old.
 
 ## Dell Latitude 5480
 
@@ -269,7 +269,12 @@ machines never were:
   interrupt off. nos's root is a partition of the second PNY, its disk log the
   next one; that disk carries GRUB's boot code too, Ubuntu's GRUB from Ubuntu's
   `/boot`, so that a BIOS that tries it first lands in the same menu instead of
-  on zeros, and `grub-pc`'s `install_devices` names both disks.
+  on zeros, and `grub-pc`'s `install_devices` names both disks. By PIO, a
+  16-bit `inw` costs this chipset 0.68 µs: 2.8 MiB/s from the SSD as from the
+  HDDs, 1.4 ms a 4 KiB read whatever its place, one CPU busy in `inw` for all
+  of it (`blkload`, `profile`) — a hundredth of the link. The ICH10R has AHCI
+  too: with the BIOS's SATA mode set to it, the `ahci` driver takes these
+  disks by DMA.
 - **Its NICs are two Intel 82574L** (the `e1000e` driver), MSI-X, the cable
   on the one at 02:00.0, which nos names `eth0` by the bus order. The BMC
   shares it — the firmware's manageability is on (ASF), and the driver leaves
@@ -298,10 +303,48 @@ POST to GRUB takes about two minutes; nos says `boot: complete` 13 s after
 GRUB, and its sshd answers then. A `reboot` in nos is Ubuntu again in under
 three minutes, nos's ext4 clean behind it.
 
+## Supermicro X11SSD-F
+
+A node of a **Supermicro SYS-5039MS-H8TRF** MicroCloud (board X11SSD-F, AMI
+BIOS 3.0 of 2023, UEFI, Secure Boot off): a **Xeon E3-1230 v6** — Kaby Lake,
+four cores and eight threads, RDRAND and RDSEED, x2APIC and the TSC-deadline
+timer — and 31 GiB, Ubuntu beside nos. Nothing about the CPU is new to nos;
+its disks and its NICs were:
+
+- **Its SATA is the C236's AHCI HBA** (8086:a102, AHCI 1.3.1, eight ports,
+  64-bit, an MSI): two Intel SSDSC2KB240G7 (512e), one of them Ubuntu's. That
+  is what brought the `ahci` driver (`src/crates/drivers/block/ahci`), the
+  disks `ada` and `adb` at 6 Gbps, the six empty ports passed over in the one
+  second their links are given together. nos's root is the first partition
+  of the second SSD, its disk log the next one; under UEFI the firmware
+  boots by its BootOrder, so that disk carries no boot code. A command at a
+  time, polled, the link kept out of its power states: 354 MiB/s in reads of
+  128 KiB, 11 000 random reads of 4 KiB a second (Ubuntu's 412 MiB/s and 9 100
+  with its CPUs held out of deep C-states, `fio` at the same depth); what it
+  lacks is depth — Ubuntu's NCQ reads 76 500 a second at 32 in flight.
+- **Its NICs are a two-port Intel I350** (8086:1521, Supermicro's
+  AOC-CGP-i2 MicroLP), MSI-X. That is what brought the I350 into `igb`, a
+  third generation beside the 82576 and the I210: each port claims its own
+  PHY semaphore bit and waits for its own config-done bit. Both ports link
+  at 1000 Mbit/s full duplex some five seconds after their PHY's reset,
+  longer than the driver's one-second wait, so the link comes as a `link
+  changed` after `device ready`; `eth0` is 02:00.0, the cable that carries
+  the address. MANC is 0x62000000 and the driver leaves it so.
+- **Its network hands out no address** either, so nos's comes from
+  `nos-install --cmdline "ip=… gw=… dns=…"`.
+- **Its TCO watchdog is the firmware's**: nos finds it by the SMBus
+  controller and leaves NO_REBOOT as firmware set it, as on the EX44, so a
+  nos that hangs there is not reset by it.
+
+Its BootOrder tries the I350's PXE first: POST to GRUB takes minutes, a
+boot of nos and back to Ubuntu about eleven. nos says `boot: complete` 10 s
+after GRUB, its microcode loaded (0xf4 to 0xf8), its root mounted from `adb1`
+at 9.4 s, sshd listening on `eth0` at once.
+
 These boxes were set up by hand, before there was a release image to set one
 up from. A new server is set up with `nos-install` from the system image,
 which makes the partition, the GRUB entry and the one-shot flag that the
 sections above describe building by hand ([Install](install.md)).
 
 Other firmware, chipsets, NICs and disks are untested; treat bare-metal support
-as "works on the four machines it was debugged on".
+as "works on the five machines it was debugged on".
