@@ -3,6 +3,9 @@ unsafe extern "C" {
         bus: u16, slot: u16, func: u16,
         mapped_bars: *const u64,
     ) -> usize;
+    /// The device's MSI capability as a table of one entry -- a handle of
+    /// the same kind, for every other call here -- or 0 where it has none.
+    pub fn kernel_msi_create(bus: u16, slot: u16, func: u16) -> usize;
     pub fn kernel_msix_destroy(handle: usize);
     pub fn kernel_msix_mask(handle: usize, index: u16);
     pub fn kernel_msix_unmask(handle: usize, index: u16);

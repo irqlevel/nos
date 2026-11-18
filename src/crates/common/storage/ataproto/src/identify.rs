@@ -22,8 +22,11 @@ const W_MODEL: usize = 27;
 const MODEL_WORDS: usize = 20;
 const W_CAPABILITIES: usize = 49;
 const W_LBA28_SECTORS: usize = 60;
+const W_QUEUE_DEPTH: usize = 75;
+const W_SATA_CAPABILITIES: usize = 76;
 const W_COMMANDS1_SUPPORTED: usize = 82;
 const W_COMMANDS2_SUPPORTED: usize = 83;
+const W_COMMANDS3_SUPPORTED: usize = 84;
 const W_COMMANDS1_ENABLED: usize = 85;
 const W_LBA48_SECTORS: usize = 100;
 const W_SECTOR_SIZES: usize = 106;
@@ -52,6 +55,17 @@ const CMD2_FLUSH_EXT: u16 = 1 << 13;
 const SIZES_LONG_LOGICAL: u16 = 1 << 12;
 const SIZES_MULTIPLE_LOGICAL: u16 = 1 << 13;
 const SIZES_LOG2_PER_PHYSICAL: u16 = 0x000F;
+/// Word 75 bits 0-4: the most commands the disk queues, less one.
+const QUEUE_DEPTH_MASK: u16 = 0x1F;
+/// Word 76 bit 8: NCQ -- READ and WRITE FPDMA QUEUED. A word 76 of 0 or of
+/// all ones is a disk that says nothing of SATA's capabilities.
+const SATA_NCQ: u16 = 1 << 8;
+/// Word 84 bit 5: the General Purpose Logging feature set -- READ LOG EXT,
+/// which is how a disk names the queued command that failed.
+const CMD3_GPL: u16 = 1 << 5;
+/// Word 84 bit 6: writes past the cache by the command's own FUA bit --
+/// WRITE DMA FUA EXT, and WRITE FPDMA QUEUED's.
+const CMD3_FUA: u16 = 1 << 6;
 /// Word 169 bit 0: DATA SET MANAGEMENT's TRIM.
 const DSM_TRIM: u16 = 1 << 0;
 /// Word 217: 1 is a disk that does not spin; 0x0401 to 0xFFFE its speed.
@@ -111,6 +125,12 @@ pub struct Identify {
     /// None when the disk says nothing of a write cache.
     pub write_cache: Option<bool>,
     pub trim: bool,
+    /// How many commands the disk queues (NCQ), when it queues any.
+    pub ncq_depth: Option<u8>,
+    /// READ LOG EXT: the NCQ Command Error log's way in.
+    pub gpl: bool,
+    /// A write's FUA bit honoured: durable when it ends.
+    pub fua: bool,
     pub rotation: Rotation,
     pub model: [u8; MODEL_WORDS * 2],
     pub serial: [u8; SERIAL_WORDS * 2],
@@ -186,6 +206,13 @@ impl Identify {
         let write_cache = (valid(cmd1) && cmd1 & CMD1_WRITE_CACHE != 0)
             .then_some(valid(enabled1) && enabled1 & CMD1_WRITE_CACHE != 0);
 
+        let sata = words[W_SATA_CAPABILITIES];
+        let ncq_depth = (sata != 0 && sata != 0xFFFF && sata & SATA_NCQ != 0)
+            .then(|| (words[W_QUEUE_DEPTH] & QUEUE_DEPTH_MASK) as u8 + 1);
+        let cmd3 = words[W_COMMANDS3_SUPPORTED];
+        let gpl = valid(cmd3) && cmd3 & CMD3_GPL != 0;
+        let fua = valid(cmd3) && cmd3 & CMD3_FUA != 0 && lba48;
+
         let rotation = match words[W_ROTATION] {
             ROTATION_NONE => Rotation::Solid,
             rpm @ ROTATION_RPM_MIN..=ROTATION_RPM_MAX => Rotation::Rpm(rpm),
@@ -200,6 +227,9 @@ impl Identify {
             flush,
             write_cache,
             trim: words[W_DSM] & DSM_TRIM != 0,
+            ncq_depth,
+            gpl,
+            fua,
             rotation,
             model: string(words, W_MODEL),
             serial: string(words, W_SERIAL),

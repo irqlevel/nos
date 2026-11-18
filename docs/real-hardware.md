@@ -319,14 +319,30 @@ its disks and its NICs were:
   disks `ada` and `adb` at 6 Gbps, the six empty ports passed over in the one
   second their links are given together. nos's root is the first partition
   of the second SSD, its disk log the next one; under UEFI the firmware
-  boots by its BootOrder, so that disk carries no boot code. A command at a
-  time, polled, the link kept out of its power states: 354 MiB/s in reads of
-  128 KiB, 11 000 random reads of 4 KiB a second (Ubuntu's 412 MiB/s and 9 100
-  with its CPUs held out of deep C-states, `fio` at the same depth); what it
-  lacks is depth — Ubuntu's NCQ reads 76 500 a second at 32 in flight. Through
-  ext4, a 256 MiB file reads at 230–243 MiB/s and copies at 48, since a
-  batch's run of contiguous blocks is one command (94 and 20 when each block
-  was a command of its own); commands past 256 KiB are no faster on this SSD
+  boots by its BootOrder, so that disk carries no boot code. Its MSI is
+  32-bit and cannot be masked; on it the driver keeps up to 31 commands out a
+  disk (NCQ), the link kept out of its power states. Against Ubuntu's `fio`
+  on the same SSD, its CPUs held out of deep C-states (`blkload` in nos,
+  writes to a third partition of nos's SSD made for them): 76 500 random
+  reads of 4 KiB a second at 32 in flight (Ubuntu's 76 700), 46 200 random
+  writes (46 700), 431–434 MiB/s in reads of 128 KiB at 4 in flight and 500
+  of 256 KiB at 8 (446 and 504); at one in flight 8 200–8 900 random reads
+  (8 100) and 30 400–30 900 random writes (23 800), but 317 MiB/s in reads
+  of 128 KiB (364): a quarter of them some 150 µs slower, a tail there
+  before NCQ too, the same through the device's queue as by a task, and
+  neither the link's power states nor the CPU the MSI goes to sleeping deep
+  (kept awake by the other disk's completions, 332) -- open. Through the
+  device's queue (`blkload ... aio`, a VM's disk's path) it does what tasks
+  do: 92 500 random reads a second at 32 in flight on Ubuntu's SSD by either,
+  46 200 random writes for 30 s. Once in some 80 s of load the error
+  handler's look found an interrupt pending a millisecond with no MSI taken
+  for it, as an early look -- one that held only its first read of IS --
+  could find of an ISR already under way; the look that holds every bit at
+  every read found none in three minutes of load after. Through ext4 NCQ
+  changes nothing: a file's batches go to the disk one after another, so a
+  256 MiB file reads at 205–243 MiB/s and copies at 46–48, since a batch's
+  run of contiguous blocks is one command (94 and 20 when each block was a
+  command of its own); commands past 256 KiB are no faster on this SSD
   (293 MiB/s at 512 KiB to 315 at 256, its Ubuntu disk), so 256 KiB is where
   the driver stops a command.
 - **Its NICs are a two-port Intel I350** (8086:1521, Supermicro's

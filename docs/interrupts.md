@@ -1,8 +1,8 @@
 # Interrupts
 
 Two interrupt controllers behind one registration API. On x86-64 it is an
-IDT with IOAPIC routing, the local APIC for IPIs and timers, and MSI-X for
-PCIe devices; on arm64 it is GICv3, with PCIe MSI translated into LPIs by
+IDT with IOAPIC routing, the local APIC for IPIs and timers, and MSI-X (or
+a plain MSI) for PCIe devices; on arm64 it is GICv3, with PCIe MSI translated into LPIs by
 the ITS. Drivers see the same two functions on both.
 
 ## The registration API
@@ -65,7 +65,7 @@ are (`hal/irqchip.h`: `irq_eoi`, `send_ipi`, `get_current_cpu_hw_id`,
 | `0x20`, `0x21`, `0x24` | Tick (PIT or HPET), 8042 keyboard, serial |
 | — | the virtio devices are Rust drivers and take one of the shared Rust slots below, on a line or as MSI-X |
 | `0x38`–`0x3F` | Legacy INTx lines requested by Rust drivers (8 slots). A line takes the first of these vectors nothing is registered at, from its slot's own on: a slot's own may still be a shared line's, whose first handler was that slot's and has left |
-| `0x40`–`0xEF` | MSI-X vectors, the lowest free one handed out by `MsixTable::alloc_vector` and given back when its table goes |
+| `0x40`–`0xEF` | MSI-X vectors and MSI's, the lowest free one handed out by `MsixTable::alloc_vector` and given back when its table goes |
 | `0xFC` | Posted-interrupt notification (`hal::POSTED_VECTOR`): a vCPU in its guest takes it without an exit (VT-x's posted interrupts, [the hypervisor](hypervisor.md#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)); one out of its guest only ends it |
 | `0xFD` | Local APIC timer — this CPU's tick, and the deadline of a task asleep on it: one-shot ([the local timer](scheduler.md#the-local-timer)) |
 | `0xFE` | IPI (`hal::IPI_VECTOR`) |
@@ -163,6 +163,32 @@ Rust drivers reach the same table through the FFI
 in 32 pre-generated stub slots that dispatch to the registered Rust closure
 under a read-write lock, with an in-flight counter so unregistering can wait
 out an ISR that is mid-call.
+
+### MSI
+
+A device with MSI and no MSI-X -- the C236's AHCI HBA, QEMU's ICH9 -- gets
+the same `MsixTable`, of one entry: `setup_msi()` (`drivers/msi.cpp`) finds
+capability 0x05 and refuses one placed too near the end of the standard
+config space for its longest form (24 bytes) to fit, turns it off with one
+message enabled (Multiple Message Enable 0), masks the vector where the
+device has per-vector masking, and on arm64 gives the device to the ITS as
+MSI-X does -- `its=off`, and there is no MSI, and the driver polls.
+`enable_vector(0, handler)` writes the message into the capability with the
+vector masked -- the local APIC's address and the vector on x86, the ITS's
+doorbell and event 0 on arm64, refused where the device addresses 32 bits
+and the doorbell is above them -- installs the handler, unmasks, and sets
+INTx Disable and then MSI Enable. A vector that cannot be masked is not:
+`mask` leaves it, and `retarget` rewrites the address, one dword the device
+takes whole, the vector the same at either CPU. Rust has it as
+`MsixTable::new_msi` (`kernel_msi_create`), its one entry index 0 to
+`MsixInterrupt::register_for` like an MSI-X table's.
+
+An MSI is an edge as an MSI-X entry is, and the AHCI HBA raises one for a
+status register software clears (IS): one lost, and the HBA may raise no
+other while IS stays set. So the driver's error-handling task looks at IS
+every 100 ms, and an interrupt pending a millisecond with no MSI taken for
+it is said and taken there (`Hba::look`) -- the stall it costs a tenth of a
+second, not every request after it.
 
 ## arm64: GICv3, and the ITS
 
