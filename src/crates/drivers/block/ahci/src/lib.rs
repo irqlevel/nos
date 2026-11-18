@@ -8,15 +8,27 @@
 //! DMA -- UEFI's own driver leaves its command lists and FIS areas pointing
 //! at memory the kernel has handed out by then -- and CAP and PI written back
 //! as they were, which some of Intel's lose to the reset. Each implemented
-//! port then gets a page of its own: its command list, the area the HBA puts
-//! the FISes it receives in, and one command table. A disk is one command at
-//! a time, slot 0, polled, under its port's lock: READ and WRITE DMA EXT
-//! straight to and from the caller's buffer through the table's PRDT, its
-//! pages found by their physical addresses; FLUSH CACHE EXT; IDENTIFY DEVICE
-//! read by `ataproto`, as the IDE driver reads it. A command that fails is
-//! said with the port's registers, and the port is brought back as AHCI 1.3.1
-//! 6.2.2.2 says: stopped, its errors cleared, the device's busy cleared by
-//! CLO or a COMRESET, started again.
+//! port then gets pages of its own: its command list, the area the HBA puts
+//! the FISes it receives in, and one command table, whose PRDT has room for
+//! 504 pieces of memory scattered anywhere. A disk is one command at a time,
+//! slot 0, polled, under its port's lock: READ and WRITE DMA EXT straight to
+//! and from the caller's buffer through the PRDT, its pages found by their
+//! physical addresses, up to 256 KiB a command; a batch's pieces
+//! (`read_pieces`, `write_pieces`) that follow one another on the disk one
+//! command, wherever they are in the batch's buffer -- an ext4 batch of a
+//! file's contiguous blocks is one read; FLUSH CACHE EXT; at power-off
+//! STANDBY IMMEDIATE; IDENTIFY DEVICE read by `ataproto`, as the IDE driver
+//! reads it.
+//!
+//! A command that fails is said with the port's registers, and the port is
+//! brought back as AHCI 1.3.1 6.2.2.2 and 10.4.2 say: stopped -- and where
+//! its command engine will not stop, reset (COMRESET) -- its errors cleared,
+//! the device's busy cleared by CLO or a COMRESET, started again. A link lost
+//! under a command (PxIS.PRCS or PCS) ends it at once rather than at its
+//! timeout. A port that does not come back, or `ataproto::MAX_UNFINISHED`
+//! commands running that did not finish, and the disk is failed: said once,
+//! and every request of it refused at once from then on, rather than each
+//! waiting out a timeout of its own.
 //!
 //! Disks are named by where they are connected, `ada` the first HBA's port
 //! 0, so that a name is a port whatever else is plugged in.
@@ -36,7 +48,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use ataproto::cmd;
 use ataproto::identify::{self, Flush, Identify, Rotation, WORDS};
-use block::BlockDriver;
+use ataproto::MAX_UNFINISHED;
+use block::{BlockDriver, Piece};
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::{self, DmaBuffer, PhysMapping};
 use kcore::io::MmioRegion;
@@ -120,6 +133,12 @@ const TFD_BSY: u32 = 1 << 7;
 /// PxIS bits that end a command as failed: a task file error, a host bus
 /// fatal or data error, an interface fatal error, an overflow.
 const IS_ERRORS: u32 = (1 << 30) | (1 << 29) | (1 << 28) | (1 << 27) | (1 << 24);
+/// PxIS bits that say the link changed under a command: PhyRdy changed
+/// (PRCS, PxSERR.DIAG.N) or the device announced itself again (PCS,
+/// PxSERR.DIAG.X -- a COMINIT). The command is lost either way. Both are
+/// PxSERR's, cleared there (`clear_errors`), and with the link kept out of
+/// its power states nothing else sets them.
+const IS_LINK: u32 = (1 << 22) | (1 << 6);
 
 const SSTS_DET_MASK: u32 = 0xF;
 /// A device there and the PHY talking to it.
@@ -136,8 +155,11 @@ const SCTL_IPM_NONE: u32 = 3 << 8;
 const SIG_ATA: u32 = 0x0000_0101;
 const SIG_ATAPI: u32 = 0xEB14_0101;
 
-/* ---- a port's page ---- */
+/* ---- a port's pages ---- */
 
+/// What a port has of memory: one physically contiguous run of pages.
+const PORT_PAGES: usize = 3;
+const PORT_BYTES: usize = PORT_PAGES * PAGE_SIZE;
 /// The command list: 32 headers of 32 bytes, 1 KiB aligned, slot 0 used.
 const CL_OFFSET: usize = 0;
 /// The received FIS area, 256 bytes, 256-aligned.
@@ -146,12 +168,12 @@ const FIS_OFFSET: usize = 1024;
 const IDENTIFY_OFFSET: usize = 1536;
 const IDENTIFY_BYTES: usize = 512;
 /// Slot 0's command table, 128-aligned: the command FIS at its start, the
-/// PRDT from 0x80 to the end of the page.
-const TABLE_OFFSET: usize = 2048;
+/// PRDT from 0x80 to the end of the port's pages.
+const TABLE_OFFSET: usize = PAGE_SIZE;
 const CFIS_BYTES: usize = 64;
 const PRDT_OFFSET: usize = TABLE_OFFSET + 0x80;
 const PRD_BYTES: usize = 16;
-const MAX_PRDS: usize = (PAGE_SIZE - PRDT_OFFSET) / PRD_BYTES;
+const MAX_PRDS: usize = (PORT_BYTES - PRDT_OFFSET) / PRD_BYTES;
 /// One PRD entry moves at most 4 MiB; its count is the bytes less one.
 const PRD_MAX_BYTES: usize = 4 << 20;
 const PRD_DBC_MASK: u32 = (1 << 22) - 1;
@@ -169,12 +191,20 @@ const FIS_H2D_COMMAND: u8 = 1 << 7;
 const FIS_DEVICE_LBA: u8 = 1 << 6;
 const FIS_H2D_BYTES: usize = 20;
 
-/// The most one command moves: 33 PRD entries at most, for a buffer that
-/// starts in the middle of a page -- well inside the table's MAX_PRDS.
-const MAX_BYTES_PER_COMMAND: usize = 128 * 1024;
+/// The most one command moves: what ext4's batch is, 64 blocks of 4 KiB,
+/// and as fast a size as measured. The Supermicro's SSD read one command at
+/// a time under this driver at 313 MiB/s in commands of 128 KiB, 315 in
+/// commands of 256 and 293 in commands of 512 (blkload, its Ubuntu disk,
+/// twice each to a tenth): bigger is not faster here, and past 256 slower.
+/// A page a PRD entry, for a buffer that starts in the middle of a page, is
+/// 65 entries; MAX_PRDS has room besides for a batch of pieces shorter than
+/// a page, each an entry of its own.
+const MAX_BYTES_PER_COMMAND: usize = 256 << 10;
+const _: () = assert!(MAX_BYTES_PER_COMMAND / PAGE_SIZE + 1 <= MAX_PRDS, "a command's pages fit its PRDT");
 const LBA28_LIMIT: u64 = 1 << 28;
-/// A 28-bit command's 0 in the count register is 256.
+/// A 28-bit command's 0 in the count register is 256, a 48-bit one's 65536.
 const LBA28_COUNT_MAX: u64 = 256;
+const LBA48_COUNT_MAX: u64 = 65536;
 
 /* ---- how long things may take ---- */
 
@@ -192,6 +222,8 @@ const IDENTIFY_MS: u64 = 5_000;
 /// A command that moves data: an HDD may spin up or retry a sector.
 const COMMAND_MS: u64 = 31_000;
 const FLUSH_MS: u64 = 60_000;
+/// An HDD spinning down takes seconds.
+const STANDBY_MS: u64 = 31_000;
 
 /// Disks named `ada`..`adz`, by their port's place across the HBAs.
 const MAX_DISKS: usize = 26;
@@ -234,6 +266,8 @@ enum Fault {
     Device { is: u32, tfd: u32 },
     /// Done, but fewer bytes moved than were asked for.
     Short { moved: u32, asked: usize },
+    /// The link went from under it (`IS_LINK`): PxIS and PxSSTS then.
+    Link { is: u32, ssts: u32 },
     /// A buffer the HBA cannot take: no physical address, an odd one, past
     /// 32 bits on an HBA without 64-bit addressing, more pieces than a PRDT.
     Buffer,
@@ -254,6 +288,7 @@ impl Fault {
                 "failed, is {:#x}, status {:#x} error {:#x}", is, tfd & TFD_STATUS_MASK,
                 (tfd >> TFD_ERROR_SHIFT) & TFD_STATUS_MASK),
             Fault::Short { moved, asked } => alloc::format!("moved {} of the {} bytes asked", moved, asked),
+            Fault::Link { is, ssts } => alloc::format!("lost its link, is {:#x} ssts {:#x}", is, ssts),
             Fault::Buffer => String::from("a buffer the HBA cannot take"),
         }
     }
@@ -261,14 +296,19 @@ impl Fault {
 
 /* ---- a port ---- */
 
-/// A port's registers and its page. Reached through its disk's lock alone,
-/// so that a command -- its FIS, PRDT and header written, issued, waited for
-/// -- is one holder's from start to end.
+/// A port's registers and its pages, and how its disk is doing. Reached
+/// through its disk's lock alone, so that a command -- its FIS, PRDT and
+/// header written, issued, waited for -- is one holder's from start to end.
 struct Port {
     regs: MmioRegion,
     mem: DmaBuffer,
     /// The HBA's CAP: 64-bit addressing, CLO.
     cap: u32,
+    /// Commands in a row that did not finish: timed out, or lost the link.
+    unfinished: u32,
+    /// Given up on (`AhciDisk::give_up`): the port stopped, every request
+    /// refused.
+    failed: bool,
 }
 
 impl Port {
@@ -330,28 +370,33 @@ impl Port {
         true
     }
 
-    /// Back from a failed command (AHCI 1.3.1, 6.2.2.2): stopped, errors
-    /// cleared, the device's busy cleared by CLO where the HBA has it and by
-    /// a COMRESET where it has not or that did not, started again.
+    /// Back from a failed command (AHCI 1.3.1, 6.2.2.2 and 10.4.2): stopped,
+    /// errors cleared, and a COMRESET -- with ST off -- where the command
+    /// engine would not stop, the link is gone, or the device stays busy and
+    /// CLO cannot clear that; started again. False where none of it brings
+    /// the port back.
     fn recover(&self) -> bool {
         let command = self.read(PX_CMD);
         self.write(PX_CMD, command & !CMD_ST);
-        if !wait(PORT_STOP_MS, || self.read(PX_CMD) & CMD_CR == 0) {
+        let stopped = wait(PORT_STOP_MS, || self.read(PX_CMD) & CMD_CR == 0);
+        self.clear_errors();
+        let reset = !stopped || !self.linked() || !(self.ready() || self.override_busy());
+        if reset && (!self.comreset() || !wait(PORT_STOP_MS, || self.read(PX_CMD) & CMD_CR == 0)) {
             return false;
         }
-        self.clear_errors();
-        if !self.ready() {
-            let mut cleared = false;
-            if self.cap & CAP_SCLO != 0 {
-                let command = self.read(PX_CMD);
-                self.write(PX_CMD, command | CMD_CLO);
-                cleared = wait(PORT_STOP_MS, || self.read(PX_CMD) & CMD_CLO == 0) && self.ready();
-            }
-            if !cleared && !self.comreset() {
-                return false;
-            }
-        }
         self.start()
+    }
+
+    /// CLO, where the HBA has it: the device's busy and DRQ taken out of
+    /// PxTFD, so that a command can be issued to it again. Whether the
+    /// device then reads as ready.
+    fn override_busy(&self) -> bool {
+        if self.cap & CAP_SCLO == 0 {
+            return false;
+        }
+        let command = self.read(PX_CMD);
+        self.write(PX_CMD, command | CMD_CLO);
+        wait(PORT_STOP_MS, || self.read(PX_CMD) & CMD_CLO == 0) && self.ready()
     }
 
     /// One PRD entry: `len` bytes at `phys`.
@@ -402,6 +447,57 @@ impl Port {
         Ok(entries)
     }
 
+    /// The PRDT of the one command that takes `pieces` from the first on,
+    /// each `len` bytes at `phys + at` of a batch's buffer -- for as long as
+    /// they follow one another on the disk and the command has room: at most
+    /// `limit` bytes and MAX_PRDS entries, pieces next to each other in
+    /// memory one entry. How many pieces it takes, their bytes, and the
+    /// entries.
+    fn prdt_for_pieces(&mut self, phys: u64, pieces: &[Piece], sector_size: usize, limit: usize)
+        -> Result<(usize, usize, usize), Fault>
+    {
+        let mut taken = 0usize;
+        let mut bytes = 0usize;
+        let mut entries = 0usize;
+        let mut run: Option<(u64, usize)> = None;
+        let mut next_sector = pieces.first().map_or(0, |p| p.sector);
+        for p in pieces {
+            if p.sector != next_sector || p.len == 0 || p.len % sector_size != 0
+                || bytes.checked_add(p.len).is_none_or(|total| total > limit)
+            {
+                break;
+            }
+            let at = phys.checked_add(p.at as u64).ok_or(Fault::Buffer)?;
+            run = match run {
+                Some((start, len)) if start.checked_add(len as u64) == Some(at) && len + p.len <= PRD_MAX_BYTES => {
+                    Some((start, len + p.len))
+                }
+                Some((start, len)) => {
+                    /* Room for the run closed here and the one this piece
+                     * opens, or the command ends before it */
+                    if entries + 2 > MAX_PRDS {
+                        break;
+                    }
+                    self.put_prd(entries, start, len)?;
+                    entries += 1;
+                    Some((at, p.len))
+                }
+                None => Some((at, p.len)),
+            };
+            bytes += p.len;
+            next_sector = p.sector.checked_add((p.len / sector_size) as u64).ok_or(Fault::Buffer)?;
+            taken += 1;
+        }
+        if let Some((start, len)) = run {
+            self.put_prd(entries, start, len)?;
+            entries += 1;
+        }
+        if taken == 0 {
+            return Err(Fault::Buffer);
+        }
+        Ok((taken, bytes, entries))
+    }
+
     /// Slot 0's command -- `fis`, over `prds` PRD entries already written --
     /// issued and waited for: the bytes the HBA says it moved.
     fn execute(&mut self, fis: &[u8; FIS_H2D_BYTES], prds: usize, write: bool, ms: u64) -> Result<u32, Fault> {
@@ -434,6 +530,11 @@ impl Port {
             }
             if self.read(PX_CI) & 1 == 0 {
                 break;
+            }
+            /* Not done, and the link changed under it: lost, and said now
+             * rather than at its timeout */
+            if is & IS_LINK != 0 {
+                return Err(Fault::Link { is, ssts: self.read(PX_SSTS) });
             }
             if deadline.passed() {
                 return Err(Fault::Timeout { is, tfd: self.read(PX_TFD), ci: self.read(PX_CI) });
@@ -522,51 +623,95 @@ impl AhciDisk {
         count != 0 && lba.checked_add(count).is_some_and(|end| end <= limit)
     }
 
-    fn failed(&self, port: &Port, what: &str, lba: u64, count: u64, fault: Fault) {
-        let (bus, slot, func, index) = self.at;
-        klog!(0, "ahci: {} ({:02x}:{:02x}.{} port {}): {} of {} sectors at {}: {}, serr {:#x} ssts {:#x}",
-            self.name(), bus, slot, func, index, what, count, lba, fault.describe(), port.read(PX_SERR),
-            port.read(PX_SSTS));
-        if !port.recover() {
-            klog!(0, "ahci: {}: the port did not come back: tfd {:#x} cmd {:#x}", self.name(), port.read(PX_TFD),
-                port.read(PX_CMD));
-        }
+    /// The most bytes one command moves on this disk: MAX_BYTES_PER_COMMAND,
+    /// or what its count register reaches, whole sectors.
+    fn per_command(&self) -> usize {
+        let size = self.id.sector_size as usize;
+        let count = if self.id.lba48 { LBA48_COUNT_MAX } else { LBA28_COUNT_MAX } as usize;
+        (MAX_BYTES_PER_COMMAND / size).min(count).max(1) * size
     }
 
-    /// Whole sectors to or from `addr`, `len` bytes, from `lba` on: in
-    /// commands of at most MAX_BYTES_PER_COMMAND, the buffer the device's.
-    fn transfer(&self, lba: u64, addr: usize, len: usize, write: bool) -> bool {
-        let size = self.id.sector_size as usize;
-        if len == 0 || len % size != 0 || !self.within(lba, (len / size) as u64) {
-            klog!(0, "ahci: {}: a {} of {} bytes at {} is none this disk takes", self.name(),
-                if write { "write" } else { "read" }, len, lba);
-            return false;
-        }
-        let per_command = (MAX_BYTES_PER_COMMAND / size).max(1) * size;
-        let command = match (write, self.id.lba48) {
+    fn data_command(&self, write: bool) -> u8 {
+        match (write, self.id.lba48) {
             (false, true) => cmd::READ_DMA_EXT,
             (true, true) => cmd::WRITE_DMA_EXT,
             (false, false) => cmd::READ_DMA,
             (true, false) => cmd::WRITE_DMA,
+        }
+    }
+
+    /// What a command came to, taken in: done, the port's run of commands
+    /// that did not finish ends; failed, it is said with the port's
+    /// registers and the port brought back -- and where it will not come
+    /// back, or MAX_UNFINISHED commands running have not finished, the disk
+    /// is given up on. Whether the command went through.
+    fn outcome(&self, port: &mut Port, what: &str, lba: u64, count: u64, result: Result<(), Fault>) -> bool {
+        let fault = match result {
+            Ok(()) => {
+                port.unfinished = 0;
+                return true;
+            }
+            Err(fault) => fault,
         };
+        let (bus, slot, func, index) = self.at;
+        klog!(0, "ahci: {} ({:02x}:{:02x}.{} port {}): {} of {} sectors at {}: {}, serr {:#x} ssts {:#x}",
+            self.name(), bus, slot, func, index, what, count, lba, fault.describe(), port.read(PX_SERR),
+            port.read(PX_SSTS));
+        match fault {
+            /* Nothing was handed to the HBA: nothing to bring back */
+            Fault::Buffer => return false,
+            Fault::Timeout { .. } | Fault::Link { .. } => port.unfinished += 1,
+            /* The device answered: it is there */
+            Fault::Device { .. } | Fault::Short { .. } => port.unfinished = 0,
+        }
+        if !port.recover() {
+            self.give_up(port, "the port did not come back");
+        } else if port.unfinished >= MAX_UNFINISHED {
+            self.give_up(port, "commands in a row did not finish");
+        }
+        false
+    }
+
+    /// The disk failed for good: its port stopped, so that the HBA does
+    /// nothing more in its memory, and every request of it refused from here
+    /// on at once -- said once, here, rather than as a timeout a request.
+    fn give_up(&self, port: &mut Port, why: &str) {
+        port.failed = true;
+        let _ = port.stop();
+        let (bus, slot, func, index) = self.at;
+        klog!(0, "ahci: {} ({:02x}:{:02x}.{} port {}): {} (tfd {:#x} cmd {:#x} ssts {:#x}): the disk is failed, \
+                  and every request of it refused from here on",
+            self.name(), bus, slot, func, index, why, port.read(PX_TFD), port.read(PX_CMD), port.read(PX_SSTS));
+    }
+
+    /// Whole sectors to or from `addr`, `len` bytes, from `lba` on: in
+    /// commands of at most `per_command`, the buffer the device's.
+    fn transfer(&self, lba: u64, addr: usize, len: usize, write: bool) -> bool {
+        let size = self.id.sector_size as usize;
+        let what = if write { "write" } else { "read" };
+        if len == 0 || len % size != 0 || !self.within(lba, (len / size) as u64) {
+            klog!(0, "ahci: {}: a {} of {} bytes at {} is none this disk takes", self.name(), what, len, lba);
+            return false;
+        }
+        let per_command = self.per_command();
+        let command = self.data_command(write);
 
         let mut port = self.port.lock();
+        if port.failed {
+            return false;
+        }
         let mut done = 0usize;
         while done < len {
             let bytes = per_command.min(len - done);
             let count = (bytes / size) as u64;
             let at = lba + (done / size) as u64;
-            if !self.id.lba48 && count > LBA28_COUNT_MAX {
-                return false;
-            }
             let result = port.prdt_for(addr + done, bytes).and_then(|prds| {
                 let fis = command_fis(command, at, count, self.id.lba48);
                 port.execute(&fis, prds, write, COMMAND_MS)
             }).and_then(|moved| {
                 if moved as usize == bytes { Ok(()) } else { Err(Fault::Short { moved, asked: bytes }) }
             });
-            if let Err(fault) = result {
-                self.failed(&port, if write { "write" } else { "read" }, at, count, fault);
+            if !self.outcome(&mut port, what, at, count, result) {
                 return false;
             }
             done += bytes;
@@ -574,22 +719,72 @@ impl AhciDisk {
         true
     }
 
+    /// A batch (`read_pieces`, `write_pieces`): its pieces, each `len`
+    /// bytes at `phys + at` of the batch's buffer, a command for every run
+    /// of them that follow one another on the disk -- a run of a file's
+    /// contiguous blocks one command, wherever its pieces are in the buffer.
+    /// The table has checked every piece against the buffer and the device;
+    /// the command's range is checked again here, as `transfer`'s is.
+    fn batch(&self, write: bool, phys: u64, base: u64, pieces: &[Piece]) -> bool {
+        let size = self.id.sector_size as usize;
+        let what = if write { "batch write" } else { "batch read" };
+        let per_command = self.per_command();
+        let command = self.data_command(write);
+
+        let mut port = self.port.lock();
+        if port.failed {
+            return false;
+        }
+        let mut next = 0usize;
+        while let Some(first) = pieces.get(next) {
+            let Some(lba) = base.checked_add(first.sector) else { return false };
+            let (taken, result, count) = match port.prdt_for_pieces(phys, &pieces[next..], size, per_command) {
+                Ok((taken, bytes, prds)) => {
+                    let count = (bytes / size) as u64;
+                    let result = if self.within(lba, count) {
+                        let fis = command_fis(command, lba, count, self.id.lba48);
+                        port.execute(&fis, prds, write, COMMAND_MS).and_then(|moved| {
+                            if moved as usize == bytes { Ok(()) } else { Err(Fault::Short { moved, asked: bytes }) }
+                        })
+                    } else {
+                        Err(Fault::Buffer)
+                    };
+                    (taken, result, count)
+                }
+                Err(fault) => (0, Err(fault), (first.len / size) as u64),
+            };
+            if !self.outcome(&mut port, what, lba, count, result) {
+                return false;
+            }
+            next += taken;
+        }
+        true
+    }
+
+    /// A command that moves nothing -- a flush, a standby -- issued and
+    /// taken in as every command is.
+    fn non_data(&self, command: u8, what: &str, ms: u64) -> bool {
+        let mut port = self.port.lock();
+        if port.failed {
+            return false;
+        }
+        let fis = command_fis(command, 0, 0, false);
+        let result = port.execute(&fis, 0, false, ms).map(|_| ());
+        self.outcome(&mut port, what, 0, 0, result)
+    }
+
     /// The write cache pushed out, where the disk has a command for it.
     fn flush_cache(&self) -> bool {
-        let command = match self.id.flush {
-            Flush::None => return true,
-            Flush::Flush => cmd::FLUSH_CACHE,
-            Flush::FlushExt => cmd::FLUSH_CACHE_EXT,
-        };
-        let mut port = self.port.lock();
-        let fis = command_fis(command, 0, 0, false);
-        match port.execute(&fis, 0, false, FLUSH_MS) {
-            Ok(_) => true,
-            Err(fault) => {
-                self.failed(&port, "flush", 0, 0, fault);
-                false
-            }
+        match self.id.flush {
+            Flush::None => true,
+            Flush::Flush => self.non_data(cmd::FLUSH_CACHE, "flush", FLUSH_MS),
+            Flush::FlushExt => self.non_data(cmd::FLUSH_CACHE_EXT, "flush", FLUSH_MS),
         }
+    }
+
+    /// The disk told the power is about to go: STANDBY IMMEDIATE.
+    fn standby(&self) -> bool {
+        self.non_data(cmd::STANDBY_IMMEDIATE, "standby", STANDBY_MS)
     }
 }
 
@@ -609,6 +804,14 @@ impl BlockDriver for AhciDisk {
     /* FUA as a flush after the write: a flush is what makes it durable */
     fn write(&'static self, sector: u64, data: &[u8], fua: bool) -> bool {
         self.transfer(sector, data.as_ptr() as usize, data.len(), true) && (!fua || self.flush_cache())
+    }
+
+    fn write_pieces(&'static self, base: u64, buf: &DmaBuffer, pieces: &[Piece]) -> bool {
+        self.batch(true, buf.phys(), base, pieces)
+    }
+
+    fn read_pieces(&'static self, base: u64, buf: &mut DmaBuffer, pieces: &[Piece]) -> bool {
+        self.batch(false, buf.phys(), base, pieces)
     }
 
     fn flush(&'static self) -> bool {
@@ -679,9 +882,11 @@ fn prepare_port(port: &mut Port, name: (u16, u16, u16, u32)) -> bool {
 
     let clb = port.mem.phys() + CL_OFFSET as u64;
     let fb = port.mem.phys() + FIS_OFFSET as u64;
-    if (clb >> 32 != 0 || fb >> 32 != 0) && port.cap & CAP_S64A == 0 {
-        klog!(0, "ahci: {:02x}:{:02x}.{} port {}: its page is past 4 GiB and the HBA addresses 32 bits", bus, slot,
-            func, index);
+    /* The command list, the FIS area and the command table are all in it */
+    let last = port.mem.phys() + (PORT_BYTES - 1) as u64;
+    if last >> 32 != 0 && port.cap & CAP_S64A == 0 {
+        klog!(0, "ahci: {:02x}:{:02x}.{} port {}: its pages are past 4 GiB and the HBA addresses 32 bits", bus,
+            slot, func, index);
         return false;
     }
     port.write(PX_CLB, clb as u32);
@@ -851,11 +1056,11 @@ fn take(dev: &PciDevice) {
             continue;
         }
         let Some(window) = regs.window(PORTS_BASE + index * PORT_STRIDE) else { continue };
-        let Some(mem) = DmaBuffer::new(1) else {
-            klog!(0, "ahci: no memory for a port's page");
+        let Some(mem) = DmaBuffer::new(PORT_PAGES) else {
+            klog!(0, "ahci: no memory for a port's pages");
             continue;
         };
-        let mut port = Port { regs: window, mem, cap };
+        let mut port = Port { regs: window, mem, cap, unfinished: 0, failed: false };
         if prepare_port(&mut port, (dev.bus, dev.slot, dev.func, index as u32)) && prepared.try_reserve(1).is_ok() {
             prepared.push((index, port));
         }
@@ -893,18 +1098,32 @@ pub fn init() {
     }
 }
 
-/// On the way down: every disk's cache flushed, and every port stopped, so
-/// that the HBA does nothing more with memory the kernel is done with.
-pub fn shutdown() {
+/// On the way down: every disk's cache flushed -- and with `power_off` the
+/// disk put in standby, as the power is about to go: not for a reboot,
+/// which leaves an HDD spinning to come back up the sooner -- and every port
+/// stopped, so that the HBA does nothing more with memory the kernel is done
+/// with. A disk given up on is skipped: its port is stopped already.
+pub fn shutdown(power_off: bool) {
     let count = DISK_COUNT.load(Ordering::Acquire).min(MAX_DISKS);
     for slot in DISKS[..count].iter() {
-        if let Some(disk) = slot.get() {
-            if !disk.flush_cache() {
-                klog!(0, "ahci: {}: the write cache was not flushed on the way down", disk.name());
+        let Some(disk) = slot.get() else { continue };
+        if disk.port.lock().failed {
+            klog!(0, "ahci: {}: failed, so neither flushed nor put in standby", disk.name());
+            continue;
+        }
+        if !disk.flush_cache() {
+            klog!(0, "ahci: {}: the write cache was not flushed on the way down", disk.name());
+        }
+        if power_off {
+            if disk.standby() {
+                klog!(0, "ahci: {}: in standby for the power-off", disk.name());
+            } else {
+                klog!(0, "ahci: {}: did not go to standby for the power-off", disk.name());
             }
-            if !disk.port.lock().stop() {
-                klog!(0, "ahci: {}: the port did not stop", disk.name());
-            }
+        }
+        let port = disk.port.lock();
+        if !port.failed && !port.stop() {
+            klog!(0, "ahci: {}: the port did not stop", disk.name());
         }
     }
 }

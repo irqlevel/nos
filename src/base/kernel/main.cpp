@@ -358,19 +358,20 @@ extern "C" void ap_main()
 
 typedef void (*HaltAction)();
 
-extern "C" void rust_fini();
+extern "C" void rust_fini(int power_off);
 
 /* Runs entirely on the static stack with its own stack frame.
    Releases the idle task, runs static destructors, then
-   performs the final halt/reboot action. Never returns. */
+   performs the final halt/reboot action -- power_off says which it is, for
+   rust_fini. Never returns. */
 static void __attribute__((noinline, noreturn))
-finalize_on_static_stack(Task* task, HaltAction action)
+finalize_on_static_stack(Task* task, HaltAction action, bool power_off)
 {
     klog(0, "finalize_on_static_stack");
 
     task->put();
 
-    rust_fini();
+    rust_fini(power_off ? 1 : 0);
 
     __cxa_finalize(0);
 
@@ -381,7 +382,7 @@ finalize_on_static_stack(Task* task, HaltAction action)
     while (1) cpu_halt();
 }
 
-static void prepare_halt(HaltAction action)
+static void prepare_halt(HaltAction action, bool power_off)
 {
     /* Hold an extra reference so CpuTable::reset()'s put()
     only drops refcount 2→1 instead of freeing the task
@@ -420,7 +421,7 @@ static void prepare_halt(HaltAction action)
        SpinLock, or anything containing one) are destroyed
        before reaching this point. */
     set_rsp((long)&stack[0][CPU_STACK_SIZE - 128]);
-    finalize_on_static_stack(task, action);
+    finalize_on_static_stack(task, action, power_off);
 }
 
 void shutdown()
@@ -428,7 +429,7 @@ void shutdown()
     auto& con = Console::get_instance();
     con.printf("Shutting down!\n");
 
-    prepare_halt(hal::power_off);
+    prepare_halt(hal::power_off, true);
 }
 
 void reboot()
@@ -436,7 +437,7 @@ void reboot()
     auto& con = Console::get_instance();
     con.printf("Rebooting!\n");
 
-    prepare_halt(hal::reset);
+    prepare_halt(hal::reset, false);
 }
 
 void some_task_routine(void *ctx)

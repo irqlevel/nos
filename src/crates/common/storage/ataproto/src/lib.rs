@@ -24,4 +24,14 @@ pub mod cmd {
     pub const WRITE_DMA: u8 = 0xCA;
     pub const FLUSH_CACHE: u8 = 0xE7;
     pub const FLUSH_CACHE_EXT: u8 = 0xEA;
+    /// The power is about to go: an HDD parks its heads and spins down, an
+    /// SSD puts its tables away -- what Linux sends a disk at power-off, so
+    /// that the cut is no emergency to it.
+    pub const STANDBY_IMMEDIATE: u8 = 0xE0;
 }
+
+/// How many commands in a row may not finish -- time out, or lose the link
+/// under them -- before a driver gives the disk up: every one of them is a
+/// command's whole timeout, and a disk that answers nothing would otherwise
+/// make every request of it wait that long, for as long as anybody asks.
+pub const MAX_UNFINISHED: u32 = 3;
