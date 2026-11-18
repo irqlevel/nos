@@ -7,7 +7,12 @@
 //! ICMP errors quoting them, and time passing through every timer the
 //! machine has. One port's listener is a bulk one (`Buffers::Bulk`): what it
 //! accepts has its buffers grown as it is taken, what had arrived moved
-//! across, and scales its window when the peer's SYN offers to.
+//! across, and scales its window when the peer's SYN offers to. Another's
+//! is a growable one (`Buffers::Growable`), as sshd's is: it scales its
+//! window the same and starts on the slot's own buffers, and a program grows
+//! any of its connections at any moment (`Tcp::grow`) -- a send waiting on
+//! it, data in flight, some of it SACKed, some lost -- every byte buffered
+//! and in flight moved across, and none of either stream lost or doubled.
 //!
 //! Some connections are links of the kind ipcnet's are, given a floor
 //! of their own for their retransmission timeout (`set_rto_floor`) --
@@ -47,8 +52,10 @@ const FAR_IP: u32 = 0x5DB8_D822;
 /// The ports the machine listens on -- one of them a bulk listener's, one
 /// a listener's with an allowlist -- and where the peer's own listening
 /// ports -- one for each connect of the machine's -- begin.
-const LISTEN_PORTS: [u16; 5] = [7001, 7002, 22, BULK_PORT, ALLOW_PORT];
+const LISTEN_PORTS: [u16; 6] = [7001, 7002, 22, BULK_PORT, ALLOW_PORT, GROW_PORT];
 const BULK_PORT: u16 = 7003;
+/// The growable listener (`Buffers::Growable`): sshd's kind.
+const GROW_PORT: u16 = 7006;
 /// The listener with an allowlist (`listen_allowed`): which addresses it
 /// answers is the input's, and changes as the input says.
 const ALLOW_PORT: u16 = 7004;
@@ -62,6 +69,15 @@ const CLOSED_PORT: u16 = 9;
 /// The churn's listener (`State::churn`), and the stranger's ports for it:
 /// past the flood's and the stranger's own.
 const CHURN_PORT: u16 = 7005;
+/* The churn's listener is its own: one of the input's listeners' ports
+   would have its accepts take the peer's connections there and close them */
+const _: () = {
+    let mut i = 0;
+    while i < LISTEN_PORTS.len() {
+        assert!(LISTEN_PORTS[i] != CHURN_PORT, "a listener on the churn's port");
+        i += 1;
+    }
+};
 const CHURN_PORT_BASE: u16 = 53000;
 const PEER_PORT_BASE: u16 = 8000;
 const PEER_SRC_BASE: u16 = 30000;
@@ -445,6 +461,23 @@ impl State {
             TCP.send(c, &data, timeout)
         });
         self.links[k].call = Some(Call::Send(app, n));
+    }
+
+    /// A program grows its connection's buffers to bulk ones, under way --
+    /// a call of its perhaps waiting on it, data in flight, some of it
+    /// SACKed or lost -- as sshd does a session's that starts to copy files.
+    fn grow(&mut self, r: &mut Input, k: usize) {
+        let l = &self.links[k];
+        let Some(c) = l.conn.filter(|_| !l.done) else { return };
+        let waiting = l.call.is_some();
+        let app = App::spawn("grow", r.below(4) as u32, move || TCP.grow(c));
+        invariant!(self.w.wait_app(&app, 10 * SEC), "a grow of connection {} never returned", k);
+        if app.take() == Some(true) {
+            crate::common::runner::reached("tcp: a connection grown under way");
+            if waiting {
+                crate::common::runner::reached("tcp: a connection grown with a call waiting on it");
+            }
+        }
     }
 
     fn recv(&mut self, r: &mut Input, k: usize) {
@@ -997,6 +1030,7 @@ pub fn tcp(r: &mut Input) {
     let listeners: Vec<(u16, Option<&'static Conn>)> = LISTEN_PORTS.iter().map(|&p| {
         (p, match p {
             BULK_PORT => TCP.listen_with(&nic, p, LISTEN_BACKLOG, Buffers::Bulk),
+            GROW_PORT => TCP.listen_with(&nic, p, LISTEN_BACKLOG, Buffers::Growable),
             ALLOW_PORT => TCP.listen_allowed(&nic, p, LISTEN_BACKLOG, Buffers::Small, &first_allow),
             _ => TCP.listen(&nic, p),
         })
@@ -1023,7 +1057,7 @@ pub fn tcp(r: &mut Input) {
                          next_src_port: PEER_SRC_BASE, nic, peer_ip, accepted: BTreeMap::new(), lossy, guest,
                          churn_port: CHURN_PORT_BASE };
 
-    while let Some(op) = r.op(25) {
+    while let Some(op) = r.op(26) {
         let k = if st.links.is_empty() { 0 } else { r.below(st.links.len() as u64) as usize };
         let some = !st.links.is_empty();
         match op {
@@ -1122,6 +1156,7 @@ pub fn tcp(r: &mut Input) {
             23 if r.u8() < 16 => st.churn(),
             20 => st.set_allow(r),
             22 if some => st.wake(r, k),
+            24 if some => st.grow(r, k),
             21 => {
                 /* A program gives its connection another floor, mid-way */
                 if let Some(l) = st.links.get_mut(k) {

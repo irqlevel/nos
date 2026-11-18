@@ -264,7 +264,10 @@ fn start<'a>(state: &State, words: impl Iterator<Item = &'a str>, out: &mut Outp
         .files
         .with(|_| -> Result<(HostKey, usize), String> { Ok((load_host_key(out)?, load_keys(&state.keys, out)?)) })?;
     let fingerprint = host.public().fingerprint();
-    let listener = TcpListener::bind(&nic, port, LISTEN_BACKLOG)
+    /* Every connection on the slot's own 8 KiB each way -- what knocks on
+       port 22 all day holds no more -- its window scaled for the bulk
+       buffers a session that copies files is given (`KernelLink::bulk`) */
+    let listener = TcpListener::bind_growable(&nic, port, LISTEN_BACKLOG)
         .map_err(|_| format!("cannot listen on TCP port {}: someone has it, or no connection slot is free", port))?;
 
     let shared = Arc::new(Shared {
@@ -850,6 +853,19 @@ impl ssh::Link for KernelLink<'_> {
     fn random(&mut self, buf: &mut [u8]) -> bool {
         kcore::random::fill_random(buf)
     }
+
+    /* A session that copies files -- SFTP's -- is given bulk buffers both
+       ways, up to 512 KiB each, where it had the slot's 8 KiB, which a round
+       trip of a WAN's holds a copy to a fraction of a MB/s by. They come
+       from the kernel's 32, which a relay's connections and the cluster's
+       links draw on too: a shell's session, which is typed at, keeps the
+       slot's own, and with none to be had a copy goes on on them. */
+    fn bulk(&mut self) {
+        if !self.stream.grow() {
+            kcore::klog!(1, "sshd: {}: no bulk buffers to be had, its copy stays on 8 KiB each way",
+                         Peer(self.stream.peer()));
+        }
+    }
 }
 
 /// Who may log in -- the keys in the authorized list, whatever the user
@@ -924,8 +940,8 @@ impl ssh::Subsystem for SftpSession {
         self.server.input(input, out)
     }
 
-    fn window(&self) -> u32 {
-        sftp::WINDOW
+    fn window(&self) -> (u32, u32) {
+        (sftp::WINDOW, sftp::WINDOW_LEAST)
     }
 }
 
