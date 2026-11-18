@@ -15,8 +15,16 @@ below.
 
 A server can also be nos's alone: a whole disk made nos's own, with a GRUB
 of its own that boots nos and nothing else -- from the provider's rescue
-system, or from the **installer ISO** a provider's virtual media boots
-([A disk of its own](#a-disk-of-its-own), [From an ISO](#from-an-iso)).
+system, with one command,
+
+```sh
+curl -fsSL https://nos-os.tech/install.sh | sh
+```
+
+or from the **installer ISO** a provider's virtual media boots
+([A disk of its own](#a-disk-of-its-own),
+[From a provider's rescue system](#from-a-providers-rescue-system),
+[From an ISO](#from-an-iso)).
 There is no system of the server's to fall back to then: the way back in
 is the provider's rescue system or its console.
 
@@ -34,8 +42,8 @@ but cannot fix any of them:
   the kernel -- it reads disks through the firmware -- but nos finds no root
   there: no modules, no `/etc/rc`, no sshd.
 - **A network card nos drives**: Realtek RTL8168 or RTL8125, Intel 82576,
-  I210 or I211 (the `igb` driver), Intel 82574L (the `e1000e` driver), or
-  virtio-net. With any other, nos boots and nobody can reach it. A network
+  I210, I211 or I350 (the `igb` driver), Intel 82574L (the `e1000e`
+  driver), or virtio-net. With any other, nos boots and nobody can reach it. A network
   that hands out no address by DHCP is given one with
   `--cmdline "ip=A.B.C.D/N gw=A.B.C.D dns=A.B.C.D"` -- what its Linux has
   statically ([Kernel parameters](kernel-parameters.md#networking)).
@@ -80,6 +88,7 @@ What is in it:
 | `/lib/licenses/CRYPTOGAMS` | the license of the CRYPTOGAMS assembly the kernel and its modules run -- ChaCha20-Poly1305's ([HTTPS](tls.md#the-assembly)) -- which asks a binary handed out to carry it |
 | `/etc/rc` | the default boot script: `insmod /lib/modules/sshd.ko`, `sshd start` |
 | `/nos-install` | the installer, the one that knows this image |
+| `/nos-setup` | the installer's dialog, the ISO's, run in a provider's rescue system from the image mounted ([From a provider's rescue system](#from-a-providers-rescue-system)); like `nos-install`, it stays in the image |
 | `/VERSION` | `version=`, `revision=` (what `version` prints in nos), `arch=`, `module_abi=` |
 
 Nothing in it belongs to a machine: no host key, no authorized key, no
@@ -304,20 +313,56 @@ this Linux reaches the network by.
 ### From a provider's rescue system
 
 A provider's rescue system -- a Linux booted from the network, the server's
-disks idle, reached by SSH on the server's address -- is the shortest way
-onto a server's disk: the network and the firmware there are the server's
-own. Selectel's, for one (its panel's boot template "Boot to Rescue"):
+disks idle, reached by SSH on the server's address (Selectel's: its panel's
+boot template "Boot to Rescue") -- is the shortest way onto a server's
+disk: the network and the firmware there are the server's own. One
+command, as root there:
+
+```sh
+curl -fsSL https://nos-os.tech/install.sh | sh
+```
+
+`https://nos-os.tech/install.sh` runs the newest release's `install.sh`
+(`scripts/installer/install.sh`, its release's tag written in by
+`release.yml`), which fetches that release's system image and its
+`SHA256SUMS`, checks the one against the other, mounts the image and runs
+the dialog in it -- the ISO's ([From an ISO](#from-an-iso)), on the rescue
+system's own terminal, with two differences:
+
+- **The network** is offered as the rescue system has it -- the address its
+  default route leaves by, the gateway, the DNS server (`nos-install
+  network`) -- since a rescue system is up on the server's own address; or
+  as a Linux on the disks has it, or as given. Nothing of the rescue
+  system's own network is touched: the session came in by it.
+- **The keys** root logs in with there (`/root/.ssh/authorized_keys`, its
+  `ssh-ed25519` ones) are offered, beside the ISO's paste, URL and GitHub.
+
+What the install runs and the rescue system lacks -- GRUB for BIOS and UEFI
+(`grub-pc-bin`, `grub-efi-amd64-bin`), mkfs, `efibootmgr`, `whiptail` -- is
+installed with apt-get first, where it has one; elsewhere it is named, and
+`nos-install` refuses what it cannot do without. Arguments after `sh -s --`
+are `nos-install`'s, and there is no dialog:
+
+```sh
+curl -fsSL https://nos-os.tech/install.sh | sh -s -- disk /dev/disk/by-id/ata-INTEL_SSDSC2KB240G7_BTYS81950A94240AGN \
+    --wipe --network-here --ssh-key /root/.ssh/authorized_keys --root-size 10G
+```
+
+`NOS_VERSION=v0.0.29` before `sh` takes that release's instead,
+`NOS_RELEASE_URL` a directory holding an image and its `SHA256SUMS`
+(https://, file://), and `NOS_NO_PACKAGES=1` installs nothing. By hand, the
+same:
 
 ```sh
 wget https://github.com/irqlevel/nos/releases/latest/download/nos-x86_64.squashfs
 mount -o loop,ro nos-x86_64.squashfs /mnt
-/mnt/nos-install disk /dev/disk/by-id/ata-INTEL_SSDSC2KB240G7_BTYS81950A94240AGN --wipe \
-    --network-here --ssh-key ~/.ssh/authorized_keys --root-size 10G
+/mnt/nos-setup        # the dialog -- or nos-install disk with its arguments
 umount /mnt
 ```
 
-Then the boot template back to what it was, and a reboot: the firmware
-boots nos after its PXE, which no longer sends the server to the rescue.
+Then the provider's boot back to the disks -- Selectel's boot template to
+what it was -- and a reboot: the firmware boots nos after its PXE, which no
+longer sends the server to the rescue.
 
 Selectel's "install from an image" runs an ISO in QEMU in that same rescue
 system (its `qemu-iso`), over the server's disks: the installer ISO below
@@ -325,8 +370,11 @@ works so, but from inside a virtual machine, whose network is QEMU's and
 whose firmware is QEMU's -- it can neither see the server's address nor set
 the server's boot order. The installer says so, looks for the address on a
 Linux already on the server's disks, and ends with the line to run in the
-rescue system before the reboot: `nos-install boot --default` from the
-release's image.
+rescue system before the reboot:
+
+```sh
+curl -fsSL https://nos-os.tech/install.sh | sh -s -- boot --default
+```
 
 ## From an ISO
 
