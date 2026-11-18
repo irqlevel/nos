@@ -69,6 +69,12 @@ pub trait Link {
     /// Fills `buf` from the machine's random pool; false when there is
     /// nothing to be had from it.
     fn random(&mut self, buf: &mut [u8]) -> bool;
+    /// The session is to carry files -- its channel given over to a
+    /// subsystem, SFTP -- and its connection may be given what that runs at
+    /// and a session typing at a shell, or a stranger knocking on the port,
+    /// is not: bigger buffers. Called once, as the subsystem starts; the
+    /// default gives nothing.
+    fn bulk(&mut self) {}
 }
 
 /// Who may log in, and what a session does once someone has.
@@ -102,11 +108,13 @@ pub trait Subsystem {
     /// cannot be read on from.
     fn input(&mut self, input: &[u8], out: &mut Vec<u8>) -> core::result::Result<usize, &'static str>;
     /// What the client may send that the session has not taken in yet --
-    /// the channel's window from the subsystem's start: at least twice the
-    /// longest message the subsystem takes, so that a whole one always has
-    /// room beside what is waiting, and at most what may be held in one
-    /// allocation.
-    fn window(&self) -> u32;
+    /// the channel's window from the subsystem's start -- as the most the
+    /// subsystem would have, and the least it works with: the session gives
+    /// the most it has room for, held in one allocation, halving it down to
+    /// the least. The least is at least twice the longest message the
+    /// subsystem takes, and a packet more, so that a whole one always has
+    /// room beside what is waiting.
+    fn window(&self) -> (u32, u32);
 }
 
 /// What a command a session runs has of the session, for as long as it runs.
