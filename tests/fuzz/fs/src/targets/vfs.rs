@@ -16,7 +16,7 @@
 
 use std::sync::atomic::Ordering;
 
-use fs::vfs::{Handle, MAX_MOUNTS, MAX_PATH, OPEN_READ, OPEN_WRITE};
+use fs::vfs::{Handle, MAX_MOUNTS, MAX_PATH, OPEN_CREATE, OPEN_EXCLUSIVE, OPEN_READ, OPEN_TRUNCATE, OPEN_WRITE};
 
 use crate::image::ext2 as ext2img;
 use crate::machine::{self, disk, sched};
@@ -378,6 +378,9 @@ fn word(r: &mut Input, w: &World) -> usize {
 
 impl World {
     fn abi(&mut self, r: &mut Input) {
+        if r.chance(32) {
+            return self.pwrite_grow(r);
+        }
         match r.u8() % 7 {
             0 => {
                 /* An open by pointer and length: none, too long, or one of
@@ -500,6 +503,45 @@ impl World {
         }
     }
 
+    /// `kernel_file_pwrite_grow`, through a word: on one of the root's open
+    /// files, the file written where it says and grown to reach past it --
+    /// a hole between -- exactly when it is open for writing and the
+    /// filesystem has room; on a word that is no open file, nothing.
+    fn pwrite_grow(&mut self, r: &mut Input) {
+        let w = word(r, self);
+        let known = classify(self, w);
+        let span = self.root.model.limits.span;
+        let size = match known {
+            Word::Root(i) => self.root.model.size(&self.root.model.open[i].1.path),
+            _ => 0,
+        };
+        let any = r.below(span);
+        let off = r.pick(&[0, size, size + 1, size + 5000, any, span.saturating_sub(10)]);
+        let data = crate::input::noise(r.u32(), fsops::length(r));
+        // SAFETY: the data's own length.
+        let got = unsafe { fs::files::kernel_file_pwrite_grow(w, off, data.as_ptr(), data.len()) };
+        match known {
+            Word::Other => {}
+            Word::Nothing => invariant!(got == -1, "kernel_file_pwrite_grow to {:#x}, no open file, gave {}", w, got),
+            Word::Root(i) => {
+                let m = &mut self.root.model;
+                let o = m.open[i].1.clone();
+                let end = off.checked_add(data.len() as u64);
+                let want = o.flags & OPEN_WRITE != 0 && !m.read_only
+                    && (data.is_empty() || end.is_some_and(|e| e <= m.limits.max_file));
+                if want && !data.is_empty() {
+                    m.file_mut(&o.path).expect("an open file").write(off, &data);
+                }
+                invariant!(if want { got == data.len() as isize } else { got == -1 },
+                           "kernel_file_pwrite_grow of {} bytes at {} gave {}, where the model {}", data.len(), off,
+                           got, if want { "writes them" } else { "does not" });
+                if want && off > size {
+                    reached("a file written past its end through the file ABI, a hole between");
+                }
+            }
+        }
+    }
+
     /// The file ABI a module keeps its configuration through: each call
     /// what its composition of the VFS's calls does to the model.
     fn file_abi(&mut self, r: &mut Input) {
@@ -507,6 +549,9 @@ impl World {
         let Ok(text) = std::str::from_utf8(&p) else { return };
         if p.is_empty() || p.len() >= MAX_PATH {
             return;
+        }
+        if r.chance(64) {
+            return self.exact_abi(r, &p, text);
         }
         let m = &mut self.root.model;
         let located = |m: &Model| -> Option<Vec<u8>> {
@@ -693,6 +738,84 @@ impl World {
                     None => -1,
                 };
                 invariant!(got == want, "kernel_file_read of {} gave {}, and the model {}", text, got, want);
+            }
+        }
+    }
+}
+
+impl World {
+    /// The file ABI for files as a person names them (sshd's SFTP): every
+    /// call at exactly its path -- never a `<path>.new` -- each what the
+    /// VFS's call under it does to the model.
+    fn exact_abi(&mut self, r: &mut Input, p: &[u8], text: &str) {
+        use ffi::fs::{FILE_CREATED, FILE_OPEN_CREATE, FILE_OPEN_EXCLUSIVE, FILE_OPEN_TRUNCATE, FILE_OPEN_WRITE,
+                      FILE_REFUSED, FILE_THERE};
+        let m = &mut self.root.model;
+        match r.u8() % 5 {
+            0 => {
+                let (mut kind, mut size) = (0u32, 0u64);
+                // SAFETY: `text` is its own length, the rest are locals.
+                let got = unsafe { fs::files::kernel_file_stat(text.as_ptr(), text.len(), &mut kind, &mut size) };
+                match m.stat(p) {
+                    Some((dir, want_size)) => {
+                        let want_kind = if dir { fs::files::ENTRY_DIR } else { fs::files::ENTRY_FILE };
+                        invariant!(got == 0 && kind == want_kind && size == want_size,
+                                   "kernel_file_stat of {} gave {} ({} of {}), the model a {} of {}", text, got, kind,
+                                   size, want_kind, want_size);
+                    }
+                    None => invariant!(got == -1, "kernel_file_stat of {}, nothing there, gave {}", text, got),
+                }
+            }
+            1 => {
+                let flags = r.pick(&[0, FILE_OPEN_WRITE, FILE_OPEN_WRITE | FILE_OPEN_CREATE | FILE_OPEN_TRUNCATE,
+                                     FILE_OPEN_WRITE | FILE_OPEN_EXCLUSIVE, FILE_OPEN_CREATE, FILE_OPEN_TRUNCATE, 16]);
+                // SAFETY: `text` is its own length.
+                let raw = unsafe { fs::files::kernel_file_open_flags(0, text.as_ptr(), text.len(), flags) };
+                let mut vfs_flags = OPEN_READ;
+                for (flag, vfs_flag) in [(FILE_OPEN_WRITE, OPEN_WRITE), (FILE_OPEN_CREATE, OPEN_CREATE),
+                                         (FILE_OPEN_TRUNCATE, OPEN_TRUNCATE), (FILE_OPEN_EXCLUSIVE, OPEN_EXCLUSIVE)] {
+                    if flags & flag != 0 {
+                        vfs_flags |= vfs_flag;
+                    }
+                }
+                let want = if flags >= 16 { None } else { m.open(p, vfs_flags) };
+                invariant!((raw != 0) == want.is_some(), "kernel_file_open_flags of {} {:#x} gave {:#x}, where the model {}",
+                           text, flags, raw, if want.is_some() { "opens it" } else { "does not" });
+                if let (Some(h), Some(o)) = (Handle::from_raw(raw), want) {
+                    if flags & FILE_OPEN_EXCLUSIVE != 0 {
+                        reached("a file made by an exclusive open");
+                    }
+                    m.open.push((h, o));
+                }
+            }
+            2 => {
+                // SAFETY: `text` is its own length.
+                let got = unsafe { fs::files::kernel_file_unlink(text.as_ptr(), text.len()) };
+                let want = m.remove_one(p, false);
+                invariant!((got == 0) == want, "kernel_file_unlink of {} gave {}, where the model {}", text, got,
+                           if want { "removes it" } else { "does not" });
+            }
+            3 => {
+                // SAFETY: `text` is its own length.
+                let got = unsafe { fs::files::kernel_dir_remove(text.as_ptr(), text.len()) };
+                let want = m.remove_one(p, true);
+                invariant!((got == 0) == want, "kernel_dir_remove of {} gave {}, where the model {}", text, got,
+                           if want { "removes it" } else { "does not" });
+                if want {
+                    reached("an empty directory removed through the file ABI");
+                }
+            }
+            _ => {
+                // SAFETY: `text` is its own length.
+                let got = unsafe { fs::files::kernel_dir_make(text.as_ptr(), text.len()) };
+                let want = if m.stat(p).is_some() {
+                    FILE_THERE
+                } else if m.create(p, true) {
+                    FILE_CREATED
+                } else {
+                    FILE_REFUSED
+                };
+                invariant!(got == want, "kernel_dir_make of {} gave {}, and the model {}", text, got, want);
             }
         }
     }

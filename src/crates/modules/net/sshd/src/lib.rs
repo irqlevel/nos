@@ -10,10 +10,12 @@
 //!
 //! The protocol is the ssh crate's (src/crates/common/net/ssh); this is the kernel's side
 //! of it: the port listened on, a task for each connection, the shell behind
-//! a login, the cipher's ChaCha20 and Poly1305 -- the crypto crate's
-//! assembly -- and the two files a server keeps -- its host key,
-//! /etc/ssh/ssh_host_ed25519_key, made on the first start, and the keys
-//! allowed to log in, /etc/ssh/authorized_keys. docs/sshd.md has the rest.
+//! a login, the files an SFTP client copies in and out (the sftp crate's
+//! server over `kcore::fs`), the cipher's ChaCha20 and Poly1305 -- the
+//! crypto crate's assembly -- and the two files a server keeps -- its host
+//! key, /etc/ssh/ssh_host_ed25519_key, made on the first start, and the
+//! keys allowed to log in, /etc/ssh/authorized_keys. docs/sshd.md has the
+//! rest.
 
 extern crate alloc;
 
@@ -891,6 +893,135 @@ impl ssh::Shell for KernelShell<'_> {
         if !run_beside(self.shared, self.id, line, io) {
             kcore::cmd::dispatch_session(line, &mut SessionIo(io));
         }
+    }
+
+    fn subsystem(&mut self, name: &str) -> Option<Box<dyn ssh::Subsystem>> {
+        if name != SFTP {
+            return None;
+        }
+        let user = self.user.clone().unwrap_or_default();
+        Some(Box::new(SftpSession { server: sftp::Server::new(KernelFiles), user, peer: self.peer }))
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* SFTP: the files a client copies in and out                          */
+/* ------------------------------------------------------------------ */
+
+/// The one subsystem served.
+const SFTP: &str = "sftp";
+
+/// A session's SFTP server, run on the session's task -- what it did said
+/// in the log as the session ends.
+struct SftpSession {
+    server: sftp::Server<KernelFiles>,
+    user: String,
+    peer: Peer,
+}
+
+impl ssh::Subsystem for SftpSession {
+    fn input(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<usize, &'static str> {
+        self.server.input(input, out)
+    }
+
+    fn window(&self) -> u32 {
+        sftp::WINDOW
+    }
+}
+
+impl Drop for SftpSession {
+    fn drop(&mut self) {
+        let s = self.server.stats();
+        kcore::klog!(
+            0,
+            "sshd: {} from {}: sftp, {} files opened ({} to be written), {} bytes read and {} written, {} of {} requests refused",
+            self.user, self.peer, s.opened, s.opened_to_write, s.read, s.written, s.refused, s.requests
+        );
+    }
+}
+
+/// The kernel's files, as an SFTP client names them: through `kcore::fs`,
+/// every path exactly the one named.
+struct KernelFiles;
+
+fn file_error(e: Error) -> sftp::Error {
+    match e {
+        Error::NotFound => sftp::Error::NotFound,
+        Error::NoMemory => sftp::Error::NoMemory,
+        _ => sftp::Error::Failed,
+    }
+}
+
+fn file_kind(kind: kcore::fs::Kind) -> sftp::Kind {
+    match kind {
+        kcore::fs::Kind::File => sftp::Kind::File,
+        kcore::fs::Kind::Dir => sftp::Kind::Dir,
+    }
+}
+
+impl sftp::Files for KernelFiles {
+    type File = kcore::fs::File;
+    const NAME_MAX: usize = kcore::fs::FILE_NAME_MAX;
+    const PATH_MAX: usize = kcore::fs::FILE_PATH_MAX;
+
+    fn stat(&mut self, path: &str) -> Result<sftp::Stat, sftp::Error> {
+        let st = kcore::fs::stat(path).map_err(file_error)?;
+        Ok(sftp::Stat { kind: file_kind(st.kind), size: st.size })
+    }
+
+    fn open(&mut self, path: &str, how: sftp::Open) -> Result<kcore::fs::File, sftp::Error> {
+        let how = kcore::fs::Open { write: how.write, create: how.create, truncate: how.truncate, exclusive: how.exclusive };
+        kcore::fs::File::open_with(path, how).map_err(file_error)
+    }
+
+    fn read(&mut self, file: &kcore::fs::File, offset: u64, buf: &mut [u8]) -> Result<usize, sftp::Error> {
+        file.read_at(offset, buf).map_err(file_error)
+    }
+
+    fn write(&mut self, file: &kcore::fs::File, offset: u64, data: &[u8]) -> Result<(), sftp::Error> {
+        file.write_growing(offset, data).map_err(file_error)
+    }
+
+    fn size(&mut self, file: &kcore::fs::File) -> Result<u64, sftp::Error> {
+        file.size().map_err(file_error)
+    }
+
+    fn set_len(&mut self, file: &kcore::fs::File, size: u64) -> Result<(), sftp::Error> {
+        file.set_len(size).map_err(file_error)
+    }
+
+    fn sync(&mut self, file: &kcore::fs::File) -> Result<(), sftp::Error> {
+        file.sync().map_err(file_error)
+    }
+
+    fn entry(&mut self, dir: &str, index: usize) -> Result<Option<sftp::Entry>, sftp::Error> {
+        let entry = kcore::fs::dir_entry(dir, index).map_err(file_error)?;
+        Ok(entry.map(|e| sftp::Entry {
+            name: e.name,
+            kind: if e.dir { sftp::Kind::Dir } else { sftp::Kind::File },
+            size: e.size,
+        }))
+    }
+
+    fn make_dir(&mut self, path: &str) -> Result<(), sftp::Error> {
+        kcore::fs::make_dir(path).map_err(file_error)
+    }
+
+    fn remove_file(&mut self, path: &str) -> Result<(), sftp::Error> {
+        kcore::fs::remove_file(path).map_err(file_error)
+    }
+
+    fn remove_dir(&mut self, path: &str) -> Result<(), sftp::Error> {
+        kcore::fs::remove_dir(path).map_err(file_error)
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), sftp::Error> {
+        kcore::fs::rename(from, to).map_err(file_error)
+    }
+
+    fn space(&mut self, path: &str) -> Result<sftp::Space, sftp::Error> {
+        let space = kcore::fs::space(path).map_err(file_error)?;
+        Ok(sftp::Space { total: space.total_bytes, free: space.free_bytes })
     }
 }
 
