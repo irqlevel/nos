@@ -1,0 +1,32 @@
+# The installer's Alpine packages (mkiso.sh): what nos-setup and the image's
+# nos-install run -- nos-install disk's tools, GRUB for BIOS and UEFI both,
+# whiptail -- and the kernel that runs them, with its modules: every disk,
+# network card and keyboard Linux has a driver for
+alpine-baselayout
+alpine-release
+busybox
+eudev
+bash
+coreutils
+findutils
+grep
+sed
+util-linux
+e2fsprogs
+e2fsprogs-extra
+dosfstools
+grub
+grub-bios
+grub-efi
+squashfs-tools
+newt
+curl
+ca-certificates
+openssh-keygen
+kmod
+linux-lts
+# The kernel takes some firmware: none but the Realtek NICs' (r8169 wants it
+# for some of the chips nos drives) -- all of it would be hundreds of MiB
+linux-firmware-none
+linux-firmware-rtl_nic
+intel-ucode

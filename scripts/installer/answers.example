@@ -1,0 +1,37 @@
+# The nos installer's answers: with them it installs asking nothing
+# (scripts/installer/build.sh --answers FILE bakes them into an ISO; a word
+# nos.KEY=VALUE on the installer's kernel command line -- GRUB's e on the
+# menu -- does the same for one answer, and wins). KEY=VALUE, a line each.
+
+# The disk nos is to make its own. Name it as /dev/disk/by-id has it, which
+# does not change from boot to boot as /dev/sda can.
+disk=/dev/disk/by-id/ata-TOSHIBA_MG04ACA400E_69P3KB9HFJKA
+
+# Erase what it holds. Without this, a disk that is not blank is refused.
+wipe=yes
+
+# nos's root. The rest of the disk is left as a partition with nothing on
+# it, nos-data: for the VMs' disks and NBS.
+root_size=10G
+
+# The keys nos's sshd lets in: ssh-ed25519 only. As many key= lines as you
+# like, and key_url= lines that give such keys (a GitHub user's .keys).
+key=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExampleExam you@laptop
+key_url=https://github.com/<user>.keys
+
+# A network with no DHCP: nos's address with its prefix, the gateway and the
+# DNS server. Left out, nos asks DHCP.
+#ip=203.0.113.5/24
+#gw=203.0.113.1
+#dns=203.0.113.1
+
+# nos's kernel log over UDP to a collector (docs/netconsole.md), and more
+# kernel parameters (docs/kernel-parameters.md).
+#netconsole=203.0.113.9:6666
+#cmdline=
+
+# When it is done: poweroff (unless told), reboot -- the installer's CD
+# ejected first, where the virtual media lets it be -- or stay. An installer
+# booted again finds the disk holding nos as it would put it there, and
+# installs nothing.
+after=poweroff
