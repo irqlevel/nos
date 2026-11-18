@@ -61,8 +61,11 @@ pub extern "C" fn rust_init() {
     r8168::init();
     r8125::init();
     igb::init();
-    /* After igb: its names are still its own count's (`eth{idx}`), and
-       this driver asks the device table for the lowest free one. */
+    /* Its names, as igb's, are the lowest ethN the device table has free
+       (net::free_eth_name): the order of the two says only which card is
+       eth0 on a machine with both. virtio-net still names itself by a count
+       of its own -- probed after these on x86-64 (rust_virtio_net_init),
+       before them on arm64 (rust_virtio_net_init_mmio). */
     e1000e::init();
     #[cfg(target_arch = "x86_64")]
     {
