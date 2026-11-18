@@ -74,7 +74,6 @@ const BARS: u8 = 6;
 const BAR_IO: u32 = 1;
 const BAR_TYPE_MASK: u32 = 0x6;
 const BAR_TYPE_64: u32 = 0x4;
-const BAR_PREFETCH: u32 = 0x8;
 const CAP_PCIE: u8 = 0x10;
 const PCIE_DEVCAP: u16 = 0x04;
 const PCIE_DEVCAP_FLR: u32 = 1 << 28;
@@ -200,7 +199,7 @@ impl Passed {
         /* Quiet while it is read: decoding and bus mastering off */
         let command = dev.read_config16(COMMAND);
         dev.write_config16(COMMAND, command & !(COMMAND_IO | COMMAND_MEMORY | COMMAND_MASTER));
-        let bars = read_bars(&dev);
+        let bars = read_bars(&dev, &name);
         if !reset(&dev) {
             return Err(alloc::format!("{}: did not answer after its reset", name));
         }
@@ -310,8 +309,11 @@ fn block_siblings(bus: u16, slot: u16, func: u16, all: &[(u16, u16, u16)]) -> Re
 }
 
 /// Its memory BARs, as the host has them -- with the device's decoding off,
-/// which the caller saw to: each register's, a 64-bit one at its first.
-fn read_bars(dev: &PciDevice) -> [Option<Bar>; 6] {
+/// which the caller saw to: each register's, a 64-bit one at its first. Each
+/// given said, and each memory BAR that is not, with what its registers read:
+/// a BAR that went missing in silence was an RTX A2000's 8 GiB BAR1, whose low
+/// register has no address bit to read back.
+fn read_bars(dev: &PciDevice, name: &str) -> [Option<Bar>; 6] {
     let mut bars = [None; 6];
     let mut i = 0u8;
     while i < BARS {
@@ -324,20 +326,24 @@ fn read_bars(dev: &PciDevice) -> [Option<Bar>; 6] {
         }
         let high = if wide { dev.read_config32(reg + 4) } else { 0 };
         dev.write_config32(reg, u32::MAX);
-        let mask_low = dev.read_config32(reg) & !0xF;
+        let mask_low = dev.read_config32(reg);
         dev.write_config32(reg, low);
-        let mask = if wide {
+        let mask_high = wide.then(|| {
             dev.write_config32(reg + 4, u32::MAX);
-            let mask_high = dev.read_config32(reg + 4);
+            let mask = dev.read_config32(reg + 4);
             dev.write_config32(reg + 4, high);
-            (u64::from(mask_high) << 32) | u64::from(mask_low)
-        } else {
-            0xFFFF_FFFF_0000_0000 | u64::from(mask_low)
-        };
-        let size = (!mask).wrapping_add(1);
+            mask
+        });
         let host = dev.bar_address(i);
-        if mask_low != 0 && host != 0 && size.is_power_of_two() {
-            bars[usize::from(i)] = Some(Bar { host, size, wide, prefetchable: low & BAR_PREFETCH != 0 });
+        bars[usize::from(i)] = hv::host::decode_bar(low, mask_low, mask_high, host);
+        match bars[usize::from(i)] {
+            Some(b) => kcore::klog!(0, "hv: {}: BAR{} of {:#x} bytes at {:#x}{}{}", name, i, b.size, b.host,
+                                    if b.wide { ", 64-bit" } else { "" }, if b.prefetchable { ", prefetchable" } else { "" }),
+            None if mask_low != 0 || mask_high.is_some_and(|m| m != 0) => {
+                kcore::klog!(0, "hv: {}: BAR{} not given -- {:#x}, all ones read back as {:#x} {:?}, at {:#x}: not \
+                                 assigned, not aligned, or a size no BAR is", name, i, low, mask_low, mask_high, host);
+            }
+            None => {}
         }
         i += if wide { 2 } else { 1 };
     }

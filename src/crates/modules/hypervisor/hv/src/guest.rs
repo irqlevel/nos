@@ -1068,6 +1068,11 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
         let _ = writeln!(out, "  posted     {} interrupts posted for a CPU to take in its guest, {} with a notification sent to the CPU it ran on",
             posted, notified);
     }
+    let (host_msis, host_lost) = guest.host_msis();
+    if host_msis != 0 {
+        let _ = writeln!(out, "  host fn    {} MSIs of its host's functions sent on to it by the host's handlers of their real ones, {} of them taken by no CPU",
+            host_msis, host_lost);
+    }
     let served = guest.served_msis();
     if served != 0 {
         let _ = writeln!(out, "  served     {} MSIs its disks' tasks sent as they served, from outside every CPU -- no CPU woken or taken out of its guest to hand a completion over",
