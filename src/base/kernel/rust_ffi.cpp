@@ -379,6 +379,13 @@ unsigned long long kernel_read_cycle_counter()
     return hal::read_cycle_counter();
 }
 
+/* The same, read after every instruction before it and before any after it:
+   what the jitter collector times its walk by */
+unsigned long long kernel_read_cycle_counter_serialized()
+{
+    return hal::read_cycle_counter_serialized();
+}
+
 unsigned long kernel_get_wall_time_secs()
 {
     return kernel::get_wall_time_secs();
