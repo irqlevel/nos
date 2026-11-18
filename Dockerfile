@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y \
     fdisk \
     dosfstools \
     udev \
+    iproute2 \
     e2fsprogs \
     squashfs-tools \
     qemu-utils \
