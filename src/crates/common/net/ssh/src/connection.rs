@@ -688,13 +688,23 @@ impl<'s, 'a> Session<'s, 'a> {
         let Some(remote) = self.channel.as_ref().map(|c| c.remote) else { return Ok(()) };
         let mut granted = None;
         if let Some(sub) = shell.subsystem(name) {
-            let size = core::cmp::max(sub.window(), WINDOW);
             /* All the client may send, in one piece, from the start: what
                the window lets it send never makes `input` grow, and so
-               never allocates */
-            let room = (size as usize).saturating_sub(self.input.len());
-            if self.input.try_reserve_exact(room).is_ok() {
-                granted = Some((sub, size));
+               never allocates -- the most the subsystem would have, or as
+               much less as the heap has room for, down to its least */
+            let (most, least) = sub.window();
+            let least = core::cmp::max(least, WINDOW);
+            let mut size = core::cmp::max(most, least);
+            loop {
+                let room = (size as usize).saturating_sub(self.input.len());
+                if self.input.try_reserve_exact(room).is_ok() {
+                    granted = Some((sub, size));
+                    break;
+                }
+                if size / 2 < least {
+                    break;
+                }
+                size /= 2;
             }
         }
         if want_reply {
@@ -703,6 +713,10 @@ impl<'s, 'a> Session<'s, 'a> {
         }
         let Some((sub, size)) = granted else { return Ok(()) };
         self.subsystem = Some(sub);
+        /* A session that carries files, whose connection may be given more
+           room to: asked before the window is opened, so that the room is
+           there when the client fills it */
+        self.t.bulk();
         let Some(channel) = self.channel.as_mut() else { return Ok(()) };
         channel.mode = Mode::Subsystem;
         let more = size - channel.window_size;
