@@ -245,12 +245,23 @@ check_partition() {
 # Warnings, not refusals: GRUB boots nos from anything the firmware reads,
 # but what nos does after that depends on what it has drivers for
 check_hardware() {
-    local dev=$1 path d id found=
+    local dev=$1 path pci class d id found=
     if [ "${NOS_ALLOW_ANY_DISK:-0}" != 1 ]; then
         path=$(readlink -f "/sys/class/block/$(basename "$(readlink -f "$dev")")")
         case "$path" in
             */nvme/*|*/virtio*) ;;
-            *) warn "$dev is not on an NVMe or a virtio disk, which is all nos reads: GRUB will load the kernel from it, but nos will not find its root on it -- no modules, no /etc/rc, no sshd" ;;
+            */ata[0-9]*/*)
+                # nos's ata driver takes a disk behind a PCI IDE controller --
+                # class 0101: SATA in IDE mode, as a BIOS may leave an ICH, or
+                # parallel ATA -- and not yet one behind AHCI (0106). The
+                # controller is the last PCI function on the device's path.
+                pci=$(printf '%s\n' "$path" | grep -o '/[0-9a-f]\{4\}:[0-9a-f]\{2\}:[0-9a-f]\{2\}\.[0-7]' | tail -n 1 || true)
+                class=$(cat "/sys/bus/pci/devices$pci/class" 2>/dev/null || true)
+                case "$class" in
+                    0x0101*) ;;
+                    *) warn "$dev is on a SATA controller nos does not drive (PCI class ${class:-unknown}: AHCI, or RAID, where nos takes IDE mode alone): GRUB will load the kernel from it, but nos will not find its root on it -- no modules, no /etc/rc, no sshd" ;;
+                esac ;;
+            *) warn "$dev is not on an NVMe, a virtio or an IDE-mode SATA disk, which is all nos reads: GRUB will load the kernel from it, but nos will not find its root on it -- no modules, no /etc/rc, no sshd" ;;
         esac
     fi
 

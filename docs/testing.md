@@ -218,6 +218,7 @@ swallowing panic messages whole.
 | `wx-test.sh [--arch x86_64\|aarch64]` | both | a mapping path |
 | `panic-test.sh [--arch x86_64\|aarch64]` | both | the panic path, `panic=N`, a reset; a panic off a task's stack (x86's double fault), its report through the netconsole; a task's stack run out |
 | `parttest.py [--arch aarch64\|x86_64]` | both | the block layer, the partition tables |
+| `ata-test.py [--iso nos-test.iso]` | x86-64, from `nos-test.iso` | `drivers/block/ata`: SATA in IDE mode and parallel ATA behind a PCI IDE controller -- four positions on two channels, a 3 TiB disk's sectors past 2^32 read and written where they were meant and nowhere else, an ext4 made, written and held to e2fsck, a CD passed over, a GPT disk beside them found and left alone |
 | `ext2-test.py` | arm64 | ext2, the halt |
 | `poweroff-test.py` | x86-64, by hand | the halt on x86-64: the sleep type `poweroff` asks for (`Acpi::parse_dsdt`, `hal::power_off`) |
 | `halt-test.py [--arch aarch64\|x86_64]` | both; x86-64 from `nos-test.iso` | the halt's order: the modules unloaded before the shells are stopped (`ModuleTable::unload_all`, the two `main`s) |
@@ -389,6 +390,29 @@ keeps writers off the disk it is on, and that `disks` gives every partition
 the id a VM's vm.toml names it by: a GPT partition its unique GUID as Linux
 writes a PARTUUID, an MBR one its disk signature and number. The smoke
 disks carry no partition table at all, so nothing else reaches this code.
+
+### `ata-test.py` -- SATA in IDE mode, every sector where it was meant
+
+`make nos-test.iso TEST_ISO_ARGS=udpshell=9100`, then `tests/ata-test.py`.
+QEMU's `pc` machine gives the kernel a PIIX3: an IDE controller in
+compatibility mode, four positions on two channels, laid out as the ASUS
+RS500's ICH10R has its disks in IDE mode ([Real hardware](real-hardware.md)):
+a 3 TiB disk at the primary master that says it spins at 7200 rpm with 4 KiB
+physical sectors behind 512-byte ones, an SSD at the primary slave, the CD
+the test boots from at the secondary master, and a GPT disk at the
+secondary slave. A driver that sets the wrong device bit writes the disk
+beside the one asked for, and one that drops an address's high byte writes
+2 TiB lower; both read back what they wrote and look like a working disk.
+So the host marks sectors of the big disk on both sides of 2^28 and 2^32
+and its last; the kernel has to read every one back as marked, and writes
+three more, which the host then finds changed with their neighbours and the
+marks not, and -- by the image's data extents -- nothing else of the 3 TiB
+written at all. The SSD is formatted ext4 by the shell's `format`, written
+and unmounted, and has to be clean to `e2fsck -fn` with its files in it; the
+CD has to be passed over as a packet device; the GPT disk's partitions have
+to be found and not one byte of it changed; and the machine has to power
+itself off, its disks' caches flushed. The pool is seeded by a virtio-rng:
+under TCG nothing else seeds it, and `format` will not make a UUID without.
 
 ### `ext2-test.py` -- ext2, judged by `e2fsck`
 
