@@ -1,0 +1,11 @@
+#!/bin/sh
+# nos-setup on the terminal init gave it (scripts/installer/init), with the
+# terminal type a dialog draws for: a serial port's is VT100's
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+case "$(tty)" in
+    /dev/ttyS*) export TERM=vt100 ;;
+    *) export TERM=linux ;;
+esac
+cd / || exit 1
+exec /usr/sbin/nos-setup
