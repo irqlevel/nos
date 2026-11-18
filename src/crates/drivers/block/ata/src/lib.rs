@@ -16,10 +16,18 @@
 //! only ACPI's `_PRT` tells, and nothing here reads it yet. Polling needs
 //! neither, and a disk is a disk before an interrupt is anything.
 //!
+//! A command that fails is said, and the channel reset (SRST, both its
+//! devices). A device that does not come back from the reset, or
+//! `ataproto::MAX_UNFINISHED` commands running that did not finish, is
+//! failed: said once, every request of it refused at once from then on, and
+//! no longer waited for by the channel's resets -- rather than each request
+//! waiting out a timeout and a reset of its own. At power-off each disk is
+//! flushed and sent STANDBY IMMEDIATE.
+//!
 //! Left for later: bus-master DMA (its PRD table addresses 32 bits, so its
 //! buffers have to be below 4 GiB, which the allocator has no way to ask
 //! for yet), the asynchronous path (`submit`), TRIM, the interrupt once
-//! `_PRT` is read, STANDBY IMMEDIATE for a spinning disk at power-off.
+//! `_PRT` is read.
 //!
 //! x86-64 only: the registers are I/O ports. On arm64 the entry points do
 //! nothing.
@@ -39,8 +47,11 @@ pub fn init() {
     x86::init();
 }
 
-/// On the way down, from `rust_fini`: every disk's write cache flushed.
-pub fn shutdown() {
+/// On the way down, from `rust_fini`: every disk's write cache flushed, and
+/// with `power_off` each disk put in standby for the power to go.
+pub fn shutdown(power_off: bool) {
     #[cfg(target_arch = "x86_64")]
-    x86::shutdown();
+    x86::shutdown(power_off);
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = power_off;
 }
