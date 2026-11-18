@@ -168,6 +168,23 @@ private:
     ModuleTable& operator=(const ModuleTable& other) = delete;
     ModuleTable& operator=(ModuleTable&& other) = delete;
 
+    /* What lsmod says of one module, copied out under the lock and printed
+       without it */
+    struct DumpLine
+    {
+        char name[NAME_LEN_MAX + 1];
+        ulong base;
+        ulong kib;
+        ulong imports;
+        bool permanent;
+        /* ", loading", ", unloading" or "": a string of the image's */
+        const char* phase;
+    };
+
+    /* The index'th module's line, in the list's order, copied under the
+       lock into line: false past the last */
+    bool dump_line(ulong index, DumpLine& line);
+
     JobOutcome start_job(bool unload, const char* arg, const char* params, stdlib::Printer& out);
     LoadedModule* find_locked(const char* name);
     void remove(LoadedModule* module);
