@@ -8,6 +8,7 @@ mod frames;
 mod memsites;
 mod one_event;
 mod ring;
+mod seed;
 mod sha256;
 mod system;
 mod trace;

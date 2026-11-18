@@ -218,6 +218,7 @@ swallowing panic messages whole.
 | `wx-test.sh [--arch x86_64\|aarch64]` | both | a mapping path |
 | `panic-test.sh [--arch x86_64\|aarch64]` | both | the panic path, `panic=N`, a reset; a panic off a task's stack (x86's double fault), its report through the netconsole; a task's stack run out |
 | `parttest.py [--arch aarch64\|x86_64]` | both | the block layer, the partition tables |
+| `random-seed-test.py [--iso nos-test.iso]` | x86-64, from `nos-test.iso` | the random pool's seed kept on the root (`src/crates/kernel/src/seed.rs`, `random::restore_seed`), the jitter collector asked again after the root is mounted, `nos-install`'s `put_seed`: a Westmere under TCG -- no RDRAND, no jitter -- seeded by its kept seed, which is 64 new bytes when it is off; with none and nothing else, unseeded and nothing made up; with a virtio-rng, a seed kept; a file of the wrong size not taken |
 | `ata-test.py [--iso nos-test.iso]` | x86-64, from `nos-test.iso` | `drivers/block/ata`: SATA in IDE mode and parallel ATA behind a PCI IDE controller -- four positions on two channels, a 3 TiB disk's sectors past 2^32 read and written where they were meant and nowhere else, an ext4 made, written and held to e2fsck, a CD passed over, a GPT disk beside them found and left alone |
 | `ext2-test.py` | arm64 | ext2, the halt |
 | `poweroff-test.py` | x86-64, by hand | the halt on x86-64: the sleep type `poweroff` asks for (`Acpi::parse_dsdt`, `hal::power_off`) |
@@ -391,6 +392,20 @@ keeps writers off the disk it is on, and that `disks` gives every partition
 the id a VM's vm.toml names it by: a GPT partition its unique GUID as Linux
 writes a PARTUUID, an MBR one its disk signature and number. The smoke
 disks carry no partition table at all, so nothing else reaches this code.
+
+### `random-seed-test.py` -- the pool's seed, kept on the root
+
+`make nos-test.iso TEST_ISO_ARGS=udpshell=9100`, then `tests/random-seed-test.py`. TCG's
+`-cpu Westmere` is the ASUS RS500 as far as randomness goes: no RDRAND, and a
+cycle counter that gives the jitter collector nothing. Four boots, each with
+a root on an IDE disk of its own: a seed kept on it has to seed the pool --
+`entropy` seeded, `random` answering -- and the file has to hold 64 new bytes
+when the machine is off, never the ones it booted with; with no seed and
+nothing else the pool has to stay unseeded, say why, `random` refuse, and no
+seed be made up for the next boot; with a virtio-rng a seed has to be kept;
+and a file of the wrong size is not taken, and left as it was. A host whose
+TCG does give the jitter collector variance has the two unseeded cases
+skipped, and says so ([Randomness](random.md)).
 
 ### `ata-test.py` -- SATA in IDE mode, every sector where it was meant
 

@@ -125,6 +125,9 @@ What `install` does, in order, stopping at the first thing that is wrong:
    keeps current -- goes to `/boot/ucode`, which GRUB loads beside the
    kernel; with none there (an AMD CPU, no `intel-microcode` package), nos
    runs firmware's.
+   A seed for the random pool goes to `/etc/random-seed`, 64 bytes from
+   this machine's `/dev/urandom`: on a CPU with no random instruction it is
+   what sshd's keys come from ([Randomness](random.md)).
 4. Writes `/grubenv` on it -- this machine's kernel parameters, and the
    one-shot flag -- and checks the filesystem with `e2fsck`, before the
    write and after it.

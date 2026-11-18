@@ -142,6 +142,7 @@ the pool worse.**
 |---|---|
 | `main2` / `main_arm64`, before anything can ask for bytes | `hal::probe_hw_random()`, then `rust_random_setup()` — register the sources that need no device, seed from them. No heap, no device |
 | `bp_startup` / `bp_startup_arm`, after the virtio probe | `rust_random_reseed()` — fold in every registered source, virtio-rng now included |
+| once the root filesystem is mounted, before `/etc/rc` | `rust_random_seed_from_root()` (`src/crates/kernel/src/seed.rs`) — every source asked again, every CPU running and interrupts coming now, the jitter collector among them; then the seed the boot before kept (below) |
 | `rust_test` | `random::selftest` — the block function against RFC 8439, then the pool's output |
 | `entropy reseed` | the reseed, by hand |
 
@@ -153,6 +154,30 @@ puts hardware entropy into it. Setup finding nothing to seed from, which takes
 a machine with no random instruction *and* a cycle counter too coarse for the
 jitter collector (as under TCG), is not fatal: boot says so plainly, and HTTPS
 is what does not work until a reseed finds a source.
+
+The jitter collector is registered whatever its first draw at setup gave.
+That draw is made on one CPU with interrupts off and the walk in its L1, and
+on the ASUS RS500's Westmere -- no RDRAND, no virtio-rng -- it found no
+variance at all; registered only on success, it was never asked again, and
+the pool stayed unseeded for the whole boot, sshd with nothing to make a key
+with.
+
+### A seed kept from one boot to the next
+
+What seeds the pool on such a machine for certain is a seed it kept itself:
+`/etc/random-seed` on the root filesystem, 64 bytes. `nos-install` writes the
+first, from its Linux's `/dev/urandom`, at every install and update. Once the
+root is mounted, the boot reads it and mixes it in, then draws the next boot's
+seed from the pool with it inside and writes that over the file, synced; only
+when that write is done does the pool count as seeded by it
+(`random::restore_seed`). A seed the file still held would be the next boot's
+too, and two boots seeded alike are one boot twice -- so a root mounted
+read-only, or a write that fails, leaves the seed mixed in but not counted,
+and says so. A file of another size is not taken. With no file and a pool
+something else seeded -- a virtio-rng, the instruction, the jitter collector
+-- a seed is kept for the next boot; with no file and nothing else, none is
+made up out of an unseeded pool. Anyone who can read the root filesystem can
+read the seed, and anyone who can do that has the host keys beside it.
 
 There is no periodic reseed. A CSPRNG needs one good seed, and the rest of what
 Linux reseeds against — recovery from a state compromise across a
