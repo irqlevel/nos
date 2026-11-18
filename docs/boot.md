@@ -108,7 +108,7 @@ and take mutexes.
   any driver can want a frame — the Rust NIC drivers too, which fill their
   receive rings as they come up; built after them, those rings started out
   as heap frames that each cost a TLB shootdown to free.
-- `rust_init()` brings up the Rust drivers — NVMe, r8168, r8125, igb.
+- `rust_init()` brings up the Rust drivers — NVMe, r8168, r8125, igb, e1000e.
 - virtio-net and virtio-rng.
 - The IPI vector (0xFE), the LAPIC timer vector (0xFD) and the LAPIC
   spurious vector (0xFF) get their IDT entries, and interrupts are enabled.

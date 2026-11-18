@@ -18,13 +18,17 @@ then switches the machine off with nothing panicking on the way.
 
 x86_64: boots nos.iso from an ext4 root that already carries sshd.ko, an
 authorized key and an /etc/rc that starts it, logs in, and copies a file in
-and back out over SFTP: no shell is touched at all.
+and back out over SFTP: no shell is touched at all. `--nic` puts QEMU's
+82574L (e1000e) or 82576 (igb) where virtio-net is, which runs the session
+over that driver.
 
     tests/sshd-test.py [--arch aarch64|x86_64] [--tcg] [--keep]
+                       [--nic virtio|e1000e|igb] [--ssh-port N]
 
 Needs ssh, ssh-keygen, sftp and scp (OpenSSH 8.7 or later, for `scp -s`),
-scripts/mkrootfs.sh (mke2fs, or the nos-builder image), host ports 2222,
-8000 and 9000 free, and `make` or `make ARCH=aarch64` done first.
+scripts/mkrootfs.sh (mke2fs, or the nos-builder image), host ports 2222
+(or --ssh-port's), 8000 and 9000 free, and `make` or `make ARCH=aarch64`
+done first.
 """
 
 import argparse
@@ -745,7 +749,8 @@ def x86_64(t):
             "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
             "-drive", "file=%s,format=raw,id=drive0,if=none" % image,
             "-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off",
-            "-device", "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off",
+            "-device", ("virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off" if t.nic == "virtio"
+                        else t.nic + ",netdev=net0"),
             "-netdev", "user,id=net0,hostfwd=tcp::%d-:22" % SSH_PORT, "-device", "virtio-rng-pci"]
     if kvm:
         argv += ["-enable-kvm", "-cpu", "host"]
@@ -776,12 +781,20 @@ def main():
     p.add_argument("--arch", choices=["aarch64", "x86_64"], default="aarch64")
     p.add_argument("--tcg", action="store_true", help="no HVF or KVM, even where there is one")
     p.add_argument("--keep", action="store_true", help="keep the scratch directory: logs, images, keys")
+    p.add_argument("--nic", choices=["virtio", "e1000e", "igb"], default="virtio",
+                   help="x86_64's network card: QEMU's 82574L (the e1000e driver) or 82576 (igb) for virtio-net")
+    p.add_argument("--ssh-port", type=int, default=SSH_PORT,
+                   help="the host port sshd is forwarded to, for a run beside another that holds 2222")
     args = p.parse_args()
+    if args.nic != "virtio" and args.arch != "x86_64":
+        sys.exit("--nic %s is for x86_64" % args.nic)
+    globals()["SSH_PORT"] = args.ssh_port
 
     tmp = tempfile.mkdtemp(prefix="sshd-test.")
     print("sshd-test: %s, scratch in %s" % (args.arch, tmp), flush=True)
     try:
         t = Test(tmp, args.tcg)
+        t.nic = args.nic
         {"aarch64": aarch64, "x86_64": x86_64}[args.arch](t)
     finally:
         if not args.keep:
