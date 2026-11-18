@@ -66,7 +66,7 @@ use crate::store::{self, Folder};
 use crate::vmlog::Log;
 
 const START_USAGE: &str =
-    "hv start <name|folder> [force] | <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [input=...] [log] [restart] [force] [uuid=U] [net] [network=name] [port=N] [forward=nos:guest]... [cmdline=...]";
+    "hv start <name|folder> [force] | <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [pci=bus:dev.fn]... [unsafe_interrupts] [input=...] [log] [restart] [force] [uuid=U] [net] [network=name] [port=N] [forward=nos:guest]... [cmdline=...]";
 /// How many times a `restart` guest is booted again after resetting itself
 /// within `RESTART_WINDOW_NS` before that is taken for a loop and it is left
 /// stopped: a guest that reboots in its first second would otherwise take
@@ -868,6 +868,12 @@ fn vcpu(start: Start) {
         };
 
         let g = Arc::new(built.guest);
+        /* Its host functions' interrupts to it from here, taken back as it
+         * stops, in this task */
+        let passed = built.passed;
+        for p in &passed {
+            p.arm(&g);
+        }
         let mut name = String::new();
         let _ = name.try_reserve(16);
         let _ = write!(name, "vm{}", shared.id);
@@ -875,6 +881,7 @@ fn vcpu(start: Start) {
          * back -- under the lock their calls hold -- before the guest goes */
         *shared.serving.lock() = Some(g.clone());
         let ran = guest::run_cpus(&g, built.cpus, &placement, &machine, u64::MAX, &host, &name);
+        drop(passed);
         *shared.serving.lock() = None;
         host.flush_line();
 

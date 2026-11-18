@@ -23,7 +23,7 @@ use crate::cores::{Cores, Hold};
 use crate::disk::{Claims, Holder, Runner, Wake};
 use crate::guest::{self, LogLine, Ring, Spec};
 
-const USAGE: &str = "hv boot <kernel> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [input=...] [uuid=U] [force] [cmdline=...]";
+const USAGE: &str = "hv boot <kernel> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [pci=bus:dev.fn]... [unsafe_interrupts] [input=...] [uuid=U] [force] [cmdline=...]";
 /// How long the guest runs by default, and at most: a Linux boot under TCG,
 /// itself under this hypervisor, is very far from quick.
 const DEFAULT_SECS: u64 = 60;
@@ -162,9 +162,16 @@ impl Boot {
         let start = kcore::time::boot_time_ns();
         let deadline = start.saturating_add(secs * NS_PER_SEC);
         let guest = Arc::new(built.guest);
+        /* Its host functions' interrupts to it from here, and taken back
+         * before it goes -- here, in this task, not in an interrupt */
+        let passed = built.passed;
+        for p in &passed {
+            p.arm(&guest);
+        }
         /* No switch reaches an `hv boot` guest; its disks ring its first
          * CPU. */
         let ran = guest::run_cpus(&guest, built.cpus, &self.placement, &self.machine, deadline, &host, "boot");
+        drop(passed);
         let run_ns = kcore::time::boot_time_ns().saturating_sub(start);
         let ran = match ran {
             Ok(ran) => ran,
