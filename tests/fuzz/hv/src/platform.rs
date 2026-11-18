@@ -20,6 +20,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 use crate::devices::blk;
+use crate::devices::host::{HostFunction, Msi};
+use crate::hostmodel;
 use crate::linux::{self, Header};
 use crate::machine::Machine;
 use crate::memory::GuestMemory;
@@ -98,6 +100,8 @@ enum Step {
     In { port: u16, size: u8 },
     Wrmsr { msr: u32, value: u64 },
     Mmio { gpa: u64, store: bool, value: u64 },
+    /// An MMIO access of `size` bytes, as asked.
+    MmioOf { gpa: u64, store: bool, size: u8, value: u64 },
     Poke { gpa: u64, bytes: Vec<u8> },
     /// An EOI as Linux makes it with KVM's PV EOI on: its word's bit
     /// cleared if the host set it -- no exit -- or the APIC's register
@@ -254,6 +258,17 @@ struct Script {
     /// stop a guest at a write of CR4 only where it changes a bit the host
     /// keeps, and at every `mov` of a debug register.
     vmx: bool,
+    /// A host's function the guest holds (`hostmodel::gpu`), when it has one.
+    hosted: Option<HostedFn>,
+}
+
+/// The GPU on the guest's bus as its driver knows it: its slot, where it
+/// has its BAR0 now, and where its interrupt is raised.
+struct HostedFn {
+    slot: u32,
+    bar0: u64,
+    msi: Arc<Msi>,
+    maskable: bool,
 }
 
 impl Script {
@@ -685,6 +700,10 @@ impl Script {
                 self.mmio_insn(v, mem, r, store, 4, value);
                 Some(Exit::NestedFault { gpa, error: npf::FINAL | if store { npf::WRITE } else { 0 } })
             }
+            Step::MmioOf { gpa, store, size, value } => {
+                self.mmio_insn(v, mem, r, store, size, value);
+                Some(Exit::NestedFault { gpa, error: npf::FINAL | if store { npf::WRITE } else { 0 } })
+            }
             Step::Poke { gpa, bytes } => {
                 let _ = mem.write(gpa, &bytes);
                 None
@@ -715,6 +734,85 @@ impl Script {
             Step::Wrmsr { msr: 0x800 + reg, value }
         };
         self.plan().push_back(step);
+    }
+
+    /// The GPU's driver at work: its configuration space written and read
+    /// through the bus and through the mirror in BAR0, BAR0 moved, MSI
+    /// programmed -- and the device's interrupt raised, from outside every
+    /// CPU, as the hv module's handler of the real one raises it.
+    fn plan_hosted(&mut self, r: &mut Input) {
+        let Some(h) = self.hosted.as_ref() else { return };
+        let (slot, bar0, msi, maskable) = (h.slot, h.bar0, h.msi.clone(), h.maskable);
+        let m = hostmodel::GPU_MSI as u32;
+        let e = hostmodel::GPU_PCIE as u32;
+        let p = hostmodel::GPU_PM as u32;
+        let reg = |r: &mut Input| -> u32 {
+            if r.u8() < 200 {
+                r.pick(&[0x04, 0x06, 0x10, 0x14, 0x18, 0x1C, 0x30, 0x3C, m, m + 2, m + 4, m + 8, m + 0xC, m + 0x10,
+                         e + 8, e + 0xA, e + 0x10, e + 0x28, p + 4])
+            } else {
+                r.below(256) as u32
+            }
+        };
+        match r.u8() % 7 {
+            0 | 1 => {
+                let at = reg(r);
+                let size = if at % 4 == 0 { r.pick(&[4u8, 2, 1]) } else if at % 2 == 0 { r.pick(&[2u8, 1]) } else { 1 };
+                let value = if r.u8() < 32 { u32::MAX } else { r.value32() };
+                self.pci_write(slot, at, size, value);
+            }
+            2 => {
+                let at = reg(r);
+                let size = if at % 4 == 0 { r.pick(&[4u8, 2, 1]) } else { 1 };
+                self.plan().push_back(Step::Out { port: 0xCF8, size: 4, value: 0x8000_0000 | (slot << 11) | (at & 0xFC) });
+                self.plan().push_back(Step::In { port: 0xCFC + (at & 3) as u16, size });
+            }
+            3 => {
+                /* BAR0 moved, as a driver that assigns it: sized, then put
+                 * elsewhere in the hole -- or anywhere, over RAM or another
+                 * BAR, which is refused its mapping */
+                self.pci_write(slot, 0x10, 4, u32::MAX);
+                let to = if r.u8() < 200 {
+                    (linux::HOLE_RAM_END + r.below(32) * hostmodel::GPU_BAR0_SIZE) as u32
+                } else {
+                    r.u32()
+                };
+                self.pci_write(slot, 0x10, 4, to);
+                if let Some(h) = self.hosted.as_mut() {
+                    h.bar0 = u64::from(to) & !(hostmodel::GPU_BAR0_SIZE - 1);
+                }
+            }
+            4 => {
+                /* The mirror: the configuration space through BAR0, the MSI's
+                 * acknowledgement among it; now and then past it, or eight
+                 * bytes at once */
+                let off = if r.u8() < 200 { u64::from(reg(r)) } else { r.below(0x1000) };
+                let gpa = bar0 + u64::from(crate::devices::host::NVIDIA_MIRROR) + off;
+                let size = r.pick(&[4u8, 4, 4, 2, 1, 8]);
+                let value = if off == u64::from(m) && r.bool() { 0xFF } else { r.value64() };
+                self.plan().push_back(Step::MmioOf { gpa, store: r.bool(), size, value });
+            }
+            5 => {
+                /* MSI to an APIC's vector, unmasked mostly, on */
+                let dest = r.below(4) as u32;
+                self.pci_write(slot, m + 4, 4, 0xFEE0_0000 | dest << 12);
+                self.pci_write(slot, m + 8, 4, 0);
+                self.pci_write(slot, m + 0xC, 2, 0x20 + r.below(0xD0) as u32);
+                if maskable {
+                    self.pci_write(slot, m + 0x10, 4, u32::from(r.u8() < 48));
+                }
+                self.pci_write(slot, m + 2, 2, u32::from(r.u8() >= 16));
+            }
+            _ => {
+                /* The device's interrupt, sent now or held pending */
+                if let Some((address, data)) = msi.raise() {
+                    let serving = SERVING.lock().unwrap().as_ref().and_then(|(g, _)| g.upgrade());
+                    if let Some(guest) = serving {
+                        guest.deliver_msi(address, data);
+                    }
+                }
+            }
+        }
     }
 
     fn pci_write(&mut self, slot: u32, reg: u32, size: u8, value: u32) {
@@ -758,6 +856,10 @@ impl Script {
 
     /// A driver's bring-up, several exits long.
     fn plan_something(&mut self, r: &mut Input) {
+        if self.hosted.is_some() && r.u8() < 48 {
+            self.plan_hosted(r);
+            return;
+        }
         match r.u8() % 12 {
             11 if self.cpus.len() > 1 => {
                 let to = 1 + r.below(self.cpus.len() as u64 - 1) as u32;
@@ -1679,14 +1781,22 @@ pub fn platform(r: &mut Input) {
     machine.posted = machine.vapic && r.u8() >= 64;
     let Some(doorbells) = Doorbells::new(cpus as usize) else { return };
     let doorbells = Arc::new(doorbells);
-    let made = LinuxGuest::new(&machine, mem_bytes, huge, cpus, doorbells.clone(), x2apic, ioapic);
+    /* Now and then a guest holding a host's function: its RAM below 4 GiB
+     * ending below the hole the function's BARs go in */
+    let hosted = r.u8() < 40;
+    let low_end = if hosted { linux::HOLE_RAM_END } else { linux::LOW_RAM_END };
+    let made = if hosted {
+        LinuxGuest::new_holed(&machine, mem_bytes, huge, cpus, doorbells.clone(), x2apic, ioapic)
+    } else {
+        LinuxGuest::new(&machine, mem_bytes, huge, cpus, doorbells.clone(), x2apic, ioapic)
+    };
     if mem_bytes > crate::run::MAX_MEM_BYTES {
         invariant!(made.is_err(), "a guest of {} MiB made, past the most there is", mem_bytes / MIB);
         return;
     }
     /* RAM past what the guest is told an address reaches is RAM it cannot
      * use: refused, never given. */
-    let ram = linux::Ram::of(mem_bytes);
+    let ram = linux::Ram::of_below(mem_bytes, low_end);
     let reach = 1u64 << crate::policy::phys_bits();
     if ram.end().is_none_or(|end| end > reach) {
         invariant!(made.is_err(), "a guest of {} MiB made, its RAM past the {:#x} its addresses reach",
@@ -1704,7 +1814,7 @@ pub fn platform(r: &mut Input) {
         invariant!(memory.backs(base, size), "a guest of {} MiB without its RAM at {:#x}+{:#x}", mem_bytes / MIB,
                    base, size);
     }
-    invariant!(!memory.backs(linux::LOW_RAM_END, 1) && !memory.backs(0xFEC0_0000, 1)
+    invariant!(!memory.backs(low_end, 1) && !memory.backs(0xFEC0_0000, 1)
                && !memory.backs(0xFEE0_0000, 1), "a guest of {} MiB with RAM over its devices' pages",
                mem_bytes / MIB);
     /* The guest's CPUs' interrupts the CPU's as it asked, or by default --
@@ -1740,11 +1850,40 @@ pub fn platform(r: &mut Input) {
         }
     }
 
+    /* The GPU last, on the slot after the emulated devices' */
+    let mut gpu = None;
+    if hosted {
+        let made = hostmodel::gpu(r);
+        let function = HostFunction::new(Box::new(hostmodel::Handle(made.model.clone())), made.bars);
+        invariant!(function.is_some(), "the platform's GPU not given");
+        let maskable = made.model.lock().unwrap().space[hostmodel::GPU_MSI + 3] & 1 != 0;
+        if let Some(f) = function {
+            let msi = f.msi();
+            if guest.add_host_function(f).is_ok() {
+                let slot = 1 + (disks.len() + nics.len()) as u32;
+                let bar0 = linux::HOLE_RAM_END.div_ceil(hostmodel::GPU_BAR0_SIZE) * hostmodel::GPU_BAR0_SIZE;
+                gpu = Some((HostedFn { slot, bar0, msi, maskable }, made.model));
+            }
+        }
+    }
+
     let (h, first) = header();
-    let Ok(layout) = linux::plan(&h, mem_bytes, 8 * MIB, if r.bool() { 4 * MIB } else { 0 }) else { return };
+    /* Now and then a layout planned for the other kind of guest: its memory
+     * map would say RAM where this one has its BARs' hole, or the hole
+     * where it has RAM -- refused, never loaded */
+    let other = if low_end == linux::LOW_RAM_END { linux::HOLE_RAM_END } else { linux::LOW_RAM_END };
+    let planned_end = if r.u8() < 8 { other } else { low_end };
+    let Ok(layout) = linux::plan_below(&h, mem_bytes, planned_end, 8 * MIB, if r.bool() { 4 * MIB } else { 0 }) else {
+        return;
+    };
     let cmdline: Vec<u8> = b"console=ttyS0 ".iter().copied().chain((0..r.below(64)).map(|_| b'a' + r.u8() % 26)).collect();
     let Some(bsp) = vcpus.first_mut() else { return };
-    invariant!(guest.load(bsp, &h, &first, layout, &cmdline).is_ok(), "a plain kernel's load failed");
+    let loaded = guest.load(bsp, &h, &first, layout, &cmdline).is_ok();
+    invariant!(loaded == (planned_end == low_end), "a kernel's layout of RAM below {:#x} {} a guest of RAM below {:#x}",
+               planned_end, if loaded { "loaded into" } else { "refused by" }, low_end);
+    if !loaded {
+        return;
+    }
 
     let host = Arc::new(HostState { input: Mutex::new(VecDeque::new()), button: AtomicBool::new(false),
                                     last_entry: AtomicU64::new(time::peek()) });
@@ -1770,6 +1909,11 @@ pub fn platform(r: &mut Input) {
         cr3: vcpus[0].backend_mut().save().cr3,
         code: CODE,
         vmx: machine.caps().vendor() == Vendor::Vmx,
+        hosted: None,
+    };
+    let (script, gpu_model) = match gpu {
+        Some((h, model)) => (Script { hosted: Some(h), ..script }, Some(model)),
+        None => (script, None),
     };
     vm::set_guest(Some(Box::new(script)));
     let deadline = time::boot_time_ns() + 3600 * crate::consts::NS_PER_SEC;
@@ -1784,6 +1928,10 @@ pub fn platform(r: &mut Input) {
     };
     vm::set_guest(None);
     *SERVING.lock().unwrap() = None;
+    /* Whatever the guest did to its GPU, the host's rules held */
+    if let Some(model) = &gpu_model {
+        hostmodel::rules_held(model);
+    }
     let stopped = guest.take_stopped();
     invariant!(stopped.is_some(), "the run ended with no stop recorded");
     if let Some(s) = &stopped {

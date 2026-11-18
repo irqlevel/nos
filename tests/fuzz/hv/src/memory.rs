@@ -145,6 +145,8 @@ pub struct GuestMemory {
     id: AtomicU64,
     shared: Arc<Shared>,
     absent: Mutex<Vec<u64>>,
+    /// A host's function's BARs mapped (`map_device`): base and size.
+    devices: Mutex<Vec<(u64, u64)>>,
     /// `map` refuses, as the real one does with no address left.
     refuse_maps: AtomicBool,
     /// Mappings made: each one undone is an address the real kernel shoots
@@ -165,6 +167,7 @@ impl GuestMemory {
             id: AtomicU64::new(1),
             shared: Arc::new(Shared { pages: Mutex::new(Pages::default()), racer: Mutex::new(None), late: Mutex::new(None) }),
             absent: Mutex::new(Vec::new()),
+            devices: Mutex::new(Vec::new()),
             refuse_maps: AtomicBool::new(false),
             maps: AtomicUsize::new(0),
             moved: AtomicU64::new(0),
@@ -385,10 +388,13 @@ impl GuestMemory {
     }
 
     /// A guest's RAM of `mem_bytes`, as `LinuxGuest::new` lays it out
-    /// (`linux::Ram`): None for one no region could hold.
-    pub fn with_ram(mem_bytes: u64) -> Option<GuestMemory> {
+    /// (`linux::Ram`), its RAM below 4 GiB ending at `low_end` -- below the
+    /// devices' pages, or as `new_holed` lays it out, below the hole a host
+    /// function's BARs go in (`linux::Ram::of_below`): None for one no
+    /// region could hold.
+    pub fn with_ram_below(mem_bytes: u64, low_end: u64) -> Option<GuestMemory> {
         let mut m = GuestMemory::new(Vendor::Svm).expect("memory");
-        for (base, size) in crate::linux::Ram::of(mem_bytes).regions() {
+        for (base, size) in crate::linux::Ram::of_below(mem_bytes, low_end).regions() {
             m.add(base, size).ok()?;
         }
         Some(m)
@@ -548,13 +554,17 @@ impl GuestMemory {
     }
 
     /// As the real one decides it: a page of the MMIO window that is no
-    /// region's and not the local APIC's, up to 64 of them.
+    /// region's, no BAR's and not the local APIC's, up to 64 of them -- the
+    /// BARs looked at under the absent pages' lock, as the real one does.
     pub fn map_absent(&self, gpa: u64) -> Result<()> {
         let page = gpa & !(PAGE - 1);
         if !MMIO_WINDOW.contains(&page) || page == XAPIC_PAGE || self.inside(page, PAGE as usize).is_ok() {
             return Err(Error::BadAddress);
         }
         let mut absent = self.absent.lock().unwrap();
+        if self.is_device(page) {
+            return Err(Error::BadAddress);
+        }
         if absent.contains(&page) {
             return Ok(());
         }
@@ -567,5 +577,40 @@ impl GuestMemory {
 
     pub fn absent_pages(&self) -> Vec<u64> {
         self.absent.lock().unwrap().clone()
+    }
+
+    /// As the real one decides it: whole pages, below `MAX_GPA`, clear of
+    /// RAM, the local APIC's page, every page of all ones made and every
+    /// BAR mapped -- or refused, and nothing mapped.
+    pub fn map_device(&self, gpa: u64, hpa: u64, size: u64, _holes: &[u64]) -> Result<()> {
+        let end = gpa.checked_add(size).ok_or(Error::BadAddress)?;
+        if size == 0 || gpa % PAGE != 0 || hpa % PAGE != 0 || size % PAGE != 0 || end > MAX_GPA
+            || self.regions.iter().any(|r| gpa < r.base + r.size && r.base < end)
+            || (gpa..end).contains(&XAPIC_PAGE)
+        {
+            return Err(Error::BadAddress);
+        }
+        let absent = self.absent.lock().unwrap();
+        if absent.iter().any(|&p| p >= gpa && p < end) {
+            return Err(Error::BadAddress);
+        }
+        let mut devices = self.devices.lock().unwrap();
+        if devices.iter().any(|&(b, s)| gpa < b + s && b < end) {
+            return Err(Error::BadAddress);
+        }
+        devices.push((gpa, size));
+        Ok(())
+    }
+
+    /// The BAR at `gpa`, `size` long, unmapped: the table's identity anew.
+    pub fn unmap_device(&self, gpa: u64, size: u64) -> Result<u64> {
+        let mut devices = self.devices.lock().unwrap();
+        let Some(i) = devices.iter().position(|&d| d == (gpa, size)) else { return Err(Error::Unmapped) };
+        devices.swap_remove(i);
+        Ok(self.id.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+
+    pub fn is_device(&self, gpa: u64) -> bool {
+        self.devices.lock().unwrap().iter().any(|&(b, s)| gpa >= b && gpa - b < s)
     }
 }
