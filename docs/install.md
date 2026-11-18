@@ -20,13 +20,12 @@ network, so check these before anything else. `nos-install` looks for each
 and says what it finds -- the partition it refuses, the rest it warns of --
 but cannot fix any of them:
 
-- **An NVMe, a virtio or an IDE-mode SATA disk** for nos's partition. Those
-  (and virtio-scsi) are the disks nos reads; a SATA disk only where the
-  firmware leaves its controller in IDE mode (PCI class 0101 -- `lspci` says
-  "IDE interface", Linux binds `ata_piix`), which nos drives by PIO. Behind
-  AHCI (`ahci`) or a RAID controller, GRUB still loads the kernel -- it reads
-  disks through the firmware -- but nos finds no root there: no modules, no
-  `/etc/rc`, no sshd.
+- **An NVMe, a virtio or a SATA disk** for nos's partition. Those (and
+  virtio-scsi) are the disks nos reads; a SATA disk behind an AHCI HBA (PCI
+  class 0106 -- Linux binds `ahci`) or a controller the firmware leaves in
+  IDE mode (0101 -- `ata_piix`). Behind a RAID controller, GRUB still loads
+  the kernel -- it reads disks through the firmware -- but nos finds no root
+  there: no modules, no `/etc/rc`, no sshd.
 - **A network card nos drives**: Realtek RTL8168 or RTL8125, Intel 82576,
   I210 or I211 (the `igb` driver), Intel 82574L (the `e1000e` driver), or
   virtio-net. With any other, nos boots and nobody can reach it. A network
