@@ -307,7 +307,17 @@ their fingerprints shown. Then what `nos-install disk --dry-run` would write,
 and the disk's name typed to erase it. When it is done: take the ISO out of
 the virtual media and boot the disk.
 
-Built from the tree with Docker:
+Every release carries one, made of the release's system image and tried
+before it is published (`.github/workflows/release.yml`); the newest is
+always at the same link, for a provider's "install from ISO by URL":
+
+```sh
+wget https://github.com/irqlevel/nos/releases/latest/download/nos-installer-x86_64.iso
+wget https://github.com/irqlevel/nos/releases/latest/download/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+Or built from the tree with Docker:
 
 ```sh
 scripts/installer/build.sh                      # nos-installer-x86_64.iso, of nos-x86_64.squashfs
@@ -334,8 +344,9 @@ own Linux would; and the random pool's first seed is the installer's own
 `/dev/urandom`, which Linux seeds where nos's jitter finds nothing.
 
 The installer's Linux is GPL software among others: the packages it is made
-of are listed in the ISO's `/etc/nos-installer/packages`, by version, for
-their sources at Alpine's.
+of are listed in the ISO's `/etc/nos-installer/packages`, by version -- and
+beside the ISO in the release, as `nos-installer-packages.txt` -- for their
+sources at Alpine's.
 
 ## Updating, and going back
 

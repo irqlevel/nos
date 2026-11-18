@@ -45,6 +45,29 @@ jobs:
             -e GIT_DESC="$(git rev-parse --short HEAD)" \
             -v "$PWD:/src" -w /src nos-builder make image
 
+      # The installer ISO a server boots -- from its provider's virtual media
+      # or a USB stick -- to make a whole disk nos's own (docs/install.md,
+      # "From an ISO"): Alpine running the dialog over the system image just
+      # built, carried in it as it is in the release. What the builder made
+      # in the checkout is root's: the build's own directory under out/ is
+      # this job's to make.
+      - name: Build the installer ISO
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" out nos-x86_64.squashfs
+          ./scripts/installer/build.sh --image nos-x86_64.squashfs --out nos-installer-x86_64.iso
+          # Its packages, taken now: the test below builds an ISO of its own
+          # in the same place
+          cp out/installer/packages.txt nos-installer-packages.txt
+
+      # The ISO is published at a link anyone installs from: it installs, by
+      # its answers, under SeaBIOS and is found installed under OVMF, before
+      # the release is made (tests/installer-test.py, docs/testing.md)
+      - name: Installer test (x86_64)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf
+          python3 tests/installer-test.py --image nos-x86_64.squashfs
+
       - name: Stage the release files
         run: |
           mkdir -p dist
@@ -52,6 +75,11 @@ jobs:
           cp nos.iso          dist/nos.iso
           cp nos.qcow2        dist/nos.qcow2
           cp nos-x86_64.squashfs dist/nos-x86_64.squashfs
+          cp nos-installer-x86_64.iso dist/nos-installer-x86_64.iso
+          # What the installer's Linux is made of, a package and its version
+          # a line: Alpine's, GPL software among them, whose sources go by
+          # these names
+          cp nos-installer-packages.txt dist/nos-installer-packages.txt
           cp dist-panel/nos-panel-*.tar.gz dist/
           # The notice of the CRYPTOGAMS assembly every kernel and module of
           # the release runs (src/crates/base/crypto/cryptogams/README.md):
@@ -168,6 +196,27 @@ jobs:
             /mnt/nos-install install /dev/nvme0n1p4 --ssh-key ~/.ssh/id_ed25519.pub --reboot
             ```
 
+            ### Installer ISO (a server's whole disk)
+
+            `nos-installer-x86_64.iso`: for a server installed from an ISO -- its
+            provider's virtual media (IPMI, iDRAC, iLO) or a USB stick, BIOS or
+            UEFI. A small Linux, run from memory, asks which disk is to be
+            nos's, how big its root is (10G unless told; the rest of the disk is
+            left blank for VMs and NBS), the network and the SSH keys, and pours
+            the system image above onto it; its menu also boots nos from the ISO
+            to see what nos finds on the machine, writing nothing. An ISO that
+            asks nothing is one built with answers:
+            [docs/install.md, "From an ISO"](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/install.md#from-an-iso).
+
+            ```sh
+            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/nos-installer-x86_64.iso
+            ```
+
+            The newest release's is always at
+            `https://github.com/${{ github.repository }}/releases/latest/download/nos-installer-x86_64.iso`.
+            `nos-installer-packages.txt` lists the Alpine packages it is made of,
+            by version.
+
             ### The management panel
 
             `nos-panel-${{ github.ref_name }}.tar.gz`: the panel, Node and Caddy,
@@ -200,6 +249,8 @@ jobs:
             dist/nos.iso
             dist/nos.qcow2
             dist/nos-x86_64.squashfs
+            dist/nos-installer-x86_64.iso
+            dist/nos-installer-packages.txt
             dist/nos-panel-*.tar.gz
             dist/*.ko
             dist/SHA256SUMS

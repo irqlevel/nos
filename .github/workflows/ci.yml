@@ -58,6 +58,15 @@ jobs:
           make image
           python3 tests/image-test.py
 
+      # What the installer ISO a release publishes does on a server
+      # (docs/install.md, "From an ISO"): built with answers from the image
+      # above -- Docker, Alpine's packages -- it installs onto a blank disk
+      # under SeaBIOS, which boots nos alone under OVMF; booted again, it
+      # installs nothing. The release runs the same before it publishes one.
+      - name: Installer ISO test (x86_64, TCG)
+        if: matrix.arch == 'x86_64'
+        run: python3 tests/installer-test.py
+
       # The hypervisor's MMIO decoder turns a guest's bytes into the access
       # it performs for it, and a wrong decode looks like success: checked
       # against the encodings clang gives, on the host.
