@@ -157,7 +157,9 @@ reaches no Rust. hv reaches it by the usual three steps (`rust_ffi.cpp`,
    deadline for a controller that has stopped (QEMU's, on the blocked fetch).
 3. ECAM; then IR (the MSI branch is in master): the smoke boots under
    `intel-iommu,intremap=on`, every interrupt remapped.
-4. Domains, the claim, the reset, `kcore::iommu`; an emulated device (an NVMe
+4. Domains (**done**, C++: `Vtd::domain_*`, held to the gate by `iommu
+   identity`, the NVMe working through a table of its own), the claim, the
+   reset, `kcore::iommu`; an emulated device (an NVMe
    or an e1000e behind a `pcie-root-port`) handed to a Linux guest under nos
    in QEMU, its driver working; a hostile phase, the guest pointing the
    device's DMA past its memory: a fault said, the host whole (a gate of its
