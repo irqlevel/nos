@@ -2184,7 +2184,11 @@ over it --
 - MSI is emulated: what the guest writes is what the host's handler of the
   real MSI sends it (`LinuxGuest::deliver_msi`), held pending while it is off
   or masked;
-- no ROM, no INTx pin; power management never out of D0; the PCIe device
+- no ROM; the INTx pin the device's, wired to a line nothing raises
+  (`run::HOST_IRQ`): the device's INTx stays off and its interrupt is its
+  MSI, but a driver that wants a legacy IRQ to exist finds one -- NVIDIA's
+  refuses a function with neither that nor MSI-X; power management never
+  out of D0; the PCIe device
   control's FLR, payload sizes and error reporting the host's, its phantom
   functions -- whose requests would carry another function's id, and so
   another IOMMU context -- and no snoop kept off; the link control the
@@ -2215,9 +2219,13 @@ the Resizable BAR, ACS, AER -- is nothing the guest reaches.
 **The guest's memory has a hole for the BARs** (`LinuxGuest::new_holed`):
 its RAM below 4 GiB ends at 3 GiB (`linux::HOLE_RAM_END`) rather than at
 0xFE000000, its 32-bit BARs go from there up to the MSI-X pages, its 64-bit
-ones from the first GiB past its RAM up to the width its CPUID gives it --
-both windows in the DSDT's `_CRS`, so that Linux keeps each BAR where it was
-put. The memory map and the kernel's and initrd's places are planned for
+ones from the first GiB past its RAM -- both windows in the DSDT's `_CRS`, so
+that Linux keeps each BAR where it was put. The 64-bit window there reaches
+only as far as the BARs placed in it, a GiB at a time: the rest of the
+guest's addresses are its OS's own, and Linux's HMM takes a GPU's VRAM's
+worth of them for the device memory NVIDIA's UVM registers the GPU with --
+with the window up to the top of them none was left, and CUDA was refused
+("initialization error"). The memory map and the kernel's and initrd's places are planned for
 the same layout (`linux::plan_below`, `pvh::plan_below`), and a layout
 planned for the other kind of guest is refused by `load`: its map would hand
 the kernel the hole as RAM. A BAR is mapped straight into the nested table,
@@ -2239,11 +2247,15 @@ real function: whatever the guest does, what reaches it holds to the host's
 rules, and what the guest sees to the PCI spec's -- a BAR decoded from its
 registers among it), the `platform` target's guest holding a GPU (the run
 loop's bus, mirror, BAR moves and MSIs), and the `linux` and `pvh` targets'
-holed layouts; `iommu-test.py` for the domains; and on a machine with a GPU,
-by hand, `gpu-passthrough-test.py`: on Hertz an RTX A2000 in nos's guest,
-nouveau up -- its GSP booted by DMA through the domain -- and a thousand
-fences, each waited for on the GPU's MSI, sent on by hv (docs/testing.md).
-`nvidia-smi` and CUDA, NVIDIA's own driver in the guest, are next.
+holed layouts, the `pci` target's ports (only the configuration data's
+are a host function's, whatever the address latched names: a disk's notify
+once went to the GPU's space instead, and the guest's disk stopped as
+NVIDIA's driver probed); `iommu-test.py` for the domains; and on a machine
+with a GPU, by hand, `gpu-passthrough-test.py`: on Hertz an RTX A2000 in
+nos's guest -- with NVIDIA's own driver (580, the open modules), nvidia-smi
+naming the GPU and CUDA's deviceQuery, vectorAdd and matrixMul passing; or
+with nouveau, its GSP booted by DMA through the domain and a thousand
+fences each waited for on the GPU's MSI, sent on by hv (docs/testing.md).
 
 ## A network
 
