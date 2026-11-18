@@ -416,7 +416,14 @@ whose DMAR names one unit for every device: nos has to take it over -- the
 boot log saying it translates with every device passed through, `iommu`
 saying on -- and the NVMe, whose DMA goes through the unit (QEMU's virtio
 devices go around it unless told `iommu_platform=on`), has to read its
-image's sector 0 through it. Then `iommu block` makes the NVMe's context
+image's sector 0 through it. `iommu identity` then moves the NVMe to a
+domain of its own (`Vtd::domain_create`, `domain_map`, `domain_attach`)
+whose second-level table maps every page of usable RAM to itself -- 2 MiB
+leaves, and 4 KiB ones about the firmware's holes -- and it has to read the
+same through the domain's tables, and again once `iommu release` has
+destroyed the domain and passed it through. Put back with the domain's leaves
+readable alone, the gate fails there: the device's writes are blocked. Then
+`iommu block` makes the NVMe's context
 entry not present, and a read of it is a DMA the unit blocks: the fault has
 to be said from the fault event's interrupt, with the NVMe's requester id and
 the reason (0x02, no context entry), the machine has to go on, `iommu` count
