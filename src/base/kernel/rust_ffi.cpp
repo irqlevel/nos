@@ -1300,6 +1300,28 @@ unsigned long kernel_msix_create(unsigned short bus, unsigned short slot,
     return (unsigned long)t;
 }
 
+/* The device's MSI capability as a table of one entry (MsixTable::setup_msi):
+   a handle every kernel_msix_* call takes, entry 0 its one vector. Asked
+   for by name, by a driver whose device has MSI and no MSI-X. */
+unsigned long kernel_msi_create(unsigned short bus, unsigned short slot, unsigned short func)
+{
+    auto* dev = find_pci_dev_by_bdf(bus, slot, func);
+    if (!dev)
+        return 0;
+
+    auto* t = kernel::mm::talloc<kernel::MsixTable, RUST_ALLOC_TAG>();
+    if (!t)
+        return 0;
+
+    if (!t->setup_msi(dev))
+    {
+        t->~MsixTable();
+        kernel::mm::free(t);
+        return 0;
+    }
+    return (unsigned long)t;
+}
+
 } /* extern "C" */
 
 static void forget_msix_table(const kernel::MsixTable* table);
