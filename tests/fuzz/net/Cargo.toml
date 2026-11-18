@@ -24,6 +24,8 @@ tls = { path = "../../../src/crates/layers/tls", features = ["pinned"] }
 web = { path = "../../../src/crates/common/net/web" }
 fs = { path = "../../../src/crates/layers/fs" }
 ssh = { path = "../../../src/crates/common/net/ssh" }
+# The SFTP server, on its own over a model of the files (the sftp target).
+sftp = { path = "../../../src/crates/common/net/sftp" }
 # What the sshd and api modules' sources need of a module's runtime.
 kmod = { path = "standins/kmod" }
 # The management bus the api module serves, its JSON, and the TOML of its

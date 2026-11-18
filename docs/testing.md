@@ -225,7 +225,7 @@ swallowing panic messages whole.
 | `disklog-test.py` | arm64 | the disk log |
 | `netconsole-test.py` | arm64 | the log path (`klog`), a net device, netconsole, what reaches the network as the machine halts |
 | `tcp-test.py` | arm64 | TCP, the HTTP client |
-| `sshd-test.py [--arch aarch64\|x86_64]` | both | TCP's listening side, the module loader, the `ffi` declarations, the terminal a session lends a command, `edit` in nos; on arm64 the halt |
+| `sshd-test.py [--arch aarch64\|x86_64]` | both | TCP's listening side, the module loader, the `ffi` declarations, the terminal a session lends a command, `edit` in nos, files copied in and out over SFTP; on arm64 the halt |
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through; the asynchronous path as the image's queue uses it (`block::queue`) is fs-fuzz's too, whose disks take it |
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/net/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `ipc-test.py [--arch aarch64\|x86_64] [--keep]` | both | the channel between hosts: `modules/cluster/ipcnet`, the router's side of `ipc` (`remote.rs`, bounces, a message received in pieces), `ipcwire` as two kernels speak it, TCP's allowlist and a link's floor as ipcnet uses them, `tls::pinned` both ways -- three nos on `tests/hub.py`'s LAN, which answers their DHCP, relays the test's UDP shell to each, and drops, delays and cuts between them |
@@ -240,7 +240,7 @@ swallowing panic messages whole.
 | `extfmt-test.py [--iterations N] [--trials N]` | host (CI) | the ext2/3/4 format crate (`src/crates/common/storage/extfmt`) hvboot reads through and the kernel's ext4 driver is to: every checksum of filesystems mke2fs makes -- ext4 by default, with metadata_csum_seed, with 1 KiB blocks and 128-byte inodes and no 64bit, with gdt_csum, ext3, ext2 -- held to extfmt's, bytes they cover changed one at a time with extfmt and `e2fsck -fn` held to both saying so, and each image fuzzed; then journals debugfs leaves unreplayed, replayed by extfmt's planner and by `e2fsck -E journal_only` to the same image byte for byte, their ring turned so the log wraps, damaged and refused, and fuzzed; and the filesystems `extfmt::mkfs` makes for the shell's `format` -- ext4 and ext2, every block size, up to 3 GiB and 128 groups, the small ones made over noise -- clean to `e2fsck -fn`, their features and label dumpe2fs's, their lost+found debugfs's, and the devices it refuses refused |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hypervisor/hv/src/{insn,walk}.rs`), against the encodings clang gives |
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and its ACPI and SMBIOS tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on; and the virtio notifications, kicks and interrupts with EVENT_IDX and without, held to a Linux driver's every request served (`virtq`); and the guests' firewall, its crate to a model of its own (`firewall`) and the switch's use of it (`fwswitch`); and NAT's one to one (`onetoone`); and the cluster's networks on the switch (`vnetswitch`), the tunnel's datagram, each held to the wire built without vnetwire (`vnetwire`), and three hosts' tunnels over a hostile wire, public addresses across them through the real NAT among it, ports migrated between them (`tunnel`); a migrated port's flows on its new host's switch (`flowmove`); `--mutants` (by hand) then takes a hundred and four of the firewall's, one to one's, the cluster networks', the tunnel's, the public addresses' and a migration's network's rules out, each to be found |
-| `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate, and the session's line editor -- fuzzed with overflow checks on, each protocol against a model of it |
+| `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate, its SFTP server, and the session's line editor -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and ext4 images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands and its `format`, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
 | `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by, and what a terminal types at the console's line editor, and the tracepoints' ring against a model and a writer thread, and the window `trace latency` reads of the rings against the truth of a schedule played out on them -- and the memory management under everything: the page tables and the physical page allocator past `setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them, and a VM kept in a folder (`hv create`, `hv start <name>`, its `console.log`), in `/vms` and in a folder `insmod /hv.ko vms=` names; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given, and a VM from its folder keeping the port it was given at its first start; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button, a press the guest declines pressed again and answered -- with `--disk`, the one nos's own poweroff presses, the guest's disk left mounted coming back clean; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs; `--mem` past 4064 with `--nos-mem`, a guest with RAM from 4 GiB; `--nos-iso`, nos booted from `make nos-test.iso TEST_ISO_ARGS=hugepages=...`, every guest's memory the huge pool's, 2 MiB an entry of its nested table |
@@ -278,7 +278,7 @@ how it works and what it found.
 | the disk log | `disklog-test.py` (arm64): nothing else gives `disklog=on` |
 | the log path (`klog`), a net device, netconsole | `netconsole-test.py` (arm64): on the Hetzner boxes it is the only console there is -- what a boot logs, a panic's report, and the halt's lines down to its own last |
 | TCP, the HTTP client; TCP's loss recovery -- SACK and D-SACK, RACK-TLP, PRR, the undos, the table of what is in flight (`Sent` in `layers/net/src/tcp.rs`); the window it offers and takes in by (`offer_window`, `acceptable`) and silly window avoidance | `net-fuzz.py --target tcp` (host, in CI): a peer that takes SACK or not, says four blocks, fewer or none, and reneges now and then -- the machine held to SACKing only what reached it, D-SACKing only what reached it twice, and never sending again what an acknowledgement it had taken in told it was held; every connection's table, and the furthest edge its window offered -- within the receive buffer, no byte inside a window offered ever finding no room -- audited after every step. Then `tcp-test.py` (arm64); for the numbers, `tests/tcp-loss-bench.py` (arm64, HVF): two nos over hub.py, MB/s and each end's counters under loss, delay and reordering, against the tree before -- `--path` for the frames each way by size, `--trace`/`--show` for TCP's tracepoints, `--top` for the CPUs |
-| TCP's listening side, the module loader, the `ffi` declarations, `ssh`, `modules/net/sshd` | `sshd-test.py` (arm64); the loader's unload order, the smoke boots (`test_module_unload`) and `cpp-fuzz.py --target module`. 59 checks pass; `connections past the four logging in are refused` flakes under load: stragglers of the probe burst land after its quiet window |
+| TCP's listening side, the module loader, the `ffi` declarations, `ssh`, `modules/net/sshd`; SFTP: `common/net/sftp`, a session's subsystem (`ssh::Subsystem`), and the file ABI at exactly the path given (`kernel_file_stat`, `kernel_file_open_flags`, `kernel_file_pwrite_grow`, `kernel_dir_make`, `kernel_file_unlink`, `kernel_dir_remove`; `Vfs::pwrite`, `Vfs::remove_one`, `OPEN_EXCLUSIVE`) | `sshd-test.py` (arm64); SFTP: `net-fuzz.py`'s `sftp` and `ssh` targets, and `fs-fuzz.py` for the file ABI (its `vfs` target); the loader's unload order, the smoke boots (`test_module_unload`) and `cpp-fuzz.py --target module`. 78 checks pass; `connections past the four logging in are refused` flakes under load: stragglers of the probe burst land after its quiet window |
 | the editor: `src/crates/common/text/edit`, `modules/tools/edit`; the terminal a session lends the command it runs -- the pty-req's and window-changes' size in `ssh`, `Output::terminal`, `kernel_printer_terminal` | `edit-test.py` (host, in CI): the crate run as the module runs it, on a terminal of the test's own that does what xterm does -- key sessions held to what they leave in the file, at the cursor and on the screen; files read and saved back byte for byte; random sessions after every key of which the editor keeps its promises and the terminal has had nothing it would wrap, scroll or not know, the screen drawn a row at a time what a full redraw draws, and undoing everything the file as it was read. Then `sshd-test.py` (arm64), whose editor phase types at `edit` through `ssh -t` on a pty of its own: drawn at the pty's size, saved, a file changed meanwhile asked about, a resize drawn again whole, `<file>.save` when the connection goes; and `net-fuzz.py`, whose `term` command is told the size its client gave and changed |
 | the receive path, the frame pool, `modules/net/netload`, a module's UDP listener in `kcore::net`, the tick's receive poll (`rxpoll`) | `netload-test.py` (arm64; about seven minutes, by design), and `--arch x86_64`, its short form, after touching the module ABI |
 | `drivers/net/igb`, the driver seam in `layers/net/src/device.rs` | `tcp-test.py --nic igb` and `netload-test.py --nic igb`: QEMU's 82576, the only way a hardware NIC driver runs anywhere but on a Hetzner box (QEMU 8.0 or later; CI's does not have it, so by hand) |
@@ -576,13 +576,24 @@ then written by somebody else and saved over after the question, the pty
 resized and the screen drawn again whole at the new size, `^Q`, the file
 read back; then the connection killed under a change, which must turn up in
 `<file>.save` with the file as it was saved; and `edit` with no terminal
-must say it needs one. On x86-64 it boots an
-ext4 root that already carries the module, a key and an `/etc/rc`, and logs
-in. It is also what notices a change to the `ffi` declarations that a module
+must say it needs one. Files copied in and out over SFTP by OpenSSH's own
+`sftp -b` and `scp -s`: 8 MiB and some in and back out the same, by each;
+`ls -l` showing it at its size, `df`, a rename, the kernel's `ls` seeing
+it, the session's line in the log; a tree in and back out with `scp -r`;
+an `rm` of `a` that leaves the `a.new` beside it (a file of its own, not a
+configuration file's next content); and the refusals, each said -- an `rm`
+of nothing (no such file), an `rmdir` of a directory with something in it,
+a `mkdir` where there is one, `chmod` (unsupported: nos keeps no
+permissions), a name of 64 bytes, and `scp -p`, whose times and mode cannot
+be kept -- then everything taken away again with `rm` and `rmdir`, a file
+and an empty directory at a time. On x86-64 it boots an
+ext4 root that already carries the module, a key and an `/etc/rc`, logs
+in, and copies a file in over SFTP and back out the same. It is also what notices a change to the `ffi` declarations that a module
 was not rebuilt against: a module's header carries a digest of them. Needs
-`ssh`, `ssh-keygen` and host ports 2222, 8000 and 9000 free.
+`ssh`, `ssh-keygen`, `sftp` and `scp` (OpenSSH 8.7 or later, for `scp -s`)
+and host ports 2222, 8000 and 9000 free.
 
-59 checks pass, 14 of them the editor's. `poweroff unloads sshd before the unmount` used to fail: from
+78 checks pass, 14 of them the editor's and 19 SFTP's. `poweroff unloads sshd before the unmount` used to fail: from
 the VFS's move to Rust (`edae1ef`) it waited for `unmounting / (ext2)`, a line
 only the C++ VFS printed, where the Rust one prints `vfs: unmounting /`. One
 check still fails now and then under load, `connections past
@@ -1459,7 +1470,43 @@ own, TCP's flags in combinations that mean something. The targets:
   then the command is `term`, which prints the terminal its session lends
   it -- run with none, or after a pty-req of a size and window-changes to
   others, sizes of 0 and of `u32::MAX` among them -- and must say the last
-  size sent and how many changes there were, as `edit` is told them;
+  size sent and how many changes there were, as `edit` is told them. And
+  now and then the client asks for the `sftp` subsystem, its INIT sent
+  behind the request before the answer, and copies a file of up to 200 KB
+  into a directory of its own and back out (`sftpc.rs`): the directory
+  made, the file opened, written in pieces sent all at once -- held to the
+  server's window, which the client's own `flush` keeps to, rekeys
+  included -- closed, looked at, read back in pieces asked for all at once
+  and one past its end, the directory listed, the file renamed and removed,
+  the directory removed, every answer checked as it comes and the file read
+  back the one written, through the module's `KernelFiles` over the ramfs;
+- `sftp`: the SFTP server (`common/net/sftp`) on its own, fed a client's
+  requests cut into pieces wherever the input says -- a piece half a
+  request, or several -- over a model of the files kcore::fs gives sshd,
+  which fails a call now and then as a disk does. The requests are every one
+  SFTP version 3 has and the four extensions it says it has, at paths of a
+  few names -- `.`, `..`, `~`, `a.new` beside `a`, a name as long as the
+  files keep and one longer, a path past the longest, one not UTF-8, one
+  with a NUL -- with handles open, closed, of the other kind and made up,
+  bursts of opens past the 32 a server holds; now and then one cut short,
+  one with bytes after its end, one of no kind there is; rarely a stream
+  there is no reading on from. Each answer is held to the judge's own
+  reading of the protocol and of [sshd](sshd.md#copying-files-sftp), worked
+  out from the files as they were before the request: one answer, of its
+  id and of a kind the request may have; a STATUS's code its case's; a READ
+  the bytes there; a READDIR every entry of a directory nobody changed,
+  once, then its end; the files changed exactly as the request says, and
+  not at all by one refused, cut short, or failed by the model; a closed
+  handle dead and never given out again; only well-formed paths handed to
+  the files; every file opened closed; the server's counters what was done.
+  Seven mutants of the server -- a read a byte short, a directory's remove
+  said to be no such file, no name length check, a READDIR that skips an
+  entry, a handle's generation kept over a close, an append written where
+  the WRITE says, a SETSTAT that drops what it cannot set -- each fail
+  its first inputs. Its first run found the server's MKDIR, which looked
+  first and made after, answering success for a directory there when the
+  look failed: MKDIR is the files' own exclusive make now
+  (`kernel_dir_make`);
 - `tls_server`: the TLS server the host API serves over (`tls::pinned::Server`), run
   as the module runs it -- a listener and a task a connection over the
   kernel's TCP, at most four at once -- letting in one key and answering
@@ -1621,7 +1668,7 @@ TARGET FILE`, with `--trace` for every frame both ways and every line
 traced.
 
 With no arguments every target runs its own number of inputs from seed 1 --
-three hundred of `ssh`, five thousand of `icmp` -- the same ones every
+three hundred of `ssh`, three thousand of `sftp`, five thousand of `icmp` -- the same ones every
 time: the gate, a couple of minutes, which CI runs on its arm64 leg. A
 campaign is `--seed N --seconds S`, a seed for each CPU.
 
@@ -1920,7 +1967,13 @@ to the tree `e2fsck -fy` leaves. The targets:
   calls does to the model -- a directory read an entry at a time
   (`kernel_dir_entry`, now and then with too little room for a name) to the
   model's entries and nothing else, an append to the end of a file made if
-  it is missing, a rename, as hv's VMs in their folders use them. A control
+  it is missing, a rename, as hv's VMs in their folders use them -- and its
+  calls at exactly the path given, sshd's SFTP's: a stat, an open with
+  flags (made, cut, made by this open or refused -- `OPEN_EXCLUSIVE`, an
+  unknown flag refused), a directory made where nothing is, a file removed
+  and an empty directory removed, each never the other kind and never a
+  tree, and a write through a word that grows the file where it reaches
+  past its end, a hole between. A control
   run whose append wrote at the start of the file was found at the 47th
   input. A mount taken exactly when its path is free and
   well formed, its device nobody else's and there is room; an unmount

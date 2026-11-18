@@ -79,7 +79,15 @@ reads as no file instead of as whatever memory is there now.
   the shell prints, `replace_file`/`locate` for a configuration file that a
   full disk or a crash midway must not leave empty, and the `kernel_file_*`
   ABI over them that a module -- and the shell's `/etc/rc` -- reads and
-  writes by.
+  writes by; and beside those the calls at exactly the path given, which
+  never look for a `<path>.new` -- what sshd's SFTP copies files in and out
+  by: `kernel_file_stat`, `kernel_file_open_flags` (made when missing, cut,
+  made by this open or refused: `OPEN_EXCLUSIVE`, under the lock the file is
+  made under), `kernel_file_pwrite_grow` (`Vfs::pwrite`, a write that grows
+  the file, a hole between), `kernel_dir_make`, and `kernel_file_unlink` and
+  `kernel_dir_remove` (`Vfs::remove_one`: one file or one empty directory,
+  never a tree, the look and the remove under one hold of the mount's
+  lock).
 
 An open file pins its vnode: `remove` and `rename` refuse a file (or a
 directory containing one) that is open, and `unmount` refuses a filesystem

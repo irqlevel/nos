@@ -1,6 +1,7 @@
 //! User authentication (RFC 4252) and the connection protocol (RFC 4254):
 //! public key logins, then one session channel -- a shell, or a command.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -11,7 +12,7 @@ use crate::transport::{
     DISCONNECT_NO_MORE_AUTH_METHODS, DISCONNECT_PROTOCOL_ERROR, MSG_SERVICE_ACCEPT, MSG_SERVICE_REQUEST,
 };
 use crate::wire::{put_bool, put_name_list, put_string, put_u32, Reader};
-use crate::{Config, Error, HostKey, Link, Result, Shell};
+use crate::{Config, Error, HostKey, Link, Result, Shell, Subsystem};
 
 const MSG_USERAUTH_REQUEST: u8 = 50;
 const MSG_USERAUTH_FAILURE: u8 = 51;
@@ -199,6 +200,8 @@ enum Mode {
     Idle,
     Shell,
     Exec,
+    /// Given over to a subsystem (`Session::subsystem`).
+    Subsystem,
 }
 
 struct Channel {
@@ -210,6 +213,9 @@ struct Channel {
     max_packet: usize,
     /// What the client may still send.
     local_window: u32,
+    /// The window the client is given in all, topped up once half of it
+    /// has been taken in: `WINDOW`, or a subsystem's own.
+    window_size: u32,
     /// Taken in since the client's window was last topped up.
     consumed: u32,
     /// A terminal was asked for: the client's side is raw.
@@ -227,14 +233,23 @@ enum Next {
     None,
     Shell,
     Exec(String),
+    /// The subsystem of that name, and whether the client asked to be told
+    /// if it got it: answered once the shell has said whether there is one.
+    Subsystem(String, bool),
 }
 
 struct Session<'s, 'a> {
     t: &'s mut Transport<'a>,
     cfg: &'s Config<'s>,
     channel: Option<Channel>,
-    /// Channel data not yet given to the line editor.
+    /// Channel data not yet given to the line editor -- or to the
+    /// subsystem, for which it never grows past the window it was given
+    /// room for.
     input: Vec<u8>,
+    /// The subsystem the channel was given over to, and where its answers
+    /// are made, one at a time.
+    subsystem: Option<Box<dyn Subsystem>>,
+    answer: Vec<u8>,
     editor: Editor,
     /// The message being handled, and the one being built.
     payload: Vec<u8>,
@@ -303,6 +318,8 @@ impl<'s, 'a> Session<'s, 'a> {
             cfg,
             channel: None,
             input: Vec::new(),
+            subsystem: None,
+            answer: Vec::new(),
             editor: Editor::new(),
             payload: Vec::new(),
             message: Vec::new(),
@@ -326,6 +343,11 @@ impl<'s, 'a> Session<'s, 'a> {
                     self.finish(0)?;
                 }
             }
+            /* A subsystem's client sends EOF once it is done -- everything
+               before it answered, whatever is left no whole message */
+            if self.subsystem_active() && self.channel.as_ref().map_or(false, |c| c.eof_in) {
+                self.finish(0)?;
+            }
             if self.channel.as_ref().map_or(false, |c| c.close_in && c.close_out) {
                 return Ok(());
             }
@@ -340,7 +362,9 @@ impl<'s, 'a> Session<'s, 'a> {
                         self.run_line(shell, &line)?;
                         self.finish(0)?;
                     }
+                    Next::Subsystem(name, want_reply) => self.start_subsystem(shell, &name, want_reply)?,
                 }
+                self.feed_subsystem()?;
             } else {
                 if self.keepalive_missed >= self.cfg.keepalive_max {
                     return Err(Error::Timeout("a client that stopped answering"));
@@ -359,6 +383,10 @@ impl<'s, 'a> Session<'s, 'a> {
 
     fn shell_active(&self) -> bool {
         matches!(&self.channel, Some(c) if c.mode == Mode::Shell && !c.close_in && !c.close_out)
+    }
+
+    fn subsystem_active(&self) -> bool {
+        matches!(&self.channel, Some(c) if c.mode == Mode::Subsystem && !c.close_in && !c.close_out)
     }
 
     fn pty(&self) -> bool {
@@ -481,6 +509,7 @@ impl<'s, 'a> Session<'s, 'a> {
                     window: u64::from(window),
                     max_packet: core::cmp::max(1, core::cmp::min(max_packet, MAX_DATA)) as usize,
                     local_window: WINDOW,
+                    window_size: WINDOW,
                     consumed: 0,
                     pty: false,
                     term: crate::Terminal::default(),
@@ -499,8 +528,8 @@ impl<'s, 'a> Session<'s, 'a> {
         self.t.send(&m)
     }
 
-    /// A channel request (RFC 4254 6): a terminal, then a shell or one
-    /// command. The rest -- env, subsystems, forwarding -- is refused.
+    /// A channel request (RFC 4254 6): a terminal, then a shell, one command
+    /// or a subsystem. The rest -- env, forwarding -- is refused.
     fn request(&mut self, r: &mut Reader, busy: bool) -> Result<Next> {
         let recipient = r.u32().ok_or(BAD_MESSAGE)?;
         let kind = r.string().ok_or(BAD_MESSAGE)?;
@@ -543,6 +572,11 @@ impl<'s, 'a> Session<'s, 'a> {
                     next = Next::Exec(String::from(command));
                     true
                 }
+                None => false,
+            },
+            /* Answered once the shell says whether it has the subsystem */
+            b"subsystem" if idle => match r.utf8() {
+                Some(name) => return Ok(Next::Subsystem(String::from(name), want_reply)),
                 None => false,
             },
             _ => false,
@@ -631,7 +665,7 @@ impl<'s, 'a> Session<'s, 'a> {
             return Ok(());
         };
         channel.consumed += n;
-        if channel.consumed < WINDOW / 2 || channel.close_out {
+        if channel.consumed < channel.window_size / 2 || channel.close_out {
             return Ok(());
         }
         let adjust = core::mem::take(&mut channel.consumed);
@@ -643,6 +677,77 @@ impl<'s, 'a> Session<'s, 'a> {
         put_u32(&mut m, remote);
         put_u32(&mut m, adjust);
         self.t.send(&m)
+    }
+
+    /// The channel given over to the subsystem `name`, if the shell has it
+    /// and there is room for what its client may send: the client told
+    /// whether it did, if it asked, and its window made the subsystem's.
+    /// Refused, the channel stays as it was, and the client may ask for
+    /// something else.
+    fn start_subsystem(&mut self, shell: &mut dyn Shell, name: &str, want_reply: bool) -> Result<()> {
+        let Some(remote) = self.channel.as_ref().map(|c| c.remote) else { return Ok(()) };
+        let mut granted = None;
+        if let Some(sub) = shell.subsystem(name) {
+            let size = core::cmp::max(sub.window(), WINDOW);
+            /* All the client may send, in one piece, from the start: what
+               the window lets it send never makes `input` grow, and so
+               never allocates */
+            let room = (size as usize).saturating_sub(self.input.len());
+            if self.input.try_reserve_exact(room).is_ok() {
+                granted = Some((sub, size));
+            }
+        }
+        if want_reply {
+            let answer = if granted.is_some() { MSG_CHANNEL_SUCCESS } else { MSG_CHANNEL_FAILURE };
+            self.channel_message(answer, remote)?;
+        }
+        let Some((sub, size)) = granted else { return Ok(()) };
+        self.subsystem = Some(sub);
+        let Some(channel) = self.channel.as_mut() else { return Ok(()) };
+        channel.mode = Mode::Subsystem;
+        let more = size - channel.window_size;
+        channel.window_size = size;
+        channel.local_window += more;
+        if more == 0 {
+            return Ok(());
+        }
+        let mut m = Vec::with_capacity(9);
+        m.push(MSG_CHANNEL_WINDOW_ADJUST);
+        put_u32(&mut m, remote);
+        put_u32(&mut m, more);
+        self.t.send(&m)
+    }
+
+    /// What the client has sent the subsystem, a whole message at a time,
+    /// each answered out on the channel before the next is looked at -- so
+    /// that one answer is all that waits to go out -- until what is left is
+    /// no whole message. What comes in while an answer waits for the
+    /// client's window is kept, and taken in its turn.
+    fn feed_subsystem(&mut self) -> Result<()> {
+        while self.subsystem_active() {
+            let Some(sub) = self.subsystem.as_mut() else { return Ok(()) };
+            let mut answer = core::mem::take(&mut self.answer);
+            answer.clear();
+            let taken = sub.input(&self.input, &mut answer);
+            let taken = match taken {
+                Ok(0) => {
+                    self.answer = answer;
+                    return Ok(());
+                }
+                Ok(n) => n,
+                Err(why) => return Err(Error::Protocol(why)),
+            };
+            /* A subsystem that took more than it was given is broken: its
+               count would have the window opened wider than the client
+               filled it */
+            assert!(taken <= self.input.len(), "a subsystem took {} bytes of {}", taken, self.input.len());
+            self.input.drain(..taken);
+            self.taken(taken as u32)?;
+            let sent = self.send_data(&answer);
+            self.answer = answer;
+            sent?;
+        }
+        Ok(())
     }
 
     /// Runs a command line, its output going out as it comes and the

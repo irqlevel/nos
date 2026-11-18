@@ -1,5 +1,6 @@
 //! The SSH wire encodings (RFC 4251 section 5): read out of a payload with
-//! a `Reader`, appended to one with the `put_` functions.
+//! a `Reader`, appended to one with the `put_` functions. Public for a
+//! subsystem's messages, which are made of the same (the sftp crate's).
 
 use alloc::vec::Vec;
 
@@ -37,6 +38,11 @@ impl<'a> Reader<'a> {
         Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    pub fn u64(&mut self) -> Option<u64> {
+        let b = self.bytes(8)?;
+        Some(u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    }
+
     pub fn string(&mut self) -> Option<&'a [u8]> {
         let n = self.u32()? as usize;
         self.bytes(n)
@@ -58,6 +64,10 @@ pub fn put_bool(out: &mut Vec<u8>, v: bool) {
 }
 
 pub fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+
+pub fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
