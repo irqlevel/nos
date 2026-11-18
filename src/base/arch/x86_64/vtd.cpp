@@ -2,6 +2,7 @@
 #include "idt.h"
 #include "idt_descriptor.h"
 
+#include <drivers/iommu.h>
 #include <drivers/pci.h>
 #include <drivers/mmio.h>
 #include <hal/barrier.h>
@@ -1329,6 +1330,46 @@ void Vtd::shell(const char* args, stdlib::Printer& printer)
     shell_domains_[slot].handle = handle;
     printer.printf("iommu: %02lx:%02lx.%lx in a domain of its own, %lu MiB of RAM mapped to itself\n", (ulong)bus,
         (ulong)dev, (ulong)fn, mapped >> 20);
+}
+
+namespace iommu
+{
+
+bool on()
+{
+    return Vtd::get_instance().is_on();
+}
+
+ulong domain_create(u16 sid)
+{
+    return Vtd::get_instance().domain_create(sid);
+}
+
+bool domain_map(ulong domain, u64 iova, u64 phys, ulong pages)
+{
+    return Vtd::get_instance().domain_map(domain, iova, phys, pages);
+}
+
+bool domain_attach(ulong domain, u16 sid)
+{
+    return Vtd::get_instance().domain_attach(domain, sid);
+}
+
+bool domain_detach(ulong domain, u16 sid)
+{
+    return Vtd::get_instance().domain_detach(domain, sid);
+}
+
+void domain_destroy(ulong domain)
+{
+    Vtd::get_instance().domain_destroy(domain);
+}
+
+bool release(u16 sid)
+{
+    return Vtd::get_instance().release(sid);
+}
+
 }
 
 extern "C" void vtd_fault_interrupt(Context* ctx)
