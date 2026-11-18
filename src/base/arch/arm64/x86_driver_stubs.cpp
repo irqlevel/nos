@@ -1,5 +1,6 @@
 #include <drivers/hpet.h>
 #include <drivers/acpi.h>
+#include <arch/x86_64/vtd.h>
 #include <hal/irq_stubs.h>
 
 /* Link stubs for the x86-only paths still referenced from common code on
@@ -42,6 +43,28 @@ Acpi::~Acpi()
 bool Acpi::has_firmware_watchdog()
 {
     return false;
+}
+
+/* No VT-d here: the shell's `iommu` says there is nothing to show (an SMMU
+   would be this architecture's own) */
+Vtd::Vtd()
+    : unit_count_(0)
+    , last_bus_(0)
+    , on_(false)
+    , fault_apic_id_(0)
+{
+    for (size_t i = 0; i < stdlib::array_size(units_); i++)
+        units_[i] = nullptr;
+}
+
+Vtd::~Vtd()
+{
+}
+
+void Vtd::shell(const char* args, stdlib::Printer& printer)
+{
+    (void)args;
+    printer.printf("no DMA remapping units\n");
 }
 
 Hpet::Hpet()

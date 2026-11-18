@@ -61,6 +61,11 @@ public:
 
     bool is_usb_off();
 
+    /* iommu=on -- x86-64: take over the DMA remapping units the DMAR names
+       (Vtd): translation on with every device passed through, the units'
+       faults said; off, the default, leaves them as the firmware did */
+    bool is_iommu_on();
+
     /* rc=off -- do not run /etc/rc at boot: the way past a command in it
        that keeps the machine from coming up (see Cmd::run_boot_script) */
     bool is_rc_off();
@@ -273,6 +278,7 @@ private:
     bool ucode_off_;
     WxProbeMode wx_probe_md_;
     bool usb_off_;
+    bool iommu_on_;
     bool rc_off_;
     ConsoleMode con_mode_;
     DhcpMode dhcp_md_;

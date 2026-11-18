@@ -8,6 +8,7 @@ extern io8042_interrupt
 extern serial_interrupt
 extern pit_interrupt
 extern hpet_interrupt
+extern vtd_fault_interrupt
 extern ip_interrupt
 extern lapic_timer_interrupt
 extern posted_interrupt
@@ -100,6 +101,7 @@ global io8042_interrupt_stub
 global serial_interrupt_stub
 global pit_interrupt_stub
 global hpet_interrupt_stub
+global vtd_fault_interrupt_stub
 global ip_interrupt_stub
 global lapic_timer_interrupt_stub
 global posted_interrupt_stub
@@ -595,6 +597,7 @@ InterruptStub io8042
 InterruptStub serial
 InterruptStub pit
 InterruptStub hpet
+InterruptStub vtd_fault
 InterruptStub ip
 InterruptStub lapic_timer
 InterruptStub posted
