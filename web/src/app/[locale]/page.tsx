@@ -4,6 +4,7 @@ import { notFound } from "next/navigation";
 import type { ReactNode } from "react";
 import { BootTerminal } from "@/components/BootTerminal";
 import { LinkCard, PostCard } from "@/components/cards";
+import { Command } from "@/components/Command";
 import { ArrowRightIcon, GitHubIcon } from "@/components/icons";
 import { JsonLd } from "@/components/JsonLd";
 import { getEntries } from "@/lib/content";
@@ -44,6 +45,15 @@ function Section({ id, title, lead, children, aside }: { id: string; title: stri
         </section>
     );
 }
+
+/*
+ * How nos goes onto a server: the installer this site serves, which runs the
+ * newest release's (public/install.sh), with the dialog or without it, and
+ * the newest release's installer ISO.
+ */
+const installCommand = `curl -fsSL ${absoluteUrl("/install.sh")} | sh`;
+const installQuietCommand = `${installCommand} -s -- disk /dev/sdX --wipe --network-here --ssh-key /root/.ssh/authorized_keys`;
+const installerIso = `${site.releases}/latest/download/nos-installer-x86_64.iso`;
 
 const statusStyle: Record<StageStatus, string> = {
     done: "border-ok/40 text-ok",
@@ -102,6 +112,12 @@ export default async function Home({ params }: Props) {
                                 {home.ctaAbout}
                                 <ArrowRightIcon width={16} height={16} />
                             </Link>
+                            <a
+                                href="#try"
+                                className="inline-flex items-center rounded-lg border border-line-strong bg-card px-4 py-2.5 text-fg transition-colors hover:border-fg"
+                            >
+                                {home.ctaInstall}
+                            </a>
                             <Link
                                 href={`/${locale}/demo`}
                                 className="inline-flex items-center gap-2 rounded-lg border border-line-strong bg-card px-4 py-2.5 text-fg transition-colors hover:border-fg"
@@ -126,6 +142,65 @@ export default async function Home({ params }: Props) {
                     <BootTerminal caption={home.terminalCaption} />
                 </div>
             </section>
+
+            <Section id="try" title={home.try.title} lead={home.try.lead}>
+                <div className="grid gap-4 lg:grid-cols-[1.4fr_1fr]">
+                    <div className="min-w-0 rounded-xl border border-line bg-card p-5 sm:p-6">
+                        <p className="font-mono text-xs font-semibold text-accent">{home.try.rescue.kicker}</p>
+                        <h3 className="mt-2 text-lg font-semibold tracking-tight text-fg">{home.try.rescue.title}</h3>
+                        <p className="mt-2 text-sm leading-relaxed text-fg-soft">{home.try.rescue.text}</p>
+                        <div className="mt-3">
+                            <Command command={installCommand} copy={home.try.copy} copied={home.try.copied} />
+                        </div>
+                        <p className="mt-4 text-sm leading-relaxed text-muted">{home.try.rescue.dialog}</p>
+                        <p className="mt-4 text-sm leading-relaxed text-fg-soft">{home.try.rescue.quiet}</p>
+                        <div className="mt-2">
+                            <Command command={installQuietCommand} copy={home.try.copy} copied={home.try.copied} />
+                        </div>
+                        <p className="mt-4 text-sm leading-relaxed text-fg-soft">{home.try.rescue.then}</p>
+                    </div>
+                    <div className="grid min-w-0 content-start gap-4">
+                        <div className="rounded-xl border border-line bg-card p-5 sm:p-6">
+                            <p className="font-mono text-xs font-semibold text-accent">{home.try.iso.kicker}</p>
+                            <h3 className="mt-2 text-lg font-semibold tracking-tight text-fg">{home.try.iso.title}</h3>
+                            <p className="mt-2 text-sm leading-relaxed text-fg-soft">{home.try.iso.text}</p>
+                            <a
+                                href={installerIso}
+                                className="mt-4 inline-flex max-w-full items-center gap-2 rounded-lg bg-fg px-4 py-2.5 text-sm font-medium text-bg transition-opacity hover:opacity-90"
+                            >
+                                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                                    <path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 20h14" />
+                                </svg>
+                                {home.try.iso.link}
+                            </a>
+                            <p className="mt-2 break-all font-mono text-[0.72rem] text-muted">nos-installer-x86_64.iso</p>
+                            <p className="mt-4 text-sm leading-relaxed text-muted">{home.try.iso.tryNos}</p>
+                        </div>
+                        <div className="rounded-xl border border-line bg-card p-5 sm:p-6">
+                            <p className="font-mono text-xs font-semibold text-accent">{home.try.local.kicker}</p>
+                            <h3 className="mt-2 text-lg font-semibold tracking-tight text-fg">{home.try.local.title}</h3>
+                            <p className="mt-2 text-sm leading-relaxed text-fg-soft">{home.try.local.text}</p>
+                            <div className="mt-4 flex flex-wrap gap-x-5 gap-y-2 text-sm font-medium">
+                                <Link href={`/${locale}/howto/run-in-qemu`} className="inline-flex items-center gap-1.5 text-accent hover:underline">
+                                    {home.ctaRun}
+                                    <ArrowRightIcon width={15} height={15} />
+                                </Link>
+                                <Link href={`/${locale}/demo`} className="inline-flex items-center gap-1.5 text-accent hover:underline">
+                                    {home.ctaDemo}
+                                    <ArrowRightIcon width={15} height={15} />
+                                </Link>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <p className="mt-6 max-w-3xl text-sm leading-relaxed text-muted">
+                    {home.try.more}{" "}
+                    <Link href={`/${locale}/howto/install-on-a-server`} className="inline-flex items-center gap-1 font-medium text-accent hover:underline">
+                        {home.try.moreLink}
+                        <ArrowRightIcon width={14} height={14} />
+                    </Link>
+                </p>
+            </Section>
 
             <Section id="why" title={home.why.title} lead={home.why.lead}>
                 <div className="grid gap-4 sm:grid-cols-3">
