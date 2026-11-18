@@ -1,4 +1,4 @@
-use crate::consts::{NS_PER_SEC, NS_PER_US};
+use crate::consts::{NS_PER_MS, NS_PER_SEC, NS_PER_US};
 use ffi::time;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -114,6 +114,43 @@ pub fn delay_us(us: u64) {
     while boot_time_ns().wrapping_sub(start) < want && left != 0 {
         core::hint::spin_loop();
         left -= 1;
+    }
+}
+
+/// The end of a wait a driver polls a device through: the boot clock's time,
+/// and a count of polls besides, so that a clock that does not move yet --
+/// a driver's bring-up runs from `rust_init`, interrupts off -- cannot make
+/// the wait endless. A poll that reads a device register takes far longer
+/// than the fraction of a microsecond the count allows it, so where the clock
+/// runs it is what ends the wait.
+pub struct Deadline {
+    end_ns: u64,
+    polls_left: u64,
+}
+
+impl Deadline {
+    /// Polls to a millisecond, at most.
+    const POLLS_PER_MS: u64 = 5_000;
+    const US_PER_MS: u64 = 1_000;
+
+    pub fn after_ms(ms: u64) -> Deadline {
+        Deadline {
+            end_ns: boot_time_ns().saturating_add(ms.saturating_mul(NS_PER_MS)),
+            polls_left: ms.saturating_mul(Self::POLLS_PER_MS).max(1),
+        }
+    }
+
+    pub fn after_us(us: u64) -> Deadline {
+        Deadline {
+            end_ns: boot_time_ns().saturating_add(us.saturating_mul(NS_PER_US)),
+            polls_left: (us.saturating_mul(Self::POLLS_PER_MS) / Self::US_PER_MS).max(1),
+        }
+    }
+
+    /// One more poll: whether the wait is over.
+    pub fn passed(&mut self) -> bool {
+        self.polls_left = self.polls_left.saturating_sub(1);
+        self.polls_left == 0 || boot_time_ns() >= self.end_ns
     }
 }
 

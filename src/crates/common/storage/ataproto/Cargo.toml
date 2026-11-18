@@ -1,0 +1,12 @@
+[package]
+name = "ataproto"
+version = "0.1.0"
+edition = "2021"
+
+# The ATA command set as both of the tree's ATA disk drivers speak it --
+# drivers/block/ata (a PCI IDE controller's taskfile) and drivers/block/ahci
+# (an AHCI port's FISes): IDENTIFY DEVICE read, the identity word, the
+# commands' numbers. No kernel and no `unsafe` in it, so a host test links it
+# as the drivers do.
+[lib]
+path = "src/lib.rs"

@@ -29,8 +29,6 @@
 extern crate alloc;
 
 #[cfg(target_arch = "x86_64")]
-mod identify;
-#[cfg(target_arch = "x86_64")]
 mod x86;
 
 /// The PCI IDE controllers, their channels and the disks on them, taken and
