@@ -393,15 +393,21 @@ blkload nvme0: randread, bs 4 KiB, qd 8, 2 s over 64 MiB
   latency us: min 56.0, avg 297.6, p50 270.3, p90 434.1, p99 770.0, p99.9 1146.8, max 9557.0
 ```
 
-    blkload <dev> [randread|randwrite|read|write] [bs=4k] [qd=1] [secs=5] [force]
+    blkload <dev> [randread|randwrite|read|write] [bs=4k] [qd=1] [secs=5] [aio] [force]
 
 - `randread`, the default, and `randwrite` pick blocks at random over the
   whole device; `read` and `write` go through it in order, the tasks taking
   consecutive blocks.
 - `qd` tasks, up to 64, each keep one I/O in flight: the queue depth asked
   of the driver, which passes on as many as it has room for -- 8 at a time
-  for virtio-blk, 63 for NVMe. A burst past that waits for a command to
-  complete rather than failing.
+  for virtio-blk, 63 for NVMe, 31 for a SATA disk with NCQ. A burst past
+  that waits for a command to complete rather than failing.
+- `aio`: one task keeps the `qd` requests in flight instead, through the
+  device's queue (`kcore::block::DiskQueue`) -- each started, the driver
+  kicked, the ends reaped as they come -- which is the path a VM's disk,
+  NBS's chunk server and `netblk` take. A device with no asynchronous path
+  does each as it is started, one at a time. The queue claims the device for
+  a read test too, so a mounted filesystem's device is refused.
 - `bs` is a whole number of sectors, up to 512 KiB -- and no more than the
   driver takes in one I/O, which today is a page for virtio-blk (one
   descriptor per request) and two for NVMe (two PRP entries, no PRP lists).
@@ -415,7 +421,8 @@ blkload nvme0: randread, bs 4 KiB, qd 8, 2 s over 64 MiB
   percentiles come off a histogram with sixteen buckets to each power of two,
   so they are within 1/16. It runs from submission to the task running
   again: the kernel's waits yield rather than sleep, so with more tasks than
-  CPUs it includes waiting for one, and the test keeps the CPUs busy.
+  CPUs it includes waiting for one, and the test keeps the CPUs busy. With
+  `aio`, from the start to the reap that finds it done.
 
 Reads are always allowed. A write test destroys what is on the device, so it
 has to be asked for by name, and it claims the device first

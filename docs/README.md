@@ -14,7 +14,7 @@ How it works, by subsystem:
 - [Boot](boot.md) — GRUB/Multiboot2 and the Linux `Image` protocol to `boot: complete`, on both architectures, and how the APs come up
 - [Paging and memory](paging.md) — the bootstrap linear map, the real page table, the free list, the allocators, MMIO and W^X, TLB shootdown
 - [Scheduler](scheduler.md) — per-CPU run queues, the context switch, preemption, blocking and load balancing
-- [Interrupts](interrupts.md) — the IDT and IOAPIC, MSI-X, GICv3 and the ITS, IPIs, NMI, IRQ balancing, deferred work
+- [Interrupts](interrupts.md) — the IDT and IOAPIC, MSI-X and MSI, GICv3 and the ITS, IPIs, NMI, IRQ balancing, deferred work
 - [Profiler](profiler.md) — sampling on a performance counter or the tick, and how to read a `profile` report
 - [Tracepoints](tracing.md) — events recorded as they happen into each CPU's ring, turned on and off with `trace`, and read back merged by time
 - [memsites](memsites.md) — who holds Rust's heap: the live blocks by the site that allocated them, to the file and the line
