@@ -786,7 +786,11 @@ impl Script {
                 /* The mirror: the configuration space through BAR0, the MSI's
                  * acknowledgement among it; now and then past it, or eight
                  * bytes at once */
-                let off = if r.u8() < 200 { u64::from(reg(r)) } else { r.below(0x1000) };
+                let off = match r.u8() % 8 {
+                    0..=5 => u64::from(reg(r)),
+                    6 => u64::from(crate::devices::host::NVIDIA_MSI_REARM),
+                    _ => r.below(0x1000),
+                };
                 let gpa = bar0 + u64::from(crate::devices::host::NVIDIA_MIRROR) + off;
                 let size = r.pick(&[4u8, 4, 4, 2, 1, 8]);
                 let value = if off == u64::from(m) && r.bool() { 0xFF } else { r.value64() };

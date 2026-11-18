@@ -1038,6 +1038,10 @@ pub struct LinuxGuest {
     notified: AtomicU64,
     /// MSIs a disk's task sent from outside every CPU (`serve_disk`).
     served_msi: AtomicU64,
+    /// MSIs of its host's functions, sent by the host's handlers of their
+    /// real ones (`deliver_msi`), and those no CPU took.
+    host_msi: AtomicU64,
+    host_msi_lost: AtomicU64,
     /// How far apart its NICs' receive interrupts are held at least
     /// (`set_rx_moderation`), and whether they offer their transmit
     /// offloads (`set_offloads`).
@@ -1307,6 +1311,8 @@ impl LinuxGuest {
             posted: AtomicU64::new(0),
             notified: AtomicU64::new(0),
             served_msi: AtomicU64::new(0),
+            host_msi: AtomicU64::new(0),
+            host_msi_lost: AtomicU64::new(0),
             rx_moderation_ns: RX_MODERATION_DEFAULT_NS,
             offloads: true,
             shape: Shape::cores(cpus),
@@ -1398,6 +1404,13 @@ impl LinuxGuest {
     /// MSIs its disks' tasks sent from outside every CPU (`serve_disk`).
     pub fn served_msis(&self) -> u64 {
         self.served_msi.load(Ordering::Relaxed)
+    }
+
+    /// MSIs of its host's functions sent on to it (`deliver_msi`), and of
+    /// those how many no CPU took -- a message the guest programmed to no
+    /// CPU of its, or of a kind not taken.
+    pub fn host_msis(&self) -> (u64, u64) {
+        (self.host_msi.load(Ordering::Relaxed), self.host_msi_lost.load(Ordering::Relaxed))
     }
 
     /// Whether its CPUs have local APICs: a guest of more than one CPU. One
@@ -1507,13 +1520,12 @@ impl LinuxGuest {
     /// included, nothing here sleeps or takes the platform's lock. Whether a
     /// CPU took it.
     pub fn deliver_msi(&self, address: u64, data: u32) -> bool {
-        match lapic::msi(address, data) {
-            Some(ipi) => {
-                self.served_msi.fetch_add(1, Ordering::Relaxed);
-                self.post_message(None, &ipi, false)
-            }
-            None => false,
+        self.host_msi.fetch_add(1, Ordering::Relaxed);
+        let taken = lapic::msi(address, data).is_some_and(|ipi| self.post_message(None, &ipi, false));
+        if !taken {
+            self.host_msi_lost.fetch_add(1, Ordering::Relaxed);
         }
+        taken
     }
 
     /// Whether it holds a host's function: a guest whose state cannot be

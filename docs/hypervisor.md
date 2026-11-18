@@ -2206,7 +2206,11 @@ MSI capability's id and next pointer is also passed to the real mirror --
 the driver acknowledges its MSI so, and without it the GPU sends one
 interrupt and no more (QEMU's `vfio_nvidia_quirk_mirror_write`) -- and only
 within them: a write that reached the control word past them would be the
-guest's to the host's own MSI.
+guest's to the host's own MSI. Since Pascal the re-arm is a dword at 0x704 of
+the mirror instead (nouveau's `gp100_pci_msi_rearm`), past the 256 bytes the
+guest is given: that dword alone is written through to the real mirror, as
+VFIO lets a write there reach the device; the rest of the extended space --
+the Resizable BAR, ACS, AER -- is nothing the guest reaches.
 
 **The guest's memory has a hole for the BARs** (`LinuxGuest::new_holed`):
 its RAM below 4 GiB ends at 3 GiB (`linux::HOLE_RAM_END`) rather than at
@@ -2232,10 +2236,14 @@ above it), and AMD-Vi.
 
 Gates: `hv-fuzz.py`'s `hostfn` target (the view above against a model of the
 real function: whatever the guest does, what reaches it holds to the host's
-rules, and what the guest sees to the PCI spec's), the `platform` target's
-guest holding a GPU (the run loop's bus, mirror, BAR moves and MSIs), and
-the `linux` and `pvh` targets' holed layouts; `iommu-test.py` for the
-domains. The GPU itself: by hand on Hertz, the plan's dev loop.
+rules, and what the guest sees to the PCI spec's -- a BAR decoded from its
+registers among it), the `platform` target's guest holding a GPU (the run
+loop's bus, mirror, BAR moves and MSIs), and the `linux` and `pvh` targets'
+holed layouts; `iommu-test.py` for the domains; and on a machine with a GPU,
+by hand, `gpu-passthrough-test.py`: on Hertz an RTX A2000 in nos's guest,
+nouveau up -- its GSP booted by DMA through the domain -- and a thousand
+fences, each waited for on the GPU's MSI, sent on by hv (docs/testing.md).
+`nvidia-smi` and CUDA, NVIDIA's own driver in the guest, are next.
 
 ## A network
 

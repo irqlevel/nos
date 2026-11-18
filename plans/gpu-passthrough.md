@@ -178,8 +178,17 @@ reaches no Rust. hv reaches it by the usual three steps (`rust_ffi.cpp`,
    mirror and BAR moves, a guest of a holed memory map, the module's
    `passthrough.rs`; `hv-fuzz.py`'s `hostfn` target, the `platform`
    target's guest holding a GPU, the `linux` and `pvh` targets' holed
-   layouts, each rule a mutant the gate catches). Then on Hertz:
-   `nvidia-smi` and a CUDA sample in the guest.
+   layouts, each rule a mutant the gate catches). **On Hertz**
+   (`tests/gpu-passthrough-test.py`): the A2000 in nos's guest under the
+   dev loop below -- BAR0, BAR1's 8 GiB and BAR3 where nos put them, BOOT0
+   read, nouveau up with its GSP (RM 570.144) booted by DMA through the
+   domain, VRAM sized, and a thousand fences each signalled on the GPU's
+   MSI, 55 to 90 us a round from the guest through nos and KVM and back.
+   It found the 8 GiB BAR1 given up for having no address bit in its low
+   register (`decode_bar` now), and nouveau's MSI re-arm since Pascal --
+   a dword at 0x704 of the mirror, past the 256 bytes given -- dropped (now
+   written through; a fence at a time does not need it). Next:
+   `nvidia-smi` and a CUDA sample, NVIDIA's own driver in the guest.
 6. nos on Hertz's metal -- the real VT-d -- once the stages above are green;
    a one-shot GRUB entry, so a boot that does not come back is Ubuntu again
    at the next reset.
