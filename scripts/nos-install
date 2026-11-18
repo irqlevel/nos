@@ -9,6 +9,8 @@
 #   nos-install update [<partition>] [options]   a new image over the one there
 #   nos-install rollback [<partition>]           back to the image before it
 #   nos-install boot [<partition>] [--reboot]    boot nos once, the next time
+#   nos-install boot --default                   a disk of nos's own the
+#                                                firmware's boot, for good
 #   nos-install status [<partition>]             what is installed and armed
 #   nos-install uninstall                        take nos out of GRUB's menu
 #
@@ -21,6 +23,8 @@
 #                         filesystem, any data: refused without it
 #   --dry-run             check everything, say what would be written, and
 #                         write nothing
+#   --keep-boot-order     leave the firmware's boot order as it is (UEFI): put
+#                         otherwise, the disk's entry first after the network's
 #
 # Options of install and update:
 #   --image FILE          the image (nos-x86_64.squashfs); by default the one
@@ -34,6 +38,9 @@
 #                         kernel. Off unless asked for
 #   --netconsole IP:PORT  the kernel log, over UDP, to IP:PORT
 #   --cmdline "ARGS"      more kernel parameters (docs/kernel-parameters.md)
+#   --network-here        nos's address, gateway and DNS server as this Linux
+#                         has them now (ip= gw= dns=): a provider's rescue
+#                         system's are the server's, on a network with no DHCP
 #   --panel               the management panel: a VM of nos's that manages it
 #                         in a browser, at https://<this machine>:39233, as
 #                         root -- with a password made now and printed once.
@@ -58,8 +65,12 @@
 # blank -- and GRUB installed onto it for BIOS and for UEFI both (the EFI
 # one at the path firmware boots with no boot entry), with a grub.cfg of its
 # own on the root that boots nos by default. Nothing of this machine's own
-# GRUB is touched. Update, rollback, boot and status find such a root by
-# itself (or take it named); uninstall has nothing to take out.
+# GRUB is touched. Under UEFI the firmware's entry for the disk goes first
+# after the network's (a provider's PXE stays first, for its rescue system),
+# so the server boots nos rather than the system it had. Update, rollback,
+# boot and status find such a root by itself (or take it named); boot is
+# the firmware's next boot (BootNext), --default its order; uninstall has
+# nothing to take out.
 #
 # Install pours the image onto a plain partition as an ext4 filesystem --
 # or the ext2 one an install before ext4 made, kept as it is -- that
@@ -70,7 +81,9 @@
 # after that is the default again, so a nos that never comes up is a reset
 # away from it.
 #
-# For a test: NOS_GRUB_D in place of /etc/grub.d, NOS_UPDATE_GRUB in place of
+# For a test: NOS_EFIBOOTMGR in place of efibootmgr, NOS_FIRMWARE (uefi or
+# bios) and NOS_IN_VM (0 or 1) for what this machine is,
+# NOS_GRUB_D in place of /etc/grub.d, NOS_UPDATE_GRUB in place of
 # update-grub (true: nothing), NOS_ALLOW_ANY_DISK=1 not to ask what the
 # partition's disk is, NOS_CPUINFO and NOS_UCODE_DIR in place of /proc/cpuinfo
 # and /lib/firmware/intel-ucode.
@@ -307,6 +320,28 @@ disk_controller_problem() {
     esac
 }
 
+# The PCI addresses of the network cards nos drives, in the bus's order --
+# the order nos names them in, so the first is its eth0, which ip= is for.
+# The parts its drivers claim: drivers/net/r8168, drivers/net/r8125,
+# drivers/net/igb (82576, I210/I211, I350), drivers/net/e1000e, virtio-net
+nos_nics() {
+    local d id
+    for d in /sys/bus/pci/devices/*; do
+        [ -r "$d/vendor" ] || continue
+        id=$(cat "$d/vendor"):$(cat "$d/device")
+        case "$id" in
+            0x10ec:0x8168|0x10ec:0x8125|\
+            0x8086:0x10c9|0x8086:0x10e8|0x8086:0x150a|\
+            0x8086:0x1533|0x8086:0x1536|0x8086:0x1537|0x8086:0x1538|\
+            0x8086:0x1539|0x8086:0x157b|0x8086:0x157c|\
+            0x8086:0x1521|\
+            0x8086:0x10d3|\
+            0x1af4:0x1000|0x1af4:0x1041)
+                basename "$d" ;;
+        esac
+    done | sort
+}
+
 # Warnings, not refusals: GRUB boots nos from anything the firmware reads,
 # but what nos does after that depends on what it has drivers for. A disk
 # that is to be nos's own ("disk" as the second argument) is refused,
@@ -322,23 +357,8 @@ check_hardware() {
         warn "$problem"
     fi
 
-    # The network is a server's only console. The parts nos's drivers claim:
-    # drivers/net/r8168, drivers/net/r8125, drivers/net/igb (82576, I210/I211,
-    # I350), drivers/net/e1000e, virtio-net
-    for d in /sys/bus/pci/devices/*; do
-        [ -r "$d/vendor" ] || continue
-        id=$(cat "$d/vendor"):$(cat "$d/device")
-        case "$id" in
-            0x10ec:0x8168|0x10ec:0x8125|\
-            0x8086:0x10c9|0x8086:0x10e8|0x8086:0x150a|\
-            0x8086:0x1533|0x8086:0x1536|0x8086:0x1537|0x8086:0x1538|\
-            0x8086:0x1539|0x8086:0x157b|0x8086:0x157c|\
-            0x8086:0x1521|\
-            0x8086:0x10d3|\
-            0x1af4:0x1000|0x1af4:0x1041)
-                found="$found $(basename "$d")" ;;
-        esac
-    done
+    # The network is a server's only console
+    found=$(nos_nics)
     [ -n "$found" ] ||
         warn "no network card here that nos has a driver for (RTL8168, RTL8125, Intel 82576/I210/I211/I350, Intel 82574L, virtio-net): booted, nos cannot be reached"
 
@@ -523,11 +543,58 @@ NETCONSOLE=
 EXTRA=
 SET_CMDLINE=0
 CMDLINE=
+NETWORK_HERE=0
+
+# The PCI address of network interface $1, or nothing for one on no PCI bus
+nic_pci() {
+    basename "$(readlink -f "/sys/class/net/$1/device" 2>/dev/null)" 2>/dev/null | grep -E '^[0-9a-f]{4}:' || true
+}
+
+# ip=, gw= and dns= for nos as this Linux has its network now: the address
+# of the interface its default route leaves by, that route's gateway, its
+# first DNS server -- a provider's rescue system's are the server's, which a
+# network with no DHCP server gives nobody else. nos puts the address on its
+# eth0, the first card it drives in the bus's order: one that is not the
+# card this Linux reaches the network by is a port with no link, said
+network_here() {
+    local route gw dev addr dns pci first
+    need ip
+    route=$(ip -4 route show default 2>/dev/null | head -n 1)
+    gw=$(printf '%s\n' "$route" | sed -n 's/.* via \([0-9.]*\).*/\1/p')
+    dev=$(printf '%s\n' "$route" | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+    [ -n "$gw" ] && [ -n "$dev" ] || die "--network-here: this Linux has no default route through a gateway"
+    addr=$(ip -4 -o addr show dev "$dev" scope global 2>/dev/null | awk '{ print $4; exit }')
+    [[ "$addr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || die "--network-here: $dev has no IPv4 address"
+    # resolv.conf's first server -- unless it is systemd-resolved's stub, which
+    # is this Linux's own: then the servers the stub asks
+    dns=$(awk '$1 == "nameserver" && $2 ~ /^[0-9.]+$/ { print $2; exit }' /etc/resolv.conf 2>/dev/null || true)
+    case "$dns" in
+        ''|127.*)
+            dns=$(awk '$1 == "nameserver" && $2 ~ /^[0-9.]+$/ && $2 !~ /^127\./ { print $2; exit }' \
+                /run/systemd/resolve/resolv.conf 2>/dev/null || true)
+            [ -n "$dns" ] || dns=$(resolvectl dns "$dev" 2>/dev/null |
+                grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1 || true) ;;
+    esac
+    [ -n "$dns" ] || die "--network-here: no DNS server this Linux uses was found (resolv.conf, systemd-resolved)"
+    pci=$(nic_pci "$dev")
+    first=$(nos_nics | head -n 1)
+    if [ -n "$pci" ] && [ -n "$first" ] && [ "$pci" != "$first" ]; then
+        warn "--network-here: this Linux reaches the network by $dev ($pci), but nos puts the address on its eth0, the first card it drives ($first): a port with no cable leaves nos unreachable"
+    fi
+    say "the network as this Linux has it, on $dev: $addr, gateway $gw, DNS $dns" >&2
+    echo "ip=$addr gw=$gw dns=$dns"
+}
 
 compose_cmdline() {
-    local parts=() words=() t
+    local parts=() words=() t here
     [ -z "$UDPSHELL" ] || parts+=("udpshell=$UDPSHELL")
     [ -z "$NETCONSOLE" ] || parts+=("netconsole=$NETCONSOLE")
+    if [ "$NETWORK_HERE" = 1 ]; then
+        # An assignment of its own, so that its die ends the run
+        here=$(network_here)
+        read -r -a words <<<"$here"
+        parts+=("${words[@]}")
+    fi
     # Split on blanks only: a * in it is not a file name
     read -r -a words <<<"$EXTRA" || true
     for t in ${words[@]+"${words[@]}"}; do
@@ -880,7 +947,7 @@ need_grub_install() {
 # firmware this machine runs has to be -- the disk is to boot here -- and
 # the other is said when it is missing, before anything is written
 grub_targets() {
-    [ ! -d /sys/firmware/efi ] || FIRMWARE=uefi
+    FIRMWARE=$(firmware)
     [ ! -f "$GRUB_LIB/i386-pc/modinfo.sh" ] || GRUB_BIOS=1
     [ ! -f "$GRUB_LIB/x86_64-efi/modinfo.sh" ] || GRUB_EFI=1
     if [ "$FIRMWARE" = bios ] && [ "$GRUB_BIOS" = 0 ]; then
@@ -1206,6 +1273,161 @@ fsck_esp() {
     fi
 }
 
+# ---- the firmware's boot order -----------------------------------------
+
+EFIBOOTMGR=${NOS_EFIBOOTMGR:-efibootmgr}
+KEEP_BOOT_ORDER=0
+BOOT_DEFAULT=0
+
+# How this machine was started: uefi or bios (NOS_FIRMWARE stands in for it
+# in a test)
+firmware() {
+    if [ -n "${NOS_FIRMWARE:-}" ]; then
+        echo "$NOS_FIRMWARE"
+    elif [ -d /sys/firmware/efi ]; then
+        echo uefi
+    else
+        echo bios
+    fi
+}
+
+# Whether this Linux runs in a virtual machine: the CPU's hypervisor flag,
+# or a board a hypervisor names (NOS_IN_VM, 0 or 1, in a test). Its firmware
+# is the virtual machine's then -- and a provider that installs from an ISO
+# by running it in QEMU over the server's disks, as Selectel's qemu-iso
+# does, leaves the server's own boot order out of an installer's reach
+in_vm() {
+    if [ -n "${NOS_IN_VM:-}" ]; then
+        [ "$NOS_IN_VM" = 1 ]
+        return
+    fi
+    grep -qw hypervisor /proc/cpuinfo 2>/dev/null && return 0
+    case "$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null)" in
+        *QEMU*|*KVM*|*VMware*|*VirtualBox*|*Bochs*|*Xen*|*"Virtual Machine"*) return 0 ;;
+    esac
+    return 1
+}
+
+vm_note() {
+    in_vm || return 0
+    warn "this Linux runs in a virtual machine, and what it set is that machine's firmware's. If nos is for the server under it -- a provider that runs the ISO in QEMU over the server's disks, as Selectel's qemu-iso does -- the server's own boot order is set on the server: from its rescue system, nos-install boot --default (docs/install.md, \"From a provider's rescue system\")"
+}
+
+# The EFI System partition of disk $1
+disk_esp() {
+    local p want
+    want=$(printf '%s' "$GPT_ESP" | tr 'A-F' 'a-f')
+    for p in $(lsblk -lnpo NAME "$1" 2>/dev/null | tail -n +2); do
+        if [ "$(blkid -p -o value -s PART_ENTRY_TYPE "$p" 2>/dev/null | tr 'A-F' 'a-f')" = "$want" ]; then
+            echo "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# The number of the firmware's entry that boots \EFI\BOOT\BOOTX64.EFI off the
+# partition with GPT GUID $1 -- one the firmware made for that path by itself
+# (AMI's "UEFI OS"), or ours -- as efibootmgr -v lists them; nothing for none
+efi_find() {
+    local guid
+    guid=$(printf '%s' "$1" | tr 'A-F' 'a-f')
+    "$EFIBOOTMGR" -v 2>/dev/null | tr 'A-Z' 'a-z' | awk -v g="gpt,$guid," '
+        /^boot[0-9a-f][0-9a-f][0-9a-f][0-9a-f]/ && index($0, g) && index($0, "\\efi\\boot\\bootx64.efi") {
+            print toupper(substr($1, 5, 4))
+            exit
+        }' || true
+}
+
+# The entry for the EFI System partition $2 of disk $1, made where the
+# firmware has none, and turned on where it is off: its number on stdout
+efi_entry() {
+    local disk=$1 esp=$2 guid num part
+    guid=$(blkid -p -o value -s PART_ENTRY_UUID "$esp" 2>/dev/null || true)
+    if [ -z "$guid" ]; then
+        warn "$esp has no GPT partition GUID"
+        return 1
+    fi
+    num=$(efi_find "$guid")
+    if [ -z "$num" ]; then
+        part=$(blkid -p -o value -s PART_ENTRY_NUMBER "$esp" 2>/dev/null || true)
+        if ! "$EFIBOOTMGR" -q -C -d "$disk" -p "$part" -L nos -l '\EFI\BOOT\BOOTX64.EFI' >/dev/null 2>&1; then
+            warn "efibootmgr could not make a boot entry for $esp"
+            return 1
+        fi
+        num=$(efi_find "$guid")
+        if [ -z "$num" ]; then
+            warn "efibootmgr made a boot entry for $esp that it then does not list"
+            return 1
+        fi
+        say "the firmware's boot entry Boot$num, nos: \\EFI\\BOOT\\BOOTX64.EFI on $esp" >&2
+    fi
+    if ! "$EFIBOOTMGR" 2>/dev/null | grep -q "^Boot$num\*"; then
+        "$EFIBOOTMGR" -q -b "$num" -a >/dev/null 2>&1 || warn "efibootmgr could not turn Boot$num on"
+    fi
+    echo "$num"
+}
+
+# BootOrder with Boot$1 put right after the network's entries that lead it
+# -- a provider's PXE first still, for its rescue system -- and nothing else
+# moved: the system that booted before nos is the one after it
+efi_order_first() {
+    local num=$1 order net new= e placed=0
+    order=$("$EFIBOOTMGR" 2>/dev/null | sed -n 's/^BootOrder: *//p' | head -n 1 | tr 'a-f' 'A-F')
+    # A network entry's device path names a MAC, an IP or a URI: PXE, HTTP boot
+    net=" $("$EFIBOOTMGR" -v 2>/dev/null |
+        awk '/^Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/ && /MAC\(|IPv4\(|IPv6\(|Uri\(/ { print toupper(substr($1, 5, 4)) }' |
+        tr '\n' ' ') "
+    for e in $(printf '%s' "$order" | tr ',' ' '); do
+        [ "$e" != "$num" ] || continue
+        if [ "$placed" = 0 ]; then
+            case "$net" in
+                *" $e "*) ;;
+                *) new="$new,$num"; placed=1 ;;
+            esac
+        fi
+        new="$new,$e"
+    done
+    [ "$placed" = 1 ] || new="$new,$num"
+    new=${new#,}
+    if [ "$new" = "$order" ]; then
+        say "the firmware's boot order has nos's entry first after the network's already: $order"
+        return 0
+    fi
+    if ! "$EFIBOOTMGR" -q -o "$new" >/dev/null 2>&1; then
+        warn "efibootmgr could not set the boot order $new"
+        return 1
+    fi
+    say "the firmware's boot order: $new (was ${order:-none}) -- the network's entries first, then nos's, Boot$num"
+}
+
+# The firmware told to boot the disk of nos's own $1, whose EFI System
+# partition is $2: first after the network's entries ("default"), or the
+# next boot alone ("once"). A BIOS has nothing a running system can tell it
+firmware_boot() {
+    local disk=$1 esp=$2 how=$3 num
+    if [ "$(firmware)" != uefi ]; then
+        say "this machine boots by BIOS: it boots $disk when its own boot order puts the disk first -- its setup, or the provider's panel"
+        vm_note
+        return 0
+    fi
+    if ! command -v "$EFIBOOTMGR" >/dev/null 2>&1; then
+        warn "no efibootmgr here: the firmware's boot order is as it was -- nos-install boot --default sets it, from a Linux that has efibootmgr"
+        return 1
+    fi
+    num=$(efi_entry "$disk" "$esp") || return 1
+    case "$how" in
+        default) efi_order_first "$num" || return 1 ;;
+        once)
+            if ! "$EFIBOOTMGR" -q -n "$num" >/dev/null 2>&1; then
+                warn "efibootmgr could not set BootNext to Boot$num"
+                return 1
+            fi
+            say "the next boot is nos's, Boot$num, once (BootNext); the one after it goes by the firmware's order again" ;;
+    esac
+    vm_note
+}
+
 # ---- the commands ------------------------------------------------------
 
 FORMAT=0
@@ -1254,6 +1476,9 @@ parse_options() {
             --root-size=*) ROOT_SIZE=${1#*=} ;;
             --wipe) WIPE=1 ;;
             --dry-run) DRY_RUN=1 ;;
+            --network-here) NETWORK_HERE=1; SET_CMDLINE=1 ;;
+            --keep-boot-order) KEEP_BOOT_ORDER=1 ;;
+            --default) BOOT_DEFAULT=1 ;;
             -h|--help) usage 0 ;;
             -*) die "unknown option $1 (--help)" ;;
             *)
@@ -1386,10 +1611,21 @@ cmd_boot() {
     resolve_partition
     check_partition "$PART"
     if is_standalone "$PART"; then
-        say "$PART is the root of a disk of nos's own, which boots nos every time: nothing to arm"
+        # Its disk's GRUB boots nos every time: what is left is the
+        # firmware's choice of the disk
+        local disk esp
+        disk=/dev/$(lsblk -no PKNAME "$PART" 2>/dev/null | head -n 1)
+        esp=$(disk_esp "$disk") || die "no EFI System partition on $disk"
+        if [ "$BOOT_DEFAULT" = 1 ]; then
+            firmware_boot "$disk" "$esp" default || die "the firmware's boot order is not set"
+        else
+            firmware_boot "$disk" "$esp" once || die "the next boot is not set"
+        fi
         [ "$REBOOT" = 0 ] || reboot_now
         return 0
     fi
+    [ "$BOOT_DEFAULT" = 0 ] ||
+        die "--default is a disk of nos's own's: beside this machine's system, nos is its GRUB's default by GRUB_DEFAULT=nos in /etc/default/grub (docs/install.md)"
     [ -f "$SNIPPET" ] || warn "no $SNIPPET: this machine's GRUB does not look for nos"
     mount_partition "$PART"
     [ -f "$MNT/grubenv" ] || die "no grubenv on $PART: install the image on it first"
@@ -1513,6 +1749,9 @@ cmd_disk() {
         say "$DISK${ids:+ ($ids)}, $(lsblk -dno SIZE "$DISK" | tr -d ' '): would be given a GPT of nos's own --"
         printf '%s' "$DISK_PLAN" | sed 's/^/nos-install: /'
         say "$(describe "$IMG/VERSION") on its root, and GRUB for$([ "$GRUB_BIOS" = 0 ] || echo " BIOS")$([ "$GRUB_BIOS" = 0 ] || [ "$GRUB_EFI" = 0 ] || echo " and")$([ "$GRUB_EFI" = 0 ] || echo " UEFI")"
+        if [ "$FIRMWARE" = uefi ] && [ "$KEEP_BOOT_ORDER" = 0 ]; then
+            say "and the firmware's boot entry for it put first after the network's"
+        fi
         return 0
     fi
     say "$DISK${ids:+ ($ids)}, $(lsblk -dno SIZE "$DISK" | tr -d ' '): a GPT of nos's own"
@@ -1562,7 +1801,11 @@ cmd_disk() {
     if [ "${#KEYS[@]}" = 0 ]; then
         warn "no --ssh-key: sshd lets nobody in until /etc/ssh/authorized_keys on $PART has a key"
     fi
-    say "the firmware boots it once its boot order puts $DISK first"
+    if [ "$KEEP_BOOT_ORDER" = 1 ]; then
+        say "the firmware's boot order is left as it is (--keep-boot-order): it boots $DISK when that order puts the disk first"
+    elif ! firmware_boot "$DISK" "$esp" default; then
+        warn "the firmware's boot order is not set: nos-install boot --default sets it, or the firmware's setup"
+    fi
     [ "$REBOOT" = 0 ] || reboot_now
 }
 
@@ -1576,18 +1819,18 @@ esac
 parse_options "$@"
 case "$COMMAND" in
     install|update)
-        only_options --image --format --ssh-key --udpshell --netconsole --cmdline --panel --no-panel \
-            --boot-once --reboot
+        only_options --image --format --ssh-key --udpshell --netconsole --cmdline --network-here --panel \
+            --no-panel --boot-once --reboot
         cmd_install "$COMMAND" ;;
     disk)
-        only_options --image --ssh-key --udpshell --netconsole --cmdline --panel --no-panel \
-            --root-size --wipe --dry-run --reboot
+        only_options --image --ssh-key --udpshell --netconsole --cmdline --network-here --panel \
+            --no-panel --root-size --wipe --dry-run --keep-boot-order --reboot
         cmd_disk ;;
     disks)
         only_options
         [ -z "$PART" ] || die "disks takes no device: it lists them"
         cmd_disks ;;
-    boot) only_options --reboot --boot-once; cmd_boot ;;
+    boot) only_options --reboot --boot-once --default; cmd_boot ;;
     rollback|status|uninstall) only_options; "cmd_$COMMAND" ;;
     *) die "no command $COMMAND (--help)" ;;
 esac
