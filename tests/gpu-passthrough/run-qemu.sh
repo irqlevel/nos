@@ -25,7 +25,7 @@ exec qemu-system-x86_64 \
     -display none \
     -cdrom "$ISO" \
     -serial "file:$LOG" \
-    -netdev user,id=n0 \
+    -netdev user,id=n0,hostfwd=udp:127.0.0.1:9100-:9100 \
     -device virtio-net-pci,netdev=n0 \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     "$@"

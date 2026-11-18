@@ -187,8 +187,18 @@ reaches no Rust. hv reaches it by the usual three steps (`rust_ffi.cpp`,
    It found the 8 GiB BAR1 given up for having no address bit in its low
    register (`decode_bar` now), and nouveau's MSI re-arm since Pascal --
    a dword at 0x704 of the mirror, past the 256 bytes given -- dropped (now
-   written through; a fence at a time does not need it). Next:
-   `nvidia-smi` and a CUDA sample, NVIDIA's own driver in the guest.
+   written through; a fence at a time does not need it). **NVIDIA's own
+   driver** (580.178.04, the open modules Ubuntu builds for the guest's
+   kernel, on a disk of the guest's): `nvidia-smi` names the A2000 -- RM up
+   on its GSP -- and CUDA 12.9's deviceQuery, vectorAdd and matrixMul pass,
+   matrixMul at 611 GFlop/s (`tests/gpu-passthrough-test.py`, its default).
+   It took three more fixes: the function's INTx pin given (NVIDIA's probe
+   refuses a function with neither an IRQ nor MSI-X), wired to a line
+   nothing raises; `PciBus::host_target` held to the configuration data's
+   ports -- every port past 0xCFF, a virtio disk's notify among them, had
+   been taken for the GPU's space once the address latched named it, and
+   the guest's disk stopped as the driver probed; and the 64-bit BAR window
+   in the DSDT cut to the BARs, leaving Linux's HMM the room UVM needs.
 6. nos on Hertz's metal -- the real VT-d -- once the stages above are green;
    a one-shot GRUB entry, so a boot that does not come back is Ubuntu again
    at the next reset.
