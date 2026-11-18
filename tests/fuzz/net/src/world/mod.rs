@@ -18,6 +18,7 @@ pub mod httpc;
 pub mod httpd;
 pub mod lan;
 pub mod link;
+pub mod sftpc;
 pub mod sshc;
 pub mod tcpm;
 pub mod tlsc;

@@ -5,8 +5,10 @@
 //!
 //! The clients (`sshc`) connect as the input says, a few at a time: log in
 //! with the key the server knows, or a stranger's, or a signature over the
-//! wrong session; run a command whose output is known, or a shell, with a
-//! window of their choosing, rekeying on the way; answer the server's
+//! wrong session; run a command whose output is known, or a shell, or copy
+//! a file in and back out over SFTP (`sftpc`: the module's `KernelFiles`
+//! over the ramfs), with a window of their choosing, rekeying on the way,
+//! keeping to the server's window; answer the server's
 //! keepalives or not; or break the protocol at one point -- a version line
 //! of HTTP, no cipher in common, a point of small order, a length past any,
 //! an IGNORE where the strict exchange allows none, a packet tampered with,
@@ -16,7 +18,9 @@
 //! Besides what the client checks of every packet: a login is had exactly
 //! when the known key signs the right session -- within six tries, as the
 //! server allows -- and what the command prints comes back whole, with its
-//! exit status; a client that breaks the protocol is told so and let go;
+//! exit status, and the file copied in comes back out the same, every SFTP
+//! answer on the way as it should be; a client that breaks the protocol is
+//! told so and let go;
 //! one that never logs in is let go when the login grace runs out; and once
 //! every client has gone and the server stops, the machine holds nothing.
 
@@ -29,6 +33,7 @@ use std::rc::Rc;
 
 use crate::machine::{cmd, sched};
 use crate::world::lan::Lan;
+use crate::world::sftpc::SftpPlan;
 use crate::world::sshc::{Break, Client, Ending, Phase, Plan, Run, Try, Who};
 use crate::world::tcpm::{Data, Tcp, S};
 use crate::world::{App, Link, Net, Peers, World, ETH0_IP, GW_IP, MASK};
@@ -193,7 +198,12 @@ fn plan(r: &mut Input) -> Plan {
     if r.u8() < 200 && !tries.contains(&Try::Sign(Who::Known)) {
         tries.push(Try::Sign(Who::Known));
     }
-    let run = match r.u8() % 6 {
+    let run = match r.u8() % 7 {
+        6 => Run::Sftp(SftpPlan {
+            dir: Vec::new(),
+            data: crate::input::noise(r.u32(), r.pick(&[0usize, 1, 1000, 32768, 70000, 200_000])),
+            piece: r.pick(&[1000usize, 4096, 32768]),
+        }),
         0 => {
             let lines: Vec<(String, Option<Vec<u8>>)> = (0..1 + r.below(4)).map(|_| command(r))
                 .filter(|c| !c.0.starts_with("sshd stop")).collect();
@@ -216,6 +226,7 @@ fn plan(r: &mut Input) -> Plan {
         Run::Exec(c, _) => spews(c),
         Run::Shell(lines) => lines.iter().any(|(c, _)| spews(c)),
         Run::Pty(lines) => lines.iter().any(|c| spews(c)),
+        Run::Sftp(p) => p.data.len() > 1000,
     };
     /* Past the window is past it only where nothing takes what came in:
      * a shell takes it as typing, and gives the window back. */
@@ -323,6 +334,16 @@ fn judge(c: &Conn, lossless: bool) {
                                cl.output.len(), String::from_utf8_lossy(&cl.output[..cl.output.len().min(40)]),
                                want.len(), String::from_utf8_lossy(&want[..want.len().min(40)]));
                 }
+                Run::Sftp(plan) => {
+                    /* Closed the usual way -- the client's EOF once it was done,
+                       the server's exit status and close -- so every step was */
+                    let finished = cl.sftp.as_ref().is_some_and(|s| s.finished);
+                    invariant!(finished && cl.exit_status == Some(0) && cl.granted == Some(true),
+                               "an SFTP session into {} closed {} its script, status {:?}",
+                               String::from_utf8_lossy(&plan.dir), if finished { "after" } else { "before the end of" },
+                               cl.exit_status);
+                    crate::common::runner::reached("ssh: a file copied in and back out over SFTP");
+                }
                 _ => {}
             }
         }
@@ -365,8 +386,12 @@ pub fn ssh(r: &mut Input) {
     while let Some(op) = r.op(8) {
         match op {
             0..=2 if conns.borrow().len() < CLIENTS => {
-                /* A client connects, with its plan. */
-                let plan = plan(r);
+                /* A client connects, with its plan -- an SFTP one into a
+                   directory of its own. */
+                let mut plan = plan(r);
+                if let Run::Sftp(p) = &mut plan.run {
+                    p.dir = format!("/up{}", next_id).into_bytes();
+                }
                 let now = sched::now();
                 let live: Vec<bool> = conns.borrow().iter()
                     .filter(|c: &&Conn| c.over_at.is_none_or(|t| now < t + REAP))

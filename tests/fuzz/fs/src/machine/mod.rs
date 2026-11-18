@@ -121,6 +121,17 @@ unsafe fn put_c_string(buf: *mut u8, len: usize, s: &[u8]) -> usize {
     n
 }
 
+/// The module table's answer to which module an address of code is in:
+/// none -- the fuzzer's code is the image's, all of it, so a file the file
+/// ABI opens here is the image's, as the kernel's own opens are.
+///
+/// # Safety
+/// `buf` takes `size` bytes; nothing is written to it.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_module_name_at(_addr: usize, _buf: *mut u8, _size: usize) -> usize {
+    0
+}
+
 #[no_mangle]
 pub extern "C" fn kernel_disklog_wanted() -> i32 {
     params().disklog

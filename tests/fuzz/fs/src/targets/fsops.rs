@@ -17,7 +17,7 @@ use std::sync::{Arc, Weak};
 
 use events::SharedEvent;
 use fs::image::{Image, Started};
-use fs::vfs::{FileStat, Handle, Vfs, OPEN_APPEND, OPEN_CREATE, OPEN_READ, OPEN_TRUNCATE, OPEN_WRITE};
+use fs::vfs::{FileStat, Handle, Vfs, OPEN_APPEND, OPEN_CREATE, OPEN_EXCLUSIVE, OPEN_READ, OPEN_TRUNCATE, OPEN_WRITE};
 use fs::vnode::Kind;
 
 use crate::model::{join, show, Data, Node};
@@ -314,6 +314,9 @@ impl Model {
         if flags & OPEN_APPEND != 0 {
             flags |= OPEN_WRITE;
         }
+        if flags & OPEN_EXCLUSIVE != 0 {
+            flags |= OPEN_CREATE;
+        }
         if flags & (OPEN_READ | OPEN_WRITE) == 0 {
             return None;
         }
@@ -323,6 +326,8 @@ impl Model {
             return None;
         }
         let path = match res {
+            /* Something there already, which an exclusive open did not make */
+            Res::Node(_) if flags & OPEN_EXCLUSIVE != 0 => return None,
             Res::Node(n) => n,
             Res::Absent(dir, name) => {
                 if flags & OPEN_CREATE == 0 || !m.make(&dir, &name, Node::File(Data::new())) {
@@ -437,6 +442,17 @@ impl Model {
                 }
                 gone
             }
+            _ => false,
+        }
+    }
+
+    /// What `Vfs::remove_one` should do, done to the model: the file -- or,
+    /// with `dir`, the empty directory -- at `p` removed, and nothing else.
+    pub fn remove_one(&mut self, p: &[u8], dir: bool) -> bool {
+        let Res::Node(n) = self.resolve(p) else { return false };
+        match self.node(&n) {
+            Some(Node::File(_)) if !dir => self.remove(p),
+            Some(Node::Dir(c)) if dir && c.is_empty() => self.remove(p),
             _ => false,
         }
     }

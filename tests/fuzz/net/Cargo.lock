@@ -525,6 +525,7 @@ dependencies = [
  "poly1305",
  "rustls",
  "rustls-rustcrypto",
+ "sftp",
  "sha2",
  "ssh",
  "tls",
@@ -929,6 +930,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.5",
+]
+
+[[package]]
+name = "sftp"
+version = "0.1.0"
+dependencies = [
+ "ssh",
 ]
 
 [[package]]

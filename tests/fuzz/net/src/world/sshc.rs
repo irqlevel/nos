@@ -3,8 +3,10 @@
 //! exchange, ssh-ed25519, chacha20-poly1305@openssh.com -- over the world's
 //! TCP, doing what its plan says: logging in with the key the server knows,
 //! or another, or a signature over the wrong thing; running a command or a
-//! shell; keeping the server to a window of its choosing; rekeying; and,
-//! when the plan says, breaking the protocol at one point of it.
+//! shell, or copying a file in and back out over SFTP (`sftpc`); keeping the
+//! server to a window of its choosing, and keeping to the server's;
+//! rekeying; and, when the plan says, breaking the protocol at one point of
+//! it.
 //!
 //! Everything the server sends is checked as it is read: every packet whole,
 //! padded as RFC 4253 6 says, its tag right; its key exchange signed by its
@@ -21,6 +23,7 @@ use poly1305::Poly1305;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{x25519, X25519_BASEPOINT_BYTES};
 
+use super::sftpc::{Script, SftpPlan};
 use super::tcpm::Tcp;
 use super::Net;
 use crate::machine::sched;
@@ -250,6 +253,8 @@ pub enum Run {
     Shell(Vec<(String, Option<Vec<u8>>)>),
     /// A shell with a terminal: typed as a person types.
     Pty(Vec<String>),
+    /// The `sftp` subsystem, and a file copied in and back out over it.
+    Sftp(SftpPlan),
 }
 
 pub struct Plan {
@@ -348,6 +353,12 @@ pub struct Client {
     tampered: bool,
     /// The client closed the channel first, cutting the session short.
     pub cut: bool,
+    /// Channel data waiting for the server's window, and the SFTP script
+    /// it comes from; whether the server granted the subsystem.
+    tx: Vec<u8>,
+    pub sftp: Option<Script>,
+    pub granted: Option<bool>,
+    eof_out: bool,
 }
 
 impl Client {
@@ -359,7 +370,8 @@ impl Client {
                  logged_in: false, granted_by: None, server_channel: None, server_window: 0, server_max: 0,
                  our_window: 0, unadjusted: 0, output: Vec::new(), exit_status: None, eof_in: false,
                  close_in: false, close_out: false, lines_sent: 0, data_packets: 0, ending: None, heard: Vec::new(),
-                 unimplemented: 0, keepalives: 0, tampered: false, cut: false }
+                 unimplemented: 0, keepalives: 0, tampered: false, cut: false, tx: Vec::new(), sftp: None,
+                 granted: None, eof_out: false }
     }
 
     fn random(&mut self, out: &mut [u8]) {
@@ -634,9 +646,19 @@ impl Client {
             }
             CHANNEL_SUCCESS | CHANNEL_FAILURE => {
                 invariant!(r.u32() == Some(OUR_CHANNEL), "a channel answer for another channel");
+                /* An SFTP plan asks for nothing but the subsystem */
+                if matches!(self.plan.run, Run::Sftp(_)) && self.granted.is_none() {
+                    self.granted = Some(p[0] == CHANNEL_SUCCESS);
+                    invariant!(p[0] == CHANNEL_SUCCESS, "the sftp subsystem refused");
+                }
             }
             CHANNEL_WINDOW_ADJUST => {
                 invariant!(r.u32() == Some(OUR_CHANNEL), "a window adjust for another channel");
+                let more = r.u32().unwrap_or(0);
+                self.server_window += u64::from(more);
+                invariant!(self.server_window <= u64::from(u32::MAX), "the server's window past 2^32-1: {}",
+                           self.server_window);
+                self.flush(tcp, net);
             }
             CHANNEL_DATA => self.on_data(tcp, net, &mut r),
             CHANNEL_EXTENDED_DATA => invariant!(false, "stderr from the server"),
@@ -889,6 +911,16 @@ impl Client {
                 self.request(tcp, net, b"exec", &e);
             }
             Run::Shell(_) => self.request(tcp, net, b"shell", &[]),
+            Run::Sftp(plan) => {
+                /* The INIT goes after the request at once, as OpenSSH's does:
+                   the server keeps it until the subsystem is its */
+                let mut name = Vec::new();
+                put_string(&mut name, b"sftp");
+                self.request(tcp, net, b"subsystem", &name);
+                let (script, first) = Script::start(plan);
+                self.sftp = Some(script);
+                self.tx.extend_from_slice(&first);
+            }
             Run::Pty(_) => {
                 let mut t = Vec::new();
                 put_string(&mut t, b"xterm");
@@ -915,17 +947,21 @@ impl Client {
     /// the plan goes.
     fn proceed(&mut self, tcp: &mut Tcp, net: &mut Net) {
         let lines: Vec<String> = match &self.plan.run {
-            Run::Exec(..) => Vec::new(),
+            Run::Exec(..) | Run::Sftp(_) => Vec::new(),
             Run::Shell(l) => l.iter().map(|x| x.0.clone()).collect(),
             Run::Pty(l) => l.clone(),
         };
+        if matches!(self.plan.run, Run::Sftp(_)) {
+            self.flush(tcp, net);
+            return;
+        }
         while self.lines_sent < lines.len() {
             let mut text = lines[self.lines_sent].clone().into_bytes();
             text.push(if matches!(self.plan.run, Run::Pty(_)) { b'\r' } else { b'\n' });
             self.lines_sent += 1;
             self.data(tcp, net, &text);
         }
-        if !matches!(self.plan.run, Run::Exec(..)) && self.lines_sent == lines.len() {
+        if matches!(self.plan.run, Run::Shell(_) | Run::Pty(_)) && self.lines_sent == lines.len() {
             self.lines_sent += 1;
             let bye: &[u8] = if matches!(self.plan.run, Run::Pty(_)) { b"exit\r" } else { b"exit\n" };
             self.data(tcp, net, bye);
@@ -946,12 +982,39 @@ impl Client {
         invariant!(!self.eof_in && !self.close_in, "data after the server's EOF or CLOSE");
         self.our_window -= data.len() as u32;
         self.output.extend_from_slice(data);
+        if let Some(script) = self.sftp.as_mut() {
+            let more = script.on_bytes(data);
+            self.tx.extend_from_slice(&more);
+            self.flush(tcp, net);
+        }
         self.unadjusted += data.len() as u32;
         self.data_packets += 1;
         self.give_window(tcp, net);
         if self.plan.rekey_after == Some(self.data_packets) && !self.rekeying {
             self.rekeying = true;
             self.kexinit(tcp, net);
+        }
+    }
+
+    /// What waits for the server's window sent, as much of it as the window
+    /// and the server's packets take -- not while a rekey the client started
+    /// is under way -- and, once an SFTP script is done, the channel's EOF:
+    /// how OpenSSH's sftp ends a session.
+    fn flush(&mut self, tcp: &mut Tcp, net: &mut Net) {
+        while !self.tx.is_empty() && !self.rekeying && !self.close_out && !self.close_in {
+            let room = self.server_window.min(u64::from(self.server_max)).min(PACKET_MAX as u64 - 64) as usize;
+            if room == 0 {
+                return;
+            }
+            let n = room.min(self.tx.len());
+            let piece: Vec<u8> = self.tx.drain(..n).collect();
+            self.server_window -= n as u64;
+            self.data(tcp, net, &piece);
+        }
+        let done = self.sftp.as_ref().is_some_and(|s| s.finished);
+        if done && self.tx.is_empty() && !self.eof_out && !self.rekeying && !self.close_out {
+            self.eof_out = true;
+            self.channel_message(tcp, net, CHANNEL_EOF);
         }
     }
 

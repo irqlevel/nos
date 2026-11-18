@@ -44,6 +44,10 @@ use crate::vnode::{Kind, NodeId, Tree, NAME_MAX};
 
 pub const MAX_MOUNTS: usize = 16;
 pub const MAX_PATH: usize = 256;
+/* What the file ABI tells a module the VFS takes: a path shorter than
+   `MAX_PATH`, a name shorter than the node keeps */
+const _: () = assert!(MAX_PATH == ffi::fs::FILE_PATH_MAX + 1 && NAME_MAX == ffi::fs::FILE_NAME_MAX + 1,
+                      "the file ABI's FILE_PATH_MAX and FILE_NAME_MAX are what the VFS takes");
 
 /// What a filesystem's line about itself, for `mounts`, fits in.
 pub const INFO_MAX: usize = 64;
@@ -61,6 +65,10 @@ pub const OPEN_APPEND: usize = 16;
 /// it, and has it alone; without, any number may hold it to read. Refused
 /// while anyone else has the file open for writing.
 pub const OPEN_HOLD: usize = 32;
+/// The file made by this open, or none: refused when the path names
+/// anything already -- under the lock the create is made under, so two
+/// opens of one new name cannot both have made it. Implies `OPEN_CREATE`.
+pub const OPEN_EXCLUSIVE: usize = 64;
 
 /// What a filesystem is to the VFS: the tree of what it holds, and the calls
 /// that change it.
@@ -1101,6 +1109,9 @@ impl Vfs {
         if flags & OPEN_APPEND != 0 {
             flags |= OPEN_WRITE;
         }
+        if flags & OPEN_EXCLUSIVE != 0 {
+            flags |= OPEN_CREATE;
+        }
         if flags & (OPEN_READ | OPEN_WRITE) == 0 {
             klog!(0, "vfs: an open for neither reading nor writing");
             return None;
@@ -1118,6 +1129,8 @@ impl Vfs {
         }
 
         let node = match resolved.node {
+            /* Something there already, which this open did not make */
+            Some(_) if flags & OPEN_EXCLUSIVE != 0 => return None,
             Some(node) => node,
             None => {
                 if flags & OPEN_CREATE == 0 {
@@ -1377,6 +1390,40 @@ impl Vfs {
             _ => return false,
         }
         data.is_empty() || fs.write(node, data, offset)
+    }
+
+    /// `data` into the file at `offset`, through a handle open for writing,
+    /// the file grown to reach past it where it must -- a hole between its
+    /// end and `offset`, where the write starts past the end: what a file
+    /// copied in is written with, each piece where its client says (sshd's
+    /// SFTP). The handle's position is not moved. A disk's image is refused
+    /// (`OPEN_HOLD`): it never grows, and `write_within` writes it.
+    pub fn pwrite(&self, handle: Handle, offset: usize, data: &[u8]) -> bool {
+        let Some(mut guard) = self.lock_handle(handle) else { return false };
+        let slot = &mut *guard;
+
+        let (node, flags) = match slot.files.get(handle) {
+            Some(file) => (file.node, file.flags),
+            None => return false,
+        };
+        if flags & OPEN_WRITE == 0 {
+            klog!(0, "vfs: that handle is not open for writing");
+            return false;
+        }
+        if flags & OPEN_HOLD != 0 {
+            klog!(0, "vfs: a disk's image is written within its size");
+            return false;
+        }
+        if offset.checked_add(data.len()).is_none() {
+            return false;
+        }
+        if data.is_empty() {
+            return true;
+        }
+        let Some(fs) = slot.mount.as_mut().map(|mount| &mut mount.fs) else {
+            return false;
+        };
+        fs.write(node, data, offset)
     }
 
     /// The file cut to `size` bytes, or grown to it -- with a hole, where
@@ -1690,15 +1737,32 @@ impl Vfs {
     }
 
     pub fn remove(&self, path: &[u8]) -> bool {
-        self.try_remove(path).is_some()
+        self.try_remove(path, None).is_some()
     }
 
-    fn try_remove(&self, path: &[u8]) -> Option<()> {
+    /// The node at `path` removed if it is of `kind` -- a file, or an empty
+    /// directory -- and refused for the other kind, for a directory with
+    /// anything in it, and where `remove` refuses. What a file copied out
+    /// and in is removed with (sshd's SFTP: its remove and its rmdir),
+    /// which must never take a tree with it as `remove` -- the shell's `rm`
+    /// -- does. The look and the remove under one hold of the mount's lock.
+    pub fn remove_one(&self, path: &[u8], kind: Kind) -> bool {
+        self.try_remove(path, Some(kind)).is_some()
+    }
+
+    fn try_remove(&self, path: &[u8], only: Option<Kind>) -> Option<()> {
         let (mut slot, resolved) = self.lock_resolved(path)?;
         let node = resolved.node?;
         let mount = slot.mount.as_mut()?.writable()?;
 
-        if mount.fs.tree().get(node)?.is_dir() && !mount.fs.load_dir(node) {
+        let is_dir = mount.fs.tree().get(node)?.is_dir();
+        if only.is_some_and(|kind| (kind == Kind::Dir) != is_dir) {
+            return None;
+        }
+        if is_dir && !mount.fs.load_dir(node) {
+            return None;
+        }
+        if only.is_some() && is_dir && mount.fs.tree().children(node).next().is_some() {
             return None;
         }
         if mount.fs.tree().has_open_files(node) {

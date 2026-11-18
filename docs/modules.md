@@ -555,10 +555,13 @@ an interrupt handler still on its way out of the module's code.
 ## sshd
 
 `sshd` (`src/crates/modules/net/sshd`) is an SSH server: `sshd allow <key>`, `sshd
-start`, and an OpenSSH client logs in to the kernel's shell. The protocol is a
-crate of its own, `src/crates/common/net/ssh`, which knows nothing of the kernel; the
+start`, and an OpenSSH client logs in to the kernel's shell -- or copies files
+in and out over SFTP, `sftp` and `scp`. The protocol is a
+crate of its own, `src/crates/common/net/ssh`, which knows nothing of the kernel, and
+SFTP's another, `src/crates/common/net/sftp`; the
 module is the kernel's side -- a listener task, a task for each connection,
-the files it keeps under `/etc/ssh`. Its page is [sshd](sshd.md). Nothing loads
+the files it keeps under `/etc/ssh`, and the files a client copies through
+`kcore::fs`. Its page is [sshd](sshd.md). Nothing loads
 a module at boot by itself, so a machine that is to be reached only through
 it gets two lines in `/etc/rc`, which the shell runs once the network is up:
 `insmod /sshd.ko` and `sshd start`.
