@@ -311,8 +311,14 @@ fn setup() -> bool {
     }
 
     let jitter = JITTER.fill(&mut seed);
+    /* Registered whatever its first draw did. This one is made on one CPU,
+     * interrupts off, the walk in its L1: a quiet machine's cycle counter
+     * may show it no variance there -- the ASUS RS500's Westmere did --
+     * where the same CPU later, every core running and interrupts coming,
+     * may. The reseeds ask it again; registered only on success, it was
+     * never asked again, and the pool stayed unseeded for the whole boot. */
+    register(Registered { name: "jitter", source: &JITTER, hardware: false });
     if jitter {
-        register(Registered { name: "jitter", source: &JITTER, hardware: false });
         POOL.add_entropy(&seed);
     }
     wipe(&mut seed);
@@ -369,6 +375,41 @@ fn reseed() {
     }
 
     klog!(0, "Random: reseeded from {} of {} sources", contributed, count);
+}
+
+/* ---- a seed kept from the boot before ---- */
+
+/// The bytes of a seed kept on disk for the next boot (`restore_seed`).
+pub const STORED_SEED_BYTES: usize = 64;
+
+/// Whether anything has seeded the pool: what a caller that keeps a seed
+/// for the next boot asks before it draws one from nothing.
+pub fn seeded() -> bool {
+    POOL.is_seeded()
+}
+
+/// A seed kept on disk by the boot before -- what makes the pool worth its
+/// name on a machine with no random instruction and a cycle counter too
+/// steady for the jitter collector: it is mixed in at once, then the next
+/// boot's seed is drawn from the pool with it inside and handed to `renew`,
+/// which puts it on the disk in this one's place and says whether it did.
+/// The pool counts as seeded by it only when it did: a seed the disk still
+/// holds is the next boot's too, and two boots seeded alike are one boot
+/// twice. Whether the pool counts as seeded by it.
+pub fn restore_seed(seed: &[u8], renew: impl FnOnce(&[u8]) -> bool) -> bool {
+    POOL.add_entropy(seed);
+    let mut next = [0u8; STORED_SEED_BYTES];
+    POOL.fill(&mut next);
+    let kept = renew(&next);
+    wipe(&mut next);
+    if kept {
+        POOL.seeded.store(true, Ordering::Release);
+        klog!(0, "Random: seeded from the seed the boot before kept, and a new one kept for the next");
+    } else {
+        klog!(0, "Random: the kept seed could not be written over -- not counted as seeding the pool, since the \
+            next boot would take it too");
+    }
+    kept
 }
 
 /* ---- the C ABI ---- */

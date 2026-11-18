@@ -512,6 +512,7 @@ put_system() {
     done
 
     put_ucode "$mnt"
+    put_seed "$mnt"
     put_panel "$mnt"
 
     # The grubenv: what this machine boots nos with, and the one-shot flag
@@ -608,6 +609,20 @@ put_ucode() {
         rm -f "$mnt/boot/ucode"
         say "microcode: none for this CPU here; nos runs firmware's"
     fi
+}
+
+# The random pool's seed for nos's next boot (docs/random.md): fresh from
+# this machine's /dev/urandom at every install and update. nos mixes it in
+# as its root is mounted and writes the next over it; on a CPU with no
+# random instruction -- an old Xeon -- it is what sshd's keys are made from.
+put_seed() {
+    local seed=$1/etc/random-seed
+    mkdir -p "$1/etc"
+    rm -f "$seed.new"
+    head -c 64 /dev/urandom > "$seed.new"
+    chmod 600 "$seed.new"
+    mv -T "$seed.new" "$seed"
+    say "random seed: 64 bytes for nos's next boot"
 }
 
 # The revision of the first update in a microcode file, as its header has it
@@ -936,6 +951,11 @@ cmd_status() {
         echo "grubenv:     none"
     fi
     echo "ssh keys:    $(grep -c '^ssh-' "$MNT/etc/ssh/authorized_keys" 2>/dev/null || true)"
+    if [ -s "$MNT/etc/random-seed" ]; then
+        echo "random seed: kept"
+    else
+        echo "random seed: none"
+    fi
     if [ -f "$MNT/boot/ucode" ]; then
         echo "microcode:   revision $(ucode_revision "$MNT/boot/ucode") at /boot/ucode"
     else
