@@ -52,6 +52,12 @@ pub extern "C" fn kernel_read_cycle_counter() -> u64 {
     sched::harness(sched::read_clock)
 }
 
+/// The same clock: nothing here runs out of order.
+#[no_mangle]
+pub extern "C" fn kernel_read_cycle_counter_serialized() -> u64 {
+    sched::harness(sched::read_clock)
+}
+
 /* ---- the CPU ---- */
 
 #[no_mangle]

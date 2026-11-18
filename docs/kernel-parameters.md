@@ -61,6 +61,9 @@ only where `udpshell=` is given -- `nos-install --udpshell`,
 - `dhcp=off` — disable DHCP entirely (even via shell command)
 - `dhcp=on` — enable DHCP only via shell command (default)
 - `dns=on` — enable DNS resolver (uses DHCP-provided DNS server; requires `dhcp=auto`)
+- `ip=A.B.C.D/N` — a static address on `eth0` and its prefix length, for a network with no DHCP server. It is put on `eth0` as the network's services start, before the netconsole sends a line, and `dhcp=auto` then leaves `eth0` alone. Refused, with a line in the log, without a prefix, with one past 32, for the subnet's own network or broadcast address (up to /30), and for 0.0.0.0, loopback, multicast and class E
+- `gw=A.B.C.D` — the default gateway for `ip=`: another address of its subnet. One off the subnet, or given without `ip=`, is named in the log and dropped
+- `dns=A.B.C.D` — a resolver on that server from the start, on `eth0`, whether the address is static or a lease's to come (whose own server then does not replace it). `dns=on` keeps taking the lease's
 - `udpshell=PORT` — start UDP remote shell on the given port (e.g. `udpshell=9000`). Off unless given: it has no authentication. See [UDP remote shell](udp-shell.md)
 - `netframes=N` — frames in the network frame pool (64–65536); watch `netpool` for misses
 - `rxpoll=on` — have the tick look at the receive path as well as the NIC's interrupt (off by default, see `DeviceTable::poll_rx` in `src/crates/layers/net/src/device.rs`)

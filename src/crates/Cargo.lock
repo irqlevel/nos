@@ -38,6 +38,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ata"
+version = "0.1.0"
+dependencies = [
+ "block",
+ "kcore",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -249,6 +257,14 @@ dependencies = [
 [[package]]
 name = "diskimage"
 version = "0.1.0"
+
+[[package]]
+name = "e1000e"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "net",
+]
 
 [[package]]
 name = "ecdsa"
@@ -536,9 +552,11 @@ dependencies = [
 name = "kernel"
 version = "0.1.0"
 dependencies = [
+ "ata",
  "block",
  "crc",
  "crypto",
+ "e1000e",
  "events",
  "ffi",
  "fs",

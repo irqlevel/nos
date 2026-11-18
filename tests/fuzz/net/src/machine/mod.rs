@@ -60,9 +60,15 @@ pub struct Params {
     pub dns_on: bool,
     pub rxpoll_on: bool,
     pub netconsole: Option<(u32, u16, usize)>,
+    /// `dns=A.B.C.D`, 0 for none
+    pub dns_server: u32,
+    /// `ip=` and `gw=`: address, mask, gateway; all 0 for none
+    pub static_ip: (u32, u32, u32),
 }
 
-static PARAMS: Mutex<Params> = Mutex::new(Params { dhcp_off: false, dns_on: false, rxpoll_on: false, netconsole: None });
+static PARAMS: Mutex<Params> = Mutex::new(Params {
+    dhcp_off: false, dns_on: false, rxpoll_on: false, netconsole: None, dns_server: 0, static_ip: (0, 0, 0),
+});
 
 pub fn params() -> Params {
     *PARAMS.lock().unwrap_or_else(|e| e.into_inner())
@@ -85,6 +91,26 @@ pub extern "C" fn kernel_param_dns_on() -> i32 {
 #[no_mangle]
 pub extern "C" fn kernel_param_rxpoll_on() -> i32 {
     params().rxpoll_on as i32
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_param_dns_server() -> u32 {
+    params().dns_server
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_param_static_ip() -> u32 {
+    params().static_ip.0
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_param_static_mask() -> u32 {
+    params().static_ip.1
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_param_static_gateway() -> u32 {
+    params().static_ip.2
 }
 
 /// # Safety

@@ -20,14 +20,19 @@ network, so check these before anything else. `nos-install` looks for each
 and says what it finds -- the partition it refuses, the rest it warns of --
 but cannot fix any of them:
 
-- **An NVMe or a virtio disk** for nos's partition. Those (and virtio-scsi)
-  are the disks nos reads. On a SATA disk, or behind a RAID controller, GRUB
-  still loads the kernel -- it reads disks through the firmware -- but nos
-  finds no root there: no modules, no `/etc/rc`, no sshd.
+- **An NVMe, a virtio or an IDE-mode SATA disk** for nos's partition. Those
+  (and virtio-scsi) are the disks nos reads; a SATA disk only where the
+  firmware leaves its controller in IDE mode (PCI class 0101 -- `lspci` says
+  "IDE interface", Linux binds `ata_piix`), which nos drives by PIO. Behind
+  AHCI (`ahci`) or a RAID controller, GRUB still loads the kernel -- it reads
+  disks through the firmware -- but nos finds no root there: no modules, no
+  `/etc/rc`, no sshd.
 - **A network card nos drives**: Realtek RTL8168 or RTL8125, Intel 82576,
-  I210 or I211 (the `igb` driver), or virtio-net. With any other, nos boots and
-  nobody can reach it. The network has to hand out addresses by DHCP: nos has
-  no static configuration.
+  I210 or I211 (the `igb` driver), Intel 82574L (the `e1000e` driver), or
+  virtio-net. With any other, nos boots and nobody can reach it. A network
+  that hands out no address by DHCP is given one with
+  `--cmdline "ip=A.B.C.D/N gw=A.B.C.D dns=A.B.C.D"` -- what its Linux has
+  statically ([Kernel parameters](kernel-parameters.md#networking)).
 - **A plain partition** of at least 64 MiB (256 MiB is comfortable; a guest's
   disk images need more): not a member of an md RAID, not an LVM volume, not
   encrypted -- nos reads none of those. A server installed with its disks
@@ -120,6 +125,9 @@ What `install` does, in order, stopping at the first thing that is wrong:
    keeps current -- goes to `/boot/ucode`, which GRUB loads beside the
    kernel; with none there (an AMD CPU, no `intel-microcode` package), nos
    runs firmware's.
+   A seed for the random pool goes to `/etc/random-seed`, 64 bytes from
+   this machine's `/dev/urandom`: on a CPU with no random instruction it is
+   what sshd's keys come from ([Randomness](random.md)).
 4. Writes `/grubenv` on it -- this machine's kernel parameters, and the
    one-shot flag -- and checks the filesystem with `e2fsck`, before the
    write and after it.

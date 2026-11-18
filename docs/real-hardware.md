@@ -1,8 +1,9 @@
 # Real hardware
 
-`nos` boots on bare metal. Three machines so far, and they pull in opposite
-directions: a laptop whose only console is its own screen, and two dedicated
-servers — one Intel, one AMD — whose only console is the network.
+`nos` boots on bare metal. Four machines so far, and they pull in opposite
+directions: a laptop whose only console is its own screen, and three
+dedicated servers — two Intel, one AMD — whose only console is the network,
+one of them fifteen years old.
 
 ## Dell Latitude 5480
 
@@ -245,10 +246,62 @@ kernel interface ([Modules](modules.md#releases)):
     wget https://github.com/irqlevel/nos/releases/download/<tag>/blkload-x86_64.ko /blkload.ko
     insmod /blkload.ko
 
+## ASUS RS500-E6-PS4
+
+A 1U **ASUS RS500-E6-PS4** (board Z8NR-D12, AMI BIOS 1501 from 2011, legacy
+BIOS boot): two **Xeon L5630** — Westmere-EP, 2010, four cores and eight
+threads each, sixteen CPUs whose APIC ids are 0–3, 18–21, 32–35 and 50–53 —
+and 19 GiB, Ubuntu beside nos, rented with a KVM console. It is the oldest
+CPU nos has run on, and nearly everything about it is a case the newer
+machines never were:
+
+- **The CPU has no x2APIC, no TSC-deadline timer, no XSAVE or AVX and no
+  RDRAND.** None of that is in the way: the local APIC runs in xAPIC mode,
+  its timer one-shot from a calibration, and the SIMD sections take SSE2 and
+  SSSE3. What RDRAND's absence takes away is below.
+- **Its SATA is in IDE mode**: the BIOS leaves the ICH10R as two PCI IDE
+  functions in native mode (8086:3a20, programming interface 0x8f, and 3a26,
+  0x85), each channel a master and a slave — two 4 TB Toshiba MG04ACA400E
+  (512e, 7200 rpm) and two PNY CS900 SSDs, one of them Ubuntu's. That is what
+  brought the `ata` driver (`src/crates/drivers/block/ata`). The line the
+  functions' PCI headers name is the PIC's — 11, where their IO-APIC pin is
+  18, which only ACPI's `_PRT` says — so the driver polls, with the devices'
+  interrupt off. nos's root is a partition of the second PNY, its disk log the
+  next one; that disk carries GRUB's boot code too, Ubuntu's GRUB from Ubuntu's
+  `/boot`, so that a BIOS that tries it first lands in the same menu instead of
+  on zeros, and `grub-pc`'s `install_devices` names both disks.
+- **Its NICs are two Intel 82574L** (the `e1000e` driver), MSI-X, the cable
+  on the one at 02:00.0, which nos names `eth0` by the bus order. The BMC
+  shares it — the firmware's manageability is on (ASF), and the driver leaves
+  MANC as it found it. The switch port offers 100BASE-TX full duplex and
+  nothing else (link partner ability 0x4101, no 1000BASE-T in its status), so
+  the link is 100 Mbit/s whatever the PHY advertises.
+- **Its network hands out no address**: Ubuntu's is set by hand, and a
+  DHCPDISCOVER heard no offer. nos takes eth0's address, gateway and resolver
+  from `nos-install --cmdline "ip=… gw=… dns=…"`, and its log goes to a
+  netconsole collector on another host.
+- **Nothing seeds the random pool but what it keeps.** No RDRAND, no
+  virtio-rng, and the jitter collector finds no variance there — at setup and
+  again once every CPU runs, with the walk timed between serialized reads —
+  where the same walk in a Linux process on the machine varies plenty. The
+  boot that found that would have given sshd nothing to make a host key with;
+  `/etc/random-seed`, which `nos-install` writes from Ubuntu's `/dev/urandom`
+  and every boot writes over with the next, is what seeds it
+  ([Randomness](random.md#a-seed-kept-from-one-boot-to-the-next)).
+- **Its BMC watchdog does not outlive a reboot.** Armed from Ubuntu it hard-
+  resets the box when it runs out, but armed before a reboot it is the BIOS's
+  again by the end of POST, and nos does not speak IPMI. What resets a nos
+  that hangs there is the ICH10's TCO watchdog, which nos finds by the LPC
+  bridge and keeps fed, 30 s at a time.
+
+POST to GRUB takes about two minutes; nos says `boot: complete` 13 s after
+GRUB, and its sshd answers then. A `reboot` in nos is Ubuntu again in under
+three minutes, nos's ext4 clean behind it.
+
 These boxes were set up by hand, before there was a release image to set one
 up from. A new server is set up with `nos-install` from the system image,
 which makes the partition, the GRUB entry and the one-shot flag that the
 sections above describe building by hand ([Install](install.md)).
 
 Other firmware, chipsets, NICs and disks are untested; treat bare-metal support
-as "works on the three machines it was debugged on".
+as "works on the four machines it was debugged on".
