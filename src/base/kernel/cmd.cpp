@@ -21,8 +21,7 @@
 
 #include <drivers/vga.h>
 #include <drivers/pci.h>
-#ifdef __x86_64__
-#endif
+#include <arch/x86_64/vtd.h>
 #include <include/const.h>
 #include <mm/page_table.h>
 #include <mm/memory_map.h>
@@ -1658,6 +1657,11 @@ static void cmd_pci(const char* args, stdlib::Printer& con)
     Pci::get_instance().dump(con);
 }
 
+static void cmd_iommu(const char* args, stdlib::Printer& con)
+{
+    Vtd::get_instance().shell(args, con);
+}
+
 
 /* A GRUB environment block bigger than this is not one grub-editenv made */
 static const ulong GRUBENV_MAX_SIZE = 64 * 1024;
@@ -2454,6 +2458,7 @@ static const CmdEntry COMMANDS[] = {
     { "memsites",  cmd_memsites,  "memsites [on|off|dump|tags|N] - Rust's heap by where it was allocated" },
     { "irqstat",   cmd_irqstat,   "irqstat - show interrupt statistics" },
     { "pci",       cmd_pci,       "pci - show pci devices" },
+    { "iommu",     cmd_iommu,     "iommu [block|unblock <bus>:<dev>.<fn>] - the DMA remapping units: what each can do and does, the faults it recorded; a device's DMA blocked, or passed through again" },
     { "grubenv",   cmd_grubenv,   "grubenv <path> [name=value ...] - show or set GRUB environment variables" },
     { "insmod",    cmd_insmod,    "insmod <path> [params] - load a kernel module (.ko), handing its init the parameters" },
     { "rmmod",     cmd_rmmod,     "rmmod <name> - unload a kernel module" },

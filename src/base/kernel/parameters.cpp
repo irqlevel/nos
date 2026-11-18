@@ -43,6 +43,7 @@ Parameters::Parameters()
     , ucode_off_(false)
     , wx_probe_md_(WxProbeOff)
     , usb_off_(false)
+    , iommu_on_(false)
     , rc_off_(false)
     , con_mode_(ConsoleBoth)
     , dhcp_md_(DhcpOn)
@@ -151,6 +152,11 @@ bool Parameters::is_wx_probe_heap()
 bool Parameters::is_usb_off()
 {
     return usb_off_;
+}
+
+bool Parameters::is_iommu_on()
+{
+    return iommu_on_;
 }
 
 bool Parameters::is_rc_off()
@@ -572,6 +578,10 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
     else if (stdlib::str_cmp(key, "usb") == 0)
     {
         usb_off_ = (stdlib::str_cmp(value, "off") == 0);
+    }
+    else if (stdlib::str_cmp(key, "iommu") == 0)
+    {
+        iommu_on_ = (stdlib::str_cmp(value, "on") == 0);
     }
     else if (stdlib::str_cmp(key, "rc") == 0)
     {
