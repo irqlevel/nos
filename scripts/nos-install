@@ -266,8 +266,8 @@ check_hardware() {
     fi
 
     # The network is a server's only console. The parts nos's drivers claim:
-    # drivers/net/r8168, drivers/net/r8125, drivers/net/igb, drivers/net/e1000e,
-    # virtio-net
+    # drivers/net/r8168, drivers/net/r8125, drivers/net/igb (82576, I210/I211,
+    # I350), drivers/net/e1000e, virtio-net
     for d in /sys/bus/pci/devices/*; do
         [ -r "$d/vendor" ] || continue
         id=$(cat "$d/vendor"):$(cat "$d/device")
@@ -276,13 +276,14 @@ check_hardware() {
             0x8086:0x10c9|0x8086:0x10e8|0x8086:0x150a|\
             0x8086:0x1533|0x8086:0x1536|0x8086:0x1537|0x8086:0x1538|\
             0x8086:0x1539|0x8086:0x157b|0x8086:0x157c|\
+            0x8086:0x1521|\
             0x8086:0x10d3|\
             0x1af4:0x1000|0x1af4:0x1041)
                 found="$found $(basename "$d")" ;;
         esac
     done
     [ -n "$found" ] ||
-        warn "no network card here that nos has a driver for (RTL8168, RTL8125, Intel 82576/I210/I211, Intel 82574L, virtio-net): booted, nos cannot be reached"
+        warn "no network card here that nos has a driver for (RTL8168, RTL8125, Intel 82576/I210/I211/I350, Intel 82574L, virtio-net): booted, nos cannot be reached"
 
     if [ -d /sys/firmware/efi ]; then
         local sb
