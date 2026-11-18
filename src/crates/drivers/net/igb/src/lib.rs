@@ -1,10 +1,13 @@
 /* Intel igb-family gigabit Ethernet driver for NOS.
  *
- * Claims 8086:10C9 (82576) and 8086:1533 (I210). The first is what QEMU
- * emulates, which is where this was written and is meant to be debugged; the
- * second is the part on real hardware. They share a register map Intel
+ * Claims 8086:10C9 (82576), 8086:1533 (I210) and 8086:1521 (I350). The first
+ * is what QEMU emulates, which is where this was written and is meant to be
+ * debugged; the I210 is the AX41's, and the I350 -- two ports, an 82580-class
+ * MAC -- the Supermicro X11SSD-F's. They share a register map Intel
  * publishes -- the reason this driver reads like a transcription of a
- * datasheet where the Realtek ones next door read like archaeology.
+ * datasheet where the Realtek ones next door read like archaeology. Where the
+ * I350 differs it has a path of its own (i350_*), taken from Linux's igb and
+ * the I350 datasheet; the 82576's and the I210's are as they were.
  *
  * Architecture, matching the r8125 driver:
  *  - PCI probe walks an ID table; each match calls init_device().
@@ -53,6 +56,7 @@ use kcore::once::Once;
 use kcore::sync::IrqSpinLock;
 use kcore::time::boot_time_ns;
 use kcore::{dma, interrupt, io, msix, pci, softirq, klog};
+use net::device::ETH_NAME_MAX;
 use net::{Frame, FrameQueue, NetDriver, RxQueue, TxQueue};
 
 mod desc;
@@ -98,6 +102,9 @@ enum Generation {
     I82576,
     /// I210/I211. Has manageability firmware sharing the MDIO bus.
     I210,
+    /// I350: an 82580-class MAC, several ports to a chip, each a PCI function
+    /// with a PHY and a semaphore bit of its own, the firmware sharing them.
+    I350,
 }
 
 impl Generation {
@@ -105,11 +112,28 @@ impl Generation {
         match self {
             Generation::I82576 => "82576",
             Generation::I210 => "I210",
+            Generation::I350 => "I350",
+        }
+    }
+
+    /// The SW_FW_SYNC bit that claims port `port`'s PHY, where firmware
+    /// shares it: none on the 82576, PHY0's on the single-port I210, the
+    /// port's own on the I350 (igb_acquire_phy_82575).
+    fn phy_semaphore(self, port: u32) -> Option<u32> {
+        match self {
+            Generation::I82576 => None,
+            Generation::I210 => Some(SWFW_PHY0_SM),
+            Generation::I350 => Some(match port {
+                0 => SWFW_PHY0_SM,
+                1 => SWFW_PHY1_SM,
+                2 => SWFW_PHY2_SM,
+                _ => SWFW_PHY3_SM,
+            }),
         }
     }
 }
 
-const SUPPORTED: [(u16, Generation); 10] = [
+const SUPPORTED: [(u16, Generation); 11] = [
     (PCI_DEVICE_82576, Generation::I82576),
     (PCI_DEVICE_82576_QUAD, Generation::I82576),
     (PCI_DEVICE_82576_NS, Generation::I82576),
@@ -120,6 +144,7 @@ const SUPPORTED: [(u16, Generation); 10] = [
     (PCI_DEVICE_I210_COPPER_FLASHLESS, Generation::I210),
     (PCI_DEVICE_I210_SERDES_FLASHLESS, Generation::I210),
     (PCI_DEVICE_I211_COPPER, Generation::I210),
+    (PCI_DEVICE_I350_COPPER, Generation::I350),
 ];
 
 /* Descriptors taken in one pass before the poll yields, and passes before it
@@ -173,6 +198,15 @@ struct IgbDevice {
     two_vector: AtomicBool,
     generation: Generation,
     phy_addr: u32,
+    /// Which port of its chip this function is (STATUS.FUNC_ID): 0 on a
+    /// single-port part.
+    port: u32,
+    /// The SW_FW_SYNC bit that claims this port's PHY from firmware, where
+    /// firmware shares it (Generation::phy_semaphore).
+    phy_sm: Option<u32>,
+    /// What the net layer named it (net::free_eth_name), for the log.
+    name: [u8; ETH_NAME_MAX],
+    name_len: usize,
     /* Set by the interrupt when the link changes, acted on by the poll: the
        work it asks for is a PHY read, which means polling MDIC for
        milliseconds, and that has no business in an interrupt handler. */
@@ -223,6 +257,10 @@ impl IgbDevice {
         self.msix.load(Ordering::Relaxed)
     }
 
+    fn name(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("eth?")
+    }
+
     /// Go quiet on receive for the duration of a poll.
     fn mask_rx(&self) {
         if self.is_msix() {
@@ -255,6 +293,12 @@ impl IgbDevice {
         self.regs.write32(TCTL, tctl & !TCTL_EN);
         self.regs.write32(RXDCTL0, 0);
         self.regs.write32(TXDCTL0, 0);
+        if self.generation == Generation::I350 {
+            /* The device back to the firmware: it answers for the host again
+             * once nobody else does (igb_release_hw_control). */
+            let ctrl_ext = self.regs.read32(CTRL_EXT);
+            self.regs.write32(CTRL_EXT, ctrl_ext & !CTRL_EXT_DRV_LOAD);
+        }
         let _ = self.regs.read32(STATUS); /* flush the posted writes */
 
         /* And the handlers: taken out under the lock, dropped after it --
@@ -311,7 +355,7 @@ fn wait_for<F: FnMut() -> bool>(us: u64, tries: u32, mut cond: F) -> bool {
 /* Public entry points called from kernel/src/lib.rs */
 
 pub fn init() {
-    match Command::register("igbdump", "igbdump - igb chip and ring state", dump) {
+    match Command::register("igbdump", "igbdump [n] - igb chip and ring state, of the nth igb (0)", dump) {
         /* The command is the kernel's own and stays for good. */
         Ok(cmd) => core::mem::forget(cmd),
         Err(_) => klog!(0, "igb: cannot register the igbdump command"),
@@ -357,7 +401,9 @@ pub fn shutdown() {
 /* Hardware bring-up */
 
 /// Take the device back from whatever the firmware left running, then reset.
-fn reset(regs: &io::MmioRegion) -> bool {
+/// The port's own reset (CTRL.RST), on the I350 as on the others: a device
+/// reset would take the chip's other ports with it.
+fn reset(regs: &io::MmioRegion, generation: Generation) -> bool {
     /* Nothing may reach a handler that does not exist yet. */
     regs.write32(IMC, u32::MAX);
     let _ = regs.read32(ICR);
@@ -399,8 +445,11 @@ fn reset(regs: &io::MmioRegion) -> bool {
      * reset itself. Reading RAL0 before it finishes gets whatever was there
      * before -- which on a cold boot is zero, and a zero station address is
      * rejected further down as "no valid address", so the card would simply
-     * not appear. Not fatal if it times out: the read below decides. */
-    if !wait_for(1000, 100, || regs.read32(EEC) & EEC_AUTO_RD != 0) {
+     * not appear. Not fatal if it times out: the read below decides. The bit
+     * is where the part keeps it: the I210 moved the register to 0x12010,
+     * the I350 has it where the 82580 class does (igb_get_auto_rd_done). */
+    let eec = if generation == Generation::I350 { EEC_82580 } else { EEC };
+    if !wait_for(1000, 100, || regs.read32(eec) & EEC_AUTO_RD != 0) {
         klog!(0, "igb: NVM auto-read did not complete; the MAC may not be loaded");
     }
 
@@ -578,6 +627,8 @@ fn mdic_wait(regs: &io::MmioRegion) -> Option<u32> {
 /// this driver does not handle. The value is reported rather than derived, so
 /// a log from a board that turns out to be wired differently says so.
 fn phy_address(regs: &io::MmioRegion, generation: Generation) -> u32 {
+    /* The I350's copper PHY is the port's own, at 1 (igb_get_phy_id_82575:
+     * "for non-SGMII PHYs ... an address of 1 should work") */
     if generation != Generation::I210 {
         return PHY_ADDR_INTERNAL;
     }
@@ -668,6 +719,40 @@ fn phy_start_link_locked(regs: &io::MmioRegion, phy_addr: u32) -> bool {
         return false;
     }
 
+    negotiate(regs, phy_addr)
+}
+
+/// What to offer, and a round of auto-negotiation on it: every speed and both
+/// duplexes, restarted, waited for long enough to say in the log whether it
+/// finished. The PHY's claim, where it has one, is the caller's, for all of it.
+fn negotiate(regs: &io::MmioRegion, phy_addr: u32) -> bool {
+    if !advertise(regs, phy_addr) {
+        return false;
+    }
+
+    /* Negotiation takes as long as it takes; this only waits long enough to
+     * be able to say in the log whether it finished, and boots either way.
+     * A link that comes up later announces itself through LSC. */
+    let up = wait_for(10_000, 100, || {
+        match phy_read(regs, phy_addr, PHY_BMSR) {
+            /* Read twice in effect: the link bit is latching-low, so the
+             * first read after a change reports the old state. */
+            Some(v) => v & (BMSR_LSTATUS | BMSR_ANEGCOMPLETE) == (BMSR_LSTATUS | BMSR_ANEGCOMPLETE),
+            None => false,
+        }
+    });
+
+    if !up {
+        klog!(0, "igb: auto-negotiation has not completed yet");
+    }
+
+    log_negotiation(regs, phy_addr);
+    up
+}
+
+/// The advertisement -- every speed, both duplexes -- and the restart that
+/// makes the PHY offer it. Whether the writes went through.
+fn advertise(regs: &io::MmioRegion, phy_addr: u32) -> bool {
     let bmcr = phy_read(regs, phy_addr, PHY_BMCR).unwrap_or(0);
 
     /* Say what to offer before asking for a round of negotiation. With
@@ -697,23 +782,11 @@ fn phy_start_link_locked(regs: &io::MmioRegion, phy_addr: u32) -> bool {
         klog!(0, "igb: PHY control write failed");
         return false;
     }
+    true
+}
 
-    /* Negotiation takes as long as it takes; this only waits long enough to
-     * be able to say in the log whether it finished, and boots either way.
-     * A link that comes up later announces itself through LSC. */
-    let up = wait_for(10_000, 100, || {
-        match phy_read(regs, phy_addr, PHY_BMSR) {
-            /* Read twice in effect: the link bit is latching-low, so the
-             * first read after a change reports the old state. */
-            Some(v) => v & (BMSR_LSTATUS | BMSR_ANEGCOMPLETE) == (BMSR_LSTATUS | BMSR_ANEGCOMPLETE),
-            None => false,
-        }
-    });
-
-    if !up {
-        klog!(0, "igb: auto-negotiation has not completed yet");
-    }
-
+/// What was offered and what came back, for the log.
+fn log_negotiation(regs: &io::MmioRegion, phy_addr: u32) {
     /* What was offered and what came back. A link that resolves lower than it
      * should is either an advertisement that did not take or a partner that
      * offered nothing better, and these two registers are the difference. */
@@ -725,7 +798,147 @@ fn phy_start_link_locked(regs: &io::MmioRegion, phy_addr: u32) -> bool {
         phy_read(regs, phy_addr, PHY_GCTL).unwrap_or(0),
         phy_read(regs, phy_addr, PHY_GSTAT).unwrap_or(0)
     );
+}
 
+/* ================================================================== */
+/* The I350: an 82580-class MAC's way to a link.
+ *
+ * Linux's igb_setup_copper_link_82575 and what it calls for the I350's PHY
+ * type (e1000_phy_82580), in its order: EEE and DMA coalescing off, the PHY
+ * out of Go Link Disconnect and D0 low-power link-up, a hard reset of the PHY
+ * -- unless manageability forbids one -- and the wait for the NVM to
+ * configure it again, the PHY's own settings, then the advertisement and a
+ * round of auto-negotiation as the other parts have it. Every PHY access is
+ * under the port's own semaphore: a chip with two ports has two PHYs, and a
+ * bit for each, and the second port must not take the first's. */
+
+/* How long the I350's link is waited for at bring-up, as the other parts'
+ * is in negotiate(): a hundred reads ten milliseconds apart. */
+const LINK_WAIT_US: u64 = 10_000;
+const LINK_WAIT_TRIES: u32 = 100;
+
+/// Which port of its chip this function is (STATUS.FUNC_ID: igb's bus.func).
+fn port_of(regs: &io::MmioRegion) -> u32 {
+    (regs.read32(STATUS) & STATUS_FUNC_MASK) >> STATUS_FUNC_SHIFT
+}
+
+/// EEE's advertisement and low-power idle off (igb_set_eee_i350's
+/// eee_disable branch), and DMA coalescing: both trade latency for power,
+/// and both are what firmware or the NVM may have left on.
+fn i350_quiet(regs: &io::MmioRegion) {
+    let ipcnfg = regs.read32(IPCNFG);
+    regs.write32(IPCNFG, ipcnfg & !(IPCNFG_EEE_1G_AN | IPCNFG_EEE_100M_AN));
+    let eeer = regs.read32(EEER);
+    regs.write32(EEER, eeer & !(EEER_TX_LPI_EN | EEER_RX_LPI_EN | EEER_LPI_FC));
+    let dmacr = regs.read32(DMACR);
+    regs.write32(DMACR, dmacr & !DMACR_DMAC_EN);
+    let _ = regs.read32(STATUS);
+}
+
+/// The port's PHY reset by CTRL.PHY_RST, held for PHY_RESET_US under the
+/// port's claim (igb_phy_hw_reset), then the NVM's configuration of it waited
+/// for (igb_get_cfg_done_82575) -- unless manageability says the BMC is on the
+/// port and the PHY may not be reset (igb_check_reset_block): then it is taken
+/// as firmware left it. Whether it was reset.
+fn i350_reset_phy(regs: &io::MmioRegion, port: u32, mask: u32) -> bool {
+    if regs.read32(MANC) & MANC_BLK_PHY_RST_ON_IDE != 0 {
+        klog!(0, "igb: manageability blocks a PHY reset on port {}: its PHY is taken as firmware left it", port);
+        return false;
+    }
+    if !swfw_acquire(regs, mask) {
+        klog!(0, "igb: could not take port {}'s PHY semaphore from firmware to reset it", port);
+        return false;
+    }
+    let ctrl = regs.read32(CTRL);
+    regs.write32(CTRL, ctrl | CTRL_PHY_RST);
+    let _ = regs.read32(STATUS);
+    udelay(PHY_RESET_US);
+    regs.write32(CTRL, ctrl);
+    let _ = regs.read32(STATUS);
+    udelay(PHY_RESET_SETTLE_US);
+    swfw_release(regs, mask);
+
+    /* A port's bit is the one after the port before's: port is two bits of
+     * STATUS, so the shift is at most 3 */
+    let done = EEMNGCTL_CFG_DONE_PORT_0 << port;
+    if !wait_for(1000, PHY_CFG_TIMEOUT_MS, || regs.read32(EEMNGCTL) & done != 0) {
+        klog!(0, "igb: port {}: the NVM's configuration of the PHY after its reset did not complete", port);
+    }
+    true
+}
+
+/// The I350's PHY's own settings (igb_copper_link_setup_82580): carrier sense
+/// asserted on transmit, which half duplex needs; downshift, so that a cable
+/// with two good pairs of four still links at 100; crossover the PHY's to
+/// choose. Under the port's claim.
+fn i350_configure_phy(regs: &io::MmioRegion, phy_addr: u32) -> bool {
+    let Some(cfg) = phy_read(regs, phy_addr, PHY_82580_CFG) else { return false };
+    let cfg = cfg | PHY_82580_CFG_ASSERT_CRS_ON_TX | PHY_82580_CFG_ENABLE_DOWNSHIFT;
+    if !phy_write(regs, phy_addr, PHY_82580_CFG, cfg) {
+        return false;
+    }
+    let Some(ctrl2) = phy_read(regs, phy_addr, PHY_82580_CTRL_2) else { return false };
+    let ctrl2 = (ctrl2 & !PHY_82580_CTRL2_MDIX_CFG_MASK) | PHY_82580_CTRL2_AUTO_MDI_MDIX;
+    phy_write(regs, phy_addr, PHY_82580_CTRL_2, ctrl2)
+}
+
+/// An I350 port's link: what the PHY is, its settings, the advertisement and
+/// a round of negotiation, as the module comment above says.
+fn i350_start_link(regs: &io::MmioRegion, phy_addr: u32, port: u32, mask: u32) -> bool {
+    i350_quiet(regs);
+
+    let phpm = regs.read32(PHPM);
+    regs.write32(PHPM, phpm & !(PHPM_GO_LINKD | PHPM_D0_LPLU));
+
+    let reset = i350_reset_phy(regs, port, mask);
+
+    if !swfw_acquire(regs, mask) {
+        klog!(0, "igb: could not take port {}'s PHY semaphore from firmware", port);
+        return false;
+    }
+    let id = (u32::from(phy_read(regs, phy_addr, PHY_ID1).unwrap_or(0)) << 16)
+        | u32::from(phy_read(regs, phy_addr, PHY_ID2).unwrap_or(0));
+    if id & !PHY_ID_REV_MASK != I350_PHY_ID {
+        klog!(0, "igb: port {}: PHY id {:#010x} is not the I350's own ({:#010x})", port, id, I350_PHY_ID);
+    }
+    let configured = i350_configure_phy(regs, phy_addr);
+    if !configured {
+        klog!(0, "igb: port {}: the PHY's configuration writes failed", port);
+    }
+    let advertised = configured && advertise(regs, phy_addr);
+    swfw_release(regs, mask);
+
+    klog!(0, "igb: I350 port {}: PHY {:#010x}{}, power management {:#x} -> {:#x}", port, id,
+        if reset { ", reset" } else { "" }, phpm, regs.read32(PHPM));
+    if !advertised {
+        return false;
+    }
+
+    /* The wait for negotiation as the other parts have it, but the claim
+     * taken for each read of the PHY's status alone, as Linux reads this
+     * PHY (igb_read_phy_reg_82580): firmware -- which until DRV_LOAD is set
+     * still answers for the port -- is not kept from it for a second. A
+     * claim that cannot be had ends the wait rather than stretching it. */
+    let mut claimed = true;
+    let up = wait_for(LINK_WAIT_US, LINK_WAIT_TRIES, || {
+        if !swfw_acquire(regs, mask) {
+            claimed = false;
+            return true;
+        }
+        let bmsr = phy_read(regs, phy_addr, PHY_BMSR);
+        swfw_release(regs, mask);
+        matches!(bmsr, Some(v) if v & (BMSR_LSTATUS | BMSR_ANEGCOMPLETE) == (BMSR_LSTATUS | BMSR_ANEGCOMPLETE))
+    }) && claimed;
+
+    if !claimed {
+        klog!(0, "igb: port {}: lost the PHY semaphore to firmware while negotiation ran", port);
+    } else if !up {
+        klog!(0, "igb: port {}: auto-negotiation has not completed yet", port);
+    }
+    if swfw_acquire(regs, mask) {
+        log_negotiation(regs, phy_addr);
+        swfw_release(regs, mask);
+    }
     up
 }
 
@@ -857,20 +1070,6 @@ fn find_mmio_bar(pci_dev: &pci::PciDevice) -> u64 {
     }
 }
 
-/* "ethN", which is the name every NIC driver here uses and the one the
- * shell's DHCP autostart looks for by name. */
-fn write_device_name(buf: &mut [u8; 16], idx: u32) -> &str {
-    let name = b"eth";
-    let mut i = 0;
-    while i < name.len() {
-        buf[i] = name[i];
-        i += 1;
-    }
-    /* Single digit is enough: MAX_DEVICES is 4. */
-    buf[i] = b'0' + (idx as u8 % 10);
-    core::str::from_utf8(&buf[..i + 1]).unwrap_or("eth?")
-}
-
 /* ================================================================== */
 /* Device initialisation */
 
@@ -902,9 +1101,22 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     let regs = io::MmioRegion::new(bar_mapping.as_mut_ptr(), BAR_MAP_PAGES * PAGE_SIZE);
     klog!(0, "igb: MMIO BAR at {:#x}", bar_phys);
 
-    if !reset(&regs) {
+    if !reset(&regs, generation) {
         klog!(0, "igb: chip reset timed out");
         return;
+    }
+
+    /* The port this function is, and the claim its PHY takes -- the port's
+     * own on a chip of several. */
+    let port = if generation == Generation::I350 { port_of(&regs) } else { 0 };
+    let phy_sm = generation.phy_semaphore(port);
+
+    if generation == Generation::I350 {
+        /* What the firmware and the NVM set up is said, not changed: the
+         * management control, the packet buffers' partition, where the MDIO
+         * goes. */
+        klog!(0, "igb: I350 port {}: manc {:#x} rxpbs {:#x} txpbs {:#x} mdicnfg {:#x}", port,
+            regs.read32(MANC), regs.read32(RXPBS), regs.read32(TXPBS), regs.read32(MDICNFG));
     }
 
     /* Which interface the MAC is wired to, from the NVM. Reported rather than
@@ -992,14 +1204,34 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
      * getting it wrong costs every descriptor fetch and every packet, with
      * nothing in the registers to say why. --- */
     let ctrl = regs.read32(CTRL);
-    regs.write32(
-        CTRL,
-        (ctrl & !CTRL_GIO_MASTER_DISABLE) | CTRL_SLU | CTRL_ASDE,
-    );
+    if generation == Generation::I350 {
+        /* The MAC's speed and duplex the internal PHY's own indication:
+         * nothing forced, as igb_setup_copper_link_82575 has it, and no
+         * auto-speed detection either -- Linux leaves ASDE as it finds it,
+         * but detection latches the first speed it senses, and the I210's
+         * latched 10 Mb/s against a PHY at 1000 (its path, below, sets ASDE
+         * and forces the speed after the fact: sync_mac_speed) */
+        regs.write32(
+            CTRL,
+            (ctrl & !(CTRL_GIO_MASTER_DISABLE | CTRL_FRCSPD | CTRL_FRCDPLX | CTRL_ASDE)) | CTRL_SLU,
+        );
+    } else {
+        regs.write32(
+            CTRL,
+            (ctrl & !CTRL_GIO_MASTER_DISABLE) | CTRL_SLU | CTRL_ASDE,
+        );
+    }
 
     let phy_addr = phy_address(&regs, generation);
     klog!(0, "igb: PHY at MDIO address {}", phy_addr);
-    phy_start_link(&regs, generation, phy_addr);
+    match (generation, phy_sm) {
+        (Generation::I350, Some(mask)) => {
+            i350_start_link(&regs, phy_addr, port, mask);
+        }
+        _ => {
+            phy_start_link(&regs, generation, phy_addr);
+        }
+    }
 
     /* --- Multicast table: nothing accepted by hash, broadcast handled by
      * RCTL.BAM below. --- */
@@ -1089,8 +1321,26 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     regs.write32(IMC, u32::MAX);
     let _ = regs.read32(ICR);
 
-    let mut name_buf = [0u8; 16];
-    let name = write_device_name(&mut name_buf, idx);
+    /* The lowest ethN nobody has: the net layer's to say, whichever driver
+     * registered before this one */
+    let mut name_buf = [0u8; ETH_NAME_MAX];
+    let name_len = match net::free_eth_name(&mut name_buf) {
+        Some(name) => name.len(),
+        None => {
+            klog!(0, "igb: no ethN name left in the device table");
+            stop_engines(&regs);
+            return;
+        }
+    };
+
+    if generation == Generation::I350 {
+        /* The port is the driver's from here, which the firmware is told
+         * where Linux tells it (igb_get_hw_control: after the link's setup,
+         * before the device is registered). Every way out after this one
+         * goes through quiesce(), which gives it back. */
+        let ctrl_ext = regs.read32(CTRL_EXT);
+        regs.write32(CTRL_EXT, ctrl_ext | CTRL_EXT_DRV_LOAD);
+    }
 
     /* For good from here: the interrupt handlers are pointed at the device,
      * and then the net stack is -- with each ring handed over to it, for the
@@ -1103,6 +1353,10 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
             two_vector: AtomicBool::new(false),
             generation,
             phy_addr,
+            port,
+            phy_sm,
+            name: name_buf,
+            name_len,
             link_event: AtomicU32::new(0),
             rx_view: rx_ring.view(),
             rx_next_to_clean: AtomicU32::new(next_to_clean),
@@ -1140,7 +1394,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
 
     trace_link(&dev.regs);
 
-    if net::register(name, mac, dev, tx_ring, rx_ring).is_none() {
+    if net::register(dev.name(), mac, dev, tx_ring, rx_ring).is_none() {
         klog!(0, "igb: NetDevice registration failed");
         dev.quiesce();
         return;
@@ -1149,7 +1403,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     let _ = DEVICES[idx as usize].set(dev);
     DEVICE_COUNT.store(idx + 1, Ordering::Release);
 
-    klog!(0, "igb: device {} ready ({})", idx, generation.as_str());
+    klog!(0, "igb: device {} ready ({}), {}", idx, generation.as_str(), dev.name());
 }
 
 fn attach_interrupt(pci_dev: &pci::PciDevice, dev: &'static IgbDevice) -> bool {
@@ -1421,6 +1675,15 @@ impl IgbDevice {
         }
 
         let regs = &self.regs;
+
+        if self.generation == Generation::I350 {
+            /* Nothing to bring into step: with nothing forced and no
+             * auto-speed detection the MAC takes the PHY's speed and duplex
+             * as the link resolves (see init_device). */
+            klog!(0, "igb: {} (I350 port {}): link changed", self.name(), self.port);
+            trace_link(regs);
+            return;
+        }
 
         if self.generation == Generation::I210 && !swfw_acquire(regs, SWFW_PHY0_SM) {
             klog!(0, "igb: link changed, but the PHY semaphore is held elsewhere");
@@ -1795,7 +2058,10 @@ fn snapshot(dev: &'static IgbDevice) -> State {
      * firmware will not give it up, report zeroes rather than whatever a
      * contended MDIO bus hands back. */
     let mut phy = [0u32; 6];
-    let phy_locked = dev.generation != Generation::I210 || swfw_acquire(regs, SWFW_PHY0_SM);
+    let phy_locked = match dev.phy_sm {
+        None => true,
+        Some(mask) => swfw_acquire(regs, mask),
+    };
     if phy_locked {
         let addr = dev.phy_addr;
         phy[0] = phy_read(regs, addr, PHY_BMCR).unwrap_or(0) as u32;
@@ -1809,8 +2075,8 @@ fn snapshot(dev: &'static IgbDevice) -> State {
         phy[3] = phy_read(regs, addr, PHY_ANLPAR).unwrap_or(0) as u32;
         phy[4] = phy_read(regs, addr, PHY_GCTL).unwrap_or(0) as u32;
         phy[5] = phy_read(regs, addr, PHY_GSTAT).unwrap_or(0) as u32;
-        if dev.generation == Generation::I210 {
-            swfw_release(regs, SWFW_PHY0_SM);
+        if let Some(mask) = dev.phy_sm {
+            swfw_release(regs, mask);
         }
     }
 
@@ -1891,13 +2157,24 @@ fn snapshot(dev: &'static IgbDevice) -> State {
     }
 }
 
-/// `igbdump`: the first igb's state, a line to a question somebody has had
-/// to ask of a machine whose only console is this NIC.
-fn dump(_args: &str, out: &mut Output) {
-    let dev = match DEVICES[0].get() {
+/// `igbdump [n]`: an igb's state -- the first's, or the n-th's -- a line to
+/// a question somebody has had to ask of a machine whose only console is
+/// this NIC.
+fn dump(args: &str, out: &mut Output) {
+    let n = match args.trim() {
+        "" => 0,
+        word => match word.parse::<usize>() {
+            Ok(n) if n < MAX_DEVICES => n,
+            _ => {
+                let _ = writeln!(out, "usage: igbdump [n] (0..{})", MAX_DEVICES - 1);
+                return;
+            }
+        },
+    };
+    let dev = match DEVICES[n].get() {
         Some(dev) => *dev,
         None => {
-            let _ = writeln!(out, "igbdump: no igb");
+            let _ = writeln!(out, "igbdump: no igb {}", n);
             return;
         }
     };
@@ -1911,7 +2188,7 @@ fn dump(_args: &str, out: &mut Output) {
 
     let bit = |word: u32, mask: u32| (word & mask != 0) as u32;
 
-    let _ = writeln!(out, "part {}", if st.generation == Generation::I210 { "I210" } else { "82576" });
+    let _ = writeln!(out, "{}: part {} port {}", dev.name(), st.generation.as_str(), dev.port);
     let _ = writeln!(out, "ctrl 0x{:X} status 0x{:X} link {}", st.ctrl, st.status, bit(st.status, STATUS_LU));
     /* The PHY's own view, which is what tells a link the driver never brought
      * up apart from a cable that is not plugged in. */
