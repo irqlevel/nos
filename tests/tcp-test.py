@@ -94,8 +94,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tcg", action="store_true")
     ap.add_argument("--keep", action="store_true")
-    ap.add_argument("--nic", choices=["virtio", "igb"], default="virtio",
-                    help="the network card: igb is QEMU's 82576, which the Rust igb driver claims")
+    ap.add_argument("--nic", choices=["virtio", "igb", "e1000e"], default="virtio",
+                    help="the network card: igb is QEMU's 82576, which the Rust igb driver claims; "
+                         "e1000e is its 82574L, which the Rust e1000e driver claims")
     args = ap.parse_args()
 
     tmp = tempfile.mkdtemp(prefix="nos-tcp-")
@@ -114,7 +115,7 @@ def main():
         "-global", "virtio-mmio.force-legacy=false",
         "-drive", "file=%s,format=raw,id=hd0,if=none" % image,
         "-device", "virtio-blk-device,drive=hd0",
-        "-device", "igb,netdev=n0" if args.nic == "igb" else "virtio-net-device,netdev=n0",
+        "-device", "virtio-net-device,netdev=n0" if args.nic == "virtio" else args.nic + ",netdev=n0",
         "-netdev", "user,id=n0,hostfwd=udp::%d-:%d" % (SHELL_PORT, SHELL_PORT),
         "-serial", "file:" + log, "-display", "none"]
 
