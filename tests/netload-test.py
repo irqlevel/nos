@@ -51,7 +51,7 @@ and of the tick's receive poll, which nothing but `rxpoll=on` turns on:
   - booted without it, the tick has not polled once by the end of all that
   - booted again with it, the tick polls
 
-    tests/netload-test.py [--arch aarch64|x86_64] [--tcg] [--keep] [--nic igb]
+    tests/netload-test.py [--arch aarch64|x86_64] [--tcg] [--keep] [--nic igb|e1000e]
 
 All of that is arm64, because it drives the shell over UDP and the arm64
 boot is the one whose command line carries one. `--arch x86_64` is the
@@ -276,7 +276,7 @@ def qemu_argv(args, image, log, extra=""):
         "-global", "virtio-mmio.force-legacy=false",
         "-drive", "file=%s,format=raw,id=hd0,if=none" % image,
         "-device", "virtio-blk-device,drive=hd0",
-        "-device", "igb,netdev=n0" if args.nic == "igb" else "virtio-net-device,netdev=n0",
+        "-device", "virtio-net-device,netdev=n0" if args.nic == "virtio" else args.nic + ",netdev=n0",
         "-netdev", "user,id=n0,hostfwd=udp::%d-:%d,hostfwd=udp::%d-:%d" % (
             SHELL_PORT, SHELL_PORT, LOAD_PORT, LOAD_PORT),
         "-serial", "file:" + log, "-display", "none"]
@@ -326,7 +326,7 @@ def x86(args):
             "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
             "-drive", "file=%s,format=raw,id=drive0,if=none" % image,
             "-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off",
-            "-device", ("igb,netdev=net0" if args.nic == "igb"
+            "-device", (args.nic + ",netdev=net0" if args.nic != "virtio"
                         else "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off"),
             "-netdev", "user,id=net0,hostfwd=udp::%d-:%d" % (LOAD_PORT, LOAD_PORT)]
     if kvm:
@@ -407,8 +407,9 @@ def main():
     ap.add_argument("--arch", choices=["aarch64", "x86_64"], default="aarch64")
     ap.add_argument("--tcg", action="store_true")
     ap.add_argument("--keep", action="store_true")
-    ap.add_argument("--nic", choices=["virtio", "igb"], default="virtio",
-                    help="the network card: igb is QEMU's 82576, which the Rust igb driver claims")
+    ap.add_argument("--nic", choices=["virtio", "igb", "e1000e"], default="virtio",
+                    help="the network card: igb is QEMU's 82576, which the Rust igb driver claims; "
+                         "e1000e is its 82574L, which the Rust e1000e driver claims")
     args = ap.parse_args()
     if args.arch == "x86_64":
         return x86(args)
