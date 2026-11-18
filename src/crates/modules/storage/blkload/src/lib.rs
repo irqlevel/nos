@@ -10,7 +10,11 @@
 //!
 //! qd tasks each keep one I/O in flight, synchronously: the queue depth
 //! asked of the driver, which passes on as many as it has room for -- 8 at
-//! a time for virtio-blk, 63 for NVMe. What a driver takes in one I/O caps
+//! a time for virtio-blk, 63 for NVMe, 31 for a SATA disk with NCQ. With
+//! `aio` one task keeps qd in flight through the device's queue instead --
+//! started, kicked, reaped, as a VM's disk and NBS's chunk server have
+//! theirs (`kcore::block::DiskQueue`) -- which claims the device, a read's
+//! as a write's. What a driver takes in one I/O caps
 //! bs -- a page for virtio-blk, two for NVMe -- and past it the first I/O
 //! fails; blkload then finds the largest size that does go through and says
 //! so. Latency runs from submission to the task running again: the kernel's
@@ -35,13 +39,13 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use kcore::block::{Disk, DiskClaim};
+use kcore::block::{Disk, DiskClaim, DiskQueue, Started};
 use kcore::cmd::{Command, Output};
 use kcore::dma::DmaBuffer;
-use kcore::time::boot_time_ns;
+use kcore::time::{boot_time_ns, Duration};
 use latency::Histogram;
 
-const HELP: &str = "blkload <dev> [randread|randwrite|read|write] [bs=4k] [qd=1] [secs=5] [force] - disk load test";
+const HELP: &str = "blkload <dev> [randread|randwrite|read|write] [bs=4k] [qd=1] [secs=5] [aio] [force] - load test";
 const _: () = assert!(HELP.len() <= kcore::cmd::HELP_MAX, "`help` would cut it short");
 
 const PAGE_SIZE: u64 = 4096;
@@ -59,6 +63,14 @@ const MAX_BS: u64 = 512 * KIB;
 const MAX_QD: u64 = 64;
 const DEFAULT_SECS: u64 = 5;
 const MAX_SECS: u64 = 60;
+/* aio: how long a turn of the loop looks for a completion spinning before
+   it sleeps for one, and how long it waits for what it has out at the end */
+const AIO_POLL_US: u64 = 200;
+const AIO_SLEEP_MS: u64 = 10;
+const AIO_DRAIN_NS: u64 = 40 * NS_PER_SEC;
+/* How often the command, sleeping out the test, looks for a worker that
+   stopped it early */
+const WATCH_MS: u64 = 100;
 
 /* ext2's superblock is 1024 bytes in, and its magic 56 bytes into that */
 const EXT2_MAGIC_AT: usize = 1024 + 56;
@@ -108,6 +120,7 @@ struct Options<'a> {
     bs: u64,
     qd: u64,
     secs: u64,
+    aio: bool,
     force: bool,
 }
 
@@ -145,6 +158,7 @@ fn parse(args: &str) -> Result<Options<'_>, String> {
         bs: DEFAULT_BS,
         qd: 1,
         secs: DEFAULT_SECS,
+        aio: false,
         force: false,
     };
 
@@ -155,6 +169,7 @@ fn parse(args: &str) -> Result<Options<'_>, String> {
             "read" => (opts.pattern, opts.write) = (Pattern::Sequential, false),
             "write" => (opts.pattern, opts.write) = (Pattern::Sequential, true),
             "force" => opts.force = true,
+            "aio" => opts.aio = true,
             _ => {
                 let value = |v: Option<u64>| v.ok_or_else(|| format!("{}: not a number", word));
                 match word.split_once('=') {
@@ -393,6 +408,10 @@ fn run(args: &str, out: &mut Output) -> Result<(), String> {
         return Err(format!("{} is smaller than one block of {}", opts.device, Size(opts.bs)));
     }
 
+    if opts.aio {
+        return run_aio(&opts, disk, block_sectors, blocks, out);
+    }
+
     /* Held to the end of the test: no mount, disk log or other writer can take
        the device -- or a disk or partition overlapping it -- meanwhile */
     let claim = if opts.write {
@@ -461,6 +480,16 @@ fn run(args: &str, out: &mut Output) -> Result<(), String> {
                 }
             }
         }
+        /* The test slept out here, not in the joins: they then wait for each
+           worker's last request alone. A join of a whole test -- a minute at
+           most -- is one the kernel reports as stuck past ten seconds. */
+        while !shared.stop.load(Ordering::Relaxed) {
+            let now = boot_time_ns();
+            if now >= shared.deadline {
+                break;
+            }
+            kcore::task::sleep_ms(WATCH_MS.min((shared.deadline - now).div_ceil(NS_PER_MS)));
+        }
         tasks.len() as u64
     };
     let elapsed = boot_time_ns().saturating_sub(start).max(1);
@@ -488,6 +517,136 @@ fn run(args: &str, out: &mut Output) -> Result<(), String> {
         );
     }
 
+    Ok(())
+}
+
+/* aio: what one buffer's request is -- where it went, and since when */
+#[derive(Clone, Copy, Default)]
+struct Out {
+    offset: u64,
+    since: u64,
+    busy: bool,
+}
+
+/* aio: the test through the device's queue, from this task -- qd buffers,
+   each with a request out as long as the test runs, started again as it
+   comes back; then the stragglers waited for */
+fn run_aio(opts: &Options, disk: Disk, block_sectors: u64, blocks: u64, out: &mut Output) -> Result<(), String> {
+    let qd = opts.qd as usize;
+    let sector_size = disk.sector_size();
+    let bytes = (opts.bs as usize).div_ceil(PAGE_SIZE as usize) * PAGE_SIZE as usize;
+    let queue: DiskQueue = disk
+        .into_queue(opts.write, "blkload", qd, bytes)
+        .map_err(|e| format!("{} gives no queue: {}", opts.device, e))?;
+    if opts.write {
+        check_writable(&disk, opts)?;
+        for k in 0..qd {
+            if let Some(mut buf) = queue.lend(k) {
+                for (n, byte) in buf.iter_mut().enumerate() {
+                    *byte = (n ^ k) as u8;
+                }
+            }
+        }
+    }
+
+    let _ = writeln!(
+        out,
+        "blkload {}: {}, bs {}, qd {}, {} s over {}, through its queue",
+        opts.device,
+        opts.mode(),
+        Size(opts.bs),
+        opts.qd,
+        opts.secs,
+        Size(disk.sectors() * sector_size)
+    );
+
+    let seed = kcore::random::random_u64().unwrap_or(0x9E37_79B9_7F4A_7C15);
+    let mut rng = Rng::new(seed, 0);
+    let mut cursor = 0u64;
+    let mut outs: Vec<Out> = Vec::new();
+    outs.try_reserve_exact(qd).map_err(|_| String::from("no memory for the test"))?;
+    outs.resize(qd, Out::default());
+    let mut stats = Stats::new();
+    let mut ready: Vec<usize> = (0..qd).collect();
+    let mut came: Vec<usize> = Vec::new();
+    came.try_reserve_exact(qd).map_err(|_| String::from("no memory for the test"))?;
+
+    let start = boot_time_ns();
+    let deadline = start + opts.secs * NS_PER_SEC;
+    loop {
+        let now = boot_time_ns();
+        let going = now < deadline && stats.error_at.is_none();
+        if going {
+            for k in ready.drain(..) {
+                let block = if opts.pattern == Pattern::Random {
+                    rng.next() % blocks
+                } else {
+                    let b = cursor % blocks;
+                    cursor += 1;
+                    b
+                };
+                let offset = block * block_sectors * sector_size;
+                outs[k] = Out { offset, since: boot_time_ns(), busy: true };
+                match queue.start(k, opts.write, offset, opts.bs as usize) {
+                    Ok(Started::InFlight) => {}
+                    Ok(Started::Done) => {
+                        /* The device has no asynchronous path: done here */
+                        stats.record(boot_time_ns().saturating_sub(outs[k].since));
+                        outs[k].busy = false;
+                        came.push(k);
+                    }
+                    Err(_) => {
+                        outs[k].busy = false;
+                        stats.error_at = Some(offset / sector_size);
+                    }
+                }
+            }
+            ready.append(&mut came);
+            queue.kick();
+        }
+
+        let reaped = queue.reap(|k, ok| {
+            if let Some(o) = outs.get_mut(k) {
+                stats.record(boot_time_ns().saturating_sub(o.since));
+                if !ok && stats.error_at.is_none() {
+                    stats.error_at = Some(o.offset / sector_size);
+                }
+                o.busy = false;
+                came.push(k);
+            }
+        });
+        let busy = outs.iter().filter(|o| o.busy).count();
+        if !going {
+            came.clear();
+            if busy == 0 {
+                break;
+            }
+            if boot_time_ns().saturating_sub(deadline) > AIO_DRAIN_NS {
+                let _ = writeln!(out, "  {} requests still out {} s past the end: left to the queue's close", busy,
+                    AIO_DRAIN_NS / NS_PER_SEC);
+                break;
+            }
+        }
+        ready.append(&mut came);
+        if reaped == 0 && busy != 0 && !queue.poll(Duration::from_nanos(AIO_POLL_US * NS_PER_US)) {
+            let _ = queue.wait(Duration::from_nanos(AIO_SLEEP_MS * NS_PER_MS));
+        }
+    }
+    let elapsed = boot_time_ns().saturating_sub(start).max(1);
+    report(out, opts, &disk, &stats, elapsed);
+
+    if opts.write {
+        let begin = boot_time_ns();
+        let flushed = queue.flush();
+        let took = boot_time_ns().saturating_sub(begin);
+        let _ = writeln!(
+            out,
+            "  flush {} in {}.{:03} ms",
+            if flushed.is_ok() { "done" } else { "FAILED" },
+            took / NS_PER_MS,
+            (took % NS_PER_MS) / NS_PER_US
+        );
+    }
     Ok(())
 }
 

@@ -35,6 +35,13 @@ working disk to everything above. So, four disks:
 - the fourth (hdd, add) is a GPT disk, as the servers' Ubuntu disks are: its
   partitions found, and not one byte of it changed.
 
+With `--controller ahci` two more disks are on the HBA's last ports: an
+ext4 the host made with the build's blkload.ko on it, and a blank one. The
+module is loaded from the first and drives the GPT disk's reads and the
+blank disk's writes through NCQ eight at a time, by tasks and through the
+device's queue (`blkload ... aio`, the asynchronous path a VM's disk and
+NBS take): every request has to come back, none failed.
+
 At power-off every ATA disk is flushed and put in standby, and says so.
 
     make nos-test.iso TEST_ISO_ARGS=udpshell=9100
@@ -111,12 +118,22 @@ LAYOUTS = {
         "ssd_where": "port 1: ",
         "cd": "port 2: a packet device",
         "gpt_where": "port 3: ",
+        "extra": ("bus=ide.4", "bus=ide.5"),
+        "extra_names": ("ade", "adf"),
     },
 }
+
+# The extra disks' sizes: the modules' ext4, and the blank one the queue's
+# writes go to
+MODS_BYTES = 16 << 20
+BLANK_BYTES = 64 << 20
 
 # A failed command's line, as either driver says it: the device's status
 # with ERR set (an odd number), and its error register
 STATUS_SAID = re.compile(r"status 0x[0-9a-f]*[13579bdf] error 0x[0-9a-f]+")
+# What `crc32` says of a file: its CRC, in hex with no leading zeros, and its
+# length
+CRC_SAID = re.compile(r"crc32 0x([0-9A-Fa-f]+), (\d+) bytes")
 
 # blkdebug's rules: an EIO for any read or write that covers BAD
 BLKDEBUG_CONF = """[inject-error]
@@ -200,8 +217,25 @@ def read_sector(sh, disk, lba):
 
 def paths(tmp):
     return {n: os.path.join(tmp, f) for n, f in (("big", "big.raw"), ("ssd", "ssd.raw"), ("gpt", "gpt.raw"),
-                                                  ("conf", "blkdebug.conf"), ("www", "www"))}
+                                                  ("conf", "blkdebug.conf"), ("www", "www"), ("mods", "mods.raw"),
+                                                  ("modsdir", "mods"), ("blank", "blank.raw"))}
 
+
+def make_mods(files):
+    """An ext4 with the build's blkload.ko on it, made as every gate makes
+    nos an ext4 (scripts/mkrootfs.sh: the features nos's driver mounts): None
+    where it could be, what went wrong where not."""
+    ko = os.path.join(ROOT, "out", "x86_64", "modules", "blkload.ko")
+    if not os.path.exists(ko):
+        return "no %s -- build the kernel first" % ko
+    os.mkdir(files["modsdir"])
+    with open(ko, "rb") as src, open(os.path.join(files["modsdir"], "blkload.ko"), "wb") as dst:
+        dst.write(src.read())
+    made = subprocess.run([os.path.join(ROOT, "scripts", "mkrootfs.sh"), files["mods"], str(MODS_BYTES >> 20),
+                           files["modsdir"]], capture_output=True, text=True, env=dict(os.environ, LABEL="mods"))
+    if made.returncode != 0:
+        return "mkrootfs.sh failed: " + (made.stdout + made.stderr)[-400:]
+    return None
 
 class Quiet(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *args):
@@ -214,6 +248,42 @@ def serve(root):
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Quiet, directory=root))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, server.server_address[1]
+
+
+def extra_disks(layout, files):
+    """The HBA's last two ports, with --controller ahci: the modules' ext4
+    and the blank disk."""
+    if "extra" not in layout:
+        return []
+    mods_at, blank_at = layout["extra"]
+    return ["-drive", "if=none,id=d4,format=raw,file=" + files["mods"],
+            "-device", "ide-hd,drive=d4,%s,rotation_rate=1,model=%s,serial=NOSATAMODS" % (mods_at, SSD_MODEL),
+            "-drive", "if=none,id=d5,format=raw,file=" + files["blank"],
+            "-device", "ide-hd,drive=d5,%s,rotation_rate=1,model=%s,serial=NOSATABLANK" % (blank_at, SSD_MODEL)]
+
+
+def queue_checks(layout, sh):
+    """blkload, from the modules' ext4 -- which the boot, finding no root on
+    disk, has on /boot (rootfs's fallback: the first of the ext family found,
+    read-only): the GPT disk read and the blank one written eight at a time,
+    by tasks and through the device's queue."""
+    if "extra" not in layout:
+        return
+    mods, blank = layout["extra_names"]
+    gpt = layout["names"][3]
+    mounts = sh.run("mounts")
+    out = sh.run("insmod /boot/blkload.ko")
+    loaded = "blkload" in sh.run("lsmod")
+    pt.check("blkload loads from the modules' ext4, which the boot has on /boot",
+             "/boot" in mounts and mods in mounts and loaded, mounts + out)
+    for disk, mode, how in ((gpt, "randread", "aio"), (gpt, "randread", ""), (blank, "randwrite", "aio"),
+                            (blank, "read", "aio"), (blank, "randwrite", "")):
+        got = sh.run("blkload %s %s bs=16k qd=8 secs=2 %s" % (disk, mode, how))
+        ios = re.search(r"(\d+) ios in", got)
+        through = ("through its queue" in got) == (how == "aio")
+        pt.check("%s %s eight at a time%s: every request back, none failed" %
+                 (disk, mode, " through its queue" if how else " by tasks"),
+                 ios is not None and int(ios.group(1)) > 0 and "error" not in got and through, got)
 
 
 def qemu(args, layout, files, log):
@@ -232,7 +302,8 @@ def qemu(args, layout, files, log):
             "-drive", "if=none,id=cd,format=raw,media=cdrom,readonly=on,file=" + args.iso,
             "-device", "ide-cd,drive=cd,%s,bootindex=0" % cd_at,
             "-drive", "if=none,id=d3,format=raw,file=" + files["gpt"],
-            "-device", "ide-hd,drive=d3,%s,rotation_rate=1,model=%s,serial=NOSATASSD3" % (gpt_at, SSD_MODEL),
+            "-device", "ide-hd,drive=d3,%s,rotation_rate=1,model=%s,serial=NOSATASSD3" % (gpt_at, SSD_MODEL)] + \
+           extra_disks(layout, files) + [
             # A filesystem's UUID needs the random pool, and under TCG nothing
             # else seeds it: no RDRAND on this CPU, a cycle counter too even
             # for the jitter collector
@@ -279,6 +350,11 @@ def fault_log_checks(layout, sh):
              len(said) >= 2 and all(STATUS_SAID.search(l) for l in said), "\n".join(said[-4:]))
     given_up = [l for l in sh.run("dmesg 4000 refused").splitlines() if "the disk is failed" in l]
     pt.check("and no disk is given up on", not given_up, "\n".join(given_up))
+    # How the port was taken back -- the NCQ error log naming the command,
+    # or a reset and each sent again alone -- is QEMU's emulation's to say:
+    # shown for the record, not held to one
+    taken = [l for l in sh.run("dmesg 400 %s:" % big).splitlines() if driver + ":" in l and "udpshell" not in l]
+    print("  what %s said of %s:\n    %s" % (driver, big, "\n    ".join(taken[-8:]) if taken else "nothing"))
 
 
 def shell_checks(layout, sh, port, crc):
@@ -312,11 +388,13 @@ def shell_checks(layout, sh, port, crc):
     out += sh.run("cp /ata/big.bin /ata/copy.bin")
     out += sh.run("umount /ata")
     out += sh.run("mount ext4 %s /ata" % ssd)
-    want = "crc32 0x%08X, %d bytes" % (crc, BIG_FILE_BYTES)
     for name in ("big.bin", "copy.bin"):
         got = sh.run("crc32 /ata/%s" % name)
+        said = CRC_SAID.search(got)
         pt.check("a %d-byte file %s there reads back, mounted again, as it was served" %
-                 (BIG_FILE_BYTES, "fetched" if name == "big.bin" else "copied"), want in got, out + got)
+                 (BIG_FILE_BYTES, "fetched" if name == "big.bin" else "copied"),
+                 said is not None and int(said.group(1), 16) == crc and int(said.group(2)) == BIG_FILE_BYTES,
+                 "%s\nwanted crc32 %#x, %d bytes" % (out + got, crc, BIG_FILE_BYTES))
 
     text = "polled-from-the-sata-driver"
     sh.run("write /ata/hello.txt %s" % text)
@@ -399,6 +477,11 @@ def main():
     pt.sparse(files["ssd"], SSD_BYTES)
     pt.gpt_image(files["gpt"])
     gpt_before = sha256(files["gpt"])
+    if "extra" in layout:
+        why = make_mods(files)
+        if why:
+            sys.exit(why)
+        pt.sparse(files["blank"], BLANK_BYTES)
     os.mkdir(files["www"])
     served_path = os.path.join(files["www"], "big.bin")
     with open(served_path, "wb") as f:
@@ -418,6 +501,7 @@ def main():
         sh = pt.Shell(timeout=120)
         text = shell_checks(layout, sh, port, crc)
         fault_log_checks(layout, sh)
+        queue_checks(layout, sh)
         try:
             sh.sock.settimeout(5)
             sh.run("poweroff")
