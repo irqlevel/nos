@@ -107,6 +107,14 @@ const DISK_IO_BASE: u16 = 0xC000;
 const NIC_IO_BASE: u16 = DISK_IO_BASE + (MAX_DISKS as u16) * (blk::BAR_SIZE as u16);
 const DISK_IRQ: u8 = 11;
 const NIC_IRQ: u8 = 10;
+/// The line a host's function's INTx pin is said to be wired to, in the MP
+/// table and the DSDT: never raised -- the function's interrupt is its MSI,
+/// its INTx off at the device -- but there, for a driver that wants a legacy
+/// IRQ to exist (NVIDIA's). Free on a PC, and on the master PIC.
+const HOST_IRQ: u8 = 5;
+/// What the 64-bit window the DSDT gives a host's functions' BARs is
+/// rounded up to, past the last of them (`write_firmware`).
+const BARS64_ROUNDING: u64 = 1 << 30;
 /// Where a device's MSI-X table page is, for a guest of more than one CPU:
 /// this plus a page for its PCI slot -- in the platform's MMIO window, clear
 /// of the local APIC's page, the IO-APIC's address the MP table gives, and
@@ -1619,7 +1627,7 @@ impl LinuxGuest {
         if bsp.index != 0 || self.loaded || layout.low_end != self.low_end {
             return Err(Error::BadAddress);
         }
-        let mut routes = [acpi::Route::default(); MAX_DISKS + MAX_NICS];
+        let mut routes = [acpi::Route::default(); pci::MAX_SLOTS];
         let (n, msix) = self.pci_routes(&mut routes)?;
         let ioapic = self.has_ioapic();
         let firmware = self.write_firmware(&routes[..n], msix, ioapic)?;
@@ -1643,7 +1651,7 @@ impl LinuxGuest {
         if !bsp.cpu.backend().runs_real_mode() {
             return Err(Error::NoUnrestrictedGuest);
         }
-        let mut routes = [acpi::Route::default(); MAX_DISKS + MAX_NICS];
+        let mut routes = [acpi::Route::default(); pci::MAX_SLOTS];
         let (n, msix) = self.pci_routes(&mut routes)?;
         let ioapic = self.has_ioapic();
         let firmware = self.write_firmware(&routes[..n], msix, ioapic)?;
@@ -1654,16 +1662,19 @@ impl LinuxGuest {
     }
 
     /// Each device on the bus with the IRQ its INTA is wired to, into
-    /// `routes`: how many, and whether any function has an MSI-X table.
+    /// `routes` -- a host's function's to one nothing raises (`HOST_IRQ`):
+    /// how many, and whether any function has an MSI-X table.
     fn pci_routes(&self, routes: &mut [acpi::Route]) -> Result<(usize, bool)> {
         let p = self.platform.lock();
         let mut n = 0;
-        for (i, d) in p.pci_devs.iter().enumerate() {
-            let irq = match d {
+        let devices = p.pci_devs.iter().enumerate().map(|(i, d)| {
+            (i + 1, match d {
                 PciDev::Disk(_) => DISK_IRQ,
                 PciDev::Nic(_) => NIC_IRQ,
-            };
-            let (Some(route), Ok(slot)) = (routes.get_mut(n), u8::try_from(i + 1)) else {
+            })
+        });
+        for (slot, irq) in devices.chain(p.hosts.iter().map(|h| (h.slot, HOST_IRQ))) {
+            let (Some(route), Ok(slot)) = (routes.get_mut(n), u8::try_from(slot)) else {
                 return Err(Error::BadAddress);
             };
             *route = acpi::Route { slot, irq };
@@ -1684,10 +1695,18 @@ impl LinuxGuest {
          * an OS keeps a BAR inside one where firmware put it */
         let (bars32, bars64) = match self.windows {
             /* Either empty where the guest's addresses end short of it -- a
-             * CPUID of few address bits -- and said as none */
-            Some((_, w)) => (
+             * CPUID of few address bits -- and said as none. The 64-bit one
+             * only as far as the BARs placed in it reach, a GiB at a time:
+             * the rest of the guest's addresses are its OS's own -- Linux's
+             * HMM takes a GPU's VRAM's worth of them for device memory
+             * (NVIDIA's UVM), and with a window to the top of them none was
+             * left, and CUDA was refused */
+            Some((placed, w)) => (
                 u32::try_from(w.low).ok().zip(w.low_end.checked_sub(w.low).and_then(|n| u32::try_from(n).ok())),
-                w.high_end.checked_sub(w.high).filter(|&n| n != 0).map(|n| (w.high, n)),
+                placed.high.checked_sub(w.high).filter(|&n| n != 0).map(|n| {
+                    let room = w.high_end.saturating_sub(w.high);
+                    (w.high, n.div_ceil(BARS64_ROUNDING).saturating_mul(BARS64_ROUNDING).min(room))
+                }),
             ),
             None => (None, None),
         };
