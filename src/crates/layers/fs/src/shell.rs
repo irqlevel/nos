@@ -6,6 +6,9 @@
 //! them -- `tests/ext2-test.py` and `tests/ext4-test.py` drive the
 //! filesystem entirely through these commands.
 
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use core::fmt::Write;
 
 use block::Disk;
@@ -118,6 +121,101 @@ pub fn umount(args: &str, out: &mut Output) {
 
 pub fn mounts(_args: &str, out: &mut Output) {
     files::dump_mounts(out);
+}
+
+/// How big each mounted filesystem is, what of it is used and what is free
+/// -- or, given paths, the filesystem each is on, whether the path is there
+/// yet or not. From what the filesystem counts in memory
+/// (`FileSystem::space`): ext2 and ext4 count, a ramfs and procfs do not,
+/// and their numbers are `-`. Sizes to a tenth of their unit, rounded down,
+/// the share used rounded up as df(1) rounds it; the bytes themselves are
+/// `mgmt call fs mounts`'.
+pub fn df(args: &str, out: &mut Output) {
+    let Some(vfs) = vfs_instance() else { return };
+    let mut rows: Vec<[String; DF_COLUMNS]> = Vec::new();
+    let mut paths = args_of(args).peekable();
+    if paths.peek().is_none() {
+        for m in vfs.mount_infos().iter().flatten() {
+            rows.push(df_row(m));
+        }
+    }
+    for p in paths {
+        match vfs.mount_info_of(p.as_bytes()) {
+            Some(m) => rows.push(df_row(&m)),
+            None => {
+                let _ = writeln!(out, "df: {}: no filesystem holds it", p);
+            }
+        }
+    }
+    if rows.is_empty() {
+        return;
+    }
+
+    /* The first three columns to the left, the numbers to the right, each
+       as wide as its widest */
+    let mut width = DF_HEADER.map(str::len);
+    for row in &rows {
+        for (w, cell) in width.iter_mut().zip(row.iter()) {
+            *w = (*w).max(cell.len());
+        }
+    }
+    let header = DF_HEADER.map(String::from);
+    for row in core::iter::once(&header).chain(rows.iter()) {
+        let mut line = String::new();
+        for (i, (cell, w)) in row.iter().zip(width).enumerate() {
+            if i > 0 {
+                line.push_str("  ");
+            }
+            let _ = if i < 3 { write!(line, "{:<w$}", cell, w = w) } else { write!(line, "{:>w$}", cell, w = w) };
+        }
+        let _ = writeln!(out, "{}", line.trim_end());
+    }
+}
+
+const DF_COLUMNS: usize = 7;
+const DF_HEADER: [&str; DF_COLUMNS] = ["mount", "type", "device", "size", "used", "free", "use%"];
+
+/// A mount's line of `df`.
+fn df_row(m: &crate::vfs::MountInfo) -> [String; DF_COLUMNS] {
+    let device = Disk::from_handle(m.device).map_or("-", |disk| disk.name());
+    let (size, used, free, share) = match m.space {
+        Some(s) => {
+            let used = s.total_bytes.saturating_sub(s.free_bytes);
+            (human(s.total_bytes), human(used), human(s.free_bytes), share_used(used, s.total_bytes))
+        }
+        None => ("-".to_string(), "-".to_string(), "-".to_string(), "-".to_string()),
+    };
+    [core::str::from_utf8(m.path()).unwrap_or("?").to_string(), m.fs_name.to_string(), device.to_string(), size, used,
+     free, share]
+}
+
+/// `bytes` as df -h says them: bytes below a KiB, and above that a tenth of
+/// the largest unit -- K, M, G, T, P, of 1024 each -- there is one of,
+/// rounded down: 1536 is 1.5K.
+fn human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["K", "M", "G", "T", "P"];
+    const KIB: u64 = 1024;
+    if bytes < KIB {
+        return format!("{}B", bytes);
+    }
+    let (mut unit, mut scale) = (0, KIB);
+    while unit + 1 < UNITS.len() && bytes / scale >= KIB {
+        unit += 1;
+        scale *= KIB;
+    }
+    let tenths = u128::from(bytes) * 10 / u128::from(scale);
+    format!("{}.{}{}", tenths / 10, tenths % 10, UNITS[unit])
+}
+
+/// The share of `total` that `used` is, in per cent rounded up -- a
+/// filesystem with a byte used is not said to be 0% used -- or `-` for a
+/// filesystem of no size.
+fn share_used(used: u64, total: u64) -> String {
+    if total == 0 {
+        return "-".to_string();
+    }
+    let percent = (u128::from(used) * 100).div_ceil(u128::from(total));
+    format!("{}%", percent)
 }
 
 /* ---- files and directories ---- */
@@ -491,6 +589,7 @@ pub fn register_all() {
         ("mount", "mount <ramfs|ext2|ext4> ... - mount filesystem", mount),
         ("umount", "umount <path> - unmount filesystem", umount),
         ("mounts", "mounts - list mount points", mounts),
+        ("df", "df [path...] - each filesystem's size, used and free, or the one a path is on", df),
         ("ls", "ls [path] - list directory (default /)", ls),
         ("find", "find [path...] [expression] - files and directories under a path, by name, type, size", crate::find::find),
         ("cat", "cat <path> - show file content", cat),

@@ -1925,11 +1925,11 @@ drive. So `disks` gives each device an id, and a vm.toml keeps that:
 
 ```
 > disks
-vda  131072 sectors (64 MB)  512 bytes/sector
-nvme0  131072 sectors (64 MB)  512 bytes/sector  disk:nvme-QEMU_NVMe_Ctrl_nosdevtesta
-nvme1  131072 sectors (64 MB)  512 bytes/sector  disk:nvme-QEMU_NVMe_Ctrl_nosdevtestb
-nvme01  16384 sectors (8 MB)  512 bytes/sector  part:6e6f7364-6576-0000-0000-000000000001
-nvme02  32768 sectors (16 MB)  512 bytes/sector  part:6e6f7364-6576-0000-0000-000000000002
+vda     131072 sectors (64 MB)  512 bytes/sector
+nvme0   131072 sectors (64 MB)  512 bytes/sector  disk:nvme-QEMU_NVMe_Ctrl_nosdevtesta
+nvme1   131072 sectors (64 MB)  512 bytes/sector  disk:nvme-QEMU_NVMe_Ctrl_nosdevtestb
+nvme01   16384 sectors (8 MB)   512 bytes/sector  part:6e6f7364-6576-0000-0000-000000000001
+nvme02   32768 sectors (16 MB)  512 bytes/sector  part:6e6f7364-6576-0000-0000-000000000002
 ```
 
 A partition is `part:` and its GPT unique GUID, as Linux's PARTUUID writes

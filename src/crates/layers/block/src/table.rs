@@ -1292,20 +1292,40 @@ pub fn dump(_args: &str, out: &mut Output) {
         return;
     }
 
+    /* Each column as wide as its widest -- the name, the sectors, the size
+     * in MB, the sector's bytes -- the devices looked through for the widths
+     * first, then listed. The words are what they always were, in the order
+     * they were, only spaced out: "<n> sectors (<m> MB)" is read whole by
+     * the tests and the tools that look for a disk by its size. */
+    let mut width = [0usize; 4];
     for index in 0..devices {
-        let handle = at(index);
-        let dev = match device(handle) {
-            Some(dev) => dev,
-            None => continue,
-        };
+        let Some(dev) = device(at(index)) else { continue };
+        let cells = disk_cells(&dev);
+        for (w, cell) in width.iter_mut().zip(cells.iter()) {
+            *w = (*w).max(cell.len());
+        }
+    }
 
-        let bytes = dev.capacity.saturating_mul(dev.sector_size);
-        let _ = write!(out, "{}  {} sectors ({} MB)  {} bytes/sector",
-            core::str::from_utf8(dev.name()).unwrap_or("?"),
-            dev.capacity, bytes / (1024 * 1024), dev.sector_size);
+    for index in 0..devices {
+        let Some(dev) = device(at(index)) else { continue };
+        let [name, sectors, mb, sector] = disk_cells(&dev);
+        let _ = write!(out, "{:<w0$}  {:>w1$} sectors {:<w2$}  {:>w3$} bytes/sector", name, sectors, mb, sector,
+                       w0 = width[0], w1 = width[1], w2 = width[2], w3 = width[3]);
         let _ = match dev.ident.as_deref() {
             Some(id) => writeln!(out, "  {}", id),
             None => writeln!(out),
         };
     }
+}
+
+/// What `disks` says of a device, a cell a column: its name, its sectors,
+/// its size in MB in brackets, and the bytes of a sector.
+fn disk_cells(dev: &Device) -> [alloc::string::String; 4] {
+    let bytes = dev.capacity.saturating_mul(dev.sector_size);
+    [
+        alloc::string::String::from(core::str::from_utf8(dev.name()).unwrap_or("?")),
+        alloc::format!("{}", dev.capacity),
+        alloc::format!("({} MB)", bytes / (1024 * 1024)),
+        alloc::format!("{}", dev.sector_size),
+    ]
 }
