@@ -58,6 +58,8 @@ extern "C" void rust_ipc_stop();
 /* The disk log is Rust (src/crates/layers/block/src/disklog.rs). */
 extern "C" int rust_disklog_setup();
 extern "C" void rust_disklog_stop();
+extern "C" void rust_ahci_start();
+extern "C" void rust_ahci_stop();
 extern "C" void rust_test();
 extern "C" void rust_fini(int power_off);
 /* The random pool is Rust (src/crates/base/random), the x86 twin's counterpart */
@@ -379,6 +381,7 @@ static void bp_startup_arm(void* ctx)
     /* Partitions and the root filesystem: here, not next to the virtio
        bring-up, because a block request completes through the BLK_IO soft
        IRQ, and the NVMe disks came up in rust_init (see kernel/main.cpp) */
+    rust_ahci_start();
     rust_partitions_probe();
     rust_mount_root_fs();
     /* The pool's sources asked again and the seed the last boot kept on
@@ -467,6 +470,7 @@ static void bp_startup_arm(void* ctx)
                and the log switches off -- after SoftIrq::stop() a write
                through a virtio disk would wait for ever. */
             rust_disklog_stop();
+            rust_ahci_stop();
 
             /* The netconsole after all of them, with the halt's own lines
                (as in kernel/main.cpp), before the soft IRQs stop. */
