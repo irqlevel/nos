@@ -1,13 +1,26 @@
 #!/bin/bash
 # nos-install: pour a nos system image onto a partition of this machine and
-# boot nos from it through this machine's own GRUB (docs/install.md).
+# boot nos from it through this machine's own GRUB -- or onto a whole disk,
+# which then boots nos alone (docs/install.md).
 #
 #   nos-install install <partition> [options]    put the image on <partition>
+#   nos-install disk <disk> [options]            make <disk> nos's own
+#   nos-install disks                            the disks here, for disk
 #   nos-install update [<partition>] [options]   a new image over the one there
 #   nos-install rollback [<partition>]           back to the image before it
 #   nos-install boot [<partition>] [--reboot]    boot nos once, the next time
 #   nos-install status [<partition>]             what is installed and armed
 #   nos-install uninstall                        take nos out of GRUB's menu
+#
+# Options of disk, besides install's (but --format and --boot-once):
+#   --root-size SIZE      nos's root: 10G unless given (M, G or T; "all" for
+#                         the whole disk). The rest of the disk is left as a
+#                         partition with nothing on it, nos-data: for the
+#                         VMs' disks and NBS
+#   --wipe                erase what the disk holds -- a partition table, a
+#                         filesystem, any data: refused without it
+#   --dry-run             check everything, say what would be written, and
+#                         write nothing
 #
 # Options of install and update:
 #   --image FILE          the image (nos-x86_64.squashfs); by default the one
@@ -38,6 +51,15 @@
 #
 # <partition> is named on install; afterwards the GRUB entry names it
 # (/etc/grub.d/42_nos). Runs under Linux, as root, on the machine itself.
+#
+# Disk makes a whole disk nos's, the server's own system gone or elsewhere:
+# what an installer from an ISO or a provider's rescue system runs. A GPT --
+# GRUB's core image for BIOS, an EFI System partition, nos's root, the rest
+# blank -- and GRUB installed onto it for BIOS and for UEFI both (the EFI
+# one at the path firmware boots with no boot entry), with a grub.cfg of its
+# own on the root that boots nos by default. Nothing of this machine's own
+# GRUB is touched. Update, rollback, boot and status find such a root by
+# itself (or take it named); uninstall has nothing to take out.
 #
 # Install pours the image onto a plain partition as an ext4 filesystem --
 # or the ext2 one an install before ext4 made, kept as it is -- that
@@ -102,6 +124,24 @@ PANEL_RC=(
 # hands the panel (panel/src/lib/auth.ts checks it), N=2^15, r=8, p=1
 PANEL_PASS=etc/api/panel.pass
 PANEL_PORT=39233
+# A disk of nos's own (disk): GPT's partition types
+GPT_BIOS_BOOT=21686148-6449-6E6F-744E-656564454649
+GPT_ESP=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+GPT_LINUX=0FC63DAF-8483-4772-8E79-3D69D8477DE4
+# ... and its layout, in MiB: a MiB left for the GPT, GRUB's core image for
+# BIOS, the EFI System partition, nos's root, then the rest -- where it is
+# worth a partition -- and a MiB at the end for the GPT's copy
+MIB=1048576
+BIOS_BOOT_MIB=1
+ESP_MIB=512
+ROOT_SIZE_DEFAULT=10G
+ROOT_MIN_MIB=256
+DATA_MIN_MIB=1024
+ESP_LABEL=NOS-EFI
+DATA_NAME=nos-data
+# The first line of the grub.cfg disk writes on the root: what says a root
+# is a disk of nos's own, whose GRUB boots nothing else
+STANDALONE_MARK="# nos: this disk's own GRUB configuration, written by nos-install disk"
 
 die() { echo "nos-install: $*" >&2; exit 1; }
 warn() { echo "nos-install: WARNING: $*" >&2; }
@@ -242,28 +282,44 @@ check_partition() {
     esac
 }
 
+# What keeps nos from reading $1, said in a line -- nothing when its
+# controller is one nos drives: NVMe, virtio, and SATA in IDE mode or behind
+# AHCI
+disk_controller_problem() {
+    local dev=$1 path pci class
+    [ "${NOS_ALLOW_ANY_DISK:-0}" != 1 ] || return 0
+    path=$(readlink -f "/sys/class/block/$(basename "$(readlink -f "$dev")")")
+    case "$path" in
+        */nvme/*|*/virtio*) ;;
+        */ata[0-9]*/*)
+            # nos's ata driver takes a disk behind a PCI IDE controller --
+            # class 0101: SATA in IDE mode, as a BIOS may leave an ICH, or
+            # parallel ATA -- and its ahci driver one behind an AHCI HBA
+            # (0106, interface 01); not one behind a RAID controller (0104).
+            # The controller is the last PCI function on the device's path.
+            pci=$(printf '%s\n' "$path" | grep -o '/[0-9a-f]\{4\}:[0-9a-f]\{2\}:[0-9a-f]\{2\}\.[0-7]' | tail -n 1 || true)
+            class=$(cat "/sys/bus/pci/devices$pci/class" 2>/dev/null || true)
+            case "$class" in
+                0x0101*|0x010601) ;;
+                *) echo "$dev is on a SATA controller nos does not drive (PCI class ${class:-unknown}: RAID, where nos takes IDE mode and AHCI)" ;;
+            esac ;;
+        *) echo "$dev is not on an NVMe, a virtio or a SATA disk (IDE mode or AHCI), which is all nos reads" ;;
+    esac
+}
+
 # Warnings, not refusals: GRUB boots nos from anything the firmware reads,
-# but what nos does after that depends on what it has drivers for
+# but what nos does after that depends on what it has drivers for. A disk
+# that is to be nos's own ("disk" as the second argument) is refused,
+# though: its root there is all nos would have
 check_hardware() {
-    local dev=$1 path pci class d id found=
-    if [ "${NOS_ALLOW_ANY_DISK:-0}" != 1 ]; then
-        path=$(readlink -f "/sys/class/block/$(basename "$(readlink -f "$dev")")")
-        case "$path" in
-            */nvme/*|*/virtio*) ;;
-            */ata[0-9]*/*)
-                # nos's ata driver takes a disk behind a PCI IDE controller --
-                # class 0101: SATA in IDE mode, as a BIOS may leave an ICH, or
-                # parallel ATA -- and its ahci driver one behind an AHCI HBA
-                # (0106, interface 01); not one behind a RAID controller (0104).
-                # The controller is the last PCI function on the device's path.
-                pci=$(printf '%s\n' "$path" | grep -o '/[0-9a-f]\{4\}:[0-9a-f]\{2\}:[0-9a-f]\{2\}\.[0-7]' | tail -n 1 || true)
-                class=$(cat "/sys/bus/pci/devices$pci/class" 2>/dev/null || true)
-                case "$class" in
-                    0x0101*|0x010601) ;;
-                    *) warn "$dev is on a SATA controller nos does not drive (PCI class ${class:-unknown}: RAID, where nos takes IDE mode and AHCI): GRUB will load the kernel from it, but nos will not find its root on it -- no modules, no /etc/rc, no sshd" ;;
-                esac ;;
-            *) warn "$dev is not on an NVMe, a virtio or a SATA disk (IDE mode or AHCI), which is all nos reads: GRUB will load the kernel from it, but nos will not find its root on it -- no modules, no /etc/rc, no sshd" ;;
-        esac
+    local dev=$1 mode=${2:-partition} problem d id found=
+    problem=$(disk_controller_problem "$dev")
+    if [ -n "$problem" ]; then
+        problem="$problem: GRUB will load the kernel from it, but nos will not find its root on it -- no modules, no /etc/rc, no sshd"
+        if [ "$mode" = disk ]; then
+            die "$problem"
+        fi
+        warn "$problem"
     fi
 
     # The network is a server's only console. The parts nos's drivers claim:
@@ -382,15 +438,45 @@ registered_uuid() {
     sed -n 's/^set nos_uuid=\([0-9a-fA-F-]*\)$/\1/p' "$SNIPPET" | head -n 1
 }
 
+# The partition named; else the one the GRUB entry names; else, on a
+# machine with no entry -- a rescue system's, an installer's -- the root of
+# the one disk of nos's own here
 resolve_partition() {
     if [ -n "$PART" ]; then
         return
     fi
     local uuid
     uuid=$(registered_uuid)
-    [ -n "$uuid" ] || die "no partition named, and no GRUB entry ($SNIPPET) to take one from"
+    if [ -z "$uuid" ]; then
+        find_standalone_root
+        return
+    fi
     PART=$(blkid -U "$uuid" 2>/dev/null || true)
     [ -n "$PART" ] || die "the GRUB entry names UUID $uuid, and no partition has it"
+}
+
+# Whether $1 is the root of a disk of nos's own: its grub.cfg is the one
+# disk wrote. Read with debugfs, which mounts nothing -- a mount of an ext4
+# would replay its journal
+is_standalone() {
+    command -v debugfs >/dev/null 2>&1 || return 1
+    [ "$(debugfs -R "cat /boot/grub/grub.cfg" "$1" 2>/dev/null | head -n 1)" = "$STANDALONE_MARK" ]
+}
+
+find_standalone_root() {
+    local dev found=()
+    while IFS= read -r dev; do
+        [ -n "$dev" ] || continue
+        if is_standalone "$dev"; then
+            found+=("$dev")
+        fi
+    done < <(blkid -c /dev/null -o device -t LABEL="$LABEL" 2>/dev/null || true)
+    case "${#found[@]}" in
+        1) PART=${found[0]}
+           say "$PART: the root of a disk of nos's own" ;;
+        0) die "no partition named, no GRUB entry ($SNIPPET) to take one from, and no disk of nos's own here" ;;
+        *) die "more than one disk of nos's own here (${found[*]}): name the partition" ;;
+    esac
 }
 
 # ---- what goes onto it -------------------------------------------------
@@ -755,6 +841,371 @@ reboot_now() {
     exec reboot
 }
 
+# ---- a disk of nos's own (disk) ----------------------------------------
+
+DISK=
+ROOT_SIZE=$ROOT_SIZE_DEFAULT
+WIPE=0
+DRY_RUN=0
+# The new table's partitions' device nodes, by their numbers
+PART_DEV=()
+MKFS_FAT=
+GRUB_INSTALL=
+GRUB_LIB=${NOS_GRUB_LIB:-/usr/lib/grub}
+GRUB_BIOS=0
+GRUB_EFI=0
+FIRMWARE=bios
+
+need_fat() {
+    if command -v mkfs.vfat >/dev/null 2>&1; then
+        MKFS_FAT=mkfs.vfat
+    elif command -v mkfs.fat >/dev/null 2>&1; then
+        MKFS_FAT=mkfs.fat
+    else
+        die "no mkfs.vfat: the EFI System partition is FAT (dosfstools)"
+    fi
+}
+
+need_grub_install() {
+    if command -v grub-install >/dev/null 2>&1; then
+        GRUB_INSTALL=grub-install
+    elif command -v grub2-install >/dev/null 2>&1; then
+        GRUB_INSTALL=grub2-install
+    else
+        die "no grub-install: GRUB's tools are not installed"
+    fi
+}
+
+# Which GRUBs go onto the disk: both where both are here. The one for the
+# firmware this machine runs has to be -- the disk is to boot here -- and
+# the other is said when it is missing, before anything is written
+grub_targets() {
+    [ ! -d /sys/firmware/efi ] || FIRMWARE=uefi
+    [ ! -f "$GRUB_LIB/i386-pc/modinfo.sh" ] || GRUB_BIOS=1
+    [ ! -f "$GRUB_LIB/x86_64-efi/modinfo.sh" ] || GRUB_EFI=1
+    if [ "$FIRMWARE" = bios ] && [ "$GRUB_BIOS" = 0 ]; then
+        die "this machine boots by BIOS, and there is no GRUB for BIOS here ($GRUB_LIB/i386-pc: grub-pc-bin)"
+    fi
+    if [ "$FIRMWARE" = uefi ] && [ "$GRUB_EFI" = 0 ]; then
+        die "this machine boots by UEFI, and there is no GRUB for UEFI here ($GRUB_LIB/x86_64-efi: grub-efi-amd64-bin)"
+    fi
+    [ "$GRUB_BIOS" = 1 ] ||
+        warn "no GRUB for BIOS here ($GRUB_LIB/i386-pc: grub-pc-bin): the disk will boot under UEFI only"
+    [ "$GRUB_EFI" = 1 ] ||
+        warn "no GRUB for UEFI here ($GRUB_LIB/x86_64-efi: grub-efi-amd64-bin): the disk will boot under BIOS only"
+}
+
+# --root-size in MiB on stdout: a number of MiB, or one with M, G or T after
+# it, or "all" -- the whole disk
+parse_root_size() {
+    local v=$1 n
+    if [ "$v" = all ]; then
+        echo all
+        return
+    fi
+    [[ "$v" =~ ^([0-9]{1,9})([MmGgTt]?)$ ]] || die "--root-size: $v is not a size (10G, 512M, all)"
+    n=$((10#${BASH_REMATCH[1]}))
+    case "${BASH_REMATCH[2]}" in
+        ''|M|m) echo "$n" ;;
+        G|g) echo $((n * 1024)) ;;
+        T|t) echo $((n * 1024 * 1024)) ;;
+    esac
+}
+
+# $1's model and serial, a tab between them ("-" for one not known): lsblk's,
+# else udev's, else what sysfs has -- a lsblk built without udev, as
+# Alpine's is, knows neither of an ATA disk
+disk_model_serial() {
+    local dev=$1 name model serial props=
+    name=$(basename "$(readlink -f "$dev")")
+    model=$(lsblk -dno MODEL "$dev" 2>/dev/null | sed 's/ *$//' || true)
+    serial=$(lsblk -dno SERIAL "$dev" 2>/dev/null | sed 's/ *$//' || true)
+    if { [ -z "$model" ] || [ -z "$serial" ]; } && command -v udevadm >/dev/null 2>&1; then
+        props=$(udevadm info --query=property --name="$dev" 2>/dev/null || true)
+        [ -n "$model" ] || model=$(printf '%s\n' "$props" | sed -n 's/^ID_MODEL=//p' | head -n 1 | tr '_' ' ')
+        [ -n "$serial" ] || serial=$(printf '%s\n' "$props" | sed -n 's/^ID_SERIAL_SHORT=//p' | head -n 1)
+    fi
+    [ -n "$model" ] || model=$(cat "/sys/block/$name/device/model" 2>/dev/null | sed 's/ *$//' || true)
+    [ -n "$serial" ] || serial=$(cat "/sys/block/$name/serial" "/sys/block/$name/device/serial" 2>/dev/null |
+        head -n 1 | sed 's/^ *//; s/ *$//' || true)
+    printf '%s\t%s\n' "${model:--}" "${serial:--}"
+}
+
+# N MiB as a person reads it: MiB, GiB or TiB, to a tenth
+mib_human() {
+    local n=$1
+    if [ "$n" -lt 1024 ]; then
+        echo "$n MiB"
+    elif [ "$n" -lt $((1024 * 1024)) ]; then
+        echo "$((n / 1024)).$((n * 10 / 1024 % 10)) GiB"
+    else
+        echo "$((n / 1048576)).$((n * 10 / 1048576 % 10)) TiB"
+    fi
+}
+
+# What of $1 is in use, said in a line -- nothing when none of it is: held
+# by md, LVM or the device mapper, a filesystem of it mounted, swap on it
+disk_in_use() {
+    local dev=$1 name sys p holders used s
+    name=$(basename "$(readlink -f "$dev")")
+    sys=/sys/class/block/$name
+    for p in "$sys" "$sys/$name"*; do
+        [ -d "$p/holders" ] || continue
+        holders=$(ls -A "$p/holders" 2>/dev/null | tr '\n' ' ' || true)
+        if [ -n "$holders" ]; then
+            echo "$(basename "$p") is held by ${holders% } (RAID, LVM, device mapper)"
+            return 0
+        fi
+    done
+    used=$(lsblk -nro MOUNTPOINT "$dev" 2>/dev/null | sed '/^$/d' | tr '\n' ' ' || true)
+    if [ -n "$used" ]; then
+        echo "mounted at ${used% }"
+        return 0
+    fi
+    while read -r s _; do
+        case "$(readlink -f "$s" 2>/dev/null || echo "$s")" in
+            "/dev/$name"|"/dev/$name"[0-9p]*) echo "swap on $s"; return 0 ;;
+        esac
+    done < <(tail -n +2 /proc/swaps 2>/dev/null || true)
+}
+
+# The whole disk, and nothing of it in use
+check_disk() {
+    local dev=$1 name sys used
+    [ -b "$dev" ] || die "$dev is not a block device"
+    name=$(basename "$(readlink -f "$dev")")
+    sys=/sys/class/block/$name
+    [ -d "$sys" ] || die "$dev: no $sys"
+    [ ! -e "$sys/partition" ] ||
+        die "$dev is a partition: disk takes a whole disk (install takes a partition)"
+    [ "$(cat "$sys/ro" 2>/dev/null || echo 0)" = 0 ] || die "$dev is read-only"
+    used=$(disk_in_use "$dev")
+    [ -z "$used" ] || die "$dev is in use: $used"
+}
+
+# Whether $1 holds anything but zeros in its $2 MiB from sector $3 on
+nonzero_at() {
+    [ -n "$(dd if="$1" bs=512 skip="$3" count=$(($2 * MIB / 512)) status=none 2>/dev/null |
+        tr -d '\000' | head -c 1)" ]
+}
+
+# What $1 holds, in a few words -- nothing when it is blank: no partition
+# table or filesystem blkid knows of, no partitions, and nothing but zeros
+# in its first and last MiB
+disk_holds() {
+    local dev=$1 what= t n sectors
+    t=$(blkid -p -o value -s PTTYPE "$dev" 2>/dev/null || true)
+    [ -z "$t" ] || what="a $t partition table"
+    t=$(blkid -p -o value -s TYPE "$dev" 2>/dev/null || true)
+    [ -z "$t" ] || what="${what:+$what, }$t"
+    n=$(lsblk -nro NAME "$dev" 2>/dev/null | tail -n +2 | wc -l)
+    if [ "$n" -gt 0 ]; then
+        what="${what:+$what, }$n partitions ($(lsblk -nro NAME,FSTYPE,LABEL "$dev" | tail -n +2 |
+            sed 's/ *$//' | paste -sd ';' - | sed 's/;/; /g'))"
+    fi
+    if [ -z "$what" ]; then
+        sectors=$(($(blockdev --getsize64 "$dev") / 512))
+        if nonzero_at "$dev" 1 0 || nonzero_at "$dev" 1 $((sectors - MIB / 512)); then
+            what="data: its first or last MiB is not all zeros"
+        fi
+    fi
+    echo "$what"
+}
+
+# The table disk writes, as sfdisk takes one, into DISK_TABLE -- how many
+# partitions it has into DISK_PARTS, and the same as a person reads it into
+# DISK_PLAN -- for a root of $2 MiB ("all": the rest of the disk) on $1:
+# GRUB's core image for BIOS, the EFI System partition, nos's root, and
+# after it the rest, where that is worth a partition -- nos-data, with
+# nothing on it. A disk with no room for it is refused here, before
+# anything is written
+DISK_TABLE=
+DISK_PARTS=3
+DISK_PLAN=
+plan_line() {
+    DISK_PLAN="$DISK_PLAN$(printf '  %-10s %-11s %s' "$(mib_human "$1")" "$2" "$3")
+"
+}
+plan_disk() {
+    local dev=$1 root=$2 ss per total used rest
+    ss=$(blockdev --getss "$dev")
+    # A 4Kn disk is untried: BIOS's GRUB on it, and nos's drivers
+    [ "$ss" = 512 ] ||
+        die "$dev has logical sectors of $ss bytes: a disk of nos's own is one of 512 (BIOS's GRUB, and nos's drivers, are not tried on others)"
+    per=$((MIB / ss))
+    total=$(($(blockdev --getsize64 "$dev") / MIB))
+    used=$((1 + BIOS_BOOT_MIB + ESP_MIB))
+    if [ "$root" = all ]; then
+        rest=$((total - used - 1))
+        [ "$rest" -ge "$ROOT_MIN_MIB" ] ||
+            die "$dev is $total MiB: no room for a root of $ROOT_MIN_MIB MiB beside GRUB's $used"
+    else
+        [ "$root" -ge "$ROOT_MIN_MIB" ] || die "--root-size: $root MiB is less than the $ROOT_MIN_MIB MiB nos's root takes"
+        rest=$((total - used - root - 1))
+        [ "$rest" -ge 0 ] ||
+            die "$dev is $total MiB: no room for a root of $root MiB beside GRUB's $used (--root-size)"
+    fi
+    DISK_TABLE="label: gpt
+start=$per, size=$((BIOS_BOOT_MIB * per)), type=$GPT_BIOS_BOOT, name=\"BIOS boot\"
+size=$((ESP_MIB * per)), type=$GPT_ESP, name=\"EFI System\""
+    DISK_PLAN=
+    plan_line "$BIOS_BOOT_MIB" "BIOS boot" "GRUB's core image, for BIOS"
+    plan_line "$ESP_MIB" "EFI System" "FAT32: GRUB for UEFI"
+    if [ "$root" = all ]; then
+        DISK_TABLE="$DISK_TABLE
+type=$GPT_LINUX, name=\"$LABEL\""
+        plan_line "$rest" "$LABEL" "nos's root, ext4: the image"
+    else
+        DISK_TABLE="$DISK_TABLE
+size=$((root * per)), type=$GPT_LINUX, name=\"$LABEL\""
+        plan_line "$root" "$LABEL" "nos's root, ext4: the image"
+        if [ "$rest" -ge "$DATA_MIN_MIB" ]; then
+            DISK_TABLE="$DISK_TABLE
+type=$GPT_LINUX, name=\"$DATA_NAME\""
+            DISK_PARTS=4
+            plan_line "$rest" "$DATA_NAME" "nothing on it: the VMs' disks, NBS"
+        fi
+    fi
+}
+
+# The table plan_disk made onto $1. sfdisk wipes what the old table and the
+# new partitions' places held that blkid knows (filesystems, RAID, LVM, the
+# old table's copy at the end)
+partition_disk() {
+    local dev=$1
+    printf '%s\n' "$DISK_TABLE" | sfdisk --quiet --wipe always --wipe-partitions always "$dev" >/dev/null ||
+        die "sfdisk could not write the partition table of $dev"
+    disk_partitions "$dev" "$DISK_PARTS"
+}
+
+# The partitions of $1 the kernel has, into PART_DEV by number -- waited for
+# until there are $2, the table read again once if they are slow to come
+disk_partitions() {
+    local dev=$1 want=$2 name sys p n tries=0
+    name=$(basename "$(readlink -f "$dev")")
+    sys=/sys/class/block/$name
+    while :; do
+        PART_DEV=()
+        for p in "$sys/$name"*; do
+            [ -f "$p/partition" ] || continue
+            n=$(cat "$p/partition")
+            [ ! -b "/dev/$(basename "$p")" ] || PART_DEV[n]=/dev/$(basename "$p")
+        done
+        [ "${#PART_DEV[@]}" -lt "$want" ] || break
+        tries=$((tries + 1))
+        [ "$tries" -le 100 ] ||
+            die "the kernel shows ${#PART_DEV[@]} of the $want partitions written on $dev: reboot, and run this again"
+        if [ "$tries" = 10 ]; then
+            partx -u "$dev" 2>/dev/null || blockdev --rereadpt "$dev" 2>/dev/null || true
+        fi
+        sleep 0.1
+    done
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm settle 2>/dev/null || true
+    fi
+}
+
+# $1 blank to whoever looks: its first and last MiB zeros, so that NBS and
+# hv take it for a device with nothing on it
+blank_partition() {
+    local dev=$1 sectors
+    sectors=$(($(blockdev --getsize64 "$dev") / 512))
+    dd if=/dev/zero of="$dev" bs=1M count=1 conv=fsync status=none ||
+        die "cannot write $dev"
+    dd if=/dev/zero of="$dev" bs=512 seek=$((sectors - MIB / 512)) count=$((MIB / 512)) conv=fsync status=none ||
+        die "cannot write $dev"
+}
+
+# GRUB onto $1: for BIOS, its boot code in the disk's first sector and its
+# core image in the BIOS boot partition; for UEFI, \EFI\BOOT\BOOTX64.EFI on
+# the EFI System partition $3, the path firmware boots a disk by when it has
+# no boot entry for it -- none is made, and the firmware's boot order is
+# left as it is. Both find the root ($2 mounted) by its UUID, and their
+# modules are on it, in /boot/grub
+install_grub() {
+    local disk=$1 root=$2 esp=$3 log dir sb=()
+    log=$(mktemp /tmp/nos-grub.XXXXXX)
+    TEMP_DIRS+=("$log")
+    if [ "$GRUB_BIOS" = 1 ]; then
+        say "GRUB for BIOS: its boot code in $disk's first sector, its core image in ${PART_DEV[1]}"
+        "$GRUB_INSTALL" --target=i386-pc --boot-directory="$root/boot" "$disk" > "$log" 2>&1 ||
+            { cat "$log" >&2; die "grub-install for BIOS onto $disk failed"; }
+    fi
+    if [ "$GRUB_EFI" = 1 ]; then
+        dir=$(mktemp -d /tmp/nos-esp.XXXXXX)
+        if ! mount -t vfat "$esp" "$dir"; then
+            rmdir "$dir"
+            die "cannot mount $esp"
+        fi
+        MOUNT_DIRS+=("$dir")
+        # Debian's and Ubuntu's grub-install put shim and their own signed
+        # GRUB there unless told not to -- a GRUB that looks for its
+        # configuration in /EFI/<their name> on this partition, not on nos's
+        # root
+        if "$GRUB_INSTALL" --help 2>&1 | grep -q -- --no-uefi-secure-boot; then
+            sb=(--no-uefi-secure-boot)
+        fi
+        say "GRUB for UEFI: \\EFI\\BOOT\\BOOTX64.EFI on $esp"
+        "$GRUB_INSTALL" --target=x86_64-efi --efi-directory="$dir" --boot-directory="$root/boot" \
+            --removable --no-nvram ${sb[@]+"${sb[@]}"} > "$log" 2>&1 ||
+            { cat "$log" >&2; die "grub-install for UEFI onto $esp failed"; }
+        [ -f "$dir/EFI/BOOT/BOOTX64.EFI" ] || die "grub-install put no \\EFI\\BOOT\\BOOTX64.EFI on $esp"
+        sync -f "$dir"
+        umount "$dir" || die "cannot unmount $esp from $dir"
+        rmdir "$dir"
+    fi
+}
+
+# The root's /boot/grub/grub.cfg: what 42_nos does in a server's own GRUB,
+# with no other system to fall back to
+standalone_cfg_text() {
+    cat <<'EOF' | sed "s/@NOS_UUID@/$1/"
+# nos: this disk's own GRUB configuration, written by nos-install disk
+# (docs/install.md). The disk boots nos alone: this finds nos's root by its
+# UUID, loads what this machine boots nos with and the one-shot flag from
+# the grubenv there, and takes the menu entries from the image on it
+# (/boot/grub/nos.cfg), so a new image brings new entries without this file
+# changing. nos is the default. nos_next -- nos-next, a kernel tried once --
+# is cleared before anything is loaded, and one GRUB cannot boot falls back
+# to nos.
+insmod part_gpt
+insmod ext2
+set nos_uuid=@NOS_UUID@
+set nos_root=
+search --no-floppy --fs-uuid --set=nos_root ${nos_uuid}
+set default=nos
+set timeout_style=menu
+set timeout=3
+if [ -n "${nos_root}" ]; then
+  set nos_next=
+  set nos_cmdline=
+  load_env -f (${nos_root})/grubenv nos_next nos_cmdline
+  source (${nos_root})/boot/grub/nos.cfg
+  if [ -n "${nos_next}" ]; then
+    set default="${nos_next}"
+    set fallback=nos
+    set nos_next=
+    save_env -f (${nos_root})/grubenv nos_next
+  fi
+fi
+EOF
+}
+
+# The EFI System partition as fsck.fat sees it, where dosfstools has it
+fsck_esp() {
+    local esp=$1 tool=
+    if command -v fsck.vfat >/dev/null 2>&1; then
+        tool=fsck.vfat
+    elif command -v fsck.fat >/dev/null 2>&1; then
+        tool=fsck.fat
+    fi
+    [ -n "$tool" ] || return 0
+    if ! "$tool" -n "$esp" >/dev/null 2>&1; then
+        "$tool" -n "$esp" >&2 || true
+        die "$tool finds the EFI System partition $esp damaged"
+    fi
+}
+
 # ---- the commands ------------------------------------------------------
 
 FORMAT=0
@@ -799,10 +1250,14 @@ parse_options() {
             --no-panel) PANEL=0 ;;
             --boot-once) BOOT_ONCE=1 ;;
             --reboot) BOOT_ONCE=1; REBOOT=1 ;;
+            --root-size) [ $# -ge 2 ] || usage; ROOT_SIZE=$2; shift ;;
+            --root-size=*) ROOT_SIZE=${1#*=} ;;
+            --wipe) WIPE=1 ;;
+            --dry-run) DRY_RUN=1 ;;
             -h|--help) usage 0 ;;
             -*) die "unknown option $1 (--help)" ;;
             *)
-                [ -z "$PART" ] || die "one partition, not $PART and $1"
+                [ -z "$PART" ] || die "one device, not $PART and $1"
                 PART=$1 ;;
         esac
         shift
@@ -821,7 +1276,7 @@ only_options() {
 }
 
 cmd_install() {
-    local mode=$1 fs uuid before cmdline
+    local mode=$1 fs uuid before cmdline standalone=0
     need blkid findmnt lsblk mount umount mountpoint mkfs.ext4 dumpe2fs e2fsck
     need_editenv
     if [ "$mode" = install ]; then
@@ -834,6 +1289,14 @@ cmd_install() {
     open_image
     check_partition "$PART"
     check_hardware "$PART"
+    # The root of a disk of nos's own is booted by that disk's GRUB: an
+    # update leaves this machine's alone, and an install would put a second
+    # GRUB's entry on it
+    if is_standalone "$PART"; then
+        [ "$mode" = update ] ||
+            die "$PART is the root of a disk of nos's own (nos-install disk): nos-install update $PART updates it"
+        standalone=1
+    fi
 
     fs=$(blkid -p -o value -s TYPE "$PART" 2>/dev/null || true)
     if [ "$FORMAT" = 1 ] || [ -z "$fs" ]; then
@@ -858,7 +1321,7 @@ cmd_install() {
     mount_partition "$PART"
     before=$(describe "$MNT/VERSION")
     put_system "$MNT"
-    if [ "$BOOT_ONCE" = 1 ]; then
+    if [ "$BOOT_ONCE" = 1 ] && [ "$standalone" = 0 ]; then
         editenv "$MNT/grubenv" set nos_next=nos
     fi
     cmdline=$(editenv "$MNT/grubenv" list | sed -n 's/^nos_cmdline=//p')
@@ -867,14 +1330,19 @@ cmd_install() {
 
     uuid=$(blkid -p -o value -s UUID "$PART")
     [[ "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]] || die "$PART has no UUID GRUB can find it by"
-    install_snippet "$uuid" "$([ "$mode" = install ] && echo 1 || echo 0)"
+    if [ "$standalone" = 0 ]; then
+        install_snippet "$uuid" "$([ "$mode" = install ] && echo 1 || echo 0)"
+    fi
 
     say "$PART: $(describe "$IMG/VERSION"), was $before"
     say "this machine's kernel parameters: ${cmdline:-none}"
     if [ "${#KEYS[@]}" = 0 ] && [ "$mode" = install ]; then
         warn "no --ssh-key: sshd lets nobody in until /etc/ssh/authorized_keys on $PART has a key"
     fi
-    if [ "$BOOT_ONCE" = 1 ]; then
+    if [ "$standalone" = 1 ]; then
+        say "its disk's own GRUB boots it: nothing of this machine's GRUB is changed"
+        [ "$REBOOT" = 0 ] || reboot_now
+    elif [ "$BOOT_ONCE" = 1 ]; then
         say "the next boot is nos, once; the one after it is this machine's default"
         [ "$REBOOT" = 0 ] || reboot_now
     else
@@ -917,6 +1385,11 @@ cmd_boot() {
     need_editenv
     resolve_partition
     check_partition "$PART"
+    if is_standalone "$PART"; then
+        say "$PART is the root of a disk of nos's own, which boots nos every time: nothing to arm"
+        [ "$REBOOT" = 0 ] || reboot_now
+        return 0
+    fi
     [ -f "$SNIPPET" ] || warn "no $SNIPPET: this machine's GRUB does not look for nos"
     mount_partition "$PART"
     [ -f "$MNT/grubenv" ] || die "no grubenv on $PART: install the image on it first"
@@ -927,7 +1400,7 @@ cmd_boot() {
 }
 
 cmd_status() {
-    local uuid next mp params
+    local uuid next mp params standalone=0
     need blkid findmnt lsblk mount umount mountpoint
     need_editenv
     uuid=$(registered_uuid)
@@ -939,6 +1412,10 @@ cmd_status() {
     resolve_partition
     mp=$(findmnt -rno TARGET --source "$PART" 2>/dev/null | head -n 1 || true)
     echo "partition:   $PART${mp:+, mounted at $mp}"
+    if is_standalone "$PART"; then
+        standalone=1
+        echo "booted by:   its disk's own GRUB (nos-install disk)"
+    fi
     mount_partition "$PART" ro
     echo "installed:   $(describe "$MNT/VERSION")"
     echo "previous:    $(describe "$MNT/VERSION.prev")"
@@ -948,6 +1425,8 @@ cmd_status() {
         next=$(editenv "$MNT/grubenv" list | sed -n 's/^nos_next=//p')
         if [ -n "$next" ]; then
             echo "next boot:   $next, once"
+        elif [ "$standalone" = 1 ]; then
+            echo "next boot:   nos, its disk's default"
         else
             echo "next boot:   this machine's default"
         fi
@@ -977,6 +1456,116 @@ cmd_uninstall() {
     say "nos is out of GRUB's menu; the partition is as it was"
 }
 
+# The disks here, a line each and tab-separated, for an installer to offer
+# (nos-setup): the device, its size in bytes, its model and serial, "ok" or
+# what keeps nos from reading it, what of it is in use, and what it holds --
+# "-" for a field with nothing in it, as a tab is IFS whitespace, and two of
+# them run together would be read as one
+cmd_disks() {
+    local name kind dev size model serial problem used holds
+    need lsblk blkid blockdev dd
+    while read -r name kind; do
+        case "$kind" in
+            disk) ;;
+            loop) [ "${NOS_ALLOW_ANY_DISK:-0}" = 1 ] || continue ;;
+            *) continue ;;
+        esac
+        dev=/dev/$name
+        size=$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)
+        [ "$size" -gt 0 ] || continue
+        IFS=$'\t' read -r model serial < <(disk_model_serial "$dev")
+        problem=$(disk_controller_problem "$dev")
+        used=$(disk_in_use "$dev")
+        holds=$(disk_holds "$dev")
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$dev" "$size" "$model" "$serial" "${problem:-ok}" \
+            "${used:--}" "${holds:--}"
+    done < <(lsblk -dnro NAME,TYPE 2>/dev/null)
+}
+
+# A whole disk made nos's: a GPT of nos's own on it, the image poured onto
+# its root, GRUB onto it for BIOS and UEFI. Everything is checked -- the
+# image, the disk, what is on it, what GRUB there is -- before anything is
+# written; --dry-run stops there, and says what it would write
+cmd_disk() {
+    local root what esp data uuid cmdline ids
+    need blkid findmnt lsblk mount umount mountpoint mkfs.ext4 dumpe2fs e2fsck debugfs \
+        sfdisk wipefs blockdev partx dd
+    need_editenv
+    need_fat
+    need_grub_install
+    [ -n "$PART" ] || die "onto which disk? (nos-install disk /dev/nvme0n1)"
+    DISK=$PART
+    PART=
+    root=$(parse_root_size "$ROOT_SIZE")
+    compose_cmdline
+    open_image
+    check_disk "$DISK"
+    check_hardware "$DISK" disk
+    grub_targets
+    plan_disk "$DISK" "$root"
+    what=$(disk_holds "$DISK")
+    if [ -n "$what" ]; then
+        [ "$WIPE" = 1 ] || die "$DISK holds $what -- --wipe erases it, and everything on it is lost"
+        say "erasing $DISK: it held $what"
+    fi
+    ids=$(disk_model_serial "$DISK" | tr '\t' ' ' | sed 's/^- //; s/ -$//; s/^-$//')
+    if [ "$DRY_RUN" = 1 ]; then
+        say "$DISK${ids:+ ($ids)}, $(lsblk -dno SIZE "$DISK" | tr -d ' '): would be given a GPT of nos's own --"
+        printf '%s' "$DISK_PLAN" | sed 's/^/nos-install: /'
+        say "$(describe "$IMG/VERSION") on its root, and GRUB for$([ "$GRUB_BIOS" = 0 ] || echo " BIOS")$([ "$GRUB_BIOS" = 0 ] || [ "$GRUB_EFI" = 0 ] || echo " and")$([ "$GRUB_EFI" = 0 ] || echo " UEFI")"
+        return 0
+    fi
+    say "$DISK${ids:+ ($ids)}, $(lsblk -dno SIZE "$DISK" | tr -d ' '): a GPT of nos's own"
+
+    partition_disk "$DISK"
+    esp=${PART_DEV[2]}
+    PART=${PART_DEV[3]}
+    data=${PART_DEV[4]:-}
+    [ -z "$data" ] || blank_partition "$data"
+    say "making the EFI System partition $esp, FAT32"
+    "$MKFS_FAT" -F 32 -n "$ESP_LABEL" "$esp" >/dev/null || die "$MKFS_FAT on $esp failed"
+    say "making an ext4 filesystem on $PART, nos's root"
+    mkfs.ext4 -F -q -L "$LABEL" -b 4096 -m 0 -O "$EXT4_FEATURES" \
+        -E lazy_itable_init=0,lazy_journal_init=0 "$PART" ||
+        die "mkfs.ext4 on $PART failed"
+    check_fs "$PART" ext4
+    # A new filesystem starts from what the options say
+    SET_CMDLINE=1
+
+    mount_partition "$PART"
+    put_system "$MNT"
+    install_grub "$DISK" "$MNT" "$esp"
+    uuid=$(blkid -p -o value -s UUID "$PART")
+    [[ "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]] || die "$PART has no UUID GRUB can find it by"
+    standalone_cfg_text "$uuid" > "$MNT/boot/grub/grub.cfg.new"
+    mv -T "$MNT/boot/grub/grub.cfg.new" "$MNT/boot/grub/grub.cfg"
+    cmdline=$(editenv "$MNT/grubenv" list | sed -n 's/^nos_cmdline=//p')
+    unmount_partition "$PART"
+    fsck_partition "$PART" "after the image was put on it"
+    fsck_esp "$esp"
+    is_standalone "$PART" || die "$PART does not read back as the root of a disk of nos's own"
+
+    say "$DISK is nos's:"
+    lsblk -o NAME,SIZE,PARTLABEL,FSTYPE,LABEL "$DISK" | sed 's/^/nos-install:   /'
+    say "root: $PART, $(describe "$IMG/VERSION"), found by its UUID $uuid"
+    if [ -n "$data" ]; then
+        say "$DATA_NAME: $data, with nothing on it -- a VM's disk (part:$(blkid -p -o value -s PART_ENTRY_UUID "$data" 2>/dev/null || true)), or NBS's (nbs devices add)"
+    fi
+    if [ "$GRUB_BIOS" = 1 ] && [ "$GRUB_EFI" = 1 ]; then
+        say "boots by BIOS and by UEFI; this machine is booted by $FIRMWARE"
+    elif [ "$GRUB_BIOS" = 1 ]; then
+        say "boots by BIOS only"
+    else
+        say "boots by UEFI only"
+    fi
+    say "this machine's kernel parameters: ${cmdline:-none}"
+    if [ "${#KEYS[@]}" = 0 ]; then
+        warn "no --ssh-key: sshd lets nobody in until /etc/ssh/authorized_keys on $PART has a key"
+    fi
+    say "the firmware boots it once its boot order puts $DISK first"
+    [ "$REBOOT" = 0 ] || reboot_now
+}
+
 [ $# -ge 1 ] || usage
 COMMAND=$1
 shift
@@ -986,7 +1575,18 @@ esac
 [ "$(id -u)" = 0 ] || die "run as root"
 parse_options "$@"
 case "$COMMAND" in
-    install|update) cmd_install "$COMMAND" ;;
+    install|update)
+        only_options --image --format --ssh-key --udpshell --netconsole --cmdline --panel --no-panel \
+            --boot-once --reboot
+        cmd_install "$COMMAND" ;;
+    disk)
+        only_options --image --ssh-key --udpshell --netconsole --cmdline --panel --no-panel \
+            --root-size --wipe --dry-run --reboot
+        cmd_disk ;;
+    disks)
+        only_options
+        [ -z "$PART" ] || die "disks takes no device: it lists them"
+        cmd_disks ;;
     boot) only_options --reboot --boot-once; cmd_boot ;;
     rollback|status|uninstall) only_options; "cmd_$COMMAND" ;;
     *) die "no command $COMMAND (--help)" ;;
