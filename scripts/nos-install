@@ -245,17 +245,29 @@ check_partition() {
 # Warnings, not refusals: GRUB boots nos from anything the firmware reads,
 # but what nos does after that depends on what it has drivers for
 check_hardware() {
-    local dev=$1 path d id found=
+    local dev=$1 path pci class d id found=
     if [ "${NOS_ALLOW_ANY_DISK:-0}" != 1 ]; then
         path=$(readlink -f "/sys/class/block/$(basename "$(readlink -f "$dev")")")
         case "$path" in
             */nvme/*|*/virtio*) ;;
-            *) warn "$dev is not on an NVMe or a virtio disk, which is all nos reads: GRUB will load the kernel from it, but nos will not find its root on it -- no modules, no /etc/rc, no sshd" ;;
+            */ata[0-9]*/*)
+                # nos's ata driver takes a disk behind a PCI IDE controller --
+                # class 0101: SATA in IDE mode, as a BIOS may leave an ICH, or
+                # parallel ATA -- and not yet one behind AHCI (0106). The
+                # controller is the last PCI function on the device's path.
+                pci=$(printf '%s\n' "$path" | grep -o '/[0-9a-f]\{4\}:[0-9a-f]\{2\}:[0-9a-f]\{2\}\.[0-7]' | tail -n 1 || true)
+                class=$(cat "/sys/bus/pci/devices$pci/class" 2>/dev/null || true)
+                case "$class" in
+                    0x0101*) ;;
+                    *) warn "$dev is on a SATA controller nos does not drive (PCI class ${class:-unknown}: AHCI, or RAID, where nos takes IDE mode alone): GRUB will load the kernel from it, but nos will not find its root on it -- no modules, no /etc/rc, no sshd" ;;
+                esac ;;
+            *) warn "$dev is not on an NVMe, a virtio or an IDE-mode SATA disk, which is all nos reads: GRUB will load the kernel from it, but nos will not find its root on it -- no modules, no /etc/rc, no sshd" ;;
         esac
     fi
 
     # The network is a server's only console. The parts nos's drivers claim:
-    # drivers/net/r8168, drivers/net/r8125, drivers/net/igb, virtio-net
+    # drivers/net/r8168, drivers/net/r8125, drivers/net/igb, drivers/net/e1000e,
+    # virtio-net
     for d in /sys/bus/pci/devices/*; do
         [ -r "$d/vendor" ] || continue
         id=$(cat "$d/vendor"):$(cat "$d/device")
@@ -264,12 +276,13 @@ check_hardware() {
             0x8086:0x10c9|0x8086:0x10e8|0x8086:0x150a|\
             0x8086:0x1533|0x8086:0x1536|0x8086:0x1537|0x8086:0x1538|\
             0x8086:0x1539|0x8086:0x157b|0x8086:0x157c|\
+            0x8086:0x10d3|\
             0x1af4:0x1000|0x1af4:0x1041)
                 found="$found $(basename "$d")" ;;
         esac
     done
     [ -n "$found" ] ||
-        warn "no network card here that nos has a driver for (RTL8168, RTL8125, Intel 82576/I210/I211, virtio-net): booted, nos cannot be reached"
+        warn "no network card here that nos has a driver for (RTL8168, RTL8125, Intel 82576/I210/I211, Intel 82574L, virtio-net): booted, nos cannot be reached"
 
     if [ -d /sys/firmware/efi ]; then
         local sb
@@ -501,6 +514,7 @@ put_system() {
     done
 
     put_ucode "$mnt"
+    put_seed "$mnt"
     put_panel "$mnt"
 
     # The grubenv: what this machine boots nos with, and the one-shot flag
@@ -597,6 +611,20 @@ put_ucode() {
         rm -f "$mnt/boot/ucode"
         say "microcode: none for this CPU here; nos runs firmware's"
     fi
+}
+
+# The random pool's seed for nos's next boot (docs/random.md): fresh from
+# this machine's /dev/urandom at every install and update. nos mixes it in
+# as its root is mounted and writes the next over it; on a CPU with no
+# random instruction -- an old Xeon -- it is what sshd's keys are made from.
+put_seed() {
+    local seed=$1/etc/random-seed
+    mkdir -p "$1/etc"
+    rm -f "$seed.new"
+    head -c 64 /dev/urandom > "$seed.new"
+    chmod 600 "$seed.new"
+    mv -T "$seed.new" "$seed"
+    say "random seed: 64 bytes for nos's next boot"
 }
 
 # The revision of the first update in a microcode file, as its header has it
@@ -925,6 +953,11 @@ cmd_status() {
         echo "grubenv:     none"
     fi
     echo "ssh keys:    $(grep -c '^ssh-' "$MNT/etc/ssh/authorized_keys" 2>/dev/null || true)"
+    if [ -s "$MNT/etc/random-seed" ]; then
+        echo "random seed: kept"
+    else
+        echo "random seed: none"
+    fi
     if [ -f "$MNT/boot/ucode" ]; then
         echo "microcode:   revision $(ucode_revision "$MNT/boot/ucode") at /boot/ucode"
     else

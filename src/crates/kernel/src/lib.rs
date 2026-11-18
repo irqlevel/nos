@@ -8,6 +8,7 @@ mod frames;
 mod memsites;
 mod one_event;
 mod ring;
+mod seed;
 mod sha256;
 mod system;
 mod trace;
@@ -50,6 +51,7 @@ pub extern "C" fn rust_init() {
     sha256::init();
     crc32::init();
     nvme::init();
+    ata::init();
     usb::init();
     virtio_rng::init();
     virtio_blk::init();
@@ -58,6 +60,9 @@ pub extern "C" fn rust_init() {
     r8168::init();
     r8125::init();
     igb::init();
+    /* After igb: its names are still its own count's (`eth{idx}`), and
+       this driver asks the device table for the lowest free one. */
+    e1000e::init();
     #[cfg(target_arch = "x86_64")]
     {
         tco_init();
@@ -163,7 +168,9 @@ pub extern "C" fn rust_test() {
 #[no_mangle]
 pub extern "C" fn rust_fini() {
     nvme::shutdown();
+    ata::shutdown();
     r8168::shutdown();
     r8125::shutdown();
     igb::shutdown();
+    e1000e::shutdown();
 }

@@ -59,6 +59,10 @@ Parameters::Parameters()
     , rx_poll_(false)
     , log_level_(DEFAULT_LOG_LEVEL)
     , dns_enabled_(false)
+    , dns_server_(0)
+    , static_ip_(0)
+    , static_mask_(0)
+    , static_gw_(0)
     , root_read_only_(false)
     , fs_test_(false)
     , disk_log_on_(false)
@@ -296,6 +300,26 @@ bool Parameters::is_dns_enabled()
     return dns_enabled_;
 }
 
+u32 Parameters::get_dns_server()
+{
+    return dns_server_;
+}
+
+u32 Parameters::get_static_ip()
+{
+    return static_ip_;
+}
+
+u32 Parameters::get_static_mask()
+{
+    return static_mask_;
+}
+
+u32 Parameters::get_static_gateway()
+{
+    return static_gw_;
+}
+
 const Parameters::RootSpec& Parameters::get_root()
 {
     return root_;
@@ -389,6 +413,88 @@ static bool parse_ip_v4(const char* text, u32& out)
 
     out = addr;
     return true;
+}
+
+/* What an address of this machine's, its gateway's or its resolver's can be:
+   not 0.0.0.0, not on the loopback network, not multicast or the reserved
+   class E above it -- the limited broadcast among them */
+static const u32 LOOPBACK_NET = 0x7F000000;      /* 127.0.0.0/8 */
+static const u32 LOOPBACK_MASK = 0xFF000000;
+static const u32 MULTICAST_FIRST = 0xE0000000;   /* 224.0.0.0 */
+static const ulong PREFIX_BITS_MAX = 32;
+/* The longest prefix a subnet with a network and a broadcast address of its
+   own has: /31 and /32 have neither (RFC 3021) */
+static const ulong PREFIX_WITH_BROADCAST_MAX = 30;
+/* "255.255.255.255" and a NUL */
+static const size_t IP_TEXT_MAX = 16;
+static const u32 BITS_PER_OCTET = 8;
+static const u32 OCTET_MAX = 0xFF;
+
+static bool is_unicast_host(u32 addr)
+{
+    return addr != 0 && (addr & LOOPBACK_MASK) != LOOPBACK_NET && addr < MULTICAST_FIRST;
+}
+
+/* Octet i of an address in host byte order, the first being 3 */
+static ulong octet(u32 addr, u32 i)
+{
+    return (ulong)((addr >> (i * BITS_PER_OCTET)) & OCTET_MAX);
+}
+
+/* ip=A.B.C.D/N: the address and its prefix length, both or neither */
+bool Parameters::parse_static_ip(const char* value)
+{
+    const char* slash = stdlib::str_chr_once(value, '/');
+    if (slash == nullptr || slash == value || *(slash + 1) == '\0')
+        return false;
+
+    size_t ip_len = (size_t)(slash - value);
+    if (ip_len >= IP_TEXT_MAX)
+        return false;
+
+    char ip_buf[IP_TEXT_MAX];
+    stdlib::strn_cpy(ip_buf, value, ip_len + 1);
+
+    u32 ip = 0;
+    ulong prefix = 0;
+    if (!parse_ip_v4(ip_buf, ip) || !stdlib::parse_ulong(slash + 1, prefix) ||
+        prefix == 0 || prefix > PREFIX_BITS_MAX || !is_unicast_host(ip))
+        return false;
+
+    /* 32 - prefix is 0 to 31: a shift a u32 takes */
+    u32 mask = 0xFFFFFFFFU << (PREFIX_BITS_MAX - prefix);
+    u32 host = ip & ~mask;
+    if (prefix <= PREFIX_WITH_BROADCAST_MAX && (host == 0 || host == ~mask))
+    {
+        klog(0, "Cmdline: ip=%s is its subnet's network or broadcast address", value);
+        return false;
+    }
+
+    static_ip_ = ip;
+    static_mask_ = mask;
+    return true;
+}
+
+/* After the whole line: gw= is a way off ip='s subnet, so it has to be on it */
+void Parameters::check_static_gateway()
+{
+    if (static_gw_ == 0)
+        return;
+
+    if (static_ip_ == 0)
+    {
+        klog(0, "Cmdline: gw=%lu.%lu.%lu.%lu without ip=: ignored",
+            octet(static_gw_, 3), octet(static_gw_, 2), octet(static_gw_, 1), octet(static_gw_, 0));
+        static_gw_ = 0;
+        return;
+    }
+
+    if (static_gw_ == static_ip_ || ((static_gw_ ^ static_ip_) & static_mask_) != 0)
+    {
+        klog(0, "Cmdline: gw=%lu.%lu.%lu.%lu is not another address of ip='s subnet: ignored",
+            octet(static_gw_, 3), octet(static_gw_, 2), octet(static_gw_, 1), octet(static_gw_, 0));
+        static_gw_ = 0;
+    }
 }
 
 bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
@@ -779,14 +885,33 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
     }
     else if (stdlib::str_cmp(key, "dns") == 0)
     {
+        u32 server = 0;
         if (stdlib::str_cmp(value, "on") == 0)
         {
+            dns_enabled_ = true;
+        }
+        else if (parse_ip_v4(value, server) && is_unicast_host(server))
+        {
+            dns_server_ = server;
             dns_enabled_ = true;
         }
         else
         {
             klog(0, "Unknown value %s, key %s", value, key);
         }
+    }
+    else if (stdlib::str_cmp(key, "ip") == 0)
+    {
+        if (!parse_static_ip(value))
+            klog(0, "Invalid ip value %s, expected A.B.C.D/N", value);
+    }
+    else if (stdlib::str_cmp(key, "gw") == 0)
+    {
+        u32 gw = 0;
+        if (parse_ip_v4(value, gw) && is_unicast_host(gw))
+            static_gw_ = gw;
+        else
+            klog(0, "Invalid gw value %s, expected A.B.C.D", value);
     }
     else
     {
@@ -864,6 +989,8 @@ void Parameters::parse(const char *cmdline)
         }
         start = i + 1;
     }
+
+    check_static_gateway();
 
     parsed_ = true;
 }

@@ -161,8 +161,9 @@ def boot(tmp, arch, tcg, nic="virtio"):
     ]
     if arch == "x86_64":
         # QEMU's igb (8.0 and later) is the 82576 the kernel's Rust igb
-        # driver claims -- the same driver that runs the I210 on the AX41
-        card = ("igb,netdev=net0" if nic == "igb"
+        # driver claims -- the same driver that runs the I210 on the AX41 --
+        # and its e1000e the 82574L the e1000e driver does
+        card = (nic + ",netdev=net0" if nic != "virtio"
                 else "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off")
         cmd = [
             "qemu-system-x86_64", *([] if tcg else ["-enable-kvm", "-cpu", "host"]),
@@ -308,13 +309,14 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--arch", choices=sorted(KERNELS), default="x86_64")
     p.add_argument("--tcg", action="store_true", help="no KVM (always so for aarch64)")
-    p.add_argument("--nic", choices=["virtio", "igb"], default="virtio",
-                   help="the network card: igb (x86, QEMU 8.0+) runs the Rust igb driver")
+    p.add_argument("--nic", choices=["virtio", "igb", "e1000e"], default="virtio",
+                   help="the network card: igb (x86, QEMU 8.0+) runs the Rust igb driver, "
+                        "e1000e (x86) the Rust e1000e driver")
     p.add_argument("--keep", action="store_true", help="keep the scratch directory")
     args = p.parse_args()
     tcg = args.tcg or args.arch != "x86_64"
-    if args.nic == "igb" and args.arch != "x86_64":
-        sys.exit("--nic igb is for x86_64")
+    if args.nic != "virtio" and args.arch != "x86_64":
+        sys.exit("--nic %s is for x86_64" % args.nic)
 
     for path in (KERNELS[args.arch], module_path(args.arch)):
         if not os.path.exists(path):
