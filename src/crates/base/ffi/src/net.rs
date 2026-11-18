@@ -165,6 +165,15 @@ unsafe extern "C" {
     pub safe fn kernel_param_dhcp_off() -> i32;
     /// `dns=on`: start a resolver on a lease's DNS server.
     pub safe fn kernel_param_dns_on() -> i32;
+    /// `dns=A.B.C.D`: the resolver's server, given; 0 when none was.
+    pub safe fn kernel_param_dns_server() -> u32;
+    /// `ip=A.B.C.D/N`: eth0's static address and its mask, host byte
+    /// order; 0 when not given.
+    pub safe fn kernel_param_static_ip() -> u32;
+    pub safe fn kernel_param_static_mask() -> u32;
+    /// `gw=A.B.C.D`: the static default gateway, on `ip=`'s subnet; 0 when
+    /// not given.
+    pub safe fn kernel_param_static_gateway() -> u32;
     /// `rxpoll=on`: the tick looks at the receive path as well as the NIC.
     pub safe fn kernel_param_rxpoll_on() -> i32;
 }
