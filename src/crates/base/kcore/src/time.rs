@@ -88,6 +88,25 @@ pub fn cycle_counter_hz() -> Option<u64> {
     }
 }
 
+/// Spin for `us` microseconds, by the boot clock, without sleeping: what a
+/// driver's bring-up waits with -- a register to settle, a reset to finish
+/// -- some of it before there is a task to sleep in. Bounded besides by a
+/// count of spins, so that a clock that stood still costs a short wait, not
+/// a boot that never goes on: each spin reads the clock, which takes far
+/// longer than the fraction of a microsecond the count allows it.
+pub fn delay_us(us: u64) {
+    const SPINS_PER_US: u64 = 200;
+    const SPINS_MIN: u64 = 1000;
+
+    let want = us.saturating_mul(NS_PER_US);
+    let start = boot_time_ns();
+    let mut left = us.saturating_mul(SPINS_PER_US).max(SPINS_MIN);
+    while boot_time_ns().wrapping_sub(start) < want && left != 0 {
+        core::hint::spin_loop();
+        left -= 1;
+    }
+}
+
 /// Busy-poll `condition` for up to `iterations` iterations without sleeping.
 ///
 /// Intended for early-boot or IRQ-disabled contexts where sleeping is not
