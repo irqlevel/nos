@@ -287,6 +287,7 @@ how it works and what it found.
 | `drivers/net/e1000e` (the 82574L), the net layer's `free_eth_name` | `sshd-test.py --arch x86_64 --nic e1000e` (a login and SFTP both ways over the card), `tcp-test.py --nic e1000e` and `netload-test.py --nic e1000e`: QEMU's 82574L model, by hand; two of them as a server board has them (`-machine q35`, each behind a `pcie-root-port`, the second's link off) for the names, by hand -- see [The hardware NIC drivers](#the-hardware-nic-drivers) |
 | `drivers/usb/` | `usb-test.py` (x86-64): types at the kernel through QEMU's monitor |
 | PCI config space and the scan (`drivers/pci.cpp`: a word or a byte written by itself -- `hal::pci_config_write16/8`, the port's own byte on x86-64, the field's address in the ECAM on arm64 -- functions past the first only where function 0 says there are any, the table of devices), an MSI-X table (`drivers/msix.cpp`, `arch/arm64/msix_its.cpp`: where the table is in a BAR somebody mapped, held to the mapping's length by `PageTable::mmio_mapped_span`; an entry enabled again given its new handler; x86-64's vectors taken and given back), a plain MSI (`drivers/msi.cpp`, `kernel_msi_create`: the capability held to the standard config space, off until its vector is enabled, masked across a change where the device can mask it), `Its::map_event` and `rebind_event`, `Idt::set_descriptor` (a live entry is written whole in one store, its upper half the same for every handler -- a BUG_ON otherwise) | the smoke boots: on x86-64 every disk and the NIC are PCI devices found by the scan, bus mastering and MSI-X turned on by word writes, the NVMe and the modern virtio devices on MSI-X vectors -- and by hand under `-machine q35`, and with a device of two functions (`-device virtio-rng-pci,addr=6.0,multifunction=on -device virtio-rng-pci,addr=6.1`), `pci` listing both. arm64 has no PCI device in any gate: by hand, a boot with `-device nvme` under HVF and under TCG -- the two take a word's store to the ECAM by different paths -- with the ITS -- the controller found, bus mastering and MSI-X turned on by word writes, its vector registered and its namespace a block device -- and with `its=off`, where the table is refused, the driver says it has no MSI-X and leaves the device, and the boot goes on; and with `-device ich9-ahci` and a disk on it, an MSI through the ITS -- `its MSI comes` -- and with `its=off` none to be had, the disk polled. x86-64's plain MSI is `ata-test.py --controller ahci`'s. `cpp-fuzz.py --target pagetable` holds `mmio_mapped_span` to its mappings. A table's destructor and an entry enabled twice are run by no gate: the drivers never let go of a table |
+| the DMA remapping units: VT-d (`arch/x86_64/vtd.{h,cpp}`: the units the DMAR names mapped and read, what the firmware left on turned off, and with `iommu=on` each taken over -- the root table and a context table a bus, every device passed through, queued invalidation and its bounded wait, the cache lines of a unit that does not snoop written back, the fault event at `Vtd::FAULT_VECTOR` with its rate and its storm brake; `iommu`, `iommu block`/`unblock`), and what ACPI keeps of the DMAR -- units, device scopes, reserved regions, whether it was kept whole -- and of the MCFG (`drivers/acpi.cpp`) | `iommu-test.py` (x86-64; see below); the smoke boots, which have no DMAR and must say so in one line, and once more from `nos-test.iso` with `iommu=on` under `SMOKE_MACHINE=q35 SMOKE_EXTRA="-device intel-iommu" SMOKE_MARKER="passed through, queued invalidation"`, every smoke device working with the unit translating; `cpp-fuzz.py --target acpi`, its DMARs and MCFGs cut, overlong and over what is kept, and Hertz's as its firmware wrote them |
 | a device's line interrupt: `Interrupt::register_level` and `unregister_level` (`kernel/interrupt.cpp`, `arch/arm64/interrupt_arm64.cpp`), the IO-APIC's pins (`arch/x86_64/ioapic.cpp`), `Gic::disable_irq`, the drivers' slots (`kernel_interrupt_register_level`, `kernel_interrupt_unregister`) | the smoke boots, both arches (`test_irq_line_unregister`: two handlers share a spare line, the first leaves, a third joins, all leave and the vector is free, four times over -- on x86 under QEMU alone, told by the firmware's OEM id, since a real IO-APIC's pin that nothing drives may be held asserted; the x86 boot's legacy virtio-scsi is on a line of its own) |
 | the shell's line editors -- the console's (`kernel/line_editor.cpp`), an SSH session's (`common/net/ssh/src/terminal.rs`) -- and what the keyboards send them (`drivers/8042.cpp`, `drivers/usb/src/hid.rs`: an arrow as ESC [ A, Ctrl and a letter as its control byte) | `cpp-fuzz.py --target lineedit` and `net-fuzz.py --target terminal` (host, in CI): each editor held to a model over random keys -- the line Enter runs, and what its screen shows, to the byte; the smoke boots, whose `test_line_editor` types at the console's; `usb-test.py` (x86-64), whose USB keyboard presses Up and ^R. Nothing but QEMU's monitor types at the 8042, by hand |
 | `hv`, `hvarch`, `modules/hypervisor/hv` | `hv-test.py [--arch x86_64\|aarch64]`: loads, turns the CPU's virtualization extension on for every CPU, runs every built-in guest on the first and the last CPU and checks what each did, unloads **without** turning it off, and loads again to ask every CPU what it has -- an `rmmod` that left it on is a freed page the CPU is still saving host state into. x86-64 uses KVM `-cpu host` where the host has an extension -- **AMD-V** on AMD, **Intel VT-x (nested)** on Intel, so both backends are covered -- and TCG `-cpu max` (AMD-V) otherwise, since TCG has no VMX |
@@ -406,6 +407,30 @@ seed be made up for the next boot; with a virtio-rng a seed has to be kept;
 and a file of the wrong size is not taken, and left as it was. A host whose
 TCG does give the jitter collector variance has the two unseeded cases
 skipped, and says so ([Randomness](random.md)).
+
+### `iommu-test.py` -- VT-d, every device passed through, a blocked DMA said
+
+`make nos-test.iso TEST_ISO_ARGS="iommu=on udpshell=9100"`, then
+`tests/iommu-test.py`. One boot under QEMU's q35 with `-device intel-iommu`,
+whose DMAR names one unit for every device: nos has to take it over -- the
+boot log saying it translates with every device passed through, `iommu`
+saying on -- and the NVMe, whose DMA goes through the unit (QEMU's virtio
+devices go around it unless told `iommu_platform=on`), has to read its
+image's sector 0 through it. Then `iommu block` makes the NVMe's context
+entry not present, and a read of it is a DMA the unit blocks: the fault has
+to be said from the fault event's interrupt, with the NVMe's requester id and
+the reason (0x02, no context entry), the machine has to go on, `iommu` count
+the fault, and `iommu unblock` pass the device through again.
+
+The read itself is never answered: QEMU's NVMe takes the blocked fetch of
+its command for a fatal error of its own (CSTS.CFS), and nos's NVMe driver
+waits for the command with no deadline -- a gap of the driver's, which the
+gate steps around rather than leans on: the read is left to the UDP shell,
+and the rest asked of the console's shell over the serial port, which QEMU
+makes a TCP socket. Lines logged while a UDP shell's command runs reach dmesg
+and not the serial port, so the fault is read by `dmesg 50 vtd`. Put back
+with the unit's fault event left masked, the gate fails at "the blocked DMA
+is said": the line comes only once `iommu` looks.
 
 ### `ata-test.py` -- SATA, every sector where it was meant
 
