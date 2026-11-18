@@ -1613,53 +1613,94 @@ ulong ModuleTable::snapshot(ModuleSnapshot* out, ulong max)
     return n;
 }
 
+bool ModuleTable::dump_line(ulong index, DumpLine& line)
+{
+    bool found = false;
+    const ulong flags = lock_.lock_irq_save();
+    ulong i = 0;
+    for (stdlib::ListEntry* entry = list_.flink; entry != &list_; entry = entry->flink, i++)
+    {
+        if (i != index)
+            continue;
+
+        const LoadedModule* module = CONTAINING_RECORD(entry, LoadedModule, list_entry);
+        stdlib::mem_cpy(line.name, module->name, sizeof(line.name));
+        line.name[NAME_LEN_MAX] = '\0';
+        line.base = module->image.base;
+        line.kib = (module->image.count * consts::PAGE_SIZE) / consts::KB;
+        line.imports = module->imports;
+        line.permanent = (module->permanent_by != nullptr);
+        line.phase = (module->phase == ModulePhase::Loading) ? ", loading" :
+            (module->phase == ModulePhase::Unloading) ? ", unloading" : "";
+        found = true;
+        break;
+    }
+    lock_.unlock_irq_restore(flags);
+    return found;
+}
+
+/* How many decimal digits n is written in */
+static ulong decimal_digits(ulong n)
+{
+    ulong count = 1;
+    while (n >= 10)
+    {
+        n /= 10;
+        count++;
+    }
+    return count;
+}
+
+/* What a column of lsmod is padded from: room for the widest it has -- a
+   module's name, or a number's twenty digits */
+static const char LSMOD_SPACES[] = "                                ";
+static_assert(sizeof(LSMOD_SPACES) - 1 >= ModuleTable::NAME_LEN_MAX && sizeof(LSMOD_SPACES) - 1 >= 20,
+              "lsmod's padding is narrower than a column");
+
+/* The spaces that make text `have` wide as wide as `want`: none for text as
+   wide already */
+static const char* lsmod_pad(ulong have, ulong want)
+{
+    const ulong room = sizeof(LSMOD_SPACES) - 1;
+    ulong spaces = (want > have) ? want - have : 0;
+    if (spaces > room)
+        spaces = room;
+    return LSMOD_SPACES + (room - spaces);
+}
+
 void ModuleTable::dump(stdlib::Printer& out)
 {
     /* A module at a time, copied under the lock and printed without it: a
-       console line can take a while */
-    ulong shown = 0;
-    for (;; shown++)
+       console line can take a while. Each column as wide as its widest --
+       the modules looked through for the widths first, then listed; one
+       loaded or unloaded between the two is listed as it is then, its
+       columns perhaps a little off. The kernel's printf takes no width from
+       its arguments, so the padding is a string of its own. */
+    DumpLine line;
+    ulong name_width = 0;
+    ulong kib_width = 0;
+    ulong imports_width = 0;
+    ulong count = 0;
+    for (; dump_line(count, line); count++)
     {
-        char name[NAME_LEN_MAX + 1];
-        ulong base = 0;
-        ulong kib = 0;
-        ulong imports = 0;
-        ModulePhase phase = ModulePhase::Live;
-        bool permanent = false;
-        bool found = false;
-
-        {
-            const ulong flags = lock_.lock_irq_save();
-            ulong i = 0;
-            for (stdlib::ListEntry* entry = list_.flink; entry != &list_; entry = entry->flink, i++)
-            {
-                if (i != shown)
-                    continue;
-
-                const LoadedModule* module = CONTAINING_RECORD(entry, LoadedModule, list_entry);
-                stdlib::mem_cpy(name, module->name, sizeof(name));
-                base = module->image.base;
-                kib = (module->image.count * consts::PAGE_SIZE) / consts::KB;
-                imports = module->imports;
-                phase = module->phase;
-                permanent = (module->permanent_by != nullptr);
-                found = true;
-                break;
-            }
-            lock_.unlock_irq_restore(flags);
-        }
-
-        if (!found)
-            break;
-
-        out.printf("%s  %lu KiB at 0x%lX, %lu kernel imports%s%s\n", name, kib, base, imports,
-            permanent ? ", permanent" : "",
-            (phase == ModulePhase::Loading) ? ", loading" :
-            (phase == ModulePhase::Unloading) ? ", unloading" : "");
+        name_width = stdlib::max(name_width, static_cast<ulong>(stdlib::str_len(line.name)));
+        kib_width = stdlib::max(kib_width, decimal_digits(line.kib));
+        imports_width = stdlib::max(imports_width, decimal_digits(line.imports));
     }
 
-    if (shown == 0)
+    if (count == 0)
+    {
         out.printf("no modules loaded\n");
+        return;
+    }
+
+    for (ulong shown = 0; dump_line(shown, line); shown++)
+    {
+        out.printf("%s%s  %s%lu KiB at 0x%lX, %s%lu kernel imports%s%s\n", line.name,
+            lsmod_pad(stdlib::str_len(line.name), name_width), lsmod_pad(decimal_digits(line.kib), kib_width),
+            line.kib, line.base, lsmod_pad(decimal_digits(line.imports), imports_width), line.imports,
+            line.permanent ? ", permanent" : "", line.phase);
+    }
 }
 
 bool ModuleTable::describe(ulong addr, bool return_address, char* buf, ulong size)
