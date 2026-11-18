@@ -1,0 +1,46 @@
+#!/bin/bash
+# tests/gpu-passthrough-test.py --driver nvidia: the guest's /init. NVIDIA's own
+# driver on the GPU nos gives it -- nvidia.ko and nvidia-uvm.ko, the GSP's
+# firmware -- then nvidia-smi, and three of cuda-samples: deviceQuery,
+# vectorAdd, matrixMul. Every line the runner reads begins "gpu-guest: ".
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /dev/shm
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
+say() { echo "gpu-guest: $*"; }
+say "$(uname -r), $(nproc) cpus, $(grep MemTotal /proc/meminfo)"
+lspci -nn | sed 's/^/gpu-guest: pci /'
+M=$(find /lib/modules/$(uname -r)/kernel -maxdepth 1 -name 'nvidia-*-open' | head -1)
+insmod $M/nvidia.ko 2>&1 | sed 's/^/gpu-guest: insmod nvidia: /'
+say "insmod nvidia exit ${PIPESTATUS[0]}"
+# UVM's own word on what it could not do, which CUDA only calls an
+# initialization error
+insmod $M/nvidia-uvm.ko uvm_debug_prints=1 2>&1 | sed 's/^/gpu-guest: insmod nvidia-uvm: /'
+say "insmod nvidia-uvm exit ${PIPESTATUS[0]}"
+mknod -m 666 /dev/nvidiactl c 195 255
+mknod -m 666 /dev/nvidia0 c 195 0
+U=$(awk '$2 == "nvidia-uvm" { print $1 }' /proc/devices)
+if [ -n "$U" ]; then
+    mknod -m 666 /dev/nvidia-uvm c "$U" 0
+    mknod -m 666 /dev/nvidia-uvm-tools c "$U" 1
+fi
+say "nvidia-smi:"
+nvidia-smi 2>&1 | sed 's/^/gpu-guest: /'
+say "nvidia-smi exit ${PIPESTATUS[0]}"
+for t in deviceQuery vectorAdd matrixMul; do
+    say "$t:"
+    (cd /opt/cuda-samples && timeout 300 ./$t) 2>&1 | sed 's/^/gpu-guest: /'
+    say "$t exit ${PIPESTATUS[0]}"
+done
+dmesg | grep -iE 'NVRM|nvidia|uvm|Xid' | tail -40 | sed 's/^/gpu-guest: dmesg: /'
+say "done"
+sync
+echo o > /proc/sysrq-trigger
+# Off by then -- and no command of the disk's run meanwhile: the disk goes
+# first, and an init that ended would be a panic before the power off
+while :; do :; done
