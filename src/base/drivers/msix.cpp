@@ -34,6 +34,9 @@ MsixTable::MsixTable()
     , cap_offset_(0)
     , dev_(nullptr)
     , pci_msix_enabled_(false)
+    , msi_(false)
+    , msi_64_(false)
+    , msi_maskable_(false)
     , entry_vector_(nullptr)
 {
 }
@@ -45,9 +48,16 @@ MsixTable::~MsixTable()
     if (dev_ && cap_offset_ != 0 && pci_msix_enabled_)
     {
         auto& pci = Pci::get_instance();
-        u16 mc = pci.read_word(dev_->bus, dev_->slot, dev_->func, (u16)(cap_offset_ + 2));
-        mc = (u16)(mc & ~MSIX_CONTROL_ENABLE);
-        pci.write_word(dev_->bus, dev_->slot, dev_->func, (u16)(cap_offset_ + 2), mc);
+        if (msi_)
+        {
+            msi_set_enabled(false);
+        }
+        else
+        {
+            u16 mc = pci.read_word(dev_->bus, dev_->slot, dev_->func, (u16)(cap_offset_ + 2));
+            mc = (u16)(mc & ~MSIX_CONTROL_ENABLE);
+            pci.write_word(dev_->bus, dev_->slot, dev_->func, (u16)(cap_offset_ + 2), mc);
+        }
 
         u16 cmd = pci.read_word(dev_->bus, dev_->slot, dev_->func, 0x04);
         cmd = (u16)(cmd & ~PCI_COMMAND_INTX_DISABLE);
@@ -84,6 +94,13 @@ MsixTable::~MsixTable()
     dev_ = nullptr;
     cap_offset_ = 0;
     pci_msix_enabled_ = false;
+    msi_ = false;
+}
+
+/* MSI on x86 is the LAPIC's address and a vector: nothing to map first */
+bool MsixTable::map_msi_device()
+{
+    return true;
 }
 
 bool MsixTable::map_bar_for_table(Pci::DeviceInfo* dev, u8 bar, ulong offset_in_bar,
@@ -267,7 +284,7 @@ void MsixTable::disable_legacy_intx(Pci::DeviceInfo* dev)
 
 u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
 {
-    if (!table_ || !dev_ || index >= count_ || cap_offset_ == 0)
+    if (!is_ready() || !dev_ || index >= count_ || cap_offset_ == 0)
         return 0;
 
     if (entry_vector_[index] != 0)
@@ -278,8 +295,11 @@ u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
         const u8 had = entry_vector_[index];
         Idt::get_instance().set_descriptor(had, IdtDescriptor::encode(handler.get_handler_fn()));
         handler.on_interrupt_register(0, had);
-        /* Masked by the disable_vector of the slot that had it */
+        /* Masked by the disable_vector of the slot that had it -- or, an
+           MSI the device cannot mask, turned off by it */
         unmask(index);
+        if (msi_)
+            msi_set_enabled(true);
         return had;
     }
 
@@ -295,6 +315,32 @@ u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
        around (IrqBalance lock -> Retarget -> entry_lock_). */
     u32 apic_id = (u32)IrqBalance::get_instance().assign_msix(this, index);
     u32 addr_low = MSIX_ADDR_BASE | (apic_id << 12);
+
+    if (msi_)
+    {
+        /* The capability's message, with MSI still off (or the vector
+           masked): nothing is sent before the handler is at its vector */
+        {
+            stdlib::AutoLock lock(entry_lock_);
+            msi_set_masked(true);
+            msi_write_message(addr_low, (u32)vector);
+        }
+        Idt::get_instance().set_descriptor(vector, IdtDescriptor::encode(handler.get_handler_fn()));
+        handler.on_interrupt_register(0, vector);
+        {
+            stdlib::AutoLock lock(entry_lock_);
+            msi_set_masked(false);
+        }
+        if (!pci_msix_enabled_)
+        {
+            disable_legacy_intx(dev_);
+            pci_msix_enabled_ = true;
+        }
+        /* On again too where disable_vector turned it off */
+        msi_set_enabled(true);
+        entry_vector_[index] = vector;
+        return vector;
+    }
 
     volatile u8* entry = table_ + (ulong)index * 16;
 
@@ -333,22 +379,34 @@ u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
 
 void MsixTable::disable_vector(u16 index)
 {
-    if (!table_ || index >= count_ || entry_vector_ == nullptr || entry_vector_[index] == 0)
+    if (!is_ready() || index >= count_ || entry_vector_ == nullptr || entry_vector_[index] == 0)
         return;
 
     /* Masked first: the device holds what it raises from here as pending.
        One already on its way is the vector's default handler's, named and
-       dismissed, as ~MsixTable leaves it. */
+       dismissed, as ~MsixTable leaves it. An MSI the device cannot mask is
+       turned off instead -- its one vector is the table's -- or it would
+       go on sending to the default handler. */
     mask(index);
+    if (msi_ && !msi_maskable_)
+        msi_set_enabled(false);
     Idt::get_instance().reset_descriptor(entry_vector_[index]);
 }
 
 void MsixTable::mask(u16 index)
 {
-    if (!table_ || index >= count_)
+    if (!is_ready() || index >= count_)
         return;
 
     stdlib::AutoLock lock(entry_lock_);
+
+    /* An MSI that cannot be masked is not: what it sends meanwhile is its
+       vector's handler's, or, its vector reset, the default one's */
+    if (msi_)
+    {
+        msi_set_masked(true);
+        return;
+    }
 
     volatile u8* entry = table_ + (ulong)index * 16;
     u32 ctrl = mmio_read32(entry + 12);
@@ -357,10 +415,16 @@ void MsixTable::mask(u16 index)
 
 void MsixTable::unmask(u16 index)
 {
-    if (!table_ || index >= count_)
+    if (!is_ready() || index >= count_)
         return;
 
     stdlib::AutoLock lock(entry_lock_);
+
+    if (msi_)
+    {
+        msi_set_masked(false);
+        return;
+    }
 
     volatile u8* entry = table_ + (ulong)index * 16;
     u32 ctrl = mmio_read32(entry + 12);
@@ -369,10 +433,21 @@ void MsixTable::unmask(u16 index)
 
 void MsixTable::retarget(u16 index, u32 apic_id)
 {
-    if (!table_ || index >= count_ || entry_vector_[index] == 0)
+    if (!is_ready() || index >= count_ || entry_vector_[index] == 0)
         return;
 
     stdlib::AutoLock lock(entry_lock_);
+
+    if (msi_)
+    {
+        /* Masked across the change where it can be; where it cannot, the
+           address is one dword, which the device takes whole -- one
+           destination or the other, the vector the same at both */
+        msi_set_masked(true);
+        msi_write_message(MSIX_ADDR_BASE | (apic_id << 12), (u32)entry_vector_[index]);
+        msi_set_masked(false);
+        return;
+    }
 
     volatile u8* entry = table_ + (ulong)index * 16;
 

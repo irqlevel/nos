@@ -22,6 +22,17 @@ public:
        for the table's offset is held to the mapping's length. */
     bool setup(Pci::DeviceInfo* dev, const ulong* mapped_bars = nullptr);
 
+    /* The device's MSI capability (cap ID 0x05) taken as a table of one
+       entry, for a device that has MSI and no MSI-X -- an Intel AHCI HBA's
+       is one. Its entry is the capability's message, written in config
+       space rather than in a BAR; everything after -- enable_vector(0),
+       disable_vector, mask, unmask, retarget, the destructor -- is the
+       table's as for MSI-X. One message (MME 0) whatever the device could
+       take. Returns false if the device has no MSI. Does not enable MSI in
+       hardware. Never taken in place of MSI-X behind a driver's back: a
+       driver asks for it by name (kernel_msi_create). */
+    bool setup_msi(Pci::DeviceInfo* dev);
+
     /* Program table entry `index`, install IDT handler, return CPU vector 0 on failure.
        An entry enabled already keeps its vector and takes the new handler,
        unmasked again: the one it had may be gone (a slot unregistered and
@@ -42,7 +53,7 @@ public:
     void retarget(u16 index, u32 apic_id);
 
     u16 get_table_size() const { return count_; }
-    bool is_ready() const { return table_ != nullptr && count_ > 0; }
+    bool is_ready() const { return (table_ != nullptr || msi_) && count_ > 0; }
 
     static const u8 MSIX_VECTOR_BASE = 0x40;
     static const u8 MSIX_VECTOR_LIMIT = 0xEF;
@@ -58,11 +69,27 @@ private:
     static void free_vector(u8 vector);
     static void disable_legacy_intx(Pci::DeviceInfo* dev);
 
+    /* MSI (setup_msi): the arch's part of taking the device -- arm64 maps it
+       with the ITS for one event, x86 has nothing to do -- and the
+       capability's own fields, written in config space (drivers/msi.cpp,
+       both arches). The message is written with MSI off or the entry
+       masked; enabling turns INTx off, as MSI-X's does. */
+    bool map_msi_device();
+    void msi_write_message(u64 address, u32 data);
+    void msi_set_masked(bool masked);
+    void msi_set_enabled(bool enabled);
+
     volatile u8* table_;
     u16 count_;
     u8 cap_offset_;
     Pci::DeviceInfo* dev_;
     bool pci_msix_enabled_;
+
+    /* MSI rather than MSI-X: the capability is its one entry, 64-bit
+       addressed or not, maskable per vector or not */
+    bool msi_;
+    bool msi_64_;
+    bool msi_maskable_;
 
     /* Per-table-entry assigned CPU vector; 0 = none. */
     u8* entry_vector_;
