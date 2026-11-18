@@ -13,6 +13,13 @@ That is how the Hetzner boxes in [Real hardware](real-hardware.md) run nos.
 They were set up by hand, before this existed; a new machine is set up as
 below.
 
+A server can also be nos's alone: a whole disk made nos's own, with a GRUB
+of its own that boots nos and nothing else -- from the provider's rescue
+system, or from the **installer ISO** a provider's virtual media boots
+([A disk of its own](#a-disk-of-its-own), [From an ISO](#from-an-iso)).
+There is no system of the server's to fall back to then: the way back in
+is the provider's rescue system or its console.
+
 ## What the server needs
 
 nos boots on what it has drivers for, and a server's only console is its
@@ -43,7 +50,9 @@ but cannot fix any of them:
   load one. `nos-install` runs under that Linux, as root, and wants
   e2fsprogs, util-linux, GRUB's tools (`grub-editenv`, `update-grub` or
   `grub-mkconfig`) and either squashfs support in the kernel or
-  `unsquashfs` -- all of them are on a stock Ubuntu or Debian.
+  `unsquashfs` -- all of them are on a stock Ubuntu or Debian. A disk of
+  nos's own needs no Linux of the server's: a rescue system's will do, or
+  the installer's own, and Secure Boot off all the same.
 
 ## The image
 
@@ -226,6 +235,108 @@ answered before), and logs in to check the kernel running is the image's.
 `--no-boot` stops before the reboot, `--wait` gives nos longer than ten
 minutes, and nos-install's options pass through.
 
+## A disk of its own
+
+`nos-install disk` makes a whole disk nos's -- what the installer ISO runs,
+and what a provider's rescue system, a Linux booted from the network with
+the server's disks idle, runs as well:
+
+```sh
+mount -o loop,ro nos-x86_64.squashfs /mnt
+/mnt/nos-install disk /dev/disk/by-id/nvme-SAMSUNG_MZQL2960HCJR-00A07_S64FNE0R123456 \
+    --ssh-key /root/.ssh/authorized_keys --root-size 10G
+umount /mnt
+```
+
+The disk gets a GPT of nos's own:
+
+| Partition | Size | |
+|---|---|---|
+| `BIOS boot` | 1 MiB, from 1 MiB | GRUB's core image, for a BIOS's boot |
+| `EFI System` | 512 MiB, FAT32 | GRUB for UEFI at `\EFI\BOOT\BOOTX64.EFI`: the path firmware boots a disk by when it has no boot entry for it |
+| `nos` | `--root-size`, 10G unless given; `all` for the rest of the disk | nos's root: an ext4 labelled `nos`, the image on it as `install` puts it there |
+| `nos-data` | the rest, where it is 1 GiB or more | nothing on it -- its first and last MiB zeros: a VM's disk, by the GUID `disks` shows it with ([A device as a guest's disk](hypervisor.md#a-device-as-a-guests-disk)), or NBS's device (`nbs devices add`) |
+
+GRUB goes on for BIOS and for UEFI both, where this Linux has both
+(`grub-pc-bin`, `grub-efi-amd64-bin`; the one the machine boots by it must
+have), so the disk boots whichever way the firmware is set, and the root's
+`/boot/grub/grub.cfg` is the disk's own: what `42_nos` does in a server's
+GRUB, with nothing else to fall back to -- it finds the root by its UUID,
+takes `nos_cmdline` and `nos_next` from `/grubenv`, and the entries from the
+image's `nos.cfg`, `nos` the default. No boot entry is written to the
+firmware, and its boot order is left as it is: a provider's servers try
+the network first, for the rescue system, and the disk after it.
+
+Refused, before anything is written: a partition (`install` takes those);
+a disk any of which is in use -- mounted, swap, held by md, LVM or the
+device mapper; a disk nos does not read -- behind a RAID controller, on USB
+(it would boot, and find no root); one too small for the root; and a disk
+that holds anything -- a partition table, a filesystem, any byte that is not
+zero in its first or last MiB -- unless `--wipe` says to erase it.
+`--dry-run` checks all of that and says what it would write.
+`nos-install disks` lists the disks here as an installer offers them.
+
+`update`, `rollback`, `boot` and `status` then find the root of a disk of
+nos's own by themselves, from any Linux booted on the machine -- the
+rescue system, the installer's shell -- by its label and its grub.cfg (or
+take it named), and change nothing of that Linux's GRUB; `boot` has
+nothing to arm, as nos is the disk's default, and `uninstall` nothing to
+take out.
+
+## From an ISO
+
+Many providers install a dedicated server from an ISO: mounted through the
+server's BMC as a virtual CD (IPMI, iDRAC, iLO), or from their panel, and
+seen on its console (KVM). `nos-installer-x86_64.iso` is that for nos: a
+small Linux that runs from memory -- Alpine, of one pinned release --
+carrying the system image as it was built, which it pours with that
+image's `nos-install disk`. It boots by BIOS or UEFI; its menu:
+
+| Entry | |
+|---|---|
+| Install nos | the dialog on the screen; the kernel's lines on the first serial port as well |
+| ... on ttyS0, ... on ttyS1 | the dialog on a serial port: an IPMI Serial over LAN is often the second |
+| Try nos | the image's own kernel, booted from the ISO with no root: nothing mounted, nothing written, and the screen says which disks and network cards nos finds -- whether this machine is one nos runs on, before anything is erased |
+
+The dialog asks which disk -- every one Linux sees, each said with its
+model, serial and size, what it holds and whether nos can read it -- how big
+nos's root is to be, the network (DHCP, or an address for a network with
+none, which the installer tries on the gateway), and the keys sshd is to let
+in: pasted, or fetched by URL or as a GitHub user's (`https://github.com/<user>.keys`),
+their fingerprints shown. Then what `nos-install disk --dry-run` would write,
+and the disk's name typed to erase it. When it is done: take the ISO out of
+the virtual media and boot the disk.
+
+Built from the tree with Docker:
+
+```sh
+scripts/installer/build.sh                      # nos-installer-x86_64.iso, of nos-x86_64.squashfs
+scripts/installer/build.sh --answers answers    # one that asks nothing
+```
+
+An ISO built with answers ([`answers.example`](../scripts/installer/answers.example))
+installs with no questions, as a fleet's is: the disk by its
+`/dev/disk/by-id` name, `wipe=yes`, the root's size, the keys or their URLs,
+a static address, netconsole, kernel parameters, and what to do after --
+`poweroff` unless told, `reboot` (the virtual CD ejected first where the BMC
+lets it be), or stay. What it does goes to the screen and, at the level
+every console shows, to the kernel log: a `netconsole=` given to the
+installer's kernel (`e` in its menu) carries it off a machine nobody
+watches. A word `nos.KEY=VALUE` on that command line answers one question,
+and wins over the file. Booted again on a disk that has the image on it as
+it would put it there, it installs nothing -- so a firmware that boots the
+ISO before the disk does not erase what it just made.
+
+It carries Intel's microcode, a file a CPU as Debian's package has them
+(split out of Alpine's `intel-ucode` with `iucode_tool`), so a disk it makes
+has the machine's CPU's at `/boot/ucode` as an install from the server's
+own Linux would; and the random pool's first seed is the installer's own
+`/dev/urandom`, which Linux seeds where nos's jitter finds nothing.
+
+The installer's Linux is GPL software among others: the packages it is made
+of are listed in the ISO's `/etc/nos-installer/packages`, by version, for
+their sources at Alpine's.
+
 ## Updating, and going back
 
 ```sh
@@ -308,9 +419,17 @@ it finds one. So does an `/etc/rc` that loads a module from outside
   tree the ones another system made there ([Filesystems](filesystems.md)).
 - A server whose disks or network card nos has no driver for is not one this
   works on: see the first section.
+- A disk of nos's own is one disk: nos reads no md mirror, so its root is
+  not mirrored onto a second. Its sectors are 512 bytes, as BIOS boots them
+  (a 4Kn disk is refused), and it boots as the firmware's order has it: no
+  boot entry is written, none moved.
+- The installer's dialog takes keys, not a password: nos's sshd lets in
+  ssh-ed25519 keys alone.
 
 `tests/image-test.py` is the test of all of this: it pours the image onto
 a partition with `nos-install` under Linux, boots the disk through a GRUB
 standing in for a server's, logs in with the key it gave, checks that no UDP
 shell answers and that the next boot is the server's own, then updates,
-rolls back and uninstalls ([Testing](testing.md)).
+rolls back and uninstalls; and it makes a whole disk nos's own and boots it
+under SeaBIOS and OVMF. `tests/installer-test.py` boots the installer ISO,
+built with answers, and installs with it ([Testing](testing.md)).
