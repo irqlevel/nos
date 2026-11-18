@@ -259,6 +259,14 @@ name = "diskimage"
 version = "0.1.0"
 
 [[package]]
+name = "e1000e"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "net",
+]
+
+[[package]]
 name = "ecdsa"
 version = "0.16.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -548,6 +556,7 @@ dependencies = [
  "block",
  "crc",
  "crypto",
+ "e1000e",
  "events",
  "ffi",
  "fs",
