@@ -17,8 +17,12 @@
 //!   machine check (Linux's VFIO blocks it so, CVE-2020-12888); its INTx
 //!   disable stays the host's (set: the device's interrupt is its MSI, the
 //!   host's to take);
-//! - there is no expansion ROM, no INTx pin, and the interrupt line is the
-//!   guest's to write;
+//! - there is no expansion ROM; the INTx pin is the device's, and the
+//!   interrupt line the guest's to write: the pin is there because a driver
+//!   may want a legacy IRQ to exist -- NVIDIA's refuses a function with
+//!   neither one nor MSI-X (`nv_treat_missing_irq_as_error`) -- and the run
+//!   loop wires it to a line nothing raises (`run::HOST_IRQ`): the device's
+//!   INTx stays off, its interrupt is its MSI;
 //! - the MSI capability is emulated: what the guest writes is what the
 //!   host's handler of the device's real MSI sends it (`Msi`), and the real
 //!   capability is the host's (`kcore::msix`);
@@ -488,7 +492,7 @@ impl HostFunction {
             ROM => 0,
             INTERRUPT_LINE => {
                 let real = self.real.read32(dword as u16);
-                (real & 0xFFFF_0000) | u32::from(self.line)
+                (real & 0xFFFF_FF00) | u32::from(self.line)
             }
             d if self.msi_cap != 0 && (self.msi_cap..self.msi_cap + msi_len(self)).contains(&d) => {
                 self.read_msi(d - self.msi_cap)
