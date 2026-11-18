@@ -30,6 +30,15 @@ Acpi::Acpi()
     , hpet_base_phys_(0)
     , hpet_min_tick_(0)
     , firmware_watchdog_(false)
+    , dmar_present_(false)
+    , dmar_complete_(false)
+    , dmar_width_(0)
+    , dmar_flags_(0)
+    , dmar_unit_count_(0)
+    , dmar_reserved_count_(0)
+    , mcfg_base_(0)
+    , mcfg_start_bus_(0)
+    , mcfg_end_bus_(0)
 {
     oem_id_[0] = '\0';
     for (size_t i = 0; i < stdlib::array_size(table_); i++)
@@ -37,6 +46,8 @@ Acpi::Acpi()
         table_[i] = nullptr;
         table_length_[i] = 0;
     }
+    stdlib::mem_set(dmar_unit_, 0, sizeof(dmar_unit_));
+    stdlib::mem_set(dmar_reserved_, 0, sizeof(dmar_reserved_));
 }
 
 Acpi::~Acpi()
@@ -241,9 +252,23 @@ ulong Acpi::root_entry(size_t index)
 namespace
 {
 
-/* What this kernel reads of ACPI: the MADT, the FADT, the HPET table and
-   the WDAT (Acpi::table_ has one slot for each) */
-const char* const WANTED_TABLES[] = { "APIC", "FACP", "HPET", "WDAT" };
+/* What this kernel reads of ACPI: the MADT, the FADT, the HPET table, the
+   WDAT, the DMAR and the MCFG (Acpi::table_ has one slot for each) */
+const char* const WANTED_TABLES[] = { "APIC", "FACP", "HPET", "WDAT", "DMAR", "MCFG" };
+
+/* A little-endian field of `bytes` bytes (8 at most) at p, a byte at a time:
+   the DMAR's and the MCFG's structures are packed, and only as aligned as
+   the table, which is 4-byte aligned if that */
+u64 read_le(const u8* p, size_t bytes)
+{
+    u64 value = 0;
+    for (size_t i = 0; i < bytes; i++)
+        value |= static_cast<u64>(p[i]) << (8 * i);
+    return value;
+}
+
+/* An ECAM window decodes a MiB a bus (PCI Express 7.2.2) */
+const ulong ECAM_BUS_SHIFT = 20;
 
 }
 
@@ -844,6 +869,186 @@ void Acpi::parse_wdat()
         (ulong)entries, (ulong)wdat->timer_period);
 }
 
+bool Acpi::parse_dmar_scopes(const u8* scopes, size_t len, DmarScope* scope, size_t& count)
+{
+    count = 0;
+    for (size_t at = 0; at < len; )
+    {
+        if (len - at < SCOPE_FIXED_BYTES)
+        {
+            klog(0, "Acpi: DMAR: a device scope cut %lu bytes in", (ulong)(len - at));
+            return false;
+        }
+
+        const u8* d = scopes + at;
+        const size_t d_len = d[1];
+        if (d_len < SCOPE_FIXED_BYTES || d_len > len - at || (d_len - SCOPE_FIXED_BYTES) % 2 != 0)
+        {
+            klog(0, "Acpi: DMAR: a device scope of length %lu, where %lu bytes are left", (ulong)d_len,
+                (ulong)(len - at));
+            return false;
+        }
+
+        const size_t hops = (d_len - SCOPE_FIXED_BYTES) / 2;
+        if (hops > MAX_DMAR_PATH || count >= MAX_DMAR_SCOPES)
+        {
+            klog(0, "Acpi: DMAR: %s", (hops > MAX_DMAR_PATH) ? "a device scope's path longer than kept" :
+                "more device scopes than kept");
+            return false;
+        }
+
+        DmarScope& s = scope[count];
+        s.type = d[0];
+        s.enumeration_id = d[4];
+        s.start_bus = d[5];
+        s.path_length = static_cast<u8>(hops);
+        for (size_t h = 0; h < MAX_DMAR_PATH; h++)
+        {
+            s.path[h][0] = (h < hops) ? d[SCOPE_FIXED_BYTES + 2 * h] : 0;
+            s.path[h][1] = (h < hops) ? d[SCOPE_FIXED_BYTES + 2 * h + 1] : 0;
+        }
+        count++;
+        at += d_len;
+    }
+    return true;
+}
+
+void Acpi::parse_dmar()
+{
+    u32 length = 0;
+    ACPISDTHeader* sdt_header = lookup_table("DMAR", length);
+    if (sdt_header == nullptr)
+    {
+        klog(ACPI_LL, "Acpi: no DMAR table");
+        return;
+    }
+
+    if (length < sizeof(ACPISDTHeader) + DMAR_BODY_BYTES)
+    {
+        klog(0, "Acpi: DMAR table too short: %lu", (ulong)length);
+        return;
+    }
+
+    /* The width is the host address width field and one: a field of 63 or
+       more is 64 bits, which is all an address has */
+    static const u8 MAX_WIDTH = 64;
+    const u8* table = reinterpret_cast<const u8*>(sdt_header);
+    const u8 haw = table[sizeof(ACPISDTHeader)];
+    dmar_present_ = true;
+    dmar_complete_ = true;
+    dmar_width_ = (haw >= MAX_WIDTH - 1) ? MAX_WIDTH : static_cast<u8>(haw + 1);
+    dmar_flags_ = table[sizeof(ACPISDTHeader) + 1];
+
+    for (size_t at = sizeof(ACPISDTHeader) + DMAR_BODY_BYTES; at < length; )
+    {
+        if (length - at < DMAR_STRUCT_HEADER_BYTES)
+        {
+            klog(0, "Acpi: DMAR: a structure cut by the table at %lu", (ulong)at);
+            dmar_complete_ = false;
+            break;
+        }
+
+        const u8* s = table + at;
+        const u16 type = static_cast<u16>(read_le(s, 2));
+        const size_t s_len = static_cast<size_t>(read_le(s + 2, 2));
+        if (s_len < DMAR_STRUCT_HEADER_BYTES || s_len > length - at)
+        {
+            klog(0, "Acpi: DMAR: a structure of type %lu at %lu of length %lu, the table %lu long", (ulong)type,
+                (ulong)at, (ulong)s_len, (ulong)length);
+            dmar_complete_ = false;
+            break;
+        }
+        at += s_len;
+
+        if (type == DMAR_TYPE_DRHD)
+        {
+            if (s_len < DRHD_FIXED_BYTES || dmar_unit_count_ >= MAX_DMAR_UNITS)
+            {
+                klog(0, "Acpi: DMAR: %s", (s_len < DRHD_FIXED_BYTES) ? "a unit shorter than its fields" :
+                    "more units than kept");
+                dmar_complete_ = false;
+                continue;
+            }
+            DmarUnit& unit = dmar_unit_[dmar_unit_count_++];
+            unit.include_all = (s[4] & DRHD_INCLUDE_PCI_ALL) != 0;
+            unit.size = s[5];
+            unit.segment = static_cast<u16>(read_le(s + 6, 2));
+            unit.base = static_cast<ulong>(read_le(s + 8, 8));
+            if (!parse_dmar_scopes(s + DRHD_FIXED_BYTES, s_len - DRHD_FIXED_BYTES, unit.scope, unit.scope_count))
+                dmar_complete_ = false;
+            klog(ACPI_LL, "Acpi: DMAR: unit at 0x%lX, segment %lu%s, %lu device scopes", unit.base,
+                (ulong)unit.segment, unit.include_all ? ", every device" : "", (ulong)unit.scope_count);
+        }
+        else if (type == DMAR_TYPE_RMRR)
+        {
+            if (s_len < RMRR_FIXED_BYTES || dmar_reserved_count_ >= MAX_DMAR_RESERVED)
+            {
+                klog(0, "Acpi: DMAR: %s", (s_len < RMRR_FIXED_BYTES) ? "a reserved region shorter than its fields" :
+                    "more reserved regions than kept");
+                dmar_complete_ = false;
+                continue;
+            }
+            DmarReserved& region = dmar_reserved_[dmar_reserved_count_++];
+            region.segment = static_cast<u16>(read_le(s + 6, 2));
+            region.base = static_cast<ulong>(read_le(s + 8, 8));
+            region.limit = static_cast<ulong>(read_le(s + 16, 8));
+            if (!parse_dmar_scopes(s + RMRR_FIXED_BYTES, s_len - RMRR_FIXED_BYTES, region.scope, region.scope_count))
+                dmar_complete_ = false;
+            klog(ACPI_LL, "Acpi: DMAR: reserved 0x%lX-0x%lX, segment %lu, %lu device scopes", region.base,
+                region.limit, (ulong)region.segment, (ulong)region.scope_count);
+        }
+    }
+
+    klog(0, "Acpi: DMAR: %lu-bit DMA, flags 0x%lX, %lu units, %lu reserved regions%s", (ulong)dmar_width_,
+        (ulong)dmar_flags_, (ulong)dmar_unit_count_, (ulong)dmar_reserved_count_,
+        dmar_complete_ ? "" : "; not all of it kept, so no IOMMU");
+}
+
+void Acpi::parse_mcfg()
+{
+    u32 length = 0;
+    ACPISDTHeader* sdt_header = lookup_table("MCFG", length);
+    if (sdt_header == nullptr)
+    {
+        klog(ACPI_LL, "Acpi: no MCFG table");
+        return;
+    }
+
+    if (length < sizeof(ACPISDTHeader) + MCFG_RESERVED_BYTES)
+    {
+        klog(0, "Acpi: MCFG table too short: %lu", (ulong)length);
+        return;
+    }
+
+    /* Segment 0's first window: the only segment the PCI code reaches. Its
+       base is bus 0's, whatever its first bus, a MiB a bus aligned; one that
+       would run past the physical address space is not a window. */
+    const u8* table = reinterpret_cast<const u8*>(sdt_header);
+    const size_t entries = (length - sizeof(ACPISDTHeader) - MCFG_RESERVED_BYTES) / MCFG_ENTRY_BYTES;
+    for (size_t i = 0; i < entries; i++)
+    {
+        const u8* e = table + sizeof(ACPISDTHeader) + MCFG_RESERVED_BYTES + i * MCFG_ENTRY_BYTES;
+        const u64 base = read_le(e, 8);
+        const u16 segment = static_cast<u16>(read_le(e + 8, 2));
+        const u8 start = e[10];
+        const u8 end = e[11];
+        const u64 span = static_cast<u64>(end + 1) << ECAM_BUS_SHIFT;
+        if (segment != 0 || base == 0 || start > end || (base & ((1ULL << ECAM_BUS_SHIFT) - 1)) != 0 ||
+            base > mm::MemoryMap::MAX_PHYS_ADDR || span > mm::MemoryMap::MAX_PHYS_ADDR - base)
+        {
+            klog(0, "Acpi: MCFG: window 0x%lX segment %lu buses %lu-%lu passed over", (ulong)base, (ulong)segment,
+                (ulong)start, (ulong)end);
+            continue;
+        }
+        mcfg_base_ = static_cast<ulong>(base);
+        mcfg_start_bus_ = start;
+        mcfg_end_bus_ = end;
+        klog(0, "Acpi: MCFG: ECAM at 0x%lX, buses %lu-%lu", mcfg_base_, (ulong)start, (ulong)end);
+        return;
+    }
+    klog(0, "Acpi: MCFG names no ECAM window of segment 0");
+}
+
 stdlib::Error Acpi::parse()
 {
     stdlib::Error err = parse_tables();
@@ -912,6 +1117,9 @@ stdlib::Error Acpi::parse_tables()
     parse_hpet();
 
     parse_wdat();
+
+    parse_dmar();
+    parse_mcfg();
 
     return make_error(stdlib::Error::SUCCESS);
 }
@@ -1033,6 +1241,61 @@ u16 Acpi::get_hpet_min_tick()
 bool Acpi::has_firmware_watchdog()
 {
     return firmware_watchdog_;
+}
+
+bool Acpi::has_dmar()
+{
+    return dmar_present_;
+}
+
+bool Acpi::dmar_complete()
+{
+    return dmar_present_ && dmar_complete_;
+}
+
+u8 Acpi::get_dmar_width()
+{
+    return dmar_width_;
+}
+
+u8 Acpi::get_dmar_flags()
+{
+    return dmar_flags_;
+}
+
+size_t Acpi::get_dmar_unit_count()
+{
+    return dmar_unit_count_;
+}
+
+const Acpi::DmarUnit* Acpi::get_dmar_unit(size_t index)
+{
+    return (index < dmar_unit_count_) ? &dmar_unit_[index] : nullptr;
+}
+
+size_t Acpi::get_dmar_reserved_count()
+{
+    return dmar_reserved_count_;
+}
+
+const Acpi::DmarReserved* Acpi::get_dmar_reserved(size_t index)
+{
+    return (index < dmar_reserved_count_) ? &dmar_reserved_[index] : nullptr;
+}
+
+ulong Acpi::get_mcfg_base()
+{
+    return mcfg_base_;
+}
+
+u8 Acpi::get_mcfg_start_bus()
+{
+    return mcfg_start_bus_;
+}
+
+u8 Acpi::get_mcfg_end_bus()
+{
+    return mcfg_end_bus_;
 }
 
 }
