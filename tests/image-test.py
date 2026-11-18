@@ -35,6 +35,20 @@ finds an NVMe disk and boots nothing from it -- "Booting from Hard Disk...",
 GRUB's core image never read, and nothing on the serial line -- where a newer
 one boots it; nos reads both, and the disk's driver is the smoke boot's to
 test, not this.
+Then a whole disk made nos's own, as an installer or a provider's rescue
+system makes one (nos-install disk), with no GRUB of the machine's to touch:
+refused, before anything is written, when it holds something and --wipe is
+not given, when it is a partition, when a filesystem of it is mounted and
+when the root's 10G does not fit; then a GPT -- BIOS boot, EFI System, the
+root of the size asked for, the rest a partition with nothing on it -- the
+image on the root, and GRUB for BIOS and UEFI. The disk boots nos alone,
+under SeaBIOS and under OVMF (by the path firmware boots a disk with no boot
+entry), from its own grub.cfg, with the command line kept in its grubenv,
+and nos sees the blank partition by its GUID. Status and update find that
+root by themselves and leave every GRUB of the machine alone; boot has
+nothing to arm, uninstall nothing to take out, and an install over it is
+refused.
+
 The Linux side (losetup, mkfs, mount, nos-install) runs under sudo on Linux,
 and in the nos-builder image, --privileged, elsewhere; QEMU runs here.
 
@@ -64,6 +78,15 @@ MiB = 1024 * 1024
 DISK_SIZE = 384 * MiB
 HOST_START, HOST_SIZE = 1 * MiB, 64 * MiB
 NOS_START, NOS_SIZE = 65 * MiB, 256 * MiB
+# The disk of nos's own: room for GRUB's two partitions, a root of 1G and a
+# blank one after it, and not for the 10G a root is unless told
+WHOLE_SIZE = 3 * 1024 * MiB
+WHOLE_ROOT = "1G"
+SECTOR = 512
+GPT_BIOS_BOOT = "21686148-6449-6E6F-744E-656564454649"
+GPT_ESP = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
+GPT_LINUX = "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
+STANDALONE_MARK = "# nos: this disk's own GRUB configuration, written by nos-install disk"
 
 # The UDP shell's framing (scripts/udpsh.py)
 SHELL_MAGIC = 0x4E4F5348
@@ -247,6 +270,117 @@ cat uninstall.out
 [ ! -e grub.d/42_nos ] && echo "uninstalled: yes"
 """
 
+# A disk of nos's own: the whole of whole.raw on a loop device that has its
+# partitions, nos-install run with no 42_nos anywhere -- as on an installer
+# or a rescue system -- and an update-grub that fails the run, should one be
+# asked for
+WHOLE_HELPERS = r"""
+attach_disk() {
+    local dev
+    dev=$(losetup -fP --show "$2")
+    [ -b "$dev" ] || { echo "no loop device for $2" >&2; exit 1; }
+    LOOPS+=("$dev")
+    printf -v "$1" %s "$dev"
+}
+disk_install() {
+    mkdir -p "$T/grub.d.disk"
+    NOS_GRUB_D="$T/grub.d.disk" NOS_UPDATE_GRUB=false NOS_ALLOW_ANY_DISK=1 \
+        NOS_CPUINFO="$T/cpuinfo" NOS_UCODE_DIR="$T/intel-ucode" "$T/img/nos-install" "$@"
+}
+first_mib() { dd if="$1" bs=1M count=1 status=none | sha256sum | cut -d' ' -f1; }
+blank_mib() { [ -z "$(dd if="$1" bs=1M count=1 status=none | tr -d '\000' | head -c 1)" ]; }
+"""
+
+WHOLE_PREPARE = WHOLE_HELPERS + r"""
+truncate -s "$WHOLE_SIZE" whole.raw
+attach_disk WHOLE whole.raw
+
+# Refused before anything is written: a disk that holds something, without
+# --wipe
+parted -s "$WHOLE" mklabel msdos mkpart primary ext2 1MiB 64MiB
+before=$(first_mib "$WHOLE")
+if disk_install disk "$WHOLE" --root-size "$WHOLE_ROOT" --ssh-key id_test.pub > refuse-holds.out 2>&1; then
+    echo "holds: installed"
+fi
+cat refuse-holds.out
+[ "$(first_mib "$WHOLE")" != "$before" ] || echo "holds: the disk is as it was"
+
+# ... a partition, not a disk
+if disk_install disk "${WHOLE}p1" --wipe > refuse-part.out 2>&1; then
+    echo "part: installed"
+fi
+cat refuse-part.out
+
+# ... a disk with a filesystem of it mounted, --wipe or not
+mkfs.ext2 -q -F "${WHOLE}p1"
+mount_at "${WHOLE}p1" busy
+if disk_install disk "$WHOLE" --wipe --root-size "$WHOLE_ROOT" > refuse-mounted.out 2>&1; then
+    echo "mounted: installed"
+fi
+cat refuse-mounted.out
+unmount_last
+
+# ... and a root of the size it is unless told, which the disk has no room for
+before=$(first_mib "$WHOLE")
+if disk_install disk "$WHOLE" --wipe --ssh-key id_test.pub > refuse-size.out 2>&1; then
+    echo "size: installed"
+fi
+cat refuse-size.out
+[ "$(first_mib "$WHOLE")" != "$before" ] || echo "size: the disk is as it was"
+
+disk_install disk "$WHOLE" --wipe --root-size "$WHOLE_ROOT" --ssh-key id_test.pub \
+    --netconsole 10.0.2.2:6666 > disk.out 2>&1 || { cat disk.out; exit 1; }
+cat disk.out
+sfdisk --dump "$WHOLE" > layout.out
+cat layout.out
+fsck.vfat -n "${WHOLE}p2" > fsckfat.out 2>&1 && echo "esp: clean" || { cat fsckfat.out; echo "esp: DAMAGED"; }
+e2fsck -fn "${WHOLE}p3" > fsckroot.out 2>&1 && echo "root: clean" || { cat fsckroot.out; echo "root: DAMAGED"; }
+[ -n "$(blkid -p -o value -s TYPE "${WHOLE}p4" || true)" ] || ! blank_mib "${WHOLE}p4" || echo "data: blank"
+[ -z "$(dd if="$WHOLE" bs=440 count=1 status=none | tr -d '\000' | head -c 1)" ] || echo "mbr: boot code"
+blkid -p -o value -s PART_ENTRY_UUID "${WHOLE}p4" > data-partuuid.out
+blkid -p -o value -s UUID "${WHOLE}p3" > root-uuid.out
+mount_at "${WHOLE}p2" esp ro
+[ ! -f esp/EFI/BOOT/BOOTX64.EFI ] || echo "esp: BOOTX64.EFI"
+unmount_last
+mount_at "${WHOLE}p3" root ro
+head -n 1 root/boot/grub/grub.cfg > grubcfg-first.out
+sed -n 's/^set nos_uuid=//p' root/boot/grub/grub.cfg > grubcfg-uuid.out
+[ ! -f root/boot/grub/i386-pc/core.img ] || echo "root: GRUB for BIOS"
+[ ! -d root/boot/grub/x86_64-efi ] || echo "root: GRUB for UEFI"
+grub-editenv root/grubenv list > disk-grubenv.out
+echo "keys: $(grep -c '^ssh-ed25519 ' root/etc/ssh/authorized_keys || true)"
+same_as_image root disk
+unmount_last
+echo "grub.d: $(ls -A grub.d.disk | wc -l)"
+"""
+
+# After nos has run from it, under BIOS and UEFI
+WHOLE_AFTER = WHOLE_HELPERS + r"""
+attach_disk WHOLE whole.raw
+e2fsck -fn "${WHOLE}p3" > fsck5.out 2>&1 && echo "fsck5: clean" || { cat fsck5.out; echo "fsck5: DAMAGED"; }
+# No partition named, and no GRUB entry: the disk of nos's own is found
+disk_install status > disk-status.out 2>&1 || { cat disk-status.out; exit 1; }
+cat disk-status.out
+disk_install update --udpshell > disk-update.out 2>&1 || { cat disk-update.out; exit 1; }
+cat disk-update.out
+disk_install boot > disk-boot.out 2>&1 || { cat disk-boot.out; exit 1; }
+cat disk-boot.out
+if disk_install uninstall > disk-uninstall.out 2>&1; then
+    echo "uninstall: done"
+fi
+cat disk-uninstall.out
+if disk_install install "${WHOLE}p3" > disk-install.out 2>&1; then
+    echo "install over it: done"
+fi
+cat disk-install.out
+echo "grub.d: $(ls -A grub.d.disk | wc -l)"
+mount_at "${WHOLE}p3" root ro
+grub-editenv root/grubenv list > disk-grubenv2.out
+same_as_image root disk-update
+unmount_last
+e2fsck -fn "${WHOLE}p3" > fsck6.out 2>&1 && echo "fsck6: clean" || { cat fsck6.out; echo "fsck6: DAMAGED"; }
+"""
+
 
 class Linux:
     """Runs a phase where losetup and mount work: here under sudo on Linux,
@@ -256,15 +390,21 @@ class Linux:
         self.tmp = tmp
         self.native = platform.system() == "Linux"
 
-    def run(self, name, script):
+    def run(self, name, script, partitions=False):
+        """`partitions`: the phase's loop devices have partitions of their
+        own (losetup -P), whose nodes the kernel makes in its /dev -- which
+        a container sees only as its own /dev."""
         env = {"DISK_SIZE": str(DISK_SIZE), "HOST_START": str(HOST_START), "HOST_SIZE": str(HOST_SIZE),
-               "NOS_START": str(NOS_START), "NOS_SIZE": str(NOS_SIZE)}
+               "NOS_START": str(NOS_START), "NOS_SIZE": str(NOS_SIZE), "WHOLE_SIZE": str(WHOLE_SIZE),
+               "WHOLE_ROOT": WHOLE_ROOT}
         if self.native:
             env.update({"T": self.tmp, "IMAGE": os.path.join(self.tmp, "image.squashfs")})
             argv = ["sudo", "env"] + ["%s=%s" % kv for kv in env.items()] + ["bash", "-c", PRELUDE + script]
         else:
             env.update({"T": "/t", "IMAGE": "/t/image.squashfs"})
             argv = ["docker", "run", "--platform", "linux/amd64", "--rm", "--privileged", "-v", "%s:/t" % self.tmp]
+            if partitions:
+                argv += ["-v", "/dev:/dev"]
             for kv in env.items():
                 argv += ["-e", "%s=%s" % kv]
             argv += ["nos-builder", "bash", "-c", PRELUDE + script]
@@ -295,10 +435,18 @@ class Machine:
         self.qemu = None
         self.log = None
 
-    def boot(self, name):
+    def boot(self, name, disk="disk.raw", firmware=None):
+        """`firmware`: UEFI's code and variables, for the two flash chips --
+        SeaBIOS without it."""
         self.log = os.path.join(self.tmp, "serial-%s.log" % name)
-        argv = ["qemu-system-x86_64", "-display", "none", "-no-reboot", "-m", "1G", "-smp", "2",
-                "-drive", "file=%s,format=raw,if=none,id=d0" % os.path.join(self.tmp, "disk.raw"),
+        argv = ["qemu-system-x86_64", "-display", "none", "-no-reboot", "-m", "1G", "-smp", "2"]
+        if firmware is not None:
+            code, variables = firmware
+            mine = os.path.join(self.tmp, "vars-%s.fd" % name)
+            shutil.copyfile(variables, mine)
+            argv += ["-drive", "if=pflash,format=raw,unit=0,readonly=on,file=%s" % code,
+                     "-drive", "if=pflash,format=raw,unit=1,file=%s" % mine]
+        argv += ["-drive", "file=%s,format=raw,if=none,id=d0" % os.path.join(self.tmp, disk),
                 "-device", "virtio-blk-pci,drive=d0,bootindex=0,disable-legacy=on,disable-modern=off",
                 "-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:%d-:22,hostfwd=udp:127.0.0.1:%d-:%d"
                 % (self.ssh_port, self.udp_port, SHELL_PORT),
@@ -444,6 +592,146 @@ def in_order(lines, wanted):
     return at == len(wanted)
 
 
+def ovmf():
+    """UEFI for QEMU's two flash chips -- its code, and the variables a copy
+    of which each boot takes -- as this host has it: QEMU's own (Homebrew's
+    among them), or a distribution's ovmf package. None where there is none."""
+    qemu = shutil.which("qemu-system-x86_64")
+    share = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(qemu))), "share", "qemu")
+    for code, variables in ((os.path.join(share, "edk2-x86_64-code.fd"), os.path.join(share, "edk2-i386-vars.fd")),
+                            ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
+                            ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
+                            ("/usr/share/qemu/edk2-x86_64-code.fd", "/usr/share/qemu/edk2-i386-vars.fd"),
+                            ("/usr/share/edk2/ovmf/OVMF_CODE.fd", "/usr/share/edk2/ovmf/OVMF_VARS.fd")):
+        if os.path.exists(code) and os.path.exists(variables):
+            return code, variables
+    return None
+
+
+def gpt_layout(dump):
+    """sfdisk --dump's partitions, in order: each a dict of its fields, the
+    numbers as numbers and the names unquoted."""
+    parts = []
+    for line in dump.splitlines():
+        if " : " not in line:
+            continue
+        fields = {}
+        for item in line.split(" : ", 1)[1].split(","):
+            if "=" in item:
+                key, value = (s.strip() for s in item.split("=", 1))
+                fields[key] = int(value) if value.isdigit() else value.strip('"')
+        parts.append(fields)
+    return parts
+
+
+def layout_ok(parts, root_mib, disk_bytes):
+    """Whether the table is the one disk makes: BIOS boot at 1 MiB, the EFI
+    System partition, the root of `root_mib`, and nos-data from right after
+    it to the disk's end but for its last MiB -- each starting where the one
+    before it ends, every type and name as it should be."""
+    per_mib = MiB // SECTOR
+    want = [(GPT_BIOS_BOOT, "BIOS boot", per_mib), (GPT_ESP, "EFI System", 512 * per_mib),
+            (GPT_LINUX, "nos", root_mib * per_mib), (GPT_LINUX, "nos-data", None)]
+    if len(parts) != len(want):
+        return False
+    at = per_mib
+    for part, (kind, name, size) in zip(parts, want):
+        if part.get("type", "").upper() != kind or part.get("name") != name or part.get("start") != at:
+            return False
+        if size is not None and part.get("size") != size:
+            return False
+        at = part["start"] + part["size"]
+    # The last MiB holds the table's copy; the partition takes the rest
+    return disk_bytes // SECTOR - per_mib - per_mib < at <= disk_bytes // SECTOR - per_mib + per_mib
+
+
+def run_disk(tmp, linux, key, want):
+    """A whole disk made nos's own (nos-install disk), booted under SeaBIOS
+    and OVMF, then updated with no GRUB entry anywhere."""
+    ok, out = linux.run("nos-install disk", WHOLE_PREPARE, partitions=True)
+    if not check("nos-install disk", ok):
+        return
+    check("a disk that holds something is refused without --wipe, by what it holds, before anything is written",
+          "holds: installed" not in out and "holds a dos partition table" in out and "--wipe erases it" in out and
+          "holds: the disk is as it was" in out, linux.read("refuse-holds.out"))
+    check("a partition is refused: disk takes a whole disk",
+          "part: installed" not in out and "is a partition" in linux.read("refuse-part.out"),
+          linux.read("refuse-part.out"))
+    check("a disk with a filesystem of it mounted is refused, --wipe or not",
+          "mounted: installed" not in out and "is in use: mounted at" in linux.read("refuse-mounted.out"),
+          linux.read("refuse-mounted.out"))
+    check("the root is 10G unless told, and a disk with no room for it is refused before anything is written",
+          "size: installed" not in out and "no room for a root of 10240 MiB" in linux.read("refuse-size.out") and
+          "size: the disk is as it was" in out, linux.read("refuse-size.out"))
+    layout = linux.read("layout.out")
+    check("its table: GPT -- BIOS boot from 1 MiB, EFI System, the root of the size asked for, nos-data to the end",
+          "label: gpt" in layout and layout_ok(gpt_layout(layout), 1024, WHOLE_SIZE), layout)
+    check("GRUB's boot code is in the disk's first sector, its core image and modules for BIOS on the root",
+          "mbr: boot code" in out and "root: GRUB for BIOS" in out, out)
+    check("GRUB for UEFI is at \\EFI\\BOOT\\BOOTX64.EFI on the EFI System partition, its modules on the root",
+          "esp: BOOTX64.EFI" in out and "root: GRUB for UEFI" in out, out)
+    check("fsck.fat finds the EFI System partition clean, e2fsck the root", "esp: clean" in out and "root: clean" in out,
+          linux.read("fsckfat.out") + linux.read("fsckroot.out"))
+    check("nos-data has nothing on it", "data: blank" in out, out)
+    root_uuid = linux.read("root-uuid.out").strip()
+    data_guid = linux.read("data-partuuid.out").strip()
+    check("the root's grub.cfg is the disk's own, and finds the root by its UUID",
+          linux.read("grubcfg-first.out").strip() == STANDALONE_MARK and
+          linux.read("grubcfg-uuid.out").strip() == root_uuid and len(root_uuid) == 36,
+          linux.read("grubcfg-first.out") + linux.read("grubcfg-uuid.out") + root_uuid)
+    check("every file of the image is on the root, the key in authorized_keys, the parameters in the grubenv",
+          "disk: every file of the image" in out and "keys: 1" in out and
+          "nos_cmdline=netconsole=10.0.2.2:6666" in linux.read("disk-grubenv.out"), out)
+    check("nothing of the machine's GRUB is touched", "grub.d: 0" in out, out)
+
+    m = Machine(tmp, key)
+    for name, firmware in (("BIOS", None), ("UEFI", ovmf())):
+        if name == "UEFI" and firmware is None:
+            check("UEFI for QEMU here: QEMU's edk2-x86_64-code.fd, or the ovmf package", False)
+            break
+        m.boot("disk-" + name.lower(), disk="whole.raw", firmware=firmware)
+        try:
+            check("the disk boots nos alone, under %s" % name, m.wait_log("boot: complete", BOOT_TIMEOUT),
+                  m.text()[-3000:])
+            check("its root is the disk's, read-write (%s)" % name,
+                  "MountRootFs: mounted ext4 on /" in m.text() and "(rw)" in m.text(), m.text()[-3000:])
+            version = m.wait_ssh(300)
+            check("sshd lets in the key disk was given, to the image's kernel (%s)" % name, version == want,
+                  "%r, the image's VERSION says %r" % (version, want))
+            if version is not None:
+                rc, out = m.ssh(["cat", "/proc/cmdline"])
+                check("the command line names the root by its UUID, with the parameters the grubenv keeps (%s)" % name,
+                      rc == 0 and ("root=UUID=" + root_uuid) in out and "netconsole=10.0.2.2:6666" in out, out)
+                rc, out = m.ssh(["disks"])
+                check("nos sees nos-data by its GUID (%s)" % name,
+                      rc == 0 and len(data_guid) == 36 and ("part:" + data_guid) in out, out)
+            m.ssh(["poweroff"], timeout=60)
+            check("nos powers off (%s)" % name, m.wait_exit(120))
+        finally:
+            m.stop()
+
+    ok, out = linux.run("status and update of a disk of nos's own", WHOLE_AFTER, partitions=True)
+    if not check("status and update of a disk of nos's own", ok):
+        return
+    check("e2fsck finds the root clean after nos ran on it", "fsck5: clean" in out, out)
+    status = linux.read("disk-status.out")
+    check("status finds the disk of nos's own by itself, and says its own GRUB boots nos by default",
+          "the root of a disk of nos's own" in status and "booted by:   its disk's own GRUB" in status and
+          "next boot:   nos, its disk's default" in status, status)
+    update = linux.read("disk-update.out")
+    check("so does update, and it leaves every GRUB of the machine alone",
+          "its disk's own GRUB boots it" in update and "grub.d: 0" in out and "update-grub" not in update, update)
+    check("update puts every file of the image there again, and takes the UDP shell it was given",
+          "disk-update: every file of the image" in out and
+          "nos_cmdline=udpshell=9000" in linux.read("disk-grubenv2.out").splitlines(), linux.read("disk-grubenv2.out"))
+    check("boot has nothing to arm there", "nothing to arm" in linux.read("disk-boot.out"), linux.read("disk-boot.out"))
+    check("uninstall has nothing to take out", "uninstall: done" not in out, linux.read("disk-uninstall.out"))
+    check("an install over its root is refused: update is what renews it",
+          "install over it: done" not in out and "nos-install update" in linux.read("disk-install.out"),
+          linux.read("disk-install.out"))
+    check("e2fsck finds the root clean after the update", "fsck6: clean" in out, out)
+
+
 def run(tmp, image):
     linux = Linux(tmp)
     shutil.copy(image, os.path.join(tmp, "image.squashfs"))
@@ -579,6 +867,8 @@ def run(tmp, image):
     check("status says what is installed and what was", "installed:   nos " in status and
           "previous:    nos " in status, status)
     check("uninstall takes the GRUB entry away", "uninstalled: yes" in out, out)
+
+    run_disk(tmp, linux, key, want)
     return linux
 
 

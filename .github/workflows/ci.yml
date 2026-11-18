@@ -21,7 +21,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang lld llvm nasm cppcheck \
             grub2-common grub-pc-bin grub-efi-amd64-bin xorriso mtools \
-            qemu-system-x86 qemu-system-arm qemu-utils squashfs-tools parted e2fsprogs
+            qemu-system-x86 qemu-system-arm qemu-utils squashfs-tools parted e2fsprogs \
+            fdisk dosfstools ovmf
           # The pinned nightly, not whatever nightly is today: src/crates/vendor
           # only resolves against the one src/crates/rust-toolchain.toml names.
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
