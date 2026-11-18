@@ -32,6 +32,7 @@
 #include <lib/stdlib.h>
 #include <drivers/pci.h>
 #include <drivers/msix.h>
+#include <drivers/iommu.h>
 #include <hal/irqchip.h>
 #include <drivers/hpet.h>
 #include <drivers/acpi.h>
@@ -1320,6 +1321,43 @@ unsigned long kernel_msi_create(unsigned short bus, unsigned short slot, unsigne
         return 0;
     }
     return (unsigned long)t;
+}
+
+/* The IOMMU's domains (drivers/iommu.h): handles the kernel looks up, the
+   arguments values the kernel checks -- what kcore::iommu wraps */
+int kernel_iommu_on()
+{
+    return kernel::iommu::on() ? 1 : 0;
+}
+
+unsigned long kernel_iommu_domain_create(unsigned short sid)
+{
+    return kernel::iommu::domain_create(sid);
+}
+
+int kernel_iommu_domain_map(unsigned long domain, unsigned long iova, unsigned long phys, unsigned long pages)
+{
+    return kernel::iommu::domain_map(domain, iova, phys, pages) ? 1 : 0;
+}
+
+int kernel_iommu_domain_attach(unsigned long domain, unsigned short sid)
+{
+    return kernel::iommu::domain_attach(domain, sid) ? 1 : 0;
+}
+
+int kernel_iommu_domain_detach(unsigned long domain, unsigned short sid)
+{
+    return kernel::iommu::domain_detach(domain, sid) ? 1 : 0;
+}
+
+void kernel_iommu_domain_destroy(unsigned long domain)
+{
+    kernel::iommu::domain_destroy(domain);
+}
+
+int kernel_iommu_release(unsigned short sid)
+{
+    return kernel::iommu::release(sid) ? 1 : 0;
 }
 
 } /* extern "C" */

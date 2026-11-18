@@ -1,6 +1,7 @@
 #include <drivers/hpet.h>
 #include <drivers/acpi.h>
 #include <arch/x86_64/vtd.h>
+#include <drivers/iommu.h>
 #include <hal/irq_stubs.h>
 
 /* Link stubs for the x86-only paths still referenced from common code on
@@ -65,6 +66,58 @@ void Vtd::shell(const char* args, stdlib::Printer& printer)
 {
     (void)args;
     printer.printf("no DMA remapping units\n");
+}
+
+/* drivers/iommu.h: no IOMMU on this architecture yet -- nothing translated,
+   no domain to be had */
+namespace iommu
+{
+
+bool on()
+{
+    return false;
+}
+
+ulong domain_create(u16 sid)
+{
+    (void)sid;
+    return 0;
+}
+
+bool domain_map(ulong domain, u64 iova, u64 phys, ulong pages)
+{
+    (void)domain;
+    (void)iova;
+    (void)phys;
+    (void)pages;
+    return false;
+}
+
+bool domain_attach(ulong domain, u16 sid)
+{
+    (void)domain;
+    (void)sid;
+    return false;
+}
+
+bool domain_detach(ulong domain, u16 sid)
+{
+    (void)domain;
+    (void)sid;
+    return false;
+}
+
+void domain_destroy(ulong domain)
+{
+    (void)domain;
+}
+
+bool release(u16 sid)
+{
+    (void)sid;
+    return false;
+}
+
 }
 
 Hpet::Hpet()
