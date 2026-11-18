@@ -1,4 +1,4 @@
-/* Register map for the Intel igb family (82575/82576/I210/I211).
+/* Register map for the Intel igb family (82575/82576/I210/I211/I350).
  *
  * Offsets are the ones Intel publishes, which is the whole reason this part
  * is pleasanter to drive than the Realtek next door: the datasheet says what
@@ -396,3 +396,99 @@ pub const PCI_DEVICE_I210_SGMII: u16 = 0x1538;
 pub const PCI_DEVICE_I210_COPPER_FLASHLESS: u16 = 0x157B;
 pub const PCI_DEVICE_I210_SERDES_FLASHLESS: u16 = 0x157C;
 pub const PCI_DEVICE_I211_COPPER: u16 = 0x1539;
+
+/* The I350's copper part, two or four ports to a chip, each a PCI function of
+ * its own: the Supermicro X11SSD-F's AOC-CGP-i2. Its fiber, SERDES and SGMII
+ * parts (0x1522..0x1524) take a link through the PCS, which this driver does
+ * not drive, so they are not claimed. */
+pub const PCI_DEVICE_I350_COPPER: u16 = 0x1521;
+
+/* ==================================================================== */
+/* The I350 -- an 82580-class MAC -- where it differs from the two above.
+ * Offsets and bits as Linux's igb has them (e1000_regs.h, e1000_defines.h,
+ * e1000_82575.h) and the I350 datasheet; each says what reads it. */
+
+/* EEPROM/flash control at its legacy offset, where the I350 has the NVM
+ * auto-read bit (EEC_AUTO_RD above) and where Linux reads it on every part of
+ * the family (E1000_EECD, igb_get_auto_rd_done). The 82576's and the I210's
+ * path reads it at 0x12010 (EEC, the I210 datasheet's), as it always has. */
+pub const EEC_82580: usize = 0x00010;
+
+/* Which port of the chip this function is: what picks its semaphore and its
+ * configuration-done bit (Linux: bus.func, from STATUS). */
+pub const STATUS_FUNC_SHIFT: u32 = 2;
+pub const STATUS_FUNC_MASK: u32 = 3 << STATUS_FUNC_SHIFT;
+
+/* The PHY semaphores of the other ports: on a part with more than one port
+ * each claims its own PHY (igb_acquire_phy_82575). */
+pub const SWFW_PHY1_SM: u32 = 1 << 2;
+pub const SWFW_PHY2_SM: u32 = 1 << 5;
+pub const SWFW_PHY3_SM: u32 = 1 << 6;
+
+/* The PHY's hard reset, held for PHY_RESET_US (igb_phy_hw_reset, the 82575
+ * family's reset_delay_us), and the wait after it. */
+pub const CTRL_PHY_RST: u32 = 1 << 31;
+pub const PHY_RESET_US: u64 = 100;
+pub const PHY_RESET_SETTLE_US: u64 = 150;
+
+/* Management control. Read, never written: the firmware's. One bit of it says
+ * manageability forbids a PHY reset -- a BMC may be using the port
+ * (igb_check_reset_block). */
+pub const MANC: usize = 0x05820;
+pub const MANC_BLK_PHY_RST_ON_IDE: u32 = 1 << 18;
+
+/* The NVM's configuration of a port's PHY done after its reset: bit 18 for
+ * port 0, one up for each port after (igb_get_cfg_done_82575), within
+ * PHY_CFG_TIMEOUT_MS. */
+pub const EEMNGCTL: usize = 0x01010;
+pub const EEMNGCTL_CFG_DONE_PORT_0: u32 = 1 << 18;
+pub const PHY_CFG_TIMEOUT_MS: u32 = 100;
+
+/* The driver has the device: what tells manageability firmware it no longer
+ * answers for the host (igb_get_hw_control / igb_release_hw_control). */
+pub const CTRL_EXT_DRV_LOAD: u32 = 1 << 28;
+
+/* PHY power management. Go Link Disconnect holds the PHY off the wire, and
+ * Low Power Link Up in D0 has it settle on the lowest speed the partner
+ * offers: both cleared for a link (igb_setup_copper_link_82575,
+ * igb_set_d0_lplu_state_82580). Smart Power Down is left as it is. */
+pub const PHPM: usize = 0x00E14;
+pub const PHPM_D0_LPLU: u32 = 1 << 1;
+pub const PHPM_GO_LINKD: u32 = 1 << 5;
+
+/* Energy Efficient Ethernet: its advertisement (IPCNFG) and its low-power idle
+ * (EEER), both off -- igb_set_eee_i350's eee_disable branch. */
+pub const IPCNFG: usize = 0x00E38;
+pub const IPCNFG_EEE_100M_AN: u32 = 1 << 2;
+pub const IPCNFG_EEE_1G_AN: u32 = 1 << 3;
+pub const EEER: usize = 0x00E30;
+pub const EEER_TX_LPI_EN: u32 = 1 << 16;
+pub const EEER_RX_LPI_EN: u32 = 1 << 17;
+pub const EEER_LPI_FC: u32 = 1 << 18;
+
+/* DMA coalescing, off: it holds receive DMA back to batch it, which is
+ * latency for power. */
+pub const DMACR: usize = 0x02508;
+pub const DMACR_DMAC_EN: u32 = 1 << 31;
+
+/* The packet buffers' partition, read for the log and left as the NVM set it:
+ * Linux reads an I350's (igb_reset, igb_rxpbs_adjust_82580) and never writes
+ * it -- its writes are the I210's. */
+pub const RXPBS: usize = 0x02404;
+pub const TXPBS: usize = 0x03404;
+
+/* The I350's PHY's own registers (an 82580-class PHY, igb's e1000_phy_82580):
+ * carrier sense on transmit and downshift in its configuration register, and
+ * crossover chosen by the PHY (igb_copper_link_setup_82580). */
+pub const PHY_ID1: u32 = 2;
+pub const PHY_ID2: u32 = 3;
+pub const PHY_82580_CFG: u32 = 22;
+pub const PHY_82580_CFG_ASSERT_CRS_ON_TX: u16 = 1 << 15;
+pub const PHY_82580_CFG_ENABLE_DOWNSHIFT: u16 = 3 << 10;
+pub const PHY_82580_CTRL_2: u32 = 18;
+pub const PHY_82580_CTRL2_MDIX_CFG_MASK: u16 = 0x0600;
+pub const PHY_82580_CTRL2_AUTO_MDI_MDIX: u16 = 0x0400;
+/* The I350's integrated PHY says it is this (Linux's I350_I_PHY_ID), its
+ * revision in the low four bits. */
+pub const I350_PHY_ID: u32 = 0x015403B0;
+pub const PHY_ID_REV_MASK: u32 = 0xF;

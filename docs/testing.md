@@ -4907,6 +4907,11 @@ three hardware NIC drivers runs anywhere but on a Hetzner box -- MSI-X with
 two vectors, the descriptor rings, the receive poll and its interrupt
 throttle -- so run `tcp-test.py --nic igb` and `netload-test.py --nic igb`
 after touching `drivers/net/igb` or the driver seam in `layers/net/src/device.rs`.
+The I350's own steps in that driver (`i350_*`: the port's semaphore, the PHY's
+hard reset and its configuration, EEE and DMA coalescing off, the MAC taking
+the PHY's speed) have no model in QEMU: those gates run the 82576's path and
+the code the three generations share, and the I350's is checked on the
+Supermicro X11SSD-F's two ports alone.
 
 `--nic e1000e` does the same with QEMU's 82574L, which the `e1000e` driver
 claims -- the part a server board of its age has two of -- and
