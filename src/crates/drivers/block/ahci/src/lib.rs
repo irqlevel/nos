@@ -10,10 +10,10 @@
 //! as they were, which some of Intel's lose to the reset. Each implemented
 //! port then gets pages of its own: its command list, the area the HBA puts
 //! the FISes it receives in, and one command table, whose PRDT has room for
-//! a megabyte in pages scattered anywhere. A disk is one command at a time,
+//! 504 pieces of memory scattered anywhere. A disk is one command at a time,
 //! slot 0, polled, under its port's lock: READ and WRITE DMA EXT straight to
 //! and from the caller's buffer through the PRDT, its pages found by their
-//! physical addresses, up to a megabyte a command; a batch's pieces
+//! physical addresses, up to 256 KiB a command; a batch's pieces
 //! (`read_pieces`, `write_pieces`) that follow one another on the disk one
 //! command, wherever they are in the batch's buffer -- an ext4 batch of a
 //! file's contiguous blocks is one read; FLUSH CACHE EXT; at power-off
@@ -191,12 +191,15 @@ const FIS_H2D_COMMAND: u8 = 1 << 7;
 const FIS_DEVICE_LBA: u8 = 1 << 6;
 const FIS_H2D_BYTES: usize = 20;
 
-/// The most one command moves. One command at a time, the bigger the
-/// faster -- Ubuntu reads the Supermicro's SSD at 412 MiB/s in commands of
-/// 128 KiB, 446 in commands of 256 -- and a megabyte is a page a PRD entry,
-/// for a buffer that starts in the middle of a page, in 257 entries: well
-/// inside the table's MAX_PRDS.
-const MAX_BYTES_PER_COMMAND: usize = 1 << 20;
+/// The most one command moves: what ext4's batch is, 64 blocks of 4 KiB,
+/// and as fast a size as measured. The Supermicro's SSD read one command at
+/// a time under this driver at 313 MiB/s in commands of 128 KiB, 315 in
+/// commands of 256 and 293 in commands of 512 (blkload, its Ubuntu disk,
+/// twice each to a tenth): bigger is not faster here, and past 256 slower.
+/// A page a PRD entry, for a buffer that starts in the middle of a page, is
+/// 65 entries; MAX_PRDS has room besides for a batch of pieces shorter than
+/// a page, each an entry of its own.
+const MAX_BYTES_PER_COMMAND: usize = 256 << 10;
 const _: () = assert!(MAX_BYTES_PER_COMMAND / PAGE_SIZE + 1 <= MAX_PRDS, "a command's pages fit its PRDT");
 const LBA28_LIMIT: u64 = 1 << 28;
 /// A 28-bit command's 0 in the count register is 256, a 48-bit one's 65536.
