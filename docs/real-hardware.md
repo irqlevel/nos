@@ -305,6 +305,19 @@ POST to GRUB takes about two minutes; nos says `boot: complete` 13 s after
 GRUB, and its sshd answers then. A `reboot` in nos is Ubuntu again in under
 three minutes, nos's ext4 clean behind it.
 
+The second Toshiba (`sdc` to Ubuntu, `hdc` to nos) is a disk of nos's own
+([A disk of its own](install.md#a-disk-of-its-own)): made so from Ubuntu
+with `nos-install disk` first, then again by the installer ISO ([From an
+ISO](install.md#from-an-iso)), which Ubuntu's GRUB boots out of `/boot` by
+loopback as a virtual CD would boot it -- with answers in a third initramfs,
+its own kernel log to the netconsole collector, the disk named by its
+`wwn-` id, the static address the answers gave, and a reboot after. The
+BIOS boots the PNY first, so Ubuntu's GRUB has an entry, `nos-own-disk`,
+that finds the Toshiba's root by its UUID and chainloads the disk's first
+sector, as the BIOS would boot the disk itself: `grub-reboot nos-own-disk`
+boots it once. nos runs from `hdc3` there, its 3.6 TB `nos-data` blank
+beside it; GRUB for UEFI is on it too, which this BIOS never runs.
+
 ## Supermicro X11SSD-F
 
 A node of a **Supermicro SYS-5039MS-H8TRF** MicroCloud (board X11SSD-F, AMI
