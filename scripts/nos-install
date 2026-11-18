@@ -253,15 +253,16 @@ check_hardware() {
             */ata[0-9]*/*)
                 # nos's ata driver takes a disk behind a PCI IDE controller --
                 # class 0101: SATA in IDE mode, as a BIOS may leave an ICH, or
-                # parallel ATA -- and not yet one behind AHCI (0106). The
-                # controller is the last PCI function on the device's path.
+                # parallel ATA -- and its ahci driver one behind an AHCI HBA
+                # (0106, interface 01); not one behind a RAID controller (0104).
+                # The controller is the last PCI function on the device's path.
                 pci=$(printf '%s\n' "$path" | grep -o '/[0-9a-f]\{4\}:[0-9a-f]\{2\}:[0-9a-f]\{2\}\.[0-7]' | tail -n 1 || true)
                 class=$(cat "/sys/bus/pci/devices$pci/class" 2>/dev/null || true)
                 case "$class" in
-                    0x0101*) ;;
-                    *) warn "$dev is on a SATA controller nos does not drive (PCI class ${class:-unknown}: AHCI, or RAID, where nos takes IDE mode alone): GRUB will load the kernel from it, but nos will not find its root on it -- no modules, no /etc/rc, no sshd" ;;
+                    0x0101*|0x010601) ;;
+                    *) warn "$dev is on a SATA controller nos does not drive (PCI class ${class:-unknown}: RAID, where nos takes IDE mode and AHCI): GRUB will load the kernel from it, but nos will not find its root on it -- no modules, no /etc/rc, no sshd" ;;
                 esac ;;
-            *) warn "$dev is not on an NVMe, a virtio or an IDE-mode SATA disk, which is all nos reads: GRUB will load the kernel from it, but nos will not find its root on it -- no modules, no /etc/rc, no sshd" ;;
+            *) warn "$dev is not on an NVMe, a virtio or a SATA disk (IDE mode or AHCI), which is all nos reads: GRUB will load the kernel from it, but nos will not find its root on it -- no modules, no /etc/rc, no sshd" ;;
         esac
     fi
 

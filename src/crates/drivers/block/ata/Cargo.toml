@@ -10,3 +10,5 @@ name = "ata"
 kcore = { path = "../../../base/kcore" }
 # The device table a disk is registered in.
 block = { path = "../../../layers/block" }
+# IDENTIFY DEVICE and the commands' numbers, shared with the AHCI driver.
+ataproto = { path = "../../../common/storage/ataproto" }
