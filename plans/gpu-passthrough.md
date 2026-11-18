@@ -25,7 +25,9 @@ Without interrupt remapping the guest has the device write to 0xFEExxxxx --
 a DMA write there is an interrupt -- and sends the host any vector it
 wants on any CPU: the TLB shootdown's, the scheduler's, an NMI. VFIO refuses
 a platform without IR unless told `allow_unsafe_interrupts`; nos refuses it
-outright. On VT-d IR is a unit's, not a device's: with it on and
+too, unless the VM's own config says `unsafe_interrupts` -- the word stages
+4 and 5 are run with before IR, stage 3, is done, and which every function
+given says in the log. On VT-d IR is a unit's, not a device's: with it on and
 compatibility-format interrupts blocked (CFI=0), every interrupt source the
 unit covers -- the IO-APIC, the HPET, every MSI and MSI-X of the host's own
 devices -- has to be remappable. So IR changes the host's interrupt
@@ -118,9 +120,14 @@ reaches no Rust. hv reaches it by the usual three steps (`rust_ffi.cpp`,
 - **A function of the host's on the guest's bus**: its config space read
   through to the real one, with what is virtual laid over it -- the BARs (the
   guest's addresses; the real registers never change), the command register
-  (memory, I/O and bus-master the guest's, INTx disable kept), the capability
-  list with the MSI and MSI-X capabilities emulated and what must not reach
-  the guest left out (ATS, SR-IOV, PASID).
+  (bus mastering the guest's; memory decoding on for as long as the guest
+  holds the device, the guest's memory and I/O bits its own view, since a
+  deaf device's BAR is an Unsupported Request -- VFIO's CVE-2020-12888; INTx
+  disable kept), the MSI capability emulated, and the PCIe controls that
+  would reach past the device -- phantom functions, no snoop, FLR, the
+  payload sizes, error reporting, the link -- the host's. What is built is
+  `hypervisor/hv/src/devices/host.rs`, and docs/hypervisor.md, "A host's PCI
+  device", says it register by register.
 - **BARs**: mapped straight into the nested table -- a new kind of leaf, UC
   or WC rather than WB, onto a physical address that is not a frame of the
   guest's; `GuestMemory`'s rule "the table maps only what this value owns"
@@ -141,9 +148,11 @@ reaches no Rust. hv reaches it by the usual three steps (`rust_ffi.cpp`,
   with a host function gets a PCI hole for its 32-bit BARs and a 64-bit
   window above its RAM for the rest (BAR1 is 8 GiB), both in the DSDT's
   `_CRS`.
-- **vm.toml**: `pci = ["0000:01:00.0", "0000:01:00.1"]`; `hv start` refuses a
-  VM whose functions are not a whole group, whose IOMMU is off, or whose
-  interrupts cannot be remapped.
+- **vm.toml**: `pci = ["01:00.0"]`, the word `pci=01:00.0`; refused where the
+  IOMMU is off, or without `unsafe_interrupts` until IR is done. A group is
+  for now a device: its other functions are blocked while the guest holds
+  one, unless the guest holds them too, and a device one of whose other
+  functions is the host's own (mastering) or another guest's is refused.
 
 ## The stages, and their gates
 
@@ -157,15 +166,20 @@ reaches no Rust. hv reaches it by the usual three steps (`rust_ffi.cpp`,
    deadline for a controller that has stopped (QEMU's, on the blocked fetch).
 3. ECAM; then IR (the MSI branch is in master): the smoke boots under
    `intel-iommu,intremap=on`, every interrupt remapped.
-4. Domains (**done**, C++: `Vtd::domain_*`, held to the gate by `iommu
+4. **Done**: domains (C++: `Vtd::domain_*`, held to the gate by `iommu
    identity`, the NVMe working through a table of its own), the claim, the
-   reset, `kcore::iommu`; an emulated device (an NVMe
-   or an e1000e behind a `pcie-root-port`) handed to a Linux guest under nos
-   in QEMU, its driver working; a hostile phase, the guest pointing the
+   reset, `kcore::iommu`. Still to do: an emulated device (an NVMe or an
+   e1000e behind a `pcie-root-port`) handed to a Linux guest under nos in
+   QEMU, its driver working; a hostile phase, the guest pointing the
    device's DMA past its memory: a fault said, the host whole (a gate of its
-   own, `hv-passthrough-test.py`, still to be written).
-5. hv's host function for the GPU, on Hertz: `nvidia-smi` and a CUDA sample
-   in the guest.
+   own, `hv-passthrough-test.py`, still to be written) -- the NVMe has
+   MSI-X, which waits for its table to be trapped.
+5. hv's host function (**built**: `devices/host.rs`, the run loop's bus,
+   mirror and BAR moves, a guest of a holed memory map, the module's
+   `passthrough.rs`; `hv-fuzz.py`'s `hostfn` target, the `platform`
+   target's guest holding a GPU, the `linux` and `pvh` targets' holed
+   layouts, each rule a mutant the gate catches). Then on Hertz:
+   `nvidia-smi` and a CUDA sample in the guest.
 6. nos on Hertz's metal -- the real VT-d -- once the stages above are green;
    a one-shot GRUB entry, so a boot that does not come back is Ubuntu again
    at the next reset.

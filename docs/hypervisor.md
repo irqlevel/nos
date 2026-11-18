@@ -2130,6 +2130,113 @@ shell's write, and refuses a clone. The second boot swaps the drives: every
 id is found under the other name, the VM starts on its partition by its id,
 and a delete leaves the device alone.
 
+## A host's PCI device
+
+A whole PCI function of the host's -- a GPU first -- given to one guest,
+which drives it with its own driver: what Linux's VFIO does for QEMU, with
+no user space between (plans/gpu-passthrough.md has the design, its stages,
+and the test machine). x86-64 with Intel VT-d, booted `iommu=on`:
+
+```
+> hv start gpu /vmlinuz initrd=/initrd.img mem=8192 cpus=4 pci=01:00.0 unsafe_interrupts net
+```
+
+or in a vm.toml, `pci = ["01:00.0"]` and `unsafe_interrupts = true`. At most
+four functions a guest, named `bus:device.function` in hex as `pci` and
+`iommu` print them.
+
+**`unsafe_interrupts` is the guest's word that it is trusted** until
+interrupt remapping is done (the plan's stage 3): without it a DMA write of
+the device's to 0xFEExxxxx is an interrupt of the host's, of any vector, on
+any CPU -- the TLB shootdown's, the scheduler's -- and `pci=` without it is
+refused, as VFIO refuses a platform without remapping unless told
+`allow_unsafe_interrupts`. Every function given says so in the log too.
+
+What the module does with it (`modules/hypervisor/hv/src/passthrough.rs`),
+before any of the guest's memory is taken: the function is claimed -- one
+guest a function, and the other functions of its device blocked, each in a
+domain of nothing, unless the guest holds them too: a device's functions are
+not isolated from each other, which is why Linux makes a GPU and its audio
+function one IOMMU group; a device one of whose other functions is mastering
+-- the host's -- or another guest's is refused. Its BARs are read with its
+decoding off, it is reset where it has FLR (as Linux makes one: its
+transactions given a second, the header and the PCIe controls saved and
+written back, the device asked until it answers), its MSI taken by the host
+(`kcore::msix::MsixTable::new_msi`). Once the guest's RAM is there, the
+function is moved to an IOMMU domain of it (`kcore::iommu::Domain`), every
+region at its guest address -- 2 MiB leaves where the RAM is the huge pool's
+-- so that its DMA reaches the guest's memory and nothing else. As the guest
+goes, in this order: the route of its interrupt to the guest, the interrupt,
+bus mastering, an FLR, the domain -- the device left blocked, never passed
+through again while it may remember a guest -- and the claims.
+
+What the guest sees is `hypervisor/hv/src/devices/host.rs`: the real
+configuration space, read through, with what has to stay the host's laid
+over it --
+
+- the BARs are the guest's: what it writes is where they are in its space,
+  and sizing reads back the real size; the real registers are never written;
+- the command register's bus mastering goes to the device; its memory and
+  I/O decoding are the guest's alone, the device decoding its memory for as
+  long as the guest holds it, so that no access of the guest's finds it deaf
+  -- an Unsupported Request, which a server may escalate to a machine check
+  (CVE-2020-12888); INTx stays off;
+- MSI is emulated: what the guest writes is what the host's handler of the
+  real MSI sends it (`LinuxGuest::deliver_msi`), held pending while it is off
+  or masked;
+- no ROM, no INTx pin; power management never out of D0; the PCIe device
+  control's FLR, payload sizes and error reporting the host's, its phantom
+  functions -- whose requests would carry another function's id, and so
+  another IOMMU context -- and no snoop kept off; the link control the
+  host's; the Advanced Features capability's FLR not reachable;
+- every other register is the device's, written through, as QEMU's VFIO
+  does.
+
+A bridge, a function with MSI-X (whose table would be the guest's to aim
+anywhere unless trapped, not done yet), one with no MSI, and one whose
+capability list loops, runs on, or has a second capability of a kind the
+host keeps registers of, are not given: a guest writes at any offset it
+likes, and every register the host keeps has to be in a capability it
+found.
+
+NVIDIA's GPUs mirror their configuration space in BAR0 at 0x88000: that page
+is left out of the mapping and every access of it trapped and performed on
+the view above (`host_mmio`), eight bytes as two dwords. A write within the
+MSI capability's id and next pointer is also passed to the real mirror --
+the driver acknowledges its MSI so, and without it the GPU sends one
+interrupt and no more (QEMU's `vfio_nvidia_quirk_mirror_write`) -- and only
+within them: a write that reached the control word past them would be the
+guest's to the host's own MSI.
+
+**The guest's memory has a hole for the BARs** (`LinuxGuest::new_holed`):
+its RAM below 4 GiB ends at 3 GiB (`linux::HOLE_RAM_END`) rather than at
+0xFE000000, its 32-bit BARs go from there up to the MSI-X pages, its 64-bit
+ones from the first GiB past its RAM up to the width its CPUID gives it --
+both windows in the DSDT's `_CRS`, so that Linux keeps each BAR where it was
+put. The memory map and the kernel's and initrd's places are planned for
+the same layout (`linux::plan_below`, `pvh::plan_below`), and a layout
+planned for the other kind of guest is refused by `load`: its map would hand
+the kernel the hole as RAM. A BAR is mapped straight into the nested table,
+uncacheable (the guest's PAT makes it write-combining where its driver asks),
+2 MiB at a time where aligned; one the guest moves is mapped anew, and one it
+moves over RAM, another BAR or the platform's pages is left unmapped -- an
+access of it stops the guest. A VM holding a host's function is not saved
+and not moved: its device's DMA reaches no dirty log, and its state is the
+device's.
+
+Not done yet: interrupt remapping (so `unsafe_interrupts`), MSI-X, a
+secondary bus reset for a function without FLR, the ROM, the extended
+configuration space (ECAM: the Resizable BAR, ACS, AER), refusing a function
+a DMAR RMRR names, isolation beyond one device's functions (ACS on the path
+above it), and AMD-Vi.
+
+Gates: `hv-fuzz.py`'s `hostfn` target (the view above against a model of the
+real function: whatever the guest does, what reaches it holds to the host's
+rules, and what the guest sees to the PCI spec's), the `platform` target's
+guest holding a GPU (the run loop's bus, mirror, BAR moves and MSIs), and
+the `linux` and `pvh` targets' holed layouts; `iommu-test.py` for the
+domains. The GPU itself: by hand on Hertz, the plan's dev loop.
+
 ## A network
 
 `net`, on `hv start`, gives the guest a NIC on the guests' switch, and with
