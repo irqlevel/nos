@@ -166,6 +166,20 @@ pub extern "C" fn rust_test() {
     trace::selftest();
 }
 
+/// The AHCI HBAs' MSI checked and their error-handling tasks started:
+/// once tasks run, before the disks' partitions are probed again.
+#[no_mangle]
+pub extern "C" fn rust_ahci_start() {
+    ahci::start();
+}
+
+/// The AHCI HBAs' error-handling tasks stopped and waited for: on the way
+/// down, once nothing writes the disks but `rust_fini`'s flush.
+#[no_mangle]
+pub extern "C" fn rust_ahci_stop() {
+    ahci::stop();
+}
+
 /* Contract: rust_fini must be the last thing before halt.  Block/net
    registrations are permanent, so the C++ ops tables keep pointing at the
    devices freed here -- any I/O issued after this call is a use-after-free.
