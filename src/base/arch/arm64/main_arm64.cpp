@@ -47,6 +47,8 @@ extern "C" void rust_net_stop_netconsole();
 /* The filesystem layer is Rust (src/crates/layers/fs): what boot mounts where, and
    taking it all down again on the way out. */
 extern "C" void rust_mount_root_fs();
+/* The random pool's seed kept on the root filesystem (src/crates/kernel/src/seed.rs) */
+extern "C" void rust_random_seed_from_root();
 extern "C" void kernel_vfs_unmount_all();
 extern "C" void rust_mgmt_stop();
 /* The message channel is Rust (src/crates/layers/ipc): at the halt, after the
@@ -376,6 +378,9 @@ static void bp_startup_arm(void* ctx)
        IRQ, and the NVMe disks came up in rust_init (see kernel/main.cpp) */
     rust_partitions_probe();
     rust_mount_root_fs();
+    /* The pool's sources asked again and the seed the last boot kept on
+       the root (as kernel/main.cpp) */
+    rust_random_seed_from_root();
 
     /* Here, and not earlier: a block request is completed through the BLK_IO
        soft IRQ, so until the line above a write returns without having

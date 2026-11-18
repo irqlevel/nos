@@ -1966,6 +1966,12 @@ impl<'a> Open<'a> {
     pub fn size(&self) -> usize {
         self.vfs.size(self.handle)
     }
+
+    /// The filesystem the file is on synced: what was written to it on the
+    /// medium.
+    pub fn sync(&self) -> bool {
+        self.vfs.sync_file(self.handle)
+    }
 }
 
 impl Drop for Open<'_> {
