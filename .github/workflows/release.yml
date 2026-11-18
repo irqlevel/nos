@@ -76,6 +76,12 @@ jobs:
           cp nos.qcow2        dist/nos.qcow2
           cp nos-x86_64.squashfs dist/nos-x86_64.squashfs
           cp nos-installer-x86_64.iso dist/nos-installer-x86_64.iso
+          # The one-line installer (scripts/installer/install.sh), what
+          # https://nos-os.tech/install.sh runs: this release's tag written
+          # in, so that it fetches this release's image
+          sed "s|^NOS_RELEASE=@NOS_RELEASE@\$|NOS_RELEASE=${GITHUB_REF_NAME}|" \
+            scripts/installer/install.sh > dist/install.sh
+          grep -qx "NOS_RELEASE=${GITHUB_REF_NAME}" dist/install.sh
           # What the installer's Linux is made of, a package and its version
           # a line: Alpine's, GPL software among them, whose sources go by
           # these names
@@ -183,12 +189,39 @@ jobs:
             `latest` works too, without naming the tag:
             `https://github.com/${{ github.repository }}/releases/latest/download/kernel-x86_64.elf`
 
+            ### nos on a server, from its rescue system
+
+            In the server's rescue system -- a Linux its provider boots from the
+            network, the disks idle -- one command. A dialog asks which disk is
+            to be nos's, how big its root is (10G; the rest of the disk is left
+            for VMs and NBS), the network, offered as the rescue system has it
+            -- the server's own address -- and the SSH keys, offered as root's
+            there; it writes the disk and has the firmware boot nos first after
+            its network's entries:
+
+            ```sh
+            curl -fsSL https://nos-os.tech/install.sh | sh
+            ```
+
+            Without the dialog, nos-install's arguments:
+
+            ```sh
+            curl -fsSL https://nos-os.tech/install.sh | sh -s -- disk /dev/sdb --wipe --network-here --ssh-key /root/.ssh/authorized_keys
+            ```
+
+            That runs the newest release's `install.sh`; this one's is
+            `NOS_VERSION=${{ github.ref_name }}` before `sh`, or `install.sh` here.
+            It fetches the system image below, checks it against `SHA256SUMS`
+            and runs the installer in it --
+            [docs/install.md, "From a provider's rescue system"](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/install.md#from-a-providers-rescue-system).
+
             ### System image (x86-64 servers)
 
             `nos-x86_64.squashfs`: the kernel, every module built with it, the
-            GRUB entries that boot it and `nos-install`, which pours it onto a
-            partition of a server running Linux with GRUB and boots nos from
-            there once -- [docs/install.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/install.md).
+            GRUB entries that boot it, `nos-install`, which pours it onto a whole
+            disk or onto a partition beside a server's Linux, and the
+            installer's dialog -- [docs/install.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/install.md).
+            Beside the server's Linux, booted once through its GRUB:
 
             ```sh
             wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/nos-x86_64.squashfs
@@ -249,6 +282,7 @@ jobs:
             dist/nos.iso
             dist/nos.qcow2
             dist/nos-x86_64.squashfs
+            dist/install.sh
             dist/nos-installer-x86_64.iso
             dist/nos-installer-packages.txt
             dist/nos-panel-*.tar.gz
