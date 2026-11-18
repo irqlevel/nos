@@ -1,24 +1,39 @@
 #!/bin/bash
 # nos-setup: the nos installer's dialog (scripts/installer, docs/install.md,
-# "From an ISO"). It runs on the installer's terminal, asks which disk, how
+# "From an ISO", "From a provider's rescue system"). It asks which disk, how
 # big nos's root, what network and which keys, shows what will be written,
 # and has the disk's name typed to go on -- then hands it all to the
-# nos-install of the system image the ISO carries, nos-install disk, which
-# checks everything again and writes.
+# nos-install of the system image beside it, nos-install disk, which checks
+# everything again and writes.
 #
-# With answers it asks nothing: /etc/nos-installer/answers, which
+# It runs in one of two places. On the installer ISO -- /etc/nos-installer
+# is the ISO's -- in its own Linux, on its console: it mounts the image the
+# ISO carries, and sets up the installer's network to try the one given.
+# With answers it asks nothing there: /etc/nos-installer/answers, which
 # build.sh --answers bakes in (answers.example), and nos.KEY=VALUE words on
-# the kernel's command line, which win. What it does goes to the screen and
+# the kernel's command line, which win; what it does goes to the screen and
 # to the kernel log -- a netconsole= given to the installer's kernel carries
 # it off a machine nobody watches.
+#
+# Or on a Linux the server runs already -- a provider's rescue system --
+# from the system image mounted (install.sh does that): the image is the
+# directory this script is in, and the network is the one the session came
+# in by, which nothing here touches -- offered to nos as it is, since a
+# rescue system is up on the server's own address.
 set -uo pipefail
 export LC_ALL=C
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 IMAGE_DIR=/usr/share/nos
 IMAGE=$IMAGE_DIR/nos-x86_64.squashfs
 ANSWERS=/etc/nos-installer/answers
 MNT=/run/nos-image
+if [ -d /etc/nos-installer ]; then
+    ON_ISO=1
+else
+    ON_ISO=0
+    MNT=$(dirname "$(readlink -f "$0")")
+fi
 LOG=/run/nos-setup.log
 KEYS_FILE=/run/nos-keys
 # An unattended install runs once a boot: init runs this again when it ends
@@ -34,6 +49,7 @@ CARRIER_WAIT=15
 KMSG_LEVEL=6
 
 kmsg() {
+    [ "$ON_ISO" = 1 ] || return 0
     echo "<$KMSG_LEVEL>$*" > /dev/kmsg 2>/dev/null || true
 }
 
@@ -329,7 +345,10 @@ root_network() {
 found_network() {
     local dev fs opts got peek=/run/nos-peek
     mkdir -p "$peek"
-    while read -r dev fs; do
+    while read -r dev; do
+        # Its type as blkid reads it off the device: lsblk's is udev's, and
+        # a rescue system may run no udev
+        fs=$(blkid -p -o value -s TYPE "$dev" 2>/dev/null || true)
         case "$fs" in
             ext2) opts=ro ;;
             ext3|ext4) opts=ro,noload ;;
@@ -347,7 +366,7 @@ found_network() {
                 return 0
             fi
         fi
-    done < <(lsblk -lnpo NAME,FSTYPE 2>/dev/null)
+    done < <(lsblk -lnpo NAME 2>/dev/null)
     return 1
 }
 
@@ -416,6 +435,21 @@ gather_keys() {
 
 keys_count() {
     grep -c '^ssh-' "$KEYS_FILE" 2>/dev/null || true
+}
+
+# The ssh-ed25519 keys this system's root logs in with, a line each, options
+# in front of one left out: on a provider's rescue system, the user's own
+here_keys() {
+    cat /root/.ssh/authorized_keys /root/.ssh/authorized_keys2 2>/dev/null | tr -d '\r' | awk '
+        {
+            for (i = 1; i < NF; i++) {
+                if ($i != "ssh-ed25519") continue
+                line = $i " " $(i + 1)
+                for (j = i + 2; j <= NF; j++) line = line " " $j
+                print line
+                next
+            }
+        }' | grep -E '^ssh-ed25519 [A-Za-z0-9+/]+=*( .*)?$' | sort -u || true
 }
 
 fingerprints() {
@@ -518,7 +552,7 @@ unattended() {
     fi
     say "done: nos is on $DISK"
     if in_vm; then
-        say "this installer ran in a virtual machine: if it is a provider's over the server's disks (Selectel's qemu-iso), have the server's firmware boot nos first, in its rescue system: $(rescue_lines | awk 'NR > 1 { printf " && " } { printf "%s", $0 } END { print "" }')"
+        say "this installer ran in a virtual machine: if it is a provider's over the server's disks (Selectel's qemu-iso), have the server's firmware boot nos first, in its rescue system: $RESCUE_LINE"
     fi
     case "$after" in
         reboot) eject_media; say "rebooting"; sync; reboot ;;
@@ -529,17 +563,9 @@ unattended() {
 }
 
 # What the server's own rescue system runs to have its firmware boot the
-# disk this installer made, a command a line: the nos-install of the
-# image's release (of the newest, for an image of no release)
-rescue_lines() {
-    local v url=https://github.com/irqlevel/nos/releases/latest/download/nos-x86_64.squashfs
-    v=$(sed -n 's/^version=//p' "$MNT/VERSION")
-    case "$v" in
-        v[0-9]*) url=https://github.com/irqlevel/nos/releases/download/$v/nos-x86_64.squashfs ;;
-    esac
-    printf '%s\n' "cd /tmp" "wget $url" "mount -o loop,ro nos-x86_64.squashfs /mnt" \
-        "/mnt/nos-install boot --default" "umount /mnt"
-}
+# disk this installer made: nos-install boot --default, of the newest
+# release's image, by the one-line installer (install.sh)
+RESCUE_LINE="curl -fsSL https://nos-os.tech/install.sh | sh -s -- boot --default"
 
 # ---- the dialog ---------------------------------------------------------
 
@@ -552,27 +578,15 @@ msg() {
 }
 
 # In a virtual machine, at the end: the server's firmware was not this
-# installer's to set, and what its rescue system runs instead -- in a box as
-# wide as the screen lets it be, a URL being one word
+# installer's to set, and what its rescue system runs instead -- one line, 67
+# columns, which fits an 80-column serial console's box
 rescue_box() {
-    local cols w
-    cols=$(stty size 2>/dev/null | awk '{ print $2 }')
-    [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
-    w=$((cols - 4))
-    [ "$w" -le 110 ] || w=110
-    [ "$w" -ge 60 ] || w=60
-    rescue_lines | sed 's/^/  /' > /run/nos-rescue
-    # 14 lines on an 80-column serial console, the URL wrapped: all of it
-    # shown in the box's 15
     whiptail --title "$TITLE" --msgbox "This installer ran in a virtual machine. If that is the provider's way of installing from an ISO -- Selectel's qemu-iso runs one in QEMU over the server's disks -- the server's own firmware was out of its reach, and still boots what it booted before. In the server's rescue system, before it reboots, have it boot nos first:
 
-$(cat /run/nos-rescue)
+$RESCUE_LINE
 
-(docs/install.md, \"From a provider's rescue system\")" 22 "$w"
-    {
-        echo "nos-setup: in the server's rescue system, before its reboot:"
-        cat /run/nos-rescue
-    } >> "$LOG"
+(docs/install.md, \"From a provider's rescue system\")" 18 76
+    echo "nos-setup: in the server's rescue system, before its reboot: $RESCUE_LINE" >> "$LOG"
 }
 
 human() {
@@ -641,8 +655,104 @@ vm_network() {
     net_dhcp >/dev/null 2>&1 || true
 }
 
+# nos's address, gateway and DNS server, in IP, GW and DNS as offered: each
+# asked and checked, and what most networks have offered where none is --
+# the gateway the network's first address, the DNS server the first of the
+# gateway, 1.1.1.1 and 8.8.8.8 that answers. Asking those on the ISO sets up
+# the installer's own network with the address; in a VM, whose network is
+# not the server's, nothing is asked; on a Linux not the ISO's, its own
+# network asks them, untouched
+edit_address() {
+    local gwnote dnsnote
+    while :; do
+        IP=$(dialog_ --inputbox "nos's address, with its prefix length (203.0.113.5/24):" 10 76 "$IP") || return 1
+        if ! valid_cidr "$IP"; then
+            msg "The address is A.B.C.D/N: 203.0.113.5/24."
+            continue
+        fi
+        # Most networks' gateway is their first address
+        gwnote=
+        if [ -z "$GW" ]; then
+            GW=$(first_host "$IP")
+            [ -z "$GW" ] || gwnote=" -- the network's first address, where most networks have it"
+        fi
+        GW=$(dialog_ --inputbox "The gateway$gwnote:" 10 76 "$GW") || return 1
+        valid_ip "$GW" || { msg "The gateway is A.B.C.D."; GW=; continue; }
+        dnsnote=
+        if [ -z "$DNS" ]; then
+            if [ "$ON_ISO" = 0 ]; then
+                DNS=$(dns_answering "$GW" 1.1.1.1 8.8.8.8 || true)
+            elif ! in_vm; then
+                # The first server that answers from this address
+                wait_carrier || true
+                net_static "$IP" "$GW" "$GW" >/dev/null 2>&1 || true
+                DNS=$(dns_answering "$GW" 1.1.1.1 8.8.8.8 || true)
+            fi
+            [ -z "$DNS" ] || dnsnote=" -- it answers from here"
+        fi
+        DNS=$(dialog_ --inputbox "The DNS server$dnsnote:" 10 76 "${DNS:-$GW}") || return 1
+        valid_ip "$DNS" || { msg "The DNS server is A.B.C.D."; DNS=; continue; }
+        return 0
+    done
+}
+
+IP=
+GW=
+DNS=
+
+# The network, on a Linux not the ISO's: offered as it has it -- a
+# provider's rescue system is up on the server's own address -- or as a
+# Linux on the disks has it, or given; nothing of this system's is changed
+ask_network_here() {
+    local how here hip= hgw= hdns= w warn= found= items=() text
+    NOS_CMDLINE=
+    text="How does nos get its address on this server's network?"
+    here=$(nos_install network 2>/run/nos-network.why) || here=
+    if [ -n "$here" ]; then
+        for w in $here; do
+            case "$w" in
+                ip=*) hip=${w#ip=} ;;
+                gw=*) hgw=${w#gw=} ;;
+                dns=*) hdns=${w#dns=} ;;
+            esac
+        done
+        items+=(here "$hip, gateway $hgw, DNS $hdns")
+        text="$text\n\nhere: as this system has it -- a provider's rescue system is up on the server's own address."
+        warn=$(sed -n 's/^nos-install: WARNING: --network-here: //p' /run/nos-network.why)
+        [ -z "$warn" ] || text="$text\n\n$warn."
+    else
+        text="$text\n\nThis system's own cannot be offered: $(sed -n 's/^nos-install: \(--network-here: \)\{0,1\}//p' /run/nos-network.why | tail -n 1)."
+    fi
+    found=$(found_network || true)
+    if [ -n "$found" ]; then
+        set -- $found
+        if [ "$1" = "$hip" ]; then
+            found=
+        else
+            items+=(found "$1, gateway ${2/#-/none}, DNS ${3/#-/none}")
+            text="$text\n\nfound: as a Linux on $4 has it ($5: $6)."
+        fi
+    fi
+    items+=(static "A static address, given here" dhcp "By DHCP")
+    how=$(dialog_ --menu "$text" 22 76 4 "${items[@]}") || return 1
+    IP=; GW=; DNS=
+    case "$how" in
+        dhcp)
+            whiptail --title "$TITLE" --defaultno --yesno "nos asks a DHCP server for its address at every boot. On a network with no DHCP server -- many dedicated servers' have none -- it boots unreachable.\n\nIs there a DHCP server on this server's network, for the server itself (not only the rescue system's)?" 14 76 || return 1
+            return 0 ;;
+        here) IP=$hip; GW=$hgw; DNS=$hdns ;;
+        found)
+            set -- $found
+            IP=$1; GW=${2/#-/}; DNS=${3/#-/} ;;
+        static) DNS=$hdns ;;
+    esac
+    edit_address || return 1
+    NOS_CMDLINE="ip=$IP gw=$GW dns=$DNS"
+}
+
 ask_network() {
-    local how ip gw dns found= items=() note= where= gwnote dnsnote
+    local how found= items=() note= where=
+    [ "$ON_ISO" = 1 ] || { ask_network_here; return; }
     NOS_CMDLINE=
     # A provider's installer VM is behind QEMU's NAT: nothing tried here says
     # anything of the server's network
@@ -671,65 +781,41 @@ ask_network() {
             return 0 ;;
         found)
             set -- $found
-            ip=$1
-            gw=${2/#-/}
-            dns=${3/#-/} ;;
+            IP=$1; GW=${2/#-/}; DNS=${3/#-/} ;;
         static)
-            ip=${ANS[ip]:-}
-            gw=${ANS[gw]:-}
-            dns=${ANS[dns]:-} ;;
+            IP=${ANS[ip]:-}; GW=${ANS[gw]:-}; DNS=${ANS[dns]:-} ;;
     esac
-    while :; do
-        ip=$(dialog_ --inputbox "nos's address, with its prefix length (203.0.113.5/24):" 10 76 "$ip") || return 1
-        if ! valid_cidr "$ip"; then
-            msg "The address is A.B.C.D/N: 203.0.113.5/24."
-            continue
-        fi
-        # Most networks' gateway is their first address
-        gwnote=
-        if [ -z "$gw" ]; then
-            gw=$(first_host "$ip")
-            [ -z "$gw" ] || gwnote=" -- the network's first address, where most networks have it"
-        fi
-        gw=$(dialog_ --inputbox "The gateway$gwnote:" 10 76 "$gw") || return 1
-        valid_ip "$gw" || { msg "The gateway is A.B.C.D."; gw=; continue; }
-        dnsnote=
-        if [ -z "$dns" ] && ! in_vm; then
-            # The first server that answers from this address: the gateway's,
-            # or a public one
-            wait_carrier || true
-            net_static "$ip" "$gw" "$gw" >/dev/null 2>&1 || true
-            dns=$(dns_answering "$gw" 1.1.1.1 8.8.8.8 || true)
-            [ -z "$dns" ] || dnsnote=" -- it answers from this address"
-        fi
-        dns=$(dialog_ --inputbox "The DNS server$dnsnote:" 10 76 "${dns:-$gw}") || return 1
-        valid_ip "$dns" || { msg "The DNS server is A.B.C.D."; dns=; continue; }
-        break
-    done
-    ANS[ip]=$ip; ANS[gw]=$gw; ANS[dns]=$dns
-    NOS_CMDLINE="ip=$ip gw=$gw dns=$dns"
+    edit_address || return 1
+    ANS[ip]=$IP; ANS[gw]=$GW; ANS[dns]=$DNS
+    NOS_CMDLINE="ip=$IP gw=$GW dns=$DNS"
     if in_vm; then
         vm_network
         return 0
     fi
     wait_carrier || true
-    if net_static "$ip" "$gw" "$dns" && ping -c 2 -W 2 "$gw" >/dev/null 2>&1; then
-        msg "The gateway $gw answers the installer at $ip."
+    if net_static "$IP" "$GW" "$DNS" && ping -c 2 -W 2 "$GW" >/dev/null 2>&1; then
+        msg "The gateway $GW answers the installer at $IP."
     else
-        whiptail --title "$TITLE" --defaultno --yesno "The gateway $gw does not answer the installer at $ip.\n\nGo on with this address anyway?" 12 76 || return 1
+        whiptail --title "$TITLE" --defaultno --yesno "The gateway $GW does not answer the installer at $IP.\n\nGo on with this address anyway?" 12 76 || return 1
     fi
 }
 
 ask_keys() {
-    local choice line url user n
+    local choice line url user n items here=
+    [ "$ON_ISO" = 1 ] || here=$(here_keys)
     while :; do
         n=$(keys_count)
-        choice=$(dialog_ --menu "nos is reached by SSH, with a key: which may log in? ($n so far)\n\nnos's sshd takes ssh-ed25519 keys only." 16 76 5 \
-            paste "Paste a key line (ssh-ed25519 AAAA...)" \
-            url "Fetch keys from a URL" \
-            github "Fetch a GitHub user's keys" \
-            done "Done") || return 1
+        items=()
+        [ -z "$here" ] || items+=(here "The keys root logs in with here: $(printf '%s\n' "$here" | wc -l) ssh-ed25519")
+        items+=(paste "Paste a key line (ssh-ed25519 AAAA...)" url "Fetch keys from a URL"
+            github "Fetch a GitHub user's keys" "done" "Done")
+        choice=$(dialog_ --menu "nos is reached by SSH, with a key: which may log in? ($n so far)\n\nnos's sshd takes ssh-ed25519 keys only." 16 76 5 "${items[@]}") || return 1
         case "$choice" in
+            here)
+                printf '%s\n' "$here" > /run/nos-keys.new
+                if whiptail --title "$TITLE" --yesno "/root/.ssh/authorized_keys here gives:\n\n$(ssh-keygen -lf /run/nos-keys.new 2>/dev/null)\n\nLet these in?" 18 76; then
+                    cat /run/nos-keys.new >> "$KEYS_FILE"
+                fi ;;
             paste)
                 line=$(dialog_ --inputbox "The key, a line as in ~/.ssh/id_ed25519.pub:" 10 76) || continue
                 if [[ "$line" =~ ^ssh-ed25519\ [A-Za-z0-9+/]+=*(\ .*)?$ ]]; then
@@ -799,28 +885,47 @@ confirm() {
 
 the_end() {
     local choice items=()
-    if [ "${2:-}" = installed ] && in_vm; then
-        rescue_box
-        items+=(rescue "What the server's rescue system runs before it reboots")
+    if [ "$ON_ISO" = 0 ]; then
+        items+=(exit "Back to this system's shell" reboot "Reboot now" install "Install again")
+    else
+        if [ "${2:-}" = installed ] && in_vm; then
+            rescue_box
+            items+=(rescue "What the server's rescue system runs before it reboots")
+        fi
+        items+=(reboot "Reboot (the installer's medium ejected where it can be)"
+            poweroff "Power off" install "Install again" shell "A shell")
     fi
-    items+=(reboot "Reboot (the installer's medium ejected where it can be)"
-        poweroff "Power off" install "Install again" shell "A shell")
     while :; do
-        choice=$(dialog_ --menu "$1" 18 76 5 "${items[@]}") || continue
+        if ! choice=$(dialog_ --menu "$1" 18 76 5 "${items[@]}"); then
+            [ "$ON_ISO" = 1 ] && continue
+            choice="exit"
+        fi
         case "$choice" in
             rescue) rescue_box ;;
-            reboot) eject_media; sync; reboot; sleep 30 ;;
+            reboot)
+                [ "$ON_ISO" = 0 ] || eject_media
+                sync; reboot; sleep 30 ;;
             poweroff) sync; poweroff; sleep 30 ;;
             install) return 0 ;;
             shell) clear; echo "nos installer: exit returns to the menu"; bash -l ;;
+            exit) clear; exit 0 ;;
         esac
     done
 }
 
+# What is left to do, once nos is on DISK
+done_text() {
+    if [ "$ON_ISO" = 1 ]; then
+        echo "$(image_version) is on $DISK.\n\nTake the installer's ISO out of the virtual media (or the USB stick out), and reboot."
+    else
+        echo "$(image_version) is on $DISK.\n\nIn the provider's panel, have the server boot its disks again instead of the rescue system; then reboot it."
+    fi
+}
+
 interactive() {
     KMSG_LEVEL=6
-    if in_vm; then
-        msg "This installer runs in a virtual machine.\n\nIf that is the provider's way of installing from an ISO -- Selectel's qemu-iso runs one in QEMU, over the server's disks -- then:\n\n- the network here is QEMU's, not the server's: nos needs the server's address (a Linux already on its disks may have it, and is looked at);\n- the server's firmware is out of reach: its boot order is set in its rescue system after the install (said at the end).\n\nSimpler still: in the provider's rescue system, nos-install disk does it all on the server itself (docs/install.md)."
+    if [ "$ON_ISO" = 1 ] && in_vm; then
+        whiptail --title "$TITLE" --msgbox "This installer runs in a virtual machine.\n\nIf that is the provider's way of installing from an ISO -- Selectel's qemu-iso runs one in QEMU, over the server's disks -- then:\n\n- the network here is QEMU's, not the server's: nos needs the server's address (a Linux already on its disks may have it, and is looked at);\n- the server's firmware is out of reach: its boot order is set in its rescue system after the install (said at the end).\n\nSimpler still: in the provider's rescue system, one command does it all on the server itself:\n\n  curl -fsSL https://nos-os.tech/install.sh | sh" 22 76
     fi
     while :; do
         : > "$KEYS_FILE"
@@ -829,12 +934,12 @@ interactive() {
         if ask_disk && ask_root_size && ask_network && ask_keys && ask_netconsole && confirm; then
             clear
             if run_install; then
-                the_end "$(image_version) is on $DISK.\n\nTake the installer's ISO out of the virtual media (or the USB stick out), and reboot." installed
+                the_end "$(done_text)" installed
             else
                 echo
                 echo "nos-setup: nos-install did not finish -- press Enter"
                 read -r _
-                the_end "nos-install did not finish: see /run/nos-setup.log in a shell."
+                the_end "nos-install did not finish: see $LOG."
             fi
         else
             the_end "Nothing was written."
@@ -842,15 +947,41 @@ interactive() {
     done
 }
 
+# What the dialog needs on a Linux not the ISO's: root, the image it came
+# in, a terminal, and its tools
+here_ready() {
+    local t missing=
+    [ "$(id -u)" = 0 ] || { echo "nos-setup: run it as root" >&2; return 1; }
+    if [ ! -x "$MNT/nos-install" ] || [ ! -f "$MNT/VERSION" ]; then
+        echo "nos-setup: $MNT is not a system image: run the nos-setup of one, mounted (docs/install.md)" >&2
+        return 1
+    fi
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        echo "nos-setup: the dialog needs a terminal -- without one, nos-install with its arguments (docs/install.md)" >&2
+        return 1
+    fi
+    for t in whiptail curl ssh-keygen; do
+        command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+    done
+    if [ -n "$missing" ]; then
+        echo "nos-setup: this Linux has no$missing (Debian, Ubuntu: apt-get install whiptail curl openssh-client)" >&2
+        return 1
+    fi
+}
+
 : >> "$LOG"
-read_answers
-if ! open_image; then
-    sleep 5
-    exec bash -l
-fi
-if [ -n "${ANS[disk]:-}" ] && [ ! -e "$DONE" ]; then
-    unattended || true
-    echo "nos-setup: press Enter for the menu"
-    read -r _ || sleep 3600
+if [ "$ON_ISO" = 1 ]; then
+    read_answers
+    if ! open_image; then
+        sleep 5
+        exec bash -l
+    fi
+    if [ -n "${ANS[disk]:-}" ] && [ ! -e "$DONE" ]; then
+        unattended || true
+        echo "nos-setup: press Enter for the menu"
+        read -r _ || sleep 3600
+    fi
+else
+    here_ready || exit 1
 fi
 interactive
