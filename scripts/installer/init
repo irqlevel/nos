@@ -1,0 +1,34 @@
+#!/bin/sh
+# The installer's first process (scripts/installer): the kernel runs it from
+# the initramfs. It mounts what a system needs, says which terminal the
+# dialog runs on -- the console the kernel was given last, as /dev/console
+# is: tty1 unless the menu's entry named a serial port -- and hands over to
+# busybox's init, which runs sysinit and then nos-setup there, again if it
+# ends.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /dev/shm /run /tmp
+mount -t devpts devpts /dev/pts
+mount -t tmpfs -o mode=0755 tmpfs /run
+
+console=tty1
+for word in $(cat /proc/cmdline); do
+    case "$word" in
+        console=*)
+            console=${word#console=}
+            console=${console%%,*} ;;
+    esac
+done
+[ "$console" != tty0 ] || console=tty1
+
+cat > /etc/inittab <<EOF
+::sysinit:/usr/lib/nos-installer/sysinit
+$console::respawn:/usr/lib/nos-installer/run-setup
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/umount -a -r
+EOF
+
+exec /sbin/init
