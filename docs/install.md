@@ -263,9 +263,17 @@ have), so the disk boots whichever way the firmware is set, and the root's
 `/boot/grub/grub.cfg` is the disk's own: what `42_nos` does in a server's
 GRUB, with nothing else to fall back to -- it finds the root by its UUID,
 takes `nos_cmdline` and `nos_next` from `/grubenv`, and the entries from the
-image's `nos.cfg`, `nos` the default. No boot entry is written to the
-firmware, and its boot order is left as it is: a provider's servers try
-the network first, for the rescue system, and the disk after it.
+image's `nos.cfg`, `nos` the default.
+
+Under UEFI the firmware is then told to boot the disk: its entry for the
+disk's `\EFI\BOOT\BOOTX64.EFI` -- one the firmware made by itself (AMI's
+"UEFI OS"), or one `nos-install` makes, `nos` -- goes right after the
+network's entries that lead the boot order, and nothing else moves. A
+provider's servers try the network first, for its rescue system, and that
+stays so; what booted after it before -- the system the server came with,
+on another disk -- boots after nos now, if nos does not come up.
+`--keep-boot-order` leaves the order as it is. A BIOS has no order a running
+system can set: its setup, or the provider's panel, puts the disk first.
 
 Refused, before anything is written: a partition (`install` takes those);
 a disk any of which is in use -- mounted, swap, held by md, LVM or the
@@ -279,9 +287,46 @@ zero in its first or last MiB -- unless `--wipe` says to erase it.
 `update`, `rollback`, `boot` and `status` then find the root of a disk of
 nos's own by themselves, from any Linux booted on the machine -- the
 rescue system, the installer's shell -- by its label and its grub.cfg (or
-take it named), and change nothing of that Linux's GRUB; `boot` has
-nothing to arm, as nos is the disk's default, and `uninstall` nothing to
-take out.
+take it named), and change nothing of that Linux's GRUB. `boot` has the
+firmware boot the disk next, once (UEFI's `BootNext`), the order as it was
+after it; `boot --default` puts it first after the network's entries, for
+good; `uninstall` has nothing to take out.
+
+`--network-here` gives nos the network this Linux has: the address of the
+interface its default route leaves by, the route's gateway, its first DNS
+server (`resolv.conf`, or the servers systemd-resolved asks) -- `ip= gw=
+dns=` on nos's command line. A provider's rescue system is up on the
+server's own address, so its network is the one nos needs on a network with
+no DHCP. nos puts the address on `eth0`, the first network card it drives
+in the bus's order, and `nos-install` says so when that is not the card
+this Linux reaches the network by.
+
+### From a provider's rescue system
+
+A provider's rescue system -- a Linux booted from the network, the server's
+disks idle, reached by SSH on the server's address -- is the shortest way
+onto a server's disk: the network and the firmware there are the server's
+own. Selectel's, for one (its panel's boot template "Boot to Rescue"):
+
+```sh
+wget https://github.com/irqlevel/nos/releases/latest/download/nos-x86_64.squashfs
+mount -o loop,ro nos-x86_64.squashfs /mnt
+/mnt/nos-install disk /dev/disk/by-id/ata-INTEL_SSDSC2KB240G7_BTYS81950A94240AGN --wipe \
+    --network-here --ssh-key ~/.ssh/authorized_keys --root-size 10G
+umount /mnt
+```
+
+Then the boot template back to what it was, and a reboot: the firmware
+boots nos after its PXE, which no longer sends the server to the rescue.
+
+Selectel's "install from an image" runs an ISO in QEMU in that same rescue
+system (its `qemu-iso`), over the server's disks: the installer ISO below
+works so, but from inside a virtual machine, whose network is QEMU's and
+whose firmware is QEMU's -- it can neither see the server's address nor set
+the server's boot order. The installer says so, looks for the address on a
+Linux already on the server's disks, and ends with the line to run in the
+rescue system before the reboot: `nos-install boot --default` from the
+release's image.
 
 ## From an ISO
 
@@ -300,12 +345,23 @@ image's `nos-install disk`. It boots by BIOS or UEFI; its menu:
 
 The dialog asks which disk -- every one Linux sees, each said with its
 model, serial and size, what it holds and whether nos can read it -- how big
-nos's root is to be, the network (DHCP, or an address for a network with
-none, which the installer tries on the gateway), and the keys sshd is to let
-in: pasted, or fetched by URL or as a GitHub user's (`https://github.com/<user>.keys`),
+nos's root is to be, the network, and the keys sshd is to let in: pasted,
+or fetched by URL or as a GitHub user's (`https://github.com/<user>.keys`),
 their fingerprints shown. Then what `nos-install disk --dry-run` would write,
 and the disk's name typed to erase it. When it is done: take the ISO out of
-the virtual media and boot the disk.
+the virtual media and reboot -- under UEFI the firmware is told to boot the
+disk (above).
+
+The network first offers what a Linux already on the server's disks is set
+up with -- the system the server came with knows its address on a network
+with no DHCP: netplan, ifupdown, NetworkManager, systemd-networkd or ifcfg,
+each root mounted read-only, its journal not replayed. Else a static
+address, given: the gateway offered is the network's first address, where
+most networks have it, and the DNS server the first of the gateway,
+1.1.1.1 and 8.8.8.8 that answers from it; the installer then tries the
+gateway. DHCP is said for what it is -- nos asks for its address at every
+boot, and on a network with no DHCP server it boots unreachable. In a
+virtual machine nothing is tried: what answers there is QEMU's.
 
 Every release carries one, made of the release's system image and tried
 before it is published (`.github/workflows/release.yml`); the newest is
@@ -432,8 +488,8 @@ it finds one. So does an `/etc/rc` that loads a module from outside
   works on: see the first section.
 - A disk of nos's own is one disk: nos reads no md mirror, so its root is
   not mirrored onto a second. Its sectors are 512 bytes, as BIOS boots them
-  (a 4Kn disk is refused), and it boots as the firmware's order has it: no
-  boot entry is written, none moved.
+  (a 4Kn disk is refused). Under UEFI the firmware's order is set, its
+  network entries first still; under BIOS it is the firmware's setup's.
 - The installer's dialog takes keys, not a password: nos's sshd lets in
   ssh-ed25519 keys alone.
 

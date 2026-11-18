@@ -289,6 +289,79 @@ disk_install() {
 }
 first_mib() { dd if="$1" bs=1M count=1 status=none | sha256sum | cut -d' ' -f1; }
 blank_mib() { [ -z "$(dd if="$1" bs=1M count=1 status=none | tr -d '\000' | head -c 1)" ]; }
+# efibootmgr's stand-in, over a firmware's entries kept in $EFI_STATE: lists
+# them as efibootmgr does (-v with the device paths), and takes -o, -n, -a
+# and -C as efibootmgr does, each call's arguments kept in $EFI_STATE.log
+cat > "$T/efibootmgr" <<'FAKE'
+#!/bin/bash
+state=$EFI_STATE
+echo "$*" >> "$state.log"
+verbose=0 order= next= create=0 disk= part= label= loader= num= activate=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -q) ;;
+        -o) order=$2; shift ;;
+        -n) next=$2; shift ;;
+        -C) create=1 ;;
+        -d) disk=$2; shift ;;
+        -p) part=$2; shift ;;
+        -L) label=$2; shift ;;
+        -l) loader=$2; shift ;;
+        -b) num=$2; shift ;;
+        -a) activate=1 ;;
+        *) echo "efibootmgr stand-in: what is $1?" >&2; exit 2 ;;
+    esac
+    shift
+done
+[ -z "$order" ] || sed -i "s/^BootOrder: .*/BootOrder: $order/" "$state"
+if [ -n "$next" ]; then
+    grep -v '^BootNext:' "$state" > "$state.new"
+    echo "BootNext: $next" >> "$state.new"
+    mv "$state.new" "$state"
+fi
+[ "$activate" = 0 ] || sed -i "s/^Boot$num  /Boot$num* /" "$state"
+if [ "$create" = 1 ]; then
+    guid=$(blkid -p -o value -s PART_ENTRY_UUID "${disk}p$part")
+    last=$(grep -o '^Boot[0-9A-F]\{4\}' "$state" | cut -c5- | sort | tail -n 1)
+    printf 'Boot%04X* %s\tHD(%s,GPT,%s,0x800,0x100000)/File(%s)\n' $((16#$last + 1)) "$label" "$part" "$guid" "$loader" >> "$state"
+fi
+[ -z "$order$next$num" ] && [ "$create" = 0 ] || exit 0
+if [ "$verbose" = 1 ]; then
+    cat "$state"
+else
+    sed 's/\t.*//' "$state"
+fi
+FAKE
+chmod 755 "$T/efibootmgr"
+# A firmware's entries: the Supermicro X11SSD-F's, as its efibootmgr -v had
+# them when it booted its old Ubuntu after an install of nos -- PXE on its two
+# ports first, the Ubuntu entry, HTTP boot, AMI's own "UEFI OS" entries, the
+# shell, a legacy one turned off; with $1 the GPT GUID of a "UEFI OS" entry's
+# EFI System partition, and none for nos's when $1 is empty
+efi_state() {
+    cat <<EOF
+BootCurrent: 0000
+Timeout: 1 seconds
+BootOrder: 0067,0069,0000,0066,0068,006A${1:+,006B},0064,0063
+Boot0000* Ubuntu	HD(2,GPT,12fe60cd-809b-4681-ac0f-67a3e80e0f7f,0x1000,0x2f800)/File(\EFI\UBUNTU\GRUBX64.EFI)
+      dp: 04 01 2a 00 02 00 00 00 00 10 00 00 00 00 00 00 00 f8 02 00 00 00 00 00
+Boot0063  Hard Drive	BBS(HD,,0x0)0000474f00004e4fa9000000000000006f0049004e00540045004c00
+Boot0064* UEFI: Built-in EFI Shell	VenMedia(5023b95c-db26-429b-a648-bd47664c8012)0000424f
+Boot0066* UEFI: Intel(R) I350 Gigabit Network Connection	PciRoot(0x0)/Pci(0x1,0x1)/Pci(0x0,0x0)/MAC(ac1f6b205352,1)/IPv4(0.0.0.00.0.0.0,0,0)/Uri()0000424f
+Boot0067* UEFI: IP4 Intel(R) I350 Gigabit Network Connection	PciRoot(0x0)/Pci(0x1,0x1)/Pci(0x0,0x0)/MAC(ac1f6b205352,1)/IPv4(0.0.0.00.0.0.0,0,0)0000424f
+Boot0068* UEFI: Intel(R) I350 Gigabit Network Connection	PciRoot(0x0)/Pci(0x1,0x1)/Pci(0x0,0x1)/MAC(ac1f6b205353,1)/IPv4(0.0.0.00.0.0.0,0,0)/Uri()0000424f
+Boot0069* UEFI: IP4 Intel(R) I350 Gigabit Network Connection	PciRoot(0x0)/Pci(0x1,0x1)/Pci(0x0,0x1)/MAC(ac1f6b205353,1)/IPv4(0.0.0.00.0.0.0,0,0)0000424f
+Boot006A* UEFI OS	HD(2,GPT,12fe60cd-809b-4681-ac0f-67a3e80e0f7f,0x1000,0x2f800)/File(\EFI\BOOT\BOOTX64.EFI)0000424f
+EOF
+    if [ -n "${1:-}" ]; then
+        printf 'Boot006B  UEFI OS\tHD(2,GPT,%s,0x1000,0x100000)/File(\\EFI\\BOOT\\BOOTX64.EFI)0000424f\n' "$1"
+    fi
+}
+# nos-install under UEFI, the firmware the stand-in's
+efi_install() {
+    NOS_FIRMWARE=uefi NOS_IN_VM=${NOS_IN_VM:-0} NOS_EFIBOOTMGR="$T/efibootmgr" disk_install "$@"
+}
 """
 
 WHOLE_PREPARE = WHOLE_HELPERS + r"""
@@ -328,9 +401,13 @@ fi
 cat refuse-size.out
 [ "$(first_mib "$WHOLE")" != "$before" ] || echo "size: the disk is as it was"
 
-disk_install disk "$WHOLE" --wipe --root-size "$WHOLE_ROOT" --ssh-key id_test.pub \
+# Under UEFI, on the Supermicro's firmware as it was before nos: no entry
+# for the disk, which nos-install makes, and puts right after PXE's
+efi_state > efi-before
+EFI_STATE="$T/efi-before" efi_install disk "$WHOLE" --wipe --root-size "$WHOLE_ROOT" --ssh-key id_test.pub \
     --netconsole 10.0.2.2:6666 > disk.out 2>&1 || { cat disk.out; exit 1; }
 cat disk.out
+cat efi-before efi-before.log
 sfdisk --dump "$WHOLE" > layout.out
 cat layout.out
 fsck.vfat -n "${WHOLE}p2" > fsckfat.out 2>&1 && echo "esp: clean" || { cat fsckfat.out; echo "esp: DAMAGED"; }
@@ -339,6 +416,7 @@ e2fsck -fn "${WHOLE}p3" > fsckroot.out 2>&1 && echo "root: clean" || { cat fsckr
 [ -z "$(dd if="$WHOLE" bs=440 count=1 status=none | tr -d '\000' | head -c 1)" ] || echo "mbr: boot code"
 blkid -p -o value -s PART_ENTRY_UUID "${WHOLE}p4" > data-partuuid.out
 blkid -p -o value -s UUID "${WHOLE}p3" > root-uuid.out
+blkid -p -o value -s PART_ENTRY_UUID "${WHOLE}p2" > esp-guid.out
 mount_at "${WHOLE}p2" esp ro
 [ ! -f esp/EFI/BOOT/BOOTX64.EFI ] || echo "esp: BOOTX64.EFI"
 unmount_last
@@ -363,8 +441,28 @@ disk_install status > disk-status.out 2>&1 || { cat disk-status.out; exit 1; }
 cat disk-status.out
 disk_install update --udpshell > disk-update.out 2>&1 || { cat disk-update.out; exit 1; }
 cat disk-update.out
+debugfs -R 'cat /grubenv' "${WHOLE}p3" 2>/dev/null | grep '^nos_' > disk-grubenv2.out
 disk_install boot > disk-boot.out 2>&1 || { cat disk-boot.out; exit 1; }
 cat disk-boot.out
+# The Supermicro's firmware as an install of nos left it: AMI's own entry
+# for the disk's \EFI\BOOT\BOOTX64.EFI, turned off, after Ubuntu's
+esp_guid=$(blkid -p -o value -s PART_ENTRY_UUID "${WHOLE}p2")
+efi_state "$esp_guid" > efi-once
+EFI_STATE="$T/efi-once" NOS_IN_VM=1 efi_install boot > efi-once.out 2>&1 || { cat efi-once.out; exit 1; }
+cat efi-once.out efi-once.log
+grep -E '^(BootOrder|BootNext):' efi-once
+efi_state "$esp_guid" > efi-default
+EFI_STATE="$T/efi-default" efi_install boot --default > efi-default.out 2>&1 || { cat efi-default.out; exit 1; }
+cat efi-default.out efi-default.log
+grep -E '^(BootOrder|BootNext|Boot006B)' efi-default
+# The network as this Linux has it, for nos: a rescue system's is the server's
+command -v ip > /dev/null ||
+    { echo "no ip here (iproute2): a builder image older than the Dockerfile -- docker build -t nos-builder ."; exit 1; }
+here_dev=$(ip -4 route show default | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)
+echo "here: ip=$(ip -4 -o addr show dev "$here_dev" scope global | awk '{ print $4; exit }') gw=$(ip -4 route show default | sed -n 's/.* via \([0-9.]*\).*/\1/p' | head -n 1)"
+disk_install update --network-here > disk-here.out 2>&1 || { cat disk-here.out; exit 1; }
+cat disk-here.out
+debugfs -R 'cat /grubenv' "${WHOLE}p3" 2>/dev/null | grep '^nos_' > disk-grubenv3.out
 if disk_install uninstall > disk-uninstall.out 2>&1; then
     echo "uninstall: done"
 fi
@@ -375,7 +473,6 @@ fi
 cat disk-install.out
 echo "grub.d: $(ls -A grub.d.disk | wc -l)"
 mount_at "${WHOLE}p3" root ro
-grub-editenv root/grubenv list > disk-grubenv2.out
 same_as_image root disk-update
 unmount_last
 e2fsck -fn "${WHOLE}p3" > fsck6.out 2>&1 && echo "fsck6: clean" || { cat fsck6.out; echo "fsck6: DAMAGED"; }
@@ -683,6 +780,13 @@ def run_disk(tmp, linux, key, want):
           "disk: every file of the image" in out and "keys: 1" in out and
           "nos_cmdline=netconsole=10.0.2.2:6666" in linux.read("disk-grubenv.out"), out)
     check("nothing of the machine's GRUB is touched", "grub.d: 0" in out, out)
+    efi = linux.read("efi-before")
+    esp_guid = linux.read("esp-guid.out").strip()
+    check("under UEFI, with no entry of the firmware's for the disk, one is made for its \\EFI\\BOOT\\BOOTX64.EFI",
+          ("Boot006B* nos\tHD(2,GPT,%s," % esp_guid) in efi and "File(\\EFI\\BOOT\\BOOTX64.EFI)" in efi,
+          efi + linux.read("efi-before.log"))
+    check("and put right after the leading PXE entries, nothing else moved: the Supermicro's old Ubuntu next",
+          "BootOrder: 0067,0069,006B,0000,0066,0068,006A,0064,0063" in efi, efi)
 
     m = Machine(tmp, key)
     for name, firmware in (("BIOS", None), ("UEFI", ovmf())):
@@ -724,7 +828,24 @@ def run_disk(tmp, linux, key, want):
     check("update puts every file of the image there again, and takes the UDP shell it was given",
           "disk-update: every file of the image" in out and
           "nos_cmdline=udpshell=9000" in linux.read("disk-grubenv2.out").splitlines(), linux.read("disk-grubenv2.out"))
-    check("boot has nothing to arm there", "nothing to arm" in linux.read("disk-boot.out"), linux.read("disk-boot.out"))
+    check("boot under BIOS says the BIOS's own order picks the disk", "boots by BIOS" in linux.read("disk-boot.out"),
+          linux.read("disk-boot.out"))
+    once = linux.read("efi-once")
+    check("boot under UEFI, on the Supermicro's firmware as an install left it: BootNext is the firmware's own "
+          "entry for the disk, turned on, and the order is as it was",
+          "BootNext: 006B" in once and "Boot006B* UEFI OS" in once and
+          "BootOrder: 0067,0069,0000,0066,0068,006A,006B,0064,0063" in once, once + linux.read("efi-once.log"))
+    check("in a virtual machine, it says the server's own order is set from the server",
+          "runs in a virtual machine" in linux.read("efi-once.out") and "nos-install boot --default" in
+          linux.read("efi-once.out"), linux.read("efi-once.out"))
+    default = linux.read("efi-default")
+    check("boot --default puts that entry right after PXE's, for good: the order the Supermicro needed",
+          "BootOrder: 0067,0069,006B,0000,0066,0068,006A,0064,0063" in default and "BootNext" not in default and
+          "Boot006B* UEFI OS" in default, default + linux.read("efi-default.log"))
+    here = [line for line in out.splitlines() if line.startswith("here: ")]
+    env3 = linux.read("disk-grubenv3.out")
+    check("update --network-here takes the address, gateway and DNS server this Linux has",
+          len(here) == 1 and here[0][len("here: "):] in env3 and " dns=" in env3, here + [env3])
     check("uninstall has nothing to take out", "uninstall: done" not in out, linux.read("disk-uninstall.out"))
     check("an install over its root is refused: update is what renews it",
           "install over it: done" not in out and "nos-install update" in linux.read("disk-install.out"),
