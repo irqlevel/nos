@@ -179,6 +179,191 @@ valid_ip() {
     [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
 }
 
+# Whether this installer runs in a virtual machine: the CPU's hypervisor
+# flag, or a board a hypervisor names. A provider that installs from an ISO
+# by running it in QEMU over the server's disks -- Selectel's qemu-iso --
+# gives it QEMU's network and firmware, not the server's
+in_vm() {
+    grep -qw hypervisor /proc/cpuinfo 2>/dev/null && return 0
+    case "$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null)" in
+        *QEMU*|*KVM*|*VMware*|*VirtualBox*|*Bochs*|*Xen*|*"Virtual Machine"*) return 0 ;;
+    esac
+    return 1
+}
+
+# The first address of the network A.B.C.D/N is in -- where most networks'
+# gateways are (.1 of a /24) -- or nothing for a /31 or /32
+first_host() {
+    local ip=${1%/*} n=${1#*/} a b c d x mask first
+    [ "$n" -le 30 ] || return 0
+    IFS=. read -r a b c d <<<"$ip"
+    x=$(( (a << 24) | (b << 16) | (c << 8) | d ))
+    mask=$(( (0xFFFFFFFF << (32 - n)) & 0xFFFFFFFF ))
+    first=$(( (x & mask) + 1 ))
+    echo "$(( (first >> 24) & 255 )).$(( (first >> 16) & 255 )).$(( (first >> 8) & 255 )).$(( first & 255 ))"
+}
+
+# A netmask's prefix length: 255.255.255.0 is 24
+mask_bits() {
+    local a b c d x n=0
+    IFS=. read -r a b c d <<<"$1"
+    x=$(( (a << 24) | (b << 16) | (c << 8) | d ))
+    while [ $(( x & 0x80000000 )) != 0 ]; do
+        n=$((n + 1))
+        x=$(( (x << 1) & 0xFFFFFFFF ))
+    done
+    echo "$n"
+}
+
+# The network a Linux root at $1 is set up with, as its own tools keep it --
+# netplan, ifupdown, NetworkManager, systemd-networkd, ifcfg: "A.B.C.D/N
+# gateway dns kind:file" of its first static IPv4 address ("-" for a gateway
+# or a DNS server not given), or nothing
+root_network() {
+    local root=$1 got= addr gw dns mask f
+    # netplan: an address with its prefix; gateway4:, or the via: of the
+    # route to default -- of another route only where there is none; a
+    # nameservers: block's addresses. A route is a list item: its to: and
+    # via: are taken together when the next item, or the end, closes it
+    for f in "$root"/etc/netplan/*.yaml; do
+        [ -f "$f" ] || continue
+        got=$(tr -d "\"'" < "$f" | awk '
+            function lead(s) { match(s, /^ */); return RLENGTH }
+            function close_route() {
+                if (via != "") {
+                    if ((to == "default" || to == "0.0.0.0/0") && dgw == "") dgw = via
+                    else if (ogw == "") ogw = via
+                }
+                to = ""; via = ""
+            }
+            {
+                line = $0; gsub(/[][,]/, " ", line)
+                ind = lead($0)
+                if (ns && ind <= nsind) ns = 0
+                if (line ~ /nameservers:/) { ns = 1; nsind = ind; next }
+                if (line ~ /^ *- /) close_route()
+                n = split(line, w, /[ \t]+/)
+                for (i = 1; i <= n; i++) {
+                    if (prev == "to:") {
+                        to = w[i]
+                    } else if (w[i] ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/) {
+                        if (addr == "" && !ns && w[i] !~ /^0\./) addr = w[i]
+                    } else if (w[i] ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                        if (ns) { if (dns == "") dns = w[i] }
+                        else if (prev == "gateway4:" && dgw == "") dgw = w[i]
+                        else if (prev == "via:") via = w[i]
+                    }
+                    prev = w[i]
+                }
+            }
+            END {
+                close_route()
+                gw = (dgw != "" ? dgw : ogw)
+                if (addr != "") print addr, (gw == "" ? "-" : gw), (dns == "" ? "-" : dns)
+            }')
+        [ -z "$got" ] || { echo "$got netplan:${f#"$root"}"; return 0; }
+    done
+    # ifupdown: address (with a prefix, or a netmask after it), gateway,
+    # dns-nameservers
+    for f in "$root"/etc/network/interfaces "$root"/etc/network/interfaces.d/*; do
+        [ -f "$f" ] || continue
+        read -r addr mask gw dns < <(awk '
+            $1 == "address" && $2 ~ /^[0-9.]+(\/[0-9]+)?$/ && a == "" { a = $2 }
+            $1 == "netmask" && m == "" { m = $2 }
+            $1 == "gateway" && $2 ~ /^[0-9.]+$/ && g == "" { g = $2 }
+            $1 == "dns-nameservers" && d == "" { d = $2 }
+            END { if (a != "") print a, (m == "" ? "-" : m), (g == "" ? "-" : g), (d == "" ? "-" : d) }' "$f")
+        [ -n "$addr" ] || continue
+        if [[ "$addr" != */* ]] && [ "$mask" != - ]; then
+            addr=$addr/$(mask_bits "$mask")
+        fi
+        echo "$addr $gw $dns ifupdown:${f#"$root"}"
+        return 0
+    done
+    # NetworkManager: [ipv4]'s address1= (with its gateway after a comma),
+    # gateway=, dns=
+    for f in "$root"/etc/NetworkManager/system-connections/*; do
+        [ -f "$f" ] || continue
+        got=$(awk '
+            /^\[/ { sec = $0 }
+            sec == "[ipv4]" && /^address[0-9]*=/ && a == "" {
+                split(substr($0, index($0, "=") + 1), x, ","); a = x[1]; if (x[2] != "") g = x[2]
+            }
+            sec == "[ipv4]" && /^gateway=/ && g == "" { g = substr($0, 9) }
+            sec == "[ipv4]" && /^dns=/ && d == "" { split(substr($0, 5), y, ";"); d = y[1] }
+            END { if (a ~ /^[0-9.]+\/[0-9]+$/) print a, (g == "" ? "-" : g), (d == "" ? "-" : d) }' "$f")
+        [ -z "$got" ] || { echo "$got NetworkManager:${f#"$root"}"; return 0; }
+    done
+    # systemd-networkd: Address=, Gateway=, DNS=
+    for f in "$root"/etc/systemd/network/*.network; do
+        [ -f "$f" ] || continue
+        got=$(awk -F= '
+            $1 == "Address" && $2 ~ /^[0-9.]+\/[0-9]+$/ && a == "" { a = $2 }
+            $1 == "Gateway" && $2 ~ /^[0-9.]+$/ && g == "" { g = $2 }
+            $1 == "DNS" && d == "" { split($2, y, " "); d = y[1] }
+            END { if (a != "") print a, (g == "" ? "-" : g), (d == "" ? "-" : d) }' "$f")
+        [ -z "$got" ] || { echo "$got systemd-networkd:${f#"$root"}"; return 0; }
+    done
+    # ifcfg (RHEL): IPADDR=, PREFIX= or NETMASK=, GATEWAY=, DNS1=
+    for f in "$root"/etc/sysconfig/network-scripts/ifcfg-*; do
+        [ -f "$f" ] || continue
+        read -r addr mask gw dns < <(tr -d "\"'" < "$f" | awk -F= '
+            $1 == "IPADDR" { a = $2 } $1 == "PREFIX" { p = $2 } $1 == "NETMASK" { m = $2 }
+            $1 == "GATEWAY" { g = $2 } $1 == "DNS1" { d = $2 }
+            END { if (a != "") print a "/" (p != "" ? p : "?"), (m == "" ? "-" : m), (g == "" ? "-" : g), (d == "" ? "-" : d) }')
+        [ -n "$addr" ] || continue
+        if [[ "$addr" == */\? ]]; then
+            [ "$mask" != - ] || continue
+            addr=${addr%/*}/$(mask_bits "$mask")
+        fi
+        echo "$addr $gw $dns ifcfg:${f#"$root"}"
+        return 0
+    done
+    return 1
+}
+
+# The network a Linux already on this machine's disks has -- the system the
+# server came with, which knows its address on a network with no DHCP:
+# "A.B.C.D/N gateway dns device kind file", "-" for what it did not say --
+# each root mounted read-only, its journal not replayed, and let go of
+found_network() {
+    local dev fs opts got peek=/run/nos-peek
+    mkdir -p "$peek"
+    while read -r dev fs; do
+        case "$fs" in
+            ext2) opts=ro ;;
+            ext3|ext4) opts=ro,noload ;;
+            xfs) opts=ro,norecovery ;;
+            btrfs) opts=ro,rescue=nologreplay ;;
+            *) continue ;;
+        esac
+        mount -t "$fs" -o "$opts" "$dev" "$peek" 2>/dev/null || continue
+        got=$(root_network "$peek" || true)
+        umount "$peek" 2>/dev/null || true
+        if [ -n "$got" ]; then
+            set -- $got
+            if valid_cidr "$1"; then
+                echo "$1 $2 $3 $dev ${4%%:*} ${4#*:}"
+                return 0
+            fi
+        fi
+    done < <(lsblk -lnpo NAME,FSTYPE 2>/dev/null)
+    return 1
+}
+
+# Of the DNS servers $@, the first that answers a query from here
+dns_answering() {
+    local d
+    for d in "$@"; do
+        valid_ip "$d" || continue
+        if timeout 4 nslookup github.com "$d" >/dev/null 2>&1; then
+            echo "$d"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ---- the keys -----------------------------------------------------------
 
 FETCHED=/run/nos-fetched
@@ -332,12 +517,28 @@ unattended() {
         return 1
     fi
     say "done: nos is on $DISK"
+    if in_vm; then
+        say "this installer ran in a virtual machine: if it is a provider's over the server's disks (Selectel's qemu-iso), have the server's firmware boot nos first, in its rescue system: $(rescue_lines | awk 'NR > 1 { printf " && " } { printf "%s", $0 } END { print "" }')"
+    fi
     case "$after" in
         reboot) eject_media; say "rebooting"; sync; reboot ;;
         poweroff) say "powering off"; sync; poweroff ;;
         *) say "staying: reboot when the installer's medium is gone" ;;
     esac
     return 0
+}
+
+# What the server's own rescue system runs to have its firmware boot the
+# disk this installer made, a command a line: the nos-install of the
+# image's release (of the newest, for an image of no release)
+rescue_lines() {
+    local v url=https://github.com/irqlevel/nos/releases/latest/download/nos-x86_64.squashfs
+    v=$(sed -n 's/^version=//p' "$MNT/VERSION")
+    case "$v" in
+        v[0-9]*) url=https://github.com/irqlevel/nos/releases/download/$v/nos-x86_64.squashfs ;;
+    esac
+    printf '%s\n' "cd /tmp" "wget $url" "mount -o loop,ro nos-x86_64.squashfs /mnt" \
+        "/mnt/nos-install boot --default" "umount /mnt"
 }
 
 # ---- the dialog ---------------------------------------------------------
@@ -348,6 +549,30 @@ dialog_() {
 
 msg() {
     whiptail --title "$TITLE" --msgbox "$1" 20 76
+}
+
+# In a virtual machine, at the end: the server's firmware was not this
+# installer's to set, and what its rescue system runs instead -- in a box as
+# wide as the screen lets it be, a URL being one word
+rescue_box() {
+    local cols w
+    cols=$(stty size 2>/dev/null | awk '{ print $2 }')
+    [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+    w=$((cols - 4))
+    [ "$w" -le 110 ] || w=110
+    [ "$w" -ge 60 ] || w=60
+    rescue_lines | sed 's/^/  /' > /run/nos-rescue
+    # 14 lines on an 80-column serial console, the URL wrapped: all of it
+    # shown in the box's 15
+    whiptail --title "$TITLE" --msgbox "This installer ran in a virtual machine. If that is the provider's way of installing from an ISO -- Selectel's qemu-iso runs one in QEMU over the server's disks -- the server's own firmware was out of its reach, and still boots what it booted before. In the server's rescue system, before it reboots, have it boot nos first:
+
+$(cat /run/nos-rescue)
+
+(docs/install.md, \"From a provider's rescue system\")" 22 "$w"
+    {
+        echo "nos-setup: in the server's rescue system, before its reboot:"
+        cat /run/nos-rescue
+    } >> "$LOG"
 }
 
 human() {
@@ -409,34 +634,89 @@ ask_root_size() {
     done
 }
 
+# In a virtual machine the installer's own network is the VM's, by DHCP:
+# for fetching keys, whatever nos's is to be
+vm_network() {
+    wait_carrier || true
+    net_dhcp >/dev/null 2>&1 || true
+}
+
 ask_network() {
-    local how ip gw dns
+    local how ip gw dns found= items=() note= where= gwnote dnsnote
     NOS_CMDLINE=
-    how=$(dialog_ --menu "How does nos get its address on this machine's network?" 14 76 3 \
-        dhcp "By DHCP" static "A static address: a network with no DHCP") || return 1
-    if [ "$how" = dhcp ]; then
-        wait_carrier || true
-        if ! net_dhcp; then
-            whiptail --title "$TITLE" --yesno "No DHCP server answered the installer.\n\nnos asks for an address the same way at its boot. Go on with DHCP anyway?" 12 76 || return 1
-        fi
-        return 0
+    # A provider's installer VM is behind QEMU's NAT: nothing tried here says
+    # anything of the server's network
+    if in_vm; then
+        note="\n\nThis installer runs in a virtual machine: its network is not the server's, and nothing tried from here says anything of it."
     fi
+    found=$(found_network || true)
+    if [ -n "$found" ]; then
+        set -- $found
+        where="\n\nA Linux on $4 has a static address ($5: $6):"
+        items+=(found "$1, gateway ${2/#-/none}, DNS ${3/#-/none}")
+    fi
+    items+=(static "A static address, given here: a network with no DHCP" dhcp "By DHCP")
+    how=$(dialog_ --menu "How does nos get its address on this machine's network?$where$note" 19 76 3 "${items[@]}") || return 1
+    case "$how" in
+        dhcp)
+            whiptail --title "$TITLE" --defaultno --yesno "nos asks a DHCP server for its address at every boot. On a network with no DHCP server -- many dedicated servers' have none -- it boots unreachable.$note\n\nIs there a DHCP server on this server's network?" 16 76 || return 1
+            if in_vm; then
+                vm_network
+            else
+                wait_carrier || true
+                if ! net_dhcp; then
+                    whiptail --title "$TITLE" --defaultno --yesno "No DHCP server answered the installer, on any port with a link.\n\nnos asks the same way at its boot. Go on with DHCP anyway?" 12 76 || return 1
+                fi
+            fi
+            return 0 ;;
+        found)
+            set -- $found
+            ip=$1
+            gw=${2/#-/}
+            dns=${3/#-/} ;;
+        static)
+            ip=${ANS[ip]:-}
+            gw=${ANS[gw]:-}
+            dns=${ANS[dns]:-} ;;
+    esac
     while :; do
-        ip=$(dialog_ --inputbox "nos's address, with its prefix length (203.0.113.5/24):" 10 76 "${ANS[ip]:-}") || return 1
-        gw=$(dialog_ --inputbox "The gateway (203.0.113.1):" 10 76 "${ANS[gw]:-}") || return 1
-        dns=$(dialog_ --inputbox "The DNS server:" 10 76 "${ANS[dns]:-${gw}}") || return 1
-        if valid_cidr "$ip" && valid_ip "$gw" && valid_ip "$dns"; then
-            break
+        ip=$(dialog_ --inputbox "nos's address, with its prefix length (203.0.113.5/24):" 10 76 "$ip") || return 1
+        if ! valid_cidr "$ip"; then
+            msg "The address is A.B.C.D/N: 203.0.113.5/24."
+            continue
         fi
-        msg "The address is A.B.C.D/N, the gateway and the DNS server A.B.C.D."
+        # Most networks' gateway is their first address
+        gwnote=
+        if [ -z "$gw" ]; then
+            gw=$(first_host "$ip")
+            [ -z "$gw" ] || gwnote=" -- the network's first address, where most networks have it"
+        fi
+        gw=$(dialog_ --inputbox "The gateway$gwnote:" 10 76 "$gw") || return 1
+        valid_ip "$gw" || { msg "The gateway is A.B.C.D."; gw=; continue; }
+        dnsnote=
+        if [ -z "$dns" ] && ! in_vm; then
+            # The first server that answers from this address: the gateway's,
+            # or a public one
+            wait_carrier || true
+            net_static "$ip" "$gw" "$gw" >/dev/null 2>&1 || true
+            dns=$(dns_answering "$gw" 1.1.1.1 8.8.8.8 || true)
+            [ -z "$dns" ] || dnsnote=" -- it answers from this address"
+        fi
+        dns=$(dialog_ --inputbox "The DNS server$dnsnote:" 10 76 "${dns:-$gw}") || return 1
+        valid_ip "$dns" || { msg "The DNS server is A.B.C.D."; dns=; continue; }
+        break
     done
     ANS[ip]=$ip; ANS[gw]=$gw; ANS[dns]=$dns
     NOS_CMDLINE="ip=$ip gw=$gw dns=$dns"
+    if in_vm; then
+        vm_network
+        return 0
+    fi
     wait_carrier || true
     if net_static "$ip" "$gw" "$dns" && ping -c 2 -W 2 "$gw" >/dev/null 2>&1; then
         msg "The gateway $gw answers the installer at $ip."
     else
-        whiptail --title "$TITLE" --yesno "The gateway $gw does not answer the installer at $ip.\n\nGo on with this address anyway?" 12 76 || return 1
+        whiptail --title "$TITLE" --defaultno --yesno "The gateway $gw does not answer the installer at $ip.\n\nGo on with this address anyway?" 12 76 || return 1
     fi
 }
 
@@ -497,7 +777,7 @@ ask_netconsole() {
 }
 
 confirm() {
-    local plan name typed rc
+    local plan name typed rc fp
     plan=$(run_install --dry-run 2>&1)
     rc=$?
     plan=$(printf '%s\n' "$plan" | grep -v '^nos-setup: ' | sed 's/^nos-install: //')
@@ -505,21 +785,30 @@ confirm() {
         msg "nos-install refuses:\n\n$plan"
         return 1
     fi
-    whiptail --title "$TITLE" --msgbox "What will be written:\n\n$plan\n\nThe keys let in:\n$(fingerprints)" 24 76
+    fp=$(fingerprints)
+    if [ -n "$fp" ]; then
+        fp="\n$fp"
+    else
+        fp="none -- nos's sshd will let nobody in"
+    fi
+    whiptail --title "$TITLE" --msgbox "What will be written:\n\n$plan\n\nnos's network: ${NOS_CMDLINE:-DHCP}\nThe keys let in: $fp" 24 76
     name=${DISK##*/}
     typed=$(dialog_ --inputbox "Everything on $DISK will be erased.\n${DISK_HOLDS[$DISK]:+It holds: ${DISK_HOLDS[$DISK]}\n}\nType $name to install nos onto it:" 14 76) || return 1
     [ "$typed" = "$name" ]
 }
 
 the_end() {
-    local choice
+    local choice items=()
+    if [ "${2:-}" = installed ] && in_vm; then
+        rescue_box
+        items+=(rescue "What the server's rescue system runs before it reboots")
+    fi
+    items+=(reboot "Reboot (the installer's medium ejected where it can be)"
+        poweroff "Power off" install "Install again" shell "A shell")
     while :; do
-        choice=$(dialog_ --menu "$1" 16 76 4 \
-            reboot "Reboot (the installer's medium ejected where it can be)" \
-            poweroff "Power off" \
-            install "Install again" \
-            shell "A shell") || continue
+        choice=$(dialog_ --menu "$1" 18 76 5 "${items[@]}") || continue
         case "$choice" in
+            rescue) rescue_box ;;
             reboot) eject_media; sync; reboot; sleep 30 ;;
             poweroff) sync; poweroff; sleep 30 ;;
             install) return 0 ;;
@@ -530,6 +819,9 @@ the_end() {
 
 interactive() {
     KMSG_LEVEL=6
+    if in_vm; then
+        msg "This installer runs in a virtual machine.\n\nIf that is the provider's way of installing from an ISO -- Selectel's qemu-iso runs one in QEMU, over the server's disks -- then:\n\n- the network here is QEMU's, not the server's: nos needs the server's address (a Linux already on its disks may have it, and is looked at);\n- the server's firmware is out of reach: its boot order is set in its rescue system after the install (said at the end).\n\nSimpler still: in the provider's rescue system, nos-install disk does it all on the server itself (docs/install.md)."
+    fi
     while :; do
         : > "$KEYS_FILE"
         chmod 600 "$KEYS_FILE"
@@ -537,7 +829,7 @@ interactive() {
         if ask_disk && ask_root_size && ask_network && ask_keys && ask_netconsole && confirm; then
             clear
             if run_install; then
-                the_end "$(image_version) is on $DISK.\n\nTake the installer's ISO out of the virtual media (or the USB stick out), and boot the disk: the firmware's boot order has to have it first."
+                the_end "$(image_version) is on $DISK.\n\nTake the installer's ISO out of the virtual media (or the USB stick out), and reboot." installed
             else
                 echo
                 echo "nos-setup: nos-install did not finish -- press Enter"
