@@ -17,7 +17,7 @@ ROOTFS=/tmp/rootfs
 TREE=/tmp/iso
 
 printf '%s/%s/main\n%s/%s/community\n' "$MIRROR" "$BRANCH" "$MIRROR" "$BRANCH" > /etc/apk/repositories
-apk add -q --cache-dir "$CACHE" grub grub-bios grub-efi xorriso mtools squashfs-tools cpio
+apk add -q --cache-dir "$CACHE" grub grub-bios grub-efi xorriso mtools squashfs-tools cpio iucode-tool
 
 # ---- the installer's system --------------------------------------------
 
@@ -44,6 +44,14 @@ trap - EXIT
 KVER=$(ls "$ROOTFS/lib/modules")
 [ "$(echo "$KVER" | wc -l)" = 1 ] || { echo "mkiso.sh: kernels: $KVER" >&2; exit 1; }
 cp "$ROOTFS/boot/vmlinuz-lts" /tmp/vmlinuz
+# Intel's microcode as nos-install takes it, a file a CPU signature in
+# /lib/firmware/intel-ucode (as Debian's package has it): Alpine's is one
+# early initramfs of all of them, in /boot
+rm -rf /tmp/ucode
+mkdir -p /tmp/ucode "$ROOTFS/lib/firmware/intel-ucode"
+(cd /tmp/ucode && cpio -idm --quiet < "$ROOTFS/boot/intel-ucode.img")
+iucode_tool -q --write-firmware="$ROOTFS/lib/firmware/intel-ucode" /tmp/ucode/kernel/x86/microcode/GenuineIntel.bin
+[ -n "$(ls "$ROOTFS/lib/firmware/intel-ucode")" ] || { echo "mkiso.sh: no microcode split out" >&2; exit 1; }
 # What the installer has no use for: the kernel and the initramfs Alpine
 # makes for itself (the ISO carries them apart), documentation, and the
 # drivers of hardware no server's installer meets -- graphics cards' own
