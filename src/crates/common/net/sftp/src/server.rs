@@ -23,9 +23,14 @@ pub const MAX_DATA: usize = MAX_PACKET - 1024;
 /// says, which OpenSSH's client also keeps its requests in flight to.
 pub const MAX_HANDLES: usize = 32;
 /// The channel's window a server is to be given (`ssh::Subsystem::window`):
-/// four messages, so that a client has a few requests on their way while
-/// one is answered -- and a whole one always fits beside what waits.
-pub const WINDOW: u32 = 4 * MAX_PACKET as u32;
+/// eight messages -- 512 KiB, the most one allocation of the kernel's heap
+/// holds, and what a connection's bulk receive buffer offers, so that a
+/// round trip of a WAN's carries as much of a copy into the machine as its
+/// TCP lets it -- and four at the least, so that a client has a few
+/// requests on their way while one is answered, and a whole one always
+/// fits beside what waits.
+pub const WINDOW: u32 = 8 * MAX_PACKET as u32;
+pub const WINDOW_LEAST: u32 = 4 * MAX_PACKET as u32;
 
 /* What a message is (draft-02 3) */
 const FXP_INIT: u8 = 1;
@@ -631,8 +636,8 @@ impl<F: Files> ssh::Subsystem for Server<F> {
         Server::input(self, input, out)
     }
 
-    fn window(&self) -> u32 {
-        WINDOW
+    fn window(&self) -> (u32, u32) {
+        (WINDOW, WINDOW_LEAST)
     }
 }
 

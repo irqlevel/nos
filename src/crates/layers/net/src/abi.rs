@@ -269,15 +269,27 @@ pub unsafe extern "C" fn kernel_tcp_recv(
     TCP.recv(conn, unsafe { core::slice::from_raw_parts_mut(buf, len) }, timeout_ms)
 }
 
+/// What a listener's connections buffer, as the ABI says it
+/// (`ffi::tcp::TCP_BUFFERS_*`): None for a word that is none of them.
+fn buffers_of(buffers: u32) -> Option<crate::tcp::Buffers> {
+    match buffers {
+        ffi::tcp::TCP_BUFFERS_SMALL => Some(crate::tcp::Buffers::Small),
+        ffi::tcp::TCP_BUFFERS_BULK => Some(crate::tcp::Buffers::Bulk),
+        ffi::tcp::TCP_BUFFERS_GROWABLE => Some(crate::tcp::Buffers::Growable),
+        _ => None,
+    }
+}
+
 /// A server of Rust's -- sshd's -- owns its connections rather than borrowing
 /// one: it listens on a device's port, accepts, and closes both what it
 /// accepted and the listener. `dev` is a `kernel_net_find` handle; `backlog`
 /// is how many connections nobody has accepted yet the listener holds at
 /// most, taken into 1..=16 -- past them a SYN is dropped and its peer tries
-/// again; `bulk`, that each connection it accepts is given bulk buffers both
-/// ways (`tcp::Buffers::Bulk`): a relay's.
+/// again; `buffers`, what each connection it accepts buffers
+/// (`tcp::Buffers`): the slot's own, bulk ones both ways -- a relay's -- or
+/// the slot's own, grown later (`kernel_tcp_grow`) -- a login server's.
 #[no_mangle]
-pub extern "C" fn kernel_tcp_listen(owner: usize, dev: usize, port: u16, backlog: usize, bulk: bool) -> ConnWord {
+pub extern "C" fn kernel_tcp_listen(owner: usize, dev: usize, port: u16, backlog: usize, buffers: u32) -> ConnWord {
     if dev == 0 || port == 0 {
         return NO_CONN;
     }
@@ -285,7 +297,7 @@ pub extern "C" fn kernel_tcp_listen(owner: usize, dev: usize, port: u16, backlog
         Some(nic) => nic,
         None => return NO_CONN,
     };
-    let buffers = if bulk { crate::tcp::Buffers::Bulk } else { crate::tcp::Buffers::Small };
+    let Some(buffers) = buffers_of(buffers) else { return NO_CONN };
     match TCP.listen_with(&nic, port, backlog, buffers) {
         Some(conn) => handed(conn, Owner::at(owner)),
         None => NO_CONN,
@@ -317,7 +329,7 @@ unsafe fn nets_of(nets: *const ffi::tcp::TcpNet, count: usize) -> Option<([(u32,
 /// # Safety
 /// `nets` points at `count` readable `TcpNet`s when `count` is past 0.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_tcp_listen_allowed(owner: usize, dev: usize, port: u16, backlog: usize, bulk: bool,
+pub unsafe extern "C" fn kernel_tcp_listen_allowed(owner: usize, dev: usize, port: u16, backlog: usize, buffers: u32,
                                                    nets: *const ffi::tcp::TcpNet, count: usize) -> ConnWord {
     if dev == 0 || port == 0 {
         return NO_CONN;
@@ -325,7 +337,7 @@ pub unsafe extern "C" fn kernel_tcp_listen_allowed(owner: usize, dev: usize, por
     let Some(nic) = Nic::from_handle(dev) else { return NO_CONN };
     // SAFETY: the caller's contract, passed on.
     let Some((list, n)) = (unsafe { nets_of(nets, count) }) else { return NO_CONN };
-    let buffers = if bulk { crate::tcp::Buffers::Bulk } else { crate::tcp::Buffers::Small };
+    let Some(buffers) = buffers_of(buffers) else { return NO_CONN };
     match TCP.listen_allowed(&nic, port, backlog, buffers, &list[..n]) {
         Some(conn) => handed(conn, Owner::at(owner)),
         None => NO_CONN,
@@ -371,6 +383,15 @@ pub extern "C" fn kernel_tcp_generation(conn: ConnWord) -> u64 {
 pub extern "C" fn kernel_tcp_set_rto_floor(conn: ConnWord, ms: u32) -> i32 {
     let Some(conn) = conn_of(conn) else { return -1 };
     if TCP.set_rto_floor(conn, u64::from(ms)) { 0 } else { -1 }
+}
+
+/// The connection given bulk buffers both ways, under way (`Tcp::grow`): 0
+/// when it has one either way it did not have, -1 when not -- a word that
+/// is no connection's among the reasons.
+#[no_mangle]
+pub extern "C" fn kernel_tcp_grow(conn: ConnWord) -> i32 {
+    let Some(conn) = conn_of(conn) else { return -1 };
+    if TCP.grow(conn) { 0 } else { -1 }
 }
 
 /// An active open, for a module: to `ip`:`port` (host byte order) through the
