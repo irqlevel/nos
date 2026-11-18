@@ -16,7 +16,11 @@
 //! for that much each way (`Receive::Both`); a listener
 //! that relays in bulk (`Buffers::Bulk`) has every connection it accepts
 //! given bulk buffers both ways, as `accept` hands it out, its window scaled
-//! from the SYN-ACK on when the peer's SYN offers to.
+//! from the SYN-ACK on when the peer's SYN offers to. A growable listener's
+//! (`Buffers::Growable`: sshd's) scales its window the same but stays on the
+//! slot's own buffers -- every knock on a login port held to them -- until
+//! its program gives it bulk ones under way (`Tcp::grow`): what it holds
+//! either way, and every segment it has in flight, moved across.
 //!
 //! With a window of hundreds of kilobytes in flight the sender has to stop
 //! short of what the path takes, and find a loss quicker than its timer
@@ -444,6 +448,13 @@ pub enum Buffers {
     /// to: a relay of a forwarded port, carrying a download either way. The
     /// slot's own when the heap has none, or `MAX_BULK` are out already.
     Bulk,
+    /// The slot's own 8 KiB each way, as `Small`'s -- but the window scaled
+    /// from the SYN-ACK on as `Bulk`'s, when the peer's SYN offers to, so
+    /// that the connection can be given bulk buffers once it has earned
+    /// them (`Tcp::grow`) and offer the whole of what it then has: a login
+    /// server's, whose port is knocked on all day, every knock held to the
+    /// slot's own, and whose session, logged in, copies files (sshd's SFTP).
+    Growable,
 }
 
 /// The least shift that says a window as big as `size` in the 16 bits a
@@ -836,6 +847,18 @@ impl Sent {
         assert!(self.big.is_none() && self.len == 0 && !big.is_empty(), "tcp: a segment table onto one in use");
         self.big = Some(big);
         self.clear();
+    }
+
+    /// A bulk send buffer's table in place of the slot's own on a
+    /// connection under way: every segment in flight moved across as it
+    /// is, oldest first, and its counts as they were.
+    fn grow(&mut self, mut big: Box<[Seg]>) {
+        assert!(self.big.is_none() && big.len() >= self.len, "tcp: a segment table grown into less, or twice");
+        for (i, slot) in big.iter_mut().enumerate().take(self.len) {
+            *slot = self.at(i);
+        }
+        self.big = Some(big);
+        self.head = 0;
     }
 
     /// The bulk table back, for the caller to put with its buffer -- and
@@ -1273,6 +1296,16 @@ impl Inner {
         self.send_buf.attach(bulk);
     }
 
+    /// A bulk send buffer and its table in place of the slot's own on a
+    /// connection under way: what is buffered moved across, each byte at its
+    /// place from SND.UNA, and every segment in flight as it was -- nothing
+    /// sent again, nothing forgotten.
+    fn grow_send(&mut self, mut bulk: BulkBuf) {
+        let segs = bulk.segs.take().expect("tcp: a bulk send buffer without its table of segments");
+        self.sent.grow(segs);
+        self.send_buf.grow(bulk);
+    }
+
     /// Whether either buffer is a bulk one, which goes back to the heap.
     fn has_bulk(&self) -> bool {
         self.recv_buf.bulk.is_some() || self.send_buf.bulk.is_some()
@@ -1456,15 +1489,15 @@ struct Slot {
     /// A listener's: the connections it holds that nobody has accepted yet,
     /// at most, 1..=LISTEN_BACKLOG. 0 for a connection.
     backlog: u8,
-    /// A listener's: what its connections buffer is `Buffers::Bulk`
-    bulk: bool,
+    /// A listener's: what its connections buffer
+    buffers: Buffers,
 }
 
 impl Slot {
     const FREE: Slot = Slot {
         used: false, listening: false,
         local_ip: 0, local_port: 0, remote_ip: 0, remote_port: 0,
-        device: None, backlog: 0, bulk: false,
+        device: None, backlog: 0, buffers: Buffers::Small,
     };
 
     fn is(&self, local_ip: u32, local_port: u16, remote_ip: u32, remote_port: u16, nic: &Nic) -> bool {
@@ -3928,7 +3961,7 @@ impl Tcp {
             /* Dropped, as a full accept queue drops it: the peer tries again
              * and the pool keeps its slots. */
             let backlog = usize::from(pool.slots[listener].backlog);
-            let bulk = pool.slots[listener].bulk;
+            let buffers = pool.slots[listener].buffers;
             if self.backlog_full(&pool, local_port, backlog) {
                 return;
             }
@@ -3936,7 +3969,7 @@ impl Tcp {
             let index = match self.take_slot(&mut pool, Slot {
                 used: true, listening: false,
                 local_ip, local_port, remote_ip, remote_port,
-                device: Some(*nic), backlog: 0, bulk: false,
+                device: Some(*nic), backlog: 0, buffers: Buffers::Small,
             }) {
                 Some(index) => index,
                 None => return,
@@ -3973,9 +4006,11 @@ impl Tcp {
              * peer's SYN offers to -- by the shift its largest buffer
              * needs, which `accept` gives it -- and neither end does
              * otherwise (RFC 7323 1.3). Its SYN-ACK says what the slot's
-             * own 8 KiB has room for, unscaled as a SYN's window is. */
-            if bulk {
-                inner.bulk_wanted = true;
+             * own 8 KiB has room for, unscaled as a SYN's window is. A
+             * growable listener's scales the same, for the buffers `grow`
+             * may give it later: a shift is said at the SYN or never. */
+            if buffers != Buffers::Small {
+                inner.bulk_wanted = buffers == Buffers::Bulk;
                 if let Some(theirs) = seg::parse_wscale(segment) {
                     let ours = wscale_for(BULK_SIZES[0]);
                     inner.wscale_offer = Some(ours);
@@ -4140,7 +4175,7 @@ impl Tcp {
         let index = match self.take_slot(&mut pool, Slot {
             used: true, listening: false,
             local_ip, local_port: src_port, remote_ip: dst_ip, remote_port: dst_port,
-            device: Some(*nic), backlog: 0, bulk: false,
+            device: Some(*nic), backlog: 0, buffers: Buffers::Small,
         }) {
             Some(index) => index,
             None => {
@@ -4322,7 +4357,7 @@ impl Tcp {
             device: Some(*nic),
             /* LISTEN_BACKLOG fits a byte: checked where it is defined */
             backlog: backlog.clamp(1, LISTEN_BACKLOG) as u8,
-            bulk: buffers == Buffers::Bulk,
+            buffers,
         })?;
         pool.allows[index] = allow;
 
@@ -4436,6 +4471,58 @@ impl Tcp {
         if inner.state == State::Established {
             self.send_ack(inner);
         }
+    }
+
+    /// The connection given bulk buffers both ways, under way -- what it
+    /// holds either way, and what it has in flight, moved across (`Ring::grow`,
+    /// `Inner::grow_send`) -- and the room offered at once: a growable
+    /// listener's connection (`Buffers::Growable`) once it has earned them,
+    /// its window scaled at its SYN for the whole of them; one whose peer
+    /// scales none offers 64 KiB of the receive buffer, and sends as much as
+    /// the peer takes. Whether it has a bulk buffer either way now that it
+    /// did not have before: false where it has both already, is not open,
+    /// or the heap has none to give, or `MAX_BULK` are out -- each way the
+    /// slot's own 8 KiB as before.
+    pub fn grow(&'static self, conn: &'static Conn) -> bool {
+        if self.index_of(conn).is_none() {
+            return false;
+        }
+        {
+            let inner = conn.inner.lock();
+            if !matches!(inner.state, State::Established | State::CloseWait)
+                || (inner.recv_buf.bulk.is_some() && inner.send_buf.bulk.is_some())
+            {
+                return false;
+            }
+        }
+        /* From the heap with no lock held -- and, should one go to nobody
+         * after all, dropped after the lock, which is declared after them
+         * and so goes first */
+        let mut recv = BulkBuf::new();
+        let mut send = BulkBuf::new_send();
+        let mut inner = conn.inner.lock();
+        if !matches!(inner.state, State::Established | State::CloseWait) {
+            return false;
+        }
+        let mut grew = false;
+        if inner.recv_buf.bulk.is_none() {
+            if let Some(buf) = recv.take() {
+                inner.recv_buf.grow(buf);
+                inner.rcv_wnd = inner.recv_buf.free() as u32;
+                grew = true;
+            }
+        }
+        if inner.send_buf.bulk.is_none() {
+            if let Some(buf) = send.take() {
+                inner.grow_send(buf);
+                grew = true;
+            }
+        }
+        /* The room offered: the peer has been held to 8 KiB */
+        if grew && inner.state == State::Established {
+            self.send_ack(&mut inner);
+        }
+        grew
     }
 
     /// Queue and send. Answers with the bytes taken: all of them, fewer once

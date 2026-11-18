@@ -35,7 +35,7 @@ extern crate alloc;
 mod path;
 mod server;
 
-pub use server::{Server, Stats, MAX_DATA, MAX_HANDLES, MAX_PACKET, VERSION, WINDOW};
+pub use server::{Server, Stats, MAX_DATA, MAX_HANDLES, MAX_PACKET, VERSION, WINDOW, WINDOW_LEAST};
 
 /// What is at a path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

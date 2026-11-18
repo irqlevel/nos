@@ -143,6 +143,11 @@ impl<'a> Transport<'a> {
         self.link.now_ms()
     }
 
+    /// The session is to carry files (`Link::bulk`).
+    pub fn bulk(&mut self) {
+        self.link.bulk();
+    }
+
     pub fn session_id(&self) -> &[u8] {
         match &self.session_id {
             Some(id) => id,

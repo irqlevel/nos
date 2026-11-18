@@ -65,7 +65,7 @@ impl TcpListener {
     /// the whole kernel has, so a server that accepts few at a time asks for
     /// few, and a flood of SYNs at its port costs the kernel no more.
     pub fn bind(nic: &Nic, port: u16, backlog: usize) -> Result<Self> {
-        Self::listen(nic, port, backlog, false)
+        Self::listen(nic, port, backlog, tcp::TCP_BUFFERS_SMALL)
     }
 
     /// `bind`, each connection it accepts given bulk buffers both ways --
@@ -74,7 +74,17 @@ impl TcpListener {
     /// a long round trip needs, which 8 KiB a round trip holds to 130 KiB/s
     /// at 62 ms. The slot's own 8 KiB when the heap has none to give.
     pub fn bind_bulk(nic: &Nic, port: u16, backlog: usize) -> Result<Self> {
-        Self::listen(nic, port, backlog, true)
+        Self::listen(nic, port, backlog, tcp::TCP_BUFFERS_BULK)
+    }
+
+    /// `bind`, each connection it accepts on the slot's own 8 KiB each way
+    /// -- but its window scaled for bulk buffers, when the peer offers to,
+    /// so that `TcpStream::grow` can give it them once it has earned them
+    /// and the whole of them be offered: a login server's, whose port is
+    /// knocked on all day, every knock held to 8 KiB, and whose session,
+    /// logged in, copies files.
+    pub fn bind_growable(nic: &Nic, port: u16, backlog: usize) -> Result<Self> {
+        Self::listen(nic, port, backlog, tcp::TCP_BUFFERS_GROWABLE)
     }
 
     /// `bind` -- `bind_bulk` with `bulk` -- answering the networks `nets`
@@ -87,9 +97,10 @@ impl TcpListener {
             return Err(Error::InvalidValue);
         }
         let list = nets_of(nets);
+        let buffers = if bulk { tcp::TCP_BUFFERS_BULK } else { tcp::TCP_BUFFERS_SMALL };
         /* `list` holds `nets.len()` TcpNets */
-        let conn = unsafe { tcp::kernel_tcp_listen_allowed(crate::owner::here(), nic.handle(), port, backlog, bulk, list.as_ptr(),
-                                                           nets.len()) };
+        let conn = unsafe { tcp::kernel_tcp_listen_allowed(crate::owner::here(), nic.handle(), port, backlog, buffers,
+                                                           list.as_ptr(), nets.len()) };
         if conn == 0 {
             Err(Error::Busy)
         } else {
@@ -114,11 +125,11 @@ impl TcpListener {
         if code == 0 { Ok(()) } else { Err(Error::InvalidValue) }
     }
 
-    fn listen(nic: &Nic, port: u16, backlog: usize, bulk: bool) -> Result<Self> {
+    fn listen(nic: &Nic, port: u16, backlog: usize, buffers: u32) -> Result<Self> {
         if port == 0 {
             return Err(Error::InvalidValue);
         }
-        let conn = tcp::kernel_tcp_listen(crate::owner::here(), nic.handle(), port, backlog, bulk);
+        let conn = tcp::kernel_tcp_listen(crate::owner::here(), nic.handle(), port, backlog, buffers);
         if conn == 0 {
             Err(Error::Busy)
         } else {
@@ -185,6 +196,19 @@ impl TcpStream {
     /// next round trip measured.
     pub fn set_rto_floor(&self, ms: u32) -> Result<()> {
         if tcp::kernel_tcp_set_rto_floor(self.conn, ms) == 0 { Ok(()) } else { Err(Error::InvalidValue) }
+    }
+
+    /// Bulk buffers both ways -- up to 512 KiB each, from the heap -- in
+    /// place of the slot's own 8 KiB, the connection under way: what it holds
+    /// and has in flight moved across, and the room offered at once -- the
+    /// whole of it on a growable listener's connection whose peer scales
+    /// its window (`TcpListener::bind_growable`). For a connection that has
+    /// earned them: a login's. Whether it has one either way it did not
+    /// have; false, and the slot's own as before, when the heap has none to
+    /// give or the kernel's 32 are out, and for one that has them already.
+    /// Allocates: sleeps.
+    pub fn grow(&self) -> bool {
+        tcp::kernel_tcp_grow(self.conn) == 0
     }
 
     /// An active open to `ip`:`port` (host byte order) through `nic`, from an
