@@ -1,0 +1,12 @@
+[package]
+name = "ata"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ata"
+
+[dependencies]
+kcore = { path = "../../../base/kcore" }
+# The device table a disk is registered in.
+block = { path = "../../../layers/block" }

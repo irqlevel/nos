@@ -38,7 +38,7 @@ src/crates/   The Rust half, one cargo workspace, a directory an area: what the 
     mgmt/     The management bus, in the image: providers registered by name -- the layers', and modules' through the C ABI -- their calls, made with no lock held and counted so that an unregister waits them out, the jobs that take long, and the `mgmt` command (docs/mgmt.md)
     ipc/      The message channel, in the image: mailboxes with addresses that are looked up, names in the host's namespace under a module's own, messages, monitors and watches, the router to other hosts' channels and its peers, and the `ipc` command (docs/ipc.md)
   drivers/
-    block/    nvme/ (NVMe: PCI, MSI-X, admin and I/O queues), virtio_blk/ (virtio-blk, the disk the root filesystem lives on), virtio_scsi/ (virtio-scsi, a SCSI adapter and the disks behind it)
+    block/    ata/ (ATA disks behind a PCI IDE controller -- SATA in IDE mode, parallel ATA -- by PIO, polled), nvme/ (NVMe: PCI, MSI-X, admin and I/O queues), virtio_blk/ (virtio-blk, the disk the root filesystem lives on), virtio_scsi/ (virtio-scsi, a SCSI adapter and the disks behind it)
     net/      igb/ (Intel I210, gigabit), r8125/ (Realtek RTL8125, 2.5GbE), r8168/ (Realtek r8168), virtio_net/ (virtio-net, the card the network comes in on)
     rng/      virtio_rng/ (virtio-rng, the host's entropy)
     usb/      xHCI host controller (rings, contexts, root-port and hub enumeration) + the HID boot-protocol keyboard on it
