@@ -4,6 +4,7 @@
 #include <lib/printer.h>
 #include <drivers/acpi.h>
 #include <kernel/spin_lock.h>
+#include <kernel/mutex.h>
 
 namespace kernel
 {
@@ -49,10 +50,13 @@ public:
 
     /* `iommu`: each unit, what it can do, what it does, its faults -- each
        unit's records looked at first. `iommu block <bus>:<dev>.<fn>` makes a
-       device's context entry not present in every unit taken over, its DMA
-       then blocked and said as a device detached from a domain's is;
-       `iommu unblock` passes it through again: for a gate to see a blocked
-       DMA said, and the machine go on. */
+       device's context entry not present, its DMA then blocked and said as a
+       device detached from a domain's is; `iommu unblock` passes it through
+       again. `iommu identity` moves a device to a domain of its own that
+       maps every page of usable RAM to itself -- what it reaches unchanged,
+       but through a second-level table -- and `iommu release` takes it out
+       and passes it through again. For a gate to see a domain translate a
+       device that works, and a blocked DMA said. */
     void shell(const char* args, stdlib::Printer& printer);
 
     /* The fault event's handler, in interrupt context: each unit's recorded
@@ -64,6 +68,48 @@ public:
        above every device's (MsixTable's) and below the posted interrupts'
        (hal::POSTED_VECTOR) */
     static const u8 FAULT_VECTOR = 0xFB;
+
+    /* Domains: an address space of its own a device is moved to -- a
+       guest's RAM, as hv lays it out -- a second-level table of the unit
+       that translates the device, as wide as that unit walks. Handles from
+       outside, looked up in the table of them and never dereferenced: 0 is
+       none. Every call is from a task: tables are allocated, and the unit
+       waited on.
+
+       A domain for the devices the unit translating `sid` translates (a
+       requester id, bus << 8 | device << 3 | function): 0 where DMA is not
+       translated, that unit is one left be, or there is no room. */
+    ulong domain_create(u16 sid);
+
+    /* [iova, iova + pages) to [phys, ...), readable and writable -- 2 MiB
+       at a time where both are aligned to it, what is left is, and the unit
+       walks such leaves. False, nothing left mapped of it, where a page of
+       it is mapped already, it runs past the domain's width or there is no
+       memory for a table. The pages must stay allocated until the domain is
+       destroyed: what a device may reach. */
+    bool domain_map(ulong domain, u64 iova, u64 phys, ulong pages);
+
+    /* sid's DMA translated through the domain: its context entry made not
+       present, the unit told, then written as the domain's -- untranslated
+       requests alone (TT=00), so that a translated one, ATS's, is blocked
+       whatever is done to the device -- and the unit told again. False
+       where sid is not translated by the domain's unit, or is another
+       domain's. */
+    bool domain_attach(ulong domain, u16 sid);
+
+    /* sid's DMA blocked: its context entry not present, the unit's caches of
+       it dropped. Never back to pass-through here: until the device is
+       reset it may still hold a guest's addresses. */
+    bool domain_detach(ulong domain, u16 sid);
+
+    /* The domain gone: every device still in it blocked first, then its
+       tables freed and its id free again. After this nothing reaches the
+       pages it mapped. */
+    void domain_destroy(ulong domain);
+
+    /* A device blocked -- detached, reset -- passed through again: given
+       back to the host. False where it is any domain's. */
+    bool release(u16 sid);
 
 private:
     Vtd();
@@ -81,6 +127,7 @@ private:
        and function a context entry */
     static const size_t BUSES = 256;
     static const size_t DEVFNS = 256;
+    static const size_t MAX_DIDS_WORDS = 256 / 64;
 
     struct Unit
     {
@@ -130,6 +177,10 @@ private:
         /* Its fault event is this CPU's interrupt */
         bool fault_irq;
         const char* state;
+        /* The domain ids it has handed out, a bit each */
+        u64 dids[MAX_DIDS_WORDS];
+        /* Its domains' tables' leaf bits: SNP where it can make DMA snoop */
+        u64 leaf_bits;
     };
 
     /* The unit's registers */
@@ -195,6 +246,73 @@ private:
     void free_tables(Unit& unit);
 
     void print(stdlib::Printer& printer);
+
+    /* A second-level table (9.8): a page of 512 entries, and for a level
+       above the last the tables its entries point at, by index */
+    struct Table
+    {
+        u64* entries;
+        ulong phys;
+        Table** child;
+    };
+
+    static const size_t TABLE_ENTRIES = 512;
+    static const size_t MAX_DOMAINS = 64;
+    static const size_t MAX_DOMAIN_DEVICES = 8;
+    /* The domain ids a unit hands out, of the 2^(4 + 2 ND) it has: 0 is
+       kept by a unit in caching mode, 1 is the passed-through entries' */
+    static const size_t MAX_DIDS = 256;
+    static const u16 FIRST_DID = 2;
+
+    struct Domain
+    {
+        Unit* unit;
+        u16 did;
+        /* Its table's levels: 3 for 39 bits, 4 for 48 */
+        u8 levels;
+        Table* root;
+        u16 devices[MAX_DOMAIN_DEVICES];
+        size_t device_count;
+    };
+
+    /* The domain a handle names, or nullptr */
+    Domain* domain_of(ulong handle);
+
+    /* The unit that translates sid: one taken over whose scopes name it, or
+       else the one of every device -- nullptr where that is a unit left be */
+    Unit* unit_for(u16 sid);
+
+    /* Whether a scope names sid: the endpoint itself, or a bridge it is
+       behind (its bus between the bridge's secondary and subordinate) */
+    static bool scope_covers(const Acpi::DmarScope& scope, u16 sid);
+
+    Table* make_table(bool last);
+    void free_table(Table* table, size_t level);
+
+    /* One leaf of 2^shift bytes at iova to phys, the tables down to it made */
+    bool map_leaf(Domain& domain, u64 iova, u64 phys, ulong shift);
+
+    /* sid's context entry in unit: lo and hi written, P last, the unit told
+       of it -- the device's context cached and the domain's IOTLB dropped */
+    bool write_context(Unit& unit, u16 sid, u64 lo, u64 hi, u16 old_did);
+
+    /* Which domain sid is in, or nullptr */
+    Domain* domain_holding(u16 sid);
+
+    Domain* domains_[MAX_DOMAINS];
+
+    /* The domains `iommu identity` made, by the device in each */
+    static const size_t MAX_SHELL_DOMAINS = 4;
+    struct ShellDomain
+    {
+        u16 sid;
+        ulong handle;
+    };
+    ShellDomain shell_domains_[MAX_SHELL_DOMAINS];
+    /* The domains and the context entries: a task at a time, tables
+       allocated and freed and units waited on under it -- a mutex, not a
+       spinlock */
+    Mutex domains_lock_;
 
     /* The device's context entry in every unit taken over: not present, or
        passed through; each unit's caches of it dropped. False, said, where

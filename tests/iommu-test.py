@@ -10,6 +10,9 @@ told iommu_platform=on. One boot:
 
 - the unit is taken: the boot log says it translates, `iommu` says on;
 - the NVMe is read through it: sector 0, the image's bytes;
+- `iommu identity` moves the NVMe to a domain of its own that maps every
+  page of RAM to itself: it reads the same through the domain's
+  second-level table, and again once `iommu release` passes it through;
 - `iommu block` makes the NVMe's context entry not present: a read of it
   is then a DMA the unit blocks -- the command's fetch -- said with the
   NVMe's requester id and the reason, no context entry, and the machine
@@ -125,6 +128,18 @@ def main():
         want = "0: " + " ".join("%X" % b for b in PATTERN[:16])
         pt.check("the NVMe reads through the unit", want in dump, dump[:400])
 
+        # A domain of its own, every page of RAM mapped to itself: the same
+        # addresses, through a second-level table -- 2 MiB leaves and 4 KiB
+        # ones about the firmware's holes
+        moved = try_run(sh, "iommu identity " + bdf)
+        pt.check("iommu identity moves the NVMe to a domain of its own", "in a domain of its own" in moved, moved)
+        dump = try_run(sh, "diskread nvme0 0")
+        pt.check("the NVMe reads through its domain's tables", want in dump, dump[:400])
+        back = try_run(sh, "iommu release " + bdf)
+        pt.check("iommu release passes it through again", "passed through" in back, back)
+        dump = try_run(sh, "diskread nvme0 0")
+        pt.check("and it reads passed through again", want in dump, dump[:400])
+
         blocked = sh.run("iommu block " + bdf)
         pt.check("iommu block takes the NVMe off", "blocked" in blocked, blocked)
 
@@ -162,6 +177,17 @@ def quiet(sh, cmd):
         sh.run(cmd)
     except Exception:
         pass
+
+
+def try_run(sh, cmd):
+    """A command's answer, or "" where none came: a DMA a domain does not let
+    through leaves the NVMe driver waiting for good (see above), and the
+    check that wanted the answer fails rather than the gate stopping"""
+    try:
+        return sh.run(cmd)
+    except Exception as e:
+        print("  (no answer to %s: %s)" % (cmd, e))
+        return ""
 
 
 def finish(args, tmp, log):
