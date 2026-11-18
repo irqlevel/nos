@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository. It holds what every change has to know: the goal, the rules, how to build, and which gate to run. Reference material lives in `docs/` and is linked from where it is needed -- read the page before the work it covers.
 
-`nos` is a hobby x86-64 / arm64 OS kernel written in C++20, Rust, and assembly. It is freestanding (no libc, no STL, no C++ exceptions/RTTI) and boots via Multiboot2/GRUB on x86-64 and the Linux `Image` protocol on arm64. It targets QEMU/KVM, KVM-based clouds (Google Cloud, Yandex Cloud), and QEMU `virt` + HVF on Apple Silicon, and boots on four real machines — a Dell Latitude 5480 (Skylake-U, UEFI, no serial port, no PS/2), where the framebuffer console and the xHCI USB keyboard are the only console channels, two Hetzner dedicated servers, an Intel EX44 (RTL8125) and an AMD Ryzen AX41 (Intel I210), whose only console is the network, and an ASUS RS500 (two Westmere Xeons, BIOS, its SATA in IDE mode, Intel 82574L, a network with no DHCP), whose console is a KVM and the network. The long-term goal is a bare-metal cloud node running Linux guests under a Rust hypervisor (`plans/README.md`: stages 0–5, currently at the start of stage 3 -- `docs/hypervisor.md`).
+`nos` is a hobby x86-64 / arm64 OS kernel written in C++20, Rust, and assembly. It is freestanding (no libc, no STL, no C++ exceptions/RTTI) and boots via Multiboot2/GRUB on x86-64 and the Linux `Image` protocol on arm64. It targets QEMU/KVM, KVM-based clouds (Google Cloud, Yandex Cloud), and QEMU `virt` + HVF on Apple Silicon, and boots on five real machines — a Dell Latitude 5480 (Skylake-U, UEFI, no serial port, no PS/2), where the framebuffer console and the xHCI USB keyboard are the only console channels, two Hetzner dedicated servers, an Intel EX44 (RTL8125) and an AMD Ryzen AX41 (Intel I210), whose only console is the network, an ASUS RS500 (two Westmere Xeons, BIOS, its SATA in IDE mode, Intel 82574L, a network with no DHCP), whose console is a KVM and the network, and a Supermicro X11SSD-F (Kaby Lake Xeon, UEFI, SATA behind AHCI, Intel I350, a network with no DHCP), whose console is the network. The long-term goal is a bare-metal cloud node running Linux guests under a Rust hypervisor (`plans/README.md`: stages 0–5, currently at the start of stage 3 -- `docs/hypervisor.md`).
 
 Reference, by what you are about to do (`docs/README.md` is the index):
 
@@ -13,7 +13,7 @@ Reference, by what you are about to do (`docs/README.md` is the index):
 - a boot parameter: `docs/kernel-parameters.md`
 - debug or profile a component: `docs/tracing.md` (tracepoints), `docs/profiler.md` (`profile`), `docs/memsites.md` (who holds Rust's heap, to the line), `docs/debug.md` (GDB)
 - how a subsystem works: `docs/boot.md`, `docs/paging.md`, `docs/scheduler.md`, `docs/interrupts.md`, `docs/profiler.md`, `docs/tracing.md`, `docs/random.md`, `docs/filesystems.md`, `docs/tls.md`, `docs/sshd.md`, `docs/netblk.md`, `docs/cluster.md`, `docs/hypervisor.md`
-- the three real machines, and what is different about each: `docs/real-hardware.md`; nos onto a new server from a release's system image: `docs/install.md`
+- the real machines, and what is different about each: `docs/real-hardware.md`; nos onto a new server from a release's system image: `docs/install.md`
 
 ## The goal: a kernel that is safe by design and by code
 
