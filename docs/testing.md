@@ -768,8 +768,17 @@ after the PXE entries, nothing else moved; `boot` sets BootNext to the
 firmware's own entry for the disk, turned on, the order left; `boot
 --default` puts it after PXE's -- the order that server needed; in a virtual
 machine it says the server's order is set from the server. `update
---network-here` gives nos the container's address, gateway and DNS server.
-OVMF is QEMU's own
+--network-here` gives nos the container's address, gateway and DNS server,
+and `network` says the same. The whole disk is made by the one-line
+installer, `scripts/installer/install.sh`, from a directory standing in for
+a release (`NOS_RELEASE_URL=file://...`): it checks the image against the
+release's `SHA256SUMS` -- a release whose sums are another image's is
+refused before anything is written -- mounts it, runs its `nos-install`
+with the arguments given, and leaves nothing in /tmp and nothing mounted;
+with no arguments and no terminal it says its dialog needs one, and fetches
+nothing. The image carries `nos-setup` byte for byte as the tree has it,
+and run from the image on a Linux that is not the ISO's, with no terminal,
+it says so and does nothing. OVMF is QEMU's own
 `edk2-x86_64-code.fd` or the ovmf package's; `grub-install` on a loop
 device needs `udevadm` -- what tells GRUB where a partition starts -- and
 `--network-here` needs `ip` (iproute2): a nos-builder image older than the
@@ -807,7 +816,15 @@ leave the disk as it was, byte for byte. In CI, and in the release workflow
 before the ISO it publishes goes up (`release.yml`): it builds the ISO with
 Docker, which takes Alpine's packages from the network (cached in
 `out/installer/apk-cache` after the first). The dialog itself is by hand: on
-a console, or `-serial` with the ttyS0 entry. Needs `qemu-system-x86_64`,
+a console, or `-serial` with the ttyS0 entry; and in a rescue system's
+place, as `curl ... | sh` runs it there: a privileged `debian:12` container
+with tmux and nothing else (`install.sh` installs the rest with apt-get),
+two loop devices for disks -- one blank, one holding a Linux root with a
+netplan -- root's `authorized_keys` holding an ed25519 key, one behind
+options and an RSA one, and `NOS_RELEASE_URL=file://... NOS_ALLOW_ANY_DISK=1
+NOS_FIRMWARE=bios sh install.sh` in a tmux session, driven by `tmux
+send-keys` and read by `capture-pane`. Such a container sees Docker's own
+disks too, and another gate's loop devices: pick the one made for it. Needs `qemu-system-x86_64`,
 `ssh`, `ssh-keygen`, Docker and the image built; about two minutes under
 TCG on an M-series Mac, the ISO's build aside -- a minute from a warm cache,
 and the first build's download of some 190 MB of Alpine's packages before.
