@@ -62,6 +62,86 @@ public:
        applies in acpi_has_watchdog(). */
     bool has_firmware_watchdog();
 
+    /* DMAR (Intel VT-d 4.1, chapter 8): the DMA remapping units and what the
+       firmware says of them, as far as this kernel uses them -- each unit
+       (DRHD) a register block and the devices it covers, and the memory
+       regions (RMRR) some devices' DMA must keep reaching. Copied out and
+       bounded at boot as every table's fields are. A DMAR this does not
+       hold all of -- a structure cut by the table or by its own length, more
+       units, scopes, regions or hops of a path than are kept -- is said, and
+       dmar_complete() is false: a unit left out would leave its devices
+       with no translation at all once the others are turned on. */
+    static const size_t MAX_DMAR_UNITS = 8;
+    static const size_t MAX_DMAR_SCOPES = 16;
+    static const size_t MAX_DMAR_RESERVED = 8;
+    static const size_t MAX_DMAR_PATH = 4;
+
+    /* A device scope (8.3.1): a PCI device by its path from start_bus -- a
+       (device, function) pair a hop, the bridges' secondary buses between --
+       or an IO-APIC or HPET by its id, whose path is its source-id's */
+    struct DmarScope
+    {
+        u8 type;
+        u8 enumeration_id;
+        u8 start_bus;
+        u8 path_length;
+        u8 path[MAX_DMAR_PATH][2];
+    };
+
+    static const u8 DMAR_SCOPE_ENDPOINT = 1;
+    static const u8 DMAR_SCOPE_BRIDGE = 2;
+    static const u8 DMAR_SCOPE_IOAPIC = 3;
+    static const u8 DMAR_SCOPE_HPET = 4;
+    static const u8 DMAR_SCOPE_NAMESPACE = 5;
+
+    /* A remapping unit (8.3): its registers, and the devices it translates --
+       those its scopes name, or with include_all every device of its
+       segment no other unit names */
+    struct DmarUnit
+    {
+        ulong base;
+        u16 segment;
+        bool include_all;
+        /* Its registers take 2^size pages (VT-d 3.0's field; 0 -- one page --
+           in a table older than that) */
+        u8 size;
+        size_t scope_count;
+        DmarScope scope[MAX_DMAR_SCOPES];
+    };
+
+    /* A reserved memory region (8.4): limit is its last byte */
+    struct DmarReserved
+    {
+        ulong base;
+        ulong limit;
+        u16 segment;
+        size_t scope_count;
+        DmarScope scope[MAX_DMAR_SCOPES];
+    };
+
+    /* The DMAR's flags (8.1) */
+    static const u8 DMAR_INTR_REMAP = 1 << 0;
+    static const u8 DMAR_X2APIC_OPT_OUT = 1 << 1;
+    static const u8 DMAR_PLATFORM_OPT_IN = 1 << 2;
+
+    bool has_dmar();
+    bool dmar_complete();
+    /* The widest DMA address the platform makes, in bits (HAW + 1) */
+    u8 get_dmar_width();
+    u8 get_dmar_flags();
+    size_t get_dmar_unit_count();
+    /* nullptr past the count */
+    const DmarUnit* get_dmar_unit(size_t index);
+    size_t get_dmar_reserved_count();
+    const DmarReserved* get_dmar_reserved(size_t index);
+
+    /* MCFG (PCI Firmware 3.2, 4.1.2): segment 0's ECAM window -- its
+       physical base, 0 where the table names none, and the buses it
+       decodes, start to end */
+    ulong get_mcfg_base();
+    u8 get_mcfg_start_bus();
+    u8 get_mcfg_end_bus();
+
 private:
     Acpi();
     ~Acpi();
@@ -185,7 +265,7 @@ private:
        eleven of them SSDTs, and the count moves with every BIOS revision --
        and a slot of the window held is one every page allocation after it
        goes without. */
-    static const size_t MAX_TABLES = 4;
+    static const size_t MAX_TABLES = 6;
     ACPISDTHeader* table_[MAX_TABLES];
     u32 table_length_[MAX_TABLES];
 
@@ -420,6 +500,36 @@ private:
     void parse_hpet();
     void parse_wdat();
 
+    /* The DMAR's fixed part, after the header: the host address width less
+       one, the flags, ten reserved bytes; then its remapping structures, a
+       type and a length each (8.1, 8.2) */
+    static const size_t DMAR_BODY_BYTES = 12;
+    static const size_t DMAR_STRUCT_HEADER_BYTES = 4;
+    static const u16 DMAR_TYPE_DRHD = 0;
+    static const u16 DMAR_TYPE_RMRR = 1;
+    /* What of a DRHD and an RMRR comes before its device scopes */
+    static const size_t DRHD_FIXED_BYTES = 16;
+    static const size_t RMRR_FIXED_BYTES = 24;
+    static const u8 DRHD_INCLUDE_PCI_ALL = 1 << 0;
+    /* A device scope: type, length, flags, reserved, enumeration id, start
+       bus, then a path of two bytes a hop */
+    static const size_t SCOPE_FIXED_BYTES = 6;
+
+    void parse_dmar();
+
+    /* The device scopes in the len bytes at scopes, into scope; false, the
+       table said to be more than is kept, where one is cut by them or by its
+       own length, or there are more than MAX_DMAR_SCOPES or a path longer
+       than MAX_DMAR_PATH */
+    static bool parse_dmar_scopes(const u8* scopes, size_t len, DmarScope* scope, size_t& count);
+
+    /* MCFG's body: eight reserved bytes, then an allocation a 16 bytes --
+       the base, the segment, the start and end bus, four reserved */
+    static const size_t MCFG_RESERVED_BYTES = 8;
+    static const size_t MCFG_ENTRY_BYTES = 16;
+
+    void parse_mcfg();
+
     /* FADT-derived values */
     ulong pm1a_cnt_port_;
     ulong pm1b_cnt_port_;
@@ -441,6 +551,21 @@ private:
 
     /* WDAT-derived value */
     bool firmware_watchdog_;
+
+    /* DMAR-derived values */
+    bool dmar_present_;
+    bool dmar_complete_;
+    u8 dmar_width_;
+    u8 dmar_flags_;
+    size_t dmar_unit_count_;
+    DmarUnit dmar_unit_[MAX_DMAR_UNITS];
+    size_t dmar_reserved_count_;
+    DmarReserved dmar_reserved_[MAX_DMAR_RESERVED];
+
+    /* MCFG-derived values */
+    ulong mcfg_base_;
+    u8 mcfg_start_bus_;
+    u8 mcfg_end_bus_;
 
 };
 
