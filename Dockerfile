@@ -16,10 +16,14 @@ RUN apt-get update && apt-get install -y \
     mtools \
     cppcheck \
     parted \
+    fdisk \
+    dosfstools \
+    udev \
     e2fsprogs \
     squashfs-tools \
     qemu-utils \
     qemu-system-x86 \
+    ovmf \
     qemu-system-arm \
     python3 \
     curl \
