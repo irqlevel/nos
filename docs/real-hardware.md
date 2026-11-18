@@ -272,7 +272,9 @@ machines never were:
   on zeros, and `grub-pc`'s `install_devices` names both disks. By PIO, a
   16-bit `inw` costs this chipset 0.68 µs: 2.8 MiB/s from the SSD as from the
   HDDs, 1.4 ms a 4 KiB read whatever its place, one CPU busy in `inw` for all
-  of it (`blkload`, `profile`) — a hundredth of the link. The ICH10R has AHCI
+  of it (`blkload`, `profile`) — a hundredth of the link: Ubuntu reads the same
+  SSD by bus-master DMA at 241 MiB/s, and 6 200 random reads of 4 KiB a
+  second, no more at 32 in flight (no NCQ in IDE mode). The ICH10R has AHCI
   too: with the BIOS's SATA mode set to it, the `ahci` driver takes these
   disks by DMA.
 - **Its NICs are two Intel 82574L** (the `e1000e` driver), MSI-X, the cable
@@ -321,7 +323,12 @@ its disks and its NICs were:
   time, polled, the link kept out of its power states: 354 MiB/s in reads of
   128 KiB, 11 000 random reads of 4 KiB a second (Ubuntu's 412 MiB/s and 9 100
   with its CPUs held out of deep C-states, `fio` at the same depth); what it
-  lacks is depth — Ubuntu's NCQ reads 76 500 a second at 32 in flight.
+  lacks is depth — Ubuntu's NCQ reads 76 500 a second at 32 in flight. Through
+  ext4, a 256 MiB file reads at 230–243 MiB/s and copies at 48, since a
+  batch's run of contiguous blocks is one command (94 and 20 when each block
+  was a command of its own); commands past 256 KiB are no faster on this SSD
+  (293 MiB/s at 512 KiB to 315 at 256, its Ubuntu disk), so 256 KiB is where
+  the driver stops a command.
 - **Its NICs are a two-port Intel I350** (8086:1521, Supermicro's
   AOC-CGP-i2 MicroLP), MSI-X. That is what brought the I350 into `igb`, a
   third generation beside the 82576 and the I210: each port claims its own

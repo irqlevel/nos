@@ -219,7 +219,7 @@ swallowing panic messages whole.
 | `panic-test.sh [--arch x86_64\|aarch64]` | both | the panic path, `panic=N`, a reset; a panic off a task's stack (x86's double fault), its report through the netconsole; a task's stack run out |
 | `parttest.py [--arch aarch64\|x86_64]` | both | the block layer, the partition tables |
 | `random-seed-test.py [--iso nos-test.iso]` | x86-64, from `nos-test.iso` | the random pool's seed kept on the root (`src/crates/kernel/src/seed.rs`, `random::restore_seed`), the jitter collector asked again after the root is mounted, `nos-install`'s `put_seed`: a Westmere under TCG -- no RDRAND, no jitter -- seeded by its kept seed, which is 64 new bytes when it is off; with none and nothing else, unseeded and nothing made up; with a virtio-rng, a seed kept; a file of the wrong size not taken |
-| `ata-test.py [--controller ide\|ahci] [--iso nos-test.iso]` | x86-64, from `nos-test.iso` | `drivers/block/ata` (`ide`: SATA in IDE mode and parallel ATA behind a PCI IDE controller, four positions on two channels) and `drivers/block/ahci` (`ahci`: QEMU q35's AHCI, a disk to a port), what they share in `common/storage/ataproto` -- a 3 TiB disk's sectors past 2^32 read and written where they were meant and nowhere else, an ext4 made, written and held to e2fsck, a CD passed over, a GPT disk beside them found and left alone |
+| `ata-test.py [--controller ide\|ahci] [--iso nos-test.iso]` | x86-64, from `nos-test.iso` | `drivers/block/ata` (`ide`: SATA in IDE mode and parallel ATA behind a PCI IDE controller, four positions on two channels) and `drivers/block/ahci` (`ahci`: QEMU q35's AHCI, a disk to a port), what they share in `common/storage/ataproto` -- a 3 TiB disk's sectors past 2^32 read and written where they were meant and nowhere else, a sector QEMU fails (blkdebug) failing that read and write alone, said, the disk brought back; an ext4 made, a file of 6 MiB fetched onto it, copied and read back through its batches, held to e2fsck and dumped byte for byte; a CD passed over, a GPT disk beside them found and left alone; every disk in standby at power-off |
 | `ext2-test.py` | arm64 | ext2, the halt |
 | `poweroff-test.py` | x86-64, by hand | the halt on x86-64: the sleep type `poweroff` asks for (`Acpi::parse_dsdt`, `hal::power_off`) |
 | `halt-test.py [--arch aarch64\|x86_64]` | both; x86-64 from `nos-test.iso` | the halt's order: the modules unloaded before the shells are stopped (`ModuleTable::unload_all`, the two `main`s) |
@@ -427,12 +427,30 @@ So the host marks sectors of the big disk on both sides of 2^28 and 2^32
 and its last; the kernel has to read every one back as marked, and writes
 three more, which the host then finds changed with their neighbours and the
 marks not, and -- by the image's data extents -- nothing else of the 3 TiB
-written at all. The SSD is formatted ext4 by the shell's `format`, written
-and unmounted, and has to be clean to `e2fsck -fn` with its files in it; the
-CD has to be passed over as a packet device; the GPT disk's partitions have
-to be found and not one byte of it changed; and the machine has to power
-itself off, its disks' caches flushed. The pool is seeded by a virtio-rng:
-under TCG nothing else seeds it, and `format` will not make a UUID without.
+written at all. One sector of the big disk QEMU fails, reads and writes
+alike (blkdebug, its EIO reported to the guest): the kernel's read and write
+of it have to fail, each said with the device's status and error (`dmesg`:
+a command's lines go to the log, not to the serial port), the sectors on
+either side of it have to read after -- the driver brought the disk back --
+and no disk may have been given up on. The SSD is formatted ext4 by the
+shell's `format`, mounted, a file of 6 MiB fetched onto it from the host
+over HTTP (`wget`) and copied (`cp`), mounted again and both read back to
+the host's CRC -- ext4's batches, which the AHCI driver makes one command a
+run of contiguous blocks -- small files written and unmounted; it has to be
+clean to `e2fsck -fn` with its files in it, and the big file and its copy
+dumped by `debugfs` have to be the one served, byte for byte. The CD has to
+be passed over as a packet device; the GPT disk's partitions have to be
+found and not one byte of it changed; and the machine has to power itself
+off, every ATA disk flushed and put in standby (STANDBY IMMEDIATE), saying
+so. The pool is seeded by a virtio-rng: under TCG nothing else seeds it, and
+`format` will not make a UUID without.
+
+What it does not drive: a command that never finishes and a link lost
+under one -- the paths that count commands that did not finish and give a
+disk up. blkdebug's errors come back at once, QEMU's SATA devices cannot be
+unplugged, and no way was found to hold a request past the driver's 31 s
+without QEMU waiting on it too (a reset cancels what is in flight). Those
+paths are read, not run.
 
 ### `ext2-test.py` -- ext2, judged by `e2fsck`
 

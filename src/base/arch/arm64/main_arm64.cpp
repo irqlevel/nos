@@ -59,7 +59,7 @@ extern "C" void rust_ipc_stop();
 extern "C" int rust_disklog_setup();
 extern "C" void rust_disklog_stop();
 extern "C" void rust_test();
-extern "C" void rust_fini();
+extern "C" void rust_fini(int power_off);
 /* The random pool is Rust (src/crates/base/random), the x86 twin's counterpart */
 extern "C" bool rust_random_setup();
 extern "C" void rust_random_reseed();
@@ -129,6 +129,8 @@ typedef void (*HaltAction)();
 /* Finalization context passed across the stack switch */
 static Task* halt_task;
 static HaltAction halt_action_fn;
+/* Whether the halt cuts the power (poweroff) or resets, for rust_fini */
+static bool halt_power_off;
 
 /* Runs on the static boot stack: releases the idle task, runs static
    destructors and Rust teardown, then powers off/resets. Never returns
@@ -141,7 +143,7 @@ static void finalize_on_boot_stack(void* ctx)
 
     halt_task->put();
 
-    rust_fini();
+    rust_fini(halt_power_off ? 1 : 0);
 
     __cxa_finalize(0);
 
@@ -150,7 +152,7 @@ static void finalize_on_boot_stack(void* ctx)
     halt_action_fn();
 }
 
-static void __attribute__((noreturn)) prepare_halt_arm(HaltAction action)
+static void __attribute__((noreturn)) prepare_halt_arm(HaltAction action, bool power_off)
 {
     /* Extra ref so the idle task is not freed while we still run on its
        stack (released in finalize_on_boot_stack after the stack switch) */
@@ -174,6 +176,7 @@ static void __attribute__((noreturn)) prepare_halt_arm(HaltAction action)
 
     halt_task = task;
     halt_action_fn = action;
+    halt_power_off = power_off;
     hal::run_on_stack((ulong)&boot_stack_top[0], finalize_on_boot_stack, nullptr);
 }
 
@@ -478,7 +481,7 @@ static void bp_startup_arm(void* ctx)
                poweroff. */
             SoftIrq::get_instance().stop();
 
-            prepare_halt_arm(reboot ? hal::reset : hal::power_off);
+            prepare_halt_arm(reboot ? hal::reset : hal::power_off, !reboot);
         }
     }
 }
