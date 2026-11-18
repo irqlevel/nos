@@ -196,7 +196,8 @@ class Test:
         check("sftp: df", re.search(r"Size\s+Used\s+Avail", out) is not None, out[-600:])
         check("sftp: renamed", "moved.bin" in out.split("rename")[-1], out[-300:])
         rc, out, _ = self.ssh(["ls", "/sftp"])
-        check("the kernel's shell sees it, at its size", rc == 0 and "f %d moved.bin" % SFTP_BIG in out, out)
+        check("the kernel's shell sees it, at its size",
+              rc == 0 and re.search(r"^f\s+%d\s+moved\.bin$" % SFTP_BIG, out, re.M) is not None, out)
         out = sh.run("dmesg 20 sftp")
         check("the session's line in the log", re.search(r"sshd: root from .*: sftp, \d+ files opened", out) is not None,
               out)

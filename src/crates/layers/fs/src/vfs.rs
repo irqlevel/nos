@@ -848,6 +848,18 @@ impl Vfs {
         order
     }
 
+    /// What the mount a path is on is -- the one the VFS resolves the path
+    /// through, whether the path is there yet or not -- as `mount_info` has
+    /// it: what `df <path>` shows. None for a path no mount holds.
+    pub fn mount_info_of(&self, path: &[u8]) -> Option<MountInfo> {
+        let (index, id) = {
+            let table = self.table.lock();
+            let (index, _) = Self::find_mount(&table, path)?;
+            (index, table.entries[index].as_ref()?.id)
+        };
+        self.info_of(index, id)
+    }
+
     /// What the index'th mount is, for `mounts` to print.
     pub fn mount_info(&self, index: usize) -> Option<MountInfo> {
         let (slot, id) = (*self.mounted().get(index)?)?;

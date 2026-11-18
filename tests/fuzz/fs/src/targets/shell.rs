@@ -1,10 +1,18 @@
 //! The shell's storage commands -- what the console, the UDP shell and an
 //! SSH session run: `mount`, `umount`, `ls`, `find`, `cat`, `write`,
 //! `append`, `mkdir`, `touch`, `cp -r`, `rm`, `mv`, `stat`, `truncate`,
-//! `sync`, `fstest`, `disks`, `partitions`, `diskread`, `diskwrite`, `disklog` --
+//! `sync`, `fstest`, `df`, `disks`, `partitions`, `diskread`, `diskwrite`, `disklog` --
 //! with arguments of every kind, over a ramfs root and two ext2s on disks,
 //! of two block sizes. First the kernel's own self-test on each filesystem,
-//! which must pass; then whatever the input types. And at the end, every
+//! which must pass; then whatever the input types. What `df` says is held
+//! to the judge's own reading of it: every mount's line in the mounts'
+//! order, or the line of the mount each path given is under -- the longest
+//! mount path it starts with -- its size, used and free from what the VFS
+//! counts, to a tenth of their unit, and the share used rounded up; `-`
+//! where a filesystem counts nothing. What `ls`, `mounts` and `disks` print
+//! is held to its columns: a listing's names in one column and its sizes
+//! right-aligned, the mounts' `on`, mount points and `ro`/`rw` each in one,
+//! the disks' sectors and sector sizes each in one. And at the end, every
 //! disk no command wrote to raw is a filesystem e2fsck passes: what the
 //! commands did through the VFS left it whole.
 
@@ -79,7 +87,165 @@ fn line(r: &mut Input) -> String {
         18 => format!("partitions {}", r.pick(DISKS)),
         19 => format!("diskread {} {}", r.pick(DISKS), r.pick(&["0", "1", "2", "18446744073709551615", "x"])),
         20 => format!("diskwrite {} {} {}", r.pick(DISKS), r.pick(&["0", "2", "100"]), r.pick(&["00", "ff00ff", "zz", ""])),
+        23 => match r.u8() % 4 {
+            0 => "df".to_string(),
+            1 => format!("df {}", p),
+            2 => format!("df {} {}", p, path(r)),
+            _ => format!("df {} {} {}", r.pick(&["/", "x", "", "/e/", "/e/../n"]), p, r.pick(&["/n/d", "/proc", "/mnt/a"])),
+        },
         _ => r.pick(&["disklog", "del", "rm", "cp", "mv a", "mount ext2 vda", "fstest", "ls /e /n /x"]).to_string(),
+    }
+}
+
+/// A size as `df` says it, worked out here: bytes below 1024, and above
+/// that a tenth of the largest of P, T, G, M and K -- each 1024 of the next
+/// below -- that it holds one of, the rest cut off.
+fn df_size(bytes: u64) -> String {
+    for (unit, shift) in [("P", 50u32), ("T", 40), ("G", 30), ("M", 20), ("K", 10)] {
+        let scale = 1u128 << shift;
+        if u128::from(bytes) >= scale {
+            let tenths = u128::from(bytes) * 10 / scale;
+            return format!("{}.{}{}", tenths / 10, tenths % 10, unit);
+        }
+    }
+    format!("{}B", bytes)
+}
+
+/// What `df` should say of a mount, a word a column.
+fn df_words(m: &fs::vfs::MountInfo) -> Vec<String> {
+    let device = block::Disk::from_handle(m.device).map_or("-".to_string(), |d| d.name().to_string());
+    let mut words = vec![String::from_utf8_lossy(m.path()).into_owned(), m.fs_name.to_string(), device];
+    match m.space {
+        Some(s) => {
+            let used = s.total_bytes.saturating_sub(s.free_bytes);
+            words.push(df_size(s.total_bytes));
+            words.push(df_size(used));
+            words.push(df_size(s.free_bytes));
+            words.push(if s.total_bytes == 0 {
+                "-".to_string()
+            } else {
+                format!("{}%", (u128::from(used) * 100 + u128::from(s.total_bytes) - 1) / u128::from(s.total_bytes))
+            });
+        }
+        None => words.extend(["-", "-", "-", "-"].map(String::from)),
+    }
+    words
+}
+
+/// The mount a path is under, as the judge reads it: the longest mount path
+/// it starts with whole -- the path itself, or followed by a `/` -- every
+/// absolute path being under `/`.
+fn df_mount_of<'m>(mounts: &'m [fs::vfs::MountInfo], p: &str) -> Option<&'m fs::vfs::MountInfo> {
+    let p = p.as_bytes();
+    mounts
+        .iter()
+        .filter(|m| {
+            let mp = m.path();
+            p == mp || (mp == b"/" && p.starts_with(b"/")) || (p.starts_with(mp) && p.get(mp.len()) == Some(&b'/'))
+        })
+        .max_by_key(|m| m.path().len())
+}
+
+/// Each word of a line, with the column it starts at.
+fn words_at(line: &str) -> Vec<(usize, &str)> {
+    let mut words = Vec::new();
+    let mut start = None;
+    for (i, c) in line.char_indices() {
+        match (c == ' ', start) {
+            (false, None) => start = Some(i),
+            (true, Some(s)) => {
+                words.push((s, &line[s..i]));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        words.push((s, &line[s..]));
+    }
+    words
+}
+
+/// Whether every one of `columns` is the same: what a printer that lines
+/// its columns up gives.
+fn one_column(what: &str, l: &str, columns: &[usize], out: &str) {
+    invariant!(columns.windows(2).all(|w| w[0] == w[1]), "{}'s {} are not in one column: {:?}\n{}", l, what, columns, out);
+}
+
+/// What `ls`, `mounts` and `disks` printed, held to their columns.
+fn judge_columns(l: &str, out: &str) {
+    if l == "ls" || l.starts_with("ls ") {
+        /* An entry is `f  <size>  <name>` or `d  <name>`, the names in one
+           column and the sizes right-aligned */
+        let entries: Vec<Vec<(usize, &str)>> = out.lines().filter(|x| x.starts_with("f ") || x.starts_with("d "))
+            .map(words_at).collect();
+        let names: Vec<usize> = entries.iter().filter_map(|w| w.last().map(|(at, _)| *at)).collect();
+        one_column("names", l, &names, out);
+        let ends: Vec<usize> = entries.iter().filter(|w| w[0].1 == "f" && w.len() == 3).map(|w| w[1].0 + w[1].1.len())
+            .collect();
+        one_column("sizes' ends", l, &ends, out);
+        if names.len() > 1 && !ends.is_empty() {
+            reached("ls: a listing in columns, files and directories");
+        }
+    } else if l == "mounts" {
+        let lines: Vec<Vec<(usize, &str)>> = out.lines().map(words_at).filter(|w| w.len() >= 4 && w[1].1 == "on")
+            .collect();
+        one_column("ons", l, &lines.iter().map(|w| w[1].0).collect::<Vec<_>>(), out);
+        one_column("mount points", l, &lines.iter().map(|w| w[2].0).collect::<Vec<_>>(), out);
+        one_column("ro/rw", l, &lines.iter().filter_map(|w| w.last().map(|(at, _)| *at)).collect::<Vec<_>>(), out);
+        if lines.len() > 2 {
+            reached("mounts: three mounts and more in columns");
+        }
+    } else if l == "disks" {
+        let lines: Vec<Vec<(usize, &str)>> = out.lines().map(words_at).filter(|w| w.len() >= 6).collect();
+        let at = |word: &str| -> Vec<usize> {
+            lines.iter().filter_map(|w| w.iter().find(|(_, x)| *x == word).map(|(at, _)| *at)).collect()
+        };
+        one_column("\"sectors\"", l, &at("sectors"), out);
+        one_column("\"bytes/sector\"", l, &at("bytes/sector"), out);
+        invariant!(lines.iter().all(|w| w.iter().any(|(_, x)| *x == "sectors")), "{} said a line with no sectors:\n{}", l,
+                   out);
+    }
+}
+
+/// What `l`, a `df`, printed, held to what it should have.
+fn judge_df(l: &str, out: &str) {
+    let vfs = fs::vfs_instance().expect("the VFS");
+    let mounts: Vec<fs::vfs::MountInfo> = vfs.mount_infos().into_iter().flatten().collect();
+    let args: Vec<&str> = l.split_whitespace().skip(1).collect();
+    let mut want: Vec<Vec<String>> = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
+    if args.is_empty() {
+        want.extend(mounts.iter().map(df_words));
+    }
+    for p in &args {
+        match df_mount_of(&mounts, p) {
+            Some(m) => want.push(df_words(m)),
+            None => refused.push(format!("df: {}: no filesystem holds it", p)),
+        }
+    }
+    let mut lines = out.lines();
+    for r in &refused {
+        let got = lines.next();
+        invariant!(got == Some(r.as_str()), "{} said {:?} where it should have said {:?}", l, got, r);
+    }
+    if !want.is_empty() {
+        let header: Vec<&str> = lines.next().unwrap_or("").split_whitespace().collect();
+        invariant!(header == ["mount", "type", "device", "size", "used", "free", "use%"], "{} began {:?}", l, header);
+    }
+    for w in &want {
+        let got: Vec<String> = lines.next().unwrap_or("").split_whitespace().map(String::from).collect();
+        invariant!(&got == w, "{} said {:?} of a mount, the judge {:?}", l, got, w);
+        if w[3] != "-" {
+            reached("df: a filesystem's size, used and free");
+        } else {
+            reached("df: a filesystem that counts nothing");
+        }
+    }
+    let rest: Vec<&str> = lines.collect();
+    invariant!(rest.is_empty(), "{} said more than it should: {:?}", l, rest);
+    if !refused.is_empty() {
+        reached("df: a path no filesystem holds");
     }
 }
 
@@ -162,6 +328,10 @@ pub fn shell(r: &mut Input) {
         let l = line(r);
         let out = cmd::run(&l);
         crate::targets::fsops::say(format_args!("{} -> {:?}", l, out.lines().last()));
+        if l == "df" || l.starts_with("df ") {
+            judge_df(&l, &out);
+        }
+        judge_columns(&l, &out);
         if out.contains("wrote ") {
             let target = l.split_whitespace().nth(1).unwrap_or("");
             for (slot, name) in ["vda", "vdb", "vdc"].iter().enumerate() {
