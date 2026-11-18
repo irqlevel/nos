@@ -622,7 +622,10 @@ pub fn hostfn_target(r: &mut Input) {
                 let expect = match dword {
                     d if (BAR0..BAR0 + 24).contains(&d) => Some(judge.regs[(d - BAR0) / 4]),
                     ROM => Some(0),
-                    _ if at == INTERRUPT_PIN && size == 1 => Some(0),
+                    /* The device's pin, in the dword's second byte */
+                    _ if at == INTERRUPT_PIN && size == 1 => {
+                        Some(u32::from(made.model.lock().unwrap().space[INTERRUPT_PIN]) << 8)
+                    }
                     _ if at == INTERRUPT_LINE && size == 1 => Some(u32::from(judge.line)),
                     _ if at == HEADER_TYPE && size == 1 => None,
                     d if judge.msi_at != 0 && d >= judge.msi_at + 4 && d < judge.msi_at + msi_len_of(judge.msi_control) => {
@@ -849,6 +852,7 @@ pub fn gpu(r: &mut Input) -> Made {
         }
     }
     space[STATUS..STATUS + 2].copy_from_slice(&STATUS_CAPABILITIES.to_le_bytes());
+    space[INTERRUPT_PIN] = 1;
     space[CAP_POINTER] = SLOT_PM as u8;
     space[SLOT_PM] = CAP_PM;
     space[SLOT_PM + 1] = SLOT_MSI as u8;

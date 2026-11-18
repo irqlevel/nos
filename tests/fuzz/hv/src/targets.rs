@@ -434,6 +434,8 @@ fn pci_bus(r: &mut Input) {
     bus.add(Function::device(&Blk::identity(), 0xC000, blk::BAR_SIZE, 11).with_msix(2, 0xFE00_1000))
         .expect("a disk");
     bus.add(Function::device(&Net::identity(), 0xC100, net::BAR_SIZE, 10)).expect("a NIC");
+    /* A host's function on slot 3, whose space is the run loop's */
+    let host = bus.add_host().expect("a host's function");
     while let Some(op) = r.op(7) {
         match op {
             0 => {
@@ -475,6 +477,11 @@ fn pci_bus(r: &mut Input) {
             }
             5 => {
                 let port = if r.bool() { 0xC000 + r.below(0x200) as u16 } else { r.u16() };
+                /* Only the configuration data's ports are a host function's,
+                 * whatever the address latched names */
+                let hosted = bus.host_target(port);
+                invariant!(hosted.is_none() || (pci::CONFIG_DATA..pci::CONFIG_DATA + 4).contains(&port),
+                           "port {:#x} taken for host function {}'s space at {:?}", port, host, hosted);
                 if let Some((slot, offset)) = bus.io_target(port) {
                     invariant!(slot != 0 && usize::from(slot) < pci::MAX_SLOTS, "port {:#x} in slot {}", port, slot);
                     invariant!(u32::from(offset) < 0x100, "port {:#x} at {:#x} into its BAR", port, offset);

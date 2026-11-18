@@ -301,9 +301,13 @@ impl PciBus {
     }
 
     /// A host's function's slot, and the byte of its space, `port` is an
-    /// access of -- None where it is any other function's or none's.
+    /// access of -- None where it is any other function's or none's, and for
+    /// every port but the configuration data's four: the address latched
+    /// names a host's function long after its access, and a device's I/O
+    /// BAR is above them (a disk's notify taken for a write of the GPU's
+    /// space left the disk with no notify again).
     pub fn host_target(&self, port: u16) -> Option<(usize, usize)> {
-        if port < CONFIG_DATA {
+        if !(CONFIG_DATA..=CONFIG_END).contains(&port) {
             return None;
         }
         self.target(port).filter(|&(slot, _)| self.host & (1 << slot) != 0)
