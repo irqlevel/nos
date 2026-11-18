@@ -10,7 +10,8 @@
 // relocations make, byte for byte; each segment's pages with its own
 // permissions and nothing both writable and executable; the imports, the
 // function table, the header's name; the lookups a backtrace makes through
-// it. Any one, sound or not: nothing written past the image's pages (a
+// it; lsmod's listing of it among others, column by column. Any one,
+// sound or not: nothing written past the image's pages (a
 // page either side of each run is poisoned for ASan -- a host's own pages
 // may be bigger than the kernel's, so guard pages and mprotect cannot be
 // placed to the kernel's page), nothing asked for that is both writable and
@@ -39,6 +40,7 @@
 
 #include <algorithm>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -905,6 +907,94 @@ void lookups(fuzz::Input& in, LoadedModule& m)
     INVARIANT(table.is_loaded(m.name), "is_loaded does not know %s", m.name);
 }
 
+/* Text right-aligned to `width`: the spaces before it */
+std::string right(const std::string& text, size_t width)
+{
+    return std::string(width > text.size() ? width - text.size() : 0, ' ') + text;
+}
+
+/* lsmod (ModuleTable::dump) over the module just loaded, if one was, and up
+   to five more of any name, size, address, imports and phase put on the list
+   before or after it: held byte for byte to the listing written out here
+   from the modules' own fields -- each column as wide as its widest, names
+   to the left, numbers to the right -- or, with none listed, to the line
+   that says so. */
+void listing(fuzz::Input& in, LoadedModule* loaded)
+{
+    static const char NAME_CHARS[] = "abcdefghijklmnopqrstuvwxyz0123456789_-";
+    static const char* const KEEPERS[] = {"a channel", "a device"};
+    static const ModulePhase PHASES[] = {ModulePhase::Loading, ModulePhase::Live, ModulePhase::Unloading};
+    auto& table = ModuleTable::get_instance();
+
+    std::vector<const LoadedModule*> order;
+    if (loaded != nullptr)
+        order.push_back(loaded);
+    std::vector<std::unique_ptr<LoadedModule>> others;
+    const size_t count = in.below(6);
+    for (size_t k = 0; k < count; k++)
+    {
+        others.push_back(std::make_unique<LoadedModule>());
+        LoadedModule& o = *others.back();
+        const size_t len = in.below(ModuleTable::NAME_LEN_MAX + 1);
+        for (size_t i = 0; i < len; i++)
+            o.name[i] = NAME_CHARS[in.below(sizeof(NAME_CHARS) - 1)];
+        o.name[len] = '\0';
+        o.image.count = in.chance(16) ? in.u64() : in.below(1024);
+        o.image.base = in.chance(16) ? in.u64() : 0xFFFF800070000000ul + in.below(64) * 0x1000000ul;
+        o.imports = in.chance(16) ? in.u64() : in.below(200);
+        o.permanent_by = in.chance(32) ? in.pick(KEEPERS) : nullptr;
+        o.phase = in.pick(PHASES);
+        const bool first = in.boolean();
+        const ulong flags = table.lock_.lock_irq_save();
+        if (first)
+            table.list_.insert_head(&o.list_entry);
+        else
+            table.list_.insert_tail(&o.list_entry);
+        table.lock_.unlock_irq_restore(flags);
+        if (first)
+            order.insert(order.begin(), &o);
+        else
+            order.push_back(&o);
+    }
+
+    std::string want;
+    size_t name_width = 0, kib_width = 0, imports_width = 0;
+    for (const LoadedModule* m : order)
+    {
+        name_width = std::max(name_width, strlen(m->name));
+        kib_width = std::max(kib_width, std::to_string(m->image.count * PAGE / 1024).size());
+        imports_width = std::max(imports_width, std::to_string(m->imports).size());
+    }
+    bool padded = false;
+    for (const LoadedModule* m : order)
+    {
+        const std::string kib = std::to_string(m->image.count * PAGE / 1024);
+        const std::string imports = std::to_string(m->imports);
+        padded |= strlen(m->name) != name_width || kib.size() != kib_width || imports.size() != imports_width;
+        char base[32];
+        snprintf(base, sizeof(base), "%lX", static_cast<unsigned long>(m->image.base));
+        want += std::string(m->name) + std::string(name_width - strlen(m->name), ' ') + "  " + right(kib, kib_width) +
+            " KiB at 0x" + base + ", " + right(imports, imports_width) + " kernel imports" +
+            (m->permanent_by != nullptr ? ", permanent" : "") +
+            (m->phase == ModulePhase::Loading ? ", loading" : m->phase == ModulePhase::Unloading ? ", unloading" : "") +
+            "\n";
+    }
+    if (order.empty())
+        want = "no modules loaded\n";
+
+    std::vector<char> said(8192);
+    stdlib::BufferPrinter out(said.data(), said.size());
+    table.dump(out);
+    fuzz::check_no_locks_held("after lsmod");
+    INVARIANT(want == said.data(), "lsmod printed\n%s\nwhere the modules listed make\n%s", said.data(), want.c_str());
+    fuzz::reached(order.empty() ? "lsmod of none" : padded ? "lsmod, its columns padded" : "lsmod, nothing to pad");
+
+    const ulong flags = table.lock_.lock_irq_save();
+    for (auto& o : others)
+        o->list_entry.remove_init();
+    table.lock_.unlock_irq_restore(flags);
+}
+
 void run(fuzz::Input& in)
 {
     fuzz::machine = in.boolean() ? elf::MACHINE_AARCH64 : elf::MACHINE_X86_64;
@@ -969,6 +1059,7 @@ void run(fuzz::Input& in)
         table.list_.insert_tail(&module->list_entry);
         table.lock_.unlock_irq_restore(flags);
         lookups(in, *module);
+        listing(in, module);
         flags = table.lock_.lock_irq_save();
         module->list_entry.remove_init();
         table.lock_.unlock_irq_restore(flags);
@@ -980,6 +1071,7 @@ void run(fuzz::Input& in)
         INVARIANT(module == nullptr, "a load that says no, with a module left");
         INVARIANT(damaged || failing, "a sound module refused: %s", said);
         fuzz::reached(failing && !damaged ? "an allocation failed" : "a module refused");
+        listing(in, nullptr);
     }
     INVARIANT(fuzz::pages.out.empty(), "%zu pages still out", fuzz::pages.out.size());
     INVARIANT(fuzz::mappings.empty(), "%zu runs still mapped", fuzz::mappings.size());
