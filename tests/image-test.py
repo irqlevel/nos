@@ -159,17 +159,17 @@ nos_install() {
         NOS_CPUINFO="$T/cpuinfo" NOS_UCODE_DIR="$T/intel-ucode" "$T/${IMG_DIR:-img}/nos-install" "$@"
 }
 # same_as_image DIR WHEN [FILE...]: every file of the image is in DIR as it
-# is in the image -- nos-install aside, which stays in it, and the FILEs
-# named, which are the machine's by then -- or the ones that are not are
-# named. Not from nos-install's list of what goes where: a file it leaves out
-# is one that list does not have
+# is in the image -- nos-install and nos-setup aside, which stay in it, and
+# the FILEs named, which are the machine's by then -- or the ones that are
+# not are named. Not from nos-install's list of what goes where: a file it
+# leaves out is one that list does not have
 same_as_image() {
     local f bad=0 dir=$1 when=$2
     shift 2
     while IFS= read -r f; do
         case " $* " in *" $f "*) continue ;; esac
         cmp -s "img/$f" "$dir/$f" || { echo "$when: not on the partition as in the image: /$f"; bad=1; }
-    done < <(cd img && find . -type f ! -path ./nos-install | sed 's|^\./||' | sort)
+    done < <(cd img && find . -type f ! -path ./nos-install ! -path ./nos-setup | sed 's|^\./||' | sort)
     [ "$bad" = 1 ] || echo "$when: every file of the image"
 }
 mount_at "$IMAGE" img loop,ro
@@ -362,6 +362,16 @@ EOF
 efi_install() {
     NOS_FIRMWARE=uefi NOS_IN_VM=${NOS_IN_VM:-0} NOS_EFIBOOTMGR="$T/efibootmgr" disk_install "$@"
 }
+# The one-line installer as a rescue system runs it (curl ... | sh -s --
+# ARGS): install.sh fetches the image and its SHA256SUMS from a release -- a
+# directory standing in for one, by file:// -- checks the one against the
+# other, mounts it and runs its nos-install; it installs no packages here
+script_install() {
+    mkdir -p "$T/grub.d.disk"
+    NOS_RELEASE_URL=${NOS_RELEASE_URL:-file://$T/release} NOS_NO_PACKAGES=1 \
+        NOS_GRUB_D="$T/grub.d.disk" NOS_UPDATE_GRUB=false NOS_ALLOW_ANY_DISK=1 \
+        NOS_CPUINFO="$T/cpuinfo" NOS_UCODE_DIR="$T/intel-ucode" sh "$T/install.sh" "$@"
+}
 """
 
 WHOLE_PREPARE = WHOLE_HELPERS + r"""
@@ -401,12 +411,39 @@ fi
 cat refuse-size.out
 [ "$(first_mib "$WHOLE")" != "$before" ] || echo "size: the disk is as it was"
 
+# The one-line installer refuses an image that is not the release's -- the
+# release's SHA256SUMS another's -- before anything is written
+before=$(first_mib "$WHOLE")
+if NOS_RELEASE_URL="file://$T/release-bad" script_install disk "$WHOLE" --wipe --root-size "$WHOLE_ROOT" \
+    > refuse-sum.out 2>&1; then
+    echo "sum: installed"
+fi
+cat refuse-sum.out
+[ "$(first_mib "$WHOLE")" != "$before" ] || echo "sum: the disk is as it was"
+# ... and with no arguments, its dialog, with no terminal to draw it on
+if setsid -w sh -c 'NOS_RELEASE_URL="file://$T/release" NOS_NO_PACKAGES=1 sh "$T/install.sh"' \
+    < /dev/null > script-noterm.out 2>&1; then
+    echo "noterm: ran"
+fi
+cat script-noterm.out
+# The image's dialog, from the image on a Linux not the installer ISO's:
+# with no terminal, it says so and does nothing
+if "$T/img/nos-setup" < /dev/null > setup-noterm.out 2>&1; then
+    echo "setup noterm: ran"
+fi
+cat setup-noterm.out
+sha256sum "$T/img/nos-setup" | cut -d' ' -f1 > img-setup.sum
+
 # Under UEFI, on the Supermicro's firmware as it was before nos: no entry
-# for the disk, which nos-install makes, and puts right after PXE's
+# for the disk, which nos-install makes, and puts right after PXE's -- the
+# install made by the one-line installer, from the release
 efi_state > efi-before
-EFI_STATE="$T/efi-before" efi_install disk "$WHOLE" --wipe --root-size "$WHOLE_ROOT" --ssh-key id_test.pub \
+EFI_STATE="$T/efi-before" NOS_FIRMWARE=uefi NOS_IN_VM=0 NOS_EFIBOOTMGR="$T/efibootmgr" \
+    script_install disk "$WHOLE" --wipe --root-size "$WHOLE_ROOT" --ssh-key id_test.pub \
     --netconsole 10.0.2.2:6666 > disk.out 2>&1 || { cat disk.out; exit 1; }
 cat disk.out
+ls -d /tmp/nos-install.* 2>/dev/null && echo "script: left in /tmp"
+grep -q ' /tmp/nos-install\.' /proc/mounts && echo "script: left mounted"
 cat efi-before efi-before.log
 sfdisk --dump "$WHOLE" > layout.out
 cat layout.out
@@ -460,6 +497,8 @@ command -v ip > /dev/null ||
     { echo "no ip here (iproute2): a builder image older than the Dockerfile -- docker build -t nos-builder ."; exit 1; }
 here_dev=$(ip -4 route show default | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)
 echo "here: ip=$(ip -4 -o addr show dev "$here_dev" scope global | awk '{ print $4; exit }') gw=$(ip -4 route show default | sed -n 's/.* via \([0-9.]*\).*/\1/p' | head -n 1)"
+disk_install network > disk-network.out 2>&1 || { cat disk-network.out; exit 1; }
+cat disk-network.out
 disk_install update --network-here > disk-here.out 2>&1 || { cat disk-here.out; exit 1; }
 cat disk-here.out
 debugfs -R 'cat /grubenv' "${WHOLE}p3" 2>/dev/null | grep '^nos_' > disk-grubenv3.out
@@ -760,6 +799,25 @@ def run_disk(tmp, linux, key, want):
     check("the root is 10G unless told, and a disk with no room for it is refused before anything is written",
           "size: installed" not in out and "no room for a root of 10240 MiB" in linux.read("refuse-size.out") and
           "size: the disk is as it was" in out, linux.read("refuse-size.out"))
+    check("the one-line installer refuses an image its release's SHA256SUMS does not have, before anything is "
+          "written", "sum: installed" not in out and "is not the release's" in linux.read("refuse-sum.out") and
+          "sum: the disk is as it was" in out, linux.read("refuse-sum.out"))
+    check("with no arguments and no terminal, it says the dialog needs one, and fetches nothing",
+          "noterm: ran" not in out and "the dialog needs a terminal" in linux.read("script-noterm.out") and
+          "fetching" not in linux.read("script-noterm.out"), linux.read("script-noterm.out"))
+    check("the image carries the dialog, nos-setup as the tree has it",
+          linux.read("img-setup.sum").strip() == digest_of(os.path.join(ROOT, "scripts", "installer", "nos-setup")),
+          linux.read("img-setup.sum"))
+    check("run from the image on a Linux not the ISO's with no terminal, it says so and does nothing",
+          "setup noterm: ran" not in out and "the dialog needs a terminal" in linux.read("setup-noterm.out"),
+          linux.read("setup-noterm.out"))
+    disk_out = linux.read("disk.out")
+    check("the one-line installer fetches the image and its sums from the release, checks them, mounts it and "
+          "runs its nos-install -- the install below is its",
+          "nos: fetching file://" in disk_out and (", sha256 %s" % digest_of(os.path.join(tmp, "image.squashfs")))
+          in disk_out and "a GPT of nos's own" in disk_out, disk_out)
+    check("and leaves nothing behind: no image in /tmp, nothing mounted",
+          "script: left in /tmp" not in out and "script: left mounted" not in out, out)
     layout = linux.read("layout.out")
     check("its table: GPT -- BIOS boot from 1 MiB, EFI System, the root of the size asked for, nos-data to the end",
           "label: gpt" in layout and layout_ok(gpt_layout(layout), 1024, WHOLE_SIZE), layout)
@@ -846,6 +904,10 @@ def run_disk(tmp, linux, key, want):
     env3 = linux.read("disk-grubenv3.out")
     check("update --network-here takes the address, gateway and DNS server this Linux has",
           len(here) == 1 and here[0][len("here: "):] in env3 and " dns=" in env3, here + [env3])
+    network = linux.read("disk-network.out")
+    check("network says the same, as the dialog offers it",
+          len(here) == 1 and ("\n" + here[0][len("here: "):] + " dns=") in "\n" + network and
+          ("nos_cmdline=" + network.strip().splitlines()[-1]) in env3, network + env3)
     check("uninstall has nothing to take out", "uninstall: done" not in out, linux.read("disk-uninstall.out"))
     check("an install over its root is refused: update is what renews it",
           "install over it: done" not in out and "nos-install update" in linux.read("disk-install.out"),
@@ -853,9 +915,30 @@ def run_disk(tmp, linux, key, want):
     check("e2fsck finds the root clean after the update", "fsck6: clean" in out, out)
 
 
+def digest_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def release_dirs(tmp):
+    """What the one-line installer fetches, as a release has it: the image and
+    SHA256SUMS -- and a release whose sums are another image's."""
+    image = os.path.join(tmp, "image.squashfs")
+    for name, digest in (("release", digest_of(image)), ("release-bad", "0" * 64)):
+        os.makedirs(os.path.join(tmp, name))
+        shutil.copy(image, os.path.join(tmp, name, "nos-x86_64.squashfs"))
+        with open(os.path.join(tmp, name, "SHA256SUMS"), "w") as f:
+            f.write("%s  install.sh\n%s  nos-x86_64.squashfs\n" % ("1" * 64, digest))
+    shutil.copy(os.path.join(ROOT, "scripts", "installer", "install.sh"), os.path.join(tmp, "install.sh"))
+
+
 def run(tmp, image):
     linux = Linux(tmp)
     shutil.copy(image, os.path.join(tmp, "image.squashfs"))
+    release_dirs(tmp)
     key = os.path.join(tmp, "id_test")
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "image-test", "-f", key], check=True)
 
