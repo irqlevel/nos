@@ -59,6 +59,9 @@ pub extern "C" fn rust_init() {
     r8168::init();
     r8125::init();
     igb::init();
+    /* After igb: its names are still its own count's (`eth{idx}`), and
+       this driver asks the device table for the lowest free one. */
+    e1000e::init();
     #[cfg(target_arch = "x86_64")]
     {
         tco_init();
@@ -168,4 +171,5 @@ pub extern "C" fn rust_fini() {
     r8168::shutdown();
     r8125::shutdown();
     igb::shutdown();
+    e1000e::shutdown();
 }
