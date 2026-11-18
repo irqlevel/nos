@@ -1,242 +1,187 @@
 ---
 title: "Install nos on a dedicated server"
-description: "Install the nos system image on a spare partition of a Linux server, boot it once through the server's own GRUB, and log in over SSH."
+description: "Put nos on a whole disk of a dedicated server with one command in the provider's rescue system or from the installer ISO, or next to the server's Linux on a spare partition, and log in over SSH."
 order: 5
-updated: 2026-10-25
+updated: 2026-11-18
 ---
 
-By the end of this guide, a bare-metal x86-64 server runs nos from its own partition. The kernel and all the modules come from a release's system image, the server's own GRUB boots them, and nos's SSH server lets you in with the key you gave it. The server's Linux stays installed and remains the default. nos boots once when you ask for it, and the boot after that is Linux again.
+There are two ways to put nos on a bare-metal x86-64 server.
 
-You need:
+- **A whole disk of its own.** nos takes one disk: a GPT, GRUB for both BIOS and UEFI, a root of 10 GiB unless you choose another size, and the rest of the disk left empty for virtual machines and storage. You install it with one command in your provider's rescue system, or from the installer ISO. This is the quick way.
+- **A partition next to the server's Linux.** The server's Linux stays installed and stays the default. nos boots once when you ask for it, and the boot after that is Linux again. This is the careful way to try nos on a machine you also need for something else.
 
-- an x86-64 server running Linux with GRUB 2, root access to it, and hardware that nos has drivers for (see [Check the server first](#check-the-server-first));
-- a spare plain partition on it, at least 64 MiB;
-- an `ssh-ed25519` key, because nos's sshd accepts no other type;
-- a way to reset the server from outside, such as your hosting provider's reset button or API, in case nos does not come up.
-
-We run nos this way on the project's own Hetzner servers: from its own partition, next to the server's Linux, booted once at a time. The full reference is [Install: nos on a server](/docs/install).
-
-## How it stays safe
-
-The install is designed so that a failed nos costs you a reset, not the server:
-
-- **nos gets its own partition.** The partition holds an ext2 filesystem that nos mounts as its root. On the server's Linux, `nos-install` adds a single file, `/etc/grub.d/42_nos`, and regenerates `grub.cfg`. It touches nothing else.
-- **The server's default boot entry does not change.** A flag, `nos_next=nos`, arms a boot of nos, that is, schedules it for the next start. The flag lives in a GRUB environment block on nos's partition, a small file of variables that GRUB can read and write. GRUB reads the flag, boots nos once, and **clears the flag before it loads anything**. The server's own first entry stays the fallback.
-- **`reboot` inside nos goes back to Linux**, because the flag is already gone.
-- **If nos never comes up, one reset brings Linux back.** A panic, a hang or a kernel that GRUB cannot load leaves nothing to undo.
-- **If nos panics, it resets itself.** The image's GRUB entries pass `panic=10`, so the machine resets ten seconds after the panic report. After a one-shot boot, that reset brings up Linux.
+Either way, nos's SSH server lets you in with your key. The full reference is [Install: nos on a server](/docs/install).
 
 ## Check the server first
 
-nos runs only on hardware it has drivers for, and on a server the network is the only console. `nos-install` checks each item below and tells you what it found. It refuses an unsuitable partition and warns about the rest, but it cannot fix any of them.
+nos runs only on hardware it has drivers for, and on most servers the network is the only console. The installers check each item below and tell you what they found.
 
 | You need | Why |
 |---|---|
-| An NVMe or virtio disk for nos's partition (virtio-scsi also works) | These are the only disks nos can read. On a SATA disk or behind a RAID controller, GRUB still loads the kernel through the firmware, but nos then finds no root filesystem. That means no modules, no `/etc/rc` and no sshd. |
-| A network card that nos has a driver for: Realtek RTL8168 or RTL8125, Intel 82576, I210 or I211 (the `igb` driver), or virtio-net | With any other card, nos boots, but nobody can reach it. |
-| DHCP on that network | nos has no static IP configuration. |
-| A plain partition of at least 64 MiB (256 MiB is comfortable; guests' disks need more: a VM made from a cloud image takes one to two GiB to begin with) | It can't be a member of an md RAID, an LVM volume or encrypted, because nos reads none of those. A server whose disks are mirrored end to end has no such partition. Leave room for one when you install the server (Hetzner's `installimage` takes a partition list), or create one from free space. |
-| Linux that boots with GRUB 2, under BIOS or UEFI, with **Secure Boot off** | nos is a Multiboot2 kernel. With Secure Boot on, GRUB runs locked down and refuses to load such a kernel. |
-| e2fsprogs, util-linux, GRUB's tools (`grub-editenv`, plus `update-grub` or `grub-mkconfig`), and squashfs support in the kernel or `unsquashfs` | `nos-install` runs these. Stock Ubuntu and Debian have them all. |
+| A disk nos reads: NVMe, virtio (virtio-scsi too), or SATA with the controller in AHCI or IDE mode | Behind a RAID controller or on USB, GRUB still loads the kernel through the firmware, but nos then finds no root filesystem. That means no modules, no `/etc/rc` and no sshd. A whole disk is refused there; a partition gets a warning. |
+| A network card nos drives: Realtek RTL8168 or RTL8125, Intel 82576, I210, I211 or I350 (the `igb` driver), Intel 82574L (the `e1000e` driver), or virtio-net | With any other card, nos boots, but nobody can reach it. nos puts its address on the first of these cards in PCI order, so the cable should be in that port. |
+| An address: DHCP, or a static one | nos asks for an address by DHCP, or takes a static one as the kernel parameters `ip=`, `gw=` and `dns=`. Many dedicated servers have no DHCP; the installers offer the address the server already has. |
+| Secure Boot off | nos is a Multiboot2 kernel. With Secure Boot on, GRUB runs locked down and refuses to load it. |
+| An `ssh-ed25519` key | nos's sshd accepts no other key type. |
 
-## Get the system image
+## A whole disk, from the rescue system
 
-What you install is the **system image**, `nos-x86_64.squashfs`. Every release tag builds one. Download it on the server and check it:
+Boot the server into your provider's rescue system: a Linux started from the network, with the server's disks left alone. Log in over SSH as root and run:
+
+```sh
+curl -fsSL https://nos-os.tech/install.sh | sh
+```
+
+The script downloads the system image of the newest release, checks it against the release's `SHA256SUMS`, mounts it and starts the installer's dialog. The dialog asks:
+
+1. **Which disk.** You see every disk with its model, serial number and size, what it holds, and whether nos can read it. Everything on the disk you choose is erased.
+2. **How big the root is.** 10G unless you change it. The rest of the disk becomes an empty partition, `nos-data`, for virtual machines' disks and NBS.
+3. **The network.** It offers the rescue system's own address, gateway and DNS server, which on a dedicated server are the server's. You can also take what a Linux already on the disks had, type a static address, or choose DHCP.
+4. **The SSH keys.** The keys root logs into the rescue system with, a pasted key, a URL, or a GitHub user's keys.
+
+Then it shows what it will write and asks you to type the disk's name before it writes anything. Under UEFI it puts nos first in the firmware's boot order, right after the network boot entries, so the provider's rescue system keeps working. If the provider's panel still has the server booting into rescue, switch that back, then reboot. About a minute later:
+
+```sh
+ssh -o UserKnownHostsFile=~/.ssh/known_hosts.nos root@<server> version
+```
+
+It prints nos's version. nos has a host key of its own, which is why the command keeps it in a separate known-hosts file.
+
+### Without the dialog
+
+Put the installer's arguments after `sh -s --`:
+
+```sh
+curl -fsSL https://nos-os.tech/install.sh | sh -s -- disk /dev/sdb --wipe --network-here --ssh-key /root/.ssh/authorized_keys
+```
+
+`--network-here` gives nos the rescue system's address, gateway and DNS server. `--wipe` is required when the disk holds anything. `--root-size 20G` changes the root's size, and `--dry-run` shows what would be written without writing it. On a server with several disks, name the disk by its `/dev/disk/by-id/` path, so that the one erased is the one you meant.
+
+The same command updates nos on that disk later, keeping its keys, host key and settings:
+
+```sh
+curl -fsSL https://nos-os.tech/install.sh | sh -s -- update
+```
+
+### By hand
+
+If you would rather not pipe a script into a shell, this is what it does:
 
 ```sh
 wget https://github.com/irqlevel/nos/releases/latest/download/nos-x86_64.squashfs
 wget https://github.com/irqlevel/nos/releases/latest/download/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
+mount -o loop,ro nos-x86_64.squashfs /mnt
+/mnt/nos-setup
+umount /mnt
 ```
 
-What is inside:
+`/mnt/nos-setup` is the dialog. `/mnt/nos-install disk ...` with the arguments above does the same without it.
 
-| Path | What |
+## A whole disk, from the installer ISO
+
+Many providers install dedicated servers from an ISO. Download [nos-installer-x86_64.iso](https://github.com/irqlevel/nos/releases/latest/download/nos-installer-x86_64.iso), mount it as virtual media through the server's IPMI, iDRAC or iLO, or give that link to the provider's install-from-ISO, and boot the server from it. Its menu:
+
+| Entry | What it does |
 |---|---|
-| `/boot/kernel64.elf` | the kernel |
-| `/boot/grub/nos.cfg` | the kernel's GRUB entries, `nos` and `nos (next)`, with the command line the kernel was built to read |
-| `/lib/modules/*.ko` | every module built together with that kernel, so each of them loads into it |
-| `/etc/rc` | the default boot script: `insmod /lib/modules/sshd.ko`, then `sshd start` |
-| `/nos-install` | the installer that matches this image |
-| `/VERSION` | `version=`, `revision=`, `arch=`, `module_abi=` |
+| Install nos | the dialog on the screen |
+| Install nos on ttyS0 or ttyS1 | the dialog on a serial port; IPMI Serial over LAN is often ttyS1 |
+| Try nos | boots nos straight from the ISO and writes nothing; the screen shows which disks and network cards nos found |
 
-Nothing in the image is tied to a particular machine: it has no host key, no authorized key and no address. File owners, timestamps and modes are fixed, so a build produces the same bytes every time, and the image's sha256 identifies its content.
+The dialog is the same as in the rescue system. When it is done, take the ISO out of the virtual media and reboot.
 
-You can also build the image yourself. Run `make image` on Linux with the toolchain installed, or `scripts/build-image.sh` anywhere Docker runs (`--clean` builds everything from scratch, as a release does). Either way, `nos-x86_64.squashfs` ends up at the top of the tree. See [Build nos](/howto/build).
+Some providers run the ISO in a virtual machine on top of the server's disks; Selectel's install-from-image does. The installer notices and says so. Such a virtual machine can see neither the server's network nor its firmware, so the installer offers the address a Linux already on the disks had, and at the end asks you to set the server's boot order from the provider's rescue system. This command does it:
 
-## Install it on a partition
+```sh
+curl -fsSL https://nos-os.tech/install.sh | sh -s -- boot --default
+```
 
-As root on the server, mount the image and run the `nos-install` that comes inside it. Replace `/dev/nvme0n1p4` with your spare partition:
+## Next to Linux, on a spare partition
+
+This way, nos needs a plain partition of at least 64 MiB (256 MiB is comfortable; a VM made from a cloud image takes one to two GiB to begin with). It can't be a member of an md RAID, an LVM volume or encrypted, because nos reads none of those. The server's Linux must boot with GRUB 2 and have e2fsprogs, util-linux, GRUB's tools (`grub-editenv`, plus `update-grub` or `grub-mkconfig`) and squashfs support. Stock Ubuntu and Debian have them all.
+
+### How it stays safe
+
+The install is designed so that a failed nos costs you a reset, not the server:
+
+- **nos gets its own partition.** It holds an ext4 filesystem that nos mounts as its root. On the server's Linux, `nos-install` adds a single file, `/etc/grub.d/42_nos`, and regenerates `grub.cfg`. It touches nothing else.
+- **The server's default boot entry does not change.** A flag, `nos_next=nos`, schedules one boot of nos. GRUB reads it, boots nos once, and **clears the flag before it loads anything**, so the server's own first entry stays the fallback.
+- **`reboot` inside nos goes back to Linux**, and if nos never comes up, one reset brings Linux back.
+- **If nos panics, it resets itself** ten seconds after the panic report (`panic=10`), and that reset brings up Linux.
+
+### Install and boot it once
+
+Download and check the image as in [By hand](#by-hand), then, as root, with your spare partition in place of `/dev/nvme0n1p4`:
 
 ```sh
 mount -o loop,ro nos-x86_64.squashfs /mnt
 /mnt/nos-install install /dev/nvme0n1p4 --ssh-key /root/.ssh/authorized_keys
-umount /mnt
+/mnt/nos-install boot --reboot
 ```
 
-`--ssh-key` takes a `.pub` file, an `authorized_keys` file or a key line, and you can give it more than once. If you pass the server's own `/root/.ssh/authorized_keys`, the keys that already log into Linux will log into nos too. From a file, `nos-install` takes the `ssh-ed25519` lines and tells you which lines it skipped: keys of other types, and lines with options in front of the key. It refuses a key line of another type given on its own, and a file with no `ssh-ed25519` key in it. The option itself is optional. But without a key, sshd lets nobody in, and if the UDP shell is off as well, there is no way into a booted nos at all.
+`--ssh-key` takes a `.pub` file, an `authorized_keys` file or a key line, and can be given more than once. From a file, `nos-install` takes the `ssh-ed25519` lines and tells you which lines it skipped. Without a key, sshd lets nobody in.
 
-`install` goes through these steps and stops at the first problem:
-
-1. **Checks the image and the partition.** The image must contain its `/VERSION`, kernel and modules, and must be built for this machine's architecture. The partition must be a block device. It must not be a whole disk with partitions on it, must not be held by md, LVM or the device mapper, and must not be one of the running system's filesystems. `install` warns if the disk is not NVMe or virtio, if there is no network card that nos has a driver for, and if Secure Boot is on.
-2. **Prepares the filesystem.** On an empty partition, it creates an ext2 filesystem labelled `nos`, in the format that nos writes. If the partition already has an ext2 filesystem that nos can write, everything on it is kept. Anything else is refused, unless you pass `--format`, which creates a new filesystem and erases what was there.
-3. **Copies the system in.** It mounts the partition and puts the kernel, the modules, `nos.cfg` and `/VERSION` there. If the partition already had a kernel, modules and `/VERSION`, the old ones move to `.prev` together, so that a later `rollback` can bring them back. `/etc` belongs to the machine: the image's `/etc/rc` is copied only if there is none yet, and your keys are added to `/etc/ssh/authorized_keys`. On an Intel CPU, if the server has a microcode file for it in `/lib/firmware/intel-ucode`, that file goes to `/boot/ucode`, and GRUB loads it alongside the kernel. Without such a file (an AMD CPU, or no `intel-microcode` package), nos runs with the microcode that the firmware loaded.
-4. **Writes `/grubenv` on the partition.** This file holds the kernel parameters for this machine and the one-shot flag. `e2fsck` checks the filesystem before and after the write.
-5. **Adds the GRUB entry.** It writes `/etc/grub.d/42_nos`, which finds the partition by its UUID. Then it runs `update-grub` (or `grub-mkconfig`) and checks that `grub.cfg` now contains the new entry.
+`install` checks the image and the partition, makes an ext4 filesystem on an empty partition (one with an ext4 or ext2 nos can write keeps everything on it, anything else is refused unless you pass `--format`), copies in the kernel, the modules and the rest of the system, adds your keys, and adds the GRUB entry. It stops at the first problem. `boot --reboot` arms the one-shot boot and reboots. About a minute later, log in as in the rescue section above.
 
 Options of `install` and `update`:
 
 | Option | What it does |
 |---|---|
 | `--ssh-key KEY` | Adds a key that sshd lets in. |
-| `--udpshell[=PORT]` | Turns on the UDP shell, on port 9000 or on PORT. **It stays off unless you pass this**, because the UDP shell runs any command for anyone who can send the machine a datagram ([UDP shell](/docs/udp-shell)). |
-| `--netconsole IP:PORT` | Sends the kernel log over UDP to IP:PORT ([Netconsole](/docs/netconsole)). This is the only way to see a boot that dies after the network is up. |
-| `--cmdline "ARGS"` | Adds kernel parameters ([Kernel parameters](/docs/kernel-parameters)). |
+| `--network-here` | Gives nos the address, gateway and DNS server this Linux has, for a network with no DHCP. |
+| `--cmdline "ARGS"` | Adds kernel parameters, such as `ip=203.0.113.5/24 gw=203.0.113.1 dns=203.0.113.1` ([Kernel parameters](/docs/kernel-parameters)). |
+| `--netconsole IP:PORT` | Sends the kernel log over UDP to IP:PORT ([Netconsole](/docs/netconsole)), the only way to see a boot that dies after the network is up. |
+| `--udpshell[=PORT]` | Turns on the UDP shell. **It stays off unless you pass this**, because it runs any command for anyone who can send the machine a datagram ([UDP shell](/docs/udp-shell)). |
 | `--format` | Creates a new filesystem on the partition, even over an existing one. |
-| `--boot-once`, `--reboot` | Arms one boot of nos for the next start. `--reboot` also reboots right away. |
-| `--image FILE` | Names the image, for when the `nos-install` you run is not the one inside it. |
+| `--boot-once`, `--reboot` | Arms one boot of nos for the next start; `--reboot` also reboots right away. |
 
-## Boot nos once
+### Or deploy from your workstation
 
-Arm one boot of nos and reboot the server:
-
-```sh
-mount -o loop,ro nos-x86_64.squashfs /mnt
-/mnt/nos-install boot --reboot
-```
-
-Instead of running `boot`, you can also pass `--reboot` to `install` or `update`.
-
-`boot` sets `nos_next=nos` in the partition's `/grubenv`. At the next boot, GRUB reads the flag through `42_nos`. It makes the `nos` entry the default for this one boot, keeps the server's first entry as the fallback, and clears the flag before it loads anything.
-
-The kernel command line is `root=UUID=<partition-uuid> dhcp=auto dns=on panic=10`, with the UUID of nos's partition, plus whatever this machine was given with `--udpshell`, `--netconsole` and `--cmdline`. nos mounts the partition read-write as its root, gets an address over DHCP and runs `/etc/rc`. The image's `/etc/rc` loads sshd and starts it. On the first boot, sshd generates a host key from the kernel's entropy pool and saves it in `/etc/ssh/ssh_host_ed25519_key` for all later boots. It lets in the keys listed in `/etc/ssh/authorized_keys`.
-
-About a minute after the reboot, run this from your workstation:
-
-```sh
-ssh -o UserKnownHostsFile=~/.ssh/known_hosts.nos root@<server> version
-```
-
-It prints `nos <version> (<revision>)`. The command uses a separate known-hosts file because nos has its own host key. Your `known_hosts` already holds a different key for that address, the Linux one. If you want one host key for both systems, copy Linux's `/etc/ssh/ssh_host_ed25519_key` to the same path on nos's partition before the first boot. nos's sshd reads OpenSSH's key format.
-
-When you are done, run `reboot` in nos to take the server back to its Linux.
-
-## Or deploy from your workstation
-
-`scripts/nos-deploy.py` does all of the above from the machine that has the image. It logs into the server's Linux as root over SSH:
+`scripts/nos-deploy.py` does all of the above from the machine that has the image, over SSH to the server's Linux as root:
 
 ```sh
 scripts/nos-deploy.py root@<server> install /dev/nvme0n1p4 --ssh-key ~/.ssh/id_ed25519.pub
 scripts/nos-deploy.py root@<server>
 ```
 
-The first command installs nos. The second has no command, which means `update`; that is what you run every time after. The script:
+The first command installs nos. The second, with no command, runs `update`; that is what you run every time after. The script copies the image over, checks its sha256 there, installs it with `--boot-once`, reboots the server, waits until nos's own sshd answers on port 22, and checks that the running kernel is the image's.
 
-1. copies the image to the server, checks its sha256 there and mounts it;
-2. runs the `nos-install` inside the image with `--boot-once`, then reboots the server;
-3. waits until nos's own sshd answers on port 22 with the banner `SSH-2.0-nos_sshd`, where OpenSSH answered before;
-4. logs in and checks that the running kernel is the one from the image.
+### Status, update, rollback, uninstall
 
-Its options:
+All of these run from the mounted image on the server's Linux:
 
-| Option | What it does |
-|---|---|
-| `--image FILE` | Uses that image instead of the default, `nos-x86_64.squashfs` at the top of the tree (built by `make image` or `scripts/build-image.sh`). |
-| `--no-boot` | Installs the image on the server, but does not reboot into it. |
-| `--wait SECONDS` | How long nos has to come up (600 by default). |
-| `--ssh-key`, `--udpshell[=PORT]`, `--netconsole IP:PORT`, `--cmdline ARGS`, `--format` | Passed through to `nos-install`. |
+- `/mnt/nos-install status` shows the partition, what is installed and what was before, the kernel parameters, whether a boot is armed, the number of SSH keys, and the microcode.
+- `/mnt/nos-install update --reboot` installs a newer image. The old kernel, modules and `/VERSION` move to `.prev` together; `/etc` (the keys, the host key, `rc`) and the kernel parameters stay, unless you pass new ones.
+- `/mnt/nos-install rollback` swaps the current system with the `.prev` one.
+- `/mnt/nos-install uninstall` takes nos out of GRUB's menu and leaves the partition alone.
 
-## Check what is installed
+To stay in nos across reboots, set `GRUB_DEFAULT=nos` in `/etc/default/grub` and run `update-grub`.
 
-Run `status` from the mounted image. It takes no options:
+> Once nos is the default, every reset boots nos again, even a nos that never comes up. Then the only way out is your hosting provider's rescue system.
 
-```sh
-mount -o loop,ro nos-x86_64.squashfs /mnt
-/mnt/nos-install status
-```
-
-It shows the GRUB entry and the partition, what is installed now and what was installed before, the kernel parameters, whether a boot is armed, how many SSH keys there are, and the microcode revision. On an AMD server right after the first install, the output looks like this:
-
-```text
-GRUB entry:  /etc/grub.d/42_nos, UUID <uuid>
-partition:   /dev/nvme0n1p4
-installed:   nos <version> (<revision>)
-previous:    none
-parameters:  none
-next boot:   this machine's default
-ssh keys:    1
-microcode:   none; nos runs firmware's
-```
-
-## Update, roll back, uninstall
-
-To install a newer image over the current one, download it as in [Get the system image](#get-the-system-image), then run:
-
-```sh
-mount -o loop,ro nos-x86_64.squashfs /mnt
-/mnt/nos-install update --reboot
-```
-
-`update` finds the partition through `42_nos`, so you don't need to name it again. It copies in the new kernel, modules and `nos.cfg`. The old kernel, modules and `/VERSION` move to `.prev` together, and the microcode is copied again from the server's `/lib/firmware`. `/etc` (`rc`, the keys, the host key) and everything else on the partition stay as they are. The kernel parameters stay too, unless you pass `--udpshell`, `--netconsole` or `--cmdline`. Any of those replaces all the parameters, and `--cmdline ""` clears them.
-
-A kernel and its modules are always replaced together, because a kernel refuses a module built against a different kernel interface. `/lib/modules` belongs to the image, so keep your own modules somewhere else.
-
-Two more commands, also run from the mounted image:
-
-- `/mnt/nos-install rollback` swaps the current kernel, modules and `/VERSION` with the `.prev` ones.
-- `/mnt/nos-install uninstall` deletes `42_nos` and regenerates GRUB's configuration, which takes nos out of the menu. It leaves the partition alone.
-
-### Try a kernel from inside nos
-
-From a running nos, you can try a kernel from a release before it replaces the installed one. Run this in nos's shell:
-
-```sh
-wget https://github.com/irqlevel/nos/releases/download/<tag>/kernel-x86_64.elf /boot/kernel64.elf.next
-sha256 /boot/kernel64.elf.next
-grubenv /grubenv nos_next=nos-next
-reboot
-```
-
-Compare what `sha256` prints with the release's `SHA256SUMS`. After the reboot, the `nos (next)` entry boots once. It brings no modules of its own. The ones in `/lib/modules` belong to the running kernel, and the new kernel refuses them if their kernel interface differs. A whole image is updated from Linux.
-
-## Get back to Linux
+### Get back to Linux
 
 - **From a running nos:** run `reboot`. The one-shot flag is gone, so GRUB boots the server's default.
 - **If nos hangs or never answers:** reset the server from outside. GRUB cleared the flag before it loaded nos, so Linux comes up.
 - **After a panic:** wait. `panic=10` resets the machine ten seconds after the report.
-- **To take nos out of the menu:** run `nos-install uninstall` from Linux, as above.
-
-If you want to stay in nos across reboots, make it the server's default: set `GRUB_DEFAULT=nos` in `/etc/default/grub` and run `update-grub`.
-
-> Once nos is the default, every reset boots nos again, even a nos that never comes up. Then the only way out is your hosting provider's rescue system.
 
 ## Troubleshooting
 
-**`nos-deploy: <server> came back with <banner>, not nos -- GRUB did not boot it`.** The server came back to Linux instead of nos. Check that Secure Boot is off. Also look for an entry of the server's own with the id `nos` or `nos-next`, such as a hand-written one in `/etc/grub.d/40_custom`. Such an entry comes first in `grub.cfg`, so it is the one GRUB boots. `nos-install` warns when it finds one.
+**No answer on port 22.** nos either died or came up but can't be reached. Reinstall with `--netconsole IP:PORT` pointing at a machine you control and run `python3 scripts/netconsole.py -p PORT` there: the kernel log, including any panic report, arrives over UDP ([Netconsole](/docs/netconsole)). On a network with no DHCP, check that nos was given the server's address (`status` shows the parameters), and that the cable is in the first port of a card nos drives.
 
-**`no nos on <address>:22 after 600 s`.** Either nos died, or it came up but can't be reached. Reset the server to get Linux back, then find out why:
-
-- Reinstall with `--netconsole IP:PORT` pointing at a machine you control, and run `python3 scripts/netconsole.py -p PORT` there. The kernel log, including any panic report, arrives over UDP ([Netconsole](/docs/netconsole)).
-- If the boot dies before its network is up, use `disklog=on`, which writes the kernel log to an area on a disk. That area has to be prepared with `scripts/disklog.py format` ([Kernel parameters](/docs/kernel-parameters)).
-
-**`ssh` refuses the host key or warns that it changed.** nos's host key is not the one the server's Linux uses. Use a separate known-hosts file for nos, as in [Boot nos once](#boot-nos-once), or copy the Linux host key onto the partition.
+**`ssh` refuses the host key or warns that it changed.** nos has its own host key. Use a separate known-hosts file for it, as above.
 
 **nos's sshd rejects your key.** It accepts only `ssh-ed25519` keys. Add one with `--ssh-key` on the next `update`, or with `sshd allow` from inside nos ([sshd](/docs/sshd)).
 
-**`WARNING: ... is not on an NVMe or a virtio disk`.** GRUB will load the kernel from that disk, but nos will not find its root there. That means no sshd and no way in. Put the partition on an NVMe or virtio disk.
+**`... is not on an NVMe, a virtio or a SATA disk`, or `... on a SATA controller nos does not drive`.** GRUB would load the kernel from that disk, but nos would not find its root there. Choose another disk, or switch the controller from RAID to AHCI in the firmware's setup.
 
-**`... is in use by ... (RAID, LVM, device mapper)`.** nos needs a plain partition. It can read none of these.
+**`... is in use by ... (RAID, LVM, device mapper)`.** nos needs a plain partition or a whole disk. It can read none of these.
 
-**`... has a <type> filesystem on it, which nos does not take`.** Pass `--format` only if you are ready to lose what is on that partition.
-
-**`/etc/rc on it runs 'insmod ...': that module is not the image's`.** After an update, a module loaded from outside `/lib/modules` comes from a different build, and the new kernel refuses it. Rebuild it against the new kernel.
-
-**`e2fsck finds ... damaged`.** Run `e2fsck -f <partition>` from Linux to repair the filesystem, then run `nos-install` again.
+**`nos-deploy: <server> came back with <banner>, not nos -- GRUB did not boot it`.** Check that Secure Boot is off, and look for an entry of the server's own with the id `nos` or `nos-next`, such as one in `/etc/grub.d/40_custom`: such an entry comes first in `grub.cfg`, so GRUB boots it instead.
 
 ## Next steps
 
 - [Connect to a running nos](/howto/connect): SSH, the UDP shell, and what you can do once you are in.
-- [Boot a Linux guest](/howto/linux-guest): on the server, the hypervisor module is already at `/lib/modules/hv.ko`.
-- [Make a VM from a cloud image](/howto/cloud-vm): `hv create <name> <url>`, with hvboot at `/lib/hvboot` in an image built from master.
-- [Write a loadable module](/howto/write-a-module), and keep your own modules outside `/lib/modules`.
+- [Boot a Linux guest](/howto/linux-guest): the hypervisor module is already at `/lib/modules/hv.ko`.
+- [Make a VM from a cloud image](/howto/cloud-vm): `hv create <name> <url>`.
 - [Install: nos on a server](/docs/install) is the full reference, and [Real hardware](/docs/real-hardware) describes the machines nos runs on.

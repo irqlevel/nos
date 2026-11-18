@@ -628,8 +628,10 @@ nos-arm64.img: $(KERNEL)
 	cp $(KERNEL) bin/kernel-arm64.elf
 
 # The system image (docs/install.md): the kernel, every module built with it,
-# hvboot, the GRUB entries that boot it, the default /etc/rc and nos-install,
-# in one read-only squashfs that nos-install pours onto a server's partition.
+# hvboot, the GRUB entries that boot it, the default /etc/rc, nos-install and
+# nos-setup -- the installer's dialog, which a provider's rescue system runs
+# from the image mounted (scripts/installer/install.sh) -- in one read-only
+# squashfs that nos-install pours onto a server's partition or a whole disk.
 # A file added to it is added to nos-install's LAYOUT too -- and to SYSTEM,
 # when an update replaces it -- or nos-install refuses the image. x86-64
 # only: what boots it is the machine's own GRUB, over Multiboot2. Owners,
@@ -661,7 +663,8 @@ image:
 	@echo "image: x86-64 only -- a server's GRUB boots it, over Multiboot2" >&2; exit 1
 endif
 
-$(IMAGE): $(KERNEL) $(MODULE_KO) $(HVBOOT) build/image/nos.cfg build/image/rc scripts/nos-install $(LICENSES)
+$(IMAGE): $(KERNEL) $(MODULE_KO) $(HVBOOT) build/image/nos.cfg build/image/rc scripts/nos-install \
+		scripts/installer/nos-setup $(LICENSES)
 	rm -rf $(IMAGE_STAGE) $@.tmp
 	mkdir -p $(IMAGE_STAGE)/boot/grub $(IMAGE_STAGE)/lib/modules $(IMAGE_STAGE)/lib/licenses $(IMAGE_STAGE)/etc
 	install -m 0644 src/crates/base/crypto/cryptogams/LICENSE $(IMAGE_STAGE)/lib/licenses/CRYPTOGAMS
@@ -672,6 +675,7 @@ $(IMAGE): $(KERNEL) $(MODULE_KO) $(HVBOOT) build/image/nos.cfg build/image/rc sc
 	install -m 0644 build/image/nos.cfg $(IMAGE_STAGE)/boot/grub/nos.cfg
 	install -m 0644 build/image/rc $(IMAGE_STAGE)/etc/rc
 	install -m 0755 scripts/nos-install $(IMAGE_STAGE)/nos-install
+	install -m 0755 scripts/installer/nos-setup $(IMAGE_STAGE)/nos-setup
 	@if [ -n '$(PANEL_BUNDLE)' ] || [ -n '$(PANEL_BUNDLE_URL)' ]; then \
 	    [ -f '$(PANEL_BUNDLE)' ] && [ -n '$(PANEL_BUNDLE_URL)' ] || \
 	        { echo "$@: PANEL_BUNDLE (a file) and PANEL_BUNDLE_URL go together" >&2; exit 1; }; \
