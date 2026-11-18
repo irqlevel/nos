@@ -1,6 +1,9 @@
 //! Files, for a module to keep its configuration in -- a host key, the keys
 //! allowed to log in -- by paths that are absolute, with nothing held open
-//! between calls; and a file held open (`File`), for a guest's disk.
+//! between calls; a file held open (`File`), for a guest's disk; and files
+//! as a person names them, copied in and out (`stat`, `File::open_with`,
+//! `make_dir`, `remove_file`, `remove_dir`: sshd's SFTP), at exactly the
+//! path given.
 
 use alloc::vec::Vec;
 use ffi::fs;
@@ -99,6 +102,29 @@ impl File {
         u64::try_from(fs::kernel_file_length(self.handle)).map_err(|_| Error::IoError)
     }
 
+    /// The regular file at exactly `path` -- never a `<path>.new` a replace
+    /// left, as `open` would take -- for reading, and as `how` says: a file
+    /// copied in or out (sshd's SFTP). NotFound when there is none and none
+    /// is to be made, or it cannot be opened so: a directory, a read-only
+    /// mount, a file there already for `exclusive`, a disk's image held.
+    pub fn open_with(path: &str, how: Open) -> Result<File> {
+        let flags = [
+            (how.write, fs::FILE_OPEN_WRITE),
+            (how.create, fs::FILE_OPEN_CREATE),
+            (how.truncate, fs::FILE_OPEN_TRUNCATE),
+            (how.exclusive, fs::FILE_OPEN_EXCLUSIVE),
+        ]
+        .iter()
+        .filter(|(on, _)| *on)
+        .fold(0, |all, (_, flag)| all | flag);
+        /* `path` is readable for its length. */
+        let handle = unsafe { fs::kernel_file_open_flags(crate::owner::here(), path.as_ptr(), path.len(), flags) };
+        if handle == 0 {
+            return Err(Error::NotFound);
+        }
+        Ok(File { handle })
+    }
+
     /// Which file this is: the same for two opens of one file, under one
     /// name or two, for as long as either is open -- what a claim on the
     /// file is keyed by. None for a handle the kernel no longer knows.
@@ -123,6 +149,19 @@ impl File {
     pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
         /* `data` is readable for its length, and the handle is looked up. */
         let put = unsafe { fs::kernel_file_pwrite(self.handle, offset, data.as_ptr(), data.len()) };
+        if usize::try_from(put) != Ok(data.len()) {
+            return Err(Error::IoError);
+        }
+        Ok(())
+    }
+
+    /// Writes `data` into the file, open for writing, at `offset` -- the
+    /// file grown to reach past it where it must, a hole between its end
+    /// and `offset`: a file copied in, a piece where its client says. A
+    /// disk's image held is refused: it never grows. Not synced.
+    pub fn write_growing(&self, offset: u64, data: &[u8]) -> Result<()> {
+        /* `data` is readable for its length, and the handle is looked up. */
+        let put = unsafe { fs::kernel_file_pwrite_grow(self.handle, offset, data.as_ptr(), data.len()) };
         if usize::try_from(put) != Ok(data.len()) {
             return Err(Error::IoError);
         }
@@ -392,6 +431,79 @@ impl ImageQueue {
     }
 }
 
+/// The longest name, and the longest path, the VFS takes, in bytes.
+pub use ffi::fs::{FILE_NAME_MAX, FILE_PATH_MAX};
+
+/// How `File::open_with` opens a file, which it reads in any case.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Open {
+    /// Written too.
+    pub write: bool,
+    /// Made, empty, when there is none.
+    pub create: bool,
+    /// Cut to nothing.
+    pub truncate: bool,
+    /// Made by this open, or refused: nothing may be at the path already --
+    /// looked at under the lock the file is made under.
+    pub exclusive: bool,
+}
+
+/// What is at a path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    File,
+    Dir,
+}
+
+/// What `stat` says of a path: what is there, and a file's size -- 0 for
+/// a directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stat {
+    pub kind: Kind,
+    pub size: u64,
+}
+
+/// What is at exactly `path` -- never a `<path>.new` a replace left, as
+/// `size` and `read` would take: NotFound when nothing is.
+pub fn stat(path: &str) -> Result<Stat> {
+    let (mut kind, mut size) = (0u32, 0u64);
+    /* `path` is readable for its length, `kind` and `size` are locals. */
+    if unsafe { fs::kernel_file_stat(path.as_ptr(), path.len(), &mut kind, &mut size) } != 0 {
+        return Err(Error::NotFound);
+    }
+    let kind = if kind == ENTRY_DIR { Kind::Dir } else { Kind::File };
+    Ok(Stat { kind, size })
+}
+
+/// Makes a directory at exactly `path`, where nothing is: Busy, and nothing
+/// made, when something is there already -- unlike `create_dir`, which is
+/// content with a directory there -- and IoError for the rest: no directory
+/// to make it in, a read-only mount, no room.
+pub fn make_dir(path: &str) -> Result<()> {
+    /* `path` is readable for its length. */
+    match unsafe { fs::kernel_dir_make(path.as_ptr(), path.len()) } {
+        fs::FILE_CREATED => Ok(()),
+        fs::FILE_THERE => Err(Error::Busy),
+        _ => Err(Error::IoError),
+    }
+}
+
+/// Removes the regular file at exactly `path`, and nothing else -- never a
+/// directory, nor a `<path>.new` beside it as `remove` would: IoError when
+/// it was not done, whether nothing was there or something kept it (open,
+/// a directory, a read-only mount); `stat` tells which.
+pub fn remove_file(path: &str) -> Result<()> {
+    /* `path` is readable for its length. */
+    if unsafe { fs::kernel_file_unlink(path.as_ptr(), path.len()) } == 0 { Ok(()) } else { Err(Error::IoError) }
+}
+
+/// Removes the empty directory at exactly `path`: IoError when it was not
+/// done -- nothing there, a file there, anything in it, a refusal.
+pub fn remove_dir(path: &str) -> Result<()> {
+    /* `path` is readable for its length. */
+    if unsafe { fs::kernel_dir_remove(path.as_ptr(), path.len()) } == 0 { Ok(()) } else { Err(Error::IoError) }
+}
+
 /// Which file an open file is (`File::identity`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FileId {
@@ -461,36 +573,39 @@ pub struct Entry {
 /// `LIST_MAX` bounds.
 pub fn list(path: &str) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
-    let mut name = [0u8; NAME_MAX];
     for index in 0..LIST_MAX {
-        let (mut kind, mut size) = (0u32, 0u64);
-        /* `name` is writable for its length, `kind` and `size` are locals. */
-        let len = unsafe {
-            fs::kernel_dir_entry(path.as_ptr(), path.len(), index, name.as_mut_ptr(), name.len(), &mut kind, &mut size)
-        };
-        if len == ENTRY_END {
-            break;
-        }
-        let len = usize::try_from(len).map_err(|_| Error::NotFound)?.min(name.len());
-        let mut entry = Vec::new();
-        entry.try_reserve_exact(len).map_err(|_| Error::NoMemory)?;
-        entry.extend_from_slice(&name[..len]);
+        let Some(entry) = dir_entry(path, index)? else { break };
         entries.try_reserve(1).map_err(|_| Error::NoMemory)?;
-        entries.push(Entry { name: entry, dir: kind == ENTRY_DIR, size });
+        entries.push(entry);
     }
-    if entries.len() == LIST_MAX {
-        /* One more look says whether that was all */
-        let (mut kind, mut size) = (0u32, 0u64);
-        /* `name` is writable for its length, `kind` and `size` are locals. */
-        let more = unsafe {
-            fs::kernel_dir_entry(path.as_ptr(), path.len(), LIST_MAX, name.as_mut_ptr(), name.len(), &mut kind,
-                                 &mut size)
-        };
-        if more != ENTRY_END {
-            return Err(Error::InvalidValue);
-        }
+    /* One more look says whether that was all */
+    if entries.len() == LIST_MAX && !matches!(dir_entry(path, LIST_MAX), Ok(None)) {
+        return Err(Error::InvalidValue);
     }
     Ok(entries)
+}
+
+/// The `index`'th entry of the directory at `path`, as `list` reads each:
+/// None past the last, NotFound when the path names no directory. For a
+/// directory read a few entries at a time -- an SFTP client's listing --
+/// with nothing held between the calls, so that one changing meanwhile may
+/// show an entry twice or not at all; and each call walks the directory to
+/// its place.
+pub fn dir_entry(path: &str, index: usize) -> Result<Option<Entry>> {
+    let mut name = [0u8; NAME_MAX];
+    let (mut kind, mut size) = (0u32, 0u64);
+    /* `name` is writable for its length, `kind` and `size` are locals. */
+    let len = unsafe {
+        fs::kernel_dir_entry(path.as_ptr(), path.len(), index, name.as_mut_ptr(), name.len(), &mut kind, &mut size)
+    };
+    if len == ENTRY_END {
+        return Ok(None);
+    }
+    let len = usize::try_from(len).map_err(|_| Error::NotFound)?.min(name.len());
+    let mut entry = Vec::new();
+    entry.try_reserve_exact(len).map_err(|_| Error::NoMemory)?;
+    entry.extend_from_slice(&name[..len]);
+    Ok(Some(Entry { name: entry, dir: kind == ENTRY_DIR, size }))
 }
 
 /// Appends `data` to the file, making it if it is missing. Not synced: a

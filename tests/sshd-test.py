@@ -5,7 +5,9 @@ aarch64 (HVF on an Apple Silicon Mac unless --tcg): boots nos-arm64.img from
 an ext4 root, loads sshd.ko over the UDP shell, and has the ssh client work
 it -- commands, a shell with a terminal and one without, 3 MiB of output
 through the client's window with rekeys in the middle, a key it has to
-refuse, sessions at once, a stop and an rmmod from inside a session -- and
+refuse, sessions at once, a stop and an rmmod from inside a session; files
+copied in and out over SFTP by OpenSSH's sftp and scp, and the copies' every
+refusal -- and
 loads edit.ko and works the editor through `ssh -t` on a pty of the test's
 own: the terminal's size reaching the command, a resize drawn again whole, a
 save, a write over a file changed meanwhile asked about, and changes kept in
@@ -15,19 +17,20 @@ the same host key, and that poweroff unloads it before the filesystems go and
 then switches the machine off with nothing panicking on the way.
 
 x86_64: boots nos.iso from an ext4 root that already carries sshd.ko, an
-authorized key and an /etc/rc that starts it, and logs in: no shell is
-touched at all.
+authorized key and an /etc/rc that starts it, logs in, and copies a file in
+and back out over SFTP: no shell is touched at all.
 
     tests/sshd-test.py [--arch aarch64|x86_64] [--tcg] [--keep]
 
-Needs ssh and ssh-keygen, scripts/mkrootfs.sh (mke2fs, or the nos-builder
-image), host ports 2222, 8000 and 9000 free, and `make` or `make
-ARCH=aarch64` done first.
+Needs ssh, ssh-keygen, sftp and scp (OpenSSH 8.7 or later, for `scp -s`),
+scripts/mkrootfs.sh (mke2fs, or the nos-builder image), host ports 2222,
+8000 and 9000 free, and `make` or `make ARCH=aarch64` done first.
 """
 
 import argparse
 import fcntl
 import functools
+import hashlib
 import http.server
 import os
 import platform
@@ -61,6 +64,9 @@ SHELL_HDR = struct.Struct("!IIHHHH")
 SHELL_LAST = 1
 
 BIG = 3 * 1024 * 1024
+# What sftp copies in and out: several of the server's messages' worth, and
+# no whole number of any of them
+SFTP_BIG = 8 * 1024 * 1024 + 12345
 # nos's uptime prints seconds: 205.613949
 NUMBER = re.compile(r"\b\d+\.\d+\b")
 
@@ -133,6 +139,126 @@ class Test:
         print("  ssh %s -> %d in %.1f s, %d bytes" % (" ".join(args) or "(shell)", p.returncode,
                                                       time.time() - start, len(p.stdout)), flush=True)
         return p.returncode, out, err
+
+    def client_options(self):
+        return ["-i", self.key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=30", "-o", "LogLevel=ERROR"]
+
+    def sftp_batch(self, commands, timeout=600):
+        """OpenSSH's sftp, running `commands` (sftp -b): its exit code, what it
+        printed and what it said went wrong. A command with `-` in front may
+        fail without ending the batch."""
+        batch = os.path.join(self.tmp, "batch")
+        with open(batch, "w") as f:
+            f.write("\n".join(commands) + "\n")
+        start = time.time()
+        try:
+            p = subprocess.run(["sftp", "-P", str(SSH_PORT)] + self.client_options() + ["-b", batch, "root@127.0.0.1"],
+                               capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            print("  sftp %s: timed out" % "; ".join(commands), flush=True)
+            return None, "", "timeout"
+        out, err = p.stdout.decode(errors="replace"), p.stderr.decode(errors="replace")
+        print("  sftp %s -> %d in %.1f s" % ("; ".join(commands), p.returncode, time.time() - start), flush=True)
+        return p.returncode, out, err
+
+    def scp(self, args, timeout=600):
+        """OpenSSH's scp over SFTP (-s: the default since OpenSSH 9.0, asked
+        for by name for the 8.7 to 8.9 that have it and still default to
+        the old protocol): its exit code and what it said went wrong."""
+        start = time.time()
+        p = subprocess.run(["scp", "-s", "-q", "-P", str(SSH_PORT)] + self.client_options() + args, capture_output=True,
+                           timeout=timeout)
+        err = p.stderr.decode(errors="replace")
+        print("  scp %s -> %d in %.1f s" % (" ".join(args), p.returncode, time.time() - start), flush=True)
+        return p.returncode, err
+
+    def sftp(self, sh):
+        """Files copied in and out over SFTP (docs/sshd.md, "Copying files"):
+        OpenSSH's sftp and scp, a file of several MiB both ways, a tree, a
+        directory listed, renamed, removed -- and what nos cannot do refused
+        by name: permissions, a name longer than the filesystem keeps, a
+        directory removed with something in it."""
+        big = os.path.join(self.tmp, "sftp-big.bin")
+        data = os.urandom(SFTP_BIG)
+        with open(big, "wb") as f:
+            f.write(data)
+        digest = hashlib.sha256(data).hexdigest()
+        back = os.path.join(self.tmp, "sftp-back.bin")
+
+        rc, out, err = self.sftp_batch(["mkdir /sftp", "cd /sftp", "put %s big.bin" % big, "ls -l", "df",
+                                        "get big.bin %s" % back, "rename big.bin moved.bin", "ls"])
+        got = hashlib.sha256(open(back, "rb").read()).hexdigest() if os.path.exists(back) else None
+        check("sftp: a file of %d bytes in and back out, the same bytes" % SFTP_BIG, rc == 0 and got == digest,
+              (err + out)[-600:])
+        check("sftp: ls -l shows it, at its size", re.search(r"-rw-r--r--.*\b%d\b.*big\.bin" % SFTP_BIG, out) is not None,
+              out[-600:])
+        check("sftp: df", re.search(r"Size\s+Used\s+Avail", out) is not None, out[-600:])
+        check("sftp: renamed", "moved.bin" in out.split("rename")[-1], out[-300:])
+        rc, out, _ = self.ssh(["ls", "/sftp"])
+        check("the kernel's shell sees it, at its size", rc == 0 and "f %d moved.bin" % SFTP_BIG in out, out)
+        out = sh.run("dmesg 20 sftp")
+        check("the session's line in the log", re.search(r"sshd: root from .*: sftp, \d+ files opened", out) is not None,
+              out)
+
+        # scp, which speaks SFTP: in, and back out
+        rc, err = self.scp([big, "root@127.0.0.1:/sftp/scp.bin"])
+        check("scp in", rc == 0, err)
+        os.remove(back)
+        rc, err = self.scp(["root@127.0.0.1:/sftp/scp.bin", back])
+        got = hashlib.sha256(open(back, "rb").read()).hexdigest() if os.path.exists(back) else None
+        check("scp back out, the same bytes", rc == 0 and got == digest, err)
+
+        # A tree, both ways: scp -r makes the directories and copies each file
+        tree = os.path.join(self.tmp, "tree")
+        os.makedirs(os.path.join(tree, "sub", "deeper"))
+        files = {"one.txt": b"one\n", os.path.join("sub", "two.bin"): os.urandom(70000),
+                 os.path.join("sub", "deeper", "three"): b"", os.path.join("sub", "a.new"): b"beside a\n",
+                 os.path.join("sub", "a"): b"a\n"}
+        for name, content in files.items():
+            with open(os.path.join(tree, name), "wb") as f:
+                f.write(content)
+        rc, err = self.scp(["-r", tree, "root@127.0.0.1:/sftp/"])
+        check("scp -r in", rc == 0, err)
+        copy = os.path.join(self.tmp, "tree-back")
+        rc, err = self.scp(["-r", "root@127.0.0.1:/sftp/tree", copy])
+        same = rc == 0 and all(os.path.exists(os.path.join(copy, n)) and open(os.path.join(copy, n), "rb").read() == c
+                               for n, c in files.items())
+        check("scp -r back out, every file the same", same, err)
+
+        # A remove takes the file named and nothing else: a.new beside it
+        # stays, as it is a file of its own (the configuration files'
+        # <path>.new is theirs)
+        rc, out, err = self.sftp_batch(["rm /sftp/tree/sub/a", "ls /sftp/tree/sub"])
+        check("sftp: rm takes the file, and a.new beside it stays", rc == 0 and "a.new" in out.split("ls")[-1] and
+              not re.search(r"(^|\s)a\s*$", out.split("ls")[-1], re.M), (err + out)[-300:])
+
+        # Refusals, each said
+        rc, out, err = self.sftp_batch(["rm /sftp/nothing-here"])
+        check("sftp: rm of nothing is refused, no such file", rc != 0 and "No such file" in err, err)
+        rc, out, err = self.sftp_batch(["rmdir /sftp/tree"])
+        check("sftp: rmdir of a directory with something in it is refused", rc != 0 and "Failure" in err, err)
+        rc, out, err = self.sftp_batch(["mkdir /sftp"])
+        check("sftp: mkdir where there is one already is refused", rc != 0 and "Failure" in err, err)
+        rc, out, err = self.sftp_batch(["chmod 600 /sftp/moved.bin"])
+        check("sftp: chmod is refused, nos keeping no permissions", rc != 0 and "unsupported" in err.lower(), err)
+        rc, out, err = self.sftp_batch(["put %s /sftp/%s" % (big, "n" * 64)])
+        check("sftp: a name of 64 bytes is refused", rc != 0, err)
+        rc, out, _ = self.ssh(["ls", "/sftp"])
+        check("and nothing of it is left behind", rc == 0 and "n" * 60 not in out, out)
+        # scp says so and goes on: OpenSSH 9.9's ends with 0, the data copied
+        rc, err = self.scp(["-p", big, "root@127.0.0.1:/sftp/kept.bin"])
+        check("scp -p: the times and the mode it would keep are refused, and scp says so",
+              "fsetstat" in err and "Operation unsupported" in err, err)
+
+        # Everything taken away again, the tree a file and a directory at a
+        # time as sftp's rm and rmdir do
+        rc, out, err = self.sftp_batch(["rm /sftp/tree/sub/deeper/three", "rmdir /sftp/tree/sub/deeper",
+                                        "rm /sftp/tree/sub/*", "rmdir /sftp/tree/sub", "rm /sftp/tree/one.txt",
+                                        "rmdir /sftp/tree", "rm /sftp/*", "rmdir /sftp"])
+        rc2, out2, _ = self.ssh(["ls", "/"])
+        check("sftp: rm and rmdir take it all away", rc == 0 and rc2 == 0 and re.search(r"\bsftp\b", out2) is None,
+              (err + out)[-400:] + out2)
 
     def ssh_background(self, args, tty=False):
         cmd = ["ssh", "-p", str(SSH_PORT), "-i", self.key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
@@ -511,6 +637,7 @@ def aarch64(t):
         fingerprint = out.split("host key ")[1].split()[0] if "host key " in out else ""
 
         t.battery(sh)
+        t.sftp(sh)
         t.probes(sh)
         t.editor(sh, slow)
 
@@ -632,6 +759,13 @@ def x86_64(t):
         check("a shell with a terminal", rc == 0 and "listening" in out, repr(out[-300:]))
         rc, out, _ = t.ssh(["dmesg", "60", "rc:"])
         check("rc's output in the kernel log", rc == 0 and "rc: /etc/rc done" in out, out)
+        data = os.urandom(300000)
+        sent, back = os.path.join(t.tmp, "sent.bin"), os.path.join(t.tmp, "back.bin")
+        with open(sent, "wb") as f:
+            f.write(data)
+        rc, out, err = t.sftp_batch(["put %s /sent.bin" % sent, "get /sent.bin %s" % back, "rm /sent.bin"])
+        check("sftp: a file in and back out, the same bytes", rc == 0 and os.path.exists(back) and
+              open(back, "rb").read() == data, (err + out)[-300:])
     finally:
         kill(p)
 

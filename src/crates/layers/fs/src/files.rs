@@ -14,7 +14,8 @@ use kcore::cmd::Output;
 use kcore::klog;
 
 use crate::paths::Path;
-use crate::vfs::{FileStat, Handle, Open, Vfs, OPEN_APPEND, OPEN_CREATE, OPEN_READ, OPEN_WRITE};
+use crate::vfs::{FileStat, Handle, Open, Vfs, OPEN_APPEND, OPEN_CREATE, OPEN_EXCLUSIVE, OPEN_READ, OPEN_TRUNCATE,
+                 OPEN_WRITE};
 use crate::vnode::Kind;
 use crate::vfs_instance;
 
@@ -473,6 +474,31 @@ pub unsafe extern "C" fn kernel_file_pwrite(file: usize, offset: u64, data: *con
     if vfs.write_within(handle, offset, unsafe { bytes(data, len) }) { len_signed } else { -1 }
 }
 
+/// Writes `len` bytes into the open file at `offset`, the file grown to
+/// reach past them where it must -- a hole between its end and `offset`,
+/// where the write starts past the end (`Vfs::pwrite`): `len`, or -1 for a
+/// word that is no open file, one not open for writing, a disk's image held
+/// (which never grows), or the filesystem refusing -- a full disk, say. What
+/// a file copied in is written with. Not synced.
+///
+/// # Safety
+/// `data` points at `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_file_pwrite_grow(file: usize, offset: u64, data: *const u8, len: usize) -> isize {
+    let (vfs, handle) = match (vfs_instance(), Handle::from_raw(file)) {
+        (Some(vfs), Some(handle)) => (vfs, handle),
+        _ => return -1,
+    };
+    if data.is_null() && len != 0 {
+        return -1;
+    }
+    let (Ok(len_signed), Ok(offset)) = (isize::try_from(len), usize::try_from(offset)) else {
+        return -1;
+    };
+
+    if vfs.pwrite(handle, offset, unsafe { bytes(data, len) }) { len_signed } else { -1 }
+}
+
 /// The open file -- open for writing -- cut or grown to `size` bytes, grown
 /// with a hole where its filesystem has them: a disk image given its disk's
 /// size before it is written (`hv convert`). 0, or -1 for a word that is no
@@ -717,6 +743,128 @@ pub unsafe extern "C" fn kernel_file_rename(
         _ => return -1,
     };
     if vfs.rename(from.as_bytes(), to.as_bytes()) { 0 } else { -1 }
+}
+
+/* ---- files as a person names them (sshd's SFTP) ----
+ *
+ * What is copied into the machine and out of it is at the path its client
+ * names, and nowhere else: none of these looks for a `<path>.new` that a cut
+ * short replace of a module's configuration left (`locate`), nor takes one
+ * away with the file -- a person's `a.new` is a file of its own. A file
+ * opened here is the handle the calls above take. */
+
+/// What is at exactly `path`: its kind into `kind` (`ENTRY_FILE`,
+/// `ENTRY_DIR`) and a file's size into `size` -- 0; or -1 when nothing is
+/// there, or the path is no path.
+///
+/// # Safety
+/// `path` points at `path_len` readable bytes; `kind` and `size` are
+/// writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_file_stat(path: *const u8, path_len: usize, kind: *mut u32, size: *mut u64) -> i32 {
+    if kind.is_null() || size.is_null() || !kind.is_aligned() || !size.is_aligned() {
+        return -1;
+    }
+    let (vfs, path) = match (vfs_instance(), unsafe { ffi_path(path, path_len) }) {
+        (Some(vfs), Some(path)) => (vfs, path),
+        _ => return -1,
+    };
+    match stat(vfs, path.as_bytes()) {
+        Some(st) => {
+            unsafe {
+                *kind = if st.kind == Kind::Dir { ENTRY_DIR } else { ENTRY_FILE };
+                *size = st.size as u64;
+            }
+            0
+        }
+        None => -1,
+    }
+}
+
+/// Opens the regular file at exactly `path` for reading, and as `flags`
+/// say (`FILE_OPEN_*`): written too, made when it is not there, cut to
+/// nothing, made by this open or refused. Its handle -- the one
+/// `kernel_file_open` gives -- or 0, also for a flag this layer does not
+/// know.
+///
+/// # Safety
+/// `path` points at `path_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_file_open_flags(owner: usize, path: *const u8, path_len: usize, flags: u32) -> usize {
+    use ffi::fs::{FILE_OPEN_CREATE, FILE_OPEN_EXCLUSIVE, FILE_OPEN_TRUNCATE, FILE_OPEN_WRITE};
+
+    if flags & !(FILE_OPEN_WRITE | FILE_OPEN_CREATE | FILE_OPEN_TRUNCATE | FILE_OPEN_EXCLUSIVE) != 0 {
+        return 0;
+    }
+    let (vfs, path) = match (vfs_instance(), unsafe { ffi_path(path, path_len) }) {
+        (Some(vfs), Some(path)) => (vfs, path),
+        _ => return 0,
+    };
+    let mut open = OPEN_READ;
+    for (flag, vfs_flag) in [(FILE_OPEN_WRITE, OPEN_WRITE), (FILE_OPEN_CREATE, OPEN_CREATE),
+                             (FILE_OPEN_TRUNCATE, OPEN_TRUNCATE), (FILE_OPEN_EXCLUSIVE, OPEN_EXCLUSIVE)] {
+        if flags & flag != 0 {
+            open |= vfs_flag;
+        }
+    }
+    Handle::into_raw(vfs.open_for(path.as_bytes(), open, kcore::owner::Owner::at(owner)))
+}
+
+/// Makes a directory at exactly `path`, where nothing is: `FILE_CREATED`;
+/// `FILE_THERE`, nothing made, when something is there already -- a
+/// directory or not, made by someone else a moment ago or long since --
+/// and `FILE_REFUSED` for the rest: no directory to make it in, a
+/// read-only mount, no room. The create itself is refused under the mount's
+/// lock when something is there, so two of these at one path cannot both
+/// say they made it.
+///
+/// # Safety
+/// `path` points at `path_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_dir_make(path: *const u8, path_len: usize) -> i32 {
+    use ffi::fs::{FILE_CREATED, FILE_REFUSED, FILE_THERE};
+
+    let (vfs, path) = match (vfs_instance(), unsafe { ffi_path(path, path_len) }) {
+        (Some(vfs), Some(path)) => (vfs, path),
+        _ => return FILE_REFUSED,
+    };
+    /* Looked at first, so that the usual case -- a client making what is
+     * there already -- does not have the create say so in the log */
+    if stat(vfs, path.as_bytes()).is_some() {
+        return FILE_THERE;
+    }
+    if vfs.create(path.as_bytes(), true) {
+        return FILE_CREATED;
+    }
+    if stat(vfs, path.as_bytes()).is_some() { FILE_THERE } else { FILE_REFUSED }
+}
+
+/// Removes the regular file at exactly `path`: 0, or -1 -- nothing there, a
+/// directory there, or a refusal (`Vfs::remove_one`).
+///
+/// # Safety
+/// `path` points at `path_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_file_unlink(path: *const u8, path_len: usize) -> i32 {
+    let (vfs, path) = match (vfs_instance(), unsafe { ffi_path(path, path_len) }) {
+        (Some(vfs), Some(path)) => (vfs, path),
+        _ => return -1,
+    };
+    if vfs.remove_one(path.as_bytes(), Kind::File) { 0 } else { -1 }
+}
+
+/// Removes the empty directory at exactly `path`: 0, or -1 -- nothing
+/// there, a file there, a directory with anything in it, or a refusal.
+///
+/// # Safety
+/// `path` points at `path_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_dir_remove(path: *const u8, path_len: usize) -> i32 {
+    let (vfs, path) = match (vfs_instance(), unsafe { ffi_path(path, path_len) }) {
+        (Some(vfs), Some(path)) => (vfs, path),
+        _ => return -1,
+    };
+    if vfs.remove_one(path.as_bytes(), Kind::Dir) { 0 } else { -1 }
 }
 
 /// What a caller outside Rust wants written: nothing, for a length of 0,
