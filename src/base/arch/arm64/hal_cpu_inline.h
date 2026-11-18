@@ -59,6 +59,16 @@ static inline __attribute__((always_inline)) u64 read_cycle_counter()
     return cnt;
 }
 
+// The counter read after every instruction before it, and before any after
+// it: an ISB on both sides (as x86-64's LFENCE pair) -- for timing a stretch
+// of work exactly, the jitter collector's walk.
+static inline __attribute__((always_inline)) u64 read_cycle_counter_serialized()
+{
+    u64 cnt;
+    asm volatile("isb; mrs %0, cntvct_el0; isb" : "=r"(cnt) :: "memory");
+    return cnt;
+}
+
 // The counter without the ISB that orders the read after every instruction
 // before it (see hal/cpu.h): a pipeline's flush, which `trace bench` times
 // against this read.

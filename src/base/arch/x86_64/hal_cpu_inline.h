@@ -105,6 +105,20 @@ static inline __attribute__((always_inline)) u64 read_cycle_counter_unordered()
     return read_cycle_counter();
 }
 
+// The counter read once every instruction before it has finished, and before
+// any after it starts: LFENCE, RDTSC, LFENCE, the SDM's own recipe (LFENCE is
+// made to serialize dispatch on AMD by setup_serializing_lfence). What timing
+// a stretch of work exactly takes -- the jitter collector's walk, which a plain
+// RDTSC, waiting on nothing the walk does, may read the end of before the walk
+// has run -- and not what a timestamp wants, to which the fences are cost for
+// nothing.
+static inline __attribute__((always_inline)) u64 read_cycle_counter_serialized()
+{
+    u32 low, high;
+    asm volatile("lfence; rdtsc; lfence" : "=a"(low), "=d"(high) :: "memory");
+    return ((u64)high << 32) | low;
+}
+
 // Halts this CPU for good, touching no memory -- no stack, no data: one
 // loop of two instructions, so that a wakeup only halts it again. HLT ends,
 // even with interrupts off, at an NMI or a machine check, whose handlers

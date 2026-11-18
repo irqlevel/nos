@@ -87,7 +87,16 @@ low bit of the duration. The buffer is on the caller's stack, its own for the
 call, so two reseeds at once share nothing; its address is put out of the
 compiler's sight first, so that the cycle-counter calls on either side of a
 walk are calls it must take to read the walk, and it cannot move the walk out
-from between them. Pairs of those bits go through von Neumann extraction:
+from between them. Nor can the CPU: the reads are serialized
+(`kcore::time::cycle_counter_serialized`: LFENCE, RDTSC, LFENCE on x86-64, an
+ISB either side of the generic timer's read on arm64), since a plain RDTSC
+waits on nothing the walk does and may be taken before it has run. That was
+not what made the ASUS RS500's Westmere refuse every draw, though: with the
+reads serialized it still does, in main2 and again once every CPU runs,
+where the same walk in a Linux process on that machine varies plenty -- a
+core held at one frequency, its walk in L1 and next to nothing interrupting
+it, is likely just that regular. The seed it keeps on its root is what seeds
+its pool. Pairs of those bits go through von Neumann extraction:
 a pair that agrees is discarded, a pair that differs contributes one bit, which
 removes whatever fixed bias the low bit has at the cost of most of the samples.
 

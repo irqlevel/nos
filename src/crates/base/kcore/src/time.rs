@@ -79,6 +79,16 @@ pub fn cycle_counter() -> u64 {
     time::kernel_read_cycle_counter()
 }
 
+/// The cycle counter read once every instruction before it has finished, and
+/// before any after it starts: what times a stretch of work exactly -- two of
+/// these around it. The plain read may be taken before the work has run
+/// (x86-64's RDTSC is not ordered), and costs less; this one is for
+/// measuring, not for stamping.
+#[inline]
+pub fn cycle_counter_serialized() -> u64 {
+    time::kernel_read_cycle_counter_serialized()
+}
+
 /// How fast the cycle counter counts, in Hz: the TSC as the kernel calibrated
 /// it on x86-64, the generic timer on arm64. None while it is not known.
 pub fn cycle_counter_hz() -> Option<u64> {
