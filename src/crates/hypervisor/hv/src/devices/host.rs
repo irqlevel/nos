@@ -44,7 +44,12 @@
 //! acknowledges its MSI so, and without it the GPU sends one interrupt and
 //! no more (QEMU's quirk, `vfio_nvidia_quirk_mirror_write`). Within them
 //! only: a write that reached the control word past them would be the
-//! guest's to the host's own MSI.
+//! guest's to the host's own MSI. Since Pascal the re-arm is a dword written
+//! at 0x704 instead (nouveau's `gp100_pci_msi_rearm`), past the 256 bytes
+//! the guest is given: that one dword goes to the real mirror alone, as
+//! VFIO lets a write there reach the device; the rest of the extended space
+//! -- its Resizable BAR, ACS and AER among it -- is nothing the guest
+//! reaches.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -160,9 +165,12 @@ const COMMAND_INTX_DISABLE: u16 = 1 << 10;
 /// 0 an endpoint's -- a bridge's is not given.
 const HEADER_MULTI: u8 = 0x80;
 const HEADER_LAYOUT: u32 = 0x7F;
-/// A memory BAR's low bits: its 64-bit type and prefetchable.
+/// A memory BAR's low bits: its 64-bit type and prefetchable; an I/O BAR's
+/// first bit; and the largest a 32-bit memory BAR is.
 const BAR_64: u32 = 0x4;
 const BAR_PREFETCH: u32 = 0x8;
+const BAR_IO: u32 = 0x1;
+const BAR32_MAX: u64 = 1 << 31;
 
 /* Capabilities (PCI 3.0, 6.7; PCIe 5.0, 7.5.3) */
 const CAP_PM: u8 = 0x01;
@@ -203,6 +211,8 @@ pub const NVIDIA_MIRROR_OLD: u32 = 0x1800;
 /// The mirror's span trapped: a page, of which the configuration space is
 /// the first 256 bytes.
 pub const MIRROR_BYTES: u32 = 0x1000;
+/// NVIDIA's MSI re-arm since Pascal, in the mirror: a dword at 0x704.
+pub const NVIDIA_MSI_REARM: u32 = 0x704;
 
 /// One function of the host's, as the guest sees it.
 pub struct HostFunction {
@@ -447,6 +457,10 @@ impl HostFunction {
         if !matches!(size, 1 | 2 | 4) {
             return (size_mask(size), None);
         }
+        if write && size == 4 && offset == NVIDIA_MSI_REARM && self.nvidia() {
+            self.real.bar0_write(mirror + offset, 4, value);
+            return (0, None);
+        }
         if at + size > CONFIG_SIZE {
             return (0, None);
         }
@@ -556,6 +570,32 @@ impl HostFunction {
         }
     }
 
+}
+
+/// A memory BAR as the module reads it with the device's decoding off:
+/// `low` its register as it was, `mask_low` what the register read back
+/// after all ones were written to it, `mask_high` the same of the next
+/// register for a 64-bit BAR, and `host` the address the registers said.
+/// None for an I/O BAR, and for one not implemented, not assigned, not
+/// aligned to its size, or of a size no BAR is -- under a page, a 32-bit one
+/// over 2 GiB, or a mask whose ones do not run down from the top. A 64-bit
+/// BAR of 4 GiB or more keeps no address bit in its low register at all:
+/// its size is in its high one alone (an RTX A2000's BAR1 is 8 GiB).
+pub fn decode_bar(low: u32, mask_low: u32, mask_high: Option<u32>, host: u64) -> Option<Bar> {
+    if low & BAR_IO != 0 {
+        return None;
+    }
+    let mask = match mask_high {
+        Some(high) => (u64::from(high) << 32) | u64::from(mask_low & !0xF),
+        None => 0xFFFF_FFFF_0000_0000 | u64::from(mask_low & !0xF),
+    };
+    let size = (!mask).wrapping_add(1);
+    let largest = if mask_high.is_some() { u64::MAX } else { BAR32_MAX };
+    let page = kcore::consts::PAGE_SIZE as u64;
+    if !size.is_power_of_two() || size < page || size > largest || host == 0 || host % size != 0 {
+        return None;
+    }
+    Some(Bar { host, size, wide: mask_high.is_some(), prefetchable: low & BAR_PREFETCH != 0 })
 }
 
 /// A BAR's type bits as its register has them: memory always (the module

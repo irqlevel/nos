@@ -24,7 +24,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::devices::host::{Bar, HostFunction, Real, MIRROR_BYTES, NVIDIA_MIRROR, VENDOR_NVIDIA};
+use crate::devices::host::{decode_bar, Bar, HostFunction, Real, MIRROR_BYTES, NVIDIA_MIRROR, NVIDIA_MSI_REARM,
+                           VENDOR_NVIDIA};
 use crate::targets::Input;
 
 const SPACE: usize = 256;
@@ -231,7 +232,9 @@ impl Real for Handle {
         let mut m = self.0.lock().unwrap();
         let msi = m.layout.msi as u32;
         let ack = NVIDIA_MIRROR + msi;
-        if msi == 0 || !matches!(size, 1 | 2 | 4) || offset < ack || offset + u32::from(size) > ack + 2 {
+        let nvidia = m.u16_at(0) == VENDOR_NVIDIA;
+        let rearm = nvidia && size == 4 && offset == NVIDIA_MIRROR + NVIDIA_MSI_REARM;
+        if !rearm && (msi == 0 || !matches!(size, 1 | 2 | 4) || offset < ack || offset + u32::from(size) > ack + 2) {
             m.broke(format!("BAR0 written {} bytes at {:#x}, not the mirror's MSI acknowledgement", size, offset));
         }
         m.bar0_writes.push((offset, size, value));
@@ -595,7 +598,7 @@ pub fn hostfn_target(r: &mut Input) {
     held(&made.model, &judge);
     let msi = f.msi();
 
-    while let Some(op) = r.op(9) {
+    while let Some(op) = r.op(10) {
         match op {
             0 | 1 => {
                 /* A register written, as the bus has the guest write it */
@@ -720,7 +723,11 @@ pub fn hostfn_target(r: &mut Input) {
                 /* NVIDIA's mirror, read or written: the configuration space's
                  * access, past its end nothing, the MSI's first two bytes
                  * acknowledged through the real one */
-                let offset = if r.u8() < 160 { register(r, &layout) as u32 } else { r.below(u64::from(MIRROR_BYTES)) as u32 };
+                let offset = match r.u8() % 8 {
+                    0..=4 => register(r, &layout) as u32,
+                    5 => NVIDIA_MSI_REARM,
+                    _ => r.below(u64::from(MIRROR_BYTES)) as u32,
+                };
                 let size = r.pick(&[4usize, 4, 2, 1, 8]);
                 let write = r.bool();
                 let value = r.value32();
@@ -735,8 +742,10 @@ pub fn hostfn_target(r: &mut Input) {
                     let got = moved.map(|m| (m.bar, m.from, m.to));
                     invariant!(got == want, "a mirror write at {:#x} moved {:?}, not {:?}", offset, got, want);
                     /* QEMU's rule: an acknowledgement is a write within the
-                     * capability's id and next pointer, and nothing past */
-                    let ack = inside && layout.msi != 0 && at >= layout.msi && at + size <= layout.msi + 2;
+                     * capability's id and next pointer, and nothing past;
+                     * and Pascal's on: a dword at 0x704 */
+                    let ack = (inside && layout.msi != 0 && at >= layout.msi && at + size <= layout.msi + 2)
+                        || (offset == NVIDIA_MSI_REARM && size == 4);
                     let now = made.model.lock().unwrap().bar0_writes.len();
                     invariant!(now == acks + usize::from(ack), "a mirror write of {} bytes at {:#x}: {} acknowledgements, \
                                                                not {}", size, offset, now - acks, usize::from(ack));
@@ -748,6 +757,7 @@ pub fn hostfn_target(r: &mut Input) {
                     invariant!(v == 0, "the mirror past the space read {:#x} at {:#x}", v, offset);
                 }
             }
+            8 => bar_decoded(r),
             _ => {
                 /* Anything at all: no panic, and no rule broken */
                 let at = r.below(300) as usize;
@@ -767,6 +777,44 @@ pub fn hostfn_target(r: &mut Input) {
     }
 }
 
+/// A BAR's registers as the module reads them -- as they were, and what
+/// all ones written read back as -- decoded (`decode_bar`), against the
+/// spec's: a BAR of `size` keeps the address bits above its size writable in
+/// both its registers, none in its low one at 4 GiB and past; given where it
+/// is a page or more, assigned and aligned, a 32-bit one 2 GiB at most. And
+/// any registers at all decode to a BAR of such a size, or to none.
+fn bar_decoded(r: &mut Input) {
+    const PAGE: u64 = 4096;
+    let wide = r.bool();
+    let size = 1u64 << (4 + r.below(if wide { 44 } else { 28 }));
+    let prefetchable = r.bool();
+    let kind = (if wide { 0x4 } else { 0 }) | (if prefetchable { 0x8 } else { 0 });
+    let host = match r.u8() % 8 {
+        0 => 0,
+        1 => r.u64(),
+        _ => r.u64() & !(size - 1) & if wide { (1 << 48) - 1 } else { 0xFFFF_FFFF },
+    };
+    let mask_low = (!((size - 1) as u32) & !0xF) | kind;
+    let mask_high = wide.then(|| !((size - 1) >> 32) as u32);
+    let low = (host as u32 & !0xF) | kind;
+    if r.u8() < 24 {
+        /* Registers no device reads back as: decoded to a BAR there could
+         * be, or to none */
+        let (noise_low, noise_high) = (r.u32(), mask_high.map(|_| r.u32()));
+        if let Some(b) = decode_bar(low, noise_low, noise_high, host) {
+            invariant!(b.size.is_power_of_two() && b.size >= PAGE && b.host != 0 && b.host % b.size == 0
+                       && (b.wide || b.size <= 1 << 31),
+                       "masks {:#x} {:?} decoded to a BAR of {:#x} at {:#x}", noise_low, noise_high, b.size, b.host);
+        }
+        return;
+    }
+    let got = decode_bar(low, mask_low, mask_high, host);
+    let want = (size >= PAGE && host != 0 && host % size == 0)
+        .then_some(Bar { host, size, wide, prefetchable });
+    invariant!(got == want, "a {} BAR of {:#x} at {:#x}, read back {:#x} {:?}: decoded {:?}, not {:?}",
+               if wide { "64-bit" } else { "32-bit" }, size, host, mask_low, mask_high, got, want);
+}
+
 /* ---- the platform target's GPU ---- */
 
 /// Where the GPU the platform target gives its guest has what: NVIDIA's,
@@ -784,7 +832,8 @@ pub fn gpu(r: &mut Input) -> Made {
     space[0x0B] = 0x03;
     let bars = [
         Some(Bar { host: 0xF000_0000, size: GPU_BAR0_SIZE, wide: false, prefetchable: false }),
-        Some(Bar { host: 0x40_0000_0000, size: 256 << 20, wide: true, prefetchable: true }),
+        Some(Bar { host: 0x40_0000_0000, size: if r.bool() { 8 << 30 } else { 256 << 20 }, wide: true,
+                   prefetchable: true }),
         None,
         Some(Bar { host: 0x41_0000_0000, size: 32 << 20, wide: true, prefetchable: true }),
         None,
