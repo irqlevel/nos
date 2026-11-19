@@ -51,8 +51,8 @@ export const docsManifest: Record<string, DocInfo> = {
         group: "start",
         title: { en: "Real hardware", ru: "Реальное железо" },
         description: {
-            en: "The Dell Latitude 5480 laptop and the Hetzner EX44 (Intel) and AX41 (AMD) servers.",
-            ru: "Ноутбук Dell Latitude 5480 и серверы Hetzner EX44 (Intel) и AX41 (AMD).",
+            en: "The machines nos runs on: a Dell laptop and six servers, two of them with two sockets, and what was different about each.",
+            ru: "Машины, на которых работает nos: ноутбук Dell и шесть серверов, два из них двухсокетные, и чем каждая отличалась.",
         },
     },
     debug: {
@@ -93,6 +93,14 @@ export const docsManifest: Record<string, DocInfo> = {
         description: {
             en: "How memory works: the early linear map, the real page tables, the page and heap allocators, MMIO, W^X and TLB shootdowns.",
             ru: "Как устроена память: начальное линейное отображение, таблицы страниц, аллокаторы страниц и кучи, MMIO, W^X и TLB shootdown.",
+        },
+    },
+    numa: {
+        group: "internals",
+        title: { en: "NUMA", ru: "NUMA" },
+        description: {
+            en: "Machines of several sockets: where the kernel learns which memory is near which CPUs, free pages kept by node, the scheduler's preference, VMs placed on a node, and what it measured on a two-socket server.",
+            ru: "Машины с несколькими сокетами: откуда ядро узнаёт, какая память ближе к каким процессорам, свободные страницы по узлам, предпочтение планировщика, ВМ на выбранном узле и замеры на двухсокетном сервере.",
         },
     },
     scheduler: {
