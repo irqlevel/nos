@@ -26,6 +26,7 @@
 #include "softirq.h"
 #include "simd.h"
 #include "irq_balance.h"
+#include "numa.h"
 #include "time.h"
 #include <arch/x86_64/tsc.h>
 
@@ -1168,6 +1169,11 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
         PANIC("Can't parse ACPI");
         break;
     }
+
+    /* The NUMA topology the SRAT and the SLIT gave, whole before the heap
+       and before a second CPU runs: read without a lock from here on */
+    Numa::get_instance().seal(CpuTable::get_instance().get_present_cpus());
+    Numa::get_instance().report();
 
     if (!mm::PageAllocatorImpl::get_instance().setup())
     {

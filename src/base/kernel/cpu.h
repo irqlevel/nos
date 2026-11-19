@@ -261,6 +261,10 @@ public:
 
     ulong get_running_cpus();
 
+    /* The CPUs the firmware named and this kernel took (insert_cpu), running
+       or not yet: a bit each, by index */
+    ulong get_present_cpus();
+
     /* Mirror of the above, readable without taking Lock. The watchdog reads
        it from every CPU's tick, and taking the table lock there would be both
        the contention the reader exists to remove and a spinlock acquired

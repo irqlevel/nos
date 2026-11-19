@@ -2,6 +2,7 @@
 
 #include <kernel/klog.h>
 #include <kernel/cpu.h>
+#include <kernel/numa.h>
 #include <mm/memory_map.h>
 #include <mm/page_table.h>
 #include <arch/x86_64/grub.h>
@@ -255,7 +256,7 @@ namespace
 
 /* What this kernel reads of ACPI: the MADT, the FADT, the HPET table, the
    WDAT, the DMAR and the MCFG (Acpi::table_ has one slot for each) */
-const char* const WANTED_TABLES[] = { "APIC", "FACP", "HPET", "WDAT", "DMAR", "MCFG" };
+const char* const WANTED_TABLES[] = { "APIC", "FACP", "HPET", "WDAT", "DMAR", "MCFG", "SRAT", "SLIT" };
 
 /* A little-endian field of `bytes` bytes (8 at most) at p, a byte at a time:
    the DMAR's and the MCFG's structures are packed, and only as aligned as
@@ -1051,6 +1052,167 @@ void Acpi::parse_mcfg()
     klog(0, "Acpi: MCFG names no ECAM window of segment 0");
 }
 
+void Acpi::parse_srat()
+{
+    u32 length = 0;
+    ACPISDTHeader* sdt_header = lookup_table("SRAT", length);
+    if (sdt_header == nullptr)
+    {
+        klog(ACPI_LL, "Acpi: no SRAT table");
+        return;
+    }
+
+    auto& numa = Numa::get_instance();
+    if (length < sizeof(ACPISDTHeader) + SRAT_BODY_BYTES)
+    {
+        klog(0, "Acpi: SRAT table too short: %lu", (ulong)length);
+        numa.refuse("the SRAT shorter than its header");
+        return;
+    }
+
+    const u8* table = reinterpret_cast<const u8*>(sdt_header);
+    const bool wide_domains = sdt_header->revision >= SRAT_WIDE_DOMAIN_REVISION;
+    ulong cpus = 0;
+    ulong ranges = 0;
+    ulong not_kept = 0;
+
+    for (size_t at = sizeof(ACPISDTHeader) + SRAT_BODY_BYTES; at < length; )
+    {
+        if (length - at < SRAT_STRUCT_HEADER_BYTES)
+        {
+            klog(0, "Acpi: SRAT: a structure cut by the table at %lu", (ulong)at);
+            numa.refuse("the SRAT cut short");
+            break;
+        }
+
+        const u8* s = table + at;
+        const u8 type = s[0];
+        const size_t s_len = s[1];
+        if (s_len < SRAT_STRUCT_HEADER_BYTES || s_len > length - at)
+        {
+            klog(0, "Acpi: SRAT: a structure of type %lu at %lu of length %lu, the table %lu long", (ulong)type,
+                (ulong)at, (ulong)s_len, (ulong)length);
+            numa.refuse("an SRAT structure of no length, or past the table");
+            break;
+        }
+        at += s_len;
+
+        if (type == SRAT_TYPE_LAPIC || type == SRAT_TYPE_X2APIC)
+        {
+            const bool x2apic = (type == SRAT_TYPE_X2APIC);
+            if (s_len < (x2apic ? SRAT_X2APIC_BYTES : SRAT_LAPIC_BYTES))
+            {
+                klog(0, "Acpi: SRAT: a CPU's entry of %lu bytes", (ulong)s_len);
+                numa.refuse("an SRAT CPU entry shorter than its fields");
+                continue;
+            }
+            const u32 flags = static_cast<u32>(read_le(s + (x2apic ? 12 : 4), 4));
+            if ((flags & SRAT_ENABLED) == 0)
+                continue;
+
+            u32 domain;
+            ulong apic_id;
+            if (x2apic)
+            {
+                domain = static_cast<u32>(read_le(s + 4, 4));
+                apic_id = static_cast<ulong>(read_le(s + 8, 4));
+            }
+            else
+            {
+                domain = s[2];
+                if (wide_domains)
+                    domain |= static_cast<u32>(read_le(s + 9, 3)) << 8;
+                apic_id = s[3];
+            }
+
+            klog(ACPI_LL, "Acpi: SRAT: CPU apic id %lu in domain %lu", apic_id, (ulong)domain);
+            if (numa.add_cpu(domain, apic_id))
+                cpus++;
+            else
+                not_kept++;
+        }
+        else if (type == SRAT_TYPE_MEMORY)
+        {
+            if (s_len < SRAT_MEMORY_BYTES)
+            {
+                klog(0, "Acpi: SRAT: a memory entry of %lu bytes", (ulong)s_len);
+                numa.refuse("an SRAT memory entry shorter than its fields");
+                continue;
+            }
+            const u32 flags = static_cast<u32>(read_le(s + 28, 4));
+            if ((flags & SRAT_ENABLED) == 0)
+                continue;
+
+            const u32 domain = static_cast<u32>(read_le(s + 2, 4));
+            const ulong base = static_cast<ulong>(read_le(s + 8, 8));
+            const ulong len = static_cast<ulong>(read_le(s + 16, 8));
+            klog(ACPI_LL, "Acpi: SRAT: memory 0x%lX, 0x%lX bytes, in domain %lu", base, len, (ulong)domain);
+            if (numa.add_memory(domain, base, len))
+                ranges++;
+            else
+                not_kept++;
+        }
+    }
+
+    klog(0, "Acpi: SRAT: %lu CPUs and %lu memory ranges in %lu proximity domains%s", cpus, ranges,
+        numa.get_domain_count(), not_kept != 0 ? ", some entries not kept" : "");
+}
+
+void Acpi::parse_slit()
+{
+    u32 length = 0;
+    ACPISDTHeader* sdt_header = lookup_table("SLIT", length);
+    if (sdt_header == nullptr)
+    {
+        klog(ACPI_LL, "Acpi: no SLIT table");
+        return;
+    }
+
+    if (length < sizeof(ACPISDTHeader) + SLIT_BODY_BYTES)
+    {
+        klog(0, "Acpi: SLIT table too short: %lu", (ulong)length);
+        return;
+    }
+
+    /* The matrix whole in the table, and a count whose square cannot wrap:
+       the table is MAX_TABLE_LENGTH long at the most */
+    const u8* table = reinterpret_cast<const u8*>(sdt_header);
+    const u64 localities = read_le(table + sizeof(ACPISDTHeader), 8);
+    const u64 room = length - sizeof(ACPISDTHeader) - SLIT_BODY_BYTES;
+    if (localities == 0 || localities > room || localities * localities > room)
+    {
+        klog(0, "Acpi: SLIT of %lu localities in %lu bytes: no distances from it", (ulong)localities,
+            (ulong)length);
+        return;
+    }
+
+    /* A domain the SRAT named that the matrix has no row for: the distances
+       are the defaults, for all of them */
+    auto& numa = Numa::get_instance();
+    const ulong domains = numa.get_domain_count();
+    for (ulong i = 0; i < domains; i++)
+    {
+        if (numa.get_domain(i) >= localities)
+        {
+            klog(0, "Acpi: SLIT of %lu localities, and domain %lu: no distances from it", (ulong)localities,
+                (ulong)numa.get_domain(i));
+            return;
+        }
+    }
+
+    const u8* matrix = table + sizeof(ACPISDTHeader) + SLIT_BODY_BYTES;
+    for (ulong i = 0; i < domains; i++)
+    {
+        for (ulong j = 0; j < domains; j++)
+        {
+            const u64 from = numa.get_domain(i);
+            const u64 to = numa.get_domain(j);
+            numa.set_distance(i, j, matrix[from * localities + to]);
+        }
+    }
+    klog(0, "Acpi: SLIT: %lu localities", (ulong)localities);
+}
+
 stdlib::Error Acpi::parse()
 {
     stdlib::Error err = parse_tables();
@@ -1123,6 +1285,10 @@ stdlib::Error Acpi::parse_tables()
 
     parse_dmar();
     parse_mcfg();
+
+    /* The SRAT before the SLIT: the distances are of the domains it named */
+    parse_srat();
+    parse_slit();
 
     return make_error(stdlib::Error::SUCCESS);
 }
