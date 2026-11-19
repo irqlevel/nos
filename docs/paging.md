@@ -136,6 +136,10 @@ one lock round trip per page instead of two of each.
 Nothing is zeroed on the way to the list: a page goes on as the firmware,
 the loader or the last boot left it, and is zeroed before anyone is handed it
 -- by the allocation, or by the zeroing tasks first ([below](#zeroed-ahead-free-pages-and-the-two-lists)).
+On a machine of several NUMA nodes the two lists are a node's, every page on
+its own node's, and an allocation takes from its CPU's node first -- the
+lists are built here as node 0's, before the firmware's tables are read, and
+spread over the nodes right after them ([NUMA](numa.md)).
 Even so, building the list touches every page twice, about 0.6 µs each, so a
 64 GiB machine spends roughly ten seconds of its boot here — hence the
 `mm: … MiB onto the free list` progress lines, one per 8 GiB, so a long boot

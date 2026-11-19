@@ -662,6 +662,13 @@ Two rules make it the one place that decides what a guest can reach:
 
 ### How much of it, and where
 
+On a machine of several NUMA nodes, every frame and every block of the huge
+pool is taken from the node of the guest's first vCPU first, the nearest
+node's when it has none ([NUMA](numa.md)): its placement sets the node
+(`Spec::placed`), and `LinuxGuest::new_on` hands it to the guest's memory
+(`GuestMemory::place_on`). `hv start` says the node, and how much of the
+memory the allocator found there (`its memory node 1's (100%)`).
+
 A Linux guest has from 64 MiB to 512 GiB (`mem=`, in MiB; `memory =` in a
 `vm.toml`), laid out as a PC's firmware lays out a machine's (`linux::Ram`):
 RAM from 0 up to 0xFE000000 at most (`linux::LOW_RAM_END`), where the
