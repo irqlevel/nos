@@ -1,9 +1,11 @@
 #!/bin/bash
-# tests/gpu-passthrough-test.py --bare-metal, on the machine with the GPU: nos
-# put on a spare disk of the machine's and booted once, to give the GPU to a
-# guest running NVIDIA's own driver -- the guest make-nvidia-root.sh made,
-# kept under <dir>/nvidia -- and to go back to the machine's own system when
-# that is done: its /etc/rc ends in a reboot, the boot is GRUB's one-shot
+# The GPU on the machine's metal (docs/real-hardware.md, Hertz), run by hand
+# on that machine from its own system, as root, once
+# tests/gpu-passthrough-test.py has made the guest there: nos put on a spare
+# disk of the machine's and booted once, to give the GPU to a guest running
+# NVIDIA's own driver -- the guest make-nvidia-root.sh made, kept under
+# <dir>/nvidia -- and to go back to the machine's own system when that is
+# done: its /etc/rc ends in a reboot, the boot is GRUB's one-shot
 # (nos-install boot), and the kernel parameters given are meant to hold
 # deadman= and the rest, so whatever becomes of nos the boot after it is the
 # machine's own.
@@ -15,6 +17,10 @@
 # refused.
 #
 #   install-bare.sh <dir> <disk by-id> <image> <pci> <guest MiB> <secs> <netconsole ip:port> <kernel args...>
+#
+# What the boot did is read off the netconsole collector (scripts/netconsole.py
+# on another host) and the disk log (scripts/disklog.py, from the machine's
+# own system once it is back): the guest's console lines are in both.
 set -eu
 D=$1
 DISK_ID=$2
@@ -80,8 +86,8 @@ used=$(du -sm $G | cut -f1)
 mke2fs -q -t ext4 -L guest -d $G $M/root/guest.img $((used * 13 / 10 + 256))M
 cp /boot/vmlinuz-$(uname -r) $M/root/vmlinuz
 cat > $M/root/etc/rc <<EOF
-# tests/gpu-passthrough-test.py --bare-metal: nos gives the GPU to a guest
-# running NVIDIA's own driver, then the machine goes back to its own system
+# tests/gpu-passthrough/install-bare.sh: nos gives the GPU to a guest running
+# NVIDIA's own driver, then the machine goes back to its own system
 insmod /lib/modules/sshd.ko
 sshd start
 insmod /lib/modules/hv.ko
