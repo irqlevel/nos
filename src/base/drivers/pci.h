@@ -27,6 +27,12 @@ public:
         u8 interrupt_line;
         u8 interrupt_pin;
         bool valid;
+        /* Named by guestpci=: kept for guests, shown to no driver of the
+           host's (kernel_pci_get_device, kernel_pci_find_device) */
+        bool kept;
+        /* A driver of the host's has taken it (take): a guest is given it
+           no more. An atomic: set by a driver's probe, read by hv's. */
+        bool driven;
     };
 
     void dump(stdlib::Printer& printer);
@@ -51,7 +57,18 @@ public:
     u32 get_bar(u16 bus, u16 slot, u16 func, u8 bar);
     u8 get_interrupt_line(u16 bus, u16 slot, u16 func);
     u8 get_interrupt_pin(u16 bus, u16 slot, u16 func);
+    /* Bus mastering on, for a driver of the host's: the function taken
+       too (take) */
     void enable_bus_mastering(u16 bus, u16 slot, u16 func);
+
+    /* The function found by the scan at bus:slot.func, kept ones among
+       them; null for one it did not find */
+    DeviceInfo* find_by_bdf(u16 bus, u16 slot, u16 func);
+
+    /* The function a driver of the host's: given to no guest from here on
+       (hv's pci= refuses it). Nothing for one the scan did not find. */
+    void take(u16 bus, u16 slot, u16 func);
+    bool is_driven(u16 bus, u16 slot, u16 func);
 
     static const u16 CLS_UNCLASSIFIED = 0x0;
     static const u16 CLS_MASS_STORAGE_CONTROLLER = 0x1;

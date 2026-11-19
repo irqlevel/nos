@@ -73,6 +73,36 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: python3 tests/installer-test.py
 
+      # A host's PCI function given to a Linux guest of nos's
+      # (docs/testing.md): QEMU's NVMe behind its VT-d, kept from nos's own
+      # driver and given by its MSI-X, read and written; then driven by hand
+      # at addresses nos's IOMMU has to refuse -- past the guest's RAM, the
+      # interrupt range. The guest's kernel is built once and kept by its
+      # recipe's digest; QEMU is Debian 13's, as a guest of two CPUs under TCG
+      # needs 9.2 or later and 22.04's is 6.2.
+      - name: Passthrough test's guest, kept (x86_64)
+        if: matrix.arch == 'x86_64'
+        uses: actions/cache@v4
+        with:
+          path: out/hv-guest
+          key: hv-guest-${{ hashFiles('tests/hv-passthrough/guest.config', 'tests/hv-passthrough/build-guest.sh', 'tests/hv-passthrough/nvmepoke.c') }}
+
+      - name: Passthrough test (x86_64, TCG)
+        if: matrix.arch == 'x86_64'
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          if [ ! -f out/hv-guest/bzImage ]; then
+            sudo apt-get install -y libelf-dev flex bison bc
+            bash tests/hv-passthrough/build-guest.sh "$RUNNER_TEMP/hv-guest"
+            mkdir -p out/hv-guest
+            cp "$RUNNER_TEMP/hv-guest/bzImage" "$RUNNER_TEMP/hv-guest/nvmepoke" out/hv-guest/
+          fi
+          make nos-test.iso TEST_ISO_ARGS="iommu=on guestpci=01:00.0"
+          docker run --rm -v "$PWD":/nos -w /nos debian:trixie-slim bash -c \
+            'apt-get update -qq && apt-get install -y -qq qemu-system-x86 e2fsprogs python3 busybox-static > /dev/null &&
+             python3 tests/hv-passthrough-test.py --bzimage out/hv-guest/bzImage --busybox /bin/busybox \
+               --nvmepoke out/hv-guest/nvmepoke'
+
       # The hypervisor's MMIO decoder turns a guest's bytes into the access
       # it performs for it, and a wrong decode looks like success: checked
       # against the encodings clang gives, on the host.

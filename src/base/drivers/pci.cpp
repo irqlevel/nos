@@ -1,6 +1,7 @@
 #include "pci.h"
 
 #include <kernel/klog.h>
+#include <kernel/parameters.h>
 #include <hal/pci.h>
 #include <kernel/raw_spin_lock.h>
 
@@ -401,9 +402,34 @@ u8 Pci::get_interrupt_pin(u16 bus, u16 slot, u16 func)
 
 void Pci::enable_bus_mastering(u16 bus, u16 slot, u16 func)
 {
+    take(bus, slot, func);
     u16 cmd = read_word(bus, slot, func, 0x04);
     cmd |= (1 << 2); /* Bus Master Enable */
     write_word(bus, slot, func, 0x04, cmd);
+}
+
+Pci::DeviceInfo* Pci::find_by_bdf(u16 bus, u16 slot, u16 func)
+{
+    for (ulong i = 0; i < device_count_; i++)
+    {
+        auto& d = devices_[i];
+        if (d.valid && d.bus == bus && d.slot == slot && d.func == func)
+            return &d;
+    }
+    return nullptr;
+}
+
+void Pci::take(u16 bus, u16 slot, u16 func)
+{
+    auto* d = find_by_bdf(bus, slot, func);
+    if (d != nullptr)
+        __atomic_store_n(&d->driven, true, __ATOMIC_RELEASE);
+}
+
+bool Pci::is_driven(u16 bus, u16 slot, u16 func)
+{
+    auto* d = find_by_bdf(bus, slot, func);
+    return d != nullptr && __atomic_load_n(&d->driven, __ATOMIC_ACQUIRE);
 }
 
 u16 Pci::get_vendor_id(u16 bus, u16 device, u16 function)
@@ -502,6 +528,11 @@ void Pci::scan()
                     d.interrupt_line = get_interrupt_line(bus, slot, function);
                     d.interrupt_pin = get_interrupt_pin(bus, slot, function);
                     d.valid = true;
+                    d.kept = kernel::Parameters::get_instance().is_guest_pci((u16)bus, (u16)slot, (u16)function);
+                    d.driven = false;
+                    if (d.kept)
+                        klog(0, "pci: %02lx:%02lx.%lx kept for guests (guestpci=): no driver of the host's takes it",
+                            (ulong)bus, (ulong)slot, (ulong)function);
                     device_count_++;
                 }
             }
@@ -510,7 +541,7 @@ void Pci::scan()
 
     /* Said: a device past the table is one no driver is shown */
     if (found > device_count_)
-        klog(0, "pci: %lu devices, %lu of them kept: the rest have no driver looking for them", found,
+        klog(0, "pci: %lu devices, %lu of them in the table: the rest have no driver looking for them", found,
             device_count_);
 
     /* Firmware programs BARs on x86; bare -kernel arm64 must assign them. */
@@ -547,7 +578,9 @@ void Pci::dump(stdlib::Printer& printer)
         if (!d.valid)
             continue;
 
-        printer.printf("vnd %s(0x%lX) dev %s(0x%lX) %s(0x%lX) %s(0x%lX) p 0x%lX r 0x%lX\n",
-            vendor_to_str(d.vendor), (ulong)d.vendor, device_to_str(d.vendor, d.device), (ulong)d.device, class_to_str(d.base_class), (ulong)d.base_class, sub_class_to_str(d.base_class, d.sub_class), (ulong)d.sub_class, (ulong)d.prog_if, (ulong)d.revision_id);
+        printer.printf("%02lx:%02lx.%lx vnd %s(0x%lX) dev %s(0x%lX) %s(0x%lX) %s(0x%lX) p 0x%lX r 0x%lX%s\n",
+            (ulong)d.bus, (ulong)d.slot, (ulong)d.func,
+            vendor_to_str(d.vendor), (ulong)d.vendor, device_to_str(d.vendor, d.device), (ulong)d.device, class_to_str(d.base_class), (ulong)d.base_class, sub_class_to_str(d.base_class, d.sub_class), (ulong)d.sub_class, (ulong)d.prog_if, (ulong)d.revision_id,
+            d.kept ? " kept for guests" : (__atomic_load_n(&d.driven, __ATOMIC_ACQUIRE) ? " a driver's" : ""));
     }
 }

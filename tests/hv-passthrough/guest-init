@@ -1,0 +1,42 @@
+#!/bin/busybox sh
+# tests/hv-passthrough-test.py: the guest's /init. The NVMe nos gives it, by
+# its own driver: the pattern the runner put on it read, a pattern of its own
+# written and read back past the page cache, the interrupts it came by; then
+# the hostile phase -- the driver let go of, the controller driven by hand
+# (nvmepoke), its DMA pointed at a page of the guest's, where the guest has no
+# RAM, and at the interrupt range -- and the controller again at a page of the
+# guest's, to show it still answers. Every line the runner reads begins
+# "pass-guest: ".
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+dmesg -n 1
+say() { echo "pass-guest: $*"; }
+say "up: $(uname -r), $(grep -c ^processor /proc/cpuinfo) cpus"
+for d in /sys/bus/pci/devices/*; do
+    say "pci $(basename $d) $(cat $d/vendor):$(cat $d/device) class $(cat $d/class)"
+done
+dev=
+for d in /sys/bus/pci/devices/*; do
+    [ "$(cat $d/class)" = "0x010802" ] && dev=$d
+done
+say "nvme at ${dev:-none}"
+i=0
+while [ ! -b /dev/nvme0n1 ] && [ $i -lt 120 ]; do
+    sleep 1
+    i=$((i + 1))
+done
+say "namespace of $(cat /sys/block/nvme0n1/size 2>/dev/null) sectors"
+say "read $(dd if=/dev/nvme0n1 bs=4096 count=16 2>/dev/null | md5sum | cut -d' ' -f1)"
+yes "nos gave this guest the NVMe and it wrote this" | head -c 65536 > /tmp/w
+dd if=/tmp/w of=/dev/nvme0n1 bs=4096 seek=256 conv=fsync 2>/dev/null && say "wrote $(md5sum < /tmp/w | cut -d' ' -f1)"
+blockdev --flushbufs /dev/nvme0n1
+say "read back $(dd if=/dev/nvme0n1 bs=4096 skip=256 count=16 2>/dev/null | md5sum | cut -d' ' -f1)"
+grep -i nvme /proc/interrupts | sed 's/^/pass-guest: irq /'
+if [ -n "$dev" ] && echo "$(basename $dev)" > /sys/bus/pci/drivers/nvme/unbind; then
+    say "the driver let go"
+    nvmepoke $dev $(cat /hostile) 2>&1 | sed 's/^/pass-guest: /'
+fi
+say "done"
+poweroff -f
