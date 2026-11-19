@@ -955,8 +955,8 @@ pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
             if input { "INS" } else { "OUTS" }, port, rip),
         Stop::MmioDelivering { gpa, rip } => write!(out,
             "the CPU's own touch of a device's page at guest physical {:#x} as it delivered an interrupt or an \
-             exception, rip {:#x} -- a stack or an IDT put on the APIC's or the IO-APIC's page: no instruction \
-             to perform", gpa, rip),
+             exception, rip {:#x} -- a stack or an IDT put on a device's page, the APIC's, the IO-APIC's, a host's \
+             function's or the PCI configuration space's: no instruction to perform", gpa, rip),
         Stop::Shutdown { rip } => write!(out, "triple fault at {:#x}", rip),
         Stop::Reset { port, value, rip } => write!(out, "the guest asked for a reset, {:#04x} to port {:#x} ({}), at {:#x}",
             value, port, hv::run::reset_source(port), rip),

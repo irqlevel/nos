@@ -132,6 +132,10 @@ pub const MAX_MEM_BYTES: u64 = 512 << 30;
  * registers as memory, none of them hearing of it -- an APIC in xAPIC mode
  * that is not there, with nothing to say so. */
 const _: () = assert!(linux::LOW_RAM_END <= MSIX_PAGES as u64);
+/// The PCI Express configuration space of a guest with the BARs' hole
+/// (`linux::ECAM_BASE`), as its MCFG says it: its base and its last bus.
+const ECAM: (u32, u8) = (linux::ECAM_BASE as u32, (linux::ECAM_BUSES - 1) as u8);
+const _: () = assert!(linux::ECAM_BASE + linux::ECAM_BYTES <= MSIX_PAGES as u64);
 /// The MSI-X entries each kind of device offers: one for configuration
 /// changes and one a queue -- what Linux's virtio-pci asks for, a vector a
 /// queue.
@@ -417,8 +421,9 @@ pub enum Stop {
     /// a bug, or an MMIO device this hypervisor does not emulate.
     Mmio { gpa: u64, rip: u64 },
     /// The CPU, delivering an interrupt or an exception, touched a device's
-    /// page -- the guest's stack or IDT put on the APIC's or the IO-APIC's
-    /// -- which no instruction did, and so none to emulate.
+    /// page -- the guest's stack or IDT put on the APIC's, the IO-APIC's, a
+    /// host's function's or ECAM's -- which no instruction did, and so none
+    /// to emulate.
     MmioDelivering { gpa: u64, rip: u64 },
     /// An INS or an OUTS, to `port`: string port I/O, which no device here
     /// emulates.
@@ -1331,7 +1336,7 @@ impl LinuxGuest {
              * told, MAX_GPA at most */
             let top = (1u64 << crate::policy::phys_bits()).min(crate::memory::MAX_GPA);
             let high = ram.end().unwrap_or(top).max(linux::HIGH_RAM_START).div_ceil(1 << 30) << 30;
-            let w = Windows { low: low_end, low_end: u64::from(MSIX_PAGES), high, high_end: top };
+            let w = Windows { low: low_end, low_end: linux::ECAM_BASE, high, high_end: top };
             (w, w)
         });
         if ram.end().is_none_or(|end| end > 1u64 << crate::policy::phys_bits()) {
@@ -1348,6 +1353,11 @@ impl LinuxGuest {
             } else {
                 memory.add(base, size)?;
             }
+        }
+        /* The PCI Express configuration space, every access of it the run
+         * loop's (`ecam`), where the guest has the BARs' hole */
+        if windows.is_some() {
+            memory.trap_range(linux::ECAM_BASE, linux::ECAM_BYTES)?;
         }
 
         let mut vcpus = Vec::new();
@@ -1924,6 +1934,7 @@ impl LinuxGuest {
             mmio: window,
             bars32,
             bars64,
+            ecam: self.windows.is_some().then_some(ECAM),
         };
 
         let mut buf = Vec::new();
@@ -3232,7 +3243,7 @@ impl LinuxGuest {
                      * and is queued still. */
                     let delivering = gc.cpu.backend().event_queued();
                     if data && delivering && ((apic_page && self.has_apic() && gc.lapic.xapic())
-                        || (IoApic::owns(gpa) && self.has_ioapic()))
+                        || (IoApic::owns(gpa) && self.has_ioapic()) || self.memory.is_device(gpa))
                     {
                         gc.counts.mmio += 1;
                         Some(Stop::MmioDelivering { gpa, rip })
@@ -4330,6 +4341,9 @@ impl LinuxGuest {
     /// A page of a BAR that is not one trapped is no access this answers:
     /// the guest stops, said.
     fn host_mmio(&self, gc: &mut GuestCpu, gpa: u64, write: bool) -> Option<Stop> {
+        if self.windows.is_some() && (linux::ECAM_BASE..linux::ECAM_BASE + linux::ECAM_BYTES).contains(&gpa) {
+            return self.ecam(gc, gpa, write);
+        }
         let rip = gc.cpu.backend().save().rip;
         let mut p = self.platform.lock();
         /* Its ROM, where the guest has it on: mapped read-only, a copy -- a
@@ -4368,6 +4382,47 @@ impl LinuxGuest {
             self.deliver_msi(address, data);
         });
         drop(p);
+        mmio::finish(gc.cpu.backend_mut(), &op, value);
+        None
+    }
+
+    /// An access of the PCI Express configuration space (`ECAM`): the
+    /// function and register its offset names, answered as an access by the
+    /// ports is -- bus 0's emulated functions by the bus
+    /// (`PciBus::function_read`), a host's slot or a bus below a port by
+    /// `Platform::host_config` -- the 4 KiB of the function's space reached,
+    /// the extended space past the 256 bytes the ports reach. An access of
+    /// another size than 1, 2 or 4 bytes, or not aligned to it, reads all
+    /// ones and writes nothing, as one of no function does.
+    fn ecam(&self, gc: &mut GuestCpu, gpa: u64, write: bool) -> Option<Stop> {
+        let rip = gc.cpu.backend().save().rip;
+        let mut bytes = mmio::Bytes::default();
+        let op = match mmio::begin(gc.cpu.backend(), &self.memory, gpa, write, &mut bytes) {
+            Ok(op) => op,
+            Err(error) => return Some(Stop::MmioInsn { gpa, rip, error, bytes }),
+        };
+        gc.counts.mmio_done += 1;
+        let t = pci::ecam_target(gpa - linux::ECAM_BASE);
+        let size = usize::from(op.size());
+        let value = if !matches!(size, 1 | 2 | 4) {
+            if op.is_write() { 0 } else { u64::MAX }
+        } else {
+            let mut p = self.platform.lock();
+            let emulated = t.bus == 0 && !p.pci.is_host(t.device);
+            match (op.is_write(), emulated) {
+                (true, true) => {
+                    p.pci.function_write(t.device, t.function, t.at, size, op.value as u32);
+                    sync_msix(&mut p);
+                    0
+                }
+                (true, false) => {
+                    self.host_config_write(&mut p, &t, size, op.value as u32);
+                    0
+                }
+                (false, true) => u64::from(p.pci.function_read(t.device, t.function, t.at, size)),
+                (false, false) => u64::from(p.host_config_read(&t, size)),
+            }
+        };
         mmio::finish(gc.cpu.backend_mut(), &op, value);
         None
     }

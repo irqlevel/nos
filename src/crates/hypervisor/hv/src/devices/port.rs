@@ -30,9 +30,11 @@ const CLASS_BRIDGE: u32 = 0x06_04_00;
 /// A type 1 header, of one function.
 const HEADER_BRIDGE: u32 = 0x01;
 
-/// The size of its configuration space, and of a dword's offsets in it.
+/// The size of its configuration space, and of a dword's offsets in it;
+/// with its extended space, as ECAM reaches it, 4 KiB.
 const CONFIG_SIZE: usize = 256;
 const DWORDS: usize = CONFIG_SIZE / 4;
+const EXTENDED_SIZE: usize = 4096;
 
 /* A type 1 header, by its dwords. */
 const ID: usize = 0x00;
@@ -226,11 +228,15 @@ impl RootPort {
     }
 
     /// A read of `size` bytes (1, 2 or 4, aligned to it) at `at`, with
-    /// `link` what the device below says of its link now; all ones for any
-    /// other.
+    /// `link` what the device below says of its link now: past the 256
+    /// bytes, its extended space, of no capability -- zeroes; all ones for
+    /// any other access.
     pub fn read(&self, at: usize, size: usize, link: &Link) -> u32 {
-        if !matches!(size, 1 | 2 | 4) || at % size != 0 || at + size > CONFIG_SIZE {
+        if !matches!(size, 1 | 2 | 4) || at % size != 0 || at + size > EXTENDED_SIZE {
             return size_mask(size);
+        }
+        if at >= CONFIG_SIZE {
+            return 0;
         }
         let dword = at & !3;
         let shift = 8 * (at - dword) as u32;

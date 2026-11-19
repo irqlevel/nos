@@ -149,6 +149,12 @@ reaches no Rust. hv reaches it by the usual three steps (`rust_ffi.cpp`,
   bus below it routed by the number the guest gives it. Its windows hold the
   device's BARs, which are placed as firmware places them behind a bridge:
   64-bit prefetchable above the RAM, the rest below 4 GiB.
+- **The guest's extended configuration space** (**done**): ECAM at the top
+  of the hole, its MCFG, reserved by a motherboard resource and in the memory
+  map; a host's function's extended space the device's, read-only, its
+  capability list cut to those there to read -- AER, the serial number, a
+  vendor's, the link's -- none the guest would have to write: SR-IOV, ATS,
+  PRI, PASID, the Resizable BAR, ACS and the rest are not in it.
 - **BARs**: mapped straight into the nested table -- a new kind of leaf, UC
   or WC rather than WB, onto a physical address that is not a frame of the
   guest's; `GuestMemory`'s rule "the table maps only what this value owns"

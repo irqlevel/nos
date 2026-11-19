@@ -537,11 +537,17 @@ drivers (`guestpci=`), to taking the unit over with interrupts remapped, and
 to giving them to its guest by their MSI-X (`hv boot ... pci=01:00.0
 pci=01:00.1 pci=02:00.0`: 16 of the NVMe's 65 vectors given), the disk with no
 FLR reset by its bridge's secondary bus reset as it is given and as the guest
-lets go of it. The guest has to find a root port of nos's above each device
+lets go of it. The guest's kernel has ACPI, as a distribution's has: it
+finds its bus by the DSDT, and has to take the MCFG's ECAM where the
+firmware reserved it, covering the host bridge's buses, nothing said
+against it. It has to find a root port of nos's above each device
 (`devices/port.rs`), the NVMe and the disk beside it as functions 0 and 1 of
 the bus below the first, the other disk below the second, each port's link
-its device's, and its PCI code has to place every BAR in its port's windows,
-nothing said against them. The guest's own drivers have
+its device's, every function's 4 KiB of configuration space -- the extended
+space past the 256 bytes, which ECAM alone reaches -- and the second virtio
+disk's extended list (`aer=on,ats=on`: AER at 0x100, ATS past it) the AER
+alone, the ports' none; and its PCI code has to place every BAR in its
+port's windows, nothing said against them. The guest's own drivers have
 to find the three disks, each by its function's address, and read the
 pattern the runner put on each -- the devices' DMA
 into the guest's RAM, through their domains -- write one of their own and
@@ -1342,14 +1348,26 @@ of `host.rs` taken out is caught by it: `tests/fuzz/hv/mutants.py`'s
 slot shows, the guest's writes kept where it may write and nowhere else, its
 link the device's at each read, its windows holding the spans set and
 nothing a MiB past them, the bus below it the one the guest numbered; ten
-`port_*` mutants, each caught. The `platform` target's guest holds
+`port_*` mutants, each caught. `hostfn`'s devices have extended lists of
+the input's -- ids shown and hidden, going up or back, now and then one that
+loops, ends below 0x100, or is no list at all (all ones) -- and the judge
+walks each its own way: what the guest reads past the 256 bytes, and the
+list it walks from 0x100, are the device's with the shown ones alone,
+linked; nothing written there. The `pci` target holds ECAM's decode and
+reach to the ports' -- a read of the 256 bytes the ports' read, a write
+their write, the extended space of a function there zeroes -- the `acpi`
+target the MCFG (one, its checksum whole, its window and last bus) and the
+host bridge's buses to ECAM's, the `linux` and `pvh` targets ECAM reserved
+in a holed guest's memory map and in no other's; thirteen mutants of ECAM
+and the extended space, each caught. The `platform` target's guest holds
 such a GPU one run in six, behind its port: its driver writing and reading
 it through the bus and through the mirror -- eight bytes at a time among it
 -- moving BAR0 over the hole and anywhere, programming its MSI as the device
 raises it, the port read, written and its bus numbered anew, the GPU's ID
 and the port's read where they are and all ones where nothing is (in a
 guest of one CPU, where no other latches an address meanwhile; three
-`run_*` mutants of the routing, each caught); and the
+`run_*` mutants of the routing, each caught), ECAM reached at any function,
+size and offset -- and no guest of the hole stops at an access of it; and the
 `linux` and `pvh` targets plan a guest with the BARs' hole a quarter of the
 time, its memory map held to RAM it has. Seven mutants of the view -- an
 acknowledgement past the id and next pointer, phantom functions or I/O let

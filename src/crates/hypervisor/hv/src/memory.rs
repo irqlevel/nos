@@ -215,12 +215,14 @@ pub struct GuestMemory {
 }
 
 /// What a device range of the guest's maps: a BAR of the host's -- where it
-/// is, and the pages of it that trap -- or a copy in frames, read-only.
+/// is, and the pages of it that trap -- a copy in frames, read-only -- or
+/// nothing, every access of it trapping.
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
 enum DevicePages<'a> {
     Bar(u64, &'a [u64]),
     Copy(&'a [Frame]),
+    None,
 }
 
 /// What [`GuestMemory::map_absent`] has made so far.
@@ -294,6 +296,16 @@ impl GuestMemory {
         self.add_device(gpa, size, DevicePages::Bar(hpa, holes))
     }
 
+    /// `size` bytes at the guest's `gpa` that are a device's of the run
+    /// loop's and map nothing -- the PCI Express configuration space's
+    /// window (`linux::ECAM_BASE`) -- every access of them a nested fault the
+    /// run loop answers (`run::host_mmio`); an absent device's page never
+    /// made there. Refused where `map_device` would be.
+    #[cfg(target_arch = "x86_64")]
+    pub fn trap_range(&self, gpa: u64, size: u64) -> Result<()> {
+        self.add_device(gpa, size, DevicePages::None)
+    }
+
     /// The ROM of the host's function `id` (its slot on the guest's bus) at
     /// the guest's `gpa`: `image`, whole pages of it, a copy in frames of the
     /// host's mapped read-only -- a read is the guest's own, a write a nested
@@ -333,13 +345,13 @@ impl GuestMemory {
         self.add_device(gpa, size, DevicePages::Copy(frames))
     }
 
-    /// `map_device`'s and `map_rom`'s: the range held to the rules, then its
+    /// `map_device`'s, `map_rom`'s and `trap_range`'s: the range held to the rules, then its
     /// pages set, and the range noted.
     #[cfg(target_arch = "x86_64")]
     fn add_device(&self, gpa: u64, size: u64, pages: DevicePages<'_>) -> Result<()> {
         let hpa = match pages {
             DevicePages::Bar(h, _) => h,
-            DevicePages::Copy(_) => 0,
+            DevicePages::Copy(_) | DevicePages::None => 0,
         };
         let end = gpa.checked_add(size).ok_or(Error::BadAddress)?;
         if size == 0 || gpa % PAGE != 0 || hpa % PAGE != 0 || size % PAGE != 0 || end > MAX_GPA
@@ -364,6 +376,7 @@ impl GuestMemory {
         let set = match pages {
             DevicePages::Bar(_, holes) => Self::set_device_pages(&mut table, gpa, hpa, size, holes, &mut at),
             DevicePages::Copy(frames) => Self::set_copy_pages(&mut table, gpa, frames, &mut at),
+            DevicePages::None => Ok(()),
         };
         if let Err(e) = set {
             /* What was set of it taken out again -- nothing in the range was
