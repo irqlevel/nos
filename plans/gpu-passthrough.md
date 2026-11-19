@@ -281,6 +281,18 @@ reaches no Rust. hv reaches it by the usual three steps (`rust_ffi.cpp`,
    unrouted by UEFI (r8168 now takes MSI-X, then MSI), the console being EGA
    text in the A2000's legacy window (let go of with the GPU), and the TCO
    timer that does not count there (docs/real-hardware.md, Hertz).
+   Run again on the metal with round two in (2026-11-19): `hv pci` on the
+   real bus -- the integrated graphics refused for its RMRR, each NVMe and
+   the NIC a group of its own, the GPU's with its audio function -- ACS
+   turned on at four ports the firmware left it off at, the guest's GPU
+   behind its root port, its ROM a copy: the same, matrixMul at 610.94
+   GFlop/s. Then the GPU and nos's own NVMe to one guest
+   (`tests/gpu-passthrough/install-bare-nvme.sh`: nos's root on the free
+   space of Ubuntu's disk, `guestpci=05:00.0`): the kernel's nvme driver on
+   16 of its MSI-X vectors, the first GiB of nos's old root read and summed
+   as Ubuntu summed it before the boot, 256 MiB of random written and read
+   back and summed alike by Ubuntu after, the guest's root mounted from the
+   NVMe and the GPU's test run from there -- 610.89 GFlop/s.
 
 ### The dev loop on Hertz
 
