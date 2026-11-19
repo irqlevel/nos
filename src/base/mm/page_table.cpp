@@ -978,28 +978,20 @@ Page* PageTable::alloc_page()
     return page;
 }
 
-Page* PageTable::alloc_page_on(ulong node)
-{
-    BUG_ON(node >= Numa::get_instance().get_node_count());
-    Page* page;
-    bool zeroed = false;
-    {
-        stdlib::AutoLock lock(lock_);
-        page = take_free_page_no_lock(node, false, zeroed);
-    }
-    if (page)
-        zero_unless_zeroed(page, zeroed);
-    return page;
-}
-
 Page* PageTable::alloc_page_keeping(ulong keep)
 {
+    return alloc_page_keeping_on(local_node(), keep);
+}
+
+Page* PageTable::alloc_page_keeping_on(ulong node, ulong keep)
+{
+    BUG_ON(node >= Numa::get_instance().get_node_count());
     Page* page = nullptr;
     bool zeroed = false;
     {
         stdlib::AutoLock lock(lock_);
         if (free_pages_count_ > keep)
-            page = take_free_page_no_lock(local_node(), true, zeroed);
+            page = take_free_page_no_lock(node, true, zeroed);
     }
     if (page)
         zero_unless_zeroed(page, zeroed);

@@ -708,24 +708,26 @@ void alloc(fuzz::Input& in)
     fuzz::reached(want_zeroed ? "alloc_page took a zeroed page" : "alloc_page took one to zero");
 }
 
-/* An allocation for a node (a guest's memory placed there): its lists
-   first, then the others' in its fallback order */
+/* A guest's allocation for a node (its memory placed there): a page known
+   zero first, of its lists, then the others' in its fallback order; none once
+   `keep` or fewer are free */
 void alloc_on(fuzz::Input& in)
 {
     const ulong node = in.below(topo.nodes);
-    Page* want = expected_page_on(false, node);
-    Page* p = tested_pt().alloc_page_on(node);
-    if (p == nullptr)
+    const ulong free_now = tested_pt().free_pages_count_;
+    const ulong keep = in.chance(8) ? free_now : in.below(free_now + 1);
+    Page* want = expected_page_on(true, node);
+    Page* p = tested_pt().alloc_page_keeping_on(node, keep);
+    if (free_now <= keep)
     {
-        INVARIANT(tested_pt().free_pages_count_ == 0, "alloc_page_on(%lu) failed with %lu pages free", node,
-            tested_pt().free_pages_count_);
+        INVARIANT(p == nullptr, "alloc_page_keeping_on(%lu, %lu) took a page with %lu free", node, keep, free_now);
         return;
     }
-    INVARIANT(p == want, "alloc_page_on(%lu) took page 0x%lx, not the head of the list it prefers", node,
-        p->get_phy_address());
-    took(p->get_phy_address(), "alloc_page_on");
+    INVARIANT(p != nullptr && p == want, "alloc_page_keeping_on(%lu, %lu) with %lu free took %s, not the head of the "
+        "list it prefers", node, keep, free_now, p == nullptr ? "nothing" : "another page");
+    took(p->get_phy_address(), "alloc_page_keeping_on");
     const ulong i = static_cast<ulong>(p - machine.page_array);
-    fuzz::reached(topo.page_node[i] == node ? "alloc_page_on its own node" : "alloc_page_on another node");
+    fuzz::reached(topo.page_node[i] == node ? "a guest's page of its own node" : "a guest's page of another node");
 }
 
 /* The sequence moved to another CPU -- now and then one boot named to no
