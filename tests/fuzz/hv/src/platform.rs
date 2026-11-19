@@ -20,12 +20,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 use crate::devices::blk;
-use crate::devices::host::{HostFunction, Msi};
+use crate::devices::host::{HostFunction, Messages};
 use crate::hostmodel;
 use crate::linux::{self, Header};
 use crate::machine::Machine;
 use crate::memory::GuestMemory;
-use crate::run::{Host, LinuxGuest};
+use crate::run::{Host, HostAddress, LinuxGuest};
 use crate::smp::Doorbells;
 use crate::svm::{Exit, Instr, Io, LongMode};
 use crate::targets::{apic_value, blk_segments, chain, gpa_in, DiskState, Disk, DriverQueue, Input, NicState, Nic,
@@ -98,6 +98,9 @@ impl Host for FuzzHost {
 enum Step {
     Out { port: u16, size: u8, value: u32 },
     In { port: u16, size: u8 },
+    /// An `in` whose value the script knows: `want`, checked at the CPU's
+    /// next entry.
+    InExpect { port: u16, size: u8, want: u32 },
     Wrmsr { msr: u32, value: u64 },
     Mmio { gpa: u64, store: bool, value: u64 },
     /// An MMIO access of `size` bytes, as asked.
@@ -131,6 +134,9 @@ struct CpuPlan {
     dr_model: [u64; 4],
     /// What its last XSETBV should have come to, for its next entry to see.
     xcr: Option<XcrExpect>,
+    /// What its last `in` should have read, and its size, for its next
+    /// entry to see (`Step::InExpect`).
+    read: Option<(u32, u8)>,
 }
 
 /// What a `mov` to or from CR4 the script put at a CPU's RIP should have
@@ -262,13 +268,24 @@ struct Script {
     hosted: Option<HostedFn>,
 }
 
-/// The GPU on the guest's bus as its driver knows it: its slot, where it
-/// has its BAR0 now, and where its interrupt is raised.
+/// The GPU on the guest's bus as its driver knows it: its port's slot on
+/// bus 0 and the bus below it, where the GPU is device 0 -- as the script
+/// last numbered it -- where it has its BAR0 now, and where its interrupt
+/// is raised.
 struct HostedFn {
     slot: u32,
+    bus: u32,
+    /// The GPU's vendor and device IDs, its first dword.
+    id: u32,
     bar0: u64,
-    msi: Arc<Msi>,
+    msi: Arc<Messages>,
     maskable: bool,
+}
+
+/// CONFIG_ADDRESS's value for register `reg` of function 0 of device
+/// `slot` on `bus`.
+fn config_address(bus: u32, slot: u32, reg: u32) -> u32 {
+    0x8000_0000 | (bus << 16) | (slot << 11) | (reg & 0xFC)
 }
 
 impl Script {
@@ -682,6 +699,10 @@ impl Script {
                 Some(io_exit(v, port, size, false))
             }
             Step::In { port, size } => Some(io_exit(v, port, size, true)),
+            Step::InExpect { port, size, want } => {
+                self.cpus[self.me].read = Some((want, size));
+                Some(io_exit(v, port, size, true))
+            }
             Step::Wrmsr { msr, value } => {
                 if msr == 0x1B {
                     self.cpus[self.me].asked_xapic = Some(value & (1 << 10) == 0);
@@ -742,7 +763,10 @@ impl Script {
     /// CPU, as the hv module's handler of the real one raises it.
     fn plan_hosted(&mut self, r: &mut Input) {
         let Some(h) = self.hosted.as_ref() else { return };
-        let (slot, bar0, msi, maskable) = (h.slot, h.bar0, h.msi.clone(), h.maskable);
+        let (slot, bus, id, bar0, msi, maskable) = (h.slot, h.bus, h.id, h.bar0, h.msi.clone(), h.maskable);
+        /* The bus's address latched is the machine's: a read's value is the
+         * script's to know only where no other CPU latches one meanwhile */
+        let alone = self.cpus.len() == 1;
         let m = hostmodel::GPU_MSI as u32;
         let e = hostmodel::GPU_PCIE as u32;
         let p = hostmodel::GPU_PM as u32;
@@ -754,30 +778,99 @@ impl Script {
                 r.below(256) as u32
             }
         };
-        match r.u8() % 7 {
+        match r.u8() % 9 {
             0 | 1 => {
                 let at = reg(r);
                 let size = if at % 4 == 0 { r.pick(&[4u8, 2, 1]) } else if at % 2 == 0 { r.pick(&[2u8, 1]) } else { 1 };
                 let value = if r.u8() < 32 { u32::MAX } else { r.value32() };
-                self.pci_write(slot, at, size, value);
+                self.pci_write(bus, 0, at, size, value);
             }
             2 => {
                 let at = reg(r);
                 let size = if at % 4 == 0 { r.pick(&[4u8, 2, 1]) } else { 1 };
-                self.plan().push_back(Step::Out { port: 0xCF8, size: 4, value: 0x8000_0000 | (slot << 11) | (at & 0xFC) });
+                self.plan().push_back(Step::Out { port: 0xCF8, size: 4, value: config_address(bus, 0, at) });
                 self.plan().push_back(Step::In { port: 0xCFC + (at & 3) as u16, size });
+            }
+            8 => {
+                /* PCI Express's configuration space (ECAM): the GPU's and
+                 * its port's, the 256 bytes and the extended space past them,
+                 * and any function's -- of any size, aligned or not, read
+                 * or written -- as a kernel with an MCFG reaches them */
+                let (b, d) = match r.u8() % 4 {
+                    0 | 1 => (bus, 0),
+                    2 => (0, slot),
+                    _ => (r.below(8) as u32, r.below(32) as u32),
+                };
+                let reg = if r.bool() { r.below(0x1000) } else { 0x100 + 4 * r.below(16) };
+                let gpa = linux::ECAM_BASE + (u64::from(b) << 20) + (u64::from(d) << 15) + (r.below(8) << 12) * u64::from(r.u8() < 16) + reg;
+                let size = r.pick(&[4u8, 4, 4, 2, 1, 8]);
+                self.plan().push_back(Step::MmioOf { gpa, store: r.u8() < 64, size, value: r.value64() });
+            }
+            7 => {
+                /* Its port: a register read, or written -- its windows, its
+                 * bridge control's reset, the PCIe capability's controls --
+                 * or its bus below numbered anew, where the GPU is found
+                 * after; and now and then a function past 0, a device past 0
+                 * below it, or a bus past it, where nothing answers */
+                let at = r.pick(&[0x04, 0x0C, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x3C, 0x3E, 0x44, 0x48, 0x4C, 0x50,
+                                  0x52, 0x5C, 0x68, 0x6C, 0x70]);
+                match r.u8() % 4 {
+                    0 => {
+                        let size = if at % 4 == 0 { r.pick(&[4u8, 2, 1]) } else { r.pick(&[2u8, 1]) };
+                        self.plan().push_back(Step::Out { port: 0xCF8, size: 4, value: config_address(0, slot, at) });
+                        self.plan().push_back(Step::In { port: 0xCFC + (at & 3) as u16, size });
+                    }
+                    1 if at != 0x18 => {
+                        let size = if at % 4 == 0 { r.pick(&[4u8, 2, 1]) } else { r.pick(&[2u8, 1]) };
+                        self.pci_write(0, slot, at, size, r.value32());
+                    }
+                    2 => {
+                        /* Numbered anew: the GPU there, and where it was
+                         * before nothing */
+                        let below = 1 + r.below(8) as u32;
+                        self.pci_write(0, slot, 0x18, 4, (below << 8) | (below << 16));
+                        if let Some(h) = self.hosted.as_mut() {
+                            h.bus = below;
+                        }
+                        if alone {
+                            self.plan().push_back(Step::Out { port: 0xCF8, size: 4, value: config_address(below, 0, 0) });
+                            self.plan().push_back(Step::InExpect { port: 0xCFC, size: 4, want: id });
+                            if below != bus {
+                                self.plan().push_back(Step::Out { port: 0xCF8, size: 4, value: config_address(bus, 0, 0) });
+                                self.plan().push_back(Step::InExpect { port: 0xCFC, size: 4, want: u32::MAX });
+                            }
+                        }
+                    }
+                    _ => {
+                        /* Its ID and the GPU's, at their places as the port
+                         * numbers them; nothing at a device past 0 below
+                         * it, a bus past it, or a function past 0 of its own */
+                        let (b, d, f, want) = match r.u8() % 5 {
+                            0 => (0, slot, 0, 0x000C_1B36),
+                            1 => (bus, 0, 0, id),
+                            2 => (bus, 1 + r.below(31) as u32, 0, u32::MAX),
+                            3 => (bus + 1 + r.below(4) as u32, 0, 0, u32::MAX),
+                            _ => (0, slot, 1 + r.below(7) as u32, u32::MAX),
+                        };
+                        self.plan().push_back(Step::Out { port: 0xCF8, size: 4, value: config_address(b, d, 0) | f << 8 });
+                        let step = if alone { Step::InExpect { port: 0xCFC, size: 4, want } } else {
+                            Step::In { port: 0xCFC, size: 4 }
+                        };
+                        self.plan().push_back(step);
+                    }
+                }
             }
             3 => {
                 /* BAR0 moved, as a driver that assigns it: sized, then put
                  * elsewhere in the hole -- or anywhere, over RAM or another
                  * BAR, which is refused its mapping */
-                self.pci_write(slot, 0x10, 4, u32::MAX);
+                self.pci_write(bus, 0, 0x10, 4, u32::MAX);
                 let to = if r.u8() < 200 {
                     (linux::HOLE_RAM_END + r.below(32) * hostmodel::GPU_BAR0_SIZE) as u32
                 } else {
                     r.u32()
                 };
-                self.pci_write(slot, 0x10, 4, to);
+                self.pci_write(bus, 0, 0x10, 4, to);
                 if let Some(h) = self.hosted.as_mut() {
                     h.bar0 = u64::from(to) & !(hostmodel::GPU_BAR0_SIZE - 1);
                 }
@@ -799,17 +892,17 @@ impl Script {
             5 => {
                 /* MSI to an APIC's vector, unmasked mostly, on */
                 let dest = r.below(4) as u32;
-                self.pci_write(slot, m + 4, 4, 0xFEE0_0000 | dest << 12);
-                self.pci_write(slot, m + 8, 4, 0);
-                self.pci_write(slot, m + 0xC, 2, 0x20 + r.below(0xD0) as u32);
+                self.pci_write(bus, 0, m + 4, 4, 0xFEE0_0000 | dest << 12);
+                self.pci_write(bus, 0, m + 8, 4, 0);
+                self.pci_write(bus, 0, m + 0xC, 2, 0x20 + r.below(0xD0) as u32);
                 if maskable {
-                    self.pci_write(slot, m + 0x10, 4, u32::from(r.u8() < 48));
+                    self.pci_write(bus, 0, m + 0x10, 4, u32::from(r.u8() < 48));
                 }
-                self.pci_write(slot, m + 2, 2, u32::from(r.u8() >= 16));
+                self.pci_write(bus, 0, m + 2, 2, u32::from(r.u8() >= 16));
             }
             _ => {
                 /* The device's interrupt, sent now or held pending */
-                if let Some((address, data)) = msi.raise() {
+                if let Some((address, data)) = msi.raise(0) {
                     let serving = SERVING.lock().unwrap().as_ref().and_then(|(g, _)| g.upgrade());
                     if let Some(guest) = serving {
                         guest.deliver_msi(address, data);
@@ -819,8 +912,8 @@ impl Script {
         }
     }
 
-    fn pci_write(&mut self, slot: u32, reg: u32, size: u8, value: u32) {
-        self.plan().push_back(Step::Out { port: 0xCF8, size: 4, value: 0x8000_0000 | (slot << 11) | (reg & 0xFC) });
+    fn pci_write(&mut self, bus: u32, slot: u32, reg: u32, size: u8, value: u32) {
+        self.plan().push_back(Step::Out { port: 0xCF8, size: 4, value: config_address(bus, slot, reg) });
         self.plan().push_back(Step::Out { port: 0xCFC + (reg & 3) as u16, size, value });
     }
 
@@ -839,7 +932,7 @@ impl Script {
             self.plan().push_back(Step::Poke { gpa: page + 16 * entry, bytes: e.to_vec() });
         }
         let control = 0x8000 | if r.u8() < 32 { 0x4000 } else { 0 };
-        self.pci_write(slot, 0x40, 4, control << 16 | 0x11);
+        self.pci_write(0, slot, 0x40, 4, control << 16 | 0x11);
     }
 
     /// Start CPU `to`, as a kernel brings its CPUs up: INIT asserted and
@@ -947,7 +1040,7 @@ impl Script {
                 let base = self.io_base(dev);
                 let queue = if self.is_nic(dev) { r.below(2) as usize } else { 0 };
                 let pfn = 0x100 + r.below(0x700);
-                self.pci_write(dev as u32 + 1, 0x04, 2, 0x7);
+                self.pci_write(0, dev as u32 + 1, 0x04, 2, 0x7);
                 self.plan().push_back(Step::Out { port: base + 0x12, size: 1, value: 0 });
                 self.plan().push_back(Step::Out { port: base + 0x12, size: 1, value: 3 });
                 self.plan().push_back(Step::Out { port: base + 0x04, size: 4, value: r.u32() });
@@ -1215,6 +1308,7 @@ impl vm::Guest for Script {
             self.cpus[cpu].dr = None;
             self.cpus[cpu].dr_model = [0; 4];
             self.cpus[cpu].xcr = None;
+            self.cpus[cpu].read = None;
             self.cpus[cpu].protected32 = false;
         }
         let data = core::mem::take(&mut self.data);
@@ -1242,6 +1336,11 @@ impl Script {
         }
         if let Some(e) = self.cpus[self.me].xcr.take() {
             check_xcr(v, e);
+        }
+        if let Some((want, size)) = self.cpus[self.me].read.take() {
+            let mask = if size >= 4 { u32::MAX } else { (1u32 << (8 * size)) - 1 };
+            let got = v.save().rax as u32 & mask;
+            invariant!(got == want, "a configuration read of {} bytes: {:#x}, not {:#x}", size, got, want);
         }
         loop {
             if let Some(s) = self.plan().pop_front() {
@@ -1861,12 +1960,16 @@ pub fn platform(r: &mut Input) {
         let function = HostFunction::new(Box::new(hostmodel::Handle(made.model.clone())), made.bars);
         invariant!(function.is_some(), "the platform's GPU not given");
         let maskable = made.model.lock().unwrap().space[hostmodel::GPU_MSI + 3] & 1 != 0;
+        let space = made.model.lock().unwrap().space;
         if let Some(f) = function {
-            let msi = f.msi();
-            if guest.add_host_function(f).is_ok() {
+            let msi = f.messages();
+            /* An endpoint: behind a port of its own on the slot after
+             * them, device 0 of bus 1 */
+            if guest.add_host_function(f, HostAddress { bus: 1, device: 0, function: 0 }).is_ok() {
                 let slot = 1 + (disks.len() + nics.len()) as u32;
                 let bar0 = linux::HOLE_RAM_END.div_ceil(hostmodel::GPU_BAR0_SIZE) * hostmodel::GPU_BAR0_SIZE;
-                gpu = Some((HostedFn { slot, bar0, msi, maskable }, made.model));
+                let id = u32::from_le_bytes([space[0], space[1], space[2], space[3]]);
+                gpu = Some((HostedFn { slot, bus: 1, id, bar0, msi, maskable }, made.model));
             }
         }
     }
@@ -1908,7 +2011,7 @@ pub fn platform(r: &mut Input) {
         ioapic,
         cpus: (0..n).map(|_| CpuPlan { plan: VecDeque::new(), xapic: first_xapic, asked_xapic: None,
                                        protected32: false, cr4: None, dr: None, dr_model: [0; 4],
-                                       xcr: None }).collect(),
+                                       xcr: None, read: None }).collect(),
         me: 0,
         cr3: vcpus[0].backend_mut().save().cr3,
         code: CODE,
@@ -1938,6 +2041,14 @@ pub fn platform(r: &mut Input) {
     }
     let stopped = guest.take_stopped();
     invariant!(stopped.is_some(), "the run ended with no stop recorded");
+    /* PCI Express's configuration space is answered, every access of it,
+     * in a guest with the BARs' hole: none stops at one -- one delivering an
+     * event stops said as that. A guest without the hole has none there */
+    if let (true, Some(crate::run::Stop::Mmio { gpa, .. })) = (hosted, stopped.as_ref().map(|s| &s.stop)) {
+        let ecam = crate::linux::ECAM_BASE..crate::linux::ECAM_BASE + crate::linux::ECAM_BYTES;
+        invariant!(!ecam.contains(gpa), "the guest stopped at an access of ECAM's {:#x}: {:x?}", gpa,
+                   stopped.as_ref().map(|s| &s.stop));
+    }
     if let Some(s) = &stopped {
         let what = format!("{:?}", s.stop);
         let mut kind = what.split([' ', '(', '{']).next().unwrap_or("").to_string();

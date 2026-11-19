@@ -59,7 +59,7 @@ use crate::State;
 
 const DESCRIPTOR: &str = include_str!("vm.descriptor.json");
 
-const METHODS: [Method; 27] = [
+const METHODS: [Method; 30] = [
     Method { name: "list", kind: Kind::Read },
     Method { name: "get", kind: Kind::Read },
     Method { name: "host", kind: Kind::Read },
@@ -69,6 +69,7 @@ const METHODS: [Method; 27] = [
     Method { name: "disks", kind: Kind::Read },
     Method { name: "disk_io", kind: Kind::Read },
     Method { name: "devices", kind: Kind::Read },
+    Method { name: "pci", kind: Kind::Read },
     Method { name: "forwards", kind: Kind::Read },
     Method { name: "config_set", kind: Kind::Action },
     Method { name: "forward_add", kind: Kind::Action },
@@ -78,6 +79,8 @@ const METHODS: [Method; 27] = [
     Method { name: "disk_grow", kind: Kind::Action },
     Method { name: "disk_attach", kind: Kind::Action },
     Method { name: "disk_detach", kind: Kind::Action },
+    Method { name: "pci_attach", kind: Kind::Action },
+    Method { name: "pci_detach", kind: Kind::Action },
     Method { name: "snapshot", kind: Kind::Action },
     Method { name: "start", kind: Kind::Job },
     Method { name: "stop", kind: Kind::Job },
@@ -247,6 +250,7 @@ fn provide(state: &State, method: &str, params: &[u8], call: &mut Call) -> Statu
         "disks" => disks(state, p, call),
         "disk_io" => disk_io(state, p, call),
         "devices" => devices(state, p, call),
+        "pci" => pci(state, p, call),
         "forwards" => forwards(state, p, call),
         "config_set" => config_set(state, p, call),
         "forward_add" => forward_add(state, p, call),
@@ -256,6 +260,8 @@ fn provide(state: &State, method: &str, params: &[u8], call: &mut Call) -> Statu
         "disk_grow" => disk_grow(state, p, call),
         "disk_attach" => disk_attach(state, p, call),
         "disk_detach" => disk_detach(state, p, call),
+        "pci_attach" => pci_attach(state, p, call),
+        "pci_detach" => pci_detach(state, p, call),
         "snapshot" => snapshot(state, p, call),
         "start" => start(state, p, call),
         "stop" => stop(state, p, call),
@@ -705,6 +711,88 @@ fn disk_detach(state: &State, mut p: Params, call: &mut Call) -> Status {
             w.end_object();
         }),
         Err(e) => refuse(call, Status::Conflict, &e, Some("device")),
+    }
+}
+
+/// The longest a function's address is, bus:dev.fn.
+const PCI_ADDRESS_MAX: usize = 16;
+
+/// The host's PCI functions as VMs are given them (`hostpci`, the survey
+/// `hv pci` prints).
+fn pci(state: &State, p: Params, call: &mut Call) -> Status {
+    if let Err(s) = finish(p, call) {
+        return s;
+    }
+    let surveyed = match crate::passthrough::survey() {
+        Ok(s) => s,
+        Err(e) => return refuse(call, Status::Busy, &e, None),
+    };
+    let named = crate::hostpci::named(&state.vms_root);
+    answer(call, |w| {
+        w.begin_object();
+        w.key("functions");
+        w.begin_list();
+        for s in &surveyed {
+            w.begin_object();
+            w.field_str("address", &crate::hostpci::address(s.bus, s.slot, s.func));
+            w.field_str("id", &alloc::format!("{:04x}:{:04x}", s.vendor, s.device));
+            w.field_str("class", &alloc::format!("{:02x}.{:02x}", s.class, s.subclass));
+            w.field_str("state", if s.driven { "driver" } else if s.kept { "kept" } else { "free" });
+            w.field_bool("held", s.held);
+            w.field_str("named_by", &crate::hostpci::named_by(&named, s));
+            w.field_str("group", &crate::hostpci::group(s));
+            w.field_str("reset", s.reset);
+            w.field_str("interrupts", &crate::hostpci::interrupts(s));
+            w.key("refused");
+            match &s.refused {
+                Some(why) => w.str(why),
+                None => w.null(),
+            }
+            w.end_object();
+        }
+        w.end_list();
+        w.end_object();
+    })
+}
+
+/// `name` and `address`, a VM and a function, for `pci_attach` and
+/// `pci_detach`.
+fn pci_params<'a>(mut p: Params<'a>, call: &mut Call) -> Result<(&'a str, &'a str), Status> {
+    let name = name_param(&mut p, "name", call)?;
+    let address = p.str("address", PCI_ADDRESS_MAX).map_err(|e| invalid(call, e))?;
+    finish(p, call)?;
+    Ok((name, address))
+}
+
+fn pci_attach(state: &State, p: Params, call: &mut Call) -> Status {
+    let (name, address) = match pci_params(p, call) {
+        Ok(f) => f,
+        Err(s) => return s,
+    };
+    match crate::hostpci::attach(&state.vms_root, &state.vms, name, address) {
+        Ok(at) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("vm", name);
+            w.field_str("address", &at);
+            w.end_object();
+        }),
+        Err(e) => refuse(call, Status::Conflict, &e, Some("address")),
+    }
+}
+
+fn pci_detach(state: &State, p: Params, call: &mut Call) -> Status {
+    let (name, address) = match pci_params(p, call) {
+        Ok(f) => f,
+        Err(s) => return s,
+    };
+    match crate::hostpci::detach(&state.vms_root, &state.vms, name, address) {
+        Ok(at) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("vm", name);
+            w.field_str("address", &at);
+            w.end_object();
+        }),
+        Err(e) => refuse(call, Status::Conflict, &e, Some("address")),
     }
 }
 

@@ -23,6 +23,16 @@ ulong ecam_buses_mapped; /* number of buses mapped from ecam_va */
 ulong mmio32_next, mmio32_end;   /* bump allocator: 32-bit non-prefetch window */
 ulong mmio64_next, mmio64_end;   /* bump allocator: 64-bit window */
 
+/* What ECAM addresses: 32 devices of 8 functions, 4 KiB each; a bus past
+   those mapped is no access's */
+const u16 ECAM_SLOTS = 32;
+const u16 ECAM_FUNCS = 8;
+
+bool reachable(u16 bus, u16 slot, u16 func)
+{
+    return ecam_va != 0 && bus < ecam_buses_mapped && slot < ECAM_SLOTS && func < ECAM_FUNCS;
+}
+
 ulong config_va(u16 bus, u16 slot, u16 func, u16 offset)
 {
     /* ECAM: addr = base + (bus << 20 | dev << 15 | func << 12) + offset.
@@ -41,30 +51,35 @@ namespace hal
 
 u32 pci_config_read32(u16 bus, u16 slot, u16 func, u16 offset)
 {
-    if (ecam_va == 0 || bus >= ecam_buses_mapped)
+    if (!reachable(bus, slot, func))
         return 0xFFFFFFFF;
     return *reinterpret_cast<volatile u32*>(config_va(bus, slot, func, offset));
 }
 
 void pci_config_write32(u16 bus, u16 slot, u16 func, u16 offset, u32 value)
 {
-    if (ecam_va == 0 || bus >= ecam_buses_mapped)
+    if (!reachable(bus, slot, func))
         return;
     *reinterpret_cast<volatile u32*>(config_va(bus, slot, func, offset)) = value;
 }
 
 void pci_config_write16(u16 bus, u16 slot, u16 func, u16 offset, u16 value)
 {
-    if (ecam_va == 0 || bus >= ecam_buses_mapped)
+    if (!reachable(bus, slot, func))
         return;
     *reinterpret_cast<volatile u16*>(config_va(bus, slot, func, offset) + (offset & 2)) = value;
 }
 
 void pci_config_write8(u16 bus, u16 slot, u16 func, u16 offset, u8 value)
 {
-    if (ecam_va == 0 || bus >= ecam_buses_mapped)
+    if (!reachable(bus, slot, func))
         return;
     *reinterpret_cast<volatile u8*>(config_va(bus, slot, func, offset) + (offset & 3)) = value;
+}
+
+bool pci_extended_open(u16 bus, u16 slot, u16 func)
+{
+    return reachable(bus, slot, func);
 }
 
 /* Probe and assign one BAR; returns the number of BAR slots consumed

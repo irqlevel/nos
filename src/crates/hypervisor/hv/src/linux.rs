@@ -86,6 +86,16 @@ pub const HOLE_RAM_END: u64 = 0xC000_0000;
 /// as a PC's firmware puts what does not fit below them.
 pub const HIGH_RAM_START: u64 = 1 << 32;
 const _: () = assert!(LOW_RAM_END % (2 << 20) == 0 && LOW_RAM_END < HIGH_RAM_START);
+/// A guest with the BARs' hole has the PCI Express configuration space too
+/// (ECAM, which its MCFG names: `acpi::Machine::ecam`): buses 0 up to
+/// `ECAM_BUSES`, a MiB each -- every bus a port's numbering puts its devices
+/// on, and room past them -- at the top of the hole, below the platform's
+/// pages; reserved in its memory map and in its DSDT, as the PCI Firmware
+/// spec has firmware reserve it, and nothing's BARs.
+pub const ECAM_BUSES: u64 = 8;
+pub const ECAM_BYTES: u64 = ECAM_BUSES << 20;
+pub const ECAM_BASE: u64 = LOW_RAM_END - ECAM_BYTES;
+const _: () = assert!(ECAM_BASE % ECAM_BYTES == 0 && ECAM_BASE > HOLE_RAM_END);
 
 /// A guest's RAM as the platform lays it out: from 0 up to `LOW_RAM_END` at
 /// most -- the hole at 640 KiB inside it the e820 map's to say -- and the
@@ -456,14 +466,15 @@ pub(crate) fn write_mp_table(m: &GuestMemory, cpus: u32, pci: &[Route], ioapic: 
 }
 
 /// How many entries [`e820_entries`] makes at most.
-pub(crate) const E820_ENTRIES: usize = 4;
+pub(crate) const E820_ENTRIES: usize = 5;
 const _: () = assert!(E820_ENTRIES <= bzimage::E820_MAX_ENTRIES);
 
 /// The memory map a guest of `mem_bytes` reads instead of asking a BIOS:
 /// low RAM, the hole at 640 KiB -- in which the firmware's tables, when
 /// there are any, are reserved -- the rest of the RAM below 4 GiB from
-/// 1 MiB up to `low_end`, and what did not fit there from 4 GiB
-/// ([`Ram::of_below`]). Into `out`; how many entries.
+/// 1 MiB up to `low_end`, the PCI Express configuration space reserved
+/// where `low_end` leaves the BARs' hole (`ECAM_BASE`), and what did not
+/// fit there from 4 GiB ([`Ram::of_below`]). Into `out`; how many entries.
 pub(crate) fn e820_entries(mem_bytes: u64, low_end: u64, firmware: Option<Firmware>,
                            out: &mut [E820Entry; E820_ENTRIES]) -> Result<usize>
 {
@@ -480,6 +491,10 @@ pub(crate) fn e820_entries(mem_bytes: u64, low_end: u64, firmware: Option<Firmwa
     }
     if ram.low > ONE_MIB {
         out[n] = E820Entry { addr: ONE_MIB, size: ram.low - ONE_MIB, kind: E820_RAM };
+        n += 1;
+    }
+    if low_end <= ECAM_BASE {
+        out[n] = E820Entry { addr: ECAM_BASE, size: ECAM_BYTES, kind: E820_RESERVED };
         n += 1;
     }
     if ram.high != 0 {

@@ -1,7 +1,7 @@
 //! A function of the host's on the guest's bus (plans/gpu-passthrough.md):
 //! a real device the guest's own driver drives, its DMA through an IOMMU
 //! domain of the guest's RAM (the module's, `kcore::iommu`), its BARs mapped
-//! into the guest's nested table straight.
+//! into the guest's nested table straight -- but for the pages that trap.
 //!
 //! Its configuration space is the real one's, read through, with what has to
 //! stay the host's laid over it:
@@ -15,17 +15,28 @@
 //!   that no access of the guest's through its mapped BARs ever finds it
 //!   deaf -- an Unsupported Request, which a server may escalate to a
 //!   machine check (Linux's VFIO blocks it so, CVE-2020-12888); its INTx
-//!   disable stays the host's (set: the device's interrupt is its MSI, the
-//!   host's to take);
-//! - there is no expansion ROM; the INTx pin is the device's, and the
+//!   disable stays the host's (set: the device's interrupts are its MSI or
+//!   MSI-X, the host's to take);
+//! - the expansion ROM is a copy the host read of the device's, once
+//!   (`set_rom`): its BAR the guest's to size, place and turn on, and while
+//!   it is on, a read of it is of the copy and a write nothing -- the real
+//!   ROM BAR, which on many devices shares its decoder with another BAR, is
+//!   never the guest's to turn on;
+//! - the INTx pin is the device's, and the
 //!   interrupt line the guest's to write: the pin is there because a driver
 //!   may want a legacy IRQ to exist -- NVIDIA's refuses a function with
 //!   neither one nor MSI-X (`nv_treat_missing_irq_as_error`) -- and the run
 //!   loop wires it to a line nothing raises (`run::HOST_IRQ`): the device's
-//!   INTx stays off, its interrupt is its MSI;
-//! - the MSI capability is emulated: what the guest writes is what the
-//!   host's handler of the device's real MSI sends it (`Msi`), and the real
-//!   capability is the host's (`kcore::msix`);
+//!   INTx stays off;
+//! - its interrupts are emulated, MSI-X's where the function has MSI-X with
+//!   its table and PBA in BARs given, else MSI's: what the guest programs is
+//!   what the host's handlers of the device's real ones send it
+//!   (`Messages`), and the real capability is the host's (`kcore::msix`).
+//!   The one of the two not given is not in the list the guest walks at
+//!   all -- a guest that turned MSI on where MSI-X is what the host takes
+//!   would wait for an interrupt that never comes. MSI-X's table is the
+//!   guest's to the size it is told, `MAX_VECTORS` at most: each entry is a
+//!   vector of the host's, and the host has so many;
 //! - power management cannot take the device out of D0, the PCIe
 //!   capability's control registers cannot start an FLR, change the payload
 //!   sizes or the error reporting, or touch the link, nor the Advanced
@@ -35,39 +46,75 @@
 //!   the IOMMU translates by another context (the audio function's beside
 //!   a GPU, passed through: the whole of the host's memory), the second
 //!   have its DMA read past what the CPUs' caches hold newer;
+//! - the header type's multi-function bit is the guest's: set where the
+//!   device has more than one function behind its port (`devices::port`,
+//!   `set_multifunction`), whatever the device's says of functions the
+//!   guest may not have;
 //! - a bridge is not given at all;
 //! - every other register is the device's: written through, as QEMU's VFIO
 //!   does -- a vendor's registers are the driver's to know.
 //!
-//! NVIDIA's GPUs mirror the configuration space in BAR0, at 0x88000 (and at
-//! 0x1800 on old ones): that page is trapped rather than mapped, and each
-//! access of it is one of the configuration space above -- otherwise the
-//! guest would write the real BARs and MSI past every rule here. A write
-//! within the MSI capability's first two bytes -- its id and next pointer,
-//! read-only -- is also passed to the real mirror: a GeForce driver
-//! acknowledges its MSI so, and without it the GPU sends one interrupt and
-//! no more (QEMU's quirk, `vfio_nvidia_quirk_mirror_write`). Within them
-//! only: a write that reached the control word past them would be the
-//! guest's to the host's own MSI. Since Pascal the re-arm is a dword written
-//! at 0x704 instead (nouveau's `gp100_pci_msi_rearm`), past the 256 bytes
-//! the guest is given: that one dword goes to the real mirror alone, as
-//! VFIO lets a write there reach the device; the rest of the extended space
-//! -- its Resizable BAR, ACS and AER among it -- is nothing the guest
-//! reaches.
+//! Some pages of its BARs trap rather than map (`traps`), and each access of
+//! one is answered here (`trapped`):
+//!
+//! - MSI-X's table and PBA: the guest's table and pending bits, emulated --
+//!   mapped, the guest would program the real entries, and send any vector
+//!   of the host's where interrupts are not remapped. A page they share
+//!   with registers of the device's own has those passed through, an access
+//!   at a time, as VFIO does;
+//! - NVIDIA's GPUs mirror the configuration space in BAR0, at 0x88000 (and
+//!   at 0x1800 on old ones): each access of that page is one of the
+//!   configuration space above -- otherwise the guest would write the real
+//!   BARs and MSI past every rule here. A write within the MSI capability's
+//!   first two bytes -- its id and next pointer, read-only -- is also passed
+//!   to the real mirror: a GeForce driver acknowledges its MSI so, and
+//!   without it the GPU sends one interrupt and no more (QEMU's quirk,
+//!   `vfio_nvidia_quirk_mirror_write`). Within them only: a write that
+//!   reached the control word past them would be the guest's to the host's
+//!   own MSI. Since Pascal the re-arm is a dword written at 0x704 instead
+//!   (nouveau's `gp100_pci_msi_rearm`), past the 256 bytes the guest is
+//!   given: that one dword goes to the real mirror alone, as VFIO lets a
+//!   write there reach the device.
+//!
+//! Its extended space, past the 256 bytes -- which the guest reaches by
+//! ECAM (`run`'s window, the MCFG's) and by NVIDIA's mirror -- is the
+//! device's, read-only, with the capability list the guest walks cut to
+//! those there to read (`EXT_SHOWN`): AER's error status, the virtual
+//! channels, the serial number, a vendor's (VSEC, DVSEC), LTR and the
+//! link's. None it would have to write to use is in the list -- a write
+//! reaches nothing, and a guest that wrote one would wait on it: SR-IOV,
+//! ARI, ATS, PRI and PASID, which are the IOMMU's, the Resizable BAR (its
+//! BARs are the size the host gives), ACS, DPC, PTM, TPH, DOE, the power
+//! budget's. Each shown capability's next offset names the next one shown,
+//! and the first dword, where the device's first is not shown, is a header
+//! of none naming the first that is; a list that loops shows none.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 
+pub use super::port::Link;
+
 /// The real function, as the module reaches it: its configuration space
-/// (offsets under 256) and its BAR0, for the mirror's MSI acknowledgement.
+/// (offsets under 256), and the pages of its BARs that trap, for what of
+/// them is passed through.
 pub trait Real: Send {
     fn read32(&self, offset: u16) -> u32;
     fn write32(&self, offset: u16, value: u32);
     fn write16(&self, offset: u16, value: u16);
     fn write8(&self, offset: u16, value: u8);
-    /// A write of `size` bytes of `value` at `offset` in BAR0.
-    fn bar0_write(&self, offset: u32, size: u8, value: u32);
+    /// The page `offset` bytes into BAR `bar` mapped for `page_read` and
+    /// `page_write`: asked by `HostFunction::new` of each page it traps,
+    /// before the function is given -- false where it cannot be.
+    fn map_page(&mut self, bar: usize, offset: u64) -> bool;
+    /// A read of `size` bytes (1, 2, 4 or 8, aligned to it) `offset` bytes
+    /// into BAR `bar`, in a page `map_page` mapped; all ones in one it did
+    /// not.
+    fn page_read(&self, bar: usize, offset: u64, size: usize) -> u64;
+    /// A write of `size` bytes of `value` likewise; dropped in a page not
+    /// mapped.
+    fn page_write(&self, bar: usize, offset: u64, size: usize, value: u64);
 }
 
 /// A BAR of the real function, as the module read it with the device's
@@ -81,56 +128,145 @@ pub struct Bar {
     pub prefetchable: bool,
 }
 
-/// What the guest wrote of the MSI capability, for the host's handler of
-/// the device's real MSI to send it: read there with interrupts off, so in
-/// atomics -- never under the platform's lock.
-pub struct Msi {
-    pub control: AtomicU16,
-    pub address: AtomicU64,
-    pub data: AtomicU32,
-    pub mask: AtomicU32,
-    /// One came while MSI was off or the vector masked: sent once it is on
-    /// and unmasked, as the device would have held it pending.
-    pub pending: AtomicU32,
+/// What the guest programmed of the device's interrupts -- MSI's one
+/// message, or MSI-X's table an entry each -- for the host's handlers of the
+/// real ones to send. Read there with interrupts off, so in atomics, never
+/// under the platform's lock; written by the guest's CPUs under it.
+pub struct Messages {
+    msix: bool,
+    /// MSI's control word's enable; MSI-X's enable and function mask.
+    control: AtomicU16,
+    entries: Box<[Entry]>,
 }
 
-impl Msi {
-    fn new() -> Msi {
-        Msi {
-            control: AtomicU16::new(0),
-            address: AtomicU64::new(0),
-            data: AtomicU32::new(0),
-            mask: AtomicU32::new(0),
-            pending: AtomicU32::new(0),
+/// One message: where it goes and what it says, whether it is masked, and
+/// whether one came while it could not go.
+struct Entry {
+    address: AtomicU64,
+    data: AtomicU32,
+    /// MSI's mask bit; MSI-X's vector control, whose bit 0 is its mask.
+    control: AtomicU32,
+    pending: AtomicU32,
+}
+
+impl Messages {
+    /// `count` messages -- MSI's one, or the MSI-X entries given -- each
+    /// masked where it is MSI-X's, as a reset leaves a table. None where
+    /// there is no memory for them.
+    fn new(msix: bool, count: usize) -> Option<Messages> {
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(count).ok()?;
+        for _ in 0..count {
+            entries.push(Entry {
+                address: AtomicU64::new(0),
+                data: AtomicU32::new(0),
+                control: AtomicU32::new(if msix { MSIX_ENTRY_MASKED } else { 0 }),
+                pending: AtomicU32::new(0),
+            });
+        }
+        Some(Messages { msix, control: AtomicU16::new(0), entries: entries.into_boxed_slice() })
+    }
+
+    /// How many there are: 1 for MSI.
+    pub fn count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether they are MSI-X's.
+    pub fn msix(&self) -> bool {
+        self.msix
+    }
+
+    /// Whether the function sends at all: MSI on, or MSI-X on and not masked
+    /// whole.
+    fn on(&self) -> bool {
+        let c = self.control.load(Ordering::Acquire);
+        if self.msix {
+            c & MSIX_ENABLE != 0 && c & MSIX_FUNCTION_MASK == 0
+        } else {
+            c & MSI_ENABLE != 0
         }
     }
 
-    /// The message to send now: None while MSI is off or the vector masked.
-    pub fn message(&self) -> Option<(u64, u32)> {
-        if self.control.load(Ordering::Acquire) & MSI_ENABLE == 0 || self.mask.load(Ordering::Acquire) & 1 != 0 {
+    /// Message `i` to send now: None while the function sends nothing, the
+    /// message is masked, or there is no such message.
+    pub fn message(&self, i: usize) -> Option<(u64, u32)> {
+        let e = self.entries.get(i)?;
+        if !self.on() || e.control.load(Ordering::Acquire) & 1 != 0 {
             return None;
         }
-        Some((self.address.load(Ordering::Acquire), self.data.load(Ordering::Acquire)))
+        Some((e.address.load(Ordering::Acquire), e.data.load(Ordering::Acquire)))
     }
 
-    /// The device's interrupt, as it comes: the message to send, or None and
-    /// held pending.
-    pub fn raise(&self) -> Option<(u64, u32)> {
-        let m = self.message();
+    /// The device's interrupt `i`, as it comes: the message to send, or None
+    /// and held pending.
+    pub fn raise(&self, i: usize) -> Option<(u64, u32)> {
+        let e = self.entries.get(i)?;
+        let m = self.message(i);
         if m.is_none() {
-            self.pending.store(1, Ordering::Release);
+            e.pending.store(1, Ordering::Release);
             /* Turned on or unmasked since the look: sent after all, by the
              * one who sees both */
-            return self.take_pending();
+            return self.take_pending(i);
         }
         m
     }
 
-    /// One held pending, now that it can go: its message, the mark cleared.
-    pub fn take_pending(&self) -> Option<(u64, u32)> {
-        let m = self.message()?;
-        (self.pending.swap(0, Ordering::AcqRel) != 0).then_some(m)
+    /// Message `i` held pending, now that it can go: the message, the mark
+    /// cleared.
+    pub fn take_pending(&self, i: usize) -> Option<(u64, u32)> {
+        let m = self.message(i)?;
+        let e = self.entries.get(i)?;
+        (e.pending.swap(0, Ordering::AcqRel) != 0).then_some(m)
     }
+
+    /// Whether message `i` is held pending: MSI-X's PBA.
+    pub fn pending(&self, i: usize) -> bool {
+        self.entries.get(i).is_some_and(|e| e.pending.load(Ordering::Acquire) != 0)
+    }
+
+    /// Every message held pending that can go now, each handed to `send`:
+    /// what a write of the guest's that turned the function on or unmasked
+    /// a message lets out.
+    pub fn send_pending(&self, mut send: impl FnMut(u64, u32)) {
+        for i in 0..self.entries.len() {
+            if let Some((address, data)) = self.take_pending(i) {
+                send(address, data);
+            }
+        }
+    }
+}
+
+/// Where MSI-X's table and PBA are: the BAR and the offset in it of each,
+/// how many entries the device has, and how many the guest is given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MsixLayout {
+    pub table_bar: usize,
+    pub table: u64,
+    pub pba_bar: usize,
+    pub pba: u64,
+    pub entries: usize,
+    pub given: usize,
+}
+
+impl MsixLayout {
+    /// The table's bytes: the device's, every entry of it.
+    pub fn table_bytes(&self) -> u64 {
+        self.entries as u64 * MSIX_ENTRY_BYTES
+    }
+
+    /// The PBA's bytes: a bit an entry, in qwords.
+    pub fn pba_bytes(&self) -> u64 {
+        (self.entries as u64).div_ceil(64) * 8
+    }
+}
+
+/// A page of one of the function's BARs that traps rather than maps: the
+/// BAR, and the page's offset in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Trap {
+    pub bar: usize,
+    pub offset: u64,
 }
 
 /// A BAR the guest moved: what the caller unmaps and maps again.
@@ -140,6 +276,28 @@ pub struct Moved {
     /// Where it was, 0 where it was nowhere yet.
     pub from: u64,
     pub to: u64,
+}
+
+/// The BARs one access moved -- an eight-byte write through the mirror may
+/// move two -- each from where it was before the access to where it is
+/// after; the ROM's (`ROM_BAR`) among them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Moves([Option<(u64, u64)>; ROM_BAR + 1]);
+
+impl Moves {
+    fn add(&mut self, m: Option<Moved>) {
+        let Some(m) = m else { return };
+        if let Some(e) = self.0.get_mut(m.bar) {
+            *e = Some((e.map_or(m.from, |(from, _)| from), m.to));
+        }
+    }
+
+    /// Each BAR moved, but one moved back to where it was.
+    pub fn iter(&self) -> impl Iterator<Item = Moved> + '_ {
+        self.0.iter().enumerate().filter_map(|(bar, m)| {
+            m.filter(|&(from, to)| from != to).map(|(from, to)| Moved { bar, from, to })
+        })
+    }
 }
 
 /* The header's registers (PCI Local Bus 3.0, 6.2) */
@@ -186,6 +344,10 @@ const CAP_AF: u8 = 0x13;
 const AF_CONTROL: usize = 4;
 /// The longest walk of the list: 48 capabilities of 4 bytes past the header.
 const CAP_WALK_MAX: usize = 48;
+/// A capability's next pointer: the second byte of its first dword, and the
+/// bits of it that are an offset.
+const CAP_NEXT_SHIFT: u32 = 8;
+const CAP_POINTER_MASK: u32 = 0xFC;
 
 /// MSI's control word: enable, the messages enabled (6:4, kept at one), and
 /// what the device can do (64-bit, per-vector masking) -- read-only.
@@ -193,6 +355,28 @@ const MSI_ENABLE: u16 = 1 << 0;
 const MSI_GUEST_CONTROL: u16 = MSI_ENABLE;
 const MSI_64: u16 = 1 << 7;
 const MSI_MASKABLE: u16 = 1 << 8;
+
+/// MSI-X (PCI 3.0, 6.8.2): its control word's table size (10:0), function
+/// mask and enable -- the last two the guest's; the table's and the PBA's
+/// dwords, a BAR's number (2:0) and an offset each; the capability's
+/// bytes; a table entry's bytes, and its vector control's dword and mask.
+const MSIX_SIZE_MASK: u16 = 0x7FF;
+const MSIX_FUNCTION_MASK: u16 = 1 << 14;
+const MSIX_ENABLE: u16 = 1 << 15;
+const MSIX_GUEST_CONTROL: u16 = MSIX_ENABLE | MSIX_FUNCTION_MASK;
+const MSIX_TABLE: usize = 4;
+const MSIX_PBA: usize = 8;
+const MSIX_BIR_MASK: u32 = 0x7;
+const MSIX_LEN: usize = 12;
+const MSIX_ENTRY_BYTES: u64 = 16;
+const MSIX_ENTRY_MASKED: u32 = 1;
+/// A message address's low two bits: the dword's alignment, written as 0.
+const MSIX_ADDRESS_LOW: u32 = 0x3;
+
+/// The most MSI-X entries a function is given: the table the guest is told
+/// of is no longer, whatever the device's -- each entry it uses is a vector
+/// of the host's, and a slot of the kernel's for its handler.
+pub const MAX_VECTORS: usize = 16;
 
 /// Power management's control and status register, and its power state.
 const PM_CONTROL: usize = 4;
@@ -207,6 +391,53 @@ const PCIE_DEVICE_CONTROL: usize = 0x08;
 const PCIE_DEVCTL_HOST: u16 = 0xF | (0x7 << 5) | (0x7 << 12);
 const PCIE_DEVCTL_OFF: u16 = (1 << 9) | (1 << 11) | (1 << 15);
 const PCIE_LINK_CONTROL: usize = 0x10;
+/// What a root port above it shows of its link (`port::Link`): the link
+/// capabilities, the link status above the control, and the link
+/// capabilities 2 of a capability of version 2 and up; the payload size,
+/// device control's bits 7:5. The flags' version and the device or port
+/// type, in the capability's first dword.
+const PCIE_LINK_CAP: usize = 0x0C;
+const PCIE_LINK_CAP2: usize = 0x2C;
+const PCIE_PAYLOAD_SHIFT: u32 = 5;
+const PCIE_PAYLOAD_MASK: u16 = 0x7;
+const PCIE_VERSION_SHIFT: u32 = 16;
+const PCIE_VERSION_MASK: u32 = 0xF;
+const PCIE_TYPE_SHIFT: u32 = 20;
+const PCIE_TYPE_MASK: u32 = 0xF;
+/// An endpoint and a legacy endpoint: the functions a root port goes
+/// above, at the other end of a link -- an integrated one (9) has none.
+pub const PCIE_ENDPOINT: u8 = 0x0;
+pub const PCIE_LEGACY_ENDPOINT: u8 = 0x1;
+
+/// The extended space, from 0x100 to 4 KiB (PCIe 6.0, 7.6): a list of
+/// capabilities, each one's header its id (15:0), version (19:16) and the
+/// next one's offset (31:20); a walk of it as long as capabilities of eight
+/// bytes each would fill it, past which it is a list that loops.
+const EXT_START: usize = 0x100;
+pub const EXT_SIZE: usize = 4096;
+const EXT_NEXT_SHIFT: u32 = 20;
+const EXT_NEXT_MASK: u32 = 0xFFC;
+const EXT_ID_MASK: u32 = 0xFFFF;
+const EXT_HEADER_KEPT: u32 = 0x000F_FFFF;
+const EXT_WALK_MAX: usize = (EXT_SIZE - EXT_START) / 8;
+/// The extended capabilities the guest is shown, by id: AER (1), the
+/// virtual channels (2), the serial number (3), a vendor's (0xB), LTR
+/// (0x18), the secondary PCIe's equalization (0x19), L1 PM substates
+/// (0x1E), a designated vendor's (0x23), the data link feature (0x25), the
+/// physical layers at 16, 32 and 64 GT/s (0x26, 0x2A, 0x31) and lane
+/// margining (0x27). The module's comment says why no other.
+const EXT_SHOWN: [u32; 13] = [0x01, 0x02, 0x03, 0x0B, 0x18, 0x19, 0x1E, 0x23, 0x25, 0x26, 0x27, 0x2A, 0x31];
+
+/// The expansion ROM's BAR (PCI 3.0, 6.2.5.2): what `Moved::bar` calls it,
+/// its register's enable bit and address bits, and the sizes a ROM given
+/// is: a page at least -- it is mapped to the guest, a copy, a page at a
+/// time; the module pads a smaller one -- and 2 MiB at most -- a GPU's is
+/// 128 KiB to 1 MiB.
+pub const ROM_BAR: usize = 6;
+const ROM_ENABLE: u32 = 1;
+const ROM_ADDRESS: u32 = 0xFFFF_F800;
+pub const ROM_MIN: usize = 4096;
+pub const ROM_MAX: usize = 2 << 20;
 
 /// NVIDIA, and where its GPUs mirror their configuration space in BAR0.
 pub const VENDOR_NVIDIA: u16 = 0x10DE;
@@ -217,6 +448,21 @@ pub const NVIDIA_MIRROR_OLD: u32 = 0x1800;
 pub const MIRROR_BYTES: u32 = 0x1000;
 /// NVIDIA's MSI re-arm since Pascal, in the mirror: a dword at 0x704.
 pub const NVIDIA_MSI_REARM: u32 = 0x704;
+
+/// A page of a BAR.
+const PAGE: u64 = 0x1000;
+
+/// What a byte of a trapped page is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Region {
+    /// NVIDIA's mirror, whose first byte is at the offset given.
+    Mirror(u32),
+    /// MSI-X's table and PBA, so many bytes into each.
+    Table(u64),
+    Pba(u64),
+    /// A register of the device's own.
+    Device,
+}
 
 /// One function of the host's, as the guest sees it.
 pub struct HostFunction {
@@ -229,61 +475,118 @@ pub struct HostFunction {
     command: u16,
     line: u8,
     msi_cap: usize,
+    msix_cap: usize,
     pm_cap: usize,
     pcie_cap: usize,
     af_cap: usize,
-    /// The capability MSI-X has, hidden: a function with MSI-X has it
-    /// emulated before it is given (not yet: such a function is refused).
-    msi: Arc<Msi>,
+    /// MSI-X's table and PBA, where MSI-X is what the guest is given.
+    msix: Option<MsixLayout>,
+    /// The capability the guest is not shown -- of MSI and MSI-X, where the
+    /// function has both, the one not given -- its length, and the pointer
+    /// that names it in the real list: 0x34's or the capability's before it.
+    /// 0 where none is hidden.
+    hidden: usize,
+    hidden_len: usize,
+    hidden_from: usize,
+    /// Each capability's place in the list, a bit a dword: its id and next
+    /// pointer, read-only, are no write's of the guest's -- a device that
+    /// took one would have the guest change the list the host walked.
+    caps: u64,
+    messages: Arc<Messages>,
+    /// The pages of its BARs that trap rather than map.
+    traps: Vec<Trap>,
+    /// Its expansion ROM, where the host gave it one (`set_rom`): the copy,
+    /// and the guest's ROM BAR register -- its address and enable.
+    rom: Option<(Box<[u8]>, u32)>,
+    /// Whether it is one of several functions of one device behind its
+    /// port (`set_multifunction`): its header type says so, whatever the
+    /// device's own says of functions the guest may not have.
+    multi: bool,
+    /// Where each extended capability the guest is shown is, in the order
+    /// the device's list has them (`ext_shown`).
+    ext: Vec<u16>,
+}
+
+/// The extended capabilities of `real` the guest is shown (`EXT_SHOWN`),
+/// where each is, in the order its list has them: none for a list that
+/// loops; up to where it ends -- a next offset back in the first 256
+/// bytes ends it, as Linux's walk does -- or is not there: a header of 0, or
+/// all ones, a function whose bus the host has no ECAM for. None for no
+/// memory.
+fn ext_shown(real: &dyn Real) -> Option<Vec<u16>> {
+    let mut shown = Vec::new();
+    let mut at = EXT_START;
+    let mut walked = 0;
+    loop {
+        let head = real.read32(at as u16);
+        if head == 0 || head == u32::MAX {
+            return Some(shown);
+        }
+        walked += 1;
+        if walked > EXT_WALK_MAX {
+            return Some(Vec::new());
+        }
+        if EXT_SHOWN.contains(&(head & EXT_ID_MASK)) {
+            shown.try_reserve(1).ok()?;
+            shown.push(at as u16);
+        }
+        let next = ((head >> EXT_NEXT_SHIFT) & EXT_NEXT_MASK) as usize;
+        if next < EXT_START {
+            return Some(shown);
+        }
+        at = next;
+    }
 }
 
 impl HostFunction {
     /// The function `real`, its BARs `bars` as the module read them: None
-    /// where it is a bridge, has MSI-X -- whose table would be the guest's to
-    /// program unless trapped, which this does not do yet -- no MSI to give
-    /// the guest, or a capability list this cannot be sure of (above). Given, the device decodes its memory from here on,
-    /// no I/O, and masters nothing until the guest has it do so; phantom
+    /// where it is a bridge, has neither MSI-X with its table and PBA in
+    /// BARs given nor MSI to give the guest, has a capability list this
+    /// cannot be sure of (above), or a page that has to trap cannot be
+    /// mapped for it. Given, the device decodes its memory from here on, no
+    /// I/O, and masters nothing until the guest has it do so; phantom
     /// functions and no snoop off.
-    pub fn new(real: Box<dyn Real>, bars: [Option<Bar>; 6]) -> Option<HostFunction> {
+    pub fn new(mut real: Box<dyn Real>, bars: [Option<Bar>; 6]) -> Option<HostFunction> {
         if (real.read32(HEADER_TYPE as u16 & !3) >> 16) & HEADER_LAYOUT != 0 {
             return None;
         }
         let id = real.read32(0);
-        let mut f = HostFunction {
-            real,
-            vendor: (id & 0xFFFF) as u16,
-            bars,
-            guest_bars: [0; 6],
-            command: 0,
-            line: 0,
-            msi_cap: 0,
-            pm_cap: 0,
-            pcie_cap: 0,
-            af_cap: 0,
-            msi: Arc::new(Msi::new()),
-        };
+        let vendor = (id & 0xFFFF) as u16;
         /* The capability list, whole: every register the host keeps is in a
          * capability it found, and a guest writes at any offset it likes --
          * so a list that loops, runs on past the walk or points into the
          * header, or a second capability of a kind the host keeps registers
          * of (a second PCIe capability's FLR, a second MSI's address), is a
-         * function not given */
-        let mut at = (f.real.read32(CAPABILITIES as u16) & 0xFC) as usize;
+         * function not given. Each one's place in the list is kept too:
+         * the pointer that names it, for a capability hidden. */
+        let (mut msi_cap, mut msix_cap, mut pm_cap, mut pcie_cap, mut af_cap) = (0, 0, 0, 0, 0);
+        let (mut msi_from, mut msix_from) = (0, 0);
+        let mut from = CAPABILITIES;
+        let mut caps = 0u64;
+        let mut at = (real.read32(CAPABILITIES as u16) & CAP_POINTER_MASK) as usize;
         let mut walked = 0;
         while at != 0 {
             walked += 1;
             if walked > CAP_WALK_MAX || at < HEADER_END || at > CONFIG_SIZE - 4 {
                 return None;
             }
-            let head = f.real.read32(at as u16);
+            caps |= 1 << (at / 4);
+            let head = real.read32(at as u16);
             let found = match (head & 0xFF) as u8 {
-                CAP_MSI => &mut f.msi_cap,
-                CAP_PM => &mut f.pm_cap,
-                CAP_PCIE => &mut f.pcie_cap,
-                CAP_AF => &mut f.af_cap,
-                CAP_MSIX => return None,
+                CAP_MSI => {
+                    msi_from = from;
+                    &mut msi_cap
+                }
+                CAP_MSIX => {
+                    msix_from = from;
+                    &mut msix_cap
+                }
+                CAP_PM => &mut pm_cap,
+                CAP_PCIE => &mut pcie_cap,
+                CAP_AF => &mut af_cap,
                 _ => {
-                    at = ((head >> 8) & 0xFC) as usize;
+                    from = at;
+                    at = ((head >> CAP_NEXT_SHIFT) & CAP_POINTER_MASK) as usize;
                     continue;
                 }
             };
@@ -291,11 +594,77 @@ impl HostFunction {
                 return None;
             }
             *found = at;
-            at = ((head >> 8) & 0xFC) as usize;
+            from = at;
+            at = ((head >> CAP_NEXT_SHIFT) & CAP_POINTER_MASK) as usize;
         }
-        if f.msi_cap == 0 {
-            return None;
+        /* MSI-X where its table and PBA are in BARs given, MSI else; the
+         * other one hidden */
+        let msix = if msix_cap != 0 { msix_layout(&*real, msix_cap, &bars) } else { None };
+        let (hidden, hidden_len, hidden_from) = match (msix, msi_cap, msix_cap) {
+            (Some(_), 0, _) => (0, 0, 0),
+            (Some(_), m, _) => (m, msi_len_at(&*real, m), msi_from),
+            (None, 0, _) => return None,
+            (None, _, 0) => (0, 0, 0),
+            (None, _, x) => (x, MSIX_LEN, msix_from),
+        };
+        let messages = Arc::new(Messages::new(msix.is_some(), msix.map_or(1, |l| l.given))?);
+        let ext = ext_shown(&*real)?;
+
+        /* The pages that trap: NVIDIA's mirror at 0x88000, a page of its
+         * own -- the old one at 0x1800 (NV4x) shares its page with registers
+         * of the GPU's, and nothing since uses it -- and every page MSI-X's
+         * table or PBA has a byte in, each mapped for what of it is passed
+         * through */
+        let mut traps: Vec<Trap> = Vec::new();
+        let mut trap = |bar: usize, offset: u64| -> Option<()> {
+            let t = Trap { bar, offset: offset & !(PAGE - 1) };
+            if !traps.contains(&t) {
+                traps.try_reserve(1).ok()?;
+                traps.push(t);
+            }
+            Some(())
+        };
+        if vendor == VENDOR_NVIDIA && bars[0].is_some_and(|b0| u64::from(NVIDIA_MIRROR + MIRROR_BYTES) <= b0.size) {
+            trap(0, u64::from(NVIDIA_MIRROR))?;
         }
+        if let Some(l) = msix {
+            for (bar, start, len) in [(l.table_bar, l.table, l.table_bytes()), (l.pba_bar, l.pba, l.pba_bytes())] {
+                let mut page = start & !(PAGE - 1);
+                while page < start + len {
+                    trap(bar, page)?;
+                    page += PAGE;
+                }
+            }
+        }
+        for t in &traps {
+            if !real.map_page(t.bar, t.offset) {
+                return None;
+            }
+        }
+
+        let mut f = HostFunction {
+            real,
+            vendor,
+            bars,
+            guest_bars: [0; 6],
+            command: 0,
+            line: 0,
+            msi_cap,
+            msix_cap,
+            pm_cap,
+            pcie_cap,
+            af_cap,
+            msix,
+            hidden,
+            hidden_len,
+            hidden_from,
+            caps,
+            messages,
+            traps,
+            rom: None,
+            multi: false,
+            ext,
+        };
         /* Each BAR the guest's at nowhere until it, or the caller placing
          * it, writes one: the type bits as the real one's */
         for i in 0..6 {
@@ -321,9 +690,46 @@ impl HostFunction {
         self.real.write16(COMMAND as u16, next);
     }
 
-    /// Where the host's handler of the device's MSI finds what to send.
-    pub fn msi(&self) -> Arc<Msi> {
-        self.msi.clone()
+    /// Where the host's handlers of the device's interrupts find what to
+    /// send.
+    pub fn messages(&self) -> Arc<Messages> {
+        self.messages.clone()
+    }
+
+    /// MSI-X's table and PBA, where the guest is given MSI-X: the host takes
+    /// the device's MSI-X then, an entry of its own for each given; else its
+    /// MSI.
+    pub fn msix_layout(&self) -> Option<MsixLayout> {
+        self.msix
+    }
+
+    /// Its PCIe capability's device or port type, where it has one: an
+    /// endpoint gets a root port above it (`run::add_host_function`).
+    pub fn pcie_type(&self) -> Option<u8> {
+        (self.pcie_cap != 0).then(|| ((self.real.read32(self.pcie_cap as u16) >> PCIE_TYPE_SHIFT) & PCIE_TYPE_MASK) as u8)
+    }
+
+    /// Its link and payload size as they are now, for the port above it
+    /// (`port::Link`); zeroes where it has no PCIe capability, or a register
+    /// of it would be past the 256 bytes.
+    pub fn link(&self) -> Link {
+        let read = |offset: usize| -> u32 {
+            let at = self.pcie_cap + offset;
+            if self.pcie_cap == 0 || at + 4 > CONFIG_SIZE { 0 } else { self.real.read32(at as u16) }
+        };
+        let version = (read(0) >> PCIE_VERSION_SHIFT) & PCIE_VERSION_MASK;
+        Link {
+            cap: read(PCIE_LINK_CAP),
+            status: (read(PCIE_LINK_CONTROL) >> 16) as u16,
+            cap2: if version >= 2 { read(PCIE_LINK_CAP2) } else { 0 },
+            payload: (read(PCIE_DEVICE_CONTROL) as u16 >> PCIE_PAYLOAD_SHIFT) & PCIE_PAYLOAD_MASK,
+        }
+    }
+
+    /// Whether its header type says it is one of several functions: those
+    /// of one device behind one port, more than one of them given.
+    pub fn set_multifunction(&mut self, multi: bool) {
+        self.multi = multi;
     }
 
     /// Whether this is an NVIDIA function, whose BAR0 mirrors its
@@ -335,6 +741,64 @@ impl HostFunction {
     /// The function's BARs: the real one of each register, None for none.
     pub fn bars(&self) -> &[Option<Bar>; 6] {
         &self.bars
+    }
+
+    /// The pages of its BARs that trap rather than map.
+    pub fn traps(&self) -> &[Trap] {
+        &self.traps
+    }
+
+    /// The device's expansion ROM given the guest: `image`, as the host read
+    /// it, its length the ROM BAR's size -- a power of two, `ROM_MIN` to
+    /// `ROM_MAX` -- or false, and no ROM. Its BAR starts nowhere and off.
+    pub fn set_rom(&mut self, image: Box<[u8]>) -> bool {
+        if !image.len().is_power_of_two() || !(ROM_MIN..=ROM_MAX).contains(&image.len()) {
+            return false;
+        }
+        self.rom = Some((image, 0));
+        true
+    }
+
+    /// The ROM's size, where there is one.
+    pub fn rom_size(&self) -> Option<u64> {
+        self.rom.as_ref().map(|(image, _)| image.len() as u64)
+    }
+
+    /// The ROM's image, where there is one: what the guest is mapped of it.
+    pub fn rom_image(&self) -> Option<&[u8]> {
+        self.rom.as_ref().map(|(image, _)| &image[..])
+    }
+
+    /// The ROM's BAR put at `gpa` before the guest starts, off -- what
+    /// firmware would do: its size aligned, below 4 GiB.
+    pub fn place_rom(&mut self, gpa: u64) -> bool {
+        let Some((image, register)) = self.rom.as_mut() else { return false };
+        let size = image.len() as u64;
+        if gpa % size != 0 || gpa > u64::from(u32::MAX) {
+            return false;
+        }
+        *register = gpa as u32 & ROM_ADDRESS;
+        true
+    }
+
+    /// Where the guest has its ROM decoded now: its address, None while it
+    /// is off or has none.
+    pub fn rom_window(&self) -> Option<u64> {
+        let (_, register) = self.rom.as_ref()?;
+        (register & ROM_ENABLE != 0).then_some(u64::from(register & ROM_ADDRESS))
+    }
+
+    /// `size` bytes (1, 2, 4 or 8) of the ROM `offset` bytes in, as its
+    /// image has them; all ones past it, or with no ROM.
+    pub fn rom_read(&self, offset: u64, size: usize) -> u64 {
+        let Some((image, _)) = self.rom.as_ref() else { return size_mask64(size) };
+        let mut v = [0xFFu8; 8];
+        for (k, b) in v.iter_mut().enumerate().take(size.min(8)) {
+            if let Some(&byte) = offset.checked_add(k as u64).and_then(|at| image.get(at as usize)) {
+                *b = byte;
+            }
+        }
+        u64::from_le_bytes(v) & size_mask64(size)
     }
 
     /// BAR `bar`'s guest address, as the guest or the caller last put it.
@@ -362,15 +826,33 @@ impl HostFunction {
         true
     }
 
-    /// A read of `size` bytes (1, 2 or 4, aligned to it) at `at`; all ones
-    /// for any other.
+    /// A read of `size` bytes (1, 2 or 4, aligned to it) at `at`, of its 4
+    /// KiB -- the extended space past the 256 bytes (the module's comment);
+    /// all ones for any other.
     pub fn config_read(&self, at: usize, size: usize) -> u32 {
-        if !matches!(size, 1 | 2 | 4) || at % size != 0 || at + size > CONFIG_SIZE {
+        if !matches!(size, 1 | 2 | 4) || at % size != 0 || at + size > EXT_SIZE {
             return size_mask(size);
         }
         let dword = at & !3;
         let shift = 8 * (at - dword) as u32;
-        (self.read_dword(dword) >> shift) & size_mask(size)
+        let v = if dword >= CONFIG_SIZE { self.ext_dword(dword) } else { self.read_dword(dword) };
+        (v >> shift) & size_mask(size)
+    }
+
+    /// The dword at `dword` of the extended space, as the guest reads it:
+    /// the device's, but for the list's headers -- a shown capability's
+    /// next offset the next one shown, and the first dword, where the
+    /// device's first is not shown, a header of none naming the first that
+    /// is (or 0, none at all).
+    fn ext_dword(&self, dword: usize) -> u32 {
+        if let Some(i) = self.ext.iter().position(|&a| usize::from(a) == dword) {
+            let next = self.ext.get(i + 1).map_or(0, |&a| u32::from(a));
+            return (self.real.read32(dword as u16) & EXT_HEADER_KEPT) | (next << EXT_NEXT_SHIFT);
+        }
+        if dword == EXT_START {
+            return self.ext.first().map_or(0, |&a| u32::from(a) << EXT_NEXT_SHIFT);
+        }
+        self.real.read32(dword as u16)
     }
 
     /// A write of `size` bytes (1, 2 or 4, aligned to it) of `value` at
@@ -401,14 +883,20 @@ impl HostFunction {
             }
             0x0C => None,
             d if (BAR0..BAR_END).contains(&d) => self.write_bar((d - BAR0) / 4, mask, value),
-            ROM => None,
+            ROM => self.write_rom(mask, value),
             INTERRUPT_LINE => {
                 if mask & 0xFF != 0 {
                     self.line = value as u8;
                 }
                 None
             }
-            d if self.msi_cap != 0 && (self.msi_cap..self.msi_cap + msi_len(self)).contains(&d) => {
+            /* The capability not shown: nothing of it is the guest's */
+            d if self.hidden != 0 && (self.hidden..self.hidden + self.hidden_len).contains(&d) => None,
+            d if self.msix.is_some() && (self.msix_cap..self.msix_cap + MSIX_LEN).contains(&d) => {
+                self.write_msix(d - self.msix_cap, mask, value);
+                None
+            }
+            d if self.msix.is_none() && self.msi_cap != 0 && (self.msi_cap..self.msi_cap + msi_len(self)).contains(&d) => {
                 self.write_msi(d - self.msi_cap, mask, value);
                 None
             }
@@ -438,10 +926,15 @@ impl HostFunction {
             d if self.af_cap != 0 && d == self.af_cap + AF_CONTROL => None,
             d => {
                 /* A register of the device's own: written through, a byte, a
-                 * word or a dword as the guest wrote it */
+                 * word or a dword as the guest wrote it -- but a capability's
+                 * id and next pointer, the first two bytes of its first
+                 * dword, which a dword's write leaves out of a word's */
+                let header = if self.caps & (1 << (d / 4)) != 0 { 0xFFFF } else { 0 };
                 match size {
+                    _ if mask & header == mask => {}
                     1 => self.real.write8(at as u16, (value >> shift) as u8),
                     2 => self.real.write16(at as u16, (value >> shift) as u16),
+                    _ if header != 0 => self.real.write16((d + 2) as u16, (value >> 16) as u16),
                     _ => self.real.write32(d as u16, value),
                 }
                 None
@@ -449,56 +942,176 @@ impl HostFunction {
         }
     }
 
+    /// An access of a trapped page of BAR `bar`, `offset` bytes into the
+    /// BAR, of `size` bytes -- 1, 2, 4 or 8, within the page -- the value a
+    /// write writes: what a read reads, and the BARs a write through the
+    /// mirror moved. One of NVIDIA's mirror is the configuration space's
+    /// (`mirror`), one of MSI-X's table or PBA the guest's own, any other a
+    /// register of the device's, passed through; one not aligned to its
+    /// size is made a byte at a time -- the mapping's volatile access cannot
+    /// be misaligned. An access of a page that does not trap reads all ones
+    /// and writes nothing.
+    pub fn trapped(&mut self, bar: usize, offset: u64, size: usize, write: bool, value: u64) -> (u64, Moves) {
+        let mut moves = Moves::default();
+        let page = offset & !(PAGE - 1);
+        if !matches!(size, 1 | 2 | 4 | 8) || offset - page + size as u64 > PAGE
+            || !self.traps.contains(&Trap { bar, offset: page })
+        {
+            return (size_mask64(size), moves);
+        }
+        if offset % size as u64 != 0 {
+            let mut read = 0u64;
+            for k in 0..size as u64 {
+                let (r, m) = self.trapped_aligned(bar, offset + k, 1, write, value >> (8 * k));
+                read |= (r & 0xFF) << (8 * k);
+                moves.add(m);
+            }
+            return (read, moves);
+        }
+        /* Eight bytes as two dwords where each is a register of four */
+        if size == 8 && self.region(bar, offset) != Region::Device {
+            let (low, m) = self.trapped_aligned(bar, offset, 4, write, value & 0xFFFF_FFFF);
+            moves.add(m);
+            let (high, m) = self.trapped_aligned(bar, offset + 4, 4, write, value >> 32);
+            moves.add(m);
+            return ((low & 0xFFFF_FFFF) | (high << 32), moves);
+        }
+        let (read, m) = self.trapped_aligned(bar, offset, size, write, value);
+        moves.add(m);
+        (read, moves)
+    }
+
+    /// What the byte `offset` into BAR `bar` is, in a trapped page.
+    fn region(&self, bar: usize, offset: u64) -> Region {
+        let mirror = u64::from(NVIDIA_MIRROR);
+        if bar == 0 && self.nvidia() && offset >= mirror && offset - mirror < u64::from(MIRROR_BYTES)
+            && self.traps.contains(&Trap { bar: 0, offset: mirror })
+        {
+            return Region::Mirror(NVIDIA_MIRROR);
+        }
+        if let Some(l) = self.msix {
+            if bar == l.table_bar && offset >= l.table && offset - l.table < l.table_bytes() {
+                return Region::Table(offset - l.table);
+            }
+            if bar == l.pba_bar && offset >= l.pba && offset - l.pba < l.pba_bytes() {
+                return Region::Pba(offset - l.pba);
+            }
+        }
+        Region::Device
+    }
+
+    /// `trapped`'s access, aligned to its size, eight bytes only for the
+    /// device's own registers.
+    fn trapped_aligned(&mut self, bar: usize, offset: u64, size: usize, write: bool, value: u64) -> (u64, Option<Moved>) {
+        match self.region(bar, offset) {
+            Region::Mirror(base) => {
+                let (read, moved) = self.mirror(base, (offset - u64::from(base)) as u32, size, write, value as u32);
+                (u64::from(read), moved)
+            }
+            Region::Table(at) => {
+                if write {
+                    self.table_write(at, size, value as u32);
+                    (0, None)
+                } else {
+                    (u64::from(self.table_read(at, size)), None)
+                }
+            }
+            /* Read-only: the guest's pending bits */
+            Region::Pba(at) => (if write { 0 } else { self.pba_read(at, size) }, None),
+            Region::Device => {
+                if write {
+                    self.real.page_write(bar, offset, size, value);
+                    (0, None)
+                } else {
+                    (self.real.page_read(bar, offset, size), None)
+                }
+            }
+        }
+    }
+
     /// An access of the trapped mirror page, `offset` bytes into it, of 1, 2
-    /// or 4 bytes -- the caller splits a wider one: a configuration space
-    /// access of the same bytes, one within the MSI capability's first two
-    /// also written to the real mirror (see the module's comment). What a
-    /// read reads: all ones for an access of another size, zeroes past the
-    /// configuration space -- the extended space's, which the guest is not
-    /// given -- where writes are dropped.
+    /// or 4 bytes: a configuration space access of the same bytes, the
+    /// extended space's among them (`config_read`), one within the MSI
+    /// capability's first two also written to the real mirror (see the
+    /// module's comment). What a read reads: all ones for an access of
+    /// another size; a write past the 256 bytes is dropped.
     pub fn mirror(&mut self, mirror: u32, offset: u32, size: usize, write: bool, value: u32) -> (u32, Option<Moved>) {
         let at = offset as usize;
         if !matches!(size, 1 | 2 | 4) {
             return (size_mask(size), None);
         }
         if write && size == 4 && offset == NVIDIA_MSI_REARM && self.nvidia() {
-            self.real.bar0_write(mirror + offset, 4, value);
-            return (0, None);
-        }
-        if at + size > CONFIG_SIZE {
+            self.real.page_write(0, u64::from(mirror + offset), 4, u64::from(value));
             return (0, None);
         }
         if !write {
             return (self.config_read(at, size), None);
         }
-        if self.msi_cap != 0 && at >= self.msi_cap && at + size <= self.msi_cap + 2 {
-            self.real.bar0_write(mirror + offset, size as u8, value);
+        if at + size > CONFIG_SIZE {
+            return (0, None);
+        }
+        if self.msix.is_none() && self.msi_cap != 0 && at >= self.msi_cap && at + size <= self.msi_cap + 2 {
+            self.real.page_write(0, u64::from(mirror + offset), size, u64::from(value));
         }
         (0, self.config_write(at, size, value))
     }
 
     /// The dword at `dword`, the guest's view of it.
     fn read_dword(&self, dword: usize) -> u32 {
-        match dword {
+        let v = match dword {
             0x04 => {
                 let real = self.real.read32(COMMAND as u16);
                 (real & 0xFFFF_0000) | u32::from(self.command)
             }
             0x0C => {
+                /* The multi-function bit the guest's: the device's says
+                 * functions are there the guest may not have */
+                let bit = u32::from(HEADER_MULTI) << (8 * (HEADER_TYPE - 0x0C));
                 let real = self.real.read32(dword as u16);
-                real & !(u32::from(HEADER_MULTI) << (8 * (HEADER_TYPE - 0x0C)))
+                (real & !bit) | if self.multi { bit } else { 0 }
             }
             d if (BAR0..BAR_END).contains(&d) => self.guest_bars[(d - BAR0) / 4],
-            ROM => 0,
+            ROM => self.rom.as_ref().map_or(0, |(_, register)| *register),
             INTERRUPT_LINE => {
                 let real = self.real.read32(dword as u16);
                 (real & 0xFFFF_FF00) | u32::from(self.line)
             }
-            d if self.msi_cap != 0 && (self.msi_cap..self.msi_cap + msi_len(self)).contains(&d) => {
+            d if self.hidden != 0 && (self.hidden..self.hidden + self.hidden_len).contains(&d) => 0,
+            d if self.msix.is_some() && (self.msix_cap..self.msix_cap + MSIX_LEN).contains(&d) => {
+                self.read_msix(d - self.msix_cap)
+            }
+            d if self.msix.is_none() && self.msi_cap != 0 && (self.msi_cap..self.msi_cap + msi_len(self)).contains(&d) => {
                 self.read_msi(d - self.msi_cap)
             }
             d => self.real.read32(d as u16),
+        };
+        self.unlinked(dword, v)
+    }
+
+    /// The capability list as the guest walks it: the pointer that names
+    /// the hidden capability -- 0x34's, or the next pointer of the one
+    /// before it -- made to name the one after it. `v` is the dword `dword`
+    /// reads otherwise.
+    fn unlinked(&self, dword: usize, v: u32) -> u32 {
+        if self.hidden == 0 || dword != self.hidden_from {
+            return v;
         }
+        let next = (self.real.read32(self.hidden as u16) >> CAP_NEXT_SHIFT) & CAP_POINTER_MASK;
+        let shift = if dword == CAPABILITIES { 0 } else { CAP_NEXT_SHIFT };
+        (v & !(0xFF << shift)) | (next << shift)
+    }
+
+    /// The ROM BAR written: its address bits above its size and its enable
+    /// the guest's, the rest none; where its window is now -- off is
+    /// nowhere -- said as a move of `ROM_BAR` when it changed.
+    fn write_rom(&mut self, mask: u32, value: u32) -> Option<Moved> {
+        let before = self.rom_window().unwrap_or(0);
+        let (image, register) = self.rom.as_mut()?;
+        let size = image.len() as u32;
+        let writable = (!(size - 1) & ROM_ADDRESS) | ROM_ENABLE;
+        *register = ((*register & !mask) | (value & mask)) & writable;
+        let after = self.rom_window().unwrap_or(0);
+        (after != before).then_some(Moved { bar: ROM_BAR, from: before, to: after })
     }
 
     fn write_bar(&mut self, bar: usize, mask: u32, value: u32) -> Option<Moved> {
@@ -526,18 +1139,24 @@ impl HostFunction {
         (after != before).then_some(Moved { bar: first, from: before, to: after })
     }
 
+    /// MSI's one message, as the guest has it.
+    fn msi_entry(&self) -> Option<&Entry> {
+        self.messages.entries.first()
+    }
+
     fn read_msi(&self, off: usize) -> u32 {
         let real = self.real.read32(self.msi_cap as u16);
         let caps = ((real >> 16) as u16) & (MSI_64 | MSI_MASKABLE);
-        let control = (self.msi.control.load(Ordering::Acquire) & MSI_GUEST_CONTROL) | caps;
+        let control = (self.messages.control.load(Ordering::Acquire) & MSI_GUEST_CONTROL) | caps;
         let wide = caps & MSI_64 != 0;
-        let address = self.msi.address.load(Ordering::Acquire);
+        let Some(e) = self.msi_entry() else { return 0 };
+        let address = e.address.load(Ordering::Acquire);
         match off {
             0x0 => (real & 0xFFFF) | (u32::from(control) << 16),
             0x4 => address as u32,
             0x8 if wide => (address >> 32) as u32,
-            0x8 | 0xC if off == data_offset(wide) => self.msi.data.load(Ordering::Acquire) & 0xFFFF,
-            o if caps & MSI_MASKABLE != 0 && o == data_offset(wide) + 4 => self.msi.mask.load(Ordering::Acquire),
+            0x8 | 0xC if off == data_offset(wide) => e.data.load(Ordering::Acquire) & 0xFFFF,
+            o if caps & MSI_MASKABLE != 0 && o == data_offset(wide) + 4 => e.control.load(Ordering::Acquire),
             _ => 0,
         }
     }
@@ -546,34 +1165,129 @@ impl HostFunction {
         let real = self.real.read32(self.msi_cap as u16);
         let caps = ((real >> 16) as u16) & (MSI_64 | MSI_MASKABLE);
         let wide = caps & MSI_64 != 0;
-        let address = self.msi.address.load(Ordering::Acquire);
         let merge = |old: u32| (old & !mask) | (value & mask);
+        if off == 0 {
+            let old = u32::from(self.messages.control.load(Ordering::Acquire)) << 16;
+            let control = ((merge(old) >> 16) as u16) & MSI_GUEST_CONTROL;
+            self.messages.control.store(control, Ordering::Release);
+            return;
+        }
+        let Some(e) = self.msi_entry() else { return };
+        let address = e.address.load(Ordering::Acquire);
         match off {
-            0x0 => {
-                let old = u32::from(self.msi.control.load(Ordering::Acquire)) << 16;
-                let control = ((merge(old) >> 16) as u16) & MSI_GUEST_CONTROL;
-                self.msi.control.store(control, Ordering::Release);
-            }
             0x4 => {
                 let low = u64::from(merge(address as u32) & !0x3);
-                self.msi.address.store((address & !0xFFFF_FFFF) | low, Ordering::Release);
+                e.address.store((address & !0xFFFF_FFFF) | low, Ordering::Release);
             }
             0x8 if wide => {
                 let high = u64::from(merge((address >> 32) as u32));
-                self.msi.address.store((address & 0xFFFF_FFFF) | (high << 32), Ordering::Release);
+                e.address.store((address & 0xFFFF_FFFF) | (high << 32), Ordering::Release);
             }
             o if o == data_offset(wide) => {
-                let data = merge(self.msi.data.load(Ordering::Acquire)) & 0xFFFF;
-                self.msi.data.store(data, Ordering::Release);
+                let data = merge(e.data.load(Ordering::Acquire)) & 0xFFFF;
+                e.data.store(data, Ordering::Release);
             }
             o if caps & MSI_MASKABLE != 0 && o == data_offset(wide) + 4 => {
-                let m = merge(self.msi.mask.load(Ordering::Acquire)) & 1;
-                self.msi.mask.store(m, Ordering::Release);
+                let m = merge(e.control.load(Ordering::Acquire)) & 1;
+                e.control.store(m, Ordering::Release);
             }
             _ => {}
         }
     }
 
+    /// MSI-X's capability as the guest sees it: its control word the
+    /// guest's enable and function mask over the table's size it is given,
+    /// the table's and the PBA's dwords the device's.
+    fn read_msix(&self, off: usize) -> u32 {
+        let real = self.real.read32((self.msix_cap + off) as u16);
+        if off != 0 {
+            return real;
+        }
+        let given = self.messages.count().clamp(1, usize::from(MSIX_SIZE_MASK) + 1) as u16;
+        let control = (self.messages.control.load(Ordering::Acquire) & MSIX_GUEST_CONTROL) | (given - 1);
+        (real & 0xFFFF) | (u32::from(control) << 16)
+    }
+
+    fn write_msix(&mut self, off: usize, mask: u32, value: u32) {
+        if off != 0 || mask & 0xFFFF_0000 == 0 {
+            return;
+        }
+        let old = u32::from(self.messages.control.load(Ordering::Acquire)) << 16;
+        let control = ((((old & !mask) | (value & mask)) >> 16) as u16) & MSIX_GUEST_CONTROL;
+        self.messages.control.store(control, Ordering::Release);
+    }
+
+    /// The guest's MSI-X table, `at` bytes into it, `size` bytes (1, 2 or
+    /// 4, aligned to it): an entry's address, data and vector control --
+    /// its mask alone -- as the guest wrote them; nothing past the entries
+    /// it is given.
+    fn table_read(&self, at: u64, size: usize) -> u32 {
+        let dword = at & !3;
+        let shift = 8 * (at - dword) as u32;
+        let Some(e) = self.messages.entries.get((dword / MSIX_ENTRY_BYTES) as usize) else { return 0 };
+        let v = match dword % MSIX_ENTRY_BYTES {
+            0 => e.address.load(Ordering::Acquire) as u32,
+            4 => (e.address.load(Ordering::Acquire) >> 32) as u32,
+            8 => e.data.load(Ordering::Acquire),
+            _ => e.control.load(Ordering::Acquire) & MSIX_ENTRY_MASKED,
+        };
+        (v >> shift) & size_mask(size)
+    }
+
+    fn table_write(&mut self, at: u64, size: usize, value: u32) {
+        let dword = at & !3;
+        let shift = 8 * (at - dword) as u32;
+        let mask = size_mask(size) << shift;
+        let value = (value << shift) & mask;
+        let merge = |old: u32| (old & !mask) | value;
+        let Some(e) = self.messages.entries.get((dword / MSIX_ENTRY_BYTES) as usize) else { return };
+        match dword % MSIX_ENTRY_BYTES {
+            0 => {
+                let a = e.address.load(Ordering::Acquire);
+                let low = u64::from(merge(a as u32) & !MSIX_ADDRESS_LOW);
+                e.address.store((a & !0xFFFF_FFFF) | low, Ordering::Release);
+            }
+            4 => {
+                let a = e.address.load(Ordering::Acquire);
+                let high = u64::from(merge((a >> 32) as u32));
+                e.address.store((a & 0xFFFF_FFFF) | (high << 32), Ordering::Release);
+            }
+            8 => e.data.store(merge(e.data.load(Ordering::Acquire)), Ordering::Release),
+            _ => {
+                let control = merge(e.control.load(Ordering::Acquire)) & MSIX_ENTRY_MASKED;
+                e.control.store(control, Ordering::Release);
+            }
+        }
+    }
+
+    /// The guest's PBA, `at` bytes into it, `size` bytes: a bit a message
+    /// held pending, none past the entries given.
+    fn pba_read(&self, at: u64, size: usize) -> u64 {
+        let first = (at * 8) as usize;
+        (0..size * 8).filter(|&bit| self.messages.pending(first + bit)).fold(0, |v, bit| v | (1 << bit))
+    }
+}
+
+/// Where MSI-X's table and PBA are, by the capability at `cap`: None where
+/// either is not wholly inside a memory BAR given -- an I/O BAR's, one not
+/// decoded, or past its end.
+fn msix_layout(real: &dyn Real, cap: usize, bars: &[Option<Bar>; 6]) -> Option<MsixLayout> {
+    let control = (real.read32(cap as u16) >> 16) as u16;
+    let entries = usize::from(control & MSIX_SIZE_MASK) + 1;
+    let table = real.read32((cap + MSIX_TABLE) as u16);
+    let pba = real.read32((cap + MSIX_PBA) as u16);
+    let l = MsixLayout {
+        table_bar: (table & MSIX_BIR_MASK) as usize,
+        table: u64::from(table & !MSIX_BIR_MASK),
+        pba_bar: (pba & MSIX_BIR_MASK) as usize,
+        pba: u64::from(pba & !MSIX_BIR_MASK),
+        entries,
+        given: entries.min(MAX_VECTORS),
+    };
+    let inside = |bar: usize, start: u64, len: u64| {
+        bars.get(bar).copied().flatten().is_some_and(|b| start.checked_add(len).is_some_and(|end| end <= b.size))
+    };
+    (inside(l.table_bar, l.table, l.table_bytes()) && inside(l.pba_bar, l.pba, l.pba_bytes())).then_some(l)
 }
 
 /// A memory BAR as the module reads it with the device's decoding off:
@@ -614,12 +1328,16 @@ fn data_offset(wide: bool) -> usize {
     if wide { 0xC } else { 0x8 }
 }
 
-/// The bytes of the MSI capability, as long as the real one's.
+/// The bytes of the MSI capability at `cap`, as long as the real one's.
+fn msi_len_at(real: &dyn Real, cap: usize) -> usize {
+    let control = (real.read32(cap as u16) >> 16) as u16;
+    let base = if control & MSI_64 != 0 { 0x10 } else { 0xC };
+    if control & MSI_MASKABLE != 0 { base + 8 } else { base }
+}
+
+/// The bytes of the function's MSI capability.
 fn msi_len(f: &HostFunction) -> usize {
-    let real = f.real.read32(f.msi_cap as u16);
-    let caps = ((real >> 16) as u16) & (MSI_64 | MSI_MASKABLE);
-    let base = if caps & MSI_64 != 0 { 0x10 } else { 0xC };
-    if caps & MSI_MASKABLE != 0 { base + 8 } else { base }
+    msi_len_at(&*f.real, f.msi_cap)
 }
 
 fn size_mask(size: usize) -> u32 {
@@ -627,5 +1345,14 @@ fn size_mask(size: usize) -> u32 {
         1 => 0xFF,
         2 => 0xFFFF,
         _ => u32::MAX,
+    }
+}
+
+fn size_mask64(size: usize) -> u64 {
+    match size {
+        1 => 0xFF,
+        2 => 0xFFFF,
+        4 => 0xFFFF_FFFF,
+        _ => u64::MAX,
     }
 }

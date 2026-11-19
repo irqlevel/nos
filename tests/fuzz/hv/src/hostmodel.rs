@@ -1,34 +1,56 @@
 //! A host's PCI function given to a guest (`hypervisor/hv/src/devices/host.rs`):
 //! the guest reads and writes its configuration space -- through the bus
 //! and through NVIDIA's mirror of it in BAR0 -- sizes and moves its BARs,
-//! programs its MSI, and the device raises its interrupt; and whatever the
-//! guest writes, what reaches the real function holds to what the host
-//! keeps. The real function is a register file every write lands in
-//! (`Model`), and it judges each write as it comes, by the rules the host
-//! keeps whatever the guest does: its BARs, ROM, header and MSI capability
-//! never written; its command register decoding memory, no I/O, INTx off;
-//! its device control's phantom functions, no snoop and FLR off and the
-//! host's fields as the host had them; its link and Advanced Features'
-//! FLR never written; never out of D0; BAR0 written only where the mirror
-//! acknowledges an MSI. And what the guest sees is held to the PCI spec's
-//! registers, worked out here from the spec and not from `host.rs`: a BAR
-//! sized reads back its size, holds no bit below it and its type, a BAR
-//! moved is said to have moved from where it was to where it is, the MSI
-//! the guest programmed is the message the device's interrupt sends -- held
-//! pending while it is off or masked, and sent once when it is not.
+//! programs its MSI or its MSI-X table, reads its pending bits, reaches the
+//! device's registers beside the table, and the device raises its
+//! interrupts; and whatever the guest writes, what reaches the real function
+//! holds to what the host keeps. The real function is a register file every
+//! write lands in (`Model`), and it judges each write as it comes, by the
+//! rules the host keeps whatever the guest does: its BARs, ROM, header, MSI
+//! and MSI-X capabilities never written; its command register decoding
+//! memory, no I/O, INTx off; its device control's phantom functions, no
+//! snoop and FLR off and the host's fields as the host had them; its link
+//! and Advanced Features' FLR never written; never out of D0; BAR0 written
+//! only where the mirror acknowledges an MSI; MSI-X's real table and PBA
+//! never reached at all -- the host's to program; a page of its BARs reached
+//! only where it traps, by an access aligned to its size. And what the guest
+//! sees is held to the PCI spec's registers, worked out here from the spec
+//! and not from `host.rs`: a BAR sized reads back its size, holds no bit
+//! below it and its type, a BAR moved is said to have moved from where it was
+//! to where it is, the MSI or MSI-X entry the guest programmed is the message
+//! the device's interrupt sends -- held pending while it is off or masked,
+//! the PBA saying so, and sent once when it is not; the capability list it
+//! walks is the real one without the one of MSI and MSI-X not given; MSI-X's
+//! table is as long as the host gives, `MAX_VECTORS` at most; the device's
+//! registers in a page MSI-X's table shares are the device's.
 //!
 //! The function is laid out the target's way: a capability a slot, in any
-//! order, now and then one the host cannot give -- MSI-X, no MSI, a bridge,
-//! a second capability of a kind it keeps, a list that loops or points into
-//! the header -- which it must refuse.
+//! order, its MSI-X table and PBA in a BAR -- sharing a page with registers
+//! of the device's, or each other's -- now and then one the host cannot
+//! give -- MSI-X's table past its BAR and no MSI, a bridge, a second
+//! capability of a kind it keeps, a list that loops or points into the
+//! header, a page that cannot be mapped -- which it must refuse.
 
 use std::sync::{Arc, Mutex};
 
-use crate::devices::host::{decode_bar, Bar, HostFunction, Real, MIRROR_BYTES, NVIDIA_MIRROR, NVIDIA_MSI_REARM,
-                           VENDOR_NVIDIA};
+use crate::devices::host::{decode_bar, Bar, HostFunction, Messages, Real, MAX_VECTORS, MIRROR_BYTES, NVIDIA_MIRROR,
+                           NVIDIA_MSI_REARM, ROM_BAR, ROM_MAX, ROM_MIN, VENDOR_NVIDIA};
 use crate::targets::Input;
 
-const SPACE: usize = 256;
+const SPACE: usize = 4096;
+/// The 256 bytes past which the extended space is, read-only to the guest.
+const HEADER_SPACE: usize = 256;
+/// The extended capabilities a guest is shown, by id (docs/hypervisor.md):
+/// AER, the virtual channels, the serial number, a vendor's, LTR, the
+/// secondary PCIe's, L1 PM substates, a designated vendor's, the data link
+/// feature, the physical layers at 16, 32 and 64 GT/s, lane margining.
+const EXT_SHOWN: [u32; 13] = [0x01, 0x02, 0x03, 0x0B, 0x18, 0x19, 0x1E, 0x23, 0x25, 0x26, 0x2A, 0x31, 0x27];
+/// Ids a device's list is made of: those, and those it must not show --
+/// SR-IOV, ARI, ATS, PRI, PASID, the Resizable BAR and its VF's, ACS, DPC,
+/// PTM, TPH, DOE, the power budget's.
+const EXT_IDS: [u32; 26] = [0x01, 0x02, 0x03, 0x0B, 0x18, 0x19, 0x1E, 0x23, 0x25, 0x26, 0x2A, 0x31, 0x27, 0x10,
+                            0x0E, 0x0F, 0x13, 0x1B, 0x15, 0x24, 0x0D, 0x1D, 0x1F, 0x17, 0x2E, 0x04];
+const PAGE: u64 = 4096;
 
 /* The header (PCI Local Bus 3.0, 6.2) */
 const COMMAND: usize = 0x04;
@@ -67,6 +89,14 @@ const MSI_ENABLE: u16 = 1 << 0;
 const MSI_64: u16 = 1 << 7;
 const MSI_MASKABLE: u16 = 1 << 8;
 
+/* MSI-X (PCI 3.0, 6.8.2): its control word's table size, function mask and
+ * enable; the capability's bytes; a table entry's */
+const MSIX_SIZE: u16 = 0x7FF;
+const MSIX_FUNCTION_MASK: u16 = 1 << 14;
+const MSIX_ENABLE: u16 = 1 << 15;
+const MSIX_LEN: usize = 12;
+const ENTRY: u64 = 16;
+
 /* PCIe (5.0, 7.5.3): device control's fields */
 const DEVCTL: usize = 0x08;
 const DEVCTL_ERRORS: u16 = 0xF;
@@ -86,12 +116,50 @@ const AF_CONTROL: usize = 4;
 pub struct Layout {
     pub pm: usize,
     pub msi: usize,
+    pub msix: usize,
     pub pcie: usize,
     pub af: usize,
 }
 
+/// Where MSI-X's table and PBA are, as the capability says: a BAR's number
+/// and an offset each, the device's entries -- and whether both are inside
+/// a BAR the host was given, which is when it gives MSI-X.
+#[derive(Clone, Copy, Debug)]
+pub struct MsixAt {
+    pub table_bar: usize,
+    pub table: u64,
+    pub pba_bar: usize,
+    pub pba: u64,
+    pub entries: usize,
+    pub inside: bool,
+}
+
+impl MsixAt {
+    fn table_len(&self) -> u64 {
+        self.entries as u64 * ENTRY
+    }
+
+    fn pba_len(&self) -> u64 {
+        (self.entries as u64).div_ceil(64) * 8
+    }
+
+    /// Whether `[offset, offset + len)` of BAR `bar` holds a byte of the
+    /// table or the PBA.
+    fn touches(&self, bar: usize, offset: u64, len: u64) -> bool {
+        let within = |b: usize, start: u64, n: u64| b == bar && offset < start + n && start < offset + len;
+        within(self.table_bar, self.table, self.table_len()) || within(self.pba_bar, self.pba, self.pba_len())
+    }
+}
+
+/// The bytes of a BAR page of the device's own, before anything writes
+/// them: told apart by where they are.
+fn pattern(bar: usize, offset: u64) -> u8 {
+    (offset.wrapping_mul(0x9E37_79B9).wrapping_add(bar as u64 * 0x51) >> 7) as u8
+}
+
 /// The real function: its configuration space, which every write lands in,
-/// the first rule a write broke, and BAR0's writes.
+/// the pages of its BARs mapped for the host and what reached them, and the
+/// first rule an access broke.
 pub struct Model {
     pub space: [u8; SPACE],
     pub layout: Layout,
@@ -100,7 +168,20 @@ pub struct Model {
     host_command: u16,
     host_devctl: u16,
     pub broken: Option<String>,
-    pub bar0_writes: Vec<(u32, u8, u32)>,
+    /// What reached its BARs through the pages that trap: BAR, offset, size,
+    /// value.
+    pub page_writes: Vec<(usize, u64, usize, u64)>,
+    /// The pages mapped (`map_page`): BAR, offset, bytes.
+    pages: Vec<(usize, u64, Box<[u8; PAGE as usize]>)>,
+    /// Whether a page asked for is refused its mapping.
+    map_fails: bool,
+    /// MSI-X's real table and PBA, where the function has MSI-X.
+    pub msix: Option<MsixAt>,
+    /// Whether the host gives MSI-X: the mirror's MSI acknowledgement is
+    /// then none of the guest's.
+    msix_given: bool,
+    /// Where each capability is: its id and next pointer read-only.
+    caps: Vec<usize>,
     /// Writes of its configuration space, every one.
     pub writes: usize,
 }
@@ -120,6 +201,10 @@ impl Model {
         u32::from_le_bytes(self.space[at..at + 4].try_into().unwrap())
     }
 
+    fn nvidia(&self) -> bool {
+        self.u16_at(0) == VENDOR_NVIDIA
+    }
+
     /// The real command register and device control, as they are now.
     pub fn command(&self) -> u16 {
         self.u16_at(COMMAND)
@@ -135,6 +220,10 @@ impl Model {
         let at = usize::from(at);
         if at % size != 0 || at + size > SPACE {
             self.broke(format!("a write of {} bytes at {:#x}: not aligned, or past the space", size, at));
+            return;
+        }
+        if at + size > HEADER_SPACE {
+            self.broke(format!("a write of {} bytes at {:#x}: the extended space, read-only", size, at));
             return;
         }
         let bytes = value.to_le_bytes();
@@ -173,6 +262,9 @@ impl Model {
             _ if l.msi != 0 && b >= l.msi && b < l.msi + msi_len(&self.space, l.msi) => {
                 self.broke(format!("the real MSI capability written: {:#04x} at {:#x}", v, b));
             }
+            _ if in_cap(l.msix, 0, MSIX_LEN) => {
+                self.broke(format!("the real MSI-X capability written: {:#04x} at {:#x}", v, b));
+            }
             _ if in_cap(l.pm, PMCSR, PMCSR + 1) => {
                 if v & PM_STATE != self.space[b] & PM_STATE {
                     self.broke(format!("the power state written {}, from {}", v & PM_STATE, self.space[b] & PM_STATE));
@@ -194,14 +286,45 @@ impl Model {
             _ if in_cap(l.af, AF_CONTROL, AF_CONTROL + 2) => {
                 self.broke(format!("Advanced Features' control written: {:#04x}", v));
             }
+            _ if self.caps.iter().any(|&c| b == c || b == c + 1) => {
+                self.broke(format!("a capability's id or next pointer written: {:#04x} at {:#x}", v, b));
+            }
             _ => {}
         }
+    }
+
+    /// Whether the byte `offset` into BAR `bar` is NVIDIA's mirror's.
+    fn in_mirror(&self, bar: usize, offset: u64) -> bool {
+        let m = u64::from(NVIDIA_MIRROR);
+        bar == 0 && self.nvidia() && offset >= m && offset - m < u64::from(MIRROR_BYTES)
+    }
+
+    /// The page an access of `size` bytes at `offset` into BAR `bar` is in,
+    /// and where in it -- the rules for any: aligned, inside one page that
+    /// was mapped. None, said, for one that breaks them.
+    fn page_of(&mut self, bar: usize, offset: u64, size: usize) -> Option<(usize, usize)> {
+        let base = offset & !(PAGE - 1);
+        let at = (offset - base) as usize;
+        if !matches!(size, 1 | 2 | 4 | 8) || at % size != 0 || at + size > PAGE as usize {
+            self.broke(format!("a BAR access of {} bytes at {:#x}: not aligned to its size, or past its page", size,
+                               offset));
+            return None;
+        }
+        let Some(i) = self.pages.iter().position(|p| p.0 == bar && p.1 == base) else {
+            self.broke(format!("BAR{}'s page at {:#x} reached, not one mapped", bar, base));
+            return None;
+        };
+        Some((i, at))
     }
 }
 
 /// The MSI capability's bytes, by its control word.
 fn msi_len(space: &[u8; SPACE], msi: usize) -> usize {
     let control = u16::from_le_bytes([space[msi + 2], space[msi + 3]]);
+    msi_len_of(control)
+}
+
+fn msi_len_of(control: u16) -> usize {
     let base = if control & MSI_64 != 0 { 0x10 } else { 0x0C };
     if control & MSI_MASKABLE != 0 { base + 8 } else { base }
 }
@@ -228,25 +351,167 @@ impl Real for Handle {
     fn write8(&self, offset: u16, value: u8) {
         self.0.lock().unwrap().write(offset, 1, u32::from(value))
     }
-    fn bar0_write(&self, offset: u32, size: u8, value: u32) {
+    fn map_page(&mut self, bar: usize, offset: u64) -> bool {
         let mut m = self.0.lock().unwrap();
-        let msi = m.layout.msi as u32;
-        let ack = NVIDIA_MIRROR + msi;
-        let nvidia = m.u16_at(0) == VENDOR_NVIDIA;
-        let rearm = nvidia && size == 4 && offset == NVIDIA_MIRROR + NVIDIA_MSI_REARM;
-        if !rearm && (msi == 0 || !matches!(size, 1 | 2 | 4) || offset < ack || offset + u32::from(size) > ack + 2) {
-            m.broke(format!("BAR0 written {} bytes at {:#x}, not the mirror's MSI acknowledgement", size, offset));
+        if offset % PAGE != 0 || bar >= 6 {
+            m.broke(format!("BAR{}'s page at {:#x} asked for: no BAR's page", bar, offset));
+            return false;
         }
-        m.bar0_writes.push((offset, size, value));
+        if m.pages.iter().any(|p| p.0 == bar && p.1 == offset) {
+            m.broke(format!("BAR{}'s page at {:#x} mapped twice", bar, offset));
+        }
+        if m.map_fails {
+            return false;
+        }
+        let mut bytes = Box::new([0u8; PAGE as usize]);
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = pattern(bar, offset + i as u64);
+        }
+        m.pages.push((bar, offset, bytes));
+        true
+    }
+    fn page_read(&self, bar: usize, offset: u64, size: usize) -> u64 {
+        let mut m = self.0.lock().unwrap();
+        if m.in_mirror(bar, offset) {
+            m.broke(format!("the real mirror read at {:#x}: its configuration space is the host's view", offset));
+        }
+        if m.msix.is_some_and(|x| x.touches(bar, offset, size as u64)) {
+            m.broke(format!("the real MSI-X table or PBA read: BAR{} at {:#x}", bar, offset));
+        }
+        let Some((i, at)) = m.page_of(bar, offset, size) else { return u64::MAX };
+        let mut v = [0u8; 8];
+        v[..size].copy_from_slice(&m.pages[i].2[at..at + size]);
+        u64::from_le_bytes(v)
+    }
+    fn page_write(&self, bar: usize, offset: u64, size: usize, value: u64) {
+        let mut m = self.0.lock().unwrap();
+        if m.in_mirror(bar, offset) {
+            let msi = m.layout.msi as u64;
+            let ack = u64::from(NVIDIA_MIRROR) + msi;
+            let rearm = size == 4 && offset == u64::from(NVIDIA_MIRROR + NVIDIA_MSI_REARM);
+            let acknowledged = msi != 0 && !m.msix_given && matches!(size, 1 | 2 | 4) && offset >= ack
+                && offset + size as u64 <= ack + 2;
+            if !rearm && !acknowledged {
+                m.broke(format!("BAR0 written {} bytes at {:#x}, not the mirror's MSI acknowledgement", size, offset));
+            }
+        } else if m.msix.is_some_and(|x| x.touches(bar, offset, size as u64)) {
+            m.broke(format!("the real MSI-X table or PBA written: BAR{} at {:#x}, {} bytes", bar, offset, size));
+        }
+        let Some((i, at)) = m.page_of(bar, offset, size) else { return };
+        m.pages[i].2[at..at + size].copy_from_slice(&value.to_le_bytes()[..size]);
+        m.page_writes.push((bar, offset, size, value));
     }
 }
 
 /// A function laid out the target's way: its model, its BARs, and whether
 /// the host can give it.
+/// A device's extended space, from 0x100: mostly a list of the input's --
+/// ids the guest is shown and ones it must not be, a capability's bytes
+/// after its header -- going on to higher offsets or back, and now and then
+/// one that loops, ends in the first 256 bytes, or is no list at all (none,
+/// or all ones: a host with no ECAM for the bus).
+fn extended(r: &mut Input, space: &mut [u8; SPACE]) {
+    match r.u8() % 8 {
+        0 => space[HEADER_SPACE..].fill(0xFF),
+        1 => {}
+        _ => {
+            let count = 1 + r.below(8) as usize;
+            let mut at = HEADER_SPACE;
+            let mut placed = vec![at];
+            for k in 0..count {
+                let id = if r.u8() < 240 { r.pick(&EXT_IDS) } else { u32::from(r.u16()) };
+                let next = if k + 1 == count {
+                    match r.u8() % 16 {
+                        0 => r.pick(&placed),
+                        1 => r.below(HEADER_SPACE as u64) as usize & !3,
+                        _ => 0,
+                    }
+                } else if r.u8() < 224 {
+                    (HEADER_SPACE + 4 * r.below(((SPACE - HEADER_SPACE) / 4) as u64) as usize).max(HEADER_SPACE)
+                } else {
+                    r.pick(&placed)
+                };
+                let head = id | (u32::from(r.u8() & 0xF) << 16) | ((next as u32) << 20);
+                space[at..at + 4].copy_from_slice(&head.to_le_bytes());
+                for b in space.iter_mut().take((at + 16).min(SPACE)).skip(at + 4) {
+                    *b = r.u8();
+                }
+                if next < HEADER_SPACE {
+                    break;
+                }
+                placed.push(next);
+                at = next;
+            }
+        }
+    }
+}
+
+/// The extended capabilities the guest should be shown, by the judge's own
+/// walk of the device's list: those of `EXT_SHOWN`'s ids, where each is, in
+/// the list's order, up to where it ends or is not there -- or none, for a
+/// list longer than capabilities of eight bytes fit: one that loops.
+fn ext_list(space: &[u8; SPACE]) -> Vec<usize> {
+    let word = |at: usize| u32::from_le_bytes(space[at..at + 4].try_into().unwrap());
+    let mut shown = Vec::new();
+    let (mut at, mut walked) = (HEADER_SPACE, 0);
+    loop {
+        let head = word(at);
+        if head == 0 || head == u32::MAX {
+            return shown;
+        }
+        walked += 1;
+        if walked > (SPACE - HEADER_SPACE) / 8 {
+            return Vec::new();
+        }
+        if EXT_SHOWN.contains(&(head & 0xFFFF)) {
+            shown.push(at);
+        }
+        let next = (head >> 20) as usize & 0xFFC;
+        if next < HEADER_SPACE {
+            return shown;
+        }
+        at = next;
+    }
+}
+
+/// The extended space's dword at `d`, as the guest should read it: the
+/// device's, but a shown capability's next offset the next one shown, and
+/// the first dword naming the first shown where it is not that one.
+fn ext_view(space: &[u8; SPACE], shown: &[usize], d: usize) -> u32 {
+    let word = u32::from_le_bytes(space[d..d + 4].try_into().unwrap());
+    match shown.iter().position(|&a| a == d) {
+        Some(i) => (word & 0xF_FFFF) | ((shown.get(i + 1).copied().unwrap_or(0) as u32) << 20),
+        None if d == HEADER_SPACE => shown.first().map_or(0, |&a| (a as u32) << 20),
+        None => word,
+    }
+}
+
 pub struct Made {
     pub model: Arc<Mutex<Model>>,
     pub bars: [Option<Bar>; 6],
     pub givable: bool,
+    /// The capabilities in the order the real list has them.
+    caps: Vec<(u8, usize)>,
+}
+
+/// Where the target puts MSI-X's table or PBA, `len` bytes: mostly inside a
+/// BAR given -- now and then where a page of the device's own registers
+/// has room left, as QEMU's NVMe has its table after its doorbells -- and
+/// now and then anywhere, which is no BAR's or past one's end.
+fn place(r: &mut Input, bars: &[Option<Bar>; 6], len: u64) -> (usize, u64) {
+    let given: Vec<usize> = (0..6).filter(|&i| bars[i].is_some()).collect();
+    if given.is_empty() || r.u8() < 24 {
+        return (r.below(8) as usize, u64::from(r.u32() & !7));
+    }
+    let i = r.pick(&given);
+    let size = bars[i].unwrap().size;
+    let room = size.saturating_sub(len).min(u64::from(u32::MAX & !7));
+    let offset = match r.u8() % 4 {
+        0 => 0,
+        1 => (PAGE + 8 * r.below(64)).min(room),
+        _ => r.below(room + 1),
+    };
+    (i, offset & !7)
 }
 
 /// What the target makes of a function: any kind it can, mostly one the
@@ -289,10 +554,36 @@ pub fn make(r: &mut Input, nvidia: bool) -> Made {
         }
     }
 
+    /* MSI-X's table and PBA, kept clear of NVIDIA's mirror page */
+    let mirror_page = nvidia && bars[0].is_some_and(|b| u64::from(NVIDIA_MIRROR + MIRROR_BYTES) <= b.size);
+    let mut msix_at = (r.u8() < 128).then(|| {
+        let entries = if r.u8() < 224 { 1 + r.below(70) as usize } else { 1 + r.below(2048) as usize };
+        let table_len = entries as u64 * ENTRY;
+        let pba_len = (entries as u64).div_ceil(64) * 8;
+        let (table_bar, table) = place(r, &bars, table_len);
+        let (pba_bar, pba) = if r.u8() < 64 {
+            (table_bar, (table + table_len).next_multiple_of(8).min(u64::from(u32::MAX & !7)))
+        } else {
+            place(r, &bars, pba_len)
+        };
+        let inside = |bar: usize, at: u64, len: u64| bars.get(bar).copied().flatten().is_some_and(|b| at + len <= b.size);
+        let inside = inside(table_bar, table, table_len) && inside(pba_bar, pba, pba_len);
+        MsixAt { table_bar, table, pba_bar, pba, entries, inside }
+    });
+    if mirror_page {
+        let m = u64::from(NVIDIA_MIRROR);
+        if msix_at.is_some_and(|x| x.touches(0, m, u64::from(MIRROR_BYTES))) {
+            msix_at = None;
+        }
+    }
+
     /* The capabilities: which, in what order */
     let msi = r.u8() >= 16;
-    let msix = r.u8() < 12;
-    let second = if r.u8() < 12 { Some(r.pick(&[CAP_MSI, CAP_PCIE, CAP_PM, CAP_AF])) } else { None };
+    let msix = msix_at.is_some();
+    /* A second MSI-X only beside a first: one alone would be laid out by
+     * no one */
+    let second = if r.u8() < 12 { Some(r.pick(&[CAP_MSI, CAP_PCIE, CAP_PM, CAP_AF, CAP_MSIX])) } else { None }
+        .filter(|&k| k != CAP_MSIX || msix);
     let mut caps: Vec<(u8, usize)> = Vec::new();
     if r.u8() >= 64 {
         caps.push((CAP_PM, SLOT_PM));
@@ -339,6 +630,7 @@ pub fn make(r: &mut Input, nvidia: bool) -> Made {
         let slot = match id {
             CAP_PM => &mut layout.pm,
             CAP_MSI => &mut layout.msi,
+            CAP_MSIX => &mut layout.msix,
             CAP_PCIE => &mut layout.pcie,
             CAP_AF => &mut layout.af,
             _ => continue,
@@ -356,6 +648,17 @@ pub fn make(r: &mut Input, nvidia: bool) -> Made {
                 for b in space.iter_mut().skip(at + 4).take(msi_len_of(control) - 4) {
                     *b = r.u8();
                 }
+            }
+            CAP_MSIX if at == SLOT_MSIX => {
+                /* As the host left it: off, or on and masked whole */
+                let x = msix_at.unwrap();
+                let control = ((x.entries - 1) as u16 & MSIX_SIZE)
+                    | if r.u8() < 32 { MSIX_ENABLE | MSIX_FUNCTION_MASK } else { 0 };
+                space[at + 2..at + 4].copy_from_slice(&control.to_le_bytes());
+                let table = (x.table as u32 & !7) | x.table_bar as u32;
+                let pba = (x.pba as u32 & !7) | x.pba_bar as u32;
+                space[at + 4..at + 8].copy_from_slice(&table.to_le_bytes());
+                space[at + 8..at + 12].copy_from_slice(&pba.to_le_bytes());
             }
             CAP_PCIE => {
                 /* Version 2, an endpoint; FLR or not; device control as the
@@ -387,28 +690,85 @@ pub fn make(r: &mut Input, nvidia: bool) -> Made {
         }
     }
 
+    extended(r, &mut space);
+
     let host_devctl = if layout.pcie != 0 {
         u16::from_le_bytes([space[layout.pcie + DEVCTL], space[layout.pcie + DEVCTL + 1]])
     } else {
         0
     };
-    /* Given where it is an endpoint with one MSI, no MSI-X, at most one of
-     * each kind the host keeps registers of, and a list that ends */
+    /* Given where it is an endpoint with at most one of each kind the host
+     * keeps registers of, a list that ends, and MSI-X with its table and PBA
+     * in BARs given or MSI to give -- and the pages it traps mapped */
     let count = |id: u8| caps.iter().filter(|&&(c, _)| c == id).count();
-    let givable = !bridge && count(CAP_MSI) == 1 && count(CAP_MSIX) == 0 && count(CAP_PM) <= 1
-        && count(CAP_PCIE) <= 1 && count(CAP_AF) <= 1 && !broken_list;
-    let model = Model { space, layout, host_command, host_devctl, broken: None, bar0_writes: Vec::new(), writes: 0 };
-    Made { model: Arc::new(Mutex::new(model)), bars, givable }
+    let msix_given = count(CAP_MSIX) == 1 && msix_at.is_some_and(|x| x.inside);
+    let map_fails = r.u8() < 8;
+    let traps = mirror_page || msix_given;
+    let givable = !bridge && count(CAP_MSI) <= 1 && count(CAP_MSIX) <= 1 && count(CAP_PM) <= 1
+        && count(CAP_PCIE) <= 1 && count(CAP_AF) <= 1 && !broken_list && (msix_given || count(CAP_MSI) == 1)
+        && !(map_fails && traps);
+    let model = Model { space, layout, host_command, host_devctl, broken: None, page_writes: Vec::new(),
+                        pages: Vec::new(), map_fails, msix: msix_at, msix_given,
+                        caps: caps.iter().map(|&(_, at)| at).collect(), writes: 0 };
+    Made { model: Arc::new(Mutex::new(model)), bars, givable, caps }
 }
 
-fn msi_len_of(control: u16) -> usize {
-    let base = if control & MSI_64 != 0 { 0x10 } else { 0x0C };
-    if control & MSI_MASKABLE != 0 { base + 8 } else { base }
+/// MSI-X as the guest sees it, by the spec: the entries it is given, its
+/// control word's enable and function mask, its table's bytes -- an entry
+/// sixteen: address, data, vector control -- and what is held pending.
+struct GuestMsix {
+    at: MsixAt,
+    given: usize,
+    control: u16,
+    table: Vec<u8>,
+    pending: Vec<bool>,
+}
+
+impl GuestMsix {
+    fn new(at: MsixAt) -> GuestMsix {
+        let given = at.entries.min(MAX_VECTORS);
+        let mut table = vec![0u8; given * ENTRY as usize];
+        /* Masked, every entry, as a reset leaves them */
+        for e in 0..given {
+            table[e * ENTRY as usize + 12] = 1;
+        }
+        GuestMsix { at, given, control: 0, table, pending: vec![false; given] }
+    }
+
+    /// The writable bits of the table's byte `k`: a dword-aligned address
+    /// (its two low bits none), the data, and the vector control's mask.
+    fn writable(k: usize) -> u8 {
+        match k % ENTRY as usize {
+            0 => 0xFC,
+            1..=11 => 0xFF,
+            12 => 0x01,
+            _ => 0,
+        }
+    }
+
+    fn u32_at(&self, k: usize) -> u32 {
+        u32::from_le_bytes(self.table[k..k + 4].try_into().unwrap())
+    }
+
+    /// The message entry `i` sends now: None while MSI-X is off, masked
+    /// whole, or the entry is masked -- or there is no such entry.
+    fn message(&self, i: usize) -> Option<(u64, u32)> {
+        if i >= self.given || self.control & MSIX_ENABLE == 0 || self.control & MSIX_FUNCTION_MASK != 0 {
+            return None;
+        }
+        let e = i * ENTRY as usize;
+        if self.table[e + 12] & 1 != 0 {
+            return None;
+        }
+        let address = u64::from(self.u32_at(e)) | (u64::from(self.u32_at(e + 4)) << 32);
+        Some((address, self.u32_at(e + 8)))
+    }
 }
 
 /// What the guest sees, by the spec: each register of the six BARs as the
-/// guest has it, the command register's three bits, the line, and the MSI
-/// capability's registers -- a byte at a time, each with its writable bits.
+/// guest has it, the command register's three bits, the line, the MSI
+/// capability's registers -- a byte at a time, each with its writable bits
+/// -- or MSI-X, and which of the two is not shown.
 struct Judge {
     bars: [Option<Bar>; 6],
     regs: [u32; 6],
@@ -417,19 +777,48 @@ struct Judge {
     msi: [u8; 0x18],
     msi_at: usize,
     msi_control: u16,
+    /// Whether MSI is what the guest is given.
+    msi_given: bool,
     pending: bool,
+    msix: Option<GuestMsix>,
+    msix_cap: usize,
+    /// The capability not shown, and its bytes.
+    hidden: Option<(usize, usize)>,
+    /// The ROM given, and the guest's ROM BAR register (PCI 3.0, 6.2.5.2):
+    /// its address bits above the ROM's size and its enable are the guest's.
+    rom: Option<(Vec<u8>, u32)>,
+    /// Whether the function is one of several behind its port: its header
+    /// type's multi-function bit, whatever the device's says.
+    multi: bool,
 }
 
 impl Judge {
+    /// Where the guest has the ROM decoded: its address while on, 0 off.
+    fn rom_window(&self) -> u64 {
+        self.rom.as_ref().map_or(0, |&(_, r)| if r & 1 != 0 { u64::from(r & 0xFFFF_F800) } else { 0 })
+    }
+
     fn new(bars: [Option<Bar>; 6], m: &Model) -> Judge {
         let msi_at = m.layout.msi;
-        let msi_control = m.u16_at(msi_at + 2);
+        let msi_control = if msi_at != 0 { m.u16_at(msi_at + 2) } else { 0 };
+        let msix = if m.msix_given { m.msix.map(GuestMsix::new) } else { None };
+        let hidden = match (msix.is_some(), msi_at, m.layout.msix) {
+            (true, 0, _) => None,
+            (true, at, _) => Some((at, msi_len_of(msi_control))),
+            (false, _, 0) => None,
+            (false, _, at) => Some((at, MSIX_LEN)),
+        };
         let mut j = Judge { bars, regs: [0; 6], command: 0, line: 0, msi: [0; 0x18], msi_at, msi_control,
-                            pending: false };
+                            msi_given: msix.is_none() && msi_at != 0, pending: false, msix,
+                            msix_cap: m.layout.msix, hidden, rom: None, multi: false };
         for k in 0..6 {
             j.regs[k] = j.fixed(k);
         }
         j
+    }
+
+    fn hides(&self, b: usize) -> bool {
+        self.hidden.is_some_and(|(at, len)| b >= at && b < at + len)
     }
 
     /// The BAR whose register `k` is, and whether it is that BAR's high half.
@@ -489,8 +878,14 @@ impl Judge {
         u32::from_le_bytes(self.msi[o..o + 4].try_into().unwrap())
     }
 
-    /// The message the device's interrupt sends now, by the registers.
-    fn message(&self) -> Option<(u64, u32)> {
+    /// The message the device's interrupt `i` sends now, by the registers.
+    fn message(&self, i: usize) -> Option<(u64, u32)> {
+        if let Some(x) = &self.msix {
+            return x.message(i);
+        }
+        if i != 0 || !self.msi_given {
+            return None;
+        }
         let wide = self.msi_control & MSI_64 != 0;
         let data_at = if wide { 0x0C } else { 0x08 };
         let enabled = self.msi[2] & MSI_ENABLE as u8 != 0;
@@ -503,10 +898,34 @@ impl Judge {
         Some((address, data))
     }
 
+    /// How many messages the device has, as the guest is given them.
+    fn messages(&self) -> usize {
+        self.msix.as_ref().map_or(1, |x| x.given)
+    }
+
+    fn is_pending(&self, i: usize) -> bool {
+        match &self.msix {
+            Some(x) => x.pending.get(i).copied().unwrap_or(false),
+            None => i == 0 && self.pending,
+        }
+    }
+
+    fn set_pending(&mut self, i: usize, on: bool) {
+        match &mut self.msix {
+            Some(x) => {
+                if let Some(p) = x.pending.get_mut(i) {
+                    *p = on;
+                }
+            }
+            None if i == 0 => self.pending = on,
+            None => {}
+        }
+    }
+
     /// A guest's write of `size` bytes of `value` at `at`, as the registers
     /// take it; the BAR it moved, if it did: (bar, from, to).
     fn write(&mut self, at: usize, size: usize, value: u32) -> Option<(usize, u64, u64)> {
-        if at >= SPACE || size == 0 || !matches!(size, 1 | 2 | 4) || at % size != 0 || at + size > SPACE {
+        if size == 0 || !matches!(size, 1 | 2 | 4) || at % size != 0 || at + size > HEADER_SPACE {
             return None;
         }
         let bytes = value.to_le_bytes();
@@ -533,8 +952,27 @@ impl Judge {
                         }
                     }
                 }
+                0x30..=0x33 if self.rom.is_some() => {
+                    let before = self.rom_window();
+                    let shift = 8 * (b - ROM);
+                    if let Some((image, reg)) = self.rom.as_mut() {
+                        let writable = (!(image.len() as u32 - 1) & 0xFFFF_F800) | 1;
+                        *reg = ((*reg & !(0xFF << shift)) | (u32::from(v) << shift)) & writable;
+                    }
+                    let to = self.rom_window();
+                    if to != before {
+                        moved = Some((ROM_BAR, moved.map_or(before, |(_, f, _)| f), to));
+                    }
+                }
                 INTERRUPT_LINE => self.line = v,
-                _ if self.msi_at != 0 && b >= self.msi_at && b < self.msi_at + msi_len_of(self.msi_control) => {
+                _ if self.hides(b) => {}
+                _ if self.msix.is_some() && (b == self.msix_cap + 2 || b == self.msix_cap + 3) => {
+                    let shift = 8 * (b - self.msix_cap - 2);
+                    let bits = ((MSIX_ENABLE | MSIX_FUNCTION_MASK) >> shift) & 0xFF;
+                    let x = self.msix.as_mut().unwrap();
+                    x.control = (x.control & !(bits << shift)) | ((u16::from(v) & bits) << shift);
+                }
+                _ if self.msi_given && b >= self.msi_at && b < self.msi_at + msi_len_of(self.msi_control) => {
                     let o = b - self.msi_at;
                     let w = self.msi_writable(o);
                     self.msi[o] = (self.msi[o] & !w) | (v & w);
@@ -545,18 +983,71 @@ impl Judge {
         /* A BAR moved and moved back within one write is no move */
         moved.filter(|&(_, from, to)| from != to)
     }
+
+    /// What the guest reads of the byte `offset` into BAR `bar` of a page
+    /// MSI-X traps, as the spec has it -- None for one of the device's own
+    /// registers, whose byte the model holds -- and the write of `v` there.
+    fn msix_byte(&mut self, bar: usize, offset: u64, write: Option<u8>) -> Option<u8> {
+        let x = self.msix.as_mut()?;
+        let a = x.at;
+        if bar == a.table_bar && offset >= a.table && offset - a.table < a.table_len() {
+            let k = (offset - a.table) as usize;
+            if k >= x.table.len() {
+                return Some(0);
+            }
+            if let Some(v) = write {
+                let w = GuestMsix::writable(k);
+                x.table[k] = (x.table[k] & !w) | (v & w);
+            }
+            return Some(x.table[k]);
+        }
+        if bar == a.pba_bar && offset >= a.pba && offset - a.pba < a.pba_len() {
+            let first = (offset - a.pba) as usize * 8;
+            let byte = (0..8).filter(|&b| x.pending.get(first + b).copied().unwrap_or(false))
+                .fold(0u8, |v, b| v | (1 << b));
+            return Some(byte);
+        }
+        None
+    }
+
+    /// The pages of the BARs the host must trap: NVIDIA's mirror, and every
+    /// page MSI-X's table or PBA has a byte in.
+    fn traps(&self, mirror: bool) -> Vec<(usize, u64)> {
+        let mut pages = Vec::new();
+        if mirror {
+            pages.push((0, u64::from(NVIDIA_MIRROR)));
+        }
+        if let Some(x) = &self.msix {
+            let a = x.at;
+            for (bar, start, len) in [(a.table_bar, a.table, a.table_len()), (a.pba_bar, a.pba, a.pba_len())] {
+                let mut page = start & !(PAGE - 1);
+                while page < start + len {
+                    if !pages.contains(&(bar, page)) {
+                        pages.push((bar, page));
+                    }
+                    page += PAGE;
+                }
+            }
+        }
+        pages.sort();
+        pages
+    }
 }
 
 /// Registers worth the guest's while, and any.
 fn register(r: &mut Input, layout: &Layout) -> usize {
-    let at = match r.u8() % 8 {
+    let at = match r.u8() % 9 {
         0 => COMMAND,
         1 | 2 => BAR0 + 4 * r.below(6) as usize + r.pick(&[0, 0, 0, 1, 2, 3]),
         3 if layout.msi != 0 => layout.msi + r.below(0x18) as usize,
         4 if layout.pcie != 0 => layout.pcie + r.pick(&[DEVCTL, DEVCTL + 1, DEVCTL + 2, LNKCTL, 0x28]),
         5 if layout.pm != 0 => layout.pm + PMCSR + r.below(4) as usize,
         6 => r.pick(&[ROM, INTERRUPT_LINE, INTERRUPT_PIN, HEADER_TYPE, CAP_POINTER, STATUS, 0x00]),
-        _ => r.below(SPACE as u64) as usize,
+        7 if layout.msix != 0 => layout.msix + r.below(MSIX_LEN as u64) as usize,
+        /* The extended space: where a list's headers mostly are, or any */
+        8 if r.bool() => 0x100 + r.below(0x40) as usize,
+        8 => r.below(SPACE as u64) as usize,
+        _ => r.below(HEADER_SPACE as u64) as usize,
     };
     at.min(SPACE - 1)
 }
@@ -580,6 +1071,61 @@ fn held(model: &Arc<Mutex<Model>>, judge: &Judge) {
     }
 }
 
+/// What a guest's write let out of what was held pending, against what the
+/// registers say: each message held that can go now, sent once, in order.
+fn released(messages: &Messages, judge: &mut Judge) {
+    let mut sent = Vec::new();
+    messages.send_pending(|address, data| sent.push((address, data)));
+    let mut want = Vec::new();
+    for i in 0..judge.messages() {
+        if judge.is_pending(i) {
+            if let Some(m) = judge.message(i) {
+                want.push(m);
+                judge.set_pending(i, false);
+            }
+        }
+    }
+    invariant!(sent == want, "messages let out {:?}, the registers' {:?}", sent, want);
+}
+
+/// The capability list as the guest walks it, against the real one: the
+/// same capabilities in the same order but the one not shown, and an end.
+fn walked(f: &HostFunction, made: &Made, judge: &Judge) {
+    let mut seen = Vec::new();
+    let mut at = (f.config_read(CAP_POINTER, 1) & 0xFC) as usize;
+    while at != 0 && seen.len() <= made.caps.len() {
+        seen.push(at);
+        at = (f.config_read(at + 1, 1) & 0xFC) as usize;
+    }
+    let want: Vec<usize> = made.caps.iter().map(|&(_, at)| at).filter(|&at| judge.hidden.is_none_or(|(h, _)| h != at))
+        .collect();
+    invariant!(at == 0 && seen == want, "the capability list walked {:x?}, not the real one's {:x?} without {:?}",
+               seen, want, judge.hidden);
+    /* The extended list as Linux walks it: from 0x100, a header of 0 none,
+     * a header of none past it -- and every one found shown */
+    let want = ext_list(&made.model.lock().unwrap().space);
+    let mut seen = Vec::new();
+    let mut at = HEADER_SPACE;
+    let mut head = f.config_read(at, 4);
+    while head != 0 && seen.len() <= want.len() {
+        if head & 0xFFFF != 0 {
+            seen.push(at);
+        }
+        at = (head >> 20) as usize & 0xFFC;
+        if at < HEADER_SPACE {
+            break;
+        }
+        head = f.config_read(at, 4);
+    }
+    invariant!(seen == want && seen.iter().all(|&a| EXT_SHOWN.contains(&(f.config_read(a, 4) & 0xFFFF))),
+               "the extended list walked {:x?}, not the shown of the real one's {:x?}", seen, want);
+    if let Some(x) = &judge.msix {
+        let control = (f.config_read(judge.msix_cap + 2, 2)) as u16;
+        invariant!(control == ((x.given - 1) as u16 | x.control),
+                   "MSI-X's control read {:#x}: {} entries given, the guest's bits {:#x}", control, x.given, x.control);
+    }
+}
+
 pub fn hostfn_target(r: &mut Input) {
     let nvidia = r.bool();
     let made = make(r, nvidia);
@@ -588,17 +1134,50 @@ pub fn hostfn_target(r: &mut Input) {
                if made.givable { "can be, not" } else { "cannot be, " });
     let Some(mut f) = function else {
         let m = made.model.lock().unwrap();
-        invariant!(m.writes == 0 && m.bar0_writes.is_empty() && m.broken.is_none(),
-                   "a function not given written: {} writes, {} of BAR0 ({:?})", m.writes, m.bar0_writes.len(),
+        invariant!(m.writes == 0 && m.page_writes.is_empty() && m.broken.is_none(),
+                   "a function not given written: {} writes, {} of its BARs ({:?})", m.writes, m.page_writes.len(),
                    m.broken);
         return;
     };
     let layout = made.model.lock().unwrap().layout;
     let mut judge = Judge::new(made.bars, &made.model.lock().unwrap());
+    let mirror = nvidia && made.bars[0].is_some_and(|b| u64::from(NVIDIA_MIRROR + MIRROR_BYTES) <= b.size);
+    let traps = judge.traps(mirror);
+    let msix_pages: Vec<(usize, u64)> = judge.traps(false);
+    {
+        let mut got: Vec<(usize, u64)> = f.traps().iter().map(|t| (t.bar, t.offset)).collect();
+        got.sort();
+        invariant!(got == traps, "pages trapped {:x?}, not {:x?}", got, traps);
+        let m = made.model.lock().unwrap();
+        let mut mapped: Vec<(usize, u64)> = m.pages.iter().map(|p| (p.0, p.1)).collect();
+        mapped.sort();
+        invariant!(mapped == traps, "pages mapped {:x?}, not the ones trapped {:x?}", mapped, traps);
+    }
+    invariant!(f.msix_layout().is_some() == judge.msix.is_some(), "MSI-X {} given",
+               if judge.msix.is_some() { "not" } else { "" });
     held(&made.model, &judge);
-    let msi = f.msi();
+    walked(&f, &made, &judge);
+    let messages = f.messages();
+    invariant!(messages.count() == judge.messages(), "{} messages, not {}", messages.count(), judge.messages());
+    /* Now and then a ROM, as the module reads one: a power of two of 2 KiB
+     * to 2 MiB is given, any other size refused */
+    if r.u8() < 64 {
+        let len = match r.u8() % 8 {
+            0 => r.pick(&[ROM_MIN / 2, ROM_MIN + 512, 3 << 12, ROM_MAX * 2]),
+            _ => ROM_MIN << r.below(6),
+        };
+        let mut image: Vec<u8> = (0..len).map(|k| (k as u8) ^ 0x5A).collect();
+        image[0] = 0x55;
+        image[1] = 0xAA;
+        let given = f.set_rom(image.clone().into_boxed_slice());
+        let want = len.is_power_of_two() && (ROM_MIN..=ROM_MAX).contains(&len);
+        invariant!(given == want, "a ROM of {} bytes {} given", len, if want { "not" } else { "" });
+        if given {
+            judge.rom = Some((image, 0));
+        }
+    }
 
-    while let Some(op) = r.op(10) {
+    while let Some(op) = r.op(16) {
         match op {
             0 | 1 => {
                 /* A register written, as the bus has the guest write it */
@@ -620,16 +1199,26 @@ pub fn hostfn_target(r: &mut Input) {
                 let shift = 8 * (at - dword);
                 let mask = if size == 4 { u32::MAX } else { (1u32 << (8 * size)) - 1 };
                 let expect = match dword {
+                    d if d >= HEADER_SPACE && d < SPACE => {
+                        let m = made.model.lock().unwrap();
+                        Some(ext_view(&m.space, &ext_list(&m.space), d))
+                    }
                     d if (BAR0..BAR0 + 24).contains(&d) => Some(judge.regs[(d - BAR0) / 4]),
-                    ROM => Some(0),
+                    ROM => Some(judge.rom.as_ref().map_or(0, |&(_, r)| r)),
                     /* The device's pin, in the dword's second byte */
                     _ if at == INTERRUPT_PIN && size == 1 => {
                         Some(u32::from(made.model.lock().unwrap().space[INTERRUPT_PIN]) << 8)
                     }
                     _ if at == INTERRUPT_LINE && size == 1 => Some(u32::from(judge.line)),
                     _ if at == HEADER_TYPE && size == 1 => None,
-                    d if judge.msi_at != 0 && d >= judge.msi_at + 4 && d < judge.msi_at + msi_len_of(judge.msi_control) => {
+                    d if judge.hides(d) => Some(0),
+                    d if judge.msi_given && d >= judge.msi_at + 4
+                        && d < judge.msi_at + msi_len_of(judge.msi_control) =>
+                    {
                         Some(judge.msi_u32(d - judge.msi_at))
+                    }
+                    d if judge.msix.is_some() && (d == judge.msix_cap + 4 || d == judge.msix_cap + 8) => {
+                        Some(made.model.lock().unwrap().u32_at(d))
                     }
                     _ => None,
                 };
@@ -638,7 +1227,9 @@ pub fn hostfn_target(r: &mut Input) {
                                at, v, (e >> shift) & mask);
                 }
                 if at == HEADER_TYPE && size == 1 {
-                    invariant!(v & 0x80 == 0, "the header type read {:#x}: another function said to be there", v);
+                    invariant!((v & 0x80 != 0) == judge.multi, "the header type read {:#x}: {}", v,
+                               if judge.multi { "a function alone, of several" } else { "another function said to be there" });
+                    invariant!(v & 0x7F == 0, "the header type read {:#x}: no type 0 header", v);
                 }
                 if dword == COMMAND && shift == 0 && size >= 2 {
                     invariant!(v as u16 & (COMMAND_IO | COMMAND_MEMORY | COMMAND_MASTER) == judge.command,
@@ -686,7 +1277,7 @@ pub fn hostfn_target(r: &mut Input) {
                                "BAR {} placed at {:#x}, at {:#x}", i, gpa, f.guest_address(i));
                 }
             }
-            5 if layout.msi != 0 => {
+            5 if judge.msi_given => {
                 /* MSI programmed: an address, data, maybe its mask, on */
                 let base = layout.msi;
                 let wide = judge.msi_control & MSI_64 != 0;
@@ -703,29 +1294,25 @@ pub fn hostfn_target(r: &mut Input) {
                     let _ = f.config_write(at, size, value);
                     let _ = judge.write(at, size, value);
                 }
-                invariant!(msi.message() == judge.message(), "MSI's message {:?}, the registers' {:?}", msi.message(),
-                           judge.message());
-                /* What was held pending goes as it may */
-                let sent = msi.take_pending();
-                let want = if judge.pending { judge.message() } else { None };
-                invariant!(sent == want, "pending MSI sent as {:?}, not {:?}", sent, want);
-                if sent.is_some() {
-                    judge.pending = false;
+                invariant!(messages.message(0) == judge.message(0), "MSI's message {:?}, the registers' {:?}",
+                           messages.message(0), judge.message(0));
+            }
+            5 | 6 => {
+                /* One of the device's interrupts -- now and then one past
+                 * those given, which no handler of the host's is for */
+                let past = u64::from(r.u8() < 16);
+                let i = r.below(judge.messages() as u64 + past) as usize;
+                let sent = messages.raise(i);
+                let now = judge.message(i);
+                invariant!(sent == now, "interrupt {} raised sends {:?}, the registers say {:?}", i, sent, now);
+                if now.is_none() && i < judge.messages() {
+                    judge.set_pending(i, true);
                 }
             }
-            6 => {
-                /* The device's interrupt */
-                let sent = msi.raise();
-                let now = judge.message();
-                invariant!(sent == now, "an MSI raised sends {:?}, the registers say {:?}", sent, now);
-                if now.is_none() {
-                    judge.pending = true;
-                }
-            }
-            7 if nvidia => {
+            7 if mirror => {
                 /* NVIDIA's mirror, read or written: the configuration space's
                  * access, past its end nothing, the MSI's first two bytes
-                 * acknowledged through the real one */
+                 * acknowledged through the real one where MSI is given */
                 let offset = match r.u8() % 8 {
                     0..=4 => register(r, &layout) as u32,
                     5 => NVIDIA_MSI_REARM,
@@ -734,7 +1321,7 @@ pub fn hostfn_target(r: &mut Input) {
                 let size = r.pick(&[4usize, 4, 2, 1, 8]);
                 let write = r.bool();
                 let value = r.value32();
-                let acks = made.model.lock().unwrap().bar0_writes.len();
+                let acks = made.model.lock().unwrap().page_writes.len();
                 let at = offset as usize;
                 let sized = matches!(size, 1 | 2 | 4);
                 let inside = sized && at + size <= SPACE;
@@ -747,35 +1334,174 @@ pub fn hostfn_target(r: &mut Input) {
                     /* QEMU's rule: an acknowledgement is a write within the
                      * capability's id and next pointer, and nothing past;
                      * and Pascal's on: a dword at 0x704 */
-                    let ack = (inside && layout.msi != 0 && at >= layout.msi && at + size <= layout.msi + 2)
+                    let ack = (inside && judge.msi_given && at >= layout.msi && at + size <= layout.msi + 2)
                         || (offset == NVIDIA_MSI_REARM && size == 4);
-                    let now = made.model.lock().unwrap().bar0_writes.len();
+                    let now = made.model.lock().unwrap().page_writes.len();
                     invariant!(now == acks + usize::from(ack), "a mirror write of {} bytes at {:#x}: {} acknowledgements, \
                                                                not {}", size, offset, now - acks, usize::from(ack));
                 } else if let Some(b) = before {
                     invariant!(v == b, "the mirror read {:#x} at {:#x}, the space {:#x}", v, offset, b);
-                } else if !sized {
-                    invariant!(v == u32::MAX, "a mirror read of {} bytes at {:#x}: {:#x}, not all ones", size, offset, v);
                 } else {
-                    invariant!(v == 0, "the mirror past the space read {:#x} at {:#x}", v, offset);
+                    let ones = match size { 1 => 0xFF, 2 => 0xFFFF, _ => u32::MAX };
+                    invariant!(v == ones, "a mirror read of {} bytes at {:#x}, past the space or of no size: \
+                                           {:#x}, not all ones", size, offset, v);
                 }
             }
             8 => bar_decoded(r),
+            9 | 10 if judge.msix.is_some() => {
+                /* A page MSI-X traps: its table programmed -- an address, the
+                 * data, the mask -- read back, its PBA read, or a register of
+                 * the device's beside them reached; mostly as a driver does
+                 * it, dword or qword aligned, now and then any way at all */
+                let x = judge.msix.as_ref().unwrap();
+                let a = x.at;
+                let given = x.given;
+                let (bar, offset) = match r.u8() % 8 {
+                    0..=3 => {
+                        let past = u64::from(r.u8() < 16);
+                        let e = r.below(given as u64 + past);
+                        (a.table_bar, a.table + e * ENTRY + 4 * r.below(4))
+                    }
+                    4 => (a.pba_bar, a.pba + 8 * r.below(a.pba_len() / 8)),
             _ => {
-                /* Anything at all: no panic, and no rule broken */
+                        let (bar, page) = r.pick(&msix_pages);
+                        (bar, page + r.below(PAGE))
+                    }
+                };
+                let size = if r.u8() < 220 { r.pick(&[4usize, 4, 4, 8]) } else { r.pick(&[1usize, 2, 4, 8]) };
+                let offset = if r.u8() < 224 { offset & !(size as u64 - 1) } else { offset };
+                let offset = offset.min((offset & !(PAGE - 1)) + PAGE - size as u64);
+                let write = op == 10 || r.u8() < 32;
+                let value = match offset.wrapping_sub(a.table) % ENTRY {
+                    12 if r.u8() < 200 => u64::from(r.u8() < 64),
+                    _ => r.value64(),
+                };
+                let before = made.model.lock().unwrap().page_writes.len();
+                let (got, moves) = f.trapped(bar, offset, size, write, value);
+                if !traps.contains(&(bar, offset & !(PAGE - 1))) {
+                    /* Past the table's last page: one that maps, reaching
+                     * nothing here */
+                    let ones = match size { 1 => 0xFF, 2 => 0xFFFF, 4 => 0xFFFF_FFFF, _ => u64::MAX };
+                    let reached = made.model.lock().unwrap().page_writes.len() - before;
+                    invariant!(got == ones && reached == 0, "BAR{} at {:#x}, a page that does not trap, read {:#x} and \
+                                                            reached {} times", bar, offset, got, reached);
+                    released(&messages, &mut judge);
+                    held(&made.model, &judge);
+                    continue;
+                }
+                invariant!(moves.iter().next().is_none(), "a write of MSI-X's page moved a BAR");
+                /* Byte by byte, by the spec: the table's and the PBA's the
+                 * guest's own, the rest the device's */
+                let mut want = 0u64;
+                let mut device = Vec::new();
+                for k in 0..size as u64 {
+                    let v = (value >> (8 * k)) as u8;
+                    match judge.msix_byte(bar, offset + k, write.then_some(v)) {
+                        Some(b) => want |= u64::from(b) << (8 * k),
+                        None => device.push(k),
+                    }
+                }
+                let m = made.model.lock().unwrap();
+                if let Some((i, _)) = m.pages.iter().enumerate().find(|(_, p)| p.0 == bar && p.1 == offset & !(PAGE - 1)) {
+                    for &k in &device {
+                        let at = ((offset + k) & (PAGE - 1)) as usize;
+                        want |= u64::from(m.pages[i].2[at]) << (8 * k);
+                    }
+                }
+                let reached = m.page_writes.len() - before;
+                drop(m);
+                if !write {
+                    invariant!(got == want, "BAR{} read {} bytes at {:#x}: {:#x}, not {:#x}", bar, size, offset, got,
+                               want);
+                }
+                invariant!(write || reached == 0, "a read of BAR{} at {:#x} wrote the device", bar, offset);
+                invariant!(!write || device.is_empty() || reached > 0,
+                           "a write of the device's registers at BAR{} {:#x} never reached it", bar, offset);
+            }
+            11 if judge.msix.is_some() => {
+                /* MSI-X turned on, off, masked whole or not */
+                let at = judge.msix_cap + 2 + usize::from(r.u8() < 32);
+                let size = if at % 2 == 0 { r.pick(&[2usize, 1]) } else { 1 };
+                let value = match r.u8() % 4 {
+                    0 => u32::from(MSIX_ENABLE),
+                    1 => u32::from(MSIX_ENABLE | MSIX_FUNCTION_MASK),
+                    2 => 0,
+                    _ => r.value32(),
+                } >> (8 * (at - judge.msix_cap - 2));
+                let _ = f.config_write(at, size, value);
+                let _ = judge.write(at, size, value);
+            }
+            12 => walked(&f, &made, &judge),
+            13 if judge.rom.is_some() => {
+                /* The ROM placed, as firmware places it, or read where the
+                 * guest has it: its image, all ones past its end; and where
+                 * it is decoded, as its register says */
+                let size = judge.rom.as_ref().unwrap().0.len() as u64;
+                if r.u8() < 48 {
+                    let gpa = if r.u8() < 200 { (r.u64() & 0xFFFF_FFFF) & !(size - 1) } else { r.u64() };
+                    let ok = f.place_rom(gpa);
+                    let want = gpa % size == 0 && gpa <= u64::from(u32::MAX);
+                    invariant!(ok == want, "the ROM placed at {:#x}: {}", gpa, ok);
+                    if ok {
+                        judge.rom.as_mut().unwrap().1 = gpa as u32 & 0xFFFF_F800;
+                    }
+                }
+                let offset = r.below(size + 16);
+                let len = r.pick(&[1usize, 2, 4, 4, 8]);
+                let got = f.rom_read(offset, len);
+                let image = &judge.rom.as_ref().unwrap().0;
+                let mut want = [0xFFu8; 8];
+                for (k, b) in want.iter_mut().enumerate().take(len) {
+                    if let Some(&byte) = image.get(offset as usize + k) {
+                        *b = byte;
+                    }
+                }
+                let mask = if len == 8 { u64::MAX } else { (1u64 << (8 * len)) - 1 };
+                let want = u64::from_le_bytes(want) & mask;
+                invariant!(got == want, "the ROM's {} bytes at {:#x} read {:#x}, not {:#x}", len, offset, got, want);
+                invariant!(f.rom_window().unwrap_or(0) == judge.rom_window(), "the ROM decoded at {:?}, not {:#x}",
+                           f.rom_window(), judge.rom_window());
+            }
+            15 => {
+                /* One of several functions of a device behind its port, or
+                 * alone (`run::add_host_function`) */
+                let multi = r.bool();
+                f.set_multifunction(multi);
+                judge.multi = multi;
+            }
+            _ => {
+                /* Anything at all: no panic, and no rule broken -- a page that
+                 * does not trap among it */
                 let at = r.below(300) as usize;
                 let size = r.below(9) as usize;
                 let value = r.value32();
-                if r.bool() {
-                    let _ = f.config_read(at, size);
-                } else {
-                    let moved = f.config_write(at, size, value);
-                    let want = judge.write(at, size, value);
-                    let got = moved.map(|m| (m.bar, m.from, m.to));
-                    invariant!(got == want, "a write of {} bytes at {:#x} moved {:?}, not {:?}", size, at, got, want);
+                match r.u8() % 3 {
+                    0 => {
+                        let _ = f.config_read(at, size);
+                    }
+                    1 => {
+                        let moved = f.config_write(at, size, value);
+                        let want = judge.write(at, size, value);
+                        let got = moved.map(|m| (m.bar, m.from, m.to));
+                        invariant!(got == want, "a write of {} bytes at {:#x} moved {:?}, not {:?}", size, at, got, want);
+                    }
+                    _ => {
+                        let bar = r.below(7) as usize;
+                        let offset = r.u64() & 0xFFFF_FFFF;
+                        let trapped = traps.contains(&(bar, offset & !(PAGE - 1)));
+                        if !trapped {
+                            let before = made.model.lock().unwrap().page_writes.len();
+                            let (v, _) = f.trapped(bar, offset, size, r.bool(), u64::from(value));
+                            let after = made.model.lock().unwrap().page_writes.len();
+                            let ones = match size { 1 => 0xFF, 2 => 0xFFFF, 4 => 0xFFFF_FFFF, _ => u64::MAX };
+                            invariant!(after == before && v == ones,
+                                       "a page that does not trap reached: BAR{} at {:#x}, read {:#x}", bar, offset, v);
+                        }
+                    }
                 }
             }
         }
+        released(&messages, &mut judge);
         held(&made.model, &judge);
     }
 }
@@ -787,7 +1513,6 @@ pub fn hostfn_target(r: &mut Input) {
 /// is a page or more, assigned and aligned, a 32-bit one 2 GiB at most. And
 /// any registers at all decode to a BAR of such a size, or to none.
 fn bar_decoded(r: &mut Input) {
-    const PAGE: u64 = 4096;
     let wide = r.bool();
     let size = 1u64 << (4 + r.below(if wide { 44 } else { 28 }));
     let prefetchable = r.bool();
@@ -866,10 +1591,12 @@ pub fn gpu(r: &mut Input) -> Made {
     /* Device control as out of reset: no snoop on, 512-byte reads */
     let devctl = DEVCTL_NO_SNOOP | (0x2 << 12) | (0x1 << 5) | 0x7;
     space[SLOT_PCIE + DEVCTL..SLOT_PCIE + DEVCTL + 2].copy_from_slice(&devctl.to_le_bytes());
-    let layout = Layout { pm: SLOT_PM, msi: SLOT_MSI, pcie: SLOT_PCIE, af: 0 };
-    let model = Model { space, layout, host_command: 0, host_devctl: devctl, broken: None, bar0_writes: Vec::new(),
-                        writes: 0 };
-    Made { model: Arc::new(Mutex::new(model)), bars, givable: true }
+    let layout = Layout { pm: SLOT_PM, msi: SLOT_MSI, msix: 0, pcie: SLOT_PCIE, af: 0 };
+    let model = Model { space, layout, host_command: 0, host_devctl: devctl, broken: None, page_writes: Vec::new(),
+                        pages: Vec::new(), map_fails: false, msix: None, msix_given: false,
+                        caps: vec![SLOT_PM, SLOT_MSI, SLOT_PCIE], writes: 0 };
+    let caps = vec![(CAP_PM, SLOT_PM), (CAP_MSI, SLOT_MSI), (CAP_PCIE, SLOT_PCIE)];
+    Made { model: Arc::new(Mutex::new(model)), bars, givable: true, caps }
 }
 
 /// The host's rules, after a run of a whole guest that held the function:

@@ -33,6 +33,8 @@ pub static ALL: &[Target] = &[
     Target { name: "pvpanic", run: pvpanic_target, max_len: 512 },
     Target { name: "pci", run: pci_bus, max_len: 2048 },
     Target { name: "hostfn", run: crate::hostmodel::hostfn_target, max_len: 4096 },
+    Target { name: "port", run: crate::portmodel::port_target, max_len: 2048 },
+    Target { name: "groups", run: crate::groupsmodel::groups_target, max_len: 1024 },
     Target { name: "lapic", run: lapic_target, max_len: 4096 },
     Target { name: "ioapic", run: ioapic_target, max_len: 4096 },
     Target { name: "msi", run: msi, max_len: 1024 },
@@ -429,6 +431,15 @@ fn pci_address(slot: u32, reg: u32) -> u32 {
     0x8000_0000 | (slot << 11) | (reg & 0xFC)
 }
 
+/// All ones, `size` bytes of them: a read of nothing.
+fn size_ones(size: usize) -> u32 {
+    match size {
+        1 => 0xFF,
+        2 => 0xFFFF,
+        _ => u32::MAX,
+    }
+}
+
 fn pci_bus(r: &mut Input) {
     let mut bus = PciBus::new().expect("a bus");
     bus.add(Function::device(&Blk::identity(), 0xC000, blk::BAR_SIZE, 11).with_msix(2, 0xFE00_1000))
@@ -436,8 +447,53 @@ fn pci_bus(r: &mut Input) {
     bus.add(Function::device(&Net::identity(), 0xC100, net::BAR_SIZE, 10)).expect("a NIC");
     /* A host's function on slot 3, whose space is the run loop's */
     let host = bus.add_host().expect("a host's function");
-    while let Some(op) = r.op(7) {
+    while let Some(op) = r.op(8) {
         match op {
+            7 => {
+                /* ECAM: an offset of bus 0 names the function and register
+                 * the ports' address does, a read of the 256 bytes reads what
+                 * the ports read -- a write of them writes what theirs would
+                 * -- and the extended space past them is none's: zeroes for a
+                 * function there, all ones for none */
+                let (device, function) = (r.below(32) as u32, if r.u8() < 200 { 0 } else { r.below(8) as u32 });
+                let reg = if r.bool() { r.pick(&PCI_REGS) } else { r.below(0x1000) as u32 };
+                let size = r.pick(&[4usize, 4, 2, 1]);
+                let reg = reg & !(size as u32 - 1);
+                let offset = (u64::from(device) << 15) | (u64::from(function) << 12) | u64::from(reg);
+                let t = pci::ecam_target(offset);
+                invariant!((t.bus, u32::from(t.device), u32::from(t.function), t.at as u32) == (0, device, function, reg),
+                           "ECAM's offset {:#x} named {:?}", offset, t);
+                let got = bus.function_read(t.device, t.function, t.at, size);
+                if reg < 0x100 {
+                    bus.write(pci::CONFIG_ADDRESS, 4, pci_address(device, reg) | function << 8);
+                    let want = bus.read(pci::CONFIG_DATA + (reg & 3) as u16, size as u8);
+                    invariant!(got == want, "ECAM read {:#x} at {:02x}.{} {:#x}, the ports {:#x}", got, device,
+                               function, reg, want);
+                    if r.bool() {
+                        let value = r.value32();
+                        let mut by_ports = PciBus::new().expect("a bus");
+                        by_ports.add(Function::device(&Blk::identity(), 0xC000, blk::BAR_SIZE, 11)
+                            .with_msix(2, 0xFE00_1000)).expect("a disk");
+                        let mut by_ecam = PciBus::new().expect("a bus");
+                        by_ecam.add(Function::device(&Blk::identity(), 0xC000, blk::BAR_SIZE, 11)
+                            .with_msix(2, 0xFE00_1000)).expect("a disk");
+                        by_ports.write(pci::CONFIG_ADDRESS, 4, pci_address(device, reg) | function << 8);
+                        by_ports.write(pci::CONFIG_DATA + (reg & 3) as u16, size as u8, value);
+                        by_ecam.function_write(t.device, t.function, t.at, size, value);
+                        for d in (0..0x100).step_by(4) {
+                            let a = by_ports.function_read(t.device, 0, d, 4);
+                            let b = by_ecam.function_read(t.device, 0, d, 4);
+                            invariant!(a == b, "a write of {:#x} at {:02x}.{} {:#x}: {:#x} at {:#x} by the ports, \
+                                                {:#x} by ECAM", value, device, function, reg, a, d, b);
+                        }
+                    }
+                } else {
+                    let there = function == 0 && device < 4;
+                    let want = if there { 0 } else { size_ones(size) };
+                    invariant!(got == want, "ECAM read {:#x} past the 256 bytes at {:02x}.{} {:#x}, not {:#x}", got,
+                               device, function, reg, want);
+                }
+            }
             0 => {
                 /* A configuration address: mostly one of bus 0's functions'
                  * registers, sometimes past them, or anything. */
@@ -482,6 +538,22 @@ fn pci_bus(r: &mut Input) {
                 let hosted = bus.host_target(port);
                 invariant!(hosted.is_none() || (pci::CONFIG_DATA..pci::CONFIG_DATA + 4).contains(&port),
                            "port {:#x} taken for host function {}'s space at {:?}", port, host, hosted);
+                /* And of those, what the address names, as it names it: the
+                 * host's slot on bus 0, or any bus past it -- those below
+                 * the ports, the run loop's to answer -- and no other */
+                let at = pci::CONFIG_DATA + r.below(4) as u16;
+                let address = bus.read(pci::CONFIG_ADDRESS, 4);
+                let named = (address >> 16 & 0xFF) as u8 != 0 || (address >> 11 & 0x1F) as u8 == host;
+                let want = (address & 0x8000_0000 != 0 && address & 0x7F00_0000 == 0 && named).then(|| {
+                    pci::HostTarget {
+                        bus: (address >> 16) as u8,
+                        device: (address >> 11 & 0x1F) as u8,
+                        function: (address >> 8 & 0x7) as u8,
+                        at: (address & 0xFC) as usize + usize::from(at - pci::CONFIG_DATA),
+                    }
+                });
+                let got = bus.host_target(at);
+                invariant!(got == want, "address {:#x} at port {:#x} named {:?}, not {:?}", address, at, got, want);
                 if let Some((slot, offset)) = bus.io_target(port) {
                     invariant!(slot != 0 && usize::from(slot) < pci::MAX_SLOTS, "port {:#x} in slot {}", port, slot);
                     invariant!(u32::from(offset) < 0x100, "port {:#x} at {:#x} into its BAR", port, offset);
@@ -2261,6 +2333,7 @@ fn zero_page_held(memory: &GuestMemory, first: &[u8], l: &crate::linux::Layout, 
 /// of it where `linux::Ram` ends it -- below 4 GiB at `low_end`.
 fn e820_held(memory: &GuestMemory, map: u64, stride: usize, n: usize, mem_bytes: u64, low_end: u64) {
     let ram = crate::linux::Ram::of_below(mem_bytes, low_end);
+    let mut ecam = false;
     invariant!((2..=crate::linux::E820_ENTRIES).contains(&n), "a memory map of {} entries", n);
     let mut end = 0u64;
     let mut ram_top = 0u64;
@@ -2274,6 +2347,7 @@ fn e820_held(memory: &GuestMemory, map: u64, stride: usize, n: usize, mem_bytes:
         invariant!(addr >= end && size != 0 && matches!(kind, 1 | 2),
                    "memory map entry {}: {:#x}+{:#x}, type {}, after {:#x}", i, addr, size, kind, end);
         end = addr + size;
+        ecam |= kind == 2 && addr == crate::linux::ECAM_BASE && size == crate::linux::ECAM_BYTES;
         if kind == 1 {
             invariant!(memory.backs(addr, size), "RAM at {:#x}+{:#x} in the map, where the guest has none", addr, size);
             ram_top = end;
@@ -2281,6 +2355,11 @@ fn e820_held(memory: &GuestMemory, map: u64, stride: usize, n: usize, mem_bytes:
         }
     }
     invariant!(Some(ram_top) == ram.end(), "RAM to {:#x} in a guest of {:#x}", ram_top, mem_bytes);
+    /* PCI Express's configuration space reserved where the guest has the
+     * BARs' hole, its MCFG's window -- and only there */
+    invariant!(ecam == (low_end == crate::linux::HOLE_RAM_END), "ECAM {} in the map of a guest whose RAM below 4 GiB \
+                                                                  ends at {:#x}", if ecam { "reserved" } else { "not" },
+               low_end);
     invariant!(high == (ram.high != 0), "a guest of {:#x} whose map says {} of its {:#x} from 4 GiB", mem_bytes,
                if high { "all" } else { "nothing" }, ram.high);
 }
@@ -2526,10 +2605,38 @@ fn acpi(r: &mut Input) {
         mmio: r.bool().then(|| (r.u32(), r.u32())),
         bars32: r.bool().then(|| (r.u32(), r.u32())),
         bars64: r.bool().then(|| (r.u64(), r.u64())),
+        ecam: r.bool().then(|| (r.u32() & !0xF_FFFF, r.u8())),
     };
     let mut buf = vec![0u8; if r.u8() < 224 { MAX_BYTES } else { r.below(MAX_BYTES as u64) as usize }];
     if let Some(n) = build(&m, &mut buf) {
         invariant!(n <= buf.len(), "tables of {} bytes in {}", n, buf.len());
+        /* ECAM, where the machine has it: one MCFG, its checksum whole, its
+         * one allocation the window, of segment 0 from bus 0 -- and none
+         * where it has not */
+        let tables = &buf[..n];
+        let at: Vec<usize> = (0..n.saturating_sub(4)).step_by(16).filter(|&a| &tables[a..a + 4] == b"MCFG").collect();
+        invariant!(at.len() == usize::from(m.ecam.is_some()), "{} MCFGs for ECAM {:x?}", at.len(), m.ecam);
+        if let (Some(&a), Some((base, last))) = (at.first(), m.ecam) {
+            let len = u32::from_le_bytes(tables[a + 4..a + 8].try_into().unwrap()) as usize;
+            invariant!(len == 60 && a + len <= n, "an MCFG of {} bytes", len);
+            let sum = tables[a..a + len].iter().fold(0u8, |s, b| s.wrapping_add(*b));
+            invariant!(sum == 0, "the MCFG's checksum leaves {:#x}", sum);
+            let entry = &tables[a + 44..a + 60];
+            let got = (u64::from_le_bytes(entry[0..8].try_into().unwrap()), u16::from_le_bytes([entry[8], entry[9]]),
+                       entry[10], entry[11]);
+            invariant!(got == (u64::from(base), 0, 0, last), "the MCFG's allocation {:x?}, not {:#x} buses 0-{}",
+                       got, base, last);
+        }
+        /* The host bridge's bus numbers, its `_CRS`'s first descriptor: 0
+         * to ECAM's last where there is ECAM, which has to cover them, to
+         * 255 where there is none */
+        let bus_range = (0..n.saturating_sub(16)).find(|&a| tables[a..a + 4] == [0x88, 0x0D, 0x00, 0x02]);
+        if let Some(a) = bus_range {
+            let range = (u16::from_le_bytes([tables[a + 8], tables[a + 9]]),
+                         u16::from_le_bytes([tables[a + 10], tables[a + 11]]));
+            let want = (0, m.ecam.map_or(0xFF, |(_, last)| u16::from(last)));
+            invariant!(range == want, "the host bridge's buses {:?}, not {:?}", range, want);
+        }
     }
 }
 
