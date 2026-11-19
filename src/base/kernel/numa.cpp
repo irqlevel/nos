@@ -279,7 +279,10 @@ void Numa::seal(ulong cpus)
     }
 
     for (ulong i = 0; i < range_count_; i++)
-        range_[i].node = domain_place(range_[i].domain);
+    {
+        Range& r = range_[i];
+        r.node = domain_place(r.domain);
+    }
 
     if (!distances_said_ || !distances_are_distances())
     {
@@ -314,6 +317,13 @@ ulong Numa::get_cpu_node(ulong cpu) const
     return cpu_node_[cpu];
 }
 
+ulong Numa::get_current_node() const
+{
+    if (node_count_ == 1)
+        return 0;
+    return get_cpu_node(CpuTable::get_instance().get_current_cpu_id());
+}
+
 ulong Numa::get_phys_node(ulong phys) const
 {
     if (node_count_ == 1)
@@ -324,12 +334,13 @@ ulong Numa::get_phys_node(ulong phys) const
     while (lo < hi)
     {
         const ulong mid = lo + (hi - lo) / 2;
-        if (phys < range_[mid].base)
+        const Range& r = range_[mid];
+        if (phys < r.base)
             hi = mid;
-        else if (phys >= range_[mid].end)
+        else if (phys >= r.end)
             lo = mid + 1;
         else
-            return range_[mid].node;
+            return r.node;
     }
     return 0;
 }
@@ -370,9 +381,10 @@ bool Numa::get_range(ulong index, ulong& base, ulong& end, ulong& node) const
 {
     if (index >= range_count_)
         return false;
-    base = range_[index].base;
-    end = range_[index].end;
-    node = range_[index].node;
+    const Range& r = range_[index];
+    base = r.base;
+    end = r.end;
+    node = r.node;
     return true;
 }
 
@@ -436,9 +448,10 @@ void Numa::report() const
         ulong ranges = 0;
         for (ulong i = 0; i < range_count_; i++)
         {
-            if (range_[i].node != node)
+            const Range& r = range_[i];
+            if (r.node != node)
                 continue;
-            bytes += range_[i].end - range_[i].base;
+            bytes += r.end - r.base;
             ranges++;
         }
         klog(0, "numa: node %lu (domain %lu): CPUs %s (%lu), %lu MiB the firmware placed in %lu ranges", node,

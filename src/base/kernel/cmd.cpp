@@ -1,4 +1,5 @@
 #include "cmd.h"
+#include "numa.h"
 #include "version_gen.h"
 #include "klog.h"
 #include "tracepoint.h"
@@ -1591,6 +1592,71 @@ static void cmd_memsites(const char* args, stdlib::Printer& con)
     memsites::report(con, top);
 }
 
+/* The NUMA topology the firmware's tables gave (kernel/numa.h), and what of
+   each node's memory is free */
+static void cmd_numa(const char* args, stdlib::Printer& con)
+{
+    (void)args;
+    auto& numa = Numa::get_instance();
+    auto& pt = mm::PageTable::get_instance();
+    const ulong nodes = numa.get_node_count();
+    static const size_t CPU_TEXT_BYTES = 192;
+    char cpus[CPU_TEXT_BYTES];
+
+    if (nodes == 1)
+    {
+        const char* reason = numa.get_fallback_reason();
+        if (reason != nullptr)
+            con.printf("one node: the firmware's tables set aside, %s\n", reason);
+        else
+            con.printf("one node\n");
+    }
+
+    for (ulong node = 0; node < nodes; node++)
+    {
+        const ulong mask = numa.get_node_cpus(node);
+        Numa::format_cpus(mask, cpus, sizeof(cpus));
+        con.printf("node %lu (domain %lu): CPUs %s (%lu)\n", node, (ulong)numa.get_node_domain(node), cpus,
+            (ulong)__builtin_popcountl(mask));
+        for (ulong i = 0; i < numa.get_range_count(); i++)
+        {
+            ulong base = 0;
+            ulong end = 0;
+            ulong range_node = 0;
+            if (!numa.get_range(i, base, end, range_node) || range_node != node)
+                continue;
+            con.printf("  memory 0x%lX-0x%lX, %lu MiB\n", base, end, (end - base) / consts::MB);
+        }
+
+        ulong free = 0;
+        ulong zeroed = 0;
+        ulong blocks = 0;
+        ulong blocks_free = 0;
+        pt.get_node_free(node, free, zeroed);
+        pt.get_node_huge_pool(node, blocks, blocks_free);
+        con.printf("  free %lu MiB, %lu MiB of it zeroed", free * consts::PAGE_SIZE / consts::MB,
+            zeroed * consts::PAGE_SIZE / consts::MB);
+        if (blocks != 0)
+            con.printf("; huge pool %lu MiB, %lu MiB of it free", blocks * mm::PageTable::HUGE_FRAME_SIZE / consts::MB,
+                blocks_free * mm::PageTable::HUGE_FRAME_SIZE / consts::MB);
+        con.printf("\n");
+    }
+
+    if (nodes == 1)
+        return;
+    con.printf("distances:\n    ");
+    for (ulong to = 0; to < nodes; to++)
+        con.printf(" %4lu", to);
+    con.printf("\n");
+    for (ulong from = 0; from < nodes; from++)
+    {
+        con.printf("%4lu", from);
+        for (ulong to = 0; to < nodes; to++)
+            con.printf(" %4lu", (ulong)numa.get_distance(from, to));
+        con.printf("\n");
+    }
+}
+
 static void cmd_meminfo(const char* args, stdlib::Printer& con)
 {
     (void)args;
@@ -2454,6 +2520,7 @@ static const CmdEntry COMMANDS[] = {
     { "watchdog",  cmd_watchdog,  "watchdog - show watchdog stats" },
     { "memusage",  cmd_memusage,  "memusage - show memory usage stats" },
     { "meminfo",   cmd_meminfo,   "meminfo - show the firmware memory map and what of it is used" },
+    { "numa",      cmd_numa,      "numa - the NUMA nodes: their CPUs and memory, what of it is free, their distances" },
     { "memcheck",  cmd_memcheck,  "memcheck - verify no reserved page reached the free list" },
     { "memsites",  cmd_memsites,  "memsites [on|off|dump|tags|N] - Rust's heap by where it was allocated" },
     { "irqstat",   cmd_irqstat,   "irqstat - show interrupt statistics" },

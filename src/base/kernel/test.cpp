@@ -1,4 +1,5 @@
 #include "klog.h"
+#include "numa.h"
 #include "debug.h"
 #include "task.h"
 #include "sched.h"
@@ -1044,7 +1045,8 @@ stdlib::Error test_zero_free()
 
     for (ulong i = 0; i < PAGES; i++)
     {
-        if (!pt.zero_free_page(reserve))
+        /* This CPU's node's: the one the allocations below take from first */
+        if (!pt.zero_free_page(Numa::get_instance().get_current_node(), reserve))
         {
             klog(0, "test_zero_free: zero_free_page %lu found nothing to zero", i);
             return make_error(stdlib::Error::UNSUCCESSFUL);

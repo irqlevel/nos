@@ -84,6 +84,12 @@ public:
     /* The node of a CPU, by its index in CpuTable: 0 for one not placed */
     ulong get_cpu_node(ulong cpu) const;
 
+    /* The node of the CPU this runs on: 0 on a machine of one node, and
+       before seal() -- when the APIC id may not be readable yet. Read from a
+       task that may be moved, it is a node it was on a moment ago: a
+       preference, not a promise. */
+    ulong get_current_node() const;
+
     /* The node of a physical address, a page's: 0 for one no range covers.
        A binary search of a few ranges, under the page table's lock on every
        free -- and nothing at all on a machine of one node */
