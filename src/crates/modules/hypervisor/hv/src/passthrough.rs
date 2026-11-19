@@ -141,6 +141,11 @@ const BRIDGE_CONTROL: u16 = 0x3E;
 const BRIDGE_BUS_RESET: u16 = 1 << 6;
 /// The devices a bus has at most.
 const SLOTS: u16 = 32;
+/// The expansion ROM's BAR (PCI 3.0, 6.2.5.2): its register, enable bit and
+/// address bits.
+const ROM_REGISTER: u16 = 0x30;
+const ROM_ENABLE: u32 = 1;
+const ROM_ADDRESS: u32 = 0xFFFF_F800;
 /// Extended capabilities (PCIe 5.0, 7.8.6 and 7.7.7): the Resizable BAR --
 /// its first control register, which says how many BARs it has (7:5), and
 /// the bytes from one BAR's registers to the next -- and ACS's control.
@@ -331,11 +336,18 @@ impl Passed {
             return Err(alloc::format!("{}: did not answer after its reset", name));
         }
 
+        let rom = read_rom(&dev, &name);
         let real = Box::new(Device { dev, bars, pages: Vec::new() });
-        let Some(function) = HostFunction::new(real, bars) else {
+        let Some(mut function) = HostFunction::new(real, bars) else {
             return Err(alloc::format!("{}: a bridge, neither MSI-X with its table in a BAR given nor MSI, a \
                                        capability list not whole, or a page that traps not mapped", name));
         };
+        if let Some(image) = rom {
+            let kib = image.len() / 1024;
+            if function.set_rom(image) {
+                kcore::klog!(0, "hv: {}: its ROM of {} KiB given, a copy", name, kib);
+            }
+        }
         let messages = function.messages();
         let (table, table_map, interrupts) = match function.msix_layout() {
             Some(l) => {
@@ -677,6 +689,50 @@ fn flr(dev: &PciDevice) -> bool {
     }
     state.restore(dev);
     true
+}
+
+/// The function's expansion ROM, read once (PCI 3.0, 6.3): its BAR sized,
+/// turned on at the address the firmware gave it -- the device's memory
+/// decoded for that alone, as nothing else reaches it meanwhile -- its image
+/// copied a dword at a time, the BAR off again. None where it has no ROM BAR
+/// or the firmware gave it no address; said, where the image is none -- no
+/// 0x55AA -- or its size is no ROM's the guest is given.
+fn read_rom(dev: &PciDevice, name: &str) -> Option<Box<[u8]>> {
+    let register = dev.read_config32(ROM_REGISTER);
+    dev.write_config32(ROM_REGISTER, ROM_ADDRESS);
+    let mask = dev.read_config32(ROM_REGISTER) & ROM_ADDRESS;
+    dev.write_config32(ROM_REGISTER, register & !ROM_ENABLE);
+    let address = u64::from(register & ROM_ADDRESS);
+    if mask == 0 || address == 0 {
+        return None;
+    }
+    let size = u64::from(!mask) + 1;
+    if size > hv::host::ROM_MAX as u64 || address % size != 0 {
+        kcore::klog!(0, "hv: {}: its ROM of {:#x} bytes at {:#x} is no ROM a guest is given", name, size, address);
+        return None;
+    }
+    /* A page at least, as the guest is mapped it: one smaller padded with
+     * what no ROM holds there, all ones */
+    let given = (size as usize).max(hv::host::ROM_MIN);
+    let mut image = Vec::new();
+    image.try_reserve_exact(given).ok()?;
+    let page = kcore::consts::PAGE_SIZE as u64;
+    let map = PhysMapping::map(address, size.div_ceil(page) as usize)?;
+    let region = MmioRegion::new(map.as_mut_ptr(), map.len());
+    let command = dev.read_config16(COMMAND);
+    dev.write_config16(COMMAND, command | COMMAND_MEMORY);
+    dev.write_config32(ROM_REGISTER, (register & ROM_ADDRESS) | ROM_ENABLE);
+    for at in (0..size as usize).step_by(4) {
+        image.extend_from_slice(&region.read32(at).to_le_bytes());
+    }
+    dev.write_config32(ROM_REGISTER, register & !ROM_ENABLE);
+    dev.write_config16(COMMAND, command);
+    image.resize(given, 0xFF);
+    if image.get(..2) != Some(&[0x55, 0xAA][..]) {
+        kcore::klog!(0, "hv: {}: its ROM BAR at {:#x} holds no ROM image (no 0x55AA): none given", name, address);
+        return None;
+    }
+    Some(image.into_boxed_slice())
 }
 
 /// The bridge whose secondary bus is `bus`.

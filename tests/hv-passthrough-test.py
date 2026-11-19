@@ -28,6 +28,9 @@ resets it by its bridge's secondary bus reset.
   table: each refused by the table, the fault said (QEMU's VT-d delivers a
   compatibility-format message whatever CFI says, and gives a DMA's message
   no requester id: those two only the metal shows);
+- the NVMe's expansion ROM (a 64 KiB image of the runner's, `romfile=`) is
+  read by the host and given a copy: the guest reads it through sysfs, the
+  image byte for byte;
 - hv sent the device's MSIs on, every one taken, and the guest stops.
 
 The guest's kernel is a 64-bit bzImage with PCI, MSI, NVMe (BLK_DEV_NVME),
@@ -94,6 +97,11 @@ NO_RAM = 0x40000000
 TO_MESSAGES = "0xfee01ff0+buf"
 # QEMU's NVMe's vendor, as Identify Controller says it
 QEMU_NVME_VENDOR = "0x1b36"
+# The NVMe's expansion ROM (`romfile=`): an image of the PCI Firmware spec's
+# (5.1) the runner makes -- its 0x55AA, its PCI data structure, code type
+# EFI so that SeaBIOS runs none of it -- of 64 KiB, the rest a pattern
+ROM_BYTES = 64 << 10
+ROM_PCIR = 0x1C
 # The last line of /etc/rc, and how the console shows it ran (hv-linux-test.py)
 RC_DONE = re.compile(r"(?m)^> version\n.+\n")
 
@@ -111,6 +119,21 @@ def guest_wrote(name):
     """What guest-init writes at block 256 of the disk it calls `name`."""
     line = b"nos gave this guest the %s and it wrote this\n" % name.encode()
     return (line * (65536 // len(line) + 1))[:65536]
+
+
+def rom():
+    """The NVMe's ROM image: a header, a PCI data structure naming QEMU's
+    NVMe, the last image, of EFI code; a pattern after."""
+    out = bytearray(pattern("rom")[:ROM_BYTES] * (ROM_BYTES // PATTERN_BYTES + 1))[:ROM_BYTES]
+    units = ROM_BYTES // 512
+    out[0:2] = b"\x55\xAA"
+    out[2] = min(units, 0xFF)
+    out[0x18:0x1A] = ROM_PCIR.to_bytes(2, "little")
+    pcir = b"PCIR" + (0x1B36).to_bytes(2, "little") + (0x0010).to_bytes(2, "little") + b"\0\0" \
+        + (0x18).to_bytes(2, "little") + b"\0" + bytes([0x02, 0x08, 0x01]) + units.to_bytes(2, "little") \
+        + b"\0\0" + bytes([0x03, 0x80]) + b"\0\0"
+    out[ROM_PCIR:ROM_PCIR + len(pcir)] = pcir
+    return bytes(out)
 
 
 def newc(entries):
@@ -240,6 +263,9 @@ def main():
             f.write(pattern(name))
             f.truncate(IMAGE_BYTES)
 
+    rom_path = os.path.join(tmp, "nvme.rom")
+    with open(rom_path, "wb") as f:
+        f.write(rom())
     log = os.path.join(tmp, "nos.log")
     argv = ["qemu-system-x86_64", "-machine", "q35", "-device", "intel-iommu,intremap=on",
             "-cpu", "max", "-smp", "2", "-m", "2G", "-display", "none", "-serial", "file:" + log,
@@ -248,7 +274,7 @@ def main():
             "-device", "virtio-blk-pci,drive=root,disable-legacy=on,disable-modern=off",
             "-device", "pcie-root-port,id=rp1,chassis=1",
             "-drive", "file=%s,format=raw,if=none,id=pass" % images["nvme"],
-            "-device", "nvme,drive=pass,serial=passthrough,bus=rp1",
+            "-device", "nvme,drive=pass,serial=passthrough,bus=rp1,romfile=" + rom_path,
             "-device", "pcie-root-port,id=rp2,chassis=2",
             "-drive", "file=%s,format=raw,if=none,id=vpass" % images["virtio"],
             # iommu_platform: a virtio device of QEMU's takes no IOMMU's
@@ -301,6 +327,8 @@ def nos_checks(text):
              lines(text, VIRTIO_IN_NOS))
     if resets:
         print("  %s reset by %s's secondary bus reset" % (VIRTIO_IN_NOS, resets[0]))
+    pt.check("the NVMe's ROM is read and given, a copy", "hv: %s: its ROM of %d KiB given" % (NVME_IN_NOS, ROM_BYTES // 1024)
+             in text, lines(text, "ROM"))
 
 
 def guest_checks(text):
@@ -315,6 +343,8 @@ def guest_checks(text):
         pt.check("it writes the %s, and reads it back past the page cache" % name,
                  "pass-guest: %s wrote %s" % (name, wrote) in text
                  and "pass-guest: %s read back %s" % (name, wrote) in text, lines(text, "pass-guest: %s" % name))
+    want = "pass-guest: rom %s %d" % (hashlib.md5(rom()).hexdigest(), ROM_BYTES)
+    pt.check("the guest reads the NVMe's ROM, the device's image", want in text, lines(text, "pass-guest: rom"))
     for name, word in (("nvme", "nvme"), ("virtio", "virtio")):
         rows = re.findall(r"pass-guest: irq\s+\d+:\s+((?:\d+\s+)+).*%s" % word, text)
         counts = [sum(int(n) for n in row.split()) for row in rows]

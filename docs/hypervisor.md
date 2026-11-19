@@ -2244,7 +2244,13 @@ over it --
 - a capability's id and next pointer are read-only, whatever the device's
   are: a device that took a write there would have the guest change the
   list the host walked;
-- no ROM; the INTx pin the device's, wired to a line nothing raises
+- the expansion ROM a copy the host read of the device's, once, as it gave
+  it (an image of 0x55AA, 2 MiB at most): the guest's ROM BAR its own to
+  size, place and turn on, and where it is on, the copy mapped read-only --
+  read as memory, `rep movs` among it, a write nothing; the real ROM BAR,
+  which on many devices shares a decoder with another BAR, never the
+  guest's;
+- the INTx pin the device's, wired to a line nothing raises
   (`run::HOST_IRQ`): the device's INTx stays off and its interrupt is its
   MSI, but a driver that wants a legacy IRQ to exist finds one -- NVIDIA's
   refuses a function with neither that nor MSI-X; power management never
@@ -2304,8 +2310,8 @@ access of it stops the guest. A VM holding a host's function is not saved
 and not moved: its device's DMA reaches no dirty log, and its state is the
 device's.
 
-Not done yet: the ROM, the guest's extended configuration space (the
-host's own is there: ECAM),
+Not done yet: the guest's extended configuration space (the host's own is
+there: ECAM),
 refusing a function a DMAR RMRR names, isolation beyond one device's
 functions (ACS on the path above it), and AMD-Vi. VT-d's posted interrupts
 -- the device's message straight into the vCPU, no host interrupt -- wait for

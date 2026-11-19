@@ -976,8 +976,9 @@ struct Hosted {
     slot: usize,
     function: HostFunction,
     /// Each BAR's mapping in the guest's space now: its address, none while
-    /// the guest has it nowhere the table can map.
-    mapped: [Option<u64>; 6],
+    /// the guest has it nowhere the table can map; the ROM's (`ROM_BAR`)
+    /// where it is on and trapped there.
+    mapped: [Option<u64>; host::ROM_BAR + 1],
     /// Each BAR's pages trapped rather than mapped, by their offsets in it:
     /// NVIDIA's configuration space mirror, MSI-X's table and PBA
     /// (`HostFunction::traps`).
@@ -995,6 +996,12 @@ impl Hosted {
             let offset = gpa.checked_sub(base).filter(|&o| o < b.size)?;
             self.holes[bar].contains(&(offset & !(PAGE - 1))).then_some((bar, offset))
         })
+    }
+
+    /// The offset of `gpa` in the ROM, where the guest has it on there.
+    fn rom_at(&self, gpa: u64) -> Option<u64> {
+        let (base, size) = (self.mapped[host::ROM_BAR]?, self.function.rom_size()?);
+        gpa.checked_sub(base).filter(|&o| o < size)
     }
 }
 
@@ -1519,7 +1526,7 @@ impl LinuxGuest {
         let Some((ref mut free, _)) = self.windows else { return Err(Error::BadAddress) };
         let mut p = self.platform.lock();
         let bars = *function.bars();
-        let mut placed = [None; 6];
+        let mut placed = [None; host::ROM_BAR + 1];
         for (i, bar) in bars.iter().enumerate() {
             let Some(b) = bar else { continue };
             if b.size < kcore::consts::PAGE_SIZE as u64 || !b.size.is_power_of_two() {
@@ -1535,6 +1542,15 @@ impl LinuxGuest {
             *next = at + b.size;
             placed[i] = Some(at);
         }
+        /* Its ROM below 4 GiB, as firmware places one, and off: it traps only
+         * once the guest turns it on (`move_bar`) */
+        if let Some(size) = function.rom_size() {
+            let at = free.low.div_ceil(size).checked_mul(size).ok_or(Error::BadAddress)?;
+            if at.checked_add(size).is_none_or(|e| e > free.low_end) || !function.place_rom(at) {
+                return Err(Error::BadAddress);
+            }
+            free.low = at + size;
+        }
         /* The pages that trap rather than map, by BAR: NVIDIA's mirror,
          * MSI-X's table and PBA (`HostFunction::traps`) */
         let mut holes: [Vec<u64>; 6] = Default::default();
@@ -1548,8 +1564,8 @@ impl LinuxGuest {
          * guest. */
         let slot = p.pci.add_host()?;
         for (i, at) in placed.iter().enumerate() {
-            let (Some(at), Some(b)) = (*at, bars[i]) else { continue };
-            self.memory.map_device(at, b.host, b.size, &holes[i])?;
+            let (Some(at), Some(b), Some(holes)) = (*at, bars.get(i).copied().flatten(), holes.get(i)) else { continue };
+            self.memory.map_device(at, b.host, b.size, holes)?;
         }
         p.hosts.try_reserve(1).map_err(|_| Error::NoMemory)?;
         p.hosts.push(Hosted { slot: usize::from(slot), function, mapped: placed, holes });
@@ -4168,6 +4184,20 @@ impl LinuxGuest {
     fn host_mmio(&self, gc: &mut GuestCpu, gpa: u64, write: bool) -> Option<Stop> {
         let rip = gc.cpu.backend().save().rip;
         let mut p = self.platform.lock();
+        /* Its ROM, where the guest has it on: mapped read-only, a copy -- a
+         * write is what comes here, and is nothing */
+        if let Some((i, offset)) = p.hosts.iter().enumerate().find_map(|(i, h)| h.rom_at(gpa).map(|o| (i, o))) {
+            let mut bytes = mmio::Bytes::default();
+            let op = match mmio::begin(gc.cpu.backend(), &self.memory, gpa, write, &mut bytes) {
+                Ok(op) => op,
+                Err(error) => return Some(Stop::MmioInsn { gpa, rip, error, bytes }),
+            };
+            gc.counts.mmio_done += 1;
+            let value = if op.is_write() { 0 } else { p.hosts[i].function.rom_read(offset, usize::from(op.size())) };
+            drop(p);
+            mmio::finish(gc.cpu.backend_mut(), &op, value);
+            return None;
+        }
         let found = p.hosts.iter().enumerate().find_map(|(i, h)| h.trapped_at(gpa).map(|(bar, at)| (i, bar, at)));
         let Some((i, bar, offset)) = found else {
             gc.counts.mmio += 1;
@@ -4199,6 +4229,18 @@ impl LinuxGuest {
     /// RAM, another BAR or the platform's pages; else left unmapped, and an
     /// access of it stops the guest.
     fn move_bar(&self, h: &mut Hosted, m: host::Moved) {
+        if m.bar == host::ROM_BAR {
+            /* Its ROM: the host's copy, mapped read-only where it is on */
+            let Some(image) = h.function.rom_image() else { return };
+            let size = image.len() as u64;
+            if let Some(at) = h.mapped[host::ROM_BAR].take() {
+                let _ = self.memory.unmap_device(at, size);
+            }
+            if m.to != 0 && m.to % size == 0 && self.memory.map_rom(h.slot, m.to, image).is_ok() {
+                h.mapped[host::ROM_BAR] = Some(m.to);
+            }
+            return;
+        }
         let Some(b) = h.function.bars().get(m.bar).copied().flatten() else { return };
         if let Some(at) = h.mapped[m.bar].take() {
             let _ = self.memory.unmap_device(at, b.size);
