@@ -5,6 +5,17 @@
 
 use ffi::numa;
 
+pub use ffi::numa::NumaNode;
+
+/// Node `node` as it stands: its domain and CPUs, its RAM, its free and
+/// zeroed pages, its share of the huge pool. None for a node past the
+/// machine's.
+pub fn node_info(node: usize) -> Option<NumaNode> {
+    let mut out = NumaNode::default();
+    /* `out` is one NumaNode, written whole or zeroed */
+    (unsafe { numa::kernel_numa_node_info(node, &mut out) } == 1).then_some(out)
+}
+
 /// How many nodes there are: 1 on a machine of one.
 #[inline]
 pub fn node_count() -> usize {

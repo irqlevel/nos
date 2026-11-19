@@ -446,12 +446,16 @@ public:
        of what it keeps free.
 
        get_node_free: a node's free pages, and of them the zeroed; and of
-       the huge pool, its blocks and its free ones. */
+       the huge pool, its blocks and its free ones. get_node_usable_bytes:
+       the RAM the firmware's map says is usable that is the node's -- each
+       usable region's overlap with the node's ranges, and node 0's what no
+       range covers, as Numa::get_phys_node places it. */
     void spread_free_pages();
     Page* alloc_page_keeping_on(ulong node, ulong keep);
     ulong alloc_huge_frame_on(ulong node);
     void get_node_free(ulong node, ulong& free, ulong& zeroed);
     void get_node_huge_pool(ulong node, ulong& blocks, ulong& free);
+    ulong get_node_usable_bytes(ulong node);
 
     /* The huge pool's window: every block of the pool mapped with one 2MiB
        entry at HUGE_POOL_WINDOW plus its physical address -- RAM, so

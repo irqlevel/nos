@@ -126,7 +126,7 @@ const vms = new Map();
 let nextVmId = 0;
 function vm(name, fields) {
   vms.set(name, {
-    name, id: null, state: 'off', protected: false, cpus: 1, memory_mib: 1024, net: true, port: null,
+    name, id: null, state: 'off', protected: false, cpus: 1, memory_mib: 1024, node: null, net: true, port: null,
     network: null, firewall: 'default', public: null, kernel: '/lib/hvboot', console: '', bootMs: 0, restarts: 0, reason: null,
     forwards: [], disks: [{ file: 'disk.raw', size_bytes: 20 * 1024 * MIB, read_only: false },
       { file: 'seed.iso', size_bytes: 65536, read_only: true }],
@@ -276,7 +276,8 @@ function vmJson(v) {
   const port = v.port;
   return {
     name: v.name, id: v.id, state: v.state, folder: true, protected: v.protected, cpus: v.cpus,
-    memory_mib: v.memory_mib, net: v.net, port, ip: port === null ? null : '10.0.100.' + (port + 2),
+    memory_mib: v.memory_mib, node: v.node, node_memory_pct: v.id !== null && v.node !== null ? 100 : null,
+    net: v.net, port, ip: port === null ? null : '10.0.100.' + (port + 2),
     network: v.network, firewall: v.firewall, public: v.public, kernel: v.kernel,
     ...(v.id !== null ? {
       uptime_ms: v.state === 'running' ? uptimeMs() - v.bootMs : 0, restarts: v.restarts,
@@ -536,6 +537,12 @@ const reads = {
   }),
   'system.cpus': () => ({ cpus: [...Array(CPUS).keys()].map((cpu) => ({ cpu, idle_ns: idleNs(cpu) })), uptime_ms: uptimeMs() }),
   'system.memory': () => ({ total_bytes: 8192 * MIB, free_bytes: Math.floor((4096 + 512 * Math.sin(uptimeMs() / 20000)) * MIB) }),
+  /* Two nodes of two CPUs and 4 GiB each, as QEMU's -numa makes them */
+  'system.numa': () => ({ nodes: [0, 1].map((node) => ({
+    node, domain: node, cpus: node === 0 ? '0-1' : '2-3', cpu_count: CPUS / 2, memory_bytes: 4096 * MIB,
+    free_bytes: (node === 0 ? 1900 : 2100) * MIB, zeroed_bytes: 1024 * MIB, huge_total_bytes: 512 * MIB,
+    huge_free_bytes: (node === 0 ? 256 : 512) * MIB, distances: node === 0 ? '10 21' : '21 10',
+  })) }),
   'system.tasks': () => ({ tasks: [
     { pid: 1, name: 'shell', state: 'waiting', idle: false, blocked: true, stopping: false, runtime_ns: 1e9, switches: 120 },
     { pid: 7, name: 'hv/vm0', state: 'running', idle: false, blocked: false, stopping: false, runtime_ns: uptimeMs() * 4e5, switches: 9000 },
@@ -1263,7 +1270,7 @@ function createOfImage(name, p) {
     + ' MiB -- thin: its chunks copied as they are written', '/vms/' + name + '/vm.toml written'][i], () => {
     nbsShare(image, clone, 'volume', nbs.hosts[0].host);
     nbs.volumes.find((v) => v.name === clone).size_mib = sizeMib;
-    vm(name, { memory_mib: p.memory_mib ?? 1024, cpus: p.cpus ?? 1, network: p.network ?? null,
+    vm(name, { memory_mib: p.memory_mib ?? 1024, cpus: p.cpus ?? 1, node: p.node ?? null, network: p.network ?? null,
                firewall: p.firewall ?? 'default', public: p.public ?? null,
       disks: [{ file: 'nbs:' + clone, size_bytes: null, read_only: false }, SEED_DISK] });
     return { name, file: '/vms/' + name + '/vm.toml', disk_bytes: sizeMib * MIB, keys: 1, port: null, id: null };
@@ -1291,7 +1298,7 @@ function createOntoVolume(name, p) {
   }
   return job('vm', 'create', 4, (i) => ['download: 120 MiB of 590 MiB, 20%', 'download: 590 MiB of 590 MiB, 100%',
     'nbs:' + word + ': 3584 MiB poured, the rest of the volume zeroes', '/vms/' + name + '/vm.toml written'][i], () => {
-    vm(name, { memory_mib: p.memory_mib ?? 1024, cpus: p.cpus ?? 1, network: p.network ?? null,
+    vm(name, { memory_mib: p.memory_mib ?? 1024, cpus: p.cpus ?? 1, node: p.node ?? null, network: p.network ?? null,
                firewall: p.firewall ?? 'default', public: p.public ?? null,
       disks: [{ file: 'nbs:' + word, size_bytes: null, read_only: false }, SEED_DISK] });
     return { name, file: '/vms/' + name + '/vm.toml', disk_bytes: v.size_mib * MIB, keys: 1, port: null, id: null };
@@ -1461,6 +1468,10 @@ const jobMethods = {
     if (vms.has(name)) {
       throw new Refused('conflict', name + ' is there already', 'name');
     }
+    /* A node the host has: system.numa's two */
+    if (p.node !== undefined && !(Number.isInteger(p.node) && p.node >= 0 && p.node < 2)) {
+      throw new Refused('invalid', 'is a NUMA node of this machine\'s: it has 2 (system.numa)', 'node');
+    }
     /* On a network of the cluster's: its port made as hv makes it, of
      * vnet's, judged by one of the cluster's firewalls */
     const cluster = typeof p.network === 'string' && p.network.startsWith('vnet:') ? p.network.slice(5) : null;
@@ -1501,7 +1512,7 @@ const jobMethods = {
       onto ? onto.name + ': 3584 MiB written in 4.2 s, the rest of the device given back to it'
         : 'disk.raw: 1785 MiB written of 3584 MiB, the rest holes',
       '/vms/' + name + '/vm.toml written'][i], () => {
-      vm(name, { memory_mib: p.memory_mib ?? 1024, cpus: p.cpus ?? 1, network: p.network ?? null,
+      vm(name, { memory_mib: p.memory_mib ?? 1024, cpus: p.cpus ?? 1, node: p.node ?? null, network: p.network ?? null,
                  firewall: p.firewall ?? 'default', public: p.public ?? null,
                  ...(onto ? { disks: [deviceDisk(onto, false), { file: 'seed.iso', size_bytes: 65536, read_only: true }] }
                    : {}) });

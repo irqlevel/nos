@@ -129,13 +129,35 @@ and this is the rule it always was.
 `hv` ([The hypervisor](hypervisor.md)) places a guest's vCPUs as before --
 whole cores, sharing the first's last-level cache where they can, which on
 a part without cluster-on-die is its socket -- and takes its memory from the
-first vCPU's node: `Spec::placed` sets `node`, `LinuxGuest::new_on` hands it
+first vCPU's node. Or a guest names its node: `node=N` to `hv start` and
+`hv create`, `node = N` in its vm.toml, `node` to the vm provider's
+`create`. Its vCPUs and the task that serves its disks are then placed on
+that node's CPUs alone (`Cores::take` narrows the CPUs the placement may
+take to the node's), and its memory is the node's. A node the machine does
+not have is refused as the guest is read (`node=2: this machine has 2 NUMA
+nodes`), a `cpu=` of another node as it is placed (`cpu 5 is node 0's, not
+node 1's`), and a node too busy for it with the placement's own reason,
+`(on node 1, as asked)` after it. Either way `Spec::placed` sets the node
+its memory comes from, `LinuxGuest::new_on` hands it
 to `GuestMemory::place_on`, and `Run::new_on` / `Run::new_huge_on`
 (`kcore::frame`) take every frame or block of the pool from it, the nearest
 node's when it has none. `hv start`'s line ends with which node, and how
 much of the memory was found there by the pages' physical addresses
-(`GuestMemory::pages_on`): `..., its memory node 1's (100%)`. A machine of
-one node builds guests as it did, and its line says nothing of nodes.
+(`GuestMemory::pages_on`): `..., its memory node 1's (100%)`; `hv list` and
+the vm provider (`node`, `node_memory_pct`) say the same while it runs, and
+`hv vms` the node a vm.toml asks for. A machine of one node builds guests as
+it did, and its line says nothing of nodes.
+
+## In the management panel
+
+The `system` provider's `numa` read ([The management bus](mgmt.md)) is each
+node: its CPUs, the RAM the firmware gives it, what of it is free and zeroed,
+its share of the huge pool, its distances. The panel draws it as a table on
+the host's system page, from the descriptor as it draws every resource; its
+form for a new VM offers the host's nodes where it has more than one, each
+with its CPUs and what it has free for a guest (the huge pool's free blocks
+where there is a pool, else its free pages), and a VM's page says its node
+and how much of its memory is there.
 
 ## From Rust
 

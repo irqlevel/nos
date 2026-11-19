@@ -345,6 +345,20 @@ fn vm_json(w: &mut Writer, name: Option<&str>, c: Option<&Result<config::Config,
         (None, None) => 0,
     };
     w.field_uint("memory_mib", mem);
+    /* Its NUMA node: where it runs on a machine of nodes, the one its memory
+     * was taken from and the share of it found there; otherwise the one its
+     * vm.toml asks for, if it does */
+    w.key("node");
+    match (l.and_then(|l| l.node), o.and_then(|o| o.node)) {
+        (Some((node, _)), _) => w.uint(node as u64),
+        (None, Some(node)) => w.uint(u64::from(node)),
+        (None, None) => w.null(),
+    }
+    w.key("node_memory_pct");
+    match l.and_then(|l| l.node) {
+        Some((_, pct)) => w.uint(u64::from(pct)),
+        None => w.null(),
+    }
     w.field_bool("net", l.is_some_and(|l| l.port.is_some()) || o.is_some_and(|o| o.net));
     let port = l.and_then(|l| l.port).or_else(|| o.and_then(|o| o.port).map(|p| p as usize));
     w.key("port");
@@ -1415,6 +1429,7 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
         let size = p.opt_uint("size_bytes", 1, u64::MAX)?;
         let mem = p.opt_uint("memory_mib", 64, u64::MAX)?;
         let cpus = p.opt_uint("cpus", 1, u64::from(u32::MAX))?;
+        let node = p.opt_uint("node", 0, u64::from(u32::MAX))?;
         let network = p.opt_str("network", config::NETWORK_NAME_MAX)?;
         let firewall = p.opt_str("firewall", firewall::NAME_MAX)?;
         let public = p.opt_str("public", PUBLIC_MAX)?;
@@ -1425,9 +1440,10 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
         let start = p.opt_bool("start")?.unwrap_or(false);
         let onto = p.opt_str("onto", DEVICE_MAX)?;
         let force = p.opt_bool("force")?.unwrap_or(false);
-        Ok((size, mem, cpus, network, firewall, public, password, user_data, port, protected, start, onto, force))
+        Ok((size, mem, cpus, node, network, firewall, public, password, user_data, port, protected, start, onto,
+            force))
     })();
-    let (size, mem, cpus, network, firewall, public, password, user_data, port, protected, start, onto, force) =
+    let (size, mem, cpus, node, network, firewall, public, password, user_data, port, protected, start, onto, force) =
         match fields {
         Ok(f) => f,
         Err(e) => return invalid(call, e),
@@ -1438,6 +1454,11 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
     };
     if let Err(s) = finish(p, call) {
         return s;
+    }
+    let nodes = kcore::numa::node_count() as u64;
+    if node.is_some_and(|n| n >= nodes) {
+        return refuse(call, Status::Invalid, &alloc::format!("is a NUMA node of this machine's: it has {} (system.numa)",
+                                                             nodes), Some("node"));
     }
     if network.is_some_and(|n| !config::valid_network(n)) {
         return refuse(call, Status::Invalid, "is a network's name -- a letter or a digit, then letters, digits, . _ \
@@ -1482,6 +1503,7 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
     let o = Options {
         mem_mib: mem,
         cpus: cpus.map(|n| n as u32),
+        node: node.map(|n| n as u32),
         network: network.map(String::from),
         firewall: firewall.map(String::from),
         public,
