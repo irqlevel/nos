@@ -48,6 +48,39 @@ public:
     /* Whether DMA is translated: iommu=on, and every unit came up */
     bool is_on() const;
 
+    /* Interrupt remapping (5.1). With DMA translated, every unit taken over
+       is given a table of interrupt entries and IR turned on, its
+       compatibility-format interrupts blocked (CFI clear) -- all of them or
+       none: a unit without IR, or an IO-APIC no unit's scope names, leaves
+       interrupts as the firmware's format has them, which is said. Then
+       every interrupt source is an entry, its requester verified to be its
+       own (SVT=01): a device that DMAs to 0xFEExxxxx raises its own
+       vectors and no other, which is what makes giving one to a guest safe.
+       Turned on before the first interrupt is programmed (setup()), with
+       the IO-APIC's pins masked first. */
+    bool is_remapping() const;
+
+    /* An entry in the interrupt table of the unit that translates sid: a
+       fixed interrupt at vector to the CPU whose APIC id is apic_id, edge or
+       level, from sid alone. Its handle -- what the source is programmed
+       with, an MSI's address or an IO-APIC's entry -- or -1 where none is to
+       be had: interrupts not remapped, no unit, the table full. From any
+       context: the table's spinlock, and the unit's queue, waited on by
+       polling. */
+    long remap_alloc(u16 sid, u8 vector, u32 apic_id, bool level);
+
+    /* The entry's destination moved to apic_id (IrqBalance) -- nothing of
+       the source's changes -- and the unit's cache of it dropped */
+    bool remap_retarget(u16 sid, u16 handle, u32 apic_id);
+
+    /* The entry not present any more, the unit's cache of it dropped, its
+       handle free again */
+    void remap_free(u16 sid, u16 handle);
+
+    /* The IO-APIC's requester id, as its DMAR scope names it: what its
+       entries are verified against. Valid while is_remapping(). */
+    u16 io_apic_sid() const;
+
     /* `iommu`: each unit, what it can do, what it does, its faults -- each
        unit's records looked at first. `iommu block <bus>:<dev>.<fn>` makes a
        device's context entry not present, its DMA then blocked and said as a
@@ -128,6 +161,11 @@ private:
     static const size_t BUSES = 256;
     static const size_t DEVFNS = 256;
     static const size_t MAX_DIDS_WORDS = 256 / 64;
+    /* An interrupt table a page: 256 entries of 16 bytes -- the IO-APIC's
+       pins and every MSI and MSI-X vector the kernel hands out (0x40-0xEF)
+       fit in it */
+    static const size_t IRT_ENTRIES = 256;
+    static const size_t IRT_USED_WORDS = IRT_ENTRIES / 64;
 
     struct Unit
     {
@@ -181,6 +219,14 @@ private:
         u64 dids[MAX_DIDS_WORDS];
         /* Its domains' tables' leaf bits: SNP where it can make DMA snoop */
         u64 leaf_bits;
+        /* Interrupt remapping: its table, a page of IRT_ENTRIES entries of
+           two words, the ones handed out a bit each -- under irt_lock --
+           and whether IR is on */
+        u64* irt;
+        ulong irt_phys;
+        u64 irt_used[IRT_USED_WORDS];
+        bool remapping;
+        SpinLock irt_lock;
     };
 
     /* The unit's registers */
@@ -222,9 +268,29 @@ private:
        translation on: false, said, with nothing of it left on */
     bool take_over(Unit& unit);
 
-    /* A unit taken over, given back: translation and the queue off, its
-       tables freed */
+    /* A unit taken over, given back: interrupt remapping, translation and
+       the queue off, its tables freed */
     void release(Unit& unit);
+
+    /* Interrupt remapping turned on in every unit taken over, or in none:
+       false, said, where it cannot be (setup()) */
+    bool setup_remapping();
+
+    /* The unit's interrupt table made, pointed at, its cache dropped and IR
+       turned on with compatibility-format interrupts blocked: false, said,
+       with nothing of it left on */
+    bool remap_unit(Unit& unit);
+
+    /* IR turned off in the unit and its table freed */
+    void unremap_unit(Unit& unit);
+
+    /* The unit whose interrupt table sid's interrupts go through: the one
+       that translates it, where IR is on there */
+    Unit* remap_unit_for(u16 sid);
+
+    /* An entry's two words written -- the high one first, the low one with
+       P last -- and the unit's cache of it dropped */
+    bool write_irte(Unit& unit, u16 handle, u64 lo, u64 hi);
 
     /* Whether every device the unit names is a display device */
     bool names_display_alone(const Acpi::DmarUnit& dmar);
@@ -341,6 +407,12 @@ private:
     SpinLock fault_lock_;
     u8 last_bus_;
     bool on_;
+    /* Interrupts remapped in every unit taken over, and the IO-APIC's
+       requester id its entries are verified against and the unit whose
+       scope names it, whose table they are in */
+    bool remapping_;
+    u16 io_apic_sid_;
+    Unit* io_apic_unit_;
     /* The APIC id of the CPU the fault events go to */
     u32 fault_apic_id_;
 };

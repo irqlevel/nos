@@ -164,8 +164,22 @@ reaches no Rust. hv reaches it by the usual three steps (`rust_ffi.cpp`,
    block` blocks said from the fault event with its requester and reason,
    the machine going on. It found that nos's NVMe driver waits with no
    deadline for a controller that has stopped (QEMU's, on the blocked fetch).
-3. ECAM; then IR (the MSI branch is in master): the smoke boots under
-   `intel-iommu,intremap=on`, every interrupt remapped.
+3. IR **done** (ECAM not yet): each unit taken over gets a table of 256
+   entries, IRTA set, the entry cache invalidated, IR on with CFI clear --
+   compatibility-format interrupts blocked; every entry SVT=01, verified
+   against its source's requester id, the IO-APIC's from the DMAR scope
+   that names it (by the MADT's id; a scope that names no PCI function --
+   Hertz's 00:1e.7, QEMU's ff:00.0 -- taken by its path alone);
+   `MsixTable` (MSI and MSI-X) and `IoApic` program handles in the
+   remappable format, IrqBalance moves entries in the table. Turned on in
+   `Vtd::setup`, before the IO-APIC's pins and the first MSI are
+   programmed, the pins masked first. `pci=` no longer needs
+   `unsafe_interrupts` where it is on. Gates: the smoke boots under
+   `intel-iommu,intremap=on` (and on a `UBSAN=1` build), `iommu-test.py`
+   with and without IR, `gpu-passthrough-test.py` with no
+   `unsafe_interrupts`, and Hertz's metal. Still to do: a gate that has a
+   device send what IR blocks -- a compatibility-format message, another's
+   entry -- and sees it said.
 4. **Done**: domains (C++: `Vtd::domain_*`, held to the gate by `iommu
    identity`, the NVMe working through a table of its own), the claim, the
    reset, `kcore::iommu`. Still to do: an emulated device (an NVMe or an
@@ -199,9 +213,17 @@ reaches no Rust. hv reaches it by the usual three steps (`rust_ffi.cpp`,
    been taken for the GPU's space once the address latched named it, and
    the guest's disk stopped as the driver probed; and the 64-bit BAR window
    in the DSDT cut to the BARs, leaving Linux's HMM the room UVM needs.
-6. nos on Hertz's metal -- the real VT-d -- once the stages above are green;
-   a one-shot GRUB entry, so a boot that does not come back is Ubuntu again
-   at the next reset.
+6. **Done**: nos on Hertz's metal -- the real VT-d -- booted once from
+   Ubuntu by `tests/gpu-passthrough/install-bare.sh` (nos-install on the
+   empty NVMe, a one-shot GRUB entry, `deadman=900`, `panic=10`, the disk
+   log, netconsole to a collector, an `/etc/rc` that ends in `reboot`): the
+   graphics unit left be, `dmar1` taken over, the A2000 given to a guest
+   running NVIDIA's own driver -- nvidia-smi, deviceQuery, vectorAdd and
+   matrixMul (611 GFlop/s) pass -- and the machine back on Ubuntu 20
+   seconds after `boot: complete`. It found the RTL8168H's INTx line left
+   unrouted by UEFI (r8168 now takes MSI-X, then MSI), the console being EGA
+   text in the A2000's legacy window (let go of with the GPU), and the TCO
+   timer that does not count there (docs/real-hardware.md, Hertz).
 
 ### The dev loop on Hertz
 

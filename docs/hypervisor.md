@@ -2138,19 +2138,25 @@ no user space between (plans/gpu-passthrough.md has the design, its stages,
 and the test machine). x86-64 with Intel VT-d, booted `iommu=on`:
 
 ```
-> hv start gpu /vmlinuz initrd=/initrd.img mem=8192 cpus=4 pci=01:00.0 unsafe_interrupts net
+> hv start gpu /vmlinuz initrd=/initrd.img mem=8192 cpus=4 pci=01:00.0 net
 ```
 
-or in a vm.toml, `pci = ["01:00.0"]` and `unsafe_interrupts = true`. At most
-four functions a guest, named `bus:device.function` in hex as `pci` and
-`iommu` print them.
+or in a vm.toml, `pci = ["01:00.0"]`. At most four functions a guest, named
+`bus:device.function` in hex as `pci` and `iommu` print them.
 
-**`unsafe_interrupts` is the guest's word that it is trusted** until
-interrupt remapping is done (the plan's stage 3): without it a DMA write of
-the device's to 0xFEExxxxx is an interrupt of the host's, of any vector, on
-any CPU -- the TLB shootdown's, the scheduler's -- and `pci=` without it is
-refused, as VFIO refuses a platform without remapping unless told
-`allow_unsafe_interrupts`. Every function given says so in the log too.
+**Its interrupts are remapped** (`arch/x86_64/vtd.cpp`, VT-d's interrupt
+remapping, on with `iommu=on` wherever every unit taken over has it): every
+interrupt of the host's -- each MSI and MSI-X vector, each IO-APIC pin -- is
+an entry of its unit's table, verified to come from its own requester, and a
+compatibility-format interrupt is blocked. So a DMA write of the device's to
+0xFEExxxxx, which is how a device interrupts, raises the device's own vector
+and no other: blocked, and said, whatever else it names. Where interrupts
+are not remapped -- a unit without IR, an IO-APIC no unit's scope names --
+that write is an interrupt of the host's, of any vector, on any CPU, the TLB
+shootdown's, the scheduler's: `pci=` is refused there unless the guest is
+said to be trusted with that, `unsafe_interrupts` (`unsafe_interrupts =
+true`), as VFIO refuses a platform without remapping unless told
+`allow_unsafe_interrupts`. Every function given says which in the log.
 
 What the module does with it (`modules/hypervisor/hv/src/passthrough.rs`),
 before any of the guest's memory is taken: the function is claimed -- one
@@ -2245,8 +2251,9 @@ access of it stops the guest. A VM holding a host's function is not saved
 and not moved: its device's DMA reaches no dirty log, and its state is the
 device's.
 
-Not done yet: interrupt remapping (so `unsafe_interrupts`), MSI-X, a
-secondary bus reset for a function without FLR, the ROM, the extended
+Not done yet: MSI-X, a secondary bus reset for a function without FLR, the
+ROM, VT-d's posted interrupts (the device's MSI straight into the vCPU), the
+extended
 configuration space (ECAM: the Resizable BAR, ACS, AER), refusing a function
 a DMAR RMRR names, isolation beyond one device's functions (ACS on the path
 above it), and AMD-Vi.

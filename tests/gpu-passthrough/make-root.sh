@@ -49,7 +49,7 @@ cat > "$R"/etc/rc <<EOF
 # tests/gpu-passthrough-test.py: nos gives the GPU to a Linux guest
 insmod /hv.ko
 hv on
-hv boot /vmlinuz initrd=/initrd mem=$MEM cpus=2 secs=$SECS pci=$PCI unsafe_interrupts cmdline=console=ttyS0 rdinit=/init nokaslr
+hv boot /vmlinuz initrd=/initrd mem=$MEM cpus=2 secs=$SECS pci=$PCI cmdline=console=ttyS0 rdinit=/init nokaslr
 EOF
 "$D"/mkrootfs.sh "$W"/root.img 256 "$R" > /dev/null
 echo "make-root: $(du -h "$W"/initrd | cut -f1) initramfs, $(wc -l < "$I"/modules) modules, kernel $K"
