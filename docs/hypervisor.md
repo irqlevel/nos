@@ -2149,7 +2149,10 @@ and the test machine). x86-64 with Intel VT-d, booted `iommu=on`:
 ```
 
 or in a vm.toml, `pci = ["01:00.0"]`. At most four functions a guest, named
-`bus:device.function` in hex as `pci` and `iommu` print them.
+`bus:device.function` in hex as `pci` and `iommu` print them. A function one of
+the host's drivers has taken is not given -- a disk's, a NIC's: `guestpci=01:00.0`
+at boot keeps every driver of the host's off it (docs/kernel-parameters.md),
+and it is the guests' to have from then on.
 
 **Its interrupts are remapped** (`arch/x86_64/vtd.cpp`, VT-d's interrupt
 remapping, on with `iommu=on` wherever every unit taken over has it): every
@@ -2166,12 +2169,15 @@ true`), as VFIO refuses a platform without remapping unless told
 `allow_unsafe_interrupts`. Every function given says which in the log.
 
 What the module does with it (`modules/hypervisor/hv/src/passthrough.rs`),
-before any of the guest's memory is taken: the function is claimed -- one
+before any of the guest's memory is taken: a function a driver of the host's
+has taken is refused (`PciDevice::driven`: one that turned bus mastering on
+through `kcore::pci`, or said it was its own, `take` -- xHCI's and ATA's, which
+turn on none); the function is claimed -- one
 guest a function, and the other functions of its device blocked, each in a
 domain of nothing, unless the guest holds them too: a device's functions are
 not isolated from each other, which is why Linux makes a GPU and its audio
 function one IOMMU group; a device one of whose other functions is mastering
--- the host's -- or another guest's is refused. Its BARs are read with its
+-- the host's, or a driver's -- or another guest's is refused. Its BARs are read with its
 decoding off, the screen held meanwhile: on a machine whose boot GPU is the
 one given -- Hertz's A2000 -- the kernel's console is that GPU's memory,
 the firmware's framebuffer in one of its BARs or, where GRUB hands nos none
@@ -2183,13 +2189,21 @@ good (`FbTerm::release_within`, `VgaTerm::release_within`, as Linux's
 vfio-pci takes efifb off its aperture): the reset ends that picture
 anyway, and the memory is the guest's. Then it is reset where it has FLR (as Linux makes one: its
 transactions given a second, the header and the PCIe controls saved and
-written back, the device asked until it answers), its MSI taken by the host
+written back, the device asked until it answers), and its interrupts taken by
+the host: its MSI-X where it has it, with its table and PBA in BARs given --
+the real table the host's to program (`kcore::msix::MsixTable`, reached through
+a mapping of its BAR from its start, so that the kernel does not size the BAR
+again while it decodes), a vector of the host's for each entry the guest is
+given, `MAX_VECTORS` (16) at most, each a slot of the kernel's 64
+(`RUST_MSIX_SLOT_COUNT`, their entry points generated in `asm.asm`) and an
+entry of its unit's interrupt table -- else its MSI
 (`kcore::msix::MsixTable::new_msi`). Once the guest's RAM is there, the
 function is moved to an IOMMU domain of it (`kcore::iommu::Domain`), every
 region at its guest address -- 2 MiB leaves where the RAM is the huge pool's
 -- so that its DMA reaches the guest's memory and nothing else. As the guest
-goes, in this order: the route of its interrupt to the guest, the interrupt,
-bus mastering, an FLR, the domain -- the device left blocked, never passed
+goes, in this order: the route of its interrupts to the guest, the
+interrupts and the host's table, bus mastering, an FLR, the domain -- the
+device left blocked, never passed
 through again while it may remember a guest -- and the claims.
 
 What the guest sees is `hypervisor/hv/src/devices/host.rs`: the real
@@ -2203,9 +2217,21 @@ over it --
   long as the guest holds it, so that no access of the guest's finds it deaf
   -- an Unsupported Request, which a server may escalate to a machine check
   (CVE-2020-12888); INTx stays off;
-- MSI is emulated: what the guest writes is what the host's handler of the
-  real MSI sends it (`LinuxGuest::deliver_msi`), held pending while it is off
-  or masked;
+- its interrupts are emulated (`host::Messages`), MSI-X's where the function
+  has MSI-X with its table and PBA in BARs given, else MSI's: what the guest
+  writes -- MSI's capability, or MSI-X's control word and table -- is what the
+  host's handler of the real vector sends it (`LinuxGuest::deliver_msi`), held
+  pending while it is off or masked, MSI-X's PBA saying so, and sent once
+  unmasked. MSI-X's table is as long as the guest is told: the device's,
+  `MAX_VECTORS` at most -- a driver takes as many vectors as the table says
+  there are -- and MSI-X's enable and function mask are the guest's alone,
+  the real ones the host's. The one of MSI and MSI-X not given is not in the
+  capability list the guest walks (the pointer that names it names the one
+  after it), and none of its bytes is the guest's: a guest that turned MSI on
+  where the host takes MSI-X would wait for an interrupt that never comes;
+- a capability's id and next pointer are read-only, whatever the device's
+  are: a device that took a write there would have the guest change the
+  list the host walked;
 - no ROM; the INTx pin the device's, wired to a line nothing raises
   (`run::HOST_IRQ`): the device's INTx stays off and its interrupt is its
   MSI, but a driver that wants a legacy IRQ to exist finds one -- NVIDIA's
@@ -2218,25 +2244,33 @@ over it --
 - every other register is the device's, written through, as QEMU's VFIO
   does.
 
-A bridge, a function with MSI-X (whose table would be the guest's to aim
-anywhere unless trapped, not done yet), one with no MSI, and one whose
-capability list loops, runs on, or has a second capability of a kind the
-host keeps registers of, are not given: a guest writes at any offset it
-likes, and every register the host keeps has to be in a capability it
-found.
+A bridge, a function with neither MSI-X whose table and PBA are in BARs given
+nor MSI, and one whose capability list loops, runs on, or has a second
+capability of a kind the host keeps registers of, are not given: a guest
+writes at any offset it likes, and every register the host keeps has to be
+in a capability it found.
 
-NVIDIA's GPUs mirror their configuration space in BAR0 at 0x88000: that page
-is left out of the mapping and every access of it trapped and performed on
-the view above (`host_mmio`), eight bytes as two dwords. A write within the
-MSI capability's id and next pointer is also passed to the real mirror --
-the driver acknowledges its MSI so, and without it the GPU sends one
-interrupt and no more (QEMU's `vfio_nvidia_quirk_mirror_write`) -- and only
-within them: a write that reached the control word past them would be the
-guest's to the host's own MSI. Since Pascal the re-arm is a dword at 0x704 of
-the mirror instead (nouveau's `gp100_pci_msi_rearm`), past the 256 bytes the
-guest is given: that dword alone is written through to the real mirror, as
-VFIO lets a write there reach the device; the rest of the extended space --
-the Resizable BAR, ACS, AER -- is nothing the guest reaches.
+Some pages of its BARs are left out of the mapping, and every access of them
+traps and is answered on the view above (`host_mmio`,
+`HostFunction::trapped`; an access not aligned to its size a byte at a time,
+eight bytes of the table or the mirror as two dwords):
+
+- MSI-X's table and PBA, every page they have a byte in: the guest's table
+  and its pending bits, emulated -- mapped, the guest would program the real
+  entries and, where interrupts are not remapped, send any vector of the
+  host's. A page they share with registers of the device's own has those
+  passed through to the real page an access at a time, as VFIO does: QEMU's
+  NVMe has its table right after its doorbells, in their page;
+- NVIDIA's mirror of the configuration space in BAR0 at 0x88000: each access
+  of it is one of the view above. A write within the MSI capability's id and next pointer is also passed to the real mirror --
+  the driver acknowledges its MSI so, and without it the GPU sends one
+  interrupt and no more (QEMU's `vfio_nvidia_quirk_mirror_write`) -- and only
+  within them: a write that reached the control word past them would be the
+  guest's to the host's own MSI. Since Pascal the re-arm is a dword at 0x704 of
+  the mirror instead (nouveau's `gp100_pci_msi_rearm`), past the 256 bytes the
+  guest is given: that dword alone is written through to the real mirror, as
+  VFIO lets a write there reach the device; the rest of the extended space --
+  the Resizable BAR, ACS, AER -- is nothing the guest reaches.
 
 **The guest's memory has a hole for the BARs** (`LinuxGuest::new_holed`):
 its RAM below 4 GiB ends at 3 GiB (`linux::HOLE_RAM_END`) rather than at
@@ -2258,23 +2292,32 @@ access of it stops the guest. A VM holding a host's function is not saved
 and not moved: its device's DMA reaches no dirty log, and its state is the
 device's.
 
-Not done yet: MSI-X, a secondary bus reset for a function without FLR, the
-ROM, VT-d's posted interrupts (the device's MSI straight into the vCPU), the
-extended
-configuration space (ECAM: the Resizable BAR, ACS, AER), refusing a function
-a DMAR RMRR names, isolation beyond one device's functions (ACS on the path
-above it), and AMD-Vi.
+Not done yet: a secondary bus reset for a function without FLR, the ROM,
+the extended configuration space (ECAM: the Resizable BAR, ACS, AER),
+refusing a function a DMAR RMRR names, isolation beyond one device's
+functions (ACS on the path above it), and AMD-Vi. VT-d's posted interrupts
+-- the device's message straight into the vCPU, no host interrupt -- wait for
+a machine whose unit has them (CAP.PI): Hertz's two have not (CAP
+0xd2008c40660462 and 0x1c0000c40660462, bit 59 clear), nor has QEMU's.
 
 Gates: `hv-fuzz.py`'s `hostfn` target (the view above against a model of the
 real function: whatever the guest does, what reaches it holds to the host's
-rules, and what the guest sees to the PCI spec's -- a BAR decoded from its
-registers among it), the `platform` target's guest holding a GPU (the run
+rules -- MSI-X's real table and PBA never reached, a page reached only where
+it traps -- and what the guest sees to the PCI spec's -- a BAR decoded from
+its registers, MSI-X's table, PBA and capability list among it; each rule of
+`host.rs` a mutant it catches, `tests/fuzz/hv/mutants.py`), the `platform`
+target's guest holding a GPU (the run
 loop's bus, mirror, BAR moves and MSIs), and the `linux` and `pvh` targets'
 holed layouts, the `pci` target's ports (only the configuration data's
 are a host function's, whatever the address latched names: a disk's notify
 once went to the GPU's space instead, and the guest's disk stopped as
-NVIDIA's driver probed); `iommu-test.py` for the domains; and on a machine
-with a GPU, by hand, `gpu-passthrough-test.py`: on Hertz an RTX A2000 in
+NVIDIA's driver probed); `iommu-test.py` for the domains;
+`hv-passthrough-test.py`, QEMU's NVMe behind its VT-d given to a Linux guest
+of nos's under TCG -- its driver reading, writing and taking its MSI-X, more
+than one vector of it, and then, the driver let go of, the controller driven
+by hand to write where the guest has no RAM (blocked, said with its
+requester) and at the interrupt range (refused by nos's table, said); and on
+a machine with a GPU, by hand, `gpu-passthrough-test.py`: on Hertz an RTX A2000 in
 nos's guest -- with NVIDIA's own driver (580, the open modules), nvidia-smi
 naming the GPU and CUDA's deviceQuery, vectorAdd and matrixMul passing; or
 with nouveau, its GSP booted by DMA through the domain and a thousand

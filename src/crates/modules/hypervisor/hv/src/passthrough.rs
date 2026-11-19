@@ -1,30 +1,35 @@
 //! A host's PCI function given to a guest (plans/gpu-passthrough.md): found,
 //! claimed against a second guest, its BARs read with its decoding off, reset
 //! where it can be (FLR); moved to an IOMMU domain of the guest's RAM, so
-//! that its DMA reaches the guest's memory and nothing else; its MSI the
-//! host's, each one sent on to the guest as the guest programmed it
-//! (`hv::host::Msi`). What the guest sees of it is `hv::host::HostFunction`'s.
+//! that its DMA reaches the guest's memory and nothing else; its interrupts
+//! the host's -- MSI-X's entries given, a vector of the host's each, or its
+//! MSI -- each one sent on to the guest as the guest programmed it
+//! (`hv::host::Messages`). What the guest sees of it is
+//! `hv::host::HostFunction`'s.
 //!
 //! The order a guest lets go of one is the order it is safe in (`Drop`):
-//! the route its interrupt takes to the guest first, then the interrupt and
-//! the host's MSI, then the device's bus mastering and the device itself --
-//! reset, so that it holds none of the guest's addresses -- then the domain,
-//! which blocks it and lets go of the guest's pages, then the claim. The
-//! device is left blocked, in no domain: never passed through again while it
-//! may remember a guest.
+//! the route its interrupts take to the guest first, then the interrupts and
+//! the host's table, then the device's bus mastering and the device itself
+//! -- reset, so that it holds none of the guest's addresses -- then the
+//! domain, which blocks it and lets go of the guest's pages, then the claim.
+//! The device is left blocked, in no domain: never passed through again
+//! while it may remember a guest.
 //!
 //! A device's functions are not isolated from each other -- no ACS between
 //! them is assumed, which is why Linux makes a GPU and its audio function one
 //! IOMMU group -- so the other functions of a device a guest holds one of are
 //! blocked for as long as it does, each in a domain of nothing, and claimed:
-//! unless the guest holds them too. A device one of whose other functions is
-//! the host's own -- mastering, a driver's -- or another guest's is refused.
+//! unless the guest holds them too. A function a driver of the host's has
+//! taken is refused, and so is a device one of whose other functions is the
+//! host's own -- a driver's, or mastering -- or another guest's: `guestpci=`
+//! keeps the host's drivers off a function at boot.
 
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
-use hv::host::{Bar, HostFunction, Msi, Real};
+use hv::host::{Bar, HostFunction, Messages, Real, MAX_VECTORS};
 use hv::run::LinuxGuest;
 use kcore::dma::PhysMapping;
 use kcore::io::MmioRegion;
@@ -37,14 +42,14 @@ use kcore::sync::IrqSpinLock;
 /// each -- the other functions of their devices, blocked, among them.
 const MAX_PASSED: usize = 16;
 
-/// Where each held function's interrupt goes: its guest and what it wrote
-/// of the MSI capability. Static, as an interrupt's target has to be; a
-/// slot is filled once its guest is in an `Arc` (`Passed::arm`) and emptied
+/// Where each held function's interrupts go: its guest and what it wrote
+/// of its MSI or MSI-X. Static, as an interrupt's target has to be; a slot
+/// is filled once its guest is in an `Arc` (`Passed::arm`) and emptied
 /// before the guest is let go of, by the task that holds it -- so the last
 /// share of a guest is never dropped by an interrupt.
 struct Route {
     guest: Arc<LinuxGuest>,
-    msi: Arc<Msi>,
+    messages: Arc<Messages>,
 }
 
 static ROUTES: [IrqSpinLock<Option<Route>>; MAX_PASSED] = [const { IrqSpinLock::new(None) }; MAX_PASSED];
@@ -52,13 +57,38 @@ static ROUTES: [IrqSpinLock<Option<Route>>; MAX_PASSED] = [const { IrqSpinLock::
 /// Which slots are held, and by which requester id: one guest a function.
 static CLAIMS: IrqSpinLock<[Option<u16>; MAX_PASSED]> = IrqSpinLock::new([None; MAX_PASSED]);
 
-/// The device's MSI, in interrupt context: sent to its guest where the
-/// guest has MSI on and the vector unmasked, else held pending for when it
-/// has (`Msi::raise`).
-fn on_msi(slot: &'static IrqSpinLock<Option<Route>>) {
+/// What the handler of one of the device's vectors is given: its function's
+/// slot, and which of its messages the vector is.
+#[derive(Clone, Copy)]
+struct Vector {
+    slot: u8,
+    index: u8,
+}
+
+const fn vectors() -> [[Vector; MAX_VECTORS]; MAX_PASSED] {
+    let mut all = [[Vector { slot: 0, index: 0 }; MAX_VECTORS]; MAX_PASSED];
+    let mut slot = 0;
+    while slot < MAX_PASSED {
+        let mut index = 0;
+        while index < MAX_VECTORS {
+            all[slot][index] = Vector { slot: slot as u8, index: index as u8 };
+            index += 1;
+        }
+        slot += 1;
+    }
+    all
+}
+
+static VECTORS: [[Vector; MAX_VECTORS]; MAX_PASSED] = vectors();
+
+/// One of the device's interrupts, in interrupt context: sent to its guest
+/// where the guest has that message on and unmasked, else held pending for
+/// when it has (`Messages::raise`).
+fn on_vector(v: &'static Vector) {
+    let Some(slot) = ROUTES.get(usize::from(v.slot)) else { return };
     let route = slot.lock();
     if let Some(r) = route.as_ref() {
-        if let Some((address, data)) = r.msi.raise() {
+        if let Some((address, data)) = r.messages.raise(usize::from(v.index)) {
             r.guest.deliver_msi(address, data);
         }
     }
@@ -108,12 +138,31 @@ const SUBCLASS_VGA: u8 = 0x00;
 const VGA_WINDOW: u64 = 0xA0000;
 const VGA_WINDOW_BYTES: u64 = 0x20000;
 
-/// The real function, as `hv::host::HostFunction` reaches it.
+/// The real function, as `hv::host::HostFunction` reaches it: its
+/// configuration space, and the pages of its BARs that trap -- NVIDIA's
+/// mirror, MSI-X's table and PBA -- mapped for what of them is passed
+/// through.
 struct Device {
     dev: PciDevice,
-    /// The page of BAR0 NVIDIA's mirror is in, mapped, for the MSI
-    /// acknowledgement passed through it: its offset in BAR0, and the page.
-    mirror: Option<(u32, MmioRegion, PhysMapping)>,
+    bars: [Option<Bar>; 6],
+    /// Each page mapped: its BAR, its offset in it, the mapping.
+    pages: Vec<(usize, u64, MmioRegion, PhysMapping)>,
+}
+
+impl Device {
+    /// The mapping of the page `offset` bytes into BAR `bar`, and where in
+    /// it an access of `size` bytes there is -- None where the page is not
+    /// mapped, or the access is not aligned to its size or runs past it.
+    fn page(&self, bar: usize, offset: u64, size: usize) -> Option<(&MmioRegion, usize)> {
+        let page_size = kcore::consts::PAGE_SIZE as u64;
+        let base = offset & !(page_size - 1);
+        let at = (offset - base) as usize;
+        if !matches!(size, 1 | 2 | 4 | 8) || at % size != 0 || at + size > page_size as usize {
+            return None;
+        }
+        let (_, _, region, _) = self.pages.iter().find(|p| p.0 == bar && p.1 == base)?;
+        Some((region, at))
+    }
 }
 
 impl Real for Device {
@@ -129,13 +178,33 @@ impl Real for Device {
     fn write8(&self, offset: u16, value: u8) {
         self.dev.write_config8(offset, value)
     }
-    fn bar0_write(&self, offset: u32, size: u8, value: u32) {
-        let Some((base, region, _)) = &self.mirror else { return };
-        let Some(at) = offset.checked_sub(*base).map(|a| a as usize) else { return };
+    fn map_page(&mut self, bar: usize, offset: u64) -> bool {
+        let page_size = kcore::consts::PAGE_SIZE as u64;
+        let Some(b) = self.bars.get(bar).copied().flatten() else { return false };
+        if offset % page_size != 0 || offset >= b.size || self.pages.try_reserve(1).is_err() {
+            return false;
+        }
+        let Some(m) = PhysMapping::map(b.host + offset, 1) else { return false };
+        let region = MmioRegion::new(m.as_mut_ptr(), m.len());
+        self.pages.push((bar, offset, region, m));
+        true
+    }
+    fn page_read(&self, bar: usize, offset: u64, size: usize) -> u64 {
+        let Some((region, at)) = self.page(bar, offset, size) else { return u64::MAX };
+        match size {
+            1 => u64::from(region.read8(at)),
+            2 => u64::from(region.read16(at)),
+            4 => u64::from(region.read32(at)),
+            _ => region.read64(at),
+        }
+    }
+    fn page_write(&self, bar: usize, offset: u64, size: usize, value: u64) {
+        let Some((region, at)) = self.page(bar, offset, size) else { return };
         match size {
             1 => region.write8(at, value as u8),
             2 => region.write16(at, value as u16),
-            _ => region.write32(at, value),
+            4 => region.write32(at, value as u32),
+            _ => region.write64(at, value),
         }
     }
 }
@@ -178,27 +247,35 @@ pub struct Passed {
     dev: PciDevice,
     function: Option<HostFunction>,
     domain: Option<Domain>,
+    /// The host's side of the device's interrupts: its MSI-X table -- or MSI,
+    /// a table of one -- the mapping of its BAR the table is reached through
+    /// (MSI-X's), and a vector of the host's for each message given.
     table: Option<MsixTable>,
-    interrupt: Option<MsixInterrupt>,
-    msi: Arc<Msi>,
-    _siblings: alloc::vec::Vec<Sibling>,
+    _table_map: Option<PhysMapping>,
+    interrupts: Vec<MsixInterrupt>,
+    messages: Arc<Messages>,
+    _siblings: Vec<Sibling>,
     claim: Claim,
 }
 
 impl Passed {
     /// The function at `bus`:`slot`.`func` taken for a guest that holds
     /// `all`: claimed, its device's other functions blocked but those in
-    /// `all` (above), its BARs read, reset, its MSI the host's. Refused,
-    /// said, where DMA is not translated, the function is not there or is
-    /// another guest's, a function beside it is the host's or another
-    /// guest's, it has no MSI (or has MSI-X, not yet given), or no vector is
-    /// to be had.
+    /// `all` (above), its BARs read, reset, its interrupts the host's.
+    /// Refused, said, where DMA is not translated, the function is not there,
+    /// is another guest's or a driver of the host's has it, a function beside
+    /// it is the host's or another guest's, it has neither MSI-X nor MSI to
+    /// give, or its vectors are not to be had.
     pub fn open(bus: u16, slot: u16, func: u16, all: &[(u16, u16, u16)]) -> Result<Passed, String> {
         let name = alloc::format!("{:02x}:{:02x}.{:x}", bus, slot, func);
         if !iommu::on() {
             return Err(alloc::format!("{}: DMA is not translated -- boot with iommu=on", name));
         }
         let dev = pci::get_device_by_bdf(bus, slot, func).ok_or_else(|| alloc::format!("{}: no such function", name))?;
+        if dev.driven() {
+            return Err(alloc::format!("{}: a driver of the host's has it -- boot with guestpci={} to keep the \
+                                       host's drivers off it", name, name));
+        }
         let sid = iommu::sid(bus, slot, func);
         let claim = Claim::take(sid).ok_or_else(|| alloc::format!("{}: another guest's, or too many held", name))?;
         let siblings = block_siblings(bus, slot, func, all).map_err(|e| alloc::format!("{}: {}", name, e))?;
@@ -229,42 +306,64 @@ impl Passed {
             return Err(alloc::format!("{}: did not answer after its reset", name));
         }
 
-        let mirror = match bars[0] {
-            Some(b0) if dev.vendor == hv::host::VENDOR_NVIDIA
-                && u64::from(hv::host::NVIDIA_MIRROR + hv::host::MIRROR_BYTES) <= b0.size =>
-            {
-                let at = b0.host + u64::from(hv::host::NVIDIA_MIRROR);
-                PhysMapping::map(at, 1).map(|m| {
-                    let region = MmioRegion::new(m.as_mut_ptr(), m.len());
-                    (hv::host::NVIDIA_MIRROR, region, m)
-                })
-            }
-            _ => None,
-        };
-        let real = Box::new(Device { dev, mirror });
+        let real = Box::new(Device { dev, bars, pages: Vec::new() });
         let Some(function) = HostFunction::new(real, bars) else {
-            return Err(alloc::format!("{}: a bridge, no MSI to give, MSI-X -- not given yet -- or a capability \
-                                       list not whole", name));
+            return Err(alloc::format!("{}: a bridge, neither MSI-X with its table in a BAR given nor MSI, a \
+                                       capability list not whole, or a page that traps not mapped", name));
         };
-        let msi = function.msi();
-
-        let table = MsixTable::new_msi(&dev);
-        let interrupt = table.as_ref().and_then(|t| MsixInterrupt::register_for(t, 0, &ROUTES[claim.0], on_msi));
-        if interrupt.is_none() {
-            return Err(alloc::format!("{}: its MSI could not be taken by the host", name));
-        }
+        let messages = function.messages();
+        let (table, table_map, interrupts) = match function.msix_layout() {
+            Some(l) => {
+                /* The real table, the host's to program: through a mapping of
+                 * its BAR from its start to the table's end, so that the
+                 * kernel does not size the BAR anew while it decodes */
+                let page = kcore::consts::PAGE_SIZE as u64;
+                let b = bars[l.table_bar].ok_or_else(|| alloc::format!("{}: MSI-X's BAR not given", name))?;
+                let pages = (l.table + l.table_bytes()).div_ceil(page) as usize;
+                let map = PhysMapping::map(b.host, pages)
+                    .ok_or_else(|| alloc::format!("{}: MSI-X's table could not be mapped", name))?;
+                let mut mapped = [0u64; 6];
+                mapped[l.table_bar] = map.as_mut_ptr() as u64;
+                let table = MsixTable::new_with_bars(&dev, &mapped)
+                    .ok_or_else(|| alloc::format!("{}: its MSI-X could not be taken by the host", name))?;
+                let interrupts = register(&table, &claim, messages.count(), &name)?;
+                (table, Some(map), interrupts)
+            }
+            None => {
+                let table = MsixTable::new_msi(&dev)
+                    .ok_or_else(|| alloc::format!("{}: its MSI could not be taken by the host", name))?;
+                let interrupts = register(&table, &claim, 1, &name)?;
+                (table, None, interrupts)
+            }
+        };
         /* Said every time. Remapped, a DMA write of the device's to the
-         * interrupt range raises its own vector alone; not, any vector of
+         * interrupt range raises its own vectors alone; not, any vector of
          * the host's -- the guest is trusted with that (unsafe_interrupts) */
+        let kind = if messages.msix() {
+            alloc::format!("MSI-X, {} of its vectors", messages.count())
+        } else {
+            String::from("MSI")
+        };
         if iommu::remapping() {
             kcore::klog!(0, "hv: {} given to a guest -- its DMA reaches the guest's RAM alone, its interrupts \
-                             remapped: what it sends raises its own vector and no other", name);
+                             ({}) remapped: what it sends raises its own vectors and no other", name, kind);
         } else {
             kcore::klog!(0, "hv: {} given to a guest -- its DMA reaches the guest's RAM alone, but its interrupts \
-                             are not remapped: a guest that has it write to 0xFEE00000 raises any interrupt of the \
-                             host's (plans/gpu-passthrough.md)", name);
+                             ({}) are not remapped: a guest that has it write to 0xFEE00000 raises any interrupt \
+                             of the host's (plans/gpu-passthrough.md)", name, kind);
         }
-        Ok(Passed { sid, dev, function: Some(function), domain: None, table, interrupt, msi, _siblings: siblings, claim })
+        Ok(Passed {
+            sid,
+            dev,
+            function: Some(function),
+            domain: None,
+            table: Some(table),
+            _table_map: table_map,
+            interrupts,
+            messages,
+            _siblings: siblings,
+            claim,
+        })
     }
 
     /// The function's DMA moved to a domain of `guest`'s RAM -- every region
@@ -285,10 +384,25 @@ impl Passed {
         self.function.take()
     }
 
-    /// Its interrupt sent on to `guest` from now on.
+    /// Its interrupts sent on to `guest` from now on.
     pub fn arm(&self, guest: &Arc<LinuxGuest>) {
-        *ROUTES[self.claim.0].lock() = Some(Route { guest: guest.clone(), msi: self.msi.clone() });
+        *ROUTES[self.claim.0].lock() = Some(Route { guest: guest.clone(), messages: self.messages.clone() });
     }
+}
+
+/// A vector of the host's for each of the device's first `count` messages,
+/// its handler `on_vector` with the function's slot and the message's index.
+fn register(table: &MsixTable, claim: &Claim, count: usize, name: &str) -> Result<Vec<MsixInterrupt>, String> {
+    let mut interrupts = Vec::new();
+    interrupts.try_reserve_exact(count).map_err(|_| String::from("out of memory"))?;
+    for (index, target) in VECTORS[claim.0].iter().enumerate().take(count) {
+        let interrupt = MsixInterrupt::register_for(table, index as u16, target, on_vector).ok_or_else(|| {
+            alloc::format!("{}: no vector of the host's for its message {} -- the kernel's interrupt slots are \
+                            taken", name, index)
+        })?;
+        interrupts.push(interrupt);
+    }
+    Ok(interrupts)
 }
 
 impl Drop for Passed {
@@ -297,7 +411,7 @@ impl Drop for Passed {
          * is done with it -- and dropped here, in a task */
         let route = ROUTES[self.claim.0].lock().take();
         drop(route);
-        self.interrupt = None;
+        self.interrupts.clear();
         self.table = None;
         let command = self.dev.read_config16(COMMAND);
         self.dev.write_config16(COMMAND, command & !(COMMAND_IO | COMMAND_MEMORY | COMMAND_MASTER));
@@ -312,8 +426,8 @@ impl Drop for Passed {
 /// lowest function of it the guest holds. Refused where one is mastering,
 /// a driver of the host's at work on it, or claimed already, another
 /// guest's: its DMA would not be kept from the one the guest is given.
-fn block_siblings(bus: u16, slot: u16, func: u16, all: &[(u16, u16, u16)]) -> Result<alloc::vec::Vec<Sibling>, String> {
-    let mut blocked = alloc::vec::Vec::new();
+fn block_siblings(bus: u16, slot: u16, func: u16, all: &[(u16, u16, u16)]) -> Result<Vec<Sibling>, String> {
+    let mut blocked = Vec::new();
     let held = |f: u16| all.contains(&(bus, slot, f));
     if (0..func).any(|f| held(f)) {
         return Ok(blocked);
@@ -325,7 +439,7 @@ fn block_siblings(bus: u16, slot: u16, func: u16, all: &[(u16, u16, u16)]) -> Re
     for f in (0..FUNCTIONS).filter(|&f| f != func && !held(f)) {
         let Some(dev) = pci::get_device_by_bdf(bus, slot, f) else { continue };
         let name = alloc::format!("{:02x}:{:02x}.{:x}, beside it,", bus, slot, f);
-        if dev.read_config16(COMMAND) & COMMAND_MASTER != 0 {
+        if dev.driven() || dev.read_config16(COMMAND) & COMMAND_MASTER != 0 {
             return Err(alloc::format!("{} is the host's: its DMA would not be kept from the guest's", name));
         }
         let sid = iommu::sid(bus, slot, f);

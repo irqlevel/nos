@@ -20,6 +20,16 @@ unsafe extern "C" {
     ) -> isize;
     pub safe fn kernel_pci_device_count() -> usize;
     pub fn kernel_pci_get_device(index: usize, out: *mut PciDeviceInfo) -> i32;
+    /// The function the scan found at `bus`:`slot`.`func` -- one kept for
+    /// guests too, which the two above pass over: 1, `out` filled; 0 for none.
+    pub fn kernel_pci_device_at(bus: u16, slot: u16, func: u16, out: *mut PciDeviceInfo) -> i32;
+    /// The function a driver of the host's: given to no guest from here on.
+    /// A value looked up in the scan's table: sound for any, at any time.
+    pub safe fn kernel_pci_take(bus: u16, slot: u16, func: u16);
+    /// 1 where a driver of the host's has taken the function; and where it
+    /// is kept for guests (`guestpci=`). Lookups, sound for any value.
+    pub safe fn kernel_pci_driven(bus: u16, slot: u16, func: u16) -> i32;
+    pub safe fn kernel_pci_kept(bus: u16, slot: u16, func: u16) -> i32;
     pub fn kernel_pci_get_bar(bus: u16, slot: u16, func: u16, bar: u8) -> u32;
     pub fn kernel_pci_enable_bus_mastering(bus: u16, slot: u16, func: u16);
     pub fn kernel_pci_find_capability(

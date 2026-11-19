@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 use crate::devices::blk;
-use crate::devices::host::{HostFunction, Msi};
+use crate::devices::host::{HostFunction, Messages};
 use crate::hostmodel;
 use crate::linux::{self, Header};
 use crate::machine::Machine;
@@ -267,7 +267,7 @@ struct Script {
 struct HostedFn {
     slot: u32,
     bar0: u64,
-    msi: Arc<Msi>,
+    msi: Arc<Messages>,
     maskable: bool,
 }
 
@@ -809,7 +809,7 @@ impl Script {
             }
             _ => {
                 /* The device's interrupt, sent now or held pending */
-                if let Some((address, data)) = msi.raise() {
+                if let Some((address, data)) = msi.raise(0) {
                     let serving = SERVING.lock().unwrap().as_ref().and_then(|(g, _)| g.upgrade());
                     if let Some(guest) = serving {
                         guest.deliver_msi(address, data);
@@ -1862,7 +1862,7 @@ pub fn platform(r: &mut Input) {
         invariant!(function.is_some(), "the platform's GPU not given");
         let maskable = made.model.lock().unwrap().space[hostmodel::GPU_MSI + 3] & 1 != 0;
         if let Some(f) = function {
-            let msi = f.msi();
+            let msi = f.messages();
             if guest.add_host_function(f).is_ok() {
                 let slot = 1 + (disks.len() + nics.len()) as u32;
                 let bar0 = linux::HOLE_RAM_END.div_ceil(hostmodel::GPU_BAR0_SIZE) * hostmodel::GPU_BAR0_SIZE;

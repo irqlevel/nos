@@ -114,38 +114,8 @@ global rust_interrupt_stub4
 global rust_interrupt_stub5
 global rust_interrupt_stub6
 global rust_interrupt_stub7
-global rust_msix_stub0
-global rust_msix_stub1
-global rust_msix_stub2
-global rust_msix_stub3
-global rust_msix_stub4
-global rust_msix_stub5
-global rust_msix_stub6
-global rust_msix_stub7
-global rust_msix_stub8
-global rust_msix_stub9
-global rust_msix_stub10
-global rust_msix_stub11
-global rust_msix_stub12
-global rust_msix_stub13
-global rust_msix_stub14
-global rust_msix_stub15
-global rust_msix_stub16
-global rust_msix_stub17
-global rust_msix_stub18
-global rust_msix_stub19
-global rust_msix_stub20
-global rust_msix_stub21
-global rust_msix_stub22
-global rust_msix_stub23
-global rust_msix_stub24
-global rust_msix_stub25
-global rust_msix_stub26
-global rust_msix_stub27
-global rust_msix_stub28
-global rust_msix_stub29
-global rust_msix_stub30
-global rust_msix_stub31
+global rust_msix_stub_table
+global rust_msix_stub_count
 
 global exc_divide_by_zero_stub
 global exc_debugger_stub
@@ -652,49 +622,36 @@ RustInterruptSlot 5
 RustInterruptSlot 6
 RustInterruptSlot 7
 
-%macro RustMsixSlot 1
-rust_msix_stub%1:
+; The Rust MSI-X slots' entry points, a slot's number baked into each, and
+; their table, which rust_ffi.cpp hands out by slot: RUST_MSIX_SLOTS of them,
+; the count rust_ffi.cpp holds its own (hal/irq_stubs.h) to at the first
+; registration.
+%define RUST_MSIX_SLOTS 64
+%assign MsixSlot 0
+%rep RUST_MSIX_SLOTS
+rust_msix_stub%+MsixSlot:
 	PushAll
 	mov rdi, rsp
-	mov esi, %1
+	mov esi, MsixSlot
 	cld
 	call dispatch_rust_msix
 	PopAll
 	iretq
-%endmacro
+%assign MsixSlot MsixSlot+1
+%endrep
 
-RustMsixSlot 0
-RustMsixSlot 1
-RustMsixSlot 2
-RustMsixSlot 3
-RustMsixSlot 4
-RustMsixSlot 5
-RustMsixSlot 6
-RustMsixSlot 7
-RustMsixSlot 8
-RustMsixSlot 9
-RustMsixSlot 10
-RustMsixSlot 11
-RustMsixSlot 12
-RustMsixSlot 13
-RustMsixSlot 14
-RustMsixSlot 15
-RustMsixSlot 16
-RustMsixSlot 17
-RustMsixSlot 18
-RustMsixSlot 19
-RustMsixSlot 20
-RustMsixSlot 21
-RustMsixSlot 22
-RustMsixSlot 23
-RustMsixSlot 24
-RustMsixSlot 25
-RustMsixSlot 26
-RustMsixSlot 27
-RustMsixSlot 28
-RustMsixSlot 29
-RustMsixSlot 30
-RustMsixSlot 31
+section .rodata
+align 8
+rust_msix_stub_count:
+	dq RUST_MSIX_SLOTS
+rust_msix_stub_table:
+%assign MsixSlot 0
+%rep RUST_MSIX_SLOTS
+	dq rust_msix_stub%+MsixSlot
+%assign MsixSlot MsixSlot+1
+%endrep
+
+section .text
 
 ExceptionStub exc_divide_by_zero
 ExceptionStub exc_debugger
