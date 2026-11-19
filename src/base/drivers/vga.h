@@ -1,6 +1,7 @@
 #pragma once
 
 #include <include/types.h>
+#include <kernel/atomic.h>
 #include <kernel/spin_lock.h>
 #include <lib/printer.h>
 
@@ -27,6 +28,16 @@ public:
     virtual void backspace() override;
 
     void panic_print_string(const char *s);
+
+    /* As FbTerm's: the text buffer let go of for good where it lies in
+       [base, base + size) -- the legacy VGA window of a VGA controller about
+       to be given to a guest, the boot GPU whose legacy memory and ports
+       0xB8000 and 0x3D4 are: nothing written there from then on, the
+       panic's report included. And drawing held and taken up again, paired,
+       while that function's decoding is off. */
+    bool release_within(ulong base, ulong size);
+    void hold();
+    void unhold();
 
     /* VGA hardware text mode color constants. */
     enum Color {
@@ -86,6 +97,9 @@ private:
        `at` on the screen */
     void puts_from(Cursor at, const char *s);
     void cls_lock_held();
+    /* Whether there is a text buffer to write: one mapped, not released,
+       not held */
+    bool drawing();
 
     const ulong buf_phy_addr_ = 0xB8000;
 
@@ -103,6 +117,11 @@ private:
     const u16 vga_index_ = 0x0E;
 
     SpinLock lock_;
+    /* Set once, by release_within; and the holds there are. Changed under
+       lock_ and read under it by every path that writes -- and by the
+       panic's, which takes no lock */
+    Atomic released_;
+    Atomic holds_;
 
     static bool ready_flag_;
 };

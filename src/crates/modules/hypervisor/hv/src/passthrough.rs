@@ -100,6 +100,13 @@ const SAVED: core::ops::Range<u16> = 0x04..0x40;
 const FLR_MS: u64 = 100;
 const ANSWER_MS: u64 = 1000;
 const ANSWER_STEP_MS: u64 = 10;
+/// A VGA controller, and the legacy window one decodes where the firmware
+/// routed it to the boot GPU -- the text buffer at 0xB8000 among it, which
+/// the kernel's console writes when GRUB handed it no framebuffer (Hertz).
+const CLASS_DISPLAY: u8 = 0x03;
+const SUBCLASS_VGA: u8 = 0x00;
+const VGA_WINDOW: u64 = 0xA0000;
+const VGA_WINDOW_BYTES: u64 = 0x20000;
 
 /// The real function, as `hv::host::HostFunction` reaches it.
 struct Device {
@@ -197,19 +204,26 @@ impl Passed {
         let siblings = block_siblings(bus, slot, func, all).map_err(|e| alloc::format!("{}: {}", name, e))?;
 
         /* Quiet while it is read: decoding and bus mastering off -- and the
-         * screen held meanwhile: the firmware's framebuffer may be in one of
-         * its BARs, the boot GPU's, which do not answer while they are off.
-         * Where it is, it is let go of for good: the reset ends it anyway,
-         * and the memory is the guest's from here */
+         * screen held meanwhile: the boot GPU's memory may be the console's,
+         * the firmware's framebuffer in one of its BARs or, for a VGA
+         * controller, the text buffer in its legacy window, and neither
+         * answers while it is off. Where it is, it is let go of for good: the
+         * reset ends that picture anyway, and the memory is the guest's */
         let hold = ScreenHold::new();
         let command = dev.read_config16(COMMAND);
         dev.write_config16(COMMAND, command & !(COMMAND_IO | COMMAND_MEMORY | COMMAND_MASTER));
         let bars = read_bars(&dev, &name);
-        let screen = (0..bars.len()).find(|&i| bars[i].is_some_and(|b| pci::release_screen(b.host, b.size)));
+        let screen = (0..bars.len())
+            .find(|&i| bars[i].is_some_and(|b| pci::release_screen(b.host, b.size)))
+            .map(|i| alloc::format!("BAR{} holds the screen's framebuffer", i))
+            .or_else(|| {
+                (dev.class == CLASS_DISPLAY && dev.subclass == SUBCLASS_VGA
+                    && pci::release_screen(VGA_WINDOW, VGA_WINDOW_BYTES))
+                    .then(|| String::from("a VGA controller, whose legacy window holds the screen's text"))
+            });
         drop(hold);
-        if let Some(i) = screen {
-            kcore::klog!(0, "hv: {}: BAR{} holds the screen's framebuffer -- let go of: nothing is drawn there from \
-                             now on", name, i);
+        if let Some(why) = screen {
+            kcore::klog!(0, "hv: {}: {} -- let go of: nothing is drawn there from now on", name, why);
         }
         if !reset(&dev) {
             return Err(alloc::format!("{}: did not answer after its reset", name));
