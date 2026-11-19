@@ -4,7 +4,7 @@
 - [Build](build.md) — native and Docker builds, arm64, the undefined-behaviour flavours (`UBSAN=1` for the C++, `RUSTUB=1` for the Rust), the disk image, the system image, BIOS vs. UEFI on the ISO
 - [Run](run.md) — QEMU on x86-64 (KVM, TCG, OVMF) and arm64 (HVF), Google Cloud
 - [Install](install.md) — nos on a server: the release's system image poured onto a partition with `nos-install`, booted once through the server's own GRUB, updated, rolled back
-- [Real hardware](real-hardware.md) — the Dell Latitude 5480 laptop and the Hetzner EX44 (Intel) and AX41 (AMD) servers
+- [Real hardware](real-hardware.md) — the Dell Latitude 5480 laptop, the Hetzner EX44 (Intel) and AX41 (AMD) servers, and the servers since, two sockets among them
 - [Debug](debug.md) — GDB, getting a log off a box with no serial port
 - [Tests and gates](testing.md) — the self-tests every boot runs, the smoke boots, and the gate each subsystem has for what a smoke boot cannot notice: what it checks and when to run it
 - [Kernel parameters](kernel-parameters.md) — `smp=`, `maxcpus=`, `console=`, `dhcp=`, `udpshell=`, `netconsole=`, `loglevel=`, …
@@ -13,6 +13,7 @@ How it works, by subsystem:
 
 - [Boot](boot.md) — GRUB/Multiboot2 and the Linux `Image` protocol to `boot: complete`, on both architectures, and how the APs come up
 - [Paging and memory](paging.md) — the bootstrap linear map, the real page table, the free list, the allocators, MMIO and W^X, TLB shootdown
+- [NUMA](numa.md) — the nodes a machine of several sockets is, from its SRAT and SLIT: free pages by node, the zeroing and the huge pool by node, the scheduler's preference, a guest's memory on its CPUs' node, and what `numabench` measures
 - [Scheduler](scheduler.md) — per-CPU run queues, the context switch, preemption, blocking and load balancing
 - [Interrupts](interrupts.md) — the IDT and IOAPIC, MSI-X and MSI, GICv3 and the ITS, IPIs, NMI, IRQ balancing, deferred work
 - [Profiler](profiler.md) — sampling on a performance counter or the tick, and how to read a `profile` report
