@@ -51,6 +51,8 @@ enum {
     COMMAND_MEMORY = 1 << 1,
     COMMAND_MASTER = 1 << 2,
     WAIT_SECS = 10,
+    /* Between one command and the next */
+    PAUSE_US = 200 * 1000,
 };
 
 static volatile uint32_t* bar;
@@ -205,6 +207,10 @@ int main(int argc, char** argv)
         if (head == 0)
             phase ^= 1;
         wr32(cq_bell, head);
+        /* A pause before the next: the fault this one made, if any, said by
+           the host before the next one's comes -- a unit records so many
+           faults, and one past them is lost */
+        usleep(PAUSE_US);
     }
     return 0;
 }

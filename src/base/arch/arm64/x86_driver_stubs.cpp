@@ -122,6 +122,14 @@ bool release(u16 sid)
     return false;
 }
 
+bool reserved(u16 sid, u64& base, u64& limit)
+{
+    (void)sid;
+    (void)base;
+    (void)limit;
+    return false;
+}
+
 /* No interrupt remapping either: nothing is */
 bool remapping()
 {

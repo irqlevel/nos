@@ -37,4 +37,11 @@ unsafe extern "C" {
     /// The device must hold no address it may no longer reach -- it was
     /// reset, or never told one: passed through, it reaches every byte.
     pub fn kernel_iommu_release(sid: u16) -> i32;
+    /// Whether the firmware reserved memory for `sid`'s DMA -- a DMAR RMRR
+    /// whose scope is it or a bridge above it -- its first byte in `base`
+    /// and its last in `limit`: not 0 where it did.
+    ///
+    /// # Safety
+    /// `base` and `limit` must be writable.
+    pub fn kernel_iommu_reserved(sid: u16, base: *mut u64, limit: *mut u64) -> i32;
 }

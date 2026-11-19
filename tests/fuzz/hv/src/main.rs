@@ -89,6 +89,10 @@ pub mod exit;
 /// frames reach.
 #[path = "../../../../src/crates/modules/hypervisor/hv/src/dhcp.rs"]
 pub mod dhcp;
+/// The IOMMU groups the module gives a guest's functions by, from the
+/// module: what its `groups` target holds to a tree.
+#[path = "../../../../src/crates/modules/hypervisor/hv/src/groups.rs"]
+pub mod groups;
 #[path = "../../../../src/crates/hypervisor/hv/src/insn.rs"]
 pub mod insn;
 #[path = "../../../../src/crates/hypervisor/hv/src/lapic.rs"]
@@ -152,6 +156,7 @@ mod fwmodel;
 mod guestnet;
 mod handovermodel;
 mod hostmodel;
+mod groupsmodel;
 mod portmodel;
 mod migwiremodel;
 mod netrx;

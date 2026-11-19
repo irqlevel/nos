@@ -514,7 +514,7 @@ without it, the A2000's thousand fences still signalled -- so the hv-fuzz
 
 ### `hv-passthrough-test.py` -- QEMU's NVMe in nos's guest, and a hostile one
 
-`make nocheck && make nos-test.iso TEST_ISO_ARGS="iommu=on guestpci=01:00.0,01:00.1,02:00.0"`,
+`make nocheck && make nos-test.iso TEST_ISO_ARGS="iommu=on guestpci=01:00.0,01:00.1,02:00.0,03:00.0"`,
 the guest's kernel and nvmepoke made once by
 `tests/hv-passthrough/build-guest.sh <dir>` (Linux 6.18 from kernel.org, its
 digest checked, `tinyconfig` and `tests/hv-passthrough/guest.config`), then
@@ -547,7 +547,15 @@ its device's, every function's 4 KiB of configuration space -- the extended
 space past the 256 bytes, which ECAM alone reaches -- and the second virtio
 disk's extended list (`aer=on,ats=on`: AER at 0x100, ATS past it) the AER
 alone, the ports' none; and its PCI code has to place every BAR in its
-port's windows, nothing said against them. The guest's own drivers have
+port's windows, nothing said against them. Isolation: nos has to turn ACS on at the three
+root ports, group the NVMe with the disk beside it -- functions of one device
+with no ACS of their own -- and the other disk alone, and refuse a third root
+port's virtio-rng, its function 0 kept for guests and asked for first, whose
+function 1 is nos's own rng's: one group with a function of the host's. The
+VT-d fault handler goes round until nothing is pending, and nvmepoke pauses
+between its commands, so that each fault is said before the next comes: a
+unit records so many, and an overflow it flagged while the handler ran was
+left set once -- and a unit with PFO set records nothing again. The guest's own drivers have
 to find the three disks, each by its function's address, and read the
 pattern the runner put on each -- the devices' DMA
 into the guest's RAM, through their domains -- write one of their own and
@@ -1359,7 +1367,14 @@ their write, the extended space of a function there zeroes -- the `acpi`
 target the MCFG (one, its checksum whole, its window and last bus) and the
 host bridge's buses to ECAM's, the `linux` and `pvh` targets ECAM reserved
 in a holed guest's memory map and in no other's; thirteen mutants of ECAM
-and the extended space, each caught. The `platform` target's guest holds
+and the extended space, each caught. `groups` holds the module's IOMMU
+groups (`modules/hypervisor/hv/src/groups.rs`) to the tree they are made
+of: random hierarchies -- root ports and devices of several of them,
+switches, endpoints of one function or several, conventional bridges, ACS
+here and there -- their buses numbered depth first, and a judge that knows
+what is below what from the tree, where the code reads it from bus numbers;
+the partition the code makes has to be the judge's exactly, and a bus two
+bridges claim grouped not at all. Seven `groups_*` mutants, each caught. The `platform` target's guest holds
 such a GPU one run in six, behind its port: its driver writing and reading
 it through the bus and through the mirror -- eight bytes at a time among it
 -- moving BAR0 over the hole and anywhere, programming its MSI as the device

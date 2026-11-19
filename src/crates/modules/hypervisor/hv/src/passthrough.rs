@@ -38,6 +38,8 @@ use kcore::msix::{MsixInterrupt, MsixTable};
 use kcore::pci::{self, PciDevice, ScreenHold};
 use kcore::sync::IrqSpinLock;
 
+use crate::groups::{self, Kind};
+
 /// The most functions held at once, by every guest together -- a route slot
 /// each -- the other functions of their devices, blocked, among them.
 const MAX_PASSED: usize = 16;
@@ -156,7 +158,16 @@ const REBAR_COUNT_MASK: u32 = 0x7;
 const REBAR_ENTRY_BYTES: u16 = 8;
 const REBARS_MAX: usize = 6;
 const EXT_ACS: u16 = 0x000D;
+const ACS_CAPABILITY: u16 = 0x04;
 const ACS_CONTROL: u16 = 0x06;
+/// The PCIe capability's device or port type (its flags' bits 7:4), by what
+/// isolation makes of it (`groups::Kind`): endpoints, a legacy one, an
+/// integrated one, a switch's upstream port; root and downstream ports.
+const PCIE_TYPE_SHIFT: u16 = 4;
+const PCIE_TYPE_MASK: u16 = 0xF;
+const PCIE_ENDPOINTS: [u16; 4] = [0x0, 0x1, 0x9, 0x5];
+const PCIE_PORTS: [u16; 2] = [0x4, 0x6];
+const SUBORDINATE_BUS: u16 = 0x1A;
 /// A VGA controller, and the legacy window one decodes where the firmware
 /// routed it to the boot GPU -- the text buffer at 0xB8000 among it, which
 /// the kernel's console writes when GRUB handed it no framebuffer (Hertz).
@@ -260,15 +271,16 @@ impl Drop for Claim {
     }
 }
 
-/// Another function of the device, blocked while the guest holds its
-/// sibling: its domain maps nothing, and it is left blocked when that goes.
+/// Another function of its IOMMU group, blocked while the guest holds one
+/// (`block_group`): its domain maps nothing, and it is left blocked when that
+/// goes.
 struct Sibling {
     _domain: Domain,
     _claim: Claim,
 }
 
 /// A host's function a guest holds. Its fields go after `drop`'s body in
-/// this order: the device's siblings left blocked, then its claim.
+/// this order: its IOMMU group's other functions left blocked, then its claim.
 pub struct Passed {
     sid: u16,
     dev: PciDevice,
@@ -283,7 +295,7 @@ pub struct Passed {
     messages: Arc<Messages>,
     /// How it is reset as the guest lets go of it, as it was as it was given.
     reset: ResetPlan,
-    _siblings: Vec<Sibling>,
+    _blocked: Vec<Sibling>,
     claim: Claim,
 }
 
@@ -306,8 +318,12 @@ impl Passed {
                                        host's drivers off it", name, name));
         }
         let sid = iommu::sid(bus, slot, func);
+        if let Some((base, limit)) = iommu::reserved(sid) {
+            return Err(alloc::format!("{}: the firmware reserved memory for its DMA ({:#x}-{:#x}, a DMAR RMRR): it \
+                                       keeps reaching the host's memory there, and is no guest's", name, base, limit));
+        }
         let claim = Claim::take(sid).ok_or_else(|| alloc::format!("{}: another guest's, or too many held", name))?;
-        let siblings = block_siblings(bus, slot, func, all).map_err(|e| alloc::format!("{}: {}", name, e))?;
+        let blocked = block_group(bus, slot, func, all).map_err(|e| alloc::format!("{}: {}", name, e))?;
 
         /* Quiet while it is read: decoding and bus mastering off -- and the
          * screen held meanwhile: the boot GPU's memory may be the console's,
@@ -399,7 +415,7 @@ impl Passed {
             interrupts,
             messages,
             reset,
-            _siblings: siblings,
+            _blocked: blocked,
             claim,
         })
     }
@@ -465,28 +481,117 @@ impl Drop for Passed {
     }
 }
 
-/// The device at `bus`:`slot`'s functions but `func` and the others the
-/// guest holds (`all`), each blocked and claimed -- once a device, by the
-/// lowest function of it the guest holds. Refused where one is mastering,
-/// a driver of the host's at work on it, or claimed already, another
-/// guest's: its DMA would not be kept from the one the guest is given.
-fn block_siblings(bus: u16, slot: u16, func: u16, all: &[(u16, u16, u16)]) -> Result<Vec<Sibling>, String> {
-    let mut blocked = Vec::new();
-    let held = |f: u16| all.contains(&(bus, slot, f));
-    if (0..func).any(|f| held(f)) {
-        return Ok(blocked);
-    }
-    let multi = pci::get_device_by_bdf(bus, slot, 0).is_some_and(|d| d.read_config8(HEADER_TYPE) & HEADER_MULTI != 0);
-    if !multi {
-        return Ok(blocked);
-    }
-    for f in (0..FUNCTIONS).filter(|&f| f != func && !held(f)) {
-        let Some(dev) = pci::get_device_by_bdf(bus, slot, f) else { continue };
-        let name = alloc::format!("{:02x}:{:02x}.{:x}, beside it,", bus, slot, f);
-        if dev.driven() || dev.read_config16(COMMAND) & COMMAND_MASTER != 0 {
-            return Err(alloc::format!("{} is the host's: its DMA would not be kept from the guest's", name));
+/// What isolation makes of the host's bus (`groups`): every function the
+/// PCI scan found -- its kind, by its PCIe capability's type, whether its
+/// device has others, its ACS, the buses below a bridge -- and the index of
+/// `bus`:`slot`.`func` among them.
+fn topology(bus: u16, slot: u16, func: u16) -> Result<(Vec<groups::Function>, usize), String> {
+    let mut all = Vec::new();
+    all.try_reserve_exact(pci::device_count()).map_err(|_| String::from("out of memory"))?;
+    let mut me = None;
+    for d in (0..pci::device_count()).filter_map(pci::get_any) {
+        let (Ok(b), Ok(s), Ok(f)) = (u8::try_from(d.bus), u8::try_from(d.slot), u8::try_from(d.func)) else { continue };
+        let kind = match d.find_capability(CAP_PCIE) {
+            Some(at) => {
+                let t = (d.read_config16(u16::from(at) + PCIE_FLAGS) >> PCIE_TYPE_SHIFT) & PCIE_TYPE_MASK;
+                if PCIE_PORTS.contains(&t) {
+                    Kind::Port
+                } else if PCIE_ENDPOINTS.contains(&t) {
+                    Kind::Endpoint
+                } else {
+                    Kind::Conventional
+                }
+            }
+            None => Kind::Conventional,
+        };
+        let multi = pci::get_device_by_bdf(d.bus, d.slot, 0)
+            .is_some_and(|f0| f0.read_config8(HEADER_TYPE) & HEADER_MULTI != 0);
+        let acs = d.find_extended_capability(EXT_ACS)
+            .map(|at| (d.read_config16(at + ACS_CAPABILITY), d.read_config16(at + ACS_CONTROL)));
+        let below = (d.read_config8(HEADER_TYPE) & HEADER_LAYOUT == HEADER_BRIDGE)
+            .then(|| (d.read_config8(SECONDARY_BUS), d.read_config8(SUBORDINATE_BUS)));
+        if (d.bus, d.slot, d.func) == (bus, slot, func) {
+            me = Some(all.len());
         }
-        let sid = iommu::sid(bus, slot, f);
+        all.push(groups::Function { bus: b, slot: s, func: f, kind, multi, acs, below });
+    }
+    let me = me.ok_or_else(|| String::from("not in the PCI scan"))?;
+    Ok((all, me))
+}
+
+/// ACS on wherever the host's functions have it -- Source Validation, P2P
+/// Request and Completion Redirect, Upstream Forwarding, each where the
+/// function has the feature -- as Linux turns it on where it has an IOMMU
+/// (`pci_std_enable_acs`): a port with it sends what comes up from below
+/// on up, where the IOMMU sees it, rather than to a peer. Said where it
+/// changed anything.
+fn enable_acs() {
+    for d in (0..pci::device_count()).filter_map(pci::get_any) {
+        let Some(at) = d.find_extended_capability(EXT_ACS) else { continue };
+        let cap = d.read_config16(at + ACS_CAPABILITY);
+        let ctrl = d.read_config16(at + ACS_CONTROL);
+        let want = ctrl | (cap & groups::ACS_NEEDED);
+        if want != ctrl {
+            d.write_config16(at + ACS_CONTROL, want);
+            kcore::klog!(0, "hv: {:02x}:{:02x}.{:x}: ACS on, control {:#x} (was {:#x})", d.bus, d.slot, d.func,
+                         d.read_config16(at + ACS_CONTROL), ctrl);
+        }
+    }
+}
+
+/// The functions of `bus`:`slot`.`func`'s IOMMU group (`groups`) that the
+/// guest is not given -- held apart from it by nothing: what one sends may
+/// reach the other peer to peer -- blocked while the guest holds it:
+/// claimed, each in a domain of none, so that its DMA reaches nothing; by
+/// the function of the group the guest is given first, in the host's order.
+/// The group's bridges are left be: they forward, and master nothing of
+/// their own. Refused where one of them is the host's -- a driver's, or
+/// mastering -- another guest's, or one the firmware reserved memory for;
+/// and for a function whose requests reach its IOMMU by a conventional
+/// bridge's id, or on a bus this cannot be sure of.
+fn block_group(bus: u16, slot: u16, func: u16, given: &[(u16, u16, u16)]) -> Result<Vec<Sibling>, String> {
+    enable_acs();
+    let (all, me) = topology(bus, slot, func)?;
+    let at = |i: usize| (u16::from(all[i].bus), u16::from(all[i].slot), u16::from(all[i].func));
+    let bdf = |i: usize| alloc::format!("{:02x}:{:02x}.{:x}", all[i].bus, all[i].slot, all[i].func);
+    if let Some(b) = groups::behind_conventional(&all, me) {
+        return Err(alloc::format!("below {}, a conventional bridge: its requests reach the IOMMU by the bridge's id, \
+                                   and no domain of its own is to be had", bdf(b)));
+    }
+    let group = groups::groups(&all).ok_or_else(|| {
+        String::from("its IOMMU group not found: no memory, or a bus with two bridges above it")
+    })?;
+    let members: Vec<usize> = (0..all.len()).filter(|&i| i != me && group[i] == group[me]).collect();
+    if !members.is_empty() {
+        let mut list = String::new();
+        for &i in &members {
+            list.push(' ');
+            list.push_str(&bdf(i));
+            if all[i].below.is_some() {
+                list.push_str(" (a bridge)");
+            }
+        }
+        let why = groups::open_port(&all, me).map_or_else(|| String::from("its device's functions, with no ACS"),
+                                                          |p| alloc::format!("{} has no ACS", bdf(p)));
+        kcore::klog!(0, "hv: {}: IOMMU group with{} -- {}", bdf(me), list, why);
+    }
+    let mut blocked = Vec::new();
+    if members.iter().any(|&i| given.contains(&at(i)) && at(i) < at(me)) {
+        return Ok(blocked);
+    }
+    for i in members.into_iter().filter(|&i| all[i].below.is_none() && !given.contains(&at(i))) {
+        let (b, s, f) = at(i);
+        let name = alloc::format!("{}, of its IOMMU group,", bdf(i));
+        let Some(dev) = pci::get_device_by_bdf(b, s, f) else { continue };
+        if dev.driven() || dev.read_config16(COMMAND) & COMMAND_MASTER != 0 {
+            return Err(alloc::format!("{} is the host's: its DMA could reach the guest's device, and the guest's \
+                                       it, peer to peer", name));
+        }
+        let sid = iommu::sid(b, s, f);
+        if let Some((base, limit)) = iommu::reserved(sid) {
+            return Err(alloc::format!("{} has memory the firmware reserved for its DMA ({:#x}-{:#x}, a DMAR \
+                                       RMRR): it cannot be blocked", name, base, limit));
+        }
         let claim = Claim::take(sid).ok_or_else(|| alloc::format!("{} is another guest's, or too many are held", name))?;
         blocked.try_reserve(1).map_err(|_| String::from("out of memory"))?;
         let mut domain = Domain::new(sid).map_err(|e| alloc::format!("{} has no IOMMU domain: {:?}", name, e))?;

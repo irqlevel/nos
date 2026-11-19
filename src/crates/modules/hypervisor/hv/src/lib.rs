@@ -62,6 +62,8 @@ mod fw_provider;
 #[cfg(target_arch = "x86_64")]
 mod guest;
 #[cfg(target_arch = "x86_64")]
+mod groups;
+#[cfg(target_arch = "x86_64")]
 mod passthrough;
 #[cfg(target_arch = "x86_64")]
 mod forward;
