@@ -300,6 +300,29 @@ test('a VM made onto a device: its disk the device, one with something on it giv
   await expect(page.getByTestId('vm-disks')).toContainText('nvme16');
 });
 
+test("the host's PCI functions: said as each would be given, one given to a stopped VM, one refused saying why", async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/p/vm`);
+  const pci = page.getByTestId('resource-pci');
+  await expect(pci).toContainText('01:00.0');
+  await expect(pci).toContainText('kept for guests');
+  await expect(pci).toContainText('guestpci=00:1f.6 keeps it');
+  /* The GPU given to db, which is off, from its row */
+  await pci.getByRole('row', { name: /^01:00\.0 10de:2571/ }).getByRole('button', { name: 'Give to a VM' }).click();
+  const attach = page.getByTestId('form-vm-pci_attach');
+  await attach.locator('input[name=name]').fill('db');
+  await attach.getByRole('button', { name: 'Give to a VM' }).click();
+  await expect(attach.getByTestId('answer')).toContainText('"address": "01:00.0"');
+  await page.goto(`/en/h/${host}/p/vm`);
+  await expect(pci.getByRole('row', { name: /^01:00\.0 10de:2571/ })).toContainText('db');
+  /* The host's NIC refused, saying why */
+  await pci.getByRole('row', { name: /^00:1f\.6 / }).getByRole('button', { name: 'Give to a VM' }).click();
+  const again = page.getByTestId('form-vm-pci_attach');
+  await again.locator('input[name=name]').fill('db');
+  await again.getByRole('button', { name: 'Give to a VM' }).click();
+  await expect(again).toContainText("a driver of the host's has it");
+});
+
 test('a protected VM is not deleted without force', async ({ page }) => {
   const host = await login(page);
   await page.goto(`/en/h/${host}/vms/panel`);

@@ -17,6 +17,8 @@ resets it by its bridge's secondary bus reset.
   the other disk alone; and refuses a function whose group holds one of its
   own drivers' (a third root port's virtio-rng, function 0 kept for guests,
   function 1 nos's rng);
+- `hv pci` says each function as it would be given: kept or a driver's, its
+  reset, its interrupts, its group, and why not for those that cannot be;
 - the guest finds a root port of nos's above each device (`devices::port`),
   the NVMe and the disk beside it as functions 0 and 1 of the bus below the
   first, the other disk on the bus below the second, each port's link the
@@ -271,6 +273,7 @@ def main():
         f.write(initrd(bb, poke, hostile))
     rc = ["insmod /hv.ko",
           "hv on",
+          "hv pci",
           "hv boot /bzImage initrd=/initrd mem=64 cpus=1 secs=5 pci=%s cmdline=console=ttyS0 rdinit=/init"
           % RNG_IN_NOS,
           "hv boot /bzImage initrd=/initrd mem=%d cpus=%d secs=%d %s cmdline=console=ttyS0 rdinit=/init"
@@ -371,6 +374,18 @@ def nos_checks(text):
     pt.check("the NVMe and the disk beside it are one IOMMU group, the other disk alone",
              "hv: %s: IOMMU group with %s -- its device's functions, with no ACS" % (NVME_IN_NOS, DISKS[1][1]) in text
              and "hv: %s: IOMMU group" % VIRTIO_IN_NOS not in text, lines(text, "IOMMU group"))
+    # hv pci: each function as it would be given, read before any is
+    survey = {m.group(1): m.group(0) for m in re.finditer(r"(?m)^(\d\d:\d\d\.\d) [0-9a-f]{4}:[0-9a-f]{4} .*$", text)}
+    want = {NVME_IN_NOS: ["kept for guests", "reset FLR", "MSI-X 65", "group %s" % DISKS[1][1]],
+            VIRTIO_IN_NOS: ["kept for guests", "reset bus reset", "MSI-X"],
+            RNG_IN_NOS: ["kept for guests", "group %s" % RNG_HOSTS,
+                         "not given: its IOMMU group holds %s, the host's" % RNG_HOSTS],
+            RNG_HOSTS: ["a driver's", "not given: a driver of the host's has it -- guestpci=%s keeps it" % RNG_HOSTS]}
+    pt.check("hv pci says each function as it would be given, and why not",
+             all(at in survey and all(w in survey[at] for w in words) for at, words in want.items())
+             and all("not given" not in survey.get(at, "not given") for at in (NVME_IN_NOS, VIRTIO_IN_NOS))
+             and re.search(r"(?m)^00:0[4-6]\.0 .* -- not given: a bridge$", text) is not None,
+             "\n".join(survey.values()))
     pt.check("a function whose group holds a function of nos's own driver is refused",
              re.search(r"hv: boot failed -- %s: %s, of its IOMMU group, is the host's" % (RNG_IN_NOS, RNG_HOSTS), text)
              is not None, lines(text, "boot failed"))
