@@ -646,11 +646,16 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
 
     /* Its devices before its furniture: the ACPI tables `load` lays out
      * describe the bus as it is then -- the host's functions last, on the
-     * slots after its own devices' */
+     * slots after its own devices', by their addresses on the host: a
+     * device's functions one after another, in order, behind its port */
     add_devices(&mut guest, spec, runner, disks)?;
+    passed.sort_unstable_by_key(|p| p.address());
     for p in passed.iter_mut() {
+        let at = p.address();
         if let Some(f) = p.function() {
-            guest.add_host_function(f).map_err(|e| alloc::format!("a host function on the guest's bus: {}", e))?;
+            guest.add_host_function(f, at).map_err(|e| {
+                alloc::format!("{:02x}:{:02x}.{:x} on the guest's bus: {}", at.bus, at.device, at.function, e)
+            })?;
         }
     }
 

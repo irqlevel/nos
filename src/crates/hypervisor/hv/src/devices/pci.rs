@@ -248,6 +248,16 @@ impl Function {
     }
 }
 
+/// A configuration access the run loop answers (`PciBus::host_target`):
+/// the function it names, and the byte of its space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostTarget {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub at: usize,
+}
+
 /// Bus 0.
 pub struct PciBus {
     address: u32,
@@ -300,17 +310,26 @@ impl PciBus {
         Ok(slot)
     }
 
-    /// A host's function's slot, and the byte of its space, `port` is an
-    /// access of -- None where it is any other function's or none's, and for
-    /// every port but the configuration data's four: the address latched
-    /// names a host's function long after its access, and a device's I/O
-    /// BAR is above them (a disk's notify taken for a write of the GPU's
-    /// space left the disk with no notify again).
-    pub fn host_target(&self, port: u16) -> Option<(usize, usize)> {
-        if !(CONFIG_DATA..=CONFIG_END).contains(&port) {
+    /// What the run loop answers of an access of `port` (`run::host_config`):
+    /// one of a host's slot on bus 0 -- a root port's, or a host's function's
+    /// of its own -- or of any bus past it, those below the ports. None for
+    /// any other, and for every port but the configuration data's four: the
+    /// address latched names a host's slot long after its access, and a
+    /// device's I/O BAR is above them (a disk's notify taken for a write of
+    /// the GPU's space left the disk with no notify again).
+    pub fn host_target(&self, port: u16) -> Option<HostTarget> {
+        let a = self.address;
+        if !(CONFIG_DATA..=CONFIG_END).contains(&port) || a & ADDRESS_ENABLE == 0 || a & ADDRESS_RESERVED != 0 {
             return None;
         }
-        self.target(port).filter(|&(slot, _)| self.host & (1 << slot) != 0)
+        let bus = ((a >> ADDRESS_BUS_SHIFT) & ADDRESS_BUS_MASK) as u8;
+        let device = ((a >> ADDRESS_DEVICE_SHIFT) & ADDRESS_DEVICE_MASK) as u8;
+        let function = ((a >> ADDRESS_FUNCTION_SHIFT) & ADDRESS_FUNCTION_MASK) as u8;
+        if bus == 0 && (usize::from(device) >= self.slots.len() || self.host & (1 << device) == 0) {
+            return None;
+        }
+        let at = (a & ADDRESS_REGISTER_MASK) as usize + usize::from(port - CONFIG_DATA);
+        Some(HostTarget { bus, device, function, at })
     }
 
     pub fn owns(port: u16) -> bool {

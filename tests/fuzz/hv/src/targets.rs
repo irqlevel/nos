@@ -33,6 +33,7 @@ pub static ALL: &[Target] = &[
     Target { name: "pvpanic", run: pvpanic_target, max_len: 512 },
     Target { name: "pci", run: pci_bus, max_len: 2048 },
     Target { name: "hostfn", run: crate::hostmodel::hostfn_target, max_len: 4096 },
+    Target { name: "port", run: crate::portmodel::port_target, max_len: 2048 },
     Target { name: "lapic", run: lapic_target, max_len: 4096 },
     Target { name: "ioapic", run: ioapic_target, max_len: 4096 },
     Target { name: "msi", run: msi, max_len: 1024 },
@@ -482,6 +483,22 @@ fn pci_bus(r: &mut Input) {
                 let hosted = bus.host_target(port);
                 invariant!(hosted.is_none() || (pci::CONFIG_DATA..pci::CONFIG_DATA + 4).contains(&port),
                            "port {:#x} taken for host function {}'s space at {:?}", port, host, hosted);
+                /* And of those, what the address names, as it names it: the
+                 * host's slot on bus 0, or any bus past it -- those below
+                 * the ports, the run loop's to answer -- and no other */
+                let at = pci::CONFIG_DATA + r.below(4) as u16;
+                let address = bus.read(pci::CONFIG_ADDRESS, 4);
+                let named = (address >> 16 & 0xFF) as u8 != 0 || (address >> 11 & 0x1F) as u8 == host;
+                let want = (address & 0x8000_0000 != 0 && address & 0x7F00_0000 == 0 && named).then(|| {
+                    pci::HostTarget {
+                        bus: (address >> 16) as u8,
+                        device: (address >> 11 & 0x1F) as u8,
+                        function: (address >> 8 & 0x7) as u8,
+                        at: (address & 0xFC) as usize + usize::from(at - pci::CONFIG_DATA),
+                    }
+                });
+                let got = bus.host_target(at);
+                invariant!(got == want, "address {:#x} at port {:#x} named {:?}, not {:?}", address, at, got, want);
                 if let Some((slot, offset)) = bus.io_target(port) {
                     invariant!(slot != 0 && usize::from(slot) < pci::MAX_SLOTS, "port {:#x} in slot {}", port, slot);
                     invariant!(u32::from(offset) < 0x100, "port {:#x} at {:#x} into its BAR", port, offset);

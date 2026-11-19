@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
-"""A host's PCI function given to a Linux guest of nos's, with no GPU to
-hand: QEMU's NVMe and a virtio disk, each behind a PCIe root port, QEMU's
-VT-d in front of them (`-device intel-iommu,intremap=on`), nos taking the unit
-over (`iommu=on`), keeping both from its own drivers (`guestpci=01:00.0,02:00.0`)
-and giving them to its guest (`hv boot ... pci=01:00.0 pci=02:00.0`) -- MSI-X's
-tables trapped, their vectors the host's, their DMA through a domain of the
-guest's RAM (plans/gpu-passthrough.md). The virtio disk has no FLR: the host
+"""A host's PCI functions given to a Linux guest of nos's, with no GPU to
+hand: QEMU's NVMe and a virtio disk beside it, functions 0 and 1 of one
+device behind a PCIe root port, and a second virtio disk behind another --
+QEMU's VT-d in front of them (`-device intel-iommu,intremap=on`), nos taking
+the unit over (`iommu=on`), keeping the three from its own drivers
+(`guestpci=01:00.0,01:00.1,02:00.0`) and giving them to its guest (`hv boot
+... pci=01:00.0 pci=01:00.1 pci=02:00.0`) -- MSI-X's tables trapped, their
+vectors the host's, their DMA through a domain of the guest's RAM
+(plans/gpu-passthrough.md). The second virtio disk has no FLR: the host
 resets it by its bridge's secondary bus reset.
 
-- nos boots under TCG, keeps the function from its drivers, takes the unit
-  over with interrupts remapped, and gives the function to its guest by its
-  MSI-X;
-- the guest's own drivers find both and read what the runner put on each
+- nos boots under TCG, keeps the functions from its drivers, takes the unit
+  over with interrupts remapped, and gives them to its guest by their MSI-X;
+- the guest finds a root port of nos's above each device (`devices::port`),
+  the NVMe and the disk beside it as functions 0 and 1 of the bus below the
+  first, the other disk on the bus below the second, each port's link the
+  device's below it, and its PCI code can place every BAR in its port's
+  windows;
+- the guest's own drivers find the three disks and read what the runner put on each
   (the devices' DMA into the guest's RAM, through the domain), write a
   pattern of their own and read it back past the page cache (the guest's RAM
   to the device and back), by MSI-X interrupts -- the vectors nos sends on,
@@ -40,7 +46,7 @@ busybox for x86-64 (`--busybox`: the binary, or an initramfs that holds it as
 bin/busybox) and nvmepoke, built static (`--nvmepoke`, or by the host's `cc
 -static` on x86-64 Linux):
 
-    make nocheck && make nos-test.iso TEST_ISO_ARGS="iommu=on guestpci=01:00.0,02:00.0"
+    make nocheck && make nos-test.iso TEST_ISO_ARGS="iommu=on guestpci=01:00.0,01:00.1,02:00.0"
     tests/hv-passthrough-test.py --bzimage <bzImage> --busybox <busybox> [--nvmepoke <nvmepoke>]
 
 x86-64, TCG: the guest twice emulated, some minutes. Manual: not in CI.
@@ -68,11 +74,19 @@ pt = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pt)
 
 FILES = os.path.join(HERE, "hv-passthrough")
-# Where the two functions are in nos: each behind a root port, alone on its
-# bus -- the NVMe, and a virtio disk with no FLR (`x-pcie-flr-init=off`),
-# which the host resets by its bridge's secondary bus reset
+# The disks: where each function is in nos -- the NVMe and a virtio disk
+# beside it, functions of one device behind a root port, and a virtio disk
+# with no FLR (`x-pcie-flr-init=off`) alone behind another, which the host
+# resets by its bridge's secondary bus reset -- and where the guest finds it:
+# behind a port of nos's for each device, numbered as the host's are, the
+# functions at their numbers
+DISKS = [("nvme", "01:00.0", "0000:01:00.0"), ("beside", "01:00.1", "0000:01:00.1"),
+         ("virtio", "02:00.0", "0000:02:00.0")]
 NVME_IN_NOS = "01:00.0"
 VIRTIO_IN_NOS = "02:00.0"
+# The guest's root ports: Red Hat's, QEMU's IDs; a PCI-to-PCI bridge
+PORT_ID = "0x1b36:0x000c"
+PORT_CLASS = "0x060400"
 # The guest: its RAM, its CPUs -- two, for the NVMe's queues a vector each --
 # and how long it may run
 GUEST_MIB = 256
@@ -245,8 +259,8 @@ def main():
         f.write(initrd(bb, poke, hostile))
     rc = ["insmod /hv.ko",
           "hv on",
-          "hv boot /bzImage initrd=/initrd mem=%d cpus=%d secs=%d pci=%s pci=%s cmdline=console=ttyS0 rdinit=/init"
-          % (GUEST_MIB, GUEST_CPUS, GUEST_SECS, NVME_IN_NOS, VIRTIO_IN_NOS),
+          "hv boot /bzImage initrd=/initrd mem=%d cpus=%d secs=%d %s cmdline=console=ttyS0 rdinit=/init"
+          % (GUEST_MIB, GUEST_CPUS, GUEST_SECS, " ".join("pci=" + nos for _, nos, _ in DISKS)),
           "dmesg vtd:",
           "dmesg hv:",
           "iommu",
@@ -257,7 +271,7 @@ def main():
     subprocess.run([os.path.join(ROOT, "scripts", "mkrootfs.sh"), root, "64", rootdir], cwd=ROOT, check=True,
                    stdout=subprocess.DEVNULL)
     images = {}
-    for name in ("nvme", "virtio"):
+    for name, _, _ in DISKS:
         images[name] = os.path.join(tmp, name + ".img")
         with open(images[name], "wb") as f:
             f.write(pattern(name))
@@ -274,7 +288,10 @@ def main():
             "-device", "virtio-blk-pci,drive=root,disable-legacy=on,disable-modern=off",
             "-device", "pcie-root-port,id=rp1,chassis=1",
             "-drive", "file=%s,format=raw,if=none,id=pass" % images["nvme"],
-            "-device", "nvme,drive=pass,serial=passthrough,bus=rp1,romfile=" + rom_path,
+            "-device", "nvme,drive=pass,serial=passthrough,bus=rp1,addr=00.0,multifunction=on,romfile=" + rom_path,
+            "-drive", "file=%s,format=raw,if=none,id=bpass" % images["beside"],
+            "-device", "virtio-blk-pci,drive=bpass,bus=rp1,addr=00.1,disable-legacy=on,disable-modern=off,"
+                       "iommu_platform=on",
             "-device", "pcie-root-port,id=rp2,chassis=2",
             "-drive", "file=%s,format=raw,if=none,id=vpass" % images["virtio"],
             # iommu_platform: a virtio device of QEMU's takes no IOMMU's
@@ -300,18 +317,18 @@ def main():
     nos_checks(text)
     guest_checks(text)
     hostile_checks(text)
-    for name in ("nvme", "virtio"):
+    for name, _, guest in DISKS:
         disk = open(images[name], "rb").read()
         pt.check("the guest's pattern is on the %s's image" % name,
-                 disk[WRITE_AT:WRITE_AT + 65536] == guest_wrote(name), repr(disk[WRITE_AT:WRITE_AT + 64]))
+                 disk[WRITE_AT:WRITE_AT + 65536] == guest_wrote(guest), repr(disk[WRITE_AT:WRITE_AT + 64]))
     return finish(args, tmp, text)
 
 
 def nos_checks(text):
     pt.check("nos boots", "boot: complete" in text, text[-2000:])
     pt.check("nos did not panic", "PANIC" not in text, text[text.find("PANIC"):][:2000])
-    pt.check("both functions are kept from nos's drivers", "pci: %s kept for guests" % NVME_IN_NOS in text
-             and "pci: %s kept for guests" % VIRTIO_IN_NOS in text, lines(text, "pci:"))
+    pt.check("the three functions are kept from nos's drivers",
+             all("pci: %s kept for guests" % nos in text for _, nos, _ in DISKS), lines(text, "pci:"))
     pt.check("QEMU's unit is taken over, every device passed through", "passed through, queued invalidation" in text,
              lines(text, "vtd:"))
     pt.check("interrupts are remapped", "interrupts remapped, the IO-APIC's from" in text, lines(text, "vtd:"))
@@ -333,16 +350,18 @@ def nos_checks(text):
 
 def guest_checks(text):
     pt.check("the guest boots", "pass-guest: up:" in text, text[-3000:])
-    for name in ("nvme", "virtio"):
-        pt.check("the guest's driver finds the %s" % name,
-                 re.search(r"pass-guest: %s of [1-9]\d* sectors" % name, text) is not None, lines(text, "pass-guest:"))
+    topology_checks(text)
+    for name, _, guest in DISKS:
+        pt.check("the guest's driver finds the %s at %s" % (name, guest),
+                 re.search(r"pass-guest: %s of [1-9]\d* sectors" % guest, text) is not None,
+                 lines(text, "pass-guest:"))
         want = hashlib.md5(pattern(name)).hexdigest()
-        pt.check("it reads what the runner put on the %s" % name, "pass-guest: %s read %s" % (name, want) in text,
-                 lines(text, "pass-guest: %s read" % name))
-        wrote = hashlib.md5(guest_wrote(name)).hexdigest()
+        pt.check("it reads what the runner put on the %s" % name, "pass-guest: %s read %s" % (guest, want) in text,
+                 lines(text, "pass-guest: %s read" % guest))
+        wrote = hashlib.md5(guest_wrote(guest)).hexdigest()
         pt.check("it writes the %s, and reads it back past the page cache" % name,
-                 "pass-guest: %s wrote %s" % (name, wrote) in text
-                 and "pass-guest: %s read back %s" % (name, wrote) in text, lines(text, "pass-guest: %s" % name))
+                 "pass-guest: %s wrote %s" % (guest, wrote) in text
+                 and "pass-guest: %s read back %s" % (guest, wrote) in text, lines(text, "pass-guest: %s" % guest))
     want = "pass-guest: rom %s %d" % (hashlib.md5(rom()).hexdigest(), ROM_BYTES)
     pt.check("the guest reads the NVMe's ROM, the device's image", want in text, lines(text, "pass-guest: rom"))
     for name, word in (("nvme", "nvme"), ("virtio", "virtio")):
@@ -357,6 +376,27 @@ def guest_checks(text):
     pt.check("hv sent the NVMe's MSIs on, every one taken", msis is not None and int(msis.group(1)) > 0
              and msis.group(2) == "0", msis.group(0) if msis else lines(text, "host fn"))
     pt.check("the guest stops", re.search(r"(?m)^  stopped", text) is not None, lines(text, "stopped"))
+
+
+def topology_checks(text):
+    """The guest's bus as its PCI code found it: a port of nos's above each
+    device, the functions below at their numbers, each port's link its
+    device's, every BAR placed in its port's windows."""
+    found = {a: (i, c) for a, i, c in re.findall(r"pass-guest: pci (\S+) (\S+) class (\S+)", text)}
+    ports = [a for a, ic in found.items() if a.startswith("0000:00:") and ic == (PORT_ID, PORT_CLASS)]
+    pt.check("the guest finds a root port of nos's above each device", len(ports) == 2,
+             lines(text, "pass-guest: pci "))
+    below = dict(re.findall(r"pass-guest: below (\S+) (\S+)", text))
+    pt.check("the NVMe and the disk beside it are functions 0 and 1 below one port, the other disk below the other",
+             all(below.get(guest) in ports for _, _, guest in DISKS)
+             and below.get("0000:01:00.0") == below.get("0000:01:00.1") != below.get("0000:02:00.0"),
+             lines(text, "pass-guest: below"))
+    links = dict(re.findall(r"pass-guest: link (\S+) (.+)", text))
+    pt.check("each port's link is the device's below it",
+             all(links.get(guest) is not None and links.get(below.get(guest)) == links.get(guest)
+                 for _, _, guest in DISKS), lines(text, "pass-guest: link"))
+    pt.check("the guest's PCI code places every BAR in its port's windows", "pass-guest: pci complains:" not in text
+             and "pass-guest: pci: " in text, lines(text, "pass-guest: pci"))
 
 
 def hostile_checks(text):

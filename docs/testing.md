@@ -514,7 +514,7 @@ without it, the A2000's thousand fences still signalled -- so the hv-fuzz
 
 ### `hv-passthrough-test.py` -- QEMU's NVMe in nos's guest, and a hostile one
 
-`make nocheck && make nos-test.iso TEST_ISO_ARGS="iommu=on guestpci=01:00.0,02:00.0"`,
+`make nocheck && make nos-test.iso TEST_ISO_ARGS="iommu=on guestpci=01:00.0,01:00.1,02:00.0"`,
 the guest's kernel and nvmepoke made once by
 `tests/hv-passthrough/build-guest.sh <dir>` (Linux 6.18 from kernel.org, its
 digest checked, `tinyconfig` and `tests/hv-passthrough/guest.config`), then
@@ -528,15 +528,22 @@ xz-utils ca-certificates && CROSS_COMPILE=x86_64-linux-gnu- bash /h/build-guest.
 /out'` -- and copied out of the volume.
 
 nos boots under TCG on q35 with QEMU's VT-d (`intel-iommu,intremap=on`), an
-NVMe and a virtio disk each behind a `pcie-root-port` -- the virtio disk with
-no FLR (`x-pcie-flr-init=off`) and its DMA through the unit (`iommu_platform=on`:
-QEMU's virtio devices take no IOMMU's translation unless told to): the gate
-holds nos to keeping both functions from its own drivers (`guestpci=`), to
-taking the unit over with interrupts remapped, and to giving both to its
-guest by their MSI-X (`hv boot ... pci=01:00.0 pci=02:00.0`: 16 of the NVMe's
-65 vectors given), the virtio disk reset by its bridge's secondary bus reset
-as it is given and as the guest lets go of it. The guest's own drivers have
-to find both and read the pattern the runner put on each -- the devices' DMA
+NVMe and a virtio disk beside it, functions 0 and 1 of one device behind a
+`pcie-root-port`, and a second virtio disk behind another -- that one with no
+FLR (`x-pcie-flr-init=off`), the virtio disks' DMA through the unit
+(`iommu_platform=on`: QEMU's virtio devices take no IOMMU's translation unless
+told to): the gate holds nos to keeping the three functions from its own
+drivers (`guestpci=`), to taking the unit over with interrupts remapped, and
+to giving them to its guest by their MSI-X (`hv boot ... pci=01:00.0
+pci=01:00.1 pci=02:00.0`: 16 of the NVMe's 65 vectors given), the disk with no
+FLR reset by its bridge's secondary bus reset as it is given and as the guest
+lets go of it. The guest has to find a root port of nos's above each device
+(`devices/port.rs`), the NVMe and the disk beside it as functions 0 and 1 of
+the bus below the first, the other disk below the second, each port's link
+its device's, and its PCI code has to place every BAR in its port's windows,
+nothing said against them. The guest's own drivers have
+to find the three disks, each by its function's address, and read the
+pattern the runner put on each -- the devices' DMA
 into the guest's RAM, through their domains -- write one of their own and
 read it back past the page cache, and take their interrupts, the NVMe's on
 more than one MSI-X vector; hv has to say it sent the MSIs on, none taken by
@@ -1329,10 +1336,20 @@ a bridge, neither MSI-X in BARs given nor MSI, a list that loops or points
 into the header, a second capability of a kind the host keeps, a page that
 cannot be mapped -- must be refused, and nothing written to them. Each rule
 of `host.rs` taken out is caught by it: `tests/fuzz/hv/mutants.py`'s
-nineteen `host_*` mutants. The `platform` target's guest holds
-such a GPU one run in six: its driver writing and reading it through the bus
-and through the mirror -- eight bytes at a time among it -- moving BAR0 over
-the hole and anywhere, programming its MSI as the device raises it; and the
+`host_*` mutants. `port` holds the root port above a host's device
+(`hypervisor/hv/src/devices/port.rs`) to a model of its own
+(`tests/fuzz/hv/src/portmodel.rs`): every register a PCIe root port of no
+slot shows, the guest's writes kept where it may write and nowhere else, its
+link the device's at each read, its windows holding the spans set and
+nothing a MiB past them, the bus below it the one the guest numbered; ten
+`port_*` mutants, each caught. The `platform` target's guest holds
+such a GPU one run in six, behind its port: its driver writing and reading
+it through the bus and through the mirror -- eight bytes at a time among it
+-- moving BAR0 over the hole and anywhere, programming its MSI as the device
+raises it, the port read, written and its bus numbered anew, the GPU's ID
+and the port's read where they are and all ones where nothing is (in a
+guest of one CPU, where no other latches an address meanwhile; three
+`run_*` mutants of the routing, each caught); and the
 `linux` and `pvh` targets plan a guest with the BARs' hole a quarter of the
 time, its memory map held to RAM it has. Seven mutants of the view -- an
 acknowledgement past the id and next pointer, phantom functions or I/O let

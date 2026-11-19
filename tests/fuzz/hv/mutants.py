@@ -35,6 +35,8 @@ DHCP = 'modules/hypervisor/hv/src/dhcp.rs'
 WIRE = 'common/net/vnetwire/src/lib.rs'
 TUN = 'modules/hypervisor/hv/src/tunnel.rs'
 HOST = 'hypervisor/hv/src/devices/host.rs'
+PORT = 'hypervisor/hv/src/devices/port.rs'
+RUN = 'hypervisor/hv/src/run.rs'
 
 # name, what it takes out, the file, the text it changes, what it becomes,
 # the targets that must find it -- the first that does is enough
@@ -685,6 +687,82 @@ MUTANTS = [
      'if !image.len().is_power_of_two() || !(ROM_MIN..=ROM_MAX).contains(&image.len()) {',
      'if !(ROM_MIN..=ROM_MAX).contains(&image.len()) {',
      ['hostfn']),
+    ('host_multifunction', "a function's header type says what the guest has of its device, not the device",
+     HOST,
+     '(real & !bit) | if self.multi { bit } else { 0 }',
+     'real',
+     ['hostfn']),
+    ('port_bus_latency', "the port's secondary latency timer is read-only",
+     PORT,
+     'const BUSES_GUEST: u32 = 0x00FF_FFFF;',
+     'const BUSES_GUEST: u32 = u32::MAX;',
+     ['port']),
+    ('port_status_written', "the port's status register is nothing the guest writes",
+     PORT,
+     '        COMMAND => COMMAND_GUEST,',
+     '        COMMAND => COMMAND_GUEST | 0xFFFF_0000,',
+     ['port']),
+    ('port_low_above_4g', 'a memory window above 4 GiB is none: its registers are 32 bits wide',
+     PORT,
+     'match low.and_then(span).filter(|&(_, last)| last >> 32 == 0) {',
+     'match low.and_then(span) {',
+     ['port']),
+    ('port_window_limit', "a port's window ends where its BARs do",
+     PORT,
+     'Some((start, last)) => field(start) | (field(last) << 16),',
+     'Some((start, last)) => field(start) | (field(start.max(last >> 1)) << 16),',
+     ['port']),
+    ('port_link_active', "the port's link is active, as the device below is there",
+     PORT,
+     '(link.status & (LINK_SPEED_WIDTH as u16 | LNKSTA_SLOT_CLOCK)) | LNKSTA_DLL_ACTIVE;',
+     '(link.status & (LINK_SPEED_WIDTH as u16 | LNKSTA_SLOT_CLOCK));',
+     ['port']),
+    ('port_retrain', 'link disable and retrain read 0: neither reaches a link',
+     PORT,
+     'const LNKCTL_GUEST: u32 = 0x03CB;',
+     'const LNKCTL_GUEST: u32 = 0x03FB;',
+     ['port']),
+    ('port_speeds_capped', "the port's speeds none past the device's most",
+     PORT,
+     '            listed => listed & upto,',
+     '            listed => listed,',
+     ['port']),
+    ('port_payload', "the port's payload size the device's, so the guest sets neither",
+     PORT,
+     'DEVCTL => (kept & DEVCTL_GUEST) | (u32::from(link.payload & PAYLOAD_MASK) << PAYLOAD_SHIFT),',
+     'DEVCTL => kept & DEVCTL_GUEST,',
+     ['port']),
+    ('port_target_speed', "the port's target speed the device's most until the guest writes one",
+     PORT,
+     '                0 => link.cap & SPEED_MASK,',
+     '                0 => 0,',
+     ['port']),
+    ('port_below_zero', 'bus 0 is below no port',
+     PORT,
+     '        bus != 0 && bus == self.secondary()',
+     '        bus == self.secondary()',
+     ['port']),
+    ('run_port_function', "a port's slot has function 0 alone",
+     RUN,
+     '''            if t.function != 0 {
+                return None;
+            }
+            if let Some(i) = self.ports.iter().position(|q| q.slot == slot) {''',
+     '''            if let Some(i) = self.ports.iter().position(|q| q.slot == slot) {''',
+     ['platform']),
+    ('run_device_below', 'device 0 alone on the bus below a port',
+     RUN,
+     '''        let port = self.ports.iter().position(|q| q.port.below(t.bus))?;
+        if t.device != 0 {
+            return None;
+        }''',
+     '''        let port = self.ports.iter().position(|q| q.port.below(t.bus))?;''',
+     ['platform']),
+    ('run_port_renumbered', 'the bus below a port the one the guest numbered',
+     RUN,
+     'let port = self.ports.iter().position(|q| q.port.below(t.bus))?;',
+     'let port = self.ports.iter().position(|q| t.bus != 0 && q.port.below(q.port.secondary()) && t.bus == 1)?;',
+     ['platform']),
 ]
 
 

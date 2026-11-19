@@ -141,6 +141,14 @@ reaches no Rust. hv reaches it by the usual three steps (`rust_ffi.cpp`,
   payload sizes, error reporting, the link -- the host's. What is built is
   `hypervisor/hv/src/devices/host.rs`, and docs/hypervisor.md, "A host's PCI
   device", says it register by register.
+- **A root port above each device** (**done**: `devices/port.rs`): the
+  device's functions behind it at their own numbers, as on the machine -- a
+  GPU's audio function at 00.1, where `hda_intel` looks for its GPU, a NIC's
+  ports in one slot -- its link the device's, read live, with no ASPM, slot
+  or interrupt of its own; registers alone, nothing reaching the device, the
+  bus below it routed by the number the guest gives it. Its windows hold the
+  device's BARs, which are placed as firmware places them behind a bridge:
+  64-bit prefetchable above the RAM, the rest below 4 GiB.
 - **BARs**: mapped straight into the nested table -- a new kind of leaf, UC
   or WC rather than WB, onto a physical address that is not a frame of the
   guest's; `GuestMemory`'s rule "the table maps only what this value owns"
