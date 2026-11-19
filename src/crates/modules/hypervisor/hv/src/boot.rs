@@ -260,7 +260,7 @@ pub fn boot(machine: &Arc<Machine>, args: &str, cores: &Cores, unloading: &Arc<A
             return;
         }
     };
-    spec.shape = place.shape;
+    spec.placed(&place);
     let placement = place.vcpus;
     let cpu = placement[0];
 

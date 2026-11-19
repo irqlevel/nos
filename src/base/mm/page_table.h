@@ -436,8 +436,8 @@ public:
        until then, and is moved to its own node's lists here, a run of a
        node's at a time.
 
-       alloc_page_on, alloc_huge_frame_on: as alloc_page and
-       alloc_huge_frame, `node`'s first -- what a guest's memory is taken
+       alloc_page_keeping_on, alloc_huge_frame_on: as alloc_page_keeping
+       and alloc_huge_frame, `node`'s first -- what a guest's memory is taken
        with, from the node its CPUs are placed on (hv); the others' when that
        one has none.
 
@@ -448,7 +448,7 @@ public:
        get_node_free: a node's free pages, and of them the zeroed; and of
        the huge pool, its blocks and its free ones. */
     void spread_free_pages();
-    Page* alloc_page_on(ulong node);
+    Page* alloc_page_keeping_on(ulong node, ulong keep);
     ulong alloc_huge_frame_on(ulong node);
     void get_node_free(ulong node, ulong& free, ulong& zeroed);
     void get_node_huge_pool(ulong node, ulong& blocks, ulong& free);

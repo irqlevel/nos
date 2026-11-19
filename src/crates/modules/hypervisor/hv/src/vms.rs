@@ -126,8 +126,9 @@ const BUTTON_HEARD: u8 = 3;
 const BUTTON_UNHEARD: u8 = 4;
 /// Room for how a VM ended, taken before it is written.
 const REASON_BYTES: usize = 256;
-/// Room for what `hv start` says, beside the kernel's path and command line.
-const SAID_BYTES: usize = 96;
+/// Room for what `hv start` says, beside the kernel's path and command line:
+/// its NUMA node's share of its memory among it.
+const SAID_BYTES: usize = 144;
 const REPORT_BYTES: usize = 4096;
 
 /// What is typed at a guest: the bytes not yet fed to its UART, and how many
@@ -1812,7 +1813,7 @@ impl Vms {
         let held = self.reserve_start(name)?;
         let has_disks = !spec.disks.is_empty();
         let (place, core_hold) = cores.take(machine, spec.cpu, spec.cpus, has_disks, None)?;
-        spec.shape = place.shape;
+        spec.placed(&place);
         let id = self.number(Some(name))?;
         core_hold.held_by(Holder::Vm(id));
         spec.name = String::from(name);
@@ -1940,7 +1941,7 @@ impl Vms {
          * way out of a start that goes no further. */
         let has_disks = !spec.disks.is_empty();
         let (place, core_hold) = cores.take(machine, spec.cpu, spec.cpus, has_disks, None)?;
-        spec.shape = place.shape;
+        spec.placed(&place);
         let placement = place.vcpus;
         let disk_cpu = place.disk;
         if spec.input.len() > INPUT_MAX {
@@ -2163,6 +2164,12 @@ impl Vms {
                        if guest::from_pool() { " of the huge pool" } else { "" }, spec.cpus,
                        if spec.cpus == 1 { "" } else { "s" }, spec.cmdline,
                        if spec.restart { ", restarted when it resets" } else { "" });
+        /* Where its memory is on a machine of nodes: the node its placement
+           asked for, and how much of it the allocator found there */
+        if let Some(node) = spec.node {
+            let (on, all) = built.guest.memory().pages_on(node);
+            let _ = write!(said, ", its memory node {}'s ({}%)", node, on * 100 / all.max(1));
+        }
 
         let mut wanted = Vec::new();
         let mut vm_name = None;

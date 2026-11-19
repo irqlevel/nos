@@ -1179,7 +1179,16 @@ impl LinuxGuest {
     pub fn new(machine: &Machine, mem_bytes: u64, huge: bool, cpus: u32, doorbells: Arc<Doorbells>, x2apic: bool,
                ioapic: bool) -> Result<(Self, Vec<GuestCpu>)>
     {
-        Self::build(machine, mem_bytes, huge, cpus, doorbells, x2apic, ioapic, linux::LOW_RAM_END)
+        Self::build(machine, mem_bytes, huge, cpus, doorbells, x2apic, ioapic, linux::LOW_RAM_END, None)
+    }
+
+    /// As [`new`](Self::new), its RAM from NUMA node `node` first where it
+    /// names one ([`GuestMemory::place_on`]): its CPUs' node.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_on(machine: &Machine, mem_bytes: u64, huge: bool, cpus: u32, doorbells: Arc<Doorbells>, x2apic: bool,
+                  ioapic: bool, node: Option<usize>) -> Result<(Self, Vec<GuestCpu>)>
+    {
+        Self::build(machine, mem_bytes, huge, cpus, doorbells, x2apic, ioapic, linux::LOW_RAM_END, node)
     }
 
     /// As [`new`](Self::new), for a guest that is to hold a host's function
@@ -1190,12 +1199,21 @@ impl LinuxGuest {
     pub fn new_holed(machine: &Machine, mem_bytes: u64, huge: bool, cpus: u32, doorbells: Arc<Doorbells>,
                      x2apic: bool, ioapic: bool) -> Result<(Self, Vec<GuestCpu>)>
     {
-        Self::build(machine, mem_bytes, huge, cpus, doorbells, x2apic, ioapic, linux::HOLE_RAM_END)
+        Self::build(machine, mem_bytes, huge, cpus, doorbells, x2apic, ioapic, linux::HOLE_RAM_END, None)
+    }
+
+    /// As [`new_holed`](Self::new_holed), its RAM from NUMA node `node`
+    /// first where it names one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_holed_on(machine: &Machine, mem_bytes: u64, huge: bool, cpus: u32, doorbells: Arc<Doorbells>,
+                        x2apic: bool, ioapic: bool, node: Option<usize>) -> Result<(Self, Vec<GuestCpu>)>
+    {
+        Self::build(machine, mem_bytes, huge, cpus, doorbells, x2apic, ioapic, linux::HOLE_RAM_END, node)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn build(machine: &Machine, mem_bytes: u64, huge: bool, cpus: u32, doorbells: Arc<Doorbells>, x2apic: bool,
-             ioapic: bool, low_end: u64) -> Result<(Self, Vec<GuestCpu>)>
+             ioapic: bool, low_end: u64, node: Option<usize>) -> Result<(Self, Vec<GuestCpu>)>
     {
         let n = cpus as usize;
         if n == 0 || n > MAX_CPUS || doorbells.len() != n || (ioapic && n < 2) || mem_bytes > MAX_MEM_BYTES {
@@ -1215,6 +1233,9 @@ impl LinuxGuest {
         }
         let x2apic = x2apic && !ioapic;
         let mut memory = GuestMemory::new(machine.caps().vendor())?;
+        if let Some(node) = node {
+            memory.place_on(node);
+        }
         for (base, size) in ram.regions() {
             if huge {
                 memory.add_huge(base, size, machine.caps().nested_2m())?;

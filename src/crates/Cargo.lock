@@ -821,6 +821,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mod-numabench"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "kmod",
+]
+
+[[package]]
 name = "mod-slowexit"
 version = "0.1.0"
 dependencies = [
