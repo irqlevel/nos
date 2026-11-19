@@ -102,8 +102,11 @@ else's (`PageTable::NodeFree`); the machine's counts are their sums.
   its share of the pages kept free, its highest blocks first. A
   block is the node's its first page is; one no range covers is found past
   them all.
-- `memcheck` says each node's free and zeroed pages and checks that they
-  add up to the machine's.
+- `memusage` and `meminfo` end with a `node N:` line a node -- its free
+  and zeroed pages, its huge pool, and in `meminfo` the RAM the firmware's
+  map gives it -- and `memcheck` says each node's free and zeroed pages and
+  checks that they add up to the machine's. On a machine of one node none
+  of the three says anything of nodes.
 
 What is not by node yet: `page_array_`, the descriptors, all on node 0; the
 heap's shared lists of blocks kept for reuse (a few hundred KiB a size), and
