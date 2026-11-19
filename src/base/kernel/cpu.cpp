@@ -1102,6 +1102,19 @@ void CpuTable::note_cpu_running(ulong index)
     }
 }
 
+ulong CpuTable::get_present_cpus()
+{
+    stdlib::AutoLock lock(lock_);
+
+    ulong result = 0;
+    for (ulong i = 0; i < stdlib::array_size(cpu_array_); i++)
+    {
+        if (cpu_array_[i].get_state() & Cpu::STATE_INITED)
+            result |= 1UL << i;
+    }
+    return result;
+}
+
 ulong CpuTable::get_running_cpus()
 {
     stdlib::AutoLock lock(lock_);
