@@ -181,6 +181,12 @@ reaches no Rust. hv reaches it by the usual three steps (`rust_ffi.cpp`,
   `_CRS`.
 - **vm.toml**: `pci = ["01:00.0"]`, the word `pci=01:00.0`; refused where the
   IOMMU is off, or without `unsafe_interrupts` until IR is done.
+- **Managed** (**done**): `hv pci` lists the host's functions as they would
+  be given -- a driver's or kept, reset, interrupts, IOMMU group, the VMs
+  that name each, why not -- `hv pci attach|detach` edits a stopped VM's
+  vm.toml, and the `vm` provider's `pci`, `pci_attach`, `pci_detach` do the
+  same through the API and the panel. No hotplug: a running VM's functions
+  are the ones it started with.
 - **IOMMU groups** (**done**: `modules/hypervisor/hv/src/groups.rs`): ACS
   turned on where the host's functions have it, then a function's group is
   everything it may reach peer to peer -- below the bridge above any port

@@ -2389,6 +2389,27 @@ access of it stops the guest. A VM holding a host's function is not saved
 and not moved: its device's DMA reaches no dirty log, and its state is the
 device's.
 
+**`hv pci`** says each function the host has as this module would give it,
+read and nothing changed (`passthrough::survey`, `hostpci.rs`): its ids
+and class, a driver's or kept for guests, its reset, its interrupts, its
+IOMMU group as it will be with ACS on, the VMs whose vm.toml names it, a
+guest holding it, and why not where it cannot be given -- as QEMU's
+topology of the passthrough gate has it:
+
+```
+> hv pci
+00:04.0 1b36:000c 06.04  free  reset none  MSI-X 1  -- not given: a bridge
+01:00.0 1b36:0010 01.08  kept for guests  reset FLR  MSI-X 65  group 01:00.1
+01:00.1 1af4:1042 01.00  kept for guests  reset FLR  MSI-X 3  group 01:00.0
+02:00.0 1af4:1042 01.00  kept for guests  reset bus reset  MSI-X 3
+03:00.0 1af4:1044 00.ff  kept for guests  reset FLR  MSI-X 2  group 03:00.1  -- not given: its IOMMU group holds 03:00.1, the host's
+```
+
+`hv pci attach <vm> <bus:dev.fn>` puts a function on a stopped VM's
+vm.toml -- refused where the survey says it cannot be given -- and `detach`
+takes it off; the `vm` provider's `pci`, `pci_attach` and `pci_detach` are
+the same through the API, and the panel lists them with the VMs.
+
 Not done yet: AMD-Vi. VT-d's posted interrupts
 -- the device's message straight into the vCPU, no host interrupt -- wait for
 a machine whose unit has them (CAP.PI): Hertz's two have not (CAP

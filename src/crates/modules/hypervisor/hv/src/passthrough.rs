@@ -107,6 +107,8 @@ const BAR_IO: u32 = 1;
 const BAR_TYPE_MASK: u32 = 0x6;
 const BAR_TYPE_64: u32 = 0x4;
 const CAP_PCIE: u8 = 0x10;
+const CAP_MSI: u8 = 0x05;
+const CAP_MSIX: u8 = 0x11;
 const PCIE_DEVCAP: u16 = 0x04;
 const PCIE_DEVCAP_FLR: u32 = 1 << 28;
 const PCIE_DEVCTL: u16 = 0x08;
@@ -482,13 +484,12 @@ impl Drop for Passed {
 }
 
 /// What isolation makes of the host's bus (`groups`): every function the
-/// PCI scan found -- its kind, by its PCIe capability's type, whether its
-/// device has others, its ACS, the buses below a bridge -- and the index of
-/// `bus`:`slot`.`func` among them.
-fn topology(bus: u16, slot: u16, func: u16) -> Result<(Vec<groups::Function>, usize), String> {
+/// PCI scan found, kept ones too -- its kind, by its PCIe capability's type,
+/// whether its device has others, its ACS (as `enable_acs` leaves it, where
+/// `acs_on`), the buses below a bridge -- each with the function itself.
+fn read_bus(acs_on: bool) -> Result<Vec<(groups::Function, PciDevice)>, String> {
     let mut all = Vec::new();
     all.try_reserve_exact(pci::device_count()).map_err(|_| String::from("out of memory"))?;
-    let mut me = None;
     for d in (0..pci::device_count()).filter_map(pci::get_any) {
         let (Ok(b), Ok(s), Ok(f)) = (u8::try_from(d.bus), u8::try_from(d.slot), u8::try_from(d.func)) else { continue };
         let kind = match d.find_capability(CAP_PCIE) {
@@ -506,17 +507,148 @@ fn topology(bus: u16, slot: u16, func: u16) -> Result<(Vec<groups::Function>, us
         };
         let multi = pci::get_device_by_bdf(d.bus, d.slot, 0)
             .is_some_and(|f0| f0.read_config8(HEADER_TYPE) & HEADER_MULTI != 0);
-        let acs = d.find_extended_capability(EXT_ACS)
-            .map(|at| (d.read_config16(at + ACS_CAPABILITY), d.read_config16(at + ACS_CONTROL)));
+        let acs = d.find_extended_capability(EXT_ACS).map(|at| {
+            let cap = d.read_config16(at + ACS_CAPABILITY);
+            let ctrl = d.read_config16(at + ACS_CONTROL);
+            (cap, if acs_on { ctrl | (cap & groups::ACS_NEEDED) } else { ctrl })
+        });
         let below = (d.read_config8(HEADER_TYPE) & HEADER_LAYOUT == HEADER_BRIDGE)
             .then(|| (d.read_config8(SECONDARY_BUS), d.read_config8(SUBORDINATE_BUS)));
-        if (d.bus, d.slot, d.func) == (bus, slot, func) {
-            me = Some(all.len());
-        }
-        all.push(groups::Function { bus: b, slot: s, func: f, kind, multi, acs, below });
+        all.push((groups::Function { bus: b, slot: s, func: f, kind, multi, acs, below }, d));
     }
-    let me = me.ok_or_else(|| String::from("not in the PCI scan"))?;
+    Ok(all)
+}
+
+/// The host's bus as `groups` reads it (`read_bus`), and the index of
+/// `bus`:`slot`.`func` among its functions.
+fn topology(bus: u16, slot: u16, func: u16) -> Result<(Vec<groups::Function>, usize), String> {
+    let read = read_bus(false)?;
+    let me = read.iter().position(|(_, d)| (d.bus, d.slot, d.func) == (bus, slot, func))
+        .ok_or_else(|| String::from("not in the PCI scan"))?;
+    let mut all = Vec::new();
+    all.try_reserve_exact(read.len()).map_err(|_| String::from("out of memory"))?;
+    all.extend(read.into_iter().map(|(f, _)| f));
     Ok((all, me))
+}
+
+/// A function of the host's as this module would give it to a guest -- read,
+/// nothing changed: what `hv pci` and the `vm` provider's `pci` say.
+pub struct Surveyed {
+    pub bus: u8,
+    pub slot: u8,
+    pub func: u8,
+    pub vendor: u16,
+    pub device: u16,
+    pub class: u8,
+    pub subclass: u8,
+    /// A driver of the host's has it; it is kept from the host's drivers
+    /// for guests (`guestpci=`); a guest holds it now.
+    pub driven: bool,
+    pub kept: bool,
+    pub held: bool,
+    /// The other functions of its IOMMU group as they will be with ACS on,
+    /// each with whether it is a bridge.
+    pub group: Vec<((u8, u8, u8), bool)>,
+    /// How it is reset as it is given and let go of: "FLR", "bus reset", or
+    /// "none".
+    pub reset: &'static str,
+    /// MSI-X's table size where it has MSI-X; whether it has MSI.
+    pub msix: Option<u16>,
+    pub msi: bool,
+    /// Why it would not be given, where it would not.
+    pub refused: Option<String>,
+}
+
+/// Every function the PCI scan found, as this module would give it
+/// (`Surveyed`), its group as it will be once `enable_acs` has run.
+pub fn survey() -> Result<Vec<Surveyed>, String> {
+    const MSIX_CONTROL: u16 = 2;
+    const MSIX_SIZE_MASK: u16 = 0x7FF;
+    let read = read_bus(true)?;
+    let mut all = Vec::new();
+    all.try_reserve_exact(read.len()).map_err(|_| String::from("out of memory"))?;
+    all.extend(read.iter().map(|(f, _)| *f));
+    let group = groups::groups(&all);
+    let claims = *CLAIMS.lock();
+    let held = |sid: u16| claims.contains(&Some(sid));
+    let at = |i: usize| (all[i].bus, all[i].slot, all[i].func);
+    let bdf = |i: usize| alloc::format!("{:02x}:{:02x}.{:x}", all[i].bus, all[i].slot, all[i].func);
+    let mut out = Vec::new();
+    out.try_reserve_exact(read.len()).map_err(|_| String::from("out of memory"))?;
+    for (i, (f, dev)) in read.iter().enumerate() {
+        let sid = iommu::sid(dev.bus, dev.slot, dev.func);
+        let bridge = f.below.is_some();
+        let msix = dev.find_capability(CAP_MSIX)
+            .map(|cap| (dev.read_config16(u16::from(cap) + MSIX_CONTROL) & MSIX_SIZE_MASK) + 1);
+        let msi = dev.find_capability(CAP_MSI).is_some();
+        let members: Vec<usize> = match &group {
+            Some(g) => (0..all.len()).filter(|&j| j != i && g[j] == g[i]).collect(),
+            None => Vec::new(),
+        };
+        let host_member = members.iter().copied().find(|&j| {
+            let d = &read[j].1;
+            all[j].below.is_none() && !d.kept() && (d.driven() || d.read_config16(COMMAND) & COMMAND_MASTER != 0)
+        });
+        let other_guest = members.iter().copied().find(|&j| {
+            let d = &read[j].1;
+            held(iommu::sid(d.bus, d.slot, d.func))
+        });
+        let reserved_member = members.iter().copied().find(|&j| {
+            let d = &read[j].1;
+            all[j].below.is_none() && iommu::reserved(iommu::sid(d.bus, d.slot, d.func)).is_some()
+        });
+        let refused = if !iommu::on() {
+            Some(String::from("DMA is not translated -- boot with iommu=on"))
+        } else if bridge {
+            Some(String::from("a bridge"))
+        } else if msix.is_none() && !msi {
+            Some(String::from("neither MSI-X nor MSI to give a guest"))
+        } else if let Some((base, limit)) = iommu::reserved(sid) {
+            Some(alloc::format!("the firmware reserved memory for its DMA ({:#x}-{:#x}, a DMAR RMRR)", base, limit))
+        } else if let Some(c) = groups::behind_conventional(&all, i) {
+            Some(alloc::format!("below {}, a conventional bridge", bdf(c)))
+        } else if group.is_none() {
+            Some(String::from("its IOMMU group not found: a bus with two bridges above it"))
+        } else if dev.driven() {
+            Some(alloc::format!("a driver of the host's has it -- guestpci={} keeps it", bdf(i)))
+        } else if let Some(j) = host_member {
+            Some(alloc::format!("its IOMMU group holds {}, the host's", bdf(j)))
+        } else if let Some(j) = reserved_member {
+            Some(alloc::format!("its IOMMU group holds {}, which the firmware reserved memory for", bdf(j)))
+        } else {
+            other_guest.filter(|_| !held(sid)).map(|j| alloc::format!("its IOMMU group holds {}, a guest's", bdf(j)))
+        };
+        let reset = if bridge {
+            "none"
+        } else if has_flr(dev) {
+            "FLR"
+        } else if bus_resettable(dev.bus, dev.slot).is_ok() {
+            "bus reset"
+        } else {
+            "none"
+        };
+        let mut group_list = Vec::new();
+        group_list.try_reserve_exact(members.len()).map_err(|_| String::from("out of memory"))?;
+        group_list.extend(members.iter().map(|&j| (at(j), all[j].below.is_some())));
+        out.push(Surveyed {
+            bus: f.bus,
+            slot: f.slot,
+            func: f.func,
+            vendor: dev.vendor,
+            device: dev.device,
+            class: dev.class,
+            subclass: dev.subclass,
+            driven: dev.driven(),
+            kept: dev.kept(),
+            held: held(sid),
+            group: group_list,
+            reset,
+            msix,
+            msi,
+            refused,
+        });
+    }
+    Ok(out)
 }
 
 /// ACS on wherever the host's functions have it -- Source Validation, P2P
