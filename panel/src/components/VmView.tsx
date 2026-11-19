@@ -93,7 +93,9 @@ export function VmView({ host, name, d, nbs = null, fw = null, hosts = [], local
       {(tab === 'overview' || moved !== null) && (
         <div className="space-y-4">
           {moved === null && <dl className="grid gap-x-6 gap-y-2 rounded-xl border border-line bg-card p-4 text-sm md:grid-cols-2">
-            {['state', 'cpus', 'memory_mib', 'ip', 'public', 'firewall', 'uptime_ms', 'restarts', 'exits'].filter((k) => fields[k]).map((k) => (
+            {['state', 'cpus', 'memory_mib', 'node', 'node_memory_pct', 'ip', 'public', 'firewall', 'uptime_ms', 'restarts', 'exits']
+              /* A NUMA node only where it has one: a host of nodes, or a vm.toml that asks for one */
+              .filter((k) => fields[k] && (!k.startsWith('node') || (vm[k] !== null && vm[k] !== undefined))).map((k) => (
               <div key={k} className="flex justify-between gap-4">
                 <dt className="text-muted">{text(fields[k]?.title, locale) || k}</dt>
                 <dd className="font-mono text-fg-soft">{show(fields[k], vm[k], locale)}</dd>

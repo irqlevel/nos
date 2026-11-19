@@ -30,6 +30,13 @@ CpuTable::~CpuTable()
 {
 }
 
+/* The CPU the target says the code runs on (fuzz::current_cpu), as the
+   kernel's reads it: the host HAL's */
+ulong CpuTable::get_current_cpu_id()
+{
+    return hal::get_current_cpu_hw_id();
+}
+
 TaskQueue::TaskQueue()
 {
 }

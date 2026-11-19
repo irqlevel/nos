@@ -63,6 +63,8 @@ NVIDIA GPU -- handed whole to a Linux guest: VT-d in the host, its domains
 and interrupt remapping, and the device's function on the guest's bus.
 [review-2026-11-open.md](review-2026-11-open.md) is what the review of
 2026-11-12 -- the Rust ffi, base and hypervisor -- left open.
+[many-cpus.md](many-cpus.md) is nos past 64 CPUs, planned and not started:
+a set of CPUs wider than a word, and x2APIC for APIC ids past 254.
 
 ### Reordering history
 

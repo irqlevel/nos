@@ -190,6 +190,9 @@ pub struct GuestMemory {
     #[cfg(target_arch = "x86_64")]
     id: AtomicU64,
     regions: Vec<Region>,
+    /// The NUMA node its RAM is taken from first (`place_on`): the node of
+    /// the CPU taking it where None
+    node: Option<usize>,
     /// Which of its pages were written since the dirty log last looked
     /// (`crate::dirty`): the host's writes marked here as they are made, the
     /// guest's at its nested faults while the log looks after them.
@@ -257,6 +260,7 @@ impl GuestMemory {
             root: nested.root,
             id: AtomicU64::new(nested.id),
             regions: Vec::new(),
+            node: None,
             log: dirty::Log::new(),
             absent: Mutex::new(Absent { frame: None, at: Vec::new() }).ok_or(Error::NoMemory)?,
             devices: Mutex::new(Vec::new()).ok_or(Error::NoMemory)?,
@@ -368,9 +372,34 @@ impl GuestMemory {
     pub fn new() -> Result<Self> {
         Ok(Self {
             regions: Vec::new(),
+            node: None,
             log: dirty::Log::new(),
             absent: Mutex::new(Absent { at: Vec::new() }).ok_or(Error::NoMemory)?,
         })
+    }
+
+    /// Its RAM taken from NUMA node `node` first (`kcore::numa`), from
+    /// here on: the node its CPUs are placed on, so that what they read is
+    /// near -- a node with none to give, the nearest that has.
+    pub fn place_on(&mut self, node: usize) {
+        self.node = Some(node);
+    }
+
+    /// Of its RAM, the pages on NUMA node `node`, and all of them: what its
+    /// placement asked of the allocator, as their physical addresses say --
+    /// a block of the pool the node's its first page is.
+    pub fn pages_on(&self, node: usize) -> (u64, u64) {
+        let mut on = 0u64;
+        let mut all = 0u64;
+        for region in &self.regions {
+            for e in region.frames.extents() {
+                all += e.pages as u64;
+                if kcore::numa::phys_node(e.phys) == node {
+                    on += e.pages as u64;
+                }
+            }
+        }
+        (on, all)
     }
 
     /// Give the guest `size` bytes of zeroed memory at `base`, a frame a
@@ -381,7 +410,11 @@ impl GuestMemory {
         /* The kernel zeroes every frame it hands out: what the guest finds
          * in its memory is what it was given, never what the host left
          * there. A failure part way drops what was taken. */
-        let frames = Run::new(pages).ok_or(Error::NoMemory)?;
+        let frames = match self.node {
+            Some(node) => Run::new_on(pages, node),
+            None => Run::new(pages),
+        }
+        .ok_or(Error::NoMemory)?;
         self.place(base, size, frames, false, false)
     }
 
@@ -394,7 +427,11 @@ impl GuestMemory {
     /// many free, the blocks taken by then going back.
     pub fn add_huge(&mut self, base: u64, size: u64, leaves_2m: bool) -> Result<()> {
         let pages = self.check_new(base, size, HUGE_SIZE)?;
-        let frames = Run::new_huge(pages).map_err(|short| match short {
+        let frames = match self.node {
+            Some(node) => Run::new_huge_on(pages, node),
+            None => Run::new_huge(pages),
+        }
+        .map_err(|short| match short {
             kcore::frame::Shortage::Pool => Error::NoHugePages,
             kcore::frame::Shortage::Memory => Error::NoMemory,
         })?;

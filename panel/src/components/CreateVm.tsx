@@ -34,6 +34,19 @@ function usable(d: Device): boolean {
   return d.id !== null && d.in_use_by === null && d.boots_the_machine === null;
 }
 
+/** A NUMA node of the host's (the system provider's `numa`): a VM may be put
+ * on it, its CPUs on the node's cores and its memory the node's. */
+interface NumaNode {
+  node: number; cpus: string; free_bytes: number; huge_total_bytes: number; huge_free_bytes: number;
+}
+
+/** What a VM made on the node has to take its memory from: the huge pool's
+ * free blocks where the host has a pool -- guests' memory is the pool's then
+ * -- and its free pages where it has none. */
+function roomOf(n: NumaNode): number {
+  return n.huge_total_bytes > 0 ? n.huge_free_bytes : n.free_bytes;
+}
+
 export function CreateVm({ host, locale, w, image: given }: { host: string; locale: string; w: Words; image?: string }) {
   const ru = locale === 'ru';
   const [name, setName] = useState('');
@@ -65,6 +78,10 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
   const cluster = network.startsWith(CLUSTER);
   /* A public address of the world's routed to the host, mapped one to one */
   const [publicIp, setPublicIp] = useState('');
+  /* The host's NUMA nodes: a choice only where it has more than one; ''
+   * leaves it to hv -- the node its first CPU falls on */
+  const [nodes, setNodes] = useState<NumaNode[]>([]);
+  const [node, setNode] = useState('');
   const [error, setError] = useState('');
   const [job, setJob] = useState<number | null>(null);
 
@@ -91,6 +108,9 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
       if (!live || !r.ok) return;
       setClusterFirewalls(((r.data as { firewalls?: Array<{ name?: unknown }> }).firewalls ?? [])
         .map((f) => f.name).filter((n): n is string => typeof n === 'string'));
+    });
+    call(host, 'system', 'numa').then((r) => {
+      if (live && r.ok) setNodes((r.data as { nodes?: NumaNode[] }).nodes ?? []);
     });
     return () => { live = false; };
   }, [host]);
@@ -143,6 +163,7 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
       }
     }
     if (password) params.password = password;
+    if (node !== '') params.node = Number(node);
     if (network) params.network = network;
     if (cluster ? clusterFirewalls !== null : firewalls !== null) params.firewall = firewall;
     if (publicIp && !cluster) {
@@ -275,6 +296,22 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
             <input value={cpus} onChange={(e) => setCpus(e.target.value)} inputMode="numeric" name="cpus" className={input} />
           </label>
         </div>
+        {nodes.length > 1 && (
+          <label className="block text-sm text-fg-soft">{ru ? 'Узел NUMA' : 'NUMA node'}
+            <span className="block text-xs text-muted">
+              {ru ? 'Процессоры машины встанут на ядра этого узла, а её память возьмётся из его памяти: к памяти другого сокета ей ходить не придётся.'
+                : "Its CPUs go on this node's cores and its memory comes from this node's memory, so it never reaches across to the other socket's."}
+            </span>
+            <select value={node} onChange={(e) => setNode(e.target.value)} name="node" className={input}>
+              <option value="">{ru ? 'Любой: там, где окажется её первый процессор' : 'Any: wherever its first CPU lands'}</option>
+              {nodes.map((n) => (
+                <option key={n.node} value={String(n.node)}>
+                  {(ru ? 'Узел ' : 'Node ') + n.node} · {(ru ? 'ЦП ' : 'CPUs ') + n.cpus} · {bytes(roomOf(n))} {ru ? 'свободно' : 'free'}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
         <label className="block text-sm text-fg-soft">
           {ru ? 'Пароль пользователя образа (необязательно)' : "Password of the image's user (optional)"}
           <span className="block text-xs text-muted">

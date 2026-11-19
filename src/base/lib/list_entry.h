@@ -32,6 +32,12 @@ struct ListEntry final
 
     void move_tail_list(ListEntry* list);
 
+    /* The run first to last of another list -- last reached from first by
+       flink, neither of them a list's head -- taken out of that list and put
+       on this one's tail, in its order: two links rewritten at each end,
+       whatever the run's length */
+    void move_run_tail(ListEntry* first, ListEntry* last);
+
     ListEntry(ListEntry&& other);
     ListEntry& operator=(ListEntry&& other);
 

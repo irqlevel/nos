@@ -1,9 +1,9 @@
 # Real hardware
 
-`nos` boots on bare metal. Five machines so far, and they pull in opposite
-directions: a laptop whose only console is its own screen, and four
-dedicated servers — three Intel, one AMD — whose only console is the
-network, one of them fifteen years old.
+`nos` boots on bare metal. Seven machines so far, and they pull in opposite
+directions: a laptop whose only console is its own screen, and six
+servers — five Intel, one AMD — whose only console is the network, one of
+them fifteen years old and two of them of two sockets.
 
 ## Dell Latitude 5480
 
@@ -419,10 +419,65 @@ collector on another host, and an `/etc/rc` that ends in `reboot`. Its
 BootOrder tries the NIC's PXE first: POST to nos takes about two minutes, a
 boot of nos and back to Ubuntu about four.
 
+## Newton: a Supermicro X10DRi of two sockets
+
+A **Supermicro X10DRi** (AMI UEFI 3.4a, Secure Boot off, a C610 PCH, an
+ASPEED BMC): two **Xeon E5-2670 v3** -- Haswell-EP, twelve cores and
+twenty-four threads each -- and 256 GiB, 128 GiB a socket; Ubuntu on one SSD,
+nos on the other, its console the network. It is the first machine nos met
+of more than one NUMA node, and the one they were measured on
+([NUMA](numa.md)).
+
+- **Two nodes.** Its SRAT puts the first socket's 24 CPUs and the memory
+  below 2 GiB and from 4 GiB to 130 GiB in one proximity domain, the second
+  socket's and the 128 GiB above in the other; its SLIT says 21 between them.
+  nos reads both (`numa: node 0 (domain 0): CPUs 0-11,16-27 (24), 131072 MiB
+  the firmware placed in 2 ranges`), spreads the free pages over the two
+  (`mm: node 0: 128880 MiB free`, `node 1: 131071`), shares the huge pool
+  out by them and zeroes each node's pages on its own CPUs. Measured with
+  `numabench`, a line of the other socket's memory takes 193 ns against 138,
+  and one CPU reads it at 6.4-6.8 GB/s against 8.2-8.7; every page a node's
+  memory was given was that node's.
+- **Its CPUs are numbered with gaps**: the MADT lists the APIC ids 0x00 to
+  0x3B, a socket's twelve cores being 0-5 and 8-13 -- the first threads of
+  both sockets' cores, then the second -- and a CPU's number in nos is its
+  APIC id, so the 48 are 0-11, 16-27, 32-43 and 48-59, well under
+  `MAX_CPUS`. The firmware has x2APIC opted out: xAPIC.
+- **Its TCO watchdog is a version-2 TCO**, at PMBASE + 0x60 (0x460), its
+  NO_REBOOT bit in the chipset's GCS register (RCBA + 0x3410), set by the
+  firmware. nos used to take the LPC bridge's config register 0x50 as the
+  TCO's base -- the offset a 100-series PCH and later keep it at in their
+  SMBus function, not their bridge; here it holds 0xF8, and the watchdog
+  was armed at ports 0xE4-0xE8, nobody's. It now takes PMBASE + 0x60 alone
+  (`TCOBASE 0x0460 via LPC 0:1F.0 ACPI base + 0x60, NO_REBOOT clear in
+  GCS`), clears NO_REBOOT through RCBA and reads it back, and an MMIO
+  mapping that would cover usable RAM is refused rather than made.
+- **Its disks are on the C610's sSATA** (00:11.4, 8086:8d62, AHCI): an Intel
+  S3500 of 800 GB that is nos's (`nos-install disk`, by its WWN) and Ubuntu's
+  SSD; the SATA controller beside it has none.
+- **Its NIC is a two-port Intel I350** (03:00.0, MSI-X), the X11SSD-F's;
+  the network hands out no address (`--network-here`).
+- **Three IO-APICs** -- the PCH's at GSI 0, which nos programs, and one a
+  socket at 24 and 48 -- two DMAR units, a PCI root a socket (00-7e,
+  80-fe), and an xHCI whose BAR is 64-bit, above 56 TiB.
+- **VT-x is off in its firmware** -- its Linux says `VMX (outside TXT)
+  disabled by BIOS` -- so no guest of hv's runs there until it is turned on
+  in the firmware's setup, which only its console reaches.
+
+Its BootOrder tries both I350 ports' PXE before Ubuntu; `nos-install boot`
+has the firmware boot nos next, once. The BMC's watchdog, armed from Linux
+(`ipmitool raw 0x06 0x24 0x04 0x01 0x00 0x10 <lsb> <msb>`, in 100 ms, then
+`raw 0x06 0x22`), keeps counting through POST and resets the machine into
+Ubuntu if nothing stops it: a test boot's way back, beside `deadman=`. A
+boot of nos and back to Ubuntu takes some six minutes -- two and a quarter
+from Ubuntu's reboot to nos's sshd, four from nos's own `reboot` to
+Ubuntu's, through both ports' PXE; nos says `boot: complete` 16 s after
+GRUB, sshd listening at once.
+
 The boxes before Hertz were set up by hand, before there was a release image
 to set one up from. A new server is set up with `nos-install` from the system image,
 which makes the partition, the GRUB entry and the one-shot flag that the
 sections above describe building by hand ([Install](install.md)).
 
 Other firmware, chipsets, NICs and disks are untested; treat bare-metal support
-as "works on the six machines it was debugged on".
+as "works on the seven machines it was debugged on".

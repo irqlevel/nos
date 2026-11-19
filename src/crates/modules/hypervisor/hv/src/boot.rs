@@ -253,14 +253,14 @@ pub fn boot(machine: &Arc<Machine>, args: &str, cores: &Cores, unloading: &Arc<A
             return;
         }
     };
-    let (place, hold) = match cores.take(machine, spec.cpu, spec.cpus, !spec.disks.is_empty(), Some(Holder::Boot)) {
+    let (place, hold) = match cores.take(machine, spec.cpu, spec.numa, spec.cpus, !spec.disks.is_empty(), Some(Holder::Boot)) {
         Ok(taken) => taken,
         Err(why) => {
             let _ = writeln!(out, "hv: {}", why);
             return;
         }
     };
-    spec.shape = place.shape;
+    spec.placed(&place);
     let placement = place.vcpus;
     let cpu = placement[0];
 

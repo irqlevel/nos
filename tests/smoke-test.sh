@@ -16,6 +16,10 @@
 #        SMOKE_EXTRA    QEMU arguments put before the devices -- an IOMMU has
 #                       to be made before the devices behind it
 #        SMOKE_MARKER   one more line the serial log must have
+#        SMOKE_NUMA     1: two NUMA nodes, CPUs 0-1 and 512 MiB the first's,
+#                       CPUs 2-3 and 512 MiB the second's, 21 apart -- QEMU's
+#                       SRAT and SLIT; the boot must read them, spread the
+#                       free pages over both and pass test_numa
 #
 # The VT-d boot: `make nos-test.iso TEST_ISO_ARGS=iommu=on`, then
 #   SMOKE_ISO=nos-test.iso SMOKE_MACHINE=q35 SMOKE_EXTRA="-device intel-iommu,intremap=on"
@@ -41,6 +45,12 @@ MACHINE_OPTS=()
 # Word-split on purpose: a list of QEMU arguments
 # shellcheck disable=SC2206
 EXTRA_OPTS=(${SMOKE_EXTRA:-})
+NUMA_OPTS=()
+if [ "${SMOKE_NUMA:-0}" = "1" ]; then
+    NUMA_OPTS=(-object memory-backend-ram,id=m0,size=512M -object memory-backend-ram,id=m1,size=512M
+               -numa node,nodeid=0,cpus=0-1,memdev=m0 -numa node,nodeid=1,cpus=2-3,memdev=m1
+               -numa dist,src=0,dst=1,val=21)
+fi
 
 TMPDIR_SMOKE="$(mktemp -d)"
 SMOKE_LOG="${SMOKE_LOG:-$TMPDIR_SMOKE/nos.log}"
@@ -86,6 +96,7 @@ echo "smoke: booting (log: $SMOKE_LOG, timeout: ${SMOKE_TIMEOUT}s)..."
     ${CPU_OPTS[@]+"${CPU_OPTS[@]}"} \
     ${MACHINE_OPTS[@]+"${MACHINE_OPTS[@]}"} \
     ${EXTRA_OPTS[@]+"${EXTRA_OPTS[@]}"} \
+    ${NUMA_OPTS[@]+"${NUMA_OPTS[@]}"} \
     -display none \
     -m 1G \
     -smp 4 \
@@ -122,6 +133,10 @@ MARKERS=("After test" "Preempt is now on" "MountRootFs: mounted ext4 on /" "a sp
          "two mounts at once: a call on the other went through" "fstest: passed"
          "EntropySource registered: rng0" "EntropySource registered: rng1" "boot: complete")
 [ -n "${SMOKE_MARKER:-}" ] && MARKERS+=("$SMOKE_MARKER")
+# Two nodes: both read from the tables, the free pages on both, and the
+# allocator's self-test held to them
+[ "${SMOKE_NUMA:-0}" = "1" ] && MARKERS+=("numa: node 1 (domain 1): CPUs 2-3 (2)" "mm: node 1: "
+                                          "test_numa: 2 nodes")
 
 ELAPSED=0
 while [ "$ELAPSED" -lt "$SMOKE_TIMEOUT" ]; do

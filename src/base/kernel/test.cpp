@@ -1,4 +1,5 @@
 #include "klog.h"
+#include "numa.h"
 #include "debug.h"
 #include "task.h"
 #include "sched.h"
@@ -1044,7 +1045,8 @@ stdlib::Error test_zero_free()
 
     for (ulong i = 0; i < PAGES; i++)
     {
-        if (!pt.zero_free_page(reserve))
+        /* This CPU's node's: the one the allocations below take from first */
+        if (!pt.zero_free_page(Numa::get_instance().get_current_node(), reserve))
         {
             klog(0, "test_zero_free: zero_free_page %lu found nothing to zero", i);
             return make_error(stdlib::Error::UNSUCCESSFUL);
@@ -1255,6 +1257,85 @@ stdlib::Error test_zero_free()
     }
 
     klog(0, "test_zero_free: complete");
+    return make_success();
+}
+
+/* What the page allocator does with the NUMA nodes (kernel/numa.h), on the
+   machine the boot finds: the nodes' free counts add up to the machine's; a
+   page the kernel takes is its CPU's node's while that node has one free;
+   one taken for a node -- a guest's memory, placed -- is that node's, each
+   node with pages free; and every page goes back to its own node's lists.
+   On a machine of one node it says so and is that last check alone. */
+stdlib::Error test_numa()
+{
+    auto& numa = Numa::get_instance();
+    auto& pt = mm::PageTable::get_instance();
+    const ulong nodes = numa.get_node_count();
+    const ulong reserve = pt.get_kernel_reserve_pages();
+
+    ulong free_sum = 0;
+    for (ulong n = 0; n < nodes; n++)
+    {
+        ulong free = 0;
+        ulong zeroed = 0;
+        pt.get_node_free(n, free, zeroed);
+        free_sum += free;
+    }
+    /* Nothing else allocates in the boot's single task: the sum is the
+       machine's count as it was read */
+    if (free_sum != pt.get_free_pages_count())
+    {
+        klog(0, "test_numa: the nodes have %lu pages free between them, the machine %lu", free_sum,
+            pt.get_free_pages_count());
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+    }
+
+    const ulong home = numa.get_current_node();
+    ulong home_free = 0;
+    ulong home_zeroed = 0;
+    pt.get_node_free(home, home_free, home_zeroed);
+    if (home_free != 0)
+    {
+        mm::Page* page = pt.alloc_page();
+        if (page == nullptr)
+        {
+            klog(0, "test_numa: no page with %lu free on node %lu", home_free, home);
+            return make_error(stdlib::Error::NO_MEMORY);
+        }
+        const ulong got = numa.get_phys_node(page->get_phy_address());
+        pt.free_page(page);
+        if (got != home)
+        {
+            klog(0, "test_numa: a page of node %lu taken on node %lu's CPU, with %lu free there", got, home,
+                home_free);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
+        }
+    }
+
+    for (ulong n = 0; n < nodes; n++)
+    {
+        ulong free = 0;
+        ulong zeroed = 0;
+        pt.get_node_free(n, free, zeroed);
+        if (free == 0)
+            continue;
+        mm::Page* page = pt.alloc_page_keeping_on(n, reserve);
+        if (page == nullptr)
+            continue;
+        const ulong got = numa.get_phys_node(page->get_phy_address());
+        pt.free_page(page);
+        ulong after = 0;
+        pt.get_node_free(n, after, zeroed);
+        if (got != n || after != free)
+        {
+            klog(0, "test_numa: a page for node %lu was node %lu's, and its free count %lu after, %lu before", n, got,
+                after, free);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
+        }
+    }
+
+    klog(0, "test_numa: %lu node%s, pages taken where they were asked for and back on their own lists", nodes,
+        nodes == 1 ? "" : "s");
     return make_success();
 }
 
@@ -3824,6 +3905,10 @@ stdlib::Error test()
         return err;
 
     err = test_zero_free();
+    if (!err.ok())
+        return err;
+
+    err = test_numa();
     if (!err.ok())
         return err;
 

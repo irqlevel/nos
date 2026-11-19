@@ -48,6 +48,10 @@ pub struct Options {
     /// The host CPU its first CPU runs on.
     pub cpu: Option<u32>,
     pub cpus: Option<u32>,
+    /// The NUMA node its CPUs are placed on and its memory taken from
+    /// (`kcore::numa`); where its first CPU falls, its memory with it, when
+    /// not said.
+    pub node: Option<u32>,
     pub xapic: bool,
     pub ioapic: bool,
     pub apicv: Option<bool>,
@@ -114,6 +118,7 @@ enum Key {
     Memory,
     Cpus,
     Cpu,
+    Node,
     Disks,
     Pci,
     UnsafeInterrupts,
@@ -137,13 +142,14 @@ enum Key {
 }
 
 /// The keys there are, in the order `render` writes them.
-const KEYS: [(&str, Key); 26] = [
+const KEYS: [(&str, Key); 27] = [
     ("kernel", Key::Kernel),
     ("initrd", Key::Initrd),
     ("cmdline", Key::Cmdline),
     ("memory", Key::Memory),
     ("cpus", Key::Cpus),
     ("cpu", Key::Cpu),
+    ("node", Key::Node),
     ("disks", Key::Disks),
     ("pci", Key::Pci),
     ("unsafe_interrupts", Key::UnsafeInterrupts),
@@ -263,11 +269,12 @@ fn assign(c: &mut Config, key: Key, name: &str, value: Value, line: usize) -> Re
         (Key::Input, Value::Str(s)) => o.input = s,
         (Key::Memory, Value::Int(n)) => o.mem_mib = Some(n),
         (Key::Rxmod, Value::Int(n)) => o.rxmod_us = Some(n),
-        (Key::Cpus | Key::Cpu | Key::Port, Value::Int(n)) => {
+        (Key::Cpus | Key::Cpu | Key::Node | Key::Port, Value::Int(n)) => {
             let n = u32::try_from(n).map_err(|_| error(line, &alloc::format!("{} is too big", name)))?;
             match key {
                 Key::Cpus => o.cpus = Some(n),
                 Key::Cpu => o.cpu = Some(n),
+                Key::Node => o.node = Some(n),
                 _ => o.port = Some(n),
             }
         }
@@ -312,7 +319,7 @@ fn assign(c: &mut Config, key: Key, name: &str, value: Value, line: usize) -> Re
          | Key::Public, v) => {
             return Err(wrong("a string", &v));
         }
-        (Key::Memory | Key::Rxmod | Key::Cpus | Key::Cpu | Key::Port, v) => return Err(wrong("a number", &v)),
+        (Key::Memory | Key::Rxmod | Key::Cpus | Key::Cpu | Key::Node | Key::Port, v) => return Err(wrong("a number", &v)),
         (Key::Disks | Key::Pci | Key::Forward, v) => return Err(wrong("a list of strings", &v)),
         (_, v) => return Err(wrong("true or false", &v)),
     }
@@ -507,6 +514,10 @@ fn line(c: &Config, key: Key, name: &str) -> Result<Option<String>, String> {
             None => return Ok(None),
         },
         Key::Cpu => match o.cpu {
+            Some(v) => said(&mut s, &v),
+            None => return Ok(None),
+        },
+        Key::Node => match o.node {
             Some(v) => said(&mut s, &v),
             None => return Ok(None),
         },
