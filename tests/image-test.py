@@ -282,9 +282,13 @@ attach_disk() {
     LOOPS+=("$dev")
     printf -v "$1" %s "$dev"
 }
+# nos-install on a disk of nos's own -- under BIOS unless told: this machine's
+# own firmware is never the test's to set (a CI runner boots by UEFI, and its
+# efibootmgr is real); under UEFI the stand-in's (efi_install)
 disk_install() {
     mkdir -p "$T/grub.d.disk"
-    NOS_GRUB_D="$T/grub.d.disk" NOS_UPDATE_GRUB=false NOS_ALLOW_ANY_DISK=1 \
+    NOS_FIRMWARE=${NOS_FIRMWARE:-bios} \
+        NOS_GRUB_D="$T/grub.d.disk" NOS_UPDATE_GRUB=false NOS_ALLOW_ANY_DISK=1 \
         NOS_CPUINFO="$T/cpuinfo" NOS_UCODE_DIR="$T/intel-ucode" "$T/img/nos-install" "$@"
 }
 first_mib() { dd if="$1" bs=1M count=1 status=none | sha256sum | cut -d' ' -f1; }
@@ -369,6 +373,7 @@ efi_install() {
 script_install() {
     mkdir -p "$T/grub.d.disk"
     NOS_RELEASE_URL=${NOS_RELEASE_URL:-file://$T/release} NOS_NO_PACKAGES=1 \
+        NOS_FIRMWARE=${NOS_FIRMWARE:-bios} \
         NOS_GRUB_D="$T/grub.d.disk" NOS_UPDATE_GRUB=false NOS_ALLOW_ANY_DISK=1 \
         NOS_CPUINFO="$T/cpuinfo" NOS_UCODE_DIR="$T/intel-ucode" sh "$T/install.sh" "$@"
 }
