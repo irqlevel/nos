@@ -369,18 +369,60 @@ its disks and its NICs were:
 - **Its network hands out no address** either, so nos's comes from
   `nos-install --cmdline "ip=… gw=… dns=…"`.
 - **Its TCO watchdog is the firmware's**: nos finds it by the SMBus
-  controller and leaves NO_REBOOT as firmware set it, as on the EX44, so a
-  nos that hangs there is not reset by it.
+  controller and leaves NO_REBOOT as firmware set it -- a 100-series PCH
+  keeps the bit behind the P2SB, which the firmware hides -- so a nos that
+  hangs there is not reset by it. From Cannon Lake on the bit is in the
+  TCO's own TCO1_CNT, and nos clears it there.
 
 Its BootOrder tries the I350's PXE first: POST to GRUB takes minutes, a
 boot of nos and back to Ubuntu about eleven. nos says `boot: complete` 10 s
 after GRUB, its microcode loaded (0xf4 to 0xf8), its root mounted from `adb1`
 at 9.4 s, sshd listening on `eth0` at once.
 
-These boxes were set up by hand, before there was a release image to set one
-up from. A new server is set up with `nos-install` from the system image,
+## Hertz: an MSI PRO B760M-P with a GPU
+
+An **MSI PRO B760M-P** (Intel Core i3-14100 — Raptor Lake, four cores and
+eight threads, a B760 PCH — UEFI, Secure Boot off, 31 GiB): Ubuntu on one
+Samsung 990 PRO, nos on the other, its only console the network -- no
+serial port, no BMC, a static address. It is where a host's GPU is given to
+a guest ([GPU passthrough](../plans/gpu-passthrough.md)): an **NVIDIA RTX
+A2000** at 01:00.0, which is its boot VGA too.
+
+- **Its NIC is an RTL8168H** (10ec:8168 rev 15, XID 541), the first `r8168`
+  ran on. Under UEFI the firmware leaves its INTx line unrouted (Interrupt
+  Line 0xFF, which is no IO-APIC pin): the driver takes its MSI-X vector 0
+  of four, then MSI, and only then the line.
+- **Its VT-d is two units**: `dmar0`, the UHD 730's alone, left be, and
+  `dmar1` for everything else -- taken over with `iommu=on`, every device
+  passed through, queued invalidation, not coherent (each table entry
+  written back with `clflush`), 4-level tables (SAGAW 48-bit alone). The
+  A2000 goes to a Linux guest running NVIDIA's own driver: `nvidia-smi`,
+  CUDA's deviceQuery, vectorAdd and matrixMul pass, matrixMul at
+  611 GFlop/s as under QEMU, `boot: complete` to the guest's power-off and
+  the reboot after it in 20 seconds.
+- **Its console is EGA text**: GRUB hands nos no framebuffer, so the kernel
+  writes 0xB8000 and the CRTC's ports, the legacy window the firmware routes
+  to the boot VGA -- the A2000. Given to a guest, the GPU takes the screen
+  with it: held while its BARs are sized, then let go of for good
+  ([The hypervisor](hypervisor.md#a-hosts-pci-device)).
+- **Its TCO watchdog does not count**: NO_REBOOT clears, in TCO1_CNT, but
+  the timer stays at its reload value with TMR_HLT clear -- started by nos
+  and started by hand from Linux alike (TCO_LOCK is set by the firmware; the
+  ACPI PM timer runs) -- so a hang there is not reset by it. `panic=10`
+  brings back a nos that panics, and `deadman=` one that runs but cannot be
+  reached.
+
+`tests/gpu-passthrough/install-bare.sh` boots it once from Ubuntu: nos-install
+onto the second NVMe, named by `/dev/disk/by-id` -- Linux swaps `nvme0` and
+`nvme1` between boots -- `deadman=900`, the disk log, netconsole to a
+collector on another host, and an `/etc/rc` that ends in `reboot`. Its
+BootOrder tries the NIC's PXE first: POST to nos takes about two minutes, a
+boot of nos and back to Ubuntu about four.
+
+The boxes before Hertz were set up by hand, before there was a release image
+to set one up from. A new server is set up with `nos-install` from the system image,
 which makes the partition, the GRUB entry and the one-shot flag that the
 sections above describe building by hand ([Install](install.md)).
 
 Other firmware, chipsets, NICs and disks are untested; treat bare-metal support
-as "works on the five machines it was debugged on".
+as "works on the six machines it was debugged on".

@@ -68,6 +68,10 @@ pub struct Machine<'a> {
     /// The window its functions' memory BARs are in, when any has one: a
     /// base and a length.
     pub mmio: Option<(u32, u32)>,
+    /// The windows a host's function's BARs are in (`run::add_host_function`):
+    /// below 4 GiB, and above RAM -- a base and a length each.
+    pub bars32: Option<(u32, u32)>,
+    pub bars64: Option<(u64, u64)>,
 }
 
 /* Who made the tables, in every header. */
@@ -200,6 +204,8 @@ const WORD_SPACE_TAG: u8 = 0x88;
 const WORD_SPACE_BYTES: u16 = 13;
 const DWORD_SPACE_TAG: u8 = 0x87;
 const DWORD_SPACE_BYTES: u16 = 23;
+const QWORD_SPACE_TAG: u8 = 0x8A;
+const QWORD_SPACE_BYTES: u16 = 43;
 const END_TAG: u8 = 0x79;
 const SPACE_MEMORY: u8 = 0;
 const SPACE_IO: u8 = 1;
@@ -217,7 +223,7 @@ const CONFIG_PORTS: u16 = 0xCF8;
 const CONFIG_PORTS_LEN: u8 = 8;
 const BUSES: u16 = 0x100;
 /// The room a `_CRS` takes: every descriptor it may have.
-const CRS_MAX: usize = 96;
+const CRS_MAX: usize = 192;
 /// The panic device's ID, which Linux's `pvpanic-mmio` binds to, and the
 /// bytes of its `_CRS`: its port, and the end.
 const PVPANIC_HID: &[u8; 8] = b"QEMU0001";
@@ -689,7 +695,7 @@ fn write_crs(r: &mut Out, m: &Machine) {
     /* From 0xD00 to the top: the length is what is left of 64 KiB. */
     let above = CONFIG_PORTS + u16::from(CONFIG_PORTS_LEN);
     word_space(r, SPACE_IO, IO_ENTIRE_RANGE, above, u16::MAX, 0u16.wrapping_sub(above));
-    if let Some((base, len)) = m.mmio {
+    for (base, len) in [m.mmio, m.bars32].into_iter().flatten() {
         let last = (u64::from(base) + u64::from(len)).checked_sub(1).and_then(|l| u32::try_from(l).ok());
         match last {
             Some(last) if len != 0 => {
@@ -703,6 +709,23 @@ fn write_crs(r: &mut Out, m: &Machine) {
                 r.u32(last);
                 r.u32(0); // translation
                 r.u32(len);
+            }
+            _ => r.overflow = true,
+        }
+    }
+    if let Some((base, len)) = m.bars64 {
+        match base.checked_add(len).and_then(|e| e.checked_sub(1)) {
+            Some(last) if len != 0 => {
+                r.u8(QWORD_SPACE_TAG);
+                r.u16(QWORD_SPACE_BYTES);
+                r.u8(SPACE_MEMORY);
+                r.u8(PRODUCER_FIXED);
+                r.u8(MEMORY_READ_WRITE);
+                r.u64(0); // granularity
+                r.u64(base);
+                r.u64(last);
+                r.u64(0); // translation
+                r.u64(len);
             }
             _ => r.overflow = true,
         }

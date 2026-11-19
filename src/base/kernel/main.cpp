@@ -51,6 +51,7 @@
 #include <drivers/acpi.h>
 #include <arch/x86_64/lapic.h>
 #include <arch/x86_64/ioapic.h>
+#include <arch/x86_64/vtd.h>
 #include <drivers/pci.h>
 
 #include <kernel/stack_probe.h>
@@ -1215,6 +1216,10 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
 
     auto& pci = Pci::get_instance();
     pci.scan();
+
+    /* The DMA remapping units: the devices are known now, and none of
+       them has been told to DMA nor any interrupt programmed yet */
+    Vtd::get_instance().setup();
 
     IO8042::get_instance();
     auto& serial = Serial::get_instance();

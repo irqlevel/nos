@@ -77,6 +77,11 @@ pub(crate) const ONE_MIB: u64 = 0x10_0000;
 /// read and write its devices' registers as memory, none of them hearing of
 /// it. A multiple of 2 MiB, so that the huge pool's blocks end with it.
 pub const LOW_RAM_END: u64 = 0xFE00_0000;
+/// Where a guest's RAM below 4 GiB ends when it holds a host's function:
+/// 3 GiB, the window from here to the platform's pages (`LOW_RAM_END`) its
+/// 32-bit BARs' -- a GPU's registers are one such, 16 MiB -- as a PC's
+/// firmware leaves a PCI hole.
+pub const HOLE_RAM_END: u64 = 0xC000_0000;
 /// Where the rest of a guest's RAM is, past the devices' pages: from 4 GiB,
 /// as a PC's firmware puts what does not fit below them.
 pub const HIGH_RAM_START: u64 = 1 << 32;
@@ -98,7 +103,14 @@ pub struct Ram {
 impl Ram {
     /// `mem_bytes` of RAM, laid out.
     pub fn of(mem_bytes: u64) -> Ram {
-        let low = mem_bytes.min(LOW_RAM_END);
+        Self::of_below(mem_bytes, LOW_RAM_END)
+    }
+
+    /// `mem_bytes` of RAM, laid out, what is below 4 GiB ending at
+    /// `low_end` -- `HOLE_RAM_END` for a guest holding a host's function --
+    /// LOW_RAM_END at most.
+    pub fn of_below(mem_bytes: u64, low_end: u64) -> Ram {
+        let low = mem_bytes.min(low_end.min(LOW_RAM_END));
         Ram { low, high: mem_bytes - low }
     }
 
@@ -191,6 +203,10 @@ const TSS_BUSY_PRESENT: u64 = 0x8B;
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
     pub mem_bytes: u64,
+    /// Where its RAM below 4 GiB ends (`Ram::of_below`): `LOW_RAM_END`, or
+    /// `HOLE_RAM_END` for a guest holding a host's function -- what its
+    /// memory map says, and what the guest it is loaded into must have.
+    pub low_end: u64,
     /// Where the 64-bit kernel is loaded: `pref_address`, since a kernel
     /// that is not relocatable must run there, and one that is may as well.
     pub kernel_addr: u64,
@@ -204,6 +220,14 @@ pub struct Layout {
 /// Decide the layout for a guest with `mem_bytes` of RAM, a kernel whose
 /// 64-bit half is `kernel_len` bytes, and an initrd of `initrd_len`.
 pub fn plan(header: &Header, mem_bytes: u64, kernel_len: u64, initrd_len: u64) -> Result<Layout> {
+    plan_below(header, mem_bytes, LOW_RAM_END, kernel_len, initrd_len)
+}
+
+/// [`plan`] for a guest whose RAM below 4 GiB ends at `low_end`
+/// ([`Ram::of_below`]).
+pub fn plan_below(header: &Header, mem_bytes: u64, low_end: u64, kernel_len: u64, initrd_len: u64)
+    -> Result<Layout>
+{
     if mem_bytes < 64 * 1024 * 1024 {
         /* Below this a kernel and an initrd do not fit with room to
          * decompress -- init_size alone is megabytes. */
@@ -212,7 +236,7 @@ pub fn plan(header: &Header, mem_bytes: u64, kernel_len: u64, initrd_len: u64) -
     /* The kernel and the initrd below 4 GiB, where the identity map and the
      * boot protocol's 32-bit fields reach: in the RAM below the devices'
      * pages, whatever is above them. */
-    let low = Ram::of(mem_bytes).low;
+    let low = Ram::of_below(mem_bytes, low_end).low;
     let kernel_addr = header.pref_address;
     /* The header's to say, and so the image's: one that asks for an address
      * below 1 MiB would be loaded over the zero page, the page tables and
@@ -247,7 +271,7 @@ pub fn plan(header: &Header, mem_bytes: u64, kernel_len: u64, initrd_len: u64) -
         (addr, initrd_len)
     };
 
-    Ok(Layout { mem_bytes, kernel_addr, kernel_len, initrd_addr, initrd_len })
+    Ok(Layout { mem_bytes, low_end, kernel_addr, kernel_len, initrd_addr, initrd_len })
 }
 
 fn round_up(v: u64, to: u64) -> u64 {
@@ -295,9 +319,9 @@ pub fn build(
      * the page it has in one piece. Made on the heap: a page of frame here
      * would be a page of stack beneath every caller. */
     let mut entries = [E820Entry::default(); E820_ENTRIES];
-    let n = e820_entries(layout.mem_bytes, firmware, &mut entries)?;
+    let n = e820_entries(layout.mem_bytes, layout.low_end, firmware, &mut entries)?;
     /* Both below 4 GiB, as `plan` placed them: a guest's RAM there ends at
-     * `LOW_RAM_END`. */
+     * `low_end`, `LOW_RAM_END` at most. */
     let (Ok(initrd_addr), Ok(initrd_len)) = (u32::try_from(layout.initrd_addr), u32::try_from(layout.initrd_len))
     else {
         return Err(Error::BadAddress);
@@ -438,12 +462,12 @@ const _: () = assert!(E820_ENTRIES <= bzimage::E820_MAX_ENTRIES);
 /// The memory map a guest of `mem_bytes` reads instead of asking a BIOS:
 /// low RAM, the hole at 640 KiB -- in which the firmware's tables, when
 /// there are any, are reserved -- the rest of the RAM below 4 GiB from
-/// 1 MiB up, and what did not fit there from 4 GiB ([`Ram`]). Into `out`;
-/// how many entries.
-pub(crate) fn e820_entries(mem_bytes: u64, firmware: Option<Firmware>, out: &mut [E820Entry; E820_ENTRIES])
-    -> Result<usize>
+/// 1 MiB up to `low_end`, and what did not fit there from 4 GiB
+/// ([`Ram::of_below`]). Into `out`; how many entries.
+pub(crate) fn e820_entries(mem_bytes: u64, low_end: u64, firmware: Option<Firmware>,
+                           out: &mut [E820Entry; E820_ENTRIES]) -> Result<usize>
 {
-    let ram = Ram::of(mem_bytes);
+    let ram = Ram::of_below(mem_bytes, low_end);
     let mut n = 0;
     out[n] = E820Entry { addr: 0, size: LOW_TOP, kind: E820_RAM };
     n += 1;

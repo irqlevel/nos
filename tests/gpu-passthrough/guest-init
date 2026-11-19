@@ -1,0 +1,35 @@
+#!/bin/busybox sh
+# tests/gpu-passthrough-test.py: the guest's /init. What it sees of the GPU nos
+# gives it, then nouveau -- the GSP's firmware booted by DMA through nos's
+# IOMMU domain of the guest's RAM -- and fences each waited for on the GPU's
+# interrupt (fence.c); every line the runner reads begins "gpu-guest: ".
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+say() { echo "gpu-guest: $*"; }
+say "$(uname -r), $(grep -c ^processor /proc/cpuinfo) cpus, $(grep MemTotal /proc/meminfo)"
+dmesg | grep -iE 'BIOS-e820|root bus resource' | sed 's/^/gpu-guest: /'
+for d in /sys/bus/pci/devices/*; do
+    say "pci $(basename $d) $(cat $d/vendor):$(cat $d/device) class $(cat $d/class)"
+done
+for d in /sys/bus/pci/devices/*; do
+    [ "$(cat $d/vendor)" = "0x10de" ] || continue
+    say "the GPU at $(basename $d):"
+    head -6 $d/resource | sed 's/^/gpu-guest: resource /'
+    b0=$(head -1 $d/resource | cut -d' ' -f1)
+    say "BOOT0 $(devmem $b0 32)"
+done
+M=/lib/modules/$(uname -r)
+for m in $(cat /modules); do
+    insmod $M/$m 2>&1 | sed 's/^/gpu-guest: insmod: /'
+done
+sleep 10
+say "fences, each waited for on the GPU's interrupt:"
+fence 1000 2>&1 | sed 's/^/gpu-guest: /'
+say "nouveau said:"
+dmesg | grep -iE 'nouveau|gsp|\[drm\]|nvkm' | sed 's/^/gpu-guest: /'
+say "interrupts:"
+grep -iE 'nvkm|nouveau' /proc/interrupts | sed 's/^/gpu-guest: /'
+say "done"
+poweroff -f

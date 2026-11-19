@@ -1,6 +1,7 @@
 #include "msix.h"
 
 #include "mmio.h"
+#include "iommu.h"
 
 #include <include/const.h>
 #include <arch/x86_64/idt.h>
@@ -38,6 +39,7 @@ MsixTable::MsixTable()
     , msi_64_(false)
     , msi_maskable_(false)
     , entry_vector_(nullptr)
+    , entry_handle_(nullptr)
 {
 }
 
@@ -89,6 +91,19 @@ MsixTable::~MsixTable()
         entry_vector_ = nullptr;
     }
 
+    if (entry_handle_)
+    {
+        /* Each remapped entry out of its unit's table, as its vector is
+           given back: the device is off above */
+        for (u16 i = 0; i < count_; i++)
+        {
+            if (entry_handle_[i] != NO_HANDLE)
+                iommu::remap_free(requester_id(), entry_handle_[i]);
+        }
+        mm::free(entry_handle_);
+        entry_handle_ = nullptr;
+    }
+
     table_ = nullptr;
     count_ = 0;
     dev_ = nullptr;
@@ -101,6 +116,11 @@ MsixTable::~MsixTable()
 bool MsixTable::map_msi_device()
 {
     return true;
+}
+
+u16 MsixTable::requester_id() const
+{
+    return static_cast<u16>((static_cast<u16>(dev_->bus) << 8) | ((dev_->slot & 0x1F) << 3) | (dev_->func & 0x7));
 }
 
 bool MsixTable::map_bar_for_table(Pci::DeviceInfo* dev, u8 bar, ulong offset_in_bar,
@@ -315,6 +335,37 @@ u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
        around (IrqBalance lock -> Retarget -> entry_lock_). */
     u32 apic_id = (u32)IrqBalance::get_instance().assign_msix(this, index);
     u32 addr_low = MSIX_ADDR_BASE | (apic_id << 12);
+    u32 data = (u32)vector;
+
+    /* Where interrupts are remapped the message names an entry of the
+       unit's table, which names the vector and the CPU, from this device
+       alone: what it sends in the compatibility format is blocked */
+    if (iommu::remapping())
+    {
+        if (entry_handle_ == nullptr)
+        {
+            entry_handle_ = (u16*)mm::alloc((size_t)count_ * sizeof(u16), 0);
+            if (entry_handle_ == nullptr)
+            {
+                free_vector(vector);
+                klog(0, "MsixTable: no memory for its entries' handles");
+                return 0;
+            }
+            for (u16 i = 0; i < count_; i++)
+                entry_handle_[i] = NO_HANDLE;
+        }
+        const long handle = iommu::remap_alloc(requester_id(), vector, apic_id, false);
+        if (handle < 0)
+        {
+            free_vector(vector);
+            klog(0, "MsixTable: %02lx:%02lx.%lx entry %lu: no interrupt entry to be had", (ulong)dev_->bus,
+                (ulong)dev_->slot, (ulong)dev_->func, (ulong)index);
+            return 0;
+        }
+        entry_handle_[index] = (u16)handle;
+        addr_low = iommu::msi_address((u16)handle);
+        data = 0;
+    }
 
     if (msi_)
     {
@@ -323,7 +374,7 @@ u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
         {
             stdlib::AutoLock lock(entry_lock_);
             msi_set_masked(true);
-            msi_write_message(addr_low, (u32)vector);
+            msi_write_message(addr_low, data);
         }
         Idt::get_instance().set_descriptor(vector, IdtDescriptor::encode(handler.get_handler_fn()));
         handler.on_interrupt_register(0, vector);
@@ -349,7 +400,7 @@ u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
 
         mmio_write32(entry + 0, addr_low);
         mmio_write32(entry + 4, 0);
-        mmio_write32(entry + 8, (u32)vector);
+        mmio_write32(entry + 8, data);
         mmio_write32(entry + 12, 1);
     }
 
@@ -435,6 +486,16 @@ void MsixTable::retarget(u16 index, u32 apic_id)
 {
     if (!is_ready() || index >= count_ || entry_vector_[index] == 0)
         return;
+
+    /* A remapped entry is moved in its unit's table: nothing of the
+       device's changes, the message naming the same entry */
+    if (entry_handle_ != nullptr && entry_handle_[index] != NO_HANDLE)
+    {
+        if (!iommu::remap_retarget(requester_id(), entry_handle_[index], apic_id))
+            klog(0, "MsixTable: %02lx:%02lx.%lx entry %lu not moved to APIC %lu", (ulong)dev_->bus,
+                (ulong)dev_->slot, (ulong)dev_->func, (ulong)index, (ulong)apic_id);
+        return;
+    }
 
     stdlib::AutoLock lock(entry_lock_);
 

@@ -32,4 +32,14 @@ unsafe extern "C" {
     pub fn kernel_pci_write_config8(bus: u16, slot: u16, func: u16, offset: u16, val: u8);
     pub fn kernel_pci_write_config16(bus: u16, slot: u16, func: u16, offset: u16, val: u16);
     pub fn kernel_pci_write_config32(bus: u16, slot: u16, func: u16, offset: u16, val: u32);
+    /// The screen's drawing held (`on` non-zero) or taken up again (0) --
+    /// a count, under the console's lock -- while a function about to be
+    /// given to a guest has its BARs sized, its decoding off: the firmware's
+    /// framebuffer may be in one. Sound for any value, at any time; kcore
+    /// pairs the two.
+    pub safe fn kernel_screen_hold(on: i32);
+    /// The screen's framebuffer let go of for good where it lies in
+    /// `[base, base + size)`, a BAR of such a function: 1 when it did.
+    /// Values compared under the console's lock: sound for any, at any time.
+    pub safe fn kernel_screen_release(base: u64, size: u64) -> i32;
 }

@@ -8,7 +8,10 @@
 // tag's copy, the EBDA or the BIOS area among decoys, an RSDT or an XSDT,
 // and tables below and above 4 GiB, across page ends, over each other: a
 // MADT of every entry kind, a FADT, an HPET table and a WDAT of every
-// length, the SSDTs and the rest a firmware lists, and seconds of the kinds
+// length, a DMAR of units, reserved regions and device scopes cut and
+// overlong and of more than is kept (and Hertz's, as its firmware wrote
+// it), an MCFG of windows of every segment, alignment and reach, the SSDTs
+// and the rest a firmware lists, and seconds of the kinds
 // read among them; the DSDT the FADT names by either of its fields or by
 // neither -- pages of AML nobody runs, with a \_S5 in it as a firmware
 // writes one and as none does, across a page's end, cut by the table's, in
@@ -565,6 +568,151 @@ std::vector<uint8_t> wdat_body(fuzz::Input& in)
     return body;
 }
 
+/* Hertz's DMAR (an MSI PRO B760M-P, an i3-14100) and MCFG past their
+   headers, as its firmware wrote them: the graphics unit with its one
+   endpoint, the unit of every other device with the IO-APIC's and the
+   HPET's scopes, the graphics' reserved region; ECAM at 0xC0000000 for
+   buses 0-255 */
+const uint8_t HERTZ_DMAR[] = {
+    0x26, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd9, 0xfe, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x08, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+    0x00, 0x00, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x10, 0xd9, 0xfe, 0x00, 0x00, 0x00, 0x00,
+    0x03, 0x08, 0x00, 0x00, 0x02, 0x00, 0x1e, 0x07,
+    0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x1e, 0x06,
+    0x01, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7c, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0x7f, 0x80, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x08, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+};
+const uint8_t HERTZ_MCFG[] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00,
+};
+
+/* A device scope: an endpoint or a bridge by its path, an IO-APIC or an
+   HPET by its id -- now and then of a kind past those, of no hops, of more
+   hops than are kept, or of a length that is not its path's */
+std::vector<uint8_t> dmar_scope(fuzz::Input& in)
+{
+    static const uint8_t TYPES[] = {1, 1, 1, 2, 3, 4, 5, 0, 6, 0xFF};
+    const size_t hops = in.chance(16) ? in.below(7) : in.range(1, 2);
+    std::vector<uint8_t> d(6 + 2 * hops, 0);
+    d[0] = in.pick(TYPES);
+    d[1] = static_cast<uint8_t>(d.size());
+    d[2] = in.chance(16) ? in.u8() : 0;
+    d[4] = in.chance(16) ? in.u8() : static_cast<uint8_t>(in.below(4));
+    d[5] = in.chance(8) ? in.u8() : 0;
+    for (size_t h = 0; h < hops; h++)
+    {
+        d[6 + 2 * h] = static_cast<uint8_t>(in.chance(16) ? in.u8() : in.below(32));
+        d[7 + 2 * h] = static_cast<uint8_t>(in.chance(16) ? in.u8() : in.below(8));
+    }
+    if (in.chance(32))
+    {
+        d[1] = in.boolean() ? static_cast<uint8_t>(in.below(d.size())) : static_cast<uint8_t>(d.size() + in.range(1, 9));
+        fuzz::reached("a DMAR scope of the wrong length");
+    }
+    return d;
+}
+
+/* A DMAR: units -- the last of them mostly of every device -- reserved
+   regions, and what this kernel does not read (ATSRs, RHSAs, SATCs, kinds
+   past those); each now and then of the wrong length, of more scopes than
+   are kept, the whole cut short; or Hertz's, at times damaged */
+std::vector<uint8_t> dmar_body(fuzz::Input& in)
+{
+    if (in.chance(8))
+    {
+        std::vector<uint8_t> body(HERTZ_DMAR, HERTZ_DMAR + sizeof(HERTZ_DMAR));
+        if (in.chance(8))
+            body[in.below(body.size())] ^= static_cast<uint8_t>(in.range(1, 255));
+        fuzz::reached("Hertz's DMAR");
+        return body;
+    }
+
+    static const uint8_t WIDTHS[] = {38, 38, 45, 47, 51, 62, 63, 0xFF};
+    std::vector<uint8_t> body(12, 0);
+    body[0] = in.chance(16) ? in.u8() : in.pick(WIDTHS);
+    body[1] = static_cast<uint8_t>(in.below(8));
+
+    const size_t count = in.chance(16) ? in.below(24) : in.range(1, 4);
+    for (size_t i = 0; i < count; i++)
+    {
+        const size_t kind = in.below(10);
+        std::vector<uint8_t> s;
+        if (kind <= 5)
+        {
+            s.assign(16, 0);
+            put(s, 0, 0, 2);
+            s[4] = (i + 1 == count) ? static_cast<uint8_t>(in.chance(8) ? 0 : 1) : static_cast<uint8_t>(in.chance(8));
+            s[5] = in.chance(16) ? in.u8() : 0;
+            put(s, 6, in.chance(16) ? in.u16() : 0, 2);
+            put(s, 8, in.chance(16) ? in.u64() : 0xFED90000ULL + 0x1000 * i, 8);
+        }
+        else if (kind <= 7)
+        {
+            s.assign(24, 0);
+            put(s, 0, 1, 2);
+            put(s, 6, in.chance(16) ? in.u16() : 0, 2);
+            const u64 base = in.chance(16) ? in.u64() : 0x7C000000ULL + (in.below(64) << 20);
+            put(s, 8, base, 8);
+            put(s, 16, in.chance(16) ? in.u64() : base + (in.range(1, 64) << 20) - 1, 8);
+        }
+        else
+        {
+            static const uint16_t OTHER_KINDS[] = {2, 3, 4, 5, 6, 0x7F, 0xFFFF};
+            s = fuzz::noise(in.u32(), 4 + in.below(40));
+            put(s, 0, in.pick(OTHER_KINDS), 2);
+        }
+        if (kind <= 7)
+        {
+            const size_t scopes = in.chance(16) ? in.below(20) : in.below(4);
+            for (size_t n = 0; n < scopes; n++)
+            {
+                std::vector<uint8_t> d = dmar_scope(in);
+                s.insert(s.end(), d.begin(), d.end());
+            }
+        }
+        put(s, 2, s.size(), 2);
+        if (in.chance(32))
+        {
+            put(s, 2, in.boolean() ? in.below(s.size()) : s.size() + in.range(1, 64), 2);
+            fuzz::reached("a DMAR structure of the wrong length");
+        }
+        body.insert(body.end(), s.begin(), s.end());
+    }
+    if (in.chance(32))
+        body.resize(in.below(body.size() + 1));
+    return body;
+}
+
+/* An MCFG: segment 0's window mostly, others before it, a window not a MiB
+   aligned, past the address space, of no buses; or Hertz's */
+std::vector<uint8_t> mcfg_body(fuzz::Input& in)
+{
+    if (in.chance(8))
+    {
+        fuzz::reached("Hertz's MCFG");
+        return std::vector<uint8_t>(HERTZ_MCFG, HERTZ_MCFG + sizeof(HERTZ_MCFG));
+    }
+    std::vector<uint8_t> body = fuzz::noise(in.u32(), 8);
+    for (size_t n = in.chance(16) ? in.below(6) : in.range(1, 2); n > 0; n--)
+    {
+        std::vector<uint8_t> e(16, 0);
+        u64 base = in.chance(4) ? 0xB0000000ULL : 0xE0000000ULL;
+        if (in.chance(16))
+            base = in.chance(4) ? (in.u64() & ~0xFFFFFULL) >> in.below(40) : in.u64() >> in.below(64);
+        put(e, 0, base, 8);
+        put(e, 8, in.chance(16) ? in.u16() : 0, 2);
+        e[10] = in.chance(16) ? in.u8() : 0;
+        e[11] = in.chance(16) ? in.u8() : 0xFF;
+        body.insert(body.end(), e.begin(), e.end());
+    }
+    if (in.chance(16))
+        body.resize(in.below(body.size() + 1));
+    return body;
+}
+
 /* Where a table goes: below 4 GiB, or for an XSDT's anywhere; now and then
    with its header across a page's end, or over another table */
 struct Placer
@@ -608,9 +756,43 @@ struct Override
     u16 flags;
 };
 
+struct Scope
+{
+    u8 type;
+    u8 id;
+    u8 bus;
+    std::vector<std::pair<u8, u8>> path;
+};
+
+struct Unit
+{
+    u64 base;
+    u16 segment;
+    bool all;
+    u8 size;
+    std::vector<Scope> scopes;
+};
+
+struct Region
+{
+    u64 base;
+    u64 limit;
+    u16 segment;
+    std::vector<Scope> scopes;
+};
+
 struct Expected
 {
     bool ok = false;
+    bool dmar = false;
+    bool dmar_whole = false;
+    u8 dmar_width = 0;
+    u8 dmar_flags = 0;
+    std::vector<Unit> units;
+    std::vector<Region> regions;
+    u64 mcfg_base = 0;
+    u8 mcfg_start = 0;
+    u8 mcfg_end = 0;
     u64 lapic = 0;
     u64 io_apic = 0;
     std::vector<ulong> cpus;
@@ -946,6 +1128,120 @@ void read_wdat(u64 wdat, u64 len, Expected& e)
     e.wdat = true;
 }
 
+/* The scopes in [at, end): false where one is cut, is of a length not six
+   bytes and a path, has more hops than acpi.h keeps, or is one more than it
+   keeps -- those before it kept all the same */
+bool read_scopes(u64 at, u64 end, std::vector<Scope>& scopes)
+{
+    while (at < end)
+    {
+        if (end - at < 6)
+            return false;
+        const u64 len = peek(at + 1);
+        if (len < 6 || len > end - at || (len - 6) % 2 != 0 || (len - 6) / 2 > Acpi::MAX_DMAR_PATH ||
+            scopes.size() >= Acpi::MAX_DMAR_SCOPES)
+            return false;
+        Scope s = {peek(at), peek(at + 4), peek(at + 5), {}};
+        for (u64 h = 0; h < (len - 6) / 2; h++)
+            s.path.push_back({peek(at + 6 + 2 * h), peek(at + 7 + 2 * h)});
+        scopes.push_back(s);
+        at += len;
+    }
+    return true;
+}
+
+void read_dmar(u64 dmar, u64 len, Expected& e)
+{
+    if (len < HDR + 12)
+        return;
+    e.dmar = true;
+    e.dmar_whole = true;
+    const u8 haw = peek(dmar + HDR);
+    e.dmar_width = (haw >= 63) ? 64 : static_cast<u8>(haw + 1);
+    e.dmar_flags = peek(dmar + HDR + 1);
+    for (u64 at = HDR + 12; at < len; )
+    {
+        if (len - at < 4)
+        {
+            e.dmar_whole = false;
+            return;
+        }
+        const u64 type = read(dmar + at, 2), s_len = read(dmar + at + 2, 2);
+        if (s_len < 4 || s_len > len - at)
+        {
+            e.dmar_whole = false;
+            return;
+        }
+        const u64 s = dmar + at;
+        at += s_len;
+        if (type == 0)
+        {
+            if (s_len < 16 || e.units.size() >= Acpi::MAX_DMAR_UNITS)
+            {
+                e.dmar_whole = false;
+                continue;
+            }
+            Unit u = {read(s + 8, 8), static_cast<u16>(read(s + 6, 2)), (peek(s + 4) & 1) != 0, peek(s + 5), {}};
+            if (!read_scopes(s + 16, s + s_len, u.scopes))
+                e.dmar_whole = false;
+            e.units.push_back(u);
+        }
+        else if (type == 1)
+        {
+            if (s_len < 24 || e.regions.size() >= Acpi::MAX_DMAR_RESERVED)
+            {
+                e.dmar_whole = false;
+                continue;
+            }
+            Region r = {read(s + 8, 8), read(s + 16, 8), static_cast<u16>(read(s + 6, 2)), {}};
+            if (!read_scopes(s + 24, s + s_len, r.scopes))
+                e.dmar_whole = false;
+            e.regions.push_back(r);
+        }
+    }
+}
+
+void read_mcfg(u64 mcfg, u64 len, Expected& e)
+{
+    if (len < HDR + 8)
+        return;
+    for (u64 i = 0; i < (len - HDR - 8) / 16; i++)
+    {
+        const u64 at = mcfg + HDR + 8 + 16 * i;
+        const u64 base = read(at, 8), segment = read(at + 8, 2);
+        const u8 start = peek(at + 10), end = peek(at + 11);
+        const u64 span = static_cast<u64>(end + 1) << 20;
+        if (segment != 0 || base == 0 || start > end || (base & 0xFFFFF) != 0 || base > MAX_PHYS ||
+            span > MAX_PHYS - base)
+            continue;
+        e.mcfg_base = base;
+        e.mcfg_start = start;
+        e.mcfg_end = end;
+        return;
+    }
+}
+
+/* A kept scope against the reader's */
+bool same_scopes(const Acpi::DmarScope* kept, size_t count, const std::vector<Scope>& scopes)
+{
+    if (count != scopes.size())
+        return false;
+    for (size_t i = 0; i < count; i++)
+    {
+        const Acpi::DmarScope& k = kept[i];
+        const Scope& s = scopes[i];
+        if (k.type != s.type || k.enumeration_id != s.id || k.start_bus != s.bus || k.path_length != s.path.size())
+            return false;
+        for (size_t h = 0; h < Acpi::MAX_DMAR_PATH; h++)
+        {
+            const std::pair<u8, u8> hop = (h < s.path.size()) ? s.path[h] : std::pair<u8, u8>(0, 0);
+            if (k.path[h][0] != hop.first || k.path[h][1] != hop.second)
+                return false;
+        }
+    }
+    return true;
+}
+
 Expected read_machine()
 {
     Expected e;
@@ -958,7 +1254,7 @@ Expected read_machine()
         return e;
 
     /* The first of each kind read that can be mapped */
-    static const char* const KINDS[] = {"APIC", "FACP", "HPET", "WDAT"};
+    static const char* const KINDS[] = {"APIC", "FACP", "HPET", "WDAT", "DMAR", "MCFG"};
     static_assert(sizeof(KINDS) / sizeof(KINDS[0]) == Acpi::MAX_TABLES, "a kind for each table read");
     u64 table[Acpi::MAX_TABLES] = {}, len[Acpi::MAX_TABLES] = {};
     const int size = xsdt ? 8 : 4;
@@ -985,6 +1281,10 @@ Expected read_machine()
         read_hpet(table[2], len[2], e);
     if (len[3] != 0)
         read_wdat(table[3], len[3], e);
+    if (len[4] != 0)
+        read_dmar(table[4], len[4], e);
+    if (len[5] != 0)
+        read_mcfg(table[5], len[5], e);
     read_dsdt(e);
     e.ok = true;
     return e;
@@ -1062,6 +1362,10 @@ void run(fuzz::Input& in)
         tables.push_back({"HPET", sdt("HPET", hpet_body(in))});
     if (in.chance(96))
         tables.push_back({"WDAT", sdt("WDAT", wdat_body(in))});
+    if (in.boolean())
+        tables.push_back({"DMAR", sdt("DMAR", dmar_body(in))});
+    if (in.boolean())
+        tables.push_back({"MCFG", sdt("MCFG", mcfg_body(in))});
     for (auto& t : tables)
     {
         if (in.chance(8))
@@ -1290,6 +1594,44 @@ void run(fuzz::Input& in)
         "the HPET at 0x%lx tick %u, not 0x%lx %u", acpi.get_hpet_base_phys(), acpi.get_hpet_min_tick(), e.hpet_base,
         e.hpet_tick);
     INVARIANT(acpi.has_firmware_watchdog() == e.wdat, "a firmware watchdog %s", e.wdat ? "missed" : "from nowhere");
+
+    INVARIANT(acpi.has_dmar() == e.dmar, "a DMAR %s", e.dmar ? "missed" : "from nowhere");
+    INVARIANT(acpi.dmar_complete() == (e.dmar && e.dmar_whole), "the DMAR said %s, where it is %s",
+        acpi.dmar_complete() ? "whole" : "not whole", (e.dmar && e.dmar_whole) ? "whole" : "not");
+    if (e.dmar)
+    {
+        INVARIANT(acpi.get_dmar_width() == e.dmar_width && acpi.get_dmar_flags() == e.dmar_flags,
+            "the DMAR's width %u flags 0x%x, not %u 0x%x", acpi.get_dmar_width(), acpi.get_dmar_flags(), e.dmar_width,
+            e.dmar_flags);
+        INVARIANT(acpi.get_dmar_unit_count() == e.units.size() && acpi.get_dmar_reserved_count() == e.regions.size(),
+            "%zu units and %zu regions kept, where the DMAR has %zu and %zu", acpi.get_dmar_unit_count(),
+            acpi.get_dmar_reserved_count(), e.units.size(), e.regions.size());
+        for (size_t i = 0; i < e.units.size(); i++)
+        {
+            const Acpi::DmarUnit* u = acpi.get_dmar_unit(i);
+            const Unit& x = e.units[i];
+            INVARIANT(u != nullptr && u->base == x.base && u->segment == x.segment && u->include_all == x.all &&
+                u->size == x.size && same_scopes(u->scope, u->scope_count, x.scopes), "unit %zu not the DMAR's", i);
+        }
+        for (size_t i = 0; i < e.regions.size(); i++)
+        {
+            const Acpi::DmarReserved* r = acpi.get_dmar_reserved(i);
+            const Region& x = e.regions[i];
+            INVARIANT(r != nullptr && r->base == x.base && r->limit == x.limit && r->segment == x.segment &&
+                same_scopes(r->scope, r->scope_count, x.scopes), "reserved region %zu not the DMAR's", i);
+        }
+        INVARIANT(acpi.get_dmar_unit(e.units.size()) == nullptr && acpi.get_dmar_reserved(e.regions.size()) == nullptr,
+            "a unit or a region past the count");
+        if (e.dmar_whole && e.units.size() >= 2)
+            fuzz::reached("a DMAR of two units, whole");
+        if (!e.dmar_whole)
+            fuzz::reached("a DMAR not kept whole");
+    }
+    INVARIANT(acpi.get_mcfg_base() == e.mcfg_base && acpi.get_mcfg_start_bus() == e.mcfg_start &&
+        acpi.get_mcfg_end_bus() == e.mcfg_end, "ECAM at 0x%lx buses %u-%u, not 0x%llx %u-%u", acpi.get_mcfg_base(),
+        acpi.get_mcfg_start_bus(), acpi.get_mcfg_end_bus(), (ull)e.mcfg_base, e.mcfg_start, e.mcfg_end);
+    if (e.mcfg_base != 0)
+        fuzz::reached("an ECAM window");
 
     fuzz::reached("a machine");
     if (e.cpus.size() > 1)

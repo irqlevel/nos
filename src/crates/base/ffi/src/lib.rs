@@ -15,6 +15,7 @@ pub mod frame;
 pub mod random;
 pub mod pci;
 pub mod msix;
+pub mod iommu;
 pub mod input;
 pub mod interrupt;
 pub mod softirq;
