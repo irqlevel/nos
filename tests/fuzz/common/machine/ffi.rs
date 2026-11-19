@@ -639,6 +639,37 @@ pub extern "C" fn kernel_cpu_idle_ns(_cpu: u32) -> u64 {
     0
 }
 
+/// One NUMA node, as a machine whose firmware names none is: every CPU and
+/// every page its.
+#[no_mangle]
+pub extern "C" fn kernel_numa_node_count() -> usize {
+    1
+}
+
+/// The one node's distance to itself; none to a node it has not.
+#[no_mangle]
+pub extern "C" fn kernel_numa_distance(from: usize, to: usize) -> u32 {
+    if from == 0 && to == 0 { 10 } else { 255 }
+}
+
+/// The one node: the machine's CPUs and its gigabyte, half of it free, as
+/// `kernel_mem_info` says the machine; 0 and `out` zeroed past it.
+///
+/// # Safety
+/// `out` is writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_numa_node_info(node: usize, out: *mut ffi::numa::NumaNode) -> i32 {
+    let info = if node == 0 {
+        ffi::numa::NumaNode { domain: 0, cpus: kernel_cpu_online_mask() as u64, usable_bytes: (1 << 18) * 4096,
+                              free_pages: 1 << 17, zeroed_pages: 0, huge_blocks: 0, huge_free: 0 }
+    } else {
+        ffi::numa::NumaNode::default()
+    };
+    // SAFETY: the caller's struct.
+    unsafe { *out = info };
+    i32::from(node == 0)
+}
+
 /// The machine's tasks, as the kernel's table copies them.
 ///
 /// # Safety
