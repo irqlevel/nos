@@ -185,6 +185,13 @@ entry stays the fallback. So:
   -- is followed by the server's own system after a reset (Hetzner's robot
   can do one), with nothing left to undo.
 
+On a server with nobody to reset it -- no robot, no BMC -- give a boot that
+tries something `--cmdline deadman=N` as well: a nos that has not been told
+`deadman off` N seconds into its boot panics, and `panic=10` resets it, so one
+that never reached the network is back on the server's own system by itself
+([Kernel parameters](kernel-parameters.md)). Not on a machine that boots nos
+every time, unless its `/etc/rc` calls it off.
+
 The kernel's command line is `root=UUID=<the partition> dhcp=auto dns=on
 panic=10` and whatever this machine was given (`--udpshell`, `--netconsole`,
 `--cmdline`) -- `panic=10` resets a nos that panics ten seconds after its

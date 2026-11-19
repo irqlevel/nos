@@ -112,6 +112,21 @@ void panic_print_string(const char *s)
         VgaTerm::get_instance().panic_print_string(s);
 }
 
+void hold(bool on)
+{
+    if (!fb_active)
+        return;
+    if (on)
+        FbTerm::get_instance().hold();
+    else
+        FbTerm::get_instance().unhold();
+}
+
+bool release_within(ulong base, ulong size)
+{
+    return fb_active && FbTerm::get_instance().release_within(base, size);
+}
+
 }
 
 }

@@ -25,6 +25,8 @@ FbTerm::FbTerm()
     , rows_(0)
     , row_(0)
     , column_(0)
+    , released_(0)
+    , holds_(0)
 {
     stdlib::mem_set(&info_, 0, sizeof(info_));
 }
@@ -33,6 +35,55 @@ FbTerm::~FbTerm()
 {
     /* The framebuffer mapping is permanent (map_mmio_region), so there is
        nothing to release; the console lives for the whole boot. */
+}
+
+bool FbTerm::drawing()
+{
+    return fb_ != nullptr && released_.get() == 0 && holds_.get() == 0;
+}
+
+void FbTerm::hold()
+{
+    /* Under the lock: a draw under way is done before it returns, and
+       every draw ends in a flush */
+    stdlib::AutoLock lock(lock_);
+
+    holds_.inc();
+}
+
+void FbTerm::unhold()
+{
+    stdlib::AutoLock lock(lock_);
+
+    if (holds_.get() > 0)
+        holds_.dec();
+}
+
+bool FbTerm::release_within(ulong base, ulong size)
+{
+    stdlib::AutoLock lock(lock_);
+
+    /* Held or not: what is asked is whose the framebuffer is */
+    if (fb_ == nullptr || released_.get() != 0 || size == 0)
+        return false;
+
+    /* Whether [phy_addr, phy_addr + the framebuffer's bytes) and
+       [base, base + size) meet: each begins before the other ends. A span
+       that would run past the top of the address space is taken to reach
+       it; the framebuffer's own was mapped whole, so it does not. */
+    const ulong fb_end = info_.phy_addr + (ulong)info_.pitch * info_.height;
+    ulong end = 0;
+    if (__builtin_add_overflow(base, size, &end))
+        end = ~0UL;
+    if (info_.phy_addr >= end || base >= fb_end)
+        return false;
+
+    /* Every draw ends in a flush, so nothing of ours is on its way there;
+       from here on nothing is. No log line under lock_: the screen is one
+       of the log's consoles, and printing takes it. */
+    hal::wc_flush();
+    released_.set(1);
+    return true;
 }
 
 u32 FbTerm::pack_color(u8 r, u8 g, u8 b)
@@ -398,7 +449,7 @@ void FbTerm::cls()
 {
     stdlib::AutoLock lock(lock_);
 
-    if (fb_ == nullptr)
+    if (!drawing())
         return;
 
     cls_lock_held();
@@ -415,7 +466,7 @@ void FbTerm::v_printf(const char *fmt, va_list args)
 
     stdlib::AutoLock lock(lock_);
 
-    if (fb_ == nullptr)
+    if (!drawing())
         return;
 
     puts_lock_held(str);
@@ -434,7 +485,7 @@ void FbTerm::print_string(const char *s)
 {
     stdlib::AutoLock lock(lock_);
 
-    if (fb_ == nullptr)
+    if (!drawing())
         return;
 
     puts_lock_held(s);
@@ -456,8 +507,13 @@ void FbTerm::panic_print_string(const char *s)
      * once and held to the grid, and every cell written is one the copy
      * names. What two CPUs draw between them may come out garbled; none of
      * it is outside the grid.
+     *
+     * A framebuffer released (release_within) is not drawn into: released_
+     * is read here without the lock, as an atomic. A panic that read it
+     * before a release on another CPU still draws -- into a mapping that
+     * stays, so into the device, never past the grid.
      */
-    if (fb_ == nullptr || rows_ == 0 || cols_ == 0)
+    if (!drawing() || rows_ == 0 || cols_ == 0)
         return;
 
     Cursor at = { row_, column_ };
@@ -473,7 +529,7 @@ void FbTerm::backspace()
 {
     stdlib::AutoLock lock(lock_);
 
-    if (fb_ == nullptr)
+    if (!drawing())
         return;
 
     draw_cursor(Cursor{ row_, column_ }, false);
