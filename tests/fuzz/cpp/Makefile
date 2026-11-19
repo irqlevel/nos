@@ -55,13 +55,14 @@ SRC_grubenv := $(COMMON) tests/fuzz/cpp/targets/grubenv.cpp \
 SRC_module := $(COMMON) $(HEAP) $(CPU) tests/fuzz/cpp/targets/module.cpp \
               src/base/lib/error.cpp
 SRC_pagetable := $(COMMON) $(HEAP) $(CPU) tests/fuzz/cpp/targets/pagetable.cpp \
-                 src/base/mm/page_table.cpp src/base/mm/memory_map.cpp src/base/lib/error.cpp
+                 src/base/mm/page_table.cpp src/base/mm/memory_map.cpp src/base/kernel/numa.cpp \
+                 src/base/lib/error.cpp
 SRC_cmdline := $(COMMON) tests/fuzz/cpp/targets/cmdline.cpp src/base/kernel/parameters.cpp
 # arch/x86_64/grub.cpp is the target's own file's: it includes it
 SRC_multiboot := $(COMMON) tests/fuzz/cpp/targets/multiboot.cpp src/base/mm/memory_map.cpp \
                  src/base/kernel/parameters.cpp
 SRC_acpi := $(COMMON) $(CPU) tests/fuzz/cpp/targets/acpi.cpp src/base/drivers/acpi.cpp \
-            src/base/lib/error.cpp
+            src/base/kernel/numa.cpp src/base/lib/error.cpp
 # lib/format.cpp is COMMON's
 SRC_format := $(COMMON) tests/fuzz/cpp/targets/format.cpp
 SRC_ucode := $(COMMON) tests/fuzz/cpp/targets/ucode.cpp src/base/arch/x86_64/microcode_file.cpp

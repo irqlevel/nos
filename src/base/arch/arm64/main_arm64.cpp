@@ -19,6 +19,7 @@
 #include <kernel/dmesg.h>
 #include <kernel/parameters.h>
 #include <kernel/memsites.h>
+#include <kernel/numa.h>
 #include <kernel/tracepoint.h>
 #include <kernel/ubsan.h>
 #include <kernel/time.h>

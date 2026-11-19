@@ -33,6 +33,7 @@
 
 #define private public
 #include <drivers/acpi.h>
+#include <kernel/numa.h>
 #include <kernel/cpu.h>
 #include <mm/page_table.h>
 #undef private
@@ -686,6 +687,174 @@ std::vector<uint8_t> dmar_body(fuzz::Input& in)
     return body;
 }
 
+/* The SRAT's CPU entry: its local APIC id's (16 bytes) or its x2APIC id's
+   (24), its domain's low byte where a revision 2 table has the other three
+   after the SAPIC EID */
+std::vector<uint8_t> srat_cpu(u32 domain, u32 apic, bool x2apic, bool enabled)
+{
+    std::vector<uint8_t> e(x2apic ? 24 : 16, 0);
+    e[0] = x2apic ? 2 : 0;
+    e[1] = static_cast<uint8_t>(e.size());
+    if (x2apic)
+    {
+        put(e, 4, domain, 4);
+        put(e, 8, apic, 4);
+        put(e, 12, enabled ? 1 : 0, 4);
+    }
+    else
+    {
+        e[2] = static_cast<uint8_t>(domain);
+        e[3] = static_cast<uint8_t>(apic);
+        put(e, 4, enabled ? 1 : 0, 4);
+        put(e, 9, domain >> 8, 3);
+    }
+    return e;
+}
+
+std::vector<uint8_t> srat_memory(u32 domain, u64 base, u64 len, u32 flags)
+{
+    std::vector<uint8_t> e(40, 0);
+    e[0] = 1;
+    e[1] = 40;
+    put(e, 2, domain, 4);
+    put(e, 8, base, 8);
+    put(e, 16, len, 8);
+    put(e, 28, flags, 4);
+    return e;
+}
+
+/* The Supermicro X10DRi's SRAT (two E5-2670 v3, 256 GiB), as its firmware
+   lays it out: 192 local APIC entries, 48 of them enabled -- each socket's
+   cores, then their siblings -- and the rest a domain of 2 and an id of 0xFF;
+   33 memory entries, 3 of them enabled; revision 3. Its SLIT is 10 and 21. */
+std::vector<uint8_t> newton_srat()
+{
+    std::vector<uint8_t> body(12, 0);
+    body[0] = 1;
+    for (u32 sibling = 0; sibling < 2; sibling++)
+    {
+        for (u32 apic = sibling; apic < 0x3C; apic += 2)
+        {
+            if ((apic & 0xF) >= 0xC)
+                continue;
+            const std::vector<uint8_t> e = srat_cpu(apic >= 0x20 ? 1 : 0, apic, false, true);
+            body.insert(body.end(), e.begin(), e.end());
+        }
+    }
+    for (int i = 0; i < 144; i++)
+    {
+        const std::vector<uint8_t> e = srat_cpu(2, 0xFF, false, false);
+        body.insert(body.end(), e.begin(), e.end());
+    }
+    const u64 GIB = 1ULL << 30;
+    const std::vector<uint8_t> m0 = srat_memory(0, 0, 2 * GIB, 1);
+    const std::vector<uint8_t> m1 = srat_memory(0, 4 * GIB, 126 * GIB, 1);
+    const std::vector<uint8_t> m2 = srat_memory(1, 130 * GIB, 128 * GIB, 1);
+    body.insert(body.end(), m0.begin(), m0.end());
+    body.insert(body.end(), m1.begin(), m1.end());
+    body.insert(body.end(), m2.begin(), m2.end());
+    for (int i = 0; i < 30; i++)
+    {
+        const std::vector<uint8_t> e = srat_memory(0, 0, 0, 0);
+        body.insert(body.end(), e.begin(), e.end());
+    }
+    return body;
+}
+
+/* An SRAT: CPUs of a few domains -- mostly ids the MADT may give, now and
+   then their x2APIC entries, disabled ones, ids past what is kept -- and
+   ranges of memory, mostly in order and apart, now and then touching,
+   overlapping, empty or wrapping; a domain now and then far from the others,
+   more domains than are kept, a structure cut, of no length, or shorter than
+   its fields; or the X10DRi's. The revision is the caller's to set. */
+std::vector<uint8_t> srat_body(fuzz::Input& in, bool& wide)
+{
+    if (in.chance(24))
+    {
+        wide = true;
+        fuzz::reached("the X10DRi's SRAT");
+        return newton_srat();
+    }
+    wide = in.boolean();
+    std::vector<uint8_t> body(12, 0);
+    body[0] = 1;
+    const u32 domains = in.chance(32) ? 17 + in.below(4) : 1 + in.below(4);
+    std::vector<u32> named;
+    for (u32 i = 0; i < domains; i++)
+        named.push_back(in.chance(16) ? in.u32() : (wide && in.chance(16) ? 0x100 * in.range(1, 3) : 0) + i);
+    std::vector<std::vector<uint8_t>> entries;
+    for (size_t n = in.chance(16) ? in.below(80) : in.below(12); n > 0; n--)
+    {
+        const u32 apic = in.chance(16) ? in.below(256) : in.below(16);
+        entries.push_back(srat_cpu(named[in.below(named.size())], apic, in.chance(48), !in.chance(8)));
+    }
+    u64 at = in.chance(4) ? 0 : in.below(1ULL << 30);
+    for (size_t n = in.chance(16) ? in.below(70) : in.below(6); n > 0; n--)
+    {
+        u64 len = (1ULL << 20) * in.range(1, 1 << 12);
+        if (in.chance(16))
+            len = in.chance(128) ? 0 : ~0ULL - in.below(1 << 20);
+        u64 base = at;
+        if (in.chance(12))
+            base = at - std::min<u64>(at, in.below(1ULL << 28));
+        entries.push_back(srat_memory(named[in.below(named.size())], base, len, in.chance(12) ? 0 : in.range(1, 7)));
+        at = base + len + (in.chance(64) ? 0 : (1ULL << 20) * in.below(1 << 10));
+    }
+    if (in.chance(16))
+    {
+        /* Another kind's: a GICC's, a generic initiator's */
+        std::vector<uint8_t> other = fuzz::noise(in.u32(), in.range(2, 40));
+        other[0] = static_cast<uint8_t>(in.range(3, 6));
+        other[1] = static_cast<uint8_t>(other.size());
+        entries.push_back(other);
+    }
+    for (size_t i = entries.size(); i > 1; i--)
+    {
+        if (in.chance(64))
+            std::swap(entries[i - 1], entries[in.below(i)]);
+    }
+    for (const auto& e : entries)
+        body.insert(body.end(), e.begin(), e.end());
+    if (in.chance(16) && body.size() > 12)
+    {
+        /* Damaged: an entry of no length, one past the end, or the table cut
+           in one */
+        const size_t i = 12 + in.below(body.size() - 12);
+        if (in.boolean())
+            body[i] = static_cast<uint8_t>(in.below(3));
+        else
+            body.resize(i);
+        fuzz::reached("an SRAT damaged");
+    }
+    return body;
+}
+
+/* A SLIT: a locality a domain, a diagonal of 10 and more across mostly; now
+   and then a distance under 10, a diagonal that is not 10, more localities
+   than the table has bytes for, or none; or the X10DRi's */
+std::vector<uint8_t> slit_body(fuzz::Input& in, bool newton)
+{
+    std::vector<uint8_t> body;
+    u64 count = newton ? 2 : in.range(1, 5);
+    put(body, 0, count, 8);
+    for (u64 i = 0; i < count; i++)
+    {
+        for (u64 j = 0; j < count; j++)
+            body.push_back(static_cast<uint8_t>(i == j ? 10 : newton ? 21 : 10 + in.below(50)));
+    }
+    if (!newton && in.chance(32))
+    {
+        body[8 + in.below(count * count)] = static_cast<uint8_t>(in.below(10));
+        fuzz::reached("a SLIT that does not hold");
+    }
+    if (!newton && in.chance(16))
+    {
+        put(body, 0, in.chance(64) ? 0 : in.chance(128) ? count + 1 : in.u64(), 8);
+        fuzz::reached("a SLIT of more localities than bytes");
+    }
+    return body;
+}
+
 /* An MCFG: segment 0's window mostly, others before it, a window not a MiB
    aligned, past the address space, of no buses; or Hertz's */
 std::vector<uint8_t> mcfg_body(fuzz::Input& in)
@@ -781,9 +950,34 @@ struct Region
     std::vector<Scope> scopes;
 };
 
+/* What the reader makes of the SRAT and the SLIT: what Numa is told */
+struct NumaSaid
+{
+    /* A structure cut, of no length, or shorter than its fields: one node,
+       whatever else was said */
+    bool refused = false;
+    /* More domains or ranges than kept, a CPU in two domains: one node */
+    bool overflow = false;
+    /* Ascending */
+    std::vector<u32> domains;
+    /* APIC id -> domain */
+    std::map<ulong, u32> cpu;
+    struct Range
+    {
+        u64 base;
+        u64 end;
+        u32 domain;
+    };
+    std::vector<Range> ranges;
+    bool slit = false;
+    /* By the domains' places */
+    std::vector<std::vector<u8>> dist;
+};
+
 struct Expected
 {
     bool ok = false;
+    NumaSaid numa;
     bool dmar = false;
     bool dmar_whole = false;
     u8 dmar_width = 0;
@@ -1242,6 +1436,266 @@ bool same_scopes(const Acpi::DmarScope* kept, size_t count, const std::vector<Sc
     return true;
 }
 
+/* A domain among those said, in its place: false when there are as many as
+   Numa keeps and it is not one of them */
+bool numa_domain(NumaSaid& n, u32 domain)
+{
+    auto it = std::lower_bound(n.domains.begin(), n.domains.end(), domain);
+    if (it != n.domains.end() && *it == domain)
+        return true;
+    if (n.domains.size() == Numa::MAX_NODES)
+        return false;
+    n.domains.insert(it, domain);
+    return true;
+}
+
+void read_srat(u64 srat, u64 len, Expected& e)
+{
+    NumaSaid& n = e.numa;
+    if (len < HDR + 12)
+    {
+        n.refused = true;
+        return;
+    }
+    const bool wide = peek(srat + 8) >= 2;
+    for (u64 at = HDR + 12; at < len;)
+    {
+        if (len - at < 2)
+        {
+            n.refused = true;
+            break;
+        }
+        const u64 st = srat + at;
+        const u8 type = peek(st);
+        const u64 st_len = peek(st + 1);
+        if (st_len < 2 || st_len > len - at)
+        {
+            n.refused = true;
+            break;
+        }
+        at += st_len;
+        if (type == 0 || type == 2)
+        {
+            const bool x2 = (type == 2);
+            if (st_len < (x2 ? 24u : 16u))
+            {
+                n.refused = true;
+                continue;
+            }
+            if ((read(st + (x2 ? 12 : 4), 4) & 1) == 0)
+                continue;
+            u32 domain = x2 ? static_cast<u32>(read(st + 4, 4)) : peek(st + 2);
+            if (!x2 && wide)
+                domain |= static_cast<u32>(read(st + 9, 3)) << 8;
+            const u64 apic = x2 ? read(st + 8, 4) : peek(st + 3);
+            if (apic >= MAX_CPUS)
+                continue;
+            if (!numa_domain(n, domain))
+            {
+                n.overflow = true;
+                continue;
+            }
+            auto it = n.cpu.find(apic);
+            if (it != n.cpu.end() && it->second != domain)
+            {
+                n.overflow = true;
+                continue;
+            }
+            n.cpu[apic] = domain;
+        }
+        else if (type == 1)
+        {
+            if (st_len < 40)
+            {
+                n.refused = true;
+                continue;
+            }
+            if ((read(st + 28, 4) & 1) == 0)
+                continue;
+            const u32 domain = static_cast<u32>(read(st + 2, 4));
+            const u64 base = read(st + 8, 8);
+            const u64 length = read(st + 16, 8);
+            if (length == 0 || base > ~0ULL - length)
+                continue;
+            if (!numa_domain(n, domain))
+            {
+                n.overflow = true;
+                continue;
+            }
+            if (n.ranges.size() == Numa::MAX_RANGES)
+            {
+                n.overflow = true;
+                continue;
+            }
+            n.ranges.push_back({base, base + length, domain});
+        }
+    }
+}
+
+void read_slit(u64 slit, u64 len, Expected& e)
+{
+    NumaSaid& n = e.numa;
+    if (len < HDR + 8 || n.domains.empty())
+        return;
+    const u64 count = read(slit + HDR, 8);
+    const u64 room = len - HDR - 8;
+    if (count == 0 || count > room || count * count > room)
+        return;
+    for (u32 d : n.domains)
+    {
+        if (d >= count)
+            return;
+    }
+    n.slit = true;
+    n.dist.assign(n.domains.size(), std::vector<u8>(n.domains.size(), 0));
+    for (size_t i = 0; i < n.domains.size(); i++)
+    {
+        for (size_t j = 0; j < n.domains.size(); j++)
+            n.dist[i][j] = peek(slit + HDR + 8 + n.domains[i] * count + n.domains[j]);
+    }
+}
+
+/* What Numa is to be once sealed over the CPUs the MADT gave: one node where
+   the tables did not hold together, or named one domain or none */
+struct NumaWant
+{
+    ulong nodes = 1;
+    std::map<ulong, ulong> cpu_node;
+    std::vector<NumaSaid::Range> ranges;
+    std::vector<ulong> range_node;
+    std::vector<std::vector<ulong>> dist;
+    std::vector<std::vector<ulong>> fallback;
+};
+
+ulong domain_place(const NumaSaid& n, u32 domain)
+{
+    return static_cast<ulong>(std::lower_bound(n.domains.begin(), n.domains.end(), domain) - n.domains.begin());
+}
+
+NumaWant numa_want(const NumaSaid& n, const std::vector<ulong>& cpus)
+{
+    NumaWant w;
+    if (n.refused || n.overflow)
+        return w;
+    std::vector<NumaSaid::Range> sorted = n.ranges;
+    std::stable_sort(sorted.begin(), sorted.end(),
+        [](const NumaSaid::Range& a, const NumaSaid::Range& b) { return a.base < b.base; });
+    std::vector<NumaSaid::Range> kept;
+    for (const auto& r : sorted)
+    {
+        if (!kept.empty())
+        {
+            NumaSaid::Range& last = kept.back();
+            if (r.base < last.end && r.domain != last.domain)
+                return w;
+            if (r.base <= last.end && r.domain == last.domain)
+            {
+                last.end = std::max(last.end, r.end);
+                continue;
+            }
+        }
+        kept.push_back(r);
+    }
+    if (n.domains.size() <= 1)
+        return w;
+
+    w.nodes = n.domains.size();
+    for (ulong c : cpus)
+    {
+        auto it = n.cpu.find(c);
+        w.cpu_node[c] = (it == n.cpu.end()) ? 0 : domain_place(n, it->second);
+    }
+    w.ranges = kept;
+    for (const auto& r : kept)
+        w.range_node.push_back(domain_place(n, r.domain));
+
+    bool holds = n.slit;
+    for (size_t i = 0; holds && i < w.nodes; i++)
+    {
+        for (size_t j = 0; holds && j < w.nodes; j++)
+            holds = (i == j) ? n.dist[i][j] == Numa::LOCAL_DISTANCE : n.dist[i][j] >= Numa::LOCAL_DISTANCE;
+    }
+    w.dist.assign(w.nodes, std::vector<ulong>(w.nodes, 0));
+    for (size_t i = 0; i < w.nodes; i++)
+    {
+        for (size_t j = 0; j < w.nodes; j++)
+            w.dist[i][j] = holds ? n.dist[i][j] : (i == j ? Numa::LOCAL_DISTANCE : Numa::REMOTE_DISTANCE);
+    }
+    w.fallback.assign(w.nodes, std::vector<ulong>());
+    for (ulong a = 0; a < w.nodes; a++)
+    {
+        std::vector<ulong>& f = w.fallback[a];
+        for (ulong b = 0; b < w.nodes; b++)
+        {
+            if (b != a)
+                f.push_back(b);
+        }
+        std::stable_sort(f.begin(), f.end(), [&](ulong x, ulong y) { return w.dist[a][x] < w.dist[a][y]; });
+        f.insert(f.begin(), a);
+    }
+    return w;
+}
+
+/* Numa sealed over the CPUs the CPU table took, held to what the reader made
+   of the tables */
+void check_numa(const Expected& e)
+{
+    auto& numa = Numa::get_instance();
+    ulong mask = 0;
+    for (ulong c : kernel::inserted)
+        mask |= 1UL << c;
+    numa.seal(mask);
+    const NumaWant w = numa_want(e.numa, kernel::inserted);
+
+    INVARIANT(numa.get_node_count() == w.nodes, "%lu nodes, where the tables make %lu", numa.get_node_count(),
+        w.nodes);
+    for (ulong c : kernel::inserted)
+    {
+        const ulong want = (w.nodes == 1) ? 0 : w.cpu_node.at(c);
+        INVARIANT(numa.get_cpu_node(c) == want, "CPU %lu is node %lu's, not %lu", c, numa.get_cpu_node(c), want);
+    }
+    if (w.nodes == 1)
+    {
+        for (const auto& r : e.numa.ranges)
+            INVARIANT(numa.get_phys_node(r.base) == 0, "0x%llx is node %lu's on a machine of one node", (ull)r.base,
+                numa.get_phys_node(r.base));
+        if (e.numa.refused || e.numa.overflow)
+            fuzz::reached("an SRAT set aside: one node");
+        return;
+    }
+
+    INVARIANT(numa.get_range_count() == w.ranges.size(), "%lu ranges kept, where the SRAT's are %zu",
+        numa.get_range_count(), w.ranges.size());
+    for (size_t i = 0; i < w.ranges.size(); i++)
+    {
+        ulong base = 0;
+        ulong end = 0;
+        ulong node = 0;
+        INVARIANT(numa.get_range(i, base, end, node) && base == w.ranges[i].base && end == w.ranges[i].end &&
+            node == w.range_node[i], "range %zu is 0x%lx-0x%lx node %lu, not 0x%llx-0x%llx node %lu", i, base, end,
+            node, (ull)w.ranges[i].base, (ull)w.ranges[i].end, w.range_node[i]);
+        INVARIANT(numa.get_phys_node(base) == node && numa.get_phys_node(end - 1) == node,
+            "range %zu's ends are not node %lu's", i, node);
+        const bool next_starts = (i + 1 < w.ranges.size()) && w.ranges[i + 1].base == end;
+        if (!next_starts && end != 0)
+            INVARIANT(numa.get_phys_node(end) == 0, "0x%lx, past range %zu, is node %lu's", end, i,
+                numa.get_phys_node(end));
+    }
+    for (ulong a = 0; a < w.nodes; a++)
+    {
+        for (ulong b = 0; b < w.nodes; b++)
+        {
+            INVARIANT(numa.get_distance(a, b) == w.dist[a][b], "distance %lu-%lu is %lu, not %lu", a, b,
+                (ulong)numa.get_distance(a, b), w.dist[a][b]);
+            INVARIANT(numa.get_fallback(a, b) == w.fallback[a][b], "node %lu's fallback %lu is %lu, not %lu", a, b,
+                numa.get_fallback(a, b), w.fallback[a][b]);
+        }
+    }
+    fuzz::reached(w.nodes == 2 ? "two nodes" : "more than two nodes");
+    if (e.numa.slit)
+        fuzz::reached("distances from a SLIT");
+}
+
 Expected read_machine()
 {
     Expected e;
@@ -1254,7 +1708,7 @@ Expected read_machine()
         return e;
 
     /* The first of each kind read that can be mapped */
-    static const char* const KINDS[] = {"APIC", "FACP", "HPET", "WDAT", "DMAR", "MCFG"};
+    static const char* const KINDS[] = {"APIC", "FACP", "HPET", "WDAT", "DMAR", "MCFG", "SRAT", "SLIT"};
     static_assert(sizeof(KINDS) / sizeof(KINDS[0]) == Acpi::MAX_TABLES, "a kind for each table read");
     u64 table[Acpi::MAX_TABLES] = {}, len[Acpi::MAX_TABLES] = {};
     const int size = xsdt ? 8 : 4;
@@ -1285,6 +1739,10 @@ Expected read_machine()
         read_dmar(table[4], len[4], e);
     if (len[5] != 0)
         read_mcfg(table[5], len[5], e);
+    if (len[6] != 0)
+        read_srat(table[6], len[6], e);
+    if (len[7] != 0)
+        read_slit(table[7], len[7], e);
     read_dsdt(e);
     e.ok = true;
     return e;
@@ -1366,6 +1824,16 @@ void run(fuzz::Input& in)
         tables.push_back({"DMAR", sdt("DMAR", dmar_body(in))});
     if (in.boolean())
         tables.push_back({"MCFG", sdt("MCFG", mcfg_body(in))});
+    if (in.boolean())
+    {
+        bool wide = false;
+        std::vector<uint8_t> srat = sdt("SRAT", srat_body(in, wide));
+        srat[8] = wide ? 3 : 1;
+        const bool newton = srat.size() == sizeof(Acpi::ACPISDTHeader) + 12 + 192 * 16 + 33 * 40;
+        tables.push_back({"SRAT", srat});
+        if (!in.chance(8))
+            tables.push_back({"SLIT", sdt("SLIT", slit_body(in, newton))});
+    }
     for (auto& t : tables)
     {
         if (in.chance(8))
@@ -1550,6 +2018,7 @@ void run(fuzz::Input& in)
 
     INVARIANT(err.ok() == e.ok, "the parse says %s where the machine is %s", err.ok() ? "yes" : "no",
         e.ok ? "whole" : "not one to boot");
+    check_numa(e);
     if (!e.ok)
     {
         fuzz::reached("no machine");
@@ -1657,6 +2126,9 @@ void reset()
     auto& acpi = Acpi::get_instance();
     acpi.~Acpi();
     new (&acpi) Acpi();
+    auto& numa = Numa::get_instance();
+    numa.~Numa();
+    new (&numa) Numa();
 }
 
 }

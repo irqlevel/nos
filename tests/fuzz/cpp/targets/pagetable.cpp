@@ -36,6 +36,20 @@
 // allocation (alloc_page_keeping, alloc_huge_frame) taking a page or block
 // known zero before any other and the kernel's (alloc_page) one that is
 // not; and zerofree=verify's reading of what it takes, on for some inputs.
+//
+// The machine has NUMA nodes now and then (kernel/numa.h): its memory cut
+// into ranges of two or three proximity domains -- in no order, far apart, a
+// domain with CPUs and no memory, a range given to none, a SLIT that holds
+// or does not -- and the free list, built on node 0's as the boot builds it
+// before the firmware's tables are read, spread over them
+// (spread_free_pages). Every free page is then on its own node's lists, as
+// the model works it out from the ranges it gave, and nowhere else; each
+// node's counts its lists' lengths, and the machine's their sums; an
+// allocation takes from the node of the CPU it runs on (the sequence moves
+// itself from CPU to CPU), then from each node in the order of its
+// distances; the zeroing takes a node's pages to that node's zeroed list;
+// the pool takes each node's blocks from its top; and a block of the pool
+// is handed out from the nearest node that has one, known zero first.
 #include "host.h"
 
 /* The page table and the memory map are singletons with private
@@ -44,6 +58,7 @@
 #define private public
 #include <mm/memory_map.h>
 #include <mm/page_table.h>
+#include <kernel/numa.h>
 #undef private
 
 #include <hal/cpu.h>
@@ -282,6 +297,49 @@ PageTable& tested_pt()
     return PageTable::get_instance();
 }
 
+/* The NUMA topology boot gave the machine, as the model has it: what it
+   told Numa, and what follows from that worked out here, not asked of Numa
+   -- each page's node (its range's domain's place among the domains,
+   ascending; 0 for a page no range covers), and each node's fallback order
+   (itself, then by distance and index, the SLIT's distances where they hold
+   together, 10 and 20 where not). */
+struct Topology
+{
+    ulong nodes;
+    std::vector<ulong> page_node;
+    std::vector<bool> covered;
+    /* The CPUs boot gave Numa a node for; any other is node 0's */
+    std::map<ulong, ulong> cpu_node;
+    ulong cpus;
+    std::vector<std::vector<ulong>> fallback;
+};
+Topology topo;
+
+/* The node of the CPU the sequence runs on */
+ulong current_node()
+{
+    if (topo.nodes == 1)
+        return 0;
+    auto it = topo.cpu_node.find(fuzz::current_cpu);
+    return it == topo.cpu_node.end() ? 0 : it->second;
+}
+
+/* A block of the pool is the node's its first page is */
+ulong block_node(ulong block)
+{
+    return topo.page_node[block * HUGE_PAGES];
+}
+
+bool block_covered(ulong block)
+{
+    return topo.covered[block * HUGE_PAGES];
+}
+
+ulong place_of(const std::vector<u32>& sorted, u32 domain)
+{
+    return static_cast<ulong>(std::lower_bound(sorted.begin(), sorted.end(), domain) - sorted.begin());
+}
+
 ulong index(ulong phys)
 {
     return phys / PAGE_BYTES;
@@ -357,8 +415,8 @@ Pte leaf_of(ulong va)
 
 /* A free list walked: each page a page, once on the two lists, marked iff
    the list is the zeroed one. Its length. */
-ulong walk_free_list(stdlib::ListEntry* head, bool zeroed_list, std::set<ulong>& free, std::set<ulong>& zeroed,
-    const char* after)
+ulong walk_free_list(stdlib::ListEntry* head, bool zeroed_list, ulong node, std::set<ulong>& free,
+    std::set<ulong>& zeroed, const char* after)
 {
     ulong on_list = 0;
     for (stdlib::ListEntry* e = head->flink; e != head; e = e->flink)
@@ -366,6 +424,8 @@ ulong walk_free_list(stdlib::ListEntry* head, bool zeroed_list, std::set<ulong>&
         Page* p = CONTAINING_RECORD(e, Page, list_entry);
         ulong i = static_cast<ulong>(p - machine.page_array);
         INVARIANT(i < machine.pages, "a free list holds a page that is no page, after %s", after);
+        INVARIANT(topo.page_node[i] == node, "page %lu, node %lu's, on node %lu's %s list, after %s", i,
+            topo.page_node[i], node, zeroed_list ? "zeroed" : "other", after);
         INVARIANT(free.insert(i).second, "page %lu twice on the free lists, after %s", i, after);
         INVARIANT(p->is_zeroed() == zeroed_list, "page %lu on the %s list %s the mark, after %s", i,
             zeroed_list ? "zeroed" : "other", zeroed_list ? "without" : "with", after);
@@ -395,8 +455,20 @@ void check(const char* after)
        marked iff on the zeroed one; the counts are the lists' lengths */
     std::set<ulong> free;
     std::set<ulong> zeroed;
-    const ulong on_other = walk_free_list(&tested_pt().free_pages_list_, false, free, zeroed, after);
-    const ulong on_zeroed = walk_free_list(&tested_pt().zeroed_pages_list_, true, free, zeroed, after);
+    ulong on_other = 0;
+    ulong on_zeroed = 0;
+    for (ulong n = 0; n < PageTable::MAX_NODES; n++)
+    {
+        PageTable::NodeFree& lists = tested_pt().node_free_[n];
+        const ulong other_n = walk_free_list(&lists.free_list, false, n, free, zeroed, after);
+        const ulong zeroed_n = walk_free_list(&lists.zeroed_list, true, n, free, zeroed, after);
+        INVARIANT(lists.free_count == other_n + zeroed_n, "node %lu's free_count %lu with %lu on its lists, after %s",
+            n, lists.free_count, other_n + zeroed_n, after);
+        INVARIANT(lists.zeroed_count == zeroed_n, "node %lu's zeroed_count %lu with %lu on its zeroed list, after %s",
+            n, lists.zeroed_count, zeroed_n, after);
+        on_other += other_n;
+        on_zeroed += zeroed_n;
+    }
     INVARIANT(tested_pt().free_pages_count_ == on_other + on_zeroed,
         "free_pages_count_ %lu with %lu on the lists, after %s", tested_pt().free_pages_count_, on_other + on_zeroed,
         after);
@@ -586,14 +658,26 @@ void check_zeroed(ulong phys, const char* by)
         INVARIANT(machine.phys[phys + b] == 0, "page 0x%lx handed out by %s is not zeroed at +%lu", phys, by, b);
 }
 
-/* The page an allocation should take: the head of the list it prefers,
-   else of the other; nullptr when both are empty */
+/* The page an allocation meant for `node` should take: of each node in its
+   fallback order, the head of the list it prefers, else of the other;
+   nullptr when every one is empty */
+Page* expected_page_on(bool zeroed_first, ulong node)
+{
+    for (ulong n : topo.fallback[node])
+    {
+        PageTable::NodeFree& lists = tested_pt().node_free_[n];
+        stdlib::ListEntry* first = zeroed_first ? &lists.zeroed_list : &lists.free_list;
+        stdlib::ListEntry* second = zeroed_first ? &lists.free_list : &lists.zeroed_list;
+        stdlib::ListEntry* list = !first->is_empty() ? first : second;
+        if (!list->is_empty())
+            return CONTAINING_RECORD(list->flink, Page, list_entry);
+    }
+    return nullptr;
+}
+
 Page* expected_page(bool zeroed_first)
 {
-    stdlib::ListEntry* first = zeroed_first ? &tested_pt().zeroed_pages_list_ : &tested_pt().free_pages_list_;
-    stdlib::ListEntry* second = zeroed_first ? &tested_pt().free_pages_list_ : &tested_pt().zeroed_pages_list_;
-    stdlib::ListEntry* list = !first->is_empty() ? first : second;
-    return list->is_empty() ? nullptr : CONTAINING_RECORD(list->flink, Page, list_entry);
+    return expected_page_on(zeroed_first, current_node());
 }
 
 /* A page an allocation took, as the model has it: held, and whether it was
@@ -622,6 +706,34 @@ void alloc(fuzz::Input& in)
     INVARIANT(p == want, "alloc_page took page 0x%lx, not the head of the list it prefers", p->get_phy_address());
     took(p->get_phy_address(), "alloc_page");
     fuzz::reached(want_zeroed ? "alloc_page took a zeroed page" : "alloc_page took one to zero");
+}
+
+/* An allocation for a node (a guest's memory placed there): its lists
+   first, then the others' in its fallback order */
+void alloc_on(fuzz::Input& in)
+{
+    const ulong node = in.below(topo.nodes);
+    Page* want = expected_page_on(false, node);
+    Page* p = tested_pt().alloc_page_on(node);
+    if (p == nullptr)
+    {
+        INVARIANT(tested_pt().free_pages_count_ == 0, "alloc_page_on(%lu) failed with %lu pages free", node,
+            tested_pt().free_pages_count_);
+        return;
+    }
+    INVARIANT(p == want, "alloc_page_on(%lu) took page 0x%lx, not the head of the list it prefers", node,
+        p->get_phy_address());
+    took(p->get_phy_address(), "alloc_page_on");
+    const ulong i = static_cast<ulong>(p - machine.page_array);
+    fuzz::reached(topo.page_node[i] == node ? "alloc_page_on its own node" : "alloc_page_on another node");
+}
+
+/* The sequence moved to another CPU -- now and then one boot named to no
+   node, which is node 0's */
+void move_cpu(fuzz::Input& in)
+{
+    fuzz::current_cpu = in.below(topo.cpus + 1);
+    fuzz::reached("moved to another CPU");
 }
 
 /* A guest's allocation: a page known zero first, and none once `keep` or
@@ -662,15 +774,17 @@ void zero_step(fuzz::Input& in)
     {
         if (!huge)
         {
-            stdlib::ListEntry* other = &tested_pt().free_pages_list_;
+            const ulong node = in.below(topo.nodes);
+            PageTable::NodeFree& lists = tested_pt().node_free_[node];
+            stdlib::ListEntry* other = &lists.free_list;
             Page* tail = other->is_empty() ? nullptr : CONTAINING_RECORD(other->blink, Page, list_entry);
             const bool want = tested_pt().free_pages_count_ > keep && tail != nullptr;
-            const bool did = tested_pt().zero_free_page(keep);
-            INVARIANT(did == want, "zero_free_page(%lu) with %lu free %s", keep, tested_pt().free_pages_count_,
-                did ? "zeroed a page" : "zeroed none");
+            const bool did = tested_pt().zero_free_page(node, keep);
+            INVARIANT(did == want, "zero_free_page(%lu, %lu) with %lu free %s", node, keep,
+                tested_pt().free_pages_count_, did ? "zeroed a page" : "zeroed none");
             if (!did)
-                break;
-            Page* head = CONTAINING_RECORD(tested_pt().zeroed_pages_list_.flink, Page, list_entry);
+                continue;
+            Page* head = CONTAINING_RECORD(lists.zeroed_list.flink, Page, list_entry);
             INVARIANT(head == tail, "zero_free_page put another page than the other list's tail on the zeroed list");
             const ulong i = static_cast<ulong>(head - machine.page_array);
             INVARIANT(pages[i].state == PageState::Free && !pages[i].zeroed, "zero_free_page zeroed page %lu (state %d, "
@@ -1161,6 +1275,11 @@ void reserve_pool(fuzz::Input& in)
     const ulong keep = in.below(machine.pages);
     const ulong want = in.chance(8) ? in.value32() : in.below(4) + in.chance(192);
     const ulong before = tested_pt().free_pages_count_;
+    /* Each node's share of what is kept free: as much as it has of the free
+       pages, worked out as the pool's documentation has it */
+    std::vector<ulong> node_keep(topo.nodes, 0);
+    for (ulong n = 0; n < topo.nodes && before != 0; n++)
+        node_keep[n] = (topo.nodes == 1) ? keep : keep * tested_pt().node_free_[n].free_count / before;
     const ulong got = tested_pt().reserve_huge_pool_keeping(want * HUGE_BYTES, keep);
     INVARIANT(got <= want, "%lu blocks reserved of %lu asked", got, want);
     INVARIANT(got == 0 || tested_pt().free_pages_count_ >= keep, "the pool left %lu pages free, under the %lu kept",
@@ -1181,9 +1300,10 @@ void reserve_pool(fuzz::Input& in)
         pool_blocks[block * HUGE_BYTES] = false;
     }
     INVARIANT(pool_blocks.size() == got, "%zu blocks in the bitmap, %lu said reserved", pool_blocks.size(), got);
-    /* Highest first: a block still free is below every block the pool
-       took, and is left only when the pool had all it asked or the pages
-       kept stopped it */
+    /* Highest first, of each node's blocks: a block still free is below
+       every block the pool took of its node, and is left only when the pool
+       had all it asked, or the pages kept -- the machine's, or its node's
+       share of them -- stopped it */
     const bool limited = tested_pt().free_pages_count_ < keep + HUGE_PAGES;
     for (ulong block = 0; block < machine.pages / HUGE_PAGES; block++)
     {
@@ -1192,10 +1312,18 @@ void reserve_pool(fuzz::Input& in)
             free = pages[i].state == PageState::Free;
         if (!free)
             continue;
-        INVARIANT(got == want || limited, "block %lu left free with %lu of %lu reserved and room for more", block, got,
-            want);
-        INVARIANT(pool_blocks.empty() || block * HUGE_BYTES < pool_blocks.begin()->first,
-            "block %lu left free above block 0x%lx of the pool", block, pool_blocks.begin()->first);
+        const ulong node = block_node(block);
+        const ulong node_free = tested_pt().node_free_[node].free_count;
+        const bool node_limited = node_free < node_keep[node] + HUGE_PAGES;
+        INVARIANT(got == want || limited || node_limited, "block %lu, node %lu's, left free with %lu of %lu reserved "
+            "and room for more", block, node, got, want);
+        for (const auto& b : pool_blocks)
+        {
+            if (block_node(b.first / HUGE_BYTES) != node)
+                continue;
+            INVARIANT(block * HUGE_BYTES < b.first, "block %lu left free above block 0x%lx of the pool, both node %lu's",
+                block, b.first, node);
+        }
     }
     if (got != 0 && got < want)
         fuzz::reached("a pool cut short");
@@ -1281,14 +1409,48 @@ void pool_window(fuzz::Input& in)
     fuzz::reached("a pool window");
 }
 
+/* What a block allocation meant for `node` takes, on a machine of nodes: of
+   each node in its fallback order, a block of that node's ranges known zero,
+   else the block the zeroing is part way through where it is that node's,
+   else any free block of that node's ranges; past every node, a block no
+   range has the first page of, known zero first. True when `phys` is what it
+   should be. */
+bool huge_as_expected(ulong node, ulong zeroing, ulong phys)
+{
+    const ulong got = phys / HUGE_BYTES;
+    for (ulong n : topo.fallback[node])
+    {
+        bool zeroed_here = false;
+        bool free_here = false;
+        for (const auto& b : pool_blocks)
+        {
+            const ulong block = b.first / HUGE_BYTES;
+            if (b.second || !block_covered(block) || block_node(block) != n)
+                continue;
+            free_here = true;
+            zeroed_here = zeroed_here || pool_zeroed.count(b.first) != 0;
+        }
+        if (zeroed_here)
+            return pool_zeroed.count(phys) != 0 && block_covered(got) && block_node(got) == n;
+        if (zeroing != PageTable::NO_HUGE_BLOCK && block_node(zeroing) == n)
+            return got == zeroing;
+        if (free_here)
+            return pool_zeroed.count(phys) == 0 && block_covered(got) && block_node(got) == n;
+    }
+    if (!pool_zeroed.empty())
+        return pool_zeroed.count(phys) != 0 && !block_covered(got);
+    return !block_covered(got);
+}
+
 void alloc_huge(fuzz::Input& in)
 {
-    (void)in;
     ulong pool_free = 0;
     for (const auto& b : pool_blocks)
         pool_free += !b.second;
+    const bool on = topo.nodes > 1 && in.chance(85);
+    const ulong node = on ? in.below(topo.nodes) : current_node();
     const ulong zeroing = tested_pt().huge_zero_block_;
-    const ulong phys = tested_pt().alloc_huge_frame();
+    const ulong phys = on ? tested_pt().alloc_huge_frame_on(node) : tested_pt().alloc_huge_frame();
     if (phys == 0)
     {
         INVARIANT(pool_free == 0, "alloc_huge_frame failed with %lu blocks free", pool_free);
@@ -1297,13 +1459,24 @@ void alloc_huge(fuzz::Input& in)
     auto it = pool_blocks.find(phys);
     INVARIANT(it != pool_blocks.end() && !it->second, "alloc_huge_frame handed out 0x%lx, no free block of the pool",
         phys);
-    /* A block known zero first; with none, the block the zeroing is part way
-       through, which the zeroing then leaves for another */
-    INVARIANT(pool_zeroed.empty() || pool_zeroed.count(phys), "alloc_huge_frame handed out 0x%lx with %zu blocks known "
-        "zero, and it none of them", phys, pool_zeroed.size());
-    INVARIANT(!pool_zeroed.empty() || zeroing == PageTable::NO_HUGE_BLOCK || zeroing == phys / HUGE_BYTES,
-        "alloc_huge_frame handed out 0x%lx with no block known zero, not block %lu the zeroing is part way through",
-        phys, zeroing);
+    if (topo.nodes == 1)
+    {
+        /* A block known zero first; with none, the block the zeroing is part
+           way through, which the zeroing then leaves for another */
+        INVARIANT(pool_zeroed.empty() || pool_zeroed.count(phys), "alloc_huge_frame handed out 0x%lx with %zu blocks "
+            "known zero, and it none of them", phys, pool_zeroed.size());
+        INVARIANT(!pool_zeroed.empty() || zeroing == PageTable::NO_HUGE_BLOCK || zeroing == phys / HUGE_BYTES,
+            "alloc_huge_frame handed out 0x%lx with no block known zero, not block %lu the zeroing is part way through",
+            phys, zeroing);
+    }
+    else
+    {
+        INVARIANT(huge_as_expected(node, zeroing, phys), "alloc_huge_frame%s for node %lu handed out 0x%lx, node %lu's%s%s, "
+            "not the nearest node's first choice", on ? "_on" : "", node, phys, block_node(phys / HUGE_BYTES),
+            block_covered(phys / HUGE_BYTES) ? "" : " by no range", pool_zeroed.count(phys) ? ", known zero" : "");
+        fuzz::reached(block_node(phys / HUGE_BYTES) == node ? "a huge frame of its own node" :
+            "a huge frame of another node");
+    }
     fuzz::reached(pool_zeroed.count(phys) ? "a huge frame known zero" : "a huge frame to zero");
     pool_zeroed.erase(phys);
     if (zeroing == phys / HUGE_BYTES)
@@ -1347,6 +1520,173 @@ void free_huge(fuzz::Input& in)
 
 /* ---- a machine as Setup leaves one ---- */
 
+/* The machine's NUMA topology, told to Numa as the SRAT and the SLIT tell it,
+   and sealed: one node mostly -- no table, or one domain -- else two or
+   three domains, in no order and now and then far apart, the memory cut into
+   ranges of them, every domain with memory one at least, and now and then a
+   domain of CPUs alone or a range given to none; CPUs of each, and some boot
+   names to none; a SLIT that holds, one that does not, or none. What Numa
+   says of every page, CPU and fallback is held to what the model works out
+   from that alone. */
+void make_topology(fuzz::Input& in)
+{
+    Numa& numa = Numa::get_instance();
+    topo.page_node.assign(machine.pages, 0);
+    topo.covered.assign(machine.pages, false);
+    topo.cpu_node.clear();
+    topo.cpus = 1 + in.below(6);
+
+    const ulong want = in.chance(128) ? 1 : 2 + in.below(2);
+    if (want == 1 && in.boolean())
+    {
+        numa.seal((1UL << topo.cpus) - 1);
+        topo.nodes = 1;
+        topo.fallback.assign(1, std::vector<ulong>(1, 0));
+        INVARIANT(numa.get_node_count() == 1, "no SRAT, and %lu nodes", numa.get_node_count());
+        return;
+    }
+
+    std::vector<u32> domains;
+    while (domains.size() < want)
+    {
+        u32 d = in.chance(32) ? in.value32() : static_cast<u32>(in.below(8));
+        /* Taken already -- or the input run out, and every value the same:
+           the next one free */
+        while (std::find(domains.begin(), domains.end(), d) != domains.end())
+            d++;
+        domains.push_back(d);
+    }
+    std::vector<u32> sorted = domains;
+    std::sort(sorted.begin(), sorted.end());
+    /* Every domain a CPU at least, so that every one is a node, the one of
+       CPUs alone too */
+    topo.cpus = std::max<ulong>(topo.cpus, want);
+    const ulong cpu_mask = (1UL << topo.cpus) - 1;
+
+    const ulong with_memory = (want > 1 && in.chance(16)) ? want - 1 : want;
+    if (with_memory < want)
+        fuzz::reached("a node of CPUs alone");
+
+    /* The cuts: a page boundary, or a block's -- the pool's blocks whole in
+       a node, or across two */
+    const ulong segments = with_memory + in.below(3);
+    const bool aligned = machine.pages >= 4 * HUGE_PAGES && in.boolean();
+    std::vector<ulong> cuts;
+    for (int tries = 0; tries < 64 && cuts.size() + 1 < segments; tries++)
+    {
+        ulong c = 1 + in.below(machine.pages - 1);
+        if (aligned)
+            c = (c / HUGE_PAGES) * HUGE_PAGES;
+        if (c != 0 && c < machine.pages && std::find(cuts.begin(), cuts.end(), c) == cuts.end())
+            cuts.push_back(c);
+    }
+    std::sort(cuts.begin(), cuts.end());
+    std::vector<ulong> bounds(1, 0);
+    bounds.insert(bounds.end(), cuts.begin(), cuts.end());
+    bounds.push_back(machine.pages);
+
+    /* The first ranges one each of the domains with memory, in no order;
+       the rest any of theirs, or none's */
+    std::vector<u32> order(domains.begin(), domains.begin() + with_memory);
+    for (ulong i = order.size(); i > 1; i--)
+        std::swap(order[i - 1], order[in.below(i)]);
+    for (ulong seg = 0; seg + 1 < bounds.size(); seg++)
+    {
+        u32 d = 0;
+        if (seg < order.size())
+            d = order[seg];
+        else if (in.chance(40))
+        {
+            fuzz::reached("a range of no node's");
+            continue;
+        }
+        else
+            d = domains[in.below(with_memory)];
+        const ulong b = bounds[seg];
+        const ulong e = bounds[seg + 1];
+        INVARIANT(numa.add_memory(d, b * PAGE_BYTES, (e - b) * PAGE_BYTES), "range %lu-%lu of domain %u refused", b, e, d);
+        for (ulong i = b; i < e; i++)
+        {
+            topo.page_node[i] = place_of(sorted, d);
+            topo.covered[i] = true;
+        }
+    }
+
+    for (ulong c = 0; c < topo.cpus; c++)
+    {
+        if (c >= want && in.chance(24))
+            continue;
+        const u32 d = (c < want) ? domains[c] : domains[in.below(want)];
+        INVARIANT(numa.add_cpu(d, c), "CPU %lu of domain %u refused", c, d);
+        topo.cpu_node[c] = place_of(sorted, d);
+    }
+
+    /* The distances: the SLIT's where it holds -- a diagonal of 10, nothing
+       under it -- 10 and 20 where it does not, or there is none */
+    std::vector<std::vector<ulong>> dist(want, std::vector<ulong>(want, 0));
+    const ulong slit = in.below(3);
+    if (slit != 0)
+    {
+        for (ulong i = 0; i < want; i++)
+        {
+            for (ulong j = 0; j < want; j++)
+                dist[i][j] = (i == j) ? Numa::LOCAL_DISTANCE : Numa::LOCAL_DISTANCE + in.below(40);
+        }
+        if (slit == 2)
+        {
+            const ulong i = in.below(want);
+            const ulong j = in.below(want);
+            dist[i][j] = (i == j) ? Numa::LOCAL_DISTANCE + 1 + in.below(8) : in.below(Numa::LOCAL_DISTANCE);
+            fuzz::reached("a SLIT that does not hold");
+        }
+        for (ulong i = 0; i < want; i++)
+        {
+            for (ulong j = 0; j < want; j++)
+                numa.set_distance(i, j, static_cast<u8>(dist[i][j]));
+        }
+    }
+    if (slit != 1)
+    {
+        for (ulong i = 0; i < want; i++)
+        {
+            for (ulong j = 0; j < want; j++)
+                dist[i][j] = (i == j) ? Numa::LOCAL_DISTANCE : Numa::REMOTE_DISTANCE;
+        }
+    }
+
+    numa.seal(cpu_mask);
+    topo.nodes = want;
+    INVARIANT(numa.get_node_count() == want, "%lu domains, and %lu nodes", want, numa.get_node_count());
+    topo.fallback.assign(want, std::vector<ulong>());
+    for (ulong n = 0; n < want; n++)
+    {
+        std::vector<ulong>& f = topo.fallback[n];
+        for (ulong m = 0; m < want; m++)
+        {
+            if (m != n)
+                f.push_back(m);
+        }
+        std::stable_sort(f.begin(), f.end(), [&](ulong a, ulong b) { return dist[n][a] < dist[n][b]; });
+        f.insert(f.begin(), n);
+        for (ulong r = 0; r < want; r++)
+            INVARIANT(numa.get_fallback(n, r) == f[r], "node %lu's fallback %lu is %lu, not %lu", n, r,
+                numa.get_fallback(n, r), f[r]);
+        for (ulong m = 0; m < want; m++)
+            INVARIANT(numa.get_distance(n, m) == dist[n][m], "distance %lu-%lu is %lu, not %lu", n, m,
+                (ulong)numa.get_distance(n, m), dist[n][m]);
+    }
+    for (ulong i = 0; i < machine.pages; i++)
+        INVARIANT(numa.get_phys_node(i * PAGE_BYTES) == topo.page_node[i], "page %lu is node %lu's, not %lu", i,
+            numa.get_phys_node(i * PAGE_BYTES), topo.page_node[i]);
+    for (ulong c = 0; c <= topo.cpus; c++)
+    {
+        auto it = topo.cpu_node.find(c);
+        const ulong node = (c < topo.cpus && it != topo.cpu_node.end()) ? it->second : 0;
+        INVARIANT(numa.get_cpu_node(c) == node, "CPU %lu is node %lu's, not %lu", c, numa.get_cpu_node(c), node);
+    }
+    fuzz::reached(want == 2 ? "two nodes" : "three nodes");
+}
+
 void boot(fuzz::Input& in)
 {
     /* Small, and now and then past 4 MiB: room for a block of the huge
@@ -1381,17 +1721,23 @@ void boot(fuzz::Input& in)
     pages.assign(machine.pages, {PageState::Machine, 1, false, false});
     /* zerofree=verify: what an allocation takes as known zero, read */
     pt.set_zero_check(in.chance(4));
-    /* What drain_early_free_list leaves: every usable page on the list, at
-       reference count 1 */
+    /* What drain_early_free_list leaves: every usable page on node 0's list
+       -- the firmware's tables not read yet -- at reference count 1 */
     for (ulong i = machine.pages; i-- > RESERVED_PAGES;)
     {
         machine.page_array[i].init(i * PAGE_BYTES);
-        pt.free_pages_list_.insert_head(&machine.page_array[i].list_entry);
+        pt.node_free_[0].free_list.insert_head(&machine.page_array[i].list_entry);
+        pt.node_free_[0].free_count++;
         pt.free_pages_count_++;
         pages[i].state = PageState::Free;
     }
     for (ulong i = 0; i < RESERVED_PAGES; i++)
         machine.page_array[i].init(i * PAGE_BYTES);
+
+    /* The tables read, the topology sealed, and the free list spread over
+       it, as the boot does right after ACPI */
+    make_topology(in);
+    pt.spread_free_pages();
 
     /* The root, as Setup allocates it */
     Page* root = pt.alloc_page();
@@ -1418,10 +1764,16 @@ void run(fuzz::Input& in)
         switch (in.u8() % 16)
         {
         case 0:
-            alloc(in);
+            if (topo.nodes > 1 && in.chance(64))
+                alloc_on(in);
+            else
+                alloc(in);
             break;
         case 1:
-            alloc_keeping(in);
+            if (topo.nodes > 1 && in.chance(48))
+                move_cpu(in);
+            else
+                alloc_keeping(in);
             break;
         case 2:
             zero_step(in);
@@ -1506,6 +1858,10 @@ void reset()
     MemoryMap& mmap = MemoryMap::get_instance();
     mmap.~MemoryMap();
     new (&mmap) MemoryMap();
+    Numa& numa = Numa::get_instance();
+    numa.~Numa();
+    new (&numa) Numa();
+    topo = Topology();
 }
 
 }

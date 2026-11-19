@@ -1068,11 +1068,6 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
         break;
     }
 
-    /* The huge pool (hugepages=), now: the free list will never again be as
-       whole as it is before the kernel's own allocations begin. */
-    pt.reserve_huge_pool(Parameters::get_instance().get_huge_pool_bytes(pt.get_total_pages_count() * consts::PAGE_SIZE));
-    /* And mapped, for the copies into and out of guests' memory (PageTable::map_huge_pool_window) */
-    pt.map_huge_pool_window();
     /* zerofree=verify: every page and block handed out as zeroed read first.
        Here, before there is another CPU to read the flag. */
     pt.set_zero_check(Parameters::get_instance().is_zero_free_verify());
@@ -1174,6 +1169,20 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
        and before a second CPU runs: read without a lock from here on */
     Numa::get_instance().seal(CpuTable::get_instance().get_present_cpus());
     Numa::get_instance().report();
+
+    /* The free pages onto their own nodes' lists, and the huge pool
+       (hugepages=) out of them, each node's share of it: the free list will
+       never again be as whole as it is before the kernel's own allocations
+       begin -- a few page tables and the screen's mapping are what came
+       before this. And mapped, for the copies into and out of guests' memory
+       (PageTable::map_huge_pool_window). */
+    {
+        auto& pages = mm::PageTable::get_instance();
+        pages.spread_free_pages();
+        pages.reserve_huge_pool(
+            Parameters::get_instance().get_huge_pool_bytes(pages.get_total_pages_count() * consts::PAGE_SIZE));
+        pages.map_huge_pool_window();
+    }
 
     if (!mm::PageAllocatorImpl::get_instance().setup())
     {
