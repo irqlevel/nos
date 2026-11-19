@@ -179,6 +179,7 @@ CXX_SRC_x86_64 =   \
     src/base/kernel/dmesg.cpp    \
     src/base/kernel/sched.cpp    \
     src/base/kernel/eevdf.cpp    \
+    src/base/kernel/numa.cpp    \
     src/base/kernel/preempt.cpp  \
     src/base/kernel/time.cpp \
     src/base/arch/x86_64/tsc.cpp \
@@ -263,6 +264,7 @@ CXX_SRC_aarch64 = \
     src/base/kernel/task.cpp \
     src/base/kernel/sched.cpp \
     src/base/kernel/eevdf.cpp \
+    src/base/kernel/numa.cpp \
     src/base/kernel/cpu.cpp \
     src/base/kernel/timer.cpp \
     src/base/kernel/mutex.cpp \

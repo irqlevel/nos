@@ -7,6 +7,7 @@
 #include <hal/mmu.h>
 #include <kernel/cpu.h>
 #include <kernel/debug.h>
+#include <kernel/numa.h>
 #include <kernel/preempt.h>
 
 namespace kernel
@@ -94,6 +95,25 @@ PageTable::PageTable()
         huge_pool_free_bits_[i] = 0;
         huge_pool_zeroed_bits_[i] = 0;
     }
+    static_assert(MAX_NODES == Numa::MAX_NODES, "a node's free lists for each node there may be");
+    for (NodeFree& node : node_free_)
+    {
+        node.free_list.init();
+        node.zeroed_list.init();
+        node.free_count = 0;
+        node.zeroed_count = 0;
+    }
+}
+
+
+ulong PageTable::local_node()
+{
+    return Numa::get_instance().get_current_node();
+}
+
+PageTable::NodeFree& PageTable::node_lists(Page* page)
+{
+    return node_free_[Numa::get_instance().get_phys_node(page->get_phy_address())];
 }
 
 PageTable::~PageTable()
@@ -291,7 +311,9 @@ void PageTable::drain_early_free_list()
         /* get_page's +1 was only for the lookup; a page on the free list must
            sit at refcount 1 */
         page->put();
-        free_pages_list_.insert_head(&page->list_entry);
+        NodeFree& node = node_lists(page);
+        node.free_list.insert_head(&page->list_entry);
+        node.free_count++;
         free_pages_count_++;
 
         if (free_pages_count_ >= next_progress)
@@ -902,8 +924,37 @@ void PageTable::check_free_list(stdlib::Printer& printer)
     printer.printf("free pages outside usable RAM:       %lu\n", outside_ram);
     printer.printf("descriptors with a wrong phys addr:  %lu\n", wrong_phys);
 
+    /* The nodes' counts, which add up to the machine's: read together, under
+       Lock, where the walk above is a snapshot without it */
+    const ulong nodes = Numa::get_instance().get_node_count();
+    ulong node_free[MAX_NODES];
+    ulong node_zeroed[MAX_NODES];
+    ulong free_sum = 0;
+    ulong zeroed_sum = 0;
+    ulong free_total = 0;
+    ulong zeroed_total = 0;
+    {
+        stdlib::AutoLock lock(lock_);
+        for (ulong n = 0; n < nodes; n++)
+        {
+            const NodeFree& lists = node_free_[n];
+            node_free[n] = lists.free_count;
+            node_zeroed[n] = lists.zeroed_count;
+            free_sum += lists.free_count;
+            zeroed_sum += lists.zeroed_count;
+        }
+        free_total = free_pages_count_;
+        zeroed_total = zeroed_pages_count_;
+    }
+    for (ulong n = 0; n < nodes; n++)
+        printer.printf("node %lu: %lu free pages, %lu of them zeroed\n", n, node_free[n], node_zeroed[n]);
+    const bool sums = (free_sum == free_total) && (zeroed_sum == zeroed_total);
+    if (!sums)
+        printer.printf("the nodes' counts add up to %lu free and %lu zeroed, the machine's are %lu and %lu\n",
+            free_sum, zeroed_sum, free_total, zeroed_total);
+
     bool ok = (in_reserved == 0) && (in_kernel == 0) && (outside_ram == 0) &&
-        (wrong_phys == 0);
+        (wrong_phys == 0) && sums;
     printer.printf("memcheck: %s (live snapshot, not locked)\n",
         ok ? "ok" : "FAILED");
 }
@@ -920,7 +971,21 @@ Page* PageTable::alloc_page()
     bool zeroed = false;
     {
         stdlib::AutoLock lock(lock_);
-        page = take_free_page_no_lock(false, zeroed);
+        page = take_free_page_no_lock(local_node(), false, zeroed);
+    }
+    if (page)
+        zero_unless_zeroed(page, zeroed);
+    return page;
+}
+
+Page* PageTable::alloc_page_on(ulong node)
+{
+    BUG_ON(node >= Numa::get_instance().get_node_count());
+    Page* page;
+    bool zeroed = false;
+    {
+        stdlib::AutoLock lock(lock_);
+        page = take_free_page_no_lock(node, false, zeroed);
     }
     if (page)
         zero_unless_zeroed(page, zeroed);
@@ -934,7 +999,7 @@ Page* PageTable::alloc_page_keeping(ulong keep)
     {
         stdlib::AutoLock lock(lock_);
         if (free_pages_count_ > keep)
-            page = take_free_page_no_lock(true, zeroed);
+            page = take_free_page_no_lock(local_node(), true, zeroed);
     }
     if (page)
         zero_unless_zeroed(page, zeroed);
@@ -944,38 +1009,47 @@ Page* PageTable::alloc_page_keeping(ulong keep)
 Page* PageTable::alloc_page_no_lock()
 {
     bool zeroed = false;
-    Page* page = take_free_page_no_lock(false, zeroed);
+    Page* page = take_free_page_no_lock(local_node(), false, zeroed);
     if (page)
         zero_unless_zeroed(page, zeroed);
     return page;
 }
 
-Page* PageTable::take_free_page_no_lock(bool zeroed_first, bool& zeroed)
+Page* PageTable::take_free_page_no_lock(ulong node, bool zeroed_first, bool& zeroed)
 {
-    stdlib::ListEntry* list = zeroed_first ? &zeroed_pages_list_ : &free_pages_list_;
-    if (list->is_empty())
-        list = zeroed_first ? &free_pages_list_ : &zeroed_pages_list_;
-    if (list->is_empty())
-        return nullptr;
-
-    Page* page = CONTAINING_RECORD(list->remove_head(), Page, list_entry);
-    page->list_entry.init(); /* Self-pointing = not on any list */
-    check_unreferenced(page);
-    zeroed = (list == &zeroed_pages_list_);
-    /* The mark and the list are changed together, under Lock: a page on the
-       zeroed list without it, or on the other with it, is the two come
-       apart -- a page handed out as zero that is not */
-    BUG_ON(page->is_zeroed() != zeroed);
-    page->set_zeroed(false);
-    BUG_ON(free_pages_count_ == 0);
-    free_pages_count_--;
-    free_pages_lowest_ = stdlib::min(free_pages_lowest_, free_pages_count_);
-    if (zeroed)
+    auto& numa = Numa::get_instance();
+    const ulong nodes = numa.get_node_count();
+    for (ulong rank = 0; rank < nodes; rank++)
     {
-        BUG_ON(zeroed_pages_count_ == 0);
-        zeroed_pages_count_--;
+        NodeFree& lists = node_free_[numa.get_fallback(node, rank)];
+        stdlib::ListEntry* list = zeroed_first ? &lists.zeroed_list : &lists.free_list;
+        if (list->is_empty())
+            list = zeroed_first ? &lists.free_list : &lists.zeroed_list;
+        if (list->is_empty())
+            continue;
+
+        Page* page = CONTAINING_RECORD(list->remove_head(), Page, list_entry);
+        page->list_entry.init(); /* Self-pointing = not on any list */
+        check_unreferenced(page);
+        zeroed = (list == &lists.zeroed_list);
+        /* The mark and the list are changed together, under Lock: a page on
+           the zeroed list without it, or on the other with it, is the two
+           come apart -- a page handed out as zero that is not */
+        BUG_ON(page->is_zeroed() != zeroed);
+        page->set_zeroed(false);
+        BUG_ON(lists.free_count == 0 || free_pages_count_ == 0);
+        lists.free_count--;
+        free_pages_count_--;
+        free_pages_lowest_ = stdlib::min(free_pages_lowest_, free_pages_count_);
+        if (zeroed)
+        {
+            BUG_ON(lists.zeroed_count == 0 || zeroed_pages_count_ == 0);
+            lists.zeroed_count--;
+            zeroed_pages_count_--;
+        }
+        return page;
     }
-    return page;
+    return nullptr;
 }
 
 /* A page taken off a free list has its descriptor's own reference and no
@@ -995,13 +1069,16 @@ void PageTable::check_unreferenced(Page* page)
 void PageTable::unlist_free_page_no_lock(Page* page)
 {
     BUG_ON(page->list_entry.flink == &page->list_entry);
+    NodeFree& lists = node_lists(page);
     page->list_entry.remove_init();
-    BUG_ON(free_pages_count_ == 0);
+    BUG_ON(lists.free_count == 0 || free_pages_count_ == 0);
+    lists.free_count--;
     free_pages_count_--;
     free_pages_lowest_ = stdlib::min(free_pages_lowest_, free_pages_count_);
     if (page->is_zeroed())
     {
-        BUG_ON(zeroed_pages_count_ == 0);
+        BUG_ON(lists.zeroed_count == 0 || zeroed_pages_count_ == 0);
+        lists.zeroed_count--;
         zeroed_pages_count_--;
         page->set_zeroed(false);
     }
@@ -1049,15 +1126,17 @@ bool PageTable::is_zero_check()
     return zero_check_;
 }
 
-bool PageTable::zero_free_page(ulong keep)
+bool PageTable::zero_free_page(ulong node, ulong keep)
 {
+    BUG_ON(node >= Numa::get_instance().get_node_count());
+    NodeFree& lists = node_free_[node];
     ulong flags = preempt_irq_save();
     Page* page = nullptr;
     {
         stdlib::AutoLock lock(lock_);
-        if (free_pages_count_ > keep && !free_pages_list_.is_empty())
+        if (free_pages_count_ > keep && !lists.free_list.is_empty())
         {
-            page = CONTAINING_RECORD(free_pages_list_.remove_tail(), Page, list_entry);
+            page = CONTAINING_RECORD(lists.free_list.remove_tail(), Page, list_entry);
             page->list_entry.init(); /* on no list: no run takes it */
             BUG_ON(page->is_zeroed());
             /* Marked while on its way: a free of it is a page freed twice,
@@ -1078,7 +1157,8 @@ bool PageTable::zero_free_page(ulong keep)
     {
         stdlib::AutoLock lock(lock_);
         BUG_ON(!page->is_zeroed() || page->list_entry.flink != &page->list_entry);
-        zeroed_pages_list_.insert_head(&page->list_entry);
+        lists.zeroed_list.insert_head(&page->list_entry);
+        lists.zeroed_count++;
         zeroed_pages_count_++;
     }
     preempt_irq_restore(flags);
@@ -1116,9 +1196,14 @@ void PageTable::zero_page(Page* page)
    looked for on each, and the rest only have to be free. */
 Page* PageTable::take_run_no_lock(ulong count, bool* zeroed, ulong& examined)
 {
-    stdlib::ListEntry* const lists[] = { &free_pages_list_, &zeroed_pages_list_ };
-    for (stdlib::ListEntry* list : lists)
+    /* This CPU's node's lists first, then the nearest's: a run may cross
+       into the next node's pages, each of them unlisted from its own */
+    auto& numa = Numa::get_instance();
+    const ulong home = local_node();
+    for (ulong at = 0; at < 2 * numa.get_node_count(); at++)
     {
+        NodeFree& lists = node_free_[numa.get_fallback(home, at / 2)];
+        stdlib::ListEntry* list = (at % 2 == 0) ? &lists.free_list : &lists.zeroed_list;
         for (auto* entry = list->flink; entry != list; entry = entry->flink)
         {
             examined++;
@@ -1210,10 +1295,12 @@ void PageTable::free_page_no_lock(Page* page)
        the other's page, and nothing to say so. */
     if (page->list_entry.flink != &page->list_entry)
         PANIC("free_page: page 0x%lX is on a free list already: freed twice", page->get_phy_address());
-    /* Back as its owner left it: onto the other list, whose hot end the
-       allocations take from */
+    /* Back as its owner left it: onto its node's other list, whose hot end
+       the allocations take from */
+    NodeFree& lists = node_lists(page);
+    lists.free_count++;
     free_pages_count_++;
-    free_pages_list_.insert_head(&page->list_entry);
+    lists.free_list.insert_head(&page->list_entry);
 }
 
 void PageTable::free_page(Page* page)
@@ -1310,26 +1397,60 @@ ulong PageTable::reserve_huge_pool_keeping(ulong bytes, ulong keep_pages)
     if (want == 0)
         return 0;
 
+    auto& numa = Numa::get_instance();
+    const ulong nodes = numa.get_node_count();
+
     stdlib::AutoLock lock(lock_);
     stdlib::AutoLock pool_lock(huge_pool_lock_);
 
     /* Once: a second call would find the bitmaps another CPU may be
        reading without the lock. */
     BUG_ON(huge_pool_count_ != 0);
-    const ulong blocks = stdlib::min(page_array_count_ / HUGE_FRAME_PAGES, HUGE_POOL_MAX_BLOCKS);
-    for (ulong block = blocks; block-- > 0 && huge_pool_count_ < want;)
+    if (free_pages_count_ == 0)
+        return 0;
+
+    /* Each node's share of the blocks asked for and of the pages kept free:
+       as much as it has of the free pages. The products fit: what is asked
+       is held to the pool's most, 2^18 blocks, and a machine is 2^27 pages
+       at the most. One node's share is the lot. */
+    const ulong asked = stdlib::min(want, HUGE_POOL_MAX_BLOCKS);
+    ulong quota[MAX_NODES];
+    ulong keep[MAX_NODES];
+    ulong taken[MAX_NODES];
+    for (ulong n = 0; n < nodes; n++)
     {
-        if (free_pages_count_ < keep_pages || free_pages_count_ - keep_pages < HUGE_FRAME_PAGES)
-            break;
-        if (!huge_block_free(block))
-            continue;
-        /* Off whichever list each page is on, its mark and the counts with
-           it: the block is not known zero, whatever its pages were */
-        for (ulong i = 0; i < HUGE_FRAME_PAGES; i++)
-            unlist_free_page_no_lock(&page_array_[block * HUGE_FRAME_PAGES + i]);
-        huge_pool_set(huge_pool_in_, block, true);
-        huge_pool_set(huge_pool_free_bits_, block, true);
-        huge_pool_count_++;
+        const ulong share = node_free_[n].free_count;
+        quota[n] = (nodes == 1) ? want : (asked * share) / free_pages_count_;
+        keep[n] = (nodes == 1) ? keep_pages : (keep_pages * share) / free_pages_count_;
+        taken[n] = 0;
+    }
+
+    /* The highest blocks first, to each node's share; then what the shares
+       left by rounding down, from any node with room above what it keeps */
+    const ulong blocks = stdlib::min(page_array_count_ / HUGE_FRAME_PAGES, HUGE_POOL_MAX_BLOCKS);
+    const ulong passes = (nodes == 1) ? 1 : 2;
+    for (ulong pass = 0; pass < passes; pass++)
+    {
+        for (ulong block = blocks; block-- > 0 && huge_pool_count_ < want;)
+        {
+            if (free_pages_count_ < keep_pages || free_pages_count_ - keep_pages < HUGE_FRAME_PAGES)
+                break;
+            const ulong node = numa.get_phys_node(block * HUGE_FRAME_SIZE);
+            const NodeFree& lists = node_free_[node];
+            if ((pass == 0 && taken[node] >= quota[node]) || lists.free_count < keep[node] ||
+                lists.free_count - keep[node] < HUGE_FRAME_PAGES)
+                continue;
+            if (huge_pool_test(huge_pool_in_, block) || !huge_block_free(block))
+                continue;
+            /* Off whichever list each page is on, its mark and the counts
+               with it: the block is not known zero, whatever its pages were */
+            for (ulong i = 0; i < HUGE_FRAME_PAGES; i++)
+                unlist_free_page_no_lock(&page_array_[block * HUGE_FRAME_PAGES + i]);
+            huge_pool_set(huge_pool_in_, block, true);
+            huge_pool_set(huge_pool_free_bits_, block, true);
+            huge_pool_count_++;
+            taken[node]++;
+        }
     }
     huge_pool_free_count_ = huge_pool_count_;
     /* Said either way: a pool cut short is guests that will not start. */
@@ -1354,6 +1475,153 @@ bool PageTable::huge_pool_find(const ulong* bits, const ulong* minus, ulong& blo
     return false;
 }
 
+void PageTable::huge_pool_blocks_of(ulong base, ulong end, ulong& first, ulong& last)
+{
+    /* A block is the node's whose first page is: those from the first that
+       starts at base or after, to the first that starts at end or after */
+    first = stdlib::min(base / HUGE_FRAME_SIZE + ((base % HUGE_FRAME_SIZE) != 0 ? 1 : 0), HUGE_POOL_MAX_BLOCKS);
+    last = stdlib::min(end / HUGE_FRAME_SIZE + ((end % HUGE_FRAME_SIZE) != 0 ? 1 : 0), HUGE_POOL_MAX_BLOCKS);
+}
+
+bool PageTable::huge_pool_find_on(const ulong* bits, ulong node, ulong& block)
+{
+    auto& numa = Numa::get_instance();
+    if (numa.get_node_count() == 1)
+        return huge_pool_find(bits, nullptr, block);
+
+    for (ulong i = 0; i < numa.get_range_count(); i++)
+    {
+        ulong base = 0;
+        ulong end = 0;
+        ulong range_node = 0;
+        if (!numa.get_range(i, base, end, range_node) || range_node != node)
+            continue;
+
+        ulong first = 0;
+        ulong last = 0;
+        huge_pool_blocks_of(base, end, first, last);
+        for (ulong b = first; b < last;)
+        {
+            /* The word's bits from b on, and below last where it ends in it */
+            const ulong w = b / HUGE_POOL_WORD_BITS;
+            const ulong word_end = (w + 1) * HUGE_POOL_WORD_BITS;
+            ulong word = bits[w] & (~0UL << (b % HUGE_POOL_WORD_BITS));
+            if (last < word_end)
+                word &= (1UL << (last % HUGE_POOL_WORD_BITS)) - 1;
+            if (word != 0)
+            {
+                block = w * HUGE_POOL_WORD_BITS + static_cast<ulong>(__builtin_ctzl(word));
+                return true;
+            }
+            b = word_end;
+        }
+    }
+    return false;
+}
+
+void PageTable::spread_free_pages()
+{
+    auto& numa = Numa::get_instance();
+    BUG_ON(!numa.is_sealed());
+    const ulong nodes = numa.get_node_count();
+    if (nodes == 1)
+        return;
+
+    {
+        stdlib::AutoLock lock(lock_);
+        NodeFree& from = node_free_[0];
+        for (ulong pass = 0; pass < 2; pass++)
+        {
+            const bool zeroed = (pass == 1);
+            stdlib::ListEntry* head = zeroed ? &from.zeroed_list : &from.free_list;
+            stdlib::ListEntry* entry = head->flink;
+            while (entry != head)
+            {
+                const ulong node = numa.get_phys_node(CONTAINING_RECORD(entry, Page, list_entry)->get_phy_address());
+                if (node == 0)
+                {
+                    entry = entry->flink;
+                    continue;
+                }
+
+                /* The node's run from here: the list is in the order the
+                   pages were listed in, by address within a region of the
+                   map, so a node's pages are a few long runs, each moved
+                   whole */
+                stdlib::ListEntry* last = entry;
+                ulong run = 1;
+                while (last->flink != head &&
+                    numa.get_phys_node(CONTAINING_RECORD(last->flink, Page, list_entry)->get_phy_address()) == node)
+                {
+                    last = last->flink;
+                    run++;
+                }
+                stdlib::ListEntry* next = last->flink;
+
+                NodeFree& to = node_free_[node];
+                (zeroed ? to.zeroed_list : to.free_list).move_run_tail(entry, last);
+                BUG_ON(from.free_count < run);
+                from.free_count -= run;
+                to.free_count += run;
+                if (zeroed)
+                {
+                    BUG_ON(from.zeroed_count < run);
+                    from.zeroed_count -= run;
+                    to.zeroed_count += run;
+                }
+                entry = next;
+            }
+        }
+    }
+
+    for (ulong n = 0; n < nodes; n++)
+    {
+        ulong free = 0;
+        ulong zeroed = 0;
+        get_node_free(n, free, zeroed);
+        klog(0, "mm: node %lu: %lu MiB free", n, free * consts::PAGE_SIZE / consts::MB);
+    }
+}
+
+void PageTable::get_node_free(ulong node, ulong& free, ulong& zeroed)
+{
+    free = 0;
+    zeroed = 0;
+    if (node >= Numa::get_instance().get_node_count())
+        return;
+    stdlib::AutoLock lock(lock_);
+    const NodeFree& lists = node_free_[node];
+    free = lists.free_count;
+    zeroed = lists.zeroed_count;
+}
+
+void PageTable::get_node_huge_pool(ulong node, ulong& blocks, ulong& free)
+{
+    blocks = 0;
+    free = 0;
+    auto& numa = Numa::get_instance();
+    if (node >= numa.get_node_count())
+        return;
+
+    stdlib::AutoLock lock(huge_pool_lock_);
+    if (numa.get_node_count() == 1)
+    {
+        blocks = huge_pool_count_;
+        free = huge_pool_free_count_;
+        return;
+    }
+    /* A bit at a time over the pool's blocks: for a command, not a path */
+    const ulong all = stdlib::min(page_array_count_ / HUGE_FRAME_PAGES, HUGE_POOL_MAX_BLOCKS);
+    for (ulong b = 0; b < all; b++)
+    {
+        if (!huge_pool_test(huge_pool_in_, b) || numa.get_phys_node(b * HUGE_FRAME_SIZE) != node)
+            continue;
+        blocks++;
+        if (huge_pool_test(huge_pool_free_bits_, b))
+            free++;
+    }
+}
+
 void PageTable::zero_huge_page(ulong phy_addr)
 {
     ulong flags = preempt_irq_save();
@@ -1374,6 +1642,15 @@ void PageTable::check_huge_page_zeroed(ulong phy_addr)
 
 ulong PageTable::alloc_huge_frame()
 {
+    return alloc_huge_frame_on(local_node());
+}
+
+ulong PageTable::alloc_huge_frame_on(ulong node)
+{
+    auto& numa = Numa::get_instance();
+    const ulong nodes = numa.get_node_count();
+    BUG_ON(node >= nodes);
+
     ulong block = 0;
     /* How many of its pages, from the first, are known zero: all of a block
        known zero, what the zeroing had done of the block it was part way
@@ -1383,34 +1660,67 @@ ulong PageTable::alloc_huge_frame()
         stdlib::AutoLock lock(huge_pool_lock_);
         if (huge_pool_free_count_ == 0)
             return 0;
-        /* A block known zero first, handed out as it is. Else the block the
+        /* Of the node's blocks, then of each node's in its fallback order: a
+           block known zero first, handed out as it is. Else the block the
            zeroing is part way through: its first pages are zeros already --
            zeroed under this lock, the block free since -- and only the rest
            is zeroed below, so that while a guest takes its memory, a zeroing
            task on an idle CPU and the allocation share each block's work
            rather than do it twice; the zeroing goes on with another. Else
-           any free one. A count that says there is one and no bit that says
-           which is the two come apart, and a block handed out of that is
-           anyone's. */
-        if (huge_pool_zeroed_count_ != 0)
+           any free one. And then, of the whole pool, a block whose first
+           page no node's range has. A count that says there is one and no bit
+           that says which is the two come apart, and a block handed out of
+           that is anyone's. */
+        bool found = false;
+        for (ulong rank = 0; rank < nodes; rank++)
+        {
+            const ulong n = numa.get_fallback(node, rank);
+            if (huge_pool_zeroed_count_ != 0)
+            {
+                if (huge_pool_find_on(huge_pool_zeroed_bits_, n, block))
+                {
+                    /* Never the zeroing's: it takes no block known zero */
+                    BUG_ON(block == huge_zero_block_);
+                    huge_pool_set(huge_pool_zeroed_bits_, block, false);
+                    huge_pool_zeroed_count_--;
+                    done = HUGE_FRAME_PAGES;
+                    found = true;
+                    break;
+                }
+                /* The one node's search is the whole pool's */
+                if (nodes == 1)
+                    PANIC("alloc_huge_frame: %lu blocks known zero by the count, none by the bitmap", huge_pool_zeroed_count_);
+            }
+            /* A block whose first page no range has is node 0's, which every
+               fallback order has */
+            if (huge_zero_block_ != NO_HUGE_BLOCK && numa.get_phys_node(huge_zero_block_ * HUGE_FRAME_SIZE) == n)
+            {
+                /* Started on and not finished: a page done, and not all 512 */
+                BUG_ON(huge_zero_next_ == 0 || huge_zero_next_ >= HUGE_FRAME_PAGES);
+                block = huge_zero_block_;
+                done = huge_zero_next_;
+                huge_zero_block_ = NO_HUGE_BLOCK;
+                found = true;
+                break;
+            }
+            if (huge_pool_find_on(huge_pool_free_bits_, n, block))
+            {
+                found = true;
+                break;
+            }
+        }
+        /* Past every node's ranges: a block known zero first, as above */
+        if (!found && huge_pool_zeroed_count_ != 0)
         {
             if (!huge_pool_find(huge_pool_zeroed_bits_, nullptr, block))
                 PANIC("alloc_huge_frame: %lu blocks known zero by the count, none by the bitmap", huge_pool_zeroed_count_);
-            /* Never the zeroing's: it takes no block known zero */
             BUG_ON(block == huge_zero_block_);
             huge_pool_set(huge_pool_zeroed_bits_, block, false);
             huge_pool_zeroed_count_--;
             done = HUGE_FRAME_PAGES;
+            found = true;
         }
-        else if (huge_zero_block_ != NO_HUGE_BLOCK)
-        {
-            /* Started on and not finished: a page done, and not all 512 */
-            BUG_ON(huge_zero_next_ == 0 || huge_zero_next_ >= HUGE_FRAME_PAGES);
-            block = huge_zero_block_;
-            done = huge_zero_next_;
-            huge_zero_block_ = NO_HUGE_BLOCK;
-        }
-        else if (!huge_pool_find(huge_pool_free_bits_, nullptr, block))
+        if (!found && !huge_pool_find(huge_pool_free_bits_, nullptr, block))
             PANIC("alloc_huge_frame: %lu blocks free by the count, none by the bitmap", huge_pool_free_count_);
         BUG_ON(!huge_pool_test(huge_pool_in_, block) || !huge_pool_test(huge_pool_free_bits_, block));
         huge_pool_set(huge_pool_free_bits_, block, false);

@@ -6,6 +6,7 @@
 #include <kernel/sched.h>
 #include <kernel/eevdf.h>
 #include <kernel/cpu.h>
+#include <kernel/numa.h>
 #include <kernel/time.h>
 #include <kernel/klog.h>
 #include <kernel/parameters.h>
@@ -19,10 +20,11 @@ namespace mm
 
 PageZeroer::PageZeroer()
 {
-    for (ulong i = 0; i < WORKERS; i++)
+    for (Worker& worker : workers_)
     {
-        workers_[i].task = nullptr;
-        workers_[i].huge_first = false;
+        worker.task = nullptr;
+        worker.huge_first = false;
+        worker.node = 0;
     }
 }
 
@@ -38,10 +40,16 @@ bool PageZeroer::start()
         return true;
     }
 
-    /* No more tasks than CPUs: two on one CPU would each find the other
-       runnable there, and neither would zero. One alone does both kinds. */
-    const ulong cpus = (ulong)__builtin_popcountl(CpuTable::get_instance().get_running_cpus());
-    const ulong workers = stdlib::min(WORKERS, stdlib::max(cpus, 1UL));
+    /* A task a node, two on a machine of one; and no more tasks than CPUs:
+       two on one CPU would each find the other runnable there, and neither
+       would zero. One alone does both kinds; a node left with no task of its
+       own has its pages zeroed as they are handed out, as zerofree=off's. */
+    auto& numa = Numa::get_instance();
+    const ulong nodes = numa.get_node_count();
+    const ulong running = CpuTable::get_instance().get_running_cpus();
+    const ulong cpus = (ulong)__builtin_popcountl(running);
+    const ulong wanted = (nodes == 1) ? ONE_NODE_WORKERS : nodes;
+    const ulong workers = stdlib::min(stdlib::min(wanted, WORKERS), stdlib::max(cpus, 1UL));
     for (ulong i = 0; i < workers; i++)
     {
         Worker& worker = workers_[i];
@@ -49,6 +57,7 @@ bool PageZeroer::start()
         /* One a kind first: the huge pool, which holds guests' memory alone,
            and the 4 KiB pages */
         worker.huge_first = (i == 0);
+        worker.node = (nodes == 1) ? 0 : i;
 
         char name[TASK_NAME_LEN];
         stdlib::sn_printf(name, sizeof(name), "zerofree/%lu", i);
@@ -60,6 +69,10 @@ bool PageZeroer::start()
         }
         /* The CPU's last claimant: whatever else is runnable there has it */
         set_task_nice(task, SchedEntity::NICE_MAX);
+        /* On its node's CPUs, where there is more than one node and the node
+           has a CPU running: a node of memory alone is zeroed from anywhere */
+        if (nodes > 1 && (numa.get_node_cpus(worker.node) & running) != 0)
+            task->set_cpu_affinity(numa.get_node_cpus(worker.node) & running);
         if (!task->start(&PageZeroer::task_func, &worker))
         {
             task->put();
@@ -157,7 +170,7 @@ void PageZeroer::run(Worker& worker)
                     huge_pages++;
                     continue;
                 }
-                if (pt.zero_free_page(keep))
+                if (pt.zero_free_page(worker.node, keep))
                 {
                     pages++;
                     continue;
@@ -165,7 +178,7 @@ void PageZeroer::run(Worker& worker)
             }
             else
             {
-                if (pt.zero_free_page(keep))
+                if (pt.zero_free_page(worker.node, keep))
                 {
                     pages++;
                     continue;
