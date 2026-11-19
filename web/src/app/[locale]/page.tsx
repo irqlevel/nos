@@ -29,7 +29,24 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
     };
 }
 
-function Section({ id, title, lead, children, aside }: { id: string; title: string; lead?: string; children: ReactNode; aside?: ReactNode }) {
+/*
+ * Names with a hyphen in them (x86-64, AMD-V, VT-x) kept on one line: a
+ * browser may otherwise break one at its hyphen, leaving "x86-" at the end of
+ * a line and "64" at the start of the next.
+ */
+function keepNames(text: string): ReactNode {
+    return text.split(/\b(x86-64|AMD-V|VT-x)\b/).map((part, i) =>
+        i % 2 === 1 ? (
+            <span key={i} className="whitespace-nowrap">
+                {part}
+            </span>
+        ) : (
+            part
+        ),
+    );
+}
+
+function Section({ id, title, lead, children, aside }: { id: string; title: string; lead?: ReactNode; children: ReactNode; aside?: ReactNode }) {
     return (
         <section aria-labelledby={id} className="mx-auto max-w-7xl px-4 pt-20 sm:px-6">
             <div className="flex flex-wrap items-end justify-between gap-4">
@@ -105,8 +122,8 @@ export default async function Home({ params }: Props) {
                 <div className="relative mx-auto grid max-w-7xl items-center gap-12 px-4 py-14 sm:px-6 lg:grid-cols-[1.02fr_1fr] lg:py-24">
                     <div className="min-w-0">
                         <p className="font-mono text-xs font-medium tracking-wider text-accent">{home.eyebrow}</p>
-                        <h1 className="mt-4 text-[2.35rem] font-bold leading-[1.08] tracking-tight text-fg sm:text-5xl lg:text-[3.3rem]">{home.title}</h1>
-                        <p className="mt-6 max-w-xl text-[1.07rem] leading-relaxed text-fg-soft">{home.lead}</p>
+                        <h1 className="mt-4 text-[2.35rem] font-bold leading-[1.08] tracking-tight text-balance text-fg sm:text-5xl lg:text-[3.3rem]">{home.title}</h1>
+                        <p className="mt-6 max-w-xl text-[1.07rem] leading-relaxed text-fg-soft">{keepNames(home.lead)}</p>
                         <div className="mt-8 flex flex-wrap gap-3 text-sm font-medium">
                             <Link href={`/${locale}/about`} className="inline-flex items-center gap-2 rounded-lg bg-fg px-4 py-2.5 text-bg transition-opacity hover:opacity-90">
                                 {home.ctaAbout}
@@ -143,7 +160,7 @@ export default async function Home({ params }: Props) {
                 </div>
             </section>
 
-            <Section id="try" title={home.try.title} lead={home.try.lead}>
+            <Section id="try" title={home.try.title} lead={keepNames(home.try.lead)}>
                 <div className="grid gap-4 lg:grid-cols-[1.4fr_1fr]">
                     <div className="min-w-0 rounded-xl border border-line bg-card p-5 sm:p-6">
                         <p className="font-mono text-xs font-semibold text-accent">{home.try.rescue.kicker}</p>
@@ -203,43 +220,21 @@ export default async function Home({ params }: Props) {
             </Section>
 
             <Section id="why" title={home.why.title} lead={home.why.lead}>
-                <div className="grid gap-4 sm:grid-cols-3">
-                    {home.why.stats.map((stat) => (
-                        <div key={stat.value} className="rounded-xl border border-line bg-card p-5">
-                            <div className="text-3xl font-bold tabular-nums tracking-tight text-fg">{stat.value}</div>
-                            <p className="mt-2 text-sm leading-relaxed text-muted">{stat.label}</p>
-                        </div>
-                    ))}
-                </div>
-                <p className="mt-6 max-w-3xl leading-relaxed text-fg-soft">{home.why.ai}</p>
-                <h3 className="mt-12 text-xl font-bold tracking-tight text-fg">{home.why.approachTitle}</h3>
-                <div className="mt-5 grid gap-4 md:grid-cols-2">
+                <div className="grid gap-4 md:grid-cols-3">
                     {home.why.approach.map((item) => (
                         <div key={item.title} className="rounded-xl border border-line bg-card p-5">
                             <p className="font-mono text-xs font-semibold text-accent">{item.kicker}</p>
-                            <h4 className="mt-2 font-semibold tracking-tight text-fg">{item.title}</h4>
-                            <p className="mt-1.5 text-sm leading-relaxed text-muted">{item.text}</p>
+                            <h3 className="mt-2 font-semibold tracking-tight text-fg">{item.title}</h3>
+                            <p className="mt-1.5 text-sm leading-relaxed text-muted">{keepNames(item.text)}</p>
                         </div>
                     ))}
                 </div>
-                <p className="mt-8 max-w-3xl text-lg font-medium leading-relaxed text-fg">{home.why.closing}</p>
-                <p className="mt-6 text-xs leading-relaxed text-muted">
-                    {home.why.sourcesTitle}:{" "}
-                    {home.why.sources.map((source, i) => (
-                        <span key={source.href}>
-                            {i > 0 && " · "}
-                            <a href={source.href} className="underline decoration-line-strong underline-offset-2 hover:text-accent">
-                                {source.label}
-                            </a>
-                        </span>
-                    ))}
-                </p>
             </Section>
 
-            <Section id="inside" title={home.highlightsTitle} lead={home.highlightsLead}>
+            <Section id="inside" title={home.highlightsTitle}>
                 <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                     {home.highlights.map((card) => (
-                        <LinkCard key={card.title} href={`/${locale}${card.href}`} title={card.title} text={card.text} />
+                        <LinkCard key={card.title} href={`/${locale}${card.href}`} title={card.title} text={keepNames(card.text)} />
                     ))}
                 </div>
             </Section>
@@ -256,7 +251,7 @@ export default async function Home({ params }: Props) {
                                 {group.items.map((item) => (
                                     <li key={item.name} className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 py-2.5">
                                         <span className="font-medium text-fg">{item.name}</span>
-                                        <span className="text-sm text-muted">{item.note}</span>
+                                        <span className="text-sm text-muted">{keepNames(item.note)}</span>
                                     </li>
                                 ))}
                             </ul>
@@ -276,7 +271,7 @@ export default async function Home({ params }: Props) {
                                 </span>
                             </div>
                             <h3 className="mt-3 font-semibold tracking-tight text-fg">{stage.title}</h3>
-                            <p className="mt-1.5 text-sm leading-relaxed text-muted">{stage.text}</p>
+                            <p className="mt-1.5 text-sm leading-relaxed text-muted">{keepNames(stage.text)}</p>
                         </li>
                     ))}
                 </ol>

@@ -8,17 +8,11 @@ export interface Card {
     href: string;
 }
 
-// The case for nos on the home page: what is wrong with the host as it is, and what nos does about it.
+// Why nos is written the way it is, on the home page: a short lead, then a card for each thing that keeps it safe.
 export interface Why {
     title: string;
     lead: string;
-    stats: { value: string; label: string }[];
-    ai: string;
-    approachTitle: string;
     approach: { kicker: string; title: string; text: string }[];
-    closing: string;
-    sourcesTitle: string;
-    sources: { label: string; href: string }[];
 }
 
 // How to put nos on a server, or try it, on the home page: the commands themselves are the page's.
@@ -66,7 +60,6 @@ export interface Dictionary {
         try: Try;
         why: Why;
         highlightsTitle: string;
-        highlightsLead: string;
         highlights: Card[];
         platformsTitle: string;
         platformsLead: string;
@@ -130,22 +123,12 @@ export interface Dictionary {
 }
 
 /*
- * What the case on the home page stands on. The CVE counts are NVD's records
- * from the kernel.org CNA by publication date, rejected ones left out, counted
- * on 22 October 2026 (2025: 5,675; 2026 to that day: 7,856; August 1,643,
- * September 2,111; January to March 644); the exploited ones, CISA's catalog
- * of 21 October 2026. nos's own: scripts/sloc.py and scripts/unsafe-count.py.
+ * The numbers in the home page's "why" cards are the tree's own, from
+ * scripts/sloc.py on 20 November 2026: Rust is 160,401 of the 220,577 lines
+ * of code (72.7%), 1,316 of its lines are inside unsafe blocks (0.8%), and
+ * hypervisor/hv has 4 unsafe blocks in 22,125 lines. Recount before changing
+ * them.
  */
-const whySources = {
-    nvd: "https://services.nvd.nist.gov/rest/json/cves/2.0?sourceIdentifier=416baaa9-dc9f-4396-8d5f-8c081fb06d67&pubStartDate=2026-09-01T00:00:00.000Z&pubEndDate=2026-09-30T23:59:59.999Z&noRejected&resultsPerPage=1",
-    announce: "https://lore.kernel.org/linux-cve-announce/",
-    kev: "https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
-    torvalds: "https://lkml.org/lkml/2026/5/17/896",
-    fix: "https://git.kernel.org/linus/de845981da67a6b049080c87e605130b0c30adc5",
-    tencent: "https://matrix.tencent.com/en/2026/10/12/vghost-cve-2026-74580",
-    sloc: "https://github.com/irqlevel/nos/blob/master/scripts/sloc.py",
-};
-
 const en: Dictionary = {
     meta: {
         title: "nos — an OS kernel in C++ and Rust with a hypervisor of its own",
@@ -168,9 +151,9 @@ const en: Dictionary = {
     },
     home: {
         eyebrow: "x86-64 · arm64 · C++20 · Rust",
-        title: "An OS kernel built to be safe by design",
+        title: "A hypervisor that runs on bare metal",
         lead:
-            "nos is an operating system kernel for x86-64 and arm64, written in C++20, Rust and a little assembly. It runs in QEMU, in KVM-based clouds, on Apple Silicon and on real servers. Where we're going: a cloud host that runs Linux virtual machines under its own hypervisor, written in Rust.",
+            "nos is installed straight onto a server and runs virtual machines on it. The network stack, storage, hypervisor and management API are all its own, so there is no other OS underneath. It's written in Rust and C++20 and runs on x86-64 and arm64. Virtual machines run on x86-64 only, for now.",
         ctaAbout: "What is nos",
         ctaRun: "Run it in QEMU",
         ctaDemo: "Watch the demo",
@@ -202,124 +185,101 @@ const en: Dictionary = {
                 title: "Try it without a server",
                 text: "Run nos in QEMU on a laptop in a few minutes, or watch the demo first.",
             },
-            more: "Step by step, with the commands for doing it by hand and for installing nos next to Linux on a spare partition:",
+            more: "Step by step, with the commands for doing it by hand and for putting nos on a spare partition next to the system already installed:",
             moreLink: "Install nos on a server",
         },
         why: {
-            title: "Why another kernel",
-            lead: "Linux is written in C. It's a great language, but it trusts the programmer with every bounds check, every object lifetime and every lock, across tens of millions of lines of code. Mistakes are inevitable, and the vulnerabilities now come by the thousand.",
-            stats: [
-                { value: "7,856", label: "vulnerabilities (CVEs) published for the Linux kernel in 2026, as of 22 October. That's more than in all of 2025 (5,675)." },
-                { value: "3,754", label: "of them in August and September alone. The whole first quarter had 644." },
-                { value: "8", label: "kernel vulnerabilities added this year to CISA's list of bugs that attackers actually exploit" },
-            ],
-            ai: "AI has made finding these bugs cheap. In May, Linus Torvalds wrote that the “continued flood of AI reports has basically made the security list almost entirely unmanageable”. In August, a fix co-credited to an AI system closed Vghost (CVE-2026-74580). It was a stale cache in vhost that let a local user become root. With a virtual IOMMU, it also let a virtual machine write outside its memory into the host's QEMU process, breaking exactly the wall a hypervisor is there to keep.",
-            approachTitle: "Our approach",
+            title: "Why our own kernel",
+            lead: "Systems software written in older languages like C gets new vulnerabilities all the time, and most of them are memory bugs. To keep that out of nos as far as we can, we chose modern tools from the start.",
             approach: [
                 {
-                    kicker: "≈ 90,000 lines",
-                    title: "Small enough to check",
-                    text: "The whole system (kernel, drivers, network stack, filesystems and hypervisor) is about 90,000 lines of code, not tens of millions. It's small enough to review in full, and much easier to verify.",
+                    kicker: "73% of the code is Rust",
+                    title: "Mostly Rust",
+                    text: "Drivers, the network stack, filesystems and the hypervisor are written in Rust. In safe Rust you can't write past the end of an array, use memory after it has been freed, or cause a data race.",
                 },
                 {
-                    kicker: "63% Rust · 1.7% of it unsafe",
-                    title: "Safe Rust by default",
-                    text: "63% of the code is Rust, and only 1.7% of those lines are inside unsafe blocks. They sit in the few crates that talk to the hardware and to the C side, and we recount them on every change. In the rest of the code, out-of-bounds writes, use-after-free and data races simply can't be written. The hypervisor's logic has just 4 unsafe spots in 18,929 lines.",
+                    kicker: "0.8% of Rust lines are unsafe",
+                    title: "Little unsafe code",
+                    text: "Code marked unsafe, which the compiler can't fully check, is needed only where nos talks to the hardware or to its C++ part. That's under one percent of the Rust, and the hypervisor's logic has just 4 such places in 22,000 lines.",
                 },
                 {
-                    kicker: "4 host fuzzers in CI",
-                    title: "Fuzzing as a first-class citizen",
-                    text: "Four fuzzers compile the kernel's own code as ordinary programs and hammer it with random input: the hypervisor's devices, the network stack, the filesystems, and the C++ under ASan and UBSan. They run in CI on every change, with long runs in between.",
-                },
-                {
-                    kicker: "UBSan · RUSTUB · W^X",
+                    kicker: "fuzzers and sanitizers",
                     title: "Checked on every change",
-                    text: "CI boots builds with undefined-behaviour checks turned on, on both architectures. Every subsystem has its own test, and when something breaks, the kernel stops with a panic that says where, instead of hanging silently.",
+                    text: "Fuzzers run the kernel's own code on random data, and CI boots both architectures with undefined-behaviour checks on every change. When something breaks, the kernel stops and says where, instead of hanging silently.",
                 },
-            ],
-            closing: "Linux doesn't go away: it runs as a guest. What changes is the host underneath, the one layer that must not fail. We want it small enough to check, and built so that whole classes of bugs can't be written in it.",
-            sourcesTitle: "Sources",
-            sources: [
-                { label: "NVD: the kernel.org CNA's CVEs, e.g. September 2026", href: whySources.nvd },
-                { label: "linux-cve-announce", href: whySources.announce },
-                { label: "CISA KEV catalog", href: whySources.kev },
-                { label: "Linus Torvalds, 17 May 2026", href: whySources.torvalds },
-                { label: "the Vghost fix (Assisted-by: tencentos-corvus-ai)", href: whySources.fix },
-                { label: "Tencent Zhuque Lab on Vghost", href: whySources.tencent },
-                { label: "nos: scripts/sloc.py, scripts/unsafe-count.py", href: whySources.sloc },
             ],
         },
-        highlightsTitle: "What is inside",
-        highlightsLead:
-            "Every design decision starts from the same list: no undefined behaviour, no memory corruption, no data races, no deadlocks, and no failure that goes unnoticed.",
+        highlightsTitle: "What's inside",
         highlights: [
             {
-                title: "Two architectures",
-                text: "The same kernel runs on x86-64 (booting from BIOS or UEFI) and on arm64. Architecture-specific code sits behind a thin hardware layer, and CI boots both on every change.",
-                href: "/docs/boot",
-            },
-            {
-                title: "Rust on top of a C++ core",
-                text: "The core (boot, memory management, the scheduler, interrupts) is C++20. Everything above it is Rust: the block layer, the network stack, filesystems, virtio and all drivers. Unsafe code lives in one library, kcore.",
-                href: "/docs/rust",
-            },
-            {
-                title: "A hypervisor of its own",
-                text: "It supports both AMD-V and Intel VT-x and ships as a module you can load and unload. Unmodified Linux, Alpine, Debian and Ubuntu boot as guests with several CPUs, virtio disks and networking through a NAT switch. A VM lives in a folder, and one command makes it from a cloud image's URL.",
+                title: "Hypervisor",
+                text: "Runs on Intel VT-x and AMD-V. Alpine, Debian and Ubuntu boot in its VMs with several CPUs, disks and networking. A VM is made from a cloud image with one command, and it can be given a whole GPU.",
                 href: "/hypervisor",
             },
             {
+                title: "Cluster",
+                text: "Several nos servers work together. VM disks are kept as copies on different servers, VMs on different servers can share one network, and a running VM can move to another server without stopping.",
+                href: "/blog/live-migration",
+            },
+            {
+                title: "Management panel",
+                text: "A web panel and an HTTP API: create a VM, open its console, look after disks, networks and the cluster's servers.",
+                href: "/blog/management-panel",
+            },
+            {
                 title: "Networking",
-                text: "Its own TCP/IP stack with DHCP and DNS, an HTTPS client (TLS 1.3 via rustls), and an SSH server you log into with an Ed25519 key.",
+                text: "Its own TCP/IP stack with DHCP and DNS, an HTTPS client on TLS 1.3, and an SSH server with SFTP.",
                 href: "/docs/tls",
             },
             {
                 title: "Storage",
-                text: "An asynchronous block layer with NVMe and virtio drivers, MBR and GPT partitions, read-write ext4 and ext2, and a VFS on top.",
+                text: "An asynchronous block layer, NVMe, SATA and virtio drivers, MBR and GPT partitions, and ext4 and ext2 for reading and writing.",
                 href: "/docs/filesystems",
             },
             {
-                title: "Loadable modules",
-                text: "Kernel services can be written in Rust as separate .ko files and loaded with insmod while the system runs. Their memory is never writable and executable at the same time.",
+                title: "x86-64 and arm64",
+                text: "One kernel for both. Everything that depends on the CPU sits behind a thin layer, and CI boots both on every change. On x86-64, nos boots from BIOS or UEFI.",
+                href: "/docs/boot",
+            },
+            {
+                title: "Modules",
+                text: "Kernel services are written in Rust as separate .ko files and loaded into the running system with insmod. The SSH server, the API and the hypervisor itself are modules.",
                 href: "/docs/modules",
             },
             {
-                title: "Gates, not hopes",
-                text: "CI boots builds with undefined-behaviour checks, every subsystem has a dedicated test, and four fuzzers test the kernel's own code on the host.",
-                href: "/docs/testing",
-            },
-            {
-                title: "Failures that are loud",
-                text: "When something goes wrong, you find out: readable backtraces, a watchdog for stuck locks, a panic that names the CPUs that stopped answering, a profiler, and netconsole for machines without a serial port.",
+                title: "Debugging",
+                text: "Readable backtraces, watchdogs, tracing and a profiler. Servers without a serial port send their log over the network with netconsole.",
                 href: "/docs/debug",
             },
         ],
         platformsTitle: "Where it runs",
-        platformsLead:
-            "We develop in emulators and clouds and test on real hardware. Two of our machines have no screen and no serial port, only the network.",
+        platformsLead: "We develop in QEMU, run in the cloud and test on real servers. Five of them we can reach only over the network.",
         virtual: "Virtual",
         metal: "Bare metal",
         platformsVirtual: [
             { name: "QEMU / KVM", note: "x86-64, BIOS and UEFI" },
-            { name: "Apple Silicon", note: "QEMU virt with HVF" },
+            { name: "QEMU virt", note: "arm64" },
             { name: "Google Cloud", note: "KVM, virtio" },
             { name: "Yandex Cloud", note: "KVM, virtio" },
         ],
         platformsMetal: [
-            { name: "Dell Latitude 5480", note: "UEFI, framebuffer console, USB keyboard" },
-            { name: "Hetzner EX44", note: "Intel CPU, RTL8125 NIC, VT-x guests; reachable only over the network" },
-            { name: "Hetzner AX41", note: "AMD Ryzen CPU, Intel I210 NIC, AMD-V guests" },
+            { name: "Dell Latitude 5480", note: "a laptop: UEFI, screen console, USB keyboard" },
+            { name: "Hetzner EX44", note: "Intel, an RTL8125 NIC, VMs on VT-x" },
+            { name: "Hetzner AX41", note: "AMD Ryzen, an Intel I210 NIC, VMs on AMD-V" },
+            { name: "ASUS RS500-E6-PS4", note: "two Xeons, BIOS, SATA in IDE mode" },
+            { name: "Supermicro X11SSD-F", note: "a Xeon, UEFI, SATA through AHCI, Intel I350" },
+            { name: "MSI PRO B760M-P", note: "Raptor Lake, an RTX A2000 given to a VM" },
+            { name: "Supermicro X10DRi", note: "two sockets, two NUMA nodes, 256 GiB" },
         ],
         roadmapTitle: "Roadmap",
-        roadmapLead:
-            "Where we're heading: a cloud server that runs nos directly on the hardware, hosts Linux guests under a Rust hypervisor, and can update itself without stopping them.",
+        roadmapLead: "We're building a cloud server where nos runs right on the hardware, hosts virtual machines and updates itself without stopping them.",
         stages: [
-            { title: "Bare metal", text: "nos boots on real servers and can be managed remotely.", status: "done" },
-            { title: "Rust strategy", text: "New code is written in Rust, with unsafe kept to a few small crates.", status: "ongoing" },
-            { title: "HAL + arm64", text: "A hardware abstraction layer and an arm64 port, done before the hypervisor.", status: "done" },
-            { title: "Hypervisor", text: "A Rust hypervisor that boots Linux guests on AMD-V and Intel VT-x.", status: "progress" },
-            { title: "Control plane", text: "An HTTP API to create and delete virtual machines and reach their consoles.", status: "planned" },
-            { title: "Live update", text: "Replace the host kernel under running guests in less than 100 ms.", status: "planned" },
+            { title: "Bare metal", text: "nos boots on real servers, and they can be managed remotely.", status: "done" },
+            { title: "Rust", text: "New code is written in Rust, with as little unsafe as possible.", status: "ongoing" },
+            { title: "HAL and arm64", text: "A thin layer between the code and the CPU, and the arm64 port. Both were done before the hypervisor.", status: "done" },
+            { title: "Hypervisor", text: "A Rust hypervisor for VMs on Intel VT-x and AMD-V.", status: "progress" },
+            { title: "Management", text: "An HTTP API and a web panel to create and delete VMs and reach their consoles.", status: "progress" },
+            { title: "Live update", text: "Update the server's kernel in under 100 ms without stopping its VMs.", status: "planned" },
         ],
         status: { done: "Done", ongoing: "Ongoing", progress: "In progress", planned: "Planned" },
         blogTitle: "From the blog",
@@ -328,12 +288,12 @@ const en: Dictionary = {
         learn: [
             {
                 title: "Documentation",
-                text: "How each part of the system works, from boot to the hypervisor. It's generated from the repository, so it always matches the code.",
+                text: "How each part of nos works, from boot to the hypervisor. It's built straight from the repository, so it matches the code.",
                 href: "/docs",
             },
             {
                 title: "How-to guides",
-                text: "Step by step: build nos, run it, connect to it over the network, install it on a server, boot Linux under it, write a module.",
+                text: "Step by step: build nos, run it, connect to it over the network, install it on a server, run a VM, write a module.",
                 href: "/howto",
             },
         ],
@@ -433,9 +393,9 @@ const ru: Dictionary = {
     },
     home: {
         eyebrow: "x86-64 · arm64 · C++20 · Rust",
-        title: "Ядро ОС, безопасное по построению",
+        title: "Гипервизор, который работает прямо на железе",
         lead:
-            "nos — ядро операционной системы для x86-64 и arm64 на C++20, Rust и немного ассемблера. Оно работает в QEMU, в облаках на KVM, на Apple Silicon и на настоящих серверах. Наша цель — облачный хост, который запускает виртуальные машины с Linux под собственным гипервизором на Rust.",
+            "nos ставится прямо на сервер и запускает на нём виртуальные машины. Сеть, хранилище, гипервизор и API для управления у него свои, так что другая ОС под ним не нужна. Написан на Rust и C++20, работает на x86-64 и arm64. Виртуальные машины пока запускаются только на x86-64.",
         ctaAbout: "Что такое nos",
         ctaRun: "Запустить в QEMU",
         ctaDemo: "Смотреть демо",
@@ -467,124 +427,101 @@ const ru: Dictionary = {
                 title: "Попробовать без сервера",
                 text: "Запустите nos в QEMU на ноутбуке за несколько минут или сначала посмотрите демо.",
             },
-            more: "По шагам, с командами для установки вручную и для установки nos рядом с Linux на свободный раздел:",
+            more: "По шагам, с командами для установки вручную и для установки nos на свободный раздел рядом с уже стоящей системой:",
             moreLink: "Как поставить nos на сервер",
         },
         why: {
-            title: "Зачем ещё одно ядро",
-            lead: "Linux написан на C. Это отличный язык, но каждую проверку границ, время жизни каждого объекта и каждую блокировку он доверяет программисту, и так на десятках миллионов строк кода. Ошибки неизбежны, и уязвимости теперь находят тысячами.",
-            stats: [
-                { value: "7 856", label: "уязвимостей (CVE) в ядре Linux опубликовано в 2026 году к 22 октября. Это больше, чем за весь 2025-й (5 675)." },
-                { value: "3 754", label: "из них — только за август и сентябрь. За весь первый квартал было 644." },
-                { value: "8", label: "уязвимостей ядра CISA в этом году добавило в список тех, что реально используются в атаках" },
-            ],
-            ai: "ИИ сделал поиск таких ошибок дешёвым. В мае Линус Торвальдс написал, что непрекращающийся поток отчётов от ИИ сделал список рассылки по безопасности почти неуправляемым. В августе исправление, соавтором которого указана ИИ-система, закрыло Vghost (CVE-2026-74580). Это был устаревший кэш в vhost, через который локальный пользователь получал root. А при виртуальном IOMMU гостевая машина могла писать за пределы своей памяти прямо в процесс QEMU на хосте, то есть пробить ту самую стену, которую гипервизор должен держать.",
-            approachTitle: "Наш подход",
+            title: "Зачем своё ядро",
+            lead: "В системных программах на старых языках вроде C постоянно находят новые уязвимости, и большая часть из них связана с памятью. Чтобы в nos такого было как можно меньше, мы с самого начала выбрали современные инструменты.",
             approach: [
                 {
-                    kicker: "≈ 90 000 строк",
-                    title: "Достаточно маленькое, чтобы проверить",
-                    text: "Вся система (ядро, драйверы, сетевой стек, файловые системы и гипервизор) — это около 90 000 строк кода, а не десятки миллионов. Её можно прочитать целиком, и её гораздо проще верифицировать.",
+                    kicker: "73% кода на Rust",
+                    title: "В основном Rust",
+                    text: "На Rust написаны драйверы, сеть, файловые системы и гипервизор. В безопасном Rust нельзя записать за границу массива, обратиться к освобождённой памяти или устроить гонку данных.",
                 },
                 {
-                    kicker: "63% Rust · 1,7% из них unsafe",
-                    title: "Безопасный Rust по умолчанию",
-                    text: "63% кода написано на Rust, и только 1,7% этих строк находятся внутри unsafe-блоков. Они собраны в нескольких крейтах, которые общаются с железом и с кодом на C, и мы пересчитываем их при каждом изменении. В остальном коде запись за границы, use-after-free и гонки данных просто невозможно написать. В логике гипервизора всего 4 места с unsafe на 18 929 строк.",
+                    kicker: "0,8% строк Rust в unsafe",
+                    title: "Мало опасного кода",
+                    text: "Код с пометкой unsafe, который компилятор не может проверить до конца, нужен только там, где nos работает с железом или с частью на C++. Это меньше процента кода на Rust, а в логике гипервизора таких мест всего 4 на 22 тысячи строк.",
                 },
                 {
-                    kicker: "4 фаззера в CI",
-                    title: "Фаззинг на первом месте",
-                    text: "Четыре фаззера собирают код ядра как обычные программы и заваливают его случайными данными: устройства гипервизора, сетевой стек, файловые системы и код на C++ под ASan и UBSan. Они запускаются в CI на каждое изменение, а в промежутках идут долгие прогоны.",
+                    kicker: "фаззеры и санитайзеры",
+                    title: "Проверка на каждое изменение",
+                    text: "Фаззеры гоняют собственный код ядра на случайных данных, а CI на каждое изменение загружает обе архитектуры с проверками неопределённого поведения. Если что-то сломалось, ядро останавливается и пишет, где именно, а не зависает молча.",
                 },
-                {
-                    kicker: "UBSan · RUSTUB · W^X",
-                    title: "Каждое изменение под проверкой",
-                    text: "В CI на обеих архитектурах загружаются сборки с проверками неопределённого поведения. У каждой подсистемы есть свой тест, а если что-то ломается, ядро останавливается с паникой и говорит, где именно, вместо того чтобы тихо зависнуть.",
-                },
-            ],
-            closing: "Linux никуда не девается: он работает гостем. Меняется хост под ним, единственный слой, который не имеет права упасть. Мы хотим, чтобы он был достаточно маленьким, чтобы его проверить, и устроенным так, чтобы целые классы ошибок в нём нельзя было написать.",
-            sourcesTitle: "Источники",
-            sources: [
-                { label: "NVD: CVE от CNA kernel.org, например за сентябрь 2026", href: whySources.nvd },
-                { label: "linux-cve-announce", href: whySources.announce },
-                { label: "каталог CISA KEV", href: whySources.kev },
-                { label: "Линус Торвальдс, 17 мая 2026", href: whySources.torvalds },
-                { label: "исправление Vghost (Assisted-by: tencentos-corvus-ai)", href: whySources.fix },
-                { label: "Tencent Zhuque Lab о Vghost", href: whySources.tencent },
-                { label: "nos: scripts/sloc.py, scripts/unsafe-count.py", href: whySources.sloc },
             ],
         },
         highlightsTitle: "Что внутри",
-        highlightsLead:
-            "Каждое решение здесь начинается с одного списка: никакого неопределённого поведения, порчи памяти, гонок данных и взаимоблокировок — и никаких ошибок, которые проходят незамеченными.",
         highlights: [
             {
-                title: "Две архитектуры",
-                text: "Одно и то же ядро работает на x86-64 (загрузка через BIOS или UEFI) и на arm64. Код, зависящий от архитектуры, спрятан за тонким аппаратным слоем, а CI загружает обе версии на каждое изменение.",
-                href: "/docs/boot",
-            },
-            {
-                title: "Rust поверх ядра на C++",
-                text: "Основа (загрузка, управление памятью, планировщик, прерывания) написана на C++20. Всё, что выше, — на Rust: блочный слой, сетевой стек, файловые системы, virtio и все драйверы. Небезопасный код собран в одной библиотеке, kcore.",
-                href: "/docs/rust",
-            },
-            {
-                title: "Собственный гипервизор",
-                text: "Поддерживает и AMD-V, и Intel VT-x и поставляется как модуль, который можно загрузить и выгрузить. Немодифицированные Linux, Alpine, Debian и Ubuntu загружаются гостями с несколькими CPU, дисками virtio и сетью через коммутатор с NAT. ВМ живёт в папке, а одна команда делает её из облачного образа по ссылке.",
+                title: "Гипервизор",
+                text: "Работает на Intel VT-x и AMD-V. В его ВМ запускаются Alpine, Debian и Ubuntu с несколькими CPU, дисками и сетью. ВМ делается из облачного образа одной командой, и ей можно отдать видеокарту целиком.",
                 href: "/hypervisor",
             },
             {
+                title: "Кластер",
+                text: "Несколько серверов с nos работают вместе. Диски ВМ хранятся в нескольких копиях на разных серверах, ВМ с разных серверов могут быть в одной сети, а работающую ВМ можно перенести на другой сервер, не останавливая её.",
+                href: "/blog/live-migration",
+            },
+            {
+                title: "Панель управления",
+                text: "Веб-панель и HTTP API: создать ВМ, открыть её консоль, управлять дисками, сетями и серверами кластера.",
+                href: "/blog/management-panel",
+            },
+            {
                 title: "Сеть",
-                text: "Собственный стек TCP/IP с DHCP и DNS, HTTPS-клиент (TLS 1.3 через rustls) и SSH-сервер, в который можно зайти по ключу Ed25519.",
+                text: "Свой стек TCP/IP с DHCP и DNS, HTTPS-клиент на TLS 1.3 и SSH-сервер с SFTP.",
                 href: "/docs/tls",
             },
             {
                 title: "Хранилище",
-                text: "Асинхронный блочный слой с драйверами NVMe и virtio, разделы MBR и GPT, ext4 и ext2 на чтение и запись и VFS поверх всего этого.",
+                text: "Асинхронный блочный слой, драйверы NVMe, SATA и virtio, разделы MBR и GPT, ext4 и ext2 на чтение и запись.",
                 href: "/docs/filesystems",
             },
             {
-                title: "Загружаемые модули",
-                text: "Сервисы ядра можно писать на Rust отдельными .ko-файлами и загружать через insmod прямо в работающую систему. Их память никогда не бывает одновременно доступной на запись и на исполнение.",
+                title: "x86-64 и arm64",
+                text: "Одно ядро для обеих архитектур. Всё, что зависит от процессора, отделено тонким слоем, и CI на каждое изменение загружает обе. На x86-64 nos загружается и через BIOS, и через UEFI.",
+                href: "/docs/boot",
+            },
+            {
+                title: "Модули",
+                text: "Сервисы ядра пишутся на Rust отдельными .ko-файлами и загружаются в работающую систему командой insmod. Так устроены SSH-сервер, API и сам гипервизор.",
                 href: "/docs/modules",
             },
             {
-                title: "Гейты вместо надежд",
-                text: "В CI загружаются сборки с проверками неопределённого поведения, у каждой подсистемы есть свой тест, а четыре фаззера проверяют собственный код ядра на хосте.",
-                href: "/docs/testing",
-            },
-            {
-                title: "Отказы, которые слышно",
-                text: "Если что-то пошло не так, вы об этом узнаете: понятные бэктрейсы, сторожевой таймер для зависших блокировок, паника с номерами не ответивших CPU, профилировщик и netconsole, чтобы достать лог с машины без последовательного порта.",
+                title: "Отладка",
+                text: "Понятные бэктрейсы, сторожевые таймеры, трассировка и профилировщик. Серверы без последовательного порта отдают лог по сети через netconsole.",
                 href: "/docs/debug",
             },
         ],
         platformsTitle: "Где работает",
-        platformsLead:
-            "Мы разрабатываем в эмуляторах и облаках и проверяем на настоящем железе. У двух наших машин нет ни экрана, ни последовательного порта, только сеть.",
+        platformsLead: "Разрабатываем в QEMU, запускаем в облаках и проверяем на настоящих серверах. Пять из них доступны нам только по сети.",
         virtual: "Виртуальные",
         metal: "Реальное железо",
         platformsVirtual: [
             { name: "QEMU / KVM", note: "x86-64, BIOS и UEFI" },
-            { name: "Apple Silicon", note: "QEMU virt с HVF" },
+            { name: "QEMU virt", note: "arm64" },
             { name: "Google Cloud", note: "KVM, virtio" },
             { name: "Yandex Cloud", note: "KVM, virtio" },
         ],
         platformsMetal: [
-            { name: "Dell Latitude 5480", note: "UEFI, консоль на фреймбуфере, USB-клавиатура" },
-            { name: "Hetzner EX44", note: "Intel, сетевая карта RTL8125, гости на VT-x; доступ только по сети" },
-            { name: "Hetzner AX41", note: "AMD Ryzen, сетевая карта Intel I210, гости на AMD-V" },
+            { name: "Dell Latitude 5480", note: "ноутбук: UEFI, консоль на экране, USB-клавиатура" },
+            { name: "Hetzner EX44", note: "Intel, сетевая карта RTL8125, ВМ на VT-x" },
+            { name: "Hetzner AX41", note: "AMD Ryzen, сетевая карта Intel I210, ВМ на AMD-V" },
+            { name: "ASUS RS500-E6-PS4", note: "два Xeon, BIOS, SATA в режиме IDE" },
+            { name: "Supermicro X11SSD-F", note: "Xeon, UEFI, SATA через AHCI, Intel I350" },
+            { name: "MSI PRO B760M-P", note: "Raptor Lake, видеокарта RTX A2000 отдана ВМ" },
+            { name: "Supermicro X10DRi", note: "два сокета, два узла NUMA, 256 ГиБ" },
         ],
         roadmapTitle: "Дорожная карта",
-        roadmapLead:
-            "Куда мы идём: облачный сервер, на котором nos работает прямо на железе, запускает гостевые Linux под гипервизором на Rust и умеет обновляться, не останавливая их.",
+        roadmapLead: "Мы делаем облачный сервер, на котором nos работает прямо на железе, держит виртуальные машины и обновляется, не останавливая их.",
         stages: [
             { title: "Голое железо", text: "nos загружается на настоящих серверах, и ими можно управлять удалённо.", status: "done" },
-            { title: "Стратегия Rust", text: "Новый код пишется на Rust, а unsafe собран в нескольких маленьких крейтах.", status: "ongoing" },
-            { title: "HAL + arm64", text: "Слой абстракции оборудования и порт на arm64, сделанные раньше гипервизора.", status: "done" },
-            { title: "Гипервизор", text: "Гипервизор на Rust, который загружает гостевые Linux на AMD-V и Intel VT-x.", status: "progress" },
-            { title: "Плоскость управления", text: "HTTP API, чтобы создавать и удалять виртуальные машины и подключаться к их консолям.", status: "planned" },
-            { title: "Живое обновление", text: "Замена ядра хоста под работающими гостями меньше чем за 100 мс.", status: "planned" },
+            { title: "Rust", text: "Новый код пишем на Rust, а unsafe сводим к минимуму.", status: "ongoing" },
+            { title: "HAL и arm64", text: "Тонкий слой между кодом и процессором и порт на arm64. Оба сделаны до гипервизора.", status: "done" },
+            { title: "Гипервизор", text: "Гипервизор на Rust для ВМ на Intel VT-x и AMD-V.", status: "progress" },
+            { title: "Управление", text: "HTTP API и веб-панель, чтобы создавать и удалять ВМ и подключаться к их консолям.", status: "progress" },
+            { title: "Живое обновление", text: "Обновить ядро сервера меньше чем за 100 мс, не останавливая его ВМ.", status: "planned" },
         ],
         status: { done: "Готово", ongoing: "Постоянно", progress: "В работе", planned: "В планах" },
         blogTitle: "Из блога",
@@ -593,12 +530,12 @@ const ru: Dictionary = {
         learn: [
             {
                 title: "Документация",
-                text: "Как устроена каждая часть системы, от загрузки до гипервизора. Она генерируется из репозитория, поэтому всегда совпадает с кодом.",
+                text: "Как устроена каждая часть nos, от загрузки до гипервизора. Собирается прямо из репозитория, поэтому не расходится с кодом.",
                 href: "/docs",
             },
             {
                 title: "Руководства",
-                text: "По шагам: собрать nos, запустить, подключиться по сети, поставить на сервер, загрузить под ним Linux, написать модуль.",
+                text: "По шагам: собрать nos, запустить, подключиться по сети, поставить на сервер, запустить ВМ, написать модуль.",
                 href: "/howto",
             },
         ],
