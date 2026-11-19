@@ -101,13 +101,43 @@ impl PciDevice {
         (u64::from(self.get_bar(bar + 1)) << 32) | base
     }
 
+    /// Bus mastering on, for a driver of the host's: the function taken by
+    /// it too (`take`).
     pub fn enable_bus_mastering(&self) {
         unsafe { pci::kernel_pci_enable_bus_mastering(self.bus, self.slot, self.func) }
+    }
+
+    /// The function a driver of the host's: given to no guest from here on.
+    /// What a driver that turns on no bus mastering says at its probe -- the
+    /// one that does says it with that.
+    pub fn take(&self) {
+        pci::kernel_pci_take(self.bus, self.slot, self.func)
+    }
+
+    /// Whether a driver of the host's has taken it.
+    pub fn driven(&self) -> bool {
+        pci::kernel_pci_driven(self.bus, self.slot, self.func) != 0
+    }
+
+    /// Whether it is kept for guests (`guestpci=`): no driver of the host's
+    /// is shown it.
+    pub fn kept(&self) -> bool {
+        pci::kernel_pci_kept(self.bus, self.slot, self.func) != 0
     }
 
     pub fn find_capability(&self, cap_id: u8) -> Option<u8> {
         let off = unsafe {
             pci::kernel_pci_find_capability(self.bus, self.slot, self.func, cap_id, 0)
+        };
+        if off == 0 { None } else { Some(off) }
+    }
+
+    /// The extended capability (PCIe's, past 256 bytes) of id `cap_id`: its
+    /// offset, None where the function has none -- or its bus has no
+    /// extended space reachable (x86-64: no MCFG, or its window refused).
+    pub fn find_extended_capability(&self, cap_id: u16) -> Option<u16> {
+        let off = unsafe {
+            pci::kernel_pci_find_extended_capability(self.bus, self.slot, self.func, cap_id)
         };
         if off == 0 { None } else { Some(off) }
     }
@@ -139,7 +169,9 @@ pub fn find_device_from(vendor: u16, device: u16, start: usize)
     }
 }
 
-/// Look up a PCI device by bus/slot/func. Returns None if not found or vendor is 0xFFFF.
+/// Look up a PCI device by bus/slot/func -- one kept for guests too, which
+/// a driver's lookups pass over. Returns None if not found or vendor is
+/// 0xFFFF.
 pub fn get_device_by_bdf(bus: u16, slot: u16, func: u16) -> Option<PciDevice> {
     let vendor = unsafe {
         pci::kernel_pci_read_config16(bus, slot, func, 0x00)
@@ -150,12 +182,10 @@ pub fn get_device_by_bdf(bus: u16, slot: u16, func: u16) -> Option<PciDevice> {
     let device = unsafe {
         pci::kernel_pci_read_config16(bus, slot, func, 0x02)
     };
-    /* Populate the remaining fields from a scan search */
-    for i in 0..device_count() {
-        let d = get_device(i)?;
-        if d.bus == bus && d.slot == slot && d.func == func {
-            return Some(d);
-        }
+    /* The remaining fields from the scan's table */
+    let mut info = NO_DEVICE;
+    if unsafe { pci::kernel_pci_device_at(bus, slot, func, &mut info) } != 0 {
+        return Some(PciDevice::from_ffi(&info));
     }
     /* Device not in scan list -- build a minimal descriptor */
     Some(PciDevice {
@@ -169,6 +199,15 @@ pub fn get_device_by_bdf(bus: u16, slot: u16, func: u16) -> Option<PciDevice> {
 
 pub fn device_count() -> usize {
     pci::kernel_pci_device_count()
+}
+
+/// The `index`-th function the scan found, one kept for guests too --
+/// which `get_device` passes over: what the whole bus is, as IOMMU groups
+/// are made of it.
+pub fn get_any(index: usize) -> Option<PciDevice> {
+    let mut info = NO_DEVICE;
+    // SAFETY: `info` is a local, writable for the call.
+    (unsafe { pci::kernel_pci_get_any(index, &mut info) } != 0).then(|| PciDevice::from_ffi(&info))
 }
 
 pub fn get_device(index: usize) -> Option<PciDevice> {

@@ -62,6 +62,10 @@ mod fw_provider;
 #[cfg(target_arch = "x86_64")]
 mod guest;
 #[cfg(target_arch = "x86_64")]
+mod groups;
+#[cfg(target_arch = "x86_64")]
+mod hostpci;
+#[cfg(target_arch = "x86_64")]
 mod passthrough;
 #[cfg(target_arch = "x86_64")]
 mod forward;
@@ -172,6 +176,13 @@ hv disk attach <vm> <device>[:ro] [force]
                                    the machine boots from it or something holds it; force
                                    for one with something on it, or another vm's
 hv disk detach <vm> <device>       a device taken off a stopped vm's vm.toml, left as it is
+hv pci                             the host's PCI functions as guests are given them: a
+                                   driver's or kept for guests (guestpci=), the reset, the
+                                   interrupts, the IOMMU group, the vms that name each, and
+                                   why not where one cannot be given
+hv pci attach <vm> <bus:dev.fn>    a function put on a stopped vm's vm.toml, given at its
+                                   next start: never one that cannot be given
+hv pci detach <vm> <bus:dev.fn>    a function taken off a stopped vm's vm.toml
 hv cores [own|shared]              whether a guest's cores are its own -- whole cores no
                                    other guest has a CPU on, its CPUs filling their
                                    threads, and refused where there are none -- or may be
@@ -581,6 +592,8 @@ fn command(state: &State, args: &str, out: &mut Output) {
         "devices" => devices::command(&state.vms_root, &state.vms, out),
         #[cfg(target_arch = "x86_64")]
         "disk" => devices::disk_command(&state.vms_root, &state.vms, rest, out),
+        #[cfg(target_arch = "x86_64")]
+        "pci" => hostpci::command(&state.vms_root, &state.vms, rest, out),
         #[cfg(target_arch = "x86_64")]
         "bench" => bench(machine, words, out),
         #[cfg(target_arch = "x86_64")]

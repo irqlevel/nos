@@ -419,6 +419,18 @@ collector on another host, and an `/etc/rc` that ends in `reboot`. Its
 BootOrder tries the NIC's PXE first: POST to nos takes about two minutes, a
 boot of nos and back to Ubuntu about four.
 
+`tests/gpu-passthrough/install-bare-nvme.sh` gives a guest nos's own NVMe as
+well, beside the GPU: nos boots instead from two partitions made in the
+free space at the end of Ubuntu's disk (`nos`, 699 MiB, and `nos-disklog`,
+64 MiB, since 2026-11-19 -- Ubuntu's table dumped before), and
+`guestpci=05:00.0` keeps its drivers off the Samsung it usually boots from.
+The guest boots its root from that Samsung (`nos-guest`, 8 GiB), writes to
+`nos-scratch` (1 GiB), and `--check` sums both from Ubuntu after. Ubuntu's
+disk is `02:00.0`, behind the CPU's x4 port; nos's is `05:00.0`, behind the
+PCH's `1c.4`: each port has ACS, which the firmware leaves off and hv turns
+on, so each NVMe is a group of its own. `hv pci` refuses the integrated
+graphics: the DMAR names memory for it (RMRR, 0x7c000000-0x807fffff).
+
 ## Newton: a Supermicro X10DRi of two sockets
 
 A **Supermicro X10DRi** (AMI UEFI 3.4a, Secure Boot off, a C610 PCH, an

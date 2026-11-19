@@ -2,8 +2,11 @@
 title: "A real NVIDIA card inside a nos VM"
 description: "A Linux VM on nos's hypervisor now drives a real NVIDIA GPU with NVIDIA's own driver and runs CUDA at full speed. How it works, what broke on the way, and what's missing."
 date: 2026-11-19
+updated: 2026-11-19
 tags: [hypervisor, hardware, drivers, safety, testing, x86-64]
 ---
+
+*Most of what this post listed as missing has been done since it went up. That part is near the end, under [the second round](#the-second-round).*
 
 Until now, every device a VM on nos's [hypervisor](/hypervisor) could see was one we emulated in software: a virtio disk, a virtio network card, a serial port. Now a VM can get a real PCI device of the host's, and the first one we tried was a graphics card.
 
@@ -51,7 +54,7 @@ The hypervisor shows the VM the card's real configuration space, but filters wha
 - MSI is emulated. The host owns the card's real interrupt, and when it fires, the host delivers whatever vector the VM asked for.
 - The bits that reach beyond the card itself (phantom functions, no-snoop, the function reset), the link controls and power management stay with the host.
 
-Cards with MSI-X are turned away for now. Their interrupt table sits inside a BAR, and until we trap that page, the VM could point those interrupts anywhere it likes.
+At first, cards with MSI-X were turned away. Their interrupt table sits inside a BAR, and until we trapped that page, the VM could have pointed those interrupts anywhere it liked. That page is trapped now, as described in [the second round](#the-second-round).
 
 NVIDIA added one more thing to worry about. Their GPUs keep a copy of the PCI configuration space inside BAR0, at offset 0x88000. If that page were mapped into the VM as it is, the driver could change the real configuration through it and skip all of the filtering above. So that one page is trapped, and every access to it goes through the same filter. Two kinds of writes are passed on to the real copy, because the driver uses them to re-arm the card's MSI after each interrupt: a write to the MSI capability's ID on older cards, and one at 0x704 on Pascal and newer. Without them the card sends exactly one interrupt and then goes quiet.
 
@@ -105,17 +108,85 @@ And the IO-APIC lives at an address where nobody answers. The DMAR table identif
 
 On the bright side, in the last test run the card raised 89 interrupts, and every one of them reached the VM.
 
+## The second round
+
+After this post went up, we went through the list of what was missing and did most of it. The A2000 didn't need any of it, since it already worked. But most network cards and NVMe drives use MSI-X, so until now they couldn't go to a VM at all.
+
+### MSI-X, and a test that attacks the IOMMU
+
+A device with MSI-X keeps its table of interrupts inside one of its BARs. The hypervisor now traps the pages that table and its pending bits are on, and the VM fills in an emulated copy. The real table is filled in by the host, one host vector per entry, and the VM gets at most 16 of them.
+
+nos has drivers of its own for NVMe drives and network cards, and a function one of them has already taken can't be given away. A new boot parameter keeps the drivers off it: `guestpci=01:00.0`.
+
+There's a test for all of this now, and it runs in CI with no KVM and no real hardware. nos runs under QEMU, takes over QEMU's emulated VT-d and gives an emulated NVMe drive to a Linux VM. The VM's driver reads a pattern the test wrote into the drive's image, writes its own and reads it back past the page cache, and afterwards the test finds that pattern in the image.
+
+Then the VM turns hostile. A small program in it takes over the NVMe controller from user space and tells it to do what no normal driver would: write a page where the VM has no memory, and write into the interrupt address range, in the remapped format, naming table entries nos never filled in. The IOMMU blocks both, nos logs them, and the controller still answers afterwards:
+
+```
+vtd: dmar0: write of 0x40000000 by 01:00.0 blocked: 0x05, write to a page not mapped writable
+vtd: dmar0: interrupt 0xFF from ff:1f.7 blocked: 0x22, interrupt entry not present
+```
+
+The first line names the NVMe drive by its PCI address. The second names no real device: QEMU doesn't say who sent an interrupt that came in as a plain DMA write, so the sender shows up as ff:1f.7, which stands for nobody. That means this test can't show the IOMMU checking who sent an interrupt. Nor can it show that interrupts in the old format are blocked, because QEMU's VT-d delivers those even when told not to. Both still need a hostile run on real hardware.
+
+### What the VM sees now
+
+In a real computer, a device sits behind a PCIe root port, on a bus of its own, and now that's how it looks in the VM too. The hypervisor puts an emulated root port in front of each device it gives away, the same generic one QEMU uses, so Linux already knows it. The device's functions sit behind it with their own numbers. If the VM also gets the A2000's audio function, the two sit side by side as functions 0 and 1, which is where the audio driver looks for its GPU. The port reports the device's real link speed and width.
+
+The VM can also reach the extended configuration space now, through ECAM, which maps it into memory. nos uses ECAM on the host as well. On x86 it used to go through the old I/O ports only, and those don't reach past the first 256 bytes. In the VM, the ECAM window sits at the top of the gap below 4 GiB and is reserved in the ACPI tables and the memory map, because Linux won't use one that isn't. The VM can read the device's extended capabilities but not write them, and it only sees the ones that are useful read-only, like AER's error status, the serial number or the link. Anything that only works when written to, like SR-IOV, ATS or Resizable BAR, is hidden.
+
+There's a ROM BAR now too, though not the real one. nos reads the device's ROM once when it gives the device away, and when the VM switches its ROM BAR on, a copy is mapped there read-only. At first we trapped the ROM like the MSI-X table, and the VM stopped as soon as Linux read the NVMe's ROM. Linux copies a ROM with `memcpy_fromio`, which is a `rep movs`, one instruction that moves the whole block, and the hypervisor's emulator for trapped device memory doesn't handle string instructions. A read-only copy keeps the emulator out of it.
+
+### Resets and IOMMU groups
+
+A device without a function-level reset used to get no reset at all. Now, if the device is alone on its bus, as it is behind a PCIe port, nos resets it through the bridge above it, with a secondary bus reset. A device with neither kind of reset still goes to the VM, with a line in the log saying so. Around a reset, nos saves and restores the device's state, now including the size of each Resizable BAR, since a reset can put those back to their defaults.
+
+The bigger change is isolation. Before, nos looked at the device and stopped there. But what one function sends can reach another function directly, peer to peer, without passing through the IOMMU: inside a multi-function device, or through a switch port or root port that doesn't stop it. PCIe has a capability for stopping it, called ACS. Functions that can reach each other this way form an IOMMU group, and a VM gets a whole group or nothing. nos now turns ACS on wherever it exists, works out the groups, and blocks the rest of a group while a VM holds one of its functions. A group with a function nos itself uses, or one another VM holds, is refused. So is a device behind an old PCI bridge, since the IOMMU sees all its requests with the bridge's ID. The same goes for a device the firmware reserved memory for in the DMAR table (an RMRR), because the firmware expects its DMA to keep reaching that memory. Our groups are a bit stricter than Linux's: a switch port without ACS puts the whole switch into one group, and a function of a multi-function device without ACS joins all of its siblings.
+
+### Seeing what can be given
+
+With all that, it got hard to tell by eye what can go to a VM. `hv pci` now lists every PCI function of the host the way nos would give it: whether a driver of nos's has it or it's kept for VMs, how it would be reset, its interrupts, its group, the VMs that name it, and, if it can't be given, why. Here's part of the list from the test's QEMU machine:
+
+```
+> hv pci
+00:02.0 8086:10d3 02.00  a driver's  reset none  MSI-X 5  -- not given: a driver of the host's has it -- guestpci=00:02.0 keeps it
+00:04.0 1b36:000c 06.04  free  reset none  MSI-X 1  -- not given: a bridge
+01:00.0 1b36:0010 01.08  kept for guests  reset FLR  MSI-X 65  group 01:00.1
+01:00.1 1af4:1042 01.00  kept for guests  reset FLR  MSI-X 3  group 01:00.0
+02:00.0 1af4:1042 01.00  kept for guests  reset bus reset  MSI-X 3
+03:00.0 1af4:1044 00.ff  kept for guests  reset FLR  MSI-X 2  group 03:00.1  -- not given: its IOMMU group holds 03:00.1, the host's
+```
+
+That machine is set up to hit each case. The NVMe drive and the virtio disk next to it are two functions of one device, so they share a group. The second virtio disk has no function-level reset and gets reset through its bridge. The random number generator has two functions, and nos refuses to give the first because it uses the second itself.
+
+`hv pci attach` and `detach` add a function to a stopped VM's config or take it off, and refuse anything the list says can't be given. The same list is in the API and in the [management panel](/blog/management-panel), on the "Virtual machines" page, with a "Give to a VM" button on each row. There's still no hotplug: a VM gets its devices when it starts.
+
+### What broke this time
+
+The first run of the test with the second disk read that disk's queue out of nos's own memory, and QEMU reported `Guest says index 32768 is available`. QEMU's virtio devices go around its IOMMU unless you add `iommu_platform=on`, so the disk took the VM's addresses for real ones. That was our mistake in setting up the test, not a bug in nos, but it shows nicely what a device does when nothing translates its addresses.
+
+The hostile test was flaky at first: now and then one of the blocked attacks never made it into the log. nos's VT-d fault handler read the unit's fault status once. If another fault arrived while it ran and the unit had nowhere left to record it, the unit set its overflow flag, and the handler left that flag set. A unit with the flag set doesn't record any new faults, so QEMU's dropped every later one without a word. The handler now goes around until nothing is pending.
+
+Linux also complained about our ACPI tables, calling it a firmware bug: the host bridge claimed buses 0 to 255, while the ECAM window covered only 0 to 7. In a VM, the firmware is us, so the bridge now claims the same eight buses.
+
+As before, we deleted each new rule from the code once and made sure the hypervisor's fuzzer caught it, 57 more rules in all. On the way, the fuzzer found one real hole: the VM's writes to a capability's "next" pointer went through to the device. That byte is read-only on a well-behaved device, but it's the very list the host edits to hide capabilities from the VM, so the VM can't write it at all now.
+
+With all of this in, we ran the GPU test on Hertz again, first with nos under QEMU there as in the first test, then with nos on the bare metal. NVIDIA's driver didn't mind the root port in front of the card: `nvidia-smi` and the three samples passed both times, and matrixMul did 610.78 GFlop/s under QEMU and 610.94 on the bare metal. On the real bus, `hv pci` refused Hertz's integrated graphics, naming the memory the firmware had reserved for it.
+
+On the bare metal we also gave the VM an NVMe drive. Hertz has two, one with Ubuntu and one that is nos's own, so to free nos's drive, nos booted from a small partition at the end of Ubuntu's disk instead, and `guestpci=` kept its drivers off its usual drive. One VM got both the GPU and that drive. The kernel's own nvme driver read the first gigabyte of the drive and wrote 256 MiB of random data to a scratch partition, then the VM mounted its root filesystem from the same drive and ran the GPU test from there. Back in Ubuntu, the checksums of what the VM read and wrote matched what Ubuntu read off the drive itself.
+
 ## What's missing
 
 - Only Intel. AMD's IOMMU needs a driver of its own, which we haven't written yet, so our AMD servers can't pass devices through.
-- Devices with MSI-X are refused. For now that rules out most network cards and NVMe drives. The A2000 uses plain MSI.
-- The VM sees only the first 256 bytes of the card's configuration space, because nos doesn't use the extended configuration space (ECAM) on x86 yet. So the VM gets no Resizable BAR, AER or ACS.
-- There's no ROM BAR. NVIDIA's driver finds the card's firmware another way, but other drivers might not.
-- Devices are reset only with a function-level reset. A device that doesn't have one isn't reset at all, because resetting it through the bridge above it isn't done yet.
-- Isolation stops at the device. Its other functions are blocked or go to the same VM, but the bridges above it aren't checked for ACS, and a device the firmware reserved memory for (an RMRR) isn't refused.
-- Every interrupt from the card still goes through a handler on the host. VT-d can deliver it straight into the VM's virtual CPU, and that is one of the next things to do.
-- A VM with a real device can't be saved or [moved to another host](/blog/live-migration). The card's DMA doesn't show up in the dirty log, and part of the VM's state lives inside the card.
-- A VM gets at most four devices, and only when it starts.
-- We don't have a test yet that makes a device send something interrupt remapping must block, and checks that it does.
+- Every interrupt from a device still goes through a handler on the host. VT-d can deliver interrupts straight into the VM's virtual CPU, but only on units with posted interrupts, and neither of Hertz's two units has them. Neither does QEMU's, so this waits for a Xeon Scalable or something like it.
+- The VM can read a device's extended configuration space but not write to it, so it gets no Resizable BAR, SR-IOV, ATS or anything else that only works when written to.
+- A device with MSI-X shows the VM at most 16 of its vectors. QEMU's NVMe has 65.
+- A device that has no function-level reset and shares its bus with others can't be reset, and goes to the VM as it is.
+- Our IOMMU groups are stricter than Linux's, so a device Linux would pass through may be refused here.
+- A VM with a real device can't be saved or [moved to another host](/blog/live-migration). The device's DMA doesn't show up in the dirty log, and part of the VM's state lives inside the device.
+- A VM gets at most four devices, and only when it starts. There's no hotplug.
+- The hostile test runs only under QEMU, which can't show that interrupts in the old format get blocked or that an interrupt's sender gets checked. We haven't tried either on real hardware yet.
 
 The code lives in the kernel's [VT-d driver](https://github.com/irqlevel/nos/blob/master/src/base/arch/x86_64/vtd.cpp), in the hypervisor's [view of the host's device](https://github.com/irqlevel/nos/blob/master/src/crates/hypervisor/hv/src/devices/host.rs), and in the [module that hands it over](https://github.com/irqlevel/nos/blob/master/src/crates/modules/hypervisor/hv/src/passthrough.rs). The plan and its stages are in [plans/gpu-passthrough.md](https://github.com/irqlevel/nos/blob/master/plans/gpu-passthrough.md), the register-by-register details are in the [hypervisor docs](/docs/hypervisor#a-hosts-pci-device), and the tests are [gpu-passthrough-test.py](https://github.com/irqlevel/nos/blob/master/tests/gpu-passthrough-test.py) and, for the bare-metal runs, [install-bare.sh](https://github.com/irqlevel/nos/blob/master/tests/gpu-passthrough/install-bare.sh). It all came in with [one merge](https://github.com/irqlevel/nos/commit/ff6c28be).
+
+The second round added an [emulated root port](https://github.com/irqlevel/nos/blob/master/src/crates/hypervisor/hv/src/devices/port.rs), the [IOMMU groups](https://github.com/irqlevel/nos/blob/master/src/crates/modules/hypervisor/hv/src/groups.rs), [`hv pci`](https://github.com/irqlevel/nos/blob/master/src/crates/modules/hypervisor/hv/src/hostpci.rs) and a new test, [hv-passthrough-test.py](https://github.com/irqlevel/nos/blob/master/tests/hv-passthrough-test.py), which runs in CI. All of it is in [pull request 23](https://github.com/irqlevel/nos/pull/23).

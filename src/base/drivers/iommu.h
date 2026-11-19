@@ -21,6 +21,9 @@ bool domain_attach(ulong domain, u16 sid);
 bool domain_detach(ulong domain, u16 sid);
 void domain_destroy(ulong domain);
 bool release(u16 sid);
+/* Whether the firmware reserved memory for sid's DMA (a DMAR RMRR): its
+   first byte and its last. Such a device is no guest's. */
+bool reserved(u16 sid, u64& base, u64& limit);
 
 /* Interrupt remapping (Vtd's is_remapping, remap_*): whether interrupts are
    remapped; an entry for a source, by its requester id -- its handle, or -1

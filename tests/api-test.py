@@ -631,6 +631,23 @@ def vm_checks(k, pin, port):
     pt.check("the reader lists the vms: t1, off", t1 and t1[0].get("state") == "off" and t1[0].get("folder") is True,
              (s, listed))
 
+    # The host's PCI functions as VMs are given them: none here -- DMA is
+    # not translated (no iommu=on) -- each said so, and a function put on a
+    # vm.toml refused, saying why
+    s, _, body = r.request("POST", "/v1/call/vm/pci")
+    fns = body.get("functions", []) if s == 200 else []
+    pt.check("the reader lists the host's PCI functions, each as it would be given: none, DMA not translated",
+             fns and all({"address", "id", "class", "state", "group", "reset", "interrupts", "refused"} <= set(f)
+                         and f.get("refused") == "DMA is not translated -- boot with iommu=on" for f in fns),
+             (s, body))
+    first = fns[0].get("address", "00:00.0") if fns else "00:00.0"
+    s, _, body = a.request("POST", "/v1/call/vm/pci_attach", {"name": "t1", "address": first})
+    pt.check("a function put on t1's vm.toml is refused, saying why: 409",
+             s == 409 and "DMA is not translated" in json.dumps(body), (s, body))
+    s, _, body = a.request("POST", "/v1/call/vm/pci_detach", {"name": "t1", "address": "01:00.0"})
+    pt.check("and one its vm.toml does not name taken off it is refused", s == 409 and "names no function" in json.dumps(body),
+             (s, body))
+
     started, rec = vm_job(a, "start", {"name": "t1"})
     pt.check("t1 started as a job, which ends ok with its number", rec is not None and rec.get("status") == "ok"
              and isinstance(rec.get("result", {}).get("id"), int), (started, rec))

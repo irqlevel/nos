@@ -651,6 +651,8 @@ fn claim(cmd: u16) -> bool {
 }
 
 fn take_controller(dev: &PciDevice, controller: usize) {
+    /* The host's from here on: no guest is given it */
+    dev.take();
     let command = dev.read_config16(PCI_COMMAND);
     if command & PCI_COMMAND_IO == 0 {
         klog!(0, "ata: {:02x}:{:02x}.{} had I/O decoding off: turned on", dev.bus, dev.slot, dev.func);

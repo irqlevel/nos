@@ -24,6 +24,8 @@
       "help": {"en": "What each disk of a running VM has done since its boot -- reads, writes and their bytes, flushes, errors, and the time its requests waited -- and when that was read: IOPS, bandwidth and latency are made of two.", "ru": "Что сделал каждый диск работающей машины с её загрузки -- чтения, записи и их байты, сбросы, ошибки и сколько ждали его запросы -- и когда это прочитано: IOPS, пропускная способность и задержка считаются по двум таким ответам."},
       "params": {"name": {"type": "string", "required": true, "title": {"en": "Name", "ru": "Имя"}}}},
     "devices": {"kind": "read", "title": {"en": "Devices", "ru": "Устройства"}},
+    "pci": {"kind": "read", "title": {"en": "PCI functions", "ru": "PCI-функции"},
+      "help": {"en": "The host's PCI functions as VMs are given them: a driver's or kept for guests (guestpci=), the reset, the interrupts, the IOMMU group, and why not where one cannot be given.", "ru": "PCI-функции хоста так, как их получают машины: у драйвера или оставлена гостям (guestpci=), сброс, прерывания, группа IOMMU и почему нельзя, если нельзя."}},
     "forwards": {"kind": "read", "title": {"en": "Port forwards", "ru": "Проброс портов"}},
     "config_set": {"kind": "action", "title": {"en": "Edit vm.toml", "ru": "Изменить vm.toml"},
       "confirm": {"en": "Replace this VM's vm.toml? Its next start boots as it says.", "ru": "Заменить vm.toml? Следующий запуск будет по нему."},
@@ -59,6 +61,13 @@
     "disk_detach": {"kind": "action", "title": {"en": "Take off the VM", "ru": "Забрать у машины"},
       "params": {"name": {"type": "string", "required": true, "title": {"en": "VM", "ru": "Машина"}},
         "device": {"type": "string", "required": true, "title": {"en": "Device", "ru": "Устройство"}}}},
+    "pci_attach": {"kind": "action", "title": {"en": "Give to a VM", "ru": "Отдать машине"},
+      "help": {"en": "A stopped VM's from its next start: never one that cannot be given.", "ru": "Остановленной машине со следующего запуска; функцию, которую нельзя отдать, -- никогда."},
+      "params": {"name": {"type": "string", "required": true, "title": {"en": "VM", "ru": "Машина"}},
+        "address": {"type": "string", "required": true, "title": {"en": "Function", "ru": "Функция"}}}},
+    "pci_detach": {"kind": "action", "title": {"en": "Take off the VM", "ru": "Забрать у машины"},
+      "params": {"name": {"type": "string", "required": true, "title": {"en": "VM", "ru": "Машина"}},
+        "address": {"type": "string", "required": true, "title": {"en": "Function", "ru": "Функция"}}}},
     "snapshot": {"kind": "action", "title": {"en": "Snapshot", "ru": "Снимок"},
       "help": {"en": "A snapshot of its disk that is a volume of NBS's -- its first, or the one named: read-only and thin, the disk as it is now; a running VM's as a power cut would leave it. VMs are made of it as of an image.", "ru": "Снимок её диска-тома NBS -- первого или указанного: только для чтения, тонкий, диск таким, какой он сейчас; у работающей машины -- каким его оставило бы отключение питания. Машины создаются из него, как из образа."},
       "params": {"name": {"type": "string", "required": true, "title": {"en": "VM", "ru": "Машина"}},
@@ -196,6 +205,27 @@
       },
       "columns": ["name", "size_bytes", "id", "held_by", "holds", "refused"],
       "actions": [{"method": "disk_attach", "params": {"device": "$id"}}]
+    },
+    "pci": {
+      "title": {"en": "PCI functions", "ru": "PCI-функции"},
+      "list": "pci", "items": "functions", "key": "address",
+      "fields": {
+        "address": {"type": "string", "title": {"en": "Address", "ru": "Адрес"}},
+        "id": {"type": "string", "title": {"en": "Vendor:device", "ru": "Производитель:устройство"}},
+        "class": {"type": "string", "title": {"en": "Class", "ru": "Класс"}},
+        "state": {"type": "enum", "title": {"en": "State", "ru": "Состояние"}, "values": {
+          "driver": {"en": "a driver's", "ru": "у драйвера"},
+          "kept": {"en": "kept for guests", "ru": "оставлена гостям"},
+          "free": {"en": "free", "ru": "свободна"}}},
+        "held": {"type": "bool", "title": {"en": "A guest holds it", "ru": "Занята гостем"}},
+        "named_by": {"type": "string", "title": {"en": "Named by", "ru": "Указана у"}},
+        "group": {"type": "string", "title": {"en": "IOMMU group", "ru": "Группа IOMMU"}},
+        "reset": {"type": "string", "title": {"en": "Reset", "ru": "Сброс"}},
+        "interrupts": {"type": "string", "title": {"en": "Interrupts", "ru": "Прерывания"}},
+        "refused": {"type": "string", "title": {"en": "Why not", "ru": "Почему нельзя"}}
+      },
+      "columns": ["address", "id", "state", "named_by", "group", "reset", "interrupts", "refused"],
+      "actions": [{"method": "pci_attach", "params": {"address": "$address"}}]
     },
     "forwards": {
       "title": {"en": "Port forwards", "ru": "Проброс портов"},

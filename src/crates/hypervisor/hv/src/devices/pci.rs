@@ -101,8 +101,11 @@ pub const MSIX_MAX_ENTRIES: u16 = 32;
 
 /// The most functions on the bus, the host bridge's slot included.
 pub const MAX_SLOTS: usize = 8;
-/// The size of a function's configuration space.
+/// The size of a function's configuration space as the ports reach it, and
+/// as ECAM does (`run`'s): its extended space past the first, a function's
+/// 4 KiB.
 const CONFIG_SIZE: usize = 256;
+pub const ECAM_FUNCTION_BYTES: usize = 4096;
 
 /// One function's configuration space.
 pub struct Function {
@@ -248,6 +251,38 @@ impl Function {
     }
 }
 
+/// An offset in PCI Express's configuration space (ECAM): a bus in 27:20,
+/// a device in 19:15, a function in 14:12, a register of the function's
+/// 4 KiB in 11:0.
+const ECAM_BUS_SHIFT: u64 = 20;
+const ECAM_DEVICE_SHIFT: u64 = 15;
+const ECAM_DEVICE_MASK: u64 = 0x1F;
+const ECAM_FUNCTION_SHIFT: u64 = 12;
+const ECAM_FUNCTION_MASK: u64 = 0x7;
+const ECAM_REGISTER_MASK: u64 = 0xFFF;
+
+/// What `offset` into the PCI Express configuration space (ECAM: `run`'s
+/// window, the MCFG's) names: its function, and the byte of the function's
+/// 4 KiB.
+pub fn ecam_target(offset: u64) -> HostTarget {
+    HostTarget {
+        bus: (offset >> ECAM_BUS_SHIFT) as u8,
+        device: ((offset >> ECAM_DEVICE_SHIFT) & ECAM_DEVICE_MASK) as u8,
+        function: ((offset >> ECAM_FUNCTION_SHIFT) & ECAM_FUNCTION_MASK) as u8,
+        at: (offset & ECAM_REGISTER_MASK) as usize,
+    }
+}
+
+/// A configuration access the run loop answers (`PciBus::host_target`):
+/// the function it names, and the byte of its space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostTarget {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub at: usize,
+}
+
 /// Bus 0.
 pub struct PciBus {
     address: u32,
@@ -300,17 +335,61 @@ impl PciBus {
         Ok(slot)
     }
 
-    /// A host's function's slot, and the byte of its space, `port` is an
-    /// access of -- None where it is any other function's or none's, and for
-    /// every port but the configuration data's four: the address latched
-    /// names a host's function long after its access, and a device's I/O
-    /// BAR is above them (a disk's notify taken for a write of the GPU's
-    /// space left the disk with no notify again).
-    pub fn host_target(&self, port: u16) -> Option<(usize, usize)> {
-        if !(CONFIG_DATA..=CONFIG_END).contains(&port) {
+    /// What the run loop answers of an access of `port` (`run::host_config`):
+    /// one of a host's slot on bus 0 -- a root port's, or a host's function's
+    /// of its own -- or of any bus past it, those below the ports. None for
+    /// any other, and for every port but the configuration data's four: the
+    /// address latched names a host's slot long after its access, and a
+    /// device's I/O BAR is above them (a disk's notify taken for a write of
+    /// the GPU's space left the disk with no notify again).
+    pub fn host_target(&self, port: u16) -> Option<HostTarget> {
+        let a = self.address;
+        if !(CONFIG_DATA..=CONFIG_END).contains(&port) || a & ADDRESS_ENABLE == 0 || a & ADDRESS_RESERVED != 0 {
             return None;
         }
-        self.target(port).filter(|&(slot, _)| self.host & (1 << slot) != 0)
+        let bus = ((a >> ADDRESS_BUS_SHIFT) & ADDRESS_BUS_MASK) as u8;
+        let device = ((a >> ADDRESS_DEVICE_SHIFT) & ADDRESS_DEVICE_MASK) as u8;
+        let function = ((a >> ADDRESS_FUNCTION_SHIFT) & ADDRESS_FUNCTION_MASK) as u8;
+        if bus == 0 && (usize::from(device) >= self.slots.len() || self.host & (1 << device) == 0) {
+            return None;
+        }
+        let at = (a & ADDRESS_REGISTER_MASK) as usize + usize::from(port - CONFIG_DATA);
+        Some(HostTarget { bus, device, function, at })
+    }
+
+    /// Whether bus 0's slot `device` is a host's: a root port's, or a host's
+    /// function's of its own -- whose configuration space the run loop
+    /// answers, not this.
+    pub fn is_host(&self, device: u8) -> bool {
+        usize::from(device) < self.slots.len() && self.host & (1 << device) != 0
+    }
+
+    /// A read of `size` bytes (1, 2 or 4, aligned to it) at `at` of bus 0's
+    /// function `device`.`function`, as ECAM reaches it: the 256 bytes the
+    /// ports reach, and past them the extended space, which no function here
+    /// has -- zeroes, a list of no capability; all ones where no function is,
+    /// or for any other access. A host's slot is the run loop's.
+    pub fn function_read(&self, device: u8, function: u8, at: usize, size: usize) -> u32 {
+        let slot = usize::from(device);
+        if function != 0 || slot >= self.slots.len() || !matches!(size, 1 | 2 | 4) || at % size != 0
+            || at + size > ECAM_FUNCTION_BYTES
+        {
+            return size_mask(size);
+        }
+        if at >= CONFIG_SIZE { 0 } else { self.slots[slot].read(at, size) }
+    }
+
+    /// A write of `size` bytes at `at` of bus 0's function `device`.`function`,
+    /// as ECAM reaches it: the header's through what each byte lets a guest
+    /// change, as the ports' is; nothing past it.
+    pub fn function_write(&mut self, device: u8, function: u8, at: usize, size: usize, value: u32) {
+        let slot = usize::from(device);
+        if function != 0 || slot >= self.slots.len() || !matches!(size, 1 | 2 | 4) || at % size != 0
+            || at + size > CONFIG_SIZE
+        {
+            return;
+        }
+        self.slots[slot].write(at, size, value);
     }
 
     pub fn owns(port: u16) -> bool {
