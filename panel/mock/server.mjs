@@ -133,6 +133,20 @@ function vm(name, fields) {
     ...fields,
   });
 }
+/* The host's PCI functions as VMs are given them (the vm provider's `pci`):
+ * a GPU and its audio function kept for guests (guestpci=), behind a root
+ * port without ACS -- one IOMMU group with it -- the host's NIC, a driver's,
+ * and the port, a bridge. */
+const PCI = [
+  { address: '00:01.0', id: '8086:a70d', class: '06.04', state: 'free', held: false, group: '01:00.0 01:00.1',
+    reset: 'none', interrupts: 'MSI', refused: 'a bridge' },
+  { address: '00:1f.6', id: '8086:1a1c', class: '02.00', state: 'driver', held: false, group: '', reset: 'FLR',
+    interrupts: 'MSI', refused: "a driver of the host's has it -- guestpci=00:1f.6 keeps it" },
+  { address: '01:00.0', id: '10de:2571', class: '03.00', state: 'kept', held: false,
+    group: '00:01.0(bridge) 01:00.1', reset: 'bus reset', interrupts: 'MSI', refused: null },
+  { address: '01:00.1', id: '10de:228e', class: '04.03', state: 'kept', held: false,
+    group: '00:01.0(bridge) 01:00.0', reset: 'bus reset', interrupts: 'MSI', refused: null },
+];
 /* The host's devices a VM's disk may be (the vm provider's `devices`): its
  * root's disk, of which nothing is given -- the EFI System partition and the
  * root it boots -- and a second disk, one partition empty and one holding an
@@ -620,6 +634,8 @@ const reads = {
     return { from, next: from + page.length, total, text: p.terminal ? page : page.replace(/\x1b\[[0-9;]*m/g, '') };
   },
   'vm.devices': () => ({ devices: DEVICES }),
+  'vm.pci': () => ({ functions: PCI.map((f) => ({ ...f,
+    named_by: [...vms.values()].filter((v) => (v.pci ?? []).includes(f.address)).map((v) => v.name).join(' ') })) }),
   /* Each disk's counters since its guest's boot, moving as a guest's would:
    * its first disk busy, a wave on it, its others near idle. */
   'vm.disk_io': (p) => {
@@ -1214,6 +1230,36 @@ const actions = {
     }
     v.disks.push(deviceDisk(d, p.read_only === true));
     return { vm: v.name, id: d.id, read_only: p.read_only === true };
+  },
+  'vm.pci_attach': (p) => {
+    const v = vmNamed(p);
+    const at = need(p, 'address');
+    const f = PCI.find((x) => x.address === at);
+    if (!f) {
+      throw new Refused('conflict', at + ': no such function', 'address');
+    }
+    if (f.refused) {
+      throw new Refused('conflict', at + ': ' + f.refused, 'address');
+    }
+    if (v.state === 'running') {
+      throw new Refused('conflict', v.name + ' is on the list -- hv stop it first');
+    }
+    v.pci = v.pci ?? [];
+    if (v.pci.includes(at)) {
+      throw new Refused('conflict', v.name + "'s vm.toml names " + at + ' already', 'address');
+    }
+    v.pci.push(at);
+    return { vm: v.name, address: at };
+  },
+  'vm.pci_detach': (p) => {
+    const v = vmNamed(p);
+    const at = need(p, 'address');
+    const i = (v.pci ?? []).indexOf(at);
+    if (i < 0) {
+      throw new Refused('conflict', v.name + "'s vm.toml names no function " + at, 'address');
+    }
+    v.pci.splice(i, 1);
+    return { vm: v.name, address: at };
   },
   'vm.disk_detach': (p) => {
     const v = vmNamed(p);

@@ -369,7 +369,6 @@ const MSIX_PBA: usize = 8;
 const MSIX_BIR_MASK: u32 = 0x7;
 const MSIX_LEN: usize = 12;
 const MSIX_ENTRY_BYTES: u64 = 16;
-const MSIX_ENTRY_CONTROL: u64 = 12;
 const MSIX_ENTRY_MASKED: u32 = 1;
 /// A message address's low two bits: the dword's alignment, written as 0.
 const MSIX_ADDRESS_LOW: u32 = 0x3;

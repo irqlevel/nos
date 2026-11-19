@@ -551,7 +551,9 @@ port's windows, nothing said against them. Isolation: nos has to turn ACS on at 
 root ports, group the NVMe with the disk beside it -- functions of one device
 with no ACS of their own -- and the other disk alone, and refuse a third root
 port's virtio-rng, its function 0 kept for guests and asked for first, whose
-function 1 is nos's own rng's: one group with a function of the host's. The
+function 1 is nos's own rng's: one group with a function of the host's; and
+`hv pci`, run first, has to say each of them so -- kept, its reset, its
+interrupts, its group, and why not for those that cannot be given. The
 VT-d fault handler goes round until nothing is pending, and nvmepoke pauses
 between its commands, so that each fault is said before the next comes: a
 unit records so many, and an overflow it flagged while the handler ran was
