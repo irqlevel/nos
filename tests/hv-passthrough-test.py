@@ -16,7 +16,9 @@ resets it by its bridge's secondary bus reset.
   the NVMe and the disk beside it as functions 0 and 1 of the bus below the
   first, the other disk on the bus below the second, each port's link the
   device's below it, and its PCI code can place every BAR in its port's
-  windows;
+  windows; its kernel, with ACPI, takes the MCFG's ECAM where it is reserved
+  and reaches every function's 4 KiB by it -- the second virtio disk's
+  extended list (`aer=on,ats=on`) its AER alone, its ATS not shown;
 - the guest's own drivers find the three disks and read what the runner put on each
   (the devices' DMA into the guest's RAM, through the domain), write a
   pattern of their own and read it back past the page cache (the guest's RAM
@@ -39,8 +41,8 @@ resets it by its bridge's secondary bus reset.
   image byte for byte;
 - hv sent the device's MSIs on, every one taken, and the guest stops.
 
-The guest's kernel is a 64-bit bzImage with PCI, MSI, NVMe (BLK_DEV_NVME),
-devtmpfs, /proc/self/pagemap (PROC_PAGE_MONITOR) and an 8250 console --
+The guest's kernel is a 64-bit bzImage with PCI, MSI, ACPI and its ECAM
+(PCI_MMCONFIG), NVMe (BLK_DEV_NVME), virtio-blk, devtmpfs, /proc/self/pagemap (PROC_PAGE_MONITOR) and an 8250 console --
 docs/testing.md has the recipe; its root is built here, from a static
 busybox for x86-64 (`--busybox`: the binary, or an initramfs that holds it as
 bin/busybox) and nvmepoke, built static (`--nvmepoke`, or by the host's `cc
@@ -296,9 +298,10 @@ def main():
             "-drive", "file=%s,format=raw,if=none,id=vpass" % images["virtio"],
             # iommu_platform: a virtio device of QEMU's takes no IOMMU's
             # translation unless told to -- its DMA would go to nos's own
-            # memory at the guest's addresses
+            # memory at the guest's addresses. aer and ats: an extended
+            # capability the guest is shown, at 0x100, and one it is not
             "-device", "virtio-blk-pci,drive=vpass,bus=rp2,disable-legacy=on,disable-modern=off,x-pcie-flr-init=off,"
-                       "iommu_platform=on"]
+                       "iommu_platform=on,aer=on,ats=on"]
     p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     t0 = time.time()
     text = ""
@@ -397,6 +400,26 @@ def topology_checks(text):
                  for _, _, guest in DISKS), lines(text, "pass-guest: link"))
     pt.check("the guest's PCI code places every BAR in its port's windows", "pass-guest: pci complains:" not in text
              and "pass-guest: pci: " in text, lines(text, "pass-guest: pci"))
+    # PCI Express's configuration space: the MCFG's window taken, reserved
+    # as the firmware should, and each function's 4 KiB reached by it --
+    # the extended list of the disk with AER and ATS the AER alone, the
+    # ports' none
+    # (Linux 6.18 says ECAM where older kernels said MMCONFIG)
+    said = lines(text, "pass-guest: pci: ")
+    pt.check("the guest's kernel takes the MCFG's ECAM, reserved where it is, covering the host bridge's buses",
+             re.search(r"(MMCONFIG|ECAM) .*0xfd800000.*for domain 0000 \[bus 00-07\]", said) is not None
+             and re.search(r"(MMCONFIG|ECAM) (at )?\[mem 0xfd800000-0xfdffffff\] reserved as", said) is not None
+             and "not reserved" not in said and "partially covers" not in said, said)
+    sizes = dict(re.findall(r"pass-guest: config (\S+) (\d+) bytes", text))
+    pt.check("each function's extended space is reached, a port's and a host's alike",
+             all(sizes.get(a) == "4096" for a in ports + [guest for _, _, guest in DISKS]),
+             lines(text, "pass-guest: config"))
+    exts = dict(re.findall(r"pass-guest: config (\S+) \d+ bytes, extended: (.*)", text))
+    pt.check("the disk's AER is shown, its ATS not; the ports show none",
+             exts.get("0000:02:00.0") == "0001" and all(exts.get(a) == "none" for a in ports),
+             lines(text, "pass-guest: config"))
+    for guest in sorted(exts):
+        print("  %s: %s" % (guest, exts[guest]))
 
 
 def hostile_checks(text):

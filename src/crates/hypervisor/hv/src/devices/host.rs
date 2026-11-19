@@ -74,8 +74,20 @@
 //!   own MSI. Since Pascal the re-arm is a dword written at 0x704 instead
 //!   (nouveau's `gp100_pci_msi_rearm`), past the 256 bytes the guest is
 //!   given: that one dword goes to the real mirror alone, as VFIO lets a
-//!   write there reach the device; the rest of the extended space -- its
-//!   Resizable BAR, ACS and AER among it -- is nothing the guest reaches.
+//!   write there reach the device.
+//!
+//! Its extended space, past the 256 bytes -- which the guest reaches by
+//! ECAM (`run`'s window, the MCFG's) and by NVIDIA's mirror -- is the
+//! device's, read-only, with the capability list the guest walks cut to
+//! those there to read (`EXT_SHOWN`): AER's error status, the virtual
+//! channels, the serial number, a vendor's (VSEC, DVSEC), LTR and the
+//! link's. None it would have to write to use is in the list -- a write
+//! reaches nothing, and a guest that wrote one would wait on it: SR-IOV,
+//! ARI, ATS, PRI and PASID, which are the IOMMU's, the Resizable BAR (its
+//! BARs are the size the host gives), ACS, DPC, PTM, TPH, DOE, the power
+//! budget's. Each shown capability's next offset names the next one shown,
+//! and the first dword, where the device's first is not shown, is a header
+//! of none naming the first that is; a list that loops shows none.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -398,6 +410,25 @@ const PCIE_TYPE_MASK: u32 = 0xF;
 pub const PCIE_ENDPOINT: u8 = 0x0;
 pub const PCIE_LEGACY_ENDPOINT: u8 = 0x1;
 
+/// The extended space, from 0x100 to 4 KiB (PCIe 6.0, 7.6): a list of
+/// capabilities, each one's header its id (15:0), version (19:16) and the
+/// next one's offset (31:20); a walk of it as long as capabilities of eight
+/// bytes each would fill it, past which it is a list that loops.
+const EXT_START: usize = 0x100;
+pub const EXT_SIZE: usize = 4096;
+const EXT_NEXT_SHIFT: u32 = 20;
+const EXT_NEXT_MASK: u32 = 0xFFC;
+const EXT_ID_MASK: u32 = 0xFFFF;
+const EXT_HEADER_KEPT: u32 = 0x000F_FFFF;
+const EXT_WALK_MAX: usize = (EXT_SIZE - EXT_START) / 8;
+/// The extended capabilities the guest is shown, by id: AER (1), the
+/// virtual channels (2), the serial number (3), a vendor's (0xB), LTR
+/// (0x18), the secondary PCIe's equalization (0x19), L1 PM substates
+/// (0x1E), a designated vendor's (0x23), the data link feature (0x25), the
+/// physical layers at 16, 32 and 64 GT/s (0x26, 0x2A, 0x31) and lane
+/// margining (0x27). The module's comment says why no other.
+const EXT_SHOWN: [u32; 13] = [0x01, 0x02, 0x03, 0x0B, 0x18, 0x19, 0x1E, 0x23, 0x25, 0x26, 0x27, 0x2A, 0x31];
+
 /// The expansion ROM's BAR (PCI 3.0, 6.2.5.2): what `Moved::bar` calls it,
 /// its register's enable bit and address bits, and the sizes a ROM given
 /// is: a page at least -- it is mapped to the guest, a copy, a page at a
@@ -472,6 +503,40 @@ pub struct HostFunction {
     /// port (`set_multifunction`): its header type says so, whatever the
     /// device's own says of functions the guest may not have.
     multi: bool,
+    /// Where each extended capability the guest is shown is, in the order
+    /// the device's list has them (`ext_shown`).
+    ext: Vec<u16>,
+}
+
+/// The extended capabilities of `real` the guest is shown (`EXT_SHOWN`),
+/// where each is, in the order its list has them: none for a list that
+/// loops; up to where it ends -- a next offset back in the first 256
+/// bytes ends it, as Linux's walk does -- or is not there: a header of 0, or
+/// all ones, a function whose bus the host has no ECAM for. None for no
+/// memory.
+fn ext_shown(real: &dyn Real) -> Option<Vec<u16>> {
+    let mut shown = Vec::new();
+    let mut at = EXT_START;
+    let mut walked = 0;
+    loop {
+        let head = real.read32(at as u16);
+        if head == 0 || head == u32::MAX {
+            return Some(shown);
+        }
+        walked += 1;
+        if walked > EXT_WALK_MAX {
+            return Some(Vec::new());
+        }
+        if EXT_SHOWN.contains(&(head & EXT_ID_MASK)) {
+            shown.try_reserve(1).ok()?;
+            shown.push(at as u16);
+        }
+        let next = ((head >> EXT_NEXT_SHIFT) & EXT_NEXT_MASK) as usize;
+        if next < EXT_START {
+            return Some(shown);
+        }
+        at = next;
+    }
 }
 
 impl HostFunction {
@@ -544,6 +609,7 @@ impl HostFunction {
             (None, _, x) => (x, MSIX_LEN, msix_from),
         };
         let messages = Arc::new(Messages::new(msix.is_some(), msix.map_or(1, |l| l.given))?);
+        let ext = ext_shown(&*real)?;
 
         /* The pages that trap: NVIDIA's mirror at 0x88000, a page of its
          * own -- the old one at 0x1800 (NV4x) shares its page with registers
@@ -598,6 +664,7 @@ impl HostFunction {
             traps,
             rom: None,
             multi: false,
+            ext,
         };
         /* Each BAR the guest's at nowhere until it, or the caller placing
          * it, writes one: the type bits as the real one's */
@@ -760,15 +827,33 @@ impl HostFunction {
         true
     }
 
-    /// A read of `size` bytes (1, 2 or 4, aligned to it) at `at`; all ones
-    /// for any other.
+    /// A read of `size` bytes (1, 2 or 4, aligned to it) at `at`, of its 4
+    /// KiB -- the extended space past the 256 bytes (the module's comment);
+    /// all ones for any other.
     pub fn config_read(&self, at: usize, size: usize) -> u32 {
-        if !matches!(size, 1 | 2 | 4) || at % size != 0 || at + size > CONFIG_SIZE {
+        if !matches!(size, 1 | 2 | 4) || at % size != 0 || at + size > EXT_SIZE {
             return size_mask(size);
         }
         let dword = at & !3;
         let shift = 8 * (at - dword) as u32;
-        (self.read_dword(dword) >> shift) & size_mask(size)
+        let v = if dword >= CONFIG_SIZE { self.ext_dword(dword) } else { self.read_dword(dword) };
+        (v >> shift) & size_mask(size)
+    }
+
+    /// The dword at `dword` of the extended space, as the guest reads it:
+    /// the device's, but for the list's headers -- a shown capability's
+    /// next offset the next one shown, and the first dword, where the
+    /// device's first is not shown, a header of none naming the first that
+    /// is (or 0, none at all).
+    fn ext_dword(&self, dword: usize) -> u32 {
+        if let Some(i) = self.ext.iter().position(|&a| usize::from(a) == dword) {
+            let next = self.ext.get(i + 1).map_or(0, |&a| u32::from(a));
+            return (self.real.read32(dword as u16) & EXT_HEADER_KEPT) | (next << EXT_NEXT_SHIFT);
+        }
+        if dword == EXT_START {
+            return self.ext.first().map_or(0, |&a| u32::from(a) << EXT_NEXT_SHIFT);
+        }
+        self.real.read32(dword as u16)
     }
 
     /// A write of `size` bytes (1, 2 or 4, aligned to it) of `value` at
@@ -946,11 +1031,11 @@ impl HostFunction {
     }
 
     /// An access of the trapped mirror page, `offset` bytes into it, of 1, 2
-    /// or 4 bytes: a configuration space access of the same bytes, one within
-    /// the MSI capability's first two also written to the real mirror (see
-    /// the module's comment). What a read reads: all ones for an access of
-    /// another size, zeroes past the configuration space -- the extended
-    /// space's, which the guest is not given -- where writes are dropped.
+    /// or 4 bytes: a configuration space access of the same bytes, the
+    /// extended space's among them (`config_read`), one within the MSI
+    /// capability's first two also written to the real mirror (see the
+    /// module's comment). What a read reads: all ones for an access of
+    /// another size; a write past the 256 bytes is dropped.
     pub fn mirror(&mut self, mirror: u32, offset: u32, size: usize, write: bool, value: u32) -> (u32, Option<Moved>) {
         let at = offset as usize;
         if !matches!(size, 1 | 2 | 4) {
@@ -960,11 +1045,11 @@ impl HostFunction {
             self.real.page_write(0, u64::from(mirror + offset), 4, u64::from(value));
             return (0, None);
         }
-        if at + size > CONFIG_SIZE {
-            return (0, None);
-        }
         if !write {
             return (self.config_read(at, size), None);
+        }
+        if at + size > CONFIG_SIZE {
+            return (0, None);
         }
         if self.msix.is_none() && self.msi_cap != 0 && at >= self.msi_cap && at + size <= self.msi_cap + 2 {
             self.real.page_write(0, u64::from(mirror + offset), size, u64::from(value));

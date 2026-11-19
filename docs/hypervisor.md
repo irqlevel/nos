@@ -2318,10 +2318,31 @@ eight bytes of the table or the mirror as two dwords):
   interrupt and no more (QEMU's `vfio_nvidia_quirk_mirror_write`) -- and only
   within them: a write that reached the control word past them would be the
   guest's to the host's own MSI. Since Pascal the re-arm is a dword at 0x704 of
-  the mirror instead (nouveau's `gp100_pci_msi_rearm`), past the 256 bytes the
-  guest is given: that dword alone is written through to the real mirror, as
-  VFIO lets a write there reach the device; the rest of the extended space --
-  the Resizable BAR, ACS, AER -- is nothing the guest reaches.
+  the mirror instead (nouveau's `gp100_pci_msi_rearm`), past the first 256
+  bytes: that dword alone is written through to the real mirror, as VFIO lets
+  a write there reach the device; the rest of the mirror's extended space is
+  the guest's view of it below, read-only.
+
+**PCI Express's configuration space** (ECAM): a guest with the hole has its
+extended space too, 4 KiB a function, at `linux::ECAM_BASE` (0xFD800000,
+buses 0-7, a MiB each, at the top of the hole), a window every access of
+which traps (`GuestMemory::trap_range`) and is answered as one through the
+ports is (`ecam`: `pci::ecam_target` names the function and the register;
+bus 0's emulated functions by the bus, `PciBus::function_read`, a host's slot
+or a bus below a port by `Platform::host_config`). The MCFG names it, a
+motherboard resource in the DSDT (PNP0C02) reserves it and so does the memory
+map -- Linux takes ECAM only where it is reserved -- and the host bridge's
+`_CRS` gives buses 0-7, which ECAM has to cover. A host's function's extended
+space is the device's, read-only, with the capability list the guest walks
+cut to those there to read (`host.rs`'s `EXT_SHOWN`): AER's error status, the
+virtual channels, the serial number, a vendor's (VSEC, DVSEC), LTR, the
+link's; none it would have to write to use, since a write reaches nothing --
+SR-IOV, ARI, ATS, PRI and PASID, which are the IOMMU's, the Resizable BAR
+(its BARs are the size the host gives), ACS, DPC, PTM, TPH, DOE and the
+power budget's are not in the list. Each one shown names the next one shown;
+the first dword, where the device's first is not shown, is a header of none
+naming the first that is; a list that loops shows none. An emulated
+function's and a port's extended space is empty: zeroes.
 
 **The guest's memory has a hole for the BARs** (`LinuxGuest::new_holed`):
 its RAM below 4 GiB ends at 3 GiB (`linux::HOLE_RAM_END`) rather than at
@@ -2333,7 +2354,8 @@ only as far as the BARs placed in it, a GiB at a time: the rest of the
 guest's addresses are its OS's own, and Linux's HMM takes a GPU's VRAM's
 worth of them for the device memory NVIDIA's UVM registers the GPU with --
 with the window up to the top of them none was left, and CUDA was refused
-("initialization error"). The memory map and the kernel's and initrd's places are planned for
+("initialization error"). The memory map -- which reserves ECAM, at the top
+of the hole -- and the kernel's and initrd's places are planned for
 the same layout (`linux::plan_below`, `pvh::plan_below`), and a layout
 planned for the other kind of guest is refused by `load`: its map would hand
 the kernel the hole as RAM. A BAR is mapped straight into the nested table,
@@ -2344,9 +2366,7 @@ access of it stops the guest. A VM holding a host's function is not saved
 and not moved: its device's DMA reaches no dirty log, and its state is the
 device's.
 
-Not done yet: the guest's extended configuration space (the host's own is
-there: ECAM),
-refusing a function a DMAR RMRR names, isolation beyond one device's
+Not done yet: refusing a function a DMAR RMRR names, isolation beyond one device's
 functions (ACS on the path above it), and AMD-Vi. VT-d's posted interrupts
 -- the device's message straight into the vCPU, no host interrupt -- wait for
 a machine whose unit has them (CAP.PI): Hertz's two have not (CAP

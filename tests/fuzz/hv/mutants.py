@@ -37,6 +37,9 @@ TUN = 'modules/hypervisor/hv/src/tunnel.rs'
 HOST = 'hypervisor/hv/src/devices/host.rs'
 PORT = 'hypervisor/hv/src/devices/port.rs'
 RUN = 'hypervisor/hv/src/run.rs'
+PCI = 'hypervisor/hv/src/devices/pci.rs'
+ACPI = 'hypervisor/hv/src/acpi.rs'
+LINUX = 'hypervisor/hv/src/linux.rs'
 
 # name, what it takes out, the file, the text it changes, what it becomes,
 # the targets that must find it -- the first that does is enough
@@ -757,6 +760,100 @@ MUTANTS = [
             return None;
         }''',
      '''        let port = self.ports.iter().position(|q| q.port.below(t.bus))?;''',
+     ['platform']),
+    ('host_ext_relink', "a shown extended capability's next offset the next one shown",
+     HOST,
+     'return (self.real.read32(dword as u16) & EXT_HEADER_KEPT) | (next << EXT_NEXT_SHIFT);',
+     'return self.real.read32(dword as u16);',
+     ['hostfn']),
+    ('host_ext_first', "the extended space's first dword names the first shown where the device's is not",
+     HOST,
+     '''        if dword == EXT_START {
+            return self.ext.first().map_or(0, |&a| u32::from(a) << EXT_NEXT_SHIFT);
+        }
+''',
+     '',
+     ['hostfn']),
+    ('host_ext_shown', 'the Resizable BAR is not in the list the guest walks',
+     HOST,
+     'const EXT_SHOWN: [u32; 13] = [0x01, 0x02,',
+     'const EXT_SHOWN: [u32; 13] = [0x15, 0x02,',
+     ['hostfn']),
+    ('host_ext_loop', 'an extended list that loops shows nothing',
+     HOST,
+     '''        if walked > EXT_WALK_MAX {
+            return Some(Vec::new());''',
+     '''        if walked > EXT_WALK_MAX {
+            return Some(shown);''',
+     ['hostfn']),
+    ('host_ext_read_only', 'the extended space is read-only to the guest',
+     HOST,
+     '|| at + size > CONFIG_SIZE {\n            return None;',
+     '|| at + size > EXT_SIZE {\n            return None;',
+     ['hostfn']),
+    ('host_mirror_ext', "the mirror's extended space is the configuration space's",
+     HOST,
+     '''        if !write {
+            return (self.config_read(at, size), None);
+        }
+        if at + size > CONFIG_SIZE {
+            return (0, None);
+        }''',
+     '''        if at + size > CONFIG_SIZE {
+            return (0, None);
+        }
+        if !write {
+            return (self.config_read(at, size), None);
+        }''',
+     ['hostfn']),
+    ('pci_ecam_decode', "ECAM's offset names the function the ports' address does",
+     PCI,
+     'const ECAM_DEVICE_SHIFT: u64 = 15;',
+     'const ECAM_DEVICE_SHIFT: u64 = 16;',
+     ['pci']),
+    ('pci_ecam_extended', "an emulated function's extended space is none: zeroes",
+     PCI,
+     'if at >= CONFIG_SIZE { 0 } else { self.slots[slot].read(at, size) }',
+     'if at >= CONFIG_SIZE { size_mask(size) } else { self.slots[slot].read(at, size) }',
+     ['pci']),
+    ('port_ext_zero', "a port's extended space reads zeroes",
+     PORT,
+     '''        if at >= CONFIG_SIZE {
+            return 0;
+        }
+''',
+     '',
+     ['port']),
+    ('acpi_mcfg_bus', "the MCFG's last bus ECAM's",
+     ACPI,
+     '''    o.u8(last);
+    o.u32(0);
+    seal(o, start);''',
+     '''    o.u8(0xFF);
+    o.u32(0);
+    seal(o, start);''',
+     ['acpi']),
+    ('acpi_crs_buses', "the host bridge's buses those ECAM covers",
+     ACPI,
+     'let last = m.ecam.map_or(BUSES - 1, |(_, last)| u16::from(last));',
+     'let last = BUSES - 1;',
+     ['acpi']),
+    ('linux_e820_ecam', 'ECAM reserved in the memory map of a guest with the hole',
+     LINUX,
+     '''    if low_end <= ECAM_BASE {
+        out[n] = E820Entry { addr: ECAM_BASE, size: ECAM_BYTES, kind: E820_RESERVED };
+        n += 1;
+    }
+''',
+     '',
+     ['linux', 'pvh']),
+    ('run_ecam_window', "ECAM's window answered by the run loop",
+     RUN,
+     '''        if self.windows.is_some() && (linux::ECAM_BASE..linux::ECAM_BASE + linux::ECAM_BYTES).contains(&gpa) {
+            return self.ecam(gc, gpa, write);
+        }
+''',
+     '',
      ['platform']),
     ('run_port_renumbered', 'the bus below a port the one the guest numbered',
      RUN,

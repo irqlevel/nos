@@ -778,7 +778,7 @@ impl Script {
                 r.below(256) as u32
             }
         };
-        match r.u8() % 8 {
+        match r.u8() % 9 {
             0 | 1 => {
                 let at = reg(r);
                 let size = if at % 4 == 0 { r.pick(&[4u8, 2, 1]) } else if at % 2 == 0 { r.pick(&[2u8, 1]) } else { 1 };
@@ -790,6 +790,21 @@ impl Script {
                 let size = if at % 4 == 0 { r.pick(&[4u8, 2, 1]) } else { 1 };
                 self.plan().push_back(Step::Out { port: 0xCF8, size: 4, value: config_address(bus, 0, at) });
                 self.plan().push_back(Step::In { port: 0xCFC + (at & 3) as u16, size });
+            }
+            8 => {
+                /* PCI Express's configuration space (ECAM): the GPU's and
+                 * its port's, the 256 bytes and the extended space past them,
+                 * and any function's -- of any size, aligned or not, read
+                 * or written -- as a kernel with an MCFG reaches them */
+                let (b, d) = match r.u8() % 4 {
+                    0 | 1 => (bus, 0),
+                    2 => (0, slot),
+                    _ => (r.below(8) as u32, r.below(32) as u32),
+                };
+                let reg = if r.bool() { r.below(0x1000) } else { 0x100 + 4 * r.below(16) };
+                let gpa = linux::ECAM_BASE + (u64::from(b) << 20) + (u64::from(d) << 15) + (r.below(8) << 12) * u64::from(r.u8() < 16) + reg;
+                let size = r.pick(&[4u8, 4, 4, 2, 1, 8]);
+                self.plan().push_back(Step::MmioOf { gpa, store: r.u8() < 64, size, value: r.value64() });
             }
             7 => {
                 /* Its port: a register read, or written -- its windows, its
@@ -2026,6 +2041,14 @@ pub fn platform(r: &mut Input) {
     }
     let stopped = guest.take_stopped();
     invariant!(stopped.is_some(), "the run ended with no stop recorded");
+    /* PCI Express's configuration space is answered, every access of it,
+     * in a guest with the BARs' hole: none stops at one -- one delivering an
+     * event stops said as that. A guest without the hole has none there */
+    if let (true, Some(crate::run::Stop::Mmio { gpa, .. })) = (hosted, stopped.as_ref().map(|s| &s.stop)) {
+        let ecam = crate::linux::ECAM_BASE..crate::linux::ECAM_BASE + crate::linux::ECAM_BYTES;
+        invariant!(!ecam.contains(gpa), "the guest stopped at an access of ECAM's {:#x}: {:x?}", gpa,
+                   stopped.as_ref().map(|s| &s.stop));
+    }
     if let Some(s) = &stopped {
         let what = format!("{:?}", s.stop);
         let mut kind = what.split([' ', '(', '{']).next().unwrap_or("").to_string();

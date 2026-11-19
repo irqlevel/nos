@@ -117,8 +117,11 @@ impl Model {
             2 => 0xFFFF,
             _ => u32::MAX,
         };
-        if !matches!(size, 1 | 2 | 4) || at % size != 0 || at + size > 256 {
+        if !matches!(size, 1 | 2 | 4) || at % size != 0 || at + size > 4096 {
             return mask;
+        }
+        if at >= 256 {
+            return 0;
         }
         (self.dword(at & !3) >> (8 * (at % 4))) & mask
     }
@@ -178,7 +181,11 @@ pub fn port_target(r: &mut Input) {
     while let Some(op) = r.op(6) {
         match op {
             0 | 1 => {
-                let at = if r.u8() < 200 { r.below(0x80) as usize } else { r.below(0x110) as usize };
+                let at = match r.u8() {
+                    0..=199 => r.below(0x80) as usize,
+                    200..=239 => r.below(0x110) as usize,
+                    _ => r.below(0x1010) as usize,
+                };
                 let size = r.pick(&[4usize, 4, 2, 1, 3, 8]);
                 let got = port.read(at, size, &model.link);
                 let want = model.read(at, size);

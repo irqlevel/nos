@@ -16,13 +16,32 @@ mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null
 dmesg -n 1
 say() { echo "pass-guest: $*"; }
+# A function's extended capabilities as a walk of its list from 0x100 finds
+# them, their ids in order -- $1 its sysfs directory
+ext() {
+    at=256
+    n=0
+    ids=
+    while [ $n -lt 64 ]; do
+        h=$(od -A n -t x4 -j $at -N 4 $1/config 2>/dev/null | tr -d ' ')
+        [ -z "$h" ] || [ "$h" = "00000000" ] || [ "$h" = "ffffffff" ] && break
+        ids="$ids $(echo $h | cut -c5-8)"
+        at=$((0x$(echo $h | cut -c1-3) & 0xffc))
+        [ $at -lt 256 ] && break
+        n=$((n + 1))
+    done
+    echo "${ids:- none}"
+}
 say "up: $(uname -r), $(grep -c ^processor /proc/cpuinfo) cpus"
 for d in /sys/bus/pci/devices/*; do
     say "pci $(basename $d) $(cat $d/vendor):$(cat $d/device) class $(cat $d/class)"
     up=$(basename $(dirname $(readlink -f $d)))
     case $up in pci*) ;; *) say "below $(basename $d) $up" ;; esac
     [ -f $d/current_link_speed ] && say "link $(basename $d) $(cat $d/current_link_speed) x$(cat $d/current_link_width)"
+    say "config $(basename $d) $(wc -c < $d/config) bytes, extended:$(ext $d)"
 done
+dmesg | grep -E "MMCONFIG|ECAM" | sed 's/^/pass-guest: pci: /'
+
 dmesg | grep -E "PCI bridge to|bridge window" | sed 's/^/pass-guest: pci: /'
 dmesg | grep -iE "can't claim|no compatible bridge window|failed to assign|no space for" \
     | sed 's/^/pass-guest: pci complains: /'
