@@ -18,9 +18,11 @@
 #        SMOKE_MARKER   one more line the serial log must have
 #
 # The VT-d boot: `make nos-test.iso TEST_ISO_ARGS=iommu=on`, then
-#   SMOKE_ISO=nos-test.iso SMOKE_MACHINE=q35 SMOKE_EXTRA="-device intel-iommu"
-#   SMOKE_MARKER="passed through, queued invalidation" tests/smoke-test.sh --skip-build
-# -- the NVMe's DMA through QEMU's unit (virtio's goes around it).
+#   SMOKE_ISO=nos-test.iso SMOKE_MACHINE=q35 SMOKE_EXTRA="-device intel-iommu,intremap=on"
+#   SMOKE_MARKER="interrupts remapped, the IO-APIC's from" tests/smoke-test.sh --skip-build
+# -- the NVMe's DMA through QEMU's unit (virtio's goes around it), and every
+# interrupt through its table; with intremap=off and SMOKE_MARKER="passed
+# through, queued invalidation", none.
 #
 # Exit codes: 0 = all markers seen, 1 = panic/timeout/build failure.
 set -u

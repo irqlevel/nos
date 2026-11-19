@@ -24,6 +24,9 @@ public:
     void* get_lapic_address();
 
     void* get_io_apic_address();
+    /* The MADT's id of the IO-APIC get_io_apic_address maps -- what a DMAR's
+       IO-APIC scope names it by (8.3.1.1) -- valid while that is not null */
+    u8 get_io_apic_id();
 
     u32 get_gsi_by_irq(u8 irq);
     u16 get_irq_flags(u8 irq);
@@ -366,8 +369,10 @@ private:
        reason enough to lose ACPI, and the boot with it. */
     void register_irq_to_gsi(u8 irq, u32 gsi, u16 flags);
 
-    /* The GSI base of the IO-APIC io_apic_address_ maps, ~0U while none */
+    /* The GSI base of the IO-APIC io_apic_address_ maps, ~0U while none,
+       and its id */
     u32 io_apic_gsi_base_;
+    u8 io_apic_id_;
 
     /* What of an APIC's page its registers take, from the address the MADT
        gives. The local APIC's are the page, which the architecture puts at

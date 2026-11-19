@@ -1,5 +1,6 @@
 #include "ioapic.h"
 #include <drivers/acpi.h>
+#include <drivers/iommu.h>
 
 #include "asm.h"
 #include <kernel/klog.h>
@@ -14,6 +15,8 @@ IoApic::IoApic()
     , base_address_(nullptr)
 {
     base_address_ = Acpi::get_instance().get_io_apic_address();
+    for (size_t i = 0; i < MAX_PINS; i++)
+        pin_handle_[i] = NO_HANDLE;
 
     klog(IO_APIC_LL, "IO Apic addr 0x%p", base_address_);
 }
@@ -116,26 +119,51 @@ u64 IoApic::check_dest(u8 irq, u64 apic_id)
 
 bool IoApic::set_irq(u8 irq, u64 apic_id, u8 vector)
 {
-    u64 data = 0;
+    return program(irq, apic_id, vector, false, true);
+}
 
+bool IoApic::program(u8 irq, u64 apic_id, u8 vector, bool level, bool active_high)
+{
     if (!has_pin(irq))
         return false;
 
     apic_id = check_dest(irq, apic_id);
 
-    data |= vector; // interrupt vector
+    u64 data = vector; // interrupt vector
     data |= DM_FIXED << DELIV_MODE_SHIFT; // delivery mode: fixed
     data |= 0 << DEST_MODE_SHIFT; // destination: physical
     data |= 0 << DELIV_STATUS_SHIFT; // delivery status : relaxed
-    data |= 0 << POLARITY_SHIFT; // pin polarity: active high
-    data |= TRIGGER_EDGE << TRIGGER_MODE_SHIFT; // trigger mode: edge
+    data |= (active_high ? 0UL : 1UL) << POLARITY_SHIFT; // pin polarity
+    data |= (level ? TRIGGER_LEVEL : TRIGGER_EDGE) << TRIGGER_MODE_SHIFT; // trigger mode
     data |= 0 << MASKED_SHIFT; // disable: no
-    data |= apic_id << DEST_SHIFT; //destination id
 
-    klog(IO_APIC_LL, "set_irq irq 0x%lX apic_id 0x%lX vector 0x%lX data 0x%lX",
-        (ulong)irq, (ulong)apic_id, (ulong)vector, (ulong)data);
+    if (!iommu::remapping())
+    {
+        data |= apic_id << DEST_SHIFT; //destination id
+        klog(IO_APIC_LL, "set_irq irq 0x%lX apic_id 0x%lX vector 0x%lX data 0x%lX level %lu active_high %lu",
+            (ulong)irq, (ulong)apic_id, (ulong)vector, (ulong)data, (ulong)level, (ulong)active_high);
+        set_entry(irq, data);
+        return true;
+    }
 
+    /* Remapped: a new entry for the pin, the pin pointed at it, then the
+       one it named before given back -- an interrupt between finds one or
+       the other, both present */
+    stdlib::AutoLock lock(handles_lock_);
+    const long handle = iommu::remap_alloc(iommu::io_apic_sid(), vector, (u32)apic_id, level);
+    if (handle < 0)
+    {
+        klog(0, "IoApic: irq 0x%lX: no interrupt entry to be had", (ulong)irq);
+        return false;
+    }
+    data |= iommu::io_apic_entry_bits((u16)handle);
+    klog(IO_APIC_LL, "set_irq irq 0x%lX apic_id 0x%lX vector 0x%lX data 0x%lX level %lu active_high %lu, entry %lu",
+        (ulong)irq, (ulong)apic_id, (ulong)vector, (ulong)data, (ulong)level, (ulong)active_high, (ulong)handle);
     set_entry(irq, data);
+    const u16 had = pin_handle_[irq];
+    pin_handle_[irq] = (u16)handle;
+    if (had != NO_HANDLE)
+        iommu::remap_free(iommu::io_apic_sid(), had);
     return true;
 }
 
@@ -146,6 +174,17 @@ u64 IoApic::set_irq_destination(u8 irq, u64 apic_id)
         return apic_id;
 
     apic_id = check_dest(irq, apic_id);
+
+    /* Remapped, the pin's entry in the table is moved: the pin keeps
+       naming it */
+    if (iommu::remapping())
+    {
+        stdlib::AutoLock lock(handles_lock_);
+        if (pin_handle_[irq] != NO_HANDLE && !iommu::remap_retarget(iommu::io_apic_sid(), pin_handle_[irq],
+            (u32)apic_id))
+            klog(0, "IoApic: irq 0x%lX not moved to APIC %lu", (ulong)irq, (ulong)apic_id);
+        return apic_id;
+    }
 
     /* The destination id occupies bits 56-63 of the redirection entry,
        i.e. bits 24-31 of the high register. A single 32-bit write
@@ -159,27 +198,7 @@ u64 IoApic::set_irq_destination(u8 irq, u64 apic_id)
 
 bool IoApic::set_irq_level(u8 irq, u64 apic_id, u8 vector, bool active_high)
 {
-    u64 data = 0;
-
-    if (!has_pin(irq))
-        return false;
-
-    apic_id = check_dest(irq, apic_id);
-
-    data |= vector; // interrupt vector
-    data |= DM_FIXED << DELIV_MODE_SHIFT; // delivery mode: fixed
-    data |= 0 << DEST_MODE_SHIFT; // destination: physical
-    data |= 0 << DELIV_STATUS_SHIFT; // delivery status : relaxed
-    data |= (active_high ? 0UL : 1UL) << POLARITY_SHIFT; // pin polarity
-    data |= TRIGGER_LEVEL << TRIGGER_MODE_SHIFT; // trigger mode: level
-    data |= 0 << MASKED_SHIFT; // disable: no
-    data |= apic_id << DEST_SHIFT; //destination id
-
-    klog(IO_APIC_LL, "set_irq_level irq 0x%lX apic_id 0x%lX vector 0x%lX data 0x%lX active_high %lu",
-        (ulong)irq, (ulong)apic_id, (ulong)vector, (ulong)data, (ulong)active_high);
-
-    set_entry(irq, data);
-    return true;
+    return program(irq, apic_id, vector, true, active_high);
 }
 
 }

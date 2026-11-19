@@ -5,6 +5,9 @@
 unsafe extern "C" {
     /// Whether DMA is translated: iommu=on, and every unit came up.
     pub safe fn kernel_iommu_on() -> i32;
+    /// Whether interrupts are remapped as well: every unit taken over has
+    /// its interrupt table, compatibility-format interrupts blocked.
+    pub safe fn kernel_iommu_remapping() -> i32;
     /// A domain for the unit that translates `sid`, as wide as that unit
     /// walks: 0 where DMA is not translated, the unit is one left be, or
     /// there is no room.

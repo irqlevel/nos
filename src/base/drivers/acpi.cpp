@@ -17,6 +17,7 @@ Acpi::Acpi()
     , io_apic_address_(nullptr)
     , irq_to_gsi_size_(0)
     , io_apic_gsi_base_(~0U)
+    , io_apic_id_(0)
     , pm1a_cnt_port_(0)
     , pm1b_cnt_port_(0)
     , dsdt_phys_(0)
@@ -529,6 +530,7 @@ stdlib::Error Acpi::parse_madt()
                 unmap_table_range(io_apic_address_, 1);
             io_apic_address_ = mapped;
             io_apic_gsi_base_ = base;
+            io_apic_id_ = io_apic_entry->io_apic_id;
             break;
         }
         case MADT_ENTRY_TYPE_INT_SRC_OVERRIDE:
@@ -1069,6 +1071,7 @@ stdlib::Error Acpi::parse()
             unmap_table_range(io_apic_address_, 1);
             io_apic_address_ = nullptr;
             io_apic_gsi_base_ = ~0U;
+            io_apic_id_ = 0;
         }
         return err;
     }
@@ -1138,6 +1141,11 @@ void* Acpi::get_lapic_address()
 void* Acpi::get_io_apic_address()
 {
     return io_apic_address_;
+}
+
+u8 Acpi::get_io_apic_id()
+{
+    return io_apic_id_;
 }
 
 void Acpi::register_irq_to_gsi(u8 irq, u32 gsi, u16 flags)

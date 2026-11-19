@@ -26,6 +26,14 @@ pub fn on() -> bool {
     iommu::kernel_iommu_on() != 0
 }
 
+/// Whether interrupts are remapped as well: every interrupt is an entry of
+/// its unit's table, verified to come from its own device, and a device's
+/// DMA to the interrupt range raises its own vectors and no other.
+#[inline]
+pub fn remapping() -> bool {
+    iommu::kernel_iommu_remapping() != 0
+}
+
 /// Why a domain did not do what it was asked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
