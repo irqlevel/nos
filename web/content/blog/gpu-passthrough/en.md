@@ -171,7 +171,9 @@ Linux also complained about our ACPI tables, calling it a firmware bug: the host
 
 As before, we deleted each new rule from the code once and made sure the hypervisor's fuzzer caught it, 57 more rules in all. On the way, the fuzzer found one real hole: the VM's writes to a capability's "next" pointer went through to the device. That byte is read-only on a well-behaved device, but it's the very list the host edits to hide capabilities from the VM, so the VM can't write it at all now.
 
-With all of this in, we ran the GPU test on Hertz again, nos under QEMU there as in the first test. NVIDIA's driver didn't mind the root port in front of the card: `nvidia-smi` and the three samples passed, and matrixMul did 610.78 GFlop/s. We haven't booted Hertz on bare metal with the second round yet.
+With all of this in, we ran the GPU test on Hertz again, first with nos under QEMU there as in the first test, then with nos on the bare metal. NVIDIA's driver didn't mind the root port in front of the card: `nvidia-smi` and the three samples passed both times, and matrixMul did 610.78 GFlop/s under QEMU and 610.94 on the bare metal. On the real bus, `hv pci` refused Hertz's integrated graphics, naming the memory the firmware had reserved for it.
+
+On the bare metal we also gave the VM an NVMe drive. Hertz has two, one with Ubuntu and one that is nos's own, so to free nos's drive, nos booted from a small partition at the end of Ubuntu's disk instead, and `guestpci=` kept its drivers off its usual drive. One VM got both the GPU and that drive. The kernel's own nvme driver read the first gigabyte of the drive and wrote 256 MiB of random data to a scratch partition, then the VM mounted its root filesystem from the same drive and ran the GPU test from there. Back in Ubuntu, the checksums of what the VM read and wrote matched what Ubuntu read off the drive itself.
 
 ## What's missing
 

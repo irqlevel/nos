@@ -481,7 +481,11 @@ nos takes the unit over and gives the GPU to a guest of its own (`hv boot
 ... pci=01:00.0`, its interrupts remapped: QEMU's unit has `intremap=on`),
 the machine's own kernel, its RAM out of nos's huge pool. The same guest on
 the machine's metal, nos booted once from its own disk:
-`tests/gpu-passthrough/install-bare.sh` (docs/real-hardware.md, Hertz).
+`tests/gpu-passthrough/install-bare.sh` (docs/real-hardware.md, Hertz); and
+with nos's own NVMe given to the guest beside the GPU, the guest booting its
+root from it, nos booted from the free space of the machine's system disk:
+`tests/gpu-passthrough/install-bare-nvme.sh`, whose `--check` sums from the
+machine's own system what the guest read and wrote.
 
 With NVIDIA's own driver, the default: the guest's root is a disk of
 Ubuntu's, debootstrapped there in a chroot with the userspace of the very

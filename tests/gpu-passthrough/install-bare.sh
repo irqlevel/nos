@@ -92,6 +92,7 @@ insmod /lib/modules/sshd.ko
 sshd start
 insmod /lib/modules/hv.ko
 hv on
+hv pci
 hv boot /vmlinuz mem=$MEM cpus=2 secs=$SECS pci=$PCI disk=/guest.img cmdline=console=ttyS0 root=/dev/vda rw init=/init nokaslr
 reboot
 EOF
