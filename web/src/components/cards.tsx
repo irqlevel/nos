@@ -1,4 +1,5 @@
 import Link from "next/link";
+import type { ReactNode } from "react";
 import type { Entry } from "@/lib/content";
 import { readingTime, type Dictionary } from "@/lib/dictionaries";
 import { formatDate, type Locale } from "@/lib/i18n";
@@ -39,7 +40,7 @@ export function PostCard({ post, locale, dict, headingLevel = 3 }: { post: Entry
     );
 }
 
-export function LinkCard({ href, title, text, eyebrow }: { href: string; title: string; text: string; eyebrow?: string }) {
+export function LinkCard({ href, title, text, eyebrow }: { href: string; title: string; text: ReactNode; eyebrow?: string }) {
     return (
         <Link href={href} className="group flex flex-col rounded-xl border border-line bg-card p-5 transition-colors hover:border-line-strong">
             {eyebrow && <span className="font-mono text-[0.7rem] text-muted">{eyebrow}</span>}
