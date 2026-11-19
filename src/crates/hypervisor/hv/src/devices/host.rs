@@ -17,7 +17,12 @@
 //!   machine check (Linux's VFIO blocks it so, CVE-2020-12888); its INTx
 //!   disable stays the host's (set: the device's interrupts are its MSI or
 //!   MSI-X, the host's to take);
-//! - there is no expansion ROM; the INTx pin is the device's, and the
+//! - the expansion ROM is a copy the host read of the device's, once
+//!   (`set_rom`): its BAR the guest's to size, place and turn on, and while
+//!   it is on, a read of it is of the copy and a write nothing -- the real
+//!   ROM BAR, which on many devices shares its decoder with another BAR, is
+//!   never the guest's to turn on;
+//! - the INTx pin is the device's, and the
 //!   interrupt line the guest's to write: the pin is there because a driver
 //!   may want a legacy IRQ to exist -- NVIDIA's refuses a function with
 //!   neither one nor MSI-X (`nv_treat_missing_irq_as_error`) -- and the run
@@ -257,9 +262,9 @@ pub struct Moved {
 
 /// The BARs one access moved -- an eight-byte write through the mirror may
 /// move two -- each from where it was before the access to where it is
-/// after.
+/// after; the ROM's (`ROM_BAR`) among them.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Moves([Option<(u64, u64)>; 6]);
+pub struct Moves([Option<(u64, u64)>; ROM_BAR + 1]);
 
 impl Moves {
     fn add(&mut self, m: Option<Moved>) {
@@ -370,6 +375,17 @@ const PCIE_DEVCTL_HOST: u16 = 0xF | (0x7 << 5) | (0x7 << 12);
 const PCIE_DEVCTL_OFF: u16 = (1 << 9) | (1 << 11) | (1 << 15);
 const PCIE_LINK_CONTROL: usize = 0x10;
 
+/// The expansion ROM's BAR (PCI 3.0, 6.2.5.2): what `Moved::bar` calls it,
+/// its register's enable bit and address bits, and the sizes a ROM given
+/// is: a page at least -- it is mapped to the guest, a copy, a page at a
+/// time; the module pads a smaller one -- and 2 MiB at most -- a GPU's is
+/// 128 KiB to 1 MiB.
+pub const ROM_BAR: usize = 6;
+const ROM_ENABLE: u32 = 1;
+const ROM_ADDRESS: u32 = 0xFFFF_F800;
+pub const ROM_MIN: usize = 4096;
+pub const ROM_MAX: usize = 2 << 20;
+
 /// NVIDIA, and where its GPUs mirror their configuration space in BAR0.
 pub const VENDOR_NVIDIA: u16 = 0x10DE;
 pub const NVIDIA_MIRROR: u32 = 0x88000;
@@ -426,6 +442,9 @@ pub struct HostFunction {
     messages: Arc<Messages>,
     /// The pages of its BARs that trap rather than map.
     traps: Vec<Trap>,
+    /// Its expansion ROM, where the host gave it one (`set_rom`): the copy,
+    /// and the guest's ROM BAR register -- its address and enable.
+    rom: Option<(Box<[u8]>, u32)>,
 }
 
 impl HostFunction {
@@ -550,6 +569,7 @@ impl HostFunction {
             caps,
             messages,
             traps,
+            rom: None,
         };
         /* Each BAR the guest's at nowhere until it, or the caller placing
          * it, writes one: the type bits as the real one's */
@@ -603,6 +623,59 @@ impl HostFunction {
     /// The pages of its BARs that trap rather than map.
     pub fn traps(&self) -> &[Trap] {
         &self.traps
+    }
+
+    /// The device's expansion ROM given the guest: `image`, as the host read
+    /// it, its length the ROM BAR's size -- a power of two, `ROM_MIN` to
+    /// `ROM_MAX` -- or false, and no ROM. Its BAR starts nowhere and off.
+    pub fn set_rom(&mut self, image: Box<[u8]>) -> bool {
+        if !image.len().is_power_of_two() || !(ROM_MIN..=ROM_MAX).contains(&image.len()) {
+            return false;
+        }
+        self.rom = Some((image, 0));
+        true
+    }
+
+    /// The ROM's size, where there is one.
+    pub fn rom_size(&self) -> Option<u64> {
+        self.rom.as_ref().map(|(image, _)| image.len() as u64)
+    }
+
+    /// The ROM's image, where there is one: what the guest is mapped of it.
+    pub fn rom_image(&self) -> Option<&[u8]> {
+        self.rom.as_ref().map(|(image, _)| &image[..])
+    }
+
+    /// The ROM's BAR put at `gpa` before the guest starts, off -- what
+    /// firmware would do: its size aligned, below 4 GiB.
+    pub fn place_rom(&mut self, gpa: u64) -> bool {
+        let Some((image, register)) = self.rom.as_mut() else { return false };
+        let size = image.len() as u64;
+        if gpa % size != 0 || gpa > u64::from(u32::MAX) {
+            return false;
+        }
+        *register = gpa as u32 & ROM_ADDRESS;
+        true
+    }
+
+    /// Where the guest has its ROM decoded now: its address, None while it
+    /// is off or has none.
+    pub fn rom_window(&self) -> Option<u64> {
+        let (_, register) = self.rom.as_ref()?;
+        (register & ROM_ENABLE != 0).then_some(u64::from(register & ROM_ADDRESS))
+    }
+
+    /// `size` bytes (1, 2, 4 or 8) of the ROM `offset` bytes in, as its
+    /// image has them; all ones past it, or with no ROM.
+    pub fn rom_read(&self, offset: u64, size: usize) -> u64 {
+        let Some((image, _)) = self.rom.as_ref() else { return size_mask64(size) };
+        let mut v = [0xFFu8; 8];
+        for (k, b) in v.iter_mut().enumerate().take(size.min(8)) {
+            if let Some(&byte) = offset.checked_add(k as u64).and_then(|at| image.get(at as usize)) {
+                *b = byte;
+            }
+        }
+        u64::from_le_bytes(v) & size_mask64(size)
     }
 
     /// BAR `bar`'s guest address, as the guest or the caller last put it.
@@ -669,7 +742,7 @@ impl HostFunction {
             }
             0x0C => None,
             d if (BAR0..BAR_END).contains(&d) => self.write_bar((d - BAR0) / 4, mask, value),
-            ROM => None,
+            ROM => self.write_rom(mask, value),
             INTERRUPT_LINE => {
                 if mask & 0xFF != 0 {
                     self.line = value as u8;
@@ -854,7 +927,7 @@ impl HostFunction {
                 real & !(u32::from(HEADER_MULTI) << (8 * (HEADER_TYPE - 0x0C)))
             }
             d if (BAR0..BAR_END).contains(&d) => self.guest_bars[(d - BAR0) / 4],
-            ROM => 0,
+            ROM => self.rom.as_ref().map_or(0, |(_, register)| *register),
             INTERRUPT_LINE => {
                 let real = self.real.read32(dword as u16);
                 (real & 0xFFFF_FF00) | u32::from(self.line)
@@ -882,6 +955,19 @@ impl HostFunction {
         let next = (self.real.read32(self.hidden as u16) >> CAP_NEXT_SHIFT) & CAP_POINTER_MASK;
         let shift = if dword == CAPABILITIES { 0 } else { CAP_NEXT_SHIFT };
         (v & !(0xFF << shift)) | (next << shift)
+    }
+
+    /// The ROM BAR written: its address bits above its size and its enable
+    /// the guest's, the rest none; where its window is now -- off is
+    /// nowhere -- said as a move of `ROM_BAR` when it changed.
+    fn write_rom(&mut self, mask: u32, value: u32) -> Option<Moved> {
+        let before = self.rom_window().unwrap_or(0);
+        let (image, register) = self.rom.as_mut()?;
+        let size = image.len() as u32;
+        let writable = (!(size - 1) & ROM_ADDRESS) | ROM_ENABLE;
+        *register = ((*register & !mask) | (value & mask)) & writable;
+        let after = self.rom_window().unwrap_or(0);
+        (after != before).then_some(Moved { bar: ROM_BAR, from: before, to: after })
     }
 
     fn write_bar(&mut self, bar: usize, mask: u32, value: u32) -> Option<Moved> {

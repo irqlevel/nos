@@ -541,7 +541,11 @@ into the guest's RAM, through their domains -- write one of their own and
 read it back past the page cache, and take their interrupts, the NVMe's on
 more than one MSI-X vector; hv has to say it sent the MSIs on, none taken by
 no CPU, and the guest's patterns have to be on the disks' images once QEMU is
-gone. Then the hostile phase: the guest lets its driver go and
+gone. The NVMe has a ROM too (`romfile=`: a 64 KiB image the runner makes,
+0x55AA and a PCI data structure of EFI code, so that SeaBIOS runs none of
+it): nos has to read it and give the guest a copy, and the guest to read it
+through sysfs byte for byte -- by `memcpy_fromio`, a `rep movs` no MMIO
+emulator decodes: the copy is mapped, read-only. Then the hostile phase: the guest lets its driver go and
 drives the controller from user space (`tests/hv-passthrough/nvmepoke.c`:
 BAR0 through sysfs, the admin queues in pages whose addresses
 /proc/self/pagemap gives), each command an Identify whose data the device
