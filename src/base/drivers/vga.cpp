@@ -18,6 +18,8 @@ VgaTerm::VgaTerm()
     , width_(MAX_WIDTH)
     , height_(MAX_HEIGHT)
     , color_code_(make_color(ColorWhite, ColorBlack))
+    , released_(0)
+    , holds_(0)
 {
     lock_.unwatch();
 
@@ -64,6 +66,48 @@ VgaTerm::~VgaTerm()
         mm::PageTable::get_instance().tmp_unmap_page((ulong)buf_);
         buf_ = nullptr;
     }
+}
+
+bool VgaTerm::drawing()
+{
+    return buf_ != nullptr && released_.get() == 0 && holds_.get() == 0;
+}
+
+void VgaTerm::hold()
+{
+    /* Under the lock: a write under way is done before it returns */
+    stdlib::AutoLock lock(lock_);
+
+    holds_.inc();
+}
+
+void VgaTerm::unhold()
+{
+    stdlib::AutoLock lock(lock_);
+
+    if (holds_.get() > 0)
+        holds_.dec();
+}
+
+bool VgaTerm::release_within(ulong base, ulong size)
+{
+    stdlib::AutoLock lock(lock_);
+
+    if (buf_ == nullptr || released_.get() != 0 || size == 0)
+        return false;
+
+    /* The text buffer, [buf_phy_addr_, + a screen's cells), meeting
+       [base, base + size), each beginning before the other ends; a span
+       past the top of the address space taken to reach it */
+    const ulong buf_end = buf_phy_addr_ + (ulong)MAX_WIDTH * MAX_HEIGHT * sizeof(u16);
+    ulong end = 0;
+    if (__builtin_add_overflow(base, size, &end))
+        end = ~0UL;
+    if (buf_phy_addr_ >= end || base >= buf_end)
+        return false;
+
+    released_.set(1);
+    return true;
 }
 
 u8 VgaTerm::make_color(Color fg, Color bg)
@@ -177,7 +221,7 @@ void VgaTerm::puts(const char *str)
 {
     stdlib::AutoLock lock(lock_);
 
-    if (buf_ == nullptr)
+    if (!drawing())
         return;
 
     puts_lock_held(str);
@@ -194,7 +238,7 @@ void VgaTerm::cls()
 {
     stdlib::AutoLock lock(lock_);
 
-    if (buf_ == nullptr)
+    if (!drawing())
         return;
 
     cls_lock_held();
@@ -212,7 +256,7 @@ void VgaTerm::v_printf(const char *fmt, va_list args)
 
     stdlib::AutoLock lock(lock_);
 
-    if (buf_ == nullptr)
+    if (!drawing())
         return;
 
     puts_lock_held(str);
@@ -231,7 +275,7 @@ void VgaTerm::print_string(const char *s)
 {
     stdlib::AutoLock lock(lock_);
 
-    if (buf_ == nullptr)
+    if (!drawing())
         return;
 
     puts_lock_held(s);
@@ -247,8 +291,11 @@ void VgaTerm::panic_print_string(const char *s)
      * stops the other CPUs, and one of them inside a line feed has row_ one
      * past the screen until it has scrolled -- and is read once and held to
      * the screen here (FbTerm::panic_print_string has the long of it).
+     *
+     * A buffer released or held is not written: released_ and holds_ are
+     * read here without the lock, as atomics, and the mapping stays.
      */
-    if (buf_ == nullptr || width_ == 0 || height_ == 0)
+    if (!drawing() || width_ == 0 || height_ == 0)
         return;
 
     Cursor at = { row_, column_ };
@@ -273,7 +320,7 @@ void VgaTerm::backspace()
 {
     stdlib::AutoLock lock(lock_);
 
-    if (buf_ == nullptr)
+    if (!drawing())
         return;
 
     if (column_ > 0)
