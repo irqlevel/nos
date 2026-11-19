@@ -1,6 +1,7 @@
 #pragma once
 
 #include <include/types.h>
+#include <kernel/atomic.h>
 #include <kernel/spin_lock.h>
 #include <lib/printer.h>
 #include <drivers/font8x16.h>
@@ -58,6 +59,22 @@ public:
 
     void panic_print_string(const char *s);
 
+    /* The framebuffer let go of for good, should any of it lie in
+       [base, base + size): a device's BAR, the device about to be given to
+       a guest (hv's pci=) -- the boot GPU, whose memory the firmware's
+       framebuffer is. Nothing is drawn there from then on, the panic's
+       report included; the mapping stays, and is not written. True when it
+       held one there. */
+    bool release_within(ulong base, ulong size);
+
+    /* Drawing paused (hold) and taken up again (unhold), the two paired:
+       around a stretch in which some device's memory does not answer -- a
+       function about to be given to a guest, its decoding off while its BARs
+       are sized, before release_within can say whether the framebuffer is
+       its. What would have been drawn meanwhile is not; the log has it. */
+    void hold();
+    void unhold();
+
 private:
     FbTerm();
     virtual ~FbTerm();
@@ -97,6 +114,9 @@ private:
     void scroll();
     void cls_lock_held();
     void repaint();
+    /* Whether there is a framebuffer to draw into: one set up, not
+       released, not held */
+    bool drawing();
 
     /* Cap the character grid so it fits a fixed allocation: the console is
        set up before the heap exists. A larger mode just leaves the right
@@ -127,6 +147,11 @@ private:
     char shown_[MAX_ROWS][MAX_COLS];
 
     SpinLock lock_;
+    /* Set once, by release_within; and the holds there are. Changed under
+       lock_ and read under it by every path that draws -- and by the
+       panic's, which takes no lock */
+    Atomic released_;
+    Atomic holds_;
 
     static bool ready_flag_;
 };

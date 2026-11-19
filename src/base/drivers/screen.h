@@ -30,6 +30,15 @@ void cls();
 /* Panic context: no locks, polled output only. */
 void panic_print_string(const char *s);
 
+/* A function about to be given to a guest: drawing held (on) and taken up
+   again (off), paired, while its BARs are sized with its decoding off; then
+   the screen let go of for good where it lies in [base, base + size) --
+   true when it was. The framebuffer is in a BAR (FbTerm); EGA text is at
+   0xB8000, the legacy VGA window a VGA controller decodes, which the caller
+   names for one (VgaTerm). */
+void hold(bool on);
+bool release_within(ulong base, ulong size);
+
 }
 
 }

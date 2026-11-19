@@ -42,6 +42,11 @@ fn path(r: &mut Input) -> String {
     p
 }
 
+/// A host's PCI function, any there may be.
+fn function(r: &mut Input) -> (u16, u16, u16) {
+    (u16::from(r.u8()), u16::from(r.u8() % 32), u16::from(r.u8() % 8))
+}
+
 fn made_up(r: &mut Input) -> Config {
     let mut o = Options {
         kernel: path(r),
@@ -54,6 +59,10 @@ fn made_up(r: &mut Input) -> Config {
         let p = path(r);
         o.disks.push((p, r.bool()));
     }
+    for _ in 0..r.below(crate::vmconfig::MAX_PCI as u64 + 1) {
+        o.pci.push(function(r));
+    }
+    o.unsafe_interrupts = r.bool();
     if r.bool() {
         o.mem_mib = Some(r.value64());
     }
@@ -136,6 +145,9 @@ fn changed(old: &Config, r: &mut Input) -> Config {
     }
     if r.bool() {
         o.disks.push((path(r), r.bool()));
+    }
+    if r.bool() && o.pci.len() < crate::vmconfig::MAX_PCI {
+        o.pci.push(function(r));
     }
     if r.bool() {
         c.protected = !c.protected;

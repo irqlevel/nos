@@ -112,6 +112,33 @@ void panic_print_string(const char *s)
         VgaTerm::get_instance().panic_print_string(s);
 }
 
+/* The console setup() chose, and only that one: VgaTerm is touched only
+   where setup() made it -- its constructor writes the VGA's ports */
+void hold(bool on)
+{
+    if (fb_active)
+    {
+        if (on)
+            FbTerm::get_instance().hold();
+        else
+            FbTerm::get_instance().unhold();
+    }
+    else if (VgaTerm::is_ready())
+    {
+        if (on)
+            VgaTerm::get_instance().hold();
+        else
+            VgaTerm::get_instance().unhold();
+    }
+}
+
+bool release_within(ulong base, ulong size)
+{
+    if (fb_active)
+        return FbTerm::get_instance().release_within(base, size);
+    return VgaTerm::is_ready() && VgaTerm::get_instance().release_within(base, size);
+}
+
 }
 
 }

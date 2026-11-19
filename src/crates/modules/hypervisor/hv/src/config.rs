@@ -31,6 +31,14 @@ pub struct Options {
     pub initrd: Option<String>,
     /// Its disks, `vda` on: each one's path, and whether it is read-only.
     pub disks: Vec<(String, bool)>,
+    /// `pci=`: the host's PCI functions it holds, each its bus, device and
+    /// function (plans/gpu-passthrough.md).
+    pub pci: Vec<(u16, u16, u16)>,
+    /// `unsafe_interrupts`: the functions given although their interrupts
+    /// are not remapped -- a DMA of theirs to the interrupt range raises
+    /// any of the host's: the guest trusted with that, until interrupt
+    /// remapping is done.
+    pub unsafe_interrupts: bool,
     pub mem_mib: Option<u64>,
     pub cmdline: Option<String>,
     /// What is typed at its console once it is at a prompt.
@@ -107,6 +115,8 @@ enum Key {
     Cpus,
     Cpu,
     Disks,
+    Pci,
+    UnsafeInterrupts,
     Net,
     Port,
     Forward,
@@ -127,7 +137,7 @@ enum Key {
 }
 
 /// The keys there are, in the order `render` writes them.
-const KEYS: [(&str, Key); 24] = [
+const KEYS: [(&str, Key); 26] = [
     ("kernel", Key::Kernel),
     ("initrd", Key::Initrd),
     ("cmdline", Key::Cmdline),
@@ -135,6 +145,8 @@ const KEYS: [(&str, Key); 24] = [
     ("cpus", Key::Cpus),
     ("cpu", Key::Cpu),
     ("disks", Key::Disks),
+    ("pci", Key::Pci),
+    ("unsafe_interrupts", Key::UnsafeInterrupts),
     ("net", Key::Net),
     ("network", Key::Network),
     ("firewall", Key::Firewall),
@@ -156,6 +168,9 @@ const KEYS: [(&str, Key); 24] = [
 
 /// The longest a network's name is.
 pub const NETWORK_NAME_MAX: usize = 31;
+
+/// The most host functions a guest holds (`pci`).
+pub const MAX_PCI: usize = 4;
 
 /// What a network is called on a VM's `network=` when it is the cluster's
 /// (plans/vnet.md): `vnet:lan`.
@@ -257,6 +272,7 @@ fn assign(c: &mut Config, key: Key, name: &str, value: Value, line: usize) -> Re
             }
         }
         (Key::Net, Value::Bool(b)) => o.net = b,
+        (Key::UnsafeInterrupts, Value::Bool(b)) => o.unsafe_interrupts = b,
         (Key::Restart, Value::Bool(b)) => o.restart = b,
         (Key::ConsoleLog, Value::Bool(b)) => c.console_log = b,
         (Key::Protected, Value::Bool(b)) => c.protected = b,
@@ -273,6 +289,17 @@ fn assign(c: &mut Config, key: Key, name: &str, value: Value, line: usize) -> Re
                 o.disks.push(disk);
             }
         }
+        (Key::Pci, Value::List(list)) => {
+            if o.pci.len() + list.len() > MAX_PCI {
+                return Err(error(line, &alloc::format!("at most {} host functions", MAX_PCI)));
+            }
+            o.pci.try_reserve_exact(list.len()).map_err(|_| String::from("out of memory"))?;
+            for f in list {
+                let function = pci(&f).ok_or_else(|| error(line, &alloc::format!("\"{}\" is not a host function -- \
+                                                                                 bus:device.function, in hex", f)))?;
+                o.pci.push(function);
+            }
+        }
         (Key::Forward, Value::List(list)) => {
             o.forwards.try_reserve_exact(list.len()).map_err(|_| String::from("out of memory"))?;
             for f in list {
@@ -286,7 +313,7 @@ fn assign(c: &mut Config, key: Key, name: &str, value: Value, line: usize) -> Re
             return Err(wrong("a string", &v));
         }
         (Key::Memory | Key::Rxmod | Key::Cpus | Key::Cpu | Key::Port, v) => return Err(wrong("a number", &v)),
-        (Key::Disks | Key::Forward, v) => return Err(wrong("a list of strings", &v)),
+        (Key::Disks | Key::Pci | Key::Forward, v) => return Err(wrong("a list of strings", &v)),
         (_, v) => return Err(wrong("true or false", &v)),
     }
     Ok(())
@@ -407,6 +434,25 @@ pub fn forward(word: &str) -> Option<(u16, u16)> {
     Some((port(host)?, port(guest)?))
 }
 
+/// A host's PCI function as a word and the file say it, and as `pci` and
+/// `iommu` name one: `bus:device.function`, each in hex.
+pub fn pci(word: &str) -> Option<(u16, u16, u16)> {
+    let (bus, rest) = word.split_once(':')?;
+    let (slot, func) = rest.split_once('.')?;
+    let hex = |s: &str, max: u16| -> Option<u16> {
+        if s.is_empty() || s.len() > 2 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        u16::from_str_radix(s, 16).ok().filter(|&v| v <= max)
+    };
+    Some((hex(bus, PCI_BUS_MAX)?, hex(slot, PCI_SLOT_MAX)?, hex(func, PCI_FUNC_MAX)?))
+}
+
+/// The largest bus, device and function numbers there are.
+const PCI_BUS_MAX: u16 = 0xFF;
+const PCI_SLOT_MAX: u16 = 0x1F;
+const PCI_FUNC_MAX: u16 = 0x7;
+
 /// A public address as a person writes it, `a.b.c.d`: one a host may have.
 pub fn public(text: &str) -> Option<u32> {
     netwire::parse_ipv4(text.as_bytes()).filter(|&a| netwire::host_address(a, 0))
@@ -433,6 +479,7 @@ fn line(c: &Config, key: Key, name: &str) -> Result<Option<String>, String> {
         Key::Network => o.network.as_deref().map_or(0, text),
         Key::Firewall => o.firewall.as_deref().map_or(0, text),
         Key::Disks => o.disks.iter().map(|(d, _)| text(d) + 5).sum::<usize>() + 2,
+        Key::Pci => o.pci.len() * 14 + 2,
         Key::Forward => o.forwards.len() * 16 + 2,
         _ => 48,
     };
@@ -483,7 +530,19 @@ fn line(c: &Config, key: Key, name: &str) -> Result<Option<String>, String> {
             }
             s.push_str("]\n");
         }
+        Key::Pci => {
+            if o.pci.is_empty() {
+                return Ok(None);
+            }
+            s.push_str(name);
+            s.push_str(" = [");
+            for (i, &(bus, slot, func)) in o.pci.iter().enumerate() {
+                let _ = write!(s, "{}\"{:02x}:{:02x}.{:x}\"", if i == 0 { "" } else { ", " }, bus, slot, func);
+            }
+            s.push_str("]\n");
+        }
         Key::Net if o.net => said(&mut s, &true),
+        Key::UnsafeInterrupts if o.unsafe_interrupts => said(&mut s, &true),
         Key::Network => match &o.network {
             Some(v) => put(&mut s, name, v),
             None => return Ok(None),
@@ -537,7 +596,7 @@ fn line(c: &Config, key: Key, name: &str) -> Result<Option<String>, String> {
             None => return Ok(None),
         },
         Key::Net | Key::Restart | Key::Protected | Key::Log | Key::Input | Key::Ioapic | Key::Xapic
-        | Key::Offload => return Ok(None),
+        | Key::Offload | Key::UnsafeInterrupts => return Ok(None),
     }
     Ok(Some(s))
 }

@@ -20,6 +20,8 @@ use kcore::sync::Mutex;
 
 use crate::config::Options;
 use crate::disk::{QueuedDisk, Runner};
+use crate::config::MAX_PCI;
+use crate::passthrough::Passed;
 
 /// How much of the file is read at once when streaming it into guest memory.
 const CHUNK: usize = 64 * 1024;
@@ -56,6 +58,8 @@ pub struct Spec {
     /// `vda`, `vdb`, ... in that order, and whether each is read-only
     /// (`disk=path:ro`).
     pub disks: Vec<(String, bool)>,
+    /// `pci=`, as many as there are: the host's functions it holds.
+    pub pci: Vec<(u16, u16, u16)>,
     pub mem_bytes: u64,
     pub cmdline: String,
     /// Bytes to type at its console once it is at a prompt.
@@ -183,6 +187,12 @@ pub fn words(args: &str, usage: &str) -> Result<Options, String> {
                 return Err(alloc::format!("at most {} disks", MAX_DISKS));
             }
             o.disks.push(crate::config::disk(v).ok_or_else(|| String::from("disk= wants a path, :ro after it for one read-only"))?);
+        } else if let Some(v) = word.strip_prefix("pci=") {
+            if o.pci.len() >= MAX_PCI {
+                return Err(alloc::format!("at most {} host functions", MAX_PCI));
+            }
+            o.pci.push(crate::config::pci(v)
+                .ok_or_else(|| String::from("pci= wants a host function, bus:device.function in hex"))?);
         } else if let Some(v) = word.strip_prefix("forward=") {
             o.forwards.push(crate::config::forward(v)
                 .ok_or_else(|| String::from("forward= wants <nos's port>:<the guest's>, each 1..65535"))?);
@@ -218,6 +228,8 @@ pub fn words(args: &str, usage: &str) -> Result<Options, String> {
             o.input = String::from_utf8(unescape(v)?).map_err(|_| String::from("input= that is not text"))?;
         } else if word == "log" {
             o.log = true;
+        } else if word == "unsafe_interrupts" {
+            o.unsafe_interrupts = true;
         } else if word == "xapic" {
             o.xapic = true;
         } else if word == "ioapic" {
@@ -306,11 +318,37 @@ pub fn spec(o: Options) -> Result<Spec, String> {
             return Err(alloc::format!("nos's port {} is forwarded twice", host));
         }
     }
-    let cmdline = o.cmdline.unwrap_or_else(|| String::from(if cpus > 1 { DEFAULT_CMDLINE_SMP } else { DEFAULT_CMDLINE }));
+    if o.pci.len() > MAX_PCI {
+        return Err(alloc::format!("at most {} host functions", MAX_PCI));
+    }
+    /* Where interrupts are not remapped -- a unit without IR, or iommu=on
+     * not given -- a function's DMA to the interrupt range is an interrupt
+     * of the host's, of any vector: refused, unless the VM says it is
+     * trusted with that (plans/gpu-passthrough.md). Remapped, it raises its
+     * own vectors alone. */
+    if !o.pci.is_empty() && !o.unsafe_interrupts && !kcore::iommu::remapping() {
+        return Err(String::from("pci= gives a guest a host's function whose interrupts are not remapped -- \
+                                 this machine's IOMMU does not remap them, and its DMA could raise any \
+                                 interrupt of the host's: unsafe_interrupts too, for a guest trusted with that"));
+    }
+    if o.unsafe_interrupts && o.pci.is_empty() {
+        return Err(String::from("unsafe_interrupts is a guest holding a host's function's -- pci= too"));
+    }
+    for (i, &(bus, slot, func)) in o.pci.iter().enumerate() {
+        if o.pci[..i].contains(&(bus, slot, func)) {
+            return Err(alloc::format!("the host function {:02x}:{:02x}.{:x} is named twice", bus, slot, func));
+        }
+    }
+    /* A host's function's interrupt is its MSI, which only a local APIC
+     * takes: a guest holding one has its APIC on, as one of several CPUs has */
+    let cmdline = o.cmdline.unwrap_or_else(|| {
+        String::from(if cpus > 1 || !o.pci.is_empty() { DEFAULT_CMDLINE_SMP } else { DEFAULT_CMDLINE })
+    });
     Ok(Spec {
         kernel: o.kernel,
         initrd: o.initrd,
         disks: o.disks,
+        pci: o.pci,
         mem_bytes: mem_mib * 1024 * 1024,
         cmdline,
         input: o.input.into_bytes(),
@@ -420,6 +458,9 @@ fn stream(guest: &LinuxGuest, path: &str, offset: u64, gpa: u64, len: u64) -> Re
 pub struct Built {
     pub guest: LinuxGuest,
     pub cpus: Vec<GuestCpu>,
+    /// The host's functions it holds (`pci=`): armed once the guest is
+    /// shared (`Passed::arm`), and let go of before it is.
+    pub passed: Vec<Passed>,
 }
 
 /// What the kernel file is, read and planned: a bzImage booted by the Linux
@@ -503,7 +544,7 @@ fn plan(spec: &Spec, initrd_len: u64) -> Result<Image, String> {
             }
             Err(_) => return Err(alloc::format!("{} is not a PVH image this can load", spec.kernel)),
         };
-        let layout = hv::pvh::plan(&image, spec.mem_bytes, initrd_len)
+        let layout = hv::pvh::plan_below(&image, spec.mem_bytes, low_end(spec), initrd_len)
             .map_err(|e| alloc::format!("the guest's memory does not fit its image: {}", e))?;
         return Ok(Image::Pvh { image, layout });
     }
@@ -515,9 +556,15 @@ fn plan(spec: &Spec, initrd_len: u64) -> Result<Image, String> {
         return Err(String::from("the image is shorter than its own setup"));
     }
     let kernel_len = kernel_size - pm_offset;
-    let layout = hv::linux::plan(&header, spec.mem_bytes, kernel_len, initrd_len)
+    let layout = hv::linux::plan_below(&header, spec.mem_bytes, low_end(spec), kernel_len, initrd_len)
         .map_err(|e| alloc::format!("the guest's memory does not fit its kernel: {}", e))?;
     Ok(Image::Linux { header, first, pm_offset, layout })
+}
+
+/// Where the guest's RAM below 4 GiB ends: below the hole a host's
+/// function's BARs go in, for a guest holding one (`LinuxGuest::new_holed`).
+fn low_end(spec: &Spec) -> u64 {
+    if spec.pci.is_empty() { hv::linux::LOW_RAM_END } else { hv::linux::HOLE_RAM_END }
 }
 
 /// Build the guest: its memory, the kernel and the initrd streamed into it,
@@ -534,7 +581,17 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
     };
     let image = plan(spec, initrd_len)?;
     let disks = open_disks(spec, runner)?;
+    /* The host's functions before its memory is taken: one another guest
+     * holds, or that has no MSI, costs nothing */
+    let mut passed = Vec::new();
+    passed.try_reserve_exact(spec.pci.len()).map_err(|_| String::from("out of memory"))?;
+    for &(bus, slot, func) in &spec.pci {
+        passed.push(Passed::open(bus, slot, func, &spec.pci)?);
+    }
     let (mut guest, mut cpus) = new_machine(machine, spec, doorbells)?;
+    for p in passed.iter_mut() {
+        p.translate(&guest)?;
+    }
 
     /* The 64-bit kernel at its load address -- or each of a PVH image's
      * segments at its own, the zeroes past its file bytes being the fresh
@@ -555,11 +612,18 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
     }
 
     /* Its devices before its furniture: the ACPI tables `load` lays out
-     * describe the bus as it is then. */
+     * describe the bus as it is then -- the host's functions last, on the
+     * slots after its own devices' */
     add_devices(&mut guest, spec, runner, disks)?;
+    for p in passed.iter_mut() {
+        if let Some(f) = p.function() {
+            guest.add_host_function(f).map_err(|e| alloc::format!("a host function on the guest's bus: {}", e))?;
+        }
+    }
 
     let tsc_khz = kcore::time::cycle_counter_hz().map(|hz| hz / 1000).filter(|&khz| khz != 0);
-    let cmdline = guest_cmdline(&spec.cmdline, spec.cpus > 1 && !spec.ioapic, tsc_khz)?;
+    let apic = spec.cpus > 1 || !spec.pci.is_empty();
+    let cmdline = guest_cmdline(&spec.cmdline, apic && !spec.ioapic, tsc_khz)?;
     let bsp = cpus.first_mut().ok_or_else(|| String::from("no guest: no CPU"))?;
     match &image {
         Image::Linux { header, first, layout, .. } => guest
@@ -572,7 +636,7 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
             e => alloc::format!("laying out the guest: {}", e),
         })?,
     }
-    Ok(Built { guest, cpus })
+    Ok(Built { guest, cpus, passed })
 }
 
 /// Build the guest of a state -- one that ran, saved (`hv restore`) or
@@ -585,6 +649,9 @@ pub fn build_restored(machine: &Machine, spec: &Spec, runner: &Runner, doorbells
                       state: &vmstate::VmState, fill: &mut dyn FnMut(&LinuxGuest) -> Result<(), String>)
     -> Result<Built, String>
 {
+    if !spec.pci.is_empty() {
+        return Err(String::from("a guest holding a host's function has no state to restore"));
+    }
     let disks = open_disks(spec, runner)?;
     let (mut guest, mut cpus) = new_machine(machine, spec, doorbells)?;
     add_devices(&mut guest, spec, runner, disks)?;
@@ -592,7 +659,7 @@ pub fn build_restored(machine: &Machine, spec: &Spec, runner: &Runner, doorbells
      * them on to its first run all the same. */
     fill(&guest)?;
     guest.restore(state, &mut cpus).map_err(|e| alloc::format!("its state: {}", e))?;
-    Ok(Built { guest, cpus })
+    Ok(Built { guest, cpus, passed: Vec::new() })
 }
 
 /// The guest of a VM coming from another host (plans/vm-migration.md),
@@ -607,6 +674,9 @@ pub fn build_coming(machine: &Machine, spec: &Spec, doorbells: Arc<Doorbells>, d
     if disks.len() != spec.disks.len() || nic.is_some() != spec.net {
         return Err(String::from("its devices are not its vm.toml's"));
     }
+    if !spec.pci.is_empty() {
+        return Err(String::from("a guest holding a host's function is not moved"));
+    }
     let (mut guest, cpus) = new_machine(machine, spec, doorbells)?;
     if let Some((mac, mtu)) = nic {
         guest.add_nic_with(Box::new(hv::nic::Standin), mac, mtu).map_err(|e| alloc::format!("the NIC: {}", e))?;
@@ -619,7 +689,7 @@ pub fn build_coming(machine: &Machine, spec: &Spec, doorbells: Arc<Doorbells>, d
         let id = core::str::from_utf8(&shape.id[..end]).map_err(|_| alloc::format!("{}: an id that is no text", path))?;
         guest.add_disk(Box::new(standin), id).map_err(|e| alloc::format!("{}: {}", path, e))?;
     }
-    Ok(Built { guest, cpus })
+    Ok(Built { guest, cpus, passed: Vec::new() })
 }
 
 /// The guest's disks, opened -- before its memory: the commonest refusal of
@@ -648,7 +718,11 @@ fn new_machine(machine: &Machine, spec: &Spec, doorbells: Arc<Doorbells>) -> Res
         pool_has(spec.mem_bytes)?;
     }
     let (mut guest, cpus) =
-        LinuxGuest::new(machine, spec.mem_bytes, huge, spec.cpus, doorbells, !spec.xapic, spec.ioapic)
+        if low_end(spec) == hv::linux::LOW_RAM_END {
+            LinuxGuest::new(machine, spec.mem_bytes, huge, spec.cpus, doorbells, !spec.xapic, spec.ioapic)
+        } else {
+            LinuxGuest::new_holed(machine, spec.mem_bytes, huge, spec.cpus, doorbells, !spec.xapic, spec.ioapic)
+        }
             .map_err(|e| match e {
                 /* Another guest took the blocks between the look and the
                  * taking: said as the look would have said it. */
@@ -995,6 +1069,11 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
     if posted != 0 {
         let _ = writeln!(out, "  posted     {} interrupts posted for a CPU to take in its guest, {} with a notification sent to the CPU it ran on",
             posted, notified);
+    }
+    let (host_msis, host_lost) = guest.host_msis();
+    if host_msis != 0 {
+        let _ = writeln!(out, "  host fn    {} MSIs of its host's functions sent on to it by the host's handlers of their real ones, {} of them taken by no CPU",
+            host_msis, host_lost);
     }
     let served = guest.served_msis();
     if served != 0 {

@@ -94,6 +94,16 @@ private:
     /* Per-table-entry assigned CPU vector; 0 = none. */
     u8* entry_vector_;
 
+    /* Where interrupts are remapped (x86's VT-d, drivers/iommu.h): each
+       entry's handle in its unit's interrupt table, NO_HANDLE for none --
+       allocated with the first, and its entries given back with the
+       vectors */
+    u16* entry_handle_;
+    static const u16 NO_HANDLE = 0xFFFF;
+
+    /* The device's requester id: what its remapped entries verify */
+    u16 requester_id() const;
+
     /* Serializes table entry updates (enable_vector/Mask/Unmask/Retarget)
        so a concurrent Mask cannot be clobbered by Retarget restoring a
        stale control value. Not taken from IRQ context. */

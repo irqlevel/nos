@@ -15,13 +15,19 @@
  *      PCI 0:1F.0 config 0x50.
  *   3. Same bridge, ACPI PMBASE (config 0x40) plus the fixed 0x60 offset.
  *
- * NO_REBOOT (the bit that inhibits the reset on the second expiry) is only
- * cleared on the (2)/(3) generations, where it sits in the LPC bridge's
- * config space.  From 100-series on it lives behind the P2SB sideband
- * (SBREG_BAR + 0xC6000C) on a device the firmware hides from PCI
- * enumeration, so it is left alone: if the firmware set it, the timer still
- * counts but the board will not reset.  Callers that depend on reset-on-hang
- * must check is_counting() -- see the TCO code in kernel/src/lib.rs.
+ * NO_REBOOT (the bit that inhibits the reset on the second expiry) is where
+ * the generation keeps it, and cleared where it can be reached:
+ *   - on the (2)/(3) generations, in the LPC bridge's config space;
+ *   - from Cannon Lake (300-series, 2018) on, in TCO1_CNT itself -- bit 0,
+ *     in the window (1) found: cleared and read back, as Linux's iTCO_wdt
+ *     does for what it calls TCO version 6.  Only the SMBus function's
+ *     device ID says a PCH is one of those (CNL_SMBUS_IDS);
+ *   - the 100- and 200-series keep it behind the P2SB sideband
+ *     (SBREG_BAR + 0xC6000C), on a device the firmware hides from PCI
+ *     enumeration, so there it is left alone: if the firmware set it, the
+ *     timer still counts but the board will not reset.
+ * no_reboot() says which.  Callers that depend on reset-on-hang must check
+ * is_counting() too -- see the TCO code in kernel/src/lib.rs.
  *
  * Timeout unit: each TCO timer tick is approximately 0.6 seconds.
  * The TCO timer reloads on write to TCO_RLD and fires twice:
@@ -59,6 +65,45 @@ const TCO_TMR_MIN:  u16 = 4;
 /* TMR_HLT: bit 11 of TCO1_CNT halts the watchdog */
 const TMR_HLT: u16 = 1 << 11;
 
+/* NMI_NOW, bit 8 of TCO1_CNT, flips when it is written as 1, so a value
+   read with it set is never written back so: every update of the register
+   writes it as 0 (update_cnt; Linux's iTCO_wdt masks it the same way) */
+const NMI_NOW: u16 = 1 << 8;
+
+/* From Cannon Lake on, NO_REBOOT is bit 0 of TCO1_CNT */
+const CNT_NO_REBOOT: u16 = 1 << 0;
+
+/* The SMBus functions of the PCHs that keep NO_REBOOT in TCO1_CNT: Cannon
+   Lake's and those after it -- the ones Linux's i2c-i801 marks
+   FEATURE_TCO_CNL. Comet Lake-V (0xA3A3) is a 200-series PCH by another
+   name, which keeps it behind the P2SB, and is not here. */
+const CNL_SMBUS_IDS: [u16; 24] = [
+    0x18DF, /* Cedar Fork */
+    0x1BC9, /* Emmitsburg */
+    0xA323, /* Cannon Lake-H (300-series) */
+    0x9DA3, /* Cannon Lake-LP */
+    0x34A3, /* Ice Lake-LP */
+    0x38A3, /* Ice Lake-N */
+    0x02A3, /* Comet Lake-LP */
+    0x06A3, /* Comet Lake-H (400-series) */
+    0x4B23, /* Elkhart Lake */
+    0xA0A3, /* Tiger Lake-LP */
+    0x43A3, /* Tiger Lake-H (500-series) */
+    0x4DA3, /* Jasper Lake */
+    0x7AA3, /* Alder Lake-S (600-series) */
+    0x51A3, /* Alder Lake-P */
+    0x54A3, /* Alder Lake-M */
+    0x7A23, /* Raptor Lake-S (700-series) */
+    0x7E22, /* Meteor Lake-P */
+    0xAE22, /* Meteor Lake SoC-S */
+    0x7F23, /* Meteor Lake PCH-S (800-series) */
+    0x7722, /* Arrow Lake-H */
+    0xE322, /* Panther Lake-H */
+    0xE422, /* Panther Lake-P */
+    0x4D22, /* Wildcat Lake-U */
+    0x6E23, /* Nova Lake-S */
+];
+
 /* TCOBASE decodes a 32-byte I/O window: bit 0 is a hardwired indicator and
    bits 4:1 are reserved, so mask them off before using it as a port base. */
 const TCOBASE_MASK: u16 = 0xFFE0;
@@ -93,8 +138,7 @@ const GCS_NO_REBOOT: u32 = 1 << 1;
 /* Approximate seconds per TCO tick */
 const TCO_TICK_NS: u64 = 600_000_000; /* 0.6 s */
 
-/* Where TCOBASE was found.  Also says whether NO_REBOOT was reachable:
-   only the two Lpc* sources have it in PCI config space. */
+/* Where TCOBASE was found. */
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TcoBaseSource {
     PchSmbus,
@@ -110,10 +154,40 @@ impl TcoBaseSource {
             TcoBaseSource::LpcAcpiBase => "LPC 0:1F.0 ACPI base + 0x60",
         }
     }
+}
 
-    /// True when probe() was able to clear NO_REBOOT for this source.
-    pub fn no_reboot_cleared(self) -> bool {
-        self != TcoBaseSource::PchSmbus
+/// What probe() made of NO_REBOOT, the bit that keeps the second expiry
+/// from resetting the machine.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NoReboot {
+    /// Cleared in TCO1_CNT, and read back clear: a Cannon Lake or later PCH
+    ClearedInCnt,
+    /// Cleared in the LPC bridge's config space -- where most of those
+    /// generations keep it, not all (probe_lpc's caveat)
+    ClearedInLpc,
+    /// Cleared in TCO1_CNT and read back set: the firmware locked it so
+    Locked,
+    /// Behind the P2SB, out of reach (the 100- and 200-series): as the
+    /// firmware set it
+    Left,
+}
+
+impl NoReboot {
+    /// Whether a hang should reset the machine, as far as this bit goes:
+    /// is_counting() says the rest.
+    pub fn cleared(self) -> bool {
+        matches!(self, NoReboot::ClearedInCnt | NoReboot::ClearedInLpc)
+    }
+
+    /// The bit's fate, for the line the kernel logs: nothing where it went
+    /// as it always has.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NoReboot::ClearedInCnt => ", NO_REBOOT cleared in TCO1_CNT",
+            NoReboot::ClearedInLpc => "",
+            NoReboot::Locked       => ", NO_REBOOT locked set by the firmware",
+            NoReboot::Left         => ", NO_REBOOT left as firmware set it",
+        }
     }
 }
 
@@ -125,6 +199,7 @@ pub struct TcoWatchdog {
        writes it. */
     armed_ticks: AtomicU16,
     source: TcoBaseSource,
+    no_reboot: NoReboot,
 }
 
 impl TcoWatchdog {
@@ -145,6 +220,11 @@ impl TcoWatchdog {
     /// Which discovery path produced the base.
     pub fn source(&self) -> TcoBaseSource {
         self.source
+    }
+
+    /// What became of NO_REBOOT.
+    pub fn no_reboot(&self) -> NoReboot {
+        self.no_reboot
     }
 
     /// 100-series PCH (Sunrise Point) and later.
@@ -178,9 +258,20 @@ impl TcoWatchdog {
             return None;
         }
 
-        /* NO_REBOOT is behind the hidden P2SB device on this generation
-           (see the file header); leave it as the firmware set it. */
-        Some(Self::from_base(tco_base, TcoBaseSource::PchSmbus))
+        /* NO_REBOOT is where the generation keeps it (the file header): in
+           TCO1_CNT from Cannon Lake on -- cleared, and read back, since
+           firmware may have locked it set -- and otherwise behind the hidden
+           P2SB device, left as the firmware set it. */
+        let no_reboot = if CNL_SMBUS_IDS.contains(&dev.device) {
+            if update_cnt(tco_base, CNT_NO_REBOOT, 0) & CNT_NO_REBOOT == 0 {
+                NoReboot::ClearedInCnt
+            } else {
+                NoReboot::Locked
+            }
+        } else {
+            NoReboot::Left
+        };
+        Some(Self::from_base(tco_base, TcoBaseSource::PchSmbus, no_reboot))
     }
 
     /// ICH9-class chipsets, including QEMU's q35.
@@ -221,16 +312,15 @@ impl TcoWatchdog {
         let gcs = dev.read_config32(PMC_GCS_REG);
         dev.write_config32(PMC_GCS_REG, gcs & !GCS_NO_REBOOT);
 
-        Some(Self::from_base(tco_base, source))
+        Some(Self::from_base(tco_base, source, NoReboot::ClearedInLpc))
     }
 
     /// Common register init once TCOBASE is known.
-    fn from_base(tco_base: u16, source: TcoBaseSource) -> Self {
-        let wdt = Self { tco_base, armed_ticks: AtomicU16::new(0), source };
+    fn from_base(tco_base: u16, source: TcoBaseSource, no_reboot: NoReboot) -> Self {
+        let wdt = Self { tco_base, armed_ticks: AtomicU16::new(0), source, no_reboot };
 
         /* Clear TMR_HLT so the watchdog can be started */
-        let cnt = Port::<u16>::new(tco_base + TCO1_CNT).read();
-        Port::<u16>::new(tco_base + TCO1_CNT).write(cnt & !TMR_HLT);
+        update_cnt(tco_base, TMR_HLT, 0);
 
         /* Clear stale timeout status bits */
         Port::<u16>::new(tco_base + TCO1_STS).write(1 << 3); /* TIMEOUT */
@@ -260,14 +350,12 @@ impl TcoWatchdog {
         self.kick();
 
         /* Ensure timer is not halted */
-        let cnt = Port::<u16>::new(self.tco_base + TCO1_CNT).read();
-        Port::<u16>::new(self.tco_base + TCO1_CNT).write(cnt & !TMR_HLT);
+        update_cnt(self.tco_base, TMR_HLT, 0);
     }
 
     /// Stop (halt) the watchdog.
     pub fn stop(&self) {
-        let cnt = Port::<u16>::new(self.tco_base + TCO1_CNT).read();
-        Port::<u16>::new(self.tco_base + TCO1_CNT).write(cnt | TMR_HLT);
+        update_cnt(self.tco_base, 0, TMR_HLT);
     }
 
     /// Kick (pet) the watchdog to prevent reset.
@@ -288,4 +376,13 @@ impl TcoWatchdog {
     pub fn is_counting(&self) -> bool {
         self.current_count() != self.armed_ticks.load(Ordering::Relaxed)
     }
+}
+
+/// TCO1_CNT with the bits of `clear` cleared and those of `set` set, and
+/// NMI_NOW written as 0 whatever it read; what the register reads after.
+fn update_cnt(tco_base: u16, clear: u16, set: u16) -> u16 {
+    let cnt = Port::<u16>::new(tco_base + TCO1_CNT);
+    let value = cnt.read() & !NMI_NOW;
+    cnt.write((value & !clear) | set);
+    cnt.read()
 }

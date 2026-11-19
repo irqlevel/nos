@@ -205,3 +205,8 @@ pub fn power_off() {
 pub fn reboot() {
     system::kernel_power_request(system::REBOOT);
 }
+
+/// `deadman=N`'s seconds, 0 where it was not given.
+pub fn deadman_secs() -> u64 {
+    system::kernel_param_deadman()
+}

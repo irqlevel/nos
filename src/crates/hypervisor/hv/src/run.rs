@@ -68,6 +68,7 @@ use crate::smbios;
 use crate::cr;
 use crate::dr;
 use crate::devices::blk::{self, Blk};
+use crate::devices::host::{self, HostFunction};
 use crate::devices::ioapic::{self, Pins};
 use crate::devices::net::{self, Net};
 use crate::devices::pci::{self, Function, PciBus};
@@ -106,6 +107,14 @@ const DISK_IO_BASE: u16 = 0xC000;
 const NIC_IO_BASE: u16 = DISK_IO_BASE + (MAX_DISKS as u16) * (blk::BAR_SIZE as u16);
 const DISK_IRQ: u8 = 11;
 const NIC_IRQ: u8 = 10;
+/// The line a host's function's INTx pin is said to be wired to, in the MP
+/// table and the DSDT: never raised -- the function's interrupt is its MSI,
+/// its INTx off at the device -- but there, for a driver that wants a legacy
+/// IRQ to exist (NVIDIA's). Free on a PC, and on the master PIC.
+const HOST_IRQ: u8 = 5;
+/// What the 64-bit window the DSDT gives a host's functions' BARs is
+/// rounded up to, past the last of them (`write_firmware`).
+const BARS64_ROUNDING: u64 = 1 << 30;
 /// Where a device's MSI-X table page is, for a guest of more than one CPU:
 /// this plus a page for its PCI slot -- in the platform's MMIO window, clear
 /// of the local APIC's page, the IO-APIC's address the MP table gives, and
@@ -957,6 +966,32 @@ struct Platform {
     /// written, whether a write). A guest's `rdmsr_safe` takes the fault in
     /// silence, so the report is the only place such a thing shows.
     msr_faults: Vec<(u32, u64, bool)>,
+    /// The host's functions the guest holds (`add_host_function`), on the
+    /// slots after every emulated device's.
+    hosts: Vec<Hosted>,
+}
+
+/// A host's function on the guest's bus, and where its BARs are.
+struct Hosted {
+    slot: usize,
+    function: HostFunction,
+    /// Each BAR's mapping in the guest's space now: its address, none while
+    /// the guest has it nowhere the table can map.
+    mapped: [Option<u64>; 6],
+    /// Offsets into BAR0 of the pages trapped rather than mapped: NVIDIA's
+    /// configuration space mirrors.
+    traps: Vec<u64>,
+}
+
+/// Where the host's functions' BARs go: the 32-bit window below the
+/// platform's pages and the 64-bit one above RAM, each with the next free
+/// address.
+#[derive(Clone, Copy, Debug)]
+struct Windows {
+    low: u64,
+    low_end: u64,
+    high: u64,
+    high_end: u64,
 }
 
 /// A Linux guest: its memory, its devices, and what its CPUs share.
@@ -989,6 +1024,15 @@ pub struct LinuxGuest {
     /// Its furniture is laid out (`load`): the ACPI tables describe the
     /// devices it had then, and it takes no more.
     loaded: bool,
+    /// Where a host function's BARs go (`add_host_function`): None for a
+    /// guest made without the PCI hole they need (`new_holed`), and with
+    /// what the windows were when made, for the tables.
+    windows: Option<(Windows, Windows)>,
+    /// Where its RAM below 4 GiB ends (`linux::Ram::of_below`): what a
+    /// layout loaded into it was planned for, or it is refused (`load`) --
+    /// a memory map of another guest's RAM would hand its kernel the BARs'
+    /// hole as RAM.
+    low_end: u64,
     /// The CR4 bits its CPUs may set, by the CPUID they are told
     /// (`policy::cr4_allowed`): asked of the host once, not at every write.
     cr4_allowed: u64,
@@ -1002,6 +1046,10 @@ pub struct LinuxGuest {
     notified: AtomicU64,
     /// MSIs a disk's task sent from outside every CPU (`serve_disk`).
     served_msi: AtomicU64,
+    /// MSIs of its host's functions, sent by the host's handlers of their
+    /// real ones (`deliver_msi`), and those no CPU took.
+    host_msi: AtomicU64,
+    host_msi_lost: AtomicU64,
     /// How far apart its NICs' receive interrupts are held at least
     /// (`set_rx_moderation`), and whether they offer their transmit
     /// offloads (`set_offloads`).
@@ -1131,11 +1179,37 @@ impl LinuxGuest {
     pub fn new(machine: &Machine, mem_bytes: u64, huge: bool, cpus: u32, doorbells: Arc<Doorbells>, x2apic: bool,
                ioapic: bool) -> Result<(Self, Vec<GuestCpu>)>
     {
+        Self::build(machine, mem_bytes, huge, cpus, doorbells, x2apic, ioapic, linux::LOW_RAM_END)
+    }
+
+    /// As [`new`](Self::new), for a guest that is to hold a host's function
+    /// (`add_host_function`): its RAM below 4 GiB ending at
+    /// `linux::HOLE_RAM_END`, the rest above, so that a 32-bit BAR has room
+    /// below the platform's pages, and a 64-bit one above its RAM.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_holed(machine: &Machine, mem_bytes: u64, huge: bool, cpus: u32, doorbells: Arc<Doorbells>,
+                     x2apic: bool, ioapic: bool) -> Result<(Self, Vec<GuestCpu>)>
+    {
+        Self::build(machine, mem_bytes, huge, cpus, doorbells, x2apic, ioapic, linux::HOLE_RAM_END)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(machine: &Machine, mem_bytes: u64, huge: bool, cpus: u32, doorbells: Arc<Doorbells>, x2apic: bool,
+             ioapic: bool, low_end: u64) -> Result<(Self, Vec<GuestCpu>)>
+    {
         let n = cpus as usize;
         if n == 0 || n > MAX_CPUS || doorbells.len() != n || (ioapic && n < 2) || mem_bytes > MAX_MEM_BYTES {
             return Err(Error::BadAddress);
         }
-        let ram = linux::Ram::of(mem_bytes);
+        let ram = linux::Ram::of_below(mem_bytes, low_end);
+        let windows = (low_end != linux::LOW_RAM_END).then(|| {
+            /* A GiB past the end of RAM, and up to the width the guest is
+             * told, MAX_GPA at most */
+            let top = (1u64 << crate::policy::phys_bits()).min(crate::memory::MAX_GPA);
+            let high = ram.end().unwrap_or(top).max(linux::HIGH_RAM_START).div_ceil(1 << 30) << 30;
+            let w = Windows { low: low_end, low_end: u64::from(MSIX_PAGES), high, high_end: top };
+            (w, w)
+        });
         if ram.end().is_none_or(|end| end > 1u64 << crate::policy::phys_bits()) {
             return Err(Error::BadAddress);
         }
@@ -1220,6 +1294,7 @@ impl LinuxGuest {
             msix_pending,
             port_hist,
             msr_faults,
+            hosts: Vec::new(),
         };
         let all = if n == u64::BITS as usize { u64::MAX } else { (1u64 << n) - 1 };
         let mut parked = Vec::new();
@@ -1237,11 +1312,15 @@ impl LinuxGuest {
             started: AtomicU64::new(0),
             last_halt: AtomicU64::new(0),
             loaded: false,
+            windows,
+            low_end,
             cr4_allowed: crate::policy::cr4_allowed(),
             apicv: None,
             posted: AtomicU64::new(0),
             notified: AtomicU64::new(0),
             served_msi: AtomicU64::new(0),
+            host_msi: AtomicU64::new(0),
+            host_msi_lost: AtomicU64::new(0),
             rx_moderation_ns: RX_MODERATION_DEFAULT_NS,
             offloads: true,
             shape: Shape::cores(cpus),
@@ -1335,6 +1414,13 @@ impl LinuxGuest {
         self.served_msi.load(Ordering::Relaxed)
     }
 
+    /// MSIs of its host's functions sent on to it (`deliver_msi`), and of
+    /// those how many no CPU took -- a message the guest programmed to no
+    /// CPU of its, or of a kind not taken.
+    pub fn host_msis(&self) -> (u64, u64) {
+        (self.host_msi.load(Ordering::Relaxed), self.host_msi_lost.load(Ordering::Relaxed))
+    }
+
     /// Whether its CPUs have local APICs: a guest of more than one CPU. One
     /// of one is the PC it always was -- an 8259 on the CPU's interrupt pin,
     /// no APIC in CPUID, no MP table, the APIC's MSRs none of its business
@@ -1380,6 +1466,81 @@ impl LinuxGuest {
         p.msix_pending.push(0);
         p.disks += 1;
         Ok(())
+    }
+
+    /// Give it a function of the host's (`devices::host`), on the slot after
+    /// every device given so far: each of its BARs placed where firmware
+    /// would have -- a 32-bit one in the window below the platform's pages,
+    /// a 64-bit one above RAM, each at its size's alignment -- and mapped
+    /// into the nested table straight, but for NVIDIA's mirror of the
+    /// configuration space in BAR0, which traps. Refused for a guest made
+    /// without the PCI hole (`new_holed`), once its tables are laid out, or
+    /// where a BAR does not fit its window.
+    pub fn add_host_function(&mut self, mut function: HostFunction) -> Result<()> {
+        if self.loaded {
+            return Err(Error::BadAddress);
+        }
+        let Some((ref mut free, _)) = self.windows else { return Err(Error::BadAddress) };
+        let mut p = self.platform.lock();
+        let bars = *function.bars();
+        let mut placed = [None; 6];
+        for (i, bar) in bars.iter().enumerate() {
+            let Some(b) = bar else { continue };
+            if b.size < kcore::consts::PAGE_SIZE as u64 || !b.size.is_power_of_two() {
+                return Err(Error::BadAddress);
+            }
+            /* A 64-bit BAR above RAM, where the big ones fit; a 32-bit one
+             * below 4 GiB, where it has to be */
+            let (next, end) = if b.wide { (&mut free.high, free.high_end) } else { (&mut free.low, free.low_end) };
+            let at = next.div_ceil(b.size).checked_mul(b.size).ok_or(Error::BadAddress)?;
+            if at.checked_add(b.size).is_none_or(|e| e > end) || !function.place(i, at) {
+                return Err(Error::BadAddress);
+            }
+            *next = at + b.size;
+            placed[i] = Some(at);
+        }
+        /* NVIDIA's mirror at 0x88000, a page of its own. The old one at
+         * 0x1800 (NV4x) shares its page with registers of the GPU's, which a
+         * trap would have to pass through: not taken, nothing since uses it */
+        let mut traps = Vec::new();
+        if function.nvidia() && bars[0].is_some_and(|b0| u64::from(host::NVIDIA_MIRROR + host::MIRROR_BYTES) <= b0.size)
+        {
+            traps.try_reserve(1).map_err(|_| Error::NoMemory)?;
+            traps.push(u64::from(host::NVIDIA_MIRROR));
+        }
+        /* The bus's slot first, then the mappings: a failure past here
+         * leaves mapped BARs of a slot that is there, which go with the
+         * guest. */
+        let slot = p.pci.add_host()?;
+        for (i, at) in placed.iter().enumerate() {
+            let (Some(at), Some(b)) = (*at, bars[i]) else { continue };
+            let holes: &[u64] = if i == 0 { &traps } else { &[] };
+            self.memory.map_device(at, b.host, b.size, holes)?;
+        }
+        p.hosts.try_reserve(1).map_err(|_| Error::NoMemory)?;
+        p.hosts.push(Hosted { slot: usize::from(slot), function, mapped: placed, traps });
+        Ok(())
+    }
+
+    /// An MSI of `address` and `data` from a host's function the guest holds,
+    /// as the host's handler of its interrupt takes it: delivered as a
+    /// device's message is, from outside every CPU -- interrupt context
+    /// included, nothing here sleeps or takes the platform's lock. Whether a
+    /// CPU took it.
+    pub fn deliver_msi(&self, address: u64, data: u32) -> bool {
+        self.host_msi.fetch_add(1, Ordering::Relaxed);
+        let taken = lapic::msi(address, data).is_some_and(|ipi| self.post_message(None, &ipi, false));
+        if !taken {
+            self.host_msi_lost.fetch_add(1, Ordering::Relaxed);
+        }
+        taken
+    }
+
+    /// Whether it holds a host's function: a guest whose state cannot be
+    /// taken -- the device's DMA reaches no dirty log, and its state is the
+    /// device's -- so neither saved nor moved.
+    pub fn holds_host_function(&self) -> bool {
+        !self.platform.lock().hosts.is_empty()
     }
 
     /// Give it a NIC with `mac`, its frames carried by `backend`: `eth0`,
@@ -1463,10 +1624,10 @@ impl LinuxGuest {
     pub fn load(&mut self, bsp: &mut GuestCpu, header: &Header, first: &[u8], layout: Layout, cmdline: &[u8])
         -> Result<()>
     {
-        if bsp.index != 0 || self.loaded {
+        if bsp.index != 0 || self.loaded || layout.low_end != self.low_end {
             return Err(Error::BadAddress);
         }
-        let mut routes = [acpi::Route::default(); MAX_DISKS + MAX_NICS];
+        let mut routes = [acpi::Route::default(); pci::MAX_SLOTS];
         let (n, msix) = self.pci_routes(&mut routes)?;
         let ioapic = self.has_ioapic();
         let firmware = self.write_firmware(&routes[..n], msix, ioapic)?;
@@ -1484,13 +1645,13 @@ impl LinuxGuest {
     pub fn load_pvh(&mut self, bsp: &mut GuestCpu, image: &pvh::Image, layout: pvh::Layout, cmdline: &[u8])
         -> Result<()>
     {
-        if bsp.index != 0 || self.loaded {
+        if bsp.index != 0 || self.loaded || layout.low_end != self.low_end {
             return Err(Error::BadAddress);
         }
         if !bsp.cpu.backend().runs_real_mode() {
             return Err(Error::NoUnrestrictedGuest);
         }
-        let mut routes = [acpi::Route::default(); MAX_DISKS + MAX_NICS];
+        let mut routes = [acpi::Route::default(); pci::MAX_SLOTS];
         let (n, msix) = self.pci_routes(&mut routes)?;
         let ioapic = self.has_ioapic();
         let firmware = self.write_firmware(&routes[..n], msix, ioapic)?;
@@ -1501,16 +1662,19 @@ impl LinuxGuest {
     }
 
     /// Each device on the bus with the IRQ its INTA is wired to, into
-    /// `routes`: how many, and whether any function has an MSI-X table.
+    /// `routes` -- a host's function's to one nothing raises (`HOST_IRQ`):
+    /// how many, and whether any function has an MSI-X table.
     fn pci_routes(&self, routes: &mut [acpi::Route]) -> Result<(usize, bool)> {
         let p = self.platform.lock();
         let mut n = 0;
-        for (i, d) in p.pci_devs.iter().enumerate() {
-            let irq = match d {
+        let devices = p.pci_devs.iter().enumerate().map(|(i, d)| {
+            (i + 1, match d {
                 PciDev::Disk(_) => DISK_IRQ,
                 PciDev::Nic(_) => NIC_IRQ,
-            };
-            let (Some(route), Ok(slot)) = (routes.get_mut(n), u8::try_from(i + 1)) else {
+            })
+        });
+        for (slot, irq) in devices.chain(p.hosts.iter().map(|h| (h.slot, HOST_IRQ))) {
+            let (Some(route), Ok(slot)) = (routes.get_mut(n), u8::try_from(slot)) else {
                 return Err(Error::BadAddress);
             };
             *route = acpi::Route { slot, irq };
@@ -1527,12 +1691,33 @@ impl LinuxGuest {
     fn write_firmware(&self, routes: &[acpi::Route], msix: bool, ioapic: bool) -> Result<linux::Firmware> {
         /* The window covers every slot's page, whichever have one. */
         let window = msix.then_some((MSIX_PAGES, pci::MAX_SLOTS as u32 * pci::MSIX_PAGE));
+        /* The host's functions' windows, whole, for a guest made with them:
+         * an OS keeps a BAR inside one where firmware put it */
+        let (bars32, bars64) = match self.windows {
+            /* Either empty where the guest's addresses end short of it -- a
+             * CPUID of few address bits -- and said as none. The 64-bit one
+             * only as far as the BARs placed in it reach, a GiB at a time:
+             * the rest of the guest's addresses are its OS's own -- Linux's
+             * HMM takes a GPU's VRAM's worth of them for device memory
+             * (NVIDIA's UVM), and with a window to the top of them none was
+             * left, and CUDA was refused */
+            Some((placed, w)) => (
+                u32::try_from(w.low).ok().zip(w.low_end.checked_sub(w.low).and_then(|n| u32::try_from(n).ok())),
+                placed.high.checked_sub(w.high).filter(|&n| n != 0).map(|n| {
+                    let room = w.high_end.saturating_sub(w.high);
+                    (w.high, n.div_ceil(BARS64_ROUNDING).saturating_mul(BARS64_ROUNDING).min(room))
+                }),
+            ),
+            None => (None, None),
+        };
         let machine = acpi::Machine {
             cpus: self.cpus(),
             apic: self.has_apic(),
             ioapic: ioapic.then_some(self.cpus() as u8),
             pci: routes,
             mmio: window,
+            bars32,
+            bars64,
         };
 
         let mut buf = Vec::new();
@@ -1925,6 +2110,11 @@ impl LinuxGuest {
         let pause = self.pause.load(Ordering::Acquire);
         if pause == 0 {
             return Err(vmstate::Error("a state taken of a guest not paused"));
+        }
+        if self.holds_host_function() {
+            /* Its device's DMA reaches no dirty log, and what the device is
+             * in is the device's own: no state of it to take, nor to move */
+            return Err(vmstate::Error("a guest holding a host's device: its state cannot be taken"));
         }
         self.drain()?;
         let ioapic = self.has_ioapic();
@@ -2844,6 +3034,10 @@ impl LinuxGuest {
                         self.xapic_access(gc, gpa, error & npf::WRITE != 0)
                     } else if data && IoApic::owns(gpa) && self.has_ioapic() {
                         self.ioapic_access(gc, gpa, error & npf::WRITE != 0)
+                    } else if data && !delivering && self.memory.is_device(gpa) {
+                        /* A page of a host's function's BAR left out of the
+                         * table: NVIDIA's mirror of its configuration space */
+                        self.host_mmio(gc, gpa, error & npf::WRITE != 0)
                     } else if plain_read && self.memory.map_absent(gpa).is_ok() {
                         None
                     } else {
@@ -3764,6 +3958,28 @@ impl LinuxGuest {
                 }
                 sync_sci(&mut p, now);
             }
+        } else if let Some((slot, at)) = p.pci.host_target(io.port) {
+            /* A host's function: its own configuration space, as it lays the
+             * guest's view over the device's */
+            let size = usize::from(io.size);
+            let Some(h) = p.hosts.iter_mut().find(|h| h.slot == slot) else { return None };
+            if io.input {
+                let value = h.function.config_read(at, size);
+                set_in(v.save_mut(), io.size, value);
+                gc.counts.port_in += 1;
+            } else {
+                let value = v.save().rax as u32;
+                let moved = h.function.config_write(at, size, value);
+                let pending = h.function.msi().take_pending();
+                if let Some(m) = moved {
+                    self.move_bar(h, m);
+                }
+                gc.counts.port_out += 1;
+                /* Under the platform's lock, which delivering takes nothing of */
+                if let Some((address, data)) = pending {
+                    self.deliver_msi(address, data);
+                }
+            }
         } else if PciBus::owns(io.port) {
             if io.input {
                 let value = p.pci.read(io.port, io.size);
@@ -3908,6 +4124,75 @@ impl LinuxGuest {
             mmio::finish(gc.cpu.backend_mut(), &op, u64::from(value));
         }
         None
+    }
+
+    /// An access of a trapped page of a host's function's BAR -- NVIDIA's
+    /// mirror of the configuration space -- decoded and performed on the
+    /// function's view of its configuration space (`HostFunction::mirror`).
+    /// A page of a BAR that is not one trapped is no access this answers:
+    /// the guest stops, said.
+    fn host_mmio(&self, gc: &mut GuestCpu, gpa: u64, write: bool) -> Option<Stop> {
+        let rip = gc.cpu.backend().save().rip;
+        let mut p = self.platform.lock();
+        const PAGE: u64 = kcore::consts::PAGE_SIZE as u64;
+        let found = p.hosts.iter().position(|h| {
+            h.mapped[0].is_some_and(|base| h.traps.iter().any(|&t| gpa >= base + t && gpa - base - t < PAGE))
+        });
+        let Some(i) = found else {
+            gc.counts.mmio += 1;
+            return Some(Stop::Mmio { gpa, rip });
+        };
+        let mut bytes = mmio::Bytes::default();
+        let op = match mmio::begin(gc.cpu.backend(), &self.memory, gpa, write, &mut bytes) {
+            Ok(op) => op,
+            Err(error) => return Some(Stop::MmioInsn { gpa, rip, error, bytes }),
+        };
+        gc.counts.mmio_done += 1;
+        let h = &mut p.hosts[i];
+        let base = h.mapped[0].unwrap_or(0);
+        let Some(&trap) = h.traps.iter().find(|&&t| gpa >= base + t && gpa - base - t < PAGE) else {
+            return Some(Stop::Mmio { gpa, rip });
+        };
+        let offset = (gpa - base - trap) as u32;
+        /* Eight bytes as two dwords, each moving what it moves */
+        let halves: &[(u32, usize, u32)] = if op.size() == 8 {
+            &[(offset, 4, op.value as u32), (offset.wrapping_add(4), 4, (op.value >> 32) as u32)]
+        } else {
+            &[(offset, usize::from(op.size()), op.value as u32)]
+        };
+        let mut value = 0u64;
+        for (k, &(at, size, v)) in halves.iter().enumerate() {
+            let (read, moved) = h.function.mirror(trap as u32, at, size, op.is_write(), v);
+            value |= u64::from(read) << (32 * k);
+            if let Some(m) = moved {
+                self.move_bar(h, m);
+            }
+        }
+        let pending = h.function.msi().take_pending();
+        drop(p);
+        mmio::finish(gc.cpu.backend_mut(), &op, value);
+        if let Some((address, data)) = pending {
+            self.deliver_msi(address, data);
+        }
+        None
+    }
+
+    /// A host's function's BAR the guest moved: unmapped where it was, and
+    /// mapped where it is now when the table can have it there -- not over
+    /// RAM, another BAR or the platform's pages; else left unmapped, and an
+    /// access of it stops the guest.
+    fn move_bar(&self, h: &mut Hosted, m: host::Moved) {
+        let Some(b) = h.function.bars().get(m.bar).copied().flatten() else { return };
+        if let Some(at) = h.mapped[m.bar].take() {
+            let _ = self.memory.unmap_device(at, b.size);
+        }
+        if m.to == 0 || m.to % b.size != 0 {
+            return;
+        }
+        let holes: &[u64] = if m.bar == 0 { &h.traps } else { &[] };
+        if self.memory.map_device(m.to, b.host, b.size, holes).is_ok() {
+            h.mapped[m.bar] = Some(m.to);
+        }
     }
 
     /// Answer an `rdmsr` or `wrmsr`: the local APIC's registers and its base
