@@ -2175,6 +2175,24 @@ ulong PageTable::map_mmio_region(ulong phys_addr, ulong size_bytes, MmioCachePol
     const bool write_combining =
         (policy == MmioWriteCombining) && hal::is_write_combining_available();
 
+    /* A BAR's or the firmware's word for where the device is: a range that
+       wraps, or reaches past what a table entry can name, is none */
+    if (size_bytes > MemoryMap::MAX_PHYS_ADDR || phys_addr > MemoryMap::MAX_PHYS_ADDR - size_bytes)
+        return 0;
+
+    /* Nor is RAM. Every caller names device registers -- a BAR, a
+       chipset's configuration window, a unit the firmware's tables place --
+       and the same word pointing into usable RAM is a firmware's error or a
+       register misread: mapped, it is an uncached alias of pages the
+       allocator hands out, a memory type the manuals of both architectures
+       leave undefined, and every write through it lands in somebody's
+       page. Refused, and said. */
+    if (MemoryMap::get_instance().has_usable_ram_in(phys_addr, phys_addr + stdlib::max<ulong>(size_bytes, 1)))
+    {
+        klog(0, "mm: device memory at 0x%lX, 0x%lX bytes, is RAM: not mapped", phys_addr, size_bytes);
+        return 0;
+    }
+
     /* The arch's premapped window is device-typed, so it can only serve an
        uncached request; a write-combining one builds its own leaf PTEs. */
     if (policy == MmioUncached)
@@ -2185,11 +2203,6 @@ ulong PageTable::map_mmio_region(ulong phys_addr, ulong size_bytes, MmioCachePol
     }
 
     if (phys_addr & (consts::PAGE_SIZE - 1))
-        return 0;
-
-    /* A BAR's or the firmware's word for where the device is: a range that
-       wraps, or reaches past what a table entry can name, is none */
-    if (size_bytes > MemoryMap::MAX_PHYS_ADDR || phys_addr > MemoryMap::MAX_PHYS_ADDR - size_bytes)
         return 0;
 
     ulong pages = (size_bytes + consts::PAGE_SIZE - 1) / consts::PAGE_SIZE;
