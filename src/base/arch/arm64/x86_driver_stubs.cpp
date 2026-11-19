@@ -53,6 +53,9 @@ Vtd::Vtd()
     : unit_count_(0)
     , last_bus_(0)
     , on_(false)
+    , remapping_(false)
+    , io_apic_sid_(0)
+    , io_apic_unit_(nullptr)
     , fault_apic_id_(0)
 {
     for (size_t i = 0; i < stdlib::array_size(units_); i++)
@@ -117,6 +120,40 @@ bool release(u16 sid)
 {
     (void)sid;
     return false;
+}
+
+/* No interrupt remapping either: nothing is */
+bool remapping()
+{
+    return false;
+}
+
+long remap_alloc(u16 sid, u8 vector, u32 apic_id, bool level)
+{
+    (void)sid;
+    (void)vector;
+    (void)apic_id;
+    (void)level;
+    return -1;
+}
+
+bool remap_retarget(u16 sid, u16 handle, u32 apic_id)
+{
+    (void)sid;
+    (void)handle;
+    (void)apic_id;
+    return false;
+}
+
+void remap_free(u16 sid, u16 handle)
+{
+    (void)sid;
+    (void)handle;
+}
+
+u16 io_apic_sid()
+{
+    return 0;
 }
 
 }

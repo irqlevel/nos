@@ -1,6 +1,7 @@
 #include "vtd.h"
 #include "idt.h"
 #include "idt_descriptor.h"
+#include "ioapic.h"
 
 #include <drivers/iommu.h>
 #include <drivers/pci.h>
@@ -40,6 +41,7 @@ const ulong REG_PMEN = 0x64;
 const ulong REG_IQH = 0x80;
 const ulong REG_IQT = 0x88;
 const ulong REG_IQA = 0x90;
+const ulong REG_IRTA = 0xB8;
 /* The last of the fixed registers this reads, and its width: the IRTA */
 const ulong REGS_FIXED_END = 0xC0;
 
@@ -55,6 +57,7 @@ const u32 GS_EAFL = 1u << 28;
 const u32 GS_WBF = 1u << 27;
 const u32 GS_QIE = 1u << 26;
 const u32 GS_IRE = 1u << 25;
+const u32 GS_SIRTP = 1u << 24;
 const u32 GS_CFI = 1u << 23;
 const u32 GS_STATES = GS_TE | GS_EAFL | GS_QIE | GS_IRE | GS_CFI;
 
@@ -144,6 +147,36 @@ const ulong QUEUE_DESCRIPTORS = consts::PAGE_SIZE / (ENTRY_WORDS * sizeof(u64));
 /* IQT and IQH hold a descriptor's index from bit 4 (11.4.15, 11.4.16) */
 const ulong QUEUE_INDEX_SHIFT = 4;
 
+/* The interrupt entry cache dropped (6.5.2.7): all of it, or one entry --
+   G set, the index from bit 32, an index mask of 0 */
+const u64 INV_IEC_GLOBAL = 0x4;
+u64 inv_iec_entry(u16 index)
+{
+    return 0x4 | (1ULL << 4) | (static_cast<u64>(index) << 32);
+}
+
+/* IRTA (11.4.29): the interrupt table's address, EIME clear -- xAPIC
+   destinations, as the kernel runs the local APICs -- and its size S, for
+   2^(S + 1) entries: a page's 256 */
+const u64 IRTA_SIZE = 7;
+
+/* An interrupt remapping table entry (9.10), two words. The low one: P, the
+   trigger mode (set for level), fixed delivery to a physical destination,
+   the vector in 23:16 and, in xAPIC mode, the destination's APIC id in
+   DST[15:8] -- bits 47:40. The high one: the requester's id in 15:0, SQ 00
+   (every bit of it compared) and SVT 01 -- verified against the request's */
+const u64 IRTE_PRESENT = 1ULL << 0;
+const u64 IRTE_LEVEL = 1ULL << 4;
+const ulong IRTE_VECTOR_SHIFT = 16;
+const ulong IRTE_DEST_SHIFT = 40;
+const u64 IRTE_DEST_MASK = 0xFFULL << IRTE_DEST_SHIFT;
+const u64 IRTE_SVT_REQUESTER = 1ULL << 18;
+
+/* A remapping fault's record (7.1.3): FI, the interrupt's index, in the low
+   word's 63:48, where a DMA fault has its address */
+const ulong FRCD_INDEX_SHIFT = 48;
+const u8 FAULT_REASON_INTERRUPT_FIRST = 0x20;
+
 /* A cache line, as clflush takes them */
 const ulong CACHE_LINE = 64;
 
@@ -195,6 +228,9 @@ Vtd::Vtd()
     : unit_count_(0)
     , last_bus_(0)
     , on_(false)
+    , remapping_(false)
+    , io_apic_sid_(0)
+    , io_apic_unit_(nullptr)
     , fault_apic_id_(0)
 {
     for (size_t i = 0; i < stdlib::array_size(units_); i++)
@@ -343,14 +379,21 @@ bool Vtd::resolve(const Acpi::DmarScope& scope, u8& bus, u8& dev, u8& fn)
     auto& pci = Pci::get_instance();
     if (scope.path_length == 0)
         return false;
+    /* An IO-APIC's or an HPET's scope names a requester id and no PCI
+       function -- Hertz's IO-APIC is 00:1e.7, QEMU's ff:00.0, neither of
+       which answers a configuration read -- so its last hop is taken as it
+       is; every bridge before it, and an endpoint or a bridge the scope
+       names, has to be there */
+    const bool function = scope.type == Acpi::DMAR_SCOPE_ENDPOINT || scope.type == Acpi::DMAR_SCOPE_BRIDGE;
     bus = scope.start_bus;
     for (size_t h = 0; h < scope.path_length; h++)
     {
         dev = scope.path[h][0];
         fn = scope.path[h][1];
-        if (dev > 0x1F || fn > 0x7 || pci.read_word(bus, dev, fn, 0) == VENDOR_NONE)
+        const bool last = h + 1 == scope.path_length;
+        if (dev > 0x1F || fn > 0x7 || ((function || !last) && pci.read_word(bus, dev, fn, 0) == VENDOR_NONE))
             return false;
-        if (h + 1 < scope.path_length)
+        if (!last)
             bus = pci.read_byte(bus, dev, fn, SECONDARY_BUS);
     }
     return true;
@@ -600,12 +643,238 @@ void Vtd::release(Unit& unit)
 {
     if (!unit.taken)
         return;
+    if (unit.remapping)
+        unremap_unit(unit);
     write32(unit, REG_FECTL, FECTL_IM);
     (void)command(unit, GS_TE, false);
     (void)command(unit, GS_QIE, false);
     free_tables(unit);
     unit.taken = false;
     unit.state = "given back";
+}
+
+bool Vtd::setup_remapping()
+{
+    for (size_t i = 0; i < unit_count_; i++)
+    {
+        const Unit& unit = *units_[i];
+        if (unit.taken && !ecap_intr_remap(unit.ecap))
+        {
+            klog(0, "vtd: dmar%lu remaps no interrupts: interrupts are not remapped", (ulong)unit.index);
+            return false;
+        }
+    }
+
+    /* The IO-APIC the kernel drives, by the id the MADT gives it: its
+       requester id from the scope that names it, the unit of that scope
+       taken over -- or its entries could not be verified, and interrupts
+       are left as they are */
+    auto& acpi = Acpi::get_instance();
+    if (acpi.get_io_apic_address() != nullptr)
+    {
+        const u8 id = acpi.get_io_apic_id();
+        for (size_t i = 0; i < unit_count_ && io_apic_unit_ == nullptr; i++)
+        {
+            Unit& unit = *units_[i];
+            const Acpi::DmarUnit& dmar = *unit.dmar;
+            for (size_t s = 0; s < dmar.scope_count; s++)
+            {
+                const Acpi::DmarScope& scope = dmar.scope[s];
+                u8 bus = 0, dev = 0, fn = 0;
+                if (scope.type != Acpi::DMAR_SCOPE_IOAPIC || scope.enumeration_id != id ||
+                    !resolve(scope, bus, dev, fn))
+                    continue;
+                if (!unit.taken)
+                {
+                    klog(0, "vtd: the IO-APIC, id %lu, is dmar%lu's, which is left be: interrupts are not remapped",
+                        (ulong)id, (ulong)unit.index);
+                    return false;
+                }
+                io_apic_sid_ = static_cast<u16>((static_cast<u16>(bus) << SID_BUS_SHIFT) | (dev << 3) | fn);
+                io_apic_unit_ = &unit;
+                break;
+            }
+        }
+        if (io_apic_unit_ == nullptr)
+        {
+            klog(0, "vtd: the IO-APIC, id %lu, is in no unit's scope: interrupts are not remapped", (ulong)id);
+            return false;
+        }
+
+        /* Its pins masked before its compatibility-format messages are
+           blocked: none is left as the firmware programmed it, sending what
+           would only be said as a fault */
+        IoApic::get_instance().enable();
+    }
+
+    for (size_t i = 0; i < unit_count_; i++)
+    {
+        Unit& unit = *units_[i];
+        if (!unit.taken)
+            continue;
+        if (!remap_unit(unit))
+        {
+            for (size_t j = 0; j < i; j++)
+            {
+                if (units_[j]->remapping)
+                    unremap_unit(*units_[j]);
+            }
+            io_apic_unit_ = nullptr;
+            klog(0, "vtd: interrupt remapping did not come up in dmar%lu: interrupts are not remapped",
+                (ulong)unit.index);
+            return false;
+        }
+    }
+    if (io_apic_unit_ != nullptr)
+        klog(0, "vtd: interrupts remapped, the IO-APIC's from %02lx:%02lx.%lu", (ulong)sid_bus(io_apic_sid_),
+            (ulong)sid_dev(io_apic_sid_), (ulong)sid_fn(io_apic_sid_));
+    else
+        klog(0, "vtd: interrupts remapped, no IO-APIC");
+    return true;
+}
+
+bool Vtd::remap_unit(Unit& unit)
+{
+    unit.irt = static_cast<u64*>(mm::alloc_map_pages(1, &unit.irt_phys));
+    if (unit.irt == nullptr)
+    {
+        klog(0, "vtd: dmar%lu: no memory for its interrupt table", (ulong)unit.index);
+        return false;
+    }
+    stdlib::mem_set(unit.irt, 0, consts::PAGE_SIZE);
+    flush(unit, unit.irt, consts::PAGE_SIZE);
+    for (size_t w = 0; w < IRT_USED_WORDS; w++)
+        unit.irt_used[w] = 0;
+
+    /* The table's pointer set, everything the unit may hold of an entry
+       dropped, then IR on -- CFI left clear: a compatibility-format
+       interrupt is blocked, and said as a fault */
+    write64(unit, REG_IRTA, unit.irt_phys | IRTA_SIZE);
+    if (!command(unit, GS_SIRTP, true) || !invalidate(unit, INV_IEC_GLOBAL, 0) || !command(unit, GS_IRE, true))
+    {
+        (void)command(unit, GS_IRE, false);
+        mm::unmap_free_pages(unit.irt);
+        unit.irt = nullptr;
+        unit.irt_phys = 0;
+        return false;
+    }
+    unit.remapping = true;
+    unit.state = "translating, every device passed through, interrupts remapped";
+    klog(0, "vtd: dmar%lu: interrupts remapped -- %lu entries, compatibility format blocked", (ulong)unit.index,
+        (ulong)IRT_ENTRIES);
+    return true;
+}
+
+void Vtd::unremap_unit(Unit& unit)
+{
+    (void)command(unit, GS_IRE, false);
+    if (unit.irt != nullptr)
+        mm::unmap_free_pages(unit.irt);
+    unit.irt = nullptr;
+    unit.irt_phys = 0;
+    unit.remapping = false;
+}
+
+bool Vtd::is_remapping() const
+{
+    return remapping_;
+}
+
+u16 Vtd::io_apic_sid() const
+{
+    return io_apic_sid_;
+}
+
+Vtd::Unit* Vtd::remap_unit_for(u16 sid)
+{
+    if (!remapping_)
+        return nullptr;
+    Unit* unit = (io_apic_unit_ != nullptr && sid == io_apic_sid_) ? io_apic_unit_ : unit_for(sid);
+    return (unit != nullptr && unit->remapping) ? unit : nullptr;
+}
+
+bool Vtd::write_irte(Unit& unit, u16 handle, u64 lo, u64 hi)
+{
+    /* An entry being made present has its requester before P, and one
+       taken out loses P before anything else: the unit never reads one
+       present with a word of another's. Each word one store. */
+    volatile u64* entry = unit.irt + static_cast<size_t>(handle) * ENTRY_WORDS;
+    if (lo & IRTE_PRESENT)
+    {
+        entry[1] = hi;
+        hal::compiler_barrier();
+        entry[0] = lo;
+    }
+    else
+    {
+        entry[0] = lo;
+        hal::compiler_barrier();
+        entry[1] = hi;
+    }
+    flush(unit, const_cast<u64*>(entry), ENTRY_WORDS * sizeof(u64));
+    return invalidate(unit, inv_iec_entry(handle), 0);
+}
+
+long Vtd::remap_alloc(u16 sid, u8 vector, u32 apic_id, bool level)
+{
+    Unit* unit = remap_unit_for(sid);
+    if (unit == nullptr || apic_id > MSI_DEST_LIMIT)
+        return -1;
+
+    long handle = -1;
+    bool written = true;
+    {
+        stdlib::AutoLock lock(unit->irt_lock);
+        for (size_t w = 0; w < IRT_USED_WORDS && handle < 0; w++)
+        {
+            if (unit->irt_used[w] == ~0ULL)
+                continue;
+            const ulong bit = static_cast<ulong>(__builtin_ctzll(~unit->irt_used[w]));
+            const u16 index = static_cast<u16>(w * 64 + bit);
+            const u64 lo = IRTE_PRESENT | (level ? IRTE_LEVEL : 0) | (static_cast<u64>(vector) << IRTE_VECTOR_SHIFT) |
+                (static_cast<u64>(apic_id) << IRTE_DEST_SHIFT);
+            written = write_irte(*unit, index, lo, IRTE_SVT_REQUESTER | sid);
+            if (written)
+            {
+                unit->irt_used[w] |= 1ULL << bit;
+                handle = index;
+            }
+            break;
+        }
+    }
+    if (handle < 0 && written)
+        klog(0, "vtd: dmar%lu: its interrupt table is full: no entry for %02lx:%02lx.%lu", (ulong)unit->index,
+            (ulong)sid_bus(sid), (ulong)sid_dev(sid), (ulong)sid_fn(sid));
+    return handle;
+}
+
+bool Vtd::remap_retarget(u16 sid, u16 handle, u32 apic_id)
+{
+    Unit* unit = remap_unit_for(sid);
+    if (unit == nullptr || handle >= IRT_ENTRIES || apic_id > MSI_DEST_LIMIT)
+        return false;
+
+    stdlib::AutoLock lock(unit->irt_lock);
+    if (!(unit->irt_used[handle / 64] & (1ULL << (handle % 64))))
+        return false;
+    const volatile u64* entry = unit->irt + static_cast<size_t>(handle) * ENTRY_WORDS;
+    const u64 lo = (entry[0] & ~IRTE_DEST_MASK) | (static_cast<u64>(apic_id) << IRTE_DEST_SHIFT);
+    return write_irte(*unit, handle, lo, entry[1]);
+}
+
+void Vtd::remap_free(u16 sid, u16 handle)
+{
+    Unit* unit = remap_unit_for(sid);
+    if (unit == nullptr || handle >= IRT_ENTRIES)
+        return;
+
+    stdlib::AutoLock lock(unit->irt_lock);
+    if (!(unit->irt_used[handle / 64] & (1ULL << (handle % 64))))
+        return;
+    /* Kept taken where the unit was not told: an entry it may still hold
+       is not handed to another source */
+    if (write_irte(*unit, handle, 0, 0))
+        unit->irt_used[handle / 64] &= ~(1ULL << (handle % 64));
 }
 
 void Vtd::setup()
@@ -659,6 +928,11 @@ void Vtd::setup()
         for (size_t w = 0; w < MAX_DIDS_WORDS; w++)
             unit->dids[w] = 0;
         unit->leaf_bits = 0;
+        unit->irt = nullptr;
+        unit->irt_phys = 0;
+        for (size_t w = 0; w < IRT_USED_WORDS; w++)
+            unit->irt_used[w] = 0;
+        unit->remapping = false;
         for (size_t bus = 0; bus < BUSES; bus++)
         {
             unit->context[bus] = nullptr;
@@ -714,6 +988,9 @@ void Vtd::setup()
         }
     }
     on_ = true;
+    /* Interrupts remapped too, before the first is programmed: the
+       IO-APIC is enabled, and every MSI made, after this */
+    remapping_ = setup_remapping();
 }
 
 bool Vtd::is_on() const
@@ -785,9 +1062,14 @@ void Vtd::report_faults(Unit& unit)
             }
             const u16 sid = static_cast<u16>(high & FRCD_SID_MASK);
             const u8 reason = static_cast<u8>(high >> FRCD_REASON_SHIFT);
-            klog(0, "vtd: dmar%lu: %s of 0x%lX by %02lx:%02lx.%lu blocked: 0x%02lx, %s", (ulong)unit.index,
-                (high & FRCD_READ) ? "read" : "write", (ulong)(low & FRCD_ADDRESS_MASK), (ulong)sid_bus(sid),
-                (ulong)sid_dev(sid), (ulong)sid_fn(sid), (ulong)reason, fault_reason(reason));
+            if (reason >= FAULT_REASON_INTERRUPT_FIRST)
+                klog(0, "vtd: dmar%lu: interrupt 0x%lX from %02lx:%02lx.%lu blocked: 0x%02lx, %s", (ulong)unit.index,
+                    (ulong)(low >> FRCD_INDEX_SHIFT), (ulong)sid_bus(sid), (ulong)sid_dev(sid), (ulong)sid_fn(sid),
+                    (ulong)reason, fault_reason(reason));
+            else
+                klog(0, "vtd: dmar%lu: %s of 0x%lX by %02lx:%02lx.%lu blocked: 0x%02lx, %s", (ulong)unit.index,
+                    (high & FRCD_READ) ? "read" : "write", (ulong)(low & FRCD_ADDRESS_MASK), (ulong)sid_bus(sid),
+                    (ulong)sid_dev(sid), (ulong)sid_fn(sid), (ulong)reason, fault_reason(reason));
         }
     }
 
@@ -827,7 +1109,7 @@ void Vtd::print(stdlib::Printer& printer)
         printer.printf("no DMA remapping units\n");
         return;
     }
-    printer.printf("iommu: %s\n", on_ ? "on" : "off");
+    printer.printf("iommu: %s%s\n", on_ ? "on" : "off", remapping_ ? ", interrupts remapped" : "");
     for (size_t i = 0; i < unit_count_; i++)
     {
         Unit& unit = *units_[i];
@@ -851,6 +1133,17 @@ void Vtd::print(stdlib::Printer& printer)
             ecap_queued(unit.ecap) ? ", QI" : "", ecap_intr_remap(unit.ecap) ? ", IR" : "",
             ecap_x2apic(unit.ecap) ? ", x2APIC" : "", ecap_snoop_control(unit.ecap) ? ", snoop control" : "");
         printer.printf("  faults %lu%s\n", unit.faults, unit.broken ? "; its invalidation queue stopped" : "");
+        if (unit.remapping)
+        {
+            ulong used = 0;
+            {
+                stdlib::AutoLock lock(unit.irt_lock);
+                for (size_t w = 0; w < IRT_USED_WORDS; w++)
+                    used += static_cast<ulong>(__builtin_popcountll(unit.irt_used[w]));
+            }
+            printer.printf("  interrupts remapped: %lu of %lu entries%s\n", used, (ulong)IRT_ENTRIES,
+                &unit == io_apic_unit_ ? ", the IO-APIC's among them" : "");
+        }
     }
 }
 
@@ -1368,6 +1661,31 @@ void domain_destroy(ulong domain)
 bool release(u16 sid)
 {
     return Vtd::get_instance().release(sid);
+}
+
+bool remapping()
+{
+    return Vtd::get_instance().is_remapping();
+}
+
+long remap_alloc(u16 sid, u8 vector, u32 apic_id, bool level)
+{
+    return Vtd::get_instance().remap_alloc(sid, vector, apic_id, level);
+}
+
+bool remap_retarget(u16 sid, u16 handle, u32 apic_id)
+{
+    return Vtd::get_instance().remap_retarget(sid, handle, apic_id);
+}
+
+void remap_free(u16 sid, u16 handle)
+{
+    Vtd::get_instance().remap_free(sid, handle);
+}
+
+u16 io_apic_sid()
+{
+    return Vtd::get_instance().io_apic_sid();
 }
 
 }

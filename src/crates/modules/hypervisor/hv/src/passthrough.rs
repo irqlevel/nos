@@ -253,12 +253,17 @@ impl Passed {
         if interrupt.is_none() {
             return Err(alloc::format!("{}: its MSI could not be taken by the host", name));
         }
-        /* Said every time: until interrupt remapping is done, a DMA write
-         * of the device's to the interrupt range is an interrupt of the
-         * host's, of any vector -- the guest is trusted with that */
-        kcore::klog!(0, "hv: {} given to a guest -- its DMA reaches the guest's RAM alone, but its interrupts are not \
-                         remapped yet: a guest that has it write to 0xFEE00000 raises any interrupt of the host's \
-                         (plans/gpu-passthrough.md)", name);
+        /* Said every time. Remapped, a DMA write of the device's to the
+         * interrupt range raises its own vector alone; not, any vector of
+         * the host's -- the guest is trusted with that (unsafe_interrupts) */
+        if iommu::remapping() {
+            kcore::klog!(0, "hv: {} given to a guest -- its DMA reaches the guest's RAM alone, its interrupts \
+                             remapped: what it sends raises its own vector and no other", name);
+        } else {
+            kcore::klog!(0, "hv: {} given to a guest -- its DMA reaches the guest's RAM alone, but its interrupts \
+                             are not remapped: a guest that has it write to 0xFEE00000 raises any interrupt of the \
+                             host's (plans/gpu-passthrough.md)", name);
+        }
         Ok(Passed { sid, dev, function: Some(function), domain: None, table, interrupt, msi, _siblings: siblings, claim })
     }
 

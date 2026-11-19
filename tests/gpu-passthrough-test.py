@@ -2,7 +2,7 @@
 """A host's GPU given to a Linux guest of nos's (plans/gpu-passthrough.md),
 on a machine that has one: nos under QEMU/KVM there, QEMU's VT-d in front of
 the real GPU (vfio-pci), nos taking the unit over with iommu=on and giving
-the GPU to its own guest (`hv boot ... pci=01:00.0 unsafe_interrupts`), the
+the GPU to its own guest (`hv boot ... pci=01:00.0`, its interrupts remapped), the
 machine's own kernel. Two drivers in the guest (tests/gpu-passthrough/):
 
 `--driver nvidia` (the default): NVIDIA's own, from a root of Ubuntu's on
@@ -91,7 +91,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", required=True, help="the machine with the GPU, as ssh reaches it (root)")
     ap.add_argument("--driver", choices=("nvidia", "nouveau"), default="nvidia")
-    ap.add_argument("--gpu", default="0000:01:00.0", help="the GPU on the machine, bound to vfio-pci")
+    ap.add_argument("--gpu", default="0000:01:00.0",
+                    help="the GPU on the machine: its IOMMU group is given to vfio-pci (bind-vfio.sh)")
     ap.add_argument("--chip", default="ga106", help="nouveau's firmware's directory under /lib/firmware/nvidia")
     ap.add_argument("--dir", default="/root/nos-gpu-passthrough-test", help="where the run lives on the machine")
     ap.add_argument("--iso", default=os.path.join(ROOT, "nos-test.iso"))
@@ -108,7 +109,8 @@ def main():
     _, ok = ssh(args, "systemctl stop %s 2>/dev/null; mkdir -p %s" % (UNIT, d))
     if not pt.check("the machine answers", ok):
         return finish(args, None)
-    files = [args.iso, hv, os.path.join(ROOT, "scripts", "mkrootfs.sh"), os.path.join(FILES, "run-qemu.sh")]
+    files = [args.iso, hv, os.path.join(ROOT, "scripts", "mkrootfs.sh"), os.path.join(FILES, "run-qemu.sh"),
+             os.path.join(FILES, "bind-vfio.sh")]
     if args.driver == "nvidia":
         files += [os.path.join(FILES, n) for n in ("nvidia-guest-init", "make-nvidia-root.sh")]
         make = "bash ./make-nvidia-root.sh %s %s %d %d" % (d, GPU_IN_NOS, GUEST_MIB, GUEST_SECS)
@@ -125,6 +127,10 @@ def main():
         return finish(args, None)
     print("  " + out.strip().splitlines()[-1])
 
+    out, ok = ssh(args, "cd %s && bash ./bind-vfio.sh %s" % (d, shlex.quote(args.gpu)))
+    if not pt.check("the GPU's IOMMU group is vfio-pci's", ok, out[-2000:]):
+        return finish(args, None)
+
     start = ("cd %s && rm -f nos.log && systemd-run --unit=%s --collect --quiet --working-directory=%s "
              "bash ./run-qemu.sh nos-test.iso nos.log %s %s "
              "-drive file=%s,format=raw,if=none,id=d0 -device virtio-blk-pci,drive=d0") % (
@@ -133,7 +139,8 @@ def main():
     if ok:
         # QEMU is still there a few seconds on: not refused its GPU -- another
         # QEMU holding its group -- nor a port of its own (the UDP shell's)
-        out, ok = ssh(args, "sleep 5; systemctl is-active -q %s || journalctl -u %s --no-pager -n 15" % (UNIT, UNIT))
+        out, ok = ssh(args, "sleep 5; systemctl is-active -q %s || { journalctl -u %s --no-pager -n 15; exit 1; }"
+                      % (UNIT, UNIT))
     if not pt.check("nos starts under QEMU there", ok, out[-2000:]):
         return finish(args, None)
     wait = ("for i in $(seq 1 %d); do grep -aqE '^  stopped|PANIC|boot failed' %s/nos.log 2>/dev/null "
@@ -158,6 +165,14 @@ def nos_checks(text):
     pt.check("nos boots", "boot: complete" in text, text[-2000:])
     pt.check("nos did not panic", "PANIC" not in text, text[text.find("PANIC"):][:2000])
     pt.check("QEMU's unit is taken over, every device passed through", "passed through, queued invalidation" in text)
+    pt.check("interrupts are remapped, the IO-APIC's verified", "interrupts remapped, the IO-APIC's from" in text,
+             lines(text, "vtd:"))
+    # What the module says as it gives the function reaches dmesg, not the
+    # serial port, while /etc/rc's command runs: that the guest is given the
+    # GPU at all is the word, since without remapping pci= is refused unless
+    # unsafe_interrupts is asked for, and /etc/rc asks for none
+    boot = lines(text, "> hv boot")
+    pt.check("hv boot asks for no unsafe_interrupts", "pci=" in boot and "unsafe_interrupts" not in boot, boot)
     pt.check("the guest sees the GPU on its bus", re.search(r"gpu-guest: pci .*(0x10de:|\[10de:)", text) is not None,
              lines(text, "gpu-guest: pci"))
 

@@ -1331,6 +1331,11 @@ int kernel_iommu_on()
     return kernel::iommu::on() ? 1 : 0;
 }
 
+int kernel_iommu_remapping()
+{
+    return kernel::iommu::remapping() ? 1 : 0;
+}
+
 unsigned long kernel_iommu_domain_create(unsigned short sid)
 {
     return kernel::iommu::domain_create(sid);

@@ -120,7 +120,7 @@ cat > $R/etc/rc <<EOF
 # guest running NVIDIA's own driver
 insmod /hv.ko
 hv on
-hv boot /vmlinuz mem=$MEM cpus=2 secs=$SECS pci=$PCI unsafe_interrupts disk=/guest.img cmdline=console=ttyS0 root=/dev/vda rw init=/init nokaslr
+hv boot /vmlinuz mem=$MEM cpus=2 secs=$SECS pci=$PCI disk=/guest.img cmdline=console=ttyS0 root=/dev/vda rw init=/init nokaslr
 EOF
 $D/mkrootfs.sh $N/root.img $(( $(du -sm $R | cut -f1) + 512 )) $R > /dev/null
 rm -rf $R

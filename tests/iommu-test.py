@@ -17,7 +17,13 @@ told iommu_platform=on. One boot:
   is then a DMA the unit blocks -- the command's fetch -- said with the
   NVMe's requester id and the reason, no context entry, and the machine
   goes on: the console's shell answers, and `iommu` counts the fault;
-- `iommu unblock` passes it through again.
+- `iommu unblock` passes it through again;
+- and all of it with interrupts remapped (`intremap=on`, unless
+  --no-intremap): the boot log says the unit took its interrupt table and
+  the IO-APIC's requester id, `iommu` says interrupts are remapped and how
+  many entries its table holds, the IO-APIC's among them -- the NVMe's
+  MSI-X, virtio-net's and the timer's all through it, or nothing above
+  would be answered.
 
 The read itself is not answered: QEMU's NVMe takes the blocked fetch for a
 fatal error of its own (CSTS.CFS), and nos's NVMe driver waits for the
@@ -53,6 +59,7 @@ spec.loader.exec_module(pt)
 SECTOR = 512
 PATTERN = b"nos iommu test, sector zero. " * 18
 TAKEN = "passed through, queued invalidation"
+REMAPPED = "interrupts remapped, the IO-APIC's from"
 SERIAL_PORT = 4555
 
 
@@ -87,6 +94,8 @@ def main():
     ap.add_argument("--iso", default=os.path.join(ROOT, "nos-test.iso"),
                     help="an ISO whose command line has iommu=on udpshell=%d" % pt.SHELL_PORT)
     ap.add_argument("--keep", action="store_true", help="leave the image and the log behind")
+    ap.add_argument("--no-intremap", action="store_true",
+                    help="QEMU's unit without interrupt remapping: nos's interrupts left in their own format")
     args = ap.parse_args()
     if not os.path.exists(args.iso):
         sys.exit("no %s -- make nos-test.iso TEST_ISO_ARGS=\"iommu=on udpshell=%d\"" % (args.iso, pt.SHELL_PORT))
@@ -98,7 +107,10 @@ def main():
         f.truncate(1 << 20)
     log = os.path.join(tmp, "nos.log")
 
-    argv = ["qemu-system-x86_64", "-machine", "q35", "-device", "intel-iommu",
+    # intremap's default is QEMU's to choose -- auto, which is on under TCG
+    # since 10.x -- so the gate says which it means
+    unit = "intel-iommu,intremap=off" if args.no_intremap else "intel-iommu,intremap=on"
+    argv = ["qemu-system-x86_64", "-machine", "q35", "-device", unit,
             "-display", "none", "-smp", "2", "-m", "1G",
             "-chardev", "socket,id=ser0,host=127.0.0.1,port=%d,server=on,wait=off,logfile=%s" % (SERIAL_PORT, log),
             "-serial", "chardev:ser0",
@@ -119,9 +131,21 @@ def main():
             return finish(args, tmp, log)
         bdf = found.group(1)
 
+        if args.no_intremap:
+            pt.check("interrupts are not remapped", REMAPPED not in text,
+                     "\n".join(l for l in text.splitlines() if "vtd:" in l))
+        else:
+            pt.check("the unit remaps interrupts, the IO-APIC's verified", REMAPPED in text,
+                     "\n".join(l for l in text.splitlines() if "vtd:" in l))
+
         sh = pt.Shell(timeout=90)
         state = sh.run("iommu")
         pt.check("iommu says on", "iommu: on" in state and "translating" in state, state)
+        if not args.no_intremap:
+            entries = re.search(r"interrupts remapped: (\d+) of \d+ entries, the IO-APIC's among them", state)
+            pt.check("iommu says interrupts are remapped, entries held for the IO-APIC and the devices",
+                     "iommu: on, interrupts remapped" in state and entries is not None and int(entries.group(1)) >= 3,
+                     state)
 
         dump = sh.run("diskread nvme0 0")
         # diskread's rows: the offset, then each byte in hex, unpadded

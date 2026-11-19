@@ -39,6 +39,7 @@ MsixTable::MsixTable()
     , msi_64_(false)
     , msi_maskable_(false)
     , entry_vector_(nullptr)
+    , entry_handle_(nullptr)
 {
 }
 

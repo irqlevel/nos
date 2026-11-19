@@ -321,13 +321,15 @@ pub fn spec(o: Options) -> Result<Spec, String> {
     if o.pci.len() > MAX_PCI {
         return Err(alloc::format!("at most {} host functions", MAX_PCI));
     }
-    /* Interrupt remapping is not done yet: a function's DMA to the interrupt
-     * range is an interrupt of the host's, of any vector -- refused, unless
-     * the VM says it is trusted with that (plans/gpu-passthrough.md) */
-    if !o.pci.is_empty() && !o.unsafe_interrupts {
+    /* Where interrupts are not remapped -- a unit without IR, or iommu=on
+     * not given -- a function's DMA to the interrupt range is an interrupt
+     * of the host's, of any vector: refused, unless the VM says it is
+     * trusted with that (plans/gpu-passthrough.md). Remapped, it raises its
+     * own vectors alone. */
+    if !o.pci.is_empty() && !o.unsafe_interrupts && !kcore::iommu::remapping() {
         return Err(String::from("pci= gives a guest a host's function whose interrupts are not remapped -- \
-                                 interrupt remapping is not done yet, and its DMA could raise any interrupt of \
-                                 the host's: unsafe_interrupts too, for a guest trusted with that"));
+                                 this machine's IOMMU does not remap them, and its DMA could raise any \
+                                 interrupt of the host's: unsafe_interrupts too, for a guest trusted with that"));
     }
     if o.unsafe_interrupts && o.pci.is_empty() {
         return Err(String::from("unsafe_interrupts is a guest holding a host's function's -- pci= too"));
