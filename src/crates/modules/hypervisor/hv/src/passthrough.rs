@@ -30,7 +30,7 @@ use kcore::dma::PhysMapping;
 use kcore::io::MmioRegion;
 use kcore::iommu::{self, Domain};
 use kcore::msix::{MsixInterrupt, MsixTable};
-use kcore::pci::{self, PciDevice};
+use kcore::pci::{self, PciDevice, ScreenHold};
 use kcore::sync::IrqSpinLock;
 
 /// The most functions held at once, by every guest together -- a route slot
@@ -196,10 +196,21 @@ impl Passed {
         let claim = Claim::take(sid).ok_or_else(|| alloc::format!("{}: another guest's, or too many held", name))?;
         let siblings = block_siblings(bus, slot, func, all).map_err(|e| alloc::format!("{}: {}", name, e))?;
 
-        /* Quiet while it is read: decoding and bus mastering off */
+        /* Quiet while it is read: decoding and bus mastering off -- and the
+         * screen held meanwhile: the firmware's framebuffer may be in one of
+         * its BARs, the boot GPU's, which do not answer while they are off.
+         * Where it is, it is let go of for good: the reset ends it anyway,
+         * and the memory is the guest's from here */
+        let hold = ScreenHold::new();
         let command = dev.read_config16(COMMAND);
         dev.write_config16(COMMAND, command & !(COMMAND_IO | COMMAND_MEMORY | COMMAND_MASTER));
         let bars = read_bars(&dev, &name);
+        let screen = (0..bars.len()).find(|&i| bars[i].is_some_and(|b| pci::release_screen(b.host, b.size)));
+        drop(hold);
+        if let Some(i) = screen {
+            kcore::klog!(0, "hv: {}: BAR{} holds the screen's framebuffer -- let go of: nothing is drawn there from \
+                             now on", name, i);
+        }
         if !reset(&dev) {
             return Err(alloc::format!("{}: did not answer after its reset", name));
         }

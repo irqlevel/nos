@@ -356,8 +356,10 @@ its disks and its NICs were:
 - **Its network hands out no address** either, so nos's comes from
   `nos-install --cmdline "ip=… gw=… dns=…"`.
 - **Its TCO watchdog is the firmware's**: nos finds it by the SMBus
-  controller and leaves NO_REBOOT as firmware set it, as on the EX44, so a
-  nos that hangs there is not reset by it.
+  controller and leaves NO_REBOOT as firmware set it -- a 100-series PCH
+  keeps the bit behind the P2SB, which the firmware hides -- so a nos that
+  hangs there is not reset by it. From Cannon Lake on the bit is in the
+  TCO's own TCO1_CNT, and nos clears it there.
 
 Its BootOrder tries the I350's PXE first: POST to GRUB takes minutes, a
 boot of nos and back to Ubuntu about eleven. nos says `boot: complete` 10 s

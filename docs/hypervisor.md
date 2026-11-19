@@ -2159,7 +2159,13 @@ domain of nothing, unless the guest holds them too: a device's functions are
 not isolated from each other, which is why Linux makes a GPU and its audio
 function one IOMMU group; a device one of whose other functions is mastering
 -- the host's -- or another guest's is refused. Its BARs are read with its
-decoding off, it is reset where it has FLR (as Linux makes one: its
+decoding off, the screen held meanwhile: on a machine whose boot GPU is the
+one given -- Hertz's A2000 -- the firmware's framebuffer, which the kernel's
+console draws into, is in one of its BARs, and a write to a BAR that is not
+decoded is an Unsupported Request. Where it is, the screen lets go of it for
+good (`FbTerm::release_within`, as Linux's vfio-pci takes efifb off its
+aperture): the reset ends that picture anyway, and the memory is the
+guest's. Then it is reset where it has FLR (as Linux makes one: its
 transactions given a second, the header and the PCIe controls saved and
 written back, the device asked until it answers), its MSI taken by the host
 (`kcore::msix::MsixTable::new_msi`). Once the guest's RAM is there, the
