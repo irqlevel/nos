@@ -101,9 +101,10 @@ void trace_cpu_state(ulong cpu)
  *      function 0:1F.4 config reg 0x50, valid only while TCO_BASE_EN
  *      (TCOCTL, reg 0x54 bit 8) is set.  The LPC registers below read back
  *      as zero on these chipsets, so this comes first.
- *   2. Read TCOBASE from LPC bridge PCI config reg 0x50.
- *   3. Fallback: ACPI PMBASE (reg 0x40) + 0x60.
- *   4. Set TMR_HLT (bit 11) in TCO1_CNT to stop the timer.
+ *   2. ICH6 to the 9-series, C600/C610 and QEMU's q35 (TCO version 2): the
+ *      LPC bridge's ACPI PMBASE (reg 0x40) + 0x60.  None of them keeps a
+ *      TCOBASE in the bridge's reg 0x50 -- the C610 reads 0xF8 there.
+ *   3. Set TMR_HLT (bit 11) in TCO1_CNT to stop the timer.
  *
  * This runs before the PCI subsystem exists, hence the raw CF8/CFC access,
  * but after Acpi::parse(), so the WDAT verdict is already available.
@@ -122,6 +123,7 @@ static void halt_tco_watchdog()
     static const u8  SERIAL_BUS_CLS = 0x0C;
     static const u8  SMBUS_SUB_CLS  = 0x05;
     static const u16 ACPI_BASE_REG = 0x40;
+    static const u16 ACPI_BASE_MASK = 0xFF80;
     static const u16 ACPI_TCO_OFF  = 0x60;
     static const u16 TCO1_STS     = 0x04;
     static const u16 TCO2_STS     = 0x06;
@@ -160,7 +162,7 @@ static void halt_tco_watchdog()
         }
     }
 
-    /* 2./3. ICH9-class chipsets, including QEMU's q35 */
+    /* 2. TCO version 2 chipsets, including QEMU's q35 */
     if (tco_base == 0)
     {
         source = "LPC 0:1F.0";
@@ -171,17 +173,13 @@ static void halt_tco_watchdog()
         if (vendor != INTEL_VENDOR)
             return;
 
-        outl(PCI_CFG_ADDR, 0x80000000 | LPC_BDF | TCO_BASE_REG);
-        u16 raw = (u16)inl(PCI_CFG_DATA);
-        if (raw != 0 && raw != 0xFFFF)
-            tco_base = raw & 0xFFE0;
-
-        if (tco_base == 0) {
-            outl(PCI_CFG_ADDR, 0x80000000 | LPC_BDF | ACPI_BASE_REG);
-            u16 pm_base = (u16)inl(PCI_CFG_DATA) & 0xFFFE;
-            if (pm_base != 0 && pm_base != 0xFFFE)
-                tco_base = pm_base + ACPI_TCO_OFF;
-        }
+        /* PMBASE says it is I/O space in bit 0, and decodes 128 ports: the
+           TCO's 32 from 0x60 in them end at 0xFFFF at the highest */
+        outl(PCI_CFG_ADDR, 0x80000000 | LPC_BDF | ACPI_BASE_REG);
+        const u16 raw = (u16)inl(PCI_CFG_DATA);
+        const u16 pm_base = raw & ACPI_BASE_MASK;
+        if ((raw & 1) != 0 && raw != 0xFFFF && pm_base != 0)
+            tco_base = pm_base + ACPI_TCO_OFF;
     }
 
     if (tco_base == 0)
