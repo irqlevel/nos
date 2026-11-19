@@ -259,6 +259,10 @@ reaches no Rust. hv reaches it by the usual three steps (`rust_ffi.cpp`,
    kernel, on a disk of the guest's): `nvidia-smi` names the A2000 -- RM up
    on its GSP -- and CUDA 12.9's deviceQuery, vectorAdd and matrixMul pass,
    matrixMul at 611 GFlop/s (`tests/gpu-passthrough-test.py`, its default).
+   Run again with all of round two in -- the A2000 behind a root port of the
+   guest's, its extended space by ECAM, its ROM a copy, its IOMMU group with
+   ACS on -- the same: nvidia-smi, the three samples, matrixMul at 610.78
+   GFlop/s.
    It took three more fixes: the function's INTx pin given (NVIDIA's probe
    refuses a function with neither an IRQ nor MSI-X), wired to a line
    nothing raises; `PciBus::host_target` held to the configuration data's
