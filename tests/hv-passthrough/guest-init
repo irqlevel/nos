@@ -1,12 +1,15 @@
 #!/bin/busybox sh
-# tests/hv-passthrough-test.py: the guest's /init. The NVMe and the virtio
-# disk nos gives it, by its own drivers: the pattern the runner put on each
-# read, a pattern of its own written and read back past the page cache, the
-# interrupts they came by; then the hostile phase -- the NVMe's driver let go
-# of, the controller driven by hand (nvmepoke), its DMA pointed at a page of
-# the guest's, where the guest has no RAM, and at the interrupt range -- and
-# the controller again at a page of the guest's, to show it still answers.
-# Every line the runner reads begins "pass-guest: ".
+# tests/hv-passthrough-test.py: the guest's /init. Its bus as its PCI code
+# found it -- every function, the root ports nos puts above the devices, the
+# links they say, the windows Linux read and anything it could not place --
+# then the disks nos gives it, the NVMe and two virtio disks, by its own
+# drivers, each named by its function's address: the pattern the runner put
+# on each read, a pattern of its own written and read back past the page
+# cache, the interrupts they came by; then the hostile phase -- the NVMe's
+# driver let go of, the controller driven by hand (nvmepoke), its DMA pointed
+# at a page of the guest's, where the guest has no RAM, and at the interrupt
+# range -- and the controller again at a page of the guest's, to show it
+# still answers. Every line the runner reads begins "pass-guest: ".
 /bin/busybox --install -s /bin
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
@@ -16,20 +19,25 @@ say() { echo "pass-guest: $*"; }
 say "up: $(uname -r), $(grep -c ^processor /proc/cpuinfo) cpus"
 for d in /sys/bus/pci/devices/*; do
     say "pci $(basename $d) $(cat $d/vendor):$(cat $d/device) class $(cat $d/class)"
+    up=$(basename $(dirname $(readlink -f $d)))
+    case $up in pci*) ;; *) say "below $(basename $d) $up" ;; esac
+    [ -f $d/current_link_speed ] && say "link $(basename $d) $(cat $d/current_link_speed) x$(cat $d/current_link_width)"
 done
+dmesg | grep -E "PCI bridge to|bridge window" | sed 's/^/pass-guest: pci: /'
+dmesg | grep -iE "can't claim|no compatible bridge window|failed to assign|no space for" \
+    | sed 's/^/pass-guest: pci complains: /'
 dev=
 for d in /sys/bus/pci/devices/*; do
     [ "$(cat $d/class)" = "0x010802" ] && dev=$d
 done
 say "nvme at ${dev:-none}"
+# The PCI function a block device is on: the last address in its path
+fn_of() {
+    readlink -f /sys/block/$1/device | grep -o '[0-9a-f]\{4\}:[0-9a-f]\{2\}:[0-9a-f]\{2\}\.[0-7]' | tail -1
+}
 # A disk nos gave: the pattern on it read, one of the guest's written and
 # read back past the page cache -- $1 its block device, $2 its name here
 disk() {
-    i=0
-    while [ ! -b $1 ] && [ $i -lt 120 ]; do
-        sleep 1
-        i=$((i + 1))
-    done
     say "$2 of $(cat /sys/block/$(basename $1)/size 2>/dev/null) sectors"
     say "$2 read $(dd if=$1 bs=4096 count=16 2>/dev/null | md5sum | cut -d' ' -f1)"
     yes "nos gave this guest the $2 and it wrote this" | head -c 65536 > /tmp/w
@@ -37,8 +45,14 @@ disk() {
     blockdev --flushbufs $1
     say "$2 read back $(dd if=$1 bs=4096 skip=256 count=16 2>/dev/null | md5sum | cut -d' ' -f1)"
 }
-disk /dev/nvme0n1 nvme
-disk /dev/vda virtio
+i=0
+while { [ ! -b /dev/nvme0n1 ] || [ ! -b /dev/vda ] || [ ! -b /dev/vdb ]; } && [ $i -lt 120 ]; do
+    sleep 1
+    i=$((i + 1))
+done
+for b in nvme0n1 vda vdb; do
+    [ -b /dev/$b ] && disk /dev/$b $(fn_of $b)
+done
 # The NVMe's ROM, the host's copy of it, through sysfs
 if [ -n "$dev" ] && [ -f $dev/rom ]; then
     echo 1 > $dev/rom

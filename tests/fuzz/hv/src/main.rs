@@ -152,6 +152,7 @@ mod fwmodel;
 mod guestnet;
 mod handovermodel;
 mod hostmodel;
+mod portmodel;
 mod migwiremodel;
 mod netrx;
 mod offloadmodel;

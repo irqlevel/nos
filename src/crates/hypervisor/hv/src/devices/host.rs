@@ -46,6 +46,10 @@
 //!   the IOMMU translates by another context (the audio function's beside
 //!   a GPU, passed through: the whole of the host's memory), the second
 //!   have its DMA read past what the CPUs' caches hold newer;
+//! - the header type's multi-function bit is the guest's: set where the
+//!   device has more than one function behind its port (`devices::port`,
+//!   `set_multifunction`), whatever the device's says of functions the
+//!   guest may not have;
 //! - a bridge is not given at all;
 //! - every other register is the device's: written through, as QEMU's VFIO
 //!   does -- a vendor's registers are the driver's to know.
@@ -77,6 +81,8 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+
+pub use super::port::Link;
 
 /// The real function, as the module reaches it: its configuration space
 /// (offsets under 256), and the pages of its BARs that trap, for what of
@@ -374,6 +380,23 @@ const PCIE_DEVICE_CONTROL: usize = 0x08;
 const PCIE_DEVCTL_HOST: u16 = 0xF | (0x7 << 5) | (0x7 << 12);
 const PCIE_DEVCTL_OFF: u16 = (1 << 9) | (1 << 11) | (1 << 15);
 const PCIE_LINK_CONTROL: usize = 0x10;
+/// What a root port above it shows of its link (`port::Link`): the link
+/// capabilities, the link status above the control, and the link
+/// capabilities 2 of a capability of version 2 and up; the payload size,
+/// device control's bits 7:5. The flags' version and the device or port
+/// type, in the capability's first dword.
+const PCIE_LINK_CAP: usize = 0x0C;
+const PCIE_LINK_CAP2: usize = 0x2C;
+const PCIE_PAYLOAD_SHIFT: u32 = 5;
+const PCIE_PAYLOAD_MASK: u16 = 0x7;
+const PCIE_VERSION_SHIFT: u32 = 16;
+const PCIE_VERSION_MASK: u32 = 0xF;
+const PCIE_TYPE_SHIFT: u32 = 20;
+const PCIE_TYPE_MASK: u32 = 0xF;
+/// An endpoint and a legacy endpoint: the functions a root port goes
+/// above, at the other end of a link -- an integrated one (9) has none.
+pub const PCIE_ENDPOINT: u8 = 0x0;
+pub const PCIE_LEGACY_ENDPOINT: u8 = 0x1;
 
 /// The expansion ROM's BAR (PCI 3.0, 6.2.5.2): what `Moved::bar` calls it,
 /// its register's enable bit and address bits, and the sizes a ROM given
@@ -445,6 +468,10 @@ pub struct HostFunction {
     /// Its expansion ROM, where the host gave it one (`set_rom`): the copy,
     /// and the guest's ROM BAR register -- its address and enable.
     rom: Option<(Box<[u8]>, u32)>,
+    /// Whether it is one of several functions of one device behind its
+    /// port (`set_multifunction`): its header type says so, whatever the
+    /// device's own says of functions the guest may not have.
+    multi: bool,
 }
 
 impl HostFunction {
@@ -570,6 +597,7 @@ impl HostFunction {
             messages,
             traps,
             rom: None,
+            multi: false,
         };
         /* Each BAR the guest's at nowhere until it, or the caller placing
          * it, writes one: the type bits as the real one's */
@@ -607,6 +635,35 @@ impl HostFunction {
     /// MSI.
     pub fn msix_layout(&self) -> Option<MsixLayout> {
         self.msix
+    }
+
+    /// Its PCIe capability's device or port type, where it has one: an
+    /// endpoint gets a root port above it (`run::add_host_function`).
+    pub fn pcie_type(&self) -> Option<u8> {
+        (self.pcie_cap != 0).then(|| ((self.real.read32(self.pcie_cap as u16) >> PCIE_TYPE_SHIFT) & PCIE_TYPE_MASK) as u8)
+    }
+
+    /// Its link and payload size as they are now, for the port above it
+    /// (`port::Link`); zeroes where it has no PCIe capability, or a register
+    /// of it would be past the 256 bytes.
+    pub fn link(&self) -> Link {
+        let read = |offset: usize| -> u32 {
+            let at = self.pcie_cap + offset;
+            if self.pcie_cap == 0 || at + 4 > CONFIG_SIZE { 0 } else { self.real.read32(at as u16) }
+        };
+        let version = (read(0) >> PCIE_VERSION_SHIFT) & PCIE_VERSION_MASK;
+        Link {
+            cap: read(PCIE_LINK_CAP),
+            status: (read(PCIE_LINK_CONTROL) >> 16) as u16,
+            cap2: if version >= 2 { read(PCIE_LINK_CAP2) } else { 0 },
+            payload: (read(PCIE_DEVICE_CONTROL) as u16 >> PCIE_PAYLOAD_SHIFT) & PCIE_PAYLOAD_MASK,
+        }
+    }
+
+    /// Whether its header type says it is one of several functions: those
+    /// of one device behind one port, more than one of them given.
+    pub fn set_multifunction(&mut self, multi: bool) {
+        self.multi = multi;
     }
 
     /// Whether this is an NVIDIA function, whose BAR0 mirrors its
@@ -923,8 +980,11 @@ impl HostFunction {
                 (real & 0xFFFF_0000) | u32::from(self.command)
             }
             0x0C => {
+                /* The multi-function bit the guest's: the device's says
+                 * functions are there the guest may not have */
+                let bit = u32::from(HEADER_MULTI) << (8 * (HEADER_TYPE - 0x0C));
                 let real = self.real.read32(dword as u16);
-                real & !(u32::from(HEADER_MULTI) << (8 * (HEADER_TYPE - 0x0C)))
+                (real & !bit) | if self.multi { bit } else { 0 }
             }
             d if (BAR0..BAR_END).contains(&d) => self.guest_bars[(d - BAR0) / 4],
             ROM => self.rom.as_ref().map_or(0, |(_, register)| *register),

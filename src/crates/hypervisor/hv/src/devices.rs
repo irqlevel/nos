@@ -27,6 +27,8 @@ pub mod offload;
 #[cfg(target_arch = "x86_64")]
 pub mod pci;
 #[cfg(target_arch = "x86_64")]
+pub mod port;
+#[cfg(target_arch = "x86_64")]
 pub mod pic;
 #[cfg(target_arch = "x86_64")]
 pub mod pit;
