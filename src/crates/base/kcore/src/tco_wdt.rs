@@ -9,15 +9,23 @@
  *      the SMBus function, PCI 0:1F.4 config 0x50, and the window is only
  *      decoded while TCO_BASE_EN (TCOCTL, config 0x54 bit 8) is set.  This
  *      is where Linux's i2c-i801 reads it from.  The LPC bridge registers
- *      used by (2) and (3) read back as zero on these chipsets, so this
- *      probe has to come first.
- *   2. ICH9-class chipsets (and QEMU's q35): TCOBASE from the LPC bridge,
- *      PCI 0:1F.0 config 0x50.
- *   3. Same bridge, ACPI PMBASE (config 0x40) plus the fixed 0x60 offset.
+ *      used by (2) read back as zero on these chipsets, so this probe has
+ *      to come first.
+ *   2. ICH6 to the 9-series and the server PCHs of their time (C600, C610
+ *      "Wellsburg"), and QEMU's q35 -- what Linux's lpc_ich calls TCO
+ *      version 2: the block is in the LPC bridge's ACPI I/O space, at
+ *      PMBASE (PCI 0:1F.0 config 0x40) plus the fixed 0x60. Nothing of
+ *      these chipsets keeps a TCOBASE in the bridge's config 0x50: on the
+ *      Supermicro X10DRi's C610 that register reads 0xF8, which was once
+ *      taken for one and put the timer's writes on ports 0xE4 to 0xE8.
  *
  * NO_REBOOT (the bit that inhibits the reset on the second expiry) is where
  * the generation keeps it, and cleared where it can be reached:
- *   - on the (2)/(3) generations, in the LPC bridge's config space;
+ *   - on the (2) generations, in GCS, bit 5 of the chipset configuration
+ *     registers' General Control and Status (RCBA + 0x3410: RCBA is the
+ *     bridge's config 0xF0, bit 0 its enable), as Linux's iTCO_wdt clears
+ *     it for version 2 -- cleared and read back, since a strap can hold it
+ *     set;
  *   - from Cannon Lake (300-series, 2018) on, in TCO1_CNT itself -- bit 0,
  *     in the window (1) found: cleared and read back, as Linux's iTCO_wdt
  *     does for what it calls TCO version 6.  Only the SMBus function's
@@ -128,12 +136,21 @@ const SMB_TCOBASE_REG: u16 = 0x50;
 const SMB_TCOCTL_REG:  u16 = 0x54;
 const TCOCTL_TCO_BASE_EN: u32 = 1 << 8;
 
-/* LPC bridge registers: ICH9-class chipsets */
-const LPC_TCOBASE_REG: u16 = 0x50;
+/* LPC bridge registers: TCO version 2 chipsets */
 const LPC_ACPI_BASE_REG: u16 = 0x40;
 const ACPI_TCO_OFFSET: u16 = 0x60;
-const PMC_GCS_REG: u16 = 0xAC; /* General Control and Status in PMC config space */
-const GCS_NO_REBOOT: u32 = 1 << 1;
+/* PMBASE decodes 128 ports: bit 0 says I/O space, bits 6:1 are reserved */
+const ACPI_BASE_MASK: u16 = 0xFF80;
+
+/* The chipset configuration registers: RCBA, config 0xF0 of the bridge,
+   is their 16 KiB window's base (bits 31:14) and its decode enable (bit 0),
+   and GCS is at 0x3410 in it -- NO_REBOOT its bit 5 */
+const LPC_RCBA_REG: u16 = 0xF0;
+const RCBA_ENABLE: u32 = 1 << 0;
+const RCBA_BASE_MASK: u32 = 0xFFFF_C000;
+const RCBA_GCS_OFFSET: u64 = 0x3410;
+const GCS_NO_REBOOT: u32 = 1 << 5;
+const PAGE_BYTES: u64 = 4096;
 
 /* Approximate seconds per TCO tick */
 const TCO_TICK_NS: u64 = 600_000_000; /* 0.6 s */
@@ -142,7 +159,6 @@ const TCO_TICK_NS: u64 = 600_000_000; /* 0.6 s */
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TcoBaseSource {
     PchSmbus,
-    LpcTcoBase,
     LpcAcpiBase,
 }
 
@@ -150,7 +166,6 @@ impl TcoBaseSource {
     pub fn as_str(self) -> &'static str {
         match self {
             TcoBaseSource::PchSmbus    => "SMBus 0:1F.4 TCOBASE",
-            TcoBaseSource::LpcTcoBase  => "LPC 0:1F.0 TCOBASE",
             TcoBaseSource::LpcAcpiBase => "LPC 0:1F.0 ACPI base + 0x60",
         }
     }
@@ -162,12 +177,13 @@ impl TcoBaseSource {
 pub enum NoReboot {
     /// Cleared in TCO1_CNT, and read back clear: a Cannon Lake or later PCH
     ClearedInCnt,
-    /// Cleared in the LPC bridge's config space -- where most of those
-    /// generations keep it, not all (probe_lpc's caveat)
-    ClearedInLpc,
-    /// Cleared in TCO1_CNT and read back set: the firmware locked it so
+    /// Clear in GCS, read back so -- cleared there, or found so: a TCO
+    /// version 2 chipset
+    ClearedInGcs,
+    /// Cleared and read back set: the firmware or a strap locked it so
     Locked,
-    /// Behind the P2SB, out of reach (the 100- and 200-series): as the
+    /// Out of reach -- behind the P2SB (the 100- and 200-series), or in
+    /// chipset configuration registers the firmware left undecoded: as the
     /// firmware set it
     Left,
 }
@@ -176,15 +192,14 @@ impl NoReboot {
     /// Whether a hang should reset the machine, as far as this bit goes:
     /// is_counting() says the rest.
     pub fn cleared(self) -> bool {
-        matches!(self, NoReboot::ClearedInCnt | NoReboot::ClearedInLpc)
+        matches!(self, NoReboot::ClearedInCnt | NoReboot::ClearedInGcs)
     }
 
-    /// The bit's fate, for the line the kernel logs: nothing where it went
-    /// as it always has.
+    /// The bit's fate, for the line the kernel logs.
     pub fn as_str(self) -> &'static str {
         match self {
             NoReboot::ClearedInCnt => ", NO_REBOOT cleared in TCO1_CNT",
-            NoReboot::ClearedInLpc => "",
+            NoReboot::ClearedInGcs => ", NO_REBOOT clear in GCS",
             NoReboot::Locked       => ", NO_REBOOT locked set by the firmware",
             NoReboot::Left         => ", NO_REBOOT left as firmware set it",
         }
@@ -274,7 +289,7 @@ impl TcoWatchdog {
         Some(Self::from_base(tco_base, TcoBaseSource::PchSmbus, no_reboot))
     }
 
-    /// ICH9-class chipsets, including QEMU's q35.
+    /// TCO version 2: ICH6 to the 9-series, C600 and C610, QEMU's q35.
     fn probe_lpc() -> Option<Self> {
         use crate::pci;
 
@@ -283,36 +298,55 @@ impl TcoWatchdog {
             return None;
         }
 
-        let tco_raw = dev.read_config16(LPC_TCOBASE_REG);
-        let (tco_base, source) = if tco_raw != 0 && tco_raw != 0xFFFF {
-            (tco_raw & TCOBASE_MASK, TcoBaseSource::LpcTcoBase)
-        } else {
-            /* Fallback: ACPI PMBASE + 0x60 */
-            let acpi_base = dev.read_config16(LPC_ACPI_BASE_REG) & 0xFFFE;
-            if acpi_base == 0 || acpi_base == 0xFFFE {
-                return None;
-            }
-            /* A PMBASE so high the TCO window -- 32 ports from the base --
-             * would wrap is none */
-            let base = acpi_base.checked_add(ACPI_TCO_OFFSET)?;
-            base.checked_add(!TCOBASE_MASK)?;
-            (base, TcoBaseSource::LpcAcpiBase)
-        };
-
-        if tco_base == 0 {
+        /* PMBASE says it is I/O space in bit 0: a register that reads
+           otherwise -- all ones from nothing there, or zero on a PCH that
+           moved it to the PMC -- names no block */
+        let raw = dev.read_config16(LPC_ACPI_BASE_REG);
+        if raw & 1 == 0 || raw == 0xFFFF {
             return None;
         }
+        let acpi_base = raw & ACPI_BASE_MASK;
+        if acpi_base == 0 {
+            return None;
+        }
+        /* The mask keeps it to 0xFF80 at the most: the TCO's 32 ports from
+           0x60 in the 128 end at 0xFFFF at the highest */
+        let tco_base = acpi_base + ACPI_TCO_OFFSET;
 
-        /* Disable No Reboot so the second expiry triggers a reset.
-           CAVEAT: the NO_REBOOT location is chipset-specific.  Config
-           register 0xAC works on PCH generations where the PMC exposes GCS
-           there; on ICH9-class chipsets it lives in RCBA MMIO (+0x3410)
-           and this write has no effect.  Callers should verify the timer
-           actually counts (is_counting()) before relying on it for reset. */
-        let gcs = dev.read_config32(PMC_GCS_REG);
-        dev.write_config32(PMC_GCS_REG, gcs & !GCS_NO_REBOOT);
+        let no_reboot = Self::clear_gcs_no_reboot(&dev);
+        Some(Self::from_base(tco_base, TcoBaseSource::LpcAcpiBase, no_reboot))
+    }
 
-        Some(Self::from_base(tco_base, source, NoReboot::ClearedInLpc))
+    /// NO_REBOOT in GCS (the file header) cleared where it is set, and read
+    /// back: what became of it. Callers that need the reset still check
+    /// is_counting().
+    fn clear_gcs_no_reboot(dev: &crate::pci::PciDevice) -> NoReboot {
+        let rcba = dev.read_config32(LPC_RCBA_REG);
+        let base = rcba & RCBA_BASE_MASK;
+        if rcba & RCBA_ENABLE == 0 || rcba == 0xFFFF_FFFF || base == 0 {
+            return NoReboot::Left;
+        }
+
+        /* The page GCS is in, as device memory: map_mmio_region refuses one
+           that is RAM, so a register misread cannot turn into a write into
+           somebody's page */
+        let gcs = u64::from(base) + RCBA_GCS_OFFSET;
+        let page = gcs & !(PAGE_BYTES - 1);
+        let Some(mapping) = crate::dma::PhysMapping::map(page, 1) else {
+            return NoReboot::Left;
+        };
+        let regs = crate::io::MmioRegion::new(mapping.as_mut_ptr(), mapping.len());
+        let at = (gcs - page) as usize;
+
+        let value = regs.read32(at);
+        if value & GCS_NO_REBOOT != 0 {
+            regs.write32(at, value & !GCS_NO_REBOOT);
+        }
+        if regs.read32(at) & GCS_NO_REBOOT == 0 {
+            NoReboot::ClearedInGcs
+        } else {
+            NoReboot::Locked
+        }
     }
 
     /// Common register init once TCOBASE is known.

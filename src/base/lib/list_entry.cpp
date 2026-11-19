@@ -108,6 +108,20 @@ void ListEntry::move_tail_list(ListEntry *list)
     append_tail(entry);
 }
 
+void ListEntry::move_run_tail(ListEntry* first, ListEntry* last)
+{
+    ListEntry* before = first->blink;
+    ListEntry* after = last->flink;
+    before->flink = after;
+    after->blink = before;
+
+    ListEntry* tail = blink;
+    tail->flink = first;
+    first->blink = tail;
+    last->flink = this;
+    blink = last;
+}
+
 ListEntry::ListEntry(ListEntry&& other)
 {
     if (other.is_empty()) {

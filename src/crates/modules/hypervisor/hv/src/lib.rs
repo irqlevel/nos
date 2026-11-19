@@ -128,13 +128,14 @@ hv boot <kernel> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noa
                                    cpus gives it N CPUs, each on a host CPU of its own, the
                                    first on cpu. The kernel is a bzImage, or a PVH ELF:
                                    /lib/hvboot boots the one its disk's grub.cfg names
-hv start <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [pci=bus:dev.fn]... [unsafe_interrupts] [input=...] [log] [restart] [force] [uuid=U] [net] [network=name] [firewall=name] [port=N] [forward=nos:guest]... [cmdline=...]
+hv start <kernel> [mem=MiB] [cpus=N] [cpu=N] [node=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [pci=bus:dev.fn]... [unsafe_interrupts] [input=...] [log] [restart] [force] [uuid=U] [net] [network=name] [firewall=name] [port=N] [forward=nos:guest]... [cmdline=...]
                                    a Linux guest that runs until hv stop; restart boots it
                                    again when it resets itself or panics; uuid= what its
                                    SMBIOS says it is; network= the guests it reaches on the
                                    switch, none without; firewall= the firewall its NIC is
                                    judged by, default without (hv fw); port= its own port of
-                                   the switch, forward= nos's ports relayed to its own
+                                   the switch, forward= nos's ports relayed to its own;
+                                   node= the NUMA node its CPUs and memory are on (numa)
 hv start <name|folder>             the vm in the vms' folder of that name, or in that
                                    folder, as its vm.toml says: its console to console.log
                                    there. The vms' folder is /vms, or what insmod hv.ko

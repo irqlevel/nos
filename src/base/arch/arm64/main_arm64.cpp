@@ -19,6 +19,7 @@
 #include <kernel/dmesg.h>
 #include <kernel/parameters.h>
 #include <kernel/memsites.h>
+#include <kernel/numa.h>
 #include <kernel/tracepoint.h>
 #include <kernel/ubsan.h>
 #include <kernel/time.h>
@@ -764,6 +765,11 @@ extern "C" void main_arm64(void* dtb)
         if (!cpus.insert_cpu(i))
             PANIC("Can't insert cpu");
     }
+
+    /* A device tree says nothing of NUMA here: one node, sealed before a
+       second CPU runs, as kernel/main.cpp seals the SRAT's */
+    Numa::get_instance().seal(cpus.get_present_cpus());
+    Numa::get_instance().report();
 
     auto& cpu = cpus.get_current_cpu();
     if (!cpus.set_bsp_index(cpu.get_index()))

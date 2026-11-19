@@ -21,10 +21,14 @@ namespace mm
    last guest left in its memory is gone from RAM within seconds of its
    end, rather than whenever the page is next handed out.
 
-   WORKERS tasks, and no more than there are CPUs: one starting with the
-   huge pool, one with the 4 KiB pages, each going on to the other's work
-   when its own has none. Free to move, so that a task displaced from a
-   busy CPU is weighed for an idle one (TaskQueue::schedule), and nice 19:
+   A task a NUMA node (kernel/numa.h) -- two on a machine of one -- and no
+   more than there are CPUs: each zeroes its node's 4 KiB pages, on that
+   node's CPUs where there are more nodes than one, since a page's stores
+   from the other socket cost about twice; node 0's starts with the huge
+   pool, whose zeroing is one block at a time for every node, and every task
+   goes on to the other kind of work when its own has none. Free to move
+   among its CPUs, so that a task displaced from a busy CPU is weighed for an
+   idle one (TaskQueue::schedule), and nice 19:
    a task zeroes only while its CPU runs nothing else -- the runnable
    count, looked at between pages -- in batches of at most BATCH_PAGES,
    after each of which it looks again; one whose CPU is busy yields, then
@@ -50,7 +54,10 @@ public:
        wait the stop cuts short. */
     void stop();
 
-    static const ulong WORKERS = 2;
+    /* The most tasks: one a node there may be (Numa::MAX_NODES) */
+    static const ulong WORKERS = 16;
+    /* The tasks of a machine of one node */
+    static const ulong ONE_NODE_WORKERS = 2;
     static const ulong BATCH_PAGES = 256;
     static const ulong IDLE_WAIT_NS = 1 * consts::NANO_SECS_IN_SEC;
     static const ulong BUSY_WAIT_NS = 10 * consts::NANO_SECS_IN_MS;
@@ -68,6 +75,8 @@ private:
         Task* task;
         /* The huge pool's free blocks before the 4 KiB pages */
         bool huge_first;
+        /* Whose free pages it zeroes */
+        ulong node;
     };
 
     static void task_func(void* ctx);

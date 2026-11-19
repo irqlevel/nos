@@ -314,8 +314,13 @@ public:
        takes as known zero read first, and a word that is not zero a panic
        naming the page -- something wrote to a free page, a use after free,
        caught at the allocation rather than handed to a guest. Set once, at
-       boot, before there is another CPU. */
-    bool zero_free_page(ulong keep);
+       boot, before there is another CPU.
+
+       Both of a node's (kernel/numa.h): zero_free_page of `node`'s free
+       pages, the zeroing tasks one a node and on its CPUs, since a page's
+       stores cost twice from the other socket; zero_free_huge_page of any
+       block's, the pool's zeroing one at a time. */
+    bool zero_free_page(ulong node, ulong keep);
     bool zero_free_huge_page();
     ulong get_zeroed_pages_count();
     ulong get_huge_pool_zeroed();
@@ -420,6 +425,38 @@ public:
     ulong get_huge_pool_blocks();
     ulong get_huge_pool_free();
 
+    /* NUMA (kernel/numa.h). Every free page is on its own node's lists,
+       and an allocation takes from the node of the CPU it runs on first,
+       then from the nearest with a page -- every node's lists, before one
+       comes up empty. On a machine of one node this is what it always was.
+
+       spread_free_pages: once, right after Numa::seal -- on the boot CPU,
+       before a second runs and before the heap: the free list was built
+       before the firmware's tables were read, so every page is node 0's
+       until then, and is moved to its own node's lists here, a run of a
+       node's at a time.
+
+       alloc_page_keeping_on, alloc_huge_frame_on: as alloc_page_keeping
+       and alloc_huge_frame, `node`'s first -- what a guest's memory is taken
+       with, from the node its CPUs are placed on (hv); the others' when that
+       one has none.
+
+       reserve_huge_pool takes each node's share of the blocks, as much of
+       the pool as the node has of the free pages, and leaves each its share
+       of what it keeps free.
+
+       get_node_free: a node's free pages, and of them the zeroed; and of
+       the huge pool, its blocks and its free ones. get_node_usable_bytes:
+       the RAM the firmware's map says is usable that is the node's -- each
+       usable region's overlap with the node's ranges, and node 0's what no
+       range covers, as Numa::get_phys_node places it. */
+    void spread_free_pages();
+    Page* alloc_page_keeping_on(ulong node, ulong keep);
+    ulong alloc_huge_frame_on(ulong node);
+    void get_node_free(ulong node, ulong& free, ulong& zeroed);
+    void get_node_huge_pool(ulong node, ulong& blocks, ulong& free);
+    ulong get_node_usable_bytes(ulong node);
+
     /* The huge pool's window: every block of the pool mapped with one 2MiB
        entry at HUGE_POOL_WINDOW plus its physical address -- RAM, so
        write-back; data, so no-execute -- from map_huge_pool_window, right
@@ -459,7 +496,8 @@ private:
 
     ulong get_free_page();
 
-    /* Move every page on the early physical free list onto free_pages_list_. */
+    /* Move every page on the early physical free list onto its node's free
+       list -- node 0's, before Numa::seal */
     void drain_early_free_list();
 
     /* One 4KiB leaf in the table setup() is building, before it is live.
@@ -485,11 +523,16 @@ private:
     Page* alloc_page_no_lock();
     void free_page_no_lock(Page* page);
     /* The halves of an allocation: a page off a free list, with Lock held --
-       the zeroed one first when zeroed_first, the other first otherwise --
-       its mark cleared and `zeroed` saying which list it came off; and its
-       zeroing, which needs no lock -- the page is the caller's alone once it
-       is off the list -- unless it came off the zeroed one. */
-    Page* take_free_page_no_lock(bool zeroed_first, bool& zeroed);
+       `node`'s lists first, then each node's in its fallback order
+       (Numa::get_fallback); of a node's, the zeroed one first when
+       zeroed_first, the other first otherwise -- its mark cleared and
+       `zeroed` saying which list it came off; and its zeroing, which needs no
+       lock -- the page is the caller's alone once it is off the list --
+       unless it came off the zeroed one. */
+    Page* take_free_page_no_lock(ulong node, bool zeroed_first, bool& zeroed);
+    /* The node of the CPU this runs on: 0 on a machine of one node, and
+       before Numa::seal -- when the APIC id may not be readable yet */
+    static ulong local_node();
     void zero_page(Page* page);
     /* What an allocation does with the page it took: zeroes it, unless it is
        known zero -- and then reads it, under zero_check_ */
@@ -565,13 +608,26 @@ private:
     ulong page_array_phys_;
     ulong page_array_count_;
     ulong highest_phy_addr_;
-    /* The free pages: free_pages_list_ those as their last owner left them,
-       zeroed_pages_list_ those known to read as zeros, each of them marked
-       (Page::ZEROED_BIT). free_pages_count_ counts both lists and a page
+    /* A node's free pages: free_list those as their last owner left them,
+       zeroed_list those known to read as zeros, each of them marked
+       (Page::ZEROED_BIT). free_count counts both lists and a page
        zero_free_page has off them on its way from one to the other;
-       zeroed_pages_count_ the zeroed list alone. */
-    stdlib::ListEntry free_pages_list_;
-    stdlib::ListEntry zeroed_pages_list_;
+       zeroed_count the zeroed list alone. A free page is on its own node's
+       lists (Numa::get_phys_node) and nobody else's, from spread_free_pages
+       on. */
+    struct NodeFree
+    {
+        stdlib::ListEntry free_list;
+        stdlib::ListEntry zeroed_list;
+        ulong free_count;
+        ulong zeroed_count;
+    };
+    /* Numa::MAX_NODES, which the .cpp holds it to */
+    static const ulong MAX_NODES = 16;
+    NodeFree node_free_[MAX_NODES];
+    /* The page's node's lists */
+    NodeFree& node_lists(Page* page);
+    /* The pages on every node's lists, and of them the zeroed */
     ulong free_pages_count_;
     /* The least free_pages_count_ has been since setup_free_pages_list:
        lowered where the count is, under Lock */
@@ -622,6 +678,12 @@ private:
     /* A block whose bit is set in bits and not in minus (nullptr: none), the
        search from the hint's word on. Under huge_pool_lock_. */
     bool huge_pool_find(const ulong* bits, const ulong* minus, ulong& block);
+    /* A block whose bit is set in bits, whose first page is `node`'s, the
+       search over the node's ranges (Numa::get_range) alone; on a machine
+       of one node huge_pool_find. Under huge_pool_lock_. */
+    bool huge_pool_find_on(const ulong* bits, ulong node, ulong& block);
+    /* The blocks whose first page is in [base, end): [first, last) */
+    static void huge_pool_blocks_of(ulong base, ulong end, ulong& first, ulong& last);
     /* A page of the pool zeroed, and read, through this CPU's frame slot,
        as kernel_frame_read copies: interrupts off for that page's stores
        and no longer, and no tmp_map_lock_ for each of the 512 */

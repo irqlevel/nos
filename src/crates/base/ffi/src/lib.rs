@@ -12,6 +12,7 @@ pub mod simd;
 pub mod io;
 pub mod dma;
 pub mod frame;
+pub mod numa;
 pub mod random;
 pub mod pci;
 pub mod msix;

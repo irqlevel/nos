@@ -686,6 +686,24 @@ CPU runs with interrupts off and may not allocate; `kcore::cpu::run_on_with`
 carries it over as a borrowed value rather than a word to cast back, which
 is sound because `run_on` does not return until the handler has run.
 
+## numabench
+
+`numabench` (`src/crates/modules/test/numabench`) measures what each NUMA
+node's memory costs the CPUs of each node ([NUMA](numa.md)). A task bound to
+a CPU of each node takes `mib=` of the heap there, in blocks of its largest
+size (512 KiB) -- its node's, as an allocation is the node of its CPU first
+-- and threads a random cycle through their cache lines in place (Sattolo's
+shuffle); then a task on a CPU of each node follows that cycle `loads=`
+lines, each load waiting for the one before, and reads every word in order
+for a second -- a line's latency as a task meets it, TLB misses among it,
+and one CPU's bandwidth: a line a pair of nodes, with the share of the
+memory's pages that were its node's as their physical addresses say. Every
+node's memory is taken before any is read, and given back after the last
+read: a block freed is kept by the heap for its next taker, whichever node
+that one is on.
+
+    numabench [mib=256] [loads=4000000]
+
 ## heapbench
 
 `heapbench` (`src/crates/modules/test/heapbench`) times the kernel heap as Rust code

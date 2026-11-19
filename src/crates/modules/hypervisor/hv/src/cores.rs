@@ -96,15 +96,28 @@ impl Cores {
     }
 
     /// A place for a guest of `n` CPUs -- the first on `wanted` if it names
-    /// one, its disks' task too where it has `disks` -- and its hold on it,
-    /// `holder`'s, or named later ([`Hold::held_by`]); or why not.
-    pub fn take(&self, machine: &Machine, wanted: Option<u32>, n: u32, disks: bool, holder: Option<Holder>)
-        -> Result<(Placement, Hold), String>
+    /// one, every one and its disks' task on NUMA node `node`'s CPUs if it
+    /// names one, its disks' task too where it has `disks` -- and its hold
+    /// on it, `holder`'s, or named later ([`Hold::held_by`]); or why not.
+    pub fn take(&self, machine: &Machine, wanted: Option<u32>, node: Option<usize>, n: u32, disks: bool,
+                holder: Option<Holder>) -> Result<(Placement, Hold), String>
     {
         let policy = if self.own() { Policy::Own } else { Policy::Shared };
         let topo = hv::topology::host();
-        let enabled = machine.enabled_mask();
-        let online = kcore::cpu::online_mask();
+        let mut enabled = machine.enabled_mask();
+        let mut online = kcore::cpu::online_mask();
+        if let Some(node) = node {
+            let cpus = kcore::numa::node_cpus(node);
+            if let Some(cpu) = wanted.filter(|&cpu| cpus & bit(cpu) == 0) {
+                return Err(alloc::format!("cpu {} is node {}'s, not node {}'s", cpu, kcore::numa::cpu_node(cpu),
+                                          node));
+            }
+            if enabled & cpus == 0 {
+                return Err(alloc::format!("the extension is on for no cpu of node {} -- hv on there first", node));
+            }
+            enabled &= cpus;
+            online &= cpus;
+        }
         let mut holds = self.inner.holds.lock();
         holds.list.try_reserve(1).map_err(|_| String::from("out of memory"))?;
         let mut taken = Taken::none();
@@ -116,7 +129,13 @@ impl Cores {
                 }
             }
         }
-        let p = place::place(&topo, policy, enabled, online, &taken, wanted, n, disks).map_err(describe)?;
+        let p = place::place(&topo, policy, enabled, online, &taken, wanted, n, disks).map_err(|r| {
+            let mut why = describe(r);
+            if let Some(node) = node {
+                let _ = write!(why, " (on node {}, as asked)", node);
+            }
+            why
+        })?;
         let id = holds.next;
         holds.next += 1;
         let vcpus = p.vcpus.iter().fold(0u64, |m, &cpu| m | bit(cpu));

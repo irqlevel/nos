@@ -550,7 +550,7 @@ def create_checks(out, grown, raw):
              "password" in out[0], out[0])
     pt.check("its folder: the disk, the seed and the vm.toml -- the download gone",
              all(f in out[1] for f in ("disk.raw", "seed.iso", "vm.toml")) and "img.qcow2" not in out[1]
-             and re.search(r"65536 seed\.iso", out[1]) is not None, out[1])
+             and re.search(r"\b65536\s+seed\.iso", out[1]) is not None, out[1])
     pt.check("the disk is the one the image was made of, grown with zeros to size= (its SHA-256)", grown in out[2],
              out[2] + "\nwant " + grown)
     pt.check("the vm.toml boots it by hvboot -- the system image's, unless told -- the disk first and the seed "
