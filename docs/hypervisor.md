@@ -2259,8 +2259,41 @@ over it --
   functions -- whose requests would carry another function's id, and so
   another IOMMU context -- and no snoop kept off; the link control the
   host's; the Advanced Features capability's FLR not reachable;
+- the header type's multi-function bit the guest's: set where its device
+  has more than one function behind its port, whatever the device's says of
+  functions the guest may not have;
 - every other register is the device's, written through, as QEMU's VFIO
   does.
+
+**Each device is behind a root port of the guest's** (`devices/port.rs`), as
+on the machine: a PCIe endpoint's functions given one after another -- the
+module sorts them by their addresses on the host -- are one device's, behind
+one port on the next slot of bus 0, as functions 0 up of the bus below it,
+numbered after the ports before it (`LinuxGuest::add_host_function`): their
+numbers on the host less the first's, so a GPU's audio function is at 00.1
+beside it, where Linux's `hda_intel` looks for its GPU, and a NIC's ports are
+one slot's, as its driver's link aggregation wants them; function 0's header
+type says the device has others. The port is Red Hat's (QEMU's,
+1b36:000c, which Linux knows as a generic root port and has no quirk of): a
+type 1 header and a PCIe capability of a root port of no slot, and nothing
+else -- no interrupt of its own, no PME, no extended capability -- so that
+Linux's port driver binds and finds no service to start. Nothing of it
+reaches the device: its bus numbers are the guest's to renumber, and the run
+loop routes configuration accesses by them (`Platform::host_config`); its
+command register, windows and bridge control are the guest's to write and
+change nothing -- the device's BARs are mapped where its own registers put
+them, and a secondary bus reset resets nothing, as an FLR the guest asks for
+does not: a reset is the host's. Its link is the device's as it is at each
+read (`port::Link`: the device's own link capabilities and status, its
+speeds, its payload size), with no ASPM, no bandwidth notification and no
+slot: the guest's PCIe code has no link of its own to manage, and the
+device's link control is the host's. A function that is no endpoint -- an
+integrated one, a PCI device -- is alone on a slot of bus 0, as before. The
+BARs are placed as firmware places them behind a bridge: a 64-bit
+prefetchable one above the guest's RAM, any other below 4 GiB, where a
+port's memory window is, and each device's from a fresh MiB of each window,
+so that its port's windows -- whole MiBs, set where its BARs are -- hold its
+BARs and nobody else's, and the guest's Linux claims every BAR where it is.
 
 A bridge, a function with neither MSI-X whose table and PBA are in BARs given
 nor MSI, and one whose capability list loops, runs on, or has a second
@@ -2292,8 +2325,9 @@ eight bytes of the table or the mirror as two dwords):
 
 **The guest's memory has a hole for the BARs** (`LinuxGuest::new_holed`):
 its RAM below 4 GiB ends at 3 GiB (`linux::HOLE_RAM_END`) rather than at
-0xFE000000, its 32-bit BARs go from there up to the MSI-X pages, its 64-bit
-ones from the first GiB past its RAM -- both windows in the DSDT's `_CRS`, so
+0xFE000000, its BARs that are not 64-bit and prefetchable go from there up
+to the MSI-X pages, the rest from the first GiB past its RAM -- both windows
+in the DSDT's `_CRS`, so
 that Linux keeps each BAR where it was put. The 64-bit window there reaches
 only as far as the BARs placed in it, a GiB at a time: the rest of the
 guest's addresses are its OS's own, and Linux's HMM takes a GPU's VRAM's

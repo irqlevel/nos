@@ -30,7 +30,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use hv::host::{Bar, HostFunction, Messages, Real, MAX_VECTORS};
-use hv::run::LinuxGuest;
+use hv::run::{HostAddress, LinuxGuest};
 use kcore::dma::PhysMapping;
 use kcore::io::MmioRegion;
 use kcore::iommu::{self, Domain};
@@ -420,6 +420,12 @@ impl Passed {
     /// What the guest is given of it, once: `hv::run::LinuxGuest::add_host_function`'s.
     pub fn function(&mut self) -> Option<HostFunction> {
         self.function.take()
+    }
+
+    /// Its bus, device and function on the host: which functions are one
+    /// device, behind one port in the guest.
+    pub fn address(&self) -> HostAddress {
+        HostAddress { bus: (self.sid >> 8) as u8, device: ((self.sid >> 3) & 0x1F) as u8, function: (self.sid & 0x7) as u8 }
     }
 
     /// Its interrupts sent on to `guest` from now on.

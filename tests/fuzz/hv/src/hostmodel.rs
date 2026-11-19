@@ -688,6 +688,9 @@ struct Judge {
     /// The ROM given, and the guest's ROM BAR register (PCI 3.0, 6.2.5.2):
     /// its address bits above the ROM's size and its enable are the guest's.
     rom: Option<(Vec<u8>, u32)>,
+    /// Whether the function is one of several behind its port: its header
+    /// type's multi-function bit, whatever the device's says.
+    multi: bool,
 }
 
 impl Judge {
@@ -708,7 +711,7 @@ impl Judge {
         };
         let mut j = Judge { bars, regs: [0; 6], command: 0, line: 0, msi: [0; 0x18], msi_at, msi_control,
                             msi_given: msix.is_none() && msi_at != 0, pending: false, msix,
-                            msix_cap: m.layout.msix, hidden, rom: None };
+                            msix_cap: m.layout.msix, hidden, rom: None, multi: false };
         for k in 0..6 {
             j.regs[k] = j.fixed(k);
         }
@@ -1054,7 +1057,7 @@ pub fn hostfn_target(r: &mut Input) {
         }
     }
 
-    while let Some(op) = r.op(15) {
+    while let Some(op) = r.op(16) {
         match op {
             0 | 1 => {
                 /* A register written, as the bus has the guest write it */
@@ -1100,7 +1103,9 @@ pub fn hostfn_target(r: &mut Input) {
                                at, v, (e >> shift) & mask);
                 }
                 if at == HEADER_TYPE && size == 1 {
-                    invariant!(v & 0x80 == 0, "the header type read {:#x}: another function said to be there", v);
+                    invariant!((v & 0x80 != 0) == judge.multi, "the header type read {:#x}: {}", v,
+                               if judge.multi { "a function alone, of several" } else { "another function said to be there" });
+                    invariant!(v & 0x7F == 0, "the header type read {:#x}: no type 0 header", v);
                 }
                 if dword == COMMAND && shift == 0 && size >= 2 {
                     invariant!(v as u16 & (COMMAND_IO | COMMAND_MEMORY | COMMAND_MASTER) == judge.command,
@@ -1234,7 +1239,7 @@ pub fn hostfn_target(r: &mut Input) {
                         (a.table_bar, a.table + e * ENTRY + 4 * r.below(4))
                     }
                     4 => (a.pba_bar, a.pba + 8 * r.below(a.pba_len() / 8)),
-                    _ => {
+            _ => {
                         let (bar, page) = r.pick(&msix_pages);
                         (bar, page + r.below(PAGE))
                     }
@@ -1332,6 +1337,13 @@ pub fn hostfn_target(r: &mut Input) {
                 invariant!(got == want, "the ROM's {} bytes at {:#x} read {:#x}, not {:#x}", len, offset, got, want);
                 invariant!(f.rom_window().unwrap_or(0) == judge.rom_window(), "the ROM decoded at {:?}, not {:#x}",
                            f.rom_window(), judge.rom_window());
+            }
+            15 => {
+                /* One of several functions of a device behind its port, or
+                 * alone (`run::add_host_function`) */
+                let multi = r.bool();
+                f.set_multifunction(multi);
+                judge.multi = multi;
             }
             _ => {
                 /* Anything at all: no panic, and no rule broken -- a page that
