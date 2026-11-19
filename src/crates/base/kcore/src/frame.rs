@@ -50,7 +50,18 @@ pub struct Frame {
 impl Frame {
     /// A zeroed page off the free list, or None when there is none.
     pub fn new() -> Option<Self> {
-        match frame::kernel_frame_alloc() {
+        Self::taken(frame::kernel_frame_alloc())
+    }
+
+    /// As [`new`](Self::new), NUMA node `node`'s first ([`crate::numa`]),
+    /// then the nearest node's.
+    pub fn new_on(node: usize) -> Option<Self> {
+        Self::taken(frame::kernel_frame_alloc_on(node))
+    }
+
+    /// What an allocation answered: 0 for none
+    fn taken(phys: u64) -> Option<Self> {
+        match phys {
             0 => None,
             phys => Some(Self { phys }),
         }
@@ -208,7 +219,18 @@ impl HugeFrame {
     /// A zeroed block of the pool, or None when it has none free -- or there
     /// is no pool, `hugepages=` not given.
     pub fn new() -> Option<Self> {
-        match frame::kernel_frame_alloc_huge() {
+        Self::taken(frame::kernel_frame_alloc_huge())
+    }
+
+    /// As [`new`](Self::new), NUMA node `node`'s blocks first, then the
+    /// nearest node's.
+    pub fn new_on(node: usize) -> Option<Self> {
+        Self::taken(frame::kernel_frame_alloc_huge_on(node))
+    }
+
+    /// What an allocation answered: 0 for none
+    fn taken(phys: u64) -> Option<Self> {
+        match phys {
             0 => None,
             phys => Some(Self { phys }),
         }
@@ -297,6 +319,15 @@ impl Run {
     /// `count` zeroed frames, or None when they cannot all be had -- those
     /// taken by then going back as the attempt is dropped.
     pub fn new(count: usize) -> Option<Run> {
+        Self::frames(count, None)
+    }
+
+    /// As [`new`](Self::new), NUMA node `node`'s pages first.
+    pub fn new_on(count: usize, node: usize) -> Option<Run> {
+        Self::frames(count, Some(node))
+    }
+
+    fn frames(count: usize, node: Option<usize>) -> Option<Run> {
         let mut pieces: Chunked<Piece> = Chunked::new();
         let mut left = count;
         while left > 0 {
@@ -304,7 +335,10 @@ impl Run {
             let mut piece = Vec::new();
             piece.try_reserve_exact(n).ok()?;
             for _ in 0..n {
-                piece.push(Frame::new()?);
+                piece.push(match node {
+                    Some(node) => Frame::new_on(node)?,
+                    None => Frame::new()?,
+                });
             }
             pieces.try_push(Piece::Pages(piece)).ok()?;
             left -= n;
@@ -317,13 +351,26 @@ impl Run {
     /// taken by then going back: the pool short of them (or `count` no
     /// whole number of blocks), or the heap of room for the table.
     pub fn new_huge(count: usize) -> Result<Run, Shortage> {
+        Self::blocks(count, None)
+    }
+
+    /// As [`new_huge`](Self::new_huge), NUMA node `node`'s blocks first.
+    pub fn new_huge_on(count: usize, node: usize) -> Result<Run, Shortage> {
+        Self::blocks(count, Some(node))
+    }
+
+    fn blocks(count: usize, node: Option<usize>) -> Result<Run, Shortage> {
         if count % HUGE_PAGES != 0 {
             return Err(Shortage::Pool);
         }
         let blocks = count / HUGE_PAGES;
         let mut pieces: Chunked<Piece> = Chunked::new();
         for _ in 0..blocks {
-            let block = HugeFrame::new().ok_or(Shortage::Pool)?;
+            let block = match node {
+                Some(node) => HugeFrame::new_on(node),
+                None => HugeFrame::new(),
+            }
+            .ok_or(Shortage::Pool)?;
             pieces.try_push(Piece::Huge(block)).map_err(|_| Shortage::Memory)?;
         }
         Ok(Run { pieces: Arc::new(pieces) })

@@ -179,6 +179,7 @@ CXX_SRC_x86_64 =   \
     src/base/kernel/dmesg.cpp    \
     src/base/kernel/sched.cpp    \
     src/base/kernel/eevdf.cpp    \
+    src/base/kernel/numa.cpp    \
     src/base/kernel/preempt.cpp  \
     src/base/kernel/time.cpp \
     src/base/arch/x86_64/tsc.cpp \
@@ -263,6 +264,7 @@ CXX_SRC_aarch64 = \
     src/base/kernel/task.cpp \
     src/base/kernel/sched.cpp \
     src/base/kernel/eevdf.cpp \
+    src/base/kernel/numa.cpp \
     src/base/kernel/cpu.cpp \
     src/base/kernel/timer.cpp \
     src/base/kernel/mutex.cpp \
@@ -464,7 +466,7 @@ $(RUST_LIB): $(RUST_SRC) $(FLAVOR_STAMP)
 # large one has no position-independent form worth having; and
 # compiler-builtins' own memcpy and friends, so that a module imports nothing
 # but the kernel's API.
-MODULES = hello modtest slowexit blkload netblk netload sshd hv heapbench edit api tlsbench ipcnet cluster nbs-mds nbs-cs nbsload vnet
+MODULES = hello modtest slowexit blkload netblk netload sshd hv heapbench numabench edit api tlsbench ipcnet cluster nbs-mds nbs-cs nbsload vnet
 MODULE_KO = $(patsubst %,$(OUT)/modules/%.ko,$(MODULES))
 MODULE_RUSTFLAGS_x86_64 = ["-Ccode-model=small","-Crelocation-model=pic"]
 MODULE_RUSTFLAGS_aarch64 = ["-Crelocation-model=pic"]

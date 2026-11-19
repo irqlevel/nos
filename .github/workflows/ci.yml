@@ -45,6 +45,12 @@ jobs:
             ./tests/smoke-arm64.sh --skip-build
           fi
 
+      # The same machine in two NUMA nodes (QEMU's SRAT and SLIT): the
+      # tables read, the free pages spread over both, test_numa
+      - name: Boot smoke test, two NUMA nodes (x86_64, TCG)
+        if: matrix.arch == 'x86_64'
+        run: SMOKE_NUMA=1 ./tests/smoke-test.sh --skip-build
+
       # What a release's system image does on a server (docs/install.md):
       # nos-install pours it onto a partition, the server's GRUB boots nos
       # from there once, by UUID, its sshd lets in the key it was given and

@@ -8,6 +8,9 @@
     "info": {"kind": "read", "title": {"en": "Overview", "ru": "Обзор"}, "result": "info"},
     "cpus": {"kind": "read", "title": {"en": "CPUs", "ru": "Процессоры"}},
     "memory": {"kind": "read", "title": {"en": "Memory", "ru": "Память"}},
+    "numa": {"kind": "read", "title": {"en": "NUMA nodes", "ru": "Узлы NUMA"},
+      "help": {"en": "Each node's CPUs and memory, what of it is free, its share of the huge pool, and its distances. One node on a machine whose firmware names none.",
+               "ru": "Процессоры и память каждого узла, сколько из неё свободно, его доля пула огромных страниц и расстояния до других узлов. Если прошивка узлов не называет, узел один."}},
     "tasks": {"kind": "read", "title": {"en": "Tasks", "ru": "Задачи"}},
     "log": {"kind": "read", "title": {"en": "Kernel log", "ru": "Журнал ядра"},
       "help": {"en": "The messages numbered after since, oldest first.", "ru": "Сообщения с номерами после since, от старых к новым."},
@@ -90,6 +93,23 @@
         "idle_ns": {"type": "duration_ns", "title": {"en": "Idle since boot", "ru": "Простой с загрузки"}}
       },
       "columns": ["cpu", "idle_ns"]
+    },
+    "numa": {
+      "title": {"en": "NUMA nodes", "ru": "Узлы NUMA"},
+      "list": "numa", "items": "nodes", "key": "node",
+      "fields": {
+        "node": {"type": "int", "title": {"en": "Node", "ru": "Узел"}},
+        "domain": {"type": "int", "title": {"en": "Proximity domain", "ru": "Домен близости"}},
+        "cpus": {"type": "string", "title": {"en": "CPUs", "ru": "Процессоры"}},
+        "cpu_count": {"type": "int", "title": {"en": "CPU count", "ru": "Число процессоров"}},
+        "memory_bytes": {"type": "bytes", "title": {"en": "Memory", "ru": "Память"}},
+        "free_bytes": {"type": "bytes", "title": {"en": "Free", "ru": "Свободно"}},
+        "zeroed_bytes": {"type": "bytes", "title": {"en": "Free and zeroed", "ru": "Свободно и обнулено"}},
+        "huge_total_bytes": {"type": "bytes", "title": {"en": "Huge pool", "ru": "Пул огромных страниц"}},
+        "huge_free_bytes": {"type": "bytes", "title": {"en": "Huge pool free", "ru": "Свободно в пуле"}},
+        "distances": {"type": "string", "title": {"en": "Distances", "ru": "Расстояния"}}
+      },
+      "columns": ["node", "cpus", "memory_bytes", "free_bytes", "huge_total_bytes", "huge_free_bytes", "distances"]
     },
     "interrupts": {
       "title": {"en": "Interrupts", "ru": "Прерывания"},

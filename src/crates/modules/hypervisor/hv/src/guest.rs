@@ -122,12 +122,34 @@ pub struct Spec {
     /// made of them (`hv::place::Placement::shape`), once it has one --
     /// each a core of its own until then. Every boot of it is told the same.
     pub shape: Shape,
+    /// The NUMA node its memory is taken from first (`kcore::numa`): the one
+    /// asked for (`numa`), else its first CPU's, once it is placed, on a
+    /// machine of more nodes than one; None -- the node of the CPU building
+    /// it -- on one, and until then.
+    pub node: Option<usize>,
+    /// `node=`, or its vm.toml's: the NUMA node its CPUs are placed on and
+    /// its memory taken from; where its first CPU falls when not said.
+    pub numa: Option<usize>,
     /// `uuid=`, or its vm.toml's: the UUID its SMBIOS gives it -- a random
     /// one at each start when it has none (`identity`).
     pub uuid: Option<[u8; 16]>,
     /// What its SMBIOS calls it, its serial number: its folder's name, or
     /// its number for a VM with none; set as it starts.
     pub name: String,
+}
+
+impl Spec {
+    /// What its placement says of it: the shape its CPUID tells, and the
+    /// node its memory is taken from first -- the one asked for, else its
+    /// first CPU's where there are nodes to choose between.
+    pub fn placed(&mut self, place: &hv::place::Placement) {
+        self.shape = place.shape;
+        self.node = match (self.numa, place.vcpus.first()) {
+            (Some(node), _) => Some(node),
+            (None, Some(&cpu)) if kcore::numa::node_count() > 1 => Some(kcore::numa::cpu_node(cpu)),
+            _ => None,
+        };
+    }
 }
 
 /// A guest's NIC: its port on the switch.
@@ -222,6 +244,8 @@ pub fn words(args: &str, usage: &str) -> Result<Options, String> {
             o.cpus = Some(v.parse().map_err(|_| String::from("cpus= wants a number of CPUs"))?);
         } else if let Some(v) = word.strip_prefix("cpu=") {
             o.cpu = Some(v.parse().map_err(|_| String::from("cpu= wants a CPU number"))?);
+        } else if let Some(v) = word.strip_prefix("node=") {
+            o.node = Some(v.parse().map_err(|_| String::from("node= wants a NUMA node's number"))?);
         } else if let Some(v) = word.strip_prefix("input=") {
             /* `\n`s made newlines: a word of a &str with two of its ASCII
              * bytes made one, so still UTF-8. */
@@ -280,6 +304,13 @@ pub fn spec(o: Options) -> Result<Spec, String> {
     if o.ioapic && cpus < 2 {
         return Err(String::from(
             "ioapic wants cpus=2 or more: a guest of one CPU has no local APIC for it to deliver to"));
+    }
+    /* A node the machine has: its CPUs and its memory are where the guest
+     * goes (`Cores::take`, `Spec::placed`) */
+    let nodes = kcore::numa::node_count();
+    if let Some(node) = o.node.filter(|&n| n as usize >= nodes) {
+        return Err(alloc::format!("node={}: this machine has {} NUMA node{} -- numa says which", node, nodes,
+                                  if nodes == 1 { "" } else { "s" }));
     }
     if o.disks.len() > MAX_DISKS {
         return Err(alloc::format!("at most {} disks", MAX_DISKS));
@@ -345,6 +376,8 @@ pub fn spec(o: Options) -> Result<Spec, String> {
         String::from(if cpus > 1 || !o.pci.is_empty() { DEFAULT_CMDLINE_SMP } else { DEFAULT_CMDLINE })
     });
     Ok(Spec {
+        node: None,
+        numa: o.node.map(|n| n as usize),
         kernel: o.kernel,
         initrd: o.initrd,
         disks: o.disks,
@@ -719,9 +752,10 @@ fn new_machine(machine: &Machine, spec: &Spec, doorbells: Arc<Doorbells>) -> Res
     }
     let (mut guest, cpus) =
         if low_end(spec) == hv::linux::LOW_RAM_END {
-            LinuxGuest::new(machine, spec.mem_bytes, huge, spec.cpus, doorbells, !spec.xapic, spec.ioapic)
+            LinuxGuest::new_on(machine, spec.mem_bytes, huge, spec.cpus, doorbells, !spec.xapic, spec.ioapic, spec.node)
         } else {
-            LinuxGuest::new_holed(machine, spec.mem_bytes, huge, spec.cpus, doorbells, !spec.xapic, spec.ioapic)
+            LinuxGuest::new_holed_on(machine, spec.mem_bytes, huge, spec.cpus, doorbells, !spec.xapic, spec.ioapic,
+                                     spec.node)
         }
             .map_err(|e| match e {
                 /* Another guest took the blocks between the look and the

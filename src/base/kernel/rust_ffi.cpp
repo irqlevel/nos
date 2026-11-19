@@ -38,6 +38,7 @@
 #include <drivers/hpet.h>
 #include <drivers/acpi.h>
 #include "parameters.h"
+#include "numa.h"
 #include "version_gen.h"
 #include "dmesg.h"
 #include "module.h"
@@ -918,11 +919,109 @@ unsigned long kernel_frame_alloc()
     return page ? page->get_phy_address() : 0;
 }
 
+/* A node the caller names, held to the machine's: one past them is the
+   calling CPU's -- a preference, as every node of an allocation is */
+static unsigned long frame_node(unsigned long node)
+{
+    auto& numa = kernel::Numa::get_instance();
+    return (node < numa.get_node_count()) ? node : numa.get_current_node();
+}
+
+/* kernel_frame_alloc's, NUMA node `node`'s first, then the nearest's */
+unsigned long kernel_frame_alloc_on(unsigned long node)
+{
+    auto& pt = kernel::mm::PageTable::get_instance();
+    kernel::mm::Page* page = pt.alloc_page_keeping_on(frame_node(node), pt.get_kernel_reserve_pages());
+    return page ? page->get_phy_address() : 0;
+}
+
 /* A block of the huge pool, zeroed: its address, or 0 when the pool has
    none free -- or is not there, hugepages= not given. */
 unsigned long kernel_frame_alloc_huge()
 {
     return kernel::mm::PageTable::get_instance().alloc_huge_frame();
+}
+
+/* kernel_frame_alloc_huge's, node `node`'s blocks first */
+unsigned long kernel_frame_alloc_huge_on(unsigned long node)
+{
+    return kernel::mm::PageTable::get_instance().alloc_huge_frame_on(frame_node(node));
+}
+
+/* ---- NUMA: the topology, values only (kcore::numa) ---- */
+
+unsigned long kernel_numa_node_count()
+{
+    return kernel::Numa::get_instance().get_node_count();
+}
+
+unsigned long kernel_numa_cpu_node(unsigned long cpu)
+{
+    return kernel::Numa::get_instance().get_cpu_node(cpu);
+}
+
+unsigned long kernel_numa_node_cpus(unsigned long node)
+{
+    return kernel::Numa::get_instance().get_node_cpus(node);
+}
+
+unsigned int kernel_numa_distance(unsigned long from, unsigned long to)
+{
+    return kernel::Numa::get_instance().get_distance(from, to);
+}
+
+unsigned long kernel_numa_phys_node(unsigned long phys)
+{
+    return kernel::Numa::get_instance().get_phys_node(phys);
+}
+
+unsigned long kernel_numa_node_free(unsigned long node)
+{
+    ulong free = 0;
+    ulong zeroed = 0;
+    kernel::mm::PageTable::get_instance().get_node_free(node, free, zeroed);
+    return free;
+}
+
+/* A node at one moment: ffi::numa::NumaNode, field for field */
+struct RustNumaNode
+{
+    unsigned long long domain;
+    unsigned long long cpus;
+    unsigned long long usable_bytes;
+    unsigned long long free_pages;
+    unsigned long long zeroed_pages;
+    unsigned long long huge_blocks;
+    unsigned long long huge_free;
+};
+
+/* As many words as ffi::numa::NumaNode, which checks the same */
+static_assert(sizeof(RustNumaNode) == 7 * sizeof(unsigned long long), "RustNumaNode is not ffi's NumaNode");
+
+int kernel_numa_node_info(unsigned long node, RustNumaNode* out)
+{
+    if (out == nullptr)
+        return 0;
+    *out = RustNumaNode{};
+    auto& numa = kernel::Numa::get_instance();
+    if (node >= numa.get_node_count())
+        return 0;
+
+    auto& pt = kernel::mm::PageTable::get_instance();
+    ulong free = 0;
+    ulong zeroed = 0;
+    ulong blocks = 0;
+    ulong blocks_free = 0;
+    pt.get_node_free(node, free, zeroed);
+    pt.get_node_huge_pool(node, blocks, blocks_free);
+    out->domain = numa.get_node_domain(node);
+    out->cpus = numa.get_node_cpus(node);
+    out->usable_bytes = pt.get_node_usable_bytes(node);
+    out->free_pages = free;
+    out->zeroed_pages = zeroed;
+    out->huge_blocks = blocks;
+    out->huge_free = blocks_free;
+    return 1;
 }
 
 /* Back into the pool: a panic for an address that is no block of it, or

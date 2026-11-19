@@ -268,7 +268,7 @@ private:
        eleven of them SSDTs, and the count moves with every BIOS revision --
        and a slot of the window held is one every page allocation after it
        goes without. */
-    static const size_t MAX_TABLES = 6;
+    static const size_t MAX_TABLES = 8;
     ACPISDTHeader* table_[MAX_TABLES];
     u32 table_length_[MAX_TABLES];
 
@@ -534,6 +534,34 @@ private:
     static const size_t MCFG_ENTRY_BYTES = 16;
 
     void parse_mcfg();
+
+    /* The SRAT (ACPI 6.5, 5.2.16): after the header four bytes the spec
+       has as 1 and eight reserved, then structures of a type and a length
+       each -- a CPU by its local APIC id (16 bytes) or its x2APIC id (24),
+       or a range of memory (40), in a proximity domain, enabled by bit 0 of
+       their flags. A CPU's entry gives its domain's low byte, and from the
+       table's revision 2 on the other three after its SAPIC EID. What it
+       says goes to Numa, which the kernel seals once the tables are read. */
+    static const size_t SRAT_BODY_BYTES = 12;
+    static const size_t SRAT_STRUCT_HEADER_BYTES = 2;
+    static const u8 SRAT_TYPE_LAPIC = 0;
+    static const u8 SRAT_TYPE_MEMORY = 1;
+    static const u8 SRAT_TYPE_X2APIC = 2;
+    static const size_t SRAT_LAPIC_BYTES = 16;
+    static const size_t SRAT_MEMORY_BYTES = 40;
+    static const size_t SRAT_X2APIC_BYTES = 24;
+    static const u32 SRAT_ENABLED = 1 << 0;
+    static const u8 SRAT_WIDE_DOMAIN_REVISION = 2;
+
+    void parse_srat();
+
+    /* The SLIT (5.2.17): the number of localities, eight bytes, and then a
+       byte a pair of them, row by row -- the distance from the row's to the
+       column's, a locality being a proximity domain by its number. Read after
+       the SRAT, for the domains it named. */
+    static const size_t SLIT_BODY_BYTES = 8;
+
+    void parse_slit();
 
     /* FADT-derived values */
     ulong pm1a_cnt_port_;

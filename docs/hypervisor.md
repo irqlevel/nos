@@ -534,7 +534,7 @@ What the VMX backend does not do yet, and says so rather than pretends:
                                 -- and run it on a vCPU -- on cpus of them,
                                 each on a host CPU of its own -- for secs,
                                 then print its console and how it ended
-    hv start <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
+    hv start <kernel> [mem=MiB] [cpus=N] [cpu=N] [node=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
                                 the same, left running until it is stopped;
                                 restart boots it again when it resets itself
     hv list                     the started guests: running or how they ended,
@@ -661,6 +661,13 @@ Two rules make it the one place that decides what a guest can reach:
   has that as a type's invariant rather than a comment's promise.
 
 ### How much of it, and where
+
+On a machine of several NUMA nodes, every frame and every block of the huge
+pool is taken from the node of the guest's first vCPU first, the nearest
+node's when it has none ([NUMA](numa.md)): its placement sets the node
+(`Spec::placed`), and `LinuxGuest::new_on` hands it to the guest's memory
+(`GuestMemory::place_on`). `hv start` says the node, and how much of the
+memory the allocator found there (`its memory node 1's (100%)`).
 
 A Linux guest has from 64 MiB to 512 GiB (`mem=`, in MiB; `memory =` in a
 `vm.toml`), laid out as a PC's firmware lays out a machine's (`linux::Ram`):
@@ -3815,6 +3822,7 @@ console_log = true
 | `cmdline` | its kernel's command line | `console=ttyS0 nolapic`; with several CPUs `console=ttyS0` |
 | `memory` | MiB | 256 |
 | `cpus`, `cpu` | how many CPUs, and the host CPU its first runs on | 1, and where it is placed |
+| `node` | the NUMA node its CPUs are placed on and its memory taken from ([NUMA](numa.md)): a node the machine has, and `cpu` one of its CPUs | where its first CPU falls, its memory with it |
 | `disks` | its disks, `vda` first, `:ro` after one it only reads | none |
 | `net` | a NIC on the guests' switch | `false` |
 | `port` | its port of the switch, 0..15: its address `10.0.100.(port+2)` and its MAC the same at every start | at its first start, the lowest no other VM's vm.toml names and none running holds -- written in, as its `uuid` is |

@@ -289,6 +289,7 @@ SHARED_STRUCTS = [
     ("src/crates/base/ffi/src/system.rs", "TaskInfo", "src/base/kernel/task.h", "TaskSnapshot"),
     ("src/crates/base/ffi/src/system.rs", "ModuleInfo", "src/base/kernel/module.h", "ModuleSnapshot"),
     ("src/crates/base/ffi/src/system.rs", "MemInfo", "src/base/kernel/rust_ffi.cpp", "RustMemInfo"),
+    ("src/crates/base/ffi/src/numa.rs", "NumaNode", "src/base/kernel/rust_ffi.cpp", "RustNumaNode"),
     ("src/crates/base/ffi/src/pci.rs", "PciDeviceInfo", "src/base/kernel/rust_ffi.cpp", "RustPciDeviceInfo"),
     ("src/crates/base/ffi/src/cmd.rs", "CmdTerminal", "src/base/lib/printer.h", "TerminalInfo"),
     ("src/crates/base/ffi/src/random.rs", "HwRandomDraw", "src/base/kernel/rust_ffi.cpp", "HwRandomDraw"),

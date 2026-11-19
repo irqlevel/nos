@@ -537,6 +537,14 @@ Two rules keep it from thrashing:
   and adds one to the other; a difference of one would be reversed on the
   next switch and the task would trade places forever.
 
+On a machine of several NUMA nodes ([NUMA](numa.md)) the lightest queue of
+the task's own node -- its queue's CPU's, or for a first placing its
+creator's -- is weighed beside the lightest of all: a move within the node
+takes the difference of two, one to another node a difference of three
+(`NUMA_MIGRATE_EXTRA`), since the task leaves its memory behind there; a task
+placed for the first time goes to its node's lightest queue unless another
+node has a lighter one. On a machine of one node the two are the same queue.
+
 ### A task left waiting
 
 A task on a run list longer than `TaskQueue::STALL_REPORT_NS` -- five seconds

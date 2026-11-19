@@ -18,6 +18,34 @@ pub fn online_mask() -> u64 {
     ffi::cpu::kernel_cpu_online_mask() as u64
 }
 
+/// A set of CPUs, a bit each, onto `out` as the shell writes one: runs,
+/// `0-11,16-27`, and `none` for none.
+pub fn write_runs(out: &mut dyn core::fmt::Write, mask: u64) -> core::fmt::Result {
+    if mask == 0 {
+        return out.write_str("none");
+    }
+    let mut cpu = 0u32;
+    let mut first = true;
+    while cpu < u64::BITS {
+        if mask & (1u64 << cpu) == 0 {
+            cpu += 1;
+            continue;
+        }
+        let start = cpu;
+        while cpu < u64::BITS && mask & (1u64 << cpu) != 0 {
+            cpu += 1;
+        }
+        let sep = if first { "" } else { "," };
+        first = false;
+        if cpu - 1 == start {
+            write!(out, "{}{}", sep, start)?;
+        } else {
+            write!(out, "{}{}-{}", sep, start, cpu - 1)?;
+        }
+    }
+    Ok(())
+}
+
 /// Run `handler(ctx)` synchronously on the given CPU via IPI, blocking the
 /// calling task until the remote CPU has: true when it ran there, false
 /// when it did not -- `cpu` out of range, not running, or stopped taking

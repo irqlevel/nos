@@ -8,6 +8,11 @@ unsafe extern "C" {
     /// the machine, at least 64 MiB). Sound anywhere -- a frame nobody frees
     /// is a leak, not undefined behaviour.
     pub safe fn kernel_frame_alloc() -> u64;
+    /// As `kernel_frame_alloc`, NUMA node `node`'s pages first, then the
+    /// nearest node's that has one: a guest's memory, on the node of its
+    /// CPUs. A node past the machine's is the calling CPU's. Sound anywhere,
+    /// as `kernel_frame_alloc` is.
+    pub safe fn kernel_frame_alloc_on(node: usize) -> u64;
     /// Back onto the free list. The kernel panics on an address that is not
     /// a page, on a page that is on the free list already, and on a page of
     /// the huge pool.
@@ -17,6 +22,9 @@ unsafe extern "C" {
     /// address, or 0 when the pool has none free or there is no pool. Sound
     /// anywhere, as `kernel_frame_alloc` is.
     pub safe fn kernel_frame_alloc_huge() -> u64;
+    /// As `kernel_frame_alloc_huge`, node `node`'s blocks first, as
+    /// `kernel_frame_alloc_on` takes its pages. Sound anywhere.
+    pub safe fn kernel_frame_alloc_huge_on(node: usize) -> u64;
     /// A block back into the pool. The kernel panics on an address that is
     /// no block of the pool, and on a block that is back already.
     pub fn kernel_frame_free_huge(phys: u64);
