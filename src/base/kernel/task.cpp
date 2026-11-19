@@ -6,6 +6,7 @@
 #include <hal/barrier.h>
 #include "sched.h"
 #include "cpu.h"
+#include "numa.h"
 #include "sched.h"
 #include "preempt.h"
 #include "mutex.h"
@@ -836,9 +837,21 @@ TaskQueue* Task::select_next_task_queue()
     /* Read once: remove() clears it, and the caller may be about to. */
     class TaskQueue* current = task_queue_;
 
+    /* The node it is on: its queue's CPU's, or for a first placing the
+       placing CPU's, where its creator or its waker runs. The lightest queue
+       of that node is weighed beside the lightest of all; on a machine of one
+       node they are the same queue, and this is what it always was. */
+    auto& numa = Numa::get_instance();
+    const bool numa_on = numa.get_node_count() > 1;
+    const ulong home = numa_on ?
+        numa.get_cpu_node(current != nullptr ? current->index() : CpuTable::get_instance().get_current_cpu_id()) : 0;
+
     class TaskQueue* best = nullptr;
     long best_load = 0;
     long best_count = 0;
+    class TaskQueue* local = nullptr;
+    long local_load = 0;
+    long local_count = 0;
 
     for (ulong i = 0; i < MAX_CPUS; i++)
     {
@@ -865,33 +878,50 @@ TaskQueue* Task::select_next_task_queue()
             best_load = load;
             best_count = count;
         }
+        if (!numa_on || numa.get_cpu_node(i) == home)
+        {
+            if (local == nullptr || load < local_load || (load == local_load && count < local_count))
+            {
+                local = &cand;
+                local_load = load;
+                local_count = count;
+            }
+        }
     }
 
     if (best == nullptr)
         return nullptr;
+    /* None of its node's CPUs is one its affinity allows: the others are
+       all there is */
+    if (local == nullptr)
+    {
+        local = best;
+        local_load = best_load;
+    }
 
-    /* Placing a task for the first time: there is nowhere to stay. */
+    /* Placing a task for the first time: there is nowhere to stay -- its
+       node's lightest, unless another node's is lighter still. */
     if (current == nullptr)
-        return best;
-
-    if (best == current)
-        return nullptr;
+        return (local_load <= best_load) ? local : best;
 
     /* On a CPU its affinity no longer has (set_task_affinity): it goes, to
-       the lightest it has, whatever the loads -- with the rule below a task
-       taken off a CPU kept coming back to it while its own queue was the
-       lighter one. */
+       the lightest it has, of its node unless another's is lighter, whatever
+       the loads -- with the rule below a task taken off a CPU kept coming
+       back to it while its own queue was the lighter one. */
     if (!(affinity & (1UL << current->index())))
-        return best;
+        return (local_load <= best_load) ? local : best;
 
     /* This task is runnable and still counted on its own queue, so moving
        it takes one off that side and puts one on the other: a difference of
        one would only be reversed on the next switch, and the task would
-       trade places forever. Move for two. */
-    if (best_load + MIGRATE_THRESHOLD > current->get_runnable_count())
-        return nullptr;
-
-    return best;
+       trade places forever. Move for two -- within its node; to another,
+       for NUMA_MIGRATE_EXTRA more. */
+    const long here = current->get_runnable_count();
+    if (local != current && local_load + MIGRATE_THRESHOLD <= here)
+        return local;
+    if (best != local && best != current && best_load + MIGRATE_THRESHOLD + NUMA_MIGRATE_EXTRA <= here)
+        return best;
+    return nullptr;
 }
 
 TaskTable::TaskTable()

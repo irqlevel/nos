@@ -16,6 +16,7 @@ pub mod http;
 pub mod io;
 pub mod dma;
 pub mod frame;
+pub mod numa;
 pub mod procinfo;
 pub mod random;
 pub mod once;

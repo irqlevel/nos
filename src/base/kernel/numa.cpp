@@ -454,8 +454,9 @@ void Numa::report() const
             bytes += r.end - r.base;
             ranges++;
         }
-        klog(0, "numa: node %lu (domain %lu): CPUs %s (%lu), %lu MiB the firmware placed in %lu ranges", node,
-            (ulong)domain_[node], text, (ulong)__builtin_popcountl(node_cpus_[node]), bytes / consts::MB, ranges);
+        klog(0, "numa: node %lu (domain %lu): CPUs %s (%lu), %lu MiB the firmware placed in %lu range%s", node,
+            (ulong)domain_[node], text, (ulong)__builtin_popcountl(node_cpus_[node]), bytes / consts::MB, ranges,
+            ranges == 1 ? "" : "s");
     }
 
     /* A row a node: what one of 16 nodes fits in a line */

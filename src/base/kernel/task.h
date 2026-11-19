@@ -239,6 +239,13 @@ public:
        whatever the loads. */
     static const long MIGRATE_THRESHOLD = 2;
 
+    /* How much more a move to another NUMA node takes (kernel/numa.h): the
+       task leaves its memory behind -- its stack, what it allocated, each
+       a page from the node it ran on -- every access from then on across
+       the link between the sockets, so a CPU of its own node is moved to for
+       the difference above, and one of another for one more */
+    static const long NUMA_MIGRATE_EXTRA = 1;
+
     /* The queue this task should be on: the lightest one its affinity
        allows, or nullptr to say it is already on the right one. */
     void set_idle();

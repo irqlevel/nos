@@ -400,6 +400,10 @@ impl GuestMemory {
         Some(m)
     }
 
+    /// The NUMA node the kernel's takes RAM from first: nothing to place
+    /// on the host.
+    pub fn place_on(&mut self, _node: usize) {}
+
     pub fn add(&mut self, base: u64, size: u64) -> Result<()> {
         self.add_region(base, size, PAGE, false)
     }
