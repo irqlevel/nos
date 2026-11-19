@@ -1,0 +1,79 @@
+#!/bin/busybox sh
+# tests/gpu-passthrough/install-bare-nvme.sh: the guest's /init, in its
+# initramfs. The NVMe nos gives it -- nos's own old disk on the host -- is
+# driven by the kernel's own nvme modules, loaded in the order
+# /lib/nvme/order names: the first GiB of nos's old root read and summed,
+# 256 MiB of random written to the partition named nos-scratch and read
+# back past the page cache, then the guest's root mounted from the partition
+# named nos-guest and handed over to its /init, the GPU's test
+# (nvidia-guest-init). Every line the runner reads begins "nvme-guest: ".
+/bin/busybox mkdir -p /proc /sys /dev /tmp /newroot /bin
+/bin/busybox --install -s /bin
+export PATH=/bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+say() { echo "nvme-guest: $*"; }
+stop() {
+    say "$*"
+    dmesg | tail -40 | sed 's/^/nvme-guest: dmesg: /'
+    sync
+    echo o > /proc/sysrq-trigger
+    while :; do sleep 1; done
+}
+now() { cut -d' ' -f1 /proc/uptime; }
+rate() { awk -v m="$1" -v a="$2" -v b="$3" 'BEGIN { s = b - a; if (s <= 0) s = 0.01; printf "%.2f s, %.0f MB/s", s, m * 1048576 / s / 1000000 }'; }
+say "$(uname -r), $(nproc) cpus, $(grep MemTotal /proc/meminfo | tr -s ' ')"
+lspci | sed 's/^/nvme-guest: pci /'
+for m in $(cat /lib/nvme/order); do
+    insmod /lib/nvme/$m 2>&1 | sed "s/^/nvme-guest: insmod $m: /"
+done
+say "modules: $(cut -d' ' -f1 /proc/modules | tr '\n' ' ')"
+i=0
+while [ ! -b /dev/nvme0n1 ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i + 1)); done
+[ -b /dev/nvme0n1 ] || stop "no /dev/nvme0n1"
+C=/sys/class/nvme/nvme0
+say "controller: $(tr -s ' ' < $C/model) serial $(tr -d ' ' < $C/serial) firmware $(tr -d ' ' < $C/firmware_rev), $(cat $C/address)"
+i=0
+while [ ! -e /sys/class/block/nvme0n1p4 ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+part() {
+    for p in /sys/class/block/nvme0n1p*; do
+        grep -q "^PARTNAME=$1\$" $p/uevent && { echo /dev/${p##*/}; return; }
+    done
+}
+OLD=$(part nos)
+ROOT=$(part nos-guest)
+SCRATCH=$(part nos-scratch)
+say "partitions: nos $OLD, nos-guest $ROOT, nos-scratch $SCRATCH"
+[ -n "$OLD" ] && [ -n "$ROOT" ] && [ -n "$SCRATCH" ] || stop "a partition is missing"
+
+echo 3 > /proc/sys/vm/drop_caches
+a=$(now)
+S=$(dd if=$OLD bs=1M count=1024 2>/dev/null | sha256sum | cut -d' ' -f1)
+b=$(now)
+say "read: 1024 MiB of $OLD, sha256 $S, $(rate 1024 $a $b)"
+
+dd if=/dev/urandom of=/tmp/pattern bs=1M count=256 2>/dev/null
+W=$(sha256sum /tmp/pattern | cut -d' ' -f1)
+a=$(now)
+dd if=/tmp/pattern of=$SCRATCH bs=1M conv=fsync 2>/dev/null
+e=$?
+b=$(now)
+rm -f /tmp/pattern
+say "write: 256 MiB to $SCRATCH, exit $e, sha256 $W, $(rate 256 $a $b)"
+echo 3 > /proc/sys/vm/drop_caches
+R=$(dd if=$SCRATCH bs=1M count=256 2>/dev/null | sha256sum | cut -d' ' -f1)
+if [ "$R" = "$W" ]; then
+    say "scratch: read back alike"
+else
+    say "scratch: read back DIFFERENT, sha256 $R"
+fi
+grep -i nvme /proc/interrupts | tr -s ' ' | sed 's/^/nvme-guest: irq /'
+
+mount -t ext4 $ROOT /newroot || stop "mount $ROOT failed"
+[ -x /newroot/init ] || stop "no /init on $ROOT"
+say "root: $ROOT mounted, on to its /init"
+mount --move /dev /newroot/dev
+umount /sys
+umount /proc
+exec switch_root /newroot /init

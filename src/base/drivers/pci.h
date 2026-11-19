@@ -27,6 +27,12 @@ public:
         u8 interrupt_line;
         u8 interrupt_pin;
         bool valid;
+        /* Named by guestpci=: kept for guests, shown to no driver of the
+           host's (kernel_pci_get_device, kernel_pci_find_device) */
+        bool kept;
+        /* A driver of the host's has taken it (take): a guest is given it
+           no more. An atomic: set by a driver's probe, read by hv's. */
+        bool driven;
     };
 
     void dump(stdlib::Printer& printer);
@@ -48,10 +54,30 @@ public:
        pointer as start_offset to find subsequent caps of the same type. */
     u8 find_capability(u16 bus, u16 slot, u16 func, u8 cap_id, u8 start_offset = 0);
 
+    /* The extended capability (PCIe 5.0, 7.6) of id cap_id: its offset, 256
+       or past; 0 where the function has none, where its list loops or points
+       outside the space, or where its bus's extended space is not reachable
+       (hal::pci_extended_open) */
+    u16 find_extended_capability(u16 bus, u16 slot, u16 func, u16 cap_id);
+
+    /* How many buses' extended space the scan made reachable */
+    ulong get_extended_bus_count() const { return extended_buses_; }
+
     u32 get_bar(u16 bus, u16 slot, u16 func, u8 bar);
     u8 get_interrupt_line(u16 bus, u16 slot, u16 func);
     u8 get_interrupt_pin(u16 bus, u16 slot, u16 func);
+    /* Bus mastering on, for a driver of the host's: the function taken
+       too (take) */
     void enable_bus_mastering(u16 bus, u16 slot, u16 func);
+
+    /* The function found by the scan at bus:slot.func, kept ones among
+       them; null for one it did not find */
+    DeviceInfo* find_by_bdf(u16 bus, u16 slot, u16 func);
+
+    /* The function a driver of the host's: given to no guest from here on
+       (hv's pci= refuses it). Nothing for one the scan did not find. */
+    void take(u16 bus, u16 slot, u16 func);
+    bool is_driven(u16 bus, u16 slot, u16 func);
 
     static const u16 CLS_UNCLASSIFIED = 0x0;
     static const u16 CLS_MASS_STORAGE_CONTROLLER = 0x1;
@@ -137,4 +163,5 @@ private:
     static const ulong MAX_DEVICES = 256;
     DeviceInfo devices_[MAX_DEVICES];
     ulong device_count_;
+    ulong extended_buses_;
 };

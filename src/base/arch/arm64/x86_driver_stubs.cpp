@@ -122,6 +122,14 @@ bool release(u16 sid)
     return false;
 }
 
+bool reserved(u16 sid, u64& base, u64& limit)
+{
+    (void)sid;
+    (void)base;
+    (void)limit;
+    return false;
+}
+
 /* No interrupt remapping either: nothing is */
 bool remapping()
 {
@@ -232,36 +240,7 @@ void rust_interrupt_stub4() {}
 void rust_interrupt_stub5() {}
 void rust_interrupt_stub6() {}
 void rust_interrupt_stub7() {}
-void rust_msix_stub0() {}
-void rust_msix_stub1() {}
-void rust_msix_stub2() {}
-void rust_msix_stub3() {}
-void rust_msix_stub4() {}
-void rust_msix_stub5() {}
-void rust_msix_stub6() {}
-void rust_msix_stub7() {}
-void rust_msix_stub8() {}
-void rust_msix_stub9() {}
-void rust_msix_stub10() {}
-void rust_msix_stub11() {}
-void rust_msix_stub12() {}
-void rust_msix_stub13() {}
-void rust_msix_stub14() {}
-void rust_msix_stub15() {}
-void rust_msix_stub16() {}
-void rust_msix_stub17() {}
-void rust_msix_stub18() {}
-void rust_msix_stub19() {}
-void rust_msix_stub20() {}
-void rust_msix_stub21() {}
-void rust_msix_stub22() {}
-void rust_msix_stub23() {}
-void rust_msix_stub24() {}
-void rust_msix_stub25() {}
-void rust_msix_stub26() {}
-void rust_msix_stub27() {}
-void rust_msix_stub28() {}
-void rust_msix_stub29() {}
-void rust_msix_stub30() {}
-void rust_msix_stub31() {}
+/* No entry point a slot: arm64's MSI-X are LPIs, dispatched by object */
+void (*const rust_msix_stub_table[RUST_MSIX_SLOT_COUNT])() = {};
+const unsigned long rust_msix_stub_count = RUST_MSIX_SLOT_COUNT;
 }

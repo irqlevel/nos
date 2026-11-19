@@ -72,6 +72,7 @@ use crate::devices::host::{self, HostFunction};
 use crate::devices::ioapic::{self, Pins};
 use crate::devices::net::{self, Net};
 use crate::devices::pci::{self, Function, PciBus};
+use crate::devices::port::{self, RootPort};
 use crate::devices::pm;
 use crate::devices::pvpanic::{self, PvPanic};
 use crate::devices::virtio::Raise;
@@ -131,6 +132,10 @@ pub const MAX_MEM_BYTES: u64 = 512 << 30;
  * registers as memory, none of them hearing of it -- an APIC in xAPIC mode
  * that is not there, with nothing to say so. */
 const _: () = assert!(linux::LOW_RAM_END <= MSIX_PAGES as u64);
+/// The PCI Express configuration space of a guest with the BARs' hole
+/// (`linux::ECAM_BASE`), as its MCFG says it: its base and its last bus.
+const ECAM: (u32, u8) = (linux::ECAM_BASE as u32, (linux::ECAM_BUSES - 1) as u8);
+const _: () = assert!(linux::ECAM_BASE + linux::ECAM_BYTES <= MSIX_PAGES as u64);
 /// The MSI-X entries each kind of device offers: one for configuration
 /// changes and one a queue -- what Linux's virtio-pci asks for, a vector a
 /// queue.
@@ -416,8 +421,9 @@ pub enum Stop {
     /// a bug, or an MMIO device this hypervisor does not emulate.
     Mmio { gpa: u64, rip: u64 },
     /// The CPU, delivering an interrupt or an exception, touched a device's
-    /// page -- the guest's stack or IDT put on the APIC's or the IO-APIC's
-    /// -- which no instruction did, and so none to emulate.
+    /// page -- the guest's stack or IDT put on the APIC's, the IO-APIC's, a
+    /// host's function's or ECAM's -- which no instruction did, and so none
+    /// to emulate.
     MmioDelivering { gpa: u64, rip: u64 },
     /// An INS or an OUTS, to `port`: string port I/O, which no device here
     /// emulates.
@@ -966,21 +972,126 @@ struct Platform {
     /// written, whether a write). A guest's `rdmsr_safe` takes the fault in
     /// silence, so the report is the only place such a thing shows.
     msr_faults: Vec<(u32, u64, bool)>,
-    /// The host's functions the guest holds (`add_host_function`), on the
-    /// slots after every emulated device's.
+    /// The host's functions the guest holds (`add_host_function`), each
+    /// behind its device's root port or on a slot of its own, after every
+    /// emulated device's.
     hosts: Vec<Hosted>,
+    /// The root ports above them (`devices::port`), one a device.
+    ports: Vec<Port>,
+}
+
+/// A function of the host's as the module names it: the host's bus, device
+/// and function -- which say the functions that are one device, behind one
+/// port at their own numbers (`LinuxGuest::add_host_function`). Ordered as
+/// the host's bus orders them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HostAddress {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+}
+
+/// A root port above a host's device: its slot on bus 0, the host's bus and
+/// device it is above, the host's number of the device's first function
+/// given -- function 0 on the bus below -- and the spans its BARs took of
+/// each window, which its windows are made to hold.
+struct Port {
+    slot: usize,
+    device: (u8, u8),
+    first: u8,
+    port: RootPort,
+    low: Option<(u64, u64)>,
+    high: Option<(u64, u64)>,
+}
+
+/// What a configuration access of a host's slot or of a bus below a port
+/// names (`Platform::host_config`): a port, or a host's function, by its
+/// index in `Platform::ports` or `hosts`.
+#[derive(Clone, Copy, Debug)]
+enum HostConfig {
+    Port(usize),
+    Function(usize),
+}
+
+impl Platform {
+    /// What `t` names: on bus 0, a port at its slot or a host's function on
+    /// a slot of its own, function 0 alone; on the bus below a port, as the
+    /// guest numbers it now, device 0's function of that number; None for
+    /// anything else -- nothing answers, and a read reads all ones.
+    fn host_config(&self, t: &pci::HostTarget) -> Option<HostConfig> {
+        if t.bus == 0 {
+            let slot = usize::from(t.device);
+            if t.function != 0 {
+                return None;
+            }
+            if let Some(i) = self.ports.iter().position(|q| q.slot == slot) {
+                return Some(HostConfig::Port(i));
+            }
+            return self.hosts.iter().position(|h| h.port.is_none() && h.slot == slot).map(HostConfig::Function);
+        }
+        let port = self.ports.iter().position(|q| q.port.below(t.bus))?;
+        if t.device != 0 {
+            return None;
+        }
+        self.hosts.iter().position(|h| h.port == Some(port) && h.number == t.function).map(HostConfig::Function)
+    }
+
+    /// The link of the device below port `i`, as its function 0 says it now.
+    fn port_link(&self, i: usize) -> port::Link {
+        self.hosts.iter().find(|h| h.port == Some(i) && h.number == 0).map(|h| h.function.link()).unwrap_or_default()
+    }
+
+    /// A configuration read of `size` bytes at `t`.
+    fn host_config_read(&self, t: &pci::HostTarget, size: usize) -> u32 {
+        let none = if size >= 4 { u32::MAX } else { (1u32 << (8 * size)) - 1 };
+        match self.host_config(t) {
+            Some(HostConfig::Port(i)) => self.ports.get(i).map_or(none, |q| q.port.read(t.at, size, &self.port_link(i))),
+            Some(HostConfig::Function(i)) => self.hosts.get(i).map_or(none, |h| h.function.config_read(t.at, size)),
+            None => none,
+        }
+    }
 }
 
 /// A host's function on the guest's bus, and where its BARs are.
 struct Hosted {
+    /// Where it is: behind its device's port -- an index in `ports` -- as
+    /// function `number` of the bus below, or None, alone on bus 0 at
+    /// `slot`; `slot` is the port's where it has one.
+    port: Option<usize>,
+    number: u8,
     slot: usize,
+    /// Which of the guest's host functions it is, for its ROM's frames
+    /// (`GuestMemory::map_rom`).
+    id: usize,
     function: HostFunction,
     /// Each BAR's mapping in the guest's space now: its address, none while
-    /// the guest has it nowhere the table can map.
-    mapped: [Option<u64>; 6],
-    /// Offsets into BAR0 of the pages trapped rather than mapped: NVIDIA's
-    /// configuration space mirrors.
-    traps: Vec<u64>,
+    /// the guest has it nowhere the table can map; the ROM's (`ROM_BAR`)
+    /// where it is on and trapped there.
+    mapped: [Option<u64>; host::ROM_BAR + 1],
+    /// Each BAR's pages trapped rather than mapped, by their offsets in it:
+    /// NVIDIA's configuration space mirror, MSI-X's table and PBA
+    /// (`HostFunction::traps`).
+    holes: [Vec<u64>; 6],
+}
+
+impl Hosted {
+    /// The BAR and the offset in it of `gpa`, where it is in a page of a BAR
+    /// mapped now that traps.
+    fn trapped_at(&self, gpa: u64) -> Option<(usize, u64)> {
+        const PAGE: u64 = kcore::consts::PAGE_SIZE as u64;
+        let bars = self.function.bars();
+        (0..6).find_map(|bar| {
+            let (base, b) = (self.mapped[bar]?, bars[bar]?);
+            let offset = gpa.checked_sub(base).filter(|&o| o < b.size)?;
+            self.holes[bar].contains(&(offset & !(PAGE - 1))).then_some((bar, offset))
+        })
+    }
+
+    /// The offset of `gpa` in the ROM, where the guest has it on there.
+    fn rom_at(&self, gpa: u64) -> Option<u64> {
+        let (base, size) = (self.mapped[host::ROM_BAR]?, self.function.rom_size()?);
+        gpa.checked_sub(base).filter(|&o| o < size)
+    }
 }
 
 /// Where the host's functions' BARs go: the 32-bit window below the
@@ -1225,7 +1336,7 @@ impl LinuxGuest {
              * told, MAX_GPA at most */
             let top = (1u64 << crate::policy::phys_bits()).min(crate::memory::MAX_GPA);
             let high = ram.end().unwrap_or(top).max(linux::HIGH_RAM_START).div_ceil(1 << 30) << 30;
-            let w = Windows { low: low_end, low_end: u64::from(MSIX_PAGES), high, high_end: top };
+            let w = Windows { low: low_end, low_end: linux::ECAM_BASE, high, high_end: top };
             (w, w)
         });
         if ram.end().is_none_or(|end| end > 1u64 << crate::policy::phys_bits()) {
@@ -1242,6 +1353,11 @@ impl LinuxGuest {
             } else {
                 memory.add(base, size)?;
             }
+        }
+        /* The PCI Express configuration space, every access of it the run
+         * loop's (`ecam`), where the guest has the BARs' hole */
+        if windows.is_some() {
+            memory.trap_range(linux::ECAM_BASE, linux::ECAM_BYTES)?;
         }
 
         let mut vcpus = Vec::new();
@@ -1316,6 +1432,7 @@ impl LinuxGuest {
             port_hist,
             msr_faults,
             hosts: Vec::new(),
+            ports: Vec::new(),
         };
         let all = if n == u64::BITS as usize { u64::MAX } else { (1u64 << n) - 1 };
         let mut parked = Vec::new();
@@ -1489,57 +1606,132 @@ impl LinuxGuest {
         Ok(())
     }
 
-    /// Give it a function of the host's (`devices::host`), on the slot after
-    /// every device given so far: each of its BARs placed where firmware
-    /// would have -- a 32-bit one in the window below the platform's pages,
-    /// a 64-bit one above RAM, each at its size's alignment -- and mapped
-    /// into the nested table straight, but for NVIDIA's mirror of the
-    /// configuration space in BAR0, which traps. Refused for a guest made
-    /// without the PCI hole (`new_holed`), once its tables are laid out, or
-    /// where a BAR does not fit its window.
-    pub fn add_host_function(&mut self, mut function: HostFunction) -> Result<()> {
+    /// Give it a function of the host's (`devices::host`), the host's `at`: a
+    /// PCIe endpoint behind a root port of its device's (`devices::port`) --
+    /// the one of the function before it, where that one is of the same
+    /// device, else a new one on the next slot of bus 0, its bus below
+    /// numbered after the ports before it -- at its number less that of the
+    /// device's first function given, so that the first is function 0, as
+    /// Linux scans for; any other function alone on the next slot of bus 0.
+    /// A device's functions come one after another and in order (the module
+    /// sorts them), or are refused. Each BAR is placed where firmware would
+    /// have: a 64-bit prefetchable one above RAM, any other in the window
+    /// below the platform's pages -- a port's memory window is 32 bits wide
+    /// -- each at its size's alignment, a device's from a fresh MiB of each,
+    /// so that its port's windows, which are whole MiBs, hold its BARs and
+    /// nobody else's; and mapped into the nested table straight, but for the
+    /// pages that trap. Refused for a guest made without the PCI hole
+    /// (`new_holed`), once its tables are laid out, or where a BAR does not
+    /// fit its window.
+    pub fn add_host_function(&mut self, mut function: HostFunction, at: HostAddress) -> Result<()> {
         if self.loaded {
             return Err(Error::BadAddress);
         }
         let Some((ref mut free, _)) = self.windows else { return Err(Error::BadAddress) };
         let mut p = self.platform.lock();
+        let endpoint = matches!(function.pcie_type(), Some(host::PCIE_ENDPOINT | host::PCIE_LEGACY_ENDPOINT));
+        let device = (at.bus, at.device);
+        /* The last port where it is of that one's device, past every
+         * function behind it; no other port may be its device's */
+        let joins = endpoint && p.ports.last().is_some_and(|q| q.device == device);
+        if p.ports.iter().rev().skip(usize::from(joins)).any(|q| q.device == device) {
+            return Err(Error::BadAddress);
+        }
+        let number = match p.ports.last() {
+            Some(q) if joins => {
+                let n = at.function.checked_sub(q.first).ok_or(Error::BadAddress)?;
+                let behind = p.ports.len() - 1;
+                if p.hosts.iter().any(|h| h.port == Some(behind) && h.number >= n) {
+                    return Err(Error::BadAddress);
+                }
+                n
+            }
+            _ => 0,
+        };
+        if !joins {
+            /* Another device: from a fresh MiB of each window */
+            for next in [&mut free.low, &mut free.high] {
+                *next = next.div_ceil(port::WINDOW_ALIGN).checked_mul(port::WINDOW_ALIGN).ok_or(Error::BadAddress)?;
+            }
+        }
         let bars = *function.bars();
-        let mut placed = [None; 6];
+        let mut placed = [None; host::ROM_BAR + 1];
+        let (mut low, mut high) = (None, None);
+        let widen = |span: &mut Option<(u64, u64)>, start: u64, end: u64| {
+            *span = Some(span.map_or((start, end), |(s, e)| (s.min(start), e.max(end))));
+        };
         for (i, bar) in bars.iter().enumerate() {
             let Some(b) = bar else { continue };
             if b.size < kcore::consts::PAGE_SIZE as u64 || !b.size.is_power_of_two() {
                 return Err(Error::BadAddress);
             }
-            /* A 64-bit BAR above RAM, where the big ones fit; a 32-bit one
-             * below 4 GiB, where it has to be */
-            let (next, end) = if b.wide { (&mut free.high, free.high_end) } else { (&mut free.low, free.low_end) };
+            /* A 64-bit prefetchable BAR above RAM, where the big ones fit;
+             * any other below 4 GiB, where a port's memory window is */
+            let above = b.wide && b.prefetchable;
+            let (next, end) = if above { (&mut free.high, free.high_end) } else { (&mut free.low, free.low_end) };
             let at = next.div_ceil(b.size).checked_mul(b.size).ok_or(Error::BadAddress)?;
             if at.checked_add(b.size).is_none_or(|e| e > end) || !function.place(i, at) {
                 return Err(Error::BadAddress);
             }
             *next = at + b.size;
             placed[i] = Some(at);
+            widen(if above { &mut high } else { &mut low }, at, at + b.size);
         }
-        /* NVIDIA's mirror at 0x88000, a page of its own. The old one at
-         * 0x1800 (NV4x) shares its page with registers of the GPU's, which a
-         * trap would have to pass through: not taken, nothing since uses it */
-        let mut traps = Vec::new();
-        if function.nvidia() && bars[0].is_some_and(|b0| u64::from(host::NVIDIA_MIRROR + host::MIRROR_BYTES) <= b0.size)
-        {
-            traps.try_reserve(1).map_err(|_| Error::NoMemory)?;
-            traps.push(u64::from(host::NVIDIA_MIRROR));
+        /* Its ROM below 4 GiB, as firmware places one, and off: it is mapped
+         * only once the guest turns it on (`move_bar`) */
+        if let Some(size) = function.rom_size() {
+            let at = free.low.div_ceil(size).checked_mul(size).ok_or(Error::BadAddress)?;
+            if at.checked_add(size).is_none_or(|e| e > free.low_end) || !function.place_rom(at) {
+                return Err(Error::BadAddress);
+            }
+            free.low = at + size;
+            widen(&mut low, at, at + size);
         }
-        /* The bus's slot first, then the mappings: a failure past here
-         * leaves mapped BARs of a slot that is there, which go with the
-         * guest. */
-        let slot = p.pci.add_host()?;
-        for (i, at) in placed.iter().enumerate() {
-            let (Some(at), Some(b)) = (*at, bars[i]) else { continue };
-            let holes: &[u64] = if i == 0 { &traps } else { &[] };
-            self.memory.map_device(at, b.host, b.size, holes)?;
+        /* The pages that trap rather than map, by BAR: NVIDIA's mirror,
+         * MSI-X's table and PBA (`HostFunction::traps`) */
+        let mut holes: [Vec<u64>; 6] = Default::default();
+        for t in function.traps() {
+            let Some(h) = holes.get_mut(t.bar) else { return Err(Error::BadAddress) };
+            h.try_reserve(1).map_err(|_| Error::NoMemory)?;
+            h.push(t.offset);
         }
         p.hosts.try_reserve(1).map_err(|_| Error::NoMemory)?;
-        p.hosts.push(Hosted { slot: usize::from(slot), function, mapped: placed, traps });
+        /* Its slot first -- its port's, or its own -- then the mappings: a
+         * failure past here leaves mapped BARs of a slot that is there,
+         * which go with the guest */
+        let (port, slot) = if joins {
+            let i = p.ports.len() - 1;
+            (Some(i), p.ports[i].slot)
+        } else if endpoint {
+            let bus = u8::try_from(p.ports.len() + 1).map_err(|_| Error::NoMemory)?;
+            p.ports.try_reserve(1).map_err(|_| Error::NoMemory)?;
+            let slot = usize::from(p.pci.add_host()?);
+            p.ports.push(Port { slot, device, first: at.function, port: RootPort::new(bus, bus), low: None, high: None });
+            (Some(p.ports.len() - 1), slot)
+        } else {
+            (None, usize::from(p.pci.add_host()?))
+        };
+        for (i, at) in placed.iter().enumerate() {
+            let (Some(at), Some(b), Some(holes)) = (*at, bars.get(i).copied().flatten(), holes.get(i)) else { continue };
+            self.memory.map_device(at, b.host, b.size, holes)?;
+        }
+        if let Some(q) = port.and_then(|i| p.ports.get_mut(i)) {
+            for (span, add) in [(&mut q.low, low), (&mut q.high, high)] {
+                if let Some((start, end)) = add {
+                    widen(span, start, end);
+                }
+            }
+            q.port.set_windows(q.low, q.high);
+        }
+        /* More than one function behind its port: each says so */
+        if joins {
+            function.set_multifunction(true);
+            for h in p.hosts.iter_mut().filter(|h| h.port == port) {
+                h.function.set_multifunction(true);
+            }
+        }
+        let id = p.hosts.len();
+        p.hosts.push(Hosted { port, number, slot, id, function, mapped: placed, holes });
         Ok(())
     }
 
@@ -1694,7 +1886,10 @@ impl LinuxGuest {
                 PciDev::Nic(_) => NIC_IRQ,
             })
         });
-        for (slot, irq) in devices.chain(p.hosts.iter().map(|h| (h.slot, HOST_IRQ))) {
+        /* A port's slot for every function behind it: Linux swizzles the
+         * pin of a function below a bridge to the bridge's */
+        let hosts = p.ports.iter().map(|q| q.slot).chain(p.hosts.iter().filter(|h| h.port.is_none()).map(|h| h.slot));
+        for (slot, irq) in devices.chain(hosts.map(|slot| (slot, HOST_IRQ))) {
             let (Some(route), Ok(slot)) = (routes.get_mut(n), u8::try_from(slot)) else {
                 return Err(Error::BadAddress);
             };
@@ -1739,6 +1934,7 @@ impl LinuxGuest {
             mmio: window,
             bars32,
             bars64,
+            ecam: self.windows.is_some().then_some(ECAM),
         };
 
         let mut buf = Vec::new();
@@ -3047,7 +3243,7 @@ impl LinuxGuest {
                      * and is queued still. */
                     let delivering = gc.cpu.backend().event_queued();
                     if data && delivering && ((apic_page && self.has_apic() && gc.lapic.xapic())
-                        || (IoApic::owns(gpa) && self.has_ioapic()))
+                        || (IoApic::owns(gpa) && self.has_ioapic()) || self.memory.is_device(gpa))
                     {
                         gc.counts.mmio += 1;
                         Some(Stop::MmioDelivering { gpa, rip })
@@ -3979,27 +4175,19 @@ impl LinuxGuest {
                 }
                 sync_sci(&mut p, now);
             }
-        } else if let Some((slot, at)) = p.pci.host_target(io.port) {
-            /* A host's function: its own configuration space, as it lays the
-             * guest's view over the device's */
+        } else if let Some(t) = p.pci.host_target(io.port) {
+            /* A host's slot, or a bus below a port: the port's configuration
+             * space, or the function's own as it lays the guest's view over
+             * the device's */
             let size = usize::from(io.size);
-            let Some(h) = p.hosts.iter_mut().find(|h| h.slot == slot) else { return None };
             if io.input {
-                let value = h.function.config_read(at, size);
+                let value = p.host_config_read(&t, size);
                 set_in(v.save_mut(), io.size, value);
                 gc.counts.port_in += 1;
             } else {
                 let value = v.save().rax as u32;
-                let moved = h.function.config_write(at, size, value);
-                let pending = h.function.msi().take_pending();
-                if let Some(m) = moved {
-                    self.move_bar(h, m);
-                }
+                self.host_config_write(&mut p, &t, size, value);
                 gc.counts.port_out += 1;
-                /* Under the platform's lock, which delivering takes nothing of */
-                if let Some((address, data)) = pending {
-                    self.deliver_msi(address, data);
-                }
             }
         } else if PciBus::owns(io.port) {
             if io.input {
@@ -4153,13 +4341,27 @@ impl LinuxGuest {
     /// A page of a BAR that is not one trapped is no access this answers:
     /// the guest stops, said.
     fn host_mmio(&self, gc: &mut GuestCpu, gpa: u64, write: bool) -> Option<Stop> {
+        if self.windows.is_some() && (linux::ECAM_BASE..linux::ECAM_BASE + linux::ECAM_BYTES).contains(&gpa) {
+            return self.ecam(gc, gpa, write);
+        }
         let rip = gc.cpu.backend().save().rip;
         let mut p = self.platform.lock();
-        const PAGE: u64 = kcore::consts::PAGE_SIZE as u64;
-        let found = p.hosts.iter().position(|h| {
-            h.mapped[0].is_some_and(|base| h.traps.iter().any(|&t| gpa >= base + t && gpa - base - t < PAGE))
-        });
-        let Some(i) = found else {
+        /* Its ROM, where the guest has it on: mapped read-only, a copy -- a
+         * write is what comes here, and is nothing */
+        if let Some((i, offset)) = p.hosts.iter().enumerate().find_map(|(i, h)| h.rom_at(gpa).map(|o| (i, o))) {
+            let mut bytes = mmio::Bytes::default();
+            let op = match mmio::begin(gc.cpu.backend(), &self.memory, gpa, write, &mut bytes) {
+                Ok(op) => op,
+                Err(error) => return Some(Stop::MmioInsn { gpa, rip, error, bytes }),
+            };
+            gc.counts.mmio_done += 1;
+            let value = if op.is_write() { 0 } else { p.hosts[i].function.rom_read(offset, usize::from(op.size())) };
+            drop(p);
+            mmio::finish(gc.cpu.backend_mut(), &op, value);
+            return None;
+        }
+        let found = p.hosts.iter().enumerate().find_map(|(i, h)| h.trapped_at(gpa).map(|(bar, at)| (i, bar, at)));
+        let Some((i, bar, offset)) = found else {
             gc.counts.mmio += 1;
             return Some(Stop::Mmio { gpa, rip });
         };
@@ -4170,32 +4372,83 @@ impl LinuxGuest {
         };
         gc.counts.mmio_done += 1;
         let h = &mut p.hosts[i];
-        let base = h.mapped[0].unwrap_or(0);
-        let Some(&trap) = h.traps.iter().find(|&&t| gpa >= base + t && gpa - base - t < PAGE) else {
-            return Some(Stop::Mmio { gpa, rip });
-        };
-        let offset = (gpa - base - trap) as u32;
-        /* Eight bytes as two dwords, each moving what it moves */
-        let halves: &[(u32, usize, u32)] = if op.size() == 8 {
-            &[(offset, 4, op.value as u32), (offset.wrapping_add(4), 4, (op.value >> 32) as u32)]
-        } else {
-            &[(offset, usize::from(op.size()), op.value as u32)]
-        };
-        let mut value = 0u64;
-        for (k, &(at, size, v)) in halves.iter().enumerate() {
-            let (read, moved) = h.function.mirror(trap as u32, at, size, op.is_write(), v);
-            value |= u64::from(read) << (32 * k);
-            if let Some(m) = moved {
-                self.move_bar(h, m);
-            }
+        let (value, moves) = h.function.trapped(bar, offset, usize::from(op.size()), op.is_write(), op.value);
+        for m in moves.iter() {
+            self.move_bar(h, m);
         }
-        let pending = h.function.msi().take_pending();
+        /* What the access let out of what was held pending: under the
+         * platform's lock, which delivering takes nothing of */
+        h.function.messages().send_pending(|address, data| {
+            self.deliver_msi(address, data);
+        });
         drop(p);
         mmio::finish(gc.cpu.backend_mut(), &op, value);
-        if let Some((address, data)) = pending {
-            self.deliver_msi(address, data);
-        }
         None
+    }
+
+    /// An access of the PCI Express configuration space (`ECAM`): the
+    /// function and register its offset names, answered as an access by the
+    /// ports is -- bus 0's emulated functions by the bus
+    /// (`PciBus::function_read`), a host's slot or a bus below a port by
+    /// `Platform::host_config` -- the 4 KiB of the function's space reached,
+    /// the extended space past the 256 bytes the ports reach. An access of
+    /// another size than 1, 2 or 4 bytes, or not aligned to it, reads all
+    /// ones and writes nothing, as one of no function does.
+    fn ecam(&self, gc: &mut GuestCpu, gpa: u64, write: bool) -> Option<Stop> {
+        let rip = gc.cpu.backend().save().rip;
+        let mut bytes = mmio::Bytes::default();
+        let op = match mmio::begin(gc.cpu.backend(), &self.memory, gpa, write, &mut bytes) {
+            Ok(op) => op,
+            Err(error) => return Some(Stop::MmioInsn { gpa, rip, error, bytes }),
+        };
+        gc.counts.mmio_done += 1;
+        let t = pci::ecam_target(gpa - linux::ECAM_BASE);
+        let size = usize::from(op.size());
+        let value = if !matches!(size, 1 | 2 | 4) {
+            if op.is_write() { 0 } else { u64::MAX }
+        } else {
+            let mut p = self.platform.lock();
+            let emulated = t.bus == 0 && !p.pci.is_host(t.device);
+            match (op.is_write(), emulated) {
+                (true, true) => {
+                    p.pci.function_write(t.device, t.function, t.at, size, op.value as u32);
+                    sync_msix(&mut p);
+                    0
+                }
+                (true, false) => {
+                    self.host_config_write(&mut p, &t, size, op.value as u32);
+                    0
+                }
+                (false, true) => u64::from(p.pci.function_read(t.device, t.function, t.at, size)),
+                (false, false) => u64::from(p.host_config_read(&t, size)),
+            }
+        };
+        mmio::finish(gc.cpu.backend_mut(), &op, value);
+        None
+    }
+
+    /// A configuration write of `size` bytes of `value` at `t`: a port's
+    /// kept, a host's function's laid over the device's -- what it moved of
+    /// the BARs mapped anew, what it let out of what was held pending sent,
+    /// under the platform's lock, which delivering takes nothing of.
+    fn host_config_write(&self, p: &mut Platform, t: &pci::HostTarget, size: usize, value: u32) {
+        match p.host_config(t) {
+            Some(HostConfig::Port(i)) => {
+                if let Some(q) = p.ports.get_mut(i) {
+                    q.port.write(t.at, size, value);
+                }
+            }
+            Some(HostConfig::Function(i)) => {
+                let Some(h) = p.hosts.get_mut(i) else { return };
+                if let Some(m) = h.function.config_write(t.at, size, value) {
+                    self.move_bar(h, m);
+                }
+                h.function.messages().send_pending(|address, data| {
+                    self.deliver_msi(address, data);
+                });
+            }
+            None => {}
+        }
     }
 
     /// A host's function's BAR the guest moved: unmapped where it was, and
@@ -4203,6 +4456,18 @@ impl LinuxGuest {
     /// RAM, another BAR or the platform's pages; else left unmapped, and an
     /// access of it stops the guest.
     fn move_bar(&self, h: &mut Hosted, m: host::Moved) {
+        if m.bar == host::ROM_BAR {
+            /* Its ROM: the host's copy, mapped read-only where it is on */
+            let Some(image) = h.function.rom_image() else { return };
+            let size = image.len() as u64;
+            if let Some(at) = h.mapped[host::ROM_BAR].take() {
+                let _ = self.memory.unmap_device(at, size);
+            }
+            if m.to != 0 && m.to % size == 0 && self.memory.map_rom(h.id, m.to, image).is_ok() {
+                h.mapped[host::ROM_BAR] = Some(m.to);
+            }
+            return;
+        }
         let Some(b) = h.function.bars().get(m.bar).copied().flatten() else { return };
         if let Some(at) = h.mapped[m.bar].take() {
             let _ = self.memory.unmap_device(at, b.size);
@@ -4210,8 +4475,7 @@ impl LinuxGuest {
         if m.to == 0 || m.to % b.size != 0 {
             return;
         }
-        let holes: &[u64] = if m.bar == 0 { &h.traps } else { &[] };
-        if self.memory.map_device(m.to, b.host, b.size, holes).is_ok() {
+        if self.memory.map_device(m.to, b.host, b.size, &h.holes[m.bar]).is_ok() {
             h.mapped[m.bar] = Some(m.to);
         }
     }

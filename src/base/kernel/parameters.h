@@ -32,6 +32,8 @@ public:
        taken -- room for root=UUID=<uuid>, which is 46 */
     static const ulong CMDLINE_LEN = 256;
     static const ulong MAX_PARAM_LEN = 48;
+    /* The most functions guestpci= keeps for guests, every list together */
+    static const ulong GUEST_PCI_MAX = 16;
 
     bool is_trace_vga();
     bool is_panic_vga();
@@ -72,6 +74,13 @@ public:
        (Vtd): translation on with every device passed through, the units'
        faults said; off, the default, leaves them as the firmware did */
     bool is_iommu_on();
+
+    /* guestpci=bb:dd.f[,bb:dd.f...] -- x86-64: PCI functions kept for
+       guests: no driver of the host's is shown them (Pci::scan, the
+       kernel_pci_* lookups), so that a VM can be given one whole (hv's
+       pci=). Given more than once, the lists add up, GUEST_PCI_MAX at most;
+       a function past that, or one not written so, is said and not kept */
+    bool is_guest_pci(u16 bus, u16 slot, u16 func);
 
     /* rc=off -- do not run /etc/rc at boot: the way past a command in it
        that keeps the machine from coming up (see Cmd::run_boot_script) */
@@ -286,6 +295,9 @@ private:
     WxProbeMode wx_probe_md_;
     bool usb_off_;
     bool iommu_on_;
+    /* guestpci=: the functions kept for guests, as requester ids */
+    u16 guest_pci_[GUEST_PCI_MAX];
+    ulong guest_pci_count_;
     bool rc_off_;
     ConsoleMode con_mode_;
     DhcpMode dhcp_md_;
@@ -317,6 +329,7 @@ private:
 
     static bool parse_uuid(const char* text, u8* out);
     bool parse_huge_pool(const char* value);
+    bool parse_guest_pci(const char* value);
     bool parse_static_ip(const char* value);
     void check_static_gateway();
 };

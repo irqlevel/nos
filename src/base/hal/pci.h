@@ -3,7 +3,8 @@
 #include <include/types.h>
 
 // PCI config-space access backend + resource assignment. x86: legacy port
-// CAM (0xCF8/0xCFC), BARs are firmware-programmed so assignment is a no-op.
+// CAM (0xCF8/0xCFC) for the first 256 bytes, the MCFG's ECAM past them; BARs
+// are firmware-programmed so assignment is a no-op.
 // arm64: ECAM (pci-host-ecam-generic), and the kernel must assign BARs from
 // the host bridge's MMIO window since bare -kernel boot has no firmware.
 namespace hal
@@ -25,5 +26,15 @@ void pci_config_write8(u16 bus, u16 slot, u16 func, u16 offset, u8 value);
 /* Called once after enumeration with the device array (opaque stride to
    avoid a Pci.h dependency here). x86: no-op. arm64: probe + assign BARs. */
 void pci_assign_resources(void* devices, ulong count, ulong stride);
+
+/* The extended configuration space -- offsets 256 to 4095, PCIe's -- of the
+   functions on `bus` made reachable, checked on the function at slot.func
+   there: true where it is. x86: the MCFG's ECAM window for the bus, mapped
+   once and held to the port CAM's reading of that function; till then, and
+   where there is none, an extended access reads all ones and writes
+   nothing. arm64: ECAM is how every access goes, for the buses mapped. Not
+   safe against the accessors on another CPU: the scan calls it, before any
+   driver reads */
+bool pci_extended_open(u16 bus, u16 slot, u16 func);
 
 }

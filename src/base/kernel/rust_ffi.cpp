@@ -1278,6 +1278,9 @@ static void fill_rust_pci_info(RustPciDeviceInfo* out, const Pci::DeviceInfo* de
     out->irq_pin = dev->interrupt_pin;
 }
 
+/* A driver's lookups -- by ids, by index -- pass over the functions kept
+   for guests (guestpci=): no driver of the host's takes one. hv finds them
+   by their address (kernel_pci_device_at). */
 long kernel_pci_find_device(unsigned short vendor, unsigned short device,
     unsigned long start_index, RustPciDeviceInfo* out)
 {
@@ -1287,7 +1290,7 @@ long kernel_pci_find_device(unsigned short vendor, unsigned short device,
     for (unsigned long i = start_index; i < pci.get_device_count(); i++)
     {
         auto* dev = pci.get_device(i);
-        if (dev && dev->valid && dev->vendor == vendor && dev->device == device)
+        if (dev && dev->valid && !dev->kept && dev->vendor == vendor && dev->device == device)
         {
             fill_rust_pci_info(out, dev);
             return (long)i;
@@ -1306,10 +1309,55 @@ int kernel_pci_get_device(unsigned long index, RustPciDeviceInfo* out)
     if (!out)
         return 0;
     auto* dev = Pci::get_instance().get_device(index);
+    if (!dev || !dev->valid || dev->kept)
+        return 0;
+    fill_rust_pci_info(out, dev);
+    return 1;
+}
+
+/* The index-th function the scan found, a kept one too -- what the hv
+   module's IOMMU groups are made of, where a driver's lookup passes over
+   those: 1, `out` filled; 0 for none */
+int kernel_pci_get_any(unsigned long index, RustPciDeviceInfo* out)
+{
+    if (!out)
+        return 0;
+    auto* dev = Pci::get_instance().get_device(index);
     if (!dev || !dev->valid)
         return 0;
     fill_rust_pci_info(out, dev);
     return 1;
+}
+
+/* The function the scan found at bus:slot.func, a kept one too: 1, `out`
+   filled; 0 for none */
+int kernel_pci_device_at(unsigned short bus, unsigned short slot, unsigned short func, RustPciDeviceInfo* out)
+{
+    if (!out)
+        return 0;
+    auto* dev = Pci::get_instance().find_by_bdf(bus, slot, func);
+    if (!dev)
+        return 0;
+    fill_rust_pci_info(out, dev);
+    return 1;
+}
+
+/* A function a driver of the host's has taken (Pci::take), and one kept for
+   guests: values looked up in the scan's table, sound for any. */
+void kernel_pci_take(unsigned short bus, unsigned short slot, unsigned short func)
+{
+    Pci::get_instance().take(bus, slot, func);
+}
+
+int kernel_pci_driven(unsigned short bus, unsigned short slot, unsigned short func)
+{
+    return Pci::get_instance().is_driven(bus, slot, func) ? 1 : 0;
+}
+
+int kernel_pci_kept(unsigned short bus, unsigned short slot, unsigned short func)
+{
+    auto* dev = Pci::get_instance().find_by_bdf(bus, slot, func);
+    return dev != nullptr && dev->kept ? 1 : 0;
 }
 
 unsigned int kernel_pci_get_bar(unsigned short bus, unsigned short slot,
@@ -1328,6 +1376,12 @@ unsigned char kernel_pci_find_capability(unsigned short bus, unsigned short slot
     unsigned short func, unsigned char cap_id, unsigned char start_offset)
 {
     return Pci::get_instance().find_capability(bus, slot, func, cap_id, start_offset);
+}
+
+unsigned short kernel_pci_find_extended_capability(unsigned short bus, unsigned short slot,
+    unsigned short func, unsigned short cap_id)
+{
+    return Pci::get_instance().find_extended_capability(bus, slot, func, cap_id);
 }
 
 unsigned char kernel_pci_read_config8(unsigned short bus, unsigned short slot,
@@ -1463,6 +1517,19 @@ void kernel_iommu_domain_destroy(unsigned long domain)
 int kernel_iommu_release(unsigned short sid)
 {
     return kernel::iommu::release(sid) ? 1 : 0;
+}
+
+int kernel_iommu_reserved(unsigned short sid, unsigned long long* base, unsigned long long* limit)
+{
+    if (base == nullptr || limit == nullptr)
+        return 0;
+    u64 first = 0;
+    u64 last = 0;
+    if (!kernel::iommu::reserved(sid, first, last))
+        return 0;
+    *base = first;
+    *limit = last;
+    return 1;
 }
 
 /* The screen, as a function about to be given to a guest needs it
@@ -1935,8 +2002,6 @@ void kernel_timer_stop(unsigned long handle)
 
 /* ---- MSI-X callback slots ---- */
 
-static const ulong RUST_MSIX_SLOT_COUNT = 32;
-
 /* Every member initialised, as RustIrqSlot's are. */
 struct RustMsixSlot
 {
@@ -1962,41 +2027,6 @@ struct RustMsixSlot
 
 static RustMsixSlot rust_msix_slots[RUST_MSIX_SLOT_COUNT];
 static kernel::RawRwSpinLock rust_msix_lock;
-
-static kernel::InterruptHandlerFn rust_msix_stub_table[RUST_MSIX_SLOT_COUNT] = {
-    rust_msix_stub0,
-    rust_msix_stub1,
-    rust_msix_stub2,
-    rust_msix_stub3,
-    rust_msix_stub4,
-    rust_msix_stub5,
-    rust_msix_stub6,
-    rust_msix_stub7,
-    rust_msix_stub8,
-    rust_msix_stub9,
-    rust_msix_stub10,
-    rust_msix_stub11,
-    rust_msix_stub12,
-    rust_msix_stub13,
-    rust_msix_stub14,
-    rust_msix_stub15,
-    rust_msix_stub16,
-    rust_msix_stub17,
-    rust_msix_stub18,
-    rust_msix_stub19,
-    rust_msix_stub20,
-    rust_msix_stub21,
-    rust_msix_stub22,
-    rust_msix_stub23,
-    rust_msix_stub24,
-    rust_msix_stub25,
-    rust_msix_stub26,
-    rust_msix_stub27,
-    rust_msix_stub28,
-    rust_msix_stub29,
-    rust_msix_stub30,
-    rust_msix_stub31,
-};
 
 static inline __attribute__((always_inline)) void run_rust_msix(int slot);
 
@@ -2111,6 +2141,11 @@ unsigned long kernel_msix_register_handler(
 {
     if (!handler || !out_vector || msix_handle == 0)
         return 0;
+    /* The arch's entry points as many as the slots: past the table's end
+       an entry point is whatever word comes next */
+    if (unlikely(rust_msix_stub_count != RUST_MSIX_SLOT_COUNT))
+        PANIC("kernel_msix_register_handler: %lu entry points for %lu slots (asm.asm's RUST_MSIX_SLOTS)",
+            rust_msix_stub_count, RUST_MSIX_SLOT_COUNT);
 
     ulong flags = rust_msix_lock.write_lock_irq_save();
     for (ulong i = 0; i < RUST_MSIX_SLOT_COUNT; i++)

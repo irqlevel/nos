@@ -254,6 +254,7 @@ swallowing panic messages whole.
 | `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by, and what a terminal types at the console's line editor, and the tracepoints' ring against a model and a writer thread, and the window `trace latency` reads of the rings against the truth of a schedule played out on them -- and the memory management under everything: the page tables and the physical page allocator past `setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them, and a VM kept in a folder (`hv create`, `hv start <name>`, its `console.log`), in `/vms` and in a folder `insmod /hv.ko vms=` names; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given, and a VM from its folder keeping the port it was given at its first start; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button, a press the guest declines pressed again and answered -- with `--disk`, the one nos's own poweroff presses, the guest's disk left mounted coming back clean; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs; `--mem` past 4064 with `--nos-mem`, a guest with RAM from 4 GiB; `--nos-iso`, nos booted from `make nos-test.iso TEST_ISO_ARGS=hugepages=...`, every guest's memory the huge pool's, 2 MiB an entry of its nested table |
 | `gpu-passthrough-test.py --host root@<machine> [--driver nvidia\|nouveau] [--gpu B:D.F] [--chip ga106]` | x86-64, by hand, on a machine with a GPU, from `nos-test.iso` (`iommu=on udpshell=9100 hugepages=5G`) | a host's PCI function given to a guest: nos under QEMU/KVM with QEMU's VT-d before the real GPU, the GPU in nos's guest -- NVIDIA's own driver, nvidia-smi and CUDA's deviceQuery, vectorAdd and matrixMul; or nouveau, its BARs, BOOT0, its GSP booted by DMA through the domain, a thousand fences on its MSIs |
+| `hv-passthrough-test.py --bzimage <img> --busybox <busybox> [--nvmepoke <bin>]` | x86-64, TCG (CI), from `nos-test.iso` (`iommu=on guestpci=01:00.0,02:00.0`) | a host's PCI function given to a guest with no GPU to hand: QEMU's NVMe and a virtio disk with no FLR behind its VT-d, kept from nos's drivers and given to a Linux guest of nos's by their MSI-X -- read, written, read back, the NVMe by more than one of its vectors, the virtio disk reset by its bridge's secondary bus reset; then, the guest's driver let go of, the controller driven by hand to write where the guest has no RAM (blocked, said with its requester id) and at the interrupt range (refused by nos's interrupt table, said) |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]] [--hvboot]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button; with `--hvboot`, Debian's and Ubuntu's booted by hvboot off their own /boot, nothing taken out of them; with `--create <url>`, a VM made by `hv create` of a cloud image nos fetches itself, booted and provisioned by cloud-init from nos's seed |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 | `trace-test.py [--arch aarch64\|x86_64]` | arm64 (x86-64 where grub-mkrescue is) | the tracepoints and the `trace` command: a boot's `tracepoints=`, records shown merged and in order, the rings made again, wrapped, cleared, frozen, freed; the scheduler's events, and the interrupts' and soft IRQs' -- [Tracepoints](tracing.md) |
@@ -297,7 +298,7 @@ how it works and what it found.
 | `drivers/usb/` | `usb-test.py` (x86-64): types at the kernel through QEMU's monitor |
 | PCI config space and the scan (`drivers/pci.cpp`: a word or a byte written by itself -- `hal::pci_config_write16/8`, the port's own byte on x86-64, the field's address in the ECAM on arm64 -- functions past the first only where function 0 says there are any, the table of devices), an MSI-X table (`drivers/msix.cpp`, `arch/arm64/msix_its.cpp`: where the table is in a BAR somebody mapped, held to the mapping's length by `PageTable::mmio_mapped_span`; an entry enabled again given its new handler; x86-64's vectors taken and given back), a plain MSI (`drivers/msi.cpp`, `kernel_msi_create`: the capability held to the standard config space, off until its vector is enabled, masked across a change where the device can mask it), `Its::map_event` and `rebind_event`, `Idt::set_descriptor` (a live entry is written whole in one store, its upper half the same for every handler -- a BUG_ON otherwise) | the smoke boots: on x86-64 every disk and the NIC are PCI devices found by the scan, bus mastering and MSI-X turned on by word writes, the NVMe and the modern virtio devices on MSI-X vectors -- and by hand under `-machine q35`, and with a device of two functions (`-device virtio-rng-pci,addr=6.0,multifunction=on -device virtio-rng-pci,addr=6.1`), `pci` listing both. arm64 has no PCI device in any gate: by hand, a boot with `-device nvme` under HVF and under TCG -- the two take a word's store to the ECAM by different paths -- with the ITS -- the controller found, bus mastering and MSI-X turned on by word writes, its vector registered and its namespace a block device -- and with `its=off`, where the table is refused, the driver says it has no MSI-X and leaves the device, and the boot goes on; and with `-device ich9-ahci` and a disk on it, an MSI through the ITS -- `its MSI comes` -- and with `its=off` none to be had, the disk polled. x86-64's plain MSI is `ata-test.py --controller ahci`'s. `cpp-fuzz.py --target pagetable` holds `mmio_mapped_span` to its mappings. A table's destructor and an entry enabled twice are run by no gate: the drivers never let go of a table |
 | the DMA remapping units: VT-d (`arch/x86_64/vtd.{h,cpp}`: the units the DMAR names mapped and read, what the firmware left on turned off, and with `iommu=on` each taken over -- the root table and a context table a bus, every device passed through, queued invalidation and its bounded wait, the cache lines of a unit that does not snoop written back, the fault event at `Vtd::FAULT_VECTOR` with its rate and its storm brake; interrupt remapping -- each unit's table, its entries verified against their requester, the IO-APIC's from its DMAR scope, the entry cache invalidated, `MsixTable` and `IoApic` programming handles, IrqBalance moving entries; `iommu`, `iommu block`/`unblock`), and what ACPI keeps of the DMAR -- units, device scopes, reserved regions, whether it was kept whole -- and of the MCFG (`drivers/acpi.cpp`) | `iommu-test.py` (x86-64; see below); the smoke boots, which have no DMAR and must say so in one line, and once more from `nos-test.iso` with `iommu=on` under `SMOKE_MACHINE=q35 SMOKE_EXTRA="-device intel-iommu,intremap=on" SMOKE_MARKER="interrupts remapped, the IO-APIC's from"`, every smoke device working with the unit translating and every interrupt remapped -- on a `UBSAN=1` build too -- and with `intremap=off`; `cpp-fuzz.py --target acpi`, its DMARs and MCFGs cut, overlong and over what is kept, and Hertz's as its firmware wrote them |
-| a host's PCI function given to a guest: what the guest sees of it (`hypervisor/hv/src/devices/host.rs`), the run loop's bus, mirror, BAR moves and MSIs (`add_host_function`, `host_mmio`, `move_bar`, `deliver_msi`), a guest with a hole for its BARs (`LinuxGuest::new_holed`, `linux::plan_below`, `pvh::plan_below`, `Ram::of_below`, `e820_entries`), a BAR in the nested table (`GuestMemory::map_device`, `unmap_device`, the tables' `clear`), the module's claim, reset, domain and MSI (`modules/hypervisor/hv/src/passthrough.rs`, `pci=`, `unsafe_interrupts` where interrupts are not remapped), the screen let go of with its GPU (`kcore::pci::ScreenHold`, `release_screen`), `kcore::iommu` | `hv-fuzz.py` (host, in CI: its `hostfn` target, the `platform` target's guest holding a GPU, the `linux` and `pvh` targets' holed layouts, `config`'s `pci`); `iommu-test.py` (the domains); `gpu-passthrough-test.py --host root@<machine>` (**manual**, x86-64: a real GPU under QEMU/KVM there, from `make nos-test.iso TEST_ISO_ARGS="iommu=on udpshell=9100 hugepages=5G"`: NVIDIA's own driver in nos's guest, nvidia-smi and CUDA's deviceQuery, vectorAdd and matrixMul; `--driver nouveau`, a thousand fences on the GPU's MSIs; plans/gpu-passthrough.md's Hertz) |
+| a host's PCI function given to a guest: what the guest sees of it (`hypervisor/hv/src/devices/host.rs`), the run loop's bus, mirror, BAR moves and MSIs (`add_host_function`, `host_mmio`, `move_bar`, `deliver_msi`), a guest with a hole for its BARs (`LinuxGuest::new_holed`, `linux::plan_below`, `pvh::plan_below`, `Ram::of_below`, `e820_entries`), a BAR in the nested table (`GuestMemory::map_device`, `unmap_device`, the tables' `clear`), the module's claim, reset, domain and interrupts (`modules/hypervisor/hv/src/passthrough.rs`, `pci=`, `unsafe_interrupts` where interrupts are not remapped), its MSI-X: the table and PBA trapped and emulated, the vectors the host's (`host::Messages`, `HostFunction::trapped`, the Rust MSI-X slots and their generated entry points), a function a driver of the host's has taken refused and `guestpci=` keeping the drivers off one (`Pci::take`, `kcore::pci::PciDevice::driven`), the screen let go of with its GPU (`kcore::pci::ScreenHold`, `release_screen`), `kcore::iommu` | `hv-fuzz.py` (host, in CI: its `hostfn` target -- each rule of `host.rs` a mutant it catches, `tests/fuzz/hv/mutants.py host_...` -- the `platform` target's guest holding a GPU, the `linux` and `pvh` targets' holed layouts, `config`'s `pci`); `cpp-fuzz.py --target cmdline` (`guestpci=`); `iommu-test.py` (the domains); `hv-passthrough-test.py` (x86-64, TCG, in CI: QEMU's NVMe in nos's guest by its MSI-X, then driven by hand at addresses nos's IOMMU must refuse; `tests/hv-passthrough/build-guest.sh` makes its guest); `gpu-passthrough-test.py --host root@<machine>` (**manual**, x86-64: a real GPU under QEMU/KVM there, from `make nos-test.iso TEST_ISO_ARGS="iommu=on udpshell=9100 hugepages=5G"`: NVIDIA's own driver in nos's guest, nvidia-smi and CUDA's deviceQuery, vectorAdd and matrixMul; `--driver nouveau`, a thousand fences on the GPU's MSIs; plans/gpu-passthrough.md's Hertz) |
 | a device's line interrupt: `Interrupt::register_level` and `unregister_level` (`kernel/interrupt.cpp`, `arch/arm64/interrupt_arm64.cpp`), the IO-APIC's pins (`arch/x86_64/ioapic.cpp`), `Gic::disable_irq`, the drivers' slots (`kernel_interrupt_register_level`, `kernel_interrupt_unregister`) | the smoke boots, both arches (`test_irq_line_unregister`: two handlers share a spare line, the first leaves, a third joins, all leave and the vector is free, four times over -- on x86 under QEMU alone, told by the firmware's OEM id, since a real IO-APIC's pin that nothing drives may be held asserted; the x86 boot's legacy virtio-scsi is on a line of its own) |
 | the shell's line editors -- the console's (`kernel/line_editor.cpp`), an SSH session's (`common/net/ssh/src/terminal.rs`) -- and what the keyboards send them (`drivers/8042.cpp`, `drivers/usb/src/hid.rs`: an arrow as ESC [ A, Ctrl and a letter as its control byte) | `cpp-fuzz.py --target lineedit` and `net-fuzz.py --target terminal` (host, in CI): each editor held to a model over random keys -- the line Enter runs, and what its screen shows, to the byte; the smoke boots, whose `test_line_editor` types at the console's; `usb-test.py` (x86-64), whose USB keyboard presses Up and ^R. Nothing but QEMU's monitor types at the 8042, by hand |
 | `hv`, `hvarch`, `modules/hypervisor/hv` | `hv-test.py [--arch x86_64\|aarch64]`: loads, turns the CPU's virtualization extension on for every CPU, runs every built-in guest on the first and the last CPU and checks what each did, unloads **without** turning it off, and loads again to ask every CPU what it has -- an `rmmod` that left it on is a freed page the CPU is still saving host state into. x86-64 uses KVM `-cpu host` where the host has an extension -- **AMD-V** on AMD, **Intel VT-x (nested)** on Intel, so both backends are covered -- and TCG `-cpu max` (AMD-V) otherwise, since TCG has no VMX |
@@ -480,7 +481,11 @@ nos takes the unit over and gives the GPU to a guest of its own (`hv boot
 ... pci=01:00.0`, its interrupts remapped: QEMU's unit has `intremap=on`),
 the machine's own kernel, its RAM out of nos's huge pool. The same guest on
 the machine's metal, nos booted once from its own disk:
-`tests/gpu-passthrough/install-bare.sh` (docs/real-hardware.md, Hertz).
+`tests/gpu-passthrough/install-bare.sh` (docs/real-hardware.md, Hertz); and
+with nos's own NVMe given to the guest beside the GPU, the guest booting its
+root from it, nos booted from the free space of the machine's system disk:
+`tests/gpu-passthrough/install-bare-nvme.sh`, whose `--check` sums from the
+machine's own system what the guest read and wrote.
 
 With NVIDIA's own driver, the default: the guest's root is a disk of
 Ubuntu's, debootstrapped there in a chroot with the userspace of the very
@@ -510,6 +515,82 @@ has to power itself off, and nos not panic. On Hertz: 1000 fences, 55 to
 writes through the mirror (a dword at 0x704) to be needed -- put back
 without it, the A2000's thousand fences still signalled -- so the hv-fuzz
 `hostfn` target is what holds that write to reaching the real mirror.
+
+### `hv-passthrough-test.py` -- QEMU's NVMe in nos's guest, and a hostile one
+
+`make nocheck && make nos-test.iso TEST_ISO_ARGS="iommu=on guestpci=01:00.0,01:00.1,02:00.0,03:00.0"`,
+the guest's kernel and nvmepoke made once by
+`tests/hv-passthrough/build-guest.sh <dir>` (Linux 6.18 from kernel.org, its
+digest checked, `tinyconfig` and `tests/hv-passthrough/guest.config`), then
+`tests/hv-passthrough-test.py --bzimage <dir>/bzImage --busybox <busybox>
+--nvmepoke <dir>/nvmepoke`, the busybox a static one for x86-64 (Ubuntu's
+busybox-static, or an initramfs that holds one). On a Mac, the guest is made
+in a container -- `docker run --rm -v $PWD/tests/hv-passthrough:/h:ro -v
+kguest-pass:/out ubuntu:24.04 bash -c 'apt-get update && apt-get install -y
+gcc-x86-64-linux-gnu libc6-dev-amd64-cross make flex bison bc libelf-dev curl
+xz-utils ca-certificates && CROSS_COMPILE=x86_64-linux-gnu- bash /h/build-guest.sh
+/out'` -- and copied out of the volume.
+
+nos boots under TCG on q35 with QEMU's VT-d (`intel-iommu,intremap=on`), an
+NVMe and a virtio disk beside it, functions 0 and 1 of one device behind a
+`pcie-root-port`, and a second virtio disk behind another -- that one with no
+FLR (`x-pcie-flr-init=off`), the virtio disks' DMA through the unit
+(`iommu_platform=on`: QEMU's virtio devices take no IOMMU's translation unless
+told to): the gate holds nos to keeping the three functions from its own
+drivers (`guestpci=`), to taking the unit over with interrupts remapped, and
+to giving them to its guest by their MSI-X (`hv boot ... pci=01:00.0
+pci=01:00.1 pci=02:00.0`: 16 of the NVMe's 65 vectors given), the disk with no
+FLR reset by its bridge's secondary bus reset as it is given and as the guest
+lets go of it. The guest's kernel has ACPI, as a distribution's has: it
+finds its bus by the DSDT, and has to take the MCFG's ECAM where the
+firmware reserved it, covering the host bridge's buses, nothing said
+against it. It has to find a root port of nos's above each device
+(`devices/port.rs`), the NVMe and the disk beside it as functions 0 and 1 of
+the bus below the first, the other disk below the second, each port's link
+its device's, every function's 4 KiB of configuration space -- the extended
+space past the 256 bytes, which ECAM alone reaches -- and the second virtio
+disk's extended list (`aer=on,ats=on`: AER at 0x100, ATS past it) the AER
+alone, the ports' none; and its PCI code has to place every BAR in its
+port's windows, nothing said against them. Isolation: nos has to turn ACS on at the three
+root ports, group the NVMe with the disk beside it -- functions of one device
+with no ACS of their own -- and the other disk alone, and refuse a third root
+port's virtio-rng, its function 0 kept for guests and asked for first, whose
+function 1 is nos's own rng's: one group with a function of the host's; and
+`hv pci`, run first, has to say each of them so -- kept, its reset, its
+interrupts, its group, and why not for those that cannot be given. The
+VT-d fault handler goes round until nothing is pending, and nvmepoke pauses
+between its commands, so that each fault is said before the next comes: a
+unit records so many, and an overflow it flagged while the handler ran was
+left set once -- and a unit with PFO set records nothing again. The guest's own drivers have
+to find the three disks, each by its function's address, and read the
+pattern the runner put on each -- the devices' DMA
+into the guest's RAM, through their domains -- write one of their own and
+read it back past the page cache, and take their interrupts, the NVMe's on
+more than one MSI-X vector; hv has to say it sent the MSIs on, none taken by
+no CPU, and the guest's patterns have to be on the disks' images once QEMU is
+gone. The NVMe has a ROM too (`romfile=`: a 64 KiB image the runner makes,
+0x55AA and a PCI data structure of EFI code, so that SeaBIOS runs none of
+it): nos has to read it and give the guest a copy, and the guest to read it
+through sysfs byte for byte -- by `memcpy_fromio`, a `rep movs` no MMIO
+emulator decodes: the copy is mapped, read-only. Then the hostile phase: the guest lets its driver go and
+drives the controller from user space (`tests/hv-passthrough/nvmepoke.c`:
+BAR0 through sysfs, the admin queues in pages whose addresses
+/proc/self/pagemap gives), each command an Identify whose data the device
+writes where the guest says -- a page of the guest's (written: QEMU's
+vendor id read there), 0x40000000 where the guest has no RAM (blocked: nos
+has to say the write, with the NVMe's requester id; QEMU's NVMe completes the
+command as if its data went), the interrupt range at 0xFEE01FF0 (four
+dwords, each a message in the remappable format naming entry 255 -- the
+last of nos's 256, never handed out first -- or one past the table: refused
+by nos's table, said), and a page of the guest's again: the controller has
+to answer, and nos to go on. Under QEMU 10.2 the whole run is about 15
+seconds on an M-series Mac.
+
+What QEMU's VT-d cannot show: it delivers a compatibility-format message
+whatever CFI says (CFI is never read), and it takes a message a DMA wrote as
+no requester's (SID 0xffff), checking no entry's requester -- so a DMA to
+0xFEE00000 itself, the attack interrupt remapping is for, would be delivered
+to nos under QEMU, and is not made here. Those two are the metal's.
 
 ### `ata-test.py` -- SATA, every sector where it was meant
 
@@ -1254,21 +1335,60 @@ DHCP server over the frames a guest's client sends, well formed and not.
 (`hypervisor/hv/src/devices/host.rs`, docs/hypervisor.md's "A host's PCI
 device") to a model of the real one (`tests/fuzz/hv/src/hostmodel.rs`): a
 register file that judges every write reaching it by the rules the host
-keeps -- its BARs, ROM, header and MSI capability never written; its memory
-decoded, no I/O, INTx off; phantom functions, no snoop and FLR off and the
-host's fields of device control as they were; the link and Advanced
-Features' FLR never written; never out of D0; BAR0 written only within the
-mirror's MSI acknowledgement -- and what the guest reads held to the PCI
-spec's registers, worked out there on their own: a BAR sized reads back its
-size, one moved is said moved from where it was to where it is, the MSI
-programmed is the message the device's interrupt sends, held pending while
-it is off or masked. Its functions are laid out the input's way, and those
-the host cannot give -- a bridge, MSI-X, no MSI, a list that loops or points
-into the header, a second capability of a kind the host keeps -- must be
-refused, and nothing written to them. The `platform` target's guest holds
-such a GPU one run in six: its driver writing and reading it through the bus
-and through the mirror -- eight bytes at a time among it -- moving BAR0 over
-the hole and anywhere, programming its MSI as the device raises it; and the
+keeps -- its BARs, ROM, header, MSI and MSI-X capabilities and every
+capability's id and next pointer never written; its memory decoded, no I/O,
+INTx off; phantom functions, no snoop and FLR off and the host's fields of
+device control as they were; the link and Advanced Features' FLR never
+written; never out of D0; BAR0 written only within the mirror's MSI
+acknowledgement; MSI-X's real table and PBA never reached; a page of its
+BARs reached only where it traps, by an access aligned to its size -- and
+what the guest reads held to the PCI spec's registers, worked out there on
+their own: a BAR sized reads back its size, one moved is said moved from
+where it was to where it is, the MSI or MSI-X entry programmed is the
+message the device's interrupt sends, held pending while it is off or
+masked, the PBA saying so, and sent once when it is not; the capability list
+walked is the real one but the one of MSI and MSI-X not given; MSI-X's table
+as long as the host gives, `MAX_VECTORS` at most; a register of the
+device's in a page the table shares the device's. Its functions are laid
+out the input's way -- MSI-X's table and PBA in a BAR, sharing a page with
+the device's registers or each other's -- and those the host cannot give --
+a bridge, neither MSI-X in BARs given nor MSI, a list that loops or points
+into the header, a second capability of a kind the host keeps, a page that
+cannot be mapped -- must be refused, and nothing written to them. Each rule
+of `host.rs` taken out is caught by it: `tests/fuzz/hv/mutants.py`'s
+`host_*` mutants. `port` holds the root port above a host's device
+(`hypervisor/hv/src/devices/port.rs`) to a model of its own
+(`tests/fuzz/hv/src/portmodel.rs`): every register a PCIe root port of no
+slot shows, the guest's writes kept where it may write and nowhere else, its
+link the device's at each read, its windows holding the spans set and
+nothing a MiB past them, the bus below it the one the guest numbered; ten
+`port_*` mutants, each caught. `hostfn`'s devices have extended lists of
+the input's -- ids shown and hidden, going up or back, now and then one that
+loops, ends below 0x100, or is no list at all (all ones) -- and the judge
+walks each its own way: what the guest reads past the 256 bytes, and the
+list it walks from 0x100, are the device's with the shown ones alone,
+linked; nothing written there. The `pci` target holds ECAM's decode and
+reach to the ports' -- a read of the 256 bytes the ports' read, a write
+their write, the extended space of a function there zeroes -- the `acpi`
+target the MCFG (one, its checksum whole, its window and last bus) and the
+host bridge's buses to ECAM's, the `linux` and `pvh` targets ECAM reserved
+in a holed guest's memory map and in no other's; thirteen mutants of ECAM
+and the extended space, each caught. `groups` holds the module's IOMMU
+groups (`modules/hypervisor/hv/src/groups.rs`) to the tree they are made
+of: random hierarchies -- root ports and devices of several of them,
+switches, endpoints of one function or several, conventional bridges, ACS
+here and there -- their buses numbered depth first, and a judge that knows
+what is below what from the tree, where the code reads it from bus numbers;
+the partition the code makes has to be the judge's exactly, and a bus two
+bridges claim grouped not at all. Seven `groups_*` mutants, each caught. The `platform` target's guest holds
+such a GPU one run in six, behind its port: its driver writing and reading
+it through the bus and through the mirror -- eight bytes at a time among it
+-- moving BAR0 over the hole and anywhere, programming its MSI as the device
+raises it, the port read, written and its bus numbered anew, the GPU's ID
+and the port's read where they are and all ones where nothing is (in a
+guest of one CPU, where no other latches an address meanwhile; three
+`run_*` mutants of the routing, each caught), ECAM reached at any function,
+size and offset -- and no guest of the hole stops at an access of it; and the
 `linux` and `pvh` targets plan a guest with the BARs' hole a quarter of the
 time, its memory map held to RAM it has. Seven mutants of the view -- an
 acknowledgement past the id and next pointer, phantom functions or I/O let

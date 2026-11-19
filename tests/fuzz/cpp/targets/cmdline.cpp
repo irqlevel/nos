@@ -21,6 +21,8 @@
 
 #include <ctype.h>
 
+#include <algorithm>
+
 #include <new>
 
 using kernel::Parameters;
@@ -72,7 +74,28 @@ struct Expected
     /* tracepoints=: the list, as said last, cut to what the field holds */
     std::string tracepoints;
     std::string kept;
+    /* guestpci=: the functions kept for guests, as requester ids -- every
+       list said that read whole, in order, GUEST_PCI_MAX at most */
+    std::vector<u16> guest_pci;
 };
+
+/* guestpci='s one function, "bb:dd.f" in hex: its requester id, or -1 */
+int bdf(const std::string& s)
+{
+    if (s.size() != 7 || s[2] != ':' || s[5] != '.')
+        return -1;
+    for (size_t i : {0, 1, 3, 4, 6})
+    {
+        if (!isxdigit(static_cast<unsigned char>(s[i])))
+            return -1;
+    }
+    const int bus = std::stoi(s.substr(0, 2), nullptr, 16);
+    const int dev = std::stoi(s.substr(3, 2), nullptr, 16);
+    const int fn = std::stoi(s.substr(6, 1), nullptr, 16);
+    if (dev >= 32 || fn >= 8)
+        return -1;
+    return (bus << 8) | (dev << 3) | fn;
+}
 
 bool number(const std::string& s, unsigned long long& out)
 {
@@ -296,6 +319,23 @@ void take(Expected& e, const std::string& token)
     {
         e.tracepoints = value.substr(0, Parameters::TRACEPOINTS_LEN - 1);
     }
+    else if (key == "guestpci")
+    {
+        std::vector<u16> found;
+        size_t at = 0;
+        for (;;)
+        {
+            size_t comma = value.find(',', at);
+            const int rid = bdf(value.substr(at, comma == std::string::npos ? std::string::npos : comma - at));
+            if (rid < 0 || e.guest_pci.size() + found.size() >= Parameters::GUEST_PCI_MAX)
+                return;
+            found.push_back(static_cast<u16>(rid));
+            if (comma == std::string::npos)
+                break;
+            at = comma + 1;
+        }
+        e.guest_pci.insert(e.guest_pci.end(), found.begin(), found.end());
+    }
     else if (key == "loglevel")
     {
         if (number(value, n) && n <= static_cast<unsigned long long>(kernel::MAX_LOG_LEVEL))
@@ -384,7 +424,7 @@ Expected read(const std::string& line)
 const char* const WORDS[] = {"trace", "panic", "its", "usb", "rc", "hwrng", "hwp", "ucode", "idle", "wxprobe", "smp",
                              "maxcpus", "console", "dhcp", "udpshell", "netconsole", "rxpoll", "ubsan", "netframes",
                              "nctail", "loglevel", "root", "fstest", "disklog", "dns", "hugepages", "tracepoints",
-                             "zerofree", "memsites"};
+                             "zerofree", "memsites", "guestpci"};
 
 const char* const HUGE_VALUES[] = {"50%", "100%", "101%", "0%", "1%", "32G", "512G", "513G", "0G", "512M", "524288M",
                                   "524289m", "1g", "2m", "G", "%", "M", "50", "50%%", "0050%", "%50", "18446744073709551615G",
@@ -427,6 +467,44 @@ std::string value(fuzz::Input& in, const std::string& key)
             return in.pick(HUGE_VALUES);
         const char* units[] = {"%", "G", "M", "g", "m", "K", ""};
         return std::to_string(in.chance(16) ? in.value32() : in.below(600)) + in.pick(units);
+    }
+    if (key == "guestpci")
+    {
+        /* A list of functions, mostly right: now and then a device past 31,
+           a function past 7, a digit that is none, a part too long or short,
+           an empty one */
+        std::string list;
+        for (int n = in.range(1, 6); n > 0; n--)
+        {
+            char one[16];
+            const unsigned bus = static_cast<unsigned>(in.below(256));
+            const unsigned dev = static_cast<unsigned>(in.below(in.chance(16) ? 40 : 32));
+            const unsigned fn = static_cast<unsigned>(in.below(in.chance(16) ? 10 : 8));
+            if (in.chance(8))
+                snprintf(one, sizeof(one), "%02X:%02X.%X", bus, dev, fn);
+            else
+                snprintf(one, sizeof(one), "%02x:%02x.%x", bus, dev, fn);
+            std::string part = one;
+            switch (in.chance(16) ? in.below(4) : 9)
+            {
+            case 0:
+                part[in.below(part.size())] = in.pick(STRAYS)[0];
+                break;
+            case 1:
+                part += "0";
+                break;
+            case 2:
+                part.pop_back();
+                break;
+            case 3:
+                part.clear();
+                break;
+            default:
+                break;
+            }
+            list += (list.empty() ? "" : ",") + part;
+        }
+        return list;
     }
     if (key == "tracepoints")
     {
@@ -536,6 +614,23 @@ void run(fuzz::Input& in)
     INVARIANT(p.get_log_level() == e.log_level, "loglevel %d, not %d", p.get_log_level(), e.log_level);
     INVARIANT(std::string(p.get_tracepoints()) == e.tracepoints, "tracepoints '%s', not '%s'", p.get_tracepoints(),
         e.tracepoints.c_str());
+    /* Each function the lists kept is kept, and any other is not -- one past
+       what a requester id holds among them */
+    for (u16 rid : e.guest_pci)
+        INVARIANT(p.is_guest_pci(rid >> 8, (rid >> 3) & 0x1F, rid & 0x7), "guestpci= %04x not kept", rid);
+    for (int k = 0; k < 8; k++)
+    {
+        const u16 bus = static_cast<u16>(in.below(in.chance(16) ? 300 : 256));
+        const u16 dev = static_cast<u16>(in.below(in.chance(16) ? 40 : 32));
+        const u16 fn = static_cast<u16>(in.below(in.chance(16) ? 10 : 8));
+        const bool want = bus < 256 && dev < 32 && fn < 8 &&
+            std::find(e.guest_pci.begin(), e.guest_pci.end(), static_cast<u16>((bus << 8) | (dev << 3) | fn)) !=
+                e.guest_pci.end();
+        INVARIANT(p.is_guest_pci(bus, dev, fn) == want, "guestpci= %x:%x.%x %s kept", bus, dev, fn,
+            want ? "not" : "");
+    }
+    if (!e.guest_pci.empty())
+        fuzz::reached("guestpci= a function kept");
     /* The pool asked of a machine of some size: the share of it, or the
        bytes, whichever the line said last */
     {

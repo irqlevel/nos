@@ -24,8 +24,15 @@
 //! active high, as the 8259's ELCR has it. Every other ISA IRQ is on the pin
 //! of its own number, and the `_PRT`'s numbers are those pins too.
 //!
-//! What is left out would need MMIO -- the HPET, PCIe's ECAM -- or is what a
-//! guest does without: processor objects (there are no C- or P-states to
+//! A guest with the BARs' hole -- one that holds a host's function -- has
+//! PCI Express's configuration space too (ECAM, `Machine::ecam`): an MCFG
+//! naming it, and in the DSDT a motherboard resource (PNP0C02) whose `_CRS`
+//! reserves it, as the PCI Firmware spec has firmware reserve it -- Linux
+//! takes ECAM only where it is (`pci_mmcfg_reserved`) -- and the memory map
+//! reserves it too, for a kernel that looks there first.
+//!
+//! What is left out would need MMIO -- the HPET -- or is what a guest does
+//! without: processor objects (there are no C- or P-states to
 //! describe), the ISA devices (an OS finds a PC's serial port, RTC and timer
 //! where they always are), GPEs. A guest of one CPU, which has no APIC,
 //! gets no MADT; a guest whose kernel has no ACPI, or is told `acpi=off`,
@@ -72,6 +79,9 @@ pub struct Machine<'a> {
     /// below 4 GiB, and above RAM -- a base and a length each.
     pub bars32: Option<(u32, u32)>,
     pub bars64: Option<(u64, u64)>,
+    /// PCI Express's configuration space, where the guest has it: its base,
+    /// below 4 GiB, and the last bus it reaches, from 0.
+    pub ecam: Option<(u32, u8)>,
 }
 
 /* Who made the tables, in every header. */
@@ -88,6 +98,7 @@ const XSDT_REVISION: u8 = 1;
 const FADT_REVISION: u8 = 6;
 const FADT_MINOR: u8 = 3;
 const MADT_REVISION: u8 = 5;
+const MCFG_REVISION: u8 = 1;
 const DSDT_REVISION: u8 = 2;
 const FACS_VERSION: u8 = 2;
 
@@ -184,8 +195,18 @@ const ROOT_CHAR: u8 = b'\\';
 const PKG_LENGTH_BYTES: usize = 3;
 const PKG_LENGTH_TWO_FOLLOW: u8 = 0x80;
 const PKG_LENGTH_MAX: usize = 1 << 20;
-/// PNP0A03, a PCI host bridge, as a compressed EISA ID.
+/// PNP0A03, a PCI host bridge, and PNP0C02, a motherboard's resources, as
+/// compressed EISA IDs.
 const EISA_PNP0A03: u32 = 0x030A_D041;
+const EISA_PNP0C02: u32 = 0x020C_D041;
+/// A fixed range of 32-bit memory, read-write (ACPI 6.5, 6.4.3.4): what the
+/// motherboard's `_CRS` reserves ECAM by -- with the end, its bytes.
+const MEMORY32_FIXED_TAG: u8 = 0x86;
+const MEMORY32_FIXED_BYTES: u16 = 9;
+const MEMORY32_READ_WRITE: u8 = 1;
+const ECAM_CRS_BYTES: u64 = 14;
+/// A bus's MiB of ECAM.
+const ECAM_BUS_SHIFT: u32 = 20;
 /// A `_PRT` entry's address: any function of the slot.
 const PRT_ANY_FUNCTION: u64 = 0xFFFF;
 const PRT_SLOT_SHIFT: u32 = 16;
@@ -326,12 +347,21 @@ pub fn build(m: &Machine, buf: &mut [u8]) -> Option<usize> {
     } else {
         None
     };
+    let mcfg = m.ecam.map(|(base, last)| {
+        o.align(TABLE_ALIGN);
+        let at = o.at;
+        write_mcfg(&mut o, base, last);
+        gpa(at)
+    });
     o.align(TABLE_ALIGN);
     let xsdt = o.at;
     let start = header(&mut o, b"XSDT", XSDT_REVISION);
     o.u64(gpa(fadt));
     if let Some(madt) = madt {
         o.u64(madt);
+    }
+    if let Some(mcfg) = mcfg {
+        o.u64(mcfg);
     }
     seal(&mut o, start);
 
@@ -376,6 +406,19 @@ fn seal(o: &mut Out, start: usize) {
     o.patch(start + 4, &(len as u32).to_le_bytes());
     let sum = checksum(o.since(start));
     o.patch(start + 9, &[sum]);
+}
+
+/// The MCFG (PCI Firmware 3.3, 4.1.2): ECAM's one allocation, at `base`,
+/// of segment 0, buses 0 to `last`.
+fn write_mcfg(o: &mut Out, base: u32, last: u8) {
+    let start = header(o, b"MCFG", MCFG_REVISION);
+    o.put(&[0; 8]);
+    o.u64(u64::from(base));
+    o.u16(0);
+    o.u8(0);
+    o.u8(last);
+    o.u32(0);
+    seal(o, start);
 }
 
 /// The FACS: no firmware waking vector -- nothing is woken -- and a global
@@ -675,16 +718,39 @@ fn write_dsdt(o: &mut Out, m: &Machine) {
     close(o, buffer);
     close(o, panic);
 
+    /* ECAM, where the guest has it: a motherboard resource reserving it */
+    if let Some((base, last)) = m.ecam {
+        o.u8(EXT_OP_PREFIX);
+        let ecam = open(o, DEVICE_OP);
+        o.put(b"ECAM");
+        name(o, b"_HID");
+        int(o, u64::from(EISA_PNP0C02));
+        name(o, b"_CRS");
+        let buffer = open(o, BUFFER_OP);
+        int(o, ECAM_CRS_BYTES);
+        o.u8(MEMORY32_FIXED_TAG);
+        o.u16(MEMORY32_FIXED_BYTES);
+        o.u8(MEMORY32_READ_WRITE);
+        o.u32(base);
+        o.u32((u32::from(last) + 1) << ECAM_BUS_SHIFT);
+        o.u8(END_TAG);
+        o.u8(0);
+        close(o, buffer);
+        close(o, ecam);
+    }
+
     close(o, scope);
     seal(o, start);
 }
 
-/// The host bridge's resources: bus 0 to 255; the configuration ports,
-/// which it decodes itself; all I/O either side of them, for the devices'
-/// BARs and the chipset's ports; and the memory window the MSI-X pages are
-/// in, when there are any.
+/// The host bridge's resources: bus 0 to 255 -- to ECAM's last, where the
+/// guest has it, which has to cover the bridge's (Linux says so, as
+/// firmware's fault) --; the configuration ports, which it decodes itself;
+/// all I/O either side of them, for the devices' BARs and the chipset's
+/// ports; and the memory window the MSI-X pages are in, when there are any.
 fn write_crs(r: &mut Out, m: &Machine) {
-    word_space(r, SPACE_BUS, 0, 0, BUSES - 1, BUSES);
+    let last = m.ecam.map_or(BUSES - 1, |(_, last)| u16::from(last));
+    word_space(r, SPACE_BUS, 0, 0, last, last + 1);
     r.u8(IO_PORT_TAG);
     r.u8(IO_DECODE_16);
     r.u16(CONFIG_PORTS);

@@ -13,6 +13,8 @@ pub mod net;
 pub mod offload;
 #[path = "../../../../src/crates/hypervisor/hv/src/devices/pci.rs"]
 pub mod pci;
+#[path = "../../../../src/crates/hypervisor/hv/src/devices/port.rs"]
+pub mod port;
 #[path = "../../../../src/crates/hypervisor/hv/src/devices/pic.rs"]
 pub mod pic;
 #[path = "../../../../src/crates/hypervisor/hv/src/devices/pit.rs"]

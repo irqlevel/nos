@@ -1,11 +1,13 @@
 #include "pci.h"
 
 #include <kernel/klog.h>
+#include <kernel/parameters.h>
 #include <hal/pci.h>
 #include <kernel/raw_spin_lock.h>
 
 Pci::Pci()
     : device_count_(0)
+    , extended_buses_(0)
 {
     klog(0, "Pci 0x%p", this);
 }
@@ -401,9 +403,58 @@ u8 Pci::get_interrupt_pin(u16 bus, u16 slot, u16 func)
 
 void Pci::enable_bus_mastering(u16 bus, u16 slot, u16 func)
 {
+    take(bus, slot, func);
     u16 cmd = read_word(bus, slot, func, 0x04);
     cmd |= (1 << 2); /* Bus Master Enable */
     write_word(bus, slot, func, 0x04, cmd);
+}
+
+u16 Pci::find_extended_capability(u16 bus, u16 slot, u16 func, u16 cap_id)
+{
+    /* The list (PCIe 5.0, 7.6.2): a header a capability -- its id (15:0),
+       version (19:16) and the next one's offset (31:20) -- from 0x100; a
+       walk no longer than the space has dwords for */
+    static const u16 EXTENDED_FIRST = 0x100;
+    static const u16 EXTENDED_END = 0x1000;
+    static const ulong WALK_MAX = (EXTENDED_END - EXTENDED_FIRST) / 4;
+    static const u32 NEXT_SHIFT = 20;
+    static const u32 NEXT_MASK = 0xFFC;
+    static const u32 ID_MASK = 0xFFFF;
+    u16 at = EXTENDED_FIRST;
+    for (ulong n = 0; n < WALK_MAX && at >= EXTENDED_FIRST && at <= EXTENDED_END - 4; n++)
+    {
+        const u32 head = read_dword(bus, slot, func, at);
+        if (head == 0 || head == 0xFFFFFFFFU)
+            return 0;
+        if ((head & ID_MASK) == cap_id)
+            return at;
+        at = (u16)((head >> NEXT_SHIFT) & NEXT_MASK);
+    }
+    return 0;
+}
+
+Pci::DeviceInfo* Pci::find_by_bdf(u16 bus, u16 slot, u16 func)
+{
+    for (ulong i = 0; i < device_count_; i++)
+    {
+        auto& d = devices_[i];
+        if (d.valid && d.bus == bus && d.slot == slot && d.func == func)
+            return &d;
+    }
+    return nullptr;
+}
+
+void Pci::take(u16 bus, u16 slot, u16 func)
+{
+    auto* d = find_by_bdf(bus, slot, func);
+    if (d != nullptr)
+        __atomic_store_n(&d->driven, true, __ATOMIC_RELEASE);
+}
+
+bool Pci::is_driven(u16 bus, u16 slot, u16 func)
+{
+    auto* d = find_by_bdf(bus, slot, func);
+    return d != nullptr && __atomic_load_n(&d->driven, __ATOMIC_ACQUIRE);
 }
 
 u16 Pci::get_vendor_id(u16 bus, u16 device, u16 function)
@@ -502,15 +553,34 @@ void Pci::scan()
                     d.interrupt_line = get_interrupt_line(bus, slot, function);
                     d.interrupt_pin = get_interrupt_pin(bus, slot, function);
                     d.valid = true;
+                    d.kept = kernel::Parameters::get_instance().is_guest_pci((u16)bus, (u16)slot, (u16)function);
+                    d.driven = false;
+                    if (d.kept)
+                        klog(0, "pci: %02lx:%02lx.%lx kept for guests (guestpci=): no driver of the host's takes it",
+                            (ulong)bus, (ulong)slot, (ulong)function);
                     device_count_++;
                 }
             }
         }
     }
 
+    /* Each bus's extended space, checked on the first function found there:
+       PCIe's capabilities past 256 bytes -- ACS, the Resizable BAR -- which
+       hv reads of a function it gives a guest and of the bridges above it */
+    extended_buses_ = 0;
+    for (ulong i = 0; i < device_count_; i++)
+    {
+        const DeviceInfo& d = devices_[i];
+        if (i > 0 && devices_[i - 1].bus == d.bus)
+            continue;
+        if (hal::pci_extended_open(d.bus, d.slot, d.func))
+            extended_buses_++;
+    }
+    klog(0, "pci: %lu functions; the extended space of %lu of their buses reachable", device_count_, extended_buses_);
+
     /* Said: a device past the table is one no driver is shown */
     if (found > device_count_)
-        klog(0, "pci: %lu devices, %lu of them kept: the rest have no driver looking for them", found,
+        klog(0, "pci: %lu devices, %lu of them in the table: the rest have no driver looking for them", found,
             device_count_);
 
     /* Firmware programs BARs on x86; bare -kernel arm64 must assign them. */
@@ -547,7 +617,9 @@ void Pci::dump(stdlib::Printer& printer)
         if (!d.valid)
             continue;
 
-        printer.printf("vnd %s(0x%lX) dev %s(0x%lX) %s(0x%lX) %s(0x%lX) p 0x%lX r 0x%lX\n",
-            vendor_to_str(d.vendor), (ulong)d.vendor, device_to_str(d.vendor, d.device), (ulong)d.device, class_to_str(d.base_class), (ulong)d.base_class, sub_class_to_str(d.base_class, d.sub_class), (ulong)d.sub_class, (ulong)d.prog_if, (ulong)d.revision_id);
+        printer.printf("%02lx:%02lx.%lx vnd %s(0x%lX) dev %s(0x%lX) %s(0x%lX) %s(0x%lX) p 0x%lX r 0x%lX%s\n",
+            (ulong)d.bus, (ulong)d.slot, (ulong)d.func,
+            vendor_to_str(d.vendor), (ulong)d.vendor, device_to_str(d.vendor, d.device), (ulong)d.device, class_to_str(d.base_class), (ulong)d.base_class, sub_class_to_str(d.base_class, d.sub_class), (ulong)d.sub_class, (ulong)d.prog_if, (ulong)d.revision_id,
+            d.kept ? " kept for guests" : (__atomic_load_n(&d.driven, __ATOMIC_ACQUIRE) ? " a driver's" : ""));
     }
 }

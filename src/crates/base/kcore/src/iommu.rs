@@ -20,6 +20,16 @@ pub fn sid(bus: u16, slot: u16, func: u16) -> u16 {
     ((bus & 0xFF) << 8) | ((slot & 0x1F) << 3) | (func & 0x7)
 }
 
+/// The memory the firmware reserved for `sid`'s DMA, where it did (a DMAR
+/// RMRR, whose scope is it or a bridge above it): its first byte and its
+/// last. Such a device's DMA has to keep reaching the host's memory there,
+/// and it is no guest's.
+pub fn reserved(sid: u16) -> Option<(u64, u64)> {
+    let (mut base, mut limit) = (0u64, 0u64);
+    // SAFETY: both are locals, writable for the call.
+    (unsafe { iommu::kernel_iommu_reserved(sid, &mut base, &mut limit) } != 0).then_some((base, limit))
+}
+
 /// Whether DMA is translated: `iommu=on`, and every unit came up.
 #[inline]
 pub fn on() -> bool {

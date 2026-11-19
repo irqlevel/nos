@@ -20,12 +20,28 @@ unsafe extern "C" {
     ) -> isize;
     pub safe fn kernel_pci_device_count() -> usize;
     pub fn kernel_pci_get_device(index: usize, out: *mut PciDeviceInfo) -> i32;
+    /// The function the scan found at `bus`:`slot`.`func` -- one kept for
+    /// guests too, which the two above pass over: 1, `out` filled; 0 for none.
+    pub fn kernel_pci_device_at(bus: u16, slot: u16, func: u16, out: *mut PciDeviceInfo) -> i32;
+    /// The `index`-th function the scan found, a kept one too: 1, `out`
+    /// filled; 0 for none.
+    pub fn kernel_pci_get_any(index: usize, out: *mut PciDeviceInfo) -> i32;
+    /// The function a driver of the host's: given to no guest from here on.
+    /// A value looked up in the scan's table: sound for any, at any time.
+    pub safe fn kernel_pci_take(bus: u16, slot: u16, func: u16);
+    /// 1 where a driver of the host's has taken the function; and where it
+    /// is kept for guests (`guestpci=`). Lookups, sound for any value.
+    pub safe fn kernel_pci_driven(bus: u16, slot: u16, func: u16) -> i32;
+    pub safe fn kernel_pci_kept(bus: u16, slot: u16, func: u16) -> i32;
     pub fn kernel_pci_get_bar(bus: u16, slot: u16, func: u16, bar: u8) -> u32;
     pub fn kernel_pci_enable_bus_mastering(bus: u16, slot: u16, func: u16);
     pub fn kernel_pci_find_capability(
         bus: u16, slot: u16, func: u16,
         cap_id: u8, start_offset: u8,
     ) -> u8;
+    /// The extended capability of id `cap_id`: its offset, 256 or past; 0 for
+    /// none, or where the function's bus has no extended space reachable.
+    pub fn kernel_pci_find_extended_capability(bus: u16, slot: u16, func: u16, cap_id: u16) -> u16;
     pub fn kernel_pci_read_config8(bus: u16, slot: u16, func: u16, offset: u16) -> u8;
     pub fn kernel_pci_read_config16(bus: u16, slot: u16, func: u16, offset: u16) -> u16;
     pub fn kernel_pci_read_config32(bus: u16, slot: u16, func: u16, offset: u16) -> u32;
