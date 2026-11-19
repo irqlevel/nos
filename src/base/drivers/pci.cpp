@@ -7,6 +7,7 @@
 
 Pci::Pci()
     : device_count_(0)
+    , extended_buses_(0)
 {
     klog(0, "Pci 0x%p", this);
 }
@@ -408,6 +409,30 @@ void Pci::enable_bus_mastering(u16 bus, u16 slot, u16 func)
     write_word(bus, slot, func, 0x04, cmd);
 }
 
+u16 Pci::find_extended_capability(u16 bus, u16 slot, u16 func, u16 cap_id)
+{
+    /* The list (PCIe 5.0, 7.6.2): a header a capability -- its id (15:0),
+       version (19:16) and the next one's offset (31:20) -- from 0x100; a
+       walk no longer than the space has dwords for */
+    static const u16 EXTENDED_FIRST = 0x100;
+    static const u16 EXTENDED_END = 0x1000;
+    static const ulong WALK_MAX = (EXTENDED_END - EXTENDED_FIRST) / 4;
+    static const u32 NEXT_SHIFT = 20;
+    static const u32 NEXT_MASK = 0xFFC;
+    static const u32 ID_MASK = 0xFFFF;
+    u16 at = EXTENDED_FIRST;
+    for (ulong n = 0; n < WALK_MAX && at >= EXTENDED_FIRST && at <= EXTENDED_END - 4; n++)
+    {
+        const u32 head = read_dword(bus, slot, func, at);
+        if (head == 0 || head == 0xFFFFFFFFU)
+            return 0;
+        if ((head & ID_MASK) == cap_id)
+            return at;
+        at = (u16)((head >> NEXT_SHIFT) & NEXT_MASK);
+    }
+    return 0;
+}
+
 Pci::DeviceInfo* Pci::find_by_bdf(u16 bus, u16 slot, u16 func)
 {
     for (ulong i = 0; i < device_count_; i++)
@@ -538,6 +563,20 @@ void Pci::scan()
             }
         }
     }
+
+    /* Each bus's extended space, checked on the first function found there:
+       PCIe's capabilities past 256 bytes -- ACS, the Resizable BAR -- which
+       hv reads of a function it gives a guest and of the bridges above it */
+    extended_buses_ = 0;
+    for (ulong i = 0; i < device_count_; i++)
+    {
+        const DeviceInfo& d = devices_[i];
+        if (i > 0 && devices_[i - 1].bus == d.bus)
+            continue;
+        if (hal::pci_extended_open(d.bus, d.slot, d.func))
+            extended_buses_++;
+    }
+    klog(0, "pci: %lu functions; the extended space of %lu of their buses reachable", device_count_, extended_buses_);
 
     /* Said: a device past the table is one no driver is shown */
     if (found > device_count_)

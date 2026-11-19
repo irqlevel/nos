@@ -81,7 +81,11 @@ reaches no Rust. hv reaches it by the usual three steps (`rust_ffi.cpp`,
   not fit what is kept is said, and the IOMMU is then not turned on.
 - **ECAM on x86** from the MCFG, the CAM kept for what is below 256 bytes
   where there is no MCFG: the extended space has ACS, AER and the Resizable
-  BAR, which a reset loses.
+  BAR, which a reset loses. **Done** (`arch/x86_64/pci_x86.cpp`): the CAM
+  for the first 256 bytes, ECAM past them, a bus mapped as the scan finds a
+  function there and held to the CAM's reading of it, the MCFG's window
+  refused over RAM; an access past 256 bytes with no ECAM reads all ones --
+  it read the header again, the CAM's offset masked to 8 bits.
 - **VT-d** (`arch/x86_64/vtd.{h,cpp}`): each unit's registers mapped; the
   root table and a context table a bus, every host device's entry
   pass-through (TT=10b), so that its driver changes in nothing; queued
@@ -114,7 +118,10 @@ reaches no Rust. hv reaches it by the usual three steps (`rust_ffi.cpp`,
   bridge above (all of its functions then the VM's); the config space saved
   before -- BARs, command, the MSI capability, the PCIe control registers,
   the Resizable BAR's sizes -- and written back after, the function asked
-  for its vendor id until it answers (bounded).
+  for its vendor id until it answers (bounded). **Done** (`ResetPlan`): the
+  bus reset made once a device, by the first of its functions the guest
+  names and before any is set up, where the bus is the device's alone; ACS's
+  controls saved too. `hv-passthrough-test.py`'s virtio disk has no FLR.
 - **MSI** comes from branch `testsrv-boot` (`MsixTable::setup_msi`): the GPU
   has no MSI-X. **MSI-X**, for everything else (an NVMe, a NIC): the real
   table the host's, a vector of the host's an entry given (16 at most), each
@@ -174,7 +181,7 @@ reaches no Rust. hv reaches it by the usual three steps (`rust_ffi.cpp`,
    block` blocks said from the fault event with its requester and reason,
    the machine going on. It found that nos's NVMe driver waits with no
    deadline for a controller that has stopped (QEMU's, on the blocked fetch).
-3. IR **done** (ECAM not yet): each unit taken over gets a table of 256
+3. IR **done**, ECAM too: each unit taken over gets a table of 256
    entries, IRTA set, the entry cache invalidated, IR on with CFI clear --
    compatibility-format interrupts blocked; every entry SVT=01, verified
    against its source's requester id, the IO-APIC's from the DMAR scope

@@ -54,6 +54,15 @@ public:
        pointer as start_offset to find subsequent caps of the same type. */
     u8 find_capability(u16 bus, u16 slot, u16 func, u8 cap_id, u8 start_offset = 0);
 
+    /* The extended capability (PCIe 5.0, 7.6) of id cap_id: its offset, 256
+       or past; 0 where the function has none, where its list loops or points
+       outside the space, or where its bus's extended space is not reachable
+       (hal::pci_extended_open) */
+    u16 find_extended_capability(u16 bus, u16 slot, u16 func, u16 cap_id);
+
+    /* How many buses' extended space the scan made reachable */
+    ulong get_extended_bus_count() const { return extended_buses_; }
+
     u32 get_bar(u16 bus, u16 slot, u16 func, u8 bar);
     u8 get_interrupt_line(u16 bus, u16 slot, u16 func);
     u8 get_interrupt_pin(u16 bus, u16 slot, u16 func);
@@ -154,4 +163,5 @@ private:
     static const ulong MAX_DEVICES = 256;
     DeviceInfo devices_[MAX_DEVICES];
     ulong device_count_;
+    ulong extended_buses_;
 };
