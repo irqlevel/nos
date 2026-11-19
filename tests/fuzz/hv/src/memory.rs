@@ -606,6 +606,15 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// A host function's ROM, a copy mapped read-only, as the real one
+    /// decides it: whole pages, `map_device`'s rules.
+    pub fn map_rom(&self, _id: usize, gpa: u64, image: &[u8]) -> Result<()> {
+        if image.is_empty() || image.len() as u64 % PAGE != 0 {
+            return Err(Error::BadAddress);
+        }
+        self.map_device(gpa, 0, image.len() as u64, &[])
+    }
+
     /// The BAR at `gpa`, `size` long, unmapped: the table's identity anew.
     pub fn unmap_device(&self, gpa: u64, size: u64) -> Result<u64> {
         let mut devices = self.devices.lock().unwrap();

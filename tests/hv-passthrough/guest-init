@@ -39,6 +39,12 @@ disk() {
 }
 disk /dev/nvme0n1 nvme
 disk /dev/vda virtio
+# The NVMe's ROM, the host's copy of it, through sysfs
+if [ -n "$dev" ] && [ -f $dev/rom ]; then
+    echo 1 > $dev/rom
+    say "rom $(md5sum < $dev/rom | cut -d' ' -f1) $(wc -c < $dev/rom)"
+    echo 0 > $dev/rom
+fi
 grep -iE 'nvme|virtio' /proc/interrupts | sed 's/^/pass-guest: irq /'
 if [ -n "$dev" ] && echo "$(basename $dev)" > /sys/bus/pci/drivers/nvme/unbind; then
     say "the driver let go"

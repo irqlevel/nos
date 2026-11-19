@@ -34,7 +34,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::devices::host::{decode_bar, Bar, HostFunction, Messages, Real, MAX_VECTORS, MIRROR_BYTES, NVIDIA_MIRROR,
-                           NVIDIA_MSI_REARM, VENDOR_NVIDIA};
+                           NVIDIA_MSI_REARM, ROM_BAR, ROM_MAX, ROM_MIN, VENDOR_NVIDIA};
 use crate::targets::Input;
 
 const SPACE: usize = 256;
@@ -685,9 +685,17 @@ struct Judge {
     msix_cap: usize,
     /// The capability not shown, and its bytes.
     hidden: Option<(usize, usize)>,
+    /// The ROM given, and the guest's ROM BAR register (PCI 3.0, 6.2.5.2):
+    /// its address bits above the ROM's size and its enable are the guest's.
+    rom: Option<(Vec<u8>, u32)>,
 }
 
 impl Judge {
+    /// Where the guest has the ROM decoded: its address while on, 0 off.
+    fn rom_window(&self) -> u64 {
+        self.rom.as_ref().map_or(0, |&(_, r)| if r & 1 != 0 { u64::from(r & 0xFFFF_F800) } else { 0 })
+    }
+
     fn new(bars: [Option<Bar>; 6], m: &Model) -> Judge {
         let msi_at = m.layout.msi;
         let msi_control = if msi_at != 0 { m.u16_at(msi_at + 2) } else { 0 };
@@ -700,7 +708,7 @@ impl Judge {
         };
         let mut j = Judge { bars, regs: [0; 6], command: 0, line: 0, msi: [0; 0x18], msi_at, msi_control,
                             msi_given: msix.is_none() && msi_at != 0, pending: false, msix,
-                            msix_cap: m.layout.msix, hidden };
+                            msix_cap: m.layout.msix, hidden, rom: None };
         for k in 0..6 {
             j.regs[k] = j.fixed(k);
         }
@@ -840,6 +848,18 @@ impl Judge {
                         if to != from {
                             moved = Some((i, moved.map_or(from, |(_, f, _)| f), to));
                         }
+                    }
+                }
+                0x30..=0x33 if self.rom.is_some() => {
+                    let before = self.rom_window();
+                    let shift = 8 * (b - ROM);
+                    if let Some((image, reg)) = self.rom.as_mut() {
+                        let writable = (!(image.len() as u32 - 1) & 0xFFFF_F800) | 1;
+                        *reg = ((*reg & !(0xFF << shift)) | (u32::from(v) << shift)) & writable;
+                    }
+                    let to = self.rom_window();
+                    if to != before {
+                        moved = Some((ROM_BAR, moved.map_or(before, |(_, f, _)| f), to));
                     }
                 }
                 INTERRUPT_LINE => self.line = v,
@@ -1016,8 +1036,25 @@ pub fn hostfn_target(r: &mut Input) {
     walked(&f, &made, &judge);
     let messages = f.messages();
     invariant!(messages.count() == judge.messages(), "{} messages, not {}", messages.count(), judge.messages());
+    /* Now and then a ROM, as the module reads one: a power of two of 2 KiB
+     * to 2 MiB is given, any other size refused */
+    if r.u8() < 64 {
+        let len = match r.u8() % 8 {
+            0 => r.pick(&[ROM_MIN / 2, ROM_MIN + 512, 3 << 12, ROM_MAX * 2]),
+            _ => ROM_MIN << r.below(6),
+        };
+        let mut image: Vec<u8> = (0..len).map(|k| (k as u8) ^ 0x5A).collect();
+        image[0] = 0x55;
+        image[1] = 0xAA;
+        let given = f.set_rom(image.clone().into_boxed_slice());
+        let want = len.is_power_of_two() && (ROM_MIN..=ROM_MAX).contains(&len);
+        invariant!(given == want, "a ROM of {} bytes {} given", len, if want { "not" } else { "" });
+        if given {
+            judge.rom = Some((image, 0));
+        }
+    }
 
-    while let Some(op) = r.op(14) {
+    while let Some(op) = r.op(15) {
         match op {
             0 | 1 => {
                 /* A register written, as the bus has the guest write it */
@@ -1040,7 +1077,7 @@ pub fn hostfn_target(r: &mut Input) {
                 let mask = if size == 4 { u32::MAX } else { (1u32 << (8 * size)) - 1 };
                 let expect = match dword {
                     d if (BAR0..BAR0 + 24).contains(&d) => Some(judge.regs[(d - BAR0) / 4]),
-                    ROM => Some(0),
+                    ROM => Some(judge.rom.as_ref().map_or(0, |&(_, r)| r)),
                     /* The device's pin, in the dword's second byte */
                     _ if at == INTERRUPT_PIN && size == 1 => {
                         Some(u32::from(made.model.lock().unwrap().space[INTERRUPT_PIN]) << 8)
@@ -1266,6 +1303,36 @@ pub fn hostfn_target(r: &mut Input) {
                 let _ = judge.write(at, size, value);
             }
             12 => walked(&f, &made, &judge),
+            13 if judge.rom.is_some() => {
+                /* The ROM placed, as firmware places it, or read where the
+                 * guest has it: its image, all ones past its end; and where
+                 * it is decoded, as its register says */
+                let size = judge.rom.as_ref().unwrap().0.len() as u64;
+                if r.u8() < 48 {
+                    let gpa = if r.u8() < 200 { (r.u64() & 0xFFFF_FFFF) & !(size - 1) } else { r.u64() };
+                    let ok = f.place_rom(gpa);
+                    let want = gpa % size == 0 && gpa <= u64::from(u32::MAX);
+                    invariant!(ok == want, "the ROM placed at {:#x}: {}", gpa, ok);
+                    if ok {
+                        judge.rom.as_mut().unwrap().1 = gpa as u32 & 0xFFFF_F800;
+                    }
+                }
+                let offset = r.below(size + 16);
+                let len = r.pick(&[1usize, 2, 4, 4, 8]);
+                let got = f.rom_read(offset, len);
+                let image = &judge.rom.as_ref().unwrap().0;
+                let mut want = [0xFFu8; 8];
+                for (k, b) in want.iter_mut().enumerate().take(len) {
+                    if let Some(&byte) = image.get(offset as usize + k) {
+                        *b = byte;
+                    }
+                }
+                let mask = if len == 8 { u64::MAX } else { (1u64 << (8 * len)) - 1 };
+                let want = u64::from_le_bytes(want) & mask;
+                invariant!(got == want, "the ROM's {} bytes at {:#x} read {:#x}, not {:#x}", len, offset, got, want);
+                invariant!(f.rom_window().unwrap_or(0) == judge.rom_window(), "the ROM decoded at {:?}, not {:#x}",
+                           f.rom_window(), judge.rom_window());
+            }
             _ => {
                 /* Anything at all: no panic, and no rule broken -- a page that
                  * does not trap among it */

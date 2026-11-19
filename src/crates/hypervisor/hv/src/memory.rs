@@ -207,6 +207,20 @@ pub struct GuestMemory {
     /// lives, which outlives this table (`run::LinuxGuest`'s fields' order).
     #[cfg(target_arch = "x86_64")]
     devices: Mutex<Vec<(u64, u64)>>,
+    /// Copies of the host's functions' ROMs, a function's frames each by its
+    /// slot (`map_rom`): after the table, so that it goes before they are
+    /// back on the free list.
+    #[cfg(target_arch = "x86_64")]
+    roms: Mutex<Vec<(usize, Vec<Frame>)>>,
+}
+
+/// What a device range of the guest's maps: a BAR of the host's -- where it
+/// is, and the pages of it that trap -- or a copy in frames, read-only.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+enum DevicePages<'a> {
+    Bar(u64, &'a [u64]),
+    Copy(&'a [Frame]),
 }
 
 /// What [`GuestMemory::map_absent`] has made so far.
@@ -264,6 +278,7 @@ impl GuestMemory {
             log: dirty::Log::new(),
             absent: Mutex::new(Absent { frame: None, at: Vec::new() }).ok_or(Error::NoMemory)?,
             devices: Mutex::new(Vec::new()).ok_or(Error::NoMemory)?,
+            roms: Mutex::new(Vec::new()).ok_or(Error::NoMemory)?,
         })
     }
 
@@ -276,6 +291,56 @@ impl GuestMemory {
     /// not whole pages; mapped whole or not at all.
     #[cfg(target_arch = "x86_64")]
     pub fn map_device(&self, gpa: u64, hpa: u64, size: u64, holes: &[u64]) -> Result<()> {
+        self.add_device(gpa, size, DevicePages::Bar(hpa, holes))
+    }
+
+    /// The ROM of the host's function `id` (its slot on the guest's bus) at
+    /// the guest's `gpa`: `image`, whole pages of it, a copy in frames of the
+    /// host's mapped read-only -- a read is the guest's own, a write a nested
+    /// fault the run loop takes for nothing (`run::host_mmio`). The frames
+    /// are made the first time and kept for as long as the table lives, the
+    /// ROM moved or turned off again included: a frame let go of while a
+    /// CPU's TLB may still map it would be the host's memory to read.
+    /// Refused where `map_device` would be; taken out by `unmap_device`.
+    #[cfg(target_arch = "x86_64")]
+    pub fn map_rom(&self, id: usize, gpa: u64, image: &[u8]) -> Result<()> {
+        let size = image.len() as u64;
+        if size == 0 || size % PAGE != 0 {
+            return Err(Error::BadAddress);
+        }
+        let mut roms = self.roms.lock();
+        let at = match roms.iter().position(|(i, _)| *i == id) {
+            Some(at) => at,
+            None => {
+                let mut frames = Vec::new();
+                frames.try_reserve_exact(image.len() / PAGE_SIZE).map_err(|_| Error::NoMemory)?;
+                for piece in image.chunks(PAGE_SIZE) {
+                    let frame = Frame::new().ok_or(Error::NoMemory)?;
+                    if !frame.write(0, piece) {
+                        return Err(Error::NoMemory);
+                    }
+                    frames.push(frame);
+                }
+                roms.try_reserve(1).map_err(|_| Error::NoMemory)?;
+                roms.push((id, frames));
+                roms.len() - 1
+            }
+        };
+        let frames = &roms[at].1;
+        if frames.len() as u64 * PAGE != size {
+            return Err(Error::BadAddress);
+        }
+        self.add_device(gpa, size, DevicePages::Copy(frames))
+    }
+
+    /// `map_device`'s and `map_rom`'s: the range held to the rules, then its
+    /// pages set, and the range noted.
+    #[cfg(target_arch = "x86_64")]
+    fn add_device(&self, gpa: u64, size: u64, pages: DevicePages<'_>) -> Result<()> {
+        let hpa = match pages {
+            DevicePages::Bar(h, _) => h,
+            DevicePages::Copy(_) => 0,
+        };
         let end = gpa.checked_add(size).ok_or(Error::BadAddress)?;
         if size == 0 || gpa % PAGE != 0 || hpa % PAGE != 0 || size % PAGE != 0 || end > MAX_GPA
             || self.regions.iter().any(|r| gpa < r.base + r.size && r.base < end)
@@ -296,7 +361,11 @@ impl GuestMemory {
 
         let mut table = self.table.lock();
         let mut at = 0u64;
-        if let Err(e) = Self::set_device_pages(&mut table, gpa, hpa, size, holes, &mut at) {
+        let set = match pages {
+            DevicePages::Bar(_, holes) => Self::set_device_pages(&mut table, gpa, hpa, size, holes, &mut at),
+            DevicePages::Copy(frames) => Self::set_copy_pages(&mut table, gpa, frames, &mut at),
+        };
+        if let Err(e) = set {
             /* What was set of it taken out again -- nothing in the range was
              * anyone else's -- and dropped by every CPU that may have cached
              * it in the moment it was there */
@@ -337,6 +406,18 @@ impl GuestMemory {
                 table.prepare(gpa + from, PAGE)?;
                 table.set_device(gpa + from, hpa + from)?;
             }
+        }
+        Ok(())
+    }
+
+    /// `map_rom`'s pages set, read-only, `at` how far it got.
+    #[cfg(target_arch = "x86_64")]
+    fn set_copy_pages(table: &mut SecondLevel, gpa: u64, frames: &[Frame], at: &mut u64) -> Result<()> {
+        for frame in frames {
+            let from = *at;
+            *at = from + PAGE;
+            table.prepare(gpa + from, PAGE)?;
+            table.set_ro(gpa + from, frame.phys())?;
         }
         Ok(())
     }
