@@ -44,6 +44,7 @@ Parameters::Parameters()
     , wx_probe_md_(WxProbeOff)
     , usb_off_(false)
     , iommu_on_(false)
+    , guest_pci_count_(0)
     , rc_off_(false)
     , con_mode_(ConsoleBoth)
     , dhcp_md_(DhcpOn)
@@ -71,6 +72,7 @@ Parameters::Parameters()
     , parsed_(false)
 {
     cmdline_[0] = '\0';
+    stdlib::mem_set(guest_pci_, 0, sizeof(guest_pci_));
     stdlib::mem_set(&root_, 0, sizeof(root_));
     root_.mode = RootNone;
     stdlib::mem_set(tracepoints_, 0, sizeof(tracepoints_));
@@ -163,6 +165,88 @@ bool Parameters::is_usb_off()
 bool Parameters::is_iommu_on()
 {
     return iommu_on_;
+}
+
+bool Parameters::is_guest_pci(u16 bus, u16 slot, u16 func)
+{
+    static const u16 BUS_MAX = 0xFF;
+    static const u16 SLOT_MAX = 0x1F;
+    static const u16 FUNC_MAX = 0x7;
+    if (bus > BUS_MAX || slot > SLOT_MAX || func > FUNC_MAX)
+        return false;
+    const u16 rid = (u16)((bus << 8) | (slot << 3) | func);
+    for (ulong i = 0; i < guest_pci_count_; i++)
+    {
+        if (guest_pci_[i] == rid)
+            return true;
+    }
+    return false;
+}
+
+/* A hex digit's value; -1 for any other character. */
+static int hex_digit(char c)
+{
+    static const int TEN = 10;
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + TEN;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + TEN;
+    return -1;
+}
+
+/* "bb:dd.f", the `len` characters at `text`: a bus, a device below 32 and a
+   function below 8, in hex, as their requester id. False for anything else. */
+static bool parse_bdf(const char* text, size_t len, u16& out)
+{
+    static const size_t BDF_LEN = 7;
+    static const int DEVICES = 32;
+    static const int FUNCTIONS = 8;
+    static const int HEX = 16;
+    if (len != BDF_LEN || text[2] != ':' || text[5] != '.')
+        return false;
+    const int b1 = hex_digit(text[0]);
+    const int b0 = hex_digit(text[1]);
+    const int d1 = hex_digit(text[3]);
+    const int d0 = hex_digit(text[4]);
+    const int f = hex_digit(text[6]);
+    if (b1 < 0 || b0 < 0 || d1 < 0 || d0 < 0 || f < 0)
+        return false;
+    const int device = d1 * HEX + d0;
+    if (device >= DEVICES || f >= FUNCTIONS)
+        return false;
+    out = (u16)(((b1 * HEX + b0) << 8) | (device << 3) | f);
+    return true;
+}
+
+/* guestpci='s list, onto what earlier ones kept: every function read before
+   any is kept, so that a list with one bad in it keeps none of it. False for
+   such a list, and for one past GUEST_PCI_MAX. */
+bool Parameters::parse_guest_pci(const char* value)
+{
+    u16 found[GUEST_PCI_MAX];
+    ulong count = 0;
+    const char* at = value;
+    for (;;)
+    {
+        const char* comma = stdlib::str_chr(at, ',');
+        const size_t len = comma ? (size_t)(comma - at) : stdlib::str_len(at);
+        u16 rid = 0;
+        if (!parse_bdf(at, len, rid) || guest_pci_count_ + count >= GUEST_PCI_MAX)
+            return false;
+        found[count] = rid;
+        count++;
+        if (comma == nullptr)
+            break;
+        at = comma + 1;
+    }
+    for (ulong i = 0; i < count; i++)
+    {
+        guest_pci_[guest_pci_count_] = found[i];
+        guest_pci_count_++;
+    }
+    return true;
 }
 
 bool Parameters::is_rc_off()
@@ -600,6 +684,11 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
     else if (stdlib::str_cmp(key, "iommu") == 0)
     {
         iommu_on_ = (stdlib::str_cmp(value, "on") == 0);
+    }
+    else if (stdlib::str_cmp(key, "guestpci") == 0)
+    {
+        if (!parse_guest_pci(value))
+            klog(0, "Invalid guestpci %s: functions as bb:dd.f, a comma between, %lu at most", value, GUEST_PCI_MAX);
     }
     else if (stdlib::str_cmp(key, "rc") == 0)
     {

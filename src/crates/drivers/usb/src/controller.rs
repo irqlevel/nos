@@ -187,7 +187,9 @@ impl Controller {
     /// is not something this driver can drive.
     pub(crate) fn open(index: usize, pci: PciDevice) -> Option<Box<Self>> {
         /* Memory space and bus mastering. Firmware normally leaves both on,
-         * but a controller handed over cold has neither. */
+         * but a controller handed over cold has neither. The host's from
+         * here on: no guest is given it (`take`). */
+        pci.take();
         let command = pci.read_config16(0x04) | (1 << 1) | (1 << 2);
         pci.write_config16(0x04, command);
 

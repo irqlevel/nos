@@ -978,9 +978,24 @@ struct Hosted {
     /// Each BAR's mapping in the guest's space now: its address, none while
     /// the guest has it nowhere the table can map.
     mapped: [Option<u64>; 6],
-    /// Offsets into BAR0 of the pages trapped rather than mapped: NVIDIA's
-    /// configuration space mirrors.
-    traps: Vec<u64>,
+    /// Each BAR's pages trapped rather than mapped, by their offsets in it:
+    /// NVIDIA's configuration space mirror, MSI-X's table and PBA
+    /// (`HostFunction::traps`).
+    holes: [Vec<u64>; 6],
+}
+
+impl Hosted {
+    /// The BAR and the offset in it of `gpa`, where it is in a page of a BAR
+    /// mapped now that traps.
+    fn trapped_at(&self, gpa: u64) -> Option<(usize, u64)> {
+        const PAGE: u64 = kcore::consts::PAGE_SIZE as u64;
+        let bars = self.function.bars();
+        (0..6).find_map(|bar| {
+            let (base, b) = (self.mapped[bar]?, bars[bar]?);
+            let offset = gpa.checked_sub(base).filter(|&o| o < b.size)?;
+            self.holes[bar].contains(&(offset & !(PAGE - 1))).then_some((bar, offset))
+        })
+    }
 }
 
 /// Where the host's functions' BARs go: the 32-bit window below the
@@ -1520,14 +1535,13 @@ impl LinuxGuest {
             *next = at + b.size;
             placed[i] = Some(at);
         }
-        /* NVIDIA's mirror at 0x88000, a page of its own. The old one at
-         * 0x1800 (NV4x) shares its page with registers of the GPU's, which a
-         * trap would have to pass through: not taken, nothing since uses it */
-        let mut traps = Vec::new();
-        if function.nvidia() && bars[0].is_some_and(|b0| u64::from(host::NVIDIA_MIRROR + host::MIRROR_BYTES) <= b0.size)
-        {
-            traps.try_reserve(1).map_err(|_| Error::NoMemory)?;
-            traps.push(u64::from(host::NVIDIA_MIRROR));
+        /* The pages that trap rather than map, by BAR: NVIDIA's mirror,
+         * MSI-X's table and PBA (`HostFunction::traps`) */
+        let mut holes: [Vec<u64>; 6] = Default::default();
+        for t in function.traps() {
+            let Some(h) = holes.get_mut(t.bar) else { return Err(Error::BadAddress) };
+            h.try_reserve(1).map_err(|_| Error::NoMemory)?;
+            h.push(t.offset);
         }
         /* The bus's slot first, then the mappings: a failure past here
          * leaves mapped BARs of a slot that is there, which go with the
@@ -1535,11 +1549,10 @@ impl LinuxGuest {
         let slot = p.pci.add_host()?;
         for (i, at) in placed.iter().enumerate() {
             let (Some(at), Some(b)) = (*at, bars[i]) else { continue };
-            let holes: &[u64] = if i == 0 { &traps } else { &[] };
-            self.memory.map_device(at, b.host, b.size, holes)?;
+            self.memory.map_device(at, b.host, b.size, &holes[i])?;
         }
         p.hosts.try_reserve(1).map_err(|_| Error::NoMemory)?;
-        p.hosts.push(Hosted { slot: usize::from(slot), function, mapped: placed, traps });
+        p.hosts.push(Hosted { slot: usize::from(slot), function, mapped: placed, holes });
         Ok(())
     }
 
@@ -3991,15 +4004,15 @@ impl LinuxGuest {
             } else {
                 let value = v.save().rax as u32;
                 let moved = h.function.config_write(at, size, value);
-                let pending = h.function.msi().take_pending();
                 if let Some(m) = moved {
                     self.move_bar(h, m);
                 }
                 gc.counts.port_out += 1;
-                /* Under the platform's lock, which delivering takes nothing of */
-                if let Some((address, data)) = pending {
+                /* What the write let out of what was held pending: under the
+                 * platform's lock, which delivering takes nothing of */
+                h.function.messages().send_pending(|address, data| {
                     self.deliver_msi(address, data);
-                }
+                });
             }
         } else if PciBus::owns(io.port) {
             if io.input {
@@ -4155,11 +4168,8 @@ impl LinuxGuest {
     fn host_mmio(&self, gc: &mut GuestCpu, gpa: u64, write: bool) -> Option<Stop> {
         let rip = gc.cpu.backend().save().rip;
         let mut p = self.platform.lock();
-        const PAGE: u64 = kcore::consts::PAGE_SIZE as u64;
-        let found = p.hosts.iter().position(|h| {
-            h.mapped[0].is_some_and(|base| h.traps.iter().any(|&t| gpa >= base + t && gpa - base - t < PAGE))
-        });
-        let Some(i) = found else {
+        let found = p.hosts.iter().enumerate().find_map(|(i, h)| h.trapped_at(gpa).map(|(bar, at)| (i, bar, at)));
+        let Some((i, bar, offset)) = found else {
             gc.counts.mmio += 1;
             return Some(Stop::Mmio { gpa, rip });
         };
@@ -4170,31 +4180,17 @@ impl LinuxGuest {
         };
         gc.counts.mmio_done += 1;
         let h = &mut p.hosts[i];
-        let base = h.mapped[0].unwrap_or(0);
-        let Some(&trap) = h.traps.iter().find(|&&t| gpa >= base + t && gpa - base - t < PAGE) else {
-            return Some(Stop::Mmio { gpa, rip });
-        };
-        let offset = (gpa - base - trap) as u32;
-        /* Eight bytes as two dwords, each moving what it moves */
-        let halves: &[(u32, usize, u32)] = if op.size() == 8 {
-            &[(offset, 4, op.value as u32), (offset.wrapping_add(4), 4, (op.value >> 32) as u32)]
-        } else {
-            &[(offset, usize::from(op.size()), op.value as u32)]
-        };
-        let mut value = 0u64;
-        for (k, &(at, size, v)) in halves.iter().enumerate() {
-            let (read, moved) = h.function.mirror(trap as u32, at, size, op.is_write(), v);
-            value |= u64::from(read) << (32 * k);
-            if let Some(m) = moved {
-                self.move_bar(h, m);
-            }
+        let (value, moves) = h.function.trapped(bar, offset, usize::from(op.size()), op.is_write(), op.value);
+        for m in moves.iter() {
+            self.move_bar(h, m);
         }
-        let pending = h.function.msi().take_pending();
+        /* What the access let out of what was held pending: under the
+         * platform's lock, which delivering takes nothing of */
+        h.function.messages().send_pending(|address, data| {
+            self.deliver_msi(address, data);
+        });
         drop(p);
         mmio::finish(gc.cpu.backend_mut(), &op, value);
-        if let Some((address, data)) = pending {
-            self.deliver_msi(address, data);
-        }
         None
     }
 
@@ -4210,8 +4206,7 @@ impl LinuxGuest {
         if m.to == 0 || m.to % b.size != 0 {
             return;
         }
-        let holes: &[u64] = if m.bar == 0 { &h.traps } else { &[] };
-        if self.memory.map_device(m.to, b.host, b.size, holes).is_ok() {
+        if self.memory.map_device(m.to, b.host, b.size, &h.holes[m.bar]).is_ok() {
             h.mapped[m.bar] = Some(m.to);
         }
     }
