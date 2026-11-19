@@ -608,6 +608,12 @@ impl GuestMemory {
 
     /// A host function's ROM, a copy mapped read-only, as the real one
     /// decides it: whole pages, `map_device`'s rules.
+    /// A range of the run loop's that maps nothing, as the real one decides
+    /// it: `map_device`'s rules.
+    pub fn trap_range(&self, gpa: u64, size: u64) -> Result<()> {
+        self.map_device(gpa, 0, size, &[])
+    }
+
     pub fn map_rom(&self, _id: usize, gpa: u64, image: &[u8]) -> Result<()> {
         if image.is_empty() || image.len() as u64 % PAGE != 0 {
             return Err(Error::BadAddress);

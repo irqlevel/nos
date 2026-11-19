@@ -37,7 +37,19 @@ use crate::devices::host::{decode_bar, Bar, HostFunction, Messages, Real, MAX_VE
                            NVIDIA_MSI_REARM, ROM_BAR, ROM_MAX, ROM_MIN, VENDOR_NVIDIA};
 use crate::targets::Input;
 
-const SPACE: usize = 256;
+const SPACE: usize = 4096;
+/// The 256 bytes past which the extended space is, read-only to the guest.
+const HEADER_SPACE: usize = 256;
+/// The extended capabilities a guest is shown, by id (docs/hypervisor.md):
+/// AER, the virtual channels, the serial number, a vendor's, LTR, the
+/// secondary PCIe's, L1 PM substates, a designated vendor's, the data link
+/// feature, the physical layers at 16, 32 and 64 GT/s, lane margining.
+const EXT_SHOWN: [u32; 13] = [0x01, 0x02, 0x03, 0x0B, 0x18, 0x19, 0x1E, 0x23, 0x25, 0x26, 0x2A, 0x31, 0x27];
+/// Ids a device's list is made of: those, and those it must not show --
+/// SR-IOV, ARI, ATS, PRI, PASID, the Resizable BAR and its VF's, ACS, DPC,
+/// PTM, TPH, DOE, the power budget's.
+const EXT_IDS: [u32; 26] = [0x01, 0x02, 0x03, 0x0B, 0x18, 0x19, 0x1E, 0x23, 0x25, 0x26, 0x2A, 0x31, 0x27, 0x10,
+                            0x0E, 0x0F, 0x13, 0x1B, 0x15, 0x24, 0x0D, 0x1D, 0x1F, 0x17, 0x2E, 0x04];
 const PAGE: u64 = 4096;
 
 /* The header (PCI Local Bus 3.0, 6.2) */
@@ -208,6 +220,10 @@ impl Model {
         let at = usize::from(at);
         if at % size != 0 || at + size > SPACE {
             self.broke(format!("a write of {} bytes at {:#x}: not aligned, or past the space", size, at));
+            return;
+        }
+        if at + size > HEADER_SPACE {
+            self.broke(format!("a write of {} bytes at {:#x}: the extended space, read-only", size, at));
             return;
         }
         let bytes = value.to_le_bytes();
@@ -389,6 +405,87 @@ impl Real for Handle {
 
 /// A function laid out the target's way: its model, its BARs, and whether
 /// the host can give it.
+/// A device's extended space, from 0x100: mostly a list of the input's --
+/// ids the guest is shown and ones it must not be, a capability's bytes
+/// after its header -- going on to higher offsets or back, and now and then
+/// one that loops, ends in the first 256 bytes, or is no list at all (none,
+/// or all ones: a host with no ECAM for the bus).
+fn extended(r: &mut Input, space: &mut [u8; SPACE]) {
+    match r.u8() % 8 {
+        0 => space[HEADER_SPACE..].fill(0xFF),
+        1 => {}
+        _ => {
+            let count = 1 + r.below(8) as usize;
+            let mut at = HEADER_SPACE;
+            let mut placed = vec![at];
+            for k in 0..count {
+                let id = if r.u8() < 240 { r.pick(&EXT_IDS) } else { u32::from(r.u16()) };
+                let next = if k + 1 == count {
+                    match r.u8() % 16 {
+                        0 => r.pick(&placed),
+                        1 => r.below(HEADER_SPACE as u64) as usize & !3,
+                        _ => 0,
+                    }
+                } else if r.u8() < 224 {
+                    (HEADER_SPACE + 4 * r.below(((SPACE - HEADER_SPACE) / 4) as u64) as usize).max(HEADER_SPACE)
+                } else {
+                    r.pick(&placed)
+                };
+                let head = id | (u32::from(r.u8() & 0xF) << 16) | ((next as u32) << 20);
+                space[at..at + 4].copy_from_slice(&head.to_le_bytes());
+                for b in space.iter_mut().take((at + 16).min(SPACE)).skip(at + 4) {
+                    *b = r.u8();
+                }
+                if next < HEADER_SPACE {
+                    break;
+                }
+                placed.push(next);
+                at = next;
+            }
+        }
+    }
+}
+
+/// The extended capabilities the guest should be shown, by the judge's own
+/// walk of the device's list: those of `EXT_SHOWN`'s ids, where each is, in
+/// the list's order, up to where it ends or is not there -- or none, for a
+/// list longer than capabilities of eight bytes fit: one that loops.
+fn ext_list(space: &[u8; SPACE]) -> Vec<usize> {
+    let word = |at: usize| u32::from_le_bytes(space[at..at + 4].try_into().unwrap());
+    let mut shown = Vec::new();
+    let (mut at, mut walked) = (HEADER_SPACE, 0);
+    loop {
+        let head = word(at);
+        if head == 0 || head == u32::MAX {
+            return shown;
+        }
+        walked += 1;
+        if walked > (SPACE - HEADER_SPACE) / 8 {
+            return Vec::new();
+        }
+        if EXT_SHOWN.contains(&(head & 0xFFFF)) {
+            shown.push(at);
+        }
+        let next = (head >> 20) as usize & 0xFFC;
+        if next < HEADER_SPACE {
+            return shown;
+        }
+        at = next;
+    }
+}
+
+/// The extended space's dword at `d`, as the guest should read it: the
+/// device's, but a shown capability's next offset the next one shown, and
+/// the first dword naming the first shown where it is not that one.
+fn ext_view(space: &[u8; SPACE], shown: &[usize], d: usize) -> u32 {
+    let word = u32::from_le_bytes(space[d..d + 4].try_into().unwrap());
+    match shown.iter().position(|&a| a == d) {
+        Some(i) => (word & 0xF_FFFF) | ((shown.get(i + 1).copied().unwrap_or(0) as u32) << 20),
+        None if d == HEADER_SPACE => shown.first().map_or(0, |&a| (a as u32) << 20),
+        None => word,
+    }
+}
+
 pub struct Made {
     pub model: Arc<Mutex<Model>>,
     pub bars: [Option<Bar>; 6],
@@ -592,6 +689,8 @@ pub fn make(r: &mut Input, nvidia: bool) -> Made {
             }
         }
     }
+
+    extended(r, &mut space);
 
     let host_devctl = if layout.pcie != 0 {
         u16::from_le_bytes([space[layout.pcie + DEVCTL], space[layout.pcie + DEVCTL + 1]])
@@ -826,7 +925,7 @@ impl Judge {
     /// A guest's write of `size` bytes of `value` at `at`, as the registers
     /// take it; the BAR it moved, if it did: (bar, from, to).
     fn write(&mut self, at: usize, size: usize, value: u32) -> Option<(usize, u64, u64)> {
-        if at >= SPACE || size == 0 || !matches!(size, 1 | 2 | 4) || at % size != 0 || at + size > SPACE {
+        if size == 0 || !matches!(size, 1 | 2 | 4) || at % size != 0 || at + size > HEADER_SPACE {
             return None;
         }
         let bytes = value.to_le_bytes();
@@ -945,7 +1044,10 @@ fn register(r: &mut Input, layout: &Layout) -> usize {
         5 if layout.pm != 0 => layout.pm + PMCSR + r.below(4) as usize,
         6 => r.pick(&[ROM, INTERRUPT_LINE, INTERRUPT_PIN, HEADER_TYPE, CAP_POINTER, STATUS, 0x00]),
         7 if layout.msix != 0 => layout.msix + r.below(MSIX_LEN as u64) as usize,
-        _ => r.below(SPACE as u64) as usize,
+        /* The extended space: where a list's headers mostly are, or any */
+        8 if r.bool() => 0x100 + r.below(0x40) as usize,
+        8 => r.below(SPACE as u64) as usize,
+        _ => r.below(HEADER_SPACE as u64) as usize,
     };
     at.min(SPACE - 1)
 }
@@ -999,6 +1101,24 @@ fn walked(f: &HostFunction, made: &Made, judge: &Judge) {
         .collect();
     invariant!(at == 0 && seen == want, "the capability list walked {:x?}, not the real one's {:x?} without {:?}",
                seen, want, judge.hidden);
+    /* The extended list as Linux walks it: from 0x100, a header of 0 none,
+     * a header of none past it -- and every one found shown */
+    let want = ext_list(&made.model.lock().unwrap().space);
+    let mut seen = Vec::new();
+    let mut at = HEADER_SPACE;
+    let mut head = f.config_read(at, 4);
+    while head != 0 && seen.len() <= want.len() {
+        if head & 0xFFFF != 0 {
+            seen.push(at);
+        }
+        at = (head >> 20) as usize & 0xFFC;
+        if at < HEADER_SPACE {
+            break;
+        }
+        head = f.config_read(at, 4);
+    }
+    invariant!(seen == want && seen.iter().all(|&a| EXT_SHOWN.contains(&(f.config_read(a, 4) & 0xFFFF))),
+               "the extended list walked {:x?}, not the shown of the real one's {:x?}", seen, want);
     if let Some(x) = &judge.msix {
         let control = (f.config_read(judge.msix_cap + 2, 2)) as u16;
         invariant!(control == ((x.given - 1) as u16 | x.control),
@@ -1079,6 +1199,10 @@ pub fn hostfn_target(r: &mut Input) {
                 let shift = 8 * (at - dword);
                 let mask = if size == 4 { u32::MAX } else { (1u32 << (8 * size)) - 1 };
                 let expect = match dword {
+                    d if d >= HEADER_SPACE && d < SPACE => {
+                        let m = made.model.lock().unwrap();
+                        Some(ext_view(&m.space, &ext_list(&m.space), d))
+                    }
                     d if (BAR0..BAR0 + 24).contains(&d) => Some(judge.regs[(d - BAR0) / 4]),
                     ROM => Some(judge.rom.as_ref().map_or(0, |&(_, r)| r)),
                     /* The device's pin, in the dword's second byte */
@@ -1217,10 +1341,10 @@ pub fn hostfn_target(r: &mut Input) {
                                                                not {}", size, offset, now - acks, usize::from(ack));
                 } else if let Some(b) = before {
                     invariant!(v == b, "the mirror read {:#x} at {:#x}, the space {:#x}", v, offset, b);
-                } else if !sized {
-                    invariant!(v == u32::MAX, "a mirror read of {} bytes at {:#x}: {:#x}, not all ones", size, offset, v);
                 } else {
-                    invariant!(v == 0, "the mirror past the space read {:#x} at {:#x}", v, offset);
+                    let ones = match size { 1 => 0xFF, 2 => 0xFFFF, _ => u32::MAX };
+                    invariant!(v == ones, "a mirror read of {} bytes at {:#x}, past the space or of no size: \
+                                           {:#x}, not all ones", size, offset, v);
                 }
             }
             8 => bar_decoded(r),
