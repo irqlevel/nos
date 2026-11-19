@@ -254,7 +254,7 @@ swallowing panic messages whole.
 | `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by, and what a terminal types at the console's line editor, and the tracepoints' ring against a model and a writer thread, and the window `trace latency` reads of the rings against the truth of a schedule played out on them -- and the memory management under everything: the page tables and the physical page allocator past `setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them, and a VM kept in a folder (`hv create`, `hv start <name>`, its `console.log`), in `/vms` and in a folder `insmod /hv.ko vms=` names; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given, and a VM from its folder keeping the port it was given at its first start; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button, a press the guest declines pressed again and answered -- with `--disk`, the one nos's own poweroff presses, the guest's disk left mounted coming back clean; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs; `--mem` past 4064 with `--nos-mem`, a guest with RAM from 4 GiB; `--nos-iso`, nos booted from `make nos-test.iso TEST_ISO_ARGS=hugepages=...`, every guest's memory the huge pool's, 2 MiB an entry of its nested table |
 | `gpu-passthrough-test.py --host root@<machine> [--driver nvidia\|nouveau] [--gpu B:D.F] [--chip ga106]` | x86-64, by hand, on a machine with a GPU, from `nos-test.iso` (`iommu=on udpshell=9100 hugepages=5G`) | a host's PCI function given to a guest: nos under QEMU/KVM with QEMU's VT-d before the real GPU, the GPU in nos's guest -- NVIDIA's own driver, nvidia-smi and CUDA's deviceQuery, vectorAdd and matrixMul; or nouveau, its BARs, BOOT0, its GSP booted by DMA through the domain, a thousand fences on its MSIs |
-| `hv-passthrough-test.py --bzimage <img> --busybox <busybox> [--nvmepoke <bin>]` | x86-64, TCG (CI), from `nos-test.iso` (`iommu=on guestpci=01:00.0`) | a host's PCI function given to a guest with no GPU to hand: QEMU's NVMe behind its VT-d, kept from nos's drivers and given to a Linux guest of nos's by its MSI-X -- read, written, read back, by more than one of its vectors; then, the guest's driver let go of, the controller driven by hand to write where the guest has no RAM (blocked, said with its requester id) and at the interrupt range (refused by nos's interrupt table, said) |
+| `hv-passthrough-test.py --bzimage <img> --busybox <busybox> [--nvmepoke <bin>]` | x86-64, TCG (CI), from `nos-test.iso` (`iommu=on guestpci=01:00.0,02:00.0`) | a host's PCI function given to a guest with no GPU to hand: QEMU's NVMe and a virtio disk with no FLR behind its VT-d, kept from nos's drivers and given to a Linux guest of nos's by their MSI-X -- read, written, read back, the NVMe by more than one of its vectors, the virtio disk reset by its bridge's secondary bus reset; then, the guest's driver let go of, the controller driven by hand to write where the guest has no RAM (blocked, said with its requester id) and at the interrupt range (refused by nos's interrupt table, said) |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]] [--hvboot]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button; with `--hvboot`, Debian's and Ubuntu's booted by hvboot off their own /boot, nothing taken out of them; with `--create <url>`, a VM made by `hv create` of a cloud image nos fetches itself, booted and provisioned by cloud-init from nos's seed |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 | `trace-test.py [--arch aarch64\|x86_64]` | arm64 (x86-64 where grub-mkrescue is) | the tracepoints and the `trace` command: a boot's `tracepoints=`, records shown merged and in order, the rings made again, wrapped, cleared, frozen, freed; the scheduler's events, and the interrupts' and soft IRQs' -- [Tracepoints](tracing.md) |
@@ -514,7 +514,7 @@ without it, the A2000's thousand fences still signalled -- so the hv-fuzz
 
 ### `hv-passthrough-test.py` -- QEMU's NVMe in nos's guest, and a hostile one
 
-`make nocheck && make nos-test.iso TEST_ISO_ARGS="iommu=on guestpci=01:00.0"`,
+`make nocheck && make nos-test.iso TEST_ISO_ARGS="iommu=on guestpci=01:00.0,02:00.0"`,
 the guest's kernel and nvmepoke made once by
 `tests/hv-passthrough/build-guest.sh <dir>` (Linux 6.18 from kernel.org, its
 digest checked, `tinyconfig` and `tests/hv-passthrough/guest.config`), then
@@ -527,17 +527,21 @@ gcc-x86-64-linux-gnu libc6-dev-amd64-cross make flex bison bc libelf-dev curl
 xz-utils ca-certificates && CROSS_COMPILE=x86_64-linux-gnu- bash /h/build-guest.sh
 /out'` -- and copied out of the volume.
 
-nos boots under TCG on q35 with QEMU's VT-d (`intel-iommu,intremap=on`), its
-NVMe behind a `pcie-root-port`: the gate holds nos to keeping that function
-from its own NVMe driver (`guestpci=`), to taking the unit over with
-interrupts remapped, and to giving the function to its guest by its MSI-X
-(`hv boot ... pci=01:00.0`: 16 of the controller's 65 vectors given). The
-guest's own driver has to find the NVMe and read the pattern the runner put
-on it -- the device's DMA into the guest's RAM, through the domain -- write
-one of its own and read it back past the page cache, and take its
-interrupts on more than one MSI-X vector; hv has to say it sent the MSIs on,
-none taken by no CPU, and the guest's pattern has to be on the disk's image
-once QEMU is gone. Then the hostile phase: the guest lets its driver go and
+nos boots under TCG on q35 with QEMU's VT-d (`intel-iommu,intremap=on`), an
+NVMe and a virtio disk each behind a `pcie-root-port` -- the virtio disk with
+no FLR (`x-pcie-flr-init=off`) and its DMA through the unit (`iommu_platform=on`:
+QEMU's virtio devices take no IOMMU's translation unless told to): the gate
+holds nos to keeping both functions from its own drivers (`guestpci=`), to
+taking the unit over with interrupts remapped, and to giving both to its
+guest by their MSI-X (`hv boot ... pci=01:00.0 pci=02:00.0`: 16 of the NVMe's
+65 vectors given), the virtio disk reset by its bridge's secondary bus reset
+as it is given and as the guest lets go of it. The guest's own drivers have
+to find both and read the pattern the runner put on each -- the devices' DMA
+into the guest's RAM, through their domains -- write one of their own and
+read it back past the page cache, and take their interrupts, the NVMe's on
+more than one MSI-X vector; hv has to say it sent the MSIs on, none taken by
+no CPU, and the guest's patterns have to be on the disks' images once QEMU is
+gone. Then the hostile phase: the guest lets its driver go and
 drives the controller from user space (`tests/hv-passthrough/nvmepoke.c`:
 BAR0 through sysfs, the admin queues in pages whose addresses
 /proc/self/pagemap gives), each command an Identify whose data the device

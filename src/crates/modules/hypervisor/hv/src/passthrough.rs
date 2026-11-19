@@ -125,11 +125,33 @@ const FUNCTIONS: u16 = 8;
 /// What a reset leaves to be written back: the header's dwords from the
 /// command register to the interrupt line's.
 const SAVED: core::ops::Range<u16> = 0x04..0x40;
-/// How long an FLR takes at most (PCIe 5.0, 6.6.2: 100 ms), and how long a
-/// device has to answer after it before it is taken for gone.
-const FLR_MS: u64 = 100;
+/// How long a reset takes at most before a function is asked anything (PCIe
+/// 5.0, 6.6.2: 100 ms), how long it has to answer after that before it is
+/// taken for gone, and how long a bus reset is held (Linux's 2 ms).
+const RESET_MS: u64 = 100;
 const ANSWER_MS: u64 = 1000;
 const ANSWER_STEP_MS: u64 = 10;
+const BUS_RESET_MS: u64 = 2;
+/// A bridge's header (PCI-to-PCI Bridge 1.2, 3.2): its layout's number, its
+/// secondary bus, and its bridge control's Secondary Bus Reset.
+const HEADER_LAYOUT: u8 = 0x7F;
+const HEADER_BRIDGE: u8 = 0x01;
+const SECONDARY_BUS: u16 = 0x19;
+const BRIDGE_CONTROL: u16 = 0x3E;
+const BRIDGE_BUS_RESET: u16 = 1 << 6;
+/// The devices a bus has at most.
+const SLOTS: u16 = 32;
+/// Extended capabilities (PCIe 5.0, 7.8.6 and 7.7.7): the Resizable BAR --
+/// its first control register, which says how many BARs it has (7:5), and
+/// the bytes from one BAR's registers to the next -- and ACS's control.
+const EXT_REBAR: u16 = 0x0015;
+const REBAR_CONTROL: u16 = 0x08;
+const REBAR_COUNT_SHIFT: u32 = 5;
+const REBAR_COUNT_MASK: u32 = 0x7;
+const REBAR_ENTRY_BYTES: u16 = 8;
+const REBARS_MAX: usize = 6;
+const EXT_ACS: u16 = 0x000D;
+const ACS_CONTROL: u16 = 0x06;
 /// A VGA controller, and the legacy window one decodes where the firmware
 /// routed it to the boot GPU -- the text buffer at 0xB8000 among it, which
 /// the kernel's console writes when GRUB handed it no framebuffer (Hertz).
@@ -254,6 +276,8 @@ pub struct Passed {
     _table_map: Option<PhysMapping>,
     interrupts: Vec<MsixInterrupt>,
     messages: Arc<Messages>,
+    /// How it is reset as the guest lets go of it, as it was as it was given.
+    reset: ResetPlan,
     _siblings: Vec<Sibling>,
     claim: Claim,
 }
@@ -302,7 +326,8 @@ impl Passed {
         if let Some(why) = screen {
             kcore::klog!(0, "hv: {}: {} -- let go of: nothing is drawn there from now on", name, why);
         }
-        if !reset(&dev) {
+        let reset = ResetPlan::of(bus, slot, func, all);
+        if !reset.make(&dev) {
             return Err(alloc::format!("{}: did not answer after its reset", name));
         }
 
@@ -361,6 +386,7 @@ impl Passed {
             _table_map: table_map,
             interrupts,
             messages,
+            reset,
             _siblings: siblings,
             claim,
         })
@@ -415,7 +441,7 @@ impl Drop for Passed {
         self.table = None;
         let command = self.dev.read_config16(COMMAND);
         self.dev.write_config16(COMMAND, command & !(COMMAND_IO | COMMAND_MEMORY | COMMAND_MASTER));
-        let _ = reset(&self.dev);
+        let _ = self.reset.make(&self.dev);
         /* Blocked, out of the domain, the guest's pages let go of */
         self.domain = None;
     }
@@ -494,14 +520,145 @@ fn read_bars(dev: &PciDevice, name: &str) -> [Option<Bar>; 6] {
     bars
 }
 
-/// A Function Level Reset where the function has one, as Linux makes it
-/// (`pcie_flr`, `pci_save_state`): its transactions given a second to
-/// finish, its header and the PCIe capability's controls saved before and
-/// written back after, the device asked for its vendor id until it answers
-/// -- a second past the 100 ms it has. False, said, and nothing more done,
-/// for a device that does not answer. Nothing for a function without FLR
-/// -- its bridge's secondary bus reset is not done yet.
-fn reset(dev: &PciDevice) -> bool {
+/// How the guest's functions of a device are reset, as the guest is given
+/// them and as it lets go: each by its own FLR, where every one of them has
+/// one; else the whole device by a secondary bus reset of the bridge above
+/// it, made once -- by the first of them the guest names, before any is set
+/// up, as a bus reset of a function set up already would undo that -- where
+/// one can be made (`bus_resettable`); else each by its FLR, and one with
+/// none given as it is, said.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ResetPlan {
+    Flr,
+    /// This function makes the bus reset.
+    Bus,
+    /// Another of the device's functions makes it.
+    ByFirst,
+}
+
+impl ResetPlan {
+    /// `bus`:`slot`.`func`'s, of a guest that holds `all`.
+    fn of(bus: u16, slot: u16, func: u16, all: &[(u16, u16, u16)]) -> ResetPlan {
+        let device = |&&(b, s, _): &&(u16, u16, u16)| b == bus && s == slot;
+        let without_flr = all.iter().filter(device).any(|&(b, s, f)| {
+            !pci::get_device_by_bdf(b, s, f).is_some_and(|d| has_flr(&d))
+        });
+        if !without_flr {
+            return ResetPlan::Flr;
+        }
+        if let Err(why) = bus_resettable(bus, slot) {
+            if !pci::get_device_by_bdf(bus, slot, func).is_some_and(|d| has_flr(&d)) {
+                kcore::klog!(0, "hv: {:02x}:{:02x}.{:x}: no FLR, and no bus reset to be had -- {}: given as it is", bus,
+                             slot, func, why);
+            }
+            return ResetPlan::Flr;
+        }
+        let me = all.iter().position(|&f| f == (bus, slot, func)).unwrap_or(0);
+        if all[..me].iter().any(|f| device(&f)) { ResetPlan::ByFirst } else { ResetPlan::Bus }
+    }
+
+    /// Made of `dev`: false, said, where the device does not answer after.
+    fn make(self, dev: &PciDevice) -> bool {
+        match self {
+            ResetPlan::Flr => flr(dev),
+            ResetPlan::Bus => bus_reset(dev),
+            ResetPlan::ByFirst => true,
+        }
+    }
+}
+
+/// Whether the function has an FLR of its own.
+fn has_flr(dev: &PciDevice) -> bool {
+    dev.find_capability(CAP_PCIE)
+        .is_some_and(|cap| dev.read_config32(u16::from(cap) + PCIE_DEVCAP) & PCIE_DEVCAP_FLR != 0)
+}
+
+/// What a reset loses of a function that the host had set, read before it
+/// and written back after, as Linux's `pci_save_state` keeps it: the
+/// header's dwords from the command register to the interrupt line's, the
+/// PCIe capability's controls, each Resizable BAR's size -- a BAR whose size
+/// a reset changed under its register is mapped for the guest as one size
+/// and decodes another -- and ACS's controls.
+struct State {
+    header: [u32; ((SAVED.end - SAVED.start) / 4) as usize],
+    /// The PCIe capability, its device and link controls, and DevCtl2 where
+    /// the capability's version has one.
+    pcie: Option<(u16, u16, u16, Option<u16>)>,
+    rebar: [Option<(u16, u32)>; REBARS_MAX],
+    acs: Option<(u16, u16)>,
+}
+
+impl State {
+    fn save(dev: &PciDevice) -> State {
+        let mut header = [0u32; ((SAVED.end - SAVED.start) / 4) as usize];
+        for (k, reg) in SAVED.step_by(4).enumerate() {
+            header[k] = dev.read_config32(reg);
+        }
+        let pcie = dev.find_capability(CAP_PCIE).map(|cap| {
+            let cap = u16::from(cap);
+            let second = (dev.read_config16(cap + PCIE_FLAGS) & PCIE_FLAGS_VERSION) >= 2;
+            (cap, dev.read_config16(cap + PCIE_DEVCTL), dev.read_config16(cap + PCIE_LNKCTL),
+             second.then(|| dev.read_config16(cap + PCIE_DEVCTL2)))
+        });
+        let mut rebar = [None; REBARS_MAX];
+        if let Some(cap) = dev.find_extended_capability(EXT_REBAR) {
+            let count = ((dev.read_config32(cap + REBAR_CONTROL) >> REBAR_COUNT_SHIFT) & REBAR_COUNT_MASK) as usize;
+            for (k, slot) in rebar.iter_mut().enumerate().take(count) {
+                let at = cap + REBAR_CONTROL + REBAR_ENTRY_BYTES * k as u16;
+                *slot = Some((at, dev.read_config32(at)));
+            }
+        }
+        let acs = dev.find_extended_capability(EXT_ACS).map(|cap| (cap + ACS_CONTROL, dev.read_config16(cap + ACS_CONTROL)));
+        State { header, pcie, rebar, acs }
+    }
+
+    /// Written back: the capability's controls and the BARs' sizes first --
+    /// a BAR register's writable bits are its size's -- then the header, its
+    /// command register last.
+    fn restore(&self, dev: &PciDevice) {
+        if let Some((cap, control, link, control2)) = self.pcie {
+            dev.write_config16(cap + PCIE_DEVCTL, control & !PCIE_DEVCTL_FLR);
+            dev.write_config16(cap + PCIE_LNKCTL, link);
+            if let Some(c2) = control2 {
+                dev.write_config16(cap + PCIE_DEVCTL2, c2);
+            }
+        }
+        for &(at, control) in self.rebar.iter().flatten() {
+            dev.write_config32(at, control);
+        }
+        if let Some((at, control)) = self.acs {
+            dev.write_config16(at, control);
+        }
+        for (k, reg) in SAVED.step_by(4).enumerate().skip(1) {
+            dev.write_config32(reg, self.header[k]);
+        }
+        dev.write_config32(SAVED.start, self.header[0]);
+    }
+}
+
+/// Whether `dev` answers -- asked for its vendor id until it does, a second
+/// at most past the time its reset has (PCIe 5.0, 6.6.2: 100 ms). Said where
+/// it does not.
+fn answers(dev: &PciDevice, how: &str) -> bool {
+    kcore::task::sleep_ms(RESET_MS);
+    let mut waited = 0;
+    while dev.read_config16(0) == VENDOR_NONE && waited < ANSWER_MS {
+        kcore::task::sleep_ms(ANSWER_STEP_MS);
+        waited += ANSWER_STEP_MS;
+    }
+    if dev.read_config16(0) == VENDOR_NONE {
+        kcore::klog!(0, "hv: {:02x}:{:02x}.{:x} did not answer after its {}", dev.bus, dev.slot, dev.func, how);
+        return false;
+    }
+    true
+}
+
+/// A Function Level Reset, as Linux makes it (`pcie_flr`,
+/// `pci_save_state`): its transactions given a second to finish, its state
+/// saved before and written back after (`State`), the device asked until it
+/// answers. False, said, and nothing more done, for a device that does not
+/// answer; true and nothing done for a function without FLR.
+fn flr(dev: &PciDevice) -> bool {
     let Some(cap) = dev.find_capability(CAP_PCIE) else { return true };
     let cap = u16::from(cap);
     if dev.read_config32(cap + PCIE_DEVCAP) & PCIE_DEVCAP_FLR == 0 {
@@ -512,36 +669,73 @@ fn reset(dev: &PciDevice) -> bool {
         kcore::task::sleep_ms(ANSWER_STEP_MS);
         waited += ANSWER_STEP_MS;
     }
-    let mut saved = [0u32; ((SAVED.end - SAVED.start) / 4) as usize];
-    for (k, reg) in SAVED.step_by(4).enumerate() {
-        saved[k] = dev.read_config32(reg);
-    }
+    let state = State::save(dev);
     let control = dev.read_config16(cap + PCIE_DEVCTL);
-    let link = dev.read_config16(cap + PCIE_LNKCTL);
-    let second = (dev.read_config16(cap + PCIE_FLAGS) & PCIE_FLAGS_VERSION) >= 2;
-    let control2 = if second { dev.read_config16(cap + PCIE_DEVCTL2) } else { 0 };
-
     dev.write_config16(cap + PCIE_DEVCTL, control | PCIE_DEVCTL_FLR);
-    kcore::task::sleep_ms(FLR_MS);
-    let mut waited = 0;
-    while dev.read_config16(0) == VENDOR_NONE && waited < ANSWER_MS {
-        kcore::task::sleep_ms(ANSWER_STEP_MS);
-        waited += ANSWER_STEP_MS;
-    }
-    if dev.read_config16(0) == VENDOR_NONE {
-        kcore::klog!(0, "hv: {:02x}:{:02x}.{:x} did not answer after its reset", dev.bus, dev.slot, dev.func);
+    if !answers(dev, "FLR") {
         return false;
     }
-    /* The capability's controls, then the BARs and the rest of the header,
-     * the command register last */
-    dev.write_config16(cap + PCIE_DEVCTL, control & !PCIE_DEVCTL_FLR);
-    dev.write_config16(cap + PCIE_LNKCTL, link);
-    if second {
-        dev.write_config16(cap + PCIE_DEVCTL2, control2);
+    state.restore(dev);
+    true
+}
+
+/// The bridge whose secondary bus is `bus`.
+fn bridge_of(bus: u16) -> Option<PciDevice> {
+    (0..pci::device_count()).filter_map(pci::get_device).find(|d| {
+        d.read_config8(HEADER_TYPE) & HEADER_LAYOUT == HEADER_BRIDGE && u16::from(d.read_config8(SECONDARY_BUS)) == bus
+    })
+}
+
+/// The bridge a secondary bus reset of the device at `bus`:`slot` goes
+/// through -- where the bus is the device's alone, as it is below a PCIe
+/// port: the reset reaches every function on the bus, and the guest holds or
+/// has blocked only the device's. Why not, where there is no such bridge or
+/// another device is beside it.
+fn bus_resettable(bus: u16, slot: u16) -> Result<PciDevice, String> {
+    let bridge = bridge_of(bus).ok_or_else(|| String::from("no bridge above it"))?;
+    for s in (0..SLOTS).filter(|&s| s != slot) {
+        if let Some(f) = (0..FUNCTIONS).find_map(|func| pci::get_device_by_bdf(bus, s, func)) {
+            return Err(alloc::format!("{:02x}:{:02x}.{:x} is on its bus, which the reset would reach", f.bus, f.slot,
+                                      f.func));
+        }
     }
-    for (k, reg) in SAVED.step_by(4).enumerate().skip(1) {
-        dev.write_config32(reg, saved[k]);
+    Ok(bridge)
+}
+
+/// The device `dev` is a function of reset whole by the bridge above it --
+/// a secondary bus reset (PCI-to-PCI Bridge 1.2, 3.2.5.18), as Linux's
+/// `pci_reset_secondary_bus` makes one: every function of it saved before
+/// and written back after, where `bus_resettable` says it can be. False,
+/// said, for a device that does not answer after.
+fn bus_reset(dev: &PciDevice) -> bool {
+    let name = alloc::format!("{:02x}:{:02x}.{:x}", dev.bus, dev.slot, dev.func);
+    let bridge = match bus_resettable(dev.bus, dev.slot) {
+        Ok(b) => b,
+        Err(why) => {
+            kcore::klog!(0, "hv: {}: no bus reset to be had -- {}: given as it is", name, why);
+            return true;
+        }
+    };
+    let mut functions = Vec::new();
+    for func in 0..FUNCTIONS {
+        let Some(f) = pci::get_device_by_bdf(dev.bus, dev.slot, func) else { continue };
+        if functions.try_reserve(1).is_err() {
+            kcore::klog!(0, "hv: {}: out of memory for its functions' state: not reset", name);
+            return true;
+        }
+        functions.push((f, State::save(&f)));
     }
-    dev.write_config32(SAVED.start, saved[0]);
+    let control = bridge.read_config16(BRIDGE_CONTROL);
+    bridge.write_config16(BRIDGE_CONTROL, control | BRIDGE_BUS_RESET);
+    kcore::task::sleep_ms(BUS_RESET_MS);
+    bridge.write_config16(BRIDGE_CONTROL, control & !BRIDGE_BUS_RESET);
+    if !answers(dev, "bus reset") {
+        return false;
+    }
+    for (f, state) in &functions {
+        state.restore(f);
+    }
+    kcore::klog!(0, "hv: {} reset by its bridge {:02x}:{:02x}.{:x}'s secondary bus reset, {} function(s) of it written \
+                     back", name, bridge.bus, bridge.slot, bridge.func, functions.len());
     true
 }
