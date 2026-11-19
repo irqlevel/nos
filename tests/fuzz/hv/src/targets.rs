@@ -34,6 +34,7 @@ pub static ALL: &[Target] = &[
     Target { name: "pci", run: pci_bus, max_len: 2048 },
     Target { name: "hostfn", run: crate::hostmodel::hostfn_target, max_len: 4096 },
     Target { name: "port", run: crate::portmodel::port_target, max_len: 2048 },
+    Target { name: "groups", run: crate::groupsmodel::groups_target, max_len: 1024 },
     Target { name: "lapic", run: lapic_target, max_len: 4096 },
     Target { name: "ioapic", run: ioapic_target, max_len: 4096 },
     Target { name: "msi", run: msi, max_len: 1024 },

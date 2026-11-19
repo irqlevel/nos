@@ -4,14 +4,19 @@ hand: QEMU's NVMe and a virtio disk beside it, functions 0 and 1 of one
 device behind a PCIe root port, and a second virtio disk behind another --
 QEMU's VT-d in front of them (`-device intel-iommu,intremap=on`), nos taking
 the unit over (`iommu=on`), keeping the three from its own drivers
-(`guestpci=01:00.0,01:00.1,02:00.0`) and giving them to its guest (`hv boot
-... pci=01:00.0 pci=01:00.1 pci=02:00.0`) -- MSI-X's tables trapped, their
-vectors the host's, their DMA through a domain of the guest's RAM
+(`guestpci=01:00.0,01:00.1,02:00.0,03:00.0`) and giving them to its guest
+(`hv boot ... pci=01:00.0 pci=01:00.1 pci=02:00.0`) -- MSI-X's tables trapped,
+their vectors the host's, their DMA through a domain of the guest's RAM
 (plans/gpu-passthrough.md). The second virtio disk has no FLR: the host
 resets it by its bridge's secondary bus reset.
 
 - nos boots under TCG, keeps the functions from its drivers, takes the unit
   over with interrupts remapped, and gives them to its guest by their MSI-X;
+- isolation: nos turns ACS on at the root ports, groups the NVMe with the
+  disk beside it -- functions of one device, with no ACS of its own -- and
+  the other disk alone; and refuses a function whose group holds one of its
+  own drivers' (a third root port's virtio-rng, function 0 kept for guests,
+  function 1 nos's rng);
 - the guest finds a root port of nos's above each device (`devices::port`),
   the NVMe and the disk beside it as functions 0 and 1 of the bus below the
   first, the other disk on the bus below the second, each port's link the
@@ -48,7 +53,7 @@ busybox for x86-64 (`--busybox`: the binary, or an initramfs that holds it as
 bin/busybox) and nvmepoke, built static (`--nvmepoke`, or by the host's `cc
 -static` on x86-64 Linux):
 
-    make nocheck && make nos-test.iso TEST_ISO_ARGS="iommu=on guestpci=01:00.0,01:00.1,02:00.0"
+    make nocheck && make nos-test.iso TEST_ISO_ARGS="iommu=on guestpci=01:00.0,01:00.1,02:00.0,03:00.0"
     tests/hv-passthrough-test.py --bzimage <bzImage> --busybox <busybox> [--nvmepoke <nvmepoke>]
 
 x86-64, TCG: the guest twice emulated, some minutes. Manual: not in CI.
@@ -86,6 +91,11 @@ DISKS = [("nvme", "01:00.0", "0000:01:00.0"), ("beside", "01:00.1", "0000:01:00.
          ("virtio", "02:00.0", "0000:02:00.0")]
 NVME_IN_NOS = "01:00.0"
 VIRTIO_IN_NOS = "02:00.0"
+# A virtio-rng of two functions behind a third root port, of one IOMMU group:
+# function 0 kept for guests, function 1 nos's own rng's -- a boot asking
+# for the first alone is refused
+RNG_IN_NOS = "03:00.0"
+RNG_HOSTS = "03:00.1"
 # The guest's root ports: Red Hat's, QEMU's IDs; a PCI-to-PCI bridge
 PORT_ID = "0x1b36:0x000c"
 PORT_CLASS = "0x060400"
@@ -261,6 +271,8 @@ def main():
         f.write(initrd(bb, poke, hostile))
     rc = ["insmod /hv.ko",
           "hv on",
+          "hv boot /bzImage initrd=/initrd mem=64 cpus=1 secs=5 pci=%s cmdline=console=ttyS0 rdinit=/init"
+          % RNG_IN_NOS,
           "hv boot /bzImage initrd=/initrd mem=%d cpus=%d secs=%d %s cmdline=console=ttyS0 rdinit=/init"
           % (GUEST_MIB, GUEST_CPUS, GUEST_SECS, " ".join("pci=" + nos for _, nos, _ in DISKS)),
           "dmesg vtd:",
@@ -301,7 +313,10 @@ def main():
             # memory at the guest's addresses. aer and ats: an extended
             # capability the guest is shown, at 0x100, and one it is not
             "-device", "virtio-blk-pci,drive=vpass,bus=rp2,disable-legacy=on,disable-modern=off,x-pcie-flr-init=off,"
-                       "iommu_platform=on,aer=on,ats=on"]
+                       "iommu_platform=on,aer=on,ats=on",
+            "-device", "pcie-root-port,id=rp3,chassis=3",
+            "-device", "virtio-rng-pci,bus=rp3,addr=00.0,multifunction=on,disable-legacy=on,iommu_platform=on",
+            "-device", "virtio-rng-pci,bus=rp3,addr=00.1,disable-legacy=on,iommu_platform=on"]
     p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     t0 = time.time()
     text = ""
@@ -349,6 +364,16 @@ def nos_checks(text):
         print("  %s reset by %s's secondary bus reset" % (VIRTIO_IN_NOS, resets[0]))
     pt.check("the NVMe's ROM is read and given, a copy", "hv: %s: its ROM of %d KiB given" % (NVME_IN_NOS, ROM_BYTES // 1024)
              in text, lines(text, "ROM"))
+    # Isolation: ACS on at the root ports, the groups as the bus has them,
+    # and a function refused for a group of one of nos's own drivers'
+    acs = re.findall(r"hv: (00:[0-9a-f]{2}\.\d): ACS on, control 0x1d", text)
+    pt.check("nos turns ACS on at the root ports", len(set(acs)) >= 3, lines(text, "ACS"))
+    pt.check("the NVMe and the disk beside it are one IOMMU group, the other disk alone",
+             "hv: %s: IOMMU group with %s -- its device's functions, with no ACS" % (NVME_IN_NOS, DISKS[1][1]) in text
+             and "hv: %s: IOMMU group" % VIRTIO_IN_NOS not in text, lines(text, "IOMMU group"))
+    pt.check("a function whose group holds a function of nos's own driver is refused",
+             re.search(r"hv: boot failed -- %s: %s, of its IOMMU group, is the host's" % (RNG_IN_NOS, RNG_HOSTS), text)
+             is not None, lines(text, "boot failed"))
 
 
 def guest_checks(text):

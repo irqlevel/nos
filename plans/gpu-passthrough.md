@@ -180,10 +180,16 @@ reaches no Rust. hv reaches it by the usual three steps (`rust_ffi.cpp`,
   window above its RAM for the rest (BAR1 is 8 GiB), both in the DSDT's
   `_CRS`.
 - **vm.toml**: `pci = ["01:00.0"]`, the word `pci=01:00.0`; refused where the
-  IOMMU is off, or without `unsafe_interrupts` until IR is done. A group is
-  for now a device: its other functions are blocked while the guest holds
-  one, unless the guest holds them too, and a device one of whose other
-  functions is the host's own (mastering) or another guest's is refused.
+  IOMMU is off, or without `unsafe_interrupts` until IR is done.
+- **IOMMU groups** (**done**: `modules/hypervisor/hv/src/groups.rs`): ACS
+  turned on where the host's functions have it, then a function's group is
+  everything it may reach peer to peer -- below the bridge above any port
+  on its way up that does not isolate, a switch's whole subtree for a
+  downstream port without ACS, a device's every function where it has no
+  ACS -- and its other functions are blocked while the guest holds one,
+  unless the guest holds them too; a group with a function of the host's,
+  another guest's, or one a DMAR RMRR names is refused, and so is a function
+  an RMRR names, or one below a conventional bridge.
 
 ## The stages, and their gates
 

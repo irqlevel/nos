@@ -2172,12 +2172,35 @@ What the module does with it (`modules/hypervisor/hv/src/passthrough.rs`),
 before any of the guest's memory is taken: a function a driver of the host's
 has taken is refused (`PciDevice::driven`: one that turned bus mastering on
 through `kcore::pci`, or said it was its own, `take` -- xHCI's and ATA's, which
-turn on none); the function is claimed -- one
-guest a function, and the other functions of its device blocked, each in a
-domain of nothing, unless the guest holds them too: a device's functions are
-not isolated from each other, which is why Linux makes a GPU and its audio
-function one IOMMU group; a device one of whose other functions is mastering
--- the host's, or a driver's -- or another guest's is refused. Its BARs are read with its
+turn on none); a function the firmware reserved memory for -- a DMAR RMRR
+names it or a bridge above it (`kcore::iommu::reserved`, `Vtd::reserved_for`):
+a USB controller's legacy keyboard, an integrated GPU's stolen memory -- is
+refused, as VFIO refuses one: its DMA has to keep reaching the host's memory;
+the function is claimed -- one guest a function -- and the other functions of
+its IOMMU group are blocked, each in a domain of nothing, unless the guest
+holds them too; a group one of whose other functions is mastering -- the
+host's, or a driver's -- another guest's, or one the firmware reserved
+memory for is refused, said with the function and why they are one group.
+
+**IOMMU groups** (`modules/hypervisor/hv/src/groups.rs`): the functions an
+IOMMU cannot keep apart, because what one sends may reach another peer to
+peer without passing it. ACS is turned on first wherever the host's
+functions have it -- Source Validation, P2P Request and Completion Redirect,
+Upstream Forwarding, as Linux turns it on where it has an IOMMU -- so that a
+port sends what comes up from below on up, where the IOMMU sees it. Then a
+function reaches everything below the bridge above any port on its way up
+that does not isolate (a switch's downstream port without ACS joins the
+switch's whole subtree, where Linux keeps each port's apart), what is below
+every function of a root port's device where one of its functions does not
+(a device of several root ports routes between them inside), and every
+function of its own device where it has no ACS of its own (a GPU and its
+audio function: one group); every pair so joined, and the closure, is a
+group. A function below a conventional bridge, or a PCIe-to-PCI one, is
+refused: its requests reach the IOMMU by the bridge's id. A bus two bridges
+claim is grouped not at all, and its functions refused. Every function
+given says its group where it has company (`hv: 01:00.0: IOMMU group with
+01:00.1 -- its device's functions, with no ACS`); a group's bridges are
+left be -- they forward, and master nothing of their own. Its BARs are read with its
 decoding off, the screen held meanwhile: on a machine whose boot GPU is the
 one given -- Hertz's A2000 -- the kernel's console is that GPU's memory,
 the firmware's framebuffer in one of its BARs or, where GRUB hands nos none
@@ -2366,8 +2389,7 @@ access of it stops the guest. A VM holding a host's function is not saved
 and not moved: its device's DMA reaches no dirty log, and its state is the
 device's.
 
-Not done yet: refusing a function a DMAR RMRR names, isolation beyond one device's
-functions (ACS on the path above it), and AMD-Vi. VT-d's posted interrupts
+Not done yet: AMD-Vi. VT-d's posted interrupts
 -- the device's message straight into the vCPU, no host interrupt -- wait for
 a machine whose unit has them (CAP.PI): Hertz's two have not (CAP
 0xd2008c40660462 and 0x1c0000c40660462, bit 59 clear), nor has QEMU's.

@@ -97,7 +97,7 @@ jobs:
             mkdir -p out/hv-guest
             cp "$RUNNER_TEMP/hv-guest/bzImage" "$RUNNER_TEMP/hv-guest/nvmepoke" out/hv-guest/
           fi
-          make nos-test.iso TEST_ISO_ARGS="iommu=on guestpci=01:00.0,01:00.1,02:00.0"
+          make nos-test.iso TEST_ISO_ARGS="iommu=on guestpci=01:00.0,01:00.1,02:00.0,03:00.0"
           docker run --rm -v "$PWD":/nos -w /nos debian:trixie-slim bash -c \
             'apt-get update -qq && apt-get install -y -qq qemu-system-x86 e2fsprogs python3 busybox-static > /dev/null &&
              python3 tests/hv-passthrough-test.py --bzimage out/hv-guest/bzImage --busybox /bin/busybox \

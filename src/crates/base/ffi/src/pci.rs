@@ -23,6 +23,9 @@ unsafe extern "C" {
     /// The function the scan found at `bus`:`slot`.`func` -- one kept for
     /// guests too, which the two above pass over: 1, `out` filled; 0 for none.
     pub fn kernel_pci_device_at(bus: u16, slot: u16, func: u16, out: *mut PciDeviceInfo) -> i32;
+    /// The `index`-th function the scan found, a kept one too: 1, `out`
+    /// filled; 0 for none.
+    pub fn kernel_pci_get_any(index: usize, out: *mut PciDeviceInfo) -> i32;
     /// The function a driver of the host's: given to no guest from here on.
     /// A value looked up in the scan's table: sound for any, at any time.
     pub safe fn kernel_pci_take(bus: u16, slot: u16, func: u16);
