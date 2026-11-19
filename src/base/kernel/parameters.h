@@ -42,6 +42,13 @@ public:
        whose next boot is its own OS: back there with no hand on it. */
     ulong get_panic_reset_secs();
     static const ulong PANIC_RESET_SECS_MAX = 3600;
+    /* deadman=N -- a boot on trial: N seconds after it began, DEADMAN_SECS_MIN
+       to DEADMAN_SECS_MAX, the kernel panics, saying why, unless the shell's
+       `deadman off` came first (kernel/src/deadman.rs); with panic=M the
+       machine resets M seconds later. 0, the default, is none. */
+    ulong get_deadman_secs();
+    static const ulong DEADMAN_SECS_MIN = 10;
+    static const ulong DEADMAN_SECS_MAX = 86400;
     /* hwp_epp=: intel_pstate's balance_performance, and the field's top */
     static const ulong HWP_EPP_DEFAULT = 0x80;
     static const ulong HWP_EPP_MAX = 0xFF;
@@ -286,6 +293,7 @@ private:
     u32 netconsole_ip_;
     u16 netconsole_port_;
     ulong netconsole_tail_kb_;
+    ulong deadman_secs_;
     ulong net_frame_count_;
     /* hugepages=: a share of RAM in percent, or bytes -- one of the two. */
     ulong huge_pool_percent_;

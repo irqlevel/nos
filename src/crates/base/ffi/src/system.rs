@@ -184,4 +184,7 @@ unsafe extern "C" {
     /// halt runs on the shell's watch after this returns; anything else is
     /// nothing.
     pub safe fn kernel_power_request(what: u32);
+    /// `deadman=N`: the seconds a boot has before the kernel panics, 0 for
+    /// none. A parameter's value, read: sound at any time.
+    pub safe fn kernel_param_deadman() -> u64;
 }

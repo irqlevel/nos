@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod crc32;
+mod deadman;
 mod frames;
 mod memsites;
 mod one_event;
@@ -31,6 +32,9 @@ fn alloc_error(layout: core::alloc::Layout) -> ! {
 #[no_mangle]
 pub extern "C" fn rust_init() {
     hello::hello();
+    /* The boot's deadline, deadman=N, first: it is there for a boot that
+       wedges, here or later */
+    deadman::init();
     /* The management bus, first: the layers register their providers on it
        as they come up. The bus itself may have been made earlier still, by
        a module the boot's test of modules loaded; this puts its command in
@@ -98,8 +102,7 @@ fn tco_init() {
     };
 
     kcore::klog!(0, "TCO watchdog: TCOBASE 0x{:04X} via {}{}",
-        wdt.base(), wdt.source().as_str(),
-        if wdt.source().no_reboot_cleared() { "" } else { ", NO_REBOOT left as firmware set it" });
+        wdt.base(), wdt.source().as_str(), wdt.no_reboot().as_str());
 
     /* The kick timer looks at the watchdog for as long as the kernel runs,
        so that is how long the watchdog lives. */

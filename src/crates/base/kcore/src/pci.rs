@@ -181,6 +181,33 @@ pub fn get_device(index: usize) -> Option<PciDevice> {
     }
 }
 
+/// The screen's drawing held for as long as this lives: around a function's
+/// BARs sized with its decoding off -- the firmware's framebuffer may be in
+/// one of them, the boot GPU's, which does not answer meanwhile -- until
+/// `release_screen` has said whether it is.
+pub struct ScreenHold(());
+
+impl ScreenHold {
+    pub fn new() -> Self {
+        pci::kernel_screen_hold(1);
+        Self(())
+    }
+}
+
+impl Drop for ScreenHold {
+    fn drop(&mut self) {
+        pci::kernel_screen_hold(0);
+    }
+}
+
+/// The screen's framebuffer let go of for good, should it lie in
+/// `[base, base + size)` -- a BAR of a function about to be given to a
+/// guest: the kernel draws nothing there from then on, the panic's report
+/// included. Whether it did.
+pub fn release_screen(base: u64, size: u64) -> bool {
+    pci::kernel_screen_release(base, size) != 0
+}
+
 pub mod vendor {
     pub const INTEL: u16 = 0x8086;
     pub const VIRTIO: u16 = 0x1AF4;

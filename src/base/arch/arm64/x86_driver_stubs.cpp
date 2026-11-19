@@ -2,6 +2,7 @@
 #include <drivers/acpi.h>
 #include <arch/x86_64/vtd.h>
 #include <drivers/iommu.h>
+#include <drivers/screen.h>
 #include <hal/irq_stubs.h>
 
 /* Link stubs for the x86-only paths still referenced from common code on
@@ -115,6 +116,26 @@ void domain_destroy(ulong domain)
 bool release(u16 sid)
 {
     (void)sid;
+    return false;
+}
+
+}
+
+/* drivers/screen.h's hold and release: this architecture has no screen of
+   the firmware's (drivers/screen.cpp is x86's) -- nothing to hold, none to
+   let go of */
+namespace screen
+{
+
+void hold(bool on)
+{
+    (void)on;
+}
+
+bool release_within(ulong base, ulong size)
+{
+    (void)base;
+    (void)size;
     return false;
 }
 

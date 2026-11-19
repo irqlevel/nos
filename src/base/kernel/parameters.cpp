@@ -51,6 +51,7 @@ Parameters::Parameters()
     , netconsole_ip_(0)
     , netconsole_port_(0)
     , netconsole_tail_kb_(0)
+    , deadman_secs_(0)
     , net_frame_count_(0)
     , huge_pool_percent_(0)
     , huge_pool_bytes_(0)
@@ -92,6 +93,11 @@ bool Parameters::is_panic_vga()
 ulong Parameters::get_panic_reset_secs()
 {
     return panic_reset_secs_;
+}
+
+ulong Parameters::get_deadman_secs()
+{
+    return deadman_secs_;
 }
 
 bool Parameters::is_smp_off()
@@ -569,6 +575,18 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
         else
         {
             klog(0, "Unknown value %s, key %s", value, key);
+        }
+    }
+    else if (stdlib::str_cmp(key, "deadman") == 0)
+    {
+        ulong secs = 0;
+        if (stdlib::parse_ulong(value, secs) && secs >= DEADMAN_SECS_MIN && secs <= DEADMAN_SECS_MAX)
+        {
+            deadman_secs_ = secs;
+        }
+        else
+        {
+            klog(0, "Invalid deadman %s: seconds, %lu to %lu", value, DEADMAN_SECS_MIN, DEADMAN_SECS_MAX);
         }
     }
     else if (stdlib::str_cmp(key, "its") == 0)

@@ -33,6 +33,7 @@
 #include <drivers/pci.h>
 #include <drivers/msix.h>
 #include <drivers/iommu.h>
+#include <drivers/screen.h>
 #include <hal/irqchip.h>
 #include <drivers/hpet.h>
 #include <drivers/acpi.h>
@@ -1358,6 +1359,22 @@ void kernel_iommu_domain_destroy(unsigned long domain)
 int kernel_iommu_release(unsigned short sid)
 {
     return kernel::iommu::release(sid) ? 1 : 0;
+}
+
+/* The screen, as a function about to be given to a guest needs it
+   (drivers/screen.h): its drawing held (on != 0) and taken up again (0)
+   while the function's BARs are sized with its decoding off -- a count,
+   under the console's lock -- and its framebuffer let go of where it lies in
+   one of them, [base, base + size): 1 when it did. Values compared under
+   the console's lock: sound for any, at any time. */
+void kernel_screen_hold(int on)
+{
+    kernel::screen::hold(on != 0);
+}
+
+int kernel_screen_release(unsigned long base, unsigned long size)
+{
+    return kernel::screen::release_within(base, size) ? 1 : 0;
 }
 
 } /* extern "C" */
@@ -2806,6 +2823,13 @@ unsigned int kernel_param_static_gateway()
 int kernel_param_rxpoll_on()
 {
     return kernel::Parameters::get_instance().is_rx_poll_enabled() ? 1 : 0;
+}
+
+/* deadman=N: the seconds a boot has before the kernel panics, 0 for none
+   (kernel/src/deadman.rs). */
+unsigned long long kernel_param_deadman()
+{
+    return kernel::Parameters::get_instance().get_deadman_secs();
 }
 
 /* Whether the kernel log is to be written to a prepared disk area: 1 for
