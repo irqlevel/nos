@@ -144,6 +144,14 @@ public:
        back to the host. False where it is any domain's. */
     bool release(u16 sid);
 
+    /* Whether the firmware reserved memory for sid's DMA: a DMAR RMRR (8.4)
+       whose scope is it, or a bridge above it -- the region's first byte in
+       base and its last in limit. Such a device's DMA has to keep reaching
+       the host's memory there -- a USB controller's legacy keyboard, an
+       integrated GPU's stolen memory -- so it is no guest's (VFIO refuses
+       it so). */
+    bool reserved_for(u16 sid, u64& base, u64& limit);
+
 private:
     Vtd();
     /* Nothing is torn down at the halt: a unit translating DMA keeps its
@@ -399,6 +407,9 @@ private:
        handler) -- `iommu` looks at it again and unmasks it */
     static const ulong FAULTS_SAID_A_SECOND = 16;
     static const ulong FAULT_STORM = 4096;
+    /* How many times report_faults looks again at what is pending: a fault
+       recorded while it runs keeps PPF set and raises no event of its own */
+    static const ulong REPORT_PASSES = 4;
 
     Unit* units_[Acpi::MAX_DMAR_UNITS];
     size_t unit_count_;

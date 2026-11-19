@@ -201,6 +201,15 @@ pub fn device_count() -> usize {
     pci::kernel_pci_device_count()
 }
 
+/// The `index`-th function the scan found, one kept for guests too --
+/// which `get_device` passes over: what the whole bus is, as IOMMU groups
+/// are made of it.
+pub fn get_any(index: usize) -> Option<PciDevice> {
+    let mut info = NO_DEVICE;
+    // SAFETY: `info` is a local, writable for the call.
+    (unsafe { pci::kernel_pci_get_any(index, &mut info) } != 0).then(|| PciDevice::from_ffi(&info))
+}
+
 pub fn get_device(index: usize) -> Option<PciDevice> {
     let mut info = NO_DEVICE;
     let ok = unsafe { pci::kernel_pci_get_device(index, &mut info) };

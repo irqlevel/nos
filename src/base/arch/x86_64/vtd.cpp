@@ -1040,7 +1040,17 @@ void Vtd::report_faults(Unit& unit)
         unit.faults_unsaid = 0;
     }
 
+    /* Until nothing is left pending, REPORT_PASSES times at most: a fault the
+       unit records while this runs keeps PPF set, and so raises no event of
+       its own; and an overflow it flags meanwhile -- PFO, set past the read
+       of FSTS below -- would be left set, and a unit with PFO set records no
+       fault again (QEMU's drops each in silence): every fault from then on
+       unsaid. So FSTS is read again after each pass */
+    for (ulong pass = 0; pass < REPORT_PASSES; pass++)
+    {
     const u32 fsts = read32(unit, REG_FSTS);
+    if (!(fsts & (FSTS_PPF | FSTS_CLEARED)))
+        break;
     if (fsts & FSTS_PPF)
     {
         ulong index = (fsts >> FSTS_FRI_SHIFT) & FSTS_FRI_MASK;
@@ -1081,6 +1091,7 @@ void Vtd::report_faults(Unit& unit)
         if (cleared & (FSTS_IQE | FSTS_ICE | FSTS_ITE))
             klog(0, "vtd: dmar%lu: an invalidation error, FSTS 0x%lX", (ulong)unit.index, (ulong)fsts);
         write32(unit, REG_FSTS, cleared);
+    }
     }
 
     if (unit.rate_count > FAULT_STORM && !unit.storm && unit.fault_irq)
@@ -1532,6 +1543,28 @@ bool Vtd::release(u16 sid)
         static_cast<u64>(unit->width_code) | (DID_PASS_THROUGH << CONTEXT_DID_SHIFT), DID_PASS_THROUGH);
 }
 
+bool Vtd::reserved_for(u16 sid, u64& base, u64& limit)
+{
+    auto& acpi = Acpi::get_instance();
+    for (size_t i = 0; i < acpi.get_dmar_reserved_count(); i++)
+    {
+        const Acpi::DmarReserved* region = acpi.get_dmar_reserved(i);
+        if (region == nullptr || region->segment != 0)
+            continue;
+        const size_t scopes = stdlib::min(region->scope_count, Acpi::MAX_DMAR_SCOPES);
+        for (size_t s = 0; s < scopes; s++)
+        {
+            if (scope_covers(region->scope[s], sid))
+            {
+                base = region->base;
+                limit = region->limit;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void Vtd::shell(const char* args, stdlib::Printer& printer)
 {
     const char* end = nullptr;
@@ -1661,6 +1694,11 @@ void domain_destroy(ulong domain)
 bool release(u16 sid)
 {
     return Vtd::get_instance().release(sid);
+}
+
+bool reserved(u16 sid, u64& base, u64& limit)
+{
+    return Vtd::get_instance().reserved_for(sid, base, limit);
 }
 
 bool remapping()

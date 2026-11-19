@@ -1315,6 +1315,20 @@ int kernel_pci_get_device(unsigned long index, RustPciDeviceInfo* out)
     return 1;
 }
 
+/* The index-th function the scan found, a kept one too -- what the hv
+   module's IOMMU groups are made of, where a driver's lookup passes over
+   those: 1, `out` filled; 0 for none */
+int kernel_pci_get_any(unsigned long index, RustPciDeviceInfo* out)
+{
+    if (!out)
+        return 0;
+    auto* dev = Pci::get_instance().get_device(index);
+    if (!dev || !dev->valid)
+        return 0;
+    fill_rust_pci_info(out, dev);
+    return 1;
+}
+
 /* The function the scan found at bus:slot.func, a kept one too: 1, `out`
    filled; 0 for none */
 int kernel_pci_device_at(unsigned short bus, unsigned short slot, unsigned short func, RustPciDeviceInfo* out)
@@ -1503,6 +1517,19 @@ void kernel_iommu_domain_destroy(unsigned long domain)
 int kernel_iommu_release(unsigned short sid)
 {
     return kernel::iommu::release(sid) ? 1 : 0;
+}
+
+int kernel_iommu_reserved(unsigned short sid, unsigned long long* base, unsigned long long* limit)
+{
+    if (base == nullptr || limit == nullptr)
+        return 0;
+    u64 first = 0;
+    u64 last = 0;
+    if (!kernel::iommu::reserved(sid, first, last))
+        return 0;
+    *base = first;
+    *limit = last;
+    return 1;
 }
 
 /* The screen, as a function about to be given to a guest needs it

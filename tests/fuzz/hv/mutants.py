@@ -40,6 +40,7 @@ RUN = 'hypervisor/hv/src/run.rs'
 PCI = 'hypervisor/hv/src/devices/pci.rs'
 ACPI = 'hypervisor/hv/src/acpi.rs'
 LINUX = 'hypervisor/hv/src/linux.rs'
+GROUPS = 'modules/hypervisor/hv/src/groups.rs'
 
 # name, what it takes out, the file, the text it changes, what it becomes,
 # the targets that must find it -- the first that does is enough
@@ -855,6 +856,46 @@ MUTANTS = [
 ''',
      '',
      ['platform']),
+    ('groups_siblings', "a function with no ACS of a device of several reaches every other, one with ACS too",
+     GROUPS,
+     'out.extend((0..all.len()).filter(|&g| g != a && all[g].bus == me.bus && all[g].slot == me.slot));',
+     'out.extend((0..all.len()).filter(|&g| g != a && all[g].bus == me.bus && all[g].slot == me.slot '
+     '&& !all[g].isolates()));',
+     ['groups']),
+    ('groups_switch', "a downstream port with no ACS joins its whole switch's subtree",
+     GROUPS,
+     '''                Some(c) => {
+                    let wide = all[c];''',
+     '''                Some(_) => {
+                    let wide = port;''',
+     ['groups']),
+    ('groups_root_device', "a root port with no ACS joins its device's every function and what is below each",
+     GROUPS,
+     'device(&all[g]) || all.iter().any(|h| device(h) && h.holds(all[g].bus))',
+     'port.holds(all[g].bus)',
+     ['groups']),
+    ('groups_acs_flags', "a port isolates with all four of what it has of SV, RR, CR and UF on",
+     GROUPS,
+     'self.acs.is_some_and(|(cap, ctrl)| ctrl & cap & ACS_NEEDED == cap & ACS_NEEDED)',
+     'self.acs.is_some_and(|(cap, ctrl)| ctrl & ACS_RR != 0 || cap & ACS_RR == 0)',
+     ['groups']),
+    ('groups_conventional', 'a conventional bridge isolates nothing',
+     GROUPS,
+     '            Kind::Conventional => false,',
+     '            Kind::Conventional => true,',
+     ['groups']),
+    ('groups_unsure_bus', 'a bus two bridges claim is grouped not at all',
+     GROUPS,
+     '''        if secondary == f.bus || all[..i].iter().any(|g| g.below.is_some_and(|(s, _)| s == secondary)) {
+            return None;
+        }''',
+     '',
+     ['groups']),
+    ('groups_alone', 'a function of a device of one needs no ACS of its own',
+     GROUPS,
+     '            Kind::Endpoint => !self.multi || self.acs_on(),',
+     '            Kind::Endpoint => self.acs_on(),',
+     ['groups']),
     ('run_port_renumbered', 'the bus below a port the one the guest numbered',
      RUN,
      'let port = self.ports.iter().position(|q| q.port.below(t.bus))?;',
