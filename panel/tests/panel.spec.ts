@@ -519,6 +519,26 @@ test('a VM\'s firewall and public address: chosen as it is made, on its page, th
   await expect(firewallRow).toContainText('panel');
 });
 
+test('a host\'s NUMA nodes: their table on its system page, a VM put on one as it is made, its node on its page', async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/p/system`);
+  const nodes = page.getByTestId('resource-numa');
+  await expect(nodes).toContainText('2-3');
+  await expect(nodes).toContainText('21 10');
+  await page.goto(`/ru/h/${host}/p/system`);
+  await expect(page.getByTestId('resource-numa')).toContainText('Узлы NUMA');
+
+  await page.goto(`/en/h/${host}/vms/new`);
+  const chosen = page.locator('select[name=node]');
+  await expect(chosen.locator('option')).toContainText(['Any', 'Node 0', 'Node 1']);
+  await page.fill('input[name=name]', 'numa1');
+  await chosen.selectOption('1');
+  await page.getByRole('button', { name: 'Create' }).click();
+  await expect(page.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+  await page.goto(`/en/h/${host}/vms/numa1`);
+  await expect(page.locator('dl div', { hasText: 'NUMA node' })).toContainText('1');
+});
+
 test('a VM on a network of the cluster\'s: chosen as it is made, judged by one of the cluster\'s firewalls, its port made in vnet', async ({ page }) => {
   const host = await login(page);
   await page.goto(`/en/h/${host}/vms/new`);

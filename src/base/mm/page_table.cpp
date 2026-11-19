@@ -1587,6 +1587,50 @@ void PageTable::get_node_free(ulong node, ulong& free, ulong& zeroed)
     zeroed = lists.zeroed_count;
 }
 
+ulong PageTable::get_node_usable_bytes(ulong node)
+{
+    auto& mmap = MemoryMap::get_instance();
+    auto& numa = Numa::get_instance();
+    if (node >= numa.get_node_count())
+        return 0;
+    if (numa.get_node_count() == 1)
+        return mmap.get_usable_ram_bytes();
+
+    ulong on = 0;
+    ulong covered = 0;
+    for (size_t i = 0; i < mmap.get_region_count(); i++)
+    {
+        ulong addr = 0;
+        ulong len = 0;
+        ulong type = 0;
+        if (!mmap.get_region(i, addr, len, type))
+            break;
+        if (type != MemoryMap::USABLE_RAM_TYPE)
+            continue;
+        /* The firmware's numbers: an end past the address space is its top */
+        const ulong end = (len > ~0UL - addr) ? ~0UL : addr + len;
+        for (ulong r = 0; r < numa.get_range_count(); r++)
+        {
+            ulong base = 0;
+            ulong range_end = 0;
+            ulong range_node = 0;
+            if (!numa.get_range(r, base, range_end, range_node))
+                break;
+            const ulong lo = stdlib::max(addr, base);
+            const ulong hi = stdlib::min(end, range_end);
+            if (lo >= hi)
+                continue;
+            covered += hi - lo;
+            if (range_node == node)
+                on += hi - lo;
+        }
+    }
+    const ulong usable = mmap.get_usable_ram_bytes();
+    if (node == 0 && usable > covered)
+        on += usable - covered;
+    return on;
+}
+
 void PageTable::get_node_huge_pool(ulong node, ulong& blocks, ulong& free)
 {
     blocks = 0;

@@ -1672,48 +1672,6 @@ static void cmd_numa(const char* args, stdlib::Printer& con)
     }
 }
 
-/* The RAM the firmware's map says is usable that is NUMA node `node`'s: each
-   usable region's overlap with the node's ranges -- and, node 0's, what of
-   it no range covers, as Numa::get_phys_node places it */
-static ulong usable_bytes_on(ulong node)
-{
-    auto& mmap = mm::MemoryMap::get_instance();
-    auto& numa = Numa::get_instance();
-    ulong on = 0;
-    ulong covered = 0;
-    for (size_t i = 0; i < mmap.get_region_count(); i++)
-    {
-        ulong addr = 0;
-        ulong len = 0;
-        ulong type = 0;
-        if (!mmap.get_region(i, addr, len, type))
-            break;
-        if (type != mm::MemoryMap::USABLE_RAM_TYPE)
-            continue;
-        /* The firmware's numbers: an end past the address space is its top */
-        const ulong end = (len > ~0UL - addr) ? ~0UL : addr + len;
-        for (ulong r = 0; r < numa.get_range_count(); r++)
-        {
-            ulong base = 0;
-            ulong range_end = 0;
-            ulong range_node = 0;
-            if (!numa.get_range(r, base, range_end, range_node))
-                break;
-            const ulong lo = stdlib::max(addr, base);
-            const ulong hi = stdlib::min(end, range_end);
-            if (lo >= hi)
-                continue;
-            covered += hi - lo;
-            if (range_node == node)
-                on += hi - lo;
-        }
-    }
-    const ulong usable = mmap.get_usable_ram_bytes();
-    if (node == 0 && usable > covered)
-        on += usable - covered;
-    return on;
-}
-
 static void cmd_meminfo(const char* args, stdlib::Printer& con)
 {
     (void)args;
@@ -1772,7 +1730,7 @@ static void cmd_meminfo(const char* args, stdlib::Printer& con)
         pt.get_node_free(node, free, zeroed);
         pt.get_node_huge_pool(node, blocks, blocks_free);
         con.printf("node %lu: usable %lu MiB; pages %lu free, %lu of them zeroed", node,
-            usable_bytes_on(node) / consts::MB, free, zeroed);
+            pt.get_node_usable_bytes(node) / consts::MB, free, zeroed);
         if (blocks != 0)
             con.printf("; huge pool %lu 2MiB pages free of %lu (%lu MiB of %lu)", blocks_free, blocks,
                 blocks_free * mm::PageTable::HUGE_FRAME_SIZE / consts::MB,
