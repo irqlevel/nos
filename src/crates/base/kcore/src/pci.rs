@@ -132,6 +132,16 @@ impl PciDevice {
         if off == 0 { None } else { Some(off) }
     }
 
+    /// The extended capability (PCIe's, past 256 bytes) of id `cap_id`: its
+    /// offset, None where the function has none -- or its bus has no
+    /// extended space reachable (x86-64: no MCFG, or its window refused).
+    pub fn find_extended_capability(&self, cap_id: u16) -> Option<u16> {
+        let off = unsafe {
+            pci::kernel_pci_find_extended_capability(self.bus, self.slot, self.func, cap_id)
+        };
+        if off == 0 { None } else { Some(off) }
+    }
+
     pub fn find_capability_from(&self, cap_id: u8, start_offset: u8) -> Option<u8> {
         let off = unsafe {
             pci::kernel_pci_find_capability(

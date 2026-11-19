@@ -2187,9 +2187,21 @@ Unsupported Request. Where the console is the function's -- a BAR of its,
 or the legacy window of a VGA controller -- the screen lets go of it for
 good (`FbTerm::release_within`, `VgaTerm::release_within`, as Linux's
 vfio-pci takes efifb off its aperture): the reset ends that picture
-anyway, and the memory is the guest's. Then it is reset where it has FLR (as Linux makes one: its
-transactions given a second, the header and the PCIe controls saved and
-written back, the device asked until it answers), and its interrupts taken by
+anyway, and the memory is the guest's. Then it is reset (`ResetPlan`): by its
+FLR where every function of the device the guest holds has one (as Linux
+makes one: its transactions given a second, the device asked until it
+answers); else the whole device by the secondary bus reset of the bridge
+above it, made once, by the first of its functions the guest names, before
+any of them is set up -- where the bus is the device's alone, as it is below
+a PCIe port; else it is given as it is, said. Either way its state is saved
+before and written back after, as Linux's `pci_save_state` keeps it: the
+header, the PCIe controls, each Resizable BAR's size -- a BAR a reset
+resized under its register would be mapped as one size and decode another
+-- and ACS's controls, the last two in the extended configuration space
+(x86-64: the MCFG's ECAM, a bus at a time, held to the port CAM's reading as
+it is opened at the scan; till then and where there is none, an access past
+256 bytes reads all ones -- it used to read the header's again). And its
+interrupts taken by
 the host: its MSI-X where it has it, with its table and PBA in BARs given --
 the real table the host's to program (`kcore::msix::MsixTable`, reached through
 a mapping of its BAR from its start, so that the kernel does not size the BAR
@@ -2292,8 +2304,8 @@ access of it stops the guest. A VM holding a host's function is not saved
 and not moved: its device's DMA reaches no dirty log, and its state is the
 device's.
 
-Not done yet: a secondary bus reset for a function without FLR, the ROM,
-the extended configuration space (ECAM: the Resizable BAR, ACS, AER),
+Not done yet: the ROM, the guest's extended configuration space (the
+host's own is there: ECAM),
 refusing a function a DMAR RMRR names, isolation beyond one device's
 functions (ACS on the path above it), and AMD-Vi. VT-d's posted interrupts
 -- the device's message straight into the vCPU, no host interrupt -- wait for

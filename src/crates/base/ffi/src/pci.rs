@@ -36,6 +36,9 @@ unsafe extern "C" {
         bus: u16, slot: u16, func: u16,
         cap_id: u8, start_offset: u8,
     ) -> u8;
+    /// The extended capability of id `cap_id`: its offset, 256 or past; 0 for
+    /// none, or where the function's bus has no extended space reachable.
+    pub fn kernel_pci_find_extended_capability(bus: u16, slot: u16, func: u16, cap_id: u16) -> u16;
     pub fn kernel_pci_read_config8(bus: u16, slot: u16, func: u16, offset: u16) -> u8;
     pub fn kernel_pci_read_config16(bus: u16, slot: u16, func: u16, offset: u16) -> u16;
     pub fn kernel_pci_read_config32(bus: u16, slot: u16, func: u16, offset: u16) -> u32;

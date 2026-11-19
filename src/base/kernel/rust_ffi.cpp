@@ -1364,6 +1364,12 @@ unsigned char kernel_pci_find_capability(unsigned short bus, unsigned short slot
     return Pci::get_instance().find_capability(bus, slot, func, cap_id, start_offset);
 }
 
+unsigned short kernel_pci_find_extended_capability(unsigned short bus, unsigned short slot,
+    unsigned short func, unsigned short cap_id)
+{
+    return Pci::get_instance().find_extended_capability(bus, slot, func, cap_id);
+}
+
 unsigned char kernel_pci_read_config8(unsigned short bus, unsigned short slot,
     unsigned short func, unsigned short offset)
 {
