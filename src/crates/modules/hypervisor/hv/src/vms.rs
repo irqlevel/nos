@@ -66,7 +66,7 @@ use crate::store::{self, Folder};
 use crate::vmlog::Log;
 
 const START_USAGE: &str =
-    "hv start <name|folder> [force] | <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [pci=bus:dev.fn]... [unsafe_interrupts] [input=...] [log] [restart] [force] [uuid=U] [net] [network=name] [port=N] [forward=nos:guest]... [cmdline=...]";
+    "hv start <name|folder> [force] | <kernel> [mem=MiB] [cpus=N] [cpu=N] [node=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [pci=bus:dev.fn]... [unsafe_interrupts] [input=...] [log] [restart] [force] [uuid=U] [net] [network=name] [port=N] [forward=nos:guest]... [cmdline=...]";
 /// How many times a `restart` guest is booted again after resetting itself
 /// within `RESTART_WINDOW_NS` before that is taken for a loop and it is left
 /// stopped: a guest that reboots in its first second would otherwise take
@@ -612,6 +612,9 @@ pub struct Listed {
     /// The host CPUs its CPUs run on.
     pub cpus: Vec<u32>,
     pub mem_mib: u64,
+    /// On a machine of NUMA nodes, the node its memory was taken from first
+    /// and the share of it, in percent, found there.
+    pub node: Option<(usize, u8)>,
     /// Its port of the switch, and its address there: the port's own on a
     /// host's network, the one vnet gave it on a cluster's.
     pub port: Option<usize>,
@@ -1012,6 +1015,9 @@ struct Vm {
     disk_cpu: Option<u32>,
     kernel: String,
     mem_mib: u64,
+    /// On a machine of NUMA nodes, the node its memory was taken from first
+    /// and how much of it, in percent, the allocator found there.
+    node: Option<(usize, u8)>,
     /// Its port on the switch, with `net`.
     port: Option<usize>,
     /// Its name, when it was started from its folder: one of a name on the
@@ -1074,6 +1080,7 @@ struct VmView {
     disk_cpu: Option<u32>,
     kernel: String,
     mem_mib: u64,
+    node: Option<(usize, u8)>,
     port: Option<usize>,
     name: Option<String>,
 }
@@ -1812,7 +1819,7 @@ impl Vms {
         hv::run::ensure_runnable(machine).map_err(|e| alloc::format!("no guest can run here -- {}", e))?;
         let held = self.reserve_start(name)?;
         let has_disks = !spec.disks.is_empty();
-        let (place, core_hold) = cores.take(machine, spec.cpu, spec.cpus, has_disks, None)?;
+        let (place, core_hold) = cores.take(machine, spec.cpu, spec.numa, spec.cpus, has_disks, None)?;
         spec.placed(&place);
         let id = self.number(Some(name))?;
         core_hold.held_by(Holder::Vm(id));
@@ -1940,7 +1947,7 @@ impl Vms {
          * VM has a number, and given back with the task -- or here, on the
          * way out of a start that goes no further. */
         let has_disks = !spec.disks.is_empty();
-        let (place, core_hold) = cores.take(machine, spec.cpu, spec.cpus, has_disks, None)?;
+        let (place, core_hold) = cores.take(machine, spec.cpu, spec.numa, spec.cpus, has_disks, None)?;
         spec.placed(&place);
         let placement = place.vcpus;
         let disk_cpu = place.disk;
@@ -2166,9 +2173,12 @@ impl Vms {
                        if spec.restart { ", restarted when it resets" } else { "" });
         /* Where its memory is on a machine of nodes: the node its placement
            asked for, and how much of it the allocator found there */
-        if let Some(node) = spec.node {
+        let mem_node = spec.node.map(|node| {
             let (on, all) = built.guest.memory().pages_on(node);
-            let _ = write!(said, ", its memory node {}'s ({}%)", node, on * 100 / all.max(1));
+            (node, (on * 100 / all.max(1)) as u8)
+        });
+        if let Some((node, pct)) = mem_node {
+            let _ = write!(said, ", its memory node {}'s ({}%)", node, pct);
         }
 
         let mut wanted = Vec::new();
@@ -2221,7 +2231,7 @@ impl Vms {
         let port = hold.as_ref().map(|h| h.port);
         let vm = Vm {
             shared: shared.clone(), task: Some(task), cpus, disk_cpu: has_disks.then_some(disk_cpu), kernel, mem_mib,
-            port, name: vm_name, folder: vm_folder, log, disks: disk_words,
+            node: mem_node, port, name: vm_name, folder: vm_folder, log, disks: disk_words,
         };
         let mut handed = None;
         let refused = {
@@ -2296,6 +2306,7 @@ impl Vms {
                 disk_cpu: vm.disk_cpu,
                 kernel: vm.kernel.clone(),
                 mem_mib: vm.mem_mib,
+                node: vm.node,
                 port: vm.port,
                 name: vm.name.clone(),
             });
@@ -2328,6 +2339,9 @@ impl Vms {
             let _ = write!(out, "  {}  cpu{} ", state, if vm.cpus.len() == 1 { "" } else { "s" });
             for (i, c) in vm.cpus.iter().enumerate() {
                 let _ = write!(out, "{}{}", if i == 0 { "" } else { "," }, c);
+            }
+            if let Some((node, pct)) = vm.node {
+                let _ = write!(out, "  node {} ({}% of its memory)", node, pct);
             }
             if let Some(cpu) = vm.disk_cpu {
                 let _ = write!(out, "  disks on cpu {}", cpu);
@@ -3032,6 +3046,7 @@ impl Vms {
                 state,
                 cpus: v.cpus,
                 mem_mib: v.mem_mib,
+                node: v.node,
                 port: v.port,
                 ip: v.port.zip(switch.as_ref()).map(|(p, s)| s.ip_of(p)),
                 public: v.port.zip(switch.as_ref()).and_then(|(p, s)| s.public_of(p)),

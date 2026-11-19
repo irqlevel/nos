@@ -983,6 +983,47 @@ unsigned long kernel_numa_node_free(unsigned long node)
     return free;
 }
 
+/* A node at one moment: ffi::numa::NumaNode, field for field */
+struct RustNumaNode
+{
+    unsigned long long domain;
+    unsigned long long cpus;
+    unsigned long long usable_bytes;
+    unsigned long long free_pages;
+    unsigned long long zeroed_pages;
+    unsigned long long huge_blocks;
+    unsigned long long huge_free;
+};
+
+/* As many words as ffi::numa::NumaNode, which checks the same */
+static_assert(sizeof(RustNumaNode) == 7 * sizeof(unsigned long long), "RustNumaNode is not ffi's NumaNode");
+
+int kernel_numa_node_info(unsigned long node, RustNumaNode* out)
+{
+    if (out == nullptr)
+        return 0;
+    *out = RustNumaNode{};
+    auto& numa = kernel::Numa::get_instance();
+    if (node >= numa.get_node_count())
+        return 0;
+
+    auto& pt = kernel::mm::PageTable::get_instance();
+    ulong free = 0;
+    ulong zeroed = 0;
+    ulong blocks = 0;
+    ulong blocks_free = 0;
+    pt.get_node_free(node, free, zeroed);
+    pt.get_node_huge_pool(node, blocks, blocks_free);
+    out->domain = numa.get_node_domain(node);
+    out->cpus = numa.get_node_cpus(node);
+    out->usable_bytes = pt.get_node_usable_bytes(node);
+    out->free_pages = free;
+    out->zeroed_pages = zeroed;
+    out->huge_blocks = blocks;
+    out->huge_free = blocks_free;
+    return 1;
+}
+
 /* Back into the pool: a panic for an address that is no block of it, or
    one back already. */
 void kernel_frame_free_huge(unsigned long phys)

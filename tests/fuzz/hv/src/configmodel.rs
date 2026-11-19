@@ -76,6 +76,9 @@ fn made_up(r: &mut Input) -> Config {
     if r.bool() {
         o.cpus = Some(r.value32());
     }
+    if r.bool() {
+        o.node = Some(r.value32());
+    }
     o.xapic = r.bool();
     o.ioapic = r.bool();
     o.apicv = match r.u8() % 3 {
@@ -136,6 +139,10 @@ fn changed(old: &Config, r: &mut Input) -> Config {
         0 => {}
         1 => o.forwards.clear(),
         _ => o.forwards.push((r.u16().max(1), r.u16().max(1))),
+    }
+    /* The NUMA node asked for: set, changed or taken out */
+    if r.below(4) == 0 {
+        o.node = if r.bool() { Some(r.value32()) } else { None };
     }
     if r.bool() {
         o.port = if r.bool() { Some(r.value32()) } else { None };

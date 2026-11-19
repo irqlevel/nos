@@ -62,7 +62,7 @@ const ROOT_MAX: usize = PATH_MAX - (1 + NAME_MAX + 1 + LONGEST_NAME);
 /// How deep `delete` goes into a VM's folder.
 const DELETE_DEPTH: usize = 8;
 
-pub(crate) const CREATE_USAGE: &str = "hv create <name> <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] \
+pub(crate) const CREATE_USAGE: &str = "hv create <name> <kernel> [mem=MiB] [cpus=N] [cpu=N] [node=N] [xapic] [ioapic] \
                             [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [pci=bus:dev.fn]... [unsafe_interrupts] \
                             [input=...] [log] [restart] [net] [port=N] [forward=nos:guest]... [force] \
                             [cmdline=...]\n\
@@ -922,6 +922,9 @@ fn summary(c: &Config, out: &mut Output) {
     let cpus = o.cpus.unwrap_or(1);
     let _ = write!(out, "  {}  {} MiB  {} cpu{}", kernel, o.mem_mib.unwrap_or(guest::DEFAULT_MEM_MIB), cpus,
                    if cpus == 1 { "" } else { "s" });
+    if let Some(node) = o.node {
+        let _ = write!(out, " on node {}", node);
+    }
     if !o.disks.is_empty() {
         let _ = write!(out, "  disks");
         for (i, (path, ro)) in o.disks.iter().enumerate() {

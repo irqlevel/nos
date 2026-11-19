@@ -2,7 +2,32 @@
    as the firmware's tables said it -- one node on a machine they say nothing
    of. Values only, every one of them: a CPU or a node past the machine's is
    answered for, not trusted. */
+
+/// A node at one moment, as `kernel_numa_node_info` copies it
+/// (rust_ffi.cpp's RustNumaNode): its proximity domain and CPUs, the RAM the
+/// firmware's map gives it, its free pages and those of them zeroed, and its
+/// share of the huge pool.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct NumaNode {
+    pub domain: u64,
+    /// A bit each, by index.
+    pub cpus: u64,
+    pub usable_bytes: u64,
+    pub free_pages: u64,
+    pub zeroed_pages: u64,
+    /// 2 MiB blocks.
+    pub huge_blocks: u64,
+    pub huge_free: u64,
+}
+
+/* As many words as the C++'s RustNumaNode, which checks the same */
+const _: () = assert!(core::mem::size_of::<NumaNode>() == 7 * 8);
+
 unsafe extern "C" {
+    /// Node `node` into `out`: 1, or 0 -- `out` zeroed -- for a node past
+    /// the machine's. Task context: it takes the page table's lock.
+    pub fn kernel_numa_node_info(node: usize, out: *mut NumaNode) -> i32;
     /// How many nodes: 1 on a machine of one.
     pub safe fn kernel_numa_node_count() -> usize;
     /// The node of CPU `cpu` (its index; the APIC id on x86-64): 0 for a CPU

@@ -10,7 +10,9 @@
 //! makes a CPU's load from two `cpus` answers, the idle time between them
 //! over the time between them.
 
+use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt::Write;
 use kcore::consts::NS_PER_MS;
 use kcore::system::{self, ModuleOutcome};
 use kcore::klog;
@@ -22,10 +24,11 @@ static SYSTEM: System = System;
 
 const DESCRIPTOR: &str = include_str!("system.descriptor.json");
 
-static METHODS: [Method; 13] = [
+static METHODS: [Method; 14] = [
     Method { name: "info", kind: Kind::Read },
     Method { name: "cpus", kind: Kind::Read },
     Method { name: "memory", kind: Kind::Read },
+    Method { name: "numa", kind: Kind::Read },
     Method { name: "tasks", kind: Kind::Read },
     Method { name: "log", kind: Kind::Read },
     Method { name: "modules", kind: Kind::Read },
@@ -102,6 +105,7 @@ fn no_params(method: &str, p: Params, call: &mut Call) -> Status {
         "info" => info(call),
         "cpus" => cpus(call),
         "memory" => memory(call),
+        "numa" => numa(call),
         "tasks" => tasks(call),
         "modules" => modules(call),
         "interrupts" => interrupts(call),
@@ -217,6 +221,60 @@ fn memory(call: &mut Call) -> Status {
         w.field_uint("rust_heap_allocations", m.rust_allocs);
         w.field_uint("rust_heap_frees", m.rust_frees);
         w.field_uint("rust_heap_refused", m.rust_refused);
+        w.end_object();
+    })
+}
+
+/// Room for a node's CPUs as runs: 64 CPUs every other one, three bytes each.
+const CPU_RUNS_MAX: usize = 192;
+/// Room for one distance and the space before it.
+const DISTANCE_BYTES: usize = 4;
+
+/// Each NUMA node (`numa` in the shell): its CPUs, the RAM the firmware's map
+/// gives it, what of it is free and zeroed, its share of the huge pool, and
+/// its distances to every node in order -- one node, all of it, on a machine
+/// whose firmware says nothing of nodes.
+fn numa(call: &mut Call) -> Status {
+    let count = kcore::numa::node_count();
+    let m = system::memory();
+    let mut nodes = Vec::new();
+    if nodes.try_reserve_exact(count).is_err() {
+        return call.refuse(Status::Busy, "no memory for the nodes", None);
+    }
+    for node in 0..count {
+        let Some(info) = kcore::numa::node_info(node) else {
+            continue;
+        };
+        let mut cpus = String::new();
+        let mut distances = String::new();
+        if cpus.try_reserve(CPU_RUNS_MAX).is_err() || distances.try_reserve(DISTANCE_BYTES * count).is_err() {
+            return call.refuse(Status::Busy, "no memory for the nodes", None);
+        }
+        let _ = kcore::cpu::write_runs(&mut cpus, info.cpus);
+        for to in 0..count {
+            let _ = write!(distances, "{}{}", if to == 0 { "" } else { " " }, kcore::numa::distance(node, to));
+        }
+        nodes.push((node, info, cpus, distances));
+    }
+    call.answer(|w| {
+        w.begin_object();
+        w.key("nodes");
+        w.begin_list();
+        for (node, info, cpus, distances) in &nodes {
+            w.begin_object();
+            w.field_uint("node", *node as u64);
+            w.field_uint("domain", info.domain);
+            w.field_str("cpus", cpus);
+            w.field_uint("cpu_count", u64::from(info.cpus.count_ones()));
+            w.field_uint("memory_bytes", info.usable_bytes);
+            w.field_uint("free_bytes", info.free_pages.saturating_mul(m.page_bytes));
+            w.field_uint("zeroed_bytes", info.zeroed_pages.saturating_mul(m.page_bytes));
+            w.field_uint("huge_total_bytes", info.huge_blocks.saturating_mul(m.huge_block_bytes));
+            w.field_uint("huge_free_bytes", info.huge_free.saturating_mul(m.huge_block_bytes));
+            w.field_str("distances", distances);
+            w.end_object();
+        }
+        w.end_list();
         w.end_object();
     })
 }
