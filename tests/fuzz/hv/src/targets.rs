@@ -32,6 +32,7 @@ pub static ALL: &[Target] = &[
     Target { name: "pm", run: pm, max_len: 2048 },
     Target { name: "pvpanic", run: pvpanic_target, max_len: 512 },
     Target { name: "pci", run: pci_bus, max_len: 2048 },
+    Target { name: "hostfn", run: crate::hostmodel::hostfn_target, max_len: 4096 },
     Target { name: "lapic", run: lapic_target, max_len: 4096 },
     Target { name: "ioapic", run: ioapic_target, max_len: 4096 },
     Target { name: "msi", run: msi, max_len: 1024 },
@@ -433,6 +434,8 @@ fn pci_bus(r: &mut Input) {
     bus.add(Function::device(&Blk::identity(), 0xC000, blk::BAR_SIZE, 11).with_msix(2, 0xFE00_1000))
         .expect("a disk");
     bus.add(Function::device(&Net::identity(), 0xC100, net::BAR_SIZE, 10)).expect("a NIC");
+    /* A host's function on slot 3, whose space is the run loop's */
+    let host = bus.add_host().expect("a host's function");
     while let Some(op) = r.op(7) {
         match op {
             0 => {
@@ -474,6 +477,11 @@ fn pci_bus(r: &mut Input) {
             }
             5 => {
                 let port = if r.bool() { 0xC000 + r.below(0x200) as u16 } else { r.u16() };
+                /* Only the configuration data's ports are a host function's,
+                 * whatever the address latched names */
+                let hosted = bus.host_target(port);
+                invariant!(hosted.is_none() || (pci::CONFIG_DATA..pci::CONFIG_DATA + 4).contains(&port),
+                           "port {:#x} taken for host function {}'s space at {:?}", port, host, hosted);
                 if let Some((slot, offset)) = bus.io_target(port) {
                     invariant!(slot != 0 && usize::from(slot) < pci::MAX_SLOTS, "port {:#x} in slot {}", port, slot);
                     invariant!(u32::from(offset) < 0x100, "port {:#x} at {:#x} into its BAR", port, offset);
@@ -2137,7 +2145,7 @@ fn insn(r: &mut Input) {
 /* ---- what a guest's image decides: the Linux loader ---- */
 
 fn linux(r: &mut Input) {
-    use crate::linux::{build, plan, set_entry, Firmware, Header};
+    use crate::linux::{build, plan_below, set_entry, Firmware, Header};
     let mut first = vec![0u8; 0x270 + r.below(0x400) as usize];
     for b in first.iter_mut() {
         *b = r.u8();
@@ -2178,11 +2186,15 @@ fn linux(r: &mut Input) {
         1 => r.value64(),
         _ => r.below(64 << 20),
     };
-    let Ok(l) = plan(&h, mem_bytes, kernel_len, initrd_len) else { return };
+    /* A guest's RAM below 4 GiB to the devices' pages, or -- one holding a
+     * host's function -- to the hole its BARs go in */
+    let low_end = if r.u8() < 64 { crate::linux::HOLE_RAM_END } else { crate::linux::LOW_RAM_END };
+    let Ok(l) = plan_below(&h, mem_bytes, low_end, kernel_len, initrd_len) else { return };
+    invariant!(l.low_end == low_end, "a layout of RAM below {:#x}, planned for {:#x}", l.low_end, low_end);
     /* What the loader streams the kernel and the initrd by, and writes its
      * own tables around: inside the RAM below 4 GiB -- under the devices'
      * pages, whatever is past them -- apart, and clear of the tables. */
-    let low = crate::linux::Ram::of(mem_bytes).low;
+    let low = crate::linux::Ram::of_below(mem_bytes, low_end).low;
     let kernel_end = l.kernel_addr.checked_add(l.kernel_len);
     invariant!(kernel_end.is_some_and(|e| e <= low), "a kernel at {:#x} of {:#x} bytes in {:#x} of RAM below 4 GiB",
                l.kernel_addr, l.kernel_len, low);
@@ -2197,7 +2209,7 @@ fn linux(r: &mut Input) {
     if mem_bytes > crate::run::MAX_MEM_BYTES {
         return;
     }
-    let Some(memory) = GuestMemory::with_ram(mem_bytes) else { return };
+    let Some(memory) = GuestMemory::with_ram_below(mem_bytes, low_end) else { return };
     let cmdline: Vec<u8> = (0..r.below(512)).map(|_| r.u8()).collect();
     let firmware = r.bool().then_some(Firmware { rsdp: crate::acpi::AREA, start: crate::acpi::AREA,
                                                  end: crate::acpi::AREA_END });
@@ -2207,7 +2219,7 @@ fn linux(r: &mut Input) {
         /* The zero page's memory map: RAM the guest has, every byte of it. */
         let mut n = [0u8; 1];
         memory.read(0x7000 + 0x1e8, &mut n).expect("the e820 count");
-        e820_held(&memory, 0x7000 + 0x2d0, 20, usize::from(n[0]), mem_bytes);
+        e820_held(&memory, 0x7000 + 0x2d0, 20, usize::from(n[0]), mem_bytes, low_end);
         zero_page_held(&memory, &first, &l, usize::from(n[0]), firmware.map(|f| f.rsdp));
     }
     let mut vcpu = crate::vm::Backend::default();
@@ -2246,9 +2258,9 @@ fn zero_page_held(memory: &GuestMemory, first: &[u8], l: &crate::linux::Layout, 
 /// A memory map of `n` entries at `map`, `stride` bytes apart, held to the
 /// guest it describes: entries apart and in order, each RAM or reserved,
 /// RAM only where the guest has memory, all of its RAM there, and the last
-/// of it where `linux::Ram` ends it.
-fn e820_held(memory: &GuestMemory, map: u64, stride: usize, n: usize, mem_bytes: u64) {
-    let ram = crate::linux::Ram::of(mem_bytes);
+/// of it where `linux::Ram` ends it -- below 4 GiB at `low_end`.
+fn e820_held(memory: &GuestMemory, map: u64, stride: usize, n: usize, mem_bytes: u64, low_end: u64) {
+    let ram = crate::linux::Ram::of_below(mem_bytes, low_end);
     invariant!((2..=crate::linux::E820_ENTRIES).contains(&n), "a memory map of {} entries", n);
     let mut end = 0u64;
     let mut ram_top = 0u64;
@@ -2415,7 +2427,7 @@ pub fn report() {
 }
 
 fn pvh(r: &mut Input) {
-    use crate::pvh::{build, plan, set_entry, Image, MAX_SEGMENTS, START_INFO};
+    use crate::pvh::{build, plan_below, set_entry, Image, MAX_SEGMENTS, START_INFO};
     use std::sync::atomic::Ordering::Relaxed;
     let f = elf_image(r);
     let file_len = if r.u8() < 240 { f.len() as u64 } else { r.value64() };
@@ -2447,13 +2459,14 @@ fn pvh(r: &mut Input) {
         2 => (4064 + r.below(32768 - 4064 + 1)) << 20,
         _ => (16 + r.below(4096 - 16 + 1)) << 20,
     };
-    let low = crate::linux::Ram::of(mem_bytes).low;
+    let low_end = if r.u8() < 64 { crate::linux::HOLE_RAM_END } else { crate::linux::LOW_RAM_END };
+    let low = crate::linux::Ram::of_below(mem_bytes, low_end).low;
     let initrd_len = match r.u8() % 4 {
         0 => r.value64(),
         1 => 0,
         _ => r.below(64 << 20),
     };
-    let Ok(l) = plan(&image, mem_bytes, initrd_len) else { return };
+    let Ok(l) = plan_below(&image, mem_bytes, low_end, initrd_len) else { return };
     PVH_PLANNED.fetch_add(1, Relaxed);
     /* All of it in the RAM below 4 GiB, which a 32-bit entry with paging
      * off reaches: under the devices' pages, whatever is past them. */
@@ -2473,7 +2486,7 @@ fn pvh(r: &mut Input) {
         return;
     }
 
-    let Some(memory) = GuestMemory::with_ram(mem_bytes) else { return };
+    let Some(memory) = GuestMemory::with_ram_below(mem_bytes, low_end) else { return };
     let cmdline: Vec<u8> = (0..r.below(2100)).map(|_| r.u8()).collect();
     let firmware = r.bool().then_some(crate::linux::Firmware { rsdp: crate::acpi::AREA, start: crate::acpi::AREA,
                                                                end: crate::acpi::AREA_END });
@@ -2492,7 +2505,7 @@ fn pvh(r: &mut Input) {
         invariant!(at32(0) == 0x336E_C578 && at32(4) == 1, "a start info of magic {:#x}, version {}", at32(0), at32(4));
         invariant!(at32(12) == u32::from(l.initrd_len != 0), "{} modules, for an initrd of {}", at32(12), l.initrd_len);
         let (map, n) = (at64(40), at32(48) as usize);
-        e820_held(&memory, map, 24, n, mem_bytes);
+        e820_held(&memory, map, 24, n, mem_bytes, low_end);
     }
     let mut vcpu = crate::vm::Backend::default();
     set_entry(&mut vcpu, &image);
@@ -2511,6 +2524,8 @@ fn acpi(r: &mut Input) {
         ioapic: r.bool().then(|| r.u8()),
         pci: &routes,
         mmio: r.bool().then(|| (r.u32(), r.u32())),
+        bars32: r.bool().then(|| (r.u32(), r.u32())),
+        bars64: r.bool().then(|| (r.u64(), r.u64())),
     };
     let mut buf = vec![0u8; if r.u8() < 224 { MAX_BYTES } else { r.below(MAX_BYTES as u64) as usize }];
     if let Some(n) = build(&m, &mut buf) {

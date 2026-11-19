@@ -63,7 +63,7 @@ const ROOT_MAX: usize = PATH_MAX - (1 + NAME_MAX + 1 + LONGEST_NAME);
 const DELETE_DEPTH: usize = 8;
 
 pub(crate) const CREATE_USAGE: &str = "hv create <name> <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] \
-                            [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... \
+                            [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [pci=bus:dev.fn]... [unsafe_interrupts] \
                             [input=...] [log] [restart] [net] [port=N] [forward=nos:guest]... [force] \
                             [cmdline=...]\n\
                             hv create <name> <http(s)://image> [size=N[K|M|G|T] | onto=<device|nbs:volume>] [password=...] \

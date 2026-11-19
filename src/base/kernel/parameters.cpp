@@ -43,6 +43,7 @@ Parameters::Parameters()
     , ucode_off_(false)
     , wx_probe_md_(WxProbeOff)
     , usb_off_(false)
+    , iommu_on_(false)
     , rc_off_(false)
     , con_mode_(ConsoleBoth)
     , dhcp_md_(DhcpOn)
@@ -50,6 +51,7 @@ Parameters::Parameters()
     , netconsole_ip_(0)
     , netconsole_port_(0)
     , netconsole_tail_kb_(0)
+    , deadman_secs_(0)
     , net_frame_count_(0)
     , huge_pool_percent_(0)
     , huge_pool_bytes_(0)
@@ -91,6 +93,11 @@ bool Parameters::is_panic_vga()
 ulong Parameters::get_panic_reset_secs()
 {
     return panic_reset_secs_;
+}
+
+ulong Parameters::get_deadman_secs()
+{
+    return deadman_secs_;
 }
 
 bool Parameters::is_smp_off()
@@ -151,6 +158,11 @@ bool Parameters::is_wx_probe_heap()
 bool Parameters::is_usb_off()
 {
     return usb_off_;
+}
+
+bool Parameters::is_iommu_on()
+{
+    return iommu_on_;
 }
 
 bool Parameters::is_rc_off()
@@ -565,6 +577,18 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
             klog(0, "Unknown value %s, key %s", value, key);
         }
     }
+    else if (stdlib::str_cmp(key, "deadman") == 0)
+    {
+        ulong secs = 0;
+        if (stdlib::parse_ulong(value, secs) && secs >= DEADMAN_SECS_MIN && secs <= DEADMAN_SECS_MAX)
+        {
+            deadman_secs_ = secs;
+        }
+        else
+        {
+            klog(0, "Invalid deadman %s: seconds, %lu to %lu", value, DEADMAN_SECS_MIN, DEADMAN_SECS_MAX);
+        }
+    }
     else if (stdlib::str_cmp(key, "its") == 0)
     {
         its_enabled_ = (stdlib::str_cmp(value, "off") != 0);
@@ -572,6 +596,10 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
     else if (stdlib::str_cmp(key, "usb") == 0)
     {
         usb_off_ = (stdlib::str_cmp(value, "off") == 0);
+    }
+    else if (stdlib::str_cmp(key, "iommu") == 0)
+    {
+        iommu_on_ = (stdlib::str_cmp(value, "on") == 0);
     }
     else if (stdlib::str_cmp(key, "rc") == 0)
     {

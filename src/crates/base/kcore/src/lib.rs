@@ -23,6 +23,7 @@ pub mod pci;
 pub mod percpu;
 pub mod pod;
 pub mod msix;
+pub mod iommu;
 pub mod input;
 pub mod interrupt;
 pub mod softirq;

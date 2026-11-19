@@ -65,6 +65,13 @@ private:
 
     void set_entry(u8 index, u64 data);
 
+    /* A pin programmed, set_irq's and set_irq_level's: where interrupts are
+       remapped (drivers/iommu.h) its entry names an entry of the IO-APIC's
+       unit's table, made for the pin -- a new one each time, the old given
+       back once the pin no longer names it -- and verified against the
+       IO-APIC's requester id */
+    bool program(u8 irq, u64 apic_id, u8 vector, bool level, bool active_high);
+
     /* Backstop for a destination the entry cannot encode; the caller is
        supposed to have filtered it out with can_target() already. */
     u64 check_dest(u8 irq, u64 apic_id);
@@ -105,6 +112,13 @@ private:
 
     void *base_address_;
     SpinLock op_lock_;
+
+    /* Each pin's handle in the interrupt table, NO_HANDLE for none, under
+       handles_lock_ -- taken before the table's own locks, never inside
+       op_lock_ */
+    static const u16 NO_HANDLE = 0xFFFF;
+    u16 pin_handle_[MAX_PINS];
+    SpinLock handles_lock_;
 };
 
 }

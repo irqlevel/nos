@@ -1,5 +1,8 @@
 #include <drivers/hpet.h>
 #include <drivers/acpi.h>
+#include <arch/x86_64/vtd.h>
+#include <drivers/iommu.h>
+#include <drivers/screen.h>
 #include <hal/irq_stubs.h>
 
 /* Link stubs for the x86-only paths still referenced from common code on
@@ -42,6 +45,137 @@ Acpi::~Acpi()
 bool Acpi::has_firmware_watchdog()
 {
     return false;
+}
+
+/* No VT-d here: the shell's `iommu` says there is nothing to show (an SMMU
+   would be this architecture's own) */
+Vtd::Vtd()
+    : unit_count_(0)
+    , last_bus_(0)
+    , on_(false)
+    , remapping_(false)
+    , io_apic_sid_(0)
+    , io_apic_unit_(nullptr)
+    , fault_apic_id_(0)
+{
+    for (size_t i = 0; i < stdlib::array_size(units_); i++)
+        units_[i] = nullptr;
+}
+
+Vtd::~Vtd()
+{
+}
+
+void Vtd::shell(const char* args, stdlib::Printer& printer)
+{
+    (void)args;
+    printer.printf("no DMA remapping units\n");
+}
+
+/* drivers/iommu.h: no IOMMU on this architecture yet -- nothing translated,
+   no domain to be had */
+namespace iommu
+{
+
+bool on()
+{
+    return false;
+}
+
+ulong domain_create(u16 sid)
+{
+    (void)sid;
+    return 0;
+}
+
+bool domain_map(ulong domain, u64 iova, u64 phys, ulong pages)
+{
+    (void)domain;
+    (void)iova;
+    (void)phys;
+    (void)pages;
+    return false;
+}
+
+bool domain_attach(ulong domain, u16 sid)
+{
+    (void)domain;
+    (void)sid;
+    return false;
+}
+
+bool domain_detach(ulong domain, u16 sid)
+{
+    (void)domain;
+    (void)sid;
+    return false;
+}
+
+void domain_destroy(ulong domain)
+{
+    (void)domain;
+}
+
+bool release(u16 sid)
+{
+    (void)sid;
+    return false;
+}
+
+/* No interrupt remapping either: nothing is */
+bool remapping()
+{
+    return false;
+}
+
+long remap_alloc(u16 sid, u8 vector, u32 apic_id, bool level)
+{
+    (void)sid;
+    (void)vector;
+    (void)apic_id;
+    (void)level;
+    return -1;
+}
+
+bool remap_retarget(u16 sid, u16 handle, u32 apic_id)
+{
+    (void)sid;
+    (void)handle;
+    (void)apic_id;
+    return false;
+}
+
+void remap_free(u16 sid, u16 handle)
+{
+    (void)sid;
+    (void)handle;
+}
+
+u16 io_apic_sid()
+{
+    return 0;
+}
+
+}
+
+/* drivers/screen.h's hold and release: this architecture has no screen of
+   the firmware's (drivers/screen.cpp is x86's) -- nothing to hold, none to
+   let go of */
+namespace screen
+{
+
+void hold(bool on)
+{
+    (void)on;
+}
+
+bool release_within(ulong base, ulong size)
+{
+    (void)base;
+    (void)size;
+    return false;
+}
+
 }
 
 Hpet::Hpet()

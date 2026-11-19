@@ -58,6 +58,9 @@ runs, NAT to the internet, a public address for a VM that wants one.
 placed by a scheduler on hosts with room and restarted where their host died.
 [vm-migration.md](vm-migration.md) is a running VM moved to another host,
 its memory copied as it runs, its disk on NBS and its network vnet's.
+[gpu-passthrough.md](gpu-passthrough.md) is a host's PCI device -- first an
+NVIDIA GPU -- handed whole to a Linux guest: VT-d in the host, its domains
+and interrupt remapping, and the device's function on the guest's bus.
 [review-2026-11-open.md](review-2026-11-open.md) is what the review of
 2026-11-12 -- the Rust ffi, base and hypervisor -- left open.
 

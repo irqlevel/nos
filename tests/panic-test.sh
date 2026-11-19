@@ -29,6 +29,12 @@
 # reach the collector, and panic=1 has to reset the machine. Before the page
 # was unmapped there was no panic to test: the stack ran on over its own
 # header and into the block below.
+#
+# And between the first two and the third, a boot on trial (deadman=10):
+# nothing calls its deadline off, so ten seconds into the boot the kernel has
+# to panic saying that is why, and panic=1 reset the machine -- what brings a
+# server with nobody to reset it back from a nos that never reached the
+# network.
 # Usage: tests/panic-test.sh [--skip-build] [--arch x86_64|aarch64]
 # Env:   PANIC_TIMEOUT  seconds to wait for each boot to panic (default 120)
 #        PANIC_HVF      set to 1 to run the arm64 boots under hvf (Apple Silicon)
@@ -56,6 +62,9 @@ STAYS_FOR=8
 SHELL_PORT=9103
 NC_PORT=6670
 OFFSTACK_ARGS="panic=1 dhcp=auto udpshell=$SHELL_PORT netconsole=10.0.2.2:$NC_PORT"
+# The boot on trial, and what its panic says
+DEADMAN_ARGS="deadman=10 panic=1"
+DEADMAN_SAYS="past its deadline, and nothing called it off"
 TMPDIR_PT="$(mktemp -d)"
 QEMU_PID=""
 
@@ -85,13 +94,15 @@ fi
 # ISO of its own; arm64 takes -append and needs none.
 if [ "$ARCH" = "x86_64" ]; then
     [ -f bin/kernel64.elf ] || fail "bin/kernel64.elf not found"
-    echo "panic-test: building the three ISOs (docker)..."
-    docker run --platform linux/amd64 --rm -v "$PWD:/src" -w /src -e OFFSTACK_ARGS="$OFFSTACK_ARGS" nos-builder bash -c '
+    echo "panic-test: building the four ISOs (docker)..."
+    docker run --platform linux/amd64 --rm -v "$PWD:/src" -w /src -e OFFSTACK_ARGS="$OFFSTACK_ARGS" \
+        -e DEADMAN_ARGS="$DEADMAN_ARGS" nos-builder bash -c '
         set -e
-        for name in reset stays offstack; do
+        for name in reset stays deadman offstack; do
             case "$name" in
                 reset) args="wxprobe=text panic=1" ;;
                 stays) args="wxprobe=text" ;;
+                deadman) args="$DEADMAN_ARGS" ;;
                 offstack) args="$OFFSTACK_ARGS" ;;
             esac
             root="out/x86_64/panic-iso"
@@ -112,11 +123,15 @@ else
     fail "unknown arch: $ARCH"
 fi
 
-# One boot that is to reset itself, one that is to stay.
-for NAME in reset stays; do
+# One boot that is to reset itself, one that is to stay, and the boot on
+# trial, to reset itself past its deadline.
+for NAME in reset stays deadman; do
     LOG="$TMPDIR_PT/panic-$NAME.log"
-    ARGS="wxprobe=text"
-    [ "$NAME" = reset ] && ARGS="$ARGS panic=1"
+    case "$NAME" in
+        reset) ARGS="wxprobe=text panic=1" ;;
+        stays) ARGS="wxprobe=text" ;;
+        deadman) ARGS="$DEADMAN_ARGS" ;;
+    esac
 
     if [ "$ARCH" = "x86_64" ]; then
         qemu-system-x86_64 \
@@ -149,7 +164,10 @@ for NAME in reset stays; do
         sleep 1
         ELAPSED=$((ELAPSED + 1))
         [ -f "$LOG" ] || continue
-        if grep -q "^PANIC:" "$LOG"; then
+        # The C++ half's report begins a line; the Rust half's (the
+        # deadline's) is "RUST PANIC:", after whatever the line had -- the
+        # shell's prompt, say
+        if grep -q -E "^PANIC:|RUST PANIC:" "$LOG"; then
             PANICKED=1
             break
         fi
@@ -157,15 +175,19 @@ for NAME in reset stays; do
     done
     [ "$PANICKED" = "1" ] || fail "$NAME: no panic within ${PANIC_TIMEOUT}s"
 
-    if [ "$NAME" = reset ]; then
+    if [ "$NAME" != stays ]; then
         WAITED=0
         while kill -0 "$QEMU_PID" 2>/dev/null && [ "$WAITED" -lt "$RESET_WITHIN" ]; do
             sleep 1
             WAITED=$((WAITED + 1))
         done
-        kill -0 "$QEMU_PID" 2>/dev/null && fail "reset: still running ${RESET_WITHIN}s after the panic, with panic=1"
-        grep -q "resetting the machine in 1 s" "$LOG" || fail "reset: it reset without saying so"
-        echo "panic-test: reset ${WAITED}s after the panic"
+        kill -0 "$QEMU_PID" 2>/dev/null && fail "$NAME: still running ${RESET_WITHIN}s after the panic, with panic=1"
+        grep -q "resetting the machine in 1 s" "$LOG" || fail "$NAME: it reset without saying so"
+        if [ "$NAME" = deadman ]; then
+            grep -q "$DEADMAN_SAYS" "$LOG" || fail "deadman: a panic, but not the deadline's"
+            grep -q "deadman: a panic 10 s into the boot" "$LOG" || fail "deadman: never said it was set"
+        fi
+        echo "panic-test: $NAME: reset ${WAITED}s after the panic"
     else
         sleep "$STAYS_FOR"
         kill -0 "$QEMU_PID" 2>/dev/null || fail "stays: reset by itself without panic="

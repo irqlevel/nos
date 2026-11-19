@@ -1,6 +1,7 @@
 /* RTL8111/8168 Gigabit Ethernet driver for NOS.
  *
- * Supports Realtek RTL8168 (PCI 10EC:8168) as found in Hetzner EX44/AX41.
+ * Supports Realtek RTL8168 (PCI 10EC:8168): first run on real hardware on
+ * Hertz's MSI PRO B760M-P, an RTL8168H (XID 541).
  *
  * Architecture:
  *  - PCI probe scans for 10EC:8168 devices; each match calls init_device().
@@ -12,7 +13,10 @@
  *    The net layer calls process_rx() on every registered device from the
  *    softirq task.  process_rx() harvests received descriptors, hands the
  *    frames up, and reposts fresh RX frames.
- *  - Interrupts: legacy INTx (RTL8168 rarely exposes MSI-X; use LegacyInterrupt).
+ *  - Interrupts: MSI-X vector 0 where the chip offers a table, else MSI, else
+ *    its INTx line (attach_interrupt). A UEFI machine's firmware may leave the
+ *    line unrouted -- Interrupt Line 0xFF, which no IO-APIC pin is -- as
+ *    Hertz's does, whose 8168H has four MSI-X entries.
  *
  * Locking:
  *  - The TX ring is the driver's `NetDriver::Tx`: flush_tx is handed it, under
@@ -33,7 +37,7 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use kcore::once::Once;
 use kcore::sync::IrqSpinLock;
-use kcore::{klog, dma, io, interrupt, pci, softirq};
+use kcore::{klog, dma, io, interrupt, msix, pci, softirq};
 use net::{Frame, NetDriver, RxQueue, TxQueue};
 
 mod desc;
@@ -56,8 +60,25 @@ static DEVICE_COUNT: AtomicU32 = AtomicU32::new(0);
  * 1 page is sufficient and avoids over-mapping). */
 const BAR_MAP_PAGES: usize = 1;
 
+/* PCI command register bits used on the INTx path */
+const PCI_COMMAND: u16 = 0x04;
+const PCI_COMMAND_INTX_DISABLE: u16 = 1 << 10;
+
 /* ================================================================== */
 /* Device structure */
+
+/* The interrupt a device has, as r8125's.  Field order is the drop order,
+ * and it matters: the handler goes before the table its vector is an entry
+ * of. */
+struct Irqs {
+    /* 1st: unregister the ISR (no further callbacks after this) */
+    _msix_irq: Option<msix::MsixInterrupt>,
+    /* 2nd: tear down the MSI-X table -- or the MSI capability taken as a
+     * table of one -- masking its entries */
+    _msix_table: Option<msix::MsixTable>,
+    /* 3rd: the legacy INTx slot, if that is the path in use */
+    _intx: Option<interrupt::LegacyInterrupt>,
+}
 
 /* What the interrupt handler, the transmit path and the receive poll share:
  * registers and counters.  The rings are not here -- each belongs to the one
@@ -69,7 +90,7 @@ struct R8168Device {
     regs:         io::MmioRegion,
     _bar_mapping: dma::PhysMapping,
     /* The interrupt, until shutdown takes it out to unregister it. */
-    irq:          IrqSpinLock<Option<interrupt::LegacyInterrupt>>,
+    irqs:         IrqSpinLock<Option<Irqs>>,
     /* Statistics (atomic so every path can update them without a lock) */
     tx_packets:   AtomicU64,
     rx_packets:   AtomicU64,
@@ -88,8 +109,8 @@ impl R8168Device {
 
         /* Unregistered outside the lock: that is a call into the kernel's
          * interrupt table, which is nothing to make under a spinlock. */
-        let irq = self.irq.lock().take();
-        drop(irq);
+        let irqs = self.irqs.lock().take();
+        drop(irqs);
     }
 }
 
@@ -250,23 +271,18 @@ fn init_device(pci_dev: &pci::PciDevice) {
     let dev: &'static R8168Device = Box::leak(Box::new(R8168Device {
         regs,
         _bar_mapping: bar_mapping,
-        irq:        IrqSpinLock::new(None),
+        irqs:       IrqSpinLock::new(None),
         tx_packets: AtomicU64::new(0),
         rx_packets: AtomicU64::new(0),
         rx_dropped: AtomicU64::new(0),
     }));
 
-    /* --- Register legacy interrupt --- */
-    let irq = match interrupt::LegacyInterrupt::register_level_for(pci_dev, dev, isr) {
-        Some(i) => i,
-        None => {
-            klog!(0, "r8168: failed to register interrupt");
-            dev.quiesce();
-            return;
-        }
-    };
-    klog!(0, "r8168: IRQ vector={}", irq.vector());
-    *dev.irq.lock() = Some(irq);
+    /* --- Its interrupt --- */
+    if !attach_interrupt(pci_dev, dev) {
+        klog!(0, "r8168: no interrupt to be had: not MSI-X, not MSI, not its line (irq {})", pci_dev.irq_line);
+        dev.quiesce();
+        return;
+    }
 
     /* --- Enable TX + RX --- */
     dev.regs.write8(CMD_REG, CMD_TX_EN | CMD_RX_EN);
@@ -285,11 +301,58 @@ fn init_device(pci_dev: &pci::PciDevice) {
     DEVICE_COUNT.store(idx + 1, Ordering::Relaxed);
     /* The slot is this device's own: init is single-threaded. */
     let _ = DEVICES[idx as usize].set(dev);
-    klog!(0, "r8168: registered as {} (irq={})", name, pci_dev.irq_line);
+    klog!(0, "r8168: registered as {}", name);
 }
 
 /* ================================================================== */
 /* Helpers */
+
+/// Attach an interrupt to the device: MSI-X vector 0 where the chip offers a
+/// table, then its MSI, then its INTx line.  False where none worked.
+fn attach_interrupt(pci_dev: &pci::PciDevice, dev: &'static R8168Device) -> bool {
+    /* One vector carries every event, as on the 8125: the ISR loops until
+     * the status reads zero, which an edge-triggered message needs. */
+    if let Some(table) = msix::MsixTable::new(pci_dev) {
+        match msix::MsixInterrupt::register_for(&table, 0, dev, isr) {
+            Some(irq) => {
+                klog!(0, "r8168: MSI-X vector={} ({} entries available)", irq.vector(), table.table_size());
+                *dev.irqs.lock() = Some(Irqs { _msix_irq: Some(irq), _msix_table: Some(table), _intx: None });
+                return true;
+            }
+            None => {
+                klog!(0, "r8168: MSI-X entry 0 unavailable, trying MSI");
+                /* `table` is dropped here.  enable_vector never ran, so MSI-X
+                 * was never enabled in config space. */
+            }
+        }
+    }
+    if let Some(table) = msix::MsixTable::new_msi(pci_dev) {
+        match msix::MsixInterrupt::register_for(&table, 0, dev, isr) {
+            Some(irq) => {
+                klog!(0, "r8168: MSI vector={}", irq.vector());
+                *dev.irqs.lock() = Some(Irqs { _msix_irq: Some(irq), _msix_table: Some(table), _intx: None });
+                return true;
+            }
+            None => klog!(0, "r8168: MSI unavailable, trying its INTx line"),
+        }
+    }
+
+    /* Firmware can hand the device over with INTx masked in the command
+     * register; the message paths clear that implicitly, this one must not
+     * assume it. */
+    let cmd = pci_dev.read_config16(PCI_COMMAND);
+    if cmd & PCI_COMMAND_INTX_DISABLE != 0 {
+        pci_dev.write_config16(PCI_COMMAND, cmd & !PCI_COMMAND_INTX_DISABLE);
+    }
+    match interrupt::LegacyInterrupt::register_level_for(pci_dev, dev, isr) {
+        Some(irq) => {
+            klog!(0, "r8168: INTx vector={} (irq {})", irq.vector(), pci_dev.irq_line);
+            *dev.irqs.lock() = Some(Irqs { _msix_irq: None, _msix_table: None, _intx: Some(irq) });
+            true
+        }
+        None => false,
+    }
+}
 
 /* Probe PCI BARs to find the 32-bit MMIO BAR.
  * RTL8168: BAR 0 is I/O (bit 0 = 1), BAR 2 is 32-bit MMIO (bit 0 = 0). */

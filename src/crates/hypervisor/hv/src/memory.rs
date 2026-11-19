@@ -65,6 +65,24 @@ impl SecondLevel {
             SecondLevel::Ept(t) => t.set_huge(gpa, hpa),
         }
     }
+    fn set_device(&mut self, gpa: u64, hpa: u64) -> Result<()> {
+        match self {
+            SecondLevel::Npt(t) => t.set_device(gpa, hpa),
+            SecondLevel::Ept(t) => t.set_device(gpa, hpa),
+        }
+    }
+    fn set_huge_device(&mut self, gpa: u64, hpa: u64) -> Result<()> {
+        match self {
+            SecondLevel::Npt(t) => t.set_huge_device(gpa, hpa),
+            SecondLevel::Ept(t) => t.set_huge_device(gpa, hpa),
+        }
+    }
+    fn clear(&mut self, gpa: u64) -> Result<()> {
+        match self {
+            SecondLevel::Npt(t) => t.clear(gpa),
+            SecondLevel::Ept(t) => t.clear(gpa),
+        }
+    }
     fn nested(&self) -> hvarch::x86::svm::Nested {
         match self {
             SecondLevel::Npt(t) => t.nested(),
@@ -179,6 +197,13 @@ pub struct GuestMemory {
     /// The page of all ones a guest's reads of an absent device find, and
     /// where it is mapped.
     absent: Mutex<Absent>,
+    /// The BARs of the host's functions the guest holds, mapped straight:
+    /// where each is in the guest's space, and how long. Not RAM -- in no
+    /// region, the dirty log's or anyone's to copy -- and not this value's
+    /// pages: a function's, whose claim the guest holds for as long as it
+    /// lives, which outlives this table (`run::LinuxGuest`'s fields' order).
+    #[cfg(target_arch = "x86_64")]
+    devices: Mutex<Vec<(u64, u64)>>,
 }
 
 /// What [`GuestMemory::map_absent`] has made so far.
@@ -234,7 +259,107 @@ impl GuestMemory {
             regions: Vec::new(),
             log: dirty::Log::new(),
             absent: Mutex::new(Absent { frame: None, at: Vec::new() }).ok_or(Error::NoMemory)?,
+            devices: Mutex::new(Vec::new()).ok_or(Error::NoMemory)?,
         })
+    }
+
+    /// `size` bytes of a host function's BAR at the guest's `gpa`, the host's
+    /// `hpa`, mapped straight and uncacheable -- 2 MiB at a time where both
+    /// are aligned to it -- but for `holes`, offsets into it of pages left
+    /// out: those trap, and the run loop performs them (`run::host_mmio`).
+    /// Refused where it would cover RAM, another BAR, a page of all ones
+    /// made for the guest (`map_absent`) or the platform's own pages, or is
+    /// not whole pages; mapped whole or not at all.
+    #[cfg(target_arch = "x86_64")]
+    pub fn map_device(&self, gpa: u64, hpa: u64, size: u64, holes: &[u64]) -> Result<()> {
+        let end = gpa.checked_add(size).ok_or(Error::BadAddress)?;
+        if size == 0 || gpa % PAGE != 0 || hpa % PAGE != 0 || size % PAGE != 0 || end > MAX_GPA
+            || self.regions.iter().any(|r| gpa < r.base + r.size && r.base < end)
+            || (gpa..end).contains(&XAPIC_PAGE)
+        {
+            return Err(Error::BadAddress);
+        }
+        /* `map_absent`'s order: nothing of the range is anyone else's below */
+        let absent = self.absent.lock();
+        if absent.at.iter().any(|&p| p >= gpa && p < end) {
+            return Err(Error::BadAddress);
+        }
+        let mut devices = self.devices.lock();
+        if devices.iter().any(|&(b, s)| gpa < b + s && b < end) {
+            return Err(Error::BadAddress);
+        }
+        devices.try_reserve(1).map_err(|_| Error::NoMemory)?;
+
+        let mut table = self.table.lock();
+        let mut at = 0u64;
+        if let Err(e) = Self::set_device_pages(&mut table, gpa, hpa, size, holes, &mut at) {
+            /* What was set of it taken out again -- nothing in the range was
+             * anyone else's -- and dropped by every CPU that may have cached
+             * it in the moment it was there */
+            let mut back = 0u64;
+            while back < at {
+                let _ = table.clear(gpa + back);
+                back += PAGE;
+            }
+            self.renew(&mut table);
+            return Err(e);
+        }
+        devices.push((gpa, size));
+        drop(absent);
+        Ok(())
+    }
+
+    /// `map_device`'s pages set, `at` how far it got.
+    #[cfg(target_arch = "x86_64")]
+    fn set_device_pages(table: &mut SecondLevel, gpa: u64, hpa: u64, size: u64, holes: &[u64], at: &mut u64)
+        -> Result<()>
+    {
+        let huge = HUGE_SIZE;
+        let in_hole = |from: u64, len: u64| holes.iter().any(|&h| h < from + len && from < h + PAGE);
+        while *at < size {
+            let from = *at;
+            let whole = (gpa + from) % huge == 0 && (hpa + from) % huge == 0 && size - from >= huge
+                && !in_hole(from, huge);
+            /* A table of 4 KiB pages made there before -- a BAR that was
+             * there once -- keeps these 2 MiB in pages too */
+            if whole && table.prepare_huge(gpa + from, huge).is_ok() {
+                /* Counted before it is set: a failure clears what may be set */
+                *at = from + huge;
+                table.set_huge_device(gpa + from, hpa + from)?;
+                continue;
+            }
+            *at = from + PAGE;
+            if !in_hole(from, PAGE) {
+                table.prepare(gpa + from, PAGE)?;
+                table.set_device(gpa + from, hpa + from)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The BAR mapped at `gpa`, `size` long, taken out of the table -- the
+    /// guest moved it -- and every CPU to drop what it cached of it as it
+    /// next enters (`renew`).
+    #[cfg(target_arch = "x86_64")]
+    pub fn unmap_device(&self, gpa: u64, size: u64) -> Result<u64> {
+        let mut devices = self.devices.lock();
+        let Some(i) = devices.iter().position(|&d| d == (gpa, size)) else {
+            return Err(Error::Unmapped);
+        };
+        let mut table = self.table.lock();
+        let mut at = 0u64;
+        while at < size {
+            table.clear(gpa + at)?;
+            at += PAGE;
+        }
+        devices.swap_remove(i);
+        Ok(self.renew(&mut table))
+    }
+
+    /// Whether `gpa` is in a host function's BAR the guest holds.
+    #[cfg(target_arch = "x86_64")]
+    pub fn is_device(&self, gpa: u64) -> bool {
+        self.devices.lock().iter().any(|&(b, s)| gpa >= b && gpa - b < s)
     }
 
     /// No memory, and no second-level table: this architecture runs no
@@ -356,9 +481,15 @@ impl GuestMemory {
         if !MMIO_WINDOW.contains(&page) || page == XAPIC_PAGE || self.region(page, PAGE_SIZE).is_ok() {
             return Err(Error::BadAddress);
         }
-        /* The absent pages' lock, then the table's: the one order anything
-         * here takes both in. */
+        /* The absent pages' lock, then the devices', then the table's: the
+         * one order anything here takes them in -- so a BAR the guest moves
+         * here as it reads the page is either here first, and the page is
+         * not made, or not yet, and refused the page (`map_device`). */
         let mut absent = self.absent.lock();
+        #[cfg(target_arch = "x86_64")]
+        if self.is_device(page) {
+            return Err(Error::BadAddress);
+        }
         if absent.at.contains(&page) {
             /* Another of the guest's CPUs read it first, and it is mapped
              * already: this one's read runs again and finds it. */
@@ -409,6 +540,13 @@ impl GuestMemory {
     /// The RAM's regions, as base and size, in the order they were given.
     pub fn ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.regions.iter().map(|r| (r.base, r.size))
+    }
+
+    /// Its RAM: each region's base in the guest's space, and its pages -- what
+    /// an IOMMU domain of the guest's maps a host's function's DMA to
+    /// (`kcore::iommu::Domain::map`), holding a share of each.
+    pub fn ram(&self) -> impl Iterator<Item = (u64, &Run)> + '_ {
+        self.regions.iter().map(|r| (r.base, &r.frames))
     }
 
     /// How much memory the guest has, over every region.

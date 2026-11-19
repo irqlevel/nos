@@ -10,6 +10,19 @@
 #                       SSSE3 or AVX, so the crypto crate runs its integer
 #                       code); `max` gives TCG's SSSE3, AVX and AVX2
 #        SMOKE_LOG      serial log path (default <tmpdir>/nos.log)
+#        SMOKE_ISO      the image booted (default nos.iso): `make nos-test.iso
+#                       TEST_ISO_ARGS=...` for a parameter nos.iso does not give
+#        SMOKE_MACHINE  QEMU's -machine (default QEMU's own, pc)
+#        SMOKE_EXTRA    QEMU arguments put before the devices -- an IOMMU has
+#                       to be made before the devices behind it
+#        SMOKE_MARKER   one more line the serial log must have
+#
+# The VT-d boot: `make nos-test.iso TEST_ISO_ARGS=iommu=on`, then
+#   SMOKE_ISO=nos-test.iso SMOKE_MACHINE=q35 SMOKE_EXTRA="-device intel-iommu,intremap=on"
+#   SMOKE_MARKER="interrupts remapped, the IO-APIC's from" tests/smoke-test.sh --skip-build
+# -- the NVMe's DMA through QEMU's unit (virtio's goes around it), and every
+# interrupt through its table; with intremap=off and SMOKE_MARKER="passed
+# through, queued invalidation", none.
 #
 # Exit codes: 0 = all markers seen, 1 = panic/timeout/build failure.
 set -u
@@ -22,6 +35,12 @@ SMOKE_TIMEOUT="${SMOKE_TIMEOUT:-300}"
 SMOKE_QEMU="${SMOKE_QEMU:-qemu-system-x86_64}"
 CPU_OPTS=()
 [ -n "${SMOKE_CPU:-}" ] && CPU_OPTS=(-cpu "$SMOKE_CPU")
+SMOKE_ISO="${SMOKE_ISO:-nos.iso}"
+MACHINE_OPTS=()
+[ -n "${SMOKE_MACHINE:-}" ] && MACHINE_OPTS=(-machine "$SMOKE_MACHINE")
+# Word-split on purpose: a list of QEMU arguments
+# shellcheck disable=SC2206
+EXTRA_OPTS=(${SMOKE_EXTRA:-})
 
 TMPDIR_SMOKE="$(mktemp -d)"
 SMOKE_LOG="${SMOKE_LOG:-$TMPDIR_SMOKE/nos.log}"
@@ -49,7 +68,7 @@ if [ "$SKIP_BUILD" = "0" ]; then
         || { tail -n 30 "$TMPDIR_SMOKE/build.log"; fail "build failed"; }
 fi
 
-[ -f nos.iso ] || fail "nos.iso not found"
+[ -f "$SMOKE_ISO" ] || fail "$SMOKE_ISO not found"
 
 # Scratch disks: exercise virtio-blk (modern), virtio-scsi (legacy) and the
 # Rust NVMe/MSI-X path on every smoke boot. The virtio-blk one carries an
@@ -65,10 +84,12 @@ qemu-img create -q -f qcow2 "$TMPDIR_SMOKE/nvme0.qcow2" 256M
 echo "smoke: booting (log: $SMOKE_LOG, timeout: ${SMOKE_TIMEOUT}s)..."
 "$SMOKE_QEMU" \
     ${CPU_OPTS[@]+"${CPU_OPTS[@]}"} \
+    ${MACHINE_OPTS[@]+"${MACHINE_OPTS[@]}"} \
+    ${EXTRA_OPTS[@]+"${EXTRA_OPTS[@]}"} \
     -display none \
     -m 1G \
     -smp 4 \
-    -cdrom nos.iso \
+    -cdrom "$SMOKE_ISO" \
     -serial "file:$SMOKE_LOG" \
     -drive "file=$TMPDIR_SMOKE/root.img,format=raw,id=drive0,if=none" \
     -device virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off \
@@ -100,6 +121,7 @@ QEMU_PID=$!
 MARKERS=("After test" "Preempt is now on" "MountRootFs: mounted ext4 on /" "a sparse file past 4 GiB"
          "two mounts at once: a call on the other went through" "fstest: passed"
          "EntropySource registered: rng0" "EntropySource registered: rng1" "boot: complete")
+[ -n "${SMOKE_MARKER:-}" ] && MARKERS+=("$SMOKE_MARKER")
 
 ELAPSED=0
 while [ "$ELAPSED" -lt "$SMOKE_TIMEOUT" ]; do

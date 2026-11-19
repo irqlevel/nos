@@ -17,6 +17,8 @@
 #[cfg(target_arch = "x86_64")]
 pub mod blk;
 #[cfg(target_arch = "x86_64")]
+pub mod host;
+#[cfg(target_arch = "x86_64")]
 pub mod ioapic;
 #[cfg(target_arch = "x86_64")]
 pub mod net;

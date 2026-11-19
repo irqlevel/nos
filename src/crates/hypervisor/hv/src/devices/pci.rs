@@ -252,6 +252,10 @@ impl Function {
 pub struct PciBus {
     address: u32,
     slots: Vec<Function>,
+    /// The slots that are host's functions (`devices::host`), a bit each:
+    /// their configuration space is theirs, not a `Function`'s, and the run
+    /// loop takes it there (`host_target`).
+    host: u32,
 }
 
 impl PciBus {
@@ -269,7 +273,7 @@ impl PciBus {
             subsystem_vendor: 0,
             subsystem: 0,
         }));
-        Ok(PciBus { address: 0, slots })
+        Ok(PciBus { address: 0, slots, host: 0 })
     }
 
     /// Put a function in the next slot, and say which.
@@ -279,6 +283,34 @@ impl PciBus {
         }
         self.slots.push(f);
         Ok((self.slots.len() - 1) as u8)
+    }
+
+    /// Take the next slot for a host's function, whose configuration space
+    /// the run loop answers from it (`host_target`): the slot.
+    pub fn add_host(&mut self) -> Result<u8> {
+        let slot = self.add(Function::blank(&Identity {
+            vendor: 0xFFFF,
+            device: 0xFFFF,
+            revision: 0,
+            class: 0,
+            subsystem_vendor: 0,
+            subsystem: 0,
+        }))?;
+        self.host |= 1 << slot;
+        Ok(slot)
+    }
+
+    /// A host's function's slot, and the byte of its space, `port` is an
+    /// access of -- None where it is any other function's or none's, and for
+    /// every port but the configuration data's four: the address latched
+    /// names a host's function long after its access, and a device's I/O
+    /// BAR is above them (a disk's notify taken for a write of the GPU's
+    /// space left the disk with no notify again).
+    pub fn host_target(&self, port: u16) -> Option<(usize, usize)> {
+        if !(CONFIG_DATA..=CONFIG_END).contains(&port) {
+            return None;
+        }
+        self.target(port).filter(|&(slot, _)| self.host & (1 << slot) != 0)
     }
 
     pub fn owns(port: u16) -> bool {

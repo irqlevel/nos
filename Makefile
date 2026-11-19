@@ -137,6 +137,7 @@ CXX_SRC_x86_64 =   \
 	src/base/arch/x86_64/pmu.cpp	\
 	src/base/arch/x86_64/percpu.cpp	\
     src/base/arch/x86_64/ioapic.cpp  \
+    src/base/arch/x86_64/vtd.cpp  \
     src/base/drivers/vga.cpp \
     src/base/drivers/font8x16.cpp \
     src/base/drivers/fb_console.cpp \
