@@ -64,8 +64,17 @@ pub const LOGS_MAX: usize = 16;
 /// Lines the queue holds for the writer, every log's together: a burst of
 /// this many before it gets to them.
 pub const QUEUE_LINES: usize = 512;
-/// How long the writer lets a burst gather once its first line wakes it.
-const GATHER_MS: u64 = 200;
+/// How long the writer lets lines gather once the first wakes it: a second
+/// of a trickle in one write a log -- one transaction, one flush of the
+/// disk, under the lock of the mount `/logs` is on -- rather than five.
+const GATHER_MS: u64 = 1_000;
+/// How soon a burst is written once the queue is half full (`FILLING_AT`):
+/// the gather cut short, though to no less than this, so that a flood is
+/// written no more often than five times a second, the rest of it lost and
+/// counted, as before the gather was a second.
+const GATHER_MIN_MS: u64 = 200;
+/// Lines waiting on the queue that cut the gather short.
+const FILLING_AT: usize = QUEUE_LINES / 2;
 /// How long a log that cannot be written waits before it is tried again,
 /// its lines going to the kernel log meanwhile.
 const RETRY_MS: u64 = 10_000;
@@ -399,6 +408,9 @@ static STATE: AtomicU8 = AtomicU8::new(BEFORE);
 /// looked: one signal a burst, not one a line.
 static WAKE: Once<Event> = Once::new();
 static PENDING: AtomicBool = AtomicBool::new(false);
+/// The queue has been half full since the writer last looked: one more
+/// signal a round, which cuts its gather short.
+static FILLING: AtomicBool = AtomicBool::new(false);
 /// The writer, for the halt to wait for.
 static WRITER: TryLock<Option<TaskHandle>> = TryLock::new(None);
 /// `logs sync`: asks numbered, and the last the writer has answered -- by a
@@ -447,7 +459,12 @@ fn send(index: usize, line: &[u8], cut: bool) {
         spill_queue();
         return;
     }
-    if !PENDING.swap(true, Ordering::AcqRel) {
+    /* The first line since the writer looked wakes it; the queue half full
+     * cuts its gather short. The count is a snapshot: a wake early or late
+     * by a line is all it can cost */
+    let first = !PENDING.swap(true, Ordering::AcqRel);
+    let filling = QUEUE.waiting() >= FILLING_AT && !FILLING.swap(true, Ordering::AcqRel);
+    if first || filling {
         if let Some(wake) = WAKE.get() {
             wake.signal();
         }
@@ -622,6 +639,7 @@ fn write_logs() {
         /* Cleared before the queue is looked at: a line queued after this
          * wakes the writer again, and one queued before is on the queue */
         PENDING.swap(false, Ordering::AcqRel);
+        FILLING.swap(false, Ordering::AcqRel);
         w.round();
         SYNC_DONE.fetch_max(asked, Ordering::AcqRel);
         if state != RUNNING {
@@ -629,13 +647,31 @@ fn write_logs() {
         }
 
         let idle = if w.failing() { RETRY_MS } else { IDLE_MS };
-        let woken = wake.wait_for(Duration::from_millis(idle));
-        /* A burst gathers before it is written -- unless someone waits */
-        if woken && STATE.load(Ordering::Acquire) == RUNNING && SYNC_ASKED.load(Ordering::Acquire) == asked {
-            task::sleep_ms(GATHER_MS);
+        if wake.wait_for(Duration::from_millis(idle)) {
+            gather(wake, asked);
         }
     }
     finish();
+}
+
+/// Lines let gather before they are written, once the first has woken the
+/// writer: `GATHER_MS`, cut short to `GATHER_MIN_MS` once the queue is half
+/// full, and at once for someone waiting (`logs sync`) or for the stop.
+fn gather(wake: &Event, asked: u64) {
+    let began = time::boot_time_ns();
+    loop {
+        if STATE.load(Ordering::Acquire) != RUNNING || SYNC_ASKED.load(Ordering::Acquire) != asked {
+            return;
+        }
+        let gather_ms = if FILLING.load(Ordering::Acquire) { GATHER_MIN_MS } else { GATHER_MS };
+        let elapsed_ms = time::boot_time_ns().saturating_sub(began) / NS_PER_MS;
+        if elapsed_ms >= gather_ms {
+            return;
+        }
+        /* Woken early by the queue filling, a sync or the stop -- each
+         * looked at again above -- or by nothing: the time looked at again */
+        wake.wait_for(Duration::from_millis(gather_ms - elapsed_ms));
+    }
 }
 
 /// Why a log's file is not being written.
