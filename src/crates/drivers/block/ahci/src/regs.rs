@@ -227,9 +227,11 @@ pub const EH_TICK_MS: u64 = 100;
 /// waits was one taken from everything else -- a guest's among them -- for
 /// as long as the disk took (a 2 TB SMR disk's format held one for minutes).
 pub const SPIN_SOLID_NS: u64 = 250_000;
-/// A wait no slot's end signals -- for a slot to take, for the queue to
-/// drain -- naps this long a turn once past the spin: a disk that spins
-/// frees a slot in milliseconds, one that does not in microseconds.
+/// The disk's own command's wait for the port -- another's to end, the
+/// queue to drain, which no slot's end signals -- naps this long a turn once
+/// past the spin: a disk that spins ends a command in milliseconds, one that
+/// does not in microseconds. A wait for a slot to take never naps
+/// (`take_slot`).
 pub const NAP_SPINNING_NS: u64 = 1_000_000;
 pub const NAP_SOLID_NS: u64 = 50_000;
 /// How long `start` waits for the interrupt of a command it has seen done.
