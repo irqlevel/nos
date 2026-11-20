@@ -33,4 +33,5 @@ pub mod ipc;
 pub mod events;
 pub mod system;
 pub mod fs;
+pub mod logs;
 pub mod trace;

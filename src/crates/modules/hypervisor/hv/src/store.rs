@@ -476,7 +476,7 @@ pub fn create(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
     let gave = give_devices(root, vms, &held, &mut given.disks, None, force)
         .and_then(|()| given.port.map_or(Ok(()), |p| take_port(root, vms, &held, Some(p)).map(|_| ())));
     if let Err(e) = gave {
-        let _ = writeln!(out, "hv: {}", e);
+        not_made(out, name, &e);
         return;
     }
     /* Its UUID, made now: the machine its OS knows it as, at every start. */
@@ -484,16 +484,16 @@ pub fn create(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
     /* Checked as a start would check it -- the paths the folder's -- before
      * anything is written: a vm.toml that cannot boot is no use kept. */
     if let Err(e) = options_checked(&folder, &Config::new(given.clone())) {
-        let _ = writeln!(out, "hv: {}", e);
+        not_made(out, name, &e);
         return;
     }
     let config = Config::new(given);
     let Some(text) = config::render(&config) else {
-        let _ = writeln!(out, "hv: out of memory");
+        not_made(out, name, "out of memory");
         return;
     };
     if make_dirs(&folder.path).is_err() {
-        let _ = writeln!(out, "hv: {} could not be made", folder.path);
+        not_made(out, name, &alloc::format!("{} could not be made", folder.path));
         return;
     }
     /* On a network of the cluster's: its port made now, where a conflict
@@ -508,7 +508,7 @@ pub fn create(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
                 port = Some(uuid);
             }
             Err(e) => {
-                let _ = writeln!(out, "hv: {}", e);
+                not_made(out, name, &e);
                 return;
             }
         }
@@ -519,7 +519,7 @@ pub fn create(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
         Err(e) => Err(alloc::format!("{} could not be written -- {}", file, e)),
     };
     if let Err(why) = written {
-        let _ = writeln!(out, "hv: {}", why);
+        not_made(out, name, &why);
         if let Some(uuid) = port {
             if let Err(e) = crate::vnet::detach(&uuid) {
                 let _ = writeln!(out, "hv: its port of vnet's left -- {}: `vnet port delete` it", e);
@@ -528,6 +528,7 @@ pub fn create(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
         return;
     }
     let _ = writeln!(out, "hv: {} written -- hv start {} boots it", file, name);
+    kcore::flog!(crate::HV, "vm {} made -- {}", name, file);
     /* What it names that is not there yet: a disk is often made after. */
     if let Ok(o) = options(&folder, &config) {
         let mut missing = Vec::new();
@@ -540,6 +541,13 @@ pub fn create(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
             }
         }
     }
+}
+
+/// A folder `hv create` did not make, after its name was held: said to
+/// whoever asked, and in the hypervisor's log.
+fn not_made(out: &mut dyn Work, name: &str, why: &str) {
+    let _ = writeln!(out, "hv: {}", why);
+    kcore::flog_limited!(crate::HV, "vm {} not made -- {}", name, why);
 }
 
 /// The folder's configuration as a start checks it: the guest it says, its
@@ -737,8 +745,20 @@ pub fn delete_command(root: &str, vms: &Vms, args: &str, out: &mut dyn Write) {
 /// in it. Refused while a VM of the name is on the list, or is being made or
 /// cloned; and for a protected VM -- or one whose vm.toml cannot be read,
 /// which may be -- unless `force`. Disks its vm.toml names outside the
-/// folder are not touched, and nothing is followed out of it.
+/// folder are not touched, and nothing is followed out of it. What it came
+/// to is the hypervisor's log's too, a shell's or the host API's.
 pub fn delete(root: &str, vms: &Vms, name: &str, keep: bool, force: bool) -> Result<Deleted, String> {
+    let deleted = take_away(root, vms, name, keep, force);
+    match &deleted {
+        Ok(d) => kcore::flog!(crate::HV, "vm {} deleted -- {} files and folders taken away, {} disk{} kept{}", name,
+                              d.removed, d.kept.len(), if d.kept.len() == 1 { "" } else { "s" },
+                              if force { ", by force" } else { "" }),
+        Err(why) => kcore::flog_limited!(crate::HV, "vm {} not deleted -- {}", name, why),
+    }
+    deleted
+}
+
+fn take_away(root: &str, vms: &Vms, name: &str, keep: bool, force: bool) -> Result<Deleted, String> {
     let folder = folder_of(root, name)?;
     /* Held under the changes' lock: a change of its vm.toml made before is
      * done -- what it wrote is in the walk below -- and one after sees the

@@ -13,7 +13,7 @@ use std::sync::Mutex;
 /// The wall clock when an input starts: in the past of whoever runs
 /// e2fsck on an image the fuzzer made, which calls a superblock written in
 /// its future damaged.
-const WALL_BASE: u64 = 1_750_000_000;
+pub const WALL_BASE: u64 = 1_750_000_000;
 
 extern "C" {
     /* The disk log's C ABI (block::disklog is private to its crate): what

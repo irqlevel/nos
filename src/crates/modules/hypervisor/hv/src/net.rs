@@ -2459,7 +2459,7 @@ impl Switch {
         let mut vnets = self.vnets.lock();
         for v in vnets.iter_mut() {
             if let Err(why) = self.behind_hv0(v) {
-                kcore::klog!(0, "hv: cluster network {} is not behind hv0 for NAT: {}", v.vni, why);
+                kcore::flog_limited!(crate::HV, "cluster network {} is not behind hv0 for NAT: {}", v.vni, why);
             }
         }
         Ok(ip)

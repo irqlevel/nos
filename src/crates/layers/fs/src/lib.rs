@@ -24,6 +24,7 @@ pub mod files;
 pub mod find;
 pub mod format;
 pub mod image;
+pub mod logs;
 pub mod paths;
 pub mod procfs;
 pub mod provider;
