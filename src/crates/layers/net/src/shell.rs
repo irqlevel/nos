@@ -18,6 +18,7 @@ use crate::device::{Device, DEVICES};
 use crate::dns::MAX_DOMAIN_LEN;
 use crate::frame::{self, POOL};
 use crate::netconsole::NETCONSOLE;
+use crate::settings::{self, Dhcp};
 use crate::tcp::TCP;
 use crate::wire::{Ipv4 as Ip, MacHex};
 
@@ -75,6 +76,17 @@ pub fn net(_args: &str, out: &mut Output) {
 
     let (polls, work, stalls) = DEVICES.poll_counts();
     let _ = writeln!(out, "rx polls {}, poll work {}, stalls {}", polls, work, stalls);
+
+    /* What the boot gave eth0, and from where: edited, /etc/net.toml is
+     * read again at the next boot */
+    let given = settings::current();
+    let _ = match (given.source, settings::refused()) {
+        (settings::Source::File, _) => writeln!(out, "{} settings: {} ({})", DEFAULT_DEVICE, given, settings::PATH),
+        (_, Some(why)) => writeln!(out, "{} settings: {} (the command line's: {} refused, {})", DEFAULT_DEVICE,
+            given, settings::PATH, why),
+        (_, None) => writeln!(out, "{} settings: {} (the command line's: no {})", DEFAULT_DEVICE, given,
+            settings::PATH),
+    };
 }
 
 pub fn netpool(args: &str, out: &mut Output) {
@@ -360,7 +372,8 @@ pub fn dnsflush(_args: &str, out: &mut Output) {
 }
 
 pub fn dhcp(args: &str, out: &mut Output) {
-    if kcore::net::dhcp_off() {
+    let settings = settings::current();
+    if settings.dhcp == Dhcp::Off {
         let _ = writeln!(out, "DHCP disabled (dhcp=off)");
         return;
     }
@@ -404,7 +417,7 @@ pub fn dhcp(args: &str, out: &mut Output) {
     let _ = writeln!(out, "dns:    {}", Ip(lease.dns));
     let _ = writeln!(out, "lease:  {} seconds", lease.lease_secs);
 
-    if kcore::net::dns_on() && lease.dns != 0 {
+    if settings.lease_dns && lease.dns != 0 {
         if let Some(dns) = abi::dns() {
             if !dns.is_ready() && dns.start(dev.as_nic(), lease.dns) {
                 let _ = writeln!(out, "DNS resolver started, server: {}", Ip(lease.dns));
@@ -444,9 +457,11 @@ pub fn register_all() {
 
 /* ---- what boot asks of the layer ---- */
 
-/// `dhcp=auto`: the shell's task runs a DHCP client on eth0 as it starts,
-/// and brings a resolver up on whatever server the lease names. What it
-/// prints goes to the console the shell is about to take.
+/// The shell's task, as it starts: where eth0's settings ask DHCP for its
+/// address at boot -- `/etc/net.toml`'s `dhcp`, or the command line's
+/// `dhcp=auto` (`settings`) -- a DHCP client on eth0, and a resolver on
+/// whatever server the lease names. What it prints goes to the console the
+/// shell is about to take.
 ///
 /// # Safety
 /// `printer` is a `stdlib::Printer*` that outlives the call.
@@ -454,9 +469,14 @@ pub fn register_all() {
 pub unsafe extern "C" fn rust_net_dhcp_auto(printer: *mut core::ffi::c_void) {
     let mut out = unsafe { Output::from_raw(printer) };
 
+    let settings = settings::current();
+    if settings.dhcp != Dhcp::Boot {
+        return;
+    }
     /* A static address is the whole of eth0's configuration: a lease would
-     * take its place, and on the network it was given for nobody answers. */
-    if let Some(given) = kcore::net::static_ip() {
+     * take its place, and on the network it was given for nobody answers.
+     * Only the command line can ask for both; the file refuses that. */
+    if let Some(given) = settings.address {
         let _ = writeln!(out, "DHCP auto: {} has a static address, {}", DEFAULT_DEVICE, Ip(given.ip));
         return;
     }
@@ -488,7 +508,7 @@ pub unsafe extern "C" fn rust_net_dhcp_auto(printer: *mut core::ffi::c_void) {
     let lease = client.lease();
     let _ = writeln!(out, "DHCP ip: {}", Ip(lease.ip));
 
-    if kcore::net::dns_on() && lease.dns != 0 {
+    if settings.lease_dns && lease.dns != 0 {
         if let Some(dns) = abi::dns() {
             if dns.start(dev.as_nic(), lease.dns) {
                 let _ = writeln!(out, "DNS resolver started, server: {}", Ip(lease.dns));
@@ -505,15 +525,17 @@ pub extern "C" fn rust_net_dhcp_stop() {
     }
 }
 
-/// `ip=` and `gw=`: eth0's address, put on it before anything that sends --
-/// the netconsole first, which waits for an address and has none on a
-/// network with no DHCP server. The mask and the gateway go first and the
-/// address last: an address is what everything here takes for a device
-/// ready to send from, and each is read with the order its store made.
+/// A static address -- `/etc/net.toml`'s `ip` and `gw`, or the command
+/// line's `ip=` and `gw=`: put on eth0 before anything that sends -- the
+/// netconsole first, which waits for an address and has none on a network
+/// with no DHCP server. The mask and the gateway go first and the address
+/// last: an address is what everything here takes for a device ready to
+/// send from, and each is read with the order its store made.
 fn configure_static() {
-    let Some(given) = kcore::net::static_ip() else { return };
+    let Some(given) = settings::current().address else { return };
     let Some(dev) = DEVICES.find(DEFAULT_DEVICE.as_bytes()) else {
-        kcore::klog!(0, "net: ip= was given, but there is no {} to put it on", DEFAULT_DEVICE);
+        kcore::klog!(0, "net: eth0's settings give it a static address, but there is no {} to put it on",
+            DEFAULT_DEVICE);
         return;
     };
     let nic = dev.as_nic();
@@ -524,13 +546,17 @@ fn configure_static() {
         Ip(given.gw));
 }
 
-/// `dns=A.B.C.D`: the resolver on that server from the start, on eth0 --
-/// with a static address or a lease to come, whose own server then does not
+/// A resolver's server given -- `/etc/net.toml`'s `dns`, or the command
+/// line's `dns=A.B.C.D`: the resolver on it from the start, on eth0 -- with
+/// a static address or a lease to come, whose own server then does not
 /// replace it.
 fn start_given_resolver() {
-    let Some(server) = kcore::net::dns_server_given() else { return };
+    let server = settings::current().dns;
+    if server == 0 {
+        return;
+    }
     let Some(dev) = DEVICES.find(DEFAULT_DEVICE.as_bytes()) else {
-        kcore::klog!(0, "dns: dns= was given, but there is no {} to resolve on", DEFAULT_DEVICE);
+        kcore::klog!(0, "dns: eth0's settings give it a resolver, but there is no {} to resolve on", DEFAULT_DEVICE);
         return;
     };
     match abi::dns() {
@@ -544,7 +570,7 @@ fn start_given_resolver() {
 }
 
 /// The services boot starts once the devices are up and the shell exists:
-/// eth0's static address where the command line gave one, and its resolver;
+/// eth0's static address where its settings give one, and its resolver;
 /// the netconsole, if the command line asked for one, and the shell over
 /// UDP. Both go on eth0, which is what the C++ looked for.
 #[no_mangle]

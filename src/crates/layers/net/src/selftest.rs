@@ -187,7 +187,7 @@ fn echo_exchange() -> bool {
 #[no_mangle]
 pub extern "C" fn rust_net_selftest() -> i32 {
     let ok = checksum_vectors() & headers() & arp_packets() & echo_exchange()
-        & crate::nat::selftest();
+        & crate::nat::selftest() & crate::settings::selftest();
 
     if ok {
         klog!(0, "net selftest: passed");

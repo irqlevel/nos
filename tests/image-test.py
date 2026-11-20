@@ -207,6 +207,7 @@ nos_install install "$NOS" --ssh-key id_test.pub --boot-once > install.out 2>&1 
 cat install.out
 mount_at "$NOS" part ro
 same_as_image part install
+cat part/etc/net.toml > nettoml1.out 2>/dev/null || echo none > nettoml1.out
 unmount_last
 
 # grub.cfg as grub-mkconfig makes it: the header, the machine's own entry
@@ -242,6 +243,16 @@ grub-editenv part/grubenv list > grubenv1.out
 sha256sum part/etc/ssh/ssh_host_ed25519_key | cut -d' ' -f1 > hostkey1.sum || echo none > hostkey1.sum
 unmount_last
 
+# An install from before /etc/net.toml, as a server with a static address
+# has one: the network the kernel parameters' words, and a kernel that does
+# not read the file -- which the update keeps for a rollback
+mount_at "$NOS" part
+rm -f part/etc/net.toml
+grub-editenv part/grubenv set "nos_cmdline=ip=10.0.2.15/24 gw=10.0.2.2 dns=10.0.2.3"
+# (its bytes not the path a kernel that reads the file has in its image)
+printf 'a kernel from before the settings file\n' > part/boot/kernel64.elf
+unmount_last
+
 # no partition named: the GRUB entry names it
 nos_install update --udpshell --boot-once --panel > update.out 2>&1 || { cat update.out; exit 1; }
 cat update.out
@@ -250,6 +261,7 @@ mount_at "$NOS" part ro
 cp part/etc/rc rc2.out
 cat part/etc/api/panel.pass > panelpass2.out 2>/dev/null || echo none > panelpass2.out
 grub-editenv part/grubenv list > grubenv2.out
+cat part/etc/net.toml > nettoml2.out 2>/dev/null || echo none > nettoml2.out
 sha256sum part/etc/ssh/ssh_host_ed25519_key | cut -d' ' -f1 > hostkey2.sum
 ls part part/boot part/lib > layout2.out
 cat part/VERSION > version2.out
@@ -263,6 +275,13 @@ attach NOS "$NOS_START" "$NOS_SIZE"
 e2fsck -fn "$NOS" > fsck2.out 2>&1 && echo "fsck2: clean" || { cat fsck2.out; echo "fsck2: DAMAGED"; }
 nos_install status > status.out 2>&1 || { cat status.out; exit 1; }
 cat status.out
+# Again: the kernel kept for a rollback is the image's now, which reads
+# /etc/net.toml, and the words a kernel before it needed go
+nos_install update > update3.out 2>&1 || { cat update3.out; exit 1; }
+cat update3.out
+mount_at "$NOS" part ro
+grub-editenv part/grubenv list > grubenv3.out
+unmount_last
 nos_install rollback > rollback.out 2>&1 || { cat rollback.out; exit 1; }
 cat rollback.out
 nos_install uninstall > uninstall.out 2>&1 || { cat uninstall.out; exit 1; }
@@ -468,6 +487,7 @@ sed -n 's/^set nos_uuid=//p' root/boot/grub/grub.cfg > grubcfg-uuid.out
 [ ! -f root/boot/grub/i386-pc/core.img ] || echo "root: GRUB for BIOS"
 [ ! -d root/boot/grub/x86_64-efi ] || echo "root: GRUB for UEFI"
 grub-editenv root/grubenv list > disk-grubenv.out
+cat root/etc/net.toml > disk-nettoml.out 2>/dev/null || echo none > disk-nettoml.out
 echo "keys: $(grep -c '^ssh-ed25519 ' root/etc/ssh/authorized_keys || true)"
 same_as_image root disk
 unmount_last
@@ -507,6 +527,18 @@ cat disk-network.out
 disk_install update --network-here > disk-here.out 2>&1 || { cat disk-here.out; exit 1; }
 cat disk-here.out
 debugfs -R 'cat /grubenv' "${WHOLE}p3" 2>/dev/null | grep '^nos_' > disk-grubenv3.out
+debugfs -R 'cat /etc/net.toml' "${WHOLE}p3" 2>/dev/null > disk-nettoml3.out
+# What the kernel would refuse is refused before anything is written, and
+# so are the network's words on the kernel command line
+for bad in '--cmdline ip=10.0.2.15/24' '--ip 10.0.2.0/24' '--ip 10.0.2.15/24 --gw 10.0.3.1' '--gw 10.0.2.2' \
+           '--ip 10.0.2.15/24 --dhcp' '--ip 127.0.0.1/8' '--dns 224.0.0.1' '--network-here --ip 10.0.2.15/24'; do
+    if disk_install update $bad > disk-bad.out 2>&1; then
+        echo "network refused: no, $bad"
+    else
+        echo "network refused: $bad: $(tail -n 1 disk-bad.out)"
+    fi
+done
+debugfs -R 'cat /etc/net.toml' "${WHOLE}p3" 2>/dev/null > disk-nettoml4.out
 if disk_install uninstall > disk-uninstall.out 2>&1; then
     echo "uninstall: done"
 fi
@@ -843,6 +875,9 @@ def run_disk(tmp, linux, key, want):
           "disk: every file of the image" in out and "keys: 1" in out and
           "nos_cmdline=netconsole=10.0.2.2:6666" in linux.read("disk-grubenv.out"), out)
     check("nothing of the machine's GRUB is touched", "grub.d: 0" in out, out)
+    disk_nettoml = linux.read("disk-nettoml.out")
+    check("disk writes /etc/net.toml: DHCP, given no network", nettoml_values(disk_nettoml) == {"dhcp": "true"},
+          disk_nettoml)
     efi = linux.read("efi-before")
     esp_guid = linux.read("esp-guid.out").strip()
     check("under UEFI, with no entry of the firmware's for the disk, one is made for its \\EFI\\BOOT\\BOOTX64.EFI",
@@ -869,6 +904,9 @@ def run_disk(tmp, linux, key, want):
                 rc, out = m.ssh(["cat", "/proc/cmdline"])
                 check("the command line names the root by its UUID, with the parameters the grubenv keeps (%s)" % name,
                       rc == 0 and ("root=UUID=" + root_uuid) in out and "netconsole=10.0.2.2:6666" in out, out)
+                rc, out = m.ssh(["net"])
+                check("eth0's settings are /etc/net.toml's: DHCP (%s)" % name,
+                      rc == 0 and "eth0 settings: DHCP, the lease's resolver (/etc/net.toml)" in out, out[-400:])
                 rc, out = m.ssh(["disks"])
                 check("nos sees nos-data by its GUID (%s)" % name,
                       rc == 0 and len(data_guid) == 36 and ("part:" + data_guid) in out, out)
@@ -906,18 +944,39 @@ def run_disk(tmp, linux, key, want):
           "BootOrder: 0067,0069,006B,0000,0066,0068,006A,0064,0063" in default and "BootNext" not in default and
           "Boot006B* UEFI OS" in default, default + linux.read("efi-default.log"))
     here = [line for line in out.splitlines() if line.startswith("here: ")]
-    env3 = linux.read("disk-grubenv3.out")
-    check("update --network-here takes the address, gateway and DNS server this Linux has",
-          len(here) == 1 and here[0][len("here: "):] in env3 and " dns=" in env3, here + [env3])
+    nettoml3 = linux.read("disk-nettoml3.out")
+    got = nettoml_values(nettoml3)
+    said = dict(word.split("=", 1) for word in here[0][len("here: "):].split()) if len(here) == 1 else {}
+    check("update --network-here writes the address, gateway and DNS server this Linux has to /etc/net.toml",
+          said != {} and got.get("ip") == said.get("ip") and got.get("gw") == said.get("gw") and "dns" in got,
+          here + [nettoml3])
+    check("and leaves the kernel parameters as they were",
+          "nos_cmdline=udpshell=9000" in linux.read("disk-grubenv3.out").splitlines(), linux.read("disk-grubenv3.out"))
     network = linux.read("disk-network.out")
+    words = network.strip().splitlines()[-1].split() if network.strip() else []
     check("network says the same, as the dialog offers it",
-          len(here) == 1 and ("\n" + here[0][len("here: "):] + " dns=") in "\n" + network and
-          ("nos_cmdline=" + network.strip().splitlines()[-1]) in env3, network + env3)
+          words == ["ip=%s" % got.get("ip"), "gw=%s" % got.get("gw"), "dns=%s" % got.get("dns")], network + nettoml3)
+    refused = [line for line in out.splitlines() if line.startswith("network refused: ")]
+    check("nos-install refuses what the kernel would refuse of a network, and ip= in --cmdline, before writing",
+          len(refused) == 8 and not any(line.startswith("network refused: no,") for line in refused) and
+          linux.read("disk-nettoml4.out") == nettoml3, refused)
     check("uninstall has nothing to take out", "uninstall: done" not in out, linux.read("disk-uninstall.out"))
     check("an install over its root is refused: update is what renews it",
           "install over it: done" not in out and "nos-install update" in linux.read("disk-install.out"),
           linux.read("disk-install.out"))
     check("e2fsck finds the root clean after the update", "fsck6: clean" in out, out)
+
+
+def nettoml_values(text):
+    """/etc/net.toml's keys and values, as nos-install writes them: key =
+    "value" or key = true, comments aside."""
+    values = {}
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if "=" in line:
+            key, value = (part.strip() for part in line.split("=", 1))
+            values[key] = value.strip('"')
+    return values
 
 
 def digest_of(path):
@@ -965,6 +1024,9 @@ def run(tmp, image):
           "intel-ucode/%s, revision 0x%x" % (FAKE_UCODE_NAME, FAKE_UCODE_REVISION) in out, out)
     want = expected_version(linux.read("img-version.out"))
     check("install says it puts no key nowhere: it was given one", "no --ssh-key" not in out, out)
+    nettoml1 = linux.read("nettoml1.out")
+    check("install writes /etc/net.toml: DHCP, given no network", nettoml_values(nettoml1) == {"dhcp": "true"},
+          nettoml1)
     snippet = linux.read("grub.cfg.made")
     check("the GRUB entry names the partition by UUID", "search --no-floppy --fs-uuid --set=nos_root" in snippet)
     m = Machine(tmp, key)
@@ -990,6 +1052,9 @@ def run(tmp, image):
             check("so is the VERSION on its root", rc == 0 and expected_version(out) == want, out)
             rc, out = m.ssh(["cat", "/proc/cmdline"])
             check("the command line has no udpshell", rc == 0 and "udpshell" not in out and "root=UUID=" in out, out)
+            rc, out = m.ssh(["net"])
+            check("eth0's settings are /etc/net.toml's: DHCP",
+                  rc == 0 and "eth0 settings: DHCP, the lease's resolver (/etc/net.toml)" in out, out[-400:])
         check("no UDP shell answers", m.udp_shell("version") is None)
         m.ssh(["reboot"], timeout=60)
         check("nos reboots", m.wait_exit(120))
@@ -1026,6 +1091,13 @@ def run(tmp, image):
     env2 = linux.read("grubenv2.out")
     check("update takes the UDP shell it was given, and arms a boot",
           "nos_cmdline=udpshell=9000" in env2 and "nos_next=nos" in env2, env2)
+    nettoml2 = linux.read("nettoml2.out")
+    check("update of an install from before /etc/net.toml writes it from the kernel parameters' words",
+          nettoml_values(nettoml2) == {"ip": "10.0.2.15/24", "gw": "10.0.2.2", "dns": "10.0.2.3"} and
+          "/etc/net.toml written from this machine's kernel parameters, ip=10.0.2.15/24 gw=10.0.2.2 dns=10.0.2.3"
+          in out, nettoml2 + "".join(line + "\n" for line in out.splitlines() if "net.toml" in line))
+    check("and keeps the words beside the UDP shell, for the kernel kept for a rollback, which does not read it",
+          "nos_cmdline=udpshell=9000 ip=10.0.2.15/24 gw=10.0.2.2 dns=10.0.2.3" in env2.splitlines(), env2)
     said = [line.split("its password ", 1)[1].strip() for line in out.splitlines()
             if "the panel's user is root, its password " in line]
     password = said[0] if len(said) == 1 else None
@@ -1049,6 +1121,10 @@ def run(tmp, image):
         check("with the host key it made the first time", m.host_key() == first_key)
         out = m.udp_shell("version", timeout=10)
         check("the UDP shell answers, now that it was asked for", out is not None and out.startswith("nos "), out)
+        rc, out = m.ssh(["net"])
+        check("eth0's settings are the static address /etc/net.toml was written with",
+              rc == 0 and "eth0 settings: 10.0.2.15/24, gateway 10.0.2.2, resolver 10.0.2.3 (/etc/net.toml)" in out,
+              out[-400:])
         # /etc/rc starts sshd in its first lines and the API after hv's: a
         # session may come in before `api start` has run.
         for _ in range(API_WAIT):
@@ -1075,6 +1151,13 @@ def run(tmp, image):
     status = linux.read("status.out")
     check("status says what is installed and what was", "installed:   nos " in status and
           "previous:    nos " in status, status)
+    check("and eth0's settings",
+          'network:     /etc/net.toml: ip = "10.0.2.15/24"; gw = "10.0.2.2"; dns = "10.0.2.3"' in status, status)
+    env3 = linux.read("grubenv3.out")
+    check("an update with every kernel on the partition reading /etc/net.toml takes the words out",
+          "nos_cmdline=udpshell=9000" in env3.splitlines() and
+          "the kernel parameters' ip=, gw=, dns= and dhcp= taken out" in linux.read("update3.out"),
+          env3 + linux.read("update3.out")[-600:])
     check("uninstall takes the GRUB entry away", "uninstalled: yes" in out, out)
 
     run_disk(tmp, linux, key, want)

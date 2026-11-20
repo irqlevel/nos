@@ -3164,8 +3164,9 @@ void Cmd::run()
 
     show_banner(con);
 
-    if (Parameters::get_instance().is_dhcp_auto())
-        rust_net_dhcp_auto(&con);
+    /* DHCP at boot, where eth0's settings ask for it -- /etc/net.toml's, or
+       the command line's dhcp=auto: the network layer's to decide */
+    rust_net_dhcp_auto(&con);
 
     run_boot_script();
 

@@ -20,7 +20,7 @@ nos runs only on hardware it has drivers for, and on most servers the network is
 |---|---|
 | A disk nos reads: NVMe, virtio (virtio-scsi too), or SATA with the controller in AHCI or IDE mode | Behind a RAID controller or on USB, GRUB still loads the kernel through the firmware, but nos then finds no root filesystem. That means no modules, no `/etc/rc` and no sshd. A whole disk is refused there; a partition gets a warning. |
 | A network card nos drives: Realtek RTL8168 or RTL8125, Intel 82576, I210, I211 or I350 (the `igb` driver), Intel 82574L (the `e1000e` driver), or virtio-net | With any other card, nos boots, but nobody can reach it. nos puts its address on the first of these cards in PCI order, so the cable should be in that port. |
-| An address: DHCP, or a static one | nos asks for an address by DHCP, or takes a static one as the kernel parameters `ip=`, `gw=` and `dns=`. Many dedicated servers have no DHCP; the installers offer the address the server already has. |
+| An address: DHCP, or a static one | nos asks for an address by DHCP, or takes a static one from `/etc/net.toml` on its root, which the installers write. Many dedicated servers have no DHCP; the installers offer the address the server already has. |
 | Secure Boot off | nos is a Multiboot2 kernel. With Secure Boot on, GRUB runs locked down and refuses to load it. |
 | An `ssh-ed25519` key | nos's sshd accepts no other key type. |
 
@@ -121,7 +121,7 @@ mount -o loop,ro nos-x86_64.squashfs /mnt
 
 `--ssh-key` takes a `.pub` file, an `authorized_keys` file or a key line, and can be given more than once. From a file, `nos-install` takes the `ssh-ed25519` lines and tells you which lines it skipped. Without a key, sshd lets nobody in.
 
-`install` checks the image and the partition, makes an ext4 filesystem on an empty partition (one with an ext4 or ext2 nos can write keeps everything on it, anything else is refused unless you pass `--format`), copies in the kernel, the modules and the rest of the system, adds your keys, and adds the GRUB entry. It stops at the first problem. `boot --reboot` arms the one-shot boot and reboots. About a minute later, log in as in the rescue section above.
+`install` checks the image and the partition, makes an ext4 filesystem on an empty partition (one with an ext4 or ext2 nos can write keeps everything on it, anything else is refused unless you pass `--format`), copies in the kernel, the modules and the rest of the system, adds your keys, writes the network to `/etc/net.toml`, and adds the GRUB entry. It stops at the first problem. `boot --reboot` arms the one-shot boot and reboots. About a minute later, log in as in the rescue section above.
 
 Options of `install` and `update`:
 
@@ -129,7 +129,9 @@ Options of `install` and `update`:
 |---|---|
 | `--ssh-key KEY` | Adds a key that sshd lets in. |
 | `--network-here` | Gives nos the address, gateway and DNS server this Linux has, for a network with no DHCP. |
-| `--cmdline "ARGS"` | Adds kernel parameters, such as `ip=203.0.113.5/24 gw=203.0.113.1 dns=203.0.113.1` ([Kernel parameters](/docs/kernel-parameters)). |
+| `--ip A.B.C.D/N`, `--gw A.B.C.D`, `--dns A.B.C.D` | Gives nos a static address, its gateway and its DNS server, for a network with no DHCP. |
+| `--dhcp` | Has nos ask DHCP for its address at every boot. Without any of the network's options, `install` writes this. |
+| `--cmdline "ARGS"` | Adds kernel parameters, such as `deadman=600` ([Kernel parameters](/docs/kernel-parameters)). The network is not among them: it is the options above. |
 | `--netconsole IP:PORT` | Sends the kernel log over UDP to IP:PORT ([Netconsole](/docs/netconsole)), the only way to see a boot that dies after the network is up. |
 | `--udpshell[=PORT]` | Turns on the UDP shell. **It stays off unless you pass this**, because it runs any command for anyone who can send the machine a datagram ([UDP shell](/docs/udp-shell)). |
 | `--format` | Creates a new filesystem on the partition, even over an existing one. |

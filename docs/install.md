@@ -45,8 +45,9 @@ but cannot fix any of them:
   I210, I211 or I350 (the `igb` driver), Intel 82574L (the `e1000e`
   driver), or virtio-net. With any other, nos boots and nobody can reach it. A network
   that hands out no address by DHCP is given one with
-  `--cmdline "ip=A.B.C.D/N gw=A.B.C.D dns=A.B.C.D"` -- what its Linux has
-  statically ([Kernel parameters](kernel-parameters.md#networking)).
+  `--ip A.B.C.D/N --gw A.B.C.D --dns A.B.C.D` -- what its Linux has
+  statically -- or `--network-here`, which takes this Linux's: written to
+  nos's `/etc/net.toml` ([The network](#the-network)).
 - **A plain partition** of at least 64 MiB (256 MiB is comfortable; a guest's
   disk images need more): not a member of an md RAID, not an LVM volume, not
   encrypted -- nos reads none of those. A server installed with its disks
@@ -158,7 +159,10 @@ The server's default boot entry does not change.
 | `--ssh-key KEY` | a key sshd lets in (above) |
 | `--udpshell[=PORT]` | the UDP shell, on 9000 or PORT. **Off unless given**: it runs any command for anyone who can send the machine a datagram ([UDP shell](udp-shell.md)) |
 | `--netconsole IP:PORT` | the kernel log, over UDP, to IP:PORT ([Netconsole](netconsole.md)) -- the one way to see a boot that dies after the network is up |
-| `--cmdline "ARGS"` | more kernel parameters ([Kernel parameters](kernel-parameters.md)) |
+| `--cmdline "ARGS"` | more kernel parameters ([Kernel parameters](kernel-parameters.md)) -- not `ip=`, `gw=`, `dns=` or `dhcp=`, which are the options below |
+| `--ip A.B.C.D/N`, `--gw A.B.C.D`, `--dns A.B.C.D` | nos's address on a network with no DHCP server, its gateway and its DNS server, in `/etc/net.toml` ([The network](#the-network)); `--dns` alone, or with `--dhcp`, is the DNS server asked in place of the lease's |
+| `--dhcp` | nos's address by DHCP, at every boot: what `/etc/net.toml` says when no option of the network is given |
+| `--network-here` | the address, gateway and DNS server this Linux has (below) |
 | `--panel` | the management panel (below); `--no-panel` takes `api panel create` out of `/etc/rc` again |
 | `--format` | a new filesystem on the partition, even over one there |
 | `--boot-once`, `--reboot` | boot nos once, the next time -- and reboot now |
@@ -213,8 +217,9 @@ every time, unless its `/etc/rc` calls it off.
 The kernel's command line is `root=UUID=<the partition> dhcp=auto dns=on
 panic=10` and whatever this machine was given (`--udpshell`, `--netconsole`,
 `--cmdline`) -- `panic=10` resets a nos that panics ten seconds after its
-report, to the server's own system after a one-shot boot. nos mounts the partition read-write as its root, takes an
-address by DHCP and runs `/etc/rc`, whose `sshd start` makes the host key the
+report, to the server's own system after a one-shot boot. nos mounts the partition read-write as its root, takes
+eth0's settings from `/etc/net.toml` there -- an address by DHCP, or the
+static one the install was given ([The network](#the-network)) -- and runs `/etc/rc`, whose `sshd start` makes the host key the
 first time -- from the kernel's entropy pool, into
 `/etc/ssh/ssh_host_ed25519_key`, kept there for every boot after -- and lets
 in the keys of `/etc/ssh/authorized_keys` ([sshd](sshd.md)). About a minute
@@ -310,8 +315,8 @@ good; `uninstall` has nothing to take out.
 
 `--network-here` gives nos the network this Linux has: the address of the
 interface its default route leaves by, the route's gateway, its first DNS
-server (`resolv.conf`, or the servers systemd-resolved asks) -- `ip= gw=
-dns=` on nos's command line. A provider's rescue system is up on the
+server (`resolv.conf`, or the servers systemd-resolved asks) -- written to
+nos's `/etc/net.toml`. A provider's rescue system is up on the
 server's own address, so its network is the one nos needs on a network with
 no DHCP. nos puts the address on `eth0`, the first network card it drives
 in the bus's order, and `nos-install` says so when that is not the card
@@ -472,7 +477,10 @@ hvboot, licenses and `/VERSION` go to `.prev` together, and the microcode is tak
 `/lib/firmware`. `/etc` -- `rc`, the keys, the host key -- and everything
 else on the partition stay. The kernel parameters stay too, unless
 `--udpshell`, `--netconsole` or `--cmdline` is given: then those replace them
-all (`--cmdline ""` clears them). A kernel and its modules are only ever
+all (`--cmdline ""` clears them). So does `/etc/net.toml`, unless `--ip`,
+`--gw`, `--dns`, `--dhcp` or `--network-here` is given; an install from
+before the file gets one written from its kernel parameters' `ip=`, `gw=`,
+`dns=` and `dhcp=` ([The network](#the-network)). A kernel and its modules are only ever
 replaced together, since a kernel refuses a module built against another
 kernel interface. `/lib/modules` is the image's: a module of your own goes
 somewhere else.
@@ -480,7 +488,7 @@ somewhere else.
 `nos-install rollback` swaps the current kernel, modules, hvboot,
 licenses and `/VERSION` with the `.prev` ones -- back to an image older
 than hvboot or the licenses, none of that. `nos-install status` says what is installed and what was,
-the kernel parameters, the microcode's revision and whether a boot is armed. `nos-install uninstall`
+eth0's settings, the kernel parameters, the microcode's revision and whether a boot is armed. `nos-install uninstall`
 takes `42_nos` out and nos out of the menu, and leaves the partition alone.
 
 From inside a running nos, without Linux, a kernel can be tried before it
@@ -496,6 +504,50 @@ reboot
 That boots the `nos (next)` entry once. It brings no modules: the ones in
 `/lib/modules` are the running kernel's, and the new one refuses them if
 their kernel interface differs. A whole image is updated from Linux.
+
+## The network
+
+nos's network is `/etc/net.toml` on its root: eth0's address, its gateway,
+its DNS server, or DHCP. `nos-install` writes it -- `install` and `disk`
+whatever they are given, `update` when given `--ip`, `--gw`, `--dns`,
+`--dhcp` or `--network-here` -- and nos reads it at every boot, once the
+root is mounted and before anything goes out: DHCP, the netconsole, sshd.
+It is the strict TOML of a VM's `vm.toml`:
+
+```toml
+# A network with no DHCP server
+ip = "203.0.113.5/24"
+gw = "203.0.113.1"
+dns = "203.0.113.53"
+```
+
+or `dhcp = true`, which is also what a file without `ip` means: an address
+asked of DHCP at every boot, and the lease's DNS server -- or, with `dns`
+beside it, that server in its place. `dhcp = false` without an `ip` leaves
+eth0 with no address until nos's `dhcp` command is run. Edited from inside
+nos (`edit /etc/net.toml`, over SSH), it is taken at the next boot. `net`
+says what eth0's settings are, and where they came from.
+
+The file is taken whole or not at all. A key it does not have, a key given
+twice, an `ip` that is not an address a host may have with its prefix
+length -- or is its subnet's network or broadcast address -- a `gw` that is
+not another address of that subnet, a `gw` with no `ip`, `dhcp = true`
+beside an `ip`: each is refused, the boot says which and on which line,
+and the kernel command line's `ip=`, `gw=`, `dns=` and `dhcp=` are taken in
+its place -- `nos.cfg`'s own `dhcp=auto dns=on`, DHCP, on an installed
+server, which on a network with no DHCP server leaves it unreachable. So
+`nos-install` checks what it writes by the same rules and refuses what nos
+would, before it writes anything.
+
+The command line's words are what a root with no `/etc/net.toml` goes by:
+an ISO's, QEMU's, a test's, a root that was not found
+([Kernel parameters](kernel-parameters.md#networking)) -- and a kernel from
+before the file. An install from before it had its network as `ip= gw=
+dns=` in the grubenv's `nos_cmdline`; `update` writes the file from them,
+and keeps them there for as long as a kernel on the partition -- the one
+kept for a rollback, above all -- does not read the file: it looks for
+`/etc/net.toml` in each kernel's image. The update after that, with both
+kernels reading it, takes them out.
 
 ## What goes where
 
@@ -513,6 +565,7 @@ On the partition, which is nos's root:
 | `/VERSION`, `.prev` | the image | what is installed, and what was |
 | `/boot/ucode` | the server's `/lib/firmware/intel-ucode`, at every install and update | this CPU's microcode, which nos loads on every CPU as it boots ([Boot](boot.md#x86-64-the-application-processors)) |
 | `/grubenv` | nos-install | `nos_cmdline`, this machine's kernel parameters; `nos_next`, the one-shot flag |
+| `/etc/net.toml` | nos-install (`--ip`, `--gw`, `--dns`, `--dhcp`, `--network-here`; DHCP where none is given) | eth0's settings, read at every boot ([The network](#the-network)) |
 | `/etc/rc` | the image, the first time | the boot script: the machine's after that (`rc` edits it) |
 | `/etc/ssh/authorized_keys` | `--ssh-key` | the keys sshd lets in (`sshd allow` adds one from inside) |
 | `/etc/ssh/ssh_host_ed25519_key` | sshd, at its first start | nos's host key |
