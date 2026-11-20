@@ -60,7 +60,7 @@ use kcore::task::TaskHandle;
 use crate::cores::{Cores, Hold};
 use crate::disk::{Claims, Holder, Runner, Wake};
 use crate::forward::{self, Forwards};
-use crate::guest::{self, Built, LogLine, NicSpec, Ring, Spec, TermFilter};
+use crate::guest::{self, Built, LogLine, NicSpec, Ring, Spec, SplitLocks, TermFilter};
 use crate::net::{self, Switch};
 use crate::store::{self, Folder};
 use crate::vmlog::Log;
@@ -242,6 +242,8 @@ pub struct Shared {
     /// so that a disk's task never holds the last of a guest, whose drop
     /// waits for that task.
     serving: Mutex<Option<Arc<hv::run::LinuxGuest>>>,
+    /// Its split locks, for the log (`Host::split_lock`).
+    split_locks: SplitLocks,
 }
 
 /// The most notes waiting for the log's writer: it takes them every second,
@@ -285,6 +287,7 @@ impl Shared {
             boot_at: AtomicU64::new(0),
             ended_ns: AtomicU64::new(0),
             serving: Mutex::new(None)?,
+            split_locks: SplitLocks::new(),
             log,
             notes: if notes {
                 let mut q = VecDeque::new();
@@ -738,6 +741,10 @@ impl Host for VmHost {
 
     fn stop_requested(&self) -> bool {
         self.shared.stop.load(Ordering::Acquire) || self.shared.reset.load(Ordering::Acquire)
+    }
+
+    fn split_lock(&self, cpu: u32, rip: u64) {
+        self.shared.split_locks.note(format_args!("vm {}", self.shared.id), cpu, rip);
     }
 
     fn progress(&self, cpu: u32, counts: &Counts) {

@@ -618,6 +618,11 @@ pub struct Counts {
     /// Exceptions of the guest's own the host intercepted and gave back:
     /// #DB -- a single step, `int1` -- and #AC.
     pub reflected: u64,
+    /// Split locks of the guest's -- locked accesses across two cache
+    /// lines -- that the host's detection stopped and stepped it past
+    /// (VT-x, where the CPU detects them): each one the bus taken from every
+    /// core while it ran.
+    pub split_locks: u64,
     pub wbinvd: u64,
     pub cr8: u64,
     pub cr0: u64,
@@ -716,6 +721,7 @@ impl Counts {
         self.to_entry_ns += o.to_entry_ns;
         self.ud += o.ud;
         self.reflected += o.reflected;
+        self.split_locks += o.split_locks;
         self.wbinvd += o.wbinvd;
         self.cr8 += o.cr8;
         self.cr0 += o.cr0;
@@ -781,6 +787,11 @@ pub trait Host: Sync {
     /// button's event enabled, and so is told of it by an SCI -- or has no
     /// ACPI, or has not got that far, and never hears of it.
     fn power_button_heard(&self, _heard: bool) {}
+    /// CPU `cpu` of the guest made a split lock at `rip` -- a locked access
+    /// across two cache lines, the bus taken from every core while it ran --
+    /// which the host's detection stopped, and the loop steps it past. For
+    /// whoever names the guest to say so, as often as it likes.
+    fn split_lock(&self, _cpu: u32, _rip: u64) {}
 }
 
 /// What a guest CPU is doing, as its loop sees it.
@@ -3263,6 +3274,20 @@ impl LinuxGuest {
                     }
                 }
                 Exit::Shutdown => Some(Stop::Shutdown { rip }),
+                /* A split lock of the guest's, which the host's detection
+                 * raised #AC for -- not its own alignment check, and nothing
+                 * it asked for: a Linux kernel given that #AC dies of it.
+                 * Said to the host, which names the guest, and the
+                 * instruction run with the CPU's detection off for it alone
+                 * (`step_split_lock`). */
+                Exit::Exception { vector, .. } if vector == VECTOR_AC && gc.cpu.backend().split_lock_ac() => {
+                    gc.counts.split_locks += 1;
+                    host.split_lock(gc.index, rip);
+                    gc.cpu.backend_mut().step_split_lock();
+                    None
+                }
+                /* The one instruction of a step past a split lock, done */
+                Exit::Stepped => None,
                 /* #AC and #DB are intercepted only so that a guest cannot
                  * have the CPU deliver one inside another for good
                  * (CVE-2015-5307 and 8104): the guest's own -- a user

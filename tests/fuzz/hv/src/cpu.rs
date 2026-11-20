@@ -498,6 +498,15 @@ pub mod x86 {
     pub mod vmx {
         use std::sync::atomic::{AtomicU64, Ordering};
 
+        /// What the run loop's trace names of VT-x's exit reasons: the
+        /// monitor trap flag's, a step past a split lock's (`tp.rs`). The
+        /// VMCS's module itself is VMREAD and VMWRITE, the host's to run.
+        pub mod vmcs {
+            pub mod reason {
+                pub const MONITOR_TRAP_FLAG: u32 = 37;
+            }
+        }
+
         pub struct PostedInterrupts {
             pir: [AtomicU64; 4],
             control: AtomicU64,
@@ -644,6 +653,11 @@ pub mod vm {
         /// The class a lowering of the task priority below is to exit at.
         pub tpr_window: u8,
         pub nmi_window: bool,
+        /// The last exit's #AC a split lock of the guest's under the host's
+        /// detection, and a step past one asked for -- its MTF exit
+        /// (`Exit::Stepped`) the script's to give.
+        pub split_lock: bool,
+        pub stepping: bool,
         /// In the shadow of an STI or a MOV SS.
         pub shadow: bool,
         /// In its NMI handler: no NMI until its IRET.
@@ -726,6 +740,8 @@ pub mod vm {
                 irq_window: false,
                 tpr_window: 0,
                 nmi_window: false,
+                split_lock: false,
+                stepping: false,
                 shadow: false,
                 nmi_masked: false,
                 cr8: 0,
@@ -1304,10 +1320,23 @@ pub mod vm {
         }
         pub fn reflect_exception(&mut self, vector: u8, _error: Option<u32>) {
             invariant!(vector == 1 || vector == 17, "exception {} given back to the guest", vector);
+            invariant!(!(vector == 17 && self.split_lock),
+                "a split lock given back to the guest as an #AC it never asked for");
             self.queue(Event::Exception(vector));
         }
         pub fn skip_icebp(&mut self) {
             self.step(1);
+        }
+        /// The host's split lock detection raised the last exit's #AC, as
+        /// the script says (VT-x alone): the run loop steps it, never gives
+        /// it back.
+        pub fn split_lock_ac(&self) -> bool {
+            self.split_lock
+        }
+        pub fn step_split_lock(&mut self) {
+            invariant!(self.vmx && self.split_lock, "a step past a split lock there was none of");
+            self.split_lock = false;
+            self.stepping = true;
         }
         pub fn request_irq_window(&mut self) {
             self.irq_window = true;

@@ -818,6 +818,14 @@ impl Vcpu {
         self.step_over(LEN_ICEBP);
     }
 
+    /// No split lock detection on an AMD part: every #AC is the guest's own.
+    pub fn split_lock_ac(&self) -> bool {
+        false
+    }
+
+    /// Never asked for: [`split_lock_ac`](Self::split_lock_ac) says no.
+    pub fn step_split_lock(&mut self) {}
+
     /// Step past an XSETBV performed for the guest (`crate::cr::xsetbv`).
     pub fn skip_xsetbv(&mut self) {
         self.skip(LEN_XSETBV);
