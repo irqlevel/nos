@@ -195,6 +195,10 @@ CLONE = [
     "hv delete c2 keep-disks",
     "ls /vms/c2",
     "hv vms",
+    # The hypervisor's file log, what is queued written first: every make,
+    # clone and delete above, and every refusal of one (docs/logs.md)
+    "logs sync",
+    "cat /logs/hv.log",
 ]
 
 
@@ -634,6 +638,28 @@ def clone_checks(out, grown):
              and "vm.toml" not in out[15] and "user-data" not in out[15], out[15])
     pt.check("which is no vm's: hv vms lists c1 alone", "c1  not running" in out[16] and "c2" not in out[16],
              out[16])
+    log = out[18]
+
+    def said(pattern):
+        return re.search(r"(?m)^\S+Z " + pattern, log) is not None
+
+    url = r"http://10\.0\.2\.2:\d+/"
+    pt.check("hv.log: c1 and c2 made, each of its URL, with its vm.toml and its disk's size",
+             said(r"vm c1 made of %simg\.qcow2 -- /vms/c1/vm\.toml, a 16 MiB disk$" % url)
+             and said(r"vm c2 made of %sraw\.img -- /vms/c2/vm\.toml, a 2 MiB disk$" % url), log)
+    pt.check("and each make refused, with why: c1 again, c3's 404, c4's no image, c5's size, c7 with no NBS",
+             said(r"vm c1 not made of %simg\.qcow2 -- .*is there already" % url)
+             and said(r"vm c3 not made of %smissing\.qcow2 -- .*404" % url)
+             and said(r"vm c4 not made of %snotes\.txt -- .*is no image" % url)
+             and said(r"vm c5 not made of %simg\.qcow2 -- .*less than the image's disk" % url)
+             and said(r"vm c7 not made of the image .*nbs-mds\.ko"), log)
+    pt.check("c6 cloned from c1, and the clone to its name again refused",
+             said(r"vm c6 cloned from c1 -- /vms/c6/vm\.toml, \d+ files? copied, \d+ MiB written$")
+             and said(r"vm c6 not cloned from c1 -- .*is there already"), log)
+    pt.check("c6's delete refused as protected, then forced; c2 deleted keeping its two disks",
+             said(r"vm c6 not deleted -- c6 is protected")
+             and said(r"vm c6 deleted -- \d+ files and folders taken away, 0 disks kept, by force$")
+             and said(r"vm c2 deleted -- \d+ files and folders taken away, 2 disks kept$"), log)
 
 
 def convert_checks(out, digest):

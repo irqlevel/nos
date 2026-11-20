@@ -28,6 +28,54 @@ kernel log.
 2026-11-20T10:30:01.913478Z sshd: root logged in from 203.0.113.7:49731 with SHA256:Xq3V... me@laptop
 ```
 
+`/logs/hv.log` is the hypervisor's (`modules/hypervisor/hv`): what became of
+each VM -- made (`hv create`, from a cloud's image or an image of NBS's),
+cloned, deleted, started (on which CPUs, with what kernel, memory and
+command line), started again, stopped and after how long, and why; a
+start, a make or a clone that failed and why; a move to another host and
+one come from another, and what went wrong on either side; a disk of
+NBS's attached and let go of; a cluster network's tunnel to a host that
+stopped answering, a port vnet revoked. A VM is `vm <number> (<name>)`,
+or `vm <number>` for one started from a kernel's path. The module itself --
+loaded, unloaded, its extension on and off, a warning of its own -- and a
+host's device given to a guest stay in the kernel log, as do the lines of
+a guest's console mirrored there (`log=`).
+
+```
+2026-11-20T11:02:13.008211Z vm web made of https://cloud-images.example/noble.img -- /vms/web/vm.toml, a 10240 MiB disk
+2026-11-20T11:02:41.517300Z vm 0 (web) started on cpus 2,3 -- /lib/hvboot, 2048 MiB, 2 cpus, cmdline "console=ttyS0"
+2026-11-20T13:40:02.100023Z vm db not started -- input= is 5000 bytes, more than the 4096 a vm queues
+2026-11-20T14:15:30.412871Z vm 0 (web) stopped after 9168895 ms -- on request
+```
+
+`/logs/nbs.log` is NBS's. Every host's member applies every change to the
+metadata, and says each in its own file as it applies it: a volume made,
+grown, attached and let go of and by whom, snapshotted, made an image,
+cloned, deleted; a replica taken out of its set, by which volume's writer
+and why -- it did not answer, or refused as failed; a cs down, up or out
+and how many sets that changed; a join begun, done or given up; a device
+added, drained, its format recorded or dropped; the members. So every host
+has the cluster's history, the same lines in the same order, each stamped
+when that host applied it. A change refused is said too (`refused at
+<entry>: ... -- <why>`), through a limiter (below); a digest and a
+copy-up's steps -- one a chunk a clone's writer writes first -- are not.
+Beside them the host's own: its leader's controller giving up a join
+(`controller:`), the scrub's findings (`scrub:`), its cs's devices and its
+side of each join (`cs:`), and what each client session on the host met --
+a replica asked out, a request refused, an operation failed at its
+deadline (`client:`), these through limiters too. The member replays its
+log as it starts; that is not said again -- but an entry applied before a
+restart and not yet known committed may be said a second time after it.
+
+```
+2026-11-20T12:00:04.229401Z volume db (7) made, 8192 MiB, for host-a
+2026-11-20T12:00:04.731122Z volume db attached for writing on host-a, generation 1
+2026-11-20T12:47:19.003845Z set 12: cs 2 (host-c) taken out by volume db's writer, generation 1 -- it did not answer; the set's version 5
+2026-11-20T12:47:19.004210Z client: cs 2 of set 12 taken out of volume db's chunks there (version 5)
+2026-11-20T12:47:21.552301Z cs 2 (host-c) down: silent to the leader, 41 sets changed
+2026-11-20T12:58:40.917745Z set 12: cs 2 (host-c) joins in place 2, the set's version 6
+```
+
 ## A line
 
 A line is its stamp, a space and its text. The stamp is the wall clock when
@@ -60,6 +108,62 @@ receive path least of all. `logs sync` waits for the moment to pass.
 A burst bigger than the queue before the writer gets to it loses lines:
 counted, said in the file, shown by `logs`. One queue serves every log, so a
 flood on one can cost another lines; each log's losses are its own count.
+
+## A place that may say it a thousand times
+
+A line about a failure can come as often as what fails: a replica that
+refuses every request, at every request; a client asking again every
+second. `flog_limited!(LOG, "fmt {}", arg)` writes such a line through the
+limiter of its place -- each use of the macro has one of its own
+(`kcore::logs::Limiter`, a `static` the macro makes):
+
+- a place's window begins at its first line after its last window ended,
+  and lasts a minute (`LIMIT_WINDOW_MS`); 30 of its lines go in it
+  (`LIMIT_PLACE`), and once they have, every line until the window ends is
+  held;
+- lines alike -- the same but for their digits: a volume's number, a count,
+  an address -- have windows of their own, begun the same way, 5 of a kind
+  going in each (`LIMIT_ALIKE`). A line of another kind still goes while one
+  kind floods. A place tells 8 kinds apart at once (`LIMIT_SHAPES`): a ninth
+  takes the slot of the kind whose window began longest ago, whose count
+  starts again -- the place's 30 hold them all;
+- every line held is counted, and the next line of the place that goes says
+  how many before it: `[held back: 1834] client: volume db: ...`. A flood
+  that stops leaves its count to the place's next line, whenever that comes.
+
+A failure a thousand times a second is then a few lines a minute and a
+count. What is history rather than failure is not limited -- a change to
+NBS's metadata, a VM started or stopped: each happened once, and a test
+that counts them counts what happened.
+
+## What it costs
+
+Measured on arm64 under HVF (Apple Silicon, four CPUs, the host busy with
+other guests: the quietest of four boots, and the range over all four), a
+typical line of 71 bytes and four arguments:
+
+| | a line |
+|---|---|
+| formatted alone | 58 ns (58-129) |
+| `flog!`: formatted and put on the queue | 104 ns (104-394) |
+| `klog!` at level 0, as these lines were written before: the ring and the consoles | 513 ns (513-2936) |
+| `flog_limited!`, held, its place closed: the clock read and an atomic add, not formatted | 19 ns (19-49) |
+| `flog_limited!`, held by its kind: formatted, its kind's sum taken, the place's lock | 169 ns (169-639) |
+| the same, four CPUs at one place at once | 427 ns a CPU (427-861) |
+| held, the place closed, four CPUs at once | 143 ns a CPU (143-300) |
+| the writer's task, per line written: the VFS, ext4, the moves along | 6-10 µs |
+
+The writer runs on its own task, never the caller's: a line costs its
+writer a tenth of a microsecond or so where it is written, a fifth of what
+the kernel log cost the same line, and whatever comes of the disk is the
+`logs` task's. The most it can be made to do is bounded by the queue -- 512
+lines a burst, a burst every 200 ms -- some 2,500 lines a second, 2-3% of a
+CPU; what is past that is counted lost, not written. A flood through a
+limiter is the cheapest of all: 30 lines a minute reach the writer, and the
+rest cost their place tens of nanoseconds each once it is closed, a few
+hundred before. No file log is written on a path per packet, per disk
+request or per guest exit: a line is a connection, a session, a VM's or a
+volume's change, or a failure behind a limiter.
 
 ## Rotation
 
@@ -146,6 +250,13 @@ static NET: kcore::logs::Log = kcore::logs::Log::new("net");
 kcore::flog!(NET, "sshd: {} logged in from {}", user, peer);
 ```
 
+A line that may come as often as a failure does goes through its place's
+limiter (above):
+
+```rust
+kcore::flog_limited!(NBS, "client: {}", line);
+```
+
 A log is made the first time a line is written to it, by whichever `Log` of
 its name writes first, with that `Log`'s limits; every `Log` of one name --
 the image's and any module's -- writes the same files. A name or limits the
@@ -175,3 +286,21 @@ boot left unsaid -- each fail it within the gate's inputs. `sshd-test.py`
 (arm64, and `--arch x86_64`) then reads `/logs/net.log` on a booted machine:
 the logins, TCP's accepts and an SFTP session's line there -- on arm64 the
 UDP shell's commands too, each with who sent it -- and none of them in dmesg.
+
+Its `limiter` target holds the limiter to a model of the rules above, its
+own: kinds of line with digits that change, some of characters of more
+than a byte and some longer than a line, at times on either side of a
+window's end -- the place's and a kind's -- in floods that close the place,
+and now and then a line that passed the closed place's look as its last
+line went on another CPU. Each line's fate is the model's where the input
+has no more kinds than the limiter tells apart; whatever it has, every held
+line is said exactly once by the next that goes, no window of the place
+lets more than its 30 through, and the count before a line fits the line's
+room, whole characters, a cut said. Its controls -- ten mistakes put in the
+limiter, off by one at each bound, the closed count or the held one
+dropped, digits counted in a kind, the count said wrong -- each fail it
+within the gate's inputs. `nbs-test.py` (arm64, and `--arch x86_64`) reads
+`/logs/nbs.log`: no replica of a slow cs taken out, counted in the
+metadata's history, and what its joins copied, from the cs's own lines;
+`hv-linux-test.py` (x86-64, **manual**) reads `/logs/hv.log`: a VM's start
+and its stop with how long it ran, and neither in dmesg.

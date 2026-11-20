@@ -31,7 +31,6 @@ use alloc::vec::Vec;
 
 use kcore::events::SharedEvent;
 use kcore::ipc::{Bounce, Error, Limits, Mailbox, Scope, TAG_BULK};
-use kcore::klog;
 use kcore::time::{boot_time_ns, Duration};
 use kcore::trace::BounceWhy;
 use nbsclient::{Buffers, Out, Phase, Session, To, UserOp};
@@ -45,6 +44,11 @@ pub const TURN_NS: u64 = 50_000_000;
 pub const BLOCK: u64 = nbsclient::BLOCK;
 /// A request to a cs as it goes: between hosts by the bulk connection.
 const REQUEST: u32 = TAG_REQUEST | TAG_BULK;
+
+/// NBS's file log, /logs/nbs.log (docs/logs.md): what a session met -- a
+/// replica taken out, a request refused, an operation failed at its
+/// deadline -- on the host of the module that drives it.
+static NBS: kcore::logs::Log = kcore::logs::Log::new("nbs");
 /// How long a start or a stop is waited for with nothing moving: the
 /// attach's own limit, then the map, the fences and the reconcile -- whose
 /// every chunk mended counts as moving, so that one of thousands of chunks
@@ -243,8 +247,8 @@ impl Drive {
             let named = alloc::format!("{}.nbsw.s{:016x}", ns, token);
             match mb.register(&named, Scope::Cluster) {
                 Ok(()) => s.answer_at(&named),
-                Err(e) => klog!(0, "nbsdrive: volume {}: the session's name {} not had ({}): its writes go to each \
-                                    replica directly", name, named, e.name()),
+                Err(e) => kcore::flog_limited!(NBS, "client: volume {}: the session's name {} not had ({}): its \
+                                                     writes go to each replica directly", name, named, e.name()),
             }
         }
         let mut d = Drive { s, mb, me: String::from(me), bufs: Bufs::default(), done: BTreeMap::new(), next_tag: 1,
@@ -419,7 +423,10 @@ impl Drive {
                         }
                     }
                     Out::Say(line) => {
-                        klog!(0, "{}", line);
+                        /* In NBS's file log, and held to a rate there: a
+                         * replica that refuses every request says so at
+                         * every one */
+                        kcore::flog_limited!(NBS, "client: {}", line.strip_prefix("nbs: ").unwrap_or(&line));
                         self.last = line;
                     }
                 }
