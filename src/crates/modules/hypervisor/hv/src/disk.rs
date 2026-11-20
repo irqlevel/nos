@@ -493,8 +493,8 @@ impl Volume {
         if data.capacity() < blk::REQUEST_BYTES {
             data.clear();
             if data.try_reserve_exact(blk::REQUEST_BYTES).is_err() {
-                kcore::klog!(0, "hv: nbs:{}: no memory for a request's buffer -- slot {} fails what it is handed",
-                             self.name, k);
+                kcore::flog_limited!(crate::HV, "nbs:{}: no memory for a request's buffer -- slot {} fails what it \
+                                                 is handed", self.name, k);
                 *slot.lock() = Vec::new();
                 return;
             }
@@ -604,8 +604,8 @@ impl Drop for Volume {
         let d = self.drive.lock().take();
         if let Some(d) = d {
             match d.stop() {
-                Ok(()) => kcore::klog!(1, "hv: nbs:{} let go of", self.name),
-                Err(e) => kcore::klog!(0, "hv: nbs:{} not let go of cleanly: {}", self.name, e),
+                Ok(()) => kcore::flog!(crate::HV, "nbs:{} let go of", self.name),
+                Err(e) => kcore::flog!(crate::HV, "nbs:{} not let go of cleanly: {}", self.name, e),
             }
         }
     }
@@ -741,7 +741,7 @@ fn open_volume(name: &str, read_only: bool, force: bool, handover: Option<(u64, 
     if size == 0 {
         return Err(NotTaken::Unknown(alloc::format!("nbs:{}: no blocks", name)));
     }
-    kcore::klog!(1, "hv: nbs:{} (volume {}) attached, generation {}", name, number, generation);
+    kcore::flog!(crate::HV, "nbs:{} (volume {}) attached, generation {}", name, number, generation);
     Ok(Served { queue: Arc::new(v), size, discard_sectors: blk::DISCARD_ALIGNMENT, discards: false,
                 writes_zeroes: false, block_size: nbsdrive::BLOCK as u32, claim: None,
                 serial: Some(alloc::format!("nbs-{}", number)) })

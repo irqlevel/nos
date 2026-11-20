@@ -373,9 +373,9 @@ impl Tunnel {
         match clash {
             Some((a, b)) => {
                 if !self.clash_said.swap(true, Ordering::AcqRel) {
-                    kcore::klog!(0, "hv: tunnel: {} and {} are both at {}:{} -- two hosts behind one address need ports \
-                                     of their own: cluster address <host> underlay <ip:port>, the NAT forwarding \
-                                     each", a.name, b.name, netwire::Ipv4(a.underlay), port_of(a));
+                    kcore::flog!(crate::HV, "tunnel: {} and {} are both at {}:{} -- two hosts behind one address need \
+                                             ports of their own: cluster address <host> underlay <ip:port>, the NAT \
+                                             forwarding each", a.name, b.name, netwire::Ipv4(a.underlay), port_of(a));
                 }
             }
             None => self.clash_said.store(false, Ordering::Release),
@@ -844,12 +844,12 @@ impl Tunnel {
             }
         }
         for (name, addr, port) in silent.iter() {
-            kcore::klog!(0, "hv: tunnel: {} answered no echo for {} s", name, SILENT_S);
+            kcore::flog_limited!(crate::HV, "tunnel: {} answered no echo for {} s", name, SILENT_S);
             keyed(*addr, *port, 0, TunnelKeyWhat::Silent);
         }
         for (name, addr, port) in narrow.iter() {
-            kcore::klog!(0, "hv: tunnel: the way to {} does not carry a packet of {} bytes -- a cluster network's MTU \
-                             is past what the underlay takes", name, mtu);
+            kcore::flog_limited!(crate::HV, "tunnel: the way to {} does not carry a packet of {} bytes -- a cluster \
+                                             network's MTU is past what the underlay takes", name, mtu);
             keyed(*addr, *port, 0, TunnelKeyWhat::Narrow);
         }
         let hello = Message::Hello { instance: self.instance };
@@ -886,9 +886,9 @@ impl Tunnel {
         let port = self.port.load(Ordering::Relaxed);
         if let Some(n) = nic {
             if me != 0 && n.ip() != me && !self.misaddressed.swap(true, Ordering::AcqRel) {
-                kcore::klog!(0, "hv: tunnel: the registry has {}:{} for this host and the uplink is at {} -- the other \
-                                 hosts reach it only through a NAT that forwards UDP port {} here", netwire::Ipv4(me),
-                             port, netwire::Ipv4(n.ip()), port);
+                kcore::flog!(crate::HV, "tunnel: the registry has {}:{} for this host and the uplink is at {} -- the \
+                                         other hosts reach it only through a NAT that forwards UDP port {} here",
+                             netwire::Ipv4(me), port, netwire::Ipv4(n.ip()), port);
             }
         }
         let same = {

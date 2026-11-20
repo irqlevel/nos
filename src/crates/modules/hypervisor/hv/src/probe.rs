@@ -369,7 +369,7 @@ impl Probes {
         let all = core::mem::take(&mut *self.list.lock());
         for p in all {
             if let Some(why) = p.end() {
-                kcore::klog!(0, "hv probe: its port of vnet's left -- {}: `vnet port delete` it", why);
+                kcore::flog!(crate::HV, "probe: its port of vnet's left -- {}: `vnet port delete` it", why);
             }
         }
     }

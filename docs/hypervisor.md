@@ -4028,6 +4028,23 @@ What it reaches the folder with is three calls of the file ABI made for it:
 `kernel_file_append`, `kernel_file_rename` in `layers/fs/src/files.rs`), and
 `remove`, which was there already.
 
+**`/logs/hv.log`** ([File logs](logs.md)) is the host's history of its VMs,
+every VM's in one file: a VM made (`hv create`, from words, a cloud's image
+or an image of NBS's), cloned and deleted -- or not, and why -- from the
+shell or the host API alike; started, with where and what (`vm 3 (web)
+started on cpus 2,3 -- ...`), or restored, and a start that failed and
+why; booting again and why, reset too often and left stopped, stopped
+after how long and why, not run; a move to another host and its rounds,
+pause and bytes, one come from another, and every step of either that
+went wrong; a disk of NBS's attached, let go of, or out of memory for a
+request; a cluster network's tunnel to a host that stopped answering or
+cannot carry the MTU, a port vnet revoked, vnet gone from the host and
+back. Lines that can repeat -- a failed start a script asks again, a
+volume asked for again, a peer silent -- go through a limiter. The kernel
+log keeps the module's own lines: loaded and unloaded, the extension on
+and off, `WARNING`s, the unload's stop of each VM, a host's device given
+to a guest, and a guest's console when `log=` mirrors it there.
+
 **What it does not do yet:** read the file again at `hv restart`, which
 boots with what the start read -- `hv stop` and `hv start` take a changed
 file; start a VM when the module loads; or clone a VM that runs, whose
