@@ -1027,8 +1027,8 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
             total.ud, total.wbinvd, total.cr8, total.cr0, total.reflected);
     }
     if total.split_locks != 0 {
-        let _ = writeln!(out, "  splitlock  {} split locks -- locked accesses across two cache lines -- stepped past with \
-                               the host's detection off for each", total.split_locks);
+        let _ = writeln!(out, "  splitlock  {} #ACs of split locks -- locked accesses across two cache lines -- each \
+                               stepped past with the host's detection off", total.split_locks);
     }
     if total.cr4 != 0 {
         let _ = writeln!(out, "  cr4        {} reads and writes performed, {} writes refused with #GP",

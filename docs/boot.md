@@ -273,11 +273,16 @@ MSR's write, and a #GP there would be a panic at boot.
   the guest is stepped past it: the CPU's detection off for that one
   instruction, the monitor trap flag on to end the run right after it, the
   detection on again at that exit, interrupts off throughout
-  (`Guest::step_split_lock`). Its sibling thread's detection is off with it
-  for that instruction, so a split lock of the sibling's in that window
-  goes unseen -- never wrongly said. A guest's CPUID does not offer the
-  feature: it neither sees nor sets the MSR. `hv run splitlock` is the
-  check, the guest report's `splitlock` line the count.
+  (`Guest::step_split_lock`). An event the entry delivers -- an interrupt
+  due then -- ends the step before the instruction runs, and the guest
+  raises the split lock again and is stepped again: what the guest report's
+  `splitlock` line counts is #ACs, a little over the instructions -- a Linux
+  guest's 3000, each run once, were 3005 on the EX44. Its sibling thread's
+  detection is off with it for that instruction, so a split lock of the
+  sibling's in that window goes unseen -- never wrongly said. A guest's
+  CPUID does not offer the feature: it neither sees nor sets the MSR.
+  `hv run splitlock` is the check, the guest report's `splitlock` line the
+  count.
 
 `splitlock=off` leaves the detection off: no panic, no warning, every split
 lock as slow as the bus makes it.

@@ -618,10 +618,13 @@ pub struct Counts {
     /// Exceptions of the guest's own the host intercepted and gave back:
     /// #DB -- a single step, `int1` -- and #AC.
     pub reflected: u64,
-    /// Split locks of the guest's -- locked accesses across two cache
-    /// lines -- that the host's detection stopped and stepped it past
-    /// (VT-x, where the CPU detects them): each one the bus taken from every
-    /// core while it ran.
+    /// The #ACs of the guest's split locks -- locked accesses across two
+    /// cache lines, each the bus taken from every core while it ran -- that
+    /// the host's detection raised and the loop stepped the guest past
+    /// (VT-x, where the CPU detects them). #ACs, not instructions: a step
+    /// that an event's delivery ends before the instruction runs -- an
+    /// interrupt due at its entry -- has the guest raise the same split lock
+    /// again, counted again (a Linux guest's 3000 were 3005 on the EX44).
     pub split_locks: u64,
     pub wbinvd: u64,
     pub cr8: u64,
