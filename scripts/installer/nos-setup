@@ -469,12 +469,14 @@ eject_media() {
 }
 
 # nos-install disk with what was answered or chosen: DISK, ROOT_SIZE,
-# WIPE, NOS_CMDLINE, NETCONSOLE and the keys -- its lines on the screen and
-# in the kernel log. $1 "--dry-run" only says what it would write
+# WIPE, the network (NOS_NET: /etc/net.toml's), NETCONSOLE, NOS_CMDLINE and
+# the keys -- its lines on the screen and in the kernel log. $1 "--dry-run"
+# only says what it would write
 run_install() {
     local args=(disk "$DISK" --root-size "$ROOT_SIZE") line
     [ "$WIPE" = 0 ] || args+=(--wipe)
     [ ! -s "$KEYS_FILE" ] || args+=(--ssh-key "$KEYS_FILE")
+    args+=(${NOS_NET[@]+"${NOS_NET[@]}"})
     [ -z "$NETCONSOLE" ] || args+=(--netconsole "$NETCONSOLE")
     [ -z "$NOS_CMDLINE" ] || args+=(--cmdline "$NOS_CMDLINE")
     [ -z "${1:-}" ] || args+=("$1")
@@ -490,8 +492,21 @@ run_install() {
 DISK=
 ROOT_SIZE=$ROOT_SIZE_DEFAULT
 WIPE=0
+# nos's network, as nos-install's options: what it writes to /etc/net.toml
+# on the root, which its plan (--dry-run) says
+NOS_NET=(--dhcp)
+# More kernel parameters (the answers' cmdline=)
 NOS_CMDLINE=
 NETCONSOLE=
+
+# nos's network a static address: IP, GW, DNS
+net_static_chosen() {
+    NOS_NET=(--ip "$IP" --gw "$GW" --dns "$DNS")
+}
+
+net_dhcp_chosen() {
+    NOS_NET=(--dhcp)
+}
 
 # Whether $1 is a disk of nos's own already, of the image this installer
 # carries: its root's /VERSION the image's, read with debugfs, which mounts
@@ -535,9 +550,11 @@ unattended() {
             say "FAILED: ip= is A.B.C.D/N, and it takes gw= and dns=, each A.B.C.D"
             return 1
         fi
-        NOS_CMDLINE="ip=${ANS[ip]} gw=${ANS[gw]} dns=${ANS[dns]}${NOS_CMDLINE:+ $NOS_CMDLINE}"
-        net_static "${ANS[ip]}" "${ANS[gw]}" "${ANS[dns]}" || say "network: the address did not take"
+        IP=${ANS[ip]}; GW=${ANS[gw]}; DNS=${ANS[dns]}
+        net_static_chosen
+        net_static "$IP" "$GW" "$DNS" || say "network: the address did not take"
     else
+        net_dhcp_chosen
         net_dhcp || true
     fi
     if [ -n "$NETCONSOLE" ]; then
@@ -705,7 +722,7 @@ DNS=
 # Linux on the disks has it, or given; nothing of this system's is changed
 ask_network_here() {
     local how here hip= hgw= hdns= w warn= found= items=() text
-    NOS_CMDLINE=
+    net_dhcp_chosen
     text="How does nos get its address on this server's network?"
     here=$(nos_install network 2>/run/nos-network.why) || here=
     if [ -n "$here" ]; then
@@ -747,13 +764,13 @@ ask_network_here() {
         static) DNS=$hdns ;;
     esac
     edit_address || return 1
-    NOS_CMDLINE="ip=$IP gw=$GW dns=$DNS"
+    net_static_chosen
 }
 
 ask_network() {
     local how found= items=() note= where=
     [ "$ON_ISO" = 1 ] || { ask_network_here; return; }
-    NOS_CMDLINE=
+    net_dhcp_chosen
     # A provider's installer VM is behind QEMU's NAT: nothing tried here says
     # anything of the server's network
     if in_vm; then
@@ -787,7 +804,7 @@ ask_network() {
     esac
     edit_address || return 1
     ANS[ip]=$IP; ANS[gw]=$GW; ANS[dns]=$DNS
-    NOS_CMDLINE="ip=$IP gw=$GW dns=$DNS"
+    net_static_chosen
     if in_vm; then
         vm_network
         return 0
@@ -877,7 +894,7 @@ confirm() {
     else
         fp="none -- nos's sshd will let nobody in"
     fi
-    whiptail --title "$TITLE" --msgbox "What will be written:\n\n$plan\n\nnos's network: ${NOS_CMDLINE:-DHCP}\nThe keys let in: $fp" 24 76
+    whiptail --title "$TITLE" --msgbox "What will be written:\n\n$plan\n\nThe keys let in: $fp" 24 76
     name=${DISK##*/}
     typed=$(dialog_ --inputbox "Everything on $DISK will be erased.\n${DISK_HOLDS[$DISK]:+It holds: ${DISK_HOLDS[$DISK]}\n}\nType $name to install nos onto it:" 14 76) || return 1
     [ "$typed" = "$name" ]

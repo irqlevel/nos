@@ -56,13 +56,12 @@ struct Expected
     bool idle_mwait = true; /* MWAIT unless the last idle= that says one way or the other says halt */
     ulong panic_reset_secs = 0;
     int console = 0; /* both, serial, vga */
-    int dhcp = 0;    /* on, auto, off */
     int zero_free = 0; /* on, off, verify -- the last of the three said */
     bool mem_sites = false; /* memsites=: the last of on and off said */
     ulong max_cpus = 0, net_frames = 0, tail_kb = 0;
     u16 udp_shell = 0, nc_port = 0;
     u32 nc_ip = 0;
-    bool rx_poll = false, dns = false, ro = false, fs_test = false, disk_log = false;
+    bool rx_poll = false, ro = false, fs_test = false, disk_log = false;
     int log_level = Parameters::DEFAULT_LOG_LEVEL;
     int root_mode = Parameters::RootNone;
     std::string root_value;
@@ -231,15 +230,6 @@ void take(Expected& e, const std::string& token)
         else if (value == "both")
             e.console = 0;
     }
-    else if (key == "dhcp")
-    {
-        if (value == "auto")
-            e.dhcp = 1;
-        else if (value == "on")
-            e.dhcp = 0;
-        else if (value == "off")
-            e.dhcp = 2;
-    }
     else if (key == "zerofree")
     {
         if (value == "on")
@@ -390,10 +380,9 @@ void take(Expected& e, const std::string& token)
         else if (value == "off")
             e.disk_log = false;
     }
-    else if (key == "dns" && value == "on")
-    {
-        e.dns = true;
-    }
+    /* ip=, gw=, dns= and dhcp= are eth0's settings, which the network
+       layer reads off the line itself: known keys here, nothing of them
+       kept (layers/net/src/settings.rs, and net-fuzz's netconf target) */
 }
 
 Expected read(const std::string& line)
@@ -426,7 +415,7 @@ Expected read(const std::string& line)
 const char* const WORDS[] = {"trace", "panic", "its", "usb", "rc", "hwrng", "hwp", "ucode", "idle", "wxprobe", "smp",
                              "maxcpus", "console", "dhcp", "udpshell", "netconsole", "rxpoll", "ubsan", "netframes",
                              "nctail", "loglevel", "root", "fstest", "disklog", "dns", "hugepages", "tracepoints",
-                             "zerofree", "memsites", "guestpci", "splitlock"};
+                             "zerofree", "memsites", "guestpci", "splitlock", "ip", "gw"};
 
 const char* const HUGE_VALUES[] = {"50%", "100%", "101%", "0%", "1%", "32G", "512G", "513G", "0G", "512M", "524288M",
                                   "524289m", "1g", "2m", "G", "%", "M", "50", "50%%", "0050%", "%50", "18446744073709551615G",
@@ -603,7 +592,6 @@ void run(fuzz::Input& in)
     INVARIANT(p.get_max_cpus() == e.max_cpus, "maxcpus %lu, not %lu", p.get_max_cpus(), e.max_cpus);
     INVARIANT(p.is_console_both() == (e.console == 0) && p.is_console_serial() == (e.console == 1) &&
         p.is_console_vga() == (e.console == 2), "console read wrong");
-    INVARIANT(p.is_dhcp_auto() == (e.dhcp == 1) && p.is_dhcp_off() == (e.dhcp == 2), "dhcp read wrong");
     INVARIANT(p.is_zero_free_off() == (e.zero_free == 1) && p.is_zero_free_verify() == (e.zero_free == 2),
         "zerofree read wrong");
     INVARIANT(p.is_mem_sites() == e.mem_sites, "memsites %d, not %d", p.is_mem_sites(), e.mem_sites);
@@ -612,8 +600,8 @@ void run(fuzz::Input& in)
         p.get_netconsole_ip() == e.nc_ip, "netconsole 0x%x:%u, not 0x%x:%u", p.get_netconsole_ip(), p.get_netconsole_port(),
         e.nc_ip, e.nc_port);
     INVARIANT(p.get_netconsole_tail_kb() == e.tail_kb && p.get_net_frame_count() == e.net_frames, "nctail or netframes wrong");
-    INVARIANT(p.is_rx_poll_enabled() == e.rx_poll && p.is_dns_enabled() == e.dns && p.is_root_read_only() == e.ro &&
-        p.is_fs_test() == e.fs_test && p.is_disk_log_on() == e.disk_log, "rxpoll, dns, ro, fstest or disklog wrong");
+    INVARIANT(p.is_rx_poll_enabled() == e.rx_poll && p.is_root_read_only() == e.ro &&
+        p.is_fs_test() == e.fs_test && p.is_disk_log_on() == e.disk_log, "rxpoll, ro, fstest or disklog wrong");
     INVARIANT(p.get_log_level() == e.log_level, "loglevel %d, not %d", p.get_log_level(), e.log_level);
     INVARIANT(std::string(p.get_tracepoints()) == e.tracepoints, "tracepoints '%s', not '%s'", p.get_tracepoints(),
         e.tracepoints.c_str());
