@@ -724,22 +724,24 @@ impl AhciDisk {
         raised
     }
 
-    /// One turn of a wait for slot `slot` (or for the port) begun at `since`:
-    /// with the interrupt to wait on, the CPU given to whoever else can run
-    /// -- for `spin_ns`, and past it a nap of `nap_ns` -- the error handler
-    /// run here first if it is wanted and nobody runs it; polling, the port
-    /// looked at and the handler run here. A wait for a slot's end sleeps on
-    /// its event past the spin instead (`wait_slot`).
-    fn idle_on(&self, slot: Option<usize>, poll: bool, since: u64) {
+    /// One turn of a wait for slot `slot` (or for the port): with the
+    /// interrupt to wait on, the CPU given to whoever else can run -- and,
+    /// for a wait begun at `nap_since` past `spin_ns` from then, a nap of
+    /// `nap_ns` instead -- the error handler run here first if it is wanted
+    /// and nobody runs it; polling, the port looked at and the handler run
+    /// here. A wait for a slot's end sleeps on its event past the spin
+    /// instead (`wait_slot`).
+    fn idle_on(&self, slot: Option<usize>, poll: bool, nap_since: Option<u64>) {
         if !poll && self.interrupt_mode() {
             let now = boot_time_ns();
             if self.attention.load(Ordering::Acquire) || slot.is_some_and(|t| self.overdue(t, now)) {
                 self.service();
             }
-            if now.saturating_sub(since) < self.spin_ns {
-                kcore::task::yield_to_runnable();
-            } else {
-                kcore::task::sleep(Duration::from_nanos(self.nap_ns));
+            match nap_since {
+                Some(since) if now.saturating_sub(since) >= self.spin_ns => {
+                    kcore::task::sleep(Duration::from_nanos(self.nap_ns));
+                }
+                _ => kcore::task::yield_to_runnable(),
             }
         } else {
             self.reap();
@@ -759,9 +761,14 @@ impl AhciDisk {
 
     /// A queued slot for a task, waited for while there is none free -- or
     /// the port is the error handler's or one of the disk's own commands'.
-    /// None for a disk given up on.
+    /// None for a disk given up on. Waited for awake, giving the CPU to
+    /// whoever else can run, and never asleep: a slot freed goes to whoever
+    /// looks first, and the task that gave it back takes it again at once
+    /// for its next command -- one asleep lost every slot to them: with 32
+    /// tasks on the SMR disk's 31, the 32nd waited six seconds for one,
+    /// where it had waited under two awake. So only more tasks than the
+    /// disk queues cost a CPU here.
     fn take_slot(&self) -> Option<usize> {
-        let since = boot_time_ns();
         loop {
             if let Some(t) = self.try_slot() {
                 return Some(t);
@@ -769,7 +776,7 @@ impl AhciDisk {
             if self.queue.lock().failed {
                 return None;
             }
-            self.idle_on(None, false, since);
+            self.idle_on(None, false, None);
         }
     }
 
@@ -813,7 +820,7 @@ impl AhciDisk {
             }
             let now = boot_time_ns();
             if poll || !self.interrupt_mode() || now.saturating_sub(since) < self.spin_ns {
-                self.idle_on(Some(t), poll, since);
+                self.idle_on(Some(t), poll, Some(since));
                 continue;
             }
             if self.attention.load(Ordering::Acquire) || self.overdue(t, now) {
@@ -1039,7 +1046,7 @@ impl AhciDisk {
                     break;
                 }
             }
-            self.idle_on(None, poll, since);
+            self.idle_on(None, poll, Some(since));
         }
         loop {
             {
@@ -1052,7 +1059,7 @@ impl AhciDisk {
                     break;
                 }
             }
-            self.idle_on(None, poll, since);
+            self.idle_on(None, poll, Some(since));
         }
         let t = self.own;
         let built = {
