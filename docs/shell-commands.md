@@ -11,6 +11,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `lscpu` | Identify the CPU and report the features the kernel depends on (1 GiB pages, NX, PAT, invariant TSC, ARAT), the performance counters it has (Intel architectural perfmon, or AMD core counters and PerfMonV2), and which of them `profile` will actually sample with |
 | `dmesg [lines] [filter]` | Dump kernel log: newest `lines` messages (all of it if omitted), optional substring filter |
 | `loglevel [N]` | Show or set the log level (0-5) on a running kernel |
+| `mark <text>` | A line of your own into the kernel log, `mark: <text>` -- onto the consoles, the netconsole and the disk log with every other line: a mark to find later, set before something is tried on a box whose only console is the network |
 | `uptime` | Show uptime |
 | `date` | Show wall clock date and time (RTC + boot time); "wall clock not available" on a machine whose RTC could not be read, rather than a date in 1970 |
 | `e1000edump [n]` | The nth 82574L's own state (0 by default): its control, status and manageability registers -- MANC as the firmware has it now and as bring-up found it -- the PHY's view of the link (BMCR, BMSR, what it advertised and what the partner offered, both 1000BASE-T registers, read holding the MDIO bus the firmware shares), the interrupt layout (INTx, one MSI-X vector, or a queue vector and Other) with IVAR, IAM and EIAC and each vector's count, the throttle and the receive rate it follows, both rings' head and tail, and the MAC's own receive and transmit counts |
