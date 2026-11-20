@@ -48,12 +48,14 @@ use kcore::ipc::{Addr, Mailbox, Message, TAG_BOUNCED, TAG_BULK};
 use kcore::klog;
 use kcore::time::boot_time_ns;
 use nbsmeta::repair::{self, Seen};
-use nbsmeta::{Answer, Command, Refusal, Replica, State};
+use nbsmeta::{Answer, Command, Refusal, Replica};
 use nbswire::scrub::{self, Scrub};
 use nbswire::{Answered, Ask, Asking, Op, Query, Question, Request, Said, Saying, Told};
 use raft::{Role, Rsm};
 use raftmember::offered::{self, Group, Half, Lost, MemberFile};
 use raftmember::{App, Core, Locked, Outcome, Pending, Request as Asked};
+
+use crate::history::{Meta, NBS};
 
 /// The member's mailbox, the same on every host of the cluster.
 pub const NAME: &str = nbswire::MDS_NAME;
@@ -200,7 +202,7 @@ pub enum Kind {
 
 /// The member over its log in `dir`, its mailbox named.
 #[allow(clippy::too_many_arguments)]
-pub fn new(rsm: Rsm<raftmember::Log, State>, me: MemberFile, lost: Lost, dir: &str, out_after_ms: u64,
+pub fn new(rsm: Rsm<raftmember::Log, Meta>, me: MemberFile, lost: Lost, dir: &str, out_after_ms: u64,
            scrub_ms: u64, scrubbed: Scrubbed) -> Result<Member, String> {
     let id = me.id;
     raftmember::Member::new(Mds { half: Half { me, lost }, dir: String::from(dir), proposed: 0, probes: Vec::new(),
@@ -214,7 +216,7 @@ pub fn new(rsm: Rsm<raftmember::Log, State>, me: MemberFile, lost: Lost, dir: &s
 }
 
 impl App for Mds {
-    type State = State;
+    type State = Meta;
     type Command = Command;
     type Answer = Answer;
     type Waiter = Waiter;
@@ -580,9 +582,10 @@ impl Mds {
         let plan = repair::plan(core.state(), &seen, &joining, self.after);
         for cmd in plan {
             if let Command::Unjoin { set, cs, since } = cmd {
-                klog!(0, "nbs: the join of set {} by cs {} (since version {}) stood past its time, {} min: given up \
-                          -- its joiner answers, but its copy never ended", set, cs, since,
-                      core.state().sets().get(set as usize).map_or(0, |s| repair::join_limit_ms(s.chunks)) / 60_000);
+                kcore::flog!(NBS, "controller: the join of set {} by cs {} (since version {}) stood past its time, {} \
+                                   min: given up -- its joiner answers, but its copy never ended", set, cs, since,
+                             core.state().sets().get(set as usize).map_or(0, |s| repair::join_limit_ms(s.chunks))
+                                 / 60_000);
             }
             klog!(1, "nbs: the controller proposes {:?}", cmd);
             self.repairing += 1;
@@ -614,7 +617,9 @@ impl Mds {
                         x.found.push_back((chunk, set, version, odd));
                     });
                 }
-                scrub::Out::Say(line) => klog!(0, "{}", line),
+                scrub::Out::Say(line) => {
+                    kcore::flog_limited!(NBS, "{}", line.strip_prefix("nbs: ").unwrap_or(&line));
+                }
             }
         }
         if let Some(s) = self.scrub.as_ref() {
@@ -844,7 +849,7 @@ impl Group for Mds {
     const TASK: &'static str = "nbs/mds";
     const IDLE_TASK: &'static str = "nbs/idle";
 
-    fn members(state: &State) -> &members::Members {
+    fn members(state: &Meta) -> &members::Members {
         state.roll()
     }
 

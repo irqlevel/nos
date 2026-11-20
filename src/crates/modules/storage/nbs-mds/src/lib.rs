@@ -67,6 +67,7 @@
 extern crate alloc;
 
 mod files;
+mod history;
 mod io;
 mod member;
 mod provider;
@@ -82,7 +83,6 @@ use core::fmt::Write;
 use kcore::cmd::{Command as ShellCommand, Output};
 use kcore::error::Error;
 use kcore::mgmt::Provider;
-use nbsmeta::State;
 use raft::Role;
 use raftmember::offered::{self, MemberFile, Offered, Starter};
 use raftmember::{Locked, Log, Recovered};
@@ -171,7 +171,11 @@ impl Starter<Mds> for ModState {
             Some(log) => log,
             None => raftmember::open_log(&self.group.dir, me.id, fresh, &lost_remedy(self, &me.host))?,
         };
-        let rsm = raftmember::member_rsm::<State>(log, me.id, fresh || campaign, Some(self.compact))?;
+        /* What its log replays as it starts was said as it was first applied:
+         * the history is said from the end of that on */
+        history::saying(false);
+        let rsm = raftmember::member_rsm::<history::Meta>(log, me.id, fresh || campaign, Some(self.compact))?;
+        history::saying(true);
         let member = member::new(rsm, me, self.group.lost.clone(), &self.group.dir, self.out_after_ms, self.scrub_ms,
                                  self.scrubbed.clone())?;
         self.group.runner.spawn(<Mds as offered::Group>::TASK, member)
