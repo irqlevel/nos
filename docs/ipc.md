@@ -341,7 +341,10 @@ hosts and back.
   anyone else the port is not there, no SYN-ACK and no reset, and no slot
   taken (TCP's allowlist, plans/tcp.md T3). At most two handshakes at once,
   one a source, each given 3 s. Each connection has a link's 20 ms floor
-  for its retransmissions (T2).
+  for its retransmissions (T2). A handshake the listener refuses -- from
+  a key not pinned, behind a peer's address -- is counted, and said in the
+  network's file log, `/logs/net.log` ([File logs](logs.md)), rather than
+  in the kernel log: a peer with the wrong key dials again and again.
 - **TLS 1.3, both keys pinned**: the dialer is a `tls::pinned::Client` of
   the peer's keys, the listener a `Server` of every peer's, ChaCha20-
   Poly1305 asked for first (measured: docs/tls.md). The connection's class is

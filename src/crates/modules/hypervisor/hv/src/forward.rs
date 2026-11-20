@@ -57,9 +57,16 @@ use kcore::net::Nic;
 use kcore::sync::Mutex;
 use kcore::task::TaskHandle;
 use kcore::tcp::{TcpListener, TcpStream, RECV_TIMEOUT};
+use netwire::Ipv4Port;
 
 use crate::net::{self, Switch};
 use crate::relay::{self, Ended, Read};
+
+/// Where a connection given up is said: the network's file log,
+/// /logs/net.log (docs/logs.md), with TCP's connections -- one a client
+/// left hanging, which a forwarded port open to the world has as often as
+/// it likes, was a line of the kernel log each.
+static NET: kcore::logs::Log = kcore::logs::Log::new("net");
 
 pub const MAX_FORWARDS: usize = 8;
 const MAX_CONNS: usize = 8;
@@ -287,8 +294,10 @@ fn relay_task(relay: Relay) {
                 == Ended::Stalled
             {
                 shared.stalled.fetch_add(1, Ordering::Relaxed);
-                kcore::klog!(0, "hv: a forwarded connection given up -- a side took nothing for {} s",
-                              RELAY_STALL_NS / NS_PER_SEC);
+                let (ip, port) = a.peer();
+                kcore::flog!(NET, "hv: a forwarded connection from {} to {} given up -- a side took nothing for {} s",
+                             Ipv4Port(ip, port), Ipv4Port(shared.guest_ip, shared.guest_port),
+                             RELAY_STALL_NS / NS_PER_SEC);
             }
             drop(a);
             drop(b);

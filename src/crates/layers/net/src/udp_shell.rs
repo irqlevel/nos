@@ -17,10 +17,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::nic::{Lent, Nic, RxContext, UdpHandler, UdpListener};
 use kcore::sync::{Event, SpinLock};
 use kcore::task::TaskHandle;
-use kcore::klog;
+use kcore::{flog, klog};
 
 use crate::abi;
 use crate::udp;
+use crate::wire::Ipv4Port;
 
 /// "NOSH", at the head of every datagram either way.
 pub const MAGIC: u32 = 0x4E4F_5348;
@@ -335,22 +336,25 @@ impl UdpShell {
                 continue;
             }
 
+            /* What came in, and from where, is the network's file log's
+             * (`crate::LOG`, /logs/net.log): a line for every command a
+             * client sends, which in the kernel log -- at level 0 -- put a
+             * line of its own around every `dmesg` read through here */
+            let from = Ipv4Port(to_ip, to_port);
             reply.clear();
             if too_long != 0 {
-                klog!(0, "udpshell: a command of {} bytes, not run", too_long);
+                flog!(crate::LOG, "udpshell: a command of {} bytes from {}, not run", too_long, from);
                 let _ = writeln!(reply, "command too long: {} bytes, at most {}", too_long, CMD_MAX);
             } else {
                 let line = match core::str::from_utf8(&cmd[..len]) {
                     Ok(line) => line,
                     Err(_) => {
-                        klog!(0, "udpshell: a command that is not text, dropped");
+                        flog!(crate::LOG, "udpshell: a command from {} that is not text, dropped", from);
                         continue;
                     }
                 };
 
-                klog!(0, "udpshell: cmd '{}' from {}.{}.{}.{}:{}", line,
-                    (to_ip >> 24) & 0xFF, (to_ip >> 16) & 0xFF,
-                    (to_ip >> 8) & 0xFF, to_ip & 0xFF, to_port);
+                flog!(crate::LOG, "udpshell: cmd '{}' from {}", line, from);
 
                 kcore::cmd::dispatch(line, &mut |piece: &[u8]| reply.collect(piece));
             }

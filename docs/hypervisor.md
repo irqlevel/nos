@@ -2778,7 +2778,11 @@ rest. A relay ends when either side's stream ends: there is no half-close, the
 kernel's TCP having no way for a program to end its sending and go on
 reading, so a client that shuts its sending side and waits for the answer
 (`nc -N`) gets none; and an idle relay looks at each side every few
-milliseconds, there being no event to wait on for two connections. Its listener is
+milliseconds, there being no event to wait on for two connections. A relay
+one side of which takes nothing for a while is given up, counted (`given up
+stalled` in `hv forward`) and said, with the client's address and the
+guest's, in the network's file
+log, `/logs/net.log` ([File logs](logs.md)), beside TCP's accept of it. Its listener is
 a bulk one (`TcpListener::bind_bulk`): a connection it accepts has buffers of
 up to 512 KiB each way and scales its window, where a connection's own 8 KiB
 would hold a client 62 ms away -- the EX44 from a desk in another country --
