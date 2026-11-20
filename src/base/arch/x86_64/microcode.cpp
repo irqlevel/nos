@@ -13,13 +13,8 @@ namespace microcode
 namespace
 {
 
-const u32 LEAF_VENDOR = 0;
 const u32 LEAF_FEATURES = 1;
 const u32 FEATURES_ECX_HYPERVISOR = 1U << 31;
-/* "GenuineIntel", as EBX, EDX and ECX give it */
-const u32 INTEL_EBX = 0x756E6547;
-const u32 INTEL_EDX = 0x49656E69;
-const u32 INTEL_ECX = 0x6C65746E;
 
 const u32 MSR_PLATFORM_ID = 0x17;
 const u32 PLATFORM_ID_SHIFT = 50;
@@ -48,8 +43,7 @@ const char* not_here()
     if (Parameters::get_instance().is_ucode_off())
         return "not loaded: ucode=off";
 
-    CpuidResult v = cpuid(LEAF_VENDOR);
-    if (v.ebx != INTEL_EBX || v.edx != INTEL_EDX || v.ecx != INTEL_ECX)
+    if (cpu_vendor() != CpuVendor::Intel)
         return "not loaded: not an Intel CPU";
 
     /* Under a hypervisor the microcode is the host's, and Linux leaves it

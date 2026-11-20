@@ -109,6 +109,8 @@ private:
     PageAllocatorImpl();
     ~PageAllocatorImpl();
 
+    static const size_t PAGE_LOG_LIMIT = stdlib::const_log2(PageTable::MAX_CONTIGUOUS_PAGES) + 1;
+
     /* Free and Alloc keep a block of the heap's freed with its pages still
        mapped, and hand it out again: a block that comes back costs neither
        a map nor -- on x86, where each unmap is an IPI to every other CPU and
@@ -135,31 +137,39 @@ private:
 
     static constexpr ulong KEPT_MARK = 0x4B4550544B455054UL;
 
-    /* The most pages each size keeps: a thousandth of the pages free at
-       Setup, and never more than 512 KiB -- 4 MiB over all eight sizes */
-    static constexpr ulong KEPT_PAGES_MAX = 128;
-    static constexpr ulong KEPT_RAM_SHARE = 1024;
+    /* The most pages each size keeps: a two-thousandth of the pages free at
+       Setup, and never more than 32 MiB. A machine of 1 GiB keeps what it
+       always did, 512 KiB a size; one of 64 GiB or more the 32 MiB. The
+       list is what the CPUs' caches trade through, and where a block the
+       list has no room for goes, it is unmapped and every CPU's TLB shot
+       down: 512 KiB was eight blocks of 64 KiB for Newton's 48 CPUs. */
+    static constexpr ulong KEPT_PAGES_MAX = 8192;
+    static constexpr ulong KEPT_RAM_SHARE = 2048;
 
-    /* In front of kept_blocks_, for the three smallest sizes -- a page, two,
-       four -- a few kept blocks a CPU, under a lock only that CPU takes
-       (and Trim), as AllocatorImpl's caches are in front of its pools: four
-       CPUs allocating pages took kept_blocks_' lock in turn, and a pair of
-       4 KiB blocks cost ten times on four what it did on one (heapbench).
-       A free a full cache cannot take spills the older half of it to
-       kept_blocks_; an allocation an empty one cannot serve takes from
-       there. A block in a CPU's cache is kept as one in kept_blocks_ is:
-       mapped, marked, nobody's. */
-    static constexpr size_t CPU_KEPT_LOGS = 3;
-    /* Pages a CPU keeps of each of those sizes: four blocks of a page, two
-       of two, one of four -- and none past kept_blocks_' own bound */
-    static constexpr ulong CPU_KEPT_PAGES = 4;
+    /* In front of kept_blocks_, for every size, a few kept blocks a CPU,
+       under a lock only that CPU takes (and Trim), as AllocatorImpl's
+       caches are in front of its pools: CPUs allocating a size took
+       kept_blocks_' lock in turn -- a pair of 4 KiB blocks cost ten times
+       on four CPUs what it did on one, and one of 64 KiB two thousand times
+       on 48 (heapbench). A free a full cache cannot take spills the older
+       half of it to kept_blocks_, under its lock once; an allocation an
+       empty one cannot serve refills it to half from there, the same. A
+       block in a CPU's cache is kept as one in kept_blocks_ is: mapped,
+       marked, nobody's. */
+    static constexpr size_t CPU_KEPT_LOGS = PAGE_LOG_LIMIT;
+    /* Pages a CPU keeps of each size: sixteen blocks of a page, eight of
+       two, four of four, two of eight, one of each larger size -- at most
+       1.2 MiB a CPU -- and none past kept_blocks_' own bound */
+    static constexpr ulong CPU_KEPT_PAGES = 16;
+    /* The most blocks of one size a CPU keeps: the page's sixteen */
+    static constexpr ulong CPU_KEPT_MAX = CPU_KEPT_PAGES;
 
     struct CpuKeptSize
     {
         ulong count = 0;
         /* 0 until Setup, which keeps nothing */
         ulong limit = 0;
-        Kept* blocks[CPU_KEPT_PAGES];
+        Kept* blocks[CPU_KEPT_MAX];
     };
 
     struct alignas(64) CpuKept
@@ -177,6 +187,14 @@ private:
     bool keep(size_t log, void* ptr);
     /* A block onto kept_blocks_; false if it is full */
     bool keep_shared(size_t log, Kept* block);
+    /* Blocks onto kept_blocks_, under its lock once: how many of them, from
+       the first, it had room for */
+    ulong keep_shared_many(size_t log, Kept* const* blocks, ulong count);
+    /* Up to count blocks off kept_blocks_ into blocks, under its lock once:
+       how many there were */
+    ulong take_shared_many(size_t log, Kept** blocks, ulong count);
+    /* The bounds of every list and cache, from the pages free at Setup */
+    void set_kept_limits(ulong free_pages_count);
     /* Whether a block is kept, in any CPU's cache or kept_blocks_: the
        double-free check, for a block that carries the mark */
     bool is_kept(size_t log, Kept* block);
@@ -194,8 +212,6 @@ private:
     PageAllocatorImpl(PageAllocatorImpl&& other) = delete;
     PageAllocatorImpl& operator=(const PageAllocatorImpl& other) = delete;
     PageAllocatorImpl& operator=(PageAllocatorImpl&& other) = delete;
-
-    static const size_t PAGE_LOG_LIMIT = stdlib::const_log2(PageTable::MAX_CONTIGUOUS_PAGES) + 1;
 
     FixedPageAllocator fixed_pg_alloc_[PAGE_LOG_LIMIT];
 

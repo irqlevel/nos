@@ -273,17 +273,35 @@ twice, or written into while free.
 What the heap keeps between a free and the next allocation, so that neither
 costs what the first one did (`heapbench`, below, measures each):
 
-- **A cache per CPU in front of the pools.** A few free blocks of each size,
-  under a lock only that CPU takes, traded with the pool half a cache at a
-  time — so allocations of one size on several CPUs do not all queue on the
-  pool's lock. Used once the CPU can say which it is (`hal::irq_chip_ready`).
+- **A cache per CPU in front of the pools.** Up to 128 free blocks of each
+  size and no more than 64 KiB of it -- 32 of the largest -- under a lock
+  only that CPU takes, traded with the pool half a cache at a time, so
+  allocations of one size on several CPUs do not all queue on the pool's
+  lock. Used once the CPU can say which it is (`hal::irq_chip_ready`). It
+  was 16 blocks and a page: on Newton's 48 CPUs a batch of 64 blocks held
+  at once took the pool's lock sixteen times a round, and each take waited
+  out the others' -- 144 µs an allocation of 64 bytes, 1318 µs one of 512,
+  where with these, and the spinlock's waiters reading
+  ([Scheduler](scheduler.md)), it is 0.78 µs and 0.85 µs (`heapbench`,
+  every CPU).
 - **An empty page per pool.** The largest class's block has a page to
   itself, so without it every allocation and free of 1 to 2 KiB was a page
   mapped and unmapped.
 - **Freed blocks of the page allocator, still mapped** — a bounded list per
-  size, a thousandth of RAM at most and never more than 512 KiB a size. A
-  block that comes back costs no map and, on x86, no TLB shootdown of every
-  other CPU. `mm::alloc` zeroes a kept block, as fresh pages always are;
+  size, a two-thousandth of RAM at most and never more than 32 MiB a size (a
+  machine of 1 GiB keeps the 512 KiB a size it always did), and in front of
+  it a cache per CPU of every size -- sixteen blocks of a page, eight of two,
+  four of four, two of eight and one of each larger size, 1.2 MiB a CPU at
+  most -- traded with the list half a cache at a time under its lock once.
+  A block that comes back costs no map and, on x86, no TLB shootdown of
+  every other CPU. Only the three smallest sizes had a CPU's cache, the list
+  512 KiB: on Newton's 48 CPUs an allocation and its free of 64 KiB took
+  986 µs, every CPU at the list's lock, and with these 28 µs -- most of
+  that the heap's counters ([What Rust holds of it](#what-rust-holds-of-it)),
+  folded into the totals every CPU shares at every block of 64 KiB -- where
+  one CPU takes 0.44 µs; a batch of 64 page-sized blocks handed to the next
+  CPU and freed there 1019 µs, now 20 µs (`heapbench`, every CPU). `mm::alloc`
+  zeroes a kept block, as fresh pages always are;
   `mm::alloc_uninit`, what Rust's global allocator calls, does not —
   `GlobalAlloc::alloc` promises no contents, and `alloc_zeroed` zeroes on the
   Rust side. DMA buffers (`unmap_free_pages`) are never kept.

@@ -561,8 +561,10 @@ void bp_startup(void* ctx)
         /* Only a UART that is there has a line to answer for: on a machine
            with none the handler was registered all the same, to read a port
            nothing decodes if the line ever moved */
-        if (serial.is_present())
-            (void)Interrupt::register_handler(serial, acpi.get_gsi_by_irq(0x4), 0x24);
+        /* From here on a log line waits for no UART: the transmitter's
+           interrupt sends what the ring holds */
+        if (serial.is_present() && Interrupt::register_handler(serial, acpi.get_gsi_by_irq(0x4), 0x24))
+            serial.start_tx_interrupt();
 
         rust_virtio_blk_init();
         rust_virtio_scsi_init();

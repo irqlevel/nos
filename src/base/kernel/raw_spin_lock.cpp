@@ -41,20 +41,43 @@ void RawSpinLock::stamp()
         return;
 
     u64 now = hal::read_cycle_counter();
-    watchdog_lock_time_.set((now != 0) ? now : 1);
+    watchdog_lock_time_.set_relaxed((now != 0) ? now : 1);
 }
 
 void RawSpinLock::acquire()
 {
-    for (;;)
+    /* Free: the one cmpxchg is the whole of it */
+    if (likely(value_.cmpxchg(1, 0) == 0))
     {
-        if (value_.cmpxchg(1, 0) == 0)
-            break;
-
-        cpu_relax();
+        stamp();
+        return;
     }
 
+    contend();
     stamp();
+}
+
+/* Out of line, past the first try. A waiter that spins on cmpxchg takes the
+   lock's line for itself at every try, from the holder too, whose every
+   write to it then waits its turn behind the waiters': on Newton's two
+   sockets of 48 CPUs all taking one lock at each allocation and free, a
+   64 KiB block's pair cost 330 us where it cost 0.5 us on one CPU
+   (heapbench). Read instead: a read shares the line with every other
+   waiter, and the line moves when the holder writes it, not when a waiter
+   looks -- 94 us there, the same lock. When it reads free, one cmpxchg;
+   lost to another waiter that saw it free too, back to reading. A pause
+   after a lost cmpxchg, doubling up to 16, 64 or 256 pauses, measured no
+   different there, and is not here. */
+void RawSpinLock::contend()
+{
+    for (;;)
+    {
+        while (value_.get_relaxed() != 0)
+            cpu_relax();
+
+        if (value_.cmpxchg(1, 0) == 0)
+            return;
+    }
 }
 
 bool RawSpinLock::try_acquire()
@@ -66,14 +89,19 @@ bool RawSpinLock::try_acquire()
     return true;
 }
 
+/* Stores, not lock xchg: the release's store orders everything before it
+   -- the stamp's clearing too, which the next holder's stamp then follows --
+   and a report flag that is already clear is not written at all, the line
+   being the one every waiter reads. */
 void RawSpinLock::release()
 {
     if (watched_)
     {
-        watchdog_reported_.set(0);
-        watchdog_lock_time_.set(0);
+        if (watchdog_reported_.get_relaxed() != 0)
+            watchdog_reported_.set_relaxed(0);
+        watchdog_lock_time_.set_relaxed(0);
     }
-    value_.set(0);
+    value_.set_release(0);
 }
 
 void RawSpinLock::lock()

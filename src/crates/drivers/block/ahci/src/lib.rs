@@ -294,13 +294,46 @@ fn prepare_port(port: &PortRegs, queue: &Queue, name: (u16, u16, u16, u32)) -> b
     true
 }
 
+/// The ports left alone after the HBA's reset until its COMRESET of each
+/// -- sent by the reset itself where the HBA does not stagger spin-up --
+/// has run its course: a link up (DET 3), or no device seen for `NO_DEVICE_MS`,
+/// or `LINK_MS` gone. Read, nothing written. A port prepared in the middle
+/// of that COMRESET -- as soon as the log stopped waiting for the UART
+/// between the reset and the ports, the eleven milliseconds a line took
+/// gone -- had its device stay busy for good: both of Newton's SSDs, its
+/// root among them, 31 seconds and passed over, and a COMRESET of the
+/// driver's own sent then made no difference. Linux sleeps 10 ms after
+/// setting the reset before it looks (ata_wait_register), and touches no
+/// port until its probe, much later.
+fn settle(hba: &Hba, pi: u32, ports: usize) {
+    let mut links = Deadline::after_ms(LINK_MS);
+    let mut quiet = Deadline::after_ms(NO_DEVICE_MS);
+    for index in 0..ports.min(MAX_PORTS) {
+        if pi & (1 << index) == 0 {
+            continue;
+        }
+        let Some(window) = hba.regs.window(PORTS_BASE + index * PORT_STRIDE) else { continue };
+        let port = PortRegs::new(window, hba.cap);
+        while !port.linked() && !links.passed() {
+            if port.read(PX_SSTS) & SSTS_DET_MASK == SSTS_DET_NONE && quiet.passed() {
+                break;
+            }
+            relax();
+        }
+    }
+}
+
 /// A prepared port's link -- waited for as long as `links` has left, the
-/// one wait every port of the HBA shares -- and its device: an ATA disk,
-/// out of its reset, the port started. False, said where there is something
-/// to say, for anything else.
-fn finish_port(port: &PortRegs, name: (u16, u16, u16, u32), links: &mut Deadline) -> bool {
+/// one wait every port of the HBA shares, and no longer than `quiet` where
+/// the port has seen no device at all -- and its device: an ATA disk, out
+/// of its reset, the port started. False, said where there is something to
+/// say, for anything else.
+fn finish_port(port: &PortRegs, name: (u16, u16, u16, u32), links: &mut Deadline, quiet: &mut Deadline) -> bool {
     let (bus, slot, func, index) = name;
     while !port.linked() && !links.passed() {
+        if port.read(PX_SSTS) & SSTS_DET_MASK == SSTS_DET_NONE && quiet.passed() {
+            break;
+        }
         relax();
     }
     if !port.linked() {
@@ -312,11 +345,19 @@ fn finish_port(port: &PortRegs, name: (u16, u16, u16, u32), links: &mut Deadline
             return false;
         }
     }
-    if !wait(DEVICE_READY_MS, || port.ready()) {
-        klog!(0, "ahci: {:02x}:{:02x}.{} port {}: the device stays busy (tfd {:#x})", bus, slot, func, index,
-            port.read(PX_TFD));
-        let _ = port.stop();
-        return false;
+    /* Busy a while with its link up: a COMRESET, as Linux's error handling
+     * resets a device that does not come ready, and then its whole wait */
+    if !wait(READY_FIRST_MS, || port.ready()) {
+        klog!(0, "ahci: {:02x}:{:02x}.{} port {}: busy {} ms after its link came (tfd {:#x} ssts {:#x} serr {:#x} \
+                  is {:#x} cmd {:#x}): a COMRESET", bus, slot, func, index, READY_FIRST_MS, port.read(PX_TFD),
+            port.read(PX_SSTS), port.read(PX_SERR), port.read(PX_IS), port.read(PX_CMD));
+        if !port.comreset() || !wait(DEVICE_READY_MS, || port.ready()) {
+            klog!(0, "ahci: {:02x}:{:02x}.{} port {}: the device stays busy (tfd {:#x} ssts {:#x} serr {:#x} \
+                      is {:#x} cmd {:#x} sig {:#x})", bus, slot, func, index, port.read(PX_TFD), port.read(PX_SSTS),
+                port.read(PX_SERR), port.read(PX_IS), port.read(PX_CMD), port.read(PX_SIG));
+            let _ = port.stop();
+            return false;
+        }
     }
     let signature = port.read(PX_SIG);
     if signature != SIG_ATA {
@@ -461,6 +502,7 @@ fn take(dev: &PciDevice) {
     }
 
     let base = NEXT_POSITION.fetch_add(ports, Ordering::Relaxed);
+    settle(hba, pi, ports);
     let mut prepared: Vec<(usize, PortRegs, Queue)> = Vec::new();
     for index in 0..ports.min(MAX_PORTS) {
         if pi & (1 << index) == 0 {
@@ -479,12 +521,13 @@ fn take(dev: &PciDevice) {
     }
 
     /* One wait for every port's link: a port with nothing on it waits
-     * out what is left of it, not a second of its own */
+     * out what is left of the quiet, not a second of its own */
     let mut links = Deadline::after_ms(LINK_MS);
+    let mut quiet = Deadline::after_ms(NO_DEVICE_MS);
     let mut found: Vec<&'static AhciDisk> = Vec::new();
     for (index, port, mut queue) in prepared {
         let name = (dev.bus, dev.slot, dev.func, index as u32);
-        if !finish_port(&port, name, &mut links) {
+        if !finish_port(&port, name, &mut links, &mut quiet) {
             continue;
         }
         let id = match disk::identify(&port, &mut queue) {

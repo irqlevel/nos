@@ -483,8 +483,13 @@ has the firmware boot nos next, once. The BMC's watchdog, armed from Linux
 Ubuntu if nothing stops it: a test boot's way back, beside `deadman=`. A
 boot of nos and back to Ubuntu takes some six minutes -- two and a quarter
 from Ubuntu's reboot to nos's sshd, four from nos's own `reboot` to
-Ubuntu's, through both ports' PXE; nos says `boot: complete` 16 s after
-GRUB, sshd listening at once.
+Ubuntu's, through both ports' PXE; nos says `boot: complete` 9 s after
+GRUB, sshd listening at once. It was 16 s: nine of them every log line
+waiting out its bytes at COM1's 115200 baud, a second each I350 port spent
+on a wait for its link that never saw it come, a second each HBA on its
+empty ports, and 10 ms after each AP's INIT. What is left of the nine is
+the early boot's, before the UART's interrupt is set up -- a few lines a
+CPU of the MADT and the SRAT.
 
 The boxes before Hertz were set up by hand, before there was a release image
 to set one up from. A new server is set up with `nos-install` from the system image,
