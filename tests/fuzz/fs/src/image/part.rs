@@ -9,8 +9,9 @@ use crate::machine::disk::Media;
 pub const MBR_SIGNATURE: u16 = 0xAA55;
 pub const TYPE_GPT_PROTECTIVE: u8 = 0xEE;
 pub const GPT_SIGNATURE: u64 = 0x5452_4150_2049_4645;
-/// The slots of a GPT the probe looks at, at most.
-pub const PARTS_PER_DISK: usize = 8;
+/// The slots of a GPT the probe looks at, at most: as many as a GPT's array
+/// usually has, every one a partition can be named for.
+pub const GPT_MAX_SLOTS: usize = 128;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MbrEntry {
@@ -158,7 +159,7 @@ pub fn expect(media: &Media, sector_size: u64, sectors: u64) -> Vec<Found> {
         }
         let per_sector = ss / entry_size;
         let entry_lba = le64(&h, 72);
-        let count = (le32(&h, 80) as usize).min(PARTS_PER_DISK);
+        let count = (le32(&h, 80) as usize).min(GPT_MAX_SLOTS);
         let mut block: Option<Vec<u8>> = None;
         for i in 0..count {
             if i % per_sector == 0 {
