@@ -109,6 +109,8 @@ pub const IS_LINK: u32 = (1 << 22) | (1 << 6);
 pub const IE_ALL: u32 = IS_DHRS | IS_PSS | IS_DSS | IS_SDBS | IS_ERRORS | IS_LINK;
 
 pub const SSTS_DET_MASK: u32 = 0xF;
+/// No device seen on the port, and no PHY talking to one.
+pub const SSTS_DET_NONE: u32 = 0;
 /// A device there and the PHY talking to it.
 pub const SSTS_DET_PRESENT: u32 = 3;
 pub const SSTS_SPD_SHIFT: u32 = 4;
@@ -190,6 +192,16 @@ pub const HANDOFF_BUSY_MS: u64 = 2_000;
 pub const HBA_RESET_MS: u64 = 1_000;
 pub const PORT_STOP_MS: u64 = 500;
 pub const LINK_MS: u64 = 1_000;
+/// A port whose PHY has seen no device in this long since the ports were
+/// spun up has none: a device answers the spin-up's COMRESET in
+/// milliseconds (COMINIT), and Linux takes a link that stays down a tenth
+/// of a second as down. Every port of Newton's two HBAs with nothing on it
+/// waited out the whole of LINK_MS, a second each HBA.
+pub const NO_DEVICE_MS: u64 = 200;
+/// A device busy this long after its link came is sent a COMRESET and
+/// waited for again, the whole of `DEVICE_READY_MS`: an SSD is ready in
+/// milliseconds, a disk spinning up in seconds.
+pub const READY_FIRST_MS: u64 = 5_000;
 /// COMRESET held at least 1 ms (AHCI 10.4.2).
 pub const COMRESET_HOLD_US: u64 = 1_000;
 /// A device to come out of its reset: an HDD spins up first, and ATA gives a
