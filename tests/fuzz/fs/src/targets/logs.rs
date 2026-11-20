@@ -55,6 +55,30 @@ const LINES: u64 = 1500;
 const BOOTED_SECS: u64 = sched::START / 1_000_000_000;
 const BOOT_LINE: &[u8] = b"--- a boot: nos fuzz (fs-fuzz) ---";
 
+/* The writer's timing as docs/logs.md says it: lines gathered a second once
+ * the first wakes it, cut short once half the queue's 512 wait -- though to
+ * no less than 200 ms -- and at once by `logs sync`. Held on the machine's
+ * clock, with room either side of each edge. */
+/// A sync answered within this, the gather cut short.
+const SYNC_PROMPT_MS: u64 = 100;
+/// Half the queue: a burst of this many and more cuts the gather short.
+const HALF_QUEUE: u64 = 256;
+/// A burst's most here: the queue's room, empty, for every line of it.
+const BURST_MAX: u64 = 500;
+/// A burst not written yet this long after it came, and written by then.
+const BURST_NOT_YET_MS: u64 = 100;
+const BURST_BY_MS: u64 = 400;
+/// A trickle -- fewer lines than half the queue -- the same.
+const TRICKLE_NOT_YET_MS: u64 = 500;
+const TRICKLE_BY_MS: u64 = 1_500;
+
+/// What is counted of the log called `name`: lines queued, and lines done
+/// with -- written, sent to the kernel log, or lost.
+fn counted(name: &str) -> (u64, u64) {
+    let s = logs::stats(name).expect("a log made at the start");
+    (s.queued, s.written + s.spilled + s.lost)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Root {
     Writable,
@@ -384,7 +408,7 @@ pub fn logs(r: &mut Input) {
     let mut tasks = Vec::new();
     let mut held: Vec<Handle> = Vec::new();
     let mut held_ever = [false; 4];
-    while let Some(op) = r.op(12) {
+    while let Some(op) = r.op(13) {
         if model(&m).next >= LINES {
             break;
         }
@@ -419,9 +443,13 @@ pub fn logs(r: &mut Input) {
                 reached("a flood");
             }
             7 => {
+                let asked = kcore::time::boot_time_ns();
                 let synced = logs::sync(Duration::from_millis(5_000));
+                let took_ms = (kcore::time::boot_time_ns() - asked) / 1_000_000;
                 assert!(synced == started, "logs sync {} with the writer {}", if synced { "answered" } else {
                     "not answered" }, if started { "running" } else { "never started" });
+                assert!(!started || took_ms < SYNC_PROMPT_MS, "logs sync answered {} ms on: the writer's gather \
+                        not cut short", took_ms);
             }
             8 => kcore::task::sleep_ms(r.pick(&[0, 1, 50, 250, 1_000, 12_000, 70_000])),
             9 => {
@@ -438,6 +466,41 @@ pub fn logs(r: &mut Input) {
                 } else if !held.is_empty() {
                     vfs.close(held.remove(0));
                 }
+            }
+            12 if started => {
+                /* The gather's timing, on a quiet machine -- every task of
+                 * the input's done, everything before written: a trickle is
+                 * written a second after its first line, not before; a burst
+                 * of half a queue and more 200 ms after it came, not before,
+                 * and long before the second */
+                for t in tasks.drain(..) {
+                    sched::join(t);
+                }
+                assert!(logs::sync(Duration::from_millis(5_000)), "logs sync not answered on a quiet machine");
+                let log = r.below(4) as usize;
+                let burst = r.bool();
+                let n = if burst { r.range(HALF_QUEUE, BURST_MAX) } else { r.range(1, 10) };
+                let (queued_before, _) = counted(NAMES[log]);
+                for _ in 0..n {
+                    let (raw, _) = prepare(&m, Some(log), &Body::Bytes(b"gathered".to_vec()), Via::Image);
+                    IMAGE[log].write(&raw, false);
+                }
+                let (queued, done) = counted(NAMES[log]);
+                assert!(queued - queued_before == n, "{} of {} lines queued, the queue empty", queued - queued_before,
+                        n);
+                let (not_yet, by) = if burst { (BURST_NOT_YET_MS, BURST_BY_MS) } else {
+                    (TRICKLE_NOT_YET_MS, TRICKLE_BY_MS) };
+                kcore::task::sleep_ms(not_yet);
+                let (_, done_early) = counted(NAMES[log]);
+                assert!(done_early == done, "{} of {} lines written {} ms after they came: the gather {}",
+                        done_early - done, n, not_yet, if burst { "of a burst not held to its 200 ms" } else {
+                        "of a trickle shorter than its second" });
+                kcore::task::sleep_ms(by - not_yet);
+                let (_, done_late) = counted(NAMES[log]);
+                assert!(done_late - done >= n, "{} of {} lines not written {} ms after they came: the gather {}",
+                        n - (done_late - done).min(n), n, by, if burst { "of a burst not cut short" } else {
+                        "longer than its second" });
+                reached(if burst { "a burst written once 200 ms passed" } else { "a trickle written at the second" });
             }
             10 => {
                 let out = cmd::run("logs");

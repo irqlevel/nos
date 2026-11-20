@@ -99,11 +99,22 @@ written, stamps it with the boot clock and puts it on one queue every log
 shares (`kcore::static_ring::Mailbox`, 512 lines): nothing is locked,
 allocated or waited for, so a line may be written from anywhere -- the
 receive path's soft IRQ, under a spin lock, an interrupt handler. The
-writer, a task of its own (`logs`), is woken by the first line of a burst,
-lets the burst gather for 200 ms, takes the queue and appends each log's
-lines to its file with one write a batch. So a line is in its file a moment
-after it is written, and whoever wrote it never waits for a disk -- the TCP
-receive path least of all. `logs sync` waits for the moment to pass.
+writer, a task of its own (`logs`), is woken by the first line, lets lines
+gather for a second (`GATHER_MS`), takes the queue and appends each log's
+lines to its file with one write a batch. So a line is in its file within
+a second of being written, and whoever wrote it never waits for a disk --
+the TCP receive path least of all. `logs sync` cuts the gather short and
+waits for the write.
+
+A write is a transaction of the filesystem `/logs` is on -- ext4 flushes
+the disk's cache for each -- and it holds that mount's lock while it runs,
+so every other call on the mount waits for it: the second's gather makes a
+trickle of lines one such write a second a log rather than one a line.
+A burst is not left to wait that long: once the queue is half full
+(`FILLING_AT`, 256 lines) the gather is cut short, to no less than 200 ms
+(`GATHER_MIN_MS`) -- a flood is written in batches no more often than five
+times a second, and lines are lost only where more than the queue holds
+come within 200 ms.
 
 A burst bigger than the queue before the writer gets to it loses lines:
 counted, said in the file, shown by `logs`. One queue serves every log, so a
@@ -157,8 +168,14 @@ The writer runs on its own task, never the caller's: a line costs its
 writer a tenth of a microsecond or so where it is written, a fifth of what
 the kernel log cost the same line, and whatever comes of the disk is the
 `logs` task's. The most it can be made to do is bounded by the queue -- 512
-lines a burst, a burst every 200 ms -- some 2,500 lines a second, 2-3% of a
-CPU; what is past that is counted lost, not written. A flood through a
+lines a burst, a burst every 200 ms at most -- some 2,500 lines a second,
+2-3% of a CPU; what is past that is counted lost, not written. What it
+costs the others on its filesystem is the time of its writes under the
+mount's lock: a transaction and a flush of the disk a log a second for a
+trickle, five a second in a flood -- each as long as the disk takes to
+flush, which is longest on a spinning disk; `/logs` on a filesystem of its
+own (a mount of its own, its lock and journal its own) keeps them off the
+root's. A flood through a
 limiter is the cheapest of all: 30 lines a minute reach the writer, and the
 rest cost their place tens of nanoseconds each once it is closed, a few
 hundred before. No file log is written on a path per packet, per disk
@@ -280,9 +297,13 @@ one place -- its files, the kernel log, or counted lost -- in its file in
 the order written, stamped right (read back by the judge's own calendar),
 its text as written; the boot said; the files within their limits as the
 rules above say, the old ones renumbered, the newest kept, others' files
-untouched; a failure said once a reason; `tail`'s lines the file's. Its
-controls -- twelve mistakes put in the engine, from the budget's sum to the
-boot left unsaid -- each fail it within the gate's inputs. `sshd-test.py`
+untouched; a failure said once a reason; `tail`'s lines the file's; and the
+writer's timing on the machine's clock -- `logs sync` answered at once, a
+trickle written a second after it came and not before, a burst of half the
+queue 200 ms after and not before. Its controls -- twelve mistakes put in
+the engine, from the budget's sum to the boot left unsaid, and seven in the
+gather, from the half-full queue waking nobody to a gather of 200 ms -- each
+fail it within the gate's inputs. `sshd-test.py`
 (arm64, and `--arch x86_64`) then reads `/logs/net.log` on a booted machine:
 the logins, TCP's accepts and an SFTP session's line there -- on arm64 the
 UDP shell's commands too, each with who sent it -- and none of them in dmesg.
