@@ -139,6 +139,70 @@ pub fn read_file(path: &str, out: &mut Output) -> bool {
     true
 }
 
+/// What `tail` reads of a file's end at most: the lines asked for are in it
+/// unless they are very long ones.
+const TAIL_BYTES: usize = 64 * 1024;
+
+/// The last `lines` lines of the file at `path`, out of the last
+/// `TAIL_BYTES` of it: a log's newest, without the whole of it through
+/// `cat`.
+pub fn tail_file(path: &str, lines: usize, out: &mut Output) -> bool {
+    let Some(vfs) = vfs_instance() else { return false };
+    let Some(file) = Open::new(vfs, path.as_bytes(), OPEN_READ) else {
+        let _ = writeln!(out, "file not found");
+        return false;
+    };
+    let size = file.size();
+    let from = size.saturating_sub(TAIL_BYTES);
+    let Some(mut buf) = buffer(size - from) else {
+        let _ = writeln!(out, "read failed: no memory for {} bytes", size - from);
+        return false;
+    };
+    if !file.seek(from) {
+        let _ = writeln!(out, "read failed");
+        return false;
+    }
+    let mut got = 0;
+    while got < buf.len() {
+        match file.read(&mut buf[got..]) {
+            Some(0) => break,
+            Some(n) => got += n,
+            None => {
+                let _ = writeln!(out, "read failed");
+                return false;
+            }
+        }
+    }
+    let text = &buf[..got];
+    let start = last_lines(text, lines, from != 0);
+    out.write_bytes(&text[start..]);
+    if !text.is_empty() && !text.ends_with(b"\n") {
+        let _ = writeln!(out);
+    }
+    true
+}
+
+/// Where the last `lines` lines of `text` begin -- a last line with no end
+/// counting as one. `mid_file`: `text` starts somewhere in the file, so its
+/// first line may be the end of one, and is not shown as a line.
+fn last_lines(text: &[u8], lines: usize, mid_file: bool) -> usize {
+    let body = text.strip_suffix(b"\n").unwrap_or(text);
+    let mut ends = 0;
+    for (at, &b) in body.iter().enumerate().rev() {
+        if b == b'\n' {
+            ends += 1;
+            if ends == lines {
+                return at + 1;
+            }
+        }
+    }
+    if mid_file {
+        body.iter().position(|&b| b == b'\n').map_or(text.len(), |at| at + 1)
+    } else {
+        0
+    }
+}
+
 pub fn dump_mounts(out: &mut Output) {
     let vfs = match vfs_instance() {
         Some(vfs) => vfs,

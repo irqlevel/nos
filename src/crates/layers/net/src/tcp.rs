@@ -122,7 +122,7 @@ use crate::nic::Nic;
 use kcore::once::Once;
 use kcore::sync::{PreemptSpinGuard, PreemptSpinLock};
 use kcore::task::TaskHandle;
-use kcore::klog;
+use kcore::{flog, klog};
 
 use crate::abi;
 use crate::wire::{self, eth, ip, tcp as seg, Mac, ETH_HDR_LEN, ETH_TYPE_IP,
@@ -3806,26 +3806,30 @@ impl Tcp {
         (Event::None, TcpVerdict::Taken)
     }
 
-    /// The line for what the state machine reported, written with no lock
-    /// held -- never under one. A trace is synchronous output: the serial
-    /// port and the screen are written there and then, while the task in
-    /// `connect` spins on the connection's lock, which goes up just before
-    /// the line. Written under the lock, the "connected" line once held it
-    /// for 25-33 ms on real hardware, forced disk log writes included.
+    /// The line for what the state machine reported, in the network's file
+    /// log (`crate::LOG`, /logs/net.log): one a connection, which a machine
+    /// on the internet has all day, and which in the kernel log -- every one
+    /// of them at level 0 -- crowded out what was worth reading there. Queued
+    /// and no more: it is written to the file by the logs' own task, and
+    /// costs the receive path a copy. Written with no lock held all the
+    /// same, as it was when a line was synchronous output -- the serial port
+    /// and the screen written there and then, while the task in `connect`
+    /// spun on the connection's lock: under the lock, the "connected" line
+    /// once held it for 25-33 ms on real hardware.
     fn trace_event(&self, event: Event, local_port: u16, remote_port: u16, peer_mss: u16,
         receive: (usize, u8, u8))
     {
         let (recv_size, rcv_wscale, snd_wscale) = receive;
         match event {
-            Event::Rst => klog!(0, "tcp: reset received, {} -> {}",
+            Event::Rst => flog!(crate::LOG, "tcp: reset received, {} -> {}",
                 local_port, remote_port),
             /* Whether the window is scaled is what says how fast it can go */
-            Event::Connected if rcv_wscale != 0 => klog!(0,
+            Event::Connected if rcv_wscale != 0 => flog!(crate::LOG,
                 "tcp: connected {} -> {}, mss {}, receive {} KiB, window scale {}/{}",
                 local_port, remote_port, peer_mss, recv_size / 1024, rcv_wscale, snd_wscale),
-            Event::Connected => klog!(0, "tcp: connected {} -> {}, mss {}, receive {} KiB",
+            Event::Connected => flog!(crate::LOG, "tcp: connected {} -> {}, mss {}, receive {} KiB",
                 local_port, remote_port, peer_mss, recv_size / 1024),
-            Event::Accepted => klog!(0, "tcp: accepted {} <- {}",
+            Event::Accepted => flog!(crate::LOG, "tcp: accepted {} <- {}",
                 local_port, remote_port),
             Event::None => {}
         }

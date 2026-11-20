@@ -50,6 +50,10 @@ extern "C" void rust_net_stop_netconsole();
 extern "C" void rust_mount_root_fs();
 /* The random pool's seed kept on the root filesystem (src/crates/kernel/src/seed.rs) */
 extern "C" void rust_random_seed_from_root();
+/* The file logs under /logs (src/crates/layers/fs/src/logs.rs): their writer
+   started once the root is mounted, finished before it is unmounted */
+extern "C" void rust_logs_start();
+extern "C" void rust_logs_stop();
 extern "C" void kernel_vfs_unmount_all();
 extern "C" void rust_mgmt_stop();
 /* The message channel is Rust (src/crates/layers/ipc): at the halt, after the
@@ -389,6 +393,10 @@ static void bp_startup_arm(void* ctx)
        the root (as kernel/main.cpp) */
     rust_random_seed_from_root();
 
+    /* The file logs' writer, now that /logs has a filesystem (as
+       kernel/main.cpp) */
+    rust_logs_start();
+
     /* Here, and not earlier: a block request is completed through the BLK_IO
        soft IRQ, so until the line above a write returns without having
        written anything. Everything traced since the first line of the boot
@@ -462,6 +470,10 @@ static void bp_startup_arm(void* ctx)
             /* The message channel after the modules too -- whose mailboxes their
                exits closed -- and before the files go: nothing is sent from here on */
             rust_ipc_stop();
+
+            /* The file logs' writer after everything that writes a line to
+               one, and before the files go (as kernel/main.cpp) */
+            rust_logs_stop();
 
             /* While the soft IRQs still run: unmounting writes the
                superblock, and a block request completes through BLK_IO */

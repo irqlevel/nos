@@ -1,0 +1,11 @@
+[package]
+name = "calendar"
+version = "0.1.0"
+edition = "2021"
+
+# The calendar date and the time of day of a Unix time, in UTC, once: what
+# an X.509 certificate's validity is written in (web), what a guest's RTC
+# reads and the dates in a VM's log (hv), and the stamps of the kernel's
+# file logs (fs). No kernel and no `unsafe` in it.
+[lib]
+path = "src/lib.rs"

@@ -36,6 +36,8 @@ vmstate = { path = "../../../src/crates/common/vm/vmstate" }
 # A migration's messages and the handover's decisions (`handover` and
 # `migwire` targets). Nothing but codec under it.
 migwire = { path = "../../../src/crates/common/vm/migwire" }
+# The date the RTC reads (its file is the device's own). Nothing under it.
+calendar = { path = "../../../src/crates/common/calendar" }
 
 # What a RUSTUB=1 kernel has on: an overflow is a panic, not a wrap -- and a
 # guest that can cause one can bring down the host that runs it.
