@@ -1,7 +1,11 @@
 //! A disk on a port, and its commands: up to 31 queued at once (NCQ), each in
 //! a slot of the port's command list with a table of its own; ended by the
 //! HBA's interrupt (`reap`, from the ISR) or, before there are interrupts to
-//! wait on -- at boot, at the halt -- by whoever waits, polling the port. The
+//! wait on -- at boot, at the halt -- by whoever waits, polling the port. A
+//! task waiting on its command gives its CPU away for a moment on a disk
+//! that answers in microseconds, and then sleeps on the slot's event, which
+//! the command's end signals: a disk that spins answers in milliseconds, and
+//! a waiter that spun held a CPU for as long as the disk took. The
 //! disk's own commands -- a flush, a standby, the NCQ error log -- go on one
 //! more slot with the queue drained (`own_command`). A command that fails,
 //! times out or loses its link has the port taken back and every command it
@@ -9,18 +13,19 @@
 //! again, the disk given up on where that is all there is left to do.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use ataproto::cmd;
-use ataproto::identify::{Flush, Identify};
+use ataproto::identify::{Flush, Identify, Rotation};
 use ataproto::{ncq_error, NcqError, LOG_NCQ_ERROR, LOG_PAGE_BYTES, MAX_UNFINISHED};
 use block::Piece;
 use kcore::block::{BlockIo, SubmitError, IO_FLUSH, IO_READ, IO_WRITE};
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::{self, DmaBuffer};
 use kcore::klog;
-use kcore::sync::{SpinLock, TryLock};
-use kcore::time::{boot_time_ns, Deadline};
+use kcore::sync::{Event, SpinLock, TryLock};
+use kcore::time::{boot_time_ns, Deadline, Duration};
 
 use crate::port::{relax, PortRegs};
 use crate::regs::*;
@@ -116,15 +121,17 @@ pub(crate) fn bits(mut mask: u32) -> impl Iterator<Item = usize> {
 }
 
 /// Asynchronous callers to tell, once the lock is let go of: their own
-/// callbacks may submit again the moment they hear.
+/// callbacks may submit again the moment they hear. And the slots whose
+/// task may sleep on its command's end, woken then too.
 struct Calls {
     list: [Option<(extern "C" fn(*mut u8, i32), usize, i32)>; MAX_SLOTS],
     n: usize,
+    wake: u32,
 }
 
 impl Calls {
     fn new() -> Calls {
-        Calls { list: [None; MAX_SLOTS], n: 0 }
+        Calls { list: [None; MAX_SLOTS], n: 0, wake: 0 }
     }
 
     fn push(&mut self, done: extern "C" fn(*mut u8, i32), ctx: usize, status: i32) {
@@ -135,7 +142,13 @@ impl Calls {
         }
     }
 
-    fn run(&mut self) {
+    /// `ended`: the disk's, a slot's each (`AhciDisk::ended`).
+    fn run(&mut self, ended: &[Event]) {
+        for t in bits(core::mem::take(&mut self.wake)) {
+            if let Some(event) = ended.get(t) {
+                event.signal();
+            }
+        }
         for entry in self.list[..self.n].iter_mut() {
             if let Some((done, ctx, status)) = entry.take() {
                 done(ctx as *mut u8, status);
@@ -437,6 +450,14 @@ pub(crate) struct AhciDisk {
     queue: SpinLock<Queue>,
     /// Per slot, for a task that waits on it: PENDING, DONE_OK, DONE_FAILED
     outcome: [AtomicU8; MAX_SLOTS],
+    /// Per slot, signalled once its outcome is set, for the task that sleeps
+    /// on it (`wait_slot`): the slot's holder, the one waiter an event takes
+    ended: Vec<Event>,
+    /// How long a waiter looks before it sleeps: SPIN_SOLID_NS, or none for
+    /// a disk that spins
+    spin_ns: u64,
+    /// The nap of a wait no slot's end signals, once past `spin_ns`
+    nap_ns: u64,
     /// Per slot, when its command is out past its time (boot ns); 0 while
     /// it is not out
     deadline: [AtomicU64; MAX_SLOTS],
@@ -474,11 +495,23 @@ impl AhciDisk {
         queue.free = if depth >= 32 { u32::MAX } else { (1u32 << depth) - 1 };
         let queue = SpinLock::new(queue)?;
         let identity = ataproto::identify::identity_word(&id.model, &id.serial);
+        let mut ended = Vec::new();
+        ended.try_reserve_exact(MAX_SLOTS).ok()?;
+        for _ in 0..MAX_SLOTS {
+            ended.push(Event::new()?);
+        }
+        let (spin_ns, nap_ns) = match id.rotation {
+            Rotation::Rpm(_) => (0, NAP_SPINNING_NS),
+            Rotation::Solid | Rotation::NotReported => (SPIN_SOLID_NS, NAP_SOLID_NS),
+        };
         Some(AhciDisk {
             hba,
             port,
             queue,
             outcome: [const { AtomicU8::new(PENDING) }; MAX_SLOTS],
+            ended,
+            spin_ns,
+            nap_ns,
             deadline: [const { AtomicU64::new(0) }; MAX_SLOTS],
             attention: AtomicBool::new(false),
             eh: TryLock::new(()),
@@ -599,7 +632,10 @@ impl AhciDisk {
     fn finish(&self, q: &mut Queue, t: usize, ok: bool, calls: &mut Calls) {
         self.deadline[t].store(0, Ordering::Relaxed);
         match q.slots[t].waiter.take() {
-            Some(Waiter::Task) => self.outcome[t].store(if ok { DONE_OK } else { DONE_FAILED }, Ordering::Release),
+            Some(Waiter::Task) => {
+                self.outcome[t].store(if ok { DONE_OK } else { DONE_FAILED }, Ordering::Release);
+                calls.wake |= 1 << t;
+            }
             Some(Waiter::Call { done, ctx }) => {
                 calls.push(done, ctx, if ok { 0 } else { STATUS_FAILED });
                 q.slots[t] = Slot::EMPTY;
@@ -680,7 +716,7 @@ impl AhciDisk {
             }
             self.start_flush(&mut q);
         }
-        calls.run();
+        calls.run(&self.ended);
         if short != 0 {
             klog!(0, "ahci: {}: {} commands moved fewer bytes than asked, and failed (slots {:#x})", self.name(),
                 short.count_ones(), short);
@@ -689,15 +725,24 @@ impl AhciDisk {
     }
 
     /// One turn of a wait for slot `slot` (or for the port): with the
-    /// interrupt to wait on, the CPU given up -- the error handler run here
-    /// first if it is wanted and nobody runs it; polling, the port looked at
-    /// and the handler run here.
-    fn idle_on(&self, slot: Option<usize>, poll: bool) {
+    /// interrupt to wait on, the CPU given to whoever else can run -- and,
+    /// for a wait begun at `nap_since` past `spin_ns` from then, a nap of
+    /// `nap_ns` instead -- the error handler run here first if it is wanted
+    /// and nobody runs it; polling, the port looked at and the handler run
+    /// here. A wait for a slot's end sleeps on its event past the spin
+    /// instead (`wait_slot`).
+    fn idle_on(&self, slot: Option<usize>, poll: bool, nap_since: Option<u64>) {
         if !poll && self.interrupt_mode() {
-            if self.attention.load(Ordering::Acquire) || slot.is_some_and(|t| self.overdue(t, boot_time_ns())) {
+            let now = boot_time_ns();
+            if self.attention.load(Ordering::Acquire) || slot.is_some_and(|t| self.overdue(t, now)) {
                 self.service();
             }
-            kcore::task::yield_to_runnable();
+            match nap_since {
+                Some(since) if now.saturating_sub(since) >= self.spin_ns => {
+                    kcore::task::sleep(Duration::from_nanos(self.nap_ns));
+                }
+                _ => kcore::task::yield_to_runnable(),
+            }
         } else {
             self.reap();
             self.service();
@@ -716,7 +761,13 @@ impl AhciDisk {
 
     /// A queued slot for a task, waited for while there is none free -- or
     /// the port is the error handler's or one of the disk's own commands'.
-    /// None for a disk given up on.
+    /// None for a disk given up on. Waited for awake, giving the CPU to
+    /// whoever else can run, and never asleep: a slot freed goes to whoever
+    /// looks first, and the task that gave it back takes it again at once
+    /// for its next command -- one asleep lost every slot to them: with 32
+    /// tasks on the SMR disk's 31, the 32nd waited six seconds for one,
+    /// where it had waited under two awake. So only more tasks than the
+    /// disk queues cost a CPU here.
     fn take_slot(&self) -> Option<usize> {
         loop {
             if let Some(t) = self.try_slot() {
@@ -725,7 +776,7 @@ impl AhciDisk {
             if self.queue.lock().failed {
                 return None;
             }
-            self.idle_on(None, false);
+            self.idle_on(None, false, None);
         }
     }
 
@@ -752,23 +803,40 @@ impl AhciDisk {
     }
 
     /// Slot `t`'s command waited for: whether it went through. The slot is
-    /// still the task's.
+    /// still the task's. Looked for, the CPU given to whoever else can run,
+    /// for `spin_ns`; then asleep on the slot's event, which the command's
+    /// end signals once `finish` has set its outcome and the lock is let go
+    /// of -- a signal that comes between the look and the sleep ends the
+    /// sleep at once -- waking at the error handler's tick to see that the
+    /// command is not out past its time. A signal left from the slot's last
+    /// command costs a turn.
     fn wait_slot(&self, t: usize, poll: bool) -> bool {
+        let since = boot_time_ns();
         loop {
             match self.outcome[t].load(Ordering::Acquire) {
                 DONE_OK => return true,
                 DONE_FAILED => return false,
                 _ => {}
             }
-            self.idle_on(Some(t), poll);
+            let now = boot_time_ns();
+            if poll || !self.interrupt_mode() || now.saturating_sub(since) < self.spin_ns {
+                self.idle_on(Some(t), poll, Some(since));
+                continue;
+            }
+            if self.attention.load(Ordering::Acquire) || self.overdue(t, now) {
+                self.service();
+            }
+            let _ = self.ended[t].wait_for(Duration::from_millis(EH_TICK_MS));
         }
     }
 
     /* ---- what the block layer asks ---- */
 
     /// Whole sectors to or from `addr`, `len` bytes, from `lba` on: in
-    /// commands of at most `per_command`, the buffer the device's.
-    pub(crate) fn transfer(&self, lba: u64, addr: usize, len: usize, write: bool) -> bool {
+    /// commands of at most `per_command`, the buffer the device's. With
+    /// `fua`, a write each command of which the disk has made durable when
+    /// it ends -- asked only of a disk with FUA.
+    pub(crate) fn transfer(&self, lba: u64, addr: usize, len: usize, write: bool, fua: bool) -> bool {
         let size = self.id.sector_size as usize;
         if len == 0 || len % size != 0 || !self.within(lba, (len / size) as u64) {
             klog!(0, "ahci: {}: a {} of {} bytes at {} is none this disk takes", self.name(),
@@ -786,7 +854,7 @@ impl AhciDisk {
                 let mut q = self.queue.lock();
                 let s64a = self.s64a();
                 let built = q.prdt_virt(t, addr + done, bytes, s64a).and_then(|prds| {
-                    let fis = self.data_fis(write, false, at, count, t);
+                    let fis = self.data_fis(write, write && fua && self.id.fua, at, count, t);
                     q.command(t, &fis, prds, write)
                 });
                 if built.is_ok() {
@@ -966,6 +1034,7 @@ impl AhciDisk {
     /// issued meanwhile. `poll` waits by looking at the port whatever the
     /// interrupt does. Whether it went through.
     pub(crate) fn own_command(&self, what: &'static str, command: u8, ms: u64, poll: bool) -> bool {
+        let since = boot_time_ns();
         loop {
             {
                 let mut q = self.queue.lock();
@@ -977,7 +1046,7 @@ impl AhciDisk {
                     break;
                 }
             }
-            self.idle_on(None, poll);
+            self.idle_on(None, poll, Some(since));
         }
         loop {
             {
@@ -990,7 +1059,7 @@ impl AhciDisk {
                     break;
                 }
             }
-            self.idle_on(None, poll);
+            self.idle_on(None, poll, Some(since));
         }
         let t = self.own;
         let built = {
@@ -1122,7 +1191,7 @@ impl AhciDisk {
             }
             q.unfinished
         };
-        calls.run();
+        calls.run(&self.ended);
 
         /* A timeout or a lost link leaves the device in no known state: a
          * COMRESET. An error it said leaves it waiting to be asked again. */
@@ -1185,7 +1254,7 @@ impl AhciDisk {
         self.ring(&mut q);
         self.start_flush(&mut q);
         drop(q);
-        calls.run();
+        calls.run(&self.ended);
     }
 
     /// Slot `t`'s command ended failed, and said: `why`.
@@ -1200,7 +1269,7 @@ impl AhciDisk {
         let (bus, slot, func, index) = self.at;
         klog!(0, "ahci: {} ({:02x}:{:02x}.{} port {}): {} of {} sectors at {}: {}", self.name(), bus, slot, func,
             index, what, count, lba, why);
-        calls.run();
+        calls.run(&self.ended);
     }
 
     /// Slot `t`'s command, built already, sent alone and waited for by
@@ -1294,7 +1363,7 @@ impl AhciDisk {
                         let ok = q.moved_all(t);
                         self.finish(&mut q, t, ok, &mut calls);
                     }
-                    calls.run();
+                    calls.run(&self.ended);
                 }
                 Err(fault) => {
                     self.fail(t, &fault.describe());
@@ -1339,7 +1408,7 @@ impl AhciDisk {
                   and every request of it refused from here on",
             self.name(), bus, slot, func, index, why, self.port.read(PX_TFD), self.port.read(PX_CMD),
             self.port.read(PX_SSTS));
-        calls.run();
+        calls.run(&self.ended);
     }
 }
 

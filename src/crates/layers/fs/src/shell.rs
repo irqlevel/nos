@@ -21,9 +21,15 @@ use crate::vfs::{FileStat, Open, OPEN_APPEND, OPEN_CREATE, OPEN_READ, OPEN_TRUNC
 use crate::vnode::Kind;
 use crate::{ext2, ext4, ramfs, vfs_instance};
 
-/// One file at a time through 64 KiB pieces: neither side has to fit in
-/// memory.
-const COPY_CHUNK: usize = 64 * 1024;
+/// One file at a time through pieces of this size, so neither side has to
+/// fit in memory: the heap's largest block (PageTable::MAX_CONTIGUOUS_PAGES
+/// pages), half what ext4 writes in one transaction. Each write is a commit,
+/// and a commit flushes the disk's cache -- 64 KiB pieces made sixteen of
+/// them a MiB, which on a disk that spins was the copy's whole time (a
+/// 2 GiB copy to an SMR disk went at 1.1 MiB/s). Where no block that big is
+/// free, the copy goes through COPY_CHUNK_SMALL.
+const COPY_CHUNK: usize = 512 * 1024;
+const COPY_CHUNK_SMALL: usize = 64 * 1024;
 
 /// Deep enough for anything a rootfs holds; the paths cap it anyway.
 const COPY_MAX_DEPTH: usize = 32;
@@ -430,7 +436,7 @@ fn copy_file(src: &str, dst: &str, out: &mut Output) -> Option<usize> {
         }
     };
 
-    let mut buf = match buffer(COPY_CHUNK) {
+    let mut buf = match buffer(COPY_CHUNK).or_else(|| buffer(COPY_CHUNK_SMALL)) {
         Some(buf) => buf,
         None => {
             let _ = writeln!(out, "cp: alloc failed");

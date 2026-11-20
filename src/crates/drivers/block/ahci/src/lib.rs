@@ -671,12 +671,19 @@ impl BlockDriver for AhciDisk {
     }
 
     fn read(&'static self, sector: u64, buf: &mut [u8]) -> bool {
-        self.transfer(sector, buf.as_mut_ptr() as usize, buf.len(), false)
+        self.transfer(sector, buf.as_mut_ptr() as usize, buf.len(), false, false)
     }
 
-    /* FUA as a flush after the write: a flush is what makes it durable */
+    /* FUA as the disk has it -- the write durable when it ends, the rest of
+     * the cache left where it is -- and as a flush after the write on one
+     * that has not. A flush pushed out everything the cache held for each
+     * forced write, ext4's every commit block among them: on a disk that
+     * spins, the dearest command there is */
     fn write(&'static self, sector: u64, data: &[u8], fua: bool) -> bool {
-        self.transfer(sector, data.as_ptr() as usize, data.len(), true) && (!fua || self.flush_cache())
+        if fua && self.id.fua {
+            return self.transfer(sector, data.as_ptr() as usize, data.len(), true, true);
+        }
+        self.transfer(sector, data.as_ptr() as usize, data.len(), true, false) && (!fua || self.flush_cache())
     }
 
     fn write_pieces(&'static self, base: u64, buf: &DmaBuffer, pieces: &[Piece]) -> bool {

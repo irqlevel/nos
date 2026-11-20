@@ -533,6 +533,49 @@ Ubuntu's reboot to nos's kernel, the root mounted from `adc3` 6.8 s into the
 boot, `boot: complete` at 7.2, sshd listening at once. The CPU already runs
 microcode 0xfa, newer than Ubuntu's file (0xf8), so nos loads none.
 
+Its two Seagates are the first disks that spin nos has been measured on,
+and they are **SMR**: shingled, the drive's own -- Seagate's datasheet has
+the ST2000VX015 SMR and its sibling the ST2000VX008 CMR, and IDENTIFY says
+nothing of zones (word 69's are 0), only that all write cache is
+non-volatile. A write lands in a media cache on the platters and is moved
+to its band later, so what the drive does depends on what was written to
+it before: each measurement below is on a 100 GiB slice of it nothing had
+written since the provider wiped it, Linux's fio (`randrepeat=0`: fio's own
+offsets again are reads the drive's cache answers) against `blkload`.
+
+- **Under the block layer nos and Linux are the drive's**: reads at the
+  medium's rate at one in flight, 162 MiB/s at its start and 120-150 past
+  a terabyte, and nos's through the device's queue at four as well (115);
+  random reads of 4 KiB 49-63 a second at one in flight and 85 at 32 --
+  its NCQ gains little -- in both; sequential writes 26-49 MiB/s in Linux
+  by the drive's state, commands of a MiB or 4 MiB no faster than of 256
+  KiB, nos's 31-33 among them. A stream read by several tasks at once
+  reaches it out of order and slows (`blkload ... qd=4`: 28 MiB/s), and
+  now and then, for minutes, it reads a stream at one revolution a
+  command -- 15-22 MiB/s on a slice nothing had written, at one in flight,
+  the CPUs idle: the drive's own doing.
+- **A task waiting on it held a CPU**: the driver's waits gave the CPU to
+  whoever else could run, and with nobody else they spun. 32 readers at
+  85 a second kept 6.3 of the 8 CPUs busy, one sequential reader 0.76 of
+  one, and `format ext4` of the 2 TB disk -- 29 GiB of inode tables, 17
+  minutes of writes -- one throughout. A waiter now sleeps on its slot's
+  event, at once on a disk that spins and after 250 us on one that does
+  not: 0.04 and 0.11, a 100 GiB slice's format 2% of one, and the SSD's
+  random reads as they were (8 877 a second at one in flight, p50 108.5 us,
+  p99 129 us). The wait for a slot stays awake: asleep, the 32nd of 32
+  readers lost every slot to the 31 that gave them back and waited 6 s.
+- **A file wrote at 1.2 MiB/s.** ext4 commits every write as a transaction
+  of its own and a commit flushes the disk's cache, 0.2-1.6 s here: `cp`'s
+  64 KiB pieces made two of them a piece, as its forced commit block went
+  as a write and a flush. Linux wrote the same 2 GiB file at 41.9 MiB/s.
+  With the commit block forced by the disk's own FUA and `cp` writing 512
+  KiB at a time (the heap's largest block) it writes at 4.2 MiB/s, and
+  reads it back cold at 39.5 MiB/s, not 24.0; the rest of the way is
+  commits that take in more than one write.
+- **It was cut into eighteen slices, and nos saw eight**: the probe read the
+  first eight of a GPT's slots and said nothing of the rest. It reads them
+  all now (128).
+
 The boxes before Hertz were set up by hand, before there was a release image
 to set one up from. A new server is set up with `nos-install` from the system image,
 which makes the partition, the GRUB entry and the one-shot flag that the
