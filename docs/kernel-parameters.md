@@ -18,7 +18,8 @@ The defaults the shipped configs use are `dhcp=auto dns=on root=auto
 fstest=on` on the x86-64 ISO, `console=serial dhcp=auto dns=on root=auto` on
 the disk image, `dhcp=auto dns=on root=auto` on arm64 (`scripts/qemu-arm64.sh`),
 and `root=UUID=<partition> dhcp=auto dns=on` on a server the system image is
-poured onto ([Install](install.md)). None of them starts the UDP shell: it
+poured onto ([Install](install.md)) -- where eth0's settings are its root's
+`/etc/net.toml` and not those words (Networking, below). None of them starts the UDP shell: it
 runs any command for anyone who can send the machine a datagram, so it is on
 only where `udpshell=` is given -- `nos-install --udpshell`,
 `NOS_UDPSHELL=9000 ./scripts/qemu-arm64.sh`, a test's own command line.
@@ -50,7 +51,7 @@ only where `udpshell=` is given -- `nos-install --udpshell`,
 - `trace=vga` — x86-64 only: mirror the boot trace on the screen as well as the serial port. Off by default because redrawing glyphs costs a full repaint per scrolled row; on a machine with no UART the mirror is the default anyway, since there is nowhere else to put it
 - `tracepoints=<list>` — events to record from the boot on (`kernel/tracepoint.h`): their names, their groups or `all`, comma-separated -- turned on as the boot ends, once every CPU has its ring, and said so in the log; a name it does not know is said too. `trace` in the shell changes them afterwards. See [Tracepoints](tracing.md)
 - `loglevel=N` — log level to boot with (0-5, default 1). The `loglevel` shell command moves it afterwards, but only a boot parameter can make the *boot* chatty; the task lifecycle and the multitasking self-test are at level 3
-- `netconsole=ip:port` — stream the kernel log over UDP to that collector (e.g. `netconsole=10.0.2.2:6666`); needs an address, so pair it with `dhcp=auto`. See [Netconsole](netconsole.md)
+- `netconsole=ip:port` — stream the kernel log over UDP to that collector (e.g. `netconsole=10.0.2.2:6666`); needs an address -- a lease's (`dhcp=auto`), or a static one, `/etc/net.toml`'s or `ip=`'s (Networking, below), put on eth0 before the netconsole sends a line. See [Netconsole](netconsole.md)
 - `nctail=N` — ship only the newest N KiB of the log buffered before the link came up (e.g. `nctail=16`); the rest is dropped. For a machine that wedges shortly after the network appears, this spends the little airtime it has on the lines around the wedge instead of on the head of the boot log
 - `disklog=on` — write the kernel log, from its first line, to a disk area laid down with `scripts/disklog.py format`: for a machine with no serial port whose boot stops before its network is up. The boot so far is written when the area is found and every line after by a task of its own, so nothing that traces waits on the disk; a panic report goes down too. Off by default, since every burst of lines is a forced disk write. It takes both, the parameter and a prepared area: without the parameter no disk is so much as read, and with it but no area found the boot logs `disk_log: disklog=on, but no prepared area on any disk` and carries on without. `disklog` in the shell says which. It works on both architectures; `tests/disklog-test.py` is its test. While the log runs the area is its own: a mount of it, or of the disk it is on, and a `blkload` write test are refused. See [Real hardware](real-hardware.md)
 - `panic=vga` — parsed and currently has no effect: the panic report already goes to the screen whenever one is ready, on both architectures
@@ -59,11 +60,22 @@ only where `udpshell=` is given -- `nos-install --udpshell`,
 
 ## Networking
 
+eth0's settings -- its address, gateway, DNS server and DHCP -- are
+`/etc/net.toml`'s on the root where there is one: what `nos-install` writes
+on a server ([The network](install.md#the-network)), read once the root is
+mounted and before anything sends. `ip=`, `gw=`, `dns=` and `dhcp=` are what
+a boot with no such file goes by -- an ISO's, QEMU's, a test's, a root that
+was not found, a kernel from before the file -- and one whose file is
+refused, which the boot says with the file's line. Where the file is taken
+they are not used, and the boot names them (`net: the command line's ... not
+used`). The network layer reads both (`layers/net/src/settings.rs`), through
+the same checks; `net` says which it took.
+
 - `dhcp=auto` — start DHCP on `eth0` automatically at boot
 - `dhcp=off` — disable DHCP entirely (even via shell command)
 - `dhcp=on` — enable DHCP only via shell command (default)
 - `dns=on` — enable DNS resolver (uses DHCP-provided DNS server; requires `dhcp=auto`)
-- `ip=A.B.C.D/N` — a static address on `eth0` and its prefix length, for a network with no DHCP server. It is put on `eth0` as the network's services start, before the netconsole sends a line, and `dhcp=auto` then leaves `eth0` alone. Refused, with a line in the log, without a prefix, with one past 32, for the subnet's own network or broadcast address (up to /30), and for 0.0.0.0, loopback, multicast and class E
+- `ip=A.B.C.D/N` — a static address on `eth0` and its prefix length, for a network with no DHCP server. It is put on `eth0` as the network's services start, before the netconsole sends a line, and `dhcp=auto` then leaves `eth0` alone. Refused, with a line in the log, without a prefix, with one past 32, for the subnet's own network or broadcast address (up to /30), and for 0.0.0.0/8, loopback, multicast and class E
 - `gw=A.B.C.D` — the default gateway for `ip=`: another address of its subnet. One off the subnet, or given without `ip=`, is named in the log and dropped
 - `dns=A.B.C.D` — a resolver on that server from the start, on `eth0`, whether the address is static or a lease's to come (whose own server then does not replace it). `dns=on` keeps taking the lease's
 - `udpshell=PORT` — start UDP remote shell on the given port (e.g. `udpshell=9000`). Off unless given: it has no authentication. See [UDP remote shell](udp-shell.md)

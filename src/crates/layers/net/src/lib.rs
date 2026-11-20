@@ -28,6 +28,7 @@ pub mod netconsole;
 pub mod nic;
 pub mod provider;
 pub mod selftest;
+pub mod settings;
 pub mod shell;
 pub mod tcp;
 pub mod udp;

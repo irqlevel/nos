@@ -936,6 +936,7 @@ dependencies = [
 name = "net"
 version = "0.1.0"
 dependencies = [
+ "conf",
  "ffi",
  "fs",
  "kcore",

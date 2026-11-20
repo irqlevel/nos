@@ -13,10 +13,15 @@ and the halt's own lines must arrive: the netconsole stops after the modules
 and the filesystems have gone -- a module's exit may wait minutes for
 guests to turn themselves off, which on such a machine nothing else would
 show -- and sends what it still holds as it stops, down to its own last
-line. A third boot is on a network that hands out no address: eth0's
-address, gateway and resolver come off the command line (ip=, gw=, dns=),
-dhcp=auto leaves them alone, and the log arrives with no lease ever asked
-for.
+line; its root holds an /etc/net.toml the kernel refuses, which it says, and
+goes by the command line's dhcp=auto. A third boot is on a network that
+hands out no address, its root with no /etc/net.toml: eth0's address,
+gateway and resolver come off the command line (ip=, gw=, dns=), dhcp=auto
+leaves them alone, and the log arrives with no lease ever asked for. A
+fourth is on that network too, as an installed server is: the address, the
+gateway and the resolver are its root's /etc/net.toml, which nos-install
+writes, and the command line's -- the system image's dhcp=auto dns=on and an
+ip= besides -- are not used.
 
     tests/netconsole-test.py [--tcg] [--keep]
 
@@ -113,11 +118,21 @@ def wait_until(predicate, timeout):
     return False
 
 
-def boot(args, tmp, name, network="dhcp=auto"):
-    """nos with its log streaming to the collector, and its serial log."""
+def boot(args, tmp, name, network="dhcp=auto", files=None):
+    """nos with its log streaming to the collector, and its serial log; its
+    root holds `files`, {path: text}, where given."""
     image = os.path.join(tmp, name + ".img")
     log = os.path.join(tmp, name + ".log")
-    pt.mkrootfs(image)
+    if files:
+        root = os.path.join(tmp, name + ".root")
+        for path, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(root, path)), exist_ok=True)
+            with open(os.path.join(root, path), "w") as f:
+                f.write(text)
+        subprocess.run([os.path.join(ROOT, "scripts", "mkrootfs.sh"), image, "64", root, "1024"],
+                       cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
+    else:
+        pt.mkrootfs(image)
 
     import platform
     hvf = platform.system() == "Darwin" and platform.machine() == "arm64" and not args.tcg
@@ -144,16 +159,27 @@ def end(p):
             p.kill()
 
 
+# An /etc/net.toml the kernel refuses: an address with no prefix length
+REFUSED = 'ip = "10.0.2.15"\n'
+
+
 def halt(args, tmp):
     """A boot powered off from the shell over UDP: the halt's own lines --
     the unmount, after every module has gone, and the netconsole's last --
-    must reach the collector, with no gap in the numbers."""
+    must reach the collector, with no gap in the numbers. Its root's
+    /etc/net.toml is one the kernel refuses: said, with its line, and the
+    command line's dhcp=auto taken in its place."""
     collector = Collector(COLLECT_PORT)
-    p, log = boot(args, tmp, "halt")
+    p, log = boot(args, tmp, "halt", files={"etc/net.toml": REFUSED})
     try:
         if not pt.check("boots again, to be powered off", pt.wait_log(log, "boot: complete", 300)):
             return collector.text()
         pt.check("its log arrives", wait_until(lambda: len(collector.lines) > 50, 60), "%d lines" % len(collector.lines))
+        pt.check("an /etc/net.toml the kernel refuses is said, with its line, and the command line's DHCP taken",
+                 'net: /etc/net.toml refused, line 1: ip "10.0.2.15" is not an address and its prefix length, '
+                 "A.B.C.D/N" in collector.text() and
+                 "net: eth0's settings from the command line: DHCP" in collector.text(),
+                 "\n".join(l for l in collector.lines if "net.toml" in l))
         sh = pt.Shell(timeout=5)
         try:
             sh.run("poweroff")
@@ -179,11 +205,12 @@ STATIC = "dhcp=auto ip=10.0.2.15/24 gw=10.0.2.2 dns=10.0.2.3"
 
 
 def static(args, tmp):
-    """A boot on a network that hands out no address, as the ASUS box's:
-    eth0's address, gateway and resolver from the command line. dhcp=auto
-    stays on the line, as the system image's GRUB entries carry it, and is
-    to leave eth0 alone; the log has to reach the collector with no lease
-    ever asked for, from the first line on."""
+    """A boot on a network that hands out no address, as the ASUS box's,
+    its root with no /etc/net.toml: eth0's address, gateway and resolver
+    from the command line, as a kernel from before the file had them.
+    dhcp=auto stays on the line, as the system image's GRUB entries carry
+    it, and is to leave eth0 alone; the log has to reach the collector with
+    no lease ever asked for, from the first line on."""
     collector = Collector(COLLECT_PORT)
     p, log = boot(args, tmp, "static", STATIC)
     try:
@@ -199,10 +226,65 @@ def static(args, tmp):
         pt.check("dhcp=auto leaves the static address alone",
                  pt.wait_log(log, "DHCP auto: eth0 has a static address, 10.0.2.15", 30))
         pt.check("no DHCP client ran", "dhcp: " not in collector.text())
+        pt.check("the boot says the settings are the command line's, with no /etc/net.toml",
+                 "net: no /etc/net.toml: eth0's settings from the command line: 10.0.2.15/24, gateway 10.0.2.2, "
+                 "resolver 10.0.2.3" in collector.text())
         sh = pt.Shell()
         out = sh.run("net")
         pt.check("the shell over UDP answers on it, and net shows it",
-                 "ip:10.0.2.15/24 gw:10.0.2.2" in out, out[-300:])
+                 "ip:10.0.2.15/24 gw:10.0.2.2" in out and
+                 "eth0 settings: 10.0.2.15/24, gateway 10.0.2.2, resolver 10.0.2.3 (the command line's: "
+                 "no /etc/net.toml)" in out, out[-300:])
+        pt.check("with no gap in the numbers", collector.gaps() == [], str(collector.gaps()[:10]))
+    finally:
+        collector.stop()
+        end(p)
+    return collector.text()
+
+
+# eth0's settings as nos-install writes them for a network with no DHCP
+# server, and the command line an installed server boots with: the system
+# image's own dhcp=auto dns=on, and an ip= the file is to win over
+NET_TOML = """# eth0's settings, as nos-install writes them
+ip = "10.0.2.15/24"
+gw = "10.0.2.2"
+dns = "10.0.2.3"
+"""
+OVERRIDDEN = "dhcp=auto dns=on ip=10.0.2.77/24"
+
+
+def from_file(args, tmp):
+    """A boot on a network that hands out no address, as an installed server
+    is: eth0's address, gateway and resolver from its root's /etc/net.toml,
+    before the netconsole sends a line, and none of the command line's --
+    neither its dhcp=auto nor its ip=, which would leave the shell over UDP
+    where nothing reaches it."""
+    collector = Collector(COLLECT_PORT)
+    p, log = boot(args, tmp, "file", OVERRIDDEN, files={"etc/net.toml": NET_TOML})
+    try:
+        if not pt.check("boots with eth0's settings on its root", pt.wait_log(log, "boot: complete", 300)):
+            return collector.text()
+        pt.check("its log arrives with no lease", wait_until(lambda: len(collector.lines) > 50, 60),
+                 "%d lines" % len(collector.lines))
+        pt.check("the settings are /etc/net.toml's",
+                 wait_until(lambda: "net: eth0's settings from /etc/net.toml: 10.0.2.15/24, gateway 10.0.2.2, "
+                            "resolver 10.0.2.3" in collector.text(), 10),
+                 "\n".join(l for l in collector.lines if "net:" in l))
+        pt.check("and the command line's are named as not used",
+                 "net: the command line's dhcp=auto dns=on ip=10.0.2.77/24 not used: /etc/net.toml is eth0's "
+                 "settings" in collector.text())
+        pt.check("eth0 is given the file's address before the netconsole sends",
+                 "net: eth0 static ip 10.0.2.15 mask 255.255.255.0 gw 10.0.2.2" in collector.text())
+        pt.check("the resolver starts on the file's server",
+                 wait_until(lambda: "dns: resolver started, server 10.0.2.3" in collector.text(), 10))
+        pt.check("no DHCP client ran, the command line's dhcp=auto not taken",
+                 "dhcp: " not in collector.text() and "DHCP auto" not in open(log, errors="replace").read())
+        sh = pt.Shell()
+        out = sh.run("net")
+        pt.check("the shell over UDP answers on it, and net says where the settings came from",
+                 "ip:10.0.2.15/24 gw:10.0.2.2" in out and
+                 "eth0 settings: 10.0.2.15/24, gateway 10.0.2.2, resolver 10.0.2.3 (/etc/net.toml)" in out,
+                 out[-300:])
         pt.check("with no gap in the numbers", collector.gaps() == [], str(collector.gaps()[:10]))
     finally:
         collector.stop()
@@ -267,13 +349,16 @@ def main():
 
     halted = halt(args, tmp)
     fixed = static(args, tmp)
+    filed = from_file(args, tmp)
 
     if args.keep:
         out = os.path.join(tmp, "netconsole.log")
         open(out, "w").write(collector.text())
         open(os.path.join(tmp, "netconsole-halt.log"), "w").write(halted)
         open(os.path.join(tmp, "netconsole-static.log"), "w").write(fixed)
-        print("collected logs at " + out + ", netconsole-halt.log and netconsole-static.log beside it")
+        open(os.path.join(tmp, "netconsole-file.log"), "w").write(filed)
+        print("collected logs at " + out + ", netconsole-halt.log, netconsole-static.log and netconsole-file.log "
+              "beside it")
     else:
         subprocess.run(["rm", "-rf", tmp])
 

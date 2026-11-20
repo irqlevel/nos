@@ -465,6 +465,9 @@ extern "C" void rust_init();
 extern "C" int rust_netframe_pool_setup(unsigned long count);
 extern "C" int rust_netconsole_setup();
 extern "C" int rust_tcp_init();
+/* eth0's settings, off the root just mounted (/etc/net.toml) or else the
+   command line (src/crates/layers/net/src/settings.rs) */
+extern "C" void rust_net_settings_from_root();
 extern "C" void rust_net_start_services(unsigned short udp_shell_port);
 extern "C" void rust_net_stop_shell();
 extern "C" void rust_net_stop_netconsole();
@@ -780,6 +783,11 @@ void bp_startup(void* ctx)
            coming, and the seed the last boot kept on the root: before
            /etc/rc starts anything that wants keys */
         rust_random_seed_from_root();
+
+        /* eth0's settings, /etc/net.toml on the root where it is: decided
+           here, before the shell's task asks DHCP at its start and before
+           the netconsole and the shell over UDP go on eth0 */
+        rust_net_settings_from_root();
 
         /* Here, and not earlier: a block request is completed through the
            BLK_IO soft IRQ, so until the line above a read returns without

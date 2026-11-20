@@ -718,13 +718,21 @@ with no gap in the numbers: the unmount, which comes after every module has
 gone -- a module's exit may wait minutes for guests to turn themselves off,
 which on a machine with no other console nothing else would show -- and the
 netconsole's own last line, traced as it stops and sent by the flush its
-drain does on the way out. A third boot is on a network that hands out no
-address -- the ASUS box's, whose Linux is configured by hand: eth0's
-address, gateway and resolver come off the command line (`ip=`, `gw=`,
-`dns=`), `dhcp=auto` on the same line has to leave them alone, and the log
-has to reach the collector with no lease ever asked for, `net` showing the
-address and the way off the subnet. On the Hetzner machines netconsole is
-the only console there is. See [Netconsole](netconsole.md).
+drain does on the way out; that boot's root holds an `/etc/net.toml` the
+kernel refuses, which the log has to say with its line, the command line's
+`dhcp=auto` taken in its place. A third boot is on a network that hands out
+no address -- the ASUS box's, whose Linux is configured by hand -- its root
+with no `/etc/net.toml`: eth0's address, gateway and resolver come off the
+command line (`ip=`, `gw=`, `dns=`), `dhcp=auto` on the same line has to
+leave them alone, and the log has to reach the collector with no lease ever
+asked for, `net` showing the address and the way off the subnet. A fourth
+is on that network as an installed server is: the address, gateway and
+resolver are its root's `/etc/net.toml`, as nos-install writes it, taken
+before the netconsole sends a line, and the command line's -- the system
+image's `dhcp=auto dns=on` and an `ip=` the file is to win over -- named as
+not used, no DHCP client run, `net` saying where the settings came from.
+On the Hetzner machines netconsole is the only console there is. See
+[Netconsole](netconsole.md).
 
 ### `tcp-test.py` -- the connecting side of TCP
 
@@ -956,8 +964,19 @@ after the PXE entries, nothing else moved; `boot` sets BootNext to the
 firmware's own entry for the disk, turned on, the order left; `boot
 --default` puts it after PXE's -- the order that server needed; in a virtual
 machine it says the server's order is set from the server. `update
---network-here` gives nos the container's address, gateway and DNS server,
-and `network` says the same. The whole disk is made by the one-line
+--network-here` writes the container's address, gateway and DNS server to
+the root's `/etc/net.toml`, the kernel parameters left as they were, and
+`network` says the same; settings the kernel would refuse -- a network or
+broadcast address, a gateway off the subnet or with no address, a loopback
+address, a multicast resolver, `--ip` with `--dhcp`, `ip=` in `--cmdline`
+-- are refused before anything is written. Every install and update writes
+eth0's settings: `install` and `disk` an `/etc/net.toml` of DHCP, which the
+booted nos's `net` says it took; an `update` of an install from before the
+file -- its network `ip= gw= dns=` in the grubenv, its kernel one that does
+not read the file -- writes the file from those words and keeps them for
+the kernel kept for a rollback, the next boot on the file's static
+address; and the update after it, both kernels reading the file, takes the
+words out. The whole disk is made by the one-line
 installer, `scripts/installer/install.sh`, from a directory standing in for
 a release (`NOS_RELEASE_URL=file://...`): it checks the image against the
 release's `SHA256SUMS` -- a release whose sums are another image's is
@@ -990,13 +1009,16 @@ quoted ifcfg; and the gateway offered where none is found, the network's
 first address. A gateway misread is a nos that boots unreachable, which
 looks like an install that worked. Then an ISO built with
 answers -- the disk by `/dev/disk/by-id`, `wipe=yes`, a root of 1G, the
-test's key, a netconsole, `after=poweroff` -- boots from a CD under SeaBIOS,
+test's key, a netconsole, a static address (QEMU's user network's, given as
+a network with no DHCP server's), `after=poweroff` -- boots from a CD under SeaBIOS,
 its Linux says on the serial line that it installs as the answers say,
 then what nos-install does as it goes, that it is done, and powers off by
 itself. The disk's GPT, read by the test itself, is the one `disk` lays
 out. The disk alone boots nos under OVMF -- made under BIOS, booted by
 UEFI -- whose sshd lets the answers' key in to the kernel the installer
-said it installs, with the netconsole asked for on its command line. Then
+said it installs, with the netconsole asked for on its command line and the
+static address from its root's `/etc/net.toml`, none of the network's words
+on the command line. Then
 the same ISO under OVMF, the installed disk beside it: the installer must
 find nos there as it would put it, say it installs nothing -- what keeps a
 firmware that boots the ISO first from erasing what it just made -- and
@@ -1892,6 +1914,16 @@ own, TCP's flags in combinations that mean something. The targets:
   the datagrams numbered with no gap of the machine's making, each line at
   most once, in order, and all of it in the end but what the ring says it
   dropped;
+- `netconf`: eth0's settings -- `/etc/net.toml` and the command line's
+  `ip=`, `gw=`, `dns=`, `dhcp=` (`layers/net/src/settings.rs`): files made
+  of lines a person might write, well and badly, or bytes of any kind, and
+  command lines of words, held to a model of the rules that shares nothing
+  with the module -- an address made from its parts and judged by them --
+  what it takes exactly what the model takes, what it refuses refused at
+  the line the model names; then the boot's own step on a ramfs root
+  holding the file, a directory in its place, one too big, bytes that are
+  not text or nothing, which must decide the file's settings where it is
+  taken and the command line's otherwise, the refusal kept for `net`;
 - `ssh`: the sshd module on a ramfs root, and SSH clients (`sshc.rs`) that
   log in with the key it knows or a stranger's or a signature over the
   wrong session, run a command or a shell with a window of their choosing,

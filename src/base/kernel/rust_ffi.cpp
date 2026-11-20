@@ -2939,41 +2939,6 @@ void kernel_input_key(u8 c, u8 code)
     kernel::KeyboardInput::get_instance().emit(static_cast<char>(c), code);
 }
 
-/* dhcp=off: the shell's `dhcp` says so rather than running one. */
-int kernel_param_dhcp_off()
-{
-    return kernel::Parameters::get_instance().is_dhcp_off() ? 1 : 0;
-}
-
-/* dns=on: a lease's DNS server is worth starting a resolver on. */
-int kernel_param_dns_on()
-{
-    return kernel::Parameters::get_instance().is_dns_enabled() ? 1 : 0;
-}
-
-/* dns=A.B.C.D: the resolver's server, given; 0 when none was. */
-unsigned int kernel_param_dns_server()
-{
-    return kernel::Parameters::get_instance().get_dns_server();
-}
-
-/* ip=A.B.C.D/N and gw=A.B.C.D: eth0's static address, its mask and its
-   gateway, host byte order; 0 for each that was not given. */
-unsigned int kernel_param_static_ip()
-{
-    return kernel::Parameters::get_instance().get_static_ip();
-}
-
-unsigned int kernel_param_static_mask()
-{
-    return kernel::Parameters::get_instance().get_static_mask();
-}
-
-unsigned int kernel_param_static_gateway()
-{
-    return kernel::Parameters::get_instance().get_static_gateway();
-}
-
 /* rxpoll=on: the tick's receive poll, which the network layer's
    DeviceTable::poll_rx asks about on every call. */
 int kernel_param_rxpoll_on()
