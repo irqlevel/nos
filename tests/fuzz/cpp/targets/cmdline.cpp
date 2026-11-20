@@ -52,7 +52,7 @@ struct Expected
 {
     bool trace_vga = false, panic_vga = false, smp_off = false, its_enabled = true, hw_rng_off = false;
     int wx_probe = 0; /* off, text, heap */
-    bool usb_off = false, rc_off = false, hwp_off = false, ucode_off = false;
+    bool usb_off = false, rc_off = false, hwp_off = false, ucode_off = false, split_lock_off = false;
     bool idle_mwait = true; /* MWAIT unless the last idle= that says one way or the other says halt */
     ulong panic_reset_secs = 0;
     int console = 0; /* both, serial, vga */
@@ -199,6 +199,8 @@ void take(Expected& e, const std::string& token)
         e.hwp_off = value == "off";
     else if (key == "ucode")
         e.ucode_off = value == "off";
+    else if (key == "splitlock")
+        e.split_lock_off = value == "off";
     else if (key == "idle")
     {
         if (value == "halt")
@@ -424,7 +426,7 @@ Expected read(const std::string& line)
 const char* const WORDS[] = {"trace", "panic", "its", "usb", "rc", "hwrng", "hwp", "ucode", "idle", "wxprobe", "smp",
                              "maxcpus", "console", "dhcp", "udpshell", "netconsole", "rxpoll", "ubsan", "netframes",
                              "nctail", "loglevel", "root", "fstest", "disklog", "dns", "hugepages", "tracepoints",
-                             "zerofree", "memsites", "guestpci"};
+                             "zerofree", "memsites", "guestpci", "splitlock"};
 
 const char* const HUGE_VALUES[] = {"50%", "100%", "101%", "0%", "1%", "32G", "512G", "513G", "0G", "512M", "524288M",
                                   "524289m", "1g", "2m", "G", "%", "M", "50", "50%%", "0050%", "%50", "18446744073709551615G",
@@ -593,6 +595,7 @@ void run(fuzz::Input& in)
         "trace, panic or smp read wrong");
     INVARIANT(p.get_panic_reset_secs() == e.panic_reset_secs, "panic=%lu, not %lu", p.get_panic_reset_secs(), e.panic_reset_secs);
     INVARIANT(p.is_hwp_off() == e.hwp_off && p.is_ucode_off() == e.ucode_off, "hwp or ucode read wrong");
+    INVARIANT(p.is_split_lock_off() == e.split_lock_off, "splitlock=off read %s", p.is_split_lock_off() ? "on" : "off");
     INVARIANT(p.is_idle_mwait() == e.idle_mwait, "idle=mwait read %s", p.is_idle_mwait() ? "on" : "off");
     INVARIANT(p.is_its_enabled() == e.its_enabled && p.is_hw_rng_off() == e.hw_rng_off && p.is_usb_off() == e.usb_off &&
         p.is_rc_off() == e.rc_off, "its, hwrng, usb or rc read wrong");
