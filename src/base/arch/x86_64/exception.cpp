@@ -8,6 +8,7 @@
 #include <kernel/panic.h>
 #include <kernel/klog.h>
 #include <kernel/cpu.h>
+#include <hal/cpu.h>
 #include <kernel/debug.h>
 #include <hal/irqchip.h>
 
@@ -326,7 +327,13 @@ void ExceptionTable::exc_alignment_check(Context* ctx)
 {
     exc_alignment_check_counter_.inc();
 
-    PANIC_CTX(ctx, true, "EXC: AlignmentCheck rip 0x%lX rsp 0x%lX err 0x%lX",
+    /* The kernel runs nothing in ring 3, the only ring CR0.AM and RFLAGS.AC
+       check alignment in: on a CPU with split lock detection on, an #AC
+       here is a split lock -- a locked access across two cache lines, the
+       bus taken from every core while it ran -- and a bug, stopped where it
+       is (hal::setup_split_lock_detect). A guest's is a VM exit, not this. */
+    PANIC_CTX(ctx, true, "EXC: %s rip 0x%lX rsp 0x%lX err 0x%lX",
+        hal::split_lock_detect_here() ? "split lock -- a locked access across two cache lines --" : "AlignmentCheck",
         ctx->get_ret_rip(true), ctx->get_orig_rsp(true), ctx->get_error_code());
 }
 
