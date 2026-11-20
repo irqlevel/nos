@@ -219,6 +219,21 @@ pub const LOG_MS: u64 = 5_000;
 /// for a command out past its time, and for a completion whose interrupt
 /// never came.
 pub const EH_TICK_MS: u64 = 100;
+/// How long a task waiting on a disk that does not spin -- an SSD, or one
+/// that does not say -- gives its CPU to whoever else can run and looks
+/// again, before it sleeps: what such a disk answers most commands in, which
+/// a sleep and a wake would add to. A disk that spins answers in
+/// milliseconds, and its waiter sleeps at once: a CPU that spun out its
+/// waits was one taken from everything else -- a guest's among them -- for
+/// as long as the disk took (a 2 TB SMR disk's format held one for minutes).
+pub const SPIN_SOLID_NS: u64 = 250_000;
+/// The disk's own command's wait for the port -- another's to end, the
+/// queue to drain, which no slot's end signals -- naps this long a turn once
+/// past the spin: a disk that spins ends a command in milliseconds, one that
+/// does not in microseconds. A wait for a slot to take never naps
+/// (`take_slot`).
+pub const NAP_SPINNING_NS: u64 = 1_000_000;
+pub const NAP_SOLID_NS: u64 = 50_000;
 /// How long `start` waits for the interrupt of a command it has seen done.
 pub const INTERRUPT_CHECK_MS: u64 = 1_000;
 /// How long the error-handling task gives an interrupt it finds pending in
