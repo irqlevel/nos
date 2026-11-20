@@ -223,8 +223,12 @@ class Test:
                                                               re.M) is not None, out)
         check("the logins and TCP's connections in it too", re.search(r"Z sshd: root logged in from ", out) is not None
               and re.search(r"Z tcp: accepted 22 <- \d+$", out, re.M) is not None, out)
+        check("and the UDP shell's commands, each with who sent it",
+              re.search(r"Z udpshell: cmd 'logs sync' from 10\.0\.2\.2:\d+$", out, re.M) is not None, out)
         out = sh.run("dmesg 200 sshd:")
         check("none of them in the kernel log", "logged in from" not in out and "files opened" not in out, out)
+        out = sh.run("dmesg 200 udpshell")
+        check("nor the UDP shell's commands", "udpshell: cmd" not in out, out)
         out = sh.run("logs")
         check("logs lists net.log, written", re.search(r"^net\s+/logs/net\.log\s.*\swritten$", out, re.M) is not None, out)
 
