@@ -1423,14 +1423,16 @@ impl SplitLocks {
             self.unsaid.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        /* The hypervisor's file log's: what a guest did, not what the host
+         * did (docs/logs.md) */
         let unsaid = self.unsaid.swap(0, Ordering::AcqRel);
         if unsaid == 0 {
-            kcore::klog!(0, "hv: {}: a split lock at rip {:#x} on its cpu {} -- a locked access across two cache lines, \
-                             the bus taken from every core while it ran", who, rip, cpu);
+            kcore::flog!(crate::HV, "{}: a split lock at rip {:#x} on its cpu {} -- a locked access across two cache \
+                                     lines, the bus taken from every core while it ran", who, rip, cpu);
         } else {
-            kcore::klog!(0, "hv: {}: a split lock at rip {:#x} on its cpu {} -- a locked access across two cache lines, \
-                             the bus taken from every core while it ran; {} more since the last line", who, rip, cpu,
-                         unsaid);
+            kcore::flog!(crate::HV, "{}: a split lock at rip {:#x} on its cpu {} -- a locked access across two cache \
+                                     lines, the bus taken from every core while it ran; {} more since the last line",
+                         who, rip, cpu, unsaid);
         }
     }
 }
