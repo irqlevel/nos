@@ -674,6 +674,26 @@ fn state_bytes(guest: &LinuxGuest) -> Result<Vec<u8>, String> {
 /// The VM `word` names moved to `host` -- `cold`, paused for all of it, or
 /// live, its memory copied as it runs -- or left running here and why not.
 pub fn migrate(state: &State, word: &str, host: &str, cold: bool, work: &mut dyn Work) -> Result<Moved, String> {
+    let moved = send_away(state, word, host, cold, work);
+    let how = if cold { "cold" } else { "live" };
+    match &moved {
+        Ok(m) => kcore::flog!(crate::HV, "migrate: vm {} moved to {} ({}) -- {} round{}, paused {} ms, {} MiB sent",
+                              word, host, how, m.rounds, if m.rounds == 1 { "" } else { "s" }, m.paused_ms,
+                              m.sent_bytes.div_ceil(1024 * 1024)),
+        Err(why) => {
+            /* The reasons begin with the VM's name and that it was not moved:
+             * said once */
+            let why = match why.split_once(" not moved -- ") {
+                Some((name, rest)) if !name.contains(' ') => rest,
+                _ => why.as_str(),
+            };
+            kcore::flog_limited!(crate::HV, "migrate: vm {} not moved to {} ({}) -- {}", word, host, how, why);
+        }
+    }
+    moved
+}
+
+fn send_away(state: &State, word: &str, host: &str, cold: bool, work: &mut dyn Work) -> Result<Moved, String> {
     let me = nbsdrive::this_host()?;
     if host == me {
         return Err(alloc::format!("{} is this host", host));
@@ -1082,8 +1102,8 @@ fn handover(state: &State, taken: &StateHold<'_>, mb: &Mailbox, d: Addr, id: u64
                         }
                         Err(NotTaken::Refused) => Take::Refused,
                         Err(NotTaken::Unknown(why)) => {
-                            kcore::klog!(0, "hv: migrate: {}'s volume not taken back yet -- {}: asked again", taken.name,
-                                         why);
+                            kcore::flog_limited!(crate::HV, "migrate: {}'s volume not taken back yet -- {}: asked \
+                                                             again", taken.name, why);
                             Take::Unknown
                         }
                     };
@@ -1535,17 +1555,17 @@ fn incoming(state: &State, mb: &Mailbox, s: Addr, offer: Offer) -> Option<u64> {
         Ok(c) => c,
         Err(why) => {
             trace_end(id, trace::MigSide::New, trace::MigHow::Refused, 0, 0, 0);
-            kcore::klog!(0, "hv: migrate: vm {} from {} refused -- {}", name, from, why);
+            kcore::flog_limited!(crate::HV, "migrate: vm {} from {} refused -- {}", name, from, why);
             let _ = send(mb, s, &Msg::Refuse { id, why: clip(&why) });
             return None;
         }
     };
     if let Err(e) = send(mb, s, &Msg::Accept { id }) {
-        kcore::klog!(0, "hv: migrate: vm {} from {}: its acceptance {}", name, from, e);
+        kcore::flog!(crate::HV, "migrate: vm {} from {}: its acceptance {}", name, from, e);
         c.let_go(false);
         return None;
     }
-    kcore::klog!(0, "hv: migrate: vm {} coming from {}", name, from);
+    kcore::flog!(crate::HV, "migrate: vm {} coming from {}", name, from);
     c.run()
 }
 
@@ -1769,7 +1789,7 @@ impl<'a> Incoming<'a> {
                     };
                 }
                 Msg::Cancel { why, .. } => {
-                    kcore::klog!(0, "hv: migrate: vm {} given up by {}: {}", self.offer.name, self.offer.from, why);
+                    kcore::flog!(crate::HV, "migrate: vm {} given up by {}: {}", self.offer.name, self.offer.from, why);
                     trace_end(self.offer.id, trace::MigSide::New, trace::MigHow::Cancelled, 0, 0, self.offer.mem_bytes);
                     self.let_go(false);
                     return None;
@@ -1917,7 +1937,7 @@ impl<'a> Incoming<'a> {
             if kcore::task::stopping() || now_ms() > since + TAKE_FOR_MS {
                 /* As if this host had died: S takes the volume back, or
                  * finds it was taken -- nothing runs here either way */
-                kcore::klog!(0, "hv: migrate: vm {} given up while its volume was asked for: it runs on {} if its \
+                kcore::flog!(crate::HV, "migrate: vm {} given up while its volume was asked for: it runs on {} if its \
                                  take back lands there, and nowhere if this host's did", self.offer.name,
                              self.offer.from);
                 trace_end(self.offer.id, trace::MigSide::New, trace::MigHow::Here, 0, 0, self.offer.mem_bytes);
@@ -1930,7 +1950,8 @@ impl<'a> Incoming<'a> {
                 Ok(d) => (Take::Took, Some(d)),
                 Err(NotTaken::Refused) => (Take::Refused, None),
                 Err(NotTaken::Unknown(why)) => {
-                    kcore::klog!(0, "hv: migrate: vm {}'s volume not had yet -- {}: asked again", self.offer.name, why);
+                    kcore::flog_limited!(crate::HV, "migrate: vm {}'s volume not had yet -- {}: asked again",
+                                         self.offer.name, why);
                     (Take::Unknown, None)
                 }
             };
@@ -1945,7 +1966,7 @@ impl<'a> Incoming<'a> {
                 },
                 DestDo::Abort => {
                     let why = alloc::format!("its first volume was taken back by {} first", self.offer.from);
-                    kcore::klog!(0, "hv: migrate: vm {} given up -- {}", self.offer.name, why);
+                    kcore::flog!(crate::HV, "migrate: vm {} given up -- {}", self.offer.name, why);
                     trace_end(self.offer.id, trace::MigSide::New, trace::MigHow::Here, 0, 0, self.offer.mem_bytes);
                     let _ = send(self.mb, self.s, &Msg::Aborted { id: self.offer.id, why });
                     self.let_go(false);
@@ -1972,7 +1993,7 @@ impl<'a> Incoming<'a> {
             .ok_or_else(|| String::from("out of memory"))
             .and_then(|p| kcore::fs::create(&p, self.offer.config.as_bytes()).map_err(|e| alloc::format!("{}: {}", p, e)));
         if let Err(e) = config {
-            kcore::klog!(0, "hv: migrate: vm {}: its vm.toml not written -- {}: write it by hand", name, e);
+            kcore::flog!(crate::HV, "migrate: vm {}: its vm.toml not written -- {}: write it by hand", name, e);
         }
         let mut disks = Vec::new();
         if disks.try_reserve_exact(self.written_disks.len()).is_err() {
@@ -1997,7 +2018,8 @@ impl<'a> Incoming<'a> {
                         if kcore::task::stopping() || now_ms() > since + TAKE_FOR_MS {
                             break None;
                         }
-                        kcore::klog!(0, "hv: migrate: vm {}'s {} not had yet -- {}: asked again", name, word, why);
+                        kcore::flog_limited!(crate::HV, "migrate: vm {}'s {} not had yet -- {}: asked again", name,
+                                             word, why);
                         kcore::task::sleep_ms(AGAIN_MS);
                     }
                 }
@@ -2015,7 +2037,7 @@ impl<'a> Incoming<'a> {
         }
         let nic = if self.coming.spec.net { self.move_port() } else { None };
         if self.coming.spec.net && nic.is_none() {
-            kcore::klog!(0, "hv: migrate: vm {} runs here without its network -- its port could not be moved: hv \
+            kcore::flog!(crate::HV, "migrate: vm {} runs here without its network -- its port could not be moved: hv \
                              restart it once vnet answers", name);
         }
         let Incoming { state, mb, s, offer, coming, built, folder, logged, .. } = self;
@@ -2027,15 +2049,15 @@ impl<'a> Incoming<'a> {
                 /* vnet's table had now, the port here in it */
                 state.vms.keeper_now();
                 trace_end(offer.id, trace::MigSide::New, trace::MigHow::There, 0, 0, offer.mem_bytes);
-                kcore::klog!(0, "hv: migrate: vm {} ({}) runs here, moved from {}", n, name, offer.from);
+                kcore::flog!(crate::HV, "migrate: vm {} ({}) runs here, moved from {}", n, name, offer.from);
                 let _ = send(mb, s, &Msg::Running { id: offer.id });
                 Some(offer.id)
             }
             Err(e) => {
                 drop(log);
                 trace_end(offer.id, trace::MigSide::New, trace::MigHow::Stopped, 0, 0, offer.mem_bytes);
-                kcore::klog!(0, "hv: migrate: vm {} could not run here after its handover -- {}: hv start {} force", name,
-                             e, name);
+                kcore::flog!(crate::HV, "migrate: vm {} could not run here after its handover -- {}: hv start {} force",
+                             name, e, name);
                 None
             }
         }
@@ -2057,7 +2079,8 @@ impl<'a> Incoming<'a> {
                 Ok(_) => break,
                 Err(why) => {
                     if kcore::task::stopping() || now_ms() > since + PORT_FOR_MS {
-                        kcore::klog!(0, "hv: migrate: vm {}'s port {} not moved -- {}", self.offer.name, nic.port, why);
+                        kcore::flog!(crate::HV, "migrate: vm {}'s port {} not moved -- {}", self.offer.name, nic.port,
+                                     why);
                         return None;
                     }
                     kcore::task::sleep_ms(AGAIN_MS);
@@ -2067,13 +2090,13 @@ impl<'a> Incoming<'a> {
         let (port, switch, a) = match self.state.vms.claim_cluster_port(&self.coming, &uuid, network) {
             Ok(c) => c,
             Err(why) => {
-                kcore::klog!(0, "hv: migrate: vm {}'s port {} not had on the switch -- {}", self.offer.name, nic.port,
-                             why);
+                kcore::flog!(crate::HV, "migrate: vm {}'s port {} not had on the switch -- {}", self.offer.name,
+                             nic.port, why);
                 return None;
             }
         };
         if switch.mac_of(port) != nic.mac {
-            kcore::klog!(0, "hv: migrate: vm {}'s port gives it another MAC than it had: its NIC keeps its own",
+            kcore::flog!(crate::HV, "migrate: vm {}'s port gives it another MAC than it had: its NIC keeps its own",
                          self.offer.name);
         }
         /* What its old host carries on to it a while taken from that host
@@ -2085,7 +2108,7 @@ impl<'a> Incoming<'a> {
         }
         let adopted = switch.adopt_flows(port, &self.flows);
         if adopted != self.flows.len() {
-            kcore::klog!(0, "hv: migrate: vm {}: {} of its {} flows had here", self.offer.name, adopted,
+            kcore::flog!(crate::HV, "migrate: vm {}: {} of its {} flows had here", self.offer.name, adopted,
                          self.flows.len());
         }
         match self.built.guest.set_nic_backend(0, Box::new(switch.backend(port))) {
@@ -2102,8 +2125,8 @@ impl<'a> Incoming<'a> {
     /// volume this host's -- said, and what was built let go of.
     fn failed(self, why: &str) -> Option<u64> {
         trace_end(self.offer.id, trace::MigSide::New, trace::MigHow::Stopped, 0, 0, self.offer.mem_bytes);
-        kcore::klog!(0, "hv: migrate: vm {} could not run here after its handover -- {}: its folder is here; hv start \
-                         {} force once that is put right", self.offer.name, why, self.offer.name);
+        kcore::flog!(crate::HV, "migrate: vm {} could not run here after its handover -- {}: its folder is here; \
+                                 hv start {} force once that is put right", self.offer.name, why, self.offer.name);
         self.let_go(true);
         None
     }
@@ -2111,7 +2134,7 @@ impl<'a> Incoming<'a> {
     /// Given up before the commit: S told -- it runs the VM on -- and what
     /// was built let go of.
     fn give_up(mut self, why: &str) {
-        kcore::klog!(0, "hv: migrate: vm {} from {} given up -- {}", self.offer.name, self.offer.from, why);
+        kcore::flog!(crate::HV, "migrate: vm {} from {} given up -- {}", self.offer.name, self.offer.from, why);
         trace_end(self.offer.id, trace::MigSide::New, trace::MigHow::Here, 0, 0, self.offer.mem_bytes);
         if self.dest.give_up() == DestDo::Abort {
             let _ = send(self.mb, self.s, &Msg::Aborted { id: self.offer.id, why: clip(why) });

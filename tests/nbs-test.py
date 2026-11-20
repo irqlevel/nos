@@ -365,6 +365,14 @@ def whole(sh):
     return h is not None and h[0] > 0 and h[1:] == (0, 0, 0, 0, 0, 0)
 
 
+def nbs_log(sh):
+    """NBS's file log on `sh`'s host, whole, what is queued written first:
+    the metadata's history as its member applied it -- a replica taken out,
+    a join done -- and what its cs and clients met (docs/logs.md)."""
+    sh.run("logs sync")
+    return sh.run("cat /logs/nbs.log")
+
+
 def json_of(out):
     m = re.search(r"(\{.*\})", out or "", re.S)
     try:
@@ -740,7 +748,7 @@ def main():
         # What `nbscs` shows is what the cs's task last made of it: a second old at most
         check("every cs fences disk1 at a's generation",
               ipct.wait_for(lambda: all(fences_of(x).get(vol1) == gen1 for x in sh), 5, 0.5),
-              [x.run("nbscs") + x.run("dmesg 8192 nbs") for x in sh])
+              [x.run("nbscs") + x.run("tail /logs/nbs.log 40") for x in sh])
         end = CHUNK_MIB << 20
         out = a.run("nbs io write disk1 %d 8192 0x33" % (end - 4096))
         check("8 KiB across a chunk's end: two chunks", "8192 bytes of 0x33" in out and ": 2 chunks" in out, out)
@@ -887,7 +895,10 @@ def main():
         # N12c it waited behind whatever request the cs was in --
         out = a.run("nbs volume create burst %d" % (BURST_CHUNKS * CHUNK_MIB))
         need("a volume of %d chunks" % BURST_CHUNKS, "nbs: volume burst" in out, out)
-        taken = len(re.findall(r"taken out of volume burst", a.run("dmesg 65536 nbs")))
+        # A replica taken out is a command of the metadata's: said in every
+        # member's NBS log as it is applied, never held back by its limiter
+        took_out = r"taken out by volume burst's writer"
+        taken = len(re.findall(took_out, nbs_log(a)))
         ipct.hmp(qmp(2), "block_set_io_throttle more0 0 0 0 %d 0 0" % BURST_IOPS)
         try:
             t0 = time.time()
@@ -906,9 +917,9 @@ def main():
               % (SILENT_S, wrote / BURST_CHUNKS), wrote / BURST_CHUNKS > SILENT_S)
         check("a detaches burst, every chunk closed -- their records together: %.1f s" % took, "burst detached" in out,
               out)
-        log = a.run("dmesg 65536 nbs")
+        log = nbs_log(a)
         check("c not taken out of burst's sets, slow as it was: the leader's look answered whatever its device did",
-              len(re.findall(r"taken out of volume burst", log)) == taken,
+              len(re.findall(took_out, log)) == taken,
               [l for l in log.split("\n") if "burst" in l][-6:])
         check("burst's chunks at three replicas still", ipct.wait_for(lambda: whole(a), 30, 1),
               [x.run("nbs status") for x in sh])
@@ -1036,6 +1047,10 @@ def main():
         check("rep's health through the bus: whole, no chunk short of three",
               js is not None and js.get("health") == "ok" and js.get("chunks_at_two") == 0
               and js.get("chunks_copying") == 0, js)
+        # c's NBS log as it goes: kept on its root across the boot, with the
+        # joins of its first return -- what its next joins did is what
+        # follows (1 MiB a file: nothing moves along meanwhile)
+        joins_before = len(re.findall(r"cs: set \d+ joined: ", nbs_log(c)))
         kill(2)
         others = [sh[0], sh[1]]
         check("c gone: the leader's controller has its cs down",
@@ -1085,9 +1100,11 @@ def main():
         out = c.run("nbs io read rep %d 65536" % (CHUNK_MIB << 20))
         check("and its second chunk, not written meanwhile, as it was",
               ("65536 bytes at %d of rep, from c: 0x33x65536" % (CHUNK_MIB << 20)) in out, out)
-        # what c's copies did, each join's end in its log
-        joined = re.findall(r"set \d+ joined: this cs is its member now -- (\d+) chunks copied, (\d+) of them found "
-                            r"as the source's, (\d+) bytes pulled", c.run("dmesg 5000 joined:"))
+        # what c's copies did since it came back, each join's end in NBS's
+        # log there
+        ends = re.findall(r"cs: set \d+ joined: this cs is its member now(?: -- (\d+) chunks copied, (\d+) of them "
+                          r"found as the source's, (\d+) bytes pulled)?", nbs_log(c))
+        joined = [j for j in ends[joins_before:] if j[0]]
         copied, kept, pulled = (sum(int(j[k]) for j in joined) for k in range(3))
         check("c's copies took only what it missed: the chunk written meanwhile pulled whole, the other found as "
               "its source's (%d chunks, %d found, %d bytes pulled, by %d joins)" % (copied, kept, pulled, len(joined)),

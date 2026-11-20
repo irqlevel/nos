@@ -140,9 +140,24 @@ fn data_of(image: &Image, path: &str, work: &dyn Work) -> Result<u64, String> {
 
 /// The VM `from`'s folder under `root` cloned into a new one, `to`, at
 /// `port` of the switch when asked: what it came to, or why not. Its lines,
-/// its progress and whether to stop are `work`'s.
+/// its progress and whether to stop are `work`'s; what it came to is the
+/// hypervisor's log's too, a shell's or the host API's.
 pub fn clone(root: &str, vms: &Vms, from: &str, to: &str, port: Option<u32>, work: &mut dyn Work)
              -> Result<Cloned, String> {
+    let cloned = copy(root, vms, from, to, port, work);
+    match &cloned {
+        Ok(c) => {
+            let written: u64 = c.copied.iter().map(|&(_, _, written)| written).sum();
+            kcore::flog!(crate::HV, "vm {} cloned from {} -- {}, {} file{} copied, {} MiB written", to, from, c.file,
+                         c.copied.len(), if c.copied.len() == 1 { "" } else { "s" }, written.div_ceil(1024 * 1024));
+        }
+        Err(why) => kcore::flog_limited!(crate::HV, "vm {} not cloned from {} -- {}", to, from, why),
+    }
+    cloned
+}
+
+fn copy(root: &str, vms: &Vms, from: &str, to: &str, port: Option<u32>, work: &mut dyn Work)
+        -> Result<Cloned, String> {
     let oom = || String::from("out of memory");
     let source = store::folder_of(root, from)?;
     if let Some(why) = store::name_refused(to) {

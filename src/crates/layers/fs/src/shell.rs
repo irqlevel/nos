@@ -192,7 +192,7 @@ fn df_row(m: &crate::vfs::MountInfo) -> [String; DF_COLUMNS] {
 /// `bytes` as df -h says them: bytes below a KiB, and above that a tenth of
 /// the largest unit -- K, M, G, T, P, of 1024 each -- there is one of,
 /// rounded down: 1536 is 1.5K.
-fn human(bytes: u64) -> String {
+pub(crate) fn human(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["K", "M", "G", "T", "P"];
     const KIB: u64 = 1024;
     if bytes < KIB {
@@ -229,6 +229,24 @@ pub fn cat(args: &str, out: &mut Output) {
     match args_of(args).next() {
         Some(path) => { files::read_file(path, out); }
         None => { let _ = writeln!(out, "usage: cat <path>"); }
+    }
+}
+
+/// Lines `tail` shows unless asked for another number, and the most it
+/// shows.
+const TAIL_LINES: usize = 10;
+const TAIL_MAX: usize = 10_000;
+
+pub fn tail(args: &str, out: &mut Output) {
+    let mut words = args_of(args);
+    let path = words.next();
+    let lines = match words.next() {
+        None => Some(TAIL_LINES),
+        Some(n) => n.parse::<usize>().ok().filter(|n| (1..=TAIL_MAX).contains(n)),
+    };
+    match (path, lines, words.next()) {
+        (Some(path), Some(lines), None) => { files::tail_file(path, lines, out); }
+        _ => { let _ = writeln!(out, "usage: tail <path> [lines, 1-{}]", TAIL_MAX); }
     }
 }
 
@@ -593,6 +611,8 @@ pub fn register_all() {
         ("ls", "ls [path] - list directory (default /)", ls),
         ("find", "find [path...] [expression] - files and directories under a path, by name, type, size", crate::find::find),
         ("cat", "cat <path> - show file content", cat),
+        ("tail", "tail <path> [lines] - the last lines of a file (10 unless told)", tail),
+        ("logs", "logs [sync] - the file logs under /logs; sync: what is queued written now", crate::logs::command),
         ("write", "write <path> <text> - write to file", write),
         ("mkdir", "mkdir <path> - create directory", mkdir),
         ("touch", "touch <path> - create empty file", touch),

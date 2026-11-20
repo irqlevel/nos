@@ -52,6 +52,29 @@ macro_rules! klog {
     }};
 }
 
+/// `kcore::flog!` and `kcore::flog_limited!`, a line to a file log
+/// (docs/logs.md): the log named and the formatting checked, the line
+/// dropped.
+#[macro_export]
+macro_rules! flog {
+    ($log:expr, $($arg:tt)*) => {{
+        let _ = &$log;
+        let _ = format_args!($($arg)*);
+    }};
+}
+
+#[macro_export]
+macro_rules! flog_limited {
+    ($log:expr, $($arg:tt)*) => {{
+        let _ = &$log;
+        let _ = format_args!($($arg)*);
+    }};
+}
+
+/// The hypervisor's file log, as the module's sources name it (`crate::HV`,
+/// its lib.rs's).
+pub static HV: () = ();
+
 /* ---- what the sources reach of the kernel and of hvarch ---- */
 
 mod kernel;

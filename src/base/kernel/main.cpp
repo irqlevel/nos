@@ -486,6 +486,10 @@ extern "C" void kernel_blockdev_set_interrupts_started();
 extern "C" void rust_mount_root_fs();
 /* The random pool's seed kept on the root filesystem (src/crates/kernel/src/seed.rs) */
 extern "C" void rust_random_seed_from_root();
+/* The file logs under /logs (src/crates/layers/fs/src/logs.rs): their writer
+   started once the root is mounted, finished before it is unmounted */
+extern "C" void rust_logs_start();
+extern "C" void rust_logs_stop();
 extern "C" void kernel_vfs_unmount_all();
 extern "C" void rust_mgmt_stop();
 /* The message channel is Rust (src/crates/layers/ipc): at the halt, after the
@@ -789,6 +793,10 @@ void bp_startup(void* ctx)
            the netconsole and the shell over UDP go on eth0 */
         rust_net_settings_from_root();
 
+        /* The file logs' writer, now that /logs has a filesystem: a line
+           written before this -- none is, yet -- waited on its queue */
+        rust_logs_start();
+
         /* Here, and not earlier: a block request is completed through the
            BLK_IO soft IRQ, so until the line above a read returns without
            having read anything. Everything traced since the first line of the
@@ -886,6 +894,12 @@ void bp_startup(void* ctx)
         /* The message channel after the modules too -- whose mailboxes their
            exits closed -- and before the files go: nothing is sent from here on */
         rust_ipc_stop();
+
+        /* The file logs' writer after everything that writes a line to one
+           -- the modules, sshd's last sessions among them -- and before the
+           files go: what it holds is written, and a line from here on goes
+           to the kernel log */
+        rust_logs_stop();
 
         /* Before the soft IRQs stop: unmounting writes the superblock, and
            a block request completes through the BLK_IO soft IRQ */

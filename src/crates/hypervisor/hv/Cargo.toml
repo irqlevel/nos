@@ -23,3 +23,6 @@ crypto = { path = "../../base/crypto" }
 # are saved into and restored from (`hv save`, a migration) -- no kernel in
 # it, so tests/fuzz/hv holds its round trips.
 vmstate = { path = "../../common/vm/vmstate" }
+# The date the guest's RTC reads and a VM's log is stamped with: the tree's
+# one calendar.
+calendar = { path = "../../common/calendar" }

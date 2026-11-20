@@ -23,3 +23,5 @@ diskimage = { path = "../../common/storage/diskimage" }
 mgmt = { path = "../mgmt" }
 # The events tasks wait on: an image's queue may be made on one.
 events = { path = "../../base/events" }
+# The date a file log's lines are stamped with: the tree's one calendar.
+calendar = { path = "../../common/calendar" }

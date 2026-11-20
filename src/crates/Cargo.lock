@@ -102,6 +102,10 @@ name = "bzimage"
 version = "0.1.0"
 
 [[package]]
+name = "calendar"
+version = "0.1.0"
+
+[[package]]
 name = "cc"
 version = "1.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -402,6 +406,7 @@ name = "fs"
 version = "0.1.0"
 dependencies = [
  "block",
+ "calendar",
  "diskimage",
  "events",
  "extfmt",
@@ -492,6 +497,7 @@ name = "hv"
 version = "0.1.0"
 dependencies = [
  "bzimage",
+ "calendar",
  "crypto",
  "hvarch",
  "kcore",
@@ -1638,6 +1644,7 @@ name = "web"
 version = "0.1.0"
 dependencies = [
  "base64ct",
+ "calendar",
  "p256",
  "sha2",
  "zeroize",

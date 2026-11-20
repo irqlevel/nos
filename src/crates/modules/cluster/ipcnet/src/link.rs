@@ -33,6 +33,16 @@ pub const ALPN: [&[u8]; CLASSES] = [b"nos-ipc/1", b"nos-ipc-bulk/1"];
 /// A link's floor for its retransmissions: both ends are nos, which
 /// acknowledges every segment at once (plans/tcp.md, T2).
 const LINK_RTO_MS: u32 = 20;
+
+/// Where a handshake refused at the listener is said: the network's file
+/// log, /logs/net.log (docs/logs.md), with TCP's connections. The port
+/// answers the peers' addresses alone, but an address may be a NAT's, with
+/// whatever else is behind it, and a peer dialing with a key not pinned here
+/// dials again and again: a line of the kernel log each, it was -- what is
+/// counted of them, and the peer's state, `ipcnet` says. This host's own
+/// handshake refused, and a hello from a pinned key that will not do, stay
+/// in the kernel log.
+static NET: kcore::logs::Log = kcore::logs::Log::new("net");
 /// A handshake's time, and the Hello's after it.
 pub const HANDSHAKE_MS: u64 = 3000;
 const HELLO_MS: u64 = 3000;
@@ -309,7 +319,7 @@ fn accept(shared: &Arc<Shared>, stream: TcpStream, ip: u32) -> Up {
         Err((sock, why)) => {
             sock.tcp.abort();
             add(&shared.counters.refused_in, 1);
-            kcore::klog!(0, "ipcnet: a handshake from {} refused: {}", super::files::Ip(ip), why.name());
+            kcore::flog!(NET, "ipcnet: a handshake from {} refused: {}", super::files::Ip(ip), why.name());
             return None;
         }
     };

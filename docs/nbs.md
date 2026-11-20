@@ -707,7 +707,15 @@ member runs"):
 What is NBS's own:
 - the cluster's id on every message;
 - its state's digest, held to the leader's; its cs's questions, its
-  clients' asks, the controller and the scrub.
+  clients' asks, the controller and the scrub;
+- its history: each change applied, said in `/logs/nbs.log` as this
+  member applies it (`history.rs`, the state machine over nbsmeta's that
+  says it) -- a volume made, attached, snapshotted or deleted, a replica
+  taken out and by whose writer, a cs down, up or out, a join begun, done
+  or given up, a device added -- so that every host has the cluster's
+  history in its own file, stamped when it applied each line. Not the
+  digests nor a copy-up's steps; a change refused through a limiter; not
+  what the member replays as it starts ([File logs](logs.md)).
 
 What every group whose hosts are offered it has, NBS's and vnet's alike, is
 raftmember's (`offered.rs`, plans/vnet.md, V1a), and its members' rules
@@ -1618,7 +1626,8 @@ only its metadata.
     place, every chunk at three replicas again with none being copied; a
     read on c of what was written while it was gone, which its join's copy
     took, and of the chunk not written meanwhile; and what its copies did,
-    each join's end in its log (`dmesg`): the chunk written meanwhile pulled
+    each join's end in NBS's log there (`/logs/nbs.log`, since c came back
+    -- the file outlives its boots): the chunk written meanwhile pulled
     whole, the other found as its source's, nothing more;
   - a fourth host, d, booted late, invited into the registry and added to
     the NBS cluster, its cs taking its device in; a volume's two chunks

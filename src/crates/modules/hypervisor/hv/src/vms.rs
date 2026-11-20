@@ -169,6 +169,9 @@ struct CpuStats {
 /// What a VM's tasks and the commands that reach it share.
 pub struct Shared {
     id: u32,
+    /// What the hypervisor's file log calls it: `vm 3 (web)`, or `vm 3` for
+    /// one with no name of its own.
+    label: String,
     stop: AtomicBool,
     /// `hv stop` has it, or `hv stop all` or the unload: the VM stays on the
     /// list -- its CPUs counted where a new VM is placed, `hv off` and an
@@ -250,8 +253,30 @@ pub struct Shared {
 /// and a VM that stops and boots faster than that loses the oldest.
 const NOTES_MAX: usize = 32;
 
+/// Room for what the hypervisor's log calls a VM beside its name: `vm
+/// 4294967295 ()`.
+const LABEL_BYTES: usize = 24;
+
+/// Why a start failed, without the `vm <n> not started -- ` many of the
+/// reasons begin with: the log's line says that once, by the VM's name.
+fn why_alone(why: &str) -> &str {
+    let Some(rest) = why.strip_prefix("vm ") else { return why };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    match rest[digits..].strip_prefix(" not started -- ") {
+        Some(alone) if digits != 0 => alone,
+        _ => why,
+    }
+}
+
 impl Shared {
-    fn new(id: u32, log: bool, input: &[u8], cpus: u32, notes: bool) -> Option<Shared> {
+    fn new(id: u32, name: &str, log: bool, input: &[u8], cpus: u32, notes: bool) -> Option<Shared> {
+        let mut label = String::new();
+        label.try_reserve(name.len() + LABEL_BYTES).ok()?;
+        let _ = write!(label, "vm {}", id);
+        /* A VM with no folder is called `vm<number>`: said once */
+        if name.strip_prefix("vm").and_then(|n| n.parse::<u32>().ok()) != Some(id) {
+            let _ = write!(label, " ({})", name);
+        }
         let mut queue = VecDeque::new();
         queue.try_reserve_exact(INPUT_MAX).ok()?;
         /* `start` refused more than fits. */
@@ -264,6 +289,7 @@ impl Shared {
         }
         Some(Shared {
             id,
+            label,
             stop: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             held: AtomicU8::new(0),
@@ -904,7 +930,7 @@ fn vcpu(start: Start) {
             Ok(ran) => ran,
             Err(why) => {
                 let _ = write!(reason, "not run -- {}", why);
-                kcore::klog!(0, "hv: vm {} not run -- {}", shared.id, why);
+                kcore::flog!(crate::HV, "{} not run -- {}", shared.label, why);
                 drop(g);
                 stopped(&shared, reason, None, ended);
                 continue;
@@ -917,7 +943,7 @@ fn vcpu(start: Start) {
             let _ = guest::describe(&ran.stopped.stop, &mut reason);
             guest::report(&mut report, &g, &ran.stopped, &ran.counts, ran_ns);
         }
-        kcore::klog!(0, "hv: vm {} stopped after {} ms -- {}", shared.id, ran_ns / NS_PER_MS, reason);
+        kcore::flog!(crate::HV, "{} stopped after {} ms -- {}", shared.label, ran_ns / NS_PER_MS, reason);
         /* Its memory, its CPUs and its devices go back before anything else
          * is built: a reboot needs as much again. Every CPU's task is done,
          * so this is the last of the guest. */
@@ -942,6 +968,8 @@ fn vcpu(start: Start) {
             } else {
                 let _ = write!(reason, " -- reset {} times in {} s, left stopped",
                                burst.count, RESTART_WINDOW_NS / NS_PER_SEC);
+                kcore::flog!(crate::HV, "{} reset {} times in {} s -- left stopped", shared.label, burst.count,
+                             RESTART_WINDOW_NS / NS_PER_SEC);
                 None
             }
         } else {
@@ -978,7 +1006,7 @@ fn stopped(shared: &Shared, reason: String, report: Option<String>, ended: u64) 
 /// when there is one to keep.
 fn reboot(shared: &Shared, machine: &Machine, spec: &Spec, runner: &Runner, why: &str,
           report: Option<String>) -> Option<Built> {
-    kcore::klog!(0, "hv: vm {} restarting -- {}", shared.id, why);
+    kcore::flog!(crate::HV, "{} restarting -- {}", shared.label, why);
     let mut note = String::new();
     if note.try_reserve(why.len() + 24).is_ok() {
         let _ = write!(note, "booting again -- {}", why);
@@ -1003,7 +1031,7 @@ fn reboot(shared: &Shared, machine: &Machine, spec: &Spec, runner: &Runner, why:
             if reason.try_reserve(REASON_BYTES).is_ok() {
                 let _ = write!(reason, "restart failed -- {}", e);
             }
-            kcore::klog!(0, "hv: vm {} not restarted -- {}", shared.id, e);
+            kcore::flog!(crate::HV, "{} not restarted -- {}", shared.label, e);
             stopped(shared, reason, report, kcore::time::boot_time_ns());
             None
         }
@@ -1832,7 +1860,7 @@ impl Vms {
         core_hold.held_by(Holder::Vm(id));
         spec.name = String::from(name);
         spec.input.clear();
-        let shared = Shared::new(id, spec.log, &[], spec.cpus, logged)
+        let shared = Shared::new(id, name, spec.log, &[], spec.cpus, logged)
             .map(Arc::new)
             .ok_or_else(|| alloc::format!("vm {} not made -- out of memory for its console", id))?;
         let runner = Runner {
@@ -1932,9 +1960,29 @@ impl Vms {
     }
 
     /// Start the guest `spec` describes -- from its folder, given one, and
-    /// whether to keep its console.log there: its number, or why not.
-    fn launch(&self, machine: &Arc<Machine>, cores: &Cores, forwards: &Forwards, mut spec: Spec,
+    /// whether to keep its console.log there: its number, or why not, which
+    /// the hypervisor's log has too.
+    fn launch(&self, machine: &Arc<Machine>, cores: &Cores, forwards: &Forwards, spec: Spec,
               stored: Option<(Folder, bool)>, origin: Origin<'_>, out: &mut dyn Write) -> Result<u32, String> {
+        let mut who = String::new();
+        let _ = who.try_reserve(spec.kernel.len() + LABEL_BYTES);
+        match &stored {
+            Some((folder, _)) => {
+                let _ = write!(who, "vm {}", folder.name);
+            }
+            None => {
+                let _ = write!(who, "a vm of {}", spec.kernel);
+            }
+        }
+        let started = self.launch_one(machine, cores, forwards, spec, stored, origin, out);
+        if let Err(why) = &started {
+            kcore::flog_limited!(crate::HV, "{} not started -- {}", who, why_alone(why));
+        }
+        started
+    }
+
+    fn launch_one(&self, machine: &Arc<Machine>, cores: &Cores, forwards: &Forwards, mut spec: Spec,
+                  stored: Option<(Folder, bool)>, origin: Origin<'_>, out: &mut dyn Write) -> Result<u32, String> {
         /* A guest of a state is typed nothing at: what its vm.toml queues is
          * for its boot, long past. */
         if matches!(origin, Origin::State { .. }) {
@@ -1988,7 +2036,7 @@ impl Vms {
         }
 
         let logged = stored.as_ref().is_some_and(|(_, log)| *log);
-        let shared = Shared::new(id, spec.log, &spec.input, spec.cpus, logged)
+        let shared = Shared::new(id, &spec.name, spec.log, &spec.input, spec.cpus, logged)
             .map(Arc::new)
             .ok_or_else(|| alloc::format!("vm {} not started -- out of memory for its console", id))?;
         let not_started = |why: &dyn core::fmt::Display| alloc::format!("vm {} not started -- {}", id, why);
@@ -2283,6 +2331,13 @@ impl Vms {
             None => {
                 let _ = writeln!(out, "hv: vm {} started on {} -- {}", id, host_cpus, said);
             }
+        }
+        /* On the list, its guest running: a start that got this far */
+        match restored {
+            Some(what) => {
+                kcore::flog!(crate::HV, "{} restored on {} from {} -- {}", shared.label, host_cpus, what, said);
+            }
+            None => kcore::flog!(crate::HV, "{} started on {} -- {}", shared.label, host_cpus, said),
         }
         /* nos's ports it asks for, relayed to its own: each said as it is
          * added, or why not -- the guest runs either way. */

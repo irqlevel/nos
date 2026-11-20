@@ -11,6 +11,8 @@ mod ext4sys;
 mod find;
 mod format;
 mod fsops;
+mod limiter;
+mod logs;
 mod part;
 mod rootfs;
 mod shell;
@@ -54,4 +56,6 @@ pub static ALL: &[Target] = &[
     Target { name: "shell", run: audited!(shell::shell), max_len: 2048, gate: 2000 },
     Target { name: "rootfs", run: audited!(rootfs::rootfs), max_len: 256, gate: 3000 },
     Target { name: "format", run: audited!(format::format), max_len: 512, gate: 2000 },
+    Target { name: "logs", run: audited!(logs::logs), max_len: 2048, gate: 3000 },
+    Target { name: "limiter", run: audited!(limiter::limiter), max_len: 8192, gate: 3000 },
 ];

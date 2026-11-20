@@ -23,3 +23,5 @@ sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 base64ct = { version = "1", default-features = false }
 # The private key's bytes wiped when they are dropped.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# A certificate's validity as a date: the tree's one calendar.
+calendar = { path = "../../calendar" }

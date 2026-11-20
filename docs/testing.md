@@ -250,7 +250,7 @@ swallowing panic messages whole.
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hypervisor/hv/src/{insn,walk}.rs`), against the encodings clang gives |
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and its ACPI and SMBIOS tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on; and the virtio notifications, kicks and interrupts with EVENT_IDX and without, held to a Linux driver's every request served (`virtq`); and the guests' firewall, its crate to a model of its own (`firewall`) and the switch's use of it (`fwswitch`); and NAT's one to one (`onetoone`); and the cluster's networks on the switch (`vnetswitch`), the tunnel's datagram, each held to the wire built without vnetwire (`vnetwire`), and three hosts' tunnels over a hostile wire, public addresses across them through the real NAT among it, ports migrated between them (`tunnel`); a migrated port's flows on its new host's switch (`flowmove`); `--mutants` (by hand) then takes a hundred and four of the firewall's, one to one's, the cluster networks', the tunnel's, the public addresses' and a migration's network's rules out, each to be found |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate, its SFTP server, and the session's line editor -- fuzzed with overflow checks on, each protocol against a model of it |
-| `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and ext4 images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands and its `format`, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
+| `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and ext4 images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands and its `format`, `root=`, the file logs; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
 | `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by, and what a terminal types at the console's line editor, and the tracepoints' ring against a model and a writer thread, and the window `trace latency` reads of the rings against the truth of a schedule played out on them -- and the memory management under everything: the page tables and the physical page allocator past `setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them, and a VM kept in a folder (`hv create`, `hv start <name>`, its `console.log`), in `/vms` and in a folder `insmod /hv.ko vms=` names; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given, and a VM from its folder keeping the port it was given at its first start; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button, a press the guest declines pressed again and answered -- with `--disk`, the one nos's own poweroff presses, the guest's disk left mounted coming back clean; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs; `--mem` past 4064 with `--nos-mem`, a guest with RAM from 4 GiB; `--nos-iso`, nos booted from `make nos-test.iso TEST_ISO_ARGS=hugepages=...`, every guest's memory the huge pool's, 2 MiB an entry of its nested table |
 | `gpu-passthrough-test.py --host root@<machine> [--driver nvidia\|nouveau] [--gpu B:D.F] [--chip ga106]` | x86-64, by hand, on a machine with a GPU, from `nos-test.iso` (`iommu=on udpshell=9100 hugepages=5G`) | a host's PCI function given to a guest: nos under QEMU/KVM with QEMU's VT-d before the real GPU, the GPU in nos's guest -- NVIDIA's own driver, nvidia-smi and CUDA's deviceQuery, vectorAdd and matrixMul; or nouveau, its BARs, BOOT0, its GSP booted by DMA through the domain, a thousand fences on its MSIs |
@@ -288,6 +288,7 @@ how it works and what it found.
 | ext2 | `ext2-test.py` (arm64): lets `e2fsck` judge the image; its file data under a guest's disk -- holes filled, blocks written over, in batches, given back by the guest's `fstrim` -- `hv-linux-test.py --disk [--nvme-root]` (x86-64), which judges nos's root the same way, on virtio-blk and on NVMe |
 | ext4: `src/crates/layers/fs/src/ext4/` -- its mount, the checksums it holds every read to, the journal it reads through without replaying when mounted read-only; and what it writes through the journal: the transaction (`txn.rs`), the commit, checkpoint and abort and the replay at a mount for writing (`journal.rs`), allocation (`bitmaps.rs`), directories and their index dropped (`dirs.rs`), the extent tree edited a leaf at a time (`extents.rs`), create, rename and remove (`ops.rs`), a file's data, truncate and punch (`data.rs`), giving back at scale through the orphan list and its release at a mount (`orphans.rs`), freed runs and the punch's reserve (`bitmaps.rs`, `txn.rs`), a torn superblock (`mod.rs`); what holds a disk's image counted by the file in `vfs.rs` -- and the driver choice (`layers/fs/src/extfs.rs`: `root=`, the fallback layout, `mount`) | `fs-fuzz.py`'s `ext4` target (the driver read-only on the fuzzer's own images -- uninitialised groups with noise, deep extent trees, unwritten extents over noise, htree directories, entries the tree leaves out, journals holding the newest copies of blocks whose homes are noise, orphans on the list -- every answer the model's, nothing written), `ext4bad` (the images damaged: refused or walked, never a panic, a write or a leak), `ext4sys` (mounted for writing over a file whose extent names the filesystem's own blocks -- an inode table, the descriptors, the journal's log -- refused by every way to its data, a write, a read, a cut, a remove, a disk's image, those blocks left as they were) and `ext4rw` (mounted for writing, the journal replayed and the orphans released: names and data, files open, disks' images, files of two names, a disk all but full, every answer the model's -- a punch never refused for room on a disk that had ext4's reserve free -- the image a clean unmount leaves clean to the judge, no orphan left; the power cut at chosen requests and before every request of a call, each picture replayed by the judge and by the kernel, read-only and for writing, all three the same and clean, its tree what the call in flight may leave -- for a write every sector what it held or was given, nothing of another file's; requests that fail: a file's data block that does not write failing its call alone, any other write's failure and nothing written in that mount after it); `fs-fuzz.py --e2fsck` holds ext4rw's images, clean ones and pictures, to e2fsck. Then `ext4-test.py` (arm64, in CI): mke2fs's ext4 read from the shell, every file's CRC-32 the host's, `find` listing what the host made; names and data changed from the shell -- `fstest` among them -- and the image e2fsck -fn's clean, debugfs's extents what was written; a boot killed under its changes, its image replayed clean by e2fsck and by Linux, every file's MD5 the model's; a journal debugfs left unreplayed read through with the image's bytes unchanged; and orphans debugfs left released by a mount for writing, the image clean to e2fsck after; and a TiB filesystem with a 1 GiB journal mounted for writing -- what the mount holds of the geometry in pieces the kernel's heap gives, which no host-side fuzzer can refuse -- written and clean to e2fsck. After touching the driver choice, the smoke boots (their roots are ext4, ext2-test's ext2) and `fs-fuzz.py`'s `rootfs` |
 | the disk log | `disklog-test.py` (arm64): nothing else gives `disklog=on` |
+| the file logs (`src/crates/layers/fs/src/logs.rs`: the table of logs, the queue every log shares, the writer's task, a batch's append, the move along -- what goes old, what goes, the renames' order -- the lost lines and the boot said, a log that cannot be written said once and its lines to the kernel log, the start after the root and the stop before the unmount; their C ABI, `kernel_log_open` and `kernel_log_write`, and `kcore::logs`; `tail`, `logs`), and a line moved from the kernel log to one | `fs-fuzz.py`'s `logs` target (host, in CI): lines from tasks, interrupt handlers and the world, through the image's `Log`, a module's and the C ABI, before the writer starts, while it runs and after it stops, floods past the queue, logs held to small limits over a `/logs` with old files of theirs, others' files and things in the way, a file of theirs held open -- or a `/logs` that is a file, a root read-only or not there -- each line held to one place, its files, the kernel log or counted lost, in its file in the order written, stamped right by a calendar of the judge's own, its text as written; the boot said; the files within the move along's rules, renumbered, the newest kept, others' untouched; a failure said once a reason; `tail` the file's last lines. Twelve controls -- the budget's sum, a control character, the cut, the lost lines, a file filled past its limit, the renames' order, the epoch, the queue at the stop, a file held open, the lines counted twice or not at all, the boot -- each fail it; and the writer's timing -- a sync answered at once, a trickle written a second on, a burst of half the queue 200 ms on -- seven controls more. Then `sshd-test.py` (arm64, and `--arch x86_64`): the logins, TCP's accepts and an SFTP session's line in `/logs/net.log`, and none of them in dmesg. A place's limiter (`kcore::logs::Limiter`, `flog_limited!`): `fs-fuzz.py --target limiter` (host, in CI), each line against a model of the rules of its own, every held line said once, ten controls each failing it. A line moved to `/logs/hv.log` or `/logs/nbs.log`, or NBS's history (`modules/storage/nbs-mds/src/history.rs`): `nbs-test.py` (arm64, and `--arch x86_64`) reads nbs.log -- the metadata's history of a slow cs left in its sets, its joins' copies; `hv-linux-test.py` (x86-64, **manual**) reads hv.log |
 | the log path (`klog`), a net device, netconsole -- a panic's report sent to the next hop however old its ARP entry (`panic_flush`, `ArpTable::known`) | `netconsole-test.py` (arm64): on the Hetzner boxes it is the only console there is -- what a boot logs, a panic's report, and the halt's lines down to its own last; a panic more than five minutes into a silence, the next hop's entry past its time, only on the metal: `deadman N` with nothing sent meanwhile -- on Newton two such reports never came before `ArpTable::known` |
 | TCP, the HTTP client; TCP's loss recovery -- SACK and D-SACK, RACK-TLP, PRR, the undos, the table of what is in flight (`Sent` in `layers/net/src/tcp.rs`); the window it offers and takes in by (`offer_window`, `acceptable`) and silly window avoidance; a connection's buffers grown under way (`Tcp::grow`, `Buffers::Growable`) | `net-fuzz.py --target tcp` (host, in CI): a peer that takes SACK or not, says four blocks, fewer or none, and reneges now and then -- the machine held to SACKing only what reached it, D-SACKing only what reached it twice, and never sending again what an acknowledgement it had taken in told it was held; every connection's table, and the furthest edge its window offered -- within the receive buffer, no byte inside a window offered ever finding no room -- audited after every step. Then `tcp-test.py` (arm64); for the numbers, `tests/tcp-loss-bench.py` (arm64, HVF): two nos over hub.py, MB/s and each end's counters under loss, delay and reordering, against the tree before -- `--path` for the frames each way by size, `--trace`/`--show` for TCP's tracepoints, `--top` for the CPUs |
 | TCP's listening side, the module loader, the `ffi` declarations, `ssh`, `modules/net/sshd`; SFTP: `common/net/sftp`, a session's subsystem (`ssh::Subsystem`), and the file ABI at exactly the path given (`kernel_file_stat`, `kernel_file_open_flags`, `kernel_file_pwrite_grow`, `kernel_dir_make`, `kernel_file_unlink`, `kernel_dir_remove`; `Vfs::pwrite`, `Vfs::remove_one`, `OPEN_EXCLUSIVE`) | `sshd-test.py` (arm64); SFTP: `net-fuzz.py`'s `sftp` and `ssh` targets, and `fs-fuzz.py` for the file ABI (its `vfs` target), and for the numbers `sftp-bench.py` (arm64, HVF): a file into nos and back out over QEMU's user network, as it is and with round trips added (`--hold-us`, QEMU's filter-buffer), against the tree before (`--tree`) -- whose round trips past a few ms QEMU's own TCP holds to some 64 KiB in flight; the loader's unload order, the smoke boots (`test_module_unload`) and `cpp-fuzz.py --target module`. 78 checks pass; `connections past the four logging in are refused` flakes under load: stragglers of the probe burst land after its quiet window |
@@ -860,7 +861,10 @@ read back; then the connection killed under a change, which must turn up in
 must say it needs one. Files copied in and out over SFTP by OpenSSH's own
 `sftp -b` and `scp -s`: 8 MiB and some in and back out the same, by each;
 `ls -l` showing it at its size, `df`, a rename, the kernel's `ls` seeing
-it, the session's line in the log; a tree in and back out with `scp -r`;
+it, the session's line in `/logs/net.log` -- with the logins, TCP's
+accepts and the UDP shell's commands, after `logs sync`, and none of them in
+dmesg ([File logs](logs.md)) -- and `logs` listing net.log written; a tree in
+and back out with `scp -r`;
 an `rm` of `a` that leaves the `a.new` beside it (a file of its own, not a
 configuration file's next content); and the refusals, each said -- an `rm`
 of nothing (no such file), an `rmdir` of a directory with something in it,
@@ -869,7 +873,8 @@ permissions), a name of 64 bytes, and `scp -p`, whose times and mode cannot
 be kept -- then everything taken away again with `rm` and `rmdir`, a file
 and an empty directory at a time. On x86-64 it boots an
 ext4 root that already carries the module, a key and an `/etc/rc`, logs
-in, and copies a file in over SFTP and back out the same. It is also what notices a change to the `ffi` declarations that a module
+in, copies a file in over SFTP and back out the same, and finds the
+sessions' lines in `/logs/net.log` and not in dmesg. It is also what notices a change to the `ffi` declarations that a module
 was not rebuilt against: a module's header carries a digest of them. Needs
 `ssh`, `ssh-keygen`, `sftp` and `scp` (OpenSSH 8.7 or later, for `scp -s`)
 and host ports 2222, 8000 and 9000 free.
@@ -2491,6 +2496,74 @@ to the tree `e2fsck -fy` leaves. The targets:
   one. Its controls: the primary superblock written first fails within three
   inputs of each seed, barriers that do not flush within two, and a label
   given twice leaving the tail of the first within fifteen.
+- `logs` (`targets/logs.rs`): the file logs ([File logs](logs.md)) over a
+  ramfs root -- writable, read-only now and then, or none -- and a `/logs`
+  that is empty, a file, or holds the logs' old files of every number (gaps,
+  `.150`), others' files (`net.log.01`, `net.log.1.bak`, `other.txt`) and
+  directories by a log's names in the way. Four logs held to small limits,
+  made by the image's call or a module's after limits no log may have and
+  names no log may have are refused; lines -- text with characters of more
+  than a byte, bytes with control characters and bytes that are no UTF-8,
+  some past what a line carries -- written through the image's `Log`, a
+  module's `kcore::logs::Log` and the C ABI, from the world, from tasks of
+  their own yielding as they go and from interrupt handlers; before the
+  writer starts, while it runs and after it stops; floods past the queue;
+  `logs sync`, `logs`, sleeps past the writer's retries, a log's file and
+  its `.1` held open and let go. Each line's number is taken where nothing
+  can run between it and the queue, so the numbers are the queue's order;
+  then held: every line in exactly one place -- its log's files, the kernel
+  log, or counted lost -- and what is counted of the log adding up to what
+  was written to it; in its files in the order written, its stamp the wall
+  clock of the run read back by a calendar of the judge's own (the boot's
+  the boot clock's zero exactly), its text as written but for control
+  characters made `?` and a cut said -- where a character begins for a line
+  formatted; the boot said once before the boot's lines, and the lines lost
+  said; the newest file a line went into within its limit -- twice it, while
+  held open; after a move along the old ones numbered from 1, no more than
+  99, all of them within what is left beside a file and the one that went
+  old last, and within the total unless a file was past its own limit; the
+  newest of the files' old lines kept, in their order, and every file of no
+  log's as it was; a failure said once for each reason in a row, the read-only
+  root's, the missing one's and the file's in /logs' place by name; a line for
+  a log refused in the kernel log, once; `tail` the file's last lines. And
+  the writer's timing, on the machine's clock: `logs sync` answered within
+  100 ms, the gather cut short; on a quiet machine -- the input's tasks done,
+  everything before written -- a trickle of under ten lines not written half
+  a second on and written by a second and a half, a burst of half the queue
+  and more not written 100 ms on and written by 400. Its twelve controls --
+  the budget's sum, a control character left, the cut unsaid, lost lines
+  unsaid, a file filled a hundred bytes past its limit, the renames in the
+  old order, the epoch a second off, the queue left at the stop, a file held
+  open moved, lines counted twice or not at all, the boot unsaid -- and seven
+  of the gather's -- the queue half full not waking the writer, or not
+  cutting the gather short, a sync not cutting it short, no floor under a
+  burst's, the half-full mark never cleared, a gather of 200 ms, a gather
+  ended by any wake -- each fail within the gate's inputs; it found a move
+  along that renamed `.98` onto a `.3` not yet moved, which stopped half way.
+- `limiter` (`targets/limiter.rs`): the limiter `flog_limited!` holds a
+  place's lines to (`kcore::logs::Limiter`, [File logs](logs.md)), a new
+  one each input, against a model of the rules of its own: up to thirteen
+  kinds of line whose digits change -- one empty, one of digits alone,
+  some of characters of more than a byte, one longer than a line holds --
+  at times that stand still, creep, jump half a window, land one either
+  side of the place's window's end or a kind's, or leap; half the inputs a
+  flood whose windows hold some fifty lines, past the place's thirty; and
+  one line in eight asked of the limiter without the closed place's look,
+  as one that passed it on another CPU as the place's last line went.
+  Where an input has no more kinds than the limiter tells apart (eight),
+  each line goes or is held as the model says, with the count it says;
+  whatever the kinds, a line that goes says exactly the lines held since
+  the last, all of them, no place window lets more than thirty through,
+  and the line with its count before it is the start of the whole of it,
+  in a line's room, of whole characters, cut where and only where it does
+  not fit. Its ten controls -- each bound off by one (a kind's, the
+  place's, a window's end, the closed place's end), the count of lines held
+  while closed not kept or not said, digits counted in a kind, a window of
+  a kind's not ended, the count said one too many, the held count not
+  taken -- each fail within the gate's inputs; two more, the cut said again
+  and the closed mark cleared at a window's start, change nothing a line
+  can show (the count makes the cut itself, and the clock does not go
+  back).
 
 Each finding comes with the seed and iteration that make it again and the
 input in `out/fs-fuzz/findings/` -- `--replay TARGET FILE`, with `--trace` for

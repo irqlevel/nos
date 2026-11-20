@@ -11,6 +11,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use base64ct::{Base64, Encoding};
+use calendar::civil;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use sha2::{Digest, Sha256};
@@ -241,9 +242,8 @@ fn time(out: &mut Vec<u8>, secs: u64) -> Result<(), Error> {
     if secs > MAX_SECS {
         return Err(Error::BadTime);
     }
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let (y, m, d) = civil(days);
+    let rem = secs % calendar::SECS_PER_DAY;
+    let (y, m, d) = civil(secs / calendar::SECS_PER_DAY);
     let (hh, mm, ss) = (rem / 3600, rem / 60 % 60, rem % 60);
     let mut text = [0u8; 15];
     let mut n = 0;
@@ -252,7 +252,6 @@ fn time(out: &mut Vec<u8>, secs: u64) -> Result<(), Error> {
         text[n + 1] = b'0' + (v % 10) as u8;
         n += 2;
     };
-    let y = y as u64;
     let tag = if y < 2050 {
         two(y % 100, &mut text);
         UTC_TIME
@@ -266,21 +265,6 @@ fn time(out: &mut Vec<u8>, secs: u64) -> Result<(), Error> {
     }
     text[n] = b'Z';
     tlv(out, tag, &text[..n + 1])
-}
-
-/// The calendar date `days` after 1970-01-01 (H. Hinnant's
-/// civil_from_days): year, month 1-12, day 1-31.
-fn civil(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    (y, m, d)
 }
 
 /// An INTEGER of an unsigned big-endian number: leading zeros dropped, one

@@ -17,6 +17,10 @@ name = "bzimage"
 version = "0.1.0"
 
 [[package]]
+name = "calendar"
+version = "0.1.0"
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -106,6 +110,7 @@ name = "hv-fuzz"
 version = "0.1.0"
 dependencies = [
  "bzimage",
+ "calendar",
  "chacha20poly1305",
  "conf",
  "firewall",

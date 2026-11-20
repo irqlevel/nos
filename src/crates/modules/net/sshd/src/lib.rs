@@ -51,6 +51,13 @@ const USAGE: &str = "usage: sshd                     what it serves, and who is 
 const DEFAULT_PORT: u16 = 22;
 const DEFAULT_NIC: &str = "eth0";
 
+/// Where a session's lines go -- who came, who logged in, how each ended,
+/// what an SFTP copy did -- the network's file log, /logs/net.log, with
+/// TCP's (docs/logs.md): a port 22 on the internet is knocked on all day,
+/// and in the kernel log they crowded out everything else. What the server
+/// itself does -- started, stopped, its keys -- stays in the kernel log.
+static NET: kcore::logs::Log = kcore::logs::Log::new("net");
+
 const ETC_DIR: &str = "/etc";
 const SSH_DIR: &str = "/etc/ssh";
 const HOST_KEY_PATH: &str = "/etc/ssh/ssh_host_ed25519_key";
@@ -695,7 +702,7 @@ fn admit(shared: &Arc<Shared>, stream: TcpStream) {
         shared.sessions.with(|v| (v.len(), v.iter().filter(|s| s.user.is_none()).count()));
     if total >= MAX_SESSIONS || logging_in >= MAX_LOGGING_IN {
         shared.stats.refused.fetch_add(1, Ordering::Relaxed);
-        kcore::klog!(1, "sshd: {} refused: {} sessions, {} of them logging in", peer, total, logging_in);
+        kcore::flog!(NET, "sshd: {} refused: {} sessions, {} of them logging in", peer, total, logging_in);
         /* Reset, not closed: closing first on everyone turned away would
            keep a TCP slot a minute each, and run the kernel out of them */
         stream.abort();
@@ -761,12 +768,12 @@ extern "C" fn session_main(ctx: *mut u8) {
 
     let secs = boot_time_ns().saturating_sub(started) / NS_PER_SEC;
     match (&shell.user, result) {
-        (Some(user), Ok(())) => kcore::klog!(0, "sshd: {} from {} logged out after {} s", user, peer, secs),
-        (Some(user), Err(e)) => kcore::klog!(0, "sshd: {} from {} gone after {} s: {}", user, peer, secs, e),
+        (Some(user), Ok(())) => kcore::flog!(NET, "sshd: {} from {} logged out after {} s", user, peer, secs),
+        (Some(user), Err(e)) => kcore::flog!(NET, "sshd: {} from {} gone after {} s: {}", user, peer, secs, e),
         (None, Ok(())) => {}
         (None, Err(e)) => {
             shared.stats.unauthenticated.fetch_add(1, Ordering::Relaxed);
-            kcore::klog!(1, "sshd: {} gone before a login: {}", peer, e);
+            kcore::flog!(NET, "sshd: {} gone before a login: {}", peer, e);
         }
     }
 
@@ -898,7 +905,7 @@ impl ssh::Shell for KernelShell<'_> {
             .keys
             .with(|keys| keys.iter().find(|k| k.key == *key).map(|k| k.comment.clone()))
             .unwrap_or_default();
-        kcore::klog!(0, "sshd: {} logged in from {} with {} {}", user, self.peer, key.fingerprint(), comment);
+        kcore::flog!(NET, "sshd: {} logged in from {} with {} {}", user, self.peer, key.fingerprint(), comment);
     }
 
     fn run(&mut self, line: &str, io: &mut dyn ssh::Io) {
@@ -948,8 +955,8 @@ impl ssh::Subsystem for SftpSession {
 impl Drop for SftpSession {
     fn drop(&mut self) {
         let s = self.server.stats();
-        kcore::klog!(
-            0,
+        kcore::flog!(
+            NET,
             "sshd: {} from {}: sftp, {} files opened ({} to be written), {} bytes read and {} written, {} of {} requests refused",
             self.user, self.peer, s.opened, s.opened_to_write, s.read, s.written, s.refused, s.requests
         );
