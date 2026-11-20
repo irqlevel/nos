@@ -1014,6 +1014,15 @@ pub struct Guest {
     /// (`virtual_nmis`).
     nmi_window: bool,
 
+    /* A split lock of the guest's, under the host's split lock detection:
+     * the last exit's #AC was one -- not the guest's own alignment check --
+     * and the guest's next instruction is to be stepped with this CPU's
+     * detection off, by the monitor trap flag where the CPU has it
+     * (`step_split_lock`). */
+    split_lock_ac: bool,
+    split_lock_step: bool,
+    mtf: bool,
+
     /* What the last exit wrote, read out before VMCLEAR. */
     exit_reason: u32,
     exit_qual: u64,
@@ -1138,6 +1147,9 @@ impl Guest {
             tpr_threshold: 0,
             tpr_threshold_set: 0,
             nmi_window: false,
+            split_lock_ac: false,
+            split_lock_step: false,
+            mtf: false,
             exit_reason: 0,
             exit_qual: 0,
             exit_intr_info: 0,
@@ -1662,6 +1674,11 @@ impl Guest {
                 | PROC_USE_TSC_OFFSETTING,
             ctls_msr(basic, MSR_VMX_PROCBASED_CTLS, MSR_VMX_TRUE_PROCBASED_CTLS),
         );
+        /* The monitor trap flag, where the CPU has it: what steps a guest
+         * past its split lock with detection off for one instruction alone
+         * (`step_split_lock`); on only for that entry. */
+        self.mtf = adjust(PROC_MONITOR_TRAP_FLAG, ctls_msr(basic, MSR_VMX_PROCBASED_CTLS, MSR_VMX_TRUE_PROCBASED_CTLS))
+            & PROC_MONITOR_TRAP_FLAG != 0;
         /* Without the bitmap control every MSR exits, which is the safe way
          * round: the bitmap then lets nothing through, and the CPU ignores
          * the address. */
@@ -2244,6 +2261,59 @@ impl Guest {
         self.whole_state
     }
 
+    /// What the last exit says of split locks, read with the VMCS current
+    /// and on the CPU whose detection raised it: whether its #AC was one --
+    /// detection on here (`kcore::cpu::split_lock_detect_here`), and not the
+    /// guest's own alignment check, which is CR0.AM and RFLAGS.AC set in
+    /// ring 3 (SDM vol. 3A, 6.15: #AC); and the end of a step past one --
+    /// its MTF exit, or without the monitor trap flag any exit, the guest's
+    /// run with detection off over.
+    unsafe fn read_split_lock(&mut self) {
+        use vmcs::reason as r;
+        const CR0_AM: u64 = 1 << 18;
+        const RFLAGS_AC: u64 = 1 << 18;
+        const CPL_USER: u64 = 3;
+        const AR_DPL_SHIFT: u64 = 5;
+        const AR_DPL_MASK: u64 = 3;
+
+        let basic = self.exit_reason & r::BASIC_MASK;
+        if self.split_lock_step && (!self.mtf || basic == r::MONITOR_TRAP_FLAG) {
+            self.split_lock_step = false;
+        }
+
+        let info = self.exit_intr_info;
+        self.split_lock_ac = basic == r::EXCEPTION_NMI
+            && info & vmcs::intr::VALID != 0
+            && info & vmcs::intr::TYPE_MASK == vmcs::intr::TYPE_HW_EXCEPTION
+            && info & vmcs::intr::VECTOR_MASK == VECTOR_AC
+            && kcore::cpu::split_lock_detect_here();
+        if self.split_lock_ac {
+            /* CR0 as the guest reads it: the host's bits from the shadow */
+            let mask = self.cr0_mask;
+            let cr0 = unsafe { (vmcs::vmread(vmcs::GUEST_CR0) & !mask) | (vmcs::vmread(vmcs::CR0_READ_SHADOW) & mask) };
+            let cpl = (unsafe { vmcs::vmread(vmcs::GUEST_SS_AR) } >> AR_DPL_SHIFT) & AR_DPL_MASK;
+            let own = cr0 & CR0_AM != 0 && self.save.rflags & RFLAGS_AC != 0 && cpl == CPL_USER;
+            self.split_lock_ac = !own;
+        }
+    }
+
+    /// Whether the last exit's #AC was a split lock of the guest's, not its
+    /// own alignment check ([`read_split_lock`]): the run loop says so and
+    /// steps the guest past it rather than give it an #AC it never asked for
+    /// -- a Linux kernel that is handed one dies of it.
+    pub fn split_lock_ac(&self) -> bool {
+        self.split_lock_ac
+    }
+
+    /// The guest's next instruction -- the split lock it stopped at -- run
+    /// with this CPU's split lock detection off, and that alone: the monitor
+    /// trap flag on for the entry, the detection back on at its exit. A CPU
+    /// without the flag has detection off for the whole of the guest's next
+    /// run, to its next exit.
+    pub fn step_split_lock(&mut self) {
+        self.split_lock_step = true;
+    }
+
     /// Whether an exit ends the guest -- one the policy will dump, so the
     /// heavy state is worth reading. The common exits (I/O, CPUID, MSR, HLT,
     /// the host's interrupt, an interrupt window) are not among them, nor an
@@ -2623,7 +2693,8 @@ impl Guest {
             let nmi_window = self.nmi_window && self.pin & vmcs::PIN_VIRTUAL_NMIS != 0;
             let proc1 = self.proc1
                 | if self.irq_window { vmcs::PROC_INTR_WINDOW_EXITING } else { 0 }
-                | if nmi_window { vmcs::PROC_NMI_WINDOW_EXITING } else { 0 };
+                | if nmi_window { vmcs::PROC_NMI_WINDOW_EXITING } else { 0 }
+                | if self.split_lock_step && self.mtf { vmcs::PROC_MONITOR_TRAP_FLAG } else { 0 };
             if proc1 != self.synced.proc1 {
                 vmcs::vmwrite(vmcs::PROC_BASED_CTLS, proc1 as u64);
                 self.synced.proc1 = proc1;
@@ -2731,9 +2802,21 @@ impl Guest {
             let ran_with = entries.spec.load_guest(self.msrs.spec_ctrl());
             let ran_with = if self.msrs.measuring() { entries.spec.read_spec_ctrl() } else { ran_with };
             self.msrs.ran(ran_with);
+            /* Stepping past a split lock: this CPU's detection off for the
+             * guest's run -- one instruction, with the monitor trap flag --
+             * and on again the moment it exits, interrupts off throughout,
+             * so that the CPU is the same at the off and the on. Before the
+             * flush, which is to be the last thing before the entry. */
+            let stepping = self.split_lock_step;
+            if stepping {
+                kcore::cpu::split_lock_detect_set(false);
+            }
             speculation.flush_l1d();
             let failed = unsafe { vmx_launch_stub(&mut gpr, flags, spec_ctrl.unwrap_or(0)) };
             entries.spec.exited(spec_ctrl.is_some());
+            if stepping {
+                kcore::cpu::split_lock_detect_set(true);
+            }
             let t4 = stamp(timed);
             if failed != 0 {
                 break (failed, t3, t4);
@@ -2747,6 +2830,11 @@ impl Guest {
             self.exit_reason = reason;
             if reason & vmcs::reason::ENTRY_FAILURE == 0 {
                 self.launched.store(true, Ordering::Release);
+            }
+            /* No exit answered here while a step is under way: its MTF exit,
+             * or whatever came first, is the run loop's to see */
+            if stepping {
+                break (0, t3, t4);
             }
             let Some(f) = fast.as_deref_mut() else { break (0, t3, t4) };
             /* A WRMSR, past which nothing is owed; or a HLT with interrupts
@@ -2871,6 +2959,7 @@ impl Guest {
             } else if self.exit_reason & vmcs::reason::BASIC_MASK == vmcs::reason::EPT_VIOLATION {
                 unsafe { self.read_guest_fault() };
             }
+            unsafe { self.read_split_lock() };
             /* A machine check taken while the guest ran is the host's,
              * and the CPU did not deliver it: raise it, as the AMD side
              * does, to the handler that treats one as fatal. An NMI the

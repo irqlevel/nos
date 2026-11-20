@@ -114,6 +114,12 @@ public:
        the kernel; the CPUs run firmware's (arch/x86_64/microcode.h) */
     bool is_ucode_off();
 
+    /* splitlock=off -- x86: leave split lock detection off where the CPU
+       has it (hal::setup_split_lock_detect): a locked access across two
+       cache lines then goes by as the bus lock it is, in the kernel and in
+       guests, rather than a panic or a guest's warning */
+    bool is_split_lock_off();
+
     bool is_console_serial();
     bool is_console_vga();
     bool is_console_both();
@@ -292,6 +298,7 @@ private:
     bool c1e_firmware_;
     bool idle_mwait_;
     bool ucode_off_;
+    bool split_lock_off_;
     WxProbeMode wx_probe_md_;
     bool usb_off_;
     bool iommu_on_;

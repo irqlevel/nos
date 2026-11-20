@@ -48,6 +48,35 @@ bool setup_serializing_lfence()
     return false;
 }
 
+/* No split locks here: an atomic access that is not aligned to its size
+   faults whatever lines it would span. */
+bool setup_split_lock_detect(bool boot_cpu)
+{
+    (void)boot_cpu;
+    return false;
+}
+
+bool split_lock_detect_here()
+{
+    return false;
+}
+
+bool split_lock_detect_set(bool on)
+{
+    (void)on;
+    return false;
+}
+
+ulong split_lock_detect_cpus()
+{
+    return 0;
+}
+
+bool split_lock()
+{
+    return false;
+}
+
 bool setup_cpu_performance(CpuPerformance* out)
 {
     /* The clock is firmware's to set here, through PSCI and SCMI. */

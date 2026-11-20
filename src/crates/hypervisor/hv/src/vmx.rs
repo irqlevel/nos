@@ -340,6 +340,7 @@ impl Vcpu {
                 })
             }
             r::HLT => Exit::Hlt,
+            r::MONITOR_TRAP_FLAG => Exit::Stepped,
             r::EOI_INDUCED => Exit::Eoi { vector: (g.exit_qualification() & u64::from(u8::MAX)) as u8 },
             r::PAUSE => Exit::Pause,
             r::CPUID => Exit::Cpuid,
@@ -811,6 +812,19 @@ impl Vcpu {
     /// the run loop gives, and no single step's beside it.
     pub fn skip_icebp(&mut self) {
         self.step_over();
+    }
+
+    /// Whether the #AC that stopped the guest was a split lock of its own,
+    /// raised by the host's detection, and not its alignment check
+    /// (`Guest::split_lock_ac`).
+    pub fn split_lock_ac(&self) -> bool {
+        self.guest.split_lock_ac()
+    }
+
+    /// The split lock it stopped at run with this CPU's detection off for
+    /// that one instruction (`Guest::step_split_lock`).
+    pub fn step_split_lock(&mut self) {
+        self.guest.step_split_lock();
     }
 
     /// CR8 written for the guest -- its APIC's task priority, written
