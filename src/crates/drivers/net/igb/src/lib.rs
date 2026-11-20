@@ -812,10 +812,6 @@ fn log_negotiation(regs: &io::MmioRegion, phy_addr: u32) {
  * under the port's own semaphore: a chip with two ports has two PHYs, and a
  * bit for each, and the second port must not take the first's. */
 
-/* How long the I350's link is waited for at bring-up, as the other parts'
- * is in negotiate(): a hundred reads ten milliseconds apart. */
-const LINK_WAIT_US: u64 = 10_000;
-const LINK_WAIT_TRIES: u32 = 100;
 
 /// Which port of its chip this function is (STATUS.FUNC_ID: igb's bus.func).
 fn port_of(regs: &io::MmioRegion) -> u32 {
@@ -910,36 +906,13 @@ fn i350_start_link(regs: &io::MmioRegion, phy_addr: u32, port: u32, mask: u32) -
 
     klog!(0, "igb: I350 port {}: PHY {:#010x}{}, power management {:#x} -> {:#x}", port, id,
         if reset { ", reset" } else { "" }, phpm, regs.read32(PHPM));
-    if !advertised {
-        return false;
-    }
-
-    /* The wait for negotiation as the other parts have it, but the claim
-     * taken for each read of the PHY's status alone, as Linux reads this
-     * PHY (igb_read_phy_reg_82580): firmware -- which until DRV_LOAD is set
-     * still answers for the port -- is not kept from it for a second. A
-     * claim that cannot be had ends the wait rather than stretching it. */
-    let mut claimed = true;
-    let up = wait_for(LINK_WAIT_US, LINK_WAIT_TRIES, || {
-        if !swfw_acquire(regs, mask) {
-            claimed = false;
-            return true;
-        }
-        let bmsr = phy_read(regs, phy_addr, PHY_BMSR);
-        swfw_release(regs, mask);
-        matches!(bmsr, Some(v) if v & (BMSR_LSTATUS | BMSR_ANEGCOMPLETE) == (BMSR_LSTATUS | BMSR_ANEGCOMPLETE))
-    }) && claimed;
-
-    if !claimed {
-        klog!(0, "igb: port {}: lost the PHY semaphore to firmware while negotiation ran", port);
-    } else if !up {
-        klog!(0, "igb: port {}: auto-negotiation has not completed yet", port);
-    }
-    if swfw_acquire(regs, mask) {
-        log_negotiation(regs, phy_addr);
-        swfw_release(regs, mask);
-    }
-    up
+    /* Not waited for: negotiation takes seconds -- a gigabit link two or
+     * three -- and the second the other parts wait was never long enough
+     * to see it end, a second a port of the boot spent on a log line. The
+     * link announces itself through LSC, and handle_link_event says then
+     * what was offered and what came back, as Linux's igb reports the link
+     * from its watchdog rather than at probe. */
+    advertised
 }
 
 /// What auto-negotiation resolved to, worked out from the advertisement both
@@ -1679,9 +1652,20 @@ impl IgbDevice {
         if self.generation == Generation::I350 {
             /* Nothing to bring into step: with nothing forced and no
              * auto-speed detection the MAC takes the PHY's speed and duplex
-             * as the link resolves (see init_device). */
+             * as the link resolves (see init_device). What the negotiation
+             * came to, read under the port's claim as bring-up reads it --
+             * the poll's PHY reads are milliseconds, and this is a link's
+             * change, seldom. */
             klog!(0, "igb: {} (I350 port {}): link changed", self.name(), self.port);
             trace_link(regs);
+            if regs.read32(STATUS) & STATUS_LU != 0 {
+                if let Some(mask) = self.phy_sm {
+                    if swfw_acquire(regs, mask) {
+                        log_negotiation(regs, self.phy_addr);
+                        swfw_release(regs, mask);
+                    }
+                }
+            }
             return;
         }
 
