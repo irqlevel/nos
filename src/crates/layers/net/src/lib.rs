@@ -38,6 +38,12 @@ pub mod wget;
 /// The frame formats: a crate of their own, shared with the modules.
 pub use netwire as wire;
 
+/// The network's file log, `/logs/net.log` (docs/logs.md): a line a
+/// connection -- TCP's, made and reset; sshd's sessions -- which a machine
+/// on the internet has all day, and which would crowd the kernel log.
+/// sshd's lines go to it by its own `kcore::logs::Log` of the same name.
+pub static LOG: fs::logs::Log = fs::logs::Log::new("net");
+
 pub use device::{NetDriver, RxQueue, TxQueue};
 pub use frame::{Frame, FrameQueue};
 pub use nic::Nic;

@@ -177,6 +177,18 @@ class Test:
         print("  scp %s -> %d in %.1f s" % (" ".join(args), p.returncode, time.time() - start), flush=True)
         return p.returncode, err
 
+    def net_log(self, read, pattern, tries=5):
+        """The network's file log's newest lines, `read()` -- what is queued
+        written first -- until one matches `pattern`: a session's last line
+        goes in as its task ends, a moment after its client is done."""
+        out = ""
+        for _ in range(tries):
+            out = read()
+            if re.search(pattern, out, re.M):
+                break
+            time.sleep(1)
+        return out
+
     def sftp(self, sh):
         """Files copied in and out over SFTP (docs/sshd.md, "Copying files"):
         OpenSSH's sftp and scp, a file of several MiB both ways, a tree, a
@@ -202,9 +214,19 @@ class Test:
         rc, out, _ = self.ssh(["ls", "/sftp"])
         check("the kernel's shell sees it, at its size",
               rc == 0 and re.search(r"^f\s+%d\s+moved\.bin$" % SFTP_BIG, out, re.M) is not None, out)
-        out = sh.run("dmesg 20 sftp")
-        check("the session's line in the log", re.search(r"sshd: root from .*: sftp, \d+ files opened", out) is not None,
-              out)
+        # A session's lines -- the login, how it ended, what its SFTP did --
+        # in the network's file log, with TCP's connections, and not in the
+        # kernel log (docs/logs.md)
+        out = self.net_log(lambda: sh.run("logs sync") and sh.run("tail /logs/net.log 60"),
+                           r"sshd: root from .*: sftp, \d+ files opened")
+        check("the session's line in /logs/net.log", re.search(r"^\S+Z sshd: root from .*: sftp, \d+ files opened", out,
+                                                              re.M) is not None, out)
+        check("the logins and TCP's connections in it too", re.search(r"Z sshd: root logged in from ", out) is not None
+              and re.search(r"Z tcp: accepted 22 <- \d+$", out, re.M) is not None, out)
+        out = sh.run("dmesg 200 sshd:")
+        check("none of them in the kernel log", "logged in from" not in out and "files opened" not in out, out)
+        out = sh.run("logs")
+        check("logs lists net.log, written", re.search(r"^net\s+/logs/net\.log\s.*\swritten$", out, re.M) is not None, out)
 
         # scp, which speaks SFTP: in, and back out
         rc, err = self.scp([big, "root@127.0.0.1:/sftp/scp.bin"])
@@ -772,6 +794,15 @@ def x86_64(t):
         rc, out, err = t.sftp_batch(["put %s /sent.bin" % sent, "get /sent.bin %s" % back, "rm /sent.bin"])
         check("sftp: a file in and back out, the same bytes", rc == 0 and os.path.exists(back) and
               open(back, "rb").read() == data, (err + out)[-300:])
+        # The sessions' lines in the network's file log, and not in the
+        # kernel log (docs/logs.md)
+        out = t.net_log(lambda: t.ssh(["logs", "sync"]) and t.ssh(["tail", "/logs/net.log", "40"])[1],
+                        r"sshd: root from .*: sftp, \d+ files opened")
+        check("the sessions' lines in /logs/net.log", re.search(r"Z sshd: root logged in from ", out) is not None and
+              re.search(r"Z tcp: accepted 22 <- \d+$", out, re.M) is not None and
+              re.search(r"Z sshd: root from .*: sftp, \d+ files opened", out) is not None, out)
+        rc, out, _ = t.ssh(["dmesg", "200", "sshd:"])
+        check("none of them in the kernel log", rc == 0 and "logged in from" not in out, out)
     finally:
         kill(p)
 

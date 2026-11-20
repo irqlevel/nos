@@ -47,6 +47,7 @@ pub mod owner;
 pub mod events;
 pub mod system;
 pub mod fs;
+pub mod logs;
 mod lent;
 pub mod vnic;
 #[cfg(target_arch = "x86_64")]
