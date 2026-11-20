@@ -828,15 +828,25 @@ in the format crate the drivers read through, with no kernel in it:
 - `label=` is up to 16 printable characters, the last one given if several
   are; the UUID and the directory hash's seed come from the kernel's random
   pool (`kcore::random`), the UUID a version 4 one.
-- The inode tables and the journal are written whole, zeros where nothing
-  is yet, as `mkrootfs.sh` has mke2fs write them: nothing an earlier use of
-  the blocks left is ever read as either, and no group is left for a driver
-  to initialise.
+- ext4's inode tables are left as mke2fs leaves them by default
+  (`lazy_itable_init`): written only where the root's and lost+found's
+  inodes are, the first block of the first group's, each group's
+  `itable_unused` saying how much of its table was never written. A group
+  nothing is in is left uninitialised -- `INODE_UNINIT`, and `BLOCK_UNINIT`
+  but for the last group and the journal's -- its bitmaps not written, made
+  by whoever first takes from it. Nothing past `itable_unused` is read, by
+  nos's driver, Linux's or e2fsck, so what an earlier use of the blocks
+  left there is never taken for an inode; a new inode is the lowest free,
+  the part never written shrinking by one. A 2 TB disk's 29 GiB of tables,
+  written whole, took 17 minutes on an SMR disk. ext2's tables, every inode
+  of which e2fsck reads, and ext4's journal are written whole, zeros where
+  nothing is yet.
 
 The order of its writes is what makes one cut short harmless. The first
 zeros the device's first block, where a superblock was, and is flushed
-before anything else is written; then the inode tables, lost+found and the
-root, the journal, the bitmaps and the descriptors, the superblock's copies,
+before anything else is written; then the inode tables (ext4's first
+block), lost+found and the root, the journal, the bitmaps and the
+descriptors, the superblock's copies,
 and a flush; then the primary superblock, and a flush. A power cut or a
 failed request anywhere leaves no superblock -- nothing anything would mount
 -- or the whole filesystem, never a superblock over half of one; a request

@@ -13,11 +13,15 @@
 //! 64bit, no resize_inode: every group carries its own bitmaps and inode
 //! table, a descriptor is 32 bytes, and the filesystem cannot grow in
 //! place. ext2 is revision 1 with filetype, sparse_super and large_file.
-//! Every inode table and the journal are written whole, zeros where
-//! nothing is yet, as scripts/mkrootfs.sh has mke2fs write them
-//! (`lazy_itable_init=0`, `lazy_journal_init=0`): no group is left for a
-//! driver to initialise later, and nothing a former use of the blocks left
-//! is ever read as either.
+//! The journal is written whole, zeros where nothing is yet, and so are
+//! ext2's inode tables, every inode of which e2fsck reads. ext4's are left
+//! as mke2fs leaves them (`lazy_itable_init=1`): written only where inodes
+//! are in use, each group's itable_unused saying how much of its table was
+//! never written -- nothing past that is read, by nos's driver, Linux's or
+//! e2fsck -- and a group nothing is in left uninitialised, its bitmaps made
+//! by whoever first takes from it (INODE_UNINIT, and BLOCK_UNINIT but in
+//! the last group). A 2 TB disk is then made in seconds, where its 29 GiB of
+//! tables took 17 minutes to write on an SMR disk.
 //!
 //! The device's identity and the time are the caller's to give: this crate
 //! has neither a clock nor randomness.
@@ -28,7 +32,7 @@ use alloc::vec::Vec;
 use crate::dir::{self, FT_DIR};
 use crate::extent::{self, Header, Leaf};
 use crate::features::{compat, incompat, ro_compat};
-use crate::group::{self, DescMut, INODE_ZEROED};
+use crate::group::{self, DescMut, BLOCK_UNINIT, INODE_UNINIT};
 use crate::inode::{self, EXTENTS_FL, S_IFDIR, S_IFREG};
 use crate::jbd2;
 use crate::sb::{self, Super};
@@ -388,6 +392,21 @@ impl Layout {
         if g == 0 { u64::from(FIRST_INO) } else { 0 }
     }
 
+    /// Whether group `g` is left as mke2fs leaves a group no inode of which
+    /// is in use: its inode bitmap made by whoever first takes an inode of
+    /// it (INODE_UNINIT). ext4 alone: ext2 has no descriptor checksums to
+    /// say so by, and e2fsck reads every inode of it.
+    fn inode_uninit(&self, g: u64) -> bool {
+        self.kind == Kind::Ext4 && self.inodes_used_in(g) == 0
+    }
+
+    /// Whether group `g`'s block bitmap is left to be made as well
+    /// (BLOCK_UNINIT): nothing in its blocks but its own metadata, and not
+    /// the last group, which mke2fs never leaves so.
+    fn block_uninit(&self, g: u64) -> bool {
+        self.kind == Kind::Ext4 && g + 1 < self.groups && self.taken_in(g).is_empty()
+    }
+
     fn features(&self) -> (u32, u32, u32) {
         match self.kind {
             Kind::Ext4 => (
@@ -627,8 +646,17 @@ impl Layout {
         emit(Piece::Zeros { at: 0, len: if bs == MIN_BLOCK_SIZE { 2 * MIN_BLOCK_SIZE } else { bs } })?;
         emit(Piece::Barrier)?;
 
-        for g in 0..self.groups {
-            emit(Piece::Zeros { at: self.inode_table(g) * bs, len: self.itable_blocks * bs })?;
+        /* The inode tables: ext2's written whole, as e2fsck reads every
+         * inode of it. ext4's are written where inodes are in use alone --
+         * the first block of the first group's -- and left past that as
+         * mke2fs leaves them: each group's itable_unused says how much of its
+         * table was never written, and nothing past it is read, by nos's
+         * driver, Linux's or e2fsck. On a 2 TB disk that was 29 GiB of
+         * zeros, 17 minutes on an SMR disk. */
+        if self.kind == Kind::Ext2 {
+            for g in 0..self.groups {
+                emit(Piece::Zeros { at: self.inode_table(g) * bs, len: self.itable_blocks * bs })?;
+            }
         }
         emit(Piece::Bytes { at: self.inode_table(0) * bs, data: &self.inode_table_head(seed) })?;
 
@@ -648,16 +676,24 @@ impl Layout {
         /* The descriptors a block at a time -- a filesystem of many groups
          * has more of them than one allocation holds -- each block's groups'
          * bitmaps written as their checksums go into it, and the block then
-         * into every group that keeps a copy. */
+         * into every group that keeps a copy. A group left uninitialised has
+         * no bitmap written, and no checksum of one: whoever first takes an
+         * inode or a block of it makes it, as e2fsck reads it -- two blocks
+         * a group nothing writes, scattered over the whole disk. */
         let per_block = bs / DESC_SIZE;
         let copies: Vec<u64> = (0..self.groups).filter(|&g| has_backup(g)).collect();
         for k in 0..self.gdt_blocks {
             let mut gdt = vec![0u8; bs as usize];
             for g in k * per_block..((k + 1) * per_block).min(self.groups) {
-                let bb = self.block_bitmap_bytes(g);
-                let ib = self.inode_bitmap_bytes(g);
-                emit(Piece::Bytes { at: self.block_bitmap(g) * bs, data: &bb })?;
-                emit(Piece::Bytes { at: self.inode_bitmap(g) * bs, data: &ib })?;
+                let (block_uninit, inode_uninit) = (self.block_uninit(g), self.inode_uninit(g));
+                let bb = (!block_uninit).then(|| self.block_bitmap_bytes(g));
+                let ib = (!inode_uninit).then(|| self.inode_bitmap_bytes(g));
+                if let Some(bb) = &bb {
+                    emit(Piece::Bytes { at: self.block_bitmap(g) * bs, data: bb })?;
+                }
+                if let Some(ib) = &ib {
+                    emit(Piece::Bytes { at: self.inode_bitmap(g) * bs, data: ib })?;
+                }
                 let at = ((g - k * per_block) * DESC_SIZE) as usize;
                 let mut d = DescMut::new(&mut gdt[at..at + DESC_SIZE as usize]).ok_or("a descriptor of no size")?;
                 d.set_block_bitmap(self.block_bitmap(g));
@@ -667,10 +703,21 @@ impl Layout {
                 d.set_free_inodes_count((self.ipg - self.inodes_used_in(g)) as u32);
                 d.set_used_dirs_count(if g == 0 { 2 } else { 0 });
                 if self.kind == Kind::Ext4 {
-                    d.set_flags(INODE_ZEROED);
+                    let mut flags = 0;
+                    if block_uninit {
+                        flags |= BLOCK_UNINIT;
+                    }
+                    if inode_uninit {
+                        flags |= INODE_UNINIT;
+                    }
+                    d.set_flags(flags);
                     d.set_itable_unused((self.ipg - self.inodes_used_in(g)) as u32);
-                    d.set_block_bitmap_csum(group::block_bitmap_csum(&sb, &bb).ok_or("a block bitmap too short")?);
-                    d.set_inode_bitmap_csum(group::inode_bitmap_csum(&sb, &ib).ok_or("an inode bitmap too short")?);
+                    if let Some(bb) = &bb {
+                        d.set_block_bitmap_csum(group::block_bitmap_csum(&sb, bb).ok_or("a block bitmap too short")?);
+                    }
+                    if let Some(ib) = &ib {
+                        d.set_inode_bitmap_csum(group::inode_bitmap_csum(&sb, ib).ok_or("an inode bitmap too short")?);
+                    }
                     d.set_checksum(&sb, g as u32);
                 }
             }
