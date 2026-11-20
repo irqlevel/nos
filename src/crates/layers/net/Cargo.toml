@@ -19,3 +19,5 @@ tls = { path = "../tls" }
 fs = { path = "../fs" }
 # The management bus, which the layer's provider registers on.
 mgmt = { path = "../mgmt" }
+# /etc/net.toml, eth0's settings, is the strict TOML a vm.toml is.
+conf = { path = "../../common/text/conf" }

@@ -124,9 +124,6 @@ public:
     bool is_console_vga();
     bool is_console_both();
 
-    bool is_dhcp_auto();
-    bool is_dhcp_off();
-
     u16 get_udp_shell_port();
 
     /* netconsole=ip:port -- stream the kernel log to that collector */
@@ -196,23 +193,10 @@ public:
     int get_log_level();
     static const int DEFAULT_LOG_LEVEL = 1;
 
-    bool is_dns_enabled();
-
-    /* dns=A.B.C.D -- the resolver's server, given rather than taken from a
-       DHCP lease, and dns=on with it. Host byte order; 0 when none was
-       given, and then a lease's is used (dns=on). */
-    u32 get_dns_server();
-
-    /* ip=A.B.C.D/N -- a static address on eth0 and its prefix length, for
-       a network that hands out none by DHCP: put on the device as the
-       network's services start, before the netconsole sends a line, and
-       dhcp=auto then leaves eth0 alone. gw=A.B.C.D -- the default gateway,
-       which has to be on that subnet: one that is not, or one given without
-       an address, is named in the log and dropped. Host byte order; 0 when
-       not given. */
-    u32 get_static_ip();
-    u32 get_static_mask();
-    u32 get_static_gateway();
+    /* ip=, gw=, dns= and dhcp= are eth0's settings, read off the line by the
+       network layer itself (layers/net/src/settings.rs): here they are only
+       known keys, and /etc/net.toml on the root takes their place where
+       there is one. */
 
     /* root=auto | <device> | LABEL=<label> | UUID=<uuid>: what to mount on /
        (see fs/rootfs.cpp). Value holds the device name or label; Uuid the
@@ -273,12 +257,6 @@ private:
         WxProbeHeap,   /* execute from a page the heap handed out */
     };
 
-    enum DhcpMode {
-        DhcpOn = 0,    /* start only by cmd (default) */
-        DhcpAuto,      /* start automatically at boot */
-        DhcpOff,       /* disabled entirely */
-    };
-
     enum ZeroFreeMode {
         ZeroFreeOn = 0,
         ZeroFreeOff,
@@ -307,7 +285,6 @@ private:
     ulong guest_pci_count_;
     bool rc_off_;
     ConsoleMode con_mode_;
-    DhcpMode dhcp_md_;
     u16 udp_shell_port_;
     u32 netconsole_ip_;
     u16 netconsole_port_;
@@ -322,11 +299,6 @@ private:
     bool mem_sites_;
     bool rx_poll_;
     int log_level_;
-    bool dns_enabled_;
-    u32 dns_server_;
-    u32 static_ip_;
-    u32 static_mask_;
-    u32 static_gw_;
     RootSpec root_;
     bool root_read_only_;
     bool fs_test_;
@@ -337,7 +309,5 @@ private:
     static bool parse_uuid(const char* text, u8* out);
     bool parse_huge_pool(const char* value);
     bool parse_guest_pci(const char* value);
-    bool parse_static_ip(const char* value);
-    void check_static_gateway();
 };
 }
