@@ -39,7 +39,12 @@ const W_ROTATION: usize = 217;
 const GENERAL_NOT_ATA: u16 = 1 << 15;
 /// Word 49 bit 9: LBA addressing, which every disk worth taking has.
 const CAP_LBA: u16 = 1 << 9;
-/// Words 82..87 and 106 are valid when bit 14 is set and bit 15 clear.
+/// Words 83, 84, 87 and 106 are valid when bit 14 is set and bit 15 clear.
+/// Words 82 and 85 carry no such mark -- their bit 14 says the disk has the
+/// NOP command, which many have not (Seagate's ST2000VX015) -- and are valid
+/// when word 83 is: what Linux takes (`ata_id_has_wcache`), where ACS-3
+/// vouches for 85 by 87. Word 82's own bits taken for its mark said "none"
+/// of such a disk's write cache, present and on.
 const VALID_MASK: u16 = 0xC000;
 const VALID: u16 = 0x4000;
 /// Word 82/85 bit 5: a volatile write cache, supported / enabled.
@@ -203,8 +208,8 @@ impl Identify {
             Flush::None
         };
 
-        let write_cache = (valid(cmd1) && cmd1 & CMD1_WRITE_CACHE != 0)
-            .then_some(valid(enabled1) && enabled1 & CMD1_WRITE_CACHE != 0);
+        let write_cache = (cmd2_valid && cmd1 & CMD1_WRITE_CACHE != 0)
+            .then_some(enabled1 & CMD1_WRITE_CACHE != 0);
 
         let sata = words[W_SATA_CAPABILITIES];
         let ncq_depth = (sata != 0 && sata != 0xFFFF && sata & SATA_NCQ != 0)
