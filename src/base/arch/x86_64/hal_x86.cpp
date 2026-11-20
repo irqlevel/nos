@@ -117,15 +117,8 @@ ulong cycle_counter_hz()
 
 bool setup_serializing_lfence()
 {
-    static const u32 LEAF_VENDOR = 0;
     static const u32 LEAF_FEATURES = 1;
     static const u32 FEATURES_ECX_HYPERVISOR = 1U << 31;
-    /* "AuthenticAMD" and "HygonGenuine", as EBX, EDX, ECX give them. */
-    static const u32 AMD_EBX = 0x68747541, AMD_EDX = 0x69746E65, AMD_ECX = 0x444D4163;
-    static const u32 HYGON_EBX = 0x6F677948, HYGON_EDX = 0x6E65476E, HYGON_ECX = 0x656E6975;
-    static const u32 FAMILY_SHIFT = 8, FAMILY_MASK = 0xF;
-    static const u32 EXT_FAMILY_SHIFT = 20, EXT_FAMILY_MASK = 0xFF;
-    static const u32 FAMILY_EXTENDED = 0xF;
     /* The first family with the MSR, and the one after it without: 11h
        (Griffin) has no DE_CFG, and serializes LFENCE as 0Fh does. */
     static const u32 FAMILY_FIRST_DE_CFG = 0x10;
@@ -133,18 +126,14 @@ bool setup_serializing_lfence()
     static const u32 AMD_DE_CFG_MSR = 0xC0011029;
     static const u64 DE_CFG_LFENCE_SERIALIZE = 1ULL << 1;
 
-    CpuidResult v = cpuid(LEAF_VENDOR);
-    bool amd = v.ebx == AMD_EBX && v.edx == AMD_EDX && v.ecx == AMD_ECX;
-    bool hygon = v.ebx == HYGON_EBX && v.edx == HYGON_EDX && v.ecx == HYGON_ECX;
-    if (!amd && !hygon)
+    CpuVendor vendor = cpu_vendor();
+    if (vendor != CpuVendor::Amd && vendor != CpuVendor::Hygon)
         return false;
 
     CpuidResult f = cpuid(LEAF_FEATURES);
     if (f.ecx & FEATURES_ECX_HYPERVISOR)
         return false;
-    u32 family = (f.eax >> FAMILY_SHIFT) & FAMILY_MASK;
-    if (family == FAMILY_EXTENDED)
-        family += (f.eax >> EXT_FAMILY_SHIFT) & EXT_FAMILY_MASK;
+    u32 family = cpu_family(f);
     if (family < FAMILY_FIRST_DE_CFG || family == FAMILY_GRIFFIN)
         return false;
 
@@ -368,10 +357,6 @@ bool setup_cpu_c1e(bool* was_on, bool* on)
     static const u32 LEAF_POWER = 6;
     static const u32 FEATURES_ECX_HYPERVISOR = 1U << 31;
     static const u32 POWER_EAX_HWP = 1U << 7;
-    /* "GenuineIntel", as EBX, EDX and ECX give it */
-    static const u32 INTEL_EBX = 0x756E6547;
-    static const u32 INTEL_EDX = 0x49656E69;
-    static const u32 INTEL_ECX = 0x6C65746E;
     /* MSR_POWER_CTL, every Intel core since Nehalem's; bit 1 lets the CPU
        turn a C1 request into C1E (SDM vol. 4) */
     static const u32 POWER_CTL_MSR = 0x1FC;
@@ -386,7 +371,7 @@ bool setup_cpu_c1e(bool* was_on, bool* on)
     if (!idle_mwait_on)
         return false;
     CpuidResult vendor = cpuid(LEAF_VENDOR);
-    if (vendor.ebx != INTEL_EBX || vendor.edx != INTEL_EDX || vendor.ecx != INTEL_ECX || vendor.eax < LEAF_POWER)
+    if (cpu_vendor(vendor) != CpuVendor::Intel || vendor.eax < LEAF_POWER)
         return false;
     if (cpuid(LEAF_FEATURES).ecx & FEATURES_ECX_HYPERVISOR)
         return false;
@@ -623,8 +608,7 @@ void print_cpu_info(stdlib::Printer& con)
        different things here, and CPUID.0AH on an AMD part reads back as
        zeroes -- printing it there would say "no counters" about a machine
        that has six. */
-    static const u32 AMD_VENDOR_EBX = 0x68747541;   /* "Auth" */
-    if (r0.ebx == AMD_VENDOR_EBX)
+    if (cpu_vendor(r0) == CpuVendor::Amd)
     {
         /* Fn8000_0022 is PerfMonV2: global control and status, Zen 4 and
            later, and the only place AMD states a counter count. Without it
@@ -771,8 +755,9 @@ void console_out_clear()
 
 void console_write(const char *msg)
 {
+    /* Into the serial ring; out of it by the UART's interrupt once that is
+       set up, and before that at once */
     kernel::Serial::get_instance().print_string(msg);
-    kernel::Serial::get_instance().flush();
 
     /* The boot trace goes out the serial port and is mirrored on the screen
        only on request -- redrawing glyphs for every line costs a full
@@ -809,6 +794,10 @@ void power_off()
        its isa-debug-exit device */
     static const u16 QEMU_PM1A_CNT = 0x604;
     static const u16 QEMU_DEBUG_EXIT = 0xF4;
+
+    /* What the serial ring holds out now, and every line after this at
+       once: the next instant may be the machine's last */
+    kernel::Serial::get_instance().stop_tx_interrupt();
 
     auto& acpi = kernel::Acpi::get_instance();
     const ulong pm1a = acpi.get_pm1a_cnt_port();
@@ -869,6 +858,7 @@ void power_off()
 void reset()
 {
     klog(0, "Reboot");
+    kernel::Serial::get_instance().stop_tx_interrupt();
     reset_now();
 }
 
