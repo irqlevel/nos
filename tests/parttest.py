@@ -52,8 +52,11 @@ SHELL_LAST = 1
 # The MBR disk: a partition to put a filesystem on, and a smaller one kept
 # raw, marked at its first sector
 MBR_PARTS = ((2048, 147456, 0x83), (155648, 8192, 0x83))
-# The GPT disk: first and last LBA, last included
-GPT_PARTS = ((2048, 10239), (10240, 14335))
+# The GPT disk: first and last LBA, last included, and the slot of the table
+# where it is not its place in this list. The third is in slot 11 --
+# partition 12 -- past the eight slots the probe used to read, which left
+# the rest of a disk cut into more unseen and said nothing.
+GPT_PARTS = ((2048, 10239), (10240, 14335), (14336, 16383, 11))
 
 # "Linux filesystem data" (0FC63DAF-8483-4772-8E79-3D69D8477DE4), stored the
 # way a GPT stores it: the first three fields little-endian.
@@ -134,11 +137,17 @@ def mbr_image(path):
         put(path, start, marker(i + 1))
 
 
+def gpt_slot(i, part):
+    """The table slot of the i-th of GPT_PARTS: its own where it names one."""
+    return part[2] if len(part) > 2 else i
+
+
 def gpt_image(path, size_mb=GPT_DISK_MB, parts=GPT_PARTS, unique=gpt_unique, disk_guid=DISK_GUID, marked=True):
     """A GPT disk: the protective MBR that says to look at LBA 1, a header
     with the checksum the kernel verifies, and an entry array -- this test's
-    two partitions, or `parts` (first and last LBA each) of `size_mb`, the
-    i-th's unique GUID `unique(i)`, as nbs-test.py makes its hosts' pools."""
+    partitions, or `parts` (first and last LBA each, and a slot of the table
+    where it is not the i-th) of `size_mb`, the i-th's unique GUID
+    `unique(i)`, as nbs-test.py makes its hosts' pools."""
     total = size_mb * 1024 * 1024 // SECTOR
     sparse(path, size_mb * 1024 * 1024)
 
@@ -154,8 +163,9 @@ def gpt_image(path, size_mb=GPT_DISK_MB, parts=GPT_PARTS, unique=gpt_unique, dis
     put(path, 0, bytes(sector))
 
     entries = bytearray(128 * 128)
-    for i, (first, last) in enumerate(parts):
-        at = i * 128
+    for i, part in enumerate(parts):
+        first, last = part[0], part[1]
+        at = gpt_slot(i, part) * 128
         entries[at:at + 16] = LINUX_DATA_GUID
         entries[at + 16:at + 32] = unique(i)
         entries[at + 32:at + 40] = struct.pack("<Q", first)
@@ -180,8 +190,8 @@ def gpt_image(path, size_mb=GPT_DISK_MB, parts=GPT_PARTS, unique=gpt_unique, dis
     put(path, 1, bytes(header))
 
     if marked:
-        for i, (first, _last) in enumerate(parts):
-            put(path, first, marker(i + 1))
+        for i, part in enumerate(parts):
+            put(path, part[0], marker(i + 1))
 
 
 class Shell:
@@ -292,8 +302,15 @@ def expected_parts():
     is what keeps this test from caring which disk QEMU hands the kernel
     first (arm64 gives the virtio-mmio slots out in reverse)."""
     mbr = [(start, count) for start, count, _type in MBR_PARTS]
-    gpt = [(first, last - first + 1) for first, last in GPT_PARTS]
+    gpt = [(part[0], part[1] - part[0] + 1) for part in GPT_PARTS]
     return mbr, gpt
+
+
+def expected_numbers():
+    """The number each table's partitions are named by: an MBR's its entry's,
+    a GPT's its slot's, one up."""
+    return ([i + 1 for i in range(len(MBR_PARTS))],
+            [gpt_slot(i, part) + 1 for i, part in enumerate(GPT_PARTS)])
 
 
 def log_checks(log):
@@ -308,16 +325,17 @@ def log_checks(log):
             parts[found.group(1)] = (int(found.group(2)), int(found.group(3)))
 
     mbr, gpt = expected_parts()
-    check("log: the four partitions written, and only those",
+    check("log: the %d partitions written, and only those" % (len(mbr) + len(gpt)),
           sorted(parts.values()) == sorted(mbr + gpt), traced)
 
-    for name, pair in (("mbr", mbr), ("gpt", gpt)):
-        on = [n for n, p in parts.items() if p in pair]
-        check("log: the %s pair is on one disk, numbered 1 and 2" % name,
-              len(on) == 2 and sorted(n[-1] for n in on) == ["1", "2"]
-              and on[0][:-1] == on[1][:-1], traced)
+    for name, pairs, numbers in zip(("mbr", "gpt"), (mbr, gpt), expected_numbers()):
+        on = [n for n, p in parts.items() if p in pairs]
+        disk = os.path.commonprefix(on) if on else ""
+        got = sorted(int(n[len(disk):]) for n in on if n[len(disk):].isdigit())
+        check("log: the %s partitions are on one disk, numbered %s" % (name, ", ".join(map(str, numbers))),
+              len(on) == len(pairs) and got == sorted(numbers), traced)
 
-    check("log: nothing on the table-less root disk", len(parts) == 4, traced)
+    check("log: nothing on the table-less root disk", len(parts) == len(mbr) + len(gpt), traced)
     check("log: three disks looked at", "on 3 disks" in text, traced)
     return parts
 
@@ -358,8 +376,8 @@ def shell_checks(sh, parts):
     # Each partition's id in `disks`: a GPT one's unique GUID as its text,
     # an MBR one's the disk's signature and its number.
     lines = {l.split()[0]: l for l in listing.splitlines() if l.split()}
-    for i in range(len(GPT_PARTS)):
-        name = gpt_disk[0] + str(i + 1)
+    for i, part in enumerate(GPT_PARTS):
+        name = gpt_disk[0] + str(gpt_slot(i, part) + 1)
         want = "part:" + str(uuid.UUID(bytes_le=gpt_unique(i)))
         check("disks gives %s its GUID as its id, %s" % (name, want), want in lines.get(name, ""), listing)
     for i in range(len(MBR_PARTS)):
@@ -376,7 +394,7 @@ def shell_checks(sh, parts):
     check("the gpt header checksum was accepted", "MISMATCH" not in out, out)
     check("the gpt table names the type guid",
           "0FC63DAF-8483-4772-8E79-3D69D8477DE4" in out, out)
-    check("the gpt table has both entries",
+    check("the gpt table has every entry, the one in slot 11 among them",
           all(str(start) in out for start, _c in gpt), out)
 
     # The offset: a partition's sector 0 is its first sector on the disk
