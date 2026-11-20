@@ -762,7 +762,14 @@ on on every entry, whatever the VMCB says:
   to -- and the CPU then loops inside the delivery, where no instruction
   ever ends and no interrupt, NMI included, is ever taken: the host has lost
   the CPU (CVE-2015-8104 and CVE-2015-5307, which KVM closes the same way).
-  Giving them back to a guest that expects them is the policy's to do;
+  Giving them back to a guest that expects them is the policy's to do --
+  but for an #AC under VT-x on a host that detects split locks, which is
+  not the guest's own alignment check (CR0.AM and RFLAGS.AC in ring 3) but
+  the host's detection of a split lock: that one is said in the log, once
+  every five seconds a VM at most, and the guest stepped past it with the
+  detection off for that instruction alone, by the monitor trap flag
+  (`Guest::read_split_lock`, `step_split_lock`; [Boot](boot.md#split-locks)).
+  The `splitlock` built-in guest is the check;
 - the intercept of #MC -- and since an intercepted machine check is not
   delivered to the host by the CPU, `run` raises vector 18 itself before
   interrupts come back on, into the kernel's own handler, which panics;
