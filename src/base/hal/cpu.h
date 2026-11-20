@@ -123,6 +123,42 @@ namespace hal
    Defined per arch. */
 bool setup_serializing_lfence();
 
+/* Split lock detection, on the CPU this runs on, once its local APIC says
+   which CPU it is. A split lock -- a locked access across two cache lines --
+   takes the bus from every core while it runs: a guest's spinning on one
+   slows every other guest and the host, and the kernel's is a bug. x86
+   Intel parts that detect them -- IA32_CORE_CAPABILITIES (MSR 0xCF, there
+   where CPUID.7.0:EDX[30] says) bit 5: Ice Lake and Tiger Lake, Alder and
+   Raptor Lake on -- raise #AC on one once MSR_TEST_CTRL (0x33) bit 29 is
+   set, which this sets, and checks it took: an #AC in the kernel is then a
+   panic that says so (ExceptionTable::exc_alignment_check), one in a guest a
+   VM exit (hv). Not with splitlock=off; on an AP not where the boot CPU's
+   did not; not under a hypervisor, as Linux has it. arm64, AMD, Intel
+   before those: false. True when it is on. */
+bool setup_split_lock_detect(bool boot_cpu);
+
+/* Whether the CPU this runs on had split lock detection turned on at its
+   bring-up -- whatever a hypervisor's step past a guest's split lock has
+   done to the MSR since, which this does not read. */
+bool split_lock_detect_here();
+
+/* Split lock detection on this CPU on or off, where its bring-up turned it
+   on: off for the one guest instruction a hypervisor steps past its split
+   lock with, on again at the exit. The MSR is the core's -- an SMT sibling
+   goes without it meanwhile too. Interrupts off, so that it is this CPU's
+   throughout. False, nothing written, where this CPU has it not. */
+bool split_lock_detect_set(bool on);
+
+/* The CPUs, by hardware id, whose bring-up turned split lock detection on:
+   for the boot's line of how many have it */
+ulong split_lock_detect_cpus();
+
+/* A locked add of 0 across two cache lines, for `panic splitlock`: an #AC
+   where detection is on, which panics; true where it ran through -- no
+   detection on this CPU -- and false where the architecture has no such
+   access to make (arm64: an atomic there faults on any misalignment). */
+bool split_lock();
+
 /* What setup_cpu_performance left a CPU asking for: on x86 with HWP, the
    range of performance levels it now picks its own clock from -- lowest to
    highest, turbo included -- and the level it guarantees, all in the CPU's

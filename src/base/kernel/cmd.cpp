@@ -2066,9 +2066,17 @@ static void cmd_panic(const char* args, stdlib::Printer& con)
         con.printf("running out of stack...\n");
         con.printf("%lu frames deep, and still a stack\n", panic_overflow(0));
     }
+    else if (stdlib::str_cmp(type, "splitlock") == 0)
+    {
+        con.printf("a locked add across two cache lines...\n");
+        if (hal::split_lock())
+            con.printf("no #AC: split lock detection is not on this cpu\n");
+        else
+            con.printf("no split lock here: an atomic access is aligned or faults on this architecture\n");
+    }
     else
     {
-        con.printf("usage: panic [pf|div0|ud|df|offstack|overflow]\n");
+        con.printf("usage: panic [pf|div0|ud|df|offstack|overflow|splitlock]\n");
         con.printf("  (no arg) - direct panic\n");
         con.printf("  pf       - page fault (null deref)\n");
         con.printf("  div0     - divide by zero\n");
@@ -2076,6 +2084,7 @@ static void cmd_panic(const char* args, stdlib::Printer& con)
         con.printf("  df       - double fault, on its own stack (x86-64)\n");
         con.printf("  offstack - panic on a stack that is no task's\n");
         con.printf("  overflow - run this task's stack out, into the page under it\n");
+        con.printf("  splitlock - a locked add across two cache lines (x86-64, split lock detection on)\n");
     }
 }
 
@@ -2567,7 +2576,7 @@ static const CmdEntry COMMANDS[] = {
     { "rc",        cmd_rc,        "rc [add <command line>|del <n>|clear|run] - show or edit /etc/rc, run at boot" },
     { "version",   cmd_version,   "version - show kernel version" },
     { "bt",        cmd_bt,        "bt <pid> - show task backtrace" },
-    { "panic",     cmd_panic,     "panic [pf|div0|ud|df|offstack|overflow] - trigger kernel panic" },
+    { "panic",     cmd_panic,     "panic [pf|div0|ud|df|offstack|overflow|splitlock] - trigger kernel panic" },
     { "poweroff",  cmd_poweroff,  "poweroff - power off (ACPI S5)" },
     { "shutdown",  cmd_poweroff,  nullptr },
     { "reboot",    cmd_reboot,    "reboot - reset system" },

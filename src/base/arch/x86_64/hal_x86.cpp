@@ -4,6 +4,7 @@
 #include <hal/mmu.h>
 #include <hal/module.h>
 #include <hal/pmu.h>
+#include <hal/irqchip.h>
 #include <arch/x86_64/pmu.h>
 
 #include <arch/x86_64/asm.h>
@@ -141,6 +142,109 @@ bool setup_serializing_lfence()
     if (cfg & DE_CFG_LFENCE_SERIALIZE)
         return false;
     write_msr(AMD_DE_CFG_MSR, cfg | DE_CFG_LFENCE_SERIALIZE);
+    return true;
+}
+
+namespace
+{
+
+/* CPUID.(EAX=7,ECX=0):EDX[30]: IA32_CORE_CAPABILITIES is there to read, and
+   its bit 5 that the part raises #AC on a split lock once MSR_TEST_CTRL's
+   bit 29 asks it to (SDM vol. 4, 2.1 and vol. 3A, 9.13) */
+const u32 LEAF_STRUCTURED = 7;
+const u32 STRUCTURED_EDX_CORE_CAPABILITIES = 1U << 30;
+const u32 CORE_CAPABILITIES_MSR = 0xCF;
+const u64 CORE_CAPABILITIES_SPLIT_LOCK_DETECT = 1ULL << 5;
+const u32 TEST_CTRL_MSR = 0x33;
+const u64 TEST_CTRL_SPLIT_LOCK_DETECT = 1ULL << 29;
+
+/* The CPUs, by local APIC id, whose bring-up turned detection on: a bit
+   each, set once and never cleared -- what the MSR says at any moment is
+   not it, a hypervisor's step past a guest's split lock turning the core's
+   off for an instruction */
+const ulong SPLIT_LOCK_CPUS = 64;
+u64 split_lock_cpus;
+/* The boot CPU's turned on: the APs follow it, and none where it did not */
+bool split_lock_boot;
+
+bool cpu_detects_split_locks()
+{
+    static const u32 LEAF_FEATURES = 1;
+    static const u32 FEATURES_ECX_HYPERVISOR = 1U << 31;
+
+    /* Not under a hypervisor, as Linux's split_lock_setup has it: one that
+       lists the capability need not take the MSR's write, and a #GP from it
+       here is a panic at boot. Its host detects the guest's split locks, if
+       anyone does. */
+    if (cpu_vendor() != CpuVendor::Intel || cpuid(0).eax < LEAF_STRUCTURED)
+        return false;
+    if (cpuid(LEAF_FEATURES).ecx & FEATURES_ECX_HYPERVISOR)
+        return false;
+    if ((cpuid(LEAF_STRUCTURED).edx & STRUCTURED_EDX_CORE_CAPABILITIES) == 0)
+        return false;
+    return (read_msr(CORE_CAPABILITIES_MSR) & CORE_CAPABILITIES_SPLIT_LOCK_DETECT) != 0;
+}
+
+}
+
+bool setup_split_lock_detect(bool boot_cpu)
+{
+    if (kernel::Parameters::get_instance().is_split_lock_off())
+        return false;
+    if (!boot_cpu && !__atomic_load_n(&split_lock_boot, __ATOMIC_ACQUIRE))
+        return false;
+
+    const ulong cpu = get_current_cpu_hw_id();
+    if (cpu >= SPLIT_LOCK_CPUS || !cpu_detects_split_locks())
+        return false;
+
+    /* Read back: a hypervisor below that lists the capability and drops the
+       write -- or a part that has it on some of its cores -- leaves it off,
+       and a CPU that says so is not one whose #AC is a split lock */
+    write_msr(TEST_CTRL_MSR, read_msr(TEST_CTRL_MSR) | TEST_CTRL_SPLIT_LOCK_DETECT);
+    if ((read_msr(TEST_CTRL_MSR) & TEST_CTRL_SPLIT_LOCK_DETECT) == 0)
+        return false;
+
+    __atomic_fetch_or(&split_lock_cpus, 1ULL << cpu, __ATOMIC_RELEASE);
+    if (boot_cpu)
+        __atomic_store_n(&split_lock_boot, true, __ATOMIC_RELEASE);
+    return true;
+}
+
+bool split_lock_detect_here()
+{
+    const ulong cpu = get_current_cpu_hw_id();
+    return cpu < SPLIT_LOCK_CPUS && (__atomic_load_n(&split_lock_cpus, __ATOMIC_ACQUIRE) & (1ULL << cpu)) != 0;
+}
+
+bool split_lock_detect_set(bool on)
+{
+    if (!split_lock_detect_here())
+        return false;
+
+    const u64 ctrl = read_msr(TEST_CTRL_MSR);
+    const u64 want = on ? (ctrl | TEST_CTRL_SPLIT_LOCK_DETECT) : (ctrl & ~TEST_CTRL_SPLIT_LOCK_DETECT);
+    if (want != ctrl)
+        write_msr(TEST_CTRL_MSR, want);
+    return true;
+}
+
+ulong split_lock_detect_cpus()
+{
+    return __atomic_load_n(&split_lock_cpus, __ATOMIC_ACQUIRE);
+}
+
+bool split_lock()
+{
+    /* Two cache lines, and the four bytes of the add across the boundary
+       between them. Its address in a register: no C++ access of a
+       misaligned u32 is made, only the instruction's. */
+    static const ulong LINE_BYTES = 64;
+    static const ulong ACROSS = LINE_BYTES - 2;
+    alignas(LINE_BYTES) static u8 lines[2 * LINE_BYTES];
+
+    const ulong addr = reinterpret_cast<ulong>(&lines[ACROSS]);
+    asm volatile("lock addl $0, (%0)" :: "r"(addr) : "memory", "cc");
     return true;
 }
 
