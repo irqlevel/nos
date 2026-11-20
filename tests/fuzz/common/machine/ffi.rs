@@ -60,6 +60,17 @@ pub extern "C" fn kernel_read_cycle_counter_serialized() -> u64 {
 
 /* ---- the CPU ---- */
 
+/* No split lock detection here: no CPU of the machine's has it */
+#[no_mangle]
+pub extern "C" fn kernel_split_lock_detect_here() -> u32 {
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_split_lock_detect_set(_on: u32) -> u32 {
+    0
+}
+
 #[no_mangle]
 pub extern "C" fn kernel_get_cpu_id() -> u32 {
     sched::harness(sched::cpu)

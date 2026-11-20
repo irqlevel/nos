@@ -87,7 +87,7 @@ The order below is load-bearing; the notes say why.
 | `test::test()` | The boot self-tests (`kernel/test.cpp`). `After test` is printed immediately after |
 | `Pci::scan()` | Enumerate the bus |
 | Console observers | `console=` decides whether the shell listens on the keyboard, the serial line, or both |
-| `Lapic::enable()`, `set_bsp_index` | This CPU's local APIC and its identity |
+| `Lapic::enable()`, `set_bsp_index` | This CPU's local APIC and its identity; then split lock detection, which keeps the CPUs that have it by their APIC ids ([below](#split-locks)) |
 | `cpu.Run(bp_startup)` | The BSP turns itself into its own idle task and never returns from here |
 
 (The GDT, the exception table and the IDT are re-saved once more after the
@@ -240,6 +240,52 @@ self-test and enters the idle loop.
 
 `ap_started_flag` is incremented at five points along that path; if `start_all`
 gives up, its value says how far the AP got.
+
+### Split locks
+
+A split lock is a locked access across two cache lines: a `lock add` on a
+dword 62 bytes into a line, an `xchg` the same. No cache can do it alone,
+so the CPU takes the bus from every core for the length of the access, and
+every other core's memory accesses wait on it. Intel's parts since Ice
+Lake's servers and Tremont can raise an #AC on one instead
+(`IA32_CORE_CAPABILITIES` bit 5, behind CPUID leaf 7's EDX bit 30, says
+so; `MSR_TEST_CTRL` bit 29 turns it on): of the machines here the EX44's
+and Hertz's. Every CPU that has it turns it on as it comes up
+(`hal::setup_split_lock_detect`) -- the BSP after its local APIC, an AP
+likewise and only where the BSP has it -- and the boot says how many do:
+`cpu: split lock detection on 20 of 20 cpus`. The MSR is a core's, its two
+threads' alike. Under a hypervisor nothing is turned on, as Linux's
+`split_lock_setup` has it: one that lists the capability need not take the
+MSR's write, and a #GP there would be a panic at boot.
+
+- **In the kernel**, which runs nothing in ring 3 -- the only ring CR0.AM
+  and RFLAGS.AC check alignment in -- an #AC is a split lock, and a bug: a
+  panic that names it, `EXC: split lock -- a locked access across two cache
+  lines -- rip ...`. `panic splitlock` makes one, to see that it does.
+- **In a guest of `hv`'s** the #AC is a VM exit (the hypervisor intercepts
+  #AC anyway, for CVE-2015-5307), and hvarch tells a split lock from the
+  guest's own alignment check -- CR0.AM and RFLAGS.AC set in ring 3, given
+  back to the guest as before -- as KVM's `vmx_guest_inject_ac` does
+  (`Guest::read_split_lock`). An #AC the guest never asked for would kill
+  it: a Linux kernel dies of one in kernel mode. So a split lock is said in
+  the log instead -- `hv: vm 3: a split lock at rip 0x... on its cpu 1`,
+  once every five seconds a VM at most, with how many came between -- and
+  the guest is stepped past it: the CPU's detection off for that one
+  instruction, the monitor trap flag on to end the run right after it, the
+  detection on again at that exit, interrupts off throughout
+  (`Guest::step_split_lock`). An event the entry delivers -- an interrupt
+  due then -- ends the step before the instruction runs, and the guest
+  raises the split lock again and is stepped again: what the guest report's
+  `splitlock` line counts is #ACs, a little over the instructions -- a Linux
+  guest's 3000, each run once, were 3005 on the EX44. Its sibling thread's
+  detection is off with it for that instruction, so a split lock of the
+  sibling's in that window goes unseen -- never wrongly said. A guest's
+  CPUID does not offer the feature: it neither sees nor sets the MSR.
+  `hv run splitlock` is the check, the guest report's `splitlock` line the
+  count.
+
+`splitlock=off` leaves the detection off: no panic, no warning, every split
+lock as slow as the bus makes it.
 
 ## arm64: from the Image header to EL1
 

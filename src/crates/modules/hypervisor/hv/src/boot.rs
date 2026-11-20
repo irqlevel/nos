@@ -21,7 +21,7 @@ use kcore::sync::Mutex;
 
 use crate::cores::{Cores, Hold};
 use crate::disk::{Claims, Holder, Runner, Wake};
-use crate::guest::{self, LogLine, Ring, Spec};
+use crate::guest::{self, LogLine, Ring, Spec, SplitLocks};
 
 const USAGE: &str = "hv boot <kernel> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [pci=bus:dev.fn]... [unsafe_interrupts] [input=...] [uuid=U] [force] [cmdline=...]";
 /// How long the guest runs by default, and at most: a Linux boot under TCG,
@@ -46,6 +46,7 @@ struct Console {
 struct BootHost {
     console: Mutex<Console>,
     unloading: Arc<AtomicBool>,
+    split_locks: SplitLocks,
 }
 
 impl Host for BootHost {
@@ -76,6 +77,10 @@ impl Host for BootHost {
 
     fn stop_requested(&self) -> bool {
         self.unloading.load(Ordering::Acquire)
+    }
+
+    fn split_lock(&self, cpu: u32, rip: u64) {
+        self.split_locks.note(format_args!("the guest of hv boot"), cpu, rip);
     }
 }
 
@@ -151,7 +156,7 @@ impl Boot {
             *self.report.lock() = report;
             return;
         };
-        let host = Arc::new(BootHost { console, unloading: self.unloading.clone() });
+        let host = Arc::new(BootHost { console, unloading: self.unloading.clone(), split_locks: SplitLocks::new() });
 
         let _ = writeln!(report, "hv: booting {} -- {} MiB{}, {} cpu{}, cmdline \"{}\"",
                          self.spec.kernel, self.spec.mem_bytes / (1024 * 1024),

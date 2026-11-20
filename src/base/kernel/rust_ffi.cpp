@@ -837,6 +837,23 @@ unsigned char kernel_posted_interrupt_vector(void)
     return hal::POSTED_VECTOR;
 }
 
+/* Whether the CPU this runs on had split lock detection turned on at its
+   bring-up (hal::split_lock_detect_here): what makes a guest's #AC there a
+   split lock and not the guest's own alignment check */
+unsigned int kernel_split_lock_detect_here(void)
+{
+    return hal::split_lock_detect_here() ? 1 : 0;
+}
+
+/* This CPU's split lock detection on or off where its bring-up turned it
+   on (hal::split_lock_detect_set): 1 when it has it, 0 -- nothing written
+   -- when it has not. A hypervisor's step past a guest's split lock, with
+   interrupts off. */
+unsigned int kernel_split_lock_detect_set(unsigned int on)
+{
+    return hal::split_lock_detect_set(on != 0) ? 1 : 0;
+}
+
 /* The CPU this runs on to take an interrupt from its own timer by
    deadline_ns on the boot clock, if it is not armed to fire sooner
    (Cpu::local_timer_wake): for a vCPU about to enter its guest, whose timer's

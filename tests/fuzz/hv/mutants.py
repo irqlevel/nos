@@ -10,7 +10,9 @@ network `flowmove`) must find it -- a rule whose loss no
 target notices is one the gate does not hold the code to. So too each rule
 of a host's PCI function as a guest sees it (src/crates/hypervisor/hv/src/
 devices/host.rs: what of it stays the host's, MSI-X's table and PBA trapped
-and emulated, the capability not given hidden), held by `hostfn`.
+and emulated, the capability not given hidden), held by `hostfn`; and the
+run loop's answer to a guest's split lock (src/crates/hypervisor/hv/src/
+run.rs: stepped past, never given back as an #AC), held by `platform`.
 
     python3 tests/fuzz/hv/mutants.py [name...]
     python3 tests/hv-fuzz.py --mutants          # the gate first, then these
@@ -900,6 +902,16 @@ MUTANTS = [
      RUN,
      'let port = self.ports.iter().position(|q| q.port.below(t.bus))?;',
      'let port = self.ports.iter().position(|q| t.bus != 0 && q.port.below(q.port.secondary()) && t.bus == 1)?;',
+     ['platform']),
+    ('run_split_lock_given', "a guest's split lock given back to it as an #AC it never asked for",
+     RUN,
+     'Exit::Exception { vector, .. } if vector == VECTOR_AC && gc.cpu.backend().split_lock_ac() => {',
+     'Exit::Exception { vector, .. } if false && vector == VECTOR_AC && gc.cpu.backend().split_lock_ac() => {',
+     ['platform']),
+    ('run_split_lock_unstepped', "a guest's split lock neither given back nor stepped past",
+     RUN,
+     '                    gc.cpu.backend_mut().step_split_lock();\n',
+     '',
      ['platform']),
 ]
 

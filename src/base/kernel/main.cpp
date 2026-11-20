@@ -298,6 +298,11 @@ __attribute__((noinline)) void ap_main2()
     Lapic::enable();
     atomic_read_and_inc(&ap_started_flag); /* 5: LAPIC enabled */
 
+    /* Split lock detection as the boot CPU has it, now that the local APIC
+       says which CPU this is (hal::setup_split_lock_detect); how many CPUs
+       have it is said once they all run (CpuTable::start_all) */
+    (void)hal::setup_split_lock_detect(false);
+
     /* This CPU's TSS as soon as its index is its own to read -- the local
        APIC's, good from the enable above -- so that #DF has its IST stack:
        the IDT loaded above names one (Gdt::setup_boot_tss has the why). */
@@ -1261,6 +1266,16 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
     }
 
     Lapic::enable();
+
+    /* Split lock detection from here on, the local APIC saying which CPU
+       this is: a split lock of the kernel's a panic, a guest's an exit
+       (hal::setup_split_lock_detect). The APs follow (ap_main2). */
+    if (hal::setup_split_lock_detect(true))
+        klog(0, "cpu: split lock detection on: a locked access across two cache lines is a panic in the kernel, "
+            "a warning in a guest (splitlock=off for neither)");
+    else
+        klog(0, "cpu: no split lock detection%s", Parameters::get_instance().is_split_lock_off()
+            ? ": splitlock=off" : " on this CPU");
 
     auto& cpu = cpus.get_current_cpu();
     if (!cpus.set_bsp_index(cpu.get_index()))
