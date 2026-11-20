@@ -441,15 +441,13 @@ bool Pmu::available()
 
     CpuidResult r0 = cpuid(0);
 
-    static const u32 INTEL_VENDOR_EBX = 0x756E6547;   /* "Genu" */
-    static const u32 AMD_VENDOR_EBX   = 0x68747541;   /* "Auth" */
-
-    if (r0.ebx == INTEL_VENDOR_EBX)
+    CpuVendor vendor = cpu_vendor(r0);
+    if (vendor == CpuVendor::Intel)
     {
         if (r0.eax >= 0xA && intel::detect())
             found = FlavorIntel;
     }
-    else if (r0.ebx == AMD_VENDOR_EBX)
+    else if (vendor == CpuVendor::Amd)
     {
         if (amd::detect())
             found = FlavorAmd;
