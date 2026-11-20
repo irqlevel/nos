@@ -412,8 +412,9 @@ machine still there twenty seconds after the report.
 
 Boots with an MBR disk and a GPT disk it writes itself -- no partitioning
 tool, no privileges -- and checks what the kernel made of them: the
-partitions registered and their sizes, both tables as `partitions` prints
-them, that a partition's sector 0 is its first sector on the disk and that a
+partitions registered and their sizes -- one of the GPT's in slot 11,
+partition 12, past the eight slots the probe once stopped at without a word
+-- both tables as `partitions` prints them, that a partition's sector 0 is its first sector on the disk and that a
 read past its end is refused, that a filesystem mounted on a partition
 keeps writers off the disk it is on, and that `disks` gives every partition
 the id a VM's vm.toml names it by: a GPT partition its unique GUID as Linux
