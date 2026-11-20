@@ -289,7 +289,11 @@ image's `nos.cfg`, `nos` the default.
 Under UEFI the firmware is then told to boot the disk: its entry for the
 disk's `\EFI\BOOT\BOOTX64.EFI` -- one the firmware made by itself (AMI's
 "UEFI OS"), or one `nos-install` makes, `nos` -- goes right after the
-network's entries that lead the boot order, and nothing else moves. A
+network's entries that lead the boot order, and nothing else moves. An
+entry of the firmware's that is off -- which firmware passes over, even as
+the next boot -- is turned on; where efibootmgr cannot turn it on (version
+18, Ubuntu 24.04's and Debian 12's, turns on only the last entry it lists),
+an entry of nos's own is made beside it, and that is the one used. A
 provider's servers try the network first, for its rescue system, and that
 stays so; what booted after it before -- the system the server came with,
 on another disk -- boots after nos now, if nos does not come up.
