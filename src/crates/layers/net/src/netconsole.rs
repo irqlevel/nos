@@ -31,7 +31,9 @@ use kcore::task::TaskHandle;
 use kcore::klog;
 
 use crate::abi;
+use crate::arp;
 use crate::udp;
+use crate::wire::Mac;
 
 /// A record is a two-byte length and that many bytes of text; either may
 /// straddle the wrap, so both go through the byte-wise push and pop.
@@ -457,6 +459,24 @@ impl Netconsole {
             &packet[..DGRAM_HDR + text_len])
     }
 
+    /// What send_batch sends, to an Ethernet address already known: nothing
+    /// asked of ARP, nothing waited for -- the panic's.
+    fn send_batch_to(&self, nic: &Nic, dst_mac: &Mac, packet: &mut [u8; DGRAM_MAX], text_len: usize, seq: u32)
+        -> bool
+    {
+        if text_len == 0 {
+            return false;
+        }
+
+        packet[..4].copy_from_slice(&MAGIC);
+        packet[4..8].copy_from_slice(&seq.to_le_bytes());
+
+        udp::send_to(nic, dst_mac,
+            self.dst_ip.load(Ordering::Relaxed), self.dst_port.load(Ordering::Relaxed),
+            nic.ip(), self.src_port.load(Ordering::Relaxed),
+            &packet[..DGRAM_HDR + text_len])
+    }
+
     /// The next datagram of what the ring holds, sent and taken off it.
     fn send_next(&self, nic: &Nic, packet: &mut [u8; DGRAM_MAX]) -> Next {
         let (len, consumed, evicted, seq) = {
@@ -604,13 +624,19 @@ impl Netconsole {
             _ => return,
         };
 
+        /* The next hop's address as the cache has it, however old: the
+         * report cannot wait for ARP -- a resolution sleeps -- and an entry
+         * past its five minutes, the machine idle meanwhile, kept a
+         * deadman's report on Newton off the network (lookup). */
         let arp = match abi::arp_table() {
             Some(arp) => arp,
             None => return,
         };
-        if arp.lookup(nic.route_ip(self.dst_ip.load(Ordering::Relaxed))).is_none() {
-            return;
-        }
+        let dst_ip = self.dst_ip.load(Ordering::Relaxed);
+        let dst_mac = match arp::link_mac(&nic, dst_ip).or_else(|| arp.known(nic.route_ip(dst_ip))) {
+            Some(mac) => mac,
+            None => return,
+        };
 
         /* The report is at the tail, behind whatever the drain task had not
          * shipped. A machine that dies just after DHCP has the entire boot
@@ -632,7 +658,7 @@ impl Netconsole {
                 break;
             }
 
-            if self.send_batch(&nic, &mut packet, len, seq) {
+            if self.send_batch_to(&nic, &dst_mac, &mut packet, len, seq) {
                 self.sent.fetch_add(1, Ordering::Relaxed);
                 /* What the send traced on the way may have filled the ring
                  * and evicted from its head. */

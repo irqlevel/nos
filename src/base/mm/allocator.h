@@ -115,11 +115,16 @@ private:
 	   Trim -- and trades them with the pools half a cache at a time, the
 	   pool's lock once a batch. A block in a cache is free: FREED_TAG, and
 	   nobody's. */
-	static constexpr size_t CACHE_BLOCKS_MAX = 16;
+	static constexpr size_t CACHE_BLOCKS_MAX = 128;
 	/* The most a CPU's cache of one size holds: CACHE_BLOCKS_MAX blocks, and
-	   no more bytes than a page -- two of the largest blocks, each of which
-	   has a page to itself */
-	static constexpr size_t CACHE_BYTES = consts::PAGE_SIZE;
+	   no more bytes than sixteen pages -- thirty-two of the largest blocks,
+	   each of which has a page to itself; 258 KiB a CPU with every size's
+	   full. A batch of 64 blocks held at once took the pool's lock sixteen
+	   times a round with caches of 16 blocks, and on Newton's 48 CPUs each
+	   take of it waited out the others': 64-byte blocks took 20 us an
+	   allocation there, 0.75 us with these; 512-byte ones 144 us, 0.9 us
+	   (heapbench) */
+	static constexpr size_t CACHE_BYTES = 16 * consts::PAGE_SIZE;
 
 	struct SizeCache
 	{

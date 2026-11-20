@@ -13,9 +13,12 @@ Nothing is lost while the network is still coming up: the ring is primed from
 backlog goes out and live lines follow within a couple of milliseconds. When
 the ring fills, the oldest lines are evicted and counted (`netconsole` shell
 command). Panics are included -- the panic report is captured and flushed
-synchronously, best-effort and only if the collector MAC is already in the ARP
-cache, since a blocking ARP resolve could never complete with the other CPUs
-halted.
+synchronously, best-effort and only if the next hop's MAC is in the ARP cache,
+since a blocking ARP resolve could never complete with the other CPUs halted.
+An entry however old will do (`ArpTable::known`): one past its five minutes
+used to keep the report off the network altogether, and a machine idle that
+long -- Newton's deadman going off half an hour into a boot that never found
+its root -- reset with nothing said.
 
 So is the halt. On `poweroff` and `reboot` the netconsole is the last thing
 stopped before the soft IRQs -- after every module has been unloaded and

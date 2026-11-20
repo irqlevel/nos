@@ -99,6 +99,16 @@ impl ArpTable {
             .map(|entry| entry.mac)
     }
 
+    /// The address the cache has for `ip`, however old, and nothing asked:
+    /// for a sender that can neither wait nor send a request -- a panic's
+    /// report, which an entry five minutes old, the machine idle meanwhile,
+    /// used to keep off the network altogether. The neighbour has seldom
+    /// moved; sent to an address it left, the report is lost, as it was.
+    pub fn known(&self, ip: u32) -> Option<Mac> {
+        let cache = self.cache.lock();
+        cache.iter().find(|entry| entry.valid && entry.ip == ip).map(|entry| entry.mac)
+    }
+
     /// The address of `ip` from the cache, never waited for: for a sender
     /// that cannot sleep. An entry past its time is still used, as Linux
     /// uses a stale neighbour, while it is asked for again; a host that has
