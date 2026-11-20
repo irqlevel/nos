@@ -10,10 +10,15 @@ to `<name>.log.1`, `.2`, ... as it fills, held to a size for the file and
 one for all its files together.
 
 `/logs/net.log` is the network's: TCP's connections, made, accepted and
-reset (`layers/net/src/tcp.rs`, `trace_event`), and sshd's sessions -- who
+reset (`layers/net/src/tcp.rs`, `trace_event`); sshd's sessions -- who
 came, who logged in and with which key, how each ended, what an SFTP copy
-did, who was turned away. What a server itself does -- sshd started and
-stopped, its keys read -- stays in the kernel log.
+did, who was turned away; every command the UDP shell runs and who sent
+it, and the ones it would not run (`layers/net/src/udp_shell.rs`); a TLS
+handshake ipcnet's listener refused, and from where; and a connection `hv
+forward` gave up for a side that took nothing, from whom and to which
+guest. What a server itself does -- sshd started and stopped, its keys
+read, the UDP shell started, ipcnet's own dials refused -- stays in the
+kernel log.
 
 ```
 2026-11-20T09:13:20.214790Z --- a boot: nos 0.1.33 (9fc9bbe9) ---
@@ -168,5 +173,5 @@ untouched; a failure said once a reason; `tail`'s lines the file's. Its
 controls -- twelve mistakes put in the engine, from the budget's sum to the
 boot left unsaid -- each fail it within the gate's inputs. `sshd-test.py`
 (arm64, and `--arch x86_64`) then reads `/logs/net.log` on a booted machine:
-the logins, TCP's accepts and an SFTP session's line there, and none of them
-in dmesg.
+the logins, TCP's accepts and an SFTP session's line there -- on arm64 the
+UDP shell's commands too, each with who sent it -- and none of them in dmesg.

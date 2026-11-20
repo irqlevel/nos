@@ -852,9 +852,10 @@ read back; then the connection killed under a change, which must turn up in
 must say it needs one. Files copied in and out over SFTP by OpenSSH's own
 `sftp -b` and `scp -s`: 8 MiB and some in and back out the same, by each;
 `ls -l` showing it at its size, `df`, a rename, the kernel's `ls` seeing
-it, the session's line in `/logs/net.log` -- with the logins and TCP's
-accepts, after `logs sync`, and none of them in dmesg ([File logs](logs.md))
--- and `logs` listing net.log written; a tree in and back out with `scp -r`;
+it, the session's line in `/logs/net.log` -- with the logins, TCP's
+accepts and the UDP shell's commands, after `logs sync`, and none of them in
+dmesg ([File logs](logs.md)) -- and `logs` listing net.log written; a tree in
+and back out with `scp -r`;
 an `rm` of `a` that leaves the `a.new` beside it (a file of its own, not a
 configuration file's next content); and the refusals, each said -- an `rm`
 of nothing (no such file), an `rmdir` of a directory with something in it,
