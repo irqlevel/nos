@@ -55,6 +55,8 @@ private:
     RawSpinLock& operator=(RawSpinLock&& other) = delete;
 
     void acquire();
+    /* acquire's wait, once its first try found the lock held */
+    void contend();
     bool try_acquire();
     void release();
     void stamp();
