@@ -108,6 +108,24 @@ pub fn posted_interrupt_vector() -> u8 {
     ffi::cpu::kernel_posted_interrupt_vector()
 }
 
+/// Whether the CPU this runs on had split lock detection turned on at its
+/// bring-up (x86 Intel parts that have it, unless `splitlock=off`): what
+/// makes a guest's #AC there a split lock, not its own alignment check.
+#[inline]
+pub fn split_lock_detect_here() -> bool {
+    ffi::cpu::kernel_split_lock_detect_here() != 0
+}
+
+/// This CPU's split lock detection on or off, where its bring-up turned it
+/// on: whether it has it -- nothing written when not. Off for the one guest
+/// instruction a hypervisor steps past a guest's split lock with, on again
+/// at the exit, interrupts off throughout so that the CPU is the same. The
+/// MSR is the core's: an SMT sibling goes without it meanwhile too.
+#[inline]
+pub fn split_lock_detect_set(on: bool) -> bool {
+    ffi::cpu::kernel_split_lock_detect_set(u32::from(on)) != 0
+}
+
 /// This CPU's own timer to interrupt it by `deadline_ns` on the boot clock
 /// ([`crate::time::boot_time_ns`]), if it is not armed to sooner: what takes
 /// a vCPU out of its guest at its guest's next timer edge, rather than at

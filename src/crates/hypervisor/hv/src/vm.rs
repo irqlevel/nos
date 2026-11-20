@@ -314,6 +314,15 @@ impl Backend {
     pub fn skip_icebp(&mut self) {
         match self { Backend::Svm(v) => v.skip_icebp(), Backend::Vmx(v) => v.skip_icebp() }
     }
+    /// Whether the #AC that stopped the guest was a split lock of its own
+    /// under the host's detection -- never under AMD-V, which has none.
+    pub fn split_lock_ac(&self) -> bool {
+        match self { Backend::Svm(v) => v.split_lock_ac(), Backend::Vmx(v) => v.split_lock_ac() }
+    }
+    /// Step the guest past that split lock with the CPU's detection off.
+    pub fn step_split_lock(&mut self) {
+        match self { Backend::Svm(v) => v.step_split_lock(), Backend::Vmx(v) => v.step_split_lock() }
+    }
     pub fn request_irq_window(&mut self) {
         match self { Backend::Svm(v) => v.request_irq_window(), Backend::Vmx(v) => v.request_irq_window() }
     }

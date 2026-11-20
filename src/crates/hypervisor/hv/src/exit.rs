@@ -96,6 +96,10 @@ pub enum Exit {
     /// SVM's -- or GETSEC, which CPUID tells the guest it has not got and a
     /// CPU without them faults #UD on: what the guest is given.
     Undefined,
+    /// The one instruction the run loop had VT-x step by the monitor trap
+    /// flag -- past a split lock of the guest's, with the CPU's detection
+    /// off for it alone (`step_split_lock`): nothing owed, the guest goes on.
+    Stepped,
     /// An instruction both backends stop the guest at and the run loop
     /// answers the same way: named here by each backend from its own exit,
     /// so that the run loop matches a name and never one extension's number

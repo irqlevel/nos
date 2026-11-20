@@ -41,6 +41,7 @@ Parameters::Parameters()
     , c1e_firmware_(false)
     , idle_mwait_(true)   /* idle by MWAIT where the CPU offers it; idle=halt for HLT */
     , ucode_off_(false)
+    , split_lock_off_(false)
     , wx_probe_md_(WxProbeOff)
     , usb_off_(false)
     , iommu_on_(false)
@@ -140,6 +141,11 @@ bool Parameters::is_idle_mwait()
 bool Parameters::is_ucode_off()
 {
     return ucode_off_;
+}
+
+bool Parameters::is_split_lock_off()
+{
+    return split_lock_off_;
 }
 
 bool Parameters::is_its_enabled()
@@ -724,6 +730,10 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
     else if (stdlib::str_cmp(key, "ucode") == 0)
     {
         ucode_off_ = (stdlib::str_cmp(value, "off") == 0);
+    }
+    else if (stdlib::str_cmp(key, "splitlock") == 0)
+    {
+        split_lock_off_ = (stdlib::str_cmp(value, "off") == 0);
     }
     else if (stdlib::str_cmp(key, "wxprobe") == 0)
     {

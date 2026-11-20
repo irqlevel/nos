@@ -5,6 +5,7 @@
 #include <arch/x86_64/lapic.h>
 #include <arch/x86_64/boot64.h>
 #include <arch/x86_64/cpuid.h>
+#include <hal/cpu.h>
 
 #include <lib/stdlib.h>
 
@@ -127,6 +128,11 @@ bool CpuTable::start_all()
     }
 
     klog(0, "Cpus started, %lu running", running);
+    /* Every CPU running has set split lock detection up or not by now
+       (ap_main2): one that a part of the machine's cores lacks is said */
+    const ulong split_lock = static_cast<ulong>(__builtin_popcountl(hal::split_lock_detect_cpus()));
+    if (split_lock != 0)
+        klog(0, "cpu: split lock detection on %lu of %lu cpus", split_lock, running);
 
     return true;
 }
