@@ -56,19 +56,15 @@ fn netconsole_log(line: &[u8]) {
 
 #[derive(Clone, Copy, Default)]
 pub struct Params {
-    pub dhcp_off: bool,
-    pub dns_on: bool,
     pub rxpoll_on: bool,
     pub netconsole: Option<(u32, u16, usize)>,
-    /// `dns=A.B.C.D`, 0 for none
-    pub dns_server: u32,
-    /// `ip=` and `gw=`: address, mask, gateway; all 0 for none
-    pub static_ip: (u32, u32, u32),
+    /// The words of the command line after its first, which the network
+    /// layer reads eth0's settings off where nothing has decided them --
+    /// as here, where no root is read (`net::settings::current`): `dhcp=off`
+    pub words: &'static str,
 }
 
-static PARAMS: Mutex<Params> = Mutex::new(Params {
-    dhcp_off: false, dns_on: false, rxpoll_on: false, netconsole: None, dns_server: 0, static_ip: (0, 0, 0),
-});
+static PARAMS: Mutex<Params> = Mutex::new(Params { rxpoll_on: false, netconsole: None, words: "" });
 
 pub fn params() -> Params {
     *PARAMS.lock().unwrap_or_else(|e| e.into_inner())
@@ -79,38 +75,8 @@ pub fn set_params(p: Params) {
 }
 
 #[no_mangle]
-pub extern "C" fn kernel_param_dhcp_off() -> i32 {
-    params().dhcp_off as i32
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_param_dns_on() -> i32 {
-    params().dns_on as i32
-}
-
-#[no_mangle]
 pub extern "C" fn kernel_param_rxpoll_on() -> i32 {
     params().rxpoll_on as i32
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_param_dns_server() -> u32 {
-    params().dns_server
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_param_static_ip() -> u32 {
-    params().static_ip.0
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_param_static_mask() -> u32 {
-    params().static_ip.1
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_param_static_gateway() -> u32 {
-    params().static_ip.2
 }
 
 /// # Safety
@@ -140,14 +106,15 @@ pub unsafe extern "C" fn kernel_netconsole_params(ip: *mut u32, port: *mut u16, 
 /// `buf` is `len` writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_cmdline_string(buf: *mut u8, len: usize) -> usize {
-    const CMDLINE: &[u8] = b"net-fuzz";
+    let words = params().words;
+    let line = if words.is_empty() { String::from("net-fuzz") } else { format!("net-fuzz {}", words) };
     if buf.is_null() || len == 0 {
         return 0;
     }
-    let n = CMDLINE.len().min(len - 1);
+    let n = line.len().min(len - 1);
     // SAFETY: the caller's buffer, `n + 1 <= len` bytes of it.
     unsafe {
-        core::ptr::copy_nonoverlapping(CMDLINE.as_ptr(), buf, n);
+        core::ptr::copy_nonoverlapping(line.as_ptr(), buf, n);
         *buf.add(n) = 0;
     }
     n

@@ -11,7 +11,9 @@ powers off. The disk's table is then GPT's, as disk lays it out: BIOS boot,
 EFI System, a root of the size answered, nos-data to the end. The disk alone
 boots nos under OVMF -- made by BIOS, booted by UEFI -- whose sshd lets in
 the key the answers gave, to the image's kernel, with the netconsole they
-asked for on its command line. Then the same ISO under OVMF, the disk beside
+asked for on its command line, on the static address they gave: eth0's
+settings in /etc/net.toml, as a network with no DHCP server needs them, and
+not on the command line. Then the same ISO under OVMF, the disk beside
 it: the installer finds nos there as it would put it, and installs nothing --
 the disk is as it was, byte for byte.
 
@@ -46,6 +48,10 @@ ROOT_MIB = 1024
 SERIAL = "NOSINSTALLTEST"
 BY_ID = "/dev/disk/by-id/virtio-" + SERIAL
 NETCONSOLE = "10.0.2.2:6666"
+# QEMU's user network, given as a static address, gateway and DNS server
+STATIC_IP = "10.0.2.15/24"
+STATIC_GW = "10.0.2.2"
+STATIC_DNS = "10.0.2.3"
 GPT_BIOS_BOOT = "21686148-6449-6E6F-744E-656564454649"
 GPT_ESP = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
 GPT_LINUX = "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
@@ -377,6 +383,9 @@ def run(tmp, image):
     with open(answers, "w") as f:
         f.write("# installer-test's\ndisk=%s\nwipe=yes\nroot_size=%dM\nkey=%s\nnetconsole=%s\nafter=poweroff\n"
                 % (BY_ID, ROOT_MIB, open(key + ".pub").read().strip(), NETCONSOLE))
+        # QEMU's user network as a static address: what a network with no
+        # DHCP server needs
+        f.write("ip=%s\ngw=%s\ndns=%s\n" % (STATIC_IP, STATIC_GW, STATIC_DNS))
     iso = os.path.join(tmp, "installer.iso")
     print("--- build.sh --answers", flush=True)
     p = subprocess.run([os.path.join(ROOT, "scripts", "installer", "build.sh"), "--image", image,
@@ -422,6 +431,11 @@ def run(tmp, image):
         if version is not None:
             rc, out = m.ssh(["cat", "/proc/cmdline"])
             check("with the netconsole the answers asked for", rc == 0 and ("netconsole=" + NETCONSOLE) in out, out)
+            check("and none of the network's words", rc == 0 and " ip=" not in out and " gw=" not in out, out)
+            rc, out = m.ssh(["net"])
+            check("on the static address the answers gave, from /etc/net.toml",
+                  rc == 0 and "eth0 settings: %s, gateway %s, resolver %s (/etc/net.toml)"
+                  % (STATIC_IP, STATIC_GW, STATIC_DNS) in out, out[-400:])
         m.ssh(["poweroff"], timeout=60)
         check("nos powers off", m.wait_exit(120))
     finally:
