@@ -207,8 +207,9 @@ pub fn udpshell(r: &mut Input) {
     nic.set_mask(MASK);
     nic.set_gw(GW_IP);
     /* As `dhcp=off` has it: the command says so rather than starting a
-     * client nobody answers. */
-    machine::set_params(machine::Params { dhcp_off: true, ..machine::params() });
+     * client nobody answers. No root is read here, so eth0's settings are
+     * the command line's (`net::settings::current`). */
+    machine::set_params(machine::Params { words: "dhcp=off", ..machine::params() });
 
     let mut lan = Lan::new();
     lan.add(NEAR, NEAR_MAC);

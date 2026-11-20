@@ -285,8 +285,9 @@ machines never were:
   the link is 100 Mbit/s whatever the PHY advertises.
 - **Its network hands out no address**: Ubuntu's is set by hand, and a
   DHCPDISCOVER heard no offer. nos takes eth0's address, gateway and resolver
-  from `nos-install --cmdline "ip=… gw=… dns=…"`, and its log goes to a
-  netconsole collector on another host.
+  from its root's `/etc/net.toml` (`nos-install --ip … --gw … --dns …`;
+  before the file, `--cmdline "ip=… gw=… dns=…"`, which an update turns into
+  it), and its log goes to a netconsole collector on another host.
 - **Nothing seeds the random pool but what it keeps.** No RDRAND, no
   virtio-rng, and the jitter collector finds no variance there — at setup and
   again once every CPU runs, with the walk timed between serialized reads —
@@ -367,7 +368,8 @@ its disks and its NICs were:
   changed` after `device ready`; `eth0` is 02:00.0, the cable that carries
   the address. MANC is 0x62000000 and the driver leaves it so.
 - **Its network hands out no address** either, so nos's comes from
-  `nos-install --cmdline "ip=… gw=… dns=…"`.
+  `/etc/net.toml` (`nos-install --ip … --gw … --dns …`, or
+  `--network-here` from its rescue system).
 - **Its TCO watchdog is the firmware's**: nos finds it by the SMBus
   controller and leaves NO_REBOOT as firmware set it -- a 100-series PCH
   keeps the bit behind the P2SB, which the firmware hides -- so a nos that

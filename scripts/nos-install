@@ -39,10 +39,18 @@
 #                         send this machine a datagram runs commands in its
 #                         kernel. Off unless asked for
 #   --netconsole IP:PORT  the kernel log, over UDP, to IP:PORT
-#   --cmdline "ARGS"      more kernel parameters (docs/kernel-parameters.md)
+#   --cmdline "ARGS"      more kernel parameters (docs/kernel-parameters.md);
+#                         not ip=, gw=, dns= or dhcp=, which are the options
+#                         below
+#   --ip A.B.C.D/N        nos's address on its network and the prefix length,
+#                         for a network with no DHCP server; with
+#   --gw A.B.C.D          its gateway, another address of that subnet, and
+#   --dns A.B.C.D         the DNS server nos asks (with --dhcp, or neither,
+#                         the one it asks in place of the DHCP lease's)
+#   --dhcp                nos's address by DHCP, at every boot
 #   --network-here        nos's address, gateway and DNS server as this Linux
-#                         has them now (ip= gw= dns=): a provider's rescue
-#                         system's are the server's, on a network with no DHCP
+#                         has them now: a provider's rescue system's are the
+#                         server's, on a network with no DHCP
 #   --panel               the management panel: a VM of nos's that manages it
 #                         in a browser, at https://<this machine>:39233, as
 #                         root -- with a password made now and printed once.
@@ -57,6 +65,13 @@
 # --udpshell, --netconsole and --cmdline set the kernel parameters this
 # machine boots nos with; update keeps the ones it had unless given any of
 # them, which then replace the lot (--cmdline "" clears them).
+#
+# --ip, --gw, --dns, --dhcp and --network-here write /etc/net.toml on the
+# root: eth0's settings, which nos reads at every boot (docs/install.md).
+# install and disk write one whatever they are given -- DHCP where none of
+# them is -- and update keeps the one there unless given any of them; an
+# update of an install from before the file writes it from the ip=, gw=,
+# dns= and dhcp= its kernel parameters had.
 #
 # <partition> is named on install; afterwards the GRUB entry names it
 # (/etc/grub.d/42_nos). Runs under Linux, as root, on the machine itself.
@@ -548,6 +563,19 @@ EXTRA=
 SET_CMDLINE=0
 CMDLINE=
 NETWORK_HERE=0
+# eth0's settings for /etc/net.toml (--ip, --gw, --dns, --dhcp,
+# --network-here): NET_MODE static (NET_IP, with NET_GW), dhcp, or manual --
+# no address until nos's `dhcp` command, which only a grubenv's dhcp=on
+# says -- and NET_DNS the resolver, given; SET_NETWORK 1 where an option says
+NET_MODE=
+NET_IP=
+NET_GW=
+NET_DNS=
+SET_NETWORK=0
+# Where the settings are on the root, and the literal a kernel that reads
+# them has in its image (src/crates/layers/net/src/settings.rs, PATH)
+NET_TOML=etc/net.toml
+NET_TOML_PATH=/etc/net.toml
 
 # The PCI address of network interface $1, or nothing for one on no PCI bus
 nic_pci() {
@@ -589,21 +617,327 @@ network_here() {
     echo "ip=$addr gw=$gw dns=$dns"
 }
 
-compose_cmdline() {
-    local parts=() words=() t here
-    [ -z "$UDPSHELL" ] || parts+=("udpshell=$UDPSHELL")
-    [ -z "$NETCONSOLE" ] || parts+=("netconsole=$NETCONSOLE")
+# ---- eth0's settings: /etc/net.toml ------------------------------------
+#
+# What nos takes is what its kernel takes (net::settings): these checks are
+# its rules, so that nothing is written the kernel would refuse -- a refused
+# file is a boot on the kernel command line's settings, which on a network
+# with no DHCP server is a server nobody can reach.
+
+# The value of the dotted quad $1, or a failure
+quad_value() {
+    local a b c d x
+    [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]}))
+    c=$((10#${BASH_REMATCH[3]})); d=$((10#${BASH_REMATCH[4]}))
+    for x in "$a" "$b" "$c" "$d"; do
+        [ "$x" -le 255 ] || return 1
+    done
+    echo $(( (a << 24) | (b << 16) | (c << 8) | d ))
+}
+
+# Whether a host may have the address of value $1 (RFC 1122 3.2.1.3): not
+# "this network", not loopback, not multicast or reserved
+may_have() {
+    local first=$(( $1 >> 24 ))
+    [ "$first" -ne 0 ] && [ "$first" -ne 127 ] && [ "$first" -lt 224 ]
+}
+
+# The mask of a prefix of $1 bits, 1 to 32
+prefix_mask() {
+    echo $(( (0xFFFFFFFF << (32 - $1)) & 0xFFFFFFFF ))
+}
+
+# Whether the address of value $1 is the network or the broadcast address of
+# its subnet of $2 bits -- which a /31 or a /32 has neither of
+network_or_broadcast() {
+    local mask host
+    [ "$2" -le 30 ] || return 1
+    mask=$(prefix_mask "$2")
+    host=$(( $1 & ~mask & 0xFFFFFFFF ))
+    [ "$host" -eq 0 ] || [ "$host" -eq $(( ~mask & 0xFFFFFFFF )) ]
+}
+
+# What is wrong with eth0's address A.B.C.D/N $1, or nothing
+ip_wrong() {
+    local addr bits value
+    if ! [[ "$1" =~ ^([0-9.]+)/([0-9]{1,2})$ ]]; then
+        echo "is not an address and its prefix length, A.B.C.D/N"
+        return 0
+    fi
+    addr=${BASH_REMATCH[1]}
+    bits=$((10#${BASH_REMATCH[2]}))
+    if ! value=$(quad_value "$addr"); then
+        echo "is not an address and its prefix length, A.B.C.D/N"
+    elif [ "$bits" -lt 1 ] || [ "$bits" -gt 32 ]; then
+        echo "has a prefix length that is not 1 to 32"
+    elif ! may_have "$value"; then
+        echo "is not an address a host may have"
+    elif network_or_broadcast "$value" "$bits"; then
+        echo "is its subnet's network or broadcast address"
+    fi
+}
+
+# What is wrong with $1 as a gateway's or a DNS server's address, or nothing
+host_wrong() {
+    local value
+    if ! value=$(quad_value "$1"); then
+        echo "is not an address, A.B.C.D"
+    elif ! may_have "$value"; then
+        echo "is not an address a host may have"
+    fi
+}
+
+# What is wrong with $1 as the gateway of eth0's address A.B.C.D/N $2 --
+# another address of its subnet -- or nothing
+gw_wrong() {
+    local why bits g a mask
+    why=$(host_wrong "$1")
+    if [ -n "$why" ]; then
+        echo "$why"
+        return 0
+    fi
+    bits=$((10#${2#*/}))
+    g=$(quad_value "$1")
+    a=$(quad_value "${2%/*}")
+    mask=$(prefix_mask "$bits")
+    if [ "$g" -eq "$a" ] || [ $(( (g ^ a) & mask )) -ne 0 ]; then
+        echo "is not another address of $2's subnet"
+    elif network_or_broadcast "$g" "$bits"; then
+        echo "is its subnet's network or broadcast address"
+    fi
+}
+
+# What is wrong with the settings in NET_*, or nothing: what the kernel
+# would refuse the file for
+net_wrong() {
+    local why
+    if [ "$NET_MODE" = static ]; then
+        why=$(ip_wrong "$NET_IP")
+        [ -z "$why" ] || { echo "the address $NET_IP $why"; return 0; }
+        if [ -n "$NET_GW" ]; then
+            why=$(gw_wrong "$NET_GW" "$NET_IP")
+            [ -z "$why" ] || { echo "the gateway $NET_GW $why"; return 0; }
+        fi
+    fi
+    if [ -n "$NET_DNS" ]; then
+        why=$(host_wrong "$NET_DNS")
+        [ -z "$why" ] || echo "the DNS server $NET_DNS $why"
+    fi
+}
+
+# The options' settings checked, and --network-here's taken: before anything
+# is written
+compose_network() {
+    local here words=() w why
     if [ "$NETWORK_HERE" = 1 ]; then
+        [ -z "$NET_IP" ] && [ -z "$NET_GW" ] && [ "$NET_MODE" != dhcp ] ||
+            die "--network-here is this Linux's address and gateway: not with --ip, --gw or --dhcp"
         # An assignment of its own, so that its die ends the run
         here=$(network_here)
         read -r -a words <<<"$here"
-        parts+=("${words[@]}")
+        for w in "${words[@]}"; do
+            case "$w" in
+                ip=*) NET_IP=${w#ip=} ;;
+                gw=*) NET_GW=${w#gw=} ;;
+                dns=*) [ -n "$NET_DNS" ] || NET_DNS=${w#dns=} ;;
+            esac
+        done
     fi
+    if [ -n "$NET_IP" ]; then
+        [ "$NET_MODE" != dhcp ] || die "--ip and --dhcp: nos's address is the one given, or DHCP's"
+        NET_MODE=static
+    elif [ -n "$NET_GW" ]; then
+        die "--gw without --ip: a gateway is the way off --ip's subnet"
+    elif [ "$SET_NETWORK" = 1 ]; then
+        # --dhcp, or --dns alone: DHCP with that resolver
+        NET_MODE=dhcp
+    fi
+    why=$(net_wrong)
+    [ -z "$why" ] || die "nos's network: $why"
+    if [ "$NET_MODE" = static ] && [ -z "$NET_GW" ]; then
+        warn "--ip without --gw: nos reaches its own subnet, $NET_IP, and nothing past it"
+    fi
+}
+
+# What the settings in NET_* come to, said
+net_said() {
+    case "$NET_MODE" in
+        static) echo "$NET_IP${NET_GW:+, gateway $NET_GW}${NET_DNS:+, DNS $NET_DNS}" ;;
+        manual) echo "no address until nos's dhcp command${NET_DNS:+, DNS $NET_DNS}" ;;
+        *) echo "DHCP${NET_DNS:+, DNS $NET_DNS}" ;;
+    esac
+}
+
+# /etc/net.toml's text for the settings in NET_* (net::settings reads it)
+net_toml_text() {
+    echo "# eth0's settings, read by nos at every boot: a static address -- ip,"
+    echo "# with its gateway, gw -- or DHCP; dns, the DNS server, where one is"
+    echo "# given. Changed here, they are taken at the next boot (docs/install.md)."
+    case "$NET_MODE" in
+        static)
+            echo "ip = \"$NET_IP\""
+            [ -z "$NET_GW" ] || echo "gw = \"$NET_GW\"" ;;
+        manual) echo "dhcp = false" ;;
+        *) echo "dhcp = true" ;;
+    esac
+    [ -z "$NET_DNS" ] || echo "dns = \"$NET_DNS\""
+}
+
+# The same settings as kernel parameters: what a kernel from before
+# /etc/net.toml reads in its place. DHCP is nos.cfg's own dhcp=auto dns=on
+net_words() {
+    case "$NET_MODE" in
+        static) echo "ip=$NET_IP${NET_GW:+ gw=$NET_GW}${NET_DNS:+ dns=$NET_DNS}" ;;
+        manual) echo "dhcp=on${NET_DNS:+ dns=$NET_DNS}" ;;
+        *) echo "${NET_DNS:+dns=$NET_DNS}" ;;
+    esac
+}
+
+# The words of kernel parameters $1 that are eth0's settings, and the rest
+network_words_in() {
+    local words=() w out=()
+    read -r -a words <<<"$1" || true
+    for w in ${words[@]+"${words[@]}"}; do
+        case "$w" in ip=*|gw=*|dns=*|dhcp=*) out+=("$w") ;; esac
+    done
+    echo ${out[@]+"${out[@]}"}
+}
+
+other_words_in() {
+    local words=() w out=()
+    read -r -a words <<<"$1" || true
+    for w in ${words[@]+"${words[@]}"}; do
+        case "$w" in ip=*|gw=*|dns=*|dhcp=*) ;; *) out+=("$w") ;; esac
+    done
+    echo ${out[@]+"${out[@]}"}
+}
+
+# NET_* from the kernel parameters' ip=, gw=, dns= and dhcp= $1 -- a
+# grubenv's from before /etc/net.toml -- or a failure, with what stands in
+# the way in NET_WHY: a word the file has nothing for, a word the kernel
+# would have dropped. The last of each, as the kernel took them. Not to be
+# called in a $(...), whose NET_* would be its own
+NET_WHY=
+net_from_words() {
+    local words=() w ip= gw= dns= dhcp=auto
+    NET_WHY=
+    read -r -a words <<<"$1" || true
+    for w in ${words[@]+"${words[@]}"}; do
+        case "$w" in
+            ip=*) ip=${w#ip=} ;;
+            gw=*) gw=${w#gw=} ;;
+            dns=on) ;;
+            dns=*) dns=${w#dns=} ;;
+            dhcp=*) dhcp=${w#dhcp=} ;;
+        esac
+    done
+    case "$dhcp" in
+        auto|on) ;;
+        off) NET_WHY="dhcp=off, which $NET_TOML_PATH has no word for"; return 1 ;;
+        *) NET_WHY="dhcp=$dhcp is not auto, on or off"; return 1 ;;
+    esac
+    NET_IP=$ip
+    NET_GW=$gw
+    NET_DNS=$dns
+    if [ -n "$ip" ]; then
+        NET_MODE=static
+    elif [ -n "$gw" ]; then
+        NET_WHY="gw=$gw without ip="
+        return 1
+    elif [ "$dhcp" = on ]; then
+        NET_MODE=manual
+    else
+        NET_MODE=dhcp
+    fi
+    NET_WHY=$(net_wrong)
+    [ -z "$NET_WHY" ]
+}
+
+# Whether every kernel on the root at $1 reads /etc/net.toml -- the one
+# booted, the one a rollback goes back to, one tried once: the path is in
+# the image of a kernel that does
+kernels_read_net_toml() {
+    local k
+    for k in "$1/boot/kernel64.elf" "$1/boot/kernel64.elf.prev" "$1/boot/kernel64.elf.next"; do
+        [ -e "$k" ] || continue
+        grep -qaF "$NET_TOML_PATH" "$k" || return 1
+    done
+}
+
+# eth0's settings on the root at $1: /etc/net.toml as the options say; else
+# the one there, kept; else -- an install from before the file -- written
+# from the kernel parameters it had, $2; else DHCP, which is what nos.cfg's
+# own dhcp=auto dns=on had it ask. Then the kernel parameters: while a
+# kernel on the root does not read the file, they carry the same settings
+# as words for it; once none is left, the words go
+put_network() {
+    local mnt=$1 before=$2 file=$1/$NET_TOML wrote=0 now rest words new
+    mkdir -p "$mnt/etc"
+    if [ "$SET_NETWORK" = 1 ]; then
+        wrote=1
+    elif [ -f "$file" ]; then
+        say "$NET_TOML_PATH kept as it is: $(net_toml_summary "$file")"
+    elif [ -n "$(network_words_in "$before")" ]; then
+        if net_from_words "$(network_words_in "$before")"; then
+            wrote=1
+            say "$NET_TOML_PATH written from this machine's kernel parameters, $(network_words_in "$before")"
+        else
+            warn "this machine's kernel parameters $(network_words_in "$before") are not written to $NET_TOML_PATH: $NET_WHY -- nos goes by them as it did"
+            return 0
+        fi
+    else
+        NET_MODE=dhcp
+        wrote=1
+    fi
+    if [ "$wrote" = 1 ]; then
+        net_toml_text > "$file.new"
+        sync -f "$mnt"
+        mv -T "$file.new" "$file"
+        say "$NET_TOML_PATH: $(net_said)"
+    fi
+
+    now=$(editenv "$mnt/grubenv" list | sed -n 's/^nos_cmdline=//p')
+    rest=$(other_words_in "$now")
+    if kernels_read_net_toml "$mnt"; then
+        words=
+    elif [ "$wrote" = 1 ]; then
+        words=$(net_words)
+    else
+        # A file kept, which a kernel that does not read it ignores: the
+        # words it booted with, as they were
+        words=$(network_words_in "$before")
+    fi
+    new="$rest${rest:+${words:+ }}$words"
+    [ "$new" != "$now" ] || return 0
+    [ "${#new}" -le "$CMDLINE_MAX" ] ||
+        die "the kernel parameters would be ${#new} characters, past the $CMDLINE_MAX left of the kernel's 255: $new"
+    editenv "$mnt/grubenv" set "nos_cmdline=$new"
+    if [ -n "$words" ]; then
+        say "the kernel parameters keep $words: a kernel on $PART from before $NET_TOML_PATH reads them in its place"
+    else
+        say "the kernel parameters' ip=, gw=, dns= and dhcp= taken out: every kernel on $PART reads $NET_TOML_PATH"
+    fi
+}
+
+# What /etc/net.toml at $1 says, on a line: its lines, the comments aside
+net_toml_summary() {
+    sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$1" | awk '{ printf "%s%s", sep, $0; sep = "; " } END { print "" }'
+}
+
+compose_cmdline() {
+    local parts=() words=() t
+    [ -z "$UDPSHELL" ] || parts+=("udpshell=$UDPSHELL")
+    [ -z "$NETCONSOLE" ] || parts+=("netconsole=$NETCONSOLE")
     # Split on blanks only: a * in it is not a file name
     read -r -a words <<<"$EXTRA" || true
     for t in ${words[@]+"${words[@]}"}; do
         [[ "$t" =~ ^[A-Za-z0-9_.:,/+=-]+$ ]] ||
             die "--cmdline: '$t' -- a kernel parameter is key=value (docs/kernel-parameters.md)"
+        case "$t" in
+            ip=*|gw=*|dns=*|dhcp=*)
+                die "--cmdline: '$t' -- eth0's settings are $NET_TOML_PATH's: --ip, --gw, --dns, --dhcp or --network-here" ;;
+        esac
         parts+=("$t")
     done
     CMDLINE=${parts[*]+"${parts[*]}"}
@@ -633,7 +967,7 @@ replace() {
 }
 
 put_system() {
-    local mnt=$1 line p
+    local mnt=$1 line p before
     mkdir -p "$mnt/boot/grub" "$mnt/lib" "$mnt/etc/ssh"
 
     # The system goes together, and what was there goes to .prev together
@@ -680,9 +1014,13 @@ put_system() {
     # GRUB reads and clears (42_nos) -- in place, its one block, which is
     # why it is only ever written by GRUB's own tool
     [ -f "$mnt/grubenv" ] || editenv "$mnt/grubenv" create
+    before=$(editenv "$mnt/grubenv" list | sed -n 's/^nos_cmdline=//p')
     if [ "$SET_CMDLINE" = 1 ]; then
         editenv "$mnt/grubenv" set "nos_cmdline=$CMDLINE"
     fi
+
+    # eth0's settings, and the kernel parameters a kernel before them reads
+    put_network "$mnt" "$before"
 }
 
 # The management panel (--panel, --no-panel): /etc/rc's lines, and root's
@@ -706,7 +1044,11 @@ put_panel() {
             fi
             mkdir -p "$mnt/etc/api"
             password=$(panel_password "$mnt/$PANEL_PASS") || die "the panel's password could not be made"
-            addr=$(this_address)
+            if [ "$NET_MODE" = static ]; then
+                addr=${NET_IP%/*}
+            else
+                addr=$(this_address)
+            fi
             [ -n "$addr" ] || addr="<this machine's address>"
             say "the panel: https://$addr:$PANEL_PORT once nos has made it, minutes after its first boot"
             say "the panel's user is root, its password $password"
@@ -1480,7 +1822,14 @@ parse_options() {
             --root-size=*) ROOT_SIZE=${1#*=} ;;
             --wipe) WIPE=1 ;;
             --dry-run) DRY_RUN=1 ;;
-            --network-here) NETWORK_HERE=1; SET_CMDLINE=1 ;;
+            --network-here) NETWORK_HERE=1; SET_NETWORK=1 ;;
+            --ip) [ $# -ge 2 ] || usage; NET_IP=$2; SET_NETWORK=1; shift ;;
+            --ip=*) NET_IP=${1#*=}; SET_NETWORK=1 ;;
+            --gw) [ $# -ge 2 ] || usage; NET_GW=$2; SET_NETWORK=1; shift ;;
+            --gw=*) NET_GW=${1#*=}; SET_NETWORK=1 ;;
+            --dns) [ $# -ge 2 ] || usage; NET_DNS=$2; SET_NETWORK=1; shift ;;
+            --dns=*) NET_DNS=${1#*=}; SET_NETWORK=1 ;;
+            --dhcp) NET_MODE=dhcp; SET_NETWORK=1 ;;
             --keep-boot-order) KEEP_BOOT_ORDER=1 ;;
             --default) BOOT_DEFAULT=1 ;;
             -h|--help) usage 0 ;;
@@ -1515,6 +1864,7 @@ cmd_install() {
     fi
     resolve_partition
     compose_cmdline
+    compose_network
     open_image
     check_partition "$PART"
     check_hardware "$PART"
@@ -1659,6 +2009,11 @@ cmd_status() {
     mount_partition "$PART" ro
     echo "installed:   $(describe "$MNT/VERSION")"
     echo "previous:    $(describe "$MNT/VERSION.prev")"
+    if [ -f "$MNT/$NET_TOML" ]; then
+        echo "network:     $NET_TOML_PATH: $(net_toml_summary "$MNT/$NET_TOML")"
+    else
+        echo "network:     no $NET_TOML_PATH: the kernel parameters' ip=, gw=, dns= and dhcp= (nos-install update writes it)"
+    fi
     if [ -f "$MNT/grubenv" ]; then
         params=$(editenv "$MNT/grubenv" list | sed -n 's/^nos_cmdline=//p')
         echo "parameters:  ${params:-none}"
@@ -1738,6 +2093,7 @@ cmd_disk() {
     PART=
     root=$(parse_root_size "$ROOT_SIZE")
     compose_cmdline
+    compose_network
     open_image
     check_disk "$DISK"
     check_hardware "$DISK" disk
@@ -1752,6 +2108,7 @@ cmd_disk() {
     if [ "$DRY_RUN" = 1 ]; then
         say "$DISK${ids:+ ($ids)}, $(lsblk -dno SIZE "$DISK" | tr -d ' '): would be given a GPT of nos's own --"
         printf '%s' "$DISK_PLAN" | sed 's/^/nos-install: /'
+        say "nos's network, $NET_TOML_PATH: $( [ "$SET_NETWORK" = 1 ] && net_said || echo DHCP )"
         say "$(describe "$IMG/VERSION") on its root, and GRUB for$([ "$GRUB_BIOS" = 0 ] || echo " BIOS")$([ "$GRUB_BIOS" = 0 ] || [ "$GRUB_EFI" = 0 ] || echo " and")$([ "$GRUB_EFI" = 0 ] || echo " UEFI")"
         if [ "$FIRMWARE" = uefi ] && [ "$KEEP_BOOT_ORDER" = 0 ]; then
             say "and the firmware's boot entry for it put first after the network's"
@@ -1823,12 +2180,12 @@ esac
 parse_options "$@"
 case "$COMMAND" in
     install|update)
-        only_options --image --format --ssh-key --udpshell --netconsole --cmdline --network-here --panel \
-            --no-panel --boot-once --reboot
+        only_options --image --format --ssh-key --udpshell --netconsole --cmdline --network-here --ip --gw \
+            --dns --dhcp --panel --no-panel --boot-once --reboot
         cmd_install "$COMMAND" ;;
     disk)
-        only_options --image --ssh-key --udpshell --netconsole --cmdline --network-here --panel \
-            --no-panel --root-size --wipe --dry-run --keep-boot-order --reboot
+        only_options --image --ssh-key --udpshell --netconsole --cmdline --network-here --ip --gw --dns \
+            --dhcp --panel --no-panel --root-size --wipe --dry-run --keep-boot-order --reboot
         cmd_disk ;;
     disks)
         only_options

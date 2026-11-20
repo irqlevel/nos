@@ -640,43 +640,6 @@ pub fn dns_server() -> Option<u32> {
     if ip == 0 { None } else { Some(ip) }
 }
 
-/// `dhcp=off`: the kernel was told not to run a DHCP client.
-pub fn dhcp_off() -> bool {
-    net::kernel_param_dhcp_off() != 0
-}
-
-/// `dns=on`: a lease's DNS server is worth starting a resolver on.
-pub fn dns_on() -> bool {
-    net::kernel_param_dns_on() != 0
-}
-
-/// `dns=A.B.C.D`: the resolver's server, given on the command line rather
-/// than taken from a lease. Host byte order.
-pub fn dns_server_given() -> Option<u32> {
-    let ip = net::kernel_param_dns_server();
-    if ip == 0 { None } else { Some(ip) }
-}
-
-/// What `ip=` and `gw=` gave eth0: for a network that hands out no address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StaticIp {
-    /// Host byte order, as everything here.
-    pub ip: u32,
-    pub mask: u32,
-    /// 0 when no gateway was given: the subnet alone is reached.
-    pub gw: u32,
-}
-
-/// `ip=A.B.C.D/N` and `gw=A.B.C.D`, off the kernel command line. None
-/// unless an address was given.
-pub fn static_ip() -> Option<StaticIp> {
-    let ip = net::kernel_param_static_ip();
-    if ip == 0 {
-        return None;
-    }
-    Some(StaticIp { ip, mask: net::kernel_param_static_mask(), gw: net::kernel_param_static_gateway() })
-}
-
 /// `rxpoll=on`: the tick is to look at the receive path as well as the
 /// NIC's own interrupt. Off unless asked for.
 pub fn rx_poll_on() -> bool {
