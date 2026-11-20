@@ -538,7 +538,7 @@ impl Keeper {
             Err(_) if quiet => return,
             Err(NoTable::Gone) => {
                 if !self.gone.swap(true, Ordering::AcqRel) {
-                    kcore::klog!(0, "hv: vnet is gone from this host -- the VMs on its networks go on as they are, \
+                    kcore::flog!(crate::HV, "vnet is gone from this host -- the VMs on its networks go on as they are, \
                                      and none starts on one until it is back");
                 }
                 return;
@@ -548,17 +548,18 @@ impl Keeper {
                  * a table comes */
                 let mut said = self.failed.lock();
                 if said.as_deref() != Some(why.as_str()) {
-                    kcore::klog!(0, "hv: vnet's table not had -- {}: what vnet changes is not seen here meanwhile", why);
+                    kcore::flog!(crate::HV, "vnet's table not had -- {}: what vnet changes is not seen here meanwhile",
+                                 why);
                     *said = Some(why);
                 }
                 return;
             }
         };
         if self.gone.swap(false, Ordering::AcqRel) {
-            kcore::klog!(0, "hv: vnet is back on this host");
+            kcore::flog!(crate::HV, "vnet is back on this host");
         }
         if self.failed.lock().take().is_some() {
-            kcore::klog!(0, "hv: vnet's table had again");
+            kcore::flog!(crate::HV, "vnet's table had again");
         }
         let mut subnets = Vec::new();
         if subnets.try_reserve_exact(table.networks.len()).is_ok() {
@@ -569,7 +570,7 @@ impl Keeper {
         self.tunnel.set_table(table.node, &table.hosts, &table.remote, mtu);
         self.public(&table);
         for why in self.firewalls.refresh_cluster(&self.switch, &table.firewalls) {
-            kcore::klog!(0, "hv: a firewall of the cluster's not changed here -- {}", why);
+            kcore::flog_limited!(crate::HV, "a firewall of the cluster's not changed here -- {}", why);
         }
         self.judged_by(&table);
         /* A port gone from this host's, of another generation, at another
@@ -597,7 +598,7 @@ impl Keeper {
         }
         for (slot, port) in shut {
             self.switch.shut(slot);
-            kcore::klog!(0, "hv: port {} of vnet's on switch port {} shut -- revoked by vnet", port, slot);
+            kcore::flog!(crate::HV, "port {} of vnet's on switch port {} shut -- revoked by vnet", port, slot);
         }
         *self.known.lock() = Some((table.instance, table.revision, table.hosts_digest));
         self.confirm();
@@ -618,7 +619,7 @@ impl Keeper {
             if let Err(why) = placed {
                 let mut said = self.judging.lock();
                 if said.as_deref() != Some(why.as_str()) {
-                    kcore::klog!(0, "hv: port {} of vnet's not judged by {}{} -- {}", port, PREFIX, f.name, why);
+                    kcore::flog!(crate::HV, "port {} of vnet's not judged by {}{} -- {}", port, PREFIX, f.name, why);
                     *said = Some(why);
                 }
             }
@@ -647,7 +648,7 @@ impl Keeper {
         {
             let mut before = self.serving.lock();
             for why in said.iter().filter(|w| !before.contains(w)) {
-                kcore::klog!(0, "hv: a public address of the cluster's -- {}", why);
+                kcore::flog!(crate::HV, "a public address of the cluster's -- {}", why);
             }
             *before = said;
         }

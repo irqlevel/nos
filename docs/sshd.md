@@ -23,7 +23,7 @@ $ ssh root@10.0.2.15 uptime
 205.613949
 $ ssh root@10.0.2.15
 nos -- `help` lists the commands, `exit` leaves
-$ dmesg 3 sshd
+$ tail /logs/net.log 3
 ...
 $ exit
 ```
@@ -100,6 +100,7 @@ starts out that way: the image's `/etc/rc` is those two lines, the module at
 |---|---|
 | `/etc/ssh/ssh_host_ed25519_key` | The host key, in OpenSSH's own format: `ssh-keygen -l -f` shows its fingerprint, and a key made by `ssh-keygen -t ed25519 -N ''` can be put here -- the one the machine's other OS uses, so clients see the same host whichever of the two is booted |
 | `/etc/ssh/authorized_keys` | One key a line, as OpenSSH writes them. `ssh-ed25519` keys only; a line with options in front of its key is skipped with a warning rather than taken without them, since the server would not honour `from=` or `command=` |
+| `/logs/net.log` | Its sessions, in the network's [file log](logs.md) beside TCP's connections: who came, who logged in and with which key, how each session ended, what an SFTP copy did, who was turned away -- a port 22 on the internet is knocked on all day, and these lines crowded the kernel log. What the server itself does -- started, stopped, its keys read -- is said in the kernel log |
 
 A file is never written over in place: the new content goes to `<path>.new`,
 is synced, and only then takes the old one's place (`kernel_file_write`), so a
@@ -269,10 +270,10 @@ A file a client writes is written where each WRITE says, the file grown to
 reach past it (`kernel_file_pwrite_grow`) -- a hole between its end and a
 write past it -- and is not synced unless the client asks (`fsync@`, `put
 -f`): a copy is on the filesystem, in its journal's next commit, once it is
-said done. As a session ends the log says what it did:
+said done. As a session ends its line in `/logs/net.log` says what it did:
 
 ```
-sshd: root from 10.0.2.2:51544: sftp, 3 files opened (1 to be written), 8400953 bytes read and 8400953 written, 0 of 61 requests refused
+2026-11-18T10:49:22.574011Z sshd: root from 10.0.2.2:51544: sftp, 3 files opened (1 to be written), 8400953 bytes read and 8400953 written, 0 of 61 requests refused
 ```
 
 ## Limits

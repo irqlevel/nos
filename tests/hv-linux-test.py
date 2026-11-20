@@ -166,8 +166,13 @@ SEQ_LINES = 150000
 RC_LAST = "version"
 RC_DONE = re.compile(r"(?m)^> version\n.+\n")
 # The module's own lines from the kernel log, printed to the console: what
-# the vCPU tasks and the unload say, which no command's output does.
+# the unload says, which no command's output does.
 RC_LOG = "dmesg hv:"
+# The hypervisor's file log, whole (docs/logs.md): what became of each VM --
+# a vCPU task's word of how its guest ended among it -- what is queued
+# written first (`logs sync`). The root is made for the run: it holds this
+# run's lines alone.
+HV_LOG = "cat /logs/hv.log"
 # What the main phase's load gives the guests at its unload (`stop_secs=`).
 UNLOAD_SECS = 2
 
@@ -446,7 +451,7 @@ def vm_commands(args):
              start_lost, restart_lost, exec_after_lost, stop_lost] + claim_lines + flood_lines + folder_lines + [
              "hv off", "rmmod hv", "insmod /hv.ko vms=%s" % elsewhere, "hv",
              "hv on", start_a, start_b, "hv exec 0 secs=%d id" % args.vm_secs, "hv exec 1 secs=%d id" % args.vm_secs,
-             stop_all] + elsewhere_lines + ["rmmod hv", RC_LOG]
+             stop_all] + elsewhere_lines + ["rmmod hv", RC_LOG, "logs sync", HV_LOG]
 
     checks = [
         ("hv help", 0, "hv help lists the vm commands", r"hv exec <vm>", True),
@@ -563,7 +568,12 @@ def vm_commands(args):
         ("hv stop t1 secs=0", 0, "and it stops", r"hv: vm %d stopped" % elsewhere_vm, True),
         (elsewhere_log, 0, "its console.log is in its folder there",
          r"vm %d started on [\s\S]*Linux version" % elsewhere_vm, True),
-        (RC_LOG, 0, "vm 1's vCPU said how it ended", r"hv: vm 1 stopped after \d+ ms -- on request", True),
+        (HV_LOG, 0, "vm 1's vCPU said how it ended, in the hypervisor's log",
+         r"(?m)^\S+Z vm 1 stopped after \d+ ms -- on request$", True),
+        (HV_LOG, 0, "and when it started, with what", r"(?m)^\S+Z vm 1 started on %s -- " % on, True),
+        # (the rc's own lines are there, `hv start`'s answer among them: a
+        # vCPU task's word of how its guest ended is no command's)
+        (RC_LOG, 0, "and no vCPU task's word of it in the kernel log", r"hv: vm \d+ stopped after", False),
         (RC_LOG, 0, "rmmod pressed vm 0's power button first, given the time insmod's stop_secs= said",
          r"hv: unloading -- 1 vm\(s\) asked to turn themselves off, given %d s" % UNLOAD_SECS, True),
         (RC_LOG, 0, "then stopped it itself, saying what became of the press, and only then turned the extension off",

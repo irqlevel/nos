@@ -24,6 +24,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "calendar"
+version = "0.1.0"
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -273,6 +277,7 @@ name = "web"
 version = "0.1.0"
 dependencies = [
  "base64ct",
+ "calendar",
  "p256",
  "sha2",
  "zeroize",

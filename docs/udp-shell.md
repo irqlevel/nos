@@ -39,4 +39,5 @@ python3 scripts/udpsh.py <vm-ip> [port] [timeout]
   way to see a subsystem whose level constant is above the default 1 (`USB_LL`
   and `KBD_LL` are 3, the allocators and MMIO are 4) without a rebuild and a
   reflash. It is loud: level 4 traces every allocation.
+- Every command it runs is written down with the address and port it came from -- `udpshell: cmd 'dmesg 40' from 10.0.2.2:65340` -- in the network's [file log](logs.md), `/logs/net.log`, and so is one it would not run (too long, not text); not in the kernel log, where a line about each `dmesg` read this way stood among the lines it read. `tail /logs/net.log` shows the newest.
 - **Warning:** the UDP shell has no authentication — anyone who can reach the port has full kernel shell access. Use only for testing or behind a firewall.

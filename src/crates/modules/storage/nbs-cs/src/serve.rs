@@ -67,6 +67,11 @@ use nbswire::{Answer, Answered, JoinView, Op, Query, Question, Refusal, Reply, R
 use crate::disk::QueueDevice;
 use crate::{DeviceShown, Shared, Shown, CHUNKS_SHOWN};
 
+/// NBS's file log, /logs/nbs.log (docs/logs.md): what this cs did with its
+/// devices and its joins, beside the metadata's history its host's mds says
+/// there.
+static NBS: kcore::logs::Log = kcore::logs::Log::new("nbs");
+
 /// How often the devices and the joins are asked of the mds again, and
 /// the gone freed; and the devices, while the cs does not serve -- a device
 /// just added taken in within a second, before the leader's controller
@@ -490,9 +495,9 @@ impl Cs {
                 let format = self.store.devices().iter().find(|x| x.device == d.device).map(|x| x.format);
                 if let (0, Some(format)) = (d.format, format) {
                     match self.ask(Question::Formatted { device: d.device, format }).await {
-                        Some(Told::Verified) => klog!(1, "nbs-cs: device {} ({})'s format recorded", d.device, d.ident),
+                        Some(Told::Verified) => kcore::flog!(NBS, "cs: device {} ({})'s format recorded", d.device, d.ident),
                         Some(Told::Refused(why)) => {
-                            klog!(0, "nbs-cs: device {} ({})'s format not recorded: {:?}", d.device, d.ident, why);
+                            kcore::flog!(NBS, "cs: device {} ({})'s format not recorded: {:?}", d.device, d.ident, why);
                         }
                         _ => {}
                     }
@@ -502,7 +507,7 @@ impl Cs {
             let ident = DevIdentity { cluster: id.cluster, cs: id.cs, device: d.device };
             match self.take(&d.ident, ident, d.slots, d.format).await {
                 Ok(how) => {
-                    klog!(1, "nbs-cs: device {} ({}) {}", d.device, d.ident, how);
+                    kcore::flog!(NBS, "cs: device {} ({}) {}", d.device, d.ident, how);
                     self.taken.borrow_mut().insert(d.device);
                     self.changed.set(true);
                     self.idents.borrow_mut().push((d.device, d.ident.clone()));
@@ -515,7 +520,7 @@ impl Cs {
                 Err(why) => {
                     let mut trouble = self.trouble.borrow_mut();
                     if !trouble.iter().any(|(n, _, w)| *n == d.device && *w == why) {
-                        klog!(0, "nbs-cs: device {} ({}) not taken: {}", d.device, d.ident, why);
+                        kcore::flog!(NBS, "cs: device {} ({}) not taken: {}", d.device, d.ident, why);
                         trouble.retain(|(n, _, _)| *n != d.device);
                         trouble.push((d.device, d.ident.clone(), why));
                     }
@@ -544,7 +549,7 @@ impl Cs {
         match self.store.open_device(dev, ident, recorded).await {
             Ok((_, rep)) => {
                 if rep.lost != 0 {
-                    klog!(0, "nbs-cs: {}: {} slots' records lost, those slots never used again", name, rep.lost);
+                    kcore::flog!(NBS, "cs: {}: {} slots' records lost, those slots never used again", name, rep.lost);
                 }
                 Ok("opened")
             }
@@ -577,7 +582,7 @@ impl Cs {
             klog!(2, "nbs-cs: chunk {} ({}) freed", c, inc);
         }
         for &(n, e) in &done.failed {
-            klog!(0, "nbs-cs: chunk {} or volume {}'s fence not let go of: {:?}", n, n, e);
+            kcore::flog_limited!(NBS, "cs: chunk {} or volume {}'s fence not let go of: {:?}", n, n, e);
         }
         if !done.freed.is_empty() || !done.unfenced.is_empty() {
             self.changed.set(true);
@@ -708,7 +713,7 @@ impl Joins {
         if !self.seen {
             self.seen = true;
             for v in &views {
-                klog!(0, "nbs-cs: the join of set {} given up: the cs started again", v.set);
+                kcore::flog!(NBS, "cs: the join of set {} given up: the cs started again", v.set);
                 self.give_up.push((v.set, v.since));
             }
         }
@@ -726,7 +731,7 @@ impl Joins {
             if views.iter().any(|v| v.set == c.set() && v.since == c.since()) {
                 kept.push(c);
             } else {
-                klog!(1, "nbs-cs: the join of set {} is over", c.set());
+                kcore::flog!(NBS, "cs: the join of set {} is over", c.set());
                 cs.store.leave(c.set());
             }
         }
@@ -745,13 +750,13 @@ impl Joins {
             if !copy::fence_for(&cs.store, &v).await {
                 let first = *self.unfenced.entry((v.set, v.since)).or_insert(now);
                 if now >= first + copy::STUCK_NS {
-                    klog!(0, "nbs-cs: set {}'s volumes not fenced here in {} s: its join given up", v.set,
+                    kcore::flog!(NBS, "cs: set {}'s volumes not fenced here in {} s: its join given up", v.set,
                           copy::STUCK_NS / 1_000_000_000);
                     if self.end(cs, v.set, v.since, false, None).await {
                         self.unfenced.remove(&(v.set, v.since));
                     }
                 } else {
-                    klog!(0, "nbs-cs: set {}'s volumes not fenced here: its join waits", v.set);
+                    kcore::flog_limited!(NBS, "cs: set {}'s volumes not fenced here: its join waits", v.set);
                 }
                 continue;
             }
@@ -759,7 +764,7 @@ impl Joins {
             match self.copies.iter_mut().find(|c| c.set() == v.set && c.since() == v.since) {
                 Some(c) => c.refresh(v),
                 None => {
-                    klog!(1, "nbs-cs: joining set {} in place {} from its {} active members", v.set, v.place,
+                    kcore::flog!(NBS, "cs: joining set {} in place {} from its {} active members", v.set, v.place,
                           v.sources.len());
                     cs.store.join(v.set, v.since);
                     self.copies.push(Copy::new(v, me, now));
@@ -801,15 +806,15 @@ impl Joins {
         match cs.ask(question).await {
             Some(Told::Verified) => {
                 match (done, stats) {
-                    (true, Some(s)) => klog!(0, "nbs-cs: set {} joined: this cs is its member now -- {} chunks copied, \
+                    (true, Some(s)) => kcore::flog!(NBS, "cs: set {} joined: this cs is its member now -- {} chunks copied, \
                                                 {} of them found as the source's, {} bytes pulled, {} granules \
                                                 pulled again, {} chunks the source had not dropped", set, s.chunks,
                                              s.kept, s.bytes, s.again, s.dropped),
-                    (true, None) => klog!(0, "nbs-cs: set {} joined: this cs is its member now", set),
+                    (true, None) => kcore::flog!(NBS, "cs: set {} joined: this cs is its member now", set),
                     (false, _) => {}
                 }
             }
-            Some(Told::Refused(Refusal::NotTheJoiner)) => klog!(1, "nbs-cs: the join of set {} was over", set),
+            Some(Told::Refused(Refusal::NotTheJoiner)) => kcore::flog!(NBS, "cs: the join of set {} was over", set),
             _ => {
                 self.end_at = boot_time_ns() + END_AGAIN_MS * NS_PER_MS;
                 return false;
@@ -846,7 +851,9 @@ impl Joins {
                     let to = alloc::format!("{}@{}", CS_NAME, host);
                     let _ = cs.mb.send_to(&to, REQUEST, 0, &bytes);
                 }
-                copy::Out::Say(line) => klog!(0, "{}", line),
+                copy::Out::Say(line) => {
+                    kcore::flog_limited!(NBS, "cs: {}", line.strip_prefix("nbs-cs: ").unwrap_or(&line));
+                }
             }
         }
     }

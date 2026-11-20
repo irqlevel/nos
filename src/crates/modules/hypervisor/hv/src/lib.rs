@@ -96,6 +96,16 @@ mod tunnel;
 mod vnet;
 mod work;
 
+/// The hypervisor's file log, /logs/hv.log (docs/logs.md): what became of the
+/// VMs -- made, cloned, deleted and changed, started, booted again and
+/// stopped and why, moved between hosts -- and what went wrong for one, a
+/// start refused or a disk of NBS's, a cluster network's tunnel; each line
+/// with when, kept across boots. What the module itself does -- loaded,
+/// unloaded, the extension on and off -- and a host's device given to a
+/// guest stay in the kernel log.
+#[cfg(target_arch = "x86_64")]
+pub(crate) static HV: kcore::logs::Log = kcore::logs::Log::new("hv");
+
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;

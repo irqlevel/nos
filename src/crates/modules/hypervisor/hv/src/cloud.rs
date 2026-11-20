@@ -219,7 +219,7 @@ impl Made {
             /* NotFound for nothing there and for one that would not go:
              * which, the look after says */
             if kcore::fs::remove(path).is_err() && kcore::fs::size(path).is_ok() {
-                kcore::klog!(0, "hv: {} could not be taken away -- left behind", path);
+                kcore::flog!(crate::HV, "{} could not be taken away -- left behind", path);
                 if left.try_reserve(1).is_ok() {
                     left.push(path.clone());
                 }
@@ -227,7 +227,7 @@ impl Made {
         }
         if let Some(folder) = &self.folder {
             if kcore::fs::remove(folder).is_err() && kcore::fs::list(folder).is_ok() {
-                kcore::klog!(0, "hv: {} could not be taken away -- left behind", folder);
+                kcore::flog!(crate::HV, "{} could not be taken away -- left behind", folder);
                 if left.try_reserve(1).is_ok() {
                     left.push(folder.clone());
                 }
@@ -235,7 +235,7 @@ impl Made {
         }
         if let Some(volume) = &self.volume {
             if let Err(e) = crate::nbs::delete(volume) {
-                kcore::klog!(0, "hv: nbs:{} could not be taken away -- left behind: {}", volume, e);
+                kcore::flog!(crate::HV, "nbs:{} could not be taken away -- left behind: {}", volume, e);
                 if left.try_reserve(1).is_ok() {
                     left.push(alloc::format!("nbs:{}", volume));
                 }
@@ -439,9 +439,27 @@ pub fn seed(name: &str, user_data: &str) -> Result<Vec<u8>, String> {
 /// A VM made of a cloud's image, `<root>/<name>`, as `recipe` says, with
 /// `o` -- `hv start`'s words, or the host API's parameters -- for its
 /// vm.toml: hvboot its kernel, the disk and the seed its first two disks.
-/// Its lines, its progress and whether to stop are `work`'s.
-pub fn create(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options, work: &mut dyn Work)
+/// Its lines, its progress and whether to stop are `work`'s; what it came
+/// to is the hypervisor's log's too, a shell's or the host API's.
+pub fn create(root: &str, vms: &Vms, name: &str, recipe: &Recipe, o: Options, work: &mut dyn Work)
               -> Result<Created, String> {
+    let made = make(root, vms, name, recipe, o, work);
+    let (what, from) = match recipe.source {
+        Source::Url(url) => ("", url),
+        Source::Image(image) => ("the image ", image),
+    };
+    let onto = recipe.onto.unwrap_or("");
+    let (on, onto) = if onto.is_empty() { ("", "") } else { (", poured onto ", onto) };
+    match &made {
+        Ok(c) => kcore::flog!(crate::HV, "vm {} made of {}{}{}{} -- {}, a {} MiB disk", name, what, from, on, onto,
+                              c.file, c.disk_bytes.div_ceil(MIB)),
+        Err(why) => kcore::flog_limited!(crate::HV, "vm {} not made of {}{} -- {}", name, what, from, why),
+    }
+    made
+}
+
+fn make(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options, work: &mut dyn Work)
+        -> Result<Created, String> {
     /* Checked as a start would check it, before anything is fetched: a VM
      * that cannot boot is no use made. */
     if o.initrd.is_some() {
