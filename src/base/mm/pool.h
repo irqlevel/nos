@@ -35,7 +35,7 @@ public:
        nobody's and still carries FREED_TAG. */
     size_t take_free(void** blocks, size_t count);
     void put_free(void* const* blocks, size_t count);
-    static constexpr size_t PUT_FREE_MAX = 16;
+    static constexpr size_t PUT_FREE_MAX = 128;
 
     /* A free block handed to an owner, and an owner's block back to free:
        a compare-and-swap of its tag each, so that a block given to two
