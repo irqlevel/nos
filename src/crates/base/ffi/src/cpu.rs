@@ -22,6 +22,16 @@ unsafe extern "C" {
     pub safe fn kernel_cpu_notify(cpu: u32);
     /// The vector `kernel_cpu_notify` sends.
     pub safe fn kernel_posted_interrupt_vector() -> u8;
+    /// Whether the CPU this runs on had split lock detection turned on at
+    /// its bring-up -- x86 Intel parts that have it, unless splitlock=off:
+    /// 1 or 0, whatever a step past a guest's split lock has done to the
+    /// MSR since. Values only.
+    pub safe fn kernel_split_lock_detect_here() -> u32;
+    /// This CPU's split lock detection on (`on` 1) or off (0), where its
+    /// bring-up turned it on: 1 when it has it, 0 -- nothing written --
+    /// when not. A hypervisor's step past a guest's split lock, interrupts
+    /// off, so that the CPU is the same at the off and the on. Values only.
+    pub safe fn kernel_split_lock_detect_set(on: u32) -> u32;
     /// The CPU this runs on to take an interrupt from its own timer by
     /// `deadline_ns` on the boot clock, if it is not armed to fire sooner;
     /// nothing for a deadline past. From any context.

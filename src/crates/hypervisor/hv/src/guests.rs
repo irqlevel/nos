@@ -761,7 +761,7 @@ pub fn names() -> impl Iterator<Item = &'static str> {
     GUESTS.iter().map(|g| g.name).chain(SEVERAL.iter().map(|g| g.name))
         .chain([SMP_NAME, POSTED_NAME, IOAPIC_NAME, APICV_NAME, PVEOI_NAME, KGS_NAME, CACHE_NAME, DEBUG_NAME, INSTR_NAME,
                 CR4_NAME,
-                MSR_NAME, DR_NAME, AVX_NAME, TSCAUX_NAME, SPEC_NAME, PKRU_NAME]
+                MSR_NAME, DR_NAME, AVX_NAME, TSCAUX_NAME, SPEC_NAME, PKRU_NAME, SPLITLOCK_NAME]
             .into_iter())
 }
 
@@ -803,6 +803,9 @@ pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Optio
     }
     if name == INSTR_NAME {
         return Some(run_one_cpu(machine, &INSTR_GUEST, out));
+    }
+    if name == SPLITLOCK_NAME {
+        return Some(run_one_cpu(machine, &SPLITLOCK_GUEST, out));
     }
     if name == CR4_NAME {
         return Some(run_cr4(machine, out));
@@ -2625,6 +2628,10 @@ fn run_one_cpu(machine: &Arc<Machine>, spec: &OneCpuGuest, out: &mut dyn Write) 
     }
     let _ = writeln!(out, "  exits      {}, {} exceptions given back, {} #UD and #GP given", counts.exits,
                      counts.reflected, counts.ud);
+    if counts.split_locks != 0 {
+        let _ = writeln!(out, "  splitlock  {} split locks stepped past, the host's detection off for each",
+                         counts.split_locks);
+    }
     let mut says = String::new();
     let _ = describe_stop(&stopped.stop, 1, DEBUG_BUDGET_MS, &mut says);
     let _ = writeln!(out, "  stopped    {}", says);
@@ -2671,6 +2678,187 @@ fn check_debug(m: &GuestMemory, stopped: &Stopped) -> core::result::Result<Strin
     }
     Ok(String::from("both #DBs its own handler's: the single step's with DR6.BS, after the NOP; the ICEBP's with \
                      no bit, after it -- and it ran on to its halt"))
+}
+
+/* ---- splitlock: a guest's split locks, and its own alignment check ---- */
+
+const SPLITLOCK_NAME: &str = "splitlock";
+const SPLITLOCK_ABOUT: &str = "a hundred locked adds across two cache lines in ring 0, half with CR0.AM and RFLAGS.AC \
+                               set, and one in ring 3 with both: where the host detects split locks, each of ring 0's \
+                               stepped past with the detection off for it, none given to the guest, and ring 3's the \
+                               guest's own alignment check, an #AC to its handler -- then, AC cleared, a split lock \
+                               stepped past too";
+
+/* A Linux guest's CPU, one, in long mode with an IDT of its own: gate 17,
+ * #AC, and gate 6, #UD. It adds 1 fifty times to the dword at +0x7E of its
+ * results, which crosses the cache line at +0x80 -- a split lock each, which
+ * the host's detection raises an #AC for at any CPL -- and fifty times more
+ * with CR0.AM and RFLAGS.AC set, which check no alignment in ring 0. Then it
+ * gives itself ring 3 -- its data and code at GDT entries 5 and 6, 0x2B and
+ * 0x33, its page table's three entries the user's too, ring 0's stack in the
+ * TSS's RSP0 -- and goes there by IRETQ with AC set, to add 1 once more:
+ * unaligned in ring 3 with AM and AC, its own alignment check, an #AC
+ * whoever detects split locks. Its handler keeps the first #AC's error code,
+ * RIP and CS and counts each -- sixteen, one after another, is a split lock
+ * given to it, and it halts -- and returns with AC clear in the frame, to the
+ * add again: a split lock alone. A UD2 takes it back to ring 0, whose
+ * handler keeps where it came from and leaves its mark. Assembled from this
+ * source with nasm, the offsets in the comments its listing's: SUM is +0x7E
+ * of `RESULTS`, ROUNDS 50, KERNEL_STACK `STACK`, USER_STACK 0xE000. */
+const SPLITLOCK_CODE: &[u8] = &[
+    0x48, 0x8D, 0x05, 0xD5, 0x00, 0x00, 0x00,               // 00: start: lea rax, [rel ac] ; gate 17, #AC
+    0xBF, 0x10, 0xA1, 0x00, 0x00,                           // 07: mov edi, IDT_BASE + 17 * 16
+    0xE8, 0x44, 0x01, 0x00, 0x00,                           // 0c: call gate
+    0x48, 0x8D, 0x05, 0x15, 0x01, 0x00, 0x00,               // 11: lea rax, [rel ud] ; gate 6, #UD: back from ring 3
+    0xBF, 0x60, 0xA0, 0x00, 0x00,                           // 18: mov edi, IDT_BASE + 6 * 16
+    0xE8, 0x33, 0x01, 0x00, 0x00,                           // 1d: call gate
+    0x0F, 0x01, 0x1D, 0x52, 0x01, 0x00, 0x00,               // 22: lidt [rel idtr]
+    0xB9, 0x32, 0x00, 0x00, 0x00,                           // 29: mov ecx, ROUNDS ; ring 0: split locks
+    0xF0, 0x83, 0x04, 0x25, 0x7E, 0x70, 0x00, 0x00, 0x01,   // 2e: .plain: lock add dword [abs SUM], 1
+    0xFF, 0xC9,                                             // 37: dec ecx
+    0x75, 0xF3,                                             // 39: jnz .plain
+    0x0F, 0x20, 0xC0,                                       // 3b: mov rax, cr0 ; AM and AC: ring 0 checks no alignment
+    0x0D, 0x00, 0x00, 0x04, 0x00,                           // 3e: or eax, CR0_AM
+    0x0F, 0x22, 0xC0,                                       // 43: mov cr0, rax
+    0x9C,                                                   // 46: pushfq
+    0x81, 0x0C, 0x24, 0x00, 0x00, 0x04, 0x00,               // 47: or dword [rsp], RFLAGS_AC
+    0x9D,                                                   // 4e: popfq
+    0xB9, 0x32, 0x00, 0x00, 0x00,                           // 4f: mov ecx, ROUNDS
+    0xF0, 0x83, 0x04, 0x25, 0x7E, 0x70, 0x00, 0x00, 0x01,   // 54: .checked: lock add dword [abs SUM], 1
+    0xFF, 0xC9,                                             // 5d: dec ecx
+    0x75, 0xF3,                                             // 5f: jnz .checked
+    0x48, 0xB8, 0xFF, 0xFF, 0x00, 0x00, 0x00,               // 61: mov rax, 0x00CFF3000000FFFF ; ring 3's data, 0x2B
+    0xF3, 0xCF, 0x00,
+    0x48, 0x89, 0x04, 0x25, 0x28, 0x10, 0x00, 0x00,         // 6b: mov [abs GDT_BASE + 5 * 8], rax
+    0x48, 0xB8, 0xFF, 0xFF, 0x00, 0x00, 0x00,               // 73: mov rax, 0x00AFFB000000FFFF ; ring 3's code, 0x33
+    0xFB, 0xAF, 0x00,
+    0x48, 0x89, 0x04, 0x25, 0x30, 0x10, 0x00, 0x00,         // 7d: mov [abs GDT_BASE + 6 * 8], rax
+    0x0F, 0x01, 0x15, 0xF9, 0x00, 0x00, 0x00,               // 85: lgdt [rel gdtr]
+    0x48, 0x83, 0x0C, 0x25, 0x00, 0x20, 0x00, 0x00, 0x04,   // 8c: or qword [abs PML4E], PTE_U ; its 2 MiB ring 3's too
+    0x48, 0x83, 0x0C, 0x25, 0x00, 0x30, 0x00, 0x00, 0x04,   // 95: or qword [abs PDPTE], PTE_U
+    0x48, 0x83, 0x0C, 0x25, 0x00, 0x40, 0x00, 0x00, 0x04,   // 9e: or qword [abs PDE], PTE_U
+    0x0F, 0x20, 0xD8,                                       // a7: mov rax, cr3
+    0x0F, 0x22, 0xD8,                                       // aa: mov cr3, rax
+    0x48, 0xC7, 0x04, 0x25, 0x04, 0x11, 0x00,               // ad: mov qword [abs TSS_RSP0], KERNEL_STACK
+    0x00, 0x00, 0xF0, 0x00, 0x00,
+    0x6A, 0x2B,                                             // b9: push USER_DATA ; to ring 3, AC set
+    0x68, 0x00, 0xE0, 0x00, 0x00,                           // bb: push USER_STACK
+    0x68, 0x02, 0x00, 0x04, 0x00,                           // c0: push RFLAGS_AC | 2
+    0x6A, 0x33,                                             // c5: push USER_CODE
+    0x48, 0x8D, 0x05, 0x03, 0x00, 0x00, 0x00,               // c7: lea rax, [rel user]
+    0x50,                                                   // ce: push rax
+    0x48, 0xCF,                                             // cf: iretq
+    0xF0, 0x83, 0x04, 0x25, 0x7E, 0x70, 0x00, 0x00, 0x01,   // d1: user: lock add dword [abs SUM], 1 ; ring 3, AM and AC: its own #AC
+    0x0F, 0x0B,                                             // da: ud2 ; back to ring 0
+    0x50,                                                   // dc: ac: push rax
+    0x83, 0x3C, 0x25, 0x00, 0x70, 0x00, 0x00, 0x00,         // dd: cmp dword [abs AC_COUNT], 0
+    0x75, 0x26,                                             // e5: jne .again
+    0x48, 0x8B, 0x44, 0x24, 0x08,                           // e7: mov rax, [rsp + 8] ; the first one's error code,
+    0x89, 0x04, 0x25, 0x04, 0x70, 0x00, 0x00,               // ec: mov [abs AC_ERROR], eax
+    0x48, 0x8B, 0x44, 0x24, 0x10,                           // f3: mov rax, [rsp + 16] ; where it came from
+    0x48, 0x89, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00,         // f8: mov [abs AC_RIP], rax
+    0x48, 0x8B, 0x44, 0x24, 0x18,                           // 100: mov rax, [rsp + 24] ; and its CS
+    0x48, 0x89, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,         // 105: mov [abs AC_CS], rax
+    0xFF, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // 10d: .again: inc dword [abs AC_COUNT]
+    0x83, 0x3C, 0x25, 0x00, 0x70, 0x00, 0x00, 0x10,         // 114: cmp dword [abs AC_COUNT], 16
+    0x73, 0x33,                                             // 11c: jae dead ; one after another: not its own
+    0x81, 0x64, 0x24, 0x20, 0xFF, 0xFF, 0xFB, 0xFF,         // 11e: and dword [rsp + 32], ~RFLAGS_AC ; AC off: a split lock alone
+    0x58,                                                   // 126: pop rax
+    0x48, 0x83, 0xC4, 0x08,                                 // 127: add rsp, 8
+    0x48, 0xCF,                                             // 12b: iretq
+    0x48, 0x8B, 0x04, 0x24,                                 // 12d: ud: mov rax, [rsp]
+    0x48, 0x89, 0x04, 0x25, 0x18, 0x70, 0x00, 0x00,         // 131: mov [abs UD_RIP], rax
+    0x48, 0x8B, 0x44, 0x24, 0x08,                           // 139: mov rax, [rsp + 8]
+    0x48, 0x89, 0x04, 0x25, 0x20, 0x70, 0x00, 0x00,         // 13e: mov [abs UD_CS], rax
+    0xC7, 0x04, 0x25, 0x28, 0x70, 0x00, 0x00,               // 146: mov dword [abs DONE], 'SPLK'
+    0x53, 0x50, 0x4C, 0x4B,
+    0xFA,                                                   // 151: dead: cli
+    0xF4,                                                   // 152: .halt: hlt
+    0xEB, 0xFD,                                             // 153: jmp .halt
+    0x66, 0x89, 0x07,                                       // 155: gate: mov word [rdi], ax
+    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // 158: mov word [rdi + 2], 0x08
+    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // 15e: mov word [rdi + 4], 0x8E00
+    0x48, 0xC1, 0xE8, 0x10,                                 // 164: shr rax, 16
+    0x66, 0x89, 0x47, 0x06,                                 // 168: mov word [rdi + 6], ax
+    0x48, 0xC1, 0xE8, 0x10,                                 // 16c: shr rax, 16
+    0x89, 0x47, 0x08,                                       // 170: mov dword [rdi + 8], eax
+    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // 173: mov dword [rdi + 12], 0
+    0xC3,                                                   // 17a: ret
+    0x1F, 0x01,                                             // 17b: idtr: dw 18 * 16 - 1 ; gates 0 to 17
+    0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // 17d: dq IDT_BASE
+    0x37, 0x00,                                             // 185: gdtr: dw 7 * 8 - 1 ; and two entries for ring 3
+    0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // 187: dq GDT_BASE
+];
+
+/* What the guest leaves at `RESULTS`: the #ACs its handler took at +0, the
+ * first one's error code at +4, RIP at +8 and CS at +0x10; where its #UD came
+ * from at +0x18, and CS at +0x20; 'SPLK' at +0x28 once back in ring 0; and its
+ * adds' sum at +0x7E, across the line at +0x80. */
+const SPLITLOCK_ACS: u64 = RESULTS;
+const SPLITLOCK_AC_ERROR: u64 = RESULTS + 0x4;
+const SPLITLOCK_AC_RIP: u64 = RESULTS + 0x8;
+const SPLITLOCK_AC_CS: u64 = RESULTS + 0x10;
+const SPLITLOCK_UD_RIP: u64 = RESULTS + 0x18;
+const SPLITLOCK_UD_CS: u64 = RESULTS + 0x20;
+const SPLITLOCK_DONE: u64 = RESULTS + 0x28;
+const SPLITLOCK_SUM: u64 = RESULTS + 0x7E;
+const SPLITLOCK_MARK: u32 = u32::from_le_bytes(*b"SPLK");
+/// Its adds: fifty in ring 0, fifty more with AM and AC, one in ring 3.
+const SPLITLOCK_ADDS: u32 = 101;
+/// Ring 3's add, and the UD2 after it.
+const SPLITLOCK_USER_ADD: u64 = ENTRY + 0xD1;
+const SPLITLOCK_USER_UD: u64 = ENTRY + 0xDA;
+/// Ring 3's code selector, RPL 3.
+const SPLITLOCK_USER_CS: u64 = 0x33;
+
+const SPLITLOCK_GUEST: OneCpuGuest =
+    OneCpuGuest { name: SPLITLOCK_NAME, about: SPLITLOCK_ABOUT, code: SPLITLOCK_CODE, check: check_split_lock };
+
+/// Every add ran once -- none skipped by a step, none run twice -- and the
+/// guest came back from ring 3 by its UD2 and halted. Where this CPU detects
+/// split locks all 101 were stepped past, and the one #AC its handler took
+/// was ring 3's, from the add; where it does not none was, and that #AC is
+/// the CPU's to raise -- an emulator that checks no alignment raises none.
+fn check_split_lock(m: &GuestMemory, stopped: &Stopped, counts: &Counts) -> core::result::Result<String, String> {
+    let dword = |gpa| m.read_obj::<u32>(gpa).map_err(|e| alloc::format!("its results cannot be read: {}", e));
+    let qword = |gpa| m.read_obj::<u64>(gpa).map_err(|e| alloc::format!("its results cannot be read: {}", e));
+    let (sum, acs) = (dword(SPLITLOCK_SUM)?, dword(SPLITLOCK_ACS)?);
+    let (ac_rip, ac_cs, ac_error) = (qword(SPLITLOCK_AC_RIP)?, qword(SPLITLOCK_AC_CS)?, dword(SPLITLOCK_AC_ERROR)?);
+    if acs > 1 {
+        return Err(alloc::format!("its #AC handler ran {} times, the first at {:#x} from cs {:#x}: a split lock given \
+                                   to the guest as an #AC it never asked for", acs, ac_rip, ac_cs));
+    }
+    if !matches!(stopped.stop, GuestStop::Halted { .. }) {
+        return Err(alloc::format!("it did not run to its halt: its adds summed to {} of {}", sum, SPLITLOCK_ADDS));
+    }
+    let (done, ud_rip, ud_cs) = (dword(SPLITLOCK_DONE)?, qword(SPLITLOCK_UD_RIP)?, qword(SPLITLOCK_UD_CS)?);
+    if done != SPLITLOCK_MARK || ud_rip != SPLITLOCK_USER_UD || ud_cs != SPLITLOCK_USER_CS {
+        return Err(alloc::format!("its mark is {:#x}, and its #UD came from {:#x}, cs {:#x}: wanted ring 3's UD2 at \
+                                   {:#x}", done, ud_rip, ud_cs, SPLITLOCK_USER_UD));
+    }
+    if sum != SPLITLOCK_ADDS {
+        return Err(alloc::format!("its adds summed to {}, not {}: a split lock skipped, or run twice", sum,
+                                  SPLITLOCK_ADDS));
+    }
+    if acs == 1 && (ac_rip != SPLITLOCK_USER_ADD || ac_cs != SPLITLOCK_USER_CS || ac_error != 0) {
+        return Err(alloc::format!("its #AC came from {:#x}, cs {:#x}, error {:#x}: wanted ring 3's add at {:#x}, \
+                                   error 0", ac_rip, ac_cs, ac_error, SPLITLOCK_USER_ADD));
+    }
+    if kcore::cpu::split_lock_detect_here() {
+        if acs != 1 || counts.split_locks != u64::from(SPLITLOCK_ADDS) {
+            return Err(alloc::format!("this CPU detecting split locks, {} were stepped past and its #AC handler ran \
+                                       {} times: wanted all {}, and ring 3's alignment check once",
+                                      counts.split_locks, acs, SPLITLOCK_ADDS));
+        }
+        return Ok(alloc::format!("all {} adds ran once each, every one a split lock stepped past and none given to \
+                                  the guest; ring 3's alignment check its own #AC, to its handler", SPLITLOCK_ADDS));
+    }
+    if counts.split_locks != 0 {
+        return Err(alloc::format!("{} split locks stepped past where this CPU detects none", counts.split_locks));
+    }
+    Ok(alloc::format!("all {} adds ran once each, no split lock detected here; ring 3's alignment check {}",
+                      SPLITLOCK_ADDS,
+                      if acs == 1 { "its own #AC, to its handler" } else { "not raised: the CPU checks no alignment" }))
 }
 
 /* ---- instr: instructions both extensions stop a guest at, answered ---- */

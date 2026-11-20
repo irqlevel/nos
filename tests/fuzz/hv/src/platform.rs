@@ -1322,6 +1322,15 @@ impl vm::Guest for Script {
 
 impl Script {
     fn run(&mut self, v: &mut Backend, mem: &GuestMemory, r: &mut Input) -> Option<vm::Next> {
+        /* The last exit's split lock stepped past -- left standing, the guest
+         * at the same instruction again would only raise it again, for good */
+        invariant!(!v.split_lock, "a split lock's #AC neither stepped past nor given back");
+        /* A step past one asked for: its one instruction run, now or after
+         * an exit that came first (VT-x's monitor trap flag) */
+        if v.stepping && r.bool() {
+            v.stepping = false;
+            return Some(vm::Next::Exit(Exit::Stepped));
+        }
         /* The last write of the base MSR: in force, unless it faulted. */
         if let Some(asked) = self.cpus[self.me].asked_xapic.take() {
             if v.event == Some(vm::Event::Exception(13)) {
@@ -1383,6 +1392,9 @@ impl Script {
                  * event an exit cut short is still on its way in, as
                  * `requeue_event` leaves one, which has to go in first. */
                 let exit = if r.bool() {
+                    /* Under VT-x now and then a split lock, which the host's
+                     * detection raised and the run loop steps past */
+                    v.split_lock = self.vmx && r.bool();
                     Exit::Exception { vector: 17, error: Some(0) }
                 } else {
                     Exit::Exception { vector: 1, error: None }

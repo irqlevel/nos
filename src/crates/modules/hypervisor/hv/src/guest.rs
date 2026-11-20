@@ -10,6 +10,7 @@ use core::fmt::Write;
 use alloc::boxed::Box;
 
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use hv::linux::Header;
 use hv::place::Shape;
@@ -1025,6 +1026,10 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
         let _ = writeln!(out, "  answered   {} #UD for instructions CPUID did not offer, {} WBINVD stepped past, {} CR8 from the shadow TPR, {} CR0 writes (VT-x), {} #DB and #AC given back",
             total.ud, total.wbinvd, total.cr8, total.cr0, total.reflected);
     }
+    if total.split_locks != 0 {
+        let _ = writeln!(out, "  splitlock  {} split locks -- locked accesses across two cache lines -- stepped past with \
+                               the host's detection off for each", total.split_locks);
+    }
     if total.cr4 != 0 {
         let _ = writeln!(out, "  cr4        {} reads and writes performed, {} writes refused with #GP",
             total.cr4, total.cr4_gp);
@@ -1385,6 +1390,50 @@ impl Esc {
 /// boot's worth goes through whole.
 const LOG_BURST: u64 = 1000;
 const LOG_LINES_PER_SEC: u64 = 50;
+
+/// A guest's split locks said at most once in this long: one spinning on a
+/// split lock is millions of them, the log one line of it every five seconds
+/// with how many came between.
+const SPLIT_LOCK_SAY_NS: u64 = 5 * NS_PER_SEC;
+
+/// A guest's split locks for the kernel log (`Host::split_lock`): the first
+/// said, and then one line a `SPLIT_LOCK_SAY_NS` at most, whatever its CPUs
+/// do -- each of them on its own task, so no lock: an atomic when the last
+/// line was said, and one of how many came since that were not.
+pub struct SplitLocks {
+    said: AtomicU64,
+    unsaid: AtomicU64,
+}
+
+impl SplitLocks {
+    pub const fn new() -> SplitLocks {
+        SplitLocks { said: AtomicU64::new(0), unsaid: AtomicU64::new(0) }
+    }
+
+    /// CPU `cpu` of the guest `who` names made a split lock at `rip`, which
+    /// the run loop steps it past: said, unless one was said lately or
+    /// another of its CPUs is saying one now -- then counted for the next.
+    pub fn note(&self, who: core::fmt::Arguments<'_>, cpu: u32, rip: u64) {
+        /* 0 is "never said": a boot's first nanosecond is taken as its second */
+        let now = kcore::time::boot_time_ns().max(1);
+        let last = self.said.load(Ordering::Acquire);
+        if (last != 0 && now.saturating_sub(last) < SPLIT_LOCK_SAY_NS)
+            || self.said.compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire).is_err()
+        {
+            self.unsaid.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let unsaid = self.unsaid.swap(0, Ordering::AcqRel);
+        if unsaid == 0 {
+            kcore::klog!(0, "hv: {}: a split lock at rip {:#x} on its cpu {} -- a locked access across two cache lines, \
+                             the bus taken from every core while it ran", who, rip, cpu);
+        } else {
+            kcore::klog!(0, "hv: {}: a split lock at rip {:#x} on its cpu {} -- a locked access across two cache lines, \
+                             the bus taken from every core while it ran; {} more since the last line", who, rip, cpu,
+                         unsaid);
+        }
+    }
+}
 
 /// A guest's console for the kernel log, a line at a time: printable ASCII
 /// only, escape sequences left out whole, the line cut at `LOG_LINE`; and
