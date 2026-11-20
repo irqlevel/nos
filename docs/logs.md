@@ -33,9 +33,10 @@ each VM -- made (`hv create`, from a cloud's image or an image of NBS's),
 cloned, deleted, started (on which CPUs, with what kernel, memory and
 command line), started again, stopped and after how long, and why; a
 start, a make or a clone that failed and why; a move to another host and
-one come from another, and what went wrong on either side; a disk of
-NBS's attached and let go of; a cluster network's tunnel to a host that
-stopped answering, a port vnet revoked. A VM is `vm <number> (<name>)`,
+one come from another, and what went wrong on either side; a split lock a
+guest made (one a VM every five seconds at most, with how many came
+between); a disk of NBS's attached and let go of; a cluster network's
+tunnel to a host that stopped answering, a port vnet revoked. A VM is `vm <number> (<name>)`,
 or `vm <number>` for one started from a kernel's path. The module itself --
 loaded, unloaded, its extension on and off, a warning of its own -- and a
 host's device given to a guest stay in the kernel log, as do the lines of

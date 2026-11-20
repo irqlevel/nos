@@ -268,8 +268,9 @@ MSR's write, and a #GP there would be a panic at boot.
   back to the guest as before -- as KVM's `vmx_guest_inject_ac` does
   (`Guest::read_split_lock`). An #AC the guest never asked for would kill
   it: a Linux kernel dies of one in kernel mode. So a split lock is said in
-  the log instead -- `hv: vm 3: a split lock at rip 0x... on its cpu 1`,
-  once every five seconds a VM at most, with how many came between -- and
+  the hypervisor's file log instead, `/logs/hv.log` ([File logs](logs.md))
+  -- `vm 3 (web): a split lock at rip 0x... on its cpu 1`, once every five
+  seconds a VM at most, with how many came between -- and
   the guest is stepped past it: the CPU's detection off for that one
   instruction, the monitor trap flag on to end the run right after it, the
   detection on again at that exit, interrupts off throughout
