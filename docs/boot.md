@@ -102,7 +102,16 @@ and take mutexes.
 - The IOAPIC is enabled and the tick source chosen: HPET in legacy
   replacement mode if there is one, otherwise the PIT. Both land on the GSI
   that ACPI maps ISA IRQ 0 to. The 8042 keyboard takes vector 0x21, the
-  serial port 0x24.
+  serial port 0x24 -- and from then on a log line waits for no UART
+  (`Serial::start_tx_interrupt`): it goes into the driver's ring, 256 KiB,
+  and out of it into the 16550's FIFO as the FIFO's "empty" interrupt asks,
+  a timer looking every 100 ms for one that never came. Until then, and
+  before this change for good, a line waited for its bytes at 115200 baud
+  -- 8 ms a line, nine of Newton's sixteen seconds of boot, its COM1 wired
+  to nothing. A ring that fills makes its writer wait for room, as every
+  writer once did; a panic sends the ring's newest 2 KiB before its report
+  and says how much it skipped, and a halt or a reset the newest 8 KiB,
+  every line after it waited for again.
 - virtio-blk and virtio-scsi come up and their partitions are probed.
 - `NetFramePool::setup()` (sized by `netframes=`). The pool is built before
   any driver can want a frame — the Rust NIC drivers too, which fill their
@@ -144,12 +153,16 @@ and take mutexes.
 ## x86-64: the application processors
 
 `CpuTable::start_all` (`arch/x86_64/cpu_start.cpp`) walks the CPUs ACPI
-reported and brings them up **one at a time**: INIT, 10 ms, then up to two
-SIPIs 200 µs apart pointing at `ap_start16 >> 12`, then poll for up to a
-second. One at a time costs the 10 ms INIT delay per CPU and buys two
-things — the trace line names the CPU being poked, so a machine that dies
-during bring-up says which one it choked on, and the APs no longer race each
-other through the dmesg lock and the heap on their way up.
+reported and brings them up **one at a time**: INIT, 10 ms where the CPU
+wants them, then up to two SIPIs 200 µs apart pointing at `ap_start16 >>
+12`, then poll for up to a second. The 10 ms after INIT are the MP
+specification's, for parts before Intel's family 6 and AMD's 0Fh; Linux
+waits none from those on (`smp_quirk_init_udelay`), nor does nos
+(`init_delay_needed`, by `cpu_vendor` and `cpu_family` in `cpuid.h`) -- on
+Newton's 48 CPUs they were half a second of the boot. One at a time buys
+two things — the trace line names the CPU being poked, so a machine that
+dies during bring-up says which one it choked on, and the APs no longer
+race each other through the dmesg lock and the heap on their way up.
 
 The AP path is the BSP's, minus the parts that only happen once:
 
