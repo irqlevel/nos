@@ -108,6 +108,11 @@
 set -euo pipefail
 # A failure inside $(...) is a failure too (bash 4.4 and later)
 shopt -s inherit_errexit 2>/dev/null || true
+# Under pipefail a reader that leaves a pipe early -- grep -q at its match --
+# makes the writer's SIGPIPE the pipeline's answer: a "no" for what was
+# there, whenever the writer had more to write after it, as efibootmgr 18
+# has, which writes its listing an entry at a time. So what a command
+# prints is read whole, into a variable, and only then looked at
 umask 022
 export LC_ALL=C
 
@@ -425,9 +430,10 @@ MOUNTED_HERE=0
 # any mount would: e2fsck -fn looks at what the replay leaves (-y with
 # journal_only and no -f replays, and goes no further)
 fsck_partition() {
-    local dev=$1 when=$2
+    local dev=$1 when=$2 features
     [ -z "$(findmnt -rno TARGET --source "$dev" 2>/dev/null || true)" ] || return 0
-    if dumpe2fs -h "$dev" 2>/dev/null | grep -q '^Filesystem features:.*needs_recovery'; then
+    features=$(dumpe2fs -h "$dev" 2>/dev/null | sed -n 's/^Filesystem features://p' || true)
+    if grep -qw needs_recovery <<< "$features"; then
         say "replaying the journal of $dev"
         e2fsck -y -E journal_only "$dev" >/dev/null 2>&1 || true
     fi
@@ -439,11 +445,11 @@ fsck_partition() {
 
 # Mounted where the system has it, or here; "ro" for a look only
 mount_partition() {
-    local dev=$1 how=${2:-rw} mp
+    local dev=$1 how=${2:-rw} mp options
     mp=$(findmnt -rno TARGET --source "$dev" 2>/dev/null | head -n 1 || true)
     if [ -n "$mp" ]; then
-        [ "$how" = ro ] ||
-            findmnt -rno OPTIONS --source "$dev" | head -n 1 | grep -qE '(^|,)rw(,|$)' ||
+        options=$(findmnt -rno OPTIONS --source "$dev" 2>/dev/null | head -n 1 || true)
+        [ "$how" = ro ] || grep -qE '(^|,)rw(,|$)' <<< "$options" ||
             die "$dev is mounted read-only at $mp"
         MNT=$mp
         MOUNTED_HERE=0
@@ -1536,7 +1542,7 @@ blank_partition() {
 # left as it is. Both find the root ($2 mounted) by its UUID, and their
 # modules are on it, in /boot/grub
 install_grub() {
-    local disk=$1 root=$2 esp=$3 log dir sb=()
+    local disk=$1 root=$2 esp=$3 log dir help sb=()
     log=$(mktemp /tmp/nos-grub.XXXXXX)
     TEMP_DIRS+=("$log")
     if [ "$GRUB_BIOS" = 1 ]; then
@@ -1555,7 +1561,8 @@ install_grub() {
         # GRUB there unless told not to -- a GRUB that looks for its
         # configuration in /EFI/<their name> on this partition, not on nos's
         # root
-        if "$GRUB_INSTALL" --help 2>&1 | grep -q -- --no-uefi-secure-boot; then
+        help=$("$GRUB_INSTALL" --help 2>&1 || true)
+        if grep -q -- --no-uefi-secure-boot <<< "$help"; then
             sb=(--no-uefi-secure-boot)
         fi
         say "GRUB for UEFI: \\EFI\\BOOT\\BOOTX64.EFI on $esp"
@@ -1674,43 +1681,72 @@ disk_esp() {
 
 # The number of the firmware's entry that boots \EFI\BOOT\BOOTX64.EFI off the
 # partition with GPT GUID $1 -- one the firmware made for that path by itself
-# (AMI's "UEFI OS"), or ours -- as efibootmgr -v lists them; nothing for none
+# (AMI's "UEFI OS"), or ours -- as efibootmgr -v lists them: the first of
+# them that is on; with $2 "any", where none is, the first that is off;
+# nothing for none
 efi_find() {
-    local guid
+    local guid listing
     guid=$(printf '%s' "$1" | tr 'A-F' 'a-f')
-    "$EFIBOOTMGR" -v 2>/dev/null | tr 'A-Z' 'a-z' | awk -v g="gpt,$guid," '
+    listing=$("$EFIBOOTMGR" -v 2>/dev/null | tr 'A-Z' 'a-z' || true)
+    # An entry's first word is Boot#### and a "*" where it is on
+    awk -v g="gpt,$guid," -v any="${2:-}" '
         /^boot[0-9a-f][0-9a-f][0-9a-f][0-9a-f]/ && index($0, g) && index($0, "\\efi\\boot\\bootx64.efi") {
-            print toupper(substr($1, 5, 4))
-            exit
-        }' || true
+            if (substr($1, 9, 1) == "*") {
+                on = toupper(substr($1, 5, 4))
+                exit
+            }
+            if (off == "")
+                off = toupper(substr($1, 5, 4))
+        }
+        END {
+            if (on != "")
+                print on
+            else if (any == "any" && off != "")
+                print off
+        }' <<< "$listing"
 }
 
-# The entry for the EFI System partition $2 of disk $1, made where the
-# firmware has none, and turned on where it is off: its number on stdout
+# The entry for the EFI System partition $2 of disk $1, on -- its number on
+# stdout: the firmware's where one of its is on; else the one it has, off,
+# turned on; else one of nos's own, made. Off, an entry is one the firmware
+# passes over even as BootNext (edk2's boot manager, AMI's with it). And
+# efibootmgr 18 -- Ubuntu 24.04's, Debian 12's -- turns on only the last
+# entry it lists: any other it says it cannot find (rhboot/efibootmgr#186),
+# so whether one was turned on is read back, and nos's own is made where not
 efi_entry() {
-    local disk=$1 esp=$2 guid num part
+    local disk=$1 esp=$2 guid num off part
     guid=$(blkid -p -o value -s PART_ENTRY_UUID "$esp" 2>/dev/null || true)
     if [ -z "$guid" ]; then
         warn "$esp has no GPT partition GUID"
         return 1
     fi
     num=$(efi_find "$guid")
-    if [ -z "$num" ]; then
-        part=$(blkid -p -o value -s PART_ENTRY_NUMBER "$esp" 2>/dev/null || true)
-        if ! "$EFIBOOTMGR" -q -C -d "$disk" -p "$part" -L nos -l '\EFI\BOOT\BOOTX64.EFI' >/dev/null 2>&1; then
-            warn "efibootmgr could not make a boot entry for $esp"
-            return 1
-        fi
+    if [ -n "$num" ]; then
+        echo "$num"
+        return 0
+    fi
+    off=$(efi_find "$guid" any)
+    if [ -n "$off" ]; then
+        "$EFIBOOTMGR" -q -b "$off" -a >/dev/null 2>&1 || true
         num=$(efi_find "$guid")
-        if [ -z "$num" ]; then
-            warn "efibootmgr made a boot entry for $esp that it then does not list"
-            return 1
+        if [ -n "$num" ]; then
+            say "the firmware's boot entry Boot$num for \\EFI\\BOOT\\BOOTX64.EFI on $esp was off: turned on" >&2
+            echo "$num"
+            return 0
         fi
-        say "the firmware's boot entry Boot$num, nos: \\EFI\\BOOT\\BOOTX64.EFI on $esp" >&2
+        say "the firmware's boot entry Boot$off for \\EFI\\BOOT\\BOOTX64.EFI on $esp is off, and efibootmgr cannot turn it on: an entry of nos's own is made beside it" >&2
     fi
-    if ! "$EFIBOOTMGR" 2>/dev/null | grep -q "^Boot$num\*"; then
-        "$EFIBOOTMGR" -q -b "$num" -a >/dev/null 2>&1 || warn "efibootmgr could not turn Boot$num on"
+    part=$(blkid -p -o value -s PART_ENTRY_NUMBER "$esp" 2>/dev/null || true)
+    if ! "$EFIBOOTMGR" -q -C -d "$disk" -p "$part" -L nos -l '\EFI\BOOT\BOOTX64.EFI' >/dev/null 2>&1; then
+        warn "efibootmgr could not make a boot entry for $esp"
+        return 1
     fi
+    num=$(efi_find "$guid")
+    if [ -z "$num" ]; then
+        warn "efibootmgr made a boot entry for $esp that it then does not list as on"
+        return 1
+    fi
+    say "the firmware's boot entry Boot$num, nos: \\EFI\\BOOT\\BOOTX64.EFI on $esp" >&2
     echo "$num"
 }
 
