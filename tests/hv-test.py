@@ -357,6 +357,10 @@ GUESTS = {
     "posted": [r"the first CPU took all 1000 of the second's IPIs while it spun, the host handing each over"],
     "debug": [r"both #DBs its own handler's: the single step's with DR6\.BS, after the NOP; the ICEBP's with no bit",
               r"2 exceptions given back"],
+    # Every add once, whoever detects split locks: stepped past where the
+    # CPU does (the EX44's, Hertz's -- not under QEMU, which gives a guest
+    # no detection), run straight through where it does not.
+    "splitlock": [r"all 101 adds ran once each"],
     # RSM, any CPL's, once stopped its whole VM under AMD-V, and INVD the
     # guest's kernel's under both: a #UD of its own, and stepped past.
     "instr": [r"its RSM a #UD of its own handler's, at the RSM -- (?:the host's to give|the CPU's own); its INVD "

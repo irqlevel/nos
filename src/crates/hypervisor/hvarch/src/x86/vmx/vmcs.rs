@@ -238,6 +238,9 @@ pub const PROC_USE_TPR_SHADOW: u32 = 1 << 21;
 /// addresses are the CPU's, not the VMCS's, and DR6 is no field either.
 pub const PROC_MOV_DR_EXITING: u32 = 1 << 23;
 pub const PROC_UNCOND_IO_EXITING: u32 = 1 << 24;
+/// The monitor trap flag: an exit after the guest's next instruction -- or
+/// the event an entry delivers -- reason 37 (`reason::MONITOR_TRAP_FLAG`).
+pub const PROC_MONITOR_TRAP_FLAG: u32 = 1 << 27;
 pub const PROC_USE_MSR_BITMAPS: u32 = 1 << 28;
 pub const PROC_MONITOR_EXITING: u32 = 1 << 29;
 /// Every PAUSE exits: a guest spin-waiting is stopped every few
@@ -401,6 +404,7 @@ pub mod reason {
     pub const ENTRY_FAIL_GUEST_STATE: u32 = 33;
     pub const ENTRY_FAIL_MSR_LOAD: u32 = 34;
     pub const MWAIT: u32 = 36;
+    pub const MONITOR_TRAP_FLAG: u32 = 37;
     pub const MONITOR: u32 = 39;
     pub const PAUSE: u32 = 40;
     /// The guest's VTPR, written under the TPR shadow, dropped below the
