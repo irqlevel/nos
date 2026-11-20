@@ -233,6 +233,21 @@ Two independent gates:
   sides; a read lock has many holders at once, so `read_lock()` hands back
   whose count it raised and `read_unlock()` takes it, the way
   `write_lock_irq_save()` hands back its flags.
+- **How a spinlock is waited for.** One `cmpxchg` takes a free lock and is
+  the whole of `acquire`. A taker that finds it held waits by *reading* it
+  (`RawSpinLock::contend`) and tries the `cmpxchg` again only once it reads
+  free: a read shares the lock's cache line with every other waiter, where a
+  `cmpxchg` takes the line for itself, from the holder too, whose every write
+  to it -- the stamp, the release -- then waits its turn behind the
+  waiters'. The release is a store with release order (`Atomic::set_release`:
+  a plain `MOV` on x86-64, `STLR` on arm64) and the watchdog's stamp a
+  relaxed one; they were `lock xchg`s, each a full barrier. On Newton's two
+  sockets of 48 CPUs, every one of them taking the same lock at each
+  allocation and free (`heapbench`'s 64 KiB pairs, on a build that did), a
+  pair took 330 µs with the waiters on `cmpxchg` and 94 µs with them
+  reading; on one CPU a 64-byte pair, two locks taken and let go of, went
+  from 460 ns to 379 ns. A pause after a lost `cmpxchg`, doubling up to 16,
+  64 or 256 pauses, measured no different there and is not done.
 
 Involuntary preemption comes from the per-CPU timer tick — the local APIC
 timer on x86-64, the generic timer on arm64, both at 100 Hz — whose handler
