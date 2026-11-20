@@ -1727,6 +1727,16 @@ impl Vfs {
         Some(slot.mount.as_ref()?.fs.tree().get(node)?.size)
     }
 
+    /// Whether anything at or under `path` is open -- a file somebody reads,
+    /// a disk's image: what a rename or a remove of it is refused for, asked
+    /// first by whoever would rather wait than be refused, and said so in
+    /// the log (the file logs' rotation). None when the path names nothing.
+    pub fn is_open(&self, path: &[u8]) -> Option<bool> {
+        let (slot, resolved) = self.lock_resolved(path)?;
+        let node = resolved.node?;
+        Some(slot.mount.as_ref()?.fs.tree().has_open_files(node))
+    }
+
     pub fn create(&self, path: &[u8], directory: bool) -> bool {
         self.try_create(path, directory).is_some()
     }
