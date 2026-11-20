@@ -1,8 +1,8 @@
 # Real hardware
 
-`nos` boots on bare metal. Seven machines so far, and they pull in opposite
-directions: a laptop whose only console is its own screen, and six
-servers — five Intel, one AMD — whose only console is the network, one of
+`nos` boots on bare metal. Eight machines so far, and they pull in opposite
+directions: a laptop whose only console is its own screen, and seven
+servers — six Intel, one AMD — whose only console is the network, one of
 them fifteen years old and two of them of two sockets.
 
 ## Dell Latitude 5480
@@ -493,10 +493,50 @@ empty ports, and 10 ms after each AP's INIT. What is left of the nine is
 the early boot's, before the UART's interrupt is set up -- a few lines a
 CPU of the MADT and the SRAT.
 
+## Kovalevskaya: a Supermicro X11SSL-F
+
+A **Supermicro X11SSL-F** (AMI UEFI 3.6 of 2025, Secure Boot off): the
+X11SSD-F's **Xeon E3-1230 v6** and C236 again, 32 GiB, Ubuntu on one Intel
+SSD and nos on another, its console the network. Nothing on it was new to
+nos, and it was set up as [Install](install.md) says a server is: from its
+Ubuntu, with the one-line installer -- `curl -fsSL
+https://nos-os.tech/install.sh | sh -s -- disk <the SSD's WWN>
+--network-here --ssh-key /root/.ssh/authorized_keys --keep-boot-order` --
+the SSD made nos's own, Ubuntu left the firmware's default.
+
+- **Its SATA is the C236's AHCI HBA** (8086:a102, six ports): nos's SSD,
+  Ubuntu's and two Seagate disks of 2 TB, `adc` to `adf` on ports 2 to 5,
+  at 6 Gbps.
+- **Its NICs are two Intel I210** (8086:1533) on the board, the AX41's
+  part; `eth0` is 01:00.0, the cabled port. Its MAC latches no speed when
+  the link first comes, as the AX41's did, and `igb` forces what the PHY
+  resolved: 1000 Mbit/s full duplex, 4.5 s after the PHY's reset.
+- **Its network hands out no address** (`--network-here`: `/etc/net.toml`).
+- **Its TCO watchdog is the firmware's**, as on the X11SSD-F -- NO_REBOOT
+  behind the P2SB the firmware hides -- so a boot on trial comes back by
+  `deadman=`.
+- **VT-x is on** (`hv run` runs its guests), and one VT-d unit, with
+  interrupt remapping, waits for `iommu=on`.
+- **Its efibootmgr is 18**, Ubuntu 24.04's, which writes its listing an
+  entry at a time and turns on (`-a`) only the last entry it lists
+  (rhboot/efibootmgr#186). The first made `nos-install boot` warn here that
+  it could not turn on the entry it had just made, on all along: its
+  `efibootmgr | grep -q` under pipefail read efibootmgr's SIGPIPE as "off".
+  The second would leave an entry of the firmware's that is off as the next
+  boot, which firmware passes over. nos-install now reads the listing whole
+  before it looks, and makes an entry of nos's own where the firmware's
+  stays off.
+
+Its BootOrder tries both I210 ports' PXE before Ubuntu; `nos-install boot`
+has the firmware boot nos next, once, and BootNext skips the PXE: 62 s from
+Ubuntu's reboot to nos's kernel, the root mounted from `adc3` 6.8 s into the
+boot, `boot: complete` at 7.2, sshd listening at once. The CPU already runs
+microcode 0xfa, newer than Ubuntu's file (0xf8), so nos loads none.
+
 The boxes before Hertz were set up by hand, before there was a release image
 to set one up from. A new server is set up with `nos-install` from the system image,
 which makes the partition, the GRUB entry and the one-shot flag that the
 sections above describe building by hand ([Install](install.md)).
 
 Other firmware, chipsets, NICs and disks are untested; treat bare-metal support
-as "works on the seven machines it was debugged on".
+as "works on the eight machines it was debugged on".

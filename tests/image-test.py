@@ -314,7 +314,14 @@ first_mib() { dd if="$1" bs=1M count=1 status=none | sha256sum | cut -d' ' -f1; 
 blank_mib() { [ -z "$(dd if="$1" bs=1M count=1 status=none | tr -d '\000' | head -c 1)" ]; }
 # efibootmgr's stand-in, over a firmware's entries kept in $EFI_STATE: lists
 # them as efibootmgr does (-v with the device paths), and takes -o, -n, -a
-# and -C as efibootmgr does, each call's arguments kept in $EFI_STATE.log
+# and -C as efibootmgr does, each call's arguments kept in $EFI_STATE.log.
+# As efibootmgr 18 does -- Ubuntu 24.04's, Debian 12's: the listing an entry
+# at a time, read from efivarfs in between, so a reader that leaves at what
+# it wanted (grep -q) leaves it writing into a closed pipe, which pipefail
+# takes for the answer -- what made nos-install warn on the Supermicro
+# X11SSL-F that it could not turn on an entry that was on; a new entry the
+# lowest number no entry has, on, listed in its place; and -a finding only
+# the last entry it lists, every other one "not found" (rhboot/efibootmgr#186)
 cat > "$T/efibootmgr" <<'FAKE'
 #!/bin/bash
 state=$EFI_STATE
@@ -343,17 +350,40 @@ if [ -n "$next" ]; then
     echo "BootNext: $next" >> "$state.new"
     mv "$state.new" "$state"
 fi
-[ "$activate" = 0 ] || sed -i "s/^Boot$num  /Boot$num* /" "$state"
+if [ "$activate" = 1 ]; then
+    if [ "$(grep -o '^Boot[0-9A-F]\{4\}' "$state" | tail -n 1)" != "Boot$num" ]; then
+        printf 'efibootmgr: Boot entry %x not found\n' $((16#$num)) >&2
+        exit 16
+    fi
+    sed -i "s/^Boot$num  /Boot$num* /" "$state"
+fi
 if [ "$create" = 1 ]; then
     guid=$(blkid -p -o value -s PART_ENTRY_UUID "${disk}p$part")
-    last=$(grep -o '^Boot[0-9A-F]\{4\}' "$state" | cut -c5- | sort | tail -n 1)
-    printf 'Boot%04X* %s\tHD(%s,GPT,%s,0x800,0x100000)/File(%s)\n' $((16#$last + 1)) "$label" "$part" "$guid" "$loader" >> "$state"
+    n=0
+    while grep -q "^Boot$(printf %04X $n)" "$state"; do
+        n=$((n + 1))
+    done
+    NUM=$(printf %04X $n) \
+    LINE=$(printf 'Boot%04X* %s\tHD(%s,GPT,%s,0x800,0x100000)/File(%s)' $n "$label" "$part" "$guid" "$loader") \
+        awk '!put && /^Boot[0-9A-F][0-9A-F][0-9A-F][0-9A-F]/ && substr($0, 5, 4) > ENVIRON["NUM"] {
+                 print ENVIRON["LINE"]
+                 put = 1
+             }
+             { print }
+             END { if (!put) print ENVIRON["LINE"] }' "$state" > "$state.new"
+    mv "$state.new" "$state"
 fi
 [ -z "$order$next$num" ] && [ "$create" = 0 ] || exit 0
+slowly() {
+    while IFS= read -r line; do
+        printf '%s\n' "$line"
+        sleep 0.02
+    done
+}
 if [ "$verbose" = 1 ]; then
-    cat "$state"
+    slowly < "$state"
 else
-    sed 's/\t.*//' "$state"
+    sed 's/\t.*//' "$state" | slowly
 fi
 FAKE
 chmod 755 "$T/efibootmgr"
@@ -361,7 +391,9 @@ chmod 755 "$T/efibootmgr"
 # them when it booted its old Ubuntu after an install of nos -- PXE on its two
 # ports first, the Ubuntu entry, HTTP boot, AMI's own "UEFI OS" entries, the
 # shell, a legacy one turned off; with $1 the GPT GUID of a "UEFI OS" entry's
-# EFI System partition, and none for nos's when $1 is empty
+# EFI System partition, and none for nos's when $1 is empty; with $2 too, an
+# entry numbered after that one -- the firmware's IPv6 PXE, out of the order
+# -- which leaves it not the last efibootmgr lists
 efi_state() {
     cat <<EOF
 BootCurrent: 0000
@@ -379,6 +411,9 @@ Boot006A* UEFI OS	HD(2,GPT,12fe60cd-809b-4681-ac0f-67a3e80e0f7f,0x1000,0x2f800)/
 EOF
     if [ -n "${1:-}" ]; then
         printf 'Boot006B  UEFI OS\tHD(2,GPT,%s,0x1000,0x100000)/File(\\EFI\\BOOT\\BOOTX64.EFI)0000424f\n' "$1"
+    fi
+    if [ -n "${2:-}" ]; then
+        printf 'Boot006C* UEFI: PXE IPv6 Intel(R) I350 Gigabit Network Connection\tPciRoot(0x0)/Pci(0x1,0x1)/Pci(0x0,0x0)/MAC(ac1f6b205352,1)/IPv6([::]:<->[::]:,0,0)0000424f\n'
     fi
 }
 # nos-install under UEFI, the firmware the stand-in's
@@ -517,6 +552,12 @@ efi_state "$esp_guid" > efi-default
 EFI_STATE="$T/efi-default" efi_install boot --default > efi-default.out 2>&1 || { cat efi-default.out; exit 1; }
 cat efi-default.out efi-default.log
 grep -E '^(BootOrder|BootNext|Boot006B)' efi-default
+# ... with AMI's entry off and not the last efibootmgr lists, which
+# efibootmgr 18 cannot turn on: an entry of nos's own made beside it
+efi_state "$esp_guid" after > efi-off
+EFI_STATE="$T/efi-off" efi_install boot > efi-off.out 2>&1 || { cat efi-off.out; exit 1; }
+cat efi-off.out efi-off.log
+grep -E '^(BootOrder|BootNext|Boot0001|Boot006B)' efi-off
 # The network as this Linux has it, for nos: a rescue system's is the server's
 command -v ip > /dev/null ||
     { echo "no ip here (iproute2): a builder image older than the Dockerfile -- docker build -t nos-builder ."; exit 1; }
@@ -879,12 +920,18 @@ def run_disk(tmp, linux, key, want):
     check("disk writes /etc/net.toml: DHCP, given no network", nettoml_values(disk_nettoml) == {"dhcp": "true"},
           disk_nettoml)
     efi = linux.read("efi-before")
+    efi_log = linux.read("efi-before.log")
     esp_guid = linux.read("esp-guid.out").strip()
-    check("under UEFI, with no entry of the firmware's for the disk, one is made for its \\EFI\\BOOT\\BOOTX64.EFI",
-          ("Boot006B* nos\tHD(2,GPT,%s," % esp_guid) in efi and "File(\\EFI\\BOOT\\BOOTX64.EFI)" in efi,
-          efi + linux.read("efi-before.log"))
+    check("under UEFI, with no entry of the firmware's for the disk, one is made for its \\EFI\\BOOT\\BOOTX64.EFI "
+          "-- the lowest number free, as efibootmgr takes it",
+          ("Boot0001* nos\tHD(2,GPT,%s," % esp_guid) in efi and "File(\\EFI\\BOOT\\BOOTX64.EFI)" in efi,
+          efi + efi_log)
     check("and put right after the leading PXE entries, nothing else moved: the Supermicro's old Ubuntu next",
-          "BootOrder: 0067,0069,006B,0000,0066,0068,006A,0064,0063" in efi, efi)
+          "BootOrder: 0067,0069,0001,0000,0066,0068,006A,0064,0063" in efi, efi)
+    check("the entry it made is on, and is not turned on again, nor said to be off -- efibootmgr's listing read "
+          "whole, an entry at a time as efibootmgr 18 writes it",
+          all("-a" not in line.split() for line in efi_log.splitlines()) and "could not turn" not in disk_out,
+          efi_log + disk_out)
 
     m = Machine(tmp, key)
     for name, firmware in (("BIOS", None), ("UEFI", ovmf())):
@@ -943,6 +990,14 @@ def run_disk(tmp, linux, key, want):
     check("boot --default puts that entry right after PXE's, for good: the order the Supermicro needed",
           "BootOrder: 0067,0069,006B,0000,0066,0068,006A,0064,0063" in default and "BootNext" not in default and
           "Boot006B* UEFI OS" in default, default + linux.read("efi-default.log"))
+    off = linux.read("efi-off")
+    off_out = linux.read("efi-off.out")
+    check("boot under UEFI, the firmware's entry for the disk off and not the last efibootmgr lists -- which "
+          "efibootmgr 18 cannot turn on: an entry of nos's own is made beside it, on, BootNext is that one, the order "
+          "as it was, and nothing is warned",
+          "BootNext: 0001" in off and ("Boot0001* nos\tHD(2,GPT,%s," % esp_guid) in off and
+          "Boot006B  UEFI OS" in off and "BootOrder: 0067,0069,0000,0066,0068,006A,006B,0064,0063" in off and
+          "WARNING" not in off_out, off + off_out + linux.read("efi-off.log"))
     here = [line for line in out.splitlines() if line.startswith("here: ")]
     nettoml3 = linux.read("disk-nettoml3.out")
     got = nettoml_values(nettoml3)
