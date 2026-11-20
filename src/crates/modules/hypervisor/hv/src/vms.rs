@@ -770,7 +770,7 @@ impl Host for VmHost {
     }
 
     fn split_lock(&self, cpu: u32, rip: u64) {
-        self.shared.split_locks.note(format_args!("vm {}", self.shared.id), cpu, rip);
+        self.shared.split_locks.note(format_args!("{}", self.shared.label), cpu, rip);
     }
 
     fn progress(&self, cpu: u32, counts: &Counts) {

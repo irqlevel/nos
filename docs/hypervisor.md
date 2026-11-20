@@ -765,8 +765,8 @@ on on every entry, whatever the VMCB says:
   Giving them back to a guest that expects them is the policy's to do --
   but for an #AC under VT-x on a host that detects split locks, which is
   not the guest's own alignment check (CR0.AM and RFLAGS.AC in ring 3) but
-  the host's detection of a split lock: that one is said in the log, once
-  every five seconds a VM at most, and the guest stepped past it with the
+  the host's detection of a split lock: that one is said in `/logs/hv.log`,
+  once every five seconds a VM at most, and the guest stepped past it with the
   detection off for that instruction alone, by the monitor trap flag
   (`Guest::read_split_lock`, `step_split_lock`; [Boot](boot.md#split-locks)).
   The `splitlock` built-in guest is the check;
@@ -4043,7 +4043,7 @@ started on cpus 2,3 -- ...`), or restored, and a start that failed and
 why; booting again and why, reset too often and left stopped, stopped
 after how long and why, not run; a move to another host and its rounds,
 pause and bytes, one come from another, and every step of either that
-went wrong; a disk of NBS's attached, let go of, or out of memory for a
+went wrong; a split lock a guest made; a disk of NBS's attached, let go of, or out of memory for a
 request; a cluster network's tunnel to a host that stopped answering or
 cannot carry the MTU, a port vnet revoked, vnet gone from the host and
 back. Lines that can repeat -- a failed start a script asks again, a
