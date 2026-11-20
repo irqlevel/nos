@@ -223,21 +223,7 @@ bool PageAllocatorImpl::setup()
         return false;
     }
 
-    ulong kept_pages = stdlib::min<ulong>(KEPT_PAGES_MAX, free_pages_count / KEPT_RAM_SHARE);
-    for (size_t i = 0; i < stdlib::array_size(kept_blocks_); i++)
-    {
-        stdlib::AutoLock lock(kept_blocks_[i].lock);
-        kept_blocks_[i].limit = kept_pages >> i;
-    }
-
-    /* A CPU keeps no more of a size than kept_blocks_ may: on a machine too
-       small to keep any, none */
-    for (auto& cpu : cpu_kept_blocks_)
-    {
-        stdlib::AutoLock lock(cpu.lock);
-        for (size_t i = 0; i < CPU_KEPT_LOGS; i++)
-            cpu.sizes[i].limit = stdlib::min<ulong>(CPU_KEPT_PAGES >> i, kept_blocks_[i].limit);
-    }
+    set_kept_limits(free_pages_count);
 
     /* Nothing held back yet: the addresses the quarantine holds are of the
        allocators set up above */
@@ -393,7 +379,7 @@ bool PageAllocatorImpl::keep(size_t log, void* ptr)
     if (cpu == nullptr)
         return keep_shared(log, block);
 
-    Kept* spill[CPU_KEPT_PAGES];
+    Kept* spill[CPU_KEPT_MAX];
     ulong spilled = 0;
     bool cached = false;
     {
@@ -422,9 +408,9 @@ bool PageAllocatorImpl::keep(size_t log, void* ptr)
 
     /* With this CPU's lock let go of: what kept_blocks_ has no room for is
        unmapped, and the shootdown waits on every other CPU */
-    for (ulong i = 0; i < spilled; i++)
+    for (ulong i = keep_shared_many(log, spill, spilled); i < spilled; i++)
     {
-        if (!keep_shared(log, spill[i]) && !fixed_pg_alloc_[log].free(spill[i]))
+        if (!fixed_pg_alloc_[log].free(spill[i]))
             PANIC("Can't free kept block 0x%p", spill[i]);
     }
     return true;
@@ -432,17 +418,49 @@ bool PageAllocatorImpl::keep(size_t log, void* ptr)
 
 bool PageAllocatorImpl::keep_shared(size_t log, Kept* block)
 {
+    return keep_shared_many(log, &block, 1) == 1;
+}
+
+ulong PageAllocatorImpl::keep_shared_many(size_t log, Kept* const* blocks, ulong count)
+{
+    /* Nothing to keep is no reason to take a lock every CPU shares: a free
+       its own cache took called here with none, and on 48 CPUs every such
+       free waited its turn at this lock (heapbench, Newton) */
+    if (count == 0)
+        return 0;
+
     auto& list = kept_blocks_[log];
 
     stdlib::AutoLock lock(list.lock);
-    if (list.count >= list.limit)
-        return false;
+    ulong kept = 0;
+    for (; kept < count && list.count < list.limit; kept++)
+    {
+        Kept* block = blocks[kept];
+        block->next = list.head;
+        block->mark = KEPT_MARK;
+        list.head = block;
+        list.count++;
+    }
+    return kept;
+}
 
-    block->next = list.head;
-    block->mark = KEPT_MARK;
-    list.head = block;
-    list.count++;
-    return true;
+ulong PageAllocatorImpl::take_shared_many(size_t log, Kept** blocks, ulong count)
+{
+    if (count == 0)
+        return 0;
+
+    auto& list = kept_blocks_[log];
+
+    stdlib::AutoLock lock(list.lock);
+    ulong taken = 0;
+    for (; taken < count && list.head != nullptr; taken++)
+    {
+        Kept* block = list.head;
+        list.head = block->next;
+        list.count--;
+        blocks[taken] = block;
+    }
+    return taken;
 }
 
 /* Every CPU's cache and kept_blocks_, each under its own lock -- never two at
@@ -481,20 +499,17 @@ void* PageAllocatorImpl::take_kept(size_t log)
     {
         stdlib::AutoLock lock(cpu->lock);
         CpuKeptSize& size = cpu->sizes[log];
-        if (size.count > 0)
-            block = size.blocks[--size.count];
-    }
-
-    if (block == nullptr)
-    {
-        auto& list = kept_blocks_[log];
-        stdlib::AutoLock lock(list.lock);
-        block = list.head;
-        if (block == nullptr)
+        /* Refilled to half, kept_blocks_' lock taken once for all of them --
+           inside this CPU's, never the other way round: the other half is
+           room for the frees to come. A cache of none takes one. */
+        if (size.count == 0)
+            size.count = take_shared_many(log, size.blocks, stdlib::max<ulong>(1, (size.limit + 1) / 2));
+        if (size.count == 0)
             return nullptr;
-        list.head = block->next;
-        list.count--;
+        block = size.blocks[--size.count];
     }
+    else if (take_shared_many(log, &block, 1) == 0)
+        return nullptr;
 
     /* Every block a cache or kept_blocks_ holds was marked on its way in
        (keep, keep_shared), and nobody writes a kept block. One taken without
@@ -519,7 +534,7 @@ bool PageAllocatorImpl::trim()
     {
         for (size_t log = 0; log < CPU_KEPT_LOGS; log++)
         {
-            Kept* blocks[CPU_KEPT_PAGES];
+            Kept* blocks[CPU_KEPT_MAX];
             ulong count;
             {
                 stdlib::AutoLock lock(cpu.lock);
@@ -559,6 +574,28 @@ bool PageAllocatorImpl::trim()
         }
     }
     return trimmed;
+}
+
+void PageAllocatorImpl::set_kept_limits(ulong free_pages_count)
+{
+    ulong kept_pages = stdlib::min<ulong>(KEPT_PAGES_MAX, free_pages_count / KEPT_RAM_SHARE);
+    for (size_t i = 0; i < stdlib::array_size(kept_blocks_); i++)
+    {
+        stdlib::AutoLock lock(kept_blocks_[i].lock);
+        kept_blocks_[i].limit = kept_pages >> i;
+    }
+
+    /* A CPU keeps no more of a size than kept_blocks_ may: on a machine too
+       small to keep any, none */
+    for (auto& cpu : cpu_kept_blocks_)
+    {
+        stdlib::AutoLock lock(cpu.lock);
+        for (size_t i = 0; i < CPU_KEPT_LOGS; i++)
+        {
+            ulong want = stdlib::min<ulong>(CPU_KEPT_MAX, stdlib::max<ulong>(1, CPU_KEPT_PAGES >> i));
+            cpu.sizes[i].limit = stdlib::min<ulong>(want, kept_blocks_[i].limit);
+        }
+    }
 }
 
 void* PageAllocatorImpl::alloc_map_pages(size_t num_pages, ulong* phys_addr)
