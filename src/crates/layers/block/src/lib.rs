@@ -35,14 +35,9 @@ use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
 use kcore::klog;
 
-/// Disks looked at, and partitions registered, at most. The kernel's device
-/// table holds 48 in all (BlockDeviceTable::MAX_DEVICES), which these fit
-/// inside with room for the disks themselves.
+/// Disks looked at, at most. Their partitions are bounded by the device
+/// table alone (table::MAX_DEVICES), which says so when it is full.
 const MAX_DISKS: usize = 8;
-/// GPT routinely declares 128 slots. Eight is what a disk here actually
-/// uses, and the cap is what bounds the work a bad table can ask for.
-const PARTS_PER_DISK: u32 = 8;
-const MAX_PARTITIONS: u32 = MAX_DISKS as u32 * PARTS_PER_DISK;
 
 /* The MBR: a boot program, four entries, and a signature at the end of the
  * first sector. */
@@ -68,11 +63,13 @@ const GPT_SIGNATURE: u64 = 0x5452_4150_2049_4645;
 const GPT_HEADER_MIN: usize = 92;
 const GPT_ENTRY_MIN: usize = 128;
 const GPT_GUID_LEN: usize = 16;
-/// The most slots `partitions` will walk. The probe stops at PARTS_PER_DISK;
-/// the viewer shows the whole of a normal table (128 slots is what tools
-/// write) but not what a corrupt header asks for -- the count comes off the
-/// disk, and u32::MAX of it would be a shell command that never returns.
-const GPT_MAX_SHOWN: u32 = 128;
+/// The most GPT slots the probe and `partitions` walk: the whole of a normal
+/// table (128 slots is what tools write), but not what a corrupt header asks
+/// for -- the count comes off the disk, and u32::MAX of it would be a boot,
+/// or a shell command, that never ends. A header that declares more is said.
+/// The probe used to stop at eight, saying nothing: a disk cut into eighteen
+/// had ten of them unseen.
+const GPT_MAX_SLOTS: u32 = 128;
 
 static PROBED: [AtomicUsize; MAX_DISKS] = {
     const ZERO: AtomicUsize = AtomicUsize::new(0);
@@ -244,7 +241,11 @@ fn probe_gpt(disk: Disk, sector_size: usize) {
         return;
     }
 
-    let entries = core::cmp::min(header.entries, PARTS_PER_DISK);
+    let entries = core::cmp::min(header.entries, GPT_MAX_SLOTS);
+    if header.entries > GPT_MAX_SLOTS {
+        klog!(0, "part: {}: its GPT has {} slots, of which the first {} are looked at", disk.name(),
+            header.entries, GPT_MAX_SLOTS);
+    }
 
     let mut ebuf = match DmaBuffer::new(1) {
         Some(buf) => buf,
@@ -311,21 +312,23 @@ fn add_partition(disk: Disk, start: u64, count: u64, index: u32, id: &PartId) ->
         }
     }
 
-    if PART_COUNT.load(Ordering::Relaxed) >= MAX_PARTITIONS {
-        klog!(0, "part: {} partitions already, the rest are not registered", MAX_PARTITIONS);
-        return false;
-    }
-
     let disk_name = disk.name();
 
     let mut name = [0u8; part::NAME_MAX];
     let len = match partition_name(disk_name.as_bytes(), index + 1, &mut name) {
         Some(len) => len,
-        None => return true,
+        None => {
+            klog!(0, "part: partition {} of {} has no name that fits, skipped", index + 1, disk_name);
+            return true;
+        }
     };
 
+    /* The device table full -- which it says -- is the one way a partition
+     * inside its disk, with a name, is refused: none after it fits either */
     if !part::register(disk, start, count, &name[..len], id) {
-        return true;
+        klog!(0, "part: {} not registered, nor anything after it on {}",
+            core::str::from_utf8(&name[..len]).unwrap_or("?"), disk_name);
+        return false;
     }
 
     PART_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -335,23 +338,22 @@ fn add_partition(disk: Disk, start: u64, count: u64, index: u32, id: &PartId) ->
 }
 
 /// The disk's name with the partition's number after it -- `nvme0` and 1
-/// make `nvme01` -- into out, whose length it returns. Two digits, because
-/// GPT gives more slots than a single one covers.
+/// make `nvme01` -- into out, whose length it returns. Up to three digits:
+/// GPT's 128 slots.
 fn partition_name(disk: &[u8], number: u32, out: &mut [u8; part::NAME_MAX]) -> Option<usize> {
-    let digits = if number >= 10 { 2 } else { 1 };
+    let digits = if number >= 100 { 3 } else if number >= 10 { 2 } else { 1 };
     let len = disk.len() + digits;
     /* The name the kernel keeps is NUL-terminated, so the last byte is not
      * ours to use. */
-    if number >= 100 || len >= part::NAME_MAX {
+    if number >= 1000 || len >= part::NAME_MAX {
         return None;
     }
 
     out[..disk.len()].copy_from_slice(disk);
-    if digits == 2 {
-        out[disk.len()] = b'0' + (number / 10) as u8;
-        out[disk.len() + 1] = b'0' + (number % 10) as u8;
-    } else {
-        out[disk.len()] = b'0' + number as u8;
+    let mut rest = number;
+    for at in (disk.len()..len).rev() {
+        out[at] = b'0' + (rest % 10) as u8;
+        rest /= 10;
     }
     Some(len)
 }
@@ -508,7 +510,7 @@ fn dump_gpt(disk: &Disk, sector_size: usize, out: &mut Output) {
         }
     };
 
-    let shown = core::cmp::min(header.entries, GPT_MAX_SHOWN);
+    let shown = core::cmp::min(header.entries, GPT_MAX_SLOTS);
     let _ = writeln!(out, "gpt, {} entries{}{}", header.entries,
         if header.crc_ok { "" } else { " (HEADER CHECKSUM MISMATCH)" },
         if shown < header.entries { " (showing the first 128)" } else { "" });
