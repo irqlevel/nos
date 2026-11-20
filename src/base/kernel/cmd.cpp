@@ -201,6 +201,24 @@ static void cmd_loglevel(const char* args, stdlib::Printer& con)
     con.printf("loglevel %lu\n", level);
 }
 
+/* A line of the operator's own into the kernel log -- and so onto the
+   consoles, the netconsole and the disk log, where every other line goes: a
+   mark to find later, set before something is tried on a box whose only
+   console is the network. The text is the rest of the command line, which
+   the shell's line holds to its length; klog cuts what its line does not. */
+static void cmd_mark(const char* args, stdlib::Printer& con)
+{
+    while (*args == ' ')
+        args++;
+    if (*args == '\0')
+    {
+        con.printf("usage: mark <text>\n");
+        return;
+    }
+    klog(0, "mark: %s", args);
+    con.printf("marked\n");
+}
+
 static void cmd_uptime(const char* args, stdlib::Printer& con)
 {
     (void)args;
@@ -2551,6 +2569,7 @@ static const CmdEntry COMMANDS[] = {
     { "lscpu",     cmd_lscpu,     "lscpu - identify the cpu and the features the kernel needs" },
     { "dmesg",     cmd_dmesg,     "dmesg [lines] [filter] - dump kernel log" },
     { "loglevel",  cmd_loglevel,  "loglevel [N] - show or set the log level" },
+    { "mark",      cmd_mark,      "mark <text> - a line of your own into the kernel log" },
     { "uptime",    cmd_uptime,    "uptime - show uptime" },
     { "date",      cmd_date,      "date - show wall clock time" },
     { "ps",        cmd_ps,        "ps - show tasks" },

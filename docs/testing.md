@@ -711,7 +711,9 @@ Boots with the log streaming to a collector the script runs, and checks what
 someone debugging a dead machine depends on: that the log queued before the
 link came up arrives once it does, that the sequence numbers are contiguous
 -- so that a gap can be told from a machine that stopped -- that lines
-produced after link-up keep coming, and that a panic's report gets out with
+produced after link-up keep coming (a mark of the test's own, `mark`: the
+UDP shell's commands are `/logs/net.log`'s, not the kernel log's), and that
+a panic's report gets out with
 its backtrace, which is the one time it matters most and the one time the
 drain task is not running to send it. Then a second boot is powered off
 from the shell over UDP, and the halt's own lines must reach the collector

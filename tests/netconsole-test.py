@@ -319,14 +319,16 @@ def main():
         pt.check("the sequence numbers have no gaps",
                  collector.gaps() == [], str(collector.gaps()[:10]))
 
-        # Something logged after link-up has to keep coming.
+        # Something logged after link-up has to keep coming: a mark of the
+        # test's own, into the kernel log (`mark`). The UDP shell's own lines
+        # were what came once, and are /logs/net.log's now (docs/logs.md)
         before = len(collector.lines)
         sh = pt.Shell()
-        sh.run("loglevel 1")
-        sh.run("net")
+        token = "netconsole-after-link-up-%d" % os.getpid()
+        out = sh.run("mark %s" % token)
         pt.check("lines logged after link-up arrive too",
-                 wait_until(lambda: len(collector.lines) > before, 30),
-                 "%d then %d" % (before, len(collector.lines)))
+                 wait_until(lambda: any(token in l for l in collector.lines[before:]), 30),
+                 "%s; %d then %d lines" % (out.strip(), before, len(collector.lines)))
 
         # The panic report is the one that matters most, and the drain task
         # is not the one that sends it.
