@@ -285,7 +285,10 @@ def main():
         time.sleep(1)
         a, b, c = [Shell(hub.shell(i)) for i in range(n)]
         for i, sh in enumerate((a, b, c)):
-            check("%s has %s from the hub's DHCP" % (HOSTS[i], ip(i)), "ip:%s " % ip(i) in sh.run("net"))
+            # `net` says the address with its prefix length, `ip:10.9.0.1/24`,
+            # since a static address could be given one (ip=)
+            check("%s has %s from the hub's DHCP" % (HOSTS[i], ip(i)),
+                  re.search(r"\bip:%s(/\d+)?\s" % re.escape(ip(i)), sh.run("net")) is not None)
         for sh in (a, b, c):
             sh.run("ipcnet start")
 
