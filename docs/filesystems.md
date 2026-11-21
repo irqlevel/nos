@@ -585,31 +585,59 @@ anything else is written. A clean unmount takes that back last, once a
 checkpoint has put everything home and the log is marked empty, the
 superblock's free counts made the groups'.
 
-Every call that changes metadata is one transaction (`ext4/txn.rs`): what
-it changes is kept apart, as copies of whole blocks, until the journal
-holds all of it, and a call that fails before then leaves nothing changed
--- on the disk, in the descriptors and superblock in memory, in the tree.
-A block is changed only as a kind -- a bitmap, the descriptors, an inode
-table block, a directory's leaf or index block, an extent block, an
-attribute block -- and every checksum its kind carries is put on it as the
-transaction is sealed; an inode's as it is stored. The transaction holds
-the device, the cache and the journal for as long as it lives, so that no
-checkpoint can write anything home meanwhile, and it is bounded: a quarter
-of the journal, and never more than 512 blocks.
+Every call that changes metadata is a transaction or several
+(`ext4/txn.rs`): what one changes is kept apart, as copies of whole
+blocks, until it is staged, and one that fails before then leaves nothing
+changed -- on the disk, in the descriptors and superblock in memory, in
+the tree. A block is changed only as a kind -- a bitmap, the descriptors,
+an inode table block, a directory's leaf or index block, an extent block,
+an attribute block -- and every checksum its kind carries is put on it as
+the transaction is sealed; an inode's as it is stored. The transaction
+holds the device, the cache and the journal for as long as it lives, so
+that no checkpoint can write anything home meanwhile, and it is bounded:
+a quarter of the journal, and never more than 512 blocks.
 
-A commit (`ext4/journal.rs`) writes the log's start into the journal's
-superblock first if the log was empty, then revoke blocks, descriptors and
-copies -- a copy whose first word is the journal's magic escaped -- flushes,
-and writes the commit block forced to the medium, its time never earlier
-than the last. Only then are the blocks what reads see -- pinned in memory
+**A transaction is staged, not committed** (`Txn::stage`): sealed, its
+copies are what every read sees from then on, held in memory beside the
+committed ones, and it joins the running group, which goes into the log
+as one of the journal's transactions (`commit_group`, `ext4/journal.rs`)
+-- at a `sync`, at the unmount, once its first transaction has waited
+five seconds (`COMMIT_MS`, Linux's default `commit=5`: looked at every
+second by a task of the filesystem layer's, `fs-commit`, and by every
+transaction staged), before it would hold more blocks than a transaction
+may, and when an allocation wants the blocks it freed. So a call costs
+what it changes in memory; the log, its flush and its forced commit block
+-- a flush of the disk's cache above all, 0.2-1.6 s on Kovalevskaya's SMR
+disk -- are paid once for many calls; and a call that returns is on the
+medium at its group's commit, five seconds later at most. A caller that
+needs it there sooner syncs, as the two-step replace, `grubenv`, raft's
+log and a guest's flush do: ext2's rule, which those callers kept
+already. A group commits whole or not at all, and in order, so a crash
+leaves the filesystem as some call left it, every call before it with
+it. With no task to commit in the background -- none could be had, or the
+halt has stopped it (`committer.rs`) -- a transaction commits as it is
+staged. `mark_written`, what a guest disk's image calls at its guest's
+flush to make what the guest wrote written, commits before it returns: on
+true, what it did is on the medium, as the flush wants of it -- and a
+`punch`, a guest's discard, makes the image's next flush the filesystem's
+sync (`Image::discard`), so what it gave back is there by then.
+
+A commit writes the log's start into the journal's superblock first if
+the log was empty, then revoke blocks, descriptors and copies -- a copy
+whose first word is the journal's magic escaped -- flushes, and writes the
+commit block forced to the medium, its time never earlier than the last.
+Only then are the staged copies the committed ones -- pinned in memory
 until a checkpoint writes them home, the only copy of each meanwhile. A
 checkpoint -- when the log is half full, when more than 1024 blocks are
-pinned, when a commit would not fit, at the unmount -- writes every pinned
-block home,
-flushes, and moves the log's start past them. A block freed is not handed
-out again by its own transaction, is never written home by a checkpoint
-after, and is revoked when the live log holds a copy of it, so that no
-replay writes that copy over what the block becomes. A write that fails in
+pinned, when a commit would not fit, at the unmount -- writes every
+committed block home, and never a staged one, which no commit block
+vouches for yet; flushes; and moves the log's start past them. A block
+freed is handed out to nobody until its group commits -- the state the
+journal holds has it still, as a file's block perhaps, and a crash before
+the commit leaves it that file's, whatever another had written into it --
+is never written home by a checkpoint after, and is revoked by that
+commit where the live log then holds a copy of it, so that no replay
+writes the copy over what the block becomes. A write that fails in
 a commit or a checkpoint -- or a flush, `sync`'s among them, whose order
 nothing after could count on -- aborts the journal: nothing more is written --
 the device itself refuses every write and flush from there on (`Io`), and
@@ -646,22 +674,26 @@ directory's link count is kept as dir_nlink keeps it: 1 past 65000, and 1
 kept.
 
 Data (`ext4/data.rs`): a write is cut into transactions of at most 256
-blocks, and each one's data is on the device before its commit -- whose
-flush comes first -- as Linux's data=ordered has it, so that no block a
-commit maps into a file can show what it held before. A block mapped and
+blocks, and each one's data is on the device before the commit of the
+group it is staged in -- whose flush comes first -- as Linux's
+data=ordered has it, so that no block a commit maps into a file can show
+what it held before. A block mapped and
 written is written over in place, read first where the write covers only
 part of it; one in a hole is allocated and written whole, zeros around what
 goes into it; one in an unwritten extent is written whole and made
 written -- the extent split around it. The blocks go to the device in
 batches, each block made whole in a page of the mount's buffer of 64 and
 as many as it holds sent together (`Disk::write_pieces`: in flight at once
-on NVMe and virtio-blk), the last before the commit; a batch that fails is
-the write's failure there, as one block's would be. A
-write that fails part way leaves the
-transactions before it committed and the file the size they gave it --
-and writes zeros again over what it put past the old end into the last
-block, in place, which the size that would have covered it never did. Every
-write commits, so a write that returns is on the medium. A truncate gives
+on NVMe and virtio-blk), the last before the transaction is staged; a
+batch that fails is the write's failure there, as one block's would be. A
+write that fails part way leaves the transactions before it staged and the
+file the size they gave it. A write that returns is on the medium at its
+group's commit, at once for one that syncs. Past a file's end, in its last
+block, is zeros whatever the device holds there: a write over part of that
+block makes it so in memory before it writes the block, and a write or a
+truncate that grows the file past the block writes it so first
+(`zero_tail`) -- a write of a group a crash cut short, or a write that
+failed, may have left bytes there that no size ever covered. A truncate gives
 back everything mapped past the new end -- unwritten extents past the old
 one among them -- and writes zeros over what of the new last block lies
 past it, so that a file reads as zeros wherever it grows over; one that
@@ -712,19 +744,17 @@ range given back whole, and may take the last few free blocks
 it, and on a full disk the leaf the split needs must not be what stops a
 guest giving its disk's blocks back. A disk another system filled past them
 may still refuse one, leaving the range as it was but for the end of it the
-transactions before gave back. A write that fails part way
-forces what it wrote in place to the medium before it returns, as every
-call leaves what it did: no commit came to flush it.
+transactions before gave back.
 
 ### What is not done yet
 
 Each of these is left until a measurement or a need asks for it:
 
-- **Group commit.** Every call that changes metadata commits before it
-  returns -- a flush, the log, a flush and the commit block written
-  through -- so what a small call costs is the device's flushes, not its
-  data: 0.58 ms a small file copied under QEMU, more on an NVMe whose flush
-  is slow. Calls that come together could share one commit.
+- **A commit of its own for a call that wants one.** A `sync` commits
+  the whole group, every file's changes with it, as Linux's `fsync` of a
+  file commits the running transaction: a caller syncing one small file
+  pays for what everybody staged. There is no `fsync` of one file, nor
+  fast commits.
 - **Preallocation.** There is no `fallocate`: a disk's image `hv create`
   makes is a sparse file, its blocks allocated as the guest first writes
   them -- through the VFS, not off its lock -- and nothing keeps the room

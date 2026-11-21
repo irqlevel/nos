@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 use extfmt::group::{self, BLOCK_UNINIT, INODE_UNINIT};
 use kcore::klog;
 
+use super::journal;
 use super::source::Source;
 use super::txn::{Kind, Txn, RESERVE};
 
@@ -103,18 +104,56 @@ impl Txn<'_> {
         Some(block)
     }
 
-    /// A block, free and the filesystem's to give: the first at `goal` or
-    /// after it in its group, then in the groups after. None, said, when
-    /// there is none -- or a bitmap is damaged -- and, but for a punch,
-    /// when only the reserve is left.
-    pub fn alloc_block(&mut self, goal: u64) -> Option<u64> {
-        if self.m.free_blocks.saturating_sub(self.allocated) <= RESERVE {
-            if !self.may_reserve {
-                klog!(0, "ext4: no free blocks but the {} kept for giving blocks back", RESERVE);
-                return None;
-            }
-            klog!(1, "ext4: the disk is full: a punch takes one of the blocks kept for it");
+    /// The free blocks that may be handed out now: what the groups count,
+    /// but what this transaction took and what the group staged freed --
+    /// free only once it commits.
+    fn usable(&self) -> u64 {
+        self.m.free_blocks.saturating_sub(self.allocated).saturating_sub(self.jnl.group.freed_blocks)
+    }
+
+    /// Room made by committing the group, where blocks it freed are what
+    /// is wanted: whether it was -- false where it freed nothing, or its
+    /// commit failed and the journal is aborted.
+    fn room_by_commit(&mut self) -> bool {
+        if self.jnl.group.freed.is_empty() {
+            return false;
         }
+        klog!(1, "ext4: the blocks a staged transaction freed are wanted: its group committed for them");
+        journal::commit_group(self.io, self.cache, self.jnl, journal::CommitWhy::Room)
+    }
+
+    /// A block, free and the filesystem's to give: the first at `goal` or
+    /// after it in its group, then in the groups after -- the group
+    /// committed first where only the blocks it freed are left. None, said,
+    /// when there is none -- or a bitmap is damaged -- and, but for a
+    /// punch, when only the reserve is left.
+    pub fn alloc_block(&mut self, goal: u64) -> Option<u64> {
+        loop {
+            if self.usable() <= RESERVE {
+                if self.room_by_commit() {
+                    continue;
+                }
+                if !self.may_reserve {
+                    klog!(0, "ext4: no free blocks but the {} kept for giving blocks back", RESERVE);
+                    return None;
+                }
+                klog!(1, "ext4: the disk is full: a punch takes one of the blocks kept for it");
+            }
+            match self.take_free(goal)? {
+                Some(b) => return Some(b),
+                None if self.room_by_commit() => continue,
+                None => {
+                    klog!(0, "ext4: no free blocks");
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// `alloc_block`'s look through the groups: the block taken; None in
+    /// it where none is free but those freed and not yet committed; None,
+    /// said, on a damaged bitmap.
+    fn take_free(&mut self, goal: u64) -> Option<Option<u64>> {
         let (groups, first, blocks) = (self.m.groups, self.m.first_data, self.m.blocks);
         let goal = goal.clamp(first, blocks.saturating_sub(1));
         let g0 = self.m.group_of(goal);
@@ -128,11 +167,16 @@ impl Txn<'_> {
             let from = if k == 0 { goal.saturating_sub(start).min(len) } else { 0 };
             let found = {
                 let data = &self.dirty.get(&map)?.data;
-                let freed = &self.freed;
-                (from..len).chain(0..from).find(|&i| !bit(data, i) && !freed.contains(start + i))
+                let (freed, staged) = (&self.freed, &self.jnl.group.freed);
+                (from..len).chain(0..from).find(|&i| !bit(data, i) && !freed.contains(start + i)
+                                                && !staged.contains(start + i))
             };
             let Some(i) = found else {
-                klog!(0, "ext4: group {} counts free blocks, and its bitmap has none", g);
+                /* Its free blocks freed and not yet committed -- by this
+                 * transaction or the group's -- are no damage. */
+                if !self.freed.any_in(start, start + len) && !self.jnl.group.freed.any_in(start, start + len) {
+                    klog!(0, "ext4: group {} counts free blocks, and its bitmap has none", g);
+                }
                 continue;
             };
             let b = start + i;
@@ -147,10 +191,9 @@ impl Txn<'_> {
             d.set_flags(flags & !BLOCK_UNINIT);
             self.cache.forget(b);
             self.allocated += 1;
-            return Some(b);
+            return Some(Some(b));
         }
-        klog!(0, "ext4: no free blocks");
-        None
+        Some(None)
     }
 
     /// Up to `want` blocks, free and the filesystem's to give, one after
@@ -182,7 +225,7 @@ impl Txn<'_> {
         if b >= self.m.blocks {
             return Some(0);
         }
-        let left = self.m.free_blocks.saturating_sub(self.allocated);
+        let left = self.usable();
         let want = want.min(if self.may_reserve { left } else { left.saturating_sub(RESERVE) });
         let g = self.m.group_of(b);
         if want == 0 || self.group(g)?.free_blocks_count() == 0 {
@@ -191,8 +234,10 @@ impl Txn<'_> {
         let map = self.bitmap(g, false)?;
         let (start, len) = (self.m.group_start(g), self.m.group_len(g));
         let (from, mut to) = (b - start, (b - start + want).min(len));
-        if let Some(f) = self.freed.first_from(b) {
-            to = to.min(f.saturating_sub(start));
+        for freed in [&self.freed, &self.jnl.group.freed] {
+            if let Some(f) = freed.first_from(b) {
+                to = to.min(f.saturating_sub(start));
+            }
         }
         let n = {
             let data = &self.dirty.get(&map)?.data;
@@ -278,8 +323,8 @@ impl Txn<'_> {
 
     /// Blocks `start..start + n` given back: free in their bitmaps and their
     /// groups' counts -- a group at a time -- not handed out again before
-    /// the commit, kept from any checkpoint, and -- each the live log holds
-    /// a copy of -- revoked, so that no replay writes that copy over
+    /// the group commits, and -- each the live log then holds a copy of --
+    /// revoked by that commit, so that no replay writes the copy over
     /// whatever the block becomes. False for blocks outside the
     /// filesystem's data, or free already: damage.
     pub fn free_run(&mut self, start: u64, n: u64) -> bool {
@@ -318,8 +363,6 @@ impl Txn<'_> {
             desc.set_free_blocks_count(free);
             b = stop;
         }
-        let logged: Vec<u64> = self.jnl.in_log.range(start..end).map(|(&b, _)| b).collect();
-        self.revoke.extend(logged);
         self.freed.insert(start, end);
         true
     }
