@@ -17,6 +17,7 @@
 
 extern crate alloc;
 
+pub mod committer;
 pub mod ext2;
 pub mod ext4;
 pub mod extfs;
@@ -87,8 +88,11 @@ pub unsafe extern "C" fn kernel_vfs_unmount(path_ptr: *const u8, len: usize) -> 
     }
 }
 
+/// Every filesystem unmounted, at the halt -- the task that commits in the
+/// background stopped first: each commits what it holds as it goes.
 #[no_mangle]
 pub extern "C" fn kernel_vfs_unmount_all() {
+    committer::stop();
     if let Some(vfs) = vfs_instance() {
         vfs.unmount_all();
     }

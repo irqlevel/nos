@@ -243,7 +243,7 @@ impl Ext4 {
         let generation = kcore::random::random_u64().map_or(wall_clock_secs() as u32 ^ 0x9E37_79B9, |r| r as u32);
         let made = match self.begin() {
             Some(mut t) => match t.make(dir_ino, name, is_dir, generation) {
-                Some(ino) => t.commit().then_some(ino),
+                Some(ino) => t.stage().then_some(ino),
                 None => None,
             },
             None => None,
@@ -296,7 +296,7 @@ impl Ext4 {
                     && (!is_dir || !moved
                         || (t.set_dotdot(ino, new_ino) && t.link_dir(old_ino, false) && t.link_dir(new_ino, true)))
                     && t.touch_inode(ino);
-                ok && t.commit()
+                ok && t.stage()
             }
             None => false,
         };
@@ -366,7 +366,7 @@ impl Ext4 {
         let name: Vec<u8> = self.tree[node].name().to_vec();
         let done = match self.begin() {
             Some(mut t) => match t.unlink(parent, &name, ino, is_dir) {
-                Some(orphaned) => t.commit().then_some(orphaned),
+                Some(orphaned) => t.stage().then_some(orphaned),
                 None => None,
             },
             None => None,

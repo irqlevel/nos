@@ -1,23 +1,25 @@
 //! A transaction: what one call that changes the filesystem changes of its
-//! metadata, kept apart from what is committed until the journal holds all
-//! of it -- and dropped, leaving nothing changed, if it never gets there. A
-//! block is changed only as one of the kinds below, whose checksum is put
-//! on it as the transaction is sealed for the journal, so that none is
-//! forgotten; and a transaction holds the device, the cache and the journal
-//! for as long as it lives, so that nothing -- a checkpoint above all --
-//! can write anything home meanwhile.
+//! metadata, kept apart from what every read sees until it is staged in the
+//! running group (`Txn::stage`), which the journal commits whole -- and
+//! dropped, leaving nothing changed, if it never gets there. A block is
+//! changed only as one of the kinds below, whose checksum is put on it as
+//! the transaction is sealed for the journal, so that none is forgotten;
+//! and a transaction holds the device, the cache and the journal for as
+//! long as it lives, so that nothing -- a checkpoint above all -- can write
+//! anything home meanwhile.
 //!
-//! What it frees stays out of reach until it commits: a block freed is not
-//! handed out again by the same transaction, and a block the live log holds
-//! a copy of is revoked, so that no replay writes that copy over whatever
-//! the block becomes next (`free_run`). What it frees is kept as runs, so
-//! that a file of millions of blocks is a handful of them.
+//! What it frees stays out of reach until its group commits: a block freed
+//! is not handed out again by the same transaction, nor by any other before
+//! the commit, and one the live log holds a copy of is revoked by that
+//! commit, so that no replay writes the copy over whatever the block
+//! becomes next (`free_run`, `journal::revokes_of`). What it frees is kept
+//! as runs, so that a file of millions of blocks is a handful of them.
 //!
 //! The last few free blocks are kept for a punch (`RESERVE`): one inside
 //! an extent splits it, and on a full disk the leaf the split needs would
 //! otherwise be what stops a guest giving its disk's blocks back.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -102,6 +104,11 @@ impl Runs {
         self.runs.is_empty()
     }
 
+    /// Whether a run holds any block of `start..end`.
+    pub fn any_in(&self, start: u64, end: u64) -> bool {
+        self.first_from(start).is_some_and(|b| b < end)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.runs.iter().map(|(&s, &e)| (s, e))
     }
@@ -118,11 +125,9 @@ pub(super) struct Txn<'a> {
     pub cache: &'a mut Cache,
     pub jnl: &'a mut Journal,
     pub dirty: BTreeMap<u64, Dirty>,
-    /// Blocks freed: not handed out again before the commit.
+    /// Blocks freed: not handed out again before the group commits.
     pub freed: Runs,
-    /// Blocks freed that the live log holds a copy of.
-    pub revoke: BTreeSet<u64>,
-    /// Blocks handed out, which the free count loses at the commit.
+    /// Blocks handed out, which the free count loses as it is staged.
     pub allocated: u64,
     /// Whether this may take the free blocks kept for a punch.
     pub may_reserve: bool,
@@ -137,8 +142,7 @@ static NO_OVERLAY: Overlay = Overlay::new();
 impl<'a> Txn<'a> {
     pub fn new(io: &'a mut Io, m: &'a mut Meta, cache: &'a mut Cache, jnl: &'a mut Journal, now: u32) -> Txn<'a> {
         Txn {
-            io, m, cache, jnl, dirty: BTreeMap::new(), freed: Runs::default(), revoke: BTreeSet::new(), allocated: 0,
-            may_reserve: false, now,
+            io, m, cache, jnl, dirty: BTreeMap::new(), freed: Runs::default(), allocated: 0, may_reserve: false, now,
         }
     }
 
@@ -146,6 +150,10 @@ impl<'a> Txn<'a> {
     fn admit(&mut self, b: u64) -> bool {
         if self.freed.contains(b) {
             klog!(0, "ext4: block {} changed after it was freed in the same transaction: refused", b);
+            return false;
+        }
+        if self.jnl.group.freed.contains(b) {
+            klog!(0, "ext4: block {} changed after a transaction its group has not committed freed it: refused", b);
             return false;
         }
         if self.dirty.len() >= self.jnl.max_txn {

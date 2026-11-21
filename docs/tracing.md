@@ -551,7 +551,7 @@ the device by its queue's `entry` and `buffer`.
 | `bio_submit` | a command of the image's handed to the device (`Queue::start`), before the device can have it: its `sector`, `count` and the queue's commands `in_flight` with it |
 | `bio_done` | that command's completion, from the device's interrupt (`on_done`), on the CPU that took it -- or, `refused`, its submit's refusal, so that every `bio_submit` has its one `bio_done` |
 | `image_note` | the blocks written over unwritten extents, made written in the filesystem at last (`make_written`): `from`, `blocks`, `ns` |
-| `ext4_commit` | a transaction committed to the journal: its `seq`, the journal's `blocks` it took, its `ns` and the part of it a checkpoint took (`checkpoint_ns`) -- a commit of nothing is no record |
+| `ext4_commit` | ext4's group of transactions committed to the journal: its `seq`, the journal's `blocks` it took, its `ns` and the part of it a checkpoint took (`checkpoint_ns`), the transactions staged in it (`txns`) and `why` then -- `sync` (a sync, or `mark_written`), `age` (its first transaction five seconds old), `full` (the next would not fit), `room` (an allocation wanted what it freed), `alone` (no task commits in the background), `unmount` -- a commit of nothing is no record |
 | `disk_done` | the request done in the disk's task, before it goes back: `how` -- with the device and reaped (`async`), done by the image's start (`at_once`), or a flush, discard or write of zeros served on its own (`command`) |
 | `blk_complete` | back at the virtio disk (`Blk::complete`), in the first CPU's round, before it is given back to the guest |
 
