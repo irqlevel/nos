@@ -23,6 +23,7 @@ src/crates/target/
 tests/fuzz/*/target/
 out/
 .claude/
+.kimi-code/
 
 # Vendored crate sources (src/crates/vendor) are checked in verbatim: cargo
 # verifies every file against the checksums shipped with each package, so

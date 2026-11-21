@@ -16,6 +16,11 @@ Reference, by what you are about to do (`docs/README.md` is the index):
 - how a subsystem works: `docs/boot.md`, `docs/paging.md`, `docs/numa.md`, `docs/scheduler.md`, `docs/interrupts.md`, `docs/profiler.md`, `docs/tracing.md`, `docs/random.md`, `docs/filesystems.md`, `docs/logs.md`, `docs/tls.md`, `docs/sshd.md`, `docs/netblk.md`, `docs/cluster.md`, `docs/hypervisor.md`
 - the real machines, and what is different about each: `docs/real-hardware.md`; nos onto a new server from a release's system image: `docs/install.md`
 
+## CodeGraph
+
+- **Use CodeGraph to index the source and navigate code relationships.** At the start of a task run `codegraph sync .`, or `codegraph init -y .` when the checkout has no index, and sync again after changing files. Use `codegraph context` or `codegraph explore` to find task-relevant code, and `codegraph query`, `node`, `callers`, `callees` or `impact` for symbols, callers, callees, dependencies and change impact. When code relationships matter, use these rather than relying on textual search alone.
+- **Use CodeGraph in every new task worktree and branch.** After creating a worktree, run `codegraph init -y .` from its root and use that worktree's index, not the main checkout's. After creating or switching to a task branch, run `codegraph sync .` before exploring the code.
+
 ## The goal: a kernel that is safe by design and by code
 
 This is being built to be as safe as a kernel can be made: **no undefined behaviour, no memory corruption, no data races, no deadlocks, no resource leaks on error paths, no failure that passes in silence.** Not as a property to test for afterwards -- as the thing every design and every line is chosen for. It ranks above speed, above brevity and above getting a feature in sooner, and the long-term goal (other people's Linux guests on this machine) is why.
