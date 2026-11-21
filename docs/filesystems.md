@@ -609,7 +609,9 @@ may, and when an allocation wants the blocks it freed. So a call costs
 what it changes in memory; the log, its flush and its forced commit block
 -- a flush of the disk's cache above all, 0.2-1.6 s on Kovalevskaya's SMR
 disk -- are paid once for many calls; and a call that returns is on the
-medium at its group's commit, five seconds later at most. A caller that
+medium at its group's commit: some six seconds later at most where
+nothing else commits it -- the five, the second the task takes to look,
+and the commit's own time. A caller that
 needs it there sooner syncs, as the two-step replace, `grubenv`, raft's
 log and a guest's flush do: ext2's rule, which those callers kept
 already. A group commits whole or not at all, and in order, so a crash
