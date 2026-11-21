@@ -46,11 +46,13 @@ e2fsck -D indexed, a name too long for the kernel's tree, a symlink:
     files written, and Linux must mount the ext4 and read them too;
   - then nos powers off, and nothing panicked on the way;
   - a second boot changes names and writes data on a fresh copy of mke2fs's
-    image and is killed, never unmounted: e2fsck must replay its journal
-    and find nothing after, and Linux (a loop mount, under sudo or in the
-    nos-builder image --privileged) must replay it too, show the tree the
-    changes make, every file's MD5 the bytes the model has, and leave
-    nothing for e2fsck.
+    image and is killed, never unmounted nor synced -- once the changes
+    have waited past the five seconds ext4 lets a group of them wait for
+    its commit, which the task committing in the background then makes:
+    e2fsck must replay its journal and find nothing after, and Linux (a
+    loop mount, under sudo or in the nos-builder image --privileged) must
+    replay it too, show the tree the changes make, every file's MD5 the
+    bytes the model has, and leave nothing for e2fsck.
 
     tests/ext4-test.py [--tcg] [--keep]
 
@@ -100,6 +102,11 @@ FORMAT2_MIB = 40
 FORMAT4_LABEL = "made"
 FORMAT2_LABEL = "two"
 FORMAT_FILE = "format.txt"
+
+# How long the killed boot's changes are let wait before the power goes:
+# past the five seconds ext4's group waits for its background commit
+# (`fs::ext4::COMMIT_MS`), the second its task takes to look, and room.
+COMMIT_WAIT_S = 10
 FORMAT_TEXT = "written-by-nos"
 
 
@@ -756,6 +763,11 @@ def main():
                 change(sh, "/k4", killed, 40)
                 write_data(sh, "/k4", killed, False)
                 held_to(sh, "/k4", killed, "before the kill")
+                # Nothing synced: the changes on the medium only by the
+                # background commit of the group they were staged in, five
+                # seconds after its first -- waited past, with the second
+                # it takes to look, before the power goes.
+                time.sleep(COMMIT_WAIT_S)
     finally:
         if p.poll() is None:
             p.kill()

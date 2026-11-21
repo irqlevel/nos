@@ -22,9 +22,11 @@ use crate::machine::sched;
 use crate::{Input, Target};
 
 /// What every input must leave: no task still running, none that ended
-/// holding a lock -- the disk log's writer stopped, every task a target
-/// started joined.
+/// holding a lock -- the disk log's writer stopped, the task that commits
+/// in the background stopped as the halt stops it (the first mount for
+/// writing of an ext4 started it), every task a target started joined.
 fn audit() {
+    fs::committer::stop();
     for (id, name, kind, st, holds) in sched::tasks() {
         invariant!(st == sched::St::Done, "task {} '{}' ({:?}) is still {:?} at the end", id, name, kind, st);
         invariant!(holds.is_empty(), "task {} '{}' ended holding {:?}", id, name, holds);

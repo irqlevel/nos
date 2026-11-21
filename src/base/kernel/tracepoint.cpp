@@ -283,6 +283,10 @@ const char* const BLK_OPS[] = { "read", "write", "flush", "discard", "write_zero
 /* How the disk's task served a request: with the device and reaped, done
    by the image's start then and there, or a command served on its own */
 const char* const DISK_HOW[] = { "async", "at_once", "command" };
+/* Why ext4 committed its group (kcore's `CommitWhy`): a sync, its age, the
+   next transaction's room, an allocation wanting what it freed, no task to
+   commit it later, the unmount */
+const char* const EXT4_COMMIT_WHY[] = { "sync", "age", "full", "room", "alone", "unmount" };
 
 const Field BLK_SUBMIT_FIELDS[] = {
     /* Its disk, vda 0, and its slot: a request is said by the two */
@@ -383,6 +387,11 @@ const Field EXT4_COMMIT_FIELDS[] = {
     { "seq", __builtin_offsetof(Ext4Commit, seq), sizeof(u32), Kind::Unsigned, nullptr, 0 },
     { "blocks", __builtin_offsetof(Ext4Commit, blocks), sizeof(u32), Kind::Unsigned, nullptr, 0 },
     { "ok", __builtin_offsetof(Ext4Commit, ok), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    /* Why the group went into the log now, and how many transactions were
+       staged in it */
+    { "why", __builtin_offsetof(Ext4Commit, why), sizeof(u8), Kind::Enum, EXT4_COMMIT_WHY,
+      sizeof(EXT4_COMMIT_WHY) / sizeof(EXT4_COMMIT_WHY[0]) },
+    { "txns", __builtin_offsetof(Ext4Commit, txns), sizeof(u16), Kind::Unsigned, nullptr, 0 },
     /* How long it took, a checkpoint the journal needed for room first
        included, and that part alone */
     { "ns", __builtin_offsetof(Ext4Commit, ns), sizeof(u32), Kind::Ns, nullptr, 0 },
@@ -1022,7 +1031,8 @@ const Event EVENTS[] = {
       sizeof(BioSubmit), sizeof(BIO_SUBMIT_FIELDS) / sizeof(BIO_SUBMIT_FIELDS[0]), BIO_SUBMIT_FIELDS },
     { "bio_done", "disk", "that command's completion, from the device's interrupt -- or its refusal",
       sizeof(BioDone), sizeof(BIO_DONE_FIELDS) / sizeof(BIO_DONE_FIELDS[0]), BIO_DONE_FIELDS },
-    { "ext4_commit", "fs", "an ext4 transaction committed to its journal, and how long that took",
+    { "ext4_commit", "fs", "ext4's group of transactions committed to its journal: why then, how many, and how long "
+      "that took",
       sizeof(Ext4Commit), sizeof(EXT4_COMMIT_FIELDS) / sizeof(EXT4_COMMIT_FIELDS[0]), EXT4_COMMIT_FIELDS },
     { "tcp_send", "tcp", "a segment a connection sent -- data, a SYN, a FIN, a reset, a probe; a pure "
       "acknowledgement apart -- and what sent it",

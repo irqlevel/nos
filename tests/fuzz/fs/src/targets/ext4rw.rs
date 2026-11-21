@@ -8,15 +8,23 @@
 //! The power is cut at chosen requests -- now and then before every
 //! request of one call -- and each picture judged as soon as its call is
 //! done: replayed by the judge's own reader and clean to its check, its
-//! tree what the call in flight may leave -- the tree before it or after
-//! it; for a remove, some of what was under the path gone, deepest first;
-//! for a write, every sector of the file what it held or what it was given,
-//! nothing of any other file's -- and then mounted by the kernel on a disk
-//! of its own beside the one under test, read-only and for writing, both
-//! showing the judge's tree, the image that unmount leaves clean. Requests
-//! fail now and then: then nothing may succeed the model does not have,
-//! nothing be written in a mount after its first write failed, and the
-//! image, replayed, must be what the call that met the failure may leave.
+//! tree what one of the calls since the filesystem was last known to be on
+//! the medium may leave -- ext4 stages a call's transactions in a group
+//! that commits later, at a sync, an unmount, or once it has waited five
+//! seconds, so a picture may show any call's tree since then (a sync's,
+//! an unmount's, five seconds passing, each end that window). Of each: the
+//! tree before it or after it; for a remove, some of what was under the
+//! path gone, deepest first; for a write, every sector of the file what it
+//! held or what it was given, nothing of any other file's -- each sector
+//! of a file also what a later call of the window wrote over it in place,
+//! which a file's data is (data=ordered), or zeros a later cut or grow
+//! wrote past an end. Then it is mounted by the kernel on a disk of its own
+//! beside the one under test, read-only and for writing, both showing the
+//! judge's tree, the image that unmount leaves clean. Requests fail now and
+//! then: then nothing may succeed the model does not have, nothing be
+//! written in a mount after its first write failed, and the image,
+//! replayed, must be what one of the calls of the window as it was when a
+//! call met the failure may leave.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -166,6 +174,145 @@ fn may_leave(leave: &Leave, before: &Node, after: &Node, got: &Node, sector: u64
     }
 }
 
+/// One call of the window -- the calls since the filesystem's state was
+/// last known to be on the medium: the trees around it, what it may leave
+/// between them, and what it renamed, which a file's sectors are followed
+/// by through the calls after it.
+#[derive(Clone)]
+struct Step {
+    before: Node,
+    after: Node,
+    leave: Leave,
+    renamed: Option<(Path, Path)>,
+}
+
+/// Every path the file at `k` has had from step `i` on: followed through
+/// the renames of the steps from there, a directory's moving what is under
+/// it -- every name kept, as either tree of a step may be the one.
+fn aliases(win: &[Step], i: usize, k: &[Vec<u8>]) -> BTreeSet<Path> {
+    let mut at: BTreeSet<Path> = BTreeSet::from([k.to_vec()]);
+    for step in &win[i..] {
+        if let Some((from, to)) = &step.renamed {
+            let moved: Vec<Path> = at.iter().filter(|p| p.starts_with(from)).map(|p| {
+                let mut q = to.clone();
+                q.extend_from_slice(&p[from.len()..]);
+                q
+            }).collect();
+            at.extend(moved);
+        }
+    }
+    at
+}
+
+/// `got` with every sector of a file that a call after step `i` may have
+/// written over in place -- what the file holds there in a tree from step
+/// `i` on, under any name it has had, or zeros past an end it had there, to
+/// the end of that block, which a cut or a grow writes -- made what `base`,
+/// one of step `i`'s trees, holds there: the tree step `i` may leave, as
+/// the device holds it once the calls after it have written in place,
+/// which is what a group that does not commit leaves of them.
+fn explained(win: &[Step], i: usize, got: &Node, base: &Node, sector: u64, block: u64) -> Node {
+    let mut out = got.clone();
+    for (k, d) in flat(got) {
+        let Some(gd) = d else { continue };
+        let Some(Node::File(bd)) = base.get(&k) else { continue };
+        if gd == bd {
+            continue;
+        }
+        let paths = aliases(win, i, &k);
+        let mut later: Vec<&Data> = Vec::new();
+        for step in &win[i..] {
+            for tree in [&step.before, &step.after] {
+                for p in &paths {
+                    if let Some(Node::File(l)) = tree.get(p) {
+                        later.push(l);
+                    }
+                }
+            }
+        }
+        /* Only where one of the two holds something can they differ. */
+        let pages: BTreeSet<u64> = gd.pages().chain(bd.pages()).collect();
+        let mut fixed = gd.clone();
+        let mut changed = false;
+        for page in pages {
+            let mut at = page * CHUNK;
+            while at < (page + 1) * CHUNK && at < gd.len() {
+                let n = sector.min(gd.len() - at);
+                let g = gd.read(at, n);
+                let b = piece(bd, at, n);
+                if g != b {
+                    let written = later.iter().any(|l| piece(l, at, n) == g);
+                    let zeros = g.iter().all(|&x| x == 0)
+                        && later.iter().any(|l| l.len() <= at && at < l.len().div_ceil(block) * block);
+                    if written || zeros {
+                        fixed.write(at, &b);
+                        changed = true;
+                    }
+                }
+                at += n;
+            }
+        }
+        if changed {
+            if let Some(Node::File(t)) = out.get_mut(&k) {
+                *t = fixed;
+            }
+        }
+    }
+    out
+}
+
+/// Whether `got` is what one of the window's calls may leave -- the power
+/// going before any of their groups committed, or between -- the sectors
+/// later calls wrote in place looked past: Ok, or what the newest call
+/// says of it. The fuzzer's own work, not held to the kernel's heap.
+fn may_leave_window(win: &[Step], got: &Node, sector: u64, block: u64) -> Result<(), String> {
+    crate::machine::sched::harness(|| judge_window(win, got, sector, block))
+}
+
+/// `n` with every file's content gone, its size kept: what a tree is to a
+/// look at its names and sizes alone.
+fn blank(n: &Node) -> Node {
+    match n {
+        Node::File(d) => {
+            let mut b = Data::new();
+            b.truncate(d.len());
+            Node::File(b)
+        }
+        Node::Dir(children) => Node::Dir(children.iter().map(|(k, c)| (k.clone(), blank(c))).collect()),
+    }
+}
+
+fn judge_window(win: &[Step], got: &Node, sector: u64, block: u64) -> Result<(), String> {
+    let mut newest = None;
+    let got_blank = blank(got);
+    for i in (0..win.len()).rev() {
+        let step = &win[i];
+        /* Its names and sizes first, which most calls' trees fail at once:
+         * the sectors only for one whose shape it is. */
+        let shape = may_leave(&step.leave, &blank(&step.before), &blank(&step.after), &got_blank, sector);
+        if let Err(e) = shape {
+            if newest.is_none() {
+                newest = Some(format!("{} (and no call before it, of {}, leaves it either)", e, win.len()));
+            }
+            continue;
+        }
+        let mut said = None;
+        for base in [&step.after, &step.before] {
+            let fixed = explained(win, i, got, base, sector, block);
+            match may_leave(&step.leave, &step.before, &step.after, &fixed, sector) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    said.get_or_insert(e);
+                }
+            }
+        }
+        if newest.is_none() {
+            newest = said.map(|e| format!("{} (and no call before it, of {}, leaves it either)", e, win.len()));
+        }
+    }
+    Err(newest.unwrap_or_else(|| String::from("no call to judge it by")))
+}
+
 /// Every path of `map` at or under `at`, moved to under `to`.
 fn move_under<V>(map: &mut BTreeMap<Path, V>, at: &[Vec<u8>], to: &[Vec<u8>]) {
     let moved: Vec<Path> = map.keys().filter(|k| k.starts_with(at)).cloned().collect();
@@ -200,9 +347,19 @@ struct Run {
     dev_bytes: u64,
     sector: u64,
     block: u64,
-    /// With requests failing: the call that met one, the trees around it,
-    /// and what it may leave -- the run ends there.
-    uncertain: Option<(Node, Node, Leave)>,
+    /// The calls since the filesystem's state was last known to be on the
+    /// medium -- at the mount, a sync that returned, a clean unmount, the
+    /// group's five seconds gone by -- the newest last: a power cut may
+    /// leave what any of them may.
+    window: Vec<Step>,
+    /// Set by a call that leaves everything before it on the medium: the
+    /// window ends with it.
+    durable: bool,
+    /// What the call renamed, for its step.
+    renamed: Option<(Path, Path)>,
+    /// With requests failing: the window as the call that met one left it
+    /// -- the run ends there.
+    uncertain: Option<Vec<Step>>,
     /// The blocks of each file mkfs allocated unwritten, as long as the
     /// file keeps its name: what says a write went into one.
     unwritten: BTreeMap<Path, BTreeSet<u64>>,
@@ -229,12 +386,15 @@ impl Run {
         self.image_syncs.push((start, disk::with(0, |d| d.log.len())));
     }
 
-    /// One call: done, the model's trees around it kept, and every picture
-    /// of a power cut taken during it judged against them.
+    /// One call: done, the model's trees around it kept in the window, and
+    /// every picture of a power cut taken during it judged against the
+    /// window.
     fn call(&mut self, r: &mut Input, op: impl FnOnce(&mut Run, &mut Input) -> Leave) {
         let before = self.f.model.tree.clone();
         let start = disk::with(0, |d| d.log.len());
         let mark = crate::machine::trace_mark();
+        self.renamed = None;
+        self.durable = false;
         let leave = op(self, r);
         let after = self.f.model.tree.clone();
         let end = disk::with(0, |d| d.log.len());
@@ -247,20 +407,29 @@ impl Run {
                 reached("ext4rw: a punch on a full disk, given a block of the reserve");
             }
         }
+        self.window.push(Step { before, after, leave, renamed: self.renamed.take() });
         if !self.strict && self.uncertain.is_none() && disk::with(0, |d| d.log[start..end].iter().any(|io| !io.ok)) {
-            self.uncertain = Some((before.clone(), after.clone(), leave.clone()));
+            self.uncertain = Some(self.window.clone());
         }
         let pictures = disk::with(0, |d| std::mem::take(&mut d.crashes));
         for (n, snap) in pictures {
-            self.judge(n, snap, &before, &after, &leave);
+            self.judge(n, snap);
+        }
+        if self.durable {
+            /* Everything up to here on the medium: a power cut from now on
+             * leaves at least what this call left. */
+            if self.window.len() > 1 {
+                reached("ext4rw: a window of calls closed, everything in it on the medium");
+            }
+            self.window.clear();
         }
     }
 
     /// A power cut's picture judged: the judge's replay of it clean and its
-    /// tree what the call may leave; then the kernel's read-only view of it
-    /// and its replay both that tree, and what the replay's unmount leaves
-    /// clean.
-    fn judge(&mut self, n: u64, snap: disk::Media, before: &Node, after: &Node, leave: &Leave) {
+    /// tree what a call of the window may leave; then the kernel's
+    /// read-only view of it and its replay both that tree, and what the
+    /// replay's unmount leaves clean.
+    fn judge(&mut self, n: u64, snap: disk::Media) {
         if let Some(dir) = std::env::var_os("FS_FUZZ_DUMP") {
             /* For e2fsck, which replays it with its own replay. */
             let base = format!("{}/ext4rw-crash-{}-{}", dir.to_string_lossy(), std::process::id(),
@@ -274,9 +443,13 @@ impl Run {
             reached("ext4rw: a power cut's picture holding orphans");
         }
         let Some(t) = c.tree else { panic!("invariant: the judge reads no tree out of a power cut's picture") };
-        if let Err(e) = may_leave(leave, before, after, &t, self.sector) {
-            panic!("invariant: the power going before request {} leaves a tree the call could not ({:?}): {}", n,
-                   leave, e);
+        if let Err(e) = may_leave_window(&self.window, &t, self.sector, self.block) {
+            let leave = self.window.last().map(|s| s.leave.clone());
+            panic!("invariant: the power going before request {} leaves a tree no call of the {} since the last \
+                    sync could ({:?}): {}", n, self.window.len(), leave, e);
+        }
+        if self.window.len() > 1 && self.window.last().is_some_and(|s| s.before != t && s.after != t) {
+            reached("ext4rw: a power cut's picture of a call before the last, its group not committed");
         }
         reached("ext4rw: a power cut's picture judged");
         let Some(handle) = self.picture else { return };
@@ -301,6 +474,7 @@ impl Run {
         if let Some(d) = view.differs_under(PICTURE.as_bytes()) {
             panic!("invariant: a power cut's picture, replayed by the kernel, is not the judge's replay: {}", d);
         }
+        let t = grow_over_tail(vfs, n, self.block, &t);
         invariant!(vfs.unmount(PICTURE.as_bytes()), "the replayed picture's unmount was refused");
         let left = disk::with(1, |d| {
             d.no_writes = Some("its ext4 is unmounted".into());
@@ -314,6 +488,55 @@ impl Run {
                    {:?}", k.tree.as_ref().and_then(|x| t.diff(x)));
         reached("ext4rw: a power cut's picture mounted by the kernel, read through and replayed");
     }
+}
+
+/// On a picture mounted for writing at `PICTURE`, its tree `t`: a file
+/// whose end is inside a block -- one of one name, its content no other's
+/// -- grown past that end by a byte, in the same block or the next by the
+/// picture's number `n`, and what lies between read back as zeros:
+/// whatever a write of a group the power cut found uncommitted left in the
+/// block past the file's end, the file reads as zeros where it grows over
+/// it. The tree the picture holds after.
+fn grow_over_tail(vfs: &fs::vfs::Vfs, n: u64, bs: u64, t: &Node) -> Node {
+    use fs::vfs::{Open, OPEN_READ, OPEN_WRITE};
+    let files = flat(t);
+    let Some((path, len)) = files.iter().find_map(|(p, d)| {
+        let d = (*d)?;
+        let alone = files.values().filter(|o| **o == Some(d)).count() == 1;
+        (d.len() % bs != 0 && alone).then(|| (p.clone(), d.len()))
+    }) else {
+        return t.clone();
+    };
+    let at = if n % 2 == 0 { len + 1 } else { len.div_ceil(bs) * bs + 1 };
+    let mut name = PICTURE.as_bytes().to_vec();
+    name.extend_from_slice(&join(&path));
+    let (Ok(pos), Ok(from)) = (usize::try_from(at), usize::try_from(len)) else { return t.clone() };
+    {
+        let Some(file) = Open::new(vfs, &name, OPEN_WRITE) else {
+            panic!("invariant: a power cut's picture's file {} does not open for writing", show(&join(&path)));
+        };
+        if !(file.seek(pos) && file.write(b"Z")) {
+            /* No room for it on the picture: nothing grown, nothing to hold */
+            return t.clone();
+        }
+    }
+    let Some(file) = Open::new(vfs, &name, OPEN_READ) else {
+        panic!("invariant: a power cut's picture's file {} does not open after a write", show(&join(&path)));
+    };
+    let mut buf = crate::machine::sched::harness(|| vec![0u8; pos + 1 - from]);
+    invariant!(file.seek(from) && file.read(&mut buf) == Some(buf.len()),
+               "a power cut's picture's file {}, grown, does not read back", show(&join(&path)));
+    let (gap, last) = buf.split_at(buf.len() - 1);
+    invariant!(gap.iter().all(|&b| b == 0) && last == b"Z",
+               "a power cut's picture's file {}, grown from {} to {}, reads {} bytes not zeros where it grew over \
+                its old end", show(&join(&path)), len, at + 1, gap.iter().filter(|&&b| b != 0).count());
+    reached(if at > len.div_ceil(bs) * bs { "ext4rw: a picture's file grown into its next block, zeros between" }
+            else { "ext4rw: a picture's file grown inside its last block, zeros between" });
+    let mut after = t.clone();
+    if let Some(Node::File(d)) = after.get_mut(&path) {
+        d.write(at, b"Z");
+    }
+    after
 }
 
 /* ---- the calls ---- */
@@ -387,6 +610,7 @@ fn rename(run: &mut Run, r: &mut Input) -> Leave {
             let mut to = d;
             to.push(n);
             move_under(&mut run.hidden, &s, &to);
+            run.renamed = Some((s, to));
         }
         reached("ext4rw: something renamed");
     }
@@ -705,6 +929,20 @@ fn close(run: &mut Run, r: &mut Input) -> Leave {
 fn sync(run: &mut Run, _r: &mut Input) -> Leave {
     let ok = run.f.vfs.sync();
     invariant!(ok || !run.strict, "sync failed");
+    run.durable = ok;
+    Leave::Either
+}
+
+/// Time going by with nothing asked: more than a group waits before the
+/// task that commits in the background commits it -- everything staged
+/// before on the medium after it, unless a request failed.
+fn pass_time(run: &mut Run, r: &mut Input) -> Leave {
+    let ms = r.pick(&[200, 1_500, 4_000, 6_500, 12_000]);
+    kcore::task::sleep_ms(ms);
+    if ms > fs::ext4::COMMIT_MS + 1_000 {
+        run.durable = run.strict;
+        reached("ext4rw: time enough for the background commit gone by");
+    }
     Leave::Either
 }
 
@@ -815,6 +1053,9 @@ pub fn ext4rw(r: &mut Input) {
         dev_bytes,
         sector: ss,
         block: bs,
+        window: Vec::new(),
+        durable: false,
+        renamed: None,
         uncertain: None,
         unwritten: unwritten_at.iter().map(|(p, v)| (p.clone(), v.iter().copied().collect())).collect(),
         image_syncs: Vec::new(),
@@ -881,6 +1122,8 @@ pub fn ext4rw(r: &mut Input) {
                         invariant!(again == 0, "ext4 mounted again as {}", again);
                         reached("ext4rw: unmounted and mounted again");
                     }
+                    /* A clean unmount commits everything it holds. */
+                    run.durable = run.strict;
                 }
                 Leave::Either
             });
@@ -935,6 +1178,7 @@ pub fn ext4rw(r: &mut Input) {
                     }
                 }
             }
+            23 if r.chance(64) => run.call(r, pass_time),
             _ => run.call(r, look),
         }
     }
@@ -995,10 +1239,12 @@ pub fn ext4rw(r: &mut Input) {
                    clean: {:?} {:?}", c.corrupt, c.unclean);
         let got = c.tree.expect("a tree, from a clean image");
         let model = run.f.model.tree.clone();
-        let (before, after, leave) = run.uncertain.clone().unwrap_or((model.clone(), model, Leave::Either));
-        if let Err(e) = may_leave(&leave, &before, &after, &got, ss) {
-            panic!("invariant: the image after requests failed is not what the call that met them may leave ({:?}): \
-                    {}", leave, e);
+        let window = run.uncertain.clone().unwrap_or_else(|| {
+            vec![Step { before: model.clone(), after: model, leave: Leave::Either, renamed: None }]
+        });
+        if let Err(e) = may_leave_window(&window, &got, ss, bs) {
+            panic!("invariant: the image after requests failed is not what a call of the {} before the failure may \
+                    leave ({:?}): {}", window.len(), window.last().map(|s| s.leave.clone()), e);
         }
         disk::with(0, |d| {
             d.current = d.durable.clone();
