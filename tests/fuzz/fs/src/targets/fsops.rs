@@ -1284,6 +1284,12 @@ impl Fs {
                     break k;
                 }
                 if !self.queue_reap(i, &mut q, reqs, &before) {
+                    /* What was started goes to the device before a wait for
+                     * one of it to be done, as the guest's disk task kicks
+                     * before it waits: a device fetches nothing before its
+                     * doorbell -- which a synchronous request of a commit's
+                     * used to ring by the way, every transaction one. */
+                    self.images[i].kick();
                     self.images[i].wait(kcore::time::Duration::from_millis(1));
                 }
             };

@@ -594,7 +594,8 @@ struct Ext4Commit
     u32 checkpoint_ns;
     u32 pid;
     u8 ok;
-    u8 pad[3];
+    u8 why;
+    u16 txns;
 };
 
 /* TCP's: a connection is said by its slot and its two ports */

@@ -275,6 +275,26 @@ names! {
         Command = "command",
     }
 
+    /// Why ext4 committed its group (`ext4_commit`'s `why`)
+    CommitWhy {
+        /// A sync -- or a call that is to return with what it did on the
+        /// medium (`mark_written`)
+        Sync = "sync",
+        /// Its first transaction staged five seconds ago or more: the
+        /// background task's look, or the next transaction's
+        Age = "age",
+        /// The next transaction would make it bigger than the journal takes
+        /// at once
+        Full = "full",
+        /// An allocation wanted the blocks it freed
+        Room = "room",
+        /// No task commits in the background: each transaction commits as
+        /// it is staged
+        Alone = "alone",
+        /// The unmount
+        Unmount = "unmount",
+    }
+
     /// What sent a TCP segment (`tcp_send`'s `why`)
     TcpWhy {
         /// Data the program wrote, sent for the first time
@@ -752,7 +772,7 @@ events! {
         _pad: [u8; 2],
     }
 
-    /// `ext4_commit`: an ext4 transaction committed to its journal
+    /// `ext4_commit`: ext4's group of transactions committed to its journal
     Ext4Commit = 26, "ext4_commit" {
         seq: u32,
         blocks: u32,
@@ -760,7 +780,9 @@ events! {
         checkpoint_ns: u32,
         pid: u32,
         ok: u8,
-        _pad: [u8; 3],
+        why: u8 as CommitWhy,
+        /// The transactions staged in the group it committed
+        txns: u16,
     }
 
     /// `tcp_send`: a segment a connection sent, a pure acknowledgement apart

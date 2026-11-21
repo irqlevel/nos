@@ -1,17 +1,25 @@
 //! A file's data, as the calls write it. A write is cut into transactions
 //! of at most `CHUNK_BLOCKS` blocks, and each one's data is on the device
-//! before its commit -- whose flush comes first -- as Linux's data=ordered
-//! has it, so that no block a commit maps into a file can show what it held
-//! before: a block mapped and written is written over in place, one in a
-//! hole is allocated and written whole -- zeros around what goes into it --
-//! and one in an unwritten extent is written whole and made written. The
-//! blocks go to the device in batches of as many as the batch holds, each
-//! one call (`Io::write_batch`), the last before the commit. A write
-//! that fails part way leaves the transactions before it committed, and the
-//! file the size they gave it. Where only a block of its data did not
-//! write, the filesystem stays writable: that block's transaction is
-//! undone, so nothing maps what failed, and one file's bad sector -- a
-//! guest disk's -- is not every file's.
+//! before the commit of the group it is staged in -- whose flush comes
+//! first -- as Linux's data=ordered has it, so that no block a commit maps
+//! into a file can show what it held before: a block mapped and written is
+//! written over in place, one in a hole is allocated and written whole --
+//! zeros around what goes into it -- and one in an unwritten extent is
+//! written whole and made written. The blocks go to the device in batches
+//! of as many as the batch holds, each one call (`Io::write_batch`), the
+//! last before the transaction is staged. A write that fails part way
+//! leaves the transactions before it staged, and the file the size they
+//! gave it. Where only a block of its data did not write, the filesystem
+//! stays writable: that block's transaction is undone, so nothing maps
+//! what failed, and one file's bad sector -- a guest disk's -- is not every
+//! file's.
+//!
+//! Past a file's end, in its last block, is zeros whatever the device
+//! holds there: a write over part of that block makes it so in memory
+//! before it writes the block, and a write or a truncate that grows the
+//! file past the block writes it so first (`zero_tail`) -- a write of a
+//! group that never committed, cut by a crash, may have left bytes there
+//! that no size ever covered.
 //!
 //! A truncate gives back everything mapped past the new end -- unwritten
 //! extents beyond the old end among them -- and writes zeros over what of
@@ -72,15 +80,16 @@ impl Txn<'_> {
         Some(raw)
     }
 
-    /// `data` written into file `ino` (`raw`) at byte `at`, block by block:
-    /// over what is there, into a block allocated for a hole, or into an
-    /// unwritten extent's block, made written. Each block is made whole in a
-    /// page of the batch -- what one written over in part holds read in
-    /// first, zeros around what goes into one that showed none -- and the
-    /// batch is written when it is full, and at the end: every block's data
-    /// is on the device -- in its cache -- before this returns, and so
-    /// before the commit that maps it.
-    fn write_data(&mut self, ino: u32, raw: &mut [u8], data: &[u8], at: u64) -> bool {
+    /// `data` written into file `ino` (`raw`), `size` bytes long, at byte
+    /// `at`, block by block: over what is there, into a block allocated for
+    /// a hole, or into an unwritten extent's block, made written. Each block
+    /// is made whole in a page of the batch -- what one written over in part
+    /// holds read in first, zeros from the file's end on whatever the
+    /// device holds there, and zeros around what goes into one that showed
+    /// none -- and the batch is written when it is full, and at the end:
+    /// every block's data is on the device -- in its cache -- before this
+    /// returns, and so before the commit that maps it.
+    fn write_data(&mut self, ino: u32, raw: &mut [u8], data: &[u8], at: u64, size: u64) -> bool {
         let bs = self.m.bs;
         let mut goal = self.m.group_start(u64::from((ino - 1) / self.m.ipg));
         let mut batch: Vec<(usize, u64)> = Vec::with_capacity(self.io.batch_blocks());
@@ -95,8 +104,18 @@ impl Txn<'_> {
             let b = match found {
                 Some(e) if !e.unwritten => {
                     let b = e.start + u64::from(l - e.first);
-                    if n < bs && !self.io.read_slot(b, k) {
-                        return false;
+                    if n < bs {
+                        if !self.io.read_slot(b, k) {
+                            return false;
+                        }
+                        /* Past the file's end it is zeros, whatever the
+                         * device holds: a write of a group that never
+                         * committed may have left bytes there that a size
+                         * never covered, and the file grows over them now. */
+                        let end = size.saturating_sub(u64::from(l) * bs as u64);
+                        if end < bs as u64 {
+                            self.io.slot_mut(k)[end as usize..].fill(0);
+                        }
                     }
                     b
                 }
@@ -132,12 +151,45 @@ impl Txn<'_> {
         self.io.write_batch(&batch)
     }
 
+    /// File `ino`'s last block, the file `size` bytes long, made zeros past
+    /// its end in place, ahead of the commit that grows the file over them:
+    /// a write of a group that never committed may have left bytes there
+    /// that no size ever covered. Nothing to do where the size ends a
+    /// block, the block is a hole or unwritten -- zeros, either -- or its
+    /// tail is zeros already. False on an I/O error.
+    fn zero_tail(&mut self, ino: u32, raw: &[u8], size: u64) -> bool {
+        let bs = self.m.bs as u64;
+        let tail = (size % bs) as usize;
+        if tail == 0 {
+            return true;
+        }
+        let Ok(l) = u32::try_from(size / bs) else { return false };
+        let Some(found) = self.ext_lookup(ino, raw, l) else { return false };
+        let Some(e) = found.filter(|e| !e.unwritten) else { return true };
+        let b = e.start + u64::from(l - e.first);
+        let mut blk = vec![0u8; self.m.bs];
+        if !self.io.read(b, &mut blk) {
+            return false;
+        }
+        if blk[tail..].iter().all(|&x| x == 0) {
+            return true;
+        }
+        blk[tail..].fill(0);
+        self.io.write(b, &blk, false)
+    }
+
     /// One transaction of a write: `data` into file `ino` at `at`, the size
     /// grown to its end, the times.
     fn write_chunk(&mut self, ino: u32, data: &[u8], at: u64) -> bool {
         let Some(mut raw) = self.file_inode(ino) else { return false };
         let size = Inode::new(&raw).map_or(0, |i| i.size(true));
-        if !self.write_data(ino, &mut raw, data, at) {
+        /* A write that begins past the last block grows the file over that
+         * block's tail without writing it: zeros there first. */
+        let bs = self.m.bs as u64;
+        if at >= size.div_ceil(bs) * bs && !self.zero_tail(ino, &raw, size) {
+            return false;
+        }
+        if !self.write_data(ino, &mut raw, data, at, size) {
             return false;
         }
         let end = at + data.len() as u64;
@@ -154,7 +206,9 @@ impl Txn<'_> {
     /// File `ino` cut, or grown, to `size` bytes: past a smaller one every
     /// mapping given back -- or as much as this transaction holds, the file
     /// then an orphan for the transactions after -- and the new last
-    /// block's tail made zeros. Whether it is an orphan now, or None.
+    /// block's tail made zeros; grown, the old last block's tail made zeros,
+    /// the file reading as zeros over it. Whether it is an orphan now, or
+    /// None.
     fn truncate_inode(&mut self, ino: u32, size: u64) -> Option<bool> {
         let mut raw = self.file_inode(ino)?;
         let old = Inode::new(&raw).map_or(0, |i| i.size(true));
@@ -194,6 +248,9 @@ impl Txn<'_> {
             if !self.io.write(b, &blk, false) {
                 return None;
             }
+        }
+        if size > old && !self.zero_tail(ino, &raw, old) {
+            return None;
         }
         Some(orphaned)
     }
@@ -346,23 +403,16 @@ impl Ext4 {
             let pos = offset as u64 + done as u64;
             let room = (CHUNK_BLOCKS * bs - pos % bs) as usize;
             let n = (data.len() - done).min(room);
-            let size = self.inode(ino).and_then(|raw| Inode::new(&raw).map(|i| i.size(true))).unwrap_or(0);
-            let committed = match self.begin() {
-                Some(mut t) => t.write_chunk(ino, &data[done..done + n], pos) && t.commit(),
+            /* A chunk that does not go in leaves what it wrote in place
+             * where it wrote it, as a chunk that does leaves it until its
+             * group commits: over the file's blocks, and past its end, which
+             * nothing reads -- past a file's end is zeros, whatever the
+             * device holds (`write_data`, `zero_tail`). */
+            let staged = match self.begin() {
+                Some(mut t) => t.write_chunk(ino, &data[done..done + n], pos) && t.stage(),
                 None => false,
             };
-            if !committed {
-                /* What the chunk wrote in place past the old end made zeros
-                 * again -- only where its transaction surely never reached
-                 * the log, as every failure of a commit that does reach it
-                 * aborts the journal: there whether its commit block is on
-                 * the medium is not known, a replay may give the file the
-                 * size that covers what was written, and nothing more is
-                 * written at all. */
-                if self.jnl.as_ref().is_some_and(|j| !j.aborted) {
-                    self.zero_past_end(ino, size, pos, n as u64);
-                    self.flush_failed();
-                }
+            if !staged {
                 ok = false;
                 break;
             }
@@ -370,46 +420,6 @@ impl Ext4 {
         }
         self.sized(file, ino);
         ok
-    }
-
-    /// After a write of `n` bytes at `pos` that never committed, zeros again
-    /// over what of file `ino`'s last block lies past its end, `size`: the
-    /// write was into the block in place, and the size that would have
-    /// covered it never came -- what it left there would show the moment
-    /// the file grew over it. Should that fail, the journal is aborted: the
-    /// filesystem no longer keeps a file reading as zeros where it grows.
-    fn zero_past_end(&mut self, ino: u32, size: u64, pos: u64, n: u64) {
-        let bs = self.io.bs as u64;
-        let tail = size % bs;
-        if tail == 0 || pos >= size.div_ceil(bs) * bs || pos + n <= size {
-            return;
-        }
-        let Some(raw) = self.inode(ino) else { return };
-        let Some(Map::Blocks { block, .. }) = self.map(ino, &raw, size / bs) else { return };
-        let mut blk = vec![0u8; self.io.bs];
-        let zeroed = self.io.read(block, &mut blk) && {
-            blk[tail as usize..].fill(0);
-            self.io.write(block, &blk, false)
-        };
-        if !zeroed {
-            if let Some(j) = self.jnl.as_mut() {
-                j.abort(&mut self.io, "what a failed write left past a file's end cannot be made zeros again");
-            }
-        }
-    }
-
-    /// After a write that never committed, what it wrote in place -- over
-    /// blocks the file had, and the zeros put back past its end -- forced to
-    /// the medium, as everything a call leaves is when it returns: no commit
-    /// came to flush it, and a power cut would otherwise take the file back
-    /// from what it reads as. A flush the device fails aborts the journal.
-    fn flush_failed(&mut self) {
-        if self.jnl.as_ref().is_none_or(|j| j.aborted) || self.io.flush() {
-            return;
-        }
-        if let Some(j) = self.jnl.as_mut() {
-            j.abort(&mut self.io, "the device does not flush what a failed write left");
-        }
     }
 
     pub fn truncate(&mut self, file: NodeId, size: usize) -> bool {
@@ -426,7 +436,7 @@ impl Ext4 {
         }
         let done = match self.begin() {
             Some(mut t) => match t.truncate_inode(ino, size as u64) {
-                Some(orphaned) => t.commit().then_some(orphaned),
+                Some(orphaned) => t.stage().then_some(orphaned),
                 None => None,
             },
             None => None,
@@ -473,7 +483,7 @@ impl Ext4 {
                 klog!(0, "ext4: an allocation of blocks {}..{} in inode {} refused", l, to, ino);
                 return None;
             };
-            if !t.commit() {
+            if !t.stage() {
                 klog!(0, "ext4: an allocation in inode {} did not commit", ino);
                 return None;
             }
@@ -490,12 +500,13 @@ impl Ext4 {
     /// The blocks of `file` named by `runs` -- each a first block and a
     /// count, in order -- made written where they are unwritten, a
     /// transaction at a time: what a disk's image wrote over the extents
-    /// `allocate` gave it. The data is the caller's, written before the
-    /// call; the first commit's flush before its commit block puts it on the
-    /// medium ahead of any extent that says it is there (data=ordered), so
-    /// the caller needs no flush of its own first -- and where there was
-    /// nothing to commit, the device is flushed all the same: on true, what
-    /// the caller wrote before the call is on the medium. Each may take the
+    /// `allocate` gave it -- and then the group committed, these with it.
+    /// The data is the caller's, written before the call; the commit's flush
+    /// before its commit block puts it on the medium ahead of any extent
+    /// that says it is there (data=ordered), so the caller needs no flush of
+    /// its own first -- and where there was nothing to commit, the device is
+    /// flushed all the same: on true, what the caller wrote before the call
+    /// is on the medium, as a guest's flush wants of it. Each may take the
     /// free blocks kept for a punch: a split of the tree is all it can need,
     /// and a guest's flush is not to fail for the room for one. false on an
     /// I/O error, or no room even so.
@@ -508,7 +519,6 @@ impl Ext4 {
             return false;
         };
         let (mut run, mut l) = (0usize, runs.first().map_or(0, |r| r.0));
-        let mut flushed = false;
         while run < runs.len() {
             let Some(mut t) = self.begin() else {
                 klog!(0, "ext4: no transaction to make blocks of inode {} written", ino);
@@ -519,8 +529,7 @@ impl Ext4 {
                 klog!(0, "ext4: blocks of inode {} not made written, from block {}", ino, l);
                 return false;
             };
-            flushed |= !t.dirty.is_empty();
-            if !t.commit() {
+            if !t.stage() {
                 klog!(0, "ext4: blocks of inode {} made written did not commit", ino);
                 return false;
             }
@@ -530,16 +539,18 @@ impl Ext4 {
             }
             (run, l) = (next_run, next_l);
         }
-        if !flushed && !self.io.flush() {
-            klog!(0, "ext4: a flush for blocks of inode {} found written already failed", ino);
+        if !self.commit_now() {
+            klog!(0, "ext4: blocks of inode {} made written did not commit", ino);
             return false;
         }
         true
     }
 
     /// The blocks of `count` blocks of `file` from block `first` -- of those
-    /// inside it -- given back: holes from here on, the size as it was. How
-    /// many, or None.
+    /// inside it -- given back: holes from here on, the size as it was. On
+    /// the medium with the group they are staged in: a disk's image makes
+    /// its guest's next flush the filesystem's sync after one
+    /// (`Image::discard`). How many, or None.
     pub fn punch(&mut self, file: NodeId, first: u64, count: u64) -> Option<u64> {
         if !self.writable() {
             return None;
@@ -555,7 +566,7 @@ impl Ext4 {
             let mut t = self.begin()?;
             t.may_reserve = true;
             let (freed, left) = t.punch_inode(ino, first, end)?;
-            if !t.commit() {
+            if !t.stage() {
                 return None;
             }
             if left >= end {
