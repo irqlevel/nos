@@ -280,12 +280,15 @@ TRACE = [
     "trace on blk disk fs",  # 12
     "hv boot /hvboot mem=64 secs=120 disk=/disk.raw",  # 13
     "write /traced.txt the disk path, traced",  # 14
-    "trace show 4096 blk disk fs",  # 15
-    "trace dump 4096 blk disk fs",  # 16
-    "trace off all",        # 17
-    "hv run exits 0",       # 18
-    "trace show 4096 hv",   # 19
-    "rmmod hv",             # 20
+    # ext4 stages the write's transactions in a group a sync commits: its
+    # commit in the window, said by the record's `why`
+    "sync",                 # 15
+    "trace show 4096 blk disk fs",  # 16
+    "trace dump 4096 blk disk fs",  # 17
+    "trace off all",        # 18
+    "hv run exits 0",       # 19
+    "trace show 4096 hv",   # 20
+    "rmmod hv",             # 21
 ]
 
 # The host's reader of a dump, shipped beside this (`--hv`): what the
@@ -944,11 +947,11 @@ def trace_checks(out):
              out[8])
 
     decode_smp(out[9])
-    disk_checks(out[12], out[13], out[15])
-    decode_disk(out[16])
+    disk_checks(out[12], out[13], out[16])
+    decode_disk(out[17])
 
-    pt.check("with every event off, the exits guest's run records nothing", "hv_" not in out[19], out[19])
-    pt.check("and hv unloads after", "hv unloaded" in out[20], out[20])
+    pt.check("with every event off, the exits guest's run records nothing", "hv_" not in out[20], out[20])
+    pt.check("and hv unloads after", "hv unloaded" in out[21], out[21])
 
 
 def decoded(dump, what):
@@ -1103,8 +1106,10 @@ def disk_checks(on, boot, shown):
              [(f.get("slot"), f.get("offset")) for f in completes] == [(f.get("slot"), f.get("offset")) for f in submits]
              and all(f.get("ok") == 1 for f in completes), shown)
     commits = [f for e, f in recs if e == "ext4_commit"]
-    pt.check("ext4_commit: the file written committed through the journal, each with its blocks and its time",
-             commits != [] and all(f.get("ok") == 1 and f.get("blocks", 0) > 0 and f.get("ns", 0) > 0 for f in commits),
+    pt.check("ext4_commit: the file written committed through the journal by the sync, its transactions in one "
+             "group, each commit with its blocks and its time",
+             commits != [] and any(f.get("why") == "sync" and f.get("txns", 0) >= 1 for f in commits)
+             and all(f.get("ok") == 1 and f.get("blocks", 0) > 0 and f.get("ns", 0) > 0 for f in commits),
              shown)
 
 

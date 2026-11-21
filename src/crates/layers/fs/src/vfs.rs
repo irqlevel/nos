@@ -146,6 +146,20 @@ pub trait FileSystem: Send {
         true
     }
 
+    /// Whether what its calls change waits in memory for a commit that the
+    /// task committing in the background makes, as well as a sync (ext4's
+    /// group): a mount that does is what starts that task (`committer`).
+    fn commits_later(&self) -> bool {
+        false
+    }
+
+    /// What has waited long enough, as of `now` (the boot clock), committed:
+    /// the background task's look, every second. False only where a commit
+    /// failed.
+    fn commit_due(&mut self, _now: u64) -> bool {
+        true
+    }
+
     /// The biggest a file here can be while it costs only what is written
     /// of it, its holes nothing: how far past its end a test may write
     /// (`selftest`). 0 where a file's whole size is paid for -- in memory,
@@ -723,11 +737,34 @@ impl Vfs {
 
         /* The filesystem in its slot before its path is in the table: whoever
          * finds the path finds the mount. */
+        let commits_later = !read_only && fs.commits_later();
         let mut slot = self.mounts[index].lock();
         assert!(slot.mount.is_none(), "vfs: a slot the table has no entry for holds a mount");
         slot.mount = Some(Mount { id, fs, read_only, claim, open_files: 0, opens: BTreeMap::new() });
         self.table.lock().entries[index] = Some(entry);
+        drop(slot);
+        drop(admin);
+        /* What it stages, a task commits when it has waited long enough --
+         * started with the first such mount, outside the locks: the task
+         * takes a slot's to look. Without one, the filesystem commits as it
+         * goes. */
+        if commits_later {
+            crate::committer::start();
+        }
         Some(read_only)
+    }
+
+    /// Every mount asked to commit what has waited long enough, as of `now`
+    /// (`FileSystem::commit_due`), a mount at a time: the committer's look.
+    pub fn commit_due(&self, now: u64) {
+        for slot in self.mounts.iter() {
+            let mut slot = slot.lock();
+            if let Some(mount) = slot.mount.as_mut() {
+                if !mount.read_only {
+                    let _ = mount.fs.commit_due(now);
+                }
+            }
+        }
     }
 
     /// Take a filesystem off its mount point and release it. False if it is

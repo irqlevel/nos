@@ -22,8 +22,34 @@
 //!   and the filesystem's state, are left for the next mount's replay -- or
 //!   e2fsck's -- to settle. A file's data that does not write fails its
 //!   call alone (`data.rs`).
+//!
+//! A call's transactions are not each a commit of their own: each is staged
+//! in the running group (`Txn::stage`) -- what every read sees from then
+//! on -- and the group goes into the log as one of the journal's
+//! transactions (`commit_group`): at a sync, at the unmount, when it is
+//! `COMMIT_NS` old, before it would hold more than the journal takes at
+//! once, and when an allocation wants the blocks it freed. So the log, its
+//! flush and its forced commit block -- what a call cost when it was a
+//! commit, a disk's flush of its cache above all -- are paid once for many
+//! calls, and a call that returns is on the medium at the group's commit:
+//! whoever needs it there sooner syncs. Its rules, each against a way of
+//! losing the filesystem to a crash:
+//!
+//! - A group commits whole or not at all, in the order the groups came,
+//!   so a crash leaves the filesystem as some call left it, every call
+//!   before it with it.
+//! - A block a staged transaction freed is handed out to nobody until the
+//!   group commits: the state the journal holds has it still -- a file's
+//!   block among them -- and a crash before the commit leaves it that
+//!   file's, whatever another had written into it.
+//! - The revokes of a group's frees are worked out as it commits, from what
+//!   the live log holds then -- not as each transaction freed them, before
+//!   a commit may have logged the block.
+//! - A checkpoint writes home only what is committed: a staged copy has no
+//!   commit block to vouch for it, and the log's start moved past a
+//!   transaction whose blocks are not all home would lose it.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -36,13 +62,14 @@ use extfmt::recovery::{self, Plan};
 use extfmt::sb::Super;
 use extfmt::Map;
 use kcore::time::{boot_time_ns, wall_clock_secs};
+pub(super) use kcore::trace::CommitWhy;
 use kcore::trace::{self, Ext4Commit};
 use kcore::klog;
 
 use super::cache::Cache;
 use super::io::Io;
 use super::source::{self, Source};
-use super::txn::Txn;
+use super::txn::{Runs, Txn};
 
 /// Where the newest copy of each home block is, in a journal nobody
 /// replayed: its device block, and whether its first word was escaped.
@@ -54,6 +81,26 @@ const MAX_TXN: usize = 512;
 
 /// The committed blocks a checkpoint is due at: what memory holds of them.
 const PIN_MAX: usize = 1024;
+
+/// The longest a staged transaction waits for its group's commit: Linux's
+/// default (`commit=5`).
+pub(super) const COMMIT_NS: u64 = 5_000_000_000;
+
+/// The transactions staged since the last commit: what the next commit
+/// writes into the log as one of the journal's transactions.
+#[derive(Default)]
+pub(super) struct Group {
+    /// The blocks they freed: free in the bitmaps they staged and in the
+    /// counts, and handed out to nobody until the commit.
+    pub freed: Runs,
+    /// How many blocks `freed` holds.
+    pub freed_blocks: u64,
+    /// When the first of them was staged: what the group's age is counted
+    /// from.
+    pub began: Option<u64>,
+    /// How many were staged.
+    pub txns: u32,
+}
 
 /// The fewest blocks a journal written through may have
 /// (`JBD2_MIN_JOURNAL_BLOCKS`): what the kernel and e2fsck take.
@@ -258,6 +305,8 @@ pub(super) struct Journal {
     /// Per home block, the transaction of the live log that holds its
     /// newest copy: what a block freed is revoked for.
     pub in_log: BTreeMap<u64, u32>,
+    /// The transactions staged since the last commit.
+    pub group: Group,
     pub aborted: bool,
     seed: u32,
     bit64: bool,
@@ -351,6 +400,7 @@ impl Journal {
             next_seq,
             started: false,
             in_log: BTreeMap::new(),
+            group: Group::default(),
             aborted: false,
             last_sec: 0,
             max_txn: (ring / 4).clamp(1, MAX_TXN),
@@ -402,12 +452,12 @@ impl Journal {
     }
 
     /// The log empty -- its start 0, the next transaction's sequence kept --
-    /// once a checkpoint has put everything home: what a clean unmount
-    /// leaves.
+    /// once the group has committed and a checkpoint has put everything
+    /// home: what a clean unmount leaves.
     pub fn close(&mut self, io: &mut Io, cache: &mut Cache) -> bool {
         /* The superblock written once, empty: a crash before it replays
          * only what is home already. */
-        if self.aborted || !write_home(io, cache, self, false) {
+        if self.aborted || !commit_group(io, cache, self, CommitWhy::Unmount) || !write_home(io, cache, self, false) {
             return false;
         }
         self.jsb.set_start(0);
@@ -517,159 +567,307 @@ fn ns_field(ns: u64) -> u32 {
     u32::try_from(ns).unwrap_or(u32::MAX)
 }
 
-impl Txn<'_> {
-    /// Into the journal, all of it, and only then into what the reads see:
-    /// sealed, its blocks -- revokes, descriptors, copies -- written into
-    /// the log, flushed, and the commit block forced to the medium. False
-    /// with nothing changed in memory: refused (too big, sealed wrong), or a
-    /// write failed and the journal is aborted. A commit that wrote the log,
-    /// or failed, is an `ext4_commit` record; one of nothing is none.
-    pub fn commit(mut self) -> bool {
-        let mut stat = CommitStat { timed: trace::on::<Ext4Commit>(), ..CommitStat::default() };
-        let began = if stat.timed { boot_time_ns() } else { 0 };
-        let seq = self.jnl.next_seq;
-        let ok = self.commit_log(&mut stat);
-        if stat.timed && (stat.wrote || !ok) {
-            trace::emit(&Ext4Commit {
-                seq,
-                blocks: stat.blocks,
-                ns: ns_field(boot_time_ns().saturating_sub(began)),
-                checkpoint_ns: ns_field(stat.checkpoint_ns),
-                pid: trace::pid(),
-                ok: u8::from(ok),
-                _pad: [0; 3],
-            });
-        }
-        ok
+/// A copy of a block for the log: its first word escaped where it is the
+/// journal's magic, and whether it was.
+fn log_copy(b: u64, data: &[u8]) -> (u64, Vec<u8>, bool) {
+    let mut c = data.to_vec();
+    let escaped = jbd2::be32(&c, 0) == jbd2::MAGIC;
+    if escaped {
+        c[..4].fill(0);
     }
+    (b, c, escaped)
+}
 
-    /// `commit`'s work, what it did into `stat`.
-    fn commit_log(&mut self, stat: &mut CommitStat) -> bool {
+/// The blocks of `freed` the live log holds a copy of: what a commit that
+/// frees them revokes, so that no replay writes that copy over whatever
+/// the block becomes. Worked out as the commit is written, from what the
+/// log holds then: a block freed by a transaction staged before a commit
+/// that logged it is revoked by the next.
+fn revokes_of(jnl: &Journal, freed: &[&Runs]) -> Vec<u64> {
+    let mut out = BTreeSet::new();
+    for runs in freed {
+        for (start, end) in runs.iter() {
+            out.extend(jnl.in_log.range(start..end).map(|(&b, _)| b));
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Blocks `freed`, their freeing committed: no committed copy of them kept
+/// for a checkpoint to write over whatever they become, and none of them
+/// said to be in the live log -- nothing to revoke from here on.
+fn release(cache: &mut Cache, jnl: &mut Journal, freed: &Runs) {
+    for (start, end) in freed.iter() {
+        cache.unpin_range(start, end);
+        let logged: Vec<u64> = jnl.in_log.range(start..end).map(|(&b, _)| b).collect();
+        for b in logged {
+            jnl.in_log.remove(&b);
+        }
+    }
+}
+
+/// `copies` and the revokes of `revokes` written into the log as the next
+/// transaction: revoke blocks, descriptors and copies, flushed, then the
+/// commit block forced to the medium -- a checkpoint first where the log
+/// has no room for them, and the log's start into the journal's superblock
+/// first where it was empty. Its sequence; None, and the journal aborted,
+/// when a write fails -- and for one of more blocks than the ring holds,
+/// which nothing makes (a transaction, and a group, keep to `max_txn`): its
+/// transactions are lost, and that is not to pass in silence.
+fn write_log(io: &mut Io, cache: &mut Cache, jnl: &mut Journal, copies: &[(u64, Vec<u8>, bool)], revokes: &[u64],
+             stat: &mut CommitStat) -> Option<u32> {
+    let bs = io.bs;
+    let n = jnl.blocks_for(bs, copies.len(), revokes.len());
+    if n >= jnl.ring() as usize {
+        let why = format!("a commit of {} blocks, more than the journal's {} hold", n, jnl.ring());
+        jnl.abort(io, &why);
+        return None;
+    }
+    stat.blocks = u32::try_from(n).unwrap_or(u32::MAX);
+    if n >= (jnl.ring() - jnl.used) as usize && !checkpoint_timed(io, cache, jnl, stat) {
+        return None;
+    }
+    stat.wrote = true;
+    let seq = jnl.next_seq;
+    if !jnl.started {
+        /* The log begins here: the superblock says so before the commit
+         * block can be on the medium. */
+        jnl.jsb.set_start(jnl.head);
+        jnl.jsb.set_sequence(seq);
+        if !jnl.write_jsb(io) {
+            jnl.abort(io, "the journal's superblock does not write");
+            return None;
+        }
+        jnl.started = true;
+    }
+    let mut pos = jnl.head;
+    let mut blk = vec![0u8; bs];
+    let header = |blk: &mut [u8], kind: u32| {
+        blk.fill(0);
+        set_be32(blk, 0, jbd2::MAGIC);
+        set_be32(blk, 4, kind);
+        set_be32(blk, 8, seq);
+    };
+    let width = if jnl.bit64 { 8 } else { 4 };
+    for chunk in revokes.chunks(records_per_block(bs, jnl.bit64)) {
+        header(&mut blk, jbd2::REVOKE_BLOCK);
+        set_be32(&mut blk, jbd2::R_COUNT, (jbd2::REVOKE_HEADER + chunk.len() * width) as u32);
+        for (k, &b) in chunk.iter().enumerate() {
+            let at = jbd2::REVOKE_HEADER + k * width;
+            if jnl.bit64 { set_be64(&mut blk, at, b) } else { set_be32(&mut blk, at, b as u32) }
+        }
+        let c = jbd2::block_tail_csum(jnl.seed, &blk).unwrap_or(0);
+        set_be32(&mut blk, bs - jbd2::BLOCK_TAIL, c);
+        if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, &blk, false)) {
+            jnl.abort(io, "a revoke block does not write");
+            return None;
+        }
+        pos = jnl.next(pos);
+    }
+    for chunk in copies.chunks(tags_per_block(bs)) {
+        header(&mut blk, jbd2::DESCRIPTOR_BLOCK);
+        let mut at = jbd2::HEADER;
+        for (k, (home, copy, escaped)) in chunk.iter().enumerate() {
+            let mut flags = if *escaped { jbd2::FLAG_ESCAPE } else { 0 };
+            if k > 0 {
+                flags |= jbd2::FLAG_SAME_UUID;
+            }
+            if k + 1 == chunk.len() {
+                flags |= jbd2::FLAG_LAST_TAG;
+            }
+            set_be32(&mut blk, at, *home as u32);
+            set_be32(&mut blk, at + 4, flags);
+            set_be32(&mut blk, at + 8, (*home >> 32) as u32);
+            set_be32(&mut blk, at + 12, jbd2::copy_csum(jnl.seed, seq, copy));
+            at += 16;
+            if k == 0 {
+                blk[at..at + jbd2::TAG_UUID].copy_from_slice(&jnl.uuid);
+                at += jbd2::TAG_UUID;
+            }
+        }
+        let c = jbd2::block_tail_csum(jnl.seed, &blk).unwrap_or(0);
+        set_be32(&mut blk, bs - jbd2::BLOCK_TAIL, c);
+        if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, &blk, false)) {
+            jnl.abort(io, "a descriptor block does not write");
+            return None;
+        }
+        pos = jnl.next(pos);
+        for (_, copy, _) in chunk {
+            if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, copy, false)) {
+                jnl.abort(io, "a block's copy does not write to the journal");
+                return None;
+            }
+            pos = jnl.next(pos);
+        }
+    }
+    /* What the calls wrote in place before this -- a file's data -- on the
+     * medium with the log, before the commit block that says the log is
+     * whole (data=ordered). */
+    if !io.flush() {
+        jnl.abort(io, "the device does not flush a transaction");
+        return None;
+    }
+    header(&mut blk, jbd2::COMMIT_BLOCK);
+    let sec = wall_clock_secs().max(jnl.last_sec);
+    set_be64(&mut blk, jbd2::H_COMMIT_SEC, sec);
+    let c = jbd2::commit_csum(jnl.seed, &blk).unwrap_or(0);
+    set_be32(&mut blk, jbd2::H_CHKSUM, c);
+    if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, &blk, true)) {
+        jnl.abort(io, "a commit block does not write");
+        return None;
+    }
+    pos = jnl.next(pos);
+    jnl.last_sec = sec;
+    jnl.head = pos;
+    jnl.used += n as u32;
+    jnl.next_seq = seq.wrapping_add(1);
+    Some(seq)
+}
+
+/// After a commit: a checkpoint, where more is held in memory than
+/// `PIN_MAX` or the log is half full. Committed whatever comes of it: a
+/// checkpoint that fails aborts the journal for the calls after this one.
+fn after_commit(io: &mut Io, cache: &mut Cache, jnl: &mut Journal, stat: &mut CommitStat) {
+    if cache.pinned_len() > PIN_MAX || jnl.used > jnl.ring() / 2 {
+        checkpoint_timed(io, cache, jnl, stat);
+    }
+}
+
+/// A commit's `ext4_commit` record -- why it was made, and of how many
+/// transactions: one that wrote the log, or failed; one of nothing is none.
+fn commit_record(seq: u32, began: u64, stat: &CommitStat, ok: bool, why: CommitWhy, txns: u32) {
+    if stat.timed && (stat.wrote || !ok) {
+        trace::emit(&Ext4Commit {
+            seq,
+            blocks: stat.blocks,
+            ns: ns_field(boot_time_ns().saturating_sub(began)),
+            checkpoint_ns: ns_field(stat.checkpoint_ns),
+            pid: trace::pid(),
+            ok: u8::from(ok),
+            why: why as u8,
+            txns: u16::try_from(txns).unwrap_or(u16::MAX),
+        });
+    }
+}
+
+/// The group committed: its staged copies and the revokes of what it freed
+/// written into the log as one transaction, flushed, the commit block
+/// forced -- and only then are the staged copies the committed ones, and
+/// what it freed free to hand out. True with nothing staged; false, and
+/// the journal aborted, when a write fails: what was staged is then lost,
+/// left for the replay of what was committed before it. `why` says why now,
+/// for its `ext4_commit` record.
+pub(super) fn commit_group(io: &mut Io, cache: &mut Cache, jnl: &mut Journal, why: CommitWhy) -> bool {
+    if jnl.aborted {
+        return false;
+    }
+    if cache.staged_len() == 0 && jnl.group.freed.is_empty() {
+        jnl.group = Group::default();
+        return true;
+    }
+    let mut stat = CommitStat { timed: trace::on::<Ext4Commit>(), ..CommitStat::default() };
+    let began = if stat.timed { boot_time_ns() } else { 0 };
+    let (seq, txns) = (jnl.next_seq, jnl.group.txns);
+    let copies: Vec<(u64, Vec<u8>, bool)> = cache.staged().map(|(&b, data)| log_copy(b, data)).collect();
+    let revokes = revokes_of(jnl, &[&jnl.group.freed]);
+    let ok = match write_log(io, cache, jnl, &copies, &revokes, &mut stat) {
+        Some(seq) => {
+            for b in cache.commit_staged() {
+                jnl.in_log.insert(b, seq);
+            }
+            let group = core::mem::take(&mut jnl.group);
+            release(cache, jnl, &group.freed);
+            after_commit(io, cache, jnl, &mut stat);
+            true
+        }
+        None => false,
+    };
+    commit_record(seq, began, &stat, ok, why, txns);
+    ok
+}
+
+impl Txn<'_> {
+    /// Into the running group, for its commit to put on the medium: sealed,
+    /// and then what the reads see -- its copies staged, what it freed out
+    /// of everyone's reach until the group commits. A group it would make
+    /// bigger than the journal takes at once is committed first, without
+    /// it. Where nothing would commit the group later -- no task commits it
+    /// (`committer::running`) -- or it is `COMMIT_NS` old, the group is
+    /// committed with it at once, and this transaction is what the reads see
+    /// only once its commit block is on the medium. False with nothing of it
+    /// changed in memory: refused (sealed wrong), or a commit's write failed
+    /// and the journal is aborted.
+    pub fn stage(mut self) -> bool {
         if self.jnl.aborted {
             klog!(0, "ext4: the journal is aborted: nothing is committed");
             return false;
         }
-        if self.dirty.is_empty() && self.revoke.is_empty() && self.freed.is_empty() {
+        if self.dirty.is_empty() && self.freed.is_empty() {
             return true;
         }
         if !self.seal() {
             return false;
         }
-        let bs = self.m.bs;
-        let copies: Vec<(u64, Vec<u8>, bool)> = self.dirty.iter().map(|(&b, d)| {
-            let mut c = d.data.clone();
-            let escaped = jbd2::be32(&c, 0) == jbd2::MAGIC;
-            if escaped {
-                c[..4].fill(0);
-            }
-            (b, c, escaped)
-        }).collect();
-        let revokes: Vec<u64> = self.revoke.iter().copied().collect();
-        let n = self.jnl.blocks_for(bs, copies.len(), revokes.len());
-        if n >= self.jnl.ring() as usize {
-            klog!(0, "ext4: a transaction of {} blocks, more than the journal's {} hold: refused", n, self.jnl.ring());
+        let fresh = self.dirty.keys().filter(|&&b| !self.cache.is_staged(b)).count();
+        if self.cache.staged_len() + fresh > self.jnl.max_txn
+            && !commit_group(self.io, self.cache, self.jnl, CommitWhy::Full)
+        {
             return false;
         }
-        stat.blocks = u32::try_from(n).unwrap_or(u32::MAX);
-        if n >= (self.jnl.ring() - self.jnl.used) as usize && !checkpoint_timed(self.io, self.cache, self.jnl, stat) {
-            return false;
+        let now = boot_time_ns();
+        if !crate::committer::running() {
+            return self.commit_with_group(CommitWhy::Alone);
         }
-        stat.wrote = true;
-        let seq = self.jnl.next_seq;
-        let jnl = &mut *self.jnl;
-        let io = &mut *self.io;
-        if !jnl.started {
-            /* The log begins here: the superblock says so before the
-             * commit block can be on the medium. */
-            jnl.jsb.set_start(jnl.head);
-            jnl.jsb.set_sequence(seq);
-            if !jnl.write_jsb(io) {
-                jnl.abort(io, "the journal's superblock does not write");
-                return false;
-            }
-            jnl.started = true;
+        if self.jnl.group.began.is_some_and(|t| now.saturating_sub(t) >= COMMIT_NS) {
+            return self.commit_with_group(CommitWhy::Age);
         }
-        let mut pos = jnl.head;
-        let mut blk = vec![0u8; bs];
-        let header = |blk: &mut [u8], kind: u32| {
-            blk.fill(0);
-            set_be32(blk, 0, jbd2::MAGIC);
-            set_be32(blk, 4, kind);
-            set_be32(blk, 8, seq);
-        };
-        let width = if jnl.bit64 { 8 } else { 4 };
-        for chunk in revokes.chunks(records_per_block(bs, jnl.bit64)) {
-            header(&mut blk, jbd2::REVOKE_BLOCK);
-            set_be32(&mut blk, jbd2::R_COUNT, (jbd2::REVOKE_HEADER + chunk.len() * width) as u32);
-            for (k, &b) in chunk.iter().enumerate() {
-                let at = jbd2::REVOKE_HEADER + k * width;
-                if jnl.bit64 { set_be64(&mut blk, at, b) } else { set_be32(&mut blk, at, b as u32) }
-            }
-            let c = jbd2::block_tail_csum(jnl.seed, &blk).unwrap_or(0);
-            set_be32(&mut blk, bs - jbd2::BLOCK_TAIL, c);
-            if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, &blk, false)) {
-                jnl.abort(io, "a revoke block does not write");
-                return false;
-            }
-            pos = jnl.next(pos);
-        }
-        for chunk in copies.chunks(tags_per_block(bs)) {
-            header(&mut blk, jbd2::DESCRIPTOR_BLOCK);
-            let mut at = jbd2::HEADER;
-            for (k, (home, copy, escaped)) in chunk.iter().enumerate() {
-                let mut flags = if *escaped { jbd2::FLAG_ESCAPE } else { 0 };
-                if k > 0 {
-                    flags |= jbd2::FLAG_SAME_UUID;
-                }
-                if k + 1 == chunk.len() {
-                    flags |= jbd2::FLAG_LAST_TAG;
-                }
-                set_be32(&mut blk, at, *home as u32);
-                set_be32(&mut blk, at + 4, flags);
-                set_be32(&mut blk, at + 8, (*home >> 32) as u32);
-                set_be32(&mut blk, at + 12, jbd2::copy_csum(jnl.seed, seq, copy));
-                at += 16;
-                if k == 0 {
-                    blk[at..at + jbd2::TAG_UUID].copy_from_slice(&jnl.uuid);
-                    at += jbd2::TAG_UUID;
-                }
-            }
-            let c = jbd2::block_tail_csum(jnl.seed, &blk).unwrap_or(0);
-            set_be32(&mut blk, bs - jbd2::BLOCK_TAIL, c);
-            if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, &blk, false)) {
-                jnl.abort(io, "a descriptor block does not write");
-                return false;
-            }
-            pos = jnl.next(pos);
-            for (_, copy, _) in chunk {
-                if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, copy, false)) {
-                    jnl.abort(io, "a block's copy does not write to the journal");
-                    return false;
-                }
-                pos = jnl.next(pos);
-            }
-        }
-        if !io.flush() {
-            jnl.abort(io, "the device does not flush a transaction");
-            return false;
-        }
-        header(&mut blk, jbd2::COMMIT_BLOCK);
-        let sec = wall_clock_secs().max(jnl.last_sec);
-        set_be64(&mut blk, jbd2::H_COMMIT_SEC, sec);
-        let c = jbd2::commit_csum(jnl.seed, &blk).unwrap_or(0);
-        set_be32(&mut blk, jbd2::H_CHKSUM, c);
-        if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, &blk, true)) {
-            jnl.abort(io, "a commit block does not write");
-            return false;
-        }
-        pos = jnl.next(pos);
-        jnl.last_sec = sec;
-        jnl.head = pos;
-        jnl.used += n as u32;
-        jnl.next_seq = seq.wrapping_add(1);
+        self.apply(None);
+        let group = &mut self.jnl.group;
+        group.began.get_or_insert(now);
+        group.txns = group.txns.saturating_add(1);
+        true
+    }
 
-        /* Committed: what the reads see now, and what a checkpoint is to
-         * write home. */
+    /// The group and this transaction committed as one: the group's staged
+    /// copies but those this one freed, this one's over them, and the
+    /// revokes of what both freed -- this one what the reads see only once
+    /// the commit block is on the medium.
+    fn commit_with_group(&mut self, why: CommitWhy) -> bool {
+        let mut stat = CommitStat { timed: trace::on::<Ext4Commit>(), ..CommitStat::default() };
+        let began = if stat.timed { boot_time_ns() } else { 0 };
+        let (seq, txns) = (self.jnl.next_seq, self.jnl.group.txns.saturating_add(1));
+        let mut copies: Vec<(u64, Vec<u8>, bool)> = self.cache.staged()
+            .filter(|(b, _)| !self.dirty.contains_key(*b) && !self.freed.contains(**b))
+            .map(|(&b, data)| log_copy(b, data))
+            .collect();
+        copies.extend(self.dirty.iter().map(|(&b, d)| log_copy(b, &d.data)));
+        copies.sort_unstable_by_key(|c| c.0);
+        let revokes = revokes_of(self.jnl, &[&self.jnl.group.freed, &self.freed]);
+        let Some(seq) = write_log(self.io, self.cache, self.jnl, &copies, &revokes, &mut stat) else {
+            commit_record(seq, began, &stat, false, why, txns);
+            return false;
+        };
+        /* The group's copies the committed ones -- not those of the blocks
+         * this one freed, which the log never got -- and what it freed
+         * free; then this one's. */
+        for (start, end) in self.freed.iter() {
+            self.cache.unstage_range(start, end);
+        }
+        for b in self.cache.commit_staged() {
+            self.jnl.in_log.insert(b, seq);
+        }
+        let group = core::mem::take(&mut self.jnl.group);
+        release(self.cache, self.jnl, &group.freed);
+        self.apply(Some(seq));
+        after_commit(self.io, self.cache, self.jnl, &mut stat);
+        commit_record(seq, began, &stat, true, why, txns);
+        true
+    }
+
+    /// What this transaction changed, into what the reads see: staged in
+    /// the group, or -- `logged` -- committed in that transaction of the
+    /// journal's, and what it freed released.
+    fn apply(&mut self, logged: Option<u32>) {
         let (sb_block, sb_at) = (self.m.sb_block(), self.m.sb_at());
         let (gdt_first, gdt_len) = (self.m.gdt_first(), self.m.gdt_len());
         let dirty = core::mem::take(&mut self.dirty);
@@ -684,22 +882,27 @@ impl Txn<'_> {
                     blk.copy_from_slice(&d.data);
                 }
             }
-            self.jnl.in_log.insert(b, seq);
-            self.cache.pin(b, d.data);
-        }
-        for (start, end) in self.freed.iter() {
-            self.cache.unpin_range(start, end);
-            let logged: Vec<u64> = self.jnl.in_log.range(start..end).map(|(&b, _)| b).collect();
-            for b in logged {
-                self.jnl.in_log.remove(&b);
+            match logged {
+                Some(seq) => {
+                    self.jnl.in_log.insert(b, seq);
+                    self.cache.pin(b, d.data);
+                }
+                None => self.cache.stage(b, d.data),
             }
         }
-        self.m.free_blocks = self.m.free_blocks.saturating_sub(self.allocated) + self.freed.blocks();
-        if self.cache.pinned_len() > PIN_MAX || self.jnl.used > self.jnl.ring() / 2 {
-            /* Committed whatever comes of it: a checkpoint that fails
-             * aborts the journal for the calls after this one. */
-            checkpoint_timed(self.io, self.cache, self.jnl, stat);
+        let freed = core::mem::take(&mut self.freed);
+        match logged {
+            Some(_) => release(self.cache, self.jnl, &freed),
+            None => {
+                for (start, end) in freed.iter() {
+                    self.cache.unstage_range(start, end);
+                    self.jnl.group.freed.insert(start, end);
+                    self.jnl.group.freed_blocks += end - start;
+                }
+            }
         }
-        true
+        /* Free in the groups' counts from here on, as `df` says it, though
+         * a block freed in the group goes to nobody until it commits. */
+        self.m.free_blocks = self.m.free_blocks.saturating_sub(self.allocated) + freed.blocks();
     }
 }

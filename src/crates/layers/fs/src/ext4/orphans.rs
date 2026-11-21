@@ -174,7 +174,7 @@ impl Ext4 {
         loop {
             let step = match self.begin() {
                 Some(mut t) => match t.orphan_step(ino) {
-                    Some(done) => t.commit().then_some(done),
+                    Some(done) => t.stage().then_some(done),
                     None => None,
                 },
                 None => None,

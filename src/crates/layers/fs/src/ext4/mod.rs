@@ -63,6 +63,11 @@ use meta::Meta;
 pub use txn::RESERVE;
 use source::{Reader, Source};
 
+/// The longest a call's changes wait for their group's commit, in ms,
+/// where nothing syncs: what a caller that leaves it to the background
+/// commit waits at most, and its fuzzer counts on.
+pub const COMMIT_MS: u64 = journal::COMMIT_NS / 1_000_000;
+
 const ROOT_INO: u32 = 2;
 
 /// The first inode a file may have is never below this (`EXT4_GOOD_OLD_FIRST_INO`):
@@ -607,24 +612,49 @@ impl Ext4 {
         self.reset();
     }
 
+    /// Everything every call left on the medium: the group committed, or
+    /// the device flushed where nothing is staged.
     pub fn sync(&mut self) -> bool {
         if !self.mounted || self.read_only {
             return true;
         }
-        if self.jnl.as_ref().is_none_or(|j| j.aborted) {
+        self.commit_now()
+    }
+
+    /// The group committed now -- its flush putting what the calls wrote in
+    /// place before it on the medium, its commit block forced -- or, with
+    /// nothing staged, the device flushed: on true, everything every call
+    /// left is on the medium. A flush the device fails is one whose order
+    /// nothing after it can count on: the journal aborts.
+    pub(super) fn commit_now(&mut self) -> bool {
+        let Some(jnl) = self.jnl.as_mut() else { return false };
+        if jnl.aborted {
             klog!(0, "ext4: the journal is aborted: nothing is synced");
             return false;
         }
-        /* Every commit is on the medium already: its blocks flushed, its
-         * commit block forced. A flush the device fails is one whose order
-         * nothing after it can count on: the journal aborts. */
+        if self.cache.staged_len() > 0 || !jnl.group.freed.is_empty() {
+            return journal::commit_group(&mut self.io, &mut self.cache, jnl, journal::CommitWhy::Sync);
+        }
         if self.io.flush() {
             return true;
         }
-        if let Some(j) = self.jnl.as_mut() {
-            j.abort(&mut self.io, "the device does not flush");
-        }
+        jnl.abort(&mut self.io, "the device does not flush");
         false
+    }
+
+    /// The group committed if it has waited `COMMIT_NS` since its first
+    /// transaction was staged, as of `now`: what the task that commits in
+    /// the background asks every mount (`committer`). False only where the
+    /// commit failed, which aborts the journal.
+    pub fn commit_due(&mut self, now: u64) -> bool {
+        if !self.mounted || self.read_only {
+            return true;
+        }
+        let Some(jnl) = self.jnl.as_mut() else { return true };
+        if jnl.aborted || !jnl.group.began.is_some_and(|t| now.saturating_sub(t) >= journal::COMMIT_NS) {
+            return true;
+        }
+        journal::commit_group(&mut self.io, &mut self.cache, jnl, journal::CommitWhy::Age)
     }
 
     fn new_vnode(&mut self, parent: Option<NodeId>, name: &[u8], kind: Kind, ino: u32, size: usize) -> Option<NodeId> {
@@ -1030,6 +1060,14 @@ impl FileSystem for Ext4 {
 
     fn sync(&mut self) -> bool {
         Ext4::sync(self)
+    }
+
+    fn commits_later(&self) -> bool {
+        self.mounted && !self.read_only && self.jnl.is_some()
+    }
+
+    fn commit_due(&mut self, now: u64) -> bool {
+        Ext4::commit_due(self, now)
     }
 
     /// What extents number: 2^32 - 1 blocks.
