@@ -570,8 +570,24 @@ offsets again are reads the drive's cache answers) against `blkload`.
   as a write and a flush. Linux wrote the same 2 GiB file at 41.9 MiB/s.
   With the commit block forced by the disk's own FUA and `cp` writing 512
   KiB at a time (the heap's largest block) it writes at 4.2 MiB/s, and
-  reads it back cold at 39.5 MiB/s, not 24.0; the rest of the way is
-  commits that take in more than one write.
+  reads it back cold at 39.5 MiB/s, not 24.0. Now a call's transactions
+  are staged in a group the journal commits at a sync, the unmount or five
+  seconds on ([Filesystems](filesystems.md)): the same 2 GiB, from a sparse
+  file on the SSD's root with a `sync` after it, onto a 100 GiB slice
+  nothing had written, at 18.7 MiB/s, where the build before wrote 3.5
+  MiB/s onto the slice beside it that day; onto the whole disk's ext4, its
+  outer tracks, at 56.4 MiB/s, read back cold at 64.4. A commit there takes
+  in 200-315 of `cp`'s transactions and 1.4-1.8 s, nearly all of it the
+  flush that has the drive put what it holds in its cache on the medium --
+  and holds the mount the while, so `cp` waits for it: what is left of the
+  way to the drive's speed (Linux's journal lets a new transaction run
+  while the last commits).
+- **`format ext4` of the 2 TB disk wrote 29 GiB of zeros, 1038.6 s.** It
+  writes the first group's first block of inodes now and leaves the rest
+  as mke2fs does: the whole disk in 3.7 s, a 100 GiB slice in 6.1 s, not
+  52.4. Ubuntu's e2fsck -fn finds nothing on either, nor on the slice the
+  build before formatted, and mounts the 2 TB one to read its 2 GiB file
+  back as nos wrote it.
 - **It was cut into eighteen slices, and nos saw eight**: the probe read the
   first eight of a GPT's slots and said nothing of the rest. It reads them
   all now (128).

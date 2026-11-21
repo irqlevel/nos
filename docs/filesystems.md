@@ -870,7 +870,8 @@ in the format crate the drivers read through, with no kernel in it:
   nos's driver, Linux's or e2fsck, so what an earlier use of the blocks
   left there is never taken for an inode; a new inode is the lowest free,
   the part never written shrinking by one. A 2 TB disk's 29 GiB of tables,
-  written whole, took 17 minutes on an SMR disk. ext2's tables, every inode
+  written whole, took 17 minutes on an SMR disk; it is made in 3.7 s now
+  (Kovalevskaya, [Real hardware](real-hardware.md)). ext2's tables, every inode
   of which e2fsck reads, and ext4's journal are written whole, zeros where
   nothing is yet.
 
