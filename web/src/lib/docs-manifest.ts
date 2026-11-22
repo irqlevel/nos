@@ -203,8 +203,8 @@ export const docsManifest: Record<string, DocInfo> = {
         group: "internals",
         title: { en: "The hypervisor", ru: "Гипервизор" },
         description: {
-            en: "A type-1 hypervisor written in Rust and shipped as a loadable module: AMD-V and Intel VT-x, Linux guests.",
-            ru: "Гипервизор первого типа на Rust в виде загружаемого модуля: AMD-V и Intel VT-x, гостевые Linux.",
+            en: "A type-1 hypervisor written in Rust and shipped as a loadable module: AMD-V and Intel VT-x, Linux and Windows Server guests.",
+            ru: "Гипервизор первого типа на Rust в виде загружаемого модуля: AMD-V и Intel VT-x, гостевые Linux и Windows Server.",
         },
     },
     cluster: {

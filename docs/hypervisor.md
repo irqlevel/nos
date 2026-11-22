@@ -4433,7 +4433,7 @@ Scope (\_SB)
 ```
 
 Q35's MCFG and the motherboard resource reserving ECAM are beside this
-excerpt ([PCI Express's configuration space](#pci-expresss-configuration-space)).
+excerpt ([PCI Express's configuration space](#a-hosts-pci-device)).
 What is left out is MMIO this does not emulate yet ([MMIO](#mmio)) -- the
 HPET; the IO-APIC is there for a guest given one -- and what a guest does
 without: C- or P-states on the processor objects (only their identity and

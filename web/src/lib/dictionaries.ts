@@ -133,7 +133,7 @@ const en: Dictionary = {
     meta: {
         title: "nos — an OS kernel in C++ and Rust with a hypervisor of its own",
         description:
-            "nos is an operating system kernel for x86-64 and arm64, written in C++20 and Rust, with its own hypervisor that runs Linux guests. Docs, guides and a blog.",
+            "nos is an operating system kernel for x86-64 and arm64, written in C++20 and Rust, with its own hypervisor that runs Linux and Windows Server guests. Docs, guides and a blog.",
     },
     nav: {
         home: "Home",
@@ -153,7 +153,7 @@ const en: Dictionary = {
         eyebrow: "x86-64 · arm64 · C++20 · Rust",
         title: "A hypervisor that runs on bare metal",
         lead:
-            "nos is installed straight onto a server and runs virtual machines on it. The network stack, storage, hypervisor and management API are all its own, so there is no other OS underneath. It's written in Rust and C++20 and runs on x86-64 and arm64. Virtual machines run on x86-64 only, for now.",
+            "nos is installed straight onto a server and runs virtual machines on it. The network stack, storage, hypervisor and management API are all its own, so there is no other OS underneath. It's written in Rust and C++20 and runs on x86-64 and arm64. Linux and Windows Server VMs run on x86-64 hosts only, for now.",
         ctaAbout: "What is nos",
         ctaRun: "Run it in QEMU",
         ctaDemo: "Watch the demo",
@@ -375,7 +375,7 @@ const ru: Dictionary = {
     meta: {
         title: "nos — ядро ОС на C++ и Rust с собственным гипервизором",
         description:
-            "nos — ядро операционной системы для x86-64 и arm64 на C++20 и Rust с собственным гипервизором, в котором работают гостевые Linux. Документация, руководства и блог.",
+            "nos — ядро операционной системы для x86-64 и arm64 на C++20 и Rust с собственным гипервизором, в котором работают гостевые Linux и Windows Server. Документация, руководства и блог.",
     },
     nav: {
         home: "Главная",
@@ -395,7 +395,7 @@ const ru: Dictionary = {
         eyebrow: "x86-64 · arm64 · C++20 · Rust",
         title: "Гипервизор, который работает прямо на железе",
         lead:
-            "nos ставится прямо на сервер и запускает на нём виртуальные машины. Сеть, хранилище, гипервизор и API для управления у него свои, так что другая ОС под ним не нужна. Написан на Rust и C++20, работает на x86-64 и arm64. Виртуальные машины пока запускаются только на x86-64.",
+            "nos ставится прямо на сервер и запускает на нём виртуальные машины. Сеть, хранилище, гипервизор и API для управления у него свои, так что другая ОС под ним не нужна. Написан на Rust и C++20, работает на x86-64 и arm64. Виртуальные машины с Linux и Windows Server пока запускаются только на хостах x86-64.",
         ctaAbout: "Что такое nos",
         ctaRun: "Запустить в QEMU",
         ctaDemo: "Смотреть демо",
