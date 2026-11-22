@@ -58,6 +58,8 @@ const MSRS: [u32; 30] = [0x10, 0x3A, 0x48, 0x49, 0x8B, 0x174, 0x175, 0x176, 0x17
 /// KVM's PV EOI: its MSR, and where the script's guest keeps its word.
 const MSR_KVM_PV_EOI_EN: u32 = 0x4B56_4D04;
 const PV_EOI_WORD: u64 = 0x0300_0000;
+const HV_PAGE: u64 = 0x0310_0000;
+const HV_INPUT: u64 = 0x0320_0000;
 const LEAVES: [u32; 20] = [0, 1, 2, 4, 6, 7, 0xA, 0xB, 0xD, 0xF, 0x10, 0x1F, 0x4000_0000, 0x4000_0001, 0x8000_0000,
                            0x8000_0001, 0x8000_0007, 0x8000_0008, 0x8000_001E, 0x8000_0021];
 /// Instructions the emulator must refuse, which stop the guest: a load of
@@ -137,6 +139,9 @@ struct CpuPlan {
     /// What its last `in` should have read, and its size, for its next
     /// entry to see (`Step::InExpect`).
     read: Option<(u32, u8)>,
+    /// The result its last Hv#1 call must return, and a flush its backend must
+    /// have marked when the call targets this CPU.
+    call: Option<(u64, Option<u64>)>,
 }
 
 /// What a `mov` to or from CR4 the script put at a CPU's RIP should have
@@ -266,6 +271,9 @@ struct Script {
     vmx: bool,
     /// A host's function the guest holds (`hostmodel::gpu`), when it has one.
     hosted: Option<HostedFn>,
+    /// Hv#1 selected, and the two partition-wide MSR writes left to enable it.
+    hyperv: bool,
+    hyperv_init: u8,
 }
 
 /// The GPU on the guest's bus as its driver knows it: its port's slot on
@@ -951,6 +959,41 @@ impl Script {
         }
     }
 
+    /// A valid Hv#1 flush or synthetic-IPI call, with its input in guest RAM
+    /// or the fast convention's registers. Its next entry checks the result.
+    fn hyperv_call(&mut self, v: &mut Backend, mem: &GuestMemory, r: &mut Input) -> Exit {
+        HV_CALLS.fetch_add(1, Ordering::Relaxed);
+        let code = r.pick(&[2u64, 3, 0xB]);
+        let reps = if code == 3 { 1 + r.below(8) } else { 0 };
+        let fast = code == 0xB && r.bool();
+        let input = code | u64::from(fast) << 16 | reps << 32;
+        let gpa = HV_INPUT + self.me as u64 * 0x1000;
+        let all = if self.cpus.len() == 64 { u64::MAX } else { (1u64 << self.cpus.len()) - 1 };
+        let mask = r.pick(&[0, 1, 2, all, 1u64 << self.me]);
+        let flags = r.pick(&[0u64, 1, 2, 4, 5]);
+        let vector = 16 + r.below(240) as u32;
+        let mut bytes = vec![0u8; if code == 0xB { 16 } else { 24 + reps as usize * 8 }];
+        if code == 0xB {
+            bytes[0..4].copy_from_slice(&vector.to_le_bytes());
+            bytes[8..16].copy_from_slice(&mask.to_le_bytes());
+        } else {
+            bytes[0..8].copy_from_slice(&r.u64().to_le_bytes());
+            bytes[8..16].copy_from_slice(&flags.to_le_bytes());
+            bytes[16..24].copy_from_slice(&mask.to_le_bytes());
+            for at in (24..bytes.len()).step_by(8) {
+                bytes[at..at + 8].copy_from_slice(&r.u64().to_le_bytes());
+            }
+        }
+        mem.write(gpa, &bytes).expect("Hyper-V call input in guest RAM");
+        v.regs_mut().rcx = input;
+        v.regs_mut().rdx = if fast { u64::from(vector) } else { gpa };
+        v.regs_mut().r8 = if fast { mask } else { 0 };
+        let answer = if code == 3 { reps << 32 } else { 0 };
+        let self_flush = code != 0xB && (flags & 1 != 0 || mask == 0 || mask & 1u64 << self.me != 0);
+        self.cpus[self.me].call = Some((answer, self_flush.then_some(v.flushes)));
+        Exit::Hypercall
+    }
+
     /// A driver's bring-up, several exits long.
     fn plan_something(&mut self, r: &mut Input) {
         if self.hosted.is_some() && r.u8() < 48 {
@@ -1351,6 +1394,25 @@ impl Script {
             let got = v.save().rax as u32 & mask;
             invariant!(got == want, "a configuration read of {} bytes: {:#x}, not {:#x}", size, got, want);
         }
+        if let Some((want, flush)) = self.cpus[self.me].call.take() {
+            invariant!(v.save().rax == want, "Hv#1 returned {:#x}, wanted {:#x}", v.save().rax, want);
+            if let Some(before) = flush {
+                invariant!(v.flushes > before, "Hv#1 returned success without flushing this vCPU's TLB");
+            }
+        }
+        if self.hyperv && self.hyperv_init < 2 {
+            let (msr, value) = if self.hyperv_init == 0 {
+                (crate::hyperv::MSR_GUEST_OS_ID, 1)
+            } else {
+                (crate::hyperv::MSR_HYPERCALL, HV_PAGE | 1)
+            };
+            self.hyperv_init += 1;
+            v.regs_mut().rcx = u64::from(msr);
+            v.regs_mut().rdx = value >> 32;
+            v.save_mut().rax = value & u64::from(u32::MAX);
+            v.take_event();
+            return Some(vm::Next::Exit(Exit::Msr { write: true }));
+        }
         loop {
             if let Some(s) = self.plan().pop_front() {
                 v.take_event();
@@ -1422,11 +1484,14 @@ impl Script {
                 }
                 6 | 7 => {
                     /* An MSR: the APIC's, a kernel's, or any. */
-                    let msr = match r.u8() % 4 {
+                    let mut msr = match r.u8() % 4 {
                         0 | 1 if self.apic => 0x800 + r.pick(&APIC_REGS),
                         _ if r.rare() => r.u32(),
                         _ => r.pick(&MSRS),
                     };
+                    if self.hyperv && matches!(msr, crate::hyperv::MSR_GUEST_OS_ID | crate::hyperv::MSR_HYPERCALL) {
+                        msr = crate::lapic::MSR_TSC_DEADLINE;
+                    }
                     let value = if (0x800..0x900).contains(&msr) { apic_value(r, msr - 0x800) } else { r.value64() };
                     let write = r.bool();
                     if write && v.virtualizes(msr) {
@@ -1668,6 +1733,7 @@ impl Script {
                 28 if r.rare() && r.bool() => Exit::TaskSwitch,
                 28 => Exit::Instr(r.pick(&[Instr::Invd, Instr::Rsm, Instr::Monitor, Instr::Mwait, Instr::Rdtscp,
                                            Instr::Wbinvd, Instr::Rdpru, Instr::Rdpmc, Instr::Icebp])),
+                29 if self.hyperv => self.hyperv_call(v, mem, r),
                 29 => Exit::Hypercall,
                 30 => Exit::Host,
                 _ if r.rare() => match r.u8() % 4 {
@@ -1724,6 +1790,7 @@ static MOV_CHECKED: Mutex<std::collections::BTreeMap<&'static str, u64>> =
 /// the first CPU when the device says its round has to come anyway.
 static SERVING: Mutex<Option<(std::sync::Weak<LinuxGuest>, Arc<Doorbells>)>> = Mutex::new(None);
 static SERVED: AtomicU64 = AtomicU64::new(0);
+static HV_CALLS: AtomicU64 = AtomicU64::new(0);
 
 static POSTED: AtomicU64 = AtomicU64::new(0);
 static NOTIFIED: AtomicU64 = AtomicU64::new(0);
@@ -1780,6 +1847,7 @@ pub fn report() {
               than 1 ms past their time", LATE_SLEPT.load(Ordering::Relaxed), LATE_OTHER.load(Ordering::Relaxed),
              OVERSLEPT.load(Ordering::Relaxed));
     println!("  platform: {} disks served from outside every CPU", SERVED.load(Ordering::Relaxed));
+    println!("  platform: {} valid Hv#1 flush and synthetic-IPI calls checked", HV_CALLS.load(Ordering::Relaxed));
     println!("  platform: {} WRMSRs answered in the world switch's own loop, {} HLTs ended there -- of {} offered it, \
               of {} made", crate::cpu::FAST_ANSWERED.load(Ordering::Relaxed), crate::cpu::FAST_HLTS.load(Ordering::Relaxed),
              crate::cpu::HLTS_OFFERED.load(Ordering::Relaxed), crate::cpu::HLTS_MADE.load(Ordering::Relaxed));
@@ -1878,6 +1946,7 @@ fn run_threads(guest: &Arc<LinuxGuest>, vcpus: Vec<crate::run::GuestCpu>, machin
 pub fn platform(r: &mut Input) {
     let cpus = 1 + r.below(4) as u32;
     let firmware = r.u8() < 24;
+    let hyperv = firmware && r.bool();
     let x2apic = !firmware && r.bool();
     let ioapic = firmware || (cpus > 1 && r.bool());
     /* Under the devices' pages, up to them, past them -- RAM from 4 GiB --
@@ -1901,7 +1970,9 @@ pub fn platform(r: &mut Input) {
      * the PCI hole; CloudHv has the same RAM layout but no ECAM. */
     let hosted = !firmware && r.u8() < 40;
     let low_end = linux::HOLE_RAM_END;
-    let made = if firmware {
+    let made = if hyperv {
+        LinuxGuest::new_hyperv_on(&machine, mem_bytes, huge, cpus, doorbells.clone(), None)
+    } else if firmware {
         LinuxGuest::new_firmware(&machine, mem_bytes, huge, cpus, doorbells.clone())
     } else if hosted {
         LinuxGuest::new_holed(&machine, mem_bytes, huge, cpus, doorbells.clone(), x2apic, ioapic)
@@ -2028,12 +2099,14 @@ pub fn platform(r: &mut Input) {
         ioapic,
         cpus: (0..n).map(|_| CpuPlan { plan: VecDeque::new(), xapic: first_xapic, asked_xapic: None,
                                        protected32: false, cr4: None, dr: None, dr_model: [0; 4],
-                                       xcr: None, read: None }).collect(),
+                                       xcr: None, read: None, call: None }).collect(),
         me: 0,
         cr3: vcpus[0].backend_mut().save().cr3,
         code: CODE,
         vmx: machine.caps().vendor() == Vendor::Vmx,
         hosted: None,
+        hyperv,
+        hyperv_init: 0,
     };
     let (script, gpu_model) = match gpu {
         Some((h, model)) => (Script { hosted: Some(h), ..script }, Some(model)),

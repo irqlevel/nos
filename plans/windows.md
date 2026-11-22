@@ -36,12 +36,14 @@ W0.5 adds `firmware` to `hv boot`/`hv start`/`hv create` and `firmware = true`
 to vm.toml. With no explicit image it selects `/lib/CLOUDHV.fd`; an explicit
 PVH path allows the DEBUG build. The firmware machine is selected by the same
 checked `Spec` and receives its image through the existing PVH loader.
-Firmware capture, restore and migration are refused until the host bridge is
-part of the versioned state.
+Firmware capture, restore and migration carry the host bridge and optional
+Hyper-V state in vmstate version 4; versions 1 through 3 remain readable as
+Q35 without Hyper-V.
 
 A real TCG run reaches OVMF's `BdsDxe: No bootable option or device was found`
 with no MSR #GP. `hv create fw firmware` and `hv start fw` work through the
-written vm.toml, and `hv save` refuses it and leaves it running. All 2.2
+written vm.toml, and the UEFI phase saves and restores a running firmware
+Hyper-V VM. All 2.2
 million inputs of `hv-fuzz.py`, `make check`, both architecture builds and
 smoke tests, and `hv-test.py` on x86-64 and arm64 pass on the final W0.5 tree.
 W0.6 is verified on the EX44's VT-x. The DEBUG firmware reaches `Shell>` and
@@ -84,7 +86,11 @@ after allowing TCP 3389 in the VM's firewall. A graceful `shutdown /s /t 0`
 now powers the VM off without `hv stop`: Windows reaches UEFI
 `ResetSystem(EfiResetShutdown)`, whose CloudHv runtime writes `0x34` to its
 fixed sleep-control port `0x600`. The PM fuzz target holds both that path and
-legacy Q35's different meaning of the same port.
+legacy Q35's different meaning of the same port. On the EX44 a running Windows
+VM was also saved (679 MiB written, 5.9 s paused) and restored: CMD and ping
+worked again, and the restored guest powered itself off normally. The UEFI
+Hyper-V save/restore gate also passes on the second stand's Ryzen 5 3600 with
+`accelerator: KVM, the host's AMD-V`, as well as under TCG.
 
 ## Firmware facts that drive the design
 
@@ -147,9 +153,10 @@ boot paths must remain unchanged.
    `hv boot`/`hv start`/`hv create`, or `firmware = true` in vm.toml, selects
    `/lib/CLOUDHV.fd` by default and the firmware machine. Q35 remains the
    default for Linux, and an explicit PVH path can select the DEBUG firmware.
-   Firmware save, restore and migration are refused until the host bridge is
-   versioned into that state. The interface, a real OVMF boot and the refusal
-   are documented in `docs/hypervisor.md`.
+   Firmware save, restore and migration use vmstate version 4's host bridge and
+   optional Hyper-V part; older states remain Q35 without Hyper-V. The
+   interface, a real OVMF boot and a UEFI Shell save/restore are documented and
+   exercised by `hv-test.py`.
 6. **W0.6, bring-up on the EX44 — implemented.** OVMF reaches `Shell>` and
    runs commands under VT-x. An Ubuntu cloud image boots automatically through
    its own shim/GRUB EFI to a working login and EFI runtime. Virtio-blk serves
@@ -161,7 +168,8 @@ boot paths must remain unchanged.
 7. **W0.7, gates and documentation — implemented.** `hv-fuzz.py` covers policy,
    BAR moves, ACPI and oversized virtio-blk requests, with mutants for the
    latter. `hv-test.py` has a UEFI phase: CloudHv through Boot Manager to Shell,
-   then a command through `hv exec`. `docs/testing.md` and the gate table in
+   commands through `hv exec`, and a running Hyper-V firmware VM saved and
+   restored to another working Shell. `docs/testing.md` and the gate table in
    `CLAUDE.md` describe it; both architectures build and pass their smoke and
    hv tests. A manual Windows gate stays out of CI because the Windows image
    cannot be redistributed.
@@ -178,22 +186,43 @@ serial console and RDP through `hv forward`.
   and four stimers cover direct and message delivery, one-shot and periodic
   operation. Crash MSRs report a Windows bugcheck and `/logs/hv.log` records
   it. Port `0x402` carries OVMF DEBUG output during bring-up.
-- **Firmware ACPI — implemented for this boot.** The firmware FADT is
-  hardware-reduced with no FACS or legacy PM1 blocks, with real sleep
-  control/status registers, and the DSDT has processor objects. COM1 as
-  PNP0501 and SPCR remain for a fuller firmware description. Legacy ports
-  stay out of the PCI0 `_CRS` I/O window.
-- Match Cloud Hypervisor's 8 MiB alignment for 64-bit BARs and retain the
-  IO-APIC version-write behaviour Windows expects.
-- Add newly discovered MSR reads and writes deliberately, not as a blanket
-  pass-through. Save all new state in vmstate for migration.
+- **Firmware ACPI — implemented.** The firmware FADT is hardware-reduced with
+  no FACS or legacy PM1 blocks, with real sleep control/status registers, and
+  the DSDT has processor objects. COM1 is PNP0501 with its I/O and IRQ
+  resources, and an SPCR revision 2 describes 16550/0x3F8, IRQ/GSI 4, 115200
+  8N1 and VT-UTF8. Legacy ports stay out of the PCI0 `_CRS` I/O window.
+- **Device compatibility — implemented.** The 64-bit BAR window uses Cloud
+  Hypervisor's 8 MiB granularity, and the IO-APIC version register's read-only
+  behaviour under a Windows write probe is pinned by the fuzz target.
+- **State — implemented.** New MSRs are handled deliberately, never by blanket
+  pass-through. Vmstate version 4 carries the host bridge, Hyper-V's shared
+  reference clock/overlays/crash state and every VP's SynIC/stimers; versions
+  1 through 3 remain readable as Q35 without Hyper-V.
 
 ## W2 -- Windows at a useful speed
 
-Hyper-V vapic and a path to x2APIC, hv-time, and hypercalls for TLB flushes
-and IPIs. Measure against KVM on the EX44 with the same VM and benchmark
-kit, and measure each change. AVIC and virtualizing the xAPIC page come
-after the measurements.
+The core Hyper-V performance path is implemented and measured on the EX44.
+Hv#1 now includes its EOI/ICR/TPR MSRs, per-VP assist pages with exit-less EOI,
+SynIC AutoEOI delivery, and the world-switch fast path for remote fixed IPIs
+through the synthetic ICR. `HvFlushVirtualAddressSpace`,
+`HvFlushVirtualAddressList` and `HvCallSendSyntheticClusterIpi` support simple
+64-bit VP masks; list flushes conservatively flush the whole TLB. Sparse Ex and
+XMM forms are not advertised. Vmstate version 5 carries VP-assist and reads
+version 4 without it.
+
+In comparable 2.66-second idle Windows windows, exits fell from 1,657 to 647
+(61%). All 1,163 xAPIC nested faults disappeared; Hyper-V EOI writes fell from
+479 to one. VP-assist removed 489 of 497 EOI exits in its isolated measurement,
+and the synthetic ICR fast path reduced median handling from 2.2 us to 715 ns.
+Windows Server 2022 still boots to SAC in about 1.65 s. The `hyperv`, `lapic`,
+`policy`, `vmstate` and whole-machine `platform` fuzz targets cover the new
+contract, including valid flush/IPI calls and their results.
+
+The current Server 2022 image remains in xAPIC mode and uses Hyper-V's
+enlightened path; x2APIC and VT-x APICv remain available to guests that select
+them. Hardware virtualization of the xAPIC page, AVIC, and the same-image KVM
+benchmark comparison are still open. Those should follow the measurements, not
+be enabled on the assumption that fewer exits always wins.
 
 ## W3 -- Installation and built-in devices
 

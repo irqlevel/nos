@@ -572,18 +572,18 @@ selects `/lib/CLOUDHV.fd`; an explicit PVH ELF path after the same flag is
 useful for the DEBUG build. The firmware is entered by the existing PVH loader,
 but its machine has CloudHv's `8086:0D57` host bridge, CF8/CFC without ECAM,
 and xAPIC plus an IO-APIC even for one vCPU. Ordinary Linux guests remain Q35.
-Host-function `pci=` is not available on this machine. Saving or migrating its
-state is refused until the host bridge is versioned into that state, rather
-than restoring the guest as Q35.
+Host-function `pci=` is not available on this machine. Save, restore and
+migration carry its host bridge and, where selected, Hyper-V's shared and
+per-vCPU state in version 5 of the VM state, so it cannot come back as Q35;
+versions 1 through 4 remain readable.
 
 `hyperv` on the same commands, or `hyperv = true` in vm.toml, selects
 Microsoft's Hv#1 interface for a firmware guest. It is refused for an ordinary
 Q35 guest, whose KVM interface is unchanged. The implementation provides the
 Microsoft CPUID range through 0x40000005, `GUEST_OS_ID`, `HYPERCALL` and
-per-vCPU `VP_INDEX`, and a read-only hypercall page with the vendor's opcode.
-The page overlays RAM or a hole without changing the underlying host-side RAM;
-disabling or moving it restores the old mapping. No synthetic timer or reference
-TSC is offered yet, and an unknown hypercall gets
+per-vCPU `VP_INDEX`, a read-only hypercall page with the vendor's opcode,
+reference time, SynIC and synthetic timers, virtual APIC MSRs and VP-assist
+EOI, and TLB-flush and synthetic-IPI hypercalls. An unknown hypercall gets
 `HV_STATUS_INVALID_HYPERCALL_CODE`.
 
 ```
@@ -2446,7 +2446,8 @@ not 64-bit and prefetchable go from there up to ECAM and the MSI-X pages,
 the rest from the first GiB past its RAM -- both windows
 in the DSDT's `_CRS`, so
 that Linux keeps each BAR where it was put. The 64-bit window there reaches
-only as far as the BARs placed in it, a GiB at a time: the rest of the
+only as far as the BARs placed in it, in Cloud Hypervisor's 8 MiB units: the
+rest of the
 guest's addresses are its OS's own, and Linux's HMM takes a GPU's VRAM's
 worth of them for the device memory NVIDIA's UVM registers the GPU with --
 with the window up to the top of them none was left, and CUDA was refused
@@ -4226,17 +4227,20 @@ as each of this host's CPUs makes it -- the EX44's, its six P-cores' twelve
 threads and eight E-cores alike: `cpu model c99c33c85afad94a -- what a guest moving here
 is held to, alike on the 20 CPUs` -- or which two differ, and at which leaf.
 
-**The state** (`common/vm/vmstate`, version 3, which reads versions 1 and 2
-too: a host updated before the others takes their VMs, whose CPUs then start
-with MTRRs at reset) is every CPU's registers in the shape
-both backends share -- the general and control registers, the segments,
-the system MSRs, each vCPU's MTRRs, the debug registers, the XSAVE area checked as it is read
-back in, a pending event, the interrupt shadow -- each local APIC, the
-mailboxes, every device's; times stored relative to the pause, the TSC
-carried by its offset, so the guest's clocks go on from where they stood,
-the pause left out (`LinuxGuest::rebase`). Every field is checked as it is
-read: a state is another host's word. `hv save` writes it and the memory
-into a file on the one host (`save.rs`).
+**The state** (`common/vm/vmstate`, version 5, which reads versions 1 through
+4 too: a host updated before the others takes their Q35 VMs, whose CPUs then
+start with MTRRs at reset and without Hyper-V) is every CPU's registers in the
+shape both backends share -- the general and control registers, the segments,
+the system MSRs, each vCPU's MTRRs, the debug registers, the XSAVE area checked
+as it is read back in, a pending event, the interrupt shadow -- each local
+APIC, the mailboxes, every device's. The VM part names Q35 or CloudHv. A
+firmware VM with Hv#1 also carries its reference-time epoch and overlay MSRs,
+crash state, and every VP's SynIC, stimers and VP-assist MSR; their deadlines
+are relative to the pause like the other timers'. Times are stored relative to
+the pause, the TSC carried by its offset, so the guest's clocks go on from where
+they stood, the pause left out (`LinuxGuest::rebase`). Every field is checked
+as it is read: a state is another host's word. `hv save` writes it and the
+memory into a file on the one host (`save.rs`).
 
 **The dirty log** (`hypervisor/hv/src/dirty.rs`) finds what the guest
 writes while its memory is copied: every page of its RAM is made read-only
@@ -4373,6 +4377,10 @@ button and evdev.)
   Q35 keeps PM1 status at `0x600` and does not take that write as power-off.
   This is what Windows accepts from its CloudHv firmware path; presenting
   that path with a legacy FADT led to bugcheck `0xA5(0x11, 0x3)`.
+- **The firmware console is described too.** An SPCR revision 2 names the
+  16550 at COM1 (`0x3F8`), IRQ/GSI 4, 115200 8N1 and VT-UTF8; the DSDT also
+  gives COM1 a PNP0501 device with those I/O and IRQ resources. Legacy Q35's
+  tables are unchanged.
 - **The MADT** lists a local APIC for each CPU and NMI on every LINT1 --
   and, for a guest given one, the IO-APIC, with the two overrides a PC's
   has: the timer's IRQ 0 on its pin 2, and the SCI a level, active high
@@ -5195,6 +5203,26 @@ call's status is `HV_STATUS_INVALID_HYPERCALL_CODE` (2). Crash MSRs P0-P4
 and CrashNotify carry a Windows bugcheck's code and four arguments into the
 VM's stop report and `/logs/hv.log`.
 
+The virtual APIC interface supplies Hyper-V's EOI, ICR and TPR MSRs in either
+xAPIC or x2APIC mode, and the per-VP assist page MSR. Its EOI-assist word is
+set before a host-injected edge interrupt when no lower-priority request is
+waiting; a guest clearing it instead of writing EOI has the EOI completed at
+the next exit. While an AutoEOI SINT is configured it disables APICv and the
+host ends its vector as it is injected. Hyper-V's synthetic ICR uses the world
+switch's remote fixed-IPI fast path as the native x2APIC ICR does. CPUID
+recommends the APIC MSRs, deprecation of AutoEOI, remote TLB flushes and
+synthetic cluster IPIs.
+
+`HvFlushVirtualAddressSpace` (0x0002), `HvFlushVirtualAddressList` (0x0003)
+and `HvCallSendSyntheticClusterIpi` (0x000b) are implemented with the simple
+64-bit processor masks. The IPI has memory and fast register forms. A list
+flush conservatively flushes the whole TLB rather than keeping each GVA range;
+the non-global-only flag is accepted on that path too, for compatibility with
+KVM's Windows path. A remote target gets an atomic flush request and a doorbell, and marks its
+backend before the next entry; the calling VPID/ASID is marked directly. The
+sparse Ex and XMM forms are not advertised. Vmstate version 5 adds each VP's
+assist MSR and reads version 4 with it disabled.
+
 TIME_REF_COUNT shares the reference TSC page: a second read-only overlay,
 with the TLFS sequence odd while a value is being published and even after,
 TSC value and scale/offset, and the TSC and local APIC frequencies. Each vCPU
@@ -5210,12 +5238,23 @@ Windows Server 2022 Standard Core then reaches `SAC>` on the EX44 in about
 1.65 seconds; its CMD channel accepts a login, viostor runs the system disk,
 and NetKVM uses DHCP. `shutdown /s /t 0` ends in `Stop::PowerOff`: Windows
 reaches CloudHv's UEFI `ResetSystem(EfiResetShutdown)`, which writes `0x34`
-to its fixed sleep-control port `0x600`. This boot also exercised a VT-x fix
+to its fixed sleep-control port `0x600`. A running Windows VM saved with
+`hv save` and restored on the EX44 resumes its CMD channel and network, and
+then shuts down normally. This boot also exercised a VT-x fix
 worth keeping in the dump: requesting an IRQ window now clears a stale TPR
 threshold first, since the CPU refuses VM-entry when that threshold exceeds
 VTPR's class.
 Both kinds of failed entry preserve the VMCS controls and related fields in
 the stopped vCPU's report (see [VT-x](#amd-v-first-intel-vt-x-second)).
+
+The W2 measurements on the same idle Windows guest, over 2.66-second trace
+windows, reduced exits from 1,657 to 647 (61%): all 1,163 xAPIC nested faults
+were gone, Hyper-V EOI writes fell from 479 to one, and 195 synthetic ICR writes
+remained. Measured separately, VP-assist removed 489 of 497 EOI exits in an
+early-boot window, and answering the synthetic ICR in the world switch reduced
+its median host cost from 2.2 us to 715 ns. The current Windows image stays in
+xAPIC mode and uses these Hyper-V paths; hardware virtualization of the xAPIC
+page, AVIC and a same-image KVM benchmark remain separate measurements.
 
 ### Starting the others
 

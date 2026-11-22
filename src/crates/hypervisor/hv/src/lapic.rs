@@ -1028,6 +1028,30 @@ impl Lapic {
         self.read_register(reg, now, false).map(u64::from).ok_or(Refused)
     }
 
+    /// Hyper-V's synthetic EOI, ICR and TPR MSRs, available in either APIC mode.
+    pub fn hyperv_read(&self, msr: u32) -> Option<u64> {
+        match msr {
+            crate::hyperv::MSR_APIC_EOI => Some(0),
+            crate::hyperv::MSR_APIC_ICR => Some(self.icr),
+            crate::hyperv::MSR_APIC_TPR => Some(u64::from(self.tpr)),
+            _ => None,
+        }
+    }
+
+    /// Write one of Hyper-V's synthetic APIC MSRs, or None where it is not one.
+    pub fn hyperv_write(&mut self, msr: u32, value: u64, now: u64) -> Option<Result<Wrote, Refused>> {
+        let result = match msr {
+            crate::hyperv::MSR_APIC_EOI if value >> 32 == 0 => self.write_register(REG_EOI, value as u32, now, true),
+            crate::hyperv::MSR_APIC_ICR => {
+                self.write_icr(value, true).map(|ipi| ipi.map_or(Wrote::Done, Wrote::Ipi))
+            }
+            crate::hyperv::MSR_APIC_TPR if value >> 8 == 0 => self.write_register(REG_TPR, value as u32, now, false),
+            crate::hyperv::MSR_APIC_EOI | crate::hyperv::MSR_APIC_TPR => Err(Refused),
+            _ => return None,
+        };
+        Some(result)
+    }
+
     /// The 32-bit register `reg` -- by its x2APIC MSR's offset -- as the mode
     /// reads it, `xapic` or not, at `now`; None for no register, or one
     /// write-only. The ICR's two halves are xAPIC mode's; x2APIC mode reads
@@ -1105,7 +1129,20 @@ impl Lapic {
     /// take it into. What the world switch's fast path takes
     /// (`run::FastMsr`).
     pub fn fixed_ipi(&mut self, value: u64, me: u32) -> Option<Ipi> {
-        if !self.x2apic() || value & ICR_RESERVED != 0 || (value & ICR_VECTOR) < 16 {
+        self.fixed_ipi_mode(value, me, false)
+    }
+
+    /// Hyper-V's synthetic ICR, in xAPIC format in either APIC mode, for the
+    /// same remote fixed-IPI fast path as [`fixed_ipi`](Self::fixed_ipi).
+    pub fn fixed_hyperv_ipi(&mut self, value: u64, me: u32) -> Option<Ipi> {
+        self.fixed_ipi_mode(value, me, true)
+    }
+
+    fn fixed_ipi_mode(&mut self, value: u64, me: u32, hyperv: bool) -> Option<Ipi> {
+        if if hyperv { !self.enabled() } else { !self.x2apic() }
+            || !hyperv && value & ICR_RESERVED != 0
+            || (value & ICR_VECTOR) < 16
+        {
             return None;
         }
         if !matches!((value >> ICR_DELIVERY_SHIFT) & ICR_DELIVERY_MASK, 0 | 1) {
@@ -1114,7 +1151,7 @@ impl Lapic {
         /* Of a write past the checks above, `write_icr` does nothing but
          * keep it in the ICR: put back, nothing of it is left. */
         let before = self.icr;
-        let ipi = self.write_icr(value, false).ok().flatten()?;
+        let ipi = self.write_icr(value, hyperv).ok().flatten()?;
         if ipi.reaches(me, self.addressing(), me) {
             self.icr = before;
             return None;

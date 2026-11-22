@@ -1,6 +1,7 @@
 //! Microsoft's Hv#1 interface for a firmware guest. KVM remains the default
-//! elsewhere. Its hypercall and reference TSC pages are read-only overlays,
-//! and its basic and time MSRs are partition-wide, as the TLFS has them.
+//! elsewhere. Its hypercall and reference TSC pages are read-only overlays;
+//! its basic, time and SynIC MSRs, virtual APIC and flush/IPI hypercalls follow
+//! the TLFS.
 
 use kcore::sync::Mutex;
 
@@ -27,6 +28,10 @@ pub const MSR_STIMER0_CONFIG: u32 = 0x4000_00B0;
 pub const MSR_STIMER3_COUNT: u32 = 0x4000_00B7;
 pub const MSR_CRASH_P0: u32 = 0x4000_0100;
 pub const MSR_CRASH_CTL: u32 = 0x4000_0105;
+pub const MSR_APIC_EOI: u32 = 0x4000_0070;
+pub const MSR_APIC_ICR: u32 = 0x4000_0071;
+pub const MSR_APIC_TPR: u32 = 0x4000_0072;
+pub const MSR_VP_ASSIST: u32 = 0x4000_0073;
 const CRASH_NOTIFY: u64 = 1 << 63;
 
 const HYPERCALL_ENABLE: u64 = 1;
@@ -39,6 +44,37 @@ const REFERENCE_TSC_GPFN: u64 = !0xFFF;
 const REFERENCE_HZ: u128 = 10_000_000;
 const APIC_HZ: u64 = 1_000_000_000;
 const HV_STATUS_INVALID_HYPERCALL_CODE: u64 = 2;
+pub const HV_STATUS_INVALID_HYPERCALL_INPUT: u64 = 3;
+pub const HV_STATUS_INVALID_ALIGNMENT: u64 = 4;
+pub const HV_STATUS_TIME_OUT: u64 = 0x78;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Call {
+    FlushSpace { fast: bool },
+    FlushList { fast: bool, reps: u16, start: u16 },
+    SendIpi { fast: bool },
+}
+
+impl Call {
+    pub fn decode(input: u64) -> core::result::Result<Call, u64> {
+        const RESERVED: u64 = 0xF000_F000_0000_0000 | 0xF800_0000;
+        if input & RESERVED != 0 {
+            return Err(HV_STATUS_INVALID_HYPERCALL_INPUT);
+        }
+        let code = input as u16;
+        let fast = input & 1 << 16 != 0;
+        let variable = (input >> 17) & 0x3FF;
+        let reps = ((input >> 32) & 0xFFF) as u16;
+        let start = ((input >> 48) & 0xFFF) as u16;
+        match code {
+            0x0002 if variable == 0 && reps == 0 && start == 0 => Ok(Call::FlushSpace { fast }),
+            0x0003 if variable == 0 && reps != 0 && start < reps => Ok(Call::FlushList { fast, reps, start }),
+            0x000B if variable == 0 && reps == 0 && start == 0 => Ok(Call::SendIpi { fast }),
+            0x0002 | 0x0003 | 0x000B => Err(HV_STATUS_INVALID_HYPERCALL_INPUT),
+            _ => Err(HV_STATUS_INVALID_HYPERCALL_CODE),
+        }
+    }
+}
 
 const STIMER_ENABLE: u64 = 1 << 0;
 const STIMER_PERIODIC: u64 = 1 << 1;
@@ -51,6 +87,7 @@ const PAGE_ENABLED: u64 = 1;
 const PAGE_PRESERVED: u64 = 0xFFC;
 const SINT_VECTOR: u64 = 0xFF;
 const SINT_MASKED: u64 = 1 << 16;
+const SINT_AUTO_EOI: u64 = 1 << 17;
 const SINT_WRITABLE: u64 = SINT_VECTOR | (0x1F << 16);
 
 #[derive(Clone, Copy, Default)]
@@ -67,11 +104,12 @@ pub struct Vp {
     pages: [u64; 3],
     sints: [u64; 16],
     timers: [Stimer; 4],
+    vp_assist: u64,
 }
 
 impl Default for Vp {
     fn default() -> Self {
-        Self { scontrol: 0, pages: [0; 3], sints: [SINT_MASKED; 16], timers: [Stimer::default(); 4] }
+        Self { scontrol: 0, pages: [0; 3], sints: [SINT_MASKED; 16], timers: [Stimer::default(); 4], vp_assist: 0 }
     }
 }
 
@@ -94,6 +132,7 @@ impl Vp {
             MSR_SIMP => return Some(self.pages[1]),
             MSR_EOM => return Some(0),
             MSR_SIRBP => return Some(self.pages[2]),
+            MSR_VP_ASSIST => return Some(self.vp_assist),
             MSR_SINT0..=MSR_SINT15 => return Some(self.sints[(msr - MSR_SINT0) as usize]),
             _ => {}
         }
@@ -108,7 +147,9 @@ impl Vp {
         let next = (value & !PAGE_PRESERVED) | (self.pages[slot] & PAGE_PRESERVED);
         if next & PAGE_ENABLED != 0 {
             let gpa = next & !0xFFF;
-            if !memory.is_ram(gpa, kcore::consts::PAGE_SIZE as _) || memory.overlay_contains(gpa) {
+            if !memory.is_ram(gpa, kcore::consts::PAGE_SIZE as _) || memory.overlay_contains(gpa)
+                || self.vp_assist & PAGE_ENABLED != 0 && self.vp_assist & !0xFFF == gpa
+            {
                 return false;
             }
             for off in (0..kcore::consts::PAGE_SIZE as u64).step_by(512) {
@@ -121,10 +162,43 @@ impl Vp {
         true
     }
 
+    fn write_vp_assist(&mut self, value: u64, memory: &GuestMemory) -> bool {
+        let next = (value & !PAGE_PRESERVED) | (self.vp_assist & PAGE_PRESERVED);
+        if next & PAGE_ENABLED != 0 {
+            let gpa = next & !0xFFF;
+            let synic = self.pages.iter().any(|page| page & PAGE_ENABLED != 0 && page & !0xFFF == gpa);
+            if synic || !memory.is_ram(gpa, kcore::consts::PAGE_SIZE as u64) || memory.overlay_contains(gpa)
+                || memory.write(gpa, &0u32.to_le_bytes()).is_err()
+            {
+                return false;
+            }
+        }
+        self.vp_assist = next;
+        true
+    }
+
+    /// The enabled VP assist page's EOI-assist word.
+    pub fn assist_page(&self) -> Option<u64> {
+        (self.vp_assist & PAGE_ENABLED != 0).then_some(self.vp_assist & !0xFFF)
+    }
+
+    pub fn auto_eoi(&self) -> bool {
+        self.scontrol & PAGE_ENABLED != 0
+            && self.sints.iter().any(|sint| sint & (SINT_MASKED | SINT_AUTO_EOI) == SINT_AUTO_EOI)
+    }
+
+    pub fn auto_eoi_vector(&self, vector: u8) -> bool {
+        self.scontrol & PAGE_ENABLED != 0
+            && self.sints.iter().any(|sint| {
+                sint & (SINT_VECTOR | SINT_MASKED | SINT_AUTO_EOI) == u64::from(vector) | SINT_AUTO_EOI
+            })
+    }
+
     /// Write a SynIC register or a timer at reference time `now`:
     /// Some(false) is a #GP, None an MSR this interface does not own.
     pub fn write(&mut self, msr: u32, value: u64, now: u64, memory: &GuestMemory) -> Option<bool> {
         match msr {
+            MSR_VP_ASSIST => return Some(self.write_vp_assist(value, memory)),
             MSR_SCONTROL => {
                 if value & !1 != 0 {
                     return Some(false);
@@ -178,6 +252,73 @@ impl Vp {
             value
         });
         Some(true)
+    }
+
+    pub fn save(&self, now: u64) -> vmstate::HypervVp {
+        vmstate::HypervVp {
+            scontrol: self.scontrol,
+            pages: self.pages,
+            sints: self.sints,
+            vp_assist: self.vp_assist,
+            timers: core::array::from_fn(|i| {
+                let timer = self.timers[i];
+                vmstate::HypervTimer {
+                    config: timer.config,
+                    count: timer.count,
+                    due_in: timer.expires.map(|expires| expires.saturating_sub(now)),
+                }
+            }),
+        }
+    }
+
+    pub fn restore(&mut self, s: &vmstate::HypervVp, now: u64, memory: &GuestMemory) -> vmstate::Result<()> {
+        let bad = |what| Err(vmstate::Error(what));
+        if s.scontrol & !1 != 0 {
+            return bad("Hyper-V's SCONTROL has reserved bits");
+        }
+        for page in s.pages {
+            if page & PAGE_ENABLED != 0 {
+                let gpa = page & !0xFFF;
+                if !memory.is_ram(gpa, kcore::consts::PAGE_SIZE as u64) || memory.overlay_contains(gpa) {
+                    return bad("a Hyper-V SynIC page outside RAM or under an overlay");
+                }
+            }
+        }
+        if s.vp_assist & PAGE_ENABLED != 0 {
+            let gpa = s.vp_assist & !0xFFF;
+            let synic = s.pages.iter().any(|page| page & PAGE_ENABLED != 0 && page & !0xFFF == gpa);
+            if synic || !memory.is_ram(gpa, kcore::consts::PAGE_SIZE as u64) || memory.overlay_contains(gpa) {
+                return bad("a Hyper-V VP assist page outside RAM, under an overlay or shared with SynIC");
+            }
+        }
+        if s.sints.iter().any(|&value| {
+            value & !SINT_WRITABLE != 0 || value & SINT_MASKED == 0 && value & SINT_VECTOR < 16
+        }) {
+            return bad("a Hyper-V SINT with reserved bits or a reserved vector");
+        }
+        for timer in &s.timers {
+            let mut config = timer.config;
+            Self::normalize(&mut config);
+            if !Self::valid(timer.config) || config != timer.config
+                || timer.count == 0 && timer.due_in.is_some()
+                || timer.config & STIMER_ENABLE == 0 && timer.due_in.is_some()
+            {
+                return bad("a Hyper-V stimer state the interface cannot have");
+            }
+        }
+        self.scontrol = s.scontrol;
+        self.pages = s.pages;
+        self.sints = s.sints;
+        self.vp_assist = s.vp_assist;
+        self.timers = core::array::from_fn(|i| {
+            let timer = s.timers[i];
+            Stimer {
+                config: timer.config,
+                count: timer.count,
+                expires: timer.due_in.map(|due| now.saturating_add(due)),
+            }
+        });
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -281,13 +422,7 @@ pub struct Hyperv {
 }
 
 impl Hyperv {
-    #[allow(unreachable_patterns)]
-    pub fn new(vendor: Vendor, epoch: u64, tsc_hz: u64) -> Result<Hyperv> {
-        let code = match vendor {
-            Vendor::Svm => [0x0F, 0x01, 0xD9, 0xC3],
-            Vendor::Vmx => [0x0F, 0x01, 0xC1, 0xC3],
-            _ => return Err(Error::NotImplemented),
-        };
+    fn make_reference(epoch: u64, tsc_hz: u64) -> Result<[u8; 24]> {
         if tsc_hz == 0 {
             return Err(Error::NotImplemented);
         }
@@ -301,6 +436,20 @@ impl Hyperv {
         reference[0..4].copy_from_slice(&1u32.to_le_bytes());
         reference[8..16].copy_from_slice(&scale.to_le_bytes());
         reference[16..24].copy_from_slice(&offset.to_le_bytes());
+        Ok(reference)
+    }
+
+    #[allow(unreachable_patterns)]
+    pub fn new(vendor: Vendor, epoch: u64, tsc_hz: u64) -> Result<Hyperv> {
+        let code = match vendor {
+            Vendor::Svm => [0x0F, 0x01, 0xD9, 0xC3],
+            Vendor::Vmx => [0x0F, 0x01, 0xC1, 0xC3],
+            _ => return Err(Error::NotImplemented),
+        };
+        if tsc_hz == 0 {
+            return Err(Error::NotImplemented);
+        }
+        let reference = Self::make_reference(epoch, tsc_hz)?;
         Ok(Hyperv {
             shared: Mutex::new(Shared::default()).ok_or(Error::NoMemory)?,
             code,
@@ -316,6 +465,69 @@ impl Hyperv {
 
     pub fn reference_page(&self) -> &[u8] {
         &self.reference
+    }
+
+    pub fn save(&self) -> vmstate::HypervShared {
+        let s = self.shared.lock();
+        vmstate::HypervShared {
+            guest_os_id: s.guest_os_id,
+            hypercall: s.hypercall,
+            reference_tsc: s.reference_tsc,
+            crash: s.crash,
+            crashed: s.crashed,
+            epoch: self.epoch,
+            tsc_hz: self.tsc_hz,
+        }
+    }
+
+    pub fn restore(&mut self, s: &vmstate::HypervShared, vm_tsc_hz: u64, memory: &GuestMemory) -> vmstate::Result<()> {
+        let bad = |what| Err(vmstate::Error(what));
+        if s.tsc_hz == 0 || s.tsc_hz != vm_tsc_hz {
+            return bad("Hyper-V's TSC rate differs from the VM's");
+        }
+        if s.hypercall & HYPERCALL_ENABLE != 0 && s.guest_os_id == 0 {
+            return bad("Hyper-V's hypercall page is enabled with no guest OS");
+        }
+        let valid_gpa = |value: u64| {
+            let gpa = value & !0xFFF;
+            gpa != crate::memory::XAPIC_PAGE
+                && gpa.checked_add(kcore::consts::PAGE_SIZE as u64).is_some_and(|end| end <= crate::memory::MAX_GPA)
+        };
+        if !valid_gpa(s.hypercall) || !valid_gpa(s.reference_tsc) {
+            return bad("a Hyper-V overlay at an invalid guest address");
+        }
+        if s.hypercall & HYPERCALL_ENABLE != 0 && s.reference_tsc & REFERENCE_TSC_ENABLE != 0
+            && s.hypercall & HYPERCALL_GPFN == s.reference_tsc & REFERENCE_TSC_GPFN
+        {
+            return bad("Hyper-V's overlays collide");
+        }
+        let reference = Self::make_reference(s.epoch, s.tsc_hz)
+            .map_err(|_| vmstate::Error("Hyper-V's reference clock cannot be restored"))?;
+        memory.prepare_overlay(OverlaySlot::Hypercall, &self.code)
+            .map_err(|_| vmstate::Error("Hyper-V's hypercall page cannot be restored"))?;
+        memory.prepare_overlay(OverlaySlot::ReferenceTsc, &reference)
+            .map_err(|_| vmstate::Error("Hyper-V's reference page cannot be restored"))?;
+        let map = |slot, enabled, value| {
+            let result = if enabled {
+                memory.map_overlay(slot, value & !0xFFF)
+            } else {
+                memory.unmap_overlay(slot)
+            };
+            result.map_err(|_| vmstate::Error("Hyper-V's overlay mapping cannot be restored"))
+        };
+        map(OverlaySlot::Hypercall, s.hypercall & HYPERCALL_ENABLE != 0, s.hypercall)?;
+        map(OverlaySlot::ReferenceTsc, s.reference_tsc & REFERENCE_TSC_ENABLE != 0, s.reference_tsc)?;
+        self.epoch = s.epoch;
+        self.tsc_hz = s.tsc_hz;
+        self.reference = reference;
+        *self.shared.lock() = Shared {
+            guest_os_id: s.guest_os_id,
+            hypercall: s.hypercall,
+            reference_tsc: s.reference_tsc,
+            crash: s.crash,
+            crashed: s.crashed,
+        };
+        Ok(())
     }
 
     /// Reference time in 100 ns units, zero at the partition's creation.
@@ -422,11 +634,10 @@ impl Hyperv {
         Some(true)
     }
 
-    /// An enabled interface answers an unknown call with its own status, not
-    /// KVM's -ENOSYS. None where the interface is off and the opcode is #UD.
-    pub fn call(&self, _input: u64) -> Option<u64> {
+    /// Decode a call when the interface is enabled; None leaves the opcode #UD.
+    pub fn call(&self, input: u64) -> Option<core::result::Result<Call, u64>> {
         let s = self.shared.lock();
-        (s.guest_os_id != 0 && s.hypercall & HYPERCALL_ENABLE != 0).then_some(HV_STATUS_INVALID_HYPERCALL_CODE)
+        (s.guest_os_id != 0 && s.hypercall & HYPERCALL_ENABLE != 0).then_some(Call::decode(input))
     }
 
     /// The five crash parameters once CrashNotify arrives.

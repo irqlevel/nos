@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! "nosvmst1" | version | part VM | part CPU, one a CPU | part PLATFORM
+//!                | optional part HYPERV
 //! part: kind u8, length u32, its bytes -- read whole, and to the byte
 //! ```
 //!
@@ -35,9 +36,11 @@
 //! state, naming what it was: a state comes from another host -- which is
 //! authenticated -- and from another build, which is not the same code. The
 //! version says which; one this does not know is refused, never guessed.
-//! This writes version 2 and reads 1 too, what 2 added given its default:
-//! 2 is 1 and the UART's escape sequence and saved cursor, which version 1
-//! did not follow.
+//! This writes version 5 and reads 1 through 4. Version 2 added the UART's
+//! escape sequence and saved cursor, version 3 the MTRRs, version 4 the
+//! host bridge and optional Hyper-V shared/per-VP state, and version 5 the
+//! per-VP assist MSR. Older states restore as Q35 with no Hyper-V and the added
+//! fields at their defaults.
 //! What only the host that restores it can say -- a ring inside the guest's
 //! RAM, a feature its devices offer, an XSAVE component its CPU has -- the
 //! restore checks in `hv` as each piece is put back.
@@ -52,11 +55,13 @@ mod cpu;
 mod apic;
 mod devices;
 mod mtrrs;
+mod hyperv;
 
 use alloc::vec::Vec;
 
 pub use apic::{Lapic, Mail, LVT_MAX, WORDS};
 pub use mtrrs::Mtrrs;
+pub use hyperv::{HypervShared, HypervState, HypervTimer, HypervVp};
 pub use cpu::{Activity, Cpu, Event, EventKind, Regs, Segment, Table, ERROR_CODE_VECTORS, XSAVE_MAX};
 pub use devices::{Blk, Device, Function, IoApic, Msix, Net, Pic, PicChip, Pit, PitChannel, Platform, Pm, PvPanic,
                   Queue, Rtc, Takes, Transport, Uart, CSI_PARAMS, ESC_CSI, ESC_CSI6_V1, ESC_CSI_OTHER, ESC_START,
@@ -69,7 +74,7 @@ pub const MAGIC: [u8; 8] = *b"nosvmst1";
 /// The format's version: the one this writes. It reads `OLDEST` on: a
 /// cluster updated a host at a time moves each one's VMs off before its
 /// turn, from hosts that write the version before.
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 5;
 pub const OLDEST: u16 = 1;
 /// The most CPUs a state holds.
 pub const CPUS_MAX: usize = 64;
@@ -98,6 +103,14 @@ pub enum Vendor {
     Vmx,
 }
 
+/// The host bridge the VM was built with. Its configuration interface and
+/// ACPI machine differ, so a restore may not substitute one for the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostBridge {
+    Q35,
+    CloudHv,
+}
+
 /// A range of guest-physical addresses with RAM behind it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Range {
@@ -119,6 +132,8 @@ pub struct Shape {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Vm {
     pub vendor: Vendor,
+    /// Q35 or CloudHv's firmware machine. Versions before 4 are Q35.
+    pub host_bridge: HostBridge,
     /// What its SMBIOS calls it.
     pub uuid: [u8; 16],
     /// Its RAM, in ascending order, none overlapping: what the pages that
@@ -156,12 +171,15 @@ pub struct VmState {
     /// One a CPU, its APIC ID its index: as many as `vm.shape.cpus`.
     pub cpus: Vec<Cpu>,
     pub platform: Platform,
+    /// Hv#1's shared and per-VP state, present only on a Hyper-V firmware VM.
+    pub hyperv: Option<HypervState>,
 }
 
 /* The parts, by their kind byte. */
 const PART_VM: u8 = 1;
 const PART_CPU: u8 = 2;
 const PART_PLATFORM: u8 = 3;
+const PART_HYPERV: u8 = 4;
 /// The most bytes a part has: the platform's, of every device's, is a few
 /// KiB, a CPU's under two; this is room, and a bound on what a length a
 /// state gives can make anything allocate.
@@ -179,6 +197,9 @@ impl VmState {
             out.part(PART_CPU, |o| cpu.put(o))?;
         }
         out.part(PART_PLATFORM, |o| self.platform.put(o))?;
+        if let Some(hyperv) = &self.hyperv {
+            out.part(PART_HYPERV, |o| hyperv.put(o))?;
+        }
         out.finish()
     }
 
@@ -206,8 +227,18 @@ impl VmState {
             cpus.push(cpu);
         }
         let platform = r.part(PART_PLATFORM, "the platform's part", Platform::get)?;
+        let hyperv = if version >= 4 && !r.done() {
+            Some(r.part(PART_HYPERV, "Hyper-V's part", HypervState::get)?)
+        } else {
+            None
+        };
         if !r.done() {
             return Err(Error("bytes past the state's end"));
+        }
+        if let Some(hyperv) = &hyperv {
+            if vm.host_bridge != HostBridge::CloudHv || hyperv.vps.len() != cpus.len() {
+                return Err(Error("Hyper-V state on the wrong machine or for another number of CPUs"));
+            }
         }
         if platform.ioapic.is_some() != vm.ioapic {
             return Err(Error("an IO-APIC where the VM has none, or none where it has one"));
@@ -218,7 +249,24 @@ impl VmState {
         if platform.functions.len() != platform.devices.len() + 1 {
             return Err(Error("PCI functions for another number of devices"));
         }
-        Ok(VmState { vm, cpus, platform })
+        Ok(VmState { vm, cpus, platform, hyperv })
+    }
+}
+
+impl HostBridge {
+    fn code(self) -> u8 {
+        match self {
+            HostBridge::Q35 => 1,
+            HostBridge::CloudHv => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<HostBridge> {
+        match code {
+            1 => Ok(HostBridge::Q35),
+            2 => Ok(HostBridge::CloudHv),
+            _ => Err(Error("a host bridge neither Q35 nor CloudHv")),
+        }
     }
 }
 
@@ -265,6 +313,7 @@ impl Vm {
         o.u64(self.tsc_hz);
         o.u64(self.tsc);
         o.u64(self.started);
+        o.u8(self.host_bridge.code());
     }
 
     fn get(r: &mut In) -> Result<Vm> {
@@ -302,8 +351,8 @@ impl Vm {
             return Err(Error("a receive moderation of more than a second"));
         }
         let cpus = r.u32("cpus")?;
-        if cpus == 0 || cpus as usize > CPUS_MAX || (ioapic && cpus < 2) {
-            return Err(Error("a VM of no CPU, more than a state holds, or an IO-APIC with one"));
+        if cpus == 0 || cpus as usize > CPUS_MAX {
+            return Err(Error("a VM of no CPU or more than a state holds"));
         }
         let shape = Shape { cpus, smt: r.bool("smt")?, llc: r.bool("llc")? };
         let model = r.fixed::<32>("model")?;
@@ -313,7 +362,11 @@ impl Vm {
         }
         let tsc = r.u64("TSC")?;
         let started = r.u64("started")?;
-        Ok(Vm { vendor, uuid, ranges, x2apic, ioapic, apicv, offloads, rx_moderation_ns, shape, model, tsc_hz, tsc,
+        let host_bridge = if r.version >= 4 { HostBridge::from_code(r.u8("host bridge")?)? } else { HostBridge::Q35 };
+        if host_bridge == HostBridge::Q35 && ioapic && cpus < 2 {
+            return Err(Error("a Q35 VM with an IO-APIC and one CPU"));
+        }
+        Ok(Vm { vendor, host_bridge, uuid, ranges, x2apic, ioapic, apicv, offloads, rx_moderation_ns, shape, model, tsc_hz, tsc,
                 started })
     }
 

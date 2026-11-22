@@ -536,12 +536,17 @@ const HV_INTERFACE: u32 = 0x3123_7648;
 const HV_PRIV_TIME_REF_COUNT: u32 = 1 << 1;
 const HV_PRIV_SYNIC: u32 = 1 << 2;
 const HV_PRIV_STIMER: u32 = 1 << 3;
+const HV_PRIV_APIC_ACCESS: u32 = 1 << 4;
 const HV_PRIV_HYPERCALL: u32 = 1 << 5;
 const HV_PRIV_VP_INDEX: u32 = 1 << 6;
 const HV_PRIV_REFERENCE_TSC: u32 = 1 << 9;
 const HV_GUEST_CRASH: u32 = 1 << 10;
 const HV_PRIV_FREQUENCY: u32 = 1 << 11;
 const HV_STIMER_DIRECT: u32 = 1 << 19;
+const HV_RECOMMEND_REMOTE_TLB_FLUSH: u32 = 1 << 2;
+const HV_RECOMMEND_APIC_ACCESS: u32 = 1 << 3;
+const HV_RECOMMEND_NO_AUTO_EOI: u32 = 1 << 9;
+const HV_RECOMMEND_CLUSTER_IPI: u32 = 1 << 10;
 
 /// MSR_KVM_PV_EOI_EN: where the guest's PV EOI word is, and whether it is
 /// on (bit 0) -- the run loop's, as the local APIC's MSRs are.
@@ -732,13 +737,19 @@ fn microsoft_leaf(leaf: u32) -> Cpuid {
         LEAF_HV_INTERFACE => Cpuid { eax: HV_INTERFACE, ebx: 0, ecx: 0, edx: 0 },
         LEAF_HV_IDENTITY => NONE,
         LEAF_HV_FEATURES => Cpuid {
-            eax: HV_PRIV_TIME_REF_COUNT | HV_PRIV_SYNIC | HV_PRIV_STIMER | HV_PRIV_HYPERCALL | HV_PRIV_VP_INDEX
-                | HV_PRIV_REFERENCE_TSC | HV_PRIV_FREQUENCY,
+            eax: HV_PRIV_TIME_REF_COUNT | HV_PRIV_SYNIC | HV_PRIV_STIMER | HV_PRIV_APIC_ACCESS | HV_PRIV_HYPERCALL
+                | HV_PRIV_VP_INDEX | HV_PRIV_REFERENCE_TSC | HV_PRIV_FREQUENCY,
             ebx: 0,
             ecx: 0,
             edx: HV_GUEST_CRASH | HV_STIMER_DIRECT,
         },
-        LEAF_HV_RECOMMENDATIONS => Cpuid { eax: 0, ebx: u32::MAX, ecx: 0, edx: 0 },
+        LEAF_HV_RECOMMENDATIONS => Cpuid {
+            eax: HV_RECOMMEND_REMOTE_TLB_FLUSH | HV_RECOMMEND_APIC_ACCESS | HV_RECOMMEND_NO_AUTO_EOI
+                | HV_RECOMMEND_CLUSTER_IPI,
+            ebx: u32::MAX,
+            ecx: 0,
+            edx: 0,
+        },
         LEAF_HV_LIMITS => Cpuid { eax: crate::smp::MAX_VCPUS as u32, ebx: crate::smp::MAX_VCPUS as u32, ecx: 0, edx: 0 },
         _ => NONE,
     }

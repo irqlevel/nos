@@ -62,7 +62,7 @@ pub fn exit_fields(exit: &Exit, regs: &ExitRegs, host_vector: Option<u8>) -> (Ex
         /* The leaf is EAX and the subleaf ECX, the registers' low halves */
         Exit::Cpuid => (ExitReason::Cpuid, low(regs.rax), low(regs.rcx) as u32),
         Exit::Msr { write } => (ExitReason::Msr, low(regs.rcx), if write { WRITE } else { 0 }),
-        Exit::Hypercall => (ExitReason::Hypercall, regs.rax, 0),
+        Exit::Hypercall => (ExitReason::Hypercall, regs.rcx, 0),
         Exit::IrqWindow => (ExitReason::IrqWindow, 0, 0),
         Exit::NmiWindow => (ExitReason::NmiWindow, 0, 0),
         /* The error code's low half: every bit AMD-V and VT-x set there */

@@ -356,6 +356,9 @@ impl Backend {
     pub fn set_flush_always(&mut self, on: bool) {
         match self { Backend::Svm(v) => v.set_flush_always(on), Backend::Vmx(v) => v.set_flush_always(on) }
     }
+    pub fn flush_tlb(&mut self) {
+        match self { Backend::Svm(v) => v.flush_tlb(), Backend::Vmx(v) => v.flush_tlb() }
+    }
     pub fn set_profile(&mut self, on: bool) {
         match self { Backend::Svm(v) => v.set_profile(on), Backend::Vmx(v) => v.set_profile(on) }
     }

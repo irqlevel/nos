@@ -36,9 +36,10 @@
 //! (Documentation/virt/kvm/x86/cpuid.rst): the signature, and of the
 //! features NOP_IO_DELAY and, with APICs, PV_EOI -- nothing else, and
 //! nothing past 0x4000_0001. A firmware guest that asks for Hyper-V gets
-//! Microsoft's vendor, Hv#1 and only the hypercall, VP-index, time, frequency
-//! SynIC and direct-synthetic-timer facilities implemented behind it, as the TLFS
-//! has them; nothing past 0x4000_0005.
+//! Microsoft's vendor, Hv#1 and only the hypercall, VP-index, time, frequency,
+//! virtual-APIC, SynIC and direct-synthetic-timer facilities implemented behind
+//! it, plus the remote-flush and cluster-IPI recommendations, as the TLFS has
+//! them; nothing past 0x4000_0005.
 
 use crate::place::{Shape, Topology};
 use crate::policy::{self, model_answers, model_differs, model_digest, Asker, Cpuid, Own, MSR_ANSWER};
@@ -274,8 +275,9 @@ fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u3
                 0x4000_0000 => [0x4000_0005, u32::from_le_bytes(*b"Micr"), u32::from_le_bytes(*b"osof"),
                                 u32::from_le_bytes(*b"t Hv")],
                 0x4000_0001 => [u32::from_le_bytes(*b"Hv#1"), 0, 0, 0],
-                0x4000_0003 => [1 << 1 | 1 << 2 | 1 << 3 | 1 << 5 | 1 << 6 | 1 << 9 | 1 << 11, 0, 0, 1 << 10 | 1 << 19],
-                0x4000_0004 => [0, u32::MAX, 0, 0],
+                0x4000_0003 => [1 << 1 | 1 << 2 | 1 << 3 | 1 << 4 | 1 << 5 | 1 << 6 | 1 << 9 | 1 << 11, 0, 0,
+                                1 << 10 | 1 << 19],
+                0x4000_0004 => [1 << 2 | 1 << 3 | 1 << 9 | 1 << 10, u32::MAX, 0, 0],
                 0x4000_0005 => [crate::smp::MAX_VCPUS as u32, crate::smp::MAX_VCPUS as u32, 0, 0],
                 _ => [0; 4],
             }

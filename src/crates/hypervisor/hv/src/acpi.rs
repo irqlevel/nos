@@ -32,11 +32,11 @@
 //! reserves it too, for a kernel that looks there first.
 //!
 //! What is left out would need MMIO -- the HPET -- or is what a guest does
-//! without: processor objects (there are no C- or P-states to
-//! describe), the ISA devices (an OS finds a PC's serial port, RTC and timer
-//! where they always are), GPEs. A guest of one CPU, which has no APIC,
-//! gets no MADT; a guest whose kernel has no ACPI, or is told `acpi=off`,
-//! finds its CPUs in the MP table as before.
+//! without: processor C- or P-states, the RTC and timer as namespace devices,
+//! and GPEs. The firmware machine also describes COM1 as PNP0501 and in an
+//! SPCR, so an OS need not discover its console by probing. A guest of one
+//! CPU, which has no APIC, gets no MADT; a guest whose kernel has no ACPI, or
+//! is told `acpi=off`, finds its CPUs in the MP table as before.
 //!
 //! Everything is laid out into a buffer the caller copies into guest memory:
 //! plain data, with its checksums, holding nothing of the guest's.
@@ -44,7 +44,7 @@
 use crate::devices::pci::HostBridge;
 use crate::devices::{ioapic, pm, pvpanic, rtc};
 use crate::lapic;
-use crate::run::{RESET_CONTROL, RESET_VALUE};
+use crate::run::{COM1, COM1_IRQ, RESET_CONTROL, RESET_VALUE};
 
 /// Where the tables go: the BIOS area, from 0xE0000 to 1 MiB, which the
 /// memory map reserves -- the RSDP at its start, 16-byte aligned, where the
@@ -102,12 +102,16 @@ const FADT_REVISION: u8 = 6;
 const FADT_MINOR: u8 = 3;
 const MADT_REVISION: u8 = 5;
 const MCFG_REVISION: u8 = 1;
+const SPCR_REVISION: u8 = 2;
 const DSDT_REVISION: u8 = 2;
 const FACS_VERSION: u8 = 2;
 
 const RSDP_BYTES: usize = 36;
 /// An ACPI 6.x FADT's length: every field through the hypervisor vendor's.
 const FADT_BYTES: usize = 276;
+/// The revision 2 Serial Port Console Redirection table, before revision 4's
+/// optional clock and namespace fields.
+const SPCR_BYTES: usize = 80;
 /// The RSDP's checksum covers its first 20 bytes -- ACPI 1.0's RSDP; the
 /// extended checksum all of it.
 const RSDP_V1_BYTES: usize = 20;
@@ -152,6 +156,18 @@ const GAS_SYSTEM_IO: u8 = 1;
 const ACCESS_BYTE: u8 = 1;
 const ACCESS_WORD: u8 = 2;
 const ACCESS_DWORD: u8 = 3;
+
+/* The firmware console's SPCR: a full 16550 at COM1, 115200 8N1, available
+ * through both the PC's interrupt controllers, and no flow control. */
+const SPCR_INTERFACE_16550: u8 = 0;
+const SPCR_INTERRUPT_8259: u8 = 1;
+const SPCR_INTERRUPT_APIC: u8 = 2;
+const SPCR_BAUD_115200: u8 = 7;
+const SPCR_NO_PARITY: u8 = 0;
+const SPCR_ONE_STOP_BIT: u8 = 1;
+const SPCR_NO_FLOW_CONTROL: u8 = 0;
+const SPCR_TERMINAL_VT_UTF8: u8 = 2;
+const SPCR_NOT_PCI: u16 = 0xFFFF;
 
 /* The MADT: its flags and entries. */
 /// There are 8259s too, which an OS masks before it uses the APICs.
@@ -201,11 +217,13 @@ const ROOT_CHAR: u8 = b'\\';
 const PKG_LENGTH_BYTES: usize = 3;
 const PKG_LENGTH_TWO_FOLLOW: u8 = 0x80;
 const PKG_LENGTH_MAX: usize = 1 << 20;
-/// PNP0A05, a CPU container; PNP0A03, a PCI host bridge; and PNP0C02, a
-/// motherboard's resources, as compressed EISA IDs.
+/// PNP0A05, a CPU container; PNP0A03, a PCI host bridge; PNP0C02, a
+/// motherboard's resources; and PNP0501, a 16550 serial port, as compressed
+/// EISA IDs.
 const EISA_PNP0A05: u32 = 0x050A_D041;
 const EISA_PNP0A03: u32 = 0x030A_D041;
 const EISA_PNP0C02: u32 = 0x020C_D041;
+const EISA_PNP0501: u32 = 0x0105_D041;
 /// A fixed range of 32-bit memory, read-write (ACPI 6.5, 6.4.3.4): what the
 /// motherboard's `_CRS` reserves ECAM by -- with the end, its bytes.
 const MEMORY32_FIXED_TAG: u8 = 0x86;
@@ -228,6 +246,8 @@ const S5_ELEMENTS: u8 = 4;
 /* Resource descriptors, for the host bridge's `_CRS` (ACPI 6.5, 6.4). */
 const IO_PORT_TAG: u8 = 0x47;
 const IO_DECODE_16: u8 = 1;
+/// A two-byte IRQ mask, with no optional trigger/polarity byte.
+const IRQ_NO_FLAGS_TAG: u8 = 0x22;
 const WORD_SPACE_TAG: u8 = 0x88;
 const WORD_SPACE_BYTES: u16 = 13;
 const DWORD_SPACE_TAG: u8 = 0x87;
@@ -256,6 +276,8 @@ const CRS_MAX: usize = 192;
 /// bytes of its `_CRS`: its port, and the end.
 const PVPANIC_HID: &[u8; 8] = b"QEMU0001";
 const PVPANIC_CRS_BYTES: u64 = 10;
+/// COM1's I/O descriptor, IRQ 4's mask, and the resource template's end.
+const COM1_CRS_BYTES: u64 = 15;
 
 /// A cursor over the bytes the tables are laid out in. A write past their
 /// end writes nothing and sets `overflow`, which is looked at once, at the
@@ -365,6 +387,14 @@ pub fn build(m: &Machine, buf: &mut [u8]) -> Option<usize> {
         write_mcfg(&mut o, base, last);
         gpa(at)
     });
+    let spcr = if m.host_bridge == HostBridge::CloudHv {
+        o.align(TABLE_ALIGN);
+        let at = o.at;
+        write_spcr(&mut o);
+        Some(gpa(at))
+    } else {
+        None
+    };
     o.align(TABLE_ALIGN);
     let xsdt = o.at;
     let start = header(&mut o, b"XSDT", XSDT_REVISION);
@@ -374,6 +404,9 @@ pub fn build(m: &Machine, buf: &mut [u8]) -> Option<usize> {
     }
     if let Some(mcfg) = mcfg {
         o.u64(mcfg);
+    }
+    if let Some(spcr) = spcr {
+        o.u64(spcr);
     }
     seal(&mut o, start);
 
@@ -430,6 +463,36 @@ fn write_mcfg(o: &mut Out, base: u32, last: u8) {
     o.u8(0);
     o.u8(last);
     o.u32(0);
+    seal(o, start);
+}
+
+/// The firmware's serial console, in the revision 2 SPCR layout: its register
+/// interface, address, interrupt, framing and terminal, and no PCI function.
+fn write_spcr(o: &mut Out) {
+    let start = header(o, b"SPCR", SPCR_REVISION);
+    o.u8(SPCR_INTERFACE_16550);
+    o.put(&[0; 3]);
+    gas_io(o, 1, ACCESS_BYTE, COM1);
+    o.u8(SPCR_INTERRUPT_8259 | SPCR_INTERRUPT_APIC);
+    o.u8(COM1_IRQ);
+    o.u32(u32::from(COM1_IRQ));
+    o.u8(SPCR_BAUD_115200);
+    o.u8(SPCR_NO_PARITY);
+    o.u8(SPCR_ONE_STOP_BIT);
+    o.u8(SPCR_NO_FLOW_CONTROL);
+    o.u8(SPCR_TERMINAL_VT_UTF8);
+    o.u8(0); // reserved
+    o.u16(SPCR_NOT_PCI);
+    o.u16(SPCR_NOT_PCI);
+    o.u8(0); // PCI bus
+    o.u8(0); // PCI device
+    o.u8(0); // PCI function
+    o.u32(0); // PCI flags
+    o.u8(0); // PCI segment
+    o.u32(0); // reserved
+    if o.at - start != SPCR_BYTES {
+        o.overflow = true;
+    }
     seal(o, start);
 }
 
@@ -766,6 +829,31 @@ fn write_dsdt(o: &mut Out, m: &Machine) {
         o.u8(0);
         close(o, buffer);
         close(o, ecam);
+    }
+
+    if m.host_bridge == HostBridge::CloudHv {
+        o.u8(EXT_OP_PREFIX);
+        let serial = open(o, DEVICE_OP);
+        o.put(b"COM1");
+        name(o, b"_HID");
+        int(o, u64::from(EISA_PNP0501));
+        name(o, b"_UID");
+        int(o, 1);
+        name(o, b"_CRS");
+        let buffer = open(o, BUFFER_OP);
+        int(o, COM1_CRS_BYTES);
+        o.u8(IO_PORT_TAG);
+        o.u8(IO_DECODE_16);
+        o.u16(COM1);
+        o.u16(COM1);
+        o.u8(0); // alignment
+        o.u8(8); // eight registers
+        o.u8(IRQ_NO_FLAGS_TAG);
+        o.u16(1u16 << COM1_IRQ);
+        o.u8(END_TAG);
+        o.u8(0);
+        close(o, buffer);
+        close(o, serial);
     }
 
     if m.apic {

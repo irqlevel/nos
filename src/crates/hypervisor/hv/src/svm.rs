@@ -348,6 +348,11 @@ impl Vcpu {
         self.guest.set_flush_always(on);
     }
 
+    /// Enter under a fresh ASID, dropping what the old one translated.
+    pub fn flush_tlb(&mut self) {
+        self.guest.forget_asid();
+    }
+
     /// Time every entry from now on, or stop (`hvarch::x86::svm::Profile`).
     pub fn set_profile(&mut self, on: bool) {
         self.guest.set_profile(on);

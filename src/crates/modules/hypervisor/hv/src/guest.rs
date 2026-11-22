@@ -1043,6 +1043,10 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
         "  exits      {} total: {} port in, {} port out, {} cpuid, {} rdmsr, {} wrmsr ({} #GP), {} irq, {} hlt, {} pause, {} host",
         total.exits, total.port_in, total.port_out, total.cpuid,
         total.msr_read, total.msr_write, total.msr_gp, total.irq + total.apic, total.hlt, total.pause, total.host);
+    if total.hypercalls != 0 {
+        let _ = writeln!(out, "  hypercalls {} total, {} errors: {} TLB flushes ({} timeouts), {} synthetic IPIs",
+            total.hypercalls, total.hypercall_errors, total.flush_calls, total.flush_timeouts, total.ipi_calls);
+    }
     if total.kicked != 0 {
         let _ = writeln!(out, "  kicked     {} entries turned back for a frame, a disk's answer or an IPI that came on the way in, \
                                or an edge of its timers -- {} of them", total.kicked, total.edges_passed);
@@ -1154,7 +1158,7 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
             total.vid, total.eoi_exits);
     }
     if total.pv_eoi != 0 {
-        let _ = writeln!(out, "  pv eoi     {} EOIs the guest made through its word (KVM's PV EOI), no exit of their own",
+        let _ = writeln!(out, "  pv eoi     {} EOIs the guest made through its word (KVM's PV EOI or Hyper-V's VP assist), no exit of their own",
             total.pv_eoi);
     }
     if total.mmio_done != 0 {

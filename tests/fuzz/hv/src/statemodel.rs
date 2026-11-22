@@ -32,6 +32,7 @@ pub fn vmstate_target(r: &mut Input) {
             let back = VmState::decode(&bytes);
             invariant!(back.as_ref() == Ok(&s), "a state read back is not the one written: {:?}", back.err());
             as_version_1(&s, &bytes, r.bool());
+            as_version_4(&s, &bytes);
             /* Its bytes changed, a byte at a time, cut short, grown. */
             while let Some(op) = r.op(3) {
                 let mut b = bytes.clone();
@@ -69,12 +70,50 @@ fn hostile(bytes: &[u8]) {
     }
 }
 
-/// `s`, written as version 1 wrote it -- its bytes, `bytes`, version 3's,
-/// with the version 1 and the UART's last fields taken out, a "ESC [ 6" of
-/// version 1's in place of a sequence of the one parameter 6 where `csi6`
-/// -- read as `s` with what versions 2 and 3 added at their defaults: a state
-/// of a host not yet updated, moved to one that is.
+/// Version 4's Hyper-V part, made from version 5's by taking each VP's last
+/// u64, the VP-assist MSR added in version 5, out.
+fn as_version_4(s: &VmState, bytes: &[u8]) {
+    let Some(hyperv) = &s.hyperv else { return };
+    let le32 = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+    let mut at = 8 + 2;
+    while bytes[at] != 4 {
+        at += 5 + le32(&bytes[at + 1..]);
+    }
+    let len = le32(&bytes[at + 1..]);
+    let body = at + 5;
+    const SHARED_LEN: usize = 81 + 1;
+    let mut part = vec![4, 0, 0, 0, 0];
+    part.extend_from_slice(&bytes[body..body + SHARED_LEN]);
+    let mut from = body + SHARED_LEN;
+    for vp in &hyperv.vps {
+        let vp_len = 160 + vp.timers.iter().map(|timer| 17 + if timer.due_in.is_some() { 8 } else { 0 }).sum::<usize>();
+        part.extend_from_slice(&bytes[from..from + vp_len]);
+        from += vp_len + 8;
+    }
+    invariant!(from == body + len, "Hyper-V's encoded VP layout differs from the model's");
+    let part_len = part.len() - 5;
+    part[1..5].copy_from_slice(&(part_len as u32).to_le_bytes());
+    let mut v4 = Vec::new();
+    v4.extend_from_slice(&bytes[..at]);
+    v4.extend_from_slice(&part);
+    v4[8..10].copy_from_slice(&4u16.to_le_bytes());
+    let mut want = s.clone();
+    for vp in &mut want.hyperv.as_mut().unwrap().vps {
+        vp.vp_assist = 0;
+    }
+    let back = VmState::decode(&v4);
+    invariant!(back.as_ref() == Ok(&want), "a state of version 4 not read as it was: {:?}", back.err());
+}
+
+/// `s`, written as version 1 wrote it -- its bytes, `bytes`, version 5's,
+/// with the version 4 host bridge, version 3 MTRRs and the UART's last fields
+/// taken out, a "ESC [ 6" of version 1's in place of a sequence of the one
+/// parameter 6 where `csi6` -- read as `s` with what versions 2 through 5
+/// added at their defaults. Only Q35 without Hyper-V has a version 1 form.
 fn as_version_1(s: &VmState, bytes: &[u8], csi6: bool) {
+    if s.vm.host_bridge != HostBridge::Q35 || s.hyperv.is_some() {
+        return;
+    }
     let u = &s.platform.uart;
     let mut want = s.clone();
     for c in &mut want.cpus {
@@ -110,6 +149,11 @@ fn as_version_1(s: &VmState, bytes: &[u8], csi6: bool) {
             cpu_parts.extend_from_slice(&((len - MTRRS_LEN) as u32).to_le_bytes());
             cpu_parts.extend_from_slice(&bytes[body..body + mtrr_at]);
             cpu_parts.extend_from_slice(&bytes[body + mtrr_at + MTRRS_LEN..body + len]);
+        } else if bytes[at] == 1 {
+            /* Version 4 appended the host bridge to the VM part. */
+            cpu_parts.push(bytes[at]);
+            cpu_parts.extend_from_slice(&((len - 1) as u32).to_le_bytes());
+            cpu_parts.extend_from_slice(&bytes[body..body + len - 1]);
         } else {
             cpu_parts.extend_from_slice(&bytes[at..body + len]);
         }
@@ -127,7 +171,7 @@ fn as_version_1(s: &VmState, bytes: &[u8], csi6: bool) {
     v1.push(bytes[at]);
     v1.extend_from_slice(&((len - tail) as u32).to_le_bytes());
     v1.extend_from_slice(&bytes[body..body + uart_v1]);
-    v1.extend_from_slice(&bytes[body + uart_v1 + tail..]);
+    v1.extend_from_slice(&bytes[body + uart_v1 + tail..body + len]);
     /* The UART's escape byte, version 1's 3 for a sequence of 6 */
     let platform_body = 8 + 2 + cpu_parts.len() + 5;
     let esc_at = platform_body + 6 + 8 + 1 + usize::from(u.loopback.is_some()) + 1 + usize::from(u.rx.is_some());
@@ -143,7 +187,8 @@ fn as_version_1(s: &VmState, bytes: &[u8], csi6: bool) {
 
 fn state(r: &mut Input) -> VmState {
     let cpus = 1 + r.below(4) as u32;
-    let ioapic = cpus > 1 && r.bool();
+    let host_bridge = if r.bool() { HostBridge::Q35 } else { HostBridge::CloudHv };
+    let ioapic = (cpus > 1 || host_bridge == HostBridge::CloudHv) && r.bool();
     let mut ranges = Vec::new();
     let mut at = r.below(16) * 0x1000;
     for _ in 0..1 + r.below(3) {
@@ -153,6 +198,7 @@ fn state(r: &mut Input) -> VmState {
     }
     let vm = Vm {
         vendor: if r.bool() { Vendor::Svm } else { Vendor::Vmx },
+        host_bridge,
         uuid: core::array::from_fn(|_| r.u8()),
         ranges,
         x2apic: r.bool(),
@@ -190,7 +236,20 @@ fn state(r: &mut Input) -> VmState {
         msix_pending: devices.iter().map(|_| r.u32()).collect(),
         devices,
     };
-    VmState { vm, cpus, platform }
+    let hyperv = (host_bridge == HostBridge::CloudHv && r.bool()).then(|| HypervState {
+        shared: HypervShared {
+            guest_os_id: r.u64(), hypercall: r.u64(), reference_tsc: r.u64(), crash: core::array::from_fn(|_| r.u64()),
+            crashed: r.bool(), epoch: r.u64(), tsc_hz: vm.tsc_hz,
+        },
+        vps: (0..vm.shape.cpus).map(|_| HypervVp {
+            scontrol: r.u64(), pages: core::array::from_fn(|_| r.u64()), sints: core::array::from_fn(|_| r.u64()),
+            timers: core::array::from_fn(|_| HypervTimer {
+                config: r.u64(), count: r.u64(), due_in: r.bool().then(|| r.u64()),
+            }),
+            vp_assist: r.u64(),
+        }).collect(),
+    });
+    VmState { vm, cpus, platform, hyperv }
 }
 
 fn segment(r: &mut Input) -> Segment {
@@ -379,7 +438,7 @@ fn device(r: &mut Input) -> Device {
 
 /* ---- one field past its bound ---- */
 
-const BOUNDS: usize = 30;
+const BOUNDS: usize = 33;
 
 /// Field `which` of `s` put one past its bound: false where `s` has none of
 /// that field (no device, no event) to put there.
@@ -473,11 +532,25 @@ fn past_bound(s: &mut VmState, which: usize, r: &mut Input) -> bool {
                 u.csi[r.below(CSI_PARAMS as u64) as usize] = 1 + r.below(u64::from(u16::MAX)) as u16;
             }
         }
+        30 => {
+            if s.hyperv.is_none() {
+                return false;
+            }
+            s.vm.host_bridge = HostBridge::Q35;
+        }
+        31 => {
+            let Some(hyperv) = &mut s.hyperv else { return false };
+            hyperv.vps.pop();
+        }
+        32 => {
+            let Some(hyperv) = &mut s.hyperv else { return false };
+            hyperv.shared.tsc_hz = 0;
+        }
         _ => match r.below(3) {
             0 => s.vm.rx_moderation_ns = 1_000_000_001 + r.below(1 << 40),
             1 => s.vm.tsc_hz = 0,
             _ => {
-                if s.vm.shape.cpus != 1 {
+                if s.vm.shape.cpus != 1 || s.vm.host_bridge != HostBridge::Q35 {
                     return false;
                 }
                 s.vm.ioapic = true;

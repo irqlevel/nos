@@ -241,14 +241,14 @@ swallowing panic messages whole.
 | `cluster-test.py [--arch aarch64\|x86_64] [--keep]` | both | the cluster's registry between kernels: `modules/cluster/cluster` (the member, raft over ipc, its folder, init, invite, join, remove), ipcnet's control mailbox (`ipcnet.ctl`) and hosts.toml as the registry writes it, the channel's word on which host sent a message (`kernel_ipc_peer_name`) -- three nos on `tests/hub.py`'s LAN, as `ipc-test.py` runs them |
 | `usb-test.py` | x86-64 | `drivers/usb/`; what a keyboard sends the shell's line editor |
 | `hv-device-test.py [--tcg] [--keep]` | x86-64 | a guest's disk on a device of nos's: the devices' ids (`layers/block/src/table.rs`, the NVMe's identity), the claims and their holders, `layers/block/src/devq.rs` and `kcore::block::DiskQueue`, `diskimage::contents`, `modules/hypervisor/hv/src/devices.rs`, a device disk in `modules/hypervisor/hv/src/disk.rs`, the pour onto a device |
-| `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hypervisor/hv` -- the hypervisor; on x86-64 PVH images too, hvboot started at its 32-bit entry and CloudHv through its Boot Manager to a UEFI Shell command, `hv create` of VMs from a web server's images, `hv clone` and `hv delete`, and the `vm` provider's actions through `mgmt`; on both, `hv convert` |
+| `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hypervisor/hv` -- the hypervisor; on x86-64 PVH images too, hvboot started at its 32-bit entry and CloudHv through its Boot Manager to a UEFI Shell command and a save/restore back to a working Shell, `hv create` of VMs from a web server's images, `hv clone` and `hv delete`, and the `vm` provider's actions through `mgmt`; on both, `hv convert` |
 | `vnet-test.py [--phase v0a\|v0b\|v1b\|v2\|v3\|v4\|all] [--arch aarch64\|x86_64] [--tcg]` | x86-64 (V0a, V0b, V2, V3, V4), both (V1b), by hand | the guests' networks and their firewalls on a running nos, with probes -- ports of the switch with no VM (`hv probe`) -- where guests would be: V0a's phase, the firewall on one host's networks: closed by default, a rule opening it, a deny outwards answered, a change cutting a flow, each denial a `fw_deny`, `rmmod hv` with probes up; V0b's, one to one past the hub's router; V1b's, vnet's group and its state on three hosts of a registry -- networks, ports, public addresses and firewalls through reboots, a leader killed, a host cut off, a module reloaded, a host removed from the registry; V2's, the cluster's networks on one host -- probes on two networks, their gateways, the world, a cluster firewall's rule from the keeper, a port revoked and shut, a VM's port made and deleted with its folder, vnet unloaded under them; V3's, the tunnel -- three nos with probes on each, reaching each other across hosts and not across networks, keys changed under traffic, a narrow link said, a host killed and back, hv reloaded, a port moved; V4's, a public address routed to one host and on a port of another's -- the world reaching the VM at it and it the world from it, moved onto a third host's port, routed elsewhere, taken off |
 | `edit-test.py [--seed N] [--sessions N] [--seconds S] [--session N]` | host (CI) | the editor (`src/crates/common/text/edit`), from its own sources: key sessions held to what they leave in the file and on the screen, files read and saved back byte for byte, random sessions on a terminal of the test's own |
 | `diskimage-test.py [--image <qcow2>] [--iterations N]` | host (CI) | the disk image converter (`src/crates/common/storage/diskimage`, `hv convert`), from its own sources: qcow2 images qemu-img and qemu-io write -- versions 2 and 3, clusters of 512 bytes to 2 MiB, stored, compressed, extended, zero, discarded, preallocated, snapshotted, dirty -- converted and held byte for byte to what qemu-img reads, its holes kept; what it must refuse; its DEFLATE decoder against zlib; each image's metadata fuzzed; and the cloud-init seed's ISO 9660, read back by xorriso or bsdtar, blkid and Linux's isofs |
 | `hvboot-test.py [--image <disk.raw>] [--iterations N]` | host (CI) | hvboot's own `plan` -- over its partition, ext2/3/4 and GRUB readers and its bzImage header, from their own sources -- under its own heap's arithmetic and size: on disks it makes -- GPT, MBR and none, ext4, ext3 and 1 KiB-block ext2, a grub-mkconfig grub.cfg and grubenv -- the entry GRUB would boot and its files byte for byte; grub.cfg read as GRUB 2.06 read each case when it was booted with it; what is said when nothing boots; a grub.cfg as long as is read, of each costliest shape, and a two-level extent tree, inside the heap; then each disk's metadata fuzzed, every run giving the heap back whole |
 | `extfmt-test.py [--iterations N] [--trials N]` | host (CI) | the ext2/3/4 format crate (`src/crates/common/storage/extfmt`) hvboot reads through and the kernel's ext4 driver is to: every checksum of filesystems mke2fs makes -- ext4 by default, with metadata_csum_seed, with 1 KiB blocks and 128-byte inodes and no 64bit, with gdt_csum, ext3, ext2 -- held to extfmt's, bytes they cover changed one at a time with extfmt and `e2fsck -fn` held to both saying so, and each image fuzzed; then journals debugfs leaves unreplayed, replayed by extfmt's planner and by `e2fsck -E journal_only` to the same image byte for byte, their ring turned so the log wraps, damaged and refused, and fuzzed; and the filesystems `extfmt::mkfs` makes for the shell's `format` -- ext4 and ext2, every block size, up to 3 GiB and 128 groups, the small ones made over noise -- clean to `e2fsck -fn`, their features and label dumpe2fs's, their lost+found debugfs's, and the devices it refuses refused |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hypervisor/hv/src/{insn,walk}.rs`), against the encodings clang gives |
-| `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and its ACPI and SMBIOS tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on; and the virtio notifications, kicks and interrupts with EVENT_IDX and without, held to a Linux driver's every request served (`virtq`); and the guests' firewall, its crate to a model of its own (`firewall`) and the switch's use of it (`fwswitch`); and NAT's one to one (`onetoone`); and the cluster's networks on the switch (`vnetswitch`), the tunnel's datagram, each held to the wire built without vnetwire (`vnetwire`), and three hosts' tunnels over a hostile wire, public addresses across them through the real NAT among it, ports migrated between them (`tunnel`); a migrated port's flows on its new host's switch (`flowmove`); `--mutants` (by hand) then takes two hundred and one of the networking, PCI, run-loop, virtio-blk, Hyper-V and MTRR rules out, each to be found |
+| `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and its ACPI and SMBIOS tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on; and the virtio notifications, kicks and interrupts with EVENT_IDX and without, held to a Linux driver's every request served (`virtq`); and the guests' firewall, its crate to a model of its own (`firewall`) and the switch's use of it (`fwswitch`); and NAT's one to one (`onetoone`); and the cluster's networks on the switch (`vnetswitch`), the tunnel's datagram, each held to the wire built without vnetwire (`vnetwire`), and three hosts' tunnels over a hostile wire, public addresses across them through the real NAT among it, ports migrated between them (`tunnel`); a migrated port's flows on its new host's switch (`flowmove`); `--mutants` (by hand) then takes two hundred and fourteen of the networking, PCI, run-loop, virtio-blk, Hyper-V, vmstate and MTRR rules out, each to be found |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate, its SFTP server, and the session's line editor -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and ext4 images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands and its `format`, `root=`, the file logs; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
 | `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by, and what a terminal types at the console's line editor, and the tracepoints' ring against a model and a writer thread, and the window `trace latency` reads of the rings against the truth of a schedule played out on them -- and the memory management under everything: the page tables and the physical page allocator past `setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
@@ -1379,17 +1379,23 @@ stream offset zero -- are each caught. The `hyperv` target holds the basic
 Hv#1 MSRs to a model of the TLFS: Guest OS ID, the hypercall page's address,
 enable and lock, per-vCPU VP_INDEX, invalid addresses refused, the overlay
 following enable, no call before Guest OS ID, and an unknown call answered
-`HV_STATUS_INVALID_HYPERCALL_CODE` (status 2). TIME_REF_COUNT and the
-reference TSC page are held to the sequence protocol, including a writer
-racing the reader, the overlay read-only and APIC frequency. SynIC covers
-SCONTROL/SVERSION, the message and event pages, EOM and SINT vectors; the
-four stimers cover direct and message delivery, zero counts, one-shot,
-periodic and auto-enable, with the 40-byte timer message's type, index and
-times. P0-P4 and CrashNotify's five parameters are checked too. Nineteen
-mutants of the interface, time, SynIC and stimers are each caught. The
-`platform` target separately catches leaving TPR_THRESHOLD above VTPR when
-an IRQ window is requested again: the VM-entry failure this caused on real
-VT-x. The page
+`HV_STATUS_INVALID_HYPERCALL_CODE` (status 2). Its hypercall decoder is held to
+an independent control-word model, including reserved bits and rep bounds.
+TIME_REF_COUNT and the reference TSC page are held to the sequence protocol,
+including a writer racing the reader, the overlay read-only and APIC frequency.
+SynIC covers SCONTROL/SVERSION, the message and event pages, EOM, SINT vectors
+and AutoEOI; the four stimers cover direct and message delivery, zero counts,
+one-shot, periodic and auto-enable, with the 40-byte timer message's type,
+index and times. VP-assist covers its RsvdP bits, page collisions, EOI-word
+clearing, migration and masked AutoEOI. P0-P4 and CrashNotify's five parameters
+are checked too. The `lapic` target holds Hyper-V's EOI/ICR/TPR MSRs and remote
+fixed-IPI decoding. The `platform` target enables Hv#1 on firmware guests and
+makes valid space/list flush and synthetic-IPI calls through the whole run loop,
+checking each result, list reps completed and the calling vCPU's backend flush.
+The interface, APIC, VP-assist, call and self-flush mutants are each caught.
+`platform` separately catches leaving TPR_THRESHOLD above VTPR when an IRQ
+window is requested again: the VM-entry failure this caused on real VT-x. The
+page
 walker over random page tables, the decoder, the
 Linux loader over headers that parse, the ACPI tables for any machine, the
 SMBIOS tables (`smbios`) from any name, version and UUID -- read back as
@@ -1446,10 +1452,11 @@ ECAM's, the `linux` and `pvh` targets ECAM reserved in a holed guest's memory
 map and in no other's; sixteen mutants of ECAM, the extended space and MSI-X
 BAR moves, each caught. `acpi` also holds the firmware machine to a
 hardware-reduced FADT with no FACS or legacy PM1 blocks, its sleep registers
-to the PM device's actual ports, and one ACPI0007 processor object per MADT
-CPU; `rtc` holds UIP set before and clear after a second turns over, and `pm`
+to the PM device's actual ports, one ACPI0007 processor object per MADT CPU,
+and its SPCR/PNP0501 COM1 description to the UART's address, IRQ and framing;
+`rtc` holds UIP set before and clear after a second turns over, and `pm`
 takes CloudHv's firmware S5 while holding the same byte at legacy Q35's PM1
-status port not to be a power-off. Six mutants of those rules are each caught.
+status port not to be a power-off. Seven mutants of those rules are each caught.
 `groups` holds the module's IOMMU
 groups (`modules/hypervisor/hv/src/groups.rs`) to the tree they are made
 of: random hierarchies -- root ports and devices of several of them,
@@ -1801,10 +1808,13 @@ concurrency is not.
 A migration's (plans/vm-migration.md) has four targets of its own.
 `vmstate`: a VM's state (`common/vm/vmstate`) from hostile bytes -- refused
 or read, never a panic, what reads writing back the same -- every state the
-input makes read back as written, and as version 1 wrote it (what versions 2
-and 3 added, the MTRRs among it, cut out of its bytes) read back as it with
-those at their defaults, its bytes then changed, cut and grown, and
-each field's bound one past refused (a CR8 bound taken out is caught); and
+input makes read back as written, including CloudHv and Hyper-V's version 5
+state. Hyper-V's version 4 form is checked with each VP-assist MSR removed and
+read back disabled. A Q35 state without Hyper-V is also read as version 1 wrote
+it (what versions 2 through 5 added, the host bridge and MTRRs among it, cut out
+of its bytes) with those at their defaults, its bytes then changed, cut and
+grown, and each field's bound one past refused (a CR8 bound taken out is
+caught); and
 a CPU's registers through `state.rs`'s `restore_common` and the backends'
 save into a fresh CPU and out again, the same (EFER left out of the restore
 once made a guest in long mode run on in legacy mode: now a field left out
@@ -3213,11 +3223,12 @@ image ([A guest's own kernel](hypervisor.md#a-guests-own-kernel-pvh-and-hvboot))
 started at its 32-bit entry with paging off -- under VT-x, by unrestricted
 guest -- which has to say it read the start info hv laid out (its RAM, and
 its command line), that it has no disk, and turn the guest off through its
-ACPI. It then creates a `firmware = true` VM of the checked-in CloudHv image,
-starts it by name, enters the Boot Manager, selects the Internal Shell with
-Down and Enter, and requires `hv exec` to run `echo HV-UEFI-OK` and see the
-`Shell> ` prompt return before the VM is stopped and deleted. Last, on both
-architectures, `hv convert`
+ACPI. It then creates a `firmware = true`, `hyperv = true` VM of the
+checked-in CloudHv image, starts it by name, enters the Boot Manager, selects
+the Internal Shell with Down and Enter, and requires `hv exec` to run `echo
+HV-UEFI-OK` and see the `Shell> ` prompt return. It saves the running VM,
+restores it, and requires another Shell command (`HV-UEFI-RESTORED`) before
+the VM is stopped and deleted. Last, on both architectures, `hv convert`
 ([A disk from a cloud's image](hypervisor.md#a-disk-from-a-clouds-image)):
 qcow2 images qemu-img made of a disk the test makes -- compressed, version
 3, and version 2 of 4 KiB clusters -- converted on nos's own ext2 and held

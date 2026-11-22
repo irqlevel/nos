@@ -140,6 +140,11 @@ impl Vcpu {
     /// surface one for both.
     pub fn set_flush_always(&mut self, _on: bool) {}
 
+    /// Drop this VPID's translations before the next entry.
+    pub fn flush_tlb(&mut self) {
+        self.guest.flush_tlb();
+    }
+
     /// Time every entry from now on, or stop (`hvarch::x86::svm::Profile`,
     /// with its VMCS halves filled in here).
     pub fn set_profile(&mut self, on: bool) {

@@ -711,6 +711,8 @@ pub mod vm {
         posted: Option<Arc<crate::x86::vmx::PostedInterrupts>>,
         /// What its TSC is ahead of the host's, as both backends keep it.
         tsc_offset: u64,
+        /// Hyper-V flush requests answered before an entry.
+        pub flushes: u64,
         /// Its XSAVE area as a state carries it: nothing this model runs
         /// uses, carried as it was given.
         fp_area: Vec<u8>,
@@ -765,6 +767,7 @@ pub mod vm {
                 pi_capable: false,
                 posted: None,
                 tsc_offset: 0,
+                flushes: 0,
                 fp_area: vec![0; 832],
             }
         }
@@ -1368,6 +1371,10 @@ pub mod vm {
         }
         pub fn read_whole_state(&mut self) -> bool {
             true
+        }
+
+        pub fn flush_tlb(&mut self) {
+            self.flushes += 1;
         }
 
         /// The guest entered: what was queued for it, taken -- the one way

@@ -820,7 +820,7 @@ fn lapic_target(r: &mut Input) {
     let (id, bsp, x2apic) = (r.below(16) as u32, r.bool(), r.bool());
     let mut a = Lapic::new(id, bsp, x2apic);
     let mut now = time::boot_time_ns();
-    while let Some(op) = r.op(16) {
+    while let Some(op) = r.op(17) {
         match op {
             0 => {
                 let reg = apic_reg(r);
@@ -963,6 +963,38 @@ fn lapic_target(r: &mut Input) {
                 }
                 invariant!(handed == 0, "a periodic timer unmasked handed over {} interrupts at that instant", handed);
             }
+            16 => {
+                use crate::hyperv::{MSR_APIC_EOI, MSR_APIC_ICR, MSR_APIC_TPR};
+                let mut a = Lapic::new(id, bsp, x2apic);
+                apic_set(&mut a, APIC_SVR, 0x1FF, now);
+                let tpr = r.u8();
+                invariant!(matches!(a.hyperv_write(MSR_APIC_TPR, u64::from(tpr), now), Some(Ok(Wrote::Tpr(v))) if v == tpr),
+                           "Hyper-V TPR write did not update the APIC");
+                invariant!(a.hyperv_read(MSR_APIC_TPR) == Some(u64::from(tpr)), "Hyper-V TPR not read back");
+                invariant!(matches!(a.hyperv_write(MSR_APIC_TPR, 0x100, now), Some(Err(_))),
+                           "Hyper-V TPR accepted reserved bits");
+                invariant!(matches!(a.hyperv_write(MSR_APIC_TPR, 1 << 32, now), Some(Err(_))),
+                           "Hyper-V TPR accepted a nonzero high half");
+                invariant!(a.hyperv_read(MSR_APIC_EOI) == Some(0), "Hyper-V EOI read not zero");
+                let icr = 0x30 | 1 << 18;
+                invariant!(matches!(a.hyperv_write(MSR_APIC_ICR, icr, now), Some(Ok(Wrote::Ipi(_)))),
+                           "Hyper-V self-IPI not decoded");
+                invariant!(a.hyperv_read(MSR_APIC_ICR) == Some(icr), "Hyper-V ICR not read back");
+                invariant!(matches!(a.hyperv_write(MSR_APIC_TPR, 0, now), Some(Ok(Wrote::Tpr(0)))),
+                           "Hyper-V TPR could not be lowered for the EOI check");
+                invariant!(a.accept(0x30), "an interrupt for the Hyper-V EOI check refused");
+                let vector = a.pending().expect("an in-service interrupt for Hyper-V EOI");
+                a.acknowledge(vector);
+                invariant!(matches!(a.hyperv_write(MSR_APIC_EOI, 0, now), Some(Ok(Wrote::Done))),
+                           "Hyper-V EOI did not end an edge interrupt");
+                invariant!(matches!(a.hyperv_write(MSR_APIC_EOI, 1 << 32, now), Some(Err(_))),
+                           "Hyper-V EOI accepted reserved bits");
+                let remote = u64::from((id + 1) & 0xFF) << 56 | 0x40;
+                invariant!(a.fixed_hyperv_ipi(remote, id).is_some_and(|ipi| ipi.vector == 0x40),
+                           "Hyper-V remote fixed IPI not accepted by the fast path");
+                invariant!(a.hyperv_read(0x4000_0074).is_none() && a.hyperv_write(0x4000_0074, 0, now).is_none(),
+                           "an unknown Hyper-V MSR claimed by the APIC");
+            }
             _ => {
                 a.sync_cr8(r.u8() & 0xF);
                 let x = a.addressing();
@@ -979,6 +1011,11 @@ fn lapic_target(r: &mut Input) {
 
 fn ioapic_target(r: &mut Input) {
     let mut io = IoApic::new(r.u8());
+    io.mmio_write(0, 4, 1);
+    let version = io.mmio_read(0x10, 4);
+    io.mmio_write(0x10, 4, 0xFFFF_FFFF);
+    io.mmio_write(0, 4, 1);
+    invariant!(io.mmio_read(0x10, 4) == version, "Windows's probe changed the IO-APIC version register");
     /* Each pin as the target has driven it: a line held up, asserted again,
      * is no edge, and sends nothing -- a level's interrupt went when it rose
      * or when it was ended, an NMI is edge-triggered whatever its entry says
@@ -2845,6 +2882,7 @@ fn pvh(r: &mut Input) {
 fn acpi(r: &mut Input) {
     use crate::acpi::{build, Machine, Route, MAX_BYTES};
     use crate::devices::pci::HostBridge;
+    invariant!(crate::run::BARS64_ROUNDING == 8 << 20, "the 64-bit BAR window is not Cloud Hypervisor's 8 MiB granularity");
     let host_bridge = if r.bool() { HostBridge::Q35 } else { HostBridge::CloudHv };
     let cloudhv = host_bridge == HostBridge::CloudHv;
     let routes: Vec<Route> = (0..r.below(10)).map(|_| Route { slot: r.u8(), irq: r.u8() }).collect();
@@ -2887,6 +2925,22 @@ fn acpi(r: &mut Input) {
             invariant!(got == (u64::from(base), 0, 0, last), "the MCFG's allocation {:x?}, not {:#x} buses 0-{}",
                        got, base, last);
         }
+        let spcr: Vec<usize> = (0..n.saturating_sub(4)).step_by(16).filter(|&a| &tables[a..a + 4] == b"SPCR").collect();
+        invariant!(spcr.len() == usize::from(cloudhv), "{} SPCRs for CloudHv {}", spcr.len(), cloudhv);
+        if let Some(&a) = spcr.first() {
+            let len = u32::from_le_bytes(tables[a + 4..a + 8].try_into().unwrap()) as usize;
+            invariant!(len == 80 && tables[a + 8] == 2 && a + len <= n, "an SPCR of {} bytes, revision {}", len, tables[a + 8]);
+            let sum = tables[a..a + len].iter().fold(0u8, |s, b| s.wrapping_add(*b));
+            invariant!(sum == 0, "the SPCR's checksum leaves {:#x}", sum);
+            invariant!(tables[a + 36] == 0 && tables[a + 40] == 1 && tables[a + 41] == 8 && tables[a + 43] == 1
+                       && u64::from_le_bytes(tables[a + 44..a + 52].try_into().unwrap()) == 0x3F8,
+                       "the SPCR's UART interface or address is wrong");
+            invariant!(tables[a + 52] == 3 && tables[a + 53] == 4
+                       && u32::from_le_bytes(tables[a + 54..a + 58].try_into().unwrap()) == 4,
+                       "the SPCR's interrupt is not COM1's IRQ/GSI 4");
+            invariant!(tables[a + 58..a + 63] == [7, 0, 1, 0, 2], "the SPCR is not 115200 8N1, VT-UTF8");
+            invariant!(tables[a + 64..a + 68] == [0xFF, 0xFF, 0xFF, 0xFF], "the SPCR names a PCI UART");
+        }
         /* The host bridge's bus numbers, its `_CRS`'s first descriptor: 0
          * to ECAM's last where there is ECAM, which has to cover them, to
          * 255 where there is none */
@@ -2928,6 +2982,10 @@ fn acpi(r: &mut Input) {
                     u32::from_le_bytes(tables[a + 22..a + 26].try_into().unwrap()) == 0x3C00_0000
             });
             invariant!(aperture, "CloudHv's MMIO32 aperture is missing");
+            let com1 = tables.windows(4).any(|w| w == b"COM1") && tables.windows(11).any(|w| {
+                w == [0x47, 1, 0xF8, 3, 0xF8, 3, 0, 8, 0x22, 0x10, 0]
+            });
+            invariant!(com1, "CloudHv's PNP0501 COM1 resources are missing");
         }
     }
 }
@@ -3101,7 +3159,26 @@ fn hyperv_target(r: &mut Input) {
     let mut scontrol = 0u64;
     let mut pages = [0u64; 3];
     let mut sints = [1u64 << 16; 16];
-    while let Some(op) = r.op(22) {
+    let mut vp_assist = 0u64;
+    let call_model = |input: u64| -> Result<crate::hyperv::Call, u64> {
+        use crate::hyperv::Call;
+        if input & (0xF000_F000_0000_0000 | 0xF800_0000) != 0 {
+            return Err(3);
+        }
+        let code = input & 0xFFFF;
+        let fast = input & 1 << 16 != 0;
+        let variable = input >> 17 & 0x3FF;
+        let reps = (input >> 32 & 0xFFF) as u16;
+        let start = (input >> 48 & 0xFFF) as u16;
+        match (code, variable, reps, start) {
+            (2, 0, 0, 0) => Ok(Call::FlushSpace { fast }),
+            (3, 0, n, at) if n != 0 && at < n => Ok(Call::FlushList { fast, reps, start }),
+            (0xB, 0, 0, 0) => Ok(Call::SendIpi { fast }),
+            (2 | 3 | 0xB, ..) => Err(3),
+            _ => Err(2),
+        }
+    };
+    while let Some(op) = r.op(24) {
         match op {
             0 => {
                 let msr = r.pick(&[MSR_GUEST_OS_ID, MSR_HYPERCALL, MSR_VP_INDEX, MSR_TIME_REF_COUNT, MSR_REFERENCE_TSC,
@@ -3161,8 +3238,14 @@ fn hyperv_target(r: &mut Input) {
                 invariant!(hv.write(MSR_VP_INDEX, r.value64(), &mem) == Some(false), "VP_INDEX writable");
             }
             5 => {
-                let want = (guest_id != 0 && hypercall & ENABLE != 0).then_some(2);
-                invariant!(hv.call(r.value64()) == want, "hypercall answered with the interface off or an unknown code");
+                let input = r.value64();
+                let want = (guest_id != 0 && hypercall & ENABLE != 0).then_some(call_model(input));
+                invariant!(hv.call(input) == want, "hypercall control {:#x} decoded as {:?}, wanted {:?}", input, hv.call(input), want);
+                if guest_id != 0 && hypercall & ENABLE != 0 {
+                    for input in [2, 0xB | 1 << 16, 3 | 1 << 32, 2 | 1 << 60, 3, 0xDEAD] {
+                        invariant!(hv.call(input) == Some(call_model(input)), "hypercall control {:#x} decoded incorrectly", input);
+                    }
+                }
             }
             6 => {
                 let msr = r.u32() | 0x8000_0000;
@@ -3299,6 +3382,24 @@ fn hyperv_target(r: &mut Input) {
                 invariant!(periodic.write(MSR_STIMER0_CONFIG, config, now, &mem) == Some(true), "periodic config refused");
                 invariant!(periodic.write(MSR_STIMER0_CONFIG + 1, 100, now, &mem) == Some(true), "periodic count refused");
                 invariant!(periodic.poll(now, &mut apic, &mem) == Some(now + 100), "wrong periodic first edge");
+                let saved = periodic.save(now);
+                let mut restored = Vp::default();
+                invariant!(restored.restore(&saved, now + 500, &mem).is_ok(), "a live periodic stimer was not restored");
+                let mut restored_apic = Lapic::new(0, true, false);
+                invariant!(restored.poll(now + 599, &mut restored_apic, &mem) == Some(now + 600)
+                           && !restored_apic.requested(0x31), "a restored periodic stimer fired early");
+                invariant!(restored.poll(now + 601, &mut restored_apic, &mem) == Some(now + 700)
+                           && restored_apic.requested(0x31), "a restored periodic stimer lost its phase");
+                let mut invalid = saved.clone();
+                invalid.scontrol = 2;
+                invariant!(restored.restore(&invalid, now, &mem).is_err(), "an invalid saved SCONTROL was accepted");
+                let mut zero = Vp::default();
+                invariant!(zero.write(MSR_STIMER0_CONFIG, ENABLE | DIRECT | (0x30 << 4), now, &mem) == Some(true),
+                           "an enabled zero-count stimer config refused");
+                let zero_saved = zero.save(now);
+                let mut zero_restored = Vp::default();
+                invariant!(zero_restored.restore(&zero_saved, now, &mem).is_ok(),
+                           "an enabled zero-count stimer config was not restored");
                 invariant!(periodic.poll(now + 101, &mut apic, &mem) == Some(now + 200) && apic.requested(0x31),
                            "periodic edge or phase wrong");
                 invariant!(periodic.poll(now + 101, &mut apic, &mem).is_none(), "periodic interrupt piled up");
@@ -3327,6 +3428,18 @@ fn hyperv_target(r: &mut Input) {
                            && u64::from_le_bytes(bytes[24..32].try_into().unwrap()) == now + 10
                            && u64::from_le_bytes(bytes[32..40].try_into().unwrap()) == now + 11,
                            "wrong timer message payload");
+
+                let shared = hv.save();
+                let mut restored_hv = Hyperv::new(crate::Vendor::Svm, EPOCH + 1000, TSC_HZ).expect("restored Hyper-V");
+                invariant!(restored_hv.restore(&shared, TSC_HZ, &mem).is_ok(), "Hyper-V's shared state was not restored");
+                invariant!(restored_hv.reference_time(tsc) == hv.reference_time(tsc)
+                           && restored_hv.reference_page() == hv.reference_page(),
+                           "Hyper-V's reference clock changed across restore");
+                for msr in [MSR_GUEST_OS_ID, MSR_HYPERCALL, MSR_REFERENCE_TSC,
+                            crate::hyperv::MSR_CRASH_P0, crate::hyperv::MSR_CRASH_CTL] {
+                    invariant!(restored_hv.read(msr, 0, tsc) == hv.read(msr, 0, tsc),
+                               "Hyper-V MSR {:#x} changed across restore", msr);
+                }
             }
             17 => {
                 use crate::hyperv::{MSR_EOM, MSR_SCONTROL, MSR_SIEFP, MSR_SIMP, MSR_SINT0, MSR_SINT15, MSR_SIRBP,
@@ -3372,7 +3485,8 @@ fn hyperv_target(r: &mut Input) {
                 let next = (value & !RESERVED) | (pages[slot] & RESERVED);
                 let enabled = next & 1 != 0;
                 let address = next & GPFN;
-                let valid = !enabled || mem.is_ram(address, PAGE as _) && !mem.overlay_contains(address);
+                let valid = !enabled || mem.is_ram(address, PAGE as _) && !mem.overlay_contains(address)
+                    && !(vp_assist & 1 != 0 && vp_assist & GPFN == address);
                 if valid && enabled {
                     mem.write(address, &[0xAA; 8]).unwrap();
                 }
@@ -3401,6 +3515,56 @@ fn hyperv_target(r: &mut Input) {
                 if ok == Some(true) {
                     sints[n] = value;
                 }
+            }
+            22 => {
+                let gpa = r.pick(&[0, 0x1000, MEM - PAGE, memory::MAX_GPA, hypercall & GPFN, reference_tsc & GPFN]);
+                let value = gpa | r.pick(&[0, 1, RESERVED]) | if r.bool() { 1 } else { 0 };
+                let next = (value & !RESERVED) | (vp_assist & RESERVED);
+                let enabled = next & 1 != 0;
+                let address = next & GPFN;
+                let synic = pages.iter().any(|page| page & 1 != 0 && page & GPFN == address);
+                let valid = !enabled || !synic && mem.is_ram(address, PAGE as _) && !mem.overlay_contains(address);
+                if valid && enabled {
+                    mem.write(address, &[0xAA; 4]).unwrap();
+                }
+                let ok = vp.write(crate::hyperv::MSR_VP_ASSIST, value, time(tsc), &mem);
+                invariant!(ok == Some(valid), "VP assist {:#x} -> {:?}, valid {}", value, ok, valid);
+                if ok == Some(true) {
+                    vp_assist = next;
+                    if enabled {
+                        let mut bytes = [1u8; 4];
+                        mem.read(address, &mut bytes).unwrap();
+                        invariant!(bytes == [0; 4], "VP assist EOI word not cleared");
+                    }
+                }
+                invariant!(vp.read(crate::hyperv::MSR_VP_ASSIST) == Some(vp_assist), "VP assist MSR not read back");
+                invariant!(vp.assist_page() == (vp_assist & 1 != 0).then_some(vp_assist & GPFN),
+                           "VP assist page address differs from its MSR");
+                let state_mem = GuestMemory::with_size(MEM);
+                let mut state = Vp::default();
+                invariant!(state.write(crate::hyperv::MSR_VP_ASSIST, 0x2001, time(tsc), &state_mem) == Some(true),
+                           "VP assist enable for a state check refused");
+                let saved = state.save(time(tsc));
+                let mut restored = Vp::default();
+                invariant!(restored.restore(&saved, time(tsc), &state_mem).is_ok(), "VP assist state was not restored");
+                invariant!(restored.read(crate::hyperv::MSR_VP_ASSIST) == Some(0x2001), "VP assist MSR lost on restore");
+            }
+            23 => {
+                let auto = scontrol & 1 != 0 && sints.iter().any(|sint| sint & (1 << 16 | 1 << 17) == 1 << 17);
+                invariant!(vp.auto_eoi() == auto, "SynIC AutoEOI presence not reported");
+                let vector = r.u8();
+                let expected = scontrol & 1 != 0 && sints.iter().any(|sint| {
+                    sint & (0xFF | 1 << 16 | 1 << 17) == u64::from(vector) | 1 << 17
+                });
+                invariant!(vp.auto_eoi_vector(vector) == expected, "AutoEOI for vector {:#x} not reported", vector);
+                let mut one = Vp::default();
+                invariant!(one.write(crate::hyperv::MSR_SCONTROL, 1, time(tsc), &mem) == Some(true)
+                           && one.write(crate::hyperv::MSR_SINT0 + 2, 0x40 | 1 << 17, time(tsc), &mem) == Some(true),
+                           "AutoEOI SINT setup refused");
+                invariant!(one.auto_eoi() && one.auto_eoi_vector(0x40) && !one.auto_eoi_vector(0x41),
+                           "AutoEOI SINT not reported by vector");
+                invariant!(one.write(crate::hyperv::MSR_SINT0 + 2, 0x40 | 1 << 16 | 1 << 17, time(tsc), &mem) == Some(true)
+                           && !one.auto_eoi() && !one.auto_eoi_vector(0x40), "a masked AutoEOI SINT still reported");
             }
             _ => {}
         }

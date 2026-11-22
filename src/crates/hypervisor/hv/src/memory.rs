@@ -539,12 +539,15 @@ impl GuestMemory {
         Ok(self.renew(&mut table))
     }
 
-    /// An overlay's contents and frame, made before a vCPU can run.
+    /// An overlay's contents and frame, made or refreshed before a vCPU can run.
     #[cfg(target_arch = "x86_64")]
     pub fn prepare_overlay(&self, slot: OverlaySlot, contents: &[u8]) -> Result<()> {
         let mut overlays = self.overlays.lock();
         let overlay = &mut overlays[slot as usize];
-        if overlay.frame.is_some() {
+        if let Some(frame) = &overlay.frame {
+            if !frame.write(0, contents) {
+                return Err(Error::BadAddress);
+            }
             return Ok(());
         }
         let frame = Frame::new().ok_or(Error::NoMemory)?;

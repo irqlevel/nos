@@ -74,7 +74,8 @@ KVM it is whatever the host CPU has):
     by slot, and a file written, its ext4 transactions committed; and with
     the events off, nothing recorded
   - CloudHv started as a firmware VM reaches its Boot Manager and UEFI Shell,
-    takes Down and Enter, and executes a command through `hv exec`
+    takes Down and Enter, executes a command through `hv exec`, and is saved
+    and restored to another working Shell
   - nothing warned, and nothing panicked
 
 and on arm64, where a hypervisor needs EL2 and this kernel dropped to EL1 in
@@ -219,7 +220,7 @@ TEST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHVub3QtYS1yZWFsLWtleS1qdXN0LWEt
 # The ESC byte is Down's CSI sequence; Shell executes a command on CR, which
 # the explicit \r gives hv exec before its usual LF.
 UEFI = [
-    "hv create uefi firmware mem=64",
+    "hv create uefi firmware hyperv mem=64",
     "cat /vms/uefi/vm.toml",
     "hv start uefi",
     "hv wait uefi secs=120 Press any key",
@@ -228,6 +229,11 @@ UEFI = [
     "hv send uefi \x1b[B\\r",
     "hv wait uefi secs=120 Shell>",
     "hv exec uefi secs=60 echo HV-UEFI-OK\\r",
+    "hv save uefi /uefi.state",
+    "hv restore /uefi.state",
+    "hv send uefi \\r",
+    "hv wait uefi secs=60 Shell>",
+    "hv exec uefi secs=60 echo HV-UEFI-RESTORED\\r",
     "hv stop uefi secs=0",
     "hv delete uefi",
 ]
@@ -1403,14 +1409,21 @@ def x86_checks(ran, script, digest, grown, raw, expect=frozenset()):
         pt.check("and, given no disk, says so and turns the guest off by its ACPI",
                  "hvboot: cannot boot: no virtio disk" in pvh and "the guest powered itself off" in pvh, pvh)
     uefi = out[36:36 + len(UEFI)]
-    pt.check("CloudHv is made a firmware VM in its vm.toml",
-             'kernel = "/lib/CLOUDHV.fd"' in uefi[1] and "firmware = true" in uefi[1], uefi[1])
+    pt.check("CloudHv is made a firmware Hyper-V VM in its vm.toml",
+             'kernel = "/lib/CLOUDHV.fd"' in uefi[1] and "firmware = true" in uefi[1]
+             and "hyperv = true" in uefi[1], uefi[1])
     for i, what in ((3, "its Boot Manager prompt"), (5, "the boot-device menu"), (7, "the UEFI Shell")):
         pt.check("CloudHv reaches " + what, "printed" in uefi[i] and "has not printed" not in uefi[i], uefi[i])
     pt.check("the UEFI Shell executes a command typed through hv exec",
              re.search(r"(?:^|\n)HV-UEFI-OK\r?$", uefi[8], re.M) is not None and "no prompt" not in uefi[8], uefi[8])
+    pt.check("a running firmware VM is saved and restored",
+             "saved into" in uefi[9] and "restored from" in uefi[10], uefi[9] + uefi[10])
+    pt.check("and its restored UEFI Shell answers again",
+             "printed" in uefi[12] and "has not printed" not in uefi[12]
+             and re.search(r"(?:^|\n)HV-UEFI-RESTORED\r?$", uefi[13], re.M) is not None
+             and "no prompt" not in uefi[13], uefi[12] + uefi[13])
     pt.check("and the firmware VM stops and is deleted",
-             "stopped -- on request" in uefi[9] and "deleted" in uefi[10], uefi[9] + uefi[10])
+             "stopped -- on request" in uefi[-2] and "deleted" in uefi[-1], uefi[-2] + uefi[-1])
 
     after_uefi = 36 + len(UEFI)
     pt.check("and hv unloads after it", "hv unloaded" in out[after_uefi], out[after_uefi])

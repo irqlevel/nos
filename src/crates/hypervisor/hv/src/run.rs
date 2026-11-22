@@ -93,8 +93,8 @@ use crate::vm::{Cpu, Refusal};
 pub use crate::smp::Doorbell;
 
 /// COM1, the guest's console, and its IRQ.
-const COM1: u16 = 0x3F8;
-const COM1_IRQ: u8 = 4;
+pub(crate) const COM1: u16 = 0x3F8;
+pub(crate) const COM1_IRQ: u8 = 4;
 /// The exceptions of a guest's own the host intercepts -- so that the CPU
 /// cannot be made to deliver one inside another for good -- and gives back.
 const VECTOR_DB: u8 = 1;
@@ -117,8 +117,9 @@ const NIC_IRQ: u8 = 10;
 /// IRQ to exist (NVIDIA's). Free on a PC, and on the master PIC.
 const HOST_IRQ: u8 = 5;
 /// What the 64-bit window the DSDT gives a host's functions' BARs is
-/// rounded up to, past the last of them (`write_firmware`).
-const BARS64_ROUNDING: u64 = 1 << 30;
+/// rounded up to, past the last of them (`write_firmware`): Cloud
+/// Hypervisor's 8 MiB allocation granularity.
+pub(crate) const BARS64_ROUNDING: u64 = 8 << 20;
 /// Where a device's MSI-X table page is, for a guest of more than one CPU:
 /// this plus a page for its PCI slot -- in the platform's MMIO window, clear
 /// of the local APIC's page, the IO-APIC's address the MP table gives, and
@@ -251,10 +252,10 @@ fn sooner(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 
 /// A guest CPU's exits the world switch's own loop answers
 /// (`hvarch::x86::fast`), the guest entered again at once past them: its
-/// writes of the x2APIC's ICR that send a fixed IPI to other CPUs alone --
-/// posted or mailed, and their CPUs notified or rung, as `send` does -- and
-/// of its TSC deadline, the host's timer armed for the edge as the run
-/// loop's round arms it. KVM answers the same two so
+/// writes of the x2APIC's or Hyper-V's synthetic ICR that send a fixed IPI to
+/// other CPUs alone -- posted or mailed, and their CPUs notified or rung, as
+/// `send` does -- and of the x2APIC TSC deadline, the host's timer armed for
+/// the edge as the run loop's round arms it. KVM answers the same native two so
 /// (`handle_fastpath_set_msr_irqoff`). Anything else -- an IPI to itself
 /// too, or of another kind, a guest with no APIC -- is refused, and goes the
 /// way it always went. What comes meanwhile for the CPU kicks it, and the
@@ -285,7 +286,9 @@ impl hvarch::x86::fast::FastExit for FastMsr<'_> {
             return false;
         }
         let answered = if msr == lapic::MSR_X2APIC_ICR {
-            self.ipi(value)
+            self.ipi(value, false)
+        } else if msr == crate::hyperv::MSR_APIC_ICR && self.guest.hyperv.is_some() {
+            self.ipi(value, true)
         } else if msr == lapic::MSR_TSC_DEADLINE && crate::policy::tsc_deadline() {
             self.tsc_deadline(value)
         } else {
@@ -344,9 +347,14 @@ impl hvarch::x86::fast::FastExit for FastMsr<'_> {
 
 impl FastMsr<'_> {
     /// A fixed IPI, to other CPUs alone, sent as `send` sends one.
-    fn ipi(&mut self, value: u64) -> bool {
+    fn ipi(&mut self, value: u64, hyperv: bool) -> bool {
         let me = self.me;
-        let Some(ipi) = self.lapic.fixed_ipi(value, me) else { return false };
+        let ipi = if hyperv {
+            self.lapic.fixed_hyperv_ipi(value, me)
+        } else {
+            self.lapic.fixed_ipi(value, me)
+        };
+        let Some(ipi) = ipi else { return false };
         self.counts.ipi_sent += 1;
         for (i, target) in self.guest.cpus.iter().enumerate() {
             let id = i as u32;
@@ -401,8 +409,9 @@ enum Step {
 /// net under that, not how it is woken.
 const ASLEEP_WAIT_NS: u64 = kcore::consts::NS_PER_SEC;
 
-/// Room for the register dump of the CPU that stopped a guest.
-const DUMP_BYTES: usize = 2048;
+/// Room for the register dump of the CPU that stopped a guest and its last
+/// refused Hyper-V call.
+const DUMP_BYTES: usize = 2560;
 /// A page of the guest's memory: what its dirty log marks (`crate::dirty`).
 const GUEST_PAGE: u64 = 4096;
 /// The most write faults in a row one CPU takes at one page with no round of
@@ -506,6 +515,11 @@ pub struct Counts {
     pub port_in: u64,
     pub port_out: u64,
     pub cpuid: u64,
+    pub hypercalls: u64,
+    pub hypercall_errors: u64,
+    pub flush_calls: u64,
+    pub flush_timeouts: u64,
+    pub ipi_calls: u64,
     pub msr_read: u64,
     pub msr_write: u64,
     pub msr_gp: u64,
@@ -640,8 +654,8 @@ pub struct Counts {
     /// not offer, or one a CPU would not take where it was.
     pub cr4: u64,
     pub cr4_gp: u64,
-    /// EOIs the guest made through its PV EOI word (KVM's), each done here
-    /// at its next exit in place of one of its own.
+    /// EOIs the guest made through its PV EOI word (KVM's or Hyper-V's), each
+    /// done here at its next exit in place of one of its own.
     pub pv_eoi: u64,
     /// `mov`s to and from DR0-DR3 the guest stopped at (AMD-V,
     /// `crate::dr`), and of those the ones not made: a #GP above CPL 0, or
@@ -672,6 +686,11 @@ impl Counts {
         self.port_in += o.port_in;
         self.port_out += o.port_out;
         self.cpuid += o.cpuid;
+        self.hypercalls += o.hypercalls;
+        self.hypercall_errors += o.hypercall_errors;
+        self.flush_calls += o.flush_calls;
+        self.flush_timeouts += o.flush_timeouts;
+        self.ipi_calls += o.ipi_calls;
         self.msr_read += o.msr_read;
         self.msr_write += o.msr_write;
         self.msr_gp += o.msr_gp;
@@ -871,6 +890,10 @@ pub struct GuestCpu {
     /// the last entry (`pv_eoi_arm`), for the exit after to look at.
     pv_eoi: u64,
     pv_eoi_armed: bool,
+    /// Hyper-V's VP-assist EOI word was set before the last entry.
+    hyperv_eoi_armed: bool,
+    /// The last Hyper-V call refused, with its input and two parameter registers.
+    bad_hypercall: Option<(u64, u64, u64, u64)>,
     /// How long its task spins for a ring when it halts (`POLL_MAX_NS`).
     poll_ns: u64,
     /// Its last exit a write the next entry may follow without the loop's
@@ -927,7 +950,12 @@ impl GuestCpu {
 
     /// Its registers and the last exit, for a report.
     pub fn dump(&self, out: &mut dyn core::fmt::Write) -> core::fmt::Result {
-        self.cpu.backend().dump(out)
+        self.cpu.backend().dump(out)?;
+        if let Some((input, first, second, answer)) = self.bad_hypercall {
+            out.write_fmt(format_args!("\n  last refused hypercall input {:#x} rdx {:#x} r8 {:#x}, status {:#x}",
+                                       input, first, second, answer))?;
+        }
+        Ok(())
     }
 
     /// Its CPU, for a guest of this crate's own that starts it somewhere
@@ -962,6 +990,10 @@ struct CpuShared {
     /// later one, which drops what the TLB kept of the table before. What a
     /// migration's dirty log waits on (`sync_tlbs`).
     epoch: AtomicU64,
+    /// Hyper-V flush requests and those whose backend has been marked before
+    /// an entry. A request's doorbell takes a running target out to mark it.
+    flush_request: AtomicU64,
+    flush_ack: AtomicU64,
 }
 
 impl CpuShared {
@@ -1237,6 +1269,7 @@ struct Parked {
     pause: u64,
     state: vmstate::Result<vmstate::Cpu>,
     at: u64,
+    hyperv: Option<(vmstate::HypervVp, u64)>,
 }
 
 /// How long a pause waits for every CPU to park, and the disks to answer
@@ -1451,6 +1484,8 @@ impl LinuxGuest {
                 last_from_pic: false,
                 pv_eoi: 0,
                 pv_eoi_armed: false,
+                hyperv_eoi_armed: false,
+                bad_hypercall: None,
                 poll_ns: 0,
                 fast: false,
                 step: Step::Other,
@@ -1470,6 +1505,8 @@ impl LinuxGuest {
                 posted,
                 posted_on: AtomicBool::new(false),
                 epoch: AtomicU64::new(0),
+                flush_request: AtomicU64::new(0),
+                flush_ack: AtomicU64::new(0),
             });
         }
 
@@ -1991,8 +2028,8 @@ impl LinuxGuest {
             HostBridge::Q35 => match self.windows {
                 /* Either empty where the guest's addresses end short of it --
                  * a CPUID of few address bits -- and said as none. The 64-bit
-                 * one only as far as the BARs placed in it reach, a GiB at a
-                 * time: the rest of the guest's addresses are its OS's own --
+                 * one only as far as the BARs placed in it reach, in Cloud
+                 * Hypervisor's 8 MiB units: the rest of the guest's addresses are its OS's own --
                  * Linux's HMM takes a GPU's VRAM's worth of them for device
                  * memory (NVIDIA's UVM), and with a window to the top of them
                  * none was left, and CUDA was refused */
@@ -2303,11 +2340,16 @@ impl LinuxGuest {
     /// slot, and then a wait until the pause is over, or the guest ends.
     fn park(&self, gc: &mut GuestCpu, bell: &Doorbell, pause: u64) {
         let at = time::boot_time_ns();
+        let hyperv = self.hyperv.as_ref().map(|hyperv| {
+            let tsc = time::cycle_counter().wrapping_add(self.tsc_offset.load(Ordering::Relaxed));
+            let now = hyperv.reference_time(tsc);
+            (gc.hyperv.save(now), now)
+        });
         let state = self.cpu_state(gc, at);
         let old = {
             let mut parked = self.parked.lock();
             match parked.get_mut(gc.index as usize) {
-                Some(slot) => slot.replace(Parked { pause, state, at }),
+                Some(slot) => slot.replace(Parked { pause, state, at, hyperv }),
                 None => None,
             }
         };
@@ -2410,9 +2452,6 @@ impl LinuxGuest {
         if pause == 0 {
             return Err(vmstate::Error("a state taken of a guest not paused"));
         }
-        if self.host_bridge != HostBridge::Q35 {
-            return Err(vmstate::Error("a firmware guest's host bridge is not in its saved state"));
-        }
         if self.holds_host_function() {
             /* Its device's DMA reaches no dirty log, and what the device is
              * in is the device's own: no state of it to take, nor to move */
@@ -2424,6 +2463,11 @@ impl LinuxGuest {
         let tsc = time::cycle_counter().wrapping_add(self.tsc_offset.load(Ordering::Relaxed));
         let tsc_hz = Some(self.told_hz.load(Ordering::Relaxed)).filter(|&hz| hz != 0)
             .ok_or(vmstate::Error("this host's TSC rate is not known"))?;
+        let reference_now = self.hyperv.as_ref().map(|hyperv| hyperv.reference_time(tsc));
+        let mut hyperv_vps = Vec::new();
+        if self.hyperv.is_some() {
+            hyperv_vps.try_reserve_exact(self.cpus.len()).map_err(|_| vmstate::Error("no memory for Hyper-V's VP states"))?;
+        }
 
         let mut cpus = Vec::new();
         cpus.try_reserve_exact(self.cpus.len()).map_err(|_| vmstate::Error("no memory for the CPUs' states"))?;
@@ -2443,6 +2487,14 @@ impl LinuxGuest {
         }
         for (p, shared) in taken.into_iter().zip(&self.cpus) {
             let mut cpu = p.state?;
+            match (p.hyperv, reference_now) {
+                (Some((mut vp, parked_at)), Some(now)) => {
+                    vp.elapse(now.saturating_sub(parked_at));
+                    hyperv_vps.push(vp);
+                }
+                (None, None) => {}
+                _ => return Err(vmstate::Error("a CPU's Hyper-V state does not match its VM")),
+            }
             /* Its timers, read as it parked, made times from now. */
             let since = at.saturating_sub(p.at);
             let l = &mut cpu.lapic;
@@ -2503,12 +2555,20 @@ impl LinuxGuest {
                 hvarch::Vendor::Vmx => vmstate::Vendor::Vmx,
                 _ => vmstate::Vendor::Svm,
             },
+            host_bridge: match self.host_bridge {
+                HostBridge::Q35 => vmstate::HostBridge::Q35,
+                HostBridge::CloudHv => vmstate::HostBridge::CloudHv,
+            },
             uuid: self.identity.uuid, ranges, x2apic: self.x2apic, ioapic, apicv: self.apicv, offloads: self.offloads,
             rx_moderation_ns: self.rx_moderation_ns, shape: vmstate::Shape { cpus: n, smt, llc },
             model: crate::policy::model_digest(self.shape), tsc_hz, tsc,
             started: self.started.load(Ordering::Relaxed),
         };
-        Ok(vmstate::VmState { vm, cpus, platform })
+        let hyperv = self.hyperv.as_ref().map(|hyperv| vmstate::HypervState {
+            shared: hyperv.save(),
+            vps: hyperv_vps,
+        });
+        Ok(vmstate::VmState { vm, cpus, platform, hyperv })
     }
 
     /// This guest -- built as the one `s` was saved from was: as much
@@ -2524,8 +2584,12 @@ impl LinuxGuest {
         if self.loaded {
             return bad("a state restored over a guest that has booted");
         }
-        if self.host_bridge != HostBridge::Q35 {
-            return bad("a firmware guest's host bridge is not in the saved state");
+        let state_bridge = match s.vm.host_bridge {
+            vmstate::HostBridge::Q35 => HostBridge::Q35,
+            vmstate::HostBridge::CloudHv => HostBridge::CloudHv,
+        };
+        if self.host_bridge != state_bridge {
+            return bad("a state of a guest with another host bridge");
         }
         let vendor = match s.vm.vendor {
             vmstate::Vendor::Svm => hvarch::Vendor::Svm,
@@ -2570,6 +2634,17 @@ impl LinuxGuest {
         self.tsc_offset.store(tsc_offset, Ordering::Relaxed);
         self.restored_at.store(now, Ordering::Relaxed);
         self.told_hz.store(s.vm.tsc_hz, Ordering::Relaxed);
+        if s.hyperv.as_ref().is_some_and(|hyperv| hyperv.vps.len() != cpus.len()) {
+            return bad("Hyper-V state for another number of CPUs");
+        }
+        let reference_now = match (&mut self.hyperv, &s.hyperv) {
+            (Some(hyperv), Some(state)) => {
+                hyperv.restore(&state.shared, s.vm.tsc_hz, &self.memory)?;
+                Some(hyperv.reference_time(s.vm.tsc))
+            }
+            (None, None) => None,
+            _ => return bad("Hyper-V state on a guest built without it, or none on one built with it"),
+        };
         {
             let p = &mut *self.platform.lock();
             let f = &s.platform;
@@ -2598,7 +2673,7 @@ impl LinuxGuest {
             p.msix_pending.copy_from_slice(&f.msix_pending);
             sync_msix(p);
         }
-        for ((gc, c), shared) in cpus.iter_mut().zip(&s.cpus).zip(&self.cpus) {
+        for (index, ((gc, c), shared)) in cpus.iter_mut().zip(&s.cpus).zip(&self.cpus).enumerate() {
             let b = gc.cpu.backend_mut();
             b.restore_regs(&c.regs)?;
             if !c.regs.mtrrs.valid(crate::policy::phys_bits()) {
@@ -2606,6 +2681,10 @@ impl LinuxGuest {
             }
             gc.mtrrs = c.regs.mtrrs;
             b.set_tsc_offset(tsc_offset);
+            if let (Some(now), Some(state)) = (reference_now, &s.hyperv) {
+                let vp = state.vps.get(index).ok_or(vmstate::Error("a missing Hyper-V VP state"))?;
+                gc.hyperv.restore(vp, now, &self.memory)?;
+            }
             gc.lapic.restore(&c.lapic, now)?;
             gc.activity = match c.activity {
                 vmstate::Activity::Running => Activity::Running,
@@ -2618,6 +2697,7 @@ impl LinuxGuest {
             gc.last_from_pic = c.last_from_pic;
             gc.pv_eoi = c.pv_eoi;
             gc.pv_eoi_armed = false;
+            gc.hyperv_eoi_armed = false;
             shared.mail.restore(&c.mail);
             let addressing = gc.lapic.addressing().pack();
             gc.published = (addressing, gc.lapic.software_enabled());
@@ -2885,6 +2965,7 @@ impl LinuxGuest {
             let rung = bell.take_rung();
             let mut fast = core::mem::take(&mut gc.fast) && entered_apicv && !rung
                 && gc.activity == Activity::Running && !shared.mail.has_mail()
+                && shared.flush_request.load(Ordering::Acquire) == shared.flush_ack.load(Ordering::Acquire)
                 && shared.posted.as_ref().is_none_or(|p| !p.outstanding())
                 && gc.exception.is_none() && !gc.nmi_pending
                 && gc.lapic.next_timer_ns().is_none_or(|edge| edge > now)
@@ -2906,6 +2987,11 @@ impl LinuxGuest {
             if matches!(gc.activity, Activity::Asleep | Activity::WaitForSipi) {
                 /* Awake while it looks, before it takes anything. */
                 self.asleep.fetch_and(!(1u64 << me), Ordering::AcqRel);
+            }
+            let flush = shared.flush_request.load(Ordering::Acquire);
+            if flush != shared.flush_ack.load(Ordering::Acquire) {
+                gc.cpu.backend_mut().flush_tlb();
+                shared.flush_ack.store(flush, Ordering::Release);
             }
             self.take_mail(gc);
             self.take_posted(gc, shared);
@@ -3189,7 +3275,8 @@ impl LinuxGuest {
              * and the guest's APIC is in x2APIC mode and on: handed where
              * the APIC stands, and given back what it did at the exit, before
              * anything here looks at the APIC again. */
-            let apicv = apicv && self.has_apic() && gc.cpu.backend().has_vapic() && gc.lapic.delivers_itself();
+            let apicv = apicv && self.has_apic() && gc.cpu.backend().has_vapic() && gc.lapic.delivers_itself()
+                && !gc.hyperv.auto_eoi();
             self.deliver(gc, extint, apicv);
             if apicv {
                 let vectors = gc.lapic.vectors();
@@ -3198,6 +3285,7 @@ impl LinuxGuest {
             } else {
                 gc.cpu.backend_mut().apicv_off();
                 self.pv_eoi_arm(gc);
+                self.hyperv_eoi_arm(gc);
             }
             apicv
             };
@@ -3231,6 +3319,7 @@ impl LinuxGuest {
              * through it comes before whatever the exit is -- an EOI written
              * to the register after it, which ends the vector beneath. */
             self.pv_eoi_sync(gc);
+            self.hyperv_eoi_sync(gc);
             let (exit, host_cpu) = match entered {
                 Ok(entered) => entered,
                 Err(refusal) => {
@@ -3508,21 +3597,33 @@ impl LinuxGuest {
                     None
                 }
                 Exit::Hypercall => {
-                    let v = gc.cpu.backend_mut();
+                    gc.counts.hypercalls += 1;
+                    let (input, first, second) = {
+                        let v = gc.cpu.backend();
+                        (v.regs().rcx, v.regs().rdx, v.regs().r8)
+                    };
                     if let Some(hyperv) = &self.hyperv {
-                        /* Hv#1 has no call implemented yet. An unknown one is
-                         * answered by its own status; with the page off the
-                         * opcode is an illegal one, as the TLFS has it. */
-                        match hyperv.call(v.regs().rcx) {
-                            Some(answer) => {
+                        match hyperv.call(input) {
+                            Some(call) => {
+                                let answer = match call {
+                                    Ok(call) => self.hypercall(gc, call, first, second),
+                                    Err(status) => status,
+                                };
+                                if answer & 0xFFFF != 0 {
+                                    gc.counts.hypercall_errors += 1;
+                                    gc.counts.flush_timeouts += u64::from(answer == hyperv::HV_STATUS_TIME_OUT);
+                                    gc.bad_hypercall = Some((input, first, second, answer));
+                                }
+                                let v = gc.cpu.backend_mut();
                                 v.save_mut().rax = answer;
                                 v.skip_vmmcall();
                             }
-                            None => v.reflect_exception(VECTOR_UD, None),
+                            None => gc.cpu.backend_mut().reflect_exception(VECTOR_UD, None),
                         }
                     } else {
                         /* A driver that probes for one, as ptp_kvm does for
                          * its clock pairing, reads -KVM_ENOSYS as not there. */
+                        let v = gc.cpu.backend_mut();
                         v.save_mut().rax = KVM_ENOSYS;
                         v.skip_vmmcall();
                     }
@@ -3771,6 +3872,126 @@ impl LinuxGuest {
     /// tick -- Linux, which disables an APIC timer whose count strays two
     /// jiffies from its PIT's -- would see them apart when they are not.
     ///
+    /// Execute one decoded Hv#1 call. RDX and R8 are its input GPA/parameters.
+    fn hypercall(&self, gc: &mut GuestCpu, call: hyperv::Call, first: u64, second: u64) -> u64 {
+        match call {
+            hyperv::Call::SendIpi { .. } => gc.counts.ipi_calls += 1,
+            hyperv::Call::FlushSpace { .. } | hyperv::Call::FlushList { .. } => gc.counts.flush_calls += 1,
+        }
+        let word = |bytes: &[u8], at: usize| {
+            u64::from_le_bytes(bytes[at..at + 8].try_into().expect("a hypercall input word"))
+        };
+        match call {
+            hyperv::Call::SendIpi { fast } => {
+                let (vector, mask) = if fast {
+                    if first >> 32 != 0 {
+                        return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                    }
+                    (first as u32, second)
+                } else {
+                    let bytes = match self.hypercall_input::<16>(first) {
+                        Ok(bytes) => bytes,
+                        Err(status) => return status,
+                    };
+                    if bytes[4..8].iter().any(|&b| b != 0) {
+                        return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                    }
+                    (u32::from_le_bytes(bytes[0..4].try_into().expect("a hypercall vector")), word(&bytes, 8))
+                };
+                if !(16..=255).contains(&vector) {
+                    return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                }
+                self.hyperv_ipi(gc, vector as u8, mask);
+                0
+            }
+            hyperv::Call::FlushSpace { fast } => {
+                if fast {
+                    return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                }
+                let bytes = match self.hypercall_input::<24>(first) {
+                    Ok(bytes) => bytes,
+                    Err(status) => return status,
+                };
+                let (flags, mask) = (word(&bytes, 8), word(&bytes, 16));
+                if flags & !7 != 0 {
+                    return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                }
+                self.hyperv_flush(gc, flags, mask)
+            }
+            hyperv::Call::FlushList { fast, reps, .. } => {
+                if fast {
+                    return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                }
+                let bytes_len = 24 + u64::from(reps) * 8;
+                if first & 7 != 0 || (first & 0xFFF) + bytes_len > kcore::consts::PAGE_SIZE as u64 {
+                    return hyperv::HV_STATUS_INVALID_ALIGNMENT;
+                }
+                if !self.memory.is_ram(first, bytes_len) {
+                    return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                }
+                let bytes = match self.hypercall_input::<24>(first) {
+                    Ok(bytes) => bytes,
+                    Err(status) => return status,
+                };
+                let (flags, mask) = (word(&bytes, 8), word(&bytes, 16));
+                if flags & !7 != 0 {
+                    return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                }
+                let status = self.hyperv_flush(gc, flags, mask);
+                if status != 0 {
+                    return status;
+                }
+                u64::from(reps) << 32
+            }
+        }
+    }
+
+    fn hypercall_input<const N: usize>(&self, gpa: u64) -> core::result::Result<[u8; N], u64> {
+        if gpa & 7 != 0 || (gpa & 0xFFF) + N as u64 > kcore::consts::PAGE_SIZE as u64 {
+            return Err(hyperv::HV_STATUS_INVALID_ALIGNMENT);
+        }
+        let mut bytes = [0u8; N];
+        self.memory.read(gpa, &mut bytes).map_err(|_| hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT)?;
+        Ok(bytes)
+    }
+
+    fn hyperv_ipi(&self, gc: &mut GuestCpu, vector: u8, mask: u64) {
+        let me = gc.index as usize;
+        let mut own = false;
+        gc.counts.ipi_sent += 1;
+        for (i, target) in self.cpus.iter().enumerate() {
+            if i >= 64 || mask & 1u64 << i == 0 {
+                continue;
+            }
+            if i == me {
+                gc.lapic.accept(vector);
+                own = true;
+            } else if target.addressing().mode != lapic::Mode::Off {
+                self.post_edge(i, target, vector);
+            }
+        }
+        gc.fast = !own;
+    }
+
+    fn hyperv_flush(&self, gc: &mut GuestCpu, flags: u64, mask: u64) -> u64 {
+        let me = gc.index as usize;
+        let mask = if flags & 1 != 0 || mask == 0 { self.all } else { mask & self.all };
+        gc.fast = false;
+        for (i, target) in self.cpus.iter().enumerate() {
+            if mask & 1u64 << i == 0 {
+                continue;
+            }
+            if i == me {
+                gc.cpu.backend_mut().flush_tlb();
+                continue;
+            }
+            target.flush_request.fetch_add(1, Ordering::AcqRel);
+            let Some(d) = self.doorbells.get(i) else { return hyperv::HV_STATUS_TIME_OUT };
+            d.ring();
+        }
+        0
+    }
+
     /// With `apicv` the APIC's interrupts are the CPU's to deliver (VT-x's
     /// virtual-interrupt delivery): only an exception, an NMI and the
     /// 8259's go in from here.
@@ -3852,6 +4073,11 @@ impl LinuxGuest {
                 v.inject_extint(vector);
                 gc.lapic.acknowledge(vector);
                 v.clear_irq_window();
+                if gc.hyperv.auto_eoi_vector(vector) {
+                    if let Some(level) = gc.lapic.quiet_eoi() {
+                        self.level_eoi(gc, level);
+                    }
+                }
                 gc.last_from_pic = false;
                 gc.counts.apic += 1;
                 tp::inject(gc.index, gc.cpu.pid(), InjectKind::Apic, vector);
@@ -4665,9 +4891,37 @@ impl LinuxGuest {
                     }
                     return None;
                 }
+                if let Some(result) = gc.lapic.hyperv_write(msr, value, time::boot_time_ns()) {
+                    match result {
+                        Ok(Wrote::Done) => gc.cpu.backend_mut().skip_msr(),
+                        Ok(Wrote::Tpr(tpr)) => {
+                            let v = gc.cpu.backend_mut();
+                            v.set_cr8(tpr >> 4);
+                            v.skip_msr();
+                        }
+                        Ok(Wrote::Ipi(ipi)) => {
+                            gc.cpu.backend_mut().skip_msr();
+                            gc.fast = !self.send(gc, ipi);
+                        }
+                        Ok(Wrote::Eoi(vector)) => {
+                            gc.cpu.backend_mut().skip_msr();
+                            self.level_eoi(gc, vector);
+                        }
+                        Err(lapic::Refused) => self.msr_fault(gc, msr, value, true),
+                    }
+                    self.publish(gc);
+                    return None;
+                }
             } else {
                 let tsc = time::cycle_counter().wrapping_add(self.tsc_offset.load(Ordering::Relaxed));
                 let value = hyperv.read(msr, gc.index, tsc).or_else(|| gc.hyperv.read(msr));
+                let value = if value.is_some() {
+                    value
+                } else {
+                    let cr8 = gc.cpu.backend().cr8();
+                    gc.lapic.sync_cr8(cr8);
+                    gc.lapic.hyperv_read(msr)
+                };
                 if let Some(value) = value {
                     let b = gc.cpu.backend_mut();
                     let (save, regs) = b.save_and_regs_mut();
@@ -4807,6 +5061,39 @@ impl LinuxGuest {
             return;
         }
         let word = gc.pv_eoi & !(PV_EOI_ON | PV_EOI_RESERVED);
+        let mut bits = [0u8];
+        match self.memory.read(word, &mut bits).map(|()| bits[0]) {
+            Ok(bits) if bits & PV_EOI_PENDING == 0 => {
+                gc.counts.pv_eoi += 1;
+                if let Some(vector) = gc.lapic.quiet_eoi() {
+                    self.level_eoi(gc, vector);
+                }
+            }
+            Ok(_) => {
+                let _ = self.memory.write(word, &[0]);
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Arm Hyper-V's VP-assist EOI word where the highest interrupt in
+    /// service is edge-triggered and no other request is waiting.
+    fn hyperv_eoi_arm(&self, gc: &mut GuestCpu) {
+        if gc.hyperv_eoi_armed || !gc.lapic.eoi_may_be_quiet() {
+            return;
+        }
+        let Some(word) = gc.hyperv.assist_page() else { return };
+        if self.memory.write(word, &[PV_EOI_PENDING]).is_ok() {
+            gc.hyperv_eoi_armed = true;
+        }
+    }
+
+    /// Complete an EOI the guest made by clearing its VP-assist word.
+    fn hyperv_eoi_sync(&self, gc: &mut GuestCpu) {
+        if !core::mem::take(&mut gc.hyperv_eoi_armed) {
+            return;
+        }
+        let Some(word) = gc.hyperv.assist_page() else { return };
         let mut bits = [0u8];
         match self.memory.read(word, &mut bits).map(|()| bits[0]) {
             Ok(bits) if bits & PV_EOI_PENDING == 0 => {
