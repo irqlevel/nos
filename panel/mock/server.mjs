@@ -618,8 +618,11 @@ const reads = {
   },
   'vm.config_get': (p) => {
     const v = vmNamed(p);
-    return { text: `# A VM of nos's hypervisor\nkernel = "${v.kernel}"\nmemory = ${v.memory_mib}\ncpus = ${v.cpus}\n`
-      + `disks = ["disk.raw", "seed.iso:ro"]\nnet = true\n` + (v.protected ? 'protected = true\n' : ''), prev: false };
+    const disks = v.disks.map((d) => `"${d.file}${d.read_only ? ':ro' : ''}"`).join(', ');
+    return { text: `# A VM of nos's hypervisor\nkernel = "${v.kernel}"\n`
+      + (v.kernel === '/lib/CLOUDHV.fd' ? 'firmware = true\nhyperv = true\n' : '')
+      + `memory = ${v.memory_mib}\ncpus = ${v.cpus}\ndisks = [${disks}]\nnet = true\n`
+      + (v.protected ? 'protected = true\n' : ''), prev: false };
   },
   'vm.console_read': (p) => {
     const v = vmNamed(p);
@@ -1283,6 +1286,8 @@ const actions = {
 };
 
 const SEED_DISK = { file: 'seed.iso', size_bytes: 65536, read_only: true };
+const createKernel = (p) => p.os === 'windows' ? '/lib/CLOUDHV.fd' : '/lib/hvboot';
+const createDisks = (p, first) => p.os === 'windows' ? [first] : [first, SEED_DISK];
 
 /** A VM of an image of NBS's (`image=nbs:<image>`): a clone of it its disk,
  * named the VM's unless onto=nbs:<volume> names it, grown to size_bytes --
@@ -1317,9 +1322,10 @@ function createOfImage(name, p) {
     nbsShare(image, clone, 'volume', nbs.hosts[0].host);
     nbs.volumes.find((v) => v.name === clone).size_mib = sizeMib;
     vm(name, { memory_mib: p.memory_mib ?? 1024, cpus: p.cpus ?? 1, node: p.node ?? null, network: p.network ?? null,
-               firewall: p.firewall ?? 'default', public: p.public ?? null,
-      disks: [{ file: 'nbs:' + clone, size_bytes: null, read_only: false }, SEED_DISK] });
-    return { name, file: '/vms/' + name + '/vm.toml', disk_bytes: sizeMib * MIB, keys: 1, port: null, id: null };
+               firewall: p.firewall ?? 'default', public: p.public ?? null, kernel: createKernel(p),
+      disks: createDisks(p, { file: 'nbs:' + clone, size_bytes: null, read_only: false }) });
+    return { name, file: '/vms/' + name + '/vm.toml', disk_bytes: sizeMib * MIB, keys: p.os === 'windows' ? 0 : 1,
+             port: null, id: null };
   });
 }
 
@@ -1345,9 +1351,10 @@ function createOntoVolume(name, p) {
   return job('vm', 'create', 4, (i) => ['download: 120 MiB of 590 MiB, 20%', 'download: 590 MiB of 590 MiB, 100%',
     'nbs:' + word + ': 3584 MiB poured, the rest of the volume zeroes', '/vms/' + name + '/vm.toml written'][i], () => {
     vm(name, { memory_mib: p.memory_mib ?? 1024, cpus: p.cpus ?? 1, node: p.node ?? null, network: p.network ?? null,
-               firewall: p.firewall ?? 'default', public: p.public ?? null,
-      disks: [{ file: 'nbs:' + word, size_bytes: null, read_only: false }, SEED_DISK] });
-    return { name, file: '/vms/' + name + '/vm.toml', disk_bytes: v.size_mib * MIB, keys: 1, port: null, id: null };
+               firewall: p.firewall ?? 'default', public: p.public ?? null, kernel: createKernel(p),
+      disks: createDisks(p, { file: 'nbs:' + word, size_bytes: null, read_only: false }) });
+    return { name, file: '/vms/' + name + '/vm.toml', disk_bytes: v.size_mib * MIB, keys: p.os === 'windows' ? 0 : 1,
+             port: null, id: null };
   });
 }
 
@@ -1559,11 +1566,11 @@ const jobMethods = {
         : 'disk.raw: 1785 MiB written of 3584 MiB, the rest holes',
       '/vms/' + name + '/vm.toml written'][i], () => {
       vm(name, { memory_mib: p.memory_mib ?? 1024, cpus: p.cpus ?? 1, node: p.node ?? null, network: p.network ?? null,
-                 firewall: p.firewall ?? 'default', public: p.public ?? null,
-                 ...(onto ? { disks: [deviceDisk(onto, false), { file: 'seed.iso', size_bytes: 65536, read_only: true }] }
-                   : {}) });
+                 firewall: p.firewall ?? 'default', public: p.public ?? null, kernel: createKernel(p),
+                 disks: createDisks(p, onto ? deviceDisk(onto, false)
+                   : { file: 'disk.raw', size_bytes: p.size_bytes ?? 20 * 1024 * MIB, read_only: false }) });
       return { name, file: '/vms/' + name + '/vm.toml', disk_bytes: onto ? onto.size_bytes : p.size_bytes ?? 3584 * MIB,
-               keys: 1 };
+               keys: p.os === 'windows' ? 0 : 1 };
     });
   },
   'vm.clone': (p) => {

@@ -17,10 +17,10 @@
 //!   `disk_add`, `disk_grow`, `snapshot` (of a disk of the VM's that is a
 //!   volume of NBS's, as `nbs volume snapshot` takes one: a running guest's
 //!   session paused for it);
-//! - jobs: `start`, `stop`, `restart`, `create` (a cloud's image by its URL,
-//!   or an image of NBS's -- an image or a snapshot -- by its name: the
-//!   user-data of the caller's own if given -- a job, which only an
-//!   admin starts -- a port of the switch of its own, nos's ports forwarded,
+//! - jobs: `start`, `stop`, `restart`, `create` (a Linux or prepared Windows
+//!   image by its URL, or an image of NBS's -- an image or a snapshot -- by
+//!   its name: Linux's user-data of the caller's own if given -- a job, which
+//!   only an admin starts -- a port of the switch of its own, nos's ports forwarded,
 //!   `protected`, and started once made, as the call asks), `clone`,
 //!   `delete`, `image` (an image of NBS's made of a URL's or a file's, as
 //!   `hv image` makes one), `migrate` (a running VM moved to another host of
@@ -1513,6 +1513,12 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
             i => cloud::Source::Image(i),
         },
     };
+    let windows = match p.opt_str("os", 7) {
+        Ok(None | Some("linux")) => false,
+        Ok(Some("windows")) => true,
+        Ok(Some(_)) => return refuse(call, Status::Invalid, "is \"linux\" or \"windows\"", Some("os")),
+        Err(e) => return invalid(call, e),
+    };
     let fields = (|| -> Result<_, Invalid> {
         let size = p.opt_uint("size_bytes", 1, u64::MAX)?;
         let mem = p.opt_uint("memory_mib", 64, u64::MAX)?;
@@ -1574,6 +1580,11 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
         return refuse(call, Status::Invalid, "is given in the user-data, when the call gives user-data of its own",
                       Some("password"));
     }
+    if windows && (password.is_some() || user_data.is_some()) {
+        return refuse(call, Status::Invalid,
+                      "is cloud-init's: a Windows image must already contain its users and remote access",
+                      if password.is_some() { Some("password") } else { Some("user_data") });
+    }
     if store::folder_of(&state.vms_root, name).is_ok() {
         return refuse(call, Status::Conflict, &alloc::format!("{} is there already", name), Some("name"));
     }
@@ -1599,7 +1610,8 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
         forwards,
         ..Options::default()
     };
-    let recipe = cloud::Recipe { source, size, onto, force, password, hvboot: cloud::HVBOOT, user_data, protected };
+    let recipe = cloud::Recipe { source, windows, size, onto, force, password, hvboot: cloud::HVBOOT, user_data,
+                                 protected };
     let mut job = Job::new(call, &state.unloading);
     let created = cloud::create(&state.vms_root, &state.vms, name, &recipe, o, &mut job);
     /* Started once it is made, when asked: by the same job, its reservation

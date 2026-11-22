@@ -50,6 +50,7 @@ function roomOf(n: NumaNode): number {
 export function CreateVm({ host, locale, w, image: given }: { host: string; locale: string; w: Words; image?: string }) {
   const ru = locale === 'ru';
   const [name, setName] = useState('');
+  const [os, setOs] = useState<'linux' | 'windows'>('linux');
   /* An image or a snapshot named in the address -- its row's "Create a VM"
    * -- is the one picked */
   const [source, setSource] = useState<'url' | 'image'>(given ? 'image' : 'url');
@@ -127,8 +128,17 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
     setSource(s);
     setOnto('');
     setForce(false);
-    setDisk(s === 'url' ? '20' : '');
+    setDisk(s === 'url' ? (os === 'windows' ? '64' : '20') : '');
     if (s === 'image' && !image && images.length) setImage(images[0]!.name);
+  }
+
+  function pickOs(next: 'linux' | 'windows') {
+    setOs(next);
+    setUrl(next === 'linux' ? IMAGES[0]!.url : '');
+    setDisk(next === 'windows' ? '64' : '20');
+    setMem(next === 'windows' ? '4096' : '1024');
+    setCpus(next === 'windows' ? '2' : '1');
+    setPassword('');
   }
 
   async function submit(e: React.FormEvent) {
@@ -138,7 +148,7 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
         'A name: a letter or a digit, then letters, digits, . _ and -, at most 32.');
       return;
     }
-    const params: Record<string, unknown> = { name, memory_mib: Number(mem), cpus: Number(cpus) };
+    const params: Record<string, unknown> = { name, os, memory_mib: Number(mem), cpus: Number(cpus) };
     if (source === 'image') {
       if (!picked) {
         setError(ru ? 'Выберите образ NBS.' : 'Pick an image of NBS\'s.');
@@ -187,6 +197,20 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
         <label className="block text-sm text-fg-soft">{w.name}
           <input value={name} onChange={(e) => setName(e.target.value)} name="name" className={input} />
         </label>
+        <label className="block text-sm text-fg-soft">{ru ? 'Операционная система' : 'Guest operating system'}
+          <select value={os} onChange={(e) => pickOs(e.target.value as 'linux' | 'windows')} name="os"
+            data-testid="guest-os" className={input}>
+            <option value="linux">Linux</option>
+            <option value="windows">Windows</option>
+          </select>
+          <span className="block text-xs text-muted">
+            {os === 'linux'
+              ? (ru ? 'Образ cloud-init: nos добавит seed с ключами и, если задан, паролем.'
+                : 'A cloud-init image: nos adds its seed with keys and, if given, a password.')
+              : (ru ? 'Подготовленный UEFI-образ raw/qcow2 с virtio-blk/net, пользователем и RDP. Нужны CloudHv и Hyper-V; cloud-init seed не добавляется.'
+                : 'A prepared UEFI raw/qcow2 image with virtio-blk/net, its user and RDP. CloudHv and Hyper-V are selected; no cloud-init seed is added.')}
+          </span>
+        </label>
         {volumes !== null && (
           <fieldset className="flex gap-4 text-sm text-fg-soft" data-testid="source">
             <legend className="sr-only">{ru ? 'Из чего диск' : 'Its disk made of'}</legend>
@@ -203,12 +227,15 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
         {source === 'url' ? (
           <>
             <label className="block text-sm text-fg-soft">{w.imageUrl}
-              <select value={IMAGES.some((i) => i.url === url) ? url : ''} onChange={(e) => e.target.value && setUrl(e.target.value)}
-                className={input}>
-                {IMAGES.map((i) => <option key={i.url} value={i.url}>{i.label}</option>)}
-                <option value="">…</option>
-              </select>
-              <input value={url} onChange={(e) => setUrl(e.target.value)} name="url" className={input + ' font-mono text-xs'} />
+              {os === 'linux' && (
+                <select value={IMAGES.some((i) => i.url === url) ? url : ''} onChange={(e) => e.target.value && setUrl(e.target.value)}
+                  className={input}>
+                  {IMAGES.map((i) => <option key={i.url} value={i.url}>{i.label}</option>)}
+                  <option value="">…</option>
+                </select>
+              )}
+              <input value={url} onChange={(e) => setUrl(e.target.value)} name="url"
+                placeholder={os === 'windows' ? 'https://example/windows-server.raw' : ''} className={input + ' font-mono text-xs'} />
             </label>
             <label className="block text-sm text-fg-soft">{ru ? 'Где диск' : 'Its disk'}
               <select value={onto} onChange={(e) => { setOnto(e.target.value); setForce(false); }} name="onto" className={input}>
@@ -312,14 +339,16 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
             </select>
           </label>
         )}
-        <label className="block text-sm text-fg-soft">
-          {ru ? 'Пароль пользователя образа (необязательно)' : "Password of the image's user (optional)"}
-          <span className="block text-xs text-muted">
-            {ru ? 'cloud-init задаёт его пользователю образа по умолчанию: ubuntu, debian, alpine…; root остаётся закрыт.'
-              : "cloud-init gives it to the image's default user: ubuntu, debian, alpine…; root stays locked."}
-          </span>
-          <input value={password} onChange={(e) => setPassword(e.target.value)} type="password" name="password" className={input} />
-        </label>
+        {os === 'linux' && (
+          <label className="block text-sm text-fg-soft">
+            {ru ? 'Пароль пользователя образа (необязательно)' : "Password of the image's user (optional)"}
+            <span className="block text-xs text-muted">
+              {ru ? 'cloud-init задаёт его пользователю образа по умолчанию: ubuntu, debian, alpine…; root остаётся закрыт.'
+                : "cloud-init gives it to the image's default user: ubuntu, debian, alpine…; root stays locked."}
+            </span>
+            <input value={password} onChange={(e) => setPassword(e.target.value)} type="password" name="password" className={input} />
+          </label>
+        )}
         {networks.length > 0 && (
           <label className="block text-sm text-fg-soft">{ru ? 'Сеть' : 'Network'}
             <span className="block text-xs text-muted">

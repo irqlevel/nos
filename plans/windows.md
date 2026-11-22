@@ -92,6 +92,14 @@ worked again, and the restored guest powered itself off normally. The UEFI
 Hyper-V save/restore gate also passes on the second stand's Ryzen 5 3600 with
 `accelerator: KVM, the host's AMD-V`, as well as under TCG.
 
+The create path is available without hand-writing vm.toml too: `hv create
+<name> <url> windows`, the vm provider's `"os": "windows"`, and the panel's
+Guest OS choice all select CloudHv with Hyper-V and omit the cloud-init seed.
+The same qcow2/raw download, conversion and optional create-and-start job as
+Linux is used. Windows defaults are two vCPUs and 4096 MiB; the panel also
+starts with a 64 GiB disk. The image must already contain its UEFI boot,
+virtio drivers and users/remote access. VHD/VHDX conversion is still W3.
+
 ## Firmware facts that drive the design
 
 - `CLOUDHV.fd` is a 4 MiB PVH ELF with one `PT_LOAD` at 1 MiB and its entry

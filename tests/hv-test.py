@@ -152,7 +152,7 @@ def create_script(port):
     file that is no image and a size= under the image's refused, each
     leaving nothing; and an image of NBS's made, and a VM of one, on a host
     with no NBS: refused, leaving nothing (N10d3). Last, a small raw image
-    made a firmware Hyper-V VM: its loader must be CloudHv, not hvboot."""
+    made a Windows VM: CloudHv with Hyper-V, Windows' defaults and no seed."""
     url = "http://10.0.2.2:%d/" % port
     return [
         "hv create c1 %simg.qcow2 size=16M mem=512 password=nos port=3" % url,
@@ -171,8 +171,9 @@ def create_script(port):
         "hv create c7 image=nbs:i1",
         "ls /vms",
     ] + CLONE + [
-        "hv create fwcloud %sraw.img firmware hyperv" % url,
+        "hv create fwcloud %sraw.img windows" % url,
         "cat /vms/fwcloud/vm.toml",
+        "ls /vms/fwcloud",
         "hv delete fwcloud",
     ]
 
@@ -620,10 +621,14 @@ def create_checks(out, grown, raw):
              "c7" not in out[14] and ".image-" not in out[14], out[14])
     clone_checks(out[15:], grown)
     fw = out[15 + len(CLONE):]
-    pt.check("a cloud image made a firmware Hyper-V VM with CloudHv, not hvboot, as its loader",
-             len(fw) == 3 and "boots it: CloudHv" in fw[0]
-             and all(w in fw[1] for w in ('kernel = "/lib/CLOUDHV.fd"', "firmware = true", "hyperv = true"))
-             and "deleted" in fw[2], "\n".join(fw))
+    pt.check("a raw image made a Windows VM: CloudHv with Hyper-V, its defaults, one disk and no cloud-init files",
+             len(fw) == 4 and "boots it: CloudHv with Hyper-V" in fw[0] and "no cloud-init seed" in fw[0]
+             and all(w in fw[1] for w in ('kernel = "/lib/CLOUDHV.fd"', "firmware = true", "hyperv = true",
+                                          "memory = 4096", "cpus = 2", 'disks = ["disk.raw"]'))
+             and "seed.iso" not in fw[1]
+             and all(w in fw[2] for w in ("disk.raw", "vm.toml"))
+             and all(w not in fw[2] for w in ("seed.iso", "user-data"))
+             and "deleted" in fw[3], "\n".join(fw))
 
 
 def clone_checks(out, grown):

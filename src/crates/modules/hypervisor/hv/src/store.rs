@@ -66,9 +66,9 @@ pub(crate) const CREATE_USAGE: &str = "hv create <name> <kernel> [firmware] [hyp
                             [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [pci=bus:dev.fn]... [unsafe_interrupts] \
                             [input=...] [log] [restart] [net] [port=N] [forward=nos:guest]... [force] \
                             [cmdline=...]\n\
-                            hv create <name> <http(s)://image> [size=N[K|M|G|T] | onto=<device|nbs:volume>] [password=...] \
+                            hv create <name> <http(s)://image> [windows] [size=N[K|M|G|T] | onto=<device|nbs:volume>] [password=...] \
                             [hvboot=path] [force] [the words hv start takes, but a kernel and initrd=]\n\
-                            hv create <name> image=nbs:<image> [size=N[K|M|G|T]] [onto=nbs:<volume>] [password=...] \
+                            hv create <name> image=nbs:<image> [windows] [size=N[K|M|G|T]] [onto=nbs:<volume>] [password=...] \
                             [hvboot=path] [the words hv start takes, but a kernel and initrd=]\n\
                             a device is a partition or a whole disk of nos's: dev:<name>, part:<id> or disk:<id> \
                             (hv devices); force gives one over what is on it";

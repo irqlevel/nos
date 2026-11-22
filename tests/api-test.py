@@ -42,8 +42,9 @@ says so and powers the guest off -- started as a job, found stopped, its
 console read and streamed, a reader's typing at it refused, an admin's
 refused for a VM that does not run, and stopped; a VM made of an image the
 test serves, cloned, the clone deleted; a protected VM's delete refused
-without force; and a create of an image served slowly cancelled midway,
-nothing of it left behind. Its fw provider, the host's firewalls (fw_checks):
+without force; a Windows image downloaded and started by one job, CloudHv
+with Hyper-V in its vm.toml and no cloud-init disk; and a create of an image
+served slowly cancelled midway, nothing of it left behind. Its fw provider, the host's firewalls (fw_checks):
 listed to a reader, default among them, a change refused it; one made, a rule
 added and one hv would not take refused by its field, a VM put on it -- its
 vm.toml, its row -- the firewall then refused its delete for the VM naming
@@ -127,6 +128,8 @@ SLOW_CHUNK = 64 * 1024
 SLOW_PAUSE = 0.05
 # hvboot, as `make hvboot` builds it: the kernel of the VM the test starts.
 HVBOOT = os.path.join(ROOT, "out", "x86_64", "hvboot")
+# CloudHv, the firmware the Windows create starts.
+CLOUDHV = os.path.join(ROOT, "build", "image", "CLOUDHV.fd")
 # What /etc/rc does for the vm checks: hv loaded and on, and a VM of hvboot.
 VM_RC = "insmod /hv.ko\nhv on\nhv create t1 /lib/hvboot mem=64\n"
 # The management panel's VM: the highest port of the switch, its address,
@@ -152,6 +155,7 @@ def rootfs(tmp, arch, k, rc, panel=None):
         shutil.copy(pt.module_path(arch, "hv"), rootdir)
         os.makedirs(os.path.join(rootdir, "lib"))
         shutil.copy(HVBOOT, os.path.join(rootdir, "lib", "hvboot"))
+        shutil.copy(CLOUDHV, os.path.join(rootdir, "lib", "CLOUDHV.fd"))
     with open(os.path.join(rootdir, "etc", "api", "api.toml"), "w") as f:
         f.write("# api-test.py\nport = %d\nlisten = [\"eth0\"]\nidle_secs = %d\nmax_connections = %d\n"
                 "max_per_key = %d\nmax_handshakes = 2\n" % (PORT, IDLE_SECS, MAX_CONNECTIONS, MAX_PER_KEY))
@@ -726,6 +730,33 @@ def vm_checks(k, pin, port):
              (started, rec))
     started, rec = vm_job(a, "delete", {"name": "c1", "force": True})
     pt.check("and done with it", rec is not None and rec.get("status") == "ok", (started, rec))
+
+    started, rec = vm_job(a, "create", {"name": "win1", "os": "vms", "url": url + "raw.img"})
+    pt.check("a guest OS other than linux or windows is refused before a download", rec is not None
+             and rec.get("status") == "invalid" and rec.get("result", {}).get("error", {}).get("field") == "os"
+             and not any(n.get("text", "").startswith("download:") for n in rec.get("notes", [])), (started, rec))
+    started, rec = vm_job(a, "create", {"name": "win1", "os": "windows", "url": url + "raw.img",
+                                       "password": "not-cloud-init"})
+    pt.check("Windows takes no cloud-init password", rec is not None and rec.get("status") == "invalid"
+             and rec.get("result", {}).get("error", {}).get("field") == "password"
+             and not any(n.get("text", "").startswith("download:") for n in rec.get("notes", [])), (started, rec))
+    started, rec = vm_job(a, "create", {"name": "win1", "os": "windows", "url": url + "raw.img",
+                                       "memory_mib": 64, "cpus": 1, "start": True})
+    pt.check("a Windows image downloaded and started by the same API job", rec is not None
+             and rec.get("status") == "ok" and isinstance(rec.get("result", {}).get("id"), int)
+             and rec.get("result", {}).get("keys") == 0, (started, rec))
+    s, _, configured = a.request("POST", "/v1/call/vm/config_get", {"name": "win1"})
+    text = configured.get("text", "")
+    pt.check("its vm.toml: CloudHv with Hyper-V, its disk alone, no seed",
+             s == 200 and all(w in text for w in ('kernel = "/lib/CLOUDHV.fd"', "firmware = true", "hyperv = true",
+                                                  'disks = ["disk.raw"]')) and "seed.iso" not in text, (s, configured))
+    s, got = vm_get(a, "win1")
+    pt.check("and the API lists no cloud-init disk for it", s == 200
+             and [d.get("file") for d in got.get("disks", [])] == ["disk.raw"], (s, got))
+    started, rec = vm_job(a, "stop", {"name": "win1", "secs": 0})
+    pt.check("the Windows VM stopped", rec is not None and rec.get("status") == "ok", (started, rec))
+    started, rec = vm_job(a, "delete", {"name": "win1"})
+    pt.check("and deleted", rec is not None and rec.get("status") == "ok", (started, rec))
 
     s, _, body = a.request("POST", "/v1/jobs/vm/create", {"name": "c3", "url": url + "slow.img"})
     job = body.get("id") if s == 202 else None

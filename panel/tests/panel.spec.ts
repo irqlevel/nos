@@ -259,6 +259,33 @@ test('VMs: listed, created as a job, cloned, deleted with a confirm', async ({ p
   await expect(page.getByTestId('resource-vms')).not.toContainText('pw2');
 });
 
+test('a Windows VM: the same image URL job, CloudHv with Hyper-V and no cloud-init seed', async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/vms/new`);
+  await page.getByTestId('guest-os').selectOption('windows');
+  await expect(page.locator('input[name=url]')).toHaveValue('');
+  await expect(page.locator('input[name=disk]')).toHaveValue('64');
+  await expect(page.locator('input[name=memory]')).toHaveValue('4096');
+  await expect(page.locator('input[name=cpus]')).toHaveValue('2');
+  await expect(page.locator('input[name=password]')).toHaveCount(0);
+  await page.fill('input[name=name]', 'win1');
+  await page.fill('input[name=url]', 'https://images.example/windows-server-2022.raw');
+  await page.getByRole('button', { name: 'Create' }).click();
+  await expect(page.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+
+  await page.goto(`/en/h/${host}/vms/win1`);
+  await page.getByRole('tab', { name: 'Configuration' }).click();
+  await expect(page.getByTestId('config')).toHaveValue(/kernel = "\/lib\/CLOUDHV\.fd"/);
+  await expect(page.getByTestId('config')).toHaveValue(/firmware = true/);
+  await expect(page.getByTestId('config')).toHaveValue(/hyperv = true/);
+  await expect(page.getByTestId('config')).toHaveValue(/memory = 4096/);
+  await expect(page.getByTestId('config')).toHaveValue(/cpus = 2/);
+  await expect(page.getByTestId('config')).not.toHaveValue(/seed\.iso/);
+  await page.getByRole('tab', { name: 'Disks' }).click();
+  await expect(page.getByTestId('vm-disks')).toContainText('disk.raw');
+  await expect(page.getByTestId('vm-disks')).not.toContainText('seed.iso');
+});
+
 test('a VM made onto a device: its disk the device, one with something on it given only with force', async ({ page }) => {
   const host = await login(page);
   await page.goto(`/en/h/${host}/vms/new`);

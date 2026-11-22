@@ -1,36 +1,31 @@
-//! `hv create <name> <url> [words]`: a VM made of a cloud's image -- what
-//! Ubuntu, Debian and Fedora ship, qcow2 or raw -- in a folder of its own,
-//! for `hv start <name>` to boot:
+//! `hv create <name> <url> [words]`: a VM made of an image, qcow2 or raw,
+//! in a folder of its own, for `hv start <name>` to boot:
 //!
 //! - the image downloaded into the folder by the kernel's own HTTP client
 //!   (`kcore::http`: TLS, and the window a download of gigabytes wants),
 //!   made the VM's raw disk (`image::convert`) -- or taken as it is, a raw
-//!   one -- and grown to `size=`, for the guest to grow its root into
-//!   (cloud-init's growpart does);
-//! - cloud-init's NoCloud seed beside it, an ISO 9660 labelled cidata
-//!   (`diskimage::iso`): its meta-data naming the machine, its user-data
-//!   giving the image's own user the keys nos's sshd lets in
+//!   one -- and grown to `size=`;
+//! - for Linux, cloud-init's NoCloud seed beside it, an ISO 9660 labelled
+//!   cidata (`diskimage::iso`): its meta-data naming the machine, its
+//!   user-data giving the image's own user the keys nos's sshd lets in
 //!   (/etc/ssh/authorized_keys) -- and with `password=` a password, for its
 //!   console -- or, given by the host API's caller, user-data of its own.
-//!   The user-data says nothing of the machine -- the meta-data names it --
-//!   and is kept in the folder as `user-data`, for a clone of the VM to give
-//!   its own first boot as it is (`clone`);
-//! - and its vm.toml, written last: hvboot as its kernel -- which boots the
-//!   one its own disk's GRUB would -- the disk its first disk and the seed
-//!   its second, read-only; on the switch, booted again when it reboots
-//!   itself, and a GiB of memory unless told.
+//!   The user-data is kept in the folder as `user-data`, for a clone's seed;
+//! - and its vm.toml, written last: hvboot for Linux, or CloudHv with
+//!   Hyper-V for `windows`; the downloaded disk first and Linux's seed
+//!   second, read-only; on the switch, booted again when it reboots itself.
 //!
-//! The words after the URL are `hv start`'s but a kernel and an initrd --
-//! hvboot is the kernel -- and its own three: `size=` (K, M, G or T),
-//! `password=`, and `hvboot=`, where hvboot is: /lib/hvboot, the system
-//! image's, unless told. The host API's create gives the same as a job's
-//! parameters (`provider`). The name is held while the folder is made, so
-//! no VM of it starts and nothing else is done to it meanwhile -- and what
-//! it is given meanwhile, a port of the switch, a device, no other VM is;
-//! the files it makes are looked for before anything is fetched, and one
-//! there refuses it. What fails, or is stopped, leaves nothing behind: what
-//! this made goes, the folder too when this made it -- and what could not
-//! be taken away is said. The image's URL is said without a user's name and
+//! The words after the URL are `hv start`'s but a kernel and an initrd, and
+//! its own: `size=` (K, M, G or T), `password=`, `hvboot=`, and `windows`.
+//! A Windows image must already boot by UEFI and contain its virtio drivers
+//! and users: it gets no cloud-init seed. The host API's `os: "windows"`
+//! selects the same path. The name is held while the folder is made, so no
+//! VM of it starts and nothing else is done to it meanwhile -- and what it
+//! is given meanwhile, a port of the switch, a device, no other VM is; the
+//! files it makes are looked for before anything is fetched, and one there
+//! refuses it. What fails, or is stopped, leaves nothing behind: what this
+//! made goes, the folder too when this made it -- and what could not be
+//! taken away is said. The image's URL is said without a user's name and
 //! password, a query or a fragment: a job's log is every reader's.
 //!
 //! Or `hv create <name> image=nbs:<image> [words]` (N10d3): an image of
@@ -70,6 +65,9 @@ const MAX_IMAGE_NAME: usize = 64;
 /// A cloud image's memory unless told: what Ubuntu's and Debian's boot to
 /// their prompt and run cloud-init in.
 const DEFAULT_MEM_MIB: u64 = 1024;
+/// Windows' defaults: its two-CPU requirement and Cloud Hypervisor's 4 GiB.
+const DEFAULT_WINDOWS_MEM_MIB: u64 = 4096;
+const DEFAULT_WINDOWS_CPUS: u32 = 2;
 /// The keys nos's sshd lets in, given to the guest's user.
 const AUTHORIZED_KEYS: &str = "/etc/ssh/authorized_keys";
 const MAX_KEYS_BYTES: usize = 64 * 1024;
@@ -132,6 +130,8 @@ pub fn is_image(word: &str) -> bool {
 /// nos's, which only the host API gives.
 pub struct Recipe<'a> {
     pub source: Source<'a>,
+    /// CloudHv with Hyper-V and no cloud-init seed, for a prepared Windows disk.
+    pub windows: bool,
     pub size: Option<u64>,
     /// A device of nos's the image is poured onto (`image::pour`) in place
     /// of a disk in the folder: its id or name (`devices::given`) -- given
@@ -175,8 +175,8 @@ pub fn command(root: &str, vms: &Vms, name: &str, from: &str, words: &str, force
     };
     let made = own_words(words).and_then(|(own, rest)| {
         let o = guest::words(&alloc::format!("{} {}", own.hvboot, rest), store::CREATE_USAGE)?;
-        let recipe = Recipe { source, size: own.size, onto: own.onto, force, password: own.password,
-                              hvboot: own.hvboot, user_data: None, protected: false };
+        let recipe = Recipe { source, windows: own.windows, size: own.size, onto: own.onto, force,
+                              password: own.password, hvboot: own.hvboot, user_data: None, protected: false };
         create(root, vms, name, &recipe, o, work)
     });
     if let Err(e) = made {
@@ -269,6 +269,7 @@ impl Drop for Made {
 /// The words of this form's own, taken out of the rest -- up to `cmdline=`,
 /// whose words are the guest's.
 struct Own<'a> {
+    windows: bool,
     size: Option<u64>,
     onto: Option<&'a str>,
     password: Option<&'a str>,
@@ -276,7 +277,7 @@ struct Own<'a> {
 }
 
 fn own_words<'a>(words: &'a str) -> Result<(Own<'a>, String), String> {
-    let mut own = Own { size: None, onto: None, password: None, hvboot: HVBOOT };
+    let mut own = Own { windows: false, size: None, onto: None, password: None, hvboot: HVBOOT };
     let mut rest = String::new();
     let mut tail = words.trim_start();
     while !tail.is_empty() {
@@ -287,7 +288,9 @@ fn own_words<'a>(words: &'a str) -> Result<(Own<'a>, String), String> {
         let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
         let word = &tail[..end];
         tail = tail[end..].trim_start();
-        if let Some(v) = word.strip_prefix("size=") {
+        if word == "windows" {
+            own.windows = true;
+        } else if let Some(v) = word.strip_prefix("size=") {
             own.size = Some(bytes(v).ok_or_else(|| String::from("size= wants a number of bytes, K, M, G or T after it"))?);
         } else if let Some(v) = word.strip_prefix("password=") {
             if v.is_empty() || v.len() > MAX_PASSWORD {
@@ -438,8 +441,8 @@ pub fn seed(name: &str, user_data: &str) -> Result<Vec<u8>, String> {
 
 /// A VM made of a cloud's image, `<root>/<name>`, as `recipe` says, with
 /// `o` -- `hv start`'s words, or the host API's parameters -- for its
-/// vm.toml: hvboot its kernel, the disk and the seed its first two disks.
-/// Its lines, its progress and whether to stop are `work`'s; what it came
+/// vm.toml: its loader and disk, with Linux's seed second. Its lines, its
+/// progress and whether to stop are `work`'s; what it came
 /// to is the hypervisor's log's too, a shell's or the host API's.
 pub fn create(root: &str, vms: &Vms, name: &str, recipe: &Recipe, o: Options, work: &mut dyn Work)
               -> Result<Created, String> {
@@ -468,6 +471,13 @@ fn make(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options, work
     if o.secs.is_some() {
         return Err(String::from("secs= is hv boot's -- a vm runs until hv stop"));
     }
+    if recipe.windows && (recipe.password.is_some() || recipe.user_data.is_some()) {
+        return Err(String::from("password= and user-data are cloud-init's: a Windows image must already contain its \
+                                 users and remote access; it gets no seed"));
+    }
+    if recipe.windows && recipe.hvboot != HVBOOT {
+        return Err(String::from("hvboot= is Linux's: Windows boots CloudHv"));
+    }
     if recipe.user_data.is_some_and(|u| u.len() > MAX_USER_DATA) {
         return Err(alloc::format!("its user-data is more than {} bytes", MAX_USER_DATA));
     }
@@ -482,8 +492,13 @@ fn make(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options, work
         return Err(String::from("size= is a file's: a device's disk is the device's size, a volume's the \
                                  volume's"));
     }
+    if recipe.windows {
+        o.firmware = true;
+        o.hyperv = true;
+        o.cpus = o.cpus.or(Some(DEFAULT_WINDOWS_CPUS));
+    }
     o.kernel = String::from(if o.firmware { crate::config::CLOUDHV } else { recipe.hvboot });
-    o.mem_mib = o.mem_mib.or(Some(DEFAULT_MEM_MIB));
+    o.mem_mib = o.mem_mib.or(Some(if recipe.windows { DEFAULT_WINDOWS_MEM_MIB } else { DEFAULT_MEM_MIB }));
     o.net = true;
     o.restart = true;
     o.uuid = o.uuid.or_else(|| Some(crate::guest::random_uuid()));
@@ -501,7 +516,8 @@ fn make(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options, work
      * the create that wrote it at the end of a download of gigabytes, every
      * time. */
     let disk_file = (recipe.onto.is_none() && matches!(recipe.source, Source::Url(_))).then_some(DISK);
-    for f in [disk_file, Some(SEED), Some(USER_DATA)].into_iter().flatten() {
+    let seed_files = if recipe.windows { [None, None] } else { [Some(SEED), Some(USER_DATA)] };
+    for f in [disk_file, seed_files[0], seed_files[1]].into_iter().flatten() {
         let there = store::join(&folder.path, f).ok_or_else(|| String::from("out of memory"))?;
         if kcore::fs::size(&there).is_ok() {
             return Err(alloc::format!("{} is there already -- not written over: take it away, or make the vm with \
@@ -549,7 +565,9 @@ fn make(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options, work
         }
     }
     o.disks.push((onto.as_ref().map_or_else(|| String::from(DISK), |(_, id)| id.clone()), false));
-    o.disks.push((String::from(SEED), true));
+    if !recipe.windows {
+        o.disks.push((String::from(SEED), true));
+    }
     o.disks.extend(theirs);
     /* `address=` is the port's on a network of the cluster's, made below:
      * carried out once and never in the vm.toml -- as `hv create <name>
@@ -619,7 +637,7 @@ enum Onto<'a> {
 
 /// The folder's files, each kept in `made` as it is: the image, the disk
 /// made of it -- or poured onto the device or the volume `onto`, or an
-/// image of NBS's cloned into one -- the user-data and the seed, and last
+/// image of NBS's cloned into one -- Linux's user-data and seed, and last
 /// the vm.toml.
 fn fill(folder: &Folder, recipe: &Recipe, onto: Option<Onto<'_>>, text: &str, file: &str, firmware: bool,
         made: &mut Made, work: &mut dyn Work) -> Result<Created, String> {
@@ -770,28 +788,33 @@ fn file_disk(download: &str, disk: &str, size: Option<u64>, made: &mut Made, wor
     grow(&disk, size)
 }
 
-/// The user-data, the seed and the vm.toml written, each kept in `made`:
-/// what was made, the disk's `size` said.
+/// Linux's user-data and seed, or nothing of cloud-init's for Windows, then
+/// the vm.toml, each kept in `made`: what was made, the disk's `size` said.
 #[allow(clippy::too_many_arguments)]
 fn finish(folder: &Folder, recipe: &Recipe, text: &str, file: &str, user_path: &str, seed_path: &str, size: u64,
           firmware: bool, made: &mut Made, work: &mut dyn Work) -> Result<Created, String> {
     let (user_path, seed_path) = (String::from(user_path), String::from(seed_path));
     let loader = if firmware { "CloudHv" } else { "hvboot" };
-    let keys = keys();
-    let user = match recipe.user_data {
-        Some(u) => String::from(u),
-        None => user_data(&keys, recipe.password),
-    };
-    kcore::fs::create(&user_path, user.as_bytes())
-        .map_err(|e| alloc::format!("{} could not be written -- {}", user_path, e))?;
-    made.files.push(user_path);
-    let seed = seed(&folder.name, &user)?;
-    kcore::fs::create(&seed_path, &seed).map_err(|e| alloc::format!("{} could not be written -- {}", seed_path, e))?;
-    made.files.push(seed_path);
+    let keys = if recipe.windows { Vec::new() } else { keys() };
+    if !recipe.windows {
+        let user = match recipe.user_data {
+            Some(u) => String::from(u),
+            None => user_data(&keys, recipe.password),
+        };
+        kcore::fs::create(&user_path, user.as_bytes())
+            .map_err(|e| alloc::format!("{} could not be written -- {}", user_path, e))?;
+        made.files.push(user_path);
+        let seed = seed(&folder.name, &user)?;
+        kcore::fs::create(&seed_path, &seed).map_err(|e| alloc::format!("{} could not be written -- {}", seed_path, e))?;
+        made.files.push(seed_path);
+    }
     kcore::fs::create(file, text.as_bytes()).map_err(|e| alloc::format!("{} could not be written -- {}", file, e))?;
     made.files.push(String::from(file));
 
-    if recipe.user_data.is_some() {
+    if recipe.windows {
+        let _ = writeln!(work, "hv: {} written -- hv start {} boots it: {} with Hyper-V, a {} MiB disk, no cloud-init \
+                                seed", file, folder.name, loader, size.div_ceil(MIB));
+    } else if recipe.user_data.is_some() {
         let _ = writeln!(work, "hv: {} written -- hv start {} boots it: {}, a {} MiB disk, cloud-init given the \
                                 user-data it was asked to", file, folder.name, loader, size.div_ceil(MIB));
     } else {
@@ -803,7 +826,8 @@ fn finish(folder: &Folder, recipe: &Recipe, text: &str, file: &str, user_path: &
             let _ = writeln!(work, "hv: no key in {} and no password= -- nobody can log in to it", AUTHORIZED_KEYS);
         }
     }
-    Ok(Created { file: String::from(file), disk_bytes: size, keys: if recipe.user_data.is_some() { 0 } else { keys.len() } })
+    Ok(Created { file: String::from(file), disk_bytes: size,
+                 keys: if recipe.windows || recipe.user_data.is_some() { 0 } else { keys.len() } })
 }
 
 /// The disk grown to `size`, when given: never shrunk under what the image
