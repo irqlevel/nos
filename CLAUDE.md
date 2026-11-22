@@ -16,6 +16,11 @@ Reference, by what you are about to do (`docs/README.md` is the index):
 - how a subsystem works: `docs/boot.md`, `docs/paging.md`, `docs/numa.md`, `docs/scheduler.md`, `docs/interrupts.md`, `docs/profiler.md`, `docs/tracing.md`, `docs/random.md`, `docs/filesystems.md`, `docs/logs.md`, `docs/tls.md`, `docs/sshd.md`, `docs/netblk.md`, `docs/cluster.md`, `docs/hypervisor.md`
 - the real machines, and what is different about each: `docs/real-hardware.md`; nos onto a new server from a release's system image: `docs/install.md`
 
+## A worktree for every task
+
+- **Make every new feature or change in a separate Git worktree and task branch.** Do not edit directly in the main or another shared checkout, even for a small change or documentation: agent sessions may run concurrently and must not overwrite, stage or commit each other's work. Create the worktree from the requested base, or from current `master` when no base is given, and keep the whole task there, including its builds and tests.
+- **Keep the task's changes isolated.** Before staging or committing, inspect both the working tree and the staged diff. Leave anything outside the task alone: never revert, clean, stage or commit another session's changes. Merge the task branch into `master` only when asked.
+
 ## CodeGraph
 
 - **Use CodeGraph to index the source and navigate code relationships.** At the start of a task run `codegraph sync .`, or `codegraph init -y .` when the checkout has no index, and sync again after changing files. Use `codegraph context` or `codegraph explore` to find task-relevant code, and `codegraph query`, `node`, `callers`, `callees` or `impact` for symbols, callers, callees, dependencies and change impact. When code relationships matter, use these rather than relying on textual search alone.
