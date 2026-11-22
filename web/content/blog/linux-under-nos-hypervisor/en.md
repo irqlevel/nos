@@ -86,7 +86,7 @@ ACPI arrived on 29 September. Its DSDT must describe the PCI host bridge, becaus
 
 ```text
 $ hv stop 0 secs=300
-hv: vm 0 stopped -- the guest powered itself off, S5 by its ACPI PM1 control register, at 0xffffffff8f1d5ae3
+hv: vm 0 stopped -- the guest powered itself off, S5 by its ACPI sleep control register, at 0xffffffff8f1d5ae3
 ```
 
 MMIO arrived the same day ([57c9826](https://github.com/irqlevel/nos/commit/57c9826d14753aff0d9bb0d1a7b1ce9f2e726e65)). When a guest's access to device memory faults, the hypervisor fetches the faulting instruction through the guest's own page tables, decodes it and performs it. The decoder knows only the `mov` forms that Linux's MMIO accessors use. It was checked against clang's encodings of 1,054 instructions and against two million random byte strings. The xAPIC page was the first device on this path, and an IO-APIC the second ([86a1721](https://github.com/irqlevel/nos/commit/86a1721359228cad00d174cf8aeb36f9c132d9fa)).

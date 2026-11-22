@@ -403,8 +403,13 @@ The differences that are not hidden by the shadow at all:
   AMD-V's VMCB is checked in software first (`Vcpu::check`) so a bad one is
   named before the CPU sees it; VMX has no such check -- a bad guest state is
   the CPU's to refuse, at `vmlaunch`, reported as an entry failure and shown
-  as `Exit::Invalid` with the instruction error. An event an exit interrupted
-  the delivery of is given back rebuilt from its vector, type and error code,
+  as `Exit::Invalid` with the instruction error. Both an outright VMfail and
+  a VM-entry failure exit keep the VMCS's entry/exit/pin/processor controls,
+  their invalid bits against the CPU's capability MSRs, the MSR-load fields,
+  VTPR/TPR threshold and the entry MSRs in the stopped vCPU's dump. The
+  snapshot is taken before VMCLEAR, so it survives the failed VMCS becoming
+  non-current; the `refused` guest checks that the dump contains it. An event
+  an exit interrupted the delivery of is given back rebuilt from its vector, type and error code,
   not copied: bit 12 of what the exit wrote is undefined, and the entry field
   wants bits 30:12 clear.
 - **VPIDs, and INVEPT and INVVPID once per CPU a guest runs on.** A VPID is
@@ -528,13 +533,13 @@ What the VMX backend does not do yet, and says so rather than pretends:
     hv off [cpu|all]            turn it off
     hv run <guest|all> [cpu]    run a built-in guest, or all of them, on a
                                 task of its own -- bound to cpu, or to one
-    hv boot <kernel> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
+    hv boot <kernel> [firmware] [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
                                 load a Linux bzImage -- or a PVH ELF, such as
                                 hvboot, which boots the guest's own kernel
                                 -- and run it on a vCPU -- on cpus of them,
                                 each on a host CPU of its own -- for secs,
                                 then print its console and how it ended
-    hv start <kernel> [mem=MiB] [cpus=N] [cpu=N] [node=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
+    hv start <kernel> [firmware] [mem=MiB] [cpus=N] [cpu=N] [node=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
                                 the same, left running until it is stopped;
                                 restart boots it again when it resets itself
     hv list                     the started guests: running or how they ended,
@@ -542,7 +547,7 @@ What the VMX backend does not do yet, and says so rather than pretends:
     hv console <id> [bytes=N]   the end of one's console
     hv attach <id>              its console, live and typed at, over ssh -t;
                                 ^] detaches
-    hv send <id> <text>         type at it, \n for a newline
+    hv send <id> <text>         type at it, \n or \r for Enter
     hv exec <id> [secs=N] <line>
                                 type a line, print what comes back up to the
                                 prompt after it
@@ -560,6 +565,42 @@ What the VMX backend does not do yet, and says so rather than pretends:
     hv forward [add <port> <vm> <guest-port> | del <port>]
                                 a port of nos's relayed to a guest's
     hv help                     all of these, a line each
+
+**CloudHv firmware guests** are selected by `firmware` on `hv boot`, `hv start`
+or `hv create`, or by `firmware = true` in `vm.toml`. With no kernel path this
+selects `/lib/CLOUDHV.fd`; an explicit PVH ELF path after the same flag is
+useful for the DEBUG build. The firmware is entered by the existing PVH loader,
+but its machine has CloudHv's `8086:0D57` host bridge, CF8/CFC without ECAM,
+and xAPIC plus an IO-APIC even for one vCPU. Ordinary Linux guests remain Q35.
+Host-function `pci=` is not available on this machine. Saving or migrating its
+state is refused until the host bridge is versioned into that state, rather
+than restoring the guest as Q35.
+
+`hyperv` on the same commands, or `hyperv = true` in vm.toml, selects
+Microsoft's Hv#1 interface for a firmware guest. It is refused for an ordinary
+Q35 guest, whose KVM interface is unchanged. The implementation provides the
+Microsoft CPUID range through 0x40000005, `GUEST_OS_ID`, `HYPERCALL` and
+per-vCPU `VP_INDEX`, and a read-only hypercall page with the vendor's opcode.
+The page overlays RAM or a hole without changing the underlying host-side RAM;
+disabling or moving it restores the old mapping. No synthetic timer or reference
+TSC is offered yet, and an unknown hypercall gets
+`HV_STATUS_INVALID_HYPERCALL_CODE`.
+
+```
+hv boot firmware mem=64
+hv create shell firmware
+hv start shell
+```
+
+With a bootable EFI System partition on its virtio disk, the firmware runs
+its `\EFI\BOOT\BOOTX64.EFI` rather than extracting a kernel on the host. On
+the EX44's VT-x this reaches the UEFI Shell and automatically boots Ubuntu
+24.04.5 through its own shim and GRUB to a login with EFI runtime services;
+virtio-blk's large-request path below is what EDK2's disk driver uses.
+`hv exec` recognizes the `Shell> ` prompt as well as Linux's `# ` and `$ `;
+end a UEFI command with `\r`, as in `hv exec shell echo hello\r`, since the
+Shell echoes LF but executes on CR. `hv-test.py` drives this path through
+Boot Manager on every x86-64 run.
 
 **Turning it on** allocates one page per CPU -- AMD's host state save area,
 Intel's VMXON region -- and then sends that CPU an IPI that does nothing but
@@ -670,16 +711,16 @@ node's when it has none ([NUMA](numa.md)): its placement sets the node
 memory the allocator found there (`its memory node 1's (100%)`).
 
 A Linux guest has from 64 MiB to 512 GiB (`mem=`, in MiB; `memory =` in a
-`vm.toml`), laid out as a PC's firmware lays out a machine's (`linux::Ram`):
-RAM from 0 up to 0xFE000000 at most (`linux::LOW_RAM_END`), where the
-devices' pages begin -- the MSI-X tables', then the IO-APIC's and the local
-APIC's, which RAM must not cover -- and the rest of it from 4 GiB. Its
-memory map says so, an entry for each, the hole at 640 KiB as before
-(`linux::e820_entries`, for a bzImage's zero page and a PVH start info
-alike); everything the loader writes -- the kernel, the initrd, a PVH
-image's segments -- is put below the devices' pages, where the identity map
-and the boot protocol's 32-bit fields reach, and the kernel finds the rest
-in the map. A guest of up to 4064 MiB has the machine it always had. Its RAM
+`vm.toml`), laid out as Q35's firmware lays out a machine (`linux::Ram`):
+RAM from 0 up to 0xC0000000 (`linux::HOLE_RAM_END`), where the PCI hole
+starts, and the rest of it from 4 GiB. Q35's ECAM is at 0xE0000000, and the
+MSI-X tables', the IO-APIC's and the local APIC's pages follow at 0xFE000000,
+which RAM must not cover. Its memory map says so, an entry for each, the
+hole at 640 KiB as before (`linux::e820_entries`, for a bzImage's zero page
+and a PVH start info alike); everything the loader writes -- the kernel, the
+initrd, a PVH image's segments -- is put below the devices' pages, where the
+identity map and the boot protocol's 32-bit fields reach, and the kernel
+finds the rest in the map. Its RAM
 must also end below what it is told a physical address is (CPUID
 0x80000008, the host's -- `policy::phys_bits`), or it could not reach it: a
 guest that would not fit there is refused rather than given RAM it cannot
@@ -997,7 +1038,7 @@ of the host after its run is the CPU's it ran on:
 | `tscaux` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own whose #UD and #GP handlers note the vector -- a #GP's error code with it -- and go on: each reads what its CPUID offers, reads its TSC_AUX by RDTSCP, RDPID and RDMSR, writes a value of its own into it, reads the TSC, RDTSCP and the TSC, reads TSC_AUX by RDPID and RDMSR again, writes it with bit 32 set and reads it once more, and runs INVPCID of types 0 to 4 | RDTSCP, RDPID and INVPCID offered exactly where they run in a guest, each run where offered and a #UD where not; TSC_AUX 0 as each VM starts, the second where the first had left its own -- its own put into the CPU before its entries (`hvarch::x86::msrs`); the value each wrote read back by every way it has, RDTSCP's TSC between the two RDTSCs; bit 32 a #GP, the value kept; RDMSR and WRMSR of it a #GP where neither instruction is offered; INVPCID's four types run and type 4 a #GP; every #GP a #GP(0) -- its IDT ends at gate 13, and an exception past it comes in as a #GP whose error code names its gate; every RDMSR and WRMSR seen by the run loop, and no RDTSCP where it runs |
 | `spec` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own whose #UD and #GP handlers note the vector -- a #GP's error code with it -- and go on: each reads what its CPUID offers of the speculation controls, reads IA32_SPEC_CTRL, writes every control offered into it and reads it back, writes it with bit 62 set and reads it again, asks for three IBPBs by IA32_PRED_CMD, reads PRED_CMD and writes its bit 1 | offered exactly the controls the host switches (`spec::guest_controls`) -- none under QEMU's TCG, every access a #GP; SPEC_CTRL 0 as each VM starts, the second where the first had left its own; the bits it wrote read back, bit 62 a #GP and the value kept; its last entry run under its bits over the host's, and the CPU's the host's alone after; every IBPB it asked for answered by a barrier before its next entry; PRED_CMD's read and bit 1 a #GP; every #GP a #GP(0), as `tscaux`'s; every RDMSR and WRMSR seen by the run loop |
 | `cr4` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: reads CR4, writes PAE alone -- MCE cleared -- then PAE and a bit its CPUID does not offer -- PKE, or CET where it is offered PKU -- 0, PAE and PGE through R9 (read back through R13), and bit 32, reading CR4 after each | every `mov` of CR4 performed by the host: the guest reads back what it wrote while the CPU's CR4 keeps MCE, and that bit PAE cleared in long mode and a reserved bit each a #GP(0), CR4 as it was ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)) -- the last two, which no CR4 takes in long mode, the CPU's own #GPs before its intercept where it makes them so, as the AX41's Zen 2 does under KVM; on QEMU's TCG, which stops no read of CR4, its reads are the register's, MCE in it, and the writes the host's all the same; under VT-x its reads are the read shadow's, and three of its writes -- those that change a bit the host keeps -- the host's, PAE cleared the CPU's own #GP |
-| `msr` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own whose #GP handler notes what faulted: writes VIRT_SPEC_CTRL and FLUSH_CMD, which its CPUID does not offer, an MSR nobody names (LS_CFG) and MTRRs turned on; reads MCG_CAP, MCG_STATUS and the PAT; asks CPUID for VIRT_SSBD, INVLPGB and the PMU | each of the four a #GP(0) its own handler took, nothing written; the machine-check registers and the PAT answered; CPUID offering no VIRT_SSBD, no INVLPGB and no PMU, and saying a hypervisor is there ([The CPU a guest is shown](#the-cpu-a-guest-is-shown)) |
+| `msr` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own whose #GP handler notes what faulted: writes VIRT_SPEC_CTRL and FLUSH_CMD, which its CPUID does not offer, an MSR nobody names (LS_CFG) and a variable MTRR base with a reserved bit; writes and reads back DEF_TYPE, a fixed MTRR and a variable base and mask; reads MCG_CAP, MCG_STATUS and the PAT; asks CPUID for VIRT_SSBD, INVLPGB and the PMU | each of the four invalid accesses a #GP(0) its own handler took, nothing written; MTRRcap and the MTRR writes read back; the machine-check registers and the PAT answered; CPUID offering no VIRT_SSBD, no INVLPGB and no PMU, and saying a hypervisor is there ([The CPU a guest is shown](#the-cpu-a-guest-is-shown)) |
 
 ```
 $ hv run all 3
@@ -1547,11 +1588,15 @@ here:
   VMCB save area -- a PAT entry that is no memory type, an address that is
   not canonical, an EFER bit its CPUID does not offer each a #GP, as the CPU
   gives -- the x2APIC's by the local APIC of a guest that has one, the TSC
-  as the host's; and a few answer as a CPU with nothing behind them would,
-  each taking a write that leaves it as it is and no other: the MTRRs (none,
-  and off) and the machine-check registers (no banks, nothing to report),
-  which leaf 1 offers and Linux reads with no fallback for a fault -- a
-  fault on a machine-check register is a panic to it -- the microcode
+  as the host's. The MTRRs are each vCPU's own: MTRRcap advertises fixed
+  ranges, WC and eight variable pairs; DEF_TYPE, the eleven fixed registers
+  and eight base/mask pairs read back as written. All start at zero; a memory
+  type or reserved bit the CPU refuses is a #GP. They never change the nested
+  table's memory types. A few more answer as a CPU with nothing behind them
+  would, each taking a write that leaves it as it is and no other: the
+  machine-check registers (no banks, nothing to report), which leaf 1 offers
+  and Linux reads with no fallback for a fault -- a fault on a machine-check
+  register is a panic to it -- the microcode
   revision, the host's on Intel (by which Linux keeps PCID on a Raptor Lake
   whose microcode has the fix) and none elsewhere, and of each vendor what Linux reads of every such CPU
   without asking: Intel's platform ID and MISC_ENABLE, its fast strings as
@@ -1573,7 +1618,8 @@ here:
   an edge a period in the periodic modes 2 and 3, and one when a loaded count
   runs out in the one-shot modes 0 and 4, which a kernel's high-resolution
   timers drive a count at a time; an MC146818 RTC that answers the host's
-  wall clock with the update bit clear; and a pair of 8259 PICs the guest
+  wall clock, with UIP set for the 2 ms before each second turns over; and a
+  pair of 8259 PICs the guest
   takes its interrupts from -- every one of them, for a guest of one CPU,
   which runs with no local APIC.
 - **The exit loop** (`hv::run`) that answers all of the above, injects the
@@ -1674,6 +1720,18 @@ nothing for, which Linux ends up disabling a line over. (That exposed a slip
 in the PIC: acknowledging a slave interrupt dropped the cascade line even
 with another slave request waiting.)
 
+**Virtio's MSI-X memory BAR is movable too.** Its table and pending bits share
+one RAM-backed page. The region that owns that page keeps its initial address,
+which the host uses to read entries, write pending bits and migrate its bytes;
+the guest's BAR and its NPT/EPT mapping move together through `move_msix`.
+A destination over RAM, another mapping, an absent page or the xAPIC page is
+left unmapped, and a later BAR write can move it again. During live migration
+the dirty log translates that stable backing address to the current mapping:
+a move makes the new page read-only while the log is active, and its first
+write faults and marks the backing page. A saved BAR restores its mapping. A
+capture while a BAR shows its temporary sizing mask is refused, since the mask
+alone cannot carry both that state and the address to restore.
+
 **The rings are the guest's; the host trusts none of them** (`hv::devices::
 virtio`). A queue's descriptors, its available ring and its used ring sit in
 guest memory, where the guest may write any of them at any moment. Every
@@ -1701,8 +1759,9 @@ and Linux, which takes descriptors from the ring until there are none, had
 three of them -- 768 KiB -- with its disk at once, whatever its queue's
 depth: a 1 MiB write at a depth of 8 that has 8 MiB out under KVM. A request's header, data and status are taken as
 streams across its readable and writable buffers, whatever the layout; its
-sector range is checked against the disk's size, and its size against what
-the driver was told a request may carry.
+sector range is checked against the disk's size. A request larger than a
+backend buffer is served in parts, including one in a single descriptor from
+EDK2's VirtioBlkDxe, which does not negotiate `size_max` or `seg_max`.
 
 **Each side asks for the other's notifications only when it wants them**
 (EVENT_IDX, `virtio::F_EVENT_IDX`, which the disks and the NICs offer).
@@ -1726,7 +1785,7 @@ on with at once -- that CPU rung, if the pass ran on another's -- since a
 driver that notifies only when asked gives the device no other reason to
 come back. A disk's pass is bound by the data it moves as well: 512 KiB of
 writes taken out of the guest's memory and reads given back into it, two
-of the largest requests (`blk::PASS_BYTES`). It runs under the platform's
+backend buffers' worth (`blk::PASS_BYTES`). It runs under the platform's
 lock, which every other CPU's port and MMIO access waits for, and a guest
 writing a megabyte at a time eight deep once had 8 MiB copied under one:
 Linux's clocksource watchdog on another of its CPUs found a read of the PM
@@ -1778,9 +1837,15 @@ write-through (virtio 1.x, 5.2.5.2): each of its writes is flushed before it
 is answered, as QEMU makes its backend write-through for one, and a flush it
 sends anyway is served, not refused. At most 64
 requests are out at once (`blk::IN_FLIGHT`), each in a 256 KiB buffer of the backend's taken
-when the disk is made (`Backend::with_buffer`) -- the driver is told a
-request carries at most 64 segments of a page (`seg_max`, `size_max`) --
-so nothing is allocated on the way, and a guest that keeps its ring full
+when the disk is made (`Backend::with_buffer`) -- a driver that negotiates
+them is told a request carries at most 64 segments of a page (`seg_max`,
+`size_max`). EDK2's VirtioBlkDxe does not negotiate either and may put an
+896 KiB read in one descriptor, so a larger guest request is served a buffer
+at a time through the same slot: a read's part is copied to its own offset
+before the buffer is reused, a write's next part is copied out then, and only
+the last part writes the status and returns the chain. A failure ends the
+whole request, and a write that needs a final flush gets one, not one a part.
+Nothing is allocated on the way, and a guest that keeps its ring full
 waits for its disk rather than growing anything of nos's -- the disk's task
 has its lists of them from the disk's opening too, so that a disk that could
 not have them refuses its VM's start rather than starting a guest whose disk
@@ -2353,16 +2418,17 @@ eight bytes of the table or the mirror as two dwords):
   a write there reach the device; the rest of the mirror's extended space is
   the guest's view of it below, read-only.
 
-**PCI Express's configuration space** (ECAM): a guest with the hole has its
-extended space too, 4 KiB a function, at `linux::ECAM_BASE` (0xFD800000,
-buses 0-7, a MiB each, at the top of the hole), a window every access of
+**PCI Express's configuration space** (ECAM): bus 0 presents Q35's root
+complex (`8086:29C0`), with CF8/CFC kept beside it. Every Q35 guest has its
+extended space, 4 KiB a function, at `linux::ECAM_BASE` (0xE0000000,
+buses 0-255, a MiB each), a window every access of
 which traps (`GuestMemory::trap_range`) and is answered as one through the
 ports is (`ecam`: `pci::ecam_target` names the function and the register;
 bus 0's emulated functions by the bus, `PciBus::function_read`, a host's slot
 or a bus below a port by `Platform::host_config`). The MCFG names it, a
 motherboard resource in the DSDT (PNP0C02) reserves it and so does the memory
 map -- Linux takes ECAM only where it is reserved -- and the host bridge's
-`_CRS` gives buses 0-7, which ECAM has to cover. A host's function's extended
+`_CRS` gives buses 0-255, which ECAM has to cover. A host's function's extended
 space is the device's, read-only, with the capability list the guest walks
 cut to those there to read (`host.rs`'s `EXT_SHOWN`): AER's error status, the
 virtual channels, the serial number, a vendor's (VSEC, DVSEC), LTR, the
@@ -2374,10 +2440,10 @@ the first dword, where the device's first is not shown, is a header of none
 naming the first that is; a list that loops shows none. An emulated
 function's and a port's extended space is empty: zeroes.
 
-**The guest's memory has a hole for the BARs** (`LinuxGuest::new_holed`):
-its RAM below 4 GiB ends at 3 GiB (`linux::HOLE_RAM_END`) rather than at
-0xFE000000, its BARs that are not 64-bit and prefetchable go from there up
-to the MSI-X pages, the rest from the first GiB past its RAM -- both windows
+**Every Q35 guest's memory has a hole for the BARs** (`LinuxGuest::new_holed`):
+its RAM below 4 GiB ends at 3 GiB (`linux::HOLE_RAM_END`), its BARs that are
+not 64-bit and prefetchable go from there up to ECAM and the MSI-X pages,
+the rest from the first GiB past its RAM -- both windows
 in the DSDT's `_CRS`, so
 that Linux keeps each BAR where it was put. The 64-bit window there reaches
 only as far as the BARs placed in it, a GiB at a time: the rest of the
@@ -4160,11 +4226,11 @@ as each of this host's CPUs makes it -- the EX44's, its six P-cores' twelve
 threads and eight E-cores alike: `cpu model c99c33c85afad94a -- what a guest moving here
 is held to, alike on the 20 CPUs` -- or which two differ, and at which leaf.
 
-**The state** (`common/vm/vmstate`, version 2, which reads version 1's
-too: a host updated before the others takes their VMs) is every CPU's
-registers in the shape
+**The state** (`common/vm/vmstate`, version 3, which reads versions 1 and 2
+too: a host updated before the others takes their VMs, whose CPUs then start
+with MTRRs at reset) is every CPU's registers in the shape
 both backends share -- the general and control registers, the segments,
-the system MSRs, the debug registers, the XSAVE area checked as it is read
+the system MSRs, each vCPU's MTRRs, the debug registers, the XSAVE area checked as it is read
 back in, a pending event, the interrupt shadow -- each local APIC, the
 mailboxes, every device's; times stored relative to the pause, the TSC
 carried by its offset, so the guest's clocks go on from where they stood,
@@ -4278,10 +4344,11 @@ button and evdev.)
 - **The tables** go in the BIOS area from 0xE0000, which the e820 map
   reserves: the RSDP first, where a kernel scanning for it finds it, and the
   zero page's `acpi_rsdp_addr` pointing at it for one that looks there. An
-  XSDT names the FADT and, for a guest whose CPUs have local APICs, a MADT;
-  the FADT names the FACS and the DSDT. They are ACPI 6.3's, laid out with
-  their checksums into a buffer and copied into guest memory as the MP
-  table is -- nothing of the guest's is kept.
+  XSDT names the FADT and, for a guest whose CPUs have local APICs, a MADT.
+  A legacy FADT names the FACS and DSDT; the firmware machine's FADT is
+  hardware-reduced, with no FACS or legacy PM1 blocks. Tables are ACPI 6.3's,
+  laid out with their checksums into a buffer and copied into guest memory
+  as the MP table is -- nothing of the guest's is kept.
 - **The fixed hardware is all on ports** (0x600-0x60B, as an ICH lays it
   out): the PM1 event block's status and enable registers, the PM1 control
   register, and the PM timer -- 24 bits at 3.579545 MHz, counting the host's
@@ -4298,6 +4365,14 @@ button and evdev.)
   register is the chipset's 0xCF9, trapped already: a kernel with ACPI
   reboots through it first, `the guest asked for a reset, 0x06 to port
   0xcf9`.
+- **The firmware machine is hardware-reduced.** Sleep control and status
+  are at `0x600` and `0x601`, as CloudHv's EDK2 `ResetSystem` runtime has
+  them: S5 is `0x34` written to control, rather than PM1's different bit
+  positions. The FADT names the same registers. There is no legacy PM1 event
+  block on this machine, so the address does not collide with one; ordinary
+  Q35 keeps PM1 status at `0x600` and does not take that write as power-off.
+  This is what Windows accepts from its CloudHv firmware path; presenting
+  that path with a legacy FADT led to bugcheck `0xA5(0x11, 0x3)`.
 - **The MADT** lists a local APIC for each CPU and NMI on every LINT1 --
   and, for a guest given one, the IO-APIC, with the two overrides a PC's
   has: the timer's IRQ 0 on its pin 2, and the SCI a level, active high
@@ -4305,9 +4380,11 @@ button and evdev.)
   ACPI finds its CPUs in the MADT, one without in the MP table, and both
   are told the same.
 - **The DSDT** is the one table in AML, and small: `\_S5`, the PCI host
-  bridge, and the panic device `PEVT` (`QEMU0001`, its port) when the VM
-  has one ([A guest that panics](#a-guest-that-panics-pvpanic)) -- which the listing below, of a
-  VM without, leaves out. The bridge has to be there. A Linux with ACPI finds PCI through
+  bridge, the processor container `CPUS` with an `ACPI0007` device and `_UID`
+  for every MADT CPU, and the panic device `PEVT` (`QEMU0001`, its port)
+  when the VM has one ([A guest that panics](#a-guest-that-panics-pvpanic)) --
+  which the listing below, of a VM without, leaves out. The bridge has to be
+  there. A Linux with ACPI finds PCI through
   the namespace alone and never probes the bus -- `pci_legacy_init` is not
   even called -- so without one the guest would have no disks and no NICs.
   Its `_CRS` gives bus 0-255, the configuration ports, the I/O either side
@@ -4347,10 +4424,13 @@ Scope (\_SB)
 }
 ```
 
+Q35's MCFG and the motherboard resource reserving ECAM are beside this
+excerpt ([PCI Express's configuration space](#pci-expresss-configuration-space)).
 What is left out is MMIO this does not emulate yet ([MMIO](#mmio)) -- the
-HPET and PCIe's ECAM, whose absence Linux names in the line above; the
-IO-APIC is there for a guest given one -- and what a guest does without: processor objects (there are no C- or P-states to describe), the
-ISA devices (a kernel finds a PC's serial port, RTC and timer where they
+HPET; the IO-APIC is there for a guest given one -- and what a guest does
+without: C- or P-states on the processor objects (only their identity and
+presence are described), the ISA devices (a kernel finds a PC's serial port,
+RTC and timer where they
 always are), GPEs, and any sleep state but S5. A guest of one CPU gets no
 MADT: it has no APIC.
 
@@ -4407,11 +4487,12 @@ the modules and the filesystems, sending what it still holds as it goes
 (`rust_net_stop_netconsole`) -- so that the wait is seen.
 
 **A power-off is a write to a port**, as a reset is: SLP_EN with S5's sleep
-type in PM1a's control register. ACPICA writes the type first and the enable
-bit second, and the second stops the VM where the guest wrote it --
-`Stop::PowerOff`, which is not a reset: a guest started with `restart` that
-turns itself off stays off. A sleep type the DSDT does not offer is left
-alone, and the report says the guest asked for it.
+type in PM1a's control register on legacy Q35, or `0x34` in CloudHv's reduced
+sleep control at `0x600`. ACPICA writes the legacy type first and the enable
+bit second; CloudHv's `ResetSystem` writes its one byte directly. Either stops
+the VM where the guest wrote it -- `Stop::PowerOff`, which is not a reset: a
+guest started with `restart` that turns itself off stays off. A sleep type the
+DSDT does not offer is left alone, and the report says the guest asked for it.
 
 The gate is `tests/hv-linux-test.py --acpi`, with a kernel built with
 ACPI, its button and evdev: the boot's lines above and nothing of a firmware
@@ -4621,8 +4702,8 @@ unmounted -- and it turns itself off, nested under KVM on the i5-13500:
 
 ```
 $ hv stop 0 secs=300
-hv: vm 0 stopped -- the guest powered itself off, S5 by its ACPI PM1 control register, at 0xffffffff8f1d5ae3
-  stopped    the guest powered itself off, S5 by its ACPI PM1 control register, at 0xffffffff8f1d5ae3, after 7624 ms
+hv: vm 0 stopped -- the guest powered itself off, S5 by its ACPI sleep control register, at 0xffffffff8f1d5ae3
+  stopped    the guest powered itself off, S5 by its ACPI sleep control register, at 0xffffffff8f1d5ae3, after 7624 ms
   ...
   acpi       taken by the guest's OS; 2 SCIs, the power button pressed 1 times
   vda        3072 MiB: 2499 reads (75589 KiB), 215 writes (3805 KiB), 36 flushes, 0 errors
@@ -4817,8 +4898,10 @@ deep, each inside the heap and all of it given back -- and fuzzes each
 disk's metadata, every run held to the heap the same way.
 
 What it does not do: boot what is not Linux -- Windows has no boot
-protocol of its own to be entered by, and needs firmware, which OVMF's
-`CloudHv` on the same PVH would be; read XFS or btrfs, so not a /boot of
+protocol of its own to be entered by, and needs firmware. OVMF's `CloudHv`
+is built for that same PVH entry by `scripts/build-cloudhv.sh`; the machine
+it needs is the work in [`plans/windows.md`](../plans/windows.md), not a
+supported Windows guest yet. Nor can hvboot read XFS or btrfs, so not a /boot of
 the RHEL family's, nor an LVM or LUKS one; read BLS entries (`blscfg`);
 or EFI -- the kernel is entered by the boot protocol, as hv enters a
 bzImage, and has no EFI runtime. And the image is still to be made raw: the
@@ -5100,6 +5183,39 @@ it does not know: a driver that probes, as `ptp_kvm` does for its clock
 pairing, takes that for not there -- where the old answer, RAX left as it
 was, read as a positive error. A kernel without `KVM_GUEST` finds a
 signature it does not know, and runs as before.
+
+### Hyper-V for a firmware guest
+
+`firmware hyperv`, or `hyperv = true` beside `firmware = true` in vm.toml,
+replaces KVM's paravirtual interface with Hv#1: CPUID leaves
+`0x40000000-0x40000005`, GUEST_OS_ID, HYPERCALL and VP_INDEX, and a
+read-execute hypercall-page overlay. A call before a guest OS is registered,
+and an unknown call, is refused rather than answered as success; the unknown
+call's status is `HV_STATUS_INVALID_HYPERCALL_CODE` (2). Crash MSRs P0-P4
+and CrashNotify carry a Windows bugcheck's code and four arguments into the
+VM's stop report and `/logs/hv.log`.
+
+TIME_REF_COUNT shares the reference TSC page: a second read-only overlay,
+with the TLFS sequence odd while a value is being published and even after,
+TSC value and scale/offset, and the TSC and local APIC frequencies. Each vCPU
+has SynIC SCONTROL/SVERSION, SIEFP/SIMP, EOM, SIRBP and SINT0-15, plus four
+synthetic timers. A timer can request a direct local-APIC vector or a
+40-byte `HVMSG_TIMER_EXPIRED` message (type `0x80000010`, 24-byte payload)
+on its SINT; one-shot, periodic and auto-enable modes use the same host
+`Kick` deadline as the other timers, so an edge also wakes a halted vCPU.
+The `hyperv` and `policy` fuzz targets cover this contract, and the Windows
+boot exercises its reference clock and message-mode timer.
+
+Windows Server 2022 Standard Core then reaches `SAC>` on the EX44 in about
+1.65 seconds; its CMD channel accepts a login, viostor runs the system disk,
+and NetKVM uses DHCP. `shutdown /s /t 0` ends in `Stop::PowerOff`: Windows
+reaches CloudHv's UEFI `ResetSystem(EfiResetShutdown)`, which writes `0x34`
+to its fixed sleep-control port `0x600`. This boot also exercised a VT-x fix
+worth keeping in the dump: requesting an IRQ window now clears a stale TPR
+threshold first, since the CPU refuses VM-entry when that threshold exceeds
+VTPR's class.
+Both kinds of failed entry preserve the VMCS controls and related fields in
+the stopped vCPU's report (see [VT-x](#amd-v-first-intel-vt-x-second)).
 
 ### Starting the others
 
@@ -5987,7 +6103,7 @@ guest has ACPI's tables and fixed hardware -- its power button what `hv
 stop` presses ([ACPI](#acpi)). MMIO is emulated -- the instruction that
 faulted fetched by the guest's paging, decoded and performed -- and the
 xAPIC page is its first device, the IO-APIC its second ([MMIO](#mmio));
-next on it are the HPET and PCIe's ECAM the tables leave out today.
+Q35's ECAM is answered there too, 256 buses of it. The HPET is still left out.
 Beyond stage 3: device work off the first CPU's task, modern virtio, and the
 control plane's HTTP API (stage 4) -- and before any of it, what a review of
 the whole found ([What a review found](#what-a-review-found)).
@@ -6267,7 +6383,7 @@ someone else's; then speed.
    not INVLPGB nor AutoIBRS; the hypervisor bit is set. An MSR the policy
    does not name is a #GP both ways; what it names is the guest's own
    state, the TSC, or a constant that takes a write leaving it as it is and
-   refuses any other: the MTRRs off, machine checks with no banks, the
+   refuses any other: machine checks with no banks, the
    microcode revision -- the host's on Intel, none elsewhere -- and of each vendor what Linux reads of every
    such CPU without asking. The guest's own state takes what the CPU would:
    a PAT entry that is no memory type, an address that is not canonical
@@ -6279,8 +6395,8 @@ someone else's; then speed.
    nine mutants, the old swallowing and IBPB offered among them, each failed
    within 1,600 inputs. `hv-test.py`'s `msr` guest has the run loop refuse
    VIRT_SPEC_CTRL, FLUSH_CMD -- once SPEC_CTRL and PRED_CMD, which are a
-   guest's own now, and the `spec` guest's -- an MSR nobody names and MTRRs
-   turned on, and answer
+   guest's own now, and the `spec` guest's -- an MSR nobody names and an
+   invalid variable MTRR base, read back the MTRRs it writes, and answer
    the machine-check registers and the PAT; a build that refused
    MCG_STATUS failed it. `hv-linux-test.py` holds every boot's console to
    no "unchecked MSR access error" and no "MCA architectural violation",
@@ -6471,10 +6587,10 @@ someone else's; then speed.
 2. **MSRs that read 0 and should not.** Intel's MISC_ENABLE without fast
    strings, which Linux answered by turning REP MOVS's fast paths off
    ("Disabled fast string operations"), has them as the host has now.
-   Left: MTRR offered but MTRRcap and the default type 0 -- MTRRs "disabled
-   by BIOS" -- which a Linux 6.1 (Debian 12) answers by leaving PAT off,
-   from its source; a default type of write-back, written back as the guest
-   sets it, would close it, with the MTRRs kept per CPU.
+   MTRRcap now advertises fixed ranges, WC and eight variable pairs, and
+   DEF_TYPE and the fixed and variable registers are each vCPU's own. They
+   start at reset's zero and a firmware or guest write of a valid type reads
+   back, so firmware can turn on write-back instead of leaving PAT unused.
 3. **Devices, smaller.** The 16550 never sets IIR's FIFO bits, so Linux
    takes it for a 16450 and writes it a byte an interrupt; the RTC never
    interrupts (status B is read-only, C always 0, IRQ 8 never raised), so

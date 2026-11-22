@@ -161,7 +161,7 @@ poweroff
 `hv stop` presses the guest's power button and gives it 30 s to shut itself down; Debian took 7 s under TCG. `secs=N` changes the wait. Boot nos again with the same QEMU command and type nothing: `/etc/rc` starts the VM. `ssh -p 2201 debian@127.0.0.1` reaches the same machine, with the same host key and the same files. cloud-init does not set the guest up a second time, because the seed's instance ID has not changed. `/vms/debian/console.log` keeps the console of every boot, with hv's own lines between them:
 
 ```text
---- hv: 2026-10-25 12:46:37 UTC vm 0 stopped -- the guest powered itself off, S5 by its ACPI PM1 control register, at 0xffffffff96e1d0a3 ---
+--- hv: 2026-10-25 12:46:37 UTC vm 0 stopped -- the guest powered itself off, S5 by its ACPI sleep control register, at 0xffffffff96e1d0a3 ---
 --- hv: 2026-10-25 12:46:37 UTC vm 0 off the list ---
 --- hv: 2026-10-25 12:46:44 UTC vm 0 started on cpu 3 -- /lib/hvboot, 1024 MiB, 1 cpu, cmdline "...", restarted when it resets ---
 ```

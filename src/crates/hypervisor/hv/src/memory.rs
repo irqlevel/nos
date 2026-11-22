@@ -24,8 +24,8 @@ use hvarch::Vendor;
 use crate::dirty;
 
 /// The second-level translation, whichever the machine has: AMD's nested
-/// page table or Intel's extended one. Both are built the same way -- from
-/// the host, only growing -- and offer the same handful of operations, so
+/// page table or Intel's extended one. Both are built from the host and offer
+/// the same operations, including clearing a mapping when its BAR moves, so
 /// the memory above them is one set of code over an enum, not two.
 #[cfg(target_arch = "x86_64")]
 enum SecondLevel {
@@ -51,6 +51,12 @@ impl SecondLevel {
         match self {
             SecondLevel::Npt(t) => t.set_ro(gpa, hpa),
             SecondLevel::Ept(t) => t.set_ro(gpa, hpa),
+        }
+    }
+    fn set_rx(&mut self, gpa: u64, hpa: u64) -> Result<()> {
+        match self {
+            SecondLevel::Npt(t) => t.set_ro(gpa, hpa),
+            SecondLevel::Ept(t) => t.set_rx(gpa, hpa),
         }
     }
     fn prepare_huge(&mut self, gpa: u64, size: u64) -> Result<()> {
@@ -116,6 +122,34 @@ impl dirty::Table for SecondLevel {
         match self {
             SecondLevel::Npt(t) => t.unprotect(gpa).is_ok(),
             SecondLevel::Ept(t) => t.unprotect(gpa).is_ok(),
+        }
+    }
+}
+
+/// The dirty log names an MSI-X page by the region that owns it; its nested
+/// mapping may have moved. An unmapped BAR has nothing to protect, and is
+/// mapped read-only if the guest moves it again before the log is over.
+#[cfg(target_arch = "x86_64")]
+struct DirtyTable<'a> {
+    table: &'a mut SecondLevel,
+    msix: &'a [MsixMapping],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl dirty::Table for DirtyTable<'_> {
+    fn protect(&mut self, gpa: u64) -> bool {
+        let page = gpa & !(PAGE - 1);
+        match self.msix.iter().find(|m| m.backing == page) {
+            Some(m) => !m.mapped || self.table.protect(m.at),
+            None => self.table.protect(gpa),
+        }
+    }
+
+    fn unprotect(&mut self, gpa: u64) -> bool {
+        let page = gpa & !(PAGE - 1);
+        match self.msix.iter().find(|m| m.backing == page) {
+            Some(m) => !m.mapped || self.table.unprotect(m.at),
+            None => self.table.unprotect(gpa),
         }
     }
 }
@@ -207,6 +241,14 @@ pub struct GuestMemory {
     /// lives, which outlives this table (`run::LinuxGuest`'s fields' order).
     #[cfg(target_arch = "x86_64")]
     devices: Mutex<Vec<(u64, u64)>>,
+    /// Each virtio MSI-X page: the region that owns its frame, and where its
+    /// nested mapping is now. The backing address remains the host's way to
+    /// the table and the dirty log's name for it.
+    #[cfg(target_arch = "x86_64")]
+    msix: Mutex<Vec<MsixMapping>>,
+    /// Hyper-V's two pages: each one's GPA now, and the RAM frame it covers.
+    #[cfg(target_arch = "x86_64")]
+    overlays: Mutex<[Overlay; 2]>,
     /// Copies of the host's functions' ROMs, a function's frames each by its
     /// slot (`map_rom`): after the table, so that it goes before they are
     /// back on the free list.
@@ -223,6 +265,32 @@ enum DevicePages<'a> {
     Bar(u64, &'a [u64]),
     Copy(&'a [Frame]),
     None,
+}
+
+/// Hyper-V's hypercall and reference TSC pages, independently mapped.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+pub enum OverlaySlot {
+    Hypercall,
+    ReferenceTsc,
+}
+
+/// A page mapped over RAM or a hole. `under` is the RAM frame to restore,
+/// None where the GPA was a hole.
+#[cfg(target_arch = "x86_64")]
+struct Overlay {
+    at: u64,
+    under: Option<u64>,
+    mapped: bool,
+    /// Owned before it can be mapped, and kept with the nested table.
+    frame: Option<Frame>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Overlay {
+    const fn new() -> Self {
+        Self { at: 0, under: None, mapped: false, frame: None }
+    }
 }
 
 /// What [`GuestMemory::map_absent`] has made so far.
@@ -245,6 +313,13 @@ struct Region {
     frames: Run,
     /// They are the huge pool's.
     huge: bool,
+}
+
+#[cfg(target_arch = "x86_64")]
+struct MsixMapping {
+    backing: u64,
+    at: u64,
+    mapped: bool,
 }
 
 impl Region {
@@ -280,6 +355,8 @@ impl GuestMemory {
             log: dirty::Log::new(),
             absent: Mutex::new(Absent { frame: None, at: Vec::new() }).ok_or(Error::NoMemory)?,
             devices: Mutex::new(Vec::new()).ok_or(Error::NoMemory)?,
+            msix: Mutex::new(Vec::new()).ok_or(Error::NoMemory)?,
+            overlays: Mutex::new([Overlay::new(), Overlay::new()]).ok_or(Error::NoMemory)?,
             roms: Mutex::new(Vec::new()).ok_or(Error::NoMemory)?,
         })
     }
@@ -369,6 +446,14 @@ impl GuestMemory {
         if devices.iter().any(|&(b, s)| gpa < b + s && b < end) {
             return Err(Error::BadAddress);
         }
+        let msix = self.msix.lock();
+        if msix.iter().any(|m| m.mapped && gpa < m.at + PAGE && m.at < end) {
+            return Err(Error::BadAddress);
+        }
+        let overlays = self.overlays.lock();
+        if overlays.iter().any(|o| o.mapped && gpa <= o.at && o.at < end) {
+            return Err(Error::BadAddress);
+        }
         devices.try_reserve(1).map_err(|_| Error::NoMemory)?;
 
         let mut table = self.table.lock();
@@ -454,6 +539,182 @@ impl GuestMemory {
         Ok(self.renew(&mut table))
     }
 
+    /// An overlay's contents and frame, made before a vCPU can run.
+    #[cfg(target_arch = "x86_64")]
+    pub fn prepare_overlay(&self, slot: OverlaySlot, contents: &[u8]) -> Result<()> {
+        let mut overlays = self.overlays.lock();
+        let overlay = &mut overlays[slot as usize];
+        if overlay.frame.is_some() {
+            return Ok(());
+        }
+        let frame = Frame::new().ok_or(Error::NoMemory)?;
+        if !frame.write(0, contents) {
+            return Err(Error::BadAddress);
+        }
+        overlay.frame = Some(frame);
+        Ok(())
+    }
+
+    /// Map an overlay at `gpa`, over RAM or a hole, read-only and executable
+    /// only for the hypercall page. An existing one moves only after the new
+    /// mapping is in place; the old GPA then gets its original RAM frame back.
+    /// No host-side access is redirected: `read` and `write` still name RAM.
+    #[cfg(target_arch = "x86_64")]
+    pub fn map_overlay(&self, slot: OverlaySlot, gpa: u64) -> Result<()> {
+        if gpa % PAGE != 0 || gpa.checked_add(PAGE).is_none_or(|end| end > MAX_GPA) || gpa == XAPIC_PAGE {
+            return Err(Error::BadAddress);
+        }
+        /* The same order as map_absent/add_device/move_msix, the overlay's
+         * lock immediately before the table's. */
+        let absent = self.absent.lock();
+        if absent.at.contains(&gpa) {
+            return Err(Error::BadAddress);
+        }
+        let devices = self.devices.lock();
+        if devices.iter().any(|&(b, s)| gpa >= b && gpa - b < s) {
+            return Err(Error::BadAddress);
+        }
+        let msix = self.msix.lock();
+        if msix.iter().any(|m| m.mapped && m.at == gpa) {
+            return Err(Error::BadAddress);
+        }
+        let mut overlays = self.overlays.lock();
+        let index = slot as usize;
+        if overlays.iter().enumerate().any(|(i, o)| i != index && o.mapped && o.at == gpa) {
+            return Err(Error::BadAddress);
+        }
+        if overlays[index].mapped && overlays[index].at == gpa {
+            return Ok(());
+        }
+        let hpa = overlays[index].frame.as_ref().map(|f| f.phys()).ok_or(Error::NoMemory)?;
+        let under = match self.region(gpa, PAGE_SIZE) {
+            Ok(i) => Some(self.regions[i].page(gpa).ok_or(Error::Unmapped)?.0.phys()),
+            Err(Error::Unmapped) => None,
+            Err(e) => return Err(e),
+        };
+        let (old_at, old_under, old_mapped) = (overlays[index].at, overlays[index].under, overlays[index].mapped);
+        let mut table = self.table.lock();
+        let result = (|| {
+            if under.is_some() {
+                /* Also splits a 2 MiB RAM mapping, so the one page can be
+                 * replaced without changing any of its neighbours. */
+                if !dirty::Table::protect(&mut *table, gpa) {
+                    return Err(Error::Unmapped);
+                }
+                table.clear(gpa)?;
+            }
+            table.prepare(gpa, PAGE)?;
+            match slot {
+                OverlaySlot::Hypercall => table.set_rx(gpa, hpa)?,
+                OverlaySlot::ReferenceTsc => table.set_ro(gpa, hpa)?,
+            }
+            if old_mapped {
+                self.restore_overlay(&mut table, old_at, old_under)?;
+            }
+            Ok(())
+        })();
+        self.renew(&mut table);
+        if let Err(e) = result {
+            if under.is_some() {
+                let _ = table.clear(gpa);
+                let _ = self.restore_overlay(&mut table, gpa, under);
+                self.renew(&mut table);
+            }
+            return Err(e);
+        }
+        overlays[index].at = gpa;
+        overlays[index].under = under;
+        overlays[index].mapped = true;
+        Ok(())
+    }
+
+    /// Remove one overlay, restoring the RAM frame it covered.
+    #[cfg(target_arch = "x86_64")]
+    pub fn unmap_overlay(&self, slot: OverlaySlot) -> Result<()> {
+        let mut overlays = self.overlays.lock();
+        let overlay = &mut overlays[slot as usize];
+        if !overlay.mapped {
+            return Ok(());
+        }
+        let (at, under) = (overlay.at, overlay.under);
+        let mut table = self.table.lock();
+        self.restore_overlay(&mut table, at, under)?;
+        self.renew(&mut table);
+        overlay.at = 0;
+        overlay.under = None;
+        overlay.mapped = false;
+        Ok(())
+    }
+
+    /// Whether `gpa` writes a read-only Hyper-V overlay: a #GP, not a
+    /// dirty-log fault and not an unexpected nested fault that stops the VM.
+    #[cfg(target_arch = "x86_64")]
+    pub fn overlay_contains(&self, gpa: u64) -> bool {
+        let overlays = self.overlays.lock();
+        overlays.iter().any(|o| o.mapped && gpa >= o.at && gpa - o.at < PAGE)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn restore_overlay(&self, table: &mut SecondLevel, at: u64, under: Option<u64>) -> Result<()> {
+        /* The overlay may own the entry now; a failed move may have left the
+         * RAM page's entry clear. Either way, restore starts with no mapping. */
+        let _ = table.clear(at);
+        if let Some(hpa) = under {
+            table.prepare(at, PAGE)?;
+            table.set(at, hpa)?;
+            if self.log.active() && !dirty::Table::protect(table, at) {
+                return Err(Error::Unmapped);
+            }
+        }
+        Ok(())
+    }
+
+    /// Move the nested mapping of the MSI-X page owned by the one-page region
+    /// at `backing`, from its current BAR address to `to`. The frame and its
+    /// host-facing address do not move. As with a passthrough BAR, an invalid
+    /// or unallocatable destination leaves the BAR unmapped; a later write
+    /// can move it again. Only this page's own old mapping is cleared.
+    #[cfg(target_arch = "x86_64")]
+    pub fn move_msix(&self, backing: u64, from: u64, to: u64) -> Result<u64> {
+        let region = self.regions.iter().find(|r| r.base == backing && r.size == PAGE).ok_or(Error::Unmapped)?;
+        let mut extents = region.frames.extents();
+        let extent = extents.next().ok_or(Error::Unmapped)?;
+        if extent.pages != 1 || extents.next().is_some() {
+            return Err(Error::BadAddress);
+        }
+        let hpa = extent.phys;
+
+        let absent = self.absent.lock();
+        let devices = self.devices.lock();
+        let mut msix = self.msix.lock();
+        let overlays = self.overlays.lock();
+        let i = msix.iter().position(|m| m.backing == backing).ok_or(Error::Unmapped)?;
+        if msix[i].at != from {
+            return Err(Error::BadAddress);
+        }
+        let old_mapped = msix[i].mapped;
+        let valid = to.checked_add(PAGE).is_some_and(|end| {
+            to % PAGE == 0 && end <= MAX_GPA && to != XAPIC_PAGE
+                && (to == backing || !self.regions.iter().any(|r| to < r.base + r.size && r.base < end))
+                && !absent.at.contains(&to)
+                && !devices.iter().any(|&(b, s)| to < b + s && b < end)
+                && !msix.iter().enumerate().any(|(j, m)| j != i && m.mapped && to < m.at + PAGE && m.at < end)
+                && overlays.iter().all(|o| !o.mapped || o.at != to)
+        });
+
+        let mut table = self.table.lock();
+        let prepare = valid && table.prepare(to, PAGE).is_ok();
+        if old_mapped {
+            table.clear(from)?;
+        }
+        let mapped = prepare
+            && if self.log.active() { table.set_ro(to, hpa).is_ok() } else { table.set(to, hpa).is_ok() };
+        let mapping = &mut msix[i];
+        mapping.at = to;
+        mapping.mapped = mapped;
+        Ok(self.renew(&mut table))
+    }
+
     /// Whether `gpa` is in a host function's BAR the guest holds.
     #[cfg(target_arch = "x86_64")]
     pub fn is_device(&self, gpa: u64) -> bool {
@@ -510,6 +771,16 @@ impl GuestMemory {
         }
         .ok_or(Error::NoMemory)?;
         self.place(base, size, frames, false, false)
+    }
+
+    /// A virtio function's MSI-X table page: owned by a one-page region at
+    /// `base`, with its first nested mapping there. Its BAR can move later.
+    #[cfg(target_arch = "x86_64")]
+    pub fn add_msix(&mut self, base: u64) -> Result<()> {
+        self.msix.lock().try_reserve(1).map_err(|_| Error::NoMemory)?;
+        self.add(base, PAGE)?;
+        self.msix.lock().push(MsixMapping { backing: base, at: base, mapped: true });
+        Ok(())
     }
 
     /// Give the guest `size` bytes of zeroed memory at `base` from the huge
@@ -619,6 +890,14 @@ impl GuestMemory {
         let mut absent = self.absent.lock();
         #[cfg(target_arch = "x86_64")]
         if self.is_device(page) {
+            return Err(Error::BadAddress);
+        }
+        let msix = self.msix.lock();
+        if msix.iter().any(|m| m.mapped && m.at == page) {
+            return Err(Error::BadAddress);
+        }
+        let overlays = self.overlays.lock();
+        if overlays.iter().any(|o| o.mapped && o.at == page) {
             return Err(Error::BadAddress);
         }
         if absent.at.contains(&page) {
@@ -822,11 +1101,18 @@ impl GuestMemory {
     /// true: the write runs again. False for anything else.
     #[cfg(target_arch = "x86_64")]
     pub fn write_fault(&self, gpa: u64) -> bool {
+        let page = gpa & !(PAGE - 1);
+        let msix = self.msix.lock();
+        let moved = msix.iter().find(|m| m.mapped && m.at == page);
+        if moved.is_none() && msix.iter().any(|m| m.backing == page && (!m.mapped || m.at != page)) {
+            return false;
+        }
+        let gpa = moved.map_or(gpa, |m| m.backing + (gpa - page));
         if self.region(gpa & !(PAGE - 1), PAGE_SIZE).is_err() {
             return false;
         }
         let mut table = self.table.lock();
-        self.log.fault(&mut *table, gpa)
+        self.log.fault(&mut DirtyTable { table: &mut table, msix: &msix }, gpa)
     }
 
     /// The dirty log begun: every page of RAM read-only to the guest, the
@@ -836,12 +1122,16 @@ impl GuestMemory {
     /// and what was protected is let go of.
     #[cfg(target_arch = "x86_64")]
     pub fn log_start(&self) -> Result<u64> {
+        let msix = self.msix.lock();
         let mut table = self.table.lock();
-        if !self.log.start(&mut *table) {
-            self.log.release(&mut *table);
+        let mut dirty = DirtyTable { table: &mut table, msix: &msix };
+        if !self.log.start(&mut dirty) {
+            self.log.release(&mut dirty);
+            drop(dirty);
             self.renew(&mut table);
             return Err(Error::NoMemory);
         }
+        drop(dirty);
         Ok(self.renew(&mut table))
     }
 
@@ -851,8 +1141,9 @@ impl GuestMemory {
     /// protected again refuses the round.
     #[cfg(target_arch = "x86_64")]
     pub fn log_take(&self, out: &mut dyn FnMut(u64)) -> Result<(u64, u64)> {
+        let msix = self.msix.lock();
         let mut table = self.table.lock();
-        let n = self.log.take(Some(&mut *table), out);
+        let n = self.log.take(Some(&mut DirtyTable { table: &mut table, msix: &msix }), out);
         let id = self.renew(&mut table);
         n.map(|n| (n, id)).ok_or(Error::NoMemory)
     }
@@ -872,7 +1163,8 @@ impl GuestMemory {
     /// identity: nothing a TLB keeps is wider than the table now.
     #[cfg(target_arch = "x86_64")]
     pub fn log_stop(&self) {
+        let msix = self.msix.lock();
         let mut table = self.table.lock();
-        self.log.release(&mut *table);
+        self.log.release(&mut DirtyTable { table: &mut table, msix: &msix });
     }
 }

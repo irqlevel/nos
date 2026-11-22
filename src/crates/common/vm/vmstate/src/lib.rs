@@ -51,10 +51,12 @@ mod wire;
 mod cpu;
 mod apic;
 mod devices;
+mod mtrrs;
 
 use alloc::vec::Vec;
 
 pub use apic::{Lapic, Mail, LVT_MAX, WORDS};
+pub use mtrrs::Mtrrs;
 pub use cpu::{Activity, Cpu, Event, EventKind, Regs, Segment, Table, ERROR_CODE_VECTORS, XSAVE_MAX};
 pub use devices::{Blk, Device, Function, IoApic, Msix, Net, Pic, PicChip, Pit, PitChannel, Platform, Pm, PvPanic,
                   Queue, Rtc, Takes, Transport, Uart, CSI_PARAMS, ESC_CSI, ESC_CSI6_V1, ESC_CSI_OTHER, ESC_START,
@@ -67,7 +69,7 @@ pub const MAGIC: [u8; 8] = *b"nosvmst1";
 /// The format's version: the one this writes. It reads `OLDEST` on: a
 /// cluster updated a host at a time moves each one's VMs off before its
 /// turn, from hosts that write the version before.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 pub const OLDEST: u16 = 1;
 /// The most CPUs a state holds.
 pub const CPUS_MAX: usize = 64;

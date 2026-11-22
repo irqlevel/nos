@@ -417,7 +417,7 @@ def vm_commands(args):
              r"(?m)^\s*9:(\s+\d+)+\s+%s\s+acpi" % (r"IO-APIC\s+9-fasteoi" if args.ioapic else "XT-PIC"), True),
             (clocks, 0, "the PM timer is one of its clocksources", r"acpi_pm", True),
             (stop4, 0, "hv stop presses its power button again, and acpid has it turn itself off",
-             r"hv: vm 4 stopped -- the guest powered itself off, S5 by its ACPI PM1 control register", True),
+             r"hv: vm 4 stopped -- the guest powered itself off, S5 by its ACPI sleep control register", True),
             (stop4, 0, "the report: ACPI taken, the SCI raised, the power button pressed twice -- declined, "
              "then answered", r"acpi\s+taken by the guest's OS; [1-9]\d* SCIs, the power button pressed 2 times", True),
             ("hv stop 5 secs=5", 0, "a guest that hears its power button and does nothing is stopped when its time is up",

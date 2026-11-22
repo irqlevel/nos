@@ -71,7 +71,7 @@ use crate::devices::blk::{self, Blk};
 use crate::devices::host::{self, HostFunction};
 use crate::devices::ioapic::{self, Pins};
 use crate::devices::net::{self, Net};
-use crate::devices::pci::{self, Function, PciBus};
+use crate::devices::pci::{self, Function, HostBridge, PciBus};
 use crate::devices::port::{self, RootPort};
 use crate::devices::pm;
 use crate::devices::pvpanic::{self, PvPanic};
@@ -81,8 +81,9 @@ use crate::lapic::{self, Addressing, Delivery, Ipi, Lapic, Wrote};
 use crate::linux::{self, Header, Layout};
 use crate::pvh;
 use crate::tp;
+use crate::hyperv;
 use crate::machine::Machine;
-use crate::memory::GuestMemory;
+use crate::memory::{GuestMemory, OverlaySlot};
 use crate::mmio;
 use crate::place::Shape;
 use crate::smp::{Doorbells, Mailbox, MAX_VCPUS};
@@ -97,6 +98,8 @@ const COM1_IRQ: u8 = 4;
 /// The exceptions of a guest's own the host intercepts -- so that the CPU
 /// cannot be made to deliver one inside another for good -- and gives back.
 const VECTOR_DB: u8 = 1;
+const VECTOR_UD: u8 = 6;
+const VECTOR_GP: u8 = 13;
 const VECTOR_AC: u8 = 17;
 /// An NMI's vector, as `hv_inject` says one.
 const VECTOR_NMI: u8 = 2;
@@ -399,7 +402,7 @@ enum Step {
 const ASLEEP_WAIT_NS: u64 = kcore::consts::NS_PER_SEC;
 
 /// Room for the register dump of the CPU that stopped a guest.
-const DUMP_BYTES: usize = 1024;
+const DUMP_BYTES: usize = 2048;
 /// A page of the guest's memory: what its dirty log marks (`crate::dirty`).
 const GUEST_PAGE: u64 = 4096;
 /// The most write faults in a row one CPU takes at one page with no round of
@@ -445,6 +448,9 @@ pub enum Stop {
     /// (`devices::pvpanic`) at `rip`: stopped there rather than left to spin
     /// in `panic` on a host CPU.
     Panicked { rip: u64 },
+    /// Windows reported a bugcheck through Hyper-V's crash MSRs: P0-P4,
+    /// the bugcheck code and its four arguments.
+    Crashed { params: [u64; 5] },
     /// An MMIO access of a device's that could not be performed for it:
     /// the instruction at `rip` that reached `gpa`, as far as it was read
     /// (`bytes`), and why (`error`).
@@ -845,6 +851,10 @@ pub struct GuestCpu {
     index: u32,
     cpu: Cpu,
     lapic: Lapic,
+    /// Its Hyper-V direct synthetic timers, when the guest uses Hv#1.
+    hyperv: hyperv::Vp,
+    /// Fixed and variable MTRRs and DEF_TYPE, kept per vCPU.
+    mtrrs: vmstate::Mtrrs,
     activity: Activity,
     /// An NMI another CPU sent it, not yet injected: an NMI is latched, one
     /// at a time, until the CPU can take it.
@@ -1158,6 +1168,11 @@ pub struct LinuxGuest {
     /// a memory map of another guest's RAM would hand its kernel the BARs'
     /// hole as RAM.
     low_end: u64,
+    /// The host bridge on bus 0, and the configuration access it offers.
+    host_bridge: HostBridge,
+    /// Microsoft's interface, for a firmware guest that asked for it; KVM's
+    /// where this is None. Its hypercall frame follows `memory` at drop.
+    hyperv: Option<hyperv::Hyperv>,
     /// The CR4 bits its CPUs may set, by the CPUID they are told
     /// (`policy::cr4_allowed`): asked of the host once, not at every write.
     cr4_allowed: u64,
@@ -1304,7 +1319,8 @@ impl LinuxGuest {
     pub fn new(machine: &Machine, mem_bytes: u64, huge: bool, cpus: u32, doorbells: Arc<Doorbells>, x2apic: bool,
                ioapic: bool) -> Result<(Self, Vec<GuestCpu>)>
     {
-        Self::build(machine, mem_bytes, huge, cpus, doorbells, x2apic, ioapic, linux::LOW_RAM_END, None)
+        Self::build(machine, mem_bytes, huge, cpus, doorbells, x2apic, ioapic, linux::HOLE_RAM_END, None,
+                    HostBridge::Q35)
     }
 
     /// As [`new`](Self::new), its RAM from NUMA node `node` first where it
@@ -1313,18 +1329,18 @@ impl LinuxGuest {
     pub fn new_on(machine: &Machine, mem_bytes: u64, huge: bool, cpus: u32, doorbells: Arc<Doorbells>, x2apic: bool,
                   ioapic: bool, node: Option<usize>) -> Result<(Self, Vec<GuestCpu>)>
     {
-        Self::build(machine, mem_bytes, huge, cpus, doorbells, x2apic, ioapic, linux::LOW_RAM_END, node)
+        Self::build(machine, mem_bytes, huge, cpus, doorbells, x2apic, ioapic, linux::HOLE_RAM_END, node,
+                    HostBridge::Q35)
     }
 
     /// As [`new`](Self::new), for a guest that is to hold a host's function
-    /// (`add_host_function`): its RAM below 4 GiB ending at
-    /// `linux::HOLE_RAM_END`, the rest above, so that a 32-bit BAR has room
-    /// below the platform's pages, and a 64-bit one above its RAM.
+    /// (`add_host_function`): Q35's PCI hole has room for its BARs.
     #[allow(clippy::too_many_arguments)]
     pub fn new_holed(machine: &Machine, mem_bytes: u64, huge: bool, cpus: u32, doorbells: Arc<Doorbells>,
                      x2apic: bool, ioapic: bool) -> Result<(Self, Vec<GuestCpu>)>
     {
-        Self::build(machine, mem_bytes, huge, cpus, doorbells, x2apic, ioapic, linux::HOLE_RAM_END, None)
+        Self::build(machine, mem_bytes, huge, cpus, doorbells, x2apic, ioapic, linux::HOLE_RAM_END, None,
+                    HostBridge::Q35)
     }
 
     /// As [`new_holed`](Self::new_holed), its RAM from NUMA node `node`
@@ -1333,15 +1349,50 @@ impl LinuxGuest {
     pub fn new_holed_on(machine: &Machine, mem_bytes: u64, huge: bool, cpus: u32, doorbells: Arc<Doorbells>,
                         x2apic: bool, ioapic: bool, node: Option<usize>) -> Result<(Self, Vec<GuestCpu>)>
     {
-        Self::build(machine, mem_bytes, huge, cpus, doorbells, x2apic, ioapic, linux::HOLE_RAM_END, node)
+        Self::build(machine, mem_bytes, huge, cpus, doorbells, x2apic, ioapic, linux::HOLE_RAM_END, node,
+                    HostBridge::Q35)
+    }
+
+    /// A CloudHv guest: Q35's RAM hole, but CloudHv's own host bridge, no
+    /// ECAM, and xAPIC plus an IO-APIC even with one CPU.
+    pub fn new_firmware(machine: &Machine, mem_bytes: u64, huge: bool, cpus: u32, doorbells: Arc<Doorbells>)
+        -> Result<(Self, Vec<GuestCpu>)>
+    {
+        Self::build(machine, mem_bytes, huge, cpus, doorbells, false, true, linux::HOLE_RAM_END, None,
+                    HostBridge::CloudHv)
+    }
+
+    /// As [`new_firmware`](Self::new_firmware), its RAM from NUMA node `node`
+    /// first where it names one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_firmware_on(machine: &Machine, mem_bytes: u64, huge: bool, cpus: u32, doorbells: Arc<Doorbells>,
+                           node: Option<usize>) -> Result<(Self, Vec<GuestCpu>)>
+    {
+        Self::build(machine, mem_bytes, huge, cpus, doorbells, false, true, linux::HOLE_RAM_END, node,
+                    HostBridge::CloudHv)
+    }
+
+    /// A CloudHv guest with Microsoft's Hv#1 interface, for Windows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_hyperv_on(machine: &Machine, mem_bytes: u64, huge: bool, cpus: u32, doorbells: Arc<Doorbells>,
+                         node: Option<usize>) -> Result<(Self, Vec<GuestCpu>)>
+    {
+        let (mut guest, cpus) = Self::new_firmware_on(machine, mem_bytes, huge, cpus, doorbells, node)?;
+        let hz = time::cycle_counter_hz().ok_or(Error::NotImplemented)?;
+        let epoch = time::cycle_counter().wrapping_add(guest.tsc_offset());
+        let interface = hyperv::Hyperv::new(guest.vendor, epoch, hz)?;
+        guest.memory.prepare_overlay(OverlaySlot::Hypercall, interface.code())?;
+        guest.memory.prepare_overlay(OverlaySlot::ReferenceTsc, interface.reference_page())?;
+        guest.hyperv = Some(interface);
+        Ok((guest, cpus))
     }
 
     #[allow(clippy::too_many_arguments)]
     fn build(machine: &Machine, mem_bytes: u64, huge: bool, cpus: u32, doorbells: Arc<Doorbells>, x2apic: bool,
-             ioapic: bool, low_end: u64, node: Option<usize>) -> Result<(Self, Vec<GuestCpu>)>
+             ioapic: bool, low_end: u64, node: Option<usize>, host_bridge: HostBridge) -> Result<(Self, Vec<GuestCpu>)>
     {
         let n = cpus as usize;
-        if n == 0 || n > MAX_CPUS || doorbells.len() != n || (ioapic && n < 2) || mem_bytes > MAX_MEM_BYTES {
+        if n == 0 || n > MAX_CPUS || doorbells.len() != n || mem_bytes > MAX_MEM_BYTES {
             return Err(Error::BadAddress);
         }
         let ram = linux::Ram::of_below(mem_bytes, low_end);
@@ -1368,9 +1419,9 @@ impl LinuxGuest {
                 memory.add(base, size)?;
             }
         }
-        /* The PCI Express configuration space, every access of it the run
-         * loop's (`ecam`), where the guest has the BARs' hole */
-        if windows.is_some() {
+        /* Q35's PCI Express configuration space, every access of it the run
+         * loop's (`ecam`). CloudHv uses CF8/CFC alone and has no MCFG. */
+        if host_bridge == HostBridge::Q35 {
             memory.trap_range(linux::ECAM_BASE, linux::ECAM_BYTES)?;
         }
 
@@ -1392,6 +1443,8 @@ impl LinuxGuest {
                 index: i,
                 cpu,
                 lapic,
+                hyperv: hyperv::Vp::default(),
+                mtrrs: vmstate::Mtrrs::default(),
                 activity,
                 nmi_pending: false,
                 exception: None,
@@ -1435,10 +1488,17 @@ impl LinuxGuest {
             pit: Pit::new(),
             rtc: Rtc::new(),
             pic: Pic::new(),
-            pm: Pm::new(time::boot_time_ns()),
+            pm: if host_bridge == HostBridge::CloudHv {
+                Pm::new_cloudhv(time::boot_time_ns())
+            } else {
+                Pm::new(time::boot_time_ns())
+            },
             pvpanic: PvPanic::default(),
             ioapic: ioapic.then(|| IoApic::new(cpus as u8)),
-            pci: PciBus::new()?,
+            pci: match host_bridge {
+                HostBridge::Q35 => PciBus::new()?,
+                HostBridge::CloudHv => PciBus::with_host_bridge(HostBridge::CloudHv)?,
+            },
             pci_devs,
             disks: 0,
             nics: 0,
@@ -1466,6 +1526,8 @@ impl LinuxGuest {
             loaded: false,
             windows,
             low_end,
+            host_bridge,
+            hyperv: None,
             cr4_allowed: crate::policy::cr4_allowed(),
             apicv: None,
             posted: AtomicU64::new(0),
@@ -1573,13 +1635,11 @@ impl LinuxGuest {
         (self.host_msi.load(Ordering::Relaxed), self.host_msi_lost.load(Ordering::Relaxed))
     }
 
-    /// Whether its CPUs have local APICs: a guest of more than one CPU. One
-    /// of one is the PC it always was -- an 8259 on the CPU's interrupt pin,
-    /// no APIC in CPUID, no MP table, the APIC's MSRs none of its business
-    /// -- which any kernel boots; the local APIC, its MP table and its x2APIC
-    /// mode take a Linux of 6.6 or later.
+    /// Whether its CPUs have local APICs: a guest of more than one CPU, or
+    /// one with an IO-APIC to deliver to. A plain guest of one is the PC it
+    /// always was -- an 8259 on its interrupt pin, no APIC in CPUID.
     pub fn has_apic(&self) -> bool {
-        self.cpus.len() > 1
+        self.cpus.len() > 1 || self.has_ioapic()
     }
 
     /// Whether it has an IO-APIC.
@@ -1638,7 +1698,7 @@ impl LinuxGuest {
     /// (`new_holed`), once its tables are laid out, or where a BAR does not
     /// fit its window.
     pub fn add_host_function(&mut self, mut function: HostFunction, at: HostAddress) -> Result<()> {
-        if self.loaded {
+        if self.loaded || self.host_bridge != HostBridge::Q35 {
             return Err(Error::BadAddress);
         }
         let Some((ref mut free, _)) = self.windows else { return Err(Error::BadAddress) };
@@ -1919,26 +1979,32 @@ impl LinuxGuest {
     /// `ioapic`, and each device on the bus, `routes` -- and the SMBIOS ones,
     /// what it is (`set_identity`).
     fn write_firmware(&self, routes: &[acpi::Route], msix: bool, ioapic: bool) -> Result<linux::Firmware> {
-        /* The window covers every slot's page, whichever have one. */
-        let window = msix.then_some((MSIX_PAGES, pci::MAX_SLOTS as u32 * pci::MSIX_PAGE));
-        /* The host's functions' windows, whole, for a guest made with them:
-         * an OS keeps a BAR inside one where firmware put it */
-        let (bars32, bars64) = match self.windows {
-            /* Either empty where the guest's addresses end short of it -- a
-             * CPUID of few address bits -- and said as none. The 64-bit one
-             * only as far as the BARs placed in it reach, a GiB at a time:
-             * the rest of the guest's addresses are its OS's own -- Linux's
-             * HMM takes a GPU's VRAM's worth of them for device memory
-             * (NVIDIA's UVM), and with a window to the top of them none was
-             * left, and CUDA was refused */
-            Some((placed, w)) => (
-                u32::try_from(w.low).ok().zip(w.low_end.checked_sub(w.low).and_then(|n| u32::try_from(n).ok())),
-                placed.high.checked_sub(w.high).filter(|&n| n != 0).map(|n| {
-                    let room = w.high_end.saturating_sub(w.high);
-                    (w.high, n.div_ceil(BARS64_ROUNDING).saturating_mul(BARS64_ROUNDING).min(room))
-                }),
+        /* Q35's fixed MSI-X window covers every slot's page. CloudHv
+         * assigns the BARs itself, inside its one 32-bit aperture. */
+        let window = (msix && self.host_bridge == HostBridge::Q35)
+            .then_some((MSIX_PAGES, pci::MAX_SLOTS as u32 * pci::MSIX_PAGE));
+        let (bars32, bars64) = match self.host_bridge {
+            HostBridge::CloudHv => (
+                Some((linux::HOLE_RAM_END as u32, (linux::CLOUDHV_MMIO32_END - linux::HOLE_RAM_END) as u32)),
+                None,
             ),
-            None => (None, None),
+            HostBridge::Q35 => match self.windows {
+                /* Either empty where the guest's addresses end short of it --
+                 * a CPUID of few address bits -- and said as none. The 64-bit
+                 * one only as far as the BARs placed in it reach, a GiB at a
+                 * time: the rest of the guest's addresses are its OS's own --
+                 * Linux's HMM takes a GPU's VRAM's worth of them for device
+                 * memory (NVIDIA's UVM), and with a window to the top of them
+                 * none was left, and CUDA was refused */
+                Some((placed, w)) => (
+                    u32::try_from(w.low).ok().zip(w.low_end.checked_sub(w.low).and_then(|n| u32::try_from(n).ok())),
+                    placed.high.checked_sub(w.high).filter(|&n| n != 0).map(|n| {
+                        let room = w.high_end.saturating_sub(w.high);
+                        (w.high, n.div_ceil(BARS64_ROUNDING).saturating_mul(BARS64_ROUNDING).min(room))
+                    }),
+                ),
+                None => (None, None),
+            },
         };
         let machine = acpi::Machine {
             cpus: self.cpus(),
@@ -1948,7 +2014,8 @@ impl LinuxGuest {
             mmio: window,
             bars32,
             bars64,
-            ecam: self.windows.is_some().then_some(ECAM),
+            ecam: (self.host_bridge == HostBridge::Q35 && self.windows.is_some()).then_some(ECAM),
+            host_bridge: self.host_bridge,
         };
 
         let mut buf = Vec::new();
@@ -2261,7 +2328,8 @@ impl LinuxGuest {
     /// of it. Its mailbox is read after the devices are drained
     /// (`capture`).
     fn cpu_state(&self, gc: &mut GuestCpu, at: u64) -> vmstate::Result<vmstate::Cpu> {
-        let regs = gc.cpu.backend_mut().save_regs()?;
+        let mut regs = gc.cpu.backend_mut().save_regs()?;
+        regs.mtrrs = gc.mtrrs;
         Ok(vmstate::Cpu {
             regs,
             nmi_pending: gc.nmi_pending,
@@ -2342,6 +2410,9 @@ impl LinuxGuest {
         if pause == 0 {
             return Err(vmstate::Error("a state taken of a guest not paused"));
         }
+        if self.host_bridge != HostBridge::Q35 {
+            return Err(vmstate::Error("a firmware guest's host bridge is not in its saved state"));
+        }
         if self.holds_host_function() {
             /* Its device's DMA reaches no dirty log, and what the device is
              * in is the device's own: no state of it to take, nor to move */
@@ -2395,6 +2466,9 @@ impl LinuxGuest {
         }
 
         let p = self.platform.lock();
+        if p.pci.msix_sizing() {
+            return Err(vmstate::Error("a state taken while an MSI-X BAR shows its sizing mask"));
+        }
         let (pci_address, functions) = p.pci.save().ok_or(vmstate::Error("no memory for PCI's state"))?;
         let mut devices = Vec::new();
         devices.try_reserve_exact(p.pci_devs.len()).map_err(|_| vmstate::Error("no memory for the devices' states"))?;
@@ -2449,6 +2523,9 @@ impl LinuxGuest {
         let bad = |what| Err(vmstate::Error(what));
         if self.loaded {
             return bad("a state restored over a guest that has booted");
+        }
+        if self.host_bridge != HostBridge::Q35 {
+            return bad("a firmware guest's host bridge is not in the saved state");
         }
         let vendor = match s.vm.vendor {
             vmstate::Vendor::Svm => hvarch::Vendor::Svm,
@@ -2507,7 +2584,7 @@ impl LinuxGuest {
                 (None, None) => {}
                 _ => return bad("an IO-APIC where the guest built here has none, or none where it has one"),
             }
-            p.pci.restore(f.pci_address, &f.functions)?;
+            p.pci.restore(f.pci_address, &f.functions, &mut |m| self.move_msix(m))?;
             if p.pci_devs.len() != f.devices.len() || p.msix_pending.len() != f.msix_pending.len() {
                 return bad("a state of a guest of other devices");
             }
@@ -2524,6 +2601,10 @@ impl LinuxGuest {
         for ((gc, c), shared) in cpus.iter_mut().zip(&s.cpus).zip(&self.cpus) {
             let b = gc.cpu.backend_mut();
             b.restore_regs(&c.regs)?;
+            if !c.regs.mtrrs.valid(crate::policy::phys_bits()) {
+                return bad("MTRRs with reserved bits or memory types this CPU would refuse");
+            }
+            gc.mtrrs = c.regs.mtrrs;
             b.set_tsc_offset(tsc_offset);
             gc.lapic.restore(&c.lapic, now)?;
             gc.activity = match c.activity {
@@ -2872,6 +2953,15 @@ impl LinuxGuest {
                     gc.counts.worst = Worst { late, how: how as u8, due: due.unwrap_or(0), entered, asked, left };
                 }
             }
+            let hyperv_due = if let Some(hyperv) = &self.hyperv {
+                let tsc = time::cycle_counter().wrapping_add(self.tsc_offset.load(Ordering::Relaxed));
+                let reference_now = hyperv.reference_time(tsc);
+                gc.hyperv.poll(reference_now, &mut gc.lapic, &self.memory).map(|due| {
+                    now.saturating_add(due.saturating_sub(reference_now).saturating_mul(100))
+                })
+            } else {
+                None
+            };
             shared.extint.store(gc.lapic.accepts_extint(), Ordering::Relaxed);
 
             /* The devices' work, on the first CPU's loop, whatever that CPU
@@ -3082,11 +3172,12 @@ impl LinuxGuest {
              * on to its next exit with it owed: round again to take it, before
              * anything is handed in for this entry; the entry itself turns
              * back for one that comes after this. */
-            let timers = pit_edge.unwrap_or(u64::MAX).min(gc.lapic.next_timer_ns().unwrap_or(u64::MAX));
+            let timers = pit_edge.unwrap_or(u64::MAX).min(gc.lapic.next_timer_ns().unwrap_or(u64::MAX))
+                .min(hyperv_due.unwrap_or(u64::MAX));
             let edge = timers.min(devices_due.unwrap_or(u64::MAX));
             gc.asked = (edge != u64::MAX).then_some(edge);
             kick.arm_at(gc.asked);
-            gc.other_due = sooner(pit_edge, devices_due);
+            gc.other_due = sooner(sooner(pit_edge, devices_due), hyperv_due);
             if timers <= time::boot_time_ns() {
                 kick.cancel();
                 gc.counts.timer_raced += 1;
@@ -3177,7 +3268,7 @@ impl LinuxGuest {
                     let leaf = v.save().rax as u32;
                     let asker = crate::policy::Asker {
                         apic_id: gc.lapic.id(), apic, apic_on: gc.lapic.enabled(), cr4: v.cr4(), xcr0: v.xcr0(),
-                        shape: self.shape,
+                        shape: self.shape, hyperv: self.hyperv.is_some(),
                     };
                     let answer = crate::policy::cpuid(leaf, sub, &asker);
                     let (save, regs) = v.save_and_regs_mut();
@@ -3233,6 +3324,12 @@ impl LinuxGuest {
                         == vmcb::npf::PRESENT | vmcb::npf::WRITE
                         && self.dirty_write(gc, gpa) =>
                 {
+                    None
+                }
+                Exit::NestedFault { gpa, error } if error & vmcb::npf::WRITE != 0
+                    && self.memory.overlay_contains(gpa) =>
+                {
+                    gc.cpu.backend_mut().reflect_exception(VECTOR_GP, Some(0));
                     None
                 }
                 Exit::NestedFault { gpa, error } => {
@@ -3411,13 +3508,24 @@ impl LinuxGuest {
                     None
                 }
                 Exit::Hypercall => {
-                    /* KVM's hypercalls: none is offered, and each is answered
-                     * -KVM_ENOSYS in RAX, as KVM answers one it does not
-                     * know -- a driver that probes for one, as ptp_kvm does
-                     * for its clock pairing, reads that as not there. */
                     let v = gc.cpu.backend_mut();
-                    v.save_mut().rax = KVM_ENOSYS;
-                    v.skip_vmmcall();
+                    if let Some(hyperv) = &self.hyperv {
+                        /* Hv#1 has no call implemented yet. An unknown one is
+                         * answered by its own status; with the page off the
+                         * opcode is an illegal one, as the TLFS has it. */
+                        match hyperv.call(v.regs().rcx) {
+                            Some(answer) => {
+                                v.save_mut().rax = answer;
+                                v.skip_vmmcall();
+                            }
+                            None => v.reflect_exception(VECTOR_UD, None),
+                        }
+                    } else {
+                        /* A driver that probes for one, as ptp_kvm does for
+                         * its clock pairing, reads -KVM_ENOSYS as not there. */
+                        v.save_mut().rax = KVM_ENOSYS;
+                        v.skip_vmmcall();
+                    }
                     None
                 }
                 other => Some(Stop::Unexpected { exit: other, rip }),
@@ -3712,6 +3820,7 @@ impl LinuxGuest {
         let v = gc.cpu.backend_mut();
         if !v.interruptible() {
             gc.counts.blocked += 1;
+            v.clear_irq_window();
             v.request_irq_window();
             tp::inject(gc.index, gc.cpu.pid(), InjectKind::Window, apic.unwrap_or(0));
             return;
@@ -4224,7 +4333,9 @@ impl LinuxGuest {
                 gc.counts.port_in += 1;
             } else {
                 let value = v.save().rax as u32;
-                p.pci.write(io.port, io.size, value);
+                if let Some(m) = p.pci.write(io.port, io.size, value) {
+                    self.move_msix(m);
+                }
                 sync_msix(&mut p);
                 gc.counts.port_out += 1;
             }
@@ -4439,7 +4550,9 @@ impl LinuxGuest {
             let emulated = t.bus == 0 && !p.pci.is_host(t.device);
             match (op.is_write(), emulated) {
                 (true, true) => {
-                    p.pci.function_write(t.device, t.function, t.at, size, op.value as u32);
+                    if let Some(m) = p.pci.function_write(t.device, t.function, t.at, size, op.value as u32) {
+                        self.move_msix(m);
+                    }
                     sync_msix(&mut p);
                     0
                 }
@@ -4508,6 +4621,13 @@ impl LinuxGuest {
         }
     }
 
+    /// A virtio function's MSI-X BAR moved: its guest-visible configuration
+    /// has already changed, so its own nested mapping moves with it.
+    fn move_msix(&self, m: pci::MsixMove) {
+        self.memory.move_msix(u64::from(m.page), u64::from(m.from), u64::from(m.to))
+            .expect("an MSI-X page's backing region and current BAR");
+    }
+
     /// Answer an `rdmsr` or `wrmsr`: the local APIC's registers and its base
     /// MSR from the APIC, the rest from the policy.
     fn msr(&self, gc: &mut GuestCpu, write: bool) -> Option<Stop> {
@@ -4520,6 +4640,42 @@ impl LinuxGuest {
             gc.counts.msr_write += 1;
         } else {
             gc.counts.msr_read += 1;
+        }
+
+        /* Hv#1's partition-wide MSRs, and this CPU's synthetic timers. */
+        if let Some(hyperv) = &self.hyperv {
+            if write {
+                if let Some(ok) = hyperv.write(msr, value, &self.memory) {
+                    if ok {
+                        gc.cpu.backend_mut().skip_msr();
+                        if let Some(params) = hyperv.crashed() {
+                            return Some(Stop::Crashed { params });
+                        }
+                    } else {
+                        self.msr_fault(gc, msr, value, true);
+                    }
+                    return None;
+                }
+                let tsc = time::cycle_counter().wrapping_add(self.tsc_offset.load(Ordering::Relaxed));
+                if let Some(ok) = gc.hyperv.write(msr, value, hyperv.reference_time(tsc), &self.memory) {
+                    if ok {
+                        gc.cpu.backend_mut().skip_msr();
+                    } else {
+                        self.msr_fault(gc, msr, value, true);
+                    }
+                    return None;
+                }
+            } else {
+                let tsc = time::cycle_counter().wrapping_add(self.tsc_offset.load(Ordering::Relaxed));
+                let value = hyperv.read(msr, gc.index, tsc).or_else(|| gc.hyperv.read(msr));
+                if let Some(value) = value {
+                    let b = gc.cpu.backend_mut();
+                    let (save, regs) = b.save_and_regs_mut();
+                    set_msr_read(save, regs, value);
+                    b.skip_msr();
+                    return None;
+                }
+            }
         }
 
         /* KVM's PV EOI: where the guest's word is, and whether it is on --
@@ -4605,8 +4761,10 @@ impl LinuxGuest {
 
         let v = gc.cpu.backend_mut();
         let mut own = v.own_msrs();
+        own.mtrrs = gc.mtrrs;
         if write {
             if crate::policy::wrmsr(v.save_mut(), &mut own, msr, value) && v.set_own_msrs(&own) {
+                gc.mtrrs = own.mtrrs;
                 v.skip_msr();
             } else {
                 self.msr_fault(gc, msr, value, true);
@@ -4689,14 +4847,14 @@ fn tsc_ns(tsc: u64, offset: u64) -> u64 {
 /// The MSI-X table page of the device in PCI slot `slot`, made guest memory:
 /// the page the function's BAR 1 names, where the guest writes its table
 /// and the device reads it. None for a guest with no APIC to take a
-/// message. RAM never reaches it (`linux::LOW_RAM_END`).
+/// message. RAM never reaches its initial address (`linux::HOLE_RAM_END`).
 fn msix_page(memory: &mut GuestMemory, apic: bool, slot: usize) -> Result<Option<u32>> {
     if !apic {
         return Ok(None);
     }
     let Some(page) = u32::try_from(slot).ok().and_then(|s| s.checked_mul(pci::MSIX_PAGE))
         .and_then(|off| MSIX_PAGES.checked_add(off)) else { return Ok(None) };
-    memory.add(u64::from(page), u64::from(pci::MSIX_PAGE))?;
+    memory.add_msix(u64::from(page))?;
     Ok(Some(page))
 }
 

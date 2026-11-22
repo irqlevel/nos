@@ -53,6 +53,12 @@ struct Region {
     huge: bool,
 }
 
+struct MsixMapping {
+    backing: u64,
+    at: u64,
+    mapped: bool,
+}
+
 impl Region {
     fn contains(&self, gpa: u64, len: u64) -> bool {
         gpa >= self.base && len <= self.size && gpa - self.base <= self.size - len
@@ -135,6 +141,35 @@ impl crate::dirty::Table for Protected {
     }
 }
 
+struct DirtyTable<'a> {
+    table: &'a mut Protected,
+    msix: &'a [MsixMapping],
+}
+
+impl crate::dirty::Table for DirtyTable<'_> {
+    fn protect(&mut self, gpa: u64) -> bool {
+        let page = gpa & !(PAGE - 1);
+        match self.msix.iter().find(|m| m.backing == page) {
+            Some(m) => !m.mapped || crate::dirty::Table::protect(self.table, m.at),
+            None => crate::dirty::Table::protect(self.table, gpa),
+        }
+    }
+
+    fn unprotect(&mut self, gpa: u64) -> bool {
+        let page = gpa & !(PAGE - 1);
+        match self.msix.iter().find(|m| m.backing == page) {
+            Some(m) => !m.mapped || crate::dirty::Table::unprotect(self.table, m.at),
+            None => crate::dirty::Table::unprotect(self.table, gpa),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum OverlaySlot {
+    Hypercall,
+    ReferenceTsc,
+}
+
 pub struct GuestMemory {
     regions: Vec<Region>,
     /// The dirty log, as the real one keeps it (`crate::dirty`), over a
@@ -147,6 +182,10 @@ pub struct GuestMemory {
     absent: Mutex<Vec<u64>>,
     /// A host's function's BARs mapped (`map_device`): base and size.
     devices: Mutex<Vec<(u64, u64)>>,
+    /// The real one's movable MSI-X mappings, by their stable backing page.
+    msix: Mutex<Vec<MsixMapping>>,
+    /// Hyper-V's overlays' GPAs, while each is enabled.
+    overlays: Mutex<[Option<u64>; 2]>,
     /// `map` refuses, as the real one does with no address left.
     refuse_maps: AtomicBool,
     /// Mappings made: each one undone is an address the real kernel shoots
@@ -168,6 +207,8 @@ impl GuestMemory {
             shared: Arc::new(Shared { pages: Mutex::new(Pages::default()), racer: Mutex::new(None), late: Mutex::new(None) }),
             absent: Mutex::new(Vec::new()),
             devices: Mutex::new(Vec::new()),
+            msix: Mutex::new(Vec::new()),
+            overlays: Mutex::new([None; 2]),
             refuse_maps: AtomicBool::new(false),
             maps: AtomicUsize::new(0),
             moved: AtomicU64::new(0),
@@ -408,6 +449,12 @@ impl GuestMemory {
         self.add_region(base, size, PAGE, false)
     }
 
+    pub fn add_msix(&mut self, base: u64) -> Result<()> {
+        self.add(base, PAGE)?;
+        self.msix.lock().unwrap().push(MsixMapping { backing: base, at: base, mapped: true });
+        Ok(())
+    }
+
     /// As the real one gives the huge pool's: whole 2 MiB blocks, clear of
     /// every other region -- kept as any region is, a page at a time.
     pub fn add_huge(&mut self, base: u64, size: u64, _leaves_2m: bool) -> Result<()> {
@@ -488,11 +535,18 @@ impl GuestMemory {
 
     /// The real one's steps, over the model table.
     pub fn write_fault(&self, gpa: u64) -> bool {
+        let page = gpa & !(PAGE - 1);
+        let msix = self.msix.lock().unwrap();
+        let moved = msix.iter().find(|m| m.mapped && m.at == page);
+        if moved.is_none() && msix.iter().any(|m| m.backing == page && (!m.mapped || m.at != page)) {
+            return false;
+        }
+        let gpa = moved.map_or(gpa, |m| m.backing + (gpa - page));
         if self.inside(gpa & !(PAGE - 1), PAGE as usize).is_err() {
             return false;
         }
-        let mut t = self.table.lock().unwrap();
-        self.log.fault(&mut *t, gpa)
+        let mut table = self.table.lock().unwrap();
+        self.log.fault(&mut DirtyTable { table: &mut table, msix: &msix }, gpa)
     }
 
     fn renew(&self) -> u64 {
@@ -500,9 +554,11 @@ impl GuestMemory {
     }
 
     pub fn log_start(&self) -> Result<u64> {
-        let mut t = self.table.lock().unwrap();
-        if !self.log.start(&mut *t) {
-            self.log.release(&mut *t);
+        let msix = self.msix.lock().unwrap();
+        let mut table = self.table.lock().unwrap();
+        let mut dirty = DirtyTable { table: &mut table, msix: &msix };
+        if !self.log.start(&mut dirty) {
+            self.log.release(&mut dirty);
             self.renew();
             return Err(Error::NoMemory);
         }
@@ -510,8 +566,9 @@ impl GuestMemory {
     }
 
     pub fn log_take(&self, out: &mut dyn FnMut(u64)) -> Result<(u64, u64)> {
-        let mut t = self.table.lock().unwrap();
-        let n = self.log.take(Some(&mut *t), out);
+        let msix = self.msix.lock().unwrap();
+        let mut table = self.table.lock().unwrap();
+        let n = self.log.take(Some(&mut DirtyTable { table: &mut table, msix: &msix }), out);
         let id = self.renew();
         n.map(|n| (n, id)).ok_or(Error::NoMemory)
     }
@@ -525,8 +582,9 @@ impl GuestMemory {
     }
 
     pub fn log_stop(&self) {
-        let mut t = self.table.lock().unwrap();
-        self.log.release(&mut *t);
+        let msix = self.msix.lock().unwrap();
+        let mut table = self.table.lock().unwrap();
+        self.log.release(&mut DirtyTable { table: &mut table, msix: &msix });
     }
 
     /// Whether the page at `gpa` is read-only to the guest now.
@@ -557,6 +615,51 @@ impl GuestMemory {
         self.write(gpa, &value.to_le_bytes())
     }
 
+    /// The real one's movable mapping, over the model's nested RAM ranges.
+    pub fn move_msix(&self, backing: u64, from: u64, to: u64) -> Result<u64> {
+        if !self.regions.iter().any(|r| r.base == backing && r.size == PAGE) {
+            return Err(Error::Unmapped);
+        }
+        let absent = self.absent.lock().unwrap();
+        let devices = self.devices.lock().unwrap();
+        let mut msix = self.msix.lock().unwrap();
+        let i = msix.iter().position(|m| m.backing == backing).ok_or(Error::Unmapped)?;
+        if msix[i].at != from {
+            return Err(Error::BadAddress);
+        }
+        let old_mapped = msix[i].mapped;
+        let valid = to.checked_add(PAGE).is_some_and(|end| {
+            to % PAGE == 0 && end <= MAX_GPA && to != XAPIC_PAGE
+                && (to == backing || !self.regions.iter().any(|r| to < r.base + r.size && r.base < end))
+                && !absent.contains(&to)
+                && !devices.iter().any(|&(b, s)| to < b + s && b < end)
+                && !msix.iter().enumerate().any(|(j, m)| j != i && m.mapped && to < m.at + PAGE && m.at < end)
+                && self.overlays.lock().unwrap().iter().all(|at| *at != Some(to))
+        });
+        let mut table = self.table.lock().unwrap();
+        if old_mapped {
+            if let Some(old) = table.ram.iter().position(|&r| r == (from, PAGE)) {
+                table.ram.swap_remove(old);
+            }
+            table.ro.remove(&from);
+        }
+        if valid {
+            table.ram.push((to, PAGE));
+            if self.log.active() {
+                table.ro.insert(to);
+            }
+        }
+        let mapping = &mut msix[i];
+        mapping.at = to;
+        mapping.mapped = valid;
+        Ok(self.renew())
+    }
+
+    /// The current nested address of an MSI-X backing page, for the PCI target.
+    pub fn msix_mapping(&self, backing: u64) -> Option<u64> {
+        self.msix.lock().unwrap().iter().find(|m| m.backing == backing && m.mapped).map(|m| m.at)
+    }
+
     /// As the real one decides it: a page of the MMIO window that is no
     /// region's, no BAR's and not the local APIC's, up to 64 of them -- the
     /// BARs looked at under the absent pages' lock, as the real one does.
@@ -567,6 +670,12 @@ impl GuestMemory {
         }
         let mut absent = self.absent.lock().unwrap();
         if self.is_device(page) {
+            return Err(Error::BadAddress);
+        }
+        if self.msix.lock().unwrap().iter().any(|m| m.mapped && m.at == page) {
+            return Err(Error::BadAddress);
+        }
+        if self.overlays.lock().unwrap().contains(&Some(page)) {
             return Err(Error::BadAddress);
         }
         if absent.contains(&page) {
@@ -602,6 +711,13 @@ impl GuestMemory {
         if devices.iter().any(|&(b, s)| gpa < b + s && b < end) {
             return Err(Error::BadAddress);
         }
+        let msix = self.msix.lock().unwrap();
+        if msix.iter().any(|m| m.mapped && gpa < m.at + PAGE && m.at < end) {
+            return Err(Error::BadAddress);
+        }
+        if self.overlays.lock().unwrap().iter().flatten().any(|&at| gpa <= at && at < end) {
+            return Err(Error::BadAddress);
+        }
         devices.push((gpa, size));
         Ok(())
     }
@@ -631,5 +747,36 @@ impl GuestMemory {
 
     pub fn is_device(&self, gpa: u64) -> bool {
         self.devices.lock().unwrap().iter().any(|&(b, s)| gpa >= b && gpa - b < s)
+    }
+
+    pub fn prepare_overlay(&self, _slot: OverlaySlot, _contents: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn map_overlay(&self, slot: OverlaySlot, gpa: u64) -> Result<()> {
+        if gpa % PAGE != 0 || gpa.checked_add(PAGE).is_none_or(|end| end > MAX_GPA)
+            || gpa == XAPIC_PAGE || self.absent.lock().unwrap().contains(&gpa)
+            || self.devices.lock().unwrap().iter().any(|&(b, s)| gpa >= b && gpa - b < s)
+            || self.msix.lock().unwrap().iter().any(|m| m.mapped && m.at == gpa)
+        {
+            return Err(Error::BadAddress);
+        }
+        let mut overlays = self.overlays.lock().unwrap();
+        if overlays.iter().enumerate().any(|(i, at)| i != slot as usize && *at == Some(gpa)) {
+            return Err(Error::BadAddress);
+        }
+        overlays[slot as usize] = Some(gpa);
+        self.id.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    pub fn unmap_overlay(&self, slot: OverlaySlot) -> Result<()> {
+        self.overlays.lock().unwrap()[slot as usize] = None;
+        self.id.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    pub fn overlay_contains(&self, gpa: u64) -> bool {
+        self.overlays.lock().unwrap().iter().flatten().any(|&at| gpa >= at && gpa - at < PAGE)
     }
 }

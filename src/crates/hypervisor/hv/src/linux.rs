@@ -77,11 +77,14 @@ pub(crate) const ONE_MIB: u64 = 0x10_0000;
 /// read and write its devices' registers as memory, none of them hearing of
 /// it. A multiple of 2 MiB, so that the huge pool's blocks end with it.
 pub const LOW_RAM_END: u64 = 0xFE00_0000;
-/// Where a guest's RAM below 4 GiB ends when it holds a host's function:
-/// 3 GiB, the window from here to the platform's pages (`LOW_RAM_END`) its
-/// 32-bit BARs' -- a GPU's registers are one such, 16 MiB -- as a PC's
-/// firmware leaves a PCI hole.
+/// Where a guest's RAM below 4 GiB ends on Q35 and CloudHv: 3 GiB, the
+/// window from here to the platform's pages (`LOW_RAM_END`) its 32-bit BARs'
+/// -- a GPU's registers are one such, 16 MiB -- as a PC's firmware leaves a
+/// PCI hole.
 pub const HOLE_RAM_END: u64 = 0xC000_0000;
+/// Where CloudHv's 32-bit PCI aperture ends (exclusive). Q35 reserves its
+/// own ECAM separately; CloudHv assigns every BAR inside this one window.
+pub const CLOUDHV_MMIO32_END: u64 = 0xFC00_0000;
 /// Where the rest of a guest's RAM is, past the devices' pages: from 4 GiB,
 /// as a PC's firmware puts what does not fit below them.
 pub const HIGH_RAM_START: u64 = 1 << 32;
@@ -92,9 +95,9 @@ const _: () = assert!(LOW_RAM_END % (2 << 20) == 0 && LOW_RAM_END < HIGH_RAM_STA
 /// on, and room past them -- at the top of the hole, below the platform's
 /// pages; reserved in its memory map and in its DSDT, as the PCI Firmware
 /// spec has firmware reserve it, and nothing's BARs.
-pub const ECAM_BUSES: u64 = 8;
+pub const ECAM_BUSES: u64 = 256;
 pub const ECAM_BYTES: u64 = ECAM_BUSES << 20;
-pub const ECAM_BASE: u64 = LOW_RAM_END - ECAM_BYTES;
+pub const ECAM_BASE: u64 = 0xE000_0000;
 const _: () = assert!(ECAM_BASE % ECAM_BYTES == 0 && ECAM_BASE > HOLE_RAM_END);
 
 /// A guest's RAM as the platform lays it out: from 0 up to `LOW_RAM_END` at
@@ -117,8 +120,7 @@ impl Ram {
     }
 
     /// `mem_bytes` of RAM, laid out, what is below 4 GiB ending at
-    /// `low_end` -- `HOLE_RAM_END` for a guest holding a host's function --
-    /// LOW_RAM_END at most.
+    /// `low_end` -- `HOLE_RAM_END` on Q35 and CloudHv -- LOW_RAM_END at most.
     pub fn of_below(mem_bytes: u64, low_end: u64) -> Ram {
         let low = mem_bytes.min(low_end.min(LOW_RAM_END));
         Ram { low, high: mem_bytes - low }
@@ -213,8 +215,8 @@ const TSS_BUSY_PRESENT: u64 = 0x8B;
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
     pub mem_bytes: u64,
-    /// Where its RAM below 4 GiB ends (`Ram::of_below`): `LOW_RAM_END`, or
-    /// `HOLE_RAM_END` for a guest holding a host's function -- what its
+    /// Where its RAM below 4 GiB ends (`Ram::of_below`): `LOW_RAM_END` for
+    /// the old machine, or `HOLE_RAM_END` on Q35 and CloudHv -- what its
     /// memory map says, and what the guest it is loaded into must have.
     pub low_end: u64,
     /// Where the 64-bit kernel is loaded: `pref_address`, since a kernel

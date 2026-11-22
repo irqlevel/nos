@@ -322,7 +322,7 @@ make image                     # nos-x86_64.squashfs, on Linux with the toolchai
 ```
 
 A read-only squashfs of the kernel, every module built with it, hvboot
-(`/lib/hvboot`, below), the GRUB entries that boot it
+(`/lib/hvboot`) and CloudHv (`/lib/CLOUDHV.fd`, below), the GRUB entries that boot it
 (`build/image/nos.cfg`), the default `/etc/rc` (`build/image/rc`),
 `scripts/nos-install` and a `VERSION` naming the build.
 Owners, times and modes are fixed (`mksquashfs -all-root -all-time 0
@@ -346,6 +346,27 @@ static, the small code model, compiler-builtins' `memcpy` and friends --
 and then linked by `ld.lld` with `src/crates/hypervisor/hvboot/hvboot.ld`, at 1 MiB,
 into an ELF with the `Xen` note PVH names its entry by. Offline, as
 everything is: it has no dependencies but `core` and `alloc`.
+
+## CloudHv guest firmware
+
+`build/image/CLOUDHV.fd` is OVMF's CloudHv firmware, another PVH ELF and a
+program of the guest's, for the UEFI path in [`plans/windows.md`](../plans/windows.md).
+It is checked in so an ordinary image build stays offline. Refresh it, and
+make the DEBUG build used for firmware bring-up, with:
+
+```sh
+./scripts/build-cloudhv.sh
+./scripts/build-cloudhv.sh --check   # rebuild and compare the checked-in RELEASE
+```
+
+The script builds `edk2-stable202608` at commit
+`2970e5699ba6267f3384ffab20f96647578aebc8` in the `nos-cloudhv-builder`
+Docker image, with iSCSI, SMM, TPM and Secure Boot off and the UEFI shell
+on. Network is needed to fetch that source and to make the builder image.
+The DEBUG firmware is `out/cloudhv/CLOUDHV-debug.fd`; its log goes to port
+`0x402`. The system image installs the RELEASE as `/lib/CLOUDHV.fd` and its
+EDK2, Xen and LZMA notices as `/lib/licenses/CLOUDHV`; `nos-install` replaces
+and rolls back the firmware with the kernel and modules.
 
 ## Firmware: BIOS and UEFI
 

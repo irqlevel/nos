@@ -17,8 +17,8 @@ for. The machine's microcode -- a made-up Intel CPU's, from a made-up
 it to the kernel as the module `ucode`, and the kernel finds it and says why
 it loads nothing under QEMU. The boot after that is the machine's own entry
 again: GRUB cleared the flag. Then nos-install update over what nos has
-written: the kernel, its modules and hvboot replaced -- every file of the
-image there again -- and the old ones kept for a rollback, with their
+written: the kernel, its modules, hvboot and CloudHv replaced -- every file
+of the image there again -- and the old ones kept for a rollback, with their
 VERSION, /etc and the host key kept, and the kernel parameters it is given
 -- the UDP shell -- taken. The update is given --panel too: root's password
 for the management panel printed once, its scrypt hash alone on the
@@ -176,6 +176,7 @@ mount_at "$IMAGE" img loop,ro
 cp img/VERSION img-version.out
 cat img/lib/panel/bundle > img-bundle.out 2>/dev/null || echo none > img-bundle.out
 cat img/lib/licenses/CRYPTOGAMS > img-license.out 2>/dev/null || echo none > img-license.out
+cat img/lib/licenses/CLOUDHV > img-cloudhv-license.out 2>/dev/null || echo none > img-cloudhv-license.out
 """
 
 PREPARE = r"""
@@ -1136,9 +1137,13 @@ def run(tmp, image):
     check("so does update", "update: every file of the image" in out,
           [line for line in out.splitlines() if line.startswith("update: ")])
     layout = linux.read("layout2.out").split()
-    check("update keeps the old kernel, modules, hvboot, licenses and VERSION for a rollback",
-          all(p in layout for p in ("kernel64.elf.prev", "modules.prev", "hvboot.prev", "licenses.prev",
-                                    "VERSION.prev")), layout)
+    check("update keeps the old kernel, modules, loaders, licenses and VERSION for a rollback",
+          all(p in layout for p in ("kernel64.elf.prev", "modules.prev", "hvboot.prev", "CLOUDHV.fd.prev",
+                                    "licenses.prev", "VERSION.prev")), layout)
+    cloudhv_notice = linux.read("img-cloudhv-license.out")
+    check("the image carries the CloudHv firmware's source and license notices",
+          "edk2-stable202608" in cloudhv_notice and "BSD-2-Clause-Patent" in cloudhv_notice and
+          "Copyright (c) 2016, Citrix Systems, Inc." in cloudhv_notice, cloudhv_notice[:300])
     notice = linux.read("img-license.out")
     check("the image carries the notice of the CRYPTOGAMS assembly its kernel and modules run, as its "
           "license asks of a binary", "CRYPTOGAMS by <appro@openssl.org>" in notice and

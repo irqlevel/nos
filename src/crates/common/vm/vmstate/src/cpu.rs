@@ -106,6 +106,9 @@ pub struct Regs {
     pub dr7: u64,
     pub tsc_aux: u64,
     pub spec_ctrl: u64,
+    /// Fixed and variable MTRRs and DEF_TYPE, saved but not applied to the
+    /// nested page table.
+    pub mtrrs: crate::Mtrrs,
     /// XCR0 and PKRU, and the x87, SSE and AVX registers in XSAVE's
     /// standard form -- the legacy region, the header, AVX's component.
     pub xcr0: u64,
@@ -255,8 +258,8 @@ impl Regs {
             gprs: [0; 16], rip: 0, rflags: 0, cr0: 0, cr2: 0, cr3: 0, cr4: 0, cr8: 0, efer: 0, pat: 0, cpl: 0,
             segs: [Segment::default(); 8], gdtr: Table::default(), idtr: Table::default(), star: 0, lstar: 0, cstar: 0,
             sfmask: 0, kernel_gs_base: 0, sysenter_cs: 0, sysenter_esp: 0, sysenter_eip: 0, dr: [0; 4], dr6: 0, dr7: 0,
-            tsc_aux: 0, spec_ctrl: 0, xcr0: 0, pkru: 0, xsave: Vec::new(), event: None, shadow: false,
-            nmi_blocked: false, pending_debug: 0,
+            tsc_aux: 0, spec_ctrl: 0, mtrrs: crate::Mtrrs::default(), xcr0: 0, pkru: 0, xsave: Vec::new(), event: None,
+            shadow: false, nmi_blocked: false, pending_debug: 0,
         }
     }
 
@@ -298,6 +301,7 @@ impl Regs {
         o.bool(self.shadow);
         o.bool(self.nmi_blocked);
         o.u64(self.pending_debug);
+        self.mtrrs.put(o);
     }
 
     fn get(r: &mut In) -> Result<Regs> {
@@ -356,10 +360,11 @@ impl Regs {
         let shadow = r.bool("the interrupt shadow")?;
         let nmi_blocked = r.bool("NMIs blocked")?;
         let pending_debug = r.u64("debug exceptions pending")?;
+        let mtrrs = if r.version >= 3 { crate::Mtrrs::get(r)? } else { crate::Mtrrs::default() };
         Ok(Regs {
             gprs, rip, rflags, cr0, cr2, cr3, cr4, cr8, efer, pat, cpl, segs, gdtr, idtr, star, lstar, cstar, sfmask,
-            kernel_gs_base, sysenter_cs, sysenter_esp, sysenter_eip, dr, dr6, dr7, tsc_aux, spec_ctrl, xcr0, pkru, xsave,
-            event, shadow, nmi_blocked, pending_debug,
+            kernel_gs_base, sysenter_cs, sysenter_esp, sysenter_eip, dr, dr6, dr7, tsc_aux, spec_ctrl, mtrrs, xcr0,
+            pkru, xsave, event, shadow, nmi_blocked, pending_debug,
         })
     }
 }

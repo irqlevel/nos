@@ -34,8 +34,10 @@ const STATUS_D: u8 = 0x0D;
 /// Where a PC's CMOS keeps the century, as the FADT names it (`acpi`).
 pub const CENTURY: u8 = 0x32;
 
-/// Status A: the update-in-progress bit, which is kept clear here.
+/// Status A: update-in-progress, set for the 2 ms before each second turns
+/// over, as the MC146818's update cycle approaches and changes the clock.
 const STATUS_A_UIP: u8 = 1 << 7;
+const UPDATE_NS: u64 = 2 * kcore::consts::NS_PER_MS;
 /// Status B: 24-hour mode and BCD (bit 1 set = 24h, bit 2 clear = BCD).
 const STATUS_B_24H: u8 = 1 << 1;
 /// Status D: the valid-RAM-and-time bit, which says the battery is good.
@@ -109,7 +111,11 @@ impl Rtc {
             return self.index;
         }
         match self.index {
-            STATUS_A => 0x26 & !STATUS_A_UIP, // a normal divider, update never in progress
+            STATUS_A => {
+                let elapsed = time::boot_time_ns().saturating_sub(self.epoch_ns);
+                let updating = elapsed % kcore::consts::NS_PER_SEC >= kcore::consts::NS_PER_SEC - UPDATE_NS;
+                0x26 | if updating { STATUS_A_UIP } else { 0 }
+            }
             STATUS_B => STATUS_B_24H,
             STATUS_C => 0, // no interrupt pending
             STATUS_D => STATUS_D_VRT,

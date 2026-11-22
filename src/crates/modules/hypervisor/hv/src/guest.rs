@@ -54,6 +54,10 @@ pub const CONSOLE_BYTES: usize = 64 * 1024;
 /// A guest as a command line describes it.
 pub struct Spec {
     pub kernel: String,
+    /// Boot a PVH firmware image on the CloudHv machine, not plain Q35.
+    pub firmware: bool,
+    /// Microsoft's Hyper-V interface, for a firmware guest; KVM otherwise.
+    pub hyperv: bool,
     pub initrd: Option<String>,
     /// `disk=`, as many as there are: files of nos's that are the guest's
     /// `vda`, `vdb`, ... in that order, and whether each is read-only
@@ -161,15 +165,15 @@ pub struct NicSpec {
     pub mtu: u16,
 }
 
-/// `\n` in a word for a newline, so that a line to type fits one word.
+/// `\n` for a newline and `\r` for carriage return, so that keys fit one word.
 pub fn unescape(text: &str) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     out.try_reserve_exact(text.len()).map_err(|_| String::from("out of memory"))?;
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'n' {
-            out.push(b'\n');
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && matches!(bytes[i + 1], b'n' | b'r') {
+            out.push(if bytes[i + 1] == b'n' { b'\n' } else { b'\r' });
             i += 2;
         } else {
             out.push(bytes[i]);
@@ -275,11 +279,18 @@ pub fn words(args: &str, usage: &str) -> Result<Options, String> {
             o.force = true;
         } else if word == "net" {
             o.net = true;
+        } else if word == "firmware" {
+            o.firmware = true;
+        } else if word == "hyperv" {
+            o.hyperv = true;
         } else if o.kernel.is_empty() && !word.contains('=') {
             o.kernel = String::from(word);
         } else {
             return Err(alloc::format!("hv: \"{}\" is not an option here\n{}", word, usage));
         }
+    }
+    if o.kernel.is_empty() && o.firmware {
+        o.kernel = String::from(crate::config::CLOUDHV);
     }
     if o.kernel.is_empty() {
         return Err(String::from(usage));
@@ -302,9 +313,15 @@ pub fn spec(o: Options) -> Result<Spec, String> {
     if cpus == 0 || cpus as usize > hv::MAX_VCPUS {
         return Err(alloc::format!("cpus= must be 1..{}", hv::MAX_VCPUS));
     }
-    if o.ioapic && cpus < 2 {
+    if o.ioapic && cpus < 2 && !o.firmware {
         return Err(String::from(
             "ioapic wants cpus=2 or more: a guest of one CPU has no local APIC for it to deliver to"));
+    }
+    if o.firmware && !o.pci.is_empty() {
+        return Err(String::from("firmware does not take pci=: the CloudHv machine has no host-function passthrough"));
+    }
+    if o.hyperv && !o.firmware {
+        return Err(String::from("hyperv is a firmware guest's -- firmware too; an ordinary Linux guest keeps KVM"));
     }
     /* A node the machine has: its CPUs and its memory are where the guest
      * goes (`Cores::take`, `Spec::placed`) */
@@ -376,10 +393,13 @@ pub fn spec(o: Options) -> Result<Spec, String> {
     let cmdline = o.cmdline.unwrap_or_else(|| {
         String::from(if cpus > 1 || !o.pci.is_empty() { DEFAULT_CMDLINE_SMP } else { DEFAULT_CMDLINE })
     });
+    let kernel = if o.kernel.is_empty() && o.firmware { String::from(crate::config::CLOUDHV) } else { o.kernel };
     Ok(Spec {
         node: None,
         numa: o.node.map(|n| n as usize),
-        kernel: o.kernel,
+        kernel,
+        firmware: o.firmware,
+        hyperv: o.hyperv,
         initrd: o.initrd,
         disks: o.disks,
         pci: o.pci,
@@ -582,6 +602,9 @@ fn plan(spec: &Spec, initrd_len: u64) -> Result<Image, String> {
             .map_err(|e| alloc::format!("the guest's memory does not fit its image: {}", e))?;
         return Ok(Image::Pvh { image, layout });
     }
+    if spec.firmware {
+        return Err(alloc::format!("{} is not a PVH ELF: firmware boots CloudHv's ELF entry", spec.kernel));
+    }
 
     let header = Header::parse(&first)
         .map_err(|_| alloc::format!("{} is neither a 64-bit bzImage nor a PVH ELF", spec.kernel))?;
@@ -595,10 +618,10 @@ fn plan(spec: &Spec, initrd_len: u64) -> Result<Image, String> {
     Ok(Image::Linux { header, first, pm_offset, layout })
 }
 
-/// Where the guest's RAM below 4 GiB ends: below the hole a host's
-/// function's BARs go in, for a guest holding one (`LinuxGuest::new_holed`).
-fn low_end(spec: &Spec) -> u64 {
-    if spec.pci.is_empty() { hv::linux::LOW_RAM_END } else { hv::linux::HOLE_RAM_END }
+/// Where the guest's RAM below 4 GiB ends on Q35: below the PCI hole,
+/// which also leaves room for the host's functions' BARs.
+fn low_end(_spec: &Spec) -> u64 {
+    hv::linux::HOLE_RAM_END
 }
 
 /// Build the guest: its memory, the kernel and the initrd streamed into it,
@@ -756,19 +779,19 @@ fn new_machine(machine: &Machine, spec: &Spec, doorbells: Arc<Doorbells>) -> Res
     if huge {
         pool_has(spec.mem_bytes)?;
     }
-    let (mut guest, cpus) =
-        if low_end(spec) == hv::linux::LOW_RAM_END {
-            LinuxGuest::new_on(machine, spec.mem_bytes, huge, spec.cpus, doorbells, !spec.xapic, spec.ioapic, spec.node)
-        } else {
-            LinuxGuest::new_holed_on(machine, spec.mem_bytes, huge, spec.cpus, doorbells, !spec.xapic, spec.ioapic,
-                                     spec.node)
-        }
-            .map_err(|e| match e {
-                /* Another guest took the blocks between the look and the
-                 * taking: said as the look would have said it. */
-                hv::Error::NoHugePages => pool_has(spec.mem_bytes).err().unwrap_or_else(|| alloc::format!("no guest: {}", e)),
-                e => alloc::format!("no guest: {}", e),
-            })?;
+    let made = if spec.hyperv {
+        LinuxGuest::new_hyperv_on(machine, spec.mem_bytes, huge, spec.cpus, doorbells, spec.node)
+    } else if spec.firmware {
+        LinuxGuest::new_firmware_on(machine, spec.mem_bytes, huge, spec.cpus, doorbells, spec.node)
+    } else {
+        LinuxGuest::new_holed_on(machine, spec.mem_bytes, huge, spec.cpus, doorbells, !spec.xapic, spec.ioapic, spec.node)
+    };
+    let (mut guest, cpus) = made.map_err(|e| match e {
+        /* Another guest took the blocks between the look and the taking:
+         * said as the look would have said it. */
+        hv::Error::NoHugePages => pool_has(spec.mem_bytes).err().unwrap_or_else(|| alloc::format!("no guest: {}", e)),
+        e => alloc::format!("no guest: {}", e),
+    })?;
     if let Some(on) = spec.apicv {
         guest.set_apicv(on);
     }
@@ -962,8 +985,10 @@ pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
         Stop::Reset { port, value, rip } => write!(out, "the guest asked for a reset, {:#04x} to port {:#x} ({}), at {:#x}",
             value, port, hv::run::reset_source(port), rip),
         Stop::Init { rip } => write!(out, "the guest asked for a reset, an INIT to its boot CPU, at {:#x}", rip),
-        Stop::PowerOff { rip } => write!(out, "the guest powered itself off, S5 by its ACPI PM1 control register, at {:#x}", rip),
+        Stop::PowerOff { rip } => write!(out, "the guest powered itself off, S5 by its ACPI sleep control register, at {:#x}", rip),
         Stop::Panicked { rip } => write!(out, "the guest's kernel panicked, and said so to its panic device, at {:#x}", rip),
+        Stop::Crashed { params } => write!(out, "Windows bugcheck {:#x}, arguments {:#x}, {:#x}, {:#x}, {:#x}, reported through Hyper-V",
+                                           params[0], params[1], params[2], params[3], params[4]),
         Stop::MmioInsn { gpa, rip, error, bytes } => {
             write!(out, "an access of guest physical {:#x} at rip {:#x} not performed -- {}; its bytes",
                 gpa, rip, error.describe())?;

@@ -38,7 +38,7 @@
 //! is where they live; a read or a write of one is served from there. The
 //! TSC reads as the host's. A few more answer as a CPU with nothing behind
 //! them would (`constant`): the ones a feature the guest's CPUID offers says
-//! the CPU has -- MTRRs off, machine checks with no banks -- and the ones a
+//! the CPU has -- machine checks with no banks -- and the ones a
 //! kernel reads of every CPU of the vendor without asking first. Every other
 //! MSR is a #GP both ways, which a guest's `rdmsr_safe`/`wrmsr_safe` probes
 //! are ready for; a refusal the guest was not ready for is a line in its
@@ -74,6 +74,11 @@ const LEAF_FREQUENCY: u32 = 0x16;
 const LEAF_BASIC_TOP: u32 = LEAF_FREQUENCY;
 const LEAF_HYPERVISOR: u32 = 0x4000_0000;
 const LEAF_KVM_FEATURES: u32 = 0x4000_0001;
+const LEAF_HV_INTERFACE: u32 = 0x4000_0001;
+const LEAF_HV_IDENTITY: u32 = 0x4000_0002;
+const LEAF_HV_FEATURES: u32 = 0x4000_0003;
+const LEAF_HV_RECOMMENDATIONS: u32 = 0x4000_0004;
+const LEAF_HV_LIMITS: u32 = 0x4000_0005;
 const LEAF_EXT: u32 = 0x8000_0000;
 const LEAF_EXT_FEATURES: u32 = 0x8000_0001;
 const LEAF_BRAND_FIRST: u32 = 0x8000_0002;
@@ -495,13 +500,16 @@ pub struct Asker {
     pub cr4: u64,
     pub xcr0: u64,
     pub shape: Shape,
+    /// Microsoft's Hyper-V interface rather than KVM's, for a firmware guest.
+    pub hyperv: bool,
 }
 
 impl Asker {
     /// A guest's first CPU out of reset, where nothing asked for depends on
     /// more: its signature, its features, its address widths.
     pub const RESET: Asker =
-        Asker { apic_id: 0, apic: true, apic_on: true, cr4: 0, xcr0: fp::XCR0_X87, shape: Shape::cores(1) };
+        Asker { apic_id: 0, apic: true, apic_on: true, cr4: 0, xcr0: fp::XCR0_X87, shape: Shape::cores(1),
+                hyperv: false };
 }
 
 /* The hypervisor's own range: KVM's signature, "KVMKVMKVM" in EBX, ECX and
@@ -520,6 +528,21 @@ impl Asker {
 const KVM_SIGNATURE: [u32; 3] = [0x4B4D_564B, 0x564B_4D56, 0x0000_004D];
 const KVM_FEATURE_NOP_IO_DELAY: u32 = 1 << 1;
 const KVM_FEATURE_PV_EOI: u32 = 1 << 6;
+
+/* Microsoft's Hv#1 interface (TLFS, feature discovery): the vendor and
+ * interface signatures, and the partition privileges backed by hyperv.rs. */
+const HV_VENDOR: [u32; 3] = [0x7263_694D, 0x666F_736F, 0x7648_2074];
+const HV_INTERFACE: u32 = 0x3123_7648;
+const HV_PRIV_TIME_REF_COUNT: u32 = 1 << 1;
+const HV_PRIV_SYNIC: u32 = 1 << 2;
+const HV_PRIV_STIMER: u32 = 1 << 3;
+const HV_PRIV_HYPERCALL: u32 = 1 << 5;
+const HV_PRIV_VP_INDEX: u32 = 1 << 6;
+const HV_PRIV_REFERENCE_TSC: u32 = 1 << 9;
+const HV_GUEST_CRASH: u32 = 1 << 10;
+const HV_PRIV_FREQUENCY: u32 = 1 << 11;
+const HV_STIMER_DIRECT: u32 = 1 << 19;
+
 /// MSR_KVM_PV_EOI_EN: where the guest's PV EOI word is, and whether it is
 /// on (bit 0) -- the run loop's, as the local APIC's MSRs are.
 pub const MSR_KVM_PV_EOI_EN: u32 = 0x4B56_4D04;
@@ -675,6 +698,9 @@ pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
 /// the range, and the features of its paravirtual interface backed here --
 /// PV EOI for a guest with APICs. Nothing else in the range.
 fn hypervisor_leaf(leaf: u32, asker: &Asker) -> Cpuid {
+    if asker.hyperv {
+        return microsoft_leaf(leaf);
+    }
     match leaf {
         LEAF_HYPERVISOR => Cpuid {
             eax: LEAF_KVM_FEATURES,
@@ -688,6 +714,32 @@ fn hypervisor_leaf(leaf: u32, asker: &Asker) -> Cpuid {
             ecx: 0,
             edx: 0,
         },
+        _ => NONE,
+    }
+}
+
+/// Microsoft's hypervisor range: the Hv#1 interface and only the facilities
+/// implemented behind it. Zero is a valid answer for every identity field,
+/// recommendation and limit the interface leaves optional.
+fn microsoft_leaf(leaf: u32) -> Cpuid {
+    match leaf {
+        LEAF_HYPERVISOR => Cpuid {
+            eax: LEAF_HV_LIMITS,
+            ebx: HV_VENDOR[0],
+            ecx: HV_VENDOR[1],
+            edx: HV_VENDOR[2],
+        },
+        LEAF_HV_INTERFACE => Cpuid { eax: HV_INTERFACE, ebx: 0, ecx: 0, edx: 0 },
+        LEAF_HV_IDENTITY => NONE,
+        LEAF_HV_FEATURES => Cpuid {
+            eax: HV_PRIV_TIME_REF_COUNT | HV_PRIV_SYNIC | HV_PRIV_STIMER | HV_PRIV_HYPERCALL | HV_PRIV_VP_INDEX
+                | HV_PRIV_REFERENCE_TSC | HV_PRIV_FREQUENCY,
+            ebx: 0,
+            ecx: 0,
+            edx: HV_GUEST_CRASH | HV_STIMER_DIRECT,
+        },
+        LEAF_HV_RECOMMENDATIONS => Cpuid { eax: 0, ebx: u32::MAX, ecx: 0, edx: 0 },
+        LEAF_HV_LIMITS => Cpuid { eax: crate::smp::MAX_VCPUS as u32, ebx: crate::smp::MAX_VCPUS as u32, ecx: 0, edx: 0 },
         _ => NONE,
     }
 }
@@ -1124,6 +1176,9 @@ pub struct Own {
     /// What its TSC is ahead of the host's (`run::LinuxGuest::restore`):
     /// what its read of IA32_TSC adds, as its RDTSC does.
     pub tsc_offset: u64,
+    /// Fixed and variable MTRRs and DEF_TYPE, per vCPU and never applied to
+    /// the nested page table.
+    pub mtrrs: vmstate::Mtrrs,
 }
 
 /* IA32_SPEC_CTRL and IA32_PRED_CMD, where the guest's CPUID offers a control
@@ -1158,12 +1213,6 @@ fn pred_cmd_takes(value: u64) -> bool {
  * kernel reads of every CPU of its vendor without asking: each answers as a
  * CPU with nothing more behind it would, and keeps nothing of the guest's
  * (`Constant`). */
-/// The MTRRs (CPUID's MTRR): MTRRcap -- no variable ranges, no fixed ones,
-/// no write-combining -- and the default type, off. A guest's memory types
-/// are its PAT's and the nested table's, which no MTRR of its own changes;
-/// Linux, finding them "disabled by BIOS", takes its PAT on its own.
-const MSR_MTRR_CAP: u32 = 0xFE;
-const MSR_MTRR_DEF_TYPE: u32 = 0x2FF;
 /// Machine checks (CPUID's MCA): no banks and no MCG_CTL, MCG_CAP says, and
 /// nothing to report. Linux reads both with no fallback for a fault -- and
 /// takes a fault on a machine-check register for an architectural violation
@@ -1221,6 +1270,8 @@ const ARCH_CAP_GUEST: u64 = (1 << 0)   // RDCL_NO: not open to Meltdown
 /// `rep movs` is the host CPU's -- and branch tracing and PEBS unavailable,
 /// as they are. Read as zero, Linux turned its fast string paths off ("Disabled
 /// fast string operations").
+const MSR_FEATURE_CONTROL: u32 = 0x3A;
+const FEATURE_CONTROL_LOCKED: u64 = 1;
 const MSR_MISC_ENABLE: u32 = 0x1A0;
 const MISC_ENABLE_FAST_STRING: u64 = 1 << 0;
 const MISC_ENABLE_BTS_UNAVAILABLE: u64 = 1 << 11;
@@ -1277,13 +1328,15 @@ fn vendor() -> Vendor {
 fn constant(msr: u32) -> Option<Constant> {
     let vendor = vendor();
     Some(match msr {
-        MSR_MTRR_CAP | MSR_MCG_CAP => Constant::ReadOnly(0),
-        MSR_MTRR_DEF_TYPE | MSR_MCG_STATUS => Constant::Fixed(0),
+        MSR_MCG_CAP => Constant::ReadOnly(0),
+        MSR_MCG_STATUS => Constant::Fixed(0),
         MSR_UCODE_REV => Constant::Revision(u64::from(cpu::microcode_revision()) << 32),
         MSR_PLATFORM_ID if vendor == Vendor::Intel => Constant::ReadOnly(0),
         /* Where the host's CPUID offers it, which is what offers it to the
          * guest too (`LEAF7_EDX_KEEP`), whoever made the CPU. */
         MSR_ARCH_CAPABILITIES => Constant::ReadOnly(cpu::arch_capabilities()? & ARCH_CAP_GUEST),
+        /* VMX/SGX are not offered to the guest; the lock alone says so. */
+        MSR_FEATURE_CONTROL if vendor == Vendor::Intel => Constant::ReadOnly(FEATURE_CONTROL_LOCKED),
         MSR_MISC_ENABLE if vendor == Vendor::Intel => Constant::Fixed(
             if cpu::fast_strings() { MISC_ENABLE_FAST_STRING } else { 0 }
                 | MISC_ENABLE_BTS_UNAVAILABLE | MISC_ENABLE_PEBS_UNAVAILABLE),
@@ -1349,9 +1402,9 @@ pub fn rdmsr(save: &Save, own: &Own, msr: u32) -> Option<u64> {
         MSR_TSC => cpu::rdtsc().wrapping_add(own.tsc_offset),
         MSR_TSC_AUX if has_tsc_aux() => own.tsc_aux,
         MSR_SPEC_CTRL if spec::guest_controls().spec_ctrl != 0 => own.spec_ctrl,
-        _ => match constant(msr)? {
-            Constant::ReadOnly(v) | Constant::Fixed(v) | Constant::Revision(v) => v,
-        },
+        _ => own.mtrrs.read(msr).or_else(|| match constant(msr)? {
+            Constant::ReadOnly(v) | Constant::Fixed(v) | Constant::Revision(v) => Some(v),
+        })?,
     };
     Some(value)
 }
@@ -1362,6 +1415,9 @@ pub fn rdmsr(save: &Save, own: &Own, msr: u32) -> Option<u64> {
 /// is (`Constant`); every other write -- to the TSC, to an MSR not named
 /// here -- is refused, and nothing a guest writes goes nowhere.
 pub fn wrmsr(save: &mut Save, own: &mut Own, msr: u32, value: u64) -> bool {
+    if vmstate::Mtrrs::is_msr(msr) {
+        return own.mtrrs.write(msr, value, phys_bits());
+    }
     match msr {
         MSR_EFER => {
             if value & !EFER_GUEST_MASK != 0 {

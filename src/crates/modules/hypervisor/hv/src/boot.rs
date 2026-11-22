@@ -23,7 +23,7 @@ use crate::cores::{Cores, Hold};
 use crate::disk::{Claims, Holder, Runner, Wake};
 use crate::guest::{self, LogLine, Ring, Spec, SplitLocks};
 
-const USAGE: &str = "hv boot <kernel> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [pci=bus:dev.fn]... [unsafe_interrupts] [input=...] [uuid=U] [force] [cmdline=...]";
+const USAGE: &str = "hv boot <kernel> [firmware] [hyperv] [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [pci=bus:dev.fn]... [unsafe_interrupts] [input=...] [uuid=U] [force] [cmdline=...]";
 /// How long the guest runs by default, and at most: a Linux boot under TCG,
 /// itself under this hypervisor, is very far from quick.
 const DEFAULT_SECS: u64 = 60;

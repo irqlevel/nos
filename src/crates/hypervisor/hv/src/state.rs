@@ -127,8 +127,8 @@ pub(crate) fn restore_common(r: &vmstate::Regs, s: &mut Save, g: &mut GuestRegs)
     check(r)?;
     let vmstate::Regs {
         gprs, rip, rflags, cr0, cr2, cr3, cr4: _, cr8: _, efer, pat, cpl, segs, gdtr, idtr, star, lstar, cstar, sfmask,
-        kernel_gs_base, sysenter_cs, sysenter_esp, sysenter_eip, dr: _, dr6, dr7, tsc_aux: _, spec_ctrl: _, xcr0: _,
-        pkru: _, xsave: _, event: _, shadow: _, nmi_blocked: _, pending_debug: _,
+        kernel_gs_base, sysenter_cs, sysenter_esp, sysenter_eip, dr: _, dr6, dr7, tsc_aux: _, spec_ctrl: _, mtrrs: _,
+        xcr0: _, pkru: _, xsave: _, event: _, shadow: _, nmi_blocked: _, pending_debug: _,
     } = r;
     let [rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15] = *gprs;
     s.rax = rax;

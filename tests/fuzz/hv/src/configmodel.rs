@@ -79,6 +79,7 @@ fn made_up(r: &mut Input) -> Config {
     if r.bool() {
         o.node = Some(r.value32());
     }
+    o.firmware = r.bool();
     o.xapic = r.bool();
     o.ioapic = r.bool();
     o.apicv = match r.u8() % 3 {
@@ -222,6 +223,11 @@ fn words_of(line: &str) -> (Vec<&str>, Option<&str>) {
 }
 
 pub fn config_target(r: &mut Input) {
+    let firmware = parse("firmware = true\n").expect("a firmware-only vm.toml");
+    invariant!(firmware.options.firmware && firmware.options.kernel == crate::vmconfig::CLOUDHV,
+               "firmware did not select CloudHv: {:?}", firmware);
+    round_trip(&firmware);
+
     match r.u8() % 6 {
         5 => {
             /* hv create's words, `force` among them or not, and a command

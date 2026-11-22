@@ -136,6 +136,8 @@ pub mod nat;
 pub mod place;
 #[path = "../../../../src/crates/hypervisor/hv/src/policy.rs"]
 pub mod policy;
+#[path = "../../../../src/crates/hypervisor/hv/src/hyperv.rs"]
+pub mod hyperv;
 #[path = "../../../../src/crates/hypervisor/hv/src/run.rs"]
 pub mod run;
 #[path = "../../../../src/crates/hypervisor/hv/src/smbios.rs"]

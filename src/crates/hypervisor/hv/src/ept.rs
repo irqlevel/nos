@@ -48,6 +48,9 @@ const TABLE: u64 = READ | WRITE | EXECUTE;
 const PAGE: u64 = READ | WRITE | EXECUTE | MEMTYPE_WB;
 /// The same page, read-only: a write to it is an EPT violation.
 const PAGE_RO: u64 = READ | MEMTYPE_WB;
+/// A page whose contents the guest may execute but not change: Hyper-V's
+/// hypercall overlay. Ordinary read-only data keeps no EXECUTE bit.
+const PAGE_RX: u64 = READ | EXECUTE | MEMTYPE_WB;
 /// An entry of the level above the last that is a page itself, 2 MiB of
 /// guest memory (bit 7): read, write, execute, write-back, as a page is.
 /// Only where the CPU says it walks them (`IA32_VMX_EPT_VPID_CAP` bit 16,
@@ -197,6 +200,11 @@ impl Ept {
     /// As [`set`](Self::set), but read-only for the guest.
     pub fn set_ro(&mut self, gpa: u64, hpa: u64) -> Result<()> {
         self.set_entry(gpa, hpa, PAGE_RO)
+    }
+
+    /// As [`set_ro`](Self::set_ro), but executable too.
+    pub fn set_rx(&mut self, gpa: u64, hpa: u64) -> Result<()> {
+        self.set_entry(gpa, hpa, PAGE_RX)
     }
 
     /// Make every table `[gpa, gpa + size)` will need to be mapped 2 MiB at

@@ -14,14 +14,14 @@ use crate::devices::blk::{self, Blk};
 use crate::devices::ioapic::{self, IoApic};
 use crate::devices::net::{self, Net};
 use crate::devices::offload::{self, TxHeader};
-use crate::devices::pci::{self, Function, PciBus};
+use crate::devices::pci::{self, Function, HostBridge, PciBus};
 use crate::devices::pic::Pic;
 use crate::devices::pit::Pit;
-use crate::devices::pm::Pm;
+use crate::devices::pm::{Pm, SLEEP_CONTROL, SLEEP_STATUS};
 use crate::devices::rtc::Rtc;
 use crate::devices::uart::Uart;
 use crate::lapic::{self, Addressing, Lapic, Mode, Wrote};
-use crate::memory::GuestMemory;
+use crate::memory::{self, GuestMemory};
 use crate::{time, Target};
 
 pub static ALL: &[Target] = &[
@@ -62,6 +62,7 @@ pub static ALL: &[Target] = &[
     Target { name: "tunnel", run: crate::tunnelmodel::tunnel_target, max_len: 4096 },
     Target { name: "platform", run: crate::platform::platform, max_len: 16384 },
     Target { name: "policy", run: crate::policymodel::policy_target, max_len: 1024 },
+    Target { name: "hyperv", run: hyperv_target, max_len: 2048 },
     Target { name: "place", run: crate::placemodel::place_target, max_len: 2048 },
     Target { name: "config", run: crate::configmodel::config_target, max_len: 4096 },
     Target { name: "relay", run: crate::relaymodel::relay_target, max_len: 4096 },
@@ -357,6 +358,12 @@ fn pit(r: &mut Input) {
 
 fn rtc(r: &mut Input) {
     let mut c = Rtc::new();
+    c.write(0x70, 0x0A);
+    invariant!(c.read(0x71) & 0x80 == 0, "UIP begins during an update");
+    time::advance(crate::consts::NS_PER_SEC - crate::consts::NS_PER_MS);
+    invariant!(c.read(0x71) & 0x80 != 0, "no UIP before the second turns over");
+    time::advance(crate::consts::NS_PER_MS);
+    invariant!(c.read(0x71) & 0x80 == 0, "UIP stays set after the update");
     while let Some(op) = r.op(4) {
         match op {
             0 => {
@@ -370,6 +377,13 @@ fn rtc(r: &mut Input) {
 
 fn pm(r: &mut Input) {
     let mut now = time::boot_time_ns();
+    let mut p = Pm::new_cloudhv(now);
+    invariant!(Pm::owns(SLEEP_CONTROL) && Pm::owns(SLEEP_STATUS), "the reduced sleep registers are not owned");
+    invariant!(p.read(SLEEP_CONTROL, 1, now) == 0 && p.read(SLEEP_STATUS, 1, now) == 0,
+               "the reduced sleep registers begin nonzero");
+    invariant!(p.write(SLEEP_CONTROL, 1, 0x34, now), "CloudHv's firmware S5 was not taken");
+    let mut legacy = Pm::new(now);
+    invariant!(!legacy.write(SLEEP_CONTROL, 1, 0x34, now), "legacy PM1 status became CloudHv sleep control");
     let mut p = Pm::new(now);
     while let Some(op) = r.op(6) {
         /* A port of the block's, as `Pm::owns` has them dispatched. */
@@ -440,13 +454,77 @@ fn size_ones(size: usize) -> u32 {
     }
 }
 
+fn pci_msix_moved(bus: &PciBus, memory: &GuestMemory, m: pci::MsixMove, bar: &mut u32, mapped: &mut Option<u64>) {
+    const BACKING: u32 = 0xFE00_1000;
+    const RAM_END: u64 = 4096;
+    const XAPIC: u64 = 0xFEE0_0000;
+
+    invariant!(m.page == BACKING && m.from == *bar, "MSI-X moved {:?}, BAR was {:#x}", m, *bar);
+    memory.move_msix(u64::from(m.page), u64::from(m.from), u64::from(m.to)).expect("the MSI-X backing page");
+    *bar = m.to;
+    let to = u64::from(m.to);
+    *mapped = (to == u64::from(BACKING) || (to >= RAM_END && to != XAPIC)).then_some(to);
+    invariant!(memory.msix_mapping(u64::from(BACKING)) == *mapped, "MSI-X at {:#x}: mapping {:?}, expected {:?}",
+               m.to, memory.msix_mapping(u64::from(BACKING)), *mapped);
+    invariant!(bus.function_read(1, 0, 0x14, 4) == m.to, "MSI-X BAR did not move to {:#x}", m.to);
+    invariant!(bus.msix(1).is_some_and(|(_, page)| page == BACKING), "MSI-X's backing moved with its BAR");
+    let mut bytes = [0u8; 4];
+    memory.read(u64::from(BACKING), &mut bytes).expect("the MSI-X backing bytes");
+    invariant!(bytes == [0x11, 0x22, 0x33, 0x44], "MSI-X's backing bytes changed in a move");
+}
+
 fn pci_bus(r: &mut Input) {
-    let mut bus = PciBus::new().expect("a bus");
-    bus.add(Function::device(&Blk::identity(), 0xC000, blk::BAR_SIZE, 11).with_msix(2, 0xFE00_1000))
+    const BACKING: u32 = 0xFE00_1000;
+
+    let cloudhv = r.bool();
+    let mut bus = if cloudhv { PciBus::with_host_bridge(HostBridge::CloudHv) } else { PciBus::new() }.expect("a bus");
+    let mut memory = GuestMemory::with_size(4096);
+    memory.add_msix(u64::from(BACKING)).expect("an MSI-X page");
+    memory.write(u64::from(BACKING), &[0x11, 0x22, 0x33, 0x44]).expect("MSI-X's first bytes");
+    let mut bar = BACKING;
+    let mut mapped = Some(u64::from(BACKING));
+    macro_rules! write_bus {
+        ($port:expr, $size:expr, $value:expr) => {
+            if let Some(m) = bus.write($port, $size, $value) {
+                pci_msix_moved(&bus, &memory, m, &mut bar, &mut mapped);
+            }
+        };
+    }
+    macro_rules! write_ecam {
+        ($device:expr, $function:expr, $at:expr, $size:expr, $value:expr) => {
+            if let Some(m) = bus.function_write($device, $function, $at, $size, $value) {
+                pci_msix_moved(&bus, &memory, m, &mut bar, &mut mapped);
+            }
+        };
+    }
+    let device = if cloudhv { 0x0D57 } else { 0x29C0 };
+    invariant!(bus.function_read(0, 0, 0, 4) == 0x8086 | device << 16,
+               "the host bridge's vendor and device are not 8086:{:04x}", device);
+    bus.add(Function::device(&Blk::identity(), 0xC000, blk::BAR_SIZE, 11).with_msix(2, BACKING))
         .expect("a disk");
     bus.add(Function::device(&Net::identity(), 0xC100, net::BAR_SIZE, 10)).expect("a NIC");
     /* A host's function on slot 3, whose space is the run loop's */
     let host = bus.add_host().expect("a host's function");
+
+    /* A move while migration's dirty log is on: the new mapping starts
+     * read-only, its first write marks the stable backing page, and a move
+     * back behaves the same way. */
+    const MOVED: u32 = 0xD000_0000;
+    memory.log_start().expect("the dirty log");
+    invariant!(memory.protected(u64::from(BACKING)), "the initial MSI-X mapping is writable under the log");
+    write_ecam!(1, 0, 0x14, 4, MOVED);
+    invariant!(memory.protected(u64::from(MOVED)), "a moved MSI-X mapping is writable under the log");
+    invariant!(memory.write_fault(u64::from(MOVED) + 4), "the moved MSI-X write was not a dirty-log fault");
+    invariant!(!memory.protected(u64::from(MOVED)), "the MSI-X write fault did not make its page writable");
+    let mut taken = Vec::new();
+    memory.log_take(&mut |gpa| taken.push(gpa)).expect("a dirty-log round");
+    invariant!(taken == [u64::from(BACKING)], "the moved MSI-X write marked {:?}, not its backing", taken);
+    write_ecam!(1, 0, 0x14, 4, BACKING);
+    invariant!(memory.protected(u64::from(BACKING)), "moving back lost the dirty log's protection");
+    invariant!(memory.write_fault(u64::from(BACKING)), "the restored MSI-X page cannot be written");
+    memory.log_stop();
+    invariant!(!memory.protected(u64::from(BACKING)), "the dirty log left MSI-X read-only");
+
     while let Some(op) = r.op(8) {
         match op {
             7 => {
@@ -465,7 +543,7 @@ fn pci_bus(r: &mut Input) {
                            "ECAM's offset {:#x} named {:?}", offset, t);
                 let got = bus.function_read(t.device, t.function, t.at, size);
                 if reg < 0x100 {
-                    bus.write(pci::CONFIG_ADDRESS, 4, pci_address(device, reg) | function << 8);
+                    write_bus!(pci::CONFIG_ADDRESS, 4, pci_address(device, reg) | function << 8);
                     let want = bus.read(pci::CONFIG_DATA + (reg & 3) as u16, size as u8);
                     invariant!(got == want, "ECAM read {:#x} at {:02x}.{} {:#x}, the ports {:#x}", got, device,
                                function, reg, want);
@@ -473,13 +551,14 @@ fn pci_bus(r: &mut Input) {
                         let value = r.value32();
                         let mut by_ports = PciBus::new().expect("a bus");
                         by_ports.add(Function::device(&Blk::identity(), 0xC000, blk::BAR_SIZE, 11)
-                            .with_msix(2, 0xFE00_1000)).expect("a disk");
+                            .with_msix(2, BACKING)).expect("a disk");
                         let mut by_ecam = PciBus::new().expect("a bus");
                         by_ecam.add(Function::device(&Blk::identity(), 0xC000, blk::BAR_SIZE, 11)
-                            .with_msix(2, 0xFE00_1000)).expect("a disk");
-                        by_ports.write(pci::CONFIG_ADDRESS, 4, pci_address(device, reg) | function << 8);
-                        by_ports.write(pci::CONFIG_DATA + (reg & 3) as u16, size as u8, value);
-                        by_ecam.function_write(t.device, t.function, t.at, size, value);
+                            .with_msix(2, BACKING)).expect("a disk");
+                        let _ = by_ports.write(pci::CONFIG_ADDRESS, 4, pci_address(device, reg) | function << 8);
+                        let by_port = by_ports.write(pci::CONFIG_DATA + (reg & 3) as u16, size as u8, value);
+                        let by_memory = by_ecam.function_write(t.device, t.function, t.at, size, value);
+                        invariant!(by_port == by_memory, "an MSI-X move differs between the ports and ECAM");
                         for d in (0..0x100).step_by(4) {
                             let a = by_ports.function_read(t.device, 0, d, 4);
                             let b = by_ecam.function_read(t.device, 0, d, 4);
@@ -506,7 +585,7 @@ fn pci_bus(r: &mut Input) {
                     240..=247 => pci_address(r.below(4) as u32, r.pick(&PCI_REGS)) | (1 + r.below(15) as u32) << 24,
                     _ => r.u32(),
                 };
-                bus.write(pci::CONFIG_ADDRESS, 4, address);
+                write_bus!(pci::CONFIG_ADDRESS, 4, address);
                 if address & 0x8000_0000 != 0 && address & 0x7F00_0000 != 0 {
                     let got = bus.read(pci::CONFIG_DATA, 4);
                     invariant!(got == u32::MAX, "configuration address {:#x}, a register past 255, read {:#x}",
@@ -516,7 +595,12 @@ fn pci_bus(r: &mut Input) {
             1 => {
                 bus.read(pci::CONFIG_DATA + r.below(4) as u16, r.io_size());
             }
-            2 => bus.write(pci::CONFIG_DATA + r.below(4) as u16, r.io_size(), r.value32()),
+            2 => {
+                let port = pci::CONFIG_DATA + r.below(4) as u16;
+                let size = r.io_size();
+                let value = r.value32();
+                write_bus!(port, size, value);
+            }
             3 => {
                 bus.read(pci::CONFIG_ADDRESS + r.below(8) as u16, r.io_size());
             }
@@ -526,9 +610,9 @@ fn pci_bus(r: &mut Input) {
                 let slot = r.below(3) as u32;
                 for (reg, value) in [(0x10, u32::MAX), (0x14, u32::MAX), (0x10, r.value32()), (0x14, r.value32()),
                                      (0x04, 1 | u32::from(r.u8() & 6))] {
-                    bus.write(pci::CONFIG_ADDRESS, 4, pci_address(slot, reg));
+                    write_bus!(pci::CONFIG_ADDRESS, 4, pci_address(slot, reg));
                     bus.read(pci::CONFIG_DATA, 4);
-                    bus.write(pci::CONFIG_DATA, 4, value);
+                    write_bus!(pci::CONFIG_DATA, 4, value);
                 }
             }
             5 => {
@@ -559,10 +643,50 @@ fn pci_bus(r: &mut Input) {
                     invariant!(u32::from(offset) < 0x100, "port {:#x} at {:#x} into its BAR", port, offset);
                 }
             }
+            6 => {
+                /* OVMF's BAR assignment: a known free or occupied page, the
+                 * backing itself, the APIC, or any 32-bit address. Sometimes
+                 * size the BAR first, which must not move its mapping. */
+                let random = r.value32() & !(pci::MSIX_PAGE - 1);
+                let to = r.pick(&[0xD000_0000, 0xFE00_0000, BACKING, 0, 0xFEE0_0000, random]);
+                let ecam = r.bool();
+                if r.bool() {
+                    if ecam {
+                        write_ecam!(1, 0, 0x14, 4, u32::MAX);
+                    } else {
+                        write_bus!(pci::CONFIG_ADDRESS, 4, pci_address(1, 0x14));
+                        write_bus!(pci::CONFIG_DATA, 4, u32::MAX);
+                    }
+                    invariant!(bus.function_read(1, 0, 0x14, 4) == !(pci::MSIX_PAGE - 1),
+                               "MSI-X's size read changed");
+                    invariant!(memory.msix_mapping(u64::from(BACKING)) == mapped, "sizing moved the MSI-X page");
+                    if ecam {
+                        write_ecam!(1, 0, 0x14, 4, bar);
+                    } else {
+                        write_bus!(pci::CONFIG_DATA, 4, bar);
+                    }
+                }
+                if ecam {
+                    write_ecam!(1, 0, 0x14, 4, to);
+                } else {
+                    write_bus!(pci::CONFIG_ADDRESS, 4, pci_address(1, 0x14));
+                    write_bus!(pci::CONFIG_DATA, 4, to);
+                }
+                let to = to & !(pci::MSIX_PAGE - 1);
+                let address = u64::from(to);
+                bar = to;
+                mapped = (to == BACKING || (address >= 4096 && address != 0xFEE0_0000)).then_some(address);
+                invariant!(bus.function_read(1, 0, 0x14, 4) == to, "the requested BAR {:#x} did not arrive", to);
+                invariant!(memory.msix_mapping(u64::from(BACKING)) == mapped,
+                           "BAR {:#x} has mapping {:?}, expected {:?}", to,
+                           memory.msix_mapping(u64::from(BACKING)), mapped);
+            }
             _ => {
                 bus.msix(r.below(12) as usize);
             }
         }
+        invariant!(memory.msix_mapping(u64::from(BACKING)) == mapped, "an unrelated PCI access moved MSI-X");
+        invariant!(bus.msix(1).is_some_and(|(_, page)| page == BACKING), "MSI-X lost its stable backing");
     }
 }
 
@@ -1192,6 +1316,9 @@ pub struct DiskState {
     /// it has the request of.
     bufs: Vec<Vec<u8>>,
     queue: VecDeque<blk::Request>,
+    /// Flushes handed over, including one behind a write whose driver took
+    /// no FLUSH (which the device's own stats answer as the write).
+    flushes: u64,
     /// Requests the fuzzer has said are served, to be taken.
     pub ready: usize,
     pub fail: bool,
@@ -1207,7 +1334,7 @@ impl DiskState {
 
     pub fn with_block(size: u64, read_only: bool, block: u64) -> DiskState {
         let bufs = (0..blk::IN_FLIGHT).map(|_| vec![0u8; blk::REQUEST_BYTES]).collect();
-        DiskState { size, read_only, block, store: HashMap::new(), keep: false, bufs, queue: VecDeque::new(),
+        DiskState { size, read_only, block, store: HashMap::new(), keep: false, bufs, queue: VecDeque::new(), flushes: 0,
                     ready: 0, fail: false, order: 0 }
     }
 
@@ -1251,6 +1378,9 @@ impl blk::Backend for Disk {
     }
     fn submit(&mut self, req: blk::Request) {
         let mut s = self.0.lock().unwrap();
+        if req.op() == blk::Op::Flush {
+            s.flushes += 1;
+        }
         invariant!(s.queue.len() < blk::IN_FLIGHT, "a request past the {} in flight", blk::IN_FLIGHT);
         invariant!(req.slot() < blk::IN_FLIGHT && !s.queue.iter().any(|r| r.slot() == req.slot()),
                    "a request handed over in slot {}, which has one", req.slot());
@@ -1411,7 +1541,7 @@ fn blk_target(r: &mut Input) {
         mem.refuse_maps(true);
     }
     let mut q = DriverQueue::default();
-    while let Some(op) = r.op(18) {
+    while let Some(op) = r.op(19) {
         match op {
             0 => {
                 disk.io_read(r.below(u64::from(blk::BAR_SIZE)) as u16, r.io_size());
@@ -1578,6 +1708,7 @@ fn blk_target(r: &mut Input) {
                 }
             }
             17 => blk_512e(&mut disk, &mem, &state, &mut q, r),
+            18 => blk_parts(&mut disk, &mem, &state, &mut q, r),
             _ => {}
         }
     }
@@ -1759,6 +1890,123 @@ fn blk_512e(disk: &mut Blk, mem: &GuestMemory, state: &Arc<Mutex<DiskState>>, q:
     drop(s);
     state.lock().unwrap().keep = false;
     E_BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// EDK2's VirtioBlkDxe puts a whole buffer in one descriptor and does not
+/// take SIZE_MAX or SEG_MAX. Its 896 KiB read is served in backend-sized
+/// parts, with the guest's chain and one status retained across all of them.
+fn blk_parts(disk: &mut Blk, mem: &GuestMemory, state: &Arc<Mutex<DiskState>>, q: &mut DriverQueue, r: &mut Input) {
+    const DATA: u64 = 0x20000;
+    const HEADER: u64 = 0x5000;
+    const STATUS: u64 = 0x6000;
+    const BYTES: usize = 0xE0000;
+
+    blk_reset_drained(disk, mem, state);
+    let flushes = r.bool();
+    blk_queue_at(disk, mem, q, if flushes { u32::MAX } else { u32::MAX & !(1 << 9) });
+    mem.put(q.used() + 2, &0u16.to_le_bytes());
+    let split = r.bool();
+    let fail = r.bool();
+    let block = state.lock().unwrap().block;
+    {
+        let mut s = state.lock().unwrap();
+        s.size = 2 * MEM;
+        s.read_only = false;
+        s.keep = true;
+        s.store.clear();
+    }
+    let original: Vec<u8> = (0..BYTES).map(|i| (i as u8).wrapping_mul(29) ^ (i >> 8) as u8).collect();
+    mem.put(DATA, &original);
+    let before = disk.stats;
+    let flushes_before = state.lock().unwrap().flushes;
+    let status = blk_part_request(disk, mem, state, q, HEADER, STATUS, DATA, BYTES, 1, split, None);
+    invariant!(status == 0, "a large write answered {:#x}", status);
+    invariant!(disk.stats.writes == before.writes + 1 && disk.stats.written_bytes == before.written_bytes + BYTES as u64,
+               "a large write counted {} times and {} bytes", disk.stats.writes - before.writes,
+               disk.stats.written_bytes - before.written_bytes);
+    invariant!(flushes || state.lock().unwrap().flushes == flushes_before + 1,
+               "a large write without FLUSH was not flushed once");
+
+    mem.put(DATA, &vec![0; BYTES]);
+    let status = blk_part_request(disk, mem, state, q, HEADER, STATUS, DATA, BYTES, 0, !split, None);
+    invariant!(status == 0, "a large read answered {:#x}", status);
+    let mut got = vec![0; BYTES];
+    let _ = mem.read(DATA, &mut got);
+    invariant!(got == original, "a large read differs from what its large write stored");
+    invariant!(disk.stats.reads == before.reads + 1 && disk.stats.read_bytes == before.read_bytes + BYTES as u64,
+               "a large read counted {} times and {} bytes", disk.stats.reads - before.reads,
+               disk.stats.read_bytes - before.read_bytes);
+
+    if fail {
+        let changed: Vec<u8> = original.iter().map(|b| b ^ 0xFF).collect();
+        mem.put(DATA, &changed);
+        let errors = disk.stats.errors;
+        let round = if block == blk::SECTOR { 1 } else { 2 };
+        let status = blk_part_request(disk, mem, state, q, HEADER, STATUS, DATA, BYTES, 1, split, Some(round));
+        invariant!(status == 1 && disk.stats.errors == errors + 1,
+                   "a failed part answered {:#x}, errors {} -> {}", status, errors, disk.stats.errors);
+        mem.put(DATA, &vec![0; BYTES]);
+        let status = blk_part_request(disk, mem, state, q, HEADER, STATUS, DATA, BYTES, 0, split, None);
+        invariant!(status == 0, "a read after a failed part answered {:#x}", status);
+        let _ = mem.read(DATA, &mut got);
+        let first = blk::REQUEST_BYTES - if block == blk::SECTOR { 0 } else { blk::SECTOR as usize };
+        invariant!(got[..first] == changed[..first] && got[first..] == original[first..],
+                   "a failed part did not stop the rest of its request");
+    }
+    let mut s = state.lock().unwrap();
+    s.keep = false;
+    s.fail = false;
+    s.ready = 0;
+}
+
+/// One request of `bytes` from sector 1, in one data descriptor as EDK2 makes
+/// it or split in two. `fail_round` fails that backend completion.
+#[allow(clippy::too_many_arguments)]
+fn blk_part_request(disk: &mut Blk, mem: &GuestMemory, state: &Arc<Mutex<DiskState>>, q: &mut DriverQueue,
+                    header: u64, status: u64, data: u64, bytes: usize, kind: u32, split: bool,
+                    fail_round: Option<usize>) -> u8 {
+    let mut h = [0u8; 16];
+    h[..4].copy_from_slice(&kind.to_le_bytes());
+    h[8..].copy_from_slice(&1u64.to_le_bytes());
+    mem.put(header, &h);
+    mem.put(status, &[BLK_UNSET]);
+    let write = kind == 0;
+    if split {
+        chain_made_well(mem, q, &[(header, 16, false), (data, (bytes / 2) as u32, write),
+                                  (data + (bytes / 2) as u64, (bytes / 2) as u32, write), (status, 1, true)]);
+    } else {
+        chain_made_well(mem, q, &[(header, 16, false), (data, bytes as u32, write), (status, 1, true)]);
+    }
+    let mut used = [0u8; 2];
+    let _ = mem.read(q.used() + 2, &mut used);
+    let before = u16::from_le_bytes(used);
+    disk.io_write(QUEUE_NOTIFY, 2, 0, mem, time::boot_time_ns());
+    for round in 0..16 {
+        let left = state.lock().unwrap().queued();
+        if left == 0 {
+            break;
+        }
+        {
+            let mut s = state.lock().unwrap();
+            s.ready = left;
+            s.fail = fail_round == Some(round);
+            if s.fail {
+                let front = s.queue.front().expect("a queued request");
+                invariant!(front.len() <= blk::REQUEST_BYTES, "a backend request of {} bytes", front.len());
+            }
+        }
+        disk.poll(mem);
+        state.lock().unwrap().fail = false;
+        let mut answer = [0u8];
+        let _ = mem.read(status, &mut answer);
+        if answer[0] != BLK_UNSET {
+            let _ = mem.read(q.used() + 2, &mut used);
+            invariant!(u16::from_le_bytes(used) == before.wrapping_add(1), "one guest request returned more than one chain");
+            invariant!(state.lock().unwrap().queued() == 0, "a request answered with backend work still out");
+            return answer[0];
+        }
+    }
+    panic!("a request of {} bytes did not finish", bytes);
 }
 
 /// What a status byte holds before the device writes it.
@@ -2596,16 +2844,24 @@ fn pvh(r: &mut Input) {
 
 fn acpi(r: &mut Input) {
     use crate::acpi::{build, Machine, Route, MAX_BYTES};
+    use crate::devices::pci::HostBridge;
+    let host_bridge = if r.bool() { HostBridge::Q35 } else { HostBridge::CloudHv };
+    let cloudhv = host_bridge == HostBridge::CloudHv;
     let routes: Vec<Route> = (0..r.below(10)).map(|_| Route { slot: r.u8(), irq: r.u8() }).collect();
     let m = Machine {
         cpus: if r.bool() { r.below(17) as u32 } else { r.u32() },
         apic: r.bool(),
         ioapic: r.bool().then(|| r.u8()),
         pci: &routes,
-        mmio: r.bool().then(|| (r.u32(), r.u32())),
-        bars32: r.bool().then(|| (r.u32(), r.u32())),
-        bars64: r.bool().then(|| (r.u64(), r.u64())),
-        ecam: r.bool().then(|| (r.u32() & !0xF_FFFF, r.u8())),
+        mmio: (!cloudhv && r.bool()).then(|| (r.u32(), r.u32())),
+        bars32: if cloudhv {
+            Some((crate::linux::HOLE_RAM_END as u32, (crate::linux::CLOUDHV_MMIO32_END - crate::linux::HOLE_RAM_END) as u32))
+        } else {
+            r.bool().then(|| (r.u32(), r.u32()))
+        },
+        bars64: (!cloudhv && r.bool()).then(|| (r.u64(), r.u64())),
+        ecam: (!cloudhv && r.bool()).then(|| (r.u32() & !0xF_FFFF, r.u8())),
+        host_bridge,
     };
     let mut buf = vec![0u8; if r.u8() < 224 { MAX_BYTES } else { r.below(MAX_BYTES as u64) as usize }];
     if let Some(n) = build(&m, &mut buf) {
@@ -2614,6 +2870,10 @@ fn acpi(r: &mut Input) {
          * one allocation the window, of segment 0 from bus 0 -- and none
          * where it has not */
         let tables = &buf[..n];
+        if m.apic && (1..=255).contains(&m.cpus) {
+            let processors = tables.windows(8).filter(|w| *w == b"ACPI0007").count();
+            invariant!(processors == m.cpus as usize, "{} processor objects for {} CPUs", processors, m.cpus);
+        }
         let at: Vec<usize> = (0..n.saturating_sub(4)).step_by(16).filter(|&a| &tables[a..a + 4] == b"MCFG").collect();
         invariant!(at.len() == usize::from(m.ecam.is_some()), "{} MCFGs for ECAM {:x?}", at.len(), m.ecam);
         if let (Some(&a), Some((base, last))) = (at.first(), m.ecam) {
@@ -2636,6 +2896,38 @@ fn acpi(r: &mut Input) {
                          u16::from_le_bytes([tables[a + 10], tables[a + 11]]));
             let want = (0, m.ecam.map_or(0xFF, |(_, last)| u16::from(last)));
             invariant!(range == want, "the host bridge's buses {:?}, not {:?}", range, want);
+        }
+        let fadt = (0..n.saturating_sub(4)).step_by(16).find(|&a| &tables[a..a + 4] == b"FACP")
+            .expect("every machine has an FADT");
+        let flags = u32::from_le_bytes(tables[fadt + 112..fadt + 116].try_into().unwrap());
+        const HW_REDUCED: u32 = 1 << 20;
+        invariant!((flags & HW_REDUCED != 0) == cloudhv, "hardware-reduced flags {:#x} for CloudHv {}", flags, cloudhv);
+        if cloudhv {
+            invariant!((0..n.saturating_sub(4)).step_by(16).all(|a| &tables[a..a + 4] != b"FACS"),
+                       "a hardware-reduced machine has a FACS");
+            invariant!(tables[fadt + 36..fadt + 40] == [0; 4] && tables[fadt + 56..fadt + 60] == [0; 4]
+                       && tables[fadt + 64..fadt + 68] == [0; 4] && tables[fadt + 88..fadt + 90] == [0; 2],
+                       "a hardware-reduced FADT has a FACS or legacy PM1 blocks");
+            invariant!(u16::from_le_bytes(tables[fadt + 248..fadt + 250].try_into().unwrap()) == 0x600
+                       && u16::from_le_bytes(tables[fadt + 260..fadt + 262].try_into().unwrap()) == 0x601,
+                       "the sleep registers are not CloudHv's");
+            let io: Vec<(u16, u16, u16)> = (0..=n.saturating_sub(16)).filter_map(|a| {
+                if tables[a] == 0x88 && tables[a + 3] == 1 {
+                    Some((u16::from_le_bytes([tables[a + 8], tables[a + 9]]),
+                          u16::from_le_bytes([tables[a + 10], tables[a + 11]]),
+                          u16::from_le_bytes([tables[a + 14], tables[a + 15]])))
+                } else {
+                    None
+                }
+            }).collect();
+            invariant!(io == [(0xC000, 0xFFFF, 0x4000)], "CloudHv's I/O aperture {:x?}", io);
+            let aperture = n >= 26 && (0..=n - 26).any(|a| {
+                tables[a] == 0x87 && tables[a + 3] == 0 &&
+                    u32::from_le_bytes(tables[a + 10..a + 14].try_into().unwrap()) == 0xC000_0000 &&
+                    u32::from_le_bytes(tables[a + 14..a + 18].try_into().unwrap()) == 0xFBFF_FFFF &&
+                    u32::from_le_bytes(tables[a + 22..a + 26].try_into().unwrap()) == 0x3C00_0000
+            });
+            invariant!(aperture, "CloudHv's MMIO32 aperture is missing");
         }
     }
 }
@@ -2760,4 +3052,364 @@ fn dhcp(r: &mut Input) {
     const NAK: u8 = 6;
     let want = (net.mtu != 0 && kind != Some(NAK)).then(|| net.mtu.to_be_bytes().to_vec());
     invariant!(mtu == want, "an answer of type {:?} gives MTU {:?}, the network's being {}", kind, mtu, net.mtu);
+}
+
+
+/// Hyper-V's basic and time MSRs against a model of the TLFS, including
+/// independent hypercall and reference TSC overlays.
+fn hyperv_target(r: &mut Input) {
+    use crate::hyperv::{Hyperv, Vp, MSR_APIC_FREQUENCY, MSR_GUEST_OS_ID, MSR_HYPERCALL, MSR_REFERENCE_TSC,
+                        MSR_STIMER0_CONFIG, MSR_STIMER3_COUNT, MSR_TIME_REF_COUNT, MSR_TSC_FREQUENCY, MSR_VP_INDEX};
+    use crate::lapic::Lapic;
+    use crate::memory::OverlaySlot;
+    const ENABLE: u64 = 1;
+    const LOCKED: u64 = 2;
+    const RESERVED: u64 = 0xFFC;
+    const GPFN: u64 = !0xFFF;
+    const EPOCH: u64 = 2_000_000_000;
+    const TSC_HZ: u64 = 2_500_000_000;
+    const REF_HZ: u128 = 10_000_000;
+    const PERIODIC: u64 = 1 << 1;
+    const AUTO_ENABLE: u64 = 1 << 3;
+    const VECTOR: u64 = 0xFF << 4;
+    const DIRECT: u64 = 1 << 12;
+
+    let mem = GuestMemory::with_size(MEM);
+    let hv = Hyperv::new(crate::Vendor::Svm, EPOCH, TSC_HZ).expect("Hyper-V");
+    mem.prepare_overlay(OverlaySlot::Hypercall, hv.code()).expect("the hypercall page");
+    mem.prepare_overlay(OverlaySlot::ReferenceTsc, hv.reference_page()).expect("the reference page");
+    let time = |tsc: u64| {
+        let ticks = u128::from(tsc - EPOCH) * REF_HZ / u128::from(TSC_HZ);
+        ticks.min(u128::from(u64::MAX)) as u64
+    };
+    invariant!(hv.read(MSR_TIME_REF_COUNT, 0, EPOCH) == Some(0), "reference time not zero at creation");
+    let page = hv.reference_page();
+    let sequence = u32::from_le_bytes(page[0..4].try_into().unwrap());
+    let scale = u64::from_le_bytes(page[8..16].try_into().unwrap());
+    let offset = i64::from_le_bytes(page[16..24].try_into().unwrap());
+    invariant!(sequence == 1, "reference TSC sequence is not usable");
+    invariant!(scale == u64::try_from((REF_HZ << 64) / u128::from(TSC_HZ)).unwrap(), "wrong TSC scale");
+    let epoch_offset = (u128::from(EPOCH) * u128::from(scale)) >> 64;
+    invariant!(offset == -i64::try_from(epoch_offset).unwrap(), "wrong TSC epoch offset");
+
+    let (mut guest_id, mut hypercall, mut reference_tsc) = (0u64, 0u64, 0u64);
+    let mut tsc = EPOCH;
+    let mut crash = [0u64; 5];
+    let mut vp = Vp::default();
+    let mut configs = [0u64; 4];
+    let mut counts = [0u64; 4];
+    let mut scontrol = 0u64;
+    let mut pages = [0u64; 3];
+    let mut sints = [1u64 << 16; 16];
+    while let Some(op) = r.op(22) {
+        match op {
+            0 => {
+                let msr = r.pick(&[MSR_GUEST_OS_ID, MSR_HYPERCALL, MSR_VP_INDEX, MSR_TIME_REF_COUNT, MSR_REFERENCE_TSC,
+                                   MSR_TSC_FREQUENCY, MSR_APIC_FREQUENCY]);
+                let vp = r.u32();
+                let want = match msr {
+                    MSR_GUEST_OS_ID => guest_id,
+                    MSR_HYPERCALL => hypercall,
+                    MSR_VP_INDEX => u64::from(vp),
+                    MSR_TIME_REF_COUNT => time(tsc),
+                    MSR_REFERENCE_TSC => reference_tsc,
+                    MSR_TSC_FREQUENCY => TSC_HZ,
+                    _ => 1_000_000_000,
+                };
+                invariant!(hv.read(msr, vp, tsc) == Some(want), "MSR {:#x} read {:?}, wanted {:#x}",
+                           msr, hv.read(msr, vp, tsc), want);
+            }
+            1 => {
+                let value = r.value64();
+                let ok = hv.write(MSR_GUEST_OS_ID, value, &mem);
+                invariant!(ok == Some(true), "Guest OS ID refused: {:?}", ok);
+                if value == 0 {
+                    hypercall &= !ENABLE;
+                }
+                guest_id = value;
+            }
+            2 => {
+                let value = if r.bool() {
+                    r.pick(&[0, 0x1000, 0x100000, 0xFEE0_0000, memory::MAX_GPA]) | r.pick(&[0, 1, 2, 3])
+                } else {
+                    r.value64()
+                };
+                let old = hypercall;
+                let mut next = (value & !RESERVED) | (old & RESERVED);
+                let locked_bad = old & LOCKED != 0 && (next & LOCKED == 0 || next & GPFN != old & GPFN);
+                if old & LOCKED != 0 && !locked_bad {
+                    next |= LOCKED;
+                }
+                if next & ENABLE != 0 && guest_id == 0 {
+                    next &= !ENABLE;
+                }
+                let gpa = next & GPFN;
+                let collision = next & ENABLE != 0 && reference_tsc & ENABLE != 0 && gpa == reference_tsc & GPFN;
+                let map_bad = gpa == memory::XAPIC_PAGE
+                    || gpa.checked_add(PAGE).is_none_or(|end| end > memory::MAX_GPA) || collision;
+                let ok = hv.write(MSR_HYPERCALL, value, &mem);
+                invariant!(ok == Some(!locked_bad && !map_bad), "hypercall MSR write {:#x} -> {:?}, old {:#x}", value, ok, old);
+                if ok == Some(true) {
+                    hypercall = next;
+                }
+            }
+            3 => {
+                let vp = r.u32();
+                invariant!(hv.read(MSR_VP_INDEX, vp, tsc) == Some(u64::from(vp)), "VP_INDEX changed");
+            }
+            4 => {
+                invariant!(hv.write(MSR_VP_INDEX, r.value64(), &mem) == Some(false), "VP_INDEX writable");
+            }
+            5 => {
+                let want = (guest_id != 0 && hypercall & ENABLE != 0).then_some(2);
+                invariant!(hv.call(r.value64()) == want, "hypercall answered with the interface off or an unknown code");
+            }
+            6 => {
+                let msr = r.u32() | 0x8000_0000;
+                invariant!(hv.read(msr, 0, tsc).is_none() && hv.write(msr, r.value64(), &mem).is_none(),
+                           "an unknown MSR was claimed");
+            }
+            7 => {
+                let n = r.below(5) as usize;
+                let value = r.value64();
+                let msr = crate::hyperv::MSR_CRASH_P0 + n as u32;
+                invariant!(hv.write(msr, value, &mem) == Some(true), "crash parameter refused");
+                crash[n] = value;
+                invariant!(hv.read(msr, 0, tsc) == Some(value), "crash parameter not read back");
+            }
+            8 => {
+                let value = r.value64();
+                invariant!(hv.write(crate::hyperv::MSR_CRASH_CTL, value, &mem) == Some(true), "crash control refused");
+                let crashed = value & (1 << 63) != 0;
+                invariant!(hv.crashed() == crashed.then_some(crash), "CrashNotify gave the wrong parameters");
+                invariant!(hv.read(crate::hyperv::MSR_CRASH_CTL, 0, tsc) == Some(1 << 63),
+                           "CrashNotify not reported as available");
+            }
+            9 => {
+                tsc = tsc.saturating_add(r.time_step());
+                let got = hv.read(MSR_TIME_REF_COUNT, 0, tsc);
+                invariant!(got == Some(time(tsc)), "reference time {:?}, wanted {:#x} at TSC {:#x}", got, time(tsc), tsc);
+                let scaled = (u128::from(tsc) * u128::from(scale)) >> 64;
+                let from_page = i128::from(offset) + i128::try_from(scaled).unwrap();
+                invariant!((from_page - i128::from(time(tsc))).unsigned_abs() <= 1,
+                           "reference page time {:#x}, MSR {:#x}", from_page, time(tsc));
+            }
+            10 => {
+                let msr = r.pick(&[MSR_TIME_REF_COUNT, MSR_TSC_FREQUENCY, MSR_APIC_FREQUENCY]);
+                invariant!(hv.write(msr, r.value64(), &mem) == Some(false), "read-only time/frequency MSR {:#x} writable", msr);
+            }
+            11 => {
+                let value = if r.bool() {
+                    r.pick(&[0, 0x1000, 0x100000, 0xFEE0_0000, memory::MAX_GPA]) | r.pick(&[0, 1, 3, RESERVED])
+                } else {
+                    r.value64()
+                };
+                let old = reference_tsc;
+                let next = (value & !RESERVED) | (old & RESERVED);
+                let gpa = next & GPFN;
+                let collision = next & ENABLE != 0 && hypercall & ENABLE != 0 && gpa == hypercall & GPFN;
+                let map_bad = gpa == memory::XAPIC_PAGE
+                    || gpa.checked_add(PAGE).is_none_or(|end| end > memory::MAX_GPA) || collision;
+                let ok = hv.write(MSR_REFERENCE_TSC, value, &mem);
+                invariant!(ok == Some(!map_bad), "reference TSC MSR write {:#x} -> {:?}, old {:#x}", value, ok, old);
+                if ok == Some(true) {
+                    reference_tsc = next;
+                }
+                invariant!(hv.read(MSR_REFERENCE_TSC, 0, tsc) == Some(reference_tsc), "reference TSC not read back");
+            }
+            12 => {
+                let value = (hypercall & GPFN) | ENABLE;
+                let next = (value & !RESERVED) | (reference_tsc & RESERVED);
+                let collision = hypercall & ENABLE != 0;
+                let ok = hv.write(MSR_REFERENCE_TSC, value, &mem);
+                invariant!(ok == Some(!collision), "reference page overlaid the hypercall page: {:?}", ok);
+                if ok == Some(true) {
+                    reference_tsc = next;
+                }
+            }
+            13 => {
+                let msr = MSR_STIMER0_CONFIG + r.below(8) as u32;
+                let n = ((msr - MSR_STIMER0_CONFIG) / 2) as usize;
+                let want = if msr & 1 == 0 { configs[n] } else { counts[n] };
+                invariant!(vp.read(msr) == Some(want), "stimer MSR {:#x} read {:?}, wanted {:#x}", msr, vp.read(msr), want);
+                invariant!(vp.read(MSR_STIMER3_COUNT + 1).is_none(), "an MSR past the stimers was claimed");
+            }
+            14 => {
+                let n = r.below(4) as usize;
+                let vector = if r.bool() { r.below(16) } else { 16 + r.below(240) };
+                let value = match r.below(4) {
+                    0 => r.value64(),
+                    1 => ENABLE | DIRECT | (vector << 4) | r.pick(&[0, PERIODIC, AUTO_ENABLE, PERIODIC | AUTO_ENABLE]),
+                    2 => ENABLE | (vector << 4),
+                    _ => 0,
+                };
+                let valid = value & ENABLE == 0 || value & DIRECT == 0 || (value & VECTOR) >> 4 >= 16;
+                let ok = vp.write(MSR_STIMER0_CONFIG + 2 * n as u32, value, time(tsc), &mem);
+                invariant!(ok == Some(valid), "stimer config {:#x} -> {:?}, valid {}", value, ok, valid);
+                if ok == Some(true) {
+                    let mut next = value;
+                    if next & ENABLE != 0 && next & DIRECT == 0 && next & (0xF << 16) == 0 {
+                        next &= !ENABLE;
+                    }
+                    configs[n] = next;
+                }
+            }
+            15 => {
+                let n = r.below(4) as usize;
+                let value = r.value64();
+                let mut config = configs[n];
+                if value == 0 {
+                    config &= !ENABLE;
+                } else if config & AUTO_ENABLE != 0 {
+                    config |= ENABLE;
+                }
+                if config & ENABLE != 0 && config & DIRECT == 0 && config & (0xF << 16) == 0 {
+                    config &= !ENABLE;
+                }
+                let valid = config & ENABLE == 0 || config & DIRECT == 0 || (config & VECTOR) >> 4 >= 16;
+                let ok = vp.write(MSR_STIMER0_CONFIG + 2 * n as u32 + 1, value, time(tsc), &mem);
+                invariant!(ok == Some(valid), "stimer count {:#x} -> {:?}, valid {}", value, ok, valid);
+                if ok == Some(true) {
+                    configs[n] = config;
+                    counts[n] = value;
+                }
+            }
+            16 => {
+                let now = time(tsc);
+                let mut one = Vp::default();
+                let mut apic = Lapic::new(0, true, false);
+                let config = ENABLE | AUTO_ENABLE | DIRECT | (0x30 << 4);
+                invariant!(one.write(MSR_STIMER0_CONFIG, config, now, &mem) == Some(true), "direct one-shot config refused");
+                invariant!(one.write(MSR_STIMER0_CONFIG + 1, now + 10, now, &mem) == Some(true), "one-shot count refused");
+                invariant!(one.read(MSR_STIMER0_CONFIG + 1) == Some(now + 10), "one-shot count changed");
+                invariant!(one.poll(now, &mut apic, &mem) == Some(now + 10) && !apic.requested(0x30),
+                           "one-shot expired before its count");
+                invariant!(one.poll(now + 11, &mut apic, &mem).is_none() && apic.requested(0x30),
+                           "one-shot did not request its APIC vector");
+                invariant!(one.read(MSR_STIMER0_CONFIG).is_some_and(|c| c & ENABLE == 0),
+                           "one-shot stayed enabled after firing");
+                invariant!(one.write(MSR_STIMER0_CONFIG + 1, 0, time(tsc), &mem) == Some(true)
+                           && one.read(MSR_STIMER0_CONFIG).is_some_and(|c| c & ENABLE == 0),
+                           "a zero count enabled a timer");
+
+                let now = time(tsc);
+                let mut periodic = Vp::default();
+                let mut apic = Lapic::new(0, true, false);
+                let config = ENABLE | PERIODIC | DIRECT | (0x31 << 4);
+                invariant!(periodic.write(MSR_STIMER0_CONFIG, config, now, &mem) == Some(true), "periodic config refused");
+                invariant!(periodic.write(MSR_STIMER0_CONFIG + 1, 100, now, &mem) == Some(true), "periodic count refused");
+                invariant!(periodic.poll(now, &mut apic, &mem) == Some(now + 100), "wrong periodic first edge");
+                invariant!(periodic.poll(now + 101, &mut apic, &mem) == Some(now + 200) && apic.requested(0x31),
+                           "periodic edge or phase wrong");
+                invariant!(periodic.poll(now + 101, &mut apic, &mem).is_none(), "periodic interrupt piled up");
+
+                let mut message = Vp::default();
+                let message_mem = GuestMemory::with_size(MEM);
+                let mut apic = Lapic::new(0, true, false);
+                let config = ENABLE | AUTO_ENABLE | (3 << 16);
+                invariant!(message.write(crate::hyperv::MSR_SIMP, 0x1001, now, &message_mem) == Some(true),
+                           "SIMP enable refused");
+                invariant!(message.write(crate::hyperv::MSR_SINT0 + 3, 0x32, now, &message_mem) == Some(true),
+                           "SINT3 config refused");
+                invariant!(message.write(MSR_STIMER0_CONFIG, config, now, &message_mem) == Some(true)
+                           && message.write(MSR_STIMER0_CONFIG + 1, now + 10, now, &message_mem) == Some(true),
+                           "message-mode one-shot refused");
+                invariant!(message.poll(now, &mut apic, &message_mem) == Some(now + 10) && !apic.requested(0x32),
+                           "message-mode timer fired early");
+                invariant!(message.poll(now + 11, &mut apic, &message_mem).is_none() && apic.requested(0x32),
+                           "timer message did not request SINT3's vector");
+                let at = 0x1000 + 3 * 256;
+                let mut bytes = [0u8; 40];
+                message_mem.read(at, &mut bytes).unwrap();
+                invariant!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()) == 0x8000_0010 && bytes[4] == 24,
+                           "wrong timer message header");
+                invariant!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()) == 0
+                           && u64::from_le_bytes(bytes[24..32].try_into().unwrap()) == now + 10
+                           && u64::from_le_bytes(bytes[32..40].try_into().unwrap()) == now + 11,
+                           "wrong timer message payload");
+            }
+            17 => {
+                use crate::hyperv::{MSR_EOM, MSR_SCONTROL, MSR_SIEFP, MSR_SIMP, MSR_SINT0, MSR_SINT15, MSR_SIRBP,
+                                    MSR_SVERSION};
+                let msr = if r.bool() {
+                    r.pick(&[MSR_SCONTROL, MSR_SVERSION, MSR_SIEFP, MSR_SIMP, MSR_EOM, MSR_SIRBP])
+                } else {
+                    MSR_SINT0 + r.below(16) as u32
+                };
+                let want = match msr {
+                    MSR_SCONTROL => scontrol,
+                    MSR_SVERSION => 1,
+                    MSR_SIEFP => pages[0],
+                    MSR_SIMP => pages[1],
+                    MSR_SIRBP => pages[2],
+                    MSR_EOM => 0,
+                    MSR_SINT0..=MSR_SINT15 => sints[(msr - MSR_SINT0) as usize],
+                    _ => unreachable!(),
+                };
+                invariant!(vp.read(msr) == Some(want), "SynIC MSR {:#x} read {:?}, wanted {:#x}", msr, vp.read(msr), want);
+            }
+            18 => {
+                let value = r.value64();
+                let ok = vp.write(crate::hyperv::MSR_SCONTROL, value, time(tsc), &mem);
+                invariant!(ok == Some(value & !1 == 0), "SCONTROL reserved bits accepted");
+                if ok == Some(true) {
+                    scontrol = value;
+                }
+            }
+            19 => {
+                invariant!(vp.write(crate::hyperv::MSR_SVERSION, r.value64(), time(tsc), &mem) == Some(false),
+                           "SVERSION writable");
+                invariant!(vp.read(crate::hyperv::MSR_SVERSION) == Some(1), "wrong SynIC version");
+                invariant!(vp.write(crate::hyperv::MSR_EOM, r.value64(), time(tsc), &mem) == Some(true)
+                           && vp.read(crate::hyperv::MSR_EOM) == Some(0), "EOM not answered");
+            }
+            20 => {
+                use crate::hyperv::{MSR_SIEFP, MSR_SIMP, MSR_SIRBP};
+                let slot = r.below(3) as usize;
+                let msr = [MSR_SIEFP, MSR_SIMP, MSR_SIRBP][slot];
+                let gpa = r.pick(&[0, 0x1000, MEM - PAGE, memory::MAX_GPA, hypercall & GPFN, reference_tsc & GPFN]);
+                let value = gpa | r.pick(&[0, 1, RESERVED]) | if r.bool() { 1 } else { 0 };
+                let next = (value & !RESERVED) | (pages[slot] & RESERVED);
+                let enabled = next & 1 != 0;
+                let address = next & GPFN;
+                let valid = !enabled || mem.is_ram(address, PAGE as _) && !mem.overlay_contains(address);
+                if valid && enabled {
+                    mem.write(address, &[0xAA; 8]).unwrap();
+                }
+                let ok = vp.write(msr, value, time(tsc), &mem);
+                invariant!(ok == Some(valid), "SynIC page {:#x} -> {:?}, valid {}", value, ok, valid);
+                if ok == Some(true) {
+                    pages[slot] = next;
+                    if enabled {
+                        let mut bytes = [1u8; 8];
+                        mem.read(address, &mut bytes).unwrap();
+                        invariant!(bytes == [0; 8], "enabled SynIC page not zeroed");
+                    }
+                }
+            }
+            21 => {
+                let n = r.below(16) as usize;
+                let value = if r.bool() {
+                    r.value64()
+                } else {
+                    r.below(256) | r.pick(&[0, 1 << 16, 1 << 17, 1 << 18])
+                };
+                let valid = value & !(0xFF | 0x1F << 16) == 0 && (value & 1 << 16 != 0 || value & 0xFF >= 16);
+                let msr = crate::hyperv::MSR_SINT0 + n as u32;
+                let ok = vp.write(msr, value, time(tsc), &mem);
+                invariant!(ok == Some(valid), "SINT {:#x} -> {:?}, valid {}", value, ok, valid);
+                if ok == Some(true) {
+                    sints[n] = value;
+                }
+            }
+            _ => {}
+        }
+        let hypercall_on = hypercall & ENABLE != 0;
+        let reference_on = reference_tsc & ENABLE != 0;
+        let (hypercall_gpa, reference_gpa) = (hypercall & GPFN, reference_tsc & GPFN);
+        invariant!(mem.overlay_contains(hypercall_gpa) == (hypercall_on || reference_on && hypercall_gpa == reference_gpa),
+                   "hypercall overlay at {:#x} does not match its MSR", hypercall_gpa);
+        invariant!(mem.overlay_contains(reference_gpa) == (reference_on || hypercall_on && hypercall_gpa == reference_gpa),
+                   "reference overlay at {:#x} does not match its MSR", reference_gpa);
+    }
 }

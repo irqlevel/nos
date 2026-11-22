@@ -631,7 +631,8 @@ nos-arm64.img: $(KERNEL)
 	cp $(KERNEL) bin/kernel-arm64.elf
 
 # The system image (docs/install.md): the kernel, every module built with it,
-# hvboot, the GRUB entries that boot it, the default /etc/rc, nos-install and
+# hvboot and the CloudHv guest firmware, the GRUB entries that boot it, the
+# default /etc/rc, nos-install and
 # nos-setup -- the installer's dialog, which a provider's rescue system runs
 # from the image mounted (scripts/installer/install.sh) -- in one read-only
 # squashfs that nos-install pours onto a server's partition or a whole disk.
@@ -651,11 +652,11 @@ nos-arm64.img: $(KERNEL)
 # has no /lib/panel, and `api panel create` is told bundle= and sha256=.
 IMAGE = nos-$(ARCH).squashfs
 IMAGE_STAGE = $(OUT)/image
-# The licenses whose notice the kernel and its modules carry, each in the
-# image's /lib/licenses: CRYPTOGAMS', whose assembly the crypto crate runs
-# (src/crates/base/crypto/cryptogams/README.md), asks a binary to reproduce
-# it in what is handed out with it.
-LICENSES = src/crates/base/crypto/cryptogams/LICENSE
+# The licenses whose notice the kernel, its modules and the guest firmware
+# carry, each in the image's /lib/licenses: CRYPTOGAMS', whose assembly the
+# crypto crate runs (src/crates/base/crypto/cryptogams/README.md), and
+# CloudHv's EDK2, Xen and LZMA notices (build/image/CLOUDHV.license).
+LICENSES = src/crates/base/crypto/cryptogams/LICENSE build/image/CLOUDHV.license
 PANEL_BUNDLE ?=
 PANEL_BUNDLE_URL ?=
 
@@ -667,14 +668,16 @@ image:
 endif
 
 $(IMAGE): $(KERNEL) $(MODULE_KO) $(HVBOOT) build/image/nos.cfg build/image/rc scripts/nos-install \
-		scripts/installer/nos-setup $(LICENSES)
+		scripts/installer/nos-setup $(LICENSES) build/image/CLOUDHV.fd
 	rm -rf $(IMAGE_STAGE) $@.tmp
 	mkdir -p $(IMAGE_STAGE)/boot/grub $(IMAGE_STAGE)/lib/modules $(IMAGE_STAGE)/lib/licenses $(IMAGE_STAGE)/etc
 	install -m 0644 src/crates/base/crypto/cryptogams/LICENSE $(IMAGE_STAGE)/lib/licenses/CRYPTOGAMS
+	install -m 0644 build/image/CLOUDHV.license $(IMAGE_STAGE)/lib/licenses/CLOUDHV
 	$(OBJCOPY) --strip-debug $(KERNEL) $(IMAGE_STAGE)/boot/kernel64.elf
 	chmod 0644 $(IMAGE_STAGE)/boot/kernel64.elf
 	install -m 0644 $(MODULE_KO) $(IMAGE_STAGE)/lib/modules/
 	install -m 0644 $(HVBOOT) $(IMAGE_STAGE)/lib/hvboot
+	install -m 0644 build/image/CLOUDHV.fd $(IMAGE_STAGE)/lib/CLOUDHV.fd
 	install -m 0644 build/image/nos.cfg $(IMAGE_STAGE)/boot/grub/nos.cfg
 	install -m 0644 build/image/rc $(IMAGE_STAGE)/etc/rc
 	install -m 0755 scripts/nos-install $(IMAGE_STAGE)/nos-install

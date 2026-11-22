@@ -30,8 +30,14 @@ pub const PM1_CNT: u16 = 0x604;
 pub const PM1_CNT_LEN: u8 = 2;
 pub const PM_TMR: u16 = 0x608;
 pub const PM_TMR_LEN: u8 = 4;
-/// The ports the block spans, the two between the control register and the
-/// timer included: they float.
+/// CloudHv's hardware-reduced sleep registers. Its firmware writes S5 to this
+/// fixed address directly; the firmware FADT describes the same registers.
+/// Their sleep type and enable bits are at 2 and 5 rather than PM1's 10 and 13.
+pub const SLEEP_CONTROL: u16 = PM1_EVT;
+pub const SLEEP_STATUS: u16 = PM1_EVT + 1;
+/// The ports the block spans on the two machine kinds, the gaps included:
+/// they float. CloudHv has no legacy PM1 blocks, so its sleep registers can
+/// use the event block's address without sharing a register on one machine.
 const FIRST: u16 = PM1_EVT;
 const END: u16 = PM_TMR + PM_TMR_LEN as u16;
 /// The status register's two bytes, then the enable register's.
@@ -76,6 +82,8 @@ const SLP_EN: u16 = 1 << 13;
 /// hand the global lock to firmware that never takes it, and SLP_EN are
 /// write-only, and read as zero.
 const CONTROL_KEPT: u16 = BM_RLD | (SLP_TYP_MASK << SLP_TYP_SHIFT);
+const REDUCED_SLP_TYP_SHIFT: u8 = 2;
+const REDUCED_SLP_EN: u8 = 1 << 5;
 
 /// The registers, and the timer's zero.
 pub struct Pm {
@@ -86,6 +94,9 @@ pub struct Pm {
     enable: u16,
     /// BM_RLD and SLP_TYP as last written.
     control: u16,
+    /// CloudHv's machine has its reduced sleep registers where a legacy
+    /// machine has PM1 status; its firmware uses that address directly.
+    cloudhv: bool,
     /// The host's time the timer counts from.
     zero_ns: u64,
     /// How many times the timer's top bit had flipped when its status was
@@ -113,6 +124,7 @@ impl Pm {
             status: 0,
             enable: 0,
             control: 0,
+            cloudhv: false,
             zero_ns: now,
             carries_seen: 0,
             scis: 0,
@@ -120,6 +132,14 @@ impl Pm {
             used: false,
             other_sleep: None,
         }
+    }
+
+    /// CloudHv's firmware machine: hardware-reduced sleep control and status
+    /// at 0x600 and 0x601, the address its ResetSystem runtime writes.
+    pub fn new_cloudhv(now: u64) -> Pm {
+        let mut p = Self::new(now);
+        p.cloudhv = true;
+        p
     }
 
     pub fn owns(port: u16) -> bool {
@@ -181,13 +201,16 @@ impl Pm {
     /// The byte at `port`, the status and the timer being `status` and
     /// `timer`.
     fn byte(&self, port: u16, status: u16, timer: u32) -> u8 {
+        if self.cloudhv && (port == SLEEP_CONTROL || port == SLEEP_STATUS) {
+            return 0;
+        }
         match port {
             p if (PM1_STS..PM1_STS + 2).contains(&p) => status.to_le_bytes()[usize::from(p - PM1_STS)],
             p if (PM1_EN..PM1_EN + 2).contains(&p) => self.enable.to_le_bytes()[usize::from(p - PM1_EN)],
             p if (PM1_CNT..PM1_CNT + 2).contains(&p) => {
                 (self.control | SCI_EN).to_le_bytes()[usize::from(p - PM1_CNT)]
             }
-            p if (PM_TMR..END).contains(&p) => timer.to_le_bytes()[usize::from(p - PM_TMR)],
+            p if (PM_TMR..PM_TMR + u16::from(PM_TMR_LEN)).contains(&p) => timer.to_le_bytes()[usize::from(p - PM_TMR)],
             _ => 0xFF,
         }
     }
@@ -202,7 +225,11 @@ impl Pm {
         for i in 0..u16::from(size.min(4)) {
             let p = port.wrapping_add(i);
             let byte = (value >> (8 * i)) as u8;
-            if (PM1_STS..PM1_STS + 2).contains(&p) {
+            if self.cloudhv && (p == SLEEP_CONTROL || p == SLEEP_STATUS) {
+                if p == SLEEP_CONTROL && byte & REDUCED_SLP_EN != 0 {
+                    sleep = Some((byte >> REDUCED_SLP_TYP_SHIFT) & SLP_TYP_MASK as u8);
+                }
+            } else if (PM1_STS..PM1_STS + 2).contains(&p) {
                 let bits = u16::from(byte) << (8 * (p - PM1_STS));
                 self.status &= !bits;
                 if bits & TMR != 0 {
@@ -257,7 +284,8 @@ impl Pm {
             return Err(vmstate::Error("a sleep type past its field"));
         }
         *self = Pm {
-            status: s.status, enable: s.enable, control: s.control, zero_ns: now.saturating_sub(s.elapsed_ns),
+            status: s.status, enable: s.enable, control: s.control, cloudhv: self.cloudhv,
+            zero_ns: now.saturating_sub(s.elapsed_ns),
             carries_seen: s.carries_seen, scis: s.scis, presses: s.presses, used: s.used, other_sleep: s.other_sleep,
         };
         Ok(())

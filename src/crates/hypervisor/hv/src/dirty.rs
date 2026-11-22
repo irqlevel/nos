@@ -25,7 +25,7 @@
 //! and the guest's CPUs (`dirtylog`).
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const PAGE: u64 = 4096;
 const BITS: u64 = 64;
@@ -80,11 +80,18 @@ impl Bits {
 #[derive(Default)]
 pub struct Log {
     regions: Vec<Bits>,
+    /// Between `start` and `release`: a movable page is mapped read-only.
+    active: AtomicBool,
 }
 
 impl Log {
     pub fn new() -> Log {
-        Log { regions: Vec::new() }
+        Log { regions: Vec::new(), active: AtomicBool::new(false) }
+    }
+
+    /// Whether guest writes are being found by read-only nested mappings.
+    pub fn active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
     }
 
     /// A run of RAM, `size` bytes from `base`, both whole pages: its marks,
@@ -151,6 +158,7 @@ impl Log {
     /// page. False where a page could not be protected; those before it are,
     /// and `release` undoes them.
     pub fn start(&self, table: &mut dyn Table) -> bool {
+        self.active.store(true, Ordering::Release);
         for r in &self.regions {
             for (_, w) in r.words() {
                 w.store(0, Ordering::Relaxed);
@@ -198,6 +206,7 @@ impl Log {
     /// does not fault on each one it writes for the rest of its run. The
     /// marks stay, and go on being made.
     pub fn release(&self, table: &mut dyn Table) {
+        self.active.store(false, Ordering::Release);
         for r in &self.regions {
             for page in 0..r.pages {
                 table.unprotect(r.base + page * PAGE);

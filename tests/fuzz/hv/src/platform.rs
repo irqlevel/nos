@@ -1505,7 +1505,7 @@ impl Script {
                     };
                     self.mmio_insn(v, mem, r, store, size, value);
                     let mut error = npf::FINAL | if store { npf::WRITE } else { 0 };
-                    if r.rare() {
+                    if r.rare() && !(crate::linux::ECAM_BASE..crate::linux::ECAM_BASE + crate::linux::ECAM_BYTES).contains(&gpa) {
                         error = r.pick(&[npf::PRESENT, npf::FETCH, npf::TABLE_WALK, npf::USER, 0]) | if r.bool() { error } else { 0 };
                     }
                     if r.rare() && v.event_queued() {
@@ -1877,8 +1877,9 @@ fn run_threads(guest: &Arc<LinuxGuest>, vcpus: Vec<crate::run::GuestCpu>, machin
 
 pub fn platform(r: &mut Input) {
     let cpus = 1 + r.below(4) as u32;
-    let x2apic = r.bool();
-    let ioapic = cpus > 1 && r.bool();
+    let firmware = r.u8() < 24;
+    let x2apic = !firmware && r.bool();
+    let ioapic = firmware || (cpus > 1 && r.bool());
     /* Under the devices' pages, up to them, past them -- RAM from 4 GiB --
      * a guest of 8, 16 and 32 GiB, and one past the most there is. */
     let mem_bytes = r.pick(&[64 * MIB, 128 * MIB, 256 * MIB, 3072 * MIB, 4064 * MIB, 4096 * MIB, 8192 * MIB,
@@ -1896,11 +1897,13 @@ pub fn platform(r: &mut Input) {
     machine.posted = machine.vapic && r.u8() >= 64;
     let Some(doorbells) = Doorbells::new(cpus as usize) else { return };
     let doorbells = Arc::new(doorbells);
-    /* Now and then a guest holding a host's function: its RAM below 4 GiB
-     * ending below the hole the function's BARs go in */
-    let hosted = r.u8() < 40;
-    let low_end = if hosted { linux::HOLE_RAM_END } else { linux::LOW_RAM_END };
-    let made = if hosted {
+    /* Now and then a guest holding a host's function. Every Q35 guest has
+     * the PCI hole; CloudHv has the same RAM layout but no ECAM. */
+    let hosted = !firmware && r.u8() < 40;
+    let low_end = linux::HOLE_RAM_END;
+    let made = if firmware {
+        LinuxGuest::new_firmware(&machine, mem_bytes, huge, cpus, doorbells.clone())
+    } else if hosted {
         LinuxGuest::new_holed(&machine, mem_bytes, huge, cpus, doorbells.clone(), x2apic, ioapic)
     } else {
         LinuxGuest::new(&machine, mem_bytes, huge, cpus, doorbells.clone(), x2apic, ioapic)
@@ -1919,6 +1922,8 @@ pub fn platform(r: &mut Input) {
         return;
     }
     let Ok((mut guest, mut vcpus)) = made else { return };
+    invariant!(guest.has_ioapic() == ioapic, "an IO-APIC {}, not {}", ioapic, guest.has_ioapic());
+    invariant!(guest.has_apic() == (cpus > 1 || ioapic), "local APICs for {} CPUs and IO-APIC {}", cpus, ioapic);
     /* Its RAM where the platform has it: below the devices' pages and from
      * 4 GiB, every byte of it, the huge pool's when asked. */
     let memory = guest.memory();
@@ -2008,7 +2013,7 @@ pub fn platform(r: &mut Input) {
                                     last_entry: AtomicU64::new(time::peek()) });
     let devices = disks.len() + nics.len();
     let n = cpus as usize;
-    let first_xapic = cpus > 1 && (!x2apic || ioapic);
+    let first_xapic = firmware || (cpus > 1 && (!x2apic || ioapic));
     /* The hypervisor's tracepoints on for half the runs: every record its
      * sites build of what this guest does, held to its description. */
     crate::trace::set_on(r.u8() < 128);
@@ -2019,7 +2024,7 @@ pub fn platform(r: &mut Input) {
         disks,
         nics,
         queues: vec![[DriverQueue::default(); 2]; devices],
-        apic: cpus > 1,
+        apic: cpus > 1 || ioapic,
         ioapic,
         cpus: (0..n).map(|_| CpuPlan { plan: VecDeque::new(), xapic: first_xapic, asked_xapic: None,
                                        protected32: false, cr4: None, dr: None, dr_model: [0; 4],
@@ -2053,10 +2058,10 @@ pub fn platform(r: &mut Input) {
     }
     let stopped = guest.take_stopped();
     invariant!(stopped.is_some(), "the run ended with no stop recorded");
-    /* PCI Express's configuration space is answered, every access of it,
-     * in a guest with the BARs' hole: none stops at one -- one delivering an
-     * event stops said as that. A guest without the hole has none there */
-    if let (true, Some(crate::run::Stop::Mmio { gpa, .. })) = (hosted, stopped.as_ref().map(|s| &s.stop)) {
+    /* Q35's PCI Express configuration space answers every data fault the
+     * script generates for it. Fetch and table-walk faults are outside this
+     * check: those stop, as they should. CloudHv has no ECAM. */
+    if let (true, Some(crate::run::Stop::Mmio { gpa, .. })) = (!firmware, stopped.as_ref().map(|s| &s.stop)) {
         let ecam = crate::linux::ECAM_BASE..crate::linux::ECAM_BASE + crate::linux::ECAM_BYTES;
         invariant!(!ecam.contains(gpa), "the guest stopped at an access of ECAM's {:#x}: {:x?}", gpa,
                    stopped.as_ref().map(|s| &s.stop));

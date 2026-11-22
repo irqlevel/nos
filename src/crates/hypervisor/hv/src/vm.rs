@@ -148,7 +148,8 @@ impl Backend {
     /// make the CPU's, and the IBPBs it asked for (`hvarch::x86::msrs`).
     pub fn own_msrs(&self) -> crate::policy::Own {
         let m = match self { Backend::Svm(v) => v.msrs(), Backend::Vmx(v) => v.msrs() };
-        crate::policy::Own { tsc_aux: m.tsc_aux(), spec_ctrl: m.spec_ctrl(), ibpbs: m.ibpbs(), tsc_offset: self.tsc_offset() }
+        crate::policy::Own { tsc_aux: m.tsc_aux(), spec_ctrl: m.spec_ctrl(), ibpbs: m.ibpbs(), tsc_offset: self.tsc_offset(),
+                             mtrrs: vmstate::Mtrrs::default() }
     }
     /// Make `own` the guest's, for a WRMSR the policy performed -- an IBPB
     /// asked for where its count is one more: false, and nothing changed,

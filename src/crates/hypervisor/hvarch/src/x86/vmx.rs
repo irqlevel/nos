@@ -841,6 +841,30 @@ struct Synced {
     entry_ctls: u32,
 }
 
+/// The VMCS fields a failed entry leaves worth seeing after its VMCS is
+/// cleared. Control masks are ordered entry, exit, pin, primary and secondary.
+#[derive(Clone, Copy)]
+pub struct EntryFailure {
+    pub entry_controls: u64,
+    pub entry_interrupt_info: u64,
+    pub entry_msr_load_count: u64,
+    pub entry_msr_load_address: u64,
+    pub exit_controls: u64,
+    pub pin_controls: u64,
+    pub processor_controls: u64,
+    pub processor_controls2: u64,
+    pub invalid_controls: [u32; 5],
+    pub tpr_threshold: u64,
+    pub virtual_tpr: u64,
+    pub ept_pointer: u64,
+    pub msr_bitmap: u64,
+    pub ple_gap: u64,
+    pub ple_window: u64,
+    pub guest_interrupt_status: u64,
+    pub guest_interruptibility: u64,
+    pub vmcs_link_pointer: u64,
+}
+
 /// A guest's CPU as VT-x keeps it: one VMCS, a shadow of the guest state
 /// that policy above reads and writes as though it were a VMCB's save area
 /// (`Save`), the registers the launch stub moves, and the x87, SSE and AVX
@@ -1041,6 +1065,8 @@ pub struct Guest {
     /// A VMLAUNCH that failed outright (VMfail), with the instruction error.
     vm_instruction_error: u32,
     entry_failed: bool,
+    /// The controls of either kind of failed VM-entry, kept for the stop's dump.
+    entry_failure: Option<EntryFailure>,
     /// The shadow holds the whole of the guest's state: its control
     /// registers, segments and descriptor tables too, which an exit that
     /// does not end a guest leaves in the VMCS ([`read_guest_heavy`]) -- as
@@ -1164,6 +1190,7 @@ impl Guest {
             exit_cs_ar: 0,
             vm_instruction_error: 0,
             entry_failed: false,
+            entry_failure: None,
             whole_state: true,
             profile: None,
             last_run: Run::default(),
@@ -1423,6 +1450,9 @@ impl Guest {
     }
     pub fn entry_failed(&self) -> bool {
         self.entry_failed
+    }
+    pub fn entry_failure(&self) -> Option<&EntryFailure> {
+        self.entry_failure.as_ref()
     }
 
     /// Queue an event for injection on the next entry: `info` in
@@ -2530,6 +2560,49 @@ impl Guest {
         }
     }
 
+    /// Keep the failed entry's controls for a dump after VMCLEAR. The VMCS
+    /// is current on this CPU, with VMX on and interrupts off.
+    unsafe fn capture_entry_failure(&mut self) {
+        let [entry_controls, entry_interrupt_info, entry_msr_load_count, entry_msr_load_address,
+             exit_controls, pin_controls, processor_controls, processor_controls2] = unsafe {
+            [vmcs::vmread(vmcs::VMENTRY_CTLS), vmcs::vmread(vmcs::VMENTRY_INTR_INFO),
+             vmcs::vmread(vmcs::VMENTRY_MSR_LOAD_COUNT), vmcs::vmread(vmcs::VMENTRY_MSR_LOAD_ADDR),
+             vmcs::vmread(vmcs::VMEXIT_CTLS), vmcs::vmread(vmcs::PIN_BASED_CTLS),
+             vmcs::vmread(vmcs::PROC_BASED_CTLS), vmcs::vmread(vmcs::PROC_BASED_CTLS2)]
+        };
+        let checks = [(entry_controls, vmcs::MSR_VMX_ENTRY_CTLS, vmcs::MSR_VMX_TRUE_ENTRY_CTLS),
+                      (exit_controls, vmcs::MSR_VMX_EXIT_CTLS, vmcs::MSR_VMX_TRUE_EXIT_CTLS),
+                      (pin_controls, vmcs::MSR_VMX_PINBASED_CTLS, vmcs::MSR_VMX_TRUE_PINBASED_CTLS),
+                      (processor_controls, vmcs::MSR_VMX_PROCBASED_CTLS, vmcs::MSR_VMX_TRUE_PROCBASED_CTLS),
+                      (processor_controls2, vmcs::MSR_VMX_PROCBASED_CTLS2, vmcs::MSR_VMX_PROCBASED_CTLS2)];
+        let mut invalid_controls = [0u32; 5];
+        for (i, (value, normal, truev)) in checks.into_iter().enumerate() {
+            let value = value as u32;
+            let cap = unsafe { cpu::rdmsr(vmcs::ctls_msr(self.basic, normal, truev)) };
+            invalid_controls[i] = (!value & cap as u32) | (value & !((cap >> 32) as u32));
+        }
+        self.entry_failure = Some(EntryFailure {
+            entry_controls,
+            entry_interrupt_info,
+            entry_msr_load_count,
+            entry_msr_load_address,
+            exit_controls,
+            pin_controls,
+            processor_controls,
+            processor_controls2,
+            invalid_controls,
+            tpr_threshold: unsafe { vmcs::vmread(vmcs::TPR_THRESHOLD) },
+            virtual_tpr: u64::from(self.virtual_tpr()),
+            ept_pointer: unsafe { vmcs::vmread(vmcs::EPT_POINTER) },
+            msr_bitmap: unsafe { vmcs::vmread(vmcs::MSR_BITMAP) },
+            ple_gap: unsafe { vmcs::vmread(vmcs::PLE_GAP) },
+            ple_window: unsafe { vmcs::vmread(vmcs::PLE_WINDOW) },
+            guest_interrupt_status: unsafe { vmcs::vmread(vmcs::GUEST_INTR_STATUS) },
+            guest_interruptibility: unsafe { vmcs::vmread(vmcs::GUEST_INTERRUPTIBILITY) },
+            vmcs_link_pointer: unsafe { vmcs::vmread(vmcs::VMCS_LINK_POINTER) },
+        });
+    }
+
     /// One entry of [`Guest::run`]'s, and its exit read back: on CPU `cpu`,
     /// whose `entries` they are.
     ///
@@ -2939,14 +3012,19 @@ impl Guest {
             self.vm_instruction_error = unsafe { vmcs::vmread(vmcs::VM_INSTRUCTION_ERROR) } as u32;
             self.entry_failed = true;
             self.exit_reason = 0;
+            unsafe { self.capture_entry_failure() };
             unsafe { vmcs::vmclear(vmcs_phys) };
             cleared_on(cpu as usize, vmcs_phys);
             now_unloaded(&self.loaded_cpu, &self.launched);
         } else {
             self.entry_failed = false;
+            self.entry_failure = None;
             /* The VMCS is launched now -- stored as the stub returned -- and
              * the next entry here resumes it. */
             unsafe { self.read_exit() };
+            if self.exit_reason & vmcs::reason::ENTRY_FAILURE != 0 {
+                unsafe { self.capture_entry_failure() };
+            }
             unsafe { self.read_guest_state() };
             self.read_stored_kernel_gs_base();
             /* The control registers and segments only when the exit is
