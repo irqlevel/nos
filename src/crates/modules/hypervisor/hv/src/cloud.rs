@@ -482,7 +482,7 @@ fn make(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options, work
         return Err(String::from("size= is a file's: a device's disk is the device's size, a volume's the \
                                  volume's"));
     }
-    o.kernel = String::from(recipe.hvboot);
+    o.kernel = String::from(if o.firmware { crate::config::CLOUDHV } else { recipe.hvboot });
     o.mem_mib = o.mem_mib.or(Some(DEFAULT_MEM_MIB));
     o.net = true;
     o.restart = true;
@@ -493,8 +493,8 @@ fn make(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options, work
     if kcore::fs::size(&file).is_ok() {
         return Err(alloc::format!("{} is there already -- not written over", file));
     }
-    if kcore::fs::size(recipe.hvboot).is_err() {
-        return Err(alloc::format!("no {} -- hvboot= says where hvboot is", recipe.hvboot));
+    if kcore::fs::size(&o.kernel).is_err() {
+        return Err(alloc::format!("no {} -- the guest's loader is not there", o.kernel));
     }
     /* The files this makes, looked for before anything is fetched: one
      * there already -- what `hv delete <vm> keep-disks` leaves -- refused
@@ -599,7 +599,7 @@ fn make(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options, work
         }
         made.folder = Some(folder.path.clone());
     }
-    match fill(&folder, recipe, onto.map(|(disk, _)| disk), &text, &file, &mut made, work) {
+    match fill(&folder, recipe, onto.map(|(disk, _)| disk), &text, &file, config.options.firmware, &mut made, work) {
         Ok(created) => {
             made.keep();
             Ok(created)
@@ -621,8 +621,8 @@ enum Onto<'a> {
 /// made of it -- or poured onto the device or the volume `onto`, or an
 /// image of NBS's cloned into one -- the user-data and the seed, and last
 /// the vm.toml.
-fn fill(folder: &Folder, recipe: &Recipe, onto: Option<Onto<'_>>, text: &str, file: &str, made: &mut Made,
-        work: &mut dyn Work) -> Result<Created, String> {
+fn fill(folder: &Folder, recipe: &Recipe, onto: Option<Onto<'_>>, text: &str, file: &str, firmware: bool,
+        made: &mut Made, work: &mut dyn Work) -> Result<Created, String> {
     let join = |f: &str| store::join(&folder.path, f).ok_or_else(|| String::from("out of memory"));
     let seed_path = join(SEED)?;
     let user_path = join(USER_DATA)?;
@@ -670,7 +670,7 @@ fn fill(folder: &Folder, recipe: &Recipe, onto: Option<Onto<'_>>, text: &str, fi
     if work.cancelled() {
         return Err(String::from(work::STOPPED));
     }
-    finish(folder, recipe, text, file, &user_path, &seed_path, size, made, work)
+    finish(folder, recipe, text, file, &user_path, &seed_path, size, firmware, made, work)
 }
 
 /// `url` downloaded into `path` by the kernel's own HTTP client, its
@@ -774,8 +774,9 @@ fn file_disk(download: &str, disk: &str, size: Option<u64>, made: &mut Made, wor
 /// what was made, the disk's `size` said.
 #[allow(clippy::too_many_arguments)]
 fn finish(folder: &Folder, recipe: &Recipe, text: &str, file: &str, user_path: &str, seed_path: &str, size: u64,
-          made: &mut Made, work: &mut dyn Work) -> Result<Created, String> {
+          firmware: bool, made: &mut Made, work: &mut dyn Work) -> Result<Created, String> {
     let (user_path, seed_path) = (String::from(user_path), String::from(seed_path));
+    let loader = if firmware { "CloudHv" } else { "hvboot" };
     let keys = keys();
     let user = match recipe.user_data {
         Some(u) => String::from(u),
@@ -791,11 +792,11 @@ fn finish(folder: &Folder, recipe: &Recipe, text: &str, file: &str, user_path: &
     made.files.push(String::from(file));
 
     if recipe.user_data.is_some() {
-        let _ = writeln!(work, "hv: {} written -- hv start {} boots it: hvboot, a {} MiB disk, cloud-init given the \
-                                user-data it was asked to", file, folder.name, size.div_ceil(MIB));
+        let _ = writeln!(work, "hv: {} written -- hv start {} boots it: {}, a {} MiB disk, cloud-init given the \
+                                user-data it was asked to", file, folder.name, loader, size.div_ceil(MIB));
     } else {
-        let _ = writeln!(work, "hv: {} written -- hv start {} boots it: hvboot, a {} MiB disk, cloud-init given {} \
-                                key{}{}", file, folder.name, size.div_ceil(MIB), keys.len(),
+        let _ = writeln!(work, "hv: {} written -- hv start {} boots it: {}, a {} MiB disk, cloud-init given {} \
+                                key{}{}", file, folder.name, loader, size.div_ceil(MIB), keys.len(),
                          if keys.len() == 1 { "" } else { "s" },
                          if recipe.password.is_some() { " and a password" } else { "" });
         if keys.is_empty() && recipe.password.is_none() {

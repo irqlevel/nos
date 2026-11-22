@@ -161,7 +161,7 @@ poweroff
 `hv stop` нажимает кнопку питания гостя и даёт ему 30 с, чтобы выключиться самому; Debian под TCG хватило 7 с. `secs=N` меняет это время. Загрузите nos снова той же командой QEMU и ничего не набирайте: ВМ запустит `/etc/rc`. `ssh -p 2201 debian@127.0.0.1` попадёт на ту же машину, с тем же ключом хоста и теми же файлами. cloud-init не настраивает гостя второй раз, потому что instance ID в сиде не изменился. `/vms/debian/console.log` хранит консоль каждой загрузки, а между загрузками — строки самого hv:
 
 ```text
---- hv: 2026-10-25 12:46:37 UTC vm 0 stopped -- the guest powered itself off, S5 by its ACPI PM1 control register, at 0xffffffff96e1d0a3 ---
+--- hv: 2026-10-25 12:46:37 UTC vm 0 stopped -- the guest powered itself off, S5 by its ACPI sleep control register, at 0xffffffff96e1d0a3 ---
 --- hv: 2026-10-25 12:46:37 UTC vm 0 off the list ---
 --- hv: 2026-10-25 12:46:44 UTC vm 0 started on cpu 3 -- /lib/hvboot, 1024 MiB, 1 cpu, cmdline "...", restarted when it resets ---
 ```

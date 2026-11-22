@@ -21,13 +21,20 @@ use core::fmt::Write;
 /// The most a vm.toml may be: a configuration, not a document.
 pub const MAX_BYTES: usize = 64 * 1024;
 
+/// The firmware a `firmware` guest boots when no image path is given.
+pub const CLOUDHV: &str = "/lib/CLOUDHV.fd";
+
 /// What a command line or a vm.toml says of a guest, as said: what is not
 /// said is `None`, `false` or empty, and `guest::spec` gives it its default
 /// and checks the whole.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
-    /// Its bzImage.
+    /// Its bzImage or PVH ELF; CloudHv's default where `firmware` is set.
     pub kernel: String,
+    /// Boot the CloudHv machine and firmware, rather than a plain Q35 guest.
+    pub firmware: bool,
+    /// Offer Microsoft's Hyper-V interface rather than KVM's; firmware only.
+    pub hyperv: bool,
     pub initrd: Option<String>,
     /// Its disks, `vda` on: each one's path, and whether it is read-only.
     pub disks: Vec<(String, bool)>,
@@ -113,6 +120,8 @@ impl Config {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Key {
     Kernel,
+    Firmware,
+    Hyperv,
     Initrd,
     Cmdline,
     Memory,
@@ -142,8 +151,10 @@ enum Key {
 }
 
 /// The keys there are, in the order `render` writes them.
-const KEYS: [(&str, Key); 27] = [
+const KEYS: [(&str, Key); 29] = [
     ("kernel", Key::Kernel),
+    ("firmware", Key::Firmware),
+    ("hyperv", Key::Hyperv),
     ("initrd", Key::Initrd),
     ("cmdline", Key::Cmdline),
     ("memory", Key::Memory),
@@ -227,9 +238,12 @@ const WHAT: &str = "a vm.toml";
 pub fn parse(text: &str) -> Result<Config, String> {
     let mut reader = Reader { c: Config::new(Options::default()) };
     conf::parse(text, WHAT, &mut reader)?;
-    let c = reader.c;
+    let mut c = reader.c;
+    if c.options.firmware && c.options.kernel.is_empty() {
+        c.options.kernel = String::from(CLOUDHV);
+    }
     if c.options.kernel.is_empty() {
-        return Err(String::from("no kernel: a vm.toml says kernel = \"<its bzImage>\""));
+        return Err(String::from("no kernel: a vm.toml says kernel = \"<its bzImage>\", or firmware = true"));
     }
     Ok(c)
 }
@@ -279,6 +293,8 @@ fn assign(c: &mut Config, key: Key, name: &str, value: Value, line: usize) -> Re
             }
         }
         (Key::Net, Value::Bool(b)) => o.net = b,
+        (Key::Firmware, Value::Bool(b)) => o.firmware = b,
+        (Key::Hyperv, Value::Bool(b)) => o.hyperv = b,
         (Key::UnsafeInterrupts, Value::Bool(b)) => o.unsafe_interrupts = b,
         (Key::Restart, Value::Bool(b)) => o.restart = b,
         (Key::ConsoleLog, Value::Bool(b)) => c.console_log = b,
@@ -553,6 +569,8 @@ fn line(c: &Config, key: Key, name: &str) -> Result<Option<String>, String> {
             s.push_str("]\n");
         }
         Key::Net if o.net => said(&mut s, &true),
+        Key::Firmware if o.firmware => said(&mut s, &true),
+        Key::Hyperv if o.hyperv => said(&mut s, &true),
         Key::UnsafeInterrupts if o.unsafe_interrupts => said(&mut s, &true),
         Key::Network => match &o.network {
             Some(v) => put(&mut s, name, v),
@@ -606,8 +624,8 @@ fn line(c: &Config, key: Key, name: &str) -> Result<Option<String>, String> {
             Some(u) => put(&mut s, name, &uuid_text(u)),
             None => return Ok(None),
         },
-        Key::Net | Key::Restart | Key::Protected | Key::Log | Key::Input | Key::Ioapic | Key::Xapic
-        | Key::Offload | Key::UnsafeInterrupts => return Ok(None),
+        Key::Net | Key::Firmware | Key::Hyperv | Key::Restart | Key::Protected | Key::Log | Key::Input | Key::Ioapic
+        | Key::Xapic | Key::Offload | Key::UnsafeInterrupts => return Ok(None),
     }
     Ok(Some(s))
 }

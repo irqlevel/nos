@@ -61,6 +61,8 @@ its memory copied as it runs, its disk on NBS and its network vnet's.
 [gpu-passthrough.md](gpu-passthrough.md) is a host's PCI device -- first an
 NVIDIA GPU -- handed whole to a Linux guest: VT-d in the host, its domains
 and interrupt remapping, and the device's function on the guest's bus.
+[windows.md](windows.md) is UEFI in a guest through OVMF CloudHv, then
+Windows Server and desktop Windows, the platform and devices they need.
 [review-2026-11-open.md](review-2026-11-open.md) is what the review of
 2026-11-12 -- the Rust ffi, base and hypervisor -- left open.
 [many-cpus.md](many-cpus.md) is nos past 64 CPUs, planned and not started:

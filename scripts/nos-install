@@ -92,7 +92,8 @@
 # Install pours the image onto a plain partition as an ext4 filesystem --
 # or the ext2 one an install before ext4 made, kept as it is -- that
 # nos mounts read-write as its root -- the kernel in /boot, the modules built
-# with it in /lib/modules, hvboot in /lib, /etc/rc, the grubenv -- and adds
+# with it in /lib/modules, hvboot and the CloudHv firmware in /lib, /etc/rc,
+# the grubenv -- and adds
 # the entry to this machine's GRUB that boots it. The machine's default does
 # not change: nos boots once when asked (boot, --boot-once), and the boot
 # after that is the default again, so a nos that never comes up is a reset
@@ -136,18 +137,19 @@ EXT4_FEATURES_OK=" has_journal ext_attr resize_inode dir_index filetype extent 6
 # What of an image goes where. The system is replaced whole by an update,
 # and what it replaces is kept as .prev, all of it together, for rollback:
 # the kernel, the modules built with it, hvboot -- the loader hv boots a
-# guest's own kernel with (docs/hypervisor.md), which an image older than it
-# does not have -- and the VERSION that names them, last. GRUB's entries are
+# guest's own kernel with (docs/hypervisor.md) -- and the CloudHv firmware,
+# which an image older than them does not have, and the VERSION that names
+# them, last. GRUB's entries are
 # replaced, /etc/rc goes in the first time only, and nos-install and
 # nos-setup (the installer's dialog, run from the image in a provider's
 # rescue system) stay in the image. An image holding anything else is
 # refused: poured, that part would be left out without a word, as
 # /lib/hvboot was by v0.0.26's own nos-install, so a file the image gains
 # is added here too. /lib/licenses
-# holds the notices of the code the kernel and its modules carry, and goes
-# with them
-SYSTEM="boot/kernel64.elf lib/modules lib/hvboot lib/panel lib/licenses VERSION"
-LAYOUT=" $SYSTEM lib/panel/bundle lib/licenses/CRYPTOGAMS boot/grub/nos.cfg etc/rc nos-install nos-setup boot boot/grub etc lib "
+# holds the notices of the code the kernel, its modules and the firmware
+# carry, and goes with them
+SYSTEM="boot/kernel64.elf lib/modules lib/hvboot lib/CLOUDHV.fd lib/panel lib/licenses VERSION"
+LAYOUT=" $SYSTEM lib/panel/bundle lib/licenses/CRYPTOGAMS lib/licenses/CLOUDHV boot/grub/nos.cfg etc/rc nos-install nos-setup boot boot/grub etc lib "
 # The management panel's lines of /etc/rc (--panel): hv and the host API,
 # then the panel's VM -- made at the first boot, started at every one after
 PANEL_RC=(

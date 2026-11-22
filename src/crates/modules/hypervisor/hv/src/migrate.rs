@@ -286,6 +286,9 @@ fn plan(state: &State, taken: &StateHold<'_>, me: &str) -> Result<Plan, String> 
     }
     let raw: Vec<String> = config.options.disks.iter().map(|(w, _)| w.clone()).collect();
     let spec = crate::guest::spec(o)?;
+    if spec.firmware {
+        return Err(String::from("a firmware guest's host bridge is not in its migration state"));
+    }
     if !spec.forwards.is_empty() {
         return Err(String::from("its vm.toml has forward=: a port of this host's address is this host's -- take \
                                  them out first"));

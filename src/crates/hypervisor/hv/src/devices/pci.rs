@@ -112,8 +112,19 @@ pub struct Function {
     config: [u8; CONFIG_SIZE],
     /// BAR 0's size in ports, a power of two, or 0 for no BAR.
     bar_size: u32,
-    /// Where BAR 1's page is, for a function with MSI-X; 0 for one without.
+    /// The page that owns MSI-X's table, for a function with it; 0 without.
     msix_page: u32,
+    /// Where the guest has BAR 1, apart from a sizing read's temporary mask.
+    msix_bar: u32,
+}
+
+/// A virtio function's MSI-X BAR moved: its stable backing page, and the
+/// guest addresses whose nested mapping the run loop is to move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MsixMove {
+    pub page: u32,
+    pub from: u32,
+    pub to: u32,
 }
 
 /// What a device function is, for its header.
@@ -129,7 +140,7 @@ pub struct Identity {
 
 impl Function {
     fn blank(id: &Identity) -> Function {
-        let mut f = Function { config: [0; CONFIG_SIZE], bar_size: 0, msix_page: 0 };
+        let mut f = Function { config: [0; CONFIG_SIZE], bar_size: 0, msix_page: 0, msix_bar: 0 };
         f.put16(VENDOR_ID, id.vendor);
         f.put16(DEVICE_ID, id.device);
         f.config[REVISION] = id.revision;
@@ -154,10 +165,11 @@ impl Function {
 
     /// The same function with MSI-X: `entries` of them (1 to
     /// `MSIX_MAX_ENTRIES`), the table and the pending bits in the page at
-    /// `page` -- page-aligned, and the caller's to have made guest memory.
+    /// `page` -- page-aligned, and made by the caller with `add_msix`.
     pub fn with_msix(mut self, entries: u16, page: u32) -> Function {
         let entries = entries.clamp(1, MSIX_MAX_ENTRIES);
         self.msix_page = page & !(MSIX_PAGE - 1);
+        self.msix_bar = self.msix_page;
         let status = self.get16(STATUS) | STATUS_CAP_LIST;
         self.put16(STATUS, status);
         self.config[CAPABILITIES] = MSIX_CAP as u8;
@@ -171,7 +183,9 @@ impl Function {
         self
     }
 
-    /// MSI-X's control word and page, for a function that has it.
+    /// MSI-X's control word and stable backing page, for a function that has
+    /// it. The guest may have moved BAR 1; the host still reaches the frames
+    /// through their region (`run`'s `msix` and `write_pba`).
     fn msix(&self) -> Option<(u16, u32)> {
         (self.msix_page != 0).then(|| (self.get16(MSIX_CONTROL), self.msix_page))
     }
@@ -212,16 +226,24 @@ impl Function {
     }
 
     /// A write of `size` bytes at `at`, byte by byte through what each byte
-    /// of the header lets a guest change.
-    fn write(&mut self, at: usize, size: usize, value: u32) {
+    /// of the header lets a guest change. An MSI-X BAR move is returned for
+    /// the run loop to move its nested mapping too.
+    fn write(&mut self, at: usize, size: usize, value: u32) -> Option<MsixMove> {
         if self.msix_page != 0 && at == BAR1 {
-            /* The whole dword or nothing: all ones sizes it, and reads back
-             * its size; anything else puts it back where it was. */
+            /* The whole dword or nothing: all ones sizes it without moving
+             * the page; any other value is its new guest address. */
             if size == 4 {
-                let v = if value == u32::MAX { !(MSIX_PAGE - 1) } else { self.msix_page };
-                self.put32(BAR1, v);
+                if value == u32::MAX {
+                    self.put32(BAR1, !(MSIX_PAGE - 1));
+                    return None;
+                }
+                let from = self.msix_bar;
+                let to = value & !(MSIX_PAGE - 1);
+                self.msix_bar = to;
+                self.put32(BAR1, to);
+                return (from != to).then_some(MsixMove { page: self.msix_page, from, to });
             }
-            return;
+            return None;
         }
         for i in 0..size {
             let byte = (value >> (8 * i)) as u8;
@@ -248,6 +270,7 @@ impl Function {
                 _ => {}
             }
         }
+        None
     }
 }
 
@@ -293,21 +316,37 @@ pub struct PciBus {
     host: u32,
 }
 
+/// The host bridge the machine presents on bus 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostBridge {
+    /// Q35's root complex: PCI Express configuration space included.
+    Q35,
+    /// The platform OVMF's CloudHv build expects, over CF8/CFC alone.
+    CloudHv,
+}
+
+impl HostBridge {
+    fn identity(self) -> Identity {
+        let (device, revision) = match self {
+            Self::Q35 => (0x29C0, 0),
+            Self::CloudHv => (0x0D57, 0),
+        };
+        Identity { vendor: 0x8086, device, revision, class: 0x06_00_00, subsystem_vendor: 0, subsystem: 0 }
+    }
+}
+
 impl PciBus {
-    /// The bus with its host bridge, an Intel 440FX as far as its header
-    /// says -- a class of host bridge, and a vendor Linux's sanity check of
-    /// the mechanism knows.
+    /// The bus with Q35's host bridge, an Intel vendor and a class Linux's
+    /// sanity check of the configuration mechanism knows.
     pub fn new() -> Result<PciBus> {
+        Self::with_host_bridge(HostBridge::Q35)
+    }
+
+    /// The bus with the host bridge `host_bridge` names.
+    pub fn with_host_bridge(host_bridge: HostBridge) -> Result<PciBus> {
         let mut slots = Vec::new();
         slots.try_reserve_exact(MAX_SLOTS).map_err(|_| Error::NoMemory)?;
-        slots.push(Function::blank(&Identity {
-            vendor: 0x8086,
-            device: 0x1237,
-            revision: 2,
-            class: 0x06_00_00,
-            subsystem_vendor: 0,
-            subsystem: 0,
-        }));
+        slots.push(Function::blank(&host_bridge.identity()));
         Ok(PciBus { address: 0, slots, host: 0 })
     }
 
@@ -381,15 +420,16 @@ impl PciBus {
 
     /// A write of `size` bytes at `at` of bus 0's function `device`.`function`,
     /// as ECAM reaches it: the header's through what each byte lets a guest
-    /// change, as the ports' is; nothing past it.
-    pub fn function_write(&mut self, device: u8, function: u8, at: usize, size: usize, value: u32) {
+    /// change, as the ports' is; nothing past it. An MSI-X BAR move is the
+    /// run loop's to map.
+    pub fn function_write(&mut self, device: u8, function: u8, at: usize, size: usize, value: u32) -> Option<MsixMove> {
         let slot = usize::from(device);
         if function != 0 || slot >= self.slots.len() || !matches!(size, 1 | 2 | 4) || at % size != 0
             || at + size > CONFIG_SIZE
         {
-            return;
+            return None;
         }
-        self.slots[slot].write(at, size, value);
+        self.slots[slot].write(at, size, value)
     }
 
     pub fn owns(port: u16) -> bool {
@@ -432,20 +472,22 @@ impl PciBus {
         }
     }
 
-    /// A write of `size` bytes (1, 2 or 4) at `port`.
-    pub fn write(&mut self, port: u16, size: u8, value: u32) {
+    /// A write of `size` bytes (1, 2 or 4) at `port`, and the MSI-X BAR move
+    /// it asks the run loop to map, if any.
+    pub fn write(&mut self, port: u16, size: u8, value: u32) -> Option<MsixMove> {
         let size = usize::from(size);
         if port < CONFIG_DATA {
             if port == CONFIG_ADDRESS && size == 4 {
                 self.address = value;
             }
-            return;
+            return None;
         }
         if let Some((slot, at)) = self.target(port) {
             if at % size == 0 && at + size <= CONFIG_SIZE {
-                self.slots[slot].write(at, size, value);
+                return self.slots[slot].write(at, size, value);
             }
         }
+        None
     }
 
     /// What the guest wrote of every function's configuration, and of the
@@ -466,28 +508,39 @@ impl PciBus {
     /// What `functions` say the guest wrote, written again through what each
     /// function lets a guest write -- so that what a function is, its
     /// identity, its BARs' sizes, its capabilities, stays this host's as it
-    /// built it -- and the address register as `address` has it.
-    pub fn restore(&mut self, address: u32, functions: &[vmstate::Function]) -> vmstate::Result<()> {
+    /// built it -- and the address register as `address` has it. MSI-X BAR
+    /// moves go to `moved`, which restores their nested mappings too.
+    pub fn restore(&mut self, address: u32, functions: &[vmstate::Function], moved: &mut dyn FnMut(MsixMove))
+        -> vmstate::Result<()>
+    {
         if functions.len() != self.slots.len() {
             return Err(vmstate::Error("PCI functions for another bus"));
         }
         for (f, s) in self.slots.iter_mut().zip(functions) {
-            f.write(COMMAND, 2, u32::from(s.command));
-            f.write(BAR0, 4, s.bar0);
+            let _ = f.write(COMMAND, 2, u32::from(s.command));
+            let _ = f.write(BAR0, 4, s.bar0);
             /* A BAR left sized reads back its size: written all ones again. */
             let sized = f.msix_page != 0 && s.bar1 == !(MSIX_PAGE - 1);
-            f.write(BAR1, 4, if sized { u32::MAX } else { s.bar1 });
-            f.write(INTERRUPT_LINE, 1, u32::from(s.interrupt_line));
-            f.write(MSIX_CONTROL + 1, 1, u32::from(s.msix_control >> 8));
+            if let Some(m) = f.write(BAR1, 4, if sized { u32::MAX } else { s.bar1 }) {
+                moved(m);
+            }
+            let _ = f.write(INTERRUPT_LINE, 1, u32::from(s.interrupt_line));
+            let _ = f.write(MSIX_CONTROL + 1, 1, u32::from(s.msix_control >> 8));
         }
         self.address = address;
         Ok(())
     }
 
     /// Slot `slot`'s MSI-X: the control word (enable, mask-all, the table's
-    /// size) and the page its table is in; None for a function without.
+    /// size) and its stable backing page; None for a function without.
     pub fn msix(&self, slot: usize) -> Option<(u16, u32)> {
         self.slots.get(slot).and_then(|f| f.msix())
+    }
+
+    /// Whether an MSI-X BAR is showing its sizing mask. Its previous address
+    /// is not in the saved configuration, so such a state cannot be restored.
+    pub fn msix_sizing(&self) -> bool {
+        self.slots.iter().any(|f| f.msix_page != 0 && f.get32(BAR1) == !(MSIX_PAGE - 1))
     }
 
     /// The slot whose I/O BAR `port` falls in, and the offset in it.

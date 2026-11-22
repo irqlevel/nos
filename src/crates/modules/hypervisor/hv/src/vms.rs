@@ -66,7 +66,7 @@ use crate::store::{self, Folder};
 use crate::vmlog::Log;
 
 const START_USAGE: &str =
-    "hv start <name|folder> [force] | <kernel> [mem=MiB] [cpus=N] [cpu=N] [node=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [pci=bus:dev.fn]... [unsafe_interrupts] [input=...] [log] [restart] [force] [uuid=U] [net] [network=name] [port=N] [forward=nos:guest]... [cmdline=...]";
+    "hv start <name|folder> [force] | <kernel> [firmware] [hyperv] [mem=MiB] [cpus=N] [cpu=N] [node=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [pci=bus:dev.fn]... [unsafe_interrupts] [input=...] [log] [restart] [force] [uuid=U] [net] [network=name] [port=N] [forward=nos:guest]... [cmdline=...]";
 /// How many times a `restart` guest is booted again after resetting itself
 /// within `RESTART_WINDOW_NS` before that is taken for a loop and it is left
 /// stopped: a guest that reboots in its first second would otherwise take
@@ -1494,7 +1494,7 @@ fn finish(mut vm: Vm) {
 /// Whether what a shell printed after a line was fed to it is the line's
 /// whole answer: the echo of its newline, then everything up to a prompt.
 fn at_prompt(text: &[u8]) -> bool {
-    text.contains(&b'\n') && (text.ends_with(b"# ") || text.ends_with(b"$ "))
+    text.contains(&b'\n') && (text.ends_with(b"# ") || text.ends_with(b"$ ") || text.ends_with(b"Shell> "))
 }
 
 impl Vms {
@@ -1757,6 +1757,16 @@ impl Vms {
                 self.start_forced(machine, cores, forwards, folder, force, out)
             }
             Ok(None) => match guest::parse(args, START_USAGE) {
+                Ok(spec) if spec.secs.is_none() => self.launch(machine, cores, forwards, spec, None, Origin::Boot, out),
+                Ok(_) => Err(String::from("secs= is hv boot's -- a started vm runs until hv stop")),
+                Err(usage) => {
+                    let _ = writeln!(out, "{}", usage);
+                    return;
+                }
+            },
+            Err(_) if first == "firmware" => match guest::parse(args, START_USAGE) {
+                /* With no folder of that name, this is the firmware flag with
+                 * CloudHv's default image, not a VM called "firmware". */
                 Ok(spec) if spec.secs.is_none() => self.launch(machine, cores, forwards, spec, None, Origin::Boot, out),
                 Ok(_) => Err(String::from("secs= is hv boot's -- a started vm runs until hv stop")),
                 Err(usage) => {
@@ -2548,7 +2558,7 @@ impl Vms {
         }
     }
 
-    /// `hv send <id> <text>`: type at the guest, `\n` for a newline -- now,
+    /// `hv send <id> <text>`: type at the guest, `\n`/`\r` for Enter -- now,
     /// as at a terminal, and not at a shell's prompt: a login prompt asks
     /// for no cursor, and a getty throws away what was typed before it
     /// printed one, so what to type at is `hv wait`'s to find. From then on

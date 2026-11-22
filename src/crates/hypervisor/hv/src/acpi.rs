@@ -41,6 +41,7 @@
 //! Everything is laid out into a buffer the caller copies into guest memory:
 //! plain data, with its checksums, holding nothing of the guest's.
 
+use crate::devices::pci::HostBridge;
 use crate::devices::{ioapic, pm, pvpanic, rtc};
 use crate::lapic;
 use crate::run::{RESET_CONTROL, RESET_VALUE};
@@ -82,6 +83,8 @@ pub struct Machine<'a> {
     /// PCI Express's configuration space, where the guest has it: its base,
     /// below 4 GiB, and the last bus it reaches, from 0.
     pub ecam: Option<(u32, u8)>,
+    /// The host bridge `_CRS` describes.
+    pub host_bridge: crate::devices::pci::HostBridge,
 }
 
 /* Who made the tables, in every header. */
@@ -139,6 +142,9 @@ const FLAG_FIX_RTC: u32 = 1 << 6;
 const FLAG_RESET_REG_SUP: u32 = 1 << 10;
 /// No monitor, keyboard or mouse to detect.
 const FLAG_HEADLESS: u32 = 1 << 12;
+/// No legacy PM1 blocks or FACS: sleep control/status and the PM timer are
+/// the whole fixed hardware interface (the firmware machine, as CloudHv's).
+const FLAG_HW_REDUCED: u32 = 1 << 20;
 const FADT_FLAGS: u32 = FLAG_WBINVD | FLAG_PROC_C1 | FLAG_SLP_BUTTON | FLAG_FIX_RTC | FLAG_RESET_REG_SUP | FLAG_HEADLESS;
 
 /* A generic address structure: its address space and access size. */
@@ -195,8 +201,9 @@ const ROOT_CHAR: u8 = b'\\';
 const PKG_LENGTH_BYTES: usize = 3;
 const PKG_LENGTH_TWO_FOLLOW: u8 = 0x80;
 const PKG_LENGTH_MAX: usize = 1 << 20;
-/// PNP0A03, a PCI host bridge, and PNP0C02, a motherboard's resources, as
-/// compressed EISA IDs.
+/// PNP0A05, a CPU container; PNP0A03, a PCI host bridge; and PNP0C02, a
+/// motherboard's resources, as compressed EISA IDs.
+const EISA_PNP0A05: u32 = 0x050A_D041;
 const EISA_PNP0A03: u32 = 0x030A_D041;
 const EISA_PNP0C02: u32 = 0x020C_D041;
 /// A fixed range of 32-bit memory, read-write (ACPI 6.5, 6.4.3.4): what the
@@ -330,15 +337,20 @@ pub fn build(m: &Machine, buf: &mut [u8]) -> Option<usize> {
     /* The RSDP's place, filled once the XSDT's address is known. */
     o.put(&[0; RSDP_BYTES]);
 
-    o.align(FACS_ALIGN);
-    let facs = o.at;
-    write_facs(&mut o);
+    let facs = if m.host_bridge == HostBridge::CloudHv {
+        None
+    } else {
+        o.align(FACS_ALIGN);
+        let at = o.at;
+        write_facs(&mut o);
+        Some(gpa(at))
+    };
     o.align(TABLE_ALIGN);
     let dsdt = o.at;
     write_dsdt(&mut o, m);
     o.align(TABLE_ALIGN);
     let fadt = o.at;
-    write_fadt(&mut o, gpa(facs), gpa(dsdt));
+    write_fadt(&mut o, m, facs, gpa(dsdt));
     let madt = if m.apic {
         o.align(TABLE_ALIGN);
         let at = o.at;
@@ -457,14 +469,18 @@ fn gas_none(o: &mut Out) {
 }
 
 /// The FADT: the fixed hardware's ports, the SCI, the reset register, and
-/// where the FACS and the DSDT are. Each register block is given twice, as
-/// ACPI 1.0's port and as the generic address that supersedes it, and the
-/// two agree -- an OS checks, and says so when they do not.
-fn write_fadt(o: &mut Out, facs: u64, dsdt: u64) {
+/// where the FACS and the DSDT are. Each legacy PM1 block is given twice, as
+/// ACPI 1.0's port and as the generic address that supersedes it, and the two
+/// agree -- an OS checks, and says so when they do not. The firmware machine
+/// is hardware-reduced instead: no FACS or PM1 blocks, its sleep registers in
+/// the two generic addresses ACPI 5.0 added for them.
+fn write_fadt(o: &mut Out, m: &Machine, facs: Option<u64>, dsdt: u64) {
     let start = header(o, b"FACP", FADT_REVISION);
+    let reduced = m.host_bridge == HostBridge::CloudHv;
     /* The FACS by its 32-bit address, and not the 64-bit one as well: the
-     * specification has one of the two zero. */
-    o.u32(facs as u32);
+     * specification has one of the two zero. A hardware-reduced FADT has no
+     * FACS at all. */
+    o.u32(facs.unwrap_or(0) as u32);
     o.u32(dsdt as u32);
     o.u8(0); // reserved
     o.u8(PM_PROFILE_UNSPECIFIED);
@@ -476,16 +492,16 @@ fn write_fadt(o: &mut Out, facs: u64, dsdt: u64) {
     o.u8(0); // ACPI_DISABLE
     o.u8(0); // S4BIOS_REQ
     o.u8(0); // PSTATE_CNT
-    o.u32(u32::from(pm::PM1_EVT));
+    o.u32(if reduced { 0 } else { u32::from(pm::PM1_EVT) });
     o.u32(0); // PM1b event block
-    o.u32(u32::from(pm::PM1_CNT));
+    o.u32(if reduced { 0 } else { u32::from(pm::PM1_CNT) });
     o.u32(0); // PM1b control block
     o.u32(0); // PM2 control block
     o.u32(u32::from(pm::PM_TMR));
     o.u32(0); // GPE0 block
     o.u32(0); // GPE1 block
-    o.u8(pm::PM1_EVT_LEN);
-    o.u8(pm::PM1_CNT_LEN);
+    o.u8(if reduced { 0 } else { pm::PM1_EVT_LEN });
+    o.u8(if reduced { 0 } else { pm::PM1_CNT_LEN });
     o.u8(0); // PM2 control length
     o.u8(pm::PM_TMR_LEN);
     o.u8(0); // GPE0 block length
@@ -503,23 +519,36 @@ fn write_fadt(o: &mut Out, facs: u64, dsdt: u64) {
     o.u8(rtc::CENTURY);
     o.u16(BOOT_LEGACY_DEVICES | BOOT_NO_VGA);
     o.u8(0); // reserved
-    o.u32(FADT_FLAGS);
+    o.u32(FADT_FLAGS | if reduced { FLAG_HW_REDUCED } else { 0 });
     gas_io(o, 1, ACCESS_BYTE, RESET_CONTROL);
     o.u8(RESET_VALUE);
     o.u16(0); // ARM boot architecture
     o.u8(FADT_MINOR);
     o.u64(0); // the FACS's 64-bit address: FIRMWARE_CTRL has it
     o.u64(dsdt);
-    gas_io(o, pm::PM1_EVT_LEN, ACCESS_WORD, pm::PM1_EVT);
+    if reduced {
+        gas_none(o);
+    } else {
+        gas_io(o, pm::PM1_EVT_LEN, ACCESS_WORD, pm::PM1_EVT);
+    }
     gas_none(o); // PM1b event block
-    gas_io(o, pm::PM1_CNT_LEN, ACCESS_WORD, pm::PM1_CNT);
+    if reduced {
+        gas_none(o);
+    } else {
+        gas_io(o, pm::PM1_CNT_LEN, ACCESS_WORD, pm::PM1_CNT);
+    }
     gas_none(o); // PM1b control block
     gas_none(o); // PM2 control block
     gas_io(o, pm::PM_TMR_LEN, ACCESS_DWORD, pm::PM_TMR);
     gas_none(o); // GPE0 block
     gas_none(o); // GPE1 block
-    gas_none(o); // sleep control register: not hardware-reduced
-    gas_none(o); // sleep status register
+    if reduced {
+        gas_io(o, 1, ACCESS_BYTE, pm::SLEEP_CONTROL);
+        gas_io(o, 1, ACCESS_BYTE, pm::SLEEP_STATUS);
+    } else {
+        gas_none(o);
+        gas_none(o);
+    }
     o.u64(0); // hypervisor vendor identity
     if o.at - start != FADT_BYTES {
         o.overflow = true;
@@ -739,15 +768,51 @@ fn write_dsdt(o: &mut Out, m: &Machine) {
         close(o, ecam);
     }
 
+    if m.apic {
+        write_cpus(o, m.cpus);
+    }
     close(o, scope);
     seal(o, start);
+}
+
+/// The processors the MADT lists, as ACPI devices for an OS that enumerates
+/// processors through the namespace too. No _STA: its absence means present,
+/// enabled and working. No hotplug state or methods belong to a static VM.
+fn write_cpus(o: &mut Out, cpus: u32) {
+    if cpus == 0 || cpus > MADT_MAX_CPUS {
+        o.overflow = true;
+        return;
+    }
+    o.u8(EXT_OP_PREFIX);
+    let container = open(o, DEVICE_OP);
+    o.put(b"CPUS");
+    name(o, b"_HID");
+    o.u8(STRING_PREFIX);
+    o.put(b"ACPI0010");
+    o.u8(0);
+    name(o, b"_CID");
+    int(o, u64::from(EISA_PNP0A05));
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for id in 0..cpus {
+        o.u8(EXT_OP_PREFIX);
+        let cpu = open(o, DEVICE_OP);
+        o.put(&[b'C', HEX[((id >> 8) & 0xF) as usize], HEX[((id >> 4) & 0xF) as usize], HEX[(id & 0xF) as usize]]);
+        name(o, b"_HID");
+        o.u8(STRING_PREFIX);
+        o.put(b"ACPI0007");
+        o.u8(0);
+        name(o, b"_UID");
+        int(o, u64::from(id));
+        close(o, cpu);
+    }
+    close(o, container);
 }
 
 /// The host bridge's resources: bus 0 to 255 -- to ECAM's last, where the
 /// guest has it, which has to cover the bridge's (Linux says so, as
 /// firmware's fault) --; the configuration ports, which it decodes itself;
-/// all I/O either side of them, for the devices' BARs and the chipset's
-/// ports; and the memory window the MSI-X pages are in, when there are any.
+/// Q35's I/O either side of them, or CloudHv's 0xC000-0xFFFF alone; and the
+/// memory windows the BARs are in.
 fn write_crs(r: &mut Out, m: &Machine) {
     let last = m.ecam.map_or(BUSES - 1, |(_, last)| u16::from(last));
     word_space(r, SPACE_BUS, 0, 0, last, last + 1);
@@ -757,10 +822,19 @@ fn write_crs(r: &mut Out, m: &Machine) {
     r.u16(CONFIG_PORTS);
     r.u8(1); // alignment
     r.u8(CONFIG_PORTS_LEN);
-    word_space(r, SPACE_IO, IO_ENTIRE_RANGE, 0, CONFIG_PORTS - 1, CONFIG_PORTS);
-    /* From 0xD00 to the top: the length is what is left of 64 KiB. */
-    let above = CONFIG_PORTS + u16::from(CONFIG_PORTS_LEN);
-    word_space(r, SPACE_IO, IO_ENTIRE_RANGE, above, u16::MAX, 0u16.wrapping_sub(above));
+    match m.host_bridge {
+        HostBridge::Q35 => {
+            word_space(r, SPACE_IO, IO_ENTIRE_RANGE, 0, CONFIG_PORTS - 1, CONFIG_PORTS);
+            /* From 0xD00 to the top: the length is what is left of 64 KiB. */
+            let above = CONFIG_PORTS + u16::from(CONFIG_PORTS_LEN);
+            word_space(r, SPACE_IO, IO_ENTIRE_RANGE, above, u16::MAX, 0u16.wrapping_sub(above));
+        }
+        HostBridge::CloudHv => {
+            /* OVMF's aperture, and none of the legacy ports Windows PnP
+             * must not rebalance away from COM1 and the chipset. */
+            word_space(r, SPACE_IO, IO_ENTIRE_RANGE, 0xC000, u16::MAX, 0x4000);
+        }
+    }
     for (base, len) in [m.mmio, m.bars32].into_iter().flatten() {
         let last = (u64::from(base) + u64::from(len)).checked_sub(1).and_then(|l| u32::try_from(l).ok());
         match last {

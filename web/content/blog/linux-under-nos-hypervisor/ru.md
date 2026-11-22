@@ -86,7 +86,7 @@ AX41 продолжал в том же духе. Гость, ушедший в �
 
 ```text
 $ hv stop 0 secs=300
-hv: vm 0 stopped -- the guest powered itself off, S5 by its ACPI PM1 control register, at 0xffffffff8f1d5ae3
+hv: vm 0 stopped -- the guest powered itself off, S5 by its ACPI sleep control register, at 0xffffffff8f1d5ae3
 ```
 
 В тот же день появился MMIO ([57c9826](https://github.com/irqlevel/nos/commit/57c9826d14753aff0d9bb0d1a7b1ce9f2e726e65)). Когда обращение гостя к памяти устройства вызывает отказ, гипервизор выбирает вызвавшую его инструкцию через собственные таблицы страниц гостя, декодирует её и исполняет. Декодер знает только те формы `mov`, которыми пользуются MMIO-аксессоры Linux. Его сверили с кодировками clang для 1054 инструкций и с двумя миллионами случайных байтовых строк. Страница xAPIC стала первым устройством на этом пути, IO-APIC — вторым ([86a1721](https://github.com/irqlevel/nos/commit/86a1721359228cad00d174cf8aeb36f9c132d9fa)).

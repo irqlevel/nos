@@ -32,10 +32,13 @@
 //! a package of that shape answers: one package, APIC IDs the CPUs'
 //! numbers, a core's threads in its low bit where it has two.
 //!
-//! The hypervisor's range is KVM's, as its ABI has it
+//! The hypervisor's range is KVM's by default, as its ABI has it
 //! (Documentation/virt/kvm/x86/cpuid.rst): the signature, and of the
 //! features NOP_IO_DELAY and, with APICs, PV_EOI -- nothing else, and
-//! nothing past 0x4000_0001.
+//! nothing past 0x4000_0001. A firmware guest that asks for Hyper-V gets
+//! Microsoft's vendor, Hv#1 and only the hypercall, VP-index, time, frequency
+//! SynIC and direct-synthetic-timer facilities implemented behind it, as the TLFS
+//! has them; nothing past 0x4000_0005.
 
 use crate::place::{Shape, Topology};
 use crate::policy::{self, model_answers, model_differs, model_digest, Asker, Cpuid, Own, MSR_ANSWER};
@@ -266,13 +269,25 @@ fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u3
     if (0x4000_0000..0x8000_0000).contains(&leaf) {
         let kvm = [0x4000_0001, u32::from_le_bytes(*b"KVMK"), u32::from_le_bytes(*b"VMKV"),
                    u32::from_le_bytes(*b"M\0\0\0")];
-        let want = match leaf {
-            0x4000_0000 => kvm,
-            0x4000_0001 => [1 << 1 | if apic { 1 << 6 } else { 0 }, 0, 0, 0],
-            _ => [0; 4],
+        let want = if asker.hyperv {
+            match leaf {
+                0x4000_0000 => [0x4000_0005, u32::from_le_bytes(*b"Micr"), u32::from_le_bytes(*b"osof"),
+                                u32::from_le_bytes(*b"t Hv")],
+                0x4000_0001 => [u32::from_le_bytes(*b"Hv#1"), 0, 0, 0],
+                0x4000_0003 => [1 << 1 | 1 << 2 | 1 << 3 | 1 << 5 | 1 << 6 | 1 << 9 | 1 << 11, 0, 0, 1 << 10 | 1 << 19],
+                0x4000_0004 => [0, u32::MAX, 0, 0],
+                0x4000_0005 => [crate::smp::MAX_VCPUS as u32, crate::smp::MAX_VCPUS as u32, 0, 0],
+                _ => [0; 4],
+            }
+        } else {
+            match leaf {
+                0x4000_0000 => kvm,
+                0x4000_0001 => [1 << 1 | if apic { 1 << 6 } else { 0 }, 0, 0, 0],
+                _ => [0; 4],
+            }
         };
-        invariant!(g == want, "leaf {:#x}.{} answered {:x?}: wanted {:x?} -- KVM's signature, its NOP_IO_DELAY and \
-                   with APICs PV_EOI, and nothing past", leaf, sub, g, want);
+        invariant!(g == want, "leaf {:#x}.{} answered {:x?}: wanted {:x?} -- the interface the guest selected, \
+                   and no facility or leaf past it", leaf, sub, g, want);
         return;
     }
     let top = if leaf >= 0x8000_0000 { ext_top } else { basic_top };
@@ -582,6 +597,10 @@ enum Kind {
     ReadOnly(u64),
     /// Reads this, and takes a write of it and of nothing else.
     Fixed(u64),
+    MtrrDef,
+    MtrrFixed,
+    MtrrBase,
+    MtrrMask,
     /// Intel's MISC_ENABLE: fixed, at what the host's fast strings make it.
     MiscEnable,
     /// The microcode revision: the host's, in the high half, on an Intel
@@ -641,12 +660,40 @@ const MSRS: &[(u32, Of, Kind)] = &[
     (0x176, Of::Every, Kind::Own(Takes::Address)),       // SYSENTER EIP
     (0x277, Of::Every, Kind::Own(Takes::Pat)),           // the PAT
     (0x10, Of::Every, Kind::Tsc),
-    (0xFE, Of::Every, Kind::ReadOnly(0)),                // MTRRcap: none
+    (0xFE, Of::Every, Kind::ReadOnly(0x508)),            // MTRRcap: 8 variable pairs, fixed, WC
     (0x179, Of::Every, Kind::ReadOnly(0)),               // MCG_CAP: no banks
-    (0x2FF, Of::Every, Kind::Fixed(0)),                  // the MTRRs' default type: off
+    (0x2FF, Of::Every, Kind::MtrrDef),
+    (0x250, Of::Every, Kind::MtrrFixed),
+    (0x258, Of::Every, Kind::MtrrFixed),
+    (0x259, Of::Every, Kind::MtrrFixed),
+    (0x268, Of::Every, Kind::MtrrFixed),
+    (0x269, Of::Every, Kind::MtrrFixed),
+    (0x26A, Of::Every, Kind::MtrrFixed),
+    (0x26B, Of::Every, Kind::MtrrFixed),
+    (0x26C, Of::Every, Kind::MtrrFixed),
+    (0x26D, Of::Every, Kind::MtrrFixed),
+    (0x26E, Of::Every, Kind::MtrrFixed),
+    (0x26F, Of::Every, Kind::MtrrFixed),
+    (0x200, Of::Every, Kind::MtrrBase),
+    (0x201, Of::Every, Kind::MtrrMask),
+    (0x202, Of::Every, Kind::MtrrBase),
+    (0x203, Of::Every, Kind::MtrrMask),
+    (0x204, Of::Every, Kind::MtrrBase),
+    (0x205, Of::Every, Kind::MtrrMask),
+    (0x206, Of::Every, Kind::MtrrBase),
+    (0x207, Of::Every, Kind::MtrrMask),
+    (0x208, Of::Every, Kind::MtrrBase),
+    (0x209, Of::Every, Kind::MtrrMask),
+    (0x20A, Of::Every, Kind::MtrrBase),
+    (0x20B, Of::Every, Kind::MtrrMask),
+    (0x20C, Of::Every, Kind::MtrrBase),
+    (0x20D, Of::Every, Kind::MtrrMask),
+    (0x20E, Of::Every, Kind::MtrrBase),
+    (0x20F, Of::Every, Kind::MtrrMask),
     (0x17A, Of::Every, Kind::Fixed(0)),                  // MCG_STATUS: nothing
     (0x8B, Of::Every, Kind::Revision),                   // the microcode revision: the host's on Intel
     (0x17, Of::Intel, Kind::ReadOnly(0)),                // the platform ID
+    (0x3A, Of::Intel, Kind::ReadOnly(1)),                // FEATURE_CONTROL: locked, no VMX/SGX
     (0x1A0, Of::Intel, Kind::MiscEnable),
     (0x10A, Of::Every, Kind::ArchCapabilities),
     (0xC001_0015, Of::Amd, Kind::Fixed(1 << 24)),        // HWCR: TscFreqSel
@@ -691,6 +738,12 @@ const CR0_PG: u64 = 1 << 31;
 /// What the model says MSR `msr` is, on this input's host -- or None, for
 /// one it does not name.
 fn kind(msr: u32) -> Option<Kind> {
+    match msr {
+        0x250 | 0x258 | 0x259 | 0x268..=0x26F => return Some(Kind::MtrrFixed),
+        0x200..=0x20F if msr & 1 == 0 => return Some(Kind::MtrrBase),
+        0x200..=0x20F => return Some(Kind::MtrrMask),
+        _ => {}
+    }
     let intel = cpu::host_is_intel();
     let runs = x86::offers();
     let has = |of: Of| match of {
@@ -720,6 +773,26 @@ fn canonical(a: u64) -> bool {
     a < 0x0000_8000_0000_0000 || a >= 0xFFFF_8000_0000_0000
 }
 
+fn mtrr_fixed_index(msr: u32) -> usize {
+    match msr {
+        0x250 => 0,
+        0x258 => 1,
+        0x259 => 2,
+        _ => {
+            assert!(msr >= 0x268, "fixed MTRR index {:#x}", msr);
+            3 + (msr - 0x268) as usize
+        }
+    }
+}
+
+fn mtrr_type(v: u64) -> bool {
+    matches!(v, 0 | 1 | 4 | 5 | 6 | 7)
+}
+
+fn mtrr_address_mask() -> u64 {
+    (1u64 << crate::policy::phys_bits().clamp(12, 52)) - 1
+}
+
 /// Whether the model has MSR `msr`, of kind `k`, take `value` from a guest
 /// whose state is `save`.
 fn takes(k: Kind, value: u64, save: &Save) -> bool {
@@ -731,6 +804,10 @@ fn takes(k: Kind, value: u64, save: &Save) -> bool {
             && !(save.cr0 & CR0_PG != 0 && (value ^ save.efer) & EFER_LME != 0),
         Kind::Tsc | Kind::ReadOnly(_) | Kind::ArchCapabilities => false,
         Kind::Fixed(v) => value == v,
+        Kind::MtrrDef => mtrr_type(value & 0xFF) && value & !(0xFF | 0x1800) == 0,
+        Kind::MtrrFixed => value.to_le_bytes().iter().all(|&t| mtrr_type(u64::from(t))),
+        Kind::MtrrBase => mtrr_type(value & 0xFF) && value & !((mtrr_address_mask() & !0xFFF) | 0xFF) == 0,
+        Kind::MtrrMask => value & !((mtrr_address_mask() & !0xFFF) | (1 << 11)) == 0,
         Kind::MiscEnable => value == misc_enable(),
         Kind::Revision => value == 0 || value == revision(),
         Kind::TscAux => value >> 32 == 0,
@@ -752,6 +829,10 @@ fn check_rdmsr(save: &Save, own: &Own, msr: u32) {
         None => got.is_none(),
         Some(Kind::Own(_)) | Some(Kind::Efer) | Some(Kind::Tsc) => got.is_some(),
         Some(Kind::ReadOnly(v)) | Some(Kind::Fixed(v)) => got == Some(v),
+        Some(Kind::MtrrDef) => got == Some(own.mtrrs.def_type),
+        Some(Kind::MtrrFixed) => got == Some(own.mtrrs.fixed[mtrr_fixed_index(msr)]),
+        Some(Kind::MtrrBase) => got == Some(own.mtrrs.base[((msr - 0x200) / 2) as usize]),
+        Some(Kind::MtrrMask) => got == Some(own.mtrrs.mask[((msr - 0x200) / 2) as usize]),
         Some(Kind::MiscEnable) => got == Some(misc_enable()),
         Some(Kind::Revision) => got == Some(revision()),
         Some(Kind::ArchCapabilities) => got == cpu::arch_capabilities().map(|v| v & ARCH_CAP),
@@ -787,15 +868,28 @@ fn check_wrmsr(save: &mut Save, own: &mut Own, msr: u32, value: u64) {
         Some(Kind::TscAux) => Own { tsc_aux: value, ..own_before },
         Some(Kind::SpecCtrl) => Own { spec_ctrl: value, ..own_before },
         Some(Kind::PredCmd) => Own { ibpbs: own_before.ibpbs.wrapping_add(u64::from(value != 0)), ..own_before },
+        Some(Kind::MtrrDef) | Some(Kind::MtrrFixed) | Some(Kind::MtrrBase) | Some(Kind::MtrrMask) => {
+            let mut m = own_before.mtrrs;
+            match k {
+                Some(Kind::MtrrDef) => m.def_type = value,
+                Some(Kind::MtrrFixed) => m.fixed[mtrr_fixed_index(msr)] = value,
+                Some(Kind::MtrrBase) => m.base[((msr - 0x200) / 2) as usize] = value,
+                Some(Kind::MtrrMask) => m.mask[((msr - 0x200) / 2) as usize] = value,
+                _ => unreachable!(),
+            }
+            Own { mtrrs: m, ..own_before }
+        }
         _ => own_before,
     };
-    let beside = matches!(k, Some(Kind::TscAux) | Some(Kind::SpecCtrl) | Some(Kind::PredCmd));
+    let beside = matches!(k, Some(Kind::TscAux) | Some(Kind::SpecCtrl) | Some(Kind::PredCmd) | Some(Kind::MtrrDef)
+        | Some(Kind::MtrrFixed) | Some(Kind::MtrrBase) | Some(Kind::MtrrMask));
     invariant!(*own == own_want && (!beside || bytes(save) == bytes(&before)),
                "wrmsr {:#x} <- {:#x} made the guest's own {:x?} from {:x?}, not {:x?}, or changed its save area", msr,
                value, own, own_before, own_want);
     let read = policy::rdmsr(save, own, msr);
     let back = match k {
         Some(Kind::Own(_)) | Some(Kind::TscAux) | Some(Kind::SpecCtrl) => Some(value),
+        Some(Kind::MtrrDef) | Some(Kind::MtrrFixed) | Some(Kind::MtrrBase) | Some(Kind::MtrrMask) => Some(value),
         Some(Kind::PredCmd) => None,
         Some(Kind::Efer) => Some((value & !EFER_LMA) | (efer_before & EFER_LMA)),
         _ => read,
@@ -809,6 +903,16 @@ fn msr_value(r: &mut Input, k: Option<Kind>) -> u64 {
     match r.u8() % 6 {
         0 => match k {
             Some(Kind::ReadOnly(v)) | Some(Kind::Fixed(v)) => v,
+            Some(Kind::MtrrDef) => r.pick(&[0, 0x806, 0x1000, 0x1806, 1, 4, 6, 0x800, 1 << 63]),
+            Some(Kind::MtrrFixed) => if r.bool() { 0x0007_0406_0007_0406 } else { r.u64() },
+            Some(Kind::MtrrBase) => {
+                let a = if r.bool() { r.u64() & mtrr_address_mask() } else { r.u64() };
+                (a & !0xFFF) | r.pick(&[0, 1, 4, 5, 6, 7])
+            }
+            Some(Kind::MtrrMask) => {
+                let a = if r.bool() { r.u64() & mtrr_address_mask() } else { r.u64() };
+                (a & !0xFFF) | (u64::from(r.bool()) << 11) | u64::from(r.bool())
+            }
             Some(Kind::MiscEnable) => misc_enable(),
             Some(Kind::Revision) => if r.bool() { 0 } else { revision() },
             Some(Kind::ArchCapabilities) => cpu::arch_capabilities().unwrap_or(0),
@@ -890,7 +994,8 @@ pub fn policy_target(r: &mut Input) {
     let vcpus: Vec<u32> = (0..n).map(|i| if r.u8() < 232 { i } else { r.below(64) as u32 }).collect();
     let shape = if r.u8() < 32 { Shape::cores(n) } else { Shape::of(&topo, &vcpus) };
     let apic_id = r.below(u64::from(shape.cpus())) as u32;
-    let asker = Asker { apic_id, apic: r.bool(), apic_on: r.u8() >= 32, cr4: r.value64(), xcr0, shape };
+    let asker = Asker { apic_id, apic: r.bool(), apic_on: r.u8() >= 32, cr4: r.value64(), xcr0, shape,
+                        hyperv: r.bool() };
     let told = tops(&asker);
     for leaf in (0..=0x30u32).chain(0x4000_0000..=0x4000_0010).chain(0x8000_0000..=0x8000_0030) {
         check_leaf(leaf, r.below(4) as u32, &asker, told);
@@ -910,6 +1015,9 @@ pub fn policy_target(r: &mut Input) {
     for &(msr, _, _) in MSRS {
         check_rdmsr(&save, &own, msr);
     }
+    /* Variable bases and masks have no address bits below bit 12. */
+    check_wrmsr(&mut save, &mut own, 0x200, 1 << 8);
+    check_wrmsr(&mut save, &mut own, 0x201, 1);
     while let Some(op) = r.op(4) {
         let msr = match op {
             0 => {

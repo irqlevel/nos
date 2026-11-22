@@ -1056,7 +1056,7 @@ pub mod vm {
         /// As vm.rs's: the guest's MSRs its save area does not hold.
         pub fn own_msrs(&self) -> crate::policy::Own {
             crate::policy::Own { tsc_aux: self.tsc_aux, spec_ctrl: self.spec_ctrl, ibpbs: self.ibpbs,
-                                 tsc_offset: self.tsc_offset }
+                                 tsc_offset: self.tsc_offset, mtrrs: vmstate::Mtrrs::default() }
         }
         /// As vm.rs's, over hvarch's `GuestMsrs::set`: held to what the MSRs
         /// can hold -- a value the policy took that an entry's WRMSR of it
@@ -1225,6 +1225,8 @@ pub mod vm {
         }
         /// The guest's CPU entered: an entry that hands back what the CPU did.
         pub fn entered(&mut self) {
+            invariant!(!self.vapic || self.apicv || self.vtpr >> 4 >= self.tpr_window,
+                       "VM-entry with TPR threshold {} above VTPR class {}", self.tpr_window, self.vtpr >> 4);
             if self.apicv {
                 self.apicv_entered = true;
             }
@@ -1357,7 +1359,6 @@ pub mod vm {
         pub fn tpr_window_hit(&mut self) -> bool {
             let hit = self.tpr_window != 0 && !self.apicv && self.vtpr >> 4 < self.tpr_window;
             if hit {
-                self.tpr_window = 0;
                 apicv_did("a task priority lowered below an interrupt it held");
             }
             hit

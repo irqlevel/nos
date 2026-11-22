@@ -83,6 +83,8 @@ pub mod dr;
 #[cfg(target_arch = "x86_64")]
 pub mod policy;
 #[cfg(target_arch = "x86_64")]
+pub mod hyperv;
+#[cfg(target_arch = "x86_64")]
 mod state;
 #[cfg(target_arch = "x86_64")]
 pub mod run;

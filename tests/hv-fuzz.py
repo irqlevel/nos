@@ -57,7 +57,7 @@ VENDOR = os.path.join(ROOT, 'src', 'crates', 'vendor')
 RUSTFLAGS = ['--cfg', 'chacha20_force_soft', '--cfg', 'poly1305_force_soft']
 
 # The gate: enough inputs that every target's deep states are reached --
-# the whole machine's included -- in well under a minute.
+# the whole machine's and the oversized disk requests' included.
 GATE_SEED = '1'
 GATE_ITERATIONS = '50000'
 

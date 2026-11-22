@@ -73,6 +73,8 @@ KVM it is whatever the host CPU has):
     served by the image then and there, done and given back, in order, slot
     by slot, and a file written, its ext4 transactions committed; and with
     the events off, nothing recorded
+  - CloudHv started as a firmware VM reaches its Boot Manager and UEFI Shell,
+    takes Down and Enter, and executes a command through `hv exec`
   - nothing warned, and nothing panicked
 
 and on arm64, where a hypervisor needs EL2 and this kernel dropped to EL1 in
@@ -148,7 +150,8 @@ def create_script(port):
     again refused; a raw image taken as it is; a URL with nothing at it, a
     file that is no image and a size= under the image's refused, each
     leaving nothing; and an image of NBS's made, and a VM of one, on a host
-    with no NBS: refused, leaving nothing (N10d3)."""
+    with no NBS: refused, leaving nothing (N10d3). Last, a small raw image
+    made a firmware Hyper-V VM: its loader must be CloudHv, not hvboot."""
     url = "http://10.0.2.2:%d/" % port
     return [
         "hv create c1 %simg.qcow2 size=16M mem=512 password=nos port=3" % url,
@@ -166,7 +169,11 @@ def create_script(port):
         "hv image i1 %simg.qcow2" % url,
         "hv create c7 image=nbs:i1",
         "ls /vms",
-    ] + CLONE
+    ] + CLONE + [
+        "hv create fwcloud %sraw.img firmware hyperv" % url,
+        "cat /vms/fwcloud/vm.toml",
+        "hv delete fwcloud",
+    ]
 
 
 # What is done to the VMs made, once they are there, and what each must
@@ -207,6 +214,23 @@ CREATE_SIZE = 16 * 1024 * 1024
 RAW_SIZE = 2 * 1024 * 1024
 # The key nos's sshd lets in, which hv create gives cloud-init.
 TEST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHVub3QtYS1yZWFsLWtleS1qdXN0LWEtdGVzdA hv-test"
+
+# CloudHv entered as a PVH image, through its Boot Manager to the UEFI Shell.
+# The ESC byte is Down's CSI sequence; Shell executes a command on CR, which
+# the explicit \r gives hv exec before its usual LF.
+UEFI = [
+    "hv create uefi firmware mem=64",
+    "cat /vms/uefi/vm.toml",
+    "hv start uefi",
+    "hv wait uefi secs=120 Press any key",
+    "hv send uefi \\r",
+    "hv wait uefi secs=60 Please select boot device",
+    "hv send uefi \x1b[B\\r",
+    "hv wait uefi secs=120 Shell>",
+    "hv exec uefi secs=60 echo HV-UEFI-OK\\r",
+    "hv stop uefi secs=0",
+    "hv delete uefi",
+]
 
 # One line a command, in the order /etc/rc runs them. The test indexes the
 # output by position, so the two lists are one thing.
@@ -251,12 +275,13 @@ SCRIPT = [
     # And of two CPUs: the MP table written beside the start info, the
     # second CPU waiting for a start-up IPI that never comes.
     "hv boot /hvboot mem=64 cpus=2 secs=120 cmdline=hvboot.verbose",  # 35
-    "rmmod hv",             # 36
+] + UEFI + [
+    "rmmod hv",
 ] + [
     # `hv convert`, a cloud's qcow2 image made a raw disk (CONVERT, above),
     # and then `hv create` of a VM from a URL (create_script, below) --
     # whose lines need the port of the test's web server -- and an rmmod.
-    "insmod /hv.ko",        # 37
+    "insmod /hv.ko",
 ] + CONVERT
 
 # The hypervisor's tracepoints, after the creates' rmmod: two guests run
@@ -314,8 +339,10 @@ WRITE = 0x1
 # What the trace says a pid off a task's stack is (tp::NO_TASK_PID).
 NO_TASK_PID = 0xFFFFFFFF
 
-# hvboot, as `make` builds it: the PVH image the script boots.
+# hvboot, as `make` builds it, and the checked-in CloudHv firmware: the PVH
+# images the script boots.
 HVBOOT = os.path.join(ROOT, "out", "x86_64", "hvboot")
+CLOUDHV = os.path.join(ROOT, "build", "image", "CLOUDHV.fd")
 
 # What `hv run all` has to have said about each guest, beyond its verdict.
 GUESTS = {
@@ -387,9 +414,9 @@ GUESTS = {
             r"2 of them the CPU's own, before its intercept)"],
     # Every MSR comes to the policy on both backends, so this one says the
     # same under either.
-    "msr": [r"VIRT_SPEC_CTRL, FLUSH_CMD, LS_CFG and MTRRs turned on each a #GP its own handler took",
+    "msr": [r"VIRT_SPEC_CTRL, FLUSH_CMD, LS_CFG and an invalid variable MTRR base each a #GP its own handler took",
             r"CPUID offers no VIRT_SSBD, no INVLPGB and no PMU, and says a hypervisor is there",
-            r"\b5 rdmsr, 3 wrmsr, 4 refused"],
+            r"\b11 rdmsr, 7 wrmsr, 4 refused"],
     # Two VMs, one after the other on the CPU the guests run on: offered
     # exactly the speculation controls the host switches -- none under
     # QEMU's TCG, which has none, every access a #GP -- and where it has
@@ -586,6 +613,11 @@ def create_checks(out, grown, raw):
     pt.check("and neither left anything behind: no folder, no download",
              "c7" not in out[14] and ".image-" not in out[14], out[14])
     clone_checks(out[15:], grown)
+    fw = out[15 + len(CLONE):]
+    pt.check("a cloud image made a firmware Hyper-V VM with CloudHv, not hvboot, as its loader",
+             len(fw) == 3 and "boots it: CloudHv" in fw[0]
+             and all(w in fw[1] for w in ('kernel = "/lib/CLOUDHV.fd"', "firmware = true", "hyperv = true"))
+             and "deleted" in fw[2], "\n".join(fw))
 
 
 def clone_checks(out, grown):
@@ -691,8 +723,8 @@ def convert_checks(out, digest):
 
 
 def rootfs(tmp, arch, rc=None):
-    """A root filesystem carrying hv.ko -- and on x86-64 hvboot, the PVH
-    image the script boots -- the images `hv convert` is given, and an
+    """A root filesystem carrying hv.ko -- and on x86-64 hvboot and CloudHv,
+    the PVH images the script boots -- the images `hv convert` is given, and an
     /etc/rc when one is wanted. The image, and the SHA-256 of the disk the
     images are of."""
     rootdir = os.path.join(tmp, "rootdir")
@@ -708,6 +740,9 @@ def rootfs(tmp, arch, rc=None):
         # And where the system image keeps it, which hv create boots by.
         os.makedirs(os.path.join(rootdir, "lib"), exist_ok=True)
         shutil.copy(HVBOOT, os.path.join(rootdir, "lib", "hvboot"))
+        if not os.path.exists(CLOUDHV):
+            sys.exit("no %s -- make first" % CLOUDHV)
+        shutil.copy(CLOUDHV, os.path.join(rootdir, "lib", "CLOUDHV.fd"))
     if rc is not None:
         with open(os.path.join(rootdir, "etc", "rc"), "w") as f:
             f.write("# tests/hv-test.py\n" + "\n".join(rc) + "\n")
@@ -1367,11 +1402,22 @@ def x86_checks(ran, script, digest, grown, raw, expect=frozenset()):
                  is not None, pvh)
         pt.check("and, given no disk, says so and turns the guest off by its ACPI",
                  "hvboot: cannot boot: no virtio disk" in pvh and "the guest powered itself off" in pvh, pvh)
-    pt.check("and hv unloads after it", "hv unloaded" in out[36], out[36])
+    uefi = out[36:36 + len(UEFI)]
+    pt.check("CloudHv is made a firmware VM in its vm.toml",
+             'kernel = "/lib/CLOUDHV.fd"' in uefi[1] and "firmware = true" in uefi[1], uefi[1])
+    for i, what in ((3, "its Boot Manager prompt"), (5, "the boot-device menu"), (7, "the UEFI Shell")):
+        pt.check("CloudHv reaches " + what, "printed" in uefi[i] and "has not printed" not in uefi[i], uefi[i])
+    pt.check("the UEFI Shell executes a command typed through hv exec",
+             re.search(r"(?:^|\n)HV-UEFI-OK\r?$", uefi[8], re.M) is not None and "no prompt" not in uefi[8], uefi[8])
+    pt.check("and the firmware VM stops and is deleted",
+             "stopped -- on request" in uefi[9] and "deleted" in uefi[10], uefi[9] + uefi[10])
 
-    pt.check("hv loads for hv convert", "hv loaded at" in out[37], out[37])
-    convert_checks(out[38:38 + len(CONVERT)], digest)
-    at = 38 + len(CONVERT)
+    after_uefi = 36 + len(UEFI)
+    pt.check("and hv unloads after it", "hv unloaded" in out[after_uefi], out[after_uefi])
+
+    pt.check("hv loads for hv convert", "hv loaded at" in out[after_uefi + 1], out[after_uefi + 1])
+    convert_checks(out[after_uefi + 2:after_uefi + 2 + len(CONVERT)], digest)
+    at = after_uefi + 2 + len(CONVERT)
     # Of what is left: the creates, then `rmmod hv`, TRACE and `RC_LAST`.
     created = len(script) - 2 - len(TRACE) - at
     create_checks(out[at:at + created], grown, raw)

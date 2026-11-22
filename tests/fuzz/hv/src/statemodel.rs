@@ -69,14 +69,17 @@ fn hostile(bytes: &[u8]) {
     }
 }
 
-/// `s`, written as version 1 wrote it -- its bytes, `bytes`, version 2's,
+/// `s`, written as version 1 wrote it -- its bytes, `bytes`, version 3's,
 /// with the version 1 and the UART's last fields taken out, a "ESC [ 6" of
 /// version 1's in place of a sequence of the one parameter 6 where `csi6`
-/// -- read as `s` with what version 2 added at its default: a state of a
-/// host not yet updated, moved to one that is.
+/// -- read as `s` with what versions 2 and 3 added at their defaults: a state
+/// of a host not yet updated, moved to one that is.
 fn as_version_1(s: &VmState, bytes: &[u8], csi6: bool) {
     let u = &s.platform.uart;
     let mut want = s.clone();
+    for c in &mut want.cpus {
+        c.regs.mtrrs = Mtrrs::default();
+    }
     {
         let w = &mut want.platform.uart;
         w.saved_col = None;
@@ -85,11 +88,32 @@ fn as_version_1(s: &VmState, bytes: &[u8], csi6: bool) {
             w.csi_n = u8::from(csi6);
         }
     }
-    /* The parts after the magic and the version, to the platform's */
+    /* The parts after the magic and the version, to the platform's. Version 1
+     * has no MTRRs: take their 28 u64s out of each CPU's registers, leaving
+     * the CPU state that follows them in place. */
+    const MTRRS_LEN: usize = 28 * 8;
+    const THROUGH_XSAVE_LEN: usize = 484;
+    const AFTER_EVENT: usize = 10;
     let le32 = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+    let mut cpu_parts = Vec::new();
+    let mut cpu_index = 0;
     let mut at = 8 + 2;
     while bytes[at] != 3 {
-        at += 5 + le32(&bytes[at + 1..]);
+        let len = le32(&bytes[at + 1..]);
+        let body = at + 5;
+        if bytes[at] == 2 {
+            let regs = &s.cpus[cpu_index].regs;
+            cpu_index += 1;
+            let event_len = 1 + regs.event.as_ref().map_or(0, |e| 3 + 4 * usize::from(e.error.is_some()));
+            let mtrr_at = THROUGH_XSAVE_LEN + regs.xsave.len() + event_len + AFTER_EVENT;
+            cpu_parts.push(bytes[at]);
+            cpu_parts.extend_from_slice(&((len - MTRRS_LEN) as u32).to_le_bytes());
+            cpu_parts.extend_from_slice(&bytes[body..body + mtrr_at]);
+            cpu_parts.extend_from_slice(&bytes[body + mtrr_at + MTRRS_LEN..body + len]);
+        } else {
+            cpu_parts.extend_from_slice(&bytes[at..body + len]);
+        }
+        at = body + len;
     }
     let len = le32(&bytes[at + 1..]);
     let uart_v1 = 6 + 8 + 1 + usize::from(u.loopback.is_some()) + 1 + usize::from(u.rx.is_some()) + 1 + 2 + 1
@@ -99,12 +123,14 @@ fn as_version_1(s: &VmState, bytes: &[u8], csi6: bool) {
     let mut v1 = Vec::with_capacity(bytes.len());
     v1.extend_from_slice(&bytes[..8]);
     v1.extend_from_slice(&1u16.to_le_bytes());
-    v1.extend_from_slice(&bytes[10..at + 1]);
+    v1.extend_from_slice(&cpu_parts);
+    v1.push(bytes[at]);
     v1.extend_from_slice(&((len - tail) as u32).to_le_bytes());
     v1.extend_from_slice(&bytes[body..body + uart_v1]);
     v1.extend_from_slice(&bytes[body + uart_v1 + tail..]);
     /* The UART's escape byte, version 1's 3 for a sequence of 6 */
-    let esc_at = body + 6 + 8 + 1 + usize::from(u.loopback.is_some()) + 1 + usize::from(u.rx.is_some());
+    let platform_body = 8 + 2 + cpu_parts.len() + 5;
+    let esc_at = platform_body + 6 + 8 + 1 + usize::from(u.loopback.is_some()) + 1 + usize::from(u.rx.is_some());
     invariant!(v1[esc_at] == u.esc, "the UART's escape not where version 1 has it");
     if u.esc == ESC_CSI && csi6 {
         v1[esc_at] = ESC_CSI6_V1;
@@ -184,6 +210,20 @@ fn event(r: &mut Input) -> Event {
     }
 }
 
+fn fixed_mtrr(r: &mut Input) -> u64 {
+    (0..8).map(|i| r.pick(&[0u64, 1, 4, 5, 6, 7]) << (8 * i)).sum()
+}
+
+fn valid_mtrrs(r: &mut Input) -> Mtrrs {
+    let types: [u64; 6] = [0, 1, 4, 5, 6, 7];
+    Mtrrs {
+        def_type: r.pick(&[0, 0x806, 0x1000, 0x1806, 1, 4, 6, 0x800]),
+        fixed: core::array::from_fn(|_| fixed_mtrr(r)),
+        base: core::array::from_fn(|_| (r.u64() & ((1u64 << 52) - 1) & !0xFFF) | r.pick(&types)),
+        mask: core::array::from_fn(|_| (r.u64() & ((1u64 << 52) - 1) & !0xFFF) | (u64::from(r.bool()) << 11)),
+    }
+}
+
 fn cpu(r: &mut Input, index: u32) -> Cpu {
     let mut regs = Regs::zeroed();
     regs.gprs = core::array::from_fn(|_| r.u64());
@@ -209,6 +249,7 @@ fn cpu(r: &mut Input, index: u32) -> Cpu {
     regs.dr7 = u64::from(r.u32());
     regs.tsc_aux = r.u64();
     regs.spec_ctrl = r.u64();
+    regs.mtrrs = valid_mtrrs(r);
     regs.xcr0 = r.u64();
     regs.pkru = r.u32();
     regs.xsave = (0..r.below(64) * 13).map(|_| r.u8()).collect();
@@ -523,7 +564,8 @@ fn cpu_round_trip(r: &mut Input) {
     crate::state::save_common(&save, &g, &mut back);
     let mut want = regs.clone();
     /* Each backend's own, which neither of the two touches. */
-    (want.cr4, want.cr8, want.dr, want.tsc_aux, want.spec_ctrl, want.xcr0, want.pkru) = (0, 0, [0; 4], 0, 0, 0, 0);
+    (want.cr4, want.cr8, want.dr, want.tsc_aux, want.spec_ctrl, want.mtrrs, want.xcr0, want.pkru) =
+        (0, 0, [0; 4], 0, 0, Mtrrs::default(), 0, 0);
     want.xsave.clear();
     (want.event, want.shadow, want.nmi_blocked, want.pending_debug) = (None, false, false, 0);
     invariant!(back == want, "registers written into a save area and read back are others:\n{:?}\n{:?}", want, back);

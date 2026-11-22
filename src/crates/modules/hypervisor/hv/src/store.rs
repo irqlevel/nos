@@ -62,7 +62,7 @@ const ROOT_MAX: usize = PATH_MAX - (1 + NAME_MAX + 1 + LONGEST_NAME);
 /// How deep `delete` goes into a VM's folder.
 const DELETE_DEPTH: usize = 8;
 
-pub(crate) const CREATE_USAGE: &str = "hv create <name> <kernel> [mem=MiB] [cpus=N] [cpu=N] [node=N] [xapic] [ioapic] \
+pub(crate) const CREATE_USAGE: &str = "hv create <name> <kernel> [firmware] [hyperv] [mem=MiB] [cpus=N] [cpu=N] [node=N] [xapic] [ioapic] \
                             [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [pci=bus:dev.fn]... [unsafe_interrupts] \
                             [input=...] [log] [restart] [net] [port=N] [forward=nos:guest]... [force] \
                             [cmdline=...]\n\

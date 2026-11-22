@@ -1095,6 +1095,25 @@ impl Vcpu {
         } else {
             writeln!(out, "  rsp, the control registers and the segments not read: the VMCS was no longer current here")?;
         }
+        if let Some(e) = g.entry_failure() {
+            let [entry_bad, exit_bad, pin_bad, proc_bad, proc2_bad] = e.invalid_controls;
+            for (name, value, invalid) in [("entry", e.entry_controls, entry_bad),
+                                           ("exit", e.exit_controls, exit_bad),
+                                           ("pin", e.pin_controls, pin_bad),
+                                           ("proc", e.processor_controls, proc_bad),
+                                           ("proc2", e.processor_controls2, proc2_bad)] {
+                writeln!(out, "  entry {} controls {:#x}  invalid bits {:#x}", name, value, invalid)?;
+            }
+            writeln!(out, "  entry intr {:#x}  interruptibility {:#x}  msr_load {} at {:#x}",
+                     e.entry_interrupt_info, e.guest_interruptibility, e.entry_msr_load_count,
+                     e.entry_msr_load_address)?;
+            writeln!(out, "  entry vtpr {:#x}  tpr_threshold {:#x}  intr_status {:#x}",
+                     e.virtual_tpr, e.tpr_threshold, e.guest_interrupt_status)?;
+            writeln!(out, "  entry eptp {:#x}  msr_bitmap {:#x}  ple_gap {:#x}  ple_window {:#x}  link {:#x}",
+                     e.ept_pointer, e.msr_bitmap, e.ple_gap, e.ple_window, e.vmcs_link_pointer)?;
+            writeln!(out, "  entry star {:#x}  lstar {:#x}  cstar {:#x}", s.star, s.lstar, s.cstar)?;
+            writeln!(out, "  entry sfmask {:#x}  kernel_gs_base {:#x}", s.sfmask, s.kernel_gs_base)?;
+        }
         writeln!(out, "  exit {:#x}  qual {:#x}  intr {:#x}  idtv {:#x}  instr_err {}",
                  g.exit_reason(), g.exit_qualification(), g.exit_intr_info(),
                  g.idt_vectoring_info(), g.vm_instruction_error())?;

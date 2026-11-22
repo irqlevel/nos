@@ -5642,8 +5642,8 @@ fn check_cr4(m: &GuestMemory, stopped: &Stopped, counts: &Counts, held: &Held, v
 /* ---- msr: the MSRs a guest is answered, a #GP for every other ---- */
 
 const MSR_NAME: &str = "msr";
-const MSR_ABOUT: &str = "a guest's MSRs: VIRT_SPEC_CTRL and FLUSH_CMD, which its CPUID does not offer, an MSR \
-                         nobody names and MTRRs turned on, which nothing keeps, each a #GP; the machine-check \
+const MSR_ABOUT: &str = "a guest's MSRs: VIRT_SPEC_CTRL, FLUSH_CMD and an invalid variable MTRR base, each a #GP; \
+                         MTRRcap, DEF_TYPE and fixed and variable MTRRs read back after writing; the machine-check \
                          registers and the PAT answered; and CPUID with no VIRT_SSBD, no INVLPGB and no PMU in it";
 
 /* A Linux guest's CPU, one, in long mode with an IDT of its own, whose #GP
@@ -5652,85 +5652,88 @@ const MSR_ABOUT: &str = "a guest's MSRs: VIRT_SPEC_CTRL and FLUSH_CMD, which its
  * `rdmsr` or `wrmsr` that raised it. It reads AMD's VIRT_SPEC_CTRL and
  * writes an L1D flush to FLUSH_CMD -- neither offered, where SPEC_CTRL and
  * PRED_CMD may be (the `spec` guest's); reads AMD's LS_CFG, which this
- * policy names for no CPU; turns its MTRRs on, write-back; reads MCG_CAP,
- * MCG_STATUS and the PAT; turns the MTRRs off -- which they are; then asks
+ * policy names for no CPU; reads MTRRcap, turns MTRRs on write-back and
+ * reads DEF_TYPE, a fixed register and a variable base and mask back; an
+ * invalid base's top bit is a #GP; reads MCG_CAP, MCG_STATUS and the PAT;
+ * turns the MTRRs off and reads DEF_TYPE again; then asks
  * CPUID for 0x8000_0008, 0xA, 0 and 1 -- and leaves its mark and halts.
  * Assembled from this source with clang, the offsets in the comments its
  * listing's. */
 const MSR_CODE: &[u8] = &[
-    0x48, 0x8D, 0x05, 0xF3, 0x00, 0x00, 0x00,               // 00: lea rax, [rip + gp] ; gate 13, #GP
-    0xBF, 0xD0, 0xA0, 0x00, 0x00,                           // 07: mov edi, 0xA0D0
-    0xE8, 0xC3, 0x00, 0x00, 0x00,                           // 0c: call gate
-    0x0F, 0x01, 0x1D, 0x13, 0x01, 0x00, 0x00,               // 11: lidt [rip + idtr]
-    0xB9, 0x1F, 0x01, 0x01, 0xC0,                           // 18: mov ecx, 0xC001011F ; VIRT_SPEC_CTRL: #GP
-    0x0F, 0x32,                                             // 1d: rdmsr
-    0xB9, 0x0B, 0x01, 0x00, 0x00,                           // 1f: mov ecx, 0x10B ; FLUSH_CMD, L1D: #GP
-    0xB8, 0x01, 0x00, 0x00, 0x00,                           // 24: mov eax, 1
-    0x31, 0xD2,                                             // 29: xor edx, edx
-    0x0F, 0x30,                                             // 2b: wrmsr
-    0xB9, 0x20, 0x10, 0x01, 0xC0,                           // 2d: mov ecx, 0xC0011020 ; LS_CFG: #GP
-    0x0F, 0x32,                                             // 32: rdmsr
-    0xB9, 0xFF, 0x02, 0x00, 0x00,                           // 34: mov ecx, 0x2FF ; MTRRs on, write-back: #GP
-    0xB8, 0x06, 0x08, 0x00, 0x00,                           // 39: mov eax, 0x806
-    0x31, 0xD2,                                             // 3e: xor edx, edx
-    0x0F, 0x30,                                             // 40: wrmsr
-    0xB9, 0x79, 0x01, 0x00, 0x00,                           // 42: mov ecx, 0x179 ; MCG_CAP
-    0x0F, 0x32,                                             // 47: rdmsr
-    0x89, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,               // 49: mov dword [0x7010], eax
-    0x89, 0x14, 0x25, 0x14, 0x70, 0x00, 0x00,               // 50: mov dword [0x7014], edx
-    0xB9, 0x7A, 0x01, 0x00, 0x00,                           // 57: mov ecx, 0x17A ; MCG_STATUS
-    0x0F, 0x32,                                             // 5c: rdmsr
-    0x89, 0x04, 0x25, 0x18, 0x70, 0x00, 0x00,               // 5e: mov dword [0x7018], eax
-    0x89, 0x14, 0x25, 0x1C, 0x70, 0x00, 0x00,               // 65: mov dword [0x701C], edx
-    0xB9, 0x77, 0x02, 0x00, 0x00,                           // 6c: mov ecx, 0x277 ; the PAT
-    0x0F, 0x32,                                             // 71: rdmsr
-    0x89, 0x04, 0x25, 0x20, 0x70, 0x00, 0x00,               // 73: mov dword [0x7020], eax
-    0x89, 0x14, 0x25, 0x24, 0x70, 0x00, 0x00,               // 7a: mov dword [0x7024], edx
-    0xB9, 0xFF, 0x02, 0x00, 0x00,                           // 81: mov ecx, 0x2FF ; MTRRs off, as they are
-    0x31, 0xC0,                                             // 86: xor eax, eax
-    0x31, 0xD2,                                             // 88: xor edx, edx
-    0x0F, 0x30,                                             // 8a: wrmsr
-    0xB8, 0x08, 0x00, 0x00, 0x80,                           // 8c: mov eax, 0x80000008
-    0x31, 0xC9,                                             // 91: xor ecx, ecx
-    0x0F, 0xA2,                                             // 93: cpuid
-    0x89, 0x1C, 0x25, 0x28, 0x70, 0x00, 0x00,               // 95: mov dword [0x7028], ebx
-    0xB8, 0x0A, 0x00, 0x00, 0x00,                           // 9c: mov eax, 0xA
-    0x31, 0xC9,                                             // a1: xor ecx, ecx
-    0x0F, 0xA2,                                             // a3: cpuid
-    0x89, 0x04, 0x25, 0x2C, 0x70, 0x00, 0x00,               // a5: mov dword [0x702C], eax
-    0x31, 0xC0,                                             // ac: xor eax, eax
-    0x0F, 0xA2,                                             // ae: cpuid
-    0x89, 0x04, 0x25, 0x30, 0x70, 0x00, 0x00,               // b0: mov dword [0x7030], eax
-    0xB8, 0x01, 0x00, 0x00, 0x00,                           // b7: mov eax, 1
-    0x0F, 0xA2,                                             // bc: cpuid
-    0x89, 0x0C, 0x25, 0x34, 0x70, 0x00, 0x00,               // be: mov dword [0x7034], ecx
-    0xC7, 0x04, 0x25, 0x38, 0x70, 0x00, 0x00,               // c5: mov dword [0x7038], 'MSR!'
-    0x4D, 0x53, 0x52, 0x21,
-    0xFA,                                                   // d0: cli
-    0xF4,                                                   // d1: .dead: hlt
-    0xEB, 0xFD,                                             // d2: jmp .dead
-    0x66, 0x89, 0x07,                                       // d4: gate: mov word [rdi], ax ; an interrupt gate for rax
-    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // d7: mov word [rdi + 2], 0x08
-    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // dd: mov word [rdi + 4], 0x8E00
-    0x48, 0xC1, 0xE8, 0x10,                                 // e3: shr rax, 16
-    0x66, 0x89, 0x47, 0x06,                                 // e7: mov word [rdi + 6], ax
-    0x48, 0xC1, 0xE8, 0x10,                                 // eb: shr rax, 16
-    0x89, 0x47, 0x08,                                       // ef: mov dword [rdi + 8], eax
-    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // f2: mov dword [rdi + 12], 0
-    0xC3,                                                   // f9: ret
-    0x50,                                                   // fa: gp: push rax
-    0x8B, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // fb: mov eax, dword [0x7000] ; how many so far
-    0x83, 0xE0, 0x07,                                       // 102: and eax, 7
-    0x89, 0x0C, 0x85, 0x40, 0x70, 0x00, 0x00,               // 105: mov dword [0x7040 + rax * 4], ecx ; which MSR
-    0xFF, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // 10c: inc dword [0x7000]
-    0x8B, 0x44, 0x24, 0x08,                                 // 113: mov eax, dword [rsp + 8] ; its error code,
-    0x09, 0x04, 0x25, 0x04, 0x70, 0x00, 0x00,               // 117: or dword [0x7004], eax ; with the others'
-    0x48, 0x83, 0x44, 0x24, 0x10, 0x02,                     // 11e: add qword [rsp + 16], 2 ; past the rdmsr or wrmsr
-    0x58,                                                   // 124: pop rax
-    0x48, 0x83, 0xC4, 0x08,                                 // 125: add rsp, 8 ; the error code
-    0x48, 0xCF,                                             // 129: iretq
-    0xDF, 0x00,                                             // 12b: idtr: dw 0xDF ; fourteen gates
-    0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // dq 0xA000
+    0x48, 0x8d, 0x05, 0xac, 0x01, 0x00, 0x00,               // 00: lea rax, [rip + gp]
+    0xbf, 0xd0, 0xa0, 0x00, 0x00,                           // 07: mov edi, 0xA0D0
+    0xe8, 0x7c, 0x01, 0x00, 0x00,                           // 0c: call gate
+    0x0f, 0x01, 0x1d, 0xcc, 0x01, 0x00, 0x00,               // 11: lidt [rip + idtr]
+    0xb9, 0x1f, 0x01, 0x01, 0xc0, 0x0f, 0x32,               // 18: VIRT_SPEC_CTRL: #GP
+    0xb9, 0x0b, 0x01, 0x00, 0x00, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x31, 0xd2, 0x0f, 0x30, // 1f: FLUSH_CMD: #GP
+    0xb9, 0x20, 0x10, 0x01, 0xc0, 0x0f, 0x32,               // 2d: LS_CFG: #GP
+    0xb9, 0xfe, 0x00, 0x00, 0x00, 0x0f, 0x32,               // 34: MTRRcap
+    0x89, 0x04, 0x25, 0x50, 0x70, 0x00, 0x00,               // 3b: save it
+    0x89, 0x14, 0x25, 0x54, 0x70, 0x00, 0x00,               // 42: and its high half
+    0xb9, 0xff, 0x02, 0x00, 0x00, 0xb8, 0x06, 0x08, 0x00, 0x00, 0x31, 0xd2, 0x0f, 0x30, // 49: DEF_TYPE = WB|E
+    0xb9, 0xff, 0x02, 0x00, 0x00, 0x0f, 0x32,               // 57: read it back
+    0x89, 0x04, 0x25, 0x58, 0x70, 0x00, 0x00,               // 5e: save it
+    0x89, 0x14, 0x25, 0x5c, 0x70, 0x00, 0x00,               // 65: and its high half
+    0xb9, 0x50, 0x02, 0x00, 0x00, 0xb8, 0x06, 0x04, 0x07, 0x00, 0xba, 0x06, 0x04, 0x07, 0x00, 0x0f, 0x30, // 6c: fixed MTRR
+    0xb9, 0x50, 0x02, 0x00, 0x00, 0x0f, 0x32,               // 7d: read it back
+    0x89, 0x04, 0x25, 0x60, 0x70, 0x00, 0x00,               // 84: save it
+    0x89, 0x14, 0x25, 0x64, 0x70, 0x00, 0x00,               // 8b: and its high half
+    0xb9, 0x00, 0x02, 0x00, 0x00, 0xb8, 0x06, 0x00, 0x20, 0x00, 0x31, 0xd2, 0x0f, 0x30, // 92: variable base
+    0xb9, 0x00, 0x02, 0x00, 0x00, 0x0f, 0x32,               // a0: read it back
+    0x89, 0x04, 0x25, 0x68, 0x70, 0x00, 0x00,               // a7: save it
+    0x89, 0x14, 0x25, 0x6c, 0x70, 0x00, 0x00,               // ae: and its high half
+    0xb9, 0x01, 0x02, 0x00, 0x00, 0xb8, 0x00, 0x08, 0x20, 0x00, 0x31, 0xd2, 0x0f, 0x30, // b5: variable mask
+    0xb9, 0x01, 0x02, 0x00, 0x00, 0x0f, 0x32,               // c3: read it back
+    0x89, 0x04, 0x25, 0x70, 0x70, 0x00, 0x00,               // ca: save it
+    0x89, 0x14, 0x25, 0x74, 0x70, 0x00, 0x00,               // d1: and its high half
+    0xb9, 0x00, 0x02, 0x00, 0x00, 0x31, 0xc0, 0xba, 0x00, 0x00, 0x00, 0x80, 0x0f, 0x30, // d8: invalid base: #GP
+    0xb9, 0x79, 0x01, 0x00, 0x00, 0x0f, 0x32,               // e6: MCG_CAP
+    0x89, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,               // ed: save it
+    0x89, 0x14, 0x25, 0x14, 0x70, 0x00, 0x00,               // f4: and its high half
+    0xb9, 0x7a, 0x01, 0x00, 0x00, 0x0f, 0x32,               // fb: MCG_STATUS
+    0x89, 0x04, 0x25, 0x18, 0x70, 0x00, 0x00,               // 102: save it
+    0x89, 0x14, 0x25, 0x1c, 0x70, 0x00, 0x00,               // 109: and its high half
+    0xb9, 0x77, 0x02, 0x00, 0x00, 0x0f, 0x32,               // 110: the PAT
+    0x89, 0x04, 0x25, 0x20, 0x70, 0x00, 0x00,               // 117: save it
+    0x89, 0x14, 0x25, 0x24, 0x70, 0x00, 0x00,               // 11e: and its high half
+    0xb9, 0xff, 0x02, 0x00, 0x00, 0x31, 0xc0, 0x31, 0xd2, 0x0f, 0x30, // 125: MTRRs off
+    0xb9, 0xff, 0x02, 0x00, 0x00, 0x0f, 0x32,               // 130: read DEF_TYPE back
+    0x89, 0x04, 0x25, 0x78, 0x70, 0x00, 0x00,               // 137: save it
+    0x89, 0x14, 0x25, 0x7c, 0x70, 0x00, 0x00,               // 13e: and its high half
+    0xb8, 0x08, 0x00, 0x00, 0x80, 0x31, 0xc9, 0x0f, 0xa2,   // 145: CPUID 0x80000008
+    0x89, 0x1c, 0x25, 0x28, 0x70, 0x00, 0x00,               // 14e: save EBX
+    0xb8, 0x0a, 0x00, 0x00, 0x00, 0x31, 0xc9, 0x0f, 0xa2,   // 155: CPUID 0xA
+    0x89, 0x04, 0x25, 0x2c, 0x70, 0x00, 0x00,               // 15e: save EAX
+    0x31, 0xc0, 0x0f, 0xa2,                                 // 165: CPUID 0
+    0x89, 0x04, 0x25, 0x30, 0x70, 0x00, 0x00,               // 169: save EAX
+    0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f, 0xa2,               // 170: CPUID 1
+    0x89, 0x0c, 0x25, 0x34, 0x70, 0x00, 0x00,               // 177: save ECX
+    0xc7, 0x04, 0x25, 0x38, 0x70, 0x00, 0x00, 0x4d, 0x53, 0x52, 0x21, // 17e: 'MSR!'
+    0xfa,                                                   // 189: cli
+    0xf4,                                                   // 18a: .dead: hlt
+    0xeb, 0xfd,                                             // 18b: jmp .dead
+    0x66, 0x89, 0x07,                                       // 18d: gate: mov word [rdi], ax
+    0x66, 0xc7, 0x47, 0x02, 0x08, 0x00,                     // 190: selector 8
+    0x66, 0xc7, 0x47, 0x04, 0x00, 0x8e,                     // 196: attributes
+    0x48, 0xc1, 0xe8, 0x10,                                 // 19c: shr rax, 16
+    0x66, 0x89, 0x47, 0x06,                                 // 1a0: mov word [rdi + 6], ax
+    0x48, 0xc1, 0xe8, 0x10,                                 // 1a4: shr rax, 16
+    0x89, 0x47, 0x08,                                       // 1a8: mov dword [rdi + 8], eax
+    0xc7, 0x47, 0x0c, 0x00, 0x00, 0x00, 0x00,               // 1ab: zero base
+    0xc3,                                                   // 1b2: ret
+    0x50,                                                   // 1b3: gp: push rax
+    0x8b, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // 1b4: count
+    0x83, 0xe0, 0x07,                                       // 1bb: and 7
+    0x89, 0x0c, 0x85, 0x40, 0x70, 0x00, 0x00,               // 1be: which MSR
+    0xff, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // 1c5: increment count
+    0x8b, 0x44, 0x24, 0x08,                                 // 1cc: error code
+    0x09, 0x04, 0x25, 0x04, 0x70, 0x00, 0x00,               // 1d0: OR it in
+    0x48, 0x83, 0x44, 0x24, 0x10, 0x02,                     // 1d7: past the instruction
+    0x58,                                                   // 1dd: pop rax
+    0x48, 0x83, 0xc4, 0x08,                                 // 1de: drop error code
+    0x48, 0xcf,                                             // 1e2: iretq
+    0xdf, 0x00,                                             // 1e4: idtr: dw 0xDF
+    0x00, 0xa0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // dq 0xA000
 ];
 
 /* What the guest leaves at `RESULTS`: the #GPs its handler took at +0, their
@@ -5751,11 +5754,21 @@ const MSR_DONE: u64 = RESULTS + 0x38;
 const MSR_REFUSALS: u64 = RESULTS + 0x40;
 const MSR_MARK: u32 = u32::from_le_bytes(*b"MSR!");
 /// The MSRs it is refused, in turn: VIRT_SPEC_CTRL, FLUSH_CMD, LS_CFG and
-/// the MTRRs' default type, written with them on.
-const MSR_REFUSED: [u32; 4] = [0xC001_011F, 0x10B, 0xC001_1020, 0x2FF];
-/// What it reads of MSRs, and writes: five and three.
-const MSR_READS: u64 = 5;
-const MSR_WRITES: u64 = 3;
+/// an invalid variable MTRR base with its top bit set.
+const MSR_REFUSED: [u32; 4] = [0xC001_011F, 0x10B, 0xC001_1020, 0x200];
+/// What it reads of MSRs, and writes: eleven and seven.
+const MSR_READS: u64 = 11;
+const MSR_WRITES: u64 = 7;
+const MSR_CAP: u64 = RESULTS + 0x50;
+const MSR_DEF: u64 = RESULTS + 0x58;
+const MSR_FIXED: u64 = RESULTS + 0x60;
+const MSR_BASE: u64 = RESULTS + 0x68;
+const MSR_MASK: u64 = RESULTS + 0x70;
+const MSR_OFF: u64 = RESULTS + 0x78;
+const MSR_DEF_ON: u64 = 0x806;
+const MSR_FIXED_VALUE: u64 = 0x0007_0406_0007_0406;
+const MSR_BASE_VALUE: u64 = 0x200006;
+const MSR_MASK_VALUE: u64 = 0x200800;
 /// What a guest is not told of in 0x8000_0008's EBX: INVLPGB, which the
 /// VMCB does not enable, and VIRT_SSBD, whose MSR nothing answers.
 const MSR_NOT_OFFERED: u32 = (1 << 3) | (1 << 25);
@@ -5858,6 +5871,18 @@ fn check_msr(m: &GuestMemory, stopped: &Stopped, counts: &Counts, faults: &[(u32
         return Err(alloc::format!("it read MCG_CAP {:#x}, MCG_STATUS {:#x} and the PAT {:#x}: wanted no banks, \
                                    nothing to report and {:#x}", mcg_cap, mcg_status, pat, crate::svm::PAT_RESET));
     }
+    let cap = m.read_obj::<u64>(MSR_CAP).map_err(unread)?;
+    let def = m.read_obj::<u64>(MSR_DEF).map_err(unread)?;
+    let fixed = m.read_obj::<u64>(MSR_FIXED).map_err(unread)?;
+    let base = m.read_obj::<u64>(MSR_BASE).map_err(unread)?;
+    let mask = m.read_obj::<u64>(MSR_MASK).map_err(unread)?;
+    let off = m.read_obj::<u64>(MSR_OFF).map_err(unread)?;
+    if cap != 0x508 || def != MSR_DEF_ON || fixed != MSR_FIXED_VALUE || base != MSR_BASE_VALUE || mask != MSR_MASK_VALUE
+        || off != 0
+    {
+        return Err(alloc::format!("MTRRs read back cap {:#x}, DEF {:#x}, fixed {:#x}, base {:#x}, mask {:#x}, off {:#x}",
+                                  cap, def, fixed, base, mask, off));
+    }
     let ext8_ebx = m.read_obj::<u32>(MSR_EXT8_EBX).map_err(unread)?;
     let pmu = m.read_obj::<u32>(MSR_PMU_EAX).map_err(unread)?;
     let top = m.read_obj::<u32>(MSR_TOP).map_err(unread)?;
@@ -5867,9 +5892,9 @@ fn check_msr(m: &GuestMemory, stopped: &Stopped, counts: &Counts, faults: &[(u32
                                    {:#x}: wanted none of {:#x}, no PMU, no higher than {:#x} and the hypervisor bit",
                                   ext8_ebx, pmu, top, leaf1_ecx, MSR_NOT_OFFERED, MSR_BASIC_TOP));
     }
-    Ok(String::from("VIRT_SPEC_CTRL, FLUSH_CMD, LS_CFG and MTRRs turned on each a #GP its own handler took; \
-                     MCG_CAP, MCG_STATUS and the PAT answered; CPUID offers no VIRT_SSBD, no INVLPGB and no PMU, \
-                     and says a hypervisor is there"))
+    Ok(String::from("VIRT_SPEC_CTRL, FLUSH_CMD, LS_CFG and an invalid variable MTRR base each a #GP its own handler took; \
+                     MTRRcap, DEF_TYPE and fixed and variable MTRRs read back after writing; MCG_CAP, MCG_STATUS and \
+                     the PAT answered; CPUID offers no VIRT_SSBD, no INVLPGB and no PMU, and says a hypervisor is there"))
 }
 
 /* The guests' machine: 1 MiB of memory with a GDT, a TSS and a page table
@@ -6443,8 +6468,19 @@ fn build_refused(vm: &mut Vm) -> Result<()> {
 fn check_refused(vm: &Vm, r: &Run) -> core::result::Result<String, String> {
     if vm.is_vmx() {
         return match r.stop {
-            Stop::Invalid => Ok(String::from(
-                "the CPU refused the VMCS at entry for invalid guest state, reported rather than run")),
+            Stop::Invalid => {
+                let mut dump = String::new();
+                let _ = vm.vcpu().dump(&mut dump);
+                if !dump.contains("entry entry controls") || !dump.contains("entry proc controls")
+                    || !dump.contains("entry vtpr") || !dump.contains("entry eptp")
+                    || !dump.contains("entry sfmask")
+                {
+                    Err(String::from("the refused entry's VMCS controls were not kept for its dump"))
+                } else {
+                    Ok(String::from(
+                        "the CPU refused the VMCS at entry for invalid guest state, its controls kept in the dump"))
+                }
+            }
             _ => Err(String::from("it was not refused for the state it breaks")),
         };
     }
