@@ -447,8 +447,8 @@ def topology_checks(text):
     # (Linux 6.18 says ECAM where older kernels said MMCONFIG)
     said = lines(text, "pass-guest: pci: ")
     pt.check("the guest's kernel takes the MCFG's ECAM, reserved where it is, covering the host bridge's buses",
-             re.search(r"(MMCONFIG|ECAM) .*0xfd800000.*for domain 0000 \[bus 00-07\]", said) is not None
-             and re.search(r"(MMCONFIG|ECAM) (at )?\[mem 0xfd800000-0xfdffffff\] reserved as", said) is not None
+             re.search(r"(MMCONFIG|ECAM) .*0xe0000000.*for domain 0000 \[bus 00-ff\]", said) is not None
+             and re.search(r"(MMCONFIG|ECAM) (at )?\[mem 0xe0000000-0xefffffff\] reserved as", said) is not None
              and "not reserved" not in said and "partially covers" not in said, said)
     sizes = dict(re.findall(r"pass-guest: config (\S+) (\d+) bytes", text))
     pt.check("each function's extended space is reached, a port's and a host's alike",
