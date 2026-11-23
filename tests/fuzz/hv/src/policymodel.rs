@@ -36,10 +36,11 @@
 //! (Documentation/virt/kvm/x86/cpuid.rst): the signature, and of the
 //! features NOP_IO_DELAY and, with APICs, PV_EOI -- nothing else, and
 //! nothing past 0x4000_0001. A firmware guest that asks for Hyper-V gets
-//! Microsoft's vendor, Hv#1 and only the hypercall, VP-index, time, frequency,
-//! virtual-APIC, SynIC and direct-synthetic-timer facilities implemented behind
-//! it, plus the remote-flush and cluster-IPI recommendations, as the TLFS has
-//! them; nothing past 0x4000_0005.
+//! Microsoft's vendor, Hv#1 and only the hypercall with XMM fast input,
+//! VP-index, time, frequency, virtual-APIC, SynIC and direct-synthetic-timer facilities implemented behind
+//! it, plus the remote-flush and cluster-IPI recommendations. APIC access is
+//! recommended without APIC virtualization, and AutoEOI is deprecated with it;
+//! nothing past 0x4000_0005.
 
 use crate::place::{Shape, Topology};
 use crate::policy::{self, model_answers, model_differs, model_digest, Asker, Cpuid, Own, MSR_ANSWER};
@@ -276,8 +277,10 @@ fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u3
                                 u32::from_le_bytes(*b"t Hv")],
                 0x4000_0001 => [u32::from_le_bytes(*b"Hv#1"), 0, 0, 0],
                 0x4000_0003 => [1 << 1 | 1 << 2 | 1 << 3 | 1 << 4 | 1 << 5 | 1 << 6 | 1 << 9 | 1 << 11, 0, 0,
-                                1 << 10 | 1 << 19],
-                0x4000_0004 => [1 << 2 | 1 << 3 | 1 << 9 | 1 << 10, u32::MAX, 0, 0],
+                                1 << 4 | 1 << 10 | 1 << 19],
+                0x4000_0004 => [1 << 2 | if apic && !asker.hyperv_avic { 1 << 3 } else { 0 }
+                                    | if apic && asker.hyperv_avic { 1 << 9 } else { 0 } | 1 << 10,
+                                u32::MAX, 0, 0],
                 0x4000_0005 => [crate::smp::MAX_VCPUS as u32, crate::smp::MAX_VCPUS as u32, 0, 0],
                 _ => [0; 4],
             }
@@ -997,7 +1000,7 @@ pub fn policy_target(r: &mut Input) {
     let shape = if r.u8() < 32 { Shape::cores(n) } else { Shape::of(&topo, &vcpus) };
     let apic_id = r.below(u64::from(shape.cpus())) as u32;
     let asker = Asker { apic_id, apic: r.bool(), apic_on: r.u8() >= 32, cr4: r.value64(), xcr0, shape,
-                        hyperv: r.bool() };
+                        hyperv: r.bool(), hyperv_avic: r.bool() };
     let told = tops(&asker);
     for leaf in (0..=0x30u32).chain(0x4000_0000..=0x4000_0010).chain(0x8000_0000..=0x8000_0030) {
         check_leaf(leaf, r.below(4) as u32, &asker, told);

@@ -1405,12 +1405,14 @@ impl LinuxGuest {
                     HostBridge::CloudHv)
     }
 
-    /// A CloudHv guest with Microsoft's Hv#1 interface, for Windows.
+    /// A CloudHv guest with Microsoft's Hv#1 interface, for Windows: x2APIC
+    /// with an IO-APIC, which Hyper-V supports without interrupt remapping.
     #[allow(clippy::too_many_arguments)]
     pub fn new_hyperv_on(machine: &Machine, mem_bytes: u64, huge: bool, cpus: u32, doorbells: Arc<Doorbells>,
                          node: Option<usize>) -> Result<(Self, Vec<GuestCpu>)>
     {
-        let (mut guest, cpus) = Self::new_firmware_on(machine, mem_bytes, huge, cpus, doorbells, node)?;
+        let (mut guest, cpus) = Self::build(machine, mem_bytes, huge, cpus, doorbells, true, true, linux::HOLE_RAM_END,
+                                            node, HostBridge::CloudHv)?;
         let hz = time::cycle_counter_hz().ok_or(Error::NotImplemented)?;
         let epoch = time::cycle_counter().wrapping_add(guest.tsc_offset());
         let interface = hyperv::Hyperv::new(guest.vendor, epoch, hz)?;
@@ -1440,7 +1442,10 @@ impl LinuxGuest {
         if ram.end().is_none_or(|end| end > 1u64 << crate::policy::phys_bits()) {
             return Err(Error::BadAddress);
         }
-        let x2apic = x2apic && !ioapic;
+        /* Only Hyper-V asks for x2APIC with an IO-APIC: its guests know that
+         * interrupt remapping is not required. Every other such machine keeps
+         * firmware's ordinary xAPIC mode for kernels that require remapping. */
+        let x2apic = x2apic && (!ioapic || matches!(host_bridge, HostBridge::CloudHv));
         let mut memory = GuestMemory::new(machine.caps().vendor())?;
         if let Some(node) = node {
             memory.place_on(node);
@@ -1682,6 +1687,11 @@ impl LinuxGuest {
     /// Whether it has an IO-APIC.
     pub fn has_ioapic(&self) -> bool {
         self.platform.lock().ioapic.is_some()
+    }
+
+    /// Whether its local APICs came out of reset in x2APIC mode.
+    pub fn x2apic(&self) -> bool {
+        self.x2apic
     }
 
     /// What its IO-APIC has done, when it has one.
@@ -2046,6 +2056,7 @@ impl LinuxGuest {
         let machine = acpi::Machine {
             cpus: self.cpus(),
             apic: self.has_apic(),
+            x2apic: self.x2apic,
             ioapic: ioapic.then_some(self.cpus() as u8),
             pci: routes,
             mmio: window,
@@ -3355,9 +3366,10 @@ impl LinuxGuest {
                     let v = gc.cpu.backend_mut();
                     let sub = v.regs().rcx as u32;
                     let leaf = v.save().rax as u32;
+                    let avic = self.apicv.unwrap_or(shared.posted.is_some()) && v.has_vapic();
                     let asker = crate::policy::Asker {
                         apic_id: gc.lapic.id(), apic, apic_on: gc.lapic.enabled(), cr4: v.cr4(), xcr0: v.xcr0(),
-                        shape: self.shape, hyperv: self.hyperv.is_some(),
+                        shape: self.shape, hyperv: self.hyperv.is_some(), hyperv_avic: avic,
                     };
                     let answer = crate::policy::cpuid(leaf, sub, &asker);
                     let (save, regs) = v.save_and_regs_mut();
@@ -3872,8 +3884,12 @@ impl LinuxGuest {
     /// tick -- Linux, which disables an APIC timer whose count strays two
     /// jiffies from its PIT's -- would see them apart when they are not.
     ///
-    /// Execute one decoded Hv#1 call. RDX and R8 are its input GPA/parameters.
+    /// Execute one decoded Hv#1 call. RDX and R8 are its input GPA/parameters;
+    /// a fast flush's mask and list are in the saved XMM registers.
     fn hypercall(&self, gc: &mut GuestCpu, call: hyperv::Call, first: u64, second: u64) -> u64 {
+        /* Six XMM registers hold twelve 64-bit words; a simple flush's first
+         * is its processor mask, leaving the rest for a list's GVA ranges. */
+        const FAST_FLUSH_LIST_MAX: u16 = 11;
         match call {
             hyperv::Call::SendIpi { .. } => gc.counts.ipi_calls += 1,
             hyperv::Call::FlushSpace { .. } | hyperv::Call::FlushList { .. } => gc.counts.flush_calls += 1,
@@ -3905,35 +3921,46 @@ impl LinuxGuest {
                 0
             }
             hyperv::Call::FlushSpace { fast } => {
-                if fast {
-                    return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
-                }
-                let bytes = match self.hypercall_input::<24>(first) {
-                    Ok(bytes) => bytes,
-                    Err(status) => return status,
+                let (flags, mask) = if fast {
+                    let Some(mask) = gc.cpu.backend().xmm_word(0) else {
+                        return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                    };
+                    (second, mask)
+                } else {
+                    let bytes = match self.hypercall_input::<24>(first) {
+                        Ok(bytes) => bytes,
+                        Err(status) => return status,
+                    };
+                    (word(&bytes, 8), word(&bytes, 16))
                 };
-                let (flags, mask) = (word(&bytes, 8), word(&bytes, 16));
                 if flags & !7 != 0 {
                     return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
                 }
                 self.hyperv_flush(gc, flags, mask)
             }
             hyperv::Call::FlushList { fast, reps, .. } => {
-                if fast {
+                if fast && reps > FAST_FLUSH_LIST_MAX {
                     return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
                 }
-                let bytes_len = 24 + u64::from(reps) * 8;
-                if first & 7 != 0 || (first & 0xFFF) + bytes_len > kcore::consts::PAGE_SIZE as u64 {
-                    return hyperv::HV_STATUS_INVALID_ALIGNMENT;
-                }
-                if !self.memory.is_ram(first, bytes_len) {
-                    return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
-                }
-                let bytes = match self.hypercall_input::<24>(first) {
-                    Ok(bytes) => bytes,
-                    Err(status) => return status,
+                let (flags, mask) = if fast {
+                    let Some(mask) = gc.cpu.backend().xmm_word(0) else {
+                        return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                    };
+                    (second, mask)
+                } else {
+                    let bytes_len = 24 + u64::from(reps) * 8;
+                    if first & 7 != 0 || (first & 0xFFF) + bytes_len > kcore::consts::PAGE_SIZE as u64 {
+                        return hyperv::HV_STATUS_INVALID_ALIGNMENT;
+                    }
+                    if !self.memory.is_ram(first, bytes_len) {
+                        return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                    }
+                    let bytes = match self.hypercall_input::<24>(first) {
+                        Ok(bytes) => bytes,
+                        Err(status) => return status,
+                    };
+                    (word(&bytes, 8), word(&bytes, 16))
                 };
-                let (flags, mask) = (word(&bytes, 8), word(&bytes, 16));
                 if flags & !7 != 0 {
                     return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
                 }

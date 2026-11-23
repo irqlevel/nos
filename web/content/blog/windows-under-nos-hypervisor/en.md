@@ -113,7 +113,7 @@ In an isolated measurement, VP-assist reduced EOI exits from 497 to 8.
 
 The second mechanism is the synthetic ICR. A remote fixed IPI now joins the existing world-switch fast path instead of taking the longer generic exit route. The synthetic cluster-IPI hypercall supports simple 64-bit VP masks in its memory and fast forms. Median host handling for the synthetic ICR path fell from 2.2 microseconds to 715 nanoseconds.
 
-The third piece is TLB invalidation. `HvFlushVirtualAddressSpace` and `HvFlushVirtualAddressList` flush the calling vCPU immediately and send other vCPUs an atomic request plus a doorbell. A remote vCPU handles the request before its next VM entry. VMX uses VPID invalidation and SVM forgets the affected ASID. A list flush conservatively flushes the whole TLB; sparse Ex and XMM forms are not advertised.
+The third piece is TLB invalidation. `HvFlushVirtualAddressSpace` and `HvFlushVirtualAddressList` flush the calling vCPU immediately and send other vCPUs an atomic request plus a doorbell. A remote vCPU handles the request before its next VM entry. VMX uses VPID invalidation and SVM forgets the affected ASID. A list flush conservatively flushes the whole TLB. Simple flushes support memory and fast register/XMM input; sparse Ex forms are not advertised.
 
 One wrong theory during this work was that Windows needed the sender to wait for every remote flush acknowledgement. Adding that wait did not fix the failure. The actual problem was in the hypercall control flags. We fixed their validation and removed the extra serialization instead of keeping a slowdown that had not solved anything.
 
@@ -148,7 +148,7 @@ It is worth keeping the current boundary explicit.
 - A graphical Windows console. W4 needs GOP, a guest framebuffer, VNC/noVNC and suitable keyboard and pointer devices. SAC is the serial management path; RDP is forwarded rather than displayed by nos itself.
 - Full Windows 11 platform compliance. W5 needs TPM 2.0, Secure Boot and persistent UEFI variables. Variables currently live in RAM and do not survive a restart. LabConfig can bypass installation checks, but that is not the same thing as supporting the platform requirements.
 - A same-image Windows performance comparison against KVM. We have measured the W2 improvement against our own immediately preceding implementation, not against KVM running this image.
-- Every possible Hyper-V call. Sparse Ex/XMM flush forms are intentionally not advertised, and a list flush currently invalidates the whole TLB.
+- Every possible Hyper-V call. Sparse Ex flush forms are intentionally not advertised, and a list flush currently invalidates the whole TLB.
 
 There is performance work left too. The current Server 2022 image still runs in xAPIC mode. Hardware virtualization of the xAPIC page and AMD's AVIC may help, but they are next measurements, not automatic next features. Our earlier APIC experiments have already shown that fewer exits do not always mean a faster workload.
 

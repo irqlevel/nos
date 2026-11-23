@@ -1065,6 +1065,31 @@ MUTANTS = [
      'HV_PRIV_STIMER | HV_PRIV_APIC_ACCESS | HV_PRIV_HYPERCALL',
      'HV_PRIV_STIMER | HV_PRIV_HYPERCALL',
      ['policy']),
+    ('hyperv_avic_apic_access', 'APIC access still recommended with APIC virtualization available',
+     POLICY,
+     'let apic_access = if asker.apic && !asker.hyperv_avic { HV_RECOMMEND_APIC_ACCESS } else { 0 };',
+     'let apic_access = HV_RECOMMEND_APIC_ACCESS;',
+     ['policy']),
+    ('hyperv_avic_auto_eoi', 'AutoEOI deprecation lost with APIC virtualization available',
+     POLICY,
+     'let no_auto_eoi = if asker.apic && asker.hyperv_avic { HV_RECOMMEND_NO_AUTO_EOI } else { 0 };',
+     'let no_auto_eoi = 0;',
+     ['policy']),
+    ('run_hyperv_starts_x2apic', "a Hyper-V VM started in xAPIC instead of x2APIC",
+     RUN,
+     'Self::build(machine, mem_bytes, huge, cpus, doorbells, true, true, linux::HOLE_RAM_END,',
+     'Self::build(machine, mem_bytes, huge, cpus, doorbells, false, true, linux::HOLE_RAM_END,',
+     ['platform']),
+    ('run_hyperv_madt_x2', "a Hyper-V MADT described legacy LAPIC instead of x2APIC",
+     ACPI,
+     'if x2apic {\n            o.u8(MADT_LOCAL_X2APIC);',
+     'if false {\n            o.u8(MADT_LOCAL_X2APIC);',
+     ['platform']),
+    ('run_hyperv_madt_x2_nmi', "a Hyper-V MADT described legacy LAPIC NMI instead of x2APIC NMI",
+     ACPI,
+     'if x2apic {\n        o.u8(MADT_LOCAL_X2APIC_NMI);',
+     'if false {\n        o.u8(MADT_LOCAL_X2APIC_NMI);',
+     ['platform']),
     ('hyperv_call_reserved', 'a reserved hypercall control bit accepted',
      HYPERV,
      'if input & RESERVED != 0 {',
@@ -1094,6 +1119,41 @@ MUTANTS = [
      RUN,
      'gc.cpu.backend_mut().flush_tlb();\n                continue;',
      'continue;',
+     ['platform']),
+    ('run_hyperv_fast_space_mask', "a fast space flush ignored its XMM processor mask",
+     RUN,
+     '''hyperv::Call::FlushSpace { fast } => {
+                let (flags, mask) = if fast {
+                    let Some(mask) = gc.cpu.backend().xmm_word(0) else {
+                        return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                    };
+                    (second, mask)''',
+     '''hyperv::Call::FlushSpace { fast } => {
+                let (flags, mask) = if fast {
+                    (second, 0)''',
+     ['platform']),
+    ('run_hyperv_fast_list_mask', "a fast list flush ignored its XMM processor mask",
+     RUN,
+     '''hyperv::Call::FlushList { fast, reps, .. } => {
+                if fast && reps > FAST_FLUSH_LIST_MAX {
+                    return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                }
+                let (flags, mask) = if fast {
+                    let Some(mask) = gc.cpu.backend().xmm_word(0) else {
+                        return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                    };
+                    (second, mask)''',
+     '''hyperv::Call::FlushList { fast, reps, .. } => {
+                if fast && reps > FAST_FLUSH_LIST_MAX {
+                    return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                }
+                let (flags, mask) = if fast {
+                    (second, 0)''',
+     ['platform']),
+    ('run_hyperv_fast_list_bound', "a fast list accepted more GVA ranges than its XMM input holds",
+     RUN,
+     'if fast && reps > FAST_FLUSH_LIST_MAX {',
+     'if false {',
      ['platform']),
     ('vmstate_vp_assist', "Hyper-V's VP-assist MSR not written to a VM state",
      VMSTATE_HV,

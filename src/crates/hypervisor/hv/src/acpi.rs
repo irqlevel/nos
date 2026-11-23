@@ -69,6 +69,9 @@ pub struct Machine<'a> {
     /// have local APICs -- a MADT only if so.
     pub cpus: u32,
     pub apic: bool,
+    /// Its local APICs come out of reset in x2APIC mode: type 9 in the MADT,
+    /// and the matching type-10 NMI.
+    pub x2apic: bool,
     /// Its IO-APIC's ID, when it has one.
     pub ioapic: Option<u8>,
     /// Each device on the PCI bus, and its interrupt.
@@ -174,8 +177,12 @@ const SPCR_NOT_PCI: u16 = 0xFFFF;
 const MADT_PCAT_COMPAT: u32 = 1 << 0;
 const MADT_LOCAL_APIC: u8 = 0;
 const MADT_LOCAL_APIC_BYTES: u8 = 8;
+const MADT_LOCAL_X2APIC: u8 = 9;
+const MADT_LOCAL_X2APIC_BYTES: u8 = 16;
 const MADT_LOCAL_APIC_NMI: u8 = 4;
 const MADT_LOCAL_APIC_NMI_BYTES: u8 = 6;
+const MADT_LOCAL_X2APIC_NMI: u8 = 10;
+const MADT_LOCAL_X2APIC_NMI_BYTES: u8 = 12;
 const MADT_IO_APIC: u8 = 1;
 const MADT_IO_APIC_BYTES: u8 = 12;
 const MADT_OVERRIDE: u8 = 2;
@@ -187,8 +194,9 @@ const MADT_BUS_ISA: u8 = 0;
 const MADT_FLAGS_BUS: u16 = 0;
 const MADT_FLAGS_LEVEL_HIGH: u16 = 0x1 | (0x3 << 2);
 const MADT_ENABLED: u32 = 1 << 0;
-/// The processor UID that means every processor.
+/// The processor UID that means every processor, in an xAPIC or x2APIC NMI.
 const MADT_ALL_PROCESSORS: u8 = 0xFF;
+const MADT_ALL_X2APIC_PROCESSORS: u32 = u32::MAX;
 /// NMI on LINT1, as a PC wires it; polarity and trigger as the bus has them.
 const MADT_NMI_LINT: u8 = 1;
 const MADT_NMI_FLAGS: u16 = 0;
@@ -376,7 +384,7 @@ pub fn build(m: &Machine, buf: &mut [u8]) -> Option<usize> {
     let madt = if m.apic {
         o.align(TABLE_ALIGN);
         let at = o.at;
-        write_madt(&mut o, m.cpus, m.ioapic);
+        write_madt(&mut o, m.cpus, m.x2apic, m.ioapic);
         Some(gpa(at))
     } else {
         None
@@ -619,11 +627,11 @@ fn write_fadt(o: &mut Out, m: &Machine, facs: Option<u64>, dsdt: u64) {
     seal(o, start);
 }
 
-/// The MADT: each CPU's local APIC, enabled, its processor UID its APIC ID;
-/// the IO-APIC whose ID is `ioapic`, when there is one, its pins global
-/// interrupts 0 up, with the overrides of the timer's IRQ and the SCI's;
-/// and NMI on every CPU's LINT1.
-fn write_madt(o: &mut Out, cpus: u32, ioapic: Option<u8>) {
+/// The MADT: each CPU's local APIC, or x2APIC when `x2apic`, enabled, its
+/// processor UID its APIC ID; the IO-APIC whose ID is `ioapic`, when there is
+/// one, its pins global interrupts 0 up, with the overrides of the timer's IRQ
+/// and the SCI's; and NMI on every CPU's LINT1.
+fn write_madt(o: &mut Out, cpus: u32, x2apic: bool, ioapic: Option<u8>) {
     if cpus == 0 || cpus > MADT_MAX_CPUS {
         o.overflow = true;
         return;
@@ -632,11 +640,20 @@ fn write_madt(o: &mut Out, cpus: u32, ioapic: Option<u8>) {
     o.u32(lapic::DEFAULT_BASE as u32);
     o.u32(MADT_PCAT_COMPAT);
     for id in 0..cpus as u8 {
-        o.u8(MADT_LOCAL_APIC);
-        o.u8(MADT_LOCAL_APIC_BYTES);
-        o.u8(id);
-        o.u8(id);
-        o.u32(MADT_ENABLED);
+        if x2apic {
+            o.u8(MADT_LOCAL_X2APIC);
+            o.u8(MADT_LOCAL_X2APIC_BYTES);
+            o.u16(0); // reserved
+            o.u32(id as u32);
+            o.u32(MADT_ENABLED);
+            o.u32(id as u32);
+        } else {
+            o.u8(MADT_LOCAL_APIC);
+            o.u8(MADT_LOCAL_APIC_BYTES);
+            o.u8(id);
+            o.u8(id);
+            o.u32(MADT_ENABLED);
+        }
     }
     if let Some(id) = ioapic {
         o.u8(MADT_IO_APIC);
@@ -654,11 +671,20 @@ fn write_madt(o: &mut Out, cpus: u32, ioapic: Option<u8>) {
             o.u16(flags);
         }
     }
-    o.u8(MADT_LOCAL_APIC_NMI);
-    o.u8(MADT_LOCAL_APIC_NMI_BYTES);
-    o.u8(MADT_ALL_PROCESSORS);
-    o.u16(MADT_NMI_FLAGS);
-    o.u8(MADT_NMI_LINT);
+    if x2apic {
+        o.u8(MADT_LOCAL_X2APIC_NMI);
+        o.u8(MADT_LOCAL_X2APIC_NMI_BYTES);
+        o.u16(MADT_NMI_FLAGS);
+        o.u32(MADT_ALL_X2APIC_PROCESSORS);
+        o.u8(MADT_NMI_LINT);
+        o.put(&[0; 3]); // reserved
+    } else {
+        o.u8(MADT_LOCAL_APIC_NMI);
+        o.u8(MADT_LOCAL_APIC_NMI_BYTES);
+        o.u8(MADT_ALL_PROCESSORS);
+        o.u16(MADT_NMI_FLAGS);
+        o.u8(MADT_NMI_LINT);
+    }
     seal(o, start);
 }
 
