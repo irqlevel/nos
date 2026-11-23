@@ -2889,6 +2889,7 @@ fn acpi(r: &mut Input) {
     let m = Machine {
         cpus: if r.bool() { r.below(17) as u32 } else { r.u32() },
         apic: r.bool(),
+        x2apic: cloudhv && r.bool(),
         ioapic: r.bool().then(|| r.u8()),
         pci: &routes,
         mmio: (!cloudhv && r.bool()).then(|| (r.u32(), r.u32())),
@@ -2911,6 +2912,25 @@ fn acpi(r: &mut Input) {
         if m.apic && (1..=255).contains(&m.cpus) {
             let processors = tables.windows(8).filter(|w| *w == b"ACPI0007").count();
             invariant!(processors == m.cpus as usize, "{} processor objects for {} CPUs", processors, m.cpus);
+            let madt = tables.windows(4).position(|w| w == b"APIC").expect("MADT");
+            let len = u32::from_le_bytes(tables[madt + 4..madt + 8].try_into().unwrap()) as usize;
+            invariant!(madt + len <= n && len >= 50, "invalid MADT length {}", len);
+            let cpu_bytes = if m.x2apic { 16 } else { 8 };
+            let cpu = &tables[madt + 44..madt + 44 + cpu_bytes];
+            let expected: &[u8] = if m.x2apic {
+                &[9, 16, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+            } else {
+                &[0, 8, 0, 0, 1, 0, 0, 0]
+            };
+            invariant!(cpu == expected, "MADT's first processor entry is {:x?}, not {:x?}", cpu, expected);
+            let nmi_bytes = if m.x2apic { 12 } else { 6 };
+            let nmi = &tables[madt + len - nmi_bytes..madt + len];
+            let expected: &[u8] = if m.x2apic {
+                &[10, 12, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 1, 0, 0, 0]
+            } else {
+                &[4, 6, 0xFF, 0, 0, 1]
+            };
+            invariant!(nmi == expected, "MADT's NMI entry is {:x?}, not {:x?}", nmi, expected);
         }
         let at: Vec<usize> = (0..n.saturating_sub(4)).step_by(16).filter(|&a| &tables[a..a + 4] == b"MCFG").collect();
         invariant!(at.len() == usize::from(m.ecam.is_some()), "{} MCFGs for ECAM {:x?}", at.len(), m.ecam);

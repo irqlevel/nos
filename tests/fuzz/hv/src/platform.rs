@@ -1968,7 +1968,7 @@ pub fn platform(r: &mut Input) {
     let cpus = 1 + r.below(4) as u32;
     let firmware = r.u8() < 24;
     let hyperv = firmware && r.bool();
-    let x2apic = !firmware && r.bool();
+    let x2apic = hyperv || (!firmware && r.bool());
     let ioapic = firmware || (cpus > 1 && r.bool());
     /* Under the devices' pages, up to them, past them -- RAM from 4 GiB --
      * a guest of 8, 16 and 32 GiB, and one past the most there is. */
@@ -2016,6 +2016,8 @@ pub fn platform(r: &mut Input) {
     let Ok((mut guest, mut vcpus)) = made else { return };
     invariant!(guest.has_ioapic() == ioapic, "an IO-APIC {}, not {}", ioapic, guest.has_ioapic());
     invariant!(guest.has_apic() == (cpus > 1 || ioapic), "local APICs for {} CPUs and IO-APIC {}", cpus, ioapic);
+    invariant!(guest.x2apic() == (hyperv || x2apic && !ioapic),
+               "x2APIC reset mode {} for Hyper-V {}, x2apic {}, IO-APIC {}", guest.x2apic(), hyperv, x2apic, ioapic);
     /* Its RAM where the platform has it: below the devices' pages and from
      * 4 GiB, every byte of it, the huge pool's when asked. */
     let memory = guest.memory();
@@ -2097,6 +2099,31 @@ pub fn platform(r: &mut Input) {
     let loaded = guest.load(bsp, &h, &first, layout, &cmdline).is_ok();
     invariant!(loaded == (planned_end == low_end), "a kernel's layout of RAM below {:#x} {} a guest of RAM below {:#x}",
                planned_end, if loaded { "loaded into" } else { "refused by" }, low_end);
+    if loaded && guest.has_apic() {
+        let mut tables = [0u8; crate::acpi::MAX_BYTES];
+        guest.memory().read(crate::acpi::AREA, &mut tables).expect("ACPI tables");
+        if let Some(madt) = tables.windows(4).position(|w| w == b"APIC") {
+            let len = u32::from_le_bytes(tables[madt + 4..madt + 8].try_into().unwrap()) as usize;
+            invariant!(madt + len <= tables.len() && len >= 50, "invalid MADT length {}", len);
+            let x2 = guest.x2apic();
+            let cpu_bytes = if x2 { 16 } else { 8 };
+            let cpu = &tables[madt + 44..madt + 44 + cpu_bytes];
+            let expected: &[u8] = if x2 {
+                &[9, 16, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+            } else {
+                &[0, 8, 0, 0, 1, 0, 0, 0]
+            };
+            invariant!(cpu == expected, "MADT's first processor entry is {:x?}, not {:x?}", cpu, expected);
+            let nmi_bytes = if x2 { 12 } else { 6 };
+            let nmi = &tables[madt + len - nmi_bytes..madt + len];
+            let expected: &[u8] = if x2 {
+                &[10, 12, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 1, 0, 0, 0]
+            } else {
+                &[4, 6, 0xFF, 0, 0, 1]
+            };
+            invariant!(nmi == expected, "MADT's NMI entry is {:x?}, not {:x?}", nmi, expected);
+        }
+    }
     if !loaded {
         return;
     }
@@ -2105,7 +2132,7 @@ pub fn platform(r: &mut Input) {
                                     last_entry: AtomicU64::new(time::peek()) });
     let devices = disks.len() + nics.len();
     let n = cpus as usize;
-    let first_xapic = firmware || (cpus > 1 && (!x2apic || ioapic));
+    let first_xapic = !guest.x2apic();
     /* The hypervisor's tracepoints on for half the runs: every record its
      * sites build of what this guest does, held to its description. */
     crate::trace::set_on(r.u8() < 128);

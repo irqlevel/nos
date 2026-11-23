@@ -236,11 +236,19 @@ fell from 2,091 to 1,992 ns (about 5%), and the mean from 2,316 to 2,022 ns
 (about 13%). This measures the hypercall path, not whole-VM speed. CMD, ping
 and ACPI shutdown worked, with no flush timeouts.
 
-The current Server 2022 image remains in xAPIC mode and uses Hyper-V's
-enlightened path; x2APIC and VT-x APICv remain available to guests that select
-them. Hardware virtualization of the xAPIC page, AVIC, and the same-image KVM
-benchmark comparison are still open. Those should follow the measurements, not
-be enabled on the assumption that fewer exits always wins.
+Hyper-V now starts with x2APIC enabled alongside the IO-APIC. The MADT uses
+ACPI's 16-byte type-9 processor and 12-byte type-10 NMI entries. CPUID follows
+QEMU's `hv-avic` contract: APIC access is recommended only without APICv;
+AutoEOI is deprecated with it. The separate `UseX2ApicMsrs` recommendation is
+not advertised, matching KVM/QEMU. Server 2022 boots to SAC, accepts CMD, pings
+the host and powers off through ACPI, with VT-x APICv delivering interrupts and
+taking EOIs. Two steady 12.6--12.7-second windows had 2,799 and 2,851 exits
+(about 222--224/s), versus 4,096 in 5.18 seconds (about 790/s) with the old
+path: roughly 72% fewer, with no xAPIC nested faults or IRQ-window exits.
+Native `0x830` ICR did not improve its own median next-exit time (810--848 ns
+versus 777 ns for synthetic ICR), so this is evidence of eliminated exit
+classes, not a whole-VM benchmark. Hardware virtualization of the xAPIC page,
+AVIC, and a same-image KVM benchmark comparison remain open.
 
 ## W3 -- Installation and built-in devices
 

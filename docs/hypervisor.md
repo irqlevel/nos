@@ -5222,8 +5222,13 @@ waiting; a guest clearing it instead of writing EOI has the EOI completed at
 the next exit. While an AutoEOI SINT is configured it disables APICv and the
 host ends its vector as it is injected. Hyper-V's synthetic ICR uses the world
 switch's remote fixed-IPI fast path as the native x2APIC ICR does. CPUID
-recommends the APIC MSRs, deprecation of AutoEOI, remote TLB flushes and
-synthetic cluster IPIs.
+recommends remote TLB flushes and synthetic cluster IPIs. Without APICv it
+also recommends the APIC MSRs and VP-assist EOI. With APICv those are not
+recommended and AutoEOI is deprecated, the same contract as QEMU's `hv-avic`.
+If a guest configures AutoEOI anyway, APICv is disabled for as long as that
+configuration needs host injection. Hyper-V starts with x2APIC enabled; the
+MADT describes the processors and their NMI with ACPI's 16-byte type-9 and
+12-byte type-10 entries respectively.
 
 `HvFlushVirtualAddressSpace` (0x0002), `HvFlushVirtualAddressList` (0x0003)
 and `HvCallSendSyntheticClusterIpi` (0x000b) are implemented with the simple

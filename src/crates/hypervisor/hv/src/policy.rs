@@ -502,6 +502,8 @@ pub struct Asker {
     pub shape: Shape,
     /// Microsoft's Hyper-V interface rather than KVM's, for a firmware guest.
     pub hyperv: bool,
+    /// SynIC can run with hardware APIC virtualization, without AutoEOI.
+    pub hyperv_avic: bool,
 }
 
 impl Asker {
@@ -509,7 +511,7 @@ impl Asker {
     /// more: its signature, its features, its address widths.
     pub const RESET: Asker =
         Asker { apic_id: 0, apic: true, apic_on: true, cr4: 0, xcr0: fp::XCR0_X87, shape: Shape::cores(1),
-                hyperv: false };
+                hyperv: false, hyperv_avic: false };
 }
 
 /* The hypervisor's own range: KVM's signature, "KVMKVMKVM" in EBX, ECX and
@@ -705,7 +707,7 @@ pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
 /// PV EOI for a guest with APICs. Nothing else in the range.
 fn hypervisor_leaf(leaf: u32, asker: &Asker) -> Cpuid {
     if asker.hyperv {
-        return microsoft_leaf(leaf);
+        return microsoft_leaf(leaf, asker);
     }
     match leaf {
         LEAF_HYPERVISOR => Cpuid {
@@ -727,7 +729,9 @@ fn hypervisor_leaf(leaf: u32, asker: &Asker) -> Cpuid {
 /// Microsoft's hypervisor range: the Hv#1 interface and only the facilities
 /// implemented behind it. Zero is a valid answer for every identity field,
 /// recommendation and limit the interface leaves optional.
-fn microsoft_leaf(leaf: u32) -> Cpuid {
+fn microsoft_leaf(leaf: u32, asker: &Asker) -> Cpuid {
+    let apic_access = if asker.apic && !asker.hyperv_avic { HV_RECOMMEND_APIC_ACCESS } else { 0 };
+    let no_auto_eoi = if asker.apic && asker.hyperv_avic { HV_RECOMMEND_NO_AUTO_EOI } else { 0 };
     match leaf {
         LEAF_HYPERVISOR => Cpuid {
             eax: LEAF_HV_LIMITS,
@@ -745,8 +749,7 @@ fn microsoft_leaf(leaf: u32) -> Cpuid {
             edx: HV_HYPERCALL_XMM_INPUT | HV_GUEST_CRASH | HV_STIMER_DIRECT,
         },
         LEAF_HV_RECOMMENDATIONS => Cpuid {
-            eax: HV_RECOMMEND_REMOTE_TLB_FLUSH | HV_RECOMMEND_APIC_ACCESS | HV_RECOMMEND_NO_AUTO_EOI
-                | HV_RECOMMEND_CLUSTER_IPI,
+            eax: HV_RECOMMEND_REMOTE_TLB_FLUSH | apic_access | no_auto_eoi | HV_RECOMMEND_CLUSTER_IPI,
             ebx: u32::MAX,
             ecx: 0,
             edx: 0,
