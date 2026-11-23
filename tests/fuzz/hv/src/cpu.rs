@@ -633,6 +633,7 @@ pub mod vm {
         Exception(u8),
     }
 
+    const XSAVE_XMM_AT: usize = 160;
     const RFLAGS_IF: u64 = 1 << 9;
     const EFER_LMA: u64 = 1 << 10;
     const CR4_PSE: u64 = 1 << 4;
@@ -769,6 +770,23 @@ pub mod vm {
                 tsc_offset: 0,
                 flushes: 0,
                 fp_area: vec![0; 832],
+            }
+        }
+
+        pub fn fp_area(&self) -> &[u8] {
+            &self.fp_area
+        }
+
+        pub fn xmm_word(&self, index: usize) -> Option<u64> {
+            let at = index.checked_mul(8)?.checked_add(XSAVE_XMM_AT)?;
+            let end = at.checked_add(8)?;
+            Some(u64::from_le_bytes(self.fp_area.get(at..end)?.try_into().ok()?))
+        }
+
+        pub fn set_xmm_words(&mut self, words: &[u64]) {
+            for (i, word) in words.iter().take(12).enumerate() {
+                let at = XSAVE_XMM_AT + i * 8;
+                self.fp_area[at..at + 8].copy_from_slice(&word.to_le_bytes());
             }
         }
 

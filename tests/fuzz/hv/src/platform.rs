@@ -139,9 +139,9 @@ struct CpuPlan {
     /// What its last `in` should have read, and its size, for its next
     /// entry to see (`Step::InExpect`).
     read: Option<(u32, u8)>,
-    /// The result its last Hv#1 call must return, and a flush its backend must
-    /// have marked when the call targets this CPU.
-    call: Option<(u64, Option<u64>)>,
+    /// The result its last Hv#1 call must return, and for a valid flush:
+    /// whether it targets this CPU and the backend's flush count before it.
+    call: Option<(u64, Option<(bool, u64)>)>,
 }
 
 /// What a `mov` to or from CR4 the script put at a CPU's RIP should have
@@ -959,38 +959,55 @@ impl Script {
         }
     }
 
-    /// A valid Hv#1 flush or synthetic-IPI call, with its input in guest RAM
-    /// or the fast convention's registers. Its next entry checks the result.
+    /// An Hv#1 flush or synthetic-IPI call, with its input in guest RAM or
+    /// the fast convention's registers and XMM words. Its next entry checks
+    /// the result, including a fast list too long for the six XMM registers.
     fn hyperv_call(&mut self, v: &mut Backend, mem: &GuestMemory, r: &mut Input) -> Exit {
         HV_CALLS.fetch_add(1, Ordering::Relaxed);
         let code = r.pick(&[2u64, 3, 0xB]);
-        let reps = if code == 3 { 1 + r.below(8) } else { 0 };
-        let fast = code == 0xB && r.bool();
+        let reps = if code == 3 { 1 + r.below(16) } else { 0 };
+        let fast = r.bool();
+        let invalid = fast && code == 3 && reps > 11;
         let input = code | u64::from(fast) << 16 | reps << 32;
         let gpa = HV_INPUT + self.me as u64 * 0x1000;
         let all = if self.cpus.len() == 64 { u64::MAX } else { (1u64 << self.cpus.len()) - 1 };
         let mask = r.pick(&[0, 1, 2, all, 1u64 << self.me]);
         let flags = r.pick(&[0u64, 1, 2, 4, 5]);
         let vector = 16 + r.below(240) as u32;
+        let address_space = r.u64();
+        let ranges: Vec<u64> = (0..reps).map(|_| r.u64()).collect();
         let mut bytes = vec![0u8; if code == 0xB { 16 } else { 24 + reps as usize * 8 }];
         if code == 0xB {
             bytes[0..4].copy_from_slice(&vector.to_le_bytes());
             bytes[8..16].copy_from_slice(&mask.to_le_bytes());
         } else {
-            bytes[0..8].copy_from_slice(&r.u64().to_le_bytes());
+            bytes[0..8].copy_from_slice(&address_space.to_le_bytes());
             bytes[8..16].copy_from_slice(&flags.to_le_bytes());
             bytes[16..24].copy_from_slice(&mask.to_le_bytes());
-            for at in (24..bytes.len()).step_by(8) {
-                bytes[at..at + 8].copy_from_slice(&r.u64().to_le_bytes());
+            for (at, range) in (24..bytes.len()).step_by(8).zip(&ranges) {
+                bytes[at..at + 8].copy_from_slice(&range.to_le_bytes());
             }
         }
         mem.write(gpa, &bytes).expect("Hyper-V call input in guest RAM");
+        if fast && code != 0xB {
+            let mut words = vec![mask];
+            words.extend_from_slice(&ranges);
+            v.set_xmm_words(&words);
+        }
         v.regs_mut().rcx = input;
-        v.regs_mut().rdx = if fast { u64::from(vector) } else { gpa };
-        v.regs_mut().r8 = if fast { mask } else { 0 };
-        let answer = if code == 3 { reps << 32 } else { 0 };
-        let self_flush = code != 0xB && (flags & 1 != 0 || mask == 0 || mask & 1u64 << self.me != 0);
-        self.cpus[self.me].call = Some((answer, self_flush.then_some(v.flushes)));
+        v.regs_mut().rdx = match (fast, code) {
+            (true, 0xB) => u64::from(vector),
+            (true, _) => address_space,
+            (false, _) => gpa,
+        };
+        v.regs_mut().r8 = match (fast, code) {
+            (true, 0xB) => mask,
+            (true, _) => flags,
+            (false, _) => 0,
+        };
+        let answer = if invalid { 3 } else if code == 3 { reps << 32 } else { 0 };
+        let self_flush = !invalid && code != 0xB && (flags & 1 != 0 || mask == 0 || mask & 1u64 << self.me != 0);
+        self.cpus[self.me].call = Some((answer, (!invalid && code != 0xB).then_some((self_flush, v.flushes))));
         Exit::Hypercall
     }
 
@@ -1396,8 +1413,12 @@ impl Script {
         }
         if let Some((want, flush)) = self.cpus[self.me].call.take() {
             invariant!(v.save().rax == want, "Hv#1 returned {:#x}, wanted {:#x}", v.save().rax, want);
-            if let Some(before) = flush {
-                invariant!(v.flushes > before, "Hv#1 returned success without flushing this vCPU's TLB");
+            if let Some((targeted, before)) = flush {
+                if targeted || self.cpus.len() == 1 {
+                    invariant!((v.flushes > before) == targeted,
+                               "Hv#1 flush target wrong for this vCPU: count {} before, {} after, targeted {}",
+                               before, v.flushes, targeted);
+                }
             }
         }
         if self.hyperv && self.hyperv_init < 2 {
@@ -1847,7 +1868,7 @@ pub fn report() {
               than 1 ms past their time", LATE_SLEPT.load(Ordering::Relaxed), LATE_OTHER.load(Ordering::Relaxed),
              OVERSLEPT.load(Ordering::Relaxed));
     println!("  platform: {} disks served from outside every CPU", SERVED.load(Ordering::Relaxed));
-    println!("  platform: {} valid Hv#1 flush and synthetic-IPI calls checked", HV_CALLS.load(Ordering::Relaxed));
+    println!("  platform: {} Hv#1 flush and synthetic-IPI calls checked", HV_CALLS.load(Ordering::Relaxed));
     println!("  platform: {} WRMSRs answered in the world switch's own loop, {} HLTs ended there -- of {} offered it, \
               of {} made", crate::cpu::FAST_ANSWERED.load(Ordering::Relaxed), crate::cpu::FAST_HLTS.load(Ordering::Relaxed),
              crate::cpu::HLTS_OFFERED.load(Ordering::Relaxed), crate::cpu::HLTS_MADE.load(Ordering::Relaxed));

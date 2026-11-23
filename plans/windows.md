@@ -214,9 +214,11 @@ Hv#1 now includes its EOI/ICR/TPR MSRs, per-VP assist pages with exit-less EOI,
 SynIC AutoEOI delivery, and the world-switch fast path for remote fixed IPIs
 through the synthetic ICR. `HvFlushVirtualAddressSpace`,
 `HvFlushVirtualAddressList` and `HvCallSendSyntheticClusterIpi` support simple
-64-bit VP masks; list flushes conservatively flush the whole TLB. Sparse Ex and
-XMM forms are not advertised. Vmstate version 5 carries VP-assist and reads
-version 4 without it.
+64-bit VP masks in memory and fast register forms. XMM fast input is
+advertised: the mask is XMM0's low half, and a list has up to eleven GVA ranges
+in the remaining halves of the six-register input. List flushes conservatively
+flush the whole TLB. Sparse Ex forms are not advertised. Vmstate version 5
+carries VP-assist and reads version 4 without it.
 
 In comparable 2.66-second idle Windows windows, exits fell from 1,657 to 647
 (61%). All 1,163 xAPIC nested faults disappeared; Hyper-V EOI writes fell from
@@ -225,6 +227,14 @@ and the synthetic ICR fast path reduced median handling from 2.2 us to 715 ns.
 Windows Server 2022 still boots to SAC in about 1.65 s. The `hyperv`, `lapic`,
 `policy`, `vmstate` and whole-machine `platform` fuzz targets cover the new
 contract, including valid flush/IPI calls and their results.
+
+A follow-up EX44 A/B on the same Windows image took 12-second traces and
+compared their newest 4,096 exits. In that tail, baseline had 187 TLB
+hypercalls, all in memory form; with XMM input advertised, all 148 were fast.
+Median time to the next exit on the same vCPU
+fell from 2,091 to 1,992 ns (about 5%), and the mean from 2,316 to 2,022 ns
+(about 13%). This measures the hypercall path, not whole-VM speed. CMD, ping
+and ACPI shutdown worked, with no flush timeouts.
 
 The current Server 2022 image remains in xAPIC mode and uses Hyper-V's
 enlightened path; x2APIC and VT-x APICv remain available to guests that select

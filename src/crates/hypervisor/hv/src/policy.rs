@@ -540,6 +540,7 @@ const HV_PRIV_APIC_ACCESS: u32 = 1 << 4;
 const HV_PRIV_HYPERCALL: u32 = 1 << 5;
 const HV_PRIV_VP_INDEX: u32 = 1 << 6;
 const HV_PRIV_REFERENCE_TSC: u32 = 1 << 9;
+const HV_HYPERCALL_XMM_INPUT: u32 = 1 << 4;
 const HV_GUEST_CRASH: u32 = 1 << 10;
 const HV_PRIV_FREQUENCY: u32 = 1 << 11;
 const HV_STIMER_DIRECT: u32 = 1 << 19;
@@ -741,7 +742,7 @@ fn microsoft_leaf(leaf: u32) -> Cpuid {
                 | HV_PRIV_VP_INDEX | HV_PRIV_REFERENCE_TSC | HV_PRIV_FREQUENCY,
             ebx: 0,
             ecx: 0,
-            edx: HV_GUEST_CRASH | HV_STIMER_DIRECT,
+            edx: HV_HYPERCALL_XMM_INPUT | HV_GUEST_CRASH | HV_STIMER_DIRECT,
         },
         LEAF_HV_RECOMMENDATIONS => Cpuid {
             eax: HV_RECOMMEND_REMOTE_TLB_FLUSH | HV_RECOMMEND_APIC_ACCESS | HV_RECOMMEND_NO_AUTO_EOI

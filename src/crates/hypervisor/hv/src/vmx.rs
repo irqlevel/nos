@@ -988,6 +988,11 @@ impl Vcpu {
         self.guest.fp_loads()
     }
 
+    /// Its registers as the last exit saved them, in XSAVE's standard form.
+    pub fn fp_area(&self) -> &[u8] {
+        self.guest.fp_area().0
+    }
+
     /// The guest's MSRs the extension does not switch: its TSC_AUX and
     /// IA32_SPEC_CTRL, and the IBPBs it asked for.
     pub fn msrs(&self) -> &hvarch::x86::msrs::GuestMsrs {

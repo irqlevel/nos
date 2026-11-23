@@ -3872,8 +3872,12 @@ impl LinuxGuest {
     /// tick -- Linux, which disables an APIC timer whose count strays two
     /// jiffies from its PIT's -- would see them apart when they are not.
     ///
-    /// Execute one decoded Hv#1 call. RDX and R8 are its input GPA/parameters.
+    /// Execute one decoded Hv#1 call. RDX and R8 are its input GPA/parameters;
+    /// a fast flush's mask and list are in the saved XMM registers.
     fn hypercall(&self, gc: &mut GuestCpu, call: hyperv::Call, first: u64, second: u64) -> u64 {
+        /* Six XMM registers hold twelve 64-bit words; a simple flush's first
+         * is its processor mask, leaving the rest for a list's GVA ranges. */
+        const FAST_FLUSH_LIST_MAX: u16 = 11;
         match call {
             hyperv::Call::SendIpi { .. } => gc.counts.ipi_calls += 1,
             hyperv::Call::FlushSpace { .. } | hyperv::Call::FlushList { .. } => gc.counts.flush_calls += 1,
@@ -3905,35 +3909,46 @@ impl LinuxGuest {
                 0
             }
             hyperv::Call::FlushSpace { fast } => {
-                if fast {
-                    return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
-                }
-                let bytes = match self.hypercall_input::<24>(first) {
-                    Ok(bytes) => bytes,
-                    Err(status) => return status,
+                let (flags, mask) = if fast {
+                    let Some(mask) = gc.cpu.backend().xmm_word(0) else {
+                        return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                    };
+                    (second, mask)
+                } else {
+                    let bytes = match self.hypercall_input::<24>(first) {
+                        Ok(bytes) => bytes,
+                        Err(status) => return status,
+                    };
+                    (word(&bytes, 8), word(&bytes, 16))
                 };
-                let (flags, mask) = (word(&bytes, 8), word(&bytes, 16));
                 if flags & !7 != 0 {
                     return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
                 }
                 self.hyperv_flush(gc, flags, mask)
             }
             hyperv::Call::FlushList { fast, reps, .. } => {
-                if fast {
+                if fast && reps > FAST_FLUSH_LIST_MAX {
                     return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
                 }
-                let bytes_len = 24 + u64::from(reps) * 8;
-                if first & 7 != 0 || (first & 0xFFF) + bytes_len > kcore::consts::PAGE_SIZE as u64 {
-                    return hyperv::HV_STATUS_INVALID_ALIGNMENT;
-                }
-                if !self.memory.is_ram(first, bytes_len) {
-                    return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
-                }
-                let bytes = match self.hypercall_input::<24>(first) {
-                    Ok(bytes) => bytes,
-                    Err(status) => return status,
+                let (flags, mask) = if fast {
+                    let Some(mask) = gc.cpu.backend().xmm_word(0) else {
+                        return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                    };
+                    (second, mask)
+                } else {
+                    let bytes_len = 24 + u64::from(reps) * 8;
+                    if first & 7 != 0 || (first & 0xFFF) + bytes_len > kcore::consts::PAGE_SIZE as u64 {
+                        return hyperv::HV_STATUS_INVALID_ALIGNMENT;
+                    }
+                    if !self.memory.is_ram(first, bytes_len) {
+                        return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                    }
+                    let bytes = match self.hypercall_input::<24>(first) {
+                        Ok(bytes) => bytes,
+                        Err(status) => return status,
+                    };
+                    (word(&bytes, 8), word(&bytes, 16))
                 };
-                let (flags, mask) = (word(&bytes, 8), word(&bytes, 16));
                 if flags & !7 != 0 {
                     return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
                 }

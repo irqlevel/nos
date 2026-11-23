@@ -14,6 +14,9 @@ use crate::machine::Machine;
 use crate::memory::GuestMemory;
 use crate::svm::{Exit, Io, LongMode, ProtectedMode};
 
+/// Where FXSAVE's legacy region, also XSAVE's, keeps XMM0's low half.
+const XSAVE_XMM_AT: usize = 160;
+
 /// Why a guest was not entered.
 #[derive(Clone, Copy, Debug)]
 pub enum Refusal {
@@ -143,6 +146,14 @@ impl Backend {
     /// a CPU that held another guest's.
     pub fn fp_loads(&self) -> u64 {
         match self { Backend::Svm(v) => v.fp_loads(), Backend::Vmx(v) => v.fp_loads() }
+    }
+    /// One 64-bit half of an XMM register as the last exit saved it in the
+    /// legacy XSAVE area: index 0 is XMM0's low half, index 1 its high half.
+    pub fn xmm_word(&self, index: usize) -> Option<u64> {
+        let at = index.checked_mul(8)?.checked_add(XSAVE_XMM_AT)?;
+        let end = at.checked_add(8)?;
+        let area = match self { Backend::Svm(v) => v.fp_area(), Backend::Vmx(v) => v.fp_area() };
+        Some(u64::from_le_bytes(area.get(at..end)?.try_into().ok()?))
     }
     /// The guest's MSRs that its save area does not hold, which its entries
     /// make the CPU's, and the IBPBs it asked for (`hvarch::x86::msrs`).

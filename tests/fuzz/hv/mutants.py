@@ -1095,6 +1095,41 @@ MUTANTS = [
      'gc.cpu.backend_mut().flush_tlb();\n                continue;',
      'continue;',
      ['platform']),
+    ('run_hyperv_fast_space_mask', "a fast space flush ignored its XMM processor mask",
+     RUN,
+     '''hyperv::Call::FlushSpace { fast } => {
+                let (flags, mask) = if fast {
+                    let Some(mask) = gc.cpu.backend().xmm_word(0) else {
+                        return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                    };
+                    (second, mask)''',
+     '''hyperv::Call::FlushSpace { fast } => {
+                let (flags, mask) = if fast {
+                    (second, 0)''',
+     ['platform']),
+    ('run_hyperv_fast_list_mask', "a fast list flush ignored its XMM processor mask",
+     RUN,
+     '''hyperv::Call::FlushList { fast, reps, .. } => {
+                if fast && reps > FAST_FLUSH_LIST_MAX {
+                    return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                }
+                let (flags, mask) = if fast {
+                    let Some(mask) = gc.cpu.backend().xmm_word(0) else {
+                        return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                    };
+                    (second, mask)''',
+     '''hyperv::Call::FlushList { fast, reps, .. } => {
+                if fast && reps > FAST_FLUSH_LIST_MAX {
+                    return hyperv::HV_STATUS_INVALID_HYPERCALL_INPUT;
+                }
+                let (flags, mask) = if fast {
+                    (second, 0)''',
+     ['platform']),
+    ('run_hyperv_fast_list_bound', "a fast list accepted more GVA ranges than its XMM input holds",
+     RUN,
+     'if fast && reps > FAST_FLUSH_LIST_MAX {',
+     'if false {',
+     ['platform']),
     ('vmstate_vp_assist', "Hyper-V's VP-assist MSR not written to a VM state",
      VMSTATE_HV,
      'o.u64(self.vp_assist);',

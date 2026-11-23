@@ -5227,13 +5227,16 @@ synthetic cluster IPIs.
 
 `HvFlushVirtualAddressSpace` (0x0002), `HvFlushVirtualAddressList` (0x0003)
 and `HvCallSendSyntheticClusterIpi` (0x000b) are implemented with the simple
-64-bit processor masks. The IPI has memory and fast register forms. A list
-flush conservatively flushes the whole TLB rather than keeping each GVA range;
-the non-global-only flag is accepted on that path too, for compatibility with
-KVM's Windows path. A remote target gets an atomic flush request and a doorbell, and marks its
-backend before the next entry; the calling VPID/ASID is marked directly. The
-sparse Ex and XMM forms are not advertised. Vmstate version 5 adds each VP's
-assist MSR and reads version 4 with it disabled.
+64-bit processor masks, in memory and fast register forms. CPUID advertises
+XMM fast hypercall input: a flush takes its processor mask from XMM0's low
+half, and a list takes its GVA ranges from the following halves, up to eleven
+in the six-register input. A list flush conservatively flushes the whole TLB
+rather than keeping each GVA range; the non-global-only flag is accepted on
+that path too, for compatibility with KVM's Windows path. A remote target gets
+an atomic flush request and a doorbell, and marks its backend before the next
+entry; the calling VPID/ASID is marked directly. The sparse Ex forms are not
+advertised. Vmstate version 5 adds each VP's assist MSR and reads version 4
+with it disabled.
 
 TIME_REF_COUNT shares the reference TSC page: a second read-only overlay,
 with the TLFS sequence odd while a value is being published and even after,
@@ -5264,9 +5267,14 @@ windows, reduced exits from 1,657 to 647 (61%): all 1,163 xAPIC nested faults
 were gone, Hyper-V EOI writes fell from 479 to one, and 195 synthetic ICR writes
 remained. Measured separately, VP-assist removed 489 of 497 EOI exits in an
 early-boot window, and answering the synthetic ICR in the world switch reduced
-its median host cost from 2.2 us to 715 ns. The current Windows image stays in
-xAPIC mode and uses these Hyper-V paths; hardware virtualization of the xAPIC
-page, AVIC and a same-image KVM benchmark remain separate measurements.
+its median host cost from 2.2 us to 715 ns. A later 12-second A/B on the same
+image compared the newest 4,096 exits: 187 memory-form TLB calls before XMM
+input and 148 fast calls after it. Median time to the next exit on that vCPU
+fell from 2,091 to 1,992 ns,
+and the mean from 2,316 to 2,022 ns. This is the hypercall path's cost, not a
+whole-VM benchmark. The current Windows image stays in xAPIC mode and uses
+these Hyper-V paths; hardware virtualization of the xAPIC page, AVIC and a
+same-image KVM benchmark remain separate measurements.
 
 ### Starting the others
 
